@@ -221,7 +221,7 @@ export function TaskQueue({ projectID, permissionMode, request, fail, onDispatch
       <header className="task-queue-head"><div><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions"><button type="button" className="task-queue-add" title="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button></div></header>
       {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => setQuickDescription(event.target.value)} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
       <nav className="task-queue-filters" aria-label="任务筛选">{filters.map((item) => <button type="button" key={item.id} className={filter === item.id ? "active" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<span>{taskCounts[item.id]}</span></button>)}</nav>
-      <div className="task-queue-list">{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task) => <TaskQueueRow key={task.id} task={task} open={() => openInlineDetail(task.id)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} />)}</div>
+      <div className={`task-queue-list${reviewingTaskID ? " reviewing" : ""}`}>{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task) => <TaskQueueRow key={task.id} task={task} open={() => openInlineDetail(task.id)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} />)}</div>
     </div>
     {confirmingTask && createPortal(<DispatchConfirmation task={confirmingTask} detail={detail} loading={loadingDetail} dispatching={dispatching} permissionMode={permissionMode} close={closeConfirmation} openBoard={() => openBoard(confirmingTask.id)} dispatch={dispatch} />, document.body)}
     {inlineDetailID && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
@@ -236,9 +236,8 @@ function TaskQueueRow({ task, open, confirm, redispatch, redispatching, openRevi
   const isReviewing = reviewingTaskID === task.id;
   const reviewRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (isReviewing && reviewRef.current) {
-      reviewRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    }
+    if (!isReviewing || !reviewRef.current) return;
+    reviewRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [isReviewing]);
   return <article className="task-queue-row">
     <button type="button" className="task-queue-open" onClick={open}>
@@ -271,6 +270,9 @@ function DispatchConfirmation({ task, detail, loading, dispatching, permissionMo
 
 function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; close: () => void; dispatch: () => Promise<void>; transition: (action: "cancel" | "reopen" | "stop") => Promise<void>; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: (action: "cancel" | "reopen") => void }) {
   const detailRef = useRef<HTMLDivElement>(null);
+  const [localReviewNote, setLocalReviewNote] = useState("");
+  const [localReviewSubmitting, setLocalReviewSubmitting] = useState(false);
+
   useEffect(() => {
     if (detailRef.current) {
       detailRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -282,8 +284,6 @@ function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, 
 
   const blocked = isTaskBlocked(detail);
   const queued = detail.status === "running" && detail.lastRun?.status === "queued";
-  const [localReviewNote, setLocalReviewNote] = useState("");
-  const [localReviewSubmitting, setLocalReviewSubmitting] = useState(false);
   const reviewBusy = Boolean(busy) || localReviewSubmitting;
 
   const doReview = async (action: "accept" | "request_changes") => {

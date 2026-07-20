@@ -36,6 +36,7 @@
 .task-queue-filters button.active { border-color: #8bbcae; color: #234f43; background: #dff1e7; }
 .task-queue-filters span { color: #879c92; font: 700 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .task-queue-list { display: grid; max-height: min(48vh, 440px); gap: 1px; overflow-y: auto; border-top: 1px solid #dce9e1; scrollbar-width: thin; }
+.task-queue-list.reviewing { max-height: none; overflow-y: visible; }
 .task-queue-empty { margin: 0; padding: 18px 4px; color: #748b81; font-size: 11px; text-align: center; }
 .task-queue-row { display: grid; min-height: 72px; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; align-items: start; border-bottom: 1px solid #e2ece6; padding: 8px 0; }
 .task-queue-open { display: grid; min-width: 0; gap: 4px; border: 0; padding: 0; color: #294f43; text-align: left; background: transparent; }
