@@ -1,0 +1,35 @@
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/*
+!data/.gitkeep
+
+# JavaScript tooling
+node_modules/
+.pnpm-store/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Go build output
+bin/
+*.exe
+*.test
+*.out
+apps/control-server/control-server
+
+# Generated API and protocol files
+packages/contracts/generated/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+
+# Local AI-agent tooling
+.agents/
+.claude/
+agent/

@@ -1,0 +1,12 @@
+{
+  "name": "auto-development-platform",
+  "private": true,
+  "scripts": {
+    "dev": "bash dev.sh"
+  },
+  "packageManager": "pnpm@10.17.1",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=10.17.1"
+  }
+}

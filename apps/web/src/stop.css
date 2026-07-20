@@ -1,0 +1,5 @@
+.stop-run { border: 1px solid #f0aa9d; border-radius: 4px; padding: 8px 10px; color: #aa4030; background: #fff0ed; font-size: 12px; font-weight: 650; }
+.stop-run:hover:not(:disabled) { background: #ffe1db; }
+.stop-run:disabled { color: #a19091; background: #f6f2f3; }
+
+.stop-run { border-color: #efb59d; border-radius: 7px; color: #a94634; background: #fff0eb; }.stop-run:hover:not(:disabled) { background: #ffe1d8; }.stop-run:disabled { color: #a49691; background: #f6f2f0; }

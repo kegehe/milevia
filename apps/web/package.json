@@ -1,0 +1,23 @@
+{
+  "name": "@auto/web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.13",
+    "@types/react-dom": "19.1.9",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.2",
+    "vite": "8.0.16"
+  }
+}
