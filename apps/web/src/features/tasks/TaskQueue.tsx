@@ -274,10 +274,10 @@ function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, 
   const [localReviewSubmitting, setLocalReviewSubmitting] = useState(false);
 
   useEffect(() => {
-    if (detailRef.current) {
+    if (detailRef.current && detail) {
       detailRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
-  }, []);
+  }, [detail]);
 
   if (loading) return <div className="task-inline-detail"><div className="task-inline-detail-body"><p className="task-inline-loading">加载任务详情...</p></div></div>;
   if (!detail) return <div className="task-inline-detail"><div className="task-inline-detail-body"><p className="task-inline-loading">无法加载任务详情。</p></div></div>;

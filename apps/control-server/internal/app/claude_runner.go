@@ -551,14 +551,43 @@ func resultError(payload json.RawMessage) error {
 	if !result.IsError && !strings.HasPrefix(result.Subtype, "error") {
 		return nil
 	}
-	message := strings.Join(result.Errors, "; ")
-	if message == "" {
-		message = result.TerminalReason
+	raw := strings.Join(result.Errors, "; ")
+	if raw == "" {
+		raw = result.TerminalReason
 	}
-	if message == "" {
-		message = result.Subtype
+	if raw == "" {
+		raw = result.Subtype
 	}
-	return errors.New("Claude result failed: " + message)
+	message := mapClaudeAPIError(raw)
+	return errors.New(message)
+}
+
+// mapClaudeAPIError translates known Claude CLI error messages into
+// user-friendly Chinese text. Unknown messages pass through unchanged.
+func mapClaudeAPIError(raw string) string {
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "connection closed mid-response"):
+		return "与 API 的流式连接意外中断，当前回复可能不完整。请稍后重试。"
+	case strings.Contains(lower, "read tcp") && strings.Contains(lower, "connection reset"):
+		return "API 连接被重置，请检查网络后重试。"
+	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "deadline exceeded"):
+		return "API 请求超时，模型可能处理时间过长。请简化输入或稍后重试。"
+	case strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests"):
+		return "API 请求频率过高，请等待片刻后再试。"
+	case strings.Contains(lower, "internal server error") || strings.Contains(lower, "server error"):
+		return "API 服务暂时不可用，请稍后重试。"
+	case strings.Contains(lower, "authentication") || strings.Contains(lower, "unauthorized"):
+		return "API 认证失败，请检查 Claude Code 登录状态（运行 claude auth status）。"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
+		return "API 请求超时，网络可能不稳定。请稍后重试。"
+	case strings.Contains(lower, "insufficient") && strings.Contains(lower, "quota"):
+		return "API 用量配额不足，请检查账户余额。"
+	case strings.Contains(lower, "overloaded"):
+		return "API 服务当前负载过高，请稍后重试。"
+	default:
+		return "Claude 执行出错：" + raw
+	}
 }
 
 func startTurn(turn *claudeSessionTurn, initialized bool) {

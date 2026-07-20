@@ -39,14 +39,32 @@ type TimelineItem =
   | { kind: "message"; id: string; createdAt: string; message: Message }
   | { kind: "tool"; id: string; createdAt: string; action: ToolAction };
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...init?.headers },
-    ...init,
-  });
-  if (response.ok) return response.status === 204 ? undefined as T : response.json() as Promise<T>;
-  const body = await response.json().catch(() => null);
-  throw new Error(body?.error || `Request failed (${response.status})`);
+async function api<T>(path: string, init?: RequestInit, retries = 2): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...init?.headers },
+        ...init,
+      });
+      if (response.ok) return response.status === 204 ? undefined as T : response.json() as Promise<T>;
+      const body = await response.json().catch(() => null);
+      const message = body?.error || `Request failed (${response.status})`;
+      // Don't retry client errors (4xx) — they won't succeed on retry.
+      if (response.status >= 400 && response.status < 500) throw new Error(message);
+      lastError = new Error(message);
+      if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    } catch (cause: unknown) {
+      if (cause instanceof TypeError) {
+        // Network error (fetch failed to reach the server). Retry.
+        lastError = new Error("无法连接到服务，请检查服务是否在运行。");
+        if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+        continue;
+      }
+      throw cause;
+    }
+  }
+  throw lastError;
 }
 
 function asRecord(value: unknown): Record<string, any> {
@@ -315,7 +333,6 @@ function requiredShortcutVariables(template: string): ("selection" | "error")[] 
 }
 
 export function App() {
-  if (window.location.pathname === "/design-preview") return <DesignPreview />;
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectStatuses, setProjectStatuses] = useState<Record<string, ProjectStatus>>({});
   const [project, setProject] = useState<Project | null>(null);
@@ -341,6 +358,8 @@ export function App() {
   }, []);
 
   useEffect(() => { void loadProjects(); }, [loadProjects]);
+
+  if (window.location.pathname === "/design-preview") return <DesignPreview />;
 
   return <main className={project ? "app-shell project-open" : "app-shell"}>
     {error && <div className="error"><span>{error}</span><button title="关闭错误提示" onClick={() => setError("")}>x</button></div>}
@@ -543,6 +562,10 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
   useEffect(() => {
     if (!conversation) return undefined;
     let cancelled = false;
+    let socket: WebSocket;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempts = 0;
+
     const reload = async () => {
       try {
         const data = await api<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
@@ -554,24 +577,54 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
         setRun(data.activeRunId || ""); setHasMoreHistory(data.hasMore); setHistoryCursor(data.nextCursor || "");
       } catch (cause) { if (!cancelled) fail(cause instanceof Error ? cause.message : "Unable to refresh conversation"); }
     };
-    const socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/conversations/${conversation.id}`);
-    socket.onopen = () => { void reload(); };
-    socket.onmessage = (raw) => {
-      const event = JSON.parse(raw.data) as Event;
-      setEvents((old) => old.some((item) => item.id === event.id) ? old : [...old, event]);
-      if (event.type === "assistant") {
-        const content = asRecord(asRecord(event.payload).message).content || [];
-        const parentToolUseId = typeof asRecord(event.payload).parent_tool_use_id === "string" ? asRecord(event.payload).parent_tool_use_id : "";
-        for (const [index, part] of content.entries()) {
-          if (part?.type === "text" && typeof part.text === "string") setMessages((old) => mergeConversationItems(old, [{ id: websocketAssistantMessageID(event.id, index), runId: event.runId, role: "assistant", content: part.text, parentToolUseId, createdAt: event.createdAt }]));
+
+    const connect = () => {
+      if (cancelled) return;
+      reconnectAttempts++;
+      socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/conversations/${conversation.id}`);
+      socket.onopen = () => {
+        reconnectAttempts = 0;
+        void reload();
+      };
+      socket.onmessage = (raw) => {
+        const event = JSON.parse(raw.data) as Event;
+        setEvents((old) => old.some((item) => item.id === event.id) ? old : [...old, event]);
+        if (event.type === "assistant") {
+          const content = asRecord(asRecord(event.payload).message).content || [];
+          const parentToolUseId = typeof asRecord(event.payload).parent_tool_use_id === "string" ? asRecord(event.payload).parent_tool_use_id : "";
+          for (const [index, part] of content.entries()) {
+            if (part?.type === "text" && typeof part.text === "string") setMessages((old) => mergeConversationItems(old, [{ id: websocketAssistantMessageID(event.id, index), runId: event.runId, role: "assistant", content: part.text, parentToolUseId, createdAt: event.createdAt }]));
+          }
         }
-      }
-      if (event.type === "usage.updated" || event.type.startsWith("run.")) {
-        void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
-      }
-      if (event.type.startsWith("run.")) { rememberFinishedRun(event.runId); setRun((active) => active === event.runId ? "" : active); setStopping(false); }
+        if (event.type === "usage.updated" || event.type.startsWith("run.")) {
+          void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
+        }
+        if (event.type.startsWith("run.")) { rememberFinishedRun(event.runId); setRun((active) => active === event.runId ? "" : active); setStopping(false); }
+      };
+      socket.onerror = () => {
+        // The onclose handler will fire after this and handle reconnection.
+      };
+      socket.onclose = (event) => {
+        if (cancelled) return;
+        // Don't reconnect on normal closure (code 1000) or when the component
+        // is unmounting. Also stop after too many failed attempts.
+        const maxAttempts = 12;
+        if (reconnectAttempts >= maxAttempts) {
+          fail("实时连接已断开，请刷新页面重新建立连接。");
+          return;
+        }
+        const delay = Math.min(500 * Math.pow(2, reconnectAttempts - 1), 15_000);
+        reconnectTimer = setTimeout(connect, delay);
+      };
     };
-    return () => { cancelled = true; socket.close(); };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      socket.close();
+    };
   }, [conversation?.id, fail, refreshUsage]);
 
   useEffect(() => {
