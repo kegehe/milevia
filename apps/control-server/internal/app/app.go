@@ -3,14 +3,15 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -62,26 +63,29 @@ func ConfigFromEnv() Config {
 }
 
 type Server struct {
-	db          *sql.DB
-	config      Config
-	runner      AgentRunner
-	runtimeCtx  context.Context
-	runtimeStop context.CancelFunc
-	runWG       sync.WaitGroup
-	closeOnce   sync.Once
-	upgrader    websocket.Upgrader
-	mu          sync.Mutex
-	closing     bool
-	subscribers map[string]map[*websocket.Conn]*subscriber
-	cancels     map[string]context.CancelFunc
-	runTokens   map[string]string
-	runContexts map[string]string
-	sessions    map[string]*activeAgentSession
-	sessionMu   sync.Mutex
-	streamMu    sync.Mutex
-	approvals   map[string]*approvalWaiter
-	usageMu     sync.Mutex
-	runUsage    map[string]*runUsageAccumulator
+	db                     *sql.DB
+	config                 Config
+	runner                 AgentRunner
+	runtimeCtx             context.Context
+	runtimeStop            context.CancelFunc
+	runWG                  sync.WaitGroup
+	closeOnce              sync.Once
+	upgrader               websocket.Upgrader
+	mu                     sync.Mutex
+	closing                bool
+	subscribers            map[string]map[*websocket.Conn]*subscriber
+	cancels                map[string]context.CancelFunc
+	runTokens              map[string]string
+	runContexts            map[string]string
+	projectWorkspaceLeases map[string]*projectWorkspaceLease
+	runWorkspaceReleases   map[string]func()
+	gitStateTokens         map[string]gitStateToken
+	sessions               map[string]*activeAgentSession
+	sessionMu              sync.Mutex
+	streamMu               sync.Mutex
+	approvals              map[string]*approvalWaiter
+	usageMu                sync.Mutex
+	runUsage               map[string]*runUsageAccumulator
 }
 
 type subscriber struct {
@@ -100,6 +104,11 @@ type activeAgentSession struct {
 	approvalToken string
 	activeRunID   string
 	stopping      bool
+}
+
+type projectWorkspaceLease struct {
+	owner   string
+	holders int
 }
 
 type Project struct {
@@ -128,11 +137,13 @@ type Conversation struct {
 }
 
 type Message struct {
-	ID             string    `json:"id"`
-	ConversationID string    `json:"conversationId"`
-	Role           string    `json:"role"`
-	Content        string    `json:"content"`
-	CreatedAt      time.Time `json:"createdAt"`
+	ID              string    `json:"id"`
+	ConversationID  string    `json:"conversationId"`
+	RunID           string    `json:"runId,omitempty"`
+	Role            string    `json:"role"`
+	Content         string    `json:"content"`
+	ParentToolUseID string    `json:"parentToolUseId,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
 }
 
 type Shortcut struct {
@@ -164,6 +175,11 @@ type ShortcutRun struct {
 	CompletedAt     *time.Time `json:"completedAt,omitempty"`
 }
 
+type runStartRecord struct {
+	Shortcut *ShortcutRun
+	Task     *TaskRun
+}
+
 type Event struct {
 	ID             string          `json:"id"`
 	ConversationID string          `json:"conversationId"`
@@ -171,6 +187,50 @@ type Event struct {
 	Type           string          `json:"type"`
 	Payload        json.RawMessage `json:"payload"`
 	CreatedAt      time.Time       `json:"createdAt"`
+}
+
+// conversationPageCursor keeps independent positions for the two persisted
+// streams. A timestamp alone is not enough because SQLite permits multiple
+// records with the same created_at value.
+type conversationPageCursor struct {
+	Message *conversationPagePosition `json:"message,omitempty"`
+	Event   *conversationPagePosition `json:"event,omitempty"`
+}
+
+type conversationPagePosition struct {
+	CreatedAt time.Time `json:"createdAt"`
+	ID        string    `json:"id"`
+}
+
+func decodeConversationPageCursor(raw string) (conversationPageCursor, error) {
+	if raw == "" {
+		return conversationPageCursor{}, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return conversationPageCursor{}, errors.New("cursor is invalid")
+	}
+	var cursor conversationPageCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil {
+		return conversationPageCursor{}, errors.New("cursor is invalid")
+	}
+	for _, position := range []*conversationPagePosition{cursor.Message, cursor.Event} {
+		if position != nil && (position.ID == "" || position.CreatedAt.IsZero()) {
+			return conversationPageCursor{}, errors.New("cursor is invalid")
+		}
+	}
+	return cursor, nil
+}
+
+func encodeConversationPageCursor(cursor conversationPageCursor) string {
+	if cursor.Message == nil && cursor.Event == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(cursor)
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 func New(ctx context.Context, config Config) (*Server, error) {
@@ -206,7 +266,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		runner = newClaudeCLIRunner(config)
 	}
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, runner: runner, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}}
+	s := &Server{db: pool, config: config, runner: runner, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return isLocalWebOrigin(r.Header.Get("Origin")) }
 	if err := s.migrate(ctx); err != nil {
 		runtimeStop()
@@ -214,6 +274,11 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		return nil, err
 	}
 	if err := s.recoverInterruptedRuns(ctx); err != nil {
+		runtimeStop()
+		pool.Close()
+		return nil, err
+	}
+	if err := s.recoverGitOperations(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
 		return nil, err
@@ -267,6 +332,28 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/validate", s.validateProject)
 	r.Get("/api/projects", s.listProjects)
 	r.Post("/api/projects", s.createProject)
+	r.Get("/api/projects/{projectID}/git/summary", s.gitSummary)
+	r.Get("/api/projects/{projectID}/git/changes", s.gitChanges)
+	r.Get("/api/projects/{projectID}/git/diff", s.gitDiff)
+	r.Get("/api/projects/{projectID}/git/log", s.gitLog)
+	r.Get("/api/projects/{projectID}/git/branches", s.gitBranches)
+	r.Get("/api/projects/{projectID}/git/operations", s.gitOperations)
+	r.Post("/api/projects/{projectID}/git/stage", s.gitStage)
+	r.Post("/api/projects/{projectID}/git/unstage", s.gitUnstage)
+	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
+	r.Post("/api/projects/{projectID}/tasks", s.createTask)
+	r.Get("/api/tasks/{taskID}", s.getTask)
+	r.Patch("/api/tasks/{taskID}", s.updateTask)
+	r.Post("/api/tasks/{taskID}/dependencies", s.addTaskDependency)
+	r.Put("/api/tasks/{taskID}/dependencies", s.replaceTaskDependencies)
+	r.Delete("/api/tasks/{taskID}/dependencies/{predecessorTaskID}", s.deleteTaskDependency)
+	r.Get("/api/tasks/{taskID}/runs", s.listTaskRuns)
+	r.Get("/api/tasks/{taskID}/events", s.listTaskEvents)
+	r.Post("/api/tasks/{taskID}/dispatch", s.dispatchTask)
+	r.Post("/api/tasks/{taskID}/review", s.reviewTask)
+	r.Post("/api/tasks/{taskID}/reopen", s.reopenTask)
+	r.Post("/api/tasks/{taskID}/cancel", s.cancelTask)
+	r.Post("/api/tasks/{taskID}/stop", s.stopTask)
 	r.Get("/api/projects/{projectID}/conversations", s.listConversations)
 	r.Post("/api/projects/{projectID}/conversations", s.createConversation)
 	r.Get("/api/projects/{projectID}/shortcuts", s.listShortcuts)
@@ -317,7 +404,7 @@ func isLocalWebOrigin(origin string) bool {
 func (s *Server) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `create table if not exists projects (id text primary key, name text not null, path text not null unique, runner text not null, git_branch text not null, claude_ready integer not null, created_at datetime not null);
 create table if not exists conversations (id text primary key, project_id text not null references projects(id) on delete cascade, claude_session_id text not null unique, status text not null, permission_mode text not null default 'approval_required', title text not null default '新会话', last_activity_at datetime not null default current_timestamp, claude_initialized integer not null default 0, is_current integer not null default 1, created_at datetime not null);
-create table if not exists messages (id text primary key, conversation_id text not null references conversations(id) on delete cascade, role text not null, content text not null, created_at datetime not null);
+	create table if not exists messages (id text primary key, conversation_id text not null references conversations(id) on delete cascade, run_id text not null default '', role text not null, content text not null, parent_tool_use_id text not null default '', created_at datetime not null);
 create table if not exists runs (id text primary key, conversation_id text not null references conversations(id) on delete cascade, status text not null, created_at datetime not null, completed_at datetime);
 create table if not exists events (id text primary key, conversation_id text not null references conversations(id) on delete cascade, run_id text not null references runs(id) on delete cascade, type text not null, payload text not null, created_at datetime not null);
 create table if not exists run_usage (run_id text primary key references runs(id) on delete cascade, conversation_id text not null references conversations(id) on delete cascade, model text not null default '', context_window integer not null default 0, context_input_tokens integer not null default 0, input_tokens integer not null default 0, output_tokens integer not null default 0, cache_read_tokens integer not null default 0, cache_creation_tokens integer not null default 0, estimated_cost_usd real not null default 0, agent_turns integer not null default 0, model_steps integer not null default 0, tool_calls integer not null default 0, subagent_count integer not null default 0, duration_ms integer not null default 0, ttft_ms integer not null default 0, terminal_reason text not null default '', has_result integer not null default 0, completed_at datetime not null);
@@ -327,9 +414,10 @@ create table if not exists shortcut_projects (shortcut_id text not null referenc
 create table if not exists shortcut_runs (id text primary key, shortcut_id text references shortcuts(id) on delete set null, conversation_id text not null references conversations(id) on delete cascade, run_id text unique references runs(id) on delete set null, rendered_content text not null, action text not null, status text not null, created_at datetime not null, completed_at datetime);
 create table if not exists shortcut_audit_events (id text primary key, shortcut_id text references shortcuts(id) on delete set null, action text not null, payload text not null default '{}', created_at datetime not null);
 create table if not exists app_metadata (key text primary key, value text not null);
-create unique index if not exists conversations_one_current_per_project on conversations(project_id) where is_current=1;
-create index if not exists messages_conversation_created on messages(conversation_id,created_at desc);
-create index if not exists run_usage_conversation_completed on run_usage(conversation_id,completed_at desc);`)
+	create unique index if not exists conversations_one_current_per_project on conversations(project_id) where is_current=1;
+	create index if not exists messages_conversation_created on messages(conversation_id,created_at desc);
+	create index if not exists events_conversation_created on events(conversation_id,created_at desc);
+	create index if not exists run_usage_conversation_completed on run_usage(conversation_id,completed_at desc);`)
 	if err != nil {
 		return fmt.Errorf("migrate database: %w", err)
 	}
@@ -376,6 +464,44 @@ create index if not exists run_usage_conversation_completed on run_usage(convers
 			return fmt.Errorf("add conversation last activity: %w", err)
 		}
 	}
+	rows.Close()
+	messageColumns, err := s.db.QueryContext(ctx, `pragma table_info(messages)`)
+	if err != nil {
+		return fmt.Errorf("inspect messages schema: %w", err)
+	}
+	hasMessageParent, hasMessageRun := false, false
+	for messageColumns.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := messageColumns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			messageColumns.Close()
+			return fmt.Errorf("read messages schema: %w", err)
+		}
+		if name == "parent_tool_use_id" {
+			hasMessageParent = true
+		}
+		if name == "run_id" {
+			hasMessageRun = true
+		}
+	}
+	if err := messageColumns.Err(); err != nil {
+		messageColumns.Close()
+		return fmt.Errorf("iterate messages schema: %w", err)
+	}
+	messageColumns.Close()
+	if !hasMessageParent {
+		if _, err := s.db.ExecContext(ctx, `alter table messages add column parent_tool_use_id text not null default ''`); err != nil {
+			return fmt.Errorf("add message parent tool use id: %w", err)
+		}
+	}
+	if !hasMessageRun {
+		if _, err := s.db.ExecContext(ctx, `alter table messages add column run_id text not null default ''`); err != nil {
+			return fmt.Errorf("add message run id: %w", err)
+		}
+	}
 	if _, err := s.db.ExecContext(ctx, `update conversations set last_activity_at=coalesce(last_activity_at,(select max(created_at) from messages where messages.conversation_id=conversations.id),created_at)`); err != nil {
 		return fmt.Errorf("backfill conversation activity: %w", err)
 	}
@@ -388,10 +514,14 @@ create index if not exists run_usage_conversation_completed on run_usage(convers
 	if _, err := s.db.ExecContext(ctx, `create index if not exists shortcuts_visible on shortcuts(scope,enabled,pinned,sort_order);
 create index if not exists shortcut_projects_project on shortcut_projects(project_id);
 create index if not exists shortcut_runs_conversation on shortcut_runs(conversation_id,created_at desc);
-create index if not exists shortcut_audit_events_shortcut on shortcut_audit_events(shortcut_id,created_at desc);`); err != nil {
+create index if not exists shortcut_audit_events_shortcut on shortcut_audit_events(shortcut_id,created_at desc);
+create index if not exists messages_conversation_primary_created on messages(conversation_id,parent_tool_use_id,created_at desc);`); err != nil {
 		return fmt.Errorf("create shortcut indexes: %w", err)
 	}
-	return nil
+	if err := s.migrateTasks(ctx); err != nil {
+		return err
+	}
+	return s.migrateGit(ctx)
 }
 
 func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
@@ -424,6 +554,11 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 	if len(runs) > 0 {
 		if _, err := tx.ExecContext(ctx, `update shortcut_runs set status='interrupted',completed_at=? where status in ('accepted','queued','running') and run_id in (select id from runs where status in ('queued','running'))`, now); err != nil {
 			return fmt.Errorf("mark interrupted shortcut runs: %w", err)
+		}
+		for _, run := range runs {
+			if err := s.finishTaskRunTx(ctx, tx, run.id, "interrupted", "service restarted before the task run completed", now); err != nil {
+				return fmt.Errorf("mark interrupted task run: %w", err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `update runs set status='interrupted',completed_at=? where status in ('queued','running')`, now); err != nil {
 			return fmt.Errorf("mark interrupted runs: %w", err)
@@ -493,7 +628,7 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("directory does not exist or is not accessible"))
 		return
 	}
-	branch, gitReady := gitBranch(path)
+	branch, gitReady := gitBranch(r.Context(), path)
 	claudeReady := s.runner.Ready(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"path": path, "name": filepath.Base(path), "gitReady": gitReady, "gitBranch": branch, "claudeReady": claudeReady})
 }
@@ -511,7 +646,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	branch, gitReady := gitBranch(path)
+	branch, gitReady := gitBranch(r.Context(), path)
 	if !s.runner.Ready(r.Context()) {
 		writeError(w, http.StatusBadRequest, errors.New("Claude Code is not available in this Runner"))
 		return
@@ -633,7 +768,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	rows, err := s.db.QueryContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id order by m.created_at desc limit 1),'') from conversations c where c.project_id=$1 and ($2='' or lower(c.title) like '%' || lower($2) || '%') order by c.is_current desc,c.last_activity_at desc limit 100`, chi.URLParam(r, "projectID"), query)
+	rows, err := s.db.QueryContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),'') from conversations c where c.project_id=$1 and ($2='' or lower(c.title) like '%' || lower($2) || '%') order by c.is_current desc,c.last_activity_at desc limit 100`, chi.URLParam(r, "projectID"), query)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -658,13 +793,35 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "conversationID")
+	limit := 400
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed < 1 || parsed > 1000 {
+			writeError(w, http.StatusBadRequest, errors.New("limit must be between 1 and 1000"))
+			return
+		}
+		limit = parsed
+	}
+	cursor, err := decodeConversationPageCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	var c Conversation
-	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.IsCurrent, &c.CreatedAt)
+	err = s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.IsCurrent, &c.CreatedAt)
 	if err != nil {
 		writeError(w, 404, errors.New("conversation not found"))
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select id,conversation_id,role,content,created_at from messages where conversation_id=$1 order by created_at`, id)
+	messageQuery := `select id,conversation_id,run_id,role,content,parent_tool_use_id,created_at from messages where conversation_id=?`
+	messageArgs := []any{id}
+	if cursor.Message != nil {
+		messageQuery += ` and (created_at < ? or (created_at = ? and id < ?))`
+		messageArgs = append(messageArgs, cursor.Message.CreatedAt, cursor.Message.CreatedAt, cursor.Message.ID)
+	}
+	messageQuery += ` order by created_at desc,id desc limit ?`
+	messageArgs = append(messageArgs, limit+1)
+	rows, err := s.db.QueryContext(r.Context(), messageQuery, messageArgs...)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -673,7 +830,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	messages := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.RunID, &m.Role, &m.Content, &m.ParentToolUseID, &m.CreatedAt); err != nil {
 			writeError(w, 500, err)
 			return
 		}
@@ -683,7 +840,22 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	erows, err := s.db.QueryContext(r.Context(), `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=$1 order by created_at`, id)
+	hasMoreMessages := len(messages) > limit
+	if hasMoreMessages {
+		messages = messages[:limit]
+	}
+	for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
+		messages[left], messages[right] = messages[right], messages[left]
+	}
+	eventQuery := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=?`
+	eventArgs := []any{id}
+	if cursor.Event != nil {
+		eventQuery += ` and (created_at < ? or (created_at = ? and id < ?))`
+		eventArgs = append(eventArgs, cursor.Event.CreatedAt, cursor.Event.CreatedAt, cursor.Event.ID)
+	}
+	eventQuery += ` order by created_at desc,id desc limit ?`
+	eventArgs = append(eventArgs, limit+1)
+	erows, err := s.db.QueryContext(r.Context(), eventQuery, eventArgs...)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -692,15 +864,33 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	events := []Event{}
 	for erows.Next() {
 		var e Event
-		if err := erows.Scan(&e.ID, &e.ConversationID, &e.RunID, &e.Type, &e.Payload, &e.CreatedAt); err != nil {
+		var payload string
+		if err := erows.Scan(&e.ID, &e.ConversationID, &e.RunID, &e.Type, &payload, &e.CreatedAt); err != nil {
 			writeError(w, 500, err)
 			return
 		}
+		e.Payload = json.RawMessage(payload)
 		events = append(events, e)
 	}
 	if err := erows.Err(); err != nil {
 		writeError(w, 500, err)
 		return
+	}
+	hasMoreEvents := len(events) > limit
+	if hasMoreEvents {
+		events = events[:limit]
+	}
+	for left, right := 0, len(events)-1; left < right; left, right = left+1, right-1 {
+		events[left], events[right] = events[right], events[left]
+	}
+	nextCursor := conversationPageCursor{}
+	if len(messages) > 0 {
+		oldest := messages[0]
+		nextCursor.Message = &conversationPagePosition{CreatedAt: oldest.CreatedAt, ID: oldest.ID}
+	}
+	if len(events) > 0 {
+		oldest := events[0]
+		nextCursor.Event = &conversationPagePosition{CreatedAt: oldest.CreatedAt, ID: oldest.ID}
 	}
 	var activeRunID *string
 	if c.Status == "running" {
@@ -712,7 +902,11 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 			activeRunID = &runID
 		}
 	}
-	writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": events})
+	hasMore := hasMoreMessages || hasMoreEvents
+	if !hasMore {
+		nextCursor = conversationPageCursor{}
+	}
+	writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": events, "hasMore": hasMore, "nextCursor": encodeConversationPageCursor(nextCursor)})
 }
 
 func (s *Server) listInputHistory(w http.ResponseWriter, r *http.Request) {
@@ -989,9 +1183,9 @@ func (s *Server) seedDefaultShortcuts(w http.ResponseWriter, r *http.Request) {
 		{"了解项目", "prompt", "请快速了解当前项目的目录结构、技术栈和关键入口，简洁总结。", "常用提示词", "run"},
 		{"检查状态", "prompt", "请检查当前项目的 Git 状态、未完成工作和明显风险，简洁总结。", "常用提示词", "run"},
 		{"审查改动", "prompt", "请审查当前项目尚未提交的改动，指出风险、测试缺口和建议。", "常用提示词", "run"},
-		{"清屏", "command_request", "clear", "常用命令", "confirm"},
-		{"Git 状态", "command_request", "git status", "常用命令", "confirm"},
-		{"当前目录", "command_request", "pwd", "常用命令", "confirm"},
+		{"清屏", "command_request", "/clear", "常用命令", "confirm"},
+		{"压缩上下文", "command_request", "/compact", "常用命令", "confirm"},
+		{"代码审查", "command_request", "/review", "常用命令", "confirm"},
 	}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1203,7 +1397,11 @@ func renderShortcut(shortcut Shortcut, conversation Conversation, project Projec
 		return "", errors.New("rendered shortcut is invalid")
 	}
 	if shortcut.Kind == "command_request" {
-		rendered = "请在当前项目中执行以下命令：\n`" + rendered + "`\n\n遵循当前权限模式；完成后总结结果。"
+		if strings.HasPrefix(rendered, "/") {
+			rendered = "请在当前 Claude Code 会话中执行以下斜杠命令：\n`" + rendered + "`\n\n遵循当前权限模式；完成后总结结果。"
+		} else {
+			rendered = "请在当前项目中执行以下命令：\n`" + rendered + "`\n\n遵循当前权限模式；完成后总结结果。"
+		}
 	}
 	return rendered, nil
 }
@@ -1314,18 +1512,32 @@ func (s *Server) runShortcut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	shortcutRun := &ShortcutRun{ID: uuid.NewString(), ShortcutID: shortcut.ID, ConversationID: conversationID, RenderedContent: content, Action: input.Action, Status: "accepted", CreatedAt: time.Now().UTC()}
-	m, runID, execution, status, err := s.startMessage(r.Context(), conversationID, content, shortcutRun)
+	m, runID, execution, status, err := s.startMessage(r.Context(), conversationID, content, &runStartRecord{Shortcut: shortcutRun})
 	if err != nil {
 		writeError(w, status, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": m, "runId": runID, "shortcutRun": execution})
+	writeJSON(w, http.StatusAccepted, map[string]any{"message": m, "runId": runID, "shortcutRun": execution.Shortcut})
 }
 
-func (s *Server) startMessage(ctx context.Context, conversationID, content string, shortcutRun *ShortcutRun) (Message, string, *ShortcutRun, int, error) {
+func (s *Server) startMessage(ctx context.Context, conversationID, content string, record *runStartRecord) (Message, string, *runStartRecord, int, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return Message{}, "", nil, http.StatusBadRequest, errors.New("message is required")
+	}
+	streamingRunner, streaming := s.runner.(StreamingAgentRunner)
+	if streaming {
+		// Keep database admission and the ordered session write together with a
+		// session stop. Otherwise a run can enter the CLI queue after stop has
+		// verified isolation and be terminated as collateral damage.
+		s.streamMu.Lock()
+		defer s.streamMu.Unlock()
+		s.mu.Lock()
+		stopping := s.sessions[conversationID] != nil && s.sessions[conversationID].stopping
+		s.mu.Unlock()
+		if stopping {
+			return Message{}, "", nil, http.StatusConflict, errors.New("conversation is stopping")
+		}
 	}
 	s.mu.Lock()
 	closing := s.closing
@@ -1333,8 +1545,8 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if closing {
 		return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("control service is shutting down")
 	}
-	m := Message{ID: uuid.NewString(), ConversationID: conversationID, Role: "user", Content: content, CreatedAt: time.Now().UTC()}
 	runID := uuid.NewString()
+	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, CreatedAt: time.Now().UTC()}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
@@ -1349,9 +1561,27 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
 	}
-	streamingRunner, streaming := s.runner.(StreamingAgentRunner)
 	if conversation.Status != "idle" && !streaming {
 		return Message{}, "", nil, http.StatusConflict, errors.New("conversation already has a running Claude turn")
+	}
+	workspaceOwner := "run:" + runID
+	if streaming {
+		workspaceOwner = "conversation:" + conversation.ID
+	}
+	releaseWorkspace, acquired := s.acquireProjectWorkspace(conversation.ProjectID, workspaceOwner)
+	if !acquired {
+		return Message{}, "", nil, http.StatusConflict, errors.New("project workspace is occupied by another run or Git operation")
+	}
+	workspaceAdmitted := false
+	defer func() {
+		if !workspaceAdmitted {
+			releaseWorkspace()
+		}
+	}()
+	if record != nil && record.Task != nil {
+		if err := s.validateTaskDispatchTx(ctx, tx, *record.Task, conversation); err != nil {
+			return Message{}, "", nil, http.StatusConflict, err
+		}
 	}
 	if conversation.Title == "" || conversation.Title == "新会话" {
 		conversation.Title = conversationTitle(content)
@@ -1366,7 +1596,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		}
 	}
 	if err == nil {
-		_, err = tx.ExecContext(ctx, `insert into messages (id,conversation_id,role,content,created_at) values ($1,$2,$3,$4,$5)`, m.ID, m.ConversationID, m.Role, m.Content, m.CreatedAt)
+		_, err = tx.ExecContext(ctx, `insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, m.ID, m.ConversationID, m.RunID, m.Role, m.Content, m.ParentToolUseID, m.CreatedAt)
 	}
 	if err == nil {
 		status := "running"
@@ -1375,9 +1605,30 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		}
 		_, err = tx.ExecContext(ctx, `insert into runs (id,conversation_id,status,created_at) values ($1,$2,$3,$4)`, runID, conversationID, status, m.CreatedAt)
 	}
-	if err == nil && shortcutRun != nil {
-		shortcutRun.RunID = runID
-		_, err = tx.ExecContext(ctx, `insert into shortcut_runs (id,shortcut_id,conversation_id,run_id,rendered_content,action,status,created_at) values (?,?,?,?,?,?,?,?)`, shortcutRun.ID, shortcutRun.ShortcutID, shortcutRun.ConversationID, shortcutRun.RunID, shortcutRun.RenderedContent, shortcutRun.Action, shortcutRun.Status, shortcutRun.CreatedAt)
+	if err == nil && record != nil && record.Shortcut != nil {
+		record.Shortcut.RunID = runID
+		_, err = tx.ExecContext(ctx, `insert into shortcut_runs (id,shortcut_id,conversation_id,run_id,rendered_content,action,status,created_at) values (?,?,?,?,?,?,?,?)`, record.Shortcut.ID, record.Shortcut.ShortcutID, record.Shortcut.ConversationID, record.Shortcut.RunID, record.Shortcut.RenderedContent, record.Shortcut.Action, record.Shortcut.Status, record.Shortcut.CreatedAt)
+	}
+	if err == nil && record != nil && record.Task != nil {
+		if streaming {
+			record.Task.Status = "queued"
+		} else {
+			record.Task.Status = "running"
+			record.Task.StartedAt = &m.CreatedAt
+		}
+		record.Task.RunID = runID
+		var sequence int
+		err = tx.QueryRowContext(ctx, `select coalesce(max(sequence),0)+1 from task_runs where task_id=?`, record.Task.TaskID).Scan(&sequence)
+		if err == nil {
+			record.Task.Sequence = sequence
+			_, err = tx.ExecContext(ctx, `insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at) values (?,?,?,?,?,?,?,?,?,?,?)`, record.Task.ID, record.Task.TaskID, record.Task.ConversationID, record.Task.RunID, record.Task.Sequence, record.Task.Status, record.Task.PromptSnapshot, record.Task.AcceptanceSnapshot, record.Task.FailureReason, record.Task.CreatedAt, record.Task.StartedAt)
+		}
+		if err == nil {
+			_, err = tx.ExecContext(ctx, `update tasks set status=?,last_task_run_id=?,updated_at=? where id=? and status in ('todo','action_required','awaiting_review')`, taskRunning, record.Task.ID, m.CreatedAt, record.Task.TaskID)
+		}
+		if err == nil {
+			err = recordTaskEventTx(ctx, tx, record.Task.TaskID, record.Task.ID, "task.dispatched", map[string]string{"runId": runID, "status": record.Task.Status}, m.CreatedAt)
+		}
 	}
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
@@ -1385,9 +1636,11 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if err = tx.Commit(); err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
 	}
+	s.registerRunWorkspace(runID, releaseWorkspace)
+	workspaceAdmitted = true
 	if streaming {
 		s.submitStreamingRun(streamingRunner, runID, conversation, projectPath, content)
-		return m, runID, shortcutRun, http.StatusAccepted, nil
+		return m, runID, record, http.StatusAccepted, nil
 	}
 	runCtx, cancel := context.WithCancel(s.runtimeCtx)
 	runToken := uuid.NewString()
@@ -1405,7 +1658,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	s.mu.Unlock()
 	s.beginRunUsage(runID, conversation.ID)
 	go func() { defer s.runWG.Done(); s.runClaude(runCtx, runID, runToken, conversation, projectPath, content) }()
-	return m, runID, shortcutRun, http.StatusAccepted, nil
+	return m, runID, record, http.StatusAccepted, nil
 }
 
 func boolToInt(value bool) int {
@@ -1415,11 +1668,56 @@ func boolToInt(value bool) int {
 	return 0
 }
 
+func (s *Server) acquireProjectWorkspace(projectID, owner string) (func(), bool) {
+	s.mu.Lock()
+	lease := s.projectWorkspaceLeases[projectID]
+	if lease != nil && lease.owner != owner {
+		s.mu.Unlock()
+		return nil, false
+	}
+	if lease == nil {
+		lease = &projectWorkspaceLease{owner: owner}
+		s.projectWorkspaceLeases[projectID] = lease
+	}
+	lease.holders++
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			current := s.projectWorkspaceLeases[projectID]
+			if current == nil || current.owner != owner {
+				return
+			}
+			current.holders--
+			if current.holders == 0 {
+				delete(s.projectWorkspaceLeases, projectID)
+			}
+		})
+	}, true
+}
+
+func (s *Server) registerRunWorkspace(runID string, release func()) {
+	s.mu.Lock()
+	s.runWorkspaceReleases[runID] = release
+	s.mu.Unlock()
+}
+
+func (s *Server) releaseRunWorkspace(runID string) {
+	s.mu.Lock()
+	release := s.runWorkspaceReleases[runID]
+	delete(s.runWorkspaceReleases, runID)
+	s.mu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
 func (s *Server) submitStreamingRun(runner StreamingAgentRunner, runID string, conversation Conversation, projectPath, prompt string) {
-	// A CLI stdin is an ordered transport. Keep session lookup and the write in
-	// one critical section so rapid submissions cannot be reordered.
-	s.streamMu.Lock()
-	defer s.streamMu.Unlock()
+	// startMessage holds streamMu across admission and this ordered transport
+	// write, so a stop cannot interleave with either operation.
 	session, err := s.streamingSession(runner, conversation, projectPath)
 	if err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
@@ -1436,6 +1734,10 @@ func (s *Server) streamingSession(runner StreamingAgentRunner, conversation Conv
 	defer s.sessionMu.Unlock()
 	s.mu.Lock()
 	if session := s.sessions[conversation.ID]; session != nil {
+		if session.stopping {
+			s.mu.Unlock()
+			return nil, errors.New("conversation is stopping")
+		}
 		s.mu.Unlock()
 		return session.agent, nil
 	}
@@ -1512,10 +1814,16 @@ func (sink *claudeRunSink) Event(eventType string, payload json.RawMessage) {
 	sink.server.collectUsageEvent(sink.runID, sink.conversationID, eventType, payload)
 }
 
-func (sink *claudeRunSink) AssistantText(content string) {
-	m := Message{ID: uuid.NewString(), ConversationID: sink.conversationID, Role: "assistant", Content: content, CreatedAt: time.Now().UTC()}
-	_, _ = sink.server.db.ExecContext(context.Background(), `insert into messages (id,conversation_id,role,content,created_at) values ($1,$2,$3,$4,$5)`, m.ID, m.ConversationID, m.Role, m.Content, m.CreatedAt)
-	_, _ = sink.server.db.ExecContext(context.Background(), `update conversations set last_activity_at=? where id=?`, m.CreatedAt, sink.conversationID)
+func (sink *claudeRunSink) AssistantText(content, parentToolUseID string) {
+	m := Message{ID: uuid.NewString(), ConversationID: sink.conversationID, RunID: sink.runID, Role: "assistant", Content: content, ParentToolUseID: parentToolUseID, CreatedAt: time.Now().UTC()}
+	if _, err := sink.server.db.ExecContext(context.Background(), `insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, m.ID, m.ConversationID, m.RunID, m.Role, m.Content, m.ParentToolUseID, m.CreatedAt); err != nil {
+		log.Printf("persist assistant message for run %s: %v", sink.runID, err)
+		sink.server.appendEvent(sink.runID, sink.conversationID, "stream.error", mustJSON(map[string]string{"error": "无法保存助手输出，刷新后该段内容可能不可用。"}))
+		return
+	}
+	if _, err := sink.server.db.ExecContext(context.Background(), `update conversations set last_activity_at=? where id=?`, m.CreatedAt, sink.conversationID); err != nil {
+		log.Printf("update conversation activity for run %s: %v", sink.runID, err)
+	}
 }
 
 func (sink *claudeRunSink) SessionInitialized() {
@@ -1528,6 +1836,7 @@ func (sink *claudeRunSink) TurnStarted() {
 	}
 	sink.server.beginRunUsage(sink.runID, sink.conversationID)
 	_, _ = sink.server.db.ExecContext(context.Background(), `update runs set status='running' where id=? and status='queued'`, sink.runID)
+	_, _ = sink.server.db.ExecContext(context.Background(), `update task_runs set status='running',started_at=? where run_id=? and status='queued'`, time.Now().UTC(), sink.runID)
 	sink.server.mu.Lock()
 	sink.server.runContexts[sink.runID] = sink.conversationID
 	if session := sink.server.sessions[sink.conversationID]; session != nil {
@@ -1576,6 +1885,13 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 			_, err = tx.ExecContext(context.Background(), `update shortcut_runs set status=?,completed_at=? where run_id=?`, status, time.Now().UTC(), runID)
 		}
 		if err == nil {
+			failureReason := ""
+			if runErr != nil {
+				failureReason = runErr.Error()
+			}
+			err = s.finishTaskRunTx(context.Background(), tx, runID, status, failureReason, time.Now().UTC())
+		}
+		if err == nil {
 			err = tx.Commit()
 		}
 		if err != nil {
@@ -1584,56 +1900,97 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 	}
 	payload, _ := json.Marshal(map[string]string{"status": status, "error": errorText(runErr)})
 	s.appendEvent(runID, conversationID, "run."+status, payload)
+	s.releaseRunWorkspace(runID)
 }
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "runID")
+	status, code, err := s.stopRunByID(r.Context(), id)
+	if err != nil {
+		writeError(w, code, err)
+		return
+	}
+	writeJSON(w, code, map[string]string{"status": status})
+}
+
+func (s *Server) stopRunByID(ctx context.Context, id string) (string, int, error) {
 	s.mu.Lock()
 	cancel, ok := s.cancels[id]
 	conversationID := s.runContexts[id]
 	session := s.sessions[conversationID]
-	if session != nil {
-		session.stopping = true
-	}
 	s.mu.Unlock()
 	if session != nil {
-		session.agent.Stop()
-		s.resolveRunApprovals(id, "deny")
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopping"})
-		return
-	}
-	if !ok {
-		var status, queuedConversationID string
-		err := s.db.QueryRowContext(r.Context(), `select status,conversation_id from runs where id=?`, id).Scan(&status, &queuedConversationID)
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, errors.New("run not found"))
-			return
+		s.streamMu.Lock()
+		defer s.streamMu.Unlock()
+		s.mu.Lock()
+		session = s.sessions[conversationID]
+		s.mu.Unlock()
+		if session == nil {
+			return "", http.StatusConflict, errors.New("streaming session is no longer active")
 		}
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		if err := s.ensureStreamingStopIsIsolated(ctx, conversationID, id); err != nil {
+			return "", http.StatusConflict, err
 		}
 		s.mu.Lock()
-		session = s.sessions[queuedConversationID]
-		if session != nil {
+		if s.sessions[conversationID] == session {
 			session.stopping = true
 		}
 		s.mu.Unlock()
+		session.agent.Stop()
+		s.resolveRunApprovals(id, "deny")
+		return "stopping", http.StatusAccepted, nil
+	}
+	if !ok {
+		var status, queuedConversationID string
+		err := s.db.QueryRowContext(ctx, `select status,conversation_id from runs where id=?`, id).Scan(&status, &queuedConversationID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", http.StatusNotFound, errors.New("run not found")
+		}
+		if err != nil {
+			return "", http.StatusInternalServerError, err
+		}
+		s.mu.Lock()
+		session = s.sessions[queuedConversationID]
+		s.mu.Unlock()
 		if session != nil {
+			s.streamMu.Lock()
+			defer s.streamMu.Unlock()
+			s.mu.Lock()
+			session = s.sessions[queuedConversationID]
+			s.mu.Unlock()
+			if session == nil {
+				return "", http.StatusConflict, errors.New("streaming session is no longer active")
+			}
+			if err := s.ensureStreamingStopIsIsolated(ctx, queuedConversationID, id); err != nil {
+				return "", http.StatusConflict, err
+			}
+			s.mu.Lock()
+			if s.sessions[queuedConversationID] == session {
+				session.stopping = true
+			}
+			s.mu.Unlock()
 			session.agent.Stop()
 			s.resolveRunApprovals(id, "deny")
-			writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopping"})
-			return
+			return "stopping", http.StatusAccepted, nil
 		}
 		if status != "running" {
-			writeJSON(w, http.StatusOK, map[string]string{"status": status})
-			return
+			return status, http.StatusOK, nil
 		}
-		writeError(w, http.StatusConflict, errors.New("run is not controlled by this service instance"))
-		return
+		return "", http.StatusConflict, errors.New("run is not controlled by this service instance")
 	}
 	cancel()
 	s.resolveRunApprovals(id, "deny")
-	writeJSON(w, 202, map[string]string{"status": "stopping"})
+	return "stopping", http.StatusAccepted, nil
+}
+
+func (s *Server) ensureStreamingStopIsIsolated(ctx context.Context, conversationID, runID string) error {
+	var otherActive bool
+	if err := s.db.QueryRowContext(ctx, `select exists(select 1 from runs where conversation_id=? and id<>? and status in ('queued','running'))`, conversationID, runID).Scan(&otherActive); err != nil {
+		return err
+	}
+	if otherActive {
+		return errors.New("cannot stop a run while this conversation has other queued or running runs")
+	}
+	return nil
 }
 
 func (s *Server) waitForApproval(w http.ResponseWriter, r *http.Request) {
@@ -1760,7 +2117,10 @@ func (s *Server) resolveRunApprovals(runID, decision string) {
 
 func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) {
 	e := Event{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Type: typ, Payload: payload, CreatedAt: time.Now().UTC()}
-	s.db.ExecContext(context.Background(), `insert into events (id,conversation_id,run_id,type,payload,created_at) values ($1,$2,$3,$4,$5,$6)`, e.ID, e.ConversationID, e.RunID, e.Type, e.Payload, e.CreatedAt)
+	if _, err := s.db.ExecContext(context.Background(), `insert into events (id,conversation_id,run_id,type,payload,created_at) values ($1,$2,$3,$4,$5,$6)`, e.ID, e.ConversationID, e.RunID, e.Type, e.Payload, e.CreatedAt); err != nil {
+		log.Printf("persist %s event for run %s: %v", typ, runID, err)
+		return
+	}
 	data, _ := json.Marshal(e)
 	s.mu.Lock()
 	connections := make([]*subscriber, 0, len(s.subscribers[conversationID]))
@@ -1814,13 +2174,15 @@ func (s *Server) allowedPath(path string) (string, error) {
 	}
 	return absolute, nil
 }
-func gitBranch(path string) (string, bool) {
-	cmd := exec.Command("git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD")
-	out, err := cmd.Output()
+func gitBranch(ctx context.Context, path string) (string, bool) {
+	snapshot, err := newGitRunner().Snapshot(ctx, path)
 	if err != nil {
 		return "", false
 	}
-	return strings.TrimSpace(string(out)), true
+	if snapshot.Head.Detached {
+		return "HEAD", true
+	}
+	return snapshot.Head.Branch, true
 }
 func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 	if err := json.NewDecoder(r.Body).Decode(target); err != nil {

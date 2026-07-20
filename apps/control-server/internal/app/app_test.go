@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,6 +31,93 @@ type idleAgentSession struct {
 	once sync.Once
 }
 
+type queuedStreamingRunner struct{ session *queuedAgentSession }
+
+func (runner queuedStreamingRunner) Ready(context.Context) bool { return true }
+func (runner queuedStreamingRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
+	return errors.New("one-shot run is not expected")
+}
+func (runner queuedStreamingRunner) StartSession(context.Context, AgentSessionRequest) (AgentSession, error) {
+	return runner.session, nil
+}
+
+type queuedAgentTurn struct {
+	request AgentRunRequest
+	sink    AgentRunSink
+}
+
+type queuedAgentSession struct {
+	done  chan error
+	mu    sync.Mutex
+	once  sync.Once
+	turns []queuedAgentTurn
+}
+
+type blockingStopAgentSession struct {
+	*queuedAgentSession
+	stopEntered chan struct{}
+	releaseStop chan struct{}
+	stopOnce    sync.Once
+}
+
+func newBlockingStopAgentSession() *blockingStopAgentSession {
+	return &blockingStopAgentSession{
+		queuedAgentSession: newQueuedAgentSession(),
+		stopEntered:        make(chan struct{}),
+		releaseStop:        make(chan struct{}),
+	}
+}
+
+func (session *blockingStopAgentSession) Stop() {
+	session.stopOnce.Do(func() {
+		close(session.stopEntered)
+		<-session.releaseStop
+		close(session.done)
+	})
+}
+
+type blockingStreamingRunner struct{ session AgentSession }
+
+func (runner blockingStreamingRunner) Ready(context.Context) bool { return true }
+func (runner blockingStreamingRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
+	return errors.New("one-shot run is not expected")
+}
+func (runner blockingStreamingRunner) StartSession(context.Context, AgentSessionRequest) (AgentSession, error) {
+	return runner.session, nil
+}
+
+func newQueuedAgentSession() *queuedAgentSession { return &queuedAgentSession{done: make(chan error)} }
+func (session *queuedAgentSession) Send(request AgentRunRequest, sink AgentRunSink) error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.turns = append(session.turns, queuedAgentTurn{request: request, sink: sink})
+	return nil
+}
+func (session *queuedAgentSession) Stop()              { session.once.Do(func() { close(session.done) }) }
+func (session *queuedAgentSession) Done() <-chan error { return session.done }
+func (session *queuedAgentSession) queuedCount() int {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return len(session.turns)
+}
+func (session *queuedAgentSession) finishNext(err error) bool {
+	session.mu.Lock()
+	if len(session.turns) == 0 {
+		session.mu.Unlock()
+		return false
+	}
+	turn := session.turns[0]
+	session.turns = session.turns[1:]
+	session.mu.Unlock()
+	sink, ok := turn.sink.(AgentTurnSink)
+	if !ok {
+		return false
+	}
+	sink.TurnStarted()
+	sink.TurnFinished(err)
+	return true
+}
+
 func newIdleAgentSession() *idleAgentSession { return &idleAgentSession{done: make(chan error)} }
 
 func (session *idleAgentSession) Send(AgentRunRequest, AgentRunSink) error { return nil }
@@ -42,6 +130,7 @@ type recordingSink struct {
 	mu          sync.Mutex
 	events      []string
 	texts       []string
+	parents     []string
 	initialized int
 }
 
@@ -51,10 +140,11 @@ func (sink *recordingSink) Event(eventType string, _ json.RawMessage) {
 	sink.events = append(sink.events, eventType)
 }
 
-func (sink *recordingSink) AssistantText(content string) {
+func (sink *recordingSink) AssistantText(content, parentToolUseID string) {
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
 	sink.texts = append(sink.texts, content)
+	sink.parents = append(sink.parents, parentToolUseID)
 }
 
 func (sink *recordingSink) SessionInitialized() {
@@ -70,7 +160,7 @@ type turnRecordingSink struct {
 }
 
 func (sink *turnRecordingSink) Event(string, json.RawMessage) {}
-func (sink *turnRecordingSink) AssistantText(string)          {}
+func (sink *turnRecordingSink) AssistantText(string, string)  {}
 func (sink *turnRecordingSink) SessionInitialized()           {}
 func (sink *turnRecordingSink) TurnStarted() {
 	sink.mu.Lock()
@@ -356,6 +446,11 @@ func TestShortcutDefaultsPreserveProjectBindingsAndWrapCommands(t *testing.T) {
 	if err != nil || !strings.Contains(content, "请在当前项目中执行以下命令") || !strings.Contains(content, "pnpm test") {
 		t.Fatalf("command shortcut render failed: content=%q err=%v", content, err)
 	}
+	slash := Shortcut{Kind: "command_request", Template: "/clear", DefaultAction: "confirm"}
+	slashContent, err := renderShortcut(slash, Conversation{}, Project{}, nil)
+	if err != nil || !strings.Contains(slashContent, "请在当前 Claude Code 会话中执行以下斜杠命令") || !strings.Contains(slashContent, "/clear") {
+		t.Fatalf("slash command shortcut render failed: content=%q err=%v", slashContent, err)
+	}
 }
 
 func TestDefaultShortcutsSeedOnceAndDoNotReappearAfterDeletion(t *testing.T) {
@@ -448,6 +543,9 @@ func TestConversationHistoryListsSummariesAndActivatesPriorSession(t *testing.T)
 			t.Fatalf("insert preview %q: %v", item.id, err)
 		}
 	}
+	if _, err := server.db.Exec(`insert into messages (id,conversation_id,role,content,parent_tool_use_id,created_at) values ('child-preview','current','assistant','不应出现在会话预览中的子代理日志','agent-call',?)`, now.Add(time.Minute)); err != nil {
+		t.Fatalf("insert child preview: %v", err)
+	}
 
 	response := httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/project/conversations", nil))
@@ -458,7 +556,7 @@ func TestConversationHistoryListsSummariesAndActivatesPriorSession(t *testing.T)
 	if err := json.NewDecoder(response.Body).Decode(&history); err != nil {
 		t.Fatalf("decode conversation history: %v", err)
 	}
-	if len(history) != 3 || history[0].ID != "current" || history[1].ID != "recent" || history[1].Preview != "最近会话最后回复" {
+	if len(history) != 3 || history[0].ID != "current" || history[0].Preview != "当前会话最后回复" || history[1].ID != "recent" || history[1].Preview != "最近会话最后回复" {
 		t.Fatalf("unexpected conversation history: %#v", history)
 	}
 
@@ -589,12 +687,90 @@ create table messages (id text primary key, conversation_id text not null refere
 	if !columns["title"] || !columns["last_activity_at"] {
 		t.Fatalf("history columns missing after migration: %#v", columns)
 	}
+	messageRows, err := server.db.Query(`pragma table_info(messages)`)
+	if err != nil {
+		t.Fatalf("inspect migrated message columns: %v", err)
+	}
+	defer messageRows.Close()
+	messageColumns := map[string]bool{}
+	for messageRows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := messageRows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("read migrated message column: %v", err)
+		}
+		messageColumns[name] = true
+	}
+	if !messageColumns["parent_tool_use_id"] || !messageColumns["run_id"] {
+		t.Fatalf("message attribution columns missing after migration: %#v", messageColumns)
+	}
 	var title string
 	if err := server.db.QueryRow(`select title from conversations where id='conversation'`).Scan(&title); err != nil {
 		t.Fatalf("read migrated title: %v", err)
 	}
 	if title != "修复历史会话标题" {
 		t.Fatalf("unexpected migrated title: %q", title)
+	}
+}
+
+func TestConversationPageReturnsLatestWindowAndCursor(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC().Add(-time.Minute)
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle','approval_required','conversation',?,1,1,?)`, now, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run','conversation','completed',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	for index := 0; index < 3; index++ {
+		createdAt := now
+		if _, err := server.db.Exec(`insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values (?,?,?,?,?,?,?)`, fmt.Sprintf("message-%d", index), "conversation", "run", "assistant", fmt.Sprintf("message-%d", index), "", createdAt); err != nil {
+			t.Fatalf("insert message %d: %v", index, err)
+		}
+		if _, err := server.db.Exec(`insert into events (id,conversation_id,run_id,type,payload,created_at) values (?,?,?,?,?,?)`, fmt.Sprintf("event-%d", index), "conversation", "run", "assistant", `{}`, createdAt); err != nil {
+			t.Fatalf("insert event %d: %v", index, err)
+		}
+	}
+	type conversationPage struct {
+		Messages   []Message `json:"messages"`
+		Events     []Event   `json:"events"`
+		HasMore    bool      `json:"hasMore"`
+		NextCursor string    `json:"nextCursor"`
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?limit=2", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("first page status: %d body=%s", response.Code, response.Body.String())
+	}
+	var first conversationPage
+	if err := json.NewDecoder(response.Body).Decode(&first); err != nil {
+		t.Fatalf("decode first page: %v", err)
+	}
+	if !first.HasMore || first.NextCursor == "" || len(first.Messages) != 2 || first.Messages[0].ID != "message-1" || len(first.Events) != 2 || first.Events[0].ID != "event-1" {
+		t.Fatalf("unexpected first page: %#v", first)
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?limit=2&cursor="+first.NextCursor, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("second page status: %d body=%s", response.Code, response.Body.String())
+	}
+	var second conversationPage
+	if err := json.NewDecoder(response.Body).Decode(&second); err != nil {
+		t.Fatalf("decode second page: %v", err)
+	}
+	if second.HasMore || len(second.Messages) != 1 || second.Messages[0].ID != "message-0" || len(second.Events) != 1 || second.Events[0].ID != "event-0" {
+		t.Fatalf("unexpected second page: %#v", second)
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?cursor=not-a-valid-cursor", nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid cursor status: %d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -729,6 +905,79 @@ func TestStreamingClaudeSessionAcceptsMessagesWhileTurnIsRunning(t *testing.T) {
 	var completed int
 	if err := server.db.QueryRow(`select count(*) from runs where conversation_id='conversation' and status='completed'`).Scan(&completed); err != nil || completed != 2 {
 		t.Fatalf("streaming runs did not complete: count=%d err=%v", completed, err)
+	}
+}
+
+func TestStreamingStopSerializesConcurrentAdmission(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	projectPath := t.TempDir()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle','full_control',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	session := newBlockingStopAgentSession()
+	server.runner = blockingStreamingRunner{session: session}
+	handler := server.routes()
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", bytes.NewBufferString(`{"content":"first"}`)))
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first streaming send status: %d body=%s", first.Code, first.Body.String())
+	}
+	var firstResult struct {
+		RunID string `json:"runId"`
+	}
+	if err := json.NewDecoder(first.Body).Decode(&firstResult); err != nil || firstResult.RunID == "" {
+		t.Fatalf("decode first streaming result: runID=%q err=%v", firstResult.RunID, err)
+	}
+
+	stop := httptest.NewRecorder()
+	stopDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(stop, httptest.NewRequest(http.MethodPost, "/api/runs/"+firstResult.RunID+"/stop", nil))
+		close(stopDone)
+	}()
+	select {
+	case <-session.stopEntered:
+	case <-time.After(time.Second):
+		t.Fatal("streaming stop did not reach the session")
+	}
+
+	second := httptest.NewRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", bytes.NewBufferString(`{"content":"second"}`)))
+		close(secondDone)
+	}()
+	secondCompletedWhileStopping := false
+	select {
+	case <-secondDone:
+		secondCompletedWhileStopping = true
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(session.releaseStop)
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("streaming stop did not finish")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second streaming admission did not finish")
+	}
+	if stop.Code != http.StatusAccepted {
+		t.Fatalf("streaming stop status: %d body=%s", stop.Code, stop.Body.String())
+	}
+	if secondCompletedWhileStopping {
+		t.Fatalf("second streaming admission completed while stop was in progress: status=%d body=%s", second.Code, second.Body.String())
+	}
+	if second.Code != http.StatusAccepted && second.Code != http.StatusConflict {
+		t.Fatalf("second streaming admission after stop: %d body=%s", second.Code, second.Body.String())
 	}
 }
 
@@ -917,7 +1166,7 @@ func TestStreamingApprovalUsesTheActiveConversationTurn(t *testing.T) {
 
 func TestClaudeCLIRunnerStreamsClaudeEvents(t *testing.T) {
 	scriptPath := filepath.Join(t.TempDir(), "fake-claude")
-	script := "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\nprintf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"runner output\"}]}}'\n"
+	script := "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\nprintf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"runner output\"}]}}'\nprintf '%s\\n' '{\"type\":\"assistant\",\"parent_tool_use_id\":\"agent-call\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"subagent output\"}]}}'\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake Claude CLI: %v", err)
 	}
@@ -934,8 +1183,8 @@ func TestClaudeCLIRunnerStreamsClaudeEvents(t *testing.T) {
 	}
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
-	if sink.initialized != 1 || len(sink.texts) != 1 || sink.texts[0] != "runner output" || !containsArgument(sink.events, "system") || !containsArgument(sink.events, "assistant") {
-		t.Fatalf("unexpected Claude stream: initialized=%d texts=%q events=%q", sink.initialized, sink.texts, sink.events)
+	if sink.initialized != 1 || len(sink.texts) != 2 || sink.texts[0] != "runner output" || sink.parents[0] != "" || sink.texts[1] != "subagent output" || sink.parents[1] != "agent-call" || !containsArgument(sink.events, "system") || !containsArgument(sink.events, "assistant") {
+		t.Fatalf("unexpected Claude stream: initialized=%d texts=%q parents=%q events=%q", sink.initialized, sink.texts, sink.parents, sink.events)
 	}
 }
 
@@ -959,7 +1208,7 @@ func TestFailedFirstRunDoesNotMarkClaudeSessionInitialized(t *testing.T) {
 		}
 		sink.Event("system", json.RawMessage(`{"type":"system","subtype":"init"}`))
 		sink.SessionInitialized()
-		sink.AssistantText("ready")
+		sink.AssistantText("ready", "")
 		return nil
 	})
 
@@ -1011,6 +1260,12 @@ func TestNewRecoversInterruptedRuns(t *testing.T) {
 	if _, err := server.db.Exec(`insert into shortcut_runs (id,conversation_id,run_id,rendered_content,action,status,created_at) values ('shortcut-run','conversation','queued-run','queued shortcut','prompt','accepted',?)`, now); err != nil {
 		t.Fatalf("insert shortcut run: %v", err)
 	}
+	if _, err := server.db.Exec(`insert into tasks (id,project_id,title,description,acceptance_criteria,priority,position,status,created_at,updated_at) values ('task','project','task','description','criteria','normal',1,'running',?,?)`, now, now); err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('task-run','task','conversation','queued-run',1,'queued','prompt','criteria','',?)`, now); err != nil {
+		t.Fatalf("insert task run: %v", err)
+	}
 	config := server.config
 	server.Close()
 	recovered, err := New(context.Background(), config)
@@ -1018,7 +1273,7 @@ func TestNewRecoversInterruptedRuns(t *testing.T) {
 		t.Fatalf("restart server: %v", err)
 	}
 	t.Cleanup(recovered.Close)
-	var runningStatus, queuedStatus, conversationStatus, eventType, shortcutStatus string
+	var runningStatus, queuedStatus, conversationStatus, eventType, shortcutStatus, taskStatus, taskRunStatus string
 	var interruptedEvents int
 	if err := recovered.db.QueryRow(`select status from runs where id='running-run'`).Scan(&runningStatus); err != nil {
 		t.Fatalf("read recovered running run: %v", err)
@@ -1038,8 +1293,14 @@ func TestNewRecoversInterruptedRuns(t *testing.T) {
 	if err := recovered.db.QueryRow(`select status from shortcut_runs where id='shortcut-run'`).Scan(&shortcutStatus); err != nil {
 		t.Fatalf("read recovered shortcut run: %v", err)
 	}
-	if runningStatus != "interrupted" || queuedStatus != "interrupted" || shortcutStatus != "interrupted" || conversationStatus != "idle" || eventType != "run.interrupted" || interruptedEvents != 2 {
-		t.Fatalf("unexpected recovery state: running=%q queued=%q shortcut=%q conversation=%q event=%q events=%d", runningStatus, queuedStatus, shortcutStatus, conversationStatus, eventType, interruptedEvents)
+	if err := recovered.db.QueryRow(`select status from tasks where id='task'`).Scan(&taskStatus); err != nil {
+		t.Fatalf("read recovered task: %v", err)
+	}
+	if err := recovered.db.QueryRow(`select status from task_runs where id='task-run'`).Scan(&taskRunStatus); err != nil {
+		t.Fatalf("read recovered task run: %v", err)
+	}
+	if runningStatus != "interrupted" || queuedStatus != "interrupted" || shortcutStatus != "interrupted" || taskStatus != taskActionRequired || taskRunStatus != "interrupted" || conversationStatus != "idle" || eventType != "run.interrupted" || interruptedEvents != 2 {
+		t.Fatalf("unexpected recovery state: running=%q queued=%q shortcut=%q task=%q taskRun=%q conversation=%q event=%q events=%d", runningStatus, queuedStatus, shortcutStatus, taskStatus, taskRunStatus, conversationStatus, eventType, interruptedEvents)
 	}
 }
 
@@ -1166,6 +1427,456 @@ func TestStopCompletedRunIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestTaskCreationAndDependenciesEnforceProjectGraph(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	for _, projectID := range []string{"project", "other-project"} {
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, filepath.Join(t.TempDir(), projectID), "wsl-local", "main", true, now); err != nil {
+			t.Fatalf("insert %s: %v", projectID, err)
+		}
+	}
+	handler := server.routes()
+
+	invalid := httptest.NewRecorder()
+	handler.ServeHTTP(invalid, httptest.NewRequest(http.MethodPost, "/api/projects/project/tasks", bytes.NewBufferString(`{"title":"missing fields"}`)))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid task status: %d body=%s", invalid.Code, invalid.Body.String())
+	}
+
+	first := createTaskForTest(t, handler, "project", "Create API")
+	second := createTaskForTest(t, handler, "project", "Create UI")
+	other := createTaskForTest(t, handler, "other-project", "Other project task")
+
+	addDependency := func(taskID, predecessorTaskID string, want int) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dependencies", bytes.NewBufferString(`{"predecessorTaskId":"`+predecessorTaskID+`"}`)))
+		if response.Code != want {
+			t.Fatalf("dependency %s -> %s status: got=%d want=%d body=%s", taskID, predecessorTaskID, response.Code, want, response.Body.String())
+		}
+	}
+	addDependency(second, first, http.StatusCreated)
+	addDependency(first, second, http.StatusBadRequest)
+	addDependency(first, other, http.StatusBadRequest)
+	addDependency(first, first, http.StatusBadRequest)
+}
+
+func TestListTasksLoadsWithSingleSQLiteConnection(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	createTaskForTest(t, server.routes(), projectID, "Load task board")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/tasks", nil).WithContext(ctx))
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("list tasks did not complete")
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("list tasks status: got=%d want=%d body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+}
+
+func TestReplaceTaskDependenciesRejectsCycleWithoutPartialChange(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	first := createTaskForTest(t, server.routes(), projectID, "First predecessor")
+	target := createTaskForTest(t, server.routes(), projectID, "Target task")
+	third := createTaskForTest(t, server.routes(), projectID, "Third task")
+	for _, dependency := range [][2]string{{target, first}, {third, target}} {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependency[0]+"/dependencies", bytes.NewBufferString(`{"predecessorTaskId":"`+dependency[1]+`"}`)))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("add dependency status: %d body=%s", response.Code, response.Body.String())
+		}
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/tasks/"+target+"/dependencies", bytes.NewBufferString(`{"predecessorTaskIds":["`+third+`"]}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("replace cyclic dependencies status: got=%d want=%d body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	var predecessorID string
+	if err := server.db.QueryRow(`select predecessor_task_id from task_dependencies where task_id=?`, target).Scan(&predecessorID); err != nil {
+		t.Fatalf("read preserved dependency: %v", err)
+	}
+	if predecessorID != first {
+		t.Fatalf("dependency replacement left partial state: got=%q want=%q", predecessorID, first)
+	}
+}
+
+func TestTaskDispatchCreatesSnapshotAndWaitsForReviewAfterRunCompletion(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server.runner = runnerFunc(func(_ context.Context, _ AgentRunRequest, _ AgentRunSink) error {
+		close(started)
+		<-release
+		return nil
+	})
+	taskID := createTaskForTest(t, server.routes(), projectID, "Implement task board")
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dispatch", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("dispatch status: %d body=%s", response.Code, response.Body.String())
+	}
+	var dispatched struct {
+		RunID   string  `json:"runId"`
+		TaskRun TaskRun `json:"taskRun"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&dispatched); err != nil {
+		t.Fatalf("decode dispatch response: %v", err)
+	}
+	if dispatched.RunID == "" || dispatched.TaskRun.RunID != dispatched.RunID || dispatched.TaskRun.TaskID != taskID {
+		t.Fatalf("unexpected dispatch response: %+v", dispatched)
+	}
+	if !strings.Contains(dispatched.TaskRun.PromptSnapshot, "Implement task board") || !strings.Contains(dispatched.TaskRun.PromptSnapshot, "Tests cover Implement task board.") {
+		t.Fatalf("task run snapshot does not preserve task content: %q", dispatched.TaskRun.PromptSnapshot)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("task runner did not start")
+	}
+	assertTaskStatus(t, server, taskID, taskRunning)
+	close(release)
+	waitForConversationIdle(t, server, conversationID)
+	assertTaskStatus(t, server, taskID, taskAwaitingReview)
+	var taskRuns, messages, runs int
+	if err := server.db.QueryRow(`select count(*) from task_runs where task_id=?`, taskID).Scan(&taskRuns); err != nil {
+		t.Fatalf("count task runs: %v", err)
+	}
+	if err := server.db.QueryRow(`select count(*) from messages where conversation_id=?`, conversationID).Scan(&messages); err != nil {
+		t.Fatalf("count task messages: %v", err)
+	}
+	if err := server.db.QueryRow(`select count(*) from runs where conversation_id=?`, conversationID).Scan(&runs); err != nil {
+		t.Fatalf("count task runs: %v", err)
+	}
+	if taskRuns != 1 || messages != 1 || runs != 1 {
+		t.Fatalf("dispatch did not create exactly one execution chain: taskRuns=%d messages=%d runs=%d", taskRuns, messages, runs)
+	}
+}
+
+func TestTaskReviewAcceptUnlocksDependentDispatch(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error {
+		return errors.New("test run stops after dispatch")
+	})
+	predecessor := createTaskForTest(t, server.routes(), projectID, "Add task API")
+	dependent := createTaskForTest(t, server.routes(), projectID, "Render task board")
+	add := httptest.NewRecorder()
+	server.routes().ServeHTTP(add, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/dependencies", bytes.NewBufferString(`{"predecessorTaskId":"`+predecessor+`"}`)))
+	if add.Code != http.StatusCreated {
+		t.Fatalf("add dependency status: %d body=%s", add.Code, add.Body.String())
+	}
+	blocked := httptest.NewRecorder()
+	server.routes().ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/dispatch", bytes.NewBufferString(`{}`)))
+	if blocked.Code != http.StatusConflict {
+		t.Fatalf("blocked task dispatch status: %d body=%s", blocked.Code, blocked.Body.String())
+	}
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, predecessor); err != nil {
+		t.Fatalf("prepare task for review: %v", err)
+	}
+
+	review := httptest.NewRecorder()
+	server.routes().ServeHTTP(review, httptest.NewRequest(http.MethodPost, "/api/tasks/"+predecessor+"/review", bytes.NewBufferString(`{"action":"accept","note":"checked diff and tests"}`)))
+	if review.Code != http.StatusOK {
+		t.Fatalf("accept task review status: %d body=%s", review.Code, review.Body.String())
+	}
+	assertTaskStatus(t, server, predecessor, taskDone)
+	ready := httptest.NewRecorder()
+	server.routes().ServeHTTP(ready, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/dispatch", bytes.NewBufferString(`{}`)))
+	if ready.Code != http.StatusAccepted {
+		t.Fatalf("unblocked task dispatch status: %d body=%s", ready.Code, ready.Body.String())
+	}
+
+	invalid := httptest.NewRecorder()
+	server.routes().ServeHTTP(invalid, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/review", bytes.NewBufferString(`{"action":"accept"}`)))
+	if invalid.Code != http.StatusConflict {
+		t.Fatalf("reviewing a non-review task status: %d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestTaskChangeRequestCancelAndReopenFollowStateRules(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Review task behavior")
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
+		t.Fatalf("prepare task for changes: %v", err)
+	}
+	changes := httptest.NewRecorder()
+	server.routes().ServeHTTP(changes, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/review", bytes.NewBufferString(`{"action":"request_changes","note":"Add coverage for interruption."}`)))
+	if changes.Code != http.StatusOK {
+		t.Fatalf("request changes status: %d body=%s", changes.Code, changes.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskActionRequired)
+
+	cancel := httptest.NewRecorder()
+	server.routes().ServeHTTP(cancel, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/cancel", nil))
+	if cancel.Code != http.StatusOK {
+		t.Fatalf("cancel task status: %d body=%s", cancel.Code, cancel.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskCancelled)
+
+	reopen := httptest.NewRecorder()
+	server.routes().ServeHTTP(reopen, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/reopen", nil))
+	if reopen.Code != http.StatusOK {
+		t.Fatalf("reopen task status: %d body=%s", reopen.Code, reopen.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskTodo)
+
+	invalid := httptest.NewRecorder()
+	server.routes().ServeHTTP(invalid, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/reopen", nil))
+	if invalid.Code != http.StatusConflict {
+		t.Fatalf("reopen todo task status: %d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestTaskStopDelegatesToActiveRun(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Stop active task")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('task-run-id',?,'running',?)`, conversationID, now); err != nil {
+		t.Fatalf("insert active run: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('task-run',?,?, 'task-run-id',1,'running','prompt','criteria','',?)`, taskID, conversationID, now); err != nil {
+		t.Fatalf("insert active task run: %v", err)
+	}
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskRunning, taskID); err != nil {
+		t.Fatalf("mark task running: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	server.mu.Lock()
+	server.cancels["task-run-id"] = cancel
+	server.runContexts["task-run-id"] = conversationID
+	server.mu.Unlock()
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/stop", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("task stop status: %d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("task stop did not cancel the existing run context")
+	}
+}
+
+func TestTaskStopRejectsActiveRunWhenConversationHasQueuedTask(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	activeTask := createTaskForTest(t, server.routes(), projectID, "Active task")
+	queuedTask := createTaskForTest(t, server.routes(), projectID, "Queued task")
+	now := time.Now().UTC()
+	for _, run := range []struct{ id, taskID, status string }{{"active-run", activeTask, "running"}, {"queued-run", queuedTask, "queued"}} {
+		if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values (?,?,?,?)`, run.id, conversationID, run.status, now); err != nil {
+			t.Fatalf("insert run: %v", err)
+		}
+		if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values (?,?,?,?,1,?,'prompt','criteria','',?)`, run.id+"-task", run.taskID, conversationID, run.id, run.status, now); err != nil {
+			t.Fatalf("insert task run: %v", err)
+		}
+	}
+	if _, err := server.db.Exec(`update tasks set status=? where id in (?,?)`, taskRunning, activeTask, queuedTask); err != nil {
+		t.Fatalf("mark tasks active: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+activeTask+"/stop", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stop active task with queue status: got=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "other queued task runs") {
+		t.Fatalf("stop was rejected for the wrong reason: %s", response.Body.String())
+	}
+}
+
+func TestRunStopRejectsStreamingSessionWithQueuedTask(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	activeTask := createTaskForTest(t, server.routes(), projectID, "Active task")
+	queuedTask := createTaskForTest(t, server.routes(), projectID, "Queued task")
+	now := time.Now().UTC()
+	for _, run := range []struct{ id, taskID, status string }{{"active-run", activeTask, "running"}, {"queued-run", queuedTask, "queued"}} {
+		if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values (?,?,?,?)`, run.id, conversationID, run.status, now); err != nil {
+			t.Fatalf("insert run: %v", err)
+		}
+		if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values (?,?,?,?,1,?,'prompt','criteria','',?)`, run.id+"-task", run.taskID, conversationID, run.id, run.status, now); err != nil {
+			t.Fatalf("insert task run: %v", err)
+		}
+	}
+	session := newQueuedAgentSession()
+	server.mu.Lock()
+	server.sessions[conversationID] = &activeAgentSession{agent: session, activeRunID: "active-run"}
+	server.mu.Unlock()
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runs/active-run/stop", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stop run with queued task: got=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	select {
+	case <-session.done:
+		t.Fatal("queued session was stopped")
+	default:
+	}
+}
+
+func TestTaskDetailIncludesLastRunAndFailureReason(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Failed task")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('failed-run',?,'running',?)`, conversationID, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('failed-task-run',?,?, 'failed-run',1,'running','prompt','criteria','',?)`, taskID, conversationID, now); err != nil {
+		t.Fatalf("insert task run: %v", err)
+	}
+	if _, err := server.db.Exec(`update tasks set status=?,last_task_run_id=? where id=?`, taskRunning, "failed-task-run", taskID); err != nil {
+		t.Fatalf("mark task running: %v", err)
+	}
+	server.finishRun("failed-run", conversationID, "failed", errors.New("permission denied"))
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskID, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("get task detail status: %d body=%s", response.Code, response.Body.String())
+	}
+	var detail TaskDetail
+	if err := json.NewDecoder(response.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode task detail: %v", err)
+	}
+	if detail.LastRun == nil || detail.LastRun.ID != "failed-task-run" {
+		t.Fatalf("last run missing from task detail: %+v", detail.LastRun)
+	}
+	if len(detail.Runs) != 1 || !strings.Contains(detail.Runs[0].FailureReason, "permission denied") {
+		t.Fatalf("failure reason was not preserved: %+v", detail.Runs)
+	}
+}
+
+func TestTaskUpdateRecordsAuditEvent(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Audited task")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Renamed task","description":"Updated scope.","acceptanceCriteria":"Updated checks.","priority":"high","position":1}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update task status: %d body=%s", response.Code, response.Body.String())
+	}
+	var events int
+	if err := server.db.QueryRow(`select count(*) from task_events where task_id=? and type='task.updated'`, taskID).Scan(&events); err != nil {
+		t.Fatalf("count update events: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("expected one task.updated event, got %d", events)
+	}
+}
+
+func TestStreamingTaskDispatchKeepsIndependentTaskRunsInOrder(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	session := newQueuedAgentSession()
+	server.runner = queuedStreamingRunner{session: session}
+	firstTask := createTaskForTest(t, server.routes(), projectID, "First queued task")
+	secondTask := createTaskForTest(t, server.routes(), projectID, "Second queued task")
+	for _, taskID := range []string{firstTask, secondTask} {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dispatch", bytes.NewBufferString(`{}`)))
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("dispatch %s status: %d body=%s", taskID, response.Code, response.Body.String())
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for session.queuedCount() != 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if session.queuedCount() != 2 {
+		t.Fatalf("expected two queued turns, got %d", session.queuedCount())
+	}
+	if !session.finishNext(nil) {
+		t.Fatal("finish first queued task")
+	}
+	assertTaskStatus(t, server, firstTask, taskAwaitingReview)
+	assertTaskStatus(t, server, secondTask, taskRunning)
+	if !session.finishNext(nil) {
+		t.Fatal("finish second queued task")
+	}
+	assertTaskStatus(t, server, secondTask, taskAwaitingReview)
+	var distinctRuns int
+	if err := server.db.QueryRow(`select count(distinct run_id) from task_runs where task_id in (?,?)`, firstTask, secondTask).Scan(&distinctRuns); err != nil {
+		t.Fatalf("count task run identities: %v", err)
+	}
+	if distinctRuns != 2 {
+		t.Fatalf("expected independent task run IDs, got %d", distinctRuns)
+	}
+}
+
+func TestTaskStopRejectsQueuedStreamingTask(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	session := newQueuedAgentSession()
+	server.runner = queuedStreamingRunner{session: session}
+	firstTask := createTaskForTest(t, server.routes(), projectID, "First queued task")
+	queuedTask := createTaskForTest(t, server.routes(), projectID, "Queued task to preserve")
+	for _, taskID := range []string{firstTask, queuedTask} {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dispatch", bytes.NewBufferString(`{}`)))
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("dispatch %s status: %d body=%s", taskID, response.Code, response.Body.String())
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for session.queuedCount() != 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+queuedTask+"/stop", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stopping a queued task status: got=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	if session.queuedCount() != 2 {
+		t.Fatalf("stopping queued task must not affect session queue, got %d turns", session.queuedCount())
+	}
+}
+
+func createTaskForTest(t *testing.T, handler http.Handler, projectID, title string) string {
+	t.Helper()
+	response := httptest.NewRecorder()
+	body := `{"title":"` + title + `","description":"Implement ` + title + ` safely.","acceptanceCriteria":"Tests cover ` + title + `.","priority":"normal"}`
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/tasks", bytes.NewBufferString(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create task %q status: %d body=%s", title, response.Code, response.Body.String())
+	}
+	var task struct{ ID string }
+	if err := json.NewDecoder(response.Body).Decode(&task); err != nil {
+		t.Fatalf("decode created task: %v", err)
+	}
+	if task.ID == "" {
+		t.Fatalf("created task %q has no ID", title)
+	}
+	return task.ID
+}
+
+func seedTaskConversation(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	projectID, conversationID := "project", "conversation"
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, "project", t.TempDir(), "wsl-local", "main", true, now); err != nil {
+		t.Fatalf("insert task project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values (?,?,?,?,?,?,?)`, conversationID, projectID, "00000000-0000-4000-8000-000000000000", "idle", false, true, now); err != nil {
+		t.Fatalf("insert task conversation: %v", err)
+	}
+	return server, projectID, conversationID
+}
+
+func assertTaskStatus(t *testing.T, server *Server, taskID, want string) {
+	t.Helper()
+	var status string
+	if err := server.db.QueryRow(`select status from tasks where id=?`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task status: %v", err)
+	}
+	if status != want {
+		t.Fatalf("task status: got=%q want=%q", status, want)
+	}
+}
+
 func containsArgument(args []string, value string) bool {
 	return strings.Contains("\x00"+strings.Join(args, "\x00")+"\x00", "\x00"+value+"\x00")
 }
@@ -1217,4 +1928,496 @@ func waitForRunStatus(t *testing.T, server *Server, conversationID, want string)
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("run did not reach status %q", want)
+}
+
+func TestGitSnapshotParsesNULPathsAndMissingUpstream(t *testing.T) {
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "已修改\n文件.txt", "one\n")
+
+	snapshot, err := newGitRunner().Snapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("read Git snapshot: %v", err)
+	}
+	if snapshot.Worktree.Untracked != 1 {
+		t.Fatalf("untracked count: got=%d want=1", snapshot.Worktree.Untracked)
+	}
+	if snapshot.Head.Upstream != "" || snapshot.Head.Ahead != 0 || snapshot.Head.Behind != 0 {
+		t.Fatalf("unexpected upstream summary: %#v", snapshot.Head)
+	}
+}
+
+func TestGitDiffDoesNotRunTextconv(t *testing.T) {
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, ".gitattributes", "asset.bin diff=sentinel\n")
+	writeGitTestFile(t, repo, "asset.bin", "before\n")
+	runGitForTest(t, repo, "add", ".gitattributes", "asset.bin")
+	runGitForTest(t, repo, "commit", "-m", "add binary asset")
+	runGitForTest(t, repo, "config", "diff.sentinel.textconv", "sh -c 'touch textconv-ran; cat'")
+	writeGitTestFile(t, repo, "asset.bin", "after\n")
+
+	if _, err := newGitRunner().Diff(context.Background(), repo, "asset.bin", gitDiffWorktree); err != nil {
+		t.Fatalf("read Git diff: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "textconv-ran")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("textconv was executed while reading diff")
+	}
+}
+
+func TestGitLogAndBranchesUseMachineReadableFields(t *testing.T) {
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	writeGitTestFile(t, repo, "readme.txt", "two\n")
+	runGitForTest(t, repo, "commit", "-am", "second commit")
+
+	runner := newGitRunner()
+	commits, err := runner.Log(context.Background(), repo, "main", 10)
+	if err != nil {
+		t.Fatalf("read Git log: %v", err)
+	}
+	if len(commits) != 2 || commits[0].Subject != "second commit" || commits[0].OID == "" {
+		t.Fatalf("unexpected commits: %#v", commits)
+	}
+	branches, err := runner.Branches(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("read Git branches: %v", err)
+	}
+	if len(branches) != 1 || branches[0].Name != "main" || !branches[0].Current || branches[0].Remote {
+		t.Fatalf("unexpected branches: %#v", branches)
+	}
+}
+
+func TestGitChangesParseRenameDestinationAndSource(t *testing.T) {
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "old-name.txt", "content\n")
+	runGitForTest(t, repo, "add", "old-name.txt")
+	runGitForTest(t, repo, "commit", "-m", "add old name")
+	runGitForTest(t, repo, "mv", "old-name.txt", "new-name.txt")
+
+	changes, err := newGitRunner().Changes(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("read renamed Git change: %v", err)
+	}
+	if len(changes) != 1 || !changes[0].Renamed || changes[0].Path != "new-name.txt" || changes[0].OriginalPath != "old-name.txt" {
+		t.Fatalf("unexpected rename change: %#v", changes)
+	}
+}
+
+func TestGitLogRejectsRevisionExpressions(t *testing.T) {
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	writeGitTestFile(t, repo, "readme.txt", "two\n")
+	runGitForTest(t, repo, "commit", "-am", "second commit")
+
+	if _, err := newGitRunner().Log(context.Background(), repo, "HEAD^", 10); err == nil {
+		t.Fatal("revision expression was accepted")
+	}
+}
+
+func TestGitLogRejectsTagNamesThatWereNotEnumeratedAsBranches(t *testing.T) {
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	runGitForTest(t, repo, "tag", "v1")
+
+	if _, err := newGitRunner().Log(context.Background(), repo, "v1", 10); err == nil {
+		t.Fatal("tag name was accepted as a client-selected log ref")
+	}
+}
+
+func TestGitBranchUsesConstrainedRunnerEnvironment(t *testing.T) {
+	repo := newTempGitRepository(t)
+	otherRepo := newTempGitRepository(t)
+	runGitForTest(t, otherRepo, "checkout", "-b", "other")
+	t.Setenv("GIT_DIR", filepath.Join(otherRepo, ".git"))
+
+	branch, ready := gitBranch(context.Background(), repo)
+	if !ready || branch != "main" {
+		t.Fatalf("Git branch used inherited repository override: branch=%q ready=%t", branch, ready)
+	}
+}
+
+func TestWaitForGitCommandHasFinalBound(t *testing.T) {
+	done := make(chan error)
+	if waitForGitCommand(nil, done, time.Millisecond, time.Millisecond) {
+		t.Fatal("wait unexpectedly completed")
+	}
+}
+
+func TestGitCommandEnvironmentDisablesInheritedAskpassAndDangerousProtocols(t *testing.T) {
+	env := gitCommandEnvironment([]string{"PATH=/usr/bin", "GIT_ASKPASS=/tmp/unsafe", "GIT_TERMINAL_PROMPT=1", "GIT_CONFIG_COUNT=1", "GIT_DIR=/tmp/other-repository", "GIT_WORK_TREE=/tmp/other-worktree", "GIT_INDEX_FILE=/tmp/other-index", "GIT_COMMON_DIR=/tmp/other-common", "GIT_OBJECT_DIRECTORY=/tmp/other-objects", "GIT_ALTERNATE_OBJECT_DIRECTORIES=/tmp/other-alternates"})
+	values := map[string]string{}
+	for _, entry := range env {
+		parts := strings.SplitN(entry, "=", 2)
+		values[parts[0]] = parts[1]
+	}
+	if values["GIT_ASKPASS"] != "" || values["GIT_TERMINAL_PROMPT"] != "0" || values["GIT_CONFIG_COUNT"] != "2" || values["GIT_CONFIG_KEY_0"] != "protocol.ext.allow" || values["GIT_CONFIG_VALUE_0"] != "never" || values["GIT_CONFIG_KEY_1"] != "protocol.file.allow" || values["GIT_CONFIG_VALUE_1"] != "never" {
+		t.Fatalf("unsafe Git environment: %#v", values)
+	}
+	for _, key := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"} {
+		if _, found := values[key]; found {
+			t.Fatalf("Git repository override %s was inherited: %#v", key, values)
+		}
+	}
+}
+
+func TestGitSnapshotIgnoresStderrWhenParsingPorcelain(t *testing.T) {
+	git := writeFakeGit(t, "printf '# branch.oid (initial)\\000# branch.head main\\000? actual.txt\\000'\nprintf '? stderr-injection.txt\\000' >&2\n")
+	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	snapshot, err := newGitRunner().Snapshot(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("read Git snapshot: %v", err)
+	}
+	if snapshot.Worktree.Untracked != 1 {
+		t.Fatalf("stderr must not be parsed as porcelain: %#v", snapshot)
+	}
+}
+
+func TestGitValidationRejectsSpecialRefAndPathspec(t *testing.T) {
+	if err := validateGitRef("@"); err == nil {
+		t.Fatal("Git HEAD shorthand was accepted")
+	}
+	if err := validateGitPath(":(top)"); err == nil {
+		t.Fatal("Git pathspec magic was accepted")
+	}
+}
+
+func TestGitCommandTimeoutTerminatesItsProcessGroup(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "child-survived")
+	git := writeFakeGit(t, "(sleep 0.2; touch \"$MARKER\") &\nsleep 5\n")
+	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MARKER", marker)
+
+	_, err := (&gitCLIRunner{timeout: 40 * time.Millisecond}).command(context.Background(), t.TempDir(), "status")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Git child process survived cancellation: %v", err)
+	}
+}
+
+func TestGitCommandStopsWhenCombinedOutputExceedsLimit(t *testing.T) {
+	git := writeFakeGit(t, "head -c 1049600 /dev/zero\n")
+	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := newGitRunner().(*gitCLIRunner).command(context.Background(), t.TempDir(), "status")
+	if !errors.Is(err, errGitOutputTooLarge) {
+		t.Fatalf("output limit error: %v", err)
+	}
+}
+
+func TestProjectWorkspaceLeaseExcludesOtherOwners(t *testing.T) {
+	server := newTestServer(t)
+	release, acquired := server.acquireProjectWorkspace("project", "run:active")
+	if !acquired {
+		t.Fatal("acquire project workspace")
+	}
+	defer release()
+	if _, acquired := server.acquireProjectWorkspace("project", "git:fetch"); acquired {
+		t.Fatal("another owner acquired the workspace lease")
+	}
+	sameOwnerRelease, acquired := server.acquireProjectWorkspace("project", "run:active")
+	if !acquired {
+		t.Fatal("the current owner could not share the workspace lease")
+	}
+	release()
+	if _, acquired := server.acquireProjectWorkspace("project", "git:fetch"); acquired {
+		t.Fatal("workspace lease was released before all current-owner holders exited")
+	}
+	sameOwnerRelease()
+	otherRelease, acquired := server.acquireProjectWorkspace("project", "git:fetch")
+	if !acquired {
+		t.Fatal("workspace lease did not release after the final holder exited")
+	}
+	otherRelease()
+}
+
+func TestRecoverGitPushWithUnknownResultNeedsAttention(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('push-project','Push project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert push project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into git_operations (id,project_id,type,status,request_summary,before_state,after_state,requested_at,started_at) values ('push-operation','push-project','push','running','origin/main','{}','{}',?,?)`, now, now); err != nil {
+		t.Fatalf("insert running push: %v", err)
+	}
+
+	if err := server.recoverGitOperations(context.Background()); err != nil {
+		t.Fatalf("recover Git operations: %v", err)
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from git_operations where id='push-operation'`).Scan(&status); err != nil {
+		t.Fatalf("read recovered push: %v", err)
+	}
+	if status != gitOperationNeedsAttention {
+		t.Fatalf("recovered push status: got=%q want=%q", status, gitOperationNeedsAttention)
+	}
+}
+
+func TestRecoverGitCommitWithUnknownResultNeedsAttention(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('commit-project','Commit project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert commit project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into git_operations (id,project_id,type,status,request_summary,before_state,after_state,requested_at,started_at) values ('commit-operation','commit-project','commit','running','commit','{}','{}',?,?)`, now, now); err != nil {
+		t.Fatalf("insert running commit: %v", err)
+	}
+
+	if err := server.recoverGitOperations(context.Background()); err != nil {
+		t.Fatalf("recover Git operations: %v", err)
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from git_operations where id='commit-operation'`).Scan(&status); err != nil {
+		t.Fatalf("read recovered commit: %v", err)
+	}
+	if status != gitOperationNeedsAttention {
+		t.Fatalf("recovered commit status: got=%q want=%q", status, gitOperationNeedsAttention)
+	}
+}
+
+func TestRecoverGitCommitWithVerifiedHeadSucceeds(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	head, err := newGitRunner().Snapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("read commit head: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('verified-commit-project','Verified commit project',?,'wsl-local','main',1,?)`, repo, now); err != nil {
+		t.Fatalf("insert Git project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into git_operations (id,project_id,type,status,request_summary,before_state,after_state,requested_at,started_at) values ('verified-commit-operation','verified-commit-project','commit','running','commit','{}',?, ?,?)`, `{"headOid":"`+head.Head.OID+`"}`, now, now); err != nil {
+		t.Fatalf("insert running commit: %v", err)
+	}
+
+	if err := server.recoverGitOperations(context.Background()); err != nil {
+		t.Fatalf("recover Git operations: %v", err)
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from git_operations where id='verified-commit-operation'`).Scan(&status); err != nil {
+		t.Fatalf("read recovered commit: %v", err)
+	}
+	if status != gitOperationSucceeded {
+		t.Fatalf("verified commit recovery status: got=%q want=%q", status, gitOperationSucceeded)
+	}
+}
+
+func TestRecoverGitFetchWithVerifiedRemoteRefsSucceeds(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	head, err := newGitRunner().Snapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("read commit head: %v", err)
+	}
+	runGitForTest(t, repo, "update-ref", "refs/remotes/origin/main", head.Head.OID)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('verified-fetch-project','Verified fetch project',?,'wsl-local','main',1,?)`, repo, now); err != nil {
+		t.Fatalf("insert Git project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into git_operations (id,project_id,type,status,request_summary,before_state,after_state,requested_at,started_at) values ('verified-fetch-operation','verified-fetch-project','fetch','running','origin','{}',?, ?,?)`, `{"remoteRefs":{"refs/remotes/origin/main":"`+head.Head.OID+`"}}`, now, now); err != nil {
+		t.Fatalf("insert running fetch: %v", err)
+	}
+
+	if err := server.recoverGitOperations(context.Background()); err != nil {
+		t.Fatalf("recover Git operations: %v", err)
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from git_operations where id='verified-fetch-operation'`).Scan(&status); err != nil {
+		t.Fatalf("read recovered fetch: %v", err)
+	}
+	if status != gitOperationSucceeded {
+		t.Fatalf("verified fetch recovery status: got=%q want=%q", status, gitOperationSucceeded)
+	}
+}
+
+func TestProjectGitReadRoutesReportRepositoryState(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	writeGitTestFile(t, repo, "new.txt", "new\n")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	handler := server.routes()
+	for _, requestPath := range []string{
+		"/api/projects/git-project/git/summary",
+		"/api/projects/git-project/git/changes",
+		"/api/projects/git-project/git/log?ref=HEAD&limit=10",
+		"/api/projects/git-project/git/branches",
+		"/api/projects/git-project/git/operations",
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, requestPath, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", requestPath, response.Code, response.Body.String())
+		}
+	}
+
+	summary := httptest.NewRecorder()
+	handler.ServeHTTP(summary, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/summary", nil))
+	if !strings.Contains(summary.Body.String(), `"untracked":1`) {
+		t.Fatalf("summary did not report untracked file: %s", summary.Body.String())
+	}
+
+	diff := httptest.NewRecorder()
+	handler.ServeHTTP(diff, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/diff?path=new.txt&stage=worktree", nil))
+	if diff.Code != http.StatusOK {
+		t.Fatalf("diff status=%d body=%s", diff.Code, diff.Body.String())
+	}
+}
+
+func TestProjectGitDiffRejectsUntrustedPathAndLogReference(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	handler := server.routes()
+	for _, requestPath := range []string{
+		"/api/projects/git-project/git/diff?path=/etc/passwd&stage=worktree",
+		"/api/projects/git-project/git/diff?path=:(top)&stage=worktree",
+		"/api/projects/git-project/git/log?ref=HEAD%5E&limit=10",
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, requestPath, nil))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d body=%s", requestPath, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestProjectGitSummaryIssuesStateTokenAndStageRejectsStaleState(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	writeGitTestFile(t, repo, "feature.txt", "first\n")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	summary := gitSummaryForTest(t, server, "git-project")
+	if summary.StateToken == "" || summary.ObservedAt.IsZero() {
+		t.Fatalf("summary has no state token: %#v", summary)
+	}
+	writeGitTestFile(t, repo, "feature.txt", "second\n")
+	changed := httptest.NewRecorder()
+	server.routes().ServeHTTP(changed, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/stage", bytes.NewBufferString(`{"paths":["feature.txt"],"stateToken":"`+summary.StateToken+`"}`)))
+	if changed.Code != http.StatusConflict {
+		t.Fatalf("content-changed state status=%d body=%s", changed.Code, changed.Body.String())
+	}
+
+	summary = gitSummaryForTest(t, server, "git-project")
+	stage := httptest.NewRecorder()
+	server.routes().ServeHTTP(stage, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/stage", bytes.NewBufferString(`{"paths":["feature.txt"],"stateToken":"`+summary.StateToken+`"}`)))
+	if stage.Code != http.StatusAccepted {
+		t.Fatalf("stage status=%d body=%s", stage.Code, stage.Body.String())
+	}
+
+	stale := httptest.NewRecorder()
+	server.routes().ServeHTTP(stale, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/unstage", bytes.NewBufferString(`{"paths":["feature.txt"],"stateToken":"`+summary.StateToken+`"}`)))
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale state status=%d body=%s", stale.Code, stale.Body.String())
+	}
+}
+
+func TestProjectGitDiffReturnsUntrackedContentAndRejectsUnchangedPath(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	writeGitTestFile(t, repo, "new.txt", "untracked content\n")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	for path, wantStatus := range map[string]int{"new.txt": http.StatusOK, "readme.txt": http.StatusBadRequest} {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/diff?path="+path+"&stage=worktree", nil))
+		if response.Code != wantStatus {
+			t.Fatalf("%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		if path == "new.txt" && !strings.Contains(response.Body.String(), "untracked content") {
+			t.Fatalf("untracked diff did not include content: %s", response.Body.String())
+		}
+	}
+}
+
+type gitSummaryTestResponse struct {
+	GitSnapshot
+	StateToken string    `json:"stateToken"`
+	ObservedAt time.Time `json:"observedAt"`
+}
+
+func gitSummaryForTest(t *testing.T, server *Server, projectID string) gitSummaryTestResponse {
+	t.Helper()
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/git/summary", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("summary status=%d body=%s", response.Code, response.Body.String())
+	}
+	var summary gitSummaryTestResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	return summary
+}
+
+func seedGitProjectForTest(t *testing.T, server *Server, projectID, repo string) {
+	t.Helper()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,'wsl-local','main',1,?)`, projectID, "Git project", repo, time.Now().UTC()); err != nil {
+		t.Fatalf("insert Git project: %v", err)
+	}
+}
+
+func newTempGitRepository(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	runGitForTest(t, repo, "init", "-b", "main")
+	runGitForTest(t, repo, "config", "user.name", "Auto Test")
+	runGitForTest(t, repo, "config", "user.email", "auto@example.test")
+	return repo
+}
+
+func writeGitTestFile(t *testing.T, repo, path, content string) {
+	t.Helper()
+	fullPath := filepath.Join(repo, path)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		t.Fatalf("create Git test directory: %v", err)
+	}
+	if err := os.WriteFile(fullPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write Git test file: %v", err)
+	}
+}
+
+func runGitForTest(t *testing.T, repo string, args ...string) {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+}
+
+func writeFakeGit(t *testing.T, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o700); err != nil {
+		t.Fatalf("write fake Git: %v", err)
+	}
+	return path
 }

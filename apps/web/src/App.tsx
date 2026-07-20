@@ -6,13 +6,18 @@ import "./permission.css";
 import "./conversation.css";
 import "./stop.css";
 import "./design-preview.css";
+import "./tasks.css";
+import "./git.css";
+import { GitWorkbench } from "./features/git/GitWorkbench";
+import { TaskBoard } from "./features/tasks/TaskBoard";
+import { TaskQueue } from "./features/tasks/TaskQueue";
 
 type Project = { id: string; name: string; pathDisplay: string; runner: string; gitBranch: string; claudeReady: boolean };
 type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string };
 type ProjectFilter = "all" | "running" | "ready" | "offline";
 type PermissionMode = "approval_required" | "full_control";
 type Conversation = { id: string; status: string; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean };
-type Message = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
+type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 type ShortcutKind = "prompt" | "snippet" | "command_request";
 type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };
 type ShortcutEditorState = { kind: ShortcutKind; shortcut?: Shortcut };
@@ -22,6 +27,10 @@ type Approval = { approvalId: string; status: "pending" | "allow" | "deny"; tool
 type ApprovalEvent = { approval: Approval; runId: string; createdAt: string };
 type ToolOutput = { content: string; isError: boolean };
 type ToolAction = { id: string; runId: string; name: string; input: Record<string, unknown>; createdAt: string; output?: ToolOutput; approval?: Approval; runStatus?: string };
+type AgentStatus = "pending" | "running" | "completed" | "failed" | "stopped" | "unresolved";
+type AgentLog = { id: string; createdAt: string; kind: "text" | "tool" | "result" | "error"; title: string; detail: string; isError?: boolean };
+type AgentNode = { id: string; runId: string; parentId?: string; name: string; summary: string; createdAt: string; status: AgentStatus; logs: AgentLog[]; children: AgentNode[] };
+type AgentExecution = { runId: string; status: string; incomplete: boolean; agents: AgentNode[]; createdAt: string };
 type ModelUsage = { model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; contextWindow: number };
 type RunUsage = { runId: string; conversationId: string; status: string; model: string; contextWindow: number; contextInputTokens: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; durationMs: number; ttftMs: number; terminalReason: string; hasResult: boolean; startedAt?: string; completedAt?: string; models: ModelUsage[] };
 type ConversationUsage = { taskCount: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number };
@@ -139,8 +148,10 @@ function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
   for (const event of events) {
     if (event.type !== "assistant") continue;
     const payload = asRecord(event.payload);
+    if (payload.parent_tool_use_id) continue;
     for (const part of asRecord(payload.message).content || []) {
       if (part?.type !== "tool_use" || !part.id) continue;
+      if (part.name === "Agent") continue;
       const input = asRecord(part.input);
       const command = typeof input.command === "string" ? input.command : "";
       const matched = approvals.find((item) => !usedApprovals.has(item.approval.approvalId) && item.runId === event.runId && typeof item.approval.toolInput.command === "string" && item.approval.toolInput.command === command && new Date(item.createdAt).getTime() >= new Date(event.createdAt).getTime());
@@ -162,6 +173,141 @@ function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
     ...tools.map((action) => ({ kind: "tool" as const, id: action.id, createdAt: action.createdAt, action })),
   ];
   return timeline.sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
+}
+
+function eventMessageParts(event: Event): Record<string, any>[] {
+  const content = asRecord(asRecord(event.payload).message).content;
+  return Array.isArray(content) ? content.map(asRecord) : [];
+}
+
+function agentSummary(input: Record<string, any>): string {
+  const value = input.description || input.prompt || input.task || input.agent_type || input.subagent_type;
+  return typeof value === "string" && value.trim() ? value.trim().replace(/\s+/g, " ") : "执行子任务";
+}
+
+function toolSummary(part: Record<string, any>): string {
+  const input = asRecord(part.input);
+  const value = input.command || input.description || input.path || input.prompt || input.query;
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function agentStatusLabel(status: AgentStatus): string {
+  return ({ pending: "等待开始", running: "执行中", completed: "已完成", failed: "执行失败", stopped: "已停止", unresolved: "结果未收齐" })[status];
+}
+
+function buildAgentExecutions(events: Event[]): AgentExecution[] {
+  const nodes = new Map<string, AgentNode>();
+  const toolOwners = new Map<string, string>();
+  const runStatuses = new Map<string, string>();
+  const runCreatedAt = new Map<string, string>();
+  const ensureNode = (id: string, runId: string, parentId: string | undefined, name: string, summary: string, createdAt: string) => {
+    const existing = nodes.get(id);
+    if (existing) return existing;
+    const node: AgentNode = { id, runId, parentId, name, summary, createdAt, status: "pending", logs: [], children: [] };
+    nodes.set(id, node);
+    return node;
+  };
+  const appendLog = (ownerID: string | undefined, log: AgentLog) => {
+    if (!ownerID) return;
+    const owner = nodes.get(ownerID);
+    if (!owner) return;
+    owner.logs.push(log);
+    if (owner.status === "pending") owner.status = "running";
+  };
+
+  for (const event of events) {
+    if (!runCreatedAt.has(event.runId)) runCreatedAt.set(event.runId, event.createdAt);
+    if (event.type.startsWith("run.")) runStatuses.set(event.runId, event.type.slice(4));
+    const payload = asRecord(event.payload);
+    const parentID = typeof payload.parent_tool_use_id === "string" && payload.parent_tool_use_id ? payload.parent_tool_use_id : undefined;
+    if (event.type === "assistant") {
+      for (const part of eventMessageParts(event)) {
+        if (part.type === "tool_use" && typeof part.id === "string") {
+          const name = typeof part.name === "string" ? part.name : "Tool";
+          const input = asRecord(part.input);
+          if (name === "Agent") ensureNode(part.id, event.runId, parentID, name, agentSummary(input), event.createdAt);
+          toolOwners.set(part.id, parentID || "");
+          appendLog(parentID, { id: event.id + part.id, createdAt: event.createdAt, kind: "tool", title: name, detail: toolSummary(part) });
+        }
+        if (part.type === "text" && typeof part.text === "string" && part.text.trim()) appendLog(parentID, { id: event.id + part.text, createdAt: event.createdAt, kind: "text", title: "输出", detail: part.text.trim() });
+      }
+      continue;
+    }
+    if (event.type === "user") {
+      for (const part of eventMessageParts(event)) {
+        if (part.type !== "tool_result" || typeof part.tool_use_id !== "string") continue;
+        const ownerID = toolOwners.get(part.tool_use_id);
+        const output = contentToText(part.content);
+        appendLog(ownerID, { id: event.id + part.tool_use_id, createdAt: event.createdAt, kind: "result", title: part.is_error ? "工具失败" : "工具结果", detail: output, isError: Boolean(part.is_error) });
+        const agent = nodes.get(part.tool_use_id);
+        if (agent) agent.status = part.is_error ? "failed" : "completed";
+      }
+    }
+    if (event.type === "stream.error") appendLog(parentID, { id: event.id, createdAt: event.createdAt, kind: "error", title: "流错误", detail: String(payload.error || "无法读取 Claude 输出"), isError: true });
+  }
+
+  const executions = new Map<string, AgentExecution>();
+  for (const node of nodes.values()) {
+    const execution = executions.get(node.runId) || { runId: node.runId, status: runStatuses.get(node.runId) || "running", incomplete: false, agents: [], createdAt: runCreatedAt.get(node.runId) || node.createdAt };
+    executions.set(node.runId, execution);
+    if (node.parentId && nodes.has(node.parentId)) nodes.get(node.parentId)!.children.push(node);
+    else execution.agents.push(node);
+  }
+  for (const execution of executions.values()) {
+    execution.status = runStatuses.get(execution.runId) || execution.status;
+    if (["completed", "failed", "stopped", "interrupted", "cancelled"].includes(execution.status)) {
+      const markUnresolved = (node: AgentNode) => {
+        if (node.status === "pending" || node.status === "running") {
+          if (execution.status === "completed") {
+            node.status = "unresolved";
+            execution.incomplete = true;
+          } else {
+            node.status = execution.status === "failed" ? "failed" : "stopped";
+          }
+        }
+        node.children.forEach(markUnresolved);
+      };
+      execution.agents.forEach(markUnresolved);
+    }
+  }
+  return [...executions.values()].sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
+}
+
+function subagentTextIndex(events: Event[]): Map<string, number[]> {
+  const index = new Map<string, number[]>();
+  for (const event of events) {
+    const payload = asRecord(event.payload);
+    if (event.type !== "assistant" || !payload.parent_tool_use_id) continue;
+    const eventTime = new Date(event.createdAt).getTime();
+    for (const part of eventMessageParts(event)) {
+      if (part.type !== "text" || typeof part.text !== "string") continue;
+      const times = index.get(part.text) || [];
+      times.push(eventTime);
+      index.set(part.text, times);
+    }
+  }
+  return index;
+}
+
+function isSubagentMessage(message: Message, indexedTexts: Map<string, number[]>): boolean {
+  if (message.parentToolUseId) return true;
+  // New records have durable attribution. Keep the text/time fallback strictly
+  // for records created before run and parent IDs were persisted.
+  if (message.runId) return false;
+  if (message.role !== "assistant") return false;
+  const messageTime = new Date(message.createdAt).getTime();
+  return (indexedTexts.get(message.content) || []).some((eventTime) => Math.abs(eventTime - messageTime) <= 5_000);
+}
+
+function mergeConversationItems<T extends { id: string; createdAt: string }>(history: T[], live: T[]): T[] {
+  const items = new Map<string, T>();
+  for (const item of history) items.set(item.id, item);
+  for (const item of live) items.set(item.id, item);
+  return [...items.values()].sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
+}
+
+function websocketAssistantMessageID(eventID: string, index: number): string {
+  return `${eventID}:assistant-text:${index}`;
 }
 
 function requiredShortcutVariables(template: string): ("selection" | "error")[] {
@@ -315,7 +461,14 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
   const [shortcutEditor, setShortcutEditor] = useState<ShortcutEditorState | null>(null);
   const [shortcutVariables, setShortcutVariables] = useState<{ shortcut: Shortcut; variables: Record<string, string> } | null>(null);
   const [shortcutBusy, setShortcutBusy] = useState("");
+  const [showTasks, setShowTasks] = useState<{ taskID?: string } | null>(null);
+  const [showGit, setShowGit] = useState(false);
+  const [showAgentExecution, setShowAgentExecution] = useState<string | null>(null);
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const [historyCursor, setHistoryCursor] = useState("");
+  const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
+  const top = useRef<HTMLDivElement>(null);
   const historyIndex = useRef<number | null>(null);
   const draftBeforeHistory = useRef("");
   const finishedRunIds = useRef(new Set<string>());
@@ -392,9 +545,13 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     let cancelled = false;
     const reload = async () => {
       try {
-        const data = await api<{ messages: Message[]; events: Event[]; activeRunId: string | null }>(`/api/conversations/${conversation.id}`);
+        const data = await api<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
         if (cancelled) return;
-        setMessages(data.messages); setEvents(data.events); setRun(data.activeRunId || "");
+        // A WebSocket frame may arrive after the HTTP query has started. Merge
+        // instead of replacing state so that frame cannot be lost on first load.
+        setMessages((current) => mergeConversationItems(data.messages, current));
+        setEvents((current) => mergeConversationItems(data.events, current));
+        setRun(data.activeRunId || ""); setHasMoreHistory(data.hasMore); setHistoryCursor(data.nextCursor || "");
       } catch (cause) { if (!cancelled) fail(cause instanceof Error ? cause.message : "Unable to refresh conversation"); }
     };
     const socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/conversations/${conversation.id}`);
@@ -404,8 +561,9 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
       setEvents((old) => old.some((item) => item.id === event.id) ? old : [...old, event]);
       if (event.type === "assistant") {
         const content = asRecord(asRecord(event.payload).message).content || [];
-        for (const part of content) {
-          if (part?.type === "text" && typeof part.text === "string") setMessages((old) => [...old, { id: event.id + part.text, role: "assistant", content: part.text, createdAt: event.createdAt }]);
+        const parentToolUseId = typeof asRecord(event.payload).parent_tool_use_id === "string" ? asRecord(event.payload).parent_tool_use_id : "";
+        for (const [index, part] of content.entries()) {
+          if (part?.type === "text" && typeof part.text === "string") setMessages((old) => mergeConversationItems(old, [{ id: websocketAssistantMessageID(event.id, index), runId: event.runId, role: "assistant", content: part.text, parentToolUseId, createdAt: event.createdAt }]));
         }
       }
       if (event.type === "usage.updated" || event.type.startsWith("run.")) {
@@ -449,8 +607,40 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     return () => { cancelled = true; };
   }, [conversation?.id, fail, historyRefresh]);
 
-  const timeline = useMemo(() => buildTimeline(messages, events), [messages, events]);
-  useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [timeline.length, run]);
+  const knownSubagentTexts = useMemo(() => subagentTextIndex(events), [events]);
+  const primaryMessages = useMemo(() => messages.filter((message) => !isSubagentMessage(message, knownSubagentTexts)), [knownSubagentTexts, messages]);
+  const timeline = useMemo(() => buildTimeline(primaryMessages, events), [events, primaryMessages]);
+  const agentExecutions = useMemo(() => buildAgentExecutions(events), [events]);
+  const executionByRun = useMemo(() => new Map(agentExecutions.map((execution) => [execution.runId, execution])), [agentExecutions]);
+  const anchoredExecutionRunIDs = useMemo(() => new Set(primaryMessages.flatMap((message) => message.role === "user" && message.runId && executionByRun.has(message.runId) ? [message.runId] : [])), [executionByRun, primaryMessages]);
+  const loadOlderHistory = async () => {
+    if (!conversation || !historyCursor || loadingOlderHistory) return;
+    setLoadingOlderHistory(true);
+    try {
+      const data = await api<{ messages: Message[]; events: Event[]; hasMore: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400&cursor=${encodeURIComponent(historyCursor)}`);
+      setMessages((current) => mergeConversationItems(data.messages, current));
+      setEvents((current) => mergeConversationItems(data.events, current));
+      setHasMoreHistory(data.hasMore);
+      setHistoryCursor(data.nextCursor || "");
+    } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to load earlier conversation history"); }
+    finally { setLoadingOlderHistory(false); }
+  };
+  const pendingApproval = useMemo(() => {
+    for (const item of timeline) {
+      if (item.kind === "tool") {
+        const approval = item.action.approval;
+        if (approval?.status === "pending" && !item.action.output) return item.action;
+      }
+    }
+    return null;
+  }, [timeline]);
+  useEffect(() => {
+    if (pendingApproval) return; // never scroll away while a command is waiting for approval
+    bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [timeline.length, run, pendingApproval]);
+
+  const scrollToTop = () => top.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const scrollToBottom = () => bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
 
   const sendContent = async (rawContent: string, clearDraft = true) => {
     if (!conversation || sending || shortcutBusy) return;
@@ -501,7 +691,7 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
   const newConversation = async (permissionMode: PermissionMode) => {
     try {
       const next = await api<Conversation>(`/api/projects/${project.id}/conversations?new=true`, { method: "POST", body: JSON.stringify({ permissionMode }) });
-      setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setConversation(next);
+      setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setShowAgentExecution(null); setHasMoreHistory(false); setHistoryCursor(""); setConversation(next);
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
       setShowNewConversation(false);
     }
@@ -512,7 +702,7 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     setActivatingConversation(item.id);
     try {
       const next = await api<Conversation>(`/api/conversations/${item.id}/activate`, { method: "POST" });
-      setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setConversation(next); setShowHistory(false);
+      setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setShowAgentExecution(null); setHasMoreHistory(false); setHistoryCursor(""); setConversation(next); setShowHistory(false);
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
     } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to switch conversation"); }
     finally { setActivatingConversation(""); }
@@ -595,6 +785,22 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
   const displayedModel = usage?.context.model || currentUsage?.model || "Claude Code";
   const promptShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "prompt" || shortcut.kind === "snippet");
   const commandShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "command_request");
+  const promptShortcutItems = promptShortcuts.length > 0 ? promptShortcuts : [undefined];
+  const commandShortcutItems = commandShortcuts.length > 0 ? commandShortcuts : [undefined];
+  const shortcutRowCount = Math.max(promptShortcutItems.length, commandShortcutItems.length);
+  const renderShortcutCell = (shortcut: Shortcut | undefined, kind: "prompt" | "command_request", placeholder = false) => {
+    if (!shortcut && placeholder) return <div className="quick-tag-slot" aria-hidden="true" />;
+    if (!shortcut) return <button type="button" className={`quick-tag-empty${kind === "command_request" ? " command-tag" : ""}`} onClick={() => setShortcutEditor({ kind })}>{kind === "command_request" ? "添加命令" : "添加提示词"}</button>;
+    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={!shortcut.enabled || !conversation || sending || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.name}已停用`}>{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} disabled={Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}>...</button></div>;
+  };
+  const handleTaskDispatched = (message: Message, runID: string) => {
+    setMessages((items) => [...items, message]);
+    setInputHistory((items) => [...items.slice(-99), message.content]);
+    setHistoryRefresh((version) => version + 1);
+    setRun(finishedRunIds.current.has(runID) ? "" : runID);
+    void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
+    void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
+  };
 
   return <div className="chat">
     <header className="project-head">
@@ -612,41 +818,48 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
         </div>
         <button className="secondary" disabled={!!run} onClick={openConversationHistory}>历史</button>
         <button className="secondary" disabled={!!run} onClick={() => setShowNewConversation(true)}>新会话</button>
+        <button className="secondary" onClick={() => setShowTasks({})}>任务</button>
+        {project.gitBranch !== "非 Git 目录" && <button className="secondary git-trigger" onClick={() => setShowGit(true)}>Git: {project.gitBranch || "HEAD"}</button>}
         <span className={run ? "running" : "ready"}>{run ? "正在执行" : "已就绪"}</span>
         {run && <button className="stop-run" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止任务"}</button>}
       </div>
     </header>
-    <section className="conversation-canvas">
+    {showGit && <GitWorkbench projectID={project.id} request={api} fail={fail} close={() => setShowGit(false)} />}
+    {showTasks ? <TaskBoard projectID={project.id} initialTaskID={showTasks.taskID} permissionMode={conversation?.permissionMode} request={api} fail={fail} close={() => setShowTasks(null)} onDispatched={handleTaskDispatched} /> : <><section className="conversation-canvas">
       <aside className="quick-tag-rail" aria-label="常用操作">
-        <div className="quick-tag-group">
-          <div className="quick-tag-heading"><span>常用提示词</span><button type="button" title="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}>+</button></div>
-          <div className="quick-tag-list">
-            {promptShortcuts.map((shortcut) => <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}`} key={shortcut.id}><button type="button" disabled={!shortcut.enabled || !conversation || sending || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.name}已停用`}>{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} disabled={Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}>...</button></div>)}
-            {promptShortcuts.length === 0 && <button type="button" className="quick-tag-empty" onClick={() => setShortcutEditor({ kind: "prompt" })}>添加提示词</button>}
-          </div>
+        <div className="quick-actions-row">
+          <div className="quick-actions-headings"><div className="quick-tag-heading"><span>常用提示词</span><button type="button" title="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}>+</button></div><div className="quick-tag-heading command-tag-heading"><span>常用命令</span><button type="button" title="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}>+</button></div></div>
+          {Array.from({ length: shortcutRowCount }, (_, index) => <div className="quick-tag-row" key={`shortcut-row-${index}`}>{renderShortcutCell(promptShortcutItems[index], "prompt", !promptShortcutItems[index])}{renderShortcutCell(commandShortcutItems[index], "command_request", !commandShortcutItems[index])}</div>)}
         </div>
-        <div className="quick-tag-group command-tags">
-          <div className="quick-tag-heading"><span>常用命令</span><button type="button" title="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}>+</button></div>
-          <div className="quick-tag-list">
-            {commandShortcuts.map((shortcut) => <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}`} key={shortcut.id}><button type="button" disabled={!shortcut.enabled || !conversation || sending || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.name}已停用`}>{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} disabled={Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: "command_request", shortcut })}>...</button></div>)}
-            {commandShortcuts.length === 0 && <button type="button" className="quick-tag-empty" onClick={() => setShortcutEditor({ kind: "command_request" })}>添加命令</button>}
-          </div>
+        <div className="quick-actions-mobile">
+          <div className="quick-tag-group"><div className="quick-tag-heading"><span>常用提示词</span><button type="button" title="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}>+</button></div><div className="quick-tag-list">{promptShortcutItems.map((shortcut, index) => <div key={shortcut?.id || `empty-prompt-${index}`}>{renderShortcutCell(shortcut, "prompt")}</div>)}</div></div>
+          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span>常用命令</span><button type="button" title="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}>+</button></div><div className="quick-tag-list">{commandShortcutItems.map((shortcut, index) => <div key={shortcut?.id || `empty-command-${index}`}>{renderShortcutCell(shortcut, "command_request")}</div>)}</div></div>
         </div>
+        <TaskQueue projectID={project.id} permissionMode={conversation?.permissionMode} request={api} fail={fail} onDispatched={handleTaskDispatched} openBoard={(taskID) => setShowTasks(taskID ? { taskID } : {})} />
       </aside>
       <section className="timeline">
+        <div ref={top} />
+        {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
         {timeline.length === 0 && <div className="empty"><h2>开始与 Claude Code 对话</h2><p>选择常用操作，或直接描述希望 Claude 完成的工作。</p></div>}
-        {timeline.map((item) => <div className={`timeline-entry ${item.kind}`} key={item.id}>{item.kind === "message" ? <MessageCard message={item.message} /> : <ToolCard action={item.action} resolving={resolving} decide={decide} />}</div>)}
+        {timeline.map((item) => <div key={item.id}><div className={`timeline-entry ${item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} /> : <ToolCard action={item.action} resolving={resolving} decide={decide} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => setShowAgentExecution(item.message.runId!)} />}</div>)}
+        {agentExecutions.filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => setShowAgentExecution(execution.runId)} />)}
         {run && <div className="run-indicator"><span></span>{runLabel}</div>}
         <div ref={bottom} />
       </section>
     </section>
-    <form className="composer" onSubmit={(event) => void send(event)}>
+    <div className="scroll-buttons">
+      <button type="button" className="scroll-btn scroll-to-top" title="回到顶部" onClick={scrollToTop}>↑</button>
+      <button type="button" className="scroll-btn scroll-to-bottom" title="回到底部" onClick={scrollToBottom}>↓</button>
+    </div>
+    <form className={`composer${pendingApproval ? " has-approval" : ""}`} onSubmit={(event) => void send(event)}>
+      {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = document.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
       <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder="描述希望 Claude 在当前项目中完成的工作..." disabled={sending || Boolean(shortcutBusy)} />
       <div><small>{run ? runLabel : conversation?.permissionMode === "full_control" ? "Claude Code · 完全控制" : "Claude Code · 命令需确认"}</small><span className="composer-actions">{run && <button className="secondary" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<button className="primary" disabled={!text.trim() || sending || Boolean(shortcutBusy)}>{sending ? "发送中" : "发送"}</button></span></div>
-    </form>
+    </form></>}
     {showNewConversation && <NewConversationDialog close={() => setShowNewConversation(false)} create={newConversation} />}
     {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={() => setShowHistory(false)} activate={activateConversation} />}
     {showFullControlConfirmation && <FullControlConfirmationDialog close={() => setShowFullControlConfirmation(false)} confirm={confirmFullControl} changing={changingPermission} />}
+    {showAgentExecution && agentExecutions.find((execution) => execution.runId === showAgentExecution) && <AgentExecutionDialog execution={agentExecutions.find((execution) => execution.runId === showAgentExecution)!} close={() => setShowAgentExecution(null)} />}
     {showUsage && <UsageDialog usage={usage} currentRun={currentUsage} now={usageNow} close={() => setShowUsage(false)} />}
     {shortcutEditor && <ShortcutEditor projectID={project.id} state={shortcutEditor} close={() => setShortcutEditor(null)} refresh={refreshShortcuts} fail={fail} />}
     {shortcutVariables && <ShortcutVariablesDialog state={shortcutVariables} close={() => setShortcutVariables(null)} run={(variables) => { setShortcutVariables(null); void runShortcut(shortcutVariables.shortcut, variables, true); }} />}
@@ -802,4 +1015,49 @@ function ToolCard({ action, resolving, decide }: { action: ToolAction; resolving
   const outputPreview = output.replace(/\s+/g, " ").trim().slice(0, 180);
   const statusClass = failed ? "failed" : stopped || denied ? "denied" : waiting ? "pending" : "";
   return <article className={`tool-card ${waiting ? "waiting" : ""}`}><header><div><span className="tool-icon">$</span><div><b>{action.name === "Bash" ? "终端命令" : action.name}</b><small>{description}</small></div></div><div className="tool-meta"><time>{formatTime(action.createdAt)}</time><span className={`tool-status ${statusClass}`}>{status}</span></div></header>{command && <pre className="command"><code>{command}</code></pre>}{waiting && approval && <div className="approval-actions"><span>此命令将会在当前项目目录执行。</span><div><button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button><button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button></div></div>}{action.output && (shouldCollapseOutput ? <details><summary>{failed ? "查看错误输出" : "查看命令输出"}<span>{outputPreview}</span></summary><pre className="output">{output}</pre></details> : <pre className={`output inline ${failed ? "error-output" : ""}`}>{output}</pre>)}</article>;
+}
+
+function flattenAgents(agents: AgentNode[]): AgentNode[] {
+  return agents.flatMap((agent) => [agent, ...flattenAgents(agent.children)]);
+}
+
+function AgentExecutionCard({ execution, open }: { execution: AgentExecution; open: () => void }) {
+  const agents = flattenAgents(execution.agents);
+  const counts = agents.reduce<Record<AgentStatus, number>>((value, agent) => { value[agent.status]++; return value; }, { pending: 0, running: 0, completed: 0, failed: 0, stopped: 0, unresolved: 0 });
+  const state = execution.incomplete ? "结果未收齐" : execution.status === "completed" ? "已完成" : execution.status === "failed" ? "执行失败" : ["stopped", "interrupted", "cancelled"].includes(execution.status) ? "已停止" : "执行中";
+  const lastActivity = agents.flatMap((agent) => agent.logs).reduce<AgentLog | undefined>((latest, log) => !latest || new Date(log.createdAt).getTime() > new Date(latest.createdAt).getTime() ? log : latest, undefined);
+  return <section className={`agent-execution-card ${execution.incomplete ? "incomplete" : execution.status}`} aria-label="子代理执行过程"><header><div><span className="agent-execution-icon">A</span><div><b>子代理执行过程</b><small>{state}{counts.running ? ` · ${counts.running} 个执行中` : ""}</small></div></div><button className="secondary" onClick={open}>查看过程</button></header><div className="agent-execution-summary"><span>{agents.length} 个子代理</span><span>{counts.completed} 已完成</span>{counts.stopped > 0 && <span>{counts.stopped} 已停止</span>}{counts.failed > 0 && <span className="failed">{counts.failed} 失败</span>}{counts.unresolved > 0 && <span className="incomplete">{counts.unresolved} 未收齐</span>}</div>{execution.incomplete && <p className="agent-execution-warning">主回合已结束，但没有收到全部子代理的最终结果。已收到的过程记录仍可查看。</p>}{lastActivity && <p className="agent-execution-last"><b>{lastActivity.title}</b><span>{lastActivity.detail.replace(/\s+/g, " ")}</span></p>}</section>;
+}
+
+function AgentExecutionDialog({ execution, close }: { execution: AgentExecution; close: () => void }) {
+  const agents = flattenAgents(execution.agents);
+  const [selectedID, setSelectedID] = useState(agents[0]?.id || "");
+  const selected = agents.find((agent) => agent.id === selectedID) || agents[0];
+  return <div className="backdrop agent-execution-backdrop" role="dialog" aria-modal="true" aria-labelledby="agent-execution-title"><section className="agent-execution-dialog"><header><div><label>CLAUDE CODE EXECUTION</label><h2 id="agent-execution-title">子代理过程</h2><p>{execution.incomplete ? "主回合已完成，但部分子代理的最终结果未送达。" : "查看每个子代理已收到的输出、工具调用和结果。"}</p></div><button title="关闭" onClick={close}>x</button></header><div className="agent-execution-body"><nav className="agent-tree" aria-label="子代理列表">{execution.agents.map((agent) => <AgentTree key={agent.id} agent={agent} selectedID={selectedID} select={setSelectedID} depth={0} />)}</nav><section className="agent-log-panel">{selected ? <><header><div><span className={`agent-status ${selected.status}`}>{agentStatusLabel(selected.status)}</span><h3>{selected.summary}</h3></div><small>{formatTime(selected.createdAt)}</small></header><div className="agent-log-list">{selected.logs.length === 0 ? <p className="agent-log-empty">尚未收到该子代理的过程输出。</p> : selected.logs.map((log) => <article className={`agent-log ${log.kind} ${log.isError ? "failed" : ""}`} key={log.id}><header><b>{log.title}</b><time>{formatTime(log.createdAt)}</time></header><details open={log.kind === "text"}><summary>{log.detail.replace(/\s+/g, " ").slice(0, 180) || "无输出"}</summary><pre>{log.detail || "(无输出)"}</pre></details></article>)}</div></> : <p className="agent-log-empty">没有可查看的子代理。</p>}</section></div></section></div>;
+}
+
+function AgentTree({ agent, selectedID, select, depth }: { agent: AgentNode; selectedID: string; select: (id: string) => void; depth: number }) {
+  return <div className="agent-tree-branch"><button className={`agent-tree-row ${agent.id === selectedID ? "selected" : ""}`} style={{ paddingLeft: `${12 + depth * 16}px` }} onClick={() => select(agent.id)}><span className={`agent-status ${agent.status}`}></span><span><b>{agent.summary}</b><small>{agentStatusLabel(agent.status)} · {agent.logs.length} 条记录</small></span></button>{agent.children.map((child) => <AgentTree key={child.id} agent={child} selectedID={selectedID} select={select} depth={depth + 1} />)}</div>;
+}
+
+function ApprovalBanner({ action, resolving, decide, scrollToCard }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void>; scrollToCard: () => void }) {
+  const command = typeof action.input.command === "string" ? action.input.command : "";
+  const description = typeof action.input.description === "string" ? action.input.description : "";
+  const approval = action.approval;
+  if (!approval) return null;
+  return <div className="approval-banner">
+    <div className="approval-banner-body">
+      <span className="approval-banner-icon">⏳</span>
+      <div className="approval-banner-info">
+        <b>等待确认命令执行</b>
+        <span>{description || command}</span>
+      </div>
+      <code className="approval-banner-command">{command}</code>
+      <div className="approval-banner-actions">
+        <button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button>
+        <button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button>
+        <button className="approval-banner-scroll" onClick={scrollToCard} title="滚动到命令卡片">↓</button>
+      </div>
+    </div>
+  </div>;
 }

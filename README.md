@@ -116,3 +116,4 @@ pnpm --filter @auto/web build
 - [Claude 对话上下文与使用状态](docs/05-Claude对话上下文与使用状态.md)
 - [快捷任务与命令系统](docs/06-快捷任务与命令系统.md)
 - [任务编排与人工下发](docs/07-任务编排与人工下发.md)
+- [Git 仓库管理与协作](docs/08-Git仓库管理与协作.md)

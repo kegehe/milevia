@@ -64,7 +64,7 @@ type AgentRunRequest struct {
 
 type AgentRunSink interface {
 	Event(eventType string, payload json.RawMessage)
-	AssistantText(content string)
+	AssistantText(content, parentToolUseID string)
 	SessionInitialized()
 }
 
@@ -287,9 +287,10 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 	for scanner.Scan() {
 		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
 		var envelope struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
-			Message struct {
+			Type            string `json:"type"`
+			Subtype         string `json:"subtype"`
+			ParentToolUseID string `json:"parent_tool_use_id"`
+			Message         struct {
 				Content []struct {
 					Type string `json:"type"`
 					Text string `json:"text"`
@@ -309,7 +310,7 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 		}
 		for _, part := range envelope.Message.Content {
 			if part.Type == "text" && strings.TrimSpace(part.Text) != "" {
-				sink.AssistantText(part.Text)
+				sink.AssistantText(part.Text, envelope.ParentToolUseID)
 			}
 		}
 	}
@@ -372,9 +373,10 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 	for scanner.Scan() {
 		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
 		var envelope struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
-			Message struct {
+			Type            string `json:"type"`
+			Subtype         string `json:"subtype"`
+			ParentToolUseID string `json:"parent_tool_use_id"`
+			Message         struct {
 				Content []struct {
 					Type string `json:"type"`
 					Text string `json:"text"`
@@ -390,7 +392,7 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 		if envelope.Type == "assistant" {
 			for _, content := range envelope.Message.Content {
 				if content.Type == "text" && content.Text != "" {
-					session.assistantText(content.Text)
+					session.assistantText(content.Text, envelope.ParentToolUseID)
 				}
 			}
 		}
@@ -432,12 +434,12 @@ func (session *claudeCLISession) emit(eventType string, payload json.RawMessage,
 	}
 }
 
-func (session *claudeCLISession) assistantText(content string) {
+func (session *claudeCLISession) assistantText(content, parentToolUseID string) {
 	session.mu.Lock()
 	turn := session.current
 	session.mu.Unlock()
 	if turn != nil {
-		turn.sink.AssistantText(content)
+		turn.sink.AssistantText(content, parentToolUseID)
 	}
 }
 
