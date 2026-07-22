@@ -1,16 +1,17 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./markdown.css";
 import "./permission.css";
 import "./conversation.css";
 import "./stop.css";
-import "./design-preview.css";
 import "./tasks.css";
 import "./git.css";
 import { GitWorkbench } from "./features/git/GitWorkbench";
 import { TaskBoard } from "./features/tasks/TaskBoard";
 import { TaskQueue } from "./features/tasks/TaskQueue";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 
 type Project = { id: string; name: string; pathDisplay: string; runner: string; gitBranch: string; claudeReady: boolean };
 type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string };
@@ -37,7 +38,8 @@ type ConversationUsage = { taskCount: number; agentTurns: number; modelSteps: nu
 type ConversationUsageResponse = { conversationId: string; context: RunUsage; currentRun?: RunUsage; latestRun?: RunUsage; session: ConversationUsage; models: ModelUsage[] };
 type TimelineItem =
   | { kind: "message"; id: string; createdAt: string; message: Message }
-  | { kind: "tool"; id: string; createdAt: string; action: ToolAction };
+  | { kind: "tool"; id: string; createdAt: string; action: ToolAction }
+  | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string };
 
 async function api<T>(path: string, init?: RequestInit, retries = 2): Promise<T> {
   let lastError: unknown;
@@ -121,14 +123,19 @@ function runDuration(run: RunUsage | undefined, now: number): number {
 }
 
 function contextLabel(context: RunUsage | undefined): string {
-  if (!context?.contextInputTokens) return "上下文计算中";
-  if (!context.contextWindow) return "上下文暂不可用";
-  return `上下文约 ${Math.min(100, Math.round(context.contextInputTokens / context.contextWindow * 100))}%`;
+  const tokens = context?.contextInputTokens;
+  if (!tokens) return "上下文计算中";
+  if (!context?.contextWindow) return "上下文暂不可用";
+  const percent = Math.round(tokens / context.contextWindow * 100);
+  const tokensDisplay = formatTokens(tokens);
+  const windowDisplay = formatTokens(context.contextWindow);
+  return `上下文 ${tokensDisplay} / ${windowDisplay} (${percent}%)`;
 }
 
 function contextLevel(context: RunUsage | undefined): string {
-  if (!context?.contextInputTokens || !context.contextWindow) return "pending";
-  const percent = context.contextInputTokens / context.contextWindow * 100;
+  const tokens = context?.contextInputTokens;
+  if (!tokens || !context?.contextWindow) return "pending";
+  const percent = tokens / context.contextWindow * 100;
   return percent >= 85 ? "danger" : percent >= 70 ? "warning" : "normal";
 }
 
@@ -147,6 +154,7 @@ function getApproval(event: Event): Approval | null {
 function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
   const results = new Map<string, ToolOutput>();
   const runStatuses = new Map<string, string>();
+  const runErrors = new Map<string, string>();
   const approvalStates = new Map<string, ApprovalEvent>();
   for (const event of events) {
     const payload = asRecord(event.payload);
@@ -156,6 +164,7 @@ function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
       }
     }
     if (event.type.startsWith("run.")) runStatuses.set(event.runId, event.type.slice(4));
+    if ((event.type === "run.failed" || event.type === "run.interrupted") && typeof payload.error === "string" && payload.error) runErrors.set(event.runId, payload.error);
     const approval = getApproval(event);
     if (approval) approvalStates.set(approval.approvalId, { approval, runId: event.runId, createdAt: event.createdAt });
   }
@@ -186,9 +195,32 @@ function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
       });
     }
   }
+  const errorItems: TimelineItem[] = [];
+  const seenStderr = new Set<string>();
+  for (const event of events) {
+    const payload = asRecord(event.payload);
+    if ((event.type === "run.failed" || event.type === "run.interrupted") && typeof payload.error === "string" && payload.error) {
+      errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title: event.type === "run.interrupted" ? "执行中断" : "执行失败", detail: payload.error });
+    }
+    if (event.type === "stream.error" && typeof payload.error === "string" && payload.error) {
+      // Skip stream.error events that are already represented by a run.failed
+      const alreadyFailed = runErrors.has(event.runId);
+      if (!alreadyFailed) {
+        errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title: "流错误", detail: payload.error });
+      }
+    }
+    if (event.type === "stderr" && typeof payload.message === "string" && payload.message.trim()) {
+      const dedupKey = `${event.runId}:${payload.message.trim()}`;
+      if (!seenStderr.has(dedupKey)) {
+        seenStderr.add(dedupKey);
+        errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title: "Claude 输出", detail: payload.message.trim() });
+      }
+    }
+  }
   const timeline: TimelineItem[] = [
     ...messages.map((message) => ({ kind: "message" as const, id: message.id, createdAt: message.createdAt, message })),
     ...tools.map((action) => ({ kind: "tool" as const, id: action.id, createdAt: action.createdAt, action })),
+    ...errorItems,
   ];
   return timeline.sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
 }
@@ -342,24 +374,33 @@ export function App() {
     try {
       const list = await api<Project[]>("/api/projects");
       setProjects(list);
-      const entries = await Promise.all(list.map(async (item) => {
-        try {
-          const conversations = await api<Conversation[]>(`/api/projects/${item.id}/conversations`);
-          const active = conversations.find((conversation) => conversation.status === "running");
-          return [item.id, { running: Boolean(active), conversationCount: conversations.length, activeTitle: active?.title || "" }] as const;
-        } catch {
-          return [item.id, { running: false, conversationCount: 0, activeTitle: "" }] as const;
-        }
-      }));
-      setProjectStatuses(Object.fromEntries(entries));
+      try {
+        const statusList = await api<{ id: string; running: number; conversationCount: number; activeTitle: string }[]>("/api/projects/statuses");
+        const entries = statusList.map((item) => [item.id, { running: item.running === 1, conversationCount: item.conversationCount, activeTitle: item.activeTitle }] as const);
+        setProjectStatuses(Object.fromEntries(entries));
+      } catch {
+        // On subsequent polls, keep the last-known status rather than
+        // blanking every card to idle on a transient error.
+        setProjectStatuses((prev) => {
+          if (Object.keys(prev).length > 0) return prev;
+          const entries = list.map((item) => [item.id, { running: false, conversationCount: 0, activeTitle: "" }] as const);
+          return Object.fromEntries(entries);
+        });
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to load projects");
     }
   }, []);
 
-  useEffect(() => { void loadProjects(); }, [loadProjects]);
-
-  if (window.location.pathname === "/design-preview") return <DesignPreview />;
+  // Poll project status while the dashboard is visible so cards reflect the
+  // real running/idle state without a manual reload.  This also handles the
+  // initial load (project starts as null).
+  useEffect(() => {
+    if (project) return; // Chat is open — WebSocket keeps the conversation view up to date.
+    void loadProjects().catch(() => undefined);
+    const interval = window.setInterval(() => { void loadProjects().catch(() => undefined); }, 10_000);
+    return () => window.clearInterval(interval);
+  }, [loadProjects, project]);
 
   return <main className={project ? "app-shell project-open" : "app-shell"}>
     {error && <div className="error"><span>{error}</span><button title="关闭错误提示" onClick={() => setError("")}>x</button></div>}
@@ -370,6 +411,8 @@ export function App() {
 
 function ProjectDashboard({ projects, statuses, importProject, openProject }: { projects: Project[]; statuses: Record<string, ProjectStatus>; importProject: () => void; openProject: (project: Project) => void }) {
   const [filter, setFilter] = useState<ProjectFilter>("all");
+  const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const runningCount = Object.values(statuses).filter((status) => status.running).length;
   const readyCount = projects.filter((project) => project.claudeReady && !statuses[project.id]?.running).length;
   const offlineCount = projects.filter((project) => !project.claudeReady).length;
@@ -379,53 +422,36 @@ function ProjectDashboard({ projects, statuses, importProject, openProject }: { 
     return order[projectState(left)] - order[projectState(right)] || left.name.localeCompare(right.name, "zh-CN");
   });
   const filters: { id: ProjectFilter; label: string; count: number }[] = [{ id: "all", label: "全部", count: projects.length }, { id: "running", label: "进行中", count: runningCount }, { id: "ready", label: "可接手", count: readyCount }, { id: "offline", label: "不可用", count: offlineCount }];
-  return <><header className="dashboard-bar"><a className="brand" href="/"><b>A</b><span>Auto<br />Development</span></a><div className="dashboard-actions"><a className="design-link" href="/design-preview">设计方向</a><span className="runner-label">WSL LOCAL RUNNER</span><button className="primary" onClick={importProject}>加载项目 <i>+</i></button></div></header><section className="project-dashboard command-dashboard"><header className="dashboard-intro"><div><span className="eyebrow">COMMAND DESK</span><h1>项目任务<br /><em>总览。</em></h1></div><div className="dashboard-summary"><div><small>全部项目</small><b>{projects.length}</b></div><div className="summary-running"><small>进行中</small><b>{runningCount}</b></div><div><small>可接手</small><b>{readyCount}</b></div></div></header>{projects.length > 0 && <nav className="task-filters" aria-label="按项目状态筛选">{filters.map((item) => <button key={item.id} className={filter === item.id ? "selected" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<b>{item.count}</b></button>)}</nav>}<div className="dashboard-divider"><span>任务队列</span><i></i><small>{filter === "all" ? "执行中的任务已置顶" : `显示${filters.find((item) => item.id === filter)?.label}项目`}</small></div>{projects.length === 0 ? <div className="empty"><h2>还没有项目</h2><p>加载一个 WSL 本地目录后，即可在这里开始 Claude Code 对话。</p><button className="primary" onClick={importProject}>加载项目</button></div> : filteredProjects.length === 0 ? <div className="empty filtered-empty"><h2>没有匹配的项目</h2><p>当前筛选下没有项目，可切换筛选查看其他任务。</p></div> : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={statuses[item.id]} open={() => openProject(item)} />)}</div>}</section></>;
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    try {
+      await api(`/api/projects/${deleteTarget.id}`, { method: "DELETE" });
+      setDeleteTarget(null);
+      // Reload projects after deletion — the parent App component polls
+      // automatically, but we want immediate feedback.
+      window.location.reload();
+    } catch (cause) {
+      alert(cause instanceof Error ? cause.message : "无法删除项目");
+    } finally {
+      setDeleting(false);
+    }
+  };
+  return <><header className="dashboard-bar"><a className="brand" href="/"><b>A</b><span>Auto<br />Development</span></a><div className="dashboard-actions"><button className="primary" onClick={importProject}>加载项目 <i>+</i></button></div></header><section className="project-dashboard command-dashboard"><header className="dashboard-intro"><div><span className="eyebrow">COMMAND DESK</span><h1>项目任务<br /><em>总览。</em></h1></div><div className="dashboard-summary"><div><small>全部项目</small><b>{projects.length}</b></div><div className="summary-running"><small>进行中</small><b>{runningCount}</b></div><div><small>可接手</small><b>{readyCount}</b></div></div></header>{projects.length > 0 && <nav className="task-filters" aria-label="按项目状态筛选">{filters.map((item) => <button key={item.id} className={filter === item.id ? "selected" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<b>{item.count}</b></button>)}</nav>}<div className="dashboard-divider"><span>任务队列</span><i></i><small>{filter === "all" ? "执行中的任务已置顶" : `显示${filters.find((item) => item.id === filter)?.label}项目`}</small></div>{projects.length === 0 ? <div className="empty"><h2>还没有项目</h2><p>加载一个 WSL 本地目录后，即可在这里开始 Claude Code 对话。</p><button className="primary" onClick={importProject}>加载项目</button></div> : filteredProjects.length === 0 ? <div className="empty filtered-empty"><h2>没有匹配的项目</h2><p>当前筛选下没有项目，可切换筛选查看其他任务。</p></div> : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={statuses[item.id]} open={() => openProject(item)} onDelete={() => setDeleteTarget(item)} />)}</div>}</section>{deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}</>;
 }
 
-function ProjectCard({ project, status, open }: { project: Project; status?: ProjectStatus; open: () => void }) {
+function ProjectCard({ project, status, open, onDelete }: { project: Project; status?: ProjectStatus; open: () => void; onDelete: () => void }) {
   const state = status?.running ? "正在执行" : project.claudeReady ? "已就绪" : "Claude 不可用";
   const stateClass = status?.running ? "running" : project.claudeReady ? "ready" : "offline";
   const taskTitle = status?.running && status.activeTitle ? status.activeTitle : "等待新的任务";
-  return <button className={`project-card task-card state-${stateClass}`} onClick={open} aria-label={`进入 ${project.name} 的对话`}><div className="project-card-top"><span className="project-mark">{project.name.slice(0, 1).toUpperCase()}</span><span className={`project-state ${stateClass}`}><i></i>{state}</span></div><div className="project-card-title"><span>当前任务</span><h2>{project.name}</h2><p>{taskTitle}</p></div><div className="project-card-meta"><span><small>会话</small><b>{status ? status.conversationCount : "--"}</b></span><span><small>工作目录</small><b title={project.pathDisplay}>{project.pathDisplay}</b></span></div><footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话 <i>→</i></b></footer></button>;
+  const handleDelete = (e: React.MouseEvent) => { e.stopPropagation(); onDelete(); };
+  const handleDeleteKey = (e: React.KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); onDelete(); } };
+  return <button className={`project-card task-card state-${stateClass}`} onClick={open} aria-label={`进入 ${project.name} 的对话`}><div className="project-card-top"><span className="project-mark">{project.name.slice(0, 1).toUpperCase()}</span><span className={`project-state ${stateClass}`}><i></i>{state}</span><span className="project-card-delete" role="button" tabIndex={0} title="删除项目" onClick={handleDelete} onKeyDown={handleDeleteKey} aria-label={`删除项目 ${project.name}`}>×</span></div><div className="project-card-title"><span>当前任务</span><h2>{project.name}</h2><p>{taskTitle}</p></div><div className="project-card-meta"><span><small>会话</small><b>{status ? status.conversationCount : "--"}</b></span><span><small>工作目录</small><b title={project.pathDisplay}>{project.pathDisplay}</b></span></div><footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话 <i>→</i></b></footer></button>;
 }
 
-type DesignDirection = "workbench" | "console" | "ide" | "command";
-
-const designDirections: { id: DesignDirection; name: string; description: string }[] = [
-  { id: "workbench", name: "开发者工作台", description: "紧凑、沉稳，以对话和执行流为中心。" },
-  { id: "console", name: "沉浸式 AI 控制台", description: "突出 AI 正在工作的过程，减少外围干扰。" },
-  { id: "ide", name: "轻量 IDE", description: "为文件、分支与部署预留清晰的三栏空间。" },
-  { id: "command", name: "任务指挥台", description: "用任务状态和交付信息组织自动开发工作。" },
-];
-
-function DesignPreview() {
-  const [selected, setSelected] = useState<DesignDirection>("workbench");
-  const direction = designDirections.find((item) => item.id === selected)!;
-  return <main className="design-preview">
-    <header className="preview-header"><a href="/">Auto Development</a><div><span>视觉方向预览</span><b>选择一个方向，再进入正式设计</b></div></header>
-    <section className="preview-intro"><h1>对话式自动开发工作台</h1><p>四种方向均保留项目、对话、命令确认和使用状态，只调整信息层级与视觉表达。</p></section>
-    <nav className="preview-selector" aria-label="设计方向">{designDirections.map((item) => <button key={item.id} className={selected === item.id ? "selected" : ""} onClick={() => setSelected(item.id)}><b>{item.name}</b><span>{item.description}</span></button>)}</nav>
-    <section className={`preview-stage ${selected}`} aria-label={`${direction.name}预览`}><PreviewFrame direction={selected} /><div className="preview-caption"><span>当前方向</span><h2>{direction.name}</h2><p>{direction.description}</p></div></section>
-    <section className="preview-grid" aria-label="全部方向缩略预览">{designDirections.map((item) => <button key={item.id} className={`preview-thumbnail ${item.id} ${selected === item.id ? "selected" : ""}`} onClick={() => setSelected(item.id)}><PreviewFrame direction={item.id} compact /><span>{item.name}</span></button>)}</section>
-  </main>;
-}
-
-function PreviewFrame({ direction, compact = false }: { direction: DesignDirection; compact?: boolean }) {
-  const title = direction === "command" ? "任务 #024 / 侧边栏 Tab" : "auto_test";
-  return <div className={`preview-frame ${direction} ${compact ? "compact" : ""}`}>
-    <aside className="preview-rail"><b>A</b><i></i><i></i><i></i><small>+</small></aside>
-    {direction === "ide" && <aside className="preview-explorer"><span>EXPLORER</span><b>auto_test</b><em>src</em><em>components</em><em>Sidebar.tsx</em><em>package.json</em></aside>}
-    <div className="preview-main"><header><div><span>{direction === "console" ? "CLAUDE SESSION" : direction === "command" ? "ACTIVE TASK" : "PROJECT"}</span><h3>{title}</h3></div><div className="preview-head-meta"><small>Sonnet</small><small>ctx 24%</small><b>运行中</b></div></header>
-      <div className="preview-content">{direction === "command" && <div className="preview-task-line"><b>实现侧边栏 Tab</b><span>分析中</span><i></i><i></i><i></i></div>}
-        {direction === "ide" && <div className="preview-tabs"><b>Sidebar.tsx</b><span>App.tsx</span></div>}
-        <div className="preview-response"><span>Claude</span><p>我会先检查现有侧边栏结构，再添加一个可配置的 Tab，并确保移动端布局保持稳定。</p></div>
-        <div className="preview-command"><div><b>$</b><span>检查当前项目结构</span><em>刚刚</em></div><code>rg --files src</code><small>等待确认</small></div>
-        <div className="preview-response short"><span>Claude</span><p>已找到导航组件，准备修改。</p></div>
-      </div>
-      <footer><span>描述希望 Claude 完成的工作...</span><b>发送</b></footer>
-    </div>
-    {direction === "ide" && <aside className="preview-inspector"><span>INSPECTOR</span><b>本次任务</b><em>3 次工具调用</em><em>1.2k 输入 Token</em><em>$0.0042 估算</em></aside>}
-  </div>;
+function DeleteProjectDialog({ project, busy, close, confirm }: { project: Project; busy: boolean; close: () => void; confirm: () => Promise<void> }) {
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-project-title"><section className="modal"><header><div><label>DELETE PROJECT</label><h2 id="delete-project-title">删除项目</h2></div><button title="关闭" disabled={busy} onClick={close}>x</button></header><p className="permission-confirmation">确定要从列表中删除项目 <b>{project.name}</b> 吗？此操作会同时删除该项目下的所有对话历史、任务、运行记录及相关数据。项目源文件不会被删除。</p><footer><button className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary danger" disabled={busy} onClick={() => void confirm()}>{busy ? "删除中" : "确认删除"}</button></footer></section></div>;
 }
 
 function Importer({ close, created, fail }: { close: () => void; created: (project: Project) => void; fail: (message: string) => void }) {
@@ -452,7 +478,7 @@ function Importer({ close, created, fail }: { close: () => void; created: (proje
     try { created(await api<Project>("/api/projects", { method: "POST", body: JSON.stringify({ path, name: result?.name }) })); }
     catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to load project"); setBusy(false); }
   };
-  return <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>WSL LOCAL RUNNER</label><h2>加载项目</h2></div><button title="关闭" onClick={close}>x</button></header><div className="path"><button title="上级目录" onClick={() => void browse(parent)}>Up</button><code>{path}</code><button className="secondary" disabled={busy} onClick={() => void validate()}>校验目录</button></div><div className="dirs">{dirs.map((dir) => <button key={dir.path} onClick={() => void browse(dir.path)}><b>{dir.name}</b><small>{dir.path}</small></button>)}</div>{result && <div className={result.claudeReady ? "valid" : "invalid"}><b>{result.name}</b><span>Git: {result.gitReady ? result.gitBranch : "未检测到 Git 仓库（仍可加载）"}</span><span>Claude Code: {result.claudeReady ? "可用" : "不可用"}</span></div>}<footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={!result?.claudeReady || busy} onClick={() => void create()}>{busy ? "处理中" : "确认加载"}</button></footer></section></div>;
+  return <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>LOAD PROJECT</label><h2>加载项目</h2></div><button title="关闭" onClick={close}>x</button></header><div className="path"><button title="上级目录" onClick={() => void browse(parent)}>Up</button><code>{path}</code><button className="secondary" disabled={busy} onClick={() => void validate()}>校验目录</button></div><div className="dirs">{dirs.map((dir) => <button key={dir.path} onClick={() => void browse(dir.path)}><b>{dir.name}</b><small>{dir.path}</small></button>)}</div>{result && <div className={result.claudeReady ? "valid" : "invalid"}><b>{result.name}</b><span>Git: {result.gitReady ? result.gitBranch : "未检测到 Git 仓库（仍可加载）"}</span><span>Claude Code: {result.claudeReady ? "可用" : "不可用"}</span></div>}<footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={!result?.claudeReady || busy} onClick={() => void create()}>{busy ? "处理中" : "确认加载"}</button></footer></section></div>;
 }
 
 function Chat({ project, fail, back }: { project: Project; fail: (message: string) => void; back: () => void }) {
@@ -485,14 +511,26 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
   const [showAgentExecution, setShowAgentExecution] = useState<string | null>(null);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [historyCursor, setHistoryCursor] = useState("");
+  const [pendingConfirm, setPendingConfirm] = useState<{ title: string; message: React.ReactNode; danger?: boolean; onConfirm: () => void; onCancel: () => void } | null>(null);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
   const top = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLFormElement>(null);
   const historyIndex = useRef<number | null>(null);
   const draftBeforeHistory = useRef("");
   const finishedRunIds = useRef(new Set<string>());
   const usageRequestVersion = useRef(0);
   const usageConversationID = useRef<string | null>(null);
+  /** Mirror of conversation state used inside async callbacks so they can check
+   *  whether the conversation has changed without reaching into setState updaters. */
+  const conversationRef = useRef<Conversation | null>(null);
+  conversationRef.current = conversation;
+  /** Tracks whether the user is near the bottom of the timeline — when false,
+   *  auto-scroll is suppressed so the user can read earlier messages undisturbed. */
+  const userNearBottom = useRef(true);
+  /** When the user has scrolled away and new content arrives, this flag is set
+   *  so the scroll-to-bottom button can indicate unseen content. */
+  const [hasNewContent, setHasNewContent] = useState(false);
   const rememberFinishedRun = (runID: string) => {
     const finished = finishedRunIds.current;
     finished.add(runID);
@@ -599,7 +637,25 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
         if (event.type === "usage.updated" || event.type.startsWith("run.")) {
           void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
         }
-        if (event.type.startsWith("run.")) { rememberFinishedRun(event.runId); setRun((active) => active === event.runId ? "" : active); setStopping(false); }
+        if (event.type.startsWith("run.")) {
+          // When a run fails or is interrupted, the server may append an
+          // interrupt marker message. Display it immediately without waiting
+          // for the next HTTP reload.
+          const runPayload = asRecord(event.payload);
+          if (typeof runPayload.interruptedMarker === "string" && runPayload.interruptedMarker) {
+            const markerMessage: Message = { id: `${event.id}:interrupted`, runId: event.runId, role: "assistant", content: runPayload.interruptedMarker, createdAt: event.createdAt };
+            setMessages((old) => mergeConversationItems(old, [markerMessage]));
+          }
+          rememberFinishedRun(event.runId);
+          setRun((active) => active === event.runId ? "" : active);
+          setStopping(false);
+          // Reload from HTTP to ensure the frontend has the complete event list.
+          // WebSocket frames may be lost during brief disconnections, which can
+          // cause subagent tool_result events to go missing.  Without those
+          // events buildAgentExecutions marks finished subagents as "unresolved"
+          // and the UI appears stuck until the user sends another message.
+          void reload();
+        }
       };
       socket.onerror = () => {
         // The onclose handler will fire after this and handle reconnection.
@@ -611,6 +667,12 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
         const maxAttempts = 12;
         if (reconnectAttempts >= maxAttempts) {
           fail("实时连接已断开，请刷新页面重新建立连接。");
+          // The WebSocket is permanently dead. Clear the active run state and
+          // reload via HTTP so the UI doesn't stay stuck showing "Claude is
+          // processing" when the backend has already finished (or failed).
+          setRun("");
+          setStopping(false);
+          void reload();
           return;
         }
         const delay = Math.min(500 * Math.pow(2, reconnectAttempts - 1), 15_000);
@@ -640,6 +702,40 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     return () => window.clearInterval(timer);
   }, [run]);
 
+  // Poll the conversation state via HTTP while a run is active, as a safety net.
+  // If the WebSocket dies permanently (e.g. after exhausting reconnection
+  // attempts), this polling ensures the UI eventually learns that the run has
+  // finished and stops showing "Claude 正在处理已发送内容" forever.
+  useEffect(() => {
+    if (!run || !conversation?.id) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await api<{ activeRunId: string | null }>(`/api/conversations/${conversation.id}?limit=1`);
+        if (cancelled) return;
+        if (!data.activeRunId) {
+          // Reload from HTTP to also refresh events, not just clear the run
+          // state.  This covers the case where the run finished but the
+          // WebSocket delivered the run.* event without the preceding subagent
+          // tool_result events (or they were lost entirely).
+          const full = await api<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
+          if (cancelled) return;
+          setMessages((current) => mergeConversationItems(full.messages, current));
+          setEvents((current) => mergeConversationItems(full.events, current));
+          setRun(full.activeRunId || ""); setHasMoreHistory(full.hasMore); setHistoryCursor(full.nextCursor || "");
+          setStopping(false);
+        }
+      } catch {
+        // Silently ignore polling errors — the WebSocket is the primary channel.
+      }
+    };
+    const interval = window.setInterval(() => { void poll(); }, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [run, conversation?.id]);
+
   useEffect(() => {
     if (!conversation) return;
     historyIndex.current = null;
@@ -667,10 +763,12 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
   const executionByRun = useMemo(() => new Map(agentExecutions.map((execution) => [execution.runId, execution])), [agentExecutions]);
   const anchoredExecutionRunIDs = useMemo(() => new Set(primaryMessages.flatMap((message) => message.role === "user" && message.runId && executionByRun.has(message.runId) ? [message.runId] : [])), [executionByRun, primaryMessages]);
   const loadOlderHistory = async () => {
-    if (!conversation || !historyCursor || loadingOlderHistory) return;
+    if (!conversation || !historyCursor || loadingOlderHistory || sending) return;
+    const conversationID = conversation.id;  // capture before async — guard against mid-flight switch
     setLoadingOlderHistory(true);
     try {
-      const data = await api<{ messages: Message[]; events: Event[]; hasMore: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400&cursor=${encodeURIComponent(historyCursor)}`);
+      const data = await api<{ messages: Message[]; events: Event[]; hasMore: boolean; nextCursor: string }>(`/api/conversations/${conversationID}?limit=400&cursor=${encodeURIComponent(historyCursor)}`);
+      if (conversationRef.current?.id !== conversationID) return;  // conversation switched, discard
       setMessages((current) => mergeConversationItems(data.messages, current));
       setEvents((current) => mergeConversationItems(data.events, current));
       setHasMoreHistory(data.hasMore);
@@ -687,24 +785,68 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     }
     return null;
   }, [timeline]);
+  /** Scroll so the last message sits just above the composer, accounting for the
+   *  composer's actual rendered height at the time of the scroll. */
+  const scrollToBottom = useCallback(() => {
+    const target = bottom.current;
+    const composer = composerRef.current;
+    if (!target) return;
+    const targetBottom = target.getBoundingClientRect().bottom + window.scrollY;
+    const composerHeight = composer ? composer.getBoundingClientRect().height : 0;
+    // Align the spacer's bottom edge to the top of the composer, with a small
+    // 8 px breathing room so text doesn't kiss the border.
+    const offset = composerHeight + 8;
+    window.scrollTo({ top: targetBottom - window.innerHeight + offset, behavior: "smooth" });
+    setHasNewContent(false);
+    userNearBottom.current = true;
+  }, []);
+
+  const scrollToTop = useCallback(() => {
+    top.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  // Track whether the user has scrolled away from the bottom so we can suppress
+  // auto-scroll and let them read earlier messages without interruption.
+  // Uses the composer height as a dynamic threshold — if the user is within
+  // one composer-height from the bottom, they are considered "near bottom".
+  useEffect(() => {
+    const onScroll = () => {
+      const distanceFromBottom = document.documentElement.scrollHeight - window.scrollY - window.innerHeight;
+      const composerHeight = composerRef.current?.getBoundingClientRect().height ?? 80;
+      const threshold = Math.max(composerHeight, 60); // at least 60 px to avoid jitter on tiny windows
+      const nearBottom = distanceFromBottom <= threshold;
+      userNearBottom.current = nearBottom;
+      // Only call setHasNewContent when the flag actually changes to avoid
+      // unnecessary React re-renders on every scroll tick.
+      if (nearBottom) {
+        setHasNewContent((prev) => prev ? false : prev);
+      }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
   useEffect(() => {
     if (pendingApproval) return; // never scroll away while a command is waiting for approval
-    bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [timeline.length, run, pendingApproval]);
-
-  const scrollToTop = () => top.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  const scrollToBottom = () => bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    if (userNearBottom.current) {
+      scrollToBottom();
+    } else {
+      setHasNewContent((prev) => prev ? prev : true);
+    }
+  }, [timeline.length, run, pendingApproval, scrollToBottom]);
 
   const sendContent = async (rawContent: string, clearDraft = true) => {
     if (!conversation || sending || shortcutBusy) return;
     const content = rawContent.trim();
     if (!content) return;
     if (content === "/resume") { if (clearDraft) setText(""); openConversationHistory(); return; }
+    const conversationID = conversation.id;  // capture before async — the conversation may change while we wait
     setSending(true);
     if (clearDraft) setText("");
     setShowPermissionMenu(false); historyIndex.current = null; draftBeforeHistory.current = "";
     try {
-      const data = await api<{ message: Message; runId: string }>(`/api/conversations/${conversation.id}/messages`, { method: "POST", body: JSON.stringify({ content }) });
+      const data = await api<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content }) });
+      if (conversationRef.current?.id !== conversationID) return;  // conversation switched mid-flight, discard
       setMessages((old) => [...old, data.message]); setInputHistory((old) => [...old.slice(-99), data.message.content]); setHistoryRefresh((version) => version + 1); setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
       void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
@@ -731,7 +873,9 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     setShortcutBusy(shortcut.id);
     try {
       const action = shortcut.defaultAction === "confirm" ? "confirm" : "run";
-      const data = await api<{ message: Message; runId: string }>(`/api/conversations/${conversation.id}/shortcuts/${shortcut.id}/run`, { method: "POST", body: JSON.stringify({ variables, action }) });
+      const conversationID = conversation.id;  // capture before async — guard against mid-flight conversation switch
+      const data = await api<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/shortcuts/${shortcut.id}/run`, { method: "POST", body: JSON.stringify({ variables, action }) });
+      if (conversationRef.current?.id !== conversationID) return;  // conversation switched, discard
       setMessages((old) => [...old, data.message]);
       setInputHistory((old) => [...old.slice(-99), data.message.content]);
       setHistoryRefresh((version) => version + 1);
@@ -742,6 +886,7 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     finally { setShortcutBusy(""); }
   };
   const newConversation = async (permissionMode: PermissionMode) => {
+    if (sending || shortcutBusy) { setShowNewConversation(false); return; }
     try {
       const next = await api<Conversation>(`/api/projects/${project.id}/conversations?new=true`, { method: "POST", body: JSON.stringify({ permissionMode }) });
       setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setShowAgentExecution(null); setHasMoreHistory(false); setHistoryCursor(""); setConversation(next);
@@ -752,6 +897,7 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
   };
   const activateConversation = async (item: Conversation) => {
     if (!conversation || item.id === conversation.id || item.status === "running") { setShowHistory(false); return; }
+    if (sending || shortcutBusy) { setShowHistory(false); return; }
     setActivatingConversation(item.id);
     try {
       const next = await api<Conversation>(`/api/conversations/${item.id}/activate`, { method: "POST" });
@@ -786,15 +932,40 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to resolve command approval"); }
     finally { setResolving(""); }
   };
+  const stopRunInternal = async (force: boolean) => {
+    const runID = run;
+    if (!runID) return;
+    const url = force ? `/api/runs/${runID}/stop?force=true` : `/api/runs/${runID}/stop`;
+    const result = await api<{ status: string }>(url, { method: "POST" });
+    if (result.status !== "stopping") { rememberFinishedRun(runID); setRun((active) => active === runID ? "" : active); setStopping(false); }
+  };
   const stopRun = async () => {
     if (!run || stopping) return;
-    const runID = run;
     setStopping(true);
     try {
-      const result = await api<{ status: string }>(`/api/runs/${runID}/stop`, { method: "POST" });
-      if (result.status !== "stopping") { rememberFinishedRun(runID); setRun((active) => active === runID ? "" : active); setStopping(false); }
+      await stopRunInternal(false);
     }
-    catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to stop run"); setStopping(false); }
+    catch (cause) {
+      const message = cause instanceof Error ? cause.message : "";
+      if (message.includes("queued") || message.includes("other queued") || message.includes("other queued or running")) {
+        setPendingConfirm({
+          title: "强制停止",
+          message: "该对话还有其他排队中或执行中的请求，强制停止将一并取消它们。是否继续？",
+          danger: true,
+          onConfirm: () => {
+            setPendingConfirm(null);
+            void stopRunInternal(true).catch((cause) => {
+              fail(cause instanceof Error ? cause.message : "Unable to stop run");
+              setStopping(false);
+            });
+          },
+          onCancel: () => { setPendingConfirm(null); setStopping(false); },
+        });
+        return;
+      }
+      fail(cause instanceof Error ? cause.message : "Unable to stop run");
+      setStopping(false);
+    }
   };
   const handleTextChange = (value: string) => {
     historyIndex.current = null;
@@ -869,8 +1040,8 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
           <span>{usage ? `${usage.session.taskCount} 次任务` : "使用状态加载中"}</span>
           <button className="usage-trigger" onClick={() => setShowUsage(true)}>使用状态</button>
         </div>
-        <button className="secondary" disabled={!!run} onClick={openConversationHistory}>历史</button>
-        <button className="secondary" disabled={!!run} onClick={() => setShowNewConversation(true)}>新会话</button>
+        <button className="secondary" disabled={sending} onClick={openConversationHistory}>历史</button>
+        <button className="secondary" disabled={!!run || sending} onClick={() => setShowNewConversation(true)}>新会话</button>
         <button className="secondary" onClick={() => setShowTasks({})}>任务</button>
         {project.gitBranch !== "非 Git 目录" && <button className="secondary git-trigger" onClick={() => setShowGit(true)}>Git: {project.gitBranch || "HEAD"}</button>}
         <span className={run ? "running" : "ready"}>{run ? "正在执行" : "已就绪"}</span>
@@ -892,22 +1063,22 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
       </aside>
       <section className="timeline">
         <div ref={top} />
-        {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
+        {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
         {timeline.length === 0 && <div className="empty"><h2>开始与 Claude Code 对话</h2><p>选择常用操作，或直接描述希望 Claude 完成的工作。</p></div>}
-        {timeline.map((item) => <div key={item.id}><div className={`timeline-entry ${item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} /> : <ToolCard action={item.action} resolving={resolving} decide={decide} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => setShowAgentExecution(item.message.runId!)} />}</div>)}
+        {timeline.map((item) => <div key={item.id}><div className={`timeline-entry ${item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : <ErrorCard item={item} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => setShowAgentExecution(item.message.runId!)} />}</div>)}
         {agentExecutions.filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => setShowAgentExecution(execution.runId)} />)}
         {run && <div className="run-indicator"><span></span>{runLabel}</div>}
         <div ref={bottom} />
       </section>
     </section>
-    <div className="scroll-buttons">
+    <div className={`scroll-buttons${hasNewContent ? " has-new" : ""}`}>
       <button type="button" className="scroll-btn scroll-to-top" title="回到顶部" onClick={scrollToTop}>↑</button>
-      <button type="button" className="scroll-btn scroll-to-bottom" title="回到底部" onClick={scrollToBottom}>↓</button>
+      <button type="button" className={`scroll-btn scroll-to-bottom${hasNewContent ? " pulse" : ""}`} title="回到底部" onClick={scrollToBottom}>↓</button>
     </div>
-    <form className={`composer${pendingApproval ? " has-approval" : ""}`} onSubmit={(event) => void send(event)}>
+    <form ref={composerRef} className={`composer${pendingApproval ? " has-approval" : ""}`} onSubmit={(event) => void send(event)}>
       {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = document.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
       <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder="描述希望 Claude 在当前项目中完成的工作..." disabled={sending || Boolean(shortcutBusy)} />
-      <div><small>{run ? runLabel : conversation?.permissionMode === "full_control" ? "Claude Code · 完全控制" : "Claude Code · 命令需确认"}</small><span className="composer-actions">{run && <button className="secondary" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<button className="primary" disabled={!text.trim() || sending || Boolean(shortcutBusy)}>{sending ? "发送中" : "发送"}</button></span></div>
+      <div><small>{run ? runLabel : conversation?.permissionMode === "full_control" ? "Claude Code · 完全控制" : "Claude Code · 命令需确认"}</small><span className="composer-actions"><button className="secondary" type="button" disabled={sending} onClick={() => void sendContent("继续", false)}>继续</button>{run && <button className="secondary" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<button className="primary" disabled={!text.trim() || sending || Boolean(shortcutBusy)}>{sending ? "发送中" : "发送"}</button></span></div>
     </form></>}
     {showNewConversation && <NewConversationDialog close={() => setShowNewConversation(false)} create={newConversation} />}
     {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={() => setShowHistory(false)} activate={activateConversation} />}
@@ -916,6 +1087,7 @@ function Chat({ project, fail, back }: { project: Project; fail: (message: strin
     {showUsage && <UsageDialog usage={usage} currentRun={currentUsage} now={usageNow} close={() => setShowUsage(false)} />}
     {shortcutEditor && <ShortcutEditor projectID={project.id} state={shortcutEditor} close={() => setShortcutEditor(null)} refresh={refreshShortcuts} fail={fail} />}
     {shortcutVariables && <ShortcutVariablesDialog state={shortcutVariables} close={() => setShortcutVariables(null)} run={(variables) => { setShortcutVariables(null); void runShortcut(shortcutVariables.shortcut, variables, true); }} />}
+    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </div>;
 }
 
@@ -933,6 +1105,7 @@ function ShortcutEditor({ projectID, state, close, refresh, fail }: { projectID:
   const [template, setTemplate] = useState(shortcut?.template || "");
   const [enabled, setEnabled] = useState(shortcut?.enabled ?? true);
   const [busy, setBusy] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<{ title: string; message: React.ReactNode; danger?: boolean; onConfirm: () => void; onCancel: () => void } | null>(null);
   const isCommand = state.kind === "command_request";
   const isSnippet = state.kind === "snippet";
 
@@ -968,18 +1141,27 @@ function ShortcutEditor({ projectID, state, close, refresh, fail }: { projectID:
     } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to save shortcut"); }
     finally { setBusy(false); }
   };
-  const remove = async () => {
-    if (!shortcut || !window.confirm(`删除“${shortcut.name}”？`)) return;
-    setBusy(true);
-    try {
-      await api(`/api/shortcuts/${shortcut.id}`, { method: "DELETE" });
-      await refresh();
-      close();
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to delete shortcut"); }
-    finally { setBusy(false); }
+  const remove = () => {
+    if (!shortcut) return;
+    setPendingConfirm({
+      title: "删除快捷方式",
+      message: <>删除"<b>{shortcut.name}</b>"？</>,
+      danger: true,
+      onConfirm: () => void (async () => {
+        setPendingConfirm(null);
+        setBusy(true);
+        try {
+          await api(`/api/shortcuts/${shortcut.id}`, { method: "DELETE" });
+          await refresh();
+          close();
+        } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to delete shortcut"); }
+        finally { setBusy(false); }
+      })(),
+      onCancel: () => setPendingConfirm(null),
+    });
   };
 
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="shortcut-editor-title"><section className="modal shortcut-editor"><header><div><label>{isCommand ? "COMMON COMMAND" : "COMMON PROMPT"}</label><h2 id="shortcut-editor-title">{shortcut ? `编辑${isCommand ? "命令" : "提示词"}` : `新增${isCommand ? "命令" : "提示词"}`}</h2></div><button title="关闭" disabled={busy} onClick={close}>x</button></header><form onSubmit={(event) => void save(event)}><div className="shortcut-editor-body"><label>名称<input autoFocus required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} placeholder={isCommand ? "例如：清空终端" : "例如：审查当前改动"} /></label><label>{isCommand ? "命令" : "提示词"}<textarea required maxLength={12000} value={template} onChange={(event) => setTemplate(event.target.value)} placeholder={isCommand ? "例如：clear" : "描述希望 Claude 在当前项目完成的工作"} /></label>{shortcut && <label className="shortcut-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用此项</label>}{isCommand && <p>点击标签后会按当前会话权限请求执行该命令。</p>}</div><footer>{shortcut && <button type="button" className="danger-text" disabled={busy} onClick={() => void remove()}>删除</button>}<span></span><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存"}</button></footer></form></section></div>;
+  return <><div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="shortcut-editor-title"><section className="modal shortcut-editor"><header><div><label>{isCommand ? "COMMON COMMAND" : "COMMON PROMPT"}</label><h2 id="shortcut-editor-title">{shortcut ? `编辑${isCommand ? "命令" : "提示词"}` : `新增${isCommand ? "命令" : "提示词"}`}</h2></div><button title="关闭" disabled={busy} onClick={close}>x</button></header><form onSubmit={(event) => void save(event)}><div className="shortcut-editor-body"><label>名称<input autoFocus required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} placeholder={isCommand ? "例如：清空终端" : "例如：审查当前改动"} /></label><label>{isCommand ? "命令" : "提示词"}<textarea required maxLength={12000} value={template} onChange={(event) => setTemplate(event.target.value)} placeholder={isCommand ? "例如：clear" : "描述希望 Claude 在当前项目完成的工作"} /></label>{shortcut && <label className="shortcut-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用此项</label>}{isCommand && <p>点击标签后会按当前会话权限请求执行该命令。</p>}</div><footer>{shortcut && <button type="button" className="danger-text" disabled={busy} onClick={() => void remove()}>删除</button>}<span></span><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存"}</button></footer></form></section></div>{pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}</>;
 }
 
 function UsageDialog({ usage, currentRun, now, close }: { usage: ConversationUsageResponse | null; currentRun: RunUsage | undefined; now: number; close: () => void }) {
@@ -1001,7 +1183,7 @@ function UsageDialog({ usage, currentRun, now, close }: { usage: ConversationUsa
   const session = usage?.session;
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><header><div><label>CLAUDE CODE USAGE</label><h2 id="usage-title">使用状态</h2></div><button title="关闭" onClick={close}>x</button></header><div className="usage-body">
     <section className="usage-section"><div className="usage-section-head"><h3>当前任务</h3>{task?.model && <span>{task.model}</span>}</div>{task ? <><dl className="usage-grid">{metrics.map(([label, value]) => <div key={String(label)}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>{!hasTaskUsage && !active && <p className="usage-note">该任务未获得 Claude 的最终统计数据。</p>}</> : <p className="usage-note">当前会话还没有可用的任务统计。</p>}</section>
-    <section className="usage-section"><div className="usage-section-head"><h3>当前会话</h3><span className={`context-state ${contextLevel(usage?.context)}`}>{contextLabel(usage?.context)}</span></div>{usage?.context.contextInputTokens && usage.context.contextWindow > 0 && <p className="context-detail">{formatTokens(usage.context.contextInputTokens)} / {formatTokens(usage.context.contextWindow)}</p>}{session && <dl className="usage-grid session-grid"><div><dt>任务次数</dt><dd>{session.taskCount}</dd></div><div><dt>Agent 轮次</dt><dd>{session.agentTurns}</dd></div><div><dt>模型步骤</dt><dd>{session.modelSteps}</dd></div><div><dt>工具调用</dt><dd>{session.toolCalls}</dd></div><div><dt>输入 / 输出</dt><dd>{formatTokens(session.inputTokens)} / {formatTokens(session.outputTokens)}</dd></div><div><dt>缓存读取 / 创建</dt><dd>{formatTokens(session.cacheReadTokens)} / {formatTokens(session.cacheCreationTokens)}</dd></div><div><dt>费用估算</dt><dd>{formatCost(session.estimatedCostUsd)}</dd></div></dl>}</section>
+    <section className="usage-section"><div className="usage-section-head"><h3>当前会话</h3><span className={`context-state ${contextLevel(usage?.context)}`}>{contextLabel(usage?.context)}</span></div>{(usage?.context.contextWindow ?? 0) > 0 && <p className="context-detail">{usage?.context.contextInputTokens ? `${formatTokens(usage.context.contextInputTokens)} / ${formatTokens(usage.context.contextWindow!)}` : "等待上下文快照"}</p>}{session && <dl className="usage-grid session-grid"><div><dt>任务次数</dt><dd>{session.taskCount}</dd></div><div><dt>Agent 轮次</dt><dd>{session.agentTurns}</dd></div><div><dt>模型步骤</dt><dd>{session.modelSteps}</dd></div><div><dt>工具调用</dt><dd>{session.toolCalls}</dd></div><div><dt>输入 / 输出</dt><dd>{formatTokens(session.inputTokens)} / {formatTokens(session.outputTokens)}</dd></div><div><dt>缓存读取 / 创建</dt><dd>{formatTokens(session.cacheReadTokens)} / {formatTokens(session.cacheCreationTokens)}</dd></div><div><dt>费用估算</dt><dd>{formatCost(session.estimatedCostUsd)}</dd></div></dl>}</section>
     {usage?.models.length ? <section className="usage-section"><div className="usage-section-head"><h3>模型用量</h3><span>包含子代理</span></div><div className="model-usage-list">{usage.models.map((model) => <div key={model.model}><b>{model.model}</b><span>{formatTokens(model.inputTokens)} 输入 · {formatTokens(model.outputTokens)} 输出</span><em>{formatCost(model.estimatedCostUsd)}</em></div>)}</div></section> : null}
     <p className="usage-disclaimer">费用为 Claude Code 客户端估算值，不代表账单金额。</p>
   </div><footer><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
@@ -1024,12 +1206,12 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
   };
   return <div className="backdrop history-backdrop" role="dialog" aria-modal="true" aria-label="会话历史"><section className="modal conversation-history"><header><div><label>CLAUDE CODE SESSION</label><h2>恢复会话</h2></div><button title="关闭" onClick={close}>x</button></header><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={keyDown} placeholder="搜索历史会话" /><div className="history-list">{filtered.length === 0 ? <p className="history-empty">没有匹配的会话</p> : filtered.map((item, index) => {
     const runningElsewhere = item.status === "running" && item.id !== activeID;
-    return <button key={item.id} className={`history-item ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""}`} disabled={Boolean(busyID) || runningElsewhere} onMouseEnter={() => setSelected(index)} onClick={() => select(item)}><span><b>{item.title || "新会话"}</b><small>{item.preview || "尚未发送消息"}</small></span><em>{item.id === activeID ? "当前" : runningElsewhere ? "运行中" : formatHistoryTime(item.lastActivityAt)}</em></button>;
+    return <button key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""}`} disabled={Boolean(busyID) || runningElsewhere} onMouseEnter={() => setSelected(index)} onClick={() => select(item)}><span><b>{item.title || "新会话"}</b><small>{item.preview || "尚未发送消息"}</small></span><em>{busyID === item.id ? "切换中…" : item.id === activeID ? "当前" : runningElsewhere ? "运行中" : formatHistoryTime(item.lastActivityAt)}</em></button>;
   })}</div><footer><small>输入 /resume 可再次打开</small><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
 }
 
 function NewConversationDialog({ close, create }: { close: () => void; create: (permissionMode: PermissionMode) => Promise<void> }) {
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>("approval_required");
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>("full_control");
   const [creating, setCreating] = useState(false);
   const submit = async () => { setCreating(true); try { await create(permissionMode); } finally { setCreating(false); } };
   return <div className="backdrop" role="dialog" aria-modal="true"><section className="modal permission-dialog"><header><div><label>CLAUDE CODE SESSION</label><h2>新会话</h2></div><button title="关闭" onClick={close}>x</button></header><div className="permission-options"><button className={permissionMode === "approval_required" ? "active" : ""} onClick={() => setPermissionMode("approval_required")}><b>默认权限</b><span>每条终端命令执行前等待确认。</span></button><button className={permissionMode === "full_control" ? "active danger" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Claude 可直接执行命令，不会等待确认。</span></button></div><footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={creating} onClick={() => void submit()}>{creating ? "创建中" : "创建会话"}</button></footer></section></div>;
@@ -1042,6 +1224,10 @@ function FullControlConfirmationDialog({ close, confirm, changing }: { close: ()
 function MessageCard({ message }: { message: Message }) {
   const isUser = message.role === "user";
   return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : "C"}</span><b>{isUser ? "你" : "Claude"}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div></article>;
+}
+
+function ErrorCard({ item }: { item: TimelineItem & { kind: "error" } }) {
+  return <article className="error-card"><header><span className="error-card-icon">!</span><div><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></header><p>{item.detail}</p></article>;
 }
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
@@ -1090,7 +1276,8 @@ function AgentExecutionDialog({ execution, close }: { execution: AgentExecution;
 }
 
 function AgentTree({ agent, selectedID, select, depth }: { agent: AgentNode; selectedID: string; select: (id: string) => void; depth: number }) {
-  return <div className="agent-tree-branch"><button className={`agent-tree-row ${agent.id === selectedID ? "selected" : ""}`} style={{ paddingLeft: `${12 + depth * 16}px` }} onClick={() => select(agent.id)}><span className={`agent-status ${agent.status}`}></span><span><b>{agent.summary}</b><small>{agentStatusLabel(agent.status)} · {agent.logs.length} 条记录</small></span></button>{agent.children.map((child) => <AgentTree key={child.id} agent={child} selectedID={selectedID} select={select} depth={depth + 1} />)}</div>;
+  const cappedDepth = Math.min(depth, 6);
+  return <div className="agent-tree-branch"><button className={`agent-tree-row ${agent.id === selectedID ? "selected" : ""}`} style={{ paddingLeft: `${12 + cappedDepth * 16}px` }} onClick={() => select(agent.id)}><span className={`agent-status ${agent.status}`}></span><span><b>{agent.summary}</b><small>{agentStatusLabel(agent.status)} · {agent.logs.length} 条记录</small></span></button>{agent.children.map((child) => <AgentTree key={child.id} agent={child} selectedID={selectedID} select={select} depth={depth + 1} />)}</div>;
 }
 
 function ApprovalBanner({ action, resolving, decide, scrollToCard }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void>; scrollToCard: () => void }) {
