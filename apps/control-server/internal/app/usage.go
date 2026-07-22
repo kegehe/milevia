@@ -223,6 +223,14 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 		accumulator.cacheRead = event.Usage.CacheReadTokens
 		accumulator.cacheCreation = event.Usage.CacheCreationTokens
 		accumulator.hasResult = true
+		// The result event carries the last API call's input token count in
+		// usage.input_tokens.  This is the best available approximation of the
+		// current context window utilisation.  Per-assistant usage.input_tokens
+		// is always zero during streaming, so we refresh the snapshot here on
+		// every result event.
+		if event.Usage.InputTokens > 0 {
+			accumulator.contextInput = event.Usage.InputTokens
+		}
 		for model, usage := range event.ModelUsage {
 			accumulator.models[model] = ModelUsage{Model: model, InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, CacheReadTokens: usage.CacheReadTokens, CacheCreationTokens: usage.CacheCreationTokens, EstimatedCostUSD: usage.CostUSD, ContextWindow: usage.ContextWindow}
 		}
@@ -324,6 +332,8 @@ func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.QueryRowContext(r.Context(), `select id,status from runs where conversation_id=? and status='running' order by created_at desc limit 1`, conversationID).Scan(&runID, &status); err == nil {
 		response.CurrentRun = s.liveRunUsage(runID, status)
 		if response.CurrentRun != nil {
+			// Fill contextWindow from model history when the run hasn't
+			// produced a result event yet.
 			if response.CurrentRun.ContextWindow == 0 && response.CurrentRun.Model != "" {
 				for _, model := range response.Models {
 					if model.Model == response.CurrentRun.Model {
@@ -333,12 +343,60 @@ func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			response.Context = *response.CurrentRun
+
+			// In-progress runs already have a row in the runs table (counted
+			// by the session SQL), but their usage stats only live in memory.
+			// Merge the live accumulator data so the usage dialog reflects
+			// work in progress.
+			response.Session.AgentTurns += response.CurrentRun.AgentTurns
+			response.Session.ModelSteps += response.CurrentRun.ModelSteps
+			response.Session.ToolCalls += response.CurrentRun.ToolCalls
+			response.Session.SubagentCount += response.CurrentRun.SubagentCount
+			response.Session.InputTokens += response.CurrentRun.InputTokens
+			response.Session.OutputTokens += response.CurrentRun.OutputTokens
+			response.Session.CacheReadTokens += response.CurrentRun.CacheReadTokens
+			response.Session.CacheCreationTokens += response.CurrentRun.CacheCreationTokens
+			response.Session.EstimatedCostUSD += response.CurrentRun.EstimatedCostUSD
+
+			// Merge live model usage so the per-model breakdown stays current.
+			for _, m := range response.CurrentRun.Models {
+				found := false
+				for i, existing := range response.Models {
+					if existing.Model == m.Model {
+						response.Models[i].InputTokens += m.InputTokens
+						response.Models[i].OutputTokens += m.OutputTokens
+						response.Models[i].CacheReadTokens += m.CacheReadTokens
+						response.Models[i].CacheCreationTokens += m.CacheCreationTokens
+						response.Models[i].EstimatedCostUSD += m.EstimatedCostUSD
+						found = true
+						break
+					}
+				}
+				if !found {
+					response.Models = append(response.Models, m)
+				}
+			}
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// Fallback: when context_input_tokens is 0 but total input_tokens is
+	// available (the per-assistant usage.input_tokens is always 0 during
+	// streaming), use input_tokens so the UI can show a context percentage.
+	normalizeContext(&response.Context)
+	if response.LatestRun != nil {
+		normalizeContext(response.LatestRun)
+	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// normalizeContext fills in context_input_tokens from total input_tokens when
+// streaming assistant events don't carry per-message usage data (always 0).
+func normalizeContext(usage *RunUsage) {
+	if usage.ContextInputTokens == 0 && usage.InputTokens > 0 {
+		usage.ContextInputTokens = usage.InputTokens
+	}
 }
 
 func (s *Server) getRunUsage(w http.ResponseWriter, r *http.Request) {
@@ -352,6 +410,7 @@ func (s *Server) getRunUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if live := s.liveRunUsage(runID, status); live != nil {
+		normalizeContext(live)
 		writeJSON(w, http.StatusOK, live)
 		return
 	}
@@ -364,6 +423,7 @@ func (s *Server) getRunUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	normalizeContext(usage)
 	writeJSON(w, http.StatusOK, usage)
 }
 

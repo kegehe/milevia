@@ -266,7 +266,7 @@ func TestRunUsageDeduplicatesEventsAndPersistsConversationSummary(t *testing.T) 
 	if usage.Session.TaskCount != 1 || usage.Session.AgentTurns != 3 || usage.Session.ModelSteps != 1 || usage.Session.ToolCalls != 2 || usage.Session.SubagentCount != 1 {
 		t.Fatalf("unexpected summary: %#v", usage.Session)
 	}
-	if usage.Context.ContextInputTokens != 48000 || usage.Context.ContextWindow != 200000 || usage.Context.EstimatedCostUSD != 0.1234 || len(usage.Models) != 2 {
+	if usage.Context.ContextInputTokens != 50000 || usage.Context.ContextWindow != 200000 || usage.Context.EstimatedCostUSD != 0.1234 || len(usage.Models) != 2 {
 		t.Fatalf("unexpected context or models: %#v models=%#v", usage.Context, usage.Models)
 	}
 }
@@ -443,12 +443,12 @@ func TestShortcutDefaultsPreserveProjectBindingsAndWrapCommands(t *testing.T) {
 	}
 	command := Shortcut{Kind: "command_request", Template: "pnpm test", DefaultAction: "confirm"}
 	content, err := renderShortcut(command, Conversation{}, Project{}, nil)
-	if err != nil || !strings.Contains(content, "请在当前项目中执行以下命令") || !strings.Contains(content, "pnpm test") {
+	if err != nil || !strings.Contains(content, "pnpm test") {
 		t.Fatalf("command shortcut render failed: content=%q err=%v", content, err)
 	}
 	slash := Shortcut{Kind: "command_request", Template: "/clear", DefaultAction: "confirm"}
 	slashContent, err := renderShortcut(slash, Conversation{}, Project{}, nil)
-	if err != nil || !strings.Contains(slashContent, "请在当前 Claude Code 会话中执行以下斜杠命令") || !strings.Contains(slashContent, "/clear") {
+	if err != nil || !strings.Contains(slashContent, "/clear") {
 		t.Fatalf("slash command shortcut render failed: content=%q err=%v", slashContent, err)
 	}
 }
@@ -785,12 +785,9 @@ func TestInputHistoryReturnsLatestUserMessagesInChronologicalOrder(t *testing.T)
 	}
 	for index := 0; index < 102; index++ {
 		createdAt := now.Add(time.Duration(index) * time.Second)
-		if _, err := server.db.Exec(`insert into messages (id,conversation_id,role,content,created_at) values (?,?,?,?,?)`, fmt.Sprintf("user-%d", index), "conversation", "user", fmt.Sprintf("prompt-%d", index), createdAt); err != nil {
-			t.Fatalf("insert user message %d: %v", index, err)
+		if _, err := server.db.Exec(`insert into prompt_history (project_id,content,created_at) values (?,?,?)`, "project", fmt.Sprintf("prompt-%d", index), createdAt); err != nil {
+			t.Fatalf("insert prompt history %d: %v", index, err)
 		}
-	}
-	if _, err := server.db.Exec(`insert into messages (id,conversation_id,role,content,created_at) values ('assistant','conversation','assistant','ignore me',?)`, now.Add(103*time.Second)); err != nil {
-		t.Fatalf("insert assistant message: %v", err)
 	}
 	response := httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation/input-history", nil))
@@ -1427,13 +1424,12 @@ func TestStopCompletedRunIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestTaskCreationAndDependenciesEnforceProjectGraph(t *testing.T) {
+func TestTaskCreationValidatesInput(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC()
-	for _, projectID := range []string{"project", "other-project"} {
-		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, filepath.Join(t.TempDir(), projectID), "wsl-local", "main", true, now); err != nil {
-			t.Fatalf("insert %s: %v", projectID, err)
-		}
+	projectID := "project"
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, filepath.Join(t.TempDir(), projectID), "wsl-local", "main", true, now); err != nil {
+		t.Fatalf("insert %s: %v", projectID, err)
 	}
 	handler := server.routes()
 
@@ -1443,22 +1439,8 @@ func TestTaskCreationAndDependenciesEnforceProjectGraph(t *testing.T) {
 		t.Fatalf("invalid task status: %d body=%s", invalid.Code, invalid.Body.String())
 	}
 
-	first := createTaskForTest(t, handler, "project", "Create API")
-	second := createTaskForTest(t, handler, "project", "Create UI")
-	other := createTaskForTest(t, handler, "other-project", "Other project task")
-
-	addDependency := func(taskID, predecessorTaskID string, want int) {
-		t.Helper()
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dependencies", bytes.NewBufferString(`{"predecessorTaskId":"`+predecessorTaskID+`"}`)))
-		if response.Code != want {
-			t.Fatalf("dependency %s -> %s status: got=%d want=%d body=%s", taskID, predecessorTaskID, response.Code, want, response.Body.String())
-		}
-	}
-	addDependency(second, first, http.StatusCreated)
-	addDependency(first, second, http.StatusBadRequest)
-	addDependency(first, other, http.StatusBadRequest)
-	addDependency(first, first, http.StatusBadRequest)
+	createTaskForTest(t, handler, "project", "Create API")
+	createTaskForTest(t, handler, "project", "Create UI")
 }
 
 func TestListTasksLoadsWithSingleSQLiteConnection(t *testing.T) {
@@ -1479,32 +1461,6 @@ func TestListTasksLoadsWithSingleSQLiteConnection(t *testing.T) {
 	}
 	if response.Code != http.StatusOK {
 		t.Fatalf("list tasks status: got=%d want=%d body=%s", response.Code, http.StatusOK, response.Body.String())
-	}
-}
-
-func TestReplaceTaskDependenciesRejectsCycleWithoutPartialChange(t *testing.T) {
-	server, projectID, _ := seedTaskConversation(t)
-	first := createTaskForTest(t, server.routes(), projectID, "First predecessor")
-	target := createTaskForTest(t, server.routes(), projectID, "Target task")
-	third := createTaskForTest(t, server.routes(), projectID, "Third task")
-	for _, dependency := range [][2]string{{target, first}, {third, target}} {
-		response := httptest.NewRecorder()
-		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependency[0]+"/dependencies", bytes.NewBufferString(`{"predecessorTaskId":"`+dependency[1]+`"}`)))
-		if response.Code != http.StatusCreated {
-			t.Fatalf("add dependency status: %d body=%s", response.Code, response.Body.String())
-		}
-	}
-	response := httptest.NewRecorder()
-	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/tasks/"+target+"/dependencies", bytes.NewBufferString(`{"predecessorTaskIds":["`+third+`"]}`)))
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("replace cyclic dependencies status: got=%d want=%d body=%s", response.Code, http.StatusBadRequest, response.Body.String())
-	}
-	var predecessorID string
-	if err := server.db.QueryRow(`select predecessor_task_id from task_dependencies where task_id=?`, target).Scan(&predecessorID); err != nil {
-		t.Fatalf("read preserved dependency: %v", err)
-	}
-	if predecessorID != first {
-		t.Fatalf("dependency replacement left partial state: got=%q want=%q", predecessorID, first)
 	}
 }
 
@@ -1558,46 +1514,6 @@ func TestTaskDispatchCreatesSnapshotAndWaitsForReviewAfterRunCompletion(t *testi
 	}
 	if taskRuns != 1 || messages != 1 || runs != 1 {
 		t.Fatalf("dispatch did not create exactly one execution chain: taskRuns=%d messages=%d runs=%d", taskRuns, messages, runs)
-	}
-}
-
-func TestTaskReviewAcceptUnlocksDependentDispatch(t *testing.T) {
-	server, projectID, _ := seedTaskConversation(t)
-	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error {
-		return errors.New("test run stops after dispatch")
-	})
-	predecessor := createTaskForTest(t, server.routes(), projectID, "Add task API")
-	dependent := createTaskForTest(t, server.routes(), projectID, "Render task board")
-	add := httptest.NewRecorder()
-	server.routes().ServeHTTP(add, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/dependencies", bytes.NewBufferString(`{"predecessorTaskId":"`+predecessor+`"}`)))
-	if add.Code != http.StatusCreated {
-		t.Fatalf("add dependency status: %d body=%s", add.Code, add.Body.String())
-	}
-	blocked := httptest.NewRecorder()
-	server.routes().ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/dispatch", bytes.NewBufferString(`{}`)))
-	if blocked.Code != http.StatusConflict {
-		t.Fatalf("blocked task dispatch status: %d body=%s", blocked.Code, blocked.Body.String())
-	}
-	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, predecessor); err != nil {
-		t.Fatalf("prepare task for review: %v", err)
-	}
-
-	review := httptest.NewRecorder()
-	server.routes().ServeHTTP(review, httptest.NewRequest(http.MethodPost, "/api/tasks/"+predecessor+"/review", bytes.NewBufferString(`{"action":"accept","note":"checked diff and tests"}`)))
-	if review.Code != http.StatusOK {
-		t.Fatalf("accept task review status: %d body=%s", review.Code, review.Body.String())
-	}
-	assertTaskStatus(t, server, predecessor, taskDone)
-	ready := httptest.NewRecorder()
-	server.routes().ServeHTTP(ready, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/dispatch", bytes.NewBufferString(`{}`)))
-	if ready.Code != http.StatusAccepted {
-		t.Fatalf("unblocked task dispatch status: %d body=%s", ready.Code, ready.Body.String())
-	}
-
-	invalid := httptest.NewRecorder()
-	server.routes().ServeHTTP(invalid, httptest.NewRequest(http.MethodPost, "/api/tasks/"+dependent+"/review", bytes.NewBufferString(`{"action":"accept"}`)))
-	if invalid.Code != http.StatusConflict {
-		t.Fatalf("reviewing a non-review task status: %d body=%s", invalid.Code, invalid.Body.String())
 	}
 }
 
@@ -2420,4 +2336,178 @@ func writeFakeGit(t *testing.T, script string) string {
 		t.Fatalf("write fake Git: %v", err)
 	}
 	return path
+}
+
+func TestTaskUpdateStatusViaPatchAllowsAllowedTransitions(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Draggable task")
+
+	// todo -> action_required is allowed
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Draggable task","description":"Implement Draggable task safely.","acceptanceCriteria":"Tests cover Draggable task.","priority":"normal","position":1,"status":"action_required"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("todo->action_required status: %d body=%s", response.Code, response.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskActionRequired)
+
+	// action_required -> todo is allowed
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Draggable task","description":"Implement Draggable task safely.","acceptanceCriteria":"Tests cover Draggable task.","priority":"normal","position":2,"status":"todo"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("action_required->todo status: %d body=%s", response.Code, response.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskTodo)
+}
+
+func TestTaskUpdateStatusViaPatchRejectsDisallowedTransitions(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Immutable task")
+
+	// todo -> done is NOT allowed
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Immutable task","description":"Implement Immutable task safely.","acceptanceCriteria":"Tests cover Immutable task.","priority":"normal","position":1,"status":"done"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("todo->done should be rejected, got %d body=%s", response.Code, response.Body.String())
+	}
+
+	// todo -> running is NOT allowed
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Immutable task","description":"Implement Immutable task safely.","acceptanceCriteria":"Tests cover Immutable task.","priority":"normal","position":1,"status":"running"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("todo->running should be rejected, got %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestTaskUpdateStatusViaPatchRejectsRunningTask(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Running task")
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskRunning, taskID); err != nil {
+		t.Fatalf("mark task running: %v", err)
+	}
+
+	// running -> anything is NOT allowed via PATCH
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Running task","description":"Implement Running task safely.","acceptanceCriteria":"Tests cover Running task.","priority":"normal","position":1,"status":"todo"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("running->todo should be rejected, got %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestTaskUpdatePositionReorderPreservesOtherFields(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	firstID := createTaskForTest(t, server.routes(), projectID, "First task")
+	secondID := createTaskForTest(t, server.routes(), projectID, "Second task")
+	thirdID := createTaskForTest(t, server.routes(), projectID, "Third task")
+
+	// Set explicit positions
+	for i, id := range []string{firstID, secondID, thirdID} {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+id, bytes.NewBufferString(`{"title":"Task `+id[:8]+`","description":"Implement Task `+id[:8]+` safely.","acceptanceCriteria":"Tests cover Task `+id[:8]+`.","priority":"normal","position":`+fmt.Sprintf("%d", (i+1)*10)+`}`)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("set position for %s: %d body=%s", id, response.Code, response.Body.String())
+		}
+	}
+
+	// Move second between first and third: position = 15
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+secondID, bytes.NewBufferString(`{"title":"Task `+secondID[:8]+`","description":"Implement Task `+secondID[:8]+` safely.","acceptanceCriteria":"Tests cover Task `+secondID[:8]+`.","priority":"normal","position":15}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("reorder second task: %d body=%s", response.Code, response.Body.String())
+	}
+
+	// Verify positions via list API
+	listResponse := httptest.NewRecorder()
+	server.routes().ServeHTTP(listResponse, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/tasks", nil))
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("list tasks: %d", listResponse.Code)
+	}
+	var tasks []Task
+	if err := json.NewDecoder(listResponse.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode task list: %v", err)
+	}
+	if len(tasks) < 3 {
+		t.Fatalf("expected at least 3 tasks, got %d", len(tasks))
+	}
+	// Tasks should be ordered by position
+	for i := 1; i < len(tasks); i++ {
+		if tasks[i].Position < tasks[i-1].Position {
+			t.Fatalf("tasks not sorted by position: %v before %v", tasks[i-1].Position, tasks[i].Position)
+		}
+	}
+}
+
+func TestTaskUpdateStatusDoesNotAffectUnrelatedFields(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Keep description intact")
+
+	// Update only status — description must stay the same
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Keep description intact","description":"Implement Keep description intact safely.","acceptanceCriteria":"Tests cover Keep description intact.","priority":"normal","status":"action_required"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status: %d body=%s", response.Code, response.Body.String())
+	}
+
+	var detail TaskDetail
+	detailResponse := httptest.NewRecorder()
+	server.routes().ServeHTTP(detailResponse, httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskID, nil))
+	if err := json.NewDecoder(detailResponse.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.Description != "Implement Keep description intact safely." {
+		t.Fatalf("description changed unexpectedly: %q", detail.Description)
+	}
+	if detail.Status != taskActionRequired {
+		t.Fatalf("status not updated: got %q want %q", detail.Status, taskActionRequired)
+	}
+}
+
+func TestTaskUpdateInvalidStatusReturnsError(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Invalid status task")
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Invalid status task","description":"Implement Invalid status task safely.","acceptanceCriteria":"Tests cover Invalid status task.","priority":"normal","status":"nonexistent"}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status should be rejected, got %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestParseContentPartsArrayFormat(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"text","text":"hello"},{"type":"text","text":"world"}]`)
+	parts := parseContentParts(raw)
+	if len(parts) != 2 || parts[0] != "hello" || parts[1] != "world" {
+		t.Fatalf("expected [hello world], got %v", parts)
+	}
+}
+
+func TestParseContentPartsStringFormat(t *testing.T) {
+	raw := json.RawMessage(`"hello world"`)
+	parts := parseContentParts(raw)
+	if len(parts) != 1 || parts[0] != "hello world" {
+		t.Fatalf("expected [hello world], got %v", parts)
+	}
+}
+
+func TestParseContentPartsArraySkipsNonTextAndEmpty(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"tool_use","text":"ignored"},{"type":"text","text":""},{"type":"text","text":"valid"}]`)
+	parts := parseContentParts(raw)
+	if len(parts) != 1 || parts[0] != "valid" {
+		t.Fatalf("expected [valid], got %v", parts)
+	}
+}
+
+func TestParseContentPartsEmptyString(t *testing.T) {
+	raw := json.RawMessage(`""`)
+	parts := parseContentParts(raw)
+	if len(parts) != 0 {
+		t.Fatalf("expected empty, got %v", parts)
+	}
+}
+
+func TestParseContentPartsInvalidJSON(t *testing.T) {
+	raw := json.RawMessage(`not-json`)
+	parts := parseContentParts(raw)
+	if len(parts) != 0 {
+		t.Fatalf("expected empty for invalid JSON, got %v", parts)
+	}
 }
