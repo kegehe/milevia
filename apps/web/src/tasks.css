@@ -102,6 +102,7 @@
 .task-inline-detail-actions .secondary:hover:not(:disabled) { border-color: #4f9a8a; background: #dff1e6; }
 .task-inline-detail-actions .danger-text { border: 0; padding: 6px 3px; color: #ae4d39; background: transparent; }
 .task-inline-detail-actions .danger-text:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 3px; }
-.task-inline-review-reject { display: grid; width: 100%; gap: 6px; margin-top: 2px; }
+.task-inline-actions-sep { width: 1px; height: 22px; flex: none; margin: 0 3px; background: #d2e3da; }
+.task-inline-review-reject { display: grid; width: 100%; gap: 6px; margin-top: 2px; border-left: 3px solid #778bc4; padding-left: 9px; }
 .task-inline-review-reject textarea { width: 100%; min-height: 54px; box-sizing: border-box; resize: vertical; border: 1px solid #ccd5d9; border-radius: 5px; padding: 7px 9px; color: #19332c; background: #fff; font: inherit; font-size: 11px; line-height: 1.45; }
 .task-inline-review-reject textarea:focus { border-color: #55a697; outline: 2px solid #cfede3; }
