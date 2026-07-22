@@ -391,12 +391,16 @@ func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-// normalizeContext fills in context_input_tokens from total input_tokens when
-// streaming assistant events don't carry per-message usage data (always 0).
+// normalizeContext ensures the context snapshot is consistent.
+// When context_input_tokens is still zero (no result event has arrived yet),
+// leave it as-is so the UI can show an appropriate pending state instead of
+// fabricating a number from the cumulative total input tokens.
 func normalizeContext(usage *RunUsage) {
-	if usage.ContextInputTokens == 0 && usage.InputTokens > 0 {
-		usage.ContextInputTokens = usage.InputTokens
-	}
+	// Intentionally empty: keep contextInputTokens as the raw value from the
+	// most recent assistant or result event.  Do NOT fall back to the
+	// cumulative InputTokens, which is the sum across all turns and does not
+	// represent the current context window utilisation.
+	_ = usage
 }
 
 func (s *Server) getRunUsage(w http.ResponseWriter, r *http.Request) {
