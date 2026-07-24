@@ -106,7 +106,7 @@ func (runner *gitCLIRunner) Stage(ctx context.Context, repo string, paths []stri
 			return err
 		}
 	}
-	_, err := runner.command(ctx, repo, append([]string{"add", "--"}, paths...)...)
+	_, err := runner.command(ctx, repo, append([]string{"--literal-pathspecs", "add", "--"}, paths...)...)
 	return err
 }
 
@@ -119,7 +119,7 @@ func (runner *gitCLIRunner) Unstage(ctx context.Context, repo string, paths []st
 			return err
 		}
 	}
-	_, err := runner.command(ctx, repo, append([]string{"restore", "--staged", "--"}, paths...)...)
+	_, err := runner.command(ctx, repo, append([]string{"--literal-pathspecs", "restore", "--staged", "--"}, paths...)...)
 	return err
 }
 

@@ -18,12 +18,34 @@ export type Task = {
   blockedBy: Blocker[];
   blocks: Dependency[];
   lastRun?: TaskRun;
+  orchestrationStatus?: string;
+  orchestrationUpdatedAt?: string;
+  createdAt: string;
   updatedAt: string;
 };
 export type TaskDetail = Task & { promptPreview: string; canDispatch: boolean; blockReason?: string; runs: TaskRun[] };
 
 export const priorityLabels: Record<Priority, string> = { urgent: "紧急", high: "高", normal: "普通", low: "低" };
 export const statusLabels: Record<TaskStatus, string> = { todo: "待处理", running: "执行中", awaiting_review: "待验收", action_required: "需处理", done: "已完成", cancelled: "已取消" };
+
+export function taskDisplayStatus(task: Task): string {
+  if (task.orchestrationStatus === "checking") return "独立审查中";
+  if (task.orchestrationStatus === "preparing") return "准备执行";
+  if (task.orchestrationStatus === "implementing") return "自动执行中";
+  if (task.orchestrationStatus === "queued") return "自动队列中";
+  if (task.orchestrationStatus === "paused") return "自动队列已暂停";
+  if (task.orchestrationStatus === "needs_human") return "自动编排需处理";
+  if (task.status === "running" && task.lastRun?.status === "queued") return "队列中";
+  return statusLabels[task.status];
+}
+
+export function taskDisplayStatusClass(task: Task): string {
+  return task.orchestrationStatus ? `orchestration-${task.orchestrationStatus}` : task.status === "running" && task.lastRun?.status === "queued" ? "action_required" : task.status;
+}
+
+export function isTaskOrchestrating(task: Task): boolean {
+  return ["queued", "preparing", "implementing", "checking"].includes(task.orchestrationStatus || "");
+}
 
 export function isTaskBlocked(task: Task): boolean {
   return (task.status === "todo" || task.status === "action_required") && task.blockedBy.length > 0;
@@ -34,7 +56,7 @@ export function canOfferDispatch(task: Task): boolean {
 }
 
 export function canRedispatch(task: Task): boolean {
-  return (task.status === "action_required" || task.status === "awaiting_review") && !isTaskBlocked(task) && task.lastRun?.status !== "queued" && task.lastRun?.status !== "running";
+  return task.status === "action_required" && !isTaskBlocked(task) && task.lastRun?.status !== "queued" && task.lastRun?.status !== "running";
 }
 
 export function filterQueueTasks(tasks: Task[], filter: TaskFilter): Task[] {
@@ -46,13 +68,12 @@ export function filterQueueTasks(tasks: Task[], filter: TaskFilter): Task[] {
 const priorityRank: Record<Priority, number> = { urgent: 0, high: 1, normal: 2, low: 3 };
 
 export function queueRank(task: Task): number {
-  // action_required tasks that failed/need rework should appear right after awaiting_review
-  if (task.status === "awaiting_review") return 0;
-  if (task.status === "action_required" && !isTaskBlocked(task)) return 1;
-  if (task.status === "running") return 2;
-  if (canOfferDispatch(task)) return 3;
+  if (task.status === "running") return 0;
+  if (canOfferDispatch(task)) return 1;
+  if (task.status === "action_required" && !isTaskBlocked(task)) return 2;
+  if (task.status === "awaiting_review") return 3;
   if (isTaskBlocked(task)) return 4;
-  return 5;
+  return 4;
 }
 
 export function taskDisplayTitle(task: Task): string {
@@ -60,8 +81,13 @@ export function taskDisplayTitle(task: Task): string {
 }
 
 export function taskQueueNote(task: Task): string {
-  const blocked = isTaskBlocked(task);
-  if (blocked) return `等待：${task.blockedBy.map((item) => item.title).join("、")}`;
+  if (task.orchestrationStatus === "checking") return "独立审查代理正在检查本次提交";
+  if (task.orchestrationStatus === "preparing") return "自动编排正在准备工作区";
+  if (task.orchestrationStatus === "implementing") return "自动编排正在执行任务";
+  if (task.orchestrationStatus === "queued") return "已进入自动编排队列";
+  if (task.orchestrationStatus === "paused") return "自动编排已暂停";
+  if (task.orchestrationStatus === "needs_human") return "自动编排需要人工处理";
+  if (isTaskBlocked(task)) return `等待：${task.blockedBy.map((item) => item.title).join("、")}`;
   if (task.status === "awaiting_review") return "执行完成，等待人工确认";
   if (task.status === "action_required" && task.lastRun) {
     const reason = task.lastRun.failureReason ? `：${task.lastRun.failureReason}` : "";
@@ -73,7 +99,6 @@ export function taskQueueNote(task: Task): string {
     return "执行中";
   }
   if (task.lastRun) return `第 ${task.lastRun.sequence} 次执行：${task.lastRun.status}`;
-  if (task.dependsOn.length) return `前置任务 ${task.dependsOn.length} 个已完成`;
   return "可独立处理";
 }
 
@@ -90,5 +115,5 @@ export function taskRunStatusLabel(status: string): string {
 }
 
 export function sortQueueTasks(tasks: Task[]): Task[] {
-  return [...tasks].sort((left, right) => queueRank(left) - queueRank(right) || priorityRank[left.priority] - priorityRank[right.priority] || left.position - right.position || left.title.localeCompare(right.title, "zh-CN"));
+  return [...tasks].sort((left, right) => queueRank(left) - queueRank(right) || priorityRank[left.priority] - priorityRank[right.priority] || left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
 }

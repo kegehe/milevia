@@ -33,3 +33,8 @@ packages/contracts/generated/
 .agents/
 .claude/
 agent/
+.superpowers/
+
+# Local convenience files
+/dev
+/package-lock.json

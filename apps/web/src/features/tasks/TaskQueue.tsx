@@ -1,7 +1,7 @@
 import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import { canOfferDispatch, canRedispatch, filterQueueTasks, priorityLabels, Request, sortQueueTasks, statusLabels, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
+import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, priorityLabels, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
@@ -16,8 +16,16 @@ const filters: { id: TaskFilter; label: string }[] = [
 
 type QueueDragData = { taskID: string; sourceIndex: number };
 type PendingConfirm = { title: string; message: React.ReactNode; danger?: boolean; onConfirm: () => void; onCancel: () => void } | null;
+type ExecutionPolicy = "approval_required" | "full_control" | "read_only" | "workspace_write";
 
-export function TaskQueue({ projectID, permissionMode, request, fail, onDispatched, openBoard }: { projectID: string; permissionMode?: "approval_required" | "full_control"; request: Request; fail: (message: string) => void; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void }) {
+function policyLabel(policy?: ExecutionPolicy): string {
+  if (policy === "full_control") return "完全控制";
+  if (policy === "read_only") return "仅分析";
+  if (policy === "workspace_write") return "项目内执行";
+  return "默认权限";
+}
+
+export function TaskQueue({ projectID, permissionMode, request, fail, onDispatched, openBoard }: { projectID: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<TaskFilter>("active");
   const [confirmingTaskID, setConfirmingTaskID] = useState<string | null>(null);
@@ -132,7 +140,7 @@ export function TaskQueue({ projectID, permissionMode, request, fail, onDispatch
     }
   };
 
-  const inlineTransition = async (action: "cancel" | "reopen" | "stop") => {
+  const inlineTransition = async (action: "reopen" | "stop") => {
     if (!inlineDetail) return;
     if (!mountedRef.current) return;
     setInlineBusy(action);
@@ -201,12 +209,11 @@ export function TaskQueue({ projectID, permissionMode, request, fail, onDispatch
     }
   };
 
-  const confirmTransition = (action: "cancel" | "reopen") => {
+  const confirmTransition = () => {
     setPendingConfirm({
-      title: action === "cancel" ? "取消任务" : "重新打开",
-      message: action === "cancel" ? "确认取消该任务？" : "确认重新打开该任务？",
-      danger: action === "cancel",
-      onConfirm: () => { if (mountedRef.current) { setPendingConfirm(null); void inlineTransition(action); } },
+      title: "重新打开",
+      message: "确认重新打开该任务？",
+      onConfirm: () => { if (mountedRef.current) { setPendingConfirm(null); void inlineTransition("reopen"); } },
       onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
     });
   };
@@ -251,10 +258,11 @@ export function TaskQueue({ projectID, permissionMode, request, fail, onDispatch
     const currentIndex = queueTasks.findIndex((t) => t.id === taskID);
     if (currentIndex < 0 || currentIndex === targetIndex) return;
     const reordered = [...queueTasks];
-    reordered.splice(currentIndex, 1);
-    reordered.splice(targetIndex, 0, queueTasks[currentIndex]);
-    const prev = reordered[targetIndex - 1];
-    const next = reordered[targetIndex + 1];
+    const [moved] = reordered.splice(currentIndex, 1);
+    const insertionIndex = currentIndex < targetIndex ? targetIndex - 1 : targetIndex;
+    reordered.splice(insertionIndex, 0, moved);
+    const prev = reordered[insertionIndex - 1];
+    const next = reordered[insertionIndex + 1];
     let newPosition: number;
     if (!prev) newPosition = next ? next.position - 1 : task.position;
     else if (!next) newPosition = prev.position + 1;
@@ -297,15 +305,26 @@ export function TaskQueue({ projectID, permissionMode, request, fail, onDispatch
       <header className="task-queue-head"><div><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions"><button type="button" className="task-queue-add" title="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button></div></header>
       {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => setQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
       <nav className="task-queue-filters" aria-label="任务筛选">{filters.map((item) => <button type="button" key={item.id} className={filter === item.id ? "active" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<span>{taskCounts[item.id]}</span></button>)}</nav>
-      <div className={`task-queue-list${reviewingTaskID ? " reviewing" : ""}`}>{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={() => openInlineDetail(task.id)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop} />)}</div>
+      <div className={`task-queue-list${reviewingTaskID || inlineDetailID ? " reviewing" : ""}`}>{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={() => openInlineDetail(task.id)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop}
+        inlineDetailID={inlineDetailID}
+        inlineDetail={inlineDetail}
+        inlineDetailLoading={inlineDetailLoading}
+        inlineBusy={inlineBusy}
+        closeInlineDetail={closeInlineDetail}
+        inlineDispatch={inlineDispatch}
+        inlineTransition={inlineTransition}
+        inlineDelete={inlineDelete}
+        inlineReview={inlineReview}
+        openBoard={openBoard}
+        confirmTransition={confirmTransition}
+      />)}</div>
     </div>
     {confirmingTask && createPortal(<DispatchConfirmation task={confirmingTask} detail={detail} loading={loadingDetail} dispatching={dispatching} permissionMode={permissionMode} close={closeConfirmation} openBoard={() => openBoard(confirmingTask.id)} dispatch={dispatch} />, document.body)}
-    {inlineDetailID && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} deleteTask={inlineDelete} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </section>;
 }
 
-function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void> }) {
+function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, inlineReview, openBoard, confirmTransition }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void }) {
   const [isDragging, setIsDragging] = useState(false);
   const [dragOverPosition, setDragOverPosition] = useState<"before" | "after" | null>(null);
   const queued = task.status === "running" && task.lastRun?.status === "queued";
@@ -346,14 +365,14 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, o
   return <article className={`task-queue-row${isDragging ? " dragging" : ""}${dragOverPosition ? ` drag-over-${dragOverPosition}` : ""}`} draggable onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragOver={handleDragOverRow} onDrop={handleDropRow}>
     {dragOverPosition === "before" && <div className="task-queue-drop-indicator" />}
     <button type="button" className="task-queue-open" onClick={open}>
-      <span className={`task-status ${queued ? "action_required" : task.status}`}>{status}</span>
+      <span className={`task-status ${taskDisplayStatusClass(task)}`}>{taskDisplayStatus(task)}</span>
       <b>{taskDisplayTitle(task)}</b>
       <small>{note}</small>
     </button>
     <div className="task-queue-row-actions">
       {canOfferDispatch(task) && <button type="button" className="task-queue-dispatch" draggable={false} onClick={(event) => void confirm(event, task.id)}>下发</button>}
       {canRedispatch(task) && <button type="button" className="task-queue-redispatch" draggable={false} disabled={redispatching} onClick={(event) => void redispatch(event, task.id)}>{redispatching ? "下发中" : "重新下发"}</button>}
-      {task.status === "awaiting_review" && !isReviewing && <button type="button" className="task-queue-review secondary" draggable={false} onClick={(event) => { event.stopPropagation(); openReview(task.id); }}>验收</button>}
+      {task.status === "awaiting_review" && !isTaskOrchestrating(task) && !isReviewing && <button type="button" className="task-queue-review secondary" draggable={false} onClick={(event) => { event.stopPropagation(); openReview(task.id); }}>验收</button>}
     </div>
     {isReviewing && <div className="task-queue-inline-review" ref={reviewRef}>
       <textarea autoFocus required disabled={reviewSubmitting} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="说明需要补充或修改的内容，留空即确认完成…" onDragStart={(e) => e.stopPropagation()} />
@@ -363,17 +382,18 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, o
         <button type="button" className="danger-text" draggable={false} disabled={reviewSubmitting} onClick={(event) => { event.stopPropagation(); closeReview(); }}>取消</button>
       </div>
     </div>}
+    {inlineDetailID === task.id && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} deleteTask={inlineDelete} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
     {dragOverPosition === "after" && <div className="task-queue-drop-indicator" />}
   </article>;
 }
 
-function DispatchConfirmation({ task, detail, loading, dispatching, permissionMode, close, openBoard, dispatch }: { task: Task; detail: TaskDetail | null; loading: boolean; dispatching: boolean; permissionMode?: "approval_required" | "full_control"; close: () => void; openBoard: () => void; dispatch: () => Promise<void> }) {
+function DispatchConfirmation({ task, detail, loading, dispatching, permissionMode, close, openBoard, dispatch }: { task: Task; detail: TaskDetail | null; loading: boolean; dispatching: boolean; permissionMode?: ExecutionPolicy; close: () => void; openBoard: () => void; dispatch: () => Promise<void> }) {
   const canDispatch = Boolean(detail?.canDispatch) && !loading;
   const eligibility = loading ? "正在检查任务状态..." : detail?.canDispatch ? "任务满足下发条件。" : detail?.blockReason || "当前任务不能下发。";
-  return <div className="backdrop task-dispatch-backdrop" role="dialog" aria-modal="true" aria-labelledby="task-dispatch-title"><section className="modal task-dispatch-dialog"><header><div><label>DISPATCH TASK</label><h2 id="task-dispatch-title">确认下发</h2></div><button type="button" title="关闭" disabled={dispatching} onClick={close}>x</button></header><div className="task-dispatch-body"><div className="task-dispatch-title"><span className={`task-status ${task.status}`}>{statusLabels[task.status]}</span><h3>{taskDisplayTitle(task)}</h3><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}优先级</em></div><p className="task-dispatch-description">{detail?.description || task.description}</p><dl><div><dt>当前权限</dt><dd>{permissionMode === "full_control" ? "完全控制" : "默认权限"}</dd></div><div><dt>状态检查</dt><dd className={canDispatch ? "eligible" : "blocked"}>{eligibility}</dd></div></dl></div><footer><button type="button" className="secondary" disabled={dispatching} onClick={openBoard}>查看完整详情</button><span><button type="button" className="secondary" disabled={dispatching} onClick={close}>取消</button><button type="button" className="primary" disabled={!canDispatch || dispatching} onClick={() => void dispatch()}>{dispatching ? "下发中" : "确认下发"}</button></span></footer></section></div>;
+  return <div className="backdrop task-dispatch-backdrop" role="dialog" aria-modal="true" aria-labelledby="task-dispatch-title"><section className="modal task-dispatch-dialog"><header><div><label>DISPATCH TASK</label><h2 id="task-dispatch-title">确认下发</h2></div><button type="button" title="关闭" disabled={dispatching} onClick={close}>x</button></header><div className="task-dispatch-body"><div className="task-dispatch-title"><span className={`task-status ${task.status}`}>{statusLabels[task.status]}</span><h3>{taskDisplayTitle(task)}</h3><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}优先级</em></div><p className="task-dispatch-description">{detail?.description || task.description}</p><dl><div><dt>当前权限</dt><dd>{policyLabel(permissionMode)}</dd></div><div><dt>状态检查</dt><dd className={canDispatch ? "eligible" : "blocked"}>{eligibility}</dd></div></dl></div><footer><button type="button" className="secondary" disabled={dispatching} onClick={openBoard}>查看完整详情</button><span><button type="button" className="secondary" disabled={dispatching} onClick={close}>取消</button><button type="button" className="primary" disabled={!canDispatch || dispatching} onClick={() => void dispatch()}>{dispatching ? "下发中" : "确认下发"}</button></span></footer></section></div>;
 }
 
-function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, deleteTask, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; close: () => void; dispatch: () => Promise<void>; transition: (action: "cancel" | "reopen" | "stop") => Promise<void>; deleteTask: () => void; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: (action: "cancel" | "reopen") => void }) {
+function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, deleteTask, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; close: () => void; dispatch: () => Promise<void>; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: () => void }) {
   const detailRef = useRef<HTMLDivElement>(null);
   const [localReviewNote, setLocalReviewNote] = useState("");
   const [localReviewSubmitting, setLocalReviewSubmitting] = useState(false);
@@ -400,7 +420,7 @@ function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, 
     finally { if (mountedRef.current) setLocalReviewSubmitting(false); }
   };
 
-  return <div className="task-inline-detail" ref={detailRef}>
+  return <div className="task-inline-detail" ref={detailRef} onDragStart={(e) => e.stopPropagation()}>
     <div className="task-inline-detail-head">
       <div className="task-inline-detail-title">
         <span className={`task-status ${queued ? "action_required" : detail.status}`}>{queued ? "队列中" : statusLabels[detail.status]}</span>
@@ -418,7 +438,6 @@ function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, 
     <div className="task-inline-detail-actions">
       {(detail.status === "todo" || detail.status === "action_required") && <>
         {detail.canDispatch && <button className="primary" disabled={Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button>}
-        <button className="danger-text" disabled={Boolean(busy)} onClick={() => confirmTransition("cancel")}>取消任务</button>
       </>}
       {detail.status === "running" && <button className="danger-text" disabled={Boolean(busy) || queued} onClick={() => void transition("stop")}>{queued ? "队列中" : busy === "stop" ? "停止中" : "停止任务"}</button>}
       {detail.status === "awaiting_review" && <>
@@ -428,7 +447,7 @@ function InlineTaskDetail({ detail, loading, busy, close, dispatch, transition, 
           <button className="primary" disabled={!localReviewNote.trim() || localReviewSubmitting} onClick={() => void doReview("request_changes")}>{localReviewSubmitting ? "提交中" : "要求修改"}</button>
         </div>
       </>}
-      {(detail.status === "done" || detail.status === "cancelled") && <button className="secondary" disabled={Boolean(busy)} onClick={() => confirmTransition("reopen")}>重新打开</button>}
+      {detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}
       <span className="task-inline-actions-sep" />
       <button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button>
       <button className="secondary" disabled={reviewBusy} onClick={openBoard}>查看完整详情</button>

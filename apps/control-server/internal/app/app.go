@@ -29,6 +29,7 @@ type Config struct {
 	DatabasePath   string
 	AllowedRoot    string
 	ClaudePath     string
+	CodexPath      string
 	PermissionMode string
 	ControlURL     string
 	ApprovalHook   string
@@ -59,13 +60,42 @@ func ConfigFromEnv() Config {
 	if hook == "" {
 		hook = "../../scripts/claude-approval-hook.sh"
 	}
-	return Config{DatabasePath: db, AllowedRoot: root, ClaudePath: "claude", PermissionMode: mode, ControlURL: controlURL, ApprovalHook: hook}
+	codexPath := os.Getenv("AUTO_CODEX_PATH")
+	if codexPath == "" {
+		codexPath = "codex"
+	}
+	return Config{DatabasePath: db, AllowedRoot: root, ClaudePath: "claude", CodexPath: codexPath, PermissionMode: mode, ControlURL: controlURL, ApprovalHook: hook}
+}
+
+// RunConfig 持久化的项目启动配置。
+type RunConfig struct {
+	WorkDir string            `json:"workDir"`
+	Command string            `json:"command"`
+	EnvVars map[string]string `json:"envVars"`
+}
+
+// RunStatusResponse 是 GET /status 的响应。
+type RunStatusResponse struct {
+	Status     RunStatus  `json:"status"`
+	StartedAt  *time.Time `json:"startedAt"`
+	PID        *int       `json:"pid"`
+	ExitCode   *int       `json:"exitCode"`
+	RecentLogs []LogEntry `json:"recentLogs"`
 }
 
 type Server struct {
 	db                     *sql.DB
 	config                 Config
+	httpMu                 sync.Mutex
+	httpServer             *http.Server
 	runner                 AgentRunner
+	codexRunner            AgentRunner
+	runnerRegistry         *runnerRegistry
+	runnerMaintenanceMu    sync.Mutex
+	runnerUpdating         map[string]bool
+	projectLifecycleMu     sync.Mutex
+	sshMu                  sync.Mutex
+	sshPrepare             func(context.Context, SSHConnection) (*sshRunner, RunnerMeta, error)
 	runtimeCtx             context.Context
 	runtimeStop            context.CancelFunc
 	runWG                  sync.WaitGroup
@@ -77,6 +107,7 @@ type Server struct {
 	cancels                map[string]context.CancelFunc
 	runTokens              map[string]string
 	runContexts            map[string]string
+	streamingSetups        map[string]*streamingSetup
 	projectWorkspaceLeases map[string]*projectWorkspaceLease
 	runWorkspaceReleases   map[string]func()
 	gitStateTokens         map[string]gitStateToken
@@ -86,11 +117,51 @@ type Server struct {
 	approvals              map[string]*approvalWaiter
 	usageMu                sync.Mutex
 	runUsage               map[string]*runUsageAccumulator
+	runManagers            map[string]*projectRunner
+	runManagersMu          sync.RWMutex
+	runLogSubscribers      map[string]map[*websocket.Conn]*runLogSubscriber
+	runLogSubMu            sync.Mutex
+	orchestrationMu        sync.Mutex
+	orchestrationActive    map[string]bool
+	orchestrationWG        sync.WaitGroup
+	orchestrationOwner     string
 }
 
 type subscriber struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	conn      *websocket.Conn
+	send      chan []byte
+	closeOnce sync.Once
+}
+
+func (sub *subscriber) close() {
+	sub.closeOnce.Do(func() {
+		close(sub.send)
+		if sub.conn != nil {
+			_ = sub.conn.Close()
+		}
+	})
+}
+
+const (
+	conversationSubscriberQueueSize = 256
+	conversationWriteTimeout        = 10 * time.Second
+	runLogSubscriberQueueSize       = 512
+	runLogWriteTimeout              = 10 * time.Second
+)
+
+type runLogSubscriber struct {
+	conn      *websocket.Conn
+	send      chan LogEntry
+	closeOnce sync.Once
+}
+
+func (sub *runLogSubscriber) close() {
+	sub.closeOnce.Do(func() {
+		close(sub.send)
+		if sub.conn != nil {
+			_ = sub.conn.Close()
+		}
+	})
 }
 
 type approvalWaiter struct {
@@ -102,8 +173,18 @@ type approvalWaiter struct {
 type activeAgentSession struct {
 	agent         AgentSession
 	approvalToken string
+	runnerID      string
 	activeRunID   string
 	stopping      bool
+}
+
+// streamingSetup closes the gap between committing a streaming Run and
+// admitting its first prompt to the persistent agent session. It is guarded
+// by Server.mu.
+type streamingSetup struct {
+	cancelled   bool
+	session     *activeAgentSession
+	ownsSession bool
 }
 
 type projectWorkspaceLease struct {
@@ -117,21 +198,31 @@ type Project struct {
 	Path        string    `json:"-"`
 	PathDisplay string    `json:"pathDisplay"`
 	Runner      string    `json:"runner"`
+	Environment string    `json:"environment"`
 	GitBranch   string    `json:"gitBranch"`
 	ClaudeReady bool      `json:"claudeReady"`
+	CodexReady  bool      `json:"codexReady"`
+	AgentReady  bool      `json:"agentReady"`
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
 type Conversation struct {
-	ID                string    `json:"id"`
-	ProjectID         string    `json:"projectId"`
-	ClaudeSessionID   string    `json:"claudeSessionId"`
+	ID        string `json:"id"`
+	ProjectID string `json:"projectId"`
+	// ClaudeSessionID is retained for clients and databases created before the
+	// agent-neutral session migration. New execution code uses AgentSessionID.
+	ClaudeSessionID   string    `json:"claudeSessionId,omitempty"`
+	AgentID           string    `json:"agentId"`
+	AgentSessionID    string    `json:"agentSessionId"`
+	AgentRuntimeID    string    `json:"agentRuntimeId"`
+	ExecutionPolicy   string    `json:"executionPolicy"`
 	Status            string    `json:"status"`
 	PermissionMode    string    `json:"permissionMode"`
 	Title             string    `json:"title"`
 	Preview           string    `json:"preview,omitempty"`
 	LastActivityAt    time.Time `json:"lastActivityAt"`
 	ClaudeInitialized bool      `json:"-"`
+	AgentInitialized  bool      `json:"-"`
 	IsCurrent         bool      `json:"isCurrent"`
 	CreatedAt         time.Time `json:"createdAt"`
 }
@@ -176,8 +267,10 @@ type ShortcutRun struct {
 }
 
 type runStartRecord struct {
-	Shortcut *ShortcutRun
-	Task     *TaskRun
+	Shortcut     *ShortcutRun
+	Task         *TaskRun
+	WorktreePath string
+	Orchestrated bool
 }
 
 type Event struct {
@@ -265,8 +358,9 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		config.ApprovalHook = approvalHook
 		runner = newClaudeCLIRunner(config)
 	}
+	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, runner: runner, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}}
+	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]*projectRunner{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return isLocalWebOrigin(r.Header.Get("Origin")) }
 	if err := s.migrate(ctx); err != nil {
 		runtimeStop()
@@ -283,11 +377,19 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		pool.Close()
 		return nil, err
 	}
+	// Register the built-in WSL local runner.
+	s.runnerRegistry.register("wsl-local", runner, s.wslLocalMeta())
+	// Recover previously-connected SSH connections (failures are non-fatal).
+	if err := s.recoverSSHConnections(ctx); err != nil {
+		log.Printf("[ssh] failed to recover SSH connections: %v", err)
+	}
+	s.recoverOrchestration(ctx)
 	return s, nil
 }
 
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		s.httpMu.Lock()
 		s.mu.Lock()
 		s.closing = true
 		cancels := make([]context.CancelFunc, 0, len(s.cancels))
@@ -302,6 +404,11 @@ func (s *Server) Close() {
 			sessions = append(sessions, session.agent)
 		}
 		s.mu.Unlock()
+		httpServer := s.httpServer
+		s.httpMu.Unlock()
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
 		s.runtimeStop()
 		for _, cancel := range cancels {
 			cancel()
@@ -309,15 +416,59 @@ func (s *Server) Close() {
 		for _, session := range sessions {
 			session.Stop()
 		}
+		// No new orchestration worker may start once closing is set. Wait for
+		// existing workers before releasing their fenced leases to another server.
+		s.orchestrationMu.Lock()
+		s.orchestrationMu.Unlock()
+		s.orchestrationWG.Wait()
+		s.releaseOrchestrationLeases()
 		for _, runID := range runIDs {
 			s.resolveRunApprovals(runID, "deny")
+		}
+		s.runManagersMu.RLock()
+		runners := make([]*projectRunner, 0, len(s.runManagers))
+		for _, runner := range s.runManagers {
+			runners = append(runners, runner)
+		}
+		s.runManagersMu.RUnlock()
+		for _, runner := range runners {
+			runner.Stop()
+		}
+		s.closeAllRunLogSubscribers()
+		for _, runner := range s.runnerRegistry.all() {
+			if sshR, ok := runner.(*sshRunner); ok {
+				_ = sshR.client.close()
+			}
 		}
 		s.runWG.Wait()
 		_ = s.db.Close()
 	})
 }
 
-func (s *Server) Listen(addr string) error { return http.ListenAndServe(addr, s.routes()) }
+func (s *Server) Listen(addr string) error {
+	s.httpMu.Lock()
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		s.httpMu.Unlock()
+		return nil
+	}
+	if s.httpServer != nil {
+		s.mu.Unlock()
+		s.httpMu.Unlock()
+		return errors.New("HTTP server is already listening")
+	}
+	httpServer := &http.Server{Addr: addr, Handler: s.routes()}
+	s.httpServer = httpServer
+	s.mu.Unlock()
+	s.httpMu.Unlock()
+
+	err := httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
 
 func (s *Server) routes() http.Handler {
 	r := chi.NewRouter()
@@ -325,13 +476,15 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	r.Get("/api/runners", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, []map[string]string{{"id": "wsl-local", "name": "WSL Local Runner", "environment": "wsl", "root": s.config.AllowedRoot}})
-	})
+	r.Get("/api/runners", s.listRunners)
+	r.Post("/api/runners/{runnerID}/claude/check-update", s.checkClaudeUpdate)
+	r.Post("/api/runners/{runnerID}/claude/update", s.updateClaude)
 	r.Get("/api/directories", s.listDirectories)
 	r.Post("/api/projects/validate", s.validateProject)
 	r.Get("/api/projects", s.listProjects)
+	r.Get("/api/projects/statuses", s.listProjectStatuses)
 	r.Post("/api/projects", s.createProject)
+	r.Delete("/api/projects/{projectID}", s.deleteProject)
 	r.Get("/api/projects/{projectID}/git/summary", s.gitSummary)
 	r.Get("/api/projects/{projectID}/git/changes", s.gitChanges)
 	r.Get("/api/projects/{projectID}/git/diff", s.gitDiff)
@@ -342,17 +495,26 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/unstage", s.gitUnstage)
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
+	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
+	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
+	r.Get("/api/projects/{projectID}/orchestration", s.listOrchestrationJobs)
+	r.Get("/api/projects/{projectID}/orchestration/releases", s.listReleaseSnapshots)
+	r.Post("/api/projects/{projectID}/orchestration/release", s.createReleaseSnapshot)
+	r.Post("/api/projects/{projectID}/orchestration/releases/{releaseID}/confirm-main", s.confirmReleaseMergedToMain)
 	r.Get("/api/tasks/{taskID}", s.getTask)
 	r.Patch("/api/tasks/{taskID}", s.updateTask)
+	r.Delete("/api/tasks/{taskID}", s.deleteTask)
 	r.Post("/api/tasks/{taskID}/dependencies", s.addTaskDependency)
 	r.Put("/api/tasks/{taskID}/dependencies", s.replaceTaskDependencies)
 	r.Delete("/api/tasks/{taskID}/dependencies/{predecessorTaskID}", s.deleteTaskDependency)
 	r.Get("/api/tasks/{taskID}/runs", s.listTaskRuns)
 	r.Get("/api/tasks/{taskID}/events", s.listTaskEvents)
 	r.Post("/api/tasks/{taskID}/dispatch", s.dispatchTask)
+	r.Post("/api/tasks/{taskID}/orchestration/enqueue", s.enqueueTaskForOrchestration)
+	r.Post("/api/tasks/{taskID}/orchestration/pause", s.pauseOrchestrationJob)
+	r.Post("/api/tasks/{taskID}/orchestration/resume", s.resumeOrchestrationJob)
 	r.Post("/api/tasks/{taskID}/review", s.reviewTask)
 	r.Post("/api/tasks/{taskID}/reopen", s.reopenTask)
-	r.Post("/api/tasks/{taskID}/cancel", s.cancelTask)
 	r.Post("/api/tasks/{taskID}/stop", s.stopTask)
 	r.Get("/api/projects/{projectID}/conversations", s.listConversations)
 	r.Post("/api/projects/{projectID}/conversations", s.createConversation)
@@ -375,6 +537,16 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/approvals/{approvalID}", s.resolveApproval)
 	r.Post("/api/internal/approvals/wait", s.waitForApproval)
 	r.Get("/ws/conversations/{conversationID}", s.subscribe)
+	r.Route("/api/projects/{projectID}/run", func(r chi.Router) {
+		r.Get("/config", s.getRunConfig)
+		r.Put("/config", s.updateRunConfig)
+		r.Post("/start", s.startProjectRun)
+		r.Post("/stop", s.stopProjectRun)
+		r.Post("/restart", s.restartProjectRun)
+		r.Get("/status", s.getProjectRunStatus)
+	})
+	r.Get("/ws/projects/{projectID}/run", s.subscribeRunLogs)
+	s.registerSSHRoutes(r)
 	return r
 }
 
@@ -384,7 +556,7 @@ func cors(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		}
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -401,11 +573,133 @@ func isLocalWebOrigin(origin string) bool {
 	return parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1"
 }
 
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("pragma table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf("alter table %s add column %s %s", table, column, definition))
+	return err
+}
+
+func (s *Server) migrateProjectsRunnerPathUnique(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `pragma index_list(projects)`)
+	if err != nil {
+		return fmt.Errorf("inspect project indexes: %w", err)
+	}
+	uniqueIndexes := []string{}
+	for rows.Next() {
+		var sequence int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&sequence, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return fmt.Errorf("read project index: %w", err)
+		}
+		if unique == 0 {
+			continue
+		}
+		uniqueIndexes = append(uniqueIndexes, name)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate project indexes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close project indexes: %w", err)
+	}
+	needsRebuild := false
+	for _, name := range uniqueIndexes {
+		columns, err := s.projectIndexColumns(ctx, name)
+		if err != nil {
+			return err
+		}
+		if len(columns) == 1 && columns[0] == "path" {
+			needsRebuild = true
+		}
+	}
+	if !needsRebuild {
+		return nil
+	}
+
+	if _, err := s.db.ExecContext(ctx, `pragma foreign_keys=off`); err != nil {
+		return fmt.Errorf("disable foreign keys for project rebuild: %w", err)
+	}
+	restoreForeignKeys := func() error {
+		_, err := s.db.ExecContext(ctx, `pragma foreign_keys=on`)
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		_ = restoreForeignKeys()
+		return fmt.Errorf("begin project rebuild: %w", err)
+	}
+	for _, statement := range []string{
+		`create table projects_rebuilt (id text primary key, name text not null, path text not null, runner text not null, git_branch text not null, claude_ready integer not null, created_at datetime not null)`,
+		`insert into projects_rebuilt (id,name,path,runner,git_branch,claude_ready,created_at) select id,name,path,runner,git_branch,claude_ready,created_at from projects`,
+		`drop table projects`,
+		`alter table projects_rebuilt rename to projects`,
+		`create unique index projects_runner_path_unique on projects(runner,path)`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			_ = tx.Rollback()
+			_ = restoreForeignKeys()
+			return fmt.Errorf("rebuild projects table: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		_ = restoreForeignKeys()
+		return fmt.Errorf("commit project rebuild: %w", err)
+	}
+	if err := restoreForeignKeys(); err != nil {
+		return fmt.Errorf("restore foreign keys after project rebuild: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) projectIndexColumns(ctx context.Context, indexName string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("pragma index_info(%q)", indexName))
+	if err != nil {
+		return nil, fmt.Errorf("inspect project index columns: %w", err)
+	}
+	defer rows.Close()
+	columns := []string{}
+	for rows.Next() {
+		var sequence, columnID int
+		var name string
+		if err := rows.Scan(&sequence, &columnID, &name); err != nil {
+			return nil, fmt.Errorf("read project index column: %w", err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate project index columns: %w", err)
+	}
+	return columns, nil
+}
+
 func (s *Server) migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `create table if not exists projects (id text primary key, name text not null, path text not null unique, runner text not null, git_branch text not null, claude_ready integer not null, created_at datetime not null);
-create table if not exists conversations (id text primary key, project_id text not null references projects(id) on delete cascade, claude_session_id text not null unique, status text not null, permission_mode text not null default 'approval_required', title text not null default '新会话', last_activity_at datetime not null default current_timestamp, claude_initialized integer not null default 0, is_current integer not null default 1, created_at datetime not null);
+	_, err := s.db.ExecContext(ctx, `create table if not exists projects (id text primary key, name text not null, path text not null, runner text not null, git_branch text not null, claude_ready integer not null, created_at datetime not null);
+create table if not exists conversations (id text primary key, project_id text not null references projects(id) on delete cascade, claude_session_id text not null unique, agent_id text not null default 'claude-code', agent_session_id text not null default '', agent_runtime_id text not null default '', execution_policy text not null default 'approval_required', status text not null, permission_mode text not null default 'approval_required', title text not null default '新会话', last_activity_at datetime not null default current_timestamp, claude_initialized integer not null default 0, agent_initialized integer not null default 0, is_current integer not null default 1, created_at datetime not null);
 	create table if not exists messages (id text primary key, conversation_id text not null references conversations(id) on delete cascade, run_id text not null default '', role text not null, content text not null, parent_tool_use_id text not null default '', created_at datetime not null);
-create table if not exists runs (id text primary key, conversation_id text not null references conversations(id) on delete cascade, status text not null, created_at datetime not null, completed_at datetime);
+create table if not exists runs (id text primary key, conversation_id text not null references conversations(id) on delete cascade, agent_id text not null default 'claude-code', agent_runtime_id text not null default '', execution_policy text not null default 'approval_required', agent_run_id text not null default '', status text not null, created_at datetime not null, completed_at datetime);
 create table if not exists events (id text primary key, conversation_id text not null references conversations(id) on delete cascade, run_id text not null references runs(id) on delete cascade, type text not null, payload text not null, created_at datetime not null);
 create table if not exists run_usage (run_id text primary key references runs(id) on delete cascade, conversation_id text not null references conversations(id) on delete cascade, model text not null default '', context_window integer not null default 0, context_input_tokens integer not null default 0, input_tokens integer not null default 0, output_tokens integer not null default 0, cache_read_tokens integer not null default 0, cache_creation_tokens integer not null default 0, estimated_cost_usd real not null default 0, agent_turns integer not null default 0, model_steps integer not null default 0, tool_calls integer not null default 0, subagent_count integer not null default 0, duration_ms integer not null default 0, ttft_ms integer not null default 0, terminal_reason text not null default '', has_result integer not null default 0, completed_at datetime not null);
 create table if not exists run_model_usage (run_id text not null references runs(id) on delete cascade, model text not null, input_tokens integer not null default 0, output_tokens integer not null default 0, cache_read_tokens integer not null default 0, cache_creation_tokens integer not null default 0, estimated_cost_usd real not null default 0, context_window integer not null default 0, primary key (run_id,model));
@@ -414,6 +708,8 @@ create table if not exists shortcut_projects (shortcut_id text not null referenc
 create table if not exists shortcut_runs (id text primary key, shortcut_id text references shortcuts(id) on delete set null, conversation_id text not null references conversations(id) on delete cascade, run_id text unique references runs(id) on delete set null, rendered_content text not null, action text not null, status text not null, created_at datetime not null, completed_at datetime);
 create table if not exists shortcut_audit_events (id text primary key, shortcut_id text references shortcuts(id) on delete set null, action text not null, payload text not null default '{}', created_at datetime not null);
 create table if not exists app_metadata (key text primary key, value text not null);
+	create table if not exists project_run_configs (project_id text primary key references projects(id) on delete cascade, work_dir text not null default '', command text not null default '', env_vars text not null default '{}', updated_at datetime not null);
+	create unique index if not exists projects_runner_path_unique on projects(runner,path);
 	create unique index if not exists conversations_one_current_per_project on conversations(project_id) where is_current=1;
 	create index if not exists messages_conversation_created on messages(conversation_id,created_at desc);
 	create index if not exists events_conversation_created on events(conversation_id,created_at desc);
@@ -421,12 +717,18 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	if err != nil {
 		return fmt.Errorf("migrate database: %w", err)
 	}
+	if err := s.migrateProjectsRunnerPathUnique(ctx); err != nil {
+		return fmt.Errorf("migrate project path uniqueness: %w", err)
+	}
+	if err := s.migrateSSHConnections(ctx); err != nil {
+		return fmt.Errorf("migrate ssh connections: %w", err)
+	}
 	rows, err := s.db.QueryContext(ctx, `pragma table_info(conversations)`)
 	if err != nil {
 		return fmt.Errorf("inspect conversations schema: %w", err)
 	}
 	defer rows.Close()
-	hasPermissionMode, hasTitle, hasLastActivity := false, false, false
+	hasPermissionMode, hasTitle, hasLastActivity, hasAgentID := false, false, false, false
 	for rows.Next() {
 		var cid int
 		var name, typ string
@@ -444,6 +746,9 @@ create table if not exists app_metadata (key text primary key, value text not nu
 		}
 		if name == "last_activity_at" {
 			hasLastActivity = true
+		}
+		if name == "agent_id" {
+			hasAgentID = true
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -464,7 +769,47 @@ create table if not exists app_metadata (key text primary key, value text not nu
 			return fmt.Errorf("add conversation last activity: %w", err)
 		}
 	}
+	if !hasAgentID {
+		if _, err := s.db.ExecContext(ctx, `alter table conversations add column agent_id text not null default 'claude-code'`); err != nil {
+			return fmt.Errorf("add conversation agent id: %w", err)
+		}
+	}
 	rows.Close()
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"agent_session_id", "text not null default ''"},
+		{"agent_initialized", "integer not null default 0"},
+		{"agent_runtime_id", "text not null default ''"},
+		{"execution_policy", "text not null default 'approval_required'"},
+	} {
+		if err := ensureColumn(ctx, s.db, "conversations", column.name, column.definition); err != nil {
+			return fmt.Errorf("add conversation %s: %w", column.name, err)
+		}
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"agent_id", "text not null default 'claude-code'"},
+		{"agent_runtime_id", "text not null default ''"},
+		{"execution_policy", "text not null default 'approval_required'"},
+		{"agent_run_id", "text not null default ''"},
+	} {
+		if err := ensureColumn(ctx, s.db, "runs", column.name, column.definition); err != nil {
+			return fmt.Errorf("add run %s: %w", column.name, err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `update conversations set agent_session_id=case when agent_session_id='' then claude_session_id else agent_session_id end, agent_initialized=case when agent_initialized=0 then claude_initialized else agent_initialized end, agent_runtime_id=case when agent_runtime_id='' then coalesce((select runner from projects where projects.id=conversations.project_id),'') else agent_runtime_id end, execution_policy=case when execution_policy='' or execution_policy='approval_required' then permission_mode else execution_policy end`); err != nil {
+		return fmt.Errorf("backfill agent conversation fields: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `update runs set agent_id=coalesce(nullif((select agent_id from conversations where conversations.id=runs.conversation_id),''),'claude-code'), agent_runtime_id=coalesce(nullif((select agent_runtime_id from conversations where conversations.id=runs.conversation_id),''),''), execution_policy=coalesce(nullif((select execution_policy from conversations where conversations.id=runs.conversation_id),''),'approval_required') where agent_runtime_id=''`); err != nil {
+		return fmt.Errorf("backfill agent run fields: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `create unique index if not exists conversations_agent_session_unique on conversations(agent_runtime_id,agent_id,agent_session_id) where agent_session_id<>''`); err != nil {
+		return fmt.Errorf("create agent session index: %w", err)
+	}
 	messageColumns, err := s.db.QueryContext(ctx, `pragma table_info(messages)`)
 	if err != nil {
 		return fmt.Errorf("inspect messages schema: %w", err)
@@ -508,6 +853,11 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	if _, err := s.db.ExecContext(ctx, `update conversations set title=coalesce(nullif((select substr(trim(content),1,80) from messages where messages.conversation_id=conversations.id and role='user' order by created_at limit 1),''),'新会话') where title='' or title='新会话'`); err != nil {
 		return fmt.Errorf("backfill conversation title: %w", err)
 	}
+	// Ensure shortcut_projects has the required project_id column.
+	// An older database may have a shortcut_projects table without it.
+	if err := s.ensureShortcutProjectID(ctx); err != nil {
+		return fmt.Errorf("ensure shortcut_projects schema: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx, `create index if not exists conversations_project_activity on conversations(project_id,last_activity_at desc)`); err != nil {
 		return fmt.Errorf("create conversation activity index: %w", err)
 	}
@@ -521,7 +871,51 @@ create index if not exists messages_conversation_primary_created on messages(con
 	if err := s.migrateTasks(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateOrchestration(ctx); err != nil {
+		return err
+	}
 	return s.migrateGit(ctx)
+}
+
+// ensureShortcutProjectID verifies the shortcut_projects table has the
+// project_id column and adds it if missing. This guards against databases
+// created before the column was part of the schema.
+func (s *Server) ensureShortcutProjectID(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `pragma table_info(shortcut_projects)`)
+	if err != nil {
+		// Unexpected error reading schema (e.g. database corruption).
+		return fmt.Errorf("inspect shortcut_projects schema: %w", err)
+	}
+	defer rows.Close()
+	hasProjectID := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("read shortcut_projects schema: %w", err)
+		}
+		if name == "project_id" {
+			hasProjectID = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate shortcut_projects schema: %w", err)
+	}
+	if !hasProjectID {
+		// The table exists but is missing project_id. Since SQLite does not
+		// support adding columns with foreign-key constraints via ALTER TABLE,
+		// and this table only contains association data (no independent
+		// meaning), we drop and recreate it. Shortcut-to-project bindings
+		// will be re-established when the user saves each shortcut again.
+		if _, err := s.db.ExecContext(ctx, `drop table if exists shortcut_projects;
+create table shortcut_projects (shortcut_id text not null references shortcuts(id) on delete cascade, project_id text not null references projects(id) on delete cascade, primary key (shortcut_id,project_id))`); err != nil {
+			return fmt.Errorf("rebuild shortcut_projects: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
@@ -579,13 +973,87 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 }
 
 func validPermissionMode(mode string) bool {
-	return mode == "approval_required" || mode == "full_control"
+	return mode == "approval_required" || mode == "full_control" || mode == "read_only" || mode == "workspace_write"
+}
+
+func validAgentPolicy(agentID, policy string) bool {
+	if agentID == "codex" {
+		return policy == "read_only" || policy == "workspace_write"
+	}
+	return agentID == "claude-code" && (policy == "approval_required" || policy == "full_control")
+}
+
+func (c Conversation) sessionID() string {
+	if c.AgentSessionID != "" {
+		return c.AgentSessionID
+	}
+	return c.ClaudeSessionID
+}
+
+func (c Conversation) initialized() bool { return c.AgentInitialized || c.ClaudeInitialized }
+
+func (c Conversation) executionPolicy() string {
+	// Rows inserted by pre-migration callers have the new column's default but
+	// no agent session yet. Their legacy permission is still authoritative.
+	if c.AgentSessionID == "" {
+		return c.PermissionMode
+	}
+	if c.ExecutionPolicy != "" {
+		return c.ExecutionPolicy
+	}
+	return c.PermissionMode
 }
 
 func (s *Server) listDirectories(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
+	runnerID := r.URL.Query().Get("runner")
 	if path == "" {
 		path = s.config.AllowedRoot
+	}
+	// For SSH runners, use SFTP to list remote directories.
+	if strings.HasPrefix(runnerID, "ssh-") {
+		runner, ok := s.runnerRegistry.get(runnerID)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("runner not found"))
+			return
+		}
+		if sshR, ok := runner.(*sshRunner); ok {
+			if r.URL.Query().Get("path") == "" {
+				path = sshR.rootPath
+			}
+			path, err := sshR.canonicalProjectPath(r.Context(), path)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			entries, err := sshR.client.readDir(r.Context(), path)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("无法读取远程目录：%w", err))
+				return
+			}
+			type item struct {
+				Name string `json:"name"`
+				Path string `json:"path"`
+			}
+			items := make([]item, 0)
+			for _, entry := range entries {
+				if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+					items = append(items, item{Name: entry.Name(), Path: filepath.Join(path, entry.Name())})
+				}
+			}
+			sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
+			parent := filepath.Dir(path)
+			meta, _ := s.runnerRegistry.getMeta(runnerID)
+			rootPath := "/"
+			if len(meta.Roots) > 0 {
+				rootPath = meta.Roots[0].Path
+			}
+			if !strings.HasPrefix(parent, rootPath) {
+				parent = rootPath
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"path": path, "parent": parent, "directories": items})
+			return
+		}
 	}
 	path, err := s.allowedPath(path)
 	if err != nil {
@@ -613,9 +1081,58 @@ func (s *Server) listDirectories(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Path string `json:"path"`
+		Path   string `json:"path"`
+		Runner string `json:"runner"`
 	}
 	if !decode(w, r, &input) {
+		return
+	}
+	runnerID := input.Runner
+	if runnerID == "" {
+		runnerID = "wsl-local"
+	}
+	// For SSH runners, validate via SSH.
+	if strings.HasPrefix(runnerID, "ssh-") {
+		runner, ok := s.runnerRegistry.get(runnerID)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("runner not found"))
+			return
+		}
+		sshR, ok := runner.(*sshRunner)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("runner is not an SSH runner"))
+			return
+		}
+		path, err := sshR.canonicalProjectPath(r.Context(), input.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if _, err := sshR.client.readDir(r.Context(), path); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("无法访问远程目录：%w", err))
+			return
+		}
+		branch, gitReady := "", false
+		if out, err := sshR.client.execCommand(r.Context(), fmt.Sprintf("cd %s && git rev-parse --abbrev-ref HEAD 2>/dev/null", shellQuote(path))); err == nil {
+			branch = strings.TrimSpace(string(out))
+			gitReady = branch != ""
+		}
+		if !gitReady {
+			branch = "非 Git 目录"
+		}
+		claudeReady := sshR.Ready(r.Context())
+		meta, _ := s.runnerRegistry.getMeta(runnerID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"path":        path,
+			"name":        filepath.Base(path),
+			"gitReady":    gitReady,
+			"gitBranch":   branch,
+			"claudeReady": claudeReady,
+			"codexReady":  false,
+			"agentReady":  claudeReady,
+			"performance": "remote",
+			"runnerName":  meta.Name,
+		})
 		return
 	}
 	path, err := s.allowedPath(input.Path)
@@ -630,15 +1147,87 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	branch, gitReady := gitBranch(r.Context(), path)
 	claudeReady := s.runner.Ready(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"path": path, "name": filepath.Base(path), "gitReady": gitReady, "gitBranch": branch, "claudeReady": claudeReady})
+	codexReady := s.codexRunner.Ready(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{"path": path, "name": filepath.Base(path), "gitReady": gitReady, "gitBranch": branch, "claudeReady": claudeReady, "codexReady": codexReady, "agentReady": claudeReady || codexReady})
 }
 
 func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Path string `json:"path"`
-		Name string `json:"name"`
+		Path   string `json:"path"`
+		Name   string `json:"name"`
+		Runner string `json:"runner"`
 	}
 	if !decode(w, r, &input) {
+		return
+	}
+	runnerID := input.Runner
+	if runnerID == "" {
+		runnerID = "wsl-local"
+	}
+	// For SSH runners, skip local path validation.
+	if strings.HasPrefix(runnerID, "ssh-") {
+		// Keep the runner registered until the project row is committed. This
+		// shares the lock used by SSH connection deletion and replacement.
+		s.projectLifecycleMu.Lock()
+		defer s.projectLifecycleMu.Unlock()
+		projectRunner, ok := s.runnerRegistry.get(runnerID)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("runner not found"))
+			return
+		}
+		sshR, ok := projectRunner.(*sshRunner)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("runner is not an SSH runner"))
+			return
+		}
+		path, err := sshR.canonicalProjectPath(r.Context(), input.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if !sshR.Ready(r.Context()) {
+			writeError(w, http.StatusBadRequest, errors.New("远程服务器上 Claude Code 不可用"))
+			return
+		}
+		branch, gitReady := "", false
+		if out, err := sshR.client.execCommand(r.Context(), fmt.Sprintf("cd %s && git rev-parse --abbrev-ref HEAD 2>/dev/null", shellQuote(path))); err == nil {
+			branch = strings.TrimSpace(string(out))
+			gitReady = branch != ""
+		}
+		if !gitReady {
+			branch = "非 Git 目录"
+		}
+		name := strings.TrimSpace(input.Name)
+		if name == "" {
+			name = filepath.Base(path)
+		}
+		meta, _ := s.runnerRegistry.getMeta(runnerID)
+		p := Project{
+			ID:          uuid.NewString(),
+			Name:        name,
+			Path:        path,
+			PathDisplay: meta.Name + ":" + path,
+			Runner:      runnerID,
+			GitBranch:   branch,
+			ClaudeReady: true,
+			AgentReady:  true,
+			CreatedAt:   time.Now().UTC(),
+		}
+		s.decorateProjectPresentation(&p)
+		_, err = s.db.ExecContext(r.Context(), `insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, p.ID, p.Name, p.Path, p.Runner, p.GitBranch, p.ClaudeReady, p.CreatedAt)
+		if err != nil {
+			var existing Project
+			lookupErr := s.db.QueryRowContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects where path=$1 and runner=$2`, path, runnerID).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.Runner, &existing.GitBranch, &existing.ClaudeReady, &existing.CreatedAt)
+			if lookupErr == nil {
+				s.decorateProjectPresentation(&existing)
+				s.decorateProjectAvailability(&existing, existing.Runner == "wsl-local" && s.codexRunner.Ready(r.Context()))
+				writeJSON(w, http.StatusOK, existing)
+				return
+			}
+			writeError(w, http.StatusConflict, fmt.Errorf("create project: %w", err))
+			return
+		}
+		writeJSON(w, http.StatusCreated, p)
 		return
 	}
 	path, err := s.allowedPath(input.Path)
@@ -647,8 +1236,10 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	branch, gitReady := gitBranch(r.Context(), path)
-	if !s.runner.Ready(r.Context()) {
-		writeError(w, http.StatusBadRequest, errors.New("Claude Code is not available in this Runner"))
+	claudeReady := s.runner.Ready(r.Context())
+	codexReady := s.codexRunner.Ready(r.Context())
+	if !claudeReady && !codexReady {
+		writeError(w, http.StatusBadRequest, errors.New("Claude Code and Codex CLI are unavailable in this Runner"))
 		return
 	}
 	name := strings.TrimSpace(input.Name)
@@ -658,13 +1249,15 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	if !gitReady {
 		branch = "非 Git 目录"
 	}
-	p := Project{ID: uuid.NewString(), Name: name, Path: path, PathDisplay: filepath.Base(path), Runner: "wsl-local", GitBranch: branch, ClaudeReady: true, CreatedAt: time.Now().UTC()}
+	p := Project{ID: uuid.NewString(), Name: name, Path: path, PathDisplay: filepath.Base(path), Runner: "wsl-local", GitBranch: branch, ClaudeReady: claudeReady, CodexReady: codexReady, AgentReady: claudeReady || codexReady, CreatedAt: time.Now().UTC()}
+	s.decorateProjectPresentation(&p)
 	_, err = s.db.ExecContext(r.Context(), `insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, p.ID, p.Name, p.Path, p.Runner, p.GitBranch, p.ClaudeReady, p.CreatedAt)
 	if err != nil {
 		var existing Project
-		lookupErr := s.db.QueryRowContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects where path=$1`, path).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.Runner, &existing.GitBranch, &existing.ClaudeReady, &existing.CreatedAt)
+		lookupErr := s.db.QueryRowContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects where path=$1 and runner=$2`, path, runnerID).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.Runner, &existing.GitBranch, &existing.ClaudeReady, &existing.CreatedAt)
 		if lookupErr == nil {
-			existing.PathDisplay = filepath.Base(existing.Path)
+			s.decorateProjectPresentation(&existing)
+			s.decorateProjectAvailability(&existing, existing.Runner == "wsl-local" && s.codexRunner.Ready(r.Context()))
 			writeJSON(w, http.StatusOK, existing)
 			return
 		}
@@ -672,6 +1265,160 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, p)
+}
+
+func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("project ID is required"))
+		return
+	}
+	// Serialize deletion with message admission so no new agent process can be
+	// started after we have stopped the project's existing sessions.
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
+	if err := s.stopProjectAgentRuns(r.Context(), projectID); err != nil {
+		writeError(w, http.StatusConflict, fmt.Errorf("stop project agents: %w", err))
+		return
+	}
+	// Foreign key cascades (on delete cascade) will clean up:
+	//   conversations -> messages, runs, events, run_usage, run_model_usage
+	//   shortcut_projects (via project_id), shortcut_runs (via conversation_id)
+	//   tasks, task_runs, task_events, task_dependencies
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(r.Context(), `delete from projects where id=$1`, projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed != 1 {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Release the workspace lease only after a successful commit.
+	s.mu.Lock()
+	delete(s.projectWorkspaceLeases, projectID)
+	s.mu.Unlock()
+	s.runManagersMu.Lock()
+	runner := s.runManagers[projectID]
+	delete(s.runManagers, projectID)
+	s.runManagersMu.Unlock()
+	if runner != nil {
+		if err := runner.Retire(); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("project was deleted but its process could not be stopped: %w", err))
+			return
+		}
+	}
+	s.closeProjectRunLogSubscribers(projectID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) stopProjectAgentRuns(ctx context.Context, projectID string) error {
+	rows, err := s.db.QueryContext(ctx, `select id from conversations where project_id=?`, projectID)
+	if err != nil {
+		return err
+	}
+	conversationIDs := map[string]struct{}{}
+	for rows.Next() {
+		var conversationID string
+		if err := rows.Scan(&conversationID); err != nil {
+			rows.Close()
+			return err
+		}
+		conversationIDs[conversationID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	cancels := []context.CancelFunc{}
+	sessions := []AgentSession{}
+	runIDs := map[string]struct{}{}
+	s.mu.Lock()
+	for runID, conversationID := range s.runContexts {
+		if _, ok := conversationIDs[conversationID]; ok {
+			runIDs[runID] = struct{}{}
+			if cancel := s.cancels[runID]; cancel != nil {
+				cancels = append(cancels, cancel)
+			}
+		}
+	}
+	for conversationID, session := range s.sessions {
+		if _, ok := conversationIDs[conversationID]; ok {
+			session.stopping = true
+			sessions = append(sessions, session.agent)
+			if session.activeRunID != "" {
+				runIDs[session.activeRunID] = struct{}{}
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, session := range sessions {
+		session.Stop()
+	}
+	for runID := range runIDs {
+		s.resolveRunApprovals(runID, "deny")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		active := false
+		for _, conversationID := range s.runContexts {
+			if _, ok := conversationIDs[conversationID]; ok {
+				active = true
+				break
+			}
+		}
+		if !active {
+			for conversationID := range s.sessions {
+				if _, ok := conversationIDs[conversationID]; ok {
+					active = true
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+		// A streaming turn removes its in-memory run mapping before it writes
+		// its terminal state. Keep waiting for the durable state as well, so
+		// cascading the project deletion cannot race that final persistence.
+		var persistedActive bool
+		if err := s.db.QueryRowContext(waitCtx, `select exists(select 1 from runs r join conversations c on c.id=r.conversation_id where c.project_id=? and r.status in ('queued','running'))`, projectID).Scan(&persistedActive); err != nil {
+			return err
+		}
+		if !active && !persistedActive {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return errors.New("agent processes did not stop before the deletion deadline")
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
@@ -682,13 +1429,15 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	projects := []Project{}
+	codexReady := s.codexRunner.Ready(r.Context())
 	for rows.Next() {
 		var p Project
 		if err := rows.Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt); err != nil {
 			writeError(w, 500, err)
 			return
 		}
-		p.PathDisplay = filepath.Base(p.Path)
+		s.decorateProjectPresentation(&p)
+		s.decorateProjectAvailability(&p, codexReady)
 		projects = append(projects, p)
 	}
 	if err := rows.Err(); err != nil {
@@ -698,11 +1447,73 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, projects)
 }
 
+func (s *Server) decorateProjectAvailability(project *Project, codexReady bool) {
+	project.CodexReady = project.Runner == "wsl-local" && codexReady
+	project.AgentReady = project.ClaudeReady || project.CodexReady
+}
+
+func (s *Server) decorateProjectPresentation(project *Project) {
+	project.PathDisplay = filepath.Base(project.Path)
+	project.Environment = "wsl"
+	if strings.HasPrefix(project.Path, "/mnt/") {
+		project.Environment = "windows"
+	}
+	if !strings.HasPrefix(project.Runner, "ssh-") {
+		return
+	}
+	project.Environment = "remote-linux"
+	project.PathDisplay = project.Path
+	if meta, ok := s.runnerRegistry.getMeta(project.Runner); ok {
+		project.PathDisplay = meta.Name + ":" + project.Path
+	}
+}
+
+type projectStatusItem struct {
+	ID                string `json:"id"`
+	Running           int    `json:"running"`
+	ConversationCount int    `json:"conversationCount"`
+	ActiveTitle       string `json:"activeTitle"`
+}
+
+func (s *Server) listProjectStatuses(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.QueryContext(r.Context(), `
+		select
+			p.id,
+			case when exists(select 1 from conversations c where c.project_id = p.id and c.is_current = 1 and c.status = 'running') then 1 else 0 end,
+			(select count(*) from conversations c where c.project_id = p.id),
+			coalesce((select c.title from conversations c where c.project_id = p.id and c.is_current = 1 limit 1), '')
+		from projects p
+		order by p.created_at desc`)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	defer rows.Close()
+	var items []projectStatusItem
+	for rows.Next() {
+		var item projectStatusItem
+		if err := rows.Scan(&item.ID, &item.Running, &item.ConversationCount, &item.ActiveTitle); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	if items == nil {
+		items = []projectStatusItem{}
+	}
+	writeJSON(w, 200, items)
+}
+
 func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 	newSession := r.URL.Query().Get("new") == "true"
 	var input struct {
 		PermissionMode string `json:"permissionMode"`
+		AgentID        string `json:"agentId"`
 	}
 	if r.Body != http.NoBody {
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
@@ -710,15 +1521,39 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if input.PermissionMode == "" {
-		input.PermissionMode = "approval_required"
+	if input.AgentID == "" {
+		input.AgentID = "claude-code"
 	}
-	if !validPermissionMode(input.PermissionMode) {
-		writeError(w, http.StatusBadRequest, errors.New("unsupported permission mode"))
+	if input.PermissionMode == "" {
+		if input.AgentID == "codex" {
+			input.PermissionMode = "workspace_write"
+		} else {
+			input.PermissionMode = "approval_required"
+		}
+	}
+	if !validAgentPolicy(input.AgentID, input.PermissionMode) {
+		writeError(w, http.StatusBadRequest, errors.New("unsupported agent or execution policy"))
+		return
+	}
+	var projectRunner string
+	if err := s.db.QueryRowContext(r.Context(), `select runner from projects where id=?`, projectID).Scan(&projectRunner); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if input.AgentID == "codex" && projectRunner != "wsl-local" {
+		writeError(w, http.StatusConflict, errors.New("Codex is currently available only on the local WSL runner"))
+		return
+	}
+	if input.AgentID == "codex" && !s.codexRunner.Ready(r.Context()) {
+		writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
 		return
 	}
 	now := time.Now().UTC()
-	c := Conversation{ID: uuid.NewString(), ProjectID: projectID, ClaudeSessionID: uuid.NewString(), Status: "idle", PermissionMode: input.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: true, CreatedAt: now}
+	sessionID := uuid.NewString()
+	c := Conversation{ID: uuid.NewString(), ProjectID: projectID, ClaudeSessionID: sessionID, AgentID: input.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, ExecutionPolicy: input.PermissionMode, Status: "idle", PermissionMode: input.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: true, CreatedAt: now}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, 500, err)
@@ -742,7 +1577,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var existing Conversation
-		err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at from conversations where project_id=$1 and is_current=1`, projectID).Scan(&existing.ID, &existing.ProjectID, &existing.ClaudeSessionID, &existing.Status, &existing.PermissionMode, &existing.Title, &existing.LastActivityAt, &existing.ClaudeInitialized, &existing.IsCurrent, &existing.CreatedAt)
+		err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where project_id=$1 and is_current=1`, projectID).Scan(&existing.ID, &existing.ProjectID, &existing.ClaudeSessionID, &existing.AgentID, &existing.AgentSessionID, &existing.AgentRuntimeID, &existing.ExecutionPolicy, &existing.Status, &existing.PermissionMode, &existing.Title, &existing.LastActivityAt, &existing.ClaudeInitialized, &existing.AgentInitialized, &existing.IsCurrent, &existing.CreatedAt)
 		if err == nil {
 			if err = tx.Commit(); err != nil {
 				writeError(w, 500, err)
@@ -756,7 +1591,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?)`, c.ID, c.ProjectID, c.ClaudeSessionID, c.Status, c.PermissionMode, c.Title, c.LastActivityAt, c.ClaudeInitialized, c.IsCurrent, c.CreatedAt); err != nil {
+	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, c.ID, c.ProjectID, c.ClaudeSessionID, c.AgentID, c.AgentSessionID, c.AgentRuntimeID, c.ExecutionPolicy, c.Status, c.PermissionMode, c.Title, c.LastActivityAt, c.ClaudeInitialized, c.AgentInitialized, c.IsCurrent, c.CreatedAt); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -768,7 +1603,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	rows, err := s.db.QueryContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),'') from conversations c where c.project_id=$1 and ($2='' or lower(c.title) like '%' || lower($2) || '%') order by c.is_current desc,c.last_activity_at desc limit 100`, chi.URLParam(r, "projectID"), query)
+	rows, err := s.db.QueryContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),'') from conversations c where c.project_id=$1 and ($2='' or lower(c.title) like '%' || lower($2) || '%') order by c.is_current desc,c.last_activity_at desc limit 100`, chi.URLParam(r, "projectID"), query)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -777,7 +1612,7 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	items := []Conversation{}
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.IsCurrent, &c.CreatedAt, &c.Preview); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt, &c.Preview); err != nil {
 			writeError(w, 500, err)
 			return
 		}
@@ -808,7 +1643,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var c Conversation
-	err = s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.IsCurrent, &c.CreatedAt)
+	err = s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt)
 	if err != nil {
 		writeError(w, 404, errors.New("conversation not found"))
 		return
@@ -906,7 +1741,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	if !hasMore {
 		nextCursor = conversationPageCursor{}
 	}
-	writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": events, "hasMore": hasMore, "nextCursor": encodeConversationPageCursor(nextCursor)})
+	writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": events, "hasMore": hasMore, "hasMoreMessages": hasMoreMessages, "nextCursor": encodeConversationPageCursor(nextCursor)})
 }
 
 func (s *Server) listInputHistory(w http.ResponseWriter, r *http.Request) {
@@ -965,7 +1800,7 @@ func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	var conversation Conversation
-	err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at from conversations where id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
+	err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -1011,13 +1846,9 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 	if !decode(w, r, &input) {
 		return
 	}
-	if !validPermissionMode(input.PermissionMode) {
-		writeError(w, http.StatusBadRequest, errors.New("unsupported permission mode"))
-		return
-	}
 	conversationID := chi.URLParam(r, "conversationID")
 	var conversation Conversation
-	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
+	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -1026,11 +1857,15 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if conversation.Status != "idle" {
-		writeError(w, http.StatusConflict, errors.New("stop the active Claude run before changing permission mode"))
+	if !validAgentPolicy(conversation.AgentID, input.PermissionMode) {
+		writeError(w, http.StatusBadRequest, errors.New("unsupported execution policy for this agent"))
 		return
 	}
-	result, err := s.db.ExecContext(r.Context(), `update conversations set permission_mode=? where id=? and status='idle'`, input.PermissionMode, conversationID)
+	if conversation.Status != "idle" {
+		writeError(w, http.StatusConflict, errors.New("stop the active agent run before changing permission mode"))
+		return
+	}
+	result, err := s.db.ExecContext(r.Context(), `update conversations set permission_mode=?,execution_policy=? where id=? and status='idle'`, input.PermissionMode, input.PermissionMode, conversationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1041,10 +1876,11 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if updated != 1 {
-		writeError(w, http.StatusConflict, errors.New("stop the active Claude run before changing permission mode"))
+		writeError(w, http.StatusConflict, errors.New("stop the active agent run before changing permission mode"))
 		return
 	}
 	conversation.PermissionMode = input.PermissionMode
+	conversation.ExecutionPolicy = input.PermissionMode
 	writeJSON(w, http.StatusOK, conversation)
 }
 
@@ -1366,7 +2202,7 @@ func (s *Server) deleteShortcut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) shortcutForConversation(ctx context.Context, shortcutID, conversationID string) (Shortcut, Conversation, Project, error) {
 	var conversation Conversation
 	var project Project
-	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.is_current,c.created_at,p.id,p.name,p.path,p.runner,p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.id,p.name,p.path,p.runner,p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
 	if err != nil {
 		return Shortcut{}, Conversation{}, Project{}, err
 	}
@@ -1520,31 +2356,49 @@ func (s *Server) runShortcut(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"message": m, "runId": runID, "shortcutRun": execution.Shortcut})
 }
 
+type messageAdmission struct {
+	agentID  string
+	runnerID string
+}
+
+func (s *Server) messageAdmission(ctx context.Context, conversationID string) (messageAdmission, error) {
+	var admission messageAdmission
+	err := s.db.QueryRowContext(ctx, `select c.agent_id,p.runner from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&admission.agentID, &admission.runnerID)
+	return admission, err
+}
+
 func (s *Server) startMessage(ctx context.Context, conversationID, content string, record *runStartRecord) (Message, string, *runStartRecord, int, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return Message{}, "", nil, http.StatusBadRequest, errors.New("message is required")
 	}
-	streamingRunner, streaming := s.runner.(StreamingAgentRunner)
-	if streaming {
-		// Keep database admission and the ordered session write together with a
-		// session stop. Otherwise a run can enter the CLI queue after stop has
-		// verified isolation and be terminated as collateral damage.
-		s.streamMu.Lock()
-		defer s.streamMu.Unlock()
-		s.mu.Lock()
-		stopping := s.sessions[conversationID] != nil && s.sessions[conversationID].stopping
-		s.mu.Unlock()
-		if stopping {
-			return Message{}, "", nil, http.StatusConflict, errors.New("conversation is stopping")
-		}
-	}
+
+	// Fast-path admission checks before hitting the database.
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
 	if closing {
 		return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("control service is shutting down")
 	}
+	admission, err := s.messageAdmission(ctx, conversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, "", nil, http.StatusNotFound, errors.New("conversation not found")
+	}
+	if err != nil {
+		return Message{}, "", nil, http.StatusInternalServerError, err
+	}
+	// Do not hold a database transaction while waiting for either of these
+	// locks. updateClaude takes the maintenance lock before querying SQLite.
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
+	if admission.agentID == "claude-code" {
+		s.runnerMaintenanceMu.Lock()
+		defer s.runnerMaintenanceMu.Unlock()
+		if s.runnerUpdating[admission.runnerID] {
+			return Message{}, "", nil, http.StatusConflict, errors.New("Claude Code is being updated on this runner")
+		}
+	}
+
 	runID := uuid.NewString()
 	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, CreatedAt: time.Now().UTC()}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1554,15 +2408,53 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	defer tx.Rollback()
 	var conversation Conversation
 	var projectPath string
-	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.is_current,c.created_at,p.path from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath)
+	var projectRunner string
+	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,p.runner from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, "", nil, http.StatusNotFound, errors.New("conversation not found")
 	}
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
 	}
+	if record != nil && record.WorktreePath != "" {
+		projectPath = record.WorktreePath
+	}
+	// Select the runner for this specific project.
+	// For SSH and other non-default runners, use the registry. For "wsl-local",
+	// prefer s.runner directly (tests may replace s.runner with a custom impl).
+	runnerObj := s.runner // default to the server-level runner
+	if conversation.AgentID == "codex" {
+		if projectRunner != "wsl-local" {
+			return Message{}, "", nil, http.StatusConflict, errors.New("Codex is currently available only on the local WSL runner")
+		}
+		if !s.codexRunner.Ready(ctx) {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in")
+		}
+		runnerObj = s.codexRunner
+	}
+	if strings.HasPrefix(projectRunner, "ssh-") {
+		r, ok := s.runnerRegistry.get(projectRunner)
+		if !ok {
+			return Message{}, "", nil, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试")
+		}
+		runnerObj = r
+	}
+	if conversation.AgentID == "claude-code" && !runnerObj.Ready(ctx) {
+		return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Claude Code is unavailable or not logged in")
+	}
+	streamingRunner, streaming := runnerObj.(StreamingAgentRunner)
+	if streaming {
+		s.streamMu.Lock()
+		defer s.streamMu.Unlock()
+		s.mu.Lock()
+		stopping := s.sessions[conversationID] != nil && s.sessions[conversationID].stopping
+		s.mu.Unlock()
+		if stopping {
+			return Message{}, "", nil, http.StatusConflict, errors.New("conversation is stopping")
+		}
+	}
 	if conversation.Status != "idle" && !streaming {
-		return Message{}, "", nil, http.StatusConflict, errors.New("conversation already has a running Claude turn")
+		return Message{}, "", nil, http.StatusConflict, errors.New("conversation already has a running agent turn")
 	}
 	workspaceOwner := "run:" + runID
 	if streaming {
@@ -1579,7 +2471,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		}
 	}()
 	if record != nil && record.Task != nil {
-		if err := s.validateTaskDispatchTx(ctx, tx, *record.Task, conversation); err != nil {
+		if err := s.validateTaskDispatchTx(ctx, tx, *record.Task, conversation, record.Orchestrated); err != nil {
 			return Message{}, "", nil, http.StatusConflict, err
 		}
 	}
@@ -1592,7 +2484,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		var changed int64
 		changed, err = result.RowsAffected()
 		if err == nil && changed != 1 {
-			return Message{}, "", nil, http.StatusConflict, errors.New("conversation already has a running Claude turn")
+			return Message{}, "", nil, http.StatusConflict, errors.New("conversation already has a running agent turn")
 		}
 	}
 	if err == nil {
@@ -1603,7 +2495,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		if streaming {
 			status = "queued"
 		}
-		_, err = tx.ExecContext(ctx, `insert into runs (id,conversation_id,status,created_at) values ($1,$2,$3,$4)`, runID, conversationID, status, m.CreatedAt)
+		_, err = tx.ExecContext(ctx, `insert into runs (id,conversation_id,agent_id,agent_runtime_id,execution_policy,agent_run_id,status,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8)`, runID, conversationID, conversation.AgentID, projectRunner, conversation.executionPolicy(), "", status, m.CreatedAt)
 	}
 	if err == nil && record != nil && record.Shortcut != nil {
 		record.Shortcut.RunID = runID
@@ -1623,8 +2515,19 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 			record.Task.Sequence = sequence
 			_, err = tx.ExecContext(ctx, `insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at) values (?,?,?,?,?,?,?,?,?,?,?)`, record.Task.ID, record.Task.TaskID, record.Task.ConversationID, record.Task.RunID, record.Task.Sequence, record.Task.Status, record.Task.PromptSnapshot, record.Task.AcceptanceSnapshot, record.Task.FailureReason, record.Task.CreatedAt, record.Task.StartedAt)
 		}
+		if err == nil && record.Task.ExecutionIntentID != "" {
+			var result sql.Result
+			result, err = tx.ExecContext(ctx, `update task_execution_intents set run_id=?,status='started',updated_at=? where id=? and run_id=''`, runID, m.CreatedAt, record.Task.ExecutionIntentID)
+			if err == nil {
+				var changed int64
+				changed, err = result.RowsAffected()
+				if err == nil && changed != 1 {
+					err = errors.New("task execution intent was already linked to a run")
+				}
+			}
+		}
 		if err == nil {
-			_, err = tx.ExecContext(ctx, `update tasks set status=?,last_task_run_id=?,updated_at=? where id=? and status in ('todo','action_required','awaiting_review')`, taskRunning, record.Task.ID, m.CreatedAt, record.Task.TaskID)
+			_, err = tx.ExecContext(ctx, `update tasks set status=?,last_task_run_id=?,updated_at=? where id=? and status in ('todo','action_required')`, taskRunning, record.Task.ID, m.CreatedAt, record.Task.TaskID)
 		}
 		if err == nil {
 			err = recordTaskEventTx(ctx, tx, record.Task.TaskID, record.Task.ID, "task.dispatched", map[string]string{"runId": runID, "status": record.Task.Status}, m.CreatedAt)
@@ -1639,7 +2542,16 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	s.registerRunWorkspace(runID, releaseWorkspace)
 	workspaceAdmitted = true
 	if streaming {
-		s.submitStreamingRun(streamingRunner, runID, conversation, projectPath, content)
+		// A streaming runner can still be establishing its persistent process
+		// after the Run row has been committed. Register a per-run cancellation
+		// immediately so /runs/{id}/stop can cancel that setup window as well.
+		runCtx, cancel := context.WithCancel(s.runtimeCtx)
+		s.mu.Lock()
+		s.cancels[runID] = cancel
+		s.runContexts[runID] = conversation.ID
+		s.streamingSetups[runID] = &streamingSetup{}
+		s.mu.Unlock()
+		s.submitStreamingRun(runCtx, streamingRunner, runID, conversation, projectPath, content)
 		return m, runID, record, http.StatusAccepted, nil
 	}
 	runCtx, cancel := context.WithCancel(s.runtimeCtx)
@@ -1656,8 +2568,13 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	s.runTokens[runID] = runToken
 	s.runContexts[runID] = conversation.ID
 	s.mu.Unlock()
-	s.beginRunUsage(runID, conversation.ID)
-	go func() { defer s.runWG.Done(); s.runClaude(runCtx, runID, runToken, conversation, projectPath, content) }()
+	if conversation.AgentID != "codex" {
+		s.beginRunUsage(runID, conversation.ID)
+	}
+	go func() {
+		defer s.runWG.Done()
+		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, projectPath, content)
+	}()
 	return m, runID, record, http.StatusAccepted, nil
 }
 
@@ -1715,21 +2632,45 @@ func (s *Server) releaseRunWorkspace(runID string) {
 	}
 }
 
-func (s *Server) submitStreamingRun(runner StreamingAgentRunner, runID string, conversation Conversation, projectPath, prompt string) {
-	// startMessage holds streamMu across admission and this ordered transport
-	// write, so a stop cannot interleave with either operation.
-	session, err := s.streamingSession(runner, conversation, projectPath)
+func (s *Server) submitStreamingRun(ctx context.Context, runner StreamingAgentRunner, runID string, conversation Conversation, projectPath, prompt string) {
+	// startMessage holds streamMu across admission and the ordered transport
+	// write. streamingSetups separately lets a stop cancel initialization before
+	// the first prompt is admitted.
+	session, err := s.streamingSession(ctx, runner, runID, conversation, projectPath)
 	if err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
 	}
-	request := AgentRunRequest{SessionID: conversation.ClaudeSessionID, ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.PermissionMode, Resume: conversation.ClaudeInitialized, RunID: runID}
-	if err := session.Send(request, &claudeRunSink{server: s, runID: runID, conversationID: conversation.ID, streaming: true}); err != nil {
+	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID}
+	if err := s.beginStreamingRun(ctx, runID); err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
+		return
+	}
+	if err := session.Send(request, &agentRunSink{server: s, runID: runID, conversationID: conversation.ID, agentID: conversation.AgentID, streaming: true}); err != nil {
+		s.finishStreamingRun(runID, conversation.ID, err)
+		return
 	}
 }
 
-func (s *Server) streamingSession(runner StreamingAgentRunner, conversation Conversation, projectPath string) (AgentSession, error) {
+func (s *Server) beginStreamingRun(ctx context.Context, runID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return context.Canceled
+	}
+	setup := s.streamingSetups[runID]
+	if setup == nil || setup.cancelled {
+		return context.Canceled
+	}
+	delete(s.streamingSetups, runID)
+	delete(s.cancels, runID)
+	return nil
+}
+
+func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunner, runID string, conversation Conversation, projectPath string) (AgentSession, error) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	s.mu.Lock()
@@ -1738,6 +2679,12 @@ func (s *Server) streamingSession(runner StreamingAgentRunner, conversation Conv
 			s.mu.Unlock()
 			return nil, errors.New("conversation is stopping")
 		}
+		setup := s.streamingSetups[runID]
+		if setup == nil || setup.cancelled {
+			s.mu.Unlock()
+			return nil, context.Canceled
+		}
+		setup.session = session
 		s.mu.Unlock()
 		return session.agent, nil
 	}
@@ -1747,18 +2694,30 @@ func (s *Server) streamingSession(runner StreamingAgentRunner, conversation Conv
 	}
 	s.mu.Unlock()
 	token := uuid.NewString()
-	agent, err := runner.StartSession(s.runtimeCtx, AgentSessionRequest{SessionID: conversation.ClaudeSessionID, ProjectPath: projectPath, PermissionMode: conversation.PermissionMode, Resume: conversation.ClaudeInitialized, ConversationID: conversation.ID, ApprovalToken: token})
+	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token})
 	if err != nil {
 		return nil, err
 	}
-	managed := &activeAgentSession{agent: agent, approvalToken: token}
+	if err := ctx.Err(); err != nil {
+		agent.Stop()
+		return nil, err
+	}
+	managed := &activeAgentSession{agent: agent, approvalToken: token, runnerID: conversation.AgentRuntimeID}
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
 		agent.Stop()
 		return nil, errors.New("control service is shutting down")
 	}
+	setup := s.streamingSetups[runID]
+	if setup == nil || setup.cancelled {
+		s.mu.Unlock()
+		agent.Stop()
+		return nil, context.Canceled
+	}
 	s.sessions[conversation.ID] = managed
+	setup.session = managed
+	setup.ownsSession = true
 	s.runWG.Add(1)
 	s.mu.Unlock()
 	go func() {
@@ -1773,7 +2732,7 @@ func (s *Server) streamingSession(runner StreamingAgentRunner, conversation Conv
 	return agent, nil
 }
 
-func (s *Server) runClaude(ctx context.Context, runID, runToken string, c Conversation, projectPath, prompt string) {
+func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, projectPath, prompt string) {
 	defer func() {
 		s.discardRunUsage(runID)
 		s.resolveRunApprovals(runID, "deny")
@@ -1783,38 +2742,43 @@ func (s *Server) runClaude(ctx context.Context, runID, runToken string, c Conver
 		delete(s.runContexts, runID)
 		s.mu.Unlock()
 	}()
-	err := s.runner.Run(ctx, AgentRunRequest{
-		SessionID:      c.ClaudeSessionID,
+	err := runner.Run(ctx, AgentRunRequest{
+		SessionID:      c.sessionID(),
 		ProjectPath:    projectPath,
 		Prompt:         prompt,
-		PermissionMode: c.PermissionMode,
-		Resume:         c.ClaudeInitialized,
+		PermissionMode: c.executionPolicy(),
+		Resume:         c.initialized(),
 		RunID:          runID,
 		RunToken:       runToken,
-	}, &claudeRunSink{server: s, runID: runID, conversationID: c.ID})
+	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, agentID: c.AgentID})
 	status := "completed"
 	if ctx.Err() != nil {
 		status = "stopped"
 	} else if err != nil {
 		status = "failed"
 	}
-	s.recordUsagePersistenceError(runID, c.ID, s.persistRunUsage(runID, status))
+	if c.AgentID != "codex" {
+		s.recordUsagePersistenceError(runID, c.ID, s.persistRunUsage(runID, status))
+	}
 	s.finishRun(runID, c.ID, status, err)
 }
 
-type claudeRunSink struct {
+type agentRunSink struct {
 	server         *Server
 	runID          string
 	conversationID string
+	agentID        string
 	streaming      bool
 }
 
-func (sink *claudeRunSink) Event(eventType string, payload json.RawMessage) {
+func (sink *agentRunSink) Event(eventType string, payload json.RawMessage) {
 	sink.server.appendEvent(sink.runID, sink.conversationID, eventType, payload)
-	sink.server.collectUsageEvent(sink.runID, sink.conversationID, eventType, payload)
+	if sink.agentID != "codex" {
+		sink.server.collectUsageEvent(sink.runID, sink.conversationID, eventType, payload)
+	}
 }
 
-func (sink *claudeRunSink) AssistantText(content, parentToolUseID string) {
+func (sink *agentRunSink) AssistantText(content, parentToolUseID string) {
 	m := Message{ID: uuid.NewString(), ConversationID: sink.conversationID, RunID: sink.runID, Role: "assistant", Content: content, ParentToolUseID: parentToolUseID, CreatedAt: time.Now().UTC()}
 	if _, err := sink.server.db.ExecContext(context.Background(), `insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, m.ID, m.ConversationID, m.RunID, m.Role, m.Content, m.ParentToolUseID, m.CreatedAt); err != nil {
 		log.Printf("persist assistant message for run %s: %v", sink.runID, err)
@@ -1824,13 +2788,24 @@ func (sink *claudeRunSink) AssistantText(content, parentToolUseID string) {
 	if _, err := sink.server.db.ExecContext(context.Background(), `update conversations set last_activity_at=? where id=?`, m.CreatedAt, sink.conversationID); err != nil {
 		log.Printf("update conversation activity for run %s: %v", sink.runID, err)
 	}
+	// Raw CLI events differ by runtime. Broadcast the durable message as a
+	// runtime-neutral event so every client can render it immediately.
+	sink.server.appendEvent(sink.runID, sink.conversationID, "assistant.message", mustJSON(m))
 }
 
-func (sink *claudeRunSink) SessionInitialized() {
-	_, _ = sink.server.db.ExecContext(context.Background(), `update conversations set claude_initialized=true where id=?`, sink.conversationID)
+func (sink *agentRunSink) SessionIdentified(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	_, _ = sink.server.db.ExecContext(context.Background(), `update conversations set agent_session_id=?,claude_session_id=case when agent_id='claude-code' then ? else claude_session_id end where id=?`, sessionID, sessionID, sink.conversationID)
+	_, _ = sink.server.db.ExecContext(context.Background(), `update runs set agent_run_id=? where id=?`, sessionID, sink.runID)
 }
 
-func (sink *claudeRunSink) TurnStarted() {
+func (sink *agentRunSink) SessionInitialized() {
+	_, _ = sink.server.db.ExecContext(context.Background(), `update conversations set agent_initialized=true,claude_initialized=case when agent_id='claude-code' then true else claude_initialized end where id=?`, sink.conversationID)
+}
+
+func (sink *agentRunSink) TurnStarted() {
 	if !sink.streaming {
 		return
 	}
@@ -1845,7 +2820,7 @@ func (sink *claudeRunSink) TurnStarted() {
 	sink.server.mu.Unlock()
 }
 
-func (sink *claudeRunSink) TurnFinished(err error) {
+func (sink *agentRunSink) TurnFinished(err error) {
 	if !sink.streaming {
 		return
 	}
@@ -1861,10 +2836,12 @@ func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) 
 			session.activeRunID = ""
 		}
 	}
+	delete(s.cancels, runID)
 	delete(s.runContexts, runID)
+	delete(s.streamingSetups, runID)
 	s.mu.Unlock()
 	status := "completed"
-	if stopped {
+	if stopped || errors.Is(runErr, context.Canceled) {
 		status = "stopped"
 	} else if runErr != nil {
 		status = "failed"
@@ -1876,6 +2853,7 @@ func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) 
 }
 func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 	tx, err := s.db.BeginTx(context.Background(), nil)
+	committed := false
 	if err == nil {
 		_, err = tx.ExecContext(context.Background(), `update runs set status=?,completed_at=? where id=?`, status, time.Now().UTC(), runID)
 		if err == nil {
@@ -1893,6 +2871,7 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 		}
 		if err == nil {
 			err = tx.Commit()
+			committed = err == nil
 		}
 		if err != nil {
 			tx.Rollback()
@@ -1901,6 +2880,9 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 	payload, _ := json.Marshal(map[string]string{"status": status, "error": errorText(runErr)})
 	s.appendEvent(runID, conversationID, "run."+status, payload)
 	s.releaseRunWorkspace(runID)
+	if committed {
+		s.kickOrchestratorForRun(runID)
+	}
 }
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "runID")
@@ -1917,7 +2899,27 @@ func (s *Server) stopRunByID(ctx context.Context, id string) (string, int, error
 	cancel, ok := s.cancels[id]
 	conversationID := s.runContexts[id]
 	session := s.sessions[conversationID]
+	setup := s.streamingSetups[id]
+	setupStop := setup != nil
+	var setupAgent AgentSession
+	if setupStop {
+		setup.cancelled = true
+		if setup.ownsSession && session == setup.session {
+			session.stopping = true
+			setupAgent = session.agent
+		}
+	}
 	s.mu.Unlock()
+	if setupStop {
+		if ok {
+			cancel()
+		}
+		if setupAgent != nil {
+			setupAgent.Stop()
+		}
+		s.resolveRunApprovals(id, "deny")
+		return "stopping", http.StatusAccepted, nil
+	}
 	if session != nil {
 		s.streamMu.Lock()
 		defer s.streamMu.Unlock()
@@ -2122,37 +3124,76 @@ func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) 
 		return
 	}
 	data, _ := json.Marshal(e)
+	s.enqueueConversationEvent(conversationID, data)
+}
+
+// enqueueConversationEvent keeps agent output independent from WebSocket I/O.
+// A slow client is removed once its bounded queue is full; it can reconnect and
+// recover durable events through the conversation HTTP endpoint.
+func (s *Server) enqueueConversationEvent(conversationID string, data []byte) {
+	toClose := make([]*subscriber, 0)
 	s.mu.Lock()
-	connections := make([]*subscriber, 0, len(s.subscribers[conversationID]))
-	for _, connection := range s.subscribers[conversationID] {
-		connections = append(connections, connection)
-	}
-	s.mu.Unlock()
-	for _, connection := range connections {
-		connection.writeMu.Lock()
-		err := connection.conn.WriteMessage(websocket.TextMessage, data)
-		connection.writeMu.Unlock()
-		if err != nil {
-			s.mu.Lock()
-			delete(s.subscribers[conversationID], connection.conn)
-			s.mu.Unlock()
-			connection.conn.Close()
+	for conn, sub := range s.subscribers[conversationID] {
+		select {
+		case sub.send <- data:
+		default:
+			delete(s.subscribers[conversationID], conn)
+			toClose = append(toClose, sub)
 		}
 	}
+	if len(s.subscribers[conversationID]) == 0 {
+		delete(s.subscribers, conversationID)
+	}
+	s.mu.Unlock()
+	for _, sub := range toClose {
+		sub.close()
+	}
 }
+
+func (s *Server) removeConversationSubscriber(conversationID string, sub *subscriber) {
+	removed := false
+	s.mu.Lock()
+	if current := s.subscribers[conversationID][sub.conn]; current == sub {
+		delete(s.subscribers[conversationID], sub.conn)
+		if len(s.subscribers[conversationID]) == 0 {
+			delete(s.subscribers, conversationID)
+		}
+		removed = true
+	}
+	s.mu.Unlock()
+	if removed {
+		sub.close()
+	}
+}
+
 func (s *Server) subscribe(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "conversationID")
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
+	sub := &subscriber{conn: conn, send: make(chan []byte, conversationSubscriberQueueSize)}
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for data := range sub.send {
+			_ = conn.SetWriteDeadline(time.Now().Add(conversationWriteTimeout))
+			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				s.removeConversationSubscriber(id, sub)
+				return
+			}
+		}
+	}()
 	s.mu.Lock()
 	if s.subscribers[id] == nil {
 		s.subscribers[id] = map[*websocket.Conn]*subscriber{}
 	}
-	s.subscribers[id][conn] = &subscriber{conn: conn}
+	s.subscribers[id][conn] = sub
 	s.mu.Unlock()
-	defer func() { s.mu.Lock(); delete(s.subscribers[id], conn); s.mu.Unlock(); conn.Close() }()
+	defer func() {
+		s.removeConversationSubscriber(id, sub)
+		<-writerDone
+	}()
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			return
@@ -2221,4 +3262,545 @@ func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\\"'\\\"'") + "'"
+}
+
+// wslLocalMeta builds the RunnerMeta for the built-in WSL local runner.
+func (s *Server) wslLocalMeta() RunnerMeta {
+	roots := []RootEntry{
+		{Name: "WSL Home", Path: s.config.AllowedRoot},
+	}
+	for _, drive := range []string{"c", "d", "e", "f"} {
+		mntPath := filepath.Join("/mnt", drive)
+		if info, err := os.Stat(mntPath); err == nil && info.IsDir() {
+			roots = append(roots, RootEntry{
+				Name:  fmt.Sprintf("Windows (%s:)", strings.ToUpper(drive)),
+				Path:  mntPath,
+				Label: "windows",
+			})
+		}
+	}
+	return RunnerMeta{
+		ID:          "wsl-local",
+		Name:        "WSL Local Runner",
+		Environment: "wsl",
+		Root:        s.config.AllowedRoot,
+		Roots:       roots,
+	}
+}
+
+func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
+	metas := s.runnerRegistry.list()
+	result := make([]map[string]any, 0, len(metas))
+	for _, m := range metas {
+		entry := map[string]any{
+			"id":          m.ID,
+			"name":        m.Name,
+			"environment": m.Environment,
+			"root":        m.Root,
+			"roots":       m.Roots,
+		}
+		if m.Host != "" {
+			entry["host"] = m.Host
+		}
+		// Fetch Claude version from each runner.
+		if runner, ok := s.runnerRegistry.get(m.ID); ok {
+			v := runner.Version(r.Context())
+			status := "ready"
+			if v == "" {
+				status = "unavailable"
+			}
+			entry["claude"] = map[string]string{
+				"status":  status,
+				"version": v,
+			}
+		}
+		codexStatus := "unavailable"
+		codexVersion := ""
+		codexReason := "Codex 目前仅支持本地 WSL Runner"
+		if m.ID == "wsl-local" {
+			if s.codexRunner.Ready(r.Context()) {
+				codexStatus = "ready"
+				codexVersion = s.codexRunner.Version(r.Context())
+				codexReason = ""
+			} else {
+				codexReason = "本机 Codex CLI 未安装或未登录"
+			}
+		}
+		entry["codex"] = map[string]string{
+			"status":  codexStatus,
+			"version": codexVersion,
+			"reason":  codexReason,
+		}
+		result = append(result, entry)
+	}
+	if result == nil {
+		result = []map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) checkClaudeUpdate(w http.ResponseWriter, r *http.Request) {
+	runnerID := chi.URLParam(r, "runnerID")
+	runner, ok := s.runnerRegistry.get(runnerID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("runner not found"))
+		return
+	}
+
+	available, latestVersion, err := runner.CheckUpdate(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"updateAvailable": false,
+			"currentVersion":  runner.Version(r.Context()),
+			"error":           err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updateAvailable": available,
+		"currentVersion":  runner.Version(r.Context()),
+		"latestVersion":   latestVersion,
+	})
+}
+
+func (s *Server) updateClaude(w http.ResponseWriter, r *http.Request) {
+	runnerID := chi.URLParam(r, "runnerID")
+	runner, ok := s.runnerRegistry.get(runnerID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("runner not found"))
+		return
+	}
+
+	// Serialize updates with Claude run admission. startMessage keeps this lock
+	// until its run record is committed, closing the check-then-start race.
+	s.runnerMaintenanceMu.Lock()
+	if s.runnerUpdating[runnerID] {
+		s.runnerMaintenanceMu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("Claude Code is already being updated on this runner"))
+		return
+	}
+
+	var active bool
+	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from runs where agent_runtime_id=? and status in ('queued','running'))`, runnerID).Scan(&active); err != nil {
+		s.runnerMaintenanceMu.Unlock()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if active {
+		s.runnerMaintenanceMu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("cannot update Claude Code while this runner has active conversations"))
+		return
+	}
+	s.mu.Lock()
+	for _, session := range s.sessions {
+		if session.runnerID == runnerID {
+			s.mu.Unlock()
+			s.runnerMaintenanceMu.Unlock()
+			writeError(w, http.StatusConflict, errors.New("cannot update Claude Code while this runner has an active session"))
+			return
+		}
+	}
+	s.mu.Unlock()
+	s.runnerUpdating[runnerID] = true
+	s.runnerMaintenanceMu.Unlock()
+	defer func() {
+		s.runnerMaintenanceMu.Lock()
+		delete(s.runnerUpdating, runnerID)
+		s.runnerMaintenanceMu.Unlock()
+	}()
+
+	previousVersion, currentVersion, err := runner.Update(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"success":         false,
+			"previousVersion": previousVersion,
+			"currentVersion":  currentVersion,
+			"error":           err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":         true,
+		"previousVersion": previousVersion,
+		"currentVersion":  currentVersion,
+	})
+}
+
+func (s *Server) loadRunConfig(ctx context.Context, projectID string) (RunConfig, error) {
+	var c RunConfig
+	var envJSON string
+	err := s.db.QueryRowContext(ctx, `select work_dir, command, env_vars from project_run_configs where project_id=$1`, projectID).Scan(&c.WorkDir, &c.Command, &envJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RunConfig{}, nil
+		}
+		return RunConfig{}, err
+	}
+	if envJSON != "" {
+		json.Unmarshal([]byte(envJSON), &c.EnvVars)
+	}
+	return c, nil
+}
+
+func (s *Server) saveRunConfig(ctx context.Context, projectID string, c RunConfig) error {
+	envJSON, _ := json.Marshal(c.EnvVars)
+	_, err := s.db.ExecContext(ctx,
+		`insert into project_run_configs (project_id, work_dir, command, env_vars, updated_at) values ($1,$2,$3,$4,$5) on conflict(project_id) do update set work_dir=excluded.work_dir, command=excluded.command, env_vars=excluded.env_vars, updated_at=excluded.updated_at`,
+		projectID, c.WorkDir, c.Command, string(envJSON), time.Now().UTC())
+	return err
+}
+
+// projectRunManagerForExistingProject rechecks project existence while holding
+// the manager map lock. A concurrent deletion therefore either retires this
+// runner after creation or prevents a new runner from being registered.
+func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projectID string) (*projectRunner, error) {
+	s.runManagersMu.Lock()
+	defer s.runManagersMu.Unlock()
+	if _, err := s.getProjectByID(ctx, projectID); err != nil {
+		return nil, err
+	}
+	if runner, ok := s.runManagers[projectID]; ok {
+		return runner, nil
+	}
+	runner := newProjectRunner(projectID, "", "", nil, func(entry LogEntry) {
+		s.broadcastRunLog(projectID, entry)
+	})
+	s.runManagers[projectID] = runner
+	return runner, nil
+}
+
+func validateProjectRunConfig(project Project, cfg RunConfig) error {
+	if cfg.Command == "" {
+		return errors.New("请先配置启动命令")
+	}
+	if err := validateRunEnvironmentVariables(cfg.EnvVars); err != nil {
+		return err
+	}
+	_, err := resolveProjectRunWorkDir(project.Path, cfg.WorkDir)
+	return err
+}
+
+func validateRunEnvironmentVariables(envVars map[string]string) error {
+	for key, value := range envVars {
+		if key == "" || strings.ContainsAny(key, "=\x00") {
+			return errors.New("环境变量名称不能为空，且不能包含 = 或 NUL 字符")
+		}
+		if strings.ContainsRune(value, 0) {
+			return errors.New("环境变量值不能包含 NUL 字符")
+		}
+	}
+	return nil
+}
+
+func (s *Server) getProjectByID(ctx context.Context, projectID string) (Project, error) {
+	var p Project
+	err := s.db.QueryRowContext(ctx, `select id,name,path,runner,git_branch,claude_ready,created_at from projects where id=$1`, projectID).Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt)
+	if err != nil {
+		return Project{}, err
+	}
+	return p, nil
+}
+
+func (s *Server) requireRunProject(w http.ResponseWriter, r *http.Request) bool {
+	if _, err := s.getProjectByID(r.Context(), chi.URLParam(r, "projectID")); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+			return false
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return false
+	}
+	return true
+}
+
+func (s *Server) getRunConfig(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.requireRunProject(w, r) {
+		return
+	}
+	c, err := s.loadRunConfig(r.Context(), projectID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	if c.EnvVars == nil {
+		c.EnvVars = map[string]string{}
+	}
+	writeJSON(w, 200, c)
+}
+
+func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.requireRunProject(w, r) {
+		return
+	}
+	var c RunConfig
+	if !decode(w, r, &c) {
+		return
+	}
+	if err := validateRunEnvironmentVariables(c.EnvVars); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.saveRunConfig(r.Context(), projectID, c); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, c)
+}
+
+func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, 404, fmt.Errorf("项目不存在"))
+			return
+		}
+		writeError(w, 500, err)
+		return
+	}
+	if project.Runner != "wsl-local" {
+		writeError(w, http.StatusConflict, errors.New("远程项目启动尚未支持"))
+		return
+	}
+
+	// 加载已保存配置
+	cfg, err := s.loadRunConfig(r.Context(), projectID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+
+	// 用请求体覆盖
+	var req RunConfig
+	if r.Body != http.NoBody {
+		if !decode(w, r, &req) {
+			return
+		}
+		if req.Command != "" {
+			cfg.Command = req.Command
+			cfg.WorkDir = req.WorkDir
+			if req.EnvVars != nil {
+				cfg.EnvVars = req.EnvVars
+			}
+		}
+	}
+
+	if cfg.EnvVars == nil {
+		cfg.EnvVars = map[string]string{}
+	}
+
+	if err := validateProjectRunConfig(project, cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	runner, err := s.projectRunManagerForExistingProject(r.Context(), projectID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := runner.StartWithConfig(s.runtimeCtx, project.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars); err != nil {
+		writeError(w, 409, err)
+		return
+	}
+	writeJSON(w, 202, map[string]string{"status": "starting"})
+}
+
+func (s *Server) stopProjectRun(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.requireRunProject(w, r) {
+		return
+	}
+	s.runManagersMu.RLock()
+	runner, ok := s.runManagers[projectID]
+	s.runManagersMu.RUnlock()
+	if !ok {
+		writeError(w, 404, fmt.Errorf("进程未在运行"))
+		return
+	}
+	if err := runner.Stop(); err != nil {
+		writeError(w, 409, err)
+		return
+	}
+	writeJSON(w, 202, map[string]string{"status": "stopping"})
+}
+
+func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, 404, fmt.Errorf("项目不存在"))
+			return
+		}
+		writeError(w, 500, err)
+		return
+	}
+	if project.Runner != "wsl-local" {
+		writeError(w, http.StatusConflict, errors.New("远程项目启动尚未支持"))
+		return
+	}
+	cfg, err := s.loadRunConfig(r.Context(), projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if cfg.EnvVars == nil {
+		cfg.EnvVars = map[string]string{}
+	}
+	if err := validateProjectRunConfig(project, cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	runner, err := s.projectRunManagerForExistingProject(r.Context(), projectID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := runner.RestartWithConfig(s.runtimeCtx, project.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars); err != nil {
+		writeError(w, 409, err)
+		return
+	}
+	writeJSON(w, 202, map[string]string{"status": "starting"})
+}
+
+func (s *Server) getProjectRunStatus(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.requireRunProject(w, r) {
+		return
+	}
+	s.runManagersMu.RLock()
+	runner, ok := s.runManagers[projectID]
+	s.runManagersMu.RUnlock()
+	if !ok {
+		writeJSON(w, 200, RunStatusResponse{Status: RunStatusStopped, RecentLogs: []LogEntry{}})
+		return
+	}
+	writeJSON(w, 200, runner.StatusSnapshot())
+}
+
+// subscribeRunLogs 处理 WebSocket 日志订阅。
+func (s *Server) subscribeRunLogs(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.requireRunProject(w, r) {
+		return
+	}
+
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	sub := &runLogSubscriber{conn: conn, send: make(chan LogEntry, runLogSubscriberQueueSize)}
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for entry := range sub.send {
+			_ = conn.SetWriteDeadline(time.Now().Add(runLogWriteTimeout))
+			if err := conn.WriteJSON(entry); err != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}()
+	if !s.registerRunLogSubscriber(r.Context(), projectID, sub) {
+		sub.close()
+		<-writerDone
+		return
+	}
+
+	defer func() {
+		s.runLogSubMu.Lock()
+		delete(s.runLogSubscribers[projectID], conn)
+		s.runLogSubMu.Unlock()
+		sub.close()
+		<-writerDone
+	}()
+
+	// 读取循环检测断开
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+// registerRunLogSubscriber adds a subscriber at the same log order point used
+// by emitLog. History is queued before any later live entry can be enqueued.
+func (s *Server) registerRunLogSubscriber(ctx context.Context, projectID string, sub *runLogSubscriber) bool {
+	s.runManagersMu.Lock()
+	defer s.runManagersMu.Unlock()
+	if _, err := s.getProjectByID(ctx, projectID); err != nil {
+		return false
+	}
+	runner := s.runManagers[projectID]
+	if runner == nil {
+		s.addRunLogSubscriber(projectID, sub, nil)
+		return true
+	}
+	runner.registerLogSubscriber(func(history []LogEntry) {
+		s.addRunLogSubscriber(projectID, sub, history)
+	})
+	return true
+}
+
+func (s *Server) addRunLogSubscriber(projectID string, sub *runLogSubscriber, history []LogEntry) {
+	s.runLogSubMu.Lock()
+	defer s.runLogSubMu.Unlock()
+	for _, entry := range history {
+		sub.send <- entry
+	}
+	if s.runLogSubscribers[projectID] == nil {
+		s.runLogSubscribers[projectID] = map[*websocket.Conn]*runLogSubscriber{}
+	}
+	s.runLogSubscribers[projectID][sub.conn] = sub
+}
+
+// broadcastRunLog enqueues logs without allowing a slow client to block a
+// project process. A full queue disconnects that subscriber.
+func (s *Server) broadcastRunLog(projectID string, entry LogEntry) {
+	s.runLogSubMu.Lock()
+	for conn, sub := range s.runLogSubscribers[projectID] {
+		select {
+		case sub.send <- entry:
+		default:
+			delete(s.runLogSubscribers[projectID], conn)
+			sub.close()
+		}
+	}
+	s.runLogSubMu.Unlock()
+}
+
+func (s *Server) closeProjectRunLogSubscribers(projectID string) {
+	s.runLogSubMu.Lock()
+	subs := s.runLogSubscribers[projectID]
+	delete(s.runLogSubscribers, projectID)
+	s.runLogSubMu.Unlock()
+	for _, sub := range subs {
+		sub.close()
+	}
+}
+
+func (s *Server) closeAllRunLogSubscribers() {
+	s.runLogSubMu.Lock()
+	all := make([]*runLogSubscriber, 0)
+	for _, subs := range s.runLogSubscribers {
+		for _, sub := range subs {
+			all = append(all, sub)
+		}
+	}
+	s.runLogSubscribers = map[string]map[*websocket.Conn]*runLogSubscriber{}
+	s.runLogSubMu.Unlock()
+	for _, sub := range all {
+		sub.close()
+	}
 }

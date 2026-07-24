@@ -19,6 +19,18 @@ import (
 type AgentRunner interface {
 	Ready(context.Context) bool
 	Run(context.Context, AgentRunRequest, AgentRunSink) error
+
+	// Version returns the installed Claude Code version string (e.g. "2.1.216").
+	// Returns an empty string when the CLI is not installed.
+	Version(context.Context) string
+
+	// CheckUpdate checks whether a newer version is available. It returns
+	// updateAvailable, the latest version string, and any error from the check.
+	CheckUpdate(context.Context) (updateAvailable bool, latestVersion string, err error)
+
+	// Update runs the CLI update command. Returns the version before and after
+	// the update. Callers must ensure no active Claude processes are running.
+	Update(context.Context) (previousVersion, currentVersion string, err error)
 }
 
 // StreamingAgentRunner supports a long-lived CLI process that accepts many
@@ -65,6 +77,7 @@ type AgentRunRequest struct {
 type AgentRunSink interface {
 	Event(eventType string, payload json.RawMessage)
 	AssistantText(content, parentToolUseID string)
+	SessionIdentified(sessionID string)
 	SessionInitialized()
 }
 
@@ -106,6 +119,49 @@ func (r *claudeCLIRunner) Ready(parent context.Context) bool {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	return exec.CommandContext(ctx, r.config.ClaudePath, "auth", "status").Run() == nil
+}
+
+func (r *claudeCLIRunner) Version(parent context.Context) string {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, r.config.ClaudePath, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	// Output is "2.1.216 (Claude Code)" — extract the version number.
+	return strings.TrimSuffix(strings.TrimSpace(string(out)), " (Claude Code)")
+}
+
+func (r *claudeCLIRunner) CheckUpdate(parent context.Context) (bool, string, error) {
+	local := r.Version(parent)
+	if local == "" {
+		return false, "", errors.New("Claude Code is not installed")
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "npm", "view", "@anthropic-ai/claude-code", "version").Output()
+	if err != nil {
+		return false, "", fmt.Errorf("query latest version: %w", err)
+	}
+	latest := strings.TrimSpace(string(out))
+	return latest != local, latest, nil
+}
+
+func (r *claudeCLIRunner) Update(parent context.Context) (string, string, error) {
+	previous := r.Version(parent)
+	if previous == "" {
+		return "", "", errors.New("Claude Code is not installed")
+	}
+	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "update")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return previous, "", fmt.Errorf("update Claude Code: %w", err)
+	}
+	current := r.Version(parent)
+	return previous, current, nil
 }
 
 func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
@@ -208,7 +264,15 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 	}()
 	go func() {
 		err := cmd.Wait()
-		readers.Wait()
+		// Defensive timeout: if reader goroutines are stuck (e.g. pipe never
+		// closed), force-unblock after a generous grace period so session
+		// cleanup is never permanently blocked.
+		readersDone := make(chan struct{})
+		go func() { readers.Wait(); close(readersDone) }()
+		select {
+		case <-readersDone:
+		case <-time.After(30 * time.Second):
+		}
 		if err == nil && session.hasTurns() {
 			err = errors.New("Claude session exited before completing active turns")
 		}
@@ -227,6 +291,8 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	args := []string{"-p", "--verbose", "--output-format", "stream-json"}
 	if request.PermissionMode == "full_control" {
 		args = append(args, "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions")
+	} else if isReadOnlyClaudeRequest(request.PermissionMode) {
+		args = append(args, "--permission-mode", "plan")
 	} else {
 		args = append(args, "--permission-mode", r.config.PermissionMode)
 		settings, err := json.Marshal(map[string]any{
@@ -258,6 +324,8 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 	args := []string{"-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json", "--replay-user-messages"}
 	if request.PermissionMode == "full_control" {
 		args = append(args, "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions")
+	} else if isReadOnlyClaudeRequest(request.PermissionMode) {
+		args = append(args, "--permission-mode", "plan")
 	} else {
 		args = append(args, "--permission-mode", r.config.PermissionMode)
 		settings, err := json.Marshal(map[string]any{
@@ -281,9 +349,17 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 	return args, nil
 }
 
+func isReadOnlyClaudeRequest(permissionMode string) bool {
+	return permissionMode == "plan" || permissionMode == "read_only"
+}
+
+func needsClaudeApprovalHook(permissionMode string) bool {
+	return permissionMode != "full_control" && !isReadOnlyClaudeRequest(permissionMode)
+}
+
 func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
 		var envelope struct {
@@ -291,10 +367,7 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 			Subtype         string `json:"subtype"`
 			ParentToolUseID string `json:"parent_tool_use_id"`
 			Message         struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
+				Content json.RawMessage `json:"content"`
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
@@ -308,15 +381,42 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 		if envelope.Type != "assistant" {
 			continue
 		}
-		for _, part := range envelope.Message.Content {
-			if part.Type == "text" && strings.TrimSpace(part.Text) != "" {
-				sink.AssistantText(part.Text, envelope.ParentToolUseID)
-			}
+		if len(envelope.Message.Content) == 0 {
+			continue
+		}
+		parts := parseContentParts(envelope.Message.Content)
+		for _, part := range parts {
+			sink.AssistantText(part, envelope.ParentToolUseID)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		sink.Event("stream.error", mustJSON(map[string]string{"error": err.Error()}))
 	}
+}
+
+// parseContentParts extracts text content from a message content field that
+// may be either a JSON array of content blocks or a plain JSON string.
+func parseContentParts(raw json.RawMessage) []string {
+	// Try array format: [{"type":"text","text":"..."}, ...]
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		var parts []string
+		for _, b := range blocks {
+			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return parts
+	}
+	// Try plain string format
+	var s string
+	if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
+		return []string{s}
+	}
+	return nil
 }
 
 func (session *claudeCLISession) Send(request AgentRunRequest, sink AgentRunSink) error {
@@ -356,6 +456,16 @@ func (session *claudeCLISession) Stop() {
 	session.mu.Unlock()
 	if cmd.Process != nil {
 		terminateProcessGroup(cmd)
+		// A process can ignore SIGTERM (or leave a descendant holding the
+		// pipes open). Match the one-shot runner's bounded cancellation so a
+		// stopped session cannot keep project deletion waiting indefinitely.
+		go func() {
+			select {
+			case <-session.processDone:
+			case <-time.After(5 * time.Second):
+				forceTerminateProcessGroup(cmd)
+			}
+		}()
 	}
 }
 
@@ -369,7 +479,7 @@ func (session *claudeCLISession) hasTurns() bool {
 
 func (session *claudeCLISession) readOutput(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
 		var envelope struct {
@@ -377,10 +487,7 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 			Subtype         string `json:"subtype"`
 			ParentToolUseID string `json:"parent_tool_use_id"`
 			Message         struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
+				Content json.RawMessage `json:"content"`
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
@@ -390,10 +497,12 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 		initialized := envelope.Type == "system" && envelope.Subtype == "init"
 		session.emit(envelope.Type, line, initialized)
 		if envelope.Type == "assistant" {
-			for _, content := range envelope.Message.Content {
-				if content.Type == "text" && content.Text != "" {
-					session.assistantText(content.Text, envelope.ParentToolUseID)
-				}
+			if len(envelope.Message.Content) == 0 {
+				continue
+			}
+			parts := parseContentParts(envelope.Message.Content)
+			for _, p := range parts {
+				session.assistantText(p, envelope.ParentToolUseID)
 			}
 		}
 		if envelope.Type == "result" {
@@ -407,7 +516,7 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 
 func (session *claudeCLISession) readStderr(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		session.emit("stderr", mustJSON(map[string]string{"message": scanner.Text()}), false)
 	}
@@ -607,6 +716,7 @@ func finishTurn(turn *claudeSessionTurn, err error) {
 
 func (r *claudeCLIRunner) readStderr(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		sink.Event("stderr", mustJSON(map[string]string{"message": scanner.Text()}))
 	}

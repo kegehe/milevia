@@ -26,5 +26,5 @@ test("keeps a late diff response from replacing the most recently selected file"
 
   assert.match(source, /const diffRequest = useRef\(0\);/);
   assert.match(source, /const requestID = \+\+diffRequest\.current;/);
-  assert.match(source, /if \(requestID === diffRequest\.current\) setSelectedDiff\(diff\);/);
+  assert.match(source, /if \(requestID === diffRequest\.current && mountedRef\.current\) setSelectedDiff\(diff\);/);
 });

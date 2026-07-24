@@ -8,7 +8,8 @@ CONTROL_PORT="${AUTO_CONTROL_PORT:-8080}"
 WEB_HOST="${AUTO_WEB_HOST:-127.0.0.1}"
 WEB_PORT="${AUTO_WEB_PORT:-5173}"
 CONTROL_ADDR="${CONTROL_HOST}:${CONTROL_PORT}"
-CONTROL_URL="http://${CONTROL_ADDR}"
+CONTROL_URL="${AUTO_CONTROL_URL:-http://${CONTROL_ADDR}}"
+VITE_CONTROL_TARGET="${VITE_CONTROL_URL:-http://127.0.0.1:${CONTROL_PORT}}"
 CONTROL_PID=""
 WEB_PID=""
 
@@ -87,7 +88,7 @@ CONTROL_PID=$!
 echo "Starting web app at http://${WEB_HOST}:${WEB_PORT}/"
 (
   cd "$ROOT_DIR/apps/web"
-  exec setsid env VITE_CONTROL_URL="$CONTROL_URL" pnpm dev --host "$WEB_HOST" --port "$WEB_PORT" --strictPort
+  exec setsid env VITE_CONTROL_URL="$VITE_CONTROL_TARGET" pnpm dev --host "$WEB_HOST" --port "$WEB_PORT" --strictPort
 ) &
 WEB_PID=$!
 

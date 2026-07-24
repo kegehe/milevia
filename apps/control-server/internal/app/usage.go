@@ -26,6 +26,8 @@ type ModelUsage struct {
 type RunUsage struct {
 	RunID               string       `json:"runId"`
 	ConversationID      string       `json:"conversationId"`
+	Available           bool         `json:"available"`
+	Reason              string       `json:"reason,omitempty"`
 	Status              string       `json:"status"`
 	Model               string       `json:"model"`
 	ContextWindow       int64        `json:"contextWindow"`
@@ -63,6 +65,8 @@ type ConversationUsage struct {
 
 type ConversationUsageResponse struct {
 	ConversationID string            `json:"conversationId"`
+	Available      bool              `json:"available"`
+	Reason         string            `json:"reason,omitempty"`
 	Context        RunUsage          `json:"context"`
 	CurrentRun     *RunUsage         `json:"currentRun,omitempty"`
 	LatestRun      *RunUsage         `json:"latestRun,omitempty"`
@@ -102,8 +106,17 @@ func newRunUsageAccumulator(runID, conversationID string) *runUsageAccumulator {
 
 func (s *Server) beginRunUsage(runID, conversationID string) {
 	s.usageMu.Lock()
-	s.runUsage[runID] = newRunUsageAccumulator(runID, conversationID)
+	if s.runUsage[runID] == nil {
+		s.runUsage[runID] = newRunUsageAccumulator(runID, conversationID)
+	}
 	s.usageMu.Unlock()
+}
+
+// contextSnapshotTokens is the complete prompt size for one model call.
+// Cached input still occupies the model context and must be included when
+// measuring context-window utilisation.
+func contextSnapshotTokens(inputTokens, cacheReadTokens, cacheCreationTokens int64) int64 {
+	return inputTokens + cacheReadTokens + cacheCreationTokens
 }
 
 func (s *Server) discardRunUsage(runID string) {
@@ -169,7 +182,9 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 			if _, exists := accumulator.messageIDs[event.Message.ID]; !exists {
 				accumulator.messageIDs[event.Message.ID] = struct{}{}
 				accumulator.modelSteps++
-				accumulator.contextInput = event.Message.Usage.InputTokens
+				if contextTokens := contextSnapshotTokens(event.Message.Usage.InputTokens, event.Message.Usage.CacheReadTokens, event.Message.Usage.CacheCreationTokens); contextTokens > 0 {
+					accumulator.contextInput = contextTokens
+				}
 				if event.Message.Model != "" {
 					accumulator.model = event.Message.Model
 					accumulator.contextModel = event.Message.Model
@@ -223,14 +238,10 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 		accumulator.cacheRead = event.Usage.CacheReadTokens
 		accumulator.cacheCreation = event.Usage.CacheCreationTokens
 		accumulator.hasResult = true
-		// The result event carries the last API call's input token count in
-		// usage.input_tokens.  This is the best available approximation of the
-		// current context window utilisation.  Per-assistant usage.input_tokens
-		// is always zero during streaming, so we refresh the snapshot here on
-		// every result event.
-		if event.Usage.InputTokens > 0 {
-			accumulator.contextInput = event.Usage.InputTokens
-		}
+		// result.usage is cumulative for this run. It is valid for run-level
+		// usage metrics, but not for a context snapshot: a multi-turn run can
+		// exceed the model window many times over. ContextInput therefore only
+		// comes from a concrete main-agent assistant event above.
 		for model, usage := range event.ModelUsage {
 			accumulator.models[model] = ModelUsage{Model: model, InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, CacheReadTokens: usage.CacheReadTokens, CacheCreationTokens: usage.CacheCreationTokens, EstimatedCostUSD: usage.CostUSD, ContextWindow: usage.ContextWindow}
 		}
@@ -253,7 +264,7 @@ func (accumulator *runUsageAccumulator) snapshot(status string, completedAt *tim
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].Model < models[j].Model })
 	startedAt := accumulator.startedAt
-	return RunUsage{RunID: accumulator.runID, ConversationID: accumulator.conversationID, Status: status, Model: accumulator.model, ContextWindow: accumulator.contextWindow, ContextInputTokens: accumulator.contextInput, InputTokens: accumulator.inputTokens, OutputTokens: accumulator.outputTokens, CacheReadTokens: accumulator.cacheRead, CacheCreationTokens: accumulator.cacheCreation, EstimatedCostUSD: accumulator.cost, AgentTurns: accumulator.agentTurns, ModelSteps: accumulator.modelSteps, ToolCalls: accumulator.toolCalls, SubagentCount: int64(len(accumulator.parentIDs)), DurationMS: accumulator.durationMS, TTFTMS: accumulator.ttftMS, TerminalReason: accumulator.terminalReason, HasResult: accumulator.hasResult, StartedAt: &startedAt, CompletedAt: completedAt, Models: models}
+	return RunUsage{RunID: accumulator.runID, ConversationID: accumulator.conversationID, Available: true, Status: status, Model: accumulator.model, ContextWindow: accumulator.contextWindow, ContextInputTokens: accumulator.contextInput, InputTokens: accumulator.inputTokens, OutputTokens: accumulator.outputTokens, CacheReadTokens: accumulator.cacheRead, CacheCreationTokens: accumulator.cacheCreation, EstimatedCostUSD: accumulator.cost, AgentTurns: accumulator.agentTurns, ModelSteps: accumulator.modelSteps, ToolCalls: accumulator.toolCalls, SubagentCount: int64(len(accumulator.parentIDs)), DurationMS: accumulator.durationMS, TTFTMS: accumulator.ttftMS, TerminalReason: accumulator.terminalReason, HasResult: accumulator.hasResult, StartedAt: &startedAt, CompletedAt: completedAt, Models: models}
 }
 
 func (s *Server) persistRunUsage(runID, status string) error {
@@ -299,21 +310,24 @@ func (s *Server) liveRunUsage(runID string, status string) *RunUsage {
 
 func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
-	var exists bool
-	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from conversations where id=?)`, conversationID).Scan(&exists); err != nil {
+	var agentID string
+	if err := s.db.QueryRowContext(r.Context(), `select agent_id from conversations where id=?`, conversationID).Scan(&agentID); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
+		return
+	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !exists {
-		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
+	if agentID == "codex" {
+		writeJSON(w, http.StatusOK, ConversationUsageResponse{ConversationID: conversationID, Available: false, Reason: "Codex CLI 未提供可验证的 Token、上下文或费用统计。"})
 		return
 	}
-	response := ConversationUsageResponse{ConversationID: conversationID}
+	response := ConversationUsageResponse{ConversationID: conversationID, Available: true}
 	if err := s.db.QueryRowContext(r.Context(), `select count(*),coalesce(sum(agent_turns),0),coalesce(sum(model_steps),0),coalesce(sum(tool_calls),0),coalesce(sum(subagent_count),0),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cache_read_tokens),0),coalesce(sum(cache_creation_tokens),0),coalesce(sum(estimated_cost_usd),0) from runs r left join run_usage u on u.run_id=r.id where r.conversation_id=?`, conversationID).Scan(&response.Session.TaskCount, &response.Session.AgentTurns, &response.Session.ModelSteps, &response.Session.ToolCalls, &response.Session.SubagentCount, &response.Session.InputTokens, &response.Session.OutputTokens, &response.Session.CacheReadTokens, &response.Session.CacheCreationTokens, &response.Session.EstimatedCostUSD); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	latest, err := s.loadLatestRunUsage(r.Context(), conversationID)
+	latest, err := s.loadLatestTerminalRunUsage(r.Context(), conversationID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -344,36 +358,42 @@ func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 			}
 			response.Context = *response.CurrentRun
 
-			// In-progress runs already have a row in the runs table (counted
-			// by the session SQL), but their usage stats only live in memory.
-			// Merge the live accumulator data so the usage dialog reflects
-			// work in progress.
-			response.Session.AgentTurns += response.CurrentRun.AgentTurns
-			response.Session.ModelSteps += response.CurrentRun.ModelSteps
-			response.Session.ToolCalls += response.CurrentRun.ToolCalls
-			response.Session.SubagentCount += response.CurrentRun.SubagentCount
-			response.Session.InputTokens += response.CurrentRun.InputTokens
-			response.Session.OutputTokens += response.CurrentRun.OutputTokens
-			response.Session.CacheReadTokens += response.CurrentRun.CacheReadTokens
-			response.Session.CacheCreationTokens += response.CurrentRun.CacheCreationTokens
-			response.Session.EstimatedCostUSD += response.CurrentRun.EstimatedCostUSD
+			// A completion persists usage immediately before changing the run
+			// status. During that small window the SQL aggregate already
+			// contains this run, so do not add its live snapshot a second time.
+			persisted, err := s.hasPersistedRunUsage(r.Context(), runID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if !persisted {
+				response.Session.AgentTurns += response.CurrentRun.AgentTurns
+				response.Session.ModelSteps += response.CurrentRun.ModelSteps
+				response.Session.ToolCalls += response.CurrentRun.ToolCalls
+				response.Session.SubagentCount += response.CurrentRun.SubagentCount
+				response.Session.InputTokens += response.CurrentRun.InputTokens
+				response.Session.OutputTokens += response.CurrentRun.OutputTokens
+				response.Session.CacheReadTokens += response.CurrentRun.CacheReadTokens
+				response.Session.CacheCreationTokens += response.CurrentRun.CacheCreationTokens
+				response.Session.EstimatedCostUSD += response.CurrentRun.EstimatedCostUSD
 
-			// Merge live model usage so the per-model breakdown stays current.
-			for _, m := range response.CurrentRun.Models {
-				found := false
-				for i, existing := range response.Models {
-					if existing.Model == m.Model {
-						response.Models[i].InputTokens += m.InputTokens
-						response.Models[i].OutputTokens += m.OutputTokens
-						response.Models[i].CacheReadTokens += m.CacheReadTokens
-						response.Models[i].CacheCreationTokens += m.CacheCreationTokens
-						response.Models[i].EstimatedCostUSD += m.EstimatedCostUSD
-						found = true
-						break
+				// Merge live model usage so the per-model breakdown stays current.
+				for _, m := range response.CurrentRun.Models {
+					found := false
+					for i, existing := range response.Models {
+						if existing.Model == m.Model {
+							response.Models[i].InputTokens += m.InputTokens
+							response.Models[i].OutputTokens += m.OutputTokens
+							response.Models[i].CacheReadTokens += m.CacheReadTokens
+							response.Models[i].CacheCreationTokens += m.CacheCreationTokens
+							response.Models[i].EstimatedCostUSD += m.EstimatedCostUSD
+							found = true
+							break
+						}
 					}
-				}
-				if !found {
-					response.Models = append(response.Models, m)
+					if !found {
+						response.Models = append(response.Models, m)
+					}
 				}
 			}
 		}
@@ -381,62 +401,58 @@ func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// Fallback: when context_input_tokens is 0 but total input_tokens is
-	// available (the per-assistant usage.input_tokens is always 0 during
-	// streaming), use input_tokens so the UI can show a context percentage.
-	normalizeContext(&response.Context)
-	if response.LatestRun != nil {
-		normalizeContext(response.LatestRun)
-	}
 	writeJSON(w, http.StatusOK, response)
-}
-
-// normalizeContext ensures the context snapshot is consistent.
-// When context_input_tokens is still zero (no result event has arrived yet),
-// leave it as-is so the UI can show an appropriate pending state instead of
-// fabricating a number from the cumulative total input tokens.
-func normalizeContext(usage *RunUsage) {
-	// Intentionally empty: keep contextInputTokens as the raw value from the
-	// most recent assistant or result event.  Do NOT fall back to the
-	// cumulative InputTokens, which is the sum across all turns and does not
-	// represent the current context window utilisation.
-	_ = usage
 }
 
 func (s *Server) getRunUsage(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
-	var status string
-	if err := s.db.QueryRowContext(r.Context(), `select status from runs where id=?`, runID).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+	var status, conversationID, agentID string
+	if err := s.db.QueryRowContext(r.Context(), `select r.status,r.conversation_id,c.agent_id from runs r join conversations c on c.id=r.conversation_id where r.id=?`, runID).Scan(&status, &conversationID, &agentID); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("run not found"))
 		return
 	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if agentID == "codex" {
+		writeJSON(w, http.StatusOK, RunUsage{RunID: runID, ConversationID: conversationID, Available: false, Reason: "Codex CLI 未提供可验证的 Token、上下文或费用统计。", Status: status})
+		return
+	}
 	if live := s.liveRunUsage(runID, status); live != nil {
-		normalizeContext(live)
 		writeJSON(w, http.StatusOK, live)
 		return
 	}
 	usage, err := s.loadRunUsage(r.Context(), runID)
 	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, errors.New("usage is not available"))
+		writeJSON(w, http.StatusOK, RunUsage{RunID: runID, ConversationID: conversationID, Available: false, Reason: "该任务未获得可用的使用统计。", Status: status})
 		return
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	normalizeContext(usage)
 	writeJSON(w, http.StatusOK, usage)
 }
 
-func (s *Server) loadLatestRunUsage(ctx context.Context, conversationID string) (*RunUsage, error) {
-	var runID string
-	if err := s.db.QueryRowContext(ctx, `select run_id from run_usage where conversation_id=? order by completed_at desc limit 1`, conversationID).Scan(&runID); err != nil {
+func (s *Server) loadLatestTerminalRunUsage(ctx context.Context, conversationID string) (*RunUsage, error) {
+	var runID, status string
+	var startedAt, completedAt time.Time
+	if err := s.db.QueryRowContext(ctx, `select id,status,created_at,completed_at from runs where conversation_id=? and status in ('completed','failed','stopped') order by completed_at desc limit 1`, conversationID).Scan(&runID, &status, &startedAt, &completedAt); err != nil {
 		return nil, err
 	}
-	return s.loadRunUsage(ctx, runID)
+	usage, err := s.loadRunUsage(ctx, runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &RunUsage{RunID: runID, ConversationID: conversationID, Available: false, Reason: "该任务未获得可用的使用统计。", Status: status, StartedAt: &startedAt, CompletedAt: &completedAt}, nil
+	}
+	return usage, err
+}
+
+func (s *Server) hasPersistedRunUsage(ctx context.Context, runID string) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `select exists(select 1 from run_usage where run_id=?)`, runID).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func (s *Server) loadRunUsage(ctx context.Context, runID string) (*RunUsage, error) {
@@ -448,6 +464,7 @@ func (s *Server) loadRunUsage(ctx context.Context, runID string) (*RunUsage, err
 	}
 	usage.StartedAt = &startedAt
 	usage.CompletedAt = &completedAt
+	usage.Available = true
 	models, err := s.loadRunModelUsage(ctx, runID)
 	if err != nil {
 		return nil, err

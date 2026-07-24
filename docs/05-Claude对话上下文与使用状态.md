@@ -41,14 +41,15 @@ Claude Code 官方说明中，`result.total_cost_usd` 和 `modelUsage.*.costUSD`
 当前上下文采用以下定义：
 
 ```text
-最后一个主 Agent 步骤的 input_tokens
+最后一个主 Agent 步骤的完整输入
+(input_tokens + cache_read_input_tokens + cache_creation_input_tokens)
 ÷
 该模型的 contextWindow
 =
 当前上下文占用估算
 ```
 
-步骤所属模型取自该 `assistant` 消息；上下文窗口取同一模型在 `result.modelUsage` 中的 `contextWindow`。模型切换时不跨模型混算。
+步骤所属模型取自该 `assistant` 消息；上下文窗口取同一模型在 `result.modelUsage` 中的 `contextWindow`。模型切换时不跨模型混算。`result.usage` 是当前 Run 的累计量，只用于 Run 用量统计，不能回填上下文快照。
 
 例如：最后一个步骤输入为 `48,000` Token，模型上下文窗口为 `200,000` Token，显示为：
 
@@ -60,7 +61,7 @@ Claude Code 官方说明中，`result.total_cost_usd` 和 `modelUsage.*.costUSD`
 
 - 只统计主 Agent，子代理 Token 不混入当前主会话上下文百分比。
 - 同一 Claude 消息 ID 的并行工具事件必须去重，避免重复计算。
-- Claude 尚未返回第一个 Agent 步骤时显示“上下文计算中”，不显示伪造的 `0%`。
+- Claude 尚未返回第一个可信 Agent 步骤时显示“上下文计算中”；若 Run 已结束仍没有该快照，则显示“上下文暂不可用”，不显示伪造的 `0%`。
 - 模型未返回 `contextWindow` 或 Token 字段时显示“暂不可用”。
 - 上下文管理与压缩事件继续保留在原始事件流中；本阶段不展示压缩历史，也不将压缩前后的百分比相加。
 

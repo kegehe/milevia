@@ -7,15 +7,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type runnerFunc func(context.Context, AgentRunRequest, AgentRunSink) error
@@ -24,7 +28,91 @@ func (fn runnerFunc) Run(ctx context.Context, request AgentRunRequest, sink Agen
 	return fn(ctx, request, sink)
 }
 
-func (runnerFunc) Ready(context.Context) bool { return true }
+func (runnerFunc) Ready(context.Context) bool                        { return true }
+func (runnerFunc) Version(context.Context) string                    { return "2.1.216" }
+func (runnerFunc) CheckUpdate(context.Context) (bool, string, error) { return false, "", nil }
+func (runnerFunc) Update(context.Context) (string, string, error)    { return "2.1.216", "2.1.217", nil }
+
+type unavailableRunner struct{}
+
+func (unavailableRunner) Ready(context.Context) bool                               { return false }
+func (unavailableRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error { return nil }
+func (unavailableRunner) Version(context.Context) string                           { return "" }
+func (unavailableRunner) CheckUpdate(context.Context) (bool, string, error)        { return false, "", nil }
+func (unavailableRunner) Update(context.Context) (string, string, error)           { return "", "", nil }
+
+type countingReadyRunner struct {
+	ready bool
+	calls int
+}
+
+func (runner *countingReadyRunner) Ready(context.Context) bool {
+	runner.calls++
+	return runner.ready
+}
+func (*countingReadyRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error { return nil }
+func (*countingReadyRunner) Version(context.Context) string                           { return "test" }
+func (*countingReadyRunner) CheckUpdate(context.Context) (bool, string, error)        { return false, "", nil }
+func (*countingReadyRunner) Update(context.Context) (string, string, error)           { return "", "", nil }
+
+type updateTestRunner struct {
+	checkAvailable bool
+	latestVersion  string
+	checkErr       error
+	updateErr      error
+	updateCalls    int
+}
+
+type blockingUpdateRunner struct {
+	updateTestRunner
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type admissionBlockingRunner struct {
+	readyStarted chan struct{}
+	releaseReady chan struct{}
+	once         sync.Once
+}
+
+func (runner *admissionBlockingRunner) Ready(context.Context) bool {
+	runner.once.Do(func() { close(runner.readyStarted) })
+	<-runner.releaseReady
+	return true
+}
+func (runner *admissionBlockingRunner) Run(ctx context.Context, _ AgentRunRequest, _ AgentRunSink) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (*admissionBlockingRunner) Version(context.Context) string { return "2.1.216" }
+func (*admissionBlockingRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (*admissionBlockingRunner) Update(context.Context) (string, string, error) {
+	return "2.1.216", "2.1.217", nil
+}
+
+func (runner *blockingUpdateRunner) Update(context.Context) (string, string, error) {
+	runner.once.Do(func() { close(runner.started) })
+	<-runner.release
+	runner.updateCalls++
+	return "2.1.216", "2.1.217", nil
+}
+
+func (*updateTestRunner) Ready(context.Context) bool                               { return true }
+func (*updateTestRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error { return nil }
+func (*updateTestRunner) Version(context.Context) string                           { return "2.1.216" }
+func (runner *updateTestRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return runner.checkAvailable, runner.latestVersion, runner.checkErr
+}
+func (runner *updateTestRunner) Update(context.Context) (string, string, error) {
+	runner.updateCalls++
+	if runner.updateErr != nil {
+		return "2.1.216", "", runner.updateErr
+	}
+	return "2.1.216", "2.1.217", nil
+}
 
 type idleAgentSession struct {
 	done chan error
@@ -33,7 +121,14 @@ type idleAgentSession struct {
 
 type queuedStreamingRunner struct{ session *queuedAgentSession }
 
-func (runner queuedStreamingRunner) Ready(context.Context) bool { return true }
+func (runner queuedStreamingRunner) Ready(context.Context) bool     { return true }
+func (runner queuedStreamingRunner) Version(context.Context) string { return "2.1.216" }
+func (runner queuedStreamingRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (runner queuedStreamingRunner) Update(context.Context) (string, string, error) {
+	return "2.1.216", "2.1.217", nil
+}
 func (runner queuedStreamingRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
 	return errors.New("one-shot run is not expected")
 }
@@ -78,12 +173,86 @@ func (session *blockingStopAgentSession) Stop() {
 
 type blockingStreamingRunner struct{ session AgentSession }
 
-func (runner blockingStreamingRunner) Ready(context.Context) bool { return true }
+func (runner blockingStreamingRunner) Ready(context.Context) bool     { return true }
+func (runner blockingStreamingRunner) Version(context.Context) string { return "2.1.216" }
+func (runner blockingStreamingRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (runner blockingStreamingRunner) Update(context.Context) (string, string, error) {
+	return "2.1.216", "2.1.217", nil
+}
 func (runner blockingStreamingRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
 	return errors.New("one-shot run is not expected")
 }
 func (runner blockingStreamingRunner) StartSession(context.Context, AgentSessionRequest) (AgentSession, error) {
 	return runner.session, nil
+}
+
+type setupBlockingStreamingRunner struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (*setupBlockingStreamingRunner) Ready(context.Context) bool     { return true }
+func (*setupBlockingStreamingRunner) Version(context.Context) string { return "2.1.216" }
+func (*setupBlockingStreamingRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (*setupBlockingStreamingRunner) Update(context.Context) (string, string, error) {
+	return "2.1.216", "2.1.217", nil
+}
+func (*setupBlockingStreamingRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
+	return errors.New("one-shot run is not expected")
+}
+func (runner *setupBlockingStreamingRunner) StartSession(ctx context.Context, _ AgentSessionRequest) (AgentSession, error) {
+	runner.once.Do(func() { close(runner.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type returnedStreamingRunner struct {
+	session    AgentSession
+	returned   chan struct{}
+	returnOnce sync.Once
+}
+
+func (*returnedStreamingRunner) Ready(context.Context) bool     { return true }
+func (*returnedStreamingRunner) Version(context.Context) string { return "2.1.216" }
+func (*returnedStreamingRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (*returnedStreamingRunner) Update(context.Context) (string, string, error) {
+	return "2.1.216", "2.1.217", nil
+}
+func (*returnedStreamingRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
+	return errors.New("one-shot run is not expected")
+}
+func (runner *returnedStreamingRunner) StartSession(context.Context, AgentSessionRequest) (AgentSession, error) {
+	runner.returnOnce.Do(func() { close(runner.returned) })
+	return runner.session, nil
+}
+
+type errBlockingContext struct {
+	context.Context
+	blockCall int
+	entered   chan struct{}
+	release   chan struct{}
+	mu        sync.Mutex
+	calls     int
+	once      sync.Once
+}
+
+func (ctx *errBlockingContext) Err() error {
+	ctx.mu.Lock()
+	ctx.calls++
+	shouldBlock := ctx.calls == ctx.blockCall
+	ctx.mu.Unlock()
+	if !shouldBlock {
+		return nil
+	}
+	ctx.once.Do(func() { close(ctx.entered) })
+	<-ctx.release
+	return nil
 }
 
 func newQueuedAgentSession() *queuedAgentSession { return &queuedAgentSession{done: make(chan error)} }
@@ -132,6 +301,7 @@ type recordingSink struct {
 	texts       []string
 	parents     []string
 	initialized int
+	sessions    []string
 }
 
 func (sink *recordingSink) Event(eventType string, _ json.RawMessage) {
@@ -145,6 +315,12 @@ func (sink *recordingSink) AssistantText(content, parentToolUseID string) {
 	defer sink.mu.Unlock()
 	sink.texts = append(sink.texts, content)
 	sink.parents = append(sink.parents, parentToolUseID)
+}
+
+func (sink *recordingSink) SessionIdentified(sessionID string) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	sink.sessions = append(sink.sessions, sessionID)
 }
 
 func (sink *recordingSink) SessionInitialized() {
@@ -161,6 +337,7 @@ type turnRecordingSink struct {
 
 func (sink *turnRecordingSink) Event(string, json.RawMessage) {}
 func (sink *turnRecordingSink) AssistantText(string, string)  {}
+func (sink *turnRecordingSink) SessionIdentified(string)      {}
 func (sink *turnRecordingSink) SessionInitialized()           {}
 func (sink *turnRecordingSink) TurnStarted() {
 	sink.mu.Lock()
@@ -226,6 +403,318 @@ func TestFinishRunUpdatesRunAndConversation(t *testing.T) {
 	}
 }
 
+func TestAssistantTextBroadcastsDurableMessageEvent(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','running',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run','conversation','running',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	sink := &agentRunSink{server: server, runID: "run", conversationID: "conversation"}
+	sink.AssistantText("live reply", "")
+
+	var eventType string
+	var payload []byte
+	if err := server.db.QueryRow(`select type,payload from events where conversation_id='conversation' order by created_at desc limit 1`).Scan(&eventType, &payload); err != nil {
+		t.Fatalf("load assistant event: %v", err)
+	}
+	if eventType != "assistant.message" {
+		t.Fatalf("event type=%q, want assistant.message", eventType)
+	}
+	var message Message
+	if err := json.Unmarshal(payload, &message); err != nil {
+		t.Fatalf("decode assistant event: %v", err)
+	}
+	if message.Content != "live reply" || message.RunID != "run" || message.Role != "assistant" {
+		t.Fatalf("broadcast message=%+v", message)
+	}
+}
+
+func TestCreateCodexConversationPersistsAgentAndPolicy(t *testing.T) {
+	server := newTestServer(t)
+	server.codexRunner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations?new=true", strings.NewReader(`{"agentId":"codex","permissionMode":"workspace_write"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var conversation Conversation
+	if err := json.NewDecoder(response.Body).Decode(&conversation); err != nil {
+		t.Fatalf("decode conversation: %v", err)
+	}
+	if conversation.AgentID != "codex" || conversation.PermissionMode != "workspace_write" || conversation.ExecutionPolicy != "workspace_write" || conversation.AgentRuntimeID != "wsl-local" || conversation.AgentSessionID == "" {
+		t.Fatalf("conversation=%#v", conversation)
+	}
+}
+
+func TestCodexReadyAllowsProjectLoadWithoutClaude(t *testing.T) {
+	server := newTestServer(t)
+	server.runner = unavailableRunner{}
+	server.codexRunner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	projectPath := server.config.AllowedRoot
+
+	validate := httptest.NewRecorder()
+	server.routes().ServeHTTP(validate, httptest.NewRequest(http.MethodPost, "/api/projects/validate", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	if validate.Code != http.StatusOK {
+		t.Fatalf("validate status=%d body=%s", validate.Code, validate.Body.String())
+	}
+	var result struct {
+		ClaudeReady bool `json:"claudeReady"`
+		CodexReady  bool `json:"codexReady"`
+		AgentReady  bool `json:"agentReady"`
+	}
+	if err := json.NewDecoder(validate.Body).Decode(&result); err != nil {
+		t.Fatalf("decode validation: %v", err)
+	}
+	if result.ClaudeReady || !result.CodexReady || !result.AgentReady {
+		t.Fatalf("validation=%#v", result)
+	}
+
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", create.Code, create.Body.String())
+	}
+	var project Project
+	if err := json.NewDecoder(create.Body).Decode(&project); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	if project.ClaudeReady || !project.CodexReady || !project.AgentReady {
+		t.Fatalf("project=%#v", project)
+	}
+
+	existing := httptest.NewRecorder()
+	server.routes().ServeHTTP(existing, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	if existing.Code != http.StatusOK {
+		t.Fatalf("repeat create status=%d body=%s", existing.Code, existing.Body.String())
+	}
+	if err := json.NewDecoder(existing.Body).Decode(&project); err != nil {
+		t.Fatalf("decode existing project: %v", err)
+	}
+	if project.ClaudeReady || !project.CodexReady || !project.AgentReady {
+		t.Fatalf("existing project=%#v", project)
+	}
+}
+
+func TestListProjectsChecksCodexOnce(t *testing.T) {
+	server := newTestServer(t)
+	codex := &countingReadyRunner{ready: true}
+	server.codexRunner = codex
+	now := time.Now().UTC()
+	for index := 0; index < 3; index++ {
+		projectID := fmt.Sprintf("project-%d", index)
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, filepath.Join(server.config.AllowedRoot, projectID), "wsl-local", "main", 0, now); err != nil {
+			t.Fatalf("insert project %d: %v", index, err)
+		}
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+	}
+	if codex.calls != 1 {
+		t.Fatalf("Codex readiness checks=%d, want 1", codex.calls)
+	}
+}
+
+func TestUnavailableCodexCannotCreateConversation(t *testing.T) {
+	server := newTestServer(t)
+	server.codexRunner = unavailableRunner{}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, server.config.AllowedRoot, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations?new=true", strings.NewReader(`{"agentId":"codex","permissionMode":"workspace_write"}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var count int
+	if err := server.db.QueryRow(`select count(*) from conversations where project_id='project'`).Scan(&count); err != nil {
+		t.Fatalf("count conversations: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("created unavailable Codex conversation count=%d", count)
+	}
+}
+
+func TestCodexUsageIsExplicitlyUnavailable(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, server.config.AllowedRoot, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values ('conversation','project','legacy','codex','thread-1','wsl-local','read_only','idle','read_only','Codex',?,0,1,1,?)`, now, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	server.codexRunner = runnerFunc(func(_ context.Context, _ AgentRunRequest, _ AgentRunSink) error { return nil })
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", strings.NewReader(`{"content":"检查项目"}`)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("send status=%d body=%s", response.Code, response.Body.String())
+	}
+	waitForConversationIdle(t, server, "conversation")
+	var runID string
+	if err := server.db.QueryRow(`select id from runs where conversation_id='conversation'`).Scan(&runID); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	var usageRows int
+	if err := server.db.QueryRow(`select count(*) from run_usage where run_id=?`, runID).Scan(&usageRows); err != nil {
+		t.Fatalf("count usage: %v", err)
+	}
+	if usageRows != 0 {
+		t.Fatalf("Codex usage rows=%d, want 0", usageRows)
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation/usage", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("conversation usage status=%d body=%s", response.Code, response.Body.String())
+	}
+	var usage ConversationUsageResponse
+	if err := json.NewDecoder(response.Body).Decode(&usage); err != nil {
+		t.Fatalf("decode usage: %v", err)
+	}
+	if usage.Available || usage.Reason == "" {
+		t.Fatalf("usage=%#v", usage)
+	}
+}
+
+func TestActivateCodexConversationReturnsAgentMetadata(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values ('codex','project','legacy-codex','codex','thread-codex','wsl-local','read_only','idle','read_only','Codex',?,0,1,0,?),('claude','project','legacy-claude','claude-code','legacy-claude','wsl-local','approval_required','idle','approval_required','Claude',?,1,1,1,?)`, now, now, now, now); err != nil {
+		t.Fatalf("insert conversations: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/codex/activate", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("activate status=%d body=%s", response.Code, response.Body.String())
+	}
+	var conversation Conversation
+	if err := json.NewDecoder(response.Body).Decode(&conversation); err != nil {
+		t.Fatalf("decode conversation: %v", err)
+	}
+	if conversation.AgentID != "codex" || conversation.AgentSessionID != "thread-codex" || conversation.ExecutionPolicy != "read_only" || !conversation.IsCurrent {
+		t.Fatalf("activated conversation=%#v", conversation)
+	}
+}
+
+func TestCodexRunSnapshotsAgentRuntimeAndPolicy(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values ('conversation','project','legacy','codex','pending-thread','wsl-local','read_only','idle','read_only','Codex',?,0,0,1,?)`, now, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	server.codexRunner = runnerFunc(func(_ context.Context, request AgentRunRequest, sink AgentRunSink) error {
+		if request.Resume || request.SessionID != "pending-thread" || request.PermissionMode != "read_only" {
+			t.Fatalf("unexpected Codex request: %#v", request)
+		}
+		sink.SessionIdentified("thread-1")
+		sink.SessionInitialized()
+		return nil
+	})
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", strings.NewReader(`{"content":"检查项目"}`)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("send status=%d body=%s", response.Code, response.Body.String())
+	}
+	waitForConversationIdle(t, server, "conversation")
+	var agentID, runtimeID, policy, agentRunID string
+	if err := server.db.QueryRow(`select agent_id,agent_runtime_id,execution_policy,agent_run_id from runs where conversation_id='conversation'`).Scan(&agentID, &runtimeID, &policy, &agentRunID); err != nil {
+		t.Fatalf("read run snapshot: %v", err)
+	}
+	if agentID != "codex" || runtimeID != "wsl-local" || policy != "read_only" || agentRunID != "thread-1" {
+		t.Fatalf("unexpected run snapshot: agent=%q runtime=%q policy=%q agentRunID=%q", agentID, runtimeID, policy, agentRunID)
+	}
+}
+
+func TestRunSnapshotUsesEffectiveExecutionPolicy(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','claude-code','','wsl-local','approval_required','idle','full_control','Claude',?,0,0,1,?)`, now, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	server.runner = runnerFunc(func(_ context.Context, request AgentRunRequest, _ AgentRunSink) error {
+		if request.PermissionMode != "full_control" {
+			t.Fatalf("execution policy = %q", request.PermissionMode)
+		}
+		return nil
+	})
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", strings.NewReader(`{"content":"继续旧会话"}`)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("send status=%d body=%s", response.Code, response.Body.String())
+	}
+	waitForConversationIdle(t, server, "conversation")
+	var policy string
+	if err := server.db.QueryRow(`select execution_policy from runs where conversation_id='conversation'`).Scan(&policy); err != nil {
+		t.Fatalf("read run snapshot: %v", err)
+	}
+	if policy != "full_control" {
+		t.Fatalf("run policy=%q, want full_control", policy)
+	}
+}
+
+func TestMigratePreservesRunSnapshotWithoutAgentRunID(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "auto.db")
+	hookPath, err := filepath.Abs("../../../../scripts/claude-approval-hook.sh")
+	if err != nil {
+		t.Fatalf("resolve hook path: %v", err)
+	}
+	config := Config{DatabasePath: databasePath, AllowedRoot: t.TempDir(), ClaudePath: "claude", ControlURL: "http://127.0.0.1:8080", ApprovalHook: hookPath}
+	server, err := New(context.Background(), config)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		server.Close()
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values ('conversation','project','legacy','codex','thread-1','wsl-local','workspace_write','idle','workspace_write','Codex',?,0,1,1,?)`, now, now); err != nil {
+		server.Close()
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,agent_id,agent_runtime_id,execution_policy,agent_run_id,status,created_at,completed_at) values ('run','conversation','codex','wsl-local','read_only','','failed',?,?)`, now, now); err != nil {
+		server.Close()
+		t.Fatalf("insert run: %v", err)
+	}
+	server.Close()
+
+	reopened, err := New(context.Background(), config)
+	if err != nil {
+		t.Fatalf("reopen server: %v", err)
+	}
+	t.Cleanup(reopened.Close)
+	var agentID, runtimeID, policy, agentRunID string
+	if err := reopened.db.QueryRow(`select agent_id,agent_runtime_id,execution_policy,agent_run_id from runs where id='run'`).Scan(&agentID, &runtimeID, &policy, &agentRunID); err != nil {
+		t.Fatalf("read run snapshot: %v", err)
+	}
+	if agentID != "codex" || runtimeID != "wsl-local" || policy != "read_only" || agentRunID != "" {
+		t.Fatalf("run snapshot changed: agent=%q runtime=%q policy=%q runID=%q", agentID, runtimeID, policy, agentRunID)
+	}
+}
+
 func TestRunUsageDeduplicatesEventsAndPersistsConversationSummary(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC()
@@ -240,12 +729,15 @@ func TestRunUsageDeduplicatesEventsAndPersistsConversationSummary(t *testing.T) 
 	}
 
 	server.beginRunUsage("run", "conversation")
-	mainStep := json.RawMessage(`{"type":"assistant","message":{"id":"main-step","model":"claude-sonnet","usage":{"input_tokens":48000},"content":[{"type":"tool_use","id":"tool-1"}]}}`)
+	mainStep := json.RawMessage(`{"type":"assistant","message":{"id":"main-step","model":"claude-sonnet","usage":{"input_tokens":48000,"cache_read_input_tokens":1200,"cache_creation_input_tokens":300},"content":[{"type":"tool_use","id":"tool-1"}]}}`)
 	server.collectUsageEvent("run", "conversation", "assistant", mainStep)
 	server.collectUsageEvent("run", "conversation", "assistant", mainStep)
 	subagentStep := json.RawMessage(`{"type":"assistant","parent_tool_use_id":"tool-1","message":{"id":"subagent-step","model":"claude-haiku","usage":{"input_tokens":1200},"content":[{"type":"tool_use","id":"tool-2"}]}}`)
 	server.collectUsageEvent("run", "conversation", "assistant", subagentStep)
 	server.collectUsageEvent("run", "conversation", "assistant", subagentStep)
+	if live := server.liveRunUsage("run", "running"); live == nil || live.ContextInputTokens != 49500 {
+		t.Fatalf("unexpected live context snapshot: %#v", live)
+	}
 	result := json.RawMessage(`{"type":"result","num_turns":3,"duration_ms":4200,"ttft_ms":700,"total_cost_usd":0.1234,"terminal_reason":"end_turn","usage":{"input_tokens":50000,"output_tokens":2000,"cache_read_input_tokens":3000,"cache_creation_input_tokens":400},"modelUsage":{"claude-sonnet":{"inputTokens":48000,"outputTokens":1800,"cacheReadInputTokens":2800,"cacheCreationInputTokens":400,"costUSD":0.11,"contextWindow":200000},"claude-haiku":{"inputTokens":2000,"outputTokens":200,"cacheReadInputTokens":200,"cacheCreationInputTokens":0,"costUSD":0.0134,"contextWindow":200000}}}`)
 	server.collectUsageEvent("run", "conversation", "result", result)
 	if err := server.persistRunUsage("run", "completed"); err != nil {
@@ -266,8 +758,220 @@ func TestRunUsageDeduplicatesEventsAndPersistsConversationSummary(t *testing.T) 
 	if usage.Session.TaskCount != 1 || usage.Session.AgentTurns != 3 || usage.Session.ModelSteps != 1 || usage.Session.ToolCalls != 2 || usage.Session.SubagentCount != 1 {
 		t.Fatalf("unexpected summary: %#v", usage.Session)
 	}
-	if usage.Context.ContextInputTokens != 50000 || usage.Context.ContextWindow != 200000 || usage.Context.EstimatedCostUSD != 0.1234 || len(usage.Models) != 2 {
+	if usage.Context.ContextInputTokens != 49500 || usage.Context.ContextWindow != 200000 || usage.Context.EstimatedCostUSD != 0.1234 || len(usage.Models) != 2 {
 		t.Fatalf("unexpected context or models: %#v models=%#v", usage.Context, usage.Models)
+	}
+}
+
+func TestRunUsageDoesNotUseCumulativeResultUsageAsContextSnapshot(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','running',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run','conversation','running',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	server.beginRunUsage("run", "conversation")
+
+	server.collectUsageEvent("run", "conversation", "assistant", json.RawMessage(`{"type":"assistant","message":{"id":"streamed-step","model":"claude-sonnet","usage":{},"content":[]}}`))
+	server.collectUsageEvent("run", "conversation", "result", json.RawMessage(`{"type":"result","num_turns":3,"usage":{"input_tokens":1000,"cache_read_input_tokens":150000,"cache_creation_input_tokens":2000},"modelUsage":{"claude-sonnet":{"contextWindow":200000}}}`))
+
+	usage := server.liveRunUsage("run", "running")
+	if usage == nil || usage.ContextInputTokens != 0 || usage.ContextWindow != 200000 {
+		t.Fatalf("live usage=%#v, want no fabricated context snapshot", usage)
+	}
+}
+
+func TestBeginRunUsageDoesNotReportPriorRunContextAsCurrent(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','idle',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at,completed_at) values ('previous','conversation','completed',?,?),('current','conversation','running',?,null)`, now, now, now); err != nil {
+		t.Fatalf("insert runs: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into run_usage (run_id,conversation_id,context_input_tokens,completed_at) values ('previous','conversation',48000,?)`, now); err != nil {
+		t.Fatalf("insert prior usage: %v", err)
+	}
+
+	server.beginRunUsage("current", "conversation")
+	usage := server.liveRunUsage("current", "running")
+	if usage == nil || usage.ContextInputTokens != 0 {
+		t.Fatalf("live usage=%#v, want no stale context snapshot", usage)
+	}
+}
+
+func TestConversationUsageDoesNotDoubleCountPersistedRunningUsage(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','running',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run','conversation','running',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	server.beginRunUsage("run", "conversation")
+	server.collectUsageEvent("run", "conversation", "result", json.RawMessage(`{"type":"result","num_turns":2,"total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":500,"cache_creation_input_tokens":10},"modelUsage":{"claude-sonnet":{"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":500,"cacheCreationInputTokens":10,"costUSD":0.01,"contextWindow":200000}}}`))
+	if err := server.persistRunUsage("run", "completed"); err != nil {
+		t.Fatalf("persist usage: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation/usage", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("get conversation usage status: %d body=%s", response.Code, response.Body.String())
+	}
+	var usage ConversationUsageResponse
+	if err := json.NewDecoder(response.Body).Decode(&usage); err != nil {
+		t.Fatalf("decode conversation usage: %v", err)
+	}
+	if usage.Session.AgentTurns != 2 || usage.Session.InputTokens != 100 || usage.Session.OutputTokens != 20 || usage.Session.CacheReadTokens != 500 || usage.Session.EstimatedCostUSD != 0.01 {
+		t.Fatalf("persisted running usage was counted more than once: %#v", usage.Session)
+	}
+	if len(usage.Models) != 1 || usage.Models[0].Model != "claude-sonnet" || usage.Models[0].InputTokens != 100 || usage.Models[0].OutputTokens != 20 || usage.Models[0].CacheReadTokens != 500 || usage.Models[0].CacheCreationTokens != 10 || usage.Models[0].EstimatedCostUSD != 0.01 {
+		t.Fatalf("persisted running model usage was counted more than once: %#v", usage.Models)
+	}
+}
+
+func TestConversationUsageDoesNotFallBackToPriorRunAfterUsagePersistenceFailure(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	prior := now.Add(-time.Minute)
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), prior); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','idle',0,1,?)`, prior); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at,completed_at) values ('prior','conversation','completed',?,?),('failed','conversation','completed',?,?)`, prior, prior, now, now); err != nil {
+		t.Fatalf("insert runs: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into run_usage (run_id,conversation_id,model,context_window,context_input_tokens,input_tokens,has_result,completed_at) values ('prior','conversation','claude-sonnet',200000,48000,100,1,?)`, prior); err != nil {
+		t.Fatalf("insert prior usage: %v", err)
+	}
+
+	conversationResponse := httptest.NewRecorder()
+	server.routes().ServeHTTP(conversationResponse, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation/usage", nil))
+	if conversationResponse.Code != http.StatusOK {
+		t.Fatalf("get conversation usage status: %d body=%s", conversationResponse.Code, conversationResponse.Body.String())
+	}
+	var conversationUsage ConversationUsageResponse
+	if err := json.NewDecoder(conversationResponse.Body).Decode(&conversationUsage); err != nil {
+		t.Fatalf("decode conversation usage: %v", err)
+	}
+	if conversationUsage.LatestRun == nil || conversationUsage.LatestRun.RunID != "failed" || conversationUsage.LatestRun.Available || conversationUsage.LatestRun.Reason == "" {
+		t.Fatalf("latest run fell back to prior usage: %#v", conversationUsage.LatestRun)
+	}
+	if conversationUsage.Context.RunID != "failed" || conversationUsage.Context.Available || conversationUsage.Context.ContextInputTokens != 0 {
+		t.Fatalf("context fell back to prior usage: %#v", conversationUsage.Context)
+	}
+
+	runResponse := httptest.NewRecorder()
+	server.routes().ServeHTTP(runResponse, httptest.NewRequest(http.MethodGet, "/api/runs/failed/usage", nil))
+	if runResponse.Code != http.StatusOK {
+		t.Fatalf("get failed run usage status: %d body=%s", runResponse.Code, runResponse.Body.String())
+	}
+	var runUsage RunUsage
+	if err := json.NewDecoder(runResponse.Body).Decode(&runUsage); err != nil {
+		t.Fatalf("decode failed run usage: %v", err)
+	}
+	if runUsage.RunID != "failed" || runUsage.Available || runUsage.Reason == "" {
+		t.Fatalf("failed run usage=%#v", runUsage)
+	}
+}
+
+func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
+	server := newTestServer(t)
+	runner := &updateTestRunner{checkAvailable: true, latestVersion: "2.1.217"}
+	server.runnerRegistry.register("update-runner", runner, RunnerMeta{ID: "update-runner"})
+
+	missing := httptest.NewRecorder()
+	server.routes().ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/api/runners/missing/claude/check-update", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing runner status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	check := httptest.NewRecorder()
+	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/check-update", nil))
+	if check.Code != http.StatusOK {
+		t.Fatalf("check update status=%d body=%s", check.Code, check.Body.String())
+	}
+	var checkResult struct {
+		UpdateAvailable bool   `json:"updateAvailable"`
+		CurrentVersion  string `json:"currentVersion"`
+		LatestVersion   string `json:"latestVersion"`
+	}
+	if err := json.NewDecoder(check.Body).Decode(&checkResult); err != nil {
+		t.Fatalf("decode check update: %v", err)
+	}
+	if !checkResult.UpdateAvailable || checkResult.CurrentVersion != "2.1.216" || checkResult.LatestVersion != "2.1.217" {
+		t.Fatalf("check result=%#v", checkResult)
+	}
+
+	update := httptest.NewRecorder()
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/update", nil))
+	if update.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", update.Code, update.Body.String())
+	}
+	var updateResult struct {
+		Success         bool   `json:"success"`
+		PreviousVersion string `json:"previousVersion"`
+		CurrentVersion  string `json:"currentVersion"`
+	}
+	if err := json.NewDecoder(update.Body).Decode(&updateResult); err != nil {
+		t.Fatalf("decode update: %v", err)
+	}
+	if !updateResult.Success || updateResult.PreviousVersion != "2.1.216" || updateResult.CurrentVersion != "2.1.217" || runner.updateCalls != 1 {
+		t.Fatalf("update result=%#v calls=%d", updateResult, runner.updateCalls)
+	}
+
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'update-runner','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_runtime_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','update-runner','running',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,agent_runtime_id,status,created_at) values ('active','conversation','update-runner','running',?)`, now); err != nil {
+		t.Fatalf("insert active run: %v", err)
+	}
+
+	blocked := httptest.NewRecorder()
+	server.routes().ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/update", nil))
+	if blocked.Code != http.StatusConflict || runner.updateCalls != 1 {
+		t.Fatalf("blocked update status=%d calls=%d body=%s", blocked.Code, runner.updateCalls, blocked.Body.String())
+	}
+
+	if _, err := server.db.Exec(`update runs set status='completed' where id='active'`); err != nil {
+		t.Fatalf("complete active run: %v", err)
+	}
+	runner.updateErr = errors.New("update failed")
+	failed := httptest.NewRecorder()
+	server.routes().ServeHTTP(failed, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/update", nil))
+	if failed.Code != http.StatusInternalServerError || runner.updateCalls != 2 {
+		t.Fatalf("failed update status=%d calls=%d body=%s", failed.Code, runner.updateCalls, failed.Body.String())
+	}
+	var failureResult struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.NewDecoder(failed.Body).Decode(&failureResult); err != nil {
+		t.Fatalf("decode failed update: %v", err)
+	}
+	if failureResult.Success || failureResult.Error != "update failed" {
+		t.Fatalf("failure result=%#v", failureResult)
 	}
 }
 
@@ -373,8 +1077,9 @@ func TestShortcutValidationVisibilityAndCORS(t *testing.T) {
 	preflight := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodOptions, "/api/shortcuts/example", nil)
 	request.Header.Set("Origin", "http://127.0.0.1:5173")
+	request.Header.Set("Access-Control-Request-Method", http.MethodPut)
 	handler.ServeHTTP(preflight, request)
-	if preflight.Code != http.StatusNoContent || preflight.Header().Get("Access-Control-Allow-Methods") != "GET, POST, PATCH, DELETE, OPTIONS" {
+	if preflight.Code != http.StatusNoContent || preflight.Header().Get("Access-Control-Allow-Methods") != "GET, POST, PUT, PATCH, DELETE, OPTIONS" {
 		t.Fatalf("unexpected preflight response: status=%d methods=%q", preflight.Code, preflight.Header().Get("Access-Control-Allow-Methods"))
 	}
 
@@ -398,6 +1103,127 @@ func TestShortcutValidationVisibilityAndCORS(t *testing.T) {
 	handler.ServeHTTP(managed, httptest.NewRequest(http.MethodGet, "/api/projects/project/shortcuts?includeDisabled=true", nil))
 	if managed.Code != http.StatusOK || !strings.Contains(managed.Body.String(), "已停用") {
 		t.Fatalf("disabled shortcut missing from management list: status=%d body=%s", managed.Code, managed.Body.String())
+	}
+}
+
+func TestClaudeUpdateBlocksConcurrentUpdatesAndNewClaudeRuns(t *testing.T) {
+	server := newTestServer(t)
+	runner := &blockingUpdateRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	server.runner = runner
+	server.runnerRegistry.register("wsl-local", runner, server.wslLocalMeta())
+
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_runtime_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','wsl-local','idle',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	idle := &idleAgentSession{done: make(chan error)}
+	server.mu.Lock()
+	server.sessions["conversation"] = &activeAgentSession{agent: idle, runnerID: "wsl-local"}
+	server.mu.Unlock()
+	idleSessionUpdate := httptest.NewRecorder()
+	server.routes().ServeHTTP(idleSessionUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+	if idleSessionUpdate.Code != http.StatusConflict {
+		t.Fatalf("update with idle session status=%d body=%s", idleSessionUpdate.Code, idleSessionUpdate.Body.String())
+	}
+	server.mu.Lock()
+	delete(server.sessions, "conversation")
+	server.mu.Unlock()
+
+	update := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+		close(done)
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("update did not start")
+	}
+
+	secondUpdate := httptest.NewRecorder()
+	server.routes().ServeHTTP(secondUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+	if secondUpdate.Code != http.StatusConflict {
+		t.Fatalf("second update status=%d body=%s", secondUpdate.Code, secondUpdate.Body.String())
+	}
+
+	message := httptest.NewRecorder()
+	server.routes().ServeHTTP(message, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", strings.NewReader(`{"content":"检查更新锁"}`)))
+	if message.Code != http.StatusConflict {
+		t.Fatalf("message during update status=%d body=%s", message.Code, message.Body.String())
+	}
+	var runCount int
+	if err := server.db.QueryRow(`select count(*) from runs where conversation_id='conversation'`).Scan(&runCount); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if runCount != 0 {
+		t.Fatalf("run admitted during update: %d", runCount)
+	}
+
+	close(runner.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("update did not finish")
+	}
+	if update.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", update.Code, update.Body.String())
+	}
+}
+
+func TestClaudeUpdateDoesNotDeadlockWithMessageAdmission(t *testing.T) {
+	server := newTestServer(t)
+	runner := &admissionBlockingRunner{readyStarted: make(chan struct{}), releaseReady: make(chan struct{})}
+	server.runner = runner
+	server.runnerRegistry.register("wsl-local", runner, server.wslLocalMeta())
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_runtime_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','wsl-local','idle',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+
+	messageDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", strings.NewReader(`{"content":"并发准入"}`)))
+		messageDone <- response
+	}()
+	select {
+	case <-runner.readyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("message admission did not reach readiness check")
+	}
+
+	updateDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+		updateDone <- response
+	}()
+	close(runner.releaseReady)
+	select {
+	case response := <-messageDone:
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("message status=%d body=%s", response.Code, response.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message admission deadlocked")
+	}
+	select {
+	case response := <-updateDone:
+		if response.Code != http.StatusConflict {
+			t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("update deadlocked")
 	}
 }
 
@@ -480,6 +1306,191 @@ func TestDefaultShortcutsSeedOnceAndDoNotReappearAfterDeletion(t *testing.T) {
 	}
 }
 
+func TestDeleteProjectRemovesProjectAndCascades(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	projectPath := t.TempDir()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('delete-me','Delete Me',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	// Create a conversation so we can verify cascading deletion.
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values ('conv','delete-me','sess','idle','approval_required','Test',?,0,1,?)`, now, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	// Create a shortcut bound to this project.
+	if _, err := server.db.Exec(`insert into shortcuts (id,name,description,kind,template,scope,default_action,group_name,pinned,enabled,sort_order,created_at,updated_at) values ('sc','Test','','prompt','test','project','run','',0,1,0,?,?)`, now, now); err != nil {
+		t.Fatalf("insert shortcut: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into shortcut_projects (shortcut_id,project_id) values ('sc','delete-me')`); err != nil {
+		t.Fatalf("bind shortcut to project: %v", err)
+	}
+
+	handler := server.routes()
+	req := httptest.NewRequest(http.MethodDelete, "/api/projects/delete-me", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete project status: want 204 got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Project should be gone.
+	var remain int
+	if err := server.db.QueryRow(`select count(*) from projects where id='delete-me'`).Scan(&remain); err != nil {
+		t.Fatalf("count projects after delete: %v", err)
+	}
+	if remain != 0 {
+		t.Fatalf("project still exists after deletion: count=%d", remain)
+	}
+	// Conversations should cascade.
+	if err := server.db.QueryRow(`select count(*) from conversations where id='conv'`).Scan(&remain); err != nil {
+		t.Fatalf("count conversations after delete: %v", err)
+	}
+	if remain != 0 {
+		t.Fatalf("conversation still exists after project deletion: count=%d", remain)
+	}
+	// shortcut_projects binding should cascade (via project_id FK).
+	if err := server.db.QueryRow(`select count(*) from shortcut_projects where project_id='delete-me'`).Scan(&remain); err != nil {
+		t.Fatalf("count shortcut_projects after delete: %v", err)
+	}
+	if remain != 0 {
+		t.Fatalf("shortcut_projects binding still exists: count=%d", remain)
+	}
+	// The shortcut itself should survive (it is not owned by the project).
+	if err := server.db.QueryRow(`select count(*) from shortcuts where id='sc'`).Scan(&remain); err != nil {
+		t.Fatalf("count shortcuts after delete: %v", err)
+	}
+	if remain != 1 {
+		t.Fatalf("shortcut unexpectedly deleted: count=%d", remain)
+	}
+}
+
+func TestDeleteProjectStopsActiveAgentRun(t *testing.T) {
+	server := newTestServer(t)
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	server.runner = runnerFunc(func(ctx context.Context, _ AgentRunRequest, _ AgentRunSink) error {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		close(stopped)
+		return ctx.Err()
+	})
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_runtime_id,status,claude_initialized,is_current,created_at) values ('conversation','project','session','wsl-local','idle',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	message := httptest.NewRecorder()
+	server.routes().ServeHTTP(message, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", strings.NewReader(`{"content":"删除时停止"}`)))
+	if message.Code != http.StatusAccepted {
+		t.Fatalf("send message: %d body=%s", message.Code, message.Body.String())
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("agent did not start")
+	}
+
+	deleted := httptest.NewRecorder()
+	server.routes().ServeHTTP(deleted, httptest.NewRequest(http.MethodDelete, "/api/projects/project", nil))
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete project: %d body=%s", deleted.Code, deleted.Body.String())
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("delete project did not stop the active agent")
+	}
+	var remaining int
+	if err := server.db.QueryRow(`select count(*) from projects where id='project'`).Scan(&remaining); err != nil {
+		t.Fatalf("count projects: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("project remains after delete: %d", remaining)
+	}
+}
+
+func TestClaudeSessionForceTerminatesStoppedProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test fixture uses a POSIX shell")
+	}
+	path := filepath.Join(t.TempDir(), "stubborn-claude")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"), 0o755); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	runner := &claudeCLIRunner{config: Config{ClaudePath: path}}
+	session, err := runner.StartSession(context.Background(), AgentSessionRequest{ProjectPath: t.TempDir(), PermissionMode: "full_control"})
+	if err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	session.Stop()
+	select {
+	case err := <-session.Done():
+		if err == nil {
+			t.Fatal("stopped Claude session unexpectedly succeeded")
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("stopped Claude session was not force terminated")
+	}
+}
+
+func TestDeleteProjectNotFound(t *testing.T) {
+	server := newTestServer(t)
+	handler := server.routes()
+	req := httptest.NewRequest(http.MethodDelete, "/api/projects/nonexistent", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete nonexistent project: want 404 got %d", rec.Code)
+	}
+}
+
+func TestEnsureShortcutProjectIDHandlesMissingTable(t *testing.T) {
+	server := newTestServer(t)
+	// Drop the table created during migration to simulate a database that
+	// never had shortcut_projects.
+	if _, err := server.db.Exec(`drop table if exists shortcut_projects`); err != nil {
+		t.Fatalf("drop shortcut_projects: %v", err)
+	}
+	// ensureShortcutProjectID should recreate it without error.
+	if err := server.ensureShortcutProjectID(context.Background()); err != nil {
+		t.Fatalf("ensureShortcutProjectID after drop: %v", err)
+	}
+	// Verify the table exists and has project_id.
+	var count int
+	if err := server.db.QueryRow(`select count(*) from pragma_table_info('shortcut_projects') where name='project_id'`).Scan(&count); err != nil {
+		t.Fatalf("verify project_id column: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("shortcut_projects missing project_id column after ensure")
+	}
+}
+
+func TestEnsureShortcutProjectIDHandlesMissingColumn(t *testing.T) {
+	server := newTestServer(t)
+	// Create shortcut_projects without project_id to simulate an old schema.
+	if _, err := server.db.Exec(`drop table if exists shortcut_projects`); err != nil {
+		t.Fatalf("drop shortcut_projects: %v", err)
+	}
+	if _, err := server.db.Exec(`create table shortcut_projects (shortcut_id text not null, primary key (shortcut_id))`); err != nil {
+		t.Fatalf("create malformed shortcut_projects: %v", err)
+	}
+	// ensureShortcutProjectID should detect the missing column and rebuild.
+	if err := server.ensureShortcutProjectID(context.Background()); err != nil {
+		t.Fatalf("ensureShortcutProjectID with missing column: %v", err)
+	}
+	// Verify the rebuilt table has project_id.
+	var count int
+	if err := server.db.QueryRow(`select count(*) from pragma_table_info('shortcut_projects') where name='project_id'`).Scan(&count); err != nil {
+		t.Fatalf("verify project_id column: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("rebuilt shortcut_projects still missing project_id column")
+	}
+}
+
 func TestConversationPermissionModeLifecycle(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC()
@@ -506,6 +1517,12 @@ func TestConversationPermissionModeLifecycle(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("switch permission mode status: %d body=%s", response.Code, response.Body.String())
+	}
+	if err := json.NewDecoder(response.Body).Decode(&conversation); err != nil {
+		t.Fatalf("decode switched conversation: %v", err)
+	}
+	if conversation.PermissionMode != "approval_required" || conversation.ExecutionPolicy != "approval_required" {
+		t.Fatalf("unexpected switched conversation: %#v", conversation)
 	}
 	if _, err := server.db.Exec(`update conversations set status='running' where id=?`, conversation.ID); err != nil {
 		t.Fatalf("mark conversation running: %v", err)
@@ -684,8 +1701,18 @@ create table messages (id text primary key, conversation_id text not null refere
 		}
 		columns[name] = true
 	}
-	if !columns["title"] || !columns["last_activity_at"] {
-		t.Fatalf("history columns missing after migration: %#v", columns)
+	for _, name := range []string{"title", "last_activity_at", "agent_id", "agent_session_id", "agent_initialized", "agent_runtime_id", "execution_policy"} {
+		if !columns[name] {
+			t.Fatalf("column %q missing after migration: %#v", name, columns)
+		}
+	}
+	var agentID, sessionID, runtimeID, policy string
+	var initialized bool
+	if err := server.db.QueryRow(`select agent_id,agent_session_id,agent_initialized,agent_runtime_id,execution_policy from conversations where id='conversation'`).Scan(&agentID, &sessionID, &initialized, &runtimeID, &policy); err != nil {
+		t.Fatalf("read migrated agent fields: %v", err)
+	}
+	if agentID != "claude-code" || sessionID != "00000000-0000-4000-8000-000000000000" || !initialized || runtimeID != "wsl-local" || policy != "approval_required" {
+		t.Fatalf("unexpected migrated agent fields: id=%q session=%q initialized=%t runtime=%q policy=%q", agentID, sessionID, initialized, runtimeID, policy)
 	}
 	messageRows, err := server.db.Query(`pragma table_info(messages)`)
 	if err != nil {
@@ -738,10 +1765,11 @@ func TestConversationPageReturnsLatestWindowAndCursor(t *testing.T) {
 		}
 	}
 	type conversationPage struct {
-		Messages   []Message `json:"messages"`
-		Events     []Event   `json:"events"`
-		HasMore    bool      `json:"hasMore"`
-		NextCursor string    `json:"nextCursor"`
+		Messages        []Message `json:"messages"`
+		Events          []Event   `json:"events"`
+		HasMore         bool      `json:"hasMore"`
+		HasMoreMessages bool      `json:"hasMoreMessages"`
+		NextCursor      string    `json:"nextCursor"`
 	}
 	response := httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?limit=2", nil))
@@ -752,7 +1780,7 @@ func TestConversationPageReturnsLatestWindowAndCursor(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&first); err != nil {
 		t.Fatalf("decode first page: %v", err)
 	}
-	if !first.HasMore || first.NextCursor == "" || len(first.Messages) != 2 || first.Messages[0].ID != "message-1" || len(first.Events) != 2 || first.Events[0].ID != "event-1" {
+	if !first.HasMore || !first.HasMoreMessages || first.NextCursor == "" || len(first.Messages) != 2 || first.Messages[0].ID != "message-1" || len(first.Events) != 2 || first.Events[0].ID != "event-1" {
 		t.Fatalf("unexpected first page: %#v", first)
 	}
 	response = httptest.NewRecorder()
@@ -764,7 +1792,7 @@ func TestConversationPageReturnsLatestWindowAndCursor(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&second); err != nil {
 		t.Fatalf("decode second page: %v", err)
 	}
-	if second.HasMore || len(second.Messages) != 1 || second.Messages[0].ID != "message-0" || len(second.Events) != 1 || second.Events[0].ID != "event-0" {
+	if second.HasMore || second.HasMoreMessages || len(second.Messages) != 1 || second.Messages[0].ID != "message-0" || len(second.Events) != 1 || second.Events[0].ID != "event-0" {
 		t.Fatalf("unexpected second page: %#v", second)
 	}
 	response = httptest.NewRecorder()
@@ -785,8 +1813,8 @@ func TestInputHistoryReturnsLatestUserMessagesInChronologicalOrder(t *testing.T)
 	}
 	for index := 0; index < 102; index++ {
 		createdAt := now.Add(time.Duration(index) * time.Second)
-		if _, err := server.db.Exec(`insert into prompt_history (project_id,content,created_at) values (?,?,?)`, "project", fmt.Sprintf("prompt-%d", index), createdAt); err != nil {
-			t.Fatalf("insert prompt history %d: %v", index, err)
+		if _, err := server.db.Exec(`insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values (?,?,?,'user',?,'',?)`, fmt.Sprintf("message-%d", index), "conversation", "", fmt.Sprintf("prompt-%d", index), createdAt); err != nil {
+			t.Fatalf("insert input history message %d: %v", index, err)
 		}
 	}
 	response := httptest.NewRecorder()
@@ -841,6 +1869,37 @@ func TestClaudeCLIArgsUseNewSessionUntilClaudeInit(t *testing.T) {
 	}
 	if !containsArguments(streamArgs, "--input-format", "stream-json") || !containsArguments(streamArgs, "--output-format", "stream-json") || !containsArgument(streamArgs, "--replay-user-messages") || streamArgs[len(streamArgs)-1] != request.SessionID {
 		t.Fatalf("streaming arguments are incomplete: %q", streamArgs)
+	}
+
+	request.PermissionMode = "plan"
+	args, err = runner.args(request)
+	if err != nil {
+		t.Fatalf("build plan arguments: %v", err)
+	}
+	if !containsArguments(args, "--permission-mode", "plan") || containsArgument(args, "--settings") || containsArgument(args, "acceptEdits") {
+		t.Fatalf("plan arguments must be read-only: %q", args)
+	}
+	streamArgs, err = runner.sessionArgs(AgentSessionRequest{SessionID: request.SessionID, ProjectPath: t.TempDir(), PermissionMode: "read_only"})
+	if err != nil {
+		t.Fatalf("build read-only streaming arguments: %v", err)
+	}
+	if !containsArguments(streamArgs, "--permission-mode", "plan") || containsArgument(streamArgs, "--settings") || containsArgument(streamArgs, "acceptEdits") {
+		t.Fatalf("read-only streaming arguments must be read-only: %q", streamArgs)
+	}
+}
+
+func TestSSHPermissionArgsKeepReviewsReadOnly(t *testing.T) {
+	for _, permissionMode := range []string{"plan", "read_only"} {
+		args := sshClaudePermissionArgs(permissionMode, "curl example.test")
+		if args != "--permission-mode plan" {
+			t.Fatalf("%s permission args = %q, want plan mode", permissionMode, args)
+		}
+	}
+	if needsClaudeApprovalHook("plan") || needsClaudeApprovalHook("read_only") || needsClaudeApprovalHook("full_control") {
+		t.Fatal("read-only and full-control modes must not open an approval hook")
+	}
+	if !needsClaudeApprovalHook("approval_required") {
+		t.Fatal("approval-required mode must open an approval hook")
 	}
 }
 
@@ -978,6 +2037,138 @@ func TestStreamingStopSerializesConcurrentAdmission(t *testing.T) {
 	}
 }
 
+func TestStopCancelsStreamingSessionSetupBeforeItCanRun(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	runner := &setupBlockingStreamingRunner{started: make(chan struct{})}
+	server.runner = runner
+	handler := server.routes()
+
+	sent := httptest.NewRecorder()
+	sendDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(sent, httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversationID+"/messages", bytes.NewBufferString(`{"content":"must not start after stop"}`)))
+		close(sendDone)
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("streaming session setup did not start")
+	}
+
+	var runID string
+	if err := server.db.QueryRow(`select id from runs where conversation_id=? order by created_at desc limit 1`, conversationID).Scan(&runID); err != nil {
+		t.Fatalf("load queued run: %v", err)
+	}
+	stopped := httptest.NewRecorder()
+	handler.ServeHTTP(stopped, httptest.NewRequest(http.MethodPost, "/api/runs/"+runID+"/stop", nil))
+	if stopped.Code != http.StatusAccepted {
+		t.Fatalf("stop setup status=%d body=%s", stopped.Code, stopped.Body.String())
+	}
+	select {
+	case <-sendDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled streaming setup did not return")
+	}
+	if sent.Code != http.StatusAccepted {
+		t.Fatalf("send status=%d body=%s", sent.Code, sent.Body.String())
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from runs where id=?`, runID).Scan(&status); err != nil {
+		t.Fatalf("load run status: %v", err)
+	}
+	if status != "stopped" {
+		t.Fatalf("run status=%q, want stopped", status)
+	}
+}
+
+func TestStopPreventsStreamingSendAfterSessionSetupReturns(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	now := time.Now().UTC()
+	const runID = "setup-returned-run"
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values (?,?,?,?)`, runID, conversationID, "queued", now); err != nil {
+		t.Fatalf("insert queued run: %v", err)
+	}
+	conversation := Conversation{ID: conversationID, ClaudeSessionID: "00000000-0000-4000-8000-000000000000", AgentRuntimeID: "wsl-local", PermissionMode: "full_control"}
+	session := newQueuedAgentSession()
+	runner := &returnedStreamingRunner{session: session, returned: make(chan struct{})}
+	runCtx, cancel := context.WithCancel(context.Background())
+	server.mu.Lock()
+	server.cancels[runID] = cancel
+	server.runContexts[runID] = conversationID
+	server.streamingSetups[runID] = &streamingSetup{}
+	server.mu.Unlock()
+	// streamingSession checks Err after StartSession returns. The next check is
+	// immediately before Send, after the Session has been registered.
+	setupCtx := &errBlockingContext{Context: context.Background(), blockCall: 2, entered: make(chan struct{}), release: make(chan struct{})}
+	finished := make(chan struct{})
+	go func() {
+		server.submitStreamingRun(setupCtx, runner, runID, conversation, t.TempDir(), "must not be sent")
+		close(finished)
+	}()
+	select {
+	case <-runner.returned:
+	case <-time.After(time.Second):
+		t.Fatal("streaming runner did not return a session")
+	}
+	select {
+	case <-setupCtx.entered:
+	case <-time.After(time.Second):
+		t.Fatal("streaming setup did not reach the send boundary")
+	}
+	server.mu.Lock()
+	registered := server.sessions[conversationID] != nil
+	server.mu.Unlock()
+	if !registered {
+		t.Fatal("streaming session was not registered before stop")
+	}
+
+	stopped := httptest.NewRecorder()
+	server.routes().ServeHTTP(stopped, httptest.NewRequest(http.MethodPost, "/api/runs/"+runID+"/stop", nil))
+	if stopped.Code != http.StatusAccepted {
+		t.Fatalf("stop setup status=%d body=%s", stopped.Code, stopped.Body.String())
+	}
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stop did not cancel the setup context")
+	}
+	close(setupCtx.release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled streaming setup did not finish")
+	}
+	if got := session.queuedCount(); got != 0 {
+		t.Fatalf("cancelled setup sent %d prompt(s)", got)
+	}
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("session returned during cancelled setup was not stopped")
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from runs where id=?`, runID).Scan(&status); err != nil {
+		t.Fatalf("load run status: %v", err)
+	}
+	if status != "stopped" {
+		t.Fatalf("run status=%q, want stopped", status)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.mu.Lock()
+		_, sessionRegistered := server.sessions[conversationID]
+		_, setupRegistered := server.streamingSetups[runID]
+		server.mu.Unlock()
+		if !sessionRegistered && !setupRegistered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cancelled setup leaked session=%v setup=%v", sessionRegistered, setupRegistered)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestStoppedClaudeSessionDoesNotStartQueuedTurnAfterResult(t *testing.T) {
 	currentSink := &turnRecordingSink{}
 	nextSink := &turnRecordingSink{}
@@ -1017,7 +2208,7 @@ func TestCloseMarksStreamingRunsStopped(t *testing.T) {
 		t.Fatalf("insert conversation: %v", err)
 	}
 	scriptPath := filepath.Join(t.TempDir(), "fake-long-running-claude")
-	script := "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\nIFS= read -r line\nwhile :; do sleep 1; done\n"
+	script := "#!/bin/sh\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then exit 0; fi\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\nIFS= read -r line\nwhile :; do sleep 1; done\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake Claude CLI: %v", err)
 	}
@@ -1443,6 +2634,399 @@ func TestTaskCreationValidatesInput(t *testing.T) {
 	createTaskForTest(t, handler, "project", "Create UI")
 }
 
+func TestMigrateTasksRemovesLegacyExecutionModeColumn(t *testing.T) {
+	server := newTestServer(t)
+	if _, err := server.db.Exec(`alter table tasks add column execution_mode text not null default 'manual'`); err != nil {
+		t.Fatalf("add legacy execution mode: %v", err)
+	}
+	if err := server.migrateTasks(context.Background()); err != nil {
+		t.Fatalf("remove legacy execution mode: %v", err)
+	}
+	rows, err := server.db.Query(`pragma table_info(tasks)`)
+	if err != nil {
+		t.Fatalf("inspect task schema: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("read task schema: %v", err)
+		}
+		if name == "execution_mode" {
+			t.Fatal("legacy execution_mode column remains")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate task schema: %v", err)
+	}
+}
+
+func TestTaskExposesActiveOrchestrationReviewStatus(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	taskID := createTaskForTest(t, server.routes(), "project", "Review visibility")
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job','project',?,1,'checking',9,'{}',?,?)`, taskID, now, now); err != nil {
+		t.Fatalf("insert checking job: %v", err)
+	}
+	task, err := server.taskByID(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if task.OrchestrationStatus != "checking" || task.OrchestrationUpdatedAt == nil {
+		t.Fatalf("orchestration visibility status=%q updated=%v", task.OrchestrationStatus, task.OrchestrationUpdatedAt)
+	}
+
+	stop := server.keepOrchestrationReviewAlive(context.Background(), OrchestrationJob{ID: "job", TaskID: taskID, LeaseToken: 9})
+	stop()
+	var updated time.Time
+	if err := server.db.QueryRow(`select updated_at from task_orchestration_jobs where id='job'`).Scan(&updated); err != nil {
+		t.Fatalf("load review heartbeat: %v", err)
+	}
+	if updated.Before(now) {
+		t.Fatalf("heartbeat did not update review activity: %s before %s", updated, now)
+	}
+}
+
+func TestAutomaticOrchestrationIntegratesVerifiedTaskToDev(t *testing.T) {
+	server := newTestServer(t)
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test User"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "README.md"}, {"commit", "-m", "baseline"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, repo, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle',0,1,?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	server.runner = runnerFunc(func(_ context.Context, request AgentRunRequest, sink AgentRunSink) error {
+		if strings.Contains(request.Prompt, "独立代码审查") {
+			sink.AssistantText(`{"verdict":"pass","blockingFindings":[],"nonBlockingFindings":[],"acceptanceCoverage":["implemented"],"testGaps":[],"reviewedCommit":"`+mustGitHead(t, request.ProjectPath)+`"}`, "")
+			return nil
+		}
+		return os.WriteFile(filepath.Join(request.ProjectPath, "implemented.txt"), []byte("done\n"), 0o600)
+	})
+	_, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values ('project',1,'main','dev','["test -f README.md"]',3,'',?)`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := createTaskForTest(t, server.routes(), "project", "Implement file")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/enqueue", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("enqueue: %d body=%s", response.Code, response.Body.String())
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var status string
+	for time.Now().Before(deadline) {
+		if err := server.db.QueryRow(`select status from task_orchestration_jobs where task_id=?`, taskID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == "integrated_to_dev" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if status != "integrated_to_dev" {
+		var reason string
+		_ = server.db.QueryRow(`select last_error from task_orchestration_jobs where task_id=?`, taskID).Scan(&reason)
+		t.Fatalf("job status=%q reason=%q", status, reason)
+	}
+	output, err := server.gitOutput(context.Background(), repo, "show", "dev:implemented.txt")
+	if err != nil || strings.TrimSpace(output) != "done" {
+		t.Fatalf("dev integration missing implementation: output=%q err=%v", output, err)
+	}
+}
+
+func TestAutomaticOrchestrationDoesNotAdvanceDevWhenIntegrationVerificationFails(t *testing.T) {
+	server := newTestServer(t)
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test User"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "README.md"}, {"commit", "-m", "baseline"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	baseline := mustGitHead(t, repo)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, repo, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle',0,1,?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	server.runner = runnerFunc(func(_ context.Context, request AgentRunRequest, sink AgentRunSink) error {
+		if strings.Contains(request.Prompt, "独立代码审查") {
+			sink.AssistantText(`{"verdict":"pass","blockingFindings":[],"nonBlockingFindings":[],"acceptanceCoverage":["implemented"],"testGaps":[],"reviewedCommit":"`+mustGitHead(t, request.ProjectPath)+`"}`, "")
+			return nil
+		}
+		return os.WriteFile(filepath.Join(request.ProjectPath, "implemented.txt"), []byte("done\n"), 0o600)
+	})
+	// The project and task worktrees are on named branches, while the integration
+	// worktree is intentionally detached. This isolates the integration phase.
+	_, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values ('project',1,'main','dev','["git branch --show-current | grep -q ."]',1,'',?)`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := createTaskForTest(t, server.routes(), "project", "Integration check must protect dev")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/enqueue", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("enqueue: %d body=%s", response.Code, response.Body.String())
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var status string
+	for time.Now().Before(deadline) {
+		if err := server.db.QueryRow(`select status from task_orchestration_jobs where task_id=?`, taskID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == orchestrationNeedsHuman {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if status != orchestrationNeedsHuman {
+		t.Fatalf("job status=%q, want %q", status, orchestrationNeedsHuman)
+	}
+	dev, err := server.gitOutput(context.Background(), repo, "rev-parse", "dev")
+	if err != nil {
+		t.Fatalf("read dev after failed integration verification: %v", err)
+	}
+	if strings.TrimSpace(dev) != baseline {
+		t.Fatalf("failed integration verification advanced dev: got=%s want=%s", strings.TrimSpace(dev), baseline)
+	}
+}
+
+func TestOrchestrationResumeClearsProjectFreeze(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Resume blocked orchestration")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,0,'main','dev','[]',3,'verification failed',?)`, projectID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'needs_human',7,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/resume", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("resume: %d body=%s", response.Code, response.Body.String())
+	}
+	var status, frozen string
+	if err := server.db.QueryRow(`select status from task_orchestration_jobs where id='job'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.db.QueryRow(`select frozen_reason from project_orchestration_configs where project_id=?`, projectID).Scan(&frozen); err != nil {
+		t.Fatal(err)
+	}
+	if status != orchestrationQueued || frozen != "" {
+		t.Fatalf("resume must unfreeze the queue: status=%q frozen=%q", status, frozen)
+	}
+}
+
+func TestOrchestrationResumeMakesNeedsHumanTaskDispatchable(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Resume checking task")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,0,'main','dev','[]',3,'test failed',?)`, projectID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,last_error,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'needs_human',7,'test failed','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/resume", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("resume: %d body=%s", response.Code, response.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskActionRequired)
+}
+
+func TestOrchestrationDependencyAcceptsIntegratedPredecessor(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	predecessorID := createTaskForTest(t, server.routes(), projectID, "Integrated predecessor")
+	dependentID := createTaskForTest(t, server.routes(), projectID, "Dependent task")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_dependencies (task_id,predecessor_task_id,created_at) values (?,?,?)`, dependentID, predecessorID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, predecessorID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('predecessor-job',?,?,1,'integrated_to_dev','{}',?,?)`, projectID, predecessorID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,integration_sha,created_at,updated_at) values ('predecessor-job','base','task/predecessor','','integrated',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	err = server.validateTaskDispatchTx(context.Background(), tx, TaskRun{TaskID: dependentID, ConversationID: conversationID}, Conversation{ProjectID: projectID, ID: conversationID}, true)
+	if err != nil {
+		t.Fatalf("integrated predecessor should unblock orchestrated task: %v", err)
+	}
+}
+
+func TestOrchestrationRejectsStaleLeaseStateWrites(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Fence stale worker")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,0,'main','dev','[]',3,'',?)`, projectID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'implementing',9,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	stale := OrchestrationJob{ID: "job", ProjectID: projectID, TaskID: taskID, LeaseToken: 8}
+	if err := server.advanceOrchestrationJob(context.Background(), stale, orchestrationImplementing, orchestrationChecking); err == nil {
+		t.Fatal("stale lease unexpectedly advanced the job")
+	}
+	server.failOrchestrationJob(context.Background(), stale, errors.New("stale failure"))
+	var status, frozen string
+	if err := server.db.QueryRow(`select status from task_orchestration_jobs where id='job'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.db.QueryRow(`select frozen_reason from project_orchestration_configs where project_id=?`, projectID).Scan(&frozen); err != nil {
+		t.Fatal(err)
+	}
+	if status != orchestrationImplementing || frozen != "" {
+		t.Fatalf("stale lease wrote state: status=%q frozen=%q", status, frozen)
+	}
+}
+
+func TestOrchestrationLeaseAssertionRenewsCurrentLease(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Renew orchestration lease")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'preparing',9,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	expires := now.Add(time.Minute)
+	if _, err := server.db.Exec(`insert into project_orchestration_leases (project_id,token,owner_id,expires_at,updated_at) values (?,?,?,?,?)`, projectID, 9, server.orchestrationOwner, expires, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.assertOrchestrationLease(context.Background(), OrchestrationJob{ID: "job", ProjectID: projectID, LeaseToken: 9}); err != nil {
+		t.Fatalf("assert current lease: %v", err)
+	}
+	var renewed time.Time
+	if err := server.db.QueryRow(`select expires_at from project_orchestration_leases where project_id=?`, projectID).Scan(&renewed); err != nil {
+		t.Fatal(err)
+	}
+	if !renewed.After(now) {
+		t.Fatalf("lease was not renewed: original=%s renewed=%s", expires, renewed)
+	}
+}
+
+func TestReleaseOrchestrationLeasesClearsOnlyCurrentOwner(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into project_orchestration_leases (project_id,token,owner_id,expires_at,updated_at) values (?,?,?,?,?)`, projectID, 9, server.orchestrationOwner, now.Add(time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+	server.releaseOrchestrationLeases()
+	var owner string
+	var expires sql.NullTime
+	if err := server.db.QueryRow(`select owner_id,expires_at from project_orchestration_leases where project_id=?`, projectID).Scan(&owner, &expires); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "" || expires.Valid {
+		t.Fatalf("lease was not released: owner=%q expires=%v", owner, expires)
+	}
+}
+
+func TestReleaseSnapshotBranchIsScopedToProject(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	for _, projectID := range []string{"project-a", "project-b"} {
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, t.TempDir(), "wsl-local", "main", true, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, item := range []struct{ id, projectID string }{{"release-a", "project-a"}, {"release-b", "project-b"}} {
+		if _, err := server.db.Exec(`insert into release_snapshots (id,project_id,dev_sha,branch,status,created_at) values (?,?,?,'release/same','awaiting_main',?)`, item.id, item.projectID, "same", now); err != nil {
+			t.Fatalf("insert release snapshot for %s: %v", item.projectID, err)
+		}
+	}
+}
+
+func TestReleaseSnapshotMigrationScopesLegacyBranchConstraint(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	for _, projectID := range []string{"project-a", "project-b"} {
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, t.TempDir(), "wsl-local", "main", true, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := server.db.Exec(`drop table release_snapshots;
+create table release_snapshots (
+	id text primary key,
+	project_id text not null references projects(id) on delete cascade,
+	dev_sha text not null,
+	branch text not null unique,
+	status text not null,
+	created_at datetime not null,
+	confirmed_at datetime
+);`); err != nil {
+		t.Fatalf("create legacy release schema: %v", err)
+	}
+	if err := server.migrateReleaseSnapshotBranchScope(context.Background()); err != nil {
+		t.Fatalf("migrate legacy release schema: %v", err)
+	}
+	for _, item := range []struct{ id, projectID string }{{"release-a", "project-a"}, {"release-b", "project-b"}} {
+		if _, err := server.db.Exec(`insert into release_snapshots (id,project_id,dev_sha,branch,status,created_at) values (?,?,?,'release/same','awaiting_main',?)`, item.id, item.projectID, "same", now); err != nil {
+			t.Fatalf("migrated release schema rejected %s: %v", item.projectID, err)
+		}
+	}
+}
+
+func mustGitHead(t *testing.T, repo string) string {
+	t.Helper()
+	command := exec.Command("git", "rev-parse", "HEAD")
+	command.Dir = repo
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("read git head: %v", err)
+	}
+	return strings.TrimSpace(string(output))
+}
+
 func TestListTasksLoadsWithSingleSQLiteConnection(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	createTaskForTest(t, server.routes(), projectID, "Load task board")
@@ -1517,7 +3101,7 @@ func TestTaskDispatchCreatesSnapshotAndWaitsForReviewAfterRunCompletion(t *testi
 	}
 }
 
-func TestTaskChangeRequestCancelAndReopenFollowStateRules(t *testing.T) {
+func TestTaskChangeRequestAndReopenFollowStateRules(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Review task behavior")
 	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
@@ -1532,10 +3116,12 @@ func TestTaskChangeRequestCancelAndReopenFollowStateRules(t *testing.T) {
 
 	cancel := httptest.NewRecorder()
 	server.routes().ServeHTTP(cancel, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/cancel", nil))
-	if cancel.Code != http.StatusOK {
-		t.Fatalf("cancel task status: %d body=%s", cancel.Code, cancel.Body.String())
+	if cancel.Code != http.StatusNotFound {
+		t.Fatalf("cancel task route status: %d body=%s", cancel.Code, cancel.Body.String())
 	}
-	assertTaskStatus(t, server, taskID, taskCancelled)
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskDone, taskID); err != nil {
+		t.Fatalf("prepare completed task for reopen: %v", err)
+	}
 
 	reopen := httptest.NewRecorder()
 	server.routes().ServeHTTP(reopen, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/reopen", nil))
@@ -1548,6 +3134,20 @@ func TestTaskChangeRequestCancelAndReopenFollowStateRules(t *testing.T) {
 	server.routes().ServeHTTP(invalid, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/reopen", nil))
 	if invalid.Code != http.StatusConflict {
 		t.Fatalf("reopen todo task status: %d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestTaskAwaitingReviewCannotBeDispatchedUntilChangesAreRequested(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Review before redispatch")
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
+		t.Fatalf("prepare task for review: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dispatch", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("dispatch awaiting-review task status: %d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -1782,6 +3382,35 @@ func seedTaskConversation(t *testing.T) (*Server, string, string) {
 	return server, projectID, conversationID
 }
 
+func TestOrchestrationDispatchLinksIntentAndRunInOneTransaction(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	taskID := createTaskForTest(t, server.routes(), projectID, "intent linkage")
+	var projectPath string
+	if err := server.db.QueryRow(`select path from projects where id=?`, projectID).Scan(&projectPath); err != nil {
+		t.Fatalf("load project path: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,attempt,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'preparing',1,1,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatalf("insert job: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_execution_intents (id,job_id,phase,attempt,status,created_at,updated_at) values ('intent','job','implementation',1,'pending',?,?)`, now, now); err != nil {
+		t.Fatalf("insert intent: %v", err)
+	}
+
+	result, status, err := server.dispatchTaskByIDInWorkspaceWithExecutionIntent(context.Background(), taskID, projectPath, "", "intent")
+	if err != nil || status != http.StatusAccepted {
+		t.Fatalf("dispatch result=%#v status=%d err=%v", result, status, err)
+	}
+	var runID, intentStatus string
+	if err := server.db.QueryRow(`select run_id,status from task_execution_intents where id='intent'`).Scan(&runID, &intentStatus); err != nil {
+		t.Fatalf("load intent: %v", err)
+	}
+	if runID != result.RunID || intentStatus != "started" {
+		t.Fatalf("intent linkage: run=%q status=%q result=%q", runID, intentStatus, result.RunID)
+	}
+}
+
 func assertTaskStatus(t *testing.T, server *Server, taskID, want string) {
 	t.Helper()
 	var status string
@@ -2000,6 +3629,37 @@ func TestGitValidationRejectsSpecialRefAndPathspec(t *testing.T) {
 	}
 	if err := validateGitPath(":(top)"); err == nil {
 		t.Fatal("Git pathspec magic was accepted")
+	}
+}
+
+func TestGitStageTreatsShortMagicFileNamesLiterally(t *testing.T) {
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "baseline.txt", "baseline\n")
+	runGitForTest(t, repo, "add", "baseline.txt")
+	runGitForTest(t, repo, "commit", "-m", "baseline")
+	writeGitTestFile(t, repo, "ordinary.txt", "ordinary\n")
+	writeGitTestFile(t, repo, ":!excluded.txt", "special\n")
+	runGitForTest(t, repo, "add", "ordinary.txt")
+
+	if err := newGitRunner().(*gitCLIRunner).Stage(context.Background(), repo, []string{":!excluded.txt"}); err != nil {
+		t.Fatalf("stage literal short-magic filename: %v", err)
+	}
+	staged, err := newGitRunner().(*gitCLIRunner).command(context.Background(), repo, "diff", "--cached", "--name-only")
+	if err != nil {
+		t.Fatalf("read staged paths: %v", err)
+	}
+	if string(staged) != ":!excluded.txt\nordinary.txt\n" {
+		t.Fatalf("staged paths=%q, want both literal selected and ordinary filenames", staged)
+	}
+	if err := newGitRunner().(*gitCLIRunner).Unstage(context.Background(), repo, []string{":!excluded.txt"}); err != nil {
+		t.Fatalf("unstage literal short-magic filename: %v", err)
+	}
+	staged, err = newGitRunner().(*gitCLIRunner).command(context.Background(), repo, "diff", "--cached", "--name-only")
+	if err != nil {
+		t.Fatalf("read staged paths after unstage: %v", err)
+	}
+	if string(staged) != "ordinary.txt\n" {
+		t.Fatalf("staged paths after unstage=%q, want the ordinary filename to remain staged", staged)
 	}
 }
 
@@ -2436,6 +4096,93 @@ func TestTaskUpdatePositionReorderPreservesOtherFields(t *testing.T) {
 	}
 }
 
+func TestTaskUpdatePositionAllowsZero(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Move to first position")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Move to first position","description":"Implement Move to first position safely.","acceptanceCriteria":"Tests cover Move to first position.","priority":"normal","position":0}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("move task to position zero: %d body=%s", response.Code, response.Body.String())
+	}
+	var position float64
+	if err := server.db.QueryRow(`select position from tasks where id=?`, taskID).Scan(&position); err != nil {
+		t.Fatalf("read task position: %v", err)
+	}
+	if position != 0 {
+		t.Fatalf("expected position 0, got %v", position)
+	}
+}
+
+func TestDeleteTaskRemovesTerminalTask(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Delete me")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/tasks/"+taskID, nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete task: %d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskID, nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("deleted task lookup: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCancelledTaskCanOnlyBeDeleted(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Legacy cancelled task")
+	dependentID := createTaskForTest(t, server.routes(), projectID, "Task depending on cancelled task")
+	if _, err := server.db.Exec(`update tasks set status=?,cancelled_at=? where id=?`, taskCancelled, time.Now().UTC(), taskID); err != nil {
+		t.Fatalf("prepare legacy cancelled task: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_dependencies (task_id,predecessor_task_id,created_at) values (?,?,?)`, dependentID, taskID, time.Now().UTC()); err != nil {
+		t.Fatalf("add dependent task: %v", err)
+	}
+
+	reopen := httptest.NewRecorder()
+	server.routes().ServeHTTP(reopen, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/reopen", nil))
+	if reopen.Code != http.StatusConflict {
+		t.Fatalf("reopen cancelled task: %d body=%s", reopen.Code, reopen.Body.String())
+	}
+
+	update := httptest.NewRecorder()
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+taskID, bytes.NewBufferString(`{"title":"Legacy cancelled task","description":"Updated description","acceptanceCriteria":"","priority":"normal"}`)))
+	if update.Code != http.StatusConflict {
+		t.Fatalf("update cancelled task: %d body=%s", update.Code, update.Body.String())
+	}
+
+	addDependency := httptest.NewRecorder()
+	server.routes().ServeHTTP(addDependency, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dependencies", bytes.NewBufferString(`{"predecessorTaskId":"`+dependentID+`"}`)))
+	if addDependency.Code != http.StatusConflict {
+		t.Fatalf("add dependency to cancelled task: %d body=%s", addDependency.Code, addDependency.Body.String())
+	}
+
+	replaceDependencies := httptest.NewRecorder()
+	server.routes().ServeHTTP(replaceDependencies, httptest.NewRequest(http.MethodPut, "/api/tasks/"+taskID+"/dependencies", bytes.NewBufferString(`{"predecessorTaskIds":[]}`)))
+	if replaceDependencies.Code != http.StatusConflict {
+		t.Fatalf("replace dependencies on cancelled task: %d body=%s", replaceDependencies.Code, replaceDependencies.Body.String())
+	}
+
+	deleteDependency := httptest.NewRecorder()
+	server.routes().ServeHTTP(deleteDependency, httptest.NewRequest(http.MethodDelete, "/api/tasks/"+taskID+"/dependencies/"+dependentID, nil))
+	if deleteDependency.Code != http.StatusConflict {
+		t.Fatalf("delete dependency from cancelled task: %d body=%s", deleteDependency.Code, deleteDependency.Body.String())
+	}
+
+	deleteResponse := httptest.NewRecorder()
+	server.routes().ServeHTTP(deleteResponse, httptest.NewRequest(http.MethodDelete, "/api/tasks/"+taskID, nil))
+	if deleteResponse.Code != http.StatusNoContent {
+		t.Fatalf("delete cancelled task: %d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	var dependencyCount int
+	if err := server.db.QueryRow(`select count(*) from task_dependencies where task_id=? or predecessor_task_id=?`, taskID, taskID).Scan(&dependencyCount); err != nil {
+		t.Fatalf("count removed dependencies: %v", err)
+	}
+	if dependencyCount != 0 {
+		t.Fatalf("expected deleted task dependencies to be removed, got %d", dependencyCount)
+	}
+}
+
 func TestTaskUpdateStatusDoesNotAffectUnrelatedFields(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Keep description intact")
@@ -2509,5 +4256,627 @@ func TestParseContentPartsInvalidJSON(t *testing.T) {
 	parts := parseContentParts(raw)
 	if len(parts) != 0 {
 		t.Fatalf("expected empty for invalid JSON, got %v", parts)
+	}
+}
+
+func TestProjectRunnerStartStop(t *testing.T) {
+	var broadcasted []LogEntry
+	var mu sync.Mutex
+	broadcast := func(e LogEntry) {
+		mu.Lock()
+		broadcasted = append(broadcasted, e)
+		mu.Unlock()
+	}
+
+	tmpDir := t.TempDir()
+	runner := newProjectRunner("test-project", "", "echo hello && sleep 3600", nil, broadcast)
+
+	err := runner.Start(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	hasHello := false
+	hasStarted := false
+	for _, e := range broadcasted {
+		if strings.Contains(e.Text, "hello") {
+			hasHello = true
+		}
+		if strings.Contains(e.Text, "进程已启动") {
+			hasStarted = true
+		}
+	}
+	mu.Unlock()
+
+	if !hasStarted {
+		t.Fatal("expected process started system message")
+	}
+	if !hasHello {
+		t.Fatal("expected hello in stdout")
+	}
+
+	snapshot := runner.StatusSnapshot()
+	if snapshot.Status != RunStatusRunning {
+		t.Fatalf("expected running, got %s", snapshot.Status)
+	}
+
+	if err := runner.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	snapshot = runner.StatusSnapshot()
+	if snapshot.Status != RunStatusStopped {
+		t.Fatalf("expected stopped after manual stop, got %s", snapshot.Status)
+	}
+}
+
+func TestProjectRunnerRejectedStartKeepsCurrentConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalEnv := map[string]string{"PORT": "3000"}
+	runner := newProjectRunner("test-project", "", "sleep 3600", originalEnv, func(LogEntry) {})
+	if err := runner.Start(context.Background(), tmpDir); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		if runner.StatusSnapshot().Status == RunStatusRunning {
+			_ = runner.Stop()
+		}
+	})
+
+	if err := runner.StartWithConfig(context.Background(), tmpDir, "other", "echo replaced", map[string]string{"PORT": "4000"}); err == nil {
+		t.Fatal("expected a second start to be rejected")
+	}
+
+	runner.mu.RLock()
+	workDir, command, port := runner.workDir, runner.command, runner.envVars["PORT"]
+	runner.mu.RUnlock()
+	if workDir != "" || command != "sleep 3600" || port != "3000" {
+		t.Fatalf("rejected start changed configuration: workDir=%q command=%q PORT=%q", workDir, command, port)
+	}
+}
+
+func TestProjectRunnerPathEscape(t *testing.T) {
+	runner := newProjectRunner("test", "../../etc", "echo bad", nil, func(e LogEntry) {})
+	err := runner.Start(context.Background(), "/tmp/test-project")
+	if err == nil {
+		t.Fatal("expected error for path escape")
+	}
+	if !strings.Contains(err.Error(), "工作目录不能超出项目路径") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProjectRunnerRejectsSymlinkWorkDirEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic link setup requires elevated privileges on Windows")
+	}
+	projectPath := t.TempDir()
+	outsidePath := t.TempDir()
+	if err := os.Symlink(outsidePath, filepath.Join(projectPath, "outside")); err != nil {
+		t.Fatalf("create symbolic link: %v", err)
+	}
+	runner := newProjectRunner("test", "outside", "echo bad", nil, func(LogEntry) {})
+	err := runner.Start(context.Background(), projectPath)
+	if err == nil || !strings.Contains(err.Error(), "工作目录不能超出项目路径") {
+		t.Fatalf("expected symbolic-link escape rejection, got %v", err)
+	}
+
+	err = validateProjectRunConfig(Project{Path: projectPath}, RunConfig{WorkDir: "outside", Command: "echo bad"})
+	if err == nil || !strings.Contains(err.Error(), "工作目录不能超出项目路径") {
+		t.Fatalf("expected symbolic-link config rejection, got %v", err)
+	}
+}
+
+func TestServerCloseStopsHTTPListener(t *testing.T) {
+	server := newTestServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve listener: %v", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release listener: %v", err)
+	}
+
+	listenDone := make(chan error, 1)
+	go func() { listenDone <- server.Listen(addr) }()
+	deadline := time.Now().Add(time.Second)
+	listening := false
+	for time.Now().Before(deadline) {
+		client := &http.Client{Timeout: 100 * time.Millisecond}
+		response, err := client.Get("http://" + addr + "/api/health")
+		if err == nil {
+			response.Body.Close()
+			listening = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !listening {
+		t.Fatal("HTTP server did not start listening")
+	}
+
+	server.Close()
+	select {
+	case err := <-listenDone:
+		if err != nil {
+			t.Fatalf("listener returned an unexpected error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener did not stop after server close")
+	}
+}
+
+func TestProjectRunnerRingBuffer(t *testing.T) {
+	rb := newRingBuffer(3)
+	now := time.Now()
+	rb.Append(LogEntry{Timestamp: now, Stream: "stdout", Text: "1"})
+	rb.Append(LogEntry{Timestamp: now, Stream: "stdout", Text: "2"})
+	rb.Append(LogEntry{Timestamp: now, Stream: "stdout", Text: "3"})
+	rb.Append(LogEntry{Timestamp: now, Stream: "stdout", Text: "4"})
+
+	recent := rb.Recent(3)
+	if len(recent) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(recent))
+	}
+	if recent[0].Text != "2" || recent[1].Text != "3" || recent[2].Text != "4" {
+		t.Fatalf("unexpected order: %v", recent)
+	}
+}
+
+func TestProjectRunnerBoundsLogTextAndAssignsSequenceIDs(t *testing.T) {
+	runner := newProjectRunner("logs", "", "", nil, func(LogEntry) {})
+	runner.emitLog(LogEntry{Timestamp: time.Now(), Stream: "stdout", Text: "first"})
+	runner.emitLog(LogEntry{Timestamp: time.Now(), Stream: "stderr", Text: strings.Repeat("好", projectRunLogMaxTextBytes)})
+
+	logs := runner.logBuf.Recent(2)
+	if len(logs) != 2 || logs[0].ID != 1 || logs[1].ID != 2 {
+		t.Fatalf("expected ordered log IDs 1 and 2, got %#v", logs)
+	}
+	if len(logs[1].Text) > projectRunLogMaxTextBytes || !strings.HasSuffix(logs[1].Text, "... [truncated]") {
+		t.Fatalf("log text was not bounded: bytes=%d text=%q", len(logs[1].Text), logs[1].Text)
+	}
+}
+
+func TestBroadcastRunLogDoesNotBlockOnFullSubscriberQueue(t *testing.T) {
+	server := newTestServer(t)
+	sub := &runLogSubscriber{send: make(chan LogEntry, 1)}
+	sub.send <- LogEntry{ID: 1}
+	server.runLogSubMu.Lock()
+	server.runLogSubscribers["project"] = map[*websocket.Conn]*runLogSubscriber{nil: sub}
+	server.runLogSubMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		server.broadcastRunLog("project", LogEntry{ID: 2})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("broadcast blocked on a full subscriber queue")
+	}
+	server.runLogSubMu.Lock()
+	_, registered := server.runLogSubscribers["project"][nil]
+	server.runLogSubMu.Unlock()
+	if registered {
+		t.Fatal("slow subscriber should be removed")
+	}
+}
+
+func TestConversationEventDoesNotBlockOnFullSubscriberQueue(t *testing.T) {
+	server := newTestServer(t)
+	sub := &subscriber{send: make(chan []byte, 1)}
+	sub.send <- []byte("already queued")
+	server.mu.Lock()
+	server.subscribers["conversation"] = map[*websocket.Conn]*subscriber{nil: sub}
+	server.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		server.enqueueConversationEvent("conversation", []byte("next event"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("conversation broadcast blocked on a full subscriber queue")
+	}
+	server.mu.Lock()
+	_, registered := server.subscribers["conversation"][nil]
+	server.mu.Unlock()
+	if registered {
+		t.Fatal("slow conversation subscriber should be removed")
+	}
+	<-sub.send // The pre-existing buffered event remains readable after close.
+	select {
+	case _, ok := <-sub.send:
+		if ok {
+			t.Fatal("slow conversation subscriber queue should be closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow conversation subscriber queue was not closed")
+	}
+}
+
+func TestRunLogSubscriptionReplaysHistoryBeforeLiveEntries(t *testing.T) {
+	server := newTestServer(t)
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), time.Now().UTC()); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	runner := newProjectRunner("project", "", "", nil, func(entry LogEntry) { server.broadcastRunLog("project", entry) })
+	server.runManagersMu.Lock()
+	server.runManagers["project"] = runner
+	server.runManagersMu.Unlock()
+	runner.emitLog(LogEntry{Timestamp: time.Now(), Stream: "stdout", Text: "history"})
+
+	sub := &runLogSubscriber{send: make(chan LogEntry, runLogSubscriberQueueSize)}
+	if !server.registerRunLogSubscriber(context.Background(), "project", sub) {
+		t.Fatal("register run log subscriber")
+	}
+	runner.emitLog(LogEntry{Timestamp: time.Now(), Stream: "stdout", Text: "live"})
+	first := <-sub.send
+	second := <-sub.send
+	sub.close()
+	if first.ID != 1 || second.ID != 2 || first.Text != "history" || second.Text != "live" {
+		t.Fatalf("unexpected subscription order: %#v, %#v", first, second)
+	}
+}
+
+func TestProjectRunnerRetireStopsAndRejectsStart(t *testing.T) {
+	tmpDir := t.TempDir()
+	runner := newProjectRunner("retired-project", "", "sleep 3600", nil, func(LogEntry) {})
+	if err := runner.Start(context.Background(), tmpDir); err != nil {
+		t.Fatalf("start runner: %v", err)
+	}
+	if err := runner.Retire(); err != nil {
+		t.Fatalf("retire runner: %v", err)
+	}
+	if status := runner.StatusSnapshot().Status; status != RunStatusStopped && status != RunStatusFailed {
+		t.Fatalf("retired runner still active: %s", status)
+	}
+	if err := runner.Start(context.Background(), tmpDir); err == nil {
+		t.Fatal("expected retired runner to reject a new start")
+	}
+}
+
+// seedServerWithProject 创建带有一个项目的 Server 用于测试。
+func seedServerWithProject(t *testing.T) (*Server, string) {
+	t.Helper()
+	rootPath := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	config := Config{
+		DatabasePath:   dbPath,
+		AllowedRoot:    rootPath,
+		ClaudePath:     "echo",
+		PermissionMode: "acceptEdits",
+		ControlURL:     "http://127.0.0.1:8080",
+	}
+	ctx := context.Background()
+	server, err := NewWithRunner(ctx, config, runnerFunc(func(ctx context.Context, req AgentRunRequest, sink AgentRunSink) error {
+		sink.Event("result", json.RawMessage(`{"status":"completed"}`))
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	t.Cleanup(func() { server.Close() })
+
+	projectPath := filepath.Join(rootPath, "test-project")
+	os.MkdirAll(filepath.Join(projectPath, ".git"), 0755)
+	body := fmt.Sprintf(`{"path":"%s","name":"test-project","runner":"wsl-local"}`, projectPath)
+	req := httptest.NewRequest(http.MethodPost, "/api/projects", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated && resp.Code != http.StatusOK {
+		t.Fatalf("create project: %d body=%s", resp.Code, resp.Body.String())
+	}
+	var project Project
+	json.NewDecoder(resp.Body).Decode(&project)
+	return server, project.ID
+}
+
+func TestRunConfigCRUD(t *testing.T) {
+	server, projectID := seedServerWithProject(t)
+
+	// 初始状态：无配置
+	resp := httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/run/config", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("get config: %d", resp.Code)
+	}
+
+	// 保存配置
+	body := bytes.NewBufferString(`{"workDir":"","command":"npm run dev","envVars":{"PORT":"3000"}}`)
+	resp = httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", body))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("put config: %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	// 验证已保存
+	resp = httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/run/config", nil))
+	var cfg RunConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if cfg.Command != "npm run dev" {
+		t.Fatalf("expected npm run dev, got %q", cfg.Command)
+	}
+	if cfg.EnvVars["PORT"] != "3000" {
+		t.Fatalf("expected PORT=3000, got %v", cfg.EnvVars)
+	}
+}
+
+func TestRunConfigRejectsInvalidEnvironmentVariables(t *testing.T) {
+	server, projectID := seedServerWithProject(t)
+	for name, body := range map[string]string{
+		"empty key":     `{"workDir":"","command":"npm run dev","envVars":{"":"3000"}}`,
+		"equals in key": `{"workDir":"","command":"npm run dev","envVars":{"PORT=DEV":"3000"}}`,
+		"NUL in value":  `{"workDir":"","command":"npm run dev","envVars":{"PORT":"3000\u0000"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", bytes.NewBufferString(body)))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestProjectRunEndpointsRejectMissingProject(t *testing.T) {
+	server := newTestServer(t)
+	for _, test := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{method: http.MethodGet, path: "/api/projects/missing/run/config"},
+		{method: http.MethodPut, path: "/api/projects/missing/run/config", body: `{"command":"echo test"}`},
+		{method: http.MethodGet, path: "/api/projects/missing/run/status"},
+		{method: http.MethodPost, path: "/api/projects/missing/run/stop"},
+	} {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(test.method, test.path, strings.NewReader(test.body)))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("%s %s: expected 404, got %d body=%s", test.method, test.path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestStartStopStatusAPI(t *testing.T) {
+	server, projectID := seedServerWithProject(t)
+
+	// 先保存配置
+	cfgBody := bytes.NewBufferString(`{"workDir":"","command":"echo hello && sleep 3600","envVars":{}}`)
+	resp := httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", cfgBody))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("put config: %d", resp.Code)
+	}
+
+	// 启动
+	resp = httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/run/start", nil))
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("start: %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// 查询状态
+	resp = httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/run/status", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status: %d", resp.Code)
+	}
+	var st RunStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if st.Status != RunStatusRunning {
+		t.Fatalf("expected running, got %s", st.Status)
+	}
+
+	// 停止
+	resp = httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/run/stop", nil))
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("stop: %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// 查询状态
+	resp = httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/run/status", nil))
+	json.NewDecoder(resp.Body).Decode(&st)
+	if st.Status != RunStatusStopped {
+		t.Fatalf("expected stopped after manual stop, got %s", st.Status)
+	}
+}
+
+func TestProjectRunStatusUsesNullForUnavailableLifecycleFields(t *testing.T) {
+	server, projectID := seedServerWithProject(t)
+	handler := server.routes()
+
+	initial := httptest.NewRecorder()
+	handler.ServeHTTP(initial, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/run/status", nil))
+	var initialStatus map[string]any
+	if err := json.NewDecoder(initial.Body).Decode(&initialStatus); err != nil {
+		t.Fatalf("decode initial status: %v", err)
+	}
+	for _, field := range []string{"startedAt", "pid", "exitCode"} {
+		if initialStatus[field] != nil {
+			t.Fatalf("initial %s=%v, want null", field, initialStatus[field])
+		}
+	}
+
+	config := bytes.NewBufferString(`{"workDir":"","command":"sleep 3600","envVars":{}}`)
+	saved := httptest.NewRecorder()
+	handler.ServeHTTP(saved, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", config))
+	if saved.Code != http.StatusOK {
+		t.Fatalf("save config: %d body=%s", saved.Code, saved.Body.String())
+	}
+	started := httptest.NewRecorder()
+	handler.ServeHTTP(started, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/run/start", nil))
+	if started.Code != http.StatusAccepted {
+		t.Fatalf("start: %d body=%s", started.Code, started.Body.String())
+	}
+
+	status := httptest.NewRecorder()
+	handler.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/run/status", nil))
+	var running RunStatusResponse
+	if err := json.NewDecoder(status.Body).Decode(&running); err != nil {
+		t.Fatalf("decode running status: %v", err)
+	}
+	if running.StartedAt == nil || running.PID == nil || running.ExitCode != nil {
+		t.Fatalf("running status=%#v, want startedAt and pid only", running)
+	}
+
+	stopped := httptest.NewRecorder()
+	handler.ServeHTTP(stopped, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/run/stop", nil))
+	if stopped.Code != http.StatusAccepted {
+		t.Fatalf("stop: %d body=%s", stopped.Code, stopped.Body.String())
+	}
+	final := httptest.NewRecorder()
+	handler.ServeHTTP(final, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/run/status", nil))
+	var finished RunStatusResponse
+	if err := json.NewDecoder(final.Body).Decode(&finished); err != nil {
+		t.Fatalf("decode finished status: %v", err)
+	}
+	if finished.StartedAt == nil || finished.PID != nil || finished.ExitCode == nil {
+		t.Fatalf("finished status=%#v, want startedAt and exitCode only", finished)
+	}
+}
+
+func TestDeleteProjectStopsManagedProcess(t *testing.T) {
+	server, projectID := seedServerWithProject(t)
+	config := bytes.NewBufferString(`{"workDir":"","command":"sleep 3600","envVars":{}}`)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", config))
+	if response.Code != http.StatusOK {
+		t.Fatalf("save run config: %d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/run/start", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("start project process: %d body=%s", response.Code, response.Body.String())
+	}
+	server.runManagersMu.RLock()
+	runner := server.runManagers[projectID]
+	server.runManagersMu.RUnlock()
+	if runner == nil {
+		t.Fatal("project runner was not registered")
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID, nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete project: %d body=%s", response.Code, response.Body.String())
+	}
+	if status := runner.StatusSnapshot().Status; status != RunStatusStopped && status != RunStatusFailed {
+		t.Fatalf("project process still active after deletion: %s", status)
+	}
+	server.runManagersMu.RLock()
+	_, remains := server.runManagers[projectID]
+	server.runManagersMu.RUnlock()
+	if remains {
+		t.Fatal("deleted project still has a registered runner")
+	}
+}
+
+func TestProjectRunManagerRejectsDeletedProject(t *testing.T) {
+	server, projectID := seedServerWithProject(t)
+	if _, err := server.db.Exec(`delete from projects where id=?`, projectID); err != nil {
+		t.Fatalf("delete project: %v", err)
+	}
+	if _, err := server.projectRunManagerForExistingProject(context.Background(), projectID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected deleted project to be rejected, got %v", err)
+	}
+	server.runManagersMu.RLock()
+	_, registered := server.runManagers[projectID]
+	server.runManagersMu.RUnlock()
+	if registered {
+		t.Fatal("deleted project created a run manager")
+	}
+}
+
+func TestListProjectsKeepsRemotePresentation(t *testing.T) {
+	server := newTestServer(t)
+	server.runnerRegistry.register("ssh-remote", runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }), RunnerMeta{ID: "ssh-remote", Name: "build-host", Environment: "remote-linux"})
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('remote-project','remote-project','/srv/apps/api','ssh-remote','main',1,?)`, now); err != nil {
+		t.Fatalf("insert remote project: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list projects: %d body=%s", response.Code, response.Body.String())
+	}
+	var projects []Project
+	if err := json.NewDecoder(response.Body).Decode(&projects); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].PathDisplay != "build-host:/srv/apps/api" || projects[0].Environment != "remote-linux" {
+		t.Fatalf("unexpected remote project presentation: %#v", projects)
+	}
+}
+
+func TestProjectsAllowSamePathOnDifferentRunners(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('local','local','/srv/shared/app','wsl-local','main',1,?)`, now); err != nil {
+		t.Fatalf("insert local project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('remote','remote','/srv/shared/app','ssh-remote','main',1,?)`, now); err != nil {
+		t.Fatalf("insert same path on remote runner: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('duplicate','duplicate','/srv/shared/app','ssh-remote','main',1,?)`, now); err == nil {
+		t.Fatal("expected duplicate path on the same runner to be rejected")
+	}
+}
+
+func TestCreateProjectDuplicateUsesSameRunner(t *testing.T) {
+	server, projectID := seedServerWithProject(t)
+	var path string
+	if err := server.db.QueryRow(`select path from projects where id=?`, projectID).Scan(&path); err != nil {
+		t.Fatalf("read project path: %v", err)
+	}
+	if _, err := server.db.Exec(`delete from projects where id=?`, projectID); err != nil {
+		t.Fatalf("remove seeded project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('remote-first','remote',?,'ssh-remote','main',1,?)`, path, time.Now().UTC()); err != nil {
+		t.Fatalf("insert remote project: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"path":%q,"name":"local","runner":"wsl-local"}`, path)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects", bytes.NewBufferString(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create local project: %d body=%s", response.Code, response.Body.String())
+	}
+	var local Project
+	if err := json.NewDecoder(response.Body).Decode(&local); err != nil {
+		t.Fatalf("decode local project: %v", err)
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects", bytes.NewBufferString(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("repeat local project: %d body=%s", response.Code, response.Body.String())
+	}
+	var existing Project
+	if err := json.NewDecoder(response.Body).Decode(&existing); err != nil {
+		t.Fatalf("decode existing project: %v", err)
+	}
+	if existing.ID != local.ID || existing.Runner != "wsl-local" {
+		t.Fatalf("expected existing local project, got %#v", existing)
 	}
 }

@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { priorityLabels, Request, statusLabels, Task, TaskDetail, TaskStatus, Priority, taskDisplayTitle } from "./task-model";
+import { isTaskOrchestrating, priorityLabels, Request, Task, TaskDetail, TaskStatus, Priority, taskDisplayStatus, taskDisplayStatusClass, taskDisplayTitle } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 type EditorState = { task?: Task } | null;
 type ReviewAction = "accept" | "request_changes";
@@ -12,17 +12,33 @@ const columnDefinitions: { id: string; label: string; statuses: TaskStatus[] }[]
   { id: "action_required", label: "需处理", statuses: ["action_required"] },
   { id: "done", label: "已完成", statuses: ["done"] },
 ];
+const historicalCancelledColumn: { id: string; label: string; statuses: TaskStatus[] } = { id: "cancelled", label: "历史已取消", statuses: ["cancelled"] };
 
 type DragData = { taskID: string; sourceColumnID: string; sourceIndex: number };
 type PendingConfirm = { title: string; message: React.ReactNode; danger?: boolean; onConfirm: () => void; onCancel: () => void } | null;
+type ExecutionPolicy = "approval_required" | "full_control" | "read_only" | "workspace_write";
+type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; devBranch: string; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
+type OrchestrationJob = { id: string; taskId: string; position: number; status: string; lastError?: string };
+type ReleaseSnapshot = { id: string; devSha: string; branch: string; status: string; createdAt: string; confirmedAt?: string };
 
-export function TaskBoard({ projectID, initialTaskID, permissionMode, request, fail, close, onDispatched }: { projectID: string; initialTaskID?: string; permissionMode?: "approval_required" | "full_control"; request: Request; fail: (message: string) => void; close: () => void; onDispatched: (message: { id: string; role: "user" | "assistant"; content: string; createdAt: string }, runID: string) => void }) {
+function policyLabel(policy?: ExecutionPolicy): string {
+  if (policy === "full_control") return "完全控制";
+  if (policy === "read_only") return "仅分析";
+  if (policy === "workspace_write") return "项目内执行";
+  return "默认权限";
+}
+
+export function TaskBoard({ projectID, initialTaskID, permissionMode, request, fail, close, onDispatched }: { projectID: string; initialTaskID?: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; close: () => void; onDispatched: (message: { id: string; role: "user" | "assistant"; content: string; createdAt: string }, runID: string) => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [view, setView] = useState<"board" | "list">("board");
-  const [includeCancelled, setIncludeCancelled] = useState(false);
+  const [showHistoricalCancelled, setShowHistoricalCancelled] = useState(false);
   const [editor, setEditor] = useState<EditorState>(null);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [busy, setBusy] = useState("");
+  const [orchestration, setOrchestration] = useState<OrchestrationConfig | null>(null);
+  const [orchestrationJobs, setOrchestrationJobs] = useState<OrchestrationJob[]>([]);
+  const [releaseSnapshots, setReleaseSnapshots] = useState<ReleaseSnapshot[]>([]);
+  const [orchestrationOpen, setOrchestrationOpen] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm>(null);
   const mountedRef = useRef(true);
 
@@ -36,6 +52,10 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     if (mountedRef.current) setTasks(next);
     return next;
   }, [projectID, request]);
+  const loadOrchestration = useCallback(async () => {
+    const [config, jobs, releases] = await Promise.all([request<OrchestrationConfig>(`/api/projects/${projectID}/orchestration/config`), request<OrchestrationJob[]>(`/api/projects/${projectID}/orchestration`), request<ReleaseSnapshot[]>(`/api/projects/${projectID}/orchestration/releases`)]);
+    if (mountedRef.current) { setOrchestration(config); setOrchestrationJobs(jobs); setReleaseSnapshots(releases); }
+  }, [projectID, request]);
 
   const loadDetail = useCallback(async (taskID: string) => {
     const next = await request<TaskDetail>(`/api/tasks/${taskID}`);
@@ -44,10 +64,17 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   }, [request]);
 
   useEffect(() => { void loadTasks().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务"); }); }, [fail, loadTasks]);
+  useEffect(() => { void loadOrchestration().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载自动编排配置"); }); }, [fail, loadOrchestration]);
   useEffect(() => {
     const interval = window.setInterval(() => { void loadTasks().catch(() => undefined); }, 10_000);
     return () => window.clearInterval(interval);
   }, [loadTasks]);
+  useEffect(() => {
+    const hasActiveJob = orchestrationJobs.some((job) => ["queued", "preparing", "implementing", "checking"].includes(job.status));
+    if (!hasActiveJob) return;
+    const interval = window.setInterval(() => { void loadOrchestration().catch(() => undefined); }, 5_000);
+    return () => window.clearInterval(interval);
+  }, [loadOrchestration, orchestrationJobs]);
   useEffect(() => {
     if (!detail) return;
     const taskID = detail.id;
@@ -59,7 +86,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     void loadDetail(initialTaskID).catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务详情"); });
   }, [fail, initialTaskID, loadDetail]);
 
-  const visibleTasks = useMemo(() => includeCancelled ? tasks : tasks.filter((task) => task.status !== "cancelled"), [includeCancelled, tasks]);
+  const visibleTasks = useMemo(() => showHistoricalCancelled ? tasks : tasks.filter((task) => task.status !== "cancelled"), [showHistoricalCancelled, tasks]);
   const openDetail = (taskID: string) => { void loadDetail(taskID).catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务详情"); }); };
   const refresh = async (taskID?: string) => {
     await loadTasks();
@@ -80,42 +107,27 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     finally { if (mountedRef.current) setBusy(""); }
   };
 
-  const transition = async (action: "cancel" | "reopen" | "stop") => {
+  const enqueue = async () => {
+    if (!detail) return;
+    setBusy("enqueue");
+    try {
+      await request(`/api/tasks/${detail.id}/orchestration/enqueue`, { method: "POST", body: "{}" });
+      await Promise.all([refresh(detail.id), loadOrchestration()]);
+    } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加入自动队列"); }
+    finally { if (mountedRef.current) setBusy(""); }
+  };
+
+  const transition = async (action: "reopen" | "stop") => {
     if (!detail) return;
     if (!mountedRef.current) return;
     setBusy(action);
-    const doTransition = async (force: boolean) => {
-      const url = force ? `/api/tasks/${detail.id}/${action}?force=true` : `/api/tasks/${detail.id}/${action}`;
-      await request(url, { method: "POST", body: "{}" });
-    };
     try {
-      await doTransition(false);
+      await request(`/api/tasks/${detail.id}/${action}`, { method: "POST", body: "{}" });
       if (!mountedRef.current) return;
       await refresh(detail.id);
     }
     catch (cause) {
       if (!mountedRef.current) return;
-      const message = cause instanceof Error ? cause.message : "";
-      if (action === "stop" && (message.includes("queued") || message.includes("other queued"))) {
-        setPendingConfirm({
-          title: "强制停止",
-          message: "该对话还有其他排队中或执行中的任务，强制停止将一并取消它们。是否继续？",
-          danger: true,
-          onConfirm: () => void (async () => {
-            if (!mountedRef.current) return;
-            setPendingConfirm(null);
-            setBusy("stop");
-            try {
-              await doTransition(true);
-              if (!mountedRef.current) return;
-              await refresh(detail.id);
-            } catch (cause2) { if (mountedRef.current) fail(cause2 instanceof Error ? cause2.message : "无法更新任务"); }
-            finally { if (mountedRef.current) setBusy(""); }
-          })(),
-          onCancel: () => { if (mountedRef.current) { setPendingConfirm(null); setBusy(""); } },
-        });
-        return;
-      }
       fail(cause instanceof Error ? cause.message : "无法更新任务");
     }
     if (mountedRef.current) setBusy("");
@@ -137,18 +149,17 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
       onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
     });
   };
-  const confirmTransition = (action: "cancel" | "reopen") => {
+  const confirmTransition = () => {
     setPendingConfirm({
-      title: action === "cancel" ? "取消任务" : "重新打开",
-      message: action === "cancel" ? "确认取消该任务？" : "确认重新打开该任务？",
-      danger: action === "cancel",
-      onConfirm: () => { if (mountedRef.current) { setPendingConfirm(null); void transition(action); } },
+      title: "重新打开",
+      message: "确认重新打开该任务？",
+      onConfirm: () => { if (mountedRef.current) { setPendingConfirm(null); void transition("reopen"); } },
       onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
     });
   };
 
   const moveTask = async (taskID: string, direction: "up" | "down") => {
-    const ordered = [...visibleTasks].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.position - right.position || left.title.localeCompare(right.title, "zh-CN"));
+    const ordered = [...visibleTasks].sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
     const index = ordered.findIndex((task) => task.id === taskID);
     const neighbor = ordered[index + (direction === "up" ? -1 : 1)];
     const task = ordered[index];
@@ -167,6 +178,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   const handleDrop = async (taskID: string, targetColumnID: string, targetIndex: number) => {
     const task = tasks.find((t) => t.id === taskID);
     if (!task) return;
+    if (task.status === "cancelled") return;
     const sourceDef = columnDefinitions.find((d) => d.statuses.includes(task.status));
     const targetDef = columnDefinitions.find((d) => d.id === targetColumnID);
     if (!targetDef) return;
@@ -176,14 +188,15 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
 
     if (sameColumn) {
       const columnTasks = visibleTasks.filter((t) => targetDef.statuses.includes(t.status))
-        .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.position - right.position || left.title.localeCompare(right.title, "zh-CN"));
+        .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
       const currentIndex = columnTasks.findIndex((t) => t.id === taskID);
       if (currentIndex < 0 || currentIndex === targetIndex) return;
       const reordered = [...columnTasks];
-      reordered.splice(currentIndex, 1);
-      reordered.splice(targetIndex, 0, columnTasks[currentIndex]);
-      const prev = reordered[targetIndex - 1];
-      const next = reordered[targetIndex + 1];
+      const [moved] = reordered.splice(currentIndex, 1);
+      const insertionIndex = currentIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      reordered.splice(insertionIndex, 0, moved);
+      const prev = reordered[insertionIndex - 1];
+      const next = reordered[insertionIndex + 1];
       let newPosition: number;
       if (!prev) newPosition = next ? next.position - 1 : task.position;
       else if (!next) newPosition = prev.position + 1;
@@ -202,7 +215,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
       setBusy("move");
       try {
         const columnTasks = visibleTasks.filter((t) => targetDef.statuses.includes(t.status))
-          .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.position - right.position || left.title.localeCompare(right.title, "zh-CN"));
+          .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
         const prev = columnTasks[targetIndex - 1];
         const next = columnTasks[targetIndex];
         let newPosition: number;
@@ -220,29 +233,32 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
 
   return <section className="task-workspace" aria-label="项目任务">
     <header className="task-workspace-head">
-      <div><label>PROJECT TASKS</label><h2>任务编排</h2><p>手动下发，人工验收。每个任务独立执行。当前执行权限：{permissionMode === "full_control" ? "完全控制" : "默认权限"}。</p></div>
+      <div><label>PROJECT TASKS</label><h2>任务编排</h2><p>手动下发，人工验收。每个任务独立执行。当前执行权限：{policyLabel(permissionMode)}。</p></div>
       <div className="task-workspace-actions">
         <div className="task-view-switch" aria-label="任务视图"><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>看板</button><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}>列表</button></div>
-        <label className="task-cancelled-toggle"><input type="checkbox" checked={includeCancelled} onChange={(event) => setIncludeCancelled(event.target.checked)} />显示已取消</label>
+        <label className="task-cancelled-toggle"><input type="checkbox" checked={showHistoricalCancelled} onChange={(event) => setShowHistoricalCancelled(event.target.checked)} />显示历史已取消</label>
+        <button className="secondary" onClick={() => setOrchestrationOpen(true)}>自动编排</button>
         <button className="secondary" onClick={close}>返回对话</button>
         <button className="primary" onClick={() => setEditor({})}>新建任务</button>
       </div>
     </header>
-    {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <TaskBoardColumns tasks={visibleTasks} open={openDetail} onDrop={handleDrop} /> : <TaskList tasks={visibleTasks} open={openDetail} />}
+    {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} /> : <TaskList tasks={visibleTasks} open={openDetail} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
-    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} dispatch={dispatch} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={visibleTasks.some((item) => item.position < detail.position)} canMoveDown={visibleTasks.some((item) => item.position > detail.position)} request={request} fail={fail} />}
+    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} dispatch={dispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={visibleTasks.some((item) => item.position < detail.position)} canMoveDown={visibleTasks.some((item) => item.position > detail.position)} request={request} fail={fail} />}
+    {orchestrationOpen && orchestration && <OrchestrationDialog config={orchestration} jobs={orchestrationJobs} releases={releaseSnapshots} request={request} close={() => setOrchestrationOpen(false)} saved={loadOrchestration} fail={fail} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </section>;
 }
 
-function TaskBoardColumns({ tasks, open, onDrop }: { tasks: Task[]; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, index: number) => Promise<void> }) {
+function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, index: number) => Promise<void> }) {
   const [showAllDone, setShowAllDone] = useState(false);
   const [dragOverColumn, setDragOverColumn] = useState<string | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [draggingTaskID, setDraggingTaskID] = useState<string | null>(null);
   const columnRefs = useRef<Record<string, HTMLElement | null>>({});
+  const definitions = showHistoricalCancelled ? [...columnDefinitions, historicalCancelledColumn] : columnDefinitions;
   const grouped = (definition: typeof columnDefinitions[number]) => tasks.filter((task) => definition.statuses.includes(task.status))
-    .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.position - right.position || left.title.localeCompare(right.title, "zh-CN"));
+    .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
   const DONE_LIMIT = 5;
 
   const handleColumnDragOver = (e: React.DragEvent, columnID: string) => {
@@ -264,10 +280,10 @@ function TaskBoardColumns({ tasks, open, onDrop }: { tasks: Task[]; open: (taskI
     if (!data) return;
     const dragData: DragData = JSON.parse(data);
     const columnTasks = tasks.filter((t) => {
-      const def = columnDefinitions.find((d) => d.id === columnID);
+      const def = definitions.find((d) => d.id === columnID);
       if (!def) return false;
       return def.statuses.includes(t.status);
-    }).sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.position - right.position || left.title.localeCompare(right.title, "zh-CN"));
+    }).sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
     const targetIndex = dragOverIndex !== null ? Math.min(dragOverIndex, columnTasks.length) : columnTasks.length;
     await onDrop(dragData.taskID, columnID, targetIndex);
   };
@@ -290,23 +306,24 @@ function TaskBoardColumns({ tasks, open, onDrop }: { tasks: Task[]; open: (taskI
     setDragOverIndex(index);
   };
   const isDraggable = (task: Task, _columnID: string): boolean => {
-    if (task.status === "running" || task.status === "done") return false;
+    if (task.status === "running" || task.status === "done" || task.status === "cancelled") return false;
     return true;
   };
 
-  return <div className="task-board-columns">{columnDefinitions.map((definition) => {
+  return <div className={`task-board-columns columns-${definitions.length}`}>{definitions.map((definition) => {
     const items = grouped(definition);
     const isDone = definition.id === "done";
     const visible = isDone && !showAllDone ? items.slice(0, DONE_LIMIT) : items;
     const hidden = isDone ? Math.max(0, items.length - DONE_LIMIT) : 0;
     const isDragOver = dragOverColumn === definition.id;
+    const acceptsDrops = definition.id !== "cancelled";
     return <section
       className={`task-board-column column-${definition.id}${isDragOver ? " drag-over" : ""}`}
       key={definition.id}
       ref={(el) => { columnRefs.current[definition.id] = el; }}
-      onDragOver={(e) => handleColumnDragOver(e, definition.id)}
-      onDragLeave={(e) => handleColumnDragLeave(e, definition.id)}
-      onDrop={(e) => handleColumnDrop(e, definition.id)}
+      onDragOver={acceptsDrops ? (e) => handleColumnDragOver(e, definition.id) : undefined}
+      onDragLeave={acceptsDrops ? (e) => handleColumnDragLeave(e, definition.id) : undefined}
+      onDrop={acceptsDrops ? (e) => handleColumnDrop(e, definition.id) : undefined}
     >
       <header><h3>{definition.label}</h3><b>{items.length}</b></header>
       <div>
@@ -314,19 +331,21 @@ function TaskBoardColumns({ tasks, open, onDrop }: { tasks: Task[]; open: (taskI
           <TaskItem key={task.id} task={task} open={open} columnID={definition.id} index={index} isDragging={draggingTaskID === task.id} draggable={isDraggable(task, definition.id)} onDragStart={handleTaskDragStart} onDragEnd={handleTaskDragEnd} onDragOver={handleTaskDragOver} />
         ))}
         {isDone && !showAllDone && hidden > 0 && <button className="task-show-more" onClick={() => setShowAllDone(true)}>显示更多（+{hidden}）</button>}
-        <div className={`task-drop-indicator${dragOverColumn === definition.id && dragOverIndex === visible.length ? " active" : ""}`} onDragOver={(e) => handleTaskDragOver(e, definition.id, visible.length)} onDrop={(e) => handleColumnDrop(e, definition.id)} />
+        {acceptsDrops && <div className={`task-drop-indicator${dragOverColumn === definition.id && dragOverIndex === visible.length ? " active" : ""}`} onDragOver={(e) => handleTaskDragOver(e, definition.id, visible.length)} onDrop={(e) => handleColumnDrop(e, definition.id)} />}
       </div>
     </section>;
   })}</div>;
 }
 
 function TaskList({ tasks, open }: { tasks: Task[]; open: (taskID: string) => void }) {
-  const sorted = [...tasks].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.position - right.position || left.title.localeCompare(right.title, "zh-CN"));
-  return <div className="task-list"><div className="task-list-head"><span>任务</span><span>状态</span><span>优先级</span><span>最近更新</span></div>{sorted.map((task) => <button key={task.id} className="task-list-row" onClick={() => open(task.id)}><span><b>{taskDisplayTitle(task)}</b><small>{task.description}</small></span><StatusBadge task={task} /><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}</em><time>{formatDate(task.updatedAt)}</time></button>)}</div>;
+  const sorted = [...tasks].sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
+  return <div className="task-list"><div className="task-list-head"><span>任务</span><span>状态</span><span>优先级</span><span>最近更新</span></div>{sorted.map((task) => { const title = taskDisplayTitle(task); const description = task.description.trim(); return <button key={task.id} className="task-list-row" onClick={() => open(task.id)}><span><b>{title}</b>{description && description !== title.trim() && <small>{description}</small>}</span><StatusBadge task={task} /><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}</em><time>{formatDate(task.updatedAt)}</time></button>; })}</div>;
 }
 
 function TaskItem({ task, open, columnID, index, isDragging, draggable, onDragStart, onDragEnd, onDragOver }: { task: Task; open: (taskID: string) => void; columnID: string; index: number; isDragging: boolean; draggable: boolean; onDragStart: (e: React.DragEvent, taskID: string, columnID: string, index: number) => void; onDragEnd: () => void; onDragOver: (e: React.DragEvent, columnID: string, index: number) => void }) {
   const dragged = useRef(false);
+  const title = taskDisplayTitle(task);
+  const description = task.description.trim();
   return <button
     className={`task-item priority-${task.priority}${isDragging ? " dragging" : ""}${!draggable ? " not-draggable" : ""}`}
     draggable={draggable}
@@ -336,15 +355,13 @@ function TaskItem({ task, open, columnID, index, isDragging, draggable, onDragSt
     onDragOver={(e) => { if (draggable) onDragOver(e, columnID, index); }}
   >
     <div className="task-item-top"><StatusBadge task={task} />{draggable && <span className="task-drag-handle" title="拖拽排序">⠿</span>}<span>{priorityLabels[task.priority]}</span></div>
-    <b>{taskDisplayTitle(task)}</b>
-    <p>{task.description}</p>
+    <b>{title}</b>
+    {description && description !== title.trim() && <p>{description}</p>}
   </button>;
 }
 
 function StatusBadge({ task }: { task: Task }) {
-  const queued = task.status === "running" && task.lastRun?.status === "queued";
-  const label = queued ? "队列中" : statusLabels[task.status];
-  return <span className={`task-status ${queued ? "action_required" : task.status}`}>{label}</span>;
+  return <span className={`task-status ${taskDisplayStatusClass(task)}`}>{taskDisplayStatus(task)}</span>;
 }
 
 function TaskEditor({ projectID, task, request, close, saved, fail }: { projectID: string; task?: Task; tasks?: Task[]; request: Request; close: () => void; saved: (taskID: string) => Promise<void>; fail: (message: string) => void }) {
@@ -373,7 +390,30 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog"><header><div><label>PROJECT TASK</label><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button title="关闭" disabled={busy} onClick={close}>x</button></header><form onSubmit={(event) => void save(event)}><div className="task-form"><label>任务名称 <small>（可选）</small><input autoFocus maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label><label>任务说明<textarea required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label><label>验收条件 <small>（可选）</small><textarea maxLength={12000} value={acceptanceCriteria} onChange={(event) => setAcceptanceCriteria(event.target.value)} placeholder="用可验证的结果描述完成标准。" /></label><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
 }
 
-function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, dispatch, transition, deleteTask, confirmTransition, edit, move, canMoveUp, canMoveDown, request, fail }: { detail: TaskDetail; permissionMode?: "approval_required" | "full_control"; busy: string; close: () => void; refresh: () => Promise<void>; dispatch: () => Promise<void>; transition: (action: "cancel" | "reopen" | "stop") => Promise<void>; deleteTask: () => void; confirmTransition: (action: "cancel" | "reopen") => void; edit: () => void; move: (taskID: string, direction: "up" | "down") => Promise<void>; canMoveUp: boolean; canMoveDown: boolean; request: Request; fail: (message: string) => void }) {
+function OrchestrationDialog({ config, jobs, releases, request, close, saved, fail }: { config: OrchestrationConfig; jobs: OrchestrationJob[]; releases: ReleaseSnapshot[]; request: Request; close: () => void; saved: () => Promise<void>; fail: (message: string) => void }) {
+  const [enabled, setEnabled] = useState(config.enabled);
+  const [mainBranch, setMainBranch] = useState(config.mainBranch);
+  const [devBranch, setDevBranch] = useState(config.devBranch);
+  const [commands, setCommands] = useState(config.verificationCommands.join("\n"));
+  const [maxFixRounds, setMaxFixRounds] = useState(config.maxFixRounds);
+  const [saving, setSaving] = useState(false);
+  const [action, setAction] = useState("");
+  const save = async (event: FormEvent) => {
+    event.preventDefault(); setSaving(true);
+    try { await request(`/api/projects/${config.projectId}/orchestration/config`, { method: "PUT", body: JSON.stringify({ enabled, mainBranch, devBranch, verificationCommands: commands.split("\n").map((item) => item.trim()).filter(Boolean), maxFixRounds }) }); await saved(); close(); }
+    catch (cause) { fail(cause instanceof Error ? cause.message : "无法保存自动编排配置"); }
+    finally { setSaving(false); }
+  };
+  const runAction = async (key: string, path: string) => {
+    setAction(key);
+    try { await request(path, { method: "POST", body: "{}" }); await saved(); }
+    catch (cause) { fail(cause instanceof Error ? cause.message : "自动编排操作失败"); }
+    finally { setAction(""); }
+  };
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="orchestration-title"><section className="modal task-dialog"><header><div><label>AUTOMATION</label><h2 id="orchestration-title">严格串行编排</h2></div><button title="关闭" disabled={saving || Boolean(action)} onClick={close}>x</button></header><form onSubmit={(event) => void save(event)}><div className="task-form"><label><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用自动队列</label><label>稳定分支<input required value={mainBranch} onChange={(event) => setMainBranch(event.target.value)} /></label><label>集成分支<input required value={devBranch} onChange={(event) => setDevBranch(event.target.value)} /></label><label>验证命令<textarea required value={commands} onChange={(event) => setCommands(event.target.value)} placeholder="每行一条命令" /></label><label>最大修复轮次<input type="number" min={1} max={10} value={maxFixRounds} onChange={(event) => setMaxFixRounds(Number(event.target.value))} /></label>{config.frozenReason && <p className="task-dispatch-reason">队列已冻结：{config.frozenReason}</p>}<section><h3>自动队列</h3>{jobs.length === 0 ? <p>暂无自动任务。</p> : <div className="task-run-list">{jobs.map((job) => <div key={job.id}><b>#{job.position}</b><span>{job.status}</span>{job.lastError && <small>{job.lastError}</small>}{job.status === "queued" && <button type="button" className="secondary" disabled={Boolean(action)} onClick={() => void runAction(`pause:${job.id}`, `/api/tasks/${job.taskId}/orchestration/pause`)}>暂停</button>}{(job.status === "paused" || job.status === "needs_human") && <button type="button" className="primary" disabled={Boolean(action)} onClick={() => void runAction(`resume:${job.id}`, `/api/tasks/${job.taskId}/orchestration/resume`)}>{action === `resume:${job.id}` ? "恢复中" : "恢复"}</button>}</div>)}</div>}</section><section><h3>验收快照</h3><button type="button" className="secondary" disabled={Boolean(action) || !config.enabled || Boolean(config.frozenReason)} onClick={() => void runAction("release", `/api/projects/${config.projectId}/orchestration/release`)}>{action === "release" ? "创建中" : "创建当前 dev 验收快照"}</button>{releases.length === 0 ? <p>尚未创建验收快照。</p> : <div className="task-run-list">{releases.map((release) => <div key={release.id}><b>{release.branch}</b><span>{release.status}</span><small>{release.devSha}</small>{release.status === "awaiting_main" && <button type="button" className="primary" disabled={Boolean(action)} onClick={() => void runAction(`confirm:${release.id}`, `/api/projects/${config.projectId}/orchestration/releases/${release.id}/confirm-main`)}>{action === `confirm:${release.id}` ? "确认中" : "确认已合并 main"}</button>}</div>)}</div>}</section></div><footer><button type="button" className="secondary" disabled={saving || Boolean(action)} onClick={close}>取消</button><button className="primary" disabled={saving || Boolean(action)}>{saving ? "保存中" : "保存配置"}</button></footer></form></section></div>;
+}
+
+function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, dispatch, enqueue, orchestrationEnabled, transition, deleteTask, confirmTransition, edit, move, canMoveUp, canMoveDown, request, fail }: { detail: TaskDetail; permissionMode?: ExecutionPolicy; busy: string; close: () => void; refresh: () => Promise<void>; dispatch: () => Promise<void>; enqueue: () => Promise<void>; orchestrationEnabled: boolean; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; confirmTransition: () => void; edit: () => void; move: (taskID: string, direction: "up" | "down") => Promise<void>; canMoveUp: boolean; canMoveDown: boolean; request: Request; fail: (message: string) => void }) {
   const [reviewAction, setReviewAction] = useState<ReviewAction | null>(null);
   const [note, setNote] = useState("");
   const [reviewSubmitting, setReviewSubmitting] = useState(false);
@@ -393,8 +433,8 @@ function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, dispat
     catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法提交验收"); }
     finally { if (mountedRef.current) setReviewSubmitting(false); }
   };
-  const reviewBusy = Boolean(busy) || reviewSubmitting;
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-detail-title"><section className="modal task-dialog task-detail-dialog"><header><div><label>PROJECT TASK</label><h2 id="task-detail-title">{taskDisplayTitle(detail)}</h2><StatusBadge task={detail} /></div><button title="关闭" disabled={reviewBusy} onClick={close}>x</button></header><div className="task-detail-body"><div className="task-detail-meta"><span className={`priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span><span>更新于 {formatDate(detail.updatedAt)}</span></div><section><h3>任务说明</h3><p>{detail.description}</p></section>{detail.acceptanceCriteria && <section><h3>验收条件</h3><p>{detail.acceptanceCriteria}</p></section>}<section><h3>下发内容</h3><pre className="task-prompt">{detail.promptPreview}</pre><p>执行权限：{permissionMode === "full_control" ? "完全控制" : "默认权限"}</p>{detail.blockReason && <p className="task-dispatch-reason">{detail.blockReason}</p>}</section><section><h3>执行记录</h3>{detail.runs.length === 0 ? <p>尚未下发。</p> : <div className="task-run-list"><div className="task-run-list-head"><span>次数</span><span>状态</span><span>时间</span></div>{detail.runs.map((run) => <div key={run.id}><b>第 {run.sequence} 次</b><span>{run.status}</span><time>{formatDate(run.createdAt)}</time>{run.failureReason && <small>{run.failureReason}</small>}</div>)}</div>}</section>{reviewAction && <div className="task-review-sheet" ref={reviewSheetRef}><h3>要求修改</h3><textarea autoFocus required disabled={reviewSubmitting} value={note} onChange={(event) => setNote(event.target.value)} placeholder="说明需要补充或修改的内容" /><div><button className="secondary" disabled={reviewSubmitting} onClick={() => setReviewAction(null)}>返回</button><button className="primary" disabled={reviewSubmitting} onClick={() => void submitReview("request_changes")}>{reviewSubmitting ? "提交中" : "提交要求"}</button></div></div>}</div><footer className="task-detail-actions">{(detail.status === "todo" || detail.status === "action_required") && <><button className="secondary" disabled={Boolean(busy)} onClick={edit}>编辑</button><button className="secondary" disabled={Boolean(busy) || !canMoveUp} onClick={() => void move(detail.id, "up")}>上移</button><button className="secondary" disabled={Boolean(busy) || !canMoveDown} onClick={() => void move(detail.id, "down")}>下移</button></>}{detail.status === "awaiting_review" && <><button className="secondary" disabled={reviewBusy} onClick={() => setReviewAction("request_changes")}>要求修改</button><button className="primary" disabled={reviewBusy} onClick={() => void submitReview("accept")}>{reviewSubmitting ? "提交中" : "确认完成"}</button></>}{detail.status === "running" && <button className="danger-text" disabled={Boolean(busy)} onClick={() => void transition("stop")}>{busy === "stop" ? "停止中" : "停止任务"}</button>}{(detail.status === "todo" || detail.status === "action_required") && <><button className="danger-text" disabled={Boolean(busy)} onClick={() => confirmTransition("cancel")}>取消任务</button><button className="primary" disabled={!detail.canDispatch || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button></>}{(detail.status === "done" || detail.status === "cancelled") && <button className="secondary" disabled={Boolean(busy)} onClick={() => confirmTransition("reopen")}>重新打开</button>}<button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button></footer></section></div>;
+  const reviewBusy = Boolean(busy) || reviewSubmitting || isTaskOrchestrating(detail);
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-detail-title"><section className="modal task-dialog task-detail-dialog"><header><div><label>PROJECT TASK</label><h2 id="task-detail-title">{taskDisplayTitle(detail)}</h2><StatusBadge task={detail} /></div><button title="关闭" disabled={reviewBusy} onClick={close}>x</button></header><div className="task-detail-body"><div className="task-detail-meta"><span className={`priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span><span>更新于 {formatDate(detail.updatedAt)}</span></div><section><h3>任务说明</h3><p>{detail.description}</p></section>{detail.acceptanceCriteria && <section><h3>验收条件</h3><p>{detail.acceptanceCriteria}</p></section>}<section><h3>下发内容</h3><pre className="task-prompt">{detail.promptPreview}</pre><p>执行权限：{policyLabel(permissionMode)}</p>{detail.blockReason && <p className="task-dispatch-reason">{detail.blockReason}</p>}</section><section><h3>执行记录</h3>{detail.runs.length === 0 ? <p>尚未下发。</p> : <div className="task-run-list"><div className="task-run-list-head"><span>次数</span><span>状态</span><span>时间</span></div>{detail.runs.map((run) => <div key={run.id}><b>第 {run.sequence} 次</b><span>{run.status}</span><time>{formatDate(run.createdAt)}</time>{run.failureReason && <small>{run.failureReason}</small>}</div>)}</div>}</section>{reviewAction && <div className="task-review-sheet" ref={reviewSheetRef}><h3>要求修改</h3><textarea autoFocus required disabled={reviewSubmitting} value={note} onChange={(event) => setNote(event.target.value)} placeholder="说明需要补充或修改的内容" /><div><button className="secondary" disabled={reviewSubmitting} onClick={() => setReviewAction(null)}>返回</button><button className="primary" disabled={reviewSubmitting} onClick={() => void submitReview("request_changes")}>{reviewSubmitting ? "提交中" : "提交要求"}</button></div></div>}</div><footer className="task-detail-actions">{(detail.status === "todo" || detail.status === "action_required") && <><button className="secondary" disabled={Boolean(busy)} onClick={edit}>编辑</button><button className="secondary" disabled={Boolean(busy) || !canMoveUp} onClick={() => void move(detail.id, "up")}>上移</button><button className="secondary" disabled={Boolean(busy) || !canMoveDown} onClick={() => void move(detail.id, "down")}>下移</button></>}{detail.status === "awaiting_review" && <><button className="secondary" disabled={reviewBusy} onClick={() => setReviewAction("request_changes")}>要求修改</button><button className="primary" disabled={reviewBusy} onClick={() => void submitReview("accept")}>{reviewSubmitting ? "提交中" : "提交要求"}</button></>}{detail.status === "running" && <button className="danger-text" disabled={Boolean(busy)} onClick={() => void transition("stop")}>{busy === "stop" ? "停止中" : "停止任务"}</button>}{(detail.status === "todo" || detail.status === "action_required") && <>{orchestrationEnabled && <button className="secondary" disabled={Boolean(busy)} onClick={() => void enqueue()}>{busy === "enqueue" ? "入队中" : "加入自动队列"}</button>}<button className="primary" disabled={!detail.canDispatch || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button></>}{detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}<button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button></footer></section></div>;
 }
 
 function formatDate(value: string): string {

@@ -24,22 +24,24 @@ const (
 )
 
 type Task struct {
-	ID                 string           `json:"id"`
-	ProjectID          string           `json:"projectId"`
-	Title              string           `json:"title"`
-	Description        string           `json:"description"`
-	AcceptanceCriteria string           `json:"acceptanceCriteria"`
-	Priority           string           `json:"priority"`
-	Position           float64          `json:"position"`
-	Status             string           `json:"status"`
-	DependsOn          []TaskDependency `json:"dependsOn"`
-	BlockedBy          []TaskBlocker    `json:"blockedBy"`
-	Blocks             []TaskDependency `json:"blocks"`
-	LastRun            *TaskRun         `json:"lastRun,omitempty"`
-	CreatedAt          time.Time        `json:"createdAt"`
-	UpdatedAt          time.Time        `json:"updatedAt"`
-	CompletedAt        *time.Time       `json:"completedAt,omitempty"`
-	CancelledAt        *time.Time       `json:"cancelledAt,omitempty"`
+	ID                     string           `json:"id"`
+	ProjectID              string           `json:"projectId"`
+	Title                  string           `json:"title"`
+	Description            string           `json:"description"`
+	AcceptanceCriteria     string           `json:"acceptanceCriteria"`
+	Priority               string           `json:"priority"`
+	Position               float64          `json:"position"`
+	Status                 string           `json:"status"`
+	DependsOn              []TaskDependency `json:"dependsOn"`
+	BlockedBy              []TaskBlocker    `json:"blockedBy"`
+	Blocks                 []TaskDependency `json:"blocks"`
+	LastRun                *TaskRun         `json:"lastRun,omitempty"`
+	OrchestrationStatus    string           `json:"orchestrationStatus,omitempty"`
+	OrchestrationUpdatedAt *time.Time       `json:"orchestrationUpdatedAt,omitempty"`
+	CreatedAt              time.Time        `json:"createdAt"`
+	UpdatedAt              time.Time        `json:"updatedAt"`
+	CompletedAt            *time.Time       `json:"completedAt,omitempty"`
+	CancelledAt            *time.Time       `json:"cancelledAt,omitempty"`
 }
 
 type TaskDependency struct {
@@ -67,6 +69,7 @@ type TaskRun struct {
 	CreatedAt          time.Time  `json:"createdAt"`
 	StartedAt          *time.Time `json:"startedAt,omitempty"`
 	FinishedAt         *time.Time `json:"finishedAt,omitempty"`
+	ExecutionIntentID  string     `json:"-"`
 }
 
 type TaskEvent struct {
@@ -92,7 +95,8 @@ type taskInput struct {
 	Description        string    `json:"description"`
 	AcceptanceCriteria string    `json:"acceptanceCriteria"`
 	Priority           string    `json:"priority"`
-	Position           float64   `json:"position"`
+	Position           *float64  `json:"position"`
+	Status             string    `json:"status"`
 	PredecessorTaskIDs *[]string `json:"predecessorTaskIds"`
 }
 
@@ -148,11 +152,65 @@ create index if not exists task_events_task_created on task_events(task_id,creat
 	if err != nil {
 		return fmt.Errorf("migrate tasks: %w", err)
 	}
+	if err := dropColumnIfPresent(ctx, s.db, "tasks", "execution_mode"); err != nil {
+		return fmt.Errorf("remove legacy task execution mode: %w", err)
+	}
 	return nil
+}
+
+func dropColumnIfPresent(ctx context.Context, db *sql.DB, table, column string) error {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("pragma table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf("alter table %s drop column %s", table, column))
+	return err
 }
 
 func validTaskPriority(value string) bool {
 	return value == "urgent" || value == "high" || value == "normal" || value == "low"
+}
+
+func validTaskStatus(value string) bool {
+	return value == taskTodo || value == taskRunning || value == taskAwaitingReview || value == taskActionRequired || value == taskDone || value == taskCancelled
+}
+
+func rejectCancelledTaskMutation(w http.ResponseWriter, task Task) bool {
+	if task.Status != taskCancelled {
+		return false
+	}
+	writeError(w, http.StatusConflict, errors.New("cancelled tasks can only be deleted"))
+	return true
+}
+
+func canUpdateTaskStatus(from, to string) bool {
+	if from == to {
+		return true
+	}
+	return (from == taskTodo && to == taskActionRequired) || (from == taskActionRequired && to == taskTodo)
 }
 
 func validateTaskInput(input *taskInput) error {
@@ -226,7 +284,11 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	task := Task{ID: uuid.NewString(), ProjectID: projectID, Title: input.Title, Description: input.Description, AcceptanceCriteria: input.AcceptanceCriteria, Priority: input.Priority, Position: input.Position, Status: taskTodo, CreatedAt: now, UpdatedAt: now, DependsOn: []TaskDependency{}, BlockedBy: []TaskBlocker{}, Blocks: []TaskDependency{}}
+	position := 0.0
+	if input.Position != nil {
+		position = *input.Position
+	}
+	task := Task{ID: uuid.NewString(), ProjectID: projectID, Title: input.Title, Description: input.Description, AcceptanceCriteria: input.AcceptanceCriteria, Priority: input.Priority, Position: position, Status: taskTodo, CreatedAt: now, UpdatedAt: now, DependsOn: []TaskDependency{}, BlockedBy: []TaskBlocker{}, Blocks: []TaskDependency{}}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -294,7 +356,7 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail := TaskDetail{Task: task, PromptPreview: taskPrompt(task), Runs: []TaskRun{}, Events: []TaskEvent{}}
-	detail.CanDispatch, detail.BlockReason, err = s.taskDispatchEligibility(r.Context(), task)
+	detail.CanDispatch, detail.BlockReason, err = s.taskDispatchEligibility(r.Context(), task, false)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -320,6 +382,9 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if rejectCancelledTaskMutation(w, task) {
+		return
+	}
 	var input taskInput
 	if !decode(w, r, &input) {
 		return
@@ -328,13 +393,25 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	originalStatus := task.Status
+	if input.Status != "" {
+		if !validTaskStatus(input.Status) {
+			writeError(w, http.StatusBadRequest, errors.New("unsupported task status"))
+			return
+		}
+		if !canUpdateTaskStatus(task.Status, input.Status) {
+			writeError(w, http.StatusConflict, errors.New("task cannot transition from its current status"))
+			return
+		}
+		task.Status = input.Status
+	}
 	if (task.Status == taskRunning || task.Status == taskAwaitingReview) && (task.Description != input.Description || task.AcceptanceCriteria != input.AcceptanceCriteria) {
 		writeError(w, http.StatusConflict, errors.New("cannot change execution content while a task is running or awaiting review"))
 		return
 	}
 	task.Title, task.Description, task.AcceptanceCriteria, task.Priority = input.Title, input.Description, input.AcceptanceCriteria, input.Priority
-	if input.Position != 0 {
-		task.Position = input.Position
+	if input.Position != nil {
+		task.Position = *input.Position
 	}
 	task.UpdatedAt = time.Now().UTC()
 	tx, err := s.db.BeginTx(r.Context(), nil)
@@ -343,7 +420,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(r.Context(), `update tasks set title=?,description=?,acceptance_criteria=?,priority=?,position=?,updated_at=? where id=? and (status not in ('running','awaiting_review') or (description=? and acceptance_criteria=?))`, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Position, task.UpdatedAt, task.ID, task.Description, task.AcceptanceCriteria)
+	result, err := tx.ExecContext(r.Context(), `update tasks set title=?,description=?,acceptance_criteria=?,priority=?,position=?,status=?,updated_at=? where id=? and status=?`, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Position, task.Status, task.UpdatedAt, task.ID, originalStatus)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -423,6 +500,64 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
+func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
+	task, err := s.taskByID(r.Context(), chi.URLParam(r, "taskID"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("task not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if task.Status == taskRunning {
+		writeError(w, http.StatusConflict, errors.New("stop the active task before deleting it"))
+		return
+	}
+	if s.hasActiveOrchestrationJob(r.Context(), task.ID) {
+		writeError(w, http.StatusConflict, errors.New("pause or resolve the active orchestration job before deleting the task"))
+		return
+	}
+	var hasOrchestrationHistory bool
+	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from task_orchestration_jobs where task_id=?)`, task.ID).Scan(&hasOrchestrationHistory); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if hasOrchestrationHistory {
+		writeError(w, http.StatusConflict, errors.New("orchestrated tasks are retained for audit and cannot be deleted"))
+		return
+	}
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(r.Context(), `delete from task_dependencies where task_id=? or predecessor_task_id=?`, task.ID, task.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("delete task dependencies: %w", err))
+		return
+	}
+	result, err := tx.ExecContext(r.Context(), `delete from tasks where id=?`, task.ID)
+	if err != nil {
+		writeError(w, http.StatusConflict, fmt.Errorf("delete task: %w", err))
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed != 1 {
+		writeError(w, http.StatusNotFound, errors.New("task not found"))
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) addTaskDependency(w http.ResponseWriter, r *http.Request) {
 	task, err := s.taskByID(r.Context(), chi.URLParam(r, "taskID"))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -431,6 +566,9 @@ func (s *Server) addTaskDependency(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if rejectCancelledTaskMutation(w, task) {
 		return
 	}
 	if task.Status == taskRunning || task.Status == taskAwaitingReview {
@@ -524,6 +662,9 @@ func (s *Server) deleteTaskDependency(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if rejectCancelledTaskMutation(w, task) {
+		return
+	}
 	if task.Status == taskRunning || task.Status == taskAwaitingReview {
 		writeError(w, http.StatusConflict, errors.New("cannot change dependencies while a task is running or awaiting review"))
 		return
@@ -576,6 +717,9 @@ func (s *Server) replaceTaskDependencies(w http.ResponseWriter, r *http.Request)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if rejectCancelledTaskMutation(w, task) {
 		return
 	}
 	var input struct {
@@ -757,13 +901,18 @@ func (s *Server) hydrateTask(ctx context.Context, task *Task) error {
 		return err
 	}
 	lastRun, err := s.latestTaskRun(ctx, task.ID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
+	if err == nil {
+		task.LastRun = &lastRun
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	task.LastRun = &lastRun
+	var orchestrationUpdatedAt time.Time
+	err = s.db.QueryRowContext(ctx, `select status,updated_at from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human') order by updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt)
+	if err == nil {
+		task.OrchestrationUpdatedAt = &orchestrationUpdatedAt
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	return nil
 }
 
@@ -865,11 +1014,23 @@ func taskPrompt(task Task) string {
 	return strings.Join(parts, "\n\n")
 }
 
-func (s *Server) taskDispatchEligibility(ctx context.Context, task Task) (bool, string, error) {
-	if task.Status != taskTodo && task.Status != taskActionRequired && task.Status != taskAwaitingReview {
+func (s *Server) taskDispatchEligibility(ctx context.Context, task Task, orchestrated bool) (bool, string, error) {
+	if task.Status != taskTodo && task.Status != taskActionRequired {
 		return false, "任务当前状态不可下发", nil
 	}
-	if len(task.BlockedBy) > 0 {
+	blocked := len(task.BlockedBy) > 0
+	if blocked {
+		if orchestrated {
+			ready, err := s.orchestrationDependenciesIntegrated(ctx, task.ID)
+			if err != nil {
+				return false, "", err
+			}
+			if ready {
+				blocked = false
+			}
+		}
+	}
+	if blocked {
 		titles := make([]string, 0, len(task.BlockedBy))
 		for _, blocker := range task.BlockedBy {
 			titles = append(titles, blocker.Title)
@@ -887,42 +1048,72 @@ func (s *Server) taskDispatchEligibility(ctx context.Context, task Task) (bool, 
 }
 
 func (s *Server) dispatchTask(w http.ResponseWriter, r *http.Request) {
-	task, err := s.taskByID(r.Context(), chi.URLParam(r, "taskID"))
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, errors.New("task not found"))
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	allowed, reason, err := s.taskDispatchEligibility(r.Context(), task)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if !allowed {
-		writeError(w, http.StatusConflict, errors.New(reason))
-		return
-	}
-	var conversationID string
-	err = s.db.QueryRowContext(r.Context(), `select id from conversations where project_id=? and is_current=true`, task.ProjectID).Scan(&conversationID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusConflict, errors.New("project has no current conversation"))
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	now := time.Now().UTC()
-	taskRun := &TaskRun{ID: uuid.NewString(), TaskID: task.ID, ConversationID: conversationID, PromptSnapshot: taskPrompt(task), AcceptanceSnapshot: task.AcceptanceCriteria, CreatedAt: now}
-	message, runID, record, status, err := s.startMessage(r.Context(), conversationID, taskRun.PromptSnapshot, &runStartRecord{Task: taskRun})
+	result, status, err := s.dispatchTaskByID(r.Context(), chi.URLParam(r, "taskID"))
 	if err != nil {
 		writeError(w, status, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": message, "runId": runID, "taskRun": record.Task})
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+type taskDispatchResult struct {
+	Message Message `json:"message"`
+	RunID   string  `json:"runId"`
+	TaskRun TaskRun `json:"taskRun"`
+}
+
+// dispatchTaskByID keeps task dispatch on the same path as direct messages so
+// it creates the Message, Run, TaskRun, workspace lease, and agent process.
+func (s *Server) dispatchTaskByID(ctx context.Context, taskID string) (taskDispatchResult, int, error) {
+	return s.dispatchTaskByIDInWorkspace(ctx, taskID, "")
+}
+
+func (s *Server) dispatchTaskByIDInWorkspace(ctx context.Context, taskID, worktreePath string) (taskDispatchResult, int, error) {
+	return s.dispatchTaskByIDInWorkspaceWithContext(ctx, taskID, worktreePath, "")
+}
+
+func (s *Server) dispatchTaskByIDInWorkspaceWithContext(ctx context.Context, taskID, worktreePath, repairContext string) (taskDispatchResult, int, error) {
+	return s.dispatchTaskByIDInWorkspaceWithExecutionIntent(ctx, taskID, worktreePath, repairContext, "")
+}
+
+func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntent(ctx context.Context, taskID, worktreePath, repairContext, executionIntentID string) (taskDispatchResult, int, error) {
+	task, err := s.taskByID(ctx, taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return taskDispatchResult{}, http.StatusNotFound, errors.New("task not found")
+	}
+	if err != nil {
+		return taskDispatchResult{}, http.StatusInternalServerError, err
+	}
+	orchestrated := worktreePath != ""
+	allowed, reason, err := s.taskDispatchEligibility(ctx, task, orchestrated)
+	if err != nil {
+		return taskDispatchResult{}, http.StatusInternalServerError, err
+	}
+	if !allowed {
+		return taskDispatchResult{}, http.StatusConflict, errors.New(reason)
+	}
+	var conversationID string
+	err = s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and is_current=true`, task.ProjectID).Scan(&conversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return taskDispatchResult{}, http.StatusConflict, errors.New("project has no current conversation")
+	}
+	if err != nil {
+		return taskDispatchResult{}, http.StatusInternalServerError, err
+	}
+	now := time.Now().UTC()
+	prompt := taskPrompt(task)
+	if strings.TrimSpace(repairContext) != "" {
+		prompt += "\n\n上轮检查或审查发现的问题：\n" + strings.TrimSpace(repairContext) + "\n\n请只修复这些问题，并重新运行相关检查。"
+	}
+	taskRun := &TaskRun{ID: uuid.NewString(), TaskID: task.ID, ConversationID: conversationID, PromptSnapshot: prompt, AcceptanceSnapshot: task.AcceptanceCriteria, CreatedAt: now, ExecutionIntentID: executionIntentID}
+	message, runID, record, status, err := s.startMessage(ctx, conversationID, taskRun.PromptSnapshot, &runStartRecord{Task: taskRun, WorktreePath: worktreePath, Orchestrated: orchestrated})
+	if err != nil {
+		return taskDispatchResult{}, status, err
+	}
+	if record == nil || record.Task == nil {
+		return taskDispatchResult{}, http.StatusInternalServerError, errors.New("task dispatch did not create a task run")
+	}
+	return taskDispatchResult{Message: message, RunID: runID, TaskRun: *record.Task}, http.StatusAccepted, nil
 }
 
 func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
@@ -944,6 +1135,10 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if task.Status != taskAwaitingReview {
 		writeError(w, http.StatusConflict, errors.New("task is not awaiting review"))
+		return
+	}
+	if s.hasActiveOrchestrationJob(r.Context(), task.ID) {
+		writeError(w, http.StatusConflict, errors.New("automatic orchestration is still verifying this task"))
 		return
 	}
 	if input.Action != "accept" && input.Action != "request_changes" {
@@ -998,14 +1193,10 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reopenTask(w http.ResponseWriter, r *http.Request) {
-	s.transitionTaskState(w, r, "task.reopened", []string{taskDone, taskCancelled}, taskTodo)
+	s.transitionTaskState(w, r, "task.reopened", taskDone, taskTodo)
 }
 
-func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
-	s.transitionTaskState(w, r, "task.cancelled", []string{taskTodo, taskActionRequired}, taskCancelled)
-}
-
-func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eventType string, allowed []string, nextStatus string) {
+func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eventType, allowedStatus, nextStatus string) {
 	task, err := s.taskByID(r.Context(), chi.URLParam(r, "taskID"))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("task not found"))
@@ -1015,14 +1206,7 @@ func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eve
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	allowedStatus := false
-	for _, status := range allowed {
-		if task.Status == status {
-			allowedStatus = true
-			break
-		}
-	}
-	if !allowedStatus {
+	if task.Status != allowedStatus {
 		writeError(w, http.StatusConflict, errors.New("task cannot transition from its current status"))
 		return
 	}
@@ -1033,7 +1217,7 @@ func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eve
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(r.Context(), `update tasks set status=?,updated_at=?,completed_at=null,cancelled_at=case when ?='cancelled' then ? else null end where id=? and status in (?,?)`, nextStatus, now, nextStatus, now, task.ID, allowed[0], allowed[1])
+	result, err := tx.ExecContext(r.Context(), `update tasks set status=?,updated_at=?,completed_at=null,cancelled_at=null where id=? and status=?`, nextStatus, now, task.ID, allowedStatus)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1055,12 +1239,7 @@ func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eve
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	task.Status, task.UpdatedAt, task.CompletedAt = nextStatus, now, nil
-	if nextStatus == taskCancelled {
-		task.CancelledAt = &now
-	} else {
-		task.CancelledAt = nil
-	}
+	task.Status, task.UpdatedAt, task.CompletedAt, task.CancelledAt = nextStatus, now, nil, nil
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -1105,7 +1284,7 @@ func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, map[string]string{"status": status})
 }
 
-func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun TaskRun, conversation Conversation) error {
+func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun TaskRun, conversation Conversation, orchestrated bool) error {
 	var projectID, status string
 	if err := tx.QueryRowContext(ctx, `select project_id,status from tasks where id=?`, taskRun.TaskID).Scan(&projectID, &status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1116,11 +1295,20 @@ func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun
 	if projectID != conversation.ProjectID || taskRun.ConversationID != conversation.ID {
 		return errors.New("task and conversation must belong to the same project")
 	}
-	if status != taskTodo && status != taskActionRequired && status != taskAwaitingReview {
+	if status != taskTodo && status != taskActionRequired {
 		return errors.New("task current status cannot be dispatched")
 	}
 	var blockers int
-	if err := tx.QueryRowContext(ctx, `select count(*) from task_dependencies dependency join tasks predecessor on predecessor.id=dependency.predecessor_task_id where dependency.task_id=? and predecessor.status<>?`, taskRun.TaskID, taskDone).Scan(&blockers); err != nil {
+	dependencyQuery := `select count(*) from task_dependencies dependency join tasks predecessor on predecessor.id=dependency.predecessor_task_id where dependency.task_id=? and predecessor.status<>?`
+	dependencyArgs := []any{taskRun.TaskID, taskDone}
+	if orchestrated {
+		dependencyQuery = `select count(*) from task_dependencies dependency
+			left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status in ('integrated_to_dev','released_to_main')
+			left join git_task_records record on record.job_id=predecessor.id and record.integration_sha<>''
+			where dependency.task_id=? and record.job_id is null`
+		dependencyArgs = []any{taskRun.TaskID}
+	}
+	if err := tx.QueryRowContext(ctx, dependencyQuery, dependencyArgs...).Scan(&blockers); err != nil {
 		return err
 	}
 	if blockers > 0 {

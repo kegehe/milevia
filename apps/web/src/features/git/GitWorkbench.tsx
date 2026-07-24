@@ -25,10 +25,17 @@ export function GitWorkbench({ projectID, request, fail, close }: { projectID: s
   const [refreshing, setRefreshing] = useState(false);
   const [mutating, setMutating] = useState("");
   const diffRequest = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
   const closeDiff = () => { diffRequest.current++; setSelectedDiff(null); };
 
   const reload = useCallback(async (manual = false) => {
-    if (manual) setRefreshing(true); else setLoading(true);
+    if (manual) { if (!mountedRef.current) return; setRefreshing(true); }
+    else { if (!mountedRef.current) return; setLoading(true); }
     try {
       const base = `/api/projects/${projectID}/git`;
       const [nextSnapshot, nextChanges, nextCommits, nextBranches, nextOperations] = await Promise.all([
@@ -38,20 +45,23 @@ export function GitWorkbench({ projectID, request, fail, close }: { projectID: s
         request<GitBranch[]>(`${base}/branches`),
         request<GitOperation[]>(`${base}/operations`),
       ]);
+      if (!mountedRef.current) return;
       setSnapshot(nextSnapshot);
       setChanges(nextChanges);
       setCommits(nextCommits);
       setBranches(nextBranches);
       setOperations(nextOperations);
     } catch (cause) {
-      fail(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
+      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (mountedRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [projectID, request, fail]);
 
-  useEffect(() => { void reload(); }, [reload]);
+  useEffect(() => { void reload().catch(() => undefined); }, [reload]);
 
   const grouped = useMemo(() => groupChanges(changes), [changes]);
   const changeCount = changes.length;
@@ -59,18 +69,20 @@ export function GitWorkbench({ projectID, request, fail, close }: { projectID: s
     const requestID = ++diffRequest.current;
     try {
       const diff = await request<GitDiff>(`/api/projects/${projectID}/git/diff?path=${encodeURIComponent(change.path)}&stage=${stage}`);
-      if (requestID === diffRequest.current) setSelectedDiff(diff);
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法读取差异"); }
+      if (requestID === diffRequest.current && mountedRef.current) setSelectedDiff(diff);
+    } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法读取差异"); }
   };
   const mutatePath = async (action: "stage" | "unstage", path: string) => {
     if (!snapshot?.stateToken) return;
+    if (!mountedRef.current) return;
     setMutating(`${action}:${path}`);
     try {
       await request(`/api/projects/${projectID}/git/${action}`, { method: "POST", body: JSON.stringify({ paths: [path], stateToken: snapshot.stateToken }) });
+      if (!mountedRef.current) return;
       setSelectedDiff(null);
       await reload(true);
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法执行 Git 操作"); }
-    finally { setMutating(""); }
+    } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法执行 Git 操作"); }
+    finally { if (mountedRef.current) setMutating(""); }
   };
 
   return <div className="git-workbench-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) close(); }}>
