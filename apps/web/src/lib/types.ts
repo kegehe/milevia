@@ -1,0 +1,57 @@
+// 类型定义 — 从 App.tsx 提取，供全项目使用
+
+export type Project = { id: string; name: string; pathDisplay: string; runner: string; environment: string; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
+export type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string };
+export type ProjectFilter = "all" | "running" | "ready" | "offline";
+export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
+export type AgentID = "claude-code" | "codex";
+export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean };
+export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
+export type ShortcutKind = "prompt" | "snippet" | "command_request";
+export type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };
+export type ShortcutEditorState = { kind: ShortcutKind; shortcut?: Shortcut };
+export type Event = { id: string; type: string; payload: unknown; runId: string; createdAt: string };
+export type Directory = { name: string; path: string };
+export type Approval = { approvalId: string; status: "pending" | "allow" | "deny"; toolName: string; toolInput: Record<string, unknown> };
+export type ApprovalEvent = { approval: Approval; runId: string; createdAt: string };
+export type ToolOutput = { content: string; isError: boolean };
+export type ToolAction = { id: string; runId: string; name: string; input: Record<string, unknown>; createdAt: string; output?: ToolOutput; approval?: Approval; runStatus?: string };
+export type AgentStatus = "pending" | "running" | "completed" | "failed" | "stopped" | "unresolved";
+export type SSHProfile = { host: string; port: number; user: string; privateKeyPath: string };
+export type SSHPreflightResult = { ok: boolean; claudeReady?: boolean; hostKey?: string; fingerprint?: string; checks?: Record<string, boolean>; error?: string; resolved?: SSHProfile };
+export type AgentLog = { id: string; createdAt: string; kind: "text" | "tool" | "result" | "error"; title: string; detail: string; isError?: boolean };
+export type AgentNode = { id: string; runId: string; parentId?: string; name: string; summary: string; createdAt: string; status: AgentStatus; logs: AgentLog[]; children: AgentNode[] };
+export type AgentExecution = { runId: string; status: string; incomplete: boolean; agents: AgentNode[]; createdAt: string };
+export type ModelUsage = { model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; contextWindow: number };
+export type RunUsage = { runId: string; conversationId: string; available: boolean; reason?: string; status: string; model: string; contextWindow: number; contextInputTokens: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; durationMs: number; ttftMs: number; terminalReason: string; hasResult: boolean; startedAt?: string; completedAt?: string; models: ModelUsage[] };
+export type ConversationUsage = { taskCount: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number };
+export type ConversationUsageResponse = { conversationId: string; available: boolean; reason?: string; context: RunUsage; currentRun?: RunUsage; latestRun?: RunUsage; session: ConversationUsage; models: ModelUsage[] };
+export type TimelineItem =
+  | { kind: "message"; id: string; createdAt: string; message: Message }
+  | { kind: "tool"; id: string; createdAt: string; action: ToolAction }
+  | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string };
+export type WorkspaceTab = "conversation" | "tasks" | "files" | "git" | "run";
+
+export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
+export type RunnerInfo = {
+  id: string;
+  name: string;
+  environment: string;
+  root: string;
+  claude: ToolStatus;
+  codex?: ToolStatus;
+};
+
+export type CheckUpdateResult = {
+  updateAvailable: boolean;
+  currentVersion: string;
+  latestVersion?: string;
+  error?: string;
+};
+
+export type UpdateResult = {
+  success: boolean;
+  previousVersion?: string;
+  currentVersion?: string;
+  error?: string;
+};

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type LogEntry, type RunConfig, type RunStatusResponse, statusLabels, statusColors } from "./run-model";
+import { toAnsiSegments } from "./ansi";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 
@@ -43,8 +44,20 @@ function nextEnvironmentVariableKey(envVars: Record<string, string>): string {
 	return key;
 }
 
-export function ProjectRunPanel({ projectID, request, fail, close }: { projectID: string; request: Request; fail: (message: string) => void; close: () => void }) {
-	const [config, setConfig] = useState<RunConfig>({ workDir: "", command: "", envVars: {} });
+function logStreamLabel(stream: LogEntry["stream"]): string {
+	if (stream === "stderr") return "ERR";
+	if (stream === "system") return "SYS";
+	return "OUT";
+}
+
+function logTone(entry: LogEntry): string {
+	if (entry.stream === "system") return "system";
+	if (entry.stream === "stderr" && /(?:^|\s)(?:error|failed|fatal|panic|exception)\b/i.test(entry.text)) return "is-error";
+	return "";
+}
+
+export function ProjectRunPanel({ projectID, request, fail, active }: { projectID: string; request: Request; fail: (message: string) => void; active: boolean }) {
+	const [config, setConfig] = useState<RunConfig>({ workDir: "", command: "", envVars: {}, executionTarget: "auto" });
 	const [status, setStatus] = useState<RunStatusResponse | null>(null);
 	const [logs, setLogs] = useState<LogEntry[]>([]);
 	const [hasNewLogs, setHasNewLogs] = useState(false);
@@ -57,6 +70,9 @@ export function ProjectRunPanel({ projectID, request, fail, close }: { projectID
 	const reconnectAttemptRef = useRef(0);
 	const activeProjectIDRef = useRef<string | null>(null);
 	const clearedThroughLogIDRef = useRef(0);
+	const configDirtyRef = useRef(false);
+	const configRevisionRef = useRef(0);
+	const renderedProjectIDRef = useRef(projectID);
 
 	const basePath = `/api/projects/${projectID}/run`;
 	const mergeIncomingLogs = useCallback((entries: LogEntry[]) => {
@@ -65,14 +81,20 @@ export function ProjectRunPanel({ projectID, request, fail, close }: { projectID
 	}, []);
 
 	const loadConfig = useCallback(async () => {
+		const revision = configRevisionRef.current;
 		try {
 			const c = await request<RunConfig>(`${basePath}/config`);
-			if (activeProjectIDRef.current === projectID) setConfig(c);
+			if (activeProjectIDRef.current === projectID && revision === configRevisionRef.current && !configDirtyRef.current) setConfig(c);
 		}
 		catch (cause) {
 			if (activeProjectIDRef.current === projectID) fail(cause instanceof Error ? cause.message : "加载配置失败");
 		}
 	}, [basePath, request, fail, projectID]);
+	const updateConfig = (next: RunConfig) => {
+		configDirtyRef.current = true;
+		configRevisionRef.current += 1;
+		setConfig(next);
+	};
 
 	const loadStatus = useCallback(async () => {
 		try {
@@ -84,9 +106,24 @@ export function ProjectRunPanel({ projectID, request, fail, close }: { projectID
 	}, [basePath, request, projectID, mergeIncomingLogs]);
 
 	useEffect(() => {
+		if (renderedProjectIDRef.current === projectID) return;
+		renderedProjectIDRef.current = projectID;
+
+		configDirtyRef.current = false;
+		configRevisionRef.current = 0;
+		clearedThroughLogIDRef.current = 0;
+		logNearBottomRef.current = true;
+		setConfig({ workDir: "", command: "", envVars: {}, executionTarget: "auto" });
+		setStatus(null);
+		setLogs([]);
+		setHasNewLogs(false);
+		setBusy("");
+	}, [projectID]);
+
+	useEffect(() => {
+		if (!active) return;
 		let disposed = false;
 		activeProjectIDRef.current = projectID;
-		clearedThroughLogIDRef.current = 0;
 		void loadConfig();
 		void loadStatus();
 
@@ -131,7 +168,7 @@ export function ProjectRunPanel({ projectID, request, fail, close }: { projectID
 			wsRef.current = null;
 			if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
 		};
-	}, [projectID, loadConfig, loadStatus, mergeIncomingLogs]);
+	}, [projectID, active, loadConfig, loadStatus, mergeIncomingLogs]);
 
 	useEffect(() => {
 		const terminal = logTerminalRef.current;
@@ -164,7 +201,11 @@ export function ProjectRunPanel({ projectID, request, fail, close }: { projectID
 		const validationError = environmentValidationError(config.envVars || {});
 		if (validationError) { fail(validationError); return; }
 		setBusy("save");
-		try { await request(`${basePath}/config`, { method: "PUT", body: JSON.stringify(config) }); }
+		const revision = configRevisionRef.current;
+		try {
+			await request(`${basePath}/config`, { method: "PUT", body: JSON.stringify(config) });
+			if (revision === configRevisionRef.current) configDirtyRef.current = false;
+		}
 		catch (cause) { fail(cause instanceof Error ? cause.message : "保存配置失败"); }
 		finally { setBusy(""); }
 	};
@@ -204,88 +245,98 @@ export function ProjectRunPanel({ projectID, request, fail, close }: { projectID
 	const statusLabel = status ? statusLabels[status.status] : statusLabels.stopped;
 	const uptime = status?.startedAt ? formatUptime(new Date(status.startedAt)) : "";
 
-	return <div className="run-panel-backdrop" role="presentation" onMouseDown={(e) => { if (e.currentTarget === e.target) close(); }}>
-		<section className="run-panel" role="dialog" aria-modal="true" aria-label="项目启动">
+	return <section id="workspace-panel-run" className="run-panel workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-run" hidden={!active}>
 			<header className="run-panel-head">
 				<div><label>PROJECT RUNNER</label><h2>项目启动</h2></div>
-				<button type="button" className="git-close" title="关闭" aria-label="关闭" onClick={close}>×</button>
 			</header>
 
-			<section className="run-config">
-				<div className="run-config-row">
-					<label>工作目录</label>
-					<input type="text" value={config.workDir} placeholder="留空使用项目根目录" onChange={(e) => setConfig({ ...config, workDir: e.target.value })} />
-				</div>
-				<div className="run-config-row">
-					<label>启动命令</label>
-					<input type="text" value={config.command} placeholder="例如: npm run dev" onChange={(e) => setConfig({ ...config, command: e.target.value })} />
-				</div>
-				<div className="run-config-row">
-					<label>环境变量</label>
-					<div className="run-env-vars">
-						{Object.entries(config.envVars || {}).map(([k, v]) => (
-							<div key={k} className="run-env-var">
-								<input type="text" value={k} placeholder="KEY" onChange={(e) => {
-									const next = { ...config.envVars };
-									delete next[k];
-									next[e.target.value || k] = v;
-									setConfig({ ...config, envVars: next });
-								}} />
-								<span>=</span>
-								<input type="text" value={v} placeholder="VALUE" onChange={(e) => {
-									setConfig({ ...config, envVars: { ...config.envVars, [k]: e.target.value } });
-								}} />
-								<button type="button" className="secondary" onClick={() => {
-									const next = { ...config.envVars };
-									delete next[k];
-									setConfig({ ...config, envVars: next });
-								}}>×</button>
-							</div>
-						))}
-							<button type="button" className="secondary" onClick={() => {
-								const envVars = config.envVars || {};
-								setConfig({ ...config, envVars: { ...envVars, [nextEnvironmentVariableKey(envVars)]: "" } });
-							}}>+ 添加</button>
+			<div className="run-body">
+				<section className="run-log-section">
+					<header>
+						<h3>日志输出</h3>
+						<button type="button" className="secondary" onClick={handleClearLogs}>清除</button>
+					</header>
+					<div className="run-log-terminal-wrap">
+						<div ref={logTerminalRef} className="run-log-terminal" onScroll={handleLogScroll}>
+							{logs.length === 0 ? <div className="run-log-empty">尚未有日志输出。配置并启动命令后，日志将显示在此处。</div> : logs.map((entry, i) => (
+								<div key={entry.id || `${entry.timestamp}-${i}`} className={`run-log-line ${entry.stream} ${logTone(entry)}`}>
+									<time>{new Date(entry.timestamp).toLocaleTimeString()}</time>
+									<span className="run-log-stream" aria-label={entry.stream}>{logStreamLabel(entry.stream)}</span>
+									<pre>{toAnsiSegments(entry.text).map((segment, index) => <span key={index} className={segment.className}>{segment.text}</span>)}</pre>
+								</div>
+							))}
+						</div>
+						{hasNewLogs && <button type="button" className="run-log-jump" title="跳转到最新日志" aria-label="跳转到最新日志" onClick={jumpToLatestLogs}>↓</button>}
 					</div>
-				</div>
-				<button type="button" className="primary" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存配置"}</button>
-			</section>
+				</section>
 
-			<section className="run-controls">
-				<div className="run-status-bar">
-					<span className="run-status-dot" style={{ background: statusColor }}></span>
-					<span>{statusLabel}</span>
-					{status?.pid ? <span>PID: {status.pid}</span> : null}
-					{uptime ? <span>运行 {uptime}</span> : null}
-					{status?.exitCode !== null && status?.exitCode !== undefined && status.status !== "running" ?
-						<span>退出码: {status.exitCode}</span> : null}
-				</div>
-				<div className="run-actions">
-					<button type="button" className="primary" disabled={running || transitioning || busy !== ""} onClick={handleStart}>{busy === "start" ? "启动中" : "启动"}</button>
-					<button type="button" className="danger" disabled={!running || busy !== ""} onClick={handleStop}>{busy === "stop" ? "停止中" : "停止"}</button>
-					<button type="button" className="secondary" disabled={busy !== ""} onClick={handleRestart}>{busy === "restart" ? "重启中" : "重启"}</button>
-				</div>
-			</section>
-
-			<section className="run-log-section">
-				<header>
-					<h3>日志输出</h3>
-					<button type="button" className="secondary" onClick={handleClearLogs}>清除</button>
-				</header>
-				<div className="run-log-terminal-wrap">
-					<div ref={logTerminalRef} className="run-log-terminal" onScroll={handleLogScroll}>
-						{logs.length === 0 ? <div className="run-log-empty">尚未有日志输出。配置并启动命令后，日志将显示在此处。</div> : logs.map((entry, i) => (
-							<div key={entry.id || `${entry.timestamp}-${i}`} className={`run-log-line ${entry.stream}`}>
-								<time>{new Date(entry.timestamp).toLocaleTimeString()}</time>
-								<pre>{entry.text}</pre>
+				<aside className="run-sidebar">
+					<section className="run-config">
+						<div className="run-config-row">
+							<label htmlFor="run-execution-target">运行环境</label>
+							<select id="run-execution-target" value={config.executionTarget || "auto"} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })}>
+								<option value="auto">自动</option>
+								<option value="windows">Windows</option>
+								<option value="wsl">WSL</option>
+							</select>
+						</div>
+						<div className="run-config-row">
+							<label>工作目录</label>
+							<input type="text" value={config.workDir} placeholder="留空使用项目根目录" onChange={(e) => updateConfig({ ...config, workDir: e.target.value })} />
+						</div>
+						<div className="run-config-row">
+							<label>启动命令</label>
+							<input type="text" value={config.command} placeholder="例如: npm run dev" onChange={(e) => updateConfig({ ...config, command: e.target.value })} />
+						</div>
+						<div className="run-config-row">
+							<label>环境变量</label>
+							<div className="run-env-vars">
+								{Object.entries(config.envVars || {}).map(([k, v]) => (
+									<div key={k} className="run-env-var">
+										<input type="text" value={k} placeholder="KEY" onChange={(e) => {
+											const next = { ...config.envVars };
+											delete next[k];
+											next[e.target.value || k] = v;
+											updateConfig({ ...config, envVars: next });
+										}} />
+										<span>=</span>
+										<input type="text" value={v} placeholder="VALUE" onChange={(e) => {
+											updateConfig({ ...config, envVars: { ...config.envVars, [k]: e.target.value } });
+										}} />
+										<button type="button" className="secondary" onClick={() => {
+											const next = { ...config.envVars };
+											delete next[k];
+											updateConfig({ ...config, envVars: next });
+										}}>×</button>
+									</div>
+								))}
+									<button type="button" className="secondary" onClick={() => {
+										const envVars = config.envVars || {};
+										updateConfig({ ...config, envVars: { ...envVars, [nextEnvironmentVariableKey(envVars)]: "" } });
+									}}>+ 添加</button>
 							</div>
-						))}
-					</div>
-					{hasNewLogs && <button type="button" className="run-log-jump" title="跳转到最新日志" aria-label="跳转到最新日志" onClick={jumpToLatestLogs}>↓</button>}
-				</div>
-			</section>
-		</section>
-	</div>;
+						</div>
+						<button type="button" className="primary" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存配置"}</button>
+					</section>
+
+					<section className="run-controls">
+						<div className="run-status-bar">
+							<span className="run-status-dot" style={{ background: statusColor }}></span>
+							<span>{statusLabel}</span>
+							{status?.pid ? <span>PID: {status.pid}</span> : null}
+							{uptime ? <span>运行 {uptime}</span> : null}
+							{status?.exitCode !== null && status?.exitCode !== undefined && status.status !== "running" ?
+								<span>退出码: {status.exitCode}</span> : null}
+						</div>
+						<div className="run-actions">
+							<button type="button" className="primary" disabled={running || transitioning || busy !== ""} onClick={handleStart}>{busy === "start" ? "启动中" : "启动"}</button>
+							<button type="button" className="danger" disabled={!running || busy !== ""} onClick={handleStop}>{busy === "stop" ? "停止中" : "停止"}</button>
+							<button type="button" className="secondary" disabled={busy !== ""} onClick={handleRestart}>{busy === "restart" ? "重启中" : "重启"}</button>
+						</div>
+					</section>
+				</aside>
+			</div>
+	</section>;
 }
 
 function formatUptime(startedAt: Date): string {

@@ -56,7 +56,10 @@ func TestCodexSandbox(t *testing.T) {
 	if value, err := codexSandbox("workspace_write"); err != nil || value != "workspace-write" {
 		t.Fatalf("workspace policy = %q, %v", value, err)
 	}
-	if _, err := codexSandbox("full_control"); err == nil {
+	if value, err := codexSandbox("full_control"); err != nil || value != "danger-full-access" {
+		t.Fatalf("full control policy = %q, %v", value, err)
+	}
+	if _, err := codexSandbox("approval_required"); err == nil {
 		t.Fatal("expected unsupported policy error")
 	}
 }

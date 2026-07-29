@@ -2,6 +2,7 @@ export interface RunConfig {
 	workDir: string;
 	command: string;
 	envVars: Record<string, string>;
+	executionTarget: 'auto' | 'wsl' | 'windows';
 }
 
 export type RunStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'failed';

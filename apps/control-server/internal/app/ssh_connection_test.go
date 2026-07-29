@@ -234,6 +234,31 @@ func TestSSHConfigProfilesIgnoresWildcardEntries(t *testing.T) {
 	}
 }
 
+func TestGetSSHProfileReturnsResolvedConnectionParameters(t *testing.T) {
+	originalGetSSHConfigOutput := getSSHConfigOutput
+	t.Cleanup(func() { getSSHConfigOutput = originalGetSSHConfigOutput })
+	getSSHConfigOutput = func(name string) ([]byte, error) {
+		if name != "Tencent" {
+			t.Fatalf("profile name=%q, want Tencent", name)
+		}
+		return []byte("hostname 192.0.2.10\nuser deploy\nport 2202\nidentityfile none\nproxyjump none\n"), nil
+	}
+
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/ssh-profiles/Tencent", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var profile sshProfile
+	if err := json.NewDecoder(response.Body).Decode(&profile); err != nil {
+		t.Fatalf("decode profile: %v", err)
+	}
+	if profile.Host != "192.0.2.10" || profile.Port != 2202 || profile.User != "deploy" {
+		t.Fatalf("profile=%+v", profile)
+	}
+}
+
 func seedSSHConnectionForTest(t *testing.T, server *Server, status string) *SSHConnection {
 	t.Helper()
 	now := time.Now().UTC()

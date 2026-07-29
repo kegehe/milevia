@@ -3,15 +3,20 @@ package app
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 )
 
 // RunStatus 表示项目运行进程的状态。
@@ -26,6 +31,14 @@ const (
 	projectRunLogCapacity               = 2_000
 	projectRunLogHistory                = 200
 	projectRunLogMaxTextBytes           = 16 * 1024
+)
+
+type RunExecutionTarget string
+
+const (
+	RunExecutionTargetAuto    RunExecutionTarget = "auto"
+	RunExecutionTargetWSL     RunExecutionTarget = "wsl"
+	RunExecutionTargetWindows RunExecutionTarget = "windows"
 )
 
 // LogEntry 表示一行日志。
@@ -82,10 +95,15 @@ type logBroadcaster func(entry LogEntry)
 
 // projectRunner 管理单个项目的运行进程。
 type projectRunner struct {
-	projectID string
-	workDir   string
-	command   string
-	envVars   map[string]string
+	projectID         string
+	workDir           string
+	command           string
+	envVars           map[string]string
+	executionTarget   RunExecutionTarget
+	windowsPID        int
+	windowsPIDMarker  string
+	windowsPIDReady   chan struct{}
+	windowsStartError string
 
 	cmd    *exec.Cmd
 	ctx    context.Context
@@ -111,13 +129,14 @@ type projectRunner struct {
 // newProjectRunner 创建一个未启动的 projectRunner。
 func newProjectRunner(projectID, workDir, command string, envVars map[string]string, broadcast logBroadcaster) *projectRunner {
 	return &projectRunner{
-		projectID: projectID,
-		workDir:   workDir,
-		command:   command,
-		envVars:   envVars,
-		logBuf:    newRingBuffer(projectRunLogCapacity),
-		broadcast: broadcast,
-		status:    RunStatusStopped,
+		projectID:       projectID,
+		workDir:         workDir,
+		command:         command,
+		envVars:         envVars,
+		executionTarget: RunExecutionTargetAuto,
+		logBuf:          newRingBuffer(projectRunLogCapacity),
+		broadcast:       broadcast,
+		status:          RunStatusStopped,
 	}
 }
 
@@ -128,7 +147,7 @@ func (pr *projectRunner) Start(parentCtx context.Context, projectPath string) er
 	return pr.start(parentCtx, projectPath)
 }
 
-func (pr *projectRunner) StartWithConfig(parentCtx context.Context, projectPath, workDir, command string, envVars map[string]string) error {
+func (pr *projectRunner) StartWithConfig(parentCtx context.Context, projectPath, workDir, command string, envVars map[string]string, executionTarget RunExecutionTarget) error {
 	pr.opMu.Lock()
 	defer pr.opMu.Unlock()
 	pr.mu.Lock()
@@ -143,6 +162,7 @@ func (pr *projectRunner) StartWithConfig(parentCtx context.Context, projectPath,
 	pr.workDir = workDir
 	pr.command = command
 	pr.envVars = envVars
+	pr.executionTarget = normalizeRunExecutionTarget(executionTarget)
 	pr.mu.Unlock()
 	return pr.start(parentCtx, projectPath)
 }
@@ -163,6 +183,11 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 		pr.mu.Unlock()
 		return err
 	}
+	executionTarget, err := resolveRunExecutionTarget(projectPath, pr.executionTarget)
+	if err != nil {
+		pr.mu.Unlock()
+		return err
+	}
 
 	pr.status = RunStatusStarting
 	pr.exitChan = make(chan struct{})
@@ -173,15 +198,34 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 	pr.mu.Unlock()
 
 	pr.ctx, pr.cancel = context.WithCancel(parentCtx)
-	pr.cmd = exec.CommandContext(pr.ctx, "sh", "-c", pr.command)
-	pr.cmd.Dir = workDir
+	cmd, windowsPIDMarker, err := newProjectRunCommand(pr.ctx, executionTarget, workDir, pr.command)
+	if err != nil {
+		pr.cancel()
+		pr.mu.Lock()
+		pr.status = RunStatusFailed
+		pr.exitCode = -1
+		pr.hasExitCode = true
+		close(pr.exitChan)
+		pr.mu.Unlock()
+		return err
+	}
+	pr.cmd = cmd
+	pr.mu.Lock()
+	pr.windowsPID = 0
+	pr.windowsPIDMarker = windowsPIDMarker
+	pr.windowsPIDReady = nil
+	pr.windowsStartError = ""
+	if executionTarget == RunExecutionTargetWindows {
+		pr.windowsPIDReady = make(chan struct{})
+	}
+	windowsPIDReady := pr.windowsPIDReady
+	pr.mu.Unlock()
 
 	// 设置环境变量
 	pr.cmd.Env = os.Environ()
 	for k, v := range pr.envVars {
 		pr.cmd.Env = append(pr.cmd.Env, k+"="+v)
 	}
-
 	// 配置进程组，方便终止整个进程树
 	configureProcessGroup(pr.cmd)
 
@@ -223,11 +267,34 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 	pr.mu.Unlock()
 
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system",
-		Text: fmt.Sprintf("进程已启动: pid=%d, 命令=%s", pr.pid, pr.command)})
+		Text: fmt.Sprintf("进程已启动: pid=%d, 环境=%s, 命令=%s", pr.pid, executionTarget, pr.command)})
 
-	go pr.readPipe(stdout, "stdout")
-	go pr.readPipe(stderr, "stderr")
-	go pr.wait()
+	pipeReadersDone := make(chan struct{})
+	var pipeReaders sync.WaitGroup
+	pipeReaders.Add(2)
+	go func() {
+		defer pipeReaders.Done()
+		pr.readPipe(stdout, "stdout")
+	}()
+	go func() {
+		defer pipeReaders.Done()
+		pr.readPipe(stderr, "stderr")
+	}()
+	go func() {
+		pipeReaders.Wait()
+		close(pipeReadersDone)
+	}()
+	go pr.wait(pipeReadersDone)
+	if windowsPIDReady != nil {
+		select {
+		case <-windowsPIDReady:
+		case <-pr.exitChan:
+			return pr.windowsLaunchError()
+		case <-time.After(3 * time.Second):
+			terminateProcessGroup(pr.cmd)
+			return errors.New("Windows 启动器未返回进程 ID，已停止启动")
+		}
+	}
 
 	return nil
 }
@@ -253,6 +320,147 @@ func resolveProjectRunWorkDir(projectPath, configuredWorkDir string) (string, er
 		return "", errors.New("工作目录不能超出项目路径")
 	}
 	return resolvedWorkDir, nil
+}
+
+func normalizeRunExecutionTarget(target RunExecutionTarget) RunExecutionTarget {
+	if target == "" {
+		return RunExecutionTargetAuto
+	}
+	return target
+}
+
+func resolveRunExecutionTarget(projectPath string, requested RunExecutionTarget) (RunExecutionTarget, error) {
+	switch normalizeRunExecutionTarget(requested) {
+	case RunExecutionTargetAuto:
+		if _, ok := wslPathToWindowsPath(projectPath); ok {
+			return RunExecutionTargetWindows, nil
+		}
+		return RunExecutionTargetWSL, nil
+	case RunExecutionTargetWSL:
+		return RunExecutionTargetWSL, nil
+	case RunExecutionTargetWindows:
+		if _, ok := wslPathToWindowsPath(projectPath); !ok {
+			return "", errors.New("Windows 运行环境仅支持 /mnt/<盘符>/ 下的项目")
+		}
+		return RunExecutionTargetWindows, nil
+	default:
+		return "", errors.New("运行环境必须为 auto、wsl 或 windows")
+	}
+}
+
+func wslPathToWindowsPath(wslPath string) (string, bool) {
+	cleaned := filepath.ToSlash(filepath.Clean(wslPath))
+	if len(cleaned) < len("/mnt/d") || !strings.HasPrefix(cleaned, "/mnt/") {
+		return "", false
+	}
+	drive := cleaned[len("/mnt/")]
+	if !((drive >= 'a' && drive <= 'z') || (drive >= 'A' && drive <= 'Z')) {
+		return "", false
+	}
+	if len(cleaned) > len("/mnt/d") && cleaned[len("/mnt/d")] != '/' {
+		return "", false
+	}
+	rest := strings.TrimPrefix(cleaned[len("/mnt/d"):], "/")
+	windowsPath := strings.ToUpper(string(drive)) + `:\`
+	if rest != "" {
+		windowsPath += strings.ReplaceAll(rest, "/", `\`)
+	}
+	return windowsPath, true
+}
+
+func newProjectRunCommand(ctx context.Context, executionTarget RunExecutionTarget, workDir, command string) (*exec.Cmd, string, error) {
+	if executionTarget == RunExecutionTargetWSL {
+		cmd := exec.CommandContext(ctx, "sh", "-c", command)
+		cmd.Dir = workDir
+		return cmd, "", nil
+	}
+	if executionTarget != RunExecutionTargetWindows {
+		return nil, "", fmt.Errorf("不支持的运行环境: %s", executionTarget)
+	}
+	windowsWorkDir, ok := wslPathToWindowsPath(workDir)
+	if !ok {
+		return nil, "", errors.New("无法将工作目录转换为 Windows 路径")
+	}
+	powershellPath, err := windowsSystemExecutable("powershell.exe")
+	if err != nil {
+		return nil, "", err
+	}
+
+	marker, err := newWindowsPIDMarker()
+	if err != nil {
+		return nil, "", fmt.Errorf("生成 Windows 进程标识失败: %w", err)
+	}
+	workDirEncoded := base64.StdEncoding.EncodeToString([]byte(windowsWorkDir))
+	commandEncoded := base64.StdEncoding.EncodeToString([]byte(command))
+	// 工作目录和命令被编码为纯 ASCII 数据，再由 PowerShell 解码，避免依赖
+	// WSLENV 传递环境变量，也不将用户命令插入 PowerShell 源码。
+	script := fmt.Sprintf("$ProgressPreference = 'SilentlyContinue'\n$ErrorActionPreference = 'Stop'\ntry {\n  $workDir = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))\n  $command = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))\n  Set-Location -LiteralPath $workDir\n  $child = Start-Process -FilePath cmd.exe -ArgumentList @('/d', '/s', '/c', $command) -PassThru -NoNewWindow\n  [Console]::Out.WriteLine('%s' + $child.Id)\n  try {\n    $child.WaitForExit()\n    exit $child.ExitCode\n  } finally {\n    if (!$child.HasExited) { & taskkill.exe /PID $child.Id /T /F | Out-Null }\n  }\n} catch {\n  [Console]::Error.WriteLine($_.Exception.Message)\n  exit 1\n}\n", workDirEncoded, commandEncoded, marker)
+	encoded := base64.StdEncoding.EncodeToString(utf16LE(script))
+	return newWindowsPowerShellCommand(ctx, powershellPath, encoded), marker, nil
+}
+
+// newWindowsPowerShellCommand keeps the PowerShell success stream in text mode.
+// The generated script also suppresses its progress stream, which otherwise
+// serializes as CLIXML when WSL attaches redirected pipes.
+func newWindowsPowerShellCommand(ctx context.Context, powershellPath, encodedScript string) *exec.Cmd {
+	return exec.CommandContext(ctx, powershellPath,
+		"-NoLogo", "-NoProfile", "-NonInteractive",
+		"-OutputFormat", "Text",
+		"-EncodedCommand", encodedScript,
+	)
+}
+
+func windowsSystemExecutable(name string) (string, error) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	relativePath := filepath.Join("Windows", "System32", name)
+	if name == "powershell.exe" {
+		relativePath = filepath.Join("Windows", "System32", "WindowsPowerShell", "v1.0", name)
+	}
+	for _, drive := range append([]string{"c"}, mountedWindowsDrives()...) {
+		candidate := filepath.Join("/mnt", drive, relativePath)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("Windows 运行环境不可用：未找到 %s。请启用 WSL Windows 互操作", name)
+}
+
+func mountedWindowsDrives() []string {
+	entries, err := os.ReadDir("/mnt")
+	if err != nil {
+		return nil
+	}
+	drives := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) != 1 || name == "c" || !entry.IsDir() {
+			continue
+		}
+		if (name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z') {
+			drives = append(drives, name)
+		}
+	}
+	return drives
+}
+
+func newWindowsPIDMarker() (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return "__AUTO_WINDOWS_CHILD_" + hex.EncodeToString(bytes) + "__=", nil
+}
+
+func utf16LE(value string) []byte {
+	units := utf16.Encode([]rune(value))
+	output := make([]byte, len(units)*2)
+	for i, unit := range units {
+		output[i*2] = byte(unit)
+		output[i*2+1] = byte(unit >> 8)
+	}
+	return output
 }
 
 func isPathWithin(basePath, candidatePath string) bool {
@@ -293,6 +501,12 @@ func (pr *projectRunner) readPipe(r io.Reader, stream string) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
+		if stream == "stdout" && pr.recordWindowsPID(scanner.Text()) {
+			continue
+		}
+		if stream == "stderr" {
+			pr.recordWindowsStartError(scanner.Text())
+		}
 		entry := LogEntry{
 			Timestamp: time.Now(),
 			Stream:    stream,
@@ -302,7 +516,54 @@ func (pr *projectRunner) readPipe(r io.Reader, stream string) {
 	}
 }
 
-func (pr *projectRunner) wait() {
+func (pr *projectRunner) recordWindowsStartError(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	if pr.windowsPID == 0 && pr.windowsPIDMarker != "" {
+		pr.windowsStartError = text
+	}
+}
+
+func (pr *projectRunner) windowsLaunchError() error {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	if pr.windowsStartError != "" {
+		return fmt.Errorf("Windows 启动失败: %s", pr.windowsStartError)
+	}
+	if pr.hasExitCode {
+		return fmt.Errorf("Windows 启动器在返回进程 ID 前退出: code=%d", pr.exitCode)
+	}
+	return errors.New("Windows 启动器在返回进程 ID 前退出")
+}
+
+func (pr *projectRunner) recordWindowsPID(text string) bool {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	if pr.windowsPIDMarker == "" || !strings.HasPrefix(text, pr.windowsPIDMarker) {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimPrefix(text, pr.windowsPIDMarker))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	if pr.windowsPID != 0 {
+		return true
+	}
+	pr.windowsPID = pid
+	if pr.windowsPIDReady != nil {
+		close(pr.windowsPIDReady)
+	}
+	return true
+}
+
+func (pr *projectRunner) wait(pipeReadersDone <-chan struct{}) {
+	// Cmd.Wait closes the pipe handles. Wait for both scanners first so the
+	// final output (including Windows launcher errors) is not discarded.
+	<-pipeReadersDone
 	err := pr.cmd.Wait()
 	pr.mu.Lock()
 	exitCode := 0
@@ -350,6 +611,12 @@ func (pr *projectRunner) stop() error {
 
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system", Text: "正在停止进程..."})
 
+	pr.mu.RLock()
+	windowsPID := pr.windowsPID
+	pr.mu.RUnlock()
+	if windowsPID > 0 {
+		terminateWindowsProcessTree(windowsPID)
+	}
 	terminateProcessGroup(pr.cmd)
 
 	select {
@@ -362,6 +629,16 @@ func (pr *projectRunner) stop() error {
 	return nil
 }
 
+func terminateWindowsProcessTree(pid int) {
+	taskkillPath, err := windowsSystemExecutable("taskkill.exe")
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(ctx, taskkillPath, "/PID", strconv.Itoa(pid), "/T", "/F").Run()
+}
+
 // Restart 重启进程：先停止，等待退出，再启动。
 func (pr *projectRunner) Restart(parentCtx context.Context, projectPath string) error {
 	pr.opMu.Lock()
@@ -369,7 +646,7 @@ func (pr *projectRunner) Restart(parentCtx context.Context, projectPath string) 
 	return pr.restart(parentCtx, projectPath)
 }
 
-func (pr *projectRunner) RestartWithConfig(parentCtx context.Context, projectPath, workDir, command string, envVars map[string]string) error {
+func (pr *projectRunner) RestartWithConfig(parentCtx context.Context, projectPath, workDir, command string, envVars map[string]string, executionTarget RunExecutionTarget) error {
 	pr.opMu.Lock()
 	defer pr.opMu.Unlock()
 	pr.mu.Lock()
@@ -380,6 +657,7 @@ func (pr *projectRunner) RestartWithConfig(parentCtx context.Context, projectPat
 	pr.workDir = workDir
 	pr.command = command
 	pr.envVars = envVars
+	pr.executionTarget = normalizeRunExecutionTarget(executionTarget)
 	pr.mu.Unlock()
 	return pr.restart(parentCtx, projectPath)
 }

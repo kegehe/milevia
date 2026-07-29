@@ -88,8 +88,7 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 .primary.danger { border-color: #b84431; color: #fff; background: #e25b44; box-shadow: 3px 3px 0 #7a2a1c; }.primary.danger:hover:not(:disabled) { background: #d5513c; box-shadow: 1px 1px 0 #7a2a1c; transform: translate(2px, 2px); }.primary.danger:disabled { border-color: #c9d6ce; color: #809188; background: #dce7df; box-shadow: none; }
 .project-dashboard { width: min(1280px, calc(100% - 48px)); padding: clamp(52px, 8vw, 104px) 0 80px; }
 .dashboard-intro { align-items: flex-end !important; gap: 30px !important; margin-bottom: 28px !important; }
-.eyebrow { color: #dc624c !important; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px !important; font-weight: 800; }
-.project-dashboard h1 { margin-top: 10px; color: #19332c; font-size: clamp(35px, 4.4vw, 59px); font-weight: 760; line-height: 1.15; }
+.project-dashboard h1 { margin-top: 0; color: #19332c; font-size: clamp(35px, 4.4vw, 59px); font-weight: 760; line-height: 1.15; }
 .project-dashboard h1 em { color: var(--accent); font-style: normal; }
 .dashboard-summary { display: flex; align-items: baseline; gap: 7px; padding-bottom: 7px; color: #6f8279; font-size: 12px; }
 .dashboard-summary b { color: #19332c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 19px; }
@@ -134,7 +133,6 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 /* Task command desk: the dashboard reads as a live queue, not a gallery. */
 .command-dashboard { max-width: 1180px; padding-top: clamp(48px, 6vw, 82px); }
 .command-dashboard .dashboard-intro { align-items: end !important; margin-bottom: 36px !important; }
-.command-dashboard .eyebrow { color: #2e7869 !important; }
 .command-dashboard h1 { font-size: clamp(38px, 3.5vw, 48px); }.command-dashboard h1 em { color: var(--accent); }
 .command-dashboard .dashboard-summary { align-items: stretch; gap: 0; border: 1px solid #cfe0d6; border-radius: 7px; padding: 0; background: #fbfefb; box-shadow: 4px 4px 0 #d9e8dd; }
 .command-dashboard .dashboard-summary > button { display: grid; min-width: 94px; gap: 4px; border: 0; border-left: 1px solid #dce9e1; padding: 10px 14px; color: #19332c; background: transparent; text-align: left; transition: color .16s ease, background .16s ease; }.command-dashboard .dashboard-summary > button:first-child { border-left: 0; }.command-dashboard .dashboard-summary > button:hover { background: #eaf5ee; }.command-dashboard .dashboard-summary > button.selected { background: #dff1e7; box-shadow: inset 0 -3px #55a697; }

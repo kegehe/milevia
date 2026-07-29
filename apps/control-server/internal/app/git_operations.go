@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -249,14 +250,62 @@ func (s *Server) gitStage(w http.ResponseWriter, r *http.Request) {
 		return newGitRunner().(*gitCLIRunner).Stage(ctx, repo, paths)
 	})
 }
+
 func (s *Server) gitUnstage(w http.ResponseWriter, r *http.Request) {
 	s.gitPathsMutation(w, r, "unstage", func(ctx context.Context, repo string, paths []string) error {
 		return newGitRunner().(*gitCLIRunner).Unstage(ctx, repo, paths)
 	})
 }
 
+func (s *Server) gitStageAll(w http.ResponseWriter, r *http.Request) {
+	s.gitAllPathsMutation(w, r, "stage", "全部暂存", func(change GitChange) bool {
+		return change.Modified || change.Untracked || change.Deleted || change.Renamed || change.Conflicted
+	}, func(ctx context.Context, repo string, paths []string) error {
+		return newGitRunner().(*gitCLIRunner).Stage(ctx, repo, paths)
+	})
+}
+
+func (s *Server) gitUnstageAll(w http.ResponseWriter, r *http.Request) {
+	s.gitAllPathsMutation(w, r, "unstage", "全部取消暂存", func(change GitChange) bool {
+		return change.Staged
+	}, func(ctx context.Context, repo string, paths []string) error {
+		return newGitRunner().(*gitCLIRunner).Unstage(ctx, repo, paths)
+	})
+}
+
+func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ, label string, eligible func(GitChange) bool, execute func(context.Context, string, []string) error) {
+	var input struct {
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	paths := make([]string, 0, len(state.changes))
+	for _, change := range state.changes {
+		if eligible(change) {
+			paths = append(paths, change.Path)
+		}
+	}
+	if len(paths) == 0 {
+		writeError(w, http.StatusConflict, errors.New("there are no eligible Git changes"))
+		return
+	}
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, typ, fmt.Sprintf("%s（%d 个文件）", label, len(paths)), state.snapshot, func() error {
+		return execute(r.Context(), repo, paths)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
 func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ string, execute func(context.Context, string, []string) error) {
-	projectID := chi.URLParam(r, "projectID")
 	var input struct {
 		Paths      []string `json:"paths"`
 		StateToken string   `json:"stateToken"`
@@ -274,26 +323,11 @@ func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ st
 			return
 		}
 	}
-	repo, err := s.projectPath(r.Context(), projectID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, errors.New("project not found"))
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	release, acquired := s.acquireProjectWorkspace(projectID, "git:"+uuid.NewString())
-	if !acquired {
-		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
 		return
 	}
 	defer release()
-	state, err := s.validateGitStateToken(r.Context(), projectID, repo, input.StateToken)
-	if err != nil {
-		writeError(w, http.StatusConflict, err)
-		return
-	}
 	available := map[string]GitChange{}
 	for _, change := range state.changes {
 		available[change.Path] = change
@@ -305,26 +339,337 @@ func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ st
 			return
 		}
 	}
-	now := time.Now().UTC()
-	operation := GitOperation{ID: uuid.NewString(), ProjectID: projectID, Type: typ, Status: gitOperationQueued, RequestSummary: strings.Join(input.Paths, ", "), RequestedAt: now}
-	if _, err := s.db.ExecContext(r.Context(), `insert into git_operations (id,project_id,type,status,request_summary,requested_at) values (?,?,?,?,?,?)`, operation.ID, operation.ProjectID, operation.Type, operation.Status, operation.RequestSummary, operation.RequestedAt); err != nil {
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, typ, strings.Join(input.Paths, ", "), state.snapshot, func() error {
+		return execute(r.Context(), repo, input.Paths)
+	})
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Message    string `json:"message"`
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	message := strings.TrimSpace(input.Message)
+	if message == "" || utf8.RuneCountInString(message) > 4000 || strings.ContainsRune(message, 0) {
+		writeError(w, http.StatusBadRequest, errors.New("Git commit message must be between 1 and 4000 characters"))
+		return
+	}
+	if firstLine := strings.Split(message, "\n")[0]; utf8.RuneCountInString(firstLine) > 72 {
+		writeError(w, http.StatusBadRequest, errors.New("Git commit subject must be at most 72 characters"))
+		return
+	}
+	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	hasStaged := false
+	for _, change := range state.changes {
+		if change.Conflicted {
+			writeError(w, http.StatusConflict, errors.New("resolve Git conflicts before committing"))
+			return
+		}
+		hasStaged = hasStaged || change.Staged
+	}
+	if !hasStaged {
+		writeError(w, http.StatusConflict, errors.New("there are no staged Git changes to commit"))
+		return
+	}
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, "commit", message, state.snapshot, func() error {
+		return newGitRunner().(*gitCLIRunner).Commit(r.Context(), repo, message)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Paths            []string `json:"paths"`
+		Mode             string   `json:"mode"`
+		IncludeUntracked bool     `json:"includeUntracked"`
+		StateToken       string   `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Mode != "worktree" && input.Mode != "all" {
+		writeError(w, http.StatusBadRequest, errors.New("unsupported Git discard mode"))
+		return
+	}
+	if len(input.Paths) > 100 {
+		writeError(w, http.StatusBadRequest, errors.New("at most 100 Git paths are allowed"))
+		return
+	}
+	for _, path := range input.Paths {
+		if err := validateGitPath(path); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	if input.Mode == "worktree" {
+		if len(input.Paths) == 0 {
+			writeError(w, http.StatusBadRequest, errors.New("at least one Git path is required"))
+			return
+		}
+		available := map[string]GitChange{}
+		for _, change := range state.changes {
+			available[change.Path] = change
+		}
+		tracked, untracked := make([]string, 0, len(input.Paths)), make([]string, 0)
+		for _, path := range input.Paths {
+			change, found := available[path]
+			if !found || change.Conflicted {
+				writeError(w, http.StatusConflict, errors.New("selected Git paths cannot be restored from the index"))
+				return
+			}
+			if change.Untracked {
+				if !input.IncludeUntracked {
+					writeError(w, http.StatusConflict, errors.New("explicit confirmation is required to remove untracked Git paths"))
+					return
+				}
+				untracked = append(untracked, path)
+				continue
+			}
+			if !(change.Modified || change.Deleted || change.Renamed) {
+				writeError(w, http.StatusConflict, errors.New("selected Git paths cannot be restored from the index"))
+				return
+			}
+			tracked = append(tracked, path)
+		}
+		runner := newGitRunner().(*gitCLIRunner)
+		if err := runner.ValidateUntrackedRemoval(repo, untracked); err != nil {
+			writeError(w, http.StatusConflict, errors.New("untracked Git paths changed; refresh the repository"))
+			return
+		}
+		result, err := s.executeGitOperation(r.Context(), projectID, repo, "discard_worktree", strings.Join(input.Paths, ", "), state.snapshot, func() error {
+			if len(tracked) > 0 {
+				if err := runner.RestoreWorktree(r.Context(), repo, tracked); err != nil {
+					return err
+				}
+			}
+			if len(untracked) == 0 {
+				return nil
+			}
+			if err := runner.RemoveUntracked(repo, untracked); err != nil {
+				if len(tracked) > 0 {
+					return partiallyAppliedGitError(err)
+				}
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, result)
+		return
+	}
+	if len(input.Paths) != 0 {
+		writeError(w, http.StatusBadRequest, errors.New("discard all does not accept individual Git paths"))
+		return
+	}
+	tracked, untracked := make([]string, 0, len(state.changes)), make([]string, 0)
+	for _, change := range state.changes {
+		if change.Conflicted {
+			writeError(w, http.StatusConflict, errors.New("resolve Git conflicts before discarding all changes"))
+			return
+		}
+		if change.Untracked {
+			untracked = append(untracked, change.Path)
+		} else {
+			tracked = append(tracked, change.Path)
+		}
+	}
+	if len(tracked) == 0 && (!input.IncludeUntracked || len(untracked) == 0) {
+		writeError(w, http.StatusConflict, errors.New("there are no Git changes eligible for discard"))
+		return
+	}
+	summary := fmt.Sprintf("丢弃全部未提交改动（%d 个文件）", len(tracked))
+	if input.IncludeUntracked {
+		summary = fmt.Sprintf("丢弃全部未提交改动及 %d 个未跟踪文件", len(untracked))
+	}
+	runner := newGitRunner().(*gitCLIRunner)
+	initial := !hasGitHead(state.snapshot)
+	removalPaths := append([]string{}, untracked...)
+	if initial {
+		removalPaths = append(removalPaths, tracked...)
+	}
+	if err := runner.ValidateUntrackedRemoval(repo, removalPaths); err != nil {
+		writeError(w, http.StatusConflict, errors.New("untracked Git paths changed; refresh the repository"))
+		return
+	}
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, "discard_all", summary, state.snapshot, func() error {
+		if initial {
+			if err := runner.DiscardInitialChanges(r.Context(), repo, tracked); err != nil {
+				return err
+			}
+			if input.IncludeUntracked {
+				if err := runner.RemoveUntracked(repo, untracked); err != nil {
+					if len(tracked) > 0 {
+						return partiallyAppliedGitError(err)
+					}
+					return err
+				}
+			}
+			return nil
+		}
+		if err := runner.RestoreAll(r.Context(), repo, tracked); err != nil {
+			return err
+		}
+		if input.IncludeUntracked {
+			if err := runner.RemoveUntracked(repo, untracked); err != nil {
+				if len(tracked) > 0 {
+					return partiallyAppliedGitError(err)
+				}
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (string, string, gitStateToken, func(), bool) {
+	projectID := chi.URLParam(r, "projectID")
+	repo, err := s.projectPath(r.Context(), projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return "", "", gitStateToken{}, nil, false
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return "", "", gitStateToken{}, nil, false
+	}
+	release, acquired := s.acquireProjectWorkspace(projectID, "git:"+uuid.NewString())
+	if !acquired {
+		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		return "", "", gitStateToken{}, nil, false
+	}
+	state, err := s.validateGitStateToken(r.Context(), projectID, repo, stateToken)
+	if err != nil {
+		release()
+		writeError(w, http.StatusConflict, err)
+		return "", "", gitStateToken{}, nil, false
+	}
+	return projectID, repo, state, release, true
+}
+
+type gitOperationResult struct {
+	OperationID  string `json:"operationId"`
+	Status       string `json:"status"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+}
+
+func (s *Server) executeGitOperation(ctx context.Context, projectID, repo, typ, summary string, before GitSnapshot, execute func() error) (gitOperationResult, error) {
+	now := time.Now().UTC()
+	beforeState, _ := json.Marshal(before)
+	operation := GitOperation{ID: uuid.NewString(), ProjectID: projectID, Type: typ, Status: gitOperationQueued, RequestSummary: summary, RequestedAt: now}
+	if _, err := s.db.ExecContext(ctx, `insert into git_operations (id,project_id,type,status,request_summary,before_state,requested_at) values (?,?,?,?,?,?,?)`, operation.ID, operation.ProjectID, operation.Type, operation.Status, operation.RequestSummary, string(beforeState), operation.RequestedAt); err != nil {
+		return gitOperationResult{}, err
 	}
 	operation.Status, operation.StartedAt = gitOperationRunning, &now
-	if _, err := s.db.ExecContext(r.Context(), `update git_operations set status=?,started_at=? where id=? and status=?`, operation.Status, operation.StartedAt, operation.ID, gitOperationQueued); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	if _, err := s.db.ExecContext(ctx, `update git_operations set status=?,started_at=? where id=? and status=?`, operation.Status, operation.StartedAt, operation.ID, gitOperationQueued); err != nil {
+		return gitOperationResult{}, err
 	}
-	err = execute(r.Context(), repo, input.Paths)
+	if err := execute(); err != nil {
+		finished := time.Now().UTC()
+		status, code, message := gitOperationFailure(err)
+		if err := s.updateGitOperation(ctx, operation.ID, status, "{}", code, message, finished); err != nil {
+			return s.markGitOperationNeedsAttention(ctx, operation.ID, "{}", "audit_update_failed", "Git 操作返回失败，但无法记录最终状态；请刷新并检查工作区", finished), nil
+		}
+		return gitOperationResult{OperationID: operation.ID, Status: status, ErrorMessage: message}, nil
+	}
 	finished := time.Now().UTC()
+	snapshot, _, _, err := readGitState(ctx, repo)
 	if err != nil {
-		_, _ = s.db.ExecContext(r.Context(), `update git_operations set status=?,error_code=?,error_message=?,finished_at=? where id=?`, gitOperationFailed, "git_failed", "Git operation failed", finished, operation.ID)
-		writeJSON(w, http.StatusAccepted, map[string]string{"operationId": operation.ID})
-		return
+		return s.markGitOperationNeedsAttention(ctx, operation.ID, "{}", "result_unverified", "Git 操作已执行，但无法读取最新仓库状态；请刷新并检查工作区", finished), nil
 	}
-	_, _ = s.db.ExecContext(r.Context(), `update git_operations set status=?,finished_at=? where id=?`, gitOperationSucceeded, finished, operation.ID)
-	writeJSON(w, http.StatusAccepted, map[string]string{"operationId": operation.ID})
+	afterState, err := json.Marshal(snapshot)
+	if err != nil {
+		return s.markGitOperationNeedsAttention(ctx, operation.ID, "{}", "result_unverified", "Git 操作已执行，但无法编码最新仓库状态；请刷新并检查工作区", finished), nil
+	}
+	if err := s.updateGitOperation(ctx, operation.ID, gitOperationSucceeded, string(afterState), "", "", finished); err != nil {
+		return s.markGitOperationNeedsAttention(ctx, operation.ID, string(afterState), "audit_update_failed", "Git 操作已执行，但无法记录最终状态；请刷新并检查工作区", finished), nil
+	}
+	return gitOperationResult{OperationID: operation.ID, Status: gitOperationSucceeded}, nil
+}
+
+func partiallyAppliedGitError(err error) error {
+	return fmt.Errorf("%w: %v", errGitPartiallyApplied, err)
+}
+
+func (s *Server) updateGitOperation(ctx context.Context, operationID, status, afterState, code, message string, finished time.Time) error {
+	_, err := s.db.ExecContext(ctx, `update git_operations set status=?,after_state=?,error_code=?,error_message=?,finished_at=? where id=?`, status, afterState, code, message, finished, operationID)
+	return err
+}
+
+func (s *Server) markGitOperationNeedsAttention(ctx context.Context, operationID, afterState, code, message string, finished time.Time) gitOperationResult {
+	if err := s.updateGitOperation(ctx, operationID, gitOperationNeedsAttention, afterState, code, message, finished); err != nil {
+		go s.retryGitOperationUpdate(operationID, afterState, code, message, finished)
+	}
+	return gitOperationResult{OperationID: operationID, Status: gitOperationNeedsAttention, ErrorMessage: message}
+}
+
+func (s *Server) retryGitOperationUpdate(operationID, afterState, code, message string, finished time.Time) {
+	for _, delay := range []time.Duration{250 * time.Millisecond, time.Second, 3 * time.Second} {
+		select {
+		case <-s.runtimeCtx.Done():
+			return
+		case <-time.After(delay):
+		}
+		result, err := s.db.ExecContext(s.runtimeCtx, `update git_operations set status=?,after_state=?,error_code=?,error_message=?,finished_at=? where id=? and status in (?,?)`, gitOperationNeedsAttention, afterState, code, message, finished, operationID, gitOperationQueued, gitOperationRunning)
+		if err != nil {
+			continue
+		}
+		changed, err := result.RowsAffected()
+		if err != nil || changed > 0 {
+			return
+		}
+	}
+}
+
+func gitOperationFailure(err error) (status, code, message string) {
+	if errors.Is(err, errGitPartiallyApplied) {
+		return gitOperationNeedsAttention, "partial_result", "部分文件可能已被处理；请刷新仓库并检查工作区"
+	}
+	var commandErr *gitCommandError
+	if !errors.As(err, &commandErr) {
+		return gitOperationFailed, "git_failed", "Git 操作失败"
+	}
+	stderr := strings.ToLower(commandErr.stderr)
+	switch {
+	case strings.Contains(stderr, "author identity unknown"), strings.Contains(stderr, "please tell me who you are"), strings.Contains(stderr, "unable to auto-detect email address"):
+		return gitOperationFailed, "identity_not_configured", "Git 用户身份未配置，请设置 user.name 和 user.email"
+	case strings.Contains(stderr, "index.lock"), strings.Contains(stderr, "another git process"):
+		return gitOperationFailed, "repository_locked", "Git 暂存区正被其他操作占用"
+	case strings.Contains(stderr, "hook declined"), strings.Contains(stderr, "hook failed"):
+		return gitOperationFailed, "hook_rejected", "Git hook 拒绝了本次操作"
+	case strings.Contains(stderr, "nothing to commit"):
+		return gitOperationFailed, "nothing_to_commit", "没有可提交的已暂存改动"
+	default:
+		return gitOperationFailed, "git_failed", "Git 操作失败"
+	}
 }
 
 func readGitState(ctx context.Context, repo string) (GitSnapshot, []GitChange, map[string]string, error) {

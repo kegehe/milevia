@@ -86,26 +86,105 @@ type claudeCLIRunner struct {
 }
 
 type claudeCLISession struct {
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	mu          sync.Mutex
-	current     *claudeSessionTurn
-	queued      []*claudeSessionTurn
-	pending     []claudeSessionEvent
-	initSeen    bool
-	stopped     bool
-	done        chan error
-	processDone chan struct{}
+	cmd                    *exec.Cmd
+	stdin                  io.WriteCloser
+	mu                     sync.Mutex
+	current                *claudeSessionTurn
+	queued                 []*claudeSessionTurn
+	pending                []claudeSessionEvent
+	initSeen               bool
+	stopped                bool
+	done                   chan error
+	processDone            chan struct{}
+	turnIdleTimeout        time.Duration
+	initialResponseTimeout time.Duration
+	toolResultTimeout      time.Duration
 }
 
 type claudeSessionTurn struct {
-	request AgentRunRequest
-	sink    AgentRunSink
+	request        AgentRunRequest
+	sink           AgentRunSink
+	idleTimer      *time.Timer
+	idleGeneration uint64
+	waitPhase      claudeTurnWaitPhase
+	lastEvent      string
+	lastToolName   string
 }
 
 type claudeSessionEvent struct {
 	typ     string
 	payload json.RawMessage
+}
+
+type claudeTurnWaitPhase string
+
+const (
+	claudeTurnWaitingInitialResponse claudeTurnWaitPhase = "initial_response"
+	claudeTurnWaitingForToolResult   claudeTurnWaitPhase = "tool_execution"
+	claudeTurnWaitingAfterToolResult claudeTurnWaitPhase = "after_tool_result"
+	claudeTurnWaitingForActivity     claudeTurnWaitPhase = "stream_activity"
+)
+
+var errClaudeTurnIdleTimeout = errors.New("Claude 流式会话长时间无输出，已自动停止，请重试")
+
+type claudeTurnStallError struct {
+	phase     claudeTurnWaitPhase
+	lastEvent string
+	toolName  string
+	timeout   time.Duration
+}
+
+type claudeQueuedTurnCancelledError struct {
+	cause *claudeTurnStallError
+}
+
+func (err *claudeQueuedTurnCancelledError) Error() string {
+	return "Claude 会话因前一条消息超时而停止，当前排队消息尚未执行，请重试。"
+}
+
+func (err *claudeQueuedTurnCancelledError) Unwrap() error { return err.cause }
+
+func (err *claudeQueuedTurnCancelledError) ErrorDetails() map[string]string {
+	details := map[string]string{
+		"stallPhase": "queued",
+		"lastEvent":  "not_started",
+		"toolName":   "",
+		"timeout":    "",
+	}
+	if err.cause != nil {
+		details["previousStallPhase"] = string(err.cause.phase)
+		details["previousLastEvent"] = err.cause.lastEvent
+		details["previousToolName"] = err.cause.toolName
+	}
+	return details
+}
+
+func (err *claudeTurnStallError) Error() string {
+	switch err.phase {
+	case claudeTurnWaitingInitialResponse:
+		return fmt.Sprintf("Claude 在 %s 内未返回模型响应，已自动停止，请重试。", err.timeout)
+	case claudeTurnWaitingAfterToolResult:
+		if err.toolName != "" {
+			return fmt.Sprintf("Claude 在工具 %s 返回结果后 %s 未继续响应，可能是上游模型流挂起，已自动停止，请重试。", err.toolName, err.timeout)
+		}
+		return fmt.Sprintf("Claude 在工具结果返回后 %s 未继续响应，可能是上游模型流挂起，已自动停止，请重试。", err.timeout)
+	case claudeTurnWaitingForToolResult:
+		if err.toolName != "" {
+			return fmt.Sprintf("Claude 工具 %s 执行超过 %s 未返回结果，已自动停止，请重试。", err.toolName, err.timeout)
+		}
+	}
+	return fmt.Sprintf("Claude 流式会话连续 %s 无进展，已自动停止，请重试。", err.timeout)
+}
+
+func (err *claudeTurnStallError) Unwrap() error { return errClaudeTurnIdleTimeout }
+
+func (err *claudeTurnStallError) ErrorDetails() map[string]string {
+	return map[string]string{
+		"stallPhase": string(err.phase),
+		"lastEvent":  err.lastEvent,
+		"toolName":   err.toolName,
+		"timeout":    err.timeout.String(),
+	}
 }
 
 func newClaudeCLIRunner(config Config) AgentRunner {
@@ -250,7 +329,15 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start Claude: %w", err)
 	}
-	session := &claudeCLISession{cmd: cmd, stdin: stdin, done: make(chan error, 1), processDone: make(chan struct{})}
+	session := &claudeCLISession{
+		cmd:                    cmd,
+		stdin:                  stdin,
+		done:                   make(chan error, 1),
+		processDone:            make(chan struct{}),
+		turnIdleTimeout:        r.config.ClaudeTurnIdleTimeout,
+		initialResponseTimeout: r.config.ClaudeInitialResponseTimeout,
+		toolResultTimeout:      r.config.ClaudeToolResultTimeout,
+	}
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go func() { defer readers.Done(); session.readOutput(stdout) }()
@@ -452,21 +539,10 @@ func (session *claudeCLISession) Stop() {
 		return
 	}
 	session.stopped = true
+	session.stopTurnTimerLocked(session.current)
 	cmd := session.cmd
 	session.mu.Unlock()
-	if cmd.Process != nil {
-		terminateProcessGroup(cmd)
-		// A process can ignore SIGTERM (or leave a descendant holding the
-		// pipes open). Match the one-shot runner's bounded cancellation so a
-		// stopped session cannot keep project deletion waiting indefinitely.
-		go func() {
-			select {
-			case <-session.processDone:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-			}
-		}()
-	}
+	session.stopProcess(cmd)
 }
 
 func (session *claudeCLISession) Done() <-chan error { return session.done }
@@ -494,6 +570,7 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 			session.emit("stream.error", mustJSON(map[string]string{"error": err.Error()}), false)
 			continue
 		}
+		session.noteStreamEvent(envelope.Type, envelope.Message.Content)
 		initialized := envelope.Type == "system" && envelope.Subtype == "init"
 		session.emit(envelope.Type, line, initialized)
 		if envelope.Type == "assistant" {
@@ -559,6 +636,7 @@ func (session *claudeCLISession) finishCurrent(err error) {
 		session.mu.Unlock()
 		return
 	}
+	session.stopTurnTimerLocked(current)
 	session.current = nil
 	var next *claudeSessionTurn
 	if !session.stopped && len(session.queued) > 0 {
@@ -593,6 +671,7 @@ func (session *claudeCLISession) finish(err error) {
 	session.stopped = true
 	turns := make([]*claudeSessionTurn, 0, 1+len(session.queued))
 	if session.current != nil {
+		session.stopTurnTimerLocked(session.current)
 		turns = append(turns, session.current)
 	}
 	turns = append(turns, session.queued...)
@@ -607,6 +686,7 @@ func (session *claudeCLISession) finish(err error) {
 func (session *claudeCLISession) abortFailedStart(current *claudeSessionTurn, err error) {
 	session.mu.Lock()
 	if session.current == current {
+		session.stopTurnTimerLocked(current)
 		session.current = nil
 	}
 	session.stopped = true
@@ -617,9 +697,7 @@ func (session *claudeCLISession) abortFailedStart(current *claudeSessionTurn, er
 	for _, turn := range queued {
 		finishTurn(turn, err)
 	}
-	if cmd.Process != nil {
-		terminateProcessGroup(cmd)
-	}
+	session.stopProcess(cmd)
 }
 
 func (session *claudeCLISession) startCurrentLocked(turn *claudeSessionTurn) error {
@@ -644,7 +722,162 @@ func (session *claudeCLISession) startCurrentLocked(turn *claudeSessionTurn) err
 	if _, err := session.stdin.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("write Claude input: %w", err)
 	}
+	turn.waitPhase = claudeTurnWaitingInitialResponse
+	turn.lastEvent = "user_prompt"
+	turn.lastToolName = ""
+	session.startTurnTimerLocked(turn)
 	return nil
+}
+
+func (session *claudeCLISession) startTurnTimerLocked(turn *claudeSessionTurn) {
+	session.stopTurnTimerLocked(turn)
+	timeout := session.timeoutForPhase(turn.waitPhase)
+	turn.idleGeneration++
+	generation := turn.idleGeneration
+	turn.idleTimer = time.AfterFunc(timeout, func() {
+		session.failStalledTurn(turn, generation)
+	})
+}
+
+func (session *claudeCLISession) stopTurnTimerLocked(turn *claudeSessionTurn) {
+	if turn == nil {
+		return
+	}
+	turn.idleGeneration++
+	if turn.idleTimer != nil {
+		turn.idleTimer.Stop()
+	}
+	turn.idleTimer = nil
+}
+
+func (session *claudeCLISession) timeoutForPhase(phase claudeTurnWaitPhase) time.Duration {
+	return claudeTimeoutForPhase(phase, session.initialResponseTimeout, session.toolResultTimeout, session.turnIdleTimeout)
+}
+
+func claudeTimeoutForPhase(phase claudeTurnWaitPhase, initialResponse, afterToolResult, idle time.Duration) time.Duration {
+	switch phase {
+	case claudeTurnWaitingInitialResponse:
+		if initialResponse > 0 {
+			return initialResponse
+		}
+		return defaultClaudeInitialResponseTimeout
+	case claudeTurnWaitingAfterToolResult:
+		if afterToolResult > 0 {
+			return afterToolResult
+		}
+		return defaultClaudeToolResultTimeout
+	default:
+		if idle > 0 {
+			return idle
+		}
+		return defaultClaudeTurnIdleTimeout
+	}
+}
+
+func (session *claudeCLISession) noteStreamEvent(eventType string, content json.RawMessage) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.current == nil {
+		return
+	}
+	turn := session.current
+	switch eventType {
+	case "assistant":
+		turn.lastEvent = "assistant"
+		if toolName := claudeToolUseName(content); toolName != "" {
+			turn.waitPhase = claudeTurnWaitingForToolResult
+			turn.lastEvent = "assistant.tool_use"
+			turn.lastToolName = toolName
+		} else {
+			turn.waitPhase = claudeTurnWaitingForActivity
+		}
+	case "user":
+		if claudeToolResult(content) {
+			turn.waitPhase = claudeTurnWaitingAfterToolResult
+			turn.lastEvent = "user.tool_result"
+		}
+	case "result":
+		turn.lastEvent = "result"
+		session.stopTurnTimerLocked(turn)
+		return
+	default:
+		return
+	}
+	session.startTurnTimerLocked(turn)
+}
+
+func (session *claudeCLISession) failStalledTurn(current *claudeSessionTurn, generation uint64) {
+	session.mu.Lock()
+	if session.stopped || session.current != current || current.idleGeneration != generation {
+		session.mu.Unlock()
+		return
+	}
+	session.stopped = true
+	current.idleGeneration++
+	current.idleTimer = nil
+	stallErr := &claudeTurnStallError{phase: current.waitPhase, lastEvent: current.lastEvent, toolName: current.lastToolName, timeout: session.timeoutForPhase(current.waitPhase)}
+	turns := make([]*claudeSessionTurn, 0, 1+len(session.queued))
+	turns = append(turns, current)
+	turns = append(turns, session.queued...)
+	session.current = nil
+	session.queued = nil
+	cmd := session.cmd
+	session.mu.Unlock()
+
+	finishTurn(current, stallErr)
+	for _, turn := range turns[1:] {
+		finishTurn(turn, &claudeQueuedTurnCancelledError{cause: stallErr})
+	}
+	// A timeout has already failed the turn. Do not retain the stale process
+	// for the normal stop grace period before a replacement session can start.
+	forceTerminateProcessGroup(cmd)
+}
+
+func claudeToolUseName(content json.RawMessage) string {
+	var blocks []struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return ""
+	}
+	for _, block := range blocks {
+		if block.Type == "tool_use" && block.Name != "" {
+			return block.Name
+		}
+	}
+	return ""
+}
+
+func claudeToolResult(content json.RawMessage) bool {
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return false
+	}
+	for _, block := range blocks {
+		if block.Type == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
+func (session *claudeCLISession) stopProcess(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	terminateProcessGroup(cmd)
+	// A process can ignore SIGTERM (or leave a descendant holding the pipes
+	// open), so ensure a stalled session cannot retain its workspace forever.
+	go func() {
+		select {
+		case <-session.processDone:
+		case <-time.After(5 * time.Second):
+			forceTerminateProcessGroup(cmd)
+		}
+	}()
 }
 
 func resultError(payload json.RawMessage) error {

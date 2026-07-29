@@ -38,3 +38,5 @@ agent/
 # Local convenience files
 /dev
 /package-lock.json
+apps/web/package-lock.json
+apps/web/test-results/

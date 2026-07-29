@@ -34,6 +34,8 @@ type sshClient struct {
 	tunnelWG    sync.WaitGroup
 	agentConn   net.Conn
 	closed      bool
+	sftpClient  *sftp.Client // 持久化 SFTP 客户端（懒初始化）
+	sftpMu      sync.Mutex   // 保护 sftpClient
 }
 
 func parsePinnedHostKey(value string) (ssh.PublicKey, error) {
@@ -203,27 +205,43 @@ func (c *sshClient) connect(ctx context.Context) error {
 
 func (c *sshClient) close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return nil
 	}
 	c.closed = true
-	if c.tunnelReady != nil {
-		close(c.tunnelReady)
-		c.tunnelReady = nil
+	tunnelReady := c.tunnelReady
+	tunnel := c.tunnel
+	client := c.client
+	agentConn := c.agentConn
+	c.tunnelReady = nil
+	c.tunnel = nil
+	c.client = nil
+	c.agentConn = nil
+	c.mu.Unlock()
+
+	if tunnelReady != nil {
+		close(tunnelReady)
 	}
-	if c.tunnel != nil {
-		_ = c.tunnel.Close()
-		c.tunnel = nil
+	if tunnel != nil {
+		_ = tunnel.Close()
 	}
 	var closeErr error
-	if c.client != nil {
-		closeErr = c.client.Close()
-		c.client = nil
+	if client != nil {
+		// Close SSH before acquiring sftpMu. A blocked SFTP request uses this
+		// transport, so this interrupts it instead of waiting behind its health
+		// check or request bookkeeping.
+		closeErr = client.Close()
 	}
-	if c.agentConn != nil {
-		_ = c.agentConn.Close()
-		c.agentConn = nil
+	if agentConn != nil {
+		_ = agentConn.Close()
+	}
+	c.sftpMu.Lock()
+	sftpClient := c.sftpClient
+	c.sftpClient = nil
+	c.sftpMu.Unlock()
+	if sftpClient != nil {
+		_ = sftpClient.Close()
 	}
 	return closeErr
 }
@@ -351,20 +369,73 @@ func (c *sshClient) execCommand(ctx context.Context, cmd string) ([]byte, error)
 	}
 }
 
-// readDir lists directory entries on the remote server via SFTP.
-func (c *sshClient) readDir(ctx context.Context, path string) ([]os.FileInfo, error) {
+// getSFTPClient 返回持久化的 SFTP 客户端。如果已有可用连接则复用，
+// 否则创建新连接。SFTP client 本身是线程安全的，可安全并发复用。
+func (c *sshClient) getSFTPClient(ctx context.Context) (*sftp.Client, error) {
+	c.sftpMu.Lock()
+	existing := c.sftpClient
+	c.sftpMu.Unlock()
+	if existing != nil {
+		// Stat can block indefinitely on an unhealthy remote. Never hold
+		// sftpMu during network I/O so close can first tear down SSH.
+		if _, err := existing.Stat("."); err == nil {
+			return existing, nil
+		}
+		c.sftpMu.Lock()
+		if c.sftpClient == existing {
+			c.sftpClient = nil
+		}
+		c.sftpMu.Unlock()
+		_ = existing.Close()
+	}
+
+	// 确保 SSH 连接可用
 	if err := c.connect(ctx); err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
 
-	sftpClient, err := sftp.NewClient(client)
+	c.mu.Lock()
+	sshClient := c.client
+	c.mu.Unlock()
+	if sshClient == nil {
+		return nil, errors.New("SSH 连接已断开")
+	}
+
+	client, err := sftp.NewClient(sshClient)
 	if err != nil {
 		return nil, fmt.Errorf("创建 SFTP 客户端失败：%w", err)
 	}
-	defer sftpClient.Close()
+
+	// Keep close and publication atomic: close marks the connection closed
+	// before waiting for sftpMu, so it will either remove this client or this
+	// branch will dispose of it without publishing a new stale client.
+	c.mu.Lock()
+	if c.closed || c.client != sshClient {
+		c.mu.Unlock()
+		_ = client.Close()
+		return nil, errors.New("SSH 连接已关闭")
+	}
+	c.sftpMu.Lock()
+	if c.sftpClient == nil {
+		c.sftpClient = client
+		c.sftpMu.Unlock()
+		c.mu.Unlock()
+		return client, nil
+	}
+	existing = c.sftpClient
+	c.sftpMu.Unlock()
+	c.mu.Unlock()
+	_ = client.Close()
+	return existing, nil
+}
+
+// readDir lists directory entries on the remote server via SFTP.
+// 使用持久化 SFTP session 以避免每次新建 client 的握手开销。
+func (c *sshClient) readDir(ctx context.Context, path string) ([]os.FileInfo, error) {
+	sftpClient, err := c.getSFTPClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return sftpClient.ReadDir(path)
 }
 
@@ -382,12 +453,15 @@ func (c *sshClient) newSession(ctx context.Context) (*ssh.Session, error) {
 // sshRunner implements AgentRunner + StreamingAgentRunner for a remote server
 // accessed via SSH.
 type sshRunner struct {
-	client      *sshClient
-	connID      string
-	connName    string
-	controlURL  string
-	approvalURL string
-	rootPath    string
+	client                 *sshClient
+	connID                 string
+	connName               string
+	controlURL             string
+	approvalURL            string
+	rootPath               string
+	turnIdleTimeout        time.Duration
+	initialResponseTimeout time.Duration
+	toolResultTimeout      time.Duration
 }
 
 func (r *sshRunner) canonicalProjectPath(ctx context.Context, requested string) (string, error) {
@@ -575,12 +649,15 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 	}
 
 	sshSess := &sshAgentSession{
-		session:     session,
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		done:        make(chan error, 1),
-		processDone: make(chan struct{}),
+		session:                session,
+		stdin:                  stdin,
+		stdout:                 stdout,
+		stderr:                 stderr,
+		done:                   make(chan error, 1),
+		processDone:            make(chan struct{}),
+		turnIdleTimeout:        r.turnIdleTimeout,
+		initialResponseTimeout: r.initialResponseTimeout,
+		toolResultTimeout:      r.toolResultTimeout,
 	}
 
 	go func() {
@@ -614,18 +691,21 @@ func sshClaudePermissionArgs(permissionMode, approvalHookCmd string) string {
 
 // sshAgentSession implements AgentSession for a remote SSH Claude process.
 type sshAgentSession struct {
-	session     *ssh.Session
-	stdin       io.WriteCloser
-	stdout      io.Reader
-	stderr      io.Reader
-	mu          sync.Mutex
-	current     *claudeSessionTurn
-	queued      []*claudeSessionTurn
-	pending     []claudeSessionEvent
-	initSeen    bool
-	stopped     bool
-	done        chan error
-	processDone chan struct{}
+	session                *ssh.Session
+	stdin                  io.WriteCloser
+	stdout                 io.Reader
+	stderr                 io.Reader
+	mu                     sync.Mutex
+	current                *claudeSessionTurn
+	queued                 []*claudeSessionTurn
+	pending                []claudeSessionEvent
+	initSeen               bool
+	stopped                bool
+	done                   chan error
+	processDone            chan struct{}
+	turnIdleTimeout        time.Duration
+	initialResponseTimeout time.Duration
+	toolResultTimeout      time.Duration
 }
 
 func (s *sshAgentSession) Send(request AgentRunRequest, sink AgentRunSink) error {
@@ -652,10 +732,16 @@ func (s *sshAgentSession) Send(request AgentRunRequest, sink AgentRunSink) error
 
 func (s *sshAgentSession) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.stopped {
-		s.stopped = true
-		s.session.Signal(ssh.SIGKILL)
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	s.stopTurnTimerLocked(s.current)
+	session := s.session
+	s.mu.Unlock()
+	if session != nil {
+		_ = session.Signal(ssh.SIGKILL)
 	}
 }
 
@@ -682,6 +768,7 @@ func (s *sshAgentSession) readOutputLoop() error {
 			s.emit("stream.error", mustJSON(map[string]string{"error": err.Error()}), false)
 			continue
 		}
+		s.noteStreamEvent(envelope.Type, envelope.Message.Content)
 		s.emit(envelope.Type, line, envelope.Type == "system" && envelope.Subtype == "init")
 		if envelope.Type == "result" {
 			s.finishCurrent(resultError(line))
@@ -730,7 +817,64 @@ func (s *sshAgentSession) startCurrentLocked(turn *claudeSessionTurn) error {
 	if _, err := s.stdin.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("write to SSH stdin: %w", err)
 	}
+	turn.waitPhase = claudeTurnWaitingInitialResponse
+	turn.lastEvent = "user_prompt"
+	turn.lastToolName = ""
+	s.startTurnTimerLocked(turn)
 	return nil
+}
+
+func (s *sshAgentSession) startTurnTimerLocked(turn *claudeSessionTurn) {
+	s.stopTurnTimerLocked(turn)
+	timeout := claudeTimeoutForPhase(turn.waitPhase, s.initialResponseTimeout, s.toolResultTimeout, s.turnIdleTimeout)
+	turn.idleGeneration++
+	generation := turn.idleGeneration
+	turn.idleTimer = time.AfterFunc(timeout, func() {
+		s.failStalledTurn(turn, generation)
+	})
+}
+
+func (s *sshAgentSession) stopTurnTimerLocked(turn *claudeSessionTurn) {
+	if turn == nil {
+		return
+	}
+	turn.idleGeneration++
+	if turn.idleTimer != nil {
+		turn.idleTimer.Stop()
+	}
+	turn.idleTimer = nil
+}
+
+func (s *sshAgentSession) noteStreamEvent(eventType string, content json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return
+	}
+	turn := s.current
+	switch eventType {
+	case "assistant":
+		turn.lastEvent = "assistant"
+		if toolName := claudeToolUseName(content); toolName != "" {
+			turn.waitPhase = claudeTurnWaitingForToolResult
+			turn.lastEvent = "assistant.tool_use"
+			turn.lastToolName = toolName
+		} else {
+			turn.waitPhase = claudeTurnWaitingForActivity
+		}
+	case "user":
+		if claudeToolResult(content) {
+			turn.waitPhase = claudeTurnWaitingAfterToolResult
+			turn.lastEvent = "user.tool_result"
+		}
+	case "result":
+		turn.lastEvent = "result"
+		s.stopTurnTimerLocked(turn)
+		return
+	default:
+		return
+	}
+	s.startTurnTimerLocked(turn)
 }
 
 func (s *sshAgentSession) emit(eventType string, payload json.RawMessage, initialized bool) {
@@ -767,6 +911,7 @@ func (s *sshAgentSession) finishCurrent(err error) {
 		s.mu.Unlock()
 		return
 	}
+	s.stopTurnTimerLocked(current)
 	s.current = nil
 	var next *claudeSessionTurn
 	if !s.stopped && len(s.queued) > 0 {
@@ -796,6 +941,7 @@ func (s *sshAgentSession) finish(err error) {
 	s.stopped = true
 	turns := make([]*claudeSessionTurn, 0, 1+len(s.queued))
 	if s.current != nil {
+		s.stopTurnTimerLocked(s.current)
 		turns = append(turns, s.current)
 	}
 	turns = append(turns, s.queued...)
@@ -809,6 +955,7 @@ func (s *sshAgentSession) finish(err error) {
 func (s *sshAgentSession) abortFailedStart(current *claudeSessionTurn, err error) {
 	s.mu.Lock()
 	if s.current == current {
+		s.stopTurnTimerLocked(current)
 		s.current = nil
 	}
 	s.stopped = true
@@ -818,7 +965,35 @@ func (s *sshAgentSession) abortFailedStart(current *claudeSessionTurn, err error
 	for _, turn := range queued {
 		finishTurn(turn, err)
 	}
-	_ = s.session.Signal(ssh.SIGKILL)
+	if s.session != nil {
+		_ = s.session.Signal(ssh.SIGKILL)
+	}
+}
+
+func (s *sshAgentSession) failStalledTurn(current *claudeSessionTurn, generation uint64) {
+	s.mu.Lock()
+	if s.stopped || s.current != current || current.idleGeneration != generation {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	current.idleGeneration++
+	current.idleTimer = nil
+	timeout := claudeTimeoutForPhase(current.waitPhase, s.initialResponseTimeout, s.toolResultTimeout, s.turnIdleTimeout)
+	stallErr := &claudeTurnStallError{phase: current.waitPhase, lastEvent: current.lastEvent, toolName: current.lastToolName, timeout: timeout}
+	queued := s.queued
+	s.current = nil
+	s.queued = nil
+	session := s.session
+	s.mu.Unlock()
+
+	finishTurn(current, stallErr)
+	for _, turn := range queued {
+		finishTurn(turn, &claudeQueuedTurnCancelledError{cause: stallErr})
+	}
+	if session != nil {
+		_ = session.Signal(ssh.SIGKILL)
+	}
 }
 
 // readClaudeJSONLines reads stream-json lines from an io.Reader and dispatches

@@ -122,6 +122,8 @@ func codexSandbox(policy string) (string, error) {
 		return "read-only", nil
 	case "workspace_write":
 		return "workspace-write", nil
+	case "full_control":
+		return "danger-full-access", nil
 	default:
 		return "", fmt.Errorf("unsupported Codex execution policy: %s", policy)
 	}

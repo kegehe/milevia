@@ -105,6 +105,24 @@ test("exposes historical cancelled tasks as read-only items in the board", () =>
   assert.match(source, /\{acceptsDrops && <div className=\{`task-drop-indicator/);
 });
 
+test("uses insertion gaps for downward board drags and suppresses drag clicks", () => {
+  const source = readFileSync(new URL("./TaskBoard.tsx", import.meta.url), "utf8");
+  const handleDropSource = source.slice(source.indexOf("const handleDrop"), source.indexOf("\n\n  return <section"));
+
+  assert.match(source, /const targetIndex = e\.clientY < rect\.top \+ rect\.height \/ 2 \? index : index \+ 1;/);
+  assert.match(source, /if \(insertionIndex === currentIndex\) return;/);
+  assert.match(source, /const dragGestureActive = useRef\(false\);/);
+  assert.match(source, /const dragClickSuppressedUntil = useRef\(0\);/);
+  assert.match(source, /onClickCapture=\{handleBoardClickCapture\}/);
+  assert.match(source, /dragGestureActive\.current = true;/);
+  assert.match(source, /dragGestureActive\.current = false;/);
+  assert.match(source, /dragAttempted\.current = true;/);
+  assert.match(source, /if \(dragged\.current \|\| dragAttempted\.current \|\| Date\.now\(\) < suppressClickUntil\.current\)/);
+  assert.match(source, /if \(dragged\.current \|\| dragAttempted\.current \|\| Date\.now\(\) < suppressClickUntil\.current\)[\s\S]*if \(e\.detail === 0\)/);
+  assert.doesNotMatch(handleDropSource, /refresh\(task\.id\)/);
+  assert.match(handleDropSource, /await refresh\(\);/);
+});
+
 test("uses WebSocket history once and caps client-side run logs", () => {
 	const source = readFileSync(new URL("../run/ProjectRunPanel.tsx", import.meta.url), "utf8");
 
@@ -115,6 +133,28 @@ test("uses WebSocket history once and caps client-side run logs", () => {
 	assert.match(source, /LOG_BOTTOM_THRESHOLD/);
 	assert.doesNotMatch(source, /scrollIntoView/);
 	assert.match(source, /\.slice\(-MAX_LOG_ENTRIES\)/);
+});
+
+test("resets runner state only when changing projects", () => {
+	const source = readFileSync(new URL("../run/ProjectRunPanel.tsx", import.meta.url), "utf8");
+
+	assert.match(source, /const configDirtyRef = useRef\(false\);/);
+	assert.match(source, /const configRevisionRef = useRef\(0\);/);
+	assert.match(source, /revision === configRevisionRef\.current && !configDirtyRef\.current/);
+	assert.match(source, /if \(revision === configRevisionRef\.current\) configDirtyRef\.current = false;/);
+	assert.match(source, /const updateConfig = \(next: RunConfig\) => \{\s*configDirtyRef\.current = true;\s*configRevisionRef\.current \+= 1;/s);
+	assert.match(source, /if \(renderedProjectIDRef\.current === projectID\) return;/);
+	assert.match(source, /renderedProjectIDRef\.current = projectID;[\s\S]*clearedThroughLogIDRef\.current = 0;/);
+});
+
+test("keeps file tabs in sync with renamed and removed paths", () => {
+  const source = readFileSync(new URL("../files/FilesPanel.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /function remapPath\(path: string, oldPath: string, newPath: string\)/);
+  assert.match(source, /path\.startsWith\(`\$\{oldPath\}\/`\)/);
+  assert.match(source, /stat: \{ \.\.\.file\.stat, path: nextPath, name \}/);
+  assert.match(source, /function isPathAtOrBelow\(path: string, directory: string\)/);
+  assert.match(source, /prev\.filter\(\(file\) => !isPathAtOrBelow\(file\.path, removedPath\)\)/);
 });
 
 test("refreshes active orchestration jobs and renders their review status", () => {
@@ -137,7 +177,7 @@ test("defines a responsive task work rail", () => {
   const conversationStyles = readFileSync(new URL("../../conversation.css", import.meta.url), "utf8");
   const taskStyles = readFileSync(new URL("../../tasks.css", import.meta.url), "utf8");
 
-  assert.match(conversationStyles, /grid-template-columns:\s*300px minmax\(0, 1fr\)/);
+  assert.match(conversationStyles, /grid-template-columns:\s*minmax\(280px, 320px\) minmax\(0, 1fr\)/);
   assert.match(conversationStyles, /\.quick-actions-row/);
   assert.match(taskStyles, /\.task-queue-mobile-toggle/);
 });

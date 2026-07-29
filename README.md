@@ -87,6 +87,9 @@ AUTO_CONTROL_PORT=8081 AUTO_WEB_PORT=5174 pnpm dev
 | `AUTO_ALLOWED_ROOT` | 当前 WSL 用户的主目录 | 网页可浏览和加载项目的根目录。 |
 | `AUTO_DATABASE_PATH` | `../../data/auto.db` | 从 `apps/control-server` 启动时使用的 SQLite 路径。建议在自定义部署时传入绝对路径。 |
 | `AUTO_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 默认权限基础模式，可选 `acceptEdits` 或 `plan`。 |
+| `AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT` | `5m` | 提示词发出后等待首个 Claude 模型响应的超时阈值。 |
+| `AUTO_CLAUDE_TOOL_RESULT_TIMEOUT` | `5m` | Claude 收到工具结果后等待下一条模型响应的超时阈值，用于识别上游流未续传。 |
+| `AUTO_CLAUDE_TURN_IDLE_TIMEOUT` | `30m` | Claude 工具执行中或普通流活动阶段的超时阈值。接受 Go 时长格式，如 `45m`、`1h`；超时后会停止会话并释放队列。 |
 | `AUTO_APPROVAL_HOOK` | `../../scripts/claude-approval-hook.sh` | 默认权限下的 Bash 命令审批 Hook。 |
 | `VITE_CONTROL_URL` | `http://127.0.0.1:8080` | Vite 代理目标地址，仅在启动网页时设置。 |
 

@@ -21,6 +21,8 @@ type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: st
 type OrchestrationJob = { id: string; taskId: string; position: number; status: string; lastError?: string };
 type ReleaseSnapshot = { id: string; devSha: string; branch: string; status: string; createdAt: string; confirmedAt?: string };
 
+const DRAG_CLICK_SUPPRESSION_MS = 400;
+
 function policyLabel(policy?: ExecutionPolicy): string {
   if (policy === "full_control") return "完全控制";
   if (policy === "read_only") return "仅分析";
@@ -40,6 +42,9 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   const [releaseSnapshots, setReleaseSnapshots] = useState<ReleaseSnapshot[]>([]);
   const [orchestrationOpen, setOrchestrationOpen] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm>(null);
+  const [batchMode, setBatchMode] = useState(false);
+  const [selectedIDs, setSelectedIDs] = useState<Set<string>>(new Set());
+  const [batchDeleting, setBatchDeleting] = useState(false);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -87,7 +92,60 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   }, [fail, initialTaskID, loadDetail]);
 
   const visibleTasks = useMemo(() => showHistoricalCancelled ? tasks : tasks.filter((task) => task.status !== "cancelled"), [showHistoricalCancelled, tasks]);
-  const openDetail = (taskID: string) => { void loadDetail(taskID).catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务详情"); }); };
+  useEffect(() => {
+    if (!batchMode || selectedIDs.size === 0) return;
+    const currentIDs = new Set(tasks.map((t) => t.id));
+    setSelectedIDs((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach((id) => { if (currentIDs.has(id)) next.add(id); else changed = true; });
+      return changed ? next : prev;
+    });
+  }, [batchMode, selectedIDs.size, tasks]);
+
+  const enterBatchMode = () => { setBatchMode(true); setSelectedIDs(new Set()); };
+  const exitBatchMode = () => { setBatchMode(false); setSelectedIDs(new Set()); };
+  const toggleSelect = (taskID: string) => {
+    setSelectedIDs((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskID)) next.delete(taskID); else next.add(taskID);
+      return next;
+    });
+  };
+  const selectAll = () => { setSelectedIDs(new Set(visibleTasks.map((t) => t.id))); };
+  const deselectAll = () => { setSelectedIDs(new Set()); };
+  const batchDelete = () => {
+    if (selectedIDs.size === 0) return;
+    const currentTaskIDs = new Set(tasks.map((t) => t.id));
+    const validIDs = [...selectedIDs].filter((id) => currentTaskIDs.has(id));
+    if (validIDs.length === 0) { setSelectedIDs(new Set()); return; }
+    const count = validIDs.length;
+    setPendingConfirm({
+      title: "批量删除任务",
+      message: <>确认删除选中的 <b>{count}</b> 个任务？此操作不可撤销，所有执行记录将被永久删除。</>,
+      danger: true,
+      onConfirm: () => void (async () => {
+        if (!mountedRef.current) return;
+        setPendingConfirm(null);
+        setBatchDeleting(true);
+        let failed = 0;
+        try {
+          await Promise.all(validIDs.map((id) => request(`/api/tasks/${id}`, { method: "DELETE" }).catch(() => { failed++; })));
+          if (!mountedRef.current) return;
+          setSelectedIDs(new Set());
+          await loadTasks();
+          if (failed > 0 && mountedRef.current) fail(`${failed} 个任务删除失败`);
+        } catch (cause) {
+          if (mountedRef.current) fail(cause instanceof Error ? cause.message : "批量删除失败");
+        } finally {
+          if (mountedRef.current) setBatchDeleting(false);
+        }
+      })(),
+      onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
+    });
+  };
+
+  const openDetail = (taskID: string) => { if (batchMode) { toggleSelect(taskID); return; } void loadDetail(taskID).catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务详情"); }); };
   const refresh = async (taskID?: string) => {
     await loadTasks();
     if (taskID) await loadDetail(taskID);
@@ -190,10 +248,11 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
       const columnTasks = visibleTasks.filter((t) => targetDef.statuses.includes(t.status))
         .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
       const currentIndex = columnTasks.findIndex((t) => t.id === taskID);
-      if (currentIndex < 0 || currentIndex === targetIndex) return;
+      if (currentIndex < 0) return;
       const reordered = [...columnTasks];
       const [moved] = reordered.splice(currentIndex, 1);
       const insertionIndex = currentIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      if (insertionIndex === currentIndex) return;
       reordered.splice(insertionIndex, 0, moved);
       const prev = reordered[insertionIndex - 1];
       const next = reordered[insertionIndex + 1];
@@ -206,7 +265,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
       try {
         await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, acceptanceCriteria: task.acceptanceCriteria, priority: task.priority, position: newPosition }) });
         if (!mountedRef.current) return;
-        await refresh(task.id);
+        await refresh();
       } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
       finally { if (mountedRef.current) setBusy(""); }
     } else {
@@ -225,7 +284,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
         else newPosition = (prev.position + next.position) / 2;
         await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, acceptanceCriteria: task.acceptanceCriteria, priority: task.priority, position: newPosition, status: targetStatus }) });
         if (!mountedRef.current) return;
-        await refresh(task.id);
+        await refresh();
       } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法移动任务"); }
       finally { if (mountedRef.current) setBusy(""); }
     }
@@ -233,16 +292,26 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
 
   return <section className="task-workspace" aria-label="项目任务">
     <header className="task-workspace-head">
-      <div><label>PROJECT TASKS</label><h2>任务编排</h2><p>手动下发，人工验收。每个任务独立执行。当前执行权限：{policyLabel(permissionMode)}。</p></div>
+      <div><label>PROJECT TASKS</label><h2>任务编排</h2></div>
       <div className="task-workspace-actions">
-        <div className="task-view-switch" aria-label="任务视图"><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>看板</button><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}>列表</button></div>
-        <label className="task-cancelled-toggle"><input type="checkbox" checked={showHistoricalCancelled} onChange={(event) => setShowHistoricalCancelled(event.target.checked)} />显示历史已取消</label>
-        <button className="secondary" onClick={() => setOrchestrationOpen(true)}>自动编排</button>
-        <button className="secondary" onClick={close}>返回对话</button>
-        <button className="primary" onClick={() => setEditor({})}>新建任务</button>
+        {batchMode ? <>
+          <div className="task-batch-bar">
+            <label className="task-batch-select-all"><input type="checkbox" checked={selectedIDs.size === visibleTasks.length && visibleTasks.length > 0} ref={(el) => { if (el) el.indeterminate = selectedIDs.size > 0 && selectedIDs.size < visibleTasks.length; }} onChange={() => selectedIDs.size === visibleTasks.length ? deselectAll() : selectAll()} />全选</label>
+            <span className="task-batch-count">已选 {selectedIDs.size} 项</span>
+            <button className="danger" disabled={selectedIDs.size === 0 || batchDeleting} onClick={batchDelete}>{batchDeleting ? "删除中" : `删除 (${selectedIDs.size})`}</button>
+            <button className="secondary" disabled={batchDeleting} onClick={exitBatchMode}>取消</button>
+          </div>
+        </> : <>
+          <div className="task-view-switch" aria-label="任务视图"><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>看板</button><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}>列表</button></div>
+          <label className="task-cancelled-toggle"><input type="checkbox" checked={showHistoricalCancelled} onChange={(event) => setShowHistoricalCancelled(event.target.checked)} />显示历史已取消</label>
+          <button className="secondary" onClick={() => setOrchestrationOpen(true)}>自动编排</button>
+          <button className="secondary" onClick={close}>返回对话</button>
+          <button className="secondary" onClick={enterBatchMode}>批量管理</button>
+          <button className="primary" onClick={() => setEditor({})}>新建任务</button>
+        </>}
       </div>
     </header>
-    {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} /> : <TaskList tasks={visibleTasks} open={openDetail} />}
+    {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} /> : <TaskList tasks={visibleTasks} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
     {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} dispatch={dispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={visibleTasks.some((item) => item.position < detail.position)} canMoveDown={visibleTasks.some((item) => item.position > detail.position)} request={request} fail={fail} />}
     {orchestrationOpen && orchestration && <OrchestrationDialog config={orchestration} jobs={orchestrationJobs} releases={releaseSnapshots} request={request} close={() => setOrchestrationOpen(false)} saved={loadOrchestration} fail={fail} />}
@@ -250,12 +319,14 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   </section>;
 }
 
-function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, index: number) => Promise<void> }) {
+function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchMode, selectedIDs, toggleSelect }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, index: number) => Promise<void>; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void }) {
   const [showAllDone, setShowAllDone] = useState(false);
   const [dragOverColumn, setDragOverColumn] = useState<string | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [draggingTaskID, setDraggingTaskID] = useState<string | null>(null);
   const columnRefs = useRef<Record<string, HTMLElement | null>>({});
+  const dragGestureActive = useRef(false);
+  const dragClickSuppressedUntil = useRef(0);
   const definitions = showHistoricalCancelled ? [...columnDefinitions, historicalCancelledColumn] : columnDefinitions;
   const grouped = (definition: typeof columnDefinitions[number]) => tasks.filter((task) => definition.statuses.includes(task.status))
     .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
@@ -288,12 +359,16 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop }: { ta
     await onDrop(dragData.taskID, columnID, targetIndex);
   };
   const handleTaskDragStart = (e: React.DragEvent, taskID: string, columnID: string, index: number) => {
+    dragGestureActive.current = true;
+    dragClickSuppressedUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS;
     setDraggingTaskID(taskID);
     const data: DragData = { taskID, sourceColumnID: columnID, sourceIndex: index };
     e.dataTransfer.setData("application/x-task-drag", JSON.stringify(data));
     e.dataTransfer.effectAllowed = "move";
   };
   const handleTaskDragEnd = () => {
+    dragGestureActive.current = false;
+    dragClickSuppressedUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS;
     setDraggingTaskID(null);
     setDragOverColumn(null);
     setDragOverIndex(null);
@@ -302,19 +377,26 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop }: { ta
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = "move";
+    const rect = e.currentTarget.getBoundingClientRect();
+    const targetIndex = e.clientY < rect.top + rect.height / 2 ? index : index + 1;
     setDragOverColumn(columnID);
-    setDragOverIndex(index);
+    setDragOverIndex(targetIndex);
+  };
+  const handleBoardClickCapture = (e: React.MouseEvent) => {
+    if (!dragGestureActive.current && Date.now() >= dragClickSuppressedUntil.current) return;
+    e.preventDefault();
+    e.stopPropagation();
   };
   const isDraggable = (task: Task, _columnID: string): boolean => {
     if (task.status === "running" || task.status === "done" || task.status === "cancelled") return false;
     return true;
   };
 
-  return <div className={`task-board-columns columns-${definitions.length}`}>{definitions.map((definition) => {
+  return <div className={`task-board-columns columns-${definitions.length}`} onClickCapture={handleBoardClickCapture}>{definitions.map((definition) => {
     const items = grouped(definition);
     const isDone = definition.id === "done";
-    const visible = isDone && !showAllDone ? items.slice(0, DONE_LIMIT) : items;
-    const hidden = isDone ? Math.max(0, items.length - DONE_LIMIT) : 0;
+    const visible = isDone && !showAllDone && !batchMode ? items.slice(0, DONE_LIMIT) : items;
+    const hidden = isDone && !batchMode ? Math.max(0, items.length - DONE_LIMIT) : 0;
     const isDragOver = dragOverColumn === definition.id;
     const acceptsDrops = definition.id !== "cancelled";
     return <section
@@ -328,7 +410,7 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop }: { ta
       <header><h3>{definition.label}</h3><b>{items.length}</b></header>
       <div>
         {visible.map((task, index) => (
-          <TaskItem key={task.id} task={task} open={open} columnID={definition.id} index={index} isDragging={draggingTaskID === task.id} draggable={isDraggable(task, definition.id)} onDragStart={handleTaskDragStart} onDragEnd={handleTaskDragEnd} onDragOver={handleTaskDragOver} />
+          <TaskItem key={task.id} task={task} open={open} columnID={definition.id} index={index} isDragging={draggingTaskID === task.id} dropTarget={dragOverColumn === definition.id && dragOverIndex === index} draggable={!batchMode && isDraggable(task, definition.id)} onDragStart={handleTaskDragStart} onDragEnd={handleTaskDragEnd} onDragOver={handleTaskDragOver} batchMode={batchMode} selected={selectedIDs.has(task.id)} toggleSelect={toggleSelect} />
         ))}
         {isDone && !showAllDone && hidden > 0 && <button className="task-show-more" onClick={() => setShowAllDone(true)}>显示更多（+{hidden}）</button>}
         {acceptsDrops && <div className={`task-drop-indicator${dragOverColumn === definition.id && dragOverIndex === visible.length ? " active" : ""}`} onDragOver={(e) => handleTaskDragOver(e, definition.id, visible.length)} onDrop={(e) => handleColumnDrop(e, definition.id)} />}
@@ -337,24 +419,51 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop }: { ta
   })}</div>;
 }
 
-function TaskList({ tasks, open }: { tasks: Task[]; open: (taskID: string) => void }) {
+function TaskList({ tasks, open, batchMode, selectedIDs, toggleSelect }: { tasks: Task[]; open: (taskID: string) => void; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void }) {
   const sorted = [...tasks].sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-  return <div className="task-list"><div className="task-list-head"><span>任务</span><span>状态</span><span>优先级</span><span>最近更新</span></div>{sorted.map((task) => { const title = taskDisplayTitle(task); const description = task.description.trim(); return <button key={task.id} className="task-list-row" onClick={() => open(task.id)}><span><b>{title}</b>{description && description !== title.trim() && <small>{description}</small>}</span><StatusBadge task={task} /><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}</em><time>{formatDate(task.updatedAt)}</time></button>; })}</div>;
+  return <div className={`task-list${batchMode ? " batch-mode" : ""}`}><div className="task-list-head">{batchMode && <span className="task-list-check-col"></span>}<span>任务</span><span>状态</span><span>优先级</span><span>最近更新</span></div>{sorted.map((task) => { const title = taskDisplayTitle(task); const description = task.description.trim(); return <button key={task.id} className={`task-list-row${batchMode && selectedIDs.has(task.id) ? " batch-selected" : ""}`} onClick={() => open(task.id)}>{batchMode && <span className="task-list-check-col"><span className={`task-batch-check${selectedIDs.has(task.id) ? " checked" : ""}`}></span></span>}<span><b>{title}</b>{description && description !== title.trim() && <small>{description}</small>}</span><StatusBadge task={task} /><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}</em><time>{formatDate(task.updatedAt)}</time></button>; })}</div>;
 }
 
-function TaskItem({ task, open, columnID, index, isDragging, draggable, onDragStart, onDragEnd, onDragOver }: { task: Task; open: (taskID: string) => void; columnID: string; index: number; isDragging: boolean; draggable: boolean; onDragStart: (e: React.DragEvent, taskID: string, columnID: string, index: number) => void; onDragEnd: () => void; onDragOver: (e: React.DragEvent, columnID: string, index: number) => void }) {
+function TaskItem({ task, open, columnID, index, isDragging, dropTarget, draggable, onDragStart, onDragEnd, onDragOver, batchMode, selected, toggleSelect }: { task: Task; open: (taskID: string) => void; columnID: string; index: number; isDragging: boolean; dropTarget: boolean; draggable: boolean; onDragStart: (e: React.DragEvent, taskID: string, columnID: string, index: number) => void; onDragEnd: () => void; onDragOver: (e: React.DragEvent, columnID: string, index: number) => void; batchMode: boolean; selected: boolean; toggleSelect: (taskID: string) => void }) {
   const dragged = useRef(false);
+  const dragAttempted = useRef(false);
+  const mouseDownRef = useRef<{ x: number; y: number } | null>(null);
+  const suppressClickUntil = useRef(0);
   const title = taskDisplayTitle(task);
   const description = task.description.trim();
+  const handleMouseDown = (e: React.MouseEvent) => {
+    mouseDownRef.current = { x: e.clientX, y: e.clientY };
+  };
+  const handleMouseMove = (e: React.MouseEvent) => {
+    const down = mouseDownRef.current;
+    if (down) {
+      const dx = e.clientX - down.x;
+      const dy = e.clientY - down.y;
+      if (Math.sqrt(dx * dx + dy * dy) > 4) dragAttempted.current = true;
+    }
+  };
   return <button
-    className={`task-item priority-${task.priority}${isDragging ? " dragging" : ""}${!draggable ? " not-draggable" : ""}`}
+    className={`task-item priority-${task.priority}${isDragging ? " dragging" : ""}${dropTarget ? " drop-target" : ""}${!draggable ? " not-draggable" : ""}${batchMode && selected ? " batch-selected" : ""}`}
     draggable={draggable}
-    onClick={() => { if (dragged.current) { dragged.current = false; return; } open(task.id); }}
-    onDragStart={(e) => { if (!draggable) { e.preventDefault(); return; } dragged.current = true; onDragStart(e, task.id, columnID, index); }}
-    onDragEnd={() => { setTimeout(() => { dragged.current = false; }, 0); onDragEnd(); }}
+    onMouseDown={handleMouseDown}
+    onMouseMove={handleMouseMove}
+    onMouseUp={() => {
+      mouseDownRef.current = null;
+      if (!dragAttempted.current) return;
+      suppressClickUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS;
+      dragAttempted.current = false;
+    }}
+    onClick={(e) => {
+      if (dragged.current || dragAttempted.current || Date.now() < suppressClickUntil.current) { e.preventDefault(); e.stopPropagation(); return; }
+      if (e.detail === 0) { open(task.id); return; }
+      open(task.id);
+    }}
+    onDragStart={(e) => { if (!draggable) { e.preventDefault(); return; } dragged.current = true; dragAttempted.current = true; suppressClickUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS; onDragStart(e, task.id, columnID, index); }}
+    onDragEnd={() => { dragged.current = false; dragAttempted.current = false; mouseDownRef.current = null; suppressClickUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS; onDragEnd(); }}
     onDragOver={(e) => { if (draggable) onDragOver(e, columnID, index); }}
   >
-    <div className="task-item-top"><StatusBadge task={task} />{draggable && <span className="task-drag-handle" title="拖拽排序">⠿</span>}<span>{priorityLabels[task.priority]}</span></div>
+    {batchMode && <span className={`task-batch-check${selected ? " checked" : ""}`} onClick={(e) => { e.stopPropagation(); toggleSelect(task.id); }}></span>}
+    <div className="task-item-top"><StatusBadge task={task} /><span>{priorityLabels[task.priority]}</span></div>
     <b>{title}</b>
     {description && description !== title.trim() && <p>{description}</p>}
   </button>;

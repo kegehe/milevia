@@ -497,6 +497,10 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 通知：任务状态变更（仅对需要关注的状态发通知）
+	if originalStatus != task.Status {
+		s.notifyTaskStatusChange(r.Context(), task.ID, task.Status)
+	}
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -1004,13 +1008,14 @@ func nullTaskRunID(value string) any {
 func taskPrompt(task Task) string {
 	var parts []string
 	if task.Title != "" {
-		parts = append(parts, "任务："+task.Title)
+		parts = append(parts, task.Title)
 	}
-	parts = append(parts, "任务说明：\n"+task.Description)
+	if task.Description != "" {
+		parts = append(parts, task.Description)
+	}
 	if task.AcceptanceCriteria != "" {
-		parts = append(parts, "验收条件：\n"+task.AcceptanceCriteria)
+		parts = append(parts, task.AcceptanceCriteria)
 	}
-	parts = append(parts, "请在当前项目中完成该任务。完成后总结改动、运行的检查及未解决风险。")
 	return strings.Join(parts, "\n\n")
 }
 
@@ -1048,7 +1053,13 @@ func (s *Server) taskDispatchEligibility(ctx context.Context, task Task, orchest
 }
 
 func (s *Server) dispatchTask(w http.ResponseWriter, r *http.Request) {
-	result, status, err := s.dispatchTaskByID(r.Context(), chi.URLParam(r, "taskID"))
+	var input struct {
+		ConversationID string `json:"conversationId"`
+	}
+	if r.Body != http.NoBody && r.ContentLength != 0 && !decode(w, r, &input) {
+		return
+	}
+	result, status, err := s.dispatchTaskByIDForConversation(r.Context(), chi.URLParam(r, "taskID"), input.ConversationID)
 	if err != nil {
 		writeError(w, status, err)
 		return
@@ -1068,6 +1079,10 @@ func (s *Server) dispatchTaskByID(ctx context.Context, taskID string) (taskDispa
 	return s.dispatchTaskByIDInWorkspace(ctx, taskID, "")
 }
 
+func (s *Server) dispatchTaskByIDForConversation(ctx context.Context, taskID, conversationID string) (taskDispatchResult, int, error) {
+	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, "", "", "", conversationID)
+}
+
 func (s *Server) dispatchTaskByIDInWorkspace(ctx context.Context, taskID, worktreePath string) (taskDispatchResult, int, error) {
 	return s.dispatchTaskByIDInWorkspaceWithContext(ctx, taskID, worktreePath, "")
 }
@@ -1077,6 +1092,10 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithContext(ctx context.Context, tas
 }
 
 func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntent(ctx context.Context, taskID, worktreePath, repairContext, executionIntentID string) (taskDispatchResult, int, error) {
+	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, worktreePath, repairContext, executionIntentID, "")
+}
+
+func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx context.Context, taskID, worktreePath, repairContext, executionIntentID, expectedConversationID string) (taskDispatchResult, int, error) {
 	task, err := s.taskByID(ctx, taskID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return taskDispatchResult{}, http.StatusNotFound, errors.New("task not found")
@@ -1092,10 +1111,14 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntent(ctx context.Cont
 	if !allowed {
 		return taskDispatchResult{}, http.StatusConflict, errors.New(reason)
 	}
-	var conversationID string
-	err = s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and is_current=true`, task.ProjectID).Scan(&conversationID)
+	conversationID := expectedConversationID
+	if conversationID == "" {
+		err = s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and is_current=true`, task.ProjectID).Scan(&conversationID)
+	} else {
+		err = s.db.QueryRowContext(ctx, `select id from conversations where id=? and project_id=? and is_current=true`, conversationID, task.ProjectID).Scan(&conversationID)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
-		return taskDispatchResult{}, http.StatusConflict, errors.New("project has no current conversation")
+		return taskDispatchResult{}, http.StatusConflict, errors.New("conversation is no longer current")
 	}
 	if err != nil {
 		return taskDispatchResult{}, http.StatusInternalServerError, err
@@ -1183,6 +1206,8 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 通知：任务审查结果（done 或 action_required）
+	s.notifyTaskStatusChange(r.Context(), task.ID, nextStatus)
 	task.Status, task.UpdatedAt = nextStatus, now
 	if nextStatus == taskDone {
 		task.CompletedAt = &now

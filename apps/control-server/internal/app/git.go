@@ -24,7 +24,17 @@ const (
 var (
 	errGitOutputTooLarge      = errors.New("Git output exceeds the allowed size")
 	errGitTerminationTimedOut = errors.New("Git process did not exit after termination")
+	errGitPartiallyApplied    = errors.New("Git operation was only partially applied")
 )
+
+type gitCommandError struct {
+	command string
+	cause   error
+	stderr  string
+}
+
+func (err *gitCommandError) Error() string { return fmt.Sprintf("Git %s failed", err.command) }
+func (err *gitCommandError) Unwrap() error { return err.cause }
 
 type GitRepositoryState string
 
@@ -106,7 +116,7 @@ func (runner *gitCLIRunner) Stage(ctx context.Context, repo string, paths []stri
 			return err
 		}
 	}
-	_, err := runner.command(ctx, repo, append([]string{"--literal-pathspecs", "add", "--"}, paths...)...)
+	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "add"}, paths)
 	return err
 }
 
@@ -119,8 +129,123 @@ func (runner *gitCLIRunner) Unstage(ctx context.Context, repo string, paths []st
 			return err
 		}
 	}
-	_, err := runner.command(ctx, repo, append([]string{"--literal-pathspecs", "restore", "--staged", "--"}, paths...)...)
+	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--staged"}, paths)
 	return err
+}
+
+func (runner *gitCLIRunner) RestoreWorktree(ctx context.Context, repo string, paths []string) error {
+	if len(paths) == 0 {
+		return errors.New("at least one Git path is required")
+	}
+	for _, path := range paths {
+		if err := validateGitPath(path); err != nil {
+			return err
+		}
+	}
+	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--worktree"}, paths)
+	return err
+}
+
+func (runner *gitCLIRunner) RestoreAll(ctx context.Context, repo string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	for _, path := range paths {
+		if err := validateGitPath(path); err != nil {
+			return err
+		}
+	}
+	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree"}, paths)
+	return err
+}
+
+func (runner *gitCLIRunner) DiscardInitialChanges(ctx context.Context, repo string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	for _, path := range paths {
+		if err := validateGitPath(path); err != nil {
+			return err
+		}
+	}
+	if _, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "rm", "--cached", "--ignore-unmatch"}, paths); err != nil {
+		return err
+	}
+	if err := runner.RemoveUntracked(repo, paths); err != nil {
+		return partiallyAppliedGitError(err)
+	}
+	return nil
+}
+
+func (runner *gitCLIRunner) Commit(ctx context.Context, repo, message string) error {
+	file, err := os.CreateTemp("", "auto-git-commit-message-*")
+	if err != nil {
+		return fmt.Errorf("create Git commit message: %w", err)
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		return fmt.Errorf("protect Git commit message: %w", err)
+	}
+	if _, err := file.WriteString(message + "\n"); err != nil {
+		file.Close()
+		return fmt.Errorf("write Git commit message: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close Git commit message: %w", err)
+	}
+	_, err = runner.command(ctx, repo, "commit", "--file="+path)
+	return err
+}
+
+func (runner *gitCLIRunner) ValidateUntrackedRemoval(repo string, paths []string) error {
+	root, err := os.OpenRoot(repo)
+	if err != nil {
+		return fmt.Errorf("open Git repository root: %w", err)
+	}
+	defer root.Close()
+	return validateUntrackedRemovalInRoot(root, paths)
+}
+
+func validateUntrackedRemovalInRoot(root *os.Root, paths []string) error {
+	for _, path := range paths {
+		if err := validateGitPath(path); err != nil {
+			return err
+		}
+		if _, err := root.Lstat(path); err != nil {
+			return fmt.Errorf("read untracked Git path: %w", err)
+		}
+	}
+	return nil
+}
+
+func (runner *gitCLIRunner) RemoveUntracked(repo string, paths []string) error {
+	root, err := os.OpenRoot(repo)
+	if err != nil {
+		return fmt.Errorf("open Git repository root: %w", err)
+	}
+	defer root.Close()
+	if err := validateUntrackedRemovalInRoot(root, paths); err != nil {
+		return err
+	}
+	return removeUntrackedFromRoot(root, paths)
+}
+
+func removeUntrackedFromRoot(root *os.Root, paths []string) error {
+	for _, path := range paths {
+		if err := root.RemoveAll(path); err != nil {
+			return fmt.Errorf("%w: remove untracked Git path: %v", errGitPartiallyApplied, err)
+		}
+		if _, err := root.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: untracked Git path remains", errGitPartiallyApplied)
+		}
+	}
+	return nil
+}
+
+func hasGitHead(snapshot GitSnapshot) bool {
+	return isFullGitObjectID(snapshot.Head.OID)
 }
 
 type gitCLIRunner struct{ timeout time.Duration }
@@ -165,6 +290,15 @@ func (runner *gitCLIRunner) Log(ctx context.Context, repo, ref string, limit int
 	}
 	if limit < 1 || limit > 100 {
 		return nil, errors.New("Git log limit must be between 1 and 100")
+	}
+	if ref == "HEAD" {
+		snapshot, err := runner.Snapshot(ctx, repo)
+		if err != nil {
+			return nil, err
+		}
+		if !hasGitHead(snapshot) {
+			return []GitCommit{}, nil
+		}
 	}
 	if err := runner.validateLogRef(ctx, repo, ref); err != nil {
 		return nil, err
@@ -278,7 +412,7 @@ func (runner *gitCLIRunner) command(ctx context.Context, repo string, args ...st
 			return output.Stdout(), errGitOutputTooLarge
 		}
 		if err != nil {
-			return output.Stdout(), fmt.Errorf("Git %s: %w", args[0], err)
+			return output.Stdout(), &gitCommandError{command: args[0], cause: err, stderr: string(output.Stderr())}
 		}
 		return output.Stdout(), nil
 	case <-commandCtx.Done():
@@ -294,6 +428,33 @@ func (runner *gitCLIRunner) command(ctx context.Context, repo string, args ...st
 		}
 		return output.Stdout(), errGitOutputTooLarge
 	}
+}
+
+func (runner *gitCLIRunner) commandPaths(ctx context.Context, repo string, args []string, paths []string) ([]byte, error) {
+	if len(paths) <= 100 {
+		return runner.command(ctx, repo, append(append([]string{}, args...), append([]string{"--"}, paths...)...)...)
+	}
+	file, err := os.CreateTemp("", "auto-git-pathspec-*")
+	if err != nil {
+		return nil, fmt.Errorf("create Git path list: %w", err)
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("protect Git path list: %w", err)
+	}
+	for _, item := range paths {
+		if _, err := file.WriteString(item + "\x00"); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("write Git path list: %w", err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		return nil, fmt.Errorf("close Git path list: %w", err)
+	}
+	args = append(args, "--pathspec-from-file="+path, "--pathspec-file-nul")
+	return runner.command(ctx, repo, args...)
 }
 
 func waitForGitCommand(command *exec.Cmd, done <-chan error, terminateWait, forceWait time.Duration) bool {
@@ -364,6 +525,12 @@ func (collector *gitOutputCollector) Stdout() []byte {
 	collector.mu.Lock()
 	defer collector.mu.Unlock()
 	return append([]byte(nil), collector.stdout.Bytes()...)
+}
+
+func (collector *gitOutputCollector) Stderr() []byte {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	return append([]byte(nil), collector.stderr.Bytes()...)
 }
 
 func (collector *gitOutputCollector) Exceeded() bool {

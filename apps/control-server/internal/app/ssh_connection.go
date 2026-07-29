@@ -58,6 +58,7 @@ func sanitizedSSHConnection(c SSHConnection) map[string]any {
 // registerSSHRoutes adds SSH connection management endpoints to the router.
 func (s *Server) registerSSHRoutes(r chi.Router) {
 	r.Get("/api/ssh-profiles", s.listSSHProfiles)
+	r.Get("/api/ssh-profiles/{profileName}", s.getSSHProfile)
 	r.Post("/api/ssh-connections/preflight", s.preflightSSHConnection)
 	r.Get("/api/ssh-connections", s.listSSHConnections)
 	r.Post("/api/ssh-connections", s.createSSHConnection)
@@ -165,11 +166,15 @@ type sshProfile struct {
 	PrivateKeyPath string `json:"privateKeyPath"`
 }
 
+var getSSHConfigOutput = func(name string) ([]byte, error) {
+	return exec.Command("ssh", "-G", name).Output()
+}
+
 func resolveSSHProfile(name string) (sshProfile, error) {
 	if name == "" || strings.ContainsAny(name, " \t\n\r;|&$`\\\"") {
 		return sshProfile{}, errors.New("SSH Profile 名称无效")
 	}
-	output, err := exec.Command("ssh", "-G", name).Output()
+	output, err := getSSHConfigOutput(name)
 	if err != nil {
 		return sshProfile{}, fmt.Errorf("读取 SSH Profile %q 失败：%w", name, err)
 	}
@@ -231,6 +236,15 @@ func (s *Server) listSSHProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, profiles)
+}
+
+func (s *Server) getSSHProfile(w http.ResponseWriter, r *http.Request) {
+	profile, err := resolveSSHProfile(chi.URLParam(r, "profileName"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, profile)
 }
 
 // preflightSSHConnection verifies the selected profile or manual settings
@@ -585,12 +599,15 @@ func (s *Server) prepareSSHRunner(ctx context.Context, c SSHConnection) (_ *sshR
 	}
 	runnerID := "ssh-" + c.ID
 	runner := &sshRunner{
-		client:      client,
-		connID:      c.ID,
-		connName:    c.Name,
-		controlURL:  s.config.ControlURL,
-		approvalURL: approvalURL,
-		rootPath:    rootPath,
+		client:                 client,
+		connID:                 c.ID,
+		connName:               c.Name,
+		controlURL:             s.config.ControlURL,
+		approvalURL:            approvalURL,
+		rootPath:               rootPath,
+		turnIdleTimeout:        s.config.ClaudeTurnIdleTimeout,
+		initialResponseTimeout: s.config.ClaudeInitialResponseTimeout,
+		toolResultTimeout:      s.config.ClaudeToolResultTimeout,
 	}
 	return runner, RunnerMeta{
 		ID:          runnerID,

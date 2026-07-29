@@ -21,7 +21,7 @@
 .markdown code { padding: 1px 4px; color: #b3224e; background: #f2f4f5; border-radius: 3px; font: 0.9em ui-monospace,SFMono-Regular,Menlo,monospace; }
 .markdown a { color: #0d7253; text-decoration: underline; text-underline-offset: 2px; }
 .markdown-image-reference { display: inline-flex; align-items: center; gap: 4px; margin: 2px 0; padding: 4px 7px; border: 1px solid #d5e4dc; border-radius: 4px; color: #60796e; background: #f2f8f4; font-size: 12px; }
-.markdown pre { margin: 10px 0; padding: 12px; overflow: auto; color: #e0e9ed; background: #17212b; border-radius: 5px; white-space: pre; font: 12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+.markdown pre { margin: 10px 0; padding: 12px; overflow: auto; max-width: 100%; color: #e0e9ed; background: #17212b; border-radius: 5px; white-space: pre; font: 12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
 .markdown pre code { padding: 0; color: inherit; background: transparent; font: inherit; }
 .markdown hr { height: 1px; margin: 18px 0; border: 0; background: #d5e4dc; }
 .markdown table { display: block; max-width: 100%; margin: 12px 0; overflow-x: auto; border: 1px solid #cfe0d6; border-spacing: 0; border-radius: 6px; background: #fbfefb; font-size: 14px; line-height: 1.55; }

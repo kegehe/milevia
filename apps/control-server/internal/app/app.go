@@ -26,14 +26,23 @@ import (
 )
 
 type Config struct {
-	DatabasePath   string
-	AllowedRoot    string
-	ClaudePath     string
-	CodexPath      string
-	PermissionMode string
-	ControlURL     string
-	ApprovalHook   string
+	DatabasePath                 string
+	AllowedRoot                  string
+	ClaudePath                   string
+	CodexPath                    string
+	PermissionMode               string
+	ControlURL                   string
+	ApprovalHook                 string
+	ClaudeTurnIdleTimeout        time.Duration
+	ClaudeInitialResponseTimeout time.Duration
+	ClaudeToolResultTimeout      time.Duration
 }
+
+const (
+	defaultClaudeTurnIdleTimeout        = 30 * time.Minute
+	defaultClaudeInitialResponseTimeout = 5 * time.Minute
+	defaultClaudeToolResultTimeout      = 5 * time.Minute
+)
 
 func ConfigFromEnv() Config {
 	home, _ := os.UserHomeDir()
@@ -64,14 +73,38 @@ func ConfigFromEnv() Config {
 	if codexPath == "" {
 		codexPath = "codex"
 	}
-	return Config{DatabasePath: db, AllowedRoot: root, ClaudePath: "claude", CodexPath: codexPath, PermissionMode: mode, ControlURL: controlURL, ApprovalHook: hook}
+	return Config{
+		DatabasePath:                 db,
+		AllowedRoot:                  root,
+		ClaudePath:                   "claude",
+		CodexPath:                    codexPath,
+		PermissionMode:               mode,
+		ControlURL:                   controlURL,
+		ApprovalHook:                 hook,
+		ClaudeTurnIdleTimeout:        durationFromEnv("AUTO_CLAUDE_TURN_IDLE_TIMEOUT", defaultClaudeTurnIdleTimeout),
+		ClaudeInitialResponseTimeout: durationFromEnv("AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT", defaultClaudeInitialResponseTimeout),
+		ClaudeToolResultTimeout:      durationFromEnv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", defaultClaudeToolResultTimeout),
+	}
+}
+
+func durationFromEnv(name string, fallback time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
 
 // RunConfig 持久化的项目启动配置。
 type RunConfig struct {
-	WorkDir string            `json:"workDir"`
-	Command string            `json:"command"`
-	EnvVars map[string]string `json:"envVars"`
+	WorkDir         string             `json:"workDir"`
+	Command         string             `json:"command"`
+	EnvVars         map[string]string  `json:"envVars"`
+	ExecutionTarget RunExecutionTarget `json:"executionTarget"`
 }
 
 // RunStatusResponse 是 GET /status 的响应。
@@ -121,6 +154,9 @@ type Server struct {
 	runManagersMu          sync.RWMutex
 	runLogSubscribers      map[string]map[*websocket.Conn]*runLogSubscriber
 	runLogSubMu            sync.Mutex
+	notificationSubs       map[*websocket.Conn]*notificationSubscriber
+	notificationSubMu      sync.Mutex
+	notificationMu         sync.Mutex
 	orchestrationMu        sync.Mutex
 	orchestrationActive    map[string]bool
 	orchestrationWG        sync.WaitGroup
@@ -360,7 +396,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]*projectRunner{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
+	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]*projectRunner{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return isLocalWebOrigin(r.Header.Get("Origin")) }
 	if err := s.migrate(ctx); err != nil {
 		runtimeStop()
@@ -435,6 +471,7 @@ func (s *Server) Close() {
 			runner.Stop()
 		}
 		s.closeAllRunLogSubscribers()
+		s.closeAllNotificationSubscribers()
 		for _, runner := range s.runnerRegistry.all() {
 			if sshR, ok := runner.(*sshRunner); ok {
 				_ = sshR.client.close()
@@ -493,6 +530,10 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/git/operations", s.gitOperations)
 	r.Post("/api/projects/{projectID}/git/stage", s.gitStage)
 	r.Post("/api/projects/{projectID}/git/unstage", s.gitUnstage)
+	r.Post("/api/projects/{projectID}/git/stage-all", s.gitStageAll)
+	r.Post("/api/projects/{projectID}/git/unstage-all", s.gitUnstageAll)
+	r.Post("/api/projects/{projectID}/git/commits", s.gitCommit)
+	r.Post("/api/projects/{projectID}/git/discard", s.gitDiscard)
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
@@ -526,6 +567,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/conversations/{conversationID}", s.getConversation)
 	r.Get("/api/conversations/{conversationID}/input-history", s.listInputHistory)
 	r.Get("/api/conversations/{conversationID}/usage", s.getConversationUsage)
+	r.Post("/api/conversations/{conversationID}/clear", s.clearConversation)
 	r.Post("/api/conversations/{conversationID}/activate", s.activateConversation)
 	r.Post("/api/conversations/{conversationID}/permission-mode", s.setConversationPermissionMode)
 	r.Post("/api/conversations/{conversationID}/messages", s.sendMessage)
@@ -546,7 +588,12 @@ func (s *Server) routes() http.Handler {
 		r.Get("/status", s.getProjectRunStatus)
 	})
 	r.Get("/ws/projects/{projectID}/run", s.subscribeRunLogs)
+	r.Get("/ws/notifications", s.subscribeNotifications)
+	r.Get("/api/notifications", s.listNotifications)
+	r.Post("/api/notifications/{notificationID}/dismiss", s.dismissNotification)
+	r.Post("/api/notifications/dismiss-all", s.dismissAllNotifications)
 	s.registerSSHRoutes(r)
+	s.registerFSRoutes(r)
 	return r
 }
 
@@ -708,7 +755,7 @@ create table if not exists shortcut_projects (shortcut_id text not null referenc
 create table if not exists shortcut_runs (id text primary key, shortcut_id text references shortcuts(id) on delete set null, conversation_id text not null references conversations(id) on delete cascade, run_id text unique references runs(id) on delete set null, rendered_content text not null, action text not null, status text not null, created_at datetime not null, completed_at datetime);
 create table if not exists shortcut_audit_events (id text primary key, shortcut_id text references shortcuts(id) on delete set null, action text not null, payload text not null default '{}', created_at datetime not null);
 create table if not exists app_metadata (key text primary key, value text not null);
-	create table if not exists project_run_configs (project_id text primary key references projects(id) on delete cascade, work_dir text not null default '', command text not null default '', env_vars text not null default '{}', updated_at datetime not null);
+	create table if not exists project_run_configs (project_id text primary key references projects(id) on delete cascade, work_dir text not null default '', command text not null default '', env_vars text not null default '{}', execution_target text not null default 'auto', updated_at datetime not null);
 	create unique index if not exists projects_runner_path_unique on projects(runner,path);
 	create unique index if not exists conversations_one_current_per_project on conversations(project_id) where is_current=1;
 	create index if not exists messages_conversation_created on messages(conversation_id,created_at desc);
@@ -722,6 +769,9 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	}
 	if err := s.migrateSSHConnections(ctx); err != nil {
 		return fmt.Errorf("migrate ssh connections: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "project_run_configs", "execution_target", "text not null default 'auto'"); err != nil {
+		return fmt.Errorf("add project run execution target: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `pragma table_info(conversations)`)
 	if err != nil {
@@ -874,6 +924,9 @@ create index if not exists messages_conversation_primary_created on messages(con
 	if err := s.migrateOrchestration(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateNotifications(ctx); err != nil {
+		return err
+	}
 	return s.migrateGit(ctx)
 }
 
@@ -969,6 +1022,17 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit interrupted run recovery: %w", err)
 	}
+	// 通知：中断恢复后任务状态变为 action_required
+	for _, run := range runs {
+		var taskID, taskStatus string
+		if err := s.db.QueryRowContext(s.runtimeCtx, `select task_id from task_runs where run_id=?`, run.id).Scan(&taskID); err != nil || taskID == "" {
+			continue
+		}
+		if err := s.db.QueryRowContext(s.runtimeCtx, `select status from tasks where id=?`, taskID).Scan(&taskStatus); err != nil {
+			continue
+		}
+		s.notifyTaskStatusChange(s.runtimeCtx, taskID, taskStatus)
+	}
 	return nil
 }
 
@@ -978,7 +1042,7 @@ func validPermissionMode(mode string) bool {
 
 func validAgentPolicy(agentID, policy string) bool {
 	if agentID == "codex" {
-		return policy == "read_only" || policy == "workspace_write"
+		return policy == "read_only" || policy == "workspace_write" || policy == "full_control"
 	}
 	return agentID == "claude-code" && (policy == "approval_required" || policy == "full_control")
 }
@@ -1055,7 +1119,7 @@ func (s *Server) listDirectories(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	path, err := s.allowedPath(path)
+	path, err := s.allowedPathForRunner(path, runnerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -1076,7 +1140,35 @@ func (s *Server) listDirectories(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
-	writeJSON(w, http.StatusOK, map[string]any{"path": path, "parent": filepath.Dir(path), "directories": items})
+	// 计算 parent：不允许越过 runner 的任意一个 root
+	parent := filepath.Dir(path)
+	if meta, ok := s.runnerRegistry.getMeta(runnerID); ok && len(meta.Roots) > 0 {
+		withinRoot := false
+		for _, root := range meta.Roots {
+			resolvedRoot, err := filepath.EvalSymlinks(root.Path)
+			if err != nil {
+				continue
+			}
+			if parent == resolvedRoot || strings.HasPrefix(parent, resolvedRoot+string(os.PathSeparator)) {
+				withinRoot = true
+				break
+			}
+		}
+		if !withinRoot {
+			// parent 越过了所有 root，回退到当前路径所属的 root
+			for _, root := range meta.Roots {
+				resolvedRoot, err := filepath.EvalSymlinks(root.Path)
+				if err != nil {
+					continue
+				}
+				if path == resolvedRoot || strings.HasPrefix(path, resolvedRoot+string(os.PathSeparator)) {
+					parent = resolvedRoot
+					break
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"path": path, "parent": parent, "directories": items})
 }
 
 func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
@@ -1135,7 +1227,7 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	path, err := s.allowedPath(input.Path)
+	path, err := s.allowedPathForRunner(input.Path, runnerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -1230,7 +1322,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, p)
 		return
 	}
-	path, err := s.allowedPath(input.Path)
+	path, err := s.allowedPathForRunner(input.Path, runnerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -1551,6 +1643,10 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
 		return
 	}
+	// New conversations replace the project's current conversation. Keep that
+	// transition ordered with message admission and context clearing.
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
 	now := time.Now().UTC()
 	sessionID := uuid.NewString()
 	c := Conversation{ID: uuid.NewString(), ProjectID: projectID, ClaudeSessionID: sessionID, AgentID: input.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, ExecutionPolicy: input.PermissionMode, Status: "idle", PermissionMode: input.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: true, CreatedAt: now}
@@ -1624,6 +1720,95 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, items)
+}
+
+func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "conversationID")
+	s.projectLifecycleMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			s.projectLifecycleMu.Unlock()
+		}
+	}()
+
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	var previous Conversation
+	var projectRunner string
+	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.runner from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &projectRunner)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !previous.IsCurrent {
+		writeError(w, http.StatusConflict, errors.New("only the current conversation can be cleared"))
+		return
+	}
+	if previous.Status != "idle" {
+		writeError(w, http.StatusConflict, errors.New("stop the active agent run before clearing the conversation"))
+		return
+	}
+
+	now := time.Now().UTC()
+	sessionID := uuid.NewString()
+	fresh := Conversation{ID: uuid.NewString(), ProjectID: previous.ProjectID, ClaudeSessionID: sessionID, AgentID: previous.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, ExecutionPolicy: previous.executionPolicy(), Status: "idle", PermissionMode: previous.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: true, CreatedAt: now}
+	result, err := tx.ExecContext(r.Context(), `update conversations set is_current=0 where id=? and is_current=1 and status='idle'`, previous.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed != 1 {
+		writeError(w, http.StatusConflict, errors.New("conversation changed while clearing"))
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, fresh.ID, fresh.ProjectID, fresh.ClaudeSessionID, fresh.AgentID, fresh.AgentSessionID, fresh.AgentRuntimeID, fresh.ExecutionPolicy, fresh.Status, fresh.PermissionMode, fresh.Title, fresh.LastActivityAt, fresh.ClaudeInitialized, fresh.AgentInitialized, fresh.IsCurrent, fresh.CreatedAt); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Mark the old session before another lifecycle operation can reactivate the
+	// old conversation. Stopping the underlying local or remote process happens
+	// after releasing the global lock because it may block.
+	previousSession := s.markConversationSessionStopping(previous.ID)
+	s.projectLifecycleMu.Unlock()
+	locked = false
+	if previousSession != nil {
+		previousSession.Stop()
+	}
+	writeJSON(w, http.StatusCreated, fresh)
+}
+
+// markConversationSessionStopping prevents a new streaming turn from joining
+// the existing session. Callers must hold projectLifecycleMu before invoking
+// it so the conversation cannot be reactivated between clearing and marking.
+func (s *Server) markConversationSessionStopping(conversationID string) AgentSession {
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session := s.sessions[conversationID]
+	if session == nil || session.stopping {
+		return nil
+	}
+	session.stopping = true
+	return session.agent
 }
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
@@ -1793,6 +1978,9 @@ func (s *Server) listInputHistory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
+	// Activation changes the same current-conversation pointer as clear.
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1846,6 +2034,9 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 	if !decode(w, r, &input) {
 		return
 	}
+	// Keep permission changes ordered with conversation clearing and activation.
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
 	conversationID := chi.URLParam(r, "conversationID")
 	var conversation Conversation
 	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
@@ -1865,7 +2056,11 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusConflict, errors.New("stop the active agent run before changing permission mode"))
 		return
 	}
-	result, err := s.db.ExecContext(r.Context(), `update conversations set permission_mode=?,execution_policy=? where id=? and status='idle'`, input.PermissionMode, input.PermissionMode, conversationID)
+	if !conversation.IsCurrent {
+		writeError(w, http.StatusConflict, errors.New("activate this conversation before changing permission mode"))
+		return
+	}
+	result, err := s.db.ExecContext(r.Context(), `update conversations set permission_mode=?,execution_policy=? where id=? and status='idle' and is_current=1`, input.PermissionMode, input.PermissionMode, conversationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2416,6 +2611,9 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
 	}
+	if !conversation.IsCurrent {
+		return Message{}, "", nil, http.StatusConflict, errors.New("activate this conversation before sending a message")
+	}
 	if record != nil && record.WorktreePath != "" {
 		projectPath = record.WorktreePath
 	}
@@ -2832,6 +3030,12 @@ func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) 
 	stopped := false
 	if session := s.sessions[conversationID]; session != nil {
 		stopped = session.stopping
+		if errors.Is(runErr, errClaudeTurnIdleTimeout) {
+			// The CLI has stopped accepting turns after its watchdog fires. Keep
+			// the session unavailable until Done removes it, rather than letting a
+			// new Run reuse a known-stopped process.
+			session.stopping = true
+		}
 		if session.activeRunID == runID {
 			session.activeRunID = ""
 		}
@@ -2877,11 +3081,25 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 			tx.Rollback()
 		}
 	}
-	payload, _ := json.Marshal(map[string]string{"status": status, "error": errorText(runErr)})
-	s.appendEvent(runID, conversationID, "run."+status, payload)
+	payload := map[string]any{"status": status, "error": errorText(runErr)}
+	if details, ok := runErr.(interface{ ErrorDetails() map[string]string }); ok {
+		for key, value := range details.ErrorDetails() {
+			payload[key] = value
+		}
+	}
+	payloadJSON, _ := json.Marshal(payload)
+	s.appendEvent(runID, conversationID, "run."+status, payloadJSON)
 	s.releaseRunWorkspace(runID)
 	if committed {
 		s.kickOrchestratorForRun(runID)
+		// 通知：任务运行结束后的状态变更（awaiting_review 或 action_required）
+		var taskID string
+		if err := s.db.QueryRowContext(s.runtimeCtx, `select task_id from task_runs where run_id=?`, runID).Scan(&taskID); err == nil && taskID != "" {
+			var taskStatus string
+			if err := s.db.QueryRowContext(s.runtimeCtx, `select status from tasks where id=?`, taskID).Scan(&taskStatus); err == nil {
+				s.notifyTaskStatusChange(s.runtimeCtx, taskID, taskStatus)
+			}
+		}
 	}
 }
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
@@ -3215,6 +3433,31 @@ func (s *Server) allowedPath(path string) (string, error) {
 	}
 	return absolute, nil
 }
+
+// allowedPathForRunner 校验路径是否在指定 runner 的任意一个 root 下。
+// 对于 wsl-local runner，root 包括 WSL Home 和 /mnt/c、/mnt/d 等 Windows 挂载点。
+func (s *Server) allowedPathForRunner(path string, runnerID string) (string, error) {
+	absolute, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	// 从 runner 注册表获取所有 roots
+	if meta, ok := s.runnerRegistry.getMeta(runnerID); ok && len(meta.Roots) > 0 {
+		for _, root := range meta.Roots {
+			resolvedRoot, err := filepath.EvalSymlinks(root.Path)
+			if err != nil {
+				continue
+			}
+			relative, err := filepath.Rel(resolvedRoot, absolute)
+			if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+				return absolute, nil
+			}
+		}
+		return "", errors.New("path is outside the Runner allowed roots")
+	}
+	// 回退到原有 allowedPath 逻辑
+	return s.allowedPath(path)
+}
 func gitBranch(ctx context.Context, path string) (string, bool) {
 	snapshot, err := newGitRunner().Snapshot(ctx, path)
 	if err != nil {
@@ -3261,7 +3504,7 @@ func compactConversationText(content string, limit int) string {
 func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\\\"'\\\"'") + "'"
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 // wslLocalMeta builds the RunnerMeta for the built-in WSL local runner.
@@ -3309,6 +3552,12 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 			if v == "" {
 				status = "unavailable"
 			}
+			// Reflect in-progress updates so the frontend can show "更新中...".
+			s.runnerMaintenanceMu.Lock()
+			if s.runnerUpdating[m.ID] {
+				status = "updating"
+			}
+			s.runnerMaintenanceMu.Unlock()
 			entry["claude"] = map[string]string{
 				"status":  status,
 				"version": v,
@@ -3429,7 +3678,7 @@ func (s *Server) updateClaude(w http.ResponseWriter, r *http.Request) {
 func (s *Server) loadRunConfig(ctx context.Context, projectID string) (RunConfig, error) {
 	var c RunConfig
 	var envJSON string
-	err := s.db.QueryRowContext(ctx, `select work_dir, command, env_vars from project_run_configs where project_id=$1`, projectID).Scan(&c.WorkDir, &c.Command, &envJSON)
+	err := s.db.QueryRowContext(ctx, `select work_dir, command, env_vars, execution_target from project_run_configs where project_id=$1`, projectID).Scan(&c.WorkDir, &c.Command, &envJSON, &c.ExecutionTarget)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return RunConfig{}, nil
@@ -3439,14 +3688,16 @@ func (s *Server) loadRunConfig(ctx context.Context, projectID string) (RunConfig
 	if envJSON != "" {
 		json.Unmarshal([]byte(envJSON), &c.EnvVars)
 	}
+	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
 	return c, nil
 }
 
 func (s *Server) saveRunConfig(ctx context.Context, projectID string, c RunConfig) error {
 	envJSON, _ := json.Marshal(c.EnvVars)
+	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
 	_, err := s.db.ExecContext(ctx,
-		`insert into project_run_configs (project_id, work_dir, command, env_vars, updated_at) values ($1,$2,$3,$4,$5) on conflict(project_id) do update set work_dir=excluded.work_dir, command=excluded.command, env_vars=excluded.env_vars, updated_at=excluded.updated_at`,
-		projectID, c.WorkDir, c.Command, string(envJSON), time.Now().UTC())
+		`insert into project_run_configs (project_id, work_dir, command, env_vars, execution_target, updated_at) values ($1,$2,$3,$4,$5,$6) on conflict(project_id) do update set work_dir=excluded.work_dir, command=excluded.command, env_vars=excluded.env_vars, execution_target=excluded.execution_target, updated_at=excluded.updated_at`,
+		projectID, c.WorkDir, c.Command, string(envJSON), c.ExecutionTarget, time.Now().UTC())
 	return err
 }
 
@@ -3474,6 +3725,9 @@ func validateProjectRunConfig(project Project, cfg RunConfig) error {
 		return errors.New("请先配置启动命令")
 	}
 	if err := validateRunEnvironmentVariables(cfg.EnvVars); err != nil {
+		return err
+	}
+	if _, err := resolveRunExecutionTarget(project.Path, cfg.ExecutionTarget); err != nil {
 		return err
 	}
 	_, err := resolveProjectRunWorkDir(project.Path, cfg.WorkDir)
@@ -3526,12 +3780,19 @@ func (s *Server) getRunConfig(w http.ResponseWriter, r *http.Request) {
 	if c.EnvVars == nil {
 		c.EnvVars = map[string]string{}
 	}
+	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
 	writeJSON(w, 200, c)
 }
 
 func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
-	if !s.requireRunProject(w, r) {
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	var c RunConfig
@@ -3542,6 +3803,15 @@ func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if _, err := resolveRunExecutionTarget(project.Path, c.ExecutionTarget); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := resolveProjectRunWorkDir(project.Path, c.WorkDir); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
 	if err := s.saveRunConfig(r.Context(), projectID, c); err != nil {
 		writeError(w, 500, err)
 		return
@@ -3581,6 +3851,7 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		if req.Command != "" {
 			cfg.Command = req.Command
 			cfg.WorkDir = req.WorkDir
+			cfg.ExecutionTarget = req.ExecutionTarget
 			if req.EnvVars != nil {
 				cfg.EnvVars = req.EnvVars
 			}
@@ -3604,7 +3875,7 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := runner.StartWithConfig(s.runtimeCtx, project.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars); err != nil {
+	if err := runner.StartWithConfig(s.runtimeCtx, project.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars, cfg.ExecutionTarget); err != nil {
 		writeError(w, 409, err)
 		return
 	}
@@ -3666,7 +3937,7 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := runner.RestartWithConfig(s.runtimeCtx, project.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars); err != nil {
+	if err := runner.RestartWithConfig(s.runtimeCtx, project.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars, cfg.ExecutionTarget); err != nil {
 		writeError(w, 409, err)
 		return
 	}

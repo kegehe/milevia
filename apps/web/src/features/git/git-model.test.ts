@@ -28,3 +28,9 @@ test("keeps a late diff response from replacing the most recently selected file"
   assert.match(source, /const requestID = \+\+diffRequest\.current;/);
   assert.match(source, /if \(requestID === diffRequest\.current && mountedRef\.current\) setSelectedDiff\(diff\);/);
 });
+
+test("closes destructive confirmations when an operation result is uncertain", () => {
+  const source = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /if \(result\.status === "needs_attention"\) \{\s+closeDiff\(\);\s+setConfirmation\(null\);\s+\}/);
+});

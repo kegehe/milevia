@@ -474,6 +474,13 @@ func (s *Server) setOrchestrationJobPause(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if target == orchestrationPaused {
+		// 通知：编排任务已暂停
+		s.notifyOrchestrationPaused(r.Context(), projectID, taskID)
+	} else if target == orchestrationQueued && previousStatus == orchestrationNeedsHuman {
+		// 通知：编排任务从 needs_human 恢复
+		s.notifyOrchestrationResumed(r.Context(), projectID, taskID)
+	}
 	if target == orchestrationQueued {
 		s.kickProjectOrchestrator(projectID)
 	}
@@ -1089,6 +1096,8 @@ func (s *Server) retryOrchestrationJob(ctx context.Context, job OrchestrationJob
 		s.failOrchestrationJob(ctx, job, err)
 		return
 	}
+	// 通知：编排任务重试，任务状态变为 action_required
+	s.notifyOrchestrationRetry(ctx, job, cause)
 	time.AfterFunc(50*time.Millisecond, func() { s.kickProjectOrchestrator(job.ProjectID) })
 }
 
@@ -1112,7 +1121,11 @@ func (s *Server) failOrchestrationJob(ctx context.Context, job OrchestrationJob,
 	if _, err = tx.ExecContext(ctx, `update orchestration_outbox set status='failed',completed_at=? where job_id=? and status='pending'`, now, job.ID); err != nil {
 		return
 	}
-	_ = tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return
+	}
+	// 通知：编排任务失败，需要人工介入
+	s.notifyOrchestrationNeedsHuman(ctx, job, cause)
 }
 
 func (s *Server) ensureDevBranch(ctx context.Context, repo string, cfg OrchestrationConfig) error {
