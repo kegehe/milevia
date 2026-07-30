@@ -1206,8 +1206,10 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 通知：任务审查结果（done 或 action_required）
-	s.notifyTaskStatusChange(r.Context(), task.ID, nextStatus)
+	// 人工确认验收后无需再次通知；要求修改仍需提醒后续处理。
+	if nextStatus == taskActionRequired {
+		s.notifyTaskStatusChange(r.Context(), task.ID, nextStatus)
+	}
 	task.Status, task.UpdatedAt = nextStatus, now
 	if nextStatus == taskDone {
 		task.CompletedAt = &now

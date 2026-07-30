@@ -3540,6 +3540,29 @@ func TestTaskChangeRequestAndReopenFollowStateRules(t *testing.T) {
 	}
 }
 
+func TestAcceptingTaskDoesNotCreateStatusNotification(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Accepted task has no notification")
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
+		t.Fatalf("prepare task for acceptance: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/review", bytes.NewBufferString(`{"action":"accept"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("accept task status: %d body=%s", response.Code, response.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskDone)
+
+	var count int
+	if err := server.db.QueryRow(`select count(*) from notifications where task_id=? and type='task.done'`, taskID).Scan(&count); err != nil {
+		t.Fatalf("count accepted-task notifications: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("accepted-task notification count = %d, want 0", count)
+	}
+}
+
 func TestTaskAwaitingReviewCannotBeDispatchedUntilChangesAreRequested(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Review before redispatch")

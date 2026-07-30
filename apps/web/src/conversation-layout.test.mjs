@@ -43,10 +43,30 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /const draftToRestore = assistantOutputRuns\.current\.has\(runID\) \? undefined : pendingUserDrafts\.current\.get\(runID\);/);
   assert.match(conversationPage, /const restorePendingUserDraft = \(conversationID: string, routeVersion: number, runID: string, draft: string \| undefined\) => \{\s*if \(!draft \|\| conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;/s);
   assert.match(conversationPage, /setText\(\(current\) => current === "" \? draft : current\);/);
+  assert.match(conversationPage, /saveConversationDraft\(projectId, conversationID, restoredText\)/);
   assert.match(conversationPage, /const conversationID = conversation\.id;\s*const routeVersion = conversationRouteVersion\.current;\s*const runID = run;/s);
   assert.match(conversationPage, /restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
   assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{ restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
+});
+
+test("all composer text sources are cached and conversation switches use the target draft", () => {
+  assert.match(conversationPage, /const setComposerText = useCallback/);
+  assert.match(conversationPage, /if \(conversationRef\.current\?\.id === conversationID\) setComposerText\(preview\.content, conversationID\);/);
+  assert.match(conversationPage, /setComposerText\(inputHistory\[historyIndex\.current!\], undefined, false\);/);
+  assert.match(conversationPage, /setComposerText\(draftBeforeHistory\.current, undefined, false\);/);
+  assert.match(conversationPage, /const nextDraft = projectId \? getConversationDraft\(projectId, next\.id\) : "";/);
+  assert.doesNotMatch(conversationPage, /resetConversationView\(next, false\)/);
+});
+
+test("input-history previews do not replace the unsent draft when the page closes", () => {
+  assert.match(conversationPage, /const textToPersist = historyIndex\.current === null \? textRef\.current : draftBeforeHistory\.current;/);
+  assert.match(conversationPage, /saveConversationDraft\(projectId, conversationID, textToPersist\);/);
+});
+
+test("a failed send restores its draft only while the original conversation remains active", () => {
+  assert.match(conversationPage, /const conversationID = conversation\.id;\s*const routeVersion = conversationRouteVersion\.current;\s*setSending\(true\);/s);
+  assert.match(conversationPage, /catch \(cause\) \{\s*if \(conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;\s*fail\(cause instanceof Error \? cause\.message : "无法发送消息"\);\s*if \(clearDraft\) \{/s);
 });
 
 test("user messages use the conversation's right edge without reserving task-entry space", () => {
@@ -159,8 +179,8 @@ test("Git workbench and project runner are first-class workspace tabs", () => {
   // 左右分栏：.run-body 水平排列，左侧日志 flex:1，右侧侧栏固定宽度
   assert.match(runStyles, /\.run-body\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
   assert.match(runStyles, /\.run-sidebar\s*\{[^}]*width:\s*340px;[^}]*overflow-y:\s*auto;/s);
-  // 日志终端使用深色高对比度底色，并保留 ANSI 语义颜色。
-  assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*background:\s*#172b27;[^}]*color:\s*#d9e8df;/s);
+  // 日志终端与全局命令输出共享深青绿基色，并保留 ANSI 语义颜色。
+  assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*background:\s*#1d3933;[^}]*color:\s*#dcece4;/s);
   assert.match(runPanel, /toAnsiSegments\(runLogText\(entry\)\)/);
   assert.match(runStyles, /\.ansi-green, \.ansi-bright-green\s*\{\s*color:\s*#a9e57e;/);
   // 移动端回退为上下布局

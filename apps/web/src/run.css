@@ -51,8 +51,9 @@
 	height: 100%;
 	overflow-y: auto;
 	padding: 10px 0 16px;
-	background: #172b27;
-	color: #d9e8df;
+	/* 与命令输出共用深青绿基底，保持终端感但不脱离工作区主题。 */
+	background: #1d3933;
+	color: #dcece4;
 	font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
 	font-size: 12px;
 	line-height: 1.65;
@@ -83,7 +84,7 @@
 .run-log-empty {
 	padding: 40px 20px;
 	text-align: center;
-	color: #8ca69a;
+	color: #9bb6ab;
 	font-family: inherit;
 }
 
@@ -97,12 +98,12 @@
 }
 
 .run-log-line:hover {
-	background: #203a34;
+	background: #294b42;
 }
 
 .run-log-line time {
 	padding-top: 1px;
-	color: #7d9c8e;
+	color: #91aaa0;
 	font-size: 11px;
 	white-space: nowrap;
 }
@@ -112,11 +113,11 @@
 	min-height: 18px;
 	align-items: center;
 	justify-content: center;
-	border: 1px solid #3e5b52;
+	border: 1px solid #496a5f;
 	border-radius: 3px;
 	padding: 0 3px;
-	color: #a9c4b8;
-	background: #1d342e;
+	color: #b5cec3;
+	background: #284940;
 	font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -130,42 +131,42 @@
 }
 
 .run-log-line.system {
-	border-left-color: #6bb69f;
-	color: #b7dfd0;
+	border-left-color: #70bca5;
+	color: #c2e4d5;
 }
 
 .run-log-line.system .run-log-stream {
-	border-color: #4d917e;
-	color: #bce4d5;
-	background: #1d4439;
+	border-color: #5c9d8a;
+	color: #c5e6d8;
+	background: #245247;
 }
 
 .run-log-line.stderr .run-log-stream {
-	border-color: #68584d;
-	color: #cbb5a7;
-	background: #382f29;
+	border-color: #786559;
+	color: #d6c0b1;
+	background: #453832;
 }
 
 .run-log-line.is-error {
-	border-left-color: #ef8b78;
-	color: #ffd0c8;
+	border-left-color: #f08b78;
+	color: #ffd4cb;
 }
 
 .run-log-line.is-error .run-log-stream {
-	border-color: #99564c;
-	color: #ffd0c8;
-	background: #4b2d29;
+	border-color: #a96155;
+	color: #ffd4cb;
+	background: #55332e;
 }
 
 .run-log-line.is-warning {
-	border-left-color: #f5d76b;
-	color: #f8e7a3;
+	border-left-color: #f2d36a;
+	color: #f7e5a2;
 }
 
 .run-log-line.is-warning .run-log-stream {
-	border-color: #8b783a;
-	color: #f8e7a3;
-	background: #443d1d;
+	border-color: #988443;
+	color: #f7e5a2;
+	background: #504722;
 }
 
 .ansi-bold { font-weight: 700; }

@@ -397,7 +397,7 @@ export default function ConversationPage() {
   const { projectId, conversationId: urlConversationId } = useParams<{ projectId: string; conversationId: string }>();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { api: projectApi, setError } = useProjectContext();
+  const { api: projectApi, setError, getConversationDraft, saveConversationDraft, flushConversationDraft } = useProjectContext();
   const { project } = useOutletContext<ProjectLayoutOutletContext>();
   const fail = setError;
   // 弹窗控制辅助函数 — 使用不可变模式创建新的 URLSearchParams
@@ -456,11 +456,13 @@ export default function ConversationPage() {
   const bottomSafeAreaFrame = useRef<number | null>(null);
   const historyIndex = useRef<number | null>(null);
   const draftBeforeHistory = useRef("");
+  const textRef = useRef("");
   const finishedRunIds = useRef(new Set<string>());
   const usageRequestVersion = useRef(0);
   const usageConversationID = useRef<string | null>(null);
   const conversationRef = useRef<Conversation | null>(null);
   conversationRef.current = conversation;
+  textRef.current = text;
   const conversationTransitionRef = useRef(false);
   const conversationRouteVersion = useRef(0);
   const stopRunRef = useRef<() => Promise<void>>(async () => {});
@@ -472,11 +474,32 @@ export default function ConversationPage() {
   const lastReloadRequestedAt = useRef(0);
   const lastReloadRunID = useRef<string | null>(null);
 
+  const setComposerText = useCallback((value: string, conversationID = conversationRef.current?.id, persist = true) => {
+    textRef.current = value;
+    setText(value);
+    if (persist && projectId && conversationID) saveConversationDraft(projectId, conversationID, value);
+  }, [projectId, saveConversationDraft]);
+
   // Route changes must invalidate a pending clear before promise callbacks can
   // write the previous conversation back into the page.
   useLayoutEffect(() => {
     conversationRouteVersion.current++;
   }, [projectId, urlConversationId]);
+
+  // 草稿归属于具体项目与会话。对话页卸载后，ProjectProvider 与浏览器缓存仍会保留它。
+  useLayoutEffect(() => {
+    if (!projectId || !conversation?.id) return;
+    const draft = getConversationDraft(projectId, conversation.id);
+    setComposerText(draft, conversation.id);
+  }, [conversation?.id, getConversationDraft, projectId, setComposerText]);
+
+  useEffect(() => () => {
+    const conversationID = conversationRef.current?.id;
+    if (!projectId || !conversationID) return;
+    const textToPersist = historyIndex.current === null ? textRef.current : draftBeforeHistory.current;
+    saveConversationDraft(projectId, conversationID, textToPersist);
+    flushConversationDraft(projectId, conversationID);
+  }, [flushConversationDraft, projectId, saveConversationDraft]);
 
   const rememberFinishedRun = (runID: string) => {
     const finished = finishedRunIds.current;
@@ -501,6 +524,9 @@ export default function ConversationPage() {
   const restorePendingUserDraft = (conversationID: string, routeVersion: number, runID: string, draft: string | undefined) => {
     if (!draft || conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) return;
     pendingUserDrafts.current.delete(runID);
+    const restoredText = textRef.current === "" ? draft : textRef.current;
+    textRef.current = restoredText;
+    if (projectId) saveConversationDraft(projectId, conversationID, restoredText);
     setText((current) => current === "" ? draft : current);
     historyIndex.current = null;
     draftBeforeHistory.current = "";
@@ -1115,10 +1141,19 @@ export default function ConversationPage() {
     if (!conversation || sending || clearing || stopping || shortcutBusy) return;
     const content = rawContent.trim();
     if (!content) return;
-    if (content === "/resume") { if (clearDraft) setText(""); openConversationHistory(); return; }
+    if (content === "/resume") {
+      if (clearDraft) {
+        setComposerText("", conversation.id);
+      }
+      openConversationHistory();
+      return;
+    }
     const conversationID = conversation.id;
+    const routeVersion = conversationRouteVersion.current;
     setSending(true);
-    if (clearDraft) setText("");
+    if (clearDraft) {
+      setComposerText("", conversationID);
+    }
     setShowPermissionMenu(false); historyIndex.current = null; draftBeforeHistory.current = "";
     try {
       const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content }) });
@@ -1128,7 +1163,14 @@ export default function ConversationPage() {
       followAfterDispatch();
       void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法发送消息"); if (clearDraft) setText(content); }
+    } catch (cause) {
+      if (conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) return;
+      fail(cause instanceof Error ? cause.message : "无法发送消息");
+      if (clearDraft) {
+        setComposerText(content, conversationID);
+        if (projectId) flushConversationDraft(projectId, conversationID);
+      }
+    }
     finally { setSending(false); }
   };
 
@@ -1142,10 +1184,11 @@ export default function ConversationPage() {
     const required = requiredShortcutVariables(shortcut.template);
     if (!variablesReady && required.length) { setShortcutVariables({ shortcut, variables }); return; }
     if (shortcut.defaultAction === "fill") {
+      const conversationID = conversation.id;
       setShortcutBusy(shortcut.id);
       try {
-        const preview = await projectApi<{ content: string }>(`/api/conversations/${conversation.id}/shortcuts/${shortcut.id}/preview`, { method: "POST", body: JSON.stringify({ variables }) });
-        setText(preview.content);
+        const preview = await projectApi<{ content: string }>(`/api/conversations/${conversationID}/shortcuts/${shortcut.id}/preview`, { method: "POST", body: JSON.stringify({ variables }) });
+        if (conversationRef.current?.id === conversationID) setComposerText(preview.content, conversationID);
       } catch (cause) { fail(cause instanceof Error ? cause.message : "无法准备快捷任务"); }
       finally { setShortcutBusy(""); }
       return;
@@ -1167,8 +1210,10 @@ export default function ConversationPage() {
     finally { setShortcutBusy(""); }
   };
 
-  const resetConversationView = (next: Conversation, clearDraft = true) => {
-    setMessages([]); setEvents([]); setRun(""); setUsage(null); if (clearDraft) setText(""); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
+  const resetConversationView = (next: Conversation) => {
+    const nextDraft = projectId ? getConversationDraft(projectId, next.id) : "";
+    setComposerText(nextDraft, next.id);
+    setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
   };
 
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode) => {
@@ -1306,7 +1351,7 @@ export default function ConversationPage() {
     setActivatingConversation(item.id);
     try {
       const next = await projectApi<Conversation>(`/api/conversations/${item.id}/activate`, { method: "POST" });
-      resetConversationView(next, false); closeHistory();
+      resetConversationView(next); closeHistory();
       if (projectId) navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
     } catch (cause) { fail(cause instanceof Error ? cause.message : "无法切换会话"); }
@@ -1396,7 +1441,7 @@ export default function ConversationPage() {
   const handleTextChange = (value: string) => {
     historyIndex.current = null;
     draftBeforeHistory.current = "";
-    setText(value);
+    setComposerText(value);
   };
 
   const navigateInputHistory = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1413,7 +1458,7 @@ export default function ConversationPage() {
       } else {
         historyIndex.current = Math.max(0, historyIndex.current! - 1);
       }
-      setText(inputHistory[historyIndex.current!]);
+      setComposerText(inputHistory[historyIndex.current!], undefined, false);
       return;
     }
     const currentIndex = historyIndex.current;
@@ -1422,10 +1467,10 @@ export default function ConversationPage() {
     if (currentIndex < inputHistory.length - 1) {
       const nextIndex = currentIndex + 1;
       historyIndex.current = nextIndex;
-      setText(inputHistory[nextIndex]);
+      setComposerText(inputHistory[nextIndex], undefined, false);
     } else {
       historyIndex.current = null;
-      setText(draftBeforeHistory.current);
+      setComposerText(draftBeforeHistory.current, undefined, false);
       draftBeforeHistory.current = "";
     }
   };
