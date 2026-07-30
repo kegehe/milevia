@@ -81,7 +81,7 @@ return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby
 - [ ] **Step 4: 验证构建**
 
 ```bash
-cd /home/tangmaoke/projects/auto/apps/web && npx tsc --noEmit 2>&1 | head -20
+cd /home/tangmaoke/projects/milevia/apps/web && npx tsc --noEmit 2>&1 | head -20
 ```
 
 预期：无类型错误。
@@ -176,7 +176,7 @@ git commit -m "fix: 弹窗详情footer吸底 + review-sheet流式布局，避免
 - [ ] **Step 4: 验证构建**
 
 ```bash
-cd /home/tangmaoke/projects/auto/apps/web && npx tsc --noEmit 2>&1 | head -20
+cd /home/tangmaoke/projects/milevia/apps/web && npx tsc --noEmit 2>&1 | head -20
 ```
 
 预期：无类型错误。
@@ -219,7 +219,7 @@ git commit -m "fix: 内联卡片操作按钮分组 + 验收textarea视觉优化"
 - [ ] **Step 2: 验证构建**
 
 ```bash
-cd /home/tangmaoke/projects/auto/apps/web && npx tsc --noEmit 2>&1 | head -20
+cd /home/tangmaoke/projects/milevia/apps/web && npx tsc --noEmit 2>&1 | head -20
 ```
 
 预期：无类型错误。
@@ -276,7 +276,7 @@ git commit -m "fix: 内联任务详情卡片移动端响应式适配"
 - [ ] **Step 3: 验证构建**
 
 ```bash
-cd /home/tangmaoke/projects/auto/apps/web && npx tsc --noEmit 2>&1 | head -20
+cd /home/tangmaoke/projects/milevia/apps/web && npx tsc --noEmit 2>&1 | head -20
 ```
 
 预期：无类型错误。

@@ -1,5 +1,5 @@
 {
-  "name": "auto-development-platform",
+  "name": "milevia",
   "private": true,
   "scripts": {
     "dev": "bash dev.sh"

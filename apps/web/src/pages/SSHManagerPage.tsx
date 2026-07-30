@@ -4,6 +4,27 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useProjectContext } from "../stores/useProjectStore";
 import type { SSHPreflightResult, SSHProfile } from "../lib/types";
+import DashboardPage from "./DashboardPage";
+
+function SshIcon({ className = "ssh-icon" }: { className?: string }) {
+  return <svg className={className} viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2" /><path d="m7.5 9 2.5 2.5L7.5 14M12.5 14h4" /></svg>;
+}
+
+function CloseIcon() {
+  return <svg className="ssh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
+}
+
+function CheckIcon() {
+  return <svg className="ssh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6.5 12 3.4 3.4 7.6-7.6" /></svg>;
+}
+
+function LinkIcon() {
+  return <svg className="ssh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 14.5 5-5M7.5 16.5l-1 1a3 3 0 0 1-4.2-4.2l3-3a3 3 0 0 1 4.2 0M16.5 7.5l1-1a3 3 0 0 1 4.2 4.2l-3 3a3 3 0 0 1-4.2 0" /></svg>;
+}
+
+function TrashIcon() {
+  return <svg className="ssh-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 7h15M9 7V4.5h6V7M7 7l.8 12.5h8.4L17 7M10 11v5M14 11v5" /></svg>;
+}
 
 export default function SSHManagerPage() {
   const { api, setError } = useProjectContext();
@@ -136,53 +157,34 @@ export default function SSHManagerPage() {
     finally { setSaving(false); }
   };
 
-  const statusIcon = (s: string) => s === "connected" ? "🟢" : s === "error" ? "🔴" : s === "disconnected" ? "⚫" : "⚪";
+  const closeForm = () => {
+    setShowForm(false);
+    updateForm({ name: "", host: "", port: 22, user: "", privateKeyPath: "", rootPath: "", profileName: "" });
+    setResolvingProfile(false);
+    resolvingCount.current = 0;
+  };
+  const statusLabel = (status: string) => status === "connected" ? "已连接" : status === "error" ? "连接异常" : status === "disconnected" ? "未连接" : "未知状态";
 
   // "确认并保存"按钮的禁用原因提示
   const saveDisabledReason = saving ? "保存中..."
     : !preflight?.ok ? "请先点击「预检连接」并通过检查"
+    : !preflight.hostKey ? "未获取到主机指纹，请重新预检"
     : !hostKeyConfirmed ? "请勾选确认主机指纹"
     : null;
 
-  return <main className="app-shell">
-    <div className="backdrop" role="dialog" aria-modal="true">
-      <section className="modal">
-        <header><div><label>SSH CONNECTIONS</label><h2>SSH 连接管理</h2></div><button title="关闭" onClick={() => navigate("/")}>x</button></header>
-        {localError && <div style={{ padding: "0.5rem 0.75rem", margin: "0.5rem 0", background: "var(--danger-bg, #fef2f2)", color: "var(--danger, #d14233)", borderRadius: "6px", fontSize: "13px", display: "flex", justifyContent: "space-between", alignItems: "center" }}><span>{localError}</span><button style={{ background: "none", border: "none", color: "inherit", cursor: "pointer", fontSize: "16px", padding: "0 4px" }} onClick={clearError}>x</button></div>}
-        {showForm && <div className="ssh-form">
-          <label>SSH Profile<select value={form.profileName} onChange={(e) => void selectProfile(e.target.value)} disabled={resolvingProfile}><option value="">手工填写</option>{profiles.map((profile) => <option key={profile} value={profile}>{profile}</option>)}</select></label>
-          {resolvingProfile && <p className="permission-confirmation" style={{ color: "var(--accent)" }}>正在解析 SSH Profile 配置...</p>}
-          <p className="permission-confirmation">选择 Profile 时，系统会读取本机 OpenSSH 配置并在预检中解析连接参数。</p>
-          <div className="ssh-fields">
-            <label>连接名称<input type="text" value={form.name} onChange={(e) => updateForm({ ...form, name: e.target.value })} placeholder="开发服务器" /></label>
-            <label>主机地址<input disabled={Boolean(form.profileName)} type="text" value={form.host} onChange={(e) => updateForm({ ...form, host: e.target.value })} placeholder="192.168.1.100" /></label>
-            <label>端口<input disabled={Boolean(form.profileName)} type="number" value={form.port} onChange={(e) => updateForm({ ...form, port: Number(e.target.value) || 22 })} /></label>
-            <label>用户名<input disabled={Boolean(form.profileName)} type="text" value={form.user} onChange={(e) => updateForm({ ...form, user: e.target.value })} placeholder="root" /></label>
-            <label className="ssh-field-wide">私钥路径<input disabled={Boolean(form.profileName)} type="text" value={form.privateKeyPath} onChange={(e) => updateForm({ ...form, privateKeyPath: e.target.value })} placeholder="例如 /home/user/.ssh/id_rsa" /><small>留空时使用 SSH Agent。</small></label>
-            <label className="ssh-field-wide">根路径<input required type="text" value={form.rootPath} onChange={(e) => updateForm({ ...form, rootPath: e.target.value })} placeholder="/home/user/projects" /></label>
-          </div>
-          <div className="ssh-form-actions">
-            <button className="secondary" disabled={preflighting || resolvingProfile} onClick={() => void runPreflight()}>{preflighting ? "预检中..." : "预检连接"}</button>
-            <button className="secondary" onClick={() => { setShowForm(false); updateForm({ name: "", host: "", port: 22, user: "", privateKeyPath: "", rootPath: "", profileName: "" }); setResolvingProfile(false); resolvingCount.current = 0; }}>取消</button>
-            <button className="primary" disabled={Boolean(saveDisabledReason)} onClick={handleSave} title={saveDisabledReason ?? undefined}>{saving ? "保存中" : "确认并保存"}</button>
-          </div>
-          {!preflight && !preflighting && <p className="permission-confirmation" style={{ marginTop: "0.5rem" }}>请先点击「预检连接」验证远端服务器可达性，通过后确认主机指纹即可保存。</p>}
-          {preflight && <div className={`ssh-preflight ${preflight.ok ? "valid" : "invalid"}`}><b>{preflight.ok ? "连接预检通过" : "预检未通过"}</b><span>SSH {preflight.checks?.ssh ? "可用" : "不可用"} · SFTP {preflight.checks?.sftp ? "可用" : "不可用"} · Claude {preflight.checks?.claude ? "可用" : "待安装或登录"} · 审批隧道 {preflight.checks?.approvalTunnel ? "可用" : "不可用"}</span>{preflight.fingerprint && <label><input type="checkbox" checked={hostKeyConfirmed} onChange={(e) => setHostKeyConfirmed(e.target.checked)} />我已核对并确认此主机指纹：<code>{preflight.fingerprint}</code></label>}{preflight.error && <span>{preflight.error}</span>}</div>}
-        </div>}
-        {loading ? <p className="permission-confirmation">加载中...</p> : connections.length === 0 ? <p className="permission-confirmation">暂无 SSH 连接配置。<br /><button className="primary" onClick={() => setShowForm(true)} style={{ marginTop: "0.5rem" }}>添加 SSH 连接</button></p> : <>
-          {connections.map((conn) => (
-            <div key={conn.id} style={{ padding: "0.75rem", marginBottom: "0.5rem", background: "var(--surface)", borderRadius: "8px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div><b>{statusIcon(conn.status)} {conn.name}</b><small style={{ display: "block", color: "var(--muted)" }}>{conn.user}@{conn.host}:{conn.port}</small>{conn.errorMsg && <small style={{ display: "block", color: "var(--danger)" }}>{conn.errorMsg}</small>}</div>
-              <div style={{ display: "flex", gap: "0.25rem", flexShrink: 0 }}>
-                <button className="secondary" disabled={testing === conn.id} onClick={() => handleTest(conn.id)}>{testing === conn.id ? "测试中" : "测试"}</button>
-                {conn.status === "connected" ? <button className="secondary" disabled={connecting === conn.id} onClick={() => handleDisconnect(conn.id)}>断开</button> : <button className="secondary" disabled={connecting === conn.id} onClick={() => handleConnect(conn.id)}>{connecting === conn.id ? "连接中" : "连接"}</button>}
-                <button className="secondary danger" onClick={() => handleDelete(conn.id)}>删除</button>
-              </div>
-            </div>))}
-          <button className="primary" onClick={() => setShowForm(true)} style={{ marginTop: "0.5rem" }}>+ 添加 SSH 连接</button>
-        </>}
-        <footer><button className="secondary" onClick={() => navigate("/")}>关闭</button></footer>
+  return <>
+    <DashboardPage />
+    <div className="backdrop ssh-manager-backdrop" role="dialog" aria-modal="true" aria-labelledby="ssh-manager-title">
+      <section className="modal ssh-manager-dialog">
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><SshIcon /></span><div><h2 id="ssh-manager-title">SSH连接</h2><p>管理远程开发环境与项目目录</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" onClick={() => navigate("/")}><CloseIcon /></button></header>
+        <div className="ssh-manager-toolbar"><span>{loading ? "正在同步连接状态" : `${connections.length} 个已保存连接`}</span><button className="primary ssh-add-button" type="button" onClick={() => setShowForm(true)}><SshIcon />添加连接</button></div>
+        {localError && <div className="ssh-error" role="alert"><span>{localError}</span><button type="button" title="关闭提示" aria-label="关闭提示" onClick={clearError}><CloseIcon /></button></div>}
+        <div className="ssh-manager-body">
+          {loading ? <div className="ssh-empty-state"><span className="ssh-loading-indicator"></span><p>正在读取SSH连接…</p></div> : connections.length === 0 ? <div className="ssh-empty-state"><span className="ssh-empty-icon"><SshIcon /></span><h3>还没有远程连接</h3><p>添加一台服务器后，即可从其中加载项目。</p><button className="primary" type="button" onClick={() => setShowForm(true)}><SshIcon />添加SSH连接</button></div> : <div className="ssh-connection-list">{connections.map((conn) => <article className={`ssh-connection-card is-${conn.status || "unknown"}`} key={conn.id}><div className="ssh-connection-main"><span className="ssh-status"><i></i>{statusLabel(conn.status)}</span><h3>{conn.name}</h3><p>{conn.user}@{conn.host}:{conn.port}</p>{conn.errorMsg && <small>{conn.errorMsg}</small>}</div><div className="ssh-connection-actions"><button className="ssh-action-button" type="button" title="测试连接" aria-label={`测试连接 ${conn.name}`} disabled={testing === conn.id} onClick={() => void handleTest(conn.id)}><CheckIcon /></button>{conn.status === "connected" ? <button className="ssh-action-button" type="button" title="断开连接" aria-label={`断开连接 ${conn.name}`} disabled={connecting === conn.id} onClick={() => void handleDisconnect(conn.id)}><LinkIcon /></button> : <button className="ssh-action-button connect" type="button" title="连接" aria-label={`连接 ${conn.name}`} disabled={connecting === conn.id} onClick={() => void handleConnect(conn.id)}><LinkIcon /></button>}<button className="ssh-action-button danger" type="button" title="删除连接" aria-label={`删除连接 ${conn.name}`} onClick={() => void handleDelete(conn.id)}><TrashIcon /></button></div></article>)}</div>}
+        </div>
+        <footer><button className="secondary" type="button" onClick={() => navigate("/")}>关闭</button></footer>
       </section>
     </div>
-  </main>;
+    {showForm && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="ssh-form-title"><section className="modal ssh-connection-dialog"><header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><SshIcon /></span><div><h2 id="ssh-form-title">添加SSH连接</h2><p>填写连接信息并完成安全预检</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={saving} onClick={closeForm}><CloseIcon /></button></header><form onSubmit={(event) => { event.preventDefault(); void handleSave(); }}><div className="ssh-form-progress" aria-label="添加连接步骤"><span className="active"><i>1</i>配置连接</span><span className={preflight ? "active" : ""}><i>2</i>预检环境</span><span className={preflight?.ok && hostKeyConfirmed ? "active" : ""}><i>3</i>保存连接</span></div>{localError && <div className="ssh-error" role="alert"><span>{localError}</span><button type="button" title="关闭提示" aria-label="关闭提示" onClick={clearError}><CloseIcon /></button></div>}<div className="ssh-form-body"><section className="ssh-form-section"><header><h3>连接方式</h3><p>可使用本机 SSH Profile 自动填充连接信息。</p></header><label className="ssh-field">SSH Profile<select value={form.profileName} onChange={(event) => void selectProfile(event.target.value)} disabled={resolvingProfile}><option value="">手工填写</option>{profiles.map((profile) => <option key={profile} value={profile}>{profile}</option>)}</select></label>{resolvingProfile && <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在解析 SSH Profile…</p>}</section><section className="ssh-form-section"><header><h3>服务器信息</h3><p>用于识别远程主机及其登录方式。</p></header><div className="ssh-fields"><label className="ssh-field">连接名称<input autoFocus type="text" value={form.name} onChange={(event) => updateForm({ ...form, name: event.target.value })} placeholder="开发服务器" /></label><label className="ssh-field">主机地址<input disabled={Boolean(form.profileName)} type="text" value={form.host} onChange={(event) => updateForm({ ...form, host: event.target.value })} placeholder="192.168.1.100" /></label><label className="ssh-field">端口<input disabled={Boolean(form.profileName)} type="number" value={form.port} onChange={(event) => updateForm({ ...form, port: Number(event.target.value) || 22 })} /></label><label className="ssh-field">用户名<input disabled={Boolean(form.profileName)} type="text" value={form.user} onChange={(event) => updateForm({ ...form, user: event.target.value })} placeholder="root" /></label><label className="ssh-field ssh-field-wide">私钥路径<input disabled={Boolean(form.profileName)} type="text" value={form.privateKeyPath} onChange={(event) => updateForm({ ...form, privateKeyPath: event.target.value })} placeholder="例如 /home/user/.ssh/id_rsa" /><small>留空时使用 SSH Agent。</small></label></div></section><section className="ssh-form-section"><header><h3>项目目录</h3><p>该目录会作为远程项目浏览的起点。</p></header><label className="ssh-field"><span>远端根路径</span><input required type="text" value={form.rootPath} onChange={(event) => updateForm({ ...form, rootPath: event.target.value })} placeholder="/home/user/projects" /></label></section><section className="ssh-form-section ssh-preflight-section"><header><div><h3>连接预检</h3><p>检查 SSH、SFTP、Claude Code 与审批隧道是否可用。</p></div><button className="secondary ssh-preflight-button" type="button" disabled={preflighting || resolvingProfile} onClick={() => void runPreflight()}><CheckIcon />{preflighting ? "预检中" : "预检连接"}</button></header>{!preflight && !preflighting && <div className="ssh-preflight-placeholder"><CheckIcon /><span>完成连接信息后开始预检。</span></div>}{preflight && <div className={`ssh-preflight ${preflight.ok ? "valid" : "invalid"}`}><header><span><CheckIcon /></span><div><h4>{preflight.ok ? "连接预检通过" : "预检未通过"}</h4><p>{preflight.ok ? "远程环境已满足连接要求。" : preflight.error || "请检查连接信息后重新预检。"}</p></div></header><div className="ssh-preflight-checks"><span>SSH <b>{preflight.checks?.ssh ? "可用" : "不可用"}</b></span><span>SFTP <b>{preflight.checks?.sftp ? "可用" : "不可用"}</b></span><span>Claude Code <b>{preflight.checks?.claude ? "可用" : "待安装或登录"}</b></span><span>审批隧道 <b>{preflight.checks?.approvalTunnel ? "可用" : "不可用"}</b></span></div>{preflight.fingerprint && <label className="ssh-host-key"><input type="checkbox" checked={hostKeyConfirmed} onChange={(event) => setHostKeyConfirmed(event.target.checked)} /><span>我已核对并确认此主机指纹：<code>{preflight.fingerprint}</code></span></label>}</div>}</section></div><footer><button className="secondary" type="button" disabled={saving} onClick={closeForm}>取消</button><button className="primary" disabled={Boolean(saveDisabledReason)} title={saveDisabledReason ?? undefined}>{saving ? "保存中" : "确认并保存"}</button></footer></form></section></div>}
+  </>;
 }

@@ -1,7 +1,7 @@
 // 项目页共享布局：header、workspace tabs
 // 通过 Outlet context 向子路由传递 project 数据，避免重复加载
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, type ReactNode } from "react";
 import { Outlet, useParams, useNavigate, useLocation } from "react-router-dom";
 import NotificationCenter from "./NotificationCenter";
 import type { Project, WorkspaceTab } from "../lib/types";
@@ -10,6 +10,21 @@ import { useProjectContext } from "../stores/useProjectStore";
 
 export interface ProjectLayoutOutletContext {
   project: Project;
+}
+
+function BackProjectsIcon() {
+  return <svg className="back-projects-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5 8 12l6.5 6.5M8.5 12h8" /></svg>;
+}
+
+function WorkspaceTabIcon({ tab }: { tab: WorkspaceTab }) {
+  const paths: Record<WorkspaceTab, ReactNode> = {
+    conversation: <><path d="M6.5 17.5 3.8 20v-11A3.5 3.5 0 0 1 7.3 5.5h9.4A3.5 3.5 0 0 1 20.2 9v5a3.5 3.5 0 0 1-3.5 3.5H6.5Z" /><path d="M8 11.5h8M8 14.5h5" /></>,
+    tasks: <><path d="M8.5 6.5h10M8.5 12h10M8.5 17.5h10" /><path d="m4.7 6.5.9.9 1.8-2M4.7 12l.9.9 1.8-2M4.7 17.5l.9.9 1.8-2" /></>,
+    files: <><path d="M4.5 7.5A2.5 2.5 0 0 1 7 5h3l1.7 2H17A2.5 2.5 0 0 1 19.5 9.5v7A2.5 2.5 0 0 1 17 19H7a2.5 2.5 0 0 1-2.5-2.5v-9Z" /><path d="M4.8 9h14.4" /></>,
+    git: <><circle cx="6" cy="6" r="2" /><circle cx="18" cy="18" r="2" /><circle cx="18" cy="6" r="2" /><path d="M8 6h5a3 3 0 0 1 3 3v7M8 6h5a3 3 0 0 1 3 3" /></>,
+    run: <><path d="m9 7 7 5-7 5V7Z" /><path d="M5 5.5v13M19 5.5v13" /></>,
+  };
+  return <svg className="workspace-tab-icon" viewBox="0 0 24 24" aria-hidden="true">{paths[tab]}</svg>;
 }
 
 export default function ProjectLayout() {
@@ -122,23 +137,19 @@ export default function ProjectLayout() {
     {globalError && <div className="error" role="alert"><span>{globalError}</span><button type="button" title="关闭错误提示" onClick={() => setGlobalError("")}>x</button></div>}
     <header className="project-head">
       <div className="project-heading">
-        <button className="back-projects" title="返回项目列表" onClick={() => navigate("/")}>←</button>
-        <div>
-          <label>{project.runner}</label>
-          <h2>{project.name}</h2>
-          <code>{project.pathDisplay}</code>
-        </div>
+        <button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表" onClick={() => navigate("/")}><BackProjectsIcon /></button>
+        <h2>{project.name}</h2>
       </div>
       <div className="head-actions-slot">
         <NotificationCenter />
       </div>
     </header>
     <nav className="workspace-tabs" role="tablist" aria-label="项目工作区" onKeyDown={navigateWorkspaceTabs}>
-      <button data-workspace-tab="conversation" id="workspace-tab-conversation" type="button" role="tab" aria-controls="workspace-panel-conversation" aria-selected={workspaceTab === "conversation"} className={workspaceTab === "conversation" ? "active" : ""} onClick={() => selectWorkspaceTab("conversation")}>对话</button>
-      <button data-workspace-tab="tasks" id="workspace-tab-tasks" type="button" role="tab" aria-controls="workspace-panel-tasks" aria-selected={workspaceTab === "tasks"} className={workspaceTab === "tasks" ? "active" : ""} onClick={() => selectWorkspaceTab("tasks")}>任务</button>
-      <button data-workspace-tab="files" id="workspace-tab-files" type="button" role="tab" aria-controls="workspace-panel-files" aria-selected={workspaceTab === "files"} className={workspaceTab === "files" ? "active" : ""} onClick={() => selectWorkspaceTab("files")}>文件</button>
-      {project.gitBranch !== "非 Git 目录" && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} disabled={isRemoteProject} title={isRemoteProject ? "远程 Git 工作台尚未支持" : undefined} onClick={() => selectWorkspaceTab("git")}>Git 工作台</button>}
-      <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} disabled={isRemoteProject} title={isRemoteProject ? "远程项目启动尚未支持" : undefined} onClick={() => selectWorkspaceTab("run")}>项目启动</button>
+      <button data-workspace-tab="conversation" id="workspace-tab-conversation" type="button" role="tab" aria-controls="workspace-panel-conversation" aria-selected={workspaceTab === "conversation"} className={workspaceTab === "conversation" ? "active" : ""} onClick={() => selectWorkspaceTab("conversation")}><WorkspaceTabIcon tab="conversation" /><span>对话</span></button>
+      <button data-workspace-tab="tasks" id="workspace-tab-tasks" type="button" role="tab" aria-controls="workspace-panel-tasks" aria-selected={workspaceTab === "tasks"} className={workspaceTab === "tasks" ? "active" : ""} onClick={() => selectWorkspaceTab("tasks")}><WorkspaceTabIcon tab="tasks" /><span>任务</span></button>
+      <button data-workspace-tab="files" id="workspace-tab-files" type="button" role="tab" aria-controls="workspace-panel-files" aria-selected={workspaceTab === "files"} className={workspaceTab === "files" ? "active" : ""} onClick={() => selectWorkspaceTab("files")}><WorkspaceTabIcon tab="files" /><span>文件</span></button>
+      {project.gitBranch !== "非 Git 目录" && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} disabled={isRemoteProject} title={isRemoteProject ? "远程Git工作台尚未支持" : undefined} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
+      <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} disabled={isRemoteProject} title={isRemoteProject ? "远程项目启动尚未支持" : undefined} onClick={() => selectWorkspaceTab("run")}><WorkspaceTabIcon tab="run" /><span>项目启动</span></button>
     </nav>
     <main className="workspace-content">
       <Outlet context={{ project } satisfies ProjectLayoutOutletContext} />

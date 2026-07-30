@@ -16,11 +16,13 @@ const runPanel = await readFile(new URL("./features/run/ProjectRunPanel.tsx", im
 const runStyles = await readFile(new URL("./run.css", import.meta.url), "utf8");
 
 const workspaceStyles = stylesheet.slice(stylesheet.indexOf("/* Desktop conversation workspace:"));
+const conversationContentStyles = stylesheet.slice(stylesheet.indexOf("/* 对话内容："));
 
 test("message bubbles use their content width without exceeding the reading measure", () => {
   assert.match(stylesheet, /\.message\s*\{[^}]*display:\s*flex;[^}]*min-width:\s*0;[^}]*width:\s*min\(760px,\s*100%\);[^}]*flex-direction:\s*column;[^}]*align-items:\s*flex-start;/s);
-  assert.match(stylesheet, /\.message\.user\s*\{[^}]*align-items:\s*flex-end;/);
-  assert.match(stylesheet, /\.message\s*>\s*\.markdown\s*\{[^}]*box-sizing:\s*border-box;[^}]*width:\s*fit-content;[^}]*max-width:\s*100%;[^}]*min-width:\s*0;/s);
+  assert.match(conversationContentStyles, /\.message\s*\{\s*width:\s*fit-content;\s*max-width:\s*min\(832px,\s*100%\);\s*\}/);
+  assert.match(conversationContentStyles, /\.message\.user\s*\{\s*width:\s*fit-content;\s*max-width:\s*min\(680px,\s*100%\);\s*\}/);
+  assert.match(conversationContentStyles, /\.message\s*>\s*\.markdown\s*\{\s*width:\s*fit-content;\s*max-width:\s*100%;/);
 });
 
 test("user messages can be copied from an icon-only control", () => {
@@ -69,15 +71,21 @@ test("a failed send restores its draft only while the original conversation rema
   assert.match(conversationPage, /catch \(cause\) \{\s*if \(conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;\s*fail\(cause instanceof Error \? cause\.message : "无法发送消息"\);\s*if \(clearDraft\) \{/s);
 });
 
-test("user messages use the conversation's right edge without reserving task-entry space", () => {
-  assert.match(stylesheet, /\.timeline-entry\.message:has\(\.message\.user\)\s*\{\s*display:\s*flex;\s*justify-content:\s*flex-end;\s*padding-left:\s*34px;\s*padding-right:\s*0;\s*\}/);
+test("conversation entries keep card styles separate from their layout and align user messages to the reading column", () => {
+  assert.match(conversationPage, /className=\{`timeline-entry \$\{item\.kind === "message" \? "message-entry" : item\.kind\}`\}/);
+  assert.doesNotMatch(conversationPage, /className=\{`timeline-entry \$\{item\.kind\}`\}/);
+  assert.match(stylesheet, /\.timeline-entry\.message-entry,\s*\.timeline-entry\.tool,\s*\.timeline-entry\.error\s*\{\s*display:\s*flex;\s*width:\s*min\(832px,\s*100%\);\s*margin-right:\s*auto;\s*margin-left:\s*auto;\s*padding:\s*0;\s*\}/s);
+  assert.match(stylesheet, /\.timeline-entry\.message-entry:has\(\.message\.user\)\s*\{\s*justify-content:\s*flex-end;\s*\}/);
   assert.match(stylesheet, /\.message\.user\s*\{\s*align-items:\s*flex-end;\s*margin-left:\s*auto;\s*margin-right:\s*0;\s*\}/);
-  assert.match(stylesheet, /\.timeline-entry\.message:has\(\.message\.user\)::before\s*\{\s*left:\s*auto;\s*right:\s*24px;\s*\}/);
-  assert.match(stylesheet, /\.chat-center \.scroll-buttons\s*\{[^}]*right:\s*4px;/s);
+  assert.match(stylesheet, /\.timeline::before\s*\{\s*display:\s*none;\s*\}/);
+  assert.match(stylesheet, /\.timeline-entry::before\s*\{\s*display:\s*none;\s*\}/);
+  assert.match(stylesheet, /\.chat-center \.scroll-buttons\s*\{[^}]*right:\s*18px;[^}]*bottom:\s*calc\(var\(--composer-height,\s*0px\)\s*\+\s*18px\);/s);
+  assert.match(stylesheet, /\.scroll-btn-icon\s*\{[^}]*stroke:\s*currentColor;/s);
+  assert.match(conversationPage, /<ScrollNavigationIcon direction="top"\s*\/>/);
+  assert.match(conversationPage, /<ScrollNavigationIcon direction="bottom"\s*\/>/);
   assert.match(stylesheet, /@media \(min-width: 821px\) and \(max-width: 1199px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*right:\s*56px;/s);
-  assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.timeline-entry\.message:has\(\.message\.user\)\s*\{\s*padding-left:\s*20px;\s*padding-right:\s*0;\s*\}/);
-  assert.match(stylesheet, /\.chat-center > \.timeline\s*\{[^}]*padding:\s*32px\s+0\s+20px\s+16px;/s);
-  assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+0\s+max\(32px,\s*var\(--composer-height,\s*0px\)\)\s+16px;/s);
+  assert.match(conversationContentStyles, /\.chat-center > \.timeline\s*\{[^}]*padding:\s*28px\s+24px\s+24px;/s);
+  assert.match(conversationContentStyles, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+16px\s+max\(32px,\s*var\(--composer-height,\s*0px\)\)\s+16px;/s);
 });
 
 test("desktop canvas uses three working columns without a page inset", () => {
@@ -110,6 +118,9 @@ test("head actions portal into the project header so the canvas grid stays clean
 test("project workspaces expose global request failures", () => {
   assert.match(projectLayout, /const \{ error: globalError, setError: setGlobalError, refreshProjects \} = useProjectContext\(\);/);
   assert.match(projectLayout, /\{globalError && <div className="error" role="alert"><span>\{globalError\}<\/span><button type="button" title="关闭错误提示" onClick=\{\(\) => setGlobalError\(""\)\}>x<\/button><\/div>\}/);
+  assert.match(projectLayout, /<button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表"[\s\S]*?<BackProjectsIcon \/><\/button>\s*<h2>\{project\.name\}<\/h2>/);
+  assert.doesNotMatch(projectLayout, /<label>\{project\.runner\}<\/label>/);
+  assert.doesNotMatch(projectLayout, /<code>\{project\.pathDisplay\}<\/code>/);
 });
 
 test("desktop conversation is a full-height three-column workspace", () => {
@@ -141,7 +152,7 @@ test("conversation content reserves space for its controls without legacy footer
   assert.match(workspaceStyles, /\.chat-center > \.timeline\s*\{[^}]*padding:\s*32px\s+0\s+20px\s+16px;/s);
   assert.match(workspaceStyles, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+0\s+max\(32px, var\(--composer-height, 0px\)\)\s+16px;/);
   assert.doesNotMatch(workspaceStyles, /padding-bottom:\s*(?:130|160)px;/);
-  assert.match(conversationPage, /const updateBottomSafeArea = \(\) => \{\s*const followBottom = userNearBottom\.current;\s*timelineElement\.style\.setProperty\("--composer-height", `\$\{Math\.ceil\(composer\.getBoundingClientRect\(\)\.height\)\}px`\);\s*if \(!followBottom\) return;/s);
+  assert.match(conversationPage, /const updateBottomSafeArea = \(\) => \{\s*const followBottom = userNearBottom\.current;\s*const composerHeight = `\$\{Math\.ceil\(composer\.getBoundingClientRect\(\)\.height\)\}px`;\s*timelineElement\.style\.setProperty\("--composer-height", composerHeight\);\s*timelineElement\.parentElement\?\.style\.setProperty\("--composer-height", composerHeight\);\s*if \(!followBottom\) return;/s);
   assert.match(conversationPage, /const observer = new ResizeObserver\(updateBottomSafeArea\);/);
   assert.match(conversationPage, /if \(userNearBottom\.current\) scrollToBottom\("auto"\);/);
 });
@@ -176,13 +187,14 @@ test("Git workbench and project runner are first-class workspace tabs", () => {
   assert.match(workspaceStyles, /\.workspace-content\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*flex:\s*1;[^}]*overflow:\s*hidden;/s);
   assert.match(gitWorkbench, /useEffect\(\(\) => \{ if \(active\) void reload\(\)\.catch\(\(\) => undefined\); \}, \[active, reload\]\);/);
   assert.match(runPanel, /if \(!active\) return;/);
-  // 左右分栏：.run-body 水平排列，左侧日志 flex:1，右侧侧栏固定宽度
+  // 左右分栏：.run-body 水平排列，左侧日志 flex:1，右侧侧栏保持受控宽度并可独立滚动。
   assert.match(runStyles, /\.run-body\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
-  assert.match(runStyles, /\.run-sidebar\s*\{[^}]*width:\s*340px;[^}]*overflow-y:\s*auto;/s);
-  // 日志终端与全局命令输出共享深青绿基色，并保留 ANSI 语义颜色。
-  assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*background:\s*#1d3933;[^}]*color:\s*#dcece4;/s);
+  assert.match(runStyles, /\.run-sidebar\s*\{[^}]*width:\s*348px;[^}]*min-width:\s*300px;[^}]*max-width:\s*420px;[^}]*overflow-y:\s*auto;/s);
+  // 日志终端使用浅薄荷底色与足够的文字对比度，并保留 ANSI 语义颜色。
+  assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*background:\s*#f4faf6;/s);
+  assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*color:\s*#29473d;/s);
   assert.match(runPanel, /toAnsiSegments\(runLogText\(entry\)\)/);
-  assert.match(runStyles, /\.ansi-green, \.ansi-bright-green\s*\{\s*color:\s*#a9e57e;/);
+  assert.match(runStyles, /\.ansi-green, \.ansi-bright-green\s*\{\s*color:\s*#287156;/);
   // 移动端回退为上下布局
   assert.match(runStyles, /@media \(max-width: 820px\)\s*\{[\s\S]*?\.run-body\s*\{[^}]*flex-direction:\s*column;[^}]*overflow-y:\s*auto;/s);
 });
@@ -261,7 +273,9 @@ test("clearing context starts a fresh conversation with the current agent and po
   assert.match(taskQueue, /conversationIDRef\.current !== dispatchConversationID/);
   assert.match(taskQueue, /setDispatching\(false\);\s*setRedispatchingTaskID\(null\);/);
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
-  assert.match(conversationPage, /<button className="secondary" type="button" disabled=\{sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}>清空<\/button><button className="secondary" type="button" disabled=\{sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}>继续<\/button>/);
+  assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
+  assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
+  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{!text\.trim\(\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\}><ComposerActionIcon action="send" \/>/);
 });
 
 test("creating a conversation keeps the newly navigated route", () => {

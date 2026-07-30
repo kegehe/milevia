@@ -165,6 +165,33 @@ test("refreshes active orchestration jobs and renders their review status", () =
   assert.match(source, /taskDisplayStatus\(task\)/);
 });
 
+test("keeps strict-serial orchestration controls visible and records responsive", () => {
+  const source = readFileSync(new URL("./TaskBoard.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../../tasks.css", import.meta.url), "utf8");
+  const dialogSource = source.slice(source.indexOf("function OrchestrationDialog"), source.indexOf("function TaskDetailDialog"));
+  const mobileStyles = styles.slice(styles.indexOf("@media (max-width: 600px)"));
+
+  assert.match(dialogSource, /className="modal task-dialog orchestration-dialog"/);
+  assert.match(dialogSource, /className="orchestration-dialog-body"/);
+  assert.match(dialogSource, /className="orchestration-enabled"/);
+  assert.match(dialogSource, /orchestrationStatusLabel\(job\.status\)/);
+  assert.match(source, /integrated_to_dev:\s*"已集成 dev"/);
+  assert.match(dialogSource, /orchestration-release-branch/);
+  assert.doesNotMatch(dialogSource, /task-run-list/);
+  assert.match(dialogSource, /const operationRef = useRef\(false\);/);
+  assert.match(dialogSource, /if \(operationRef\.current\) return;/);
+  assert.doesNotMatch(dialogSource, /disabled=\{Boolean\(action\)\}/);
+  assert.match(dialogSource, /disabled=\{busy\} onClick=\{\(\) => void runAction/);
+  assert.match(dialogSource, /input required disabled=\{busy\}/);
+  assert.match(dialogSource, /textarea required disabled=\{busy\}/);
+  assert.match(styles, /\.orchestration-dialog form\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
+  assert.match(styles, /\.orchestration-dialog-body\s*\{[^}]*overflow-y:\s*auto;/);
+  assert.match(styles, /\.orchestration-enabled input\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;/s);
+  assert.match(styles, /\.orchestration-release-branch\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
+  assert.match(styles, /\.orchestration-status\[data-status="integrated_to_dev"\]/);
+  assert.match(mobileStyles, /\.orchestration-record-action\s*\{[^}]*grid-column:\s*1;/);
+});
+
 test("prevents duplicate task review submissions", () => {
   const source = readFileSync(new URL("./TaskBoard.tsx", import.meta.url), "utf8");
 

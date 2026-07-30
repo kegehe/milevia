@@ -1,4 +1,4 @@
-module github.com/tangmaoke/auto/apps/control-server
+module github.com/tangmaoke/milevia/apps/control-server
 
 go 1.26.2
 

@@ -30,6 +30,15 @@ interface FileTreeItemData {
   icon: string;
 }
 
+function TreeActionIcon({ name }: { name: "new-file" | "new-folder" | "refresh" }) {
+  const paths = {
+    "new-file": <><path d="M5 2.8h6.4L16 7.4v9.8a1.8 1.8 0 0 1-1.8 1.8H5A1.8 1.8 0 0 1 3.2 17.2V4.6A1.8 1.8 0 0 1 5 2.8Z" /><path d="M11.2 2.9v4.6h4.6M9.6 11v5M7.1 13.5h5" /></>,
+    "new-folder": <><path d="M2.8 6.2A1.8 1.8 0 0 1 4.6 4.4h3l1.8 2h6.1a1.8 1.8 0 0 1 1.8 1.8v7.2a1.8 1.8 0 0 1-1.8 1.8H4.6a1.8 1.8 0 0 1-1.8-1.8V6.2Z" /><path d="M10 10v5M7.5 12.5h5" /></>,
+    refresh: <><path d="M16.6 7.8A6.7 6.7 0 1 0 18 12" /><path d="M16.6 3.8v4h-4" /></>,
+  };
+  return <svg className="file-tree-action-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.55" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+}
+
 // ─── Provider ────────────────────────────────────────────────────────────────
 
 class FileTreeProvider {
@@ -315,13 +324,18 @@ export function ProjectFileTree({
             onKeyDown={(e) => e.key === "Enter" && !loading && handleSearch()}
           />
         </div>
+        {!readOnly && <>
+          <button type="button" className="file-tree-action" onClick={() => onCreateFile("")} title="新建文件" aria-label="新建文件"><TreeActionIcon name="new-file" /></button>
+          <button type="button" className="file-tree-action" onClick={() => onCreateDir("")} title="新建目录" aria-label="新建目录"><TreeActionIcon name="new-folder" /></button>
+        </>}
         <button
+          type="button"
           className="file-tree-refresh"
           onClick={handleRefresh}
           title="刷新"
           disabled={loading}
         >
-          {loading ? "⏳" : "↻"}
+          <TreeActionIcon name="refresh" />
         </button>
       </div>
 
@@ -389,7 +403,7 @@ export function ProjectFileTree({
                 className={`file-tree-arrow ${context.isExpanded ? "expanded" : ""}`}
                 {...context.arrowProps}
               >
-                ▶
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 4 4 4-4 4" /></svg>
               </span>
             );
           }}

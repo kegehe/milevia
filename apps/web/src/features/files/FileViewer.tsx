@@ -118,8 +118,9 @@ export function FileViewer({
   return (
     <div className="file-viewer text-viewer">
       <div className="file-viewer-toolbar">
-        <span className="file-viewer-file-path" title={stat.path}>{stat.name}</span>
-        <div className="file-viewer-font-controls">
+        <span className="file-viewer-file-path" title={stat.path}><FileIcon iconKey="file" size={15} /><span>{stat.path}</span></span>
+        <div className="file-viewer-actions">
+          <div className="file-viewer-font-controls">
           <button
             className="file-viewer-font-btn"
             onClick={onDecreaseFont}
@@ -139,6 +140,9 @@ export function FileViewer({
           >
             A+
           </button>
+          </div>
+          {isEditableFile(stat) && !readOnly && <button className="file-viewer-edit-btn" onClick={onEdit}>编辑</button>}
+          {readOnly && isEditableFile(stat) && <span className="file-viewer-readonly-hint" title="AI 正在运行中，文件编辑已锁定">只读</span>}
         </div>
       </div>
       <Highlight theme={studioLightTheme} code={content} language={language}>
@@ -160,16 +164,6 @@ export function FileViewer({
           </pre>
         )}
       </Highlight>
-      {isEditableFile(stat) && !readOnly && (
-        <button className="file-viewer-edit-btn" onClick={onEdit}>
-          编辑
-        </button>
-      )}
-      {readOnly && isEditableFile(stat) && (
-        <div className="file-viewer-readonly-hint" title="AI 正在运行中，文件编辑已锁定">
-          🔒 只读
-        </div>
-      )}
     </div>
   );
 }

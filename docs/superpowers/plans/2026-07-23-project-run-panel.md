@@ -1454,7 +1454,7 @@ Expected: 编译通过（可能有 TypeScrpt 错误需要修复）
 - [ ] **Step 1: 启动开发环境**
 
 ```bash
-cd /home/tangmaoke/projects/auto && bash dev.sh
+cd /home/tangmaoke/projects/milevia && bash dev.sh
 ```
 
 - [ ] **Step 2: 浏览器验证**

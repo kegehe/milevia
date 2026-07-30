@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
 import { changeState, formatGitTime, groupChanges, shortOID, type GitBranch, type GitChange, type GitCommit, type GitDiff, type GitOperation, type GitSnapshot } from "./git-model";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Tab = "overview" | "changes" | "history" | "branches" | "operations";
 type GitOperationResult = { operationId: string; status: "succeeded" | "failed" | "needs_attention"; errorMessage?: string };
+type DiffLine = { content: string; kind: "added" | "removed" | "context" | "hunk" | "meta"; oldLine?: number; newLine?: number };
 type Confirmation =
   | { type: "commit" }
   | { type: "discard-worktree"; path: string; untracked: boolean }
@@ -39,6 +40,18 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   }, []);
 
   const closeDiff = () => { diffRequest.current++; setSelectedDiff(null); };
+  const selectTab = (next: Tab) => { setTab(next); closeDiff(); };
+  const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, current: Tab) => {
+    const currentIndex = tabs.findIndex((item) => item.id === current);
+    const targetIndex = event.key === "ArrowRight" ? (currentIndex + 1) % tabs.length
+      : event.key === "ArrowLeft" ? (currentIndex - 1 + tabs.length) % tabs.length
+        : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : -1;
+    if (targetIndex < 0) return;
+    event.preventDefault();
+    const next = tabs[targetIndex].id;
+    selectTab(next);
+    requestAnimationFrame(() => document.getElementById(`git-tab-${next}`)?.focus());
+  };
 
   const reload = useCallback(async (manual = false) => {
     if (manual) { if (!mountedRef.current) return; setRefreshing(true); }
@@ -118,17 +131,17 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   const discardAll = (includeUntracked: boolean) => mutate("discard-all", "discard", { mode: "all", includeUntracked }, () => setConfirmation(null));
 
   return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active}>
-    <nav className="git-tabs" aria-label="Git 工作台视图">
-      <div className="git-tab-list">{tabs.map((item) => <button type="button" key={item.id} className={tab === item.id ? "active" : ""} aria-pressed={tab === item.id} onClick={() => { setTab(item.id); closeDiff(); }}>{item.label}{item.id === "changes" && changeCount > 0 ? <b>{changeCount}</b> : null}</button>)}</div>
-      <div className="git-workbench-actions"><button type="button" className="secondary" disabled={refreshing || Boolean(mutating)} onClick={() => void reload(true)}>{refreshing ? "刷新中" : "刷新"}</button></div>
+    <nav className="git-tabs" aria-label="Git工作台视图">
+      <div className="git-tab-list" role="tablist" aria-label="Git工作台视图">{tabs.map((item) => <button type="button" key={item.id} id={`git-tab-${item.id}`} role="tab" aria-controls={`git-view-${item.id}`} className={tab === item.id ? "active" : ""} aria-selected={tab === item.id} tabIndex={tab === item.id ? 0 : -1} onClick={() => selectTab(item.id)} onKeyDown={(event) => handleTabKeyDown(event, item.id)}>{item.label}{item.id === "changes" && changeCount > 0 ? <b>{changeCount}</b> : null}</button>)}</div>
+      <div className="git-workbench-actions"><button type="button" className={`git-refresh${refreshing ? " spinning" : ""}`} title={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} aria-label={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} disabled={refreshing || Boolean(mutating)} onClick={() => void reload(true)}><RefreshIcon /></button></div>
     </nav>
     <main className="git-workbench-body">
       {loading ? <div className="git-empty">正在读取仓库状态</div> : <>
-        {tab === "overview" && <Overview snapshot={snapshot} changeCount={changeCount} />}
-        {tab === "changes" && <Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} />}
-        {tab === "history" && <History commits={commits} />}
-        {tab === "branches" && <Branches branches={branches} />}
-        {tab === "operations" && <Operations operations={operations} />}
+        {tab === "overview" && <div id="git-view-overview" role="tabpanel" aria-labelledby="git-tab-overview"><Overview snapshot={snapshot} changeCount={changeCount} /></div>}
+        {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
+        {tab === "history" && <div id="git-view-history" role="tabpanel" aria-labelledby="git-tab-history"><History commits={commits} /></div>}
+        {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} /></div>}
+        {tab === "operations" && <div id="git-view-operations" role="tabpanel" aria-labelledby="git-tab-operations"><Operations operations={operations} /></div>}
       </>}
     </main>
     {confirmation && <GitConfirmation confirmation={confirmation} snapshot={snapshot} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} discardWorktree={discardWorktree} discardAll={discardAll} />}
@@ -147,19 +160,56 @@ function Overview({ snapshot, changeCount }: { snapshot: GitSnapshot | null; cha
 
 function GitStat({ label, value }: { label: string; value: number }) { return <div><span>{label}</span><b>{value}</b></div>; }
 
+function PlusIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M8 3v10M3 8h10" /></svg>; }
+
+function UndoIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M13.5 11a5.5 5.5 0 0 0-9.4-3.9L2.5 8.7" /><path d="M2.5 4.5v4.2h4.2" /></svg>; }
+
+function PendingIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M14 8A6 6 0 1 1 8 2" /><polyline points="8 2 8 5.5 11 2.5" /></svg>; }
+
+function RefreshIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M13 5.8A5.5 5.5 0 1 0 13.4 10" /><path d="M13 2.5v3.3H9.7" /></svg>; }
+
+function CloseIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="m4 4 8 8M12 4l-8 8" /></svg>; }
+
 function Changes({ grouped, selectedDiff, openDiff, closeDiff, mutatePath, stageAll, unstageAll, requestDiscardWorktree, requestDiscardAll, requestCommit, commitMessage, setCommitMessage, mutating, changeCount }: { grouped: { staged: GitChange[]; worktree: GitChange[] }; selectedDiff: GitDiff | null; openDiff: (change: GitChange, stage: "worktree" | "index") => Promise<void>; closeDiff: () => void; mutatePath: (action: "stage" | "unstage", path: string) => void; stageAll: () => void; unstageAll: () => void; requestDiscardWorktree: (path: string, untracked: boolean) => void; requestDiscardAll: () => void; requestCommit: () => void; commitMessage: string; setCommitMessage: (value: string) => void; mutating: string; changeCount: number }) {
   return <div className="git-changes-view">
-    <section className="git-change-group"><header><h3>已暂存</h3><div className="git-group-actions"><span>{grouped.staged.length}</span><button type="button" className={`git-icon-btn${mutating === "unstage-all" ? " spinning" : ""}`} title={mutating === "unstage-all" ? "取消暂存中" : "全部取消暂存"} aria-label="全部取消暂存" disabled={mutating !== "" || grouped.staged.length === 0} onClick={unstageAll}>{mutating === "unstage-all" ? <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M14 8A6 6 0 1 1 8 2" /><polyline points="8 2 8 5.5 11 2.5" /></svg> : <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><line x1="10" y1="8" x2="3" y2="8" /><polyline points="5.5 5.5 3 8 5.5 10.5" /></svg>}</button></div></header><ChangeList changes={grouped.staged} stage="index" openDiff={openDiff} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="没有已暂存变更" /></section>
+    <section className="git-change-group"><header><h3>已暂存</h3><div className="git-group-actions"><span>{grouped.staged.length}</span><button type="button" className={`git-icon-btn${mutating === "unstage-all" ? " spinning" : ""}`} title={mutating === "unstage-all" ? "取消暂存中" : "全部取消暂存"} aria-label="全部取消暂存" disabled={mutating !== "" || grouped.staged.length === 0} onClick={unstageAll}>{mutating === "unstage-all" ? <PendingIcon /> : <UndoIcon />}</button></div></header><ChangeList changes={grouped.staged} stage="index" openDiff={openDiff} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="没有已暂存变更" /></section>
     <CommitPanel stagedCount={grouped.staged.length} value={commitMessage} setValue={setCommitMessage} open={requestCommit} disabled={mutating !== ""} />
-    <section className="git-change-group"><header><h3>工作区</h3><div className="git-group-actions"><span>{grouped.worktree.length}</span><button type="button" className={`git-icon-btn${mutating === "stage-all" ? " spinning" : ""}`} title={mutating === "stage-all" ? "暂存中" : "全部暂存"} aria-label="全部暂存" disabled={mutating !== "" || grouped.worktree.length === 0} onClick={stageAll}>{mutating === "stage-all" ? <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M14 8A6 6 0 1 1 8 2" /><polyline points="8 2 8 5.5 11 2.5" /></svg> : <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><line x1="6" y1="8" x2="13" y2="8" /><polyline points="10.5 5.5 13 8 10.5 10.5" /></svg>}</button><button type="button" className="git-icon-btn danger" title="丢弃全部未提交改动" aria-label="丢弃全部未提交改动" disabled={mutating !== "" || changeCount === 0} onClick={requestDiscardAll}><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="2 4.5 14 4.5" /><path d="M5 4.5V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1.5" /><path d="M3.5 4.5l.7 9a1.5 1.5 0 0 0 1.5 1.4h4.6a1.5 1.5 0 0 0 1.5-1.4l.7-9" /><line x1="6.5" y1="7" x2="6.5" y2="12.5" /><line x1="9.5" y1="7" x2="9.5" y2="12.5" /></svg></button></div></header><ChangeList changes={grouped.worktree} stage="worktree" openDiff={openDiff} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="工作区没有变更" /></section>
-    {selectedDiff && <section className="git-diff"><header><div><span>{selectedDiff.stage === "index" ? "已暂存差异" : "工作区差异"}</span><b>{selectedDiff.path}</b></div><button type="button" className="git-close" title="关闭差异" aria-label="关闭差异" onClick={closeDiff}>×</button></header><pre>{selectedDiff.content || "该文件没有可显示的文本差异。"}</pre></section>}
+    <section className="git-change-group"><header><h3>工作区</h3><div className="git-group-actions"><span>{grouped.worktree.length}</span><button type="button" className={`git-icon-btn${mutating === "stage-all" ? " spinning" : ""}`} title={mutating === "stage-all" ? "暂存中" : "全部暂存"} aria-label="全部暂存" disabled={mutating !== "" || grouped.worktree.length === 0} onClick={stageAll}>{mutating === "stage-all" ? <PendingIcon /> : <PlusIcon />}</button><button type="button" className="git-icon-btn danger" title="撤销全部未提交改动" aria-label="撤销全部未提交改动" disabled={mutating !== "" || changeCount === 0} onClick={requestDiscardAll}><UndoIcon /></button></div></header><ChangeList changes={grouped.worktree} stage="worktree" openDiff={openDiff} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="工作区没有变更" /></section>
+    {selectedDiff && <DiffViewer diff={selectedDiff} close={closeDiff} />}
   </div>;
+}
+
+export function parseDiffContent(content: string): DiffLine[] {
+  const source = content.split(/\r?\n/);
+  if (source.at(-1) === "") source.pop();
+  const unified = source.some((line) => line.startsWith("@@ "));
+  let oldLine = 1;
+  let newLine = 1;
+  return source.map((line) => {
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      return { content: line, kind: "hunk" };
+    }
+    if (unified && (line.startsWith("diff --git ") || line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ ") || line.startsWith("\\ No newline"))) return { content: line, kind: "meta" };
+    if (unified && line.startsWith("+")) return { content: line.slice(1), kind: "added", newLine: newLine++ };
+    if (unified && line.startsWith("-")) return { content: line.slice(1), kind: "removed", oldLine: oldLine++ };
+    if (unified && line.startsWith(" ")) return { content: line.slice(1), kind: "context", oldLine: oldLine++, newLine: newLine++ };
+    return { content: line, kind: "context", oldLine: oldLine++, newLine: newLine++ };
+  });
+}
+
+function DiffViewer({ diff, close }: { diff: GitDiff; close: () => void }) {
+  const lines = parseDiffContent(diff.content);
+  const stageLabel = diff.stage === "index" ? "已暂存差异" : "工作区差异";
+  return <section className="git-diff"><header><div><span>{stageLabel}</span><b>{diff.path}</b></div><button type="button" className="git-close" title="关闭差异" aria-label="关闭差异" onClick={close}>×</button></header>{lines.length ? <div className="git-diff-code" role="region" aria-label={`${diff.path} 的${stageLabel}`}>{lines.map((line, index) => <div className={`git-diff-line ${line.kind}`} key={`${index}-${line.content}`}><span className="git-diff-number">{line.oldLine ?? ""}</span><span className="git-diff-number">{line.newLine ?? ""}</span><span className="git-diff-prefix" aria-hidden="true">{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : ""}</span><code>{line.content}</code></div>)}</div> : <p className="git-diff-empty">该文件没有可显示的文本差异。</p>}</section>;
 }
 
 function ChangeList({ changes, stage, openDiff, mutatePath, requestDiscard, mutating, empty }: { changes: GitChange[]; stage: "worktree" | "index"; openDiff: (change: GitChange, stage: "worktree" | "index") => Promise<void>; mutatePath: (action: "stage" | "unstage", path: string) => void; requestDiscard: (path: string, untracked: boolean) => void; mutating: string; empty: string }) {
   if (changes.length === 0) return <p className="git-list-empty">{empty}</p>;
   const action = stage === "index" ? "unstage" : "stage";
-  return <div className="git-change-list">{changes.map((change) => <div key={`${stage}-${change.path}`}><button type="button" onClick={() => void openDiff(change, stage)}><span className={`git-change-kind ${change.conflicted ? "conflicted" : ""}`}>{changeState(change)}</span><b>{change.path}</b>{change.originalPath ? <small>{change.originalPath}</small> : null}</button><div className="git-inline-actions"><button type="button" className="git-inline-action" disabled={mutating !== ""} onClick={() => mutatePath(action, change.path)}>{mutating === `${action}:${change.path}` ? "处理中" : action === "stage" ? "暂存" : "取消暂存"}</button>{stage === "worktree" && <button type="button" className="git-inline-action danger" disabled={mutating !== "" || change.conflicted} onClick={() => requestDiscard(change.path, change.untracked)}>{change.untracked ? "删除" : "撤销"}</button>}</div></div>)}</div>;
+  return <div className="git-change-list">{changes.map((change) => <div key={`${stage}-${change.path}`}><button type="button" onClick={() => void openDiff(change, stage)}><span className={`git-change-kind ${change.conflicted ? "conflicted" : ""}`}>{changeState(change)}</span><b>{change.path}</b>{change.originalPath ? <small>{change.originalPath}</small> : null}</button><div className="git-inline-actions"><button type="button" className={`git-inline-icon${mutating === `${action}:${change.path}` ? " spinning" : ""}`} title={mutating === `${action}:${change.path}` ? "处理中" : action === "stage" ? "暂存" : "取消暂存"} aria-label={action === "stage" ? "暂存" : "取消暂存"} disabled={mutating !== ""} onClick={() => mutatePath(action, change.path)}>{mutating === `${action}:${change.path}` ? <PendingIcon /> : action === "stage" ? <PlusIcon /> : <UndoIcon />}</button>{stage === "worktree" && <button type="button" className="git-inline-icon danger" title={change.untracked ? "删除未跟踪文件" : "撤销工作区改动"} aria-label={change.untracked ? "删除未跟踪文件" : "撤销工作区改动"} disabled={mutating !== "" || change.conflicted} onClick={() => requestDiscard(change.path, change.untracked)}>{change.untracked ? <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><polyline points="2 4.5 14 4.5" /><path d="M5 4.5V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1.5" /><path d="M3.5 4.5l.7 9a1.5 1.5 0 0 0 1.5 1.4h4.6a1.5 1.5 0 0 0 1.5-1.4l.7-9" /></svg> : <UndoIcon />}</button>}</div></div>)}</div>;
 }
 
 function CommitPanel({ stagedCount, value, setValue, open, disabled }: { stagedCount: number; value: string; setValue: (value: string) => void; open: () => void; disabled: boolean }) {
@@ -170,16 +220,23 @@ function GitConfirmation({ confirmation, snapshot, stagedCount, trackedChangeCou
   const [includeUntracked, setIncludeUntracked] = useState(confirmation.type === "discard-all" && untrackedChangeCount > 0 && trackedChangeCount === 0);
   const isCommit = confirmation.type === "commit";
   const title = isCommit ? "确认提交" : confirmation.type === "discard-all" ? "丢弃全部未提交改动" : confirmation.untracked ? "删除未跟踪文件" : "撤销工作区更改";
+  const isUntracked = confirmation.type === "discard-worktree" && confirmation.untracked;
+  const discardPath = confirmation.type === "discard-worktree" ? confirmation.path : "";
+  const riskLabel = confirmation.type === "discard-worktree" && !confirmation.untracked ? "工作区内容将恢复到暂存版本" : "此操作无法在页面中撤销";
   const confirm = () => {
     if (confirmation.type === "commit") commit();
     else if (confirmation.type === "discard-all") discardAll(includeUntracked);
     else discardWorktree(confirmation.path, confirmation.untracked);
   };
-  return <div className="backdrop git-confirmation-backdrop" role="dialog" aria-modal="true" aria-labelledby="git-confirmation-title"><section className="modal git-confirmation-dialog"><header><div><label>GIT OPERATION</label><h2 id="git-confirmation-title">{title}</h2></div><button type="button" title="关闭" disabled={busy} onClick={close}>×</button></header><div className="git-confirmation-body">{confirmation.type === "commit" ? <><p>将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交，包含 {stagedCount} 个已暂存文件。</p><pre>{commitMessage}</pre></> : confirmation.type === "discard-all" ? <><p>已暂存和工作区中的受跟踪改动都会恢复到 <code>HEAD</code>，此操作无法在页面中撤销。</p><label className="git-confirmation-check"><input type="checkbox" checked={includeUntracked} onChange={(event) => setIncludeUntracked(event.target.checked)} />同时删除未跟踪文件</label></> : <p>{confirmation.untracked ? <>将永久删除 <code>{confirmation.path}</code>。</> : <>将 <code>{confirmation.path}</code> 恢复到暂存区版本，已暂存内容不会改变。</>}</p>}</div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button type="button" className={isCommit ? "primary" : "primary danger"} disabled={busy} onClick={confirm}>{busy ? "处理中" : isCommit ? "确认提交" : "确认丢弃"}</button></footer></section></div>;
+  return <div className="backdrop git-confirmation-backdrop" role="dialog" aria-modal="true" aria-labelledby="git-confirmation-title"><section className={`modal git-confirmation-dialog${isCommit ? "" : " destructive"}`}><header><div><span>{isCommit ? "本地提交" : "高风险操作"}</span><h2 id="git-confirmation-title">{title}</h2></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><CloseIcon /></button></header><div className="git-confirmation-body">{confirmation.type === "commit" ? <><p className="git-confirmation-lead">将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交，包含 {stagedCount} 个已暂存文件。</p><pre>{commitMessage}</pre></> : <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{confirmation.type === "discard-all" ? <><p className="git-confirmation-lead">已暂存和工作区中的受跟踪改动都会恢复到 <code>HEAD</code>。</p><div className="git-confirmation-scope"><span>受影响内容</span><b>{trackedChangeCount} 个受跟踪文件</b>{untrackedChangeCount > 0 ? <small>另有 {untrackedChangeCount} 个未跟踪文件可选删除</small> : null}</div><label className="git-confirmation-check"><input type="checkbox" checked={includeUntracked} onChange={(event) => setIncludeUntracked(event.target.checked)} />同时删除未跟踪文件</label></> : <><p className="git-confirmation-lead">{isUntracked ? "将永久删除以下未跟踪文件。" : "将以下文件恢复到暂存版本，已暂存内容不会改变。"}</p><code className="git-confirmation-path">{discardPath}</code></>}</>}</div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button type="button" className={isCommit ? "primary" : "primary danger"} disabled={busy} onClick={confirm}>{busy ? "处理中" : isCommit ? "确认提交" : isUntracked ? "确认删除" : "确认撤销"}</button></footer></section></div>;
 }
 
 function History({ commits }: { commits: GitCommit[] }) { return commits.length === 0 ? <div className="git-empty">没有可显示的提交记录</div> : <div className="git-history">{commits.map((commit) => <article key={commit.oid}><code>{shortOID(commit.oid)}</code><div><b>{commit.subject || "(无提交说明)"}</b><span>{commit.author} · {formatGitTime(commit.authoredAt)}</span></div></article>)}</div>; }
 
 function Branches({ branches }: { branches: GitBranch[] }) { return branches.length === 0 ? <div className="git-empty">没有可显示的分支</div> : <div className="git-branches">{branches.map((branch) => <article key={`${branch.remote ? "remote" : "local"}-${branch.name}`}><span className={branch.current ? "current" : ""}>{branch.current ? "当前" : branch.remote ? "远端" : "本地"}</span><b>{branch.name}</b><small>{branch.upstream || ""}</small></article>)}</div>; }
 
-function Operations({ operations }: { operations: GitOperation[] }) { return operations.length === 0 ? <div className="git-empty">暂无操作记录</div> : <div className="git-operations">{operations.map((operation) => <article key={operation.id}><span className={`git-operation-status ${operation.status}`}>{operation.status}</span><div><b>{operation.type}</b><p>{operation.requestSummary}</p>{operation.errorMessage ? <small>{operation.errorMessage}</small> : null}</div><time>{formatGitTime(operation.finishedAt || operation.startedAt || operation.requestedAt)}</time></article>)}</div>; }
+function operationStatusLabel(status: string): string { return ({ queued: "等待中", running: "进行中", succeeded: "已完成", failed: "失败", needs_attention: "需检查" })[status] || status; }
+
+function operationTypeLabel(type: string): string { return ({ stage: "暂存", unstage: "取消暂存", stage_all: "全部暂存", unstage_all: "全部取消暂存", commit: "提交", discard_worktree: "撤销工作区改动", discard_all: "丢弃全部改动" })[type] || type; }
+
+function Operations({ operations }: { operations: GitOperation[] }) { return operations.length === 0 ? <div className="git-empty">暂无操作记录</div> : <div className="git-operations">{operations.map((operation) => <article key={operation.id}><span className={`git-operation-status ${operation.status}`}>{operationStatusLabel(operation.status)}</span><div><b>{operationTypeLabel(operation.type)}</b><p>{operation.requestSummary}</p>{operation.errorMessage ? <small>{operation.errorMessage}</small> : null}</div><time title={operation.finishedAt || operation.startedAt || operation.requestedAt}>{formatGitTime(operation.finishedAt || operation.startedAt || operation.requestedAt)}</time></article>)}</div>; }

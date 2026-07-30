@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/tangmaoke/auto/apps/control-server/internal/app"
+	"github.com/tangmaoke/milevia/apps/control-server/internal/app"
 )
 
 func main() {

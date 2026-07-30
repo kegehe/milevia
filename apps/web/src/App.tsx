@@ -3,6 +3,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ProjectProvider } from "./stores/useProjectStore";
 import { NotificationProvider } from "./components/NotificationProvider";
+import { TooltipProvider } from "./components/TooltipProvider";
 import DashboardPage from "./pages/DashboardPage";
 import ImportProjectPage from "./pages/ImportProjectPage";
 import SSHManagerPage from "./pages/SSHManagerPage";
@@ -16,9 +17,10 @@ import FilesPage from "./pages/FilesPage";
 export function App() {
   return (
     <BrowserRouter>
-      <NotificationProvider>
-        <ProjectProvider>
-          <Routes>
+      <TooltipProvider>
+        <NotificationProvider>
+          <ProjectProvider>
+            <Routes>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/projects/import" element={<ImportProjectPage />} />
             <Route path="/ssh-manager" element={<SSHManagerPage />} />
@@ -33,9 +35,10 @@ export function App() {
               <Route path="run" element={<ProjectRunPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
-        </ProjectProvider>
-      </NotificationProvider>
+            </Routes>
+          </ProjectProvider>
+        </NotificationProvider>
+      </TooltipProvider>
     </BrowserRouter>
   );
 }

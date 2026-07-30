@@ -1,6 +1,6 @@
-# 自动开发平台
+# Milevia
 
-自动开发平台用于在一个网页中加载和管理 WSL 本地项目，并通过 Claude Code 进行连续的开发对话。
+Milevia 用于在一个网页中加载和管理 WSL 本地项目，并通过 Claude Code 进行连续的开发对话。
 
 当前版本聚焦于一个可用闭环：选择项目目录、加载项目、创建 Claude Code 会话、下发提示词、查看消息和命令过程、确认命令权限，以及停止正在执行的任务。
 
@@ -107,7 +107,7 @@ go build ./cmd/control-server
 前端构建：
 
 ```bash
-pnpm --filter @auto/web build
+pnpm --filter @milevia/web build
 ```
 
 ## 文档

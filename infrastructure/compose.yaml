@@ -1,4 +1,4 @@
-name: auto-development-platform
+name: milevia
 
 services:
   postgres:

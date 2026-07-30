@@ -5558,7 +5558,7 @@ func TestRunExecutionTargetAutoDetectsMountedWindowsProjects(t *testing.T) {
 }
 
 func TestRunExecutionTargetKeepsWSLProjectsAndAllowsOverride(t *testing.T) {
-	target, err := resolveRunExecutionTarget("/home/tangmaoke/projects/auto", RunExecutionTargetAuto)
+	target, err := resolveRunExecutionTarget("/home/tangmaoke/projects/milevia", RunExecutionTargetAuto)
 	if err != nil {
 		t.Fatalf("resolve WSL target: %v", err)
 	}
@@ -5571,7 +5571,7 @@ func TestRunExecutionTargetKeepsWSLProjectsAndAllowsOverride(t *testing.T) {
 		t.Fatalf("WSL override target=%q, err=%v", target, err)
 	}
 
-	_, err = resolveRunExecutionTarget("/home/tangmaoke/projects/auto", RunExecutionTargetWindows)
+	_, err = resolveRunExecutionTarget("/home/tangmaoke/projects/milevia", RunExecutionTargetWindows)
 	if err == nil || !strings.Contains(err.Error(), "仅支持") {
 		t.Fatalf("expected Windows target rejection, got %v", err)
 	}

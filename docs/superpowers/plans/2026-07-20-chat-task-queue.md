@@ -79,7 +79,7 @@ Run:
 
 ```bash
 cd apps/web && node --experimental-strip-types --test src/features/tasks/task-model.test.ts
-pnpm --filter @auto/web build
+pnpm --filter @milevia/web build
 ```
 
 Expected: the Node test passes and TypeScript/Vite production build exits 0.
@@ -130,7 +130,7 @@ Run:
 
 ```bash
 cd apps/web && node --experimental-strip-types --test src/features/tasks/task-model.test.ts
-pnpm --filter @auto/web build
+pnpm --filter @milevia/web build
 ```
 
 Expected: all Node tests pass and the production build exits 0.
@@ -167,7 +167,7 @@ Run:
 
 ```bash
 cd apps/web && node --experimental-strip-types --test src/features/tasks/task-model.test.ts
-pnpm --filter @auto/web build
+pnpm --filter @milevia/web build
 git diff --check
 ```
 

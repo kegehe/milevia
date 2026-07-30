@@ -60,6 +60,8 @@ export function FilesPanel({
   const [isSaving, setIsSaving] = useState(false);
   const [mobileView, setMobileView] = useState<"tree" | "editor">("tree");
   const treeRefreshRef = useRef<(() => void) | null>(null);
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const dialogOpenerRef = useRef<HTMLElement | null>(null);
   const pendingOpens = useRef<Set<string>>(new Set());
   const savingRef = useRef(false);
 
@@ -71,6 +73,40 @@ export function FilesPanel({
 
   const readOnly = isWorkspaceOccupied;
   const activeFile = openFiles.find((f) => f.path === activeFilePath) || null;
+  const activeDialog = showNewFileDialog ? "create" : showRenameDialog ? "rename" : showDeleteConfirm ? "delete" : null;
+
+  const closeActiveDialog = useCallback(() => {
+    setShowNewFileDialog(null);
+    setShowRenameDialog(null);
+    setShowDeleteConfirm(null);
+  }, []);
+
+  useEffect(() => {
+    if (!activeDialog) return;
+    if (!dialogOpenerRef.current) {
+      dialogOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
+    const dialog = dialogRef.current;
+    const focusableSelector = 'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])';
+    const focusFirst = () => dialog?.querySelector<HTMLElement>("input:not(:disabled), button:not(:disabled)")?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); closeActiveDialog(); return; }
+      if (event.key !== "Tab" || !dialog) return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>(focusableSelector)];
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    requestAnimationFrame(focusFirst);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      dialogOpenerRef.current?.focus();
+      dialogOpenerRef.current = null;
+    };
+  }, [activeDialog, closeActiveDialog]);
 
   // 打开文件
   const openFile = useCallback(
@@ -252,12 +288,14 @@ export function FilesPanel({
 
   // 新建文件
   const handleCreateFile = useCallback((dirPath: string) => {
+    dialogOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setShowNewFileDialog({ dirPath, type: "file" });
     setNewFileName("");
   }, []);
 
   // 新建目录
   const handleCreateDir = useCallback((dirPath: string) => {
+    dialogOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setShowNewFileDialog({ dirPath, type: "dir" });
     setNewFileName("");
   }, []);
@@ -305,6 +343,7 @@ export function FilesPanel({
 
   // 重命名
   const handleRename = useCallback((path: string, name: string) => {
+    dialogOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setShowRenameDialog({ path, name });
     setRenameValue(name);
   }, []);
@@ -351,6 +390,7 @@ export function FilesPanel({
 
   // 删除
   const handleDelete = useCallback((path: string, name: string, isDir: boolean) => {
+    dialogOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setShowDeleteConfirm({ path, name, isDir });
   }, []);
 
@@ -422,7 +462,7 @@ export function FilesPanel({
         </div>
 
         {/* 查看器/编辑器 */}
-        <div className={`files-editor ${mobileView === "tree" ? "hidden-mobile" : ""}`}>
+        <div id="file-content-panel" role="tabpanel" aria-label="文件内容" className={`files-editor ${mobileView === "tree" ? "hidden-mobile" : ""}`}>
           {/* 标签栏 */}
           <FileTabs
             openFiles={openFiles}
@@ -479,9 +519,9 @@ export function FilesPanel({
 
       {/* 新建文件/目录对话框 */}
       {showNewFileDialog && (
-        <div className="files-dialog-backdrop" onClick={() => setShowNewFileDialog(null)}>
-          <div className="files-dialog" onClick={(e) => e.stopPropagation()}>
-            <h3>{showNewFileDialog.type === "file" ? "新建文件" : "新建目录"}</h3>
+        <div className="files-dialog-backdrop" onClick={closeActiveDialog}>
+          <section ref={dialogRef} className="files-dialog" role="dialog" aria-modal="true" aria-labelledby="file-create-title" onClick={(e) => e.stopPropagation()}>
+            <header><h3 id="file-create-title">{showNewFileDialog.type === "file" ? "新建文件" : "新建目录"}</h3><button type="button" className="files-dialog-close" title="关闭" aria-label="关闭" onClick={closeActiveDialog}>x</button></header>
             <input
               type="text"
               value={newFileName}
@@ -493,20 +533,20 @@ export function FilesPanel({
               autoFocus
             />
             <div className="files-dialog-actions">
-              <button className="primary" onClick={submitNewFile}>
+              <button type="button" className="primary" onClick={submitNewFile}>
                 创建
               </button>
-              <button onClick={() => setShowNewFileDialog(null)}>取消</button>
+              <button type="button" onClick={closeActiveDialog}>取消</button>
             </div>
-          </div>
+          </section>
         </div>
       )}
 
       {/* 重命名对话框 */}
       {showRenameDialog && (
-        <div className="files-dialog-backdrop" onClick={() => setShowRenameDialog(null)}>
-          <div className="files-dialog" onClick={(e) => e.stopPropagation()}>
-            <h3>重命名</h3>
+        <div className="files-dialog-backdrop" onClick={closeActiveDialog}>
+          <section ref={dialogRef} className="files-dialog" role="dialog" aria-modal="true" aria-labelledby="file-rename-title" onClick={(e) => e.stopPropagation()}>
+            <header><h3 id="file-rename-title">重命名</h3><button type="button" className="files-dialog-close" title="关闭" aria-label="关闭" onClick={closeActiveDialog}>x</button></header>
             <input
               type="text"
               value={renameValue}
@@ -515,31 +555,31 @@ export function FilesPanel({
               autoFocus
             />
             <div className="files-dialog-actions">
-              <button className="primary" onClick={submitRename}>
+              <button type="button" className="primary" onClick={submitRename}>
                 确认
               </button>
-              <button onClick={() => setShowRenameDialog(null)}>取消</button>
+              <button type="button" onClick={closeActiveDialog}>取消</button>
             </div>
-          </div>
+          </section>
         </div>
       )}
 
       {/* 删除确认 */}
       {showDeleteConfirm && (
-        <div className="files-dialog-backdrop" onClick={() => setShowDeleteConfirm(null)}>
-          <div className="files-dialog" onClick={(e) => e.stopPropagation()}>
-            <h3>确认删除</h3>
+        <div className="files-dialog-backdrop" onClick={closeActiveDialog}>
+          <section ref={dialogRef} className="files-dialog files-dialog-danger" role="dialog" aria-modal="true" aria-labelledby="file-delete-title" onClick={(e) => e.stopPropagation()}>
+            <header><h3 id="file-delete-title">确认删除</h3><button type="button" className="files-dialog-close" title="关闭" aria-label="关闭" onClick={closeActiveDialog}>x</button></header>
             <p>
               确定要删除「{showDeleteConfirm.name}」
               {showDeleteConfirm.isDir ? " 及其所有内容" : ""}吗？此操作不可撤销。
             </p>
             <div className="files-dialog-actions">
-              <button className="danger" onClick={submitDelete}>
+              <button type="button" className="danger" onClick={submitDelete}>
                 删除
               </button>
-              <button onClick={() => setShowDeleteConfirm(null)}>取消</button>
+              <button type="button" onClick={closeActiveDialog}>取消</button>
             </div>
-          </div>
+          </section>
         </div>
       )}
     </div>

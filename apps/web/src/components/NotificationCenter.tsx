@@ -6,6 +6,29 @@ import { useUnreadCount } from "./NotificationProvider";
 import { api } from "../lib/api";
 import { notificationConversationURL, type NotificationEvent } from "../lib/notifications";
 
+function NotificationBellIcon() {
+  return (
+    <svg className="notification-bell-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M18 10a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+      <path d="M10 22h4" />
+    </svg>
+  );
+}
+
+function NotificationStatusIcon({ priority }: { priority: string }) {
+  if (priority === "high") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4 3.8 19h16.4L12 4Z" /><path d="M12 9v4.5M12 16.7h.01" /></svg>;
+  }
+  if (priority === "normal") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7.5 12.5 3 3 6-7" /></svg>;
+  }
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 10v5M12 7.4h.01" /></svg>;
+}
+
+function NotificationReadAllIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 12 3 3 5-6M11 15l2 2 7-8" /></svg>;
+}
+
 export default function NotificationCenter() {
   const unreadCount = useUnreadCount();
   const navigate = useNavigate();
@@ -79,12 +102,6 @@ export default function NotificationCenter() {
     setOpen(false);
   };
 
-  const priorityIcon = (priority: string) => {
-    if (priority === "high") return "⚠️";
-    if (priority === "normal") return "✅";
-    return "ℹ️";
-  };
-
   const timeAgo = (dateStr: string) => {
     const seconds = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
     if (seconds < 60) return "刚刚";
@@ -99,24 +116,33 @@ export default function NotificationCenter() {
   return (
     <div className="notification-center" ref={dropdownRef}>
       <button
-        className="notification-bell"
+        type="button"
+        className={`notification-bell${open ? " is-open" : ""}`}
         title="通知"
         onClick={() => setOpen(!open)}
         aria-label={`通知${unreadCount > 0 ? ` (${unreadCount} 条未读)` : ""}`}
+        aria-expanded={open}
+        aria-controls="notification-dropdown"
       >
-        🔔
+        <NotificationBellIcon />
         {unreadCount > 0 && (
           <span className="notification-badge">{unreadCount > 99 ? "99+" : unreadCount}</span>
         )}
       </button>
 
       {open && (
-        <div className="notification-dropdown">
+        <div id="notification-dropdown" className="notification-dropdown">
           <div className="notification-dropdown-header">
-            <span>通知</span>
+            <div className="notification-header-title-group">
+              <span className="notification-header-icon"><NotificationBellIcon /></span>
+              <div>
+                <span className="notification-header-title">通知</span>
+                <small>{unreadCount > 0 ? `${unreadCount} 条待处理` : "通知中心"}</small>
+              </div>
+            </div>
             {notifications.length > 0 && (
-              <button className="notification-dismiss-all" onClick={handleDismissAll}>
-                全部已读
+              <button type="button" className="notification-dismiss-all" title="全部标记为已读" aria-label="全部标记为已读" onClick={handleDismissAll}>
+                <NotificationReadAllIcon />
               </button>
             )}
           </div>
@@ -124,11 +150,11 @@ export default function NotificationCenter() {
             {loading ? (
               <div className="notification-empty">加载中...</div>
             ) : notifications.length === 0 ? (
-              <div className="notification-empty">暂无未读通知</div>
+              <div className="notification-empty"><span className="notification-empty-icon"><NotificationBellIcon /></span><span>暂无未读通知</span></div>
             ) : (
               notifications.map((n) => (
                 <div key={n.id} className={`notification-item priority-${n.priority}`}>
-                  <span className="notification-item-icon">{priorityIcon(n.priority)}</span>
+                  <span className="notification-item-icon"><NotificationStatusIcon priority={n.priority} /></span>
                   <div className="notification-item-content">
                     <div className="notification-item-title">{n.title}</div>
                     <div className="notification-item-body">{n.body}</div>

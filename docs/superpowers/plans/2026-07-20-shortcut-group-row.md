@@ -47,6 +47,6 @@ Expected: the wide-screen group-direction assertion fails because the current ru
 
 - [ ] **Step 4: Verify the regression test and production build**
 
-Run: `node --test apps/web/src/conversation-layout.test.mjs && pnpm --filter @auto/web build`
+Run: `node --test apps/web/src/conversation-layout.test.mjs && pnpm --filter @milevia/web build`
 
 Expected: `2` passing tests, `0` failing tests, and a successful Vite build.

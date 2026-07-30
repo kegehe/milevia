@@ -130,6 +130,6 @@ Expected: `2` passing tests and `0` failing tests.
 
 - [ ] **Step 2: Run the frontend production build**
 
-Run: `pnpm --filter @auto/web build`
+Run: `pnpm --filter @milevia/web build`
 
 Expected: command exits with code `0` after `tsc -b` and Vite finish successfully.

@@ -317,7 +317,7 @@ const [showTasks, setShowTasks] = useState(false);
 
 Use full-width workspace sections rather than cards nested within cards. Maintain the existing 7-8px border radius, compact control sizes, no viewport-scaled typography, and make board columns horizontally scrollable on narrow screens. Add focus-visible states for controls and ensure all status labels wrap rather than overlap.
 
-Run: `pnpm --filter @auto/web build`
+Run: `pnpm --filter @milevia/web build`
 
 Expected: TypeScript and Vite build exit 0.
 
@@ -350,7 +350,7 @@ Run: `cd apps/control-server && go build ./cmd/control-server`
 
 Expected: PASS.
 
-Run: `pnpm --filter @auto/web build`
+Run: `pnpm --filter @milevia/web build`
 
 Expected: PASS.
 

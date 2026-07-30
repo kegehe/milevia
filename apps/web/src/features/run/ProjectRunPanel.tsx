@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type LogEntry, type RunConfig, type RunStatusResponse, runLogPresentation, runLogText, statusLabels, statusColors } from "./run-model";
+import { type LogEntry, type RunConfig, type RunStatusResponse, runLogPresentation, runLogText, statusLabels } from "./run-model";
 import { toAnsiSegments } from "./ansi";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
@@ -229,16 +229,16 @@ export function ProjectRunPanel({ projectID, request, fail, active }: { projectI
 
 	const running = status?.status === "running";
 	const transitioning = status?.status === "starting" || status?.status === "stopping";
-	const statusColor = status ? statusColors[status.status] : statusColors.stopped;
 	const statusLabel = status ? statusLabels[status.status] : statusLabels.stopped;
+	const statusKey = status?.status || "stopped";
 	const uptime = status?.startedAt ? formatUptime(new Date(status.startedAt)) : "";
 
 	return <section id="workspace-panel-run" className="run-panel workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-run" hidden={!active}>
 			<div className="run-body">
 				<section className="run-log-section">
 					<header>
-						<h3>日志输出</h3>
-						<button type="button" className="secondary" onClick={handleClearLogs}>清除</button>
+						<div className="run-section-heading"><span className="run-section-mark"><TerminalIcon /></span><div><h3>运行日志</h3><small>{logs.length ? `${logs.length} 条输出` : "等待服务输出"}</small></div></div>
+						<button type="button" className="run-log-clear" title="清除当前日志" aria-label="清除当前日志" disabled={logs.length === 0} onClick={handleClearLogs}><ClearIcon /></button>
 					</header>
 					<div className="run-log-terminal-wrap">
 						<div ref={logTerminalRef} className="run-log-terminal" onScroll={handleLogScroll}>
@@ -251,12 +251,27 @@ export function ProjectRunPanel({ projectID, request, fail, active }: { projectI
 							</div>;
 						})}
 						</div>
-						{hasNewLogs && <button type="button" className="run-log-jump" title="跳转到最新日志" aria-label="跳转到最新日志" onClick={jumpToLatestLogs}>↓</button>}
+						{hasNewLogs && <button type="button" className="run-log-jump" title="跳转到最新日志" aria-label="跳转到最新日志" onClick={jumpToLatestLogs}><DownIcon /></button>}
 					</div>
 				</section>
 
 				<aside className="run-sidebar">
+					<section className="run-controls">
+						<header className="run-sidebar-heading"><div><span>服务状态</span><h3>项目进程</h3></div><div className={`run-status-badge ${statusKey}`} aria-live="polite"><i></i>{statusLabel}</div></header>
+						<div className="run-status-details">
+							<span><small>进程</small><b>{status?.pid ? `PID ${status.pid}` : "尚未启动"}</b></span>
+							<span><small>运行时长</small><b>{uptime || "-"}</b></span>
+							{status?.exitCode !== null && status?.exitCode !== undefined && status.status !== "running" ? <span className="run-exit-code"><small>退出码</small><b>{status.exitCode}</b></span> : null}
+						</div>
+						<div className="run-actions">
+							<button type="button" className="primary" disabled={running || transitioning || busy !== ""} onClick={handleStart}><PlayIcon />{busy === "start" ? "启动中" : "启动"}</button>
+							<button type="button" className="danger" disabled={!running || busy !== ""} onClick={handleStop}><StopIcon />{busy === "stop" ? "停止中" : "停止"}</button>
+							<button type="button" className="secondary" disabled={busy !== ""} onClick={handleRestart}><RestartIcon />{busy === "restart" ? "重启中" : "重启"}</button>
+						</div>
+					</section>
+
 					<section className="run-config">
+						<header className="run-sidebar-heading"><div><span>启动配置</span><h3>命令与环境</h3></div><button type="button" className="run-save-config" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存"}</button></header>
 						<div className="run-config-row">
 							<label htmlFor="run-execution-target">运行环境</label>
 							<select id="run-execution-target" value={config.executionTarget || "auto"} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })}>
@@ -288,41 +303,33 @@ export function ProjectRunPanel({ projectID, request, fail, active }: { projectI
 										<input type="text" value={v} placeholder="VALUE" onChange={(e) => {
 											updateConfig({ ...config, envVars: { ...config.envVars, [k]: e.target.value } });
 										}} />
-										<button type="button" className="secondary" onClick={() => {
+										<button type="button" className="run-env-remove" title={`移除环境变量 ${k}`} aria-label={`移除环境变量 ${k}`} onClick={() => {
 											const next = { ...config.envVars };
 											delete next[k];
 											updateConfig({ ...config, envVars: next });
-										}}>×</button>
+										}}><CloseIcon /></button>
 									</div>
 								))}
 									<button type="button" className="secondary" onClick={() => {
 										const envVars = config.envVars || {};
 										updateConfig({ ...config, envVars: { ...envVars, [nextEnvironmentVariableKey(envVars)]: "" } });
-									}}>+ 添加</button>
+									}}><PlusIcon />添加环境变量</button>
 							</div>
-						</div>
-						<button type="button" className="primary" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存配置"}</button>
-					</section>
-
-					<section className="run-controls">
-						<div className="run-status-bar">
-							<span className="run-status-dot" style={{ background: statusColor }}></span>
-							<span>{statusLabel}</span>
-							{status?.pid ? <span>PID: {status.pid}</span> : null}
-							{uptime ? <span>运行 {uptime}</span> : null}
-							{status?.exitCode !== null && status?.exitCode !== undefined && status.status !== "running" ?
-								<span>退出码: {status.exitCode}</span> : null}
-						</div>
-						<div className="run-actions">
-							<button type="button" className="primary" disabled={running || transitioning || busy !== ""} onClick={handleStart}>{busy === "start" ? "启动中" : "启动"}</button>
-							<button type="button" className="danger" disabled={!running || busy !== ""} onClick={handleStop}>{busy === "stop" ? "停止中" : "停止"}</button>
-							<button type="button" className="secondary" disabled={busy !== ""} onClick={handleRestart}>{busy === "restart" ? "重启中" : "重启"}</button>
 						</div>
 					</section>
 				</aside>
 			</div>
 	</section>;
 }
+
+function TerminalIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="1.5" /><path d="m5 6 2 2-2 2M9.5 10h1.5" /></svg>; }
+function ClearIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M3 4.5h10M6 2.5h4M5 4.5l.5 9h5l.5-9" /></svg>; }
+function DownIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2.5v9M4.5 8.5 8 12l3.5-3.5" /></svg>; }
+function PlayIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M5 3.2c0-.7.8-1.1 1.4-.7l5 3.1a1 1 0 0 1 0 1.7l-5 3.1A.8.8 0 0 1 5 9.7V3.2Z" /></svg>; }
+function StopIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1" /></svg>; }
+function RestartIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M13 6A5.3 5.3 0 1 0 13.4 10" /><path d="M13 2.5V6H9.5" /></svg>; }
+function PlusIcon() { return <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M8 3v10M3 8h10" /></svg>; }
+function CloseIcon() { return <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="m4 4 8 8M12 4l-8 8" /></svg>; }
 
 function formatUptime(startedAt: Date): string {
 	const diff = Date.now() - startedAt.getTime();

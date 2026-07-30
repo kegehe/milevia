@@ -209,7 +209,7 @@ Then: git add apps/control-server/internal/app/git.go apps/control-server/intern
 
 - [ ] **Step 2: Verify RED**
 
-Run: pnpm --filter @auto/web test -- git-model.test.ts
+Run: pnpm --filter @milevia/web test -- git-model.test.ts
 
 Expected: FAIL because the model module and test command are absent.
 
@@ -219,7 +219,7 @@ Add `vitest` as a web dev dependency and `"test": "vitest run"` to apps/web/pack
 
 - [ ] **Step 4: Verify GREEN and commit**
 
-Run: pnpm --filter @auto/web test -- git-model.test.ts && pnpm --filter @auto/web build
+Run: pnpm --filter @milevia/web test -- git-model.test.ts && pnpm --filter @milevia/web build
 
 Then: git add apps/web/src/features/git apps/web/src/git.css apps/web/src/App.tsx apps/web/package.json pnpm-lock.yaml && git commit -m "feat: add project Git workbench"
 
@@ -241,7 +241,7 @@ Then: git add apps/web/src/features/git apps/web/src/git.css apps/web/src/App.ts
 
 Run: cd apps/control-server && go test -race ./... && go vet ./... && go build ./cmd/control-server
 
-Run: pnpm --filter @auto/web build
+Run: pnpm --filter @milevia/web build
 
 Run: git diff --check
 

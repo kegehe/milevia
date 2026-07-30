@@ -24,7 +24,7 @@ test("replaces English error logs with a Chinese fallback", () => {
 test("reserves room for semantic labels and lets their colors override stderr", () => {
 	const styles = readFileSync(new URL("../../run.css", import.meta.url), "utf8");
 
-	assert.match(styles, /grid-template-columns:\s*72px\s+52px\s+minmax\(0,\s*1fr\)/);
+	assert.match(styles, /grid-template-columns:\s*70px\s+52px\s+minmax\(0,\s*1fr\)/);
 	assert.ok(styles.indexOf(".run-log-line.stderr .run-log-stream") < styles.indexOf(".run-log-line.is-warning .run-log-stream"));
 	assert.match(styles, /\.run-log-line\.is-error \.run-log-stream\s*\{/);
 });

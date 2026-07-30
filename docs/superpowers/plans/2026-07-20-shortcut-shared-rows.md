@@ -58,7 +58,7 @@ In `@media (max-width: 820px)`, restore `.quick-tag-group` and `.quick-tag-list`
 
 - [ ] **Step 4: Run the regression test and production build**
 
-Run: `node --test apps/web/src/conversation-layout.test.mjs && pnpm --filter @auto/web build`
+Run: `node --test apps/web/src/conversation-layout.test.mjs && pnpm --filter @milevia/web build`
 
 Expected: `2` passing tests, `0` failing tests, and a successful Vite production build.
 

@@ -30,6 +30,32 @@ function policyLabel(policy?: ExecutionPolicy): string {
   return "默认权限";
 }
 
+function orchestrationStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    queued: "等待执行",
+    preparing: "准备中",
+    implementing: "执行中",
+    checking: "验证中",
+    paused: "已暂停",
+    needs_human: "需人工处理",
+    integrated_to_dev: "已集成 dev",
+    awaiting_main: "待合并 main",
+    released_to_main: "已合并 main",
+  };
+  return labels[status] || status;
+}
+
+function TaskToolbarIcon({ name }: { name: "board" | "list" | "workflow" | "batch" | "plus" }) {
+  const paths = {
+    board: <><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="12" y="3" width="5" height="5" rx="1" /><rect x="3" y="12" width="5" height="5" rx="1" /><rect x="12" y="12" width="5" height="5" rx="1" /></>,
+    list: <><path d="M8 5h9M8 10h9M8 15h9" /><path d="M4 5h.01M4 10h.01M4 15h.01" /></>,
+    workflow: <><circle cx="5" cy="5" r="2" /><circle cx="15" cy="6" r="2" /><circle cx="10" cy="15" r="2" /><path d="m6.8 6.1 6.4-.8M6.1 6.8l2.8 6.4M13.8 7.7l-2.6 5.5" /></>,
+    batch: <><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="3" y="12" width="5" height="5" rx="1" /><path d="M11 5.5h6M11 14.5h6" /></>,
+    plus: <><path d="M10 4v12M4 10h12" /></>,
+  };
+  return <svg className="task-toolbar-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+}
+
 export function TaskBoard({ projectID, initialTaskID, permissionMode, request, fail, close, onDispatched }: { projectID: string; initialTaskID?: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; close: () => void; onDispatched: (message: { id: string; role: "user" | "assistant"; content: string; createdAt: string }, runID: string) => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [view, setView] = useState<"board" | "list">("board");
@@ -301,11 +327,22 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
             <button className="secondary" disabled={batchDeleting} onClick={exitBatchMode}>取消</button>
           </div>
         </> : <>
-          <div className="task-view-switch" aria-label="任务视图"><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>看板</button><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}>列表</button></div>
-          <label className="task-cancelled-toggle"><input type="checkbox" checked={showHistoricalCancelled} onChange={(event) => setShowHistoricalCancelled(event.target.checked)} />显示历史已取消</label>
-          <button className="secondary" onClick={() => setOrchestrationOpen(true)}>自动编排</button>
-          <button className="secondary" onClick={enterBatchMode}>批量管理</button>
-          <button className="primary" onClick={() => setEditor({})}>新建任务</button>
+          <div className="task-toolbar-group task-view-tools">
+            <div className="task-view-switch" aria-label="任务视图">
+              <button className={view === "board" ? "active" : ""} aria-pressed={view === "board"} onClick={() => setView("board")}><TaskToolbarIcon name="board" />看板</button>
+              <button className={view === "list" ? "active" : ""} aria-pressed={view === "list"} onClick={() => setView("list")}><TaskToolbarIcon name="list" />列表</button>
+            </div>
+            <label className="task-cancelled-toggle">
+              <input type="checkbox" checked={showHistoricalCancelled} onChange={(event) => setShowHistoricalCancelled(event.target.checked)} />
+              <span className="task-cancelled-toggle-control" aria-hidden="true"><i /></span>
+              <span>显示历史已取消</span>
+            </label>
+          </div>
+          <div className="task-toolbar-group task-toolbar-commands">
+            <button className="task-toolbar-action" onClick={() => setOrchestrationOpen(true)}><TaskToolbarIcon name="workflow" />自动编排</button>
+            <button className="task-toolbar-action" onClick={enterBatchMode}><TaskToolbarIcon name="batch" />批量管理</button>
+            <button className="task-toolbar-action task-toolbar-create" onClick={() => setEditor({})}><TaskToolbarIcon name="plus" />新建任务</button>
+          </div>
         </>}
       </div>
     </header>
@@ -461,9 +498,10 @@ function TaskItem({ task, open, columnID, index, isDragging, dropTarget, draggab
     onDragOver={(e) => { if (draggable) onDragOver(e, columnID, index); }}
   >
     {batchMode && <span className={`task-batch-check${selected ? " checked" : ""}`} onClick={(e) => { e.stopPropagation(); toggleSelect(task.id); }}></span>}
-    <div className="task-item-top"><StatusBadge task={task} /><span>{priorityLabels[task.priority]}</span></div>
+    <div className="task-item-top"><StatusBadge task={task} /><span className={`task-item-priority priority-${task.priority}`} title={`${priorityLabels[task.priority]}优先级`} aria-label={`${priorityLabels[task.priority]}优先级`} /></div>
     <b>{title}</b>
     {description && description !== title.trim() && <p>{description}</p>}
+    <small className="task-item-updated">更新于 {formatDate(task.updatedAt)}</small>
   </button>;
 }
 
@@ -494,7 +532,7 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法保存任务"); }
     finally { if (mountedRef.current) setBusy(false); }
   };
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog"><header><div><label>PROJECT TASK</label><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button title="关闭" disabled={busy} onClick={close}>x</button></header><form onSubmit={(event) => void save(event)}><div className="task-form"><label>任务名称 <small>（可选）</small><input autoFocus maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label><label>任务说明<textarea required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label><label>验收条件 <small>（可选）</small><textarea maxLength={12000} value={acceptanceCriteria} onChange={(event) => setAcceptanceCriteria(event.target.value)} placeholder="用可验证的结果描述完成标准。" /></label><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog task-editor-dialog"><header className="task-editor-header"><div><span>任务</span><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button type="button" className="task-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><form className="task-editor-form" onSubmit={(event) => void save(event)}><div className="task-form"><section className="task-form-section"><div className="task-form-section-head"><h3>基本信息</h3></div><div className="task-form-basic-grid"><label className="task-form-title">任务名称 <small>可选</small><input autoFocus maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div></section><section className="task-form-section"><div className="task-form-section-head"><h3>任务内容</h3></div><label>任务说明<textarea required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label><label>验收条件 <small>可选</small><textarea maxLength={12000} value={acceptanceCriteria} onChange={(event) => setAcceptanceCriteria(event.target.value)} placeholder="用可验证的结果描述完成标准。" /></label></section></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
 }
 
 function OrchestrationDialog({ config, jobs, releases, request, close, saved, fail }: { config: OrchestrationConfig; jobs: OrchestrationJob[]; releases: ReleaseSnapshot[]; request: Request; close: () => void; saved: () => Promise<void>; fail: (message: string) => void }) {
@@ -505,19 +543,71 @@ function OrchestrationDialog({ config, jobs, releases, request, close, saved, fa
   const [maxFixRounds, setMaxFixRounds] = useState(config.maxFixRounds);
   const [saving, setSaving] = useState(false);
   const [action, setAction] = useState("");
+  const operationRef = useRef(false);
   const save = async (event: FormEvent) => {
-    event.preventDefault(); setSaving(true);
+    event.preventDefault();
+    if (operationRef.current) return;
+    operationRef.current = true;
+    setSaving(true);
     try { await request(`/api/projects/${config.projectId}/orchestration/config`, { method: "PUT", body: JSON.stringify({ enabled, mainBranch, devBranch, verificationCommands: commands.split("\n").map((item) => item.trim()).filter(Boolean), maxFixRounds }) }); await saved(); close(); }
     catch (cause) { fail(cause instanceof Error ? cause.message : "无法保存自动编排配置"); }
-    finally { setSaving(false); }
+    finally { operationRef.current = false; setSaving(false); }
   };
   const runAction = async (key: string, path: string) => {
+    if (operationRef.current) return;
+    operationRef.current = true;
     setAction(key);
     try { await request(path, { method: "POST", body: "{}" }); await saved(); }
     catch (cause) { fail(cause instanceof Error ? cause.message : "自动编排操作失败"); }
-    finally { setAction(""); }
+    finally { operationRef.current = false; setAction(""); }
   };
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="orchestration-title"><section className="modal task-dialog"><header><div><label>AUTOMATION</label><h2 id="orchestration-title">严格串行编排</h2></div><button title="关闭" disabled={saving || Boolean(action)} onClick={close}>x</button></header><form onSubmit={(event) => void save(event)}><div className="task-form"><label><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用自动队列</label><label>稳定分支<input required value={mainBranch} onChange={(event) => setMainBranch(event.target.value)} /></label><label>集成分支<input required value={devBranch} onChange={(event) => setDevBranch(event.target.value)} /></label><label>验证命令<textarea required value={commands} onChange={(event) => setCommands(event.target.value)} placeholder="每行一条命令" /></label><label>最大修复轮次<input type="number" min={1} max={10} value={maxFixRounds} onChange={(event) => setMaxFixRounds(Number(event.target.value))} /></label>{config.frozenReason && <p className="task-dispatch-reason">队列已冻结：{config.frozenReason}</p>}<section><h3>自动队列</h3>{jobs.length === 0 ? <p>暂无自动任务。</p> : <div className="task-run-list">{jobs.map((job) => <div key={job.id}><b>#{job.position}</b><span>{job.status}</span>{job.lastError && <small>{job.lastError}</small>}{job.status === "queued" && <button type="button" className="secondary" disabled={Boolean(action)} onClick={() => void runAction(`pause:${job.id}`, `/api/tasks/${job.taskId}/orchestration/pause`)}>暂停</button>}{(job.status === "paused" || job.status === "needs_human") && <button type="button" className="primary" disabled={Boolean(action)} onClick={() => void runAction(`resume:${job.id}`, `/api/tasks/${job.taskId}/orchestration/resume`)}>{action === `resume:${job.id}` ? "恢复中" : "恢复"}</button>}</div>)}</div>}</section><section><h3>验收快照</h3><button type="button" className="secondary" disabled={Boolean(action) || !config.enabled || Boolean(config.frozenReason)} onClick={() => void runAction("release", `/api/projects/${config.projectId}/orchestration/release`)}>{action === "release" ? "创建中" : "创建当前 dev 验收快照"}</button>{releases.length === 0 ? <p>尚未创建验收快照。</p> : <div className="task-run-list">{releases.map((release) => <div key={release.id}><b>{release.branch}</b><span>{release.status}</span><small>{release.devSha}</small>{release.status === "awaiting_main" && <button type="button" className="primary" disabled={Boolean(action)} onClick={() => void runAction(`confirm:${release.id}`, `/api/projects/${config.projectId}/orchestration/releases/${release.id}/confirm-main`)}>{action === `confirm:${release.id}` ? "确认中" : "确认已合并 main"}</button>}</div>)}</div>}</section></div><footer><button type="button" className="secondary" disabled={saving || Boolean(action)} onClick={close}>取消</button><button className="primary" disabled={saving || Boolean(action)}>{saving ? "保存中" : "保存配置"}</button></footer></form></section></div>;
+  const busy = saving || Boolean(action);
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="orchestration-title">
+    <section className="modal task-dialog orchestration-dialog">
+      <header>
+        <div><h2 id="orchestration-title">严格串行编排</h2></div>
+        <button type="button" className="orchestration-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button>
+      </header>
+      <form onSubmit={(event) => void save(event)}>
+        <div className="orchestration-dialog-body">
+          <div className="orchestration-settings">
+            <label className="orchestration-enabled"><input type="checkbox" disabled={busy} checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用自动队列</span></label>
+            <div className="orchestration-settings-grid">
+              <label>稳定分支<input required disabled={busy} value={mainBranch} onChange={(event) => setMainBranch(event.target.value)} /></label>
+              <label>集成分支<input required disabled={busy} value={devBranch} onChange={(event) => setDevBranch(event.target.value)} /></label>
+              <label className="orchestration-wide-field">验证命令<textarea required disabled={busy} value={commands} onChange={(event) => setCommands(event.target.value)} placeholder="每行一条命令" /></label>
+              <label className="orchestration-number-field">最大修复轮次<input type="number" min={1} max={10} disabled={busy} value={maxFixRounds} onChange={(event) => setMaxFixRounds(Number(event.target.value))} /></label>
+            </div>
+            {config.frozenReason && <p className="orchestration-frozen-reason">队列已冻结：{config.frozenReason}</p>}
+          </div>
+
+          <section className="orchestration-section" aria-labelledby="orchestration-queue-title">
+            <div className="orchestration-section-head"><h3 id="orchestration-queue-title">自动队列</h3><span>{jobs.length} 项</span></div>
+            {jobs.length === 0 ? <p className="orchestration-empty">暂无自动任务。</p> : <ul className="orchestration-record-list">
+              {jobs.map((job) => <li key={job.id} className="orchestration-record">
+                <div className="orchestration-record-title"><b className="orchestration-position">#{job.position}</b><span className="orchestration-status" data-status={job.status}>{orchestrationStatusLabel(job.status)}</span></div>
+                {job.status === "queued" && <div className="orchestration-record-action"><button type="button" className="secondary" disabled={busy} onClick={() => void runAction(`pause:${job.id}`, `/api/tasks/${job.taskId}/orchestration/pause`)}>{action === `pause:${job.id}` ? "暂停中" : "暂停"}</button></div>}
+                {(job.status === "paused" || job.status === "needs_human") && <div className="orchestration-record-action"><button type="button" className="primary" disabled={busy} onClick={() => void runAction(`resume:${job.id}`, `/api/tasks/${job.taskId}/orchestration/resume`)}>{action === `resume:${job.id}` ? "恢复中" : "恢复"}</button></div>}
+                {job.lastError && <small className="orchestration-record-error">{job.lastError}</small>}
+              </li>)}
+            </ul>}
+          </section>
+
+          <section className="orchestration-section" aria-labelledby="orchestration-release-title">
+            <div className="orchestration-section-head"><h3 id="orchestration-release-title">验收快照</h3><button type="button" className="secondary" disabled={busy || !config.enabled || Boolean(config.frozenReason)} onClick={() => void runAction("release", `/api/projects/${config.projectId}/orchestration/release`)}>{action === "release" ? "创建中" : "创建当前 dev 验收快照"}</button></div>
+            {releases.length === 0 ? <p className="orchestration-empty">尚未创建验收快照。</p> : <ul className="orchestration-record-list">
+              {releases.map((release) => <li key={release.id} className="orchestration-record">
+                <div className="orchestration-record-title"><b className="orchestration-release-branch" title={release.branch}>{release.branch}</b><span className="orchestration-status" data-status={release.status}>{orchestrationStatusLabel(release.status)}</span></div>
+                {release.status === "awaiting_main" && <div className="orchestration-record-action"><button type="button" className="primary" disabled={busy} onClick={() => void runAction(`confirm:${release.id}`, `/api/projects/${config.projectId}/orchestration/releases/${release.id}/confirm-main`)}>{action === `confirm:${release.id}` ? "确认中" : "确认已合并 main"}</button></div>}
+                <code className="orchestration-record-sha">{release.devSha}</code>
+              </li>)}
+            </ul>}
+          </section>
+        </div>
+        <footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{saving ? "保存中" : "保存配置"}</button></footer>
+      </form>
+    </section>
+  </div>;
 }
 
 function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, dispatch, enqueue, orchestrationEnabled, transition, deleteTask, confirmTransition, edit, move, canMoveUp, canMoveDown, request, fail }: { detail: TaskDetail; permissionMode?: ExecutionPolicy; busy: string; close: () => void; refresh: () => Promise<void>; dispatch: () => Promise<void>; enqueue: () => Promise<void>; orchestrationEnabled: boolean; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; confirmTransition: () => void; edit: () => void; move: (taskID: string, direction: "up" | "down") => Promise<void>; canMoveUp: boolean; canMoveDown: boolean; request: Request; fail: (message: string) => void }) {
@@ -541,7 +631,7 @@ function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, dispat
     finally { if (mountedRef.current) setReviewSubmitting(false); }
   };
   const reviewBusy = Boolean(busy) || reviewSubmitting || isTaskOrchestrating(detail);
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-detail-title"><section className="modal task-dialog task-detail-dialog"><header><div><label>PROJECT TASK</label><h2 id="task-detail-title">{taskDisplayTitle(detail)}</h2><StatusBadge task={detail} /></div><button title="关闭" disabled={reviewBusy} onClick={close}>x</button></header><div className="task-detail-body"><div className="task-detail-meta"><span className={`priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span><span>更新于 {formatDate(detail.updatedAt)}</span></div><section><h3>任务说明</h3><p>{detail.description}</p></section>{detail.acceptanceCriteria && <section><h3>验收条件</h3><p>{detail.acceptanceCriteria}</p></section>}<section><h3>下发内容</h3><pre className="task-prompt">{detail.promptPreview}</pre><p>执行权限：{policyLabel(permissionMode)}</p>{detail.blockReason && <p className="task-dispatch-reason">{detail.blockReason}</p>}</section><section><h3>执行记录</h3>{detail.runs.length === 0 ? <p>尚未下发。</p> : <div className="task-run-list"><div className="task-run-list-head"><span>次数</span><span>状态</span><span>时间</span></div>{detail.runs.map((run) => <div key={run.id}><b>第 {run.sequence} 次</b><span>{run.status}</span><time>{formatDate(run.createdAt)}</time>{run.failureReason && <small>{run.failureReason}</small>}</div>)}</div>}</section>{reviewAction && <div className="task-review-sheet" ref={reviewSheetRef}><h3>要求修改</h3><textarea autoFocus required disabled={reviewSubmitting} value={note} onChange={(event) => setNote(event.target.value)} placeholder="说明需要补充或修改的内容" /><div><button className="secondary" disabled={reviewSubmitting} onClick={() => setReviewAction(null)}>返回</button><button className="primary" disabled={reviewSubmitting} onClick={() => void submitReview("request_changes")}>{reviewSubmitting ? "提交中" : "提交要求"}</button></div></div>}</div><footer className="task-detail-actions">{(detail.status === "todo" || detail.status === "action_required") && <><button className="secondary" disabled={Boolean(busy)} onClick={edit}>编辑</button><button className="secondary" disabled={Boolean(busy) || !canMoveUp} onClick={() => void move(detail.id, "up")}>上移</button><button className="secondary" disabled={Boolean(busy) || !canMoveDown} onClick={() => void move(detail.id, "down")}>下移</button></>}{detail.status === "awaiting_review" && <><button className="secondary" disabled={reviewBusy} onClick={() => setReviewAction("request_changes")}>要求修改</button><button className="primary" disabled={reviewBusy} onClick={() => void submitReview("accept")}>{reviewSubmitting ? "提交中" : "确认完成"}</button></>}{detail.status === "running" && <button className="danger-text" disabled={Boolean(busy)} onClick={() => void transition("stop")}>{busy === "stop" ? "停止中" : "停止任务"}</button>}{(detail.status === "todo" || detail.status === "action_required") && <>{orchestrationEnabled && <button className="secondary" disabled={Boolean(busy)} onClick={() => void enqueue()}>{busy === "enqueue" ? "入队中" : "加入自动队列"}</button>}<button className="primary" disabled={!detail.canDispatch || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button></>}{detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}<button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button></footer></section></div>;
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-detail-title"><section className="modal task-dialog task-detail-dialog"><header className="task-detail-header"><div className="task-detail-heading"><h2 id="task-detail-title">{taskDisplayTitle(detail)}</h2><div><StatusBadge task={detail} /><span>更新于 {formatDate(detail.updatedAt)}</span></div></div><button type="button" className="task-detail-close" title="关闭" aria-label="关闭" disabled={reviewBusy} onClick={close}>x</button></header><div className="task-detail-body"><div className="task-detail-meta"><span className={`priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span><span>执行权限：{policyLabel(permissionMode)}</span></div><section className="task-detail-section"><h3>任务说明</h3><p>{detail.description}</p></section>{detail.acceptanceCriteria && <section className="task-detail-section"><h3>验收条件</h3><p>{detail.acceptanceCriteria}</p></section>}<section className="task-detail-section"><h3>下发内容</h3><pre className="task-prompt">{detail.promptPreview}</pre>{detail.blockReason && <p className="task-dispatch-reason">{detail.blockReason}</p>}</section><section className="task-detail-section"><h3>执行记录</h3>{detail.runs.length === 0 ? <p className="task-detail-empty">尚未下发。</p> : <div className="task-run-list"><div className="task-run-list-head"><span>次数</span><span>状态</span><span>时间</span></div>{detail.runs.map((run) => <div key={run.id}><b>第 {run.sequence} 次</b><span>{run.status}</span><time>{formatDate(run.createdAt)}</time>{run.failureReason && <small>{run.failureReason}</small>}</div>)}</div>}</section>{reviewAction && <div className="task-review-sheet" ref={reviewSheetRef}><h3>要求修改</h3><textarea autoFocus required disabled={reviewSubmitting} value={note} onChange={(event) => setNote(event.target.value)} placeholder="说明需要补充或修改的内容" /><div><button className="secondary" disabled={reviewSubmitting} onClick={() => setReviewAction(null)}>返回</button><button className="primary" disabled={reviewSubmitting} onClick={() => void submitReview("request_changes")}>{reviewSubmitting ? "提交中" : "提交要求"}</button></div></div>}</div><footer className="task-detail-actions"><div className="task-detail-main-actions">{(detail.status === "todo" || detail.status === "action_required") && <><button className="secondary" disabled={Boolean(busy)} onClick={edit}>编辑</button><button className="secondary" disabled={Boolean(busy) || !canMoveUp} onClick={() => void move(detail.id, "up")}>上移</button><button className="secondary" disabled={Boolean(busy) || !canMoveDown} onClick={() => void move(detail.id, "down")}>下移</button></>}{detail.status === "awaiting_review" && <><button className="secondary" disabled={reviewBusy} onClick={() => setReviewAction("request_changes")}>要求修改</button><button className="primary" disabled={reviewBusy} onClick={() => void submitReview("accept")}>{reviewSubmitting ? "提交中" : "确认完成"}</button></>}{detail.status === "running" && <button className="task-detail-stop" disabled={Boolean(busy)} onClick={() => void transition("stop")}>{busy === "stop" ? "停止中" : "停止任务"}</button>}{(detail.status === "todo" || detail.status === "action_required") && <>{orchestrationEnabled && <button className="secondary" disabled={Boolean(busy)} onClick={() => void enqueue()}>{busy === "enqueue" ? "入队中" : "加入自动队列"}</button>}<button className="primary" disabled={!detail.canDispatch || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button></>}{detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}</div><button className="task-detail-delete" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button></footer></section></div>;
 }
 
 function formatDate(value: string): string {
