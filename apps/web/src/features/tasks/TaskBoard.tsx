@@ -292,7 +292,6 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
 
   return <section className="task-workspace" aria-label="项目任务">
     <header className="task-workspace-head">
-      <div><label>PROJECT TASKS</label><h2>任务编排</h2></div>
       <div className="task-workspace-actions">
         {batchMode ? <>
           <div className="task-batch-bar">
@@ -305,7 +304,6 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
           <div className="task-view-switch" aria-label="任务视图"><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>看板</button><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}>列表</button></div>
           <label className="task-cancelled-toggle"><input type="checkbox" checked={showHistoricalCancelled} onChange={(event) => setShowHistoricalCancelled(event.target.checked)} />显示历史已取消</label>
           <button className="secondary" onClick={() => setOrchestrationOpen(true)}>自动编排</button>
-          <button className="secondary" onClick={close}>返回对话</button>
           <button className="secondary" onClick={enterBatchMode}>批量管理</button>
           <button className="primary" onClick={() => setEditor({})}>新建任务</button>
         </>}

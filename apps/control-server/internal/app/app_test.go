@@ -72,6 +72,12 @@ type blockingUpdateRunner struct {
 	once    sync.Once
 }
 
+type requestContextUpdateRunner struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
 type admissionBlockingRunner struct {
 	readyStarted chan struct{}
 	releaseReady chan struct{}
@@ -100,6 +106,24 @@ func (runner *blockingUpdateRunner) Update(context.Context) (string, string, err
 	<-runner.release
 	runner.updateCalls++
 	return "2.1.216", "2.1.217", nil
+}
+
+func (*requestContextUpdateRunner) Ready(context.Context) bool { return true }
+func (*requestContextUpdateRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
+	return nil
+}
+func (*requestContextUpdateRunner) Version(context.Context) string { return "0.145.0" }
+func (*requestContextUpdateRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (runner *requestContextUpdateRunner) Update(ctx context.Context) (string, string, error) {
+	runner.once.Do(func() { close(runner.started) })
+	select {
+	case <-ctx.Done():
+		return "0.145.0", "", ctx.Err()
+	case <-runner.release:
+		return "0.145.0", "0.146.0", nil
+	}
 }
 
 func (*updateTestRunner) Ready(context.Context) bool                               { return true }
@@ -155,6 +179,31 @@ type blockingStopAgentSession struct {
 	stopEntered chan struct{}
 	releaseStop chan struct{}
 	stopOnce    sync.Once
+}
+
+type delayedDoneAgentSession struct {
+	*queuedAgentSession
+	stopped chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newDelayedDoneAgentSession() *delayedDoneAgentSession {
+	return &delayedDoneAgentSession{
+		queuedAgentSession: newQueuedAgentSession(),
+		stopped:            make(chan struct{}),
+		release:            make(chan struct{}),
+	}
+}
+
+func (session *delayedDoneAgentSession) Stop() {
+	session.once.Do(func() {
+		close(session.stopped)
+		go func() {
+			<-session.release
+			close(session.done)
+		}()
+	})
 }
 
 func newBlockingStopAgentSession() *blockingStopAgentSession {
@@ -995,8 +1044,166 @@ func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
 	if err := json.NewDecoder(failed.Body).Decode(&failureResult); err != nil {
 		t.Fatalf("decode failed update: %v", err)
 	}
-	if failureResult.Success || failureResult.Error != "update failed" {
+	if failureResult.Success || failureResult.Error != "任务执行失败，请查看任务日志后重试。" {
 		t.Fatalf("failure result=%#v", failureResult)
+	}
+}
+
+func TestCodexUpdateEndpointsUseLocalCodexRunner(t *testing.T) {
+	server := newTestServer(t)
+	codex := &updateTestRunner{checkAvailable: true, latestVersion: "0.146.0"}
+	server.codexRunner = codex
+
+	unsupported := httptest.NewRecorder()
+	server.routes().ServeHTTP(unsupported, httptest.NewRequest(http.MethodPost, "/api/runners/ssh-example/codex/check-update", nil))
+	if unsupported.Code != http.StatusNotFound {
+		t.Fatalf("unsupported Codex runner status=%d body=%s", unsupported.Code, unsupported.Body.String())
+	}
+
+	check := httptest.NewRecorder()
+	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/check-update", nil))
+	if check.Code != http.StatusOK {
+		t.Fatalf("check Codex update status=%d body=%s", check.Code, check.Body.String())
+	}
+	var checkResult struct {
+		UpdateAvailable bool   `json:"updateAvailable"`
+		CurrentVersion  string `json:"currentVersion"`
+		LatestVersion   string `json:"latestVersion"`
+	}
+	if err := json.NewDecoder(check.Body).Decode(&checkResult); err != nil {
+		t.Fatalf("decode Codex check update: %v", err)
+	}
+	if !checkResult.UpdateAvailable || checkResult.CurrentVersion != "2.1.216" || checkResult.LatestVersion != "0.146.0" {
+		t.Fatalf("Codex check result=%#v", checkResult)
+	}
+
+	update := httptest.NewRecorder()
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil))
+	if update.Code != http.StatusOK || codex.updateCalls != 1 {
+		t.Fatalf("update Codex status=%d calls=%d body=%s", update.Code, codex.updateCalls, update.Body.String())
+	}
+}
+
+func TestCodexUpdateIsIsolatedFromClaudeSessions(t *testing.T) {
+	server := newTestServer(t)
+	codex := &blockingUpdateRunner{started: make(chan struct{}), release: make(chan struct{})}
+	server.codexRunner = codex
+	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	server.runnerRegistry.register("wsl-local", server.runner, server.wslLocalMeta())
+	server.mu.Lock()
+	server.sessions["claude"] = &activeAgentSession{agent: &idleAgentSession{done: make(chan error)}, runnerID: "wsl-local", agentID: "claude-code"}
+	server.mu.Unlock()
+
+	update := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil))
+		close(done)
+	}()
+	select {
+	case <-codex.started:
+	case <-time.After(time.Second):
+		t.Fatal("Codex update was incorrectly blocked by a Claude session")
+	}
+
+	status := httptest.NewRecorder()
+	server.routes().ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/runners", nil))
+	var runners []struct {
+		ID     string `json:"id"`
+		Claude struct {
+			Status string `json:"status"`
+		} `json:"claude"`
+		Codex struct {
+			Status string `json:"status"`
+		} `json:"codex"`
+	}
+	if err := json.NewDecoder(status.Body).Decode(&runners); err != nil {
+		t.Fatalf("decode runner status: %v", err)
+	}
+	if len(runners) != 1 || runners[0].Claude.Status == "updating" || runners[0].Codex.Status != "updating" {
+		t.Fatalf("unexpected isolated update status: %#v", runners)
+	}
+
+	close(codex.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Codex update did not finish")
+	}
+	if update.Code != http.StatusOK {
+		t.Fatalf("Codex update status=%d body=%s", update.Code, update.Body.String())
+	}
+}
+
+func TestRunnerUpdatesAreSerializedAcrossAgents(t *testing.T) {
+	server := newTestServer(t)
+	codex := &blockingUpdateRunner{started: make(chan struct{}), release: make(chan struct{})}
+	claude := &updateTestRunner{}
+	server.codexRunner = codex
+	server.runner = claude
+	server.runnerRegistry.register("wsl-local", claude, server.wslLocalMeta())
+
+	codexUpdate := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.routes().ServeHTTP(codexUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil))
+		close(done)
+	}()
+	select {
+	case <-codex.started:
+	case <-time.After(time.Second):
+		t.Fatal("Codex update did not start")
+	}
+
+	claudeUpdate := httptest.NewRecorder()
+	server.routes().ServeHTTP(claudeUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+	if claudeUpdate.Code != http.StatusConflict || claude.updateCalls != 0 {
+		t.Fatalf("Claude update must wait for Codex update: status=%d calls=%d body=%s", claudeUpdate.Code, claude.updateCalls, claudeUpdate.Body.String())
+	}
+
+	close(codex.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Codex update did not finish")
+	}
+	if codexUpdate.Code != http.StatusOK {
+		t.Fatalf("Codex update status=%d body=%s", codexUpdate.Code, codexUpdate.Body.String())
+	}
+}
+
+func TestCodexUpdateSurvivesRequestCancellation(t *testing.T) {
+	server := newTestServer(t)
+	runner := &requestContextUpdateRunner{started: make(chan struct{}), release: make(chan struct{})}
+	server.codexRunner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.routes().ServeHTTP(response, request)
+		close(done)
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("Codex update did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+		t.Fatalf("update ended after request cancellation: status=%d body=%s", response.Code, response.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(runner.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Codex update did not finish")
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("Codex update status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -3399,7 +3606,7 @@ func TestTaskStopRejectsActiveRunWhenConversationHasQueuedTask(t *testing.T) {
 	if response.Code != http.StatusConflict {
 		t.Fatalf("stop active task with queue status: got=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "other queued task runs") {
+	if !strings.Contains(response.Body.String(), "当前会话还有排队的任务") {
 		t.Fatalf("stop was rejected for the wrong reason: %s", response.Body.String())
 	}
 }
@@ -3426,11 +3633,249 @@ func TestRunStopRejectsStreamingSessionWithQueuedTask(t *testing.T) {
 	if response.Code != http.StatusConflict {
 		t.Fatalf("stop run with queued task: got=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
 	}
+	var errorPayload struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&errorPayload); err != nil {
+		t.Fatalf("decode stop conflict: %v", err)
+	}
+	if errorPayload.Code != "active_runs_present" {
+		t.Fatalf("stop conflict code=%q", errorPayload.Code)
+	}
 	select {
 	case <-session.done:
 		t.Fatal("queued session was stopped")
 	default:
 	}
+}
+
+func TestConversationReportsQueuedRunAsActive(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update conversations set status='running' where id=?`, conversationID); err != nil {
+		t.Fatalf("mark conversation running: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('queued-run',?,'queued',?)`, conversationID, now); err != nil {
+		t.Fatalf("insert queued run: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/"+conversationID+"?limit=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("get conversation status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		ActiveRunID *string `json:"activeRunId"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode conversation response: %v", err)
+	}
+	if payload.ActiveRunID == nil || *payload.ActiveRunID != "queued-run" {
+		t.Fatalf("active run ID=%v, want queued-run", payload.ActiveRunID)
+	}
+}
+
+func TestRunForceStopCancelsAllActiveConversationRuns(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	activeTask := createTaskForTest(t, server.routes(), projectID, "Active task")
+	queuedTask := createTaskForTest(t, server.routes(), projectID, "Queued task")
+	now := time.Now().UTC()
+	for _, run := range []struct{ id, taskID, status string }{{"active-run", activeTask, "running"}, {"queued-run", queuedTask, "queued"}} {
+		if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values (?,?,?,?)`, run.id, conversationID, run.status, now); err != nil {
+			t.Fatalf("insert run: %v", err)
+		}
+		if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values (?,?,?,?,1,?,'prompt','criteria','',?)`, run.id+"-task", run.taskID, conversationID, run.id, run.status, now); err != nil {
+			t.Fatalf("insert task run: %v", err)
+		}
+	}
+	if _, err := server.db.Exec(`update tasks set status=? where id in (?,?)`, taskRunning, activeTask, queuedTask); err != nil {
+		t.Fatalf("mark tasks active: %v", err)
+	}
+	cancelled := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		close(cancelled)
+	}()
+	session := newQueuedAgentSession()
+	server.mu.Lock()
+	server.cancels["active-run"] = cancel
+	server.runContexts["active-run"] = conversationID
+	server.runContexts["queued-run"] = conversationID
+	server.streamingSetups["queued-run"] = &streamingSetup{}
+	managed := &activeAgentSession{agent: session, activeRunID: "active-run", runIDs: map[string]struct{}{"active-run": {}, "queued-run": {}}}
+	server.sessions[conversationID] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession(conversationID, managed)
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runs/active-run/stop?force=true", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("force stop status=%d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("force stop did not cancel the active run context")
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("force stop did not stop the shared streaming session")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var remaining int
+		if err := server.db.QueryRow(`select count(*) from runs where id in ('active-run','queued-run') and status in ('queued','running')`).Scan(&remaining); err != nil {
+			t.Fatalf("count active runs: %v", err)
+		}
+		if remaining == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, runID := range []string{"active-run", "queued-run"} {
+		var status string
+		if err := server.db.QueryRow(`select status from runs where id=?`, runID).Scan(&status); err != nil {
+			t.Fatalf("load %s status: %v", runID, err)
+		}
+		if status != "stopped" {
+			t.Fatalf("%s status=%q, want stopped", runID, status)
+		}
+	}
+	for _, taskID := range []string{activeTask, queuedTask} {
+		assertTaskStatus(t, server, taskID, taskActionRequired)
+	}
+	var conversationStatus string
+	if err := server.db.QueryRow(`select status from conversations where id=?`, conversationID).Scan(&conversationStatus); err != nil {
+		t.Fatalf("load conversation status: %v", err)
+	}
+	if conversationStatus != "idle" {
+		t.Fatalf("conversation status=%q, want idle", conversationStatus)
+	}
+	server.mu.Lock()
+	_, activeCancel := server.cancels["active-run"]
+	_, activeContext := server.runContexts["active-run"]
+	_, queuedContext := server.runContexts["queued-run"]
+	_, queuedSetup := server.streamingSetups["queued-run"]
+	server.mu.Unlock()
+	if activeCancel || activeContext || queuedContext || queuedSetup {
+		t.Fatalf("force-stopped runs retained in-memory state: cancel=%t activeContext=%t queuedContext=%t queuedSetup=%t", activeCancel, activeContext, queuedContext, queuedSetup)
+	}
+}
+
+func TestStreamingSessionUnexpectedExitFinalizesOutstandingRuns(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update conversations set status='running' where id=?`, conversationID); err != nil {
+		t.Fatalf("mark conversation running: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('abandoned-run',?,'running',?)`, conversationID, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	session := newQueuedAgentSession()
+	managed := &activeAgentSession{agent: session, activeRunID: "abandoned-run", runIDs: map[string]struct{}{"abandoned-run": {}}}
+	server.mu.Lock()
+	server.runContexts["abandoned-run"] = conversationID
+	server.streamingSetups["abandoned-run"] = &streamingSetup{}
+	server.sessions[conversationID] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession(conversationID, managed)
+
+	// The process exited without emitting TurnFinished for its active turn.
+	session.Stop()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var status string
+		if err := server.db.QueryRow(`select status from runs where id='abandoned-run'`).Scan(&status); err != nil {
+			t.Fatalf("load run: %v", err)
+		}
+		if status == "failed" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	var status, conversationStatus string
+	if err := server.db.QueryRow(`select status from runs where id='abandoned-run'`).Scan(&status); err != nil {
+		t.Fatalf("load final run: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("run status=%q, want failed", status)
+	}
+	if err := server.db.QueryRow(`select status from conversations where id=?`, conversationID).Scan(&conversationStatus); err != nil {
+		t.Fatalf("load conversation: %v", err)
+	}
+	if conversationStatus != "idle" {
+		t.Fatalf("conversation status=%q, want idle", conversationStatus)
+	}
+	server.mu.Lock()
+	_, contextRetained := server.runContexts["abandoned-run"]
+	_, setupRetained := server.streamingSetups["abandoned-run"]
+	server.mu.Unlock()
+	if contextRetained || setupRetained {
+		t.Fatalf("unexpectedly exited run retained in-memory state: context=%t setup=%t", contextRetained, setupRetained)
+	}
+}
+
+func TestRunForceStopKeepsWorkspaceUntilStreamingSessionExits(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update conversations set status='running' where id=?`, conversationID); err != nil {
+		t.Fatalf("mark conversation running: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('active-run',?,'running',?)`, conversationID, now); err != nil {
+		t.Fatalf("insert active run: %v", err)
+	}
+	releaseWorkspace, acquired := server.acquireProjectWorkspace(projectID, "conversation:"+conversationID)
+	if !acquired {
+		t.Fatal("acquire streaming workspace")
+	}
+	server.registerRunWorkspace("active-run", releaseWorkspace)
+	session := newDelayedDoneAgentSession()
+	managed := &activeAgentSession{agent: session, activeRunID: "active-run", runIDs: map[string]struct{}{"active-run": {}}}
+	server.mu.Lock()
+	server.sessions[conversationID] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession(conversationID, managed)
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runs/active-run/stop?force=true", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("force stop status=%d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case <-session.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("force stop did not request session shutdown")
+	}
+	var runStatus, conversationStatus string
+	if err := server.db.QueryRow(`select status from runs where id='active-run'`).Scan(&runStatus); err != nil {
+		t.Fatalf("load active run: %v", err)
+	}
+	if err := server.db.QueryRow(`select status from conversations where id=?`, conversationID).Scan(&conversationStatus); err != nil {
+		t.Fatalf("load conversation: %v", err)
+	}
+	if runStatus != "running" || conversationStatus != "running" {
+		t.Fatalf("session exited too early: run=%q conversation=%q", runStatus, conversationStatus)
+	}
+	if _, acquired := server.acquireProjectWorkspace(projectID, "run:replacement"); acquired {
+		t.Fatal("workspace was released before the stopped session exited")
+	}
+
+	close(session.release)
+	waitForConversationIdle(t, server, conversationID)
+	if err := server.db.QueryRow(`select status from runs where id='active-run'`).Scan(&runStatus); err != nil {
+		t.Fatalf("load stopped run: %v", err)
+	}
+	if runStatus != "stopped" {
+		t.Fatalf("run status=%q, want stopped", runStatus)
+	}
+	releaseReplacement, acquired := server.acquireProjectWorkspace(projectID, "run:replacement")
+	if !acquired {
+		t.Fatal("workspace remained held after the stopped session exited")
+	}
+	releaseReplacement()
 }
 
 func TestTaskDetailIncludesLastRunAndFailureReason(t *testing.T) {
@@ -3459,8 +3904,134 @@ func TestTaskDetailIncludesLastRunAndFailureReason(t *testing.T) {
 	if detail.LastRun == nil || detail.LastRun.ID != "failed-task-run" {
 		t.Fatalf("last run missing from task detail: %+v", detail.LastRun)
 	}
-	if len(detail.Runs) != 1 || !strings.Contains(detail.Runs[0].FailureReason, "permission denied") {
+	if len(detail.Runs) != 1 || detail.Runs[0].FailureReason != "任务执行失败，请查看任务日志后重试。" {
 		t.Fatalf("failure reason was not preserved: %+v", detail.Runs)
+	}
+}
+
+func TestTaskStatusNotificationLinksToTaskConversation(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Notification target")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('notification-task-run',?,?,1,'completed','prompt','criteria','',?)`, taskID, conversationID, now); err != nil {
+		t.Fatalf("insert task run: %v", err)
+	}
+
+	server.notifyTaskStatusChange(context.Background(), taskID, taskDone)
+
+	var gotConversationID, actionURL string
+	if err := server.db.QueryRow(`select conversation_id,action_url from notifications where task_id=?`, taskID).Scan(&gotConversationID, &actionURL); err != nil {
+		t.Fatalf("load notification: %v", err)
+	}
+	if gotConversationID != conversationID {
+		t.Fatalf("notification conversation ID = %q, want %q", gotConversationID, conversationID)
+	}
+	wantURL := "/projects/" + projectID + "/conversations/" + conversationID
+	if actionURL != wantURL {
+		t.Fatalf("notification URL = %q, want %q", actionURL, wantURL)
+	}
+}
+
+func TestTaskStatusNotificationUsesDescriptionForUntitledTaskAndDeduplicates(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/tasks", bytes.NewBufferString(`{"title":"","description":"修复通知中的空任务名称","acceptanceCriteria":"","priority":"normal"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create untitled task: %d body=%s", response.Code, response.Body.String())
+	}
+	var task Task
+	if err := json.NewDecoder(response.Body).Decode(&task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+
+	server.notifyTaskStatusChange(context.Background(), task.ID, taskDone)
+	server.notifyTaskStatusChange(context.Background(), task.ID, taskDone)
+
+	var count int
+	var body string
+	if err := server.db.QueryRow(`select count(*), max(body) from notifications where task_id=? and type='task.done'`, task.ID).Scan(&count, &body); err != nil {
+		t.Fatalf("load notification: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("notification count = %d, want 1", count)
+	}
+	if !strings.Contains(body, "修复通知中的空任务名称") || strings.Contains(body, "任务「」") {
+		t.Fatalf("notification body = %q, want task description fallback", body)
+	}
+}
+
+func TestOrchestrationNotificationsUseDescriptionForUntitledTask(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/tasks", bytes.NewBufferString(`{"title":"","description":"修复编排通知中的空任务名称","acceptanceCriteria":"","priority":"normal"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create untitled task: %d body=%s", response.Code, response.Body.String())
+	}
+	var task Task
+	if err := json.NewDecoder(response.Body).Decode(&task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	job := OrchestrationJob{ProjectID: projectID, TaskID: task.ID}
+	server.notifyOrchestrationNeedsHuman(context.Background(), job, errors.New("verification failed"))
+	server.notifyOrchestrationRetry(context.Background(), job, errors.New("retrying"))
+	server.notifyOrchestrationPaused(context.Background(), projectID, task.ID)
+	server.notifyOrchestrationResumed(context.Background(), projectID, task.ID)
+
+	rows, err := server.db.Query(`select body from notifications where task_id=? order by created_at,id`, task.ID)
+	if err != nil {
+		t.Fatalf("load orchestration notifications: %v", err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var body string
+		if err := rows.Scan(&body); err != nil {
+			t.Fatalf("scan notification body: %v", err)
+		}
+		count++
+		if !strings.Contains(body, "修复编排通知中的空任务名称") || strings.Contains(body, "任务「」") {
+			t.Fatalf("notification body=%q, want task description fallback", body)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate orchestration notifications: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("notification count=%d, want 4", count)
+	}
+}
+
+func TestMigrateNotificationsAddsDedupeKeyToExistingTable(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`create table notifications (
+		id text primary key,
+		type text not null,
+		project_id text not null,
+		project_name text not null default '',
+		conversation_id text not null default '',
+		task_id text not null default '',
+		title text not null,
+		body text not null,
+		priority text not null default 'normal',
+		action_url text not null,
+		dismissed integer not null default 0,
+		created_at datetime not null
+	)`); err != nil {
+		t.Fatalf("create legacy notifications table: %v", err)
+	}
+	server := &Server{db: db}
+	if err := server.migrateNotifications(context.Background()); err != nil {
+		t.Fatalf("migrate notifications: %v", err)
+	}
+	if _, err := db.Exec(`insert into notifications (id,type,project_id,title,body,priority,action_url,created_at,dedupe_key) values ('first','task.done','project','title','body','normal','/','2026-01-01','same-event')`); err != nil {
+		t.Fatalf("insert first deduplicated notification: %v", err)
+	}
+	if _, err := db.Exec(`insert into notifications (id,type,project_id,title,body,priority,action_url,created_at,dedupe_key) values ('second','task.done','project','title','body','normal','/','2026-01-01','same-event')`); err == nil {
+		t.Fatal("duplicate dedupe key was accepted")
 	}
 }
 
@@ -3909,6 +4480,31 @@ func TestProjectWorkspaceLeaseExcludesOtherOwners(t *testing.T) {
 		t.Fatal("workspace lease did not release after the final holder exited")
 	}
 	otherRelease()
+}
+
+func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
+	workspace := localizedHTTPErrorText(http.StatusConflict, errors.New("project workspace is occupied by another run or Git operation"))
+	if workspace != "项目工作区正被其他 AI 任务或 Git 操作占用，请等待当前操作完成后重试。" {
+		t.Fatalf("workspace error = %q", workspace)
+	}
+
+	unknown := localizedHTTPErrorText(http.StatusInternalServerError, errors.New("database connection refused"))
+	if unknown != "服务内部错误，请稍后重试。" {
+		t.Fatalf("unknown error = %q", unknown)
+	}
+
+	known := localizedHTTPErrorText(http.StatusBadRequest, errors.New("invalid JSON request"))
+	if known != "请求内容不是有效的 JSON。" {
+		t.Fatalf("known error = %q", known)
+	}
+
+	mixed := localizedHTTPErrorText(http.StatusBadRequest, errors.New("无法读取目录：permission denied"))
+	if mixed != "请求参数无效，请检查后重试。" {
+		t.Fatalf("mixed error = %q", mixed)
+	}
+	if code := httpErrorCode(errors.New("cannot stop a run while this conversation has other queued or running runs")); code != "active_runs_present" {
+		t.Fatalf("stop conflict code = %q", code)
+	}
 }
 
 func TestRecoverGitPushWithUnknownResultNeedsAttention(t *testing.T) {

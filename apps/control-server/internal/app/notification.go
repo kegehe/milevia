@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,7 @@ type NotificationEvent struct {
 	Priority       string    `json:"priority"` // "high" | "normal" | "low"
 	ActionURL      string    `json:"actionUrl"`
 	CreatedAt      time.Time `json:"createdAt"`
+	DedupeKey      string    `json:"-"`
 }
 
 type notificationSubscriber struct {
@@ -63,9 +66,11 @@ func (s *Server) migrateNotifications(ctx context.Context) error {
 	priority text not null default 'normal',
 	action_url text not null,
 	dismissed integer not null default 0,
-	created_at datetime not null
+	created_at datetime not null,
+	dedupe_key text not null default ''
 );
-create index if not exists idx_notifications_dismissed on notifications(dismissed, created_at desc);`)
+create index if not exists idx_notifications_dismissed on notifications(dismissed, created_at desc);
+`)
 	if err != nil {
 		return err
 	}
@@ -73,7 +78,9 @@ create index if not exists idx_notifications_dismissed on notifications(dismisse
 	s.db.ExecContext(ctx, `alter table notifications add column project_name text not null default ''`)
 	s.db.ExecContext(ctx, `alter table notifications add column conversation_id text not null default ''`)
 	s.db.ExecContext(ctx, `alter table notifications add column task_id text not null default ''`)
-	return nil
+	s.db.ExecContext(ctx, `alter table notifications add column dedupe_key text not null default ''`)
+	_, err = s.db.ExecContext(ctx, `create unique index if not exists idx_notifications_dedupe_key on notifications(dedupe_key) where dedupe_key<>''`)
+	return err
 }
 
 // --- WebSocket 端点 ---
@@ -142,13 +149,16 @@ func (s *Server) broadcastNotification(event NotificationEvent) {
 	// 1. 持久化到 notifications 表（冗余存储 project_name/conversation_id/task_id，项目删除后仍可显示）
 	s.notificationMu.Lock()
 	event.CreatedAt = time.Now().UTC()
-	_, err := s.db.ExecContext(s.runtimeCtx,
-		`insert into notifications (id, type, project_id, project_name, conversation_id, task_id, title, body, priority, action_url, dismissed, created_at) values (?,?,?,?,?,?,?,?,?,?,0,?)`,
-		event.ID, event.Type, event.ProjectID, event.ProjectName, event.ConversationID, event.TaskID, event.Title, event.Body, event.Priority, event.ActionURL, event.CreatedAt)
+	result, err := s.db.ExecContext(s.runtimeCtx,
+		`insert or ignore into notifications (id, type, project_id, project_name, conversation_id, task_id, title, body, priority, action_url, dismissed, created_at, dedupe_key) values (?,?,?,?,?,?,?,?,?,?,0,?,?)`,
+		event.ID, event.Type, event.ProjectID, event.ProjectName, event.ConversationID, event.TaskID, event.Title, event.Body, event.Priority, event.ActionURL, event.CreatedAt, event.DedupeKey)
 	s.notificationMu.Unlock()
 	if err != nil {
 		log.Printf("persist notification %s: %v", event.ID, err)
 		return // 持久化失败则不广播
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed == 0 {
+		return
 	}
 
 	// 2. 广播给所有通知订阅者
@@ -256,7 +266,7 @@ func (s *Server) closeAllNotificationSubscribers() {
 func (s *Server) notifyTaskStatusChange(_ context.Context, taskID, newStatus string) {
 	ctx := s.runtimeCtx
 	var task Task
-	if err := s.db.QueryRowContext(ctx, `select id,project_id,title,status from tasks where id=?`, taskID).Scan(&task.ID, &task.ProjectID, &task.Title, &task.Status); err != nil {
+	if err := s.db.QueryRowContext(ctx, `select id,project_id,title,description,status,updated_at from tasks where id=?`, taskID).Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.Status, &task.UpdatedAt); err != nil {
 		return
 	}
 	project, err := s.getProjectByID(ctx, task.ProjectID)
@@ -270,59 +280,90 @@ func (s *Server) notifyTaskStatusChange(_ context.Context, taskID, newStatus str
 	case taskAwaitingReview:
 		notifType = "task.awaiting_review"
 		title = "任务等待审查"
-		body = "项目「" + project.Name + "」的任务「" + task.Title + "」已完成，等待审查"
+		body = "项目「" + project.Name + "」的任务「" + taskNotificationTitle(task) + "」已完成，等待审查"
 		priority = "normal"
 	case taskActionRequired:
 		notifType = "task.action_required"
 		title = "任务需要处理"
-		body = "项目「" + project.Name + "」的任务「" + task.Title + "」需要你的操作"
+		body = "项目「" + project.Name + "」的任务「" + taskNotificationTitle(task) + "」需要你的操作"
 		priority = "high"
 	case taskDone:
 		notifType = "task.done"
 		title = "任务已完成"
-		body = "项目「" + project.Name + "」的任务「" + task.Title + "」已完成"
+		body = "项目「" + project.Name + "」的任务「" + taskNotificationTitle(task) + "」已完成"
 		priority = "normal"
 	default:
 		return
 	}
+	conversationID, actionURL := s.taskNotificationTarget(ctx, task.ProjectID, task.ID)
 
 	s.broadcastNotification(NotificationEvent{
-		ID:          uuid.NewString(),
-		Type:        notifType,
-		ProjectID:   task.ProjectID,
-		ProjectName: project.Name,
-		TaskID:      task.ID,
-		Title:       title,
-		Body:        body,
-		Priority:    priority,
-		ActionURL:   "/projects/" + task.ProjectID + "/tasks/" + task.ID,
-		CreatedAt:   time.Now().UTC(),
+		ID:             uuid.NewString(),
+		Type:           notifType,
+		ProjectID:      task.ProjectID,
+		ProjectName:    project.Name,
+		ConversationID: conversationID,
+		TaskID:         task.ID,
+		Title:          title,
+		Body:           body,
+		Priority:       priority,
+		ActionURL:      actionURL,
+		CreatedAt:      time.Now().UTC(),
+		DedupeKey:      "task-status:" + task.ID + ":" + newStatus + ":" + task.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	})
+}
+
+func taskNotificationTitle(task Task) string {
+	if title := strings.TrimSpace(task.Title); title != "" {
+		return title
+	}
+	words := strings.Fields(task.Description)
+	if len(words) == 0 {
+		return "未命名任务"
+	}
+	value := strings.Join(words, " ")
+	runes := []rune(value)
+	if len(runes) > 80 {
+		return string(runes[:80]) + "..."
+	}
+	return value
+}
+
+func (s *Server) taskNotificationTitleByID(ctx context.Context, taskID string) string {
+	var task Task
+	if err := s.db.QueryRowContext(ctx, `select title,description from tasks where id=?`, taskID).Scan(&task.Title, &task.Description); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("taskNotificationTitleByID: load task %s: %v", taskID, err)
+		}
+		return "未命名任务"
+	}
+	return taskNotificationTitle(task)
 }
 
 // notifyOrchestrationNeedsHuman 在编排任务进入 needs_human 状态后调用。
 // 使用 s.runtimeCtx 而非调用者 ctx，避免请求取消导致通知丢失。
 func (s *Server) notifyOrchestrationNeedsHuman(_ context.Context, job OrchestrationJob, cause error) {
 	ctx := s.runtimeCtx
-	var taskTitle string
-	_ = s.db.QueryRowContext(ctx, `select title from tasks where id=?`, job.TaskID).Scan(&taskTitle)
+	taskTitle := s.taskNotificationTitleByID(ctx, job.TaskID)
 	project, err := s.getProjectByID(ctx, job.ProjectID)
 	if err != nil {
 		log.Printf("notifyOrchestrationNeedsHuman: getProjectByID(%s): %v", job.ProjectID, err)
 		return
 	}
+	conversationID, actionURL := s.taskNotificationTarget(ctx, job.ProjectID, job.TaskID)
 
 	s.broadcastNotification(NotificationEvent{
-		ID:          uuid.NewString(),
-		Type:        "orchestration.needs_human",
-		ProjectID:   job.ProjectID,
-		ProjectName: project.Name,
-		TaskID:      job.TaskID,
-		Title:       "编排任务需要人工介入",
-		Body:        "项目「" + project.Name + "」的编排任务「" + taskTitle + "」需要人工介入：" + cause.Error(),
-		Priority:    "high",
-		ActionURL:   "/projects/" + job.ProjectID + "/tasks/" + job.TaskID,
-		CreatedAt:   time.Now().UTC(),
+		ID:             uuid.NewString(),
+		Type:           "orchestration.needs_human",
+		ProjectID:      job.ProjectID,
+		ProjectName:    project.Name,
+		ConversationID: conversationID,
+		TaskID:         job.TaskID,
+		Title:          "编排任务需要人工介入",
+		Body:           "项目「" + project.Name + "」的编排任务「" + taskTitle + "」需要人工介入：" + errorText(cause),
+		Priority:       "high",
+		ActionURL:      actionURL,
+		CreatedAt:      time.Now().UTC(),
 	})
 }
 
@@ -330,25 +371,26 @@ func (s *Server) notifyOrchestrationNeedsHuman(_ context.Context, job Orchestrat
 // 使用 s.runtimeCtx 而非调用者 ctx，避免请求取消导致通知丢失。
 func (s *Server) notifyOrchestrationRetry(_ context.Context, job OrchestrationJob, cause error) {
 	ctx := s.runtimeCtx
-	var taskTitle string
-	_ = s.db.QueryRowContext(ctx, `select title from tasks where id=?`, job.TaskID).Scan(&taskTitle)
+	taskTitle := s.taskNotificationTitleByID(ctx, job.TaskID)
 	project, err := s.getProjectByID(ctx, job.ProjectID)
 	if err != nil {
 		log.Printf("notifyOrchestrationRetry: getProjectByID(%s): %v", job.ProjectID, err)
 		return
 	}
+	conversationID, actionURL := s.taskNotificationTarget(ctx, job.ProjectID, job.TaskID)
 
 	s.broadcastNotification(NotificationEvent{
-		ID:          uuid.NewString(),
-		Type:        "orchestration.retry",
-		ProjectID:   job.ProjectID,
-		ProjectName: project.Name,
-		TaskID:      job.TaskID,
-		Title:       "编排任务正在重试",
-		Body:        "项目「" + project.Name + "」的编排任务「" + taskTitle + "」正在重试：" + cause.Error(),
-		Priority:    "normal",
-		ActionURL:   "/projects/" + job.ProjectID + "/tasks/" + job.TaskID,
-		CreatedAt:   time.Now().UTC(),
+		ID:             uuid.NewString(),
+		Type:           "orchestration.retry",
+		ProjectID:      job.ProjectID,
+		ProjectName:    project.Name,
+		ConversationID: conversationID,
+		TaskID:         job.TaskID,
+		Title:          "编排任务正在重试",
+		Body:           "项目「" + project.Name + "」的编排任务「" + taskTitle + "」正在重试：" + errorText(cause),
+		Priority:       "normal",
+		ActionURL:      actionURL,
+		CreatedAt:      time.Now().UTC(),
 	})
 }
 
@@ -356,25 +398,26 @@ func (s *Server) notifyOrchestrationRetry(_ context.Context, job OrchestrationJo
 // 使用 s.runtimeCtx 而非调用者 ctx，避免请求取消导致通知丢失。
 func (s *Server) notifyOrchestrationPaused(_ context.Context, projectID, taskID string) {
 	ctx := s.runtimeCtx
-	var taskTitle string
-	_ = s.db.QueryRowContext(ctx, `select title from tasks where id=?`, taskID).Scan(&taskTitle)
+	taskTitle := s.taskNotificationTitleByID(ctx, taskID)
 	project, err := s.getProjectByID(ctx, projectID)
 	if err != nil {
 		log.Printf("notifyOrchestrationPaused: getProjectByID(%s): %v", projectID, err)
 		return
 	}
+	conversationID, actionURL := s.taskNotificationTarget(ctx, projectID, taskID)
 
 	s.broadcastNotification(NotificationEvent{
-		ID:          uuid.NewString(),
-		Type:        "orchestration.paused",
-		ProjectID:   projectID,
-		ProjectName: project.Name,
-		TaskID:      taskID,
-		Title:       "编排任务已暂停",
-		Body:        "项目「" + project.Name + "」的编排任务「" + taskTitle + "」已暂停",
-		Priority:    "normal",
-		ActionURL:   "/projects/" + projectID + "/tasks/" + taskID,
-		CreatedAt:   time.Now().UTC(),
+		ID:             uuid.NewString(),
+		Type:           "orchestration.paused",
+		ProjectID:      projectID,
+		ProjectName:    project.Name,
+		ConversationID: conversationID,
+		TaskID:         taskID,
+		Title:          "编排任务已暂停",
+		Body:           "项目「" + project.Name + "」的编排任务「" + taskTitle + "」已暂停",
+		Priority:       "normal",
+		ActionURL:      actionURL,
+		CreatedAt:      time.Now().UTC(),
 	})
 }
 
@@ -382,24 +425,47 @@ func (s *Server) notifyOrchestrationPaused(_ context.Context, projectID, taskID 
 // 使用 s.runtimeCtx 而非调用者 ctx，避免请求取消导致通知丢失。
 func (s *Server) notifyOrchestrationResumed(_ context.Context, projectID, taskID string) {
 	ctx := s.runtimeCtx
-	var taskTitle string
-	_ = s.db.QueryRowContext(ctx, `select title from tasks where id=?`, taskID).Scan(&taskTitle)
+	taskTitle := s.taskNotificationTitleByID(ctx, taskID)
 	project, err := s.getProjectByID(ctx, projectID)
 	if err != nil {
 		log.Printf("notifyOrchestrationResumed: getProjectByID(%s): %v", projectID, err)
 		return
 	}
+	conversationID, actionURL := s.taskNotificationTarget(ctx, projectID, taskID)
 
 	s.broadcastNotification(NotificationEvent{
-		ID:          uuid.NewString(),
-		Type:        "orchestration.resumed",
-		ProjectID:   projectID,
-		ProjectName: project.Name,
-		TaskID:      taskID,
-		Title:       "编排任务已恢复",
-		Body:        "项目「" + project.Name + "」的编排任务「" + taskTitle + "」已恢复执行",
-		Priority:    "normal",
-		ActionURL:   "/projects/" + projectID + "/tasks/" + taskID,
-		CreatedAt:   time.Now().UTC(),
+		ID:             uuid.NewString(),
+		Type:           "orchestration.resumed",
+		ProjectID:      projectID,
+		ProjectName:    project.Name,
+		ConversationID: conversationID,
+		TaskID:         taskID,
+		Title:          "编排任务已恢复",
+		Body:           "项目「" + project.Name + "」的编排任务「" + taskTitle + "」已恢复执行",
+		Priority:       "normal",
+		ActionURL:      actionURL,
+		CreatedAt:      time.Now().UTC(),
 	})
+}
+
+// taskNotificationTarget 让任务相关通知回到发起该任务的会话。
+// 未关联执行记录时，回到项目的当前对话入口。
+func (s *Server) taskNotificationTarget(ctx context.Context, projectID, taskID string) (string, string) {
+	conversationID := ""
+	taskRun, err := s.latestTaskRun(ctx, taskID)
+	if err == nil {
+		conversationID = taskRun.ConversationID
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("taskNotificationTarget: load task run for %s: %v", taskID, err)
+	}
+	if conversationID == "" {
+		if err := s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and is_current=true`, projectID).Scan(&conversationID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("taskNotificationTarget: load current conversation for %s: %v", projectID, err)
+		}
+	}
+	baseURL := "/projects/" + projectID + "/conversations"
+	if conversationID == "" {
+		return "", baseURL
+	}
+	return conversationID, baseURL + "/" + conversationID
 }

@@ -49,9 +49,9 @@ export function FileEditor({ content, stat, isSaving, onChange, onSave, onCancel
         setEditorModule(codemirrorModule);
         setLanguageExt(langExt);
         setLoading(false);
-      } catch (err) {
+      } catch {
         if (cancelled) return;
-        setLoadError(err instanceof Error ? err.message : "加载编辑器失败");
+        setLoadError("无法加载编辑器，请刷新页面后重试。");
         setLoading(false);
       }
     };

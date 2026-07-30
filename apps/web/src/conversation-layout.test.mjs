@@ -10,6 +10,7 @@ const utilsLib = await readFile(new URL("./lib/utils.ts", import.meta.url), "utf
 const projectLayout = await readFile(new URL("./components/ProjectLayout.tsx", import.meta.url), "utf8");
 const conversationPage = await readFile(new URL("./pages/ConversationPage.tsx", import.meta.url), "utf8");
 const taskQueue = await readFile(new URL("./features/tasks/TaskQueue.tsx", import.meta.url), "utf8");
+const taskStyles = await readFile(new URL("./tasks.css", import.meta.url), "utf8");
 const gitWorkbench = await readFile(new URL("./features/git/GitWorkbench.tsx", import.meta.url), "utf8");
 const runPanel = await readFile(new URL("./features/run/ProjectRunPanel.tsx", import.meta.url), "utf8");
 const runStyles = await readFile(new URL("./run.css", import.meta.url), "utf8");
@@ -18,13 +19,62 @@ const workspaceStyles = stylesheet.slice(stylesheet.indexOf("/* Desktop conversa
 
 test("message bubbles use their content width without exceeding the reading measure", () => {
   assert.match(stylesheet, /\.message\s*\{[^}]*display:\s*flex;[^}]*min-width:\s*0;[^}]*width:\s*min\(760px,\s*100%\);[^}]*flex-direction:\s*column;[^}]*align-items:\s*flex-start;/s);
-  assert.match(stylesheet, /\.message\.user\s*\{\s*align-items:\s*flex-end;\s*\}/);
+  assert.match(stylesheet, /\.message\.user\s*\{[^}]*align-items:\s*flex-end;/);
   assert.match(stylesheet, /\.message\s*>\s*\.markdown\s*\{[^}]*box-sizing:\s*border-box;[^}]*width:\s*fit-content;[^}]*max-width:\s*100%;[^}]*min-width:\s*0;/s);
 });
 
-test("desktop canvas uses two working columns without a page inset", () => {
-  assert.match(workspaceStyles, /\.conversation-canvas\s*\{[^}]*width:\s*100%;[^}]*grid-template-columns:\s*minmax\(280px,\s*320px\)\s+minmax\(0,\s*1fr\);[^}]*margin:\s*0;/s);
-  assert.doesNotMatch(workspaceStyles, /chat-right/);
+test("user messages can be copied from an icon-only control", () => {
+  assert.match(conversationPage, /navigator\.clipboard\?\.writeText/);
+  assert.match(conversationPage, /await navigator\.clipboard\.writeText\(content\);\s*return;\s*} catch \{/s);
+  assert.match(conversationPage, /catch \{[\s\S]*?copyWithLegacyClipboard\(content\);/);
+  assert.match(conversationPage, /document\.execCommand\("copy"\)/);
+  assert.match(conversationPage, /try \{\s*textarea\.select\(\);[\s\S]*?\} finally \{\s*textarea\.remove\(\);\s*\}/);
+  assert.match(conversationPage, /isUser && <button className=\{`message-copy/);
+  assert.match(conversationPage, /title=\{copied \? "已复制" : "复制消息"\}/);
+  assert.match(stylesheet, /\.message-copy\s*\{[^}]*width:\s*26px;[^}]*height:\s*26px;[^}]*background:\s*transparent;/s);
+  assert.match(stylesheet, /\.message-copy::before,[\s\S]*?\.message-copy::after/);
+});
+
+test("stopping an unanswered direct prompt restores it to the composer", () => {
+  assert.match(conversationPage, /const pendingUserDrafts = useRef\(new Map<string, string>\(\)\);/);
+  assert.match(conversationPage, /const assistantOutputRuns = useRef\(new Set<string>\(\)\);/);
+  assert.match(conversationPage, /const recordAssistantOutput = useCallback[\s\S]*?if \(outputs\.size > 128\)[\s\S]*?pendingUserDrafts\.current\.delete\(runID\);/);
+  assert.match(conversationPage, /pendingUserDrafts\.current\.set\(data\.runId, data\.message\.content\)/);
+  assert.match(conversationPage, /const draftToRestore = assistantOutputRuns\.current\.has\(runID\) \? undefined : pendingUserDrafts\.current\.get\(runID\);/);
+  assert.match(conversationPage, /const restorePendingUserDraft = \(conversationID: string, routeVersion: number, runID: string, draft: string \| undefined\) => \{\s*if \(!draft \|\| conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;/s);
+  assert.match(conversationPage, /setText\(\(current\) => current === "" \? draft : current\);/);
+  assert.match(conversationPage, /const conversationID = conversation\.id;\s*const routeVersion = conversationRouteVersion\.current;\s*const runID = run;/s);
+  assert.match(conversationPage, /restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
+  assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{ restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
+  assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
+});
+
+test("user messages use the conversation's right edge without reserving task-entry space", () => {
+  assert.match(stylesheet, /\.timeline-entry\.message:has\(\.message\.user\)\s*\{\s*display:\s*flex;\s*justify-content:\s*flex-end;\s*padding-left:\s*34px;\s*padding-right:\s*0;\s*\}/);
+  assert.match(stylesheet, /\.message\.user\s*\{\s*align-items:\s*flex-end;\s*margin-left:\s*auto;\s*margin-right:\s*0;\s*\}/);
+  assert.match(stylesheet, /\.timeline-entry\.message:has\(\.message\.user\)::before\s*\{\s*left:\s*auto;\s*right:\s*24px;\s*\}/);
+  assert.match(stylesheet, /\.chat-center \.scroll-buttons\s*\{[^}]*right:\s*4px;/s);
+  assert.match(stylesheet, /@media \(min-width: 821px\) and \(max-width: 1199px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*right:\s*56px;/s);
+  assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.timeline-entry\.message:has\(\.message\.user\)\s*\{\s*padding-left:\s*20px;\s*padding-right:\s*0;\s*\}/);
+  assert.match(stylesheet, /\.chat-center > \.timeline\s*\{[^}]*padding:\s*32px\s+0\s+20px\s+16px;/s);
+  assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+0\s+max\(32px,\s*var\(--composer-height,\s*0px\)\)\s+16px;/s);
+});
+
+test("desktop canvas uses three working columns without a page inset", () => {
+  assert.match(workspaceStyles, /\.conversation-canvas\s*\{[^}]*width:\s*100%;[^}]*grid-template-columns:\s*minmax\(260px,\s*300px\)\s+minmax\(440px,\s*1fr\)\s+minmax\(280px,\s*340px\);[^}]*margin:\s*0;/s);
+  assert.match(conversationPage, /<aside className="quick-tag-rail"[\s\S]*?<section className="chat-center">[\s\S]*?<aside className="task-queue-rail"/);
+});
+
+test("stop and clear retries with force and reports a force-stop failure", () => {
+  assert.match(conversationPage, /\/api\/runs\/\$\{runID\}\/stop\?force=true/);
+  assert.match(conversationPage, /function requiresForceStop\(cause: unknown\): boolean[\s\S]*?active_runs_present/);
+  assert.match(conversationPage, /if \(requiresForceStop\(cause\)\)/);
+  assert.doesNotMatch(conversationPage, /message\.includes\("queued"\)/);
+  assert.match(conversationPage, /const result = await stopRunInternal\(false\);\s*if \(result !== "stopping"\) setStopping\(false\);/s);
+  assert.match(conversationPage, /projectApi<\{ conversation: Conversation; activeRunId: string \| null \}>\(`\/api\/conversations\/\$\{conversationID\}\?limit=1`\)/);
+  assert.match(conversationPage, /status\.conversation\.status === "idle" && !status\.activeRunId/);
+  assert.match(conversationPage, /await stopRunInternal\(true\);\s*}\s*catch \(forceCause\) \{\s*fail\(forceCause instanceof Error \? forceCause\.message : "无法强制停止任务"\);\s*setStopping\(false\);\s*return;/s);
+  assert.doesNotMatch(conversationPage, /try \{ await stopRunInternal\(true\); \} catch \{ \/\* best effort \*\/ \}/);
 });
 
 test("head actions portal into the project header so the canvas grid stays clean", () => {
@@ -37,23 +87,52 @@ test("head actions portal into the project header so the canvas grid stays clean
   assert.match(stylesheet, /\.head-actions-slot\s*\{/);
 });
 
-test("desktop conversation is a full-height two-column workspace", () => {
+test("project workspaces expose global request failures", () => {
+  assert.match(projectLayout, /const \{ error: globalError, setError: setGlobalError, refreshProjects \} = useProjectContext\(\);/);
+  assert.match(projectLayout, /\{globalError && <div className="error" role="alert"><span>\{globalError\}<\/span><button type="button" title="关闭错误提示" onClick=\{\(\) => setGlobalError\(""\)\}>x<\/button><\/div>\}/);
+});
+
+test("desktop conversation is a full-height three-column workspace", () => {
   assert.match(workspaceStyles, /\.chat\s*\{[^}]*height:\s*100dvh;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
-  assert.match(workspaceStyles, /\.conversation-canvas\s*\{[^}]*width:\s*100%;[^}]*min-height:\s*0;[^}]*grid-template-columns:\s*minmax\(280px,\s*320px\)\s+minmax\(0,\s*1fr\);/s);
+  assert.match(workspaceStyles, /\.conversation-canvas\s*\{[^}]*position:\s*relative;[^}]*width:\s*100%;[^}]*min-height:\s*0;[^}]*grid-template-columns:\s*minmax\(260px,\s*300px\)\s+minmax\(440px,\s*1fr\)\s+minmax\(280px,\s*340px\);/s);
   assert.match(workspaceStyles, /\.quick-tag-rail\s*\{[^}]*align-self:\s*stretch;[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s);
+  assert.match(workspaceStyles, /\.task-queue-rail\s*\{[^}]*display:\s*flex;[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*border-left:/s);
+  assert.match(workspaceStyles, /\.task-queue-rail \.task-queue-list\s*\{[^}]*min-height:\s*0;[^}]*flex:\s*1;[^}]*overflow-y:\s*auto;/s);
   assert.match(workspaceStyles, /\.chat-center\s*\{[^}]*display:\s*grid;[^}]*min-height:\s*0;[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+auto;/s);
   assert.match(workspaceStyles, /\.chat-center > \.timeline\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s);
   assert.match(workspaceStyles, /\.chat-center > \.composer\s*\{[^}]*position:\s*static;/s);
-  assert.doesNotMatch(conversationPage, /chat-right/);
+  assert.match(workspaceStyles, /@media \(min-width: 821px\) and \(max-width: 1199px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*position:\s*absolute;[^}]*top:\s*16px;[^}]*right:\s*56px;/s);
+  assert.match(workspaceStyles, /@media \(max-width: 820px\)[\s\S]*?\.conversation-canvas\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);[^}]*grid-template-rows:\s*auto\s+auto\s+minmax\(0,\s*1fr\);/s);
+  assert.match(workspaceStyles, /@media \(max-width: 820px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/s);
+});
+
+test("task queue has one named landmark", () => {
+  assert.match(conversationPage, /<aside className="task-queue-rail" aria-label="任务队列">/);
+  assert.match(taskQueue, /return <div className=\{`task-queue \$\{mobileOpen \? "mobile-open" : ""\}`\}>/);
+  assert.doesNotMatch(taskQueue, /<section className=\{`task-queue[^>]*aria-label="任务队列"/);
+});
+
+test("shortcut and task cards keep their intrinsic row heights", () => {
+  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*align-content:\s*start;[^}]*gap:\s*10px;/s);
+  assert.match(taskStyles, /\.task-queue-list\s*\{[^}]*align-content:\s*start;[^}]*gap:\s*6px;/s);
 });
 
 test("conversation content reserves space for its controls without legacy footer padding", () => {
-  assert.match(workspaceStyles, /\.chat-center > \.timeline\s*\{[^}]*padding:\s*32px\s+16px\s+20px;/s);
-  assert.match(workspaceStyles, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+56px\s+max\(32px, var\(--composer-height, 0px\)\)\s+16px;/);
+  assert.match(workspaceStyles, /\.chat-center > \.timeline\s*\{[^}]*padding:\s*32px\s+0\s+20px\s+16px;/s);
+  assert.match(workspaceStyles, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+0\s+max\(32px, var\(--composer-height, 0px\)\)\s+16px;/);
   assert.doesNotMatch(workspaceStyles, /padding-bottom:\s*(?:130|160)px;/);
   assert.match(conversationPage, /const updateBottomSafeArea = \(\) => \{\s*const followBottom = userNearBottom\.current;\s*timelineElement\.style\.setProperty\("--composer-height", `\$\{Math\.ceil\(composer\.getBoundingClientRect\(\)\.height\)\}px`\);\s*if \(!followBottom\) return;/s);
   assert.match(conversationPage, /const observer = new ResizeObserver\(updateBottomSafeArea\);/);
   assert.match(conversationPage, /if \(userNearBottom\.current\) scrollToBottom\("auto"\);/);
+});
+
+test("Codex and Claude use the same version check and update controls", () => {
+  assert.match(conversationPage, /const agentPath = agentID === "codex" \? "codex" : "claude";/);
+  assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/\$\{agentPath\}\/check-update/);
+  assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/\$\{agentPath\}\/update/);
+  assert.match(conversationPage, /!run && tool\?\.status === "ready" && <button className="runner-inline-btn"/);
+  assert.match(conversationPage, /确认更新 \{toolName\}/);
+  assert.doesNotMatch(conversationPage, /status: "ready" as const/);
 });
 
 test("approval and task-board views keep working inside the workspace", () => {
@@ -82,7 +161,7 @@ test("Git workbench and project runner are first-class workspace tabs", () => {
   assert.match(runStyles, /\.run-sidebar\s*\{[^}]*width:\s*340px;[^}]*overflow-y:\s*auto;/s);
   // 日志终端使用深色高对比度底色，并保留 ANSI 语义颜色。
   assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*background:\s*#172b27;[^}]*color:\s*#d9e8df;/s);
-  assert.match(runPanel, /toAnsiSegments\(entry\.text\)/);
+  assert.match(runPanel, /toAnsiSegments\(runLogText\(entry\)\)/);
   assert.match(runStyles, /\.ansi-green, \.ansi-bright-green\s*\{\s*color:\s*#a9e57e;/);
   // 移动端回退为上下布局
   assert.match(runStyles, /@media \(max-width: 820px\)\s*\{[\s\S]*?\.run-body\s*\{[^}]*flex-direction:\s*column;[^}]*overflow-y:\s*auto;/s);
@@ -99,11 +178,15 @@ test("conversation follows streaming updates and explicitly follows dispatched m
   assert.match(timelineLib, /function timelineContentVersion\(timeline: TimelineItem\[\], executions: AgentExecution\[\]\): string/);
   assert.match(conversationPage, /const visibleContentVersion = useMemo\(\(\) => timelineContentVersion\(timeline, agentExecutions\), \[timeline, agentExecutions\]\);/);
   assert.match(conversationPage, /scrollToBottom\("auto"\);/);
-  assert.match(conversationPage, /\[visibleContentVersion, run, pendingApproval, scrollToBottom\]/);
+  assert.match(conversationPage, /\[visibleContentVersion, run, pendingApproval, scrollToBottomNextFrame\]/);
   assert.doesNotMatch(conversationPage, /\[timeline\.length, run, pendingApproval, scrollToBottom\]/);
-  assert.match(conversationPage, /if \(isNarrowConversationLayout\(\)\) \{\s*window\.scrollTo\(\{ top: document\.documentElement\.scrollHeight, behavior \}\);/s);
+  // 窄屏下 timeline overflow: visible，滚动容器是 window
+  assert.match(conversationPage, /if \(isNarrowConversationLayout\(\)\) \{\s*\/\/ 窄屏下 timeline overflow: visible/s);
+  assert.match(conversationPage, /window\.scrollTo\(\{ top: document\.documentElement\.scrollHeight, behavior \}\);/);
   assert.match(conversationPage, /container\.scrollTo\(\{ top: Math\.max\(0, container\.scrollHeight - container\.clientHeight\), behavior \}\);/);
-  assert.match(conversationPage, /const followAfterDispatch = useCallback\(\(\) => \{\s*userNearBottom\.current = true;\s*setHasNewContent\(false\);\s*requestAnimationFrame\(\(\) => scrollToBottom\("auto"\)\);/s);
+  // scrollToBottomNextFrame 延迟一帧确保 DOM 更新后再读取 scrollHeight
+  assert.match(conversationPage, /const scrollToBottomNextFrame = useCallback\(\(behavior: ScrollBehavior = "auto"\) => \{\s*requestAnimationFrame\(\(\) => scrollToBottom\(behavior\)\);/s);
+  assert.match(conversationPage, /const followAfterDispatch = useCallback\(\(\) => \{\s*userNearBottom\.current = true;\s*setHasNewContent\(false\);\s*scrollToBottomNextFrame\("auto"\);/s);
   assert.match(conversationPage, /setRun\(finishedRunIds\.current\.has\(data\.runId\) \? "" : data\.runId\);\s*followAfterDispatch\(\);/);
   assert.match(utilsLib, /export function isNarrowConversationLayout/);
   assert.match(conversationPage, /useEffect\(\(\) => \{\s*userNearBottom\.current = true;\s*setHasNewContent\(false\);/s);
@@ -133,15 +216,16 @@ test("clearing context starts a fresh conversation with the current agent and po
   assert.match(conversationPage, /const clearConversationContext = \(\) => \{/);
   assert.match(conversationPage, /title: "清空上下文"/);
   assert.match(conversationPage, /message: "将开始一个新的空白会话，当前内容仍可在历史会话中恢复。"/);
-  assert.match(conversationPage, /const clearCurrentConversation = async \(\) => \{/);
+  assert.match(conversationPage, /const clearCurrentConversation = async \(skipRunGuard = false\) => \{/);
   assert.match(conversationPage, /`\/api\/conversations\/\$\{conversationID\}\/clear`/);
-  assert.match(conversationPage, /if \(!conversation \|\| sending \|\| clearing \|\| shortcutBusy\) return;/);
-  assert.match(conversationPage, /if \(!conversation \|\| sending \|\| clearing \|\| shortcutBusy\) return;/);
+  assert.match(conversationPage, /if \(!conversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
+  assert.match(conversationPage, /if \(!conversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
   assert.match(conversationPage, /const isCurrentConversation = \(\) => !cancelled && conversationRef\.current\?\.id === conversation\.id;/);
   assert.match(conversationPage, /socket\.onmessage = \(raw\) => \{\s*if \(!isCurrentConversation\(\)\) return;/s);
-  assert.match(conversationPage, /if \(sending \|\| clearing \|\| shortcutBusy\) \{ closeHistory\(\); return; \}/);
-  assert.match(conversationPage, /disabled=\{!!run \|\| clearing \|\| changingPermission\}/);
-  assert.match(conversationPage, /if \(!conversation \|\| conversation\.permissionMode === permissionMode \|\| run \|\| clearing\) return;/);
+  assert.match(conversationPage, /if \(sending \|\| clearing \|\| stopping \|\| shortcutBusy\) \{ closeHistory\(\); return; \}/);
+  assert.match(conversationPage, /disabled=\{!!run \|\| clearing \|\| stopping \|\| changingPermission\}/);
+  assert.match(conversationPage, /if \(!conversation \|\| conversation\.permissionMode === permissionMode \|\| run \|\| clearing \|\| stopping\) return;/);
+  assert.match(conversationPage, /if \(!conversation \|\| run \|\| clearing \|\| stopping\) return;/);
   assert.match(conversationPage, /const current = list\.find\(\(item\) => item\.isCurrent\);/);
   assert.match(conversationPage, /if \(conversationRef\.current\?\.id !== conversationID\) return;\s*setConversation\(updated\);/s);
   assert.match(conversationPage, /const conversationTransitionRef = useRef\(false\);/);
@@ -152,12 +236,12 @@ test("clearing context starts a fresh conversation with the current agent and po
   assert.match(conversationPage, /const clearStillOwnsView = \(\) =>/);
   assert.match(conversationPage, /conversationRouteVersion\.current === routeVersion/);
   assert.match(conversationPage, /setHasNewContent\(false\); userNearBottom\.current = true;/);
-  assert.match(conversationPage, /<TaskQueue projectID=\{project\.id\} conversationID=\{conversation\?\.id \|\| ""\}/);
+  assert.match(conversationPage, /<TaskQueue projectID=\{project\.id\} conversationID=\{conversation\?\.id \|\| ""\}[\s\S]*?dispatchDisabled=\{clearing \|\| stopping \|\| !conversation\}/);
   assert.match(taskQueue, /conversationId: dispatchConversationID/);
   assert.match(taskQueue, /conversationIDRef\.current !== dispatchConversationID/);
   assert.match(taskQueue, /setDispatching\(false\);\s*setRedispatchingTaskID\(null\);/);
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
-  assert.match(conversationPage, /<button className="secondary" type="button" disabled=\{Boolean\(run\) \|\| sending \|\| clearing \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}>清空<\/button><button className="secondary" type="button" disabled=\{sending \|\| clearing\} onClick=\{\(\) => void sendContent\("继续", false\)\}>继续<\/button>/);
+  assert.match(conversationPage, /<button className="secondary" type="button" disabled=\{sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}>清空<\/button><button className="secondary" type="button" disabled=\{sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}>继续<\/button>/);
 });
 
 test("creating a conversation keeps the newly navigated route", () => {
@@ -177,7 +261,9 @@ test("wide screens render aligned shortcut rows and narrow screens keep grouped 
   assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-row\s*\{[^}]*display:\s*none;/);
   assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-mobile\s*\{[^}]*display:\s*grid;/);
   assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-mobile \.quick-tag > button:first-child,\s*\.quick-actions-mobile \.quick-tag-empty\s*\{[^}]*flex:\s*1;[^}]*max-width:\s*none;/);
+  assert.match(stylesheet, /\.quick-actions-row \.quick-tag > button:first-child,\s*\.quick-actions-row \.quick-tag-empty\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
   assert.match(conversationPage, /const shortcutRowCount = Math\.max\(promptShortcutItems\.length, commandShortcutItems\.length\);/);
+  assert.match(conversationPage, /title=\{shortcut\.enabled \? shortcut\.template : `\$\{shortcut\.template\}\\n\\n\$\{shortcut\.name\}已停用`\}/);
   assert.match(conversationPage, /className="quick-tag-slot"/);
   assert.doesNotMatch(stylesheet, /\.quick-actions-row\s*\{[^}]*overflow-x:\s*auto/s);
 });
@@ -199,4 +285,10 @@ test("agent work is progressive: primary chat stays clean and trace details rema
   assert.match(conversationPage, /setEvents\(\(current\) => mergeConversationItems\(data\.events, current\)\)/);
   assert.match(stylesheet, /\.agent-execution-card\s*\{/);
   assert.match(stylesheet, /\.agent-execution-dialog\s*\{/);
+});
+
+test("known Codex stdin notices do not render as errors", () => {
+  assert.match(timelineLib, /const ignoredCodexStderr = new Set\(\["Reading additional input from stdin\.\.\."\]\);/);
+  assert.match(timelineLib, /function isIgnoredCLIStderr\(message: string\): boolean/);
+  assert.match(timelineLib, /event\.type === "stderr"[\s\S]*?!isIgnoredCLIStderr\(payload\.message\)/);
 });

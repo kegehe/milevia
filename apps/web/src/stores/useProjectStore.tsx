@@ -42,7 +42,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         });
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Unable to load projects");
+      setError(cause instanceof Error ? cause.message : "无法加载项目列表");
     }
   }, []);
 

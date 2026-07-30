@@ -52,6 +52,20 @@ func TestCodexOutputRedactsSensitiveValues(t *testing.T) {
 	}
 }
 
+func TestReadCodexStderrSkipsAdditionalStdinNotice(t *testing.T) {
+	sink := &codexPayloadSink{}
+	readCodexStderr(strings.NewReader(codexAdditionalStdinNotice+"\nactual Codex diagnostic\n"), sink)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.events) != 1 || sink.events[0] != "stderr" {
+		t.Fatalf("events = %#v", sink.events)
+	}
+	if len(sink.payloads) != 1 || !strings.Contains(sink.payloads[0], "actual Codex diagnostic") {
+		t.Fatalf("payloads = %#v", sink.payloads)
+	}
+}
+
 func TestCodexSandbox(t *testing.T) {
 	if value, err := codexSandbox("workspace_write"); err != nil || value != "workspace-write" {
 		t.Fatalf("workspace policy = %q, %v", value, err)
@@ -61,6 +75,48 @@ func TestCodexSandbox(t *testing.T) {
 	}
 	if _, err := codexSandbox("approval_required"); err == nil {
 		t.Fatal("expected unsupported policy error")
+	}
+}
+
+func TestCodexCheckUpdateQueriesOfficialNPMPackage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fixture uses POSIX shell scripts")
+	}
+	dir := t.TempDir()
+	codexPath := filepath.Join(dir, "codex")
+	npmPath := filepath.Join(dir, "npm")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nprintf 'codex-cli 0.145.0\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write Codex fixture: %v", err)
+	}
+	if err := os.WriteFile(npmPath, []byte("#!/bin/sh\n[ \"$1\" = view ] && [ \"$2\" = @openai/codex ] && [ \"$3\" = version ] || exit 2\nprintf '0.146.0\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write npm fixture: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := newCodexCLIRunner(Config{CodexPath: codexPath})
+	available, latest, err := runner.CheckUpdate(context.Background())
+	if err != nil || !available || latest != "0.146.0" {
+		t.Fatalf("Codex update check: available=%t latest=%q err=%v", available, latest, err)
+	}
+}
+
+func TestCodexUpdateAvailableUsesSemverOrdering(t *testing.T) {
+	tests := []struct {
+		name          string
+		local, latest string
+		want          bool
+	}{
+		{name: "newer latest", local: "0.145.0", latest: "0.146.0", want: true},
+		{name: "local newer", local: "0.147.0", latest: "0.146.0", want: false},
+		{name: "release supersedes prerelease", local: "0.146.0-rc.1", latest: "0.146.0", want: true},
+		{name: "newer prerelease is not downgraded", local: "0.147.0-beta.1", latest: "0.146.0", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := codexUpdateAvailable(test.local, test.latest)
+			if err != nil || got != test.want {
+				t.Fatalf("codexUpdateAvailable(%q, %q) = %t, %v; want %t", test.local, test.latest, got, err, test.want)
+			}
+		})
 	}
 }
 

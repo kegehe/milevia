@@ -1076,7 +1076,7 @@ func (s *Server) retryOrchestrationJob(ctx context.Context, job OrchestrationJob
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,updated_at=? where id=? and lease_token=? and status in ('implementing','checking')`, orchestrationQueued, cause.Error(), now, job.ID, job.LeaseToken)
+	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,updated_at=? where id=? and lease_token=? and status in ('implementing','checking')`, orchestrationQueued, errorText(cause), now, job.ID, job.LeaseToken)
 	if err != nil {
 		s.failOrchestrationJob(ctx, job, err)
 		return
@@ -1108,14 +1108,14 @@ func (s *Server) failOrchestrationJob(ctx context.Context, job OrchestrationJob,
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,updated_at=? where id=? and lease_token=? and status not in ('integrated_to_dev','released_to_main')`, orchestrationNeedsHuman, cause.Error(), now, job.ID, job.LeaseToken)
+	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,updated_at=? where id=? and lease_token=? and status not in ('integrated_to_dev','released_to_main')`, orchestrationNeedsHuman, errorText(cause), now, job.ID, job.LeaseToken)
 	if err != nil {
 		return
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return
 	}
-	if _, err = tx.ExecContext(ctx, `update project_orchestration_configs set frozen_reason=?,updated_at=? where project_id=?`, cause.Error(), now, job.ProjectID); err != nil {
+	if _, err = tx.ExecContext(ctx, `update project_orchestration_configs set frozen_reason=?,updated_at=? where project_id=?`, errorText(cause), now, job.ProjectID); err != nil {
 		return
 	}
 	if _, err = tx.ExecContext(ctx, `update orchestration_outbox set status='failed',completed_at=? where job_id=? and status='pending'`, now, job.ID); err != nil {

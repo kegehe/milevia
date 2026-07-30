@@ -765,7 +765,7 @@ func (s *sshAgentSession) readOutputLoop() error {
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
-			s.emit("stream.error", mustJSON(map[string]string{"error": err.Error()}), false)
+			s.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
 			continue
 		}
 		s.noteStreamEvent(envelope.Type, envelope.Message.Content)
@@ -1012,7 +1012,7 @@ func readClaudeJSONLines(reader io.Reader, sink AgentRunSink) error {
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
-			sink.Event("stream.error", mustJSON(map[string]string{"error": err.Error()}))
+			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 			continue
 		}
 		sink.Event(envelope.Type, line)

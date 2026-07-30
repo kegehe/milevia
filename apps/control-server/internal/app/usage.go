@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"sort"
 	"time"
@@ -509,6 +508,6 @@ func (s *Server) loadConversationModelUsage(ctx context.Context, conversationID 
 
 func (s *Server) recordUsagePersistenceError(runID, conversationID string, err error) {
 	if err != nil {
-		s.appendEvent(runID, conversationID, "usage.error", mustJSON(map[string]string{"error": fmt.Sprintf("persist usage: %v", err)}))
+		s.appendEvent(runID, conversationID, "usage.error", mustJSON(map[string]string{"error": "无法保存用量统计，请稍后刷新重试。"}))
 	}
 }

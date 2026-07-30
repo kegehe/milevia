@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type LogEntry, type RunConfig, type RunStatusResponse, statusLabels, statusColors } from "./run-model";
+import { type LogEntry, type RunConfig, type RunStatusResponse, runLogPresentation, runLogText, statusLabels, statusColors } from "./run-model";
 import { toAnsiSegments } from "./ansi";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
@@ -42,18 +42,6 @@ function nextEnvironmentVariableKey(envVars: Record<string, string>): string {
 		key = `ENV_VAR_${suffix}`;
 	}
 	return key;
-}
-
-function logStreamLabel(stream: LogEntry["stream"]): string {
-	if (stream === "stderr") return "ERR";
-	if (stream === "system") return "SYS";
-	return "OUT";
-}
-
-function logTone(entry: LogEntry): string {
-	if (entry.stream === "system") return "system";
-	if (entry.stream === "stderr" && /(?:^|\s)(?:error|failed|fatal|panic|exception)\b/i.test(entry.text)) return "is-error";
-	return "";
 }
 
 export function ProjectRunPanel({ projectID, request, fail, active }: { projectID: string; request: Request; fail: (message: string) => void; active: boolean }) {
@@ -246,10 +234,6 @@ export function ProjectRunPanel({ projectID, request, fail, active }: { projectI
 	const uptime = status?.startedAt ? formatUptime(new Date(status.startedAt)) : "";
 
 	return <section id="workspace-panel-run" className="run-panel workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-run" hidden={!active}>
-			<header className="run-panel-head">
-				<div><label>PROJECT RUNNER</label><h2>项目启动</h2></div>
-			</header>
-
 			<div className="run-body">
 				<section className="run-log-section">
 					<header>
@@ -258,13 +242,14 @@ export function ProjectRunPanel({ projectID, request, fail, active }: { projectI
 					</header>
 					<div className="run-log-terminal-wrap">
 						<div ref={logTerminalRef} className="run-log-terminal" onScroll={handleLogScroll}>
-							{logs.length === 0 ? <div className="run-log-empty">尚未有日志输出。配置并启动命令后，日志将显示在此处。</div> : logs.map((entry, i) => (
-								<div key={entry.id || `${entry.timestamp}-${i}`} className={`run-log-line ${entry.stream} ${logTone(entry)}`}>
-									<time>{new Date(entry.timestamp).toLocaleTimeString()}</time>
-									<span className="run-log-stream" aria-label={entry.stream}>{logStreamLabel(entry.stream)}</span>
-									<pre>{toAnsiSegments(entry.text).map((segment, index) => <span key={index} className={segment.className}>{segment.text}</span>)}</pre>
-								</div>
-							))}
+						{logs.length === 0 ? <div className="run-log-empty">尚未有日志输出。配置并启动命令后，日志将显示在此处。</div> : logs.map((entry, i) => {
+							const presentation = runLogPresentation(entry);
+							return <div key={entry.id || `${entry.timestamp}-${i}`} className={`run-log-line ${entry.stream} ${presentation.tone}`}>
+								<time>{new Date(entry.timestamp).toLocaleTimeString()}</time>
+									<span className="run-log-stream" aria-label={presentation.label}>{presentation.label}</span>
+								<pre>{toAnsiSegments(runLogText(entry)).map((segment, index) => <span key={index} className={segment.className}>{segment.text}</span>)}</pre>
+							</div>;
+						})}
 						</div>
 						{hasNewLogs && <button type="button" className="run-log-jump" title="跳转到最新日志" aria-label="跳转到最新日志" onClick={jumpToLatestLogs}>↓</button>}
 					</div>

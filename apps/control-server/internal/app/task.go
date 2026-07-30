@@ -1301,7 +1301,7 @@ func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("cannot stop a task while this conversation has other queued task runs"))
 		return
 	}
-	status, code, err := s.stopRunByID(r.Context(), runID)
+	status, code, err := s.stopRunByID(r.Context(), runID, false)
 	if err != nil {
 		writeError(w, code, err)
 		return

@@ -83,7 +83,11 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   };
 
   const mutate = async (key: string, endpoint: string, payload: Record<string, unknown>, success?: () => void) => {
-    if (!snapshot?.stateToken || !mountedRef.current) return;
+    if (!mountedRef.current) return;
+    if (!snapshot?.stateToken) {
+      fail("Git 状态尚未准备完成，请刷新后重试");
+      return;
+    }
     setMutating(key);
     try {
       const result = await request<GitOperationResult>(`/api/projects/${projectID}/git/${endpoint}`, { method: "POST", body: JSON.stringify({ ...payload, stateToken: snapshot.stateToken }) });
@@ -97,7 +101,10 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
       closeDiff();
       success?.();
     } catch (cause) {
-      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
+      if (mountedRef.current) {
+        fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
+        void reload(true).catch(() => undefined);
+      }
     } finally {
       if (mountedRef.current) setMutating("");
     }
@@ -111,11 +118,10 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   const discardAll = (includeUntracked: boolean) => mutate("discard-all", "discard", { mode: "all", includeUntracked }, () => setConfirmation(null));
 
   return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active}>
-    <header className="git-workbench-head">
-      <div><label>PROJECT REPOSITORY</label><h2>Git 工作台</h2><p>{snapshot?.head.detached ? "HEAD 分离状态" : snapshot?.head.branch || "读取仓库中"}</p></div>
+    <nav className="git-tabs" aria-label="Git 工作台视图">
+      <div className="git-tab-list">{tabs.map((item) => <button type="button" key={item.id} className={tab === item.id ? "active" : ""} aria-pressed={tab === item.id} onClick={() => { setTab(item.id); closeDiff(); }}>{item.label}{item.id === "changes" && changeCount > 0 ? <b>{changeCount}</b> : null}</button>)}</div>
       <div className="git-workbench-actions"><button type="button" className="secondary" disabled={refreshing || Boolean(mutating)} onClick={() => void reload(true)}>{refreshing ? "刷新中" : "刷新"}</button></div>
-    </header>
-    <nav className="git-tabs" aria-label="Git 工作台视图">{tabs.map((item) => <button type="button" key={item.id} className={tab === item.id ? "active" : ""} aria-pressed={tab === item.id} onClick={() => { setTab(item.id); closeDiff(); }}>{item.label}{item.id === "changes" && changeCount > 0 ? <b>{changeCount}</b> : null}</button>)}</nav>
+    </nav>
     <main className="git-workbench-body">
       {loading ? <div className="git-empty">正在读取仓库状态</div> : <>
         {tab === "overview" && <Overview snapshot={snapshot} changeCount={changeCount} />}

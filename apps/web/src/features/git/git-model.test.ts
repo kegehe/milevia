@@ -34,3 +34,10 @@ test("closes destructive confirmations when an operation result is uncertain", (
 
   assert.match(source, /if \(result\.status === "needs_attention"\) \{\s+closeDiff\(\);\s+setConfirmation\(null\);\s+\}/);
 });
+
+test("reports an unavailable Git state instead of silently ignoring a mutation", () => {
+  const source = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /if \(!snapshot\?\.stateToken\) \{\s+fail\("Git 状态尚未准备完成，请刷新后重试"\);\s+return;\s+\}/);
+  assert.match(source, /void reload\(true\)\.catch\(\(\) => undefined\);/);
+});

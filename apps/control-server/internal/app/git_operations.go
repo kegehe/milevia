@@ -108,7 +108,7 @@ func (s *Server) recoverGitOperations(ctx context.Context) error {
 		return fmt.Errorf("iterate interrupted Git operations: %w", err)
 	}
 	for _, operation := range operations {
-		status, errorCode, errorMessage := gitOperationNeedsAttention, "result_unknown", "Control service restarted before the operation result was confirmed"
+		status, errorCode, errorMessage := gitOperationNeedsAttention, "result_unknown", "控制服务在确认 Git 操作结果前已重启，请刷新并检查工作区。"
 		if operation.typ == "commit" && recoveredGitCommit(ctx, operation.path, operation.afterState) {
 			status, errorCode, errorMessage = gitOperationSucceeded, "", ""
 		}

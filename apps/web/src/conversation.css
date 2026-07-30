@@ -148,10 +148,20 @@
 /* 消息圆点按说话方分色：AI 消息用主题默认灰绿，用户消息用主题强调色区分。
    tool/error 色由主题层(style.css)控制，此处不再覆盖。 */
 .timeline-entry.message:has(.message.user)::before { background: #2c7567; }
-/* 用户消息靠右，圆点跟随到右侧，避免与内容割裂。
+/* 用户消息直接以对话区右边为基准。整张消息卡片（头像、标题、气泡）由
+   行容器右对齐，任务入口的位置不能反过来挤压消息内容。
    .user 在内层 <article class="message user"> 上，timeline-entry 本身无 user class，故用 :has 定位 */
-.timeline-entry.message:has(.message.user) { padding-left: 0; padding-right: 34px; }
-.timeline-entry.message:has(.message.user)::before { left: auto; right: 0; }
+.timeline-entry.message:has(.message.user) {
+  display: flex;
+  justify-content: flex-end;
+  padding-left: 34px;
+  padding-right: 0;
+}
+/* 圆点置于头像左侧，既保持右侧消息的识别，也不覆盖头像。 */
+.timeline-entry.message:has(.message.user)::before {
+  left: auto;
+  right: 24px;
+}
 
 /* ---- 消息卡片 ------------------------------------------------------------ */
 .message {
@@ -164,7 +174,7 @@
   align-items: flex-start;
   overflow-wrap: anywhere;
 }
-.message.user { align-items: flex-end; }
+.message.user { align-items: flex-end; margin-left: auto; margin-right: 0; }
 .message > .markdown {
   box-sizing: border-box;
   width: fit-content;
@@ -197,6 +207,33 @@
 }
 .message.user .message-avatar { color: #245d52; background: var(--accent-soft); }
 .message.user > header { justify-content: flex-end; }
+.message-copy {
+  position: relative;
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  margin-top: 3px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  color: #56776d;
+  background: transparent;
+}
+.message-copy::before,
+.message-copy::after {
+  position: absolute;
+  width: 9px;
+  height: 11px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  content: "";
+}
+.message-copy::before { transform: translate(-2px, -2px); opacity: .72; }
+.message-copy::after { transform: translate(2px, 2px); background: #fbfefb; }
+.message-copy:hover { color: #1f5e50; background: #e3f2e9; }
+.message-copy:focus-visible { outline: 2px solid #4f9a8a; outline-offset: 2px; }
+.message-copy.copied { color: #287a48; }
 
 /* ---- 工具卡片 ------------------------------------------------------------ */
 .tool-meta { display: flex; align-items: center; gap: 8px; }
@@ -231,7 +268,7 @@
 }
 .error-card > header b { display: block; color: #542b24; font-size: 13px; }
 .error-card > header time { color: #8c5e55; font-size: 11px; }
-.error-card > p {
+.error-card > pre {
   margin: 0;
   border-top: 1px solid #f0ccc4;
   padding: 10px 13px 12px;
@@ -241,6 +278,7 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
+  font-family: inherit;
 }
 
 /* ---- 运行指示器 ---------------------------------------------------------- */
@@ -699,7 +737,7 @@
 .command-tags .quick-tag-empty:hover,
 .quick-tag-empty.command-tag:hover { border-color: #cf906d; color: #713d27; background: #fff0e8; }
 
-.quick-actions-row { display: grid; gap: 7px; }
+.quick-actions-row { display: grid; align-content: start; gap: 10px; }
 .quick-actions-headings,
 .quick-tag-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .quick-actions-row .quick-tag-heading { padding-bottom: 6px; }
@@ -708,7 +746,7 @@
 .quick-tag-slot { min-height: 30px; }
 .quick-actions-row .quick-tag { align-items: stretch; max-width: none; }
 .quick-actions-row .quick-tag > button:first-child,
-.quick-actions-row .quick-tag-empty { min-width: 0; padding: 7px 8px; overflow-wrap: anywhere; white-space: normal; }
+.quick-actions-row .quick-tag-empty { min-width: 0; padding: 7px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .quick-actions-row .quick-tag-edit { width: 22px; }
 .quick-tag-slot { border: 1px solid transparent; border-radius: 6px; }
 .quick-actions-mobile { display: none; }
@@ -757,13 +795,14 @@
   overflow: auto;
 }
 
-/* 对话画布 — 双栏：左侧快捷标签 + 右侧对话区 */
+/* 对话画布：快捷操作、对话内容和任务队列三栏独立滚动。 */
 .conversation-canvas {
+  position: relative;
   display: grid;
   width: 100%;
   flex: 1;
   min-height: 0;
-  grid-template-columns: minmax(280px, 320px) minmax(0, 1fr);
+  grid-template-columns: minmax(260px, 300px) minmax(440px, 1fr) minmax(280px, 340px);
   gap: 0;
   margin: 0;
   overflow: hidden;
@@ -784,6 +823,40 @@
   scrollbar-width: thin;
 }
 
+/* 宽屏右侧任务栏：标题和筛选保持可见，任务列表在栏内滚动。 */
+@media (min-width: 1200px) {
+  .task-queue-rail {
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    border-left: 1px solid #cfe0d6;
+    padding: 22px 18px;
+    overflow: hidden;
+  }
+  .task-queue-rail .task-queue {
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+    flex-direction: column;
+    border-top: 0;
+    padding-top: 0;
+  }
+  .task-queue-rail .task-queue-panel {
+    display: flex;
+    min-height: 0;
+    flex: 1;
+    flex-direction: column;
+  }
+  .task-queue-rail .task-queue-list {
+    min-height: 0;
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+  }
+}
+
 /* 右侧对话中心 */
 .chat-center {
   position: relative;
@@ -798,7 +871,8 @@
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 32px 16px 20px;
+  /* 用户消息可直接延伸到对话区右边。 */
+  padding: 32px 0 20px 16px;
 }
 .chat-center > .composer {
   position: static;
@@ -832,12 +906,72 @@
 
 /* ---- 响应式 -------------------------------------------------------------- */
 
+/* 中等宽度：保留左栏和对话宽度，右上入口展开右侧任务抽屉。 */
+@media (min-width: 821px) and (max-width: 1199px) {
+  .conversation-canvas { grid-template-columns: minmax(260px, 300px) minmax(0, 1fr); }
+  .task-queue-rail {
+    position: absolute;
+    top: 16px;
+    right: 56px;
+    z-index: 5;
+    width: 144px;
+    border: 0;
+    padding: 0;
+    overflow: visible;
+  }
+  .task-queue-rail .task-queue { display: block; min-height: auto; flex: none; border-top: 0; padding-top: 0; }
+  .task-queue-rail .task-queue-mobile-toggle {
+    display: flex;
+    width: 100%;
+    min-height: 38px;
+    align-items: center;
+    justify-content: space-between;
+    border: 1px solid #cfe0d6;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #315e50;
+    background: #f8fcf9;
+    font-size: 12px;
+    font-weight: 800;
+  }
+  .task-queue-rail .task-queue-mobile-toggle b {
+    display: grid;
+    min-width: 20px;
+    height: 20px;
+    place-items: center;
+    border-radius: 50%;
+    color: #2c7567;
+    background: #dff0e5;
+    font-size: 10px;
+  }
+  .task-queue-rail .task-queue-panel { display: none; }
+  .task-queue-rail .task-queue.mobile-open .task-queue-panel {
+    position: fixed;
+    z-index: 20;
+    right: 16px;
+    bottom: 72px;
+    display: flex;
+    width: min(380px, calc(100vw - 32px));
+    max-height: min(640px, calc(100dvh - 112px));
+    box-sizing: border-box;
+    overflow: hidden;
+    border: 1px solid #b8d6c9;
+    border-radius: 7px;
+    padding: 14px;
+    background: #fbfefb;
+    box-shadow: 0 16px 42px #17362c40;
+  }
+  .task-queue-rail .task-queue.mobile-open .task-queue-list { min-height: 0; flex: 1; overflow-y: auto; }
+  .task-queue-rail .task-queue.mobile-open .task-queue-mobile-toggle { border-color: #68a995; background: #e6f4eb; }
+  .chat-center > .timeline { padding-top: 76px; }
+}
+
 /* 窄屏：单列布局 */
 @media (max-width: 820px) {
   .timeline::before { left: 23px; }
   .timeline-entry { padding-left: 20px; }
   .timeline-entry::before { left: 16px; }
-  .timeline-entry.message:has(.message.user) { padding-left: 0; padding-right: 20px; }
+  .timeline-entry.message:has(.message.user) { padding-left: 20px; padding-right: 0; }
   .run-indicator { margin-left: 20px; }
   .permission-popover { right: auto; left: 0; }
   .head-actions { position: relative; }
@@ -854,8 +988,10 @@
   .workspace-tabs button { min-height: 40px; padding: 0 12px; }
   .workspace-content { display: flex; flex-direction: column; overflow: visible; flex: 1; min-height: 0; }
   .workspace-content > .workspace-tab-panel { display: flex; flex-direction: column; overflow: visible; flex: 1; min-height: 0; }
-  .conversation-canvas { min-height: 0; overflow: visible; flex: 1; grid-template-rows: 1fr; }
+  .conversation-canvas { min-height: 0; overflow: visible; flex: 1; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); }
   .quick-tag-rail {
+    grid-column: 1;
+    grid-row: 1;
     position: static;
     width: 100%;
     max-height: none;
@@ -864,6 +1000,7 @@
     overflow: visible;
     padding: 14px 16px 0;
   }
+  .task-queue-rail { display: block; grid-column: 1; grid-row: 2; min-height: auto; border: 0; padding: 0 16px; overflow: visible; }
   .quick-actions-row { display: none; }
   .quick-actions-mobile { display: grid; width: 100%; gap: 12px; }
   .quick-actions-mobile .quick-tag-group { display: grid; min-width: 0; gap: 7px; }
@@ -874,8 +1011,8 @@
   .quick-actions-mobile .quick-tag > button:first-child,
   .quick-actions-mobile .quick-tag-empty { flex: 1; max-width: none; }
 
-  .chat-center { display: flex; flex-direction: column; min-height: 0; flex: 1; }
-  .chat-center > .timeline { overflow: visible; padding: 20px 56px max(32px, var(--composer-height, 0px)) 16px; flex: 1; }
+  .chat-center { display: flex; grid-column: 1; grid-row: 3; flex-direction: column; min-height: 0; flex: 1; }
+  .chat-center > .timeline { overflow: visible; padding: 20px 0 max(32px, var(--composer-height, 0px)) 16px; flex: 1; }
   .chat-center > .composer { position: sticky; bottom: 0; padding: 12px 16px; z-index: 2; }
   .chat-center .scroll-buttons {
     position: fixed;

@@ -458,7 +458,7 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
-			sink.Event("stream.error", mustJSON(map[string]string{"error": err.Error()}))
+			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 			continue
 		}
 		sink.Event(envelope.Type, line)
@@ -477,7 +477,7 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		sink.Event("stream.error", mustJSON(map[string]string{"error": err.Error()}))
+		sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 	}
 }
 
@@ -567,7 +567,7 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
-			session.emit("stream.error", mustJSON(map[string]string{"error": err.Error()}), false)
+			session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
 			continue
 		}
 		session.noteStreamEvent(envelope.Type, envelope.Message.Content)
@@ -587,7 +587,7 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		session.emit("stream.error", mustJSON(map[string]string{"error": err.Error()}), false)
+		session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
 	}
 }
 
@@ -598,7 +598,7 @@ func (session *claudeCLISession) readStderr(reader io.Reader) {
 		session.emit("stderr", mustJSON(map[string]string{"message": scanner.Text()}), false)
 	}
 	if err := scanner.Err(); err != nil {
-		session.emit("stream.error", mustJSON(map[string]string{"error": err.Error()}), false)
+		session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
 	}
 }
 
@@ -954,6 +954,6 @@ func (r *claudeCLIRunner) readStderr(reader io.Reader, sink AgentRunSink) {
 		sink.Event("stderr", mustJSON(map[string]string{"message": scanner.Text()}))
 	}
 	if err := scanner.Err(); err != nil {
-		sink.Event("stream.error", mustJSON(map[string]string{"error": err.Error()}))
+		sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 	}
 }

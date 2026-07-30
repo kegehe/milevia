@@ -4,6 +4,48 @@ import type { Event, Message, ToolAction, ToolOutput, AgentExecution, AgentNode,
 import { asRecord } from "./api";
 import { contentToText, agentSummary, toolSummary } from "./utils";
 
+const ignoredCodexStderr = new Set(["Reading additional input from stdin..."]);
+const allowedTechnicalTerms = /\b(?:AI|API|CLI|Codex|Claude|Git|HTTP|ID|JSON|SSH|URL|WSL)\b/g;
+
+function isIgnoredCLIStderr(message: string): boolean {
+  return ignoredCodexStderr.has(message.trim());
+}
+
+function firstText(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function localizedErrorDetail(value: unknown, fallback: string): string {
+  const detail = typeof value === "string" ? value.trim() : "";
+  if (!detail) return fallback;
+  if (!/[\u4e00-\u9fff]/.test(detail)) return fallback;
+  const withoutTechnicalTerms = detail.replace(allowedTechnicalTerms, "");
+  return /[A-Za-z]{3,}/.test(withoutTechnicalTerms) ? fallback : detail;
+}
+
+// Codex emits top-level failures as JSONL events. Depending on the failure
+// phase, its diagnostic is a string or a nested error object.
+function eventErrorDetail(payload: Record<string, any>): string {
+  const nestedError = asRecord(payload.error);
+  return localizedErrorDetail(firstText(
+    payload.message,
+    payload.detail,
+    payload.reason,
+    typeof payload.error === "string" ? payload.error : "",
+    nestedError.message,
+    nestedError.detail,
+    nestedError.reason,
+    nestedError.code,
+  ), "任务执行失败，请查看任务日志后重试。");
+}
+
+function isGenericCodexExit(detail: string): boolean {
+  return /^Codex exited: exit status \d+\.?$/.test(detail.trim());
+}
+
 export function getApproval(event: Event): Approval | null {
   if (!event.type.startsWith("approval.")) return null;
   const payload = asRecord(event.payload);
@@ -19,17 +61,19 @@ export function getApproval(event: Event): Approval | null {
 export function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
   const results = new Map<string, ToolOutput>();
   const runStatuses = new Map<string, string>();
-  const runErrors = new Map<string, string>();
   const approvalStates = new Map<string, ApprovalEvent>();
   for (const event of events) {
     const payload = asRecord(event.payload);
     if (event.type === "user") {
       for (const part of asRecord(payload.message).content || []) {
-        if (part?.type === "tool_result" && part.tool_use_id) results.set(String(part.tool_use_id), { content: contentToText(part.content), isError: Boolean(part.is_error) });
+        if (part?.type === "tool_result" && part.tool_use_id) {
+          const isError = Boolean(part.is_error);
+          const content = contentToText(part.content);
+          results.set(String(part.tool_use_id), { content: isError ? localizedErrorDetail(content, "工具执行失败，请查看任务日志后重试。") : content, isError });
+        }
       }
     }
     if (event.type.startsWith("run.")) runStatuses.set(event.runId, event.type.slice(4));
-    if ((event.type === "run.failed" || event.type === "run.interrupted") && typeof payload.error === "string" && payload.error) runErrors.set(event.runId, payload.error);
     const approval = getApproval(event);
     if (approval) approvalStates.set(approval.approvalId, { approval, runId: event.runId, createdAt: event.createdAt });
   }
@@ -82,31 +126,46 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
       name: itemType === "command_execution" ? "命令" : "文件变更",
       input,
       createdAt: existing?.createdAt || event.createdAt,
-      output: event.type === "item.completed" ? { content: outputText || (failed ? "命令执行失败" : "已完成"), isError: failed } : existing?.output,
+      output: event.type === "item.completed" ? { content: failed ? localizedErrorDetail(outputText, "命令执行失败，请查看任务日志后重试。") : outputText || "已完成", isError: failed } : existing?.output,
       runStatus: runStatuses.get(event.runId),
     });
   }
   tools.push(...codexTools.values());
   const errorItems: TimelineItem[] = [];
-  const seenStderr = new Set<string>();
+  const detailedRuns = new Set<string>();
+  const seenDiagnostics = new Set<string>();
+  const fallbackTerminalFailures: Array<{ event: Event; detail: string }> = [];
+  const addDiagnostic = (event: Event, title: string, detail: string, detailed = true) => {
+    const normalized = detail.trim();
+    if (!normalized) return;
+    const key = `${event.runId}:${normalized}`;
+    if (seenDiagnostics.has(key)) return;
+    seenDiagnostics.add(key);
+    if (detailed) detailedRuns.add(event.runId);
+    errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title, detail: normalized });
+  };
   for (const event of events) {
     const payload = asRecord(event.payload);
-    if ((event.type === "run.failed" || event.type === "run.interrupted") && typeof payload.error === "string" && payload.error) {
-      errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title: event.type === "run.interrupted" ? "执行中断" : "执行失败", detail: payload.error });
-    }
-    if (event.type === "stream.error" && typeof payload.error === "string" && payload.error) {
-      const alreadyFailed = runErrors.has(event.runId);
-      if (!alreadyFailed) {
-        errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title: "流错误", detail: payload.error });
+    const detail = eventErrorDetail(payload);
+    if (event.type === "run.failed" || event.type === "run.interrupted") {
+      if (detail && !isGenericCodexExit(detail)) {
+        addDiagnostic(event, event.type === "run.interrupted" ? "执行中断" : "执行失败", detail);
+      } else if (detail) {
+        fallbackTerminalFailures.push({ event, detail });
       }
+    } else if (event.type === "error" || event.type === "turn.failed") {
+      addDiagnostic(event, "执行错误", detail);
+    } else if (event.type === "stream.error") {
+      addDiagnostic(event, "流错误", detail);
     }
-    if (event.type === "stderr" && typeof payload.message === "string" && payload.message.trim()) {
-      const dedupKey = `${event.runId}:${payload.message.trim()}`;
-      if (!seenStderr.has(dedupKey)) {
-        seenStderr.add(dedupKey);
-        errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title: "CLI 输出", detail: payload.message.trim() });
-      }
+    if (event.type === "stderr" && typeof payload.message === "string" && payload.message.trim() && !isIgnoredCLIStderr(payload.message)) {
+      addDiagnostic(event, "CLI 输出", localizedErrorDetail(payload.message, "工具输出异常，请查看任务日志后重试。"));
     }
+  }
+  // The process exit code is useful only when the CLI provided no actionable
+  // diagnostic in JSONL or stderr for the same run.
+  for (const { event, detail } of fallbackTerminalFailures) {
+    if (!detailedRuns.has(event.runId)) addDiagnostic(event, "执行失败", detail, false);
   }
   const timeline: TimelineItem[] = [
     ...messages.map((message) => ({ kind: "message" as const, id: message.id, createdAt: message.createdAt, message })),
@@ -163,13 +222,14 @@ export function buildAgentExecutions(events: Event[]): AgentExecution[] {
       for (const part of eventMessageParts(event)) {
         if (part.type !== "tool_result" || typeof part.tool_use_id !== "string") continue;
         const ownerID = toolOwners.get(part.tool_use_id);
+        const isError = Boolean(part.is_error);
         const output = contentToText(part.content);
-        appendLog(ownerID, { id: event.id + part.tool_use_id, createdAt: event.createdAt, kind: "result", title: part.is_error ? "工具失败" : "工具结果", detail: output, isError: Boolean(part.is_error) });
+        appendLog(ownerID, { id: event.id + part.tool_use_id, createdAt: event.createdAt, kind: "result", title: isError ? "工具失败" : "工具结果", detail: isError ? localizedErrorDetail(output, "工具执行失败，请查看任务日志后重试。") : output, isError });
         const agent = nodes.get(part.tool_use_id);
         if (agent) agent.status = part.is_error ? "failed" : "completed";
       }
     }
-    if (event.type === "stream.error") appendLog(parentID, { id: event.id, createdAt: event.createdAt, kind: "error", title: "流错误", detail: String(payload.error || "无法读取工具输出"), isError: true });
+    if (event.type === "stream.error") appendLog(parentID, { id: event.id, createdAt: event.createdAt, kind: "error", title: "流错误", detail: localizedErrorDetail(payload.error, "无法读取工具输出，请稍后重试。"), isError: true });
   }
 
   const executions = new Map<string, AgentExecution>();

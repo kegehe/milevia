@@ -15,16 +15,26 @@ export async function api<T>(path: string, init?: RequestInit, retries = retryCo
         ...init,
         headers: { "Content-Type": "application/json", ...init?.headers },
       });
-      if (response.ok) return response.status === 204 ? undefined as T : response.json() as Promise<T>;
+      if (response.ok) {
+        if (response.status === 204 || response.status === 205) return undefined as T;
+        try {
+          return await response.json() as T;
+        } catch (cause: unknown) {
+          if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+          throw new Error("服务响应格式无效，请稍后重试。");
+        }
+      }
       const body = await response.json().catch(() => null);
-      const message = body?.error || `Request failed (${response.status})`;
+      const message = body?.error || `请求失败（状态码 ${response.status}）`;
       if (response.status >= 400 && response.status < 500) {
-        const err = new Error(message) as Error & { status: number };
+        const err = new Error(message) as Error & { status: number; code?: string };
         err.status = response.status;
+        if (typeof body?.code === "string") err.code = body.code;
         throw err;
       }
-      const err5xx = new Error(message) as Error & { status: number };
+      const err5xx = new Error(message) as Error & { status: number; code?: string };
       err5xx.status = response.status;
+      if (typeof body?.code === "string") err5xx.code = body.code;
       lastError = err5xx;
       if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
     } catch (cause: unknown) {

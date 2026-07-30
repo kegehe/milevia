@@ -267,12 +267,12 @@ func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) 
 	defer client.close()
 	checks := map[string]bool{"ssh": false, "sftp": false, "claude": false, "approvalTunnel": false}
 	if _, err := client.execCommand(r.Context(), "echo ok"); err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checks": checks, "error": err.Error()})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checks": checks, "error": errorText(err)})
 		return
 	}
 	checks["ssh"] = true
 	if _, err := client.readDir(r.Context(), connection.RootPath); err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checks": checks, "hostKey": client.lastHostKey, "fingerprint": hostKeyFingerprint(client.lastHostKey), "error": fmt.Sprintf("无法读取根目录：%v", err)})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checks": checks, "hostKey": client.lastHostKey, "fingerprint": hostKeyFingerprint(client.lastHostKey), "error": "无法读取 SSH 根目录，请检查目录路径和访问权限后重试。"})
 		return
 	}
 	checks["sftp"] = true
@@ -282,7 +282,7 @@ func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) 
 	if _, err := client.startApprovalTunnel(r.Context(), s.config.ControlURL); err == nil {
 		checks["approvalTunnel"] = true
 	} else {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checks": checks, "hostKey": client.lastHostKey, "fingerprint": hostKeyFingerprint(client.lastHostKey), "error": err.Error()})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checks": checks, "hostKey": client.lastHostKey, "fingerprint": hostKeyFingerprint(client.lastHostKey), "error": errorText(err)})
 		return
 	}
 	errorText := ""
@@ -416,7 +416,7 @@ func (s *Server) createSSHConnection(w http.ResponseWriter, r *http.Request) {
 			// Save the error message but don't fail the whole request — the connection
 			// config is persisted so the user can adjust and retry.
 			c.Status = "error"
-			c.ErrorMsg = err.Error()
+			c.ErrorMsg = errorText(err)
 			s.db.ExecContext(r.Context(), `update ssh_connections set status=?,error_msg=?,updated_at=? where id=?`, c.Status, c.ErrorMsg, time.Now().UTC(), c.ID)
 		}
 	}
@@ -473,7 +473,7 @@ func (s *Server) testSSHConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	runner, _, err := s.prepareSSHRunner(r.Context(), *c)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": errorText(err)})
 		return
 	}
 	_ = runner.client.close()
@@ -636,7 +636,7 @@ func (s *Server) tryConnectAndRegister(ctx context.Context, c *SSHConnection) er
 	runner, meta, err := s.prepareSSHRunner(ctx, *c)
 	if err != nil {
 		if !hadOldRunner {
-			s.markSSHStatus(ctx, c, "error", err.Error())
+			s.markSSHStatus(ctx, c, "error", errorText(err))
 		}
 		return err
 	}

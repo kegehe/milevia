@@ -324,7 +324,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     setQuickDescription("");
   };
 
-  return <section className={`task-queue ${mobileOpen ? "mobile-open" : ""}`} aria-label="任务队列">
+  return <div className={`task-queue ${mobileOpen ? "mobile-open" : ""}`}>
     <button type="button" className="task-queue-mobile-toggle" aria-expanded={mobileOpen} onClick={() => setMobileOpen((open) => !open)}>任务 <b>{taskCounts.active}</b></button>
     <div className="task-queue-panel">
       <header className="task-queue-head"><div><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions"><button type="button" className="task-queue-add" title="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button></div></header>
@@ -346,7 +346,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     </div>
     {confirmingTask && createPortal(<DispatchConfirmation task={confirmingTask} detail={detail} loading={loadingDetail} dispatching={dispatching} dispatchDisabled={dispatchDisabled} permissionMode={permissionMode} close={closeConfirmation} openBoard={() => openBoard(confirmingTask.id)} dispatch={dispatch} />, document.body)}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
-  </section>;
+  </div>;
 }
 
 function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, inlineReview, openBoard, confirmTransition }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void }) {

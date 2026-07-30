@@ -125,7 +125,8 @@ type Server struct {
 	codexRunner            AgentRunner
 	runnerRegistry         *runnerRegistry
 	runnerMaintenanceMu    sync.Mutex
-	runnerUpdating         map[string]bool
+	runnerUpdating         map[runnerAgentKey]bool
+	runnerUpdateExecuting  map[string]bool
 	projectLifecycleMu     sync.Mutex
 	sshMu                  sync.Mutex
 	sshPrepare             func(context.Context, SSHConnection) (*sshRunner, RunnerMeta, error)
@@ -161,6 +162,12 @@ type Server struct {
 	orchestrationActive    map[string]bool
 	orchestrationWG        sync.WaitGroup
 	orchestrationOwner     string
+}
+
+// runnerAgentKey scopes CLI maintenance to one tool on one Runner.
+type runnerAgentKey struct {
+	runnerID string
+	agentID  string
 }
 
 type subscriber struct {
@@ -210,8 +217,10 @@ type activeAgentSession struct {
 	agent         AgentSession
 	approvalToken string
 	runnerID      string
+	agentID       string
 	activeRunID   string
 	stopping      bool
+	runIDs        map[string]struct{}
 }
 
 // streamingSetup closes the gap between committing a streaming Run and
@@ -396,7 +405,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]*projectRunner{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
+	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]*projectRunner{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return isLocalWebOrigin(r.Header.Get("Origin")) }
 	if err := s.migrate(ctx); err != nil {
 		runtimeStop()
@@ -516,6 +525,8 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/runners", s.listRunners)
 	r.Post("/api/runners/{runnerID}/claude/check-update", s.checkClaudeUpdate)
 	r.Post("/api/runners/{runnerID}/claude/update", s.updateClaude)
+	r.Post("/api/runners/{runnerID}/codex/check-update", s.checkCodexUpdate)
+	r.Post("/api/runners/{runnerID}/codex/update", s.updateCodex)
 	r.Get("/api/directories", s.listDirectories)
 	r.Post("/api/projects/validate", s.validateProject)
 	r.Get("/api/projects", s.listProjects)
@@ -1003,7 +1014,7 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 			return fmt.Errorf("mark interrupted shortcut runs: %w", err)
 		}
 		for _, run := range runs {
-			if err := s.finishTaskRunTx(ctx, tx, run.id, "interrupted", "service restarted before the task run completed", now); err != nil {
+			if err := s.finishTaskRunTx(ctx, tx, run.id, "interrupted", "控制服务在任务完成前已重启，任务已中断。", now); err != nil {
 				return fmt.Errorf("mark interrupted task run: %w", err)
 			}
 		}
@@ -1015,7 +1026,7 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 		return fmt.Errorf("release interrupted conversations: %w", err)
 	}
 	for _, run := range runs {
-		if _, err := tx.ExecContext(ctx, `insert into events (id,conversation_id,run_id,type,payload,created_at) values (?,?,?,?,?,?)`, uuid.NewString(), run.conversationID, run.id, "run.interrupted", mustJSON(map[string]string{"status": "interrupted", "error": "Control service restarted before the run completed."}), now); err != nil {
+		if _, err := tx.ExecContext(ctx, `insert into events (id,conversation_id,run_id,type,payload,created_at) values (?,?,?,?,?,?)`, uuid.NewString(), run.conversationID, run.id, "run.interrupted", mustJSON(map[string]string{"status": "interrupted", "error": "控制服务在任务完成前已重启，任务已中断。"}), now); err != nil {
 			return fmt.Errorf("record interrupted run: %w", err)
 		}
 	}
@@ -1915,7 +1926,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	var activeRunID *string
 	if c.Status == "running" {
 		var runID string
-		if err := s.db.QueryRowContext(r.Context(), `select id from runs where conversation_id=$1 and status='running' order by created_at desc limit 1`, id).Scan(&runID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err := s.db.QueryRowContext(r.Context(), `select id from runs where conversation_id=$1 and status in ('queued','running') order by created_at desc limit 1`, id).Scan(&runID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, 500, err)
 			return
 		} else if err == nil {
@@ -2586,11 +2597,11 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	// locks. updateClaude takes the maintenance lock before querying SQLite.
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
-	if admission.agentID == "claude-code" {
+	if admission.agentID == "claude-code" || admission.agentID == "codex" {
 		s.runnerMaintenanceMu.Lock()
 		defer s.runnerMaintenanceMu.Unlock()
-		if s.runnerUpdating[admission.runnerID] {
-			return Message{}, "", nil, http.StatusConflict, errors.New("Claude Code is being updated on this runner")
+		if s.runnerUpdating[runnerAgentKey{runnerID: admission.runnerID, agentID: admission.agentID}] {
+			return Message{}, "", nil, http.StatusConflict, errors.New("this AI CLI is being updated on this runner")
 		}
 	}
 
@@ -2883,6 +2894,10 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 			return nil, context.Canceled
 		}
 		setup.session = session
+		if session.runIDs == nil {
+			session.runIDs = map[string]struct{}{}
+		}
+		session.runIDs[runID] = struct{}{}
 		s.mu.Unlock()
 		return session.agent, nil
 	}
@@ -2900,7 +2915,7 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 		agent.Stop()
 		return nil, err
 	}
-	managed := &activeAgentSession{agent: agent, approvalToken: token, runnerID: conversation.AgentRuntimeID}
+	managed := &activeAgentSession{agent: agent, approvalToken: token, runnerID: conversation.AgentRuntimeID, agentID: conversation.AgentID, runIDs: map[string]struct{}{runID: {}}}
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -2920,14 +2935,52 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	s.mu.Unlock()
 	go func() {
 		defer s.runWG.Done()
-		<-agent.Done()
-		s.mu.Lock()
-		if s.sessions[conversation.ID] == managed {
-			delete(s.sessions, conversation.ID)
-		}
-		s.mu.Unlock()
+		s.watchStreamingSession(conversation.ID, managed)
 	}()
 	return agent, nil
+}
+
+// watchStreamingSession keeps the workspace lease held until the underlying
+// process has actually exited. A stopped session may still flush output after
+// Stop returns, so its active runs must not be finalized early.
+func (s *Server) watchStreamingSession(conversationID string, managed *activeAgentSession) {
+	<-managed.agent.Done()
+
+	// Block new streaming admission while removing this stopped session and
+	// snapshotting its admitted runs. A new session may start once the lock is
+	// released, so only the captured IDs are eligible for this cleanup.
+	s.streamMu.Lock()
+	s.mu.Lock()
+	if s.sessions[conversationID] != managed {
+		s.mu.Unlock()
+		s.streamMu.Unlock()
+		return
+	}
+	stopping := managed.stopping
+	runIDs := make([]string, 0, len(managed.runIDs))
+	for runID := range managed.runIDs {
+		runIDs = append(runIDs, runID)
+		// finishStreamingRun normally removes these mappings. This watcher is
+		// its fallback when the process exits without a TurnFinished callback.
+		delete(s.cancels, runID)
+		delete(s.runContexts, runID)
+		delete(s.streamingSetups, runID)
+	}
+	delete(s.sessions, conversationID)
+	s.mu.Unlock()
+	s.streamMu.Unlock()
+	status := "failed"
+	runErr := errors.New("streaming agent session ended unexpectedly")
+	if stopping {
+		status = "stopped"
+		runErr = errors.New("streaming agent session stopped")
+	}
+	for _, runID := range runIDs {
+		s.recordUsagePersistenceError(runID, conversationID, s.persistRunUsage(runID, status))
+		s.discardRunUsage(runID)
+		s.resolveRunApprovals(runID, "deny")
+		s.finishRun(runID, conversationID, status, runErr)
+	}
 }
 
 func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, projectPath, prompt string) {
@@ -3030,6 +3083,7 @@ func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) 
 	stopped := false
 	if session := s.sessions[conversationID]; session != nil {
 		stopped = session.stopping
+		delete(session.runIDs, runID)
 		if errors.Is(runErr, errClaudeTurnIdleTimeout) {
 			// The CLI has stopped accepting turns after its watchdog fires. Keep
 			// the session unavailable until Done removes it, rather than letting a
@@ -3059,7 +3113,16 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 	tx, err := s.db.BeginTx(context.Background(), nil)
 	committed := false
 	if err == nil {
-		_, err = tx.ExecContext(context.Background(), `update runs set status=?,completed_at=? where id=?`, status, time.Now().UTC(), runID)
+		var result sql.Result
+		result, err = tx.ExecContext(context.Background(), `update runs set status=?,completed_at=? where id=? and status in ('queued','running')`, status, time.Now().UTC(), runID)
+		if err == nil {
+			var changed int64
+			changed, err = result.RowsAffected()
+			if err == nil && changed == 0 {
+				tx.Rollback()
+				return
+			}
+		}
 		if err == nil {
 			_, err = tx.ExecContext(context.Background(), `update conversations set status=case when exists(select 1 from runs where conversation_id=? and id<>? and status in ('queued','running')) then 'running' else 'idle' end,last_activity_at=? where id=?`, conversationID, runID, time.Now().UTC(), conversationID)
 		}
@@ -3069,7 +3132,7 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 		if err == nil {
 			failureReason := ""
 			if runErr != nil {
-				failureReason = runErr.Error()
+				failureReason = errorText(runErr)
 			}
 			err = s.finishTaskRunTx(context.Background(), tx, runID, status, failureReason, time.Now().UTC())
 		}
@@ -3104,7 +3167,8 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 }
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "runID")
-	status, code, err := s.stopRunByID(r.Context(), id)
+	force := r.URL.Query().Get("force") == "true"
+	status, code, err := s.stopRunByID(r.Context(), id, force)
 	if err != nil {
 		writeError(w, code, err)
 		return
@@ -3112,7 +3176,10 @@ func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, map[string]string{"status": status})
 }
 
-func (s *Server) stopRunByID(ctx context.Context, id string) (string, int, error) {
+func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string, int, error) {
+	if force {
+		return s.forceStopConversationRuns(ctx, id)
+	}
 	s.mu.Lock()
 	cancel, ok := s.cancels[id]
 	conversationID := s.runContexts[id]
@@ -3199,6 +3266,75 @@ func (s *Server) stopRunByID(ctx context.Context, id string) (string, int, error
 	}
 	cancel()
 	s.resolveRunApprovals(id, "deny")
+	return "stopping", http.StatusAccepted, nil
+}
+
+// forceStopConversationRuns stops every active turn for the requested run's
+// conversation. A streaming agent owns a single process for its queued turns,
+// so stopping only the selected run would otherwise leave that process and its
+// queued work active.
+func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID string) (string, int, error) {
+	var conversationID, requestedStatus string
+	err := s.db.QueryRowContext(ctx, `select conversation_id,status from runs where id=?`, requestedRunID).Scan(&conversationID, &requestedStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", http.StatusNotFound, errors.New("run not found")
+	}
+	if err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	if requestedStatus != "queued" && requestedStatus != "running" {
+		return requestedStatus, http.StatusOK, nil
+	}
+
+	// Serialize with streaming admission before collecting active runs. This
+	// prevents a new queued turn from escaping the force-stop snapshot.
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+
+	type activeRun struct{ id string }
+	rows, err := s.db.QueryContext(ctx, `select id from runs where conversation_id=? and status in ('queued','running')`, conversationID)
+	if err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	activeRuns := []activeRun{}
+	for rows.Next() {
+		var run activeRun
+		if err := rows.Scan(&run.id); err != nil {
+			rows.Close()
+			return "", http.StatusInternalServerError, err
+		}
+		activeRuns = append(activeRuns, run)
+	}
+	if err := rows.Close(); err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	if err := rows.Err(); err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+
+	cancels := make([]context.CancelFunc, 0, len(activeRuns))
+	var session AgentSession
+	s.mu.Lock()
+	if activeSession := s.sessions[conversationID]; activeSession != nil {
+		activeSession.stopping = true
+		session = activeSession.agent
+	}
+	for _, run := range activeRuns {
+		if cancel := s.cancels[run.id]; cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	if session != nil {
+		session.Stop()
+	}
+	for _, run := range activeRuns {
+		s.resolveRunApprovals(run.id, "deny")
+	}
 	return "stopping", http.StatusAccepted, nil
 }
 
@@ -3481,13 +3617,134 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	json.NewEncoder(w).Encode(value)
 }
 func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]string{"error": err.Error()})
+	payload := map[string]string{"error": localizedHTTPErrorText(status, err)}
+	if code := httpErrorCode(err); code != "" {
+		payload["code"] = code
+	}
+	writeJSON(w, status, payload)
+}
+
+// httpErrorCode provides stable client behavior without coupling it to a
+// localized error message.
+func httpErrorCode(err error) string {
+	if err != nil && strings.TrimSpace(err.Error()) == "cannot stop a run while this conversation has other queued or running runs" {
+		return "active_runs_present"
+	}
+	return ""
 }
 func errorText(err error) string {
 	if err == nil {
 		return ""
 	}
-	return err.Error()
+	return localizedErrorText(err, "任务执行失败，请查看任务日志后重试。")
+}
+
+// localizedHTTPErrorText keeps internal implementation errors out of the UI
+// while preserving actionable messages that have already been localized.
+func localizedHTTPErrorText(status int, err error) string {
+	fallback := "操作失败，请稍后重试。"
+	switch status {
+	case http.StatusBadRequest:
+		fallback = "请求参数无效，请检查后重试。"
+	case http.StatusUnauthorized:
+		fallback = "未授权访问，请重新登录后重试。"
+	case http.StatusForbidden:
+		fallback = "没有执行此操作的权限。"
+	case http.StatusNotFound:
+		fallback = "请求的资源不存在或已被删除。"
+	case http.StatusConflict:
+		fallback = "当前操作与进行中的操作冲突，请稍后重试。"
+	case http.StatusGatewayTimeout:
+		fallback = "操作超时，请稍后重试。"
+	case http.StatusServiceUnavailable:
+		fallback = "服务暂时不可用，请稍后重试。"
+	case http.StatusInternalServerError:
+		fallback = "服务内部错误，请稍后重试。"
+	}
+	return localizedErrorText(err, fallback)
+}
+
+func localizedErrorText(err error, fallback string) string {
+	if err == nil {
+		return ""
+	}
+
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		return fallback
+	}
+	if strings.HasPrefix(message, "project workspace is occupied") {
+		return "项目工作区正被其他 AI 任务或 Git 操作占用，请等待当前操作完成后重试。"
+	}
+
+	translations := map[string]string{
+		"project not found":      "项目不存在或已被删除。",
+		"conversation not found": "会话不存在或已被删除。",
+		"run not found":          "任务运行记录不存在。",
+		"invalid JSON request":   "请求内容不是有效的 JSON。",
+		"activate this conversation before sending a message":                        "请先激活该会话，再发送消息。",
+		"Codex is currently available only on the local WSL runner":                  "Codex 目前仅支持本地 WSL 运行器。",
+		"Codex CLI is unavailable or not logged in":                                  "Codex CLI 不可用或尚未登录。",
+		"Claude Code is unavailable or not logged in":                                "Claude Code 不可用或尚未登录。",
+		"conversation is stopping":                                                   "会话正在停止，请稍后再试。",
+		"conversation already has a running agent turn":                              "该会话已有正在运行的 AI 任务。",
+		"cannot stop a run while this conversation has other queued or running runs": "当前会话还有排队或运行中的任务，暂时无法单独停止此任务。",
+		"cannot stop a task while this conversation has other queued task runs":      "当前会话还有排队的任务，暂时无法单独停止此任务。",
+		"queued task cannot be stopped independently":                                "排队中的任务无法单独停止。",
+		"Git request timed out":                                                      "Git 操作超时，请稍后重试。",
+		"project is not currently a readable Git repository":                         "当前项目不是可读取的 Git 仓库。",
+		"runner not found":                                       "运行器不存在。",
+		"runner is not an SSH runner":                            "当前运行器不是 SSH 运行器。",
+		"another AI CLI is already being updated on this runner": "该运行器上已有 AI CLI 正在更新。",
+	}
+	if translated, ok := translations[message]; ok {
+		return translated
+	}
+	if errors.Is(err, context.Canceled) {
+		return "操作已取消。"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "操作超时，请稍后重试。"
+	}
+	if containsChinese(message) {
+		if containsUntranslatedEnglish(message) {
+			return fallback
+		}
+		return message
+	}
+	return fallback
+}
+
+func containsChinese(value string) bool {
+	for _, r := range value {
+		if r >= '\u4e00' && r <= '\u9fff' {
+			return true
+		}
+	}
+	return false
+}
+
+func containsUntranslatedEnglish(value string) bool {
+	allowed := map[string]bool{
+		"AI": true, "API": true, "CLI": true, "Codex": true, "Claude": true,
+		"Git": true, "HTTP": true, "ID": true, "JSON": true, "NUL": true,
+		"SSH": true, "URL": true, "WSL": true,
+	}
+	for index := 0; index < len(value); {
+		if (value[index] < 'A' || value[index] > 'Z') && (value[index] < 'a' || value[index] > 'z') {
+			index++
+			continue
+		}
+		start := index
+		for index < len(value) && ((value[index] >= 'A' && value[index] <= 'Z') || (value[index] >= 'a' && value[index] <= 'z')) {
+			index++
+		}
+		word := value[start:index]
+		if len(word) >= 3 && !allowed[word] {
+			return true
+		}
+	}
+	return false
 }
 
 func conversationTitle(content string) string { return compactConversationText(content, 80) }
@@ -3554,7 +3811,7 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 			}
 			// Reflect in-progress updates so the frontend can show "更新中...".
 			s.runnerMaintenanceMu.Lock()
-			if s.runnerUpdating[m.ID] {
+			if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "claude-code"}] {
 				status = "updating"
 			}
 			s.runnerMaintenanceMu.Unlock()
@@ -3574,6 +3831,12 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 			} else {
 				codexReason = "本机 Codex CLI 未安装或未登录"
 			}
+			s.runnerMaintenanceMu.Lock()
+			if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "codex"}] {
+				codexStatus = "updating"
+				codexReason = ""
+			}
+			s.runnerMaintenanceMu.Unlock()
 		}
 		entry["codex"] = map[string]string{
 			"status":  codexStatus,
@@ -3595,13 +3858,25 @@ func (s *Server) checkClaudeUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("runner not found"))
 		return
 	}
+	s.checkAgentUpdate(w, r, runner)
+}
 
+func (s *Server) checkCodexUpdate(w http.ResponseWriter, r *http.Request) {
+	runnerID := chi.URLParam(r, "runnerID")
+	if runnerID != "wsl-local" {
+		writeError(w, http.StatusNotFound, errors.New("Codex is currently available only on the local WSL runner"))
+		return
+	}
+	s.checkAgentUpdate(w, r, s.codexRunner)
+}
+
+func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner AgentRunner) {
 	available, latestVersion, err := runner.CheckUpdate(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"updateAvailable": false,
 			"currentVersion":  runner.Version(r.Context()),
-			"error":           err.Error(),
+			"error":           errorText(err),
 		})
 		return
 	}
@@ -3620,51 +3895,69 @@ func (s *Server) updateClaude(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Serialize updates with Claude run admission. startMessage keeps this lock
-	// until its run record is committed, closing the check-then-start race.
+	s.updateAgent(w, r, runnerID, "claude-code", "Claude Code", runner)
+}
+
+func (s *Server) updateCodex(w http.ResponseWriter, r *http.Request) {
+	runnerID := chi.URLParam(r, "runnerID")
+	if runnerID != "wsl-local" {
+		writeError(w, http.StatusNotFound, errors.New("Codex is currently available only on the local WSL runner"))
+		return
+	}
+	s.updateAgent(w, r, runnerID, "codex", "Codex", s.codexRunner)
+}
+
+func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, agentID, agentName string, runner AgentRunner) {
+	// Serialize updates with run admission. startMessage keeps this lock until
+	// its run record is committed, closing the check-then-start race.
+	maintenanceKey := runnerAgentKey{runnerID: runnerID, agentID: agentID}
 	s.runnerMaintenanceMu.Lock()
-	if s.runnerUpdating[runnerID] {
+	if s.runnerUpdateExecuting[runnerID] {
 		s.runnerMaintenanceMu.Unlock()
-		writeError(w, http.StatusConflict, errors.New("Claude Code is already being updated on this runner"))
+		writeError(w, http.StatusConflict, errors.New("another AI CLI is already being updated on this runner"))
 		return
 	}
 
 	var active bool
-	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from runs where agent_runtime_id=? and status in ('queued','running'))`, runnerID).Scan(&active); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from runs where agent_runtime_id=? and agent_id=? and status in ('queued','running'))`, runnerID, agentID).Scan(&active); err != nil {
 		s.runnerMaintenanceMu.Unlock()
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if active {
 		s.runnerMaintenanceMu.Unlock()
-		writeError(w, http.StatusConflict, errors.New("cannot update Claude Code while this runner has active conversations"))
+		writeError(w, http.StatusConflict, fmt.Errorf("cannot update %s while this runner has active conversations", agentName))
 		return
 	}
 	s.mu.Lock()
 	for _, session := range s.sessions {
-		if session.runnerID == runnerID {
+		if session.runnerID == runnerID && (session.agentID == agentID || (session.agentID == "" && agentID == "claude-code")) {
 			s.mu.Unlock()
 			s.runnerMaintenanceMu.Unlock()
-			writeError(w, http.StatusConflict, errors.New("cannot update Claude Code while this runner has an active session"))
+			writeError(w, http.StatusConflict, fmt.Errorf("cannot update %s while this runner has an active session", agentName))
 			return
 		}
 	}
 	s.mu.Unlock()
-	s.runnerUpdating[runnerID] = true
+	s.runnerUpdateExecuting[runnerID] = true
+	s.runnerUpdating[maintenanceKey] = true
 	s.runnerMaintenanceMu.Unlock()
 	defer func() {
 		s.runnerMaintenanceMu.Lock()
-		delete(s.runnerUpdating, runnerID)
+		delete(s.runnerUpdateExecuting, runnerID)
+		delete(s.runnerUpdating, maintenanceKey)
 		s.runnerMaintenanceMu.Unlock()
 	}()
 
-	previousVersion, currentVersion, err := runner.Update(r.Context())
+	updateCtx, cancel := context.WithTimeout(s.runtimeCtx, 2*time.Minute)
+	defer cancel()
+	previousVersion, currentVersion, err := runner.Update(updateCtx)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success":         false,
 			"previousVersion": previousVersion,
 			"currentVersion":  currentVersion,
-			"error":           err.Error(),
+			"error":           errorText(err),
 		})
 		return
 	}

@@ -14,6 +14,12 @@ export interface NotificationEvent {
   createdAt: string;
 }
 
+/** 通知统一进入所属项目的对话页面，不再跳转到任务详情。 */
+export function notificationConversationURL(event: Pick<NotificationEvent, "projectId" | "conversationId">): string {
+  const baseURL = `/projects/${event.projectId}/conversations`;
+  return event.conversationId ? `${baseURL}/${event.conversationId}` : baseURL;
+}
+
 /** 需要发通知的任务/编排状态 */
 export const NOTIFIABLE_STATUSES = new Set([
   "action_required",

@@ -4,7 +4,7 @@ import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useUnreadCount } from "./NotificationProvider";
 import { api } from "../lib/api";
-import type { NotificationEvent } from "../lib/notifications";
+import { notificationConversationURL, type NotificationEvent } from "../lib/notifications";
 
 export default function NotificationCenter() {
   const unreadCount = useUnreadCount();
@@ -73,9 +73,9 @@ export default function NotificationCenter() {
     }
   };
 
-  const handleNavigate = (actionUrl: string, id: string) => {
-    navigate(actionUrl);
-    void handleDismiss(id);
+  const handleNavigate = (notification: NotificationEvent) => {
+    navigate(notificationConversationURL(notification));
+    void handleDismiss(notification.id);
     setOpen(false);
   };
 
@@ -136,7 +136,7 @@ export default function NotificationCenter() {
                     <div className="notification-item-actions">
                       <button
                         className="notification-item-view"
-                        onClick={() => handleNavigate(n.actionUrl, n.id)}
+                        onClick={() => handleNavigate(n)}
                       >
                         查看
                       </button>

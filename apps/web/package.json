@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "tsx --test 'src/**/*.test.ts' 'src/**/*.test.mjs'",
     "build": "tsc -b && vite build"
   },
   "dependencies": {

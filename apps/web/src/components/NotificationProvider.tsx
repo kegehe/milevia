@@ -6,6 +6,7 @@ import { Toaster, toast } from "sonner";
 import { api } from "../lib/api";
 import {
   type NotificationEvent,
+  notificationConversationURL,
   priorityForType,
   toastVariantForType,
 } from "../lib/notifications";
@@ -164,7 +165,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         action: {
           label: "查看详情",
           onClick: () => {
-            navigate(event.actionUrl);
+            navigate(notificationConversationURL(event));
             dismissNotification(event.id);
           },
         },

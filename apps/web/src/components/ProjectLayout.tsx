@@ -20,7 +20,7 @@ export default function ProjectLayout() {
 	const [loading, setLoading] = useState(true);
 	const [resolvedProjectID, setResolvedProjectID] = useState<string | null>(null);
 	const [error, setError] = useState("");
-  const { refreshProjects } = useProjectContext();
+  const { error: globalError, setError: setGlobalError, refreshProjects } = useProjectContext();
 
   // 确定当前工作区标签
   const getWorkspaceTab = useCallback((): WorkspaceTab => {
@@ -119,6 +119,7 @@ export default function ProjectLayout() {
   };
 
   return <div className="chat">
+    {globalError && <div className="error" role="alert"><span>{globalError}</span><button type="button" title="关闭错误提示" onClick={() => setGlobalError("")}>x</button></div>}
     <header className="project-head">
       <div className="project-heading">
         <button className="back-projects" title="返回项目列表" onClick={() => navigate("/")}>←</button>

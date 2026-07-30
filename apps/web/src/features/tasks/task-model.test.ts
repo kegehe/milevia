@@ -177,7 +177,7 @@ test("defines a responsive task work rail", () => {
   const conversationStyles = readFileSync(new URL("../../conversation.css", import.meta.url), "utf8");
   const taskStyles = readFileSync(new URL("../../tasks.css", import.meta.url), "utf8");
 
-  assert.match(conversationStyles, /grid-template-columns:\s*minmax\(280px, 320px\) minmax\(0, 1fr\)/);
+  assert.match(conversationStyles, /grid-template-columns:\s*minmax\(260px, 300px\) minmax\(440px, 1fr\) minmax\(280px, 340px\)/);
   assert.match(conversationStyles, /\.quick-actions-row/);
   assert.match(taskStyles, /\.task-queue-mobile-toggle/);
 });

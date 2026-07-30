@@ -9,12 +9,15 @@ import (
 	"io"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const maxCodexDiagnosticBytes = 4 * 1024
+
+const codexAdditionalStdinNotice = "Reading additional input from stdin..."
 
 var (
 	codexBearerPattern              = regexp.MustCompile(`(?i)\b(authorization\s*[:=]\s*)bearer\s+[^\s,;]+`)
@@ -49,8 +52,136 @@ func (r *codexCLIRunner) Version(parent context.Context) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "codex-cli "))
 }
 
-func (r *codexCLIRunner) CheckUpdate(context.Context) (bool, string, error) {
-	return false, "", errors.New("Codex CLI does not provide a non-interactive update check")
+func (r *codexCLIRunner) CheckUpdate(parent context.Context) (bool, string, error) {
+	local := r.Version(parent)
+	if local == "" {
+		return false, "", errors.New("Codex CLI is not installed")
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "npm", "view", "@openai/codex", "version").Output()
+	if err != nil {
+		return false, "", fmt.Errorf("query latest Codex version: %w", err)
+	}
+	latest := strings.TrimSpace(string(out))
+	if latest == "" {
+		return false, "", errors.New("latest Codex version is empty")
+	}
+	available, err := codexUpdateAvailable(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
+}
+
+type codexSemver struct {
+	major int
+	minor int
+	patch int
+	pre   []string
+}
+
+func codexUpdateAvailable(local, latest string) (bool, error) {
+	localVersion, err := parseCodexSemver(local)
+	if err != nil {
+		return false, fmt.Errorf("parse local Codex version: %w", err)
+	}
+	latestVersion, err := parseCodexSemver(latest)
+	if err != nil {
+		return false, fmt.Errorf("parse latest Codex version: %w", err)
+	}
+	return compareCodexSemver(latestVersion, localVersion) > 0, nil
+}
+
+func parseCodexSemver(raw string) (codexSemver, error) {
+	value := strings.TrimPrefix(strings.TrimSpace(raw), "v")
+	value, _, _ = strings.Cut(value, "+")
+	core, prerelease, hasPrerelease := strings.Cut(value, "-")
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
+	}
+	parsed := codexSemver{}
+	for index, target := range []*int{&parsed.major, &parsed.minor, &parsed.patch} {
+		if parts[index] == "" || (len(parts[index]) > 1 && parts[index][0] == '0') {
+			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
+		}
+		value, err := strconv.Atoi(parts[index])
+		if err != nil || value < 0 {
+			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
+		}
+		*target = value
+	}
+	if !hasPrerelease {
+		return parsed, nil
+	}
+	if prerelease == "" {
+		return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
+	}
+	for _, identifier := range strings.Split(prerelease, ".") {
+		if identifier == "" {
+			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
+		}
+		for _, character := range identifier {
+			if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || character == '-') {
+				return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
+			}
+		}
+		if _, err := strconv.Atoi(identifier); err == nil && len(identifier) > 1 && identifier[0] == '0' {
+			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
+		}
+		parsed.pre = append(parsed.pre, identifier)
+	}
+	return parsed, nil
+}
+
+func compareCodexSemver(left, right codexSemver) int {
+	for _, pair := range [][2]int{{left.major, right.major}, {left.minor, right.minor}, {left.patch, right.patch}} {
+		if pair[0] < pair[1] {
+			return -1
+		}
+		if pair[0] > pair[1] {
+			return 1
+		}
+	}
+	if len(left.pre) == 0 && len(right.pre) > 0 {
+		return 1
+	}
+	if len(left.pre) > 0 && len(right.pre) == 0 {
+		return -1
+	}
+	for index := 0; index < len(left.pre) && index < len(right.pre); index++ {
+		leftNumber, leftErr := strconv.Atoi(left.pre[index])
+		rightNumber, rightErr := strconv.Atoi(right.pre[index])
+		if leftErr == nil && rightErr != nil {
+			return -1
+		}
+		if leftErr != nil && rightErr == nil {
+			return 1
+		}
+		if leftErr == nil && rightErr == nil {
+			if leftNumber < rightNumber {
+				return -1
+			}
+			if leftNumber > rightNumber {
+				return 1
+			}
+			continue
+		}
+		if left.pre[index] < right.pre[index] {
+			return -1
+		}
+		if left.pre[index] > right.pre[index] {
+			return 1
+		}
+	}
+	if len(left.pre) < len(right.pre) {
+		return -1
+	}
+	if len(left.pre) > len(right.pre) {
+		return 1
+	}
+	return 0
 }
 
 func (r *codexCLIRunner) Update(parent context.Context) (string, string, error) {
@@ -135,7 +266,7 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink) {
 	for scanner.Scan() {
 		line, err := sanitizeCodexJSONL(scanner.Bytes())
 		if err != nil {
-			sink.Event("stream.error", mustJSON(map[string]string{"error": codexDiagnostic(err.Error())}))
+			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 			continue
 		}
 		var event struct {
@@ -147,7 +278,7 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink) {
 			} `json:"item"`
 		}
 		if err := json.Unmarshal(line, &event); err != nil {
-			sink.Event("stream.error", mustJSON(map[string]string{"error": codexDiagnostic(err.Error())}))
+			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 			continue
 		}
 		sink.Event(event.Type, line)
@@ -160,7 +291,7 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		sink.Event("stream.error", mustJSON(map[string]string{"error": codexDiagnostic(err.Error())}))
+		sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 	}
 }
 
@@ -169,6 +300,11 @@ func readCodexStderr(reader io.Reader, sink AgentRunSink) {
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		if text := strings.TrimSpace(scanner.Text()); text != "" {
+			// codex exec emits this informational line when its /dev/null stdin is
+			// non-interactive. The prompt is already supplied through argv.
+			if text == codexAdditionalStdinNotice {
+				continue
+			}
 			sink.Event("stderr", mustJSON(map[string]string{"message": codexDiagnostic(text)}))
 		}
 	}

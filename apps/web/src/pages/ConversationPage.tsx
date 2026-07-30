@@ -36,6 +36,37 @@ import {
   isSubagentMessage, flattenAgents, timelineContentVersion,
 } from "../lib/timeline";
 
+function requiresForceStop(cause: unknown): boolean {
+  return typeof cause === "object" && cause !== null && (cause as { code?: unknown }).code === "active_runs_present";
+}
+
+function copyWithLegacyClipboard(content: string) {
+  const textarea = document.createElement("textarea");
+  textarea.value = content;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  try {
+    textarea.select();
+    if (!document.execCommand("copy")) throw new Error("clipboard unavailable");
+  } finally {
+    textarea.remove();
+  }
+}
+
+async function copyMessageText(content: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(content);
+      return;
+    } catch {
+      // Permission policies can reject the modern API while legacy copy works.
+    }
+  }
+  copyWithLegacyClipboard(content);
+}
+
 // ---- 子组件 ---------------------------------------------------------------
 
 function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, usage, displayedModel, contextLabel, contextLevel, onShowUsage, stopping, onStop }: { runnerID: string; agentID: AgentID; run: string; runLabel: string; permissionMode?: string; usage: ConversationUsageResponse | null; displayedModel: string; contextLabel: string; contextLevel: string; onShowUsage: () => void; stopping: boolean; onStop: () => void }) {
@@ -45,15 +76,22 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
   const [updating, setUpdating] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [showConfirm, setShowConfirm] = useState(false);
+  const tool = agentID === "codex" ? runner?.codex : runner?.claude;
+  const toolName = agentID === "codex" ? "Codex" : "Claude Code";
+  const agentPath = agentID === "codex" ? "codex" : "claude";
 
-  const refreshRunner = useCallback(async () => {
+  const refreshRunner = useCallback(async (): Promise<RunnerInfo | null> => {
     try {
       const list = await api<RunnerInfo[]>("/api/runners");
       const match = list.find((r) => r.id === runnerID);
-      if (match) setRunner(match);
+      if (match) {
+        setRunner(match);
+        return match;
+      }
     } catch {
       /* ignore — runner info is best-effort */
     }
+    return null;
   }, [runnerID]);
 
   useEffect(() => {
@@ -62,20 +100,19 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
 
   // 当后端报告 runner 正在更新（如页面刷新后检测到），定期轮询直到状态恢复
   useEffect(() => {
-    const claudeStatus = runner?.claude?.status;
-    if (!runner || updating || claudeStatus !== "updating") return;
+    if (!runner || updating || tool?.status !== "updating") return;
     const id = window.setInterval(() => { void refreshRunner(); }, 5_000);
     return () => window.clearInterval(id);
-  }, [runner, updating, refreshRunner]);
+  }, [runner, tool?.status, updating, refreshRunner]);
 
   const handleCheckUpdate = async () => {
     setChecking(true);
     setUpdateInfo(null);
     try {
-      const result = await api<CheckUpdateResult>(`/api/runners/${runnerID}/claude/check-update`, { method: "POST" });
+      const result = await api<CheckUpdateResult>(`/api/runners/${runnerID}/${agentPath}/check-update`, { method: "POST" });
       setUpdateInfo(result);
     } catch (err) {
-      setUpdateInfo({ updateAvailable: false, currentVersion: runner?.claude?.version || "", error: err instanceof Error ? err.message : "检查更新失败" });
+      setUpdateInfo({ updateAvailable: false, currentVersion: tool?.version || "", error: err instanceof Error ? err.message : "检查更新失败" });
     } finally {
       setChecking(false);
     }
@@ -85,9 +122,9 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
     setShowConfirm(false);
     setUpdating(true);
     // 立即将状态置为 updating，触发底部"更新中..."脉冲动画
-    setRunner((prev) => prev ? { ...prev, claude: { ...prev.claude, status: "updating" as const } } : prev);
+    setRunner((prev) => !prev ? prev : agentID === "codex" ? prev.codex ? { ...prev, codex: { ...prev.codex, status: "updating" as const } } : prev : { ...prev, claude: { ...prev.claude, status: "updating" as const } });
     try {
-      const result = await api<UpdateResult>(`/api/runners/${runnerID}/claude/update`, { method: "POST" });
+      const result = await api<UpdateResult>(`/api/runners/${runnerID}/${agentPath}/update`, { method: "POST" });
       if (result.success) {
         setUpdateInfo(null);
       } else {
@@ -99,26 +136,22 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
       setUpdating(false);
       // 从后端拉取最新 runner 信息，刷新版本号与状态
       await refreshRunner();
-      // 若 refreshRunner 未能更新状态（如网络异常），确保 updating 状态不会残留
-      setRunner((prev) => prev?.claude?.status === "updating" ? { ...prev, claude: { ...prev.claude, status: "ready" as const } } : prev);
     }
   };
 
-  const tool = agentID === "codex" ? runner?.codex : runner?.claude;
-  const toolName = agentID === "codex" ? "Codex" : "Claude Code";
   const runnerStatusClass = run ? "running" : tool?.status || "unavailable";
 
   const canShowUsage = Boolean(run) || tool?.status === "ready";
   return (<>
     <span className="composer-status-group">
       <span className={`runner-inline ${runnerStatusClass}`} title={tool?.reason}><i></i>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span>
-      {agentID === "claude-code" && !run && tool?.status === "ready" && <button className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
-      {agentID === "claude-code" && !run && !updating && updateInfo?.updateAvailable && !updateInfo.error && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo.latestVersion}</button>}
-      {agentID === "claude-code" && !run && !updating && updateInfo?.error && <span className="runner-inline-error" title={updateInfo.error}>{updateInfo.error}</span>}
+      {!run && tool?.status === "ready" && <button className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
+      {!run && !updating && updateInfo?.updateAvailable && !updateInfo.error && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo.latestVersion}</button>}
+      {!run && !updating && updateInfo?.error && <span className="runner-inline-error" title={updateInfo.error}>{updateInfo.error}</span>}
       {canShowUsage ? <span className="composer-usage"><span title={displayedModel}>{displayedModel}</span><span className={contextLevel}>{contextLabel}</span><span>{usage ? `${usage.session.taskCount} 次对话` : "加载中"}</span><button className="usage-trigger" type="button" onClick={onShowUsage}>使用状态</button></span> : <span className="composer-usage pending">用量将在工具就绪后显示</span>}
     </span>
-    {showConfirm && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>UPDATE CLAUDE CODE</label><h2>确认更新 Claude Code</h2></div><button title="关闭" onClick={() => setShowConfirm(false)}>x</button></header><p className="permission-confirmation">当前版本：<b>{tool?.version}</b> → 最新版本：<b>{updateInfo?.latestVersion}</b>。更新期间将无法使用 AI 对话功能，更新预计需要数十秒。</p><footer><button className="secondary" onClick={() => setShowConfirm(false)}>取消</button><button className="primary" onClick={() => void handleUpdate()}>确认更新</button></footer></section></div>}
-    {updateError && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>UPDATE ERROR</label><h2>更新失败</h2></div><button title="关闭" onClick={() => setUpdateError(null)}>x</button></header><p className="permission-confirmation">{updateError}</p><footer><button className="secondary" onClick={() => setUpdateError(null)}>关闭</button></footer></section></div>}
+    {showConfirm && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新 {toolName}</label><h2>确认更新 {toolName}</h2></div><button title="关闭" onClick={() => setShowConfirm(false)}>x</button></header><p className="permission-confirmation">当前版本：<b>{tool?.version}</b> → 最新版本：<b>{updateInfo?.latestVersion}</b>。更新期间将无法使用 AI 对话功能，更新预计需要数十秒。</p><footer><button className="secondary" onClick={() => setShowConfirm(false)}>取消</button><button className="primary" onClick={() => void handleUpdate()}>确认更新</button></footer></section></div>}
+    {updateError && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新错误</label><h2>更新失败</h2></div><button title="关闭" onClick={() => setUpdateError(null)}>x</button></header><p className="permission-confirmation">{updateError}</p><footer><button className="secondary" onClick={() => setUpdateError(null)}>关闭</button></footer></section></div>}
   </>);
 }
 
@@ -189,14 +222,32 @@ function FullControlConfirmationDialog({ close, confirm, changing, isCodex }: { 
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="full-control-title"><section className="modal permission-dialog"><header><div><label>{agentName.toUpperCase()} PERMISSION</label><h2 id="full-control-title">切换为完全控制</h2></div><button title="关闭" disabled={changing} onClick={close}>x</button></header><p className="permission-confirmation">{isCodex ? `完全控制会允许 Codex 绕过沙箱限制，直接执行所有命令，不再受项目目录约束。` : `完全控制会允许 Claude 在当前项目中直接执行所有命令，不再等待确认。`}</p><footer><button className="secondary" disabled={changing} onClick={close}>取消</button><button className="primary danger" disabled={changing} onClick={() => void confirm()}>{changing ? "切换中" : "确认切换"}</button></footer></section></div>;
 }
 
-function MessageCard({ message, agentID }: { message: Message; agentID: AgentID }) {
+function MessageCard({ message, agentID, fail }: { message: Message; agentID: AgentID; fail: (message: string) => void }) {
   const isUser = message.role === "user";
   const agentName = agentID === "codex" ? "Codex" : "Claude";
-  return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentID === "codex" ? "O" : "C"}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div></article>;
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
+  }, []);
+
+  const copy = async () => {
+    try {
+      await copyMessageText(message.content);
+      setCopied(true);
+      if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      fail("无法复制消息，请检查浏览器剪贴板权限。");
+    }
+  };
+
+  return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentID === "codex" ? "O" : "C"}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div>{isUser && <button className={`message-copy${copied ? " copied" : ""}`} type="button" title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()} />}</article>;
 }
 
 function ErrorCard({ item }: { item: TimelineItem & { kind: "error" } }) {
-  return <article className="error-card"><header><span className="error-card-icon">!</span><div><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></header><p>{item.detail}</p></article>;
+  return <article className="error-card"><header><span className="error-card-icon">!</span><div><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></header><pre>{item.detail}</pre></article>;
 }
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
@@ -314,7 +365,7 @@ function ShortcutEditor({ projectID, state, close, refresh, fail }: { projectID:
       });
       await refresh();
       close();
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to save shortcut"); }
+    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法保存快捷任务"); }
     finally { setBusy(false); }
   };
   const remove = () => {
@@ -330,7 +381,7 @@ function ShortcutEditor({ projectID, state, close, refresh, fail }: { projectID:
           await api(`/api/shortcuts/${shortcut.id}`, { method: "DELETE" });
           await refresh();
           close();
-        } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to delete shortcut"); }
+        } catch (cause) { fail(cause instanceof Error ? cause.message : "无法删除快捷任务"); }
         finally { setBusy(false); }
       })(),
       onCancel: () => setPendingConfirm(null),
@@ -413,6 +464,9 @@ export default function ConversationPage() {
   const conversationTransitionRef = useRef(false);
   const conversationRouteVersion = useRef(0);
   const stopRunRef = useRef<() => Promise<void>>(async () => {});
+  const stopAndClearRef = useRef<() => Promise<void>>(async () => {});
+  const pendingUserDrafts = useRef(new Map<string, string>());
+  const assistantOutputRuns = useRef(new Set<string>());
   const userNearBottom = useRef(true);
   const [hasNewContent, setHasNewContent] = useState(false);
   const lastReloadRequestedAt = useRef(0);
@@ -433,6 +487,25 @@ export default function ConversationPage() {
     }
   };
 
+  const recordAssistantOutput = useCallback((runID: string, content: string) => {
+    if (!runID || !content.trim()) return;
+    const outputs = assistantOutputRuns.current;
+    outputs.add(runID);
+    if (outputs.size > 128) {
+      const oldest = outputs.values().next().value;
+      if (oldest !== undefined) outputs.delete(oldest);
+    }
+    pendingUserDrafts.current.delete(runID);
+  }, []);
+
+  const restorePendingUserDraft = (conversationID: string, routeVersion: number, runID: string, draft: string | undefined) => {
+    if (!draft || conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) return;
+    pendingUserDrafts.current.delete(runID);
+    setText((current) => current === "" ? draft : current);
+    historyIndex.current = null;
+    draftBeforeHistory.current = "";
+  };
+
   // 刷新函数
   const refreshConversationHistory = useCallback(async () => {
     if (!projectId) return [] as Conversation[];
@@ -448,7 +521,7 @@ export default function ConversationPage() {
 
   const openConversationHistory = () => {
     setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("history", "true"); return next; });
-    void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
+    void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
   };
 
   const refreshUsage = useCallback(async () => {
@@ -516,7 +589,7 @@ export default function ConversationPage() {
           }
         }
       } catch (cause) {
-        if (!cancelled) fail(cause instanceof Error ? cause.message : "Unable to create conversation");
+        if (!cancelled) fail(cause instanceof Error ? cause.message : "无法创建会话");
       }
     }
     void loadConversation();
@@ -531,7 +604,7 @@ export default function ConversationPage() {
       try {
         await projectApi("/api/shortcuts/defaults", { method: "POST" });
         if (!cancelled) await refreshShortcuts();
-      } catch (cause) { if (!cancelled) fail(cause instanceof Error ? cause.message : "Unable to load shortcuts"); }
+      } catch (cause) { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法加载快捷任务"); }
     })();
     return () => { cancelled = true; };
   }, [fail, refreshShortcuts, projectApi, projectId]);
@@ -552,10 +625,11 @@ export default function ConversationPage() {
       try {
         const data = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
         if (!isCurrentConversation()) return;
+        data.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
         setMessages((current) => mergeReloadMessages(data.messages, current));
         setEvents((current) => mergeConversationItems(data.events, current));
         setRun(data.activeRunId || ""); setHasMoreHistory(data.hasMore); setHasMoreMessageHistory(data.hasMoreMessages); setHistoryCursor(data.nextCursor || "");
-      } catch (cause) { if (isCurrentConversation()) fail(cause instanceof Error ? cause.message : "Unable to refresh conversation"); }
+      } catch (cause) { if (isCurrentConversation()) fail(cause instanceof Error ? cause.message : "无法刷新会话"); }
     };
 
     const connect = () => {
@@ -579,6 +653,7 @@ export default function ConversationPage() {
             const canonicalRunID = event.runId;
             const canonicalParent = typeof m.parentToolUseId === "string" ? m.parentToolUseId : "";
             const canonicalCreatedAt = typeof m.createdAt === "string" ? m.createdAt : event.createdAt;
+            recordAssistantOutput(canonicalRunID, canonicalContent);
             setMessages((old) => {
               const filtered = old.filter((item) => {
                 if (!isTemporaryMessage(item) || item.role !== "assistant") return true;
@@ -600,6 +675,7 @@ export default function ConversationPage() {
           for (const [index, part] of content.entries()) {
             if (part?.type !== "text" || typeof part.text !== "string") continue;
             const textPart = part.text;
+            recordAssistantOutput(event.runId, textPart);
             setMessages((old) => {
               const alreadyCanonical = old.some(
                 (item) =>
@@ -624,7 +700,7 @@ export default function ConversationPage() {
           }
         }
         if (event.type === "usage.updated" || event.type.startsWith("run.")) {
-          void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
+          void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
         }
         if (event.type.startsWith("run.")) {
           const runPayload = asRecord(event.payload);
@@ -632,6 +708,8 @@ export default function ConversationPage() {
             const markerMessage: Message = { id: `${event.id}:interrupted`, runId: event.runId, role: "assistant", content: runPayload.interruptedMarker, createdAt: event.createdAt };
             setMessages((old) => mergeConversationItems(old, [markerMessage]));
           }
+          pendingUserDrafts.current.delete(event.runId);
+          assistantOutputRuns.current.delete(event.runId);
           rememberFinishedRun(event.runId);
           setRun((active) => active === event.runId ? "" : active);
           setStopping(false);
@@ -668,13 +746,13 @@ export default function ConversationPage() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       try { socket.close(); } catch { /* already closed */ }
     };
-  }, [conversation?.id, fail, refreshUsage, projectApi]);
+  }, [conversation?.id, fail, recordAssistantOutput, refreshUsage, projectApi]);
 
   // 刷新使用统计
   useEffect(() => {
     if (!conversation) return undefined;
     let cancelled = false;
-    void refreshUsage().catch((cause) => { if (!cancelled) fail(cause instanceof Error ? cause.message : "Unable to load usage"); });
+    void refreshUsage().catch((cause) => { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法加载用量统计"); });
     return () => { cancelled = true; };
   }, [conversation?.id, fail, refreshUsage]);
 
@@ -697,6 +775,7 @@ export default function ConversationPage() {
         if (!data.activeRunId) {
           const full = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
           if (cancelled) return;
+          full.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
           setMessages((current) => mergeReloadMessages(full.messages, current));
           setEvents((current) => mergeConversationItems(full.events, current));
           setRun(full.activeRunId || ""); setHasMoreHistory(full.hasMore); setHasMoreMessageHistory(full.hasMoreMessages); setHistoryCursor(full.nextCursor || "");
@@ -711,11 +790,13 @@ export default function ConversationPage() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [run, conversation?.id, projectApi]);
+  }, [run, conversation?.id, projectApi, recordAssistantOutput]);
 
   // 对话切换时重置输入历史
   useEffect(() => {
     if (!conversation) return;
+    pendingUserDrafts.current.clear();
+    assistantOutputRuns.current.clear();
     historyIndex.current = null;
     draftBeforeHistory.current = "";
     setInputHistory([]);
@@ -729,7 +810,7 @@ export default function ConversationPage() {
       try {
         const history = await projectApi<string[]>(`/api/conversations/${conversation.id}/input-history?limit=100`);
         if (!cancelled) setInputHistory(history);
-      } catch (cause) { if (!cancelled) fail(cause instanceof Error ? cause.message : "Unable to load input history"); }
+      } catch (cause) { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法加载输入历史"); }
     };
     void loadHistory();
     return () => { cancelled = true; };
@@ -757,6 +838,7 @@ export default function ConversationPage() {
     try {
       const data = await projectApi<{ messages: Message[]; events: Event[]; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversationID}?limit=400&cursor=${encodeURIComponent(historyCursor)}`);
       if (conversationRef.current?.id !== conversationID) return false;
+      data.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
       setMessages((current) => mergeConversationItems(data.messages, current));
       setEvents((current) => mergeConversationItems(data.events, current));
       setHasMoreHistory(data.hasMore);
@@ -771,7 +853,7 @@ export default function ConversationPage() {
       });
       return true;
     } catch (cause) {
-      fail(cause instanceof Error ? cause.message : "Unable to load earlier conversation history");
+      fail(cause instanceof Error ? cause.message : "无法加载更早的会话历史");
       return false;
     } finally { setLoadingOlderHistory(false); }
   };
@@ -789,25 +871,28 @@ export default function ConversationPage() {
   // 滚动
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     if (isNarrowConversationLayout()) {
+      // 窄屏下 timeline overflow: visible，滚动容器是 window
       window.scrollTo({ top: document.documentElement.scrollHeight, behavior });
-      setHasNewContent(false);
-      userNearBottom.current = true;
-      setCurrentUserMessageIndex(userMessages.length - 1);
-      return;
+    } else {
+      const container = timelineRef.current;
+      if (!container) return;
+      container.scrollTo({ top: Math.max(0, container.scrollHeight - container.clientHeight), behavior });
     }
-    const container = timelineRef.current;
-    if (!container) return;
-    container.scrollTo({ top: Math.max(0, container.scrollHeight - container.clientHeight), behavior });
     setHasNewContent(false);
     userNearBottom.current = true;
     setCurrentUserMessageIndex(userMessages.length - 1);
   }, [userMessages.length]);
 
+  // 延迟一帧再滚动到底部，确保 DOM 已更新后再读取 scrollHeight
+  const scrollToBottomNextFrame = useCallback((behavior: ScrollBehavior = "auto") => {
+    requestAnimationFrame(() => scrollToBottom(behavior));
+  }, [scrollToBottom]);
+
   const followAfterDispatch = useCallback(() => {
     userNearBottom.current = true;
     setHasNewContent(false);
-    requestAnimationFrame(() => scrollToBottom("auto"));
-  }, [scrollToBottom]);
+    scrollToBottomNextFrame("auto");
+  }, [scrollToBottomNextFrame]);
 
   const scrollToTop = useCallback(() => {
     userNearBottom.current = false;
@@ -952,6 +1037,7 @@ export default function ConversationPage() {
       const followBottom = userNearBottom.current;
       timelineElement.style.setProperty("--composer-height", `${Math.ceil(composer.getBoundingClientRect().height)}px`);
       if (!followBottom) return;
+      // 去抖：取消上一帧的滚动请求，只保留最新一次
       if (bottomSafeAreaFrame.current !== null) cancelAnimationFrame(bottomSafeAreaFrame.current);
       bottomSafeAreaFrame.current = requestAnimationFrame(() => {
         bottomSafeAreaFrame.current = null;
@@ -1018,15 +1104,15 @@ export default function ConversationPage() {
   useEffect(() => {
     if (pendingApproval) return;
     if (userNearBottom.current) {
-      scrollToBottom("auto");
+      scrollToBottomNextFrame("auto");
     } else {
       setHasNewContent((prev) => prev ? prev : true);
     }
-  }, [visibleContentVersion, run, pendingApproval, scrollToBottom]);
+  }, [visibleContentVersion, run, pendingApproval, scrollToBottomNextFrame]);
 
   // 业务方法
   const sendContent = async (rawContent: string, clearDraft = true) => {
-    if (!conversation || sending || clearing || shortcutBusy) return;
+    if (!conversation || sending || clearing || stopping || shortcutBusy) return;
     const content = rawContent.trim();
     if (!content) return;
     if (content === "/resume") { if (clearDraft) setText(""); openConversationHistory(); return; }
@@ -1037,11 +1123,12 @@ export default function ConversationPage() {
     try {
       const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content }) });
       if (conversationRef.current?.id !== conversationID) return;
+      if (!assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, data.message.content);
       setMessages((old) => [...old, data.message]); setInputHistory((old) => [...old.slice(-99), data.message.content]); setHistoryRefresh((version) => version + 1); setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
       followAfterDispatch();
-      void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
-      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to send message"); if (clearDraft) setText(content); }
+      void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
+      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
+    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法发送消息"); if (clearDraft) setText(content); }
     finally { setSending(false); }
   };
 
@@ -1051,7 +1138,7 @@ export default function ConversationPage() {
   };
 
   const runShortcut = async (shortcut: Shortcut, variables: Record<string, string> = {}, variablesReady = false) => {
-    if (!conversation || sending || clearing || shortcutBusy) return;
+    if (!conversation || sending || clearing || stopping || shortcutBusy) return;
     const required = requiredShortcutVariables(shortcut.template);
     if (!variablesReady && required.length) { setShortcutVariables({ shortcut, variables }); return; }
     if (shortcut.defaultAction === "fill") {
@@ -1059,7 +1146,7 @@ export default function ConversationPage() {
       try {
         const preview = await projectApi<{ content: string }>(`/api/conversations/${conversation.id}/shortcuts/${shortcut.id}/preview`, { method: "POST", body: JSON.stringify({ variables }) });
         setText(preview.content);
-      } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to prepare shortcut"); }
+      } catch (cause) { fail(cause instanceof Error ? cause.message : "无法准备快捷任务"); }
       finally { setShortcutBusy(""); }
       return;
     }
@@ -1074,9 +1161,9 @@ export default function ConversationPage() {
       setHistoryRefresh((version) => version + 1);
       setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
       followAfterDispatch();
-      void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
-      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to run shortcut"); }
+      void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
+      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
+    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法运行快捷任务"); }
     finally { setShortcutBusy(""); }
   };
 
@@ -1085,21 +1172,35 @@ export default function ConversationPage() {
   };
 
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode) => {
-    if (sending || clearing || shortcutBusy || run || !projectId) { closeNewConversation(); return; }
+    if (sending || clearing || stopping || shortcutBusy || run || !projectId) { closeNewConversation(); return; }
     conversationTransitionRef.current = true;
     setClearing(true);
     try {
       const next = await projectApi<Conversation>(`/api/projects/${projectId}/conversations?new=true`, { method: "POST", body: JSON.stringify({ agentId, permissionMode }) });
       resetConversationView(next);
       navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
-      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
+      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
     }
-    catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to start a new conversation"); }
+    catch (cause) { fail(cause instanceof Error ? cause.message : "无法新建会话"); }
     finally { conversationTransitionRef.current = false; setClearing(false); }
   };
 
   const clearConversationContext = () => {
-    if (!conversation || run || sending || clearing || shortcutBusy) return;
+    if (!conversation || sending || clearing || stopping || shortcutBusy) return;
+    if (run) {
+      // 运行中时先停止再清空
+      setPendingConfirm({
+        title: "停止并清空",
+        message: "当前对话正在运行中，将先停止运行（包括排队中的请求）再清空上下文。当前内容仍可在历史会话中恢复。",
+        danger: true,
+        onConfirm: () => {
+          setPendingConfirm(null);
+          void stopAndClearRef.current();
+        },
+        onCancel: () => setPendingConfirm(null),
+      });
+      return;
+    }
     setPendingConfirm({
       title: "清空上下文",
       message: "将开始一个新的空白会话，当前内容仍可在历史会话中恢复。",
@@ -1111,8 +1212,56 @@ export default function ConversationPage() {
     });
   };
 
-  const clearCurrentConversation = async () => {
-    if (!conversation || run || sending || clearing || shortcutBusy) return;
+  const stopAndClear = async () => {
+    if (!conversation || stopping) return;
+    // 运行可能已在确认框等待期间自然结束
+    if (!run) {
+      void clearCurrentConversation();
+      return;
+    }
+    const currentRun = run;
+    const conversationID = conversation.id;
+    setStopping(true);
+    try {
+      await stopRunInternal(false);
+    } catch (cause) {
+      if (requiresForceStop(cause)) {
+        try {
+          await stopRunInternal(true);
+        } catch (forceCause) {
+          fail(forceCause instanceof Error ? forceCause.message : "无法强制停止任务");
+          setStopping(false);
+          return;
+        }
+      } else {
+        fail(cause instanceof Error ? cause.message : "无法停止任务");
+        setStopping(false);
+        return;
+      }
+    }
+    // 等待后端确认对话状态变为 idle（最多 10 秒）
+    let idle = false;
+    for (let i = 0; i < 20; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      try {
+        const status = await projectApi<{ conversation: Conversation; activeRunId: string | null }>(`/api/conversations/${conversationID}?limit=1`);
+        if (status.conversation.status === "idle" && !status.activeRunId) { idle = true; break; }
+      } catch { /* ignore polling errors */ }
+    }
+    setStopping(false);
+    if (!idle) {
+      // 超时时不清空 run，因为后端可能仍在 running
+      fail("停止超时，请稍后重试清空操作。");
+      return;
+    }
+    // 只清空我们正在停止的 run，避免误清空其他新启动的 run
+    setRun((active) => active === currentRun ? "" : active);
+    void clearCurrentConversation(true);
+  };
+  stopAndClearRef.current = stopAndClear;
+
+  const clearCurrentConversation = async (skipRunGuard = false) => {
+    if (!conversation || sending || clearing || shortcutBusy || (!skipRunGuard && run)) return;
     const conversationID = conversation.id;
     const routeVersion = conversationRouteVersion.current;
     const routeConversationID = urlConversationId;
@@ -1127,7 +1276,7 @@ export default function ConversationPage() {
       if (!clearStillOwnsView()) return;
       resetConversationView(next);
       if (projectId) navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
-      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
+      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
     } catch (cause) {
       // The request can fail after the server has committed the new
       // conversation. Reconcile before leaving the page on a historical one.
@@ -1144,7 +1293,7 @@ export default function ConversationPage() {
           // Preserve the original request error below when reconciliation fails.
         }
       }
-      if (clearStillOwnsView()) fail(cause instanceof Error ? cause.message : "Unable to clear conversation context");
+      if (clearStillOwnsView()) fail(cause instanceof Error ? cause.message : "无法清除会话上下文");
     } finally {
       conversationTransitionRef.current = false;
       setClearing(false);
@@ -1153,19 +1302,19 @@ export default function ConversationPage() {
 
   const activateConversation = async (item: Conversation) => {
     if (!conversation || item.id === conversation.id || item.status === "running") { closeHistory(); return; }
-    if (sending || clearing || shortcutBusy) { closeHistory(); return; }
+    if (sending || clearing || stopping || shortcutBusy) { closeHistory(); return; }
     setActivatingConversation(item.id);
     try {
       const next = await projectApi<Conversation>(`/api/conversations/${item.id}/activate`, { method: "POST" });
       resetConversationView(next, false); closeHistory();
       if (projectId) navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
-      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to switch conversation"); }
+      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
+    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法切换会话"); }
     finally { setActivatingConversation(""); }
   };
 
   const changePermissionMode = async (permissionMode: PermissionMode) => {
-    if (!conversation || conversation.permissionMode === permissionMode || run || clearing) return;
+    if (!conversation || conversation.permissionMode === permissionMode || run || clearing || stopping) return;
     if (permissionMode === "full_control") { setShowPermissionMenu(false); setShowFullControlConfirmation(true); return; }
     const conversationID = conversation.id;
     setChangingPermission(true);
@@ -1175,12 +1324,12 @@ export default function ConversationPage() {
       setConversation(updated);
       setShowPermissionMenu(false);
     }
-    catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to change permission mode"); }
+    catch (cause) { fail(cause instanceof Error ? cause.message : "无法修改权限模式"); }
     finally { setChangingPermission(false); }
   };
 
   const confirmFullControl = async () => {
-    if (!conversation || run || clearing) return;
+    if (!conversation || run || clearing || stopping) return;
     const conversationID = conversation.id;
     setChangingPermission(true);
     try {
@@ -1188,42 +1337,48 @@ export default function ConversationPage() {
       if (conversationRef.current?.id !== conversationID) return;
       setConversation(updated);
       setShowFullControlConfirmation(false);
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to change permission mode"); }
+    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法修改权限模式"); }
     finally { setChangingPermission(false); }
   };
 
   const decide = async (approvalId: string, decision: "allow" | "deny") => {
     setResolving(approvalId);
     try { await projectApi(`/api/approvals/${approvalId}`, { method: "POST", body: JSON.stringify({ decision }) }); }
-    catch (cause) { fail(cause instanceof Error ? cause.message : "Unable to resolve command approval"); }
+    catch (cause) { fail(cause instanceof Error ? cause.message : "无法处理命令审批"); }
     finally { setResolving(""); }
   };
 
-  const stopRunInternal = async (force: boolean) => {
-    const runID = run;
+  const stopRunInternal = async (force: boolean, requestedRunID = run) => {
+    const runID = requestedRunID;
     if (!runID) return;
     const url = force ? `/api/runs/${runID}/stop?force=true` : `/api/runs/${runID}/stop`;
     const result = await projectApi<{ status: string }>(url, { method: "POST" });
-    if (result.status !== "stopping") { rememberFinishedRun(runID); setRun((active) => active === runID ? "" : active); setStopping(false); }
+    if (result.status !== "stopping") { rememberFinishedRun(runID); setRun((active) => active === runID ? "" : active); }
+    return result.status;
   };
 
   const stopRun = async () => {
-    if (!run || stopping) return;
+    if (!conversation || !run || stopping) return;
+    const conversationID = conversation.id;
+    const routeVersion = conversationRouteVersion.current;
+    const runID = run;
+    const draftToRestore = assistantOutputRuns.current.has(runID) ? undefined : pendingUserDrafts.current.get(runID);
     setStopping(true);
     try {
-      await stopRunInternal(false);
+      const result = await stopRunInternal(false);
+      if (result !== "stopping") setStopping(false);
+      restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore);
     }
     catch (cause) {
-      const message = cause instanceof Error ? cause.message : "";
-      if (message.includes("queued") || message.includes("other queued") || message.includes("other queued or running")) {
+      if (requiresForceStop(cause)) {
         setPendingConfirm({
           title: "强制停止",
           message: "该对话还有其他排队中或执行中的请求，强制停止将一并取消它们。是否继续？",
           danger: true,
           onConfirm: () => {
             setPendingConfirm(null);
-            void stopRunInternal(true).catch((cause) => {
-              fail(cause instanceof Error ? cause.message : "Unable to stop run");
+            void stopRunInternal(true, runID).then((result) => { restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore); if (result !== "stopping") setStopping(false); }).catch((cause) => {
+              fail(cause instanceof Error ? cause.message : "无法停止任务");
               setStopping(false);
             });
           },
@@ -1231,8 +1386,9 @@ export default function ConversationPage() {
         });
         return;
       }
-      fail(cause instanceof Error ? cause.message : "Unable to stop run");
+      fail(cause instanceof Error ? cause.message : "无法停止任务");
       setStopping(false);
+      return;
     }
   };
   stopRunRef.current = stopRun;
@@ -1279,8 +1435,8 @@ export default function ConversationPage() {
     setInputHistory((items) => [...items.slice(-99), message.content]);
     setHistoryRefresh((version) => version + 1);
     setRun(finishedRunIds.current.has(runID) ? "" : runID);
-    void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh usage"));
-    void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "Unable to refresh conversation history"));
+    void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
+    void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
   };
 
   const isCodex = conversation?.agentId === "codex";
@@ -1298,7 +1454,7 @@ export default function ConversationPage() {
   const renderShortcutCell = (shortcut: Shortcut | undefined, kind: "prompt" | "command_request", placeholder = false) => {
     if (!shortcut && placeholder) return <div className="quick-tag-slot" aria-hidden="true" />;
     if (!shortcut) return <button type="button" className={`quick-tag-empty${kind === "command_request" ? " command-tag" : ""}`} onClick={() => setShortcutEditor({ kind })}>{kind === "command_request" ? "添加命令" : "添加提示词"}</button>;
-    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={!shortcut.enabled || !conversation || sending || clearing || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.name}已停用`}>{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} disabled={clearing || Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}>...</button></div>;
+    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={!shortcut.enabled || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.template}\n\n${shortcut.name}已停用`}>{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} disabled={clearing || Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}>...</button></div>;
   };
 
   return <>
@@ -1306,14 +1462,14 @@ export default function ConversationPage() {
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
         <div className="head-actions">
           <div className="permission-menu">
-            <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} disabled={!!run || clearing || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}>{permissionLabel}</button>
+            <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} disabled={!!run || clearing || stopping || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}>{permissionLabel}</button>
             {showPermissionMenu && <div className="permission-popover" role="menu">{isCodex ? <><button className={conversation?.permissionMode === "read_only" ? "selected" : ""} onClick={() => void changePermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={conversation?.permissionMode === "workspace_write" ? "selected" : ""} onClick={() => void changePermissionMode("workspace_write")}><b>项目内执行</b><span>可在当前项目范围内读写和执行。</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>不受沙箱限制，命令直接执行</span></button></> : <><button className={conversation?.permissionMode === "approval_required" ? "selected" : ""} onClick={() => void changePermissionMode("approval_required")}><b>默认权限</b><span>命令执行前需要确认</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>命令直接执行</span></button></>}</div>}
           </div>
           <button className="secondary" disabled={sending} onClick={openConversationHistory}>历史</button>
-          <button className="secondary" disabled={!!run || sending} onClick={openNewConversationParam}>新会话</button>
+          <button className="secondary" disabled={!!run || sending || stopping} onClick={openNewConversationParam}>新会话</button>
         </div>
       </div>, document.querySelector('.head-actions-slot') || document.body)}
-    {/* 对话面板：快捷方式 + 时间线 + 输入框 */}
+    {/* 对话面板：快捷方式、对话内容和任务队列 */}
     <section className="conversation-canvas">
       <aside className="quick-tag-rail" aria-label="常用操作">
         <div className="quick-actions-row">
@@ -1324,14 +1480,13 @@ export default function ConversationPage() {
           <div className="quick-tag-group"><div className="quick-tag-heading"><span>常用提示词</span><button type="button" title="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}>+</button></div><div className="quick-tag-list">{promptShortcutItems.map((shortcut, index) => <div key={shortcut?.id || `empty-prompt-${index}`}>{renderShortcutCell(shortcut, "prompt")}</div>)}</div></div>
           <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span>常用命令</span><button type="button" title="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}>+</button></div><div className="quick-tag-list">{commandShortcutItems.map((shortcut, index) => <div key={shortcut?.id || `empty-command-${index}`}>{renderShortcutCell(shortcut, "command_request")}</div>)}</div></div>
         </div>
-        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} />
       </aside>
       <section className="chat-center">
       <section className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
         <div ref={top} />
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
         {timeline.length === 0 && <div className="empty conversation-empty"><h2>开始与 {isCodex ? "Codex" : "Claude Code"} 对话</h2><p>选择常用操作，或直接描述希望工具完成的工作。</p><button className="secondary" type="button" onClick={() => composerRef.current?.querySelector("textarea")?.focus()}>开始输入</button></div>}
-        {timeline.map((item) => <div key={item.id} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { if (element) userMessageElements.current.set(item.message.id, element); else userMessageElements.current.delete(item.message.id); } : undefined}><div className={`timeline-entry ${item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={conversation?.agentId || "claude-code"} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : <ErrorCard item={item} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => openExecutionParam(item.message.runId!)} />}</div>)}
+        {timeline.map((item) => <div key={item.id} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { if (element) userMessageElements.current.set(item.message.id, element); else userMessageElements.current.delete(item.message.id); } : undefined}><div className={`timeline-entry ${item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={conversation?.agentId || "claude-code"} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : <ErrorCard item={item} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => openExecutionParam(item.message.runId!)} />}</div>)}
         {agentExecutions.filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => openExecutionParam(execution.runId)} />)}
         {run && <div className="run-indicator"><span></span>{runLabel}</div>}
         <div ref={bottom} />
@@ -1340,14 +1495,17 @@ export default function ConversationPage() {
         <button type="button" className="scroll-btn scroll-to-top" title="回到顶部" aria-label="回到顶部" onClick={scrollToTop}>⇞</button>
         <button type="button" className="scroll-btn scroll-to-previous-message" title="上一条我的消息" aria-label="上一条我的消息" disabled={loadingOlderHistory || (userMessageNavigationIndex <= 0 && !hasMoreMessageHistory)} onClick={goToPreviousUserMessage}>↑</button>
         <button type="button" className="scroll-btn scroll-to-next-message" title="下一条我的消息" aria-label="下一条我的消息" disabled={userMessageNavigationIndex < 0 || userMessageNavigationIndex >= userMessages.length - 1} onClick={goToNextUserMessage}>↓</button>
-        <button type="button" className={`scroll-btn scroll-to-bottom${hasNewContent ? " pulse" : ""}`} title="回到底部" aria-label="回到底部" onClick={() => scrollToBottom("auto")}>⇟</button>
+        <button type="button" className={`scroll-btn scroll-to-bottom${hasNewContent ? " pulse" : ""}`} title="回到底部" aria-label="回到底部" onClick={() => scrollToBottomNextFrame("auto")}>⇟</button>
       </div>
       <form ref={composerRef} className={`composer${pendingApproval ? " has-approval" : ""}`} onSubmit={(event) => void send(event)}>
         {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
-        <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={`描述希望${isCodex ? " Codex" : " Claude"}在当前项目中完成的工作...`} disabled={sending || clearing || Boolean(shortcutBusy)} />
-        <div><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary" type="button" disabled={Boolean(run) || sending || clearing || Boolean(shortcutBusy)} onClick={clearConversationContext}>清空</button><button className="secondary" type="button" disabled={sending || clearing} onClick={() => void sendContent("继续", false)}>继续</button>{run && <button className="secondary" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<button className="primary" disabled={!text.trim() || sending || clearing || Boolean(shortcutBusy)}>{sending ? "发送中" : "发送"}</button></span></div>
+        <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={`描述希望${isCodex ? " Codex" : " Claude"}在当前项目中完成的工作...`} disabled={sending || clearing || stopping || Boolean(shortcutBusy)} />
+        <div><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary" type="button" disabled={sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}>清空</button><button className="secondary" type="button" disabled={sending || clearing || stopping} onClick={() => void sendContent("继续", false)}>继续</button>{run && <button className="secondary" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<button className="primary" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}>{sending ? "发送中" : "发送"}</button></span></div>
       </form>
       </section>
+      <aside className="task-queue-rail" aria-label="任务队列">
+        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} />
+      </aside>
     </section>
     {showNewConversation && <NewConversationDialog runnerID={project.runner} close={closeNewConversation} create={newConversation} />}
     {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} />}

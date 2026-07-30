@@ -8,27 +8,6 @@
 	overflow: hidden;
 }
 
-.run-panel-head {
-	display: flex;
-	align-items: flex-start;
-	justify-content: space-between;
-	padding: 20px max(24px, calc((100vw - 920px) / 2)) 16px;
-	border-bottom: 1px solid var(--border, #e5e7eb);
-}
-
-.run-panel-head label {
-	font-size: 11px;
-	font-weight: 600;
-	letter-spacing: 0.5px;
-	color: var(--text-secondary, #6b7280);
-}
-
-.run-panel-head h2 {
-	margin: 4px 0 0;
-	font-size: 18px;
-	font-weight: 600;
-}
-
 /* ===== 左右分栏布局 ===== */
 .run-body {
 	flex: 1;
@@ -110,7 +89,7 @@
 
 .run-log-line {
 	display: grid;
-	grid-template-columns: 72px 30px minmax(0, 1fr);
+	grid-template-columns: 72px 52px minmax(0, 1fr);
 	gap: 10px;
 	align-items: start;
 	padding: 1px 18px;
@@ -161,15 +140,32 @@
 	background: #1d4439;
 }
 
+.run-log-line.stderr .run-log-stream {
+	border-color: #68584d;
+	color: #cbb5a7;
+	background: #382f29;
+}
+
 .run-log-line.is-error {
 	border-left-color: #ef8b78;
 	color: #ffd0c8;
 }
 
-.run-log-line.stderr .run-log-stream {
-	border-color: #68584d;
-	color: #cbb5a7;
-	background: #382f29;
+.run-log-line.is-error .run-log-stream {
+	border-color: #99564c;
+	color: #ffd0c8;
+	background: #4b2d29;
+}
+
+.run-log-line.is-warning {
+	border-left-color: #f5d76b;
+	color: #f8e7a3;
+}
+
+.run-log-line.is-warning .run-log-stream {
+	border-color: #8b783a;
+	color: #f8e7a3;
+	background: #443d1d;
 }
 
 .ansi-bold { font-weight: 700; }
@@ -309,12 +305,6 @@
 
 	.run-log-terminal-wrap {
 		min-height: 80px;
-	}
-
-	/* 移动端紧凑 padding */
-	.run-panel-head {
-		padding-left: 16px;
-		padding-right: 16px;
 	}
 
 	.run-log-section > header {
