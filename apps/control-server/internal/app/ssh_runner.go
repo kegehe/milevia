@@ -58,7 +58,9 @@ func remotePathWithinRoot(root, candidate string) bool {
 func newSSHClient(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
 	c := &sshClient{host: conn.Host, port: conn.Port}
 	var auth ssh.AuthMethod
-	if conn.PrivateKeyPath != "" {
+	if conn.Password != "" {
+		auth = ssh.Password(conn.Password)
+	} else if conn.PrivateKeyPath != "" {
 		keyBytes, err := os.ReadFile(conn.PrivateKeyPath)
 		if err != nil {
 			return nil, fmt.Errorf("读取私钥 %s 失败：%w", conn.PrivateKeyPath, err)

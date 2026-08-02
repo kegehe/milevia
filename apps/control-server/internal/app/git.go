@@ -252,6 +252,71 @@ type gitCLIRunner struct{ timeout time.Duration }
 
 func newGitRunner() GitRunner { return &gitCLIRunner{timeout: gitCommandTimeout} }
 
+func (runner *gitCLIRunner) Fetch(ctx context.Context, repo, remote string) error {
+	if remote == "" {
+		remote = "origin"
+	}
+	if err := validateGitRef(remote); err != nil {
+		return err
+	}
+	_, err := runner.command(ctx, repo, "fetch", "--prune", remote)
+	return err
+}
+
+func (runner *gitCLIRunner) Push(ctx context.Context, repo, remote, branch string, setUpstream bool) error {
+	if remote == "" {
+		remote = "origin"
+	}
+	if branch == "" {
+		return errors.New("branch is required for push")
+	}
+	if err := validateGitRef(remote); err != nil {
+		return err
+	}
+	if err := validateGitRef(branch); err != nil {
+		return err
+	}
+	args := []string{"push"}
+	if setUpstream {
+		args = append(args, "--set-upstream")
+	}
+	args = append(args, remote, "HEAD:"+branch)
+	_, err := runner.command(ctx, repo, args...)
+	return err
+}
+
+func (runner *gitCLIRunner) CreateBranch(ctx context.Context, repo, name, startPoint string) error {
+	if name == "" {
+		return errors.New("branch name is required")
+	}
+	if err := validateGitRef(name); err != nil {
+		return err
+	}
+	if _, err := runner.command(ctx, repo, "check-ref-format", "--branch", "refs/heads/"+name); err != nil {
+		return fmt.Errorf("invalid Git branch name: %w", err)
+	}
+	args := []string{"branch", name}
+	if startPoint != "" {
+		if err := validateGitRef(startPoint); err != nil {
+			return err
+		}
+		args = append(args, startPoint)
+	}
+	_, err := runner.command(ctx, repo, args...)
+	return err
+}
+
+func (runner *gitCLIRunner) SwitchBranch(ctx context.Context, repo, name string) error {
+	if name == "" {
+		return errors.New("branch name is required")
+	}
+	if err := validateGitRef(name); err != nil {
+		return err
+	}
+	_, err := runner.command(ctx, repo, "switch", name)
+	return err
+}
+
 func (runner *gitCLIRunner) Snapshot(ctx context.Context, repo string) (GitSnapshot, error) {
 	raw, err := runner.command(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
 	if err != nil {

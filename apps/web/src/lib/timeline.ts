@@ -18,12 +18,25 @@ function firstText(...values: unknown[]): string {
   return "";
 }
 
+// isInternalError detects Go runtime errors that would leak implementation
+// details to the UI \u2014 stack traces, panics, and file/line references.
+function isInternalError(message: string): boolean {
+  return message.includes(".go:") || message.includes("panic:") || message.includes("goroutine");
+}
+
 function localizedErrorDetail(value: unknown, fallback: string): string {
   const detail = typeof value === "string" ? value.trim() : "";
   if (!detail) return fallback;
-  if (!/[\u4e00-\u9fff]/.test(detail)) return fallback;
-  const withoutTechnicalTerms = detail.replace(allowedTechnicalTerms, "");
-  return /[A-Za-z]{3,}/.test(withoutTechnicalTerms) ? fallback : detail;
+  // Pure Chinese without untranslated English \u2014 display directly.
+  if (/[\u4e00-\u9fff]/.test(detail)) {
+    const withoutTechnicalTerms = detail.replace(allowedTechnicalTerms, "");
+    if (!/[A-Za-z]{3,}/.test(withoutTechnicalTerms)) return detail;
+  }
+  // Internal Go errors (stack traces, panics) \u2014 keep the fallback only.
+  if (isInternalError(detail)) return fallback;
+  // English or mixed-language errors \u2014 keep the fallback as a prefix, then
+  // append the original error so users can see the real cause.
+  return fallback + "\uff1a" + detail;
 }
 
 // Codex emits top-level failures as JSONL events. Depending on the failure
@@ -142,13 +155,25 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
     if (seenDiagnostics.has(key)) return;
     seenDiagnostics.add(key);
     if (detailed) detailedRuns.add(event.runId);
-    errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title, detail: normalized });
+    const payload = asRecord(event.payload);
+    const taskId = typeof payload.taskId === "string" && payload.taskId ? payload.taskId : undefined;
+    errorItems.push({ kind: "error", id: event.id, createdAt: event.createdAt, runId: event.runId, title, detail: normalized, taskId });
   };
   for (const event of events) {
     const payload = asRecord(event.payload);
-    const detail = eventErrorDetail(payload);
+    const rawDetail = firstText(
+      payload.message,
+      payload.detail,
+      payload.reason,
+      typeof payload.error === "string" ? payload.error : "",
+      asRecord(payload.error).message,
+      asRecord(payload.error).detail,
+      asRecord(payload.error).reason,
+      asRecord(payload.error).code,
+    );
+    const detail = localizedErrorDetail(rawDetail, "任务执行失败，请查看任务日志后重试。");
     if (event.type === "run.failed" || event.type === "run.interrupted") {
-      if (detail && !isGenericCodexExit(detail)) {
+      if (detail && !isGenericCodexExit(rawDetail)) {
         addDiagnostic(event, event.type === "run.interrupted" ? "执行中断" : "执行失败", detail);
       } else if (detail) {
         fallbackTerminalFailures.push({ event, detail });

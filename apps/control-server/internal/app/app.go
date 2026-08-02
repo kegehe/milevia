@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -528,6 +529,7 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/runners/{runnerID}/codex/check-update", s.checkCodexUpdate)
 	r.Post("/api/runners/{runnerID}/codex/update", s.updateCodex)
 	r.Get("/api/directories", s.listDirectories)
+	r.Post("/api/directories/mkdir", s.createDirectory)
 	r.Post("/api/projects/validate", s.validateProject)
 	r.Get("/api/projects", s.listProjects)
 	r.Get("/api/projects/statuses", s.listProjectStatuses)
@@ -545,6 +547,10 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/unstage-all", s.gitUnstageAll)
 	r.Post("/api/projects/{projectID}/git/commits", s.gitCommit)
 	r.Post("/api/projects/{projectID}/git/discard", s.gitDiscard)
+	r.Post("/api/projects/{projectID}/git/fetch", s.gitFetch)
+	r.Post("/api/projects/{projectID}/git/push", s.gitPush)
+	r.Post("/api/projects/{projectID}/git/branches", s.gitCreateBranch)
+	r.Post("/api/projects/{projectID}/git/switch", s.gitSwitchBranch)
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
@@ -1180,6 +1186,103 @@ func (s *Server) listDirectories(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"path": path, "parent": parent, "directories": items})
+}
+
+func (s *Server) createDirectory(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Path   string `json:"path"`
+		Runner string `json:"runner"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	runnerID := input.Runner
+	if runnerID == "" {
+		runnerID = "wsl-local"
+	}
+	if input.Path == "" {
+		writeError(w, http.StatusBadRequest, errors.New("path 必填"))
+		return
+	}
+	// 校验文件夹名称
+	name := filepath.Base(input.Path)
+	if name == "" || name == "." || name == ".." || strings.HasPrefix(name, ".") ||
+		strings.Contains(name, "/") || strings.Contains(name, "\\") || strings.ContainsRune(name, 0) {
+		writeError(w, http.StatusBadRequest, errors.New("文件夹名称无效"))
+		return
+	}
+	// SSH runner
+	if strings.HasPrefix(runnerID, "ssh-") {
+		runner, ok := s.runnerRegistry.get(runnerID)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("未找到运行环境"))
+			return
+		}
+		sshR, ok := runner.(*sshRunner)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("运行环境不是 SSH 类型"))
+			return
+		}
+		// 校验父目录路径在 SSH root 范围内
+		parentPath := pathpkg.Dir(input.Path)
+		resolvedParent, err := sshR.canonicalProjectPath(r.Context(), parentPath)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		fullPath := pathpkg.Join(resolvedParent, name)
+		sftpClient, err := sshR.client.getSFTPClient(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		// 检查是否已存在
+		if info, err := sftpClient.Stat(fullPath); err == nil {
+			if info.IsDir() {
+				writeError(w, http.StatusConflict, errors.New("目录已存在"))
+			} else {
+				writeError(w, http.StatusConflict, errors.New("同名文件已存在"))
+			}
+			return
+		}
+		if err := sftpClient.Mkdir(fullPath); err != nil {
+			// SFTP Mkdir 在目录已存在时可能返回错误，尝试 Stat 区分
+			if info, statErr := sftpClient.Stat(fullPath); statErr == nil && info.IsDir() {
+				writeError(w, http.StatusConflict, errors.New("目录已存在"))
+				return
+			}
+			writeError(w, http.StatusBadRequest, fmt.Errorf("无法创建远程目录：%w", err))
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"path": fullPath, "name": name})
+		return
+	}
+	// 本地 runner
+	parentPath := filepath.Dir(input.Path)
+	resolvedParent, err := s.allowedPathForRunner(parentPath, runnerID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	fullPath := filepath.Join(resolvedParent, name)
+	// 检查是否已存在
+	if info, err := os.Stat(fullPath); err == nil {
+		if info.IsDir() {
+			writeError(w, http.StatusConflict, errors.New("目录已存在"))
+		} else {
+			writeError(w, http.StatusConflict, errors.New("同名文件已存在"))
+		}
+		return
+	}
+	if err := os.Mkdir(fullPath, 0o755); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			writeError(w, http.StatusConflict, errors.New("目录已存在"))
+			return
+		}
+		writeError(w, http.StatusBadRequest, fmt.Errorf("无法创建目录：%w", err))
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"path": fullPath, "name": name})
 }
 
 func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
@@ -3145,7 +3248,14 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 		}
 	}
 	payload := map[string]any{"status": status, "error": errorText(runErr)}
-	if details, ok := runErr.(interface{ ErrorDetails() map[string]string }); ok {
+		// Attach taskId so the frontend can link error cards to the task detail page.
+		{
+			var payloadTaskID string
+			if err := s.db.QueryRowContext(s.runtimeCtx, `select task_id from task_runs where run_id=?`, runID).Scan(&payloadTaskID); err == nil && payloadTaskID != "" {
+				payload["taskId"] = payloadTaskID
+			}
+		}
+		if details, ok := runErr.(interface{ ErrorDetails() map[string]string }); ok {
 		for key, value := range details.ErrorDetails() {
 			payload[key] = value
 		}
@@ -3706,13 +3816,26 @@ func localizedErrorText(err error, fallback string) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "操作超时，请稍后重试。"
 	}
-	if containsChinese(message) {
-		if containsUntranslatedEnglish(message) {
-			return fallback
-		}
+	// Pure Chinese error without untranslated English — display directly.
+	if containsChinese(message) && !containsUntranslatedEnglish(message) {
 		return message
 	}
-	return fallback
+	// Internal Go errors (stack traces, panics) — keep the fallback only
+	// to avoid leaking implementation details.
+	if isInternalError(message) {
+		return fallback
+	}
+	// English or mixed-language errors — keep the fallback as a prefix so
+	// users always see a Chinese description, then append the original error.
+	return fallback + "：" + message
+}
+
+// isInternalError detects Go runtime errors that would leak implementation
+// details to the UI — stack traces, panics, and file/line references.
+func isInternalError(message string) bool {
+	return strings.Contains(message, ".go:") ||
+		strings.Contains(message, "panic:") ||
+		strings.Contains(message, "goroutine")
 }
 
 func containsChinese(value string) bool {

@@ -29,6 +29,7 @@ type SSHConnection struct {
 	Port           int        `json:"port"`
 	User           string     `json:"user"`
 	PrivateKeyPath string     `json:"-"`
+	Password       string     `json:"-"`
 	KnownHosts     string     `json:"-"`
 	RootPath       string     `json:"rootPath"`
 	Status         string     `json:"status"` // unknown / connected / disconnected / error
@@ -39,19 +40,24 @@ type SSHConnection struct {
 }
 
 // sanitizedSSHConnection returns a copy safe to expose via the API (private key
-// path and known_hosts redacted).
+// path, password and known_hosts redacted).
 func sanitizedSSHConnection(c SSHConnection) map[string]any {
+	authMethod := "key"
+	if c.Password != "" {
+		authMethod = "password"
+	}
 	return map[string]any{
-		"id":        c.ID,
-		"name":      c.Name,
-		"host":      c.Host,
-		"port":      c.Port,
-		"user":      c.User,
-		"rootPath":  c.RootPath,
-		"status":    c.Status,
-		"lastSeen":  c.LastSeen,
-		"errorMsg":  c.ErrorMsg,
-		"createdAt": c.CreatedAt,
+		"id":         c.ID,
+		"name":       c.Name,
+		"host":       c.Host,
+		"port":       c.Port,
+		"user":       c.User,
+		"authMethod": authMethod,
+		"rootPath":   c.RootPath,
+		"status":     c.Status,
+		"lastSeen":   c.LastSeen,
+		"errorMsg":   c.ErrorMsg,
+		"createdAt":  c.CreatedAt,
 	}
 }
 
@@ -84,11 +90,14 @@ func (s *Server) migrateSSHConnections(ctx context.Context) error {
 		last_seen       datetime,
 		error_msg       text not null default '',
 		created_at      datetime not null,
-		updated_at      datetime not null
+		updated_at      datetime not null,
+		password        text not null default ''
 	)`)
 	if err != nil {
 		return fmt.Errorf("migrate ssh_connections: %w", err)
 	}
+	// Add password column for existing databases that don't have it yet.
+	_, _ = s.db.ExecContext(ctx, `alter table ssh_connections add column password text not null default ''`)
 	return nil
 }
 
@@ -301,7 +310,7 @@ func hostKeyFingerprint(rawKey string) string {
 }
 
 func (s *Server) listSSHConnections(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at from ssh_connections order by created_at desc`)
+	rows, err := s.db.QueryContext(r.Context(), `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at,password from ssh_connections order by created_at desc`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -310,7 +319,7 @@ func (s *Server) listSSHConnections(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0)
 	for rows.Next() {
 		var c SSHConnection
-		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -326,8 +335,8 @@ func (s *Server) listSSHConnections(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getSSHConnection(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "connectionID")
 	var c SSHConnection
-	err := s.db.QueryRowContext(r.Context(), `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at from ssh_connections where id=?`, id).
-		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt)
+	err := s.db.QueryRowContext(r.Context(), `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where id=?`, id).
+		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("SSH connection not found"))
 		return
@@ -345,6 +354,8 @@ type sshConnectionInput struct {
 	Port           int    `json:"port"`
 	User           string `json:"user"`
 	PrivateKeyPath string `json:"privateKeyPath"`
+	AuthMethod     string `json:"authMethod"`
+	Password       string `json:"password"`
 	RootPath       string `json:"rootPath"`
 	ProfileName    string `json:"profileName"`
 	HostKey        string `json:"hostKey"`
@@ -362,8 +373,14 @@ func (input *sshConnectionInput) resolve() error {
 	if strings.TrimSpace(input.Name) == "" || strings.TrimSpace(input.Host) == "" || strings.TrimSpace(input.User) == "" {
 		return errors.New("name, host, and user are required")
 	}
-	if strings.TrimSpace(input.PrivateKeyPath) == "" && os.Getenv("SSH_AUTH_SOCK") == "" {
-		return errors.New("请指定私钥路径，或启动并配置 SSH Agent")
+	if input.AuthMethod == "password" {
+		if strings.TrimSpace(input.Password) == "" {
+			return errors.New("请输入密码")
+		}
+	} else {
+		if strings.TrimSpace(input.PrivateKeyPath) == "" && os.Getenv("SSH_AUTH_SOCK") == "" {
+			return errors.New("请指定私钥路径，或启动并配置 SSH Agent")
+		}
 	}
 	if input.Port <= 0 || input.Port > 65535 {
 		input.Port = 22
@@ -382,6 +399,7 @@ func (input sshConnectionInput) connection() SSHConnection {
 		Port:           input.Port,
 		User:           strings.TrimSpace(input.User),
 		PrivateKeyPath: strings.TrimSpace(input.PrivateKeyPath),
+		Password:       strings.TrimSpace(input.Password),
 		KnownHosts:     strings.TrimSpace(input.HostKey),
 		RootPath:       strings.TrimSpace(input.RootPath),
 		Status:         "unknown",
@@ -404,8 +422,8 @@ func (s *Server) createSSHConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := input.connection()
-	_, err := s.db.ExecContext(r.Context(), `insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.Name, c.Host, c.Port, c.User, c.PrivateKeyPath, c.KnownHosts, c.RootPath, c.Status, c.ErrorMsg, c.CreatedAt, c.UpdatedAt)
+	_, err := s.db.ExecContext(r.Context(), `insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at,password) values (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, c.Host, c.Port, c.User, c.PrivateKeyPath, c.KnownHosts, c.RootPath, c.Status, c.ErrorMsg, c.CreatedAt, c.UpdatedAt, c.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("save ssh connection: %w", err))
 		return
@@ -556,8 +574,8 @@ func (s *Server) ensureSSHRunnerInactive(ctx context.Context, runnerID string) e
 // loadSSHConnection reads a single SSH connection from the database.
 func (s *Server) loadSSHConnection(ctx context.Context, id string) (*SSHConnection, error) {
 	var c SSHConnection
-	err := s.db.QueryRowContext(ctx, `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at from ssh_connections where id=?`, id).
-		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where id=?`, id).
+		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password)
 	if err != nil {
 		return nil, err
 	}
@@ -673,14 +691,14 @@ func (s *Server) markSSHStatus(ctx context.Context, c *SSHConnection, status, er
 // recoverSSHConnections is called during startup to re-register SSH connections
 // that were previously connected.
 func (s *Server) recoverSSHConnections(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at from ssh_connections where status='connected'`)
+	rows, err := s.db.QueryContext(ctx, `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where status='connected'`)
 	if err != nil {
 		return fmt.Errorf("query ssh connections for recovery: %w", err)
 	}
 	connections := []SSHConnection{}
 	for rows.Next() {
 		var c SSHConnection
-		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan ssh connection: %w", err)
 		}

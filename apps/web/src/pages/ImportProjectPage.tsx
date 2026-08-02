@@ -47,6 +47,10 @@ function ImportCheckIcon() {
   return <svg className="import-check-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6.5 12 3.4 3.4 7.6-7.6" /></svg>;
 }
 
+function ImportNewFolderIcon() {
+  return <svg className="import-control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l1.8 2h9.2v8.2a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2V7.5Z" /><path d="M12 12v5M9.5 14.5h5" /></svg>;
+}
+
 export default function ImportProjectPage() {
   const { api } = useProjectContext();
   const navigate = useNavigate();
@@ -61,6 +65,10 @@ export default function ImportProjectPage() {
   const [localError, setLocalError] = useState<string | null>(null);
   const [loadingDirectory, setLoadingDirectory] = useState(false);
   const [directoryReady, setDirectoryReady] = useState(false);
+  const [creatingDirectory, setCreatingDirectory] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [showNewFolderInput, setShowNewFolderInput] = useState(false);
+  const newFolderInputRef = useRef<HTMLInputElement>(null);
   const mountedRef = useRef(true);
   const browseRequestRef = useRef(0);
   const validationRequestRef = useRef(0);
@@ -74,6 +82,10 @@ export default function ImportProjectPage() {
       createRequestRef.current++;
     };
   }, []);
+
+  useEffect(() => {
+    if (showNewFolderInput && newFolderInputRef.current) newFolderInputRef.current.focus();
+  }, [showNewFolderInput]);
   const [loadingRoots, setLoadingRoots] = useState(true);
 
   useEffect(() => {
@@ -109,6 +121,8 @@ export default function ImportProjectPage() {
     setParent("");
     setDirs([]);
     setResult(null);
+    setShowNewFolderInput(false);
+    setNewFolderName("");
     try {
       const query = target ? `?path=${encodeURIComponent(target)}` : "";
       const runnerParam = runnerID ? `${query ? "&" : "?"}runner=${encodeURIComponent(runnerID)}` : "";
@@ -121,6 +135,29 @@ export default function ImportProjectPage() {
       if (mountedRef.current && requestID === browseRequestRef.current) setLoadingDirectory(false);
     }
   }, [api, activeRunner]);
+
+  const createDirectory = useCallback(async () => {
+    const trimmedName = newFolderName.trim();
+    if (!trimmedName) return;
+    if (trimmedName.includes("/") || trimmedName.includes("\\") || trimmedName === ".." || trimmedName.startsWith(".")) {
+      setLocalError("文件夹名称不能包含 /、\\、.. 或以 . 开头");
+      return;
+    }
+    setCreatingDirectory(true);
+    setLocalError(null);
+    try {
+      const fullPath = path + "/" + trimmedName;
+      await api("/api/directories/mkdir", { method: "POST", body: JSON.stringify({ path: fullPath, runner: activeRunner }) });
+      if (!mountedRef.current) return;
+      setShowNewFolderInput(false);
+      setNewFolderName("");
+      void browse(fullPath);
+    } catch (cause) {
+      if (mountedRef.current) setLocalError(cause instanceof Error ? cause.message : "无法创建文件夹");
+    } finally {
+      if (mountedRef.current) setCreatingDirectory(false);
+    }
+  }, [api, activeRunner, path, newFolderName, browse]);
 
   const selectRoot = (rootPath: string, runnerId?: string) => {
     setActiveRoot(rootPath);
@@ -140,6 +177,8 @@ export default function ImportProjectPage() {
     setLoadingDirectory(false);
     setDirectoryReady(false);
     setResult(null);
+    setShowNewFolderInput(false);
+    setNewFolderName("");
   };
   const validate = async () => {
     const requestID = ++validationRequestRef.current;
@@ -176,7 +215,7 @@ export default function ImportProjectPage() {
         <header className="import-project-header"><div className="import-project-title"><h1 id="import-project-title">加载项目</h1></div><button className="import-project-close" type="button" title="关闭" aria-label="关闭" disabled={busy} onClick={() => navigate("/")}><ImportCloseIcon /></button></header>
         <section className="import-project-shell">
       <div className="import-project-steps" aria-label="加载步骤"><span className={choosingRoot ? "active" : "done"}><i>1</i>选择环境</span><span className={!choosingRoot ? "active" : ""}><i>2</i>浏览目录</span><span className={result ? "active" : ""}><i>3</i>校验加载</span></div>
-      {choosingRoot ? <section className="import-surface import-environment-surface"><header><div><span className="import-surface-mark"><ImportWorkspaceIcon /></span><div><h2>{loadingRoots ? "正在检测环境" : roots.length ? "选择项目环境" : "未找到环境"}</h2><p>{loadingRoots ? "正在读取可用运行环境" : roots.length ? "从可用环境开始浏览项目目录" : "请检查本地或远程运行环境的配置"}</p></div></div><span className="import-surface-count">{loadingRoots ? "检测中" : `${roots.length} 个环境`}</span></header>{localError && <p className="error" role="alert">{localError}</p>}{loadingRoots ? <div className="import-loading-state"><span></span><p>正在检测可用环境…</p></div> : roots.length ? <div className="import-root-grid">{roots.map((root) => <button className="environment-option" type="button" key={root.path} onClick={() => selectRoot(root.path, root.runnerId)}><b className="root-option"><EnvironmentIcon environment={root.label} /><span>{root.name}</span></b><small>{displayPath(root.path)}</small><i>浏览</i></button>)}</div> : <div className="import-empty-state"><p>{localError || "未检测到可用的运行环境。"}</p></div>}<footer><button className="secondary" type="button" onClick={() => navigate("/")}>返回总览</button></footer></section> : <section className="import-surface import-browser-surface"><header><div><span className="import-surface-mark"><EnvironmentIcon environment={selectedRoot?.label} /></span><div><h2>{selectedRoot?.name || "项目目录"}</h2><p>{loadingDirectory ? "正在读取目录" : `${dirs.length} 个可选目录`}</p></div></div><button className="import-change-environment" type="button" disabled={busy} onClick={returnToRootSelection}>切换环境</button></header><div className="import-browser-toolbar"><div className="import-path-controls"><button className="import-icon-button" type="button" title="返回环境选择" aria-label="返回环境选择" disabled={busy} onClick={returnToRootSelection}><ImportBackIcon /></button><button className="import-icon-button" type="button" title="上级目录" aria-label="上级目录" disabled={busy || loadingDirectory || !parent} onClick={() => void browse(parent)}><ImportUpIcon /></button><code>{displayPath(path)}</code></div><button className="primary import-validate-button" disabled={busy || loadingDirectory || !directoryReady} onClick={() => void validate()}><ImportCheckIcon />{busy ? "校验中" : "校验目录"}</button></div>{localError && <p className="error" role="alert">{localError}</p>}<div className="import-directory-head"><span>目录</span>{loadingDirectory ? <small className="is-loading">读取中</small> : <small>{dirs.length} 项</small>}</div><div className="dirs import-directory-list">{loadingDirectory ? <div className="import-loading-state"><span></span><p>正在读取目录…</p></div> : dirs.length ? dirs.map((dir) => <button type="button" key={dir.path} disabled={busy || loadingDirectory} onClick={() => void browse(dir.path)}><ImportFolderIcon /><span><b>{dir.name}</b><small>{displayPath(dir.path)}</small></span><i>›</i></button>) : <div className="import-empty-state"><p>当前目录没有可浏览的子目录。</p></div>}</div>{result ? <section className={`import-validation ${result.agentReady ? "ready" : "unavailable"}`}><header><div><span className="import-validation-icon"><ImportCheckIcon /></span><div><h3>{result.name}</h3><p>{result.agentReady ? "已通过加载校验" : "当前环境无法启动可用的 AI 工具"}</p></div></div><span>{result.agentReady ? "可加载" : "不可用"}</span></header><div><span>Git <b>{result.gitReady ? result.gitBranch : "非 Git 仓库"}</b></span><span>Claude Code <b>{result.claudeReady ? "可用" : "不可用"}</b></span><span>Codex <b>{result.codexReady ? "可用" : "不可用"}</b></span>{result.performance === "cross-filesystem" && <span className="import-performance-note">跨文件系统，读写性能可能较慢</span>}</div></section> : <div className="import-validation-placeholder"><ImportCheckIcon /><span>校验目录后显示项目运行状态</span></div>}<footer><button className="secondary" type="button" disabled={busy} onClick={() => navigate("/")}>取消</button><button className="primary import-load-button" disabled={!result?.agentReady || busy || loadingDirectory || !directoryReady} onClick={() => void create()}>{busy ? "加载中" : "确认加载"}</button></footer></section>}
+      {choosingRoot ? <section className="import-surface import-environment-surface"><header><div><span className="import-surface-mark"><ImportWorkspaceIcon /></span><div><h2>{loadingRoots ? "正在检测环境" : roots.length ? "选择项目环境" : "未找到环境"}</h2><p>{loadingRoots ? "正在读取可用运行环境" : roots.length ? "从可用环境开始浏览项目目录" : "请检查本地或远程运行环境的配置"}</p></div></div><span className="import-surface-count">{loadingRoots ? "检测中" : `${roots.length} 个环境`}</span></header>{localError && <p className="error" role="alert">{localError}</p>}{loadingRoots ? <div className="import-loading-state"><span></span><p>正在检测可用环境…</p></div> : roots.length ? <div className="import-root-grid">{roots.map((root) => <button className="environment-option" type="button" key={root.path} onClick={() => selectRoot(root.path, root.runnerId)}><b className="root-option"><EnvironmentIcon environment={root.label} /><span>{root.name}</span></b><small>{displayPath(root.path)}</small><i>浏览</i></button>)}</div> : <div className="import-empty-state"><p>{localError || "未检测到可用的运行环境。"}</p></div>}<footer><button className="secondary" type="button" onClick={() => navigate("/")}>返回总览</button></footer></section> : <section className="import-surface import-browser-surface"><header><div><span className="import-surface-mark"><EnvironmentIcon environment={selectedRoot?.label} /></span><div><h2>{selectedRoot?.name || "项目目录"}</h2><p>{loadingDirectory ? "正在读取目录" : `${dirs.length} 个可选目录`}</p></div></div><button className="import-change-environment" type="button" disabled={busy} onClick={returnToRootSelection}>切换环境</button></header><div className="import-browser-toolbar"><div className="import-path-controls"><button className="import-icon-button" type="button" title="返回环境选择" aria-label="返回环境选择" disabled={busy} onClick={returnToRootSelection}><ImportBackIcon /></button><button className="import-icon-button" type="button" title="上级目录" aria-label="上级目录" disabled={busy || loadingDirectory || !parent} onClick={() => void browse(parent)}><ImportUpIcon /></button><code>{displayPath(path)}</code></div><div className="import-new-folder-controls">{showNewFolderInput ? <div className="import-new-folder-input-row"><input ref={newFolderInputRef} className="import-new-folder-input" type="text" value={newFolderName} onChange={(e) => setNewFolderName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void createDirectory(); if (e.key === "Escape") { setShowNewFolderInput(false); setNewFolderName(""); } }} placeholder="文件夹名称" disabled={creatingDirectory || busy} /><button className="import-icon-button" type="button" title="确认创建" aria-label="确认创建" disabled={creatingDirectory || !newFolderName.trim()} onClick={() => void createDirectory()}><ImportCheckIcon /></button><button className="import-icon-button" type="button" title="取消" aria-label="取消" disabled={creatingDirectory} onClick={() => { setShowNewFolderInput(false); setNewFolderName(""); }}><ImportCloseIcon /></button></div> : <button className="import-new-folder-button" type="button" title="新建文件夹" aria-label="新建文件夹" disabled={busy || loadingDirectory || creatingDirectory} onClick={() => { setShowNewFolderInput(true); setNewFolderName(""); }}><ImportNewFolderIcon />新建</button>}</div><button className="primary import-validate-button" disabled={busy || loadingDirectory || creatingDirectory || !directoryReady} onClick={() => void validate()}><ImportCheckIcon />{busy ? "校验中" : "校验目录"}</button></div>{localError && <p className="error" role="alert">{localError}</p>}<div className="import-directory-head"><span>目录</span>{loadingDirectory ? <small className="is-loading">读取中</small> : <small>{dirs.length} 项</small>}</div><div className="dirs import-directory-list">{loadingDirectory ? <div className="import-loading-state"><span></span><p>正在读取目录…</p></div> : dirs.length ? dirs.map((dir) => <button type="button" key={dir.path} disabled={busy || loadingDirectory || creatingDirectory} onClick={() => void browse(dir.path)}><ImportFolderIcon /><span><b>{dir.name}</b><small>{displayPath(dir.path)}</small></span><i>›</i></button>) : <div className="import-empty-state"><p>当前目录没有可浏览的子目录。</p></div>}</div>{result ? <section className={`import-validation ${result.agentReady ? "ready" : "unavailable"}`}><header><div><span className="import-validation-icon"><ImportCheckIcon /></span><div><h3>{result.name}</h3><p>{result.agentReady ? "已通过加载校验" : "当前环境无法启动可用的 AI 工具"}</p></div></div><span>{result.agentReady ? "可加载" : "不可用"}</span></header><div><span>Git <b>{result.gitReady ? result.gitBranch : "非 Git 仓库"}</b></span><span>Claude Code <b>{result.claudeReady ? "可用" : "不可用"}</b></span><span>Codex <b>{result.codexReady ? "可用" : "不可用"}</b></span>{result.performance === "cross-filesystem" && <span className="import-performance-note">跨文件系统，读写性能可能较慢</span>}</div></section> : <div className="import-validation-placeholder"><ImportCheckIcon /><span>校验目录后显示项目运行状态</span></div>}<footer><button className="secondary" type="button" disabled={busy} onClick={() => navigate("/")}>取消</button><button className="primary import-load-button" disabled={!result?.agentReady || busy || loadingDirectory || !directoryReady} onClick={() => void create()}>{busy ? "加载中" : "确认加载"}</button></footer></section>}
         </section>
       </section>
     </div>

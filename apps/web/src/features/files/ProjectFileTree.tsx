@@ -9,6 +9,34 @@ import type { FileEntry, TreeResponse, SearchResponse } from "./file-model";
 import { getFileIcon } from "./file-model";
 import { FileIcon } from "./FileIcon";
 
+// sessionStorage key：暂存要添加到对话的文件路径
+const ADD_TO_CHAT_KEY = "milevia_add_file_to_chat";
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to legacy method
+    }
+  }
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    const ok = document.execCommand("copy");
+    textarea.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 // ─── 类型 ────────────────────────────────────────────────────────────────────
 
 interface ProjectFileTreeProps {
@@ -19,6 +47,7 @@ interface ProjectFileTreeProps {
   onCreateDir: (dirPath: string) => void;
   onRename: (path: string, name: string) => void;
   onDelete: (path: string, name: string, isDir: boolean) => void;
+  onAddToChat?: (path: string) => void;
   readOnly: boolean;
   refreshRef?: React.MutableRefObject<(() => void) | null>;
 }
@@ -206,6 +235,7 @@ export function ProjectFileTree({
   onCreateDir,
   onRename,
   onDelete,
+  onAddToChat,
   readOnly,
   refreshRef,
 }: ProjectFileTreeProps) {
@@ -221,6 +251,7 @@ export function ProjectFileTree({
     name: string;
     isDir: boolean;
   } | null>(null);
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
 
   const showError = useCallback((message: string) => {
     setError(message);
@@ -417,8 +448,8 @@ export function ProjectFileTree({
         <div
           className="file-tree-context-menu"
           style={{
-            left: Math.min(contextMenu.x, window.innerWidth - 140),
-            top: Math.min(contextMenu.y, window.innerHeight - 240),
+            left: Math.min(contextMenu.x, window.innerWidth - 160),
+            top: Math.min(contextMenu.y, window.innerHeight - 320),
           }}
         >
           {contextMenu.isDir && !readOnly && (
@@ -451,6 +482,16 @@ export function ProjectFileTree({
               刷新目录
             </button>
           )}
+          {!contextMenu.isDir && (
+            <button
+              onClick={() => {
+                onFileSelect(contextMenu.path, contextMenu.name);
+                setContextMenu(null);
+              }}
+            >
+              打开
+            </button>
+          )}
           {!readOnly && (
             <button
               onClick={() => {
@@ -472,14 +513,36 @@ export function ProjectFileTree({
               删除
             </button>
           )}
+          <div className="file-tree-context-menu-separator" />
+          <button
+            onClick={async () => {
+              const ok = await copyToClipboard(contextMenu.path);
+              if (!ok) {
+                setContextMenu(null);
+                return;
+              }
+              setCopiedPath(contextMenu.path);
+              setTimeout(() => {
+                setContextMenu(null);
+                setCopiedPath(null);
+              }, 1000);
+            }}
+          >
+            {copiedPath === contextMenu.path ? "已复制路径" : "复制路径"}
+          </button>
           {!contextMenu.isDir && (
             <button
               onClick={() => {
-                onFileSelect(contextMenu.path, contextMenu.name);
+                if (onAddToChat) {
+                  onAddToChat(contextMenu.path);
+                } else {
+                  sessionStorage.setItem(ADD_TO_CHAT_KEY, contextMenu.path);
+                  window.location.href = `/projects/${projectId}/conversations?addFile=true`;
+                }
                 setContextMenu(null);
               }}
             >
-              打开
+              添加到对话
             </button>
           )}
         </div>

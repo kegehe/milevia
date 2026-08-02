@@ -550,6 +550,188 @@ func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, result)
 }
 
+func (s *Server) gitFetch(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Remote     string `json:"remote"`
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Remote == "" {
+		input.Remote = "origin"
+	}
+	if err := validateGitRef(input.Remote); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, "fetch",
+		fmt.Sprintf("fetch %s", input.Remote), state.snapshot, func() error {
+			return newGitRunner().(*gitCLIRunner).Fetch(r.Context(), repo, input.Remote)
+		})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) gitPush(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Remote      string `json:"remote"`
+		Branch      string `json:"branch"`
+		SetUpstream bool   `json:"setUpstream"`
+		StateToken  string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Remote == "" {
+		input.Remote = "origin"
+	}
+	if input.Branch == "" {
+		writeError(w, http.StatusBadRequest, errors.New("branch is required"))
+		return
+	}
+	if err := validateGitRef(input.Remote); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateGitRef(input.Branch); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	for _, change := range state.changes {
+		if change.Conflicted {
+			writeError(w, http.StatusConflict, errors.New("resolve Git conflicts before pushing"))
+			return
+		}
+	}
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, "push",
+		fmt.Sprintf("push %s %s", input.Remote, input.Branch), state.snapshot, func() error {
+			return newGitRunner().(*gitCLIRunner).Push(r.Context(), repo, input.Remote, input.Branch, input.SetUpstream)
+		})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Name       string `json:"name"`
+		StartPoint string `json:"startPoint"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Name == "" || utf8.RuneCountInString(input.Name) > 200 {
+		writeError(w, http.StatusBadRequest, errors.New("branch name is required and must be under 200 characters"))
+		return
+	}
+	if err := validateGitRef(input.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if input.StartPoint != "" {
+		if err := validateGitRef(input.StartPoint); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	projectID := chi.URLParam(r, "projectID")
+	repo, err := s.projectPath(r.Context(), projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	release, acquired := s.acquireProjectWorkspace(projectID, "git:"+uuid.NewString())
+	if !acquired {
+		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		return
+	}
+	defer release()
+	snapshot, _, _, err := readGitState(r.Context(), repo)
+	if err != nil {
+		writeError(w, http.StatusConflict, errors.New("Git repository state is unavailable"))
+		return
+	}
+	summary := fmt.Sprintf("创建分支 %s", input.Name)
+	if input.StartPoint != "" {
+		summary = fmt.Sprintf("创建分支 %s（基于 %s）", input.Name, input.StartPoint)
+	}
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, "create_branch",
+		summary, snapshot, func() error {
+			return newGitRunner().(*gitCLIRunner).CreateBranch(r.Context(), repo, input.Name, input.StartPoint)
+		})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Branch     string `json:"branch"`
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Branch == "" {
+		writeError(w, http.StatusBadRequest, errors.New("branch is required"))
+		return
+	}
+	if err := validateGitRef(input.Branch); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	for _, change := range state.changes {
+		if change.Conflicted {
+			writeError(w, http.StatusConflict, errors.New("resolve Git conflicts before switching branches"))
+			return
+		}
+		if change.Staged || change.Modified || change.Deleted || change.Renamed || change.Untracked {
+			writeError(w, http.StatusConflict, errors.New("commit or discard changes before switching branches"))
+			return
+		}
+	}
+	if state.snapshot.Head.Branch == input.Branch && !state.snapshot.Head.Detached {
+		writeError(w, http.StatusConflict, errors.New("already on the target branch"))
+		return
+	}
+	result, err := s.executeGitOperation(r.Context(), projectID, repo, "switch_branch",
+		fmt.Sprintf("切换到 %s", input.Branch), state.snapshot, func() error {
+			return newGitRunner().(*gitCLIRunner).SwitchBranch(r.Context(), repo, input.Branch)
+		})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
 func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (string, string, gitStateToken, func(), bool) {
 	projectID := chi.URLParam(r, "projectID")
 	repo, err := s.projectPath(r.Context(), projectID)
@@ -667,6 +849,14 @@ func gitOperationFailure(err error) (status, code, message string) {
 		return gitOperationFailed, "hook_rejected", "Git hook 拒绝了本次操作"
 	case strings.Contains(stderr, "nothing to commit"):
 		return gitOperationFailed, "nothing_to_commit", "没有可提交的已暂存改动"
+	case strings.Contains(stderr, "non-fast-forward"), strings.Contains(stderr, "updates were rejected"):
+		return gitOperationFailed, "push_rejected", "推送被拒绝，远端有更新。请先 fetch 再推送"
+	case strings.Contains(stderr, "authentication failed"), strings.Contains(stderr, "permission denied"):
+		return gitOperationFailed, "auth_failed", "Git 远端认证失败，请检查凭证"
+	case strings.Contains(stderr, "could not resolve host"), strings.Contains(stderr, "unable to access"):
+		return gitOperationFailed, "remote_unavailable", "无法连接到 Git 远端，请检查网络或远端地址"
+	case strings.Contains(stderr, "your local changes"), strings.Contains(stderr, "would be overwritten"):
+		return gitOperationFailed, "dirty_worktree", "工作区有未提交改动，请先提交或丢弃"
 	default:
 		return gitOperationFailed, "git_failed", "Git 操作失败"
 	}

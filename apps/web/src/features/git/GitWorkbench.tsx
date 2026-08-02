@@ -9,7 +9,10 @@ type DiffLine = { content: string; kind: "added" | "removed" | "context" | "hunk
 type Confirmation =
   | { type: "commit" }
   | { type: "discard-worktree"; path: string; untracked: boolean }
-  | { type: "discard-all" };
+  | { type: "discard-all" }
+  | { type: "fetch"; remote: string }
+  | { type: "push"; remote: string; branch: string; setUpstream: boolean }
+  | { type: "switch-branch"; branch: string };
 
 const tabs: { id: Tab; label: string }[] = [
   { id: "overview", label: "概览" },
@@ -129,6 +132,28 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   const commit = () => mutate("commit", "commits", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); });
   const discardWorktree = (path: string, untracked: boolean) => mutate(`discard:${path}`, "discard", { mode: "worktree", paths: [path], includeUntracked: untracked }, () => setConfirmation(null));
   const discardAll = (includeUntracked: boolean) => mutate("discard-all", "discard", { mode: "all", includeUntracked }, () => setConfirmation(null));
+  const fetchRemote = (remote: string) => mutate("fetch", "fetch", { remote }, () => setConfirmation(null));
+  const pushBranch = (remote: string, branch: string, setUpstream: boolean) => mutate("push", "push", { remote, branch, setUpstream }, () => setConfirmation(null));
+  const switchBranch = (branch: string) => mutate("switch-branch", "switch", { branch }, () => setConfirmation(null));
+
+  const createBranch = async (name: string, startPoint: string) => {
+    if (!mountedRef.current) return;
+    setMutating("create-branch");
+    try {
+      const result = await request<GitOperationResult>(`/api/projects/${projectID}/git/branches`, { method: "POST", body: JSON.stringify({ name, startPoint }) });
+      await reload(true);
+      if (result.status !== "succeeded" && result.status !== "needs_attention") throw new Error(result.errorMessage || "创建分支失败");
+      closeDiff();
+      setConfirmation(null);
+    } catch (cause) {
+      if (mountedRef.current) {
+        fail(cause instanceof Error ? cause.message : "无法创建分支");
+        void reload(true).catch(() => undefined);
+      }
+    } finally {
+      if (mountedRef.current) setMutating("");
+    }
+  };
 
   return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active}>
     <nav className="git-tabs" aria-label="Git工作台视图">
@@ -137,22 +162,23 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
     </nav>
     <main className="git-workbench-body">
       {loading ? <div className="git-empty">正在读取仓库状态</div> : <>
-        {tab === "overview" && <div id="git-view-overview" role="tabpanel" aria-labelledby="git-tab-overview"><Overview snapshot={snapshot} changeCount={changeCount} /></div>}
+        {tab === "overview" && <div id="git-view-overview" role="tabpanel" aria-labelledby="git-tab-overview"><Overview snapshot={snapshot} changeCount={changeCount} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} mutating={mutating} /></div>}
         {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
         {tab === "history" && <div id="git-view-history" role="tabpanel" aria-labelledby="git-tab-history"><History commits={commits} /></div>}
-        {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} /></div>}
+        {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} snapshot={snapshot} mutating={mutating} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} requestSwitchBranch={(branch) => setConfirmation({ type: "switch-branch", branch })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
         {tab === "operations" && <div id="git-view-operations" role="tabpanel" aria-labelledby="git-tab-operations"><Operations operations={operations} /></div>}
       </>}
     </main>
-    {confirmation && <GitConfirmation confirmation={confirmation} snapshot={snapshot} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} discardWorktree={discardWorktree} discardAll={discardAll} />}
+    {confirmation && <GitConfirmation confirmation={confirmation} snapshot={snapshot} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pushBranch={pushBranch} switchBranch={switchBranch} />}
   </section>;
 }
 
-function Overview({ snapshot, changeCount }: { snapshot: GitSnapshot | null; changeCount: number }) {
+function Overview({ snapshot, changeCount, requestFetch, requestPush, mutating }: { snapshot: GitSnapshot | null; changeCount: number; requestFetch: () => void; requestPush: () => void; mutating: string }) {
   if (!snapshot) return <div className="git-empty">无法读取仓库状态</div>;
   const { head, worktree } = snapshot;
   return <div className="git-overview">
     <section className="git-head-card"><div><span>当前引用</span><b>{head.detached ? "HEAD" : head.branch || "未初始化"}</b><code>{shortOID(head.oid)}</code></div><dl><div><dt>上游</dt><dd>{head.upstream || "未设置"}</dd></div><div><dt>领先</dt><dd>{head.ahead}</dd></div><div><dt>落后</dt><dd>{head.behind}</dd></div></dl></section>
+    <div className="git-overview-remote"><button type="button" className="secondary" disabled={Boolean(mutating)} onClick={requestFetch}>获取更新</button><button type="button" className="secondary" disabled={Boolean(mutating) || head.ahead === 0} onClick={requestPush}>推送</button></div>
     <section className="git-stat-grid" aria-label="工作区统计"><GitStat label="变更文件" value={changeCount} /><GitStat label="已暂存" value={worktree.staged} /><GitStat label="未跟踪" value={worktree.untracked} /><GitStat label="冲突" value={worktree.conflicted} /></section>
     <section className="git-summary-list"><div><span>工作区修改</span><b>{worktree.modified}</b></div><div><span>删除</span><b>{worktree.deleted}</b></div><div><span>重命名</span><b>{worktree.renamed}</b></div></section>
   </div>;
@@ -216,27 +242,67 @@ function CommitPanel({ stagedCount, value, setValue, open, disabled }: { stagedC
   return <section className="git-commit-panel"><label htmlFor="git-commit-message">提交信息</label><textarea id="git-commit-message" value={value} maxLength={4000} disabled={disabled || stagedCount === 0} onChange={(event) => setValue(event.target.value)} placeholder={stagedCount === 0 ? "暂存文件后即可提交" : "简要说明本次变更"} /><footer><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span><button type="button" className="primary" disabled={disabled || stagedCount === 0 || !value.trim() || value.split("\n")[0].length > 72} onClick={open}>提交</button></footer></section>;
 }
 
-function GitConfirmation({ confirmation, snapshot, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, discardWorktree, discardAll }: { confirmation: Confirmation; snapshot: GitSnapshot | null; stagedCount: number; trackedChangeCount: number; untrackedChangeCount: number; commitMessage: string; busy: boolean; close: () => void; commit: () => void; discardWorktree: (path: string, untracked: boolean) => void; discardAll: (includeUntracked: boolean) => void }) {
+function GitConfirmation({ confirmation, snapshot, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, discardWorktree, discardAll, fetchRemote, pushBranch, switchBranch }: { confirmation: Confirmation; snapshot: GitSnapshot | null; stagedCount: number; trackedChangeCount: number; untrackedChangeCount: number; commitMessage: string; busy: boolean; close: () => void; commit: () => void; discardWorktree: (path: string, untracked: boolean) => void; discardAll: (includeUntracked: boolean) => void; fetchRemote: (remote: string) => void; pushBranch: (remote: string, branch: string, setUpstream: boolean) => void; switchBranch: (branch: string) => void }) {
   const [includeUntracked, setIncludeUntracked] = useState(confirmation.type === "discard-all" && untrackedChangeCount > 0 && trackedChangeCount === 0);
   const isCommit = confirmation.type === "commit";
-  const title = isCommit ? "确认提交" : confirmation.type === "discard-all" ? "丢弃全部未提交改动" : confirmation.untracked ? "删除未跟踪文件" : "撤销工作区更改";
+  const isFetch = confirmation.type === "fetch";
+  const isPush = confirmation.type === "push";
+  const isSwitch = confirmation.type === "switch-branch";
+  const isDestructive = confirmation.type === "discard-worktree" || confirmation.type === "discard-all";
+  const title = isCommit ? "确认提交" : isFetch ? "获取远端更新" : isPush ? "推送到远端" : isSwitch ? "切换分支" : confirmation.type === "discard-all" ? "丢弃全部未提交改动" : confirmation.type === "discard-worktree" && confirmation.untracked ? "删除未跟踪文件" : "撤销工作区更改";
   const isUntracked = confirmation.type === "discard-worktree" && confirmation.untracked;
   const discardPath = confirmation.type === "discard-worktree" ? confirmation.path : "";
   const riskLabel = confirmation.type === "discard-worktree" && !confirmation.untracked ? "工作区内容将恢复到暂存版本" : "此操作无法在页面中撤销";
+  const categoryLabel = isCommit ? "本地提交" : isFetch ? "远端操作" : isPush ? "远端操作" : isSwitch ? "分支操作" : "高风险操作";
   const confirm = () => {
     if (confirmation.type === "commit") commit();
     else if (confirmation.type === "discard-all") discardAll(includeUntracked);
-    else discardWorktree(confirmation.path, confirmation.untracked);
+    else if (confirmation.type === "discard-worktree") discardWorktree(confirmation.path, confirmation.untracked);
+    else if (confirmation.type === "fetch") fetchRemote(confirmation.remote);
+    else if (confirmation.type === "push") pushBranch(confirmation.remote, confirmation.branch, confirmation.setUpstream);
+    else if (confirmation.type === "switch-branch") switchBranch(confirmation.branch);
   };
-  return <div className="backdrop git-confirmation-backdrop" role="dialog" aria-modal="true" aria-labelledby="git-confirmation-title"><section className={`modal git-confirmation-dialog${isCommit ? "" : " destructive"}`}><header><div><span>{isCommit ? "本地提交" : "高风险操作"}</span><h2 id="git-confirmation-title">{title}</h2></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><CloseIcon /></button></header><div className="git-confirmation-body">{confirmation.type === "commit" ? <><p className="git-confirmation-lead">将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交，包含 {stagedCount} 个已暂存文件。</p><pre>{commitMessage}</pre></> : <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{confirmation.type === "discard-all" ? <><p className="git-confirmation-lead">已暂存和工作区中的受跟踪改动都会恢复到 <code>HEAD</code>。</p><div className="git-confirmation-scope"><span>受影响内容</span><b>{trackedChangeCount} 个受跟踪文件</b>{untrackedChangeCount > 0 ? <small>另有 {untrackedChangeCount} 个未跟踪文件可选删除</small> : null}</div><label className="git-confirmation-check"><input type="checkbox" checked={includeUntracked} onChange={(event) => setIncludeUntracked(event.target.checked)} />同时删除未跟踪文件</label></> : <><p className="git-confirmation-lead">{isUntracked ? "将永久删除以下未跟踪文件。" : "将以下文件恢复到暂存版本，已暂存内容不会改变。"}</p><code className="git-confirmation-path">{discardPath}</code></>}</>}</div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button type="button" className={isCommit ? "primary" : "primary danger"} disabled={busy} onClick={confirm}>{busy ? "处理中" : isCommit ? "确认提交" : isUntracked ? "确认删除" : "确认撤销"}</button></footer></section></div>;
+  const confirmLabel = busy ? "处理中" : isCommit ? "确认提交" : isFetch ? "确认获取" : isPush ? "确认推送" : isSwitch ? "确认切换" : isUntracked ? "确认删除" : "确认撤销";
+  return <div className="backdrop git-confirmation-backdrop" role="dialog" aria-modal="true" aria-labelledby="git-confirmation-title"><section className={`modal git-confirmation-dialog${isDestructive ? " destructive" : ""}`}><header><div><span>{categoryLabel}</span><h2 id="git-confirmation-title">{title}</h2></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><CloseIcon /></button></header><div className="git-confirmation-body">{confirmation.type === "commit" ? <><p className="git-confirmation-lead">将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交，包含 {stagedCount} 个已暂存文件。</p><pre>{commitMessage}</pre></> : confirmation.type === "fetch" ? <><p className="git-confirmation-lead">从 <b>{confirmation.remote}</b> 获取最新更新。</p><div className="git-confirmation-scope"><span>操作说明</span><b>更新远端引用并清理已删除的分支引用</b><small>工作树不会改变</small></div></> : confirmation.type === "push" ? <><p className="git-confirmation-lead">将 <b>{confirmation.branch}</b> 推送到 <b>{confirmation.remote}</b>。</p><div className="git-confirmation-scope"><span>操作说明</span><b>仅允许普通推送，non-fast-forward 将被拒绝</b>{confirmation.setUpstream ? <small>将同时设置上游跟踪</small> : null}</div></> : confirmation.type === "switch-branch" ? <><div className="git-confirmation-risk"><span>注意</span><p>切换分支前需确保工作区干净且无进行中的 AI 任务。</p></div><p className="git-confirmation-lead">将切换到分支 <b>{confirmation.branch}</b>。</p><div className="git-confirmation-scope"><span>当前分支</span><b>{snapshot?.head.branch || "HEAD"}</b></div></> : <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{confirmation.type === "discard-all" ? <><p className="git-confirmation-lead">已暂存和工作区中的受跟踪改动都会恢复到 <code>HEAD</code>。</p><div className="git-confirmation-scope"><span>受影响内容</span><b>{trackedChangeCount} 个受跟踪文件</b>{untrackedChangeCount > 0 ? <small>另有 {untrackedChangeCount} 个未跟踪文件可选删除</small> : null}</div><label className="git-confirmation-check"><input type="checkbox" checked={includeUntracked} onChange={(event) => setIncludeUntracked(event.target.checked)} />同时删除未跟踪文件</label></> : <><p className="git-confirmation-lead">{isUntracked ? "将永久删除以下未跟踪文件。" : "将以下文件恢复到暂存版本，已暂存内容不会改变。"}</p><code className="git-confirmation-path">{discardPath}</code></>}</>}</div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button type="button" className={isDestructive ? "primary danger" : "primary"} disabled={busy} onClick={confirm}>{confirmLabel}</button></footer></section></div>;
 }
 
 function History({ commits }: { commits: GitCommit[] }) { return commits.length === 0 ? <div className="git-empty">没有可显示的提交记录</div> : <div className="git-history">{commits.map((commit) => <article key={commit.oid}><code>{shortOID(commit.oid)}</code><div><b>{commit.subject || "(无提交说明)"}</b><span>{commit.author} · {formatGitTime(commit.authoredAt)}</span></div></article>)}</div>; }
 
-function Branches({ branches }: { branches: GitBranch[] }) { return branches.length === 0 ? <div className="git-empty">没有可显示的分支</div> : <div className="git-branches">{branches.map((branch) => <article key={`${branch.remote ? "remote" : "local"}-${branch.name}`}><span className={branch.current ? "current" : ""}>{branch.current ? "当前" : branch.remote ? "远端" : "本地"}</span><b>{branch.name}</b><small>{branch.upstream || ""}</small></article>)}</div>; }
+function Branches({ branches, snapshot, mutating, requestFetch, requestPush, requestSwitchBranch, requestCreateBranch }: { branches: GitBranch[]; snapshot: GitSnapshot | null; mutating: string; requestFetch: () => void; requestPush: () => void; requestSwitchBranch: (branch: string) => void; requestCreateBranch: (name: string, startPoint: string) => void }) {
+  const [showForm, setShowForm] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [startPoint, setStartPoint] = useState("");
+  const local = branches.filter((b) => !b.remote);
+  const remote = branches.filter((b) => b.remote);
+  const busy = Boolean(mutating);
+  const handleCreate = () => {
+    if (!newName.trim()) return;
+    requestCreateBranch(newName.trim(), startPoint.trim());
+    setNewName("");
+    setStartPoint("");
+    setShowForm(false);
+  };
+  return <div className="git-branches-view">
+    <div className="git-branch-toolbar">
+      <button type="button" className="secondary" disabled={busy} onClick={requestFetch}>获取更新</button>
+      <button type="button" className="secondary" disabled={busy || !snapshot?.head.branch} onClick={requestPush}>推送</button>
+      <button type="button" className="secondary" disabled={busy} onClick={() => setShowForm(!showForm)}>新建分支</button>
+    </div>
+    {showForm && <div className="git-branch-create">
+      <input type="text" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="分支名" disabled={busy} className="git-branch-input" />
+      <input type="text" value={startPoint} onChange={(e) => setStartPoint(e.target.value)} placeholder="起始点（可选，默认为 HEAD）" disabled={busy} className="git-branch-input" />
+      <button type="button" className="primary" disabled={busy || !newName.trim()} onClick={handleCreate}>创建</button>
+      <button type="button" className="secondary" disabled={busy} onClick={() => setShowForm(false)}>取消</button>
+    </div>}
+    {branches.length === 0 ? <div className="git-empty">没有可显示的分支</div> : <>
+      {local.length > 0 && <div className="git-branches"><h3 className="git-branch-group-title">本地分支</h3>{local.map((branch) => <article key={`local-${branch.name}`}><span className={branch.current ? "current" : ""}>{branch.current ? "当前" : "本地"}</span><b>{branch.name}</b><small>{branch.upstream || ""}</small>{!branch.current && <button type="button" className="git-branch-switch-btn" disabled={busy} onClick={() => requestSwitchBranch(branch.name)}>切换</button>}</article>)}</div>}
+      {remote.length > 0 && <div className="git-branches"><h3 className="git-branch-group-title">远端分支</h3>{remote.map((branch) => <article key={`remote-${branch.name}`}><span>远端</span><b>{branch.name}</b><small>{branch.upstream || ""}</small></article>)}</div>}
+    </>}
+  </div>;
+}
 
 function operationStatusLabel(status: string): string { return ({ queued: "等待中", running: "进行中", succeeded: "已完成", failed: "失败", needs_attention: "需检查" })[status] || status; }
 
-function operationTypeLabel(type: string): string { return ({ stage: "暂存", unstage: "取消暂存", stage_all: "全部暂存", unstage_all: "全部取消暂存", commit: "提交", discard_worktree: "撤销工作区改动", discard_all: "丢弃全部改动" })[type] || type; }
+function operationTypeLabel(type: string): string { return ({ stage: "暂存", unstage: "取消暂存", stage_all: "全部暂存", unstage_all: "全部取消暂存", commit: "提交", discard_worktree: "撤销工作区改动", discard_all: "丢弃全部改动", fetch: "获取更新", push: "推送", create_branch: "创建分支", switch_branch: "切换分支" })[type] || type; }
 
 function Operations({ operations }: { operations: GitOperation[] }) { return operations.length === 0 ? <div className="git-empty">暂无操作记录</div> : <div className="git-operations">{operations.map((operation) => <article key={operation.id}><span className={`git-operation-status ${operation.status}`}>{operationStatusLabel(operation.status)}</span><div><b>{operationTypeLabel(operation.type)}</b><p>{operation.requestSummary}</p>{operation.errorMessage ? <small>{operation.errorMessage}</small> : null}</div><time title={operation.finishedAt || operation.startedAt || operation.requestedAt}>{formatGitTime(operation.finishedAt || operation.startedAt || operation.requestedAt)}</time></article>)}</div>; }

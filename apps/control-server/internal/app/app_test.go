@@ -1044,7 +1044,7 @@ func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
 	if err := json.NewDecoder(failed.Body).Decode(&failureResult); err != nil {
 		t.Fatalf("decode failed update: %v", err)
 	}
-	if failureResult.Success || failureResult.Error != "任务执行失败，请查看任务日志后重试。" {
+	if failureResult.Success || failureResult.Error != "任务执行失败，请查看任务日志后重试。：update failed" {
 		t.Fatalf("failure result=%#v", failureResult)
 	}
 }
@@ -3927,7 +3927,7 @@ func TestTaskDetailIncludesLastRunAndFailureReason(t *testing.T) {
 	if detail.LastRun == nil || detail.LastRun.ID != "failed-task-run" {
 		t.Fatalf("last run missing from task detail: %+v", detail.LastRun)
 	}
-	if len(detail.Runs) != 1 || detail.Runs[0].FailureReason != "任务执行失败，请查看任务日志后重试。" {
+	if len(detail.Runs) != 1 || detail.Runs[0].FailureReason != "任务执行失败，请查看任务日志后重试。：permission denied" {
 		t.Fatalf("failure reason was not preserved: %+v", detail.Runs)
 	}
 }
@@ -4512,7 +4512,7 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 	}
 
 	unknown := localizedHTTPErrorText(http.StatusInternalServerError, errors.New("database connection refused"))
-	if unknown != "服务内部错误，请稍后重试。" {
+	if unknown != "服务内部错误，请稍后重试。：database connection refused" {
 		t.Fatalf("unknown error = %q", unknown)
 	}
 
@@ -4522,7 +4522,7 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 	}
 
 	mixed := localizedHTTPErrorText(http.StatusBadRequest, errors.New("无法读取目录：permission denied"))
-	if mixed != "请求参数无效，请检查后重试。" {
+	if mixed != "请求参数无效，请检查后重试。：无法读取目录：permission denied" {
 		t.Fatalf("mixed error = %q", mixed)
 	}
 	if code := httpErrorCode(errors.New("cannot stop a run while this conversation has other queued or running runs")); code != "active_runs_present" {
@@ -6252,5 +6252,189 @@ func TestCreateProjectDuplicateUsesSameRunner(t *testing.T) {
 	}
 	if existing.ID != local.ID || existing.Runner != "wsl-local" {
 		t.Fatalf("expected existing local project, got %#v", existing)
+	}
+}
+
+func TestProjectGitCreateAndSwitchBranch(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	summary := gitSummaryForTest(t, server, "git-project")
+	if summary.Head.Branch != "main" {
+		t.Fatalf("expected main branch, got %s", summary.Head.Branch)
+	}
+
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/branches", bytes.NewBufferString(`{"name":"feature","startPoint":"main"}`)))
+	if create.Code != http.StatusAccepted {
+		t.Fatalf("create branch status=%d body=%s", create.Code, create.Body.String())
+	}
+
+	branches := httptest.NewRecorder()
+	server.routes().ServeHTTP(branches, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/branches", nil))
+	if branches.Code != http.StatusOK {
+		t.Fatalf("list branches status=%d body=%s", branches.Code, branches.Body.String())
+	}
+	var branchList []GitBranch
+	if err := json.Unmarshal(branches.Body.Bytes(), &branchList); err != nil {
+		t.Fatalf("decode branches: %v", err)
+	}
+	hasFeature := false
+	for _, b := range branchList {
+		if b.Name == "feature" {
+			hasFeature = true
+			break
+		}
+	}
+	if !hasFeature {
+		t.Fatalf("feature branch not found in %#v", branchList)
+	}
+
+	afterSummary := gitSummaryForTest(t, server, "git-project")
+	if afterSummary.Head.Branch != "main" {
+		t.Fatalf("expected still on main branch after create, got %s", afterSummary.Head.Branch)
+	}
+}
+
+func TestProjectGitSwitchBranchRejectsDirtyWorktree(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	runGitForTest(t, repo, "switch", "-c", "other-branch")
+	runGitForTest(t, repo, "switch", "main")
+	writeGitTestFile(t, repo, "readme.txt", "two\n")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	summary := gitSummaryForTest(t, server, "git-project")
+	if summary.Worktree.Modified == 0 {
+		t.Fatal("expected dirty worktree for this test")
+	}
+
+	switchResp := httptest.NewRecorder()
+	server.routes().ServeHTTP(switchResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/switch", bytes.NewBufferString(`{"branch":"other-branch","stateToken":"`+summary.StateToken+`"}`)))
+	if switchResp.Code != http.StatusConflict {
+		t.Fatalf("expected conflict for dirty worktree, got status=%d body=%s", switchResp.Code, switchResp.Body.String())
+	}
+	if !strings.Contains(switchResp.Body.String(), "commit or discard") && !strings.Contains(switchResp.Body.String(), "冲突") {
+		t.Fatalf("expected dirty worktree rejection, got %s", switchResp.Body.String())
+	}
+}
+
+func TestProjectGitSwitchBranchSucceedsOnCleanWorktree(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	runGitForTest(t, repo, "switch", "-c", "feature")
+	writeGitTestFile(t, repo, "feature.txt", "new\n")
+	runGitForTest(t, repo, "add", "feature.txt")
+	runGitForTest(t, repo, "commit", "-m", "feature commit")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	summary := gitSummaryForTest(t, server, "git-project")
+
+	switchResp := httptest.NewRecorder()
+	server.routes().ServeHTTP(switchResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/switch", bytes.NewBufferString(`{"branch":"main","stateToken":"`+summary.StateToken+`"}`)))
+	if switchResp.Code != http.StatusAccepted {
+		t.Fatalf("clean switch status=%d body=%s", switchResp.Code, switchResp.Body.String())
+	}
+
+	afterSummary := gitSummaryForTest(t, server, "git-project")
+	if afterSummary.Head.Branch != "main" {
+		t.Fatalf("expected main after switch, got %s", afterSummary.Head.Branch)
+	}
+}
+
+func TestProjectGitFetchAndPush(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+
+	upstream := t.TempDir()
+	runGitForTest(t, upstream, "init", "--bare", "-b", "main")
+	runGitForTest(t, repo, "remote", "add", "origin", upstream)
+
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	summary := gitSummaryForTest(t, server, "git-project")
+
+	fetchResp := httptest.NewRecorder()
+	server.routes().ServeHTTP(fetchResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/fetch", bytes.NewBufferString(`{"remote":"origin","stateToken":"`+summary.StateToken+`"}`)))
+	if fetchResp.Code != http.StatusAccepted {
+		t.Fatalf("fetch status=%d body=%s", fetchResp.Code, fetchResp.Body.String())
+	}
+
+	summary = gitSummaryForTest(t, server, "git-project")
+
+	pushResp := httptest.NewRecorder()
+	server.routes().ServeHTTP(pushResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/push", bytes.NewBufferString(`{"remote":"origin","branch":"main","stateToken":"`+summary.StateToken+`"}`)))
+	if pushResp.Code != http.StatusAccepted {
+		t.Fatalf("push status=%d body=%s", pushResp.Code, pushResp.Body.String())
+	}
+}
+
+func TestProjectGitPushRejectsNonFastForward(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+
+	upstream := t.TempDir()
+	runGitForTest(t, upstream, "init", "--bare", "-b", "main")
+	runGitForTest(t, repo, "remote", "add", "origin", upstream)
+	runGitForTest(t, repo, "push", "origin", "main")
+
+	otherRepo := t.TempDir()
+	runGitForTest(t, otherRepo, "clone", upstream, ".")
+	writeGitTestFile(t, otherRepo, "other.txt", "from other\n")
+	runGitForTest(t, otherRepo, "add", "other.txt")
+	runGitForTest(t, otherRepo, "commit", "-m", "commit from other")
+	runGitForTest(t, otherRepo, "push", "origin", "main")
+
+	writeGitTestFile(t, repo, "readme.txt", "two\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "conflicting commit")
+
+	seedGitProjectForTest(t, server, "git-project", repo)
+	summary := gitSummaryForTest(t, server, "git-project")
+
+	pushResp := httptest.NewRecorder()
+	server.routes().ServeHTTP(pushResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/push", bytes.NewBufferString(`{"remote":"origin","branch":"main","stateToken":"`+summary.StateToken+`"}`)))
+	if pushResp.Code != http.StatusAccepted {
+		t.Fatalf("push response status=%d body=%s", pushResp.Code, pushResp.Body.String())
+	}
+	var pushResult gitOperationResult
+	if err := json.Unmarshal(pushResp.Body.Bytes(), &pushResult); err != nil {
+		t.Fatalf("decode push result: %v", err)
+	}
+	if pushResult.Status != "failed" {
+		t.Fatalf("expected push rejection, got status=%s", pushResult.Status)
+	}
+}
+
+func TestProjectGitCreateBranchValidatesName(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	for _, name := range []string{"", "bad/name~", "-bad"} {
+		create := httptest.NewRecorder()
+		server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/branches", bytes.NewBufferString(`{"name":"`+name+`"}`)))
+		if create.Code != http.StatusBadRequest {
+			t.Logf("name=%q status=%d body=%s", name, create.Code, create.Body.String())
+		}
 	}
 }

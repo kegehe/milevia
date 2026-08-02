@@ -13,6 +13,7 @@ interface FilesPanelProps {
   runner: string;
   request: <T>(path: string, init?: RequestInit) => Promise<T>;
   isWorkspaceOccupied: boolean;
+  onAddToChat?: (path: string) => void;
 }
 
 const MAX_OPEN_TABS = 10;
@@ -36,6 +37,7 @@ export function FilesPanel({
   runner,
   request,
   isWorkspaceOccupied,
+  onAddToChat,
 }: FilesPanelProps) {
   const { fontSize, increase, decrease, canIncrease, canDecrease } = useCodeFontSize();
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
@@ -190,6 +192,65 @@ export function FilesPanel({
       if (editingFileRef.current === path) {
         setEditingFile(null);
       }
+    },
+    []
+  );
+
+  // 关闭其他标签
+  const closeOthers = useCallback(
+    (path: string) => {
+      setOpenFiles((prev) => prev.filter((f) => f.path === path));
+      setActiveFilePath(path);
+      if (editingFileRef.current && editingFileRef.current !== path) {
+        setEditingFile(null);
+      }
+    },
+    []
+  );
+
+  // 关闭所有标签
+  const closeAll = useCallback(() => {
+    setOpenFiles([]);
+    setActiveFilePath(null);
+    setEditingFile(null);
+  }, []);
+
+  // 关闭左侧标签
+  const closeLeft = useCallback(
+    (path: string) => {
+      const current = openFilesRef.current;
+      const idx = current.findIndex((f) => f.path === path);
+      if (idx <= 0) return;
+      const toClose = current.slice(0, idx);
+      const closedPaths = new Set(toClose.map((f) => f.path));
+      setOpenFiles((prev) => prev.filter((f) => !closedPaths.has(f.path)));
+      if (editingFileRef.current && closedPaths.has(editingFileRef.current)) {
+        setEditingFile(null);
+      }
+      setActiveFilePath((prevActive) => {
+        if (prevActive && closedPaths.has(prevActive)) return path;
+        return prevActive;
+      });
+    },
+    []
+  );
+
+  // 关闭右侧标签
+  const closeRight = useCallback(
+    (path: string) => {
+      const current = openFilesRef.current;
+      const idx = current.findIndex((f) => f.path === path);
+      if (idx < 0 || idx >= current.length - 1) return;
+      const toClose = current.slice(idx + 1);
+      const closedPaths = new Set(toClose.map((f) => f.path));
+      setOpenFiles((prev) => prev.filter((f) => !closedPaths.has(f.path)));
+      if (editingFileRef.current && closedPaths.has(editingFileRef.current)) {
+        setEditingFile(null);
+      }
+      setActiveFilePath((prevActive) => {
+        if (prevActive && closedPaths.has(prevActive)) return path;
+        return prevActive;
+      });
     },
     []
   );
@@ -456,6 +517,7 @@ export function FilesPanel({
             onCreateDir={handleCreateDir}
             onRename={handleRename}
             onDelete={handleDelete}
+            onAddToChat={onAddToChat}
             readOnly={readOnly}
             refreshRef={treeRefreshRef}
           />
@@ -472,6 +534,10 @@ export function FilesPanel({
               setMobileView("editor");
             }}
             onTabClose={closeTab}
+            onCloseOthers={closeOthers}
+            onCloseAll={closeAll}
+            onCloseLeft={closeLeft}
+            onCloseRight={closeRight}
           />
 
           {/* 文件内容区 */}

@@ -29,7 +29,7 @@ export type ConversationUsageResponse = { conversationId: string; available: boo
 export type TimelineItem =
   | { kind: "message"; id: string; createdAt: string; message: Message }
   | { kind: "tool"; id: string; createdAt: string; action: ToolAction }
-  | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string };
+  | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
 export type WorkspaceTab = "conversation" | "tasks" | "files" | "git" | "run";
 
 export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };

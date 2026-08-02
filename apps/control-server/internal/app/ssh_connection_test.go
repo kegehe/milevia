@@ -275,7 +275,7 @@ func seedSSHConnectionForTest(t *testing.T, server *Server, status string) *SSHC
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
-	if _, err := server.db.Exec(`insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?)`, connection.ID, connection.Name, connection.Host, connection.Port, connection.User, connection.PrivateKeyPath, connection.KnownHosts, connection.RootPath, connection.Status, "", connection.CreatedAt, connection.UpdatedAt); err != nil {
+	if _, err := server.db.Exec(`insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at,password) values (?,?,?,?,?,?,?,?,?,?,?,?,?)`, connection.ID, connection.Name, connection.Host, connection.Port, connection.User, connection.PrivateKeyPath, connection.KnownHosts, connection.RootPath, connection.Status, "", "", connection.CreatedAt, connection.UpdatedAt); err != nil {
 		t.Fatalf("seed SSH connection: %v", err)
 	}
 	return connection
@@ -423,7 +423,7 @@ func TestActiveSSHRunnerCannotReconnectOrDisconnect(t *testing.T) {
 func TestRecoverSSHConnectionsReleasesRowsBeforeReconnecting(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,created_at,updated_at) values ('connection','connection','host',22,'user','key','ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest','/workspace','connected',?,?)`, now, now); err != nil {
+	if _, err := server.db.Exec(`insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at,password) values ('connection','connection','host',22,'user','key','ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest','/workspace','connected','','',?,?)`, now, now); err != nil {
 		t.Fatalf("insert ssh connection: %v", err)
 	}
 	server.sshPrepare = func(_ context.Context, connection SSHConnection) (*sshRunner, RunnerMeta, error) {

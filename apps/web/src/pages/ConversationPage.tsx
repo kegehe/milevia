@@ -316,8 +316,8 @@ function MessageCard({ message, agentID, fail }: { message: Message; agentID: Ag
   return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentID === "codex" ? "<>" : "C"}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div>{isUser && <button className={`message-copy${copied ? " copied" : ""}`} type="button" title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()} />}</article>;
 }
 
-function ErrorCard({ item }: { item: TimelineItem & { kind: "error" } }) {
-  return <article className="error-card"><header><span className="error-card-icon">!</span><div><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></header><pre>{item.detail}</pre></article>;
+function ErrorCard({ item, projectId, onViewTask }: { item: TimelineItem & { kind: "error" }; projectId: string; onViewTask: (taskId: string) => void }) {
+  return <article className="error-card"><header><span className="error-card-icon">!</span><div><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></header><pre>{item.detail}</pre>{item.taskId && <footer className="error-card-footer"><button type="button" className="secondary" onClick={() => onViewTask(item.taskId!)}>查看任务详情</button></footer>}</article>;
 }
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
@@ -356,9 +356,10 @@ function AgentExecutionCard({ execution, open }: { execution: AgentExecution; op
 
 function AgentExecutionDialog({ execution, close }: { execution: AgentExecution; close: () => void }) {
   const agents = flattenAgents(execution.agents);
+  const counts = agents.reduce<Record<AgentStatus, number>>((value, agent) => { value[agent.status]++; return value; }, { pending: 0, running: 0, completed: 0, failed: 0, stopped: 0, unresolved: 0 });
   const [selectedID, setSelectedID] = useState(agents[0]?.id || "");
   const selected = agents.find((agent) => agent.id === selectedID) || agents[0];
-  return <div className="backdrop agent-execution-backdrop" role="dialog" aria-modal="true" aria-labelledby="agent-execution-title"><section className="agent-execution-dialog"><header><div><h2 id="agent-execution-title">子代理过程</h2><p>{execution.incomplete ? "主回合已完成，但部分子代理的最终结果未送达。" : "查看每个子代理已收到的输出、工具调用和结果。"}</p></div><button title="关闭" onClick={close}>x</button></header><div className="agent-execution-body"><nav className="agent-tree" aria-label="子代理列表">{execution.agents.map((agent) => <AgentTree key={agent.id} agent={agent} selectedID={selectedID} select={setSelectedID} depth={0} />)}</nav><section className="agent-log-panel">{selected ? <><header><div><span className={`agent-status ${selected.status}`}>{agentStatusLabel(selected.status)}</span><h3>{selected.summary}</h3></div><small>{formatTime(selected.createdAt)}</small></header><div className="agent-log-list">{selected.logs.length === 0 ? <p className="agent-log-empty">尚未收到该子代理的过程输出。</p> : selected.logs.map((log) => <article className={`agent-log ${log.kind} ${log.isError ? "failed" : ""}`} key={log.id}><header><b>{log.title}</b><time>{formatTime(log.createdAt)}</time></header><details open={log.kind === "text"}><summary>{log.detail.replace(/\s+/g, " ").slice(0, 180) || "无输出"}</summary><pre>{log.detail || "(无输出)"}</pre></details></article>)}</div></> : <p className="agent-log-empty">没有可查看的子代理。</p>}</section></div></section></div>;
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="agent-execution-title" onClick={(e) => { if (e.target === e.currentTarget) close(); }}><section className="modal agent-execution-dialog"><header><div><h2 id="agent-execution-title">子代理过程</h2><p>{execution.incomplete ? "主回合已完成，但部分子代理的最终结果未送达。" : "查看每个子代理已收到的输出、工具调用和结果。"}</p></div><button title="关闭" onClick={close}>x</button></header><div className="agent-execution-summary-bar">{(["running", "completed", "failed", "stopped", "unresolved"] as AgentStatus[]).map((s) => { const c = counts[s]; if (!c) return null; return <span key={s} className={`summary-chip ${s}`}><span className="dot"></span>{agentStatusLabel(s)}: {c}</span>; })}</div><div className="agent-execution-body"><nav className="agent-tree" aria-label="子代理列表">{execution.agents.map((agent) => <AgentTree key={agent.id} agent={agent} selectedID={selectedID} select={setSelectedID} depth={0} />)}</nav><section className="agent-log-panel">{selected ? <><header><div><span className={`agent-status ${selected.status}`}>{agentStatusLabel(selected.status)}</span><h3>{selected.summary}</h3></div><small>{formatTime(selected.createdAt)}</small></header><div className="agent-log-list">{selected.logs.length === 0 ? <p className="agent-log-empty">尚未收到该子代理的过程输出。</p> : selected.logs.map((log) => <article className={`agent-log ${log.kind} ${log.isError ? "failed" : ""}`} key={log.id}><header><span className={`log-kind-badge ${log.kind}`}>{log.kind === "text" ? "文本" : log.kind === "tool" ? "工具" : log.kind === "result" ? "结果" : "错误"}</span><b>{log.title}</b><time>{formatTime(log.createdAt)}</time></header><details open={log.kind === "text"}><summary>{log.detail.replace(/\s+/g, " ").slice(0, 180) || "无输出"}</summary><pre>{log.detail || "(无输出)"}</pre></details></article>)}</div></> : <p className="agent-log-empty">没有可查看的子代理。</p>}</section></div><footer><span>{agents.length} 个子代理 · {counts.completed} 完成{counts.failed > 0 ? ` · ${counts.failed} 失败` : ""}{counts.running > 0 ? ` · ${counts.running} 执行中` : ""}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
 }
 
 function AgentTree({ agent, selectedID, select, depth }: { agent: AgentNode; selectedID: string; select: (id: string) => void; depth: number }) {
@@ -551,10 +552,13 @@ export default function ConversationPage() {
   const stopAndClearRef = useRef<() => Promise<void>>(async () => {});
   const pendingUserDrafts = useRef(new Map<string, string>());
   const assistantOutputRuns = useRef(new Set<string>());
+  // 跟踪被撤回的用户消息 runId — reload 时需过滤避免后端数据重新加回来
+  const retractedMessageRuns = useRef(new Set<string>());
   const userNearBottom = useRef(true);
   const [hasNewContent, setHasNewContent] = useState(false);
   const lastReloadRequestedAt = useRef(0);
   const lastReloadRunID = useRef<string | null>(null);
+  const addFileHandledRef = useRef<string | null>(null);
 
   const setComposerText = useCallback((value: string, conversationID = conversationRef.current?.id, persist = true) => {
     textRef.current = value;
@@ -574,6 +578,25 @@ export default function ConversationPage() {
     const draft = getConversationDraft(projectId, conversation.id);
     setComposerText(draft, conversation.id);
   }, [conversation?.id, getConversationDraft, projectId, setComposerText]);
+
+  // 处理从文件树"添加到对话"传来的文件路径
+  useEffect(() => {
+    if (!projectId || !conversation?.id) return;
+    const addFile = searchParams.get("addFile");
+    if (addFile !== "true") return;
+    const filePath = sessionStorage.getItem("milevia_add_file_to_chat");
+    if (!filePath) return;
+    // 同一会话只处理一次（避免 searchParams 清除后重新触发）
+    const dedupKey = `${conversation.id}:${filePath}`;
+    if (addFileHandledRef.current === dedupKey) return;
+    addFileHandledRef.current = dedupKey;
+    sessionStorage.removeItem("milevia_add_file_to_chat");
+    // 清除 URL 中的 addFile 参数
+    setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("addFile"); return next; });
+    // 将文件路径追加到输入框
+    const prefix = textRef.current.trim() ? `${textRef.current}\n` : "";
+    setComposerText(`${prefix}@${filePath} `, conversation.id);
+  }, [projectId, conversation?.id, searchParams, setSearchParams, setComposerText]);
 
   useEffect(() => () => {
     const conversationID = conversationRef.current?.id;
@@ -601,6 +624,8 @@ export default function ConversationPage() {
       if (oldest !== undefined) outputs.delete(oldest);
     }
     pendingUserDrafts.current.delete(runID);
+    // 一旦助手有输出，该消息就不再需要被撤回
+    retractedMessageRuns.current.delete(runID);
   }, []);
 
   const restorePendingUserDraft = (conversationID: string, routeVersion: number, runID: string, draft: string | undefined) => {
@@ -676,6 +701,9 @@ export default function ConversationPage() {
               historyIndex.current = null;
               draftBeforeHistory.current = "";
               finishedRunIds.current.clear();
+              pendingUserDrafts.current.clear();
+              assistantOutputRuns.current.clear();
+              retractedMessageRuns.current.clear();
               setShowPermissionMenu(false);
               closeAgentExecution();
               setHasMoreHistory(false);
@@ -734,7 +762,9 @@ export default function ConversationPage() {
         const data = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
         if (!isCurrentConversation()) return;
         data.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
-        setMessages((current) => mergeReloadMessages(data.messages, current));
+        // 过滤掉被撤回的用户消息 — 停止时如果助手还没有输出，后端可能仍会返回用户消息
+        const filteredMessages = data.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
+        setMessages((current) => mergeReloadMessages(filteredMessages, current));
         setEvents((current) => mergeConversationItems(data.events, current));
         setRun(data.activeRunId || ""); setHasMoreHistory(data.hasMore); setHasMoreMessageHistory(data.hasMoreMessages); setHistoryCursor(data.nextCursor || "");
       } catch (cause) { if (isCurrentConversation()) fail(cause instanceof Error ? cause.message : "无法刷新会话"); }
@@ -818,6 +848,10 @@ export default function ConversationPage() {
           }
           pendingUserDrafts.current.delete(event.runId);
           assistantOutputRuns.current.delete(event.runId);
+          // 不在这里清理 retractedMessageRuns。
+          // 如果之前 stopRun 标记了撤回，需要在后续 reload 中过滤用户消息。
+          // reload 完成后 recordAssistantOutput 会根据情况清理（如果有助手输出），
+          // 否则 run 结束后 retractedMessageRuns 中的条目由大小限制或对话切换清理。
           rememberFinishedRun(event.runId);
           setRun((active) => active === event.runId ? "" : active);
           setStopping(false);
@@ -884,7 +918,9 @@ export default function ConversationPage() {
           const full = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
           if (cancelled) return;
           full.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
-          setMessages((current) => mergeReloadMessages(full.messages, current));
+          // 过滤掉被撤回的用户消息
+          const pollMessages = full.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
+          setMessages((current) => mergeReloadMessages(pollMessages, current));
           setEvents((current) => mergeConversationItems(full.events, current));
           setRun(full.activeRunId || ""); setHasMoreHistory(full.hasMore); setHasMoreMessageHistory(full.hasMoreMessages); setHistoryCursor(full.nextCursor || "");
           setStopping(false);
@@ -905,6 +941,7 @@ export default function ConversationPage() {
     if (!conversation) return;
     pendingUserDrafts.current.clear();
     assistantOutputRuns.current.clear();
+    retractedMessageRuns.current.clear();
     historyIndex.current = null;
     draftBeforeHistory.current = "";
     setInputHistory([]);
@@ -954,7 +991,9 @@ export default function ConversationPage() {
       const data = await projectApi<{ messages: Message[]; events: Event[]; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversationID}?limit=400&cursor=${encodeURIComponent(historyCursor)}`);
       if (conversationRef.current?.id !== conversationID) return false;
       data.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
-      setMessages((current) => mergeConversationItems(data.messages, current));
+      // 过滤掉被撤回的用户消息
+      const olderMessages = data.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
+      setMessages((current) => mergeConversationItems(olderMessages, current));
       setEvents((current) => mergeConversationItems(data.events, current));
       setHasMoreHistory(data.hasMore);
       setHasMoreMessageHistory(data.hasMoreMessages);
@@ -1291,6 +1330,7 @@ export default function ConversationPage() {
       const conversationID = conversation.id;
       const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/shortcuts/${shortcut.id}/run`, { method: "POST", body: JSON.stringify({ variables, action }) });
       if (conversationRef.current?.id !== conversationID) return;
+      if (!assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, data.message.content);
       setMessages((old) => [...old, data.message]);
       setInputHistory((old) => [...old.slice(-99), data.message.content]);
       setHistoryRefresh((version) => version + 1);
@@ -1305,7 +1345,7 @@ export default function ConversationPage() {
   const resetConversationView = (next: Conversation) => {
     const nextDraft = projectId ? getConversationDraft(projectId, next.id) : "";
     setComposerText(nextDraft, next.id);
-    setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
+    setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
   };
 
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode) => {
@@ -1505,11 +1545,27 @@ export default function ConversationPage() {
     const conversationID = conversation.id;
     const routeVersion = conversationRouteVersion.current;
     const runID = run;
-    const draftToRestore = assistantOutputRuns.current.has(runID) ? undefined : pendingUserDrafts.current.get(runID);
+    // 助手没有输出时，需要撤回用户消息并恢复草稿
+    const shouldRetractMessage = !assistantOutputRuns.current.has(runID);
+    const draftToRestore = shouldRetractMessage ? pendingUserDrafts.current.get(runID) : undefined;
     setStopping(true);
+    // retractUserMessage 在执行时重新检查 assistantOutputRuns，避免竞态：
+    // 如果在异步 stop 请求期间 WebSocket 收到了助手输出，就不应撤回消息
+    const retractUserMessage = () => {
+      if (!shouldRetractMessage) return;
+      if (assistantOutputRuns.current.has(runID)) return;
+      const retracted = retractedMessageRuns.current;
+      retracted.add(runID);
+      if (retracted.size > 128) {
+        const oldest = retracted.values().next().value;
+        if (oldest !== undefined) retracted.delete(oldest);
+      }
+      setMessages((items) => items.filter((item) => !(item.role === "user" && item.runId === runID)));
+    };
     try {
       const result = await stopRunInternal(false);
       if (result !== "stopping") setStopping(false);
+      retractUserMessage();
       restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore);
     }
     catch (cause) {
@@ -1520,7 +1576,7 @@ export default function ConversationPage() {
           danger: true,
           onConfirm: () => {
             setPendingConfirm(null);
-            void stopRunInternal(true, runID).then((result) => { restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore); if (result !== "stopping") setStopping(false); }).catch((cause) => {
+            void stopRunInternal(true, runID).then((result) => { retractUserMessage(); restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore); if (result !== "stopping") setStopping(false); }).catch((cause) => {
               fail(cause instanceof Error ? cause.message : "无法停止任务");
               setStopping(false);
             });
@@ -1574,6 +1630,7 @@ export default function ConversationPage() {
   };
 
   const handleTaskDispatched = (message: Message, runID: string) => {
+    if (!assistantOutputRuns.current.has(runID) && !finishedRunIds.current.has(runID)) pendingUserDrafts.current.set(runID, message.content);
     setMessages((items) => [...items, message]);
     setInputHistory((items) => [...items.slice(-99), message.content]);
     setHistoryRefresh((version) => version + 1);
@@ -1642,7 +1699,7 @@ export default function ConversationPage() {
         <div ref={top} />
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
         {isEmptyConversation && <section className="conversation-starter" aria-label="新会话建议"><span>新会话</span><h2>从一个任务开始</h2><div className="conversation-starter-options">{starterSuggestions.map((suggestion) => <button key={suggestion.label} type="button" onClick={() => startFromSuggestion(suggestion.prompt)}>{suggestion.label}</button>)}</div></section>}
-        {timeline.map((item) => <div key={item.id} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { if (element) userMessageElements.current.set(item.message.id, element); else userMessageElements.current.delete(item.message.id); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={conversation?.agentId || "claude-code"} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : <ErrorCard item={item} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => openExecutionParam(item.message.runId!)} />}</div>)}
+        {timeline.map((item) => <div key={item.id} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { if (element) userMessageElements.current.set(item.message.id, element); else userMessageElements.current.delete(item.message.id); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={conversation?.agentId || "claude-code"} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : <ErrorCard item={item} projectId={project.id} onViewTask={(taskId) => navigate(`/projects/${project.id}/tasks/${taskId}`)} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => openExecutionParam(item.message.runId!)} />}</div>)}
         {agentExecutions.filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => openExecutionParam(execution.runId)} />)}
         {run && <div className="run-indicator"><span></span>{runLabel}</div>}
         <div ref={bottom} />
