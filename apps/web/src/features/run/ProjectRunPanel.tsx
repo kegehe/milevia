@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type LogEntry, type RunConfig, type RunStatusResponse, runLogPresentation, runLogText, statusLabels } from "./run-model";
 import { toAnsiSegments } from "./ansi";
+import { createWebSocket } from "../../lib/runtime";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 
@@ -115,10 +116,9 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		void loadConfig();
 		void loadStatus();
 
-		const protocol = location.protocol === "https:" ? "wss" : "ws";
 		const connect = () => {
 			if (disposed) return;
-			const ws = new WebSocket(`${protocol}://${location.host}/ws/projects/${projectID}/run`);
+			const ws = createWebSocket(`/ws/projects/${projectID}/run`);
 			wsRef.current = ws;
 
 			ws.onmessage = (raw) => {

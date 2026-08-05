@@ -944,8 +944,8 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 	if err != nil {
 		return err
 	}
-	if project.Runner != "wsl-local" {
-		return errors.New("automatic orchestration currently requires the local WSL runner")
+	if !isLocalRunnerID(project.Runner) {
+		return errors.New("automatic orchestration currently requires a local runner")
 	}
 	if len(cfg.VerificationCommands) == 0 {
 		return errors.New("verification commands must be configured before automatic orchestration")

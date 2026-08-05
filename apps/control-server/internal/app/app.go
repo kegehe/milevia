@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,12 +30,18 @@ import (
 
 type Config struct {
 	DatabasePath                 string
+	DataDir                      string
+	Mode                         string
+	WebRoot                      string
+	SessionToken                 string
+	AllowedOrigins               []string
 	AllowedRoot                  string
 	ClaudePath                   string
 	CodexPath                    string
 	PermissionMode               string
 	ControlURL                   string
 	ApprovalHook                 string
+	NativeApprovalHook           bool
 	ClaudeTurnIdleTimeout        time.Duration
 	ClaudeInitialResponseTimeout time.Duration
 	ClaudeToolResultTimeout      time.Duration
@@ -51,7 +59,11 @@ func ConfigFromEnv() Config {
 	if root == "" {
 		root = home
 	}
+	dataDir := os.Getenv("AUTO_DATA_DIR")
 	db := os.Getenv("AUTO_DATABASE_PATH")
+	if db == "" && dataDir != "" {
+		db = filepath.Join(dataDir, "data", "milevia.db")
+	}
 	if db == "" {
 		db = "../../data/auto.db"
 	}
@@ -76,6 +88,8 @@ func ConfigFromEnv() Config {
 	}
 	return Config{
 		DatabasePath:                 db,
+		DataDir:                      dataDir,
+		Mode:                         "web",
 		AllowedRoot:                  root,
 		ClaudePath:                   "claude",
 		CodexPath:                    codexPath,
@@ -120,6 +134,7 @@ type RunStatusResponse struct {
 type Server struct {
 	db                     *sql.DB
 	config                 Config
+	dataLock               *dataDirLock
 	httpMu                 sync.Mutex
 	httpServer             *http.Server
 	runner                 AgentRunner
@@ -244,6 +259,7 @@ type Project struct {
 	Path        string    `json:"-"`
 	PathDisplay string    `json:"pathDisplay"`
 	Runner      string    `json:"runner"`
+	RunnerID    string    `json:"runnerId"`
 	Environment string    `json:"environment"`
 	GitBranch   string    `json:"gitBranch"`
 	ClaudeReady bool      `json:"claudeReady"`
@@ -379,26 +395,52 @@ func New(ctx context.Context, config Config) (*Server, error) {
 // NewWithRunner allows future AI CLIs to reuse the project and conversation services.
 // A nil runner selects the built-in Claude Code CLI implementation.
 func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Server, error) {
+	if config.DataDir != "" {
+		dataDir, err := filepath.Abs(config.DataDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve data directory: %w", err)
+		}
+		config.DataDir = dataDir
+		if config.DatabasePath == "" {
+			config.DatabasePath = filepath.Join(dataDir, "data", "milevia.db")
+		}
+	}
+	if config.DatabasePath == "" {
+		return nil, errors.New("database path is required")
+	}
+	var dataLock *dataDirLock
+	if config.DataDir != "" {
+		var err error
+		dataLock, err = acquireDataDirLock(config.DataDir)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(config.DatabasePath), 0o755); err != nil {
+		_ = dataLock.close()
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 	pool, err := sql.Open("sqlite3", config.DatabasePath)
 	if err != nil {
+		_ = dataLock.close()
 		return nil, fmt.Errorf("open SQLite: %w", err)
 	}
 	pool.SetMaxOpenConns(1)
 	if _, err := pool.ExecContext(ctx, `pragma foreign_keys=on; pragma journal_mode=wal; pragma busy_timeout=5000`); err != nil {
 		pool.Close()
+		_ = dataLock.close()
 		return nil, fmt.Errorf("configure SQLite: %w", err)
 	}
 	if runner == nil {
 		approvalHook, err := filepath.Abs(config.ApprovalHook)
 		if err != nil {
 			pool.Close()
+			_ = dataLock.close()
 			return nil, fmt.Errorf("resolve approval hook: %w", err)
 		}
 		if info, err := os.Stat(approvalHook); err != nil || info.IsDir() {
 			pool.Close()
+			_ = dataLock.close()
 			return nil, fmt.Errorf("approval hook is unavailable: %s", approvalHook)
 		}
 		config.ApprovalHook = approvalHook
@@ -406,25 +448,31 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
-	s.upgrader.CheckOrigin = func(r *http.Request) bool { return isLocalWebOrigin(r.Header.Get("Origin")) }
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
+	s.upgrader.CheckOrigin = func(r *http.Request) bool { return s.allowedOrigin(r.Header.Get("Origin")) }
+	if config.SessionToken != "" {
+		s.upgrader.Subprotocols = []string{s.websocketSessionProtocol()}
+	}
 	if err := s.migrate(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
+		_ = dataLock.close()
 		return nil, err
 	}
 	if err := s.recoverInterruptedRuns(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
+		_ = dataLock.close()
 		return nil, err
 	}
 	if err := s.recoverGitOperations(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
+		_ = dataLock.close()
 		return nil, err
 	}
-	// Register the built-in WSL local runner.
-	s.runnerRegistry.register("wsl-local", runner, s.wslLocalMeta())
+	// Register the native local runner for this server platform.
+	s.runnerRegistry.register(s.localRunnerID(), runner, s.localRunnerMeta())
 	// Recover previously-connected SSH connections (failures are non-fatal).
 	if err := s.recoverSSHConnections(ctx); err != nil {
 		log.Printf("[ssh] failed to recover SSH connections: %v", err)
@@ -489,28 +537,69 @@ func (s *Server) Close() {
 		}
 		s.runWG.Wait()
 		_ = s.db.Close()
+		_ = s.dataLock.close()
 	})
 }
 
 func (s *Server) Listen(addr string) error {
+	return s.ListenWithReady(addr, nil)
+}
+
+// ListenWithReady invokes ready after the TCP listener owns its assigned port.
+// It is used by the desktop sidecar launcher to discover a random loopback port.
+func (s *Server) ListenWithReady(addr string, ready func(string)) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.ServeListener(listener, ready)
+}
+
+// ServeListener serves an already-bound listener. Desktop startup uses it to
+// discover the assigned random port before runners receive their ControlURL.
+func (s *Server) ServeListener(listener net.Listener, ready func(string)) error {
 	s.httpMu.Lock()
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
 		s.httpMu.Unlock()
+		_ = listener.Close()
 		return nil
 	}
 	if s.httpServer != nil {
 		s.mu.Unlock()
 		s.httpMu.Unlock()
+		_ = listener.Close()
 		return errors.New("HTTP server is already listening")
 	}
-	httpServer := &http.Server{Addr: addr, Handler: s.routes()}
+	httpServer := &http.Server{Handler: s.routes()}
 	s.httpServer = httpServer
 	s.mu.Unlock()
 	s.httpMu.Unlock()
 
-	err := httpServer.ListenAndServe()
+	listenURL := "http://" + listener.Addr().String()
+	if err := s.dataLock.writeState(fmt.Sprintf("pid=%d\nstarted_at=%s\napi_base=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano), listenURL)); err != nil {
+		log.Printf("write data directory lock state: %v", err)
+	}
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- httpServer.Serve(listener) }()
+	if ready != nil {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			connection, dialErr := net.DialTimeout("tcp", listener.Addr().String(), 50*time.Millisecond)
+			if dialErr == nil {
+				_ = connection.Close()
+				break
+			}
+			if time.Now().After(deadline) {
+				log.Printf("control server accept loop did not become ready before timeout: %v", dialErr)
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		ready(listenURL)
+	}
+	err := <-serveResult
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -519,10 +608,14 @@ func (s *Server) Listen(addr string) error {
 
 func (s *Server) routes() http.Handler {
 	r := chi.NewRouter()
-	r.Use(cors)
+	r.Use(s.cors)
+	r.Use(s.requireSession)
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	if s.config.Mode == "desktop-api" && s.config.SessionToken != "" {
+		r.Post("/api/internal/shutdown", s.shutdown)
+	}
 	r.Get("/api/runners", s.listRunners)
 	r.Post("/api/runners/{runnerID}/claude/check-update", s.checkClaudeUpdate)
 	r.Post("/api/runners/{runnerID}/claude/update", s.updateClaude)
@@ -615,15 +708,18 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/notifications/dismiss-all", s.dismissAllNotifications)
 	s.registerSSHRoutes(r)
 	s.registerFSRoutes(r)
+	if s.config.Mode == "web" && s.config.WebRoot != "" {
+		r.NotFound(s.serveWebApp)
+	}
 	return r
 }
 
-func cors(next http.Handler) http.Handler {
+func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin := r.Header.Get("Origin"); isLocalWebOrigin(origin) {
+		if origin := r.Header.Get("Origin"); s.allowedOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		}
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Milevia-Session")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -633,12 +729,92 @@ func cors(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) allowedOrigin(origin string) bool {
+	if origin == "" {
+		return s.config.SessionToken == ""
+	}
+	if len(s.config.AllowedOrigins) > 0 {
+		for _, allowed := range s.config.AllowedOrigins {
+			if origin == allowed {
+				return true
+			}
+		}
+		return false
+	}
+	return isLocalWebOrigin(origin)
+}
+
 func isLocalWebOrigin(origin string) bool {
 	parsed, err := url.Parse(origin)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return false
 	}
 	return parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1"
+}
+
+func (s *Server) websocketSessionProtocol() string {
+	return "milevia-session." + s.config.SessionToken
+}
+
+func (s *Server) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.config.SessionToken == "" || r.URL.Path == "/api/health" || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Claude hooks and SSH approval tunnels cannot carry the desktop page
+		// session. The handler validates this separate, per-run secret before it
+		// creates an approval waiter.
+		if r.URL.Path == "/api/internal/approvals/wait" && r.Header.Get("X-Auto-Approval-Token") != "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if websocket.IsWebSocketUpgrade(r) {
+			for _, protocol := range websocket.Subprotocols(r) {
+				if protocol == s.websocketSessionProtocol() {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+		} else if r.Header.Get("X-Milevia-Session") == s.config.SessionToken {
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeError(w, http.StatusUnauthorized, errors.New("invalid desktop session"))
+	})
+}
+
+func (s *Server) serveWebApp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusNotFound, errors.New("route not found"))
+		return
+	}
+	// BrowserRouter owns application routes only. Unknown API and WebSocket
+	// paths must remain real 404s instead of returning HTML with a 200 status.
+	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/ws/") {
+		writeError(w, http.StatusNotFound, errors.New("route not found"))
+		return
+	}
+	cleanPath := pathpkg.Clean("/" + r.URL.Path)
+	target := filepath.Join(s.config.WebRoot, filepath.FromSlash(strings.TrimPrefix(cleanPath, "/")))
+	root := filepath.Clean(s.config.WebRoot) + string(os.PathSeparator)
+	if !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), root) {
+		writeError(w, http.StatusBadRequest, errors.New("invalid asset path"))
+		return
+	}
+	if info, err := os.Stat(target); err == nil && !info.IsDir() {
+		http.ServeFile(w, r, target)
+		return
+	}
+	http.ServeFile(w, r, filepath.Join(s.config.WebRoot, "index.html"))
+}
+
+// shutdown is intentionally available only through the desktop session
+// middleware. Closing on a separate goroutine lets the sidecar flush the HTTP
+// response before it stops its listener and SQLite connections.
+func (s *Server) shutdown(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "shutting_down"})
+	go s.Close()
 }
 
 func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
@@ -791,6 +967,9 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	if err := s.migrateSSHConnections(ctx); err != nil {
 		return fmt.Errorf("migrate ssh connections: %w", err)
 	}
+	if err := s.migratePersistedRunners(ctx); err != nil {
+		return fmt.Errorf("migrate persisted runners: %w", err)
+	}
 	if err := ensureColumn(ctx, s.db, "project_run_configs", "execution_target", "text not null default 'auto'"); err != nil {
 		return fmt.Errorf("add project run execution target: %w", err)
 	}
@@ -872,7 +1051,7 @@ create table if not exists app_metadata (key text primary key, value text not nu
 			return fmt.Errorf("add run %s: %w", column.name, err)
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `update conversations set agent_session_id=case when agent_session_id='' then claude_session_id else agent_session_id end, agent_initialized=case when agent_initialized=0 then claude_initialized else agent_initialized end, agent_runtime_id=case when agent_runtime_id='' then coalesce((select runner from projects where projects.id=conversations.project_id),'') else agent_runtime_id end, execution_policy=case when execution_policy='' or execution_policy='approval_required' then permission_mode else execution_policy end`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `update conversations set agent_session_id=case when agent_session_id='' then claude_session_id else agent_session_id end, agent_initialized=case when agent_initialized=0 then claude_initialized else agent_initialized end, agent_runtime_id=case when agent_runtime_id='' then coalesce((select nullif(runner_id,'') from projects where projects.id=conversations.project_id),(select runner from projects where projects.id=conversations.project_id),'') else agent_runtime_id end, execution_policy=case when execution_policy='' or execution_policy='approval_required' then permission_mode else execution_policy end`); err != nil {
 		return fmt.Errorf("backfill agent conversation fields: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `update runs set agent_id=coalesce(nullif((select agent_id from conversations where conversations.id=runs.conversation_id),''),'claude-code'), agent_runtime_id=coalesce(nullif((select agent_runtime_id from conversations where conversations.id=runs.conversation_id),''),''), execution_policy=coalesce(nullif((select execution_policy from conversations where conversations.id=runs.conversation_id),''),'approval_required') where agent_runtime_id=''`); err != nil {
@@ -1202,7 +1381,7 @@ func (s *Server) createDirectory(w http.ResponseWriter, r *http.Request) {
 	}
 	runnerID := input.Runner
 	if runnerID == "" {
-		runnerID = "wsl-local"
+		runnerID = s.localRunnerID()
 	}
 	if input.Path == "" {
 		writeError(w, http.StatusBadRequest, errors.New("path 必填"))
@@ -1299,7 +1478,7 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	runnerID := input.Runner
 	if runnerID == "" {
-		runnerID = "wsl-local"
+		runnerID = s.localRunnerID()
 	}
 	// For SSH runners, validate via SSH.
 	if strings.HasPrefix(runnerID, "ssh-") {
@@ -1373,7 +1552,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 	runnerID := input.Runner
 	if runnerID == "" {
-		runnerID = "wsl-local"
+		runnerID = s.localRunnerID()
 	}
 	// For SSH runners, skip local path validation.
 	if strings.HasPrefix(runnerID, "ssh-") {
@@ -1420,6 +1599,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			Path:        path,
 			PathDisplay: meta.Name + ":" + path,
 			Runner:      runnerID,
+			RunnerID:    runnerID,
 			GitBranch:   branch,
 			ClaudeReady: true,
 			CodexReady:  codexReady,
@@ -1427,11 +1607,12 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:   time.Now().UTC(),
 		}
 		s.decorateProjectPresentation(&p)
-		_, err = s.db.ExecContext(r.Context(), `insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, p.ID, p.Name, p.Path, p.Runner, p.GitBranch, p.ClaudeReady, p.CreatedAt)
+		_, err = s.db.ExecContext(r.Context(), `insert into projects (id,name,path,runner,runner_id,git_branch,claude_ready,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8)`, p.ID, p.Name, p.Path, p.Runner, p.RunnerID, p.GitBranch, p.ClaudeReady, p.CreatedAt)
 		if err != nil {
 			var existing Project
 			lookupErr := s.db.QueryRowContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects where path=$1 and runner=$2`, path, runnerID).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.Runner, &existing.GitBranch, &existing.ClaudeReady, &existing.CreatedAt)
 			if lookupErr == nil {
+				existing.RunnerID = existing.Runner
 				s.decorateProjectPresentation(&existing)
 				s.decorateProjectAvailability(&existing, s.codexRunner.Ready(r.Context()))
 				writeJSON(w, http.StatusOK, existing)
@@ -1462,13 +1643,14 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	if !gitReady {
 		branch = "非 Git 目录"
 	}
-	p := Project{ID: uuid.NewString(), Name: name, Path: path, PathDisplay: filepath.Base(path), Runner: "wsl-local", GitBranch: branch, ClaudeReady: claudeReady, CodexReady: codexReady, AgentReady: claudeReady || codexReady, CreatedAt: time.Now().UTC()}
+	p := Project{ID: uuid.NewString(), Name: name, Path: path, PathDisplay: filepath.Base(path), Runner: runnerID, RunnerID: runnerID, GitBranch: branch, ClaudeReady: claudeReady, CodexReady: codexReady, AgentReady: claudeReady || codexReady, CreatedAt: time.Now().UTC()}
 	s.decorateProjectPresentation(&p)
-	_, err = s.db.ExecContext(r.Context(), `insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, p.ID, p.Name, p.Path, p.Runner, p.GitBranch, p.ClaudeReady, p.CreatedAt)
+	_, err = s.db.ExecContext(r.Context(), `insert into projects (id,name,path,runner,runner_id,git_branch,claude_ready,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8)`, p.ID, p.Name, p.Path, p.Runner, p.RunnerID, p.GitBranch, p.ClaudeReady, p.CreatedAt)
 	if err != nil {
 		var existing Project
 		lookupErr := s.db.QueryRowContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects where path=$1 and runner=$2`, path, runnerID).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.Runner, &existing.GitBranch, &existing.ClaudeReady, &existing.CreatedAt)
 		if lookupErr == nil {
+			existing.RunnerID = existing.Runner
 			s.decorateProjectPresentation(&existing)
 			s.decorateProjectAvailability(&existing, s.codexRunner.Ready(r.Context()))
 			writeJSON(w, http.StatusOK, existing)
@@ -1635,7 +1817,7 @@ func (s *Server) stopProjectAgentRuns(ctx context.Context, projectID string) err
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects order by created_at desc`)
+	rows, err := s.db.QueryContext(r.Context(), `select id,name,path,coalesce(nullif(runner_id,''),runner),git_branch,claude_ready,created_at from projects order by created_at desc`)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -1652,8 +1834,9 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err)
 			return
 		}
+		p.RunnerID = p.Runner
 		s.decorateProjectPresentation(&p)
-		if p.Runner == "wsl-local" {
+		if isLocalRunnerID(p.Runner) {
 			s.decorateProjectAvailability(&p, localCodexReady)
 		} else if strings.HasPrefix(p.Runner, "ssh-") {
 			if cached, ok := sshCodexCache[p.Runner]; ok {
@@ -1677,7 +1860,7 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) decorateProjectAvailability(project *Project, localCodexReady bool) {
 	switch {
-	case project.Runner == "wsl-local":
+	case isLocalRunnerID(project.Runner):
 		project.CodexReady = localCodexReady
 	case strings.HasPrefix(project.Runner, "ssh-"):
 		project.CodexReady = s.sshCodexReady(project.Runner)
@@ -1788,7 +1971,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var projectRunner string
-	if err := s.db.QueryRowContext(r.Context(), `select runner from projects where id=?`, projectID).Scan(&projectRunner); errors.Is(err, sql.ErrNoRows) {
+	if err := s.db.QueryRowContext(r.Context(), `select coalesce(nullif(runner_id,''),runner) from projects where id=?`, projectID).Scan(&projectRunner); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("project not found"))
 		return
 	} else if err != nil {
@@ -1909,7 +2092,7 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 	var previous Conversation
 	var projectRunner string
-	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.runner from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &projectRunner)
+	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -2615,10 +2798,11 @@ func (s *Server) deleteShortcut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) shortcutForConversation(ctx context.Context, shortcutID, conversationID string) (Shortcut, Conversation, Project, error) {
 	var conversation Conversation
 	var project Project
-	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.id,p.name,p.path,p.runner,p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.id,p.name,p.path,coalesce(nullif(p.runner_id,''),p.runner),p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
 	if err != nil {
 		return Shortcut{}, Conversation{}, Project{}, err
 	}
+	project.RunnerID = project.Runner
 	row := s.db.QueryRowContext(ctx, `select s.id,s.name,s.description,s.kind,s.template,s.scope,s.default_action,s.group_name,s.pinned,s.enabled,s.sort_order,s.created_at,s.updated_at from shortcuts s where s.id=? and s.enabled=1 and (s.scope='local' or exists(select 1 from shortcut_projects sp where sp.shortcut_id=s.id and sp.project_id=?))`, shortcutID, project.ID)
 	shortcut, err := scanShortcut(row)
 	if err == nil {
@@ -2776,7 +2960,7 @@ type messageAdmission struct {
 
 func (s *Server) messageAdmission(ctx context.Context, conversationID string) (messageAdmission, error) {
 	var admission messageAdmission
-	err := s.db.QueryRowContext(ctx, `select c.agent_id,p.runner from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&admission.agentID, &admission.runnerID)
+	err := s.db.QueryRowContext(ctx, `select c.agent_id,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&admission.agentID, &admission.runnerID)
 	return admission, err
 }
 
@@ -2822,7 +3006,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	var conversation Conversation
 	var projectPath string
 	var projectRunner string
-	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,p.runner from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
+	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, "", nil, http.StatusNotFound, errors.New("conversation not found")
 	}
@@ -2835,9 +3019,13 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if record != nil && record.WorktreePath != "" {
 		projectPath = record.WorktreePath
 	}
+	if runtime.GOOS == "windows" && projectRunner == "wsl-local" {
+		return Message{}, "", nil, http.StatusServiceUnavailable,
+			errors.New("该项目使用旧 WSL Runner；请先配置对应的 WSL 发行版 Runner")
+	}
 	// Select the runner for this specific project.
-	// For SSH and other non-default runners, use the registry. For "wsl-local",
-	// prefer s.runner directly (tests may replace s.runner with a custom impl).
+	// For SSH and other non-default runners, use the registry. For the built-in
+	// local runner, prefer s.runner directly (tests may replace it).
 	runnerObj := s.runner // default to the server-level runner
 	if conversation.AgentID == "codex" {
 		if strings.HasPrefix(projectRunner, "ssh-") {
@@ -3362,14 +3550,14 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 		}
 	}
 	payload := map[string]any{"status": status, "error": errorText(runErr)}
-		// Attach taskId so the frontend can link error cards to the task detail page.
-		{
-			var payloadTaskID string
-			if err := s.db.QueryRowContext(s.runtimeCtx, `select task_id from task_runs where run_id=?`, runID).Scan(&payloadTaskID); err == nil && payloadTaskID != "" {
-				payload["taskId"] = payloadTaskID
-			}
+	// Attach taskId so the frontend can link error cards to the task detail page.
+	{
+		var payloadTaskID string
+		if err := s.db.QueryRowContext(s.runtimeCtx, `select task_id from task_runs where run_id=?`, runID).Scan(&payloadTaskID); err == nil && payloadTaskID != "" {
+			payload["taskId"] = payloadTaskID
 		}
-		if details, ok := runErr.(interface{ ErrorDetails() map[string]string }); ok {
+	}
+	if details, ok := runErr.(interface{ ErrorDetails() map[string]string }); ok {
 		for key, value := range details.ErrorDetails() {
 			payload[key] = value
 		}
@@ -3908,9 +4096,9 @@ func localizedErrorText(err error, fallback string) string {
 		"invalid JSON request":   "请求内容不是有效的 JSON。",
 		"activate this conversation before sending a message":                        "请先激活该会话，再发送消息。",
 		"Codex is currently available only on the local WSL runner":                  "Codex 目前仅支持本地 WSL 运行器。",
-		"远程服务器上 Codex CLI 不可用或未登录":                                                  "远程服务器上 Codex CLI 不可用或未登录。",
-		"远程服务器上未安装 Codex CLI":                                                  "远程服务器上未安装 Codex CLI。",
-		"此 Runner 不支持 Codex":                                                  "此运行器不支持 Codex。",
+		"远程服务器上 Codex CLI 不可用或未登录":                                                   "远程服务器上 Codex CLI 不可用或未登录。",
+		"远程服务器上未安装 Codex CLI":                                                        "远程服务器上未安装 Codex CLI。",
+		"此 Runner 不支持 Codex":                                                         "此运行器不支持 Codex。",
 		"Codex CLI is unavailable or not logged in":                                  "Codex CLI 不可用或尚未登录。",
 		"Claude Code is unavailable or not logged in":                                "Claude Code 不可用或尚未登录。",
 		"conversation is stopping":                                                   "会话正在停止，请稍后再试。",
@@ -3920,9 +4108,9 @@ func localizedErrorText(err error, fallback string) string {
 		"queued task cannot be stopped independently":                                "排队中的任务无法单独停止。",
 		"Git request timed out":                                                      "Git 操作超时，请稍后重试。",
 		"project is not currently a readable Git repository":                         "当前项目不是可读取的 Git 仓库。",
-		"runner not found":                                       "运行器不存在。",
-		"runner is not an SSH runner":                            "当前运行器不是 SSH 运行器。",
-		"another AI CLI is already being updated on this runner": "该运行器上已有 AI CLI 正在更新。",
+		"runner not found":                                                           "运行器不存在。",
+		"runner is not an SSH runner":                                                "当前运行器不是 SSH 运行器。",
+		"another AI CLI is already being updated on this runner":                     "该运行器上已有 AI CLI 正在更新。",
 	}
 	if translated, ok := translations[message]; ok {
 		return translated
@@ -4004,6 +4192,27 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
+func (s *Server) localRunnerID() string {
+	if runtime.GOOS == "windows" {
+		return "windows-local"
+	}
+	return "wsl-local"
+}
+
+func isLocalRunnerID(id string) bool {
+	if runtime.GOOS == "windows" {
+		return id == "" || id == "windows-local"
+	}
+	return id == "" || id == "wsl-local"
+}
+
+func (s *Server) localRunnerMeta() RunnerMeta {
+	if runtime.GOOS == "windows" {
+		return s.windowsLocalMeta()
+	}
+	return s.wslLocalMeta()
+}
+
 // wslLocalMeta builds the RunnerMeta for the built-in WSL local runner.
 func (s *Server) wslLocalMeta() RunnerMeta {
 	roots := []RootEntry{
@@ -4026,6 +4235,17 @@ func (s *Server) wslLocalMeta() RunnerMeta {
 		Root:        s.config.AllowedRoot,
 		Roots:       roots,
 	}
+}
+
+func (s *Server) windowsLocalMeta() RunnerMeta {
+	roots := []RootEntry{{Name: "用户目录", Path: s.config.AllowedRoot}}
+	for drive := 'C'; drive <= 'Z'; drive++ {
+		path := string(drive) + `:\\`
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			roots = append(roots, RootEntry{Name: "Windows (" + string(drive) + ":)", Path: path, Label: "windows"})
+		}
+	}
+	return RunnerMeta{ID: "windows-local", Name: "Windows Local Runner", Environment: "windows", Root: s.config.AllowedRoot, Roots: roots}
 }
 
 func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
@@ -4063,7 +4283,7 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		codexStatus := "unavailable"
 		codexVersion := ""
 		codexReason := ""
-		if m.ID == "wsl-local" {
+		if isLocalRunnerID(m.ID) {
 			if s.codexRunner.Ready(r.Context()) {
 				codexStatus = "ready"
 				codexVersion = s.codexRunner.Version(r.Context())
@@ -4113,7 +4333,7 @@ func (s *Server) checkClaudeUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) checkCodexUpdate(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
-	if runnerID == "wsl-local" {
+	if isLocalRunnerID(runnerID) {
 		s.checkAgentUpdate(w, r, s.codexRunner)
 		return
 	}
@@ -4160,7 +4380,7 @@ func (s *Server) updateClaude(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) updateCodex(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
-	if runnerID == "wsl-local" {
+	if isLocalRunnerID(runnerID) {
 		s.updateAgent(w, r, runnerID, "codex", "Codex", s.codexRunner)
 		return
 	}
@@ -4182,8 +4402,8 @@ func (s *Server) updateCodex(w http.ResponseWriter, r *http.Request) {
 // same locking and active-run checks as Claude Code.
 type codexRunnerAdapter struct{ inner CodexCapableRunner }
 
-func (a codexRunnerAdapter) Ready(ctx context.Context) bool        { return a.inner.CodexReady(ctx) }
-func (a codexRunnerAdapter) Version(ctx context.Context) string    { return a.inner.CodexVersion(ctx) }
+func (a codexRunnerAdapter) Ready(ctx context.Context) bool     { return a.inner.CodexReady(ctx) }
+func (a codexRunnerAdapter) Version(ctx context.Context) string { return a.inner.CodexVersion(ctx) }
 func (a codexRunnerAdapter) Run(ctx context.Context, _ AgentRunRequest, _ AgentRunSink) error {
 	return errors.New("codexRunnerAdapter does not support Run")
 }
@@ -4299,7 +4519,7 @@ func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projec
 		s.broadcastRunLog(projectID, entry)
 	}
 	var runner projectRunnerInterface
-	if project.Runner == "wsl-local" || project.Runner == "" {
+	if isLocalRunnerID(project.Runner) {
 		runner = newProjectRunner(projectID, "", "", nil, broadcast)
 	} else {
 		agentRunner, ok := s.runnerRegistry.get(project.Runner)
@@ -4328,7 +4548,7 @@ func validateProjectRunConfig(project Project, cfg RunConfig) error {
 		return err
 	}
 	// SSH 远程项目的执行环境与工作目录在远端解析，跳过本地路径校验。
-	if project.Runner != "wsl-local" && project.Runner != "" {
+	if !isLocalRunnerID(project.Runner) {
 		return nil
 	}
 	if _, err := resolveRunExecutionTarget(project.Path, cfg.ExecutionTarget); err != nil {
@@ -4352,10 +4572,11 @@ func validateRunEnvironmentVariables(envVars map[string]string) error {
 
 func (s *Server) getProjectByID(ctx context.Context, projectID string) (Project, error) {
 	var p Project
-	err := s.db.QueryRowContext(ctx, `select id,name,path,runner,git_branch,claude_ready,created_at from projects where id=$1`, projectID).Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `select id,name,path,coalesce(nullif(runner_id,''),runner),git_branch,claude_ready,created_at from projects where id=$1`, projectID).Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt)
 	if err != nil {
 		return Project{}, err
 	}
+	p.RunnerID = p.Runner
 	return p, nil
 }
 
@@ -4407,13 +4628,15 @@ func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if _, err := resolveRunExecutionTarget(project.Path, c.ExecutionTarget); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if _, err := resolveProjectRunWorkDir(project.Path, c.WorkDir); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
+	if isLocalRunnerID(project.Runner) {
+		if _, err := resolveRunExecutionTarget(project.Path, c.ExecutionTarget); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if _, err := resolveProjectRunWorkDir(project.Path, c.WorkDir); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
 	if err := s.saveRunConfig(r.Context(), projectID, c); err != nil {
@@ -4434,7 +4657,7 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	if project.Runner != "wsl-local" && project.Runner != "" {
+	if !isLocalRunnerID(project.Runner) {
 		// SSH 等远程项目：校验 runner 在线，由 projectRunManagerForExistingProject 负责。
 		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
 			writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})
@@ -4519,7 +4742,7 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	if project.Runner != "wsl-local" && project.Runner != "" {
+	if !isLocalRunnerID(project.Runner) {
 		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
 			writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})
 			return

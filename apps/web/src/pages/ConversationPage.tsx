@@ -23,8 +23,8 @@ import type {
   AgentExecution, RunUsage, ConversationUsageResponse,
   RunnerInfo, CheckUpdateResult, UpdateResult,
 } from "../lib/types";
-import { api } from "../lib/api";
-import { asRecord } from "../lib/api";
+import { api, asRecord } from "../lib/api";
+import { createWebSocket } from "../lib/runtime";
 import {
   formatTime, formatHistoryTime, formatTokens, formatDuration,
   formatCost, runDuration, contextLabel, contextLevel, requiredShortcutVariables,
@@ -836,7 +836,7 @@ export default function ConversationPage() {
     const connect = () => {
       if (!isCurrentConversation()) return;
       reconnectAttempts++;
-      socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/conversations/${conversation.id}`);
+      socket = createWebSocket(`/ws/conversations/${conversation.id}`);
       socket.onopen = () => {
         if (!isCurrentConversation()) return;
         reconnectAttempts = 0;

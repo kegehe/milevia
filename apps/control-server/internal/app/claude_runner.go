@@ -401,7 +401,7 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 					"matcher": "Bash",
 					"hooks": []any{map[string]any{
 						"type":    "command",
-						"command": "sh " + shellQuote(r.config.ApprovalHook),
+						"command": r.approvalHookCommand(),
 						"timeout": 310,
 					}},
 				}},
@@ -432,7 +432,7 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 			"hooks": map[string]any{
 				"PreToolUse": []any{map[string]any{
 					"matcher": "Bash",
-					"hooks":   []any{map[string]any{"type": "command", "command": "sh " + shellQuote(r.config.ApprovalHook), "timeout": 310}},
+					"hooks":   []any{map[string]any{"type": "command", "command": r.approvalHookCommand(), "timeout": 310}},
 				}},
 			},
 		})
@@ -447,6 +447,15 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 		args = append(args, "--session-id", request.SessionID)
 	}
 	return args, nil
+}
+
+func (r *claudeCLIRunner) approvalHookCommand() string {
+	if r.config.NativeApprovalHook {
+		// Claude executes hook commands through the platform shell. A quoted
+		// absolute executable path keeps the Windows helper independent of sh.
+		return `"` + strings.ReplaceAll(r.config.ApprovalHook, `"`, `\"`) + `"`
+	}
+	return "sh " + shellQuote(r.config.ApprovalHook)
 }
 
 func isReadOnlyClaudeRequest(permissionMode string) bool {

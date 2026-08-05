@@ -1,5 +1,7 @@
 // API 请求封装 — 从 App.tsx 提取
 
+import { apiURL, sessionHeaders } from "./runtime";
+
 function retryCountFor(init?: RequestInit): number {
   const method = (init?.method ?? "GET").toUpperCase();
   return method === "GET" || method === "HEAD" || method === "OPTIONS" ? 2 : 0;
@@ -11,9 +13,11 @@ export async function api<T>(path: string, init?: RequestInit, retries = retryCo
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      const response = await fetch(path, {
+      const headers = sessionHeaders(init?.headers);
+      if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+      const response = await fetch(apiURL(path), {
         ...init,
-        headers: { "Content-Type": "application/json", ...init?.headers },
+        headers,
       });
       if (response.ok) {
         if (response.status === 204 || response.status === 205) return undefined as T;

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -215,7 +216,7 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 	pr.windowsPIDMarker = windowsPIDMarker
 	pr.windowsPIDReady = nil
 	pr.windowsStartError = ""
-	if executionTarget == RunExecutionTargetWindows {
+	if executionTarget == RunExecutionTargetWindows && runtime.GOOS != "windows" {
 		pr.windowsPIDReady = make(chan struct{})
 	}
 	windowsPIDReady := pr.windowsPIDReady
@@ -330,6 +331,16 @@ func normalizeRunExecutionTarget(target RunExecutionTarget) RunExecutionTarget {
 }
 
 func resolveRunExecutionTarget(projectPath string, requested RunExecutionTarget) (RunExecutionTarget, error) {
+	if runtime.GOOS == "windows" {
+		switch normalizeRunExecutionTarget(requested) {
+		case RunExecutionTargetAuto, RunExecutionTargetWindows:
+			return RunExecutionTargetWindows, nil
+		case RunExecutionTargetWSL:
+			return "", errors.New("WSL 项目运行需要配置专用 WSL Runner")
+		default:
+			return "", errors.New("运行环境必须为 auto、wsl 或 windows")
+		}
+	}
 	switch normalizeRunExecutionTarget(requested) {
 	case RunExecutionTargetAuto:
 		if _, ok := wslPathToWindowsPath(projectPath); ok {
@@ -369,6 +380,11 @@ func wslPathToWindowsPath(wslPath string) (string, bool) {
 }
 
 func newProjectRunCommand(ctx context.Context, executionTarget RunExecutionTarget, workDir, command string) (*exec.Cmd, string, error) {
+	if executionTarget == RunExecutionTargetWindows && runtime.GOOS == "windows" {
+		cmd := exec.CommandContext(ctx, "cmd.exe", "/d", "/s", "/c", command)
+		cmd.Dir = workDir
+		return cmd, "", nil
+	}
 	if executionTarget == RunExecutionTargetWSL {
 		cmd := exec.CommandContext(ctx, "sh", "-c", command)
 		cmd.Dir = workDir

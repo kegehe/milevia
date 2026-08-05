@@ -998,7 +998,7 @@ func (s *Server) gitOperations(w http.ResponseWriter, r *http.Request) {
 }
 
 // getGitRunner 根据项目的 runner 类型返回对应的 GitRunner 与仓库路径。
-// 本地项目（wsl-local）使用本地 exec.Command；SSH 项目通过 SSH 在远端执行 git。
+// 本地项目使用本地 exec.Command；SSH 项目通过 SSH 在远端执行 git。
 func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner, string, bool) {
 	projectID := chi.URLParam(r, "projectID")
 	project, err := s.getProjectByID(r.Context(), projectID)
@@ -1010,7 +1010,7 @@ func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner
 		}
 		return nil, "", false
 	}
-	if project.Runner == "wsl-local" || project.Runner == "" {
+	if isLocalRunnerID(project.Runner) {
 		return newGitRunner(), project.Path, true
 	}
 	runner, ok := s.runnerRegistry.get(project.Runner)
@@ -1037,7 +1037,7 @@ func (s *Server) gitRunnerForProject(ctx context.Context, projectID string) (Git
 	if err != nil {
 		return nil, "", err
 	}
-	if project.Runner == "wsl-local" || project.Runner == "" {
+	if isLocalRunnerID(project.Runner) {
 		return newGitRunner(), project.Path, nil
 	}
 	runner, ok := s.runnerRegistry.get(project.Runner)

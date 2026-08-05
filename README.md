@@ -21,7 +21,7 @@ Milevia 用于在一个网页中加载和管理 WSL 本地项目，并通过 Cla
 - 本地数据：SQLite
 - AI 运行时：Claude Code CLI 的持久 `stream-json` 输入/输出会话
 
-## 前置条件
+## Web 端前置条件
 
 请在 WSL 环境中准备：
 
@@ -57,6 +57,32 @@ pnpm dev
 根目录的 `dev.sh` 会先清理默认端口 `8080` 和 `5173` 上的监听进程，再启动控制服务和网页。按 `Ctrl+C` 会同时停止两个服务。
 
 默认打开：`http://127.0.0.1:5173/`
+
+### Windows 桌面端
+
+桌面端使用 Tauri 2 承载现有 Web 页面，业务 API、页面结构和样式与 Web 端共用。桌面端启动时会自动拉起本地 Go control-server sidecar，并为本次启动生成独立会话令牌；Web 端仍可继续单独运行。
+
+桌面端必须在 Windows 10/11 上构建和运行。请先准备：
+
+- Node.js 22 或更高版本、pnpm 10 或更高版本
+- Go 1.26 或更高版本，并配置可用的 CGO/SQLite 编译工具链
+- 已安装并登录的 Claude Code CLI；如使用 Codex，也需准备 Codex CLI
+- WebView2 Runtime（Windows 11 通常已预装）
+
+首次安装依赖后，在仓库根目录启动桌面开发模式：
+
+```powershell
+pnpm install
+pnpm --filter @milevia/desktop dev
+```
+
+桌面端构建脚本会在 Windows 上重新编译 `milevia-control.exe` 和 `milevia-approval.exe`，然后启动 Tauri 窗口。正式生成 NSIS/MSI 安装包：
+
+```powershell
+pnpm --filter @milevia/desktop build
+```
+
+Linux/WSL 环境不能直接生成可用的 Windows 安装包；应使用 Windows 实机或 Windows CI 完成最终构建和安装验证。
 
 ### 自定义端口
 

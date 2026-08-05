@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Milevia",
+  "version": "0.1.0",
+  "identifier": "com.milevia.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --dir ../web dev --host 127.0.0.1 --port 1420 --strictPort",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../web/dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "../binaries/milevia-control.exe": "milevia-control.exe",
+      "../binaries/milevia-approval.exe": "milevia-approval.exe"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

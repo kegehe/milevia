@@ -4194,7 +4194,6 @@ func seedTaskConversation(t *testing.T) (*Server, string, string) {
 	return server, projectID, conversationID
 }
 
-
 func enableOrchestrationForTest(t *testing.T, server *Server, projectID string) {
 	t.Helper()
 	now := time.Now().UTC()
@@ -5804,6 +5803,16 @@ func TestRunExecutionTargetKeepsWSLProjectsAndAllowsOverride(t *testing.T) {
 	}
 }
 
+func TestWindowsExecutionTargetKeepsPublicValue(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows target behavior")
+	}
+	target, err := resolveRunExecutionTarget(`C:\\projects\\milevia`, RunExecutionTargetAuto)
+	if err != nil || target != RunExecutionTargetWindows {
+		t.Fatalf("target=%q err=%v, want windows", target, err)
+	}
+}
+
 func TestWindowsPowerShellCommandUsesTextOutputFormat(t *testing.T) {
 	cmd := newWindowsPowerShellCommand(context.Background(), "powershell.exe", "encoded-script")
 	args := strings.Join(cmd.Args, " ")
@@ -5879,6 +5888,26 @@ func TestRunConfigDefaultsAndPersistsExecutionTarget(t *testing.T) {
 	}
 	if cfg.ExecutionTarget != RunExecutionTargetWSL {
 		t.Fatalf("execution target=%q, want wsl", cfg.ExecutionTarget)
+	}
+}
+
+func TestRemoteRunConfigAcceptsRemoteLinuxPaths(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,runner_id,git_branch,claude_ready,created_at) values ('remote-run','remote-run','/srv/apps/api','ssh-remote','ssh-remote','main',1,?)`, now); err != nil {
+		t.Fatalf("insert remote project: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/projects/remote-run/run/config", strings.NewReader(`{"workDir":"/srv/apps/api/frontend","command":"npm run dev","envVars":{},"executionTarget":"auto"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("save remote config: %d body=%s", response.Code, response.Body.String())
+	}
+	var cfg RunConfig
+	if err := json.NewDecoder(response.Body).Decode(&cfg); err != nil {
+		t.Fatalf("decode remote config: %v", err)
+	}
+	if cfg.WorkDir != "/srv/apps/api/frontend" || cfg.ExecutionTarget != RunExecutionTargetAuto {
+		t.Fatalf("unexpected remote config: %#v", cfg)
 	}
 }
 
@@ -6674,8 +6703,8 @@ type codexCapableStubRunner struct {
 	codexVersion string
 }
 
-func (r codexCapableStubRunner) CodexReady(context.Context) bool        { return r.codexReady }
-func (r codexCapableStubRunner) CodexVersion(context.Context) string    { return r.codexVersion }
+func (r codexCapableStubRunner) CodexReady(context.Context) bool     { return r.codexReady }
+func (r codexCapableStubRunner) CodexVersion(context.Context) string { return r.codexVersion }
 func (r codexCapableStubRunner) CodexCheckUpdate(context.Context) (bool, string, error) {
 	return false, r.codexVersion, nil
 }

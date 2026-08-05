@@ -38,7 +38,7 @@ func (s *Server) getFilesystem(r *http.Request) (Filesystem, error) {
 		return nil, fmt.Errorf("项目不存在：%w", err)
 	}
 
-	if project.Runner == "wsl-local" || project.Runner == "" {
+	if isLocalRunnerID(project.Runner) {
 		return &LocalFilesystem{
 			allowedRoot: s.config.AllowedRoot,
 			projectPath: project.Path,

@@ -456,7 +456,7 @@ func (s *Server) deleteSSHConnection(w http.ResponseWriter, r *http.Request) {
 	defer s.sshMu.Unlock()
 	runnerID := "ssh-" + id
 	var projCount int
-	if err := s.db.QueryRowContext(r.Context(), `select count(*) from projects where runner=?`, runnerID).Scan(&projCount); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), `select count(*) from projects where coalesce(nullif(runner_id,''),runner)=?`, runnerID).Scan(&projCount); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

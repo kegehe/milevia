@@ -1,0 +1,14 @@
+{
+  "name": "@milevia/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "prepare-assets": "node scripts/generate-icon.mjs",
+    "dev": "pnpm run prepare-assets && node scripts/build-sidecar.mjs && tauri dev",
+    "build": "pnpm --dir ../web build && pnpm run prepare-assets && node scripts/build-sidecar.mjs && tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1"
+  }
+}

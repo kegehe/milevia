@@ -1,0 +1,4 @@
+binaries/*.exe
+src-tauri/icons/
+src-tauri/target/
+src-tauri/gen/schemas/

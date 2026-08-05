@@ -4,6 +4,7 @@ import { createContext, useContext, useEffect, useRef, useCallback, useState } f
 import { useNavigate, useLocation } from "react-router-dom";
 import { Toaster, toast } from "sonner";
 import { api } from "../lib/api";
+import { createWebSocket } from "../lib/runtime";
 import {
   type NotificationEvent,
   notificationConversationURL,
@@ -193,8 +194,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
 
     const connect = () => {
       if (cancelled) return;
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${protocol}://${window.location.host}/ws/notifications`);
+      const ws = createWebSocket("/ws/notifications");
 
       ws.onopen = () => {
         const isReconnect = reconnectAttempts > 0;
