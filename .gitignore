@@ -6,6 +6,7 @@
 # Runtime data
 data/*
 !data/.gitkeep
+logs/
 
 # JavaScript tooling
 node_modules/

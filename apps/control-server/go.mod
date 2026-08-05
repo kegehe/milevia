@@ -1,4 +1,4 @@
-module github.com/tangmaoke/milevia/apps/control-server
+module github.com/kegehe/milevia/apps/control-server
 
 go 1.26.2
 
@@ -9,9 +9,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/pkg/sftp v1.13.11
 	golang.org/x/crypto v0.54.0
+	golang.org/x/sys v0.47.0
 )
 
-require (
-	github.com/kr/fs v0.1.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-)
+require github.com/kr/fs v0.1.0 // indirect
