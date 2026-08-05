@@ -2,10 +2,9 @@
 
 import { useParams, useOutletContext } from "react-router-dom";
 import { ProjectRunPanel } from "../features/run/ProjectRunPanel";
+import { ProjectLayoutOutletContext } from "../components/ProjectLayout";
 import "../run.css";
 import { useProjectContext } from "../stores/useProjectStore";
-
-type ProjectLayoutOutletContext = { project: { runner: string } };
 
 export default function ProjectRunPage() {
   const { projectId } = useParams<{ projectId: string }>();

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +42,10 @@ type sshProjectRunner struct {
 	exitChan    chan struct{}
 	exitCode    int
 	hasExitCode bool
+
+	workDir string
+	envVars map[string]string
+	command string
 
 	opMu sync.Mutex
 	mu   sync.RWMutex
@@ -87,28 +93,35 @@ func (pr *sshProjectRunner) StartWithConfig(parentCtx context.Context, projectPa
 		pr.mu.Unlock()
 		return fmt.Errorf("进程已在运行中")
 	}
+	pr.workDir = workDir
+	pr.command = command
+	pr.envVars = envVars
 	pr.mu.Unlock()
-	return pr.start(parentCtx, projectPath, command)
+	return pr.start(parentCtx, projectPath)
 }
 
 func (pr *sshProjectRunner) RestartWithConfig(parentCtx context.Context, projectPath, workDir, command string, envVars map[string]string, executionTarget RunExecutionTarget) error {
 	pr.opMu.Lock()
 	defer pr.opMu.Unlock()
-	pr.mu.RLock()
+	pr.mu.Lock()
+	if pr.retired {
+		pr.mu.Unlock()
+		return fmt.Errorf("项目已删除，无法启动进程")
+	}
 	running := pr.status == RunStatusRunning || pr.status == RunStatusStarting
-	pr.mu.RUnlock()
+	pr.workDir = workDir
+	pr.command = command
+	pr.envVars = envVars
+	pr.mu.Unlock()
 	if running {
 		if err := pr.stop(); err != nil {
 			return fmt.Errorf("停止进程失败: %w", err)
 		}
 	}
-	return pr.start(parentCtx, projectPath, command)
+	return pr.start(parentCtx, projectPath)
 }
 
-func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath, command string) error {
-	if command == "" {
-		return errors.New("请先配置启动命令")
-	}
+func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string) error {
 	pr.mu.Lock()
 	if pr.retired {
 		pr.mu.Unlock()
@@ -117,6 +130,13 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath, comman
 	if pr.status == RunStatusRunning || pr.status == RunStatusStarting {
 		pr.mu.Unlock()
 		return fmt.Errorf("进程已在运行中")
+	}
+	command := pr.command
+	workDir := pr.workDir
+	envVars := pr.envVars
+	if command == "" {
+		pr.mu.Unlock()
+		return errors.New("请先配置启动命令")
 	}
 	pr.status = RunStatusStarting
 	pr.exitChan = make(chan struct{})
@@ -138,8 +158,27 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath, comman
 		return fmt.Errorf("创建 SSH session 失败: %w", err)
 	}
 
-	// 在远端通过 cd 进入项目目录后执行命令；环境变量通过 shell export 前缀注入。
-	shellCmd := "cd " + shellQuote(pr.rootPath) + " && " + command
+	// cd 到项目目录（或配置的子工作目录），注入环境变量，然后执行命令。
+	cdTarget := pr.rootPath
+	if workDir != "" {
+		cleaned := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(workDir)), "/")
+		if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			pr.cancel()
+			pr.mu.Lock()
+			pr.status = RunStatusFailed
+			pr.exitCode = -1
+			pr.hasExitCode = true
+			close(pr.exitChan)
+			pr.mu.Unlock()
+			return errors.New("工作目录不能超出项目路径")
+		}
+		cdTarget = pr.rootPath + "/" + cleaned
+	}
+	shellCmd := "cd " + shellQuote(cdTarget) + " && "
+	for k, v := range envVars {
+		shellCmd += "export " + k + "=" + shellQuote(v) + " "
+	}
+	shellCmd += command
 	stdout, err := session.StdoutPipe()
 	if err != nil {
 		session.Close()
@@ -284,7 +323,7 @@ func (pr *sshProjectRunner) Retire() error {
 	defer pr.opMu.Unlock()
 	pr.mu.Lock()
 	pr.retired = true
-	running := pr.status == RunStatusRunning
+	running := pr.status == RunStatusRunning || pr.status == RunStatusStarting
 	pr.mu.Unlock()
 	if !running {
 		return nil

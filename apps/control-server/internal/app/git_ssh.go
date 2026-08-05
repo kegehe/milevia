@@ -54,8 +54,7 @@ func gitEnvExports() string {
 	return b.String()
 }
 
-// buildGitShell 构造在远端执行的 shell 命令：cd 到仓库并执行 git。
-// stdinTarget 为空时输出重定向到 /dev/null（避免与 stdout 混合）；否则从 stdin 读取。
+// buildGitShell 构造在远端执行的 shell 命令：设置环境变量、cd 到仓库并执行 git。
 func (b *sshGitBackend) buildGitShell(repo string, args []string) string {
 	var cmd strings.Builder
 	cmd.WriteString(gitEnvExports())
@@ -69,24 +68,12 @@ func (b *sshGitBackend) buildGitShell(repo string, args []string) string {
 	return cmd.String()
 }
 
-// classifySSHError 将 ssh CombinedOutput 的非零退出转为 *gitCommandError，与本地后端保持一致。
-func classifySSHError(args []string, out []byte, err error) error {
+// classifySSHError 将 ssh 的非零退出转为 *gitCommandError，与本地后端保持一致。
+func classifySSHError(args []string, stderr []byte, err error) error {
 	if err == nil {
 		return nil
 	}
-	stderr := extractGitStderr(out)
-	return &gitCommandError{command: gitFirstArg(args), cause: err, stderr: stderr}
-}
-
-// extractGitStderr 从 CombinedOutput 中尽量提取 stderr 文本。
-// SSH CombinedOutput 合并了 stdout 与 stderr，这里取末尾的非空行作为提示。
-func extractGitStderr(out []byte) string {
-	text := strings.TrimSpace(string(out))
-	if text == "" {
-		return ""
-	}
-	// git 错误通常在末尾；返回全部内容供分类逻辑匹配关键字。
-	return text
+	return &gitCommandError{command: gitFirstArg(args), cause: err, stderr: string(stderr)}
 }
 
 func gitFirstArg(args []string) string {
@@ -100,12 +87,12 @@ func (b *sshGitBackend) runGit(ctx context.Context, repo string, args ...string)
 	commandCtx, cancel := context.WithTimeout(ctx, gitCommandTimeout)
 	defer cancel()
 	cmd := b.buildGitShell(repo, args)
-	out, err := b.client.execCommand(commandCtx, cmd)
+	out, stderr, err := b.client.execCommandSeparate(commandCtx, cmd, gitOutputLimit)
 	if commandCtx.Err() != nil {
 		return out, commandCtx.Err()
 	}
 	if err != nil {
-		return out, classifySSHError(args, out, err)
+		return out, classifySSHError(args, stderr, err)
 	}
 	if len(out) > gitOutputLimit {
 		return out[:gitOutputLimit], errGitOutputTooLarge
@@ -125,12 +112,29 @@ func (b *sshGitBackend) runGitPaths(ctx context.Context, repo string, args, path
 	pathspec := strings.Join(paths, "\x00") + "\x00"
 	fullArgs := append(append([]string{}, args...), "--pathspec-from-file=-", "--pathspec-file-nul")
 	cmd := b.buildGitShell(repo, fullArgs)
-	out, err := b.client.execCommandWithStdin(commandCtx, cmd, []byte(pathspec))
+	out, stderr, err := b.client.execCommandWithStdinSeparate(commandCtx, cmd, []byte(pathspec), gitOutputLimit)
 	if commandCtx.Err() != nil {
 		return out, commandCtx.Err()
 	}
 	if err != nil {
-		return out, classifySSHError(fullArgs, out, err)
+		return out, classifySSHError(fullArgs, stderr, err)
+	}
+	if len(out) > gitOutputLimit {
+		return out[:gitOutputLimit], errGitOutputTooLarge
+	}
+	return out, nil
+}
+
+func (b *sshGitBackend) runGitStdin(ctx context.Context, repo string, args []string, stdin []byte) ([]byte, error) {
+	commandCtx, cancel := context.WithTimeout(ctx, gitCommandTimeout)
+	defer cancel()
+	cmd := b.buildGitShell(repo, args)
+	out, stderr, err := b.client.execCommandWithStdinSeparate(commandCtx, cmd, stdin, gitOutputLimit)
+	if commandCtx.Err() != nil {
+		return out, commandCtx.Err()
+	}
+	if err != nil {
+		return out, classifySSHError(args, stderr, err)
 	}
 	if len(out) > gitOutputLimit {
 		return out[:gitOutputLimit], errGitOutputTooLarge
@@ -185,7 +189,7 @@ func (b *sshGitBackend) lstat(repo, rel string) (os.FileMode, int64, int64, int6
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-	info, err := sftpClient.Stat(path.Join(repo, rel))
+	info, err := sftpClient.Lstat(path.Join(repo, rel))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
@@ -226,8 +230,13 @@ func (b *sshGitBackend) validateUntrackedRemoval(repo string, paths []string) er
 		if err := validateGitPath(p); err != nil {
 			return err
 		}
-		if _, err := sftpClient.Stat(path.Join(repo, p)); err != nil {
+		abs := path.Join(repo, p)
+		info, err := sftpClient.Lstat(abs)
+		if err != nil {
 			return fmt.Errorf("read untracked Git path: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("refusing to remove a symbolic link")
 		}
 	}
 	return nil
@@ -245,13 +254,18 @@ func (b *sshGitBackend) removeUntracked(repo string, paths []string) error {
 			return err
 		}
 		abs := path.Join(repo, p)
-		if _, err := sftpClient.Stat(abs); err != nil {
+		info, err := sftpClient.Lstat(abs)
+		if err != nil {
 			return fmt.Errorf("read untracked Git path: %w", err)
 		}
-		if err := sftpClient.Remove(abs); err != nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: refusing to remove a symbolic link", errGitPartiallyApplied)
+		}
+		// RemoveAll 能递归删除目录；Remove 仅删除文件。
+		if err := sftpClient.RemoveAll(abs); err != nil {
 			return fmt.Errorf("%w: remove untracked Git path: %v", errGitPartiallyApplied, err)
 		}
-		if _, err := sftpClient.Stat(abs); err == nil {
+		if _, err := sftpClient.Lstat(abs); err == nil {
 			return fmt.Errorf("%w: untracked Git path remains", errGitPartiallyApplied)
 		}
 	}

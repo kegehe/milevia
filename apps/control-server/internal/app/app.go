@@ -534,6 +534,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects", s.listProjects)
 	r.Get("/api/projects/statuses", s.listProjectStatuses)
 	r.Post("/api/projects", s.createProject)
+	r.Get("/api/projects/{projectID}", s.getProject)
 	r.Delete("/api/projects/{projectID}", s.deleteProject)
 	r.Get("/api/projects/{projectID}/git/summary", s.gitSummary)
 	r.Get("/api/projects/{projectID}/git/changes", s.gitChanges)
@@ -1675,6 +1676,31 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, projects)
 }
 
+// getProject returns a single project by ID. Unlike listProjects it performs no
+// remote Codex/Claude readiness probing, so it returns immediately even when an
+// SSH runner is slow or unreachable. Callers that need the current readiness
+// state should use listProjects or the statuses endpoint instead.
+func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("project ID is required"))
+		return
+	}
+	p, err := s.getProjectByID(r.Context(), projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.decorateProjectPresentation(&p)
+	// agentReady falls back to the persisted claude_ready flag; remote codex
+	// readiness is intentionally not probed here.
+	p.AgentReady = p.ClaudeReady
+	writeJSON(w, 200, p)
+}
+
 func (s *Server) decorateProjectAvailability(project *Project, localCodexReady bool) {
 	switch {
 	case project.Runner == "wsl-local":
@@ -2647,7 +2673,9 @@ func renderShortcut(shortcut Shortcut, conversation Conversation, project Projec
 	}
 	if shortcut.Kind == "command_request" {
 		if strings.HasPrefix(rendered, "/") {
-			rendered = "请在当前 Claude Code 会话中执行以下斜杠命令：\n`" + rendered + "`\n\n遵循当前权限模式；完成后总结结果。"
+			// Slash commands (e.g. /compact, /clear, /review) are native CLI
+			// commands — pass them through verbatim so the CLI executes them
+			// directly rather than treating them as a prompt to the model.
 		} else {
 			rendered = "请在当前项目中执行以下命令：\n`" + rendered + "`\n\n遵循当前权限模式；完成后总结结果。"
 		}
@@ -4285,23 +4313,19 @@ func (s *Server) saveRunConfig(ctx context.Context, projectID string, c RunConfi
 // the manager map lock. A concurrent deletion therefore either retires this
 // runner after creation or prevents a new runner from being registered.
 // 根据项目的 runner 类型创建对应的 projectRunner（本地或 SSH）。
+// 先在锁外解析远端路径（SSH 往返），再持锁检查并注册 runner，避免长时间持锁。
 func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projectID string) (projectRunnerInterface, error) {
-	s.runManagersMu.Lock()
-	defer s.runManagersMu.Unlock()
 	project, err := s.getProjectByID(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
-	if runner, ok := s.runManagers[projectID]; ok {
-		return runner, nil
+
+	// SSH 项目需要先解析远端规范路径（含一次 SSH 往返），在锁外完成。
+	type preparedRunner struct {
+		runner projectRunnerInterface
 	}
-	broadcast := func(entry LogEntry) {
-		s.broadcastRunLog(projectID, entry)
-	}
-	var runner projectRunnerInterface
-	if project.Runner == "wsl-local" || project.Runner == "" {
-		runner = newProjectRunner(projectID, "", "", nil, broadcast)
-	} else {
+	var prepared *preparedRunner
+	if project.Runner != "wsl-local" && project.Runner != "" {
 		agentRunner, ok := s.runnerRegistry.get(project.Runner)
 		if !ok {
 			return nil, &runnerOfflineError{RunnerID: project.Runner}
@@ -4314,7 +4338,29 @@ func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projec
 		if err != nil {
 			return nil, err
 		}
-		runner = newSSHProjectRunner(projectID, sshR.client, repo, broadcast)
+		broadcast := func(entry LogEntry) {
+			s.broadcastRunLog(projectID, entry)
+		}
+		prepared = &preparedRunner{runner: newSSHProjectRunner(projectID, sshR.client, repo, broadcast)}
+	}
+
+	s.runManagersMu.Lock()
+	defer s.runManagersMu.Unlock()
+	// 持锁后重新检查项目是否存在（并发删除可能在锁释放期间发生）。
+	if _, err := s.getProjectByID(ctx, projectID); err != nil {
+		return nil, err
+	}
+	if runner, ok := s.runManagers[projectID]; ok {
+		return runner, nil
+	}
+	broadcast := func(entry LogEntry) {
+		s.broadcastRunLog(projectID, entry)
+	}
+	var runner projectRunnerInterface
+	if prepared != nil {
+		runner = prepared.runner
+	} else {
+		runner = newProjectRunner(projectID, "", "", nil, broadcast)
 	}
 	s.runManagers[projectID] = runner
 	return runner, nil
@@ -4343,11 +4389,31 @@ func validateRunEnvironmentVariables(envVars map[string]string) error {
 		if key == "" || strings.ContainsAny(key, "=\x00") {
 			return errors.New("环境变量名称不能为空，且不能包含 = 或 NUL 字符")
 		}
+		if !isPosixEnvName(key) {
+			return errors.New("环境变量名称只能包含字母、数字和下划线，且不能以数字开头")
+		}
 		if strings.ContainsRune(value, 0) {
 			return errors.New("环境变量值不能包含 NUL 字符")
 		}
 	}
 	return nil
+}
+
+// isPosixEnvName 检查是否为合法的 POSIX 环境变量名：
+// 仅含字母、数字、下划线，且不以数字开头。
+func isPosixEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 && r >= '0' && r <= '9' {
+			return false
+		}
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) getProjectByID(ctx context.Context, projectID string) (Project, error) {
@@ -4479,6 +4545,10 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
 			return
 		}
+		if offline, ok := err.(*runnerOfflineError); ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "runner_offline", "runnerId": offline.RunnerID})
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -4541,6 +4611,10 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+			return
+		}
+		if offline, ok := err.(*runnerOfflineError); ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "runner_offline", "runnerId": offline.RunnerID})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err)

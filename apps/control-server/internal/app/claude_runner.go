@@ -476,6 +476,12 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 		}
 		sink.Event(envelope.Type, line)
 		if envelope.Type == "system" && envelope.Subtype == "init" {
+			var init struct {
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(line, &init) == nil && init.SessionID != "" {
+				sink.SessionIdentified(init.SessionID)
+			}
 			sink.SessionInitialized()
 		}
 		if envelope.Type != "assistant" {
@@ -629,6 +635,15 @@ func (session *claudeCLISession) emit(eventType string, payload json.RawMessage,
 	session.mu.Unlock()
 	turn.sink.Event(eventType, payload)
 	if initialized {
+		// The init event carries the CLI-assigned session_id. Persist it so a
+		// later process restart resumes the exact session even if the
+		// --session-id argument was not honored by the CLI.
+		var init struct {
+			SessionID string `json:"session_id"`
+		}
+		if json.Unmarshal(payload, &init) == nil && init.SessionID != "" {
+			turn.sink.SessionIdentified(init.SessionID)
+		}
 		turn.sink.SessionInitialized()
 	}
 }
@@ -719,6 +734,21 @@ func (session *claudeCLISession) startCurrentLocked(turn *claudeSessionTurn) err
 	startTurn(turn, session.initSeen)
 	for _, event := range pending {
 		turn.sink.Event(event.typ, event.payload)
+		// Replay the init handling that emit() defers when no turn is bound:
+		// extract the CLI-assigned session_id so it persists even when the init
+		// event arrived before Send() set the current turn.
+		if event.typ == "system" {
+			var env struct {
+				Subtype   string `json:"subtype"`
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(event.payload, &env) == nil && env.Subtype == "init" {
+				if env.SessionID != "" {
+					turn.sink.SessionIdentified(env.SessionID)
+				}
+				turn.sink.SessionInitialized()
+			}
+		}
 	}
 	payload, err := json.Marshal(map[string]any{
 		"type":               "user",

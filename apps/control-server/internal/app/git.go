@@ -106,6 +106,8 @@ type gitBackend interface {
 	runGit(ctx context.Context, repo string, args ...string) ([]byte, error)
 	// runGitPaths 与 runGit 相同，但当路径过多时通过临时文件传递 pathspec。
 	runGitPaths(ctx context.Context, repo string, args, paths []string) ([]byte, error)
+	// runGitStdin 执行从 stdin 读取数据的 git 命令（如 commit --file=-）。
+	runGitStdin(ctx context.Context, repo string, args []string, stdin []byte) ([]byte, error)
 	// writeTempFile 写入临时文件并返回其路径与清理函数。用于 commit message 与 pathspec 文件。
 	writeTempFile(content []byte) (path string, cleanup func(), err error)
 	// lstat 返回仓库内相对路径的文件信息（用于变更指纹）。
@@ -215,12 +217,7 @@ func (runner *gitCLIRunner) DiscardInitialChanges(ctx context.Context, repo stri
 }
 
 func (runner *gitCLIRunner) Commit(ctx context.Context, repo, message string) error {
-	path, cleanup, err := runner.backend.writeTempFile([]byte(message + "\n"))
-	if err != nil {
-		return fmt.Errorf("create Git commit message: %w", err)
-	}
-	defer cleanup()
-	_, err = runner.backend.runGit(ctx, repo, "commit", "--file="+path)
+	_, err := runner.backend.runGitStdin(ctx, repo, []string{"commit", "--file=-"}, []byte(message+"\n"))
 	return err
 }
 
@@ -535,6 +532,61 @@ func (b *localGitBackend) writeTempFile(content []byte) (string, func(), error) 
 		return "", nil, err
 	}
 	return path, cleanup, nil
+}
+
+func (b *localGitBackend) runGitStdin(ctx context.Context, repo string, args []string, stdin []byte) ([]byte, error) {
+	timeout := b.timeout
+	if timeout <= 0 {
+		timeout = gitCommandTimeout
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	command := exec.Command("git", args...)
+	command.Dir = repo
+	command.Env = gitCommandEnvironment(os.Environ())
+	configureProcessGroup(command)
+	output := newGitOutputCollector(gitOutputLimit)
+	command.Stdout = output.stdoutWriter()
+	command.Stderr = output.stderrWriter()
+	pipe, err := command.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("create Git stdin pipe: %w", err)
+	}
+	if err := command.Start(); err != nil {
+		return nil, fmt.Errorf("start Git: %w", err)
+	}
+	go func() {
+		_, _ = pipe.Write(stdin)
+		_ = pipe.Close()
+	}()
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		if commandCtx.Err() != nil {
+			terminateProcessGroup(command)
+			return output.Stdout(), commandCtx.Err()
+		}
+		if output.Exceeded() {
+			return output.Stdout(), errGitOutputTooLarge
+		}
+		if err != nil {
+			return output.Stdout(), &gitCommandError{command: args[0], cause: err, stderr: string(output.Stderr())}
+		}
+		return output.Stdout(), nil
+	case <-commandCtx.Done():
+		terminateProcessGroup(command)
+		if !waitForGitCommand(command, done, gitTerminateWait, gitForceWait) {
+			return output.Stdout(), fmt.Errorf("%w: %v", errGitTerminationTimedOut, commandCtx.Err())
+		}
+		return output.Stdout(), commandCtx.Err()
+	case <-output.Overflowed():
+		terminateProcessGroup(command)
+		if !waitForGitCommand(command, done, gitTerminateWait, gitForceWait) {
+			return output.Stdout(), errGitTerminationTimedOut
+		}
+		return output.Stdout(), errGitOutputTooLarge
+	}
 }
 
 func (b *localGitBackend) lstat(repo, path string) (os.FileMode, int64, int64, int64, error) {
