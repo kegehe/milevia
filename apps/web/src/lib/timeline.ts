@@ -11,6 +11,22 @@ function isIgnoredCLIStderr(message: string): boolean {
   return ignoredCodexStderr.has(message.trim());
 }
 
+// Codex wraps shell commands as `/usr/bin/zsh -lc 'actual command'` (or sh).
+// Strip the wrapper so the tool card shows the real command the model ran.
+function unwrapCodexShell(command: string): string {
+  const match = command.match(/^(?:\/[^\s'"]+\/)?(?:zsh|sh|bash)\s+-lc\s+['"](.*)['"]$/s);
+  if (match) return match[1];
+  return command;
+}
+
+// shortenPath reduces an absolute path to its last two segments for compact
+// display in tool card descriptions.
+function shortenPath(path: string): string {
+  const segments = path.split("/").filter(Boolean);
+  if (segments.length <= 2) return segments.join("/") || path;
+  return segments.slice(-2).join("/");
+}
+
 function firstText(...values: unknown[]): string {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value.trim();
@@ -126,17 +142,31 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
     const id = String(item.id || event.id);
     const key = `codex:${id}`;
     const changes = Array.isArray(item.changes) ? item.changes.map(asRecord) : [];
-    const changeSummary = changes.map((change) => `${change.kind || "修改"}: ${change.path || "文件"}`).join("\n");
+    const changeLabel = (kind: string): string => {
+      switch (String(kind)) {
+        case "add": return "新增";
+        case "modify": return "修改";
+        case "delete": return "删除";
+        default: return "修改";
+      }
+    };
+    const changeSummary = changes.map((change) => `${changeLabel(String(change.kind || ""))} ${shortenPath(String(change.path || "文件"))}`).join("\n");
+    const changeDescription = changes.length > 0 ? changeSummary.replace(/\n/g, "、") : "修改项目文件";
     const input = itemType === "command_execution"
-      ? { command: String(item.command || ""), description: "执行命令" }
-      : { description: changeSummary || "修改项目文件", changes };
+      ? { command: unwrapCodexShell(String(item.command || "")), description: "执行命令" }
+      : { description: changeDescription, changes };
     const existing = codexTools.get(key);
-    const outputText = itemType === "command_execution" ? String(item.aggregated_output || item.output || "") : changeSummary;
+    const changeDiffs = changes.map((change) => {
+      const diff = typeof change.diff === "string" ? change.diff.trim() : "";
+      const header = `${changeLabel(String(change.kind || ""))} ${shortenPath(String(change.path || "文件"))}`;
+      return diff ? `${header}\n${diff}` : header;
+    }).join("\n\n");
+    const outputText = itemType === "command_execution" ? String(item.aggregated_output || item.output || "") : changeDiffs || changeSummary;
     const failed = Number(item.exit_code ?? item.exitCode ?? 0) !== 0 || item.status === "failed";
     codexTools.set(key, {
       id: key,
       runId: event.runId,
-      name: itemType === "command_execution" ? "命令" : "文件变更",
+      name: itemType === "command_execution" ? "终端命令" : "文件修改",
       input,
       createdAt: existing?.createdAt || event.createdAt,
       output: event.type === "item.completed" ? { content: failed ? localizedErrorDetail(outputText, "命令执行失败，请查看任务日志后重试。") : outputText || "已完成", isError: failed } : existing?.output,

@@ -41,6 +41,16 @@ type StreamingAgentRunner interface {
 	StartSession(context.Context, AgentSessionRequest) (AgentSession, error)
 }
 
+// CodexCapableRunner is implemented by runners that can run Codex CLI in
+// addition to Claude Code (notably SSH runners, where Codex runs remotely).
+// The local WSL runner uses the standalone codexRunner instead.
+type CodexCapableRunner interface {
+	CodexReady(context.Context) bool
+	CodexVersion(context.Context) string
+	CodexCheckUpdate(context.Context) (updateAvailable bool, latestVersion string, err error)
+	CodexUpdate(context.Context) (previousVersion, currentVersion string, err error)
+}
+
 type AgentSessionRequest struct {
 	SessionID      string
 	ProjectPath    string
@@ -72,6 +82,9 @@ type AgentRunRequest struct {
 	Resume         bool
 	RunID          string
 	RunToken       string
+	// AgentID identifies which CLI ("claude-code" or "codex") this run targets.
+	// SSH runners consult it to dispatch to the correct remote command.
+	AgentID string
 }
 
 type AgentRunSink interface {

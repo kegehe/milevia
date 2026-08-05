@@ -309,7 +309,6 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     <UnreadNotificationContext.Provider value={unreadCount}>
       <Toaster
         position="bottom-right"
-        richColors
         closeButton
       />
       {children}

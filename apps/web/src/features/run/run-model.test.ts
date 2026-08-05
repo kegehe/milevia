@@ -10,14 +10,14 @@ test("uses semantic labels for standard-error logs", () => {
 	assert.deepEqual(runLogPresentation({ stream: "stderr", text: "Error failed to start" }), { label: "错误", tone: "is-error" });
 });
 
-test("replaces English error logs with a Chinese fallback", () => {
-  assert.equal(runLogText({ stream: "stderr", text: "Error failed to start" }), "项目运行出现错误，请检查运行配置和日志后重试。");
-  assert.equal(runLogText({ stream: "stderr", text: "npm ERR! code ERESOLVE" }), "项目运行出现错误，请检查运行配置和日志后重试。");
-  assert.equal(runLogText({ stream: "stderr", text: "ModuleNotFoundError: Cannot find module x" }), "项目运行出现错误，请检查运行配置和日志后重试。");
-  assert.equal(runLogText({ stream: "stderr", text: "sh: vite: not found" }), "项目运行出现错误，请检查运行配置和日志后重试。");
-  assert.equal(runLogText({ stream: "stderr", text: "permission denied" }), "项目运行出现错误，请检查运行配置和日志后重试。");
-  assert.equal(runLogText({ stream: "stderr", text: "exit code 1" }), "项目运行出现错误，请检查运行配置和日志后重试。");
-  assert.equal(runLogText({ stream: "stderr", text: "go: module example.com/foo: malformed module path" }), "项目运行出现错误，请检查运行配置和日志后重试。");
+test("shows the original error log text verbatim", () => {
+  assert.equal(runLogText({ stream: "stderr", text: "Error failed to start" }), "Error failed to start");
+  assert.equal(runLogText({ stream: "stderr", text: "npm ERR! code ERESOLVE" }), "npm ERR! code ERESOLVE");
+  assert.equal(runLogText({ stream: "stderr", text: "ModuleNotFoundError: Cannot find module x" }), "ModuleNotFoundError: Cannot find module x");
+  assert.equal(runLogText({ stream: "stderr", text: "sh: vite: not found" }), "sh: vite: not found");
+  assert.equal(runLogText({ stream: "stderr", text: "permission denied" }), "permission denied");
+  assert.equal(runLogText({ stream: "stderr", text: "exit code 1" }), "exit code 1");
+  assert.equal(runLogText({ stream: "stderr", text: "go: module example.com/foo: malformed module path" }), "go: module example.com/foo: malformed module path");
   assert.equal(runLogText({ stream: "stderr", text: "错误：配置无效" }), "错误：配置无效");
 });
 

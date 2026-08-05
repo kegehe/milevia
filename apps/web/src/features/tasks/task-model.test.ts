@@ -189,7 +189,7 @@ test("keeps strict-serial orchestration controls visible and records responsive"
   assert.match(styles, /\.orchestration-enabled input\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;/s);
   assert.match(styles, /\.orchestration-release-branch\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
   assert.match(styles, /\.orchestration-status\[data-status="integrated_to_dev"\]/);
-  assert.match(mobileStyles, /\.orchestration-record-action\s*\{[^}]*grid-column:\s*1;/);
+  assert.match(mobileStyles, /\.orchestration-record-actions\s*\{[^}]*grid-column:\s*1;/);
 });
 
 test("prevents duplicate task review submissions", () => {

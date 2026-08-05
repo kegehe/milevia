@@ -99,12 +99,49 @@ type GitBranch struct {
 	Upstream string `json:"upstream,omitempty"`
 }
 
+// gitBackend 抽象 Git 命令执行与仓库文件系统操作，使本地 runner 与 SSH runner 共用同一套解析逻辑。
+// 本地实现用 exec.Command + os 文件 API；SSH 实现用 sshClient.execCommand + SFTP。
+type gitBackend interface {
+	// runGit 在 repo 目录执行 git args，返回 stdout。失败时返回 *gitCommandError 以便上层分类。
+	runGit(ctx context.Context, repo string, args ...string) ([]byte, error)
+	// runGitPaths 与 runGit 相同，但当路径过多时通过临时文件传递 pathspec。
+	runGitPaths(ctx context.Context, repo string, args, paths []string) ([]byte, error)
+	// writeTempFile 写入临时文件并返回其路径与清理函数。用于 commit message 与 pathspec 文件。
+	writeTempFile(content []byte) (path string, cleanup func(), err error)
+	// lstat 返回仓库内相对路径的文件信息（用于变更指纹）。
+	lstat(repo, path string) (mode os.FileMode, size int64, mtimeNano int64, mtimeUnix int64, err error)
+	// readFile 读取仓库内相对路径的文件内容（用于未跟踪文件 diff）。
+	readFile(repo, path string) ([]byte, error)
+	// validateUntrackedRemoval 确认给定相对路径在仓库内存在且可删除。
+	validateUntrackedRemoval(repo string, paths []string) error
+	// removeUntracked 删除仓库内给定相对路径的未跟踪文件。
+	removeUntracked(repo string, paths []string) error
+}
+
 type GitRunner interface {
 	Snapshot(context.Context, string) (GitSnapshot, error)
 	Changes(context.Context, string) ([]GitChange, error)
 	Diff(context.Context, string, string, GitDiffStage) (string, error)
 	Log(context.Context, string, string, int) ([]GitCommit, error)
 	Branches(context.Context, string) ([]GitBranch, error)
+	Stage(context.Context, string, []string) error
+	Unstage(context.Context, string, []string) error
+	RestoreWorktree(context.Context, string, []string) error
+	RestoreAll(context.Context, string, []string) error
+	DiscardInitialChanges(context.Context, string, []string) error
+	Commit(context.Context, string, string) error
+	ValidateUntrackedRemoval(string, []string) error
+	RemoveUntracked(string, []string) error
+	Fetch(context.Context, string, string) error
+	Push(context.Context, string, string, string, bool) error
+	CreateBranch(context.Context, string, string, string) error
+	SwitchBranch(context.Context, string, string) error
+	// lstat 返回仓库内相对路径的文件信息（用于变更指纹）。
+	lstat(repo, path string) (mode os.FileMode, size int64, mtimeNano int64, mtimeUnix int64, err error)
+	// readFile 读取仓库内相对路径的文件内容（用于未跟踪文件 diff）。
+	readFile(repo, path string) ([]byte, error)
+	// runGit 在仓库目录执行原始 git 命令并返回 stdout（用于恢复检查等内部逻辑）。
+	runGit(ctx context.Context, repo string, args ...string) ([]byte, error)
 }
 
 func (runner *gitCLIRunner) Stage(ctx context.Context, repo string, paths []string) error {
@@ -116,7 +153,7 @@ func (runner *gitCLIRunner) Stage(ctx context.Context, repo string, paths []stri
 			return err
 		}
 	}
-	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "add"}, paths)
+	_, err := runner.backend.runGitPaths(ctx, repo, []string{"--literal-pathspecs", "add"}, paths)
 	return err
 }
 
@@ -129,7 +166,7 @@ func (runner *gitCLIRunner) Unstage(ctx context.Context, repo string, paths []st
 			return err
 		}
 	}
-	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--staged"}, paths)
+	_, err := runner.backend.runGitPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--staged"}, paths)
 	return err
 }
 
@@ -142,7 +179,7 @@ func (runner *gitCLIRunner) RestoreWorktree(ctx context.Context, repo string, pa
 			return err
 		}
 	}
-	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--worktree"}, paths)
+	_, err := runner.backend.runGitPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--worktree"}, paths)
 	return err
 }
 
@@ -155,7 +192,7 @@ func (runner *gitCLIRunner) RestoreAll(ctx context.Context, repo string, paths [
 			return err
 		}
 	}
-	_, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree"}, paths)
+	_, err := runner.backend.runGitPaths(ctx, repo, []string{"--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree"}, paths)
 	return err
 }
 
@@ -168,7 +205,7 @@ func (runner *gitCLIRunner) DiscardInitialChanges(ctx context.Context, repo stri
 			return err
 		}
 	}
-	if _, err := runner.commandPaths(ctx, repo, []string{"--literal-pathspecs", "rm", "--cached", "--ignore-unmatch"}, paths); err != nil {
+	if _, err := runner.backend.runGitPaths(ctx, repo, []string{"--literal-pathspecs", "rm", "--cached", "--ignore-unmatch"}, paths); err != nil {
 		return err
 	}
 	if err := runner.RemoveUntracked(repo, paths); err != nil {
@@ -178,79 +215,42 @@ func (runner *gitCLIRunner) DiscardInitialChanges(ctx context.Context, repo stri
 }
 
 func (runner *gitCLIRunner) Commit(ctx context.Context, repo, message string) error {
-	file, err := os.CreateTemp("", "auto-git-commit-message-*")
+	path, cleanup, err := runner.backend.writeTempFile([]byte(message + "\n"))
 	if err != nil {
 		return fmt.Errorf("create Git commit message: %w", err)
 	}
-	path := file.Name()
-	defer os.Remove(path)
-	if err := file.Chmod(0o600); err != nil {
-		file.Close()
-		return fmt.Errorf("protect Git commit message: %w", err)
-	}
-	if _, err := file.WriteString(message + "\n"); err != nil {
-		file.Close()
-		return fmt.Errorf("write Git commit message: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close Git commit message: %w", err)
-	}
-	_, err = runner.command(ctx, repo, "commit", "--file="+path)
+	defer cleanup()
+	_, err = runner.backend.runGit(ctx, repo, "commit", "--file="+path)
 	return err
 }
 
 func (runner *gitCLIRunner) ValidateUntrackedRemoval(repo string, paths []string) error {
-	root, err := os.OpenRoot(repo)
-	if err != nil {
-		return fmt.Errorf("open Git repository root: %w", err)
-	}
-	defer root.Close()
-	return validateUntrackedRemovalInRoot(root, paths)
-}
-
-func validateUntrackedRemovalInRoot(root *os.Root, paths []string) error {
-	for _, path := range paths {
-		if err := validateGitPath(path); err != nil {
-			return err
-		}
-		if _, err := root.Lstat(path); err != nil {
-			return fmt.Errorf("read untracked Git path: %w", err)
-		}
-	}
-	return nil
+	return runner.backend.validateUntrackedRemoval(repo, paths)
 }
 
 func (runner *gitCLIRunner) RemoveUntracked(repo string, paths []string) error {
-	root, err := os.OpenRoot(repo)
-	if err != nil {
-		return fmt.Errorf("open Git repository root: %w", err)
-	}
-	defer root.Close()
-	if err := validateUntrackedRemovalInRoot(root, paths); err != nil {
-		return err
-	}
-	return removeUntrackedFromRoot(root, paths)
+	return runner.backend.removeUntracked(repo, paths)
 }
 
-func removeUntrackedFromRoot(root *os.Root, paths []string) error {
-	for _, path := range paths {
-		if err := root.RemoveAll(path); err != nil {
-			return fmt.Errorf("%w: remove untracked Git path: %v", errGitPartiallyApplied, err)
-		}
-		if _, err := root.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: untracked Git path remains", errGitPartiallyApplied)
-		}
-	}
-	return nil
+func (runner *gitCLIRunner) lstat(repo, path string) (os.FileMode, int64, int64, int64, error) {
+	return runner.backend.lstat(repo, path)
+}
+
+func (runner *gitCLIRunner) readFile(repo, path string) ([]byte, error) {
+	return runner.backend.readFile(repo, path)
+}
+
+func (runner *gitCLIRunner) runGit(ctx context.Context, repo string, args ...string) ([]byte, error) {
+	return runner.backend.runGit(ctx, repo, args...)
 }
 
 func hasGitHead(snapshot GitSnapshot) bool {
 	return isFullGitObjectID(snapshot.Head.OID)
 }
 
-type gitCLIRunner struct{ timeout time.Duration }
+type gitCLIRunner struct{ timeout time.Duration; backend gitBackend }
 
-func newGitRunner() GitRunner { return &gitCLIRunner{timeout: gitCommandTimeout} }
+func newGitRunner() GitRunner { return &gitCLIRunner{timeout: gitCommandTimeout, backend: newLocalGitBackend()} }
 
 func (runner *gitCLIRunner) Fetch(ctx context.Context, repo, remote string) error {
 	if remote == "" {
@@ -259,7 +259,7 @@ func (runner *gitCLIRunner) Fetch(ctx context.Context, repo, remote string) erro
 	if err := validateGitRef(remote); err != nil {
 		return err
 	}
-	_, err := runner.command(ctx, repo, "fetch", "--prune", remote)
+	_, err := runner.backend.runGit(ctx, repo, "fetch", "--prune", remote)
 	return err
 }
 
@@ -281,7 +281,7 @@ func (runner *gitCLIRunner) Push(ctx context.Context, repo, remote, branch strin
 		args = append(args, "--set-upstream")
 	}
 	args = append(args, remote, "HEAD:"+branch)
-	_, err := runner.command(ctx, repo, args...)
+	_, err := runner.backend.runGit(ctx, repo, args...)
 	return err
 }
 
@@ -292,7 +292,7 @@ func (runner *gitCLIRunner) CreateBranch(ctx context.Context, repo, name, startP
 	if err := validateGitRef(name); err != nil {
 		return err
 	}
-	if _, err := runner.command(ctx, repo, "check-ref-format", "--branch", "refs/heads/"+name); err != nil {
+	if _, err := runner.backend.runGit(ctx, repo, "check-ref-format", "--branch", "refs/heads/"+name); err != nil {
 		return fmt.Errorf("invalid Git branch name: %w", err)
 	}
 	args := []string{"branch", name}
@@ -302,7 +302,7 @@ func (runner *gitCLIRunner) CreateBranch(ctx context.Context, repo, name, startP
 		}
 		args = append(args, startPoint)
 	}
-	_, err := runner.command(ctx, repo, args...)
+	_, err := runner.backend.runGit(ctx, repo, args...)
 	return err
 }
 
@@ -313,12 +313,12 @@ func (runner *gitCLIRunner) SwitchBranch(ctx context.Context, repo, name string)
 	if err := validateGitRef(name); err != nil {
 		return err
 	}
-	_, err := runner.command(ctx, repo, "switch", name)
+	_, err := runner.backend.runGit(ctx, repo, "switch", name)
 	return err
 }
 
 func (runner *gitCLIRunner) Snapshot(ctx context.Context, repo string) (GitSnapshot, error) {
-	raw, err := runner.command(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
+	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
 	if err != nil {
 		return GitSnapshot{}, err
 	}
@@ -327,7 +327,7 @@ func (runner *gitCLIRunner) Snapshot(ctx context.Context, repo string) (GitSnaps
 }
 
 func (runner *gitCLIRunner) Changes(ctx context.Context, repo string) ([]GitChange, error) {
-	raw, err := runner.command(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
+	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +345,7 @@ func (runner *gitCLIRunner) Diff(ctx context.Context, repo, path string, stage G
 	} else if stage != gitDiffWorktree {
 		return "", errors.New("unsupported Git diff stage")
 	}
-	output, err := runner.command(ctx, repo, append(args, "--", path)...)
+	output, err := runner.backend.runGit(ctx, repo, append(args, "--", path)...)
 	return string(output), err
 }
 
@@ -369,7 +369,7 @@ func (runner *gitCLIRunner) Log(ctx context.Context, repo, ref string, limit int
 		return nil, err
 	}
 	format := "%H%x00%P%x00%an%x00%at%x00%s"
-	output, err := runner.command(ctx, repo, "log", "-z", "--format="+format, "--max-count="+strconv.Itoa(limit), ref)
+	output, err := runner.backend.runGit(ctx, repo, "log", "-z", "--format="+format, "--max-count="+strconv.Itoa(limit), ref)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +400,7 @@ func (runner *gitCLIRunner) validateLogRef(ctx context.Context, repo, ref string
 		return nil
 	}
 	if isFullGitObjectID(ref) {
-		if _, err := runner.command(ctx, repo, "cat-file", "-e", ref+"^{commit}"); err != nil {
+		if _, err := runner.backend.runGit(ctx, repo, "cat-file", "-e", ref+"^{commit}"); err != nil {
 			return errors.New("Git object ID is not a commit in this repository")
 		}
 		return nil
@@ -431,7 +431,7 @@ func isFullGitObjectID(value string) bool {
 
 func (runner *gitCLIRunner) Branches(ctx context.Context, repo string) ([]GitBranch, error) {
 	format := "%(refname:short)%00%(HEAD)%00%(upstream:short)%00%(refname)%00"
-	output, err := runner.command(ctx, repo, "for-each-ref", "--format="+format, "refs/heads", "refs/remotes")
+	output, err := runner.backend.runGit(ctx, repo, "for-each-ref", "--format="+format, "refs/heads", "refs/remotes")
 	if err != nil {
 		return nil, err
 	}
@@ -448,8 +448,13 @@ func (runner *gitCLIRunner) Branches(ctx context.Context, repo string) ([]GitBra
 	return branches, nil
 }
 
-func (runner *gitCLIRunner) command(ctx context.Context, repo string, args ...string) ([]byte, error) {
-	timeout := runner.timeout
+// localGitBackend 通过本地 exec.Command 与 os 文件 API 实现 gitBackend。
+type localGitBackend struct{ timeout time.Duration }
+
+func newLocalGitBackend() *localGitBackend { return &localGitBackend{timeout: gitCommandTimeout} }
+
+func (b *localGitBackend) runGit(ctx context.Context, repo string, args ...string) ([]byte, error) {
+	timeout := b.timeout
 	if timeout <= 0 {
 		timeout = gitCommandTimeout
 	}
@@ -495,31 +500,93 @@ func (runner *gitCLIRunner) command(ctx context.Context, repo string, args ...st
 	}
 }
 
-func (runner *gitCLIRunner) commandPaths(ctx context.Context, repo string, args []string, paths []string) ([]byte, error) {
+func (b *localGitBackend) runGitPaths(ctx context.Context, repo string, args, paths []string) ([]byte, error) {
 	if len(paths) <= 100 {
-		return runner.command(ctx, repo, append(append([]string{}, args...), append([]string{"--"}, paths...)...)...)
+		return b.runGit(ctx, repo, append(append([]string{}, args...), append([]string{"--"}, paths...)...)...)
 	}
-	file, err := os.CreateTemp("", "auto-git-pathspec-*")
+	path, cleanup, err := b.writeTempFile([]byte(strings.Join(paths, "\x00") + "\x00"))
 	if err != nil {
 		return nil, fmt.Errorf("create Git path list: %w", err)
 	}
+	defer cleanup()
+	args = append(args, "--pathspec-from-file="+path, "--pathspec-file-nul")
+	return b.runGit(ctx, repo, args...)
+}
+
+func (b *localGitBackend) writeTempFile(content []byte) (string, func(), error) {
+	file, err := os.CreateTemp("", "auto-git-*")
+	if err != nil {
+		return "", nil, err
+	}
 	path := file.Name()
-	defer os.Remove(path)
+	cleanup := func() { _ = os.Remove(path) }
 	if err := file.Chmod(0o600); err != nil {
 		file.Close()
-		return nil, fmt.Errorf("protect Git path list: %w", err)
+		cleanup()
+		return "", nil, err
 	}
-	for _, item := range paths {
-		if _, err := file.WriteString(item + "\x00"); err != nil {
-			file.Close()
-			return nil, fmt.Errorf("write Git path list: %w", err)
-		}
+	if _, err := file.Write(content); err != nil {
+		file.Close()
+		cleanup()
+		return "", nil, err
 	}
 	if err := file.Close(); err != nil {
-		return nil, fmt.Errorf("close Git path list: %w", err)
+		cleanup()
+		return "", nil, err
 	}
-	args = append(args, "--pathspec-from-file="+path, "--pathspec-file-nul")
-	return runner.command(ctx, repo, args...)
+	return path, cleanup, nil
+}
+
+func (b *localGitBackend) lstat(repo, path string) (os.FileMode, int64, int64, int64, error) {
+	info, err := os.Lstat(filepath.Join(repo, path))
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return info.Mode(), info.Size(), info.ModTime().UnixNano(), info.ModTime().Unix(), nil
+}
+
+func (b *localGitBackend) readFile(repo, path string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(repo, path))
+}
+
+func (b *localGitBackend) validateUntrackedRemoval(repo string, paths []string) error {
+	root, err := os.OpenRoot(repo)
+	if err != nil {
+		return fmt.Errorf("open Git repository root: %w", err)
+	}
+	defer root.Close()
+	for _, path := range paths {
+		if err := validateGitPath(path); err != nil {
+			return err
+		}
+		if _, err := root.Lstat(path); err != nil {
+			return fmt.Errorf("read untracked Git path: %w", err)
+		}
+	}
+	return nil
+}
+
+func (b *localGitBackend) removeUntracked(repo string, paths []string) error {
+	root, err := os.OpenRoot(repo)
+	if err != nil {
+		return fmt.Errorf("open Git repository root: %w", err)
+	}
+	defer root.Close()
+	for _, path := range paths {
+		if err := validateGitPath(path); err != nil {
+			return err
+		}
+		if _, err := root.Lstat(path); err != nil {
+			return fmt.Errorf("read untracked Git path: %w", err)
+		}
+		if err := root.RemoveAll(path); err != nil {
+			return fmt.Errorf("%w: remove untracked Git path: %v", errGitPartiallyApplied, err)
+		}
+		if _, err := root.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: untracked Git path remains", errGitPartiallyApplied)
+		}
+	}
+	return nil
 }
 
 func waitForGitCommand(command *exec.Cmd, done <-chan error, terminateWait, forceWait time.Duration) bool {

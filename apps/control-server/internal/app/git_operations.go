@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -85,17 +83,17 @@ create index if not exists git_operations_project_requested on git_operations(pr
 
 func (s *Server) recoverGitOperations(ctx context.Context) error {
 	now := time.Now().UTC()
-	rows, err := s.db.QueryContext(ctx, `select operations.id,operations.type,operations.after_state,projects.path from git_operations operations join projects on projects.id=operations.project_id where operations.status in ('queued','running')`)
+	rows, err := s.db.QueryContext(ctx, `select operations.id,operations.type,operations.after_state,projects.id,projects.path from git_operations operations join projects on projects.id=operations.project_id where operations.status in ('queued','running')`)
 	if err != nil {
 		return fmt.Errorf("list interrupted Git operations: %w", err)
 	}
 	type interruptedOperation struct {
-		id, typ, afterState, path string
+		id, typ, afterState, projectID, path string
 	}
 	operations := []interruptedOperation{}
 	for rows.Next() {
 		var operation interruptedOperation
-		if err := rows.Scan(&operation.id, &operation.typ, &operation.afterState, &operation.path); err != nil {
+		if err := rows.Scan(&operation.id, &operation.typ, &operation.afterState, &operation.projectID, &operation.path); err != nil {
 			rows.Close()
 			return fmt.Errorf("read interrupted Git operation: %w", err)
 		}
@@ -109,11 +107,14 @@ func (s *Server) recoverGitOperations(ctx context.Context) error {
 	}
 	for _, operation := range operations {
 		status, errorCode, errorMessage := gitOperationNeedsAttention, "result_unknown", "控制服务在确认 Git 操作结果前已重启，请刷新并检查工作区。"
-		if operation.typ == "commit" && recoveredGitCommit(ctx, operation.path, operation.afterState) {
-			status, errorCode, errorMessage = gitOperationSucceeded, "", ""
-		}
-		if operation.typ == "fetch" && recoveredGitFetch(ctx, operation.path, operation.afterState) {
-			status, errorCode, errorMessage = gitOperationSucceeded, "", ""
+		runner, repo, runnerErr := s.gitRunnerForProject(ctx, operation.projectID)
+		if runnerErr == nil {
+			if operation.typ == "commit" && recoveredGitCommit(ctx, runner, repo, operation.afterState) {
+				status, errorCode, errorMessage = gitOperationSucceeded, "", ""
+			}
+			if operation.typ == "fetch" && recoveredGitFetch(ctx, runner, repo, operation.afterState) {
+				status, errorCode, errorMessage = gitOperationSucceeded, "", ""
+			}
 		}
 		if _, err := s.db.ExecContext(ctx, `update git_operations set status=?,error_code=?,error_message=?,finished_at=? where id=? and status in ('queued','running')`, status, errorCode, errorMessage, now, operation.id); err != nil {
 			return fmt.Errorf("recover Git operation %s: %w", operation.id, err)
@@ -122,7 +123,7 @@ func (s *Server) recoverGitOperations(ctx context.Context) error {
 	return nil
 }
 
-func recoveredGitFetch(ctx context.Context, repo, afterState string) bool {
+func recoveredGitFetch(ctx context.Context, runner GitRunner, repo, afterState string) bool {
 	var evidence struct {
 		RemoteRefs map[string]string `json:"remoteRefs"`
 	}
@@ -134,8 +135,7 @@ func recoveredGitFetch(ctx context.Context, repo, afterState string) bool {
 			return false
 		}
 	}
-	runner := newGitRunner().(*gitCLIRunner)
-	output, err := runner.command(ctx, repo, "for-each-ref", "--format=%(refname)%00%(objectname)%00", "refs/remotes")
+	output, err := runner.runGit(ctx, repo, "for-each-ref", "--format=%(refname)%00%(objectname)%00", "refs/remotes")
 	if err != nil {
 		return false
 	}
@@ -155,23 +155,23 @@ func recoveredGitFetch(ctx context.Context, repo, afterState string) bool {
 	return true
 }
 
-func recoveredGitCommit(ctx context.Context, repo, afterState string) bool {
+func recoveredGitCommit(ctx context.Context, runner GitRunner, repo, afterState string) bool {
 	var evidence struct {
 		HeadOID string `json:"headOid"`
 	}
 	if json.Unmarshal([]byte(afterState), &evidence) != nil || !isFullGitObjectID(evidence.HeadOID) {
 		return false
 	}
-	snapshot, err := newGitRunner().Snapshot(ctx, repo)
+	snapshot, err := runner.Snapshot(ctx, repo)
 	return err == nil && snapshot.Head.OID == evidence.HeadOID
 }
 
 func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
-	repo, ok := s.projectGitRepository(w, r)
+	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
 		return
 	}
-	snapshot, changes, fingerprints, err := readGitState(r.Context(), repo)
+	snapshot, changes, fingerprints, err := readGitState(r.Context(), runner, repo)
 	if err != nil {
 		s.writeGitReadError(w, err)
 		return
@@ -182,11 +182,11 @@ func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) gitChanges(w http.ResponseWriter, r *http.Request) {
-	repo, ok := s.projectGitRepository(w, r)
+	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
 		return
 	}
-	changes, err := newGitRunner().Changes(r.Context(), repo)
+	changes, err := runner.Changes(r.Context(), repo)
 	if err != nil {
 		s.writeGitReadError(w, err)
 		return
@@ -195,7 +195,7 @@ func (s *Server) gitChanges(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) gitDiff(w http.ResponseWriter, r *http.Request) {
-	repo, ok := s.projectGitRepository(w, r)
+	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
 		return
 	}
@@ -212,7 +212,7 @@ func (s *Server) gitDiff(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("unsupported Git diff stage"))
 		return
 	}
-	changes, err := newGitRunner().Changes(r.Context(), repo)
+	changes, err := runner.Changes(r.Context(), repo)
 	if err != nil {
 		s.writeGitReadError(w, err)
 		return
@@ -229,7 +229,7 @@ func (s *Server) gitDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if selected.Untracked && stage == gitDiffWorktree {
-		content, err := readUntrackedGitContent(repo, path)
+		content, err := readUntrackedGitContent(runner, repo, path)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -237,7 +237,7 @@ func (s *Server) gitDiff(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"path": path, "stage": string(stage), "content": content})
 		return
 	}
-	diff, err := newGitRunner().Diff(r.Context(), repo, path, stage)
+	diff, err := runner.Diff(r.Context(), repo, path, stage)
 	if err != nil {
 		s.writeGitReadError(w, err)
 		return
@@ -246,41 +246,41 @@ func (s *Server) gitDiff(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) gitStage(w http.ResponseWriter, r *http.Request) {
-	s.gitPathsMutation(w, r, "stage", func(ctx context.Context, repo string, paths []string) error {
-		return newGitRunner().(*gitCLIRunner).Stage(ctx, repo, paths)
+	s.gitPathsMutation(w, r, "stage", func(ctx context.Context, runner GitRunner, repo string, paths []string) error {
+		return runner.Stage(ctx, repo, paths)
 	})
 }
 
 func (s *Server) gitUnstage(w http.ResponseWriter, r *http.Request) {
-	s.gitPathsMutation(w, r, "unstage", func(ctx context.Context, repo string, paths []string) error {
-		return newGitRunner().(*gitCLIRunner).Unstage(ctx, repo, paths)
+	s.gitPathsMutation(w, r, "unstage", func(ctx context.Context, runner GitRunner, repo string, paths []string) error {
+		return runner.Unstage(ctx, repo, paths)
 	})
 }
 
 func (s *Server) gitStageAll(w http.ResponseWriter, r *http.Request) {
 	s.gitAllPathsMutation(w, r, "stage", "全部暂存", func(change GitChange) bool {
 		return change.Modified || change.Untracked || change.Deleted || change.Renamed || change.Conflicted
-	}, func(ctx context.Context, repo string, paths []string) error {
-		return newGitRunner().(*gitCLIRunner).Stage(ctx, repo, paths)
+	}, func(ctx context.Context, runner GitRunner, repo string, paths []string) error {
+		return runner.Stage(ctx, repo, paths)
 	})
 }
 
 func (s *Server) gitUnstageAll(w http.ResponseWriter, r *http.Request) {
 	s.gitAllPathsMutation(w, r, "unstage", "全部取消暂存", func(change GitChange) bool {
 		return change.Staged
-	}, func(ctx context.Context, repo string, paths []string) error {
-		return newGitRunner().(*gitCLIRunner).Unstage(ctx, repo, paths)
+	}, func(ctx context.Context, runner GitRunner, repo string, paths []string) error {
+		return runner.Unstage(ctx, repo, paths)
 	})
 }
 
-func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ, label string, eligible func(GitChange) bool, execute func(context.Context, string, []string) error) {
+func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ, label string, eligible func(GitChange) bool, execute func(context.Context, GitRunner, string, []string) error) {
 	var input struct {
 		StateToken string `json:"stateToken"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -295,8 +295,8 @@ func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ
 		writeError(w, http.StatusConflict, errors.New("there are no eligible Git changes"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, typ, fmt.Sprintf("%s（%d 个文件）", label, len(paths)), state.snapshot, func() error {
-		return execute(r.Context(), repo, paths)
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, typ, fmt.Sprintf("%s（%d 个文件）", label, len(paths)), state.snapshot, func(runner GitRunner) error {
+		return execute(r.Context(), runner, repo, paths)
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -305,7 +305,7 @@ func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ
 	writeJSON(w, http.StatusAccepted, result)
 }
 
-func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ string, execute func(context.Context, string, []string) error) {
+func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ string, execute func(context.Context, GitRunner, string, []string) error) {
 	var input struct {
 		Paths      []string `json:"paths"`
 		StateToken string   `json:"stateToken"`
@@ -323,7 +323,7 @@ func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ st
 			return
 		}
 	}
-	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -339,8 +339,8 @@ func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ st
 			return
 		}
 	}
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, typ, strings.Join(input.Paths, ", "), state.snapshot, func() error {
-		return execute(r.Context(), repo, input.Paths)
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, typ, strings.Join(input.Paths, ", "), state.snapshot, func(runner GitRunner) error {
+		return execute(r.Context(), runner, repo, input.Paths)
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -366,7 +366,7 @@ func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("Git commit subject must be at most 72 characters"))
 		return
 	}
-	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -383,8 +383,8 @@ func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("there are no staged Git changes to commit"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, "commit", message, state.snapshot, func() error {
-		return newGitRunner().(*gitCLIRunner).Commit(r.Context(), repo, message)
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "commit", message, state.snapshot, func(runner GitRunner) error {
+		return runner.Commit(r.Context(), repo, message)
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -417,7 +417,7 @@ func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -452,12 +452,11 @@ func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 			}
 			tracked = append(tracked, path)
 		}
-		runner := newGitRunner().(*gitCLIRunner)
 		if err := runner.ValidateUntrackedRemoval(repo, untracked); err != nil {
 			writeError(w, http.StatusConflict, errors.New("untracked Git paths changed; refresh the repository"))
 			return
 		}
-		result, err := s.executeGitOperation(r.Context(), projectID, repo, "discard_worktree", strings.Join(input.Paths, ", "), state.snapshot, func() error {
+		result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "discard_worktree", strings.Join(input.Paths, ", "), state.snapshot, func(runner GitRunner) error {
 			if len(tracked) > 0 {
 				if err := runner.RestoreWorktree(r.Context(), repo, tracked); err != nil {
 					return err
@@ -505,7 +504,6 @@ func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 	if input.IncludeUntracked {
 		summary = fmt.Sprintf("丢弃全部未提交改动及 %d 个未跟踪文件", len(untracked))
 	}
-	runner := newGitRunner().(*gitCLIRunner)
 	initial := !hasGitHead(state.snapshot)
 	removalPaths := append([]string{}, untracked...)
 	if initial {
@@ -515,7 +513,7 @@ func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("untracked Git paths changed; refresh the repository"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, "discard_all", summary, state.snapshot, func() error {
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "discard_all", summary, state.snapshot, func(runner GitRunner) error {
 		if initial {
 			if err := runner.DiscardInitialChanges(r.Context(), repo, tracked); err != nil {
 				return err
@@ -565,14 +563,14 @@ func (s *Server) gitFetch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
 	defer release()
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, "fetch",
-		fmt.Sprintf("fetch %s", input.Remote), state.snapshot, func() error {
-			return newGitRunner().(*gitCLIRunner).Fetch(r.Context(), repo, input.Remote)
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "fetch",
+		fmt.Sprintf("fetch %s", input.Remote), state.snapshot, func(runner GitRunner) error {
+			return runner.Fetch(r.Context(), repo, input.Remote)
 		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -606,7 +604,7 @@ func (s *Server) gitPush(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -617,9 +615,9 @@ func (s *Server) gitPush(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, "push",
-		fmt.Sprintf("push %s %s", input.Remote, input.Branch), state.snapshot, func() error {
-			return newGitRunner().(*gitCLIRunner).Push(r.Context(), repo, input.Remote, input.Branch, input.SetUpstream)
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "push",
+		fmt.Sprintf("push %s %s", input.Remote, input.Branch), state.snapshot, func(runner GitRunner) error {
+			return runner.Push(r.Context(), repo, input.Remote, input.Branch, input.SetUpstream)
 		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -651,13 +649,8 @@ func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	projectID := chi.URLParam(r, "projectID")
-	repo, err := s.projectPath(r.Context(), projectID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, errors.New("project not found"))
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	runner, repo, ok := s.getGitRunner(w, r)
+	if !ok {
 		return
 	}
 	release, acquired := s.acquireProjectWorkspace(projectID, "git:"+uuid.NewString())
@@ -666,7 +659,7 @@ func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	snapshot, _, _, err := readGitState(r.Context(), repo)
+	snapshot, _, _, err := readGitState(r.Context(), runner, repo)
 	if err != nil {
 		writeError(w, http.StatusConflict, errors.New("Git repository state is unavailable"))
 		return
@@ -675,9 +668,9 @@ func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if input.StartPoint != "" {
 		summary = fmt.Sprintf("创建分支 %s（基于 %s）", input.Name, input.StartPoint)
 	}
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, "create_branch",
-		summary, snapshot, func() error {
-			return newGitRunner().(*gitCLIRunner).CreateBranch(r.Context(), repo, input.Name, input.StartPoint)
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "create_branch",
+		summary, snapshot, func(runner GitRunner) error {
+			return runner.CreateBranch(r.Context(), repo, input.Name, input.StartPoint)
 		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -702,7 +695,7 @@ func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -721,9 +714,9 @@ func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("already on the target branch"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), projectID, repo, "switch_branch",
-		fmt.Sprintf("切换到 %s", input.Branch), state.snapshot, func() error {
-			return newGitRunner().(*gitCLIRunner).SwitchBranch(r.Context(), repo, input.Branch)
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "switch_branch",
+		fmt.Sprintf("切换到 %s", input.Branch), state.snapshot, func(runner GitRunner) error {
+			return runner.SwitchBranch(r.Context(), repo, input.Branch)
 		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -732,29 +725,24 @@ func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, result)
 }
 
-func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (string, string, gitStateToken, func(), bool) {
+func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (GitRunner, string, string, gitStateToken, func(), bool) {
+	runner, repo, ok := s.getGitRunner(w, r)
+	if !ok {
+		return nil, "", "", gitStateToken{}, nil, false
+	}
 	projectID := chi.URLParam(r, "projectID")
-	repo, err := s.projectPath(r.Context(), projectID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, errors.New("project not found"))
-		return "", "", gitStateToken{}, nil, false
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return "", "", gitStateToken{}, nil, false
-	}
 	release, acquired := s.acquireProjectWorkspace(projectID, "git:"+uuid.NewString())
 	if !acquired {
 		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
-		return "", "", gitStateToken{}, nil, false
+		return nil, "", "", gitStateToken{}, nil, false
 	}
-	state, err := s.validateGitStateToken(r.Context(), projectID, repo, stateToken)
+	state, err := s.validateGitStateToken(r.Context(), runner, projectID, repo, stateToken)
 	if err != nil {
 		release()
 		writeError(w, http.StatusConflict, err)
-		return "", "", gitStateToken{}, nil, false
+		return nil, "", "", gitStateToken{}, nil, false
 	}
-	return projectID, repo, state, release, true
+	return runner, projectID, repo, state, release, true
 }
 
 type gitOperationResult struct {
@@ -763,7 +751,7 @@ type gitOperationResult struct {
 	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
-func (s *Server) executeGitOperation(ctx context.Context, projectID, repo, typ, summary string, before GitSnapshot, execute func() error) (gitOperationResult, error) {
+func (s *Server) executeGitOperation(ctx context.Context, runner GitRunner, projectID, repo, typ, summary string, before GitSnapshot, execute func(GitRunner) error) (gitOperationResult, error) {
 	now := time.Now().UTC()
 	beforeState, _ := json.Marshal(before)
 	operation := GitOperation{ID: uuid.NewString(), ProjectID: projectID, Type: typ, Status: gitOperationQueued, RequestSummary: summary, RequestedAt: now}
@@ -774,7 +762,7 @@ func (s *Server) executeGitOperation(ctx context.Context, projectID, repo, typ, 
 	if _, err := s.db.ExecContext(ctx, `update git_operations set status=?,started_at=? where id=? and status=?`, operation.Status, operation.StartedAt, operation.ID, gitOperationQueued); err != nil {
 		return gitOperationResult{}, err
 	}
-	if err := execute(); err != nil {
+	if err := execute(runner); err != nil {
 		finished := time.Now().UTC()
 		status, code, message := gitOperationFailure(err)
 		if err := s.updateGitOperation(ctx, operation.ID, status, "{}", code, message, finished); err != nil {
@@ -783,7 +771,7 @@ func (s *Server) executeGitOperation(ctx context.Context, projectID, repo, typ, 
 		return gitOperationResult{OperationID: operation.ID, Status: status, ErrorMessage: message}, nil
 	}
 	finished := time.Now().UTC()
-	snapshot, _, _, err := readGitState(ctx, repo)
+	snapshot, _, _, err := readGitState(ctx, runner, repo)
 	if err != nil {
 		return s.markGitOperationNeedsAttention(ctx, operation.ID, "{}", "result_unverified", "Git 操作已执行，但无法读取最新仓库状态；请刷新并检查工作区", finished), nil
 	}
@@ -862,8 +850,7 @@ func gitOperationFailure(err error) (status, code, message string) {
 	}
 }
 
-func readGitState(ctx context.Context, repo string) (GitSnapshot, []GitChange, map[string]string, error) {
-	runner := newGitRunner()
+func readGitState(ctx context.Context, runner GitRunner, repo string) (GitSnapshot, []GitChange, map[string]string, error) {
 	snapshot, err := runner.Snapshot(ctx, repo)
 	if err != nil {
 		return GitSnapshot{}, nil, nil, err
@@ -872,18 +859,18 @@ func readGitState(ctx context.Context, repo string) (GitSnapshot, []GitChange, m
 	if err != nil {
 		return GitSnapshot{}, nil, nil, err
 	}
-	return snapshot, changes, gitChangeFingerprints(repo, changes), nil
+	return snapshot, changes, gitChangeFingerprints(runner, repo, changes), nil
 }
 
-func gitChangeFingerprints(repo string, changes []GitChange) map[string]string {
+func gitChangeFingerprints(runner GitRunner, repo string, changes []GitChange) map[string]string {
 	result := make(map[string]string, len(changes))
 	for _, change := range changes {
-		info, err := os.Lstat(filepath.Join(repo, change.Path))
+		mode, size, mtimeNano, mtimeUnix, err := runner.lstat(repo, change.Path)
 		if err != nil {
 			result[change.Path] = "missing"
 			continue
 		}
-		result[change.Path] = fmt.Sprintf("%d:%d:%d:%d", info.Mode(), info.Size(), info.ModTime().UnixNano(), info.ModTime().Unix())
+		result[change.Path] = fmt.Sprintf("%d:%d:%d:%d", mode, size, mtimeNano, mtimeUnix)
 	}
 	return result
 }
@@ -902,14 +889,14 @@ func (s *Server) issueGitStateToken(projectID string, snapshot GitSnapshot, chan
 	return token
 }
 
-func (s *Server) validateGitStateToken(ctx context.Context, projectID, repo, token string) (gitStateToken, error) {
+func (s *Server) validateGitStateToken(ctx context.Context, runner GitRunner, projectID, repo, token string) (gitStateToken, error) {
 	s.mu.Lock()
 	record, found := s.gitStateTokens[token]
 	s.mu.Unlock()
 	if token == "" || !found || record.projectID != projectID || !record.expiresAt.After(time.Now().UTC()) {
 		return gitStateToken{}, errors.New("Git state changed; refresh the repository")
 	}
-	snapshot, changes, fingerprints, err := readGitState(ctx, repo)
+	snapshot, changes, fingerprints, err := readGitState(ctx, runner, repo)
 	if err != nil {
 		return gitStateToken{}, errors.New("Git repository state is unavailable")
 	}
@@ -919,22 +906,21 @@ func (s *Server) validateGitStateToken(ctx context.Context, projectID, repo, tok
 	return record, nil
 }
 
-func readUntrackedGitContent(repo, path string) (string, error) {
+func readUntrackedGitContent(runner GitRunner, repo, path string) (string, error) {
 	if err := validateGitPath(path); err != nil {
 		return "", err
 	}
-	fullPath := filepath.Join(repo, path)
-	info, err := os.Lstat(fullPath)
+	mode, size, _, _, err := runner.lstat(repo, path)
 	if err != nil {
 		return "", errors.New("untracked Git path is unavailable")
 	}
-	if !info.Mode().IsRegular() {
+	if !mode.IsRegular() {
 		return "(Untracked non-regular file)", nil
 	}
-	if info.Size() > gitOutputLimit {
+	if size > gitOutputLimit {
 		return "", errors.New("untracked file exceeds the display limit")
 	}
-	content, err := os.ReadFile(fullPath)
+	content, err := runner.readFile(repo, path)
 	if err != nil {
 		return "", errors.New("cannot read untracked Git file")
 	}
@@ -942,7 +928,7 @@ func readUntrackedGitContent(repo, path string) (string, error) {
 }
 
 func (s *Server) gitLog(w http.ResponseWriter, r *http.Request) {
-	repo, ok := s.projectGitRepository(w, r)
+	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
 		return
 	}
@@ -959,7 +945,7 @@ func (s *Server) gitLog(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	commits, err := newGitRunner().Log(r.Context(), repo, ref, limit)
+	commits, err := runner.Log(r.Context(), repo, ref, limit)
 	if err != nil {
 		if validateGitRef(ref) != nil || strings.Contains(err.Error(), "reference is not available") || strings.Contains(err.Error(), "object ID is not a commit") {
 			writeError(w, http.StatusBadRequest, err)
@@ -972,11 +958,11 @@ func (s *Server) gitLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) gitBranches(w http.ResponseWriter, r *http.Request) {
-	repo, ok := s.projectGitRepository(w, r)
+	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
 		return
 	}
-	branches, err := newGitRunner().Branches(r.Context(), repo)
+	branches, err := runner.Branches(r.Context(), repo)
 	if err != nil {
 		s.writeGitReadError(w, err)
 		return
@@ -1011,17 +997,62 @@ func (s *Server) gitOperations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, operations)
 }
 
-func (s *Server) projectGitRepository(w http.ResponseWriter, r *http.Request) (string, bool) {
-	repo, err := s.projectPath(r.Context(), chi.URLParam(r, "projectID"))
-	if err == nil {
-		return repo, true
+// getGitRunner 根据项目的 runner 类型返回对应的 GitRunner 与仓库路径。
+// 本地项目（wsl-local）使用本地 exec.Command；SSH 项目通过 SSH 在远端执行 git。
+func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner, string, bool) {
+	projectID := chi.URLParam(r, "projectID")
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("project not found"))
+		} else {
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return nil, "", false
 	}
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, errors.New("project not found"))
-	} else {
-		writeError(w, http.StatusInternalServerError, err)
+	if project.Runner == "wsl-local" || project.Runner == "" {
+		return newGitRunner(), project.Path, true
 	}
-	return "", false
+	runner, ok := s.runnerRegistry.get(project.Runner)
+	if !ok {
+		writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})
+		return nil, "", false
+	}
+	sshR, ok := runner.(*sshRunner)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("runner 不是 SSH 类型"))
+		return nil, "", false
+	}
+	repo, err := sshR.canonicalProjectPath(r.Context(), project.Path)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return nil, "", false
+	}
+	return newSSHGitRunner(sshR.client, repo), repo, true
+}
+
+// gitRunnerForPath 根据 projectID 返回对应的 GitRunner 与仓库路径（用于非 HTTP 上下文，如恢复逻辑）。
+func (s *Server) gitRunnerForProject(ctx context.Context, projectID string) (GitRunner, string, error) {
+	project, err := s.getProjectByID(ctx, projectID)
+	if err != nil {
+		return nil, "", err
+	}
+	if project.Runner == "wsl-local" || project.Runner == "" {
+		return newGitRunner(), project.Path, nil
+	}
+	runner, ok := s.runnerRegistry.get(project.Runner)
+	if !ok {
+		return nil, "", &runnerOfflineError{RunnerID: project.Runner}
+	}
+	sshR, ok := runner.(*sshRunner)
+	if !ok {
+		return nil, "", errors.New("runner 不是 SSH 类型")
+	}
+	repo, err := sshR.canonicalProjectPath(ctx, project.Path)
+	if err != nil {
+		return nil, "", err
+	}
+	return newSSHGitRunner(sshR.client, repo), repo, nil
 }
 
 func (s *Server) projectPath(ctx context.Context, projectID string) (string, error) {

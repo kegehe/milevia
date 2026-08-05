@@ -2155,7 +2155,7 @@
   font-weight: 760;
 }
 .shortcut-editor footer .secondary { border-color: #c7dcd1; background: #fff; }
-.shortcut-editor footer .primary { border-color: #267b67; background: #2c7567; box-shadow: none; }
+.shortcut-editor footer .primary { border-color: #267b67; color: #f8fdf9; background: #2c7567; box-shadow: none; }
 .shortcut-editor footer .primary:hover:not(:disabled) { border-color: #1c5b4d; background: #1f6556; }
 .shortcut-editor .danger-text { border-color: #edc1b7; color: #a44735; background: #fff8f6; }
 .shortcut-editor .danger-text:hover:not(:disabled) { border-color: #dc8d7b; color: #863523; background: #fff0ec; }
@@ -2268,7 +2268,7 @@
   font-weight: 760;
 }
 .conversation-clear-dialog footer .secondary { border-color: #c7dcd1; background: #fff; }
-.conversation-clear-dialog footer .primary { border-color: #267b67; background: #2c7567; box-shadow: none; }
+.conversation-clear-dialog footer .primary { border-color: #267b67; color: #f8fdf9; background: #2c7567; box-shadow: none; }
 .conversation-clear-dialog footer .primary:hover:not(:disabled) { border-color: #1c5b4d; background: #1f6556; }
 .conversation-clear-dialog footer .primary.danger { border-color: #c76b4d; color: #fff; background: #c9664b; }
 .conversation-clear-dialog footer .primary.danger:hover:not(:disabled) { border-color: #a64d35; background: #ad5238; }

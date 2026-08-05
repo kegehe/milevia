@@ -1,7 +1,7 @@
-import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, priorityLabels, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
+import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, priorityLabels, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
@@ -356,6 +356,10 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
 function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, inlineReview, openBoard, confirmTransition }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void }) {
   const [isDragging, setIsDragging] = useState(false);
   const [dragOverPosition, setDragOverPosition] = useState<"before" | "after" | null>(null);
+  const [hoverOpen, setHoverOpen] = useState(false);
+  const rowRef = useRef<HTMLElement | null>(null);
+  const hoverTimer = useRef<number | undefined>(undefined);
+  const canHover = useMemo(() => typeof window !== "undefined" && window.matchMedia("(hover: hover) and (pointer: fine)").matches, []);
   const didDragRef = useRef(false);
   const mouseDownPosRef = useRef<{ x: number; y: number } | null>(null);
   const queued = task.status === "running" && task.lastRun?.status === "queued";
@@ -368,11 +372,35 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
     reviewRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [isReviewing]);
 
+  // 当行进入内联详情或验收态时，关闭悬浮预览，避免重叠。
+  useEffect(() => {
+    if (inlineDetailID === task.id || isReviewing) setHoverOpen(false);
+  }, [inlineDetailID, isReviewing, task.id]);
+
+  // 卸载时清理悬浮计时器。
+  useEffect(() => () => { if (hoverTimer.current) window.clearTimeout(hoverTimer.current); }, []);
+
+  // 任务切换（列表刷新后行被复用到新任务）时关闭悬浮预览。
+  useEffect(() => { setHoverOpen(false); }, [task.id]);
+
+  const showHover = () => {
+    if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+    if (!canHover || isDragging || inlineDetailID === task.id || isReviewing) return;
+    hoverTimer.current = window.setTimeout(() => setHoverOpen(true), 280);
+  };
+  const hideHover = () => {
+    if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+    // 延迟关闭，给鼠标从行移动到悬浮卡片留出衔接时间。
+    hoverTimer.current = window.setTimeout(() => setHoverOpen(false), 120);
+  };
+
   const handleMouseDown = (e: React.MouseEvent) => {
     mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
   };
   const handleDragStart = (e: React.DragEvent) => {
     e.stopPropagation();
+    if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+    setHoverOpen(false);
     setIsDragging(true);
     didDragRef.current = true;
     const data: QueueDragData = { taskID: task.id, sourceIndex: index };
@@ -414,8 +442,7 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
     void onDrop(dragData.taskID, e.clientY < rect.top + rect.height / 2 ? index : index + 1);
   };
 
-  return <article className={`task-queue-row${isDragging ? " dragging" : ""}${dragOverPosition ? ` drag-over-${dragOverPosition}` : ""}`} draggable onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragOver={handleDragOverRow} onDrop={handleDropRow} onMouseDown={handleMouseDown} onClick={(e) => { if (didDragRef.current) { e.preventDefault(); e.stopPropagation(); } }}>
-    {dragOverPosition === "before" && <div className="task-queue-drop-indicator" />}
+  return <article ref={rowRef} className={`task-queue-row${isDragging ? " dragging" : ""}${dragOverPosition ? ` drag-over-${dragOverPosition}` : ""}`} draggable onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragOver={handleDragOverRow} onDrop={handleDropRow} onMouseDown={handleMouseDown} onMouseEnter={showHover} onMouseLeave={hideHover} onClick={(e) => { if (didDragRef.current) { e.preventDefault(); e.stopPropagation(); } }}>
     <button type="button" className="task-queue-open" onClick={handleClick}>
       <span className={`task-status ${taskDisplayStatusClass(task)}`}>{taskDisplayStatus(task)}</span>
       <b>{taskDisplayTitle(task)}</b>
@@ -435,8 +462,60 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
       </div>
     </div>}
     {inlineDetailID === task.id && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} dispatchDisabled={dispatchDisabled} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} deleteTask={inlineDelete} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
-    {dragOverPosition === "after" && <div className="task-queue-drop-indicator" />}
+    {hoverOpen && rowRef.current && createPortal(<TaskHoverCard task={task} anchor={rowRef.current} onEnter={showHover} onLeave={hideHover} />, document.body)}
   </article>;
+}
+
+function TaskHoverCard({ task, anchor, onEnter, onLeave }: { task: Task; anchor: HTMLElement; onEnter: () => void; onLeave: () => void }) {
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const margin = 10;
+
+  useLayoutEffect(() => {
+    const place = () => {
+      const rect = anchor.getBoundingClientRect();
+      const cardW = 340;
+      const cardMaxH = 420;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      let left: number;
+      // 优先放在行的右侧；右侧空间不足时放左侧。
+      if (rect.right + margin + cardW <= vw) left = rect.right + margin;
+      else if (rect.left - margin - cardW >= 0) left = rect.left - margin - cardW;
+      else left = Math.max(margin, Math.min(rect.right + margin, vw - margin - cardW));
+      let top: number;
+      // 尽量贴着行顶部；若下方放不下则上移，保证卡片不超出视口上下边界。
+      if (rect.top + cardMaxH <= vh) {
+        top = rect.top;
+      } else {
+        top = Math.max(margin, Math.min(rect.top, vh - margin - cardMaxH));
+      }
+      setPos({ left, top });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => { window.removeEventListener("resize", place); window.removeEventListener("scroll", place, true); };
+  }, [anchor]);
+
+  const note = taskQueueNote(task);
+  const queued = task.status === "running" && task.lastRun?.status === "queued";
+  const hasContent = Boolean(task.description || task.acceptanceCriteria || task.blockedBy.length > 0 || task.lastRun);
+
+  return <div className="task-hover-card" role="tooltip" style={pos ? { left: pos.left, top: pos.top, maxHeight: 420, opacity: 1 } : { opacity: 0 }} onMouseEnter={onEnter} onMouseLeave={onLeave}>
+    <div className="task-hover-card-head">
+      <span className={`task-status ${taskDisplayStatusClass(task)}`}>{queued ? "队列中" : taskDisplayStatus(task)}</span>
+      <b>{taskDisplayTitle(task)}</b>
+      <span className={`task-hover-priority priority-${task.priority}`}>{priorityLabels[task.priority]}优先级</span>
+    </div>
+    {note && <p className="task-hover-note">{note}</p>}
+    {hasContent ? <>
+      {task.description && <div className="task-hover-section"><b>任务说明</b><p>{task.description}</p></div>}
+      {task.acceptanceCriteria && <div className="task-hover-section"><b>验收条件</b><p>{task.acceptanceCriteria}</p></div>}
+      {task.blockedBy.length > 0 && <div className="task-hover-section"><b>依赖阻塞</b><p>{task.blockedBy.map((item) => item.title).join("、")}</p></div>}
+      {task.lastRun && <div className="task-hover-section"><b>最近执行</b><p>第 {task.lastRun.sequence} 次 · {taskRunStatusLabel(task.lastRun.status)}{task.lastRun.failureReason ? `：${task.lastRun.failureReason}` : ""}</p></div>}
+    </> : <p className="task-hover-empty">该任务暂无详细说明。</p>}
+    <p className="task-hover-hint">点击查看完整详情与操作</p>
+  </div>;
 }
 
 function DispatchConfirmation({ task, detail, loading, dispatching, dispatchDisabled, permissionMode, close, openBoard, dispatch }: { task: Task; detail: TaskDetail | null; loading: boolean; dispatching: boolean; dispatchDisabled: boolean; permissionMode?: ExecutionPolicy; close: () => void; openBoard: () => void; dispatch: () => Promise<void> }) {

@@ -118,8 +118,6 @@ export default function ProjectLayout() {
     </main>;
   }
 
-  const isRemoteProject = project.runner.startsWith("ssh-");
-
   const navigateWorkspaceTabs = (event: React.KeyboardEvent<HTMLElement>) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not(:disabled)'));
@@ -148,8 +146,8 @@ export default function ProjectLayout() {
       <button data-workspace-tab="conversation" id="workspace-tab-conversation" type="button" role="tab" aria-controls="workspace-panel-conversation" aria-selected={workspaceTab === "conversation"} className={workspaceTab === "conversation" ? "active" : ""} onClick={() => selectWorkspaceTab("conversation")}><WorkspaceTabIcon tab="conversation" /><span>对话</span></button>
       <button data-workspace-tab="tasks" id="workspace-tab-tasks" type="button" role="tab" aria-controls="workspace-panel-tasks" aria-selected={workspaceTab === "tasks"} className={workspaceTab === "tasks" ? "active" : ""} onClick={() => selectWorkspaceTab("tasks")}><WorkspaceTabIcon tab="tasks" /><span>任务</span></button>
       <button data-workspace-tab="files" id="workspace-tab-files" type="button" role="tab" aria-controls="workspace-panel-files" aria-selected={workspaceTab === "files"} className={workspaceTab === "files" ? "active" : ""} onClick={() => selectWorkspaceTab("files")}><WorkspaceTabIcon tab="files" /><span>文件</span></button>
-      {project.gitBranch !== "非 Git 目录" && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} disabled={isRemoteProject} title={isRemoteProject ? "远程Git工作台尚未支持" : undefined} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
-      <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} disabled={isRemoteProject} title={isRemoteProject ? "远程项目启动尚未支持" : undefined} onClick={() => selectWorkspaceTab("run")}><WorkspaceTabIcon tab="run" /><span>项目启动</span></button>
+      {project.gitBranch !== "非 Git 目录" && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
+      <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} onClick={() => selectWorkspaceTab("run")}><WorkspaceTabIcon tab="run" /><span>项目启动</span></button>
     </nav>
     <main className="workspace-content">
       <Outlet context={{ project } satisfies ProjectLayoutOutletContext} />

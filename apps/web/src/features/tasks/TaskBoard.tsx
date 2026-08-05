@@ -349,7 +349,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} /> : <TaskList tasks={visibleTasks} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
     {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} dispatch={dispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={visibleTasks.some((item) => item.position < detail.position)} canMoveDown={visibleTasks.some((item) => item.position > detail.position)} request={request} fail={fail} />}
-    {orchestrationOpen && orchestration && <OrchestrationDialog config={orchestration} jobs={orchestrationJobs} releases={releaseSnapshots} request={request} close={() => setOrchestrationOpen(false)} saved={loadOrchestration} fail={fail} />}
+    {orchestrationOpen && orchestration && <OrchestrationDialog config={orchestration} jobs={orchestrationJobs} releases={releaseSnapshots} tasks={tasks} request={request} close={() => setOrchestrationOpen(false)} saved={loadOrchestration} fail={fail} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </section>;
 }
@@ -535,7 +535,7 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog task-editor-dialog"><header className="task-editor-header"><div><span>任务</span><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button type="button" className="task-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><form className="task-editor-form" onSubmit={(event) => void save(event)}><div className="task-form"><section className="task-form-section"><div className="task-form-section-head"><h3>基本信息</h3></div><div className="task-form-basic-grid"><label className="task-form-title">任务名称 <small>可选</small><input autoFocus maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div></section><section className="task-form-section"><div className="task-form-section-head"><h3>任务内容</h3></div><label>任务说明<textarea required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label><label>验收条件 <small>可选</small><textarea maxLength={12000} value={acceptanceCriteria} onChange={(event) => setAcceptanceCriteria(event.target.value)} placeholder="用可验证的结果描述完成标准。" /></label></section></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
 }
 
-function OrchestrationDialog({ config, jobs, releases, request, close, saved, fail }: { config: OrchestrationConfig; jobs: OrchestrationJob[]; releases: ReleaseSnapshot[]; request: Request; close: () => void; saved: () => Promise<void>; fail: (message: string) => void }) {
+function OrchestrationDialog({ config, jobs, releases, tasks, request, close, saved, fail }: { config: OrchestrationConfig; jobs: OrchestrationJob[]; releases: ReleaseSnapshot[]; tasks: Task[]; request: Request; close: () => void; saved: () => Promise<void>; fail: (message: string) => void }) {
   const [enabled, setEnabled] = useState(config.enabled);
   const [mainBranch, setMainBranch] = useState(config.mainBranch);
   const [devBranch, setDevBranch] = useState(config.devBranch);
@@ -543,7 +543,19 @@ function OrchestrationDialog({ config, jobs, releases, request, close, saved, fa
   const [maxFixRounds, setMaxFixRounds] = useState(config.maxFixRounds);
   const [saving, setSaving] = useState(false);
   const [action, setAction] = useState("");
+  const [selectedEnqueue, setSelectedEnqueue] = useState<Set<string>>(new Set());
   const operationRef = useRef(false);
+  const taskTitleByID = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const task of tasks) map.set(task.id, taskDisplayTitle(task));
+    return map;
+  }, [tasks]);
+  const queuedTaskIDs = useMemo(() => jobs.filter((job) => job.status === "queued" || job.status === "paused").sort((a, b) => a.position - b.position).map((job) => job.taskId), [jobs]);
+  const enqueueableTasks = useMemo(() => {
+    const inQueue = new Set(jobs.map((job) => job.taskId));
+    return tasks.filter((task) => (task.status === "todo" || task.status === "action_required") && !inQueue.has(task.id))
+      .sort((a, b) => a.position - b.position || a.createdAt.localeCompare(b.createdAt));
+  }, [tasks, jobs]);
   const save = async (event: FormEvent) => {
     event.preventDefault();
     if (operationRef.current) return;
@@ -553,13 +565,42 @@ function OrchestrationDialog({ config, jobs, releases, request, close, saved, fa
     catch (cause) { fail(cause instanceof Error ? cause.message : "无法保存自动编排配置"); }
     finally { operationRef.current = false; setSaving(false); }
   };
-  const runAction = async (key: string, path: string) => {
-    if (operationRef.current) return;
+  const runAction = async (key: string, path: string, init?: RequestInit): Promise<boolean> => {
+    if (operationRef.current) return false;
     operationRef.current = true;
     setAction(key);
-    try { await request(path, { method: "POST", body: "{}" }); await saved(); }
-    catch (cause) { fail(cause instanceof Error ? cause.message : "自动编排操作失败"); }
+    try { await request(path, init ?? { method: "POST", body: "{}" }); await saved(); return true; }
+    catch (cause) { fail(cause instanceof Error ? cause.message : "自动编排操作失败"); return false; }
     finally { operationRef.current = false; setAction(""); }
+  };
+  const toggleEnqueueSelect = (taskID: string) => {
+    setSelectedEnqueue((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskID)) next.delete(taskID); else next.add(taskID);
+      return next;
+    });
+  };
+  const enqueueSelected = async () => {
+    if (selectedEnqueue.size === 0) return;
+    const taskIDs = enqueueableTasks.filter((task) => selectedEnqueue.has(task.id)).map((task) => task.id);
+    const ok = await runAction("enqueue-batch", `/api/projects/${config.projectId}/orchestration/enqueue-batch`, { method: "POST", body: JSON.stringify({ taskIds: taskIDs }) });
+    if (ok) { setSelectedEnqueue(new Set()); return; }
+    // Partial success is possible: batch enqueue commits each task in its own
+    // transaction, so some may have entered the queue before a later task failed.
+    // Refresh so the user sees what actually made it in; swallow refresh errors
+    // so they don't mask the original enqueue failure already shown by runAction.
+    await saved().catch(() => undefined);
+  };
+  const moveJob = async (taskID: string, direction: "up" | "down") => {
+    const index = queuedTaskIDs.indexOf(taskID);
+    const target = direction === "up" ? index - 1 : index + 1;
+    if (index < 0 || target < 0 || target >= queuedTaskIDs.length) return;
+    const reordered = [...queuedTaskIDs];
+    [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+    await runAction(`reorder:${taskID}`, `/api/projects/${config.projectId}/orchestration/order`, { method: "PATCH", body: JSON.stringify({ taskIds: reordered }) });
+  };
+  const dequeueJob = async (taskID: string) => {
+    await runAction(`dequeue:${taskID}`, `/api/tasks/${taskID}/orchestration/dequeue`, { method: "DELETE" });
   };
   const busy = saving || Boolean(action);
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="orchestration-title">
@@ -583,12 +624,29 @@ function OrchestrationDialog({ config, jobs, releases, request, close, saved, fa
 
           <section className="orchestration-section" aria-labelledby="orchestration-queue-title">
             <div className="orchestration-section-head"><h3 id="orchestration-queue-title">自动队列</h3><span>{jobs.length} 项</span></div>
-            {jobs.length === 0 ? <p className="orchestration-empty">暂无自动任务。</p> : <ul className="orchestration-record-list">
-              {jobs.map((job) => <li key={job.id} className="orchestration-record">
-                <div className="orchestration-record-title"><b className="orchestration-position">#{job.position}</b><span className="orchestration-status" data-status={job.status}>{orchestrationStatusLabel(job.status)}</span></div>
-                {job.status === "queued" && <div className="orchestration-record-action"><button type="button" className="secondary" disabled={busy} onClick={() => void runAction(`pause:${job.id}`, `/api/tasks/${job.taskId}/orchestration/pause`)}>{action === `pause:${job.id}` ? "暂停中" : "暂停"}</button></div>}
-                {(job.status === "paused" || job.status === "needs_human") && <div className="orchestration-record-action"><button type="button" className="primary" disabled={busy} onClick={() => void runAction(`resume:${job.id}`, `/api/tasks/${job.taskId}/orchestration/resume`)}>{action === `resume:${job.id}` ? "恢复中" : "恢复"}</button></div>}
+            {jobs.length === 0 ? <p className="orchestration-empty">暂无自动任务，从下方候选任务中选择加入。</p> : <ul className="orchestration-record-list">
+              {jobs.map((job) => {
+                const reorderable = job.status === "queued" || job.status === "paused";
+                const queuedIndex = queuedTaskIDs.indexOf(job.taskId);
+                return <li key={job.id} className="orchestration-record">
+                <div className="orchestration-record-title"><b className="orchestration-position">#{job.position}</b><span className="orchestration-record-name" title={taskTitleByID.get(job.taskId) ?? ""}>{taskTitleByID.get(job.taskId) ?? "未知任务"}</span><span className="orchestration-status" data-status={job.status}>{orchestrationStatusLabel(job.status)}</span></div>
+                <div className="orchestration-record-actions">
+                  {job.status === "queued" && <button type="button" className="secondary" disabled={busy} onClick={() => void runAction(`pause:${job.id}`, `/api/tasks/${job.taskId}/orchestration/pause`)}>{action === `pause:${job.id}` ? "暂停中" : "暂停"}</button>}
+                  {(job.status === "paused" || job.status === "needs_human") && <button type="button" className="primary" disabled={busy} onClick={() => void runAction(`resume:${job.id}`, `/api/tasks/${job.taskId}/orchestration/resume`)}>{action === `resume:${job.id}` ? "恢复中" : "恢复"}</button>}
+                  {reorderable && <button type="button" className="secondary orchestration-icon-button" title="上移" aria-label="上移" disabled={busy || queuedIndex <= 0} onClick={() => void moveJob(job.taskId, "up")}>↑</button>}
+                  {reorderable && <button type="button" className="secondary orchestration-icon-button" title="下移" aria-label="下移" disabled={busy || queuedIndex < 0 || queuedIndex >= queuedTaskIDs.length - 1} onClick={() => void moveJob(job.taskId, "down")}>↓</button>}
+                  {reorderable && <button type="button" className="danger orchestration-icon-button" title="移出队列" aria-label="移出队列" disabled={busy} onClick={() => void dequeueJob(job.taskId)}>{action === `dequeue:${job.taskId}` ? "移出中" : "移出"}</button>}
+                </div>
                 {job.lastError && <small className="orchestration-record-error">{job.lastError}</small>}
+              </li>; })}
+            </ul>}
+          </section>
+
+          <section className="orchestration-section" aria-labelledby="orchestration-candidates-title">
+            <div className="orchestration-section-head"><h3 id="orchestration-candidates-title">候选任务</h3>{enqueueableTasks.length > 0 && <button type="button" className="secondary" disabled={busy || selectedEnqueue.size === 0} onClick={() => void enqueueSelected()}>{action === "enqueue-batch" ? "入队中" : `加入队列 (${selectedEnqueue.size})`}</button>}</div>
+            {enqueueableTasks.length === 0 ? <p className="orchestration-empty">没有可加入队列的任务。</p> : <ul className="orchestration-record-list orchestration-candidate-list">
+              {enqueueableTasks.map((task) => <li key={task.id} className="orchestration-record orchestration-candidate">
+                <label className="orchestration-candidate-select"><input type="checkbox" disabled={busy} checked={selectedEnqueue.has(task.id)} onChange={() => toggleEnqueueSelect(task.id)} /><span className="orchestration-record-name">{taskDisplayTitle(task)}</span><span className="orchestration-status" data-status={task.status}>{task.status === "action_required" ? "需处理" : "待处理"}</span></label>
               </li>)}
             </ul>}
           </section>

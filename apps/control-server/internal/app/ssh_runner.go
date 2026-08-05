@@ -371,6 +371,51 @@ func (c *sshClient) execCommand(ctx context.Context, cmd string) ([]byte, error)
 	}
 }
 
+// execCommandWithStdin runs a command on the remote server, feeding stdin and
+// returning combined output. Respects context cancellation.
+func (c *sshClient) execCommandWithStdin(ctx context.Context, cmd string, stdin []byte) ([]byte, error) {
+	if err := c.connect(ctx); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, errors.New("SSH 连接已断开")
+	}
+
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("创建 SSH session 失败：%w", err)
+	}
+	defer session.Close()
+	w, err := session.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("创建 SSH stdin 管道失败：%w", err)
+	}
+
+	type result struct {
+		out []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		go func() {
+			_, _ = w.Write(stdin)
+			_ = w.Close()
+		}()
+		out, err := session.CombinedOutput(cmd)
+		ch <- result{out, err}
+	}()
+	select {
+	case <-ctx.Done():
+		session.Signal(ssh.SIGKILL)
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.out, r.err
+	}
+}
+
 // getSFTPClient 返回持久化的 SFTP 客户端。如果已有可用连接则复用，
 // 否则创建新连接。SFTP client 本身是线程安全的，可安全并发复用。
 func (c *sshClient) getSFTPClient(ctx context.Context) (*sftp.Client, error) {
@@ -519,7 +564,59 @@ func (r *sshRunner) Update(ctx context.Context) (string, string, error) {
 	return previous, r.Version(ctx), nil
 }
 
+// codexLoginStatusCommand mirrors the local codex runner's readiness check on
+// the remote host. Codex prints "Logged in" (or similar) on success and exits
+// non-zero when not authenticated.
+const codexLoginStatusCommand = "codex login status"
+
+func (r *sshRunner) CodexReady(ctx context.Context) bool {
+	out, err := r.client.execCommand(ctx, "which codex && "+codexLoginStatusCommand)
+	return err == nil && len(out) > 0
+}
+
+func (r *sshRunner) CodexVersion(ctx context.Context) string {
+	out, err := r.client.execCommand(ctx, "codex --version")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimSpace(string(out)), "codex-cli ")
+}
+
+func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) {
+	local := r.CodexVersion(ctx)
+	if local == "" {
+		return false, "", errors.New("远程服务器上未安装 Codex CLI")
+	}
+	out, err := r.client.execCommand(ctx, "npm view @openai/codex version 2>/dev/null")
+	if err != nil {
+		return false, "", err
+	}
+	latest := strings.TrimSpace(string(out))
+	if latest == "" {
+		return false, "", errors.New("latest Codex version is empty")
+	}
+	available, err := codexUpdateAvailable(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
+}
+
+func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
+	previous := r.CodexVersion(ctx)
+	if previous == "" {
+		return "", "", errors.New("远程服务器上未安装 Codex CLI")
+	}
+	if _, err := r.client.execCommand(ctx, "codex update"); err != nil {
+		return previous, "", err
+	}
+	return previous, r.CodexVersion(ctx), nil
+}
+
 func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
+	if request.AgentID == "codex" {
+		return r.runCodex(ctx, request, sink)
+	}
 	approvalURL := ""
 	if needsClaudeApprovalHook(request.PermissionMode) {
 		var err error
@@ -594,6 +691,66 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 		}
 		if waitErr != nil {
 			return fmt.Errorf("远程 Claude 退出：%w", waitErr)
+		}
+		return nil
+	}
+}
+
+// runCodex executes one non-interactive Codex turn on the remote host over SSH.
+// It mirrors the local codexCLIRunner.Run command line, streaming JSONL on
+// stdout and diagnostic lines on stderr through the same sinks.
+func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
+	policy, err := codexSandbox(request.PermissionMode)
+	if err != nil {
+		return err
+	}
+	configArg := fmt.Sprintf("sandbox_mode=%q", policy)
+	var cmd string
+	if request.Resume {
+		cmd = fmt.Sprintf("codex exec resume -c %s --json %s %s",
+			shellQuote(configArg), shellQuote(request.SessionID), shellQuote(request.Prompt))
+	} else {
+		cmd = fmt.Sprintf("codex exec -c %s --json --color never -C %s --sandbox %s %s",
+			shellQuote(configArg), shellQuote(request.ProjectPath), policy, shellQuote(request.Prompt))
+	}
+	// Run from the project directory so Codex resolves relative paths correctly.
+	fullCmd := fmt.Sprintf("cd %s && %s", shellQuote(request.ProjectPath), cmd)
+
+	session, err := r.client.newSession(ctx)
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("SSH stdout pipe: %w", err)
+	}
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("SSH stderr pipe: %w", err)
+	}
+	if err := session.Start(fullCmd); err != nil {
+		return fmt.Errorf("启动远程 Codex 失败：%w", err)
+	}
+
+	done := make(chan struct{})
+	go func() { readCodexJSONL(stdout, sink, ""); close(done) }()
+	go func() { readCodexStderr(stderr, sink) }()
+
+	select {
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		return ctx.Err()
+	case <-done:
+		waitErr := session.Wait()
+		if waitErr != nil {
+			return fmt.Errorf("远程 Codex 退出：%w", waitErr)
 		}
 		return nil
 	}

@@ -317,3 +317,115 @@
     max-height: calc(100vh - 64px);
   }
 }
+
+/* ===== Sonner Toast 主题覆盖 —— 统一绿色站点风格 ===== */
+
+[data-sonner-toast] {
+  border: 1px solid #c8dcd1 !important;
+  border-radius: 8px !important;
+  background: #fbfefb !important;
+  color: #19332c !important;
+  font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif !important;
+  box-shadow: 7px 7px 0 #d8e8de, 0 14px 28px #17362c1a !important;
+  padding: 12px 14px !important;
+}
+
+/* 左侧状态色条 —— 用 inset box-shadow 实现，避免覆盖 sonner 的 ::before（swiping/移除动画在用） */
+[data-sonner-toast][data-type="success"] { box-shadow: inset 3px 0 0 #2c7567, 7px 7px 0 #d8e8de, 0 14px 28px #17362c1a !important; }
+[data-sonner-toast][data-type="error"]   { box-shadow: inset 3px 0 0 #b44b38, 7px 7px 0 #d8e8de, 0 14px 28px #17362c1a !important; }
+[data-sonner-toast][data-type="warning"] { box-shadow: inset 3px 0 0 #e08a1a, 7px 7px 0 #d8e8de, 0 14px 28px #17362c1a !important; }
+[data-sonner-toast][data-type="info"]    { box-shadow: inset 3px 0 0 #2c7567, 7px 7px 0 #d8e8de, 0 14px 28px #17362c1a !important; }
+
+[data-sonner-toast] [data-title] {
+  color: #19332c !important;
+  font-weight: 750 !important;
+  font-size: 13px !important;
+  line-height: 1.35 !important;
+}
+
+[data-sonner-toast] [data-description] {
+  color: #597268 !important;
+  font-size: 12px !important;
+  line-height: 1.45 !important;
+  margin-top: 3px !important;
+}
+/* 清除 sonner content 的 gap，让 title/description 间距由上面的 margin-top 单独控制，与通知中心一致 */
+[data-sonner-toast] [data-content] {
+  gap: 0 !important;
+}
+
+/* 键盘聚焦反馈 —— sonner 默认用 box-shadow 做描边但被上方 !important 覆盖，改用 outline 补回 */
+[data-sonner-toast]:focus-visible {
+  outline: 3px solid #f6be4e !important;
+  outline-offset: 2px !important;
+}
+
+/* 图标圆角方块，呼应站点 env-tag / item-icon */
+[data-sonner-toast] [data-icon] {
+  width: 28px !important;
+  height: 28px !important;
+  flex-shrink: 0 !important;
+  border: 1px solid #b8d8ca !important;
+  border-radius: 6px !important;
+  background: #e5f4ea !important;
+  display: grid !important;
+  place-items: center !important;
+}
+[data-sonner-toast] [data-icon] svg {
+  width: 16px !important;
+  height: 16px !important;
+  /* 清除 sonner 的 svg margin，由 grid place-items 居中 */
+  margin: 0 !important;
+}
+[data-sonner-toast][data-type="success"] [data-icon] { color: #2c7567 !important; border-color: #b8d8ca !important; background: #e5f4ea !important; }
+[data-sonner-toast][data-type="error"] [data-icon] { color: #b44b38 !important; border-color: #efb59d !important; background: #fff0eb !important; }
+[data-sonner-toast][data-type="warning"] [data-icon] { color: #a06f16 !important; border-color: #f0d49a !important; background: #fff8ee !important; }
+[data-sonner-toast][data-type="info"] [data-icon] { color: #2c7567 !important; border-color: #b8d8ca !important; background: #e5f4ea !important; }
+
+/* 关闭按钮 */
+[data-sonner-toast] [data-close-button] {
+  color: #597268 !important;
+  background: #fbfefb !important;
+  border-color: #c8dcd1 !important;
+  border-radius: 50% !important;
+}
+[data-sonner-toast] [data-close-button]:hover {
+  color: #31594f !important;
+  background: #eaf5ee !important;
+  border-color: #8eb9aa !important;
+}
+
+/* 「查看详情」action 按钮 —— 主按钮绿色 */
+[data-sonner-toast] [data-button] {
+  border-radius: 5px !important;
+  border: 1px solid #2c7567 !important;
+  background: #2c7567 !important;
+  color: #fff !important;
+  font-weight: 700 !important;
+  font-size: 11px !important;
+  padding: 4px 9px !important;
+  height: auto !important;
+  min-height: 26px !important;
+  /* 保留 sonner 的 opacity 过渡（折叠/展开时子元素渐隐），叠加颜色与聚焦描边过渡 */
+  transition: opacity .4s, background .15s ease, border-color .15s ease, box-shadow .15s ease !important;
+}
+[data-sonner-toast] [data-button]:hover {
+  background: #245d52 !important;
+  border-color: #245d52 !important;
+}
+/* action 按钮键盘聚焦 —— 用站点统一焦点色，覆盖 sonner 默认黑色描边 */
+[data-sonner-toast] [data-button]:focus-visible {
+  box-shadow: 0 0 0 3px #f6be4e !important;
+}
+/* 关闭按钮键盘聚焦 —— 同样覆盖 sonner 默认黑色描边 */
+[data-sonner-toast] [data-close-button]:focus-visible {
+  box-shadow: 0 0 0 3px #f6be4e !important;
+}
+
+/* 尊重「减少动态效果」偏好 —— 与 sonner 自身的 reduced-motion 规则一致 */
+@media (prefers-reduced-motion: reduce) {
+  [data-sonner-toast],
+  [data-sonner-toast] [data-button] {
+    transition: none !important;
+  }
+}
