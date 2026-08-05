@@ -17,6 +17,7 @@ interface ProjectContextValue {
   error: string;
   setError: (msg: string) => void;
   refreshProjects: () => Promise<void>;
+  refreshStatuses: () => Promise<void>;
   getConversationDraft: (projectID: string, conversationID: string) => string;
   saveConversationDraft: (projectID: string, conversationID: string, text: string) => void;
   flushConversationDraft: (projectID: string, conversationID: string) => void;
@@ -92,28 +93,28 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     pendingDraftTimers.current.set(key, window.setTimeout(() => flushConversationDraft(projectID, conversationID), 300));
   }, [flushConversationDraft]);
 
+  const refreshStatuses = useCallback(async () => {
+    try {
+      const statusList = await apiFn<{ id: string; running: number; conversationCount: number; activeTitle: string }[]>("/api/projects/statuses");
+      const entries = statusList.map((item) => [item.id, { running: item.running === 1, conversationCount: item.conversationCount, activeTitle: item.activeTitle }] as const);
+      setProjectStatuses(Object.fromEntries(entries));
+    } catch {
+      // 失败时保留上一次已知的状态，不覆盖。
+    }
+  }, []);
+
   const refreshProjects = useCallback(async () => {
     try {
       const list = await apiFn<Project[]>("/api/projects");
       setProjects(list);
-      try {
-        const statusList = await apiFn<{ id: string; running: number; conversationCount: number; activeTitle: string }[]>("/api/projects/statuses");
-        const entries = statusList.map((item) => [item.id, { running: item.running === 1, conversationCount: item.conversationCount, activeTitle: item.activeTitle }] as const);
-        setProjectStatuses(Object.fromEntries(entries));
-      } catch {
-        setProjectStatuses((prev) => {
-          if (Object.keys(prev).length > 0) return prev;
-          const entries = list.map((item) => [item.id, { running: false, conversationCount: 0, activeTitle: "" }] as const);
-          return Object.fromEntries(entries);
-        });
-      }
+      await refreshStatuses();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法加载项目列表");
     }
-  }, []);
+  }, [refreshStatuses]);
 
   return (
-    <ProjectContext.Provider value={{ projects, projectStatuses, error, setError, refreshProjects, getConversationDraft, saveConversationDraft, flushConversationDraft, api: apiFn }}>
+    <ProjectContext.Provider value={{ projects, projectStatuses, error, setError, refreshProjects, refreshStatuses, getConversationDraft, saveConversationDraft, flushConversationDraft, api: apiFn }}>
       {children}
     </ProjectContext.Provider>
   );

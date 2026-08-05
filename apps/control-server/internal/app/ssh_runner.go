@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -371,6 +372,97 @@ func (c *sshClient) execCommand(ctx context.Context, cmd string) ([]byte, error)
 	}
 }
 
+// cappedWriter 写入最多 limit 字节到 buf，超出部分继续读取但丢弃，
+// 确保远端进程不会因 stdout 管道流控而阻塞（与本地 gitOutputCollector 行为一致）。
+type cappedWriter struct {
+	buf   *bytes.Buffer
+	limit int
+	written int
+}
+
+func (cw *cappedWriter) Write(p []byte) (int, error) {
+	remaining := cw.limit - cw.written
+	if remaining > 0 {
+		write := len(p)
+		if write > remaining {
+			write = remaining
+		}
+		cw.buf.Write(p[:write])
+		cw.written += write
+	}
+	// 超出 limit 的数据被丢弃，但返回 len(p)（假装已消费），避免远端写阻塞。
+	return len(p), nil
+}
+
+// execCommandSeparate runs a command on the remote server, returning stdout
+// and stderr separately. stdout is capped at stdoutLimit+1 bytes to bound
+// memory; callers check for overflow. stderr is read in full (typically small).
+// Respects context cancellation. Used by the Git SSH backend so that git
+// warnings on stderr do not pollute structured stdout.
+func (c *sshClient) execCommandSeparate(ctx context.Context, cmd string, stdoutLimit int) (stdout, stderr []byte, err error) {
+	if err := c.connect(ctx); err != nil {
+		return nil, nil, err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, nil, errors.New("SSH 连接已断开")
+	}
+
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 SSH session 失败：%w", err)
+	}
+	defer session.Close()
+
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 stdout 管道失败：%w", err)
+	}
+	stderrPipe, err := session.StderrPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 stderr 管道失败：%w", err)
+	}
+
+	type result struct {
+		stdout []byte
+		stderr []byte
+		err    error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		var stdoutBuf, stderrBuf bytes.Buffer
+		stdoutCapped := &cappedWriter{buf: &stdoutBuf, limit: stdoutLimit + 1}
+		done := make(chan struct{})
+		go func() {
+			io.Copy(stdoutCapped, stdoutPipe)
+			io.Copy(&stderrBuf, stderrPipe)
+			close(done)
+		}()
+		err := session.Start(cmd)
+		if err != nil {
+			// Start 失败时 session 未运行，pipe reader 会阻塞在 Read 上。
+			// 关闭 session 让 pipe reader 收到 EOF 后退出，避免 <-done 死锁。
+			session.Close()
+			<-done
+			ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), err}
+			return
+		}
+		waitErr := session.Wait()
+		<-done
+		ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), waitErr}
+	}()
+
+	select {
+	case <-ctx.Done():
+		session.Signal(ssh.SIGKILL)
+		return nil, nil, ctx.Err()
+	case r := <-ch:
+		return r.stdout, r.stderr, r.err
+	}
+}
+
 // execCommandWithStdin runs a command on the remote server, feeding stdin and
 // returning combined output. Respects context cancellation.
 func (c *sshClient) execCommandWithStdin(ctx context.Context, cmd string, stdin []byte) ([]byte, error) {
@@ -413,6 +505,80 @@ func (c *sshClient) execCommandWithStdin(ctx context.Context, cmd string, stdin 
 		return nil, ctx.Err()
 	case r := <-ch:
 		return r.out, r.err
+	}
+}
+
+// execCommandWithStdinSeparate runs a command on the remote server, feeding
+// stdin via pipe and returning stdout/stderr separately. stdout is capped at
+// stdoutLimit+1 bytes to bound memory. Respects context cancellation.
+// Used by the Git SSH backend for --pathspec-from-file=- and commit --file=-.
+func (c *sshClient) execCommandWithStdinSeparate(ctx context.Context, cmd string, stdin []byte, stdoutLimit int) (stdout, stderr []byte, err error) {
+	if err := c.connect(ctx); err != nil {
+		return nil, nil, err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, nil, errors.New("SSH 连接已断开")
+	}
+
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 SSH session 失败：%w", err)
+	}
+	defer session.Close()
+	w, err := session.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 SSH stdin 管道失败：%w", err)
+	}
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 stdout 管道失败：%w", err)
+	}
+	stderrPipe, err := session.StderrPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 stderr 管道失败：%w", err)
+	}
+
+	type result struct {
+		stdout []byte
+		stderr []byte
+		err    error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		go func() {
+			_, _ = w.Write(stdin)
+			_ = w.Close()
+		}()
+		var stdoutBuf, stderrBuf bytes.Buffer
+		stdoutCapped := &cappedWriter{buf: &stdoutBuf, limit: stdoutLimit + 1}
+		done := make(chan struct{})
+		go func() {
+			io.Copy(stdoutCapped, stdoutPipe)
+			io.Copy(&stderrBuf, stderrPipe)
+			close(done)
+		}()
+		startErr := session.Start(cmd)
+		if startErr != nil {
+			// Start 失败时 session 未运行，pipe reader 会阻塞在 Read 上。
+			// 关闭 session 让 pipe reader 收到 EOF 后退出，避免 <-done 死锁。
+			session.Close()
+			<-done
+			ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), startErr}
+			return
+		}
+		waitErr := session.Wait()
+		<-done
+		ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), waitErr}
+	}()
+	select {
+	case <-ctx.Done():
+		session.Signal(ssh.SIGKILL)
+		return nil, nil, ctx.Err()
+	case r := <-ch:
+		return r.stdout, r.stderr, r.err
 	}
 }
 
@@ -648,10 +814,19 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 		)
 	}
 	permissionArgs := sshClaudePermissionArgs(request.PermissionMode, approvalHookCmd)
+	// Explicitly resume the tracked session so one-shot SSH runs stay in the
+	// same conversation context. Mirrors claudeCLIRunner.args.
+	sessionArg := ""
+	if request.Resume && request.SessionID != "" {
+		sessionArg = "--resume " + shellQuote(request.SessionID)
+	} else if request.SessionID != "" {
+		sessionArg = "--session-id " + shellQuote(request.SessionID)
+	}
 	cmd := fmt.Sprintf(
-		"cd %s && claude -p --verbose --output-format stream-json %s %s",
+		"cd %s && claude -p --verbose --output-format stream-json %s %s %s",
 		shellQuote(request.ProjectPath),
 		permissionArgs,
+		sessionArg,
 		shellQuote(request.Prompt),
 	)
 
@@ -781,10 +956,21 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 		)
 	}
 	permissionArgs := sshClaudePermissionArgs(req.PermissionMode, approvalHookCmd)
+	// Pass the session ID explicitly so the remote CLI resumes the exact
+	// conversation Milevia tracked, instead of relying on the CLI's implicit
+	// "most recent session" behavior (which breaks after the session file ages
+	// out or another conversation interleaves). Mirrors claudeCLIRunner.sessionArgs.
+	sessionArg := ""
+	if req.Resume && req.SessionID != "" {
+		sessionArg = "--resume " + shellQuote(req.SessionID)
+	} else if req.SessionID != "" {
+		sessionArg = "--session-id " + shellQuote(req.SessionID)
+	}
 	cmd := fmt.Sprintf(
-		"cd %s && claude -p --verbose --input-format stream-json --output-format stream-json --replay-user-messages %s",
+		"cd %s && claude -p --verbose --input-format stream-json --output-format stream-json --replay-user-messages %s %s",
 		shellQuote(req.ProjectPath),
 		permissionArgs,
+		sessionArg,
 	)
 
 	stdin, err := session.StdinPipe()
@@ -965,6 +1151,21 @@ func (s *sshAgentSession) startCurrentLocked(turn *claudeSessionTurn) error {
 	startTurn(turn, s.initSeen)
 	for _, event := range pending {
 		turn.sink.Event(event.typ, event.payload)
+		// Replay the init handling that emit() defers when no turn is bound:
+		// extract the CLI-assigned session_id so it persists even when the init
+		// event arrived before Send() set the current turn.
+		if event.typ == "system" {
+			var env struct {
+				Subtype   string `json:"subtype"`
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(event.payload, &env) == nil && env.Subtype == "init" {
+				if env.SessionID != "" {
+					turn.sink.SessionIdentified(env.SessionID)
+				}
+				turn.sink.SessionInitialized()
+			}
+		}
 	}
 	payload, err := json.Marshal(map[string]any{
 		"type":    "user",
@@ -1050,6 +1251,15 @@ func (s *sshAgentSession) emit(eventType string, payload json.RawMessage, initia
 	s.mu.Unlock()
 	turn.sink.Event(eventType, payload)
 	if initialized {
+		// The init event carries the CLI-assigned session_id. Persist it so a
+		// later process restart resumes the exact session instead of falling
+		// back to the CLI's implicit "most recent" heuristic.
+		var init struct {
+			SessionID string `json:"session_id"`
+		}
+		if json.Unmarshal(payload, &init) == nil && init.SessionID != "" {
+			turn.sink.SessionIdentified(init.SessionID)
+		}
 		turn.sink.SessionInitialized()
 	}
 }
@@ -1176,6 +1386,12 @@ func readClaudeJSONLines(reader io.Reader, sink AgentRunSink) error {
 		}
 		sink.Event(envelope.Type, line)
 		if envelope.Type == "system" && envelope.Subtype == "init" {
+			var init struct {
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(line, &init) == nil && init.SessionID != "" {
+				sink.SessionIdentified(init.SessionID)
+			}
 			sink.SessionInitialized()
 		}
 		if envelope.Type != "assistant" {

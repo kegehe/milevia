@@ -26,9 +26,12 @@ export type ModelUsage = { model: string; inputTokens: number; outputTokens: num
 export type RunUsage = { runId: string; conversationId: string; available: boolean; reason?: string; status: string; model: string; contextWindow: number; contextInputTokens: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; durationMs: number; ttftMs: number; terminalReason: string; hasResult: boolean; startedAt?: string; completedAt?: string; models: ModelUsage[] };
 export type ConversationUsage = { taskCount: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number };
 export type ConversationUsageResponse = { conversationId: string; available: boolean; reason?: string; context: RunUsage; currentRun?: RunUsage; latestRun?: RunUsage; session: ConversationUsage; models: ModelUsage[] };
+export type SystemVariant = "compact" | "compact_result" | "compact_boundary" | "api_retry" | "task";
+export type SystemItem = { id: string; createdAt: string; runId: string; variant: SystemVariant; title: string; detail?: string; metadata?: Record<string, unknown> };
 export type TimelineItem =
   | { kind: "message"; id: string; createdAt: string; message: Message }
   | { kind: "tool"; id: string; createdAt: string; action: ToolAction }
+  | { kind: "system"; id: string; createdAt: string; system: SystemItem }
   | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
 export type WorkspaceTab = "conversation" | "tasks" | "files" | "git" | "run";
 

@@ -74,7 +74,7 @@ test("a failed send restores its draft only while the original conversation rema
 test("conversation entries keep card styles separate from their layout and align user messages to the reading column", () => {
   assert.match(conversationPage, /className=\{`timeline-entry \$\{item\.kind === "message" \? "message-entry" : item\.kind\}`\}/);
   assert.doesNotMatch(conversationPage, /className=\{`timeline-entry \$\{item\.kind\}`\}/);
-  assert.match(stylesheet, /\.timeline-entry\.message-entry,\s*\.timeline-entry\.tool,\s*\.timeline-entry\.error\s*\{\s*display:\s*flex;\s*width:\s*min\(832px,\s*100%\);\s*margin-right:\s*auto;\s*margin-left:\s*auto;\s*padding:\s*0;\s*\}/s);
+  assert.match(stylesheet, /\.timeline-entry\.message-entry,\s*\.timeline-entry\.tool,\s*\.timeline-entry\.system,\s*\.timeline-entry\.error\s*\{\s*display:\s*flex;\s*width:\s*min\(832px,\s*100%\);\s*margin-right:\s*auto;\s*margin-left:\s*auto;\s*padding:\s*0;\s*\}/s);
   assert.match(stylesheet, /\.timeline-entry\.message-entry:has\(\.message\.user\)\s*\{\s*justify-content:\s*flex-end;\s*\}/);
   assert.match(stylesheet, /\.message\.user\s*\{\s*align-items:\s*flex-end;\s*margin-left:\s*auto;\s*margin-right:\s*0;\s*\}/);
   assert.match(stylesheet, /\.timeline::before\s*\{\s*display:\s*none;\s*\}/);
@@ -116,7 +116,7 @@ test("head actions portal into the project header so the canvas grid stays clean
 });
 
 test("project workspaces expose global request failures", () => {
-  assert.match(projectLayout, /const \{ error: globalError, setError: setGlobalError, refreshProjects \} = useProjectContext\(\);/);
+  assert.match(projectLayout, /const \{ error: globalError, setError: setGlobalError, refreshStatuses \} = useProjectContext\(\);/);
   assert.match(projectLayout, /\{globalError && <div className="error" role="alert"><span>\{globalError\}<\/span><button type="button" title="关闭错误提示" onClick=\{\(\) => setGlobalError\(""\)\}>x<\/button><\/div>\}/);
   assert.match(projectLayout, /<button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表"[\s\S]*?<BackProjectsIcon \/><\/button>\s*<h2>\{project\.name\}<\/h2>/);
   assert.doesNotMatch(projectLayout, /<label>\{project\.runner\}<\/label>/);
@@ -200,10 +200,12 @@ test("Git workbench and project runner are first-class workspace tabs", () => {
 });
 
 test("switching projects does not render an outlet with the previous project context", () => {
-  assert.match(projectLayout, /const \[resolvedProjectID, setResolvedProjectID\] = useState<string \| null>\(null\);/);
-  assert.match(projectLayout, /setLoading\(true\);\s*setError\(""\);\s*setProject\(null\);/s);
-  assert.match(projectLayout, /setResolvedProjectID\(projectId\);\s*setLoading\(false\);/s);
-  assert.match(projectLayout, /if \(loading \|\| resolvedProjectID !== projectId\)/);
+  // 切换项目时，若 project 与当前路由 id 不匹配，显示全屏 loading 而非带旧 project 的 outlet。
+  assert.match(projectLayout, /if \(loading \|\| !project \|\| project\.id !== projectId\)/);
+  // 用单项目接口而非全量列表，避免远程探活阻塞。
+  assert.match(projectLayout, /api<Project>\(`\/api\/projects\/\$\{projectId\}`\)/);
+  // 不再重置 setProject(null)——保留旧数据但靠 id 不匹配守卫，避免全屏闪烁。
+  assert.doesNotMatch(projectLayout, /setProject\(null\);/);
 });
 
 test("conversation follows streaming updates and explicitly follows dispatched messages", () => {

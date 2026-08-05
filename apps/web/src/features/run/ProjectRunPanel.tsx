@@ -190,8 +190,10 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		if (validationError) { fail(validationError); return; }
 		setBusy("save");
 		const revision = configRevisionRef.current;
+		// 远程项目的执行环境固定为 auto，避免旧值被持久化。
+		const payload: RunConfig = isRemote ? { ...config, executionTarget: "auto" } : config;
 		try {
-			await request(`${basePath}/config`, { method: "PUT", body: JSON.stringify(config) });
+			await request(`${basePath}/config`, { method: "PUT", body: JSON.stringify(payload) });
 			if (revision === configRevisionRef.current) configDirtyRef.current = false;
 		}
 		catch (cause) { fail(cause instanceof Error ? cause.message : "保存配置失败"); }
@@ -274,7 +276,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 						<header className="run-sidebar-heading"><div><span>启动配置</span><h3>命令与环境</h3></div><button type="button" className="run-save-config" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存"}</button></header>
 						<div className="run-config-row">
 							<label htmlFor="run-execution-target">运行环境</label>
-							<select id="run-execution-target" value={config.executionTarget || "auto"} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })} disabled={isRemote}>
+							<select id="run-execution-target" value={isRemote ? "auto" : (config.executionTarget || "auto")} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })} disabled={isRemote}>
 								<option value="auto">{isRemote ? "远程" : "自动"}</option>
 								{!isRemote && <option value="windows">Windows</option>}
 								{!isRemote && <option value="wsl">WSL</option>}

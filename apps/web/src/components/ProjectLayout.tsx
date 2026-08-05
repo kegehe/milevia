@@ -33,9 +33,8 @@ export default function ProjectLayout() {
   const location = useLocation();
 	const [project, setProject] = useState<Project | null>(null);
 	const [loading, setLoading] = useState(true);
-	const [resolvedProjectID, setResolvedProjectID] = useState<string | null>(null);
 	const [error, setError] = useState("");
-  const { error: globalError, setError: setGlobalError, refreshProjects } = useProjectContext();
+  const { error: globalError, setError: setGlobalError, refreshStatuses } = useProjectContext();
 
   // 确定当前工作区标签
   const getWorkspaceTab = useCallback((): WorkspaceTab => {
@@ -65,55 +64,57 @@ export default function ProjectLayout() {
     }
   }, [projectId, navigate]);
 
-  useEffect(() => {
-    void refreshProjects().catch(() => undefined);
-    const interval = window.setInterval(() => { void refreshProjects().catch(() => undefined); }, 10_000);
-    return () => window.clearInterval(interval);
-  }, [refreshProjects]);
-
   // 加载项目数据（仅一次，通过 context 共享给子路由）
+	// 用单项目接口而非全量 /api/projects：后者会对每个 SSH runner 同步探活，
+	// 进入项目时被阻塞数秒。不重置 project 以避免请求期间全屏闪烁；但切换项目时
+	// 仍需 setLoading(true) 兜底，否则数据到达前会误显错误页。
 	useEffect(() => {
 		if (!projectId) return;
 		let cancelled = false;
-		setLoading(true);
 		setError("");
-		setProject(null);
+		setLoading(true);
 		(async () => {
       try {
-        const list = await api<Project[]>("/api/projects");
+        const found = await api<Project>(`/api/projects/${projectId}`);
         if (cancelled) return;
-        const found = list.find((p) => p.id === projectId);
-			if (found) {
 				setProject(found);
-        } else {
-          setError("项目不存在");
-          navigate("/", { replace: true });
-        }
       } catch (cause) {
         if (!cancelled) setError(cause instanceof Error ? cause.message : "无法加载项目");
-		} finally {
-			if (!cancelled) {
-				setResolvedProjectID(projectId);
-				setLoading(false);
+			} finally {
+				if (!cancelled) {
+					setLoading(false);
+				}
 			}
-		}
     })();
     return () => { cancelled = true; };
-  }, [projectId, navigate]);
+  }, [projectId]);
 
-	if (loading || resolvedProjectID !== projectId) {
+	// 项目页期间持续刷新项目状态（运行中/会话数等），供 FilesPage 等子路由使用。
+	// 只调 /api/projects/statuses（纯 SQL 查询），不触发 refreshProjects 的远程探活。
+	useEffect(() => {
+		void refreshStatuses().catch(() => undefined);
+		const interval = window.setInterval(() => { void refreshStatuses().catch(() => undefined); }, 10_000);
+		return () => window.clearInterval(interval);
+	}, [refreshStatuses]);
+
+	// 当前 project 是否对应当前路由的项目 id。
+	// 请求失败且无匹配数据时显示错误页。loading 期间 error 已被清空，不会误触发。
+	if (error && (!project || project.id !== projectId)) {
     return <main className="app-shell project-open">
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
-        <p style={{ color: "#586273", fontSize: "14px" }}>加载项目中...</p>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100vh", gap: "16px" }}>
+        <p style={{ color: "#d14233", fontSize: "14px" }}>{error}</p>
+        <button className="primary" onClick={() => navigate("/")}>返回项目列表</button>
       </div>
     </main>;
   }
 
-  if (error || !project) {
+	// loading 期间，或 project 与当前路由不匹配时，显示全屏 loading。
+	// 切换项目时旧 project 不匹配新 id，显示 loading 而非旧内容。
+	// 此条件之后 project 必非 null 且匹配，TS 可收窄。
+	if (loading || !project || project.id !== projectId) {
     return <main className="app-shell project-open">
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100vh", gap: "16px" }}>
-        <p style={{ color: "#d14233", fontSize: "14px" }}>{error || "项目加载失败"}</p>
-        <button className="primary" onClick={() => navigate("/")}>返回项目列表</button>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
+        <p style={{ color: "#586273", fontSize: "14px" }}>加载项目中...</p>
       </div>
     </main>;
   }

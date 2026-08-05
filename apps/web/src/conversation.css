@@ -145,6 +145,7 @@
   content: "";
 }
 .timeline-entry.error::before { background: #c65343; }
+.timeline-entry.system::before { background: #8a97ad; }
 /* 消息圆点按说话方分色：AI 消息用主题默认灰绿，用户消息用主题强调色区分。
    tool/error 色由主题层(style.css)控制，此处不再覆盖。 */
 .timeline-entry.message-entry:has(.message.user)::before { background: #2c7567; }
@@ -250,6 +251,49 @@
 .tool-card details summary span { overflow: hidden; color: #748198; text-overflow: ellipsis; white-space: nowrap; }
 .tool-card .output.inline { margin: 0; border-top: 1px solid #e2e6ef; background: #f3f5f9; color: #303d56; }
 .tool-card .error-output { color: #a84130; background: #fff0ed; }
+
+/* ---- 系统状态卡片（斜杠命令反馈、压缩、重试等） -------------------------- */
+.system-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 16px;
+  padding: 9px 13px;
+  border: 1px solid #e2e6ef;
+  border-left: 3px solid #8a97ad;
+  border-radius: 6px;
+  background: #f7f8fb;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.system-card.compact { border-left-color: #6b7fa3; background: #f0f3f9; }
+.system-card.compact_result { border-left-color: #2c7567; background: #eef6f4; }
+.system-card.compact_result.failed { border-left-color: #c65343; background: #fff5f3; }
+.system-card.compact_boundary { border-left-color: #5a6b8a; }
+.system-card.api_retry { border-left-color: #b8923a; background: #fbf7ed; }
+.system-card.task { border-left-color: #7a6b9a; }
+.system-card > header { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.system-card-icon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border-radius: 50%;
+  color: #5a6b8a;
+  background: #e2e6ef;
+  font-size: 12px;
+  font-weight: 700;
+}
+.system-card.compact .system-card-icon { color: #4a5d80; background: #dde3ef; }
+.system-card.compact_result .system-card-icon { color: #2c7567; background: #d6e9e4; }
+.system-card.compact_result.failed .system-card-icon { color: #9d3a2b; background: #ffe6d9; }
+.system-card.api_retry .system-card-icon { color: #8a6c2a; background: #f0e8d0; }
+.system-card > header > div { min-width: 0; }
+.system-card > header b { display: block; color: #3a465e; font-size: 13px; }
+.system-card > header small { display: block; color: #748198; font-size: 12px; overflow-wrap: anywhere; }
+.system-card-time { color: #a0a8b5; font-size: 11px; flex: none; }
 
 /* ---- 错误卡片 ------------------------------------------------------------ */
 .error-card { margin: 0 0 20px; border: 1px solid #f0ccc4; border-radius: 6px; background: #fff9f8; min-width: 0; overflow-wrap: anywhere; }
@@ -1365,9 +1409,11 @@
 }
 .timeline-entry.message-entry { margin-bottom: 26px; }
 .timeline-entry.tool { margin-bottom: 18px; }
+.timeline-entry.system { margin-bottom: 14px; }
 .timeline-entry.error { margin-bottom: 18px; }
 .timeline-entry.message-entry,
 .timeline-entry.tool,
+.timeline-entry.system,
 .timeline-entry.error {
   display: flex;
   width: min(832px, 100%);
@@ -1575,6 +1621,7 @@
   .chat-center > .timeline { padding: 20px 16px max(32px, var(--composer-height, 0px)) 16px; }
   .timeline-entry.message-entry,
   .timeline-entry.tool,
+  .timeline-entry.system,
   .timeline-entry.error { width: 100%; padding: 0; }
   .message.user { width: min(100%, 680px); }
   .message > .markdown { padding: 13px 14px; }

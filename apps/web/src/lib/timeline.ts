@@ -1,8 +1,8 @@
 // Timeline 构建逻辑 — 从 App.tsx 提取
 
-import type { Event, Message, ToolAction, ToolOutput, AgentExecution, AgentNode, AgentLog, TimelineItem, Approval, ApprovalEvent } from "./types";
+import type { Event, Message, ToolAction, ToolOutput, AgentExecution, AgentNode, AgentLog, TimelineItem, Approval, ApprovalEvent, SystemItem, SystemVariant } from "./types";
 import { asRecord } from "./api";
-import { contentToText, agentSummary, toolSummary } from "./utils";
+import { contentToText, agentSummary, toolSummary, formatTokens, formatDuration } from "./utils";
 
 const ignoredCodexStderr = new Set(["Reading additional input from stdin..."]);
 const allowedTechnicalTerms = /\b(?:AI|API|CLI|Codex|Claude|Git|HTTP|ID|JSON|SSH|URL|WSL)\b/g;
@@ -174,6 +174,119 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
     });
   }
   tools.push(...codexTools.values());
+
+  // ---- system 事件 → system timeline items ----
+  // Claude CLI 的斜杠命令（如 /compact）和后台任务会产生 system 类型事件，
+  // 这些事件携带重要的会话状态信息（压缩进度、token 统计、API 重试、后台任务等），
+  // 需要解析并展示在时间线上。
+  const systemItems: SystemItem[] = [];
+  for (const event of events) {
+    // tool_progress 是长时间运行工具的心跳事件（每 ~31s 一次），
+    // 与 ToolCard 的"执行中"状态指示器冗余，且多次心跳会产生噪音卡片，故不展示。
+    if (event.type === "tool_progress") continue;
+    if (event.type !== "system") continue;
+    const payload = asRecord(event.payload);
+    const subtype = String(payload.subtype || "");
+    if (subtype === "status") {
+      const status = String(payload.status || "");
+      const compactResult = String(payload.compact_result || "");
+      if (status === "compacting") {
+        systemItems.push({
+          id: event.id, createdAt: event.createdAt, runId: event.runId,
+          variant: "compact", title: "正在压缩上下文",
+          detail: "Claude 正在压缩对话上下文以释放 token 空间…",
+        });
+      } else if (compactResult === "success") {
+        systemItems.push({
+          id: event.id, createdAt: event.createdAt, runId: event.runId,
+          variant: "compact_result", title: "上下文压缩完成",
+        });
+      } else if (compactResult && compactResult !== "success") {
+        systemItems.push({
+          id: event.id, createdAt: event.createdAt, runId: event.runId,
+          variant: "compact_result", title: "上下文压缩失败",
+          detail: `压缩结果：${compactResult}`,
+        });
+      }
+      continue;
+    }
+    if (subtype === "compact_boundary") {
+      const meta = asRecord(payload.compact_metadata);
+      const preTokens = Number(meta.pre_tokens) || 0;
+      const postTokens = Number(meta.post_tokens) || 0;
+      const dropped = Number(meta.cumulative_dropped_tokens) || 0;
+      const durationMs = Number(meta.duration_ms) || 0;
+      const parts: string[] = [];
+      if (preTokens && postTokens) parts.push(`${formatTokens(preTokens)} → ${formatTokens(postTokens)}`);
+      if (dropped) parts.push(`减少 ${formatTokens(dropped)}`);
+      if (durationMs) parts.push(`耗时 ${formatDuration(durationMs)}`);
+      systemItems.push({
+        id: event.id, createdAt: event.createdAt, runId: event.runId,
+        variant: "compact_boundary", title: "上下文压缩摘要",
+        detail: parts.join(" · ") || undefined,
+        metadata: meta as Record<string, unknown>,
+      });
+      continue;
+    }
+    if (subtype === "api_retry") {
+      const attempt = Number(payload.attempt) || 0;
+      const maxRetries = Number(payload.max_retries) || 0;
+      const errorStatus = Number(payload.error_status) || 0;
+      // 常见错误码/标识本地化，其余原样展示。
+      const errorLabel = (() => {
+        const raw = String(payload.error || "").trim();
+        if (!raw) return "";
+        const known: Record<string, string> = { rate_limit: "速率限制", overloaded: "服务过载", server_error: "服务器错误", timeout: "请求超时" };
+        return known[raw] || raw;
+      })();
+      const errorPart = errorLabel ? `：${errorLabel}${errorStatus ? ` (${errorStatus})` : ""}` : errorStatus ? ` (${errorStatus})` : "";
+      systemItems.push({
+        id: event.id, createdAt: event.createdAt, runId: event.runId,
+        variant: "api_retry", title: "API 重试中",
+        detail: attempt && maxRetries ? `第 ${attempt}/${maxRetries} 次重试${errorPart}` : undefined,
+      });
+      continue;
+    }
+    if (subtype === "task_started" || subtype === "task_notification" || subtype === "task_updated" || subtype === "background_tasks_changed") {
+      let title = "后台任务";
+      let detail = "";
+      if (subtype === "task_started") {
+        title = "后台任务启动";
+        detail = String(payload.description || payload.summary || "").trim();
+      } else if (subtype === "task_notification") {
+        const taskStatus = String(payload.status || "");
+        // CLI 有时用英文模板生成 summary（如 Background command "..." completed (exit code 0)），
+        // 尝试提取引号内的描述并本地化；若不匹配则原样展示。
+        const rawSummary = String(payload.summary || "").trim();
+        const bgMatch = rawSummary.match(/^Background command "(.+)" (completed|failed) \(exit code (\d+)\)$/);
+        if (taskStatus === "failed") { title = "后台任务失败"; }
+        else if (taskStatus === "completed") { title = "后台任务完成"; }
+        else { title = "后台任务通知"; }
+        detail = bgMatch
+          ? `${bgMatch[2] === "failed" ? "失败" : "完成"}（退出码 ${bgMatch[3]}）${bgMatch[1]}`
+          : rawSummary;
+      } else if (subtype === "task_updated") {
+        const patch = asRecord(payload.patch);
+        if (patch.is_backgrounded) { title = "任务转入后台"; }
+        else continue; // 无意义的状态更新，跳过
+      } else {
+        // background_tasks_changed
+        const tasks = Array.isArray(payload.tasks) ? payload.tasks.map(asRecord) : [];
+        if (tasks.length === 0) { title = "后台任务已全部完成"; }
+        else {
+          title = "后台任务列表更新";
+          detail = tasks.map((t) => String(t.description || t.task_type || "")).filter(Boolean).join("、");
+        }
+      }
+      systemItems.push({
+        id: event.id, createdAt: event.createdAt, runId: event.runId,
+        variant: "task", title, detail: detail || undefined,
+      });
+      continue;
+    }
+    // 其它 system 子类型（init 等）不展示在时间线上
+  }
+
   const errorItems: TimelineItem[] = [];
   const detailedRuns = new Set<string>();
   const seenDiagnostics = new Set<string>();
@@ -225,6 +338,7 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
   const timeline: TimelineItem[] = [
     ...messages.map((message) => ({ kind: "message" as const, id: message.id, createdAt: message.createdAt, message })),
     ...tools.map((action) => ({ kind: "tool" as const, id: action.id, createdAt: action.createdAt, action })),
+    ...systemItems.map((system) => ({ kind: "system" as const, id: system.id, createdAt: system.createdAt, system })),
     ...errorItems,
   ];
   return timeline.sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
@@ -348,6 +462,7 @@ export function timelineContentVersion(timeline: TimelineItem[], executions: Age
     if (item.kind === "tool") {
       return `tool:${item.id}:${item.action.output?.content.length || 0}:${item.action.approval?.status || ""}:${item.action.runStatus || ""}`;
     }
+    if (item.kind === "system") return `system:${item.id}:${item.system.title}:${item.system.detail?.length || 0}`;
     return `error:${item.id}:${item.detail.length}`;
   });
   const nodeVersion = (node: AgentNode): string => [
