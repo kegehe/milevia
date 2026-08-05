@@ -135,7 +135,17 @@ export default function DashboardPage() {
       </header>
       <div className="dashboard-divider"><span>项目列表</span><i></i>{filter !== "all" && <small>{`显示${filters.find((item) => item.id === filter)?.label}项目`}</small>}</div>
       {projects.length === 0 ? <div className="empty"><h2>还没有项目</h2><p>加载一个本地目录后，即可在这里开始 AI 工具对话。</p><button className="primary" onClick={() => navigate("/projects/import")}>加载项目</button></div>
-        : filteredProjects.length === 0 ? <div className="empty filtered-empty"><h2>没有匹配的项目</h2><p>当前筛选下没有项目，可切换筛选查看其他任务。</p></div>
+        : filteredProjects.length === 0 ? (() => {
+          const current = filters.find((item) => item.id === filter);
+          const others = filters.filter((item) => item.id !== filter && item.id !== "all" && item.count > 0);
+          return <div className="empty filtered-empty">
+            <span className="filtered-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" /><circle cx="18.5" cy="17.5" r="3.5" /><path d="M18.5 16v1.5l1 1" /></svg></span>
+            <h2>{`暂无${current?.label ?? ""}项目`}</h2>
+            <p>{`当前筛选下没有匹配的项目。${others.length ? "试试切换到下方其他状态，或查看全部项目。" : "切换到全部项目查看所有任务。"}`}</p>
+            {others.length > 0 && <div className="filtered-empty-suggest">{others.map((item) => <button key={item.id} type="button" className="filtered-empty-chip" onClick={() => setFilter(item.id)}><small>{item.label}</small><b>{item.count}</b></button>)}</div>}
+            <button className="primary" type="button" onClick={() => setFilter("all")}>查看全部项目</button>
+          </div>;
+        })()
           : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
     </section>
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}

@@ -53,7 +53,7 @@ export function contextLabel(context: import("./types").RunUsage | undefined): s
   if (context?.available === false) return "上下文暂不可用";
   const tokens = context?.contextInputTokens;
   if (!tokens) return context?.hasResult ? "上下文暂不可用" : "上下文计算中";
-  if (!context?.contextWindow) return "上下文暂不可用";
+  if (!context?.contextWindow) return `上下文 ${formatTokens(tokens)}`;
   const percent = Math.round(tokens / context.contextWindow * 100);
   const tokensDisplay = formatTokens(tokens);
   const windowDisplay = formatTokens(context.contextWindow);

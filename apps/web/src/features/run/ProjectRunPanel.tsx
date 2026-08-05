@@ -44,7 +44,7 @@ function nextEnvironmentVariableKey(envVars: Record<string, string>): string {
 	return key;
 }
 
-export function ProjectRunPanel({ projectID, request, fail, active }: { projectID: string; request: Request; fail: (message: string) => void; active: boolean }) {
+export function ProjectRunPanel({ projectID, request, fail, active, isRemote = false }: { projectID: string; request: Request; fail: (message: string) => void; active: boolean; isRemote?: boolean }) {
 	const [config, setConfig] = useState<RunConfig>({ workDir: "", command: "", envVars: {}, executionTarget: "auto" });
 	const [status, setStatus] = useState<RunStatusResponse | null>(null);
 	const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -274,10 +274,10 @@ export function ProjectRunPanel({ projectID, request, fail, active }: { projectI
 						<header className="run-sidebar-heading"><div><span>启动配置</span><h3>命令与环境</h3></div><button type="button" className="run-save-config" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存"}</button></header>
 						<div className="run-config-row">
 							<label htmlFor="run-execution-target">运行环境</label>
-							<select id="run-execution-target" value={config.executionTarget || "auto"} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })}>
-								<option value="auto">自动</option>
-								<option value="windows">Windows</option>
-								<option value="wsl">WSL</option>
+							<select id="run-execution-target" value={config.executionTarget || "auto"} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })} disabled={isRemote}>
+								<option value="auto">{isRemote ? "远程" : "自动"}</option>
+								{!isRemote && <option value="windows">Windows</option>}
+								{!isRemote && <option value="wsl">WSL</option>}
 							</select>
 						</div>
 						<div className="run-config-row">

@@ -1,7 +1,7 @@
 // 对话页 — 从 App.tsx Chat 组件提取
 // 完整保留了原 Chat 组件的全部功能：消息列表、WebSocket 实时事件、输入框、权限管理、会话切换、所有弹窗
 
-import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useParams, useNavigate, useSearchParams, useOutletContext } from "react-router-dom";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
@@ -131,6 +131,12 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
   const toolName = agentID === "codex" ? "Codex" : "Claude Code";
   const agentPath = agentID === "codex" ? "codex" : "claude";
 
+  // 自动检查的缓存键：按 runner + agent 隔离，10 分钟内不重复请求 npm。
+  const cacheKey = `milevia:update-check:${runnerID}:${agentID}`;
+  const autoChecked = useRef(false);
+  // 切换 runner 或 agent 时重置自动检查守卫，确保每个工具都会被检查一次。
+  useEffect(() => { autoChecked.current = false; }, [cacheKey]);
+
   const refreshRunner = useCallback(async (): Promise<RunnerInfo | null> => {
     try {
       const list = await api<RunnerInfo[]>("/api/runners");
@@ -149,25 +155,50 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
     void refreshRunner();
   }, [refreshRunner]);
 
+  const handleCheckUpdate = useCallback(async (silent = false): Promise<void> => {
+    if (!silent) setChecking(true);
+    // 手动检查先清空旧结果以便 UI 反映"检查中"；静默检查保留旧结果，避免后台失败时抹掉已有结论。
+    if (!silent) setUpdateInfo(null);
+    try {
+      const result = await api<CheckUpdateResult>(`/api/runners/${runnerID}/${agentPath}/check-update`, { method: "POST" });
+      setUpdateInfo(result);
+      // 记录检查时间戳，供自动检查的缓存窗口使用。
+      try { window.localStorage.setItem(cacheKey, String(Date.now())); } catch { /* localStorage 可能在隐私模式下不可用 */ }
+    } catch (err) {
+      if (!silent) setUpdateInfo({ updateAvailable: false, currentVersion: tool?.version || "", error: err instanceof Error ? err.message : "检查更新失败" });
+    } finally {
+      if (!silent) setChecking(false);
+    }
+  }, [runnerID, agentPath, cacheKey, tool?.version]);
+
+  // 主动检查：runner 就绪后自动检查一次（受 10 分钟缓存窗口约束），之后每 30 分钟静默复查。
+  useEffect(() => {
+    if (!runner || tool?.status !== "ready" || updating) return;
+    // 已有运行中的对话时不自动检查，避免分散注意力；用户仍可手动检查。
+    if (run) return;
+    if (autoChecked.current) return;
+    autoChecked.current = true;
+    let cached = false;
+    try {
+      const stamp = window.localStorage.getItem(cacheKey);
+      if (stamp && Date.now() - Number(stamp) < 10 * 60 * 1000) cached = true;
+    } catch { /* localStorage 不可用则直接检查 */ }
+    if (!cached) void handleCheckUpdate(true);
+  }, [runner, tool?.status, updating, run, cacheKey, handleCheckUpdate]);
+
+  // 定时轮询：每 30 分钟静默复查一次（仅在无运行中对话时）。
+  useEffect(() => {
+    if (!runner || tool?.status !== "ready" || run || updating) return;
+    const id = window.setInterval(() => { void handleCheckUpdate(true); }, 30 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [runner, tool?.status, run, updating, handleCheckUpdate]);
+
   // 当后端报告 runner 正在更新（如页面刷新后检测到），定期轮询直到状态恢复
   useEffect(() => {
     if (!runner || updating || tool?.status !== "updating") return;
     const id = window.setInterval(() => { void refreshRunner(); }, 5_000);
     return () => window.clearInterval(id);
   }, [runner, tool?.status, updating, refreshRunner]);
-
-  const handleCheckUpdate = async () => {
-    setChecking(true);
-    setUpdateInfo(null);
-    try {
-      const result = await api<CheckUpdateResult>(`/api/runners/${runnerID}/${agentPath}/check-update`, { method: "POST" });
-      setUpdateInfo(result);
-    } catch (err) {
-      setUpdateInfo({ updateAvailable: false, currentVersion: tool?.version || "", error: err instanceof Error ? err.message : "检查更新失败" });
-    } finally {
-      setChecking(false);
-    }
-  };
 
   const handleUpdate = async () => {
     setShowConfirm(false);
@@ -187,6 +218,10 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
       setUpdating(false);
       // 从后端拉取最新 runner 信息，刷新版本号与状态
       await refreshRunner();
+      // 重置自动检查守卫并清除缓存时间戳：runner 状态恢复 ready 后，主动检查 effect 会
+      // 自动复查一次（缓存已失效，必然执行），立即展示"已是最新版本"。
+      autoChecked.current = false;
+      try { window.localStorage.removeItem(cacheKey); } catch { /* localStorage 不可用则忽略 */ }
     }
   };
 
@@ -198,6 +233,7 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
       <span className={`runner-inline ${runnerStatusClass}${run ? " run-active" : ""}`} title={tool?.reason} role={run ? "status" : undefined} aria-live={run ? "polite" : undefined}><i aria-hidden="true"></i><span>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span></span>
       {!run && tool?.status === "ready" && <button className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
       {!run && !updating && updateInfo?.updateAvailable && !updateInfo.error && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo.latestVersion}</button>}
+      {!run && !updating && updateInfo && !updateInfo.updateAvailable && !updateInfo.error && <span className="runner-inline-uptodate" title={`${toolName} 已是最新版本`}>已是最新版本</span>}
       {!run && !updating && updateInfo?.error && <span className="runner-inline-error" title={updateInfo.error}>{updateInfo.error}</span>}
       {canShowUsage ? <span className="composer-usage"><span className="composer-usage-model" title={displayedModel}>{displayedModel}</span><span className={`composer-usage-context ${contextLevel}`}>{contextLabel}</span><span className="composer-usage-count">{usage ? `${usage.session.taskCount} 次对话` : "加载中"}</span><button className="usage-trigger" type="button" onClick={onShowUsage}>使用状态</button></span> : <span className="composer-usage pending">用量将在工具就绪后显示</span>}
     </span>
@@ -214,8 +250,14 @@ function UsageDialogHeader({ agentName, close }: { agentName: string; close: () 
   return <header><div className="usage-dialog-heading"><span className="usage-dialog-mark"><UsageDialogIcon /></span><div><label>{agentName.toUpperCase()} USAGE</label><h2 id="usage-title">使用状态</h2></div></div><button type="button" className="usage-dialog-close" title="关闭" aria-label="关闭" onClick={close}><DialogCloseIcon /></button></header>;
 }
 
-function UsageDialog({ agentID, usage, currentRun, now, close }: { agentID: AgentID; usage: ConversationUsageResponse | null; currentRun: RunUsage | undefined; now: number; close: () => void }) {
+function UsageDialog({ agentID, usage, currentRun, close }: { agentID: AgentID; usage: ConversationUsageResponse | null; currentRun: RunUsage | undefined; close: () => void }) {
   const agentName = agentID === "codex" ? "Codex" : "Claude Code";
+  // 计时器仅在本组件挂载时（即弹窗打开时）运行，避免在对话页顶层每秒触发整页重渲染。
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
   if (usage && !usage.available) return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><UsageDialogHeader agentName={agentName} close={close} /><div className="usage-body usage-unavailable"><p className="usage-note">{usage.reason || "当前工具未提供可验证的使用统计。"}</p></div><footer><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
   const task = usage?.currentRun ?? usage?.latestRun;
   const active = Boolean(usage?.currentRun && usage.currentRun.status === "running");
@@ -237,7 +279,7 @@ function UsageDialog({ agentID, usage, currentRun, now, close }: { agentID: Agen
   const contextWindow = context?.contextWindow ?? 0;
   const contextTokens = context?.contextInputTokens ?? 0;
   const contextPercent = contextWindow > 0 ? Math.min(100, Math.round(contextTokens / contextWindow * 100)) : 0;
-  const contextDetail = contextTokens && contextWindow ? `${formatTokens(contextTokens)} / ${formatTokens(contextWindow)}` : context?.available === false ? context.reason || "当前工具未提供上下文快照" : context?.hasResult ? "当前工具未提供上下文快照" : "等待上下文快照";
+  const contextDetail = contextTokens && contextWindow ? `${formatTokens(contextTokens)} / ${formatTokens(contextWindow)}` : contextTokens ? `已用 ${formatTokens(contextTokens)}` : context?.available === false ? context.reason || "当前工具未提供上下文快照" : context?.hasResult ? "当前工具未提供上下文快照" : "等待上下文快照";
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><UsageDialogHeader agentName={agentName} close={close} /><div className="usage-body">
     <section className="usage-context-overview"><div><span>当前会话上下文</span><b>{contextDetail}</b></div><span className={`context-state ${contextLevel(context)}`}>{contextLabel(context)}</span>{contextWindow > 0 && <div className={`usage-context-meter ${contextLevel(context)}`} aria-label={`上下文使用 ${contextPercent}%`}><i style={{ width: `${contextPercent}%` }} /></div>}</section>
     <section className="usage-section"><div className="usage-section-head"><h3>当前任务</h3>{task?.model && <span className="usage-model-label" title={task.model}>{task.model}</span>}</div>{task ? <><dl className="usage-grid task-usage-grid">{metrics.map(([label, value]) => <div key={String(label)} className={label === "状态" ? `usage-metric-status ${active ? "running" : task.status}` : ""}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>{!hasTaskUsage && !active && <p className="usage-note">{task.reason || `该任务未获得 ${agentName} 的最终统计数据。`}</p>}</> : <p className="usage-note">当前会话还没有可用的任务统计。</p>}</section>
@@ -292,7 +334,7 @@ function FullControlConfirmationDialog({ close, confirm, changing, isCodex }: { 
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="full-control-title" onClick={(e) => { if (e.target === e.currentTarget) close(); }}><section className="modal permission-dialog"><header><div><label>{agentName.toUpperCase()} PERMISSION</label><h2 id="full-control-title">切换为完全控制</h2></div><button title="关闭" disabled={changing} onClick={close}>x</button></header><p className="permission-confirmation">{isCodex ? `完全控制会允许 Codex 绕过沙箱限制，直接执行所有命令，不再受项目目录约束。` : `完全控制会允许 Claude 在当前项目中直接执行所有命令，不再等待确认。`}</p><footer><button className="secondary" disabled={changing} onClick={close}>取消</button><button className="primary danger" disabled={changing} onClick={() => void confirm()}>{changing ? "切换中" : "确认切换"}</button></footer></section></div>;
 }
 
-function MessageCard({ message, agentID, fail }: { message: Message; agentID: AgentID; fail: (message: string) => void }) {
+const MessageCard = memo(function MessageCard({ message, agentID, fail }: { message: Message; agentID: AgentID; fail: (message: string) => void }) {
   const isUser = message.role === "user";
   const agentName = agentID === "codex" ? "Codex" : "Claude";
   const [copied, setCopied] = useState(false);
@@ -314,11 +356,11 @@ function MessageCard({ message, agentID, fail }: { message: Message; agentID: Ag
   };
 
   return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentID === "codex" ? "<>" : "C"}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div>{isUser && <button className={`message-copy${copied ? " copied" : ""}`} type="button" title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()} />}</article>;
-}
+});
 
-function ErrorCard({ item, projectId, onViewTask }: { item: TimelineItem & { kind: "error" }; projectId: string; onViewTask: (taskId: string) => void }) {
+const ErrorCard = memo(function ErrorCard({ item, projectId, onViewTask }: { item: TimelineItem & { kind: "error" }; projectId: string; onViewTask: (taskId: string) => void }) {
   return <article className="error-card"><header><span className="error-card-icon">!</span><div><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></header><pre>{item.detail}</pre>{item.taskId && <footer className="error-card-footer"><button type="button" className="secondary" onClick={() => onViewTask(item.taskId!)}>查看任务详情</button></footer>}</article>;
-}
+});
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   const label = alt?.trim() || "未命名图片";
@@ -326,11 +368,11 @@ function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   return <span className="markdown-image-reference" role="note">图片：{externalImage ? <a href={externalImage} target="_blank" rel="noreferrer">{label}</a> : label}</span>;
 }
 
-function Markdown({ content }: { content: string }) {
+const Markdown = memo(function Markdown({ content }: { content: string }) {
   return <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>, img: MarkdownImage }}>{content}</ReactMarkdown>;
-}
+});
 
-function ToolCard({ action, resolving, decide }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void> }) {
+const ToolCard = memo(function ToolCard({ action, resolving, decide }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void> }) {
   const command = typeof action.input.command === "string" ? action.input.command : "";
   const description = typeof action.input.description === "string" ? action.input.description : action.name;
   const approval = action.approval;
@@ -341,10 +383,12 @@ function ToolCard({ action, resolving, decide }: { action: ToolAction; resolving
   const status = denied ? "已拒绝" : failed ? "执行失败" : stopped ? "已停止" : action.output ? "已完成" : waiting ? "等待确认" : approval?.status === "allow" ? "已允许" : action.runStatus === "completed" ? "已结束" : "执行中";
   const output = action.output?.content || "(无输出)";
   const shouldCollapseOutput = output.length > 260 || output.split("\n").length > 5;
+  const isFileChange = action.name === "文件修改";
+  const outputLabel = failed ? isFileChange ? "查看文件变更" : "查看错误输出" : isFileChange ? "查看文件内容" : "查看命令输出";
   const outputPreview = output.replace(/\s+/g, " ").trim().slice(0, 180);
   const statusClass = failed ? "failed" : stopped || denied ? "denied" : waiting ? "pending" : "";
-  return <article className={`tool-card ${waiting ? "waiting" : ""}`}><header><div><span className="tool-icon" aria-hidden="true">{">_"}</span><div><b>{action.name === "Bash" ? "终端命令" : action.name}</b><small>{description}</small></div></div><div className="tool-meta"><time>{formatTime(action.createdAt)}</time><span className={`tool-status ${statusClass}`}>{status}</span></div></header>{command && <pre className="command"><code>{command}</code></pre>}{waiting && approval && <div className="approval-actions"><span>此命令将会在当前项目目录执行。</span><div><button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button><button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button></div></div>}{action.output && (shouldCollapseOutput ? <details><summary>{failed ? "查看错误输出" : "查看命令输出"}<span>{outputPreview}</span></summary><pre className="output">{output}</pre></details> : <pre className={`output inline ${failed ? "error-output" : ""}`}>{output}</pre>)}</article>;
-}
+  return <article className={`tool-card ${waiting ? "waiting" : ""}`}><header><div><span className="tool-icon" aria-hidden="true">{">_"}</span><div><b>{action.name === "Bash" ? "终端命令" : action.name}</b><small>{description}</small></div></div><div className="tool-meta"><time>{formatTime(action.createdAt)}</time><span className={`tool-status ${statusClass}`}>{status}</span></div></header>{command && <pre className="command"><code>{command}</code></pre>}{waiting && approval && <div className="approval-actions"><span>此命令将会在当前项目目录执行。</span><div><button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button><button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button></div></div>}{action.output && (shouldCollapseOutput ? <details><summary>{outputLabel}<span>{outputPreview}</span></summary><pre className="output">{output}</pre></details> : <pre className={`output inline ${failed ? "error-output" : ""}`}>{output}</pre>)}</article>;
+});
 
 function AgentExecutionCard({ execution, open }: { execution: AgentExecution; open: () => void }) {
   const agents = flattenAgents(execution.agents);
@@ -462,6 +506,27 @@ function ShortcutEditor({ projectID, state, close, refresh, fail }: { projectID:
   return <><div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="shortcut-editor-title"><section className={`modal shortcut-editor${isCommand ? " command-editor" : " prompt-editor"}`}><header><div className="shortcut-editor-heading"><span className="shortcut-editor-mark"><ShortcutCategoryIcon kind={isCommand ? "command" : "prompt"} /></span><div><label>{isCommand ? "COMMON COMMAND" : "COMMON PROMPT"}</label><h2 id="shortcut-editor-title">{shortcut ? `编辑${isCommand ? "命令" : "提示词"}` : `新增${isCommand ? "命令" : "提示词"}`}</h2></div></div><button type="button" className="shortcut-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><DialogCloseIcon /></button></header><form onSubmit={(event) => void save(event)}><div className="shortcut-editor-body"><label className="shortcut-editor-field"><span>名称 <small>最多 64 个字符</small></span><input autoFocus required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} placeholder={isCommand ? "例如：清空终端" : "例如：审查当前改动"} /></label><label className="shortcut-editor-field"><span>{isCommand ? "命令内容" : "提示词内容"}</span><textarea required maxLength={12000} value={template} onChange={(event) => setTemplate(event.target.value)} placeholder={isCommand ? "例如：clear" : "描述希望 Claude 在当前项目完成的工作"} /></label>{shortcut && <label className="shortcut-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此项</span></label>}{isCommand && <p className="shortcut-editor-hint">执行时会遵循当前会话的权限设置。</p>}</div><footer>{shortcut && <button type="button" className="danger-text" disabled={busy} onClick={() => void remove()}>删除</button>}<div className="shortcut-editor-footer-actions"><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存"}</button></div></footer></form></section></div>{pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}</>;
 }
 
+// ---- 消息列表（独立 memo 组件，阻断对话页其他状态变化导致的列表重渲染） ----
+
+const MessageList = memo(function MessageList({ timeline, agentID, fail, resolving, decide, projectId, onViewTask, executionByRun, onOpenExecution, registerUserMessageElement }: {
+  timeline: TimelineItem[];
+  agentID: AgentID;
+  fail: (message: string) => void;
+  resolving: string;
+  decide: (approvalId: string, decision: "allow" | "deny") => Promise<void>;
+  projectId: string;
+  onViewTask: (taskId: string) => void;
+  executionByRun: Map<string, AgentExecution>;
+  onOpenExecution: (runId: string) => void;
+  registerUserMessageElement: (messageId: string, element: HTMLDivElement | null) => void;
+}) {
+  const anchoredExecutionRunIDs = useMemo(() => new Set(timeline.flatMap((item) => item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.has(item.message.runId) ? [item.message.runId] : [])), [executionByRun, timeline]);
+  return <>
+    {timeline.map((item) => <div key={item.id} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { registerUserMessageElement(item.message.id, element); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={agentID} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : <ErrorCard item={item} projectId={projectId} onViewTask={onViewTask} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => onOpenExecution(item.message.runId!)} />}</div>)}
+    {executionByRun && Array.from(executionByRun.values()).filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => onOpenExecution(execution.runId)} />)}
+  </>;
+});
+
 // ---- 主组件 ---------------------------------------------------------------
 
 export default function ConversationPage() {
@@ -478,7 +543,7 @@ export default function ConversationPage() {
   const closeAgentExecution = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("execution"); return next; });
   const openUsage = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("usage", "true"); return next; });
   const openNewConversationParam = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("new", "true"); return next; });
-  const openExecutionParam = (runId: string) => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("execution", runId); return next; });
+  const openExecutionParam = useCallback((runId: string) => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("execution", runId); return next; }), [setSearchParams]);
 
   // 对话核心状态
   const [conversation, setConversation] = useState<Conversation | null>(null);
@@ -516,7 +581,6 @@ export default function ConversationPage() {
 
   const [activatingConversation, setActivatingConversation] = useState("");
   const [usage, setUsage] = useState<ConversationUsageResponse | null>(null);
-  const [usageNow, setUsageNow] = useState(Date.now());
   const [shortcuts, setShortcuts] = useState<Shortcut[]>([]);
   const [shortcutEditor, setShortcutEditor] = useState<ShortcutEditorState | null>(null);
   const [shortcutVariables, setShortcutVariables] = useState<{ shortcut: Shortcut; variables: Record<string, string> } | null>(null);
@@ -697,7 +761,6 @@ export default function ConversationPage() {
               setEvents([]);
               setRun("");
               setUsage(null);
-              setInputHistory([]);
               historyIndex.current = null;
               draftBeforeHistory.current = "";
               finishedRunIds.current.clear();
@@ -898,14 +961,6 @@ export default function ConversationPage() {
     return () => { cancelled = true; };
   }, [conversation?.id, fail, refreshUsage]);
 
-  // 运行计时器
-  useEffect(() => {
-    if (!run) return undefined;
-    setUsageNow(Date.now());
-    const timer = window.setInterval(() => setUsageNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [run]);
-
   // HTTP 轮询回退
   useEffect(() => {
     if (!run || !conversation?.id) return undefined;
@@ -936,7 +991,7 @@ export default function ConversationPage() {
     };
   }, [run, conversation?.id, projectApi, recordAssistantOutput]);
 
-  // 对话切换时重置输入历史
+  // 对话切换时重置输入历史浏览状态（历史本身按项目保留，不清空）
   useEffect(() => {
     if (!conversation) return;
     pendingUserDrafts.current.clear();
@@ -944,22 +999,24 @@ export default function ConversationPage() {
     retractedMessageRuns.current.clear();
     historyIndex.current = null;
     draftBeforeHistory.current = "";
-    setInputHistory([]);
   }, [conversation?.id]);
 
-  // 加载输入历史
+  // 加载项目级输入历史（在新建/清空对话后仍保留）
   useEffect(() => {
-    if (!conversation) return undefined;
+    if (!projectId) return undefined;
+    // 切换项目时退出历史浏览，避免索引对新历史越界
+    historyIndex.current = null;
+    draftBeforeHistory.current = "";
     let cancelled = false;
     const loadHistory = async () => {
       try {
-        const history = await projectApi<string[]>(`/api/conversations/${conversation.id}/input-history?limit=100`);
+        const history = await projectApi<string[]>(`/api/projects/${projectId}/input-history?limit=100`);
         if (!cancelled) setInputHistory(history);
       } catch (cause) { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法加载输入历史"); }
     };
     void loadHistory();
     return () => { cancelled = true; };
-  }, [conversation?.id, fail, historyRefresh, projectApi]);
+  }, [projectId, fail, historyRefresh, projectApi]);
 
   // 计算属性
   const knownSubagentTexts = useMemo(() => subagentTextIndex(events), [events]);
@@ -968,7 +1025,6 @@ export default function ConversationPage() {
   const timeline = useMemo(() => buildTimeline(primaryMessages, events), [events, primaryMessages]);
   const agentExecutions = useMemo(() => buildAgentExecutions(events), [events]);
   const executionByRun = useMemo(() => new Map(agentExecutions.map((execution) => [execution.runId, execution])), [agentExecutions]);
-  const anchoredExecutionRunIDs = useMemo(() => new Set(primaryMessages.flatMap((message) => message.role === "user" && message.runId && executionByRun.has(message.runId) ? [message.runId] : [])), [executionByRun, primaryMessages]);
   const visibleContentVersion = useMemo(() => timelineContentVersion(timeline, agentExecutions), [timeline, agentExecutions]);
   const isEmptyConversation = timeline.length === 0;
 
@@ -1290,7 +1346,7 @@ export default function ConversationPage() {
       const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content }) });
       if (conversationRef.current?.id !== conversationID) return;
       if (!assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, data.message.content);
-      setMessages((old) => [...old, data.message]); setInputHistory((old) => [...old.slice(-99), data.message.content]); setHistoryRefresh((version) => version + 1); setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
+      setMessages((old) => [...old, data.message]); appendInputHistory(data.message.content); setHistoryRefresh((version) => version + 1); setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
       followAfterDispatch();
       void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
@@ -1332,7 +1388,7 @@ export default function ConversationPage() {
       if (conversationRef.current?.id !== conversationID) return;
       if (!assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, data.message.content);
       setMessages((old) => [...old, data.message]);
-      setInputHistory((old) => [...old.slice(-99), data.message.content]);
+      appendInputHistory(data.message.content);
       setHistoryRefresh((version) => version + 1);
       setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
       followAfterDispatch();
@@ -1345,7 +1401,7 @@ export default function ConversationPage() {
   const resetConversationView = (next: Conversation) => {
     const nextDraft = projectId ? getConversationDraft(projectId, next.id) : "";
     setComposerText(nextDraft, next.id);
-    setMessages([]); setEvents([]); setRun(""); setUsage(null); setInputHistory([]); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
+    setMessages([]); setEvents([]); setRun(""); setUsage(null); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
   };
 
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode) => {
@@ -1524,12 +1580,19 @@ export default function ConversationPage() {
     finally { setChangingPermission(false); }
   };
 
-  const decide = async (approvalId: string, decision: "allow" | "deny") => {
+  const decide = useCallback(async (approvalId: string, decision: "allow" | "deny") => {
     setResolving(approvalId);
     try { await projectApi(`/api/approvals/${approvalId}`, { method: "POST", body: JSON.stringify({ decision }) }); }
     catch (cause) { fail(cause instanceof Error ? cause.message : "无法处理命令审批"); }
     finally { setResolving(""); }
-  };
+  }, [projectApi, fail]);
+
+  // 稳定回调：避免每次渲染新建函数导致 MessageList memo 失效
+  const onViewTask = useCallback((taskId: string) => { navigate(`/projects/${project.id}/tasks/${taskId}`); }, [navigate, project.id]);
+  const registerUserMessageElement = useCallback((messageId: string, element: HTMLDivElement | null) => {
+    if (element) userMessageElements.current.set(messageId, element);
+    else userMessageElements.current.delete(messageId);
+  }, []);
 
   const stopRunInternal = async (force: boolean, requestedRunID = run) => {
     const runID = requestedRunID;
@@ -1629,10 +1692,19 @@ export default function ConversationPage() {
     }
   };
 
+  // 追加一条输入历史，连续重复内容压缩为一条，最多保留 100 条
+  const appendInputHistory = useCallback((content: string) => {
+    setInputHistory((items) => {
+      if (items.length > 0 && items[items.length - 1] === content) return items;
+      const next = [...items, content];
+      return next.length > 100 ? next.slice(next.length - 100) : next;
+    });
+  }, []);
+
   const handleTaskDispatched = (message: Message, runID: string) => {
     if (!assistantOutputRuns.current.has(runID) && !finishedRunIds.current.has(runID)) pendingUserDrafts.current.set(runID, message.content);
     setMessages((items) => [...items, message]);
-    setInputHistory((items) => [...items.slice(-99), message.content]);
+    appendInputHistory(message.content);
     setHistoryRefresh((version) => version + 1);
     setRun(finishedRunIds.current.has(runID) ? "" : runID);
     void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
@@ -1699,8 +1771,7 @@ export default function ConversationPage() {
         <div ref={top} />
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
         {isEmptyConversation && <section className="conversation-starter" aria-label="新会话建议"><span>新会话</span><h2>从一个任务开始</h2><div className="conversation-starter-options">{starterSuggestions.map((suggestion) => <button key={suggestion.label} type="button" onClick={() => startFromSuggestion(suggestion.prompt)}>{suggestion.label}</button>)}</div></section>}
-        {timeline.map((item) => <div key={item.id} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { if (element) userMessageElements.current.set(item.message.id, element); else userMessageElements.current.delete(item.message.id); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={conversation?.agentId || "claude-code"} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : <ErrorCard item={item} projectId={project.id} onViewTask={(taskId) => navigate(`/projects/${project.id}/tasks/${taskId}`)} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => openExecutionParam(item.message.runId!)} />}</div>)}
-        {agentExecutions.filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => openExecutionParam(execution.runId)} />)}
+        <MessageList timeline={timeline} agentID={conversation?.agentId || "claude-code"} fail={fail} resolving={resolving} decide={decide} projectId={project.id} onViewTask={onViewTask} executionByRun={executionByRun} onOpenExecution={openExecutionParam} registerUserMessageElement={registerUserMessageElement} />
         {run && <div className="run-indicator"><span></span>{runLabel}</div>}
         <div ref={bottom} />
       </section>
@@ -1724,7 +1795,7 @@ export default function ConversationPage() {
     {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} />}
     {showFullControlConfirmation && <FullControlConfirmationDialog close={() => setShowFullControlConfirmation(false)} confirm={confirmFullControl} changing={changingPermission} isCodex={isCodex} />}
     {showAgentExecution && agentExecutions.find((execution) => execution.runId === showAgentExecution) && <AgentExecutionDialog execution={agentExecutions.find((execution) => execution.runId === showAgentExecution)!} close={closeAgentExecution} />}
-    {showUsage && <UsageDialog agentID={conversation?.agentId || "claude-code"} usage={usage} currentRun={currentUsage} now={usageNow} close={closeUsage} />}
+    {showUsage && <UsageDialog agentID={conversation?.agentId || "claude-code"} usage={usage} currentRun={currentUsage} close={closeUsage} />}
     {shortcutEditor && <ShortcutEditor projectID={project.id} state={shortcutEditor} close={() => setShortcutEditor(null)} refresh={refreshShortcuts} fail={fail} />}
     {shortcutVariables && <ShortcutVariablesDialog state={shortcutVariables} close={() => setShortcutVariables(null)} run={(variables) => { setShortcutVariables(null); void runShortcut(shortcutVariables.shortcut, variables, true); }} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} confirmLabel={pendingConfirm.confirmLabel} danger={pendingConfirm.danger} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}

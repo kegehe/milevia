@@ -152,7 +152,7 @@ type Server struct {
 	approvals              map[string]*approvalWaiter
 	usageMu                sync.Mutex
 	runUsage               map[string]*runUsageAccumulator
-	runManagers            map[string]*projectRunner
+	runManagers            map[string]projectRunnerInterface
 	runManagersMu          sync.RWMutex
 	runLogSubscribers      map[string]map[*websocket.Conn]*runLogSubscriber
 	runLogSubMu            sync.Mutex
@@ -406,7 +406,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]*projectRunner{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
+	s := &Server{db: pool, config: config, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return isLocalWebOrigin(r.Header.Get("Origin")) }
 	if err := s.migrate(ctx); err != nil {
 		runtimeStop()
@@ -472,7 +472,7 @@ func (s *Server) Close() {
 			s.resolveRunApprovals(runID, "deny")
 		}
 		s.runManagersMu.RLock()
-		runners := make([]*projectRunner, 0, len(s.runManagers))
+		runners := make([]projectRunnerInterface, 0, len(s.runManagers))
 		for _, runner := range s.runManagers {
 			runners = append(runners, runner)
 		}
@@ -553,12 +553,15 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/switch", s.gitSwitchBranch)
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
+	r.Get("/api/projects/{projectID}/input-history", s.listProjectInputHistory)
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
 	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
 	r.Get("/api/projects/{projectID}/orchestration", s.listOrchestrationJobs)
 	r.Get("/api/projects/{projectID}/orchestration/releases", s.listReleaseSnapshots)
 	r.Post("/api/projects/{projectID}/orchestration/release", s.createReleaseSnapshot)
 	r.Post("/api/projects/{projectID}/orchestration/releases/{releaseID}/confirm-main", s.confirmReleaseMergedToMain)
+	r.Post("/api/projects/{projectID}/orchestration/enqueue-batch", s.enqueueBatchForOrchestration)
+	r.Patch("/api/projects/{projectID}/orchestration/order", s.reorderOrchestrationJobs)
 	r.Get("/api/tasks/{taskID}", s.getTask)
 	r.Patch("/api/tasks/{taskID}", s.updateTask)
 	r.Delete("/api/tasks/{taskID}", s.deleteTask)
@@ -571,6 +574,7 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/tasks/{taskID}/orchestration/enqueue", s.enqueueTaskForOrchestration)
 	r.Post("/api/tasks/{taskID}/orchestration/pause", s.pauseOrchestrationJob)
 	r.Post("/api/tasks/{taskID}/orchestration/resume", s.resumeOrchestrationJob)
+	r.Delete("/api/tasks/{taskID}/orchestration/dequeue", s.dequeueTaskFromOrchestration)
 	r.Post("/api/tasks/{taskID}/review", s.reviewTask)
 	r.Post("/api/tasks/{taskID}/reopen", s.reopenTask)
 	r.Post("/api/tasks/{taskID}/stop", s.stopTask)
@@ -1327,6 +1331,7 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 			branch = "非 Git 目录"
 		}
 		claudeReady := sshR.Ready(r.Context())
+		codexReady := sshR.CodexReady(r.Context())
 		meta, _ := s.runnerRegistry.getMeta(runnerID)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"path":        path,
@@ -1334,8 +1339,8 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 			"gitReady":    gitReady,
 			"gitBranch":   branch,
 			"claudeReady": claudeReady,
-			"codexReady":  false,
-			"agentReady":  claudeReady,
+			"codexReady":  codexReady,
+			"agentReady":  claudeReady || codexReady,
 			"performance": "remote",
 			"runnerName":  meta.Name,
 		})
@@ -1408,6 +1413,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			name = filepath.Base(path)
 		}
 		meta, _ := s.runnerRegistry.getMeta(runnerID)
+		codexReady := sshR.CodexReady(r.Context())
 		p := Project{
 			ID:          uuid.NewString(),
 			Name:        name,
@@ -1416,7 +1422,8 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			Runner:      runnerID,
 			GitBranch:   branch,
 			ClaudeReady: true,
-			AgentReady:  true,
+			CodexReady:  codexReady,
+			AgentReady:  true, // Claude Code is confirmed ready above
 			CreatedAt:   time.Now().UTC(),
 		}
 		s.decorateProjectPresentation(&p)
@@ -1426,7 +1433,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			lookupErr := s.db.QueryRowContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects where path=$1 and runner=$2`, path, runnerID).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.Runner, &existing.GitBranch, &existing.ClaudeReady, &existing.CreatedAt)
 			if lookupErr == nil {
 				s.decorateProjectPresentation(&existing)
-				s.decorateProjectAvailability(&existing, existing.Runner == "wsl-local" && s.codexRunner.Ready(r.Context()))
+				s.decorateProjectAvailability(&existing, s.codexRunner.Ready(r.Context()))
 				writeJSON(w, http.StatusOK, existing)
 				return
 			}
@@ -1463,7 +1470,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		lookupErr := s.db.QueryRowContext(r.Context(), `select id,name,path,runner,git_branch,claude_ready,created_at from projects where path=$1 and runner=$2`, path, runnerID).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.Runner, &existing.GitBranch, &existing.ClaudeReady, &existing.CreatedAt)
 		if lookupErr == nil {
 			s.decorateProjectPresentation(&existing)
-			s.decorateProjectAvailability(&existing, existing.Runner == "wsl-local" && s.codexRunner.Ready(r.Context()))
+			s.decorateProjectAvailability(&existing, s.codexRunner.Ready(r.Context()))
 			writeJSON(w, http.StatusOK, existing)
 			return
 		}
@@ -1635,7 +1642,10 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	projects := []Project{}
-	codexReady := s.codexRunner.Ready(r.Context())
+	localCodexReady := s.codexRunner.Ready(r.Context())
+	// Cache remote Codex readiness per SSH runner so we don't issue redundant
+	// remote checks when many projects share the same connection.
+	sshCodexCache := map[string]bool{}
 	for rows.Next() {
 		var p Project
 		if err := rows.Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt); err != nil {
@@ -1643,7 +1653,19 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.decorateProjectPresentation(&p)
-		s.decorateProjectAvailability(&p, codexReady)
+		if p.Runner == "wsl-local" {
+			s.decorateProjectAvailability(&p, localCodexReady)
+		} else if strings.HasPrefix(p.Runner, "ssh-") {
+			if cached, ok := sshCodexCache[p.Runner]; ok {
+				p.CodexReady = cached
+				p.AgentReady = p.ClaudeReady || p.CodexReady
+			} else {
+				s.decorateProjectAvailability(&p, localCodexReady)
+				sshCodexCache[p.Runner] = p.CodexReady
+			}
+		} else {
+			s.decorateProjectAvailability(&p, localCodexReady)
+		}
 		projects = append(projects, p)
 	}
 	if err := rows.Err(); err != nil {
@@ -1653,9 +1675,33 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, projects)
 }
 
-func (s *Server) decorateProjectAvailability(project *Project, codexReady bool) {
-	project.CodexReady = project.Runner == "wsl-local" && codexReady
+func (s *Server) decorateProjectAvailability(project *Project, localCodexReady bool) {
+	switch {
+	case project.Runner == "wsl-local":
+		project.CodexReady = localCodexReady
+	case strings.HasPrefix(project.Runner, "ssh-"):
+		project.CodexReady = s.sshCodexReady(project.Runner)
+	default:
+		project.CodexReady = false
+	}
 	project.AgentReady = project.ClaudeReady || project.CodexReady
+}
+
+// sshCodexReady reports whether Codex is available on the remote host behind the
+// given SSH runner. It returns false when the runner is disconnected or the
+// remote Codex CLI is not installed/logged in.
+func (s *Server) sshCodexReady(runnerID string) bool {
+	r, ok := s.runnerRegistry.get(runnerID)
+	if !ok {
+		return false
+	}
+	codexR, ok := r.(CodexCapableRunner)
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return codexR.CodexReady(ctx)
 }
 
 func (s *Server) decorateProjectPresentation(project *Project) {
@@ -1749,13 +1795,22 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if input.AgentID == "codex" && projectRunner != "wsl-local" {
-		writeError(w, http.StatusConflict, errors.New("Codex is currently available only on the local WSL runner"))
-		return
-	}
-	if input.AgentID == "codex" && !s.codexRunner.Ready(r.Context()) {
-		writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
-		return
+	if input.AgentID == "codex" {
+		if strings.HasPrefix(projectRunner, "ssh-") {
+			runner, ok := s.runnerRegistry.get(projectRunner)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试"))
+				return
+			}
+			codexR, ok := runner.(CodexCapableRunner)
+			if !ok || !codexR.CodexReady(r.Context()) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("远程服务器上 Codex CLI 不可用或未登录"))
+				return
+			}
+		} else if !s.codexRunner.Ready(r.Context()) {
+			writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
+			return
+		}
 	}
 	// New conversations replace the project's current conversation. Keep that
 	// transition ordered with message admission and context clearing.
@@ -2088,6 +2143,55 @@ func (s *Server) listInputHistory(w http.ResponseWriter, r *http.Request) {
 		history[left], history[right] = history[right], history[left]
 	}
 	writeJSON(w, http.StatusOK, history)
+}
+
+// listProjectInputHistory 返回项目级别的用户输入历史（最近 limit 条），
+// 连续重复内容会被压缩为一条。与对话级别的历史不同，它在新建/清空对话后仍然保留。
+func (s *Server) listProjectInputHistory(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	limit := 100
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed < 1 {
+			writeError(w, http.StatusBadRequest, errors.New("limit must be a positive integer"))
+			return
+		}
+		if parsed < limit {
+			limit = parsed
+		}
+	}
+	rows, err := s.db.QueryContext(r.Context(), `select messages.content from messages join conversations on conversations.id = messages.conversation_id where conversations.project_id = ? and messages.role = 'user' order by messages.created_at desc limit ?`, projectID, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+	history := make([]string, 0, limit)
+	for rows.Next() {
+		var content string
+		if err := rows.Scan(&content); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		history = append(history, content)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// 反转为按时间正序（旧 -> 新）
+	for left, right := 0, len(history)-1; left < right; left, right = left+1, right-1 {
+		history[left], history[right] = history[right], history[left]
+	}
+	// 压缩连续重复项：连续多次输入相同内容只保留一条
+	deduped := make([]string, 0, len(history))
+	for _, content := range history {
+		if len(deduped) > 0 && deduped[len(deduped)-1] == content {
+			continue
+		}
+		deduped = append(deduped, content)
+	}
+	writeJSON(w, http.StatusOK, deduped)
 }
 
 func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
@@ -2736,15 +2840,24 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	// prefer s.runner directly (tests may replace s.runner with a custom impl).
 	runnerObj := s.runner // default to the server-level runner
 	if conversation.AgentID == "codex" {
-		if projectRunner != "wsl-local" {
-			return Message{}, "", nil, http.StatusConflict, errors.New("Codex is currently available only on the local WSL runner")
+		if strings.HasPrefix(projectRunner, "ssh-") {
+			r, ok := s.runnerRegistry.get(projectRunner)
+			if !ok {
+				return Message{}, "", nil, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试")
+			}
+			codexR, ok := r.(CodexCapableRunner)
+			if !ok || !codexR.CodexReady(ctx) {
+				return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("远程服务器上 Codex CLI 不可用或未登录")
+			}
+			runnerObj = r
+		} else {
+			if !s.codexRunner.Ready(ctx) {
+				return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in")
+			}
+			runnerObj = s.codexRunner
 		}
-		if !s.codexRunner.Ready(ctx) {
-			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in")
-		}
-		runnerObj = s.codexRunner
 	}
-	if strings.HasPrefix(projectRunner, "ssh-") {
+	if conversation.AgentID != "codex" && strings.HasPrefix(projectRunner, "ssh-") {
 		r, ok := s.runnerRegistry.get(projectRunner)
 		if !ok {
 			return Message{}, "", nil, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试")
@@ -2755,6 +2868,12 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Claude Code is unavailable or not logged in")
 	}
 	streamingRunner, streaming := runnerObj.(StreamingAgentRunner)
+	// Codex runs one-shot turns (non-streaming) even on SSH runners, which
+	// otherwise implement StreamingAgentRunner for Claude Code.
+	if conversation.AgentID == "codex" {
+		streaming = false
+		streamingRunner = nil
+	}
 	if streaming {
 		s.streamMu.Lock()
 		defer s.streamMu.Unlock()
@@ -2880,9 +2999,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	s.runTokens[runID] = runToken
 	s.runContexts[runID] = conversation.ID
 	s.mu.Unlock()
-	if conversation.AgentID != "codex" {
-		s.beginRunUsage(runID, conversation.ID)
-	}
+	s.beginRunUsage(runID, conversation.ID)
 	go func() {
 		defer s.runWG.Done()
 		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, projectPath, content)
@@ -3104,6 +3221,7 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		Resume:         c.initialized(),
 		RunID:          runID,
 		RunToken:       runToken,
+		AgentID:        c.AgentID,
 	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, agentID: c.AgentID})
 	status := "completed"
 	if ctx.Err() != nil {
@@ -3111,9 +3229,7 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 	} else if err != nil {
 		status = "failed"
 	}
-	if c.AgentID != "codex" {
-		s.recordUsagePersistenceError(runID, c.ID, s.persistRunUsage(runID, status))
-	}
+	s.recordUsagePersistenceError(runID, c.ID, s.persistRunUsage(runID, status))
 	s.finishRun(runID, c.ID, status, err)
 }
 
@@ -3127,9 +3243,7 @@ type agentRunSink struct {
 
 func (sink *agentRunSink) Event(eventType string, payload json.RawMessage) {
 	sink.server.appendEvent(sink.runID, sink.conversationID, eventType, payload)
-	if sink.agentID != "codex" {
-		sink.server.collectUsageEvent(sink.runID, sink.conversationID, eventType, payload)
-	}
+	sink.server.collectUsageEvent(sink.runID, sink.conversationID, eventType, payload)
 }
 
 func (sink *agentRunSink) AssistantText(content, parentToolUseID string) {
@@ -3794,6 +3908,9 @@ func localizedErrorText(err error, fallback string) string {
 		"invalid JSON request":   "请求内容不是有效的 JSON。",
 		"activate this conversation before sending a message":                        "请先激活该会话，再发送消息。",
 		"Codex is currently available only on the local WSL runner":                  "Codex 目前仅支持本地 WSL 运行器。",
+		"远程服务器上 Codex CLI 不可用或未登录":                                                  "远程服务器上 Codex CLI 不可用或未登录。",
+		"远程服务器上未安装 Codex CLI":                                                  "远程服务器上未安装 Codex CLI。",
+		"此 Runner 不支持 Codex":                                                  "此运行器不支持 Codex。",
 		"Codex CLI is unavailable or not logged in":                                  "Codex CLI 不可用或尚未登录。",
 		"Claude Code is unavailable or not logged in":                                "Claude Code 不可用或尚未登录。",
 		"conversation is stopping":                                                   "会话正在停止，请稍后再试。",
@@ -3945,22 +4062,32 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		}
 		codexStatus := "unavailable"
 		codexVersion := ""
-		codexReason := "Codex 目前仅支持本地 WSL Runner"
+		codexReason := ""
 		if m.ID == "wsl-local" {
 			if s.codexRunner.Ready(r.Context()) {
 				codexStatus = "ready"
 				codexVersion = s.codexRunner.Version(r.Context())
-				codexReason = ""
 			} else {
 				codexReason = "本机 Codex CLI 未安装或未登录"
 			}
-			s.runnerMaintenanceMu.Lock()
-			if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "codex"}] {
-				codexStatus = "updating"
-				codexReason = ""
+		} else if runner, ok := s.runnerRegistry.get(m.ID); ok {
+			if codexR, ok := runner.(CodexCapableRunner); ok {
+				if codexR.CodexReady(r.Context()) {
+					codexStatus = "ready"
+					codexVersion = codexR.CodexVersion(r.Context())
+				} else {
+					codexReason = "远程服务器上 Codex CLI 未安装或未登录"
+				}
+			} else {
+				codexReason = "此 Runner 不支持 Codex"
 			}
-			s.runnerMaintenanceMu.Unlock()
 		}
+		s.runnerMaintenanceMu.Lock()
+		if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "codex"}] {
+			codexStatus = "updating"
+			codexReason = ""
+		}
+		s.runnerMaintenanceMu.Unlock()
 		entry["codex"] = map[string]string{
 			"status":  codexStatus,
 			"version": codexVersion,
@@ -3986,11 +4113,21 @@ func (s *Server) checkClaudeUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) checkCodexUpdate(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
-	if runnerID != "wsl-local" {
-		writeError(w, http.StatusNotFound, errors.New("Codex is currently available only on the local WSL runner"))
+	if runnerID == "wsl-local" {
+		s.checkAgentUpdate(w, r, s.codexRunner)
 		return
 	}
-	s.checkAgentUpdate(w, r, s.codexRunner)
+	runner, ok := s.runnerRegistry.get(runnerID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("runner not found"))
+		return
+	}
+	codexR, ok := runner.(CodexCapableRunner)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("此 Runner 不支持 Codex"))
+		return
+	}
+	s.checkAgentUpdate(w, r, codexRunnerAdapter{codexR})
 }
 
 func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner AgentRunner) {
@@ -4023,11 +4160,38 @@ func (s *Server) updateClaude(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) updateCodex(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
-	if runnerID != "wsl-local" {
-		writeError(w, http.StatusNotFound, errors.New("Codex is currently available only on the local WSL runner"))
+	if runnerID == "wsl-local" {
+		s.updateAgent(w, r, runnerID, "codex", "Codex", s.codexRunner)
 		return
 	}
-	s.updateAgent(w, r, runnerID, "codex", "Codex", s.codexRunner)
+	runner, ok := s.runnerRegistry.get(runnerID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("runner not found"))
+		return
+	}
+	codexR, ok := runner.(CodexCapableRunner)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("此 Runner 不支持 Codex"))
+		return
+	}
+	s.updateAgent(w, r, runnerID, "codex", "Codex", codexRunnerAdapter{codexR})
+}
+
+// codexRunnerAdapter exposes a CodexCapableRunner (e.g. an SSH runner) through
+// the AgentRunner interface so that updateAgent can drive Codex updates with the
+// same locking and active-run checks as Claude Code.
+type codexRunnerAdapter struct{ inner CodexCapableRunner }
+
+func (a codexRunnerAdapter) Ready(ctx context.Context) bool        { return a.inner.CodexReady(ctx) }
+func (a codexRunnerAdapter) Version(ctx context.Context) string    { return a.inner.CodexVersion(ctx) }
+func (a codexRunnerAdapter) Run(ctx context.Context, _ AgentRunRequest, _ AgentRunSink) error {
+	return errors.New("codexRunnerAdapter does not support Run")
+}
+func (a codexRunnerAdapter) CheckUpdate(ctx context.Context) (bool, string, error) {
+	return a.inner.CodexCheckUpdate(ctx)
+}
+func (a codexRunnerAdapter) Update(ctx context.Context) (string, string, error) {
+	return a.inner.CodexUpdate(ctx)
 }
 
 func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, agentID, agentName string, runner AgentRunner) {
@@ -4120,18 +4284,38 @@ func (s *Server) saveRunConfig(ctx context.Context, projectID string, c RunConfi
 // projectRunManagerForExistingProject rechecks project existence while holding
 // the manager map lock. A concurrent deletion therefore either retires this
 // runner after creation or prevents a new runner from being registered.
-func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projectID string) (*projectRunner, error) {
+// 根据项目的 runner 类型创建对应的 projectRunner（本地或 SSH）。
+func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projectID string) (projectRunnerInterface, error) {
 	s.runManagersMu.Lock()
 	defer s.runManagersMu.Unlock()
-	if _, err := s.getProjectByID(ctx, projectID); err != nil {
+	project, err := s.getProjectByID(ctx, projectID)
+	if err != nil {
 		return nil, err
 	}
 	if runner, ok := s.runManagers[projectID]; ok {
 		return runner, nil
 	}
-	runner := newProjectRunner(projectID, "", "", nil, func(entry LogEntry) {
+	broadcast := func(entry LogEntry) {
 		s.broadcastRunLog(projectID, entry)
-	})
+	}
+	var runner projectRunnerInterface
+	if project.Runner == "wsl-local" || project.Runner == "" {
+		runner = newProjectRunner(projectID, "", "", nil, broadcast)
+	} else {
+		agentRunner, ok := s.runnerRegistry.get(project.Runner)
+		if !ok {
+			return nil, &runnerOfflineError{RunnerID: project.Runner}
+		}
+		sshR, ok := agentRunner.(*sshRunner)
+		if !ok {
+			return nil, errors.New("runner 不是 SSH 类型")
+		}
+		repo, err := sshR.canonicalProjectPath(ctx, project.Path)
+		if err != nil {
+			return nil, err
+		}
+		runner = newSSHProjectRunner(projectID, sshR.client, repo, broadcast)
+	}
 	s.runManagers[projectID] = runner
 	return runner, nil
 }
@@ -4142,6 +4326,10 @@ func validateProjectRunConfig(project Project, cfg RunConfig) error {
 	}
 	if err := validateRunEnvironmentVariables(cfg.EnvVars); err != nil {
 		return err
+	}
+	// SSH 远程项目的执行环境与工作目录在远端解析，跳过本地路径校验。
+	if project.Runner != "wsl-local" && project.Runner != "" {
+		return nil
 	}
 	if _, err := resolveRunExecutionTarget(project.Path, cfg.ExecutionTarget); err != nil {
 		return err
@@ -4246,9 +4434,12 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	if project.Runner != "wsl-local" {
-		writeError(w, http.StatusConflict, errors.New("远程项目启动尚未支持"))
-		return
+	if project.Runner != "wsl-local" && project.Runner != "" {
+		// SSH 等远程项目：校验 runner 在线，由 projectRunManagerForExistingProject 负责。
+		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
+			writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})
+			return
+		}
 	}
 
 	// 加载已保存配置
@@ -4328,9 +4519,11 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	if project.Runner != "wsl-local" {
-		writeError(w, http.StatusConflict, errors.New("远程项目启动尚未支持"))
-		return
+	if project.Runner != "wsl-local" && project.Runner != "" {
+		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
+			writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})
+			return
+		}
 	}
 	cfg, err := s.loadRunConfig(r.Context(), projectID)
 	if err != nil {

@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const maxCodexDiagnosticBytes = 4 * 1024
@@ -238,7 +241,7 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	}()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); readCodexJSONL(stdout, sink) }()
+	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, request.ProjectPath) }()
 	go func() { defer wg.Done(); readCodexStderr(stderr, sink) }()
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
@@ -260,7 +263,7 @@ func codexSandbox(policy string) (string, error) {
 	}
 }
 
-func readCodexJSONL(reader io.Reader, sink AgentRunSink) {
+func readCodexJSONL(reader io.Reader, sink AgentRunSink, projectPath string) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
@@ -273,15 +276,28 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink) {
 			Type     string `json:"type"`
 			ThreadID string `json:"thread_id"`
 			Item     struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
+				Type    string `json:"type"`
+				Text    string `json:"text"`
+				Changes []struct {
+					Path string `json:"path"`
+					Kind string `json:"kind"`
+				} `json:"changes"`
 			} `json:"item"`
 		}
 		if err := json.Unmarshal(line, &event); err != nil {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 			continue
 		}
-		sink.Event(event.Type, line)
+		// When running locally, enrich file_change items with the actual file
+		// content or git diff so the UI can show what changed. SSH runners
+		// pass an empty projectPath and skip this — the files are remote.
+		emitted := line
+		if projectPath != "" && event.Type == "item.completed" && event.Item.Type == "file_change" && len(event.Item.Changes) > 0 {
+			if enriched := enrichCodexFileChange(line, projectPath); enriched != nil {
+				emitted = enriched
+			}
+		}
+		sink.Event(event.Type, emitted)
 		if event.Type == "thread.started" && event.ThreadID != "" {
 			sink.SessionIdentified(event.ThreadID)
 			sink.SessionInitialized()
@@ -365,4 +381,176 @@ func codexDiagnostic(value string) string {
 		return value
 	}
 	return value[:maxCodexDiagnosticBytes] + "... [TRUNCATED]"
+}
+
+// maxCodexFileDiffBytes bounds the amount of file content/diff we attach to
+// file_change events so a single huge file cannot blow up the event payload.
+const maxCodexFileDiffBytes = 64 * 1024
+
+// enrichCodexFileChange attaches the actual file content or git diff to a
+// file_change item so the UI can show what Codex modified. It re-serializes
+// the payload with an added "diff" field on each change. Returns nil if the
+// payload cannot be processed.
+func enrichCodexFileChange(line json.RawMessage, projectPath string) json.RawMessage {
+	var payload map[string]any
+	if err := json.Unmarshal(line, &payload); err != nil {
+		return nil
+	}
+	itemRaw, ok := payload["item"]
+	if !ok {
+		return nil
+	}
+	item, ok := itemRaw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	changesRaw, ok := item["changes"].([]any)
+	if !ok {
+		return nil
+	}
+	absProject, err := filepath.Abs(projectPath)
+	if err != nil {
+		return nil
+	}
+	gitDir := filepath.Join(absProject, ".git")
+	for _, changeRaw := range changesRaw {
+		change, ok := changeRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		path, _ := change["path"].(string)
+		if path == "" {
+			continue
+		}
+		kind, _ := change["kind"].(string)
+		diff := codexFileChangeDiff(absProject, gitDir, path, kind)
+		if diff != "" {
+			// Redact sensitive values (API keys, tokens, auth paths) that may
+			// appear in file contents or git diff output. The original JSONL
+			// was sanitized by sanitizeCodexJSONL, but the diff we just read
+			// from disk has never been through redaction.
+			change["diff"] = redactCodexText(diff)
+		}
+	}
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return result
+}
+
+// codexFileChangeDiff returns the content to display for a single file change:
+//   - add: the full file content (if small enough)
+//   - modify: a git diff against HEAD
+//   - delete: a placeholder marker
+// The path may be relative or absolute; the resolved path (with symlinks
+// evaluated) must stay inside the project root to prevent directory-traversal
+// and symlink-based information leaks.
+func codexFileChangeDiff(projectRoot, gitDir, changePath, kind string) string {
+	cleanRoot := filepath.Clean(projectRoot)
+	var absPath string
+	if filepath.IsAbs(changePath) {
+		absPath = filepath.Clean(changePath)
+	} else {
+		absPath = filepath.Clean(filepath.Join(cleanRoot, changePath))
+	}
+	// Evaluate symlinks so a symlink pointing outside the project root cannot
+	// leak arbitrary file contents through the diff field.
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+		absPath = resolved
+	}
+	if !isWithinPath(absPath, cleanRoot) {
+		return ""
+	}
+	relPath, err := filepath.Rel(cleanRoot, absPath)
+	if err != nil {
+		return ""
+	}
+	switch kind {
+	case "add":
+		content, err := os.ReadFile(absPath)
+		if err != nil {
+			return ""
+		}
+		if !isProbablyText(content) {
+			return "（二进制文件，无法预览）"
+		}
+		if len(content) > maxCodexFileDiffBytes {
+			return truncateUTF8(string(content), maxCodexFileDiffBytes) + "\n... [已截断]"
+		}
+		return string(content)
+	case "modify":
+		return codexGitDiff(gitDir, projectRoot, relPath)
+	case "delete":
+		return "（文件已删除）"
+	default:
+		return codexGitDiff(gitDir, projectRoot, relPath)
+	}
+}
+
+// isWithinPath reports whether target is equal to or nested inside root.
+// It handles the root-"/" edge case where appending a separator would
+// produce "//" and break the prefix check.
+func isWithinPath(target, root string) bool {
+	if target == root {
+		return true
+	}
+	if root == string(filepath.Separator) {
+		return strings.HasPrefix(target, root)
+	}
+	return strings.HasPrefix(target, root+string(filepath.Separator))
+}
+
+// codexGitDiff runs `git diff HEAD -- <path>` in the project root and returns
+// the patch output. Returns an empty string if git is unavailable, the
+// repository has no HEAD (freshly initialised), or the diff is empty.
+func codexGitDiff(gitDir, projectRoot, relPath string) string {
+	if _, err := os.Stat(gitDir); err != nil {
+		return ""
+	}
+	cmd := exec.Command("git", "-C", projectRoot, "diff", "HEAD", "--", relPath)
+	// Isolate from user/system gitconfig: diff.external and other hooks could
+	// otherwise execute arbitrary commands or alter diff output.
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	if len(out) > maxCodexFileDiffBytes {
+		return truncateUTF8(string(out), maxCodexFileDiffBytes) + "\n... [已截断]"
+	}
+	return string(out)
+}
+
+// truncateUTF8 cuts the string to at most maxBytes, backing up to the last
+// valid UTF-8 rune boundary so we never split a multi-byte character.
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// Walk backward from the boundary to find a valid rune start.
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// isProbablyText checks whether the byte slice looks like text (no NUL bytes
+// in the first 512 bytes), mirroring how git and file(1) distinguish text
+// from binary.
+func isProbablyText(data []byte) bool {
+	limit := len(data)
+	if limit > 512 {
+		limit = 512
+	}
+	for i := 0; i < limit; i++ {
+		if data[i] == 0 {
+			return false
+		}
+	}
+	return true
 }

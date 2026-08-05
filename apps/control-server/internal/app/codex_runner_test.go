@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type codexPayloadSink struct {
@@ -25,7 +26,7 @@ func (sink *codexPayloadSink) Event(eventType string, payload json.RawMessage) {
 
 func TestReadCodexJSONLStoresThreadAndAssistantText(t *testing.T) {
 	sink := &recordingSink{}
-	readCodexJSONL(strings.NewReader("{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n"), sink)
+	readCodexJSONL(strings.NewReader("{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n"), sink, "")
 	if len(sink.sessions) != 1 || sink.sessions[0] != "thread-1" {
 		t.Fatalf("sessions = %#v", sink.sessions)
 	}
@@ -36,7 +37,7 @@ func TestReadCodexJSONLStoresThreadAndAssistantText(t *testing.T) {
 
 func TestCodexOutputRedactsSensitiveValues(t *testing.T) {
 	sink := &codexPayloadSink{}
-	readCodexJSONL(strings.NewReader(`{"type":"item.completed","item":{"type":"agent_message","text":"OPENAI_API_KEY=sk-message-secret-value Authorization: Bearer bearer-message-secret"},"api_key":"json-secret","auth_path":"/home/alice/.codex/auth.json","environment":{"CODEX_HOME":"/home/alice/.codex"}}`+"\n"), sink)
+	readCodexJSONL(strings.NewReader(`{"type":"item.completed","item":{"type":"agent_message","text":"OPENAI_API_KEY=sk-message-secret-value Authorization: Bearer bearer-message-secret"},"api_key":"json-secret","auth_path":"/home/alice/.codex/auth.json","environment":{"CODEX_HOME":"/home/alice/.codex"}}`+"\n"), sink, "")
 	readCodexStderr(strings.NewReader("OPENAI_API_KEY=stderr-secret\nAuthorization: Bearer bearer-stderr-secret\nCODEX_HOME=/home/alice/.codex\n"), sink)
 
 	sink.mu.Lock()
@@ -143,5 +144,120 @@ func TestCodexRunForceTerminatesCancelledProcess(t *testing.T) {
 		}
 	case <-time.After(7 * time.Second):
 		t.Fatal("cancelled Codex process was not force terminated")
+	}
+}
+
+func TestEnrichCodexFileChangeAttachesContentForAdd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello world\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	payload := json.RawMessage(`{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"hello.txt","kind":"add"}],"status":"completed"}}`)
+	enriched := enrichCodexFileChange(payload, dir)
+	if enriched == nil {
+		t.Fatal("enrichCodexFileChange returned nil")
+	}
+	var decoded struct {
+		Item struct {
+			Changes []struct {
+				Path string `json:"path"`
+				Kind string `json:"kind"`
+				Diff string `json:"diff"`
+			} `json:"changes"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(enriched, &decoded); err != nil {
+		t.Fatalf("decode enriched: %v", err)
+	}
+	if len(decoded.Item.Changes) != 1 || decoded.Item.Changes[0].Diff != "hello world\n" {
+		t.Fatalf("enriched changes = %+v", decoded.Item.Changes)
+	}
+}
+
+func TestEnrichCodexFileChangeRejectsPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret\n"), 0o644)
+	payload := json.RawMessage(`{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"../secret.txt","kind":"add"}],"status":"completed"}}`)
+	enriched := enrichCodexFileChange(payload, dir)
+	var decoded struct {
+		Item struct {
+			Changes []struct {
+				Diff string `json:"diff"`
+			} `json:"changes"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(enriched, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded.Item.Changes) == 1 && decoded.Item.Changes[0].Diff != "" {
+		t.Fatalf("path escape should not attach diff, got %q", decoded.Item.Changes[0].Diff)
+	}
+}
+
+func TestEnrichCodexFileChangeSkipsWhenProjectPathEmpty(t *testing.T) {
+	payload := json.RawMessage(`{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"hello.txt","kind":"add"}],"status":"completed"}}`)
+	// readCodexJSONL with empty projectPath should NOT enrich — the event stays verbatim.
+	sink := &codexPayloadSink{}
+	readCodexJSONL(strings.NewReader(string(payload)+"\n"), sink, "")
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.payloads) != 1 || strings.Contains(sink.payloads[0], `"diff"`) {
+		t.Fatalf("empty projectPath should not enrich, payloads=%#v", sink.payloads)
+	}
+}
+
+func TestEnrichCodexFileChangeRedactsSecretsInDiff(t *testing.T) {
+	dir := t.TempDir()
+	// File content contains a bearer token that redactCodexText should scrub.
+	secret := "Authorization: Bearer sk-test-secret-value-12345"
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(secret), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	payload := json.RawMessage(`{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":".env","kind":"add"}],"status":"completed"}}`)
+	enriched := enrichCodexFileChange(payload, dir)
+	if enriched == nil {
+		t.Fatal("enrichCodexFileChange returned nil")
+	}
+	if strings.Contains(string(enriched), "sk-test-secret-value-12345") {
+		t.Fatalf("secret value leaked into enriched payload: %s", enriched)
+	}
+	if !strings.Contains(string(enriched), "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in enriched payload: %s", enriched)
+	}
+}
+
+func TestEnrichCodexFileChangeRejectsSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	// Create a file outside the project root.
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("top secret\n"), 0o644); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	// Create a symlink inside the project pointing to the outside file.
+	linkPath := filepath.Join(dir, "leaked.txt")
+	if err := os.Symlink(outsideFile, linkPath); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	payload := json.RawMessage(`{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"leaked.txt","kind":"add"}],"status":"completed"}}`)
+	enriched := enrichCodexFileChange(payload, dir)
+	if enriched == nil {
+		t.Fatal("enrichCodexFileChange returned nil")
+	}
+	if strings.Contains(string(enriched), "top secret") {
+		t.Fatalf("symlink escape leaked outside file content: %s", enriched)
+	}
+}
+
+func TestTruncateUTF8PreservesCharBoundary(t *testing.T) {
+	// "你好" is 6 bytes (3 bytes per CJK char). Truncating at 4 bytes
+	// should back up to 3 bytes to keep the first character intact.
+	s := "你好你好"
+	truncated := truncateUTF8(s, 4)
+	if !utf8.ValidString(truncated) {
+		t.Fatalf("truncated string is not valid UTF-8: %q", truncated)
+	}
+	if truncated != "你" {
+		t.Fatalf("truncated = %q, want %q", truncated, "你")
 	}
 }

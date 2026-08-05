@@ -252,6 +252,79 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 			accumulator.contextWindow = usage.ContextWindow
 		}
 		return true
+	case "item.started":
+		// Codex emits item.started/item.completed for command_execution and
+		// file_change. Count each tool invocation once, on the started event,
+		// using the stable item id as the dedup key.
+		var event struct {
+			Item struct {
+				ID   string `json:"id"`
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		if json.Unmarshal(payload, &event) != nil {
+			return false
+		}
+		if event.Item.Type != "command_execution" && event.Item.Type != "file_change" {
+			return false
+		}
+		if event.Item.ID == "" {
+			return false
+		}
+		if _, exists := accumulator.toolIDs[event.Item.ID]; exists {
+			return false
+		}
+		accumulator.toolIDs[event.Item.ID] = struct{}{}
+		accumulator.toolCalls++
+		return true
+	case "item.completed":
+		// Codex agent_message items are model steps. Dedup by item id.
+		var event struct {
+			Item struct {
+				ID   string `json:"id"`
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		if json.Unmarshal(payload, &event) != nil || event.Item.Type != "agent_message" {
+			return false
+		}
+		if event.Item.ID == "" {
+			return false
+		}
+		if _, exists := accumulator.messageIDs[event.Item.ID]; exists {
+			return false
+		}
+		accumulator.messageIDs[event.Item.ID] = struct{}{}
+		accumulator.modelSteps++
+		return true
+	case "turn.completed":
+		// Codex emits a usage block at the end of each turn. The usage fields
+		// are per-turn (not cumulative across the run), so each turn's tokens
+		// must be accumulated. contextInput is a snapshot of the latest turn's
+		// prompt size — it reflects the maximum context used and should NOT be
+		// accumulated.
+		var event struct {
+			Usage struct {
+				InputTokens           int64 `json:"input_tokens"`
+				OutputTokens          int64 `json:"output_tokens"`
+				CachedInputTokens     int64 `json:"cached_input_tokens"`
+				CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(payload, &event) != nil {
+			return false
+		}
+		accumulator.inputTokens += event.Usage.InputTokens
+		accumulator.outputTokens += event.Usage.OutputTokens
+		accumulator.cacheRead += event.Usage.CachedInputTokens
+		accumulator.cacheCreation += event.Usage.CacheWriteInputTokens
+		// contextInput is the latest turn's prompt size (a snapshot), not a
+		// cumulative total. Later turns have larger prompts, so keeping the
+		// latest value approximates peak context-window utilisation.
+		accumulator.contextInput = contextSnapshotTokens(event.Usage.InputTokens, event.Usage.CachedInputTokens, event.Usage.CacheWriteInputTokens)
+		accumulator.hasResult = true
+		accumulator.agentTurns++
+		return true
 	}
 	return false
 }
@@ -309,16 +382,12 @@ func (s *Server) liveRunUsage(runID string, status string) *RunUsage {
 
 func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
-	var agentID string
-	if err := s.db.QueryRowContext(r.Context(), `select agent_id from conversations where id=?`, conversationID).Scan(&agentID); errors.Is(err, sql.ErrNoRows) {
+	var exists string
+	if err := s.db.QueryRowContext(r.Context(), `select id from conversations where id=?`, conversationID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
 	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if agentID == "codex" {
-		writeJSON(w, http.StatusOK, ConversationUsageResponse{ConversationID: conversationID, Available: false, Reason: "Codex CLI 未提供可验证的 Token、上下文或费用统计。"})
 		return
 	}
 	response := ConversationUsageResponse{ConversationID: conversationID, Available: true}
@@ -405,16 +474,12 @@ func (s *Server) getConversationUsage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getRunUsage(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
-	var status, conversationID, agentID string
-	if err := s.db.QueryRowContext(r.Context(), `select r.status,r.conversation_id,c.agent_id from runs r join conversations c on c.id=r.conversation_id where r.id=?`, runID).Scan(&status, &conversationID, &agentID); errors.Is(err, sql.ErrNoRows) {
+	var status, conversationID string
+	if err := s.db.QueryRowContext(r.Context(), `select r.status,r.conversation_id from runs r join conversations c on c.id=r.conversation_id where r.id=?`, runID).Scan(&status, &conversationID); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("run not found"))
 		return
 	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if agentID == "codex" {
-		writeJSON(w, http.StatusOK, RunUsage{RunID: runID, ConversationID: conversationID, Available: false, Reason: "Codex CLI 未提供可验证的 Token、上下文或费用统计。", Status: status})
 		return
 	}
 	if live := s.liveRunUsage(runID, status); live != nil {

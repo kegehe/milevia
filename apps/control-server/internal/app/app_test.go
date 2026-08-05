@@ -623,7 +623,7 @@ func TestUnavailableCodexCannotCreateConversation(t *testing.T) {
 	}
 }
 
-func TestCodexUsageIsExplicitlyUnavailable(t *testing.T) {
+func TestCodexUsageCollectedFromEvents(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC()
 	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, server.config.AllowedRoot, now); err != nil {
@@ -632,7 +632,13 @@ func TestCodexUsageIsExplicitlyUnavailable(t *testing.T) {
 	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values ('conversation','project','legacy','codex','thread-1','wsl-local','read_only','idle','read_only','Codex',?,0,1,1,?)`, now, now); err != nil {
 		t.Fatalf("insert conversation: %v", err)
 	}
-	server.codexRunner = runnerFunc(func(_ context.Context, _ AgentRunRequest, _ AgentRunSink) error { return nil })
+	server.codexRunner = runnerFunc(func(_ context.Context, _ AgentRunRequest, sink AgentRunSink) error {
+		// Two turns with independent per-turn usage. The accumulator must
+		// sum them, not overwrite with the last turn's values.
+		sink.Event("turn.completed", json.RawMessage(`{"usage":{"input_tokens":1000,"output_tokens":50,"cached_input_tokens":800,"cache_write_input_tokens":0}}`))
+		sink.Event("turn.completed", json.RawMessage(`{"usage":{"input_tokens":3000,"output_tokens":150,"cached_input_tokens":2000,"cache_write_input_tokens":100}}`))
+		return nil
+	})
 	response := httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", strings.NewReader(`{"content":"检查项目"}`)))
 	if response.Code != http.StatusAccepted {
@@ -647,8 +653,8 @@ func TestCodexUsageIsExplicitlyUnavailable(t *testing.T) {
 	if err := server.db.QueryRow(`select count(*) from run_usage where run_id=?`, runID).Scan(&usageRows); err != nil {
 		t.Fatalf("count usage: %v", err)
 	}
-	if usageRows != 0 {
-		t.Fatalf("Codex usage rows=%d, want 0", usageRows)
+	if usageRows != 1 {
+		t.Fatalf("Codex usage rows=%d, want 1 (turn.completed should persist usage)", usageRows)
 	}
 	response = httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation/usage", nil))
@@ -659,8 +665,24 @@ func TestCodexUsageIsExplicitlyUnavailable(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&usage); err != nil {
 		t.Fatalf("decode usage: %v", err)
 	}
-	if usage.Available || usage.Reason == "" {
-		t.Fatalf("usage=%#v", usage)
+	if !usage.Available {
+		t.Fatalf("Codex usage should be available, got reason=%q", usage.Reason)
+	}
+	// Two turns: 1000 + 3000 = 4000 input, 50 + 150 = 200 output.
+	if usage.Session.InputTokens != 4000 {
+		t.Fatalf("session input tokens=%d, want 4000 (sum of two turns)", usage.Session.InputTokens)
+	}
+	if usage.Session.OutputTokens != 200 {
+		t.Fatalf("session output tokens=%d, want 200 (sum of two turns)", usage.Session.OutputTokens)
+	}
+	if usage.Session.CacheReadTokens != 2800 {
+		t.Fatalf("session cache read tokens=%d, want 2800 (800+2000)", usage.Session.CacheReadTokens)
+	}
+	if usage.Session.CacheCreationTokens != 100 {
+		t.Fatalf("session cache creation tokens=%d, want 100 (0+100)", usage.Session.CacheCreationTokens)
+	}
+	if usage.Session.AgentTurns != 2 {
+		t.Fatalf("session agent turns=%d, want 2", usage.Session.AgentTurns)
 	}
 }
 
@@ -4172,6 +4194,215 @@ func seedTaskConversation(t *testing.T) (*Server, string, string) {
 	return server, projectID, conversationID
 }
 
+
+func enableOrchestrationForTest(t *testing.T, server *Server, projectID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,1,'main','dev','["true"]',3,'',?) on conflict(project_id) do update set enabled=1,verification_commands='["true"]',frozen_reason=''`, projectID, now); err != nil {
+		t.Fatalf("enable orchestration: %v", err)
+	}
+}
+
+func queuePositionForTest(t *testing.T, server *Server, taskID string) int {
+	t.Helper()
+	var position int
+	if err := server.db.QueryRow(`select queue_position from task_orchestration_jobs where task_id=?`, taskID).Scan(&position); err != nil {
+		t.Fatalf("load queue position for %s: %v", taskID, err)
+	}
+	return position
+}
+
+func TestEnqueueBatchAddsTasksInOrder(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "batch A")
+	taskB := createTaskForTest(t, server.routes(), projectID, "batch B")
+	taskC := createTaskForTest(t, server.routes(), projectID, "batch C")
+	body := fmt.Sprintf(`{"taskIds":["%s","%s","%s"]}`, taskA, taskB, taskC)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/enqueue-batch", bytes.NewBufferString(body)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("enqueue-batch: %d body=%s", response.Code, response.Body.String())
+	}
+	if got := queuePositionForTest(t, server, taskA); got != 1 {
+		t.Fatalf("taskA position=%d want 1", got)
+	}
+	if got := queuePositionForTest(t, server, taskB); got != 2 {
+		t.Fatalf("taskB position=%d want 2", got)
+	}
+	if got := queuePositionForTest(t, server, taskC); got != 3 {
+		t.Fatalf("taskC position=%d want 3", got)
+	}
+}
+
+func TestEnqueueBatchRejectsDuplicates(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "dup A")
+	body := fmt.Sprintf(`{"taskIds":["%s","%s"]}`, taskA, taskA)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/enqueue-batch", bytes.NewBufferString(body)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate enqueue-batch: %d want 400", response.Code)
+	}
+}
+
+func TestEnqueueBatchRejectsIneligibleTaskAsConflict(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "eligible")
+	taskB := createTaskForTest(t, server.routes(), projectID, "ineligible")
+	if _, err := server.db.Exec(`update tasks set status='running' where id=?`, taskB); err != nil {
+		t.Fatalf("mark task running: %v", err)
+	}
+	body := fmt.Sprintf(`{"taskIds":["%s","%s"]}`, taskA, taskB)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/enqueue-batch", bytes.NewBufferString(body)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("ineligible enqueue-batch: %d want 409", response.Code)
+	}
+}
+
+func TestEnqueueBatchRejectsUnknownTaskAsNotFound(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	body := `{"taskIds":["00000000-0000-0000-0000-000000000000"]}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/enqueue-batch", bytes.NewBufferString(body)))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("unknown enqueue-batch: %d want 404", response.Code)
+	}
+}
+
+func TestEnqueueBatchRejectsForeignTaskAsBadRequest(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	// Create a task under a different project.
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('other','other',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert other project: %v", err)
+	}
+	foreignTask := createTaskForTest(t, server.routes(), "other", "foreign")
+	body := fmt.Sprintf(`{"taskIds":["%s"]}`, foreignTask)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/enqueue-batch", bytes.NewBufferString(body)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("foreign enqueue-batch: %d want 400", response.Code)
+	}
+}
+
+func TestDequeueRemovesQueuedTaskAndCompactsPositions(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "dequeue A")
+	taskB := createTaskForTest(t, server.routes(), projectID, "dequeue B")
+	taskC := createTaskForTest(t, server.routes(), projectID, "dequeue C")
+	now := time.Now().UTC()
+	for i, id := range []string{taskA, taskB, taskC} {
+		if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,'queued','{}',?,?)`, fmt.Sprintf("job-%d", i), projectID, id, i+1, now, now); err != nil {
+			t.Fatalf("insert job: %v", err)
+		}
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/tasks/"+taskB+"/orchestration/dequeue", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("dequeue: %d body=%s", response.Code, response.Body.String())
+	}
+	var count int
+	if err := server.db.QueryRow(`select count(*) from task_orchestration_jobs where task_id=?`, taskB).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("dequeued task still has a job")
+	}
+	if got := queuePositionForTest(t, server, taskA); got != 1 {
+		t.Fatalf("taskA position=%d want 1 after compact", got)
+	}
+	if got := queuePositionForTest(t, server, taskC); got != 2 {
+		t.Fatalf("taskC position=%d want 2 after compact", got)
+	}
+}
+
+func TestDequeueRefusesRunningJob(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "running dequeue")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job','project',?,1,'implementing','{}',?,?)`, taskA, now, now); err != nil {
+		t.Fatalf("insert job: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/tasks/"+taskA+"/orchestration/dequeue", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("dequeue implementing: %d want 409", response.Code)
+	}
+}
+
+func TestDequeueTargetsActiveJobAmongStaleRecords(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "finished task")
+	now := time.Now().UTC()
+	// A finished (integrated_to_dev) job: the task is not in the active queue,
+	// so dequeue should report it as not queued rather than refusing.
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('stale','project',?,1,'integrated_to_dev','{}',?,?)`, taskA, now, now); err != nil {
+		t.Fatalf("insert finished job: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/tasks/"+taskA+"/orchestration/dequeue", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("dequeue finished task: %d want 404 body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestReorderReordersQueuedTasks(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "reorder A")
+	taskB := createTaskForTest(t, server.routes(), projectID, "reorder B")
+	taskC := createTaskForTest(t, server.routes(), projectID, "reorder C")
+	now := time.Now().UTC()
+	for i, id := range []string{taskA, taskB, taskC} {
+		if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,'queued','{}',?,?)`, fmt.Sprintf("job-%d", i), projectID, id, i+1, now, now); err != nil {
+			t.Fatalf("insert job: %v", err)
+		}
+	}
+	body := fmt.Sprintf(`{"taskIds":["%s","%s","%s"]}`, taskC, taskA, taskB)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/projects/"+projectID+"/orchestration/order", bytes.NewBufferString(body)))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("reorder: %d body=%s", response.Code, response.Body.String())
+	}
+	if got := queuePositionForTest(t, server, taskC); got != 1 {
+		t.Fatalf("taskC position=%d want 1", got)
+	}
+	if got := queuePositionForTest(t, server, taskA); got != 2 {
+		t.Fatalf("taskA position=%d want 2", got)
+	}
+	if got := queuePositionForTest(t, server, taskB); got != 3 {
+		t.Fatalf("taskB position=%d want 3", got)
+	}
+}
+
+func TestReorderRejectsPartialList(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskA := createTaskForTest(t, server.routes(), projectID, "partial A")
+	taskB := createTaskForTest(t, server.routes(), projectID, "partial B")
+	now := time.Now().UTC()
+	for i, id := range []string{taskA, taskB} {
+		if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,'queued','{}',?,?)`, fmt.Sprintf("job-%d", i), projectID, id, i+1, now, now); err != nil {
+			t.Fatalf("insert job: %v", err)
+		}
+	}
+	body := fmt.Sprintf(`{"taskIds":["%s"]}`, taskA)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/projects/"+projectID+"/orchestration/order", bytes.NewBufferString(body)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("partial reorder: %d want 400", response.Code)
+	}
+}
+
 func TestOrchestrationDispatchLinksIntentAndRunInOneTransaction(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
@@ -4431,20 +4662,20 @@ func TestGitStageTreatsShortMagicFileNamesLiterally(t *testing.T) {
 	writeGitTestFile(t, repo, ":!excluded.txt", "special\n")
 	runGitForTest(t, repo, "add", "ordinary.txt")
 
-	if err := newGitRunner().(*gitCLIRunner).Stage(context.Background(), repo, []string{":!excluded.txt"}); err != nil {
+	if err := newGitRunner().Stage(context.Background(), repo, []string{":!excluded.txt"}); err != nil {
 		t.Fatalf("stage literal short-magic filename: %v", err)
 	}
-	staged, err := newGitRunner().(*gitCLIRunner).command(context.Background(), repo, "diff", "--cached", "--name-only")
+	staged, err := newGitRunner().runGit(context.Background(), repo, "diff", "--cached", "--name-only")
 	if err != nil {
 		t.Fatalf("read staged paths: %v", err)
 	}
 	if string(staged) != ":!excluded.txt\nordinary.txt\n" {
 		t.Fatalf("staged paths=%q, want both literal selected and ordinary filenames", staged)
 	}
-	if err := newGitRunner().(*gitCLIRunner).Unstage(context.Background(), repo, []string{":!excluded.txt"}); err != nil {
+	if err := newGitRunner().Unstage(context.Background(), repo, []string{":!excluded.txt"}); err != nil {
 		t.Fatalf("unstage literal short-magic filename: %v", err)
 	}
-	staged, err = newGitRunner().(*gitCLIRunner).command(context.Background(), repo, "diff", "--cached", "--name-only")
+	staged, err = newGitRunner().runGit(context.Background(), repo, "diff", "--cached", "--name-only")
 	if err != nil {
 		t.Fatalf("read staged paths after unstage: %v", err)
 	}
@@ -4459,7 +4690,7 @@ func TestGitCommandTimeoutTerminatesItsProcessGroup(t *testing.T) {
 	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("MARKER", marker)
 
-	_, err := (&gitCLIRunner{timeout: 40 * time.Millisecond}).command(context.Background(), t.TempDir(), "status")
+	_, err := (&gitCLIRunner{timeout: 40 * time.Millisecond, backend: &localGitBackend{timeout: 40 * time.Millisecond}}).runGit(context.Background(), t.TempDir(), "status")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout error: %v", err)
 	}
@@ -4473,7 +4704,7 @@ func TestGitCommandStopsWhenCombinedOutputExceedsLimit(t *testing.T) {
 	git := writeFakeGit(t, "head -c 1049600 /dev/zero\n")
 	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	_, err := newGitRunner().(*gitCLIRunner).command(context.Background(), t.TempDir(), "status")
+	_, err := newGitRunner().runGit(context.Background(), t.TempDir(), "status")
 	if !errors.Is(err, errGitOutputTooLarge) {
 		t.Fatalf("output limit error: %v", err)
 	}
@@ -4980,11 +5211,6 @@ func TestRemoveUntrackedFromRootRejectsAnEscapingSymlink(t *testing.T) {
 	outside := t.TempDir()
 	writeGitTestFile(t, repo, "nested/remove.txt", "inside\n")
 	writeGitTestFile(t, outside, "remove.txt", "outside\n")
-	root, err := os.OpenRoot(repo)
-	if err != nil {
-		t.Fatalf("open root: %v", err)
-	}
-	defer root.Close()
 	if err := os.Rename(filepath.Join(repo, "nested"), filepath.Join(repo, "nested-real")); err != nil {
 		t.Fatalf("rename nested directory: %v", err)
 	}
@@ -4992,10 +5218,11 @@ func TestRemoveUntrackedFromRootRejectsAnEscapingSymlink(t *testing.T) {
 		t.Fatalf("create escaping symlink: %v", err)
 	}
 
-	if err := validateUntrackedRemovalInRoot(root, []string{"nested/remove.txt"}); err == nil {
+	backend := newLocalGitBackend()
+	if err := backend.validateUntrackedRemoval(repo, []string{"nested/remove.txt"}); err == nil {
 		t.Fatal("validation through escaping symlink unexpectedly succeeded")
 	}
-	if err := removeUntrackedFromRoot(root, []string{"nested/remove.txt"}); err == nil {
+	if err := backend.removeUntracked(repo, []string{"nested/remove.txt"}); err == nil {
 		t.Fatal("removal through escaping symlink unexpectedly succeeded")
 	}
 	content, err := os.ReadFile(filepath.Join(outside, "remove.txt"))
@@ -5030,7 +5257,7 @@ func TestExecuteGitOperationNeedsAttentionWhenResultCannotBeVerified(t *testing.
 	repo := t.TempDir()
 	seedGitProjectForTest(t, server, "git-project", repo)
 
-	result, err := server.executeGitOperation(context.Background(), "git-project", repo, "stage", "stage file", GitSnapshot{}, func() error {
+	result, err := server.executeGitOperation(context.Background(), newGitRunner(), "git-project", repo, "stage", "stage file", GitSnapshot{}, func(GitRunner) error {
 		return nil
 	})
 	if err != nil {
@@ -5054,7 +5281,7 @@ func TestExecuteGitOperationReturnsNeedsAttentionWhenAuditCannotBeSaved(t *testi
 	repo := newTempGitRepository(t)
 	seedGitProjectForTest(t, server, "git-project", repo)
 
-	result, err := server.executeGitOperation(context.Background(), "git-project", repo, "stage", "stage file", GitSnapshot{}, func() error {
+	result, err := server.executeGitOperation(context.Background(), newGitRunner(), "git-project", repo, "stage", "stage file", GitSnapshot{}, func(GitRunner) error {
 		return server.db.Close()
 	})
 	if err != nil {
@@ -6435,6 +6662,136 @@ func TestProjectGitCreateBranchValidatesName(t *testing.T) {
 		server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/branches", bytes.NewBufferString(`{"name":"`+name+`"}`)))
 		if create.Code != http.StatusBadRequest {
 			t.Logf("name=%q status=%d body=%s", name, create.Code, create.Body.String())
+		}
+	}
+}
+
+// codexCapableStubRunner is a test double for an SSH runner that also runs
+// Codex on the remote host. It implements both AgentRunner and CodexCapableRunner.
+type codexCapableStubRunner struct {
+	runnerFunc
+	codexReady   bool
+	codexVersion string
+}
+
+func (r codexCapableStubRunner) CodexReady(context.Context) bool        { return r.codexReady }
+func (r codexCapableStubRunner) CodexVersion(context.Context) string    { return r.codexVersion }
+func (r codexCapableStubRunner) CodexCheckUpdate(context.Context) (bool, string, error) {
+	return false, r.codexVersion, nil
+}
+func (r codexCapableStubRunner) CodexUpdate(context.Context) (string, string, error) {
+	return r.codexVersion, r.codexVersion, nil
+}
+
+func TestListRunnersReportsCodexOnSSHCodexCapableRunner(t *testing.T) {
+	server := newTestServer(t)
+	stub := codexCapableStubRunner{
+		runnerFunc:   runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }),
+		codexReady:   true,
+		codexVersion: "0.146.0",
+	}
+	server.runnerRegistry.register("ssh-codex", stub, RunnerMeta{ID: "ssh-codex", Name: "tencent-host", Environment: "remote-linux"})
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/runners", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list runners: %d body=%s", response.Code, response.Body.String())
+	}
+	var raw []map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode runners: %v", err)
+	}
+	for _, entry := range raw {
+		if entry["id"] != "ssh-codex" {
+			continue
+		}
+		codex, ok := entry["codex"].(map[string]any)
+		if !ok || codex["status"] != "ready" {
+			t.Fatalf("expected ssh-codex codex ready, got %#v", entry["codex"])
+		}
+		if codex["version"] != "0.146.0" {
+			t.Fatalf("expected codex version 0.146.0, got %v", codex["version"])
+		}
+		return
+	}
+	t.Fatal("ssh-codex runner not found in list")
+}
+
+func TestListRunnersReportsCodexUnavailableOnNonCodexRunner(t *testing.T) {
+	server := newTestServer(t)
+	server.runnerRegistry.register("ssh-plain", runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }), RunnerMeta{ID: "ssh-plain", Name: "plain-host", Environment: "remote-linux"})
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/runners", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list runners: %d body=%s", response.Code, response.Body.String())
+	}
+	var raw []map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode runners: %v", err)
+	}
+	for _, entry := range raw {
+		if entry["id"] != "ssh-plain" {
+			continue
+		}
+		codex, _ := entry["codex"].(map[string]any)
+		if codex["status"] != "unavailable" {
+			t.Fatalf("expected ssh-plain codex unavailable, got %#v", codex)
+		}
+		return
+	}
+	t.Fatal("ssh-plain runner not found in list")
+}
+
+// TestListProjectInputHistory 验证项目级输入历史跨对话聚合，并压缩连续重复项。
+func TestListProjectInputHistory(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	// 两个对话同属一个项目
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('c1','project','00000000-0000-4000-8000-000000000000','idle',1,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation c1: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('c2','project','00000000-0000-4000-8000-000000000001','idle',1,0,?)`, now); err != nil {
+		t.Fatalf("insert conversation c2: %v", err)
+	}
+	// 依次插入用户消息：a, a, b, a（跨两个对话），连续的 a,a 应压缩为一条
+	base := now
+	inserts := []struct {
+		conversation string
+		content      string
+	}{
+		{"c1", "a"}, {"c1", "a"}, {"c1", "b"},
+		{"c2", "b"}, {"c2", "c"},
+	}
+	for index, item := range inserts {
+		at := base.Add(time.Duration(index) * time.Second)
+		if _, err := server.db.Exec(`insert into messages (id,conversation_id,role,content,created_at) values (?,?,?,?,?)`, fmt.Sprintf("m%d", index), item.conversation, "user", item.content, at); err != nil {
+			t.Fatalf("insert message %d: %v", index, err)
+		}
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/project/input-history?limit=100", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var history []string
+	if err := json.NewDecoder(response.Body).Decode(&history); err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+	// 时间线：a, a, b, b, c
+	// 同对话连续 a 被压缩；跨对话连续 b（c1 末尾 + c2 开头）也被压缩
+	// 期望：a, b, c
+	want := []string{"a", "b", "c"}
+	if len(history) != len(want) {
+		t.Fatalf("history=%v want=%v", history, want)
+	}
+	for index, value := range want {
+		if history[index] != value {
+			t.Fatalf("history=%v want=%v", history, want)
 		}
 	}
 }

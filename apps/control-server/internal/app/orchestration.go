@@ -332,6 +332,9 @@ func (s *Server) updateOrchestrationConfig(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, cfg)
 }
 
+// enqueueTaskForOrchestration adds a single task to the project's automatic
+// orchestration queue. The task must be in todo or action_required state and
+// automatic orchestration must be enabled for the project.
 func (s *Server) enqueueTaskForOrchestration(w http.ResponseWriter, r *http.Request) {
 	task, err := s.taskByID(r.Context(), chi.URLParam(r, "taskID"))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -342,51 +345,317 @@ func (s *Server) enqueueTaskForOrchestration(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if task.Status != taskTodo && task.Status != taskActionRequired {
-		writeError(w, http.StatusConflict, errors.New("only todo or action-required tasks can enter the automatic queue"))
-		return
-	}
 	cfg, err := s.orchestrationConfig(r.Context(), task.ProjectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !cfg.Enabled {
-		writeError(w, http.StatusConflict, errors.New("automatic orchestration is not enabled for this project"))
+	job, err := s.enqueueTask(r.Context(), task, cfg)
+	if err != nil {
+		writeError(w, errorStatusForEnqueue(err), err)
 		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
+}
+
+// enqueueTask performs the queue insertion shared by the single and batch
+// enqueue endpoints. It does not write an HTTP response.
+func (s *Server) enqueueTask(ctx context.Context, task Task, cfg OrchestrationConfig) (OrchestrationJob, error) {
+	if task.Status != taskTodo && task.Status != taskActionRequired {
+		return OrchestrationJob{}, errOrchestrationTaskIneligible
+	}
+	if !cfg.Enabled {
+		return OrchestrationJob{}, errOrchestrationDisabled
 	}
 	now := time.Now().UTC()
 	policySnapshot, err := json.Marshal(cfg)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return OrchestrationJob{}, err
 	}
 	job := OrchestrationJob{ID: uuid.NewString(), ProjectID: task.ProjectID, TaskID: task.ID, Status: orchestrationQueued, PolicySnapshot: string(policySnapshot), CreatedAt: now, UpdatedAt: now}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return OrchestrationJob{}, err
+	}
+	defer tx.Rollback()
+	if err = tx.QueryRowContext(ctx, `select coalesce(max(queue_position),0)+1 from task_orchestration_jobs where project_id=?`, task.ProjectID).Scan(&job.Position); err == nil {
+		_, err = tx.ExecContext(ctx, `insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,?,?,?,?)`, job.ID, job.ProjectID, job.TaskID, job.Position, job.Status, job.PolicySnapshot, job.CreatedAt, job.UpdatedAt)
+	}
+	if err == nil {
+		_, err = tx.ExecContext(ctx, `insert into orchestration_outbox (id,project_id,job_id,type,idempotency_key,status,created_at) values (?,?,?,?,?,?,?)`, uuid.NewString(), job.ProjectID, job.ID, "dispatch", "enqueue:"+job.ID, "pending", now)
+	}
+	if err == nil {
+		err = recordTaskEventTx(ctx, tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": job.ID, "position": job.Position}, now)
+	}
+	if err != nil {
+		return OrchestrationJob{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return OrchestrationJob{}, err
+	}
+	s.kickProjectOrchestrator(task.ProjectID)
+	return job, nil
+}
+
+// errorStatusForEnqueue maps enqueue errors to the HTTP status code a handler
+// should return. Business-rule violations are 409; anything else is 500.
+func errorStatusForEnqueue(err error) int {
+	if errors.Is(err, errOrchestrationDisabled) || errors.Is(err, errOrchestrationTaskIneligible) {
+		return http.StatusConflict
+	}
+	if errors.Is(err, errOrchestrationTaskNotFound) {
+		return http.StatusNotFound
+	}
+	if errors.Is(err, errOrchestrationTaskForeign) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+var errOrchestrationDisabled = errors.New("automatic orchestration is not enabled for this project")
+var errOrchestrationTaskIneligible = errors.New("only todo or action-required tasks can enter the automatic queue")
+var errOrchestrationTaskNotFound = errors.New("task not found")
+var errOrchestrationTaskForeign = errors.New("task does not belong to this project")
+
+// enqueueBatchTasks adds multiple tasks to the project's orchestration queue in
+// the order given. Tasks already in the queue are skipped so a partial failure
+// does not double-enqueue. The returned slice mirrors the input order.
+func (s *Server) enqueueBatchTasks(ctx context.Context, projectID string, taskIDs []string) ([]OrchestrationJob, error) {
+	cfg, err := s.orchestrationConfig(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if !cfg.Enabled {
+		return nil, errOrchestrationDisabled
+	}
+	jobs := make([]OrchestrationJob, 0, len(taskIDs))
+	for _, taskID := range taskIDs {
+		task, err := s.taskByID(ctx, taskID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %s", errOrchestrationTaskNotFound, taskID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if task.ProjectID != projectID {
+			return nil, fmt.Errorf("%w: %s", errOrchestrationTaskForeign, taskID)
+		}
+		if s.hasOrchestrationJob(ctx, taskID) {
+			continue // already queued, running, paused, or finished; skip idempotently
+		}
+		job, err := s.enqueueTask(ctx, task, cfg)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
+func (s *Server) enqueueBatchForOrchestration(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.projectExists(r.Context(), projectID) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	var payload struct {
+		TaskIDs []string `json:"taskIds"`
+	}
+	if !decode(w, r, &payload) {
+		return
+	}
+	if len(payload.TaskIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("taskIds must not be empty"))
+		return
+	}
+	if len(payload.TaskIDs) > 100 {
+		writeError(w, http.StatusBadRequest, errors.New("at most 100 tasks can be enqueued at once"))
+		return
+	}
+	seen := make(map[string]bool, len(payload.TaskIDs))
+	for _, id := range payload.TaskIDs {
+		if id == "" {
+			writeError(w, http.StatusBadRequest, errors.New("taskIds contains an empty value"))
+			return
+		}
+		if seen[id] {
+			writeError(w, http.StatusBadRequest, errors.New("taskIds contains duplicates"))
+			return
+		}
+		seen[id] = true
+	}
+	jobs, err := s.enqueueBatchTasks(r.Context(), projectID, payload.TaskIDs)
+	if err != nil {
+		writeError(w, errorStatusForEnqueue(err), err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, jobs)
+}
+
+// dequeueTaskFromOrchestration removes a task from the automatic queue. Only
+// tasks that are queued or paused can be removed — a task already in
+// preparing/implementing/checking may hold a worktree and must not be pulled.
+func (s *Server) dequeueTaskFromOrchestration(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer tx.Rollback()
-	if err = tx.QueryRowContext(r.Context(), `select coalesce(max(queue_position),0)+1 from task_orchestration_jobs where project_id=?`, task.ProjectID).Scan(&job.Position); err == nil {
-		_, err = tx.ExecContext(r.Context(), `insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,?,?,?,?)`, job.ID, job.ProjectID, job.TaskID, job.Position, job.Status, job.PolicySnapshot, job.CreatedAt, job.UpdatedAt)
-	}
-	if err == nil {
-		_, err = tx.ExecContext(r.Context(), `insert into orchestration_outbox (id,project_id,job_id,type,idempotency_key,status,created_at) values (?,?,?,?,?,?,?)`, uuid.NewString(), job.ProjectID, job.ID, "dispatch", "enqueue:"+job.ID, "pending", now)
-	}
-	if err == nil {
-		err = recordTaskEventTx(r.Context(), tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": job.ID, "position": job.Position}, now)
+	var jobID, projectID, status string
+	err = tx.QueryRowContext(r.Context(), `select id,project_id,status from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human') order by updated_at desc limit 1`, taskID).Scan(&jobID, &projectID, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("task is not in the orchestration queue"))
+		return
 	}
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if status != orchestrationQueued && status != orchestrationPaused {
+		writeError(w, http.StatusConflict, fmt.Errorf("cannot remove a task that is %s", status))
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `delete from task_orchestration_jobs where id=?`, jobID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err = s.compactQueuePositionsTx(r.Context(), tx, projectID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err = recordTaskEventTx(r.Context(), tx, taskID, "", "orchestration.dequeued", map[string]any{"jobId": jobID}, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if err = tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.kickProjectOrchestrator(task.ProjectID)
-	writeJSON(w, http.StatusAccepted, job)
+	s.kickProjectOrchestrator(projectID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// compactQueuePositionsTx renumbers every queue row for a project so that
+// queue_position is contiguous starting at 1, preserving the existing order.
+// It must run inside a transaction holding the rows it updates.
+func (s *Server) compactQueuePositionsTx(ctx context.Context, tx *sql.Tx, projectID string) error {
+	rows, err := tx.QueryContext(ctx, `select id from task_orchestration_jobs where project_id=? order by queue_position`, projectID)
+	if err != nil {
+		return err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for index, id := range ids {
+		if _, err = tx.ExecContext(ctx, `update task_orchestration_jobs set queue_position=?,updated_at=? where id=?`, index+1, time.Now().UTC(), id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reorderOrchestrationJobs rewrites the queue order for the queued and paused
+// tasks of a project. Tasks already executing (preparing/implementing/checking)
+// keep their positions and are not part of the supplied list; the supplied
+// tasks are renumbered to follow them.
+func (s *Server) reorderOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.projectExists(r.Context(), projectID) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	var payload struct {
+		TaskIDs []string `json:"taskIds"`
+	}
+	if !decode(w, r, &payload) {
+		return
+	}
+	if len(payload.TaskIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("taskIds must not be empty"))
+		return
+	}
+	seen := make(map[string]bool, len(payload.TaskIDs))
+	for _, id := range payload.TaskIDs {
+		if id == "" {
+			writeError(w, http.StatusBadRequest, errors.New("taskIds contains an empty value"))
+			return
+		}
+		if seen[id] {
+			writeError(w, http.StatusBadRequest, errors.New("taskIds contains duplicates"))
+			return
+		}
+		seen[id] = true
+	}
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	// Fetch the tasks that are eligible for reordering (queued or paused) and
+	// the highest position held by an in-flight job, in one pass.
+	rows, err := tx.QueryContext(r.Context(), `select task_id from task_orchestration_jobs where project_id=? and status in ('queued','paused') order by queue_position`, projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	current := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		current[id] = true
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	rows.Close()
+	for _, id := range payload.TaskIDs {
+		if !current[id] {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("task %s is not queued or paused", id))
+			return
+		}
+	}
+	if len(payload.TaskIDs) != len(current) {
+		writeError(w, http.StatusBadRequest, errors.New("taskIds must include every queued or paused task exactly once"))
+		return
+	}
+	var basePosition int
+	if err = tx.QueryRowContext(r.Context(), `select coalesce(max(queue_position),0) from task_orchestration_jobs where project_id=? and status not in ('queued','paused','integrated_to_dev','released_to_main')`, projectID).Scan(&basePosition); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	now := time.Now().UTC()
+	for offset, taskID := range payload.TaskIDs {
+		if _, err = tx.ExecContext(r.Context(), `update task_orchestration_jobs set queue_position=?,updated_at=? where project_id=? and task_id=? and status in ('queued','paused')`, basePosition+offset+1, now, projectID, taskID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.kickProjectOrchestrator(projectID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) listOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
@@ -650,6 +919,15 @@ func (s *Server) hasActiveOrchestrationJob(ctx context.Context, taskID string) b
 	var active bool
 	err := s.db.QueryRowContext(ctx, `select exists(select 1 from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking'))`, taskID).Scan(&active)
 	return err == nil && active
+}
+
+// hasOrchestrationJob reports whether a task has any orchestration job record at
+// all (active, paused, or terminal). Because task_id is unique on
+// task_orchestration_jobs, any existing row blocks inserting a new one.
+func (s *Server) hasOrchestrationJob(ctx context.Context, taskID string) bool {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `select exists(select 1 from task_orchestration_jobs where task_id=?)`, taskID).Scan(&exists)
+	return err == nil && exists
 }
 
 func (s *Server) orchestrationDependenciesIntegrated(ctx context.Context, taskID string) (bool, error) {

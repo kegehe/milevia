@@ -29,11 +29,6 @@ export interface RunLogPresentation {
 
 const errorLogPattern = /(?:^|\s)(?:error|failed|fatal|panic|exception|traceback)\b|\bERR!|[A-Za-z]+Error(?::|\b)|\b(?:not found|permission denied|exit code \d+|command not found|cannot find|no such file or directory)\b/i;
 const warningLogPattern = /(?:^|\s)(?:warn|warning)\b/i;
-const allowedTechnicalTerms = /\b(?:API|CLI|Git|HTTP|JSON|SSH|URL)\b/g;
-
-function isLocalizedLogText(text: string): boolean {
-	return /[\u4e00-\u9fff]/.test(text) && !/[A-Za-z]{3,}/.test(text.replace(allowedTechnicalTerms, ""));
-}
 
 export function runLogPresentation(entry: Pick<LogEntry, 'stream' | 'text'>): RunLogPresentation {
 	if (entry.stream === 'system') return { label: '系统', tone: 'system' };
@@ -44,10 +39,7 @@ export function runLogPresentation(entry: Pick<LogEntry, 'stream' | 'text'>): Ru
 }
 
 export function runLogText(entry: Pick<LogEntry, 'stream' | 'text'>): string {
-	const presentation = runLogPresentation(entry);
-	if (presentation.tone !== 'is-error' && presentation.label !== '错误输出') return entry.text;
-	if (isLocalizedLogText(entry.text)) return entry.text;
-	return '项目运行出现错误，请检查运行配置和日志后重试。';
+	return entry.text;
 }
 
 export const statusLabels: Record<RunStatus, string> = {
