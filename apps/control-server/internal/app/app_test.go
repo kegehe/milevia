@@ -1839,11 +1839,11 @@ func TestConversationHistoryListsSummariesAndActivatesPriorSession(t *testing.T)
 	if response.Code != http.StatusOK {
 		t.Fatalf("list conversation history status: %d body=%s", response.Code, response.Body.String())
 	}
-	var history []Conversation
+	var history conversationListPage
 	if err := json.NewDecoder(response.Body).Decode(&history); err != nil {
 		t.Fatalf("decode conversation history: %v", err)
 	}
-	if len(history) != 3 || history[0].ID != "current" || history[0].Preview != "当前会话最后回复" || history[1].ID != "recent" || history[1].Preview != "最近会话最后回复" {
+	if history.NextCursor != "" || len(history.Items) != 3 || history.Items[0].ID != "current" || history.Items[0].Preview != "当前会话最后回复" || history.Items[1].ID != "recent" || history.Items[1].Preview != "最近会话最后回复" {
 		t.Fatalf("unexpected conversation history: %#v", history)
 	}
 
@@ -1874,6 +1874,80 @@ func TestConversationHistoryListsSummariesAndActivatesPriorSession(t *testing.T)
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/older/activate", nil))
 	if response.Code != http.StatusConflict {
 		t.Fatalf("activate while active conversation is running status: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestConversationHistoryPaginatesAndSearchesMessageContent(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	for index := 0; index < 101; index++ {
+		id := fmt.Sprintf("conversation-%03d", index)
+		// All entries share a timestamp so the cursor's ID tie-breaker is exercised.
+		activity := now
+		if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?)`, id, "project", fmt.Sprintf("session-%03d", index), "idle", "approval_required", fmt.Sprintf("会话 %03d", index), activity, 1, false, activity); err != nil {
+			t.Fatalf("insert conversation %d: %v", index, err)
+		}
+		content := fmt.Sprintf("普通消息 %03d", index)
+		if index == 0 {
+			content = "只在最早会话中出现的搜索词"
+		}
+		if _, err := server.db.Exec(`insert into messages (id,conversation_id,role,content,created_at) values (?,?,?,?,?)`, fmt.Sprintf("message-%03d", index), id, "assistant", content, activity); err != nil {
+			t.Fatalf("insert message %d: %v", index, err)
+		}
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/project/conversations?limit=100", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list first conversation page status: %d body=%s", response.Code, response.Body.String())
+	}
+	var first conversationListPage
+	if err := json.NewDecoder(response.Body).Decode(&first); err != nil {
+		t.Fatalf("decode first conversation page: %v", err)
+	}
+	if len(first.Items) != 100 || first.NextCursor == "" || first.Items[0].ID != "conversation-100" || first.Items[99].ID != "conversation-001" {
+		t.Fatalf("unexpected first conversation page: %#v", first)
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/project/conversations?limit=100&cursor="+first.NextCursor, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list second conversation page status: %d body=%s", response.Code, response.Body.String())
+	}
+	var second conversationListPage
+	if err := json.NewDecoder(response.Body).Decode(&second); err != nil {
+		t.Fatalf("decode second conversation page: %v", err)
+	}
+	if len(second.Items) != 1 || second.NextCursor != "" || second.Items[0].ID != "conversation-000" {
+		t.Fatalf("unexpected second conversation page: %#v", second)
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/project/conversations?q=%E6%90%9C%E7%B4%A2%E8%AF%8D", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("search conversations status: %d body=%s", response.Code, response.Body.String())
+	}
+	var matches conversationListPage
+	if err := json.NewDecoder(response.Body).Decode(&matches); err != nil {
+		t.Fatalf("decode searched conversations: %v", err)
+	}
+	if len(matches.Items) != 1 || matches.NextCursor != "" || matches.Items[0].ID != "conversation-000" {
+		t.Fatalf("unexpected searched conversations: %#v", matches)
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/project/conversations?limit=0", nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid page limit status: %d body=%s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/project/conversations?cursor=not-a-valid-cursor", nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid page cursor status: %d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -5522,6 +5596,27 @@ func TestDeleteTaskRemovesTerminalTask(t *testing.T) {
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskID, nil))
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("deleted task lookup: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestDeleteTaskRejectsRunningTask(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Running task")
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskRunning, taskID); err != nil {
+		t.Fatalf("mark task running: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/tasks/"+taskID, nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete running task: %d body=%s", response.Code, response.Body.String())
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from tasks where id=?`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read running task after delete: %v", err)
+	}
+	if status != taskRunning {
+		t.Fatalf("running task status=%q, want %q", status, taskRunning)
 	}
 }
 

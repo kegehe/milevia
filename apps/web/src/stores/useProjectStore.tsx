@@ -41,6 +41,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const transientConversationDrafts = useRef<Record<string, string>>({});
   const pendingConversationDrafts = useRef(new Map<string, PendingConversationDraft>());
   const pendingDraftTimers = useRef(new Map<string, number>());
+  const projectRequestVersion = useRef(0);
+  const statusRequestVersion = useRef(0);
 
   const flushConversationDraft = useCallback((projectID: string, conversationID: string) => {
     const key = conversationDraftKey(projectID, conversationID);
@@ -94,8 +96,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, [flushConversationDraft]);
 
   const refreshStatuses = useCallback(async () => {
+    const requestVersion = ++statusRequestVersion.current;
     try {
       const statusList = await apiFn<{ id: string; running: number; conversationCount: number; activeTitle: string }[]>("/api/projects/statuses");
+      if (requestVersion !== statusRequestVersion.current) return;
       const entries = statusList.map((item) => [item.id, { running: item.running === 1, conversationCount: item.conversationCount, activeTitle: item.activeTitle }] as const);
       setProjectStatuses(Object.fromEntries(entries));
     } catch {
@@ -104,12 +108,14 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshProjects = useCallback(async () => {
+    const requestVersion = ++projectRequestVersion.current;
     try {
       const list = await apiFn<Project[]>("/api/projects");
+      if (requestVersion !== projectRequestVersion.current) return;
       setProjects(list);
       await refreshStatuses();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "无法加载项目列表");
+      if (requestVersion === projectRequestVersion.current) setError(cause instanceof Error ? cause.message : "无法加载项目列表");
     }
   }, [refreshStatuses]);
 

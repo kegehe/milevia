@@ -52,6 +52,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const confirmationRequest = useRef(0);
   const inlineRequest = useRef(0);
   const redispatchRequest = useRef(0);
+  const tasksRequestVersion = useRef(0);
   const mountedRef = useRef(true);
   const conversationIDRef = useRef(conversationID);
   conversationIDRef.current = conversationID;
@@ -77,8 +78,9 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   }, [conversationID]);
 
   const loadTasks = useCallback(async () => {
+    const requestVersion = ++tasksRequestVersion.current;
     const next = await request<Task[]>(`/api/projects/${projectID}/tasks`);
-    if (mountedRef.current) setTasks(next);
+    if (mountedRef.current && requestVersion === tasksRequestVersion.current) setTasks(next);
   }, [projectID, request]);
 
   useEffect(() => { void loadTasks().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务队列"); }); }, [fail, loadTasks]);
@@ -167,15 +169,18 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const inlineTransition = async (action: "reopen" | "stop") => {
     if (!inlineDetail) return;
     if (!mountedRef.current) return;
+    const taskID = inlineDetail.id;
+    const requestID = ++inlineRequest.current;
     setInlineBusy(action);
     try {
-      await request(`/api/tasks/${inlineDetail.id}/${action}`, { method: "POST", body: "{}" });
-      if (!mountedRef.current) return;
-      const next = await request<TaskDetail>(`/api/tasks/${inlineDetail.id}`);
-      if (mountedRef.current) setInlineDetail(next);
+      await request(`/api/tasks/${taskID}/${action}`, { method: "POST", body: "{}" });
+      if (!mountedRef.current || inlineRequest.current !== requestID) return;
+      const next = await request<TaskDetail>(`/api/tasks/${taskID}`);
+      if (!mountedRef.current || inlineRequest.current !== requestID) return;
+      setInlineDetail(next);
       await loadTasks();
-    } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法更新任务"); }
-    finally { if (mountedRef.current) setInlineBusy(""); }
+    } catch (cause) { if (mountedRef.current && inlineRequest.current === requestID) fail(cause instanceof Error ? cause.message : "无法更新任务"); }
+    finally { if (mountedRef.current && inlineRequest.current === requestID) setInlineBusy(""); }
   };
 
   const inlineDelete = () => {
@@ -186,15 +191,17 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
       danger: true,
       onConfirm: () => void (async () => {
         if (!mountedRef.current) return;
+        const taskID = inlineDetail.id;
+        const requestID = ++inlineRequest.current;
         setPendingConfirm(null);
         setInlineBusy("delete");
         try {
-          await request(`/api/tasks/${inlineDetail.id}`, { method: "DELETE" });
-          if (!mountedRef.current) return;
+          await request(`/api/tasks/${taskID}`, { method: "DELETE" });
+          if (!mountedRef.current || inlineRequest.current !== requestID) return;
           closeInlineDetail();
           await loadTasks();
-        } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法删除任务"); }
-        finally { if (mountedRef.current) setInlineBusy(""); }
+        } catch (cause) { if (mountedRef.current && inlineRequest.current === requestID) fail(cause instanceof Error ? cause.message : "无法删除任务"); }
+        finally { if (mountedRef.current && inlineRequest.current === requestID) setInlineBusy(""); }
       })(),
       onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
     });
@@ -203,13 +210,16 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const inlineReview = async (action: "accept" | "request_changes", note: string) => {
     if (!inlineDetail) return;
     if (action === "request_changes" && !note.trim()) { fail("请填写需要修改的原因"); return; }
+    const taskID = inlineDetail.id;
+    const requestID = ++inlineRequest.current;
     try {
-      await request(`/api/tasks/${inlineDetail.id}/review`, { method: "POST", body: JSON.stringify({ action, note: action === "accept" ? "" : note }) });
-      if (!mountedRef.current) return;
-      const next = await request<TaskDetail>(`/api/tasks/${inlineDetail.id}`);
-      if (mountedRef.current) setInlineDetail(next);
+      await request(`/api/tasks/${taskID}/review`, { method: "POST", body: JSON.stringify({ action, note: action === "accept" ? "" : note }) });
+      if (!mountedRef.current || inlineRequest.current !== requestID) return;
+      const next = await request<TaskDetail>(`/api/tasks/${taskID}`);
+      if (!mountedRef.current || inlineRequest.current !== requestID) return;
+      setInlineDetail(next);
       await loadTasks();
-    } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法提交验收"); }
+    } catch (cause) { if (mountedRef.current && inlineRequest.current === requestID) fail(cause instanceof Error ? cause.message : "无法提交验收"); }
   };
 
   const dispatch = async () => {

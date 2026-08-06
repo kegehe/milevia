@@ -37,7 +37,7 @@ test("only the newest directory request can update the import view", () => {
 test("directory-dependent actions wait for directory loading", () => {
   assert.match(page, /const \[loadingDirectory, setLoadingDirectory\] = useState\(false\);/);
   assert.match(page, /const \[directoryReady, setDirectoryReady\] = useState\(false\);/);
-  assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| !directoryReady\}/);
+  assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| creatingDirectory \|\| !directoryReady\}/);
   assert.match(page, /disabled=\{!result\?\.agentReady \|\| busy \|\| loadingDirectory \|\| !directoryReady\}/);
 });
 

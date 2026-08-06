@@ -72,6 +72,9 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   const [selectedIDs, setSelectedIDs] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
   const mountedRef = useRef(true);
+  const tasksRequestVersion = useRef(0);
+  const detailRequestVersion = useRef(0);
+  const orchestrationRequestVersion = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -79,18 +82,21 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   }, []);
 
   const loadTasks = useCallback(async () => {
+    const requestVersion = ++tasksRequestVersion.current;
     const next = await request<Task[]>(`/api/projects/${projectID}/tasks`);
-    if (mountedRef.current) setTasks(next);
+    if (mountedRef.current && requestVersion === tasksRequestVersion.current) setTasks(next);
     return next;
   }, [projectID, request]);
   const loadOrchestration = useCallback(async () => {
+    const requestVersion = ++orchestrationRequestVersion.current;
     const [config, jobs, releases] = await Promise.all([request<OrchestrationConfig>(`/api/projects/${projectID}/orchestration/config`), request<OrchestrationJob[]>(`/api/projects/${projectID}/orchestration`), request<ReleaseSnapshot[]>(`/api/projects/${projectID}/orchestration/releases`)]);
-    if (mountedRef.current) { setOrchestration(config); setOrchestrationJobs(jobs); setReleaseSnapshots(releases); }
+    if (mountedRef.current && requestVersion === orchestrationRequestVersion.current) { setOrchestration(config); setOrchestrationJobs(jobs); setReleaseSnapshots(releases); }
   }, [projectID, request]);
 
   const loadDetail = useCallback(async (taskID: string) => {
+    const requestVersion = ++detailRequestVersion.current;
     const next = await request<TaskDetail>(`/api/tasks/${taskID}`);
-    if (mountedRef.current) setDetail(next);
+    if (mountedRef.current && requestVersion === detailRequestVersion.current) setDetail(next);
     return next;
   }, [request]);
 

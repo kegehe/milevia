@@ -36,6 +36,7 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   const [commitMessage, setCommitMessage] = useState("");
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const diffRequest = useRef(0);
+  const reloadRequest = useRef(0);
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -57,6 +58,7 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   };
 
   const reload = useCallback(async (manual = false) => {
+    const requestID = ++reloadRequest.current;
     if (manual) { if (!mountedRef.current) return; setRefreshing(true); }
     else { if (!mountedRef.current) return; setLoading(true); }
     try {
@@ -68,16 +70,16 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
         request<GitBranch[]>(`${base}/branches`),
         request<GitOperation[]>(`${base}/operations`),
       ]);
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || requestID !== reloadRequest.current) return;
       setSnapshot(nextSnapshot);
       setChanges(nextChanges);
       setCommits(nextCommits);
       setBranches(nextBranches);
       setOperations(nextOperations);
     } catch (cause) {
-      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
+      if (mountedRef.current && requestID === reloadRequest.current) fail(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
     } finally {
-      if (mountedRef.current) {
+      if (mountedRef.current && requestID === reloadRequest.current) {
         setLoading(false);
         setRefreshing(false);
       }

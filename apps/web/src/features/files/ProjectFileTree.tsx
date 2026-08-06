@@ -78,6 +78,8 @@ class FileTreeProvider {
   private onError?: (message: string) => void;
   // 记录每个目录正在进行的请求，防止重复请求与旧请求覆盖新数据
   private pendingLoads = new Map<string, Promise<void>>();
+  private pendingLoadIDs = new Map<string, number>();
+  private nextLoadID = 0;
   // 按目录追踪的加载代次，仅丢弃同一目录的过期请求（避免跨目录干扰）
   private dirEpochs = new Map<string, number>();
 
@@ -149,6 +151,7 @@ class FileTreeProvider {
     if (existing && !force) return existing;
 
     const myEpoch = (this.dirEpochs.get(cacheKey) || 0) + 1;
+    const loadID = ++this.nextLoadID;
     this.dirEpochs.set(cacheKey, myEpoch);
     const promise = (async () => {
       this.setLoading(true);
@@ -185,15 +188,18 @@ class FileTreeProvider {
         if (this.dirEpochs.get(cacheKey) !== myEpoch) return;
         this.onError?.(err instanceof Error ? err.message : "加载目录失败");
       } finally {
-        // 仅当自己仍是该目录最新 epoch 时才从 pending 中移除
-        if (this.dirEpochs.get(cacheKey) === myEpoch) {
+        // 不应由过期请求清理后来请求；被 refreshAll 作废但没有后继请求的
+        // Promise 则仍需在这里自行清理。
+        if (this.pendingLoadIDs.get(cacheKey) === loadID) {
           this.pendingLoads.delete(cacheKey);
+          this.pendingLoadIDs.delete(cacheKey);
         }
         // 仅在没有其他进行中请求时关闭 loading
         if (this.pendingLoads.size === 0) this.setLoading(false);
       }
     })();
     this.pendingLoads.set(cacheKey, promise);
+    this.pendingLoadIDs.set(cacheKey, loadID);
     return promise;
   }
 
@@ -210,8 +216,11 @@ class FileTreeProvider {
    * 已展开的子目录在用户再次展开时会重新拉取。
    */
   refreshAll() {
-    this.pendingLoads.clear();
-    this.dirEpochs.clear();
+    // 不能清空 epoch。旧请求若为 1，而新请求在清空后也变为 1，就会重新
+    // 获得写入资格。递增所有已知目录的 epoch 可同时作废仍在飞行的请求。
+    for (const key of new Set([...this.dirEpochs.keys(), ...this.pendingLoads.keys()])) {
+      this.dirEpochs.set(key, (this.dirEpochs.get(key) || 0) + 1);
+    }
     const root = this.items.get("root");
     this.items.clear();
     if (root) {

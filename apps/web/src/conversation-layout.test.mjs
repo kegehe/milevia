@@ -42,14 +42,33 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /const assistantOutputRuns = useRef\(new Set<string>\(\)\);/);
   assert.match(conversationPage, /const recordAssistantOutput = useCallback[\s\S]*?if \(outputs\.size > 128\)[\s\S]*?pendingUserDrafts\.current\.delete\(runID\);/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.set\(data\.runId, data\.message\.content\)/);
-  assert.match(conversationPage, /const draftToRestore = assistantOutputRuns\.current\.has\(runID\) \? undefined : pendingUserDrafts\.current\.get\(runID\);/);
+  assert.match(conversationPage, /const shouldRetractMessage = !assistantOutputRuns\.current\.has\(runID\);\s*const draftToRestore = shouldRetractMessage \? pendingUserDrafts\.current\.get\(runID\) : undefined;/s);
   assert.match(conversationPage, /const restorePendingUserDraft = \(conversationID: string, routeVersion: number, runID: string, draft: string \| undefined\) => \{\s*if \(!draft \|\| conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;/s);
   assert.match(conversationPage, /setText\(\(current\) => current === "" \? draft : current\);/);
   assert.match(conversationPage, /saveConversationDraft\(projectId, conversationID, restoredText\)/);
   assert.match(conversationPage, /const conversationID = conversation\.id;\s*const routeVersion = conversationRouteVersion\.current;\s*const runID = run;/s);
   assert.match(conversationPage, /restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
-  assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{ restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
+  assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{ retractUserMessage\(\); restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
+});
+
+test("persisted conversation history loads without waiting for the realtime socket", () => {
+  assert.match(conversationPage, /const reload = async \(runID\?: string\): Promise<boolean> => \{[\s\S]*?setMessages\(\(current\) => mergeReloadMessages\(filteredMessages, current\)\);/);
+  assert.match(conversationPage, /const initialHistoryLoad = reload\(\);\s*connect\(\);/);
+  assert.match(conversationPage, /void initialHistoryLoad\.then\(\(loaded\) => \{\s*if \(!loaded && isCurrentConversation\(\)\) void reload\(\);\s*}\);/s);
+  assert.match(conversationPage, /let hasOpenedSocket = false;/);
+  assert.match(conversationPage, /const reconnecting = hasOpenedSocket;\s*hasOpenedSocket = true;\s*if \(reconnecting\) \{\s*void reload\(\);\s*return;\s*}/s);
+  assert.match(conversationPage, /const abort = new AbortController\(\);/);
+  assert.match(conversationPage, /const conversationActivationTail = useRef<Promise<void>>\(Promise\.resolve\(\)\);/);
+  assert.match(conversationPage, /const previous = conversationActivationTail\.current;\s*conversationActivationTail\.current = new Promise<void>\(\(resolve\) => \{ release = resolve; \}\);\s*await previous\.catch\(\(\) => undefined\);/s);
+  assert.match(conversationPage, /`\/api\/conversations\/\$\{urlConversationId\}\?limit=1`, \{ signal: abort\.signal \}/);
+  assert.match(conversationPage, /if \(!isCurrentRoute\(\)\) return;[\s\S]*?const activated = await activateCurrentRoute\(\);/);
+  assert.match(conversationPage, /return \(\) => \{ cancelled = true; abort\.abort\(\); \};/);
+  assert.match(conversationPage, /if \(detail\.conversation\.projectId !== projectId\) throw new Error\("指定会话不属于当前项目"\);/);
+  assert.match(conversationPage, /if \(conversationRef\.current\?\.id === activated\.id\) \{\s*setConversation\(activated\);\s*\} else \{\s*resetConversationView\(activated\);\s*\}/s);
+  assert.match(conversationPage, /const params = new URLSearchParams\(\{ limit: "100" \}\);\s*if \(query\.trim\(\)\) params\.set\("q", query\.trim\(\)\);\s*if \(cursor\) params\.set\("cursor", cursor\);/s);
+  assert.match(conversationPage, /const page = await projectApi<ConversationHistoryPage>/);
+  assert.match(conversationPage, /setConversationHistoryCursor\(page\.nextCursor\);/);
 });
 
 test("all composer text sources are cached and conversation switches use the target draft", () => {
@@ -317,7 +336,7 @@ test("agent work is progressive: primary chat stays clean and trace details rema
   assert.match(conversationPage, /<AgentExecutionCard key=\{execution\.runId\}/);
   assert.match(conversationPage, /<AgentExecutionDialog execution=/);
   assert.match(timelineLib, /node\.status = "unresolved"/);
-  assert.match(conversationPage, /setMessages\(\(current\) => mergeConversationItems\(data\.messages, current\)\)/);
+  assert.match(conversationPage, /setMessages\(\(current\) => mergeReloadMessages\(filteredMessages, current\)\)/);
   assert.match(conversationPage, /setEvents\(\(current\) => mergeConversationItems\(data\.events, current\)\)/);
   assert.match(stylesheet, /\.agent-execution-card\s*\{/);
   assert.match(stylesheet, /\.agent-execution-dialog\s*\{/);

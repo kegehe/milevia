@@ -61,6 +61,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const clearedThroughLogIDRef = useRef(0);
 	const configDirtyRef = useRef(false);
 	const configRevisionRef = useRef(0);
+	const statusRequestVersionRef = useRef(0);
 	const renderedProjectIDRef = useRef(projectID);
 
 	const basePath = `/api/projects/${projectID}/run`;
@@ -86,9 +87,10 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	};
 
 	const loadStatus = useCallback(async () => {
+		const requestVersion = ++statusRequestVersionRef.current;
 		try {
 			const s = await request<RunStatusResponse>(`${basePath}/status`);
-			if (activeProjectIDRef.current !== projectID) return;
+			if (activeProjectIDRef.current !== projectID || requestVersion !== statusRequestVersionRef.current) return;
 			setStatus(s);
 			mergeIncomingLogs(s.recentLogs);
 		} catch { /* 轮询忽略错误 */ }
@@ -100,6 +102,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 
 		configDirtyRef.current = false;
 		configRevisionRef.current = 0;
+		statusRequestVersionRef.current += 1;
 		clearedThroughLogIDRef.current = 0;
 		logNearBottomRef.current = true;
 		setConfig({ workDir: "", command: "", envVars: {}, executionTarget: "auto" });

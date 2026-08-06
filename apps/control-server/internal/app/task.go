@@ -505,6 +505,11 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
+	// Keep deletion ordered with task dispatch. Otherwise a task can start after
+	// the initial status read and be deleted with its task run by cascading FKs.
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
+
 	task, err := s.taskByID(r.Context(), chi.URLParam(r, "taskID"))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("task not found"))
@@ -541,7 +546,7 @@ func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("delete task dependencies: %w", err))
 		return
 	}
-	result, err := tx.ExecContext(r.Context(), `delete from tasks where id=?`, task.ID)
+	result, err := tx.ExecContext(r.Context(), `delete from tasks where id=? and status<>?`, task.ID, taskRunning)
 	if err != nil {
 		writeError(w, http.StatusConflict, fmt.Errorf("delete task: %w", err))
 		return
@@ -552,7 +557,7 @@ func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if changed != 1 {
-		writeError(w, http.StatusNotFound, errors.New("task not found"))
+		writeError(w, http.StatusConflict, errors.New("task started before it could be deleted"))
 		return
 	}
 	if err := tx.Commit(); err != nil {

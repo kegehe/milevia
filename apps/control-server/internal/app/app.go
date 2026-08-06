@@ -352,6 +352,17 @@ type conversationPageCursor struct {
 	Event   *conversationPagePosition `json:"event,omitempty"`
 }
 
+type conversationListCursor struct {
+	IsCurrent      bool      `json:"isCurrent"`
+	LastActivityAt time.Time `json:"lastActivityAt"`
+	ID             string    `json:"id"`
+}
+
+type conversationListPage struct {
+	Items      []Conversation `json:"items"`
+	NextCursor string         `json:"nextCursor"`
+}
+
 type conversationPagePosition struct {
 	CreatedAt time.Time `json:"createdAt"`
 	ID        string    `json:"id"`
@@ -381,6 +392,29 @@ func encodeConversationPageCursor(cursor conversationPageCursor) string {
 	if cursor.Message == nil && cursor.Event == nil {
 		return ""
 	}
+	encoded, err := json.Marshal(cursor)
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded)
+}
+
+func decodeConversationListCursor(raw string) (conversationListCursor, error) {
+	if raw == "" {
+		return conversationListCursor{}, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return conversationListCursor{}, errors.New("cursor is invalid")
+	}
+	var cursor conversationListCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.ID == "" || cursor.LastActivityAt.IsZero() {
+		return conversationListCursor{}, errors.New("cursor is invalid")
+	}
+	return cursor, nil
+}
+
+func encodeConversationListCursor(cursor conversationListCursor) string {
 	encoded, err := json.Marshal(cursor)
 	if err != nil {
 		return ""
@@ -2077,7 +2111,42 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	rows, err := s.db.QueryContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),'') from conversations c where c.project_id=$1 and ($2='' or lower(c.title) like '%' || lower($2) || '%') order by c.is_current desc,c.last_activity_at desc limit 100`, chi.URLParam(r, "projectID"), query)
+	limit := 100
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed < 1 || parsed > 100 {
+			writeError(w, http.StatusBadRequest, errors.New("limit must be between 1 and 100"))
+			return
+		}
+		limit = parsed
+	}
+	offset := 0
+	if rawOffset := r.URL.Query().Get("offset"); rawOffset != "" {
+		parsed, err := strconv.Atoi(rawOffset)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, errors.New("offset must be a non-negative integer"))
+			return
+		}
+		offset = parsed
+	}
+	if offset != 0 {
+		writeError(w, http.StatusBadRequest, errors.New("offset pagination is no longer supported; use cursor"))
+		return
+	}
+	cursor, err := decodeConversationListCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),'') from conversations c where c.project_id=? and (?='' or lower(c.title) like '%' || lower(?) || '%' or exists(select 1 from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' and lower(m.content) like '%' || lower(?) || '%'))`
+	args := []any{chi.URLParam(r, "projectID"), query, query, query}
+	if cursor.ID != "" {
+		statement += ` and (c.is_current < ? or (c.is_current = ? and (c.last_activity_at < ? or (c.last_activity_at = ? and c.id < ?))))`
+		args = append(args, boolToInt(cursor.IsCurrent), boolToInt(cursor.IsCurrent), cursor.LastActivityAt, cursor.LastActivityAt, cursor.ID)
+	}
+	statement += ` order by c.is_current desc,c.last_activity_at desc,c.id desc limit ?`
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(r.Context(), statement, args...)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -2097,7 +2166,13 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	writeJSON(w, 200, items)
+	nextCursor := ""
+	if len(items) > limit {
+		items = items[:limit]
+		last := items[len(items)-1]
+		nextCursor = encodeConversationListCursor(conversationListCursor{IsCurrent: last.IsCurrent, LastActivityAt: last.LastActivityAt, ID: last.ID})
+	}
+	writeJSON(w, http.StatusOK, conversationListPage{Items: items, NextCursor: nextCursor})
 }
 
 func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {

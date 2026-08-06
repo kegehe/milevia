@@ -293,26 +293,28 @@ function HistorySearchIcon() {
   return <svg className="history-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4.2 4.2" /></svg>;
 }
 
-function ConversationHistoryDialog({ conversations, activeID, busyID, close, activate }: { conversations: Conversation[]; activeID: string; busyID: string; close: () => void; activate: (item: Conversation) => Promise<void> }) {
+type ConversationHistoryPage = { items: Conversation[]; nextCursor: string };
+
+function ConversationHistoryDialog({ conversations, activeID, busyID, close, activate, search, hasMore, loadingMore, loadMore }: { conversations: Conversation[]; activeID: string; busyID: string; close: () => void; activate: (item: Conversation) => Promise<void>; search: (query: string) => void; hasMore: boolean; loadingMore: boolean; loadMore: () => void }) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
-  const filtered = useMemo(() => {
-    const keyword = query.trim().toLocaleLowerCase();
-    return keyword ? conversations.filter((item) => `${item.title} ${item.preview || ""}`.toLocaleLowerCase().includes(keyword)) : conversations;
-  }, [conversations, query]);
-  useEffect(() => { setSelected(0); }, [query]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => search(query), 200);
+    return () => window.clearTimeout(timer);
+  }, [query, search]);
+  useEffect(() => { setSelected(0); }, [conversations, query]);
   const select = (item: Conversation) => { if (item.id !== activeID && item.status !== "running" && !busyID) void activate(item); };
   const keyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Escape") { event.preventDefault(); close(); return; }
-    if (event.key === "ArrowDown") { event.preventDefault(); setSelected((index) => Math.min(filtered.length - 1, index + 1)); return; }
+    if (event.key === "ArrowDown") { event.preventDefault(); setSelected((index) => Math.min(conversations.length - 1, index + 1)); return; }
     if (event.key === "ArrowUp") { event.preventDefault(); setSelected((index) => Math.max(0, index - 1)); return; }
-    if (event.key === "Enter" && filtered[selected]) { event.preventDefault(); select(filtered[selected]); }
+    if (event.key === "Enter" && conversations[selected]) { event.preventDefault(); select(conversations[selected]); }
   };
-  return <div className="backdrop history-backdrop" role="dialog" aria-modal="true" aria-labelledby="conversation-history-title"><section className="modal conversation-history"><header><div className="conversation-history-heading"><span className="conversation-history-mark"><HistoryIcon /></span><div><h2 id="conversation-history-title">会话历史</h2></div></div><button type="button" className="conversation-history-close" title="关闭" aria-label="关闭" onClick={close}><DialogCloseIcon /></button></header><div className="history-toolbar"><label className="history-search"><HistorySearchIcon /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={keyDown} placeholder="搜索会话标题或内容" /></label><span>{query ? `${filtered.length} 个匹配` : `${conversations.length} 个会话`}</span></div><div className="history-list">{filtered.length === 0 ? <p className="history-empty">没有匹配的会话</p> : filtered.map((item, index) => {
+  return <div className="backdrop history-backdrop" role="dialog" aria-modal="true" aria-labelledby="conversation-history-title"><section className="modal conversation-history"><header><div className="conversation-history-heading"><span className="conversation-history-mark"><HistoryIcon /></span><div><h2 id="conversation-history-title">会话历史</h2></div></div><button type="button" className="conversation-history-close" title="关闭" aria-label="关闭" onClick={close}><DialogCloseIcon /></button></header><div className="history-toolbar"><label className="history-search"><HistorySearchIcon /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={keyDown} placeholder="搜索会话标题或内容" /></label><span>{query ? `${conversations.length} 个匹配` : `${conversations.length} 个会话`}</span></div><div className="history-list">{conversations.length === 0 ? <p className="history-empty">没有匹配的会话</p> : conversations.map((item, index) => {
     const runningElsewhere = item.status === "running" && item.id !== activeID;
     const state = busyID === item.id ? "切换中" : item.id === activeID ? "当前会话" : runningElsewhere ? "运行中" : "";
     return <button key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""} ${runningElsewhere ? "running" : ""}`} disabled={Boolean(busyID) || runningElsewhere} onMouseEnter={() => setSelected(index)} onClick={() => select(item)}><span className="history-item-main"><span className="history-item-title"><b>{item.title || "新会话"}</b><span className={`history-item-agent ${item.agentId === "codex" ? "codex" : "claude"}`}>{item.agentId === "codex" ? "Codex" : "Claude Code"}</span></span><small>{item.preview || "尚未发送消息"}</small></span><span className="history-item-meta">{state && <em>{state}</em>}<time>{formatHistoryTime(item.lastActivityAt)}</time></span></button>;
-  })}</div><footer><span>{busyID ? "正在切换会话" : `${filtered.length} 条记录`}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
+  })}</div>{hasMore && <button className="secondary load-earlier-history" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "加载中" : "加载更多会话"}</button>}<footer><span>{busyID ? "正在切换会话" : `${conversations.length} 条记录`}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
 }
 
 function NewConversationDialog({ runnerID, close, create }: { runnerID: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode) => Promise<void> }) {
@@ -554,6 +556,9 @@ export default function ConversationPage() {
   // 对话核心状态
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [conversationHistory, setConversationHistory] = useState<Conversation[]>([]);
+  const [historyQuery, setHistoryQuery] = useState("");
+  const [conversationHistoryCursor, setConversationHistoryCursor] = useState("");
+  const [loadingMoreConversationHistory, setLoadingMoreConversationHistory] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [text, setText] = useState("");
@@ -618,6 +623,8 @@ export default function ConversationPage() {
   textRef.current = text;
   const conversationTransitionRef = useRef(false);
   const conversationRouteVersion = useRef(0);
+  const conversationHistoryRequestVersion = useRef(0);
+  const conversationActivationTail = useRef<Promise<void>>(Promise.resolve());
   const stopRunRef = useRef<() => Promise<void>>(async () => {});
   const stopAndClearRef = useRef<() => Promise<void>>(async () => {});
   const pendingUserDrafts = useRef(new Map<string, string>());
@@ -709,13 +716,47 @@ export default function ConversationPage() {
     draftBeforeHistory.current = "";
   };
 
+  const resetConversationView = (next: Conversation) => {
+    const nextDraft = projectId ? getConversationDraft(projectId, next.id) : "";
+    setComposerText(nextDraft, next.id);
+    setMessages([]); setEvents([]); setRun(""); setUsage(null); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
+  };
+
   // 刷新函数
-  const refreshConversationHistory = useCallback(async () => {
+  const requestConversationHistory = useCallback(async (query: string, cursor = "", append = false) => {
     if (!projectId) return [] as Conversation[];
-    const list = await projectApi<Conversation[]>(`/api/projects/${projectId}/conversations`);
-    setConversationHistory(list);
-    return list;
+    const requestVersion = ++conversationHistoryRequestVersion.current;
+    const params = new URLSearchParams({ limit: "100" });
+    if (query.trim()) params.set("q", query.trim());
+    if (cursor) params.set("cursor", cursor);
+    const page = await projectApi<ConversationHistoryPage>(`/api/projects/${projectId}/conversations?${params.toString()}`);
+    if (requestVersion !== conversationHistoryRequestVersion.current) return [] as Conversation[];
+    setConversationHistory((current) => {
+      if (!append) return page.items;
+      const known = new Set(current.map((item) => item.id));
+      return [...current, ...page.items.filter((item) => !known.has(item.id))];
+    });
+    setConversationHistoryCursor(page.nextCursor);
+    return page.items;
   }, [projectId, projectApi]);
+
+  const refreshConversationHistory = useCallback(async () => {
+    setHistoryQuery("");
+    return requestConversationHistory("");
+  }, [requestConversationHistory]);
+
+  const searchConversationHistory = useCallback((query: string) => {
+    setHistoryQuery(query);
+    void requestConversationHistory(query).catch((cause) => fail(cause instanceof Error ? cause.message : "无法搜索会话历史"));
+  }, [fail, requestConversationHistory]);
+
+  const loadMoreConversationHistory = useCallback(() => {
+    if (loadingMoreConversationHistory || !conversationHistoryCursor) return;
+    setLoadingMoreConversationHistory(true);
+    void requestConversationHistory(historyQuery, conversationHistoryCursor, true)
+      .catch((cause) => fail(cause instanceof Error ? cause.message : "无法加载更多会话"))
+      .finally(() => setLoadingMoreConversationHistory(false));
+  }, [conversationHistoryCursor, fail, historyQuery, loadingMoreConversationHistory, requestConversationHistory]);
 
   const refreshShortcuts = useCallback(async () => {
     if (!projectId) return;
@@ -751,39 +792,46 @@ export default function ConversationPage() {
   useEffect(() => {
     if (!projectId || conversationTransitionRef.current) return;
     let cancelled = false;
+    const abort = new AbortController();
+    const isCurrentRoute = () => !cancelled && !conversationTransitionRef.current;
+    const activateCurrentRoute = async () => {
+      let release!: () => void;
+      const previous = conversationActivationTail.current;
+      conversationActivationTail.current = new Promise<void>((resolve) => { release = resolve; });
+      await previous.catch(() => undefined);
+      try {
+        if (!isCurrentRoute()) return null;
+        return await projectApi<Conversation>(`/api/conversations/${urlConversationId}/activate`, { method: "POST", signal: abort.signal });
+      } finally {
+        release();
+      }
+    };
     async function loadConversation() {
       try {
-        const list = await refreshConversationHistory();
-        if (cancelled || conversationTransitionRef.current) return;
-
-        // 如果 URL 里指定了 conversationId，尝试直接激活它
+        // 直接链接必须按 ID 查询，不能依赖历史列表的当前分页结果。
         if (urlConversationId) {
-          const found = list.find((c) => c.id === urlConversationId);
-          if (found && found.id && found.status !== "running") {
-            const activated = await projectApi<Conversation>(`/api/conversations/${found.id}/activate`, { method: "POST" });
-            if (!cancelled && !conversationTransitionRef.current) {
+          const detail = await projectApi<{ conversation: Conversation & { projectId: string } }>(`/api/conversations/${urlConversationId}?limit=1`, { signal: abort.signal });
+          if (!isCurrentRoute()) return;
+          if (detail.conversation.projectId !== projectId) throw new Error("指定会话不属于当前项目");
+          if (detail.conversation.status === "running" && !detail.conversation.isCurrent) throw new Error("指定会话正在其他项目窗口中运行");
+          const activated = await activateCurrentRoute();
+          if (isCurrentRoute()) {
+            if (!activated) return;
+            // 从 /conversations 自动跳到同一会话的详情 URL 时，消息请求可能已经完成。
+            // 保留同一会话的内容，避免这次路由确认把已加载历史重新清空。
+            if (conversationRef.current?.id === activated.id) {
               setConversation(activated);
-              setMessages([]);
-              setEvents([]);
-              setRun("");
-              setUsage(null);
-              historyIndex.current = null;
-              draftBeforeHistory.current = "";
-              finishedRunIds.current.clear();
-              pendingUserDrafts.current.clear();
-              assistantOutputRuns.current.clear();
-              retractedMessageRuns.current.clear();
-              setShowPermissionMenu(false);
-              closeAgentExecution();
-              setHasMoreHistory(false);
-              setHasMoreMessageHistory(false);
-              setHistoryCursor("");
-              return;
+            } else {
+              resetConversationView(activated);
             }
+            void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
+            return;
           }
         }
 
         // 否则使用最新对话或创建新对话
+        const list = await refreshConversationHistory();
+        if (cancelled || conversationTransitionRef.current) return;
         const next = list[0] ?? await projectApi<Conversation>(`/api/projects/${projectId}/conversations`, { method: "POST" });
         if (!cancelled && !conversationTransitionRef.current) {
           setConversation(next);
@@ -794,11 +842,14 @@ export default function ConversationPage() {
           }
         }
       } catch (cause) {
-        if (!cancelled) fail(cause instanceof Error ? cause.message : "无法创建会话");
+        if (!cancelled) {
+          fail(cause instanceof Error ? cause.message : "无法打开会话");
+          if (urlConversationId) navigate(`/projects/${projectId}/conversations`, { replace: true });
+        }
       }
     }
     void loadConversation();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; abort.abort(); };
   }, [projectId, urlConversationId, clearing, fail, refreshConversationHistory, projectApi, navigate]);
 
   // 加载快捷方式
@@ -821,22 +872,27 @@ export default function ConversationPage() {
     let socket: WebSocket;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = 0;
+    let hasOpenedSocket = false;
     const isCurrentConversation = () => !cancelled && conversationRef.current?.id === conversation.id;
 
-    const reload = async (runID?: string) => {
-      if (!isCurrentConversation()) return;
+    const reload = async (runID?: string): Promise<boolean> => {
+      if (!isCurrentConversation()) return false;
       if (runID) lastReloadRunID.current = runID;
       lastReloadRequestedAt.current = Date.now();
       try {
         const data = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
-        if (!isCurrentConversation()) return;
+        if (!isCurrentConversation()) return false;
         data.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
         // 过滤掉被撤回的用户消息 — 停止时如果助手还没有输出，后端可能仍会返回用户消息
         const filteredMessages = data.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
         setMessages((current) => mergeReloadMessages(filteredMessages, current));
         setEvents((current) => mergeConversationItems(data.events, current));
         setRun(data.activeRunId || ""); setHasMoreHistory(data.hasMore); setHasMoreMessageHistory(data.hasMoreMessages); setHistoryCursor(data.nextCursor || "");
-      } catch (cause) { if (isCurrentConversation()) fail(cause instanceof Error ? cause.message : "无法刷新会话"); }
+        return true;
+      } catch (cause) {
+        if (isCurrentConversation()) fail(cause instanceof Error ? cause.message : "无法刷新会话");
+        return false;
+      }
     };
 
     const connect = () => {
@@ -846,7 +902,16 @@ export default function ConversationPage() {
       socket.onopen = () => {
         if (!isCurrentConversation()) return;
         reconnectAttempts = 0;
-        void reload();
+        const reconnecting = hasOpenedSocket;
+        hasOpenedSocket = true;
+        if (reconnecting) {
+          void reload();
+          return;
+        }
+        // 首次 HTTP 加载失败时，实时连接建立后补试一次；成功时不重复请求相同历史。
+        void initialHistoryLoad.then((loaded) => {
+          if (!loaded && isCurrentConversation()) void reload();
+        });
       };
       socket.onmessage = (raw) => {
         if (!isCurrentConversation()) return;
@@ -950,6 +1015,8 @@ export default function ConversationPage() {
       };
     };
 
+    // 历史消息不应依赖实时连接。WebSocket 建立慢或不可用时，仍要立即显示已持久化内容。
+    const initialHistoryLoad = reload();
     connect();
 
     return () => {
@@ -1404,12 +1471,6 @@ export default function ConversationPage() {
     finally { setShortcutBusy(""); }
   };
 
-  const resetConversationView = (next: Conversation) => {
-    const nextDraft = projectId ? getConversationDraft(projectId, next.id) : "";
-    setComposerText(nextDraft, next.id);
-    setMessages([]); setEvents([]); setRun(""); setUsage(null); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
-  };
-
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode) => {
     if (sending || clearing || stopping || shortcutBusy || run || !projectId) { closeNewConversation(); return; }
     conversationTransitionRef.current = true;
@@ -1798,7 +1859,7 @@ export default function ConversationPage() {
       </aside>
     </section>
     {showNewConversation && <NewConversationDialog runnerID={project.runner} close={closeNewConversation} create={newConversation} />}
-    {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} />}
+    {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} search={searchConversationHistory} hasMore={Boolean(conversationHistoryCursor)} loadingMore={loadingMoreConversationHistory} loadMore={loadMoreConversationHistory} />}
     {showFullControlConfirmation && <FullControlConfirmationDialog close={() => setShowFullControlConfirmation(false)} confirm={confirmFullControl} changing={changingPermission} isCodex={isCodex} />}
     {showAgentExecution && agentExecutions.find((execution) => execution.runId === showAgentExecution) && <AgentExecutionDialog execution={agentExecutions.find((execution) => execution.runId === showAgentExecution)!} close={closeAgentExecution} />}
     {showUsage && <UsageDialog agentID={conversation?.agentId || "claude-code"} usage={usage} currentRun={currentUsage} close={closeUsage} />}

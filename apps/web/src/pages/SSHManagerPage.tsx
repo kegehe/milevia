@@ -44,6 +44,8 @@ export default function SSHManagerPage() {
   const profileRequestVersion = useRef(0);
   const resolvingCount = useRef(0);
   const preflightRequestVersion = useRef(0);
+  const connectionsRequestVersion = useRef(0);
+  const profilesRequestVersion = useRef(0);
   const mountedRef = useRef(true);
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
   const [saving, setSaving] = useState(false);
@@ -52,12 +54,21 @@ export default function SSHManagerPage() {
   const clearError = () => { setLocalError(""); setError(""); };
 
   const loadConnections = useCallback(async () => {
-    try { const list = await api<any[]>("/api/ssh-connections"); if (mountedRef.current) setConnections(list); } catch { /* ignore */ }
-    if (mountedRef.current) setLoading(false);
+    const requestVersion = ++connectionsRequestVersion.current;
+    try {
+      const list = await api<any[]>("/api/ssh-connections");
+      if (mountedRef.current && requestVersion === connectionsRequestVersion.current) setConnections(list);
+    } catch { /* ignore */ }
+    if (mountedRef.current && requestVersion === connectionsRequestVersion.current) setLoading(false);
   }, [api]);
 
   useEffect(() => { void loadConnections(); }, [loadConnections]);
-  useEffect(() => { void api<string[]>("/api/ssh-profiles").then(setProfiles).catch(() => setProfiles([])); }, [api]);
+  useEffect(() => {
+    const requestVersion = ++profilesRequestVersion.current;
+    void api<string[]>("/api/ssh-profiles")
+      .then((next) => { if (mountedRef.current && requestVersion === profilesRequestVersion.current) setProfiles(next); })
+      .catch(() => { if (mountedRef.current && requestVersion === profilesRequestVersion.current) setProfiles([]); });
+  }, [api]);
   const updateForm = (next: typeof form) => {
     if (next.profileName !== form.profileName) profileRequestVersion.current++;
     preflightRequestVersion.current++;
