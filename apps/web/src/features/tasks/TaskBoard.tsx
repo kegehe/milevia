@@ -22,6 +22,8 @@ type OrchestrationJob = { id: string; taskId: string; position: number; status: 
 type ReleaseSnapshot = { id: string; devSha: string; branch: string; status: string; createdAt: string; confirmedAt?: string };
 
 const DRAG_CLICK_SUPPRESSION_MS = 400;
+// 看板每列初始渲染数量；滚动到底部后再追加一批，避免一次性渲染过长的列。
+const COLUMN_PAGE_SIZE = 8;
 
 function policyLabel(policy?: ExecutionPolicy): string {
   if (policy === "full_control") return "完全控制";
@@ -355,17 +357,46 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
 }
 
 function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchMode, selectedIDs, toggleSelect }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, index: number) => Promise<void>; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void }) {
-  const [showAllDone, setShowAllDone] = useState(false);
   const [dragOverColumn, setDragOverColumn] = useState<string | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [draggingTaskID, setDraggingTaskID] = useState<string | null>(null);
+  // 每列已渲染的任务数量，滚到底部时增量加载更多，避免一次性渲染过长的列。
+  // 批量模式下展开全部，便于勾选与全选。
+  const [visibleCounts, setVisibleCounts] = useState<Record<string, number>>({});
   const columnRefs = useRef<Record<string, HTMLElement | null>>({});
+  const sentinelRefs = useRef<Record<string, HTMLElement | null>>({});
+  const observerRef = useRef<IntersectionObserver | null>(null);
   const dragGestureActive = useRef(false);
   const dragClickSuppressedUntil = useRef(0);
-  const definitions = showHistoricalCancelled ? [...columnDefinitions, historicalCancelledColumn] : columnDefinitions;
+  // 用 useMemo 稳定 definitions 引用：否则勾选“显示历史已取消”时每次渲染都会生成新数组，
+  // 导致下方的 IntersectionObserver effect 反复重建，新 observer 对仍在视口内的哨兵立即触发
+  // 回调，形成连锁加载直到哨兵卸载——无限滚动会退化为一次性全量加载。
+  const definitions = useMemo(() => showHistoricalCancelled ? [...columnDefinitions, historicalCancelledColumn] : columnDefinitions, [showHistoricalCancelled]);
   const grouped = (definition: typeof columnDefinitions[number]) => tasks.filter((task) => definition.statuses.includes(task.status))
     .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-  const DONE_LIMIT = 5;
+
+  // IntersectionObserver 观察各列底部的哨兵元素，进入视口即扩大该列可见数量。
+  useEffect(() => {
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const columnID = (entry.target as HTMLElement).dataset.column;
+        if (!columnID) continue;
+        setVisibleCounts((prev) => ({ ...prev, [columnID]: (prev[columnID] ?? COLUMN_PAGE_SIZE) + COLUMN_PAGE_SIZE }));
+      }
+    }, { root: null, rootMargin: "200px", threshold: 0 });
+    observerRef.current = observer;
+    for (const id of Object.keys(sentinelRefs.current)) {
+      const el = sentinelRefs.current[id];
+      if (el) observer.observe(el);
+    }
+    return () => { observer.disconnect(); observerRef.current = null; };
+  }, [definitions]);
+
+  const registerSentinel = (columnID: string, el: HTMLElement | null) => {
+    sentinelRefs.current[columnID] = el;
+    if (el && observerRef.current) observerRef.current.observe(el);
+  };
 
   const handleColumnDragOver = (e: React.DragEvent, columnID: string) => {
     e.preventDefault();
@@ -429,9 +460,9 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
 
   return <div className={`task-board-columns columns-${definitions.length}`} onClickCapture={handleBoardClickCapture}>{definitions.map((definition) => {
     const items = grouped(definition);
-    const isDone = definition.id === "done";
-    const visible = isDone && !showAllDone && !batchMode ? items.slice(0, DONE_LIMIT) : items;
-    const hidden = isDone && !batchMode ? Math.max(0, items.length - DONE_LIMIT) : 0;
+    const limit = batchMode ? items.length : (visibleCounts[definition.id] ?? COLUMN_PAGE_SIZE);
+    const visible = items.slice(0, limit);
+    const hidden = Math.max(0, items.length - visible.length);
     const isDragOver = dragOverColumn === definition.id;
     const acceptsDrops = definition.id !== "cancelled";
     return <section
@@ -447,7 +478,7 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
         {visible.map((task, index) => (
           <TaskItem key={task.id} task={task} open={open} columnID={definition.id} index={index} isDragging={draggingTaskID === task.id} dropTarget={dragOverColumn === definition.id && dragOverIndex === index} draggable={!batchMode && isDraggable(task, definition.id)} onDragStart={handleTaskDragStart} onDragEnd={handleTaskDragEnd} onDragOver={handleTaskDragOver} batchMode={batchMode} selected={selectedIDs.has(task.id)} toggleSelect={toggleSelect} />
         ))}
-        {isDone && !showAllDone && hidden > 0 && <button className="task-show-more" onClick={() => setShowAllDone(true)}>显示更多（+{hidden}）</button>}
+        {hidden > 0 && <div className="task-show-more" ref={(el) => registerSentinel(definition.id, el)} data-column={definition.id}>还有 {hidden} 项，滚动加载更多…</div>}
         {acceptsDrops && <div className={`task-drop-indicator${dragOverColumn === definition.id && dragOverIndex === visible.length ? " active" : ""}`} onDragOver={(e) => handleTaskDragOver(e, definition.id, visible.length)} onDrop={(e) => handleColumnDrop(e, definition.id)} />}
       </div>
     </section>;

@@ -240,6 +240,7 @@ node apps/desktop/scripts/build-sidecar.mjs --force
 | [15-跨项目通知系统调研与实施方案](docs/15-跨项目通知系统调研与实施方案.md) | 通知系统 |
 | [16-项目文件浏览与编辑系统调研与实施方案](docs/16-项目文件浏览与编辑系统调研与实施方案.md) | 文件编辑系统 |
 | [17-Windows桌面端最终架构与实施方案](docs/17-Windows桌面端最终架构与实施方案.md) | 桌面端架构 |
+| [18-AI CLI配置档案管理调研与实施方案](docs/18-AI%20CLI配置档案管理调研与实施方案.md) | Claude/Codex 配置档案与跨环境密钥策略 |
 
 ## 贡献
 

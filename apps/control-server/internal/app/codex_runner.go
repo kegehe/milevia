@@ -206,6 +206,15 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 		return err
 	}
 	args := []string{"exec"}
+	profileArgs, environment, closeProfile, err := r.profileLaunch(ctx, request.Profile)
+	if err != nil {
+		return err
+	}
+	defer closeProfile()
+	args = append(args, profileArgs...)
+	if request.Profile != nil && request.Profile.Model != "" {
+		args = append(args, "-c", fmt.Sprintf("model=%q", request.Profile.Model))
+	}
 	if request.Resume {
 		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
 	} else {
@@ -213,6 +222,7 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	}
 	cmd := exec.Command(r.config.CodexPath, args...)
 	cmd.Dir = request.ProjectPath
+	cmd.Env = environment
 	configureProcessGroup(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -248,6 +258,10 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 		return fmt.Errorf("Codex exited: %w", err)
 	}
 	return nil
+}
+
+func (r *codexCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeProfile) ([]string, []string, func(), error) {
+	return nil, managedCLIEnvironment(profile, os.Environ()), func() {}, nil
 }
 
 func codexSandbox(policy string) (string, error) {
@@ -326,54 +340,66 @@ func readCodexStderr(reader io.Reader, sink AgentRunSink) {
 	}
 }
 
-func sanitizeCodexJSONL(line []byte) (json.RawMessage, error) {
+// sanitizeAgentJSONL removes credentials before a CLI event reaches any
+// parser, persistence sink, or client-facing stream. Both supported CLIs use
+// JSONL output, so this must remain independent of a particular CLI schema.
+func sanitizeAgentJSONL(line []byte) (json.RawMessage, error) {
 	var payload any
 	if err := json.Unmarshal(line, &payload); err != nil {
 		return nil, err
 	}
-	sanitized, err := json.Marshal(redactCodexJSONValue(payload, ""))
+	sanitized, err := json.Marshal(redactAgentJSONValue(payload, ""))
 	if err != nil {
 		return nil, err
 	}
 	return json.RawMessage(sanitized), nil
 }
 
-func redactCodexJSONValue(value any, field string) any {
+// sanitizeCodexJSONL is kept for existing callers and tests.
+func sanitizeCodexJSONL(line []byte) (json.RawMessage, error) {
+	return sanitizeAgentJSONL(line)
+}
+
+func redactAgentJSONValue(value any, field string) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		redacted := make(map[string]any, len(typed))
 		for key, item := range typed {
-			redacted[key] = redactCodexJSONValue(item, key)
+			redacted[key] = redactAgentJSONValue(item, key)
 		}
 		return redacted
 	case []any:
 		redacted := make([]any, len(typed))
 		for index, item := range typed {
-			redacted[index] = redactCodexJSONValue(item, field)
+			redacted[index] = redactAgentJSONValue(item, field)
 		}
 		return redacted
 	case string:
-		if isSensitiveCodexField(field) {
+		if isSensitiveAgentField(field) {
 			return "[REDACTED]"
 		}
-		return redactCodexText(typed)
+		return redactAgentText(typed)
 	default:
 		return value
 	}
 }
 
-func isSensitiveCodexField(field string) bool {
+func isSensitiveAgentField(field string) bool {
 	field = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(field, "_", ""), "-", ""))
 	return strings.Contains(field, "apikey") || strings.Contains(field, "token") || strings.Contains(field, "password") || strings.Contains(field, "secret") || strings.Contains(field, "authorization") || strings.Contains(field, "credential") || strings.Contains(field, "codexhome")
 }
 
-func redactCodexText(value string) string {
+func redactAgentText(value string) string {
 	value = codexBearerPattern.ReplaceAllString(value, "${1}[REDACTED]")
 	value = codexSensitiveAssignmentPattern.ReplaceAllString(value, "${1}${2}[REDACTED]")
 	value = codexHomePattern.ReplaceAllString(value, "${1}[REDACTED_PATH]")
 	value = codexAuthPathPattern.ReplaceAllString(value, "[REDACTED_PATH]")
 	return codexAPIKeyPattern.ReplaceAllString(value, "[REDACTED]")
 }
+
+// redactCodexText is kept for existing callers that redact Codex-specific
+// file diffs. The implementation is deliberately shared with Claude output.
+func redactCodexText(value string) string { return redactAgentText(value) }
 
 func codexDiagnostic(value string) string {
 	value = redactCodexText(value)
@@ -443,6 +469,7 @@ func enrichCodexFileChange(line json.RawMessage, projectPath string) json.RawMes
 //   - add: the full file content (if small enough)
 //   - modify: a git diff against HEAD
 //   - delete: a placeholder marker
+//
 // The path may be relative or absolute; the resolved path (with symlinks
 // evaluated) must stay inside the project root to prevent directory-traversal
 // and symlink-based information leaks.

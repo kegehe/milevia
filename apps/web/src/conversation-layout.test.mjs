@@ -42,13 +42,13 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /const assistantOutputRuns = useRef\(new Set<string>\(\)\);/);
   assert.match(conversationPage, /const recordAssistantOutput = useCallback[\s\S]*?if \(outputs\.size > 128\)[\s\S]*?pendingUserDrafts\.current\.delete\(runID\);/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.set\(data\.runId, data\.message\.content\)/);
-  assert.match(conversationPage, /const draftToRestore = assistantOutputRuns\.current\.has\(runID\) \? undefined : pendingUserDrafts\.current\.get\(runID\);/);
+  assert.match(conversationPage, /const shouldRetractMessage = !assistantOutputRuns\.current\.has\(runID\);\s*const draftToRestore = shouldRetractMessage \? pendingUserDrafts\.current\.get\(runID\) : undefined;/s);
   assert.match(conversationPage, /const restorePendingUserDraft = \(conversationID: string, routeVersion: number, runID: string, draft: string \| undefined\) => \{\s*if \(!draft \|\| conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;/s);
   assert.match(conversationPage, /setText\(\(current\) => current === "" \? draft : current\);/);
   assert.match(conversationPage, /saveConversationDraft\(projectId, conversationID, restoredText\)/);
   assert.match(conversationPage, /const conversationID = conversation\.id;\s*const routeVersion = conversationRouteVersion\.current;\s*const runID = run;/s);
   assert.match(conversationPage, /restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
-  assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{ restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
+  assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{ retractUserMessage\(\); restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
 });
 
@@ -317,7 +317,7 @@ test("agent work is progressive: primary chat stays clean and trace details rema
   assert.match(conversationPage, /<AgentExecutionCard key=\{execution\.runId\}/);
   assert.match(conversationPage, /<AgentExecutionDialog execution=/);
   assert.match(timelineLib, /node\.status = "unresolved"/);
-  assert.match(conversationPage, /setMessages\(\(current\) => mergeConversationItems\(data\.messages, current\)\)/);
+  assert.match(conversationPage, /setMessages\(\(current\) => mergeReloadMessages\(filteredMessages, current\)\)/);
   assert.match(conversationPage, /setEvents\(\(current\) => mergeConversationItems\(data\.events, current\)\)/);
   assert.match(stylesheet, /\.agent-execution-card\s*\{/);
   assert.match(stylesheet, /\.agent-execution-dialog\s*\{/);

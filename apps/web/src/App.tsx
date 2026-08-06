@@ -13,6 +13,7 @@ import TaskBoardPage from "./pages/TaskBoardPage";
 import GitWorkbenchPage from "./pages/GitWorkbenchPage";
 import ProjectRunPage from "./pages/ProjectRunPage";
 import FilesPage from "./pages/FilesPage";
+import AgentProfilesPage from "./pages/AgentProfilesPage";
 
 export function App() {
   return (
@@ -24,6 +25,7 @@ export function App() {
             <Route path="/" element={<DashboardPage />} />
             <Route path="/projects/import" element={<ImportProjectPage />} />
             <Route path="/ssh-manager" element={<SSHManagerPage />} />
+            <Route path="/agent-profiles" element={<AgentProfilesPage />} />
             <Route path="/projects/:projectId" element={<ProjectLayout />}>
               <Route index element={<Navigate to="conversations" replace />} />
               <Route path="conversations" element={<ConversationPage />} />

@@ -157,6 +157,8 @@ type Server struct {
 	cancels                map[string]context.CancelFunc
 	runTokens              map[string]string
 	runContexts            map[string]string
+	profileAdmissions      *profileRevisionAdmissionGate
+	profileRunCancels      map[string]map[string]context.CancelFunc
 	streamingSetups        map[string]*streamingSetup
 	projectWorkspaceLeases map[string]*projectWorkspaceLease
 	runWorkspaceReleases   map[string]func()
@@ -273,20 +275,21 @@ type Conversation struct {
 	ProjectID string `json:"projectId"`
 	// ClaudeSessionID is retained for clients and databases created before the
 	// agent-neutral session migration. New execution code uses AgentSessionID.
-	ClaudeSessionID   string    `json:"claudeSessionId,omitempty"`
-	AgentID           string    `json:"agentId"`
-	AgentSessionID    string    `json:"agentSessionId"`
-	AgentRuntimeID    string    `json:"agentRuntimeId"`
-	ExecutionPolicy   string    `json:"executionPolicy"`
-	Status            string    `json:"status"`
-	PermissionMode    string    `json:"permissionMode"`
-	Title             string    `json:"title"`
-	Preview           string    `json:"preview,omitempty"`
-	LastActivityAt    time.Time `json:"lastActivityAt"`
-	ClaudeInitialized bool      `json:"-"`
-	AgentInitialized  bool      `json:"-"`
-	IsCurrent         bool      `json:"isCurrent"`
-	CreatedAt         time.Time `json:"createdAt"`
+	ClaudeSessionID        string    `json:"claudeSessionId,omitempty"`
+	AgentID                string    `json:"agentId"`
+	AgentSessionID         string    `json:"agentSessionId"`
+	AgentRuntimeID         string    `json:"agentRuntimeId"`
+	AgentProfileRevisionID string    `json:"agentProfileRevisionId,omitempty"`
+	ExecutionPolicy        string    `json:"executionPolicy"`
+	Status                 string    `json:"status"`
+	PermissionMode         string    `json:"permissionMode"`
+	Title                  string    `json:"title"`
+	Preview                string    `json:"preview,omitempty"`
+	LastActivityAt         time.Time `json:"lastActivityAt"`
+	ClaudeInitialized      bool      `json:"-"`
+	AgentInitialized       bool      `json:"-"`
+	IsCurrent              bool      `json:"isCurrent"`
+	CreatedAt              time.Time `json:"createdAt"`
 }
 
 type Message struct {
@@ -448,7 +451,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return s.allowedOrigin(r.Header.Get("Origin")) }
 	if config.SessionToken != "" {
 		s.upgrader.Subprotocols = []string{s.websocketSessionProtocol()}
@@ -617,6 +620,13 @@ func (s *Server) routes() http.Handler {
 		r.Post("/api/internal/shutdown", s.shutdown)
 	}
 	r.Get("/api/runners", s.listRunners)
+	r.Get("/api/runners/{runnerID}/agent-profiles", s.listAgentProfiles)
+	r.Post("/api/runners/{runnerID}/agent-profiles", s.createAgentProfile)
+	r.Patch("/api/agent-profiles/{profileID}", s.updateAgentProfile)
+	r.Post("/api/agent-profiles/{profileID}/validate", s.validateAgentProfile)
+	r.Post("/api/agent-profiles/{profileID}/enable", s.enableAgentProfile)
+	r.Post("/api/agent-profiles/{profileID}/disable", s.disableAgentProfile)
+	r.Post("/api/agent-profile-revisions/{revisionID}/revoke", s.revokeAgentProfileRevision)
 	r.Post("/api/runners/{runnerID}/claude/check-update", s.checkClaudeUpdate)
 	r.Post("/api/runners/{runnerID}/claude/update", s.updateClaude)
 	r.Post("/api/runners/{runnerID}/codex/check-update", s.checkCodexUpdate)
@@ -970,6 +980,9 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	}
 	if err := s.migratePersistedRunners(ctx); err != nil {
 		return fmt.Errorf("migrate persisted runners: %w", err)
+	}
+	if err := s.migrateAgentProfiles(ctx); err != nil {
+		return err
 	}
 	if err := ensureColumn(ctx, s.db, "project_run_configs", "execution_target", "text not null default 'auto'"); err != nil {
 		return fmt.Errorf("add project run execution target: %w", err)
@@ -1973,8 +1986,9 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 	newSession := r.URL.Query().Get("new") == "true"
 	var input struct {
-		PermissionMode string `json:"permissionMode"`
-		AgentID        string `json:"agentId"`
+		PermissionMode string  `json:"permissionMode"`
+		AgentID        string  `json:"agentId"`
+		ProfileID      *string `json:"profileId"`
 	}
 	if r.Body != http.NoBody {
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
@@ -2004,23 +2018,6 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if input.AgentID == "codex" {
-		if strings.HasPrefix(projectRunner, "ssh-") {
-			runner, ok := s.runnerRegistry.get(projectRunner)
-			if !ok {
-				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试"))
-				return
-			}
-			codexR, ok := runner.(CodexCapableRunner)
-			if !ok || !codexR.CodexReady(r.Context()) {
-				writeError(w, http.StatusServiceUnavailable, errors.New("远程服务器上 Codex CLI 不可用或未登录"))
-				return
-			}
-		} else if !s.codexRunner.Ready(r.Context()) {
-			writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
-			return
-		}
-	}
 	// New conversations replace the project's current conversation. Keep that
 	// transition ordered with message admission and context clearing.
 	s.projectLifecycleMu.Lock()
@@ -2034,6 +2031,36 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	profileRevisionID, err := s.profileForNewConversationTx(r.Context(), tx, input.ProfileID, projectRunner, input.AgentID)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	c.AgentProfileRevisionID = profileRevisionID
+	if input.AgentID == "codex" {
+		if strings.HasPrefix(projectRunner, "ssh-") {
+			runner, ok := s.runnerRegistry.get(projectRunner)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试"))
+				return
+			}
+			codexR, ok := runner.(CodexCapableRunner)
+			if !ok || !codexR.CodexReady(r.Context()) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("远程服务器上 Codex CLI 不可用或未登录"))
+				return
+			}
+		} else {
+			_, profileErr := s.runtimeProfileTx(r.Context(), tx, profileRevisionID, projectRunner, input.AgentID)
+			if profileErr != nil {
+				writeError(w, http.StatusConflict, profileErr)
+				return
+			}
+			if !s.codexRunner.Ready(r.Context()) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
+				return
+			}
+		}
+	}
 	if newSession {
 		var status string
 		err = tx.QueryRowContext(r.Context(), `select status from conversations where project_id=$1 and is_current=1`, projectID).Scan(&status)
@@ -2051,7 +2078,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var existing Conversation
-		err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where project_id=$1 and is_current=1`, projectID).Scan(&existing.ID, &existing.ProjectID, &existing.ClaudeSessionID, &existing.AgentID, &existing.AgentSessionID, &existing.AgentRuntimeID, &existing.ExecutionPolicy, &existing.Status, &existing.PermissionMode, &existing.Title, &existing.LastActivityAt, &existing.ClaudeInitialized, &existing.AgentInitialized, &existing.IsCurrent, &existing.CreatedAt)
+		err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where project_id=$1 and is_current=1`, projectID).Scan(&existing.ID, &existing.ProjectID, &existing.ClaudeSessionID, &existing.AgentID, &existing.AgentSessionID, &existing.AgentRuntimeID, &existing.AgentProfileRevisionID, &existing.ExecutionPolicy, &existing.Status, &existing.PermissionMode, &existing.Title, &existing.LastActivityAt, &existing.ClaudeInitialized, &existing.AgentInitialized, &existing.IsCurrent, &existing.CreatedAt)
 		if err == nil {
 			if err = tx.Commit(); err != nil {
 				writeError(w, 500, err)
@@ -2065,7 +2092,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, c.ID, c.ProjectID, c.ClaudeSessionID, c.AgentID, c.AgentSessionID, c.AgentRuntimeID, c.ExecutionPolicy, c.Status, c.PermissionMode, c.Title, c.LastActivityAt, c.ClaudeInitialized, c.AgentInitialized, c.IsCurrent, c.CreatedAt); err != nil {
+	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, c.ID, c.ProjectID, c.ClaudeSessionID, c.AgentID, c.AgentSessionID, c.AgentRuntimeID, c.AgentProfileRevisionID, c.ExecutionPolicy, c.Status, c.PermissionMode, c.Title, c.LastActivityAt, c.ClaudeInitialized, c.AgentInitialized, c.IsCurrent, c.CreatedAt); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -2077,7 +2104,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	rows, err := s.db.QueryContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),'') from conversations c where c.project_id=$1 and ($2='' or lower(c.title) like '%' || lower($2) || '%') order by c.is_current desc,c.last_activity_at desc limit 100`, chi.URLParam(r, "projectID"), query)
+	rows, err := s.db.QueryContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),'') from conversations c where c.project_id=$1 and ($2='' or lower(c.title) like '%' || lower($2) || '%') order by c.is_current desc,c.last_activity_at desc limit 100`, chi.URLParam(r, "projectID"), query)
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -2086,7 +2113,7 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	items := []Conversation{}
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt, &c.Preview); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.AgentProfileRevisionID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt, &c.Preview); err != nil {
 			writeError(w, 500, err)
 			return
 		}
@@ -2118,7 +2145,7 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 	var previous Conversation
 	var projectRunner string
-	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &projectRunner)
+	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.AgentProfileRevisionID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -2138,7 +2165,7 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	sessionID := uuid.NewString()
-	fresh := Conversation{ID: uuid.NewString(), ProjectID: previous.ProjectID, ClaudeSessionID: sessionID, AgentID: previous.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, ExecutionPolicy: previous.executionPolicy(), Status: "idle", PermissionMode: previous.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: true, CreatedAt: now}
+	fresh := Conversation{ID: uuid.NewString(), ProjectID: previous.ProjectID, ClaudeSessionID: sessionID, AgentID: previous.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, AgentProfileRevisionID: previous.AgentProfileRevisionID, ExecutionPolicy: previous.executionPolicy(), Status: "idle", PermissionMode: previous.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: true, CreatedAt: now}
 	result, err := tx.ExecContext(r.Context(), `update conversations set is_current=0 where id=? and is_current=1 and status='idle'`, previous.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -2153,7 +2180,7 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("conversation changed while clearing"))
 		return
 	}
-	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, fresh.ID, fresh.ProjectID, fresh.ClaudeSessionID, fresh.AgentID, fresh.AgentSessionID, fresh.AgentRuntimeID, fresh.ExecutionPolicy, fresh.Status, fresh.PermissionMode, fresh.Title, fresh.LastActivityAt, fresh.ClaudeInitialized, fresh.AgentInitialized, fresh.IsCurrent, fresh.CreatedAt); err != nil {
+	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, fresh.ID, fresh.ProjectID, fresh.ClaudeSessionID, fresh.AgentID, fresh.AgentSessionID, fresh.AgentRuntimeID, fresh.AgentProfileRevisionID, fresh.ExecutionPolicy, fresh.Status, fresh.PermissionMode, fresh.Title, fresh.LastActivityAt, fresh.ClaudeInitialized, fresh.AgentInitialized, fresh.IsCurrent, fresh.CreatedAt); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2206,7 +2233,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var c Conversation
-	err = s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt)
+	err = s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.AgentProfileRevisionID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt)
 	if err != nil {
 		writeError(w, 404, errors.New("conversation not found"))
 		return
@@ -2415,7 +2442,7 @@ func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	var conversation Conversation
-	err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
+	err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -2466,7 +2493,7 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 	defer s.projectLifecycleMu.Unlock()
 	conversationID := chi.URLParam(r, "conversationID")
 	var conversation Conversation
-	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
+	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -2824,7 +2851,7 @@ func (s *Server) deleteShortcut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) shortcutForConversation(ctx context.Context, shortcutID, conversationID string) (Shortcut, Conversation, Project, error) {
 	var conversation Conversation
 	var project Project
-	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.id,p.name,p.path,coalesce(nullif(p.runner_id,''),p.runner),p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.id,p.name,p.path,coalesce(nullif(p.runner_id,''),p.runner),p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
 	if err != nil {
 		return Shortcut{}, Conversation{}, Project{}, err
 	}
@@ -2982,13 +3009,14 @@ func (s *Server) runShortcut(w http.ResponseWriter, r *http.Request) {
 }
 
 type messageAdmission struct {
-	agentID  string
-	runnerID string
+	agentID           string
+	runnerID          string
+	profileRevisionID string
 }
 
 func (s *Server) messageAdmission(ctx context.Context, conversationID string) (messageAdmission, error) {
 	var admission messageAdmission
-	err := s.db.QueryRowContext(ctx, `select c.agent_id,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&admission.agentID, &admission.runnerID)
+	err := s.db.QueryRowContext(ctx, `select c.agent_id,coalesce(nullif(p.runner_id,''),p.runner),c.agent_profile_revision_id from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&admission.agentID, &admission.runnerID, &admission.profileRevisionID)
 	return admission, err
 }
 
@@ -3023,6 +3051,12 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 			return Message{}, "", nil, http.StatusConflict, errors.New("this AI CLI is being updated on this runner")
 		}
 	}
+	var profileGate *sync.RWMutex
+	if admission.profileRevisionID != "" {
+		profileGate = s.profileAdmissions.gate(admission.profileRevisionID)
+		profileGate.RLock()
+		defer profileGate.RUnlock()
+	}
 
 	runID := uuid.NewString()
 	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, CreatedAt: time.Now().UTC()}
@@ -3034,12 +3068,16 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	var conversation Conversation
 	var projectPath string
 	var projectRunner string
-	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
+	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, "", nil, http.StatusNotFound, errors.New("conversation not found")
 	}
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
+	}
+	profile, err := s.runtimeProfileTx(ctx, tx, conversation.AgentProfileRevisionID, projectRunner, conversation.AgentID)
+	if err != nil {
+		return Message{}, "", nil, http.StatusConflict, err
 	}
 	if !conversation.IsCurrent {
 		return Message{}, "", nil, http.StatusConflict, errors.New("activate this conversation before sending a message")
@@ -3142,7 +3180,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		if streaming {
 			status = "queued"
 		}
-		_, err = tx.ExecContext(ctx, `insert into runs (id,conversation_id,agent_id,agent_runtime_id,execution_policy,agent_run_id,status,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8)`, runID, conversationID, conversation.AgentID, projectRunner, conversation.executionPolicy(), "", status, m.CreatedAt)
+		_, err = tx.ExecContext(ctx, `insert into runs (id,conversation_id,agent_id,agent_runtime_id,agent_profile_revision_id,execution_policy,agent_run_id,status,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, runID, conversationID, conversation.AgentID, projectRunner, conversation.AgentProfileRevisionID, conversation.executionPolicy(), "", status, m.CreatedAt)
 	}
 	if err == nil && record != nil && record.Shortcut != nil {
 		record.Shortcut.RunID = runID
@@ -3196,9 +3234,10 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		s.mu.Lock()
 		s.cancels[runID] = cancel
 		s.runContexts[runID] = conversation.ID
+		s.registerProfileRunCancelLocked(conversation.AgentProfileRevisionID, runID, cancel)
 		s.streamingSetups[runID] = &streamingSetup{}
 		s.mu.Unlock()
-		s.submitStreamingRun(runCtx, streamingRunner, runID, conversation, projectPath, content)
+		s.submitStreamingRunWithProfile(runCtx, streamingRunner, runID, conversation, profile, projectPath, content)
 		return m, runID, record, http.StatusAccepted, nil
 	}
 	runCtx, cancel := context.WithCancel(s.runtimeCtx)
@@ -3214,11 +3253,12 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	s.cancels[runID] = cancel
 	s.runTokens[runID] = runToken
 	s.runContexts[runID] = conversation.ID
+	s.registerProfileRunCancelLocked(conversation.AgentProfileRevisionID, runID, cancel)
 	s.mu.Unlock()
 	s.beginRunUsage(runID, conversation.ID)
 	go func() {
 		defer s.runWG.Done()
-		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, projectPath, content)
+		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectPath, content)
 	}()
 	return m, runID, record, http.StatusAccepted, nil
 }
@@ -3267,6 +3307,29 @@ func (s *Server) registerRunWorkspace(runID string, release func()) {
 	s.mu.Unlock()
 }
 
+// registerProfileRunCancelLocked makes a Run visible to revision revocation
+// before the admission lock is released. Caller must hold s.mu.
+func (s *Server) registerProfileRunCancelLocked(revisionID, runID string, cancel context.CancelFunc) {
+	if revisionID == "" {
+		return
+	}
+	if s.profileRunCancels[revisionID] == nil {
+		s.profileRunCancels[revisionID] = map[string]context.CancelFunc{}
+	}
+	s.profileRunCancels[revisionID][runID] = cancel
+}
+
+func (s *Server) unregisterProfileRunCancel(runID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for revisionID, cancels := range s.profileRunCancels {
+		delete(cancels, runID)
+		if len(cancels) == 0 {
+			delete(s.profileRunCancels, revisionID)
+		}
+	}
+}
+
 func (s *Server) releaseRunWorkspace(runID string) {
 	s.mu.Lock()
 	release := s.runWorkspaceReleases[runID]
@@ -3278,15 +3341,19 @@ func (s *Server) releaseRunWorkspace(runID string) {
 }
 
 func (s *Server) submitStreamingRun(ctx context.Context, runner StreamingAgentRunner, runID string, conversation Conversation, projectPath, prompt string) {
+	s.submitStreamingRunWithProfile(ctx, runner, runID, conversation, nil, projectPath, prompt)
+}
+
+func (s *Server) submitStreamingRunWithProfile(ctx context.Context, runner StreamingAgentRunner, runID string, conversation Conversation, profile *AgentRuntimeProfile, projectPath, prompt string) {
 	// startMessage holds streamMu across admission and the ordered transport
 	// write. streamingSetups separately lets a stop cancel initialization before
 	// the first prompt is admitted.
-	session, err := s.streamingSession(ctx, runner, runID, conversation, projectPath)
+	session, err := s.streamingSession(ctx, runner, runID, conversation, profile, projectPath)
 	if err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
 	}
-	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID}
+	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID, Profile: profile}
 	if err := s.beginStreamingRun(ctx, runID); err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
@@ -3315,7 +3382,7 @@ func (s *Server) beginStreamingRun(ctx context.Context, runID string) error {
 	return nil
 }
 
-func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunner, runID string, conversation Conversation, projectPath string) (AgentSession, error) {
+func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunner, runID string, conversation Conversation, profile *AgentRuntimeProfile, projectPath string) (AgentSession, error) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	s.mu.Lock()
@@ -3343,7 +3410,7 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	}
 	s.mu.Unlock()
 	token := uuid.NewString()
-	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token})
+	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile})
 	if err != nil {
 		return nil, err
 	}
@@ -3412,6 +3479,7 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 		runErr = errors.New("streaming agent session stopped")
 	}
 	for _, runID := range runIDs {
+		s.unregisterProfileRunCancel(runID)
 		s.recordUsagePersistenceError(runID, conversationID, s.persistRunUsage(runID, status))
 		s.discardRunUsage(runID)
 		s.resolveRunApprovals(runID, "deny")
@@ -3419,8 +3487,9 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 	}
 }
 
-func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, projectPath, prompt string) {
+func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, profile *AgentRuntimeProfile, projectPath, prompt string) {
 	defer func() {
+		s.unregisterProfileRunCancel(runID)
 		s.discardRunUsage(runID)
 		s.resolveRunApprovals(runID, "deny")
 		s.mu.Lock()
@@ -3438,6 +3507,7 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		RunID:          runID,
 		RunToken:       runToken,
 		AgentID:        c.AgentID,
+		Profile:        profile,
 	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, agentID: c.AgentID})
 	status := "completed"
 	if ctx.Err() != nil {
@@ -3512,6 +3582,7 @@ func (sink *agentRunSink) TurnFinished(err error) {
 }
 
 func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) {
+	s.unregisterProfileRunCancel(runID)
 	s.mu.Lock()
 	stopped := false
 	if session := s.sessions[conversationID]; session != nil {
@@ -4281,11 +4352,12 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	result := make([]map[string]any, 0, len(metas))
 	for _, m := range metas {
 		entry := map[string]any{
-			"id":          m.ID,
-			"name":        m.Name,
-			"environment": m.Environment,
-			"root":        m.Root,
-			"roots":       m.Roots,
+			"id":                m.ID,
+			"name":              m.Name,
+			"environment":       m.Environment,
+			"root":              m.Root,
+			"roots":             m.Roots,
+			"profileManagement": s.canManageProfileRunner(m.ID),
 		}
 		if m.Host != "" {
 			entry["host"] = m.Host

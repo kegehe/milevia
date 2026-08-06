@@ -76,6 +76,12 @@ test("orders equal-priority tasks by position before creation time", () => {
   assert.deepEqual(sortQueueTasks([second, first]).map((task) => task.id), ["first", "second"]);
 });
 
+test("places pinned tasks ahead of status and priority ordering", () => {
+  const running = makeTask("running", { status: "running", priority: "urgent", position: 1 });
+  const pinned = makeTask("pinned", { status: "todo", priority: "low", position: 99, pinned: true });
+  assert.deepEqual(sortQueueTasks([running, pinned]).map((task) => task.id), ["pinned", "running"]);
+});
+
 test("keeps blocked tasks out of dispatch actions and explains why", () => {
   const blocked = makeTask("blocked", {
     blockedBy: [{ taskId: "predecessor", title: "完成接口设计", status: "todo" }],

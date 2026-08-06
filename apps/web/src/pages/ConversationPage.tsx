@@ -21,7 +21,7 @@ import type {
   Conversation, Message, Event, Shortcut, ShortcutEditorState,
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
   AgentExecution, RunUsage, ConversationUsageResponse,
-  RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant,
+  RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
 } from "../lib/types";
 import { api, asRecord } from "../lib/api";
 import { createWebSocket } from "../lib/runtime";
@@ -315,18 +315,29 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
   })}</div><footer><span>{busyID ? "正在切换会话" : `${filtered.length} 条记录`}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
 }
 
-function NewConversationDialog({ runnerID, close, create }: { runnerID: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode) => Promise<void> }) {
+function NewConversationDialog({ runnerID, close, create }: { runnerID: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => Promise<void> }) {
   const [agentId, setAgentId] = useState<AgentID>("claude-code");
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("full_control");
   const [creating, setCreating] = useState(false);
   const [runner, setRunner] = useState<RunnerInfo | null>(null);
+  const [profiles, setProfiles] = useState<AgentProfile[]>([]);
+  const [profileID, setProfileID] = useState("");
+  const [profilesSupported, setProfilesSupported] = useState(false);
+  const navigate = useNavigate();
   useEffect(() => { api<RunnerInfo[]>("/api/runners").then((items) => setRunner(items.find((item) => item.id === runnerID) || null)).catch(() => setRunner(null)); }, [runnerID]);
-  const selectAgent = (next: AgentID) => { setAgentId(next); setPermissionMode(next === "codex" ? "workspace_write" : "full_control"); };
+  useEffect(() => { api<AgentProfile[]>(`/api/runners/${runnerID}/agent-profiles`).then((items) => { setProfiles(items); setProfilesSupported(true); }).catch(() => { setProfiles([]); setProfilesSupported(false); }); }, [runnerID]);
+  const availableProfiles = useMemo(() => profiles.filter((profile) => profile.agentId === agentId && profile.enabled && profile.state === "active" && profile.authMode === "cli_managed"), [agentId, profiles]);
+  useEffect(() => {
+    if (availableProfiles.some((profile) => profile.id === profileID)) return;
+    setProfileID("");
+  }, [availableProfiles, profileID]);
+  const selectAgent = (next: AgentID) => { setAgentId(next); setProfileID(""); setPermissionMode(next === "codex" ? "workspace_write" : "full_control"); };
   const codexStatus = runner?.codex;
   const codexReady = codexStatus?.status === "ready";
-  const submit = async () => { if (agentId === "codex" && !codexReady) return; setCreating(true); try { await create(agentId, permissionMode); } finally { setCreating(false); } };
+	const codexAvailable = codexReady;
+  const submit = async () => { if (agentId === "codex" && !codexAvailable) return; setCreating(true); try { await create(agentId, permissionMode, profileID || undefined); } finally { setCreating(false); } };
   const codex = agentId === "codex";
-  return <div className="backdrop" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) close(); }}><section className="modal permission-dialog"><header><div><h2>新会话</h2></div><button title="关闭" onClick={close}>x</button></header><div className="permission-options"><button className={!codex ? "active" : ""} onClick={() => selectAgent("claude-code")}><b>Claude Code</b></button><button className={codex ? "active" : ""} disabled={Boolean(runner) && !codexReady} title={codexStatus?.reason} onClick={() => selectAgent("codex")}><b>Codex</b></button></div><div className="permission-options">{codex ? <><button className={permissionMode === "read_only" ? "active" : ""} onClick={() => setPermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={permissionMode === "workspace_write" ? "active" : ""} onClick={() => setPermissionMode("workspace_write")}><b>项目内执行</b><span>可在项目范围内读写和执行。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Codex 可直接执行命令，不受沙箱限制。</span></button></> : <><button className={permissionMode === "approval_required" ? "active" : ""} onClick={() => setPermissionMode("approval_required")}><b>默认权限</b><span>每条终端命令执行前等待确认。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Claude 可直接执行命令，不会等待确认。</span></button></>}</div><footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={creating || (codex && !codexReady)} onClick={() => void submit()}>{creating ? "创建中" : "创建会话"}</button></footer></section></div>;
+  return <div className="backdrop" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) close(); }}><section className="modal permission-dialog"><header><div><h2>新会话</h2></div><button title="关闭" onClick={close}>x</button></header><div className="permission-options"><button className={!codex ? "active" : ""} onClick={() => selectAgent("claude-code")}><b>Claude Code</b></button><button className={codex ? "active" : ""} disabled={Boolean(runner) && !codexAvailable} title={codexStatus?.reason} onClick={() => selectAgent("codex")}><b>Codex</b></button></div>{availableProfiles.length > 0 && <label className="conversation-profile-select"><span>配置档案</span><select value={profileID} onChange={(event) => setProfileID(event.target.value)}><option value="">使用原有 CLI 配置</option>{availableProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.model ? ` (${profile.model})` : ""}</option>)}</select></label>}{profilesSupported && <button className="conversation-profile-manage" type="button" onClick={() => navigate("/agent-profiles")}>管理配置档案</button>}<div className="permission-options">{codex ? <><button className={permissionMode === "read_only" ? "active" : ""} onClick={() => setPermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={permissionMode === "workspace_write" ? "active" : ""} onClick={() => setPermissionMode("workspace_write")}><b>项目内执行</b><span>可在项目范围内读写和执行。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Codex 可直接执行命令，不受沙箱限制。</span></button></> : <><button className={permissionMode === "approval_required" ? "active" : ""} onClick={() => setPermissionMode("approval_required")}><b>默认权限</b><span>每条终端命令执行前等待确认。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Claude 可直接执行命令，不会等待确认。</span></button></>}</div><footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={creating || (codex && !codexAvailable)} onClick={() => void submit()}>{creating ? "创建中" : "创建会话"}</button></footer></section></div>;
 }
 
 function FullControlConfirmationDialog({ close, confirm, changing, isCodex }: { close: () => void; confirm: () => Promise<void>; changing: boolean; isCodex?: boolean }) {
@@ -1410,12 +1421,12 @@ export default function ConversationPage() {
     setMessages([]); setEvents([]); setRun(""); setUsage(null); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
   };
 
-  const newConversation = async (agentId: AgentID, permissionMode: PermissionMode) => {
+  const newConversation = async (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => {
     if (sending || clearing || stopping || shortcutBusy || run || !projectId) { closeNewConversation(); return; }
     conversationTransitionRef.current = true;
     setClearing(true);
     try {
-      const next = await projectApi<Conversation>(`/api/projects/${projectId}/conversations?new=true`, { method: "POST", body: JSON.stringify({ agentId, permissionMode }) });
+      const next = await projectApi<Conversation>(`/api/projects/${projectId}/conversations?new=true`, { method: "POST", body: JSON.stringify({ agentId, permissionMode, profileId: profileID || "" }) });
       resetConversationView(next);
       navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));

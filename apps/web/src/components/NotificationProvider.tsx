@@ -217,7 +217,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
           });
       };
 
-      ws.onmessage = (raw) => {
+      ws.onmessage = (raw: MessageEvent) => {
         try {
           const event: NotificationEvent = JSON.parse(raw.data);
           handleNotification(event);

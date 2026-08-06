@@ -5510,6 +5510,32 @@ func TestTaskUpdatePositionAllowsZero(t *testing.T) {
 	}
 }
 
+func TestTaskPinningPersistsAndLeadsTaskList(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	firstID := createTaskForTest(t, server.routes(), projectID, "First task")
+	pinnedID := createTaskForTest(t, server.routes(), projectID, "Pinned task")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/tasks/"+pinnedID, bytes.NewBufferString(`{"title":"Pinned task","description":"Implement pinned queue ordering safely.","acceptanceCriteria":"Pinned tasks are first.","priority":"low","pinned":true,"position":999}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("pin task: %d body=%s", response.Code, response.Body.String())
+	}
+	listResponse := httptest.NewRecorder()
+	server.routes().ServeHTTP(listResponse, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/tasks", nil))
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("list tasks: %d body=%s", listResponse.Code, listResponse.Body.String())
+	}
+	var tasks []Task
+	if err := json.NewDecoder(listResponse.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode task list: %v", err)
+	}
+	if len(tasks) < 2 || tasks[0].ID != pinnedID || !tasks[0].Pinned {
+		t.Fatalf("pinned task was not first: %#v", tasks)
+	}
+	if tasks[1].ID != firstID {
+		t.Fatalf("unexpected second task: %q", tasks[1].ID)
+	}
+}
+
 func TestDeleteTaskRemovesTerminalTask(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Delete me")

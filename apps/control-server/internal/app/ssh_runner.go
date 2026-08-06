@@ -375,8 +375,8 @@ func (c *sshClient) execCommand(ctx context.Context, cmd string) ([]byte, error)
 // cappedWriter 写入最多 limit 字节到 buf，超出部分继续读取但丢弃，
 // 确保远端进程不会因 stdout 管道流控而阻塞（与本地 gitOutputCollector 行为一致）。
 type cappedWriter struct {
-	buf   *bytes.Buffer
-	limit int
+	buf     *bytes.Buffer
+	limit   int
 	written int
 }
 
@@ -1100,7 +1100,11 @@ func (s *sshAgentSession) readOutputLoop() error {
 	scanner := bufio.NewScanner(s.stdout)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
+		line, err := sanitizeAgentJSONL(scanner.Bytes())
+		if err != nil {
+			s.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
+			continue
+		}
 		var envelope struct {
 			Type            string `json:"type"`
 			Subtype         string `json:"subtype"`
@@ -1138,9 +1142,10 @@ func (s *sshAgentSession) readOutputLoop() error {
 
 func (s *sshAgentSession) readStderrLoop() {
 	scanner := bufio.NewScanner(s.stderr)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		if text := strings.TrimSpace(scanner.Text()); text != "" {
-			s.emit("stderr", mustJSON(map[string]string{"message": text}), false)
+			s.emit("stderr", mustJSON(map[string]string{"message": redactAgentText(text)}), false)
 		}
 	}
 }
@@ -1371,7 +1376,11 @@ func readClaudeJSONLines(reader io.Reader, sink AgentRunSink) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
+		line, err := sanitizeAgentJSONL(scanner.Bytes())
+		if err != nil {
+			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
+			continue
+		}
 		var envelope struct {
 			Type            string `json:"type"`
 			Subtype         string `json:"subtype"`
@@ -1414,13 +1423,14 @@ func readClaudeJSONLines(reader io.Reader, sink AgentRunSink) error {
 // readStderrLines reads lines from stderr and emits them as stream.error events.
 func readStderrLines(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		text := strings.TrimSpace(scanner.Text())
 		if text == "" {
 			continue
 		}
 		if sink != nil {
-			sink.Event("stderr", mustJSON(map[string]string{"message": text}))
+			sink.Event("stderr", mustJSON(map[string]string{"message": redactAgentText(text)}))
 		}
 	}
 }

@@ -4,6 +4,9 @@
 .permission-options button.active.danger { border-color: #ef7058; box-shadow: inset 0 0 0 1px #ef7058; background: #fff0ec; }
 .permission-options b { color: #19332c; font-size: 14px; }
 .permission-options span { color: #6b8178; font-size: 12px; line-height: 1.45; }
+.conversation-profile-select { display: grid; gap: 6px; padding: 0 18px 4px; color: #49665c; font-size: 12px; }
+.conversation-profile-select select { width: 100%; min-height: 36px; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 10px; color: #19332c; background: #fff; }
+.conversation-profile-manage { margin: 0 18px; padding: 0; border: 0; color: #277566; background: transparent; font-size: 12px; text-align: left; }
 .permission-confirmation { margin: 0; padding: 4px 18px 20px; color: #5f7169; line-height: 1.55; }
 .permission-dialog .primary.danger { border-color: #dc5c46; color: #fff; background: #e6624b; }
 .permission-dialog .primary.danger:hover { background: #d5513c; }
