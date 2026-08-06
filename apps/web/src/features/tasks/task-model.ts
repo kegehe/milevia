@@ -12,6 +12,7 @@ export type Task = {
   description: string;
   acceptanceCriteria: string;
   priority: Priority;
+  pinned?: boolean;
   position: number;
   status: TaskStatus;
   dependsOn: Dependency[];
@@ -115,5 +116,5 @@ export function taskRunStatusLabel(status: string): string {
 }
 
 export function sortQueueTasks(tasks: Task[]): Task[] {
-  return [...tasks].sort((left, right) => queueRank(left) - queueRank(right) || priorityRank[left.priority] - priorityRank[right.priority] || left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
+  return [...tasks].sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned)) || queueRank(left) - queueRank(right) || priorityRank[left.priority] - priorityRank[right.priority] || left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
 }

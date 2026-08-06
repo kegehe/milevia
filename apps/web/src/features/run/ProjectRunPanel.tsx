@@ -124,7 +124,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 			const ws = createWebSocket(`/ws/projects/${projectID}/run`);
 			wsRef.current = ws;
 
-			ws.onmessage = (raw) => {
+			ws.onmessage = (raw: MessageEvent) => {
 				if (disposed) return;
 				try { mergeIncomingLogs([JSON.parse(raw.data) as LogEntry]); }
 				catch { /* 忽略无法解析的消息 */ }

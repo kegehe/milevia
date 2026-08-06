@@ -30,6 +30,7 @@ type Task struct {
 	Description            string           `json:"description"`
 	AcceptanceCriteria     string           `json:"acceptanceCriteria"`
 	Priority               string           `json:"priority"`
+	Pinned                 bool             `json:"pinned"`
 	Position               float64          `json:"position"`
 	Status                 string           `json:"status"`
 	DependsOn              []TaskDependency `json:"dependsOn"`
@@ -95,6 +96,7 @@ type taskInput struct {
 	Description        string    `json:"description"`
 	AcceptanceCriteria string    `json:"acceptanceCriteria"`
 	Priority           string    `json:"priority"`
+	Pinned             *bool     `json:"pinned"`
 	Position           *float64  `json:"position"`
 	Status             string    `json:"status"`
 	PredecessorTaskIDs *[]string `json:"predecessorTaskIds"`
@@ -108,6 +110,7 @@ func (s *Server) migrateTasks(ctx context.Context) error {
 	description text not null default '',
 	acceptance_criteria text not null default '',
 	priority text not null default 'normal',
+	pinned integer not null default 0,
 	position real not null default 0,
 	status text not null default 'todo',
 	last_task_run_id text,
@@ -154,6 +157,9 @@ create index if not exists task_events_task_created on task_events(task_id,creat
 	}
 	if err := dropColumnIfPresent(ctx, s.db, "tasks", "execution_mode"); err != nil {
 		return fmt.Errorf("remove legacy task execution mode: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "tasks", "pinned", "integer not null default 0"); err != nil {
+		return fmt.Errorf("add tasks.pinned: %w", err)
 	}
 	return nil
 }
@@ -238,7 +244,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("project not found"))
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,title,description,acceptance_criteria,priority,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where project_id=? order by position,created_at`, projectID)
+	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,title,description,acceptance_criteria,priority,pinned,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where project_id=? order by pinned desc,position,created_at`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -301,7 +307,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err := tx.ExecContext(r.Context(), `insert into tasks (id,project_id,title,description,acceptance_criteria,priority,position,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?)`, task.ID, task.ProjectID, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(r.Context(), `insert into tasks (id,project_id,title,description,acceptance_criteria,priority,pinned,position,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?)`, task.ID, task.ProjectID, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Pinned, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -410,6 +416,9 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task.Title, task.Description, task.AcceptanceCriteria, task.Priority = input.Title, input.Description, input.AcceptanceCriteria, input.Priority
+	if input.Pinned != nil {
+		task.Pinned = *input.Pinned
+	}
 	if input.Position != nil {
 		task.Position = *input.Position
 	}
@@ -420,7 +429,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(r.Context(), `update tasks set title=?,description=?,acceptance_criteria=?,priority=?,position=?,status=?,updated_at=? where id=? and status=?`, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Position, task.Status, task.UpdatedAt, task.ID, originalStatus)
+	result, err := tx.ExecContext(r.Context(), `update tasks set title=?,description=?,acceptance_criteria=?,priority=?,pinned=?,position=?,status=?,updated_at=? where id=? and status=?`, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Pinned, task.Position, task.Status, task.UpdatedAt, task.ID, originalStatus)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -846,7 +855,7 @@ func (s *Server) projectExists(ctx context.Context, projectID string) bool {
 }
 
 func (s *Server) taskByID(ctx context.Context, taskID string) (Task, error) {
-	task, err := scanTask(s.db.QueryRowContext(ctx, `select id,project_id,title,description,acceptance_criteria,priority,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where id=?`, taskID))
+	task, err := scanTask(s.db.QueryRowContext(ctx, `select id,project_id,title,description,acceptance_criteria,priority,pinned,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where id=?`, taskID))
 	if err != nil {
 		return Task{}, err
 	}
@@ -859,7 +868,7 @@ func (s *Server) taskByID(ctx context.Context, taskID string) (Task, error) {
 func scanTask(row interface{ Scan(...any) error }) (Task, error) {
 	var task Task
 	var completedAt, cancelledAt sql.NullTime
-	if err := row.Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.AcceptanceCriteria, &task.Priority, &task.Position, &task.Status, &task.CreatedAt, &task.UpdatedAt, &completedAt, &cancelledAt); err != nil {
+	if err := row.Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.AcceptanceCriteria, &task.Priority, &task.Pinned, &task.Position, &task.Status, &task.CreatedAt, &task.UpdatedAt, &completedAt, &cancelledAt); err != nil {
 		return Task{}, err
 	}
 	if completedAt.Valid {

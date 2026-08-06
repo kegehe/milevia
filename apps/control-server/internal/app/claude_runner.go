@@ -58,6 +58,7 @@ type AgentSessionRequest struct {
 	Resume         bool
 	ConversationID string
 	ApprovalToken  string
+	Profile        *AgentRuntimeProfile
 }
 
 type AgentSession interface {
@@ -85,6 +86,7 @@ type AgentRunRequest struct {
 	// AgentID identifies which CLI ("claude-code" or "codex") this run targets.
 	// SSH runners consult it to dispatch to the correct remote command.
 	AgentID string
+	Profile *AgentRuntimeProfile
 }
 
 type AgentRunSink interface {
@@ -261,13 +263,19 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	if err != nil {
 		return err
 	}
+	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, []string{
+		"AUTO_CONTROL_URL=" + r.config.ControlURL,
+		"AUTO_APPROVAL_RUN_ID=" + request.RunID,
+		"AUTO_APPROVAL_TOKEN=" + request.RunToken,
+	})
+	if err != nil {
+		return err
+	}
+	defer closeProfile()
+	args = append(args[:len(args)-1], append(profileArgs, args[len(args)-1])...)
 	cmd := exec.Command(r.config.ClaudePath, args...)
 	cmd.Dir = request.ProjectPath
-	cmd.Env = append(os.Environ(),
-		"AUTO_CONTROL_URL="+r.config.ControlURL,
-		"AUTO_APPROVAL_RUN_ID="+request.RunID,
-		"AUTO_APPROVAL_TOKEN="+request.RunToken,
-	)
+	cmd.Env = environment
 	configureProcessGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
@@ -319,27 +327,36 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 	if err != nil {
 		return nil, err
 	}
+	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, []string{
+		"AUTO_CONTROL_URL=" + r.config.ControlURL,
+		"AUTO_APPROVAL_CONVERSATION_ID=" + request.ConversationID,
+		"AUTO_APPROVAL_TOKEN=" + request.ApprovalToken,
+	})
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, profileArgs...)
 	cmd := exec.Command(r.config.ClaudePath, args...)
 	cmd.Dir = request.ProjectPath
-	cmd.Env = append(os.Environ(),
-		"AUTO_CONTROL_URL="+r.config.ControlURL,
-		"AUTO_APPROVAL_CONVERSATION_ID="+request.ConversationID,
-		"AUTO_APPROVAL_TOKEN="+request.ApprovalToken,
-	)
+	cmd.Env = environment
 	configureProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		closeProfile()
 		return nil, fmt.Errorf("open Claude stdin: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		closeProfile()
 		return nil, fmt.Errorf("open Claude stdout: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		closeProfile()
 		return nil, fmt.Errorf("open Claude stderr: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
+		closeProfile()
 		return nil, fmt.Errorf("start Claude: %w", err)
 	}
 	session := &claudeCLISession{
@@ -383,6 +400,7 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 		close(session.processDone)
 		session.done <- err
 		close(session.done)
+		closeProfile()
 	}()
 	return session, nil
 }
@@ -417,6 +435,9 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	} else {
 		args = append(args, "--session-id", request.SessionID)
 	}
+	if request.Profile != nil && request.Profile.Model != "" {
+		args = append(args, "--model", request.Profile.Model)
+	}
 	return append(args, request.Prompt), nil
 }
 
@@ -446,7 +467,14 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 	} else {
 		args = append(args, "--session-id", request.SessionID)
 	}
+	if request.Profile != nil && request.Profile.Model != "" {
+		args = append(args, "--model", request.Profile.Model)
+	}
 	return args, nil
+}
+
+func (r *claudeCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeProfile, additions []string) ([]string, []string, func(), error) {
+	return managedCLIEnvironment(profile, os.Environ(), additions...), nil, func() {}, nil
 }
 
 func (r *claudeCLIRunner) approvalHookCommand() string {
@@ -470,7 +498,11 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
+		line, err := sanitizeAgentJSONL(scanner.Bytes())
+		if err != nil {
+			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
+			continue
+		}
 		var envelope struct {
 			Type            string `json:"type"`
 			Subtype         string `json:"subtype"`
@@ -585,7 +617,11 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		line := json.RawMessage(append([]byte(nil), scanner.Bytes()...))
+		line, err := sanitizeAgentJSONL(scanner.Bytes())
+		if err != nil {
+			session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
+			continue
+		}
 		var envelope struct {
 			Type            string `json:"type"`
 			Subtype         string `json:"subtype"`
@@ -623,7 +659,7 @@ func (session *claudeCLISession) readStderr(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		session.emit("stderr", mustJSON(map[string]string{"message": scanner.Text()}), false)
+		session.emit("stderr", mustJSON(map[string]string{"message": redactAgentText(scanner.Text())}), false)
 	}
 	if err := scanner.Err(); err != nil {
 		session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
@@ -1003,7 +1039,7 @@ func (r *claudeCLIRunner) readStderr(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		sink.Event("stderr", mustJSON(map[string]string{"message": scanner.Text()}))
+		sink.Event("stderr", mustJSON(map[string]string{"message": redactAgentText(scanner.Text())}))
 	}
 	if err := scanner.Err(); err != nil {
 		sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))

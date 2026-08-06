@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,41 @@ import (
 type claudeTurnTestSink struct {
 	mu       sync.Mutex
 	finished []error
+}
+
+type claudeOutputTestSink struct {
+	events []json.RawMessage
+	texts  []string
+}
+
+func (sink *claudeOutputTestSink) Event(_ string, payload json.RawMessage) {
+	sink.events = append(sink.events, append(json.RawMessage(nil), payload...))
+}
+func (sink *claudeOutputTestSink) AssistantText(text, _ string) {
+	sink.texts = append(sink.texts, text)
+}
+func (*claudeOutputTestSink) SessionIdentified(string) {}
+func (*claudeOutputTestSink) SessionInitialized()      {}
+
+func TestClaudeOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
+	const secret = "sk-claude-test-secret-value-12345"
+	runner := &claudeCLIRunner{}
+	sink := &claudeOutputTestSink{}
+	runner.readOutput(strings.NewReader(`{"type":"assistant","api_key":"`+secret+`","message":{"content":[{"type":"text","text":"Authorization: Bearer `+secret+`"}]}}`+"\n"), sink)
+	runner.readStderr(strings.NewReader("OPENAI_API_KEY="+secret+"\n"), sink)
+	for _, payload := range sink.events {
+		if strings.Contains(string(payload), secret) {
+			t.Fatalf("credential leaked in event: %s", payload)
+		}
+	}
+	for _, text := range sink.texts {
+		if strings.Contains(text, secret) {
+			t.Fatalf("credential leaked in assistant text: %s", text)
+		}
+	}
+	if len(sink.texts) != 1 || !strings.Contains(sink.texts[0], "[REDACTED]") {
+		t.Fatalf("assistant text was not redacted: %#v", sink.texts)
+	}
 }
 
 func (*claudeTurnTestSink) Event(string, json.RawMessage) {}

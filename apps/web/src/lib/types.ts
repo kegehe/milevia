@@ -5,7 +5,7 @@ export type ProjectStatus = { running: boolean; conversationCount: number; activ
 export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
 export type AgentID = "claude-code" | "codex";
-export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean };
+export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean };
 export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 export type ShortcutKind = "prompt" | "snippet" | "command_request";
 export type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };
@@ -41,8 +41,25 @@ export type RunnerInfo = {
   name: string;
   environment: string;
   root: string;
+  profileManagement?: boolean;
   claude: ToolStatus;
   codex?: ToolStatus;
+};
+
+export type AgentProfile = {
+  id: string;
+  runnerId: string;
+  agentId: AgentID;
+  name: string;
+  currentRevisionId: string;
+  enabled: boolean;
+  revision: number;
+  baseUrl?: string;
+  model?: string;
+  // Legacy records can still be listed so their owner can migrate them. New
+  // records and every executable record are cli_managed.
+  authMode: string;
+  state: "active" | "deprecated" | "revoked";
 };
 
 export type CheckUpdateResult = {

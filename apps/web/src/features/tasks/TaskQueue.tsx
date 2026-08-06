@@ -314,6 +314,18 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
   };
 
+  const setPinned = async (taskID: string, pinned: boolean) => {
+    const task = tasks.find((t) => t.id === taskID);
+    if (!task || !mountedRef.current) return;
+    const first = queueTasks.find((item) => item.pinned && item.id !== taskID) || queueTasks.find((item) => item.id !== taskID);
+    const newPosition = pinned && first ? first.position - 1 : task.position;
+    try {
+      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, acceptanceCriteria: task.acceptanceCriteria, priority: task.priority, pinned, position: newPosition }) });
+      if (!mountedRef.current) return;
+      await loadTasks();
+    } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法置顶任务"); }
+  };
+
   const quickCreate = async (event: FormEvent) => {
     event.preventDefault();
     if (!quickDescription.trim() || quickCreating) return;
@@ -356,6 +368,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
         inlineReview={inlineReview}
         openBoard={openBoard}
         confirmTransition={confirmTransition}
+        setPinned={setPinned}
       />)}</div>
     </div>
     {confirmingTask && createPortal(<DispatchConfirmation task={confirmingTask} detail={detail} loading={loadingDetail} dispatching={dispatching} dispatchDisabled={dispatchDisabled} permissionMode={permissionMode} close={closeConfirmation} openBoard={() => openBoard(confirmingTask.id)} dispatch={dispatch} />, document.body)}
@@ -363,10 +376,11 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   </div>;
 }
 
-function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, inlineReview, openBoard, confirmTransition }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void }) {
+function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, inlineReview, openBoard, confirmTransition, setPinned }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void; setPinned: (taskID: string, pinned: boolean) => Promise<void> }) {
   const [isDragging, setIsDragging] = useState(false);
   const [dragOverPosition, setDragOverPosition] = useState<"before" | "after" | null>(null);
   const [hoverOpen, setHoverOpen] = useState(false);
+  const [pinning, setPinning] = useState(false);
   const rowRef = useRef<HTMLElement | null>(null);
   const hoverTimer = useRef<number | undefined>(undefined);
   const canHover = useMemo(() => typeof window !== "undefined" && window.matchMedia("(hover: hover) and (pointer: fine)").matches, []);
@@ -377,6 +391,14 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
   const note = taskQueueNote(task);
   const isReviewing = reviewingTaskID === task.id;
   const reviewRef = useRef<HTMLDivElement>(null);
+  const isPinned = Boolean(task.pinned);
+
+  const handlePinToTop = async (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (pinning) return;
+    setPinning(true);
+    try { await setPinned(task.id, !isPinned); } finally { setPinning(false); }
+  };
   useEffect(() => {
     if (!isReviewing || !reviewRef.current) return;
     reviewRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -462,6 +484,9 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
       {canOfferDispatch(task) && <button type="button" className="task-queue-dispatch" draggable={false} disabled={dispatchDisabled} onClick={(event) => void confirm(event, task.id)}>下发</button>}
       {canRedispatch(task) && <button type="button" className="task-queue-redispatch" draggable={false} disabled={dispatchDisabled || redispatching} onClick={(event) => void redispatch(event, task.id)}>{redispatching ? "下发中" : "重新下发"}</button>}
       {task.status === "awaiting_review" && !isTaskOrchestrating(task) && !isReviewing && <button type="button" className="task-queue-review secondary" draggable={false} onClick={(event) => { event.stopPropagation(); openReview(task.id); }}>验收</button>}
+      <button type="button" className={`task-queue-pin${isPinned ? " pinned" : ""}`} draggable={false} disabled={pinning} title={isPinned ? "取消置顶" : "置顶"} aria-label={isPinned ? "取消置顶" : "置顶"} onClick={(event) => void handlePinToTop(event)}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.4 6L14 4H7.7L8 6 5 9.3c-.3.3-.5.7-.5 1.1 0 .4.3.6.6.6h4.2l-1.2 6.2c-.1.4.2.8.6.8.2 0 .4-.1.5-.2L15 12l3.9.1c.4 0 .6-.3.6-.6 0-.4-.2-.8-.5-1.1L14.4 6z" /></svg>
+      </button>
     </div>
     {isReviewing && <div className="task-queue-inline-review" ref={reviewRef}>
       <textarea autoFocus required disabled={reviewSubmitting} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="说明需要补充或修改的内容，留空即确认完成…" onDragStart={(e) => e.stopPropagation()} />

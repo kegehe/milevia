@@ -36,6 +36,40 @@ type sshTestWriteCloser struct{ bytes.Buffer }
 
 func (sshTestWriteCloser) Close() error { return nil }
 
+type sshOutputTestSink struct {
+	events []json.RawMessage
+	texts  []string
+}
+
+func (sink *sshOutputTestSink) Event(_ string, payload json.RawMessage) {
+	sink.events = append(sink.events, append(json.RawMessage(nil), payload...))
+}
+func (sink *sshOutputTestSink) AssistantText(text, _ string) { sink.texts = append(sink.texts, text) }
+func (*sshOutputTestSink) SessionIdentified(string)          {}
+func (*sshOutputTestSink) SessionInitialized()               {}
+
+func TestSSHOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
+	const secret = "sk-ssh-test-secret-value-12345"
+	sink := &sshOutputTestSink{}
+	if err := readClaudeJSONLines(strings.NewReader(`{"type":"assistant","api_key":"`+secret+`","message":{"content":[{"type":"text","text":"Authorization: Bearer `+secret+`"}]}}`+"\n"), sink); err != nil {
+		t.Fatalf("read Claude JSONL: %v", err)
+	}
+	readStderrLines(strings.NewReader("ANTHROPIC_API_KEY="+secret+"\n"), sink)
+	for _, payload := range sink.events {
+		if strings.Contains(string(payload), secret) {
+			t.Fatalf("credential leaked in event: %s", payload)
+		}
+	}
+	for _, text := range sink.texts {
+		if strings.Contains(text, secret) {
+			t.Fatalf("credential leaked in assistant text: %s", text)
+		}
+	}
+	if len(sink.texts) != 1 || !strings.Contains(sink.texts[0], "[REDACTED]") {
+		t.Fatalf("assistant text was not redacted: %#v", sink.texts)
+	}
+}
+
 func TestRemotePathWithinRoot(t *testing.T) {
 	cases := []struct {
 		root string
