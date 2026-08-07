@@ -723,9 +723,9 @@ func (r *sshRunner) Update(ctx context.Context) (string, string, error) {
 	if previous == "" {
 		return "", "", errors.New("远程服务器上未安装 Claude Code")
 	}
-	_, err := r.client.execCommand(ctx, "claude update")
+	out, err := r.client.execCommand(ctx, "claude update")
 	if err != nil {
-		return previous, "", err
+		return previous, "", fmt.Errorf("远程执行 claude update 失败：%w%s", err, updateOutputDetail(string(out)))
 	}
 	return previous, r.Version(ctx), nil
 }
@@ -773,8 +773,9 @@ func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
 	if previous == "" {
 		return "", "", errors.New("远程服务器上未安装 Codex CLI")
 	}
-	if _, err := r.client.execCommand(ctx, "codex update"); err != nil {
-		return previous, "", err
+	out, err := r.client.execCommand(ctx, "codex update")
+	if err != nil {
+		return previous, "", fmt.Errorf("远程执行 codex update 失败：%w%s", err, updateOutputDetail(string(out)))
 	}
 	return previous, r.CodexVersion(ctx), nil
 }

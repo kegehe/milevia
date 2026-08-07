@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -249,13 +250,93 @@ func (r *claudeCLIRunner) Update(parent context.Context) (string, string, error)
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "update")
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		return previous, "", fmt.Errorf("update Claude Code: %w", err)
+		// 捕获 claude update 的实际输出，失败时把排错信息带给用户，
+		// 而不是只给一个模糊的 "exit status N"。
+		return previous, "", fmt.Errorf("update Claude Code 失败：%w%s", err, updateOutputDetail(out.String()))
 	}
 	current := r.Version(parent)
 	return previous, current, nil
+}
+
+// tailUpdateOutput strips control sequences from a failing CLI update and
+// returns the last few lines of meaningful output, so the error shown to the
+// user carries the actual reason (network error, permission problem, registry
+// outage, ...) instead of a bare "exit status N" — or raw escape codes from
+// the CLI's colored/progress output. The tail is bounded in both lines and
+// bytes to keep the message compact and single-line-safe.
+func tailUpdateOutput(out string) string {
+	clean := redactAgentText(stripAnsi(strings.TrimSpace(out)))
+	if len(clean) > maxUpdateOutputDetailBytes {
+		clean = clean[len(clean)-maxUpdateOutputDetailBytes:] // 保留末尾若干字节（含关键报错）
+	}
+	return strings.Join(tailUpdateLines(clean), " ")
+}
+
+// maxUpdateOutputDetailBytes bounds the update-failure detail surfaced to the
+// user so a pathological single-line output (e.g. MBs on one line) cannot blow
+// up the error message beyond the 8-line tail limit.
+const maxUpdateOutputDetailBytes = 4 * 1024
+
+// tailUpdateLines 返回给定文本的尾部最多 max 行（不足或为空时原样返回）。
+func tailUpdateLines(clean string) []string {
+	lines := strings.Split(clean, "\n")
+	const max = 8
+	start := 0
+	if len(lines) > max {
+		start = len(lines) - max
+	}
+	return lines[start:]
+}
+
+// updateOutputDetail wraps a failing CLI update's cleaned tail in "（…）" so the
+// reason reads naturally, and returns "" when there is nothing to show (e.g. a
+// context timeout produced no output) instead of a dangling "（）".
+func updateOutputDetail(out string) string {
+	tail := tailUpdateOutput(out)
+	if tail == "" {
+		return ""
+	}
+	return "（" + tail + "）"
+}
+
+// stripAnsi removes ANSI escape sequences and bare carriage returns so they
+// never appear in user-facing error text. CSI sequences like the color codes
+// of a CLI (e.g. "\x1b[32m") as well as the OSC form ("\x1b]…" terminated by
+// BEL or ST "\x1b\\") are covered.
+func stripAnsi(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\x1b' {
+			// Skip the full escape sequence.
+			i++
+			switch {
+			case i < len(s) && s[i] == '[': // CSI: \x1b[<params><final>
+				i++
+				for i < len(s) && !(s[i] >= '@' && s[i] <= '~') {
+					i++
+				}
+			case i < len(s) && s[i] == ']': // OSC: \x1b]…term by BEL or ST
+				for i < len(s) && s[i] != '\a' && s[i] != '\x1b' {
+					i++
+				}
+				// i 停在 BEL 或 ST 的引导 \x1b 上；若为 ST（后跟反斜杠），
+				// 一并跳过收尾的 "\"，避免反斜杠残留进用户可见文本。
+				if i < len(s) && s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '\\' {
+					i++
+				}
+			}
+			continue
+		}
+		if s[i] == '\r' {
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {

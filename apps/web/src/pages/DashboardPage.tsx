@@ -3,8 +3,11 @@
 import { useEffect, useState, useRef, useCallback, useMemo, type DragEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { useProjectContext } from "../stores/useProjectStore";
+import { useProcessStatusMap } from "../components/ProcessStatusProvider";
 import NotificationCenter from "../components/NotificationCenter";
 import type { Project, ProjectFilter, ProjectStatus } from "../lib/types";
+import type { RunStatus } from "../features/run/run-model";
+import { statusColors, statusLabels } from "../features/run/run-model";
 import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order";
 
 function WindowsEnvironmentIcon() {
@@ -25,6 +28,7 @@ function ImportProjectIcon() {
 
 export default function DashboardPage() {
   const { projects, projectStatuses, error, setError, refreshProjects, removeProject, api } = useProjectContext();
+  const processStatuses = useProcessStatusMap();
   const navigate = useNavigate();
   const [filter, setFilter] = useState<ProjectFilter>("all");
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
@@ -149,15 +153,16 @@ export default function DashboardPage() {
             <button className="primary" type="button" onClick={() => setFilter("all")}>查看全部项目</button>
           </div>;
         })()
-          : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
+          : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
     </section>
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
   </main>;
 }
 
-function ProjectCard({ project, status, open, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isDropTarget }: {
+function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isDropTarget }: {
   project: Project;
   status?: ProjectStatus;
+  runStatus: RunStatus;
   open: () => void;
   onDelete: () => void;
   onDragStart: (event: DragEvent, id: string) => void;
@@ -171,6 +176,8 @@ function ProjectCard({ project, status, open, onDelete, onDragStart, onDragOver,
   const stateClass = status?.running ? "running" : project.agentReady ? "ready" : "offline";
   const taskTitle = status?.running && status.activeTitle ? status.activeTitle : "等待新的任务";
   const dragClass = isDragging ? " dragging" : isDropTarget ? " drop-target" : "";
+  // 开发进程状态点徽标：已停止（进程未启动是常态）不显示，仅可视化进行中的状态。
+  const runStatusLabel = runStatus !== "stopped" ? statusLabels[runStatus] : null;
   return <article className={`project-card task-card state-${stateClass}${dragClass}`} draggable onClick={open}
     onDragStart={(event) => onDragStart(event, project.id)}
     onDragOver={(event) => onDragOver(event, project.id)}
@@ -181,6 +188,7 @@ function ProjectCard({ project, status, open, onDelete, onDragStart, onDragOver,
       <span className="project-mark">{project.name.slice(0, 1).toUpperCase()}</span>
       <span className="project-card-top-actions">
         <span className={`project-state ${stateClass}`}><i></i>{state}</span>
+        {runStatusLabel && <span className={`project-run-state run-state-${runStatus}`} title={`开发进程: ${statusLabels[runStatus]}`}><i style={{ background: statusColors[runStatus] }}></i>{runStatusLabel}</span>}
         {project.environment === "windows" && <span className="env-tag windows" title="Windows 项目" role="img" aria-label="Windows 项目"><WindowsEnvironmentIcon /></span>}
         {project.environment === "remote-linux" && <span className="env-tag remote" title="远程服务器" role="img" aria-label="远程服务器"><RemoteServerIcon /></span>}
         <button className="project-card-delete" type="button" draggable={false} title="删除项目" onClick={(event) => { event.stopPropagation(); onDelete(); }} aria-label={`删除项目 ${project.name}`}>×</button>

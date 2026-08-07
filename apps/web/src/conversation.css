@@ -935,22 +935,9 @@
   align-items: center;
   gap: 4px;
 }
+.quick-tag-list.sortable .quick-tag-item { cursor: grab; }
+.quick-tag-list.sortable .quick-tag-item:active { cursor: grabbing; }
 .quick-tag-item .quick-tag { flex: 1; min-width: 0; }
-.quick-tag-grip {
-  display: grid;
-  flex: none;
-  width: 14px;
-  height: 28px;
-  place-items: center;
-  color: #9abcb0;
-  cursor: grab;
-  border-radius: 4px;
-  user-select: none;
-  -webkit-user-select: none;
-}
-.quick-tag-grip:hover { color: #2b6c5e; background: #eaf4ee; }
-.quick-tag-grip:active { cursor: grabbing; }
-.quick-tag-grip-icon { width: 12px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; }
 .quick-tag-item.dragging {
   opacity: .55;
   background: #eaf4ee;
@@ -1237,8 +1224,6 @@
   .quick-actions-mobile .quick-tag-empty { min-height: 42px; }
   .quick-actions-mobile .quick-tag > button:first-child,
   .quick-actions-mobile .quick-tag-empty { flex: 1; max-width: none; }
-  /* 窄屏不支持 HTML5 触摸拖拽，隐藏抓手避免误导 */
-  .quick-actions-mobile .quick-tag-grip { display: none; }
 
   .chat-center { display: flex; grid-column: 1; grid-row: 3; flex-direction: column; min-height: 0; flex: 1; }
   .chat-center > .timeline { overflow: visible; padding: 20px 0 max(32px, var(--composer-height, 0px)) 16px; flex: 1; }
@@ -1783,6 +1768,24 @@
 }
 .runner-inline.unavailable,
 .runner-inline.needs_auth { border-color: #ead4a8; color: #85671c; background: #fff8e8; }
+
+/* 更新失败弹窗：失败原因通常比普通提示长（可能带 CLI 输出），
+   需要独立滚动区域，避免被弹窗 max-height 裁剪而看不到报错。 */
+.update-error-dialog .update-error-reason {
+  min-height: 48px;
+  max-height: 40vh;
+  overflow: auto;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 16px 20px 18px;
+  color: #a4462f;
+  font-size: 13px;
+  line-height: 1.65;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.update-error-dialog .update-error-reason::-webkit-scrollbar { width: 8px; }
+.update-error-dialog .update-error-reason::-webkit-scrollbar-thumb { border-radius: 4px; background: #d7cec3; }
 .runner-inline-btn {
   min-height: 27px;
   border-color: #c5dcd0;

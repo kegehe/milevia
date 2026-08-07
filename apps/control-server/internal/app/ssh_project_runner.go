@@ -20,7 +20,9 @@ type projectRunnerInterface interface {
 	Stop() error
 	RestartWithConfig(parentCtx context.Context, projectPath, workDir, command string, envVars map[string]string, executionTarget RunExecutionTarget) error
 	StatusSnapshot() RunStatusResponse
+	LightStatusSnapshot() RunStatusResponse
 	registerLogSubscriber(register func([]LogEntry))
+	setStatusListener(listener statusBroadcaster)
 	Retire() error
 }
 
@@ -34,6 +36,8 @@ type sshProjectRunner struct {
 	broadcast logBroadcaster
 	logMu     sync.Mutex
 	nextLogID uint64
+
+	statusBroadcast statusBroadcaster
 
 	status      RunStatus
 	retired     bool
@@ -62,6 +66,18 @@ func newSSHProjectRunner(projectID string, client *sshClient, rootPath string, b
 		logBuf:    newRingBuffer(projectRunLogCapacity),
 		broadcast: broadcast,
 		status:    RunStatusStopped,
+	}
+}
+
+// setStatusListener 注册进程状态变更回调（由 Server 注入）。须在启动之前设置。
+func (pr *sshProjectRunner) setStatusListener(listener statusBroadcaster) {
+	pr.statusBroadcast = listener
+}
+
+// emitStatus 在状态切分归位后触发状态广播。调用方须已释放 pr.mu。
+func (pr *sshProjectRunner) emitStatus(event RunStatusEvent) {
+	if pr.statusBroadcast != nil {
+		pr.statusBroadcast(event)
 	}
 }
 
@@ -155,6 +171,7 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return fmt.Errorf("创建 SSH session 失败: %w", err)
 	}
 
@@ -170,6 +187,7 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 			pr.hasExitCode = true
 			close(pr.exitChan)
 			pr.mu.Unlock()
+			pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 			return errors.New("工作目录不能超出项目路径")
 		}
 		cdTarget = pr.rootPath + "/" + cleaned
@@ -189,6 +207,7 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return fmt.Errorf("创建 stdout 管道失败: %w", err)
 	}
 	stderr, err := session.StderrPipe()
@@ -201,6 +220,7 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return fmt.Errorf("创建 stderr 管道失败: %w", err)
 	}
 	if err := session.Start(shellCmd); err != nil {
@@ -212,6 +232,7 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return fmt.Errorf("启动进程失败: %w", err)
 	}
 
@@ -219,7 +240,10 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 	pr.session = session
 	pr.startedAt = time.Now()
 	pr.status = RunStatusRunning
+	startedAt := pr.startedAt
 	pr.mu.Unlock()
+
+	pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusRunning, StartedAt: &startedAt})
 
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system",
 		Text: fmt.Sprintf("远端进程已启动: 命令=%s", command)})
@@ -260,7 +284,9 @@ func (pr *sshProjectRunner) wait(session *ssh.Session, pipeReadersDone <-chan st
 	err := session.Wait()
 	pr.mu.Lock()
 	exitCode := 0
-	if err != nil {
+	// 与本地 runner 的 wait 一致：停止流程中（status==Stopping）即使远端 session.Wait()
+	// 返回非零退出（cancel+SIGKILL 触发），也归为 Stopped 而非 Failed。
+	if err != nil && pr.status != RunStatusStopping {
 		if exitErr, ok := err.(*ssh.ExitError); ok {
 			exitCode = exitErr.ExitStatus()
 		} else {
@@ -268,11 +294,17 @@ func (pr *sshProjectRunner) wait(session *ssh.Session, pipeReadersDone <-chan st
 		}
 		pr.status = RunStatusFailed
 	} else {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			exitCode = exitErr.ExitStatus()
+		}
 		pr.status = RunStatusStopped
 	}
 	pr.exitCode = exitCode
 	pr.hasExitCode = true
+	status := pr.status
 	pr.mu.Unlock()
+
+	pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: status})
 
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system",
 		Text: fmt.Sprintf("进程已退出: code=%d", exitCode)})
@@ -299,6 +331,8 @@ func (pr *sshProjectRunner) stop() error {
 	session := pr.session
 	pr.status = RunStatusStopping
 	pr.mu.Unlock()
+
+	pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusStopping})
 
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system", Text: "正在停止进程..."})
 
@@ -343,6 +377,25 @@ func (pr *sshProjectRunner) StatusSnapshot() RunStatusResponse {
 		snapshot.StartedAt = &startedAt
 	}
 	// SSH 远端进程 PID 不可靠获取，统一不返回。
+	if pr.hasExitCode {
+		exitCode := pr.exitCode
+		snapshot.ExitCode = &exitCode
+	}
+	return snapshot
+}
+
+// LightStatusSnapshot 返回精简状态快照（线程安全），仅供批量总览端点使用：
+// 不拷贝环形日志缓冲区。SSH 远端无本地 PID，恒不填充 PID。
+func (pr *sshProjectRunner) LightStatusSnapshot() RunStatusResponse {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	snapshot := RunStatusResponse{
+		Status: pr.status,
+	}
+	if !pr.startedAt.IsZero() {
+		startedAt := pr.startedAt
+		snapshot.StartedAt = &startedAt
+	}
 	if pr.hasExitCode {
 		exitCode := pr.exitCode
 		snapshot.ExitCode = &exitCode

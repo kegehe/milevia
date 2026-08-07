@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -202,8 +203,12 @@ func (r *codexCLIRunner) Update(parent context.Context) (string, string, error) 
 	}
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
-	if err := exec.CommandContext(ctx, r.config.CodexPath, "update").Run(); err != nil {
-		return previous, "", fmt.Errorf("update Codex: %w", err)
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, r.config.CodexPath, "update")
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return previous, "", fmt.Errorf("update Codex 失败：%w%s", err, updateOutputDetail(out.String()))
 	}
 	return previous, r.Version(parent), nil
 }

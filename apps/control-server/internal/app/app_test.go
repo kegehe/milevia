@@ -5123,6 +5123,73 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 	}
 }
 
+func TestUpdateFailureSurfacesRealReason(t *testing.T) {
+	// 更新失败必须把 CLI 的实际输出带给用户，而不是只给一个"请查看日志"的通用提示。
+	// 带有明确中文"失败"标签的消息应原样展示，而不是被通用 fallback 前缀掩盖。
+	real := localizedErrorText(errors.New("远程执行 claude update 失败：Process exited with status 1（[130] npm ERR! network timeout）"), "任务执行失败，请查看任务日志后重试。")
+	if !strings.Contains(real, "npm ERR! network timeout") || strings.Contains(real, "查看任务日志") {
+		t.Fatalf("update reason not surfaced: %q", real)
+	}
+
+	// tailUpdatOutput 应截取最后几行，避免超长输出刷屏。
+	lines := []string{}
+	for i := 1; i <= 30; i++ {
+		lines = append(lines, "line")
+	}
+	tail := tailUpdateOutput(strings.Join(lines, "\n"))
+	if strings.Count(tail, "line") != 8 {
+		t.Fatalf("tailUpdateOutput kept %d lines, want 8: %q", strings.Count(tail, "line"), tail)
+	}
+
+	// ANSI 转义码（颜色、进度）和 \r 必须被剥离，否则会污染用户可见的报错。
+	ansi := tailUpdateOutput("\x1b[31mnpm ERR!\x1b[0m network timeout\r\n")
+	if !strings.Contains(ansi, "npm ERR! network timeout") || strings.Contains(ansi, "\x1b") || strings.Contains(ansi, "\r") {
+		t.Fatalf("tailUpdateOutput did not strip ANSI/CR: %q", ansi)
+	}
+
+	// OSC-8 超链接（\x1b]8;;url\x1b\）的终止反斜杠不得残留。BEL 结尾同样干净。
+	osc := tailUpdateOutput("\x1b]8;;https://x\x1b\\npm ERR!\x1b]8;;\x1b\\")
+	if strings.Contains(osc, "\\") || !strings.Contains(osc, "npm ERR!") {
+		t.Fatalf("OSC/ST backslash leaked or text lost: %q", osc)
+	}
+
+	// 凭据必须被脱敏：sk-…、Authorization: Bearer …、CODEX_HOME 路径不得原样带到 UI。
+	redacted := tailUpdateOutput("auth: sk-0123456789abcdef\nAuthorization: Bearer abc123\nCODEX_HOME=/root/.codex")
+	if strings.Contains(redacted, "sk-0123456789abcdef") || strings.Contains(redacted, "abc123") || strings.Contains(redacted, "/root/.codex") {
+		t.Fatalf("credential not redacted: %q", redacted)
+	}
+
+	// 无输出的失败（如超时）不应留下悬空的 "（）"。
+	if detail := updateOutputDetail("  \x1b[0m  \r  "); detail != "" {
+		t.Fatalf("empty output should produce no detail, got %q", detail)
+	}
+	if detail := updateOutputDetail("npm ERR! timeout"); detail != "（npm ERR! timeout）" {
+		t.Fatalf("non-empty output detail = %q", detail)
+	}
+
+	// 单行巨型输出也必须被字节封顶，避免撑爆错误消息。
+	huge := strings.Repeat("x", 100_000)
+	bigDetail := tailUpdateOutput("ok " + huge)
+	if len(bigDetail) > maxUpdateOutputDetailBytes {
+		t.Fatalf("tailUpdateOutput detail too large: %d bytes", len(bigDetail))
+	}
+	if len(tailUpdateOutput(huge+" end")) < 3 {
+		t.Fatalf("byte cap should keep the tail, got?")
+	}
+}
+
+func TestLocalizedErrorSuppressesInternalUpdateWraps(t *testing.T) {
+	// 即使被包装成含"失败"的错误，涉及 Go 内部堆栈/实现的细节也不得外泄。
+	wrapped := localizedErrorText(errors.New("update Codex 失败：panic: runtime error（goroutine 1 [running]）"), "任务执行失败，请查看任务日志后重试。")
+	if strings.Contains(wrapped, "panic") || strings.Contains(wrapped, "goroutine") {
+		t.Fatalf("internal detail leaked: %q", wrapped)
+	}
+	// 纯中文错误仍原样展示。
+	if direct := localizedErrorText(errors.New("更新服务超时，请稍后再试。"), "fallback"); direct != "更新服务超时，请稍后再试。" {
+		t.Fatalf("pure Chinese error not shown directly: %q", direct)
+	}
+}
+
 func TestRecoverGitPushWithUnknownResultNeedsAttention(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC()

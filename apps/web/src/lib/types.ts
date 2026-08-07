@@ -2,6 +2,13 @@
 
 export type Project = { id: string; name: string; pathDisplay: string; fullPath: string; runner: string; environment: string; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
 export type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string };
+// 开发进程运行状态（/api/projects/processes/statuses + /ws/processes）。
+// 与会话状态 ProjectStatus 语义独立，由 ProcessStatusProvider 单独拥有。
+export type RunStatus = "stopped" | "starting" | "running" | "stopping" | "failed";
+export type ProjectProcessStatus = { runStatus: RunStatus; runPid?: number; runStartedAt?: string | null; /** 进程状态上次由 WS 实时更新的时间戳(ms),用于判断 REST 兜底是否已过期。 */ runUpdatedAt?: number };
+export type ProjectProcessStatusMap = Record<string, ProjectProcessStatus>;
+// /ws/processes 单帧负载（与批量端点字段一一对应）。
+export type RunStatusEvent = { projectId: string; status: RunStatus; startedAt?: string | null; pid?: number | null };
 export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
 export type AgentID = "claude-code" | "codex";

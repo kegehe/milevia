@@ -117,10 +117,6 @@ function ShortcutMoreIcon() {
   return <svg className="quick-tag-control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 12h.01M12 12h.01M17.5 12h.01" /></svg>;
 }
 
-function ShortcutDragIcon() {
-  return <svg className="quick-tag-grip-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 6h.01M12 6h.01M15.5 6h.01M8.5 12h.01M12 12h.01M15.5 12h.01M8.5 18h.01M12 18h.01M15.5 18h.01" strokeLinecap="round" /></svg>;
-}
-
 type SortableShortcutKind = "prompt" | "command_request";
 
 // ShortcutSortableList 渲染某一类别（提示词/命令）快捷方式的竖向排序列表，支持
@@ -199,7 +195,6 @@ function ShortcutSortableList({ items, kind, renderItem, draggingDisabled, onReo
           onDragStart={(e) => onDragStart(e, shortcut.id)}
           onDragOver={(e) => onDragOver(e, shortcut.id)}
           onDragEnd={() => { setDragID(null); setDropTarget(null); }}>
-        <span className="quick-tag-grip" aria-hidden="true"><ShortcutDragIcon /></span>
         {renderItem(shortcut, kind)}
       </li>
     ))}
@@ -334,7 +329,7 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
       {canShowUsage ? <span className="composer-usage"><span className="composer-usage-model" title={displayedModel}>{displayedModel}</span><span className={`composer-usage-context ${contextLevel}`}>{contextLabel}</span><span className="composer-usage-count">{usage ? `${usage.session.taskCount} 次对话` : "加载中"}</span><button className="usage-trigger" type="button" onClick={onShowUsage}>使用状态</button></span> : <span className="composer-usage pending">用量将在工具就绪后显示</span>}
     </span>
     {showConfirm && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新 {toolName}</label><h2>确认更新 {toolName}</h2></div><button title="关闭" onClick={() => setShowConfirm(false)}>x</button></header><p className="permission-confirmation">当前版本：<b>{tool?.version}</b> → 最新版本：<b>{updateInfo?.latestVersion}</b>。更新期间将无法使用 AI 对话功能，更新预计需要数十秒。</p><footer><button className="secondary" onClick={() => setShowConfirm(false)}>取消</button><button className="primary" onClick={() => void handleUpdate()}>确认更新</button></footer></section></div>}
-    {updateError && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新错误</label><h2>更新失败</h2></div><button title="关闭" onClick={() => setUpdateError(null)}>x</button></header><p className="permission-confirmation">{updateError}</p><footer><button className="secondary" onClick={() => setUpdateError(null)}>关闭</button></footer></section></div>}
+    {updateError && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal update-error-dialog"><header><div><label>更新错误</label><h2>更新失败</h2></div><button title="关闭" onClick={() => setUpdateError(null)}>x</button></header><div className="update-error-reason" role="alert">{updateError}</div><footer><button className="secondary" onClick={() => setUpdateError(null)}>关闭</button></footer></section></div>}
   </>);
 }
 

@@ -129,11 +129,12 @@ type RunConfig struct {
 
 // RunStatusResponse 是 GET /status 的响应。
 type RunStatusResponse struct {
-	Status     RunStatus  `json:"status"`
-	StartedAt  *time.Time `json:"startedAt"`
-	PID        *int       `json:"pid"`
-	ExitCode   *int       `json:"exitCode"`
-	RecentLogs []LogEntry `json:"recentLogs"`
+	Status          RunStatus        `json:"status"`
+	ExecutionTarget RunExecutionTarget `json:"executionTarget"`
+	StartedAt       *time.Time       `json:"startedAt"`
+	PID             *int             `json:"pid"`
+	ExitCode        *int             `json:"exitCode"`
+	RecentLogs      []LogEntry       `json:"recentLogs"`
 }
 
 type Server struct {
@@ -182,6 +183,8 @@ type Server struct {
 	runLogSubMu            sync.Mutex
 	notificationSubs       map[*websocket.Conn]*notificationSubscriber
 	notificationSubMu      sync.Mutex
+	processStatusSubs      map[*websocket.Conn]*processStatusSubscriber
+	processStatusSubMu     sync.Mutex
 	notificationMu         sync.Mutex
 	orchestrationMu        sync.Mutex
 	orchestrationActive    map[string]bool
@@ -498,7 +501,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return s.allowedOrigin(r.Header.Get("Origin")) }
 	if config.SessionToken != "" {
 		s.upgrader.Subprotocols = []string{s.websocketSessionProtocol()}
@@ -568,6 +571,7 @@ func (s *Server) Close() {
 		s.closeAllConversationSubscribers()
 		s.closeAllRunLogSubscribers()
 		s.closeAllNotificationSubscribers()
+		s.closeAllProcessStatusSubscribers()
 		s.waitForWebSocketSubscriptions()
 		if httpServer != nil {
 			_ = httpServer.Close()
@@ -713,6 +717,7 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/validate", s.validateProject)
 	r.Get("/api/projects", s.listProjects)
 	r.Get("/api/projects/statuses", s.listProjectStatuses)
+	r.Get("/api/projects/processes/statuses", s.listProjectProcessStatuses)
 	r.Post("/api/projects", s.createProject)
 	r.Get("/api/projects/{projectID}", s.getProject)
 	r.Delete("/api/projects/{projectID}", s.deleteProject)
@@ -794,6 +799,7 @@ func (s *Server) routes() http.Handler {
 	})
 	r.Get("/ws/projects/{projectID}/run", s.subscribeRunLogs)
 	r.Get("/ws/notifications", s.subscribeNotifications)
+	r.Get("/ws/processes", s.subscribeProcessStatuses)
 	r.Get("/api/notifications", s.listNotifications)
 	r.Post("/api/notifications/{notificationID}/dismiss", s.dismissNotification)
 	r.Post("/api/notifications/dismiss-all", s.dismissAllNotifications)
@@ -4619,14 +4625,18 @@ func localizedErrorText(err error, fallback string) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "操作超时，请稍后重试。"
 	}
-	// Pure Chinese error without untranslated English — display directly.
-	if containsChinese(message) && !containsUntranslatedEnglish(message) {
-		return message
-	}
 	// Internal Go errors (stack traces, panics) — keep the fallback only
-	// to avoid leaking implementation details.
+	// to avoid leaking implementation details. Checked first so a wrapped
+	// "… 失败" message can never carry a stack trace to the UI.
 	if isInternalError(message) {
 		return fallback
+	}
+	// Messages that already carry a descriptive Chinese failure label (e.g. the
+	// update errors "更新 … 失败：<原因>") are self-explanatory and must be shown
+	// as-is, rather than being buried under the generic "查看日志" fallback that
+	// gives no reason. Pure Chinese errors also display directly.
+	if containsChinese(message) && (strings.Contains(message, "失败") || !containsUntranslatedEnglish(message)) {
+		return message
 	}
 	// English or mixed-language errors — keep the fallback as a prefix so
 	// users always see a Chinese description, then append the original error.
@@ -5066,6 +5076,9 @@ func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projec
 	} else {
 		runner = newProjectRunner(projectID, "", "", nil, broadcast)
 	}
+	runner.setStatusListener(func(event RunStatusEvent) {
+		s.broadcastProcessStatus(event)
+	})
 	s.runManagers[projectID] = runner
 	return runner, nil
 }
