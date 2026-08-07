@@ -146,6 +146,7 @@ AUTO_CLEAR_PORTS=1 pnpm dev
 | `AUTO_CONTROL_PORT` | `8080` | `pnpm dev` 使用的控制服务端口 |
 | `AUTO_WEB_PORT` | `5173` | `pnpm dev` 使用的网页端口 |
 | `AUTO_CLEAR_PORTS` | `0` | 设为 `1` 时允许 `pnpm dev` 停止占用开发端口的进程 |
+| `AUTO_STARTUP_TIMEOUT` | `60` | `pnpm dev` 等待控制服务健康检查通过的最长秒数 |
 | `AUTO_ALLOWED_ROOT` | 当前用户主目录 | 可浏览加载项目的根目录 |
 | `AUTO_DATABASE_PATH` | `../../data/auto.db` | SQLite 数据库路径 |
 | `AUTO_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 默认权限模式 (`acceptEdits` / `plan`) |

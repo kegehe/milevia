@@ -11,6 +11,7 @@ CONTROL_ADDR="${CONTROL_HOST}:${CONTROL_PORT}"
 CONTROL_URL="${AUTO_CONTROL_URL:-http://${CONTROL_ADDR}}"
 VITE_CONTROL_TARGET="${VITE_CONTROL_URL:-http://127.0.0.1:${CONTROL_PORT}}"
 AUTO_CLEAR_PORTS="${AUTO_CLEAR_PORTS:-0}"
+AUTO_STARTUP_TIMEOUT="${AUTO_STARTUP_TIMEOUT:-60}"
 CONTROL_PID=""
 WEB_PID=""
 
@@ -55,6 +56,27 @@ stop_process_group() {
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 }
 
+wait_for_control_server() {
+  local health_url="http://${CONTROL_HOST}:${CONTROL_PORT}/api/health"
+  local deadline=$((SECONDS + AUTO_STARTUP_TIMEOUT))
+
+  printf 'Waiting for control server readiness at %s\n' "$health_url"
+  while true; do
+    if curl --silent --show-error --fail --max-time 1 "$health_url" >/dev/null 2>&1; then
+      return
+    fi
+    if ! kill -0 "$CONTROL_PID" 2>/dev/null; then
+      echo "Control server exited before becoming ready." >&2
+      return 1
+    fi
+    if (( SECONDS >= deadline )); then
+      printf 'Control server did not become ready within %s seconds.\n' "$AUTO_STARTUP_TIMEOUT" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
@@ -77,6 +99,14 @@ if [[ "$AUTO_CLEAR_PORTS" != "0" && "$AUTO_CLEAR_PORTS" != "1" ]]; then
   echo "AUTO_CLEAR_PORTS must be 0 or 1." >&2
   exit 1
 fi
+if ! [[ "$AUTO_STARTUP_TIMEOUT" =~ ^[0-9]+$ ]] || (( AUTO_STARTUP_TIMEOUT < 1 )); then
+  echo "AUTO_STARTUP_TIMEOUT must be a positive number of seconds." >&2
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required to wait for the control server to become ready." >&2
+  exit 1
+fi
 if ! command -v lsof >/dev/null 2>&1 && ! command -v fuser >/dev/null 2>&1; then
   echo "lsof or fuser is required to clear occupied ports." >&2
   exit 1
@@ -94,6 +124,8 @@ echo "Starting control server at ${CONTROL_URL}"
   exec setsid env AUTO_HTTP_ADDR="$CONTROL_ADDR" AUTO_CONTROL_URL="$CONTROL_URL" go run ./cmd/control-server
 ) &
 CONTROL_PID=$!
+
+wait_for_control_server
 
 echo "Starting web app at http://${WEB_HOST}:${WEB_PORT}/"
 (
