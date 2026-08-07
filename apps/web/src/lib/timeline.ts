@@ -250,21 +250,34 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
     if (subtype === "task_started" || subtype === "task_notification" || subtype === "task_updated" || subtype === "background_tasks_changed") {
       let title = "后台任务";
       let detail = "";
+      let state: "success" | "failed" | "info" = "info";
       if (subtype === "task_started") {
         title = "后台任务启动";
         detail = String(payload.description || payload.summary || "").trim();
       } else if (subtype === "task_notification") {
         const taskStatus = String(payload.status || "");
-        // CLI 有时用英文模板生成 summary（如 Background command "..." completed (exit code 0)），
-        // 尝试提取引号内的描述并本地化；若不匹配则原样展示。
+        // CLI 有时用英文模板生成 summary，需要逐模版提取描述并本地化；
+        // 匹配不到就原样展示，保证任何英文原文都至少能被读到。
         const rawSummary = String(payload.summary || "").trim();
         const bgMatch = rawSummary.match(/^Background command "(.+)" (completed|failed) \(exit code (\d+)\)$/);
-        if (taskStatus === "failed") { title = "后台任务失败"; }
-        else if (taskStatus === "completed") { title = "后台任务完成"; }
-        else { title = "后台任务通知"; }
-        detail = bgMatch
+        // 「上一会话的后台代理没有完成记录」——通常是会话退出时该代理仍在运行或尚未回写。
+        const recordMatch = rawSummary.match(/^No completion record was found for background agent "([^"]*)"(?: from the previous session)?\.?/);
+        // 摘要模板优先提供 detail，taskStatus 决定最终标题与状态；两者信息都尽量保留。
+        const matchedDetail = bgMatch
           ? `${bgMatch[2] === "failed" ? "失败" : "完成"}（退出码 ${bgMatch[3]}）${bgMatch[1]}`
-          : rawSummary;
+          : recordMatch
+            ? `「${recordMatch[1]}」可能仍在运行，或其进程已在会话退出后终止。`
+            : rawSummary;
+        // No-completion-record 本质是「无记录」的中性态，而非成功/失败二分；
+        // 一旦摘要命中 recordMatch，就以它为准，压制可能自相矛盾的 taskStatus。
+        if (recordMatch) { title = "后台代理未找到完成记录"; state = "info"; }
+        else if (taskStatus === "failed") { title = "后台任务失败"; state = "failed"; }
+        else if (taskStatus === "completed") { title = "后台任务完成"; state = "success"; }
+        else if (bgMatch) {
+          title = bgMatch[2] === "failed" ? "后台任务失败" : "后台任务完成";
+          state = bgMatch[2] === "failed" ? "failed" : "success";
+        } else { title = "后台任务通知"; }
+        detail = matchedDetail;
       } else if (subtype === "task_updated") {
         const patch = asRecord(payload.patch);
         if (patch.is_backgrounded) { title = "任务转入后台"; }
@@ -281,6 +294,7 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
       systemItems.push({
         id: event.id, createdAt: event.createdAt, runId: event.runId,
         variant: "task", title, detail: detail || undefined,
+        metadata: { state },
       });
       continue;
     }

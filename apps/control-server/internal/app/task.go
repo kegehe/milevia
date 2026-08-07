@@ -1233,6 +1233,105 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
+// reviewAllTasks accepts every task in a project that is currently awaiting
+// review. Tasks that a live automatic-orchestration job is still verifying are
+// skipped so an in-flight review is not overwritten. The response reports how
+// many tasks were accepted and how many were skipped.
+func (s *Server) reviewAllTasks(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !s.projectExists(r.Context(), projectID) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	// 统计项目当前待验收任务总数。
+	var total int
+	if err := tx.QueryRowContext(r.Context(), `select count(*) from tasks where project_id=? and status=?`, projectID, taskAwaitingReview).Scan(&total); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if total == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"accepted": 0, "skipped": 0, "total": 0})
+		return
+	}
+	// 选出本次可实际验收的任务：仍在自动编排验证（queued/preparing/implementing/checking）中的
+	// 一律排除。该筛选与下方 UPDATE 处于同一事务、同一 Snapshot 连接（SQLite 写事务持有数据库锁），
+	// 从而把“检查编排状态”与“写入验收”放进同一个原子窗口，消除二者间的 TOCTOU 间隙。
+	// 全程只使用事务连接 tx，避免在 SQLite 单连接下对 s.db 再发查询导致死锁。
+	rows, err := tx.QueryContext(r.Context(), `select id from tasks where project_id=? and status=? and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking'))`, projectID, taskAwaitingReview)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var accepted []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		accepted = append(accepted, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := rows.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	skipped := total - len(accepted)
+	if len(accepted) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"accepted": 0, "skipped": skipped, "total": total})
+		return
+	}
+	placeholders := strings.Repeat("?,", len(accepted))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, len(accepted)+3)
+	args = append(args, taskDone, now, now)
+	for _, id := range accepted {
+		args = append(args, id)
+	}
+	query := `update tasks set status=?,updated_at=?,completed_at=? where id in (` + placeholders + `) and status=?`
+	args = append(args, taskAwaitingReview)
+	result, err := tx.ExecContext(r.Context(), query, args...)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// 事务内同一锁窗口下仍可能让状态被并发改动漏过 where status=?；
+	// 一旦实际修改行数与预期不符，整批中止（下面的 defer rollback），避免写入落空事件。
+	changed, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if int(changed) != len(accepted) {
+		writeError(w, http.StatusConflict, errors.New("task status changed before review was recorded"))
+		return
+	}
+	for _, id := range accepted {
+		if err := recordTaskEventTx(r.Context(), tx, id, "", "task.accepted", map[string]string{"note": ""}, now); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// 人工确认验收后无需再次通知，与单任务验收行为一致。
+	writeJSON(w, http.StatusOK, map[string]any{"accepted": len(accepted), "skipped": skipped, "total": total})
+}
+
 func (s *Server) reopenTask(w http.ResponseWriter, r *http.Request) {
 	s.transitionTaskState(w, r, "task.reopened", taskDone, taskTodo)
 }

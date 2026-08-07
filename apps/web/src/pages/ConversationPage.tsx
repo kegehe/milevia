@@ -67,6 +67,12 @@ async function copyMessageText(content: string) {
   copyWithLegacyClipboard(content);
 }
 
+// 合并现有草稿与预约内容：已约内容优先追加到末尾，避免续期时互相覆盖。
+function mergeDraftAndPending(draft: string, pending: string) {
+  const cleaned = draft.trim();
+  return cleaned ? `${cleaned}\n${pending}` : pending;
+}
+
 // ---- 子组件 ---------------------------------------------------------------
 
 function PermissionModeIcon() {
@@ -90,9 +96,10 @@ function ScrollNavigationIcon({ direction }: { direction: "top" | "previous" | "
   </svg>;
 }
 
-function ComposerActionIcon({ action }: { action: "clear" | "continue" | "send" }) {
+function ComposerActionIcon({ action }: { action: "clear" | "continue" | "send" | "schedule" }) {
   if (action === "clear") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 7 1 12h10l1-12M9 7V4.5h6V7M4.5 7h15M10 11v4.5M14 11v4.5" /></svg>;
   if (action === "continue") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h12M13 7.5l4.5 4.5-4.5 4.5" /></svg>;
+  if (action === "schedule") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2M9.5 4.5v-2M14.5 4.5v-2M4.8 8.5l-1.5-1.5M12 2.5l1.6 1.6" /></svg>;
   return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 15 7.2-6.6 2.1-2.1 6.7-6.3-16Z" /><path d="m12.9 13.8 3-3" /></svg>;
 }
 
@@ -108,6 +115,95 @@ function ShortcutAddIcon() {
 
 function ShortcutMoreIcon() {
   return <svg className="quick-tag-control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 12h.01M12 12h.01M17.5 12h.01" /></svg>;
+}
+
+function ShortcutDragIcon() {
+  return <svg className="quick-tag-grip-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 6h.01M12 6h.01M15.5 6h.01M8.5 12h.01M12 12h.01M15.5 12h.01M8.5 18h.01M12 18h.01M15.5 18h.01" strokeLinecap="round" /></svg>;
+}
+
+type SortableShortcutKind = "prompt" | "command_request";
+
+// ShortcutSortableList 渲染某一类别（提示词/命令）快捷方式的竖向排序列表，支持
+// HTML5 拖拽排序：拖动时本地预览顺序，落下时通过 onReorder 一次性提交新顺序。
+// 使用与后端 reorderShortcuts 匹配的 kind 语义（prompt 列统一归类为 "prompt"）。
+function ShortcutSortableList({ items, kind, renderItem, draggingDisabled, onReorder }: {
+  items: Shortcut[];
+  kind: SortableShortcutKind;
+  renderItem: (shortcut: Shortcut | undefined, kind: SortableShortcutKind) => React.ReactNode;
+  draggingDisabled: boolean;
+  onReorder: (kind: SortableShortcutKind, orderedIDs: string[]) => Promise<void>;
+}) {
+  const [order, setOrder] = useState<Shortcut[]>(items);
+  const [dragID, setDragID] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => { setOrder(items); }, [items]);
+
+  const dataKind = kind === "command_request" ? "command_request" : "prompt";
+
+  const onDragStart = (event: React.DragEvent<HTMLLIElement>, id: string) => {
+    if (draggingDisabled || saving) { event.preventDefault(); return; }
+    setOrder(items);
+    setDragID(id);
+    setDropTarget(id);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", id);
+  };
+
+  const onDragOver = (event: React.DragEvent<HTMLLIElement>, overID: string) => {
+    event.preventDefault();
+    if (!dragID || dragID === overID || !items.some((s) => s.id === dragID)) return;
+    event.dataTransfer.dropEffect = "move";
+    setDropTarget(overID);
+    setOrder((prev) => {
+      const from = prev.findIndex((s) => s.id === dragID);
+      const to = prev.findIndex((s) => s.id === overID);
+      if (from === -1 || to === -1 || from === to) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  };
+
+  const commit = () => {
+    if (!dragID) return;
+    // 顺序未发生变化（拖回原位）时不需要调用后端。
+    const sameOrder = order.length === items.length && order.every((s, index) => s.id === items[index].id);
+    setDragID(null);
+    setDropTarget(null);
+    if (sameOrder) return;
+    setSaving(true);
+    const orderedIDs = order.map((s) => s.id);
+    void onReorder(dataKind, orderedIDs)
+      .catch(() => { /* 失败时父组件负责回滚 refresh */ })
+      .finally(() => setSaving(false));
+  };
+
+  const onDrop = (event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    commit();
+  };
+
+  if (items.length === 0) {
+    return <div className="quick-tag-list">{renderItem(undefined, kind)}</div>;
+  }
+
+  return <ul className="quick-tag-list sortable" onDragOver={(e) => e.preventDefault()} onDrop={onDrop} onDragEnd={() => { setDragID(null); setDropTarget(null); }}>
+    {order.map((shortcut) => (
+      <li key={shortcut.id}
+          className={`quick-tag-item${dragID === shortcut.id ? " dragging" : dragID && dropTarget === shortcut.id ? " drop-over" : ""}`}
+          data-id={shortcut.id}
+          draggable={!draggingDisabled && !saving}
+          onDragStart={(e) => onDragStart(e, shortcut.id)}
+          onDragOver={(e) => onDragOver(e, shortcut.id)}
+          onDragEnd={() => { setDragID(null); setDropTarget(null); }}>
+        <span className="quick-tag-grip" aria-hidden="true"><ShortcutDragIcon /></span>
+        {renderItem(shortcut, kind)}
+      </li>
+    ))}
+  </ul>;
 }
 
 function DialogCloseIcon() {
@@ -373,8 +469,11 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail }: { mess
 
 const SystemCard = memo(function SystemCard({ system }: { system: SystemItem }) {
   const icon: Record<SystemVariant, string> = { compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", task: "▸" };
-  const variantClass = system.variant === "compact_result" && system.detail ? "failed" : system.variant;
-  return <article className={`system-card ${variantClass}`}><header><span className="system-card-icon" aria-hidden="true">{icon[system.variant]}</span><div><b>{system.title}</b>{system.detail && <small>{system.detail}</small>}</div></header><time className="system-card-time">{formatTime(system.createdAt)}</time></article>;
+  const variantClass = system.variant === "compact_result" && system.detail ? "compact_result failed" : system.variant;
+  // task 卡片按 metadata.state 追加成功/失败/中性后缀，失败换成警告图标。
+  const state = system.metadata?.state;
+  const taskState = system.variant === "task" ? (state === "failed" || state === "success" ? state : "info") : null;
+  return <article className={taskState ? `system-card task ${taskState}` : `system-card ${variantClass}`}><header><span className="system-card-icon" aria-hidden="true">{taskState === "failed" ? "!" : icon[system.variant]}</span><div><b>{system.title}</b>{system.detail && <small>{system.detail}</small>}</div></header><time className="system-card-time">{formatTime(system.createdAt)}</time></article>;
 });
 
 const ErrorCard = memo(function ErrorCard({ item, projectId, onViewTask }: { item: TimelineItem & { kind: "error" }; projectId: string; onViewTask: (taskId: string) => void }) {
@@ -589,6 +688,12 @@ export default function ConversationPage() {
   const [showMobileActions, setShowMobileActions] = useState(false);
   const [showFullControlConfirmation, setShowFullControlConfirmation] = useState(false);
   const [showPermissionMenu, setShowPermissionMenu] = useState(false);
+  // 预约发送：内容暂存到当前对话（含子代理）彻底空闲后再真正发出。
+  // 用 ref 保存并发安全的待发内容 + 一个 state 驱动 UI。
+  const [pendingSendContent, setPendingSendContent] = useState<string | null>(null);
+  const [showSendMenu, setShowSendMenu] = useState(false);
+  const pendingSendRef = useRef<string | null>(null);
+  const pendingSendConversationRef = useRef<string | null>(null);
   // 点击外部关闭权限菜单
   useEffect(() => {
     if (!showPermissionMenu) return;
@@ -600,6 +705,18 @@ export default function ConversationPage() {
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [showPermissionMenu]);
+
+  // 点击外部关闭发送方式菜单
+  useEffect(() => {
+    if (!showSendMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.closest(".composer-send-wrap")) return;
+      setShowSendMenu(false);
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showSendMenu]);
 
   const [activatingConversation, setActivatingConversation] = useState("");
   const [usage, setUsage] = useState<ConversationUsageResponse | null>(null);
@@ -689,7 +806,11 @@ export default function ConversationPage() {
   useEffect(() => () => {
     const conversationID = conversationRef.current?.id;
     if (!projectId || !conversationID) return;
-    const textToPersist = historyIndex.current === null ? textRef.current : draftBeforeHistory.current;
+    // 预约尚未触发的内容在页面卸载时写回草稿，避免丢失；下次进入同会话时自然恢复为可编辑文本。
+    let textToPersist = historyIndex.current === null ? textRef.current : draftBeforeHistory.current;
+    if (pendingSendConversationRef.current === conversationID && pendingSendRef.current != null) {
+      textToPersist = mergeDraftAndPending(textToPersist, pendingSendRef.current);
+    }
     saveConversationDraft(projectId, conversationID, textToPersist);
     flushConversationDraft(projectId, conversationID);
   }, [flushConversationDraft, projectId, saveConversationDraft]);
@@ -1083,6 +1204,20 @@ export default function ConversationPage() {
     retractedMessageRuns.current.clear();
     historyIndex.current = null;
     draftBeforeHistory.current = "";
+    // 切换到了别的会话：把仍挂在此前会话上的预约内容写回其草稿，避免被带入新会话或误发。
+    const scheduledConversationID = pendingSendConversationRef.current;
+    const scheduledContent = pendingSendRef.current;
+    if (scheduledConversationID && scheduledContent != null && scheduledConversationID !== conversation.id) {
+      if (projectId) {
+        const currentDraft = getConversationDraft(projectId, scheduledConversationID) || "";
+        saveConversationDraft(projectId, scheduledConversationID, mergeDraftAndPending(currentDraft, scheduledContent));
+        flushConversationDraft(projectId, scheduledConversationID);
+      }
+      pendingSendRef.current = null;
+      pendingSendConversationRef.current = null;
+      setPendingSendContent(null);
+    }
+    setShowSendMenu(false);
   }, [conversation?.id]);
 
   // 加载项目级输入历史（在新建/清空对话后仍保留）
@@ -1447,8 +1582,77 @@ export default function ConversationPage() {
 
   const send = (event: FormEvent) => {
     event.preventDefault();
+    setShowSendMenu(false);
     void sendContent(text);
   };
+
+  // 预约发送：将输入内容暂存，等当前对话（含所有子代理）彻底空闲后再真正发送。
+  const scheduleSend = () => {
+    const content = text.trim();
+    if (!content || !conversation) return;
+    if (sending || clearing || stopping || shortcutBusy) return;
+    setShowSendMenu(false);
+    pendingSendRef.current = content;
+    pendingSendConversationRef.current = conversation.id;
+    setPendingSendContent(content);
+    setComposerText("", conversation.id);
+  };
+
+  // 仅清空预约状态（不写回输入框）。用于 stopRun / clearCurrentConversation——
+  // 这两条流程自己有草稿恢复（restorePendingUserDraft / resetConversationView），
+  // 若这里预填输入框会污染 textRef，破坏它们对"输入框为空才恢复"的判断或被 reset 覆盖。
+  const clearScheduledSend = () => {
+    const pending = pendingSendRef.current;
+    pendingSendRef.current = null;
+    pendingSendConversationRef.current = null;
+    if (pending != null) setPendingSendContent(null);
+  };
+
+  // 取消预约（用户主动点取消按钮）：清空预约状态并把暂存内容写回输入框，方便继续编辑或改为立即发送。
+  const cancelScheduledSend = () => {
+    const conversationID = conversation?.id;
+    const pending = pendingSendRef.current;
+    if (!conversationID || pending == null) return;
+    clearScheduledSend();
+    const existing = textRef.current.trim();
+    setComposerText(existing ? `${existing}\n${pending}` : pending, conversationID);
+    requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
+  };
+
+  // 会话彻底空闲（主回合结束，且没有子代理仍在运行）时，自动发出预约内容。
+  const isConversationIdle = useCallback(() => {
+    if (run) return false;
+    for (const execution of agentExecutions) {
+      for (const agent of flattenAgents(execution.agents)) {
+        if (agent.status === "running" || agent.status === "pending") return false;
+      }
+    }
+    return true;
+  }, [agentExecutions, run]);
+
+  // 监听预约内容：一旦会话空闲便真正发送，随后清理预约状态。
+  useEffect(() => {
+    if (!pendingSendRef.current) return;
+    if (sending || clearing || stopping || shortcutBusy) return;
+    const conversationID = pendingSendConversationRef.current;
+    const content = pendingSendRef.current;
+    if (!conversationID || !content) return;
+    if (conversationRef.current?.id !== conversationID) return; // 切换会话后不越界发送
+    if (!isConversationIdle()) return; // 主回合或子代理仍在运行，继续等待
+    pendingSendRef.current = null;
+    pendingSendConversationRef.current = null;
+    // 发送成功/失败后统一清除 UI，避免残留预约提示。
+    // 使用默认 clearDraft=true：与普通发送行为一致——成功后清空输入框，
+    // 失败时 sendContent 会把内容写回输入框（不丢失预约内容）。
+    // 预约本身在 scheduleSend 时已清空输入框，因此这里使用默认行为最安全。
+    void (async () => {
+      try {
+        await sendContent(content);
+      } finally {
+        setPendingSendContent((current) => current === content ? null : current);
+      }
+    })();
+  }, [isConversationIdle, pendingSendContent, clearing, sendContent, sending, shortcutBusy, stopping]);
 
   const runShortcut = async (shortcut: Shortcut, variables: Record<string, string> = {}, variablesReady = false) => {
     if (!conversation || sending || clearing || stopping || shortcutBusy) return;
@@ -1579,6 +1783,9 @@ export default function ConversationPage() {
 
   const clearCurrentConversation = async (skipRunGuard = false) => {
     if (!conversation || sending || clearing || shortcutBusy || (!skipRunGuard && run)) return;
+    // 用户主动清空会话：清空预约状态，让预约内容随之作废。
+    // 这里不清写回输入框——resetConversationView 会用新会话草稿重置输入框，写回会被覆盖。
+    clearScheduledSend();
     const conversationID = conversation.id;
     const routeVersion = conversationRouteVersion.current;
     const routeConversationID = urlConversationId;
@@ -1686,6 +1893,9 @@ export default function ConversationPage() {
     const conversationID = conversation.id;
     const routeVersion = conversationRouteVersion.current;
     const runID = run;
+    // 用户主动停止：仅清空预约状态，避免停止后又把预约自动发射开启新一轮。
+    // 不写回输入框——restorePendingUserDraft 依赖"输入框为空"才恢复中断草稿，预填会破坏它。
+    clearScheduledSend();
     // 助手没有输出时，需要撤回用户消息并恢复草稿
     const shouldRetractMessage = !assistantOutputRuns.current.has(runID);
     const draftToRestore = shouldRetractMessage ? pendingUserDrafts.current.get(runID) : undefined;
@@ -1796,10 +2006,7 @@ export default function ConversationPage() {
   const displayedModel = usage?.context.model || currentUsage?.model || (isCodex ? "Codex" : "Claude Code");
   const promptShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "prompt" || shortcut.kind === "snippet");
   const commandShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "command_request");
-  const promptShortcutItems = promptShortcuts.length > 0 ? promptShortcuts : [undefined];
-  const commandShortcutItems = commandShortcuts.length > 0 ? commandShortcuts : [undefined];
   const userMessageNavigationIndex = userMessages.length === 0 ? -1 : Math.max(0, Math.min(currentUserMessageIndex, userMessages.length - 1));
-  const shortcutRowCount = Math.max(promptShortcutItems.length, commandShortcutItems.length);
   const starterSuggestions = [
     { label: "审查改动", prompt: "请审查当前工作区的改动，重点检查潜在问题、风险和缺少的测试。" },
     { label: "定位问题", prompt: "请帮我定位并分析以下问题的原因：" },
@@ -1820,6 +2027,23 @@ export default function ConversationPage() {
     return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={!shortcut.enabled || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.template}\n\n${shortcut.name}已停用`}><span className="quick-tag-text">{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</span></button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} aria-label={`编辑 ${shortcut.name}`} disabled={clearing || Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}><ShortcutMoreIcon /></button></div>;
   };
 
+  const reorderKind = useCallback(async (kind: SortableShortcutKind, orderedIDs: string[]) => {
+    try {
+      await projectApi(`/api/projects/${projectId}/shortcuts/reorder`, {
+        method: "PUT",
+        body: JSON.stringify({ kind, orderedIds: orderedIDs }),
+      });
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : "无法保存排序");
+    } finally {
+      await refreshShortcuts();
+    }
+  }, [projectId, projectApi, fail, refreshShortcuts]);
+
+  const renderPromptCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "prompt");
+  const renderCommandCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "command_request");
+  const sortableDraggingDisabled = sending || clearing || stopping || Boolean(shortcutBusy);
+
   return <>
     {createPortal(<div className={`head-actions-menu${showMobileActions ? " mobile-open" : ""}`}>
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
@@ -1836,12 +2060,12 @@ export default function ConversationPage() {
     <section className="conversation-canvas">
       <aside className="quick-tag-rail" aria-label="常用操作">
         <div className="quick-actions-row">
-          <div className="quick-actions-headings"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><div className="quick-tag-heading command-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div></div>
-          {Array.from({ length: shortcutRowCount }, (_, index) => <div className="quick-tag-row" key={`shortcut-row-${index}`}>{renderShortcutCell(promptShortcutItems[index], "prompt", !promptShortcutItems[index])}{renderShortcutCell(commandShortcutItems[index], "command_request", !commandShortcutItems[index])}</div>)}
+          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
         </div>
         <div className="quick-actions-mobile">
-          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><div className="quick-tag-list">{promptShortcutItems.map((shortcut, index) => <div key={shortcut?.id || `empty-prompt-${index}`}>{renderShortcutCell(shortcut, "prompt")}</div>)}</div></div>
-          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><div className="quick-tag-list">{commandShortcutItems.map((shortcut, index) => <div key={shortcut?.id || `empty-command-${index}`}>{renderShortcutCell(shortcut, "command_request")}</div>)}</div></div>
+          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
         </div>
       </aside>
       <section className="chat-center">
@@ -1862,7 +2086,8 @@ export default function ConversationPage() {
       <form ref={composerRef} className={`composer${pendingApproval ? " has-approval" : ""}${isEmptyConversation ? " empty-session" : ""}`} onSubmit={(event) => void send(event)}>
         {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
         <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={`描述希望${isCodex ? " Codex" : " Claude"}在当前项目中完成的工作...`} disabled={sending || clearing || stopping || Boolean(shortcutBusy)} />
-        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<button className="primary composer-action composer-send" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button></span></div>
+        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {isCodex ? "Codex" : "Claude"}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
+        {pendingSendContent && <div className="composer-pending"><span className="composer-pending-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2" /></svg></span><span className="composer-pending-text"><b>已预约发送</b><small>{run ? "等待当前任务完成..." : "等待子代理完成..."}<span className="composer-pending-preview">{pendingSendContent.length > 40 ? `${pendingSendContent.slice(0, 40)}…` : pendingSendContent}</span></small></span><button className="composer-pending-cancel" type="button" title="撤回预约并带回输入框" onClick={cancelScheduledSend}>取消</button></div>}
       </form>
       </section>
       <aside className="task-queue-rail" aria-label="任务队列">

@@ -164,6 +164,7 @@ type Server struct {
 	runTokens              map[string]string
 	runContexts            map[string]string
 	profileAdmissions      *profileRevisionAdmissionGate
+	profileSecrets         *profileSecretStore
 	profileRunCancels      map[string]map[string]context.CancelFunc
 	streamingSetups        map[string]*streamingSetup
 	projectWorkspaceLeases map[string]*projectWorkspaceLease
@@ -268,6 +269,7 @@ type Project struct {
 	Name        string    `json:"name"`
 	Path        string    `json:"-"`
 	PathDisplay string    `json:"pathDisplay"`
+	FullPath    string    `json:"fullPath"`
 	Runner      string    `json:"runner"`
 	RunnerID    string    `json:"runnerId"`
 	Environment string    `json:"environment"`
@@ -276,6 +278,9 @@ type Project struct {
 	CodexReady  bool      `json:"codexReady"`
 	AgentReady  bool      `json:"agentReady"`
 	CreatedAt   time.Time `json:"createdAt"`
+	// DefaultProfileID is the agent profile applied to new conversations when no
+	// explicit profile is requested, letting a project ride one credential.
+	DefaultProfileID string `json:"defaultProfileId"`
 }
 
 type Conversation struct {
@@ -498,6 +503,18 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	if config.SessionToken != "" {
 		s.upgrader.Subprotocols = []string{s.websocketSessionProtocol()}
 	}
+	keyPath := filepath.Join(config.DataDir, "profile-master.key")
+	if keyPath == filepath.Join("", "profile-master.key") {
+		keyPath = filepath.Join(filepath.Dir(config.DatabasePath), "profile-master.key")
+	}
+	if manager, err := newProfileSecretStore(pool, keyPath); err != nil {
+		runtimeStop()
+		pool.Close()
+		_ = dataLock.close()
+		return nil, fmt.Errorf("initialize managed credential store: %w", err)
+	} else {
+		s.profileSecrets = manager
+	}
 	if err := s.migrate(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
@@ -699,6 +716,7 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects", s.createProject)
 	r.Get("/api/projects/{projectID}", s.getProject)
 	r.Delete("/api/projects/{projectID}", s.deleteProject)
+	r.Patch("/api/projects/{projectID}/agent-profile", s.setProjectDefaultProfile)
 	r.Get("/api/projects/{projectID}/git/summary", s.gitSummary)
 	r.Get("/api/projects/{projectID}/git/changes", s.gitChanges)
 	r.Get("/api/projects/{projectID}/git/diff", s.gitDiff)
@@ -717,6 +735,7 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/switch", s.gitSwitchBranch)
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
+	r.Post("/api/projects/{projectID}/tasks/review-all", s.reviewAllTasks)
 	r.Get("/api/projects/{projectID}/input-history", s.listProjectInputHistory)
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
 	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
@@ -745,6 +764,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/conversations", s.listConversations)
 	r.Post("/api/projects/{projectID}/conversations", s.createConversation)
 	r.Get("/api/projects/{projectID}/shortcuts", s.listShortcuts)
+	r.Put("/api/projects/{projectID}/shortcuts/reorder", s.reorderShortcuts)
 	r.Post("/api/shortcuts/defaults", s.seedDefaultShortcuts)
 	r.Post("/api/shortcuts", s.createShortcut)
 	r.Patch("/api/shortcuts/{shortcutID}", s.updateShortcut)
@@ -1742,41 +1762,90 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("project ID is required"))
 		return
 	}
-	// Serialize deletion with message admission so no new agent process can be
-	// started after we have stopped the project's existing sessions.
+	// Perform the destructive step (signal agent sessions, delete the project row
+	// and its cascaded records, drop the workspace lease and managed-process
+	// runner). deleteProjectLocked serializes it with message admission under
+	// projectLifecycleMu so no new agent process can be started for the project
+	// after it is gone; the lock is held only for this fast section, and final
+	// process teardown runs in the background below.
+	runner, conversationIDs, status, err := s.deleteProjectLocked(s.runtimeCtx, projectID)
+	if status != http.StatusNoContent {
+		writeError(w, status, err)
+		return
+	}
+
+	// Background teardown: from this point the project row and its cascaded
+	// conversations/runs are gone, so any new request to start a run is rejected
+	// by projectRunManagerForExistingProject's existence check. Retire the
+	// detached managed-process runner and wait for the signalled agent runs to
+	// actually settle so a straggler cannot linger beyond the project's lifetime.
+	// Both are tracked in runWG so Close() does not return until the project's
+	// processes have actually been collected.
+	if runner != nil {
+		s.runWG.Add(1)
+		go func(runner projectRunnerInterface) {
+			defer s.runWG.Done()
+			_ = runner.Retire()
+		}(runner)
+	}
+	if len(conversationIDs) > 0 {
+		s.runWG.Add(1)
+		go func() {
+			defer s.runWG.Done()
+			s.waitProjectAgentsStop(s.runtimeCtx, conversationIDs)
+		}()
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteProjectLocked cancels and stops the project's agent sessions, then
+// deletes the project row and its cascade, finally dropping the workspace lease
+// and the managed-process runner. It acquires and releases projectLifecycleMu
+// itself (via defer), serializing with message admission so no new agent process
+// can be started for the project after it is gone. A future edit that adds an
+// early return cannot accidentally skip the unlock and deadlock the server. It
+// returns the released managed-process runner (nil if none), the set of
+// conversation IDs that were active (empty if none), an HTTP status code
+// (http.StatusNoContent on success), and the error to report when the status is
+// not StatusNoContent.
+func (s *Server) deleteProjectLocked(ctx context.Context, projectID string) (projectRunnerInterface, map[string]struct{}, int, error) {
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
-	if err := s.stopProjectAgentRuns(r.Context(), projectID); err != nil {
-		writeError(w, http.StatusConflict, fmt.Errorf("stop project agents: %w", err))
-		return
+
+	// Signal phase: cancel + stop every agent session for this project. These
+	// calls do not wait for the processes to actually exit (they are fast),
+	// which keeps the lock short and deletion responsive even when a project
+	// has a long-running task. Final process teardown happens in the background.
+	// Deleting is a user's explicit, idempotent intent rooted in the runtime
+	// context, so a client disconnect mid-request cannot leave a half-deleted
+	// project (processes stopped but the row still present).
+	conversationIDs, err := s.signalProjectStop(ctx, projectID)
+	if err != nil {
+		return nil, nil, http.StatusConflict, fmt.Errorf("stop project agents: %w", err)
 	}
 	// Foreign key cascades (on delete cascade) will clean up:
 	//   conversations -> messages, runs, events, run_usage, run_model_usage
 	//   shortcut_projects (via project_id), shortcut_runs (via conversation_id)
 	//   tasks, task_runs, task_events, task_dependencies
-	tx, err := s.db.BeginTx(r.Context(), nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	tx, txErr := s.db.BeginTx(ctx, nil)
+	if txErr != nil {
+		return nil, nil, http.StatusInternalServerError, txErr
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(r.Context(), `delete from projects where id=$1`, projectID)
+	result, err := tx.ExecContext(ctx, `delete from projects where id=$1`, projectID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, nil, http.StatusInternalServerError, err
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, nil, http.StatusInternalServerError, err
 	}
 	if changed != 1 {
-		writeError(w, http.StatusNotFound, errors.New("project not found"))
-		return
+		return nil, nil, http.StatusNotFound, errors.New("project not found")
 	}
 	if err = tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, nil, http.StatusInternalServerError, err
 	}
 	// Release the workspace lease only after a successful commit.
 	s.mu.Lock()
@@ -1786,36 +1855,36 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	runner := s.runManagers[projectID]
 	delete(s.runManagers, projectID)
 	s.runManagersMu.Unlock()
-	if runner != nil {
-		if err := runner.Retire(); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("project was deleted but its process could not be stopped: %w", err))
-			return
-		}
-	}
 	s.closeProjectRunLogSubscribers(projectID)
-	w.WriteHeader(http.StatusNoContent)
+	return runner, conversationIDs, http.StatusNoContent, nil
 }
 
-func (s *Server) stopProjectAgentRuns(ctx context.Context, projectID string) error {
+// signalProjectStop collects the project's agent sessions and issues
+// cancellation / stop signals for them. All operations are non-blocking; this
+// marks sessions as stopping and requests their contexts be cancelled, but does
+// not wait for the underlying processes to reap. It returns the set of
+// conversation IDs that were active so the caller can wait for them to settle
+// in the background. The caller must hold projectLifecycleMu.
+func (s *Server) signalProjectStop(ctx context.Context, projectID string) (map[string]struct{}, error) {
 	rows, err := s.db.QueryContext(ctx, `select id from conversations where project_id=?`, projectID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	conversationIDs := map[string]struct{}{}
 	for rows.Next() {
 		var conversationID string
 		if err := rows.Scan(&conversationID); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		conversationIDs[conversationID] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return nil, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return nil, err
 	}
 
 	cancels := []context.CancelFunc{}
@@ -1849,7 +1918,17 @@ func (s *Server) stopProjectAgentRuns(ctx context.Context, projectID string) err
 	for runID := range runIDs {
 		s.resolveRunApprovals(runID, "deny")
 	}
+	return conversationIDs, nil
+}
 
+// waitProjectAgentsStop blocks until the in-memory runs and sessions that were
+// signalled for deletion have fully settled. It is intended to run in a
+// background goroutine (rooted at the service runtime context) so project
+// deletion is not blocked by a slow-to-stop agent. The 15s cap bounds how long
+// a straggler run may linger beyond the project's deletion. Note: the durable
+// run rows are gone the moment the project row is cascade-deleted, so only the
+// in-memory maps (runContexts / sessions) matter here.
+func (s *Server) waitProjectAgentsStop(ctx context.Context, conversationIDs map[string]struct{}) {
 	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -1872,19 +1951,12 @@ func (s *Server) stopProjectAgentRuns(ctx context.Context, projectID string) err
 			}
 		}
 		s.mu.Unlock()
-		// A streaming turn removes its in-memory run mapping before it writes
-		// its terminal state. Keep waiting for the durable state as well, so
-		// cascading the project deletion cannot race that final persistence.
-		var persistedActive bool
-		if err := s.db.QueryRowContext(waitCtx, `select exists(select 1 from runs r join conversations c on c.id=r.conversation_id where c.project_id=? and r.status in ('queued','running'))`, projectID).Scan(&persistedActive); err != nil {
-			return err
-		}
-		if !active && !persistedActive {
-			return nil
+		if !active {
+			return
 		}
 		select {
 		case <-waitCtx.Done():
-			return errors.New("agent processes did not stop before the deletion deadline")
+			return
 		case <-ticker.C:
 		}
 	}
@@ -1957,6 +2029,64 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, p)
 }
 
+// setProjectDefaultProfile sets (or clears, with profileId "") the agent profile
+// applied to new conversations in a project. This is the "一键应用到项目" entry
+// point: set it once and every subsequent conversation for that project uses the
+// chosen profile and its managed credentials.
+func (s *Server) setProjectDefaultProfile(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	var input struct {
+		ProfileID string `json:"profileId"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	profileID := strings.TrimSpace(input.ProfileID)
+	var projectRunner string
+	if err := s.db.QueryRowContext(r.Context(), `select coalesce(nullif(runner_id,''),runner) from projects where id=?`, projectID).Scan(&projectRunner); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if profileID != "" {
+		tx, err := s.db.BeginTx(r.Context(), nil)
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		defer tx.Rollback()
+		var state, agentID string
+		err = tx.QueryRowContext(r.Context(), `select p2.agent_id,r.state from agent_profiles p2 join agent_profile_revisions r on r.id=p2.current_revision_id where p2.id=? and p2.runner_id=? and p2.enabled=1`, profileID, projectRunner).Scan(&agentID, &state)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && state != "active") {
+			writeError(w, http.StatusConflict, errors.New("agent profile is unavailable for this project runner"))
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		// The tx holds the only SQLite connection; the update must run on the
+		// same tx or the subsequent db call would deadlock.
+		if _, err = tx.ExecContext(r.Context(), `update projects set default_profile_id=? where id=?`, profileID, projectID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if err = tx.Commit(); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"profileId": profileID})
+		return
+	}
+	if _, err := s.db.ExecContext(r.Context(), `update projects set default_profile_id=? where id=?`, profileID, projectID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"profileId": profileID})
+}
+
 func (s *Server) decorateProjectAvailability(project *Project, localCodexReady bool) {
 	switch {
 	case isLocalRunnerID(project.Runner):
@@ -1987,6 +2117,7 @@ func (s *Server) sshCodexReady(runnerID string) bool {
 }
 
 func (s *Server) decorateProjectPresentation(project *Project) {
+	project.FullPath = project.Path
 	project.PathDisplay = filepath.Base(project.Path)
 	project.Environment = "wsl"
 	if strings.HasPrefix(project.Path, "/mnt/") {
@@ -1998,6 +2129,8 @@ func (s *Server) decorateProjectPresentation(project *Project) {
 	project.Environment = "remote-linux"
 	project.PathDisplay = project.Path
 	if meta, ok := s.runnerRegistry.getMeta(project.Runner); ok {
+		// 远程项目用 服务器名:路径 作为完整路径，标识它所在的主机
+		project.FullPath = meta.Name + ":" + project.Path
 		project.PathDisplay = meta.Name + ":" + project.Path
 	}
 }
@@ -2088,7 +2221,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	profileRevisionID, err := s.profileForNewConversationTx(r.Context(), tx, input.ProfileID, projectRunner, input.AgentID)
+	profileRevisionID, err := s.profileForNewConversationTx(r.Context(), tx, input.ProfileID, projectRunner, input.AgentID, projectID)
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
@@ -2107,12 +2240,12 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			_, profileErr := s.runtimeProfileTx(r.Context(), tx, profileRevisionID, projectRunner, input.AgentID)
+			profile, profileErr := s.runtimeProfileTx(r.Context(), tx, profileRevisionID, projectRunner, input.AgentID)
 			if profileErr != nil {
 				writeError(w, http.StatusConflict, profileErr)
 				return
 			}
-			if !s.codexRunner.Ready(r.Context()) {
+			if !s.codexUsableForProfile(r.Context(), profile) {
 				writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
 				return
 			}
@@ -2722,7 +2855,7 @@ func (s *Server) listShortcuts(w http.ResponseWriter, r *http.Request) {
 	if !includeDisabled {
 		query += ` and s.enabled=1`
 	}
-	query += ` order by s.enabled desc,s.pinned desc,s.sort_order,s.name`
+	query += ` order by s.sort_order,s.name`
 	rows, err := s.db.QueryContext(r.Context(), query, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -2756,6 +2889,94 @@ func (s *Server) listShortcuts(w http.ResponseWriter, r *http.Request) {
 		shortcuts[index].ProjectIDs = projectIDs
 	}
 	writeJSON(w, http.StatusOK, shortcuts)
+}
+
+type reorderShortcutsInput struct {
+	Kind       string   `json:"kind"`
+	OrderedIDs []string `json:"orderedIds"`
+}
+
+// reorderShortcuts 以提交的完整顺序一次性重写某类别（提示词/命令）在当前项目下可见
+// 快捷方式的 sort_order。客户端必须提交该类别在当前项目下可见的全部 id（无增减），
+// 服务端据此校验为一种排列后，在单个事务内按数组下标重新编号，保证原子与幂等。
+func (s *Server) reorderShortcuts(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	var input reorderShortcutsInput
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Kind != "prompt" && input.Kind != "snippet" && input.Kind != "command_request" {
+		writeError(w, http.StatusBadRequest, errors.New("invalid shortcut kind"))
+		return
+	}
+	if len(input.OrderedIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("orderedIds must not be empty"))
+		return
+	}
+	rows, err := s.db.QueryContext(r.Context(), `select distinct s.id from shortcuts s left join shortcut_projects sp on sp.shortcut_id=s.id where s.kind=? and (s.scope='local' or sp.project_id=?)`, input.Kind, projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	expected := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !expected[id] {
+			expected[id] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := rows.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	seen := map[string]bool{}
+	for _, id := range input.OrderedIDs {
+		if !expected[id] {
+			writeError(w, http.StatusBadRequest, errors.New("orderedIds must contain exactly the visible shortcuts of this kind"))
+			return
+		}
+		if seen[id] {
+			writeError(w, http.StatusBadRequest, errors.New("orderedIds contains duplicates"))
+			return
+		}
+		seen[id] = true
+	}
+	if len(seen) != len(expected) {
+		writeError(w, http.StatusBadRequest, errors.New("orderedIds must contain exactly the visible shortcuts of this kind"))
+		return
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	for index, id := range input.OrderedIDs {
+		if _, err := tx.ExecContext(r.Context(), `update shortcuts set sort_order=?,updated_at=? where id=?`, index, now, id); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if _, err := tx.ExecContext(r.Context(), `insert into shortcut_audit_events (id,shortcut_id,action,payload,created_at) values (?,?,?,?,?)`, uuid.NewString(), nil, "reordered", mustJSON(map[string]any{"kind": input.Kind, "count": len(input.OrderedIDs)}), now); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"reordered": len(input.OrderedIDs)})
 }
 
 func (s *Server) seedDefaultShortcuts(w http.ResponseWriter, r *http.Request) {
@@ -3203,7 +3424,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 			}
 			runnerObj = r
 		} else {
-			if !s.codexRunner.Ready(ctx) {
+			if !s.codexUsableForProfile(ctx, profile) {
 				return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in")
 			}
 			runnerObj = s.codexRunner
@@ -4469,6 +4690,19 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
+// codexUsableForProfile reports whether the local Codex binary can run the given
+// bound profile. A managed api_key profile injects its own OPENAI_API_KEY, so it
+// only needs the binary; cli_managed and profile-less runs also require a
+// persisted CLI login.
+func (s *Server) codexUsableForProfile(ctx context.Context, profile *AgentRuntimeProfile) bool {
+	if codexRunner, ok := s.codexRunner.(*codexCLIRunner); ok {
+		if profile != nil && profile.AuthMode == "api_key" {
+			return codexRunner.BinaryReady()
+		}
+	}
+	return s.codexRunner.Ready(ctx)
+}
+
 func (s *Server) localRunnerID() string {
 	if runtime.GOOS == "windows" {
 		return "windows-local"
@@ -4888,7 +5122,7 @@ func isPosixEnvName(name string) bool {
 
 func (s *Server) getProjectByID(ctx context.Context, projectID string) (Project, error) {
 	var p Project
-	err := s.db.QueryRowContext(ctx, `select id,name,path,coalesce(nullif(runner_id,''),runner),git_branch,claude_ready,created_at from projects where id=$1`, projectID).Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `select id,name,path,coalesce(nullif(runner_id,''),runner),git_branch,claude_ready,created_at,coalesce(default_profile_id,'') from projects where id=$1`, projectID).Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt, &p.DefaultProfileID)
 	if err != nil {
 		return Project{}, err
 	}

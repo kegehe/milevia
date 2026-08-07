@@ -1563,6 +1563,148 @@ func TestShortcutDefaultsPreserveProjectBindingsAndWrapCommands(t *testing.T) {
 	}
 }
 
+func TestReorderShortcuts(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','Project','project-path','wsl-local','main',1,?)`, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	// 插入三个提示词 + 两个命令，用于验证 kind 内重排与跨 kind 隔离。
+	for i, entry := range []struct {
+		id, kind string
+	}{
+		{"p-a", "prompt"}, {"p-b", "prompt"}, {"p-c", "prompt"},
+		{"c-a", "command_request"}, {"c-b", "command_request"},
+	} {
+		if _, err := server.db.Exec(`insert into shortcuts (id,name,description,kind,template,scope,default_action,group_name,pinned,enabled,sort_order,created_at,updated_at) values (?,?,?,?,?,'local','run','',1,1,?,?,?)`, entry.id, entry.id, "", entry.kind, entry.kind, i, now, now); err != nil {
+			t.Fatalf("insert shortcut %s: %v", entry.id, err)
+		}
+	}
+	// 让 p-c 停用，验证自由排序下停用项也能被重排。
+	if _, err := server.db.Exec(`update shortcuts set enabled=0 where id='p-c'`); err != nil {
+		t.Fatalf("disable p-c: %v", err)
+	}
+
+	handler := server.routes()
+	payload := `{"kind":"prompt","orderedIds":["p-c","p-a","p-b"]}`
+	reorder := httptest.NewRecorder()
+	handler.ServeHTTP(reorder, httptest.NewRequest(http.MethodPut, "/api/projects/project/shortcuts/reorder", bytes.NewBufferString(payload)))
+	if reorder.Code != http.StatusOK {
+		t.Fatalf("reorder prompt status: %d body=%s", reorder.Code, reorder.Body.String())
+	}
+	// 验证 sort_order 已按提交顺序重新编号。
+	for index, id := range []string{"p-c", "p-a", "p-b"} {
+		var order int
+		if err := server.db.QueryRow(`select sort_order from shortcuts where id=?`, id).Scan(&order); err != nil {
+			t.Fatalf("read sort_order for %s: %v", id, err)
+		}
+		if order != index {
+			t.Fatalf("sort_order for %s: want %d got %d", id, index, order)
+		}
+	}
+	// list 应返回新顺序（含停用项，因 includeDisabled=true），且 p-c 在前。
+	listed := httptest.NewRecorder()
+	handler.ServeHTTP(listed, httptest.NewRequest(http.MethodGet, "/api/projects/project/shortcuts?includeDisabled=true", nil))
+	var shortcuts []Shortcut
+	if err := json.NewDecoder(listed.Body).Decode(&shortcuts); err != nil {
+		t.Fatalf("decode listed shortcuts: %v", err)
+	}
+	promptIDs := []string{}
+	for _, sc := range shortcuts {
+		if sc.Kind == "prompt" {
+			promptIDs = append(promptIDs, sc.ID)
+		}
+	}
+	if strings.Join(promptIDs, ",") != "p-c,p-a,p-b" {
+		t.Fatalf("listed prompt order: want p-c,p-a,p-b got %s", strings.Join(promptIDs, ","))
+	}
+	// 命令种类不受 prompt 重排影响，仍保持各自原 sort_order（c-a=3, c-b=4）不变。
+	for _, wanted := range []struct {
+		id   string
+		from int
+	}{
+		{"c-a", 3}, {"c-b", 4},
+	} {
+		var commandOrder int
+		if err := server.db.QueryRow(`select sort_order from shortcuts where id=?`, wanted.id).Scan(&commandOrder); err != nil || commandOrder != wanted.from {
+			t.Fatalf("command %s sort_order altered by prompt reorder: want %d got %d err=%v", wanted.id, wanted.from, commandOrder, err)
+		}
+	}
+}
+
+func TestReorderShortcutsRejectsInvalidInput(t *testing.T) {
+	server := newTestServer(t)
+	// 无项目时 reorder 也要求 orderedIds 与可见集一致，用于校验 400 分支。
+	cases := []string{
+		`{"kind":"unknown","orderedIds":["x"]}`,              // 非法 kind
+		`{"kind":"prompt","orderedIds":[]}`,                  // 空数组
+		`{"orderedIds":["x"]}`,                               // 缺 kind
+		`{"kind":"prompt"}`,                                  // 缺 orderedIds（为空）
+		`{"kind":"prompt","orderedIds":["x","y"]}`,           // 含不可见 id
+	}
+	for _, payload := range cases {
+		rec := httptest.NewRecorder()
+		handler := server.routes()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/projects/project/shortcuts/reorder", bytes.NewBufferString(payload)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("reorder %s: want 400 got %d body=%s", payload, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// 项目级快捷方式只在绑定它的项目内可见：项目 A 的 reorder 不能写入绑定到项目 B 的
+// 项目级项（服务端应拒绝未知 id），而 local 全局项在所有项目可见、可被任一项目重排。
+func TestReorderShortcutsScopeIsolation(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	for _, id := range []string{"project-a", "project-b"} {
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,'wsl-local','main',1,?)`, id, id, id+"-path", now); err != nil {
+			t.Fatalf("insert project %s: %v", id, err)
+		}
+	}
+	type row struct {
+		id, kind, scope string
+		projectID       string // 空表示 local
+	}
+	rows := []row{
+		{"pa-1", "prompt", "project", "project-a"},
+		{"bonly", "prompt", "project", "project-b"},
+		{"pa-2", "command_request", "project", "project-a"},
+	}
+	for _, r := range rows {
+		if _, err := server.db.Exec(`insert into shortcuts (id,name,description,kind,template,scope,default_action,group_name,pinned,enabled,sort_order,created_at,updated_at) values (?,?,?,?,?,'project','run','',1,1,?,?,?)`, r.id, r.id, "", r.kind, r.kind+"-tpl", len(rows), now, now); err != nil {
+			t.Fatalf("insert shortcut %s: %v", r.id, err)
+		}
+		if _, err := server.db.Exec(`insert into shortcut_projects (shortcut_id,project_id) values (?,?)`, r.id, r.projectID); err != nil {
+			t.Fatalf("bind shortcut %s: %v", r.id, err)
+		}
+	}
+	handler := server.routes()
+	// 项目 A 同时提交 pa-1（自己的）和 bonly（项目 B 的）→ 必须 400，不能越权改动 B 的项。
+	payload := `{"kind":"prompt","orderedIds":["pa-1","bonly"]}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/projects/project-a/shortcuts/reorder", bytes.NewBufferString(payload)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("reorder across projects: want 400 got %d body=%s", rec.Code, rec.Body.String())
+	}
+	// 项目 A 按 kind=prompt 可见集只有 pa-1，正确重排应只含 pa-1。
+	ok := httptest.NewRecorder()
+	handler.ServeHTTP(ok, httptest.NewRequest(http.MethodPut, "/api/projects/project-a/shortcuts/reorder", bytes.NewBufferString(`{"kind":"prompt","orderedIds":["pa-1"]}`)))
+	if ok.Code != http.StatusOK {
+		t.Fatalf("reorder own prompt: want 200 got %d body=%s", ok.Code, ok.Body.String())
+	}
+	// 越权请求不得改动 bonly 的 sort_order。
+	var bOrder int
+	if err := server.db.QueryRow(`select sort_order from shortcuts where id='bonly'`).Scan(&bOrder); err != nil || bOrder != len(rows) {
+		t.Fatalf("project B shortcut sort_order altered: order=%d err=%v", bOrder, err)
+	}
+	// 未被提交的项目项 pa-2（command），其 sort_order 也不得被改。
+	var cOrder int
+	if err := server.db.QueryRow(`select sort_order from shortcuts where id='pa-2'`).Scan(&cOrder); err != nil || cOrder != len(rows) {
+		t.Fatalf("untouched command sort_order altered: order=%d err=%v", cOrder, err)
+	}
+}
+
 func TestDefaultShortcutsSeedOnceAndDoNotReappearAfterDeletion(t *testing.T) {
 	server := newTestServer(t)
 	handler := server.routes()
@@ -3686,6 +3828,123 @@ func TestAcceptingTaskDoesNotCreateStatusNotification(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("accepted-task notification count = %d, want 0", count)
+	}
+}
+
+func TestReviewAllTasksAcceptsAwaitingReviewTasks(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	first := createTaskForTest(t, server.routes(), projectID, "batch accept A")
+	second := createTaskForTest(t, server.routes(), projectID, "batch accept B")
+	done := createTaskForTest(t, server.routes(), projectID, "already done")
+	for _, taskID := range []string{first, second} {
+		if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
+			t.Fatalf("mark task awaiting review: %v", err)
+		}
+	}
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskDone, done); err != nil {
+		t.Fatalf("mark task done: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/tasks/review-all", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("review-all status: %d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Skipped  int `json:"skipped"`
+		Total    int `json:"total"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode review-all result: %v", err)
+	}
+	if result.Accepted != 2 || result.Skipped != 0 || result.Total != 2 {
+		t.Fatalf("review-all result: accepted=%d skipped=%d total=%d want 2/0/2", result.Accepted, result.Skipped, result.Total)
+	}
+	assertTaskStatus(t, server, first, taskDone)
+	assertTaskStatus(t, server, second, taskDone)
+	// 已经 done 的任务不应被重新改动。
+	assertTaskStatus(t, server, done, taskDone)
+
+	// 仅批量验收的两项任务被标记 completed_at；基线任务虽为 done 但无 completed_at。
+	var completedCount int
+	if err := server.db.QueryRow(`select count(*) from tasks where status=? and completed_at is not null`, taskDone).Scan(&completedCount); err != nil {
+		t.Fatalf("count completed tasks: %v", err)
+	}
+	if completedCount != 2 {
+		t.Fatalf("completed task count = %d, want 2", completedCount)
+	}
+
+	var eventCount int
+	if err := server.db.QueryRow(`select count(*) from task_events where type=?`, "task.accepted").Scan(&eventCount); err != nil {
+		t.Fatalf("count accepted events: %v", err)
+	}
+	if eventCount != 2 {
+		t.Fatalf("accepted event count = %d, want 2", eventCount)
+	}
+
+	var notificationCount int
+	if err := server.db.QueryRow(`select count(*) from notifications where type='task.done'`).Scan(&notificationCount); err != nil {
+		t.Fatalf("count done notifications: %v", err)
+	}
+	if notificationCount != 0 {
+		t.Fatalf("done notification count = %d, want 0 (acceptance does not notify)", notificationCount)
+	}
+}
+
+func TestReviewAllTasksSkipsTasksUnderActiveOrchestration(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	reviewable := createTaskForTest(t, server.routes(), projectID, "batch accept skipped check A")
+	verifying := createTaskForTest(t, server.routes(), projectID, "batch accept skipped check B")
+	for _, taskID := range []string{reviewable, verifying} {
+		if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
+			t.Fatalf("mark task awaiting review: %v", err)
+		}
+	}
+	now := time.Now().UTC()
+	// 模拟一个仍在独立审查（checking）中的自动编排任务。
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job-verifying',?,?,1,'checking',7,'{}',?,?)`, projectID, verifying, now, now); err != nil {
+		t.Fatalf("insert verifying orchestration job: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/tasks/review-all", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("review-all status: %d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Skipped  int `json:"skipped"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode review-all result: %v", err)
+	}
+	if result.Accepted != 1 || result.Skipped != 1 {
+		t.Fatalf("review-all result: accepted=%d skipped=%d want 1/1", result.Accepted, result.Skipped)
+	}
+	assertTaskStatus(t, server, reviewable, taskDone)
+	assertTaskStatus(t, server, verifying, taskAwaitingReview)
+}
+
+func TestReviewAllTasksWithNoAwaitingReviewTasks(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	createTaskForTest(t, server.routes(), projectID, "no pending accept A")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/tasks/review-all", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("review-all with none status: %d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Accepted int `json:"accepted"`
+		Skipped  int `json:"skipped"`
+		Total    int `json:"total"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode review-all result: %v", err)
+	}
+	if result.Accepted != 0 || result.Skipped != 0 || result.Total != 0 {
+		t.Fatalf("review-all result: accepted=%d skipped=%d total=%d want 0/0/0", result.Accepted, result.Skipped, result.Total)
 	}
 }
 
@@ -6562,8 +6821,18 @@ func TestDeleteProjectStopsManagedProcess(t *testing.T) {
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("delete project: %d body=%s", response.Code, response.Body.String())
 	}
-	if status := runner.StatusSnapshot().Status; status != RunStatusStopped && status != RunStatusFailed {
-		t.Fatalf("project process still active after deletion: %s", status)
+	// Project deletion returns immediately (204); the managed process is retired
+	// in the background, so wait for it to settle within a bounded window.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		status := runner.StatusSnapshot().Status
+		if status == RunStatusStopped || status == RunStatusFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("project process still active after deletion: %s", status)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	server.runManagersMu.RLock()
 	_, remains := server.runManagers[projectID]
@@ -6605,8 +6874,32 @@ func TestListProjectsKeepsRemotePresentation(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&projects); err != nil {
 		t.Fatalf("decode projects: %v", err)
 	}
-	if len(projects) != 1 || projects[0].PathDisplay != "build-host:/srv/apps/api" || projects[0].Environment != "remote-linux" {
+	if len(projects) != 1 || projects[0].PathDisplay != "build-host:/srv/apps/api" || projects[0].FullPath != "build-host:/srv/apps/api" || projects[0].Environment != "remote-linux" {
 		t.Fatalf("unexpected remote project presentation: %#v", projects)
+	}
+}
+
+func TestListProjectsExposesFullPathForLocalProjects(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('local-project','local-project','/home/dev/apps/my-service','wsl-local','main',1,?)`, now); err != nil {
+		t.Fatalf("insert local project: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list projects: %d body=%s", response.Code, response.Body.String())
+	}
+	var projects []Project
+	if err := json.NewDecoder(response.Body).Decode(&projects); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected 1 project, got %#v", projects)
+	}
+	// 卡片正文展示简短目录名，FullPath 提供完整路径供悬停/查看
+	if projects[0].PathDisplay != "my-service" || projects[0].FullPath != "/home/dev/apps/my-service" {
+		t.Fatalf("unexpected local project presentation: %#v", projects[0])
 	}
 }
 

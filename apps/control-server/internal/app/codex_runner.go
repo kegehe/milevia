@@ -37,12 +37,20 @@ type codexCLIRunner struct{ config Config }
 func newCodexCLIRunner(config Config) AgentRunner { return &codexCLIRunner{config: config} }
 
 func (r *codexCLIRunner) Ready(parent context.Context) bool {
-	if _, err := exec.LookPath(r.config.CodexPath); err != nil {
+	if !r.BinaryReady() {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	return exec.CommandContext(ctx, r.config.CodexPath, "login", "status").Run() == nil
+}
+
+// BinaryReady reports whether the Codex binary is present, independent of any
+// CLI login state. A managed api_key profile injects its own credential, so it
+// only needs the binary, not a persisted login.
+func (r *codexCLIRunner) BinaryReady() bool {
+	_, err := exec.LookPath(r.config.CodexPath)
+	return err == nil
 }
 
 func (r *codexCLIRunner) Version(parent context.Context) string {
