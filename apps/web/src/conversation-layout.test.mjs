@@ -344,7 +344,7 @@ test("creating a conversation keeps the newly navigated route", () => {
 test("wide and narrow screens sort prompts and commands in separate vertical lists", () => {
   assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
   assert.match(stylesheet, /\.quick-tag-list\.sortable\s*\{[^}]*list-style:\s*none;[^}]*margin:\s*0;[^}]*padding:\s*0;/s);
-  assert.match(stylesheet, /\.quick-tag-grip\s*\{[^}]*cursor:\s*grab;/s);
+  assert.match(stylesheet, /\.quick-tag-list\.sortable \.quick-tag-item\s*\{[^}]*cursor:\s*grab;/s);
   assert.match(stylesheet, /\.quick-tag-item\.dragging\s*\{[^}]*opacity:\s*\.55;/);
   assert.match(stylesheet, /\.quick-tag-item\.drop-over\s*>[^}]*\.quick-tag\s*\{[^}]*border-color:\s*#2b6c5e;/);
   assert.match(stylesheet, /\.quick-actions-mobile\s*\{[^}]*display:\s*none;/s);

@@ -65,6 +65,10 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const renderedProjectIDRef = useRef(projectID);
 
 	const basePath = `/api/projects/${projectID}/run`;
+	// 运行环境为 Windows cmd 时提示写法（反斜杠、不加 ./ 前缀）。优先用后端解析后的
+	// 真实目标（status.executionTarget，SSH 远端为 ""），未加载时退回配置近似判断。
+	const resolvedTarget = status?.executionTarget ?? (isRemote ? "" : config.executionTarget || "auto");
+	const isWindowsTarget = resolvedTarget === "windows";
 	const mergeIncomingLogs = useCallback((entries: LogEntry[]) => {
 		const visibleEntries = entries.filter((entry) => entry.id <= 0 || entry.id > clearedThroughLogIDRef.current);
 		setLogs((prev) => mergeLogs(prev, visibleEntries));
@@ -292,6 +296,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 						<div className="run-config-row">
 							<label>启动命令</label>
 							<input type="text" value={config.command} placeholder="例如: npm run dev" onChange={(e) => updateConfig({ ...config, command: e.target.value })} />
+							{isWindowsTarget && <p className="run-config-hint">由 Windows cmd 执行：路径用反斜杠、不要加 ./ 前缀，例如用 start.bat 而非 ./start.bat</p>}
 						</div>
 						<div className="run-config-row">
 							<label>环境变量</label>

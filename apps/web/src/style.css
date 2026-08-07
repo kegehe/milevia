@@ -162,6 +162,12 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 .project-state.running { border-color: #195f51; color: #fff; background: #217b68; box-shadow: 0 2px 5px #17362c24; }.project-state.running i { background: #c8e85a; box-shadow: 0 0 0 4px #217b6840; animation: project-state-pulse 1.25s ease-in-out infinite; }
 .project-state.offline { color: #826718; background: #fff8df; }.project-state.offline i { background: #c6a34c; }
 @keyframes project-state-pulse { 50% { opacity: .45; transform: scale(.72); } }
+.project-run-state { display: inline-flex; align-items: center; gap: 5px; flex: none; border: 1px solid #ecd9a8; border-radius: 99px; padding: 5px 8px !important; white-space: nowrap; color: #8a6d22; background: #fdf6e3; font-size: 11px; font-weight: 700; }
+.project-run-state i { width: 7px; height: 7px; border-radius: 50%; }
+.project-run-state.run-state-failed { border-color: #ecc1b8; color: #b43c2c; background: #fdeeea; }
+.project-run-state.run-state-running { border-color: #bfe4d2; color: #1f6b52; background: #eaf8f0; }
+.project-run-state.run-state-starting, .project-run-state.run-state-stopping { border-color: #ecd9a8; color: #8a6d22; background: #fdf6e3; }
+
 .project-card-title h2 { color: #19332c; font-size: 22px; font-weight: 820; }
 .project-card-title p { color: #73887e; font-size: 11px; }
 .project-card-meta { border-top-color: #dce9e1; color: #70877c; }

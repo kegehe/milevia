@@ -3,6 +3,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ProjectProvider } from "./stores/useProjectStore";
 import { NotificationProvider } from "./components/NotificationProvider";
+import { ProcessStatusProvider } from "./components/ProcessStatusProvider";
 import { TooltipProvider } from "./components/TooltipProvider";
 import DashboardPage from "./pages/DashboardPage";
 import ImportProjectPage from "./pages/ImportProjectPage";
@@ -20,6 +21,7 @@ export function App() {
     <BrowserRouter>
       <TooltipProvider>
         <NotificationProvider>
+          <ProcessStatusProvider>
           <ProjectProvider>
             <Routes>
             <Route path="/" element={<DashboardPage />} />
@@ -39,6 +41,7 @@ export function App() {
             <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </ProjectProvider>
+          </ProcessStatusProvider>
         </NotificationProvider>
       </TooltipProvider>
     </BrowserRouter>

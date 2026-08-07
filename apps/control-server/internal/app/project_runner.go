@@ -18,6 +18,9 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 // RunStatus 表示项目运行进程的状态。
@@ -94,6 +97,19 @@ func (rb *ringBuffer) Recent(n int) []LogEntry {
 // logBroadcaster 是广播日志的回调，由 Server 注入。
 type logBroadcaster func(entry LogEntry)
 
+// RunStatusEvent 是推送给总览进程状态订阅者的状态变更事件（轻量、不落库、无日志）。
+// 与批量端点 /api/projects/processes/statuses 的 runStatus/runPid/runStartedAt 字段
+// 一一对应，前端从此单一来源收敛，不派生冗余布尔（status=="running" 即 running）。
+type RunStatusEvent struct {
+	ProjectID string     `json:"projectId"`
+	Status    RunStatus  `json:"status"`
+	StartedAt *time.Time `json:"startedAt,omitempty"`
+	PID       *int       `json:"pid,omitempty"`
+}
+
+// statusBroadcaster 是广播进程状态变更的回调，由 Server 注入（仿 logBroadcaster）。
+type statusBroadcaster func(event RunStatusEvent)
+
 // projectRunner 管理单个项目的运行进程。
 type projectRunner struct {
 	projectID         string
@@ -114,6 +130,8 @@ type projectRunner struct {
 	broadcast logBroadcaster
 	logMu     sync.Mutex
 	nextLogID uint64
+
+	statusBroadcast statusBroadcaster
 
 	status      RunStatus
 	retired     bool
@@ -138,6 +156,19 @@ func newProjectRunner(projectID, workDir, command string, envVars map[string]str
 		logBuf:          newRingBuffer(projectRunLogCapacity),
 		broadcast:       broadcast,
 		status:          RunStatusStopped,
+	}
+}
+
+// setStatusListener 注册进程状态变更回调（由 Server 注入）。须在启动之前设置。
+func (pr *projectRunner) setStatusListener(listener statusBroadcaster) {
+	pr.statusBroadcast = listener
+}
+
+// emitStatus 在状态切分归位后触发状态广播。调用方须已释放 pr.mu（与 emitLog 同一位），
+// 避免在锁内调用 Server 广播造成二次锁与死锁风险。
+func (pr *projectRunner) emitStatus(event RunStatusEvent) {
+	if pr.statusBroadcast != nil {
+		pr.statusBroadcast(event)
 	}
 }
 
@@ -208,10 +239,14 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return err
 	}
 	pr.cmd = cmd
 	pr.mu.Lock()
+	// 记录解析后的真实运行目标：auto 可能被解析为 windows，readPipe 靠它决定
+	// 是否需要 GBK 转码。executionTarget 在本次运行内不再改变。
+	pr.executionTarget = executionTarget
 	pr.windowsPID = 0
 	pr.windowsPIDMarker = windowsPIDMarker
 	pr.windowsPIDReady = nil
@@ -238,6 +273,7 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return fmt.Errorf("创建 stdout 管道失败: %w", err)
 	}
 	stderr, err := pr.cmd.StderrPipe()
@@ -248,6 +284,7 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return fmt.Errorf("创建 stderr 管道失败: %w", err)
 	}
 
@@ -258,6 +295,7 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 		pr.hasExitCode = true
 		close(pr.exitChan)
 		pr.mu.Unlock()
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
 		return fmt.Errorf("启动进程失败: %w", err)
 	}
 
@@ -265,10 +303,14 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 	pr.pid = pr.cmd.Process.Pid
 	pr.startedAt = time.Now()
 	pr.status = RunStatusRunning
+	pid := pr.pid
+	startedAt := pr.startedAt
 	pr.mu.Unlock()
 
+	pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusRunning, StartedAt: &startedAt, PID: &pid})
+
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system",
-		Text: fmt.Sprintf("进程已启动: pid=%d, 环境=%s, 命令=%s", pr.pid, executionTarget, pr.command)})
+		Text: fmt.Sprintf("进程已启动: pid=%d, 环境=%s, 命令=%s", pid, executionTarget, pr.command)})
 
 	pipeReadersDone := make(chan struct{})
 	var pipeReaders sync.WaitGroup
@@ -516,20 +558,51 @@ func truncateRunLogText(text string) string {
 func (pr *projectRunner) readPipe(r io.Reader, stream string) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	// Windows 目标下，cmd/原生程序常按系统代码页（GBK）把中文写进重定向管道，
+	// 而 Go 端统一按 UTF-8 读取，导致中文乱码。这里对每一行先判断其是否为合法
+	// UTF-8：是则原样保留（不误伤已按 UTF-8 输出的程序），否则按 GBK 解码。
+	transcode := pr.decodeWindowsOutput()
 	for scanner.Scan() {
-		if stream == "stdout" && pr.recordWindowsPID(scanner.Text()) {
+		line := scanner.Bytes()
+		text := decodeRunOutputLine(line, transcode)
+		if stream == "stdout" && pr.recordWindowsPID(text) {
 			continue
 		}
 		if stream == "stderr" {
-			pr.recordWindowsStartError(scanner.Text())
+			pr.recordWindowsStartError(text)
 		}
 		entry := LogEntry{
 			Timestamp: time.Now(),
 			Stream:    stream,
-			Text:      scanner.Text(),
+			Text:      text,
 		}
 		pr.emitLog(entry)
 	}
+}
+
+// decodeWindowsOutput 报告当前运行是否面向 Windows 目标：是则输出行可能是 GBK。
+// executionTarget 在启动后保持不变，可安全读取。
+func (pr *projectRunner) decodeWindowsOutput() bool {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	return pr.executionTarget == RunExecutionTargetWindows
+}
+
+// gbkDecoder 复用的 GBK→UTF-8 解码器，避免每行重建。
+var gbkDecoder = simplifiedchinese.GBK.NewDecoder()
+
+// decodeRunOutputLine 把一行输出规范化为 UTF-8。transcode 为 false 时原样返回；
+// 为 true 时，若整行已是合法 UTF-8 则原样返回（避免把已按 UTF-8 输出的程序二次
+// 破坏），否则尝试按 GBK 解码。
+func decodeRunOutputLine(line []byte, transcode bool) string {
+	if !transcode || utf8.Valid(line) || len(line) == 0 {
+		return string(line)
+	}
+	decoded, err := gbkDecoder.Bytes(line)
+	if err != nil {
+		return string(line)
+	}
+	return string(decoded)
 }
 
 func (pr *projectRunner) recordWindowsStartError(text string) {
@@ -598,7 +671,10 @@ func (pr *projectRunner) wait(pipeReadersDone <-chan struct{}) {
 	}
 	pr.exitCode = exitCode
 	pr.hasExitCode = true
+	status := pr.status
 	pr.mu.Unlock()
+
+	pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: status})
 
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system",
 		Text: fmt.Sprintf("进程已退出: code=%d", exitCode)})
@@ -624,6 +700,8 @@ func (pr *projectRunner) stop() error {
 	}
 	pr.status = RunStatusStopping
 	pr.mu.Unlock()
+
+	pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusStopping})
 
 	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "system", Text: "正在停止进程..."})
 
@@ -711,8 +789,33 @@ func (pr *projectRunner) StatusSnapshot() RunStatusResponse {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
 	snapshot := RunStatusResponse{
-		Status:     pr.status,
-		RecentLogs: pr.logBuf.Recent(projectRunLogHistory),
+		Status:          pr.status,
+		ExecutionTarget: pr.executionTarget,
+		RecentLogs:      pr.logBuf.Recent(projectRunLogHistory),
+	}
+	if !pr.startedAt.IsZero() {
+		startedAt := pr.startedAt
+		snapshot.StartedAt = &startedAt
+	}
+	if pr.pid > 0 && (pr.status == RunStatusRunning || pr.status == RunStatusStopping) {
+		pid := pr.pid
+		snapshot.PID = &pid
+	}
+	if pr.hasExitCode {
+		exitCode := pr.exitCode
+		snapshot.ExitCode = &exitCode
+	}
+	return snapshot
+}
+
+// LightStatusSnapshot 返回精简状态快照（线程安全），仅供批量总览端点使用：
+// 不拷贝环形日志缓冲区（避免 N×200 拷贝），其余取值与 StatusSnapshot 一致。
+func (pr *projectRunner) LightStatusSnapshot() RunStatusResponse {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	snapshot := RunStatusResponse{
+		Status:          pr.status,
+		ExecutionTarget: pr.executionTarget,
 	}
 	if !pr.startedAt.IsZero() {
 		startedAt := pr.startedAt

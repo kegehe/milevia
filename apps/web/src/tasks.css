@@ -84,6 +84,10 @@
 .task-queue-head-actions { display: inline-flex; align-items: center; gap: 4px; }
 .task-queue-add { display: grid; width: 22px; height: 22px; place-items: center; border: 1px solid #b8d4c5; border-radius: 5px; padding: 0; color: #2b6c5e; background: #f8fcf9; font: 700 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .task-queue-add:hover { border-color: #4f9a8a; color: #173f35; background: #dff1e6; }
+.task-queue-review-all { display: inline-flex; height: 22px; align-items: center; gap: 4px; border: 1px solid #2c7567; border-radius: 5px; padding: 0 6px; color: #f8fdf9; background: #2c7567; font-size: 10px; font-weight: 800; white-space: nowrap; }
+.task-queue-review-all:hover:not(:disabled) { border-color: #1b5548; background: #1b5548; }
+.task-queue-review-all:disabled { opacity: .55; }
+.task-queue-review-all b { display: grid; min-width: 15px; height: 15px; place-items: center; border-radius: 99px; color: #2c6b5c; background: #e6f5ec; font: 800 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .task-queue-quick-create { display: grid; gap: 7px; }
 .task-queue-quick-create textarea { width: 100%; min-height: 56px; max-height: 200px; box-sizing: border-box; resize: vertical; border: 1px solid #c5dad0; border-radius: 6px; padding: 8px 10px; color: #19332c; background: #fff; font: inherit; font-size: 12px; line-height: 1.45; overflow-y: auto; }
 .task-queue-quick-create textarea:focus { border-color: #55a697; outline: 2px solid #cfede3; }
@@ -297,6 +301,27 @@
   transition: border-color .16s ease, color .16s ease, background .16s ease;
 }
 .task-queue-all:hover { border-color: #8fbca9; color: #1f5d4e; background: #eaf6ee; }
+.task-queue-review-all {
+  min-height: 26px;
+  border-radius: 6px;
+  padding: 4px 7px;
+  font-size: 10px;
+  line-height: 1;
+  transition: border-color .16s ease, color .16s ease, background .16s ease, transform .16s ease;
+}
+.task-queue-review-all:hover:not(:disabled) { transform: translateY(-1px); }
+/* 徽标显式声明，避免被同优先级、后声明的 .task-queue-head b 覆盖 */
+.task-queue-review-all b {
+  min-width: 15px;
+  height: 15px;
+  border: 0;
+  border-radius: 99px;
+  display: grid;
+  place-items: center;
+  color: #2c6b5c;
+  background: #e6f5ec;
+  font: 800 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
 .task-queue-quick-create {
   gap: 8px;
   border: 1px solid #c9dfd3;

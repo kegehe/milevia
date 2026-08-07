@@ -1,5 +1,6 @@
 import { FormEvent, MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { toast } from "sonner";
 
 import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, priorityLabels, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -44,6 +45,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const [reviewingTaskID, setReviewingTaskID] = useState<string | null>(null);
   const [reviewSubmitting, setReviewSubmitting] = useState(false);
   const [redispatchingTaskID, setRedispatchingTaskID] = useState<string | null>(null);
+  const [approvingAll, setApprovingAll] = useState(false);
   const [inlineDetailID, setInlineDetailID] = useState<string | null>(null);
   const [inlineDetail, setInlineDetail] = useState<TaskDetail | null>(null);
   const [inlineDetailLoading, setInlineDetailLoading] = useState(false);
@@ -52,6 +54,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const confirmationRequest = useRef(0);
   const inlineRequest = useRef(0);
   const redispatchRequest = useRef(0);
+  const reviewAllRequest = useRef(0);
   const tasksRequestVersion = useRef(0);
   const mountedRef = useRef(true);
   const conversationIDRef = useRef(conversationID);
@@ -71,6 +74,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     setLoadingDetail(false);
     setDispatching(false);
     setRedispatchingTaskID(null);
+    setApprovingAll(false);
     setInlineDetailID(null);
     setInlineDetail(null);
     setInlineDetailLoading(false);
@@ -314,6 +318,34 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
   };
 
+  const confirmReviewAll = () => {
+    const count = taskCounts.awaiting_review;
+    if (count === 0 || approvingAll) return;
+    setPendingConfirm({
+      title: "一键验收",
+      message: <>将验收当前项目全部 <b>{count}</b> 个待验收任务，标记为完成。正在自动编排验证中的任务会被跳过。确认继续？</>,
+      onConfirm: () => void (async () => {
+        if (!mountedRef.current) return;
+        // 批量验收使用独立请求令牌，避免与单任务确认（confirmationRequest）相互串扰。
+        const requestID = ++reviewAllRequest.current;
+        setPendingConfirm(null);
+        setApprovingAll(true);
+        try {
+          const result = await request<{ accepted: number; skipped: number; total: number }>(`/api/projects/${projectID}/tasks/review-all`, { method: "POST", body: "{}" });
+          if (reviewAllRequest.current !== requestID || !mountedRef.current) return;
+          if (result.skipped > 0) toast.success(`已验收 ${result.accepted} 个任务，${result.skipped} 个正在自动编排验证中已跳过`);
+          else if (result.total > 0) toast.success(`已验收 ${result.accepted} 个任务`);
+        } catch (cause) {
+          if (reviewAllRequest.current === requestID && mountedRef.current) fail(cause instanceof Error ? cause.message : "一键验收失败");
+        } finally {
+          if (reviewAllRequest.current === requestID && mountedRef.current) setApprovingAll(false);
+          void loadTasks().catch(() => undefined);
+        }
+      })(),
+      onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
+    });
+  };
+
   const setPinned = async (taskID: string, pinned: boolean) => {
     const task = tasks.find((t) => t.id === taskID);
     if (!task || !mountedRef.current) return;
@@ -353,10 +385,10 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   return <div className={`task-queue ${mobileOpen ? "mobile-open" : ""}`}>
     <button type="button" className="task-queue-mobile-toggle" aria-expanded={mobileOpen} onClick={() => setMobileOpen((open) => !open)}>任务 <b>{taskCounts.active}</b></button>
     <div className="task-queue-panel">
-      <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions"><button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button></div></header>
+      <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions">{taskCounts.awaiting_review > 0 && <button type="button" className="task-queue-review-all" disabled={approvingAll} title="一键验收全部待验收任务" aria-label="一键验收全部待验收任务" onClick={confirmReviewAll}>{approvingAll ? "验收中" : "一键验收"}{!approvingAll && <b>{taskCounts.awaiting_review}</b>}</button>}<button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button></div></header>
       {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => setQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
       <nav className="task-queue-filters" aria-label="任务筛选">{filters.map((item) => <button type="button" key={item.id} className={filter === item.id ? "active" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<span>{taskCounts[item.id]}</span></button>)}</nav>
-      <div className={`task-queue-list${reviewingTaskID || inlineDetailID ? " reviewing" : ""}`}>{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={() => openInlineDetail(task.id)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} dispatchDisabled={dispatchDisabled} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop}
+      <div className="task-queue-list">{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={() => openInlineDetail(task.id)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} dispatchDisabled={dispatchDisabled} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop}
         inlineDetailID={inlineDetailID}
         inlineDetail={inlineDetail}
         inlineDetailLoading={inlineDetailLoading}
@@ -401,7 +433,7 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
   };
   useEffect(() => {
     if (!isReviewing || !reviewRef.current) return;
-    reviewRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    reviewRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isReviewing]);
 
   // 当行进入内联详情或验收态时，关闭悬浮预览，避免重叠。
@@ -569,7 +601,7 @@ function InlineTaskDetail({ detail, loading, busy, dispatchDisabled, close, disp
     return () => { mountedRef.current = false; };
   }, []);
 
-  useEffect(() => { if (detailRef.current && detail) detailRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" }); }, [detail]);
+  useEffect(() => { if (detailRef.current && detail) detailRef.current.scrollIntoView({ behavior: "smooth", block: "center" }); }, [detail]);
 
   if (loading) return <div className="task-inline-detail"><div className="task-inline-detail-body"><p className="task-inline-loading">加载任务详情...</p></div></div>;
   if (!detail) return <div className="task-inline-detail"><div className="task-inline-detail-body"><p className="task-inline-loading">无法加载任务详情。</p></div></div>;
