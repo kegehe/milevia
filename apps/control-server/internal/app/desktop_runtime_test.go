@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -124,6 +126,257 @@ func TestDesktopSessionProtectsHTTPAndWebSocket(t *testing.T) {
 	defer connection.Close()
 	if connection.Subprotocol() != server.websocketSessionProtocol() {
 		t.Fatalf("unexpected WebSocket protocol: %q", connection.Subprotocol())
+	}
+}
+
+func TestNotificationSubscriptionClosesWithGoingAway(t *testing.T) {
+	server := newTestServer(t)
+	httpServer := httptest.NewServer(server.routes())
+	t.Cleanup(httpServer.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/notifications"
+	connection, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{httpServer.URL}})
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial notification WebSocket: %v (status %d)", err, response.StatusCode)
+		}
+		t.Fatalf("dial notification WebSocket: %v", err)
+	}
+	defer connection.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.notificationSubMu.Lock()
+		registered := len(server.notificationSubs) == 1
+		server.notificationSubMu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("notification WebSocket was not registered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	server.closeAllNotificationSubscribers()
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, _, err = connection.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("expected WebSocket close error, got %v", err)
+	}
+	if closeErr.Code != websocket.CloseGoingAway {
+		t.Fatalf("close code: got %d want %d", closeErr.Code, websocket.CloseGoingAway)
+	}
+
+	handlersDone := make(chan struct{})
+	go func() {
+		server.websocketWG.Wait()
+		close(handlersDone)
+	}()
+	select {
+	case <-handlersDone:
+	case <-time.After(time.Second):
+		t.Fatal("notification WebSocket handler did not exit after close handshake")
+	}
+}
+
+func TestNotificationSubscriptionClosesSlowClientWithTryAgainLater(t *testing.T) {
+	server := newTestServer(t)
+	httpServer := httptest.NewServer(server.routes())
+	t.Cleanup(httpServer.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/notifications"
+	connection, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{httpServer.URL}})
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial notification WebSocket: %v (status %d)", err, response.StatusCode)
+		}
+		t.Fatalf("dial notification WebSocket: %v", err)
+	}
+	defer connection.Close()
+
+	var sub *notificationSubscriber
+	deadline := time.Now().Add(time.Second)
+	for sub == nil {
+		server.notificationSubMu.Lock()
+		for _, candidate := range server.notificationSubs {
+			sub = candidate
+		}
+		server.notificationSubMu.Unlock()
+		if sub != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("notification WebSocket was not registered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	go sub.closeWithStatus(websocket.CloseTryAgainLater, "client is too slow")
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, _, err = connection.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("expected WebSocket close error, got %v", err)
+	}
+	if closeErr.Code != websocket.CloseTryAgainLater {
+		t.Fatalf("close code: got %d want %d", closeErr.Code, websocket.CloseTryAgainLater)
+	}
+
+	handlersDone := make(chan struct{})
+	go func() {
+		server.websocketWG.Wait()
+		close(handlersDone)
+	}()
+	select {
+	case <-handlersDone:
+	case <-time.After(time.Second):
+		t.Fatal("slow-client WebSocket handler did not exit after close handshake")
+	}
+}
+
+func TestWebSocketSubscriptionOverridesHTTPReadTimeout(t *testing.T) {
+	server := newTestServer(t)
+	httpServer := httptest.NewUnstartedServer(server.routes())
+	httpServer.Config.ReadTimeout = 50 * time.Millisecond
+	httpServer.Start()
+	t.Cleanup(httpServer.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/notifications"
+	connection, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{httpServer.URL}})
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial notification WebSocket: %v (status %d)", err, response.StatusCode)
+		}
+		t.Fatalf("dial notification WebSocket: %v", err)
+	}
+	defer connection.Close()
+
+	var sub *notificationSubscriber
+	deadline := time.Now().Add(time.Second)
+	for sub == nil {
+		server.notificationSubMu.Lock()
+		for _, candidate := range server.notificationSubs {
+			sub = candidate
+		}
+		server.notificationSubMu.Unlock()
+		if sub != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("notification WebSocket was not registered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	sub.send <- []byte(`{"type":"after-http-read-timeout"}`)
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, data, err := connection.ReadMessage()
+	if err != nil {
+		t.Fatalf("read notification after HTTP timeout: %v", err)
+	}
+	if string(data) != `{"type":"after-http-read-timeout"}` {
+		t.Fatalf("notification payload: got %q", data)
+	}
+}
+
+func TestRemovingConversationSubscriberClosesConnection(t *testing.T) {
+	server := newTestServer(t)
+	httpServer := httptest.NewServer(server.routes())
+	t.Cleanup(httpServer.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/conversations/conversation"
+	connection, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{httpServer.URL}})
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial conversation WebSocket: %v (status %d)", err, response.StatusCode)
+		}
+		t.Fatalf("dial conversation WebSocket: %v", err)
+	}
+	defer connection.Close()
+
+	var sub *subscriber
+	deadline := time.Now().Add(time.Second)
+	for sub == nil {
+		server.mu.Lock()
+		for _, candidate := range server.subscribers["conversation"] {
+			sub = candidate
+		}
+		server.mu.Unlock()
+		if sub != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("conversation WebSocket was not registered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	server.removeConversationSubscriber("conversation", sub)
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, _, err := connection.ReadMessage(); err == nil {
+		t.Fatal("conversation WebSocket remained open after subscriber removal")
+	}
+
+	handlersDone := make(chan struct{})
+	go func() {
+		server.websocketWG.Wait()
+		close(handlersDone)
+	}()
+	select {
+	case <-handlersDone:
+	case <-time.After(time.Second):
+		t.Fatal("conversation WebSocket handler did not exit after subscriber removal")
+	}
+}
+
+func TestShutdownRejectsNewWebSocketSubscriptions(t *testing.T) {
+	server := newTestServer(t)
+	httpServer := httptest.NewServer(server.routes())
+	t.Cleanup(httpServer.Close)
+	server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/notifications"
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{httpServer.URL}})
+	if err == nil {
+		t.Fatal("expected shutdown WebSocket subscription to be rejected")
+	}
+	if response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+		}
+		t.Fatalf("shutdown WebSocket status: got %d want %d (error %v)", status, http.StatusServiceUnavailable, err)
+	}
+}
+
+func TestClosingServerRejectsPendingWebSocketRegistrations(t *testing.T) {
+	server := newTestServer(t)
+	server.mu.Lock()
+	server.closing = true
+	server.mu.Unlock()
+
+	conversation := &subscriber{send: make(chan []byte, 1)}
+	if server.addConversationSubscriber("conversation", conversation) {
+		t.Fatal("closing server registered conversation WebSocket")
+	}
+	notification := &notificationSubscriber{send: make(chan []byte, 1)}
+	if server.addNotificationSubscriber(nil, notification) {
+		t.Fatal("closing server registered notification WebSocket")
+	}
+	runLog := &runLogSubscriber{send: make(chan LogEntry, 1)}
+	if server.addRunLogSubscriber("project", runLog, nil) {
+		t.Fatal("closing server registered run-log WebSocket")
 	}
 }
 

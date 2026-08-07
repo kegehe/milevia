@@ -121,6 +121,9 @@ pnpm --filter @milevia/desktop build
 ```bash
 # 端口被占用时可指定自定义端口
 AUTO_CONTROL_PORT=8081 AUTO_WEB_PORT=5174 pnpm dev
+
+# 仅在确认占用端口的进程可以停止时，显式清理它们
+AUTO_CLEAR_PORTS=1 pnpm dev
 ```
 
 ## 使用指南
@@ -142,6 +145,7 @@ AUTO_CONTROL_PORT=8081 AUTO_WEB_PORT=5174 pnpm dev
 | `AUTO_CONTROL_URL` | `http://127.0.0.1:8080` | 审批 Hook 回调地址 |
 | `AUTO_CONTROL_PORT` | `8080` | `pnpm dev` 使用的控制服务端口 |
 | `AUTO_WEB_PORT` | `5173` | `pnpm dev` 使用的网页端口 |
+| `AUTO_CLEAR_PORTS` | `0` | 设为 `1` 时允许 `pnpm dev` 停止占用开发端口的进程 |
 | `AUTO_ALLOWED_ROOT` | 当前用户主目录 | 可浏览加载项目的根目录 |
 | `AUTO_DATABASE_PATH` | `../../data/auto.db` | SQLite 数据库路径 |
 | `AUTO_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 默认权限模式 (`acceptEdits` / `plan`) |

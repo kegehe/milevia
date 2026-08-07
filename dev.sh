@@ -10,6 +10,7 @@ WEB_PORT="${AUTO_WEB_PORT:-5173}"
 CONTROL_ADDR="${CONTROL_HOST}:${CONTROL_PORT}"
 CONTROL_URL="${AUTO_CONTROL_URL:-http://${CONTROL_ADDR}}"
 VITE_CONTROL_TARGET="${VITE_CONTROL_URL:-http://127.0.0.1:${CONTROL_PORT}}"
+AUTO_CLEAR_PORTS="${AUTO_CLEAR_PORTS:-0}"
 CONTROL_PID=""
 WEB_PID=""
 
@@ -30,6 +31,11 @@ clear_port() {
   local pids
   pids="$(listener_pids "$port")"
   [[ -z "$pids" ]] && return
+
+  if [[ "$AUTO_CLEAR_PORTS" != "1" ]]; then
+    printf 'Port %s is already in use (PID: %s). Choose other ports or set AUTO_CLEAR_PORTS=1 to stop the listener.\n' "$port" "$(tr '\n' ' ' <<<"$pids")" >&2
+    return 1
+  fi
 
   printf 'Clearing port %s (PID: %s)\n' "$port" "$(tr '\n' ' ' <<<"$pids")"
   kill -TERM $pids 2>/dev/null || true
@@ -65,6 +71,10 @@ if ! validate_port "$CONTROL_PORT" || ! validate_port "$WEB_PORT"; then
 fi
 if [[ "$CONTROL_PORT" == "$WEB_PORT" ]]; then
   echo "Control and web ports must be different." >&2
+  exit 1
+fi
+if [[ "$AUTO_CLEAR_PORTS" != "0" && "$AUTO_CLEAR_PORTS" != "1" ]]; then
+  echo "AUTO_CLEAR_PORTS must be 0 or 1." >&2
   exit 1
 fi
 if ! command -v lsof >/dev/null 2>&1 && ! command -v fuser >/dev/null 2>&1; then

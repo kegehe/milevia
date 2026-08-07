@@ -33,18 +33,19 @@ type NotificationEvent struct {
 }
 
 type notificationSubscriber struct {
-	conn      *websocket.Conn
-	send      chan []byte
-	closeOnce sync.Once
+	conn           *websocket.Conn
+	send           chan []byte
+	closeOnce      sync.Once
+	closeFrameOnce sync.Once
 }
 
 func (sub *notificationSubscriber) close() {
-	sub.closeOnce.Do(func() {
-		close(sub.send)
-		if sub.conn != nil {
-			_ = sub.conn.Close()
-		}
-	})
+	sub.closeOnce.Do(func() { close(sub.send) })
+}
+
+func (sub *notificationSubscriber) closeWithStatus(code int, reason string) {
+	sub.close()
+	sub.closeFrameOnce.Do(func() { initiateWebSocketClose(sub.conn, code, reason) })
 }
 
 const (
@@ -86,10 +87,22 @@ create index if not exists idx_notifications_dismissed on notifications(dismisse
 // --- WebSocket 端点 ---
 
 func (s *Server) subscribeNotifications(w http.ResponseWriter, r *http.Request) {
+	const path = "/ws/notifications"
+	if !s.beginWebSocketSubscription(w) {
+		return
+	}
+	defer s.websocketWG.Done()
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
+	defer conn.Close()
+	if s.isClosing() {
+		initiateWebSocketClose(conn, websocket.CloseGoingAway, "server shutting down")
+		waitForWebSocketClose(conn)
+		return
+	}
+	stopHeartbeat := startWebSocketHeartbeat(conn, path)
 
 	sub := &notificationSubscriber{
 		conn: conn,
@@ -103,16 +116,22 @@ func (s *Server) subscribeNotifications(w http.ResponseWriter, r *http.Request) 
 		for data := range sub.send {
 			_ = conn.SetWriteDeadline(time.Now().Add(notificationWriteTimeout))
 			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				logWebSocketDisconnect(path, err)
 				_ = conn.Close()
 				return
 			}
 		}
 	}()
 
-	// 注册订阅者
-	s.notificationSubMu.Lock()
-	s.notificationSubs[conn] = sub
-	s.notificationSubMu.Unlock()
+	// 以与 Server.Close 相同的生命周期锁完成最终注册，避免升级后、
+	// 注册前开始停机时留下未被关闭流程发现的连接。
+	if !s.addNotificationSubscriber(conn, sub) {
+		stopHeartbeat()
+		sub.closeWithStatus(websocket.CloseGoingAway, "server shutting down")
+		waitForWebSocketClose(conn)
+		<-writerDone
+		return
+	}
 
 	// 连接后发送未读通知（writer goroutine 已启动，可以消费）
 	unread, err := s.getUnreadNotifications(r.Context())
@@ -128,19 +147,34 @@ func (s *Server) subscribeNotifications(w http.ResponseWriter, r *http.Request) 
 	}
 
 	defer func() {
+		stopHeartbeat()
 		s.notificationSubMu.Lock()
 		delete(s.notificationSubs, conn)
 		s.notificationSubMu.Unlock()
 		sub.close()
+		_ = conn.Close()
 		<-writerDone
 	}()
 
 	// 读取循环检测断开
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
+			logWebSocketDisconnect(path, err)
 			return
 		}
 	}
+}
+
+func (s *Server) addNotificationSubscriber(conn *websocket.Conn, sub *notificationSubscriber) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.notificationSubMu.Lock()
+	s.notificationSubs[conn] = sub
+	s.notificationSubMu.Unlock()
+	return true
 }
 
 // --- 广播函数 ---
@@ -175,7 +209,8 @@ func (s *Server) broadcastNotification(event NotificationEvent) {
 	}
 	s.notificationSubMu.Unlock()
 	for _, sub := range toClose {
-		sub.close()
+		log.Printf("[ws] /ws/notifications subscriber queue full; closing slow client")
+		go sub.closeWithStatus(websocket.CloseTryAgainLater, "client is too slow")
 	}
 }
 
@@ -254,9 +289,15 @@ func (s *Server) closeAllNotificationSubscribers() {
 	}
 	s.notificationSubs = map[*websocket.Conn]*notificationSubscriber{}
 	s.notificationSubMu.Unlock()
+	var closeWG sync.WaitGroup
+	closeWG.Add(len(all))
 	for _, sub := range all {
-		sub.close()
+		go func(sub *notificationSubscriber) {
+			defer closeWG.Done()
+			sub.closeWithStatus(websocket.CloseGoingAway, "server shutting down")
+		}(sub)
 	}
+	closeWG.Wait()
 }
 
 // --- 通知触发辅助 ---

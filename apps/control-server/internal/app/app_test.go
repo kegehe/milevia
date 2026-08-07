@@ -426,6 +426,36 @@ func newTestServer(t *testing.T) *Server {
 	return server
 }
 
+func TestDecodeJSONRejectsOversizedBody(t *testing.T) {
+	body := `{"value":"` + strings.Repeat("x", maxJSONBodyBytes) + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	response := httptest.NewRecorder()
+	var target map[string]string
+	if decode(response, request, &target) {
+		t.Fatal("oversized JSON body was accepted")
+	}
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: got %d want %d", response.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestHTTPServerUsesBoundedRequestSettings(t *testing.T) {
+	server := newTestServer(t)
+	httpServer := server.newHTTPServer()
+	if httpServer.ReadHeaderTimeout != httpReadHeaderTimeout {
+		t.Fatalf("ReadHeaderTimeout: got %s want %s", httpServer.ReadHeaderTimeout, httpReadHeaderTimeout)
+	}
+	if httpServer.ReadTimeout != httpReadTimeout {
+		t.Fatalf("ReadTimeout: got %s want %s", httpServer.ReadTimeout, httpReadTimeout)
+	}
+	if httpServer.IdleTimeout != httpIdleTimeout {
+		t.Fatalf("IdleTimeout: got %s want %s", httpServer.IdleTimeout, httpIdleTimeout)
+	}
+	if httpServer.MaxHeaderBytes != maxHTTPHeaderBytes {
+		t.Fatalf("MaxHeaderBytes: got %d want %d", httpServer.MaxHeaderBytes, maxHTTPHeaderBytes)
+	}
+}
+
 func TestFinishRunUpdatesRunAndConversation(t *testing.T) {
 	server := newTestServer(t)
 

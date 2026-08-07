@@ -51,6 +51,11 @@ const (
 	defaultClaudeTurnIdleTimeout        = 30 * time.Minute
 	defaultClaudeInitialResponseTimeout = 5 * time.Minute
 	defaultClaudeToolResultTimeout      = 5 * time.Minute
+	maxJSONBodyBytes                    = 16 * 1024 * 1024
+	httpReadHeaderTimeout               = 5 * time.Second
+	httpReadTimeout                     = 30 * time.Second
+	httpIdleTimeout                     = 60 * time.Second
+	maxHTTPHeaderBytes                  = 1 << 20
 )
 
 func ConfigFromEnv() Config {
@@ -153,6 +158,7 @@ type Server struct {
 	upgrader               websocket.Upgrader
 	mu                     sync.Mutex
 	closing                bool
+	websocketWG            sync.WaitGroup
 	subscribers            map[string]map[*websocket.Conn]*subscriber
 	cancels                map[string]context.CancelFunc
 	runTokens              map[string]string
@@ -189,18 +195,19 @@ type runnerAgentKey struct {
 }
 
 type subscriber struct {
-	conn      *websocket.Conn
-	send      chan []byte
-	closeOnce sync.Once
+	conn           *websocket.Conn
+	send           chan []byte
+	closeOnce      sync.Once
+	closeFrameOnce sync.Once
 }
 
 func (sub *subscriber) close() {
-	sub.closeOnce.Do(func() {
-		close(sub.send)
-		if sub.conn != nil {
-			_ = sub.conn.Close()
-		}
-	})
+	sub.closeOnce.Do(func() { close(sub.send) })
+}
+
+func (sub *subscriber) closeWithStatus(code int, reason string) {
+	sub.close()
+	sub.closeFrameOnce.Do(func() { initiateWebSocketClose(sub.conn, code, reason) })
 }
 
 const (
@@ -211,18 +218,19 @@ const (
 )
 
 type runLogSubscriber struct {
-	conn      *websocket.Conn
-	send      chan LogEntry
-	closeOnce sync.Once
+	conn           *websocket.Conn
+	send           chan LogEntry
+	closeOnce      sync.Once
+	closeFrameOnce sync.Once
 }
 
 func (sub *runLogSubscriber) close() {
-	sub.closeOnce.Do(func() {
-		close(sub.send)
-		if sub.conn != nil {
-			_ = sub.conn.Close()
-		}
-	})
+	sub.closeOnce.Do(func() { close(sub.send) })
+}
+
+func (sub *runLogSubscriber) closeWithStatus(code int, reason string) {
+	sub.close()
+	sub.closeFrameOnce.Do(func() { initiateWebSocketClose(sub.conn, code, reason) })
 }
 
 type approvalWaiter struct {
@@ -537,6 +545,13 @@ func (s *Server) Close() {
 		s.mu.Unlock()
 		httpServer := s.httpServer
 		s.httpMu.Unlock()
+		// Upgraded connections are not regular HTTP requests. Notify them before
+		// closing the listener so clients and the Vite proxy receive a WebSocket
+		// close frame instead of a TCP reset.
+		s.closeAllConversationSubscribers()
+		s.closeAllRunLogSubscribers()
+		s.closeAllNotificationSubscribers()
+		s.waitForWebSocketSubscriptions()
 		if httpServer != nil {
 			_ = httpServer.Close()
 		}
@@ -565,8 +580,6 @@ func (s *Server) Close() {
 		for _, runner := range runners {
 			runner.Stop()
 		}
-		s.closeAllRunLogSubscribers()
-		s.closeAllNotificationSubscribers()
 		for _, runner := range s.runnerRegistry.all() {
 			if sshR, ok := runner.(*sshRunner); ok {
 				_ = sshR.client.close()
@@ -609,7 +622,7 @@ func (s *Server) ServeListener(listener net.Listener, ready func(string)) error 
 		_ = listener.Close()
 		return errors.New("HTTP server is already listening")
 	}
-	httpServer := &http.Server{Handler: s.routes()}
+	httpServer := s.newHTTPServer()
 	s.httpServer = httpServer
 	s.mu.Unlock()
 	s.httpMu.Unlock()
@@ -641,6 +654,19 @@ func (s *Server) ServeListener(listener net.Listener, ready func(string)) error 
 		return nil
 	}
 	return err
+}
+
+func (s *Server) newHTTPServer() *http.Server {
+	// WebSocket connections are hijacked by Gorilla and have their own
+	// heartbeat/deadline policy. The subscription handlers replace the initial
+	// read deadline immediately after upgrading the connection.
+	return &http.Server{
+		Handler:           s.routes(),
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		IdleTimeout:       httpIdleTimeout,
+		MaxHeaderBytes:    maxHTTPHeaderBytes,
+	}
 }
 
 func (s *Server) routes() http.Handler {
@@ -2024,11 +2050,8 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		AgentID        string  `json:"agentId"`
 		ProfileID      *string `json:"profileId"`
 	}
-	if r.Body != http.NoBody {
-		if err := json.NewDecoder(r.Body).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
-			writeError(w, http.StatusBadRequest, errors.New("invalid JSON request"))
-			return
-		}
+	if !decodeOptional(w, r, &input) {
+		return
 	}
 	if input.AgentID == "" {
 		input.AgentID = "claude-code"
@@ -4086,7 +4109,8 @@ func (s *Server) enqueueConversationEvent(conversationID string, data []byte) {
 	}
 	s.mu.Unlock()
 	for _, sub := range toClose {
-		sub.close()
+		log.Printf("[ws] /ws/conversations/%s subscriber queue full; closing slow client", conversationID)
+		go sub.closeWithStatus(websocket.CloseTryAgainLater, "client is too slow")
 	}
 }
 
@@ -4103,15 +4127,54 @@ func (s *Server) removeConversationSubscriber(conversationID string, sub *subscr
 	s.mu.Unlock()
 	if removed {
 		sub.close()
+		// A failed writer has already removed this subscriber from the registry.
+		// Closing the transport unblocks the owning reader and heartbeat so the
+		// handler cannot outlive an unreachable subscription.
+		if sub.conn != nil {
+			_ = sub.conn.Close()
+		}
 	}
+}
+
+func (s *Server) closeAllConversationSubscribers() {
+	s.mu.Lock()
+	all := make([]*subscriber, 0)
+	for _, subscribers := range s.subscribers {
+		for _, sub := range subscribers {
+			all = append(all, sub)
+		}
+	}
+	s.subscribers = map[string]map[*websocket.Conn]*subscriber{}
+	s.mu.Unlock()
+	var closeWG sync.WaitGroup
+	closeWG.Add(len(all))
+	for _, sub := range all {
+		go func(sub *subscriber) {
+			defer closeWG.Done()
+			sub.closeWithStatus(websocket.CloseGoingAway, "server shutting down")
+		}(sub)
+	}
+	closeWG.Wait()
 }
 
 func (s *Server) subscribe(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "conversationID")
+	path := "/ws/conversations/" + id
+	if !s.beginWebSocketSubscription(w) {
+		return
+	}
+	defer s.websocketWG.Done()
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
+	defer conn.Close()
+	if s.isClosing() {
+		initiateWebSocketClose(conn, websocket.CloseGoingAway, "server shutting down")
+		waitForWebSocketClose(conn)
+		return
+	}
+	stopHeartbeat := startWebSocketHeartbeat(conn, path)
 	sub := &subscriber{conn: conn, send: make(chan []byte, conversationSubscriberQueueSize)}
 	writerDone := make(chan struct{})
 	go func() {
@@ -4119,27 +4182,48 @@ func (s *Server) subscribe(w http.ResponseWriter, r *http.Request) {
 		for data := range sub.send {
 			_ = conn.SetWriteDeadline(time.Now().Add(conversationWriteTimeout))
 			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				logWebSocketDisconnect(path, err)
 				s.removeConversationSubscriber(id, sub)
 				return
 			}
 		}
 	}()
-	s.mu.Lock()
-	if s.subscribers[id] == nil {
-		s.subscribers[id] = map[*websocket.Conn]*subscriber{}
+	if !s.addConversationSubscriber(id, sub) {
+		stopHeartbeat()
+		sub.closeWithStatus(websocket.CloseGoingAway, "server shutting down")
+		waitForWebSocketClose(conn)
+		<-writerDone
+		return
 	}
-	s.subscribers[id][conn] = sub
-	s.mu.Unlock()
 	defer func() {
+		stopHeartbeat()
 		s.removeConversationSubscriber(id, sub)
+		_ = conn.Close()
 		<-writerDone
 	}()
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
+			logWebSocketDisconnect(path, err)
 			return
 		}
 	}
 }
+
+// addConversationSubscriber atomically checks the service lifecycle and
+// records the subscription, so Server.Close either observes it or rejects it.
+func (s *Server) addConversationSubscriber(conversationID string, sub *subscriber) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
+	if s.subscribers[conversationID] == nil {
+		s.subscribers[conversationID] = map[*websocket.Conn]*subscriber{}
+	}
+	s.subscribers[conversationID][sub.conn] = sub
+	return true
+}
+
 func (s *Server) allowedPath(path string) (string, error) {
 	absolute, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -4191,8 +4275,25 @@ func gitBranch(ctx context.Context, path string) (string, bool) {
 	return snapshot.Head.Branch, true
 }
 func decode(w http.ResponseWriter, r *http.Request, target any) bool {
-	if err := json.NewDecoder(r.Body).Decode(target); err != nil {
-		writeError(w, 400, errors.New("invalid JSON request"))
+	return decodeJSON(w, r, target, false)
+}
+
+func decodeOptional(w http.ResponseWriter, r *http.Request, target any) bool {
+	return decodeJSON(w, r, target, true)
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any, allowEmpty bool) bool {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes))
+	if err := decoder.Decode(target); err != nil {
+		if errors.Is(err, io.EOF) && allowEmpty {
+			return true
+		}
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, errors.New("request body too large"))
+		} else {
+			writeError(w, http.StatusBadRequest, errors.New("invalid JSON request"))
+		}
 		return false
 	}
 	return true
@@ -4232,6 +4333,8 @@ func localizedHTTPErrorText(status int, err error) string {
 	switch status {
 	case http.StatusBadRequest:
 		fallback = "请求参数无效，请检查后重试。"
+	case http.StatusRequestEntityTooLarge:
+		fallback = "请求内容过大，请缩小后重试。"
 	case http.StatusUnauthorized:
 		fallback = "未授权访问，请重新登录后重试。"
 	case http.StatusForbidden:
@@ -5015,14 +5118,26 @@ func (s *Server) getProjectRunStatus(w http.ResponseWriter, r *http.Request) {
 // subscribeRunLogs 处理 WebSocket 日志订阅。
 func (s *Server) subscribeRunLogs(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
+	path := "/ws/projects/" + projectID + "/run"
 	if !s.requireRunProject(w, r) {
 		return
 	}
+	if !s.beginWebSocketSubscription(w) {
+		return
+	}
+	defer s.websocketWG.Done()
 
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
+	defer conn.Close()
+	if s.isClosing() {
+		initiateWebSocketClose(conn, websocket.CloseGoingAway, "server shutting down")
+		waitForWebSocketClose(conn)
+		return
+	}
+	stopHeartbeat := startWebSocketHeartbeat(conn, path)
 
 	sub := &runLogSubscriber{conn: conn, send: make(chan LogEntry, runLogSubscriberQueueSize)}
 	writerDone := make(chan struct{})
@@ -5031,28 +5146,34 @@ func (s *Server) subscribeRunLogs(w http.ResponseWriter, r *http.Request) {
 		for entry := range sub.send {
 			_ = conn.SetWriteDeadline(time.Now().Add(runLogWriteTimeout))
 			if err := conn.WriteJSON(entry); err != nil {
+				logWebSocketDisconnect(path, err)
 				_ = conn.Close()
 				return
 			}
 		}
 	}()
 	if !s.registerRunLogSubscriber(r.Context(), projectID, sub) {
-		sub.close()
+		stopHeartbeat()
+		sub.closeWithStatus(websocket.CloseGoingAway, "project log stream unavailable")
+		waitForWebSocketClose(conn)
 		<-writerDone
 		return
 	}
 
 	defer func() {
+		stopHeartbeat()
 		s.runLogSubMu.Lock()
 		delete(s.runLogSubscribers[projectID], conn)
 		s.runLogSubMu.Unlock()
 		sub.close()
+		_ = conn.Close()
 		<-writerDone
 	}()
 
 	// 读取循环检测断开
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
+			logWebSocketDisconnect(path, err)
 			return
 		}
 	}
@@ -5068,16 +5189,23 @@ func (s *Server) registerRunLogSubscriber(ctx context.Context, projectID string,
 	}
 	runner := s.runManagers[projectID]
 	if runner == nil {
-		s.addRunLogSubscriber(projectID, sub, nil)
-		return true
+		return s.addRunLogSubscriber(projectID, sub, nil)
 	}
+	registered := false
 	runner.registerLogSubscriber(func(history []LogEntry) {
-		s.addRunLogSubscriber(projectID, sub, history)
+		registered = s.addRunLogSubscriber(projectID, sub, history)
 	})
-	return true
+	return registered
 }
 
-func (s *Server) addRunLogSubscriber(projectID string, sub *runLogSubscriber, history []LogEntry) {
+// addRunLogSubscriber atomically checks the service lifecycle and records the
+// subscription, so Server.Close either observes this connection or rejects it.
+func (s *Server) addRunLogSubscriber(projectID string, sub *runLogSubscriber, history []LogEntry) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
 	s.runLogSubMu.Lock()
 	defer s.runLogSubMu.Unlock()
 	for _, entry := range history {
@@ -5087,21 +5215,27 @@ func (s *Server) addRunLogSubscriber(projectID string, sub *runLogSubscriber, hi
 		s.runLogSubscribers[projectID] = map[*websocket.Conn]*runLogSubscriber{}
 	}
 	s.runLogSubscribers[projectID][sub.conn] = sub
+	return true
 }
 
 // broadcastRunLog enqueues logs without allowing a slow client to block a
 // project process. A full queue disconnects that subscriber.
 func (s *Server) broadcastRunLog(projectID string, entry LogEntry) {
+	toClose := make([]*runLogSubscriber, 0)
 	s.runLogSubMu.Lock()
 	for conn, sub := range s.runLogSubscribers[projectID] {
 		select {
 		case sub.send <- entry:
 		default:
 			delete(s.runLogSubscribers[projectID], conn)
-			sub.close()
+			toClose = append(toClose, sub)
 		}
 	}
 	s.runLogSubMu.Unlock()
+	for _, sub := range toClose {
+		log.Printf("[ws] /ws/projects/%s/run subscriber queue full; closing slow client", projectID)
+		go sub.closeWithStatus(websocket.CloseTryAgainLater, "client is too slow")
+	}
 }
 
 func (s *Server) closeProjectRunLogSubscribers(projectID string) {
@@ -5109,9 +5243,15 @@ func (s *Server) closeProjectRunLogSubscribers(projectID string) {
 	subs := s.runLogSubscribers[projectID]
 	delete(s.runLogSubscribers, projectID)
 	s.runLogSubMu.Unlock()
+	var closeWG sync.WaitGroup
+	closeWG.Add(len(subs))
 	for _, sub := range subs {
-		sub.close()
+		go func(sub *runLogSubscriber) {
+			defer closeWG.Done()
+			sub.closeWithStatus(websocket.CloseGoingAway, "project log stream closed")
+		}(sub)
 	}
+	closeWG.Wait()
 }
 
 func (s *Server) closeAllRunLogSubscribers() {
@@ -5124,7 +5264,13 @@ func (s *Server) closeAllRunLogSubscribers() {
 	}
 	s.runLogSubscribers = map[string]map[*websocket.Conn]*runLogSubscriber{}
 	s.runLogSubMu.Unlock()
+	var closeWG sync.WaitGroup
+	closeWG.Add(len(all))
 	for _, sub := range all {
-		sub.close()
+		go func(sub *runLogSubscriber) {
+			defer closeWG.Done()
+			sub.closeWithStatus(websocket.CloseGoingAway, "server shutting down")
+		}(sub)
 	}
+	closeWG.Wait()
 }

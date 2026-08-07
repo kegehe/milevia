@@ -9,6 +9,11 @@
     "node": ">=22.0.0",
     "pnpm": ">=10.17.1"
   },
+  "pnpm": {
+    "overrides": {
+      "postcss": "^8.5.23"
+    }
+  },
   "dependencies": {
     "tsx": "^4.23.1"
   }

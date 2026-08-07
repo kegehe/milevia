@@ -130,9 +130,7 @@ fn wait_for_ready(
 fn wait_for_health(sidecar: &RunningSidecar) -> Result<(), Box<dyn Error>> {
     let url = Url::parse(&sidecar.api_base)?;
     let host = url.host_str().ok_or("控制服务地址缺少主机名")?;
-    let port = url
-        .port_or_known_default()
-        .ok_or("控制服务地址缺少端口")?;
+    let port = url.port_or_known_default().ok_or("控制服务地址缺少端口")?;
     let address = format!("{host}:{port}");
     let socket_address = address
         .to_socket_addrs()?
@@ -221,14 +219,8 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
                 e
             )
         })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("无法获取控制服务 stdout 管道")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("无法获取控制服务 stderr 管道")?;
+    let stdout = child.stdout.take().ok_or("无法获取控制服务 stdout 管道")?;
+    let stderr = child.stderr.take().ok_or("无法获取控制服务 stderr 管道")?;
     match wait_for_ready(stdout, stderr, sidecar_path.clone()) {
         Ok(api_base) => {
             let sidecar = RunningSidecar {
