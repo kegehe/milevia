@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Highlight, type Token } from "prism-react-renderer";
 import type { PrismTheme } from "prism-react-renderer";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { FileInfo } from "./file-model";
-import { detectLanguage, isImageFile, isEditableFile, formatSize } from "./file-model";
+import { detectLanguage, getDirPath, isImageFile, isEditableFile, formatSize } from "./file-model";
 import { FileIcon } from "./FileIcon";
 
 // ─── 自定义浅色主题（与网站绿色工作室主题一致）────────────────────────────
@@ -26,6 +28,83 @@ const studioLightTheme: PrismTheme = {
     { types: ["deleted"], style: { color: "#a54a39" } },
   ],
 };
+
+// ─── 文件工具栏（文本查看与 Markdown 预览共用）───────────────────────────
+
+interface FileViewerToolbarProps {
+  stat: FileInfo;
+  iconKey: string;
+  fontSize: number;
+  onIncreaseFont?: () => void;
+  onDecreaseFont?: () => void;
+  canIncreaseFont?: boolean;
+  canDecreaseFont?: boolean;
+  onEdit: () => void;
+  readOnly: boolean;
+}
+
+function FileViewerToolbar({
+  stat,
+  iconKey,
+  fontSize,
+  onIncreaseFont,
+  onDecreaseFont,
+  canIncreaseFont,
+  canDecreaseFont,
+  onEdit,
+  readOnly,
+}: FileViewerToolbarProps) {
+  return (
+    <div className="file-viewer-toolbar">
+      <span className="file-viewer-file-path" title={stat.path}><FileIcon iconKey={iconKey} size={15} /><span>{stat.path}</span></span>
+      <div className="file-viewer-actions">
+        <div className="file-viewer-font-controls">
+          <button
+            className="file-viewer-font-btn"
+            onClick={onDecreaseFont}
+            disabled={!canDecreaseFont}
+            title="缩小字号"
+            aria-label="缩小字号"
+          >
+            A−
+          </button>
+          <span className="file-viewer-font-size">{fontSize}px</span>
+          <button
+            className="file-viewer-font-btn"
+            onClick={onIncreaseFont}
+            disabled={!canIncreaseFont}
+            title="放大字号"
+            aria-label="放大字号"
+          >
+            A+
+          </button>
+        </div>
+        {isEditableFile(stat) && !readOnly && <button className="file-viewer-edit-btn" onClick={onEdit}>编辑</button>}
+        {readOnly && isEditableFile(stat) && <span className="file-viewer-readonly-hint" title="AI 正在运行中，文件编辑已锁定">只读</span>}
+      </div>
+    </div>
+  );
+}
+
+// ─── Markdown 渲染配置（模块级常量，避免每次渲染重建引用）────────────────
+
+/** 安全外链协议白名单；其余 scheme（javascript:、data:、vbscript: 等）一律拦截 */
+const SAFE_EXTERNAL_LINK = /^(https?:|ftp:|mailto:|tel:)/i;
+const PROTOCOL_RELATIVE = /^\/\//;
+
+/** 是否为可在链接中安全使用的 href（放行 http(s)/ftp/mailto/tel、protocol-relative、项目内相对/root、锚点） */
+function isSafeHref(href: string | undefined): boolean {
+  if (!href) return true;
+  const colon = href.indexOf(":");
+  if (colon === -1) return true; // 无协议：相对路径/锚点，安全
+  return SAFE_EXTERNAL_LINK.test(href); // 有协议：仅放行白名单
+}
+
+/** 判断 href 是否应在新标签页打开的安全外链；否则视为项目内相对链接/锚点 */
+function isExternalLink(href: string | undefined): boolean {
+  if (!href) return false;
+  return isSafeHref(href) && (SAFE_EXTERNAL_LINK.test(href) || PROTOCOL_RELATIVE.test(href));
+}
 
 // ─── 搜索匹配类型 ──────────────────────────────────────────────────────────
 
@@ -118,6 +197,8 @@ export function FileViewer({
   const [imgError, setImgError] = useState(false);
   const [imgLoading, setImgLoading] = useState(true);
   const language = detectLanguage(stat.name);
+  // Markdown 预览：仅纯 Markdown 文档走 react-markdown 渲染；.mdx 含 JSX/组件，保留 prism 源文高亮
+  const isMarkdown = language === "markdown" && !/\.mdx$/i.test(stat.name) && stat.isText && !isImageFile(stat.mimeType);
 
   // ─── 搜索状态 ─────────────────────────────────────────────────────────
 
@@ -203,9 +284,9 @@ export function FileViewer({
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // Ctrl/Cmd+F：仅在文本文件时打开搜索
+      // Ctrl/Cmd+F：仅在文本文件且非 markdown 预览时打开搜索
       if ((e.ctrlKey || e.metaKey) && e.key === "f") {
-        if (!stat.isText || isImageFile(stat.mimeType)) return;
+        if (!stat.isText || isImageFile(stat.mimeType) || isMarkdown) return;
         e.preventDefault();
         if (!showSearch) {
           setShowSearch(true);
@@ -224,7 +305,7 @@ export function FileViewer({
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [closeSearch, showSearch, stat.isText, stat.mimeType]);
+  }, [closeSearch, showSearch, stat.isText, stat.mimeType, isMarkdown]);
 
   // 搜索栏内 Enter / Shift+Enter 处理
   const handleSearchKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -244,17 +325,17 @@ export function FileViewer({
     }
   }, [goToNext, goToPrev, closeSearch]);
 
-  // ─── 切换图片文件时重置加载状态 ───────────────────────────────────────
+  // ─── 切换图片 / Markdown 预览时重置状态（它们不支持行内代码搜索）────────
 
   useEffect(() => {
-    if (isImageFile(stat.mimeType)) {
+    if (isImageFile(stat.mimeType) || isMarkdown) {
       setImgError(false);
       setImgLoading(true);
       // 切换文件时也重置搜索状态
       setShowSearch(false);
       setSearchQuery("");
     }
-  }, [stat.path, stat.mimeType]);
+  }, [stat.path, stat.mimeType, isMarkdown]);
 
   // ─── 图片预览 ─────────────────────────────────────────────────────────
 
@@ -308,37 +389,62 @@ export function FileViewer({
   }
 
   // ─── 文本文件：prism 语法高亮 + 搜索 ──────────────────────────────────
+  // ─── Markdown 文件：渲染预览（react-markdown）──────────────────────────
+
+  if (isMarkdown) {
+    return (
+      <div className="file-viewer text-viewer">
+        <FileViewerToolbar
+          stat={stat}
+          iconKey="md"
+          fontSize={fontSize}
+          onIncreaseFont={onIncreaseFont}
+          onDecreaseFont={onDecreaseFont}
+          canIncreaseFont={canIncreaseFont}
+          canDecreaseFont={canDecreaseFont}
+          onEdit={onEdit}
+          readOnly={readOnly}
+        />
+        <div
+          className="file-viewer-markdown markdown"
+          style={{ fontSize: `${fontSize}px` }}
+        >
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            skipHtml
+            components={{
+              a: ({ href, children }) => {
+                const safe = isSafeHref(href);
+                return (
+                  <a
+                    {...(safe ? { href } : undefined)}
+                    {...(safe && isExternalLink(href) ? { target: "_blank", rel: "noreferrer" } : undefined)}
+                  >{children}</a>
+                );
+              },
+              img: ({ src, alt }) => <MarkdownFileImage src={src} alt={alt} projectId={projectId} baseDir={getDirPath(stat.path)} />,
+            }}
+          >
+            {content}
+          </ReactMarkdown>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="file-viewer text-viewer">
-      <div className="file-viewer-toolbar">
-        <span className="file-viewer-file-path" title={stat.path}><FileIcon iconKey="file" size={15} /><span>{stat.path}</span></span>
-        <div className="file-viewer-actions">
-          <div className="file-viewer-font-controls">
-          <button
-            className="file-viewer-font-btn"
-            onClick={onDecreaseFont}
-            disabled={!canDecreaseFont}
-            title="缩小字号"
-            aria-label="缩小字号"
-          >
-            A−
-          </button>
-          <span className="file-viewer-font-size">{fontSize}px</span>
-          <button
-            className="file-viewer-font-btn"
-            onClick={onIncreaseFont}
-            disabled={!canIncreaseFont}
-            title="放大字号"
-            aria-label="放大字号"
-          >
-            A+
-          </button>
-          </div>
-          {isEditableFile(stat) && !readOnly && <button className="file-viewer-edit-btn" onClick={onEdit}>编辑</button>}
-          {readOnly && isEditableFile(stat) && <span className="file-viewer-readonly-hint" title="AI 正在运行中，文件编辑已锁定">只读</span>}
-        </div>
-      </div>
+      <FileViewerToolbar
+        stat={stat}
+        iconKey="file"
+        fontSize={fontSize}
+        onIncreaseFont={onIncreaseFont}
+        onDecreaseFont={onDecreaseFont}
+        canIncreaseFont={canIncreaseFont}
+        canDecreaseFont={canDecreaseFont}
+        onEdit={onEdit}
+        readOnly={readOnly}
+      />
 
       {/* ─── 搜索栏 ──────────────────────────────────────────────────── */}
       {showSearch && (
@@ -524,4 +630,53 @@ function renderLineWithHighlights(
   }
 
   return nodes;
+}
+
+// ─── Markdown 文件内图片解析 ──────────────────────────────────────────────
+
+/** 归一化相对路径（处理 ./ 与 ../），返回清理后的绝对项目路径 */
+function normalizeProjectPath(baseDir: string, rel: string): string {
+  const segments = baseDir ? baseDir.split("/").filter(Boolean) : [];
+  for (const part of rel.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") { segments.pop(); }
+    else segments.push(part);
+  }
+  return "/" + segments.join("/");
+}
+
+/**
+ * 解析 markdown 中的图片地址为可直接加载的 URL。
+ * - 外链(http/https/data:)、protocol-relative（//）、/api/ 前缀：原样返回
+ * - 项目根绝对路径、相对路径（./、../、裸文件名）：基于 md 所在目录拼 raw 接口，
+ *   并剥离 query/hash 防止把 `img.png?v=1` 这种缓存参数误当文件名
+ */
+function resolveMarkdownImageUrl(src: string, baseDir: string, projectId: string): string {
+  if (!src) return src;
+  // 外链 / data URI / protocol-relative / 已有完整接口地址：原样返回
+  if (/^(https?:|data:)/i.test(src) || src.startsWith("/api/") || PROTOCOL_RELATIVE.test(src)) return src;
+  // 剥离 query 与 hash，仅保留文件系统真实路径部分
+  const filePath = src.split(/[?#]/, 1)[0].trim();
+  if (!filePath || filePath === ".") return ""; // 纯锚点/纯 query/无有效路径：不渲染
+  if (filePath.startsWith("/")) {
+    return `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(filePath)}`;
+  }
+  const normalized = normalizeProjectPath(baseDir, filePath);
+  return `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(normalized)}`;
+}
+
+function MarkdownFileImage({
+  src,
+  alt,
+  projectId,
+  baseDir,
+}: {
+  src?: string;
+  alt?: string;
+  projectId: string;
+  baseDir: string;
+}) {
+  const url = resolveMarkdownImageUrl(src ?? "", baseDir, projectId);
+  if (!url) return null;
+  return <img src={url} alt={alt ?? ""} loading="lazy" />;
 }

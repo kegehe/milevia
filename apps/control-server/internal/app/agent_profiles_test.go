@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -47,19 +49,40 @@ func TestManagedCLIEnvironmentOverridesServerControlledValues(t *testing.T) {
 	}
 }
 
-func TestCredentialProfileInputsAreRejectedForBothAgents(t *testing.T) {
+func TestLegacyCredentialModesAreRejectedButAPIKeyIsSupported(t *testing.T) {
 	server := newTestServer(t)
+	// keychain/env_ref legacy modes remain rejected.
 	for _, agentID := range []string{"claude-code", "codex"} {
 		for _, authMode := range []string{"keychain", "env_ref"} {
 			t.Run(agentID+"/"+authMode, func(t *testing.T) {
 				response := httptest.NewRecorder()
 				body := `{"agentId":"` + agentID + `","name":"Credential profile","model":"test-model","baseUrl":"https://api.example.com/v1","authMode":"` + authMode + `","apiKey":"test-key","secretRef":"TEST_KEY"}`
 				server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(body)))
-				if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "only cli_managed") {
-					t.Fatalf("credential profile status=%d body=%s", response.Code, response.Body.String())
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("legacy credential mode status=%d body=%s", response.Code, response.Body.String())
 				}
 			})
 		}
+	}
+	// api_key profiles with a managed key and endpoint are accepted.
+	for _, agentID := range []string{"claude-code", "codex"} {
+		t.Run(agentID+"/api_key", func(t *testing.T) {
+			response := httptest.NewRecorder()
+			body := `{"agentId":"` + agentID + `","name":"Managed key profile","model":"test-model","baseUrl":"https://api.example.com/v1","authMode":"api_key","apiKey":"sk-test-managed-key"}`
+			server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(body)))
+			if response.Code != http.StatusCreated {
+				t.Fatalf("api_key profile status=%d body=%s", response.Code, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), "sk-test-managed-key") {
+				t.Fatalf("plaintext key leaked in response: %s", response.Body.String())
+			}
+		})
+	}
+	// A base URL that is not an HTTP(S) endpoint is rejected.
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"claude-code","name":"Bad endpoint","authMode":"api_key","baseUrl":"not-a-url","apiKey":"sk-x"}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid base URL status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -90,6 +113,126 @@ func TestClaudeCLIManagedProfileLaunchHasNoCredentialOrEndpointInjection(t *test
 		if strings.Contains(joinedArgs, forbidden) || strings.Contains(joinedEnvironment, forbidden) {
 			t.Fatalf("Claude CLI-managed launch injected %q: args=%q env=%q", forbidden, joinedArgs, joinedEnvironment)
 		}
+	}
+}
+
+func TestAPIKeyManagedProfileRoundTripAndLaunch(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"claude-code","name":"Managed key profile","model":"claude-test","baseUrl":"https://api.example.com/v1","authMode":"api_key","apiKey":"sk-super-secret-value","env":{"ANTHROPIC_VERSION":"2023-06-01","X_CUSTOM":"1"}}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create api_key profile status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Profile  AgentProfile         `json:"profile"`
+		Revision AgentProfileRevision `json:"revision"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode api_key profile response: %v", err)
+	}
+	if strings.Contains(response.Body.String(), "sk-super-secret-value") {
+		t.Fatalf("plaintext key leaked in response: %s", response.Body.String())
+	}
+	// Runtime admission resolves the encrypted secret back to the plaintext key.
+	tx, beginErr := server.db.BeginTx(context.Background(), nil)
+	if beginErr != nil {
+		t.Fatalf("begin tx: %v", beginErr)
+	}
+	runtimeProfile, err := server.runtimeProfileTx(context.Background(), tx, result.Revision.ID, server.localRunnerID(), "claude-code")
+	_ = tx.Rollback()
+	if err != nil || runtimeProfile == nil {
+		t.Fatalf("runtime profile err=%v", err)
+	}
+	if runtimeProfile.Secret != "sk-super-secret-value" || runtimeProfile.BaseURL != "https://api.example.com/v1" || runtimeProfile.AuthMode != "api_key" {
+		t.Fatalf("runtime profile=%#v", runtimeProfile)
+	}
+	if runtimeProfile.Env["ANTHROPIC_VERSION"] != "2023-06-01" || runtimeProfile.Env["X_CUSTOM"] != "1" {
+		t.Fatalf("runtime profile env=%#v", runtimeProfile.Env)
+	}
+	// Launch injects the managed key and endpoint into the CLI environment.
+	environment, _, cleanup, err := (&claudeCLIRunner{config: Config{}}).profileLaunch(context.Background(), runtimeProfile, []string{})
+	if err != nil {
+		t.Fatalf("launch api_key profile: %v", err)
+	}
+	defer cleanup()
+	joined := strings.Join(environment, "\n")
+	if !strings.Contains(joined, "ANTHROPIC_API_KEY=sk-super-secret-value") {
+		t.Fatalf("launch did not inject API key: %q", joined)
+	}
+	if !strings.Contains(joined, "ANTHROPIC_BASE_URL=https://api.example.com/v1") {
+		t.Fatalf("launch did not inject base URL: %q", joined)
+	}
+	if strings.Contains(joined, "ANTHROPIC_MODEL=") {
+		t.Fatalf("launch unexpectedly injected ANTHROPIC_MODEL: %q", joined)
+	}
+}
+
+func TestAPIKeyRotationMintsIndependentSecretPerRevision(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"claude-code","name":"Key profile","model":"m1","authMode":"api_key","apiKey":"key-one","env":{"X":"1"}}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		Profile  AgentProfile         `json:"profile"`
+		Revision AgentProfileRevision `json:"revision"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created.Revision.Environment["X"] != "1" {
+		t.Fatalf("revision did not persist env: %#v", created.Revision.Environment)
+	}
+	secretForRevision := func(revisionID string) string {
+		var ref string
+		if err := server.db.QueryRow(`select secret_ref from agent_profile_revisions where id=?`, revisionID).Scan(&ref); err != nil {
+			t.Fatalf("read secret ref: %v", err)
+		}
+		return ref
+	}
+	firstSecret := secretForRevision(created.Revision.ID)
+	// Edit model (no new key): the same secret row is reused and env preserved.
+	update := httptest.NewRecorder()
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPatch, "/api/agent-profiles/"+created.Profile.ID, strings.NewReader(`{"model":"m2"}`)))
+	if update.Code != http.StatusOK {
+		t.Fatalf("update model status=%d body=%s", update.Code, update.Body.String())
+	}
+	var updated struct {
+		Profile  AgentProfile         `json:"profile"`
+		Revision AgentProfileRevision `json:"revision"`
+	}
+	if err := json.NewDecoder(update.Body).Decode(&updated); err != nil {
+		t.Fatalf("decode update: %v", err)
+	}
+	if updatedSecret := secretForRevision(updated.Revision.ID); updatedSecret != firstSecret {
+		t.Fatalf("model-only edit rotated secret: old=%q new=%q", firstSecret, updatedSecret)
+	}
+	// Rotating the key mints a fresh secret; the old revision keeps its own.
+	rotate := httptest.NewRecorder()
+	server.routes().ServeHTTP(rotate, httptest.NewRequest(http.MethodPatch, "/api/agent-profiles/"+created.Profile.ID, strings.NewReader(`{"apiKey":"key-two"}`)))
+	if rotate.Code != http.StatusOK {
+		t.Fatalf("rotate status=%d body=%s", rotate.Code, rotate.Body.String())
+	}
+	var rotated struct {
+		Revision AgentProfileRevision `json:"revision"`
+	}
+	if err := json.NewDecoder(rotate.Body).Decode(&rotated); err != nil {
+		t.Fatalf("decode rotate: %v", err)
+	}
+	if rotatedSecret := secretForRevision(rotated.Revision.ID); rotatedSecret == "" || rotatedSecret == firstSecret {
+		t.Fatalf("rotation did not mint an independent secret: first=%q new=%q", firstSecret, rotatedSecret)
+	}
+	// The old secret row still decrypts to the first key (preserved for the
+	// immutable earlier revision).
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	oldKey, err := server.profileSecrets.Load(tx, context.Background(), firstSecret)
+	_ = tx.Rollback()
+	if err != nil || oldKey != "key-one" {
+		t.Fatalf("old revision secret lost: key=%q err=%v", oldKey, err)
 	}
 }
 
@@ -187,7 +330,7 @@ func TestProfileSelectionDefaultsToInheritedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin inherited transaction: %v", err)
 	}
-	revisionID, err := server.profileForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code")
+	revisionID, err := server.profileForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code", "")
 	_ = tx.Rollback()
 	if err != nil || revisionID != "" {
 		t.Fatalf("empty profile selection revision=%q err=%v", revisionID, err)
@@ -197,7 +340,7 @@ func TestProfileSelectionDefaultsToInheritedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin default transaction: %v", err)
 	}
-	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code")
+	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code", "")
 	_ = tx.Rollback()
 	if err != nil || revisionID != "" {
 		t.Fatalf("implicit profile selection revision=%q err=%v", revisionID, err)
@@ -207,7 +350,7 @@ func TestProfileSelectionDefaultsToInheritedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin explicit fallback transaction: %v", err)
 	}
-	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, &empty, server.localRunnerID(), "claude-code")
+	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, &empty, server.localRunnerID(), "claude-code", "")
 	_ = tx.Rollback()
 	if err != nil || revisionID != "" {
 		t.Fatalf("explicit inherited fallback revision=%q err=%v", revisionID, err)
@@ -216,7 +359,7 @@ func TestProfileSelectionDefaultsToInheritedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin explicit profile transaction: %v", err)
 	}
-	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, &profile.ID, server.localRunnerID(), "claude-code")
+	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, &profile.ID, server.localRunnerID(), "claude-code", "")
 	_ = tx.Rollback()
 	if err != nil || revisionID != profile.CurrentRevisionID {
 		t.Fatalf("explicit profile selection revision=%q err=%v want=%q", revisionID, err, profile.CurrentRevisionID)
@@ -228,10 +371,165 @@ func TestProfileSelectionDefaultsToInheritedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin fallback transaction: %v", err)
 	}
-	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code")
+	revisionID, err = server.profileForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code", "")
 	_ = tx.Rollback()
 	if err != nil || revisionID != "" {
 		t.Fatalf("disabled default fallback revision=%q err=%v", revisionID, err)
+	}
+}
+
+func TestProjectDefaultProfileAppliesToNewConversations(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "claude-default")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	// Set the project default through the one-click endpoint (non-empty path).
+	set := httptest.NewRecorder()
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPatch, "/api/projects/project/agent-profile", strings.NewReader(`{"profileId":"`+profile.ID+`"}`)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set default status=%d body=%s", set.Code, set.Body.String())
+	}
+	// A new conversation with no explicit profile inherits the project default.
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations?new=true", strings.NewReader(`{"agentId":"claude-code"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("conversation status=%d body=%s", response.Code, response.Body.String())
+	}
+	var conversation Conversation
+	if err := json.NewDecoder(response.Body).Decode(&conversation); err != nil {
+		t.Fatalf("decode conversation: %v", err)
+	}
+	if conversation.AgentProfileRevisionID != profile.CurrentRevisionID {
+		t.Fatalf("project default revision=%q want=%q", conversation.AgentProfileRevisionID, profile.CurrentRevisionID)
+	}
+	// The endpoint reports the configured default.
+	detail := httptest.NewRecorder()
+	server.routes().ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/projects/project", nil))
+	if detail.Code != http.StatusOK {
+		t.Fatalf("get project status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	var project struct {
+		DefaultProfileID string `json:"defaultProfileId"`
+	}
+	if err := json.NewDecoder(detail.Body).Decode(&project); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	if project.DefaultProfileID != profile.ID {
+		t.Fatalf("project default=%q want=%q", project.DefaultProfileID, profile.ID)
+	}
+	// Clearing the default can be done via the dedicated endpoint.
+	clear := httptest.NewRecorder()
+	server.routes().ServeHTTP(clear, httptest.NewRequest(http.MethodPatch, "/api/projects/project/agent-profile", strings.NewReader(`{"profileId":""}`)))
+	if clear.Code != http.StatusOK {
+		t.Fatalf("clear default status=%d body=%s", clear.Code, clear.Body.String())
+	}
+	tx, beginErr := server.db.BeginTx(context.Background(), nil)
+	if beginErr != nil {
+		t.Fatalf("begin tx: %v", beginErr)
+	}
+	empty := ""
+	revisionID, err := server.profileForNewConversationTx(context.Background(), tx, &empty, server.localRunnerID(), "claude-code", "project")
+	_ = tx.Rollback()
+	if err != nil || revisionID != "" {
+		t.Fatalf("cleared default revision=%q err=%v", revisionID, err)
+	}
+}
+
+func TestCodexApiKeyProfileBypassesLoginReadiness(t *testing.T) {
+	server := newTestServer(t)
+	// A fake codex binary that exists but is NOT logged in (login status fails).
+	bin := filepath.Join(t.TempDir(), "fake-codex")
+	script := "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then exit 1; fi\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	server.codexRunner = &codexCLIRunner{config: Config{CodexPath: bin}}
+	// cli_managed still requires a login.
+	if profile := (*AgentRuntimeProfile)(nil); server.codexUsableForProfile(context.Background(), profile) {
+		t.Fatal("codex reported usable without login for cli_managed")
+	}
+	// An api_key profile injects its own key, so binary presence suffices.
+	apiKeyProfile := &AgentRuntimeProfile{AgentID: "codex", AuthMode: "api_key", Secret: "sk-x"}
+	if !server.codexUsableForProfile(context.Background(), apiKeyProfile) {
+		t.Fatal("codex reported unusable for api_key profile despite binary present")
+	}
+}
+
+func TestAPIKeyProfileAsProjectDefaultBindsAndAdmitsAtRuntime(t *testing.T) {
+	server := newTestServer(t)
+	created := httptest.NewRecorder()
+	server.routes().ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"codex","name":"Key default","model":"gpt-test","baseUrl":"https://api.example.com/v1","authMode":"api_key","apiKey":"sk-codex-key"}`)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create codex api_key status=%d body=%s", created.Code, created.Body.String())
+	}
+	var result struct {
+		Profile  AgentProfile         `json:"profile"`
+		Revision AgentProfileRevision `json:"revision"`
+	}
+	if err := json.NewDecoder(created.Body).Decode(&result); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project-key','project-key',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	// One-click: make the api_key profile the project default.
+	set := httptest.NewRecorder()
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPatch, "/api/projects/project-key/agent-profile", strings.NewReader(`{"profileId":"`+result.Profile.ID+`"}`)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set key default status=%d body=%s", set.Code, set.Body.String())
+	}
+	// A new conversation with no explicit profile inherits the api_key default.
+	tx, beginErr := server.db.BeginTx(context.Background(), nil)
+	if beginErr != nil {
+		t.Fatalf("begin tx: %v", beginErr)
+	}
+	revisionID, err := server.profileForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "codex", "project-key")
+	if err != nil || revisionID != result.Revision.ID {
+		t.Fatalf("api_key default revision=%q err=%v want=%q", revisionID, err, result.Revision.ID)
+	}
+	// Runtime admission resolves the managed codex key and endpoint.
+	runtimeProfile, err := server.runtimeProfileTx(context.Background(), tx, revisionID, server.localRunnerID(), "codex")
+	_ = tx.Rollback()
+	if err != nil || runtimeProfile == nil {
+		t.Fatalf("runtime admission err=%v", err)
+	}
+	if runtimeProfile.Secret != "sk-codex-key" || runtimeProfile.BaseURL != "https://api.example.com/v1" {
+		t.Fatalf("runtime codex profile=%#v", runtimeProfile)
+	}
+}
+
+func TestRevokingOrDisablingProjectDefaultClearsIt(t *testing.T) {
+	server := newTestServer(t)
+	for _, action := range []string{"revoke", "disable"} {
+		t.Run(action, func(t *testing.T) {
+			profile := createCLIManagedProfile(t, server, "claude-code", "")
+			now := time.Now().UTC()
+			projectID := "project-" + action
+			if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at,default_profile_id) values (?,?,?,'wsl-local','main',1,?,?)`, projectID, projectID, t.TempDir(), now, profile.ID); err != nil {
+				t.Fatalf("insert project: %v", err)
+			}
+			var endpoint string
+			if action == "revoke" {
+				endpoint = "/api/agent-profile-revisions/" + profile.CurrentRevisionID + "/revoke"
+			} else {
+				endpoint = "/api/agent-profiles/" + profile.ID + "/disable"
+			}
+			resp := httptest.NewRecorder()
+			server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodPost, endpoint, nil))
+			if resp.Code != http.StatusNoContent && resp.Code != http.StatusAccepted {
+				t.Fatalf("%s status=%d body=%s", action, resp.Code, resp.Body.String())
+			}
+			var cleared string
+			if err := server.db.QueryRow(`select default_profile_id from projects where id=?`, projectID).Scan(&cleared); err != nil {
+				t.Fatalf("read project default: %v", err)
+			}
+			if cleared != "" {
+				t.Fatalf("%s did not clear project default: %q", action, cleared)
+			}
+		})
 	}
 }
 
@@ -329,7 +627,7 @@ func TestLegacyCredentialRevisionIsRejectedForSelectionAndRuntime(t *testing.T) 
 	if err != nil {
 		t.Fatalf("begin selection transaction: %v", err)
 	}
-	_, err = server.profileForNewConversationTx(context.Background(), tx, &requested, server.localRunnerID(), "claude-code")
+	_, err = server.profileForNewConversationTx(context.Background(), tx, &requested, server.localRunnerID(), "claude-code", "")
 	_ = tx.Rollback()
 	if err == nil {
 		t.Fatal("legacy credential revision was admitted for a new conversation")

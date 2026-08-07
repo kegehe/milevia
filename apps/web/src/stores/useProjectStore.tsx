@@ -18,6 +18,7 @@ interface ProjectContextValue {
   setError: (msg: string) => void;
   refreshProjects: () => Promise<void>;
   refreshStatuses: () => Promise<void>;
+  removeProject: (projectID: string) => void;
   getConversationDraft: (projectID: string, conversationID: string) => string;
   saveConversationDraft: (projectID: string, conversationID: string, text: string) => void;
   flushConversationDraft: (projectID: string, conversationID: string) => void;
@@ -119,8 +120,14 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshStatuses]);
 
+  // 乐观删除：立即从内存列表移除，避免依赖后续网络刷新（可能被并发轮询
+  // 的"最新发起者"竞态覆盖，导致已删项目残留到下次手动刷新）。
+  const removeProject = useCallback((projectID: string) => {
+    setProjects((current) => current.filter((project) => project.id !== projectID));
+  }, []);
+
   return (
-    <ProjectContext.Provider value={{ projects, projectStatuses, error, setError, refreshProjects, refreshStatuses, getConversationDraft, saveConversationDraft, flushConversationDraft, api: apiFn }}>
+    <ProjectContext.Provider value={{ projects, projectStatuses, error, setError, refreshProjects, refreshStatuses, removeProject, getConversationDraft, saveConversationDraft, flushConversationDraft, api: apiFn }}>
       {children}
     </ProjectContext.Provider>
   );

@@ -81,8 +81,40 @@ test("all composer text sources are cached and conversation switches use the tar
 });
 
 test("input-history previews do not replace the unsent draft when the page closes", () => {
-  assert.match(conversationPage, /const textToPersist = historyIndex\.current === null \? textRef\.current : draftBeforeHistory\.current;/);
+  assert.match(conversationPage, /let textToPersist = historyIndex\.current === null \? textRef\.current : draftBeforeHistory\.current;/);
   assert.match(conversationPage, /saveConversationDraft\(projectId, conversationID, textToPersist\);/);
+});
+
+test("scheduled send holds input until the conversation plus subagents go idle", () => {
+  // 预约入口：发送按钮旁的下拉里提供「预约发送」
+  assert.match(conversationPage, /composer-send-wrap/, "发送按钮有下拉容器");
+  assert.match(conversationPage, /composer-send-more[\s\S]*?aria-expanded=\{showSendMenu\}/, "有切换下拉的小箭头");
+  assert.match(conversationPage, /<b>立即发送<\/b><small>立即交给/s, "下拉提供立即发送");
+  assert.match(conversationPage, /<b>预约发送<\/b><small>当前任务（含子代理）全部结束后再发送<\/small>/, "下拉提供预约发送说明");
+  // 预约：把内容暂存到 ref 驱动的 state，清空输入框
+  assert.match(conversationPage, /const scheduleSend = \(\) => \{[\s\S]*?pendingSendRef\.current = content;[\s\S]*?setPendingSendContent\(content\);[\s\S]*?setComposerText\("", conversation\.id\);/s);
+  // 取消失约：把内容写回输入框
+  assert.match(conversationPage, /const cancelScheduledSend = \(\) => \{[\s\S]*?setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);/s);
+  // 空闲判定：主回合结束 且 没有任何子代理仍在运行
+  assert.match(conversationPage, /const isConversationIdle = useCallback\(\(\) => \{[\s\S]*?if \(run\) return false;[\s\S]*?for \(const execution of agentExecutions\)[\s\S]*?agent\.status === "running" \|\| agent\.status === "pending"\) return false;/s);
+  // 触发：空闲才真正 sendContent
+  assert.match(conversationPage, /if \(!isConversationIdle\(\)\) return;\s*[\s\S]*?await sendContent\(content\);/s);
+  // 预约进行中的提示条与取消按钮
+  assert.match(conversationPage, /pendingSendContent && <div className="composer-pending"/);
+  assert.match(conversationPage, /composer-pending-cancel[\s\S]*?onClick=\{cancelScheduledSend\}/);
+  assert.match(stylesheet, /\.send-menu\s*\{\s*position:\s*absolute;[\s\S]*?bottom:\s*calc\(100%\s*\+\s*8px\);/s);
+  assert.match(stylesheet, /\.composer-pending\s*\{[\s\S]*?border:\s*1px solid #d0c98a;/s);
+});
+
+test("user-triggered stop or clear cancels a pending scheduled send", () => {
+  // 用户主动停止（stopRun）时清空预约，避免停止后又把预约自动发射开启新一轮；不写回输入框以保留草稿恢复
+  assert.match(conversationPage, /const stopRun = async \(\) => \{[\s\S]*?clearScheduledSend\(\);/s);
+  // 用户主动清空（clearCurrentConversation）时清空预约，避免内容落入被清空的旧会话草稿或被 reset 覆盖
+  assert.match(conversationPage, /const clearCurrentConversation = async \(skipRunGuard = false\) => \{[\s\S]*?clearScheduledSend\(\);/s);
+  // 只有用户主动点"撤回预约"按钮才把内容写回输入框
+  assert.match(conversationPage, /const cancelScheduledSend = \(\) => \{[\s\S]*?clearScheduledSend\(\);[\s\S]*?setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);/s);
+  // 普通发送（含键盘 Enter 提交）会收起发送方式下拉
+  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*setShowSendMenu\(false\);/s);
 });
 
 test("a failed send restores its draft only while the original conversation remains active", () => {
@@ -163,7 +195,7 @@ test("task queue has one named landmark", () => {
 });
 
 test("shortcut and task cards keep their intrinsic row heights", () => {
-  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*align-content:\s*start;[^}]*gap:\s*10px;/s);
+  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*align-content:\s*start;/s);
   assert.match(taskStyles, /\.task-queue-list\s*\{[^}]*align-content:\s*start;[^}]*gap:\s*6px;/s);
 });
 
@@ -309,17 +341,20 @@ test("creating a conversation keeps the newly navigated route", () => {
   assert.doesNotMatch(newConversation[0], /navigate\(`\/projects\/\$\{projectId\}\/conversations\/\$\{next\.id\}`, \{ replace: true \}\);[\s\S]*closeNewConversation\(\);/);
 });
 
-test("wide screens render aligned shortcut rows and narrow screens keep grouped order", () => {
-  assert.match(stylesheet, /\.quick-tag-row\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
-  assert.match(stylesheet, /\.quick-tag-slot\s*\{[^}]*min-height:\s*30px;/s);
+test("wide and narrow screens sort prompts and commands in separate vertical lists", () => {
+  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
+  assert.match(stylesheet, /\.quick-tag-list\.sortable\s*\{[^}]*list-style:\s*none;[^}]*margin:\s*0;[^}]*padding:\s*0;/s);
+  assert.match(stylesheet, /\.quick-tag-grip\s*\{[^}]*cursor:\s*grab;/s);
+  assert.match(stylesheet, /\.quick-tag-item\.dragging\s*\{[^}]*opacity:\s*\.55;/);
+  assert.match(stylesheet, /\.quick-tag-item\.drop-over\s*>[^}]*\.quick-tag\s*\{[^}]*border-color:\s*#2b6c5e;/);
   assert.match(stylesheet, /\.quick-actions-mobile\s*\{[^}]*display:\s*none;/s);
   assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-row\s*\{[^}]*display:\s*none;/);
   assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-mobile\s*\{[^}]*display:\s*grid;/);
-  assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-mobile \.quick-tag > button:first-child,\s*\.quick-actions-mobile \.quick-tag-empty\s*\{[^}]*flex:\s*1;[^}]*max-width:\s*none;/);
   assert.match(stylesheet, /\.quick-actions-row \.quick-tag > button:first-child,\s*\.quick-actions-row \.quick-tag-empty\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
-  assert.match(conversationPage, /const shortcutRowCount = Math\.max\(promptShortcutItems\.length, commandShortcutItems\.length\);/);
+  assert.match(conversationPage, /function ShortcutSortableList\(/);
+  assert.match(conversationPage, /const reorderKind = useCallback\(async \(kind/s);
+  assert.match(conversationPage, /`\/api\/projects\/\$\{projectId\}\/shortcuts\/reorder`/);
   assert.match(conversationPage, /title=\{shortcut\.enabled \? shortcut\.template : `\$\{shortcut\.template\}\\n\\n\$\{shortcut\.name\}已停用`\}/);
-  assert.match(conversationPage, /className="quick-tag-slot"/);
   assert.doesNotMatch(stylesheet, /\.quick-actions-row\s*\{[^}]*overflow-x:\s*auto/s);
 });
 

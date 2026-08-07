@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
-import { changeState, formatGitTime, groupChanges, shortOID, type GitBranch, type GitChange, type GitCommit, type GitDiff, type GitOperation, type GitSnapshot } from "./git-model";
+import { changeState, formatGitTime, groupChanges, shortOID, type GitBranch, type GitChange, type GitCommit, type GitDiff, type GitOperation, type GitSnapshot, type GitWorktreeSummary } from "./git-model";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Tab = "overview" | "changes" | "history" | "branches" | "operations";
@@ -164,7 +164,7 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
     </nav>
     <main className="git-workbench-body">
       {loading ? <div className="git-empty">正在读取仓库状态</div> : <>
-        {tab === "overview" && <div id="git-view-overview" role="tabpanel" aria-labelledby="git-tab-overview"><Overview snapshot={snapshot} changeCount={changeCount} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} mutating={mutating} /></div>}
+        {tab === "overview" && <div id="git-view-overview" role="tabpanel" aria-labelledby="git-tab-overview"><Overview snapshot={snapshot} changeCount={changeCount} commits={commits} branches={branches} operations={operations} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} mutating={mutating} /></div>}
         {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
         {tab === "history" && <div id="git-view-history" role="tabpanel" aria-labelledby="git-tab-history"><History commits={commits} /></div>}
         {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} snapshot={snapshot} mutating={mutating} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} requestSwitchBranch={(branch) => setConfirmation({ type: "switch-branch", branch })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
@@ -175,18 +175,68 @@ export function GitWorkbench({ projectID, request, fail, active }: { projectID: 
   </section>;
 }
 
-function Overview({ snapshot, changeCount, requestFetch, requestPush, mutating }: { snapshot: GitSnapshot | null; changeCount: number; requestFetch: () => void; requestPush: () => void; mutating: string }) {
+function Overview({ snapshot, changeCount, commits, branches, operations, requestFetch, requestPush, mutating }: { snapshot: GitSnapshot | null; changeCount: number; commits: GitCommit[]; branches: GitBranch[]; operations: GitOperation[]; requestFetch: () => void; requestPush: () => void; mutating: string }) {
   if (!snapshot) return <div className="git-empty">无法读取仓库状态</div>;
   const { head, worktree } = snapshot;
+  const remoteName = head.upstream?.split("/")[0] || "origin";
+  const localBranches = branches.filter((b) => !b.remote);
+  const remoteBranches = branches.filter((b) => b.remote);
+  const currentBranch = branches.find((b) => b.current);
+  const recentCommits = commits.slice(0, 6);
+  const recentOps = operations.filter((op) => op.status === "succeeded" || op.status === "failed" || op.status === "needs_attention").slice(0, 5);
+  const syncLabel = head.upstream ? (head.ahead === 0 && head.behind === 0 ? "与上游同步" : head.ahead > 0 && head.behind === 0 ? `领先 ${head.ahead}` : head.ahead === 0 && head.behind > 0 ? `落后 ${head.behind}` : `领先 ${head.ahead} · 落后 ${head.behind}`) : "";
   return <div className="git-overview">
-    <section className="git-head-card"><div><span>当前引用</span><b>{head.detached ? "HEAD" : head.branch || "未初始化"}</b><code>{shortOID(head.oid)}</code></div><dl><div><dt>上游</dt><dd>{head.upstream || "未设置"}</dd></div><div><dt>领先</dt><dd>{head.ahead}</dd></div><div><dt>落后</dt><dd>{head.behind}</dd></div></dl></section>
-    <div className="git-overview-remote"><button type="button" className="secondary" disabled={Boolean(mutating)} onClick={requestFetch}>获取更新</button><button type="button" className="secondary" disabled={Boolean(mutating) || head.ahead === 0} onClick={requestPush}>推送</button></div>
-    <section className="git-stat-grid" aria-label="工作区统计"><GitStat label="变更文件" value={changeCount} /><GitStat label="已暂存" value={worktree.staged} /><GitStat label="未跟踪" value={worktree.untracked} /><GitStat label="冲突" value={worktree.conflicted} /></section>
-    <section className="git-summary-list"><div><span>工作区修改</span><b>{worktree.modified}</b></div><div><span>删除</span><b>{worktree.deleted}</b></div><div><span>重命名</span><b>{worktree.renamed}</b></div></section>
+    <section className="git-overview-hero" aria-label="仓库概览">
+      <div className="git-hero-ref" title={head.oid}>
+        <span className="git-hero-label">当前引用</span>
+        <b>{head.detached ? "HEAD (游离指针)" : head.branch || "未初始化"}</b>
+        <code>{shortOID(head.oid)}</code>
+      </div>
+      <dl className="git-hero-stats">
+        <div className={head.ahead > 0 ? "same" : ""}><dt>领先</dt><dd>{head.ahead}</dd></div>
+        <div className={head.behind > 0 ? "warn" : ""}><dt>落后</dt><dd>{head.behind}</dd></div>
+        <div><dt>上游</dt><dd className="git-hero-upstream" title={head.upstream}>{head.upstream || "未设置"}</dd></div>
+      </dl>
+      <div className="git-hero-meta">
+        {head.upstream ? <span>{syncLabel}</span> : <span>未跟踪上游</span>}
+        {head.upstream ? <span><code>{remoteName}</code> 远端分支 {remoteBranches.length} 个</span> : null}
+        {snapshot.observedAt ? <span>刷新于 {formatGitTime(snapshot.observedAt)}</span> : null}
+      </div>
+      <div className="git-overview-remote"><button type="button" className="secondary" disabled={Boolean(mutating)} onClick={requestFetch}>获取更新</button><button type="button" className="secondary" disabled={Boolean(mutating) || head.detached || !head.branch || head.ahead === 0} onClick={requestPush} title={head.detached || !head.branch ? "游离指针状态无法推送" : head.ahead === 0 ? "没有需要推送的提交" : undefined}>推送</button></div>
+    </section>
+    <GitStatPanel worktree={worktree} changeCount={changeCount} />
+    <section className="git-overview-feeds" aria-label="仓库动态">
+      <section className="git-overview-feed">
+        <header><h3>最近提交</h3>{commits.length > 5 ? <button type="button" className="git-feed-more" onClick={() => document.getElementById("git-tab-history")?.click()}>查看全部</button> : null}</header>
+        {recentCommits.length === 0 ? <div className="git-feed-empty">暂无提交</div> : <div className="git-feed-list">{recentCommits.map((commit) => <article key={commit.oid} title={commit.subject}><code>{shortOID(commit.oid)}</code><b>{commit.subject || "(无提交说明)"}</b><span>{commit.author}</span><time>{formatGitTime(commit.authoredAt)}</time></article>)}</div>}
+      </section>
+      <section className="git-overview-feed">
+        <header><h3>分支</h3><span className="git-feed-count">{localBranches.length} 本地 · {remoteBranches.length} 远端</span></header>
+        <div className="git-feed-branches">
+          {currentBranch ? <article className="git-feed-current"><span className="git-feed-tag current">当前</span><b>{currentBranch.name}</b><small>{currentBranch.upstream || "未跟踪上游"}</small></article> : null}
+          {localBranches.filter((b) => !b.current).slice(0, 4).map((branch) => <article key={branch.name}><span className="git-feed-tag">本地</span><b>{branch.name}</b><small>{branch.upstream || ""}</small></article>)}
+        </div>
+      </section>
+      <section className="git-overview-feed">
+        <header><h3>最近操作</h3>{operations.length > 5 ? <button type="button" className="git-feed-more" onClick={() => document.getElementById("git-tab-operations")?.click()}>查看全部</button> : null}</header>
+        {recentOps.length === 0 ? <div className="git-feed-empty">暂无操作记录</div> : <div className="git-feed-list ops">{recentOps.map((op) => <article key={op.id}><span className={`git-operation-status ${op.status}`}>{operationStatusLabel(op.status)}</span><b>{operationTypeLabel(op.type)}</b><span>{op.errorMessage || op.requestSummary}</span><time>{formatGitTime(op.finishedAt || op.startedAt || op.requestedAt)}</time></article>)}</div>}
+      </section>
+    </section>
   </div>;
 }
 
-function GitStat({ label, value }: { label: string; value: number }) { return <div><span>{label}</span><b>{value}</b></div>; }
+function GitStatPanel({ worktree, changeCount }: { worktree: GitWorktreeSummary; changeCount: number }) {
+  const stats: { label: string; value: number; attention?: boolean; title?: string }[] = [
+    { label: "变更文件", value: changeCount, title: "有改动的文件总数（一个文件可能同时计入下方多个分项）" },
+    { label: "已暂存", value: worktree.staged, title: "已加入暂存区的文件" },
+    { label: "未跟踪", value: worktree.untracked, title: "尚未被 Git 跟踪的新文件" },
+    { label: "修改", value: worktree.modified, title: "已跟踪文件的内容改动" },
+    { label: "删除", value: worktree.deleted, title: "已删除的受跟踪文件" },
+    { label: "重命名", value: worktree.renamed, title: "已重命名/移动的文件" },
+    { label: "冲突", value: worktree.conflicted, attention: worktree.conflicted > 0, title: "需要手动解决的合并冲突" },
+  ];
+  return <section className="git-stat-grid" aria-label="工作区统计">{stats.map((stat) => <div key={stat.label} className={stat.attention ? "attention" : ""} title={stat.title}><span>{stat.label}</span><b>{stat.value}</b></div>)}</section>;
+}
 
 function PlusIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M8 3v10M3 8h10" /></svg>; }
 

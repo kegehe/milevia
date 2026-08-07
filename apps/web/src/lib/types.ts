@@ -1,6 +1,6 @@
 // 类型定义 — 从 App.tsx 提取，供全项目使用
 
-export type Project = { id: string; name: string; pathDisplay: string; runner: string; environment: string; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
+export type Project = { id: string; name: string; pathDisplay: string; fullPath: string; runner: string; environment: string; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
 export type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string };
 export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";

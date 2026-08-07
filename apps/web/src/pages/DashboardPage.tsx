@@ -24,7 +24,7 @@ function ImportProjectIcon() {
 }
 
 export default function DashboardPage() {
-  const { projects, projectStatuses, error, setError, refreshProjects, api } = useProjectContext();
+  const { projects, projectStatuses, error, setError, refreshProjects, removeProject, api } = useProjectContext();
   const navigate = useNavigate();
   const [filter, setFilter] = useState<ProjectFilter>("all");
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
@@ -107,7 +107,10 @@ export default function DashboardPage() {
     setDeleting(true);
     try {
       await api(`/api/projects/${deleteTarget.id}`, { method: "DELETE" });
+      // 立即从内存列表移除，卡片马上消失，不依赖后续网络刷新收敛。
+      removeProject(deleteTarget.id);
       setDeleteTarget(null);
+      // 后台再拉一次做最终校准，即便被并发轮询的竞态覆盖也不影响即时反馈。
       void refreshProjects();
     } catch (cause) {
       alert(cause instanceof Error ? cause.message : "无法删除项目");
@@ -184,7 +187,7 @@ function ProjectCard({ project, status, open, onDelete, onDragStart, onDragOver,
       </span>
     </div>
     <div className="project-card-title"><span>项目</span><h2>{project.name}</h2><p>{taskTitle}</p></div>
-    <div className="project-card-meta"><span><small>会话</small><b>{status ? status.conversationCount : "--"}</b></span><span><small>工作目录</small><b title={project.pathDisplay}>{project.pathDisplay}</b></span></div>
+    <div className="project-card-meta"><span><small>会话</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b>{project.pathDisplay}</b></span></div>
     <footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话<i>→</i></b></footer>
   </article>;
 }
