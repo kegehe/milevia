@@ -120,7 +120,6 @@
 .task-queue-pin svg { width: 12px; height: 12px; fill: currentColor; }
 .task-queue-pin:hover:not(:disabled) { opacity: 1; border-color: #79ae99; color: #1f5b4c; background: #eef8f2; }
 .task-queue-pin:disabled { cursor: default; }
-.task-queue-pin.pinned { opacity: 1; border-color: #79ae99; color: #1f5b4c; background: #e0f2e7; }
 .task-queue-row:has(.task-queue-inline-review) .task-queue-pin,
 .task-queue-row:has(.task-inline-detail) .task-queue-pin { display: none; }
 .task-queue-inline-review { grid-column: 1 / -1; display: grid; gap: 7px; border: 1px solid #b8d8ca; border-radius: 6px; padding: 10px; background: #f8fcf9; }

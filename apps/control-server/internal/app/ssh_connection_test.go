@@ -472,3 +472,188 @@ func TestRecoverSSHConnectionsReleasesRowsBeforeReconnecting(t *testing.T) {
 		t.Fatal("recovered SSH runner was not registered")
 	}
 }
+
+func TestUpdateSSHConnectionPreservesIdentityStatusAndSecrets(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	if _, err := server.db.Exec(`update ssh_connections set password=? where id=?`, "old-password", connection.ID); err != nil {
+		t.Fatalf("seed password: %v", err)
+	}
+	before, err := server.loadSSHConnection(context.Background(), connection.ID)
+	if err != nil {
+		t.Fatalf("load original: %v", err)
+	}
+	body := `{"name":"renamed","host":"new.example.test","user":"dev","privateKeyPath":"","rootPath":"/new/path","authMethod":"password","password":"","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBd875TBQVvl6l2xrvhta9tuJAvo0toGSWCQaQsBRzYd","connect":false}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := server.loadSSHConnection(context.Background(), connection.ID)
+	if err != nil {
+		t.Fatalf("reload connection: %v", err)
+	}
+	if updated.ID != before.ID || updated.CreatedAt != before.CreatedAt {
+		t.Fatalf("identity not preserved: id=%s", updated.ID)
+	}
+	if updated.Name != "renamed" || updated.Host != "new.example.test" {
+		t.Fatalf("fields not updated: %+v", updated)
+	}
+	if updated.Status != "disconnected" {
+		t.Fatalf("status overwritten on non-connect edit: %q", updated.Status)
+	}
+	if updated.Password != "old-password" {
+		t.Fatalf("blank password did not preserve existing: %q", updated.Password)
+	}
+}
+
+func TestUpdateSSHConnectionRequiresPreflightHostKey(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	body := `{"name":"renamed","host":"new.example.test","user":"dev","privateKeyPath":"","rootPath":"/new/path","authMethod":"password","password":"","hostKey":"","connect":false}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("update without host key status=%d want 400", response.Code)
+	}
+}
+
+func TestUpdateSSHConnectionMissingReturnsNotFound(t *testing.T) {
+	server := newTestServer(t)
+	body := `{"name":"x","host":"h","user":"u","privateKeyPath":"/tmp/k","rootPath":"/","authMethod":"key","password":"","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEV4YW1wbGUgaG9zdCBrZXk=","connect":false}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/missing", strings.NewReader(body)))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("update missing status=%d want 404", response.Code)
+	}
+}
+
+func TestPreflightEditReusesStoredPassword(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	if _, err := server.db.Exec(`update ssh_connections set password=? where id=?`, "stored-secret", connection.ID); err != nil {
+		t.Fatalf("seed password: %v", err)
+	}
+	// 捕获预检实际使用的凭据：编辑模式密码为空时应沿用已保存的密码。
+	var seen SSHConnection
+	orig := newSSHClient
+	newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
+		seen = conn
+		return nil, errors.New("stop after capture")
+	}
+	t.Cleanup(func() { newSSHClient = orig })
+	// 编辑表单密码为空、认证方式为密码，附带 connectionId。
+	body := `{"name":"renamed","host":"example.test","user":"dev","authMethod":"password","password":"","rootPath":"/srv/projects","connectionId":"` + connection.ID + `"}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-connections/preflight", strings.NewReader(body)))
+	if seen.Password != "stored-secret" {
+		t.Fatalf("preflight did not reuse stored password; got %q", seen.Password)
+	}
+	if seen.PrivateKeyPath != "" {
+		t.Fatalf("password-auth edit carried over private key path: %q", seen.PrivateKeyPath)
+	}
+}
+
+func TestPreflightEditReusesStoredPrivateKeyPath(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	var seen SSHConnection
+	orig := newSSHClient
+	newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
+		seen = conn
+		return nil, errors.New("stop after capture")
+	}
+	t.Cleanup(func() { newSSHClient = orig })
+	body := `{"name":"renamed","host":"example.test","user":"dev","authMethod":"key","privateKeyPath":"","rootPath":"/srv/projects","connectionId":"` + connection.ID + `"}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-connections/preflight", strings.NewReader(body)))
+	if seen.PrivateKeyPath != connection.PrivateKeyPath {
+		t.Fatalf("preflight did not reuse stored private key path; got %q want %q", seen.PrivateKeyPath, connection.PrivateKeyPath)
+	}
+	if seen.Password != "" {
+		t.Fatalf("key-auth edit carried over password: %q", seen.Password)
+	}
+}
+
+func TestUpdateConnectedConnectionFailingReconnectKeepsConnectedStatus(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "connected")
+	// 注册一个存活的旧 runner，模拟已连接状态。
+	oldRunner := &sshRunner{client: &sshClient{}, rootPath: connection.RootPath}
+	runnerID := "ssh-" + connection.ID
+	server.runnerRegistry.register(runnerID, oldRunner, RunnerMeta{ID: runnerID})
+	// 让重连失败：prepareSSHRunner 返回错误，但旧 runner 应保留、状态应保持 connected。
+	server.sshPrepare = func(context.Context, SSHConnection) (*sshRunner, RunnerMeta, error) {
+		return nil, RunnerMeta{}, errors.New("remote host unreachable")
+	}
+	body := `{"name":"renamed","host":"example.test","user":"dev","privateKeyPath":"/tmp/test-key","authMethod":"key","password":"","rootPath":"/srv/projects","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBd875TBQVvl6l2xrvhta9tuJAvo0toGSWCQaQsBRzYd","connect":true}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	// 旧 runner 应仍存活。
+	if runner, ok := server.runnerRegistry.get(runnerID); !ok || runner != oldRunner {
+		t.Fatal("failed edit reconnect replaced the still-alive runner")
+	}
+	// DB 状态应保持 connected，而非被标为 error。
+	var status string
+	if err := server.db.QueryRow(`select status from ssh_connections where id=?`, connection.ID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "connected" {
+		t.Fatalf("status = %q, want connected (old runner still alive)", status)
+	}
+}
+
+func TestUpdateConnectionReconnectsAndRegistersNewRunner(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	newRunner := &sshRunner{client: &sshClient{}, rootPath: "/srv/projects"}
+	server.sshPrepare = func(_ context.Context, c SSHConnection) (*sshRunner, RunnerMeta, error) {
+		return newRunner, RunnerMeta{ID: "ssh-" + c.ID, Root: newRunner.rootPath}, nil
+	}
+	body := `{"name":"renamed","host":"example.test","user":"dev","privateKeyPath":"/tmp/test-key","authMethod":"key","password":"","rootPath":"/srv/projects","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBd875TBQVvl6l2xrvhta9tuJAvo0toGSWCQaQsBRzYd","connect":true}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	runner, ok := server.runnerRegistry.get("ssh-" + connection.ID)
+	if !ok || runner != newRunner {
+		t.Fatal("edit+reconnect did not register the new runner")
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from ssh_connections where id=?`, connection.ID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "connected" {
+		t.Fatalf("status=%q want connected", status)
+	}
+}
+
+func TestUpdateSwitchingAuthMethodClearsOppositeCredential(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	// 原连接是密码认证，存有密码。
+	if _, err := server.db.Exec(`update ssh_connections set password=? where id=?`, "old-password", connection.ID); err != nil {
+		t.Fatalf("seed password: %v", err)
+	}
+	// 编辑切换到密钥认证，填入新私钥路径，不提供密码。
+	body := `{"name":"renamed","host":"example.test","user":"dev","privateKeyPath":"/tmp/new-key","authMethod":"key","password":"","rootPath":"/srv/projects","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBd875TBQVvl6l2xrvhta9tuJAvo0toGSWCQaQsBRzYd","connect":false}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := server.loadSSHConnection(context.Background(), connection.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if updated.Password != "" {
+		t.Fatalf("switching to key auth did not clear old password: %q", updated.Password)
+	}
+	if updated.PrivateKeyPath != "/tmp/new-key" {
+		t.Fatalf("private key path not updated: %q", updated.PrivateKeyPath)
+	}
+}

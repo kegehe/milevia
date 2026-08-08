@@ -56,6 +56,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const redispatchRequest = useRef(0);
   const reviewAllRequest = useRef(0);
   const tasksRequestVersion = useRef(0);
+  const pinLockRef = useRef(false);
   const mountedRef = useRef(true);
   const conversationIDRef = useRef(conversationID);
   conversationIDRef.current = conversationID;
@@ -347,15 +348,28 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   };
 
   const setPinned = async (taskID: string, pinned: boolean) => {
+    if (pinLockRef.current || !mountedRef.current) return;
     const task = tasks.find((t) => t.id === taskID);
-    if (!task || !mountedRef.current) return;
-    const first = queueTasks.find((item) => item.pinned && item.id !== taskID) || queueTasks.find((item) => item.id !== taskID);
-    const newPosition = pinned && first ? first.position - 1 : task.position;
+    if (!task) return;
+    pinLockRef.current = true;
+    // 置顶只切换 pinned 标记，不改 position：pinned 优先排序会让它稳居第一，
+    // 而保留原 position 使取消置顶时自然回到原位，也避免 position 反复减一负向漂移。
+    const patch = (t: Task, p: boolean) => JSON.stringify({ title: t.title, description: t.description, acceptanceCriteria: t.acceptanceCriteria, priority: t.priority, pinned: p, position: t.position });
     try {
-      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, acceptanceCriteria: task.acceptanceCriteria, priority: task.priority, pinned, position: newPosition }) });
+      if (pinned) {
+        // 单置顶：点谁谁到第一个，同时取消其它任务原来的置顶。
+        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: patch(task, true) });
+        const others = tasks.filter((t) => t.pinned && t.id !== taskID);
+        for (const other of others) {
+          await request(`/api/tasks/${other.id}`, { method: "PATCH", body: patch(other, false) });
+        }
+      } else {
+        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: patch(task, false) });
+      }
       if (!mountedRef.current) return;
       await loadTasks();
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法置顶任务"); }
+    finally { pinLockRef.current = false; }
   };
 
   const quickCreate = async (event: FormEvent) => {
@@ -423,13 +437,12 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
   const note = taskQueueNote(task);
   const isReviewing = reviewingTaskID === task.id;
   const reviewRef = useRef<HTMLDivElement>(null);
-  const isPinned = Boolean(task.pinned);
 
   const handlePinToTop = async (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     if (pinning) return;
     setPinning(true);
-    try { await setPinned(task.id, !isPinned); } finally { setPinning(false); }
+    try { await setPinned(task.id, !task.pinned); } finally { setPinning(false); }
   };
   useEffect(() => {
     if (!isReviewing || !reviewRef.current) return;
@@ -516,7 +529,7 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
       {canOfferDispatch(task) && <button type="button" className="task-queue-dispatch" draggable={false} disabled={dispatchDisabled} onClick={(event) => void confirm(event, task.id)}>下发</button>}
       {canRedispatch(task) && <button type="button" className="task-queue-redispatch" draggable={false} disabled={dispatchDisabled || redispatching} onClick={(event) => void redispatch(event, task.id)}>{redispatching ? "下发中" : "重新下发"}</button>}
       {task.status === "awaiting_review" && !isTaskOrchestrating(task) && !isReviewing && <button type="button" className="task-queue-review secondary" draggable={false} onClick={(event) => { event.stopPropagation(); openReview(task.id); }}>验收</button>}
-      <button type="button" className={`task-queue-pin${isPinned ? " pinned" : ""}`} draggable={false} disabled={pinning} title={isPinned ? "取消置顶" : "置顶"} aria-label={isPinned ? "取消置顶" : "置顶"} onClick={(event) => void handlePinToTop(event)}>
+      <button type="button" className="task-queue-pin" draggable={false} disabled={pinning} title={task.pinned ? "取消置顶" : "置顶"} aria-label={task.pinned ? "取消置顶" : "置顶"} onClick={(event) => void handlePinToTop(event)}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.4 6L14 4H7.7L8 6 5 9.3c-.3.3-.5.7-.5 1.1 0 .4.3.6.6.6h4.2l-1.2 6.2c-.1.4.2.8.6.8.2 0 .4-.1.5-.2L15 12l3.9.1c.4 0 .6-.3.6-.6 0-.4-.2-.8-.5-1.1L14.4 6z" /></svg>
       </button>
     </div>

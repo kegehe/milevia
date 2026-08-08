@@ -327,6 +327,115 @@ func (s *Server) listAgentProfiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, profiles)
 }
 
+// ProjectAgentConfigView is the read-only, project-scoped view of the AI
+// configuration that applies to new conversations in a project. It is the
+// "当前项目的 AI 配置" surface: one entry per target agent (Claude Code / Codex),
+// carrying only the non-secret fields the UI needs to render and edit them.
+type ProjectAgentConfigView struct {
+	// RunnerID is the project's execution runner; RunnerManaged is false for
+	// SSH / Windows-scheduled WSL where credentials are not injected locally.
+	RunnerID      string `json:"runnerId"`
+	RunnerManaged bool   `json:"runnerManaged"`
+	Claude        *ProjectAgentEntryView `json:"claude"`
+	Codex         *ProjectAgentEntryView `json:"codex"`
+}
+
+type ProjectAgentEntryView struct {
+	ProfileID string          `json:"profileId"`
+	Model     string          `json:"model,omitempty"`
+	BaseURL   string          `json:"baseUrl,omitempty"`
+	AuthMode  string          `json:"authMode"`
+	IsDefault bool            `json:"isDefault"`
+	Enabled   bool            `json:"enabled"`
+	State     string          `json:"state"`
+	Env       map[string]string `json:"env,omitempty"`
+}
+
+// getProjectAgentConfig returns the current AI configuration applied to new
+// conversations in a project, grouped by target agent. It is strictly read-only:
+// managed keys are never exposed. Write/mutate flows keep using the existing
+// runner-scoped profile endpoints plus PATCH /api/projects/{id}/agent-profile.
+func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	runnerID := project.RunnerID
+	if runnerID == "" {
+		runnerID = s.localRunnerID()
+	}
+	view := ProjectAgentConfigView{RunnerID: runnerID, RunnerManaged: s.canManageProfileRunner(runnerID)}
+	// Load every profile on this runner + each target agent, then select the
+	// effective one per agent: the project's default_profile_id wins when it
+	// points at one of them, otherwise the currently-enabled profile.
+	rows, err := s.db.QueryContext(r.Context(), `select p.id,p.agent_id,p.enabled,p.is_default,r.revision,r.base_url,r.model,r.options_json,r.auth_mode,r.state
+		from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id
+		where p.runner_id=? and p.agent_id in ('claude-code','codex') order by p.agent_id,p.name`, runnerID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+	type entryByAgent struct {
+		agentID string
+		entry   ProjectAgentEntryView
+	}
+	byAgentDefault := map[string]*ProjectAgentEntryView{}
+	candidates := []entryByAgent{}
+	for rows.Next() {
+		var entry ProjectAgentEntryView
+		var agentID string
+		var revision int
+		var optionsJSON string
+		if err := rows.Scan(&entry.ProfileID, &agentID, &entry.Enabled, &entry.IsDefault, &revision, &entry.BaseURL, &entry.Model, &optionsJSON, &entry.AuthMode, &entry.State); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		entry.Env, _ = unmarshalProfileOptions(optionsJSON)
+		if project.DefaultProfileID != "" && entry.ProfileID == project.DefaultProfileID {
+			byAgentDefault[agentID] = &entry
+		} else {
+			candidates = append(candidates, entryByAgent{agentID: agentID, entry: entry})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	pick := func(agentID string, dflt *ProjectAgentEntryView) *ProjectAgentEntryView {
+		if dflt != nil {
+			dflt.IsDefault = true
+			return dflt
+		}
+		// Prefer an enabled, active profile; fall back to any candidate.
+		var fallback *ProjectAgentEntryView
+		for index := range candidates {
+			c := candidates[index]
+			if c.agentID != agentID {
+				continue
+			}
+			entry := c.entry
+			if entry.Enabled && entry.State == "active" {
+				return &entry
+			}
+			if fallback == nil {
+				fallback = &entry
+			}
+		}
+		return fallback
+	}
+	// The two independent statements keep claude/codex mapping distinct from the
+	// agent_id string values used in the query.
+	view.Claude = pick("claude-code", byAgentDefault["claude-code"])
+	view.Codex = pick("codex", byAgentDefault["codex"])
+	writeJSON(w, http.StatusOK, view)
+}
+
 func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
 	var input struct {
@@ -761,6 +870,12 @@ func (s *Server) profileForNewConversationTx(ctx context.Context, tx *sql.Tx, re
 	if requestedProfileID != nil {
 		profileID = strings.TrimSpace(*requestedProfileID)
 	}
+	// fromDefault marks a fallback inherited from the project's configured default
+	// (rather than an explicit user selection). Fallbacks that don't fit the
+	// conversation's target agent degrade to the CLI's own config instead of
+	// failing the conversation, so a project can configure both Claude and Codex
+	// independently while the single default column covers whichever was set last.
+	fromDefault := false
 	// The explicit selection wins. When empty, fall back to the project's
 	// configured default profile, which lets a whole project ride one credential
 	// without repeating the choice on every conversation.
@@ -769,6 +884,7 @@ func (s *Server) profileForNewConversationTx(ctx context.Context, tx *sql.Tx, re
 		err := tx.QueryRowContext(ctx, `select default_profile_id from projects where id=?`, projectID).Scan(&fallback)
 		if err == nil {
 			profileID = strings.TrimSpace(fallback)
+			fromDefault = true
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return "", err
 		}
@@ -781,15 +897,26 @@ func (s *Server) profileForNewConversationTx(ctx context.Context, tx *sql.Tx, re
 		from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id
 		where p.runner_id=? and p.agent_id=? and p.enabled=1 and p.id=?`, runnerID, agentID, profileID).Scan(&revision.ID, &revision.ProfileID, &revision.Revision, &revision.BaseURL, &revision.Model, &revision.Protocol, &revision.AuthMode, &revision.SecretRef, &revision.State, &revision.ExecutionMode, &revision.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
+		// A project default configured for a different agent is not an error: the
+		// CLI's own config takes over for conversations of the other agent.
+		if fromDefault {
+			return "", nil
+		}
 		return "", errors.New("agent profile is unavailable for this runner or agent")
 	}
 	if err != nil {
 		return "", err
 	}
 	if revision.State != "active" || revision.ExecutionMode != "isolated" || (revision.AuthMode != "cli_managed" && revision.AuthMode != "api_key") {
+		if fromDefault {
+			return "", nil
+		}
 		return "", errors.New("agent profile revision is not admissible")
 	}
 	if revision.AuthMode == "cli_managed" && (revision.BaseURL != "" || revision.SecretRef != "") {
+		if fromDefault {
+			return "", nil
+		}
 		return "", errors.New("agent profile revision is invalid")
 	}
 	return revision.ID, nil

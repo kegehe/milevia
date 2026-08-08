@@ -1242,8 +1242,12 @@ func (s *Server) runIndependentReview(ctx context.Context, project Project, job 
 	var agentID string
 	_ = s.db.QueryRowContext(ctx, `select agent_id from conversations where project_id=? and is_current=true`, project.ID).Scan(&agentID)
 	if agentID == "codex" {
-		runner = s.codexRunner
+		runner = s.codexRunnerFor(s.resolveAgentTargetEnv(project.Runner, project.Path))
 		reviewPolicy = "read_only"
+	} else {
+		// 让独立审查的 Claude 也跟随项目所在环境（docs/20 §3.3）：Windows 目标项目
+		// 审查跑 Windows 侧，WSL 项目跑 WSL 侧。
+		runner = s.agentClaudeRunnerFor(s.resolveAgentTargetEnv(project.Runner, project.Path))
 	}
 	sink := &orchestrationReviewSink{}
 	reviewCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)

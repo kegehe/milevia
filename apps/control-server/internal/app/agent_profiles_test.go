@@ -790,3 +790,134 @@ func TestUpdatingProfileModelCreatesImmutableRevision(t *testing.T) {
 		t.Fatal("immutable revision accepted a model update")
 	}
 }
+
+func TestGetProjectAgentConfig(t *testing.T) {
+	server := newTestServer(t)
+	// Create a project.
+	projectPath := filepath.Join(server.config.AllowedRoot, "cfgproj")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create project status=%d body=%s", create.Code, create.Body.String())
+	}
+	var project Project
+	if err := json.NewDecoder(create.Body).Decode(&project); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	// Configure a cli_managed Claude profile and an api_key Codex profile.
+	claude := createCLIManagedProfile(t, server, "claude-code", "opus-config")
+	codexResponse := httptest.NewRecorder()
+	server.routes().ServeHTTP(codexResponse, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"codex","name":"Codex key","model":"gpt-config","baseUrl":"https://api.example.com/v1","authMode":"api_key","apiKey":"sk-do-not-leak"}`)))
+	if codexResponse.Code != http.StatusCreated {
+		t.Fatalf("create codex profile status=%d body=%s", codexResponse.Code, codexResponse.Body.String())
+	}
+	var codexA struct {
+		Profile AgentProfile `json:"profile"`
+	}
+	if err := json.NewDecoder(codexResponse.Body).Decode(&codexA); err != nil {
+		t.Fatalf("decode codex profile: %v", err)
+	}
+	// Set the Claude profile as the project default.
+	setDefault := httptest.NewRecorder()
+	server.routes().ServeHTTP(setDefault, httptest.NewRequest(http.MethodPatch, "/api/projects/"+project.ID+"/agent-profile", strings.NewReader(`{"profileId":"`+claude.ID+`"}`)))
+	if setDefault.Code != http.StatusOK {
+		t.Fatalf("set default status=%d body=%s", setDefault.Code, setDefault.Body.String())
+	}
+	// The aggregate view reflects both agents and marks the Claude one as default.
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/"+project.ID+"/agent-config", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("agent-config status=%d body=%s", response.Code, response.Body.String())
+	}
+	var view ProjectAgentConfigView
+	if err := json.NewDecoder(response.Body).Decode(&view); err != nil {
+		t.Fatalf("decode agent-config: %v", err)
+	}
+	if !view.RunnerManaged {
+		t.Fatalf("local project should be runner-managed: %#v", view)
+	}
+	if view.Claude == nil || view.Codex == nil {
+		t.Fatalf("expected both agent entries: %#v", view)
+	}
+	if view.Claude.ProfileID != claude.ID || !view.Claude.IsDefault || view.Claude.Model != "opus-config" || view.Claude.AuthMode != "cli_managed" {
+		t.Fatalf("claude entry mismatch: %#v", view.Claude)
+	}
+	if view.Codex.ProfileID != codexA.Profile.ID || view.Codex.IsDefault || view.Codex.Model != "gpt-config" || view.Codex.BaseURL != "https://api.example.com/v1" || view.Codex.AuthMode != "api_key" {
+		t.Fatalf("codex entry mismatch: %#v", view.Codex)
+	}
+	if strings.Contains(response.Body.String(), "sk-do-not-leak") {
+		t.Fatalf("managed key leaked in agent-config body: %s", response.Body.String())
+	}
+}
+
+func TestGetProjectAgentConfigOnlyLoadsExecutableAgents(t *testing.T) {
+	server := newTestServer(t)
+	projectPath := filepath.Join(server.config.AllowedRoot, "cfgproj2")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create project status=%d body=%s", create.Code, create.Body.String())
+	}
+	var project Project
+	if err := json.NewDecoder(create.Body).Decode(&project); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	// Only a Claude profile exists; codex stays nil.
+	_ = createCLIManagedProfile(t, server, "claude-code", "only-claude")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/"+project.ID+"/agent-config", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("agent-config status=%d body=%s", response.Code, response.Body.String())
+	}
+	var view ProjectAgentConfigView
+	if err := json.NewDecoder(response.Body).Decode(&view); err != nil {
+		t.Fatalf("decode agent-config: %v", err)
+	}
+	if view.Claude == nil || view.Codex != nil {
+		t.Fatalf("expected only claude entry: %#v", view)
+	}
+}
+
+func TestGetProjectAgentConfigPrefersProjectDefaultOverAlphabeticOrder(t *testing.T) {
+	server := newTestServer(t)
+	projectPath := filepath.Join(server.config.AllowedRoot, "cfgproj3")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create project status=%d body=%s", create.Code, create.Body.String())
+	}
+	var project Project
+	if err := json.NewDecoder(create.Body).Decode(&project); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	// Two claude profiles; the second (alphabetically later) is set as default.
+	first := createCLIManagedProfile(t, server, "claude-code", "a-model")
+	second := createCLIManagedProfile(t, server, "claude-code", "b-model")
+	set := httptest.NewRecorder()
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPatch, "/api/projects/"+project.ID+"/agent-profile", strings.NewReader(`{"profileId":"`+second.ID+`"}`)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set default status=%d body=%s", set.Code, set.Body.String())
+	}
+	_ = first
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/"+project.ID+"/agent-config", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("agent-config status=%d body=%s", response.Code, response.Body.String())
+	}
+	var view ProjectAgentConfigView
+	if err := json.NewDecoder(response.Body).Decode(&view); err != nil {
+		t.Fatalf("decode agent-config: %v", err)
+	}
+	if view.Claude == nil || view.Claude.ProfileID != second.ID || !view.Claude.IsDefault || view.Claude.Model != "b-model" {
+		t.Fatalf("aggregate did not prefer project default: %#v", view.Claude)
+	}
+}

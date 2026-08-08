@@ -833,7 +833,7 @@
 .scroll-btn.pulse { animation: scroll-pulse 1.6s ease-in-out infinite; }
 
 /* ---- 快捷标签侧栏 -------------------------------------------------------- */
-.quick-tag-group { display: grid; gap: 6px; }
+.quick-tag-group { display: grid; gap: 4px; }
 .quick-tag-heading {
   display: flex;
   align-items: center;
@@ -1999,7 +1999,7 @@
 .quick-tag-row { gap: 10px; }
 .quick-tag-heading {
   min-height: 28px;
-  padding: 0 0 8px;
+  padding: 0 0 2px;
   border-bottom-color: #cfe1d7;
   color: #2e6d5d;
   font-family: inherit;
@@ -2041,7 +2041,7 @@
   stroke-linejoin: round;
   stroke-width: 2;
 }
-.quick-tag-list { gap: 7px; }
+.quick-tag-list { gap: 4px; }
 .quick-tag { gap: 5px; }
 .quick-tag > button:first-child,
 .quick-tag-empty {
@@ -2120,7 +2120,7 @@
   color: #425b1e;
   background: #f2f7e5;
 }
-.quick-actions-row .quick-tag-heading { padding-bottom: 8px; }
+.quick-actions-row .quick-tag-heading { padding-bottom: 4px; }
 .quick-actions-row .quick-tag,
 .quick-actions-row .quick-tag-empty,
 .quick-tag-slot { min-height: 36px; }
@@ -2379,31 +2379,6 @@
 }
 
 /* 清空会话确认：强调会话会重置，但历史记录仍然保留。 */
-.confirm-dialog-close-icon,
-.conversation-clear-icon {
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-.confirm-dialog-close-icon { width: 16px; height: 16px; stroke-width: 1.9; }
-.confirm-dialog > header .confirm-dialog-close {
-  display: grid;
-  width: 30px;
-  height: 30px;
-  min-width: 30px;
-  box-sizing: border-box;
-  flex: none;
-  place-items: center;
-  border: 1px solid #d0e1d8;
-  border-radius: 6px;
-  padding: 0;
-  color: #668176;
-  background: #fcfefc;
-  line-height: 1;
-  transition: border-color .16s ease, color .16s ease, background .16s ease, transform .16s ease;
-}
-.confirm-dialog > header .confirm-dialog-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; transform: translateY(-1px); }
 .conversation-clear-dialog {
   width: min(460px, calc(100% - 32px));
   border-color: #c5dbd0;
@@ -2440,7 +2415,7 @@
   color: #a75a31;
   background: #fff6ea;
 }
-.conversation-clear-icon { width: 19px; height: 19px; stroke-width: 1.75; }
+.conversation-clear-icon { width: 19px; height: 19px; stroke-width: 1.75; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; }
 .conversation-clear-dialog h2 { margin: 0; color: #193d32; font-size: 18px; font-weight: 800; line-height: 1.25; }
 .conversation-clear-dialog .permission-confirmation {
   margin: 0;
