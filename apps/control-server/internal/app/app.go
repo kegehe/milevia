@@ -42,6 +42,7 @@ type Config struct {
 	ControlURL                   string
 	ApprovalHook                 string
 	NativeApprovalHook           bool
+	AgentUpdateTimeout           time.Duration
 	ClaudeTurnIdleTimeout        time.Duration
 	ClaudeInitialResponseTimeout time.Duration
 	ClaudeToolResultTimeout      time.Duration
@@ -51,6 +52,7 @@ const (
 	defaultClaudeTurnIdleTimeout        = 30 * time.Minute
 	defaultClaudeInitialResponseTimeout = 5 * time.Minute
 	defaultClaudeToolResultTimeout      = 5 * time.Minute
+	defaultAgentUpdateTimeout           = 15 * time.Minute
 	maxJSONBodyBytes                    = 16 * 1024 * 1024
 	httpReadHeaderTimeout               = 5 * time.Second
 	httpReadTimeout                     = 30 * time.Second
@@ -101,10 +103,18 @@ func ConfigFromEnv() Config {
 		PermissionMode:               mode,
 		ControlURL:                   controlURL,
 		ApprovalHook:                 hook,
+		AgentUpdateTimeout:           durationFromEnv("AUTO_AGENT_UPDATE_TIMEOUT", defaultAgentUpdateTimeout),
 		ClaudeTurnIdleTimeout:        durationFromEnv("AUTO_CLAUDE_TURN_IDLE_TIMEOUT", defaultClaudeTurnIdleTimeout),
 		ClaudeInitialResponseTimeout: durationFromEnv("AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT", defaultClaudeInitialResponseTimeout),
 		ClaudeToolResultTimeout:      durationFromEnv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", defaultClaudeToolResultTimeout),
 	}
+}
+
+func (c Config) agentUpdateTimeout() time.Duration {
+	if c.AgentUpdateTimeout <= 0 {
+		return defaultAgentUpdateTimeout
+	}
+	return c.AgentUpdateTimeout
 }
 
 func durationFromEnv(name string, fallback time.Duration) time.Duration {
@@ -4978,7 +4988,7 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, a
 		s.runnerMaintenanceMu.Unlock()
 	}()
 
-	updateCtx, cancel := context.WithTimeout(s.runtimeCtx, 2*time.Minute)
+	updateCtx, cancel := context.WithTimeout(s.runtimeCtx, s.config.agentUpdateTimeout())
 	defer cancel()
 	previousVersion, currentVersion, err := runner.Update(updateCtx)
 	if err != nil {

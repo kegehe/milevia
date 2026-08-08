@@ -723,11 +723,18 @@ func (r *sshRunner) Update(ctx context.Context) (string, string, error) {
 	if previous == "" {
 		return "", "", errors.New("远程服务器上未安装 Claude Code")
 	}
+	recovery, recoveryErr := r.prepareRemoteNpmCLIRecovery(ctx, claudeNpmCLIInstall)
 	out, err := r.client.execCommand(ctx, "claude update")
 	if err != nil {
-		return previous, "", fmt.Errorf("远程执行 claude update 失败：%w%s", err, updateOutputDetail(string(out)))
+		return r.finishRemoteNpmUpdate(previous, "Claude Code", r.Version, fmt.Errorf("远程执行 claude update 失败：%w%s", err, updateOutputDetail(string(out))), recovery, recoveryErr)
 	}
-	return previous, r.Version(ctx), nil
+	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	current := r.Version(healthCtx)
+	if current == "" {
+		return r.finishRemoteNpmUpdate(previous, "Claude Code", r.Version, errors.New("远程 Claude Code 更新后未通过健康检查"), recovery, recoveryErr)
+	}
+	return previous, current, nil
 }
 
 // codexLoginStatusCommand mirrors the local codex runner's readiness check on
@@ -773,11 +780,101 @@ func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
 	if previous == "" {
 		return "", "", errors.New("远程服务器上未安装 Codex CLI")
 	}
+	recovery, recoveryErr := r.prepareRemoteNpmCLIRecovery(ctx, codexNpmCLIInstall)
 	out, err := r.client.execCommand(ctx, "codex update")
 	if err != nil {
-		return previous, "", fmt.Errorf("远程执行 codex update 失败：%w%s", err, updateOutputDetail(string(out)))
+		return r.finishRemoteNpmUpdate(previous, "Codex", r.CodexVersion, fmt.Errorf("远程执行 codex update 失败：%w%s", err, updateOutputDetail(string(out))), recovery, recoveryErr)
 	}
-	return previous, r.CodexVersion(ctx), nil
+	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	current := r.CodexVersion(healthCtx)
+	if current == "" {
+		return r.finishRemoteNpmUpdate(previous, "Codex", r.CodexVersion, errors.New("远程 Codex 更新后未通过健康检查"), recovery, recoveryErr)
+	}
+	return previous, current, nil
+}
+
+type remoteNpmCLIRecovery struct {
+	prefix  string
+	install npmCLIInstall
+}
+
+// prepareRemoteNpmCLIRecovery accepts only the npm package that provides the
+// exact command being updated. This keeps a failed native or custom install
+// from changing an unrelated global npm package.
+func (r *sshRunner) prepareRemoteNpmCLIRecovery(ctx context.Context, install npmCLIInstall) (remoteNpmCLIRecovery, error) {
+	expected := pathpkg.Join("$prefix", "lib", "node_modules", install.scope, install.packageName, "bin", install.binFile)
+	command := fmt.Sprintf(`set -eu
+prefix=$(npm prefix -g)
+command_path=$(command -v %s)
+resolved=$(readlink -f -- "$command_path")
+expected=$(readlink -f -- "%s")
+[ "$resolved" = "$expected" ]
+printf '%%s\n' "$prefix"`, install.commandName, expected)
+	out, err := r.client.execCommand(ctx, command)
+	if err != nil {
+		return remoteNpmCLIRecovery{}, fmt.Errorf("确认远程 npm 全局安装来源失败：%w", err)
+	}
+	prefix := strings.TrimSpace(string(out))
+	if prefix == "" {
+		return remoteNpmCLIRecovery{}, errors.New("远程 npm global prefix 为空")
+	}
+	return remoteNpmCLIRecovery{prefix: prefix, install: install}, nil
+}
+
+func (r *sshRunner) finishRemoteNpmUpdate(previous, displayName string, version func(context.Context) string, updateErr error, recovery remoteNpmCLIRecovery, recoveryErr error) (string, string, error) {
+	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if version(healthCtx) != "" {
+		cancel()
+		return previous, "", updateErr
+	}
+	cancel()
+	if recoveryErr != nil {
+		return previous, "", fmt.Errorf("%w；自动回滚不可用：%v", updateErr, recoveryErr)
+	}
+	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	_, err := r.client.execCommand(recoveryCtx, remoteNpmRollbackCommand(recovery.prefix, previous, recovery.install))
+	recoveryCancel()
+	if err != nil {
+		return previous, "", fmt.Errorf("%w；自动回滚失败：%v", updateErr, err)
+	}
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	current := version(verifyCtx)
+	verifyCancel()
+	if current != previous {
+		return previous, "", fmt.Errorf("%w；自动回滚失败：rollback health check failed (version %q)", updateErr, current)
+	}
+	return previous, previous, fmt.Errorf("%w；已自动回滚到 %s %s", updateErr, displayName, previous)
+}
+
+func remoteNpmRollbackCommand(prefix, previous string, install npmCLIInstall) string {
+	packageRoot := pathpkg.Join(prefix, "lib", "node_modules", install.scope)
+	active := pathpkg.Join(packageRoot, install.packageName)
+	binary := pathpkg.Join("bin", install.binFile)
+	command := pathpkg.Join(prefix, "bin", install.commandName)
+	target := pathpkg.Join(active, binary)
+	return fmt.Sprintf(`set -eu
+root=%s
+active=%s
+previous=%s
+backup=''
+for candidate in "$root"/.%s-*; do
+  [ -d "$candidate" ] || continue
+  case "$(basename "$candidate")" in .%s-interrupted-*) continue ;; esac
+  version=$(node -e 'process.stdout.write(require(process.argv[1]).version)' "$candidate/package.json" 2>/dev/null || true)
+  if [ "$version" = "$previous" ] && [ -f "$candidate/%s" ] && [ -x "$candidate/%s" ]; then
+    backup="$candidate"
+    break
+  fi
+done
+[ -n "$backup" ]
+if [ -e "$active" ] || [ -L "$active" ]; then
+  mv "$active" "$root/.%s-interrupted-$(date +%%s)-$$"
+fi
+mv "$backup" "$active"
+mkdir -p %s
+rm -f %s
+ln -s %s %s`, shellQuote(packageRoot), shellQuote(active), shellQuote(previous), install.packageName, install.packageName, binary, binary, install.packageName, shellQuote(pathpkg.Join(prefix, "bin")), shellQuote(command), shellQuote(target), shellQuote(command))
 }
 
 func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {

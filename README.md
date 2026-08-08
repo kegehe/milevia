@@ -150,6 +150,7 @@ AUTO_CLEAR_PORTS=1 pnpm dev
 | `AUTO_ALLOWED_ROOT` | 当前用户主目录 | 可浏览加载项目的根目录 |
 | `AUTO_DATABASE_PATH` | `../../data/auto.db` | SQLite 数据库路径 |
 | `AUTO_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 默认权限模式 (`acceptEdits` / `plan`) |
+| `AUTO_AGENT_UPDATE_TIMEOUT` | `15m` | AI CLI 更新最长等待时间；更新期间不会提前终止 npm 安装 |
 | `AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT` | `5m` | 等待首个 Claude 模型响应的超时 |
 | `AUTO_CLAUDE_TOOL_RESULT_TIMEOUT` | `5m` | 等待 Claude 下一条响应（工具结果后）的超时 |
 | `AUTO_CLAUDE_TURN_IDLE_TIMEOUT` | `30m` | Claude 空闲超时，超时后释放会话队列 |

@@ -201,16 +201,46 @@ func (r *codexCLIRunner) Update(parent context.Context) (string, string, error) 
 	if previous == "" {
 		return "", "", errors.New("Codex CLI is not installed")
 	}
-	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+	recovery, recoveryErr := prepareNpmCLIRecovery(parent, r.config.CodexPath, codexNpmCLIInstall)
+	ctx, cancel := context.WithTimeout(parent, r.config.agentUpdateTimeout())
 	defer cancel()
 	var out bytes.Buffer
 	cmd := exec.CommandContext(ctx, r.config.CodexPath, "update")
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		return previous, "", fmt.Errorf("update Codex 失败：%w%s", err, updateOutputDetail(out.String()))
+		return r.finishFailedUpdate(previous, fmt.Errorf("update Codex 失败：%w%s", err, updateOutputDetail(out.String())), recovery, recoveryErr)
 	}
-	return previous, r.Version(parent), nil
+	current := r.Version(context.Background())
+	if current == "" {
+		return r.finishFailedUpdate(previous, errors.New("update Codex 失败：更新后 Codex 未通过健康检查"), recovery, recoveryErr)
+	}
+	return previous, current, nil
+}
+
+func (r *codexCLIRunner) finishFailedUpdate(previous string, updateErr error, recovery npmCLIRecovery, recoveryErr error) (string, string, error) {
+	if r.Version(context.Background()) != "" {
+		return previous, "", updateErr
+	}
+	if recoveryErr != nil {
+		return previous, "", fmt.Errorf("%w；自动回滚不可用：%v", updateErr, recoveryErr)
+	}
+	recovered, err := rollbackInterruptedNpmInstall(recovery.prefix, previous, recovery.install)
+	if err != nil {
+		return previous, "", fmt.Errorf("%w；自动回滚失败：%v", updateErr, err)
+	}
+	if current := r.Version(context.Background()); current != recovered {
+		return previous, "", fmt.Errorf("%w；自动回滚失败：rollback health check failed (version %q)", updateErr, current)
+	}
+	return previous, recovered, fmt.Errorf("%w；已自动回滚到 Codex %s", updateErr, recovered)
+}
+
+var codexNpmCLIInstall = npmCLIInstall{
+	scope: "@openai", packageName: "codex", commandName: "codex", binFile: "codex.js",
+}
+
+func rollbackInterruptedNpmCodexInstall(prefix, previous string) (string, error) {
+	return rollbackInterruptedNpmInstall(prefix, previous, codexNpmCLIInstall)
 }
 
 func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {

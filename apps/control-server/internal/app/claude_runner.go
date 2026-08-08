@@ -247,19 +247,57 @@ func (r *claudeCLIRunner) Update(parent context.Context) (string, string, error)
 	if previous == "" {
 		return "", "", errors.New("Claude Code is not installed")
 	}
-	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+	recovery, recoveryErr := prepareNpmCLIRecovery(parent, r.config.ClaudePath, claudeNpmCLIInstall)
+	ctx, cancel := context.WithTimeout(parent, r.config.agentUpdateTimeout())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "update")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		// 捕获 claude update 的实际输出，失败时把排错信息带给用户，
-		// 而不是只给一个模糊的 "exit status N"。
-		return previous, "", fmt.Errorf("update Claude Code 失败：%w%s", err, updateOutputDetail(out.String()))
+		return r.finishFailedUpdate(previous, fmt.Errorf("update Claude Code 失败：%w%s", err, updateOutputDetail(out.String())), recovery, recoveryErr)
 	}
-	current := r.Version(parent)
+	current := r.Version(context.Background())
+	if current == "" {
+		return r.finishFailedUpdate(previous, errors.New("update Claude Code 失败：更新后 Claude Code 未通过健康检查"), recovery, recoveryErr)
+	}
 	return previous, current, nil
+}
+
+// finishFailedUpdate recovers only a local npm installation verified before
+// the update. npm can leave its previous package beside the incomplete
+// replacement when an update is interrupted after moving the command shim.
+func (r *claudeCLIRunner) finishFailedUpdate(previous string, updateErr error, recovery npmCLIRecovery, recoveryErr error) (string, string, error) {
+	if r.Version(context.Background()) != "" {
+		return previous, "", updateErr
+	}
+	if recoveryErr != nil {
+		return previous, "", fmt.Errorf("%w；自动回滚不可用：%v", updateErr, recoveryErr)
+	}
+	recovered, err := rollbackInterruptedNpmInstall(recovery.prefix, previous, recovery.install)
+	if err != nil {
+		return previous, "", fmt.Errorf("%w；自动回滚失败：%v", updateErr, err)
+	}
+	if current := r.Version(context.Background()); current != recovered {
+		return previous, "", fmt.Errorf("%w；自动回滚失败：rollback health check failed (version %q)", updateErr, current)
+	}
+	return previous, recovered, fmt.Errorf("%w；已自动回滚到 Claude Code %s", updateErr, recovered)
+}
+
+func claudePackageVersion(packageDir string) (string, error) {
+	return npmPackageVersion(packageDir)
+}
+
+var claudeNpmCLIInstall = npmCLIInstall{
+	scope: "@anthropic-ai", packageName: "claude-code", commandName: "claude", binFile: "claude.exe",
+}
+
+func rollbackInterruptedNpmClaudeInstall(prefix, previous string) (string, error) {
+	return rollbackInterruptedNpmInstall(prefix, previous, claudeNpmCLIInstall)
+}
+
+func ensureNpmClaudeCommand(prefix string) error {
+	return ensureNpmCLICommand(prefix, claudeNpmCLIInstall)
 }
 
 // tailUpdateOutput strips control sequences from a failing CLI update and

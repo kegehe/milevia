@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -295,6 +298,7 @@ func TestConfigFromEnvParsesClaudeTurnIdleTimeout(t *testing.T) {
 	t.Setenv("AUTO_CLAUDE_TURN_IDLE_TIMEOUT", "45m")
 	t.Setenv("AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT", "6m")
 	t.Setenv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", "7m")
+	t.Setenv("AUTO_AGENT_UPDATE_TIMEOUT", "16m")
 	config := ConfigFromEnv()
 	if got := config.ClaudeTurnIdleTimeout; got != 45*time.Minute {
 		t.Fatalf("ClaudeTurnIdleTimeout=%s, want 45m", got)
@@ -305,6 +309,9 @@ func TestConfigFromEnvParsesClaudeTurnIdleTimeout(t *testing.T) {
 	if got := config.ClaudeToolResultTimeout; got != 7*time.Minute {
 		t.Fatalf("ClaudeToolResultTimeout=%s, want 7m", got)
 	}
+	if got := config.AgentUpdateTimeout; got != 16*time.Minute {
+		t.Fatalf("AgentUpdateTimeout=%s, want 16m", got)
+	}
 }
 
 func TestConfigFromEnvFallsBackForInvalidClaudeTurnIdleTimeout(t *testing.T) {
@@ -313,6 +320,7 @@ func TestConfigFromEnvFallsBackForInvalidClaudeTurnIdleTimeout(t *testing.T) {
 			t.Setenv("AUTO_CLAUDE_TURN_IDLE_TIMEOUT", value)
 			t.Setenv("AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT", value)
 			t.Setenv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", value)
+			t.Setenv("AUTO_AGENT_UPDATE_TIMEOUT", value)
 			config := ConfigFromEnv()
 			if got := config.ClaudeTurnIdleTimeout; got != defaultClaudeTurnIdleTimeout {
 				t.Fatalf("ClaudeTurnIdleTimeout=%s, want %s", got, defaultClaudeTurnIdleTimeout)
@@ -323,7 +331,119 @@ func TestConfigFromEnvFallsBackForInvalidClaudeTurnIdleTimeout(t *testing.T) {
 			if got := config.ClaudeToolResultTimeout; got != defaultClaudeToolResultTimeout {
 				t.Fatalf("ClaudeToolResultTimeout=%s, want %s", got, defaultClaudeToolResultTimeout)
 			}
+			if got := config.AgentUpdateTimeout; got != defaultAgentUpdateTimeout {
+				t.Fatalf("AgentUpdateTimeout=%s, want %s", got, defaultAgentUpdateTimeout)
+			}
 		})
+	}
+}
+
+func writeNpmClaudeInstall(t *testing.T, dir, version string, executable bool) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"version":"`+version+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mode := os.FileMode(0o644)
+	if executable {
+		mode = 0o755
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "claude.exe"), []byte("test binary"), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRollbackInterruptedNpmClaudeInstall(t *testing.T) {
+	prefix := t.TempDir()
+	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@anthropic-ai")
+	current := filepath.Join(packageRoot, "claude-code")
+	backup := filepath.Join(packageRoot, ".claude-code-previous")
+	writeNpmClaudeInstall(t, current, "2.1.224", false)
+	writeNpmClaudeInstall(t, backup, "2.1.220", true)
+
+	recovered, err := rollbackInterruptedNpmClaudeInstall(prefix, "2.1.220")
+	if err != nil {
+		t.Fatalf("rollback interrupted install: %v", err)
+	}
+	if recovered != "2.1.220" {
+		t.Fatalf("recovered version=%q, want 2.1.220", recovered)
+	}
+	if version, err := claudePackageVersion(current); err != nil || version != "2.1.220" {
+		t.Fatalf("active package version=%q err=%v, want 2.1.220", version, err)
+	}
+	if info, err := os.Stat(filepath.Join(current, "bin", "claude.exe")); err != nil || info.Mode()&0o111 == 0 {
+		t.Fatalf("active binary is not executable: info=%v err=%v", info, err)
+	}
+	link := filepath.Join(prefix, "bin", "claude")
+	if target, err := os.Readlink(link); err != nil || target != "../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" {
+		t.Fatalf("recovered CLI link target=%q err=%v", target, err)
+	}
+	entries, err := os.ReadDir(packageRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundInterrupted := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".claude-code-interrupted-") {
+			foundInterrupted = true
+		}
+	}
+	if !foundInterrupted {
+		t.Fatal("interrupted package was not retained as a rollback backup")
+	}
+}
+
+func TestClaudeUpdateRollsBackInterruptedNpmInstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fixture uses POSIX shell scripts and symlinks")
+	}
+	prefix := t.TempDir()
+	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@anthropic-ai")
+	active := filepath.Join(packageRoot, "claude-code")
+	writeNpmClaudeInstall(t, active, "2.1.220", true)
+	claudeScript := `#!/bin/sh
+case "$1" in
+  --version) echo "2.1.220 (Claude Code)" ;;
+  auth) exit 0 ;;
+  update)
+    mv "$TEST_PACKAGE_ROOT/claude-code" "$TEST_PACKAGE_ROOT/.claude-code-previous"
+    mkdir -p "$TEST_PACKAGE_ROOT/claude-code/bin"
+    printf '{"version":"2.1.224"}' > "$TEST_PACKAGE_ROOT/claude-code/package.json"
+    printf 'interrupted update' > "$TEST_PACKAGE_ROOT/claude-code/bin/claude.exe"
+    mv "$TEST_PREFIX/bin/claude" "$TEST_PREFIX/bin/.claude-interrupted"
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(active, "bin", "claude.exe"), []byte(claudeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", filepath.Join(prefix, "bin", "claude")); err != nil {
+		t.Fatal(err)
+	}
+	npmScript := "#!/bin/sh\nprintf '%s\\n' \"$TEST_PREFIX\"\n"
+	if err := os.WriteFile(filepath.Join(prefix, "bin", "npm"), []byte(npmScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_PREFIX", prefix)
+	t.Setenv("TEST_PACKAGE_ROOT", packageRoot)
+	t.Setenv("PATH", filepath.Join(prefix, "bin")+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	runner := &claudeCLIRunner{config: Config{ClaudePath: "claude", AgentUpdateTimeout: time.Minute}}
+	previous, current, err := runner.Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "已自动回滚到 Claude Code 2.1.220") {
+		t.Fatalf("update error=%v, want rollback result", err)
+	}
+	if previous != "2.1.220" || current != "2.1.220" {
+		t.Fatalf("update versions previous=%q current=%q", previous, current)
+	}
+	if got := runner.Version(context.Background()); got != "2.1.220" {
+		t.Fatalf("recovered CLI version=%q, want 2.1.220", got)
 	}
 }
 

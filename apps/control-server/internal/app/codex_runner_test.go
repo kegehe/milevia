@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -97,6 +98,168 @@ func TestCodexCheckUpdateQueriesOfficialNPMPackage(t *testing.T) {
 	available, latest, err := runner.CheckUpdate(context.Background())
 	if err != nil || !available || latest != "0.146.0" {
 		t.Fatalf("Codex update check: available=%t latest=%q err=%v", available, latest, err)
+	}
+}
+
+func writeNpmCodexInstall(t *testing.T, dir, version string, executable bool) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"version":"`+version+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mode := os.FileMode(0o644)
+	if executable {
+		mode = 0o755
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "codex.js"), []byte("test binary"), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRollbackInterruptedNpmCodexInstall(t *testing.T) {
+	prefix := t.TempDir()
+	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@openai")
+	current := filepath.Join(packageRoot, "codex")
+	backup := filepath.Join(packageRoot, ".codex-previous")
+	writeNpmCodexInstall(t, current, "0.147.0", false)
+	writeNpmCodexInstall(t, backup, "0.146.1", true)
+
+	recovered, err := rollbackInterruptedNpmCodexInstall(prefix, "0.146.1")
+	if err != nil {
+		t.Fatalf("rollback interrupted install: %v", err)
+	}
+	if recovered != "0.146.1" {
+		t.Fatalf("recovered version=%q, want 0.146.1", recovered)
+	}
+	if version, err := npmPackageVersion(current); err != nil || version != "0.146.1" {
+		t.Fatalf("active package version=%q err=%v, want 0.146.1", version, err)
+	}
+	if info, err := os.Stat(filepath.Join(current, "bin", "codex.js")); err != nil || info.Mode()&0o111 == 0 {
+		t.Fatalf("active binary is not executable: info=%v err=%v", info, err)
+	}
+	link := filepath.Join(prefix, "bin", "codex")
+	if target, err := os.Readlink(link); err != nil || target != "../lib/node_modules/@openai/codex/bin/codex.js" {
+		t.Fatalf("recovered CLI link target=%q err=%v", target, err)
+	}
+}
+
+func TestRollbackInterruptedNpmCodexInstallRestoresMissingActivePackage(t *testing.T) {
+	prefix := t.TempDir()
+	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@openai")
+	backup := filepath.Join(packageRoot, ".codex-previous")
+	writeNpmCodexInstall(t, backup, "0.146.1", true)
+
+	recovered, err := rollbackInterruptedNpmCodexInstall(prefix, "0.146.1")
+	if err != nil {
+		t.Fatalf("rollback interrupted install with missing active package: %v", err)
+	}
+	if recovered != "0.146.1" {
+		t.Fatalf("recovered version=%q, want 0.146.1", recovered)
+	}
+	active := filepath.Join(packageRoot, "codex")
+	if version, err := npmPackageVersion(active); err != nil || version != "0.146.1" {
+		t.Fatalf("active package version=%q err=%v, want 0.146.1", version, err)
+	}
+	if target, err := os.Readlink(filepath.Join(prefix, "bin", "codex")); err != nil || target != "../lib/node_modules/@openai/codex/bin/codex.js" {
+		t.Fatalf("recovered CLI link target=%q err=%v", target, err)
+	}
+}
+
+func TestPrepareNpmCLIRecoveryRejectsOtherInstallation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fixture validates POSIX symlink resolution")
+	}
+	prefix := t.TempDir()
+	active := filepath.Join(prefix, "lib", "node_modules", "@openai", "codex")
+	writeNpmCodexInstall(t, active, "0.146.1", true)
+	if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	npmScript := "#!/bin/sh\nprintf '%s\\n' \"$TEST_PREFIX\"\n"
+	if err := os.WriteFile(filepath.Join(prefix, "bin", "npm"), []byte(npmScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_PREFIX", prefix)
+	t.Setenv("PATH", filepath.Join(prefix, "bin")+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	if _, err := prepareNpmCLIRecovery(context.Background(), "/bin/echo", codexNpmCLIInstall); err == nil || !strings.Contains(err.Error(), "does not resolve") {
+		t.Fatalf("prepare recovery error=%v, want command provenance rejection", err)
+	}
+}
+
+func TestRemoteNpmRollbackCommandRestoresMissingActivePackage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fixture uses POSIX shell commands and symlinks")
+	}
+	prefix := t.TempDir()
+	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@openai")
+	backup := filepath.Join(packageRoot, ".codex-previous")
+	writeNpmCodexInstall(t, backup, "0.146.1", true)
+
+	cmd := exec.Command("sh", "-c", remoteNpmRollbackCommand(prefix, "0.146.1", codexNpmCLIInstall))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run remote rollback command: %v\n%s", err, out)
+	}
+	active := filepath.Join(packageRoot, "codex")
+	if version, err := npmPackageVersion(active); err != nil || version != "0.146.1" {
+		t.Fatalf("active package version=%q err=%v, want 0.146.1", version, err)
+	}
+	command := filepath.Join(prefix, "bin", "codex")
+	if target, err := os.Readlink(command); err != nil || target != filepath.Join(active, "bin", "codex.js") {
+		t.Fatalf("recovered remote CLI link target=%q err=%v", target, err)
+	}
+}
+
+func TestCodexUpdateRollsBackInterruptedNpmInstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fixture uses POSIX shell scripts and symlinks")
+	}
+	prefix := t.TempDir()
+	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@openai")
+	active := filepath.Join(packageRoot, "codex")
+	writeNpmCodexInstall(t, active, "0.146.1", true)
+	codexScript := `#!/bin/sh
+case "$1" in
+  --version) echo "codex-cli 0.146.1" ;;
+  update)
+    mv "$TEST_PACKAGE_ROOT/codex" "$TEST_PACKAGE_ROOT/.codex-previous"
+    mkdir -p "$TEST_PACKAGE_ROOT/codex/bin"
+    printf '{"version":"0.147.0"}' > "$TEST_PACKAGE_ROOT/codex/package.json"
+    printf 'interrupted update' > "$TEST_PACKAGE_ROOT/codex/bin/codex.js"
+    mv "$TEST_PREFIX/bin/codex" "$TEST_PREFIX/bin/.codex-interrupted"
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(active, "bin", "codex.js"), []byte(codexScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../lib/node_modules/@openai/codex/bin/codex.js", filepath.Join(prefix, "bin", "codex")); err != nil {
+		t.Fatal(err)
+	}
+	npmScript := "#!/bin/sh\nprintf '%s\\n' \"$TEST_PREFIX\"\n"
+	if err := os.WriteFile(filepath.Join(prefix, "bin", "npm"), []byte(npmScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_PREFIX", prefix)
+	t.Setenv("TEST_PACKAGE_ROOT", packageRoot)
+	t.Setenv("PATH", filepath.Join(prefix, "bin")+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	runner := &codexCLIRunner{config: Config{CodexPath: "codex", AgentUpdateTimeout: time.Minute}}
+	previous, current, err := runner.Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "已自动回滚到 Codex 0.146.1") {
+		t.Fatalf("update error=%v, want rollback result", err)
+	}
+	if previous != "0.146.1" || current != "0.146.1" {
+		t.Fatalf("update versions previous=%q current=%q", previous, current)
+	}
+	if got := runner.Version(context.Background()); got != "0.146.1" {
+		t.Fatalf("recovered CLI version=%q, want 0.146.1", got)
 	}
 }
 
