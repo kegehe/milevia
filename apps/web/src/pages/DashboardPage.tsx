@@ -1,6 +1,7 @@
 // 项目列表页 — 从 App.tsx ProjectDashboard 提取
 
 import { useEffect, useState, useRef, useCallback, useMemo, type DragEvent } from "react";
+import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useProcessStatusMap } from "../components/ProcessStatusProvider";
@@ -117,7 +118,7 @@ export default function DashboardPage() {
       // 后台再拉一次做最终校准，即便被并发轮询的竞态覆盖也不影响即时反馈。
       void refreshProjects();
     } catch (cause) {
-      alert(cause instanceof Error ? cause.message : "无法删除项目");
+      toast.error(cause instanceof Error ? cause.message : "无法删除项目");
     } finally {
       setDeleting(false);
     }

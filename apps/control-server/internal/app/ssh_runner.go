@@ -56,7 +56,7 @@ func remotePathWithinRoot(root, candidate string) bool {
 	return candidate == root || strings.HasPrefix(candidate, root+"/")
 }
 
-func newSSHClient(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
+var newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
 	c := &sshClient{host: conn.Host, port: conn.Port}
 	var auth ssh.AuthMethod
 	if conn.Password != "" {

@@ -93,12 +93,16 @@ func ConfigFromEnv() Config {
 	if codexPath == "" {
 		codexPath = "codex"
 	}
+	claudePath := os.Getenv("AUTO_CLAUDE_PATH")
+	if claudePath == "" {
+		claudePath = "claude"
+	}
 	return Config{
 		DatabasePath:                 db,
 		DataDir:                      dataDir,
 		Mode:                         "web",
 		AllowedRoot:                  root,
-		ClaudePath:                   "claude",
+		ClaudePath:                   claudePath,
 		CodexPath:                    codexPath,
 		PermissionMode:               mode,
 		ControlURL:                   controlURL,
@@ -155,6 +159,7 @@ type Server struct {
 	httpServer             *http.Server
 	runner                 AgentRunner
 	codexRunner            AgentRunner
+	windowsRunner          AgentRunner
 	runnerRegistry         *runnerRegistry
 	runnerMaintenanceMu    sync.Mutex
 	runnerUpdating         map[runnerAgentKey]bool
@@ -732,6 +737,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}", s.getProject)
 	r.Delete("/api/projects/{projectID}", s.deleteProject)
 	r.Patch("/api/projects/{projectID}/agent-profile", s.setProjectDefaultProfile)
+	r.Get("/api/projects/{projectID}/agent-config", s.getProjectAgentConfig)
 	r.Get("/api/projects/{projectID}/git/summary", s.gitSummary)
 	r.Get("/api/projects/{projectID}/git/changes", s.gitChanges)
 	r.Get("/api/projects/{projectID}/git/diff", s.gitDiff)
@@ -1646,8 +1652,8 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	branch, gitReady := gitBranch(r.Context(), path)
-	claudeReady := s.runner.Ready(r.Context())
-	codexReady := s.codexRunner.Ready(r.Context())
+	target := s.resolveAgentTargetEnv(runnerID, path)
+	claudeReady, codexReady := s.agentCLIReady(r.Context(), target)
 	writeJSON(w, http.StatusOK, map[string]any{"path": path, "name": filepath.Base(path), "gitReady": gitReady, "gitBranch": branch, "claudeReady": claudeReady, "codexReady": codexReady, "agentReady": claudeReady || codexReady})
 }
 
@@ -1724,7 +1730,9 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			if lookupErr == nil {
 				existing.RunnerID = existing.Runner
 				s.decorateProjectPresentation(&existing)
-				s.decorateProjectAvailability(&existing, s.codexRunner.Ready(r.Context()))
+				// SSH 项目的 codex 就绪由 decorateProjectAvailability 走 sshCodexReady，
+				// 忽略此参数；传 false 避免对本机 codex 做无意义的探测。
+				s.decorateProjectAvailability(&existing, false)
 				writeJSON(w, http.StatusOK, existing)
 				return
 			}
@@ -1740,10 +1748,10 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	branch, gitReady := gitBranch(r.Context(), path)
-	claudeReady := s.runner.Ready(r.Context())
-	codexReady := s.codexRunner.Ready(r.Context())
+	target := s.resolveAgentTargetEnv(runnerID, path)
+	claudeReady, codexReady := s.agentCLIReady(r.Context(), target)
 	if !claudeReady && !codexReady {
-		writeError(w, http.StatusBadRequest, errors.New("Claude Code and Codex CLI are unavailable in this Runner"))
+		writeError(w, http.StatusBadRequest, errors.New("该 Runner 环境中 Claude Code 与 Codex CLI 均不可用或未登录"))
 		return
 	}
 	name := strings.TrimSpace(input.Name)
@@ -1762,7 +1770,8 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		if lookupErr == nil {
 			existing.RunnerID = existing.Runner
 			s.decorateProjectPresentation(&existing)
-			s.decorateProjectAvailability(&existing, s.codexRunner.Ready(r.Context()))
+			// 传入 createProject 已按目标环境计算的 codexReady，避免对 /mnt/ 项目重复探测本机 codex。
+			s.decorateProjectAvailability(&existing, codexReady)
 			writeJSON(w, http.StatusOK, existing)
 			return
 		}
@@ -1990,6 +1999,9 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	// Cache remote Codex readiness per SSH runner so we don't issue redundant
 	// remote checks when many projects share the same connection.
 	sshCodexCache := map[string]bool{}
+	// Cache the cross-boundary Windows Codex readiness (WSL server + windows target)
+	// so many /mnt/ projects probe the Windows side only once per listing.
+	windowsCodexReady := -1 // -1 = 未缓存（每次首次使用时探测）
 	for rows.Next() {
 		var p Project
 		if err := rows.Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt); err != nil {
@@ -1998,7 +2010,16 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		p.RunnerID = p.Runner
 		s.decorateProjectPresentation(&p)
-		if isLocalRunnerID(p.Runner) {
+		if isLocalRunnerID(p.Runner) && s.resolveAgentTargetEnv(p.Runner, p.Path) == agentTargetEnvWindows && runtime.GOOS != "windows" {
+			if windowsCodexReady < 0 {
+				windowsCodexReady = 0
+				if s.codexReadyForTarget(r.Context(), agentTargetEnvWindows) {
+					windowsCodexReady = 1
+				}
+			}
+			p.CodexReady = windowsCodexReady == 1
+			p.AgentReady = p.ClaudeReady || p.CodexReady
+		} else if isLocalRunnerID(p.Runner) {
 			s.decorateProjectAvailability(&p, localCodexReady)
 		} else if strings.HasPrefix(p.Runner, "ssh-") {
 			if cached, ok := sshCodexCache[p.Runner]; ok {
@@ -2103,10 +2124,23 @@ func (s *Server) setProjectDefaultProfile(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{"profileId": profileID})
 }
 
+// decorateProjectAvailability fills a project's Codex and combined Agent readiness
+// by the project's own target environment (docs/20). localCodexReady is a cached
+// probe for the server-local environment used by listProjects; for projects whose
+// target environment differs from the server (e.g. WSL server + /mnt/ project),
+// the readiness is probed against that environment so the UI never reports "ready"
+// for a CLI that actually lives on the other side.
 func (s *Server) decorateProjectAvailability(project *Project, localCodexReady bool) {
 	switch {
 	case isLocalRunnerID(project.Runner):
-		project.CodexReady = localCodexReady
+		target := s.resolveAgentTargetEnv(project.Runner, project.Path)
+		if target == agentTargetEnvWSL || (target == agentTargetEnvWindows && runtime.GOOS == "windows") {
+			project.CodexReady = localCodexReady
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			project.CodexReady = s.codexReadyForTarget(ctx, target)
+		}
 	case strings.HasPrefix(project.Runner, "ssh-"):
 		project.CodexReady = s.sshCodexReady(project.Runner)
 	default:
@@ -2135,10 +2169,9 @@ func (s *Server) sshCodexReady(runnerID string) bool {
 func (s *Server) decorateProjectPresentation(project *Project) {
 	project.FullPath = project.Path
 	project.PathDisplay = filepath.Base(project.Path)
-	project.Environment = "wsl"
-	if strings.HasPrefix(project.Path, "/mnt/") {
-		project.Environment = "windows"
-	}
+	// Environment 由项目 Runner 与路径解析出的 Agent 目标环境如实推导（docs/20 §3.5），
+	// 不再用 /mnt/ 前缀单独猜测。
+	project.Environment = string(s.resolveAgentTargetEnv(project.Runner, project.Path))
 	if !strings.HasPrefix(project.Runner, "ssh-") {
 		return
 	}
@@ -2217,7 +2250,8 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var projectRunner string
-	if err := s.db.QueryRowContext(r.Context(), `select coalesce(nullif(runner_id,''),runner) from projects where id=?`, projectID).Scan(&projectRunner); errors.Is(err, sql.ErrNoRows) {
+	var projectPathForTarget string
+	if err := s.db.QueryRowContext(r.Context(), `select coalesce(nullif(runner_id,''),runner),path from projects where id=?`, projectID).Scan(&projectRunner, &projectPathForTarget); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("project not found"))
 		return
 	} else if err != nil {
@@ -2261,7 +2295,14 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, profileErr)
 				return
 			}
-			if !s.codexUsableForProfile(r.Context(), profile) {
+			target := s.resolveAgentTargetEnv(projectRunner, projectPathForTarget)
+			if target == agentTargetEnvWindows && runtime.GOOS != "windows" {
+				// 跨端 Codex：按 Windows 目标环境探测，未就绪如实报错，不静默回退 WSL。
+				if !s.codexReadyForTarget(r.Context(), target) {
+					writeError(w, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Codex"))
+					return
+				}
+			} else if !s.codexUsableForProfile(r.Context(), profile) {
 				writeError(w, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in"))
 				return
 			}
@@ -3420,41 +3461,49 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if record != nil && record.WorktreePath != "" {
 		projectPath = record.WorktreePath
 	}
-	if runtime.GOOS == "windows" && projectRunner == "wsl-local" {
-		return Message{}, "", nil, http.StatusServiceUnavailable,
-			errors.New("该项目使用旧 WSL Runner；请先配置对应的 WSL 发行版 Runner")
-	}
-	// Select the runner for this specific project.
-	// For SSH and other non-default runners, use the registry. For the built-in
-	// local runner, prefer s.runner directly (tests may replace it).
-	runnerObj := s.runner // default to the server-level runner
-	if conversation.AgentID == "codex" {
-		if strings.HasPrefix(projectRunner, "ssh-") {
-			r, ok := s.runnerRegistry.get(projectRunner)
-			if !ok {
-				return Message{}, "", nil, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试")
+	// Select the runner for this specific project by its target environment
+	// (docs/20 §3.3). SSH projects resolve through the registry; local Windows/WSL
+	// projects route to the runner for their resolved target environment so a
+	// Windows project drives the Windows-side CLI and never silently falls back to
+	// the WSL-side one.
+	target := s.resolveAgentTargetEnv(projectRunner, projectPath)
+	isSSH := strings.HasPrefix(projectRunner, "ssh-")
+	runnerObj := s.runner // default to the server-level runner (tests may replace it)
+	switch {
+	case conversation.AgentID == "codex" && isSSH:
+		r, ok := s.runnerRegistry.get(projectRunner)
+		if !ok {
+			return Message{}, "", nil, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试")
+		}
+		codexR, ok := r.(CodexCapableRunner)
+		if !ok || !codexR.CodexReady(ctx) {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("远程服务器上 Codex CLI 不可用或未登录")
+		}
+		runnerObj = r
+	case conversation.AgentID == "codex":
+		if target == agentTargetEnvWindows && runtime.GOOS != "windows" {
+			// 跨端 Codex：经 Windows Agent Runner 驱动，未就绪如实报错，不静默回退 WSL。
+			if !s.codexReadyForTarget(ctx, target) {
+				return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Codex")
 			}
-			codexR, ok := r.(CodexCapableRunner)
-			if !ok || !codexR.CodexReady(ctx) {
-				return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("远程服务器上 Codex CLI 不可用或未登录")
-			}
-			runnerObj = r
+			runnerObj = s.codexRunnerFor(target)
 		} else {
 			if !s.codexUsableForProfile(ctx, profile) {
-				return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Codex CLI is unavailable or not logged in")
+				return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Codex")
 			}
 			runnerObj = s.codexRunner
 		}
-	}
-	if conversation.AgentID != "codex" && strings.HasPrefix(projectRunner, "ssh-") {
+	case conversation.AgentID != "codex" && isSSH:
 		r, ok := s.runnerRegistry.get(projectRunner)
 		if !ok {
 			return Message{}, "", nil, http.StatusServiceUnavailable, fmt.Errorf("SSH 连接不可用，请重新连接后再试")
 		}
 		runnerObj = r
+	default:
+		runnerObj = s.agentClaudeRunnerFor(target)
 	}
 	if conversation.AgentID == "claude-code" && !runnerObj.Ready(ctx) {
-		return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("Claude Code is unavailable or not logged in")
+		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Claude Code")
 	}
 	streamingRunner, streaming := runnerObj.(StreamingAgentRunner)
 	// Codex runs one-shot turns (non-streaming) even on SSH runners, which

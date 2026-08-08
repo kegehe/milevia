@@ -1,0 +1,27 @@
+/* 项目 AI 配置弹窗 — 复刻会话页的绿色 studio 色板 */
+.project-config-dialog { width: min(560px, 100%); color: #19332c; background: #fcfefc; }
+.project-config-dialog > header { border-bottom-color: #dcebe1; padding: 16px 18px; }
+.project-config-heading { display: flex; min-width: 0; align-items: center; gap: 12px; }
+.project-config-mark { display: grid; width: 34px; height: 34px; flex: none; place-items: center; border-radius: 8px; color: #19332c; background: #d9f0b8; }
+.project-config-mark svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+.project-config-heading label { color: #6d8494; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.project-config-heading h2 { margin: 2px 0 0; color: #19332c; font-size: 18px; }
+.project-config-close { display: grid; width: 30px; height: 30px; min-width: 0; box-sizing: border-box; flex: none; place-items: center; border: 1px solid #d0e1d8; border-radius: 6px; padding: 0; color: #668176; background: #fcfefc; font: 19px/1 ui-sans-serif, system-ui, sans-serif; transition: border-color .16s ease, color .16s ease, background .16s ease; }.project-config-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }
+.project-config-intro { padding: 14px 18px 0; color: #5f7169; font-size: 12.5px; line-height: 1.55; }
+.project-config-error { margin: 12px 18px 0; border: 1px solid #f3aa9a; padding: 9px 11px; color: #8c2d21; background: #fff0ed; font-size: 12.5px; }
+.project-config-notice { margin: 12px 18px 0; border: 1px solid #bfe6cd; padding: 9px 11px; color: #1d6a4e; background: #eaf9ef; font-size: 12.5px; }
+.project-config-loading { padding: 32px 18px; color: #637a70; text-align: center; font-size: 13px; }
+.project-config-agents { display: grid; gap: 14px; padding: 16px 18px; }
+.project-config-agent { border: 1px solid #dcebe1; border-radius: 9px; padding: 14px; background: #fff; box-shadow: 0 1px 2px #17362c0a; }
+.project-config-agent.is-default { border-color: #9bc4af; background: #f2faf4; }
+.project-config-agent > header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; border: 0; padding: 0 0 10px; }.project-config-agent > header b { color: #19332c; font-size: 13.5px; }.project-config-agent > header small { color: #6d8494; font-size: 11.5px; }
+.project-config-fields { display: grid; gap: 11px; }
+.project-config-field { display: grid; gap: 5px; color: #49665c; font-size: 12px; }
+.project-config-field > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }.project-config-field > span small { color: #8aa093; font-size: 11px; }
+.project-config-field input { min-height: 36px; box-sizing: border-box; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 10px; color: #19332c; background: #fff; font: 13px ui-sans-serif, system-ui, sans-serif; }.project-config-field input:focus { border-color: #7fae9d; outline: 2px solid #d5ebe0; }
+.project-config-authmode { display: flex; gap: 6px; }.project-config-authmode button { min-height: 32px; flex: 1; border: 1px solid #c8dcd1; border-radius: 6px; padding: 6px 10px; color: #49665c; background: #f7fbf8; font-size: 12px; cursor: pointer; }.project-config-authmode button.active { border-color: #2c7567; color: #fff; background: #2c7567; }.project-config-authmode button:disabled { opacity: .6; cursor: default; }
+.project-config-agent > footer { border: 0; padding: 12px 0 0; justify-content: flex-end; }.project-config-agent > footer .primary { border-color: #9fbd46; color: #19332c; background: #c8e85a; font-weight: 700; }.project-config-agent > footer .primary:hover:not(:disabled) { background: #d8f47b; }
+.project-config-clear { padding: 0 18px 14px; }.project-config-clear .secondary { color: #9b4632; border-color: #ecc7bc; background: #fff6f2; }
+.project-config-dialog-footer { border-top-color: #dcebe1; padding: 14px 18px; }.project-config-dialog-footer .secondary { border-color: #c8dcd1; color: #31594f; background: #f7fbf8; }
+.project-config-remote { padding: 22px 20px; color: #5f7169; font-size: 13px; line-height: 1.6; }.project-config-remote p { margin: 0 0 18px; }.project-config-remote p strong { color: #19332c; }
+@media (max-width: 520px) { .project-config-agents { padding: 14px; }.project-config-agent { padding: 12px; } }

@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import type { AgentID, AgentProfile, RunnerInfo } from "../lib/types";
 import "../agent-profiles.css";
 
@@ -16,6 +17,9 @@ type ProfileDraft = {
 const emptyDraft = (): ProfileDraft => ({ agentId: "claude-code", name: "", model: "", authMode: "cli_managed" });
 const draftForProfile = (profile: AgentProfile): ProfileDraft => ({ id: profile.id, agentId: profile.agentId, name: profile.name, model: profile.model || "", authMode: "cli_managed" });
 
+// 停用/撤销的二次确认：仅记录「动作 + 目标档案」，实际执行在确认后由 runPending 完成。
+type PendingConfirm = { kind: "disable" | "revoke"; profile: AgentProfile };
+
 export default function AgentProfilesPage() {
   const navigate = useNavigate();
   const [runners, setRunners] = useState<RunnerInfo[]>([]);
@@ -27,6 +31,8 @@ export default function AgentProfilesPage() {
   const [testingID, setTestingID] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   useEffect(() => {
     void api<RunnerInfo[]>("/api/runners").then((items) => {
@@ -91,14 +97,12 @@ export default function AgentProfilesPage() {
     }
   };
 
-  const disable = async (profile: AgentProfile) => {
-    if (!window.confirm(`停用“${profile.name}”？现有会话不受影响。`)) return;
-    try {
-      await api(`/api/agent-profiles/${profile.id}/disable`, { method: "POST" });
-      await refreshProfiles();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "无法停用配置档案");
-    }
+  const disable = (profile: AgentProfile) => {
+    setPendingConfirm({ kind: "disable", profile });
+  };
+
+  const revoke = (profile: AgentProfile) => {
+    setPendingConfirm({ kind: "revoke", profile });
   };
 
   const enable = async (profile: AgentProfile) => {
@@ -110,20 +114,35 @@ export default function AgentProfilesPage() {
     }
   };
 
-  const revoke = async (profile: AgentProfile) => {
-    if (!window.confirm(`撤销“${profile.name}”的当前版本会停止使用该版本的运行。此操作不可恢复。`)) return;
+  // 二次确认后真正执行停用/撤销，busy 状态由 confirming 控制。
+  const runPending = async () => {
+    if (!pendingConfirm || confirming) return;
+    setConfirming(true);
+    const { kind, profile } = pendingConfirm;
     try {
-      await api(`/api/agent-profile-revisions/${profile.currentRevisionId}/revoke`, { method: "POST" });
+      if (kind === "disable") {
+        await api(`/api/agent-profiles/${profile.id}/disable`, { method: "POST" });
+      } else {
+        await api(`/api/agent-profile-revisions/${profile.currentRevisionId}/revoke`, { method: "POST" });
+      }
+      setPendingConfirm(null);
       await refreshProfiles();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "无法撤销配置档案版本");
+      setError(cause instanceof Error ? cause.message : kind === "disable" ? "无法停用配置档案" : "无法撤销配置档案版本");
+    } finally {
+      setConfirming(false);
     }
+  };
+
+  const closeConfirm = () => {
+    if (confirming) return;
+    setPendingConfirm(null);
   };
 
   return <main className="app-shell agent-profiles-page">
     <header className="agent-profiles-head">
       <button className="secondary" type="button" onClick={() => navigate(-1)}>返回</button>
-      <div><h1>AI 配置档案</h1><p>未选档案时继续使用原有 CLI 配置。</p></div>
+      <div><h1>AI 配置管理</h1><p>高级管理视图：项目级配置请用「会话页 → AI 配置」。此处可停用 / 撤销版本。</p></div>
       <label>Runner<select value={runnerID} onChange={(event) => { setRunnerID(event.target.value); setDraft(null); setNotice(""); }} disabled={runners.length === 0}>{runners.map((runner) => <option key={runner.id} value={runner.id}>{runner.name}</option>)}</select></label>
     </header>
     {error && <div className="agent-profiles-error" role="alert">{error}</div>}
@@ -151,5 +170,16 @@ export default function AgentProfilesPage() {
       </div>
       <footer><button type="button" className="secondary" disabled={saving} onClick={() => setDraft(null)}>取消</button><button className="primary" disabled={saving}>{saving ? "保存中" : "保存"}</button></footer>
     </form></div>}
+    {pendingConfirm && <ConfirmDialog
+      title={pendingConfirm.kind === "disable" ? "停用配置档案" : "撤销配置档案版本"}
+      message={pendingConfirm.kind === "disable"
+        ? <>停用“<b>{pendingConfirm.profile.name}</b>”？现有会话不受影响。</>
+        : <>撤销“<b>{pendingConfirm.profile.name}</b>”的当前版本会停止使用该版本的运行。此操作不可恢复。</>}
+      confirmLabel={pendingConfirm.kind === "disable" ? "停用" : "撤销"}
+      danger={pendingConfirm.kind === "revoke"}
+      busy={confirming}
+      onConfirm={runPending}
+      onCancel={closeConfirm}
+    />}
   </main>;
 }

@@ -39,25 +39,28 @@ type SSHConnection struct {
 	UpdatedAt      time.Time  `json:"updatedAt"`
 }
 
-// sanitizedSSHConnection returns a copy safe to expose via the API (private key
-// path, password and known_hosts redacted).
+// sanitizedSSHConnection returns a copy safe to expose via the API. The private
+// key path (a filesystem location, not key material) is exposed so edits can
+// re-preflight without re-entering it; the password and known_hosts remain
+// redacted.
 func sanitizedSSHConnection(c SSHConnection) map[string]any {
 	authMethod := "key"
 	if c.Password != "" {
 		authMethod = "password"
 	}
 	return map[string]any{
-		"id":         c.ID,
-		"name":       c.Name,
-		"host":       c.Host,
-		"port":       c.Port,
-		"user":       c.User,
-		"authMethod": authMethod,
-		"rootPath":   c.RootPath,
-		"status":     c.Status,
-		"lastSeen":   c.LastSeen,
-		"errorMsg":   c.ErrorMsg,
-		"createdAt":  c.CreatedAt,
+		"id":             c.ID,
+		"name":           c.Name,
+		"host":           c.Host,
+		"port":           c.Port,
+		"user":           c.User,
+		"authMethod":     authMethod,
+		"privateKeyPath": c.PrivateKeyPath,
+		"rootPath":       c.RootPath,
+		"status":         c.Status,
+		"lastSeen":       c.LastSeen,
+		"errorMsg":       c.ErrorMsg,
+		"createdAt":      c.CreatedAt,
 	}
 }
 
@@ -69,6 +72,7 @@ func (s *Server) registerSSHRoutes(r chi.Router) {
 	r.Get("/api/ssh-connections", s.listSSHConnections)
 	r.Post("/api/ssh-connections", s.createSSHConnection)
 	r.Get("/api/ssh-connections/{connectionID}", s.getSSHConnection)
+	r.Put("/api/ssh-connections/{connectionID}", s.updateSSHConnection)
 	r.Delete("/api/ssh-connections/{connectionID}", s.deleteSSHConnection)
 	r.Post("/api/ssh-connections/{connectionID}/test", s.testSSHConnection)
 	r.Post("/api/ssh-connections/{connectionID}/connect", s.connectSSHConnection)
@@ -258,10 +262,32 @@ func (s *Server) getSSHProfile(w http.ResponseWriter, r *http.Request) {
 
 // preflightSSHConnection verifies the selected profile or manual settings
 // before they are persisted. The returned host key must be confirmed on save.
+// When connectionId is supplied (edit mode), stored secrets are reused so the
+// preflight can actually connect without re-entering the password or key path.
 func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) {
 	var input sshConnectionInput
 	if !decode(w, r, &input) {
 		return
+	}
+	if strings.TrimSpace(input.ConnectionID) != "" {
+		input.Update = true
+		existing, err := s.loadSSHConnection(r.Context(), strings.TrimSpace(input.ConnectionID))
+		if err == nil {
+			// 凭据不回显到前端，编辑预检时沿用已保存的密码/私钥路径，使预检能真正连上远端。
+			// 仅补全当前认证方式对应的凭据，切换认证方式时不携带旧凭据，避免 newSSHClient
+			// 因残留密码而误用密码认证。
+			if input.AuthMethod == "password" {
+				if strings.TrimSpace(input.Password) == "" {
+					input.Password = existing.Password
+				}
+				input.PrivateKeyPath = ""
+			} else {
+				input.Password = ""
+				if strings.TrimSpace(input.PrivateKeyPath) == "" {
+					input.PrivateKeyPath = existing.PrivateKeyPath
+				}
+			}
+		}
 	}
 	if err := input.resolve(); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -360,6 +386,8 @@ type sshConnectionInput struct {
 	ProfileName    string `json:"profileName"`
 	HostKey        string `json:"hostKey"`
 	Connect        bool   `json:"connect"`
+	ConnectionID   string `json:"connectionId"`
+	Update         bool   `json:"-"`
 }
 
 func (input *sshConnectionInput) resolve() error {
@@ -375,11 +403,17 @@ func (input *sshConnectionInput) resolve() error {
 	}
 	if input.AuthMethod == "password" {
 		if strings.TrimSpace(input.Password) == "" {
-			return errors.New("请输入密码")
+			// During an edit the existing password is preserved when the user does
+			// not supply a new one — see updateSSHConnection.
+			if !input.Update {
+				return errors.New("请输入密码")
+			}
 		}
 	} else {
 		if strings.TrimSpace(input.PrivateKeyPath) == "" && os.Getenv("SSH_AUTH_SOCK") == "" {
-			return errors.New("请指定私钥路径，或启动并配置 SSH Agent")
+			if !input.Update {
+				return errors.New("请指定私钥路径，或启动并配置 SSH Agent")
+			}
 		}
 	}
 	if input.Port <= 0 || input.Port > 65535 {
@@ -422,23 +456,103 @@ func (s *Server) createSSHConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := input.connection()
-	_, err := s.db.ExecContext(r.Context(), `insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at,password) values (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	s.saveSSHConnection(w, r, &c, input.Connect)
+}
+
+// updateSSHConnection edits an existing SSH connection. Identity and creation
+// time are preserved; a blank password/private key (kept secret from the API)
+// is carried over from the stored row so editing other fields does not erase
+// the saved credentials.
+func (s *Server) updateSSHConnection(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "connectionID")
+	// Replacing the underlying SSH client tears down remote sessions, so editing
+	// a connected runner must be serialized against run admission and deletion.
+	// The lock is held across load+save so a concurrent delete cannot revive the
+	// row via the upsert below (TOCTOU).
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
+	existing, err := s.loadSSHConnection(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("SSH connection not found"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var input sshConnectionInput
+	if !decode(w, r, &input) {
+		return
+	}
+	input.Update = true
+	if err := input.resolve(); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := parsePinnedHostKey(input.HostKey); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("请先完成预检并确认远端主机指纹"))
+		return
+	}
+	c := input.connection()
+	c.ID = existing.ID
+	c.CreatedAt = existing.CreatedAt
+	// 沿用原有凭据：预检/编辑表单不回显已保存的密码或私钥，留空即表示保持原值。
+	// 切换认证方式时，清除不再使用的那一侧凭据，避免残留旧的密码或私钥。
+	if input.AuthMethod == "password" {
+		if strings.TrimSpace(input.Password) == "" {
+			c.Password = existing.Password
+		}
+		c.PrivateKeyPath = ""
+	} else {
+		c.Password = ""
+		if strings.TrimSpace(input.PrivateKeyPath) == "" {
+			c.PrivateKeyPath = existing.PrivateKeyPath
+		}
+	}
+	knownHosts := strings.TrimSpace(input.HostKey)
+	if knownHosts == "" {
+		knownHosts = existing.KnownHosts
+	}
+	c.KnownHosts = knownHosts
+
+	if err := s.ensureSSHRunnerInactive(r.Context(), "ssh-"+c.ID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	s.saveSSHConnection(w, r, &c, input.Connect)
+}
+
+// saveSSHConnection persists (inserts or updates) a connection and optionally
+// connects it, writing the shared success/error handling. The connection struct
+// must already carry its final ID and secrets.
+func (s *Server) saveSSHConnection(w http.ResponseWriter, r *http.Request, c *SSHConnection, connect bool) {
+	_, err := s.db.ExecContext(r.Context(), `
+		insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at,password)
+		values (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		on conflict(id) do update set
+			name=excluded.name, host=excluded.host, port=excluded.port, user=excluded.user,
+			private_key_path=excluded.private_key_path, known_hosts=excluded.known_hosts,
+			root_path=excluded.root_path, updated_at=excluded.updated_at, password=excluded.password`,
 		c.ID, c.Name, c.Host, c.Port, c.User, c.PrivateKeyPath, c.KnownHosts, c.RootPath, c.Status, c.ErrorMsg, c.CreatedAt, c.UpdatedAt, c.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("save ssh connection: %w", err))
 		return
 	}
 
-	if input.Connect {
-		if err := s.tryConnectAndRegister(r.Context(), &c); err != nil {
-			// Save the error message but don't fail the whole request — the connection
-			// config is persisted so the user can adjust and retry.
-			c.Status = "error"
-			c.ErrorMsg = errorText(err)
-			s.db.ExecContext(r.Context(), `update ssh_connections set status=?,error_msg=?,updated_at=? where id=?`, c.Status, c.ErrorMsg, time.Now().UTC(), c.ID)
+	if connect {
+		if err := s.tryConnectAndRegister(r.Context(), c); err != nil {
+			// tryConnectAndRegister already wrote the correct status: "error" when no
+			// prior runner survived, or left "connected" untouched when the old runner
+			// is still alive. Reload that authoritative status instead of overwriting
+			// it here — clobbering would mislabel a still-connected runner as errored.
+			var status, errorMsg string
+			if rowErr := s.db.QueryRowContext(r.Context(), `select status,error_msg from ssh_connections where id=?`, c.ID).Scan(&status, &errorMsg); rowErr == nil {
+				c.Status = status
+				c.ErrorMsg = errorMsg
+			}
 		}
 	}
-	writeJSON(w, http.StatusCreated, sanitizedSSHConnection(c))
+	writeJSON(w, http.StatusOK, sanitizedSSHConnection(*c))
 }
 
 func (s *Server) deleteSSHConnection(w http.ResponseWriter, r *http.Request) {
