@@ -1,0 +1,11 @@
+{
+  "version": "0.1.0",
+  "notes": "Milevia 0.1.0 初次打包验证",
+  "pub_date": "2026-08-10T08:29:42.120Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczZlQVRIWkZ3U1lUY0dodG92TG9nLzJrRjUydzhzZHlIMmExNWZtSkNpOUx3MHlpWG0wb3V5TXpwcDNDU1ZRWFdob0xIZHNHd3dFYkE2N2RqVk45UXd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MzUwNTgyCWZpbGU6TWlsZXZpYV8wLjEuMF94NjQtc2V0dXAuZXhlCnZJT0VQMUFiY0E5bkRVM0dNRjlQdjZ6ZVNzd0hvUXlRRDBGcDdxWng3cXNQRjN5ZDB5bS8ycEdUWE80NFQ4bUZnbDdIVmlCYnlaNUNNQzFLZ0pvQkFRPT0K",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.0/Milevia_0.1.0_x64-setup.exe"
+    }
+  }
+}

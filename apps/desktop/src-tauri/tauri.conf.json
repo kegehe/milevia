@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm --dir ../web dev --host 127.0.0.1 --port 1420 --strictPort",
     "devUrl": "http://127.0.0.1:1420",
-    "frontendDist": "../web/dist"
+    "frontendDist": "../../web/dist"
   },
   "app": {
     "windows": [],
@@ -16,8 +16,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
-    "icon": ["icons/icon.ico"],
+    "targets": [
+      "nsis",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
     "resources": {
       "../binaries/milevia-control.exe": "milevia-control.exe",
       "../binaries/milevia-approval.exe": "milevia-approval.exe"
@@ -26,6 +31,14 @@
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIzRTA5REEyMEI3OTlEMjEKUldRaG5Ya0xvcDNnczVlUXBncU90d2lwRnVWaStqNlZXeTBLUWpTYVY2b2M2Vy9LR0paS3NrZWsK",
+      "endpoints": [
+        "https://kegehe.github.io/milevia/latest.json"
+      ]
     }
   }
 }

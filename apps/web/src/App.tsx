@@ -16,6 +16,7 @@ import GitWorkbenchPage from "./pages/GitWorkbenchPage";
 import ProjectRunPage from "./pages/ProjectRunPage";
 import FilesPage from "./pages/FilesPage";
 import AgentProfilesPage from "./pages/AgentProfilesPage";
+import { UpdateBanner } from "./features/updater/UpdateBanner";
 
 declare global {
   interface Window {
@@ -44,6 +45,7 @@ export function App() {
           <ProcessStatusProvider>
           <ProjectProvider>
             <NavigationBridge />
+            <UpdateBanner />
             <Routes>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/projects/import" element={<ImportProjectPage />} />

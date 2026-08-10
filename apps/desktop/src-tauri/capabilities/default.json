@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Milevia desktop window permissions",
   "windows": ["main", "tray-panel"],
-  "permissions": ["core:default", "core:window:allow-close", "core:window:allow-hide", "core:window:allow-show"]
+  "permissions": ["core:default", "core:window:allow-close", "core:window:allow-hide", "core:window:allow-show", "updater:default"]
 }

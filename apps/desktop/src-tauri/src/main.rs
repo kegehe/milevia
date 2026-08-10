@@ -14,9 +14,10 @@ use tauri::{
     image::Image,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::NewWindowResponse,
-    LogicalPosition, LogicalSize, Manager, PhysicalPosition, RunEvent, WebviewUrl,
+    Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, RunEvent, WebviewUrl,
     WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_updater::UpdaterExt;
 use url::Url;
 use uuid::Uuid;
 
@@ -34,6 +35,81 @@ struct ManagedSidecar(Mutex<Option<RunningSidecar>>);
 
 /// 记住最近一次托盘点击的鼠标位置（物理像素），供面板内容加载后按实际高度重新贴齐。
 struct TrayAnchor(Mutex<Option<PhysicalPosition<f64>>>);
+
+/// 向主窗口上报的可序列化升级信息。仅在有新版时存在。
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    /// 本机已安装版本
+    current_version: String,
+    /// 服务器发布的新版本
+    version: String,
+    /// 更新日志（可能为空）
+    notes: Option<String>,
+}
+
+/// 启动时后台查询到的升级结果缓存；`None` 表示暂无可升级信息。
+struct UpdateCheck(Mutex<Option<UpdateInfo>>);
+
+/// 静默拉取升级清单：成功且有新版则缓存信息，任何错误都吞掉（不阻断启动）。
+fn prime_update_check(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(updater) = app.updater() else {
+            return;
+        };
+        let Ok(Some(update)) = updater.check().await else {
+            return;
+        };
+        let info = UpdateInfo {
+            current_version: update.current_version,
+            version: update.version,
+            notes: update.body.clone(),
+        };
+        *app.state::<UpdateCheck>().0.lock().expect("update state lock") = Some(info);
+    });
+}
+
+/// 查询升级状态：返回本机版本号 + 是否发现新版本。前端启动时轮询一次。
+#[tauri::command]
+fn get_updater_status(app: tauri::AppHandle) -> UpdateInfoRepr {
+    let cached = app.state::<UpdateCheck>().0.lock().expect("update state lock").clone();
+    UpdateInfoRepr {
+        app_version: app.package_info().version.to_string(),
+        update: cached,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfoRepr {
+    app_version: String,
+    update: Option<UpdateInfo>,
+}
+
+/// 下载并安装新版本，结束后重启应用。期间通过 `updater://progress` 事件回报进度。
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|error| error.to_string())?;
+    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    update
+        .download_and_install(
+            |received, total| {
+                let _ = app.emit(
+                    "updater://progress",
+                    serde_json::json!({ "received": received, "total": total }),
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    app.restart();
+    #[allow(unreachable_code)]
+    Ok(())
+}
 
 const TRAY_PANEL_LABEL: &str = "tray-panel";
 /// 面板初始宽度/高度（仅作建窗时的初始值，前端随后按内容自适应覆盖）。
@@ -586,16 +662,20 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             show_main_window,
             close_panel,
             quit_app,
             set_panel_size,
-            navigate_main
+            navigate_main,
+            get_updater_status,
+            install_update
         ])
         .setup(|app| {
             app.manage(ManagedSidecar(Mutex::new(None)));
             app.manage(TrayAnchor(Mutex::new(None)));
+            app.manage(UpdateCheck(Mutex::new(None)));
             let sidecar = start_sidecar(&app.handle()).map_err(|error| error.to_string())?;
             if let Err(error) = create_main_window(&app.handle(), &sidecar) {
                 let mut sidecar = sidecar;
@@ -617,6 +697,8 @@ fn main() {
             if let Err(error) = restore_or_create_panel(&app.handle(), &panel_api_base, &panel_session_token) {
                 eprintln!("[tray-panel] 预建面板失败（首次点击时将重建）: {error}");
             }
+            // 后台静默检查更新，结果供主窗 `get_updater_status` 查询。
+            prime_update_check(&app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())

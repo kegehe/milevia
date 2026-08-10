@@ -10,6 +10,7 @@ import type { Project, ProjectFilter, ProjectStatus } from "../lib/types";
 import type { RunStatus } from "../features/run/run-model";
 import { statusColors, statusLabels } from "../features/run/run-model";
 import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order";
+import { AppVersionTag } from "../features/updater/AppVersionTag";
 
 function WindowsEnvironmentIcon() {
   return <svg className="env-tag-icon windows" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4v7H3v-5.5ZM13 3.5 21 2v9h-8v-7.5ZM3 13h7.5v7L3 18.5V13ZM13 13h8v9l-8-1.5V13Z" /></svg>;
@@ -129,6 +130,7 @@ export default function DashboardPage() {
     <header className="dashboard-bar">
       <a className="brand" href="/"><img className="brand-mark" src="/milevia-mark.svg" width="42" height="42" alt="" /><span className="brand-word"><strong>Mile</strong><em>via</em></span></a>
       <div className="dashboard-actions">
+        <AppVersionTag />
         <NotificationCenter />
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
