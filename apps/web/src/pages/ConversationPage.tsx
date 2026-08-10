@@ -23,6 +23,7 @@ import type {
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
   AgentExecution, RunUsage, ConversationUsageResponse,
   RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
+  Skill,
 } from "../lib/types";
 import { api, asRecord } from "../lib/api";
 import { createWebSocket } from "../lib/runtime";
@@ -116,6 +117,10 @@ function ShortcutCategoryIcon({ kind }: { kind: "prompt" | "command" }) {
 
 function ShortcutAddIcon() {
   return <svg className="quick-tag-control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>;
+}
+
+function SkillTagIcon() {
+  return <svg className="quick-tag-heading-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 3.5h5l1 4.3 3.6 2.6-1.6 5.8-4.5.4-1 4.9h-5l-1-4.9-4.5-.4-1.6-5.8 3.6-2.6 1-4.3Z" /><circle cx="12" cy="9.6" r="1.6" /></svg>;
 }
 
 function ShortcutMoreIcon() {
@@ -722,6 +727,10 @@ export default function ConversationPage() {
   const [activatingConversation, setActivatingConversation] = useState("");
   const [usage, setUsage] = useState<ConversationUsageResponse | null>(null);
   const [shortcuts, setShortcuts] = useState<Shortcut[]>([]);
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  // 技能按来源分组后，各来源组的折叠状态。插件组（系统/官方自带，含大量 marketplace 样板）默认折叠。
+  const [skillGroupsCollapsed, setSkillGroupsCollapsed] = useState<Partial<Record<Skill["source"], boolean>>>({ plugin: true });
   const [shortcutEditor, setShortcutEditor] = useState<ShortcutEditorState | null>(null);
   const [shortcutVariables, setShortcutVariables] = useState<{ shortcut: Shortcut; variables: Record<string, string> } | null>(null);
   const [shortcutBusy, setShortcutBusy] = useState("");
@@ -997,6 +1006,24 @@ export default function ConversationPage() {
     })();
     return () => { cancelled = true; };
   }, [fail, refreshShortcuts, projectApi, projectId]);
+
+  // 加载 Skill：按当前会话 agentId 过滤展示对应 CLI 的技能。失败时静默为空。
+  useEffect(() => {
+    if (!projectId) return;
+    const agentId = conversation?.agentId || "claude-code";
+    let cancelled = false;
+    // agentId 变化（切换到另一 CLI 的会话）时先清空旧技能，避免短暂显示上一 CLI 的技能。
+    setSkills([]);
+    setSkillsLoading(true);
+    void (async () => {
+      try {
+        const list = await projectApi<Skill[]>(`/api/projects/${projectId}/skills?agentId=${encodeURIComponent(agentId)}`);
+        if (!cancelled) setSkills(list);
+      } catch { if (!cancelled) setSkills([]); }
+      finally { if (!cancelled) setSkillsLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [projectId, conversation?.agentId, projectApi]);
 
   // WebSocket 连接
   useEffect(() => {
@@ -2022,6 +2049,18 @@ export default function ConversationPage() {
     requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
   };
 
+  // 把 skill 名称 + 描述转成一段可引用的提示词文本，插入输入框（见 docs/22）。
+  const mergeSkillPrompt = (skill: Skill) =>
+    skill.description && skill.description !== skill.name
+      ? `请使用技能 <${skill.name}>：${skill.description}`
+      : `请使用技能 <${skill.name}>`;
+
+  const useSkill = (skill: Skill) => {
+    if (!conversation || sending || clearing || stopping || Boolean(shortcutBusy) || skillsLoading) return;
+    setComposerText(mergeSkillPrompt(skill));
+    requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
+  };
+
   const renderShortcutCell = (shortcut: Shortcut | undefined, kind: "prompt" | "command_request", placeholder = false) => {
     if (!shortcut && placeholder) return <div className="quick-tag-slot" aria-hidden="true" />;
     if (!shortcut) return <button type="button" className={`quick-tag-empty${kind === "command_request" ? " command-tag" : ""}`} onClick={() => setShortcutEditor({ kind })}>{kind === "command_request" ? "添加命令" : "添加提示词"}</button>;
@@ -2045,6 +2084,49 @@ export default function ConversationPage() {
   const renderCommandCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "command_request");
   const sortableDraggingDisabled = sending || clearing || stopping || Boolean(shortcutBusy);
 
+  // Skill 组内容：标题 + 按来源分组的技能标签列表。技能点击填入输入框；加载中 / 空态单独呈现。
+  const skillSourceMeta: Record<Skill["source"], { label: string; className: string; title: string }> = {
+    plugin: { label: "系统/官方", className: "plugin", title: "来自插件 / 官方 marketplace 的技能（含内置样板），~/.claude/plugins" },
+    user: { label: "用户", className: "user", title: "用户目录中的自建技能（~/.claude/skills）" },
+    project: { label: "项目", className: "project", title: "当前项目自带的技能（<项目>/.claude/skills）" },
+  };
+  const skillSources: Skill["source"][] = ["plugin", "user", "project"];
+  const skillsBySource = (source: Skill["source"]) => skills.filter((skill) => skill.source === source);
+  const toggleSkillGroup = (source: Skill["source"]) => setSkillGroupsCollapsed((prev) => ({ ...prev, [source]: !prev[source] }));
+
+  const renderSkillGroup = () => (
+    <div className="quick-tag-group skill-tags">
+      <div className="quick-tag-heading">
+        <span className="quick-tag-heading-label"><SkillTagIcon /><span>技能 (Skill)</span></span>
+        <span className="skill-source-hint" title="全部来源"> {skillsLoading ? "加载中" : `${skills.length} 个`}</span>
+      </div>
+      {skillsLoading ? <div className="quick-tag-list"><div className="quick-tag-empty skill-loading">加载中…</div></div>
+        : skills.length === 0 ? <div className="quick-tag-list"><div className="quick-tag-empty skill-empty">未发现 Skill</div></div>
+        : <div className="skill-source-groups">{skillSources.map((source) => {
+            const group = skillsBySource(source);
+            if (group.length === 0) return null;
+            const meta = skillSourceMeta[source];
+            const collapsed = Boolean(skillGroupsCollapsed[source]);
+            return (
+              <div key={source} className={`skill-source-group${collapsed ? " collapsed" : ""}`}>
+                <button type="button" className="skill-source-heading" onClick={() => toggleSkillGroup(source)} title={meta.title} aria-expanded={!collapsed}>
+                  <em className={`skill-source-chip ${meta.className}`}>{meta.label}</em>
+                  <span className="skill-source-count">{group.length}</span>
+                  <span className={`skill-source-chevron${collapsed ? "" : " open"}`} aria-hidden="true" />
+                </button>
+                {!collapsed && <ul className="quick-tag-list">{group.map((skill) => (
+                  <li key={skill.name} className="quick-tag-item skill-item">
+                    <button type="button" className="skill-tag" disabled={!conversation || sending || clearing || stopping || Boolean(shortcutBusy)} title={`${skill.description}\n${meta.title}`} onClick={() => useSkill(skill)}>
+                      <span className="skill-tag-text">{skill.name}</span>
+                    </button>
+                  </li>
+                ))}</ul>}
+              </div>
+            );
+          })}</div>}
+    </div>
+  );
+
   return <>
     {createPortal(<div className={`head-actions-menu${showMobileActions ? " mobile-open" : ""}`}>
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
@@ -2064,10 +2146,12 @@ export default function ConversationPage() {
         <div className="quick-actions-row">
           <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          {renderSkillGroup()}
         </div>
         <div className="quick-actions-mobile">
           <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          {renderSkillGroup()}
         </div>
       </aside>
       <section className="chat-center">

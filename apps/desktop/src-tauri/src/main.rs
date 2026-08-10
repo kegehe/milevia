@@ -11,10 +11,11 @@ use std::{
 };
 
 use tauri::{
-    menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    image::Image,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::NewWindowResponse,
-    Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    LogicalPosition, LogicalSize, Manager, PhysicalPosition, RunEvent, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use url::Url;
 use uuid::Uuid;
@@ -30,6 +31,14 @@ struct RunningSidecar {
 }
 
 struct ManagedSidecar(Mutex<Option<RunningSidecar>>);
+
+/// 记住最近一次托盘点击的鼠标位置（物理像素），供面板内容加载后按实际高度重新贴齐。
+struct TrayAnchor(Mutex<Option<PhysicalPosition<f64>>>);
+
+const TRAY_PANEL_LABEL: &str = "tray-panel";
+/// 面板初始宽度/高度（仅作建窗时的初始值，前端随后按内容自适应覆盖）。
+const TRAY_PANEL_WIDTH: f64 = 220.0;
+const TRAY_PANEL_HEIGHT: f64 = 224.0;
 
 fn sidecar_binary(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
     if let Ok(path) = env::var("MILEVIA_CONTROL_BINARY") {
@@ -292,30 +301,55 @@ fn stop_running_sidecar(sidecar: &mut RunningSidecar) {
     let _ = sidecar.child.wait();
 }
 
-fn create_main_window(app: &tauri::AppHandle, sidecar: &RunningSidecar) -> tauri::Result<()> {
+/// 主窗口与托盘面板窗口共用的导航白名单：只放行本地前端源。
+fn navigation_allowed(url: &Url) -> bool {
+    if cfg!(dev) {
+        return url.scheme() == "http"
+            && url.host_str() == Some("127.0.0.1")
+            && url.port_or_known_default() == Some(1420);
+    }
+    url.scheme() == "tauri"
+        || (url.scheme() == "https" && url.host_str() == Some("tauri.localhost"))
+}
+
+/// 生成注入前端 `window.__MILEVIA_DESKTOP_RUNTIME__` 的初始化脚本。
+/// 主窗口用 `mode:"app"`，托盘面板用 `mode:"tray"`（前端据此分流渲染）。
+/// 托盘面板额外注入 `window.__MILEVIA_TRAY_ACTIONS__`，经 `__TAURI_INTERNALS__.invoke`
+/// 调用 Rust command（免去在 web 包引入 @tauri-apps/api 依赖）。
+fn runtime_init_script(api_base: &str, session_token: &str, mode: &str) -> String {
     let runtime_config = serde_json::json!({
-        "apiBase": sidecar.api_base,
-        "wsBase": sidecar.api_base.replacen("http", "ws", 1),
-        "sessionToken": sidecar.session_token,
+        "apiBase": api_base,
+        "wsBase": api_base.replacen("http", "ws", 1),
+        "sessionToken": session_token,
+        "mode": mode,
     });
-    let initialization_script = format!(
+    let runtime_define = format!(
         "Object.defineProperty(window, '__MILEVIA_DESKTOP_RUNTIME__', {{ value: {}, writable: false, configurable: false }});",
         serde_json::to_string(&runtime_config).expect("runtime config serializes")
     );
+    let mut script = runtime_define;
+    if mode == "tray" {
+        script.push_str(
+            r#"Object.defineProperty(window, '__MILEVIA_TRAY_ACTIONS__', { value: {
+  showMain: () => window.__TAURI_INTERNALS__.invoke('show_main_window'),
+  close: () => window.__TAURI_INTERNALS__.invoke('close_panel'),
+  quit: () => window.__TAURI_INTERNALS__.invoke('quit_app'),
+  resize: (w, h) => window.__TAURI_INTERNALS__.invoke('set_panel_size', { width: w, height: h }),
+  navigateMain: (path) => window.__TAURI_INTERNALS__.invoke('navigate_main', { path }),
+}, writable: false, configurable: false });"#,
+        );
+    }
+    script
+}
+
+fn create_main_window(app: &tauri::AppHandle, sidecar: &RunningSidecar) -> tauri::Result<()> {
+    let initialization_script = runtime_init_script(&sidecar.api_base, &sidecar.session_token, "app");
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Milevia")
         .inner_size(1440.0, 920.0)
         .min_inner_size(1080.0, 720.0)
         .initialization_script(&initialization_script)
-        .on_navigation(|url| {
-            if cfg!(dev) {
-                return url.scheme() == "http"
-                    && url.host_str() == Some("127.0.0.1")
-                    && url.port_or_known_default() == Some(1420);
-            }
-            url.scheme() == "tauri"
-                || (url.scheme() == "https" && url.host_str() == Some("tauri.localhost"))
-        })
+        .on_navigation(navigation_allowed)
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .build()?;
     let w = window.clone();
@@ -328,23 +362,219 @@ fn create_main_window(app: &tauri::AppHandle, sidecar: &RunningSidecar) -> tauri
     Ok(())
 }
 
-fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "显示 Milevia", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
-    TrayIconBuilder::new()
-        .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+/// 克隆侧边进程的注入所需字段（api_base / session_token），避免持锁建窗。
+fn sidecar_snapshot(app: &tauri::AppHandle) -> Option<(String, String)> {
+    let state = app.state::<ManagedSidecar>();
+    let guard = state.0.lock().ok()?;
+    guard
+        .as_ref()
+        .map(|s| (s.api_base.clone(), s.session_token.clone()))
+}
+
+/// 惰性创建并返回托盘品牌面板窗口（已存在则复用）。
+fn restore_or_create_panel(
+    app: &tauri::AppHandle,
+    api_base: &str,
+    session_token: &str,
+) -> tauri::Result<WebviewWindow> {
+    if let Some(window) = app.get_webview_window(TRAY_PANEL_LABEL) {
+        return Ok(window);
+    }
+    let initialization_script = runtime_init_script(api_base, session_token, "tray");
+    let window = WebviewWindowBuilder::new(
+        app,
+        TRAY_PANEL_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("Milevia")
+    .inner_size(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .shadow(false)
+    .visible(false) // 先隐藏，待定位后再 show，避免在错误坐标闪一下
+    .initialization_script(&initialization_script)
+    .on_navigation(navigation_allowed)
+    .on_new_window(|_, _| NewWindowResponse::Deny)
+    .build()?;
+    let w = window.clone();
+    window.on_window_event(move |event| {
+        match event {
+            WindowEvent::Focused(false) => {
+                // 失焦自动隐藏
+                let _ = w.hide();
             }
-            "quit" => app.exit(0),
+            WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = w.hide();
+            }
             _ => {}
-        })
-        .build(app)?;
+        }
+    });
+    Ok(window)
+}
+
+/// 将品牌面板定位到鼠标右键点：面板**左下角**贴住点击点（向左上展开），
+/// 仅在超出显示器边界时平移收进屏幕。
+/// - `size_logical: Some((w,h))` 使用调用方提供的逻辑尺寸（如 `set_panel_size`
+///   传入刚请求的尺寸，避免 `inner_size()` 读到 set_size 前的旧值）。
+/// - `None` 时读面板当前实际 inner 尺寸。
+fn position_panel_at_cursor(
+    panel: &WebviewWindow,
+    click_physical: &PhysicalPosition<f64>,
+    size_logical: Option<(f64, f64)>,
+) {
+    let Ok(scale) = panel.scale_factor() else {
+        return;
+    };
+    let (pw, ph) = match size_logical {
+        Some((w, h)) => (w, h),
+        None => {
+            let Ok(inner) = panel.inner_size() else {
+                return;
+            };
+            (inner.width as f64 / scale, inner.height as f64 / scale)
+        }
+    };
+    // 点击点 → 逻辑像素
+    let mx = click_physical.x / scale;
+    let my = click_physical.y / scale;
+
+    // 面板期望：左下角贴住点击点 → 顶缘 = 鼠标y - 高度，左缘 = 鼠标x
+    let mut x = mx;
+    let mut y = my - ph;
+
+    // 收进当前显示器完整范围（含任务栏），避免超出上/右界被裁
+    if let Ok(Some(monitor)) = panel.current_monitor() {
+        let pos = monitor.position();
+        let size = monitor.size();
+        let wl = pos.x as f64 / scale;
+        let wt = pos.y as f64 / scale;
+        let wr = (pos.x + size.width as i32) as f64 / scale;
+        let wb = (pos.y + size.height as i32) as f64 / scale;
+        if x + pw > wr {
+            x = wr - pw;
+        }
+        if y + ph > wb {
+            y = wb - ph;
+        }
+        if x < wl {
+            x = wl;
+        }
+        if y < wt {
+            y = wt;
+        }
+    }
+    let _ = panel.set_position(LogicalPosition::new(x, y));
+    // 记录锚点，供内容自适应 resize 后重新贴齐
+    *panel.app_handle().state::<TrayAnchor>().0.lock().unwrap() = Some(*click_physical);
+}
+
+/// 点击托盘图标（左/右键）时弹出品牌面板。
+fn open_tray_panel(app: &tauri::AppHandle, click_position: &PhysicalPosition<f64>) {
+    let Some((api_base, session_token)) = sidecar_snapshot(app) else {
+        return;
+    };
+    let panel = match restore_or_create_panel(app, &api_base, &session_token) {
+        Ok(panel) => panel,
+        Err(error) => {
+            eprintln!("[tray-panel] 创建品牌面板失败: {error}");
+            return;
+        }
+    };
+    position_panel_at_cursor(&panel, click_position, None);
+    let _ = panel.set_always_on_top(true);
+    let _ = panel.show();
+    let _ = panel.set_focus();
+}
+
+/// 显示并聚焦主窗口（先隐藏托盘面板，避免焦点竞争导致面板误关）。
+#[tauri::command]
+fn show_main_window(app: tauri::AppHandle) {
+    if let Some(panel) = app.get_webview_window(TRAY_PANEL_LABEL) {
+        let _ = panel.hide();
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// 隐藏品牌托盘面板。
+#[tauri::command]
+fn close_panel(app: tauri::AppHandle) {
+    if let Some(panel) = app.get_webview_window(TRAY_PANEL_LABEL) {
+        let _ = panel.hide();
+    }
+}
+
+/// 让主窗口导航到指定路径（相对路径，基于主窗口自身 origin 解析）。
+/// 先显示并聚焦主窗口，再让前端以客户端路由跳转（避免整页刷新丢状态）。
+#[tauri::command]
+fn navigate_main(app: tauri::AppHandle, path: String) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        let _ = window.eval(&format!(
+            "window.__mileviaNavigate && window.__mileviaNavigate({path:?})"
+        ));
+    }
+}
+
+/// 真正退出应用（触发 ExitRequested → 优雅停掉 sidecar）。
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+/// 让面板窗口按内容自适应尺寸（前端测量后调用，消除右侧留白）。
+/// 尺寸变化后重新按最近一次点击点把面板左下角贴回鼠标位置。
+#[tauri::command]
+fn set_panel_size(app: tauri::AppHandle, width: f64, height: f64) {
+    if let Some(panel) = app.get_webview_window(TRAY_PANEL_LABEL) {
+        // 逻辑像素尺寸；加一点安全余量避免贴边裁切
+        let new_w = width + 2.0;
+        let new_h = height + 2.0;
+        let _ = panel.set_size(LogicalSize::new(new_w, new_h));
+        // 内容自适应后高度变化会破坏“左下角贴鼠标”，这里用刚请求的尺寸重贴一次
+        // （避免读 inner_size() 时 set_size 尚未生效拿到旧值）
+        let anchor = app.state::<TrayAnchor>().0.lock().unwrap().clone();
+        if let Some(anchor) = anchor {
+            position_panel_at_cursor(&panel, &anchor, Some((new_w, new_h)));
+        }
+    }
+}
+
+fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
+    // Windows 托盘必须在创建时显式提供图标，否则 Shell_NotifyIconW(NIM_ADD) 只注册一个
+    // “无图标”的托盘项，任务栏通知区不会渲染出任何可见图标。
+    let tray = TrayIconBuilder::with_id("main-tray")
+        // 去掉原生菜单，改由品牌覆盖层面板承载；左/右键都弹面板。
+        .icon(app.default_window_icon().map(Clone::clone).unwrap_or_else(|| {
+            Image::from_bytes(include_bytes!("../icons/icon.ico"))
+                .expect("内置图标必须可解码")
+        }))
+        .show_menu_on_left_click(false);
+
+    tray.on_tray_icon_event(|tray, event| {
+        if let TrayIconEvent::Click {
+            button_state: MouseButtonState::Up,
+            button,
+            position,
+            ..
+        } = event
+        {
+            if matches!(button, MouseButton::Left | MouseButton::Right) {
+                let app = tray.app_handle();
+                open_tray_panel(&app, &position);
+            }
+        }
+    })
+    .build(app)?;
     Ok(())
 }
 
@@ -356,14 +586,25 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        .invoke_handler(tauri::generate_handler![
+            show_main_window,
+            close_panel,
+            quit_app,
+            set_panel_size,
+            navigate_main
+        ])
         .setup(|app| {
             app.manage(ManagedSidecar(Mutex::new(None)));
+            app.manage(TrayAnchor(Mutex::new(None)));
             let sidecar = start_sidecar(&app.handle()).map_err(|error| error.to_string())?;
             if let Err(error) = create_main_window(&app.handle(), &sidecar) {
                 let mut sidecar = sidecar;
                 stop_running_sidecar(&mut sidecar);
                 return Err(error.into());
             }
+            // 提前保存注入字段，供预建面板使用（sidecar 随后移入状态）。
+            let panel_api_base = sidecar.api_base.clone();
+            let panel_session_token = sidecar.session_token.clone();
             *app.state::<ManagedSidecar>()
                 .0
                 .lock()
@@ -371,6 +612,10 @@ fn main() {
             if let Err(error) = configure_tray(app) {
                 stop_sidecar(&app.handle());
                 return Err(error.into());
+            }
+            // 预建隐藏的品牌面板窗口：首次点击即可直接显示，避免首点延迟/空白。
+            if let Err(error) = restore_or_create_panel(&app.handle(), &panel_api_base, &panel_session_token) {
+                eprintln!("[tray-panel] 预建面板失败（首次点击时将重建）: {error}");
             }
             Ok(())
         })

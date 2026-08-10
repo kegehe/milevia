@@ -38,7 +38,8 @@ func (s *Server) getFilesystem(r *http.Request) (Filesystem, error) {
 		return nil, fmt.Errorf("项目不存在：%w", err)
 	}
 
-	if isLocalRunnerID(project.Runner) {
+	if isLocalRunnerID(project.Runner) || project.Runner == "wsl-local" {
+		// wsl-local 项目路径为 UNC（\\wsl$\...），Go 的 os 直读，复用 LocalFilesystem。
 		return &LocalFilesystem{
 			allowedRoot: s.config.AllowedRoot,
 			projectPath: project.Path,

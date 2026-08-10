@@ -99,6 +99,9 @@ type AgentRunSink interface {
 
 type claudeCLIRunner struct {
 	config Config
+	// approvalHookOverride 允许跨端 runner（如 wslAgentRunner）注入自定义审批 hook
+	// 命令字符串。nil 时走默认（本机 NativeApprovalHook / sh 逻辑）。
+	approvalHookOverride func() string
 }
 
 type claudeCLISession struct {
@@ -597,6 +600,9 @@ func (r *claudeCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntime
 }
 
 func (r *claudeCLIRunner) approvalHookCommand() string {
+	if r.approvalHookOverride != nil {
+		return r.approvalHookOverride()
+	}
 	if r.config.NativeApprovalHook {
 		// Claude executes hook commands through the platform shell. A quoted
 		// absolute executable path keeps the Windows helper independent of sh.
@@ -623,12 +629,10 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 			continue
 		}
 		var envelope struct {
-			Type            string `json:"type"`
-			Subtype         string `json:"subtype"`
-			ParentToolUseID string `json:"parent_tool_use_id"`
-			Message         struct {
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
+			Type            string          `json:"type"`
+			Subtype         string          `json:"subtype"`
+			ParentToolUseID string          `json:"parent_tool_use_id"`
+			Message         json.RawMessage `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
@@ -647,10 +651,7 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 		if envelope.Type != "assistant" {
 			continue
 		}
-		if len(envelope.Message.Content) == 0 {
-			continue
-		}
-		parts := parseContentParts(envelope.Message.Content)
+		parts, _ := parseClaudeMessage(envelope.Message)
 		for _, part := range parts {
 			sink.AssistantText(part, envelope.ParentToolUseID)
 		}
@@ -683,6 +684,36 @@ func parseContentParts(raw json.RawMessage) []string {
 		return []string{s}
 	}
 	return nil
+}
+
+// parseClaudeMessage 从 claude stream-json 的 message 字段提取可展示的文本与用于
+// 回合状态机的 content。claude 的 assistant 行里 message 有两种形态：
+//   - 对象：{"content":[{type,text},...]} 或 {"content":"纯文本"}——取 content 按块/串解析；
+//   - 纯字符串："直接文本"——某些模型/输出的 assistant 行把整段文本直接放进 message 字符串
+//     （此形态下旧解码器把 message 声明成 struct{Content}，反序列化会报
+//     "cannot unmarshal string into ... .message" 并整行丢弃）。
+//
+// 返回 (文本片段, 用于工具探测的 content)。message 为纯字符串时没有工具用 content，返回 nil。
+func parseClaudeMessage(msg json.RawMessage) ([]string, json.RawMessage) {
+	if len(msg) == 0 {
+		return nil, nil
+	}
+	// 形态一：message 是对象，取其 content（可能是数组或字符串）。
+	var obj struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(msg, &obj) == nil {
+		return parseContentParts(obj.Content), obj.Content
+	}
+	// 形态二：message 是纯 JSON 字符串，整串即文本。
+	var s string
+	if json.Unmarshal(msg, &s) == nil {
+		if strings.TrimSpace(s) != "" {
+			return []string{s}, nil
+		}
+		return nil, nil
+	}
+	return nil, nil
 }
 
 func (session *claudeCLISession) Send(request AgentRunRequest, sink AgentRunSink) error {
@@ -742,25 +773,20 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 			continue
 		}
 		var envelope struct {
-			Type            string `json:"type"`
-			Subtype         string `json:"subtype"`
-			ParentToolUseID string `json:"parent_tool_use_id"`
-			Message         struct {
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
+			Type            string          `json:"type"`
+			Subtype         string          `json:"subtype"`
+			ParentToolUseID string          `json:"parent_tool_use_id"`
+			Message         json.RawMessage `json:"message"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
 			session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
 			continue
 		}
-		session.noteStreamEvent(envelope.Type, envelope.Message.Content)
+		parts, content := parseClaudeMessage(envelope.Message)
+		session.noteStreamEvent(envelope.Type, content)
 		initialized := envelope.Type == "system" && envelope.Subtype == "init"
 		session.emit(envelope.Type, line, initialized)
 		if envelope.Type == "assistant" {
-			if len(envelope.Message.Content) == 0 {
-				continue
-			}
-			parts := parseContentParts(envelope.Message.Content)
 			for _, p := range parts {
 				session.assistantText(p, envelope.ParentToolUseID)
 			}

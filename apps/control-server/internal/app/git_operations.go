@@ -1010,7 +1010,8 @@ func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner
 		}
 		return nil, "", false
 	}
-	if isLocalRunnerID(project.Runner) {
+	if isLocalRunnerID(project.Runner) || project.Runner == "wsl-local" {
+		// wsl-local 也走本地 GitRunner 直读 UNC（与 fs_handler 复用 LocalFilesystem 一致）。
 		return newGitRunner(), project.Path, true
 	}
 	runner, ok := s.runnerRegistry.get(project.Runner)
@@ -1037,7 +1038,8 @@ func (s *Server) gitRunnerForProject(ctx context.Context, projectID string) (Git
 	if err != nil {
 		return nil, "", err
 	}
-	if isLocalRunnerID(project.Runner) {
+	if isLocalRunnerID(project.Runner) || project.Runner == "wsl-local" {
+		// wsl-local 也走本地 GitRunner 直读 UNC。
 		return newGitRunner(), project.Path, nil
 	}
 	runner, ok := s.runnerRegistry.get(project.Runner)

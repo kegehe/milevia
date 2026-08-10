@@ -524,3 +524,83 @@ func TestClaudeSessionIdleTimeoutFailsRunsAndReleasesConversation(t *testing.T) 
 	}
 	t.Fatalf("timeout statuses: first=%q second=%q conversation=%q", firstStatus, secondStatus, conversationStatus)
 }
+
+func TestParseClaudeMessage(t *testing.T) {
+	cases := []struct {
+		name      string
+		msg       string // JSON for the message field
+		wantParts []string
+	}{
+		{
+			"object with content array",
+			`{"content":[{"type":"text","text":"hello"},{"type":"tool_use","name":"Read"}]}`,
+			[]string{"hello"},
+		},
+		{
+			"object with content plain string",
+			`{"content":"直接文本"}`,
+			[]string{"直接文本"},
+		},
+		{
+			"object empty content",
+			`{"content":[]}`,
+			nil,
+		},
+		{
+			"plain string message",
+			`"整段文本作为 message 字符串"`,
+			[]string{"整段文本作为 message 字符串"},
+		},
+		{
+			"plain empty string message",
+			`""`,
+			nil,
+		},
+		{
+			"missing message field",
+			``,
+			nil,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var raw json.RawMessage
+			if c.msg != "" {
+				raw = json.RawMessage(c.msg)
+			} else {
+				raw = nil
+			}
+			parts, _ := parseClaudeMessage(raw)
+			if len(parts) != len(c.wantParts) {
+				t.Fatalf("parseClaudeMessage(%q) = %#v; want %#v", c.msg, parts, c.wantParts)
+			}
+			for i := range parts {
+				if parts[i] != c.wantParts[i] {
+					t.Errorf("part[%d] = %q; want %q", i, parts[i], c.wantParts[i])
+				}
+			}
+		})
+	}
+}
+
+// TestClaudeReadOutputAcceptsPlainStringMessage 验证 readOutput（一次性 Run 路径）能
+// 接受 message 为纯字符串的 assistant 行——即此前 "cannot unmarshal string into ... .message"
+// 导致整行丢弃的形态——并照常把文本交给 AssistantText，且不产生 stream.error。
+func TestClaudeReadOutputAcceptsPlainStringMessage(t *testing.T) {
+	runner := &claudeCLIRunner{}
+	sink := &claudeOutputTestSink{}
+	// 旧的 struct{Content json.RawMessage} 声明会拒绝此行的 "message":"..." 字符串形态。
+	runner.readOutput(strings.NewReader(`{"type":"assistant","parent_tool_use_id":"t1","message":"纯字符串消息正文"}`+"\n"), sink)
+	if len(sink.texts) != 1 {
+		t.Fatalf("expected 1 assistant text, got %#v", sink.texts)
+	}
+	if sink.texts[0] != "纯字符串消息正文" {
+		t.Errorf("assistant text = %q; want 纯字符串消息正文", sink.texts[0])
+	}
+	for _, e := range sink.events {
+		var errEv struct{ Error string `json:"error"` }
+		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
+			t.Fatalf("unexpected stream.error event: %s", string(e))
+		}
+	}
+}

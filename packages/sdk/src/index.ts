@@ -10,6 +10,8 @@ export type DesktopRuntimeConfig = {
   apiBase: string;
   wsBase: string;
   sessionToken: string;
+  /** 窗口角色：主窗口 `app`；托盘面板窗口 `tray`。Web 端无注入，此字段缺省。 */
+  mode?: "app" | "tray";
 };
 
 export type Platform = "web" | "desktop";

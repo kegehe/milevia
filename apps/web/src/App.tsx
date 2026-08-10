@@ -1,6 +1,7 @@
 // 路由入口 — 从 2003 行精简为 ~50 行
 
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { useEffect } from "react";
+import { BrowserRouter, Routes, Route, Navigate, useNavigate } from "react-router-dom";
 import { ProjectProvider } from "./stores/useProjectStore";
 import { NotificationProvider } from "./components/NotificationProvider";
 import { ProcessStatusProvider } from "./components/ProcessStatusProvider";
@@ -16,6 +17,25 @@ import ProjectRunPage from "./pages/ProjectRunPage";
 import FilesPage from "./pages/FilesPage";
 import AgentProfilesPage from "./pages/AgentProfilesPage";
 
+declare global {
+  interface Window {
+    /** 由托盘面板经 Rust 注入触发的主窗口客户端路由导航钩子。 */
+    __mileviaNavigate?: (path: string) => void;
+  }
+}
+
+/** 把窗口级导航钩子接到 React Router：供托盘面板（`navigate_main` command）驱动主窗跳转。 */
+function NavigationBridge() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    window.__mileviaNavigate = (path: string) => navigate(path);
+    return () => {
+      delete window.__mileviaNavigate;
+    };
+  }, [navigate]);
+  return null;
+}
+
 export function App() {
   return (
     <BrowserRouter>
@@ -23,6 +43,7 @@ export function App() {
         <NotificationProvider>
           <ProcessStatusProvider>
           <ProjectProvider>
+            <NavigationBridge />
             <Routes>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/projects/import" element={<ImportProjectPage />} />

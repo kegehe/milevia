@@ -1,0 +1,107 @@
+/* 托盘品牌面板（替代原生托盘菜单）—— 复用 Milevia 全局品牌桌面 */
+
+/* 面板窗口为无边框透明窗口：清掉 style.css 对 html/body/#root 的实底，
+   只让品牌卡片本身可见（圆角而非整窗方块）。 */
+html, body, #root {
+  background: transparent !important;
+  overflow: hidden;
+  margin: 0;
+}
+body { padding: 0; }
+
+.tray-panel {
+  display: flex;
+  flex-direction: column;
+  width: max-content; /* 宽度贴合内容，消除右侧留白 */
+  min-width: 160px;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1px solid #c8dcd1;
+  border-radius: 10px;
+  background: #fbfefb;
+  /* 透明窗口上不要用品牌硬投影（7px 7px 0），否则像“后面错位的第二层”。
+     改用柔和的品牌色阴影，保持悬浮感又不产生残留层。 */
+  box-shadow: 0 2px 4px #17362c24, 0 14px 28px #17362c1a;
+  user-select: none;
+}
+
+.tray-panel-brand {
+  display: flex;
+  align-items: center;
+  gap: 5px; /* logo 与 Milevia 文字间距收紧 */
+  padding: 14px 12px 10px; /* 左内边距收窄，品牌区整体靠左 */
+  border-bottom: 1px solid #e2efe8;
+}
+
+.tray-panel-mark {
+  width: 26px;
+  height: 26px;
+  flex: none;
+}
+
+.tray-panel-brand-name {
+  position: relative;
+  display: inline-flex;
+  align-items: baseline;
+  padding: 2px 1px 5px;
+  color: #19332c;
+  font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+  font-size: 17px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+}
+.tray-panel-brand-name strong { font: inherit; }
+.tray-panel-brand-name em { color: #75982e; font: inherit; font-style: normal; }
+.tray-panel-brand-name::after {
+  position: absolute;
+  bottom: 0;
+  left: 1px;
+  width: 20px;
+  height: 2px;
+  border-radius: 2px;
+  background: #c8e85a;
+  content: "";
+}
+
+.tray-panel-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+}
+
+.tray-panel-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 9px;
+  width: auto; /* 贴合文字宽度，避免撑宽面板 */
+  white-space: nowrap;
+  border: 0;
+  border-radius: 7px;
+  padding: 9px 10px;
+  color: #214d42;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+}
+.tray-panel-item:hover:not(:disabled) {
+  background: #eaf5ee;
+  color: #1e5145;
+}
+.tray-panel-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.tray-panel-item-danger { color: #a24230; }
+.tray-panel-item-danger:hover:not(:disabled) { background: #fff0eb; color: #8c3c2c; }
+
+.tray-panel-sep {
+  height: 1px;
+  margin: 4px 8px;
+  background: #e2efe8;
+}

@@ -160,6 +160,9 @@ type Server struct {
 	runner                 AgentRunner
 	codexRunner            AgentRunner
 	windowsRunner          AgentRunner
+	wslRunner              AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
+	wslDistro              string      // 探测到的默认 WSL 发行版名；空表示无 WSL
+	wslHome                string      // WSL 内当前用户的 Linux home 路径
 	runnerRegistry         *runnerRegistry
 	runnerMaintenanceMu    sync.Mutex
 	runnerUpdating         map[runnerAgentKey]bool
@@ -553,6 +556,24 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	// Register the native local runner for this server platform.
 	s.runnerRegistry.register(s.localRunnerID(), runner, s.localRunnerMeta())
+	// Windows 服务端：额外探测 WSL 并注册 wsl-local runner，使 Windows 桌面端可加载
+	// WSL 内的项目目录（UNC 路径），加载后 AI 经 wsl.exe 在 WSL 侧执行。无 WSL / 探测
+	// 失败时仅记日志跳过，绝不影响 windows-local（其注册在上行）。
+	if runtime.GOOS == "windows" {
+		if distro, err := detectDefaultWSLDistro(ctx); err == nil {
+			if home, err := detectWSLHome(ctx, distro); err == nil {
+				s.wslDistro = distro
+				s.wslHome = home
+				s.wslRunner = newWSLAgentRunner(s.config, distro)
+				s.runnerRegistry.register("wsl-local", s.wslRunner, s.wslLocalRunnerMeta(distro, home))
+				log.Printf("[wsl] registered wsl-local runner (distro=%s home=%s)", distro, home)
+			} else {
+				log.Printf("[wsl] home probe failed, wsl-local not registered: %v", err)
+			}
+		} else {
+			log.Printf("[wsl] no WSL detected, wsl-local not registered: %v", err)
+		}
+	}
 	// Recover previously-connected SSH connections (failures are non-fatal).
 	if err := s.recoverSSHConnections(ctx); err != nil {
 		log.Printf("[ssh] failed to recover SSH connections: %v", err)
@@ -785,6 +806,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/conversations", s.listConversations)
 	r.Post("/api/projects/{projectID}/conversations", s.createConversation)
 	r.Get("/api/projects/{projectID}/shortcuts", s.listShortcuts)
+	r.Get("/api/projects/{projectID}/skills", s.listSkills)
 	r.Put("/api/projects/{projectID}/shortcuts/reorder", s.reorderShortcuts)
 	r.Post("/api/shortcuts/defaults", s.seedDefaultShortcuts)
 	r.Post("/api/shortcuts", s.createShortcut)
@@ -1458,7 +1480,31 @@ func (s *Server) listDirectories(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
 	// 计算 parent：不允许越过 runner 的任意一个 root
 	parent := filepath.Dir(path)
-	if meta, ok := s.runnerRegistry.getMeta(runnerID); ok && len(meta.Roots) > 0 {
+	if isWSLUncPath(path) {
+		// WSL UNC runner：EvalSymlinks 不可靠，parent 用字符串前缀判定，不越过任何 UNC root。
+		if meta, ok := s.runnerRegistry.getMeta(runnerID); ok && len(meta.Roots) > 0 {
+			withinUnc := false
+			for _, root := range meta.Roots {
+				if wslPathWithin(root.Path, parent) {
+					withinUnc = true
+					break
+				}
+			}
+			if withinUnc {
+				parent = wslUncNormalize(parent)
+			} else {
+				// parent 越过了所有 root，回退到当前路径所属的 root
+				for _, root := range meta.Roots {
+					if wslPathWithin(root.Path, wslUncNormalize(path)) {
+						parent = wslUncNormalize(root.Path)
+						break
+					}
+				}
+			}
+		} else {
+			parent = wslUncNormalize(parent)
+		}
+	} else if meta, ok := s.runnerRegistry.getMeta(runnerID); ok && len(meta.Roots) > 0 {
 		withinRoot := false
 		for _, root := range meta.Roots {
 			resolvedRoot, err := filepath.EvalSymlinks(root.Path)
@@ -1629,15 +1675,17 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 		codexReady := sshR.CodexReady(r.Context())
 		meta, _ := s.runnerRegistry.getMeta(runnerID)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"path":        path,
-			"name":        filepath.Base(path),
-			"gitReady":    gitReady,
-			"gitBranch":   branch,
-			"claudeReady": claudeReady,
-			"codexReady":  codexReady,
-			"agentReady":  claudeReady || codexReady,
-			"performance": "remote",
-			"runnerName":  meta.Name,
+			"path":          path,
+			"name":          filepath.Base(path),
+			"gitReady":      gitReady,
+			"gitBranch":     branch,
+			"claudeReady":   claudeReady,
+			"codexReady":    codexReady,
+			"agentReady":    claudeReady || codexReady,
+			"performance":   "remote",
+			"runnerName":    meta.Name,
+			"claudeVersion": normalizeClaudeVersion(sshR.Version(r.Context())),
+			"codexVersion":  normalizeCodexVersion(sshR.CodexVersion(r.Context())),
 		})
 		return
 	}
@@ -1654,7 +1702,8 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 	branch, gitReady := gitBranch(r.Context(), path)
 	target := s.resolveAgentTargetEnv(runnerID, path)
 	claudeReady, codexReady := s.agentCLIReady(r.Context(), target)
-	writeJSON(w, http.StatusOK, map[string]any{"path": path, "name": filepath.Base(path), "gitReady": gitReady, "gitBranch": branch, "claudeReady": claudeReady, "codexReady": codexReady, "agentReady": claudeReady || codexReady})
+	claudeVersion, codexVersion := s.agentCLIVersion(r.Context(), target)
+	writeJSON(w, http.StatusOK, map[string]any{"path": path, "name": filepath.Base(path), "gitReady": gitReady, "gitBranch": branch, "claudeReady": claudeReady, "codexReady": codexReady, "agentReady": claudeReady || codexReady, "claudeVersion": claudeVersion, "codexVersion": codexVersion})
 }
 
 func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
@@ -2002,6 +2051,9 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	// Cache the cross-boundary Windows Codex readiness (WSL server + windows target)
 	// so many /mnt/ projects probe the Windows side only once per listing.
 	windowsCodexReady := -1 // -1 = 未缓存（每次首次使用时探测）
+	// Cache the cross-boundary WSL Codex readiness (Windows server + wsl-local runner)
+	// so many WSL projects probe the WSL side only once per listing.
+	wslCodexReady := -1
 	for rows.Next() {
 		var p Project
 		if err := rows.Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt); err != nil {
@@ -2018,6 +2070,18 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			p.CodexReady = windowsCodexReady == 1
+			p.AgentReady = p.ClaudeReady || p.CodexReady
+		} else if p.Runner == "wsl-local" {
+			// Windows 服务端下 wsl-local 项目跨到 WSL 侧探测 codex 就绪，缓存避免重复 probe。
+			if wslCodexReady < 0 {
+				wslCodexReady = 0
+				if w := s.wslAgentRunner(); w != nil {
+					if cr, ok := w.(CodexCapableRunner); ok && cr.CodexReady(r.Context()) {
+						wslCodexReady = 1
+					}
+				}
+			}
+			p.CodexReady = wslCodexReady == 1
 			p.AgentReady = p.ClaudeReady || p.CodexReady
 		} else if isLocalRunnerID(p.Runner) {
 			s.decorateProjectAvailability(&p, localCodexReady)
@@ -2141,6 +2205,11 @@ func (s *Server) decorateProjectAvailability(project *Project, localCodexReady b
 			defer cancel()
 			project.CodexReady = s.codexReadyForTarget(ctx, target)
 		}
+	case project.Runner == "wsl-local":
+		// Windows 服务端 + wsl-local：Codex 在 WSL 侧，探测其真实就绪，不误用本机 Windows codex。
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		project.CodexReady = s.codexReadyForTarget(ctx, agentTargetEnvWSL)
 	case strings.HasPrefix(project.Runner, "ssh-"):
 		project.CodexReady = s.sshCodexReady(project.Runner)
 	default:
@@ -2297,7 +2366,13 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 			}
 			target := s.resolveAgentTargetEnv(projectRunner, projectPathForTarget)
 			if target == agentTargetEnvWindows && runtime.GOOS != "windows" {
-				// 跨端 Codex：按 Windows 目标环境探测，未就绪如实报错，不静默回退 WSL。
+				// 跨端 Codex（WSL 服务端→Windows 侧）：按 Windows 目标环境探测。
+				if !s.codexReadyForTarget(r.Context(), target) {
+					writeError(w, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Codex"))
+					return
+				}
+			} else if target == agentTargetEnvWSL && runtime.GOOS == "windows" {
+				// Windows 服务端 + wsl-local：Codex 在 WSL 侧，按 WSL 目标探测，不测本机 Windows codex。
 				if !s.codexReadyForTarget(r.Context(), target) {
 					writeError(w, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Codex"))
 					return
@@ -3482,7 +3557,13 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		runnerObj = r
 	case conversation.AgentID == "codex":
 		if target == agentTargetEnvWindows && runtime.GOOS != "windows" {
-			// 跨端 Codex：经 Windows Agent Runner 驱动，未就绪如实报错，不静默回退 WSL。
+			// 跨端 Codex（WSL 服务端→Windows 侧）：经 Windows Agent Runner 驱动。
+			if !s.codexReadyForTarget(ctx, target) {
+				return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Codex")
+			}
+			runnerObj = s.codexRunnerFor(target)
+		} else if target == agentTargetEnvWSL && runtime.GOOS == "windows" {
+			// Windows 服务端 + wsl-local：Codex 在 WSL 侧，经 wslAgentRunner 驱动，不在本机 Windows 跑。
 			if !s.codexReadyForTarget(ctx, target) {
 				return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Codex")
 			}
@@ -4529,6 +4610,20 @@ func (s *Server) allowedPath(path string) (string, error) {
 // allowedPathForRunner 校验路径是否在指定 runner 的任意一个 root 下。
 // 对于 wsl-local runner，root 包括 WSL Home 和 /mnt/c、/mnt/d 等 Windows 挂载点。
 func (s *Server) allowedPathForRunner(path string, runnerID string) (string, error) {
+	// WSL UNC 路径：filepath.EvalSymlinks 对 9P UNC 不可靠，改用字符串前缀匹配。
+	if isWSLUncPath(path) {
+		meta, ok := s.runnerRegistry.getMeta(runnerID)
+		if !ok || len(meta.Roots) == 0 {
+			return "", errors.New("path is outside the Runner allowed roots")
+		}
+		for _, root := range meta.Roots {
+			if wslPathWithin(root.Path, path) {
+				norm := filepath.Clean(wslUncNormalize(path))
+				return norm, nil
+			}
+		}
+		return "", errors.New("path is outside the Runner allowed roots")
+	}
 	absolute, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", err
@@ -4550,15 +4645,27 @@ func (s *Server) allowedPathForRunner(path string, runnerID string) (string, err
 	// 回退到原有 allowedPath 逻辑
 	return s.allowedPath(path)
 }
+// gitBranch 返回给定目录当前所在的分支名。
+//
+// 用轻量 git symbolic-ref --short HEAD 取代全量 git status --porcelain=v2
+// （后者会扫描整个工作区，对 WSL UNC / 9P 路径可达数百毫秒；前者只读 HEAD ref）。
+// 三种状态的语义与原实现一致：
+//   - 正常分支（含未提交首个 commit 的 unborn HEAD）：输出分支名 → (branch, true)
+//   - detached HEAD：symbolic-ref 失败但仍是 git 仓库 → ("HEAD", true)
+//   - 非 git 目录：symbolic-ref 失败且 rev-parse 也失败 → ("", false)
 func gitBranch(ctx context.Context, path string) (string, bool) {
-	snapshot, err := newGitRunner().Snapshot(ctx, path)
-	if err != nil {
+	backend := newLocalGitBackend()
+	out, err := backend.runGit(ctx, path, "symbolic-ref", "-q", "--short", "HEAD")
+	if err == nil {
+		if branch := strings.TrimSpace(string(out)); branch != "" {
+			return branch, true
+		}
+	}
+	// symbolic-ref 失败：可能是 detached HEAD，也可能是非 git 目录，用 rev-parse 区分。
+	if _, err := backend.runGit(ctx, path, "rev-parse", "--is-inside-work-tree"); err != nil {
 		return "", false
 	}
-	if snapshot.Head.Detached {
-		return "HEAD", true
-	}
-	return snapshot.Head.Branch, true
+	return "HEAD", true
 }
 func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 	return decodeJSON(w, r, target, false)
@@ -4818,7 +4925,7 @@ func (s *Server) wslLocalMeta() RunnerMeta {
 }
 
 func (s *Server) windowsLocalMeta() RunnerMeta {
-	roots := []RootEntry{{Name: "用户目录", Path: s.config.AllowedRoot}}
+	roots := []RootEntry{}
 	for drive := 'C'; drive <= 'Z'; drive++ {
 		path := string(drive) + `:\\`
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
@@ -4826,6 +4933,15 @@ func (s *Server) windowsLocalMeta() RunnerMeta {
 		}
 	}
 	return RunnerMeta{ID: "windows-local", Name: "Windows Local Runner", Environment: "windows", Root: s.config.AllowedRoot, Roots: roots}
+}
+
+// wslLocalRunnerMeta 构建 Windows 服务端下 wsl-local runner 的 RunnerMeta。roots 指向
+// WSL 内当前用户的 home（UNC 路径），供导入页浏览。与 wslLocalMeta（WSL 服务端 Linux
+// /mnt/ roots，供测试直接调用）区分，本函数仅 Windows 服务端注册时使用。
+func (s *Server) wslLocalRunnerMeta(distro, home string) RunnerMeta {
+	uncHome := wslToUncPath(home, distro)
+	roots := []RootEntry{{Name: "WSL Home (" + distro + ")", Path: uncHome, Label: "wsl"}}
+	return RunnerMeta{ID: "wsl-local", Name: "WSL Local Runner (" + distro + ")", Environment: "wsl", Root: uncHome, Roots: roots}
 }
 
 func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
@@ -5098,6 +5214,11 @@ func (s *Server) projectRunManagerForExistingProject(ctx context.Context, projec
 		runner projectRunnerInterface
 	}
 	var prepared *preparedRunner
+	if project.Runner == "wsl-local" {
+		// WSL 项目运行在 WSL 内，Windows 控制侧不支持"运行命令"（resolveRunExecutionTarget
+		// 对 Windows+WSL 目标亦明确拒绝）。给出明确提示而非误导性的 SSH 类型错误。
+		return nil, errors.New("WSL 环境暂不支持运行命令；请改用会话/文件操作，或在 WSL 内直接执行")
+	}
 	if !isLocalRunnerID(project.Runner) {
 		agentRunner, ok := s.runnerRegistry.get(project.Runner)
 		if !ok {

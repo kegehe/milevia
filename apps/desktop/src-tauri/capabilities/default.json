@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Milevia desktop window permissions",
-  "windows": ["main"],
+  "windows": ["main", "tray-panel"],
   "permissions": ["core:default", "core:window:allow-close", "core:window:allow-hide", "core:window:allow-show"]
 }

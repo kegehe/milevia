@@ -347,6 +347,14 @@ func (fs *LocalFilesystem) Rename(ctx context.Context, oldPath, newPath string) 
 // final one. Mutating the final component must operate on a symlink itself,
 // rather than silently following it to a different filesystem object.
 func (fs *LocalFilesystem) resolveMutationPath(path string) (string, error) {
+	// WSL UNC 项目路径：走字符串前缀解析（写法操作不 follow symlink，见 resolvePathUNC）。
+	if isWSLUncPath(fs.projectPath) {
+		norm, err := fs.resolvePathUNC(path)
+		if err != nil {
+			return "", err
+		}
+		return norm, nil
+	}
 	if path == "" || path == "/" {
 		projectRoot, err := filepath.EvalSymlinks(fs.projectPath)
 		if err != nil {
@@ -376,6 +384,10 @@ func (fs *LocalFilesystem) resolveMutationPath(path string) (string, error) {
 }
 
 func (fs *LocalFilesystem) isProjectRoot(path string) bool {
+	// WSL UNC：直接与规范项目根比较字符串。
+	if isWSLUncPath(fs.projectPath) {
+		return wslUncNormalize(path) == wslUncNormalize(fs.projectPath)
+	}
 	projectRoot, err := filepath.EvalSymlinks(fs.projectPath)
 	return err == nil && path == projectRoot
 }
@@ -389,6 +401,11 @@ func pathWithin(root, candidate string) bool {
 func (fs *LocalFilesystem) resolvePath(path string) (string, error) {
 	if path == "" || path == "/" {
 		return fs.projectPath, nil
+	}
+	// WSL UNC 项目路径（\\wsl$...）：filepath.EvalSymlinks 对 9P UNC 不可靠（Windows API
+	// 报 "system cannot find"），改用字符串前缀校验，否则 WSL 项目任何子路径都读写不了。
+	if isWSLUncPath(fs.projectPath) {
+		return fs.resolvePathUNC(path)
 	}
 	// 如果已经是绝对路径，校验是否在 projectPath 下
 	if filepath.IsAbs(path) {
@@ -438,6 +455,41 @@ func (fs *LocalFilesystem) resolvePath(path string) (string, error) {
 		return "", errors.New("路径超出项目范围")
 	}
 	return absolute, nil
+}
+
+// resolvePathUNC 用字符串前缀校验解析 WSL UNC 项目内的路径（不触发 EvalSymlinks）。
+// 相对路径安全拼接；绝对 UNC 路径提取相对部分后同样经 wslJoinUnc 的 filepath.Clean
+// 净化（合并 . / ..），避免 .. 目录穿越逃逸出项目范围。
+func (fs *LocalFilesystem) resolvePathUNC(path string) (string, error) {
+	if path == "" || path == "/" {
+		return wslUncNormalize(fs.projectPath), nil
+	}
+	if filepath.IsAbs(path) || isWSLUncPath(path) {
+		norm := wslUncNormalize(path)
+		if norm == "" {
+			return "", errors.New("路径超出项目范围")
+		}
+		if !wslPathWithin(fs.projectPath, norm) {
+			return "", errors.New("路径超出项目范围")
+		}
+		// 提取相对部分（含 .. 段），交 wslJoinUnc 净化，防止 UNC 9P 层解析 .. 造成穿越。
+		projNorm := wslUncNormalize(fs.projectPath)
+		relPart := strings.TrimPrefix(norm[len(projNorm):], `\`)
+		if relPart == "" {
+			return projNorm, nil
+		}
+		joined, ok := wslJoinUnc(projNorm, relPart)
+		if !ok || !wslPathWithin(projNorm, joined) {
+			return "", errors.New("路径超出项目范围")
+		}
+		return joined, nil
+	}
+	// 相对路径
+	joined, ok := wslJoinUnc(fs.projectPath, path)
+	if !ok {
+		return "", errors.New("路径超出项目范围")
+	}
+	return joined, nil
 }
 
 // relativePath 返回相对于项目根路径的相对路径。
