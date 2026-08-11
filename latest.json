@@ -1,11 +1,11 @@
 {
-  "version": "0.1.0",
-  "notes": "Milevia 0.1.0 首次对外发布",
-  "pub_date": "2026-08-10T09:14:52.456Z",
+  "version": "0.1.1",
+  "notes": "优化建议支持编辑/删除/发送到对话; 修复 Pass B 静默丢弃; 修复 SQLite 相关回归",
+  "pub_date": "2026-08-11T06:59:04.293Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnc3hkSUZ0aTZRSG1OU0ZCY1JYUmpLOURxQXZLKzdLL3FReDF2LzFRT0JkbXdaN1MyczlwRzJISHYrdk9RM3cwbzE4WlNKREQxaEdzeSsrVk5NMmovSFE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MzUzMjkyCWZpbGU6TWlsZXZpYV8wLjEuMF94NjQtc2V0dXAuZXhlCjh0RTlXZ0puYXN0Q053YWVMUjFIMWVFZEQ1L2N5UmorcEpaVWpGQTR0dFo0SWgvNVhROElzTk1CM25QTlZkY3BaMDJlcmtqYUhtQ3dPN1A5aFZKbkNnPT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.0/Milevia_0.1.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnc3dnUFNaK2hVYmlqc3B3TE9xV2VKdkkxUFVnQTQrTkY4M2k2ZkYwWFEwbFhROVVkWHZQTk1XWXRRRVIzVW84Wi9vL1VXdE4ycGxVdDJUT2NGcjkxZUFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NDMxNTQ0CWZpbGU6TWlsZXZpYV8wLjEuMV94NjQtc2V0dXAuZXhlCngvZjRnRmtWVjZTOTZNMWpoOThBWjdsTElqNFU4TjZTeGpRNkhYNUhPTFo5RGh4a3cyN0JXOThhZzcyOFFNVFplODNzSVgwUjR1KzdUVkwxa2dNSUR3PT0K",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.1/Milevia_0.1.1_x64-setup.exe"
     }
   }
 }
