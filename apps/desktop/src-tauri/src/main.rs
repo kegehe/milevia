@@ -1,3 +1,7 @@
+// 发布版（release）以 Windows GUI 子系统运行：不弹黑色 cmd 控制台窗口。
+// dev（debug）保留控制台子系统，便于在终端观察日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::{
     env,
     error::Error,
@@ -284,6 +288,7 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
 
     let approval_binary_arg = approval_path.to_string_lossy().to_string();
     let session_token = Uuid::new_v4().simple().to_string();
+    let parent_pid = std::process::id();
     let mut child = Command::new(&sidecar_path)
         .args([
             "--mode",
@@ -299,6 +304,8 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
             "--approval-hook",
             &approval_binary_arg,
             "--native-approval-hook",
+            "--parent-pid",
+            &parent_pid.to_string(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

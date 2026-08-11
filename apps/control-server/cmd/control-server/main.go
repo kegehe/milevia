@@ -27,6 +27,7 @@ func main() {
 	allowedOrigin := flag.String("allowed-origin", "", "exact allowed browser origin for desktop mode")
 	approvalHook := flag.String("approval-hook", config.ApprovalHook, "approval hook executable or script")
 	nativeApprovalHook := flag.Bool("native-approval-hook", false, "run approval hook as a native executable")
+	parentPID := flag.Int("parent-pid", 0, "desktop host process PID; sidecar exits if this process dies")
 	flag.Parse()
 	if *mode != "web" && *mode != "desktop-api" {
 		log.Fatalf("invalid mode %q", *mode)
@@ -70,6 +71,16 @@ func main() {
 		log.Printf("control server shutting down: %v", ctx.Err())
 		server.Close()
 	}()
+	// 父进程（桌面主程序）监视：仅当本进程确由桌面拉起（parent-pid>0）才启用。
+	// sidecar 会因桌面主进程被强杀而变孤儿、长期占用 SQLite 库锁（导致下次启动卡在
+	// "库被锁定"）。检测到父进程死了就自行关闭，从源头避免残留。
+	if *parentPID > 0 {
+		app.WatchParentProcess(*parentPID, func() {
+			stop()
+			_ = listener.Close()
+			server.Close()
+		})
+	}
 	if err := server.ServeListener(listener, func(url string) {
 		log.Printf("control server listening on %s", url)
 		fmt.Printf("MILEVIA_READY=%s\n", url)

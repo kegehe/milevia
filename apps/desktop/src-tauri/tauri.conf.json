@@ -32,7 +32,20 @@
         "type": "downloadBootstrapper"
       },
       "wix": {
-        "language": "zh-CN"
+        "language": "zh-CN",
+        "bannerPath": "icons/wix-banner.bmp"
+      },
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "headerImage": "icons/nsis-header.bmp",
+        "sidebarImage": "icons/nsis-sidebar.bmp",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": false,
+        "installerHooks": "nsis-hooks.nsh"
       }
     }
   },
