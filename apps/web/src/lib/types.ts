@@ -44,7 +44,7 @@ export type TimelineItem =
   | { kind: "tool"; id: string; createdAt: string; action: ToolAction }
   | { kind: "system"; id: string; createdAt: string; system: SystemItem }
   | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
-export type WorkspaceTab = "conversation" | "tasks" | "files" | "git" | "run";
+export type WorkspaceTab = "conversation" | "tasks" | "files" | "git" | "run" | "insights";
 
 export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
 export type RunnerInfo = {

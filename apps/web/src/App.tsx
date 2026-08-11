@@ -14,6 +14,7 @@ import ConversationPage from "./pages/ConversationPage";
 import TaskBoardPage from "./pages/TaskBoardPage";
 import GitWorkbenchPage from "./pages/GitWorkbenchPage";
 import ProjectRunPage from "./pages/ProjectRunPage";
+import InsightsPage from "./pages/InsightsPage";
 import FilesPage from "./pages/FilesPage";
 import AgentProfilesPage from "./pages/AgentProfilesPage";
 import { UpdateBanner } from "./features/updater/UpdateBanner";
@@ -60,6 +61,7 @@ export function App() {
               <Route path="files" element={<FilesPage />} />
               <Route path="git" element={<GitWorkbenchPage />} />
               <Route path="run" element={<ProjectRunPage />} />
+              <Route path="insights" element={<InsightsPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

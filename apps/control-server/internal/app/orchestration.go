@@ -1436,6 +1436,7 @@ func (s *Server) gitOutput(ctx context.Context, repo string, args ...string) (st
 	cmd := exec.CommandContext(commandCtx, "git", args...)
 	cmd.Dir = repo
 	cmd.Env = gitCommandEnvironment(os.Environ())
+	configureProcessGroup(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(output), fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(string(output)))
@@ -1463,6 +1464,7 @@ func (s *Server) runVerificationCommands(ctx context.Context, job OrchestrationJ
 		commandCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 		cmd := exec.CommandContext(commandCtx, "sh", "-lc", command)
 		cmd.Dir = worktree
+		configureProcessGroup(cmd)
 		output, err := cmd.CombinedOutput()
 		cancel()
 		status := "passed"

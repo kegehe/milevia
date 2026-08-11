@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"sync"
@@ -143,7 +144,11 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 		return err
 	}
 	defer closeProfile()
-	args = append(args[:len(args)-1], append(profileArgs, args[len(args)-1])...)
+	// 与 claudeCLIRunner.Run 相同：PromptViaStdin（只读执行用）时 profileArgs 追加末尾，
+	// 且 prompt 经 stdin 提供（wsl 上一次性 claude 与 --allowedTools 都依赖 stdin）。
+	if request.PromptViaStdin {
+		args = append(args, profileArgs...)
+	}
 	cmd := r.wslClaudeCommand(ctx, args, environment, linuxWorkDir)
 
 	stdout, err := cmd.StdoutPipe()
@@ -153,6 +158,14 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("open Claude stderr: %w", err)
+	}
+	var stdin io.WriteCloser
+	if request.PromptViaStdin {
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			return fmt.Errorf("open Claude stdin (wsl): %w", err)
+		}
+		stdin = pipe
 	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Claude (wsl): %w", err)
@@ -173,10 +186,18 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 		}
 	}()
 
+	// PromptViaStdin：后台 goroutine 写 prompt 再关 stdin，避免阻塞主流程（与本地 Run 一致，
+	// 也不会因大 prompt 撑满管道而与后续 reader 互相阻塞——reader 已在此前启动）。
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); r.claude.readOutput(stdout, sink) }()
 	go func() { defer wg.Done(); r.claude.readStderr(stderr, sink) }()
+	if stdin != nil {
+		go func() {
+			_, _ = io.WriteString(stdin, request.Prompt)
+			_ = stdin.Close()
+		}()
+	}
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("Claude exited: %w", err)

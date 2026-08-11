@@ -52,7 +52,9 @@ func prepareNpmCLIRecovery(ctx context.Context, command string, install npmCLIIn
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(lookupCtx, "npm", "prefix", "-g").Output()
+	cmd := exec.CommandContext(lookupCtx, "npm", "prefix", "-g")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return npmCLIRecovery{}, fmt.Errorf("locate npm global prefix: %w", err)
 	}

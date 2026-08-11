@@ -21,6 +21,13 @@ use tauri_plugin_updater::UpdaterExt;
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// 启动 sidecar 时隐藏其控制台窗口：sidecar 是控制台子系统程序，若不传
+/// `CREATE_NO_WINDOW`，Windows 会为它分配一个独立黑色 cmd 窗口（伴随主程序弹出）。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 const DESKTOP_ORIGIN: &str = "https://tauri.localhost";
 const DEV_ORIGIN: &str = "http://127.0.0.1:1420";
 const SIDECAR_READY_PREFIX: &str = "MILEVIA_READY=";
@@ -296,6 +303,8 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // 隐藏 sidecar 控制台窗口（见 CREATE_NO_WINDOW）。
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| {
             format!(
@@ -424,6 +433,10 @@ fn create_main_window(app: &tauri::AppHandle, sidecar: &RunningSidecar) -> tauri
         .title("Milevia")
         .inner_size(1440.0, 920.0)
         .min_inner_size(1080.0, 720.0)
+        // Windows 上统一走 https://tauri.localhost 标准 scheme：WebView2 会把 http://
+        // 升级为 https://，而 wry 的资源拦截只注册 http，升级后无人拦截导致
+        // ERR_CONNECTION_REFUSED → 空白黑屏。打开 https 让导航/拦截/过滤三者一致。
+        .use_https_scheme(true)
         .initialization_script(&initialization_script)
         .on_navigation(navigation_allowed)
         .on_new_window(|_, _| NewWindowResponse::Deny)
@@ -470,6 +483,8 @@ fn restore_or_create_panel(
     .skip_taskbar(true)
     .resizable(false)
     .shadow(false)
+    // 同上：统一 https scheme，避免 WebView2 将 http 升级后 wry 拦截失效导致黑屏。
+    .use_https_scheme(true)
     .visible(false) // 先隐藏，待定位后再 show，避免在错误坐标闪一下
     .initialization_script(&initialization_script)
     .on_navigation(navigation_allowed)

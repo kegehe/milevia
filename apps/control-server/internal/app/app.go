@@ -208,6 +208,9 @@ type Server struct {
 	orchestrationActive    map[string]bool
 	orchestrationWG        sync.WaitGroup
 	orchestrationOwner     string
+	insightMu              sync.Mutex
+	insightActive          map[string]bool
+	insightWG              sync.WaitGroup
 }
 
 // runnerAgentKey scopes CLI maintenance to one tool on one Runner.
@@ -519,7 +522,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString()}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return s.allowedOrigin(r.Header.Get("Origin")) }
 	if config.SessionToken != "" {
 		s.upgrader.Subprotocols = []string{s.websocketSessionProtocol()}
@@ -625,6 +628,11 @@ func (s *Server) Close() {
 		s.orchestrationMu.Unlock()
 		s.orchestrationWG.Wait()
 		s.releaseOrchestrationLeases()
+		// 与 orchestration 同理：先取 insightMu 与请求侧的 Add(1) 建立次序，
+		// 再 Wait 以避免 WaitGroup 在计数为 0 时 Add/Wait 竞态。
+		s.insightMu.Lock()
+		s.insightMu.Unlock()
+		s.insightWG.Wait()
 		for _, runID := range runIDs {
 			s.resolveRunApprovals(runID, "deny")
 		}
@@ -778,6 +786,10 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
 	r.Post("/api/projects/{projectID}/tasks/review-all", s.reviewAllTasks)
+	r.Post("/api/projects/{projectID}/insights/scan", s.triggerInsightScan)
+	r.Get("/api/projects/{projectID}/insights", s.listInsights)
+	r.Delete("/api/projects/{projectID}/insights/{findingID}", s.deleteInsightFinding)
+	r.Patch("/api/projects/{projectID}/insights/{findingID}", s.updateInsightFinding)
 	r.Get("/api/projects/{projectID}/input-history", s.listProjectInputHistory)
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
 	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
@@ -1088,11 +1100,17 @@ create table if not exists shortcut_runs (id text primary key, shortcut_id text 
 create table if not exists shortcut_audit_events (id text primary key, shortcut_id text references shortcuts(id) on delete set null, action text not null, payload text not null default '{}', created_at datetime not null);
 create table if not exists app_metadata (key text primary key, value text not null);
 	create table if not exists project_run_configs (project_id text primary key references projects(id) on delete cascade, work_dir text not null default '', command text not null default '', env_vars text not null default '{}', execution_target text not null default 'auto', updated_at datetime not null);
+	create table if not exists project_insight_scans (id text primary key, project_id text not null references projects(id) on delete cascade, status text not null default 'running', error text not null default '', agent text not null default 'claude-code', repo_sha text not null default '', findings_count integer not null default 0, suppressed_count integer not null default 0, created_at datetime not null, started_at datetime, completed_at datetime);
+	create table if not exists project_insights (id text primary key, project_id text not null references projects(id) on delete cascade, scan_id text not null references project_insight_scans(id) on delete cascade, type text not null, severity text not null default 'normal', title text not null, summary text not null, file_hint text not null default '', fingerprint text not null default '', status text not null default 'open', created_at datetime not null, updated_at datetime not null);
 	create unique index if not exists projects_runner_path_unique on projects(runner,path);
 	create unique index if not exists conversations_one_current_per_project on conversations(project_id) where is_current=1;
 	create index if not exists messages_conversation_created on messages(conversation_id,created_at desc);
 	create index if not exists events_conversation_created on events(conversation_id,created_at desc);
-	create index if not exists run_usage_conversation_completed on run_usage(conversation_id,completed_at desc);`)
+	create index if not exists run_usage_conversation_completed on run_usage(conversation_id,completed_at desc);
+	create index if not exists project_insight_scans_project on project_insight_scans(project_id,created_at desc);
+	create index if not exists project_insights_project on project_insights(project_id,status);
+	create index if not exists project_insights_scan on project_insights(scan_id);
+	create unique index if not exists project_insights_project_fingerprint on project_insights(project_id,fingerprint);`)
 	if err != nil {
 		return fmt.Errorf("migrate database: %w", err)
 	}
@@ -1110,6 +1128,19 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	}
 	if err := ensureColumn(ctx, s.db, "project_run_configs", "execution_target", "text not null default 'auto'"); err != nil {
 		return fmt.Errorf("add project run execution target: %w", err)
+	}
+	// 优化建议扫描的方向（主题 + 查找类型）：只读展示本次扫描聚焦，参与 prompt 组装，不参与去重。
+	// 用 ensureColumn（幂等）而非改 create table heredoc——该表已存在，if not exists 不会补列。
+	if err := ensureColumn(ctx, s.db, "project_insight_scans", "theme", "text not null default ''"); err != nil {
+		return fmt.Errorf("add insight scan theme: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "project_insight_scans", "focus_types", "text not null default ''"); err != nil {
+		return fmt.Errorf("add insight scan focus types: %w", err)
+	}
+	// 服务启动时，上次运行遗留的 "running" 扫描行必然已不在此进程内跑（进程重启即中止）。
+	// 一律置为 failed，避免 triggerInsightScan 因残留 running 行而对该项目永久 409。
+	if _, err := s.db.ExecContext(ctx, `update project_insight_scans set status='failed',error='分析被中断，请重新发起',completed_at=? where status='running'`, time.Now().UTC()); err != nil {
+		return fmt.Errorf("clear orphaned insight scans: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `pragma table_info(conversations)`)
 	if err != nil {

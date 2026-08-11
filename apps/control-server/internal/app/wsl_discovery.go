@@ -38,7 +38,9 @@ func detectDefaultWSLDistro(ctx context.Context) (string, error) {
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	out, err := exec.CommandContext(probeCtx, wslPath, "--list", "--quiet").Output()
+	cmd := exec.CommandContext(probeCtx, wslPath, "--list", "--quiet")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
@@ -64,7 +66,9 @@ func detectWSLHome(ctx context.Context, distro string) (string, error) {
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	out, err := exec.CommandContext(probeCtx, wslPath, "-d", distro, "-e", "sh", "-c", "echo $HOME").Output()
+	cmd := exec.CommandContext(probeCtx, wslPath, "-d", distro, "-e", "sh", "-c", "echo $HOME")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}

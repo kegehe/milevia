@@ -1,0 +1,300 @@
+/* 优化建议页样式 —— 复用 conversation.css / tasks.css 的视觉 token */
+
+.insights {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: min(860px, 100%);
+  margin: 0 auto;
+  padding: 28px 30px 48px;
+}
+
+.insights-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.insights-heading { min-width: 0; }
+.insights-heading h2 { margin: 0 0 6px; color: #202942; font-size: 19px; }
+.insights-heading p { margin: 0; color: #71818b; font-size: 12px; line-height: 1.6; }
+.insights-head > button.primary { flex: none; min-width: 120px; }
+
+.insights-empty {
+  border: 1px dashed #cfd8e4;
+  border-radius: 8px;
+  padding: 26px 20px;
+  color: #687791;
+  background: #f8fafc;
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.insights-progress {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid #cfe0d6;
+  border-radius: 8px;
+  padding: 18px 20px;
+  background: #f4faf6;
+}
+.insights-spinner {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border: 3px solid #cfe3d8;
+  border-top-color: #2c7567;
+  border-radius: 50%;
+  animation: insight-spin 0.9s linear infinite;
+}
+@keyframes insight-spin { to { transform: rotate(360deg); } }
+.insights-progress b { color: #264a40; font-size: 14px; }
+.insights-progress small { display: block; margin-top: 3px; color: #6f887e; font-size: 11px; }
+
+.insights-failed {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #f2cfc5;
+  border-radius: 8px;
+  padding: 16px 18px;
+  color: #a73c2a;
+  background: #fff4f1;
+  font-size: 13px;
+}
+.insights-failed b { font-size: 14px; }
+
+.insights-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: #71818b;
+  font-size: 12px;
+}
+.insights-suppressed { color: #a66127; }
+
+.insights-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.insights-filters button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d4dae6;
+  border-radius: 99px;
+  padding: 6px 12px;
+  color: #46536e;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.insights-filters button:hover { border-color: #aeb9d0; background: #f3f5fa; }
+.insights-filters button.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-filters button small { font-size: 10px; opacity: 0.7; }
+
+.insights-pickers {
+  display: grid;
+  gap: 12px;
+  border: 1px dashed #cfd8e4;
+  border-radius: 8px;
+  padding: 16px 18px;
+  background: #f8fafc;
+}
+.insights-picker { display: flex; align-items: flex-start; gap: 12px; }
+.insights-picker-label {
+  flex: none;
+  width: 64px;
+  padding-top: 6px;
+  color: #5a687d;
+  font-size: 12px;
+  font-weight: 700;
+}
+.insights-theme-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.insights-theme-chips button {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d4dae6;
+  border-radius: 99px;
+  padding: 6px 12px;
+  color: #46536e;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.insights-theme-chips button:hover { border-color: #aeb9d0; background: #f3f5fa; }
+.insights-theme-chips button.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-type-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 14px;
+  color: #46536e;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.insights-type-option input { accent-color: #2c7567; cursor: pointer; }
+
+.insights-select-all {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d4dae6;
+  border-radius: 99px;
+  padding: 6px 12px;
+  margin-right: 14px;
+  color: #46536e;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.insights-select-all:hover:not(:disabled) { border-color: #aeb9d0; background: #f3f5fa; }
+.insights-select-all.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-select-all:disabled { cursor: default; opacity: 0.7; }
+
+.insights-focus { color: #35608a; }
+
+.insights-list {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.insight-card {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #d1e1d8;
+  border-radius: 7px;
+  padding: 13px 15px;
+  background: #fcfefc;
+  box-shadow: 0 1px 2px #17362c0d;
+  transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+.insight-card:hover { border-color: #91baaa; background: #fff; box-shadow: 0 7px 16px #17362c14; transform: translateY(-2px); }
+.insight-card > b { color: #264a40; font-size: 14px; font-weight: 780; line-height: 1.4; }
+.insight-card > p { margin: 0; color: #668077; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+
+.insight-card-type {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  border: 1px solid #d2e3da;
+  border-radius: 99px;
+  padding: 3px 9px 3px 6px;
+  color: #507066;
+  background: #f4f8f5;
+  font-size: 11px;
+  font-weight: 700;
+}
+.insight-type-icon { width: 14px; height: 14px; }
+.insight-card-type.insight-type-bug { color: #a73c2a; border-color: #f2cfc5; background: #fff4f1; }
+.insight-card-type.insight-type-style { color: #7b4b6d; border-color: #e5cfe0; background: #faf3f8; }
+.insight-card-type.insight-type-optimization { color: #41665b; border-color: #cfe0d6; background: #f4faf6; }
+.insight-card-type.insight-type-feature { color: #35608a; border-color: #c3d5e8; background: #f2f6fb; }
+
+.insight-card-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-top: 1px solid #e5eee8;
+  padding-top: 8px;
+}
+.insight-severity {
+  display: inline-flex;
+  border: 1px solid #d2e3da;
+  border-radius: 99px;
+  padding: 2px 8px;
+  color: #507066;
+  background: #f4f8f5;
+  font-size: 10px;
+  font-weight: 700;
+}
+.insight-severity.insight-severity-high { color: #ad4838; border-color: #f0d3cb; background: #fff3ef; }
+.insight-severity.insight-severity-low { color: #4f907f; border-color: #cdddd2; background: #eef6f1; }
+.insight-file {
+  max-width: 100%;
+  overflow: hidden;
+  color: #789087;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.insights-none {
+  border: 1px dashed #d4dae6;
+  border-radius: 8px;
+  padding: 22px;
+  color: #7a879b;
+  font-size: 12px;
+  text-align: center;
+}
+
+.insights-new { color: #1f5b4c; }
+
+/* 卡片动作行：默认低调，hover 卡片时显眼 */
+.insight-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  opacity: 0.65;
+  transition: opacity 0.18s ease;
+}
+.insight-card:hover .insight-card-actions,
+.insight-card.editing .insight-card-actions { opacity: 1; }
+.insight-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 3px 8px;
+  color: #5a687d;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.insight-action:hover { background: #eef3fb; border-color: #d4dae6; color: #25415f; }
+.insight-action.danger:hover { background: #fff0ee; border-color: #f2cfc5; color: #a73c2a; }
+.insight-action-icon { width: 13px; height: 13px; }
+
+/* 内联编辑表单 */
+.insight-card.editing { border-color: #a7cdbb; box-shadow: 0 0 0 3px #2c75671a; }
+.insight-edit-field { display: grid; gap: 4px; }
+.insight-edit-field > span { color: #5a687d; font-size: 11px; font-weight: 700; }
+.insight-edit-field input,
+.insight-edit-field textarea,
+.insight-edit-field select {
+  width: 100%;
+  border: 1px solid #cdd6e3;
+  border-radius: 6px;
+  padding: 7px 9px;
+  color: #202942;
+  background: #fff;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+.insight-edit-field input:focus,
+.insight-edit-field textarea:focus,
+.insight-edit-field select:focus { outline: none; border-color: #2c7567; box-shadow: 0 0 0 2px #2c75671a; }
+.insight-edit-severity select { max-width: 220px; }
+.insight-card.editing .insight-card-actions { justify-content: flex-end; border-top: 1px solid #e5eee8; padding-top: 10px; }
+.insight-card.editing .insight-card-actions button.secondary,
+.insight-card.editing .insight-card-actions button.primary { margin: 0; }

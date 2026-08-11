@@ -912,21 +912,41 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 		)
 	}
 	permissionArgs := sshClaudePermissionArgs(request.PermissionMode, approvalHookCmd)
-	// Explicitly resume the tracked session so one-shot SSH runs stay in the
-	// same conversation context. Mirrors claudeCLIRunner.args.
-	sessionArg := ""
-	if request.Resume && request.SessionID != "" {
-		sessionArg = "--resume " + shellQuote(request.SessionID)
-	} else if request.SessionID != "" {
-		sessionArg = "--session-id " + shellQuote(request.SessionID)
+	if len(request.ReadOnlyTools) > 0 {
+		// 只读执行：default + 仅放行只读工具（与本地 claude runner 一致）。
+		permissionArgs = "--permission-mode default --allowedTools " + shellQuote(strings.Join(request.ReadOnlyTools, " "))
 	}
-	cmd := fmt.Sprintf(
-		"cd %s && claude -p --verbose --output-format stream-json %s %s %s",
-		shellQuote(request.ProjectPath),
-		permissionArgs,
-		sessionArg,
-		shellQuote(request.Prompt),
-	)
+	// Explicitly resume the tracked session so one-shot SSH runs stay in the
+	// same conversation context. Mirrors claudeCLIRunner.args. 会话无关的只读分析
+	//（SkipSessionID）不带会话参数，避免 plan 模式一次性调用走"待命"分支。
+	sessionArg := ""
+	if !request.SkipSessionID {
+		if request.Resume && request.SessionID != "" {
+			sessionArg = "--resume " + shellQuote(request.SessionID)
+		} else if request.SessionID != "" {
+			sessionArg = "--session-id " + shellQuote(request.SessionID)
+		}
+	}
+	// --allowedTools（只读执行）要求 prompt 经 stdin 提供（`claude ... -` 读 stdin）；
+	// 否则按 argv 传 prompt。
+	var cmd string
+	if request.PromptViaStdin {
+		cmd = fmt.Sprintf(
+			"cd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json %s %s -",
+			shellQuote(request.ProjectPath),
+			shellQuote(request.Prompt),
+			permissionArgs,
+			sessionArg,
+		)
+	} else {
+		cmd = fmt.Sprintf(
+			"cd %s && claude -p --verbose --output-format stream-json %s %s %s",
+			shellQuote(request.ProjectPath),
+			permissionArgs,
+			sessionArg,
+			shellQuote(request.Prompt),
+		)
+	}
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {

@@ -16,6 +16,10 @@ function BackProjectsIcon() {
   return <svg className="back-projects-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5 8 12l6.5 6.5M8.5 12h8" /></svg>;
 }
 
+function ErrorAlertIcon() {
+  return <svg className="error-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5v4.5M12 16.5h.01M10.3 4.5 2.6 18a2 2 0 0 0 1.74 3h15.32a2 2 0 0 0 1.74-3L13.7 4.5a2 2 0 0 0-3.4 0Z" /></svg>;
+}
+
 function WorkspaceTabIcon({ tab }: { tab: WorkspaceTab }) {
   const paths: Record<WorkspaceTab, ReactNode> = {
     conversation: <><path d="M6.5 17.5 3.8 20v-11A3.5 3.5 0 0 1 7.3 5.5h9.4A3.5 3.5 0 0 1 20.2 9v5a3.5 3.5 0 0 1-3.5 3.5H6.5Z" /><path d="M8 11.5h8M8 14.5h5" /></>,
@@ -23,6 +27,7 @@ function WorkspaceTabIcon({ tab }: { tab: WorkspaceTab }) {
     files: <><path d="M4.5 7.5A2.5 2.5 0 0 1 7 5h3l1.7 2H17A2.5 2.5 0 0 1 19.5 9.5v7A2.5 2.5 0 0 1 17 19H7a2.5 2.5 0 0 1-2.5-2.5v-9Z" /><path d="M4.8 9h14.4" /></>,
     git: <><circle cx="6" cy="6" r="2" /><circle cx="18" cy="18" r="2" /><circle cx="18" cy="6" r="2" /><path d="M8 6h5a3 3 0 0 1 3 3v7M8 6h5a3 3 0 0 1 3 3" /></>,
     run: <><path d="m9 7 7 5-7 5V7Z" /><path d="M5 5.5v13M19 5.5v13" /></>,
+    insights: <><path d="M9.5 18.5h5M10 18.5l.6 2.4a.7.7 0 0 0 .68.51h1.44a.7.7 0 0 0 .68-.51L14 18.5" /><path d="M12 3.5a6 6 0 0 0-3 11.18c.73.48 1 1.35 1 2.32v.5h4v-.5c0-.97.27-1.84 1-2.32A6 6 0 0 0 12 3.5Z" /></>,
   };
   return <svg className="workspace-tab-icon" viewBox="0 0 24 24" aria-hidden="true">{paths[tab]}</svg>;
 }
@@ -43,6 +48,7 @@ export default function ProjectLayout() {
     if (path.endsWith("/files")) return "files";
     if (path.endsWith("/git")) return "git";
     if (path.endsWith("/run")) return "run";
+    if (path.endsWith("/insights")) return "insights";
     return "conversation";
   }, [location.pathname]);
 
@@ -61,6 +67,7 @@ export default function ProjectLayout() {
       case "files": navigate(`${base}/files`); break;
       case "git": navigate(`${base}/git`); break;
       case "run": navigate(`${base}/run`); break;
+      case "insights": navigate(`${base}/insights`); break;
     }
   }, [projectId, navigate]);
 
@@ -133,7 +140,7 @@ export default function ProjectLayout() {
   };
 
   return <div className="chat">
-    {globalError && <div className="error" role="alert"><span>{globalError}</span><button type="button" title="关闭错误提示" onClick={() => setGlobalError("")}>x</button></div>}
+    {globalError && <div className="error" role="alert"><ErrorAlertIcon /><span>{globalError}</span><button type="button" title="关闭错误提示" aria-label="关闭错误提示" onClick={() => setGlobalError("")}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button></div>}
     <header className="project-head">
       <div className="project-heading">
         <button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表" onClick={() => navigate("/")}><BackProjectsIcon /></button>
@@ -149,6 +156,7 @@ export default function ProjectLayout() {
       <button data-workspace-tab="files" id="workspace-tab-files" type="button" role="tab" aria-controls="workspace-panel-files" aria-selected={workspaceTab === "files"} className={workspaceTab === "files" ? "active" : ""} onClick={() => selectWorkspaceTab("files")}><WorkspaceTabIcon tab="files" /><span>文件</span></button>
       {project.gitBranch !== "非 Git 目录" && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
       <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} onClick={() => selectWorkspaceTab("run")}><WorkspaceTabIcon tab="run" /><span>项目启动</span></button>
+      <button data-workspace-tab="insights" id="workspace-tab-insights" type="button" role="tab" aria-controls="workspace-panel-insights" aria-selected={workspaceTab === "insights"} className={workspaceTab === "insights" ? "active" : ""} onClick={() => selectWorkspaceTab("insights")}><WorkspaceTabIcon tab="insights" /><span>优化建议</span></button>
     </nav>
     <main className="workspace-content">
       <Outlet context={{ project } satisfies ProjectLayoutOutletContext} />

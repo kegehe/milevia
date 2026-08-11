@@ -168,7 +168,7 @@ test("head actions portal into the project header so the canvas grid stays clean
 
 test("project workspaces expose global request failures", () => {
   assert.match(projectLayout, /const \{ error: globalError, setError: setGlobalError, refreshStatuses \} = useProjectContext\(\);/);
-  assert.match(projectLayout, /\{globalError && <div className="error" role="alert"><span>\{globalError\}<\/span><button type="button" title="关闭错误提示" onClick=\{\(\) => setGlobalError\(""\)\}>x<\/button><\/div>\}/);
+  assert.match(projectLayout, /\{globalError && <div className="error" role="alert"><ErrorAlertIcon \/><span>\{globalError\}<\/span><button type="button" title="关闭错误提示" aria-label="关闭错误提示" onClick=\{\(\) => setGlobalError\(""\)\}><svg[\s\S]*?<\/svg><\/button><\/div>\}/);
   assert.match(projectLayout, /<button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表"[\s\S]*?<BackProjectsIcon \/><\/button>\s*<h2>\{project\.name\}<\/h2>/);
   assert.doesNotMatch(projectLayout, /<label>\{project\.runner\}<\/label>/);
   assert.doesNotMatch(projectLayout, /<code>\{project\.pathDisplay\}<\/code>/);
@@ -225,7 +225,7 @@ test("approval and task-board views keep working inside the workspace", () => {
 
 test("Git workbench and project runner are first-class workspace tabs", () => {
   // Types 在 lib/types.ts
-  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "files" \| "git" \| "run";/);
+  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "files" \| "git" \| "run" \| "insights";/);
   // ProjectLayout 管理 workspace tabs
   assert.match(projectLayout, /const \[workspaceTab, setWorkspaceTab\] = useState<WorkspaceTab>/);
   assert.match(projectLayout, /<nav className="workspace-tabs" role="tablist" aria-label="项目工作区" onKeyDown=\{navigateWorkspaceTabs\}>/);
@@ -332,7 +332,7 @@ test("clearing context starts a fresh conversation with the current agent and po
 });
 
 test("creating a conversation keeps the newly navigated route", () => {
-  const newConversation = conversationPage.match(/const newConversation = async[\s\S]*?\n  };\n\n  const clearConversationContext/);
+  const newConversation = conversationPage.match(/const newConversation = async[\s\S]*?\r?\n  };\r?\n\r?\n  const clearConversationContext/);
   assert.ok(newConversation, "newConversation handler should exist");
   assert.match(newConversation[0], /`\/api\/projects\/\$\{projectId\}\/conversations\?new=true`/);
   assert.match(newConversation[0], /navigate\(`\/projects\/\$\{projectId\}\/conversations\/\$\{next\.id\}`, \{ replace: true \}\);/);

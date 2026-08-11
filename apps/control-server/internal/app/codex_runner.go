@@ -43,7 +43,9 @@ func (r *codexCLIRunner) Ready(parent context.Context) bool {
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, r.config.CodexPath, "login", "status").Run() == nil
+	cmd := exec.CommandContext(ctx, r.config.CodexPath, "login", "status")
+	configureProcessGroup(cmd)
+	return cmd.Run() == nil
 }
 
 // BinaryReady reports whether the Codex binary is present, independent of any
@@ -57,7 +59,9 @@ func (r *codexCLIRunner) BinaryReady() bool {
 func (r *codexCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, r.config.CodexPath, "--version").Output()
+	cmd := exec.CommandContext(ctx, r.config.CodexPath, "--version")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -71,7 +75,9 @@ func (r *codexCLIRunner) CheckUpdate(parent context.Context) (bool, string, erro
 	}
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "npm", "view", "@openai/codex", "version").Output()
+	cmd := exec.CommandContext(ctx, "npm", "view", "@openai/codex", "version")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return false, "", fmt.Errorf("query latest Codex version: %w", err)
 	}
@@ -206,6 +212,7 @@ func (r *codexCLIRunner) Update(parent context.Context) (string, string, error) 
 	defer cancel()
 	var out bytes.Buffer
 	cmd := exec.CommandContext(ctx, r.config.CodexPath, "update")
+	configureProcessGroup(cmd)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
@@ -585,6 +592,7 @@ func codexGitDiff(gitDir, projectRoot, relPath string) string {
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 	)
+	configureProcessGroup(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

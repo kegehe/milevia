@@ -87,7 +87,22 @@ type AgentRunRequest struct {
 	// AgentID identifies which CLI ("claude-code" or "codex") this run targets.
 	// SSH runners consult it to dispatch to the correct remote command.
 	AgentID string
+	// Profile resolves model/baseUrl/managed-key injection for this run.
 	Profile *AgentRuntimeProfile
+	// SkipSessionID 让一次性 Run 不带 --session-id/--resume。会话无关的只读分析
+	//（投递式扫描）需要它：规划模式的 Claude 在带 --session-id 的一次性 -p 调用下
+	// 会进入"待命"而非执行，导致扫描收到 "I'll wait for your request"。
+	SkipSessionID bool
+	// ReadOnlyExecution 让一次性 Run 走"只读执行"而非 `--permission-mode plan`：
+	// 使用 --permission-mode default + --allowedTools 仅放行只读工具（Read/Glob/Grep/
+	// List 等）。这样 agent 能真正执行（读、搜索、结论）而物理上无法修改任何文件，
+	// 且只读工具无需审批不会挂起——是"在当前分支只读分析、不改代码"的正确姿势。
+	// 实测：配合"你的唯一回复就是这个 JSON"的强结构 prompt，能稳定返回单一 JSON 数组。
+	ReadOnlyTools []string
+	// PromptViaStdin 让一次性 Run 把 prompt 写入 stdin（而非作为最后 argv 参数）。
+	// claude 在同时使用 --allowedTools 时要求 --print 的输入必须经 stdin 提供，
+	// 传 argv 会报 "Input must be provided ... as a prompt argument" 而退出码 1。
+	PromptViaStdin bool
 }
 
 type AgentRunSink interface {
@@ -216,13 +231,17 @@ func (r *claudeCLIRunner) Ready(parent context.Context) bool {
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, r.config.ClaudePath, "auth", "status").Run() == nil
+	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "auth", "status")
+	configureProcessGroup(cmd)
+	return cmd.Run() == nil
 }
 
 func (r *claudeCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, r.config.ClaudePath, "--version").Output()
+	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "--version")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -237,7 +256,9 @@ func (r *claudeCLIRunner) CheckUpdate(parent context.Context) (bool, string, err
 	}
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "npm", "view", "@anthropic-ai/claude-code", "version").Output()
+	cmd := exec.CommandContext(ctx, "npm", "view", "@anthropic-ai/claude-code", "version")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return false, "", fmt.Errorf("query latest version: %w", err)
 	}
@@ -254,6 +275,7 @@ func (r *claudeCLIRunner) Update(parent context.Context) (string, string, error)
 	ctx, cancel := context.WithTimeout(parent, r.config.agentUpdateTimeout())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "update")
+	configureProcessGroup(cmd)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -394,11 +416,25 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 		return err
 	}
 	defer closeProfile()
-	args = append(args[:len(args)-1], append(profileArgs, args[len(args)-1])...)
+	// 插入 profile 注入的 CLI 参数。prompt 作为 argv 末尾时（非 PromptViaStdin），
+	// profileArgs 需插到 prompt 之前；prompt 走 stdin 时则直接追加到末尾。
+	if request.PromptViaStdin {
+		args = append(args, profileArgs...)
+	} else {
+		args = append(args[:len(args)-1], append(profileArgs, args[len(args)-1])...)
+	}
 	cmd := exec.Command(r.config.ClaudePath, args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
 	configureProcessGroup(cmd)
+	var stdin io.WriteCloser
+	if request.PromptViaStdin {
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			return fmt.Errorf("open Claude stdin: %w", err)
+		}
+		stdin = pipe
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -411,7 +447,6 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Claude: %w", err)
 	}
-
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -437,6 +472,16 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 		defer wg.Done()
 		r.readStderr(stderr, sink)
 	}()
+	// PromptViaStdin：后台 goroutine 写 prompt 再关 stdin。绝不能在此主流程同步写——
+	// 大 prompt 超出 OS 管道缓冲时会阻塞，而此时 reader 才刚启动，claude 提前大量输出
+	// stdout/stderr 装满其管道后也会阻塞读 stdin，形成互相等待的死锁。goroutine 化后，
+	// 写 stdin 与读 stdout 并行推进，claude 边读边写不会互相卡死。
+	if stdin != nil {
+		go func() {
+			_, _ = io.WriteString(stdin, request.Prompt)
+			_ = stdin.Close()
+		}()
+	}
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("Claude exited: %w", err)
@@ -529,7 +574,10 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 
 func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	args := []string{"-p", "--verbose", "--output-format", "stream-json"}
-	if request.PermissionMode == "full_control" {
+	if len(request.ReadOnlyTools) > 0 {
+		// 只读执行：default 模式 + 仅放行只读工具，agent 能执行但改不了任何文件。
+		args = append(args, "--permission-mode", "default", "--allowedTools", strings.Join(request.ReadOnlyTools, " "))
+	} else if request.PermissionMode == "full_control" {
 		args = append(args, "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions")
 	} else if isReadOnlyClaudeRequest(request.PermissionMode) {
 		args = append(args, "--permission-mode", "plan")
@@ -552,7 +600,9 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 		}
 		args = append(args, "--settings", string(settings))
 	}
-	if request.Resume {
+	if request.SkipSessionID {
+		// 会话无关的一次性只读分析：不带 --session-id/--resume，避免 plan 模式走"待命"分支。
+	} else if request.Resume {
 		args = append(args, "--resume", request.SessionID)
 	} else {
 		args = append(args, "--session-id", request.SessionID)
@@ -560,7 +610,11 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	if request.Profile != nil && request.Profile.Model != "" {
 		args = append(args, "--model", request.Profile.Model)
 	}
-	return append(args, request.Prompt), nil
+	// PromptViaStdin 时 prompt 走 stdin（ReadOnlyTools 需如此），不追加为 argv。
+	if !request.PromptViaStdin {
+		args = append(args, request.Prompt)
+	}
+	return args, nil
 }
 
 func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, error) {

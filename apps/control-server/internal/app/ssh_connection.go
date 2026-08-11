@@ -180,7 +180,9 @@ type sshProfile struct {
 }
 
 var getSSHConfigOutput = func(name string) ([]byte, error) {
-	return exec.Command("ssh", "-G", name).Output()
+	cmd := exec.Command("ssh", "-G", name)
+	configureProcessGroup(cmd)
+	return cmd.Output()
 }
 
 func resolveSSHProfile(name string) (sshProfile, error) {

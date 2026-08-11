@@ -774,6 +774,7 @@ export default function ConversationPage() {
   const lastReloadRequestedAt = useRef(0);
   const lastReloadRunID = useRef<string | null>(null);
   const addFileHandledRef = useRef<string | null>(null);
+  const addInsightHandledRef = useRef<string | null>(null);
 
   const setComposerText = useCallback((value: string, conversationID = conversationRef.current?.id, persist = true) => {
     textRef.current = value;
@@ -811,6 +812,24 @@ export default function ConversationPage() {
     // 将文件路径追加到输入框
     const prefix = textRef.current.trim() ? `${textRef.current}\n` : "";
     setComposerText(`${prefix}@${filePath} `, conversation.id);
+  }, [projectId, conversation?.id, searchParams, setSearchParams, setComposerText]);
+
+  // 处理从优化建议"发送到对话"传来的提示词：追加到输入框现有内容末尾，等用户检查后再发送。
+  useEffect(() => {
+    if (!projectId || !conversation?.id) return;
+    const addInsight = searchParams.get("addInsight");
+    if (addInsight !== "true") return;
+    const prompt = sessionStorage.getItem("milevia_insight_prompt");
+    if (!prompt) return;
+    // 同一会话只处理一次（避免 searchParams 清除后重新触发）
+    const dedupKey = `${conversation.id}:${prompt}`;
+    if (addInsightHandledRef.current === dedupKey) return;
+    addInsightHandledRef.current = dedupKey;
+    sessionStorage.removeItem("milevia_insight_prompt");
+    // 清除 URL 中的 addInsight 参数
+    setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("addInsight"); return next; });
+    // 追加到输入框末尾（与已有草稿不互相覆盖）
+    setComposerText(mergeDraftAndPending(textRef.current, prompt), conversation.id);
   }, [projectId, conversation?.id, searchParams, setSearchParams, setComposerText]);
 
   useEffect(() => () => {

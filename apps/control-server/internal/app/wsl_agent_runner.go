@@ -75,7 +75,9 @@ func (r *wslAgentRunner) wslBridgeProbe(ctx context.Context, command string) (st
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	out, err := exec.CommandContext(probeCtx, wslPath, "-d", r.distro, "-e", "sh", "-c", command).Output()
+	cmd := exec.CommandContext(probeCtx, wslPath, "-d", r.distro, "-e", "sh", "-c", command)
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("WSL 探测失败：%s: %w", strings.TrimSpace(string(out)), err)
 	}
