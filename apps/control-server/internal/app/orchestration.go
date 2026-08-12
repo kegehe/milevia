@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -1545,7 +1546,7 @@ func (s *Server) runVerificationCommands(ctx context.Context, job OrchestrationJ
 		}
 		started := time.Now().UTC()
 		commandCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
-		cmd := exec.CommandContext(commandCtx, "sh", "-lc", command)
+		cmd := newVerificationCommand(commandCtx, command)
 		cmd.Dir = worktree
 		configureProcessGroup(cmd)
 		output, err := cmd.CombinedOutput()
@@ -1569,6 +1570,21 @@ func (s *Server) runVerificationCommands(ctx context.Context, job OrchestrationJ
 		}
 	}
 	return nil
+}
+
+// newVerificationCommand selects the shell available on the control server.
+// Verification commands run in the task worktree, not inside an AI CLI, so a
+// Windows server must not depend on a separately installed POSIX shell.
+func newVerificationCommand(ctx context.Context, command string) *exec.Cmd {
+	executable, args := verificationCommandArgs(runtime.GOOS, command)
+	return exec.CommandContext(ctx, executable, args...)
+}
+
+func verificationCommandArgs(goos, command string) (string, []string) {
+	if goos == "windows" {
+		return "cmd.exe", []string{"/d", "/s", "/c", command}
+	}
+	return "sh", []string{"-lc", command}
 }
 
 type ReleaseSnapshot struct {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -3429,6 +3430,23 @@ func TestAutomaticOrchestrationIntegratesVerifiedTaskToDev(t *testing.T) {
 	}
 }
 
+func TestVerificationCommandArgsUsePlatformShell(t *testing.T) {
+	tests := []struct {
+		goos       string
+		wantBinary string
+		wantArgs   []string
+	}{
+		{goos: "windows", wantBinary: "cmd.exe", wantArgs: []string{"/d", "/s", "/c", "npm test"}},
+		{goos: "linux", wantBinary: "sh", wantArgs: []string{"-lc", "npm test"}},
+	}
+	for _, test := range tests {
+		binary, args := verificationCommandArgs(test.goos, "npm test")
+		if binary != test.wantBinary || !reflect.DeepEqual(args, test.wantArgs) {
+			t.Fatalf("verification command for %s = %q %q, want %q %q", test.goos, binary, args, test.wantBinary, test.wantArgs)
+		}
+	}
+}
+
 func TestAutomaticOrchestrationDoesNotAdvanceDevWhenIntegrationVerificationFails(t *testing.T) {
 	server := newTestServer(t)
 	repo := t.TempDir()
@@ -5107,6 +5125,11 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 	dirtyWorktree := errorText(errors.New("project worktree is not clean"))
 	if dirtyWorktree != "项目工作区存在未提交或未跟踪的更改。请提交、暂存或清理这些更改后重试任务编排。" {
 		t.Fatalf("dirty worktree error = %q", dirtyWorktree)
+	}
+
+	missingShell := errorText(errors.New(`dev baseline verification failed: ls: exec: "sh": executable file not found in %PATH%`))
+	if missingShell != "自动编排无法执行验证命令：系统找不到 sh。请升级服务端到支持 Windows 命令解释器的版本后，恢复队列并重试。" {
+		t.Fatalf("missing shell error = %q", missingShell)
 	}
 
 	unknown := localizedHTTPErrorText(http.StatusInternalServerError, errors.New("database connection refused"))

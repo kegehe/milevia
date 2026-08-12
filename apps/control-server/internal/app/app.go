@@ -4798,6 +4798,9 @@ func localizedErrorText(err error, fallback string) string {
 	if strings.HasPrefix(message, "project workspace is occupied") {
 		return "项目工作区正被其他 AI 任务或 Git 操作占用，请等待当前操作完成后重试。"
 	}
+	if strings.Contains(message, `exec: "sh": executable file not found`) {
+		return "自动编排无法执行验证命令：系统找不到 sh。请升级服务端到支持 Windows 命令解释器的版本后，恢复队列并重试。"
+	}
 
 	translations := map[string]string{
 		"project not found":      "项目不存在或已被删除。",
