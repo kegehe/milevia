@@ -2,6 +2,8 @@
 
 import { apiURL, sessionHeaders } from "./runtime";
 
+const requestTimeoutMs = 15_000;
+
 function retryCountFor(init?: RequestInit): number {
   const method = (init?.method ?? "GET").toUpperCase();
   return method === "GET" || method === "HEAD" || method === "OPTIONS" ? 2 : 0;
@@ -15,10 +17,26 @@ export async function api<T>(path: string, init?: RequestInit, retries = retryCo
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const headers = sessionHeaders(init?.headers);
       if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-      const response = await fetch(apiURL(path), {
-        ...init,
-        headers,
-      });
+      const controller = new AbortController();
+      const timeout = globalThis.setTimeout(() => controller.abort(), requestTimeoutMs);
+      const abort = () => controller.abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      let response: Response;
+      try {
+        response = await fetch(apiURL(path), {
+          ...init,
+          headers,
+          signal: controller.signal,
+        });
+      } catch (cause) {
+        if (controller.signal.aborted && !signal?.aborted) {
+          throw new Error("控制服务未在 15 秒内响应，请重启 Milevia 后重试。");
+        }
+        throw cause;
+      } finally {
+        globalThis.clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
+      }
       if (response.ok) {
         if (response.status === 204 || response.status === 205) return undefined as T;
         try {

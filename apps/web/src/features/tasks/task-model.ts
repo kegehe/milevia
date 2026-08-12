@@ -6,13 +6,12 @@ export type TaskFilter = "active" | "todo" | "running" | "awaiting_review";
 export type Dependency = { taskId: string; title: string; status: TaskStatus };
 export type Blocker = Dependency;
 export type TaskRun = { id: string; runId: string; sequence: number; status: string; createdAt: string; finishedAt?: string; failureReason: string };
-export type VerificationRun = { id: string; phase: "baseline" | "task" | "review" | string; command: string; reviewedSha?: string; status: "passed" | "failed" | string; exitCode: number; output?: string; createdAt: string; completedAt?: string };
+export type VerificationRun = { id: string; phase: "task" | "review" | string; command: string; reviewedSha?: string; status: "passed" | "failed" | string; exitCode: number; output?: string; createdAt: string; completedAt?: string };
 export type TaskEvent = { id: string; taskId: string; taskRunId?: string; type: string; payload: unknown; createdAt: string };
 export type Task = {
   id: string;
   title: string;
   description: string;
-  acceptanceCriteria: string;
   priority: Priority;
   pinned?: boolean;
   position: number;
@@ -22,11 +21,12 @@ export type Task = {
   blocks: Dependency[];
   lastRun?: TaskRun;
   orchestrationStatus?: string;
+  orchestrationTargetBranch?: string;
   orchestrationUpdatedAt?: string;
   createdAt: string;
   updatedAt: string;
 };
-export type TaskDetail = Task & { promptPreview: string; canDispatch: boolean; blockReason?: string; runs: TaskRun[]; events: TaskEvent[]; verificationRuns: VerificationRun[] };
+export type TaskDetail = Task & { canDispatch: boolean; blockReason?: string; runs: TaskRun[]; events: TaskEvent[]; verificationRuns: VerificationRun[] };
 
 export const priorityLabels: Record<Priority, string> = { urgent: "紧急", high: "高", normal: "普通", low: "低" };
 export const statusLabels: Record<TaskStatus, string> = { todo: "待处理", running: "执行中", awaiting_review: "待验收", action_required: "需处理", done: "已完成", cancelled: "已取消" };
@@ -40,7 +40,7 @@ export function taskDisplayStatus(task: Task): string {
   if (task.orchestrationStatus === "stopped") return "自动编排已停止";
   if (task.orchestrationStatus === "removing") return "自动编排清理中";
   if (task.orchestrationStatus === "needs_human") return "自动编排需处理";
-  if (isTaskAwaitingMainMerge(task)) return "待合并 main";
+  if (isTaskAwaitingMainMerge(task)) return `待合并 ${task.orchestrationTargetBranch || "目标分支"}`;
   if (task.status === "running" && task.lastRun?.status === "queued") return "队列中";
   return statusLabels[task.status];
 }
@@ -66,7 +66,21 @@ export function canOfferDispatch(task: Task): boolean {
 }
 
 export function canRedispatch(task: Task): boolean {
-  return task.status === "action_required" && !isTaskBlocked(task) && task.lastRun?.status !== "queued" && task.lastRun?.status !== "running";
+  if (task.status === "action_required") {
+    // 编排清理中不提供重新下发，避免与收尾流程竞争。
+    return !isTaskOrchestrating(task) && !isTaskBlocked(task)
+      && task.lastRun?.status !== "queued" && task.lastRun?.status !== "running";
+  }
+  if (task.status === "awaiting_review") {
+    // 待验收任务可直接重新下发（跳过"要求修改"这一步），但仅限非编排管理的任务：
+    // 只要挂了编排 job（paused/needs_human/checking/待合并等任何状态），就必须走
+    // resume/验收/要求修改等编排感知路径，避免与编排收尾互相覆盖任务状态。
+    // blockedBy 与后端一致：前置被重开会同样拦下发。
+    return !task.orchestrationStatus
+      && task.blockedBy.length === 0
+      && task.lastRun?.status !== "queued" && task.lastRun?.status !== "running";
+  }
+  return false;
 }
 
 export function filterQueueTasks(tasks: Task[], filter: TaskFilter): Task[] {
@@ -99,7 +113,7 @@ export function taskQueueNote(task: Task): string {
   if (task.orchestrationStatus === "stopped") return "自动编排已停止，可重新开始";
   if (task.orchestrationStatus === "removing") return "自动编排正在停止执行并清理工作区";
   if (task.orchestrationStatus === "needs_human") return "自动编排需要人工处理";
-	if (isTaskAwaitingMainMerge(task)) return "分支已验证，可合并至 main";
+  if (isTaskAwaitingMainMerge(task)) return `分支已验证，可合并至 ${task.orchestrationTargetBranch || "目标分支"}`;
   if (isTaskBlocked(task)) return `等待：${task.blockedBy.map((item) => item.title).join("、")}`;
   if (task.status === "awaiting_review") return "执行完成，等待人工确认";
   if (task.status === "action_required" && task.lastRun) {
@@ -112,7 +126,9 @@ export function taskQueueNote(task: Task): string {
     return "执行中";
   }
   if (task.lastRun) return `第 ${task.lastRun.sequence} 次执行：${task.lastRun.status}`;
-  return "可独立处理";
+  // 全新未执行、无阻塞、无编排状态的待办任务没有任何可补充的状态说明：
+  // 是否可下发已由行内的下发按钮表达，这里不重复提示。
+  return "";
 }
 
 export function taskRunStatusLabel(status: string): string {

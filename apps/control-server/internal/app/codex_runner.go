@@ -382,6 +382,8 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink, projectPath string) {
 func readCodexStderr(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	// 同 claude readStderr：解码 wsl.exe 的 UTF-16LE 主机侧警告；非 WSL 路径行为不变。
+	scanner.Split(wslStderrSplit)
 	for scanner.Scan() {
 		if text := strings.TrimSpace(scanner.Text()); text != "" {
 			// codex exec emits this informational line when its /dev/null stdin is

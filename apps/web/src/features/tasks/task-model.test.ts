@@ -8,7 +8,6 @@ const makeTask = (id: string, overrides: Partial<Task> = {}): Task => ({
   id,
   title: id,
   description: "Task description",
-  acceptanceCriteria: "Task acceptance criteria",
   priority: "normal",
   position: 1,
   status: "todo",
@@ -57,16 +56,47 @@ test("shows failure reason in queue note for action_required tasks", () => {
 test("shows awaiting review note", () => {
   const review = makeTask("review", { status: "awaiting_review" });
   assert.match(taskQueueNote(review), /执行完成，等待人工确认/);
-  assert.equal(canRedispatch(review), false);
+  assert.equal(canRedispatch(review), true);
+});
+
+test("blocks redispatch while awaiting_review task is under orchestration", () => {
+  const checking = makeTask("checking", { status: "awaiting_review", orchestrationStatus: "checking" });
+  assert.equal(isTaskOrchestrating(checking), true);
+  assert.equal(canRedispatch(checking), false);
+
+  const awaitingMain = makeTask("merge", { status: "awaiting_review", orchestrationStatus: "awaiting_main", orchestrationTargetBranch: "release/2026.08" });
+  assert.equal(isTaskAwaitingMainMerge(awaitingMain), true);
+  assert.equal(canRedispatch(awaitingMain), false);
+
+  // 暂停/待人工决策/清理中……任何编排状态都禁止手动重新下发，
+  // 防止与编排收尾互相覆盖任务状态（后端同规则）。
+  for (const orchestrationStatus of ["paused", "needs_human", "stopped", "removing"]) {
+    const task = makeTask("orch", { status: "awaiting_review", orchestrationStatus });
+    assert.equal(canRedispatch(task), false);
+  }
+});
+
+test("blocks redispatch when awaiting_review task has unfinished predecessors", () => {
+  const blocked = makeTask("blocked-review", {
+    status: "awaiting_review",
+    blockedBy: [{ taskId: "predecessor", title: "完成接口设计", status: "action_required" }],
+  });
+  assert.equal(canRedispatch(blocked), false);
 });
 
 test("marks verified orchestration branches as awaiting main merge", () => {
   for (const orchestrationStatus of ["awaiting_main", "integrated_to_dev"]) {
     const task = makeTask(orchestrationStatus, { status: "awaiting_review", orchestrationStatus });
     assert.equal(isTaskAwaitingMainMerge(task), true);
-    assert.equal(taskDisplayStatus(task), "待合并 main");
-    assert.match(taskQueueNote(task), /可合并至 main/);
+    assert.equal(taskDisplayStatus(task), "待合并 目标分支");
+    assert.match(taskQueueNote(task), /可合并至 目标分支/);
   }
+});
+
+test("shows the orchestration snapshot target branch", () => {
+  const task = makeTask("release", { orchestrationStatus: "awaiting_main", orchestrationTargetBranch: "release/2026.08" });
+  assert.equal(taskDisplayStatus(task), "待合并 release/2026.08");
+  assert.match(taskQueueNote(task), /可合并至 release\/2026\.08/);
 });
 
 test("makes an active independent review visible ahead of manual review", () => {
@@ -118,6 +148,17 @@ test("requires server eligibility in the queue confirmation flow", () => {
   assert.match(source, /\/dispatch/);
 });
 
+test("offers re-dispatch and icon-only review on awaiting_review cards", () => {
+  const source = readFileSync(new URL("./TaskQueue.tsx", import.meta.url), "utf8");
+
+  // 待验收卡片四按钮 2×2：验收(1,1)、置顶(1,2)、重新下发(2,1)、删除(2,2)。
+  // 重新下发按钮在待验收态落到下排左位（awaiting-review 修饰类由 CSS 定位）。
+  assert.match(source, /task\.status === "awaiting_review" \? " awaiting-review" : ""/);
+  // 验收按钮改为图标：不再渲染文字，保留 title/aria-label 无障碍提示。
+  assert.match(source, /className="task-queue-review" draggable=\{false\} title="验收"/);
+  assert.doesNotMatch(source, /task-queue-review secondary/);
+});
+
 test("exposes historical cancelled tasks as read-only items in the board", () => {
   const source = readFileSync(new URL("./TaskBoard.tsx", import.meta.url), "utf8");
 
@@ -157,6 +198,8 @@ test("uses WebSocket history once and caps client-side run logs", () => {
 	assert.match(source, /LOG_BOTTOM_THRESHOLD/);
 	assert.doesNotMatch(source, /scrollIntoView/);
 	assert.match(source, /\.slice\(-MAX_LOG_ENTRIES\)/);
+	assert.match(source, /request<RunStatusResponse>\(`\$\{basePath\}\/logs\/clear`, \{ method: "POST" \}\)/);
+	assert.match(source, /setStatus\(next\)/);
 });
 
 test("resets runner state only when changing projects", () => {

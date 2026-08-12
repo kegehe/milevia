@@ -37,6 +37,12 @@ const (
 var errOrchestrationWaiting = errors.New("orchestration queue head is waiting")
 
 const maxIndependentReviewAttempts = 3
+const maxOrchestrationFixRounds = 10
+
+const (
+	orchestrationWorktreeRemoveAttempts = 4
+	orchestrationWorktreeRemoveDelay    = 750 * time.Millisecond
+)
 
 type independentReviewProtocolError struct{ cause error }
 
@@ -45,6 +51,20 @@ func (err independentReviewProtocolError) Error() string {
 }
 
 func (err independentReviewProtocolError) Unwrap() error { return err.cause }
+
+// orchestrationAgentFailure is a previously localized task-run failure. Keep
+// its concrete agent message when it is promoted to the orchestration job.
+type orchestrationAgentFailure struct{ reason string }
+
+func (err orchestrationAgentFailure) Error() string { return err.reason }
+
+func orchestrationFailureText(cause error) string {
+	var agentFailure orchestrationAgentFailure
+	if errors.As(cause, &agentFailure) {
+		return agentFailure.reason
+	}
+	return errorText(cause)
+}
 
 type OrchestrationConfig struct {
 	ProjectID            string   `json:"projectId"`
@@ -74,6 +94,7 @@ type OrchestrationJob struct {
 	ExecutionContext   string     `json:"-"`
 	ResourcesCleanedAt *time.Time `json:"resourcesCleanedAt,omitempty"`
 	LastError          string     `json:"lastError,omitempty"`
+	TargetBranch       string     `json:"targetBranch,omitempty"`
 	PolicySnapshot     string     `json:"-"`
 	CreatedAt          time.Time  `json:"createdAt"`
 	UpdatedAt          time.Time  `json:"updatedAt"`
@@ -143,6 +164,7 @@ create table if not exists orchestration_batches (
 	project_id text not null references projects(id) on delete cascade,
 	name text not null,
 	conversation_strategy text not null default 'new',
+	archived_at datetime,
 	created_at datetime not null,
 	updated_at datetime not null
 );
@@ -219,6 +241,9 @@ create index if not exists verification_runs_job on verification_runs(job_id,cre
 	}
 	if err := ensureColumn(ctx, s.db, "task_orchestration_jobs", "batch_id", "text not null default ''"); err != nil {
 		return fmt.Errorf("add orchestration batch: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "orchestration_batches", "archived_at", "datetime"); err != nil {
+		return fmt.Errorf("add orchestration batch archive timestamp: %w", err)
 	}
 	if err := ensureColumn(ctx, s.db, "task_orchestration_jobs", "human_decision", "text not null default ''"); err != nil {
 		return fmt.Errorf("add orchestration decision: %w", err)
@@ -474,6 +499,42 @@ func (s *Server) orchestrationConfig(ctx context.Context, projectID string) (Orc
 	return cfg, nil
 }
 
+// orchestrationTargetBranch reads the branch that was frozen when a job entered
+// the queue. Old jobs without a complete snapshot retain the historical main
+// default rather than inheriting a later project configuration change.
+func orchestrationTargetBranch(projectID, policySnapshot string) string {
+	cfg := defaultOrchestrationConfig(projectID)
+	if strings.TrimSpace(policySnapshot) != "" {
+		_ = json.Unmarshal([]byte(policySnapshot), &cfg)
+	}
+	if strings.TrimSpace(cfg.MainBranch) == "" {
+		return "main"
+	}
+	return cfg.MainBranch
+}
+
+// orchestrationConfigForJob decodes the immutable policy captured for a job.
+// Early snapshots did not include every setting. They keep the historical main
+// target while borrowing only the missing verification commands from the
+// current project policy, since those commands cannot be recovered otherwise.
+func (s *Server) orchestrationConfigForJob(ctx context.Context, projectID, policySnapshot string) (OrchestrationConfig, error) {
+	cfg := defaultOrchestrationConfig(projectID)
+	if strings.TrimSpace(policySnapshot) != "" {
+		if err := json.Unmarshal([]byte(policySnapshot), &cfg); err != nil {
+			return OrchestrationConfig{}, err
+		}
+	}
+	cfg.ProjectID = projectID
+	if len(cfg.VerificationCommands) == 0 {
+		current, err := s.orchestrationConfig(ctx, projectID)
+		if err != nil {
+			return OrchestrationConfig{}, err
+		}
+		cfg.VerificationCommands = current.VerificationCommands
+	}
+	return cfg, nil
+}
+
 func validateOrchestrationConfig(cfg OrchestrationConfig) error {
 	if !validOrchestrationBranch(cfg.MainBranch) {
 		return errors.New("main branch is invalid")
@@ -481,7 +542,7 @@ func validateOrchestrationConfig(cfg OrchestrationConfig) error {
 	if cfg.AgentID != "claude-code" && cfg.AgentID != "codex" {
 		return errors.New("automatic orchestration agent is invalid")
 	}
-	if cfg.MaxFixRounds < 1 || cfg.MaxFixRounds > 10 {
+	if cfg.MaxFixRounds < 1 || cfg.MaxFixRounds > maxOrchestrationFixRounds {
 		return errors.New("maxFixRounds must be between 1 and 10")
 	}
 	if cfg.Enabled && len(cfg.VerificationCommands) == 0 {
@@ -852,19 +913,36 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, errors.New("project not found"))
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,name,conversation_strategy,created_at,updated_at from orchestration_batches where project_id=? order by created_at desc`, projectID)
+	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,name,conversation_strategy,created_at,updated_at from orchestration_batches where project_id=? and archived_at is null order by created_at desc`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	defer rows.Close()
 	items := []OrchestrationBatch{}
 	for rows.Next() {
 		var item OrchestrationBatch
 		if err := rows.Scan(&item.ID, &item.ProjectID, &item.Name, &item.ConversationStrategy, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			rows.Close()
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := rows.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// The SQLite pool has one connection. Release the batch result set before
+	// calculating each batch's job summary, otherwise the next query waits on
+	// the connection held by rows indefinitely.
+	for index := range items {
+		item := &items[index]
 		var active, blocked, paused, awaitingMain int
 		if err := s.db.QueryRowContext(r.Context(), `select count(*), coalesce(sum(case when status in ('queued','preparing','implementing','checking') then 1 else 0 end),0), coalesce(sum(case when status='needs_human' then 1 else 0 end),0), coalesce(sum(case when status in ('paused','stopped') then 1 else 0 end),0), coalesce(sum(case when status in ('awaiting_main','integrated_to_dev') then 1 else 0 end),0) from task_orchestration_jobs where batch_id=?`, item.ID).Scan(&item.TaskCount, &active, &blocked, &paused, &awaitingMain); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -882,13 +960,40 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 		} else {
 			item.Status = "completed"
 		}
-		items = append(items, item)
 	}
-	if err := rows.Err(); err != nil {
+	writeJSON(w, http.StatusOK, items)
+}
+
+// deleteOrchestrationBatch archives a plan from the user-facing list. Queue
+// jobs retain their batch ID so inherited conversation context stays intact.
+func (s *Server) deleteOrchestrationBatch(w http.ResponseWriter, r *http.Request) {
+	projectID, batchID := chi.URLParam(r, "projectID"), chi.URLParam(r, "batchID")
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, items)
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(r.Context(), `update orchestration_batches set archived_at=?,updated_at=? where id=? and project_id=? and archived_at is null`, now, now, batchID, projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed != 1 {
+		writeError(w, http.StatusNotFound, errors.New("orchestration batch not found"))
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // addTasksToOrchestrationBatch permits a running plan to grow without
@@ -916,7 +1021,7 @@ func (s *Server) addTasksToOrchestrationBatch(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var batchExists bool
-	if err = s.db.QueryRowContext(r.Context(), `select exists(select 1 from orchestration_batches where id=? and project_id=?)`, batchID, projectID).Scan(&batchExists); err != nil {
+	if err = s.db.QueryRowContext(r.Context(), `select exists(select 1 from orchestration_batches where id=? and project_id=? and archived_at is null)`, batchID, projectID).Scan(&batchExists); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1048,10 +1153,19 @@ func (s *Server) dequeueTaskFromOrchestration(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusConflict, fmt.Errorf("wait for task execution to stop before cleanup: %w", err))
 		return
 	}
+	// A queue removal can delete a stopped task's worktree. Serialize this with
+	// project-level Git and filesystem operations just like explicit cleanup.
+	release, acquired := s.acquireProjectWorkspace(projectID, "orchestration-dequeue:"+jobID)
+	if !acquired {
+		_, _ = s.db.ExecContext(context.Background(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, orchestrationStopped, time.Now().UTC(), jobID, orchestrationRemoving)
+		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		return
+	}
+	defer release()
 	// A removed job must not retain its deterministic branch name. Clean the
 	// Git resources before deleting the record so a cleanup failure remains
 	// actionable rather than becoming an invisible orphan.
-	if err = s.removeOrchestrationGitResources(r.Context(), projectPath, worktree, branch); err != nil {
+	if err = s.removeOrchestrationGitResources(r.Context(), projectPath, projectID, jobID, worktree, branch); err != nil {
 		_, _ = s.db.ExecContext(r.Context(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, orchestrationStopped, time.Now().UTC(), jobID, orchestrationRemoving)
 		writeError(w, http.StatusConflict, err)
 		return
@@ -1210,7 +1324,7 @@ func (s *Server) reorderOrchestrationJobs(w http.ResponseWriter, r *http.Request
 
 func (s *Server) listOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
-	rows, err := s.db.QueryContext(r.Context(), `select job.id,job.project_id,job.task_id,job.queue_position,job.status,job.attempt,job.lease_token,job.base_dev_sha,coalesce(record.task_branch,''),coalesce(record.worktree_path,''),coalesce(record.conversation_id,''),job.batch_id,job.human_decision,record.resources_cleaned_at,job.last_error,job.created_at,job.updated_at from task_orchestration_jobs job left join git_task_records record on record.job_id=job.id where job.project_id=? order by job.queue_position`, projectID)
+	rows, err := s.db.QueryContext(r.Context(), `select job.id,job.project_id,job.task_id,job.queue_position,job.status,job.attempt,job.lease_token,job.base_dev_sha,coalesce(record.task_branch,''),coalesce(record.worktree_path,''),coalesce(record.conversation_id,''),job.batch_id,job.human_decision,record.resources_cleaned_at,job.last_error,job.policy_snapshot,job.created_at,job.updated_at from task_orchestration_jobs job left join git_task_records record on record.job_id=job.id where job.project_id=? order by job.queue_position`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1219,10 +1333,11 @@ func (s *Server) listOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
 	items := []OrchestrationJob{}
 	for rows.Next() {
 		var item OrchestrationJob
-		if err := rows.Scan(&item.ID, &item.ProjectID, &item.TaskID, &item.Position, &item.Status, &item.Attempt, &item.LeaseToken, &item.BaseDevSHA, &item.TaskBranch, &item.WorktreePath, &item.ConversationID, &item.BatchID, &item.HumanDecision, &item.ResourcesCleanedAt, &item.LastError, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.ProjectID, &item.TaskID, &item.Position, &item.Status, &item.Attempt, &item.LeaseToken, &item.BaseDevSHA, &item.TaskBranch, &item.WorktreePath, &item.ConversationID, &item.BatchID, &item.HumanDecision, &item.ResourcesCleanedAt, &item.LastError, &item.PolicySnapshot, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		item.TargetBranch = orchestrationTargetBranch(item.ProjectID, item.PolicySnapshot)
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -1233,7 +1348,6 @@ func (s *Server) listOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) submitOrchestrationDecision(w http.ResponseWriter, r *http.Request) {
-	taskID := chi.URLParam(r, "taskID")
 	var input struct {
 		Decision string `json:"decision"`
 	}
@@ -1245,42 +1359,23 @@ func (s *Server) submitOrchestrationDecision(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, errors.New("decision must be between 1 and 8000 characters"))
 		return
 	}
-	var job OrchestrationJob
-	err := s.db.QueryRowContext(r.Context(), `select job.id,job.project_id,coalesce(record.conversation_id,'') from task_orchestration_jobs job left join git_task_records record on record.job_id=job.id where job.task_id=? and job.status='needs_human'`, taskID).Scan(&job.ID, &job.ProjectID, &job.ConversationID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusConflict, errors.New("task is not waiting for a human decision"))
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	now := time.Now().UTC()
-	if _, err = s.db.ExecContext(r.Context(), `update task_orchestration_jobs set human_decision=?,updated_at=? where id=? and status='needs_human'`, input.Decision, now, job.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if job.ConversationID != "" {
-		message := Message{ID: uuid.NewString(), ConversationID: job.ConversationID, Role: "user", Content: "人工决策：\n" + input.Decision, CreatedAt: now}
-		if _, err = s.db.ExecContext(r.Context(), `insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values (?,?,?,?,?,?,?)`, message.ID, message.ConversationID, "", message.Role, message.Content, "", now); err == nil {
-			s.broadcastConversationEvent(Event{ID: uuid.NewString(), ConversationID: job.ConversationID, Type: "user.message", Payload: mustJSON(message), CreatedAt: now})
-		}
-	}
-	// Resume through the same guarded state transition used by the normal UI.
-	s.setOrchestrationJobPause(w, r, orchestrationQueued)
+	// Store the decision and resume through one guarded transaction, so a
+	// concurrent stop cannot be overwritten by this request.
+	s.setOrchestrationJobPause(w, r, orchestrationQueued, input.Decision)
 }
 
 func (s *Server) cleanupOrchestrationResources(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 	var input struct {
-		ConfirmUnmerged bool `json:"confirmUnmerged"`
+		ConfirmUnmerged       bool `json:"confirmUnmerged"`
+		CloseLockingProcesses bool `json:"closeLockingProcesses"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
 	var job OrchestrationJob
 	var projectPath string
-	err := s.db.QueryRowContext(r.Context(), `select job.id,job.project_id,job.status,coalesce(record.task_branch,''),coalesce(record.worktree_path,''),record.resources_cleaned_at,project.path from task_orchestration_jobs job join projects project on project.id=job.project_id join git_task_records record on record.job_id=job.id where job.task_id=?`, taskID).Scan(&job.ID, &job.ProjectID, &job.Status, &job.TaskBranch, &job.WorktreePath, &job.ResourcesCleanedAt, &projectPath)
+	err := s.db.QueryRowContext(r.Context(), `select job.id,job.project_id,job.status,job.policy_snapshot,coalesce(record.task_branch,''),coalesce(record.worktree_path,''),record.resources_cleaned_at,project.path from task_orchestration_jobs job join projects project on project.id=job.project_id join git_task_records record on record.job_id=job.id where job.task_id=?`, taskID).Scan(&job.ID, &job.ProjectID, &job.Status, &job.PolicySnapshot, &job.TaskBranch, &job.WorktreePath, &job.ResourcesCleanedAt, &projectPath)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("orchestration resources not found"))
 		return
@@ -1298,7 +1393,7 @@ func (s *Server) cleanupOrchestrationResources(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if job.Status != "released_to_main" && !input.ConfirmUnmerged {
-		writeError(w, http.StatusConflict, errors.New("this branch is not merged into main; explicit unmerged cleanup confirmation is required"))
+		writeError(w, http.StatusConflict, fmt.Errorf("this branch is not merged into %s; explicit unmerged cleanup confirmation is required", orchestrationTargetBranch(job.ProjectID, job.PolicySnapshot)))
 		return
 	}
 	s.runManagersMu.RLock()
@@ -1308,20 +1403,130 @@ func (s *Server) cleanupOrchestrationResources(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusConflict, errors.New("stop the project acceptance process before cleaning its worktree"))
 		return
 	}
-	if err = s.removeOrchestrationGitResources(r.Context(), projectPath, job.WorktreePath, job.TaskBranch); err != nil {
-		writeError(w, http.StatusConflict, err)
-		return
-	}
-	now := time.Now().UTC()
-	if _, err = s.db.ExecContext(r.Context(), `update git_task_records set worktree_path='',resources_cleaned_at=?,updated_at=? where job_id=?`, now, now, job.ID); err != nil {
+	// Reserve the job before stopping processes or removing files. This prevents
+	// a concurrent resume/cleanup from racing with the worktree deletion.
+	claimed, err := s.db.ExecContext(r.Context(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, orchestrationRemoving, time.Now().UTC(), job.ID, job.Status)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if changed, _ := claimed.RowsAffected(); changed != 1 {
+		writeError(w, http.StatusConflict, errors.New("job state changed before resources could be cleaned"))
+		return
+	}
+	cleanupSucceeded := false
+	gitResourcesRemoved := false
+	defer func() {
+		if !cleanupSucceeded {
+			restoredStatus := job.Status
+			if gitResourcesRemoved {
+				// The worktree no longer exists. Keep this job non-resumable even
+				// when persisting the cleanup marker failed; a later cleanup retry
+				// can safely repair the record because Git removal is idempotent.
+				restoredStatus = orchestrationStopped
+			}
+			_, _ = s.db.ExecContext(context.Background(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, restoredStatus, time.Now().UTC(), job.ID, orchestrationRemoving)
+		}
+	}()
+
+	// Stopped and needs-human jobs can still have a just-exited CLI process.
+	// Windows does not permit Git to remove a directory while such a process
+	// keeps a file handle open.
+	s.cancelOrchestrationJob(job.ID)
+	s.stopOrchestrationRun(context.Background(), taskID)
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelCleanup()
+	if err = s.waitForOrchestrationJobShutdown(cleanupCtx, job.ID); err != nil {
+		writeError(w, http.StatusConflict, fmt.Errorf("wait for task execution to stop before cleanup: %w", err))
+		return
+	}
+
+	// Serialize the physical Git cleanup with user Git operations after the
+	// execution run has released its own workspace lease.
+	release, acquired := s.acquireProjectWorkspace(job.ProjectID, "orchestration-cleanup:"+job.ID)
+	if !acquired {
+		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		return
+	}
+	defer release()
+	if err = s.removeOrchestrationGitResources(cleanupCtx, projectPath, job.ProjectID, job.ID, job.WorktreePath, job.TaskBranch); err != nil {
+		gitResourcesRemoved = orchestrationWorktreeNoLongerExists(job.WorktreePath)
+		// Closing external applications is a destructive last resort. First let
+		// Git handle a normal or already-unregistered worktree; only a genuine
+		// Windows handle-lock error warrants asking Restart Manager to stop apps.
+		if !input.CloseLockingProcesses || !isWorktreeHandleInUseError(err) || strings.TrimSpace(job.WorktreePath) == "" {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		if !isExpectedOrchestrationWorktree(projectPath, job.WorktreePath, job.ProjectID, job.ID) {
+			writeError(w, http.StatusConflict, errors.New("refusing to close processes for worktree outside the automatic orchestration directory"))
+			return
+		}
+		if err = closeWorktreeLockingProcesses(cleanupCtx, job.WorktreePath); err != nil {
+			writeError(w, http.StatusConflict, fmt.Errorf("close processes using task worktree: %w", err))
+			return
+		}
+		if err = s.removeOrchestrationGitResources(cleanupCtx, projectPath, job.ProjectID, job.ID, job.WorktreePath, job.TaskBranch); err != nil {
+			gitResourcesRemoved = orchestrationWorktreeNoLongerExists(job.WorktreePath)
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+	}
+	gitResourcesRemoved = true
+	now := time.Now().UTC()
+	completedStatus := job.Status
+	if completedStatus == orchestrationNeedsHuman {
+		// Cleanup is destructive for an unmerged task. Do not leave a resumable
+		// state pointing at a worktree that no longer exists.
+		completedStatus = orchestrationStopped
+	}
+	// The Git operation cannot be transactional, but all persistent state that
+	// follows it must change together. A disconnected HTTP client must not leave
+	// a resumable job pointing at a worktree that was already deleted.
+	finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelFinalize()
+	tx, err := s.db.BeginTx(finalizeCtx, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(finalizeCtx, `update git_task_records set worktree_path='',resources_cleaned_at=?,updated_at=? where job_id=?`, now, now, job.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	result, err := tx.ExecContext(finalizeCtx, `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, completedStatus, now, job.ID, orchestrationRemoving)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		writeError(w, http.StatusConflict, errors.New("job state changed while resources were being cleaned"))
+		return
+	}
+	if job.Status == orchestrationNeedsHuman {
+		var blocked int
+		if err = tx.QueryRowContext(finalizeCtx, `select count(*) from task_orchestration_jobs where project_id=? and status=?`, job.ProjectID, orchestrationNeedsHuman).Scan(&blocked); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if blocked == 0 {
+			if _, err = tx.ExecContext(finalizeCtx, `update project_orchestration_configs set frozen_reason='',updated_at=? where project_id=?`, now, job.ProjectID); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	cleanupSucceeded = true
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) pauseOrchestrationJob(w http.ResponseWriter, r *http.Request) {
-	s.setOrchestrationJobPause(w, r, orchestrationPaused)
+	s.setOrchestrationJobPause(w, r, orchestrationPaused, "")
 }
 
 // stopOrchestrationJob removes a job from scheduling but intentionally keeps
@@ -1345,7 +1550,7 @@ func (s *Server) stopOrchestrationJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	result, err := tx.ExecContext(r.Context(), `update task_orchestration_jobs set status=?,last_error='',updated_at=? where id=? and status in ('queued','preparing','implementing','checking','paused','needs_human')`, orchestrationStopped, now, jobID)
+	result, err := tx.ExecContext(r.Context(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status in ('queued','preparing','implementing','checking','paused','needs_human')`, orchestrationStopped, now, jobID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1384,14 +1589,14 @@ func (s *Server) stopOrchestrationJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resumeOrchestrationJob(w http.ResponseWriter, r *http.Request) {
-	s.setOrchestrationJobPause(w, r, orchestrationQueued)
+	s.setOrchestrationJobPause(w, r, orchestrationQueued, "")
 }
 
 func (s *Server) mergeTaskBranchToMain(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 	var job OrchestrationJob
 	var branch, commit string
-	err := s.db.QueryRowContext(r.Context(), `select job.id,job.project_id,job.status,record.task_branch,record.integration_sha from task_orchestration_jobs job join git_task_records record on record.job_id=job.id where job.task_id=?`, taskID).Scan(&job.ID, &job.ProjectID, &job.Status, &branch, &commit)
+	err := s.db.QueryRowContext(r.Context(), `select job.id,job.project_id,job.status,job.policy_snapshot,record.task_branch,record.integration_sha from task_orchestration_jobs job join git_task_records record on record.job_id=job.id where job.task_id=?`, taskID).Scan(&job.ID, &job.ProjectID, &job.Status, &job.PolicySnapshot, &branch, &commit)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("orchestration task branch not found"))
 		return
@@ -1409,11 +1614,7 @@ func (s *Server) mergeTaskBranchToMain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	cfg, err := s.orchestrationConfig(r.Context(), job.ProjectID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
+	targetBranch := orchestrationTargetBranch(job.ProjectID, job.PolicySnapshot)
 	release, acquired := s.acquireProjectWorkspace(job.ProjectID, "orchestration-merge:"+job.ID)
 	if !acquired {
 		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
@@ -1429,8 +1630,8 @@ func (s *Server) mergeTaskBranchToMain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	if strings.TrimSpace(currentBranch) != cfg.MainBranch {
-		writeError(w, http.StatusConflict, fmt.Errorf("project worktree must be on %s before merging", cfg.MainBranch))
+	if strings.TrimSpace(currentBranch) != targetBranch {
+		writeError(w, http.StatusConflict, fmt.Errorf("project worktree must be on %s before merging", targetBranch))
 		return
 	}
 	branchCommit, err := s.gitOutput(r.Context(), project.Path, "rev-parse", branch)
@@ -1442,17 +1643,17 @@ func (s *Server) mergeTaskBranchToMain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("task branch no longer points to the reviewed commit"))
 		return
 	}
-	if err = s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", commit, cfg.MainBranch); err != nil {
+	if err = s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", commit, targetBranch); err != nil {
 		if err = s.gitCommand(r.Context(), project.Path, "merge", "--no-ff", "--no-edit", branch); err != nil {
 			// Never leave a conflicted merge in the project worktree. The user can
 			// resolve it on a dedicated branch and try again after it is clean.
 			_ = s.gitCommand(r.Context(), project.Path, "merge", "--abort")
-			writeError(w, http.StatusConflict, fmt.Errorf("cannot merge task branch %s into %s: %w", branch, cfg.MainBranch, err))
+			writeError(w, http.StatusConflict, fmt.Errorf("cannot merge task branch %s into %s: %w", branch, targetBranch, err))
 			return
 		}
 	}
-	if err = s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", commit, cfg.MainBranch); err != nil {
-		writeError(w, http.StatusConflict, errors.New("main does not contain this task branch commit after merge"))
+	if err = s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", commit, targetBranch); err != nil {
+		writeError(w, http.StatusConflict, fmt.Errorf("%s does not contain this task branch commit after merge", targetBranch))
 		return
 	}
 	now := time.Now().UTC()
@@ -1482,7 +1683,7 @@ func (s *Server) mergeTaskBranchToMain(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) setOrchestrationJobPause(w http.ResponseWriter, r *http.Request, target string) {
+func (s *Server) setOrchestrationJobPause(w http.ResponseWriter, r *http.Request, target, decision string) {
 	taskID := chi.URLParam(r, "taskID")
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1490,8 +1691,9 @@ func (s *Server) setOrchestrationJobPause(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer tx.Rollback()
-	var jobID, projectID, previousStatus, taskCommitSHA string
-	err = tx.QueryRowContext(r.Context(), `select job.id,job.project_id,job.status,coalesce(record.task_commit_sha,'') from task_orchestration_jobs job left join git_task_records record on record.job_id=job.id where job.task_id=?`, taskID).Scan(&jobID, &projectID, &previousStatus, &taskCommitSHA)
+	var jobID, projectID, previousStatus, taskCommitSHA, policySnapshot, humanDecision, conversationID string
+	var attempt int
+	err = tx.QueryRowContext(r.Context(), `select job.id,job.project_id,job.status,job.attempt,job.policy_snapshot,job.human_decision,coalesce(record.task_commit_sha,''),coalesce(record.conversation_id,'') from task_orchestration_jobs job left join git_task_records record on record.job_id=job.id where job.task_id=?`, taskID).Scan(&jobID, &projectID, &previousStatus, &attempt, &policySnapshot, &humanDecision, &taskCommitSHA, &conversationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("orchestration job not found"))
 		return
@@ -1500,15 +1702,66 @@ func (s *Server) setOrchestrationJobPause(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if strings.TrimSpace(decision) != "" && previousStatus != orchestrationNeedsHuman {
+		writeError(w, http.StatusConflict, errors.New("task is not waiting for a human decision"))
+		return
+	}
+	// Earlier versions reset job.attempt during manual recovery. Recover its
+	// monotonic value from the immutable execution intents before scheduling a
+	// new run, otherwise a resume can attach to one of the already-failed Runs.
+	if previousStatus == orchestrationNeedsHuman {
+		var recordedAttempt int
+		if err := tx.QueryRowContext(r.Context(), `select coalesce(max(attempt),0) from task_execution_intents where job_id=? and phase='implementation'`, jobID).Scan(&recordedAttempt); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if recordedAttempt > attempt {
+			attempt = recordedAttempt
+		}
+	}
 	allowed := "status in ('queued','preparing','implementing','checking')"
 	if target == orchestrationQueued {
 		allowed = "status in ('paused','needs_human','stopped')"
 	}
+	if target == orchestrationQueued && previousStatus == orchestrationNeedsHuman && strings.TrimSpace(decision) == "" && strings.TrimSpace(humanDecision) == "" {
+		writeError(w, http.StatusConflict, errors.New("submit a human decision before resuming this orchestration task"))
+		return
+	}
 	update := `update task_orchestration_jobs set status=?,updated_at=? where task_id=? and ` + allowed
+	updateArgs := []any{target, time.Now().UTC(), taskID}
 	if target == orchestrationQueued {
 		update = `update task_orchestration_jobs set status=?,last_error='',updated_at=? where task_id=? and ` + allowed
+		if previousStatus == orchestrationNeedsHuman {
+			// Keep attempt monotonic: execution intents are unique per phase and
+			// attempt, so resetting it could resume an old Run after a credential
+			// failure. Extend this job's snapshot enough for the resumed execution
+			// and one subsequent automatic retry.
+			cfg := defaultOrchestrationConfig(projectID)
+			if strings.TrimSpace(policySnapshot) != "" {
+				if err := json.Unmarshal([]byte(policySnapshot), &cfg); err != nil {
+					writeError(w, http.StatusInternalServerError, fmt.Errorf("decode orchestration policy snapshot: %w", err))
+					return
+				}
+			}
+			cfg.ProjectID = projectID
+			if cfg.MaxFixRounds < attempt+1 {
+				cfg.MaxFixRounds = min(attempt+1, maxOrchestrationFixRounds)
+			}
+			updatedSnapshot, marshalErr := json.Marshal(cfg)
+			if marshalErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("encode orchestration policy snapshot: %w", marshalErr))
+				return
+			}
+			if strings.TrimSpace(decision) != "" {
+				update = `update task_orchestration_jobs set status=?,last_error='',human_decision=?,attempt=case when attempt<? then ? else attempt end,policy_snapshot=?,updated_at=? where task_id=? and ` + allowed
+				updateArgs = []any{target, decision, attempt, attempt, string(updatedSnapshot), time.Now().UTC(), taskID}
+			} else {
+				update = `update task_orchestration_jobs set status=?,last_error='',attempt=case when attempt<? then ? else attempt end,policy_snapshot=?,updated_at=? where task_id=? and ` + allowed
+				updateArgs = []any{target, attempt, attempt, string(updatedSnapshot), time.Now().UTC(), taskID}
+			}
+		}
 	}
-	result, err := tx.ExecContext(r.Context(), update, target, time.Now().UTC(), taskID)
+	result, err := tx.ExecContext(r.Context(), update, updateArgs...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1547,9 +1800,21 @@ func (s *Server) setOrchestrationJobPause(w http.ResponseWriter, r *http.Request
 			}
 		}
 	}
+	var decisionMessage *Message
+	if target == orchestrationQueued && previousStatus == orchestrationNeedsHuman && strings.TrimSpace(decision) != "" && conversationID != "" {
+		message := Message{ID: uuid.NewString(), ConversationID: conversationID, Role: "user", Content: "人工决策：\n" + decision, CreatedAt: time.Now().UTC()}
+		if _, err := tx.ExecContext(r.Context(), `insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values (?,?,?,?,?,?,?)`, message.ID, message.ConversationID, "", message.Role, message.Content, "", message.CreatedAt); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		decisionMessage = &message
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if decisionMessage != nil {
+		s.broadcastConversationEvent(Event{ID: uuid.NewString(), ConversationID: conversationID, Type: "user.message", Payload: mustJSON(*decisionMessage), CreatedAt: decisionMessage.CreatedAt})
 	}
 	if target == orchestrationPaused {
 		s.cancelOrchestrationJob(jobID)
@@ -1658,8 +1923,8 @@ func (s *Server) processProjectOrchestration(ctx context.Context, projectID stri
 		close(done)
 		s.orchestrationMu.Unlock()
 	}()
-	var cfg OrchestrationConfig
-	if err := json.Unmarshal([]byte(job.PolicySnapshot), &cfg); err != nil {
+	cfg, err := s.orchestrationConfigForJob(jobCtx, job.ProjectID, job.PolicySnapshot)
+	if err != nil {
 		s.failOrchestrationJob(jobCtx, *job, fmt.Errorf("decode policy snapshot: %w", err))
 		return
 	}
@@ -1883,6 +2148,22 @@ func (s *Server) hasOrchestrationJob(ctx context.Context, taskID string) bool {
 	return err == nil && exists
 }
 
+// sqlQueryer 是 *sql.DB 与 *sql.Tx 的最小公共查询接口，供跨 DB/事务复用的查询辅助使用。
+type sqlQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// orchestrationOwnsTask 判断任务是否仍被"编排感知"的 job 持有执行上下文（即存在未合并的
+// orchestration job）。released_to_main 是终态（已合并进目标分支），编排已结束，不再
+// 阻止手动重新下发。判定集合与前端 hydrateTask 的 orchestrationStatus 查询完全一致
+// （同样排除 released_to_main），避免"前端显示可重新下发、后端 409"的前后端不一致。
+func orchestrationOwnsTask(ctx context.Context, q sqlQueryer, taskID string) (bool, error) {
+	var owns bool
+	err := q.QueryRowContext(ctx, `select exists(select 1 from task_orchestration_jobs
+		where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev'))`, taskID).Scan(&owns)
+	return owns, err
+}
+
 func (s *Server) orchestrationDependenciesIntegrated(ctx context.Context, taskID string) (bool, error) {
 	var unresolved int
 	err := s.db.QueryRowContext(ctx, `select count(*) from task_dependencies dependency left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status='released_to_main' where dependency.task_id=? and predecessor.id is null`, taskID).Scan(&unresolved)
@@ -1921,14 +2202,10 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 	} else if !ready {
 		return errOrchestrationWaiting
 	}
-	if err := s.ensureCleanRepository(ctx, project.Path); err != nil {
-		return err
-	}
 	if err := s.gitCommand(ctx, project.Path, "show-ref", "--verify", "--quiet", "refs/heads/"+cfg.MainBranch); err != nil {
 		return fmt.Errorf("main branch check: %w", err)
 	}
 	var base, branch, worktree string
-	newRecord := false
 	if job.Status == orchestrationQueued {
 		record, recordErr := s.orchestrationTaskRecord(ctx, job.ID)
 		if recordErr == nil {
@@ -1936,7 +2213,10 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 		} else if !errors.Is(recordErr, sql.ErrNoRows) {
 			return recordErr
 		} else {
-			newRecord = true
+			// The task branch is created from the committed main branch SHA and
+			// checked out into an isolated worktree, so uncommitted or untracked
+			// changes in the project worktree never affect the task and must not
+			// block its first dispatch.
 			branch = automaticOrchestrationBranch(time.Now(), task.ID)
 			if err := s.gitCommand(ctx, project.Path, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
 				return errors.New("automatic orchestration branch already exists for this task")
@@ -2038,22 +2318,6 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			return fmt.Errorf("create task worktree: %w", worktreeErr)
 		}
 	}
-	// A repair attempt must keep the failed implementation worktree and proceed
-	// directly to the agent. The one exception is an initial baseline failure:
-	// no implementation Run was started, so resuming must verify the baseline
-	// again before any agent is dispatched.
-	var implementationStarted bool
-	if !newRecord {
-		err = s.db.QueryRowContext(ctx, `select exists(select 1 from task_execution_intents where job_id=? and phase='implementation' and run_id<>'')`, job.ID).Scan(&implementationStarted)
-		if err != nil {
-			return err
-		}
-	}
-	if newRecord || !implementationStarted {
-		if err := s.runVerificationCommands(ctx, job, worktree, base, "baseline", cfg.VerificationCommands); err != nil {
-			return fmt.Errorf("main baseline verification failed: %w", err)
-		}
-	}
 	if err := s.assertOrchestrationLease(ctx, job); err != nil {
 		return err
 	}
@@ -2130,7 +2394,11 @@ func (s *Server) completeOrchestrationImplementation(ctx context.Context, job Or
 		return
 	}
 	if taskStatus != taskAwaitingReview {
-		s.retryOrchestrationJob(ctx, job, cfg, fmt.Errorf("implementation ended with task status %s", taskStatus))
+		cause := fmt.Errorf("implementation ended with task status %s", taskStatus)
+		if failureReason, err := s.orchestrationImplementationFailure(ctx, job); err == nil && failureReason != "" {
+			cause = orchestrationAgentFailure{reason: failureReason}
+		}
+		s.retryOrchestrationJob(ctx, job, cfg, cause)
 		return
 	}
 	if job.Status == orchestrationImplementing {
@@ -2182,6 +2450,17 @@ func (s *Server) completeOrchestrationImplementation(ctx context.Context, job Or
 	// Let the current worker release its in-memory guard before selecting the
 	// next strictly ordered job for this project.
 	time.AfterFunc(50*time.Millisecond, func() { s.kickProjectOrchestrator(job.ProjectID) })
+}
+
+// orchestrationImplementationFailure preserves the agent's actionable failure
+// reason when its TaskRun has already returned the task to action_required.
+func (s *Server) orchestrationImplementationFailure(ctx context.Context, job OrchestrationJob) (string, error) {
+	var failureReason string
+	err := s.db.QueryRowContext(ctx, `select task_run.failure_reason from task_execution_intents intent join task_runs task_run on task_run.run_id=intent.run_id where intent.job_id=? and intent.phase='implementation' and intent.attempt=? and task_run.failure_reason<>'' order by task_run.sequence desc limit 1`, job.ID, job.Attempt).Scan(&failureReason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return strings.TrimSpace(strings.TrimPrefix(failureReason, "任务执行失败，请查看任务日志后重试。：")), err
 }
 
 func (s *Server) advanceOrchestrationJob(ctx context.Context, job OrchestrationJob, from, to string) error {
@@ -2303,7 +2582,7 @@ func (s *Server) keepOrchestrationReviewAlive(ctx context.Context, job Orchestra
 
 func (s *Server) runIndependentReview(ctx context.Context, project Project, job OrchestrationJob, cfg OrchestrationConfig, worktree, commit string) error {
 	var task Task
-	if err := s.db.QueryRowContext(ctx, `select id,project_id,title,description,acceptance_criteria,priority,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where id=?`, job.TaskID).Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.AcceptanceCriteria, &task.Priority, &task.Position, &task.Status, &task.CreatedAt, &task.UpdatedAt, new(sql.NullTime), new(sql.NullTime)); err != nil {
+	if err := s.db.QueryRowContext(ctx, `select id,project_id,title,description,priority,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where id=?`, job.TaskID).Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.Priority, &task.Position, &task.Status, &task.CreatedAt, &task.UpdatedAt, new(sql.NullTime), new(sql.NullTime)); err != nil {
 		return err
 	}
 	diff, err := s.gitOutput(ctx, worktree, "diff", "--no-ext-diff", job.BaseDevSHA+".."+commit)
@@ -2336,7 +2615,7 @@ func (s *Server) runIndependentReview(ctx context.Context, project Project, job 
 		}
 		return nil
 	}
-	prompt := fmt.Sprintf("你是独立代码审查者。不要修改文件。仅输出一个 JSON 对象，不得使用 Markdown。审查提交 %s。\n任务：%s\n说明：%s\n验收条件：%s\n文件：%s\nDiff：\n%s\n返回 {\"verdict\":\"pass|fail\",\"blockingFindings\":[],\"nonBlockingFindings\":[],\"acceptanceCoverage\":[],\"testGaps\":[],\"reviewedCommit\":\"%s\"}。任何无法确认的关键验收条件、风险或缺失测试都必须为 fail 并写入 blockingFindings。", commit, task.Title, task.Description, task.AcceptanceCriteria, files, diff, commit)
+	prompt := fmt.Sprintf("你是独立代码审查者。不要修改文件。仅输出一个 JSON 对象，不得使用 Markdown。审查提交 %s。\n任务：%s\n说明：%s\n文件：%s\nDiff：\n%s\n返回 {\"verdict\":\"pass|fail\",\"blockingFindings\":[],\"nonBlockingFindings\":[],\"acceptanceCoverage\":[],\"testGaps\":[],\"reviewedCommit\":\"%s\"}。任何无法确认的关键风险或缺失测试都必须为 fail 并写入 blockingFindings。", commit, task.Title, task.Description, files, diff, commit)
 	runner := s.runner
 	reviewPolicy := "read_only"
 	readOnlyTools := orchestrationReviewReadOnlyTools(cfg.AgentID)
@@ -2512,7 +2791,7 @@ func (s *Server) retryOrchestrationJob(ctx context.Context, job OrchestrationJob
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,updated_at=? where id=? and lease_token=? and status in ('implementing','checking')`, orchestrationQueued, errorText(cause), now, job.ID, job.LeaseToken)
+	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,updated_at=? where id=? and lease_token=? and status in ('implementing','checking')`, orchestrationQueued, orchestrationFailureText(cause), now, job.ID, job.LeaseToken)
 	if err != nil {
 		s.failOrchestrationJob(ctx, job, err)
 		return
@@ -2547,14 +2826,17 @@ func (s *Server) failOrchestrationJob(ctx context.Context, job OrchestrationJob,
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,updated_at=? where id=? and lease_token=? and status in ('queued','preparing','implementing','checking')`, orchestrationNeedsHuman, errorText(cause), now, job.ID, job.LeaseToken)
+	result, err := tx.ExecContext(ctx, `update task_orchestration_jobs set status=?,last_error=?,human_decision='',updated_at=? where id=? and lease_token=? and status in ('queued','preparing','implementing','checking')`, orchestrationNeedsHuman, orchestrationFailureText(cause), now, job.ID, job.LeaseToken)
 	if err != nil {
 		return
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return
 	}
-	if _, err = tx.ExecContext(ctx, `update project_orchestration_configs set frozen_reason=?,updated_at=? where project_id=?`, errorText(cause), now, job.ProjectID); err != nil {
+	if _, err = tx.ExecContext(ctx, `update project_orchestration_configs set frozen_reason=?,updated_at=? where project_id=?`, orchestrationFailureText(cause), now, job.ProjectID); err != nil {
+		return
+	}
+	if err = recordTaskEventTx(ctx, tx, job.TaskID, "", "orchestration.needs_human", map[string]any{"jobId": job.ID, "reason": orchestrationFailureText(cause)}, now); err != nil {
 		return
 	}
 	if _, err = tx.ExecContext(ctx, `update orchestration_outbox set status='failed',completed_at=? where job_id=? and status='pending'`, now, job.ID); err != nil {
@@ -2639,11 +2921,11 @@ func (s *Server) orchestrationTaskRecord(ctx context.Context, jobID string) (Git
 	return record, err
 }
 
-func (s *Server) removeOrchestrationGitResources(ctx context.Context, repo, worktree, branch string) error {
+func (s *Server) removeOrchestrationGitResources(ctx context.Context, repo, projectID, jobID, worktree, branch string) error {
 	if worktree != "" {
 		if _, err := os.Stat(worktree); err == nil {
-			if err := s.gitCommand(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
-				return fmt.Errorf("clean task worktree: %w", err)
+			if err := s.removeOrchestrationWorktree(ctx, repo, projectID, jobID, worktree); err != nil {
+				return err
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -2660,6 +2942,91 @@ func (s *Server) removeOrchestrationGitResources(ctx context.Context, repo, work
 		}
 	}
 	return nil
+}
+
+func (s *Server) removeOrchestrationWorktree(ctx context.Context, repo, projectID, jobID, worktree string) error {
+	var err error
+	for attempt := 1; attempt <= orchestrationWorktreeRemoveAttempts; attempt++ {
+		err = s.gitCommand(ctx, repo, "worktree", "remove", "--force", worktree)
+		if err == nil {
+			return nil
+		}
+		if isUnregisteredWorktreeError(err) {
+			return removeOrphanedOrchestrationWorktree(repo, worktree, projectID, jobID)
+		}
+		if !isWorktreeHandleInUseError(err) || attempt == orchestrationWorktreeRemoveAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(orchestrationWorktreeRemoveDelay):
+		}
+	}
+	if isWorktreeHandleInUseError(err) {
+		return fmt.Errorf("orchestration worktree is still in use: %w", err)
+	}
+	return fmt.Errorf("clean task worktree: %w", err)
+}
+
+func isUnregisteredWorktreeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "is not a working tree")
+}
+
+func removeOrphanedOrchestrationWorktree(repo, worktree, projectID, jobID string) error {
+	// Git can prune metadata before the on-disk directory is removed. Only
+	// remove a residual directory when it is exactly this job's deterministic
+	// auto-worktree path, never merely a descendant of the shared parent.
+	if !isExpectedOrchestrationWorktree(repo, worktree, projectID, jobID) {
+		return errors.New("refusing to remove worktree outside the automatic orchestration directory")
+	}
+	info, err := os.Lstat(worktree)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect orphaned task worktree: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to remove an invalid orphaned task worktree")
+	}
+	if err = os.RemoveAll(worktree); err != nil {
+		return fmt.Errorf("clean orphaned task worktree: %w", err)
+	}
+	if _, err = os.Lstat(worktree); !errors.Is(err, os.ErrNotExist) {
+		if err != nil {
+			return fmt.Errorf("verify orphaned task worktree cleanup: %w", err)
+		}
+		return errors.New("orphaned task worktree remains after cleanup")
+	}
+	return nil
+}
+
+func isExpectedOrchestrationWorktree(repo, worktree, projectID, jobID string) bool {
+	expected := filepath.Join(filepath.Dir(filepath.Clean(repo)), ".auto-worktrees", projectID, jobID)
+	return sameCleanPath(worktree, expected)
+}
+
+func orchestrationWorktreeNoLongerExists(worktree string) bool {
+	if strings.TrimSpace(worktree) == "" {
+		return false
+	}
+	_, err := os.Lstat(worktree)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func isWorktreeHandleInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "permission denied") ||
+		strings.Contains(message, "access is denied") ||
+		strings.Contains(message, "being used by another process") ||
+		strings.Contains(message, "used by another process")
 }
 
 func automaticOrchestrationBranch(now time.Time, taskID string) string {

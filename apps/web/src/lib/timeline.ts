@@ -5,7 +5,10 @@ import { asRecord } from "./api";
 import { contentToText, agentSummary, toolSummary, formatTokens, formatDuration } from "./utils";
 
 const ignoredCodexStderr = new Set(["Reading additional input from stdin..."]);
-const allowedTechnicalTerms = /\b(?:AI|API|CLI|Codex|Claude|Git|HTTP|ID|JSON|SSH|URL|WSL)\b/g;
+// WSL 等字词是常见技术术语而非"未翻译的英文"，在纯中文错误里出现不应触发
+// "fallback：detail" 的前缀拼接（例如 wsl.exe 的 "wsl: 检测到 localhost 代理配置..."
+// 主机侧警告，本身是可读中文，无需再包一层"工具输出异常"）。
+const allowedTechnicalTerms = /\b(?:AI|API|CLI|Codex|Claude|Git|HTTP|ID|JSON|NAT|SSH|URL|WSL|wsl|localhost)\b/g;
 
 function isIgnoredCLIStderr(message: string): boolean {
   return ignoredCodexStderr.has(message.trim());
@@ -305,6 +308,7 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
   const detailedRuns = new Set<string>();
   const seenDiagnostics = new Set<string>();
   const fallbackTerminalFailures: Array<{ event: Event; detail: string }> = [];
+  const stderrDiagnostics = new Map<string, { event: Event; messages: string[] }>();
   const addDiagnostic = (event: Event, title: string, detail: string, detailed = true) => {
     const normalized = detail.trim();
     if (!normalized) return;
@@ -341,8 +345,16 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
       addDiagnostic(event, "流错误", detail);
     }
     if (event.type === "stderr" && typeof payload.message === "string" && payload.message.trim() && !isIgnoredCLIStderr(payload.message)) {
-      addDiagnostic(event, "CLI 输出", localizedErrorDetail(payload.message, "工具输出异常，请查看任务日志后重试。"));
+      const existing = stderrDiagnostics.get(event.runId);
+      if (existing) existing.messages.push(payload.message.trim());
+      else stderrDiagnostics.set(event.runId, { event, messages: [payload.message.trim()] });
     }
+  }
+  // CLI often emits one stderr event per line. Present one diagnostic per run
+  // while retaining the complete output, instead of showing a card for every
+  // progress line and compiler message.
+  for (const { event, messages } of stderrDiagnostics.values()) {
+    addDiagnostic(event, "CLI 输出", localizedErrorDetail(messages.join("\n"), "工具输出异常，请查看任务日志后重试。"));
   }
   // The process exit code is useful only when the CLI provided no actionable
   // diagnostic in JSONL or stderr for the same run.

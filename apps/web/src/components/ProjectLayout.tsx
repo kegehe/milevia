@@ -2,9 +2,9 @@
 // 通过 Outlet context 向子路由传递 project 数据，避免重复加载
 
 import { useEffect, useState, useCallback, type ReactNode } from "react";
-import { Outlet, useParams, useNavigate, useLocation } from "react-router-dom";
+import { Outlet, useParams, useNavigate, useLocation, Navigate } from "react-router-dom";
 import NotificationCenter from "./NotificationCenter";
-import type { Project, WorkspaceTab } from "../lib/types";
+import { type Project, type WorkspaceTab, NON_GIT_BRANCH } from "../lib/types";
 import { api } from "../lib/api";
 import { useProjectContext } from "../stores/useProjectStore";
 
@@ -44,7 +44,8 @@ export default function ProjectLayout() {
 
   // 确定当前工作区标签
   const getWorkspaceTab = useCallback((): WorkspaceTab => {
-    const path = location.pathname;
+    // 去掉末尾斜杠：/git/ 与 /git 是同一工作区，保证标签高亮与路由守卫（见下方 git 守卫）判断一致。
+    const path = location.pathname.replace(/\/+$/, "");
     if (path.endsWith("/tasks") || path.includes("/tasks/")) return "tasks";
     if (path.endsWith("/orchestration")) return "orchestration";
     if (path.endsWith("/files")) return "files";
@@ -129,6 +130,12 @@ export default function ProjectLayout() {
     </main>;
   }
 
+  // 非 Git 项目在顶部标签栏不展示 Git 工作台入口；直接访问 /git（含末尾斜杠）时
+  // 重定向到默认工作区，避免打开无法工作的空页面（后端对非 Git 目录的 git 接口会返回 409）。
+  if (location.pathname.replace(/\/+$/, "").endsWith("/git") && project.gitBranch === NON_GIT_BRANCH) {
+    return <Navigate to={`/projects/${project.id}/conversations`} replace />;
+  }
+
   const navigateWorkspaceTabs = (event: React.KeyboardEvent<HTMLElement>) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not(:disabled)'));
@@ -158,7 +165,7 @@ export default function ProjectLayout() {
       <button data-workspace-tab="tasks" id="workspace-tab-tasks" type="button" role="tab" aria-controls="workspace-panel-tasks" aria-selected={workspaceTab === "tasks"} className={workspaceTab === "tasks" ? "active" : ""} onClick={() => selectWorkspaceTab("tasks")}><WorkspaceTabIcon tab="tasks" /><span>任务</span></button>
       <button data-workspace-tab="orchestration" id="workspace-tab-orchestration" type="button" role="tab" aria-controls="workspace-panel-orchestration" aria-selected={workspaceTab === "orchestration"} className={workspaceTab === "orchestration" ? "active" : ""} onClick={() => selectWorkspaceTab("orchestration")}><WorkspaceTabIcon tab="orchestration" /><span>自动编排</span></button>
       <button data-workspace-tab="files" id="workspace-tab-files" type="button" role="tab" aria-controls="workspace-panel-files" aria-selected={workspaceTab === "files"} className={workspaceTab === "files" ? "active" : ""} onClick={() => selectWorkspaceTab("files")}><WorkspaceTabIcon tab="files" /><span>文件</span></button>
-      {project.gitBranch !== "非 Git 目录" && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
+      {project.gitBranch !== NON_GIT_BRANCH && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
       <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} onClick={() => selectWorkspaceTab("run")}><WorkspaceTabIcon tab="run" /><span>项目启动</span></button>
       <button data-workspace-tab="insights" id="workspace-tab-insights" type="button" role="tab" aria-controls="workspace-panel-insights" aria-selected={workspaceTab === "insights"} className={workspaceTab === "insights" ? "active" : ""} onClick={() => selectWorkspaceTab("insights")}><WorkspaceTabIcon tab="insights" /><span>优化建议</span></button>
     </nav>

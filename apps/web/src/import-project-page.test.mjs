@@ -6,9 +6,10 @@ const page = await readFile(new URL("./pages/ImportProjectPage.tsx", import.meta
 
 test("Windows-mounted paths are displayed as Windows paths while request paths remain unchanged", () => {
   assert.match(page, /function displayPath\(path: string\): string/);
+  assert.match(page, /\^\(\[a-zA-Z\]\):\[\\\\\/\]\?\$/);
   assert.match(page, /\^\\\/mnt\\\/\(\[a-zA-Z\]\)\(\?:\\\/\(\.\*\)\)\?\$/);
-  assert.match(page, /return `\$\{drive\.toUpperCase\(\)\}:\\\\\$\{rest\.replaceAll\("\/", "\\\\"\)\}`;/);
-  assert.match(page, /<small>\{displayPath\(root\.path\)\}<\/small>/);
+  assert.match(page, /return rest \? `\$\{driveLabel\}.*rest\.replaceAll\("\/", "\\\\"\)\}` : driveLabel;/);
+  assert.match(page, /<small>\{root\.drives \? root\.drives\.map\(\(drive\) => displayPath\(drive\.path\)\)\.join\("、"\) : displayPath\(root\.path\)\}<\/small>/);
   assert.match(page, /<code>\{displayPath\(path\)\}<\/code>/);
   assert.match(page, /<small>\{displayPath\(dir\.path\)\}<\/small>/);
   assert.match(page, /void browse\(dir\.path\)/);
@@ -48,4 +49,21 @@ test("validation and project creation cannot update a stale import view", () => 
   assert.match(page, /const createRequestRef = useRef\(0\);/);
   assert.match(page, /requestID === createRequestRef\.current\) navigate\(`/);
   assert.match(page, /disabled=\{busy\} onClick=\{returnToRootSelection\}/);
+});
+
+test("multiple Windows drive roots merge into one card with a drive-picker step", () => {
+  assert.match(page, /const displayRoots = useMemo<DisplayRootEntry\[\]>\(\(\) =>/);
+  assert.match(page, /root\.label === "windows"/);
+  assert.match(page, /windows\.length >= 2/);
+  assert.match(page, /const \[pickingDrives, setPickingDrives\] = useState<RootEntry\[\] \| null>\(null\);/);
+  assert.match(page, /root\.drives \? setPickingDrives\(root\.drives\) : selectRoot\(root\.path, root\.runnerId\)/);
+  assert.match(page, /pickingDrives\.map\(\(drive\) =>/);
+  assert.match(page, /setPickingDrives\(null\); selectRoot\(drive\.path, drive\.runnerId\)/);
+});
+
+test("grouped Windows card shows drive letters and a dedicated action label", () => {
+  assert.match(page, /root\.drives \? root\.drives\.map\(\(drive\) => displayPath\(drive\.path\)\)\.join\("、"\) : displayPath\(root\.path\)/);
+  assert.match(page, /root\.drives \? "选择盘符" : "浏览"/);
+  assert.match(page, /name: "Windows"/);
+  assert.match(page, /drives: windows/);
 });

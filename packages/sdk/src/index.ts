@@ -87,3 +87,36 @@ export function createWebSocket(path: string): WebSocket {
   const url = new URL(path, runtime.wsBase).toString();
   return new WebSocket(url, `milevia-session.${runtime.sessionToken}`);
 }
+
+/**
+ * 在系统默认浏览器中打开外部链接。
+ * - 桌面端：调用 Rust `open_external` command，由系统浏览器打开（WebView 本身不导航）
+ * - Web 端：开新标签页
+ * 仅放行 http/https，避免把日志/文本里的任意字符串交给系统协议处理器。
+ */
+export async function openExternal(url: string): Promise<void> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+
+  const runtime = getDesktopRuntime();
+  if (runtime) {
+    const internals = (window as unknown as {
+      __TAURI_INTERNALS__?: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+    }).__TAURI_INTERNALS__;
+    if (internals?.invoke) {
+      try {
+        await internals.invoke("open_external", { url });
+        return;
+      } catch {
+        // invoke 失败时退回 window.open（桌面端会被新窗口拦截，效果为空；Web 端不受影响）
+      }
+    }
+  }
+  const opened = window.open(url, "_blank", "noopener,noreferrer");
+  opened?.focus();
+}

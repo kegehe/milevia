@@ -28,7 +28,10 @@ func newSSHGitRunner(client *sshClient, rootPath string) GitRunner {
 	return &gitCLIRunner{timeout: gitCommandTimeout, backend: newSSHGitBackend(client, rootPath)}
 }
 
-// gitEnvExports 返回 gitCommandEnvironment 等价的环境变量 export 前缀，用于远程 shell。
+// gitEnvExports 返回 gitCommandEnvironment 等价的环境变量 export 命令串，用于远程 shell。
+// 每个 export 都必须是独立的命令并以 "&& " 结尾：此前把全部 export 与后续
+// "cd <repo>" 连续拼在一起，shell 会把路径当作 export 的参数（"not a valid
+// identifier"），git 永远执行不到。chained && 保证任一命令失败即整体短路。
 func gitEnvExports() string {
 	parts := []string{
 		"GIT_ASKPASS=",
@@ -49,7 +52,7 @@ func gitEnvExports() string {
 		b.WriteString(key)
 		b.WriteByte('=')
 		b.WriteString(shellQuote(val))
-		b.WriteByte(' ')
+		b.WriteString(" && ")
 	}
 	return b.String()
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import "./tray-panel.css";
 
 /**
@@ -34,6 +34,16 @@ function actions(): TrayActions {
 
 export function TrayPanel() {
   const rootRef = useRef<HTMLElement>(null);
+
+  // 托盘窗口与主窗口共用同一份 CSS bundle：给 <html> 加 tray-window 标记，
+  // 让 tray-panel.css 里针对 html/body/#root 的透明背景与 overflow:hidden
+  // 只在本窗口生效，避免主窗口的项目总览等页面被全局 overflow:hidden 锁死滚动。
+  // 用 useLayoutEffect 保证标记在首帧绘制前就已加好（窗口即便立刻 show 也不闪实底）。
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.classList.add("tray-window");
+    return () => root.classList.remove("tray-window");
+  }, []);
 
   // 内容自适应：渲染后按实际内容尺寸调整窗口
   const remeasure = useCallback(() => {

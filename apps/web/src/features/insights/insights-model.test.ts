@@ -2,16 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildInsightPrompt,
   filterFindingsByType,
   insightFindingCounts,
   insightSeverityLabels,
   insightThemeLabels,
   insightThemes,
   insightTypeLabels,
+  insightVerificationLabels,
   normalizeInsightSeverity,
   normalizeInsightTheme,
   normalizeInsightType,
+  normalizeInsightVerification,
   sortFindings,
   type InsightFinding,
   type InsightType,
@@ -108,41 +109,33 @@ test("theme labels render Chinese for every known theme", () => {
   assert.equal(insightThemes.length, 5);
 });
 
-test("buildInsightPrompt renders user-facing prompt with file hint", () => {
-  const finding = makeFinding("f1", {
-    type: "bug",
-    severity: "high",
-    title: "列表加载很慢",
-    summary: "列表页打开要等好几秒",
-    fileHint: "src/List.tsx",
-  });
-  const prompt = buildInsightPrompt(finding);
-  assert.ok(prompt.includes("【优化建议】列表加载很慢"));
-  assert.ok(prompt.includes("类型：有 bug"));
-  assert.ok(prompt.includes("严重度：高"));
-  assert.ok(prompt.includes("说明：列表页打开要等好几秒"));
-  assert.ok(prompt.includes("相关位置：src/List.tsx"));
-  assert.ok(prompt.includes("请据此排查并修复"));
+test("normalizes verification result to a known value, unknown → 未验证", () => {
+  assert.equal(normalizeInsightVerification("pending"), "pending");
+  assert.equal(normalizeInsightVerification("valid"), "valid");
+  assert.equal(normalizeInsightVerification("invalid"), "invalid");
+  assert.equal(normalizeInsightVerification("failed"), "failed");
+  assert.equal(normalizeInsightVerification("bogus"), "");
+  assert.equal(normalizeInsightVerification(""), "");
+  assert.equal(normalizeInsightVerification(undefined), "");
 });
 
-test("buildInsightPrompt omits file hint line when absent", () => {
-  const finding = makeFinding("f2", {
-    type: "feature",
-    severity: "normal",
-    title: "可加导出按钮",
-    summary: "在列表页加一个导出功能",
-    fileHint: "",
-  });
-  const prompt = buildInsightPrompt(finding);
-  assert.ok(!prompt.includes("相关位置"));
-  assert.ok(prompt.includes("【优化建议】可加导出按钮"));
-  assert.ok(prompt.includes("类型：可新增功能"));
+test("verification result labels render Chinese for every known state", () => {
+  assert.equal(insightVerificationLabels[""], "未验证");
+  assert.equal(insightVerificationLabels.pending, "验证中…");
+  assert.equal(insightVerificationLabels.valid, "已复核 · 仍存在");
+  assert.equal(insightVerificationLabels.invalid, "已失效");
+  assert.equal(insightVerificationLabels.failed, "验证失败");
 });
 
-test("buildInsightPrompt normalizes invalid type/severity", () => {
-  const finding = makeFinding("f3", { type: "weird" as unknown as InsightType, severity: "extreme", title: "T", summary: "S" });
-  const prompt = buildInsightPrompt(finding);
-  // 非法 type → optimization，非法 severity → normal
-  assert.ok(prompt.includes("类型：可优化项"));
-  assert.ok(prompt.includes("严重度：普通"));
+test("finding carries verification fields through sorting", () => {
+  const verified = makeFinding("v", { severity: "high", verificationResult: "valid", verificationNote: "src/List.tsx 仍未做分页", verifiedAt: "2026-08-14T10:00:00Z" });
+  const stale = makeFinding("s", { severity: "normal", verificationResult: "invalid" });
+  const failed = makeFinding("f", { severity: "low", verificationResult: "failed" });
+  const sorted = sortFindings([failed, stale, verified]);
+  assert.deepEqual(
+    sorted.map((f) => f.id),
+    ["v", "s", "f"],
+  );
+  assert.equal(sorted[0].verificationNote, "src/List.tsx 仍未做分页");
+  assert.equal(normalizeInsightVerification(sorted[1].verificationResult), "invalid");
 });

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	pathpkg "path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -56,32 +57,41 @@ func remotePathWithinRoot(root, candidate string) bool {
 	return candidate == root || strings.HasPrefix(candidate, root+"/")
 }
 
+// remoteDirItem 是 /api/directories 返回的远端目录项。
+type remoteDirItem struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// buildRemoteDirItems 从远端目录项构造目录浏览项。path 是已规范化的远端绝对
+// 路径，拼接必须用 "/"（path 包）。Windows 控制端若用 filepath.Join 会产出
+// 反斜杠路径（"\home\..."），浏览器回传后 readlink -f 会把反斜杠当作字面
+// 字符，解析结果越出 rootPath，报"远端路径超出此连接允许的根路径"。
+func buildRemoteDirItems(path string, entries []os.FileInfo) []remoteDirItem {
+	items := make([]remoteDirItem, 0)
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			items = append(items, remoteDirItem{Name: entry.Name(), Path: pathpkg.Join(path, entry.Name())})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
+	return items
+}
+
 var newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
 	c := &sshClient{host: conn.Host, port: conn.Port}
 	var auth ssh.AuthMethod
 	if conn.Password != "" {
 		auth = ssh.Password(conn.Password)
-	} else if conn.PrivateKeyPath != "" {
-		keyBytes, err := os.ReadFile(conn.PrivateKeyPath)
-		if err != nil {
-			return nil, fmt.Errorf("读取私钥 %s 失败：%w", conn.PrivateKeyPath, err)
-		}
-		signer, err := ssh.ParsePrivateKey(keyBytes)
-		if err != nil {
-			return nil, fmt.Errorf("解析私钥失败：%w；请将加密私钥加载到 SSH Agent 后留空私钥路径", err)
-		}
-		auth = ssh.PublicKeys(signer)
 	} else {
-		socket := os.Getenv("SSH_AUTH_SOCK")
-		if socket == "" {
-			return nil, errors.New("未指定私钥且 SSH_AUTH_SOCK 不可用")
-		}
-		agentConn, err := net.Dial("unix", socket)
+		// 镜像 OpenSSH 行为：按顺序尝试所有候选私钥（SSH Profile 可能解析出多个
+		// IdentityFile，CLI 会依次尝试而旧实现只挑第一个），解析失败的加密私钥
+		// 跳过，最后回退到 SSH Agent 兜底。ssh.PublicKeys 会依次使用每个 signer。
+		signers, err := collectSSHKeySigners(c, conn)
 		if err != nil {
-			return nil, fmt.Errorf("连接 SSH Agent 失败：%w", err)
+			return nil, err
 		}
-		c.agentConn = agentConn
-		auth = ssh.PublicKeysCallback(agent.NewClient(agentConn).Signers)
+		auth = ssh.PublicKeys(signers...)
 	}
 
 	// A saved host key is a strict pin. New connections are allowed to capture a
@@ -116,6 +126,52 @@ var newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, e
 	}
 
 	return c, nil
+}
+
+// collectSSHKeySigners 按顺序收集所有可用私钥的 signer（跳过读取/解析失败的
+// 加密私钥），并追加 SSH Agent 中的身份作为兜底。返回空列表时给出最可能的
+// 错误提示。ssh.PublicKeys 会依次使用返回的每个 signer 尝试认证。
+func collectSSHKeySigners(c *sshClient, conn SSHConnection) ([]ssh.Signer, error) {
+	keyPaths := conn.PrivateKeyPaths
+	if len(keyPaths) == 0 && conn.PrivateKeyPath != "" {
+		keyPaths = []string{conn.PrivateKeyPath}
+	}
+	var signers []ssh.Signer
+	var keyErr error
+	for _, keyPath := range keyPaths {
+		keyBytes, err := os.ReadFile(keyPath)
+		if err != nil {
+			if keyErr == nil {
+				keyErr = fmt.Errorf("读取私钥 %s 失败：%w", keyPath, err)
+			}
+			continue
+		}
+		signer, err := ssh.ParsePrivateKey(keyBytes)
+		if err != nil {
+			if keyErr == nil {
+				keyErr = fmt.Errorf("解析私钥 %s 失败：%w；请将加密私钥加载到 SSH Agent 后留空私钥路径", keyPath, err)
+			}
+			continue
+		}
+		signers = append(signers, signer)
+	}
+	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
+		if agentConn, dialErr := net.Dial("unix", socket); dialErr == nil {
+			if agentSigners, agentErr := agent.NewClient(agentConn).Signers(); agentErr == nil && len(agentSigners) > 0 {
+				c.agentConn = agentConn
+				signers = append(signers, agentSigners...)
+			} else {
+				_ = agentConn.Close()
+			}
+		}
+	}
+	if len(signers) == 0 {
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		return nil, errors.New("未指定私钥且 SSH_AUTH_SOCK 不可用")
+	}
+	return signers, nil
 }
 
 func (c *sshClient) connect(ctx context.Context) error {
@@ -913,8 +969,14 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	}
 	permissionArgs := sshClaudePermissionArgs(request.PermissionMode, approvalHookCmd)
 	if len(request.ReadOnlyTools) > 0 {
-		// 只读执行：default + 仅放行只读工具（与本地 claude runner 一致）。
-		permissionArgs = "--permission-mode default --allowedTools " + shellQuote(strings.Join(request.ReadOnlyTools, " "))
+		// 只读执行：default + 仅放行只读工具（与本地 claude runner 一致）。额外用
+		// --settings permissions.deny 把可写/可执行工具从模型工具集里真正移除。
+		settings, err := insightReadOnlySettingsJSON()
+		if err != nil {
+			return err
+		}
+		permissionArgs = "--permission-mode default --allowedTools " + shellQuote(strings.Join(request.ReadOnlyTools, " ")) +
+			" --settings " + shellQuote(settings)
 	}
 	// Explicitly resume the tracked session so one-shot SSH runs stay in the
 	// same conversation context. Mirrors claudeCLIRunner.args. 会话无关的只读分析

@@ -94,6 +94,14 @@ func (rb *ringBuffer) Recent(n int) []LogEntry {
 	return result
 }
 
+// Clear drops all buffered log entries while preserving the buffer allocation.
+func (rb *ringBuffer) Clear() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.head = 0
+	rb.size = 0
+}
+
 // logBroadcaster 是广播日志的回调，由 Server 注入。
 type logBroadcaster func(entry LogEntry)
 
@@ -789,6 +797,31 @@ func (pr *projectRunner) Retire() error {
 		return nil
 	}
 	return pr.stop()
+}
+
+// ClearLogs removes the retained output. Clearing a failed run also acknowledges
+// its terminal failure, so project overviews return to the ordinary stopped state.
+func (pr *projectRunner) ClearLogs() {
+	pr.opMu.Lock()
+	defer pr.opMu.Unlock()
+
+	pr.logMu.Lock()
+	pr.logBuf.Clear()
+	pr.logMu.Unlock()
+
+	pr.mu.Lock()
+	failed := pr.status == RunStatusFailed
+	if failed {
+		pr.status = RunStatusStopped
+		pr.startedAt = time.Time{}
+		pr.pid = 0
+		pr.exitCode = 0
+		pr.hasExitCode = false
+	}
+	pr.mu.Unlock()
+	if failed {
+		pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusStopped})
+	}
 }
 
 // StatusSnapshot 返回当前状态快照（线程安全）。

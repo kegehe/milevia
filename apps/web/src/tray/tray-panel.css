@@ -1,13 +1,21 @@
 /* 托盘品牌面板（替代原生托盘菜单）—— 复用 Milevia 全局品牌桌面 */
 
 /* 面板窗口为无边框透明窗口：清掉 style.css 对 html/body/#root 的实底，
-   只让品牌卡片本身可见（圆角而非整窗方块）。 */
-html, body, #root {
+   只让品牌卡片本身可见（圆角而非整窗方块）。
+
+   注意：主窗口与托盘窗口共用同一份打包产物（main.tsx 静态 import TrayPanel），
+   因此不能直接写 `html, body, #root { overflow: hidden; }` —— 那会让主窗口的
+   html/body 也变成 overflow:hidden，导致项目总览等依赖页面滚动的视图无法滚动。
+   这里改为只在 TrayPanel 挂载时给 <html> 追加 tray-window 类才生效：
+   主窗口不匹配，页面滚动不受影响。 */
+html.tray-window,
+html.tray-window body,
+html.tray-window #root {
   background: transparent !important;
   overflow: hidden;
   margin: 0;
 }
-body { padding: 0; }
+html.tray-window body { padding: 0; }
 
 .tray-panel {
   display: flex;

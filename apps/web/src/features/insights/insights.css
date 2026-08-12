@@ -27,7 +27,8 @@
 .insights-heading h2 { margin: 0 0 6px; color: #19332c; font-size: 19px; font-weight: 820; }
 .insights-heading p { margin: 0; color: #73887e; font-size: 12px; line-height: 1.6; }
 /* 主按钮直接复用全局 .primary（黄绿新拟态），与 tasks 页「创建任务」一致 */
-.insights-head > button.primary { flex: none; min-width: 120px; }
+.insights-head > button.primary,
+.insights-head > button.insight-stop { flex: none; min-width: 120px; }
 
 .insights-empty {
   border: 1px dashed #bfd8cb;
@@ -41,14 +42,19 @@
 }
 
 .insights-progress {
-  display: flex;
-  align-items: center;
-  gap: 14px;
+  display: grid;
+  gap: 12px;
   border: 1px solid #cfe0d6;
   border-radius: 8px;
   padding: 18px 20px;
   background: #f4faf6;
 }
+.insights-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.insights-progress-copy { min-width: 0; }
 .insights-spinner {
   width: 22px;
   height: 22px;
@@ -59,8 +65,76 @@
   animation: insight-spin 0.9s linear infinite;
 }
 @keyframes insight-spin { to { transform: rotate(360deg); } }
-.insights-progress b { color: #264a40; font-size: 14px; }
-.insights-progress small { display: block; margin-top: 3px; color: #6f887e; font-size: 11px; }
+.insights-progress-copy b { color: #264a40; font-size: 14px; }
+.insights-progress-copy small { display: block; margin-top: 3px; color: #6f887e; font-size: 11px; }
+/* 停止分析 / 停止复核：描边警示按钮，与「开始分析」的实底主按钮区分 */
+.insight-stop {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #e0b7ac;
+  border-radius: 99px;
+  padding: 6px 14px;
+  color: #a73c2a;
+  background: #fff7f4;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insight-stop:hover:not(:disabled) { border-color: #c9604a; background: #fff0ec; }
+.insight-stop:disabled { cursor: default; opacity: 0.6; }
+.insights-verification-progress .insight-stop { margin-left: auto; }
+.insights-verification-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #d8d9c5;
+  border-radius: 8px;
+  padding: 12px 16px;
+  background: #fbfbf2;
+}
+.insights-verification-progress b { display: block; color: #55583a; font-size: 13px; }
+.insights-verification-progress small { display: block; margin-top: 2px; color: #777a59; font-size: 11px; }
+/* 分析信息滚动日志：里程碑 + agent 实时工具动作，随轮询滚动追加 */
+.insights-progress-log {
+  display: grid;
+  gap: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #dbe9e1;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #fbfdfb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  scroll-behavior: smooth;
+}
+.insights-progress-idle { color: #8aa297; font-size: 12px; font-style: italic; }
+.insights-log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #4b6a60;
+}
+.insights-log-line > i {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  align-self: center;
+  border-radius: 50%;
+  background: #9db4aa;
+}
+.insights-log-line > small { flex: none; color: #9db4aa; font-size: 10px; }
+.insights-log-line > span { min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.insights-log-line.insight-log-success > i { background: #2c7567; }
+.insights-log-line.insight-log-success > span { color: #1f5b4c; }
+.insights-log-line.insight-log-warn > i { background: #c08a2d; }
+.insights-log-line.insight-log-warn > span { color: #8a631c; }
+.insights-log-line.insight-log-error > i { background: #c04a36; }
+.insights-log-line.insight-log-error > span { color: #a73c2a; }
 
 .insights-failed {
   display: grid;
@@ -73,6 +147,13 @@
   font-size: 13px;
 }
 .insights-failed b { font-size: 14px; }
+/* 用户主动停止（非失败）：暖黄提示，区别于失败的红底 */
+.insights-failed.cancelled {
+  border-color: #e6d9a8;
+  color: #8a6d1c;
+  background: #fbf8ec;
+}
+.insights-failed.cancelled b { color: #7a5f14; }
 
 .insights-summary {
   display: flex;
@@ -286,6 +367,8 @@
 }
 .insight-action:hover { background: #eef7f1; border-color: #d4e4da; color: #1f5b4c; }
 .insight-action.danger:hover { background: #fff0ee; border-color: #f2cfc5; color: #a73c2a; }
+.insight-action:disabled { cursor: default; opacity: 0.6; }
+.insight-action:disabled:hover { background: transparent; border-color: transparent; color: #5d766c; }
 .insight-action-icon { width: 13px; height: 13px; }
 
 /* 内联编辑表单 */
@@ -317,6 +400,120 @@
   .insights { padding: 20px 16px 32px; }
   /* 长副标题 + 主按钮挤一行时会压窄按钮：窄屏下让按钮换到下一行右对齐 */
   .insights-head { flex-direction: column; }
-  .insights-head > button.primary { align-self: flex-end; }
+  .insights-head > button.primary,
+  .insights-head > button.insight-stop { align-self: flex-end; }
   .insights-summary { flex-wrap: wrap; }
 }
+
+/* ─── 建议再验证（re-verify）──────────────────────────────────────────── */
+
+/* 汇总行动作：验证全部 + 已失效折叠开关 */
+.insights-summary-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+.insight-verify-all,
+.insight-invalidated-toggle {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 4px 12px;
+  color: #41665b;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insight-verify-all:hover:not(:disabled),
+.insight-invalidated-toggle:hover { border-color: #a6cbbb; background: #f0f8f3; }
+.insight-verify-all:disabled { cursor: default; opacity: 0.6; }
+.insight-invalidated-toggle.active { border-color: #c9d3c4; color: #5d766c; background: #eef2ec; }
+
+/* 一键把全部有效建议添加为任务：实底主按钮。配色对齐应用既有绿实底按钮
+   （tasks.css `.task-inline-detail-actions .primary`：#2c7567/#f8fdf9/hover #1b5548），
+   与 outline 的"验证全部"区分。 */
+.insight-add-all {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #2c7567;
+  border-radius: 99px;
+  padding: 4px 12px;
+  color: #f8fdf9;
+  background: #2c7567;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, opacity .16s ease;
+}
+.insight-add-all:hover:not(:disabled) { border-color: #1b5548; background: #1b5548; }
+.insight-add-all:disabled { cursor: default; opacity: 0.6; }
+
+/* 验证状态徽章：仍存在 / 已失效 / 验证失败 / 验证中 */
+.insight-verify-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #d2e3da;
+  border-radius: 99px;
+  padding: 2px 8px;
+  color: #507066;
+  background: #f4f8f5;
+  font-size: 10px;
+  font-weight: 700;
+}
+.insight-verify-badge.valid { color: #1f7a5e; border-color: #bfe2cf; background: #eef8f1; }
+.insight-verify-badge.invalid { color: #8a6d1c; border-color: #e7d9a8; background: #faf6e8; }
+.insight-verify-badge.failed { color: #a73c2a; border-color: #f0d3cb; background: #fff3ef; }
+.insight-verify-badge.pending { color: #35608a; border-color: #c3d5e8; background: #f2f6fb; }
+.insight-verify-spin {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border: 2px solid #cfe0d6;
+  border-top-color: #2c7567;
+  border-radius: 50%;
+  animation: insight-spin 0.9s linear infinite;
+}
+
+/* AI 验证的判断依据（仍存在 / 失效 / 失败的原因说明） */
+.insight-verify-reason {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px dashed #cfe3d8;
+  border-radius: 6px;
+  color: #5d766c;
+  background: #f7fbf8;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.insight-verify-reason.failed { color: #a73c2a; border-color: #f0d3cb; background: #fff6f3; }
+.insight-verify-reason.invalidated { color: #8a6d1c; border-color: #e7d9a8; background: #fbf8ec; }
+
+/* 已失效折叠区 */
+.insights-invalidated {
+  display: grid;
+  gap: 10px;
+  border: 1px dashed #cdc8b4;
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: #fbfaf5;
+}
+.insights-invalidated-head { display: grid; gap: 3px; }
+.insights-invalidated-head b { color: #6d5f2e; font-size: 13px; }
+.insights-invalidated-head small { color: #9a8f62; font-size: 11px; line-height: 1.5; }
+
+/* 已失效卡片：低调置灰 */
+.insight-card.invalidated {
+  border-color: #ddd6bf;
+  background: #faf8f1;
+  box-shadow: none;
+}
+.insight-card.invalidated:hover { border-color: #c9c2a6; background: #fbfaf4; transform: none; box-shadow: 0 3px 8px #2d241010; }
+.insight-card.invalidated > b { color: #7a7358; }
+.insight-card.invalidated > p { color: #8a8266; }

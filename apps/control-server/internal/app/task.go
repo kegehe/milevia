@@ -24,25 +24,25 @@ const (
 )
 
 type Task struct {
-	ID                     string           `json:"id"`
-	ProjectID              string           `json:"projectId"`
-	Title                  string           `json:"title"`
-	Description            string           `json:"description"`
-	AcceptanceCriteria     string           `json:"acceptanceCriteria"`
-	Priority               string           `json:"priority"`
-	Pinned                 bool             `json:"pinned"`
-	Position               float64          `json:"position"`
-	Status                 string           `json:"status"`
-	DependsOn              []TaskDependency `json:"dependsOn"`
-	BlockedBy              []TaskBlocker    `json:"blockedBy"`
-	Blocks                 []TaskDependency `json:"blocks"`
-	LastRun                *TaskRun         `json:"lastRun,omitempty"`
-	OrchestrationStatus    string           `json:"orchestrationStatus,omitempty"`
-	OrchestrationUpdatedAt *time.Time       `json:"orchestrationUpdatedAt,omitempty"`
-	CreatedAt              time.Time        `json:"createdAt"`
-	UpdatedAt              time.Time        `json:"updatedAt"`
-	CompletedAt            *time.Time       `json:"completedAt,omitempty"`
-	CancelledAt            *time.Time       `json:"cancelledAt,omitempty"`
+	ID                        string           `json:"id"`
+	ProjectID                 string           `json:"projectId"`
+	Title                     string           `json:"title"`
+	Description               string           `json:"description"`
+	Priority                  string           `json:"priority"`
+	Pinned                    bool             `json:"pinned"`
+	Position                  float64          `json:"position"`
+	Status                    string           `json:"status"`
+	DependsOn                 []TaskDependency `json:"dependsOn"`
+	BlockedBy                 []TaskBlocker    `json:"blockedBy"`
+	Blocks                    []TaskDependency `json:"blocks"`
+	LastRun                   *TaskRun         `json:"lastRun,omitempty"`
+	OrchestrationStatus       string           `json:"orchestrationStatus,omitempty"`
+	OrchestrationTargetBranch string           `json:"orchestrationTargetBranch,omitempty"`
+	OrchestrationUpdatedAt    *time.Time       `json:"orchestrationUpdatedAt,omitempty"`
+	CreatedAt                 time.Time        `json:"createdAt"`
+	UpdatedAt                 time.Time        `json:"updatedAt"`
+	CompletedAt               *time.Time       `json:"completedAt,omitempty"`
+	CancelledAt               *time.Time       `json:"cancelledAt,omitempty"`
 }
 
 type TaskDependency struct {
@@ -96,7 +96,6 @@ type VerificationRun struct {
 
 type TaskDetail struct {
 	Task
-	PromptPreview    string            `json:"promptPreview"`
 	CanDispatch      bool              `json:"canDispatch"`
 	BlockReason      string            `json:"blockReason,omitempty"`
 	Runs             []TaskRun         `json:"runs"`
@@ -107,7 +106,6 @@ type TaskDetail struct {
 type taskInput struct {
 	Title              string    `json:"title"`
 	Description        string    `json:"description"`
-	AcceptanceCriteria string    `json:"acceptanceCriteria"`
 	Priority           string    `json:"priority"`
 	Pinned             *bool     `json:"pinned"`
 	Position           *float64  `json:"position"`
@@ -121,7 +119,6 @@ func (s *Server) migrateTasks(ctx context.Context) error {
 	project_id text not null references projects(id) on delete cascade,
 	title text not null,
 	description text not null default '',
-	acceptance_criteria text not null default '',
 	priority text not null default 'normal',
 	pinned integer not null default 0,
 	position real not null default 0,
@@ -170,6 +167,11 @@ create index if not exists task_events_task_created on task_events(task_id,creat
 	}
 	if err := dropColumnIfPresent(ctx, s.db, "tasks", "execution_mode"); err != nil {
 		return fmt.Errorf("remove legacy task execution mode: %w", err)
+	}
+	// 验收条件已从产品移除（前端不再创建/编辑）：删掉旧列，避免 PATCH 全量替换
+	// 把旧任务的验收条件静默写空（历史快照保留在 task_runs.acceptance_snapshot）。
+	if err := dropColumnIfPresent(ctx, s.db, "tasks", "acceptance_criteria"); err != nil {
+		return fmt.Errorf("remove legacy task acceptance criteria: %w", err)
 	}
 	if err := ensureColumn(ctx, s.db, "tasks", "pinned", "integer not null default 0"); err != nil {
 		return fmt.Errorf("add tasks.pinned: %w", err)
@@ -235,11 +237,10 @@ func canUpdateTaskStatus(from, to string) bool {
 func validateTaskInput(input *taskInput) error {
 	input.Title = strings.TrimSpace(input.Title)
 	input.Description = strings.TrimSpace(input.Description)
-	input.AcceptanceCriteria = strings.TrimSpace(input.AcceptanceCriteria)
 	if input.Description == "" {
 		return errors.New("task description is required")
 	}
-	if len([]rune(input.Title)) > 120 || len([]rune(input.Description)) > 12000 || len([]rune(input.AcceptanceCriteria)) > 12000 {
+	if len([]rune(input.Title)) > 120 || len([]rune(input.Description)) > 12000 {
 		return errors.New("task content exceeds the allowed length")
 	}
 	if input.Priority == "" {
@@ -257,7 +258,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("project not found"))
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,title,description,acceptance_criteria,priority,pinned,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where project_id=? order by pinned desc,position,created_at`, projectID)
+	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,title,description,priority,pinned,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where project_id=? order by pinned desc,position,created_at`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -307,7 +308,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if input.Position != nil {
 		position = *input.Position
 	}
-	task := Task{ID: uuid.NewString(), ProjectID: projectID, Title: input.Title, Description: input.Description, AcceptanceCriteria: input.AcceptanceCriteria, Priority: input.Priority, Position: position, Status: taskTodo, CreatedAt: now, UpdatedAt: now, DependsOn: []TaskDependency{}, BlockedBy: []TaskBlocker{}, Blocks: []TaskDependency{}}
+	task := Task{ID: uuid.NewString(), ProjectID: projectID, Title: input.Title, Description: input.Description, Priority: input.Priority, Position: position, Status: taskTodo, CreatedAt: now, UpdatedAt: now, DependsOn: []TaskDependency{}, BlockedBy: []TaskBlocker{}, Blocks: []TaskDependency{}}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -320,7 +321,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err := tx.ExecContext(r.Context(), `insert into tasks (id,project_id,title,description,acceptance_criteria,priority,pinned,position,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?)`, task.ID, task.ProjectID, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Pinned, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(r.Context(), `insert into tasks (id,project_id,title,description,priority,pinned,position,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?)`, task.ID, task.ProjectID, task.Title, task.Description, task.Priority, task.Pinned, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -374,7 +375,7 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	detail := TaskDetail{Task: task, PromptPreview: taskPrompt(task), Runs: []TaskRun{}, Events: []TaskEvent{}, VerificationRuns: []VerificationRun{}}
+	detail := TaskDetail{Task: task, Runs: []TaskRun{}, Events: []TaskEvent{}, VerificationRuns: []VerificationRun{}}
 	detail.CanDispatch, detail.BlockReason, err = s.taskDispatchEligibility(r.Context(), task, false)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -427,11 +428,11 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		}
 		task.Status = input.Status
 	}
-	if (task.Status == taskRunning || task.Status == taskAwaitingReview) && (task.Description != input.Description || task.AcceptanceCriteria != input.AcceptanceCriteria) {
+	if (task.Status == taskRunning || task.Status == taskAwaitingReview) && task.Description != input.Description {
 		writeError(w, http.StatusConflict, errors.New("cannot change execution content while a task is running or awaiting review"))
 		return
 	}
-	task.Title, task.Description, task.AcceptanceCriteria, task.Priority = input.Title, input.Description, input.AcceptanceCriteria, input.Priority
+	task.Title, task.Description, task.Priority = input.Title, input.Description, input.Priority
 	if input.Pinned != nil {
 		task.Pinned = *input.Pinned
 	}
@@ -445,7 +446,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(r.Context(), `update tasks set title=?,description=?,acceptance_criteria=?,priority=?,pinned=?,position=?,status=?,updated_at=? where id=? and status=?`, task.Title, task.Description, task.AcceptanceCriteria, task.Priority, task.Pinned, task.Position, task.Status, task.UpdatedAt, task.ID, originalStatus)
+	result, err := tx.ExecContext(r.Context(), `update tasks set title=?,description=?,priority=?,pinned=?,position=?,status=?,updated_at=? where id=? and status=?`, task.Title, task.Description, task.Priority, task.Pinned, task.Position, task.Status, task.UpdatedAt, task.ID, originalStatus)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -871,7 +872,7 @@ func (s *Server) projectExists(ctx context.Context, projectID string) bool {
 }
 
 func (s *Server) taskByID(ctx context.Context, taskID string) (Task, error) {
-	task, err := scanTask(s.db.QueryRowContext(ctx, `select id,project_id,title,description,acceptance_criteria,priority,pinned,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where id=?`, taskID))
+	task, err := scanTask(s.db.QueryRowContext(ctx, `select id,project_id,title,description,priority,pinned,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where id=?`, taskID))
 	if err != nil {
 		return Task{}, err
 	}
@@ -884,7 +885,7 @@ func (s *Server) taskByID(ctx context.Context, taskID string) (Task, error) {
 func scanTask(row interface{ Scan(...any) error }) (Task, error) {
 	var task Task
 	var completedAt, cancelledAt sql.NullTime
-	if err := row.Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.AcceptanceCriteria, &task.Priority, &task.Pinned, &task.Position, &task.Status, &task.CreatedAt, &task.UpdatedAt, &completedAt, &cancelledAt); err != nil {
+	if err := row.Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.Priority, &task.Pinned, &task.Position, &task.Status, &task.CreatedAt, &task.UpdatedAt, &completedAt, &cancelledAt); err != nil {
 		return Task{}, err
 	}
 	if completedAt.Valid {
@@ -941,9 +942,11 @@ func (s *Server) hydrateTask(ctx context.Context, task *Task) error {
 		return err
 	}
 	var orchestrationUpdatedAt time.Time
-	err = s.db.QueryRowContext(ctx, `select status,updated_at from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev') order by updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt)
+	var policySnapshot string
+	err = s.db.QueryRowContext(ctx, `select status,updated_at,policy_snapshot from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev') order by updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt, &policySnapshot)
 	if err == nil {
 		task.OrchestrationUpdatedAt = &orchestrationUpdatedAt
+		task.OrchestrationTargetBranch = orchestrationTargetBranch(task.ProjectID, policySnapshot)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -953,7 +956,7 @@ func (s *Server) hydrateTask(ctx context.Context, task *Task) error {
 func (s *Server) verificationRunsForTask(ctx context.Context, taskID string) ([]VerificationRun, error) {
 	rows, err := s.db.QueryContext(ctx, `select verification.id,verification.phase,verification.command,verification.reviewed_sha,verification.status,verification.exit_code,verification.output,verification.created_at,verification.completed_at
 		from verification_runs verification join task_orchestration_jobs job on job.id=verification.job_id
-		where job.task_id=? order by verification.created_at desc`, taskID)
+		where job.task_id=? and verification.phase<>'baseline' order by verification.created_at desc`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1066,15 +1069,24 @@ func taskPrompt(task Task) string {
 	if task.Description != "" {
 		parts = append(parts, task.Description)
 	}
-	if task.AcceptanceCriteria != "" {
-		parts = append(parts, task.AcceptanceCriteria)
-	}
 	return strings.Join(parts, "\n\n")
 }
 
 func (s *Server) taskDispatchEligibility(ctx context.Context, task Task, orchestrated bool) (bool, string, error) {
-	if task.Status != taskTodo && task.Status != taskActionRequired {
+	if task.Status != taskTodo && task.Status != taskActionRequired && task.Status != taskAwaitingReview {
 		return false, "任务当前状态不可下发", nil
+	}
+	// 待验收任务若仍被活跃的自动编排 job 持有执行上下文（未合并），不可手动重新下发：
+	// 新起的手动 run 会与编排收尾互相覆盖任务状态，应走 resume/验收/要求修改等编排感知
+	// 路径。已合并（released_to_main）的 job 是终态，编排已结束，不阻止手动重下发。
+	if task.Status == taskAwaitingReview && !orchestrated {
+		owns, err := orchestrationOwnsTask(ctx, s.db, task.ID)
+		if err != nil {
+			return false, "", err
+		}
+		if owns {
+			return false, "自动编排尚未结束此任务，无法重新下发", nil
+		}
 	}
 	blocked := len(task.BlockedBy) > 0
 	if blocked {
@@ -1185,8 +1197,10 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(c
 	if strings.TrimSpace(repairContext) != "" {
 		prompt += "\n\n上轮检查或审查发现的问题：\n" + strings.TrimSpace(repairContext) + "\n\n请只修复这些问题，并重新运行相关检查。"
 	}
-	taskRun := &TaskRun{ID: uuid.NewString(), TaskID: task.ID, ConversationID: conversationID, PromptSnapshot: prompt, AcceptanceSnapshot: task.AcceptanceCriteria, CreatedAt: now, ExecutionIntentID: executionIntentID}
-	message, runID, record, status, err := s.startMessage(ctx, conversationID, taskRun.PromptSnapshot, &runStartRecord{Task: taskRun, WorktreePath: worktreePath, Orchestrated: orchestrated})
+	// 验收条件已从产品移除，task_runs.acceptance_snapshot 仅保留旧 run 的历史快照；
+	// 新 run 一律快照空值（prompt 也不再包含验收条件段）。
+	taskRun := &TaskRun{ID: uuid.NewString(), TaskID: task.ID, ConversationID: conversationID, PromptSnapshot: prompt, AcceptanceSnapshot: "", CreatedAt: now, ExecutionIntentID: executionIntentID}
+	message, runID, record, status, err := s.startMessage(ctx, conversationID, taskRun.PromptSnapshot, "", &runStartRecord{Task: taskRun, WorktreePath: worktreePath, Orchestrated: orchestrated})
 	if err != nil {
 		return taskDispatchResult{}, status, err
 	}
@@ -1482,8 +1496,20 @@ func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun
 	if projectID != conversation.ProjectID || taskRun.ConversationID != conversation.ID {
 		return errors.New("task and conversation must belong to the same project")
 	}
-	if status != taskTodo && status != taskActionRequired {
+	if status != taskTodo && status != taskActionRequired && status != taskAwaitingReview {
 		return errors.New("task current status cannot be dispatched")
+	}
+	// 待验收任务在同一事务内复核活跃编排 job（排除已合并终态 released_to_main）：
+	// 关闭 eligibility 检查到本事务之间的 TOCTOU 窗口（并发编排入队与手动重下发），
+	// 避免新 run 与编排收尾互相覆盖。
+	if status == taskAwaitingReview && !orchestrated {
+		owns, err := orchestrationOwnsTask(ctx, tx, taskRun.TaskID)
+		if err != nil {
+			return err
+		}
+		if owns {
+			return errors.New("自动编排尚未结束此任务，无法重新下发")
+		}
 	}
 	var blockers int
 	dependencyQuery := `select count(*) from task_dependencies dependency join tasks predecessor on predecessor.id=dependency.predecessor_task_id where dependency.task_id=? and predecessor.status<>?`

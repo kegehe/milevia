@@ -14,6 +14,7 @@ AUTO_CLEAR_PORTS="${AUTO_CLEAR_PORTS:-0}"
 AUTO_STARTUP_TIMEOUT="${AUTO_STARTUP_TIMEOUT:-60}"
 CONTROL_PID=""
 WEB_PID=""
+GO_BIN="${AUTO_GO_BIN:-}"
 
 validate_port() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 && $1 < 65536 ))
@@ -53,7 +54,38 @@ stop_process_group() {
   local pid="$1"
   [[ -z "$pid" ]] && return
   kill -0 "$pid" 2>/dev/null || return
+  # 子进程与脚本同组（不再用 setsid）：`kill -TERM -- -$pid` 命不中任何进程组，
+  # 只会落到下面的单进程 kill，pnpm 的 vite 等孙进程会成孤儿。因此先递归 kill 全部
+  # 后代（深层优先），再对进程本身发信号；有 pgrep 时逐层清理，没有时退回单进程 kill。
+  if command -v pgrep >/dev/null 2>&1; then
+    local child
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+      stop_process_group "$child"
+    done
+  fi
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+}
+
+resolve_go() {
+  if [[ -n "$GO_BIN" ]]; then
+    command -v "$GO_BIN" >/dev/null 2>&1 || {
+      echo "AUTO_GO_BIN does not resolve to an executable: $GO_BIN" >&2
+      return 1
+    }
+    return
+  fi
+  if command -v go >/dev/null 2>&1; then
+    GO_BIN="go"
+    return
+  fi
+  # Windows' WSL launcher inherits go.exe but not necessarily a Linux `go`.
+  # Using the executable explicitly keeps `pnpm dev` usable from PowerShell.
+  if command -v go.exe >/dev/null 2>&1; then
+    GO_BIN="go.exe"
+    return
+  fi
+  echo "go or go.exe is required to start the control server." >&2
+  return 1
 }
 
 wait_for_control_server() {
@@ -62,7 +94,8 @@ wait_for_control_server() {
 
   printf 'Waiting for control server readiness at %s\n' "$health_url"
   while true; do
-    if curl --silent --show-error --fail --max-time 1 "$health_url" >/dev/null 2>&1; then
+    if curl --silent --show-error --fail --max-time 1 "$health_url" >/dev/null 2>&1 || \
+      { command -v curl.exe >/dev/null 2>&1 && curl.exe --silent --show-error --fail --max-time 1 "$health_url" >/dev/null 2>&1; }; then
       return
     fi
     if ! kill -0 "$CONTROL_PID" 2>/dev/null; then
@@ -103,14 +136,15 @@ if ! [[ "$AUTO_STARTUP_TIMEOUT" =~ ^[0-9]+$ ]] || (( AUTO_STARTUP_TIMEOUT < 1 ))
   echo "AUTO_STARTUP_TIMEOUT must be a positive number of seconds." >&2
   exit 1
 fi
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl is required to wait for the control server to become ready." >&2
+if ! command -v curl >/dev/null 2>&1 && ! command -v curl.exe >/dev/null 2>&1; then
+  echo "curl or curl.exe is required to wait for the control server to become ready." >&2
   exit 1
 fi
 if ! command -v lsof >/dev/null 2>&1 && ! command -v fuser >/dev/null 2>&1; then
   echo "lsof or fuser is required to clear occupied ports." >&2
   exit 1
 fi
+resolve_go
 
 clear_port "$CONTROL_PORT"
 clear_port "$WEB_PORT"
@@ -121,7 +155,7 @@ trap 'exit 130' INT TERM
 echo "Starting control server at ${CONTROL_URL}"
 (
   cd "$ROOT_DIR/apps/control-server"
-  exec setsid env AUTO_HTTP_ADDR="$CONTROL_ADDR" AUTO_CONTROL_URL="$CONTROL_URL" go run ./cmd/control-server
+  exec env AUTO_HTTP_ADDR="$CONTROL_ADDR" AUTO_CONTROL_URL="$CONTROL_URL" "$GO_BIN" run ./cmd/control-server
 ) &
 CONTROL_PID=$!
 
@@ -130,7 +164,7 @@ wait_for_control_server
 echo "Starting web app at http://${WEB_HOST}:${WEB_PORT}/"
 (
   cd "$ROOT_DIR/apps/web"
-  exec setsid env VITE_CONTROL_URL="$VITE_CONTROL_TARGET" pnpm dev --host "$WEB_HOST" --port "$WEB_PORT" --strictPort
+  exec env VITE_CONTROL_URL="$VITE_CONTROL_TARGET" pnpm dev --host "$WEB_HOST" --port "$WEB_PORT" --strictPort
 ) &
 WEB_PID=$!
 

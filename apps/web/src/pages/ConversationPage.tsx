@@ -406,6 +406,8 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
   useEffect(() => { setSelected(0); }, [conversations, query]);
   const select = (item: Conversation) => {
     if (busyID || item.id === activeID) return;
+    // 自动编排会话是后台只读会话，不能切换为当前会话，始终以只读方式查看。
+    if (item.isOrchestration) { view(item); return; }
     if (item.status === "running") { view(item); return; }
     void activate(item);
   };
@@ -416,9 +418,10 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
     if (event.key === "Enter" && conversations[selected]) { event.preventDefault(); select(conversations[selected]); }
   };
   return <div className="backdrop history-backdrop" role="dialog" aria-modal="true" aria-labelledby="conversation-history-title"><section className="modal conversation-history"><header><div className="conversation-history-heading"><span className="conversation-history-mark"><HistoryIcon /></span><div><h2 id="conversation-history-title">会话历史</h2></div></div><button type="button" className="conversation-history-close" title="关闭" aria-label="关闭" onClick={close}><DialogCloseIcon /></button></header><div className="history-toolbar"><label className="history-search"><HistorySearchIcon /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={keyDown} placeholder="搜索会话标题或内容" /></label><span>{query ? `${conversations.length} 个匹配` : `${conversations.length} 个会话`}</span></div><div className="history-list">{conversations.length === 0 ? <p className="history-empty">没有匹配的会话</p> : conversations.map((item, index) => {
+    const orchestration = item.isOrchestration === true;
     const runningElsewhere = item.status === "running" && item.id !== activeID;
-    const state = busyID === item.id ? "切换中" : item.id === activeID ? "当前会话" : runningElsewhere ? "运行中" : "";
-    return <button key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""} ${runningElsewhere ? "running" : ""}`} disabled={Boolean(busyID)} onMouseEnter={() => setSelected(index)} onClick={() => runningElsewhere ? view(item) : select(item)}><span className="history-item-main"><span className="history-item-title"><b>{item.title || "新会话"}</b><span className={`history-item-agent ${item.agentId === "codex" ? "codex" : "claude"}`}>{item.agentId === "codex" ? "Codex" : "Claude Code"}</span></span><small>{item.preview || "尚未发送消息"}</small></span><span className="history-item-meta">{state && <em>{state}</em>}<time>{formatHistoryTime(item.lastActivityAt)}</time></span></button>;
+    const state = busyID === item.id ? "切换中" : item.id === activeID ? "当前会话" : runningElsewhere ? "运行中" : orchestration ? "自动编排" : "";
+    return <button key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""} ${runningElsewhere ? "running" : ""}`} disabled={Boolean(busyID)} onMouseEnter={() => setSelected(index)} onClick={() => runningElsewhere || orchestration ? view(item) : select(item)}><span className="history-item-main"><span className="history-item-title"><b>{item.title || "新会话"}</b><span className={`history-item-agent ${item.agentId === "codex" ? "codex" : "claude"}`}>{item.agentId === "codex" ? "Codex" : "Claude Code"}</span>{orchestration && <span className="history-item-orchestration">自动编排</span>}</span><small>{item.preview || "尚未发送消息"}</small></span><span className="history-item-meta">{state && <em>{state}</em>}<time>{formatHistoryTime(item.lastActivityAt)}</time></span></button>;
   })}</div>{hasMore && <button className="secondary load-earlier-history" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "加载中" : "加载更多会话"}</button>}<footer><span>{busyID ? "正在切换会话" : `${conversations.length} 条记录`}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
 }
 
@@ -484,7 +487,7 @@ const SystemCard = memo(function SystemCard({ system }: { system: SystemItem }) 
 });
 
 const ErrorCard = memo(function ErrorCard({ item, projectId, onViewTask }: { item: TimelineItem & { kind: "error" }; projectId: string; onViewTask: (taskId: string) => void }) {
-  return <article className="error-card"><header><span className="error-card-icon">!</span><div><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></header><pre>{item.detail}</pre>{item.taskId && <footer className="error-card-footer"><button type="button" className="secondary" onClick={() => onViewTask(item.taskId!)}>查看任务详情</button></footer>}</article>;
+  return <article className="error-card"><div className="error-card__header"><span className="error-card__icon" aria-hidden="true">!</span><div className="error-card__heading"><b>{item.title}</b><time>{formatTime(item.createdAt)}</time></div></div><div className="error-card__body"><pre aria-label={`${item.title}详情`}>{item.detail}</pre></div>{item.taskId && <footer className="error-card__footer"><button type="button" className="secondary" onClick={() => onViewTask(item.taskId!)}>查看任务详情</button></footer>}</article>;
 });
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
@@ -628,7 +631,7 @@ function ShortcutEditor({ projectID, state, close, refresh, fail }: { projectID:
     });
   };
 
-  return <><div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="shortcut-editor-title"><section className={`modal shortcut-editor${isCommand ? " command-editor" : " prompt-editor"}`}><header><div className="shortcut-editor-heading"><span className="shortcut-editor-mark"><ShortcutCategoryIcon kind={isCommand ? "command" : "prompt"} /></span><div><label>{isCommand ? "COMMON COMMAND" : "COMMON PROMPT"}</label><h2 id="shortcut-editor-title">{shortcut ? `编辑${isCommand ? "命令" : "提示词"}` : `新增${isCommand ? "命令" : "提示词"}`}</h2></div></div><button type="button" className="shortcut-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><DialogCloseIcon /></button></header><form onSubmit={(event) => void save(event)}><div className="shortcut-editor-body"><label className="shortcut-editor-field"><span>名称 <small>最多 64 个字符</small></span><input autoFocus required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} placeholder={isCommand ? "例如：清空终端" : "例如：审查当前改动"} /></label><label className="shortcut-editor-field"><span>{isCommand ? "命令内容" : "提示词内容"}</span><textarea required maxLength={12000} value={template} onChange={(event) => setTemplate(event.target.value)} placeholder={isCommand ? "例如：/compact" : "描述希望 Claude 在当前项目完成的工作"} /></label>{shortcut && <label className="shortcut-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此项</span></label>}{isCommand && <p className="shortcut-editor-hint">以 <code>/</code> 开头的内容会作为斜杠命令直接发送给 CLI 执行（如 <code>/compact</code>、<code>/clear</code>）；其余内容作为普通命令提示发送。执行时会遵循当前会话的权限设置。</p>}</div><footer>{shortcut && <button type="button" className="danger-text" disabled={busy} onClick={() => void remove()}>删除</button>}<div className="shortcut-editor-footer-actions"><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存"}</button></div></footer></form></section></div>{pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}</>;
+  return <><div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="shortcut-editor-title"><section className={`modal shortcut-editor${isCommand ? " command-editor" : " prompt-editor"}`}><header><div className="shortcut-editor-heading"><span className="shortcut-editor-mark"><ShortcutCategoryIcon kind={isCommand ? "command" : "prompt"} /></span><div><label>{isCommand ? "COMMON COMMAND" : "COMMON PROMPT"}</label><h2 id="shortcut-editor-title">{shortcut ? `编辑${isCommand ? "命令" : "提示词"}` : `新增${isCommand ? "命令" : "提示词"}`}</h2></div></div><button type="button" className="shortcut-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><DialogCloseIcon /></button></header><form onSubmit={(event) => void save(event)}><div className="shortcut-editor-body"><label className="shortcut-editor-field"><span>名称 <small>最多 64 个字符</small></span><input autoFocus required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} placeholder={isCommand ? "例如：清空终端" : "例如：审查当前改动"} /></label><label className="shortcut-editor-field"><span>{isCommand ? "命令内容" : "提示词内容"}</span><textarea required maxLength={12000} value={template} onChange={(event) => setTemplate(event.target.value)} placeholder={isCommand ? "例如：/compact" : "描述希望 Claude 在当前项目完成的工作"} /></label>{shortcut && <label className="shortcut-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此项</span></label>}{isCommand && <p className="shortcut-editor-hint">以 <code>/</code> 开头的内容会作为斜杠命令直接发送给 CLI 执行（如 <code>/compact</code>）；其中 <code>/clear</code> 由应用本地清空会话（新建空白会话，旧会话保留在历史中）。其余内容作为普通命令提示发送。执行时会遵循当前会话的权限设置。</p>}</div><footer>{shortcut && <button type="button" className="danger-text" disabled={busy} onClick={() => void remove()}>删除</button>}<div className="shortcut-editor-footer-actions"><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存"}</button></div></footer></form></section></div>{pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}</>;
 }
 
 // ---- 消息列表（独立 memo 组件，阻断对话页其他状态变化导致的列表重渲染） ----
@@ -647,7 +650,7 @@ const MessageList = memo(function MessageList({ timeline, agentID, fail, resolvi
 }) {
   const anchoredExecutionRunIDs = useMemo(() => new Set(timeline.flatMap((item) => item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.has(item.message.runId) ? [item.message.runId] : [])), [executionByRun, timeline]);
   return <>
-    {timeline.map((item) => <div key={item.id} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { registerUserMessageElement(item.message.id, element); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={agentID} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : item.kind === "system" ? <SystemCard system={item.system} /> : <ErrorCard item={item} projectId={projectId} onViewTask={onViewTask} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => onOpenExecution(item.message.runId!)} />}</div>)}
+    {timeline.map((item) => <div key={item.id} className="timeline-item" data-timeline-kind={item.kind} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { registerUserMessageElement(item.message.id, element); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={agentID} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : item.kind === "system" ? <SystemCard system={item.system} /> : <ErrorCard item={item} projectId={projectId} onViewTask={onViewTask} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => onOpenExecution(item.message.runId!)} />}</div>)}
     {executionByRun && Array.from(executionByRun.values()).filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => onOpenExecution(execution.runId)} />)}
   </>;
 });
@@ -694,7 +697,7 @@ export default function ConversationPage() {
   const [changingPermission, setChangingPermission] = useState(false);
   // 弹窗状态 — 通过 URL search params 驱动
   const showHistory = searchParams.get("history") === "true";
-	const readOnlyConversation = searchParams.get("readonly") === "true";
+	const readOnlyConversation = searchParams.get("readonly") === "true" || conversation?.isOrchestration === true;
   const showNewConversation = searchParams.get("new") === "true";
   const showUsage = searchParams.get("usage") === "true";
   const showAgentExecution = searchParams.get("execution");
@@ -708,6 +711,11 @@ export default function ConversationPage() {
   const [showSendMenu, setShowSendMenu] = useState(false);
   const pendingSendRef = useRef<string | null>(null);
   const pendingSendConversationRef = useRef<string | null>(null);
+  const pendingSendRequestIDRef = useRef<string | null>(null);
+  // 预约自动发送：仅在“空闲状态刚成立”时挂起一次延迟触发，避免 run.* 事件后的
+  // reload 回包与后端收尾尚未完成时立即 POST 撞上瞬时 4xx，导致内容被回退到输入框。
+  const scheduledSendTimerRef = useRef<number | null>(null);
+  const wasScheduledIdleRef = useRef(false);
   // 点击外部关闭权限菜单
   useEffect(() => {
     if (!showPermissionMenu) return;
@@ -767,6 +775,8 @@ export default function ConversationPage() {
   const conversationRef = useRef<Conversation | null>(null);
   conversationRef.current = conversation;
   textRef.current = text;
+  const runRef = useRef("");
+  runRef.current = run;
   const conversationTransitionRef = useRef(false);
   const conversationRouteVersion = useRef(0);
   const conversationHistoryRequestVersion = useRef(0);
@@ -782,7 +792,6 @@ export default function ConversationPage() {
   const lastReloadRequestedAt = useRef(0);
   const lastReloadRunID = useRef<string | null>(null);
   const addFileHandledRef = useRef<string | null>(null);
-  const addInsightHandledRef = useRef<string | null>(null);
 
   const setComposerText = useCallback((value: string, conversationID = conversationRef.current?.id, persist = true) => {
     textRef.current = value;
@@ -820,24 +829,6 @@ export default function ConversationPage() {
     // 将文件路径追加到输入框
     const prefix = textRef.current.trim() ? `${textRef.current}\n` : "";
     setComposerText(`${prefix}@${filePath} `, conversation.id);
-  }, [projectId, conversation?.id, searchParams, setSearchParams, setComposerText]);
-
-  // 处理从优化建议"发送到对话"传来的提示词：追加到输入框现有内容末尾，等用户检查后再发送。
-  useEffect(() => {
-    if (!projectId || !conversation?.id) return;
-    const addInsight = searchParams.get("addInsight");
-    if (addInsight !== "true") return;
-    const prompt = sessionStorage.getItem("milevia_insight_prompt");
-    if (!prompt) return;
-    // 同一会话只处理一次（避免 searchParams 清除后重新触发）
-    const dedupKey = `${conversation.id}:${prompt}`;
-    if (addInsightHandledRef.current === dedupKey) return;
-    addInsightHandledRef.current = dedupKey;
-    sessionStorage.removeItem("milevia_insight_prompt");
-    // 清除 URL 中的 addInsight 参数
-    setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("addInsight"); return next; });
-    // 追加到输入框末尾（与已有草稿不互相覆盖）
-    setComposerText(mergeDraftAndPending(textRef.current, prompt), conversation.id);
   }, [projectId, conversation?.id, searchParams, setSearchParams, setComposerText]);
 
   useEffect(() => () => {
@@ -983,7 +974,7 @@ export default function ConversationPage() {
           const detail = await projectApi<{ conversation: Conversation & { projectId: string } }>(`/api/conversations/${urlConversationId}?limit=1`, { signal: abort.signal });
           if (!isCurrentRoute()) return;
           if (detail.conversation.projectId !== projectId) throw new Error("指定会话不属于当前项目");
-			if (readOnlyConversation) {
+			if (readOnlyConversation || detail.conversation.isOrchestration) {
 				resetConversationView(detail.conversation);
 				return;
 			}
@@ -1071,6 +1062,7 @@ export default function ConversationPage() {
       if (!isCurrentConversation()) return false;
       if (runID) lastReloadRunID.current = runID;
       lastReloadRequestedAt.current = Date.now();
+      const runAtRequest = runRef.current;
       try {
         const data = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
         if (!isCurrentConversation()) return false;
@@ -1079,7 +1071,14 @@ export default function ConversationPage() {
         const filteredMessages = data.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
         setMessages((current) => mergeReloadMessages(filteredMessages, current));
         setEvents((current) => mergeConversationItems(data.events, current));
-        setRun(data.activeRunId || ""); setHasMoreHistory(data.hasMore); setHasMoreMessageHistory(data.hasMoreMessages); setHistoryCursor(data.nextCursor || "");
+        // 这份回包是请求发出时的快照：若请求期间 run 已推进到更晚的值（例如预约发送
+        // 自动发出的新回合，或另一处已启动的新 run），不能拿旧快照把它覆盖/清空，
+        // 否则 isConversationIdle 会误判为空闲、运行指示也会丢失。
+        setRun((current) => {
+          if (data.activeRunId) return data.activeRunId;
+          if (current && current !== runAtRequest) return current;
+          return "";
+        }); setHasMoreHistory(data.hasMore); setHasMoreMessageHistory(data.hasMoreMessages); setHistoryCursor(data.nextCursor || "");
         return true;
       } catch (cause) {
         if (isCurrentConversation()) fail(cause instanceof Error ? cause.message : "无法刷新会话");
@@ -1275,6 +1274,7 @@ export default function ConversationPage() {
       }
       pendingSendRef.current = null;
       pendingSendConversationRef.current = null;
+      pendingSendRequestIDRef.current = null;
       setPendingSendContent(null);
     }
     setShowSendMenu(false);
@@ -1592,8 +1592,11 @@ export default function ConversationPage() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [run, stopping]);
 
-  // 自动滚动
-  useEffect(() => {
+  // 自动滚动。用 useLayoutEffect 而非 useEffect：紧跟 DOM 提交同步决策，
+  // 避免上一次自动滚动排队中的 scroll 事件先于本 effect 触发，把 userNearBottom
+  // 误翻为 false（内容已增长而 scrollTop 还停在旧底部，nearBottom 会算成 false）。
+  // 真正滚动仍延后到下一帧（scrollToBottomNextFrame），确保 scrollHeight 已就绪。
+  useLayoutEffect(() => {
     if (pendingApproval) return;
     if (userNearBottom.current) {
       scrollToBottomNextFrame("auto");
@@ -1603,18 +1606,28 @@ export default function ConversationPage() {
   }, [visibleContentVersion, run, pendingApproval, scrollToBottomNextFrame]);
 
   // 业务方法
-  const sendContent = async (rawContent: string, clearDraft = true) => {
-    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
+  const sendContent = async (rawContent: string, clearDraft = true, options: { restoreOnFailure?: boolean; notifyFailure?: boolean; clientRequestId?: string } = {}): Promise<boolean> => {
+    const { restoreOnFailure = true, notifyFailure = true } = options;
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return false;
     const content = rawContent.trim();
-    if (!content) return;
+    if (!content) return false;
     if (content === "/resume") {
       if (clearDraft) {
         setComposerText("", conversation.id);
       }
       openConversationHistory();
-      return;
+      return false;
+    }
+    if (content === "/clear") {
+      // /clear 是 CLI 的"清屏"命令：headless（-p --output-format stream-json）模式下
+      // CLI 只发一个 conversation_reset 事件、内部重置自己的会话，不会在应用界面清空历史，
+      // 导致与 Claude Code / Codex 里的展示效果不一致。这里拦截并走应用自己的
+      // "清空上下文"流程（新建空白会话、旧会话保留在历史中），让 /clear 真正清空对话历史。
+      clearConversationContext();
+      return false;
     }
     const conversationID = conversation.id;
+    const clientRequestId = options.clientRequestId ?? crypto.randomUUID();
     const routeVersion = conversationRouteVersion.current;
     setSending(true);
     if (clearDraft) {
@@ -1622,23 +1635,28 @@ export default function ConversationPage() {
     }
     setShowPermissionMenu(false); historyIndex.current = null; draftBeforeHistory.current = "";
     try {
-      const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content }) });
-      if (conversationRef.current?.id !== conversationID) return;
+      const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content, clientRequestId }) });
+      if (conversationRef.current?.id !== conversationID) return false;
       if (!assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, data.message.content);
       setMessages((old) => [...old, data.message]); appendInputHistory(data.message.content); setHistoryRefresh((version) => version + 1); setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
       followAfterDispatch();
       void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
+      return true;
     } catch (cause) {
-      if (conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) return;
-      fail(cause instanceof Error ? cause.message : "无法发送消息");
-      if (clearDraft) {
+      if (conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) return false;
+      if (notifyFailure) fail(cause instanceof Error ? cause.message : "无法发送消息");
+      if (clearDraft && restoreOnFailure) {
         setComposerText(content, conversationID);
         if (projectId) flushConversationDraft(projectId, conversationID);
       }
+      return false;
     }
     finally { setSending(false); }
   };
+
+  const sendContentRef = useRef(sendContent);
+  sendContentRef.current = sendContent;
 
   const send = (event: FormEvent) => {
     event.preventDefault();
@@ -1654,6 +1672,10 @@ export default function ConversationPage() {
     setShowSendMenu(false);
     pendingSendRef.current = content;
     pendingSendConversationRef.current = conversation.id;
+    pendingSendRequestIDRef.current = crypto.randomUUID();
+    // 新预约视为“尚未开始等待空闲”，让 effect 在空闲成立时重新挂起延迟发送
+    // （否则对话当前已空闲时，wasScheduledIdleRef 为 true，空闲转变检测不会触发）。
+    wasScheduledIdleRef.current = false;
     setPendingSendContent(content);
     setComposerText("", conversation.id);
   };
@@ -1665,6 +1687,7 @@ export default function ConversationPage() {
     const pending = pendingSendRef.current;
     pendingSendRef.current = null;
     pendingSendConversationRef.current = null;
+    pendingSendRequestIDRef.current = null;
     if (pending != null) setPendingSendContent(null);
   };
 
@@ -1690,29 +1713,96 @@ export default function ConversationPage() {
     return true;
   }, [agentExecutions, run]);
 
-  // 监听预约内容：一旦会话空闲便真正发送，随后清理预约状态。
-  useEffect(() => {
-    if (!pendingSendRef.current) return;
-    if (sending || clearing || stopping || shortcutBusy) return;
+  // 真正发出预约内容。仅在“空闲刚成立”的延迟触发中被调用，随后清理预约状态。
+  const fireScheduledSend = useCallback(async (): Promise<boolean> => {
     const conversationID = pendingSendConversationRef.current;
     const content = pendingSendRef.current;
-    if (!conversationID || !content) return;
-    if (conversationRef.current?.id !== conversationID) return; // 切换会话后不越界发送
-    if (!isConversationIdle()) return; // 主回合或子代理仍在运行，继续等待
-    pendingSendRef.current = null;
-    pendingSendConversationRef.current = null;
-    // 发送成功/失败后统一清除 UI，避免残留预约提示。
-    // 使用默认 clearDraft=true：与普通发送行为一致——成功后清空输入框，
-    // 失败时 sendContent 会把内容写回输入框（不丢失预约内容）。
-    // 预约本身在 scheduleSend 时已清空输入框，因此这里使用默认行为最安全。
-    void (async () => {
-      try {
-        await sendContent(content);
-      } finally {
+    const clientRequestId = pendingSendRequestIDRef.current;
+    if (!conversationID || !content || !clientRequestId) return false;
+    if (readOnlyConversation) return false; // 会话变为只读（编排/readonly）时不能发送，保留预约不丢失
+    if (sending || clearing || stopping || shortcutBusy) return false;
+    if (conversationRef.current?.id !== conversationID) return false; // 切换会话后不越界发送
+    if (!isConversationIdle()) return false; // 延迟期间又有了新的运行，继续等待
+    // 自动发送可能撞上瞬时的后端拒绝（工作区被并发的 insight 扫描 / Git 操作占用、
+    // 会话重建、CLI 忙碌等）。带退避重试几次，避免一失败就把内容弹回输入框；
+    // 前几次静默重试（不弹错误、不写回输入框），最后一次才提示并回退。
+    const backoff = [1500, 3000, 6000, 10000];
+    for (let attempt = 0; attempt <= backoff.length; attempt++) {
+      if (pendingSendRef.current !== content || pendingSendConversationRef.current !== conversationID || pendingSendRequestIDRef.current !== clientRequestId) return false; // 预约已被取消/切换会话
+      if (conversationRef.current?.id !== conversationID) return false;
+      if (!isConversationIdleRef.current()) return false; // 重试期间又有了新的运行，交回空闲检测重新挂起
+      const last = attempt === backoff.length;
+      const ok = await sendContentRef.current(content, true, { restoreOnFailure: last, notifyFailure: last, clientRequestId });
+      if (ok) {
+        pendingSendRef.current = null;
+        pendingSendConversationRef.current = null;
+        pendingSendRequestIDRef.current = null;
         setPendingSendContent((current) => current === content ? null : current);
+        return true;
       }
-    })();
-  }, [isConversationIdle, pendingSendContent, clearing, sendContent, sending, shortcutBusy, stopping]);
+      if (last) {
+        // 最后一次也失败：sendContent 若走了 catch（restoreOnFailure）已把内容写回输入框；
+        // 否则（被 sendContent 守卫拦截，如 sending 卡住）在这里手动写回，避免预约内容丢失。
+        if (!textRef.current.trim()) setComposerText(content, conversationID);
+        pendingSendRef.current = null;
+        pendingSendConversationRef.current = null;
+        pendingSendRequestIDRef.current = null;
+        setPendingSendContent((current) => current === content ? null : current);
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, backoff[attempt]));
+    }
+    return true;
+  }, [clearing, isConversationIdle, readOnlyConversation, sending, shortcutBusy, stopping]);
+
+  const fireScheduledSendRef = useRef(fireScheduledSend);
+  fireScheduledSendRef.current = fireScheduledSend;
+  const isConversationIdleRef = useRef(isConversationIdle);
+  isConversationIdleRef.current = isConversationIdle;
+
+  // 监听预约内容：会话“从运行中变为彻底空闲”时延迟一拍再真正发送。
+  // run.* 事件会立刻把 run 置空并触发 reload，后端也还在对上一个 run 做收尾；
+  // 立即 POST 可能撞上瞬时 4xx，被 sendContent 的失败回退写回输入框。
+  // 延迟后再重查空闲仍成立才发送，显著降低这类竞态。
+  useEffect(() => {
+    if (!pendingSendRef.current) {
+      if (scheduledSendTimerRef.current != null) {
+        window.clearTimeout(scheduledSendTimerRef.current);
+        scheduledSendTimerRef.current = null;
+      }
+      wasScheduledIdleRef.current = isConversationIdle();
+      return;
+    }
+    const idle = isConversationIdle();
+    if (idle && !wasScheduledIdleRef.current) {
+      // 刚进入空闲：挂起一次延迟触发。
+      if (scheduledSendTimerRef.current != null) window.clearTimeout(scheduledSendTimerRef.current);
+      scheduledSendTimerRef.current = window.setTimeout(() => {
+        scheduledSendTimerRef.current = null;
+        void fireScheduledSendRef.current().then((fired) => {
+          // 若因发送中/停止中/清空中被拦截而未真正发出，重置状态让下一次空闲成立时重试。
+          if (!fired && pendingSendRef.current) wasScheduledIdleRef.current = false;
+        }).catch(() => {
+          // sendContent 内部已兜底，这里仅防止意外拒绝导致未处理 Promise。
+          if (pendingSendRef.current) wasScheduledIdleRef.current = false;
+        });
+      }, 400);
+    } else if (!idle) {
+      // 又开始了新运行：取消挂起的预约发送。
+      if (scheduledSendTimerRef.current != null) {
+        window.clearTimeout(scheduledSendTimerRef.current);
+        scheduledSendTimerRef.current = null;
+      }
+    }
+    wasScheduledIdleRef.current = idle;
+    // 注意：不要把 sendContent 加进依赖。它每次渲染都重建（非 useCallback），
+    // 且本 effect 只通过 fireScheduledSendRef 间接调用它，加了会让此 effect 每
+    // 次渲染都跑一遍，白白重复 idle 判定。
+  }, [isConversationIdle, pendingSendContent, clearing, readOnlyConversation, sending, shortcutBusy, stopping]);
+
+  useEffect(() => () => {
+    if (scheduledSendTimerRef.current != null) window.clearTimeout(scheduledSendTimerRef.current);
+  }, []);
 
   const runShortcut = async (shortcut: Shortcut, variables: Record<string, string> = {}, variablesReady = false) => {
     if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
@@ -1726,6 +1816,13 @@ export default function ConversationPage() {
         if (conversationRef.current?.id === conversationID) setComposerText(preview.content, conversationID);
       } catch (cause) { fail(cause instanceof Error ? cause.message : "无法准备快捷任务"); }
       finally { setShortcutBusy(""); }
+      return;
+    }
+    // 清屏（模板恰好为 /clear）也是 CLI 的本地命令：headless 模式下只发
+    // conversation_reset、不会在应用界面清空历史。点击清屏快捷项直接走应用自己的
+    // "清空上下文"流程，与输入框里键入 /clear 的行为一致。
+    if (shortcut.template.trim() === "/clear") {
+      clearConversationContext();
       return;
     }
     setShortcutBusy(shortcut.id);
@@ -1885,7 +1982,7 @@ export default function ConversationPage() {
   };
 
   const activateConversation = async (item: Conversation) => {
-    if (!conversation || item.id === conversation.id || item.status === "running") { closeHistory(); return; }
+    if (!conversation || item.id === conversation.id || item.status === "running" || item.isOrchestration) { closeHistory(); return; }
     if (sending || clearing || stopping || shortcutBusy) { closeHistory(); return; }
     setActivatingConversation(item.id);
     try {

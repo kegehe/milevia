@@ -99,9 +99,15 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const refreshStatuses = useCallback(async () => {
     const requestVersion = ++statusRequestVersion.current;
     try {
-      const statusList = await apiFn<{ id: string; running: number; conversationCount: number; activeTitle: string }[]>("/api/projects/statuses");
+      const statusList = await apiFn<{ id: string; running: number; conversationCount: number; activeTitle: string; insightsRunning: number; insightsMessage: string }[]>("/api/projects/statuses");
       if (requestVersion !== statusRequestVersion.current) return;
-      const entries = statusList.map((item) => [item.id, { running: item.running === 1, conversationCount: item.conversationCount, activeTitle: item.activeTitle }] as const);
+      const entries = statusList.map((item) => [item.id, {
+        running: item.running === 1,
+        conversationCount: item.conversationCount,
+        activeTitle: item.activeTitle,
+        insightsRunning: item.insightsRunning === 1,
+        insightsMessage: item.insightsMessage ?? "",
+      }] as const);
       setProjectStatuses(Object.fromEntries(entries));
     } catch {
       // 失败时保留上一次已知的状态，不覆盖。

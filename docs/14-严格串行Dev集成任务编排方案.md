@@ -101,14 +101,13 @@ checking / reviewing 失败
 ### 4.3 每项任务的 Git 流程
 
 1. 获取项目串行 lease，记录当前 `dev` 的 `base_dev_sha`。
-2. 同步受保护的 `dev`，确认工作树干净，并在未修改的 `base_dev_sha` 上执行基线检查。
-3. 基线检查失败时冻结队列并转 `needs_human`；不得开始任务，否则无法判断后续失败是否由新改动引入。
-4. 从该 SHA 创建 `task/<task-id>-<slug>`，并创建独立 `git worktree`。
-5. Agent 只允许在该 worktree 中实施；TaskRun 保存分支、worktree、基线 SHA、Agent、Runner、Prompt 和策略快照。
-6. 完成验证闭环后，自动创建任务提交。提交信息必须携带稳定标识，例如 `Task: <task-id>`。
-7. 合并前再次确认 `dev` HEAD 仍等于 `base_dev_sha`。不相等时停止并转人工处理，禁止静默把任务合并到变化后的基线。
-8. 严格串行时优先执行 `git merge --ff-only task/<task-id>-<slug>` 到 `dev`；不能 fast-forward 即视为异常，不自动解决冲突。
-9. 在 `dev` 上执行集成检查。通过后记录 `integration_sha`，清理 worktree；任务分支可按保留策略归档或删除。
+2. 从 `base_dev_sha`（主工作区的 `main` 分支提交）创建独立 `git worktree`。任务在隔离 worktree 中实施，因此主工作区存在未提交/未跟踪改动不阻止首次派发；但主工作区必须在并入 `main` 前清理干净。
+3. 从该 SHA 创建 `task/<task-id>-<slug>` 任务分支（工作区已在上一步创建）。实施开始前不在主工作区或 worktree 上运行基线验证，避免用尚不存在的改动阻塞任务派发。
+4. Agent 只允许在该 worktree 中实施；TaskRun 保存分支、worktree、基线 SHA、Agent、Runner、Prompt 和策略快照。
+5. 完成验证闭环后，自动创建任务提交。提交信息必须携带稳定标识，例如 `Task: <task-id>`。
+6. 合并前再次确认 `dev` HEAD 仍等于 `base_dev_sha`。不相等时停止并转人工处理，禁止静默把任务合并到变化后的基线。
+7. 严格串行时优先执行 `git merge --ff-only task/<task-id>-<slug>` 到 `dev`；不能 fast-forward 即视为异常，不自动解决冲突。
+8. 在 `dev` 上执行集成检查。通过后记录 `integration_sha`，清理 worktree；任务分支可按保留策略归档或删除。
 
 调度器不得 force push、改写 `dev` 历史、自动 push/merge `main`。发现已经集成的任务有问题时，创建修复任务或显式 revert 提交；不以重置共享分支修复问题。
 

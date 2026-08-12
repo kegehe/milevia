@@ -799,7 +799,7 @@ func TestGetProjectAgentConfig(t *testing.T) {
 		t.Fatalf("mkdir project: %v", err)
 	}
 	create := httptest.NewRecorder()
-	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", jsonBody(t, map[string]string{"path": projectPath})))
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create project status=%d body=%s", create.Code, create.Body.String())
 	}
@@ -860,7 +860,7 @@ func TestGetProjectAgentConfigOnlyLoadsExecutableAgents(t *testing.T) {
 		t.Fatalf("mkdir project: %v", err)
 	}
 	create := httptest.NewRecorder()
-	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", jsonBody(t, map[string]string{"path": projectPath})))
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create project status=%d body=%s", create.Code, create.Body.String())
 	}
@@ -891,7 +891,7 @@ func TestGetProjectAgentConfigPrefersProjectDefaultOverAlphabeticOrder(t *testin
 		t.Fatalf("mkdir project: %v", err)
 	}
 	create := httptest.NewRecorder()
-	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", strings.NewReader(`{"path":"`+projectPath+`"}`)))
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects", jsonBody(t, map[string]string{"path": projectPath})))
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create project status=%d body=%s", create.Code, create.Body.String())
 	}

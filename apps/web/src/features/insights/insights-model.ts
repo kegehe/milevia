@@ -34,14 +34,48 @@ export type InsightFinding = {
   fileHint?: string;
   status: string;
   createdAt: string;
+  // 建议再验证（re-verify）落库状态：''=未验证 | pending=验证中 | valid=确认仍存在 |
+  // invalid=已失效（从有效列表隐藏） | failed=验证失败（可重试）。
+  verificationResult?: InsightVerificationResult;
+  verificationNote?: string;
+  verifiedAt?: string | null;
+};
+
+// 建议再验证的结果状态，与后端 insightVerify* 常量一一对应。
+export type InsightVerificationResult = "" | "pending" | "valid" | "invalid" | "failed";
+
+export type InsightVerificationRun = {
+  id: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  error?: string;
+  message?: string;
+  totalCount: number;
+  processedCount: number;
+  createdAt: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
 };
 
 export type InsightsResponse = {
   scan: InsightScan | null;
   findings: InsightFinding[];
+  events: InsightEvent[];
   hasScan: boolean;
   suppressedCount: number;
   openCount: number;
+  verification?: InsightVerificationRun | null;
+  // 经验证已失效、从有效列表隐藏的建议（折叠展示，含 AI 判断依据）。
+  invalidated?: InsightFinding[];
+};
+
+// 一条分析过程中的进度消息（"分析信息"滚动展示）。level 与后端一一对应。
+export type InsightEventLevel = "info" | "success" | "warn" | "error";
+export type InsightEvent = {
+  id: string;
+  seq: number;
+  ts: string;
+  level: InsightEventLevel;
+  message: string;
 };
 
 export const insightTypeLabels: Record<InsightType, string> = {
@@ -97,6 +131,21 @@ export function normalizeInsightSeverity(value?: string): InsightSeverity {
   return isInsightSeverity(value ?? "") ? (value as InsightSeverity) : "normal";
 }
 
+// 建议再验证状态标签（卡片徽章 / 已失效折叠区）。
+export const insightVerificationLabels: Record<InsightVerificationResult, string> = {
+  "": "未验证",
+  pending: "验证中…",
+  valid: "已复核 · 仍存在",
+  invalid: "已失效",
+  failed: "验证失败",
+};
+
+/** 把后端任意字符串归一为合法验证状态；非法/缺省 → ""（未验证）。 */
+export function normalizeInsightVerification(value?: string): InsightVerificationResult {
+  if (value === "pending" || value === "valid" || value === "invalid" || value === "failed") return value;
+  return "";
+}
+
 export type InsightFilter = InsightType | "all";
 
 // 排序：动态类型在前，同类型内 high → normal → low → created_at 升序（稳定）。
@@ -121,22 +170,4 @@ export function insightFindingCounts(findings: InsightFinding[]): Record<Insight
   const counts: Record<InsightFilter, number> = { all: findings.length, bug: 0, style: 0, optimization: 0, feature: 0 };
   for (const f of findings) counts[normalizeInsightType(f.type)] += 1;
   return counts;
-}
-
-/**
- * 把一条 finding 拼成给 AI 的提示词，用于"发送到对话"快速发起修复/功能添加。
- * 内容是用户可读的现象描述 + 明确的行动指令，不含代码标识符。
- */
-export function buildInsightPrompt(finding: InsightFinding): string {
-  const type = normalizeInsightType(finding.type);
-  const severity = normalizeInsightSeverity(finding.severity);
-  const lines = [
-    `【优化建议】${finding.title}`,
-    `类型：${insightTypeLabels[type]}　严重度：${insightSeverityLabels[severity]}`,
-    `说明：${finding.summary}`,
-  ];
-  const hint = (finding.fileHint || "").trim();
-  if (hint) lines.push(`相关位置：${hint}`);
-  lines.push("", "请据此排查并修复上述问题/实现上述功能。");
-  return lines.join("\n");
 }

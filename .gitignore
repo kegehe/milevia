@@ -18,9 +18,14 @@ coverage/
 # Go build output
 bin/
 *.exe
+*.exe~
 *.test
 *.out
 apps/control-server/control-server
+
+# Go test JSON log dumps (debugging artifacts)
+.suite.json
+.suite.txt
 
 # Generated API and protocol files
 packages/contracts/generated/

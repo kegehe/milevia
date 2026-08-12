@@ -127,18 +127,37 @@ const TRAY_PANEL_LABEL: &str = "tray-panel";
 const TRAY_PANEL_WIDTH: f64 = 220.0;
 const TRAY_PANEL_HEIGHT: f64 = 224.0;
 
-fn sidecar_binary(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
+fn sidecar_binary(_app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
     if let Ok(path) = env::var("MILEVIA_CONTROL_BINARY") {
         return Ok(PathBuf::from(path));
     }
-    Ok(app.path().resource_dir()?.join("milevia-control.exe"))
+    // Tauri copies resources into target/debug only when it rebuilds the host.
+    // In development the Go sidecar can be rebuilt independently, so use the
+    // freshly generated binary instead of a stale copied resource.
+    #[cfg(debug_assertions)]
+    {
+        return Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("binaries")
+            .join("milevia-control.exe"));
+    }
+    #[cfg(not(debug_assertions))]
+    Ok(_app.path().resource_dir()?.join("milevia-control.exe"))
 }
 
-fn approval_binary(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
+fn approval_binary(_app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
     if let Ok(path) = env::var("MILEVIA_APPROVAL_BINARY") {
         return Ok(PathBuf::from(path));
     }
-    Ok(app.path().resource_dir()?.join("milevia-approval.exe"))
+    #[cfg(debug_assertions)]
+    {
+        return Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("binaries")
+            .join("milevia-approval.exe"));
+    }
+    #[cfg(not(debug_assertions))]
+    Ok(_app.path().resource_dir()?.join("milevia-approval.exe"))
 }
 
 fn page_origin() -> &'static str {
@@ -440,6 +459,12 @@ fn create_main_window(app: &tauri::AppHandle, sidecar: &RunningSidecar) -> tauri
         .title("Milevia")
         .inner_size(1440.0, 920.0)
         .min_inner_size(1080.0, 720.0)
+        // 必须禁用 Tauri 原生文件拖放处理器：它会 RevokeDragDrop 掉 WebView2 子窗口自带的
+        // OLE IDropTarget 并注册一个只转发文件拖放的替代者，导致窗口内 HTML5 拖拽
+        // （任务队列/看板卡片重排、常用提示词/命令排序）在 Windows 上收不到 dragstart/
+        // dragover/drop。应用本身不依赖 Tauri 的文件拖放事件，禁用后 WebView2 原生
+        // 接管拖放，HTML5 拖拽恢复正常。参考 tauri 2.11 `disable_drag_drop_handler` 文档。
+        .disable_drag_drop_handler()
         // Windows 上统一走 https://tauri.localhost 标准 scheme：WebView2 会把 http://
         // 升级为 https://，而 wry 的资源拦截只注册 http，升级后无人拦截导致
         // ERR_CONNECTION_REFUSED → 空白黑屏。打开 https 让导航/拦截/过滤三者一致。

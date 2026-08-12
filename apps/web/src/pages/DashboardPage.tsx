@@ -22,7 +22,9 @@ function RemoteServerIcon() {
 }
 
 function WslEnvironmentIcon() {
-  return <svg className="env-tag-icon wsl" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 3v9.6L3.5 10 11 3ZM21 3v9.6L13.5 10 21 3ZM11 12.3V21L3.5 14.5 11 12.3ZM21 12.3V21l-7.5-6.5L21 12.3Z" /></svg>;
+  // 企鹅：WSL = Windows 上的 Linux，用 Tux 剪影比抽象的"四叶风车"更易识别。
+  // 身体/头部用 evenodd 挖出白色肚皮、眼睛与嘴，翅膀单独绘制盖在肚皮上。
+  return <svg className="env-tag-icon wsl" viewBox="0 0 24 24" aria-hidden="true"><g fill="currentColor"><path fillRule="evenodd" d="M9 7.8L15 7.8C18.2 9 19.2 11.2 19 14C18.8 16.8 18 19.2 15.6 20.6C14.4 21.4 9.6 21.4 8.4 20.6C6 19.2 5.2 16.8 5 14C4.8 11.2 5.8 9 9 7.8ZM8.6 15.6a3.4 3.8 0 1 0 6.8 0a3.4 3.8 0 1 0 -6.8 0Z" /><path fillRule="evenodd" d="M12 1.2a4.2 4.2 0 1 0 0 8.4a4.2 4.2 0 1 0 0 -8.4ZM10.2 4.2a1 1 0 1 0 0 2a1 1 0 1 0 0 -2ZM13.8 4.2a1 1 0 1 0 0 2a1 1 0 1 0 0 -2ZM10.9 6.9L13.1 6.9L12 8.8Z" /><path d="M16.5 10.8C18.8 11.8 20.2 14 20.2 16.2C20.2 18.4 18.6 19.6 16.2 19.6C15.2 19.6 14.6 19 14.4 18.4C14.8 16.2 15.2 13 16.5 10.8Z" /><path d="M7.5 10.8C5.2 11.8 3.8 14 3.8 16.2C3.8 18.4 5.4 19.6 7.8 19.6C8.8 19.6 9.4 19 9.6 18.4C9.2 16.2 8.8 13 7.5 10.8Z" /></g></svg>;
 }
 
 function SshConnectionIcon() {
@@ -182,7 +184,14 @@ function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, 
 }) {
   const state = status?.running ? "正在执行" : project.agentReady ? "已就绪" : "工具不可用";
   const stateClass = status?.running ? "running" : project.agentReady ? "ready" : "offline";
-  const taskTitle = status?.running && status.activeTitle ? status.activeTitle : "等待新的任务";
+  // 优化建议分析中：项目总览卡片上的闪烁状态（与对话执行状态相互独立）。
+  const analyzing = status?.insightsRunning === true;
+  const analysisTitle = status?.insightsMessage || "正在优化建议分析…";
+  const taskTitle = status?.running && status.activeTitle
+    ? status.activeTitle
+    : analyzing
+      ? `优化建议分析：${analysisTitle}`
+      : "等待新的任务";
   const dragClass = isDragging ? " dragging" : isDropTarget ? " drop-target" : "";
   // 开发进程状态点徽标：已停止（进程未启动是常态）不显示，仅可视化进行中的状态。
   const runStatusLabel = runStatus !== "stopped" ? statusLabels[runStatus] : null;
@@ -196,7 +205,8 @@ function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, 
       <span className="project-mark">{project.name.slice(0, 1).toUpperCase()}</span>
       <span className="project-card-top-actions">
         <span className={`project-state ${stateClass}`}><i></i>{state}</span>
-        {runStatusLabel && <span className={`project-run-state run-state-${runStatus}`} title={`开发进程: ${statusLabels[runStatus]}`}><i style={{ background: statusColors[runStatus] }}></i>{runStatusLabel}</span>}
+        {analyzing && <span className="project-analysis-badge" title={analysisTitle}><i></i>优化建议分析中</span>}
+        {runStatusLabel && <span className={`project-run-state run-state-${runStatus}`} title={`开发进程: ${statusLabels[runStatus]}`}><svg className="project-run-state-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 3.5 6 8l-4.5 4.5M7.5 12.5h7" /></svg><i style={{ background: statusColors[runStatus] }}></i>{runStatusLabel}</span>}
         {project.environment === "windows" && <span className="env-tag windows" title="Windows 项目" role="img" aria-label="Windows 项目"><WindowsEnvironmentIcon /></span>}
         {project.environment === "remote-linux" && <span className="env-tag remote" title="远程服务器" role="img" aria-label="远程服务器"><RemoteServerIcon /></span>}
         {project.environment === "wsl" && <span className="env-tag wsl" title="WSL 项目" role="img" aria-label="WSL 项目"><WslEnvironmentIcon /></span>}

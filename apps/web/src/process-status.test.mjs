@@ -39,12 +39,12 @@ test("DashboardPage: 项目卡片渲染开发进程状态点徽标（stopped 隐
   assert.match(dashboard, /useProcessStatusMap\(\)/);
 });
 
-// 类型扩展：新增进程状态类型，但保留会话状态 ProjectStatus
-test("types: 新增 RunStatus/ProjectProcessStatus/RunStatusEvent，不改 ProjectStatus", () => {
+// 类型扩展：新增进程状态类型；会话状态 ProjectStatus 追加优化建议分析状态字段
+test("types: 新增 RunStatus/ProjectProcessStatus/RunStatusEvent，ProjectStatus 含 insights 状态", () => {
   assert.match(types, /export type RunStatus = "stopped" \| "starting" \| "running" \| "stopping" \| "failed"/);
   assert.match(types, /export type ProjectProcessStatusMap = Record<string, ProjectProcessStatus>/);
   assert.match(types, /export type RunStatusEvent = \{ projectId: string; status: RunStatus/);
-  assert.match(types, /export type ProjectStatus = \{ running: boolean; conversationCount: number; activeTitle: string \};/);
+  assert.match(types, /export type ProjectStatus = \{ running: boolean; conversationCount: number; activeTitle: string; insightsRunning: boolean; insightsMessage: string \};/);
 });
 
 // App 根部挂载：Provider 树位于 NotificationProvider 与 ProjectProvider 之间

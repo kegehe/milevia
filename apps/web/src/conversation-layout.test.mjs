@@ -99,7 +99,7 @@ test("scheduled send holds input until the conversation plus subagents go idle",
   // 空闲判定：主回合结束 且 没有任何子代理仍在运行
   assert.match(conversationPage, /const isConversationIdle = useCallback\(\(\) => \{[\s\S]*?if \(run\) return false;[\s\S]*?for \(const execution of agentExecutions\)[\s\S]*?agent\.status === "running" \|\| agent\.status === "pending"\) return false;/s);
   // 触发：空闲才真正 sendContent
-  assert.match(conversationPage, /if \(!isConversationIdle\(\)\) return;\s*[\s\S]*?await sendContent\(content\);/s);
+  assert.match(conversationPage, /if \(!isConversationIdle\(\)\) return false;\s*[\s\S]*?await sendContent(?:Ref\.current)?\(content[,;]/s);
   // 预约进行中的提示条与取消按钮
   assert.match(conversationPage, /pendingSendContent && <div className="composer-pending"/);
   assert.match(conversationPage, /composer-pending-cancel[\s\S]*?onClick=\{cancelScheduledSend\}/);
@@ -119,8 +119,8 @@ test("user-triggered stop or clear cancels a pending scheduled send", () => {
 });
 
 test("a failed send restores its draft only while the original conversation remains active", () => {
-  assert.match(conversationPage, /const conversationID = conversation\.id;\s*const routeVersion = conversationRouteVersion\.current;\s*setSending\(true\);/s);
-  assert.match(conversationPage, /catch \(cause\) \{\s*if \(conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;\s*fail\(cause instanceof Error \? cause\.message : "无法发送消息"\);\s*if \(clearDraft\) \{/s);
+  assert.match(conversationPage, /const conversationID = conversation\.id;\s*const clientRequestId = options\.clientRequestId \?\? crypto\.randomUUID\(\);\s*const routeVersion = conversationRouteVersion\.current;\s*setSending\(true\);/s);
+  assert.match(conversationPage, /catch \(cause\) \{\s*if \(conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return false;\s*if \(notifyFailure\) fail\(cause instanceof Error \? cause\.message : "无法发送消息"\);\s*if \(clearDraft && restoreOnFailure\) \{/s);
 });
 
 test("conversation entries keep card styles separate from their layout and align user messages to the reading column", () => {
@@ -196,7 +196,9 @@ test("task queue has one named landmark", () => {
 });
 
 test("shortcut and task cards keep their intrinsic row heights", () => {
-  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*align-content:\s*start;/s);
+  // align-content: start 让列表行不被拉高；align-items: start 让两列各自按内容高度顶部对齐，
+  // 否则提示词/命令数量不等时，较短一列的卡片间距会被拉伸（见 quick-tag-rail 两列布局）。
+  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*align-content:\s*start;[^}]*align-items:\s*start;/s);
   assert.match(taskStyles, /\.task-queue-list\s*\{[^}]*align-content:\s*start;[^}]*gap:\s*6px;/s);
 });
 
@@ -260,6 +262,15 @@ test("switching projects does not render an outlet with the previous project con
   assert.match(projectLayout, /api<Project>\(`\/api\/projects\/\$\{projectId\}`\)/);
   // 不再重置 setProject(null)——保留旧数据但靠 id 不匹配守卫，避免全屏闪烁。
   assert.doesNotMatch(projectLayout, /setProject\(null\);/);
+});
+
+test("non-git projects cannot open the Git workspace via direct /git access", () => {
+  // 与顶部标签栏一致：非 Git 项目不展示 Git 工作台入口，直接访问 /git（含末尾斜杠）
+  // 重定向到默认工作区，避免打开无法工作的空页面。
+  assert.match(projectLayout, /location\.pathname\.replace\([^)]*\)\.endsWith\("\/git"\)/);
+  assert.match(projectLayout, /project\.gitBranch === NON_GIT_BRANCH/);
+  assert.match(projectLayout, /import \{ type Project, type WorkspaceTab, NON_GIT_BRANCH \} from "\.\.\/lib\/types";/);
+  assert.match(projectLayout, /<Navigate to=\{`\/projects\/\$\{project\.id\}\/conversations`\} replace \/>/);
 });
 
 test("conversation follows streaming updates and explicitly follows dispatched messages", () => {
@@ -332,6 +343,16 @@ test("clearing context starts a fresh conversation with the current agent and po
   assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
   assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
   assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| !text\.trim\(\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\}><ComposerActionIcon action="send" \/>/);
+});
+
+test("/clear in the composer and the 清屏 shortcut route through the app clear flow", () => {
+  // /clear 是 CLI 的"清屏"命令，但 headless 模式下 CLI 只发 conversation_reset、
+  // 不会在应用界面清空历史。输入框键入 /clear 必须拦截并走应用自己的清空流程。
+  assert.match(conversationPage, /if \(content === "\/clear"\) \{[\s\S]*?clearConversationContext\(\);[\s\S]*?return false;/s);
+  // 模板恰好为 /clear 的快捷项（默认"清屏"）同样拦截，不再 POST 给后端/CLI。
+  assert.match(conversationPage, /if \(shortcut\.template\.trim\(\) === "\/clear"\) \{[\s\S]*?clearConversationContext\(\);[\s\S]*?return;/s);
+  // 其它斜杠命令（/compact 等）仍原样发送，保证原生 CLI 命令链路不受影响。
+  assert.match(conversationPage, /const action = shortcut\.defaultAction === "confirm" \? "confirm" : "run";/);
 });
 
 test("creating a conversation keeps the newly navigated route", () => {

@@ -73,6 +73,32 @@ test("appends original English turn failure details after the Chinese fallback",
   assert.deepEqual(fallback.filter((item) => item.kind === "error").map((item) => item.detail), ["任务执行失败，请查看任务日志后重试。：Codex exited: exit status 1"]);
 });
 
+test("coalesces multiple CLI stderr events from one run into one diagnostic", () => {
+  const timeline = buildTimeline([], [
+    event("stderr-1", "stderr", { message: "> @milevia/web@0.0.1 build" }),
+    event("stderr-2", "stderr", { message: "src/features/tasks/TaskQueue.tsx(534,10): error TS2554" }),
+    event("stderr-3", "stderr", { message: "src/features/tasks/TaskQueue.tsx(568,234): error TS2554" }),
+  ]);
+
+  const errors = timeline.filter((item) => item.kind === "error");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].detail, /@milevia\/web@0\.0\.1 build/);
+  assert.match(errors[0].detail, /TS2554/);
+  assert.match(errors[0].detail, /\n/);
+});
+
+test("renders decoded WSL launcher warning as readable detail, no fallback prefix", () => {
+  // wsl.exe 的 UTF-16LE 主机侧警告经服务端解码后是含技术术语（wsl/localhost/NAT）的
+  // 纯中文；不应被当作"未翻译英文"而包上"工具输出异常：..." 前缀。
+  const timeline = buildTimeline([], [
+    event("stderr-wsl", "stderr", { message: "wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost 代理。" }),
+  ]);
+  const errors = timeline.filter((item) => item.kind === "error");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].title, "CLI 输出");
+  assert.equal(errors[0].detail, "wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost 代理。");
+});
+
 test("unwraps Codex shell wrapper and labels command execution as terminal command", () => {
   const timeline = buildTimeline([], [
     event("cmd-start", "item.started", { item: { id: "item_1", type: "command_execution", command: "/usr/bin/zsh -lc 'cat hello.txt'", aggregated_output: "", exit_code: null, status: "in_progress" } }),

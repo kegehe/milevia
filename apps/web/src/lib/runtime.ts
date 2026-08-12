@@ -10,5 +10,6 @@ export {
   getPlatform,
   isDesktop,
   isWeb,
+  openExternal,
   sessionHeaders,
 } from "@milevia/sdk";

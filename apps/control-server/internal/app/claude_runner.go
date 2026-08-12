@@ -94,10 +94,11 @@ type AgentRunRequest struct {
 	// 会进入"待命"而非执行，导致扫描收到 "I'll wait for your request"。
 	SkipSessionID bool
 	// ReadOnlyExecution 让一次性 Run 走"只读执行"而非 `--permission-mode plan`：
-	// 使用 --permission-mode default + --allowedTools 仅放行只读工具（Read/Glob/Grep/
-	// List 等）。这样 agent 能真正执行（读、搜索、结论）而物理上无法修改任何文件，
-	// 且只读工具无需审批不会挂起——是"在当前分支只读分析、不改代码"的正确姿势。
-	// 实测：配合"你的唯一回复就是这个 JSON"的强结构 prompt，能稳定返回单一 JSON 数组。
+	// 使用 --permission-mode default + --allowedTools 放行只读工具（Read/Glob/Grep）。
+	// 这样 agent 能真正执行（读、搜索、结论）。同时用 --settings permissions.deny
+	// 硬拒可写/可执行工具（见 insightReadOnlyDenyTools）——实测 --allowedTools 在本
+	// 版本不会移除非白名单工具，模型仍能调 PowerShell 跑 git diff/写文件，deny 清单
+	// 才是真正把只读落地的机制：只读工具无需审批不会挂起，可写工具不在工具集里。
 	ReadOnlyTools []string
 	// PromptViaStdin 让一次性 Run 把 prompt 写入 stdin（而非作为最后 argv 参数）。
 	// claude 在同时使用 --allowedTools 时要求 --print 的输入必须经 stdin 提供，
@@ -462,6 +463,7 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 		}
 	}()
 
+	var stderrTail = &stderrCapture{}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -470,7 +472,7 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	}()
 	go func() {
 		defer wg.Done()
-		r.readStderr(stderr, sink)
+		r.readStderrCapture(stderr, sink, stderrTail)
 	}()
 	// PromptViaStdin：后台 goroutine 写 prompt 再关 stdin。绝不能在此主流程同步写——
 	// 大 prompt 超出 OS 管道缓冲时会阻塞，而此时 reader 才刚启动，claude 提前大量输出
@@ -484,6 +486,11 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	}
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
+		// 附上 claude 自己写的 stderr 尾部，让"Claude exited: exit status 1"带上真实原因
+		// （API 错误/上下文超限/权限问题等），否则用户只能看到一个裸退出码。
+		if detail := claudeStderrDetail(stderrTail.tail()); detail != "" {
+			return fmt.Errorf("Claude exited: %w %s", err, detail)
+		}
 		return fmt.Errorf("Claude exited: %w", err)
 	}
 	return nil
@@ -575,8 +582,15 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	args := []string{"-p", "--verbose", "--output-format", "stream-json"}
 	if len(request.ReadOnlyTools) > 0 {
-		// 只读执行：default 模式 + 仅放行只读工具，agent 能执行但改不了任何文件。
-		args = append(args, "--permission-mode", "default", "--allowedTools", strings.Join(request.ReadOnlyTools, " "))
+		// 只读执行：default 模式 + 仅放行只读工具。
+		// 实测 --allowedTools 在本版本并不限制非白名单工具（模型仍可调 PowerShell
+		// 跑 git diff 做全量探索，甚至写文件），故额外用 --settings permissions.deny
+		// 把可写/可执行工具从模型工具集里真正移除（insightReadOnlyDenyTools）。
+		settings, err := insightReadOnlySettingsJSON()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--permission-mode", "default", "--allowedTools", strings.Join(request.ReadOnlyTools, " "), "--settings", settings)
 	} else if request.PermissionMode == "full_control" {
 		args = append(args, "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions")
 	} else if isReadOnlyClaudeRequest(request.PermissionMode) {
@@ -864,6 +878,8 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 func (session *claudeCLISession) readStderr(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	// 同 readStderr：解码 wsl.exe 的 UTF-16LE 主机侧警告；非 WSL 路径行为不变。
+	scanner.Split(wslStderrSplit)
 	for scanner.Scan() {
 		session.emit("stderr", mustJSON(map[string]string{"message": redactAgentText(scanner.Text())}), false)
 	}
@@ -1245,10 +1261,23 @@ func finishTurn(turn *claudeSessionTurn, err error) {
 }
 
 func (r *claudeCLIRunner) readStderr(reader io.Reader, sink AgentRunSink) {
+	r.readStderrCapture(reader, sink, nil)
+}
+
+// readStderrCapture 在 readStderr 基础上，把读到的 stderr 行追加到 capture（非 nil 时），
+// 供一次性 Run 失败时把 claude 的真实原因拼进错误信息（见 claudeStderrDetail）。
+func (r *claudeCLIRunner) readStderrCapture(reader io.Reader, sink AgentRunSink, capture *stderrCapture) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	// wsl.exe 的主机侧警告以 UTF-16LE 写入 stderr，需经 wslStderrSplit 解码为 UTF-8；
+	// 非 WSL 路径（无 NUL 字节）退化为普通按行切分，行为不变。
+	scanner.Split(wslStderrSplit)
 	for scanner.Scan() {
-		sink.Event("stderr", mustJSON(map[string]string{"message": redactAgentText(scanner.Text())}))
+		line := scanner.Text()
+		if capture != nil {
+			capture.append(line)
+		}
+		sink.Event("stderr", mustJSON(map[string]string{"message": redactAgentText(line)}))
 	}
 	if err := scanner.Err(); err != nil {
 		// errorText 对停止时管道关闭（os.ErrClosed）返回空，据此跳过上报。
@@ -1256,4 +1285,88 @@ func (r *claudeCLIRunner) readStderr(reader io.Reader, sink AgentRunSink) {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": text}))
 		}
 	}
+}
+
+// stderrCapture 累积一次性 claude 运行的 stderr 尾部，失败时把真实原因拼进错误。
+// 缓冲有界：只保留最近 maxStderrCaptureLines 行，总字节超限时丢弃最早的行，避免
+// 病态的长输出把错误信息撑爆。
+type stderrCapture struct {
+	mu    sync.Mutex
+	lines []string
+	bytes int
+}
+
+const (
+	maxStderrCaptureLines = 12
+	maxStderrCaptureBytes = 4096
+)
+
+func (c *stderrCapture) append(line string) {
+	if line == "" {
+		return
+	}
+	// 跳过 wsl.exe 的已知无害主机侧警告（NAT/localhost 代理提示），它们不是 claude
+	// 的输出，拼进错误 detail 只会占用有限的展示空间。过滤必须精确到该警告本身，
+	// 不能把所有 "wsl: " 前缀行都滤掉——wsl.exe 启动命令失败的真实报错
+	// （如 "wsl: 找不到发行版 …"）同样以 "wsl: " 开头，那些正是失败原因，必须保留。
+	if isWslHostWarning(line) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 单行超长时先截断到总字节上限再入缓冲，避免"最后一行超大导致整行被后面的
+	// 有界循环丢光、tail 为空"的边界情况。
+	if len(line) > maxStderrCaptureBytes {
+		line = line[len(line)-maxStderrCaptureBytes:]
+	}
+	c.lines = append(c.lines, line)
+	c.bytes += len(line)
+	for len(c.lines) > maxStderrCaptureLines || c.bytes > maxStderrCaptureBytes {
+		c.bytes -= len(c.lines[0])
+		c.lines = c.lines[1:]
+	}
+}
+
+// isWslHostWarning 判断是否为 wsl.exe 的已知无害主机侧警告。实测每次经 wsl.exe 启动
+// 命令时，若本机配了 localhost 代理，wsl 都会写一条 UTF-16LE 的
+// "wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost 代理。"
+// （中文 locale；英文 locale 为 "wsl: Detected localhost proxy configuration …"）。
+// 识别条件：以 "wsl:" 开头，且同时包含 proxy/代理 与 NAT（两种 locale 都满足）——
+// 要求两者兼有，避免把 wsl.exe 只提 NAT 的真实网络错误（如 "wsl: NAT 连接失败"）误滤掉。
+func isWslHostWarning(line string) bool {
+	l := strings.ToLower(strings.TrimSpace(line))
+	if !strings.HasPrefix(l, "wsl:") {
+		return false
+	}
+	return (strings.Contains(l, "proxy") || strings.Contains(l, "代理")) && strings.Contains(l, "nat")
+}
+
+func (c *stderrCapture) tail() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.lines, " ")
+}
+
+// claudeStderrDetail 把一次性运行捕获的 stderr 尾部转成错误信息附加段
+// "（stderr：…）"。空捕获返回空串（不拼任何括号）。结果有界且保留末尾
+// （最有用的报错信息通常在后几行），并做脱敏 + 去 ANSI。
+// maxDetailBytes 取 180：加上 "Claude exited: exit status 1（stderr：…）" 前缀后仍能
+// 落入 insightRunErrorMessage 的 240 字符截断（其保留开头、截断末尾）之内，避免
+// 关键的末尾原因被截掉。
+func claudeStderrDetail(tail string) string {
+	clean := redactAgentText(stripAnsi(strings.TrimSpace(tail)))
+	if clean == "" {
+		return ""
+	}
+	const maxDetailBytes = 180
+	if len(clean) > maxDetailBytes {
+		start := len(clean) - maxDetailBytes
+		// 向后推进到下一个 UTF-8 字符起始字节，避免从多字节字符（中文）中间
+		// 截断产生 U+FFFD 替换符。
+		for start < len(clean) && (clean[start]&0xC0) == 0x80 {
+			start++
+		}
+		clean = clean[start:] // 保留末尾（含关键报错）
+	}
+	return "（stderr：" + clean + "）"
 }

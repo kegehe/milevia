@@ -3,10 +3,15 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -86,6 +91,44 @@ func TestRemotePathWithinRoot(t *testing.T) {
 	for _, test := range cases {
 		if got := remotePathWithinRoot(test.root, test.path); got != test.want {
 			t.Errorf("remotePathWithinRoot(%q, %q) = %v, want %v", test.root, test.path, got, test.want)
+		}
+	}
+}
+
+// fakeFileInfo implements os.FileInfo for buildRemoteDirItems tests.
+type fakeFileInfo struct {
+	name  string
+	isDir bool
+}
+
+func (f fakeFileInfo) Name() string       { return f.name }
+func (f fakeFileInfo) Size() int64        { return 0 }
+func (f fakeFileInfo) Mode() os.FileMode  { if f.isDir { return os.ModeDir }; return 0 }
+func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeFileInfo) IsDir() bool        { return f.isDir }
+func (f fakeFileInfo) Sys() any           { return nil }
+
+// TestBuildRemoteDirItemsUsesForwardSlashes 防止回归：远端目录浏览项路径必须
+// 用 "/" 分隔。此前用 filepath.Join 在 Windows 上产出 "\home\..."，浏览器
+// 回传后 readlink -f 把反斜杠当字面字符，解析结果越出 rootPath。
+func TestBuildRemoteDirItemsUsesForwardSlashes(t *testing.T) {
+	entries := []os.FileInfo{
+		fakeFileInfo{name: "api", isDir: true},
+		fakeFileInfo{name: "README.md", isDir: false},
+		fakeFileInfo{name: ".git", isDir: true},
+		fakeFileInfo{name: "z-app", isDir: true},
+	}
+	items := buildRemoteDirItems("/home/user/projects", entries)
+	want := []string{"/home/user/projects/api", "/home/user/projects/z-app"}
+	if len(items) != len(want) {
+		t.Fatalf("buildRemoteDirItems returned %d items, want %d: %#v", len(items), len(want), items)
+	}
+	for i, item := range items {
+		if item.Path != want[i] {
+			t.Errorf("item %d path = %q, want %q", i, item.Path, want[i])
+		}
+		if strings.Contains(item.Path, `\`) {
+			t.Errorf("item %d path %q contains backslash; remote paths must use \"/\"", i, item.Path)
 		}
 	}
 }
@@ -655,5 +698,286 @@ func TestUpdateSwitchingAuthMethodClearsOppositeCredential(t *testing.T) {
 	}
 	if updated.PrivateKeyPath != "/tmp/new-key" {
 		t.Fatalf("private key path not updated: %q", updated.PrivateKeyPath)
+	}
+}
+
+func testEd25519PEM(t *testing.T) []byte {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+}
+
+// TestResolveSSHProfileCollectsAllExistingIdentityFiles 保证 profile 解析会
+// 收集所有实际存在的候选私钥（而不仅是第一个），顺序与 ssh -G 输出一致，
+// 与 OpenSSH CLI 依次尝试每个 identity 的行为保持一致。
+func TestResolveSSHProfileCollectsAllExistingIdentityFiles(t *testing.T) {
+	originalGetSSHConfigOutput := getSSHConfigOutput
+	t.Cleanup(func() { getSSHConfigOutput = originalGetSSHConfigOutput })
+	dir := t.TempDir()
+	key1 := filepath.Join(dir, "id_rsa")
+	key2 := filepath.Join(dir, "id_ed25519")
+	missing := filepath.Join(dir, "does-not-exist")
+	for _, p := range []string{key1, key2} {
+		if err := os.WriteFile(p, []byte("unused"), 0o600); err != nil {
+			t.Fatalf("write key: %v", err)
+		}
+	}
+	getSSHConfigOutput = func(name string) ([]byte, error) {
+		return []byte(fmt.Sprintf("hostname 192.0.2.10\nuser deploy\nport 22\nidentityfile %s\nidentityfile %s\nidentityfile %s\nproxyjump none\n", key1, key2, missing)), nil
+	}
+	profile, err := resolveSSHProfile("Multi")
+	if err != nil {
+		t.Fatalf("resolve profile: %v", err)
+	}
+	if profile.PrivateKeyPath != key1 {
+		t.Fatalf("primary key = %q, want %q", profile.PrivateKeyPath, key1)
+	}
+	want := []string{key1, key2}
+	if len(profile.IdentityFiles) != len(want) || profile.IdentityFiles[0] != key1 || profile.IdentityFiles[1] != key2 {
+		t.Fatalf("IdentityFiles = %#v, want %#v (missing path excluded, order preserved)", profile.IdentityFiles, want)
+	}
+}
+
+// TestCollectSSHKeySignersTriesAllCandidatesAndSkipsBrokenKeys 保证认证时按顺序
+// 尝试所有候选私钥，读取/解析失败的私钥被跳过而不是整体失败。
+func TestCollectSSHKeySignersTriesAllCandidatesAndSkipsBrokenKeys(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	dir := t.TempDir()
+	goodPath := filepath.Join(dir, "id_good")
+	brokenPath := filepath.Join(dir, "id_broken")
+	if err := os.WriteFile(goodPath, testEd25519PEM(t), 0o600); err != nil {
+		t.Fatalf("write good key: %v", err)
+	}
+	if err := os.WriteFile(brokenPath, []byte("not a private key"), 0o600); err != nil {
+		t.Fatalf("write broken key: %v", err)
+	}
+	// 损坏的私钥排在最前：应被跳过，仍能收集到后面的可用私钥。
+	signers, err := collectSSHKeySigners(&sshClient{}, SSHConnection{PrivateKeyPaths: []string{brokenPath, goodPath}})
+	if err != nil {
+		t.Fatalf("collect signers: %v", err)
+	}
+	if len(signers) != 1 {
+		t.Fatalf("signers = %d, want 1 (broken key skipped, good key collected)", len(signers))
+	}
+}
+
+func TestCollectSSHKeySignersErrorsWithoutAnyUsableKey(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	if _, err := collectSSHKeySigners(&sshClient{}, SSHConnection{PrivateKeyPath: filepath.Join(t.TempDir(), "missing")}); err == nil {
+		t.Fatal("expected an error when no candidate key is usable")
+	}
+}
+
+// seedCandidateKeys 在已保存的连接上写入候选私钥列表，模拟多钥匙 profile 保存后的状态。
+func seedCandidateKeys(t *testing.T, server *Server, id string, paths ...string) {
+	t.Helper()
+	joined := joinKeyPaths(paths)
+	if _, err := server.db.Exec(`update ssh_connections set private_key_path=?, private_key_paths=? where id=?`, paths[0], joined, id); err != nil {
+		t.Fatalf("seed candidate keys: %v", err)
+	}
+}
+
+// TestUpdateSSHConnectionCandidateKeysCarriedOverWhenPrimaryUnchanged 保证编辑时
+// 主私钥未变则候选列表一并沿用；换成新私钥则重置为单钥匙。
+func TestUpdateSSHConnectionCandidateKeysCarriedOverWhenPrimaryUnchanged(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	seedCandidateKeys(t, server, connection.ID, "/tmp/key1", "/tmp/key2")
+
+	// 主私钥未变（编辑表单回填 primary），候选列表应保留。
+	body := `{"name":"renamed","host":"example.test","user":"dev","privateKeyPath":"/tmp/key1","authMethod":"key","password":"","rootPath":"/srv/projects","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBd875TBQVvl6l2xrvhta9tuJAvo0toGSWCQaQsBRzYd","connect":false}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := server.loadSSHConnection(context.Background(), connection.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(updated.PrivateKeyPaths) != 2 || updated.PrivateKeyPaths[0] != "/tmp/key1" || updated.PrivateKeyPaths[1] != "/tmp/key2" {
+		t.Fatalf("unchanged primary dropped candidate list: %#v", updated.PrivateKeyPaths)
+	}
+
+	// 换成新私钥：应重置为单钥匙候选。
+	body2 := `{"name":"renamed","host":"example.test","user":"dev","privateKeyPath":"/tmp/new-key","authMethod":"key","password":"","rootPath":"/srv/projects","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBd875TBQVvl6l2xrvhta9tuJAvo0toGSWCQaQsBRzYd","connect":false}`
+	response2 := httptest.NewRecorder()
+	server.routes().ServeHTTP(response2, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body2)))
+	if response2.Code != http.StatusOK {
+		t.Fatalf("update2 status=%d body=%s", response2.Code, response2.Body.String())
+	}
+	updated2, err := server.loadSSHConnection(context.Background(), connection.ID)
+	if err != nil {
+		t.Fatalf("reload2: %v", err)
+	}
+	if len(updated2.PrivateKeyPaths) != 0 || updated2.PrivateKeyPath != "/tmp/new-key" {
+		t.Fatalf("changed primary should reset candidate list; got path=%q list=%#v", updated2.PrivateKeyPath, updated2.PrivateKeyPaths)
+	}
+}
+
+// TestPreflightEditCarriesOverCandidateKeysWhenPrimaryUnchanged 保证编辑预检时
+// 主私钥未变，预检实际使用的连接也携带完整候选列表。
+func TestPreflightEditCarriesOverCandidateKeysWhenPrimaryUnchanged(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	seedCandidateKeys(t, server, connection.ID, "/tmp/key1", "/tmp/key2")
+
+	var seen SSHConnection
+	orig := newSSHClient
+	newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
+		seen = conn
+		return nil, errors.New("stop after capture")
+	}
+	t.Cleanup(func() { newSSHClient = orig })
+
+	body := `{"name":"renamed","host":"example.test","user":"dev","authMethod":"key","privateKeyPath":"/tmp/key1","rootPath":"/srv/projects","connectionId":"` + connection.ID + `"}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-connections/preflight", strings.NewReader(body)))
+	if len(seen.PrivateKeyPaths) != 2 || seen.PrivateKeyPaths[0] != "/tmp/key1" || seen.PrivateKeyPaths[1] != "/tmp/key2" {
+		t.Fatalf("preflight dropped candidate list: %#v", seen.PrivateKeyPaths)
+	}
+}
+
+// TestUpdateSSHConnectionEmptyKeyPathCarriesOverCandidateKeys 保证编辑表单 key
+// 模式私钥路径留空时，既沿用已有主钥匙路径，也沿用完整候选列表。
+func TestUpdateSSHConnectionEmptyKeyPathCarriesOverCandidateKeys(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	seedCandidateKeys(t, server, connection.ID, "/tmp/key1", "/tmp/key2")
+
+	body := `{"name":"renamed","host":"example.test","user":"dev","privateKeyPath":"","authMethod":"key","password":"","rootPath":"/srv/projects","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBd875TBQVvl6l2xrvhta9tuJAvo0toGSWCQaQsBRzYd","connect":false}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/ssh-connections/"+connection.ID, strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := server.loadSSHConnection(context.Background(), connection.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if updated.PrivateKeyPath != "/tmp/key1" {
+		t.Fatalf("empty path did not carry over existing primary: %q", updated.PrivateKeyPath)
+	}
+	if len(updated.PrivateKeyPaths) != 2 || updated.PrivateKeyPaths[0] != "/tmp/key1" || updated.PrivateKeyPaths[1] != "/tmp/key2" {
+		t.Fatalf("empty path dropped candidate list: %#v", updated.PrivateKeyPaths)
+	}
+}
+
+// TestPublicKeysAuthTriesAllSignersInOrder 用进程内 SSH 服务器证明
+// ssh.PublicKeys(signers...) 会按顺序尝试每个 signer：服务器只接受第二把
+// 钥匙（模拟 id_rsa 被拒、id_ed25519 被接受的真实场景），客户端仍能连上。
+// 若只尝试第一把钥匙，Dial 就会以 publickey 认证失败告终。
+func TestPublicKeysAuthTriesAllSignersInOrder(t *testing.T) {
+	_, priv1, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key1: %v", err)
+	}
+	_, priv2, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key2: %v", err)
+	}
+	signer1, err := ssh.NewSignerFromKey(priv1)
+	if err != nil {
+		t.Fatalf("signer1: %v", err)
+	}
+	signer2, err := ssh.NewSignerFromKey(priv2)
+	if err != nil {
+		t.Fatalf("signer2: %v", err)
+	}
+
+	serverConfig := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), signer2.PublicKey().Marshal()) {
+				return &ssh.Permissions{}, nil
+			}
+			return nil, errors.New("key not accepted")
+		},
+	}
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
+	if err != nil {
+		t.Fatalf("host signer: %v", err)
+	}
+	serverConfig.AddHostKey(hostSigner)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		if _, _, _, err := ssh.NewServerConn(conn, serverConfig); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	client, err := ssh.Dial("tcp", listener.Addr().String(), &ssh.ClientConfig{
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer1, signer2)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("dial with two signers (first rejected): %v", err)
+	}
+	_ = client.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server handshake: %v", err)
+	}
+}
+
+// TestMigrateSSHConnectionsAddsCandidateKeyPathColumn 模拟旧版本数据库
+// （ssh_connections 表没有 private_key_paths 列）升级到新代码：迁移应自动加列，
+// 且新列可正常读写。这正是已有连接升级到本次修复后的真实路径。
+func TestMigrateSSHConnectionsAddsCandidateKeyPathColumn(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "legacy.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`create table ssh_connections (
+		id text primary key, name text not null, host text not null,
+		port integer not null default 22, user text not null,
+		private_key_path text not null, known_hosts text not null default '',
+		root_path text not null default '/', status text not null default 'unknown',
+		last_seen datetime, error_msg text not null default '',
+		created_at datetime not null, updated_at datetime not null,
+		password text not null default '')`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if err := (&Server{db: db}).migrateSSHConnections(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	// 新列应已存在且可读写（用 joinKeyPaths 的换行分隔格式写入）。
+	if _, err := db.Exec(`insert into ssh_connections (id,name,host,user,private_key_path,private_key_paths,created_at,updated_at) values ('c','n','h','u','/tmp/k','/tmp/k1
+/tmp/k2','2020-01-01','2020-01-01')`); err != nil {
+		t.Fatalf("insert with new column: %v", err)
+	}
+	var keyPaths string
+	if err := db.QueryRow(`select private_key_paths from ssh_connections where id='c'`).Scan(&keyPaths); err != nil {
+		t.Fatalf("read new column: %v", err)
+	}
+	if got := splitKeyPaths(keyPaths); len(got) != 2 || got[0] != "/tmp/k1" || got[1] != "/tmp/k2" {
+		t.Fatalf("split after migration = %#v", got)
 	}
 }

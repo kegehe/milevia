@@ -913,7 +913,7 @@
 .command-tags .quick-tag-empty:hover,
 .quick-tag-empty.command-tag:hover { border-color: #cf906d; color: #713d27; background: #fff0e8; }
 
-.quick-actions-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; gap: 12px; }
+.quick-actions-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; align-items: start; gap: 12px; }
 .quick-actions-headings,
 .quick-tag-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .quick-actions-row .quick-tag-heading { padding-bottom: 6px; }
@@ -949,7 +949,7 @@
   box-shadow: 0 0 0 1px #2b6c5e;
 }
 .quick-actions-row .quick-tag-item.drop-over > .quick-tag { box-shadow: inset 0 3px 0 #2b6c5e; }
-.quick-actions-row .quick-tag-item { padding: 1px 0; }
+.quick-actions-row .quick-tag-item { padding: 2px 0; }
 
 /* Desktop conversation workspace: a compact action rail and a focused conversation. */
 .chat {
@@ -1165,6 +1165,7 @@
     right: 16px;
     bottom: 72px;
     display: flex;
+    flex-direction: column;
     width: min(380px, calc(100vw - 32px));
     max-height: min(640px, calc(100dvh - 112px));
     box-sizing: border-box;
@@ -1443,6 +1444,8 @@
 .timeline-entry.tool { margin-bottom: 18px; }
 .timeline-entry.system { margin-bottom: 14px; }
 .timeline-entry.error { margin-bottom: 18px; }
+/* 错误是上一条操作的结果：向上收紧，向下留出更清晰的阅读边界。 */
+.timeline-item[data-timeline-kind="error"] { margin-top: -14px; padding-bottom: 12px; }
 .timeline-entry.message-entry,
 .timeline-entry.tool,
 .timeline-entry.system,
@@ -1641,6 +1644,76 @@
 .error-card { border-color: #efcbc2; border-radius: 8px; background: #fffaf8; }
 .error-card > header { padding: 12px 14px 10px; }
 .error-card > pre { border-top-color: #f0d8d1; padding: 11px 14px 13px; }
+
+/* 错误卡片：诊断内容优先，警示色仅用于固定尺寸的图标。 */
+.error-card {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid #e5d7d4;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: none;
+}
+.error-card::before { display: none; }
+.error-card__header {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 0;
+  padding: 11px 14px;
+  background: #fff;
+}
+.error-card__icon {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: #c65343;
+  font: 800 11px/1 ui-sans-serif, system-ui, sans-serif;
+}
+.error-card__heading {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+.error-card__heading b {
+  overflow: hidden;
+  color: #3f302d;
+  font-size: 13px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.error-card__heading time { flex: none; color: #8c7a76; font-size: 10px; }
+.error-card__body {
+  min-width: 0;
+  border-top: 1px solid #eee6e4;
+  background: #fcfbfb;
+}
+.error-card__body pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px 14px;
+  color: #55423e;
+  background: transparent;
+  font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  scrollbar-color: #d5c9c6 transparent;
+}
+.error-card__footer { border-top: 1px solid #eee6e4; padding: 9px 14px; background: #fff; }
+
+@media (max-width: 520px) {
+  .error-card__header { align-items: flex-start; }
+  .error-card__heading { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .error-card__body pre { max-height: 220px; padding-right: 12px; font-size: 11px; }
+}
 
 .agent-execution-card {
   width: min(832px, 100%);
@@ -2041,7 +2114,7 @@
   stroke-linejoin: round;
   stroke-width: 2;
 }
-.quick-tag-list { gap: 4px; }
+.quick-tag-list { gap: 7px; }
 .quick-tag { gap: 5px; }
 .quick-tag > button:first-child,
 .quick-tag-empty {
@@ -2120,7 +2193,7 @@
   color: #425b1e;
   background: #f2f7e5;
 }
-.quick-actions-row .quick-tag-heading { padding-bottom: 4px; }
+.quick-actions-row .quick-tag-heading { padding-bottom: 7px; }
 .quick-actions-row .quick-tag,
 .quick-actions-row .quick-tag-empty,
 .quick-tag-slot { min-height: 36px; }
@@ -2907,6 +2980,16 @@
   font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .history-item-agent.codex { border-color: #d5e2b7; color: #61782d; background: #f5f8ea; }
+.history-item-orchestration {
+  flex: none;
+  border: 1px solid #cdbfe8;
+  border-radius: 4px;
+  padding: 2px 5px;
+  color: #6b4fb8;
+  background: #f3eefb;
+  font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+}
 .history-item small { color: #71897f; font-size: 11px; }
 .history-item > .history-item-meta {
   display: grid;

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type LogEntry, type RunConfig, type RunStatusResponse, runLogPresentation, runLogText, statusLabels } from "./run-model";
-import { toAnsiSegments } from "./ansi";
-import { createWebSocket } from "../../lib/runtime";
+import { type AnsiSegment, toAnsiSegments } from "./ansi";
+import { linkifyText } from "./linkify";
+import { createWebSocket, openExternal } from "../../lib/runtime";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type OrchestrationWorktree = { taskId: string; jobId: string; taskBranch: string; worktreePath: string; status: string };
@@ -44,6 +45,22 @@ function nextEnvironmentVariableKey(envVars: Record<string, string>): string {
 		key = `ENV_VAR_${suffix}`;
 	}
 	return key;
+}
+
+/** 渲染单条日志中的一个文本片段：把其中的 http/https 地址渲染成可点击链接。
+ *  保持 ANSI 颜色类在链接上，未着色的链接继承行文字颜色。 */
+function LogSegment({ segment }: { segment: AnsiSegment }) {
+	const parts = linkifyText(segment.text);
+	if (parts.length === 1 && !parts[0].url) {
+		return <span className={segment.className}>{parts[0].text}</span>;
+	}
+	return <>{parts.map((part, index) => {
+		if (part.url) {
+			const href = part.url;
+			return <a key={index} href={href} className={`run-log-link${segment.className ? ` ${segment.className}` : ""}`} rel="noreferrer" onClick={(event) => { event.preventDefault(); void openExternal(href); }}>{part.text}</a>;
+		}
+		return <span key={index} className={segment.className}>{part.text}</span>;
+	})}</>;
 }
 
 export function ProjectRunPanel({ projectID, request, fail, active, isRemote = false }: { projectID: string; request: Request; fail: (message: string) => void; active: boolean; isRemote?: boolean }) {
@@ -239,12 +256,26 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		finally { setBusy(""); }
 	};
 
-	const handleClearLogs = () => {
-		setLogs((prev) => {
-			for (const entry of prev) clearedThroughLogIDRef.current = Math.max(clearedThroughLogIDRef.current, entry.id);
-			return [];
-		});
-		setHasNewLogs(false);
+	const handleClearLogs = async () => {
+		setBusy("clear-logs");
+		try {
+			const next = await request<RunStatusResponse>(`${basePath}/logs/clear`, { method: "POST" });
+			if (activeProjectIDRef.current !== projectID) return;
+			// Only after the server confirms the clear should the local log state
+			// advance, otherwise a failed request would leave the UI empty while
+			// the server still retains the logs (and loadStatus would filter them).
+			setLogs((prev) => {
+				for (const entry of prev) clearedThroughLogIDRef.current = Math.max(clearedThroughLogIDRef.current, entry.id);
+				return [];
+			});
+			setHasNewLogs(false);
+			setStatus(next);
+		} catch (cause) {
+			fail(cause instanceof Error ? cause.message : "清除日志失败");
+			void loadStatus();
+		} finally {
+			setBusy("");
+		}
 	};
 
 	const running = status?.status === "running";
@@ -258,7 +289,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 				<section className="run-log-section">
 					<header>
 						<div className="run-section-heading"><span className="run-section-mark"><TerminalIcon /></span><div><h3>运行日志</h3><small>{logs.length ? `${logs.length} 条输出` : "等待服务输出"}</small></div></div>
-						<button type="button" className="run-log-clear" title="清除当前日志" aria-label="清除当前日志" disabled={logs.length === 0} onClick={handleClearLogs}><ClearIcon /></button>
+						<button type="button" className="run-log-clear" title="清除当前日志" aria-label="清除当前日志" disabled={logs.length === 0 || busy !== ""} onClick={() => void handleClearLogs()}><ClearIcon /></button>
 					</header>
 					<div className="run-log-terminal-wrap">
 						<div ref={logTerminalRef} className="run-log-terminal" onScroll={handleLogScroll}>
@@ -267,7 +298,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 							return <div key={entry.id || `${entry.timestamp}-${i}`} className={`run-log-line ${entry.stream} ${presentation.tone}`}>
 								<time>{new Date(entry.timestamp).toLocaleTimeString()}</time>
 									<span className="run-log-stream" aria-label={presentation.label}>{presentation.label}</span>
-								<pre>{toAnsiSegments(runLogText(entry)).map((segment, index) => <span key={index} className={segment.className}>{segment.text}</span>)}</pre>
+								<pre>{toAnsiSegments(runLogText(entry)).map((segment, index) => <LogSegment key={index} segment={segment} />)}</pre>
 							</div>;
 						})}
 						</div>

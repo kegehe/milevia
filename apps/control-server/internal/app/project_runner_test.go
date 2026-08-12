@@ -178,6 +178,35 @@ func TestSetStatusListenerNoListener(t *testing.T) {
 	pr.emitStatus(RunStatusEvent{ProjectID: "p1", Status: RunStatusRunning}) // 不应 panic
 }
 
+func TestClearLogsAcknowledgesFailedRun(t *testing.T) {
+	pr := newProjectRunner("p1", "", "", nil, func(LogEntry) {})
+	var events []RunStatusEvent
+	pr.setStatusListener(func(event RunStatusEvent) { events = append(events, event) })
+	pr.emitLog(LogEntry{Timestamp: time.Now(), Stream: "stderr", Text: "failed"})
+	pr.mu.Lock()
+	pr.status = RunStatusFailed
+	pr.startedAt = time.Now()
+	pr.exitCode = 1
+	pr.hasExitCode = true
+	pr.mu.Unlock()
+
+	pr.ClearLogs()
+
+	snapshot := pr.StatusSnapshot()
+	if snapshot.Status != RunStatusStopped {
+		t.Fatalf("status = %q, want stopped", snapshot.Status)
+	}
+	if len(snapshot.RecentLogs) != 0 {
+		t.Fatalf("recent logs = %d, want 0", len(snapshot.RecentLogs))
+	}
+	if snapshot.ExitCode != nil || snapshot.StartedAt != nil || snapshot.PID != nil {
+		t.Fatalf("acknowledged failure retained terminal fields: %+v", snapshot)
+	}
+	if len(events) != 1 || events[0].Status != RunStatusStopped {
+		t.Fatalf("events = %+v, want one stopped event", events)
+	}
+}
+
 // TestListProjectProcessStatuses 验证批量进程状态端点：有 runner 的项目用 LightStatusSnapshot
 // 精简取值（含 PID/StartedAt），无 runner 的项目缺省 stopped；断言的响应字段与前端契约一致。
 func TestListProjectProcessStatuses(t *testing.T) {
@@ -368,5 +397,3 @@ func TestProcessStatusWebSocketSnapshotForRunningProject(t *testing.T) {
 		t.Fatalf("ps-off 不应携带 pid（stopped 清空），实际 = %v", off["pid"])
 	}
 }
-
-

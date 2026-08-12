@@ -23,20 +23,43 @@ import (
 
 // SSHConnection represents an SSH connection configuration stored in the database.
 type SSHConnection struct {
-	ID             string     `json:"id"`
-	Name           string     `json:"name"`
-	Host           string     `json:"host"`
-	Port           int        `json:"port"`
-	User           string     `json:"user"`
-	PrivateKeyPath string     `json:"-"`
-	Password       string     `json:"-"`
-	KnownHosts     string     `json:"-"`
-	RootPath       string     `json:"rootPath"`
-	Status         string     `json:"status"` // unknown / connected / disconnected / error
-	LastSeen       *time.Time `json:"lastSeen"`
-	ErrorMsg       string     `json:"errorMsg"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	UpdatedAt      time.Time  `json:"updatedAt"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	User           string `json:"user"`
+	PrivateKeyPath string `json:"-"`
+	// PrivateKeyPaths 按顺序记录所有可用候选私钥（SSH Profile 可能解析出多个
+	// IdentityFile）。PrivateKeyPath 是其中的主键（第一个），用于旧数据与回显。
+	PrivateKeyPaths []string   `json:"-"`
+	Password        string     `json:"-"`
+	KnownHosts      string     `json:"-"`
+	RootPath        string     `json:"rootPath"`
+	Status          string     `json:"status"` // unknown / connected / disconnected / error
+	LastSeen        *time.Time `json:"lastSeen"`
+	ErrorMsg        string     `json:"errorMsg"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	UpdatedAt       time.Time  `json:"updatedAt"`
+}
+
+// joinKeyPaths / splitKeyPaths 用换行分隔持久化候选私钥列表。文件系统路径在
+// 各平台都不允许包含换行符，因此无需转义。
+func joinKeyPaths(paths []string) string {
+	return strings.Join(paths, "\n")
+}
+
+func splitKeyPaths(s string) []string {
+	parts := strings.Split(s, "\n")
+	out := parts[:0]
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // sanitizedSSHConnection returns a copy safe to expose via the API. The private
@@ -88,6 +111,7 @@ func (s *Server) migrateSSHConnections(ctx context.Context) error {
 		port            integer not null default 22,
 		user            text not null,
 		private_key_path text not null,
+		private_key_paths text not null default '',
 		known_hosts     text not null default '',
 		root_path       text not null default '/',
 		status          text not null default 'unknown',
@@ -102,6 +126,8 @@ func (s *Server) migrateSSHConnections(ctx context.Context) error {
 	}
 	// Add password column for existing databases that don't have it yet.
 	_, _ = s.db.ExecContext(ctx, `alter table ssh_connections add column password text not null default ''`)
+	// Add candidate private key list column for existing databases.
+	_, _ = s.db.ExecContext(ctx, `alter table ssh_connections add column private_key_paths text not null default ''`)
 	return nil
 }
 
@@ -177,6 +203,9 @@ type sshProfile struct {
 	Port           int    `json:"port"`
 	User           string `json:"user"`
 	PrivateKeyPath string `json:"privateKeyPath"`
+	// IdentityFiles 记录所有实际存在的候选私钥，按 ssh -G 输出顺序排列，
+	// 与 OpenSSH CLI 依次尝试每个 identity 的行为保持一致。
+	IdentityFiles []string `json:"-"`
 }
 
 var getSSHConfigOutput = func(name string) ([]byte, error) {
@@ -229,8 +258,10 @@ func resolveSSHProfile(name string) (sshProfile, error) {
 			}
 		}
 		if info, err := os.Stat(keyPath); err == nil && !info.IsDir() {
-			profile.PrivateKeyPath = keyPath
-			break
+			if profile.PrivateKeyPath == "" {
+				profile.PrivateKeyPath = keyPath
+			}
+			profile.IdentityFiles = append(profile.IdentityFiles, keyPath)
 		}
 	}
 	if profile.Host == "" || profile.User == "" {
@@ -283,10 +314,16 @@ func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) 
 					input.Password = existing.Password
 				}
 				input.PrivateKeyPath = ""
+				input.PrivateKeyPaths = nil
 			} else {
 				input.Password = ""
 				if strings.TrimSpace(input.PrivateKeyPath) == "" {
 					input.PrivateKeyPath = existing.PrivateKeyPath
+				}
+				// 主私钥未变（编辑表单总回填主钥匙路径）时，连同候选列表一起沿用，
+				// 避免编辑一次就丢掉多钥匙候选、退回单钥匙。
+				if strings.TrimSpace(input.PrivateKeyPath) == existing.PrivateKeyPath {
+					input.PrivateKeyPaths = append([]string(nil), existing.PrivateKeyPaths...)
 				}
 			}
 		}
@@ -338,7 +375,7 @@ func hostKeyFingerprint(rawKey string) string {
 }
 
 func (s *Server) listSSHConnections(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at,password from ssh_connections order by created_at desc`)
+	rows, err := s.db.QueryContext(r.Context(), `select id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at,password from ssh_connections order by created_at desc`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -347,10 +384,12 @@ func (s *Server) listSSHConnections(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0)
 	for rows.Next() {
 		var c SSHConnection
-		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password); err != nil {
+		var keyPaths string
+		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &keyPaths, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		c.PrivateKeyPaths = splitKeyPaths(keyPaths)
 		items = append(items, sanitizedSSHConnection(c))
 	}
 	if err := rows.Err(); err != nil {
@@ -363,8 +402,9 @@ func (s *Server) listSSHConnections(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getSSHConnection(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "connectionID")
 	var c SSHConnection
-	err := s.db.QueryRowContext(r.Context(), `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where id=?`, id).
-		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password)
+	var keyPaths string
+	err := s.db.QueryRowContext(r.Context(), `select id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where id=?`, id).
+		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &keyPaths, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("SSH connection not found"))
 		return
@@ -373,23 +413,25 @@ func (s *Server) getSSHConnection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	c.PrivateKeyPaths = splitKeyPaths(keyPaths)
 	writeJSON(w, http.StatusOK, sanitizedSSHConnection(c))
 }
 
 type sshConnectionInput struct {
-	Name           string `json:"name"`
-	Host           string `json:"host"`
-	Port           int    `json:"port"`
-	User           string `json:"user"`
-	PrivateKeyPath string `json:"privateKeyPath"`
-	AuthMethod     string `json:"authMethod"`
-	Password       string `json:"password"`
-	RootPath       string `json:"rootPath"`
-	ProfileName    string `json:"profileName"`
-	HostKey        string `json:"hostKey"`
-	Connect        bool   `json:"connect"`
-	ConnectionID   string `json:"connectionId"`
-	Update         bool   `json:"-"`
+	Name            string   `json:"name"`
+	Host            string   `json:"host"`
+	Port            int      `json:"port"`
+	User            string   `json:"user"`
+	PrivateKeyPath  string   `json:"privateKeyPath"`
+	PrivateKeyPaths []string `json:"-"`
+	AuthMethod      string   `json:"authMethod"`
+	Password        string   `json:"password"`
+	RootPath        string   `json:"rootPath"`
+	ProfileName     string   `json:"profileName"`
+	HostKey         string   `json:"hostKey"`
+	Connect         bool     `json:"connect"`
+	ConnectionID    string   `json:"connectionId"`
+	Update          bool     `json:"-"`
 }
 
 func (input *sshConnectionInput) resolve() error {
@@ -399,6 +441,7 @@ func (input *sshConnectionInput) resolve() error {
 			return err
 		}
 		input.Host, input.Port, input.User, input.PrivateKeyPath = profile.Host, profile.Port, profile.User, profile.PrivateKeyPath
+		input.PrivateKeyPaths = append([]string(nil), profile.IdentityFiles...)
 	}
 	if strings.TrimSpace(input.Name) == "" || strings.TrimSpace(input.Host) == "" || strings.TrimSpace(input.User) == "" {
 		return errors.New("name, host, and user are required")
@@ -429,18 +472,19 @@ func (input *sshConnectionInput) resolve() error {
 
 func (input sshConnectionInput) connection() SSHConnection {
 	return SSHConnection{
-		ID:             uuid.NewString(),
-		Name:           strings.TrimSpace(input.Name),
-		Host:           strings.TrimSpace(input.Host),
-		Port:           input.Port,
-		User:           strings.TrimSpace(input.User),
-		PrivateKeyPath: strings.TrimSpace(input.PrivateKeyPath),
-		Password:       strings.TrimSpace(input.Password),
-		KnownHosts:     strings.TrimSpace(input.HostKey),
-		RootPath:       strings.TrimSpace(input.RootPath),
-		Status:         "unknown",
-		CreatedAt:      time.Now().UTC(),
-		UpdatedAt:      time.Now().UTC(),
+		ID:              uuid.NewString(),
+		Name:            strings.TrimSpace(input.Name),
+		Host:            strings.TrimSpace(input.Host),
+		Port:            input.Port,
+		User:            strings.TrimSpace(input.User),
+		PrivateKeyPath:  strings.TrimSpace(input.PrivateKeyPath),
+		PrivateKeyPaths: append([]string(nil), input.PrivateKeyPaths...),
+		Password:        strings.TrimSpace(input.Password),
+		KnownHosts:      strings.TrimSpace(input.HostKey),
+		RootPath:        strings.TrimSpace(input.RootPath),
+		Status:          "unknown",
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
 	}
 }
 
@@ -505,10 +549,15 @@ func (s *Server) updateSSHConnection(w http.ResponseWriter, r *http.Request) {
 			c.Password = existing.Password
 		}
 		c.PrivateKeyPath = ""
+		c.PrivateKeyPaths = nil
 	} else {
 		c.Password = ""
-		if strings.TrimSpace(input.PrivateKeyPath) == "" {
+		if c.PrivateKeyPath == "" {
 			c.PrivateKeyPath = existing.PrivateKeyPath
+		}
+		// 主私钥未变时连同候选列表一起沿用（见 preflight 的同样处理）。
+		if c.PrivateKeyPath == existing.PrivateKeyPath {
+			c.PrivateKeyPaths = append([]string(nil), existing.PrivateKeyPaths...)
 		}
 	}
 	knownHosts := strings.TrimSpace(input.HostKey)
@@ -529,13 +578,14 @@ func (s *Server) updateSSHConnection(w http.ResponseWriter, r *http.Request) {
 // must already carry its final ID and secrets.
 func (s *Server) saveSSHConnection(w http.ResponseWriter, r *http.Request, c *SSHConnection, connect bool) {
 	_, err := s.db.ExecContext(r.Context(), `
-		insert into ssh_connections (id,name,host,port,user,private_key_path,known_hosts,root_path,status,error_msg,created_at,updated_at,password)
-		values (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		insert into ssh_connections (id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,error_msg,created_at,updated_at,password)
+		values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set
 			name=excluded.name, host=excluded.host, port=excluded.port, user=excluded.user,
-			private_key_path=excluded.private_key_path, known_hosts=excluded.known_hosts,
+			private_key_path=excluded.private_key_path, private_key_paths=excluded.private_key_paths,
+			known_hosts=excluded.known_hosts,
 			root_path=excluded.root_path, updated_at=excluded.updated_at, password=excluded.password`,
-		c.ID, c.Name, c.Host, c.Port, c.User, c.PrivateKeyPath, c.KnownHosts, c.RootPath, c.Status, c.ErrorMsg, c.CreatedAt, c.UpdatedAt, c.Password)
+		c.ID, c.Name, c.Host, c.Port, c.User, c.PrivateKeyPath, joinKeyPaths(c.PrivateKeyPaths), c.KnownHosts, c.RootPath, c.Status, c.ErrorMsg, c.CreatedAt, c.UpdatedAt, c.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("save ssh connection: %w", err))
 		return
@@ -690,11 +740,13 @@ func (s *Server) ensureSSHRunnerInactive(ctx context.Context, runnerID string) e
 // loadSSHConnection reads a single SSH connection from the database.
 func (s *Server) loadSSHConnection(ctx context.Context, id string) (*SSHConnection, error) {
 	var c SSHConnection
-	err := s.db.QueryRowContext(ctx, `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where id=?`, id).
-		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password)
+	var keyPaths string
+	err := s.db.QueryRowContext(ctx, `select id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where id=?`, id).
+		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &keyPaths, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password)
 	if err != nil {
 		return nil, err
 	}
+	c.PrivateKeyPaths = splitKeyPaths(keyPaths)
 	return &c, nil
 }
 
@@ -807,17 +859,19 @@ func (s *Server) markSSHStatus(ctx context.Context, c *SSHConnection, status, er
 // recoverSSHConnections is called during startup to re-register SSH connections
 // that were previously connected.
 func (s *Server) recoverSSHConnections(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `select id,name,host,port,user,private_key_path,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where status='connected'`)
+	rows, err := s.db.QueryContext(ctx, `select id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where status='connected'`)
 	if err != nil {
 		return fmt.Errorf("query ssh connections for recovery: %w", err)
 	}
 	connections := []SSHConnection{}
 	for rows.Next() {
 		var c SSHConnection
-		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password); err != nil {
+		var keyPaths string
+		if err := rows.Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &keyPaths, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan ssh connection: %w", err)
 		}
+		c.PrivateKeyPaths = splitKeyPaths(keyPaths)
 		connections = append(connections, c)
 	}
 	if err := rows.Err(); err != nil {

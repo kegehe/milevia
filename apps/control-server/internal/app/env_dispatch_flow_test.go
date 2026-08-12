@@ -28,7 +28,7 @@ func TestHomeProjectStillRoutesThroughLocalRunner(t *testing.T) {
 
 	create := httptest.NewRecorder()
 	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects",
-		strings.NewReader(`{"path":"`+projectPath+`"}`)))
+		jsonBody(t, map[string]string{"path": projectPath})))
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", create.Code, create.Body.String())
 	}

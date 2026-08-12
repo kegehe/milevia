@@ -1,7 +1,11 @@
 // 类型定义 — 从 App.tsx 提取，供全项目使用
 
+// 后端对非 Git 目录项目填的 gitBranch 标记值（app.go 三处一致）。前端用它在标签栏隐藏
+// Git 工作台入口并拦截直接访问 /git 的重定向；若后端更换标记，只需改这一处。
+export const NON_GIT_BRANCH = "非 Git 目录";
+
 export type Project = { id: string; name: string; pathDisplay: string; fullPath: string; runner: string; environment: string; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
-export type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string };
+export type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string; insightsRunning: boolean; insightsMessage: string };
 // 开发进程运行状态（/api/projects/processes/statuses + /ws/processes）。
 // 与会话状态 ProjectStatus 语义独立，由 ProcessStatusProvider 单独拥有。
 export type RunStatus = "stopped" | "starting" | "running" | "stopping" | "failed";
@@ -12,7 +16,7 @@ export type RunStatusEvent = { projectId: string; status: RunStatus; startedAt?:
 export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
 export type AgentID = "claude-code" | "codex";
-export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean };
+export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean; isOrchestration?: boolean };
 export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 export type ShortcutKind = "prompt" | "snippet" | "command_request";
 export type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };

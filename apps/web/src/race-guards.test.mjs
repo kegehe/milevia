@@ -67,6 +67,42 @@ test("orchestration workspace exposes plan, queue, decision and verification con
 	assert.match(orchestrationStyles, /\.orchestration-head-actions \{ flex-wrap: wrap; \}/);
 });
 
+test("orchestration workspace loads complete history and keeps a single-column mobile layout", () => {
+  assert.match(orchestrationPage, /type ConversationHistory = \{ conversation\?: \{ agentId: AgentID \}; activeRunId\?: string \| null; messages: Message\[\]; events: Event\[\]; hasMore: boolean; nextCursor: string \}/);
+  assert.match(orchestrationPage, /const shouldLoadFullHistory = historyMode === "full" \|\| historyRef\.current === null;/);
+  assert.match(orchestrationPage, /const query = new URLSearchParams\(\{ limit: "1000" \}\);/);
+  assert.match(orchestrationPage, /if \(cursor\) query\.set\("cursor", cursor\);/);
+  assert.match(orchestrationPage, /cursor = shouldLoadFullHistory && page\.hasMore \? page\.nextCursor : "";/);
+  assert.match(orchestrationPage, /\} while \(cursor\);/);
+  assert.match(orchestrationPage, /requestVersion !== selectedRequestVersion\.current\) return;/);
+  assert.match(orchestrationPage, /if \(historyMode === "latest" && selectedRequestInFlight\.current !== 0\) return;/);
+  assert.match(orchestrationPage, /if \(selected && refreshingStatuses\.has\(selected\.status\)\) void loadSelected\("latest"\)/);
+  const conversationPanel = orchestrationPage.match(/<main className="orchestration-conversation">[\s\S]*?<\/main>/)?.[0] || "";
+  assert.match(conversationPanel, /<h2>完整对话<\/h2>/);
+  assert.doesNotMatch(conversationPanel, /<section className="orchestration-timeline">/);
+  assert.match(orchestrationPage, /import "\.\.\/conversation\.css";/);
+  assert.match(orchestrationPage, /<section className="timeline orchestration-conversation-timeline">/);
+  assert.match(orchestrationPage, /<div className="timeline-entry message-entry"><article className=\{`message \$\{message\.role\}`\}/);
+  assert.match(orchestrationPage, /<ReactMarkdown remarkPlugins=\{\[remarkGfm\]\}/);
+  assert.match(orchestrationPage, /const selectedAgentID = history\?\.conversation\?\.agentId \|\| config\?\.agentId \|\| "claude-code";/);
+  assert.match(conversationPanel, /agentID=\{selectedAgentID\}/);
+  assert.match(orchestrationPage, /function orchestrationActivityLabel\(status: string, agentID: AgentID\)/);
+  assert.match(conversationPanel, /className="run-indicator orchestration-run-indicator" role="status"/);
+  assert.match(orchestrationPage, /function ScrollNavigationIcon\(\{ direction \}: \{ direction: "top" \| "previous" \| "next" \| "bottom" \}\)/);
+  assert.match(conversationPanel, /className="scroll-buttons orchestration-scroll-buttons"/);
+  assert.match(conversationPanel, /title="回到顶部"/);
+  assert.match(conversationPanel, /title="上一条我的消息"/);
+  assert.match(conversationPanel, /title="下一条我的消息"/);
+  assert.match(conversationPanel, /title="回到底部"/);
+  assert.match(orchestrationPage, /<aside className="orchestration-detail"[\s\S]*?<section className="orchestration-timeline">/);
+  assert.match(orchestrationStyles, /\.orchestration-page \{ display: flex; height: 100%; min-height: 0; flex-direction: column; overflow: hidden; \}/);
+  assert.match(orchestrationStyles, /\.orchestration-console \{ min-height: 0; flex: 1 1 0; grid-template-rows: minmax\(0, 1fr\); overflow: hidden; \}/);
+  assert.match(orchestrationStyles, /\.orchestration-console > \* \{ min-height: 0; \}/);
+  assert.match(orchestrationStyles, /\.orchestration-scroll-buttons \{ position: absolute; right: 18px; bottom: 18px; \}/);
+  assert.match(orchestrationStyles, /\.orchestration-queue, \.orchestration-detail \{ overflow-y: auto; overflow-x: hidden; \}/);
+  assert.match(orchestrationStyles, /@media \(max-width: 820px\) \{[\s\S]*?\.orchestration-console \{ grid-template-columns: 1fr; \}/);
+});
+
 test("Git, project dashboard, and SSH lists discard stale responses", () => {
   assert.match(gitWorkbench, /const reloadRequest = useRef\(0\);/);
   assert.match(gitWorkbench, /const requestID = \+\+reloadRequest\.current;/);

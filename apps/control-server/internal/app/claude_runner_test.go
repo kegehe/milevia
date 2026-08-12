@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,6 +78,126 @@ func TestClaudeOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
 	}
 	if len(sink.texts) != 1 || !strings.Contains(sink.texts[0], "[REDACTED]") {
 		t.Fatalf("assistant text was not redacted: %#v", sink.texts)
+	}
+}
+
+func TestClaudeStderrCaptureBoundsAndDetail(t *testing.T) {
+	capture := &stderrCapture{}
+	// 超过行数上限：只保留最近 maxStderrCaptureLines 行。
+	for i := 0; i < 20; i++ {
+		capture.append(fmt.Sprintf("line-%02d", i))
+	}
+	got := capture.tail()
+	for _, keep := range []string{"line-19", "line-08"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("capture tail %q missing %q", got, keep)
+		}
+	}
+	if strings.Contains(got, "line-00") || strings.Contains(got, "line-06") {
+		t.Fatalf("capture tail %q should have dropped oldest lines", got)
+	}
+
+	// wsl.exe 的无害主机侧警告（代理/NAT 提示）不应污染；但 wsl.exe 启动命令失败的
+	// 真实报错（同样以 "wsl: " 开头）必须保留，包括只提 NAT 的真实网络错误。
+	capture.append("wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost 代理。")
+	capture.append("wsl: NAT 网络连接失败")
+	capture.append("wsl: 找不到发行版 BadDistro")
+	capture.append("Error: rate limit exceeded")
+	if strings.Contains(capture.tail(), "代理") {
+		t.Fatalf("wsl host warning leaked into capture: %q", capture.tail())
+	}
+	if !strings.Contains(capture.tail(), "NAT 网络连接失败") {
+		t.Fatalf("real wsl NAT error should not be filtered: %q", capture.tail())
+	}
+	if !strings.Contains(capture.tail(), "找不到发行版") {
+		t.Fatalf("real wsl distro error should not be filtered: %q", capture.tail())
+	}
+	if !strings.Contains(capture.tail(), "rate limit") {
+		t.Fatalf("claude error missing after wsl warning filter: %q", capture.tail())
+	}
+
+	// 超长单行：append 先截断到总字节上限，tail 保留末尾且不超限。
+	long := &stderrCapture{}
+	long.append(strings.Repeat("x", maxStderrCaptureBytes+100))
+	if len(long.tail()) > maxStderrCaptureBytes {
+		t.Fatalf("capture did not bound bytes: %d", len(long.tail()))
+	}
+	if long.tail() == "" {
+		t.Fatalf("oversized line should not be dropped entirely")
+	}
+	if !strings.HasSuffix(long.tail(), "xxxxx") {
+		t.Fatalf("oversized line should keep the tail end")
+	}
+
+	// claudeStderrDetail：脱敏 + 去 ANSI + 有界保留末尾。
+	ansi := "\x1b[31mError: rate limit \x1b[0mwith key sk-test-secret-abcdef123"
+	detail := claudeStderrDetail(ansi)
+	if strings.Contains(detail, "\x1b") {
+		t.Fatalf("detail leaked ANSI escapes: %q", detail)
+	}
+	if strings.Contains(detail, "sk-test-secret-abcdef123") {
+		t.Fatalf("detail leaked secret: %q", detail)
+	}
+	if !strings.Contains(detail, "rate limit") {
+		t.Fatalf("detail missing reason: %q", detail)
+	}
+	if !strings.HasPrefix(detail, "（stderr：") {
+		t.Fatalf("detail missing prefix: %q", detail)
+	}
+	if claudeStderrDetail("   ") != "" {
+		t.Fatalf("empty/whitespace stderr should produce empty detail")
+	}
+	// 构造贴近上限的 detail（180 字节内容），验证加上固定前缀后仍落在
+	// insightRunErrorMessage 的 240 字符截断（保留开头）之内，不砍关键末尾。
+	maxDetail := claudeStderrDetail(strings.Repeat("x", 500))
+	if len("Claude exited: exit status 1 "+maxDetail) > 240 {
+		t.Fatalf("max-length error message exceeds 240-char insight truncation: %d", len("Claude exited: exit status 1 "+maxDetail))
+	}
+	if !strings.HasSuffix(maxDetail, "xxx）") {
+		t.Fatalf("max-length detail should keep the tail end: %q", maxDetail)
+	}
+}
+
+func TestClaudeReadStderrCaptureAccumulatesTail(t *testing.T) {
+	runner := &claudeCLIRunner{}
+	sink := &claudeOutputTestSink{}
+	capture := &stderrCapture{}
+	runner.readStderrCapture(strings.NewReader("first warning\nreal error: context length exceeded\n"), sink, capture)
+	if !strings.Contains(capture.tail(), "real error: context length exceeded") {
+		t.Fatalf("capture missing claude error line: %q", capture.tail())
+	}
+	// 空捕获（nil capture）行为不变：仅事件，不 panic。
+	runner.readStderr(strings.NewReader("noise\n"), sink)
+	if capture.tail() == "noise" {
+		t.Fatalf("nil-capture readStderr should not write into existing capture")
+	}
+}
+
+// TestClaudeCLIRunErrorIncludesStderrDetail 端到端验证真实失败场景：fake claude 脚本
+// 写一行 stderr 后以退出码 1 结束，Run 返回的错误应包含 claude 自己写的 stderr 尾部，
+// 而非只有裸的 "Claude exited: exit status 1"。
+func TestClaudeCLIRunErrorIncludesStderrDetail(t *testing.T) {
+	requirePOSIXShell(t)
+	scriptPath := filepath.Join(t.TempDir(), "fake-claude-fail")
+	script := "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\nprintf '%s\\n' 'Error: rate limit exceeded' >&2\nexit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake Claude CLI: %v", err)
+	}
+	runner := claudeCLIRunner{config: Config{ClaudePath: scriptPath}}
+	err := runner.Run(context.Background(), AgentRunRequest{
+		SessionID:      "00000000-0000-4000-8000-000000000000",
+		ProjectPath:    t.TempDir(),
+		Prompt:         "test",
+		PermissionMode: "full_control",
+	}, &recordingSink{})
+	if err == nil {
+		t.Fatal("expected error from failing fake Claude CLI")
+	}
+	if !strings.Contains(err.Error(), "Claude exited") {
+		t.Fatalf("error missing Claude exited marker: %v", err)
+	}
+	if !strings.Contains(err.Error(), "rate limit exceeded") {
+		t.Fatalf("error missing stderr detail: %v", err)
 	}
 }
 
