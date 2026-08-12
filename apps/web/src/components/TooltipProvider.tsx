@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-type TooltipState = { anchor: HTMLElement; text: string };
+type TooltipState = { anchor: HTMLElement; text: string; title?: string; desc?: string };
 type TooltipPosition = { left: number; top: number; side: "top" | "bottom" };
 
 const TOOLTIP_ID = "milevia-global-tooltip";
@@ -20,7 +20,7 @@ function normalizeTooltipTree(root: Node) {
 }
 
 function tooltipTarget(node: EventTarget | null) {
-  return node instanceof Element ? node.closest<HTMLElement>("[data-tooltip], [title]") : null;
+  return node instanceof Element ? node.closest<HTMLElement>("[data-tooltip-title], [data-tooltip], [title]") : null;
 }
 
 function tooltipPreview(text: string) {
@@ -52,6 +52,17 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
 
   const showTooltip = useCallback((anchor: HTMLElement) => {
     normalizeTooltip(anchor);
+    // 结构化悬浮卡片：data-tooltip-title(标题) + data-tooltip-desc(描述)。
+    // 用于技能等需要“名称标题 + 简短描述”的场景，不走超长截断逻辑。
+    const title = anchor.dataset.tooltipTitle?.trim();
+    if (title) {
+      if (activeAnchorRef.current !== anchor && activeAnchorRef.current?.isConnected) updateTooltipDescription(activeAnchorRef.current, false);
+      updateTooltipDescription(anchor, true);
+      activeAnchorRef.current = anchor;
+      setPosition(null);
+      setTooltip({ anchor, text: "", title, desc: anchor.dataset.tooltipDesc?.trim() });
+      return;
+    }
     const text = anchor.dataset.tooltip?.trim();
     if (!text) return;
     if (activeAnchorRef.current !== anchor && activeAnchorRef.current?.isConnected) updateTooltipDescription(activeAnchorRef.current, false);
@@ -146,7 +157,14 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
   }, [hideTooltip, tooltip]);
 
   return <>{children}{tooltip && createPortal(
-    <div ref={tooltipRef} id={TOOLTIP_ID} className="app-tooltip" role="tooltip" data-side={position?.side} data-positioned={position ? "true" : undefined} style={position ? { left: position.left, top: position.top } : undefined}>{tooltip.text}</div>,
+    <div ref={tooltipRef} id={TOOLTIP_ID} className="app-tooltip" role="tooltip" data-side={position?.side} data-positioned={position ? "true" : undefined} data-structured={tooltip.title ? "true" : undefined} style={position ? { left: position.left, top: position.top } : undefined}>
+      {tooltip.title
+        ? <>
+            <span className="app-tooltip-title">{tooltip.title}</span>
+            {tooltip.desc && <span className="app-tooltip-desc">{tooltip.desc}</span>}
+          </>
+        : tooltip.text}
+    </div>,
     document.body,
   )}</>;
 }

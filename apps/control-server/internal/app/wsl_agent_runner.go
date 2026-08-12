@@ -62,8 +62,23 @@ func newWSLAgentRunner(config Config, distro string) *wslAgentRunner {
 	}
 }
 
+// wslPathPrefix 返回在 WSL 内把原生 npm bin 目录前置到 PATH 的 shell 语句前缀。
+//
+// 背景：wsl.exe 不会继承 Windows 侧 PATH，而是为默认 shell 重建一份，且会把 Windows
+// npm 全局目录（/mnt/c/Users/.../AppData/Roaming/npm）混进 PATH 并置于用户原生目录之前。
+// 于是 WSL 内裸 `codex` 会命中 Windows 那个 npm shim——它在 Linux 平台缺
+// @openai/codex-linux-x64 可选二进制，一跑即抛 "Missing optional dependency"。用户原生
+// 目录（$HOME/.npm-global/bin、$HOME/.local/bin，见 WSL .bashrc/.zshrc）里的同名单文件
+// 才是可在 Linux 执行的版本。探测与运行都前置这两个目录，保证"WSL 项目用 WSL 原生
+// codex/claude"，不让 Windows shim 劫持。
+func wslPathPrefix() string {
+	return `export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"`
+}
+
 // wslBridgeProbe 在 WSL 内执行一条 sh 命令，返回 stdout 文本（UTF-8）。找不到 wsl.exe
 // 或命令失败均如实返回错误，不降级为 Windows 侧。ctx 无截止时间时兜底 5s 超时。
+// 执行前先施加 wslPathPrefix，使 claude/codex 就绪与版本探测解析到 WSL 原生二进制，
+// 而非 Windows 挂载的 npm shim。
 func (r *wslAgentRunner) wslBridgeProbe(ctx context.Context, command string) (string, error) {
 	wslPath, err := wslExePath()
 	if err != nil {
@@ -75,7 +90,8 @@ func (r *wslAgentRunner) wslBridgeProbe(ctx context.Context, command string) (st
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(probeCtx, wslPath, "-d", r.distro, "-e", "sh", "-c", command)
+	full := wslPathPrefix() + ";" + command
+	cmd := exec.CommandContext(probeCtx, wslPath, "-d", r.distro, "-e", "sh", "-c", full)
 	configureProcessGroup(cmd)
 	out, err := cmd.Output()
 	if err != nil {
@@ -113,7 +129,11 @@ func (r *wslAgentRunner) claudeReady(ctx context.Context) bool {
 }
 
 func (r *wslAgentRunner) codexReady(ctx context.Context) bool {
-	return r.cachedReady(ctx, &r.codexAt, &r.codexCache, "command -v codex")
+	// 仅测 command -v 不够：WSL 的 PATH 混入的 Windows 挂载 npm shim 也能被找到，但它在
+	// Linux 平台缺 codex-linux-x64，无法真正运行。故在施加 wslPathPrefix 后代真跑一遍
+	// `codex --version`，能跑才判就绪，避免"假就绪→一跑就崩"。需先探测到默认发行版，
+	// 否则 wslBridgeProbe 必失败、如实返回不可用。
+	return r.cachedReady(ctx, &r.codexAt, &r.codexCache, "codex --version")
 }
 
 func (r *wslAgentRunner) claudeVersion(ctx context.Context) string {

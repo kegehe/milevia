@@ -252,6 +252,185 @@ func TestRunInsightScanBadJSONFails(t *testing.T) {
 	}
 }
 
+// Pass A 首轮输出非法（模型 end_turn 未给 JSON 数组，见运行期真因）时，应自动用
+// 修正 prompt 重试一次；重试返回合法数组则该次扫描照常完成，而非直接判 failed。
+func TestRunInsightScanRetriesBadPassA(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	// 输出序：Pass A 首轮（非法）→ Pass A 重试（合法）→ Pass B（核实）。
+	badA := `我通读了项目，针对各个子系统做了分析：
+1. **列表加载慢** —— 建议优化分页，具体见源码。
+["这是","随手写的","字符串数组","不满足契约"]
+以上就是我发现的问题，我稍后再整理成正式结果。`
+	goodA := `[{"type":"optimization","severity":"normal","title":"列表分页","summary":"列表页数据量大时可加分页避免卡顿","fileHint":"src/List.tsx"}]`
+	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`
+	stub := &insightScriptRunner{outputs: []string{badA, goodA, passB}}
+	server.runner = stub
+
+	scanID := insertSyncInsightScan(t, server, projectID)
+
+	var status string
+	if err := server.db.QueryRow(`select status from project_insight_scans where id=?`, scanID).Scan(&status); err != nil {
+		t.Fatalf("scan row: %v", err)
+	}
+	if status != insightScanCompleted {
+		t.Fatalf("scan status: got %q want %q", status, insightScanCompleted)
+	}
+	// 应触发 3 趟 agent 运行：Pass A 首轮 + Pass A 重试 + Pass B。
+	reqs := stub.capturedRequests()
+	if len(reqs) != 3 {
+		t.Fatalf("agent runs: got %d want 3 (A, A-retry, B)", len(reqs))
+	}
+	// 首轮与重试用不同 prompt（重试必须走修正 prompt）。
+	if reqs[0].Prompt == reqs[1].Prompt {
+		t.Errorf("retry prompt should differ from first Pass A prompt")
+	}
+	// 重试 prompt 必须含强约束表白（"必须是且仅是一个 JSON 数组"）。
+	if !strings.Contains(reqs[1].Prompt, "JSON 数组") {
+		t.Errorf("repair prompt missing strict JSON-array instruction")
+	}
+	// 产物应落库。
+	var n int
+	if err := server.db.QueryRow(`select count(*) from project_insights where scan_id=?`, scanID).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("persisted findings: got %d want 1", n)
+	}
+}
+
+// 首轮与重试都输出非法 JSON 时，重试不应无限循环，最终仍判 failed。
+func TestRunInsightScanBadJSONFailsAfterRetry(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	server.runner = &insightScriptRunner{outputs: []string{`not json`, `still not json`, ``}}
+	scanID := insertSyncInsightScan(t, server, projectID)
+
+	var status string
+	if err := server.db.QueryRow(`select status from project_insight_scans where id=?`, scanID).Scan(&status); err != nil {
+		t.Fatalf("scan row: %v", err)
+	}
+	if status != insightScanFailed {
+		t.Fatalf("scan status: got %q want %q", status, insightScanFailed)
+	}
+	if got := stubCalls(server.runner); got != 2 {
+		t.Errorf("agent runs: got %d want 2 (two Pass A attempts, no Pass B)", got)
+	}
+}
+
+// stubCalls 返回 *insightScriptRunner 已消费的输出个数（同步辅助）。
+func stubCalls(runner AgentRunner) int {
+	sr, ok := runner.(*insightScriptRunner)
+	if !ok {
+		return -1
+	}
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.calls
+}
+
+// Pass B 核实输出非法（模型再次没给 JSON）时，应同样用修正 prompt 重试一次。
+func TestRunInsightScanRetriesBadPassB(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	passA := `[{"type":"bug","severity":"high","title":"悬浮球重挂","summary":"取消截图后悬浮球又冒出来","fileHint":"src-tauri/src/commands.rs"}]`
+	badB := `我逐条核对了候选：
+1. 确实在 cleanup_screenshot_session_inner 里无条件 orb.show()，属实。
+以上就是我的核实结论，整理后再给正式输出。`
+	goodB := `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`
+	stub := &insightScriptRunner{outputs: []string{passA, badB, goodB}}
+	server.runner = stub
+
+	scanID := insertSyncInsightScan(t, server, projectID)
+
+	var status string
+	if err := server.db.QueryRow(`select status from project_insight_scans where id=?`, scanID).Scan(&status); err != nil {
+		t.Fatalf("scan row: %v", err)
+	}
+	if status != insightScanCompleted {
+		t.Fatalf("scan status: got %q want %q", status, insightScanCompleted)
+	}
+	reqs := stub.capturedRequests()
+	if len(reqs) != 3 {
+		t.Fatalf("agent runs: got %d want 3 (A, B, B-retry)", len(reqs))
+	}
+	// B 首轮与重试用不同 prompt（重试必须走修正 prompt）。
+	if reqs[1].Prompt == reqs[2].Prompt {
+		t.Errorf("verify retry prompt should differ from first verify prompt")
+	}
+	if !strings.Contains(reqs[2].Prompt, "JSON 对象") {
+		t.Errorf("verify repair prompt missing strict JSON-object instruction")
+	}
+	// 产物应落库。
+	var n int
+	if err := server.db.QueryRow(`select count(*) from project_insights where scan_id=?`, scanID).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("persisted findings: got %d want 1", n)
+	}
+}
+
+// Pass B 首轮与重试都失败时，整个扫描最终判 failed，且不落任何发现。
+func TestRunInsightScanBadJSONFailsAfterVerifyRetry(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`
+	stub := &insightScriptRunner{outputs: []string{passA, `no json`, `still no json`}}
+	server.runner = stub
+
+	scanID := insertSyncInsightScan(t, server, projectID)
+
+	var status string
+	var n int
+	if err := server.db.QueryRow(`select status from project_insight_scans where id=?`, scanID).Scan(&status); err != nil {
+		t.Fatalf("scan row: %v", err)
+	}
+	if err := server.db.QueryRow(`select count(*) from project_insights where scan_id=?`, scanID).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if status != insightScanFailed || n != 0 {
+		t.Errorf("after failed verify retry: status=%q findings=%d want %q/0", status, n, insightScanFailed)
+	}
+	if got := stubCalls(server.runner); got != 3 {
+		t.Errorf("agent runs: got %d want 3 (A, B, B-retry)", got)
+	}
+}
+
+// Pass B 的 agent 进程本身运行失败（非解析失败）时，不应重试、不应误报"未返回有效结果"，
+// 而应提示"建议核实失败"（区分环境失败与输出失败两类错误）。
+func TestRunInsightScanVerifyRunnerErrorFailsWithSuggestionMessage(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`
+	calls := 0
+	server.runner = runnerFunc(func(_ context.Context, _ AgentRunRequest, sink AgentRunSink) error {
+		calls++
+		if calls == 1 {
+			sink.AssistantText(passA, "") // Pass A 首轮成功
+			return nil
+		}
+		return fmt.Errorf("claude process crashed") // Pass B runner 运行失败
+	})
+
+	scanID := insertSyncInsightScan(t, server, projectID)
+
+	var status, errMsg string
+	if err := server.db.QueryRow(`select status,error from project_insight_scans where id=?`, scanID).Scan(&status, &errMsg); err != nil {
+		t.Fatalf("scan row: %v", err)
+	}
+	if status != insightScanFailed {
+		t.Fatalf("scan status: got %q want %q", status, insightScanFailed)
+	}
+	if !strings.Contains(errMsg, "建议核实失败") {
+		t.Errorf("error should read as verify-runner failure, got %q", errMsg)
+	}
+	// runner 失败不应触发 B 重试：只应跑 1 次 A + 1 次 B。
+	if calls != 2 {
+		t.Errorf("agent runs: got %d want 2 (A, B-first); B must not retry on runner error", calls)
+	}
+}
+
 func TestUnconfirmedFindingsDoNotPersist(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)

@@ -604,3 +604,47 @@ func TestClaudeReadOutputAcceptsPlainStringMessage(t *testing.T) {
 		}
 	}
 }
+
+// errClosedReader 在 Read 时返回 os.ErrClosed，模拟进程被停止/强杀后 stdout/stderr
+// 管道被关闭、bufio.Scanner 拿到 "file already closed" 的形态。
+type errClosedReader struct{}
+
+func (errClosedReader) Read([]byte) (int, error) { return 0, os.ErrClosed }
+
+// TestClaudeReadOutputSilencesPipeClosed 验证：停止时管道关闭（os.ErrClosed）不应
+// 产生 stream.error 事件。此前该路径会在对话历史里留下"流错误 / file already closed"。
+func TestClaudeReadOutputSilencesPipeClosed(t *testing.T) {
+	runner := &claudeCLIRunner{}
+
+	// readOutput（一次性 Run 路径）。
+	sink := &claudeOutputTestSink{}
+	runner.readOutput(errClosedReader{}, sink)
+	for _, e := range sink.events {
+		var errEv struct{ Error string `json:"error"` }
+		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
+			t.Fatalf("readOutput emitted stream.error on pipe close: %s", string(e))
+		}
+	}
+
+	// readStderr（一次性 Run 路径）。
+	sink = &claudeOutputTestSink{}
+	runner.readStderr(errClosedReader{}, sink)
+	for _, e := range sink.events {
+		var errEv struct{ Error string `json:"error"` }
+		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
+			t.Fatalf("readStderr emitted stream.error on pipe close: %s", string(e))
+		}
+	}
+}
+
+// TestCodexReadOutputSilencesPipeClosed 同理验证 codex 一次性读循环。
+func TestCodexReadOutputSilencesPipeClosed(t *testing.T) {
+	sink := &claudeOutputTestSink{}
+	readCodexJSONL(errClosedReader{}, sink, "")
+	for _, e := range sink.events {
+		var errEv struct{ Error string `json:"error"` }
+		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
+			t.Fatalf("readCodexJSONL emitted stream.error on pipe close: %s", string(e))
+		}
+	}
+}

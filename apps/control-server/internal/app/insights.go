@@ -434,6 +434,42 @@ func buildInsightScanPrompt(projectPath, repoSHA string, alreadySurfaced []strin
 		projectPath, repoSHA, themeLine, strings.Join(types, "\n- "), prev)
 }
 
+// buildInsightRepairPrompt 组装 Pass A 解析失败后的修正重试 prompt。与首轮同方向
+// （theme + types），但对输出契约做最强约束：不得叙述、不得展示过程、不得贴示例、
+// 不得中途改口，整段回复就是且仅是那个 JSON 数组。首轮失败的真因是模型把 JSON 数组
+// 留到最后却在输出前 end_turn，因此这里明确"宁可少报也必须在回复里给出数组"。
+func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string {
+	var types []string
+	if len(opts.Types) == 0 {
+		for _, t := range insightTypeOrder {
+			types = append(types, fmt.Sprintf("%s —— %s", t, insightTypeLabels[t]))
+		}
+	} else {
+		for _, t := range opts.Types {
+			types = append(types, fmt.Sprintf("%s —— %s", t, insightTypeLabels[t]))
+		}
+	}
+	themeLine := "不限定主题，全面审视。"
+	if opts.Theme != "" {
+		themeLine = fmt.Sprintf("聚焦主题：%s。请从「%s」的视角审视项目，优先发现这类相关问题。",
+			insightThemeLabels[opts.Theme], insightThemeLabels[opts.Theme])
+	}
+	return fmt.Sprintf(`针对同一项目补交上一轮缺失的结果，直接给出，别再说思考过程、别再重新通读全目录。
+
+上一轮你只做了大量分析却未在回复里给出结果，这不可接受。你现在已经掌握项目结构，只需快速核对后用 JSON 数组把发现交出来，尽量少做重复探索。
+
+对象：%s（git %s）。%s
+覆盖类别：%s
+
+这一次的硬性要求（必须严格遵守）：
+1. 你的整段回复必须是且仅是一个 JSON 数组，前面、后面、中间都不允许有任何说明文字、思考、标题、示例或 Markdown 围栏。
+2. 数组元素格式：{"type":"bug|style|optimization|feature","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
+3. 宁缺毋滥：只报你直接核实过的发现；拿不稳的不报，最少可以只报 1 条，但必须给出数组。
+4. title 用用户能看懂的表述；禁止代码标识符、行号、堆栈。
+
+现在只输出那个 JSON 数组：`, projectPath, repoSHA, themeLine, strings.Join(types, "\n- "))
+}
+
 // buildVerifyPrompt 组装 Pass B 的核实 prompt：逐条到项目里查证候选是否真实存在。
 // 同样以"立即执行"的强指令开头，避免 agent 反问澄清。
 func buildVerifyPrompt(projectPath string, candidates []pendingInsight) string {
@@ -456,7 +492,93 @@ func buildVerifyPrompt(projectPath string, candidates []pendingInsight) string {
 confirmed=true 表示确认真实存在；false 表示伪需求/假 bug/已具备。每条对应候选的 index；无法证实的判 false。`, projectPath, strings.Join(items, "\n"))
 }
 
-// fingerprintedFact 落库时附带规范化指纹的一条发现。
+// buildVerifyRepairPrompt 组装 Pass B 核实输出非法后的修正重试 prompt。
+// 仅复述候选与硬性输出契约，要求"整个回复只能是那个 JSON 对象"。
+func buildVerifyRepairPrompt(projectPath string, candidates []pendingInsight) string {
+	return fmt.Sprintf(`重新执行刚才的只读核验，直接给出结果，别再说思考过程。
+
+上一轮你只做了查证却未在回复里给出唯一结果，这不可接受。
+
+对象目录：%s
+候选编号：%s
+
+这一次的硬性要求（必须严格遵守）：
+你的整段回复必须且仅是一个 JSON 对象，前面、后面、中间都不允许任何说明、思考、标题、示例或 Markdown 围栏。结构必须是：
+{"findings":[{"index":1,"confirmed":true,"reason":""},{"index":2,"confirmed":false,"reason":"项目当前已具备"}]}
+每条 findings 的 index 对应候选编号；confirmed=true 表示确认真实存在、false 表示伪需求/假 bug/已具备；无法证实的判 false。每条候选都必须有一条。
+
+现在只输出那个 JSON 对象：`, projectPath, insightCandidateIDs(candidates))
+}
+
+// insightCandidateIDs 渲染候选的编号清单（供核实 prompt 指代）。
+func insightCandidateIDs(candidates []pendingInsight) string {
+	parts := make([]string, 0, len(candidates))
+	for i := range candidates {
+		parts = append(parts, fmt.Sprintf("%d", i+1))
+	}
+	return strings.Join(parts, "、")
+}
+
+// insightVerifyVerdict 是 Pass B 核实结果的解码目标。
+type insightVerifyVerdict struct {
+	Findings []struct {
+		Index     int  `json:"index"`
+		Confirmed bool `json:"confirmed"`
+	} `json:"findings"`
+}
+
+// runInsightVerify 跑一趟 Pass B 核实并解码结果。与 Pass A 同样地，模型可能在输出
+// JSON 前 end_turn 或给散文/错误的形状——先抽最外层 JSON，非法则用强约束修正 prompt
+// 重试一次，仍失败才返回错误。
+//
+// 返回的错误分两类，供调用方给出准确提示：
+//   - 包装 errInsightVerifyRunner 的：agent 进程本身跑失败（启动/超时/退出），
+//     属环境问题，重试无用；
+//   - 其余：核实结果解析失败（模型没给合法 JSON 对象）。这二者在 UI 提示文案上应区别。
+var errInsightVerifyRunner = errors.New("核实代理运行失败")
+
+func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID string, candidates []pendingInsight) ([]struct {
+	Index     int  `json:"index"`
+	Confirmed bool `json:"confirmed"`
+}, error) {
+	cc := func(prompt string) (string, error) {
+		return s.runReadOnlyAgent(ctx, project, agentID, prompt)
+	}
+	// 首轮。
+	textB, err := cc(buildVerifyPrompt(project.Path, candidates))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInsightVerifyRunner, err)
+	}
+	verdict, vErr := decodeInsightVerdict(textB)
+	if vErr == nil {
+		return verdict.Findings, nil
+	}
+	log.Printf("[insights] project=%s Pass B parse failed on first attempt: %v", project.ID, vErr)
+	// 修正 prompt 重试一次。
+	textB, err = cc(buildVerifyRepairPrompt(project.Path, candidates))
+	if err != nil {
+		return nil, fmt.Errorf("%w（重试）: %v", errInsightVerifyRunner, err)
+	}
+	verdict, vErr = decodeInsightVerdict(textB)
+	if vErr != nil {
+		return nil, fmt.Errorf("核实代理未返回有效结果: %v (raw len=%d)", vErr, len(textB))
+	}
+	return verdict.Findings, nil
+}
+
+// decodeInsightVerdict 从 agent 输出抽最外层 JSON 并解码为核实对象。
+func decodeInsightVerdict(text string) (insightVerifyVerdict, error) {
+	vJSON := extractInsightJSON(text)
+	if vJSON == "" {
+		return insightVerifyVerdict{}, errors.New("empty/non-json")
+	}
+	var verdict insightVerifyVerdict
+	if err := json.Unmarshal([]byte(vJSON), &verdict); err != nil {
+		return insightVerifyVerdict{}, err
+	}
+	return verdict, nil
+}
+
 type fingerprintedFact struct {
 	InsightFinding
 	id          string
@@ -544,7 +666,10 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 		repoSHA = strings.TrimSpace(out)
 	}
 
-	// Pass A：发现。
+	// Pass A：发现。模型常在通读项目时过度叙述，把最终 JSON 数组留到回合末尾，可能在
+	// 输出前就 end_turn——此时 transcript 里只有散文 + 随手写的字符串数组残片，
+	// parseInsightCandidates 必然失败（这正是「分析代理未返回有效结果」的真因）。
+	// 补救：用一条强约束的"只输出 JSON"修正 prompt 重试一次；仍失败才判 scan failed。
 	textA, err := s.runReadOnlyAgent(ctx, project, agentID, buildInsightScanPrompt(project.Path, repoSHA, alreadySurfaced, opts))
 	if err != nil {
 		log.Printf("[insights] project=%s Pass A runner error: %v", projectID, err)
@@ -553,9 +678,22 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	}
 	candidates, err := parseInsightCandidates(textA)
 	if err != nil {
-		log.Printf("[insights] project=%s Pass A parse failed; raw (len=%d): %q", projectID, len(textA), truncateInsightLog(textA, 1200))
-		markFailed("分析代理未返回有效结果，请重试")
-		return
+		log.Printf("[insights] project=%s Pass A parse failed on first attempt; raw(len=%d): %q",
+			projectID, len(textA), truncateInsightLog(textA, 300))
+		// 修正 prompt 重试一次（同项目同方向，但明确"只输出数组"。）
+		textA, err = s.runReadOnlyAgent(ctx, project, agentID, buildInsightRepairPrompt(project.Path, repoSHA, opts))
+		if err != nil {
+			log.Printf("[insights] project=%s Pass A retry runner error: %v", projectID, err)
+			markFailed("项目分析失败，请重试")
+			return
+		}
+		candidates, err = parseInsightCandidates(textA)
+		if err != nil {
+			log.Printf("[insights] project=%s Pass A parse failed after retry; raw (len=%d): %q",
+				projectID, len(textA), truncateInsightLog(textA, 1200))
+			markFailed("分析代理未返回有效结果，请重试")
+			return
+		}
 	}
 	if len(candidates) > insightFindingsCap {
 		candidates = candidates[:insightFindingsCap]
@@ -565,31 +703,18 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	// Pass B：独立核实。
 	verified := map[int]bool{}
 	if len(candidates) > 0 {
-		textB, err := s.runReadOnlyAgent(ctx, project, agentID, buildVerifyPrompt(project.Path, candidates))
-		if err != nil {
-			log.Printf("[insights] project=%s Pass B runner error: %v", projectID, err)
-			markFailed("建议核实失败，请重试")
+		verdict, bErr := s.runInsightVerify(ctx, project, agentID, candidates)
+		if bErr != nil {
+			log.Printf("[insights] project=%s Pass B failed: %v", projectID, bErr)
+			// 区分 agent 进程运行失败（环境问题，提示"建议核实失败"）与解析失败（"未返回有效结果"）。
+			if errors.Is(bErr, errInsightVerifyRunner) {
+				markFailed("建议核实失败，请重试")
+			} else {
+				markFailed("核实代理未返回有效结果，请重试")
+			}
 			return
 		}
-		var verdict struct {
-			Findings []struct {
-				Index     int  `json:"index"`
-				Confirmed bool `json:"confirmed"`
-			} `json:"findings"`
-		}
-		// 与 Pass A 同理：agent 输出可能带 Markdown 围栏/散文，先抽出最外层 JSON 再解析。
-		vJSON := extractInsightJSON(textB)
-		if vJSON == "" {
-			log.Printf("[insights] project=%s Pass B empty/non-json; raw (len=%d): %q", projectID, len(textB), truncateInsightLog(textB, 1200))
-			markFailed("核实代理未返回有效结果，请重试")
-			return
-		}
-		if err := json.Unmarshal([]byte(vJSON), &verdict); err != nil {
-			log.Printf("[insights] project=%s Pass B unmarshal err=%v raw(len=%d): %q", projectID, err, len(textB), truncateInsightLog(textB, 1200))
-			markFailed("核实代理未返回有效结果，请重试")
-			return
-		}
-		for _, v := range verdict.Findings {
+		for _, v := range verdict {
 			verified[v.Index] = v.Confirmed
 		}
 	}

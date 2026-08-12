@@ -164,6 +164,26 @@ type AgentRunner interface {
 | `CheckUpdate()` | `npm view @anthropic-ai/claude-code version` | 对比本地版本与远端最新版本 |
 | `Update()` | `claude update` | 直接调用 CLI 更新命令 |
 
+> **更新：实际接口已超出本节描述**。代码中除 `AgentRunner` 外，还定义了两个相关接口（`claude_runner.go`）：
+>
+> ```go
+> // StreamingAgentRunner 支持流式会话（StartSession），用于对话页实时过程
+> type StreamingAgentRunner interface {
+>     AgentRunner
+>     StartSession(context.Context, AgentSessionRequest) (AgentSession, error)
+> }
+>
+> // CodexCapableRunner 支持 Codex CLI 的版本管理（对称的四个方法）
+> type CodexCapableRunner interface {
+>     CodexReady(context.Context) bool
+>     CodexVersion(context.Context) string
+>     CodexCheckUpdate(context.Context) (bool, string, error)
+>     CodexUpdate(context.Context) (string, string, error)
+> }
+> ```
+>
+> **Codex CLI 的版本管理已完整实现**（`codex_runner.go`），与本节 Claude 的三能力对称：`codex --version` / `npm view` / `codex update`，对应 API `POST /api/runners/{runnerId}/codex/check-update` 与 `POST /api/runners/{runnerId}/codex/update`。本节原仅描述 Claude，实际应理解为"Claude 与 Codex 共用同一套版本管理接口模式"。
+
 ### 5.2 RunnerInfo（扩展）
 
 当前 `/api/runners` 返回静态列表。扩展为包含动态版本信息：
@@ -319,9 +339,20 @@ type AgentRunner interface {
 }
 ```
 
-### 7.4 兼容性说明
+### 7.4 Codex CLI 版本管理 API（已实现）
 
-以上 API 路径使用 `{runnerId}` 作为路径参数，当前阶段只有一个 runner（`wsl-local`），但这为未来远程 Runner 扩展保留了空间。远程 Runner 场景下，control-server 需要通过 Runner 的 gRPC 接口或代理执行 CLI 命令，但 API 契约保持不变。
+Codex 与 Claude 对称，复用同一套模式：
+
+- `POST /api/runners/{runnerId}/codex/check-update` — 检查 Codex CLI 更新
+- `POST /api/runners/{runnerId}/codex/update` — 执行 Codex CLI 更新
+
+请求/响应结构与 §7.2、§7.3 的 Claude 端点一致，底层命令为 `codex --version` / `npm view @openai/codex version` / `codex update`。
+
+### 7.5 兼容性说明
+
+以上 API 路径使用 `{runnerId}` 作为路径参数。当前 `runnerId` 已不限于 `wsl-local`，还包括 `windows-local` 和 `ssh-{id}`（见 `docs/11`、`docs/17`、`docs/20`）。各 Runner 通过 `CodexCapableRunner` 接口决定是否支持 Codex 版本管理；不支持的 Runner 对 Codex 端点返回不可用。
+
+> 注：本节原提及"gRPC 接口"——当前无 gRPC，Runner 是进程内接口实现，见 `docs/02` 当前架构。
 
 ## 8. 前端交互
 

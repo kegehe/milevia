@@ -54,7 +54,9 @@
 4. 点击“获取更新”执行 `fetch --prune`，刷新远端信息和 ahead/behind；点击“推送”将当前分支按正常 fast-forward 规则推到指定远端。
 5. 在分支抽屉创建本地分支、切换到干净工作树中的分支；可选择从当前 HEAD 或已存在的本地/远端引用创建。
 
-下列操作必须在后续阶段另行设计：`pull`、merge、rebase、reset、restore、clean、cherry-pick、tag、删除或重命名分支、修改远端 URL、强制推送，以及任何会覆写本地或远端历史的命令。它们不是缺少按钮，而是需要冲突处理、预览和恢复机制。
+下列操作必须在后续阶段另行设计：`pull`、merge、rebase、reset、cherry-pick、tag、删除或重命名分支、修改远端 URL、强制推送，以及任何会覆写本地或远端历史的命令。它们不是缺少按钮，而是需要冲突处理、预览和恢复机制。
+
+> **更新**：初版将 `restore`、`clean` 列为"后续阶段"。实际 `git.go` 已实现 `RestoreWorktree`（恢复单文件）、`RestoreAll`（恢复全部）、`DiscardInitialChanges`（丢弃未暂存初始改动）、`RemoveUntracked`（清理未跟踪文件）四个操作，对应前端 stage-all / unstage-all / discard 路由。`pull`、merge、rebase、reset 等仍属后续阶段。
 
 ## 4. 方案比较与推荐
 
@@ -116,8 +118,10 @@ Project
 
 建议 SQLite 迁移如下；`git_repository_settings` 只记录策略，状态本身不永久缓存为真相。
 
+> **实现说明**：`git_operations` 表已落地（字段与下方一致，含 `executor_id`、`lease_until`）。`git_repository_settings` 表**尚未实现**——`default_remote`、`protected_branch_patterns`、`require_clean_switch` 等策略字段当前无对应存储，受保护分支模式、默认远端配置等功能待后续补充。下方保留该表设计作参考。
+
 ```text
-git_repository_settings
+git_repository_settings   # ⚠️ 未实现，保留设计参考
   project_id                 text primary key references projects(id)
   enabled                    integer not null default 1
   default_remote             text
@@ -125,7 +129,7 @@ git_repository_settings
   require_clean_switch       integer not null default 1
   created_at, updated_at     datetime not null
 
-git_operations
+git_operations            # ✅ 已实现
   id, project_id             text
   task_id, task_run_id       text null
   type, status               text
@@ -231,8 +235,13 @@ POST /api/projects/{projectID}/git/branches         { name, startPoint, trackRem
 POST /api/projects/{projectID}/git/switch           { branch, stateToken }
 GET  /api/projects/{projectID}/git/operations?cursor=&limit=50
 GET  /api/git/operations/{operationID}
-GET  /ws/projects/{projectID}
+POST /api/projects/{projectID}/git/stage-all       # 后续新增
+POST /api/projects/{projectID}/git/unstage-all     # 后续新增
+POST /api/projects/{projectID}/git/discard         # 后续新增（restore/clean 语义）
+GET  /ws/projects/{projectID}                      # ⚠️ 通用项目级 WS 未实现
 ```
+
+> **实现说明**：通用的 `GET /ws/projects/{projectID}`（用于推送 `git.snapshot.updated` / `git.operation.updated`）**未实现**。当前实际 WebSocket 端点为：`/ws/conversations/{id}`、`/ws/projects/{id}/run`（项目启停日志）、`/ws/processes`、`/ws/notifications`。Git 操作的最终结果目前通过 `GET operation` 轮询或会话级 WS 获取，无独立的项目级 Git 实时推送。
 
 所有写接口都返回 `202 Accepted` 与 `operationId`，由 `GET operation` 或 WebSocket 获得最终结果；短操作也遵循同一模型，便于 hooks、网络和未来远程 Runner。读取接口不可接受任意 revision 表达式：`ref`、`branch`、`startPoint` 必须来自服务端列出的引用，或通过严格的 SHA/分支名校验。
 

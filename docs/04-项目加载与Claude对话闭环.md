@@ -87,7 +87,9 @@ Project
 | Claude Run | Runner 为某一轮对话启动的 Claude Code 进程。 |
 | Process Event | Claude 消息、工具行为、命令输出、文件修改、完成或失败等过程记录。 |
 
-同一 Conversation 后续发送提示词时，Runner 必须恢复同一个 Claude 会话，而不是每轮创建全新上下文。用户选择“开始新会话”后，才建立新的 Conversation。
+> **实现说明**：实际代码中 **Turn 不作为独立实体/表落地**——一次消息发送直接对应一个 Run（`runs` 表），Conversation → Message → Run → Event 四层。Turn 的概念隐含在 Message 与 Run 的一一对应中。同会话续问通过 Claude Code 的 `--resume` 恢复同一会话。
+
+同一 Conversation 后续发送提示词时，Runner 必须恢复同一个 Claude 会话，而不是每轮创建全新上下文。用户选择"开始新会话"后，才建立新的 Conversation。
 
 Runner 使用 Claude Code 的非交互、结构化流式输出能力运行一次对话，并把输出转换为平台过程事件。网页只展示统一事件，不依赖终端颜色文本或某个 Claude CLI 版本的非结构化输出。
 
@@ -151,47 +153,49 @@ Runner 返回的过程信息至少应能区分：
 
 ### 基础能力
 
-- [ ] 定义 Project、Runner、Claude Conversation、Claude Turn、Claude Run 和 Process Event 的领域对象。
-- [ ] 定义项目加载、对话和运行的状态流转。
-- [ ] 定义浏览器 API 与 Runner 通信契约中的目录、项目和 Claude 对话对象。
-- [ ] 定义 Claude Code 结构化流式输出到 Process Event 的映射规则。
+- [x] 定义 Project、Runner、Claude Conversation、Claude Turn、Claude Run 和 Process Event 的领域对象。
+- [x] 定义项目加载、对话和运行的状态流转。
+- [x] 定义浏览器 API 与 Runner 通信契约中的目录、项目和 Claude 对话对象。
+- [x] 定义 Claude Code 结构化流式输出到 Process Event 的映射规则。
 
 ### Runner 能力
 
-- [ ] 实现 WSL Runner 的 Runner 注册、能力上报和 Claude Code 探测。
-- [ ] 实现 Runner 目录浏览与目录校验，限制可浏览根目录。
-- [ ] 实现项目路径、Git 信息和 Claude 可用状态探测。
-- [ ] 实现 Claude Conversation 的创建、恢复、新建与停止。
-- [ ] 实现 Claude 结构化事件采集、顺序上报和失败信息归类。
+- [x] 实现 WSL Runner 的 Runner 注册、能力上报和 Claude Code 探测。
+- [x] 实现 Runner 目录浏览与目录校验，限制可浏览根目录。
+- [x] 实现项目路径、Git 信息和 Claude 可用状态探测。
+- [x] 实现 Claude Conversation 的创建、恢复、新建与停止。
+- [x] 实现 Claude 结构化事件采集、顺序上报和失败信息归类。
 
 ### Control Server 能力
 
-- [ ] 实现项目加载、项目查询和项目状态管理。
-- [ ] 实现 Claude Conversation、Turn、Run 与事件记录管理。
-- [ ] 实现向 Runner 发起 Claude 运行、停止和恢复的编排能力。
-- [ ] 实现历史事件读取和实时事件转发。
+- [x] 实现项目加载、项目查询和项目状态管理。
+- [x] 实现 Claude Conversation、Turn、Run 与事件记录管理。
+- [x] 实现向 Runner 发起 Claude 运行、停止和恢复的编排能力。
+- [x] 实现历史事件读取和实时事件转发。
 
 ### Web 页面能力
 
-- [ ] 实现项目列表和空状态。
-- [ ] 实现 Runner 选择、目录浏览、校验结果和项目加载页面。
-- [ ] 实现项目 Claude 对话页、过程面板和状态提示。
-- [ ] 实现流式消息显示、运行停止、继续对话和开始新会话。
-- [ ] 实现刷新页面后恢复项目与对话历史。
+- [x] 实现项目列表和空状态。
+- [x] 实现 Runner 选择、目录浏览、校验结果和项目加载页面。
+- [x] 实现项目 Claude 对话页、过程面板和状态提示。
+- [x] 实现流式消息显示、运行停止、继续对话和开始新会话。
+- [x] 实现刷新页面后恢复项目与对话历史。
 
 ### 验证任务
 
-- [ ] 用一个 WSL Git 项目完成加载、首次对话、继续对话和停止运行测试。
-- [ ] 验证目录不存在、无权限、非 Git 项目、Claude 未安装和 Claude 未登录的错误提示。
-- [ ] 验证浏览器刷新和短暂断连后，历史过程与当前运行状态一致。
-- [ ] Windows Runner 实现后，用 Windows 本机 Git 项目复用相同流程进行验证。
+- [x] 用一个 WSL Git 项目完成加载、首次对话、继续对话和停止运行测试。
+- [x] 验证目录不存在、无权限、非 Git 项目、Claude 未安装和 Claude 未登录的错误提示。
+- [x] 验证浏览器刷新和短暂断连后，历史过程与当前运行状态一致。
+- [x] Windows Runner 实现后，用 Windows 本机 Git 项目复用相同流程进行验证。
 
 ## 10. 本阶段不做的内容
 
-- 通用任务看板和任务分解；
-- Git worktree、分支、提交和合并请求；
-- Codex CLI 和其他 AI 工具；
-- 完整 diff、测试门禁、部署和通知；
-- 多人协作、权限管理和远程 Runner 管理界面。
+> **更新**：以下为 2026-07 初版的"不做"清单。其中多项后续已实现，标注如下。
+
+- 通用任务看板和任务分解； ✅ 已实现（`docs/07`、TaskBoardPage）
+- Git worktree、分支、提交和合并请求； ⚠️ worktree 未实现；分支、提交、push、fetch **已实现**（`docs/08`、GitWorkbenchPage）
+- Codex CLI 和其他 AI 工具； ✅ Codex CLI **已实现**（`docs/13`、`codex_runner.go`）
+- 完整 diff、测试门禁、部署和通知； ⚠️ diff **已实现**；测试门禁/部署未实现；通知 **已实现**（`docs/15`）
+- 多人协作、权限管理和远程 Runner 管理界面。 ⚠️ 多人协作/权限未实现；远程 Runner（SSH）**已实现**（`docs/11`、SSHManagerPage）
 
 这些功能后续应建立在本次项目、Conversation、Run、事件和 Runner 边界之上。

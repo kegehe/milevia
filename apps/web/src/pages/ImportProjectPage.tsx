@@ -35,6 +35,9 @@ function EnvironmentIcon({ environment }: { environment?: string }) {
   if (environment === "windows") {
     return <svg className="root-option-icon windows" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4v7H3v-5.5ZM13 3.5 21 2v9h-8v-7.5ZM3 13h7.5v7L3 18.5V13ZM13 13h8v9l-8-1.5V13Z" /></svg>;
   }
+  if (environment === "wsl") {
+    return <svg className="root-option-icon wsl" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 3v9.6L3.5 10 11 3ZM21 3v9.6L13.5 10 21 3ZM11 12.3V21L3.5 14.5 11 12.3ZM21 12.3V21l-7.5-6.5L21 12.3Z" /></svg>;
+  }
   if (environment === "remote-linux") {
     return <svg className="root-option-icon remote" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="6" rx="1.2" /><rect x="4" y="14" width="16" height="6" rx="1.2" /><path d="M8 7h.01M8 17h.01M12 7h5M12 17h5" /></svg>;
   }

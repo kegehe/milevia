@@ -177,6 +177,24 @@ Windows 环境（`agentTargetEnvWindows`）的 Agent 执行，按服务端所处
 
 > **诚实降级原则**：在"WSL 部署 + /mnt/ 项目"且未确认 Windows 侧可长驻运行 claude 时，`AgentReady` 与对话启动会**明确报中文错误**（指出需在 Windows 侧安装/配置 CLI，或改用本机对称环境），绝不静默回退到 WSL 侧——这正是消除"标成 windows 却跑 wsl"错位的核心。Windows 部署下 `agentTargetEnvWindows` 直接走本机 `exec.Command`（文档17 §5.3），连跨界转发器都不需要。
 
+#### 3.4-补充 Windows→WSL 方向（`wslAgentRunner`，已落地）
+
+> **补充**：本节原只描述 WSL→Windows 方向（`windowsAgentRunner`）。实际还实现了反方向的 **`wslAgentRunner`**（`wsl_agent_runner.go` + `wsl_agent_run.go`），用于 **Windows 服务端部署下跨到 WSL 侧执行 Claude/Codex CLI**。完整方案见 `docs/26-Windows到WSL跨界Agent Runner实现.md`。
+
+| 服务端部署 | 触发条件 | 执行方式 |
+|---|---|---|
+| **Windows 本机**（桌面版） | wsl-local 项目（`\\wsl$\...` UNC 路径） | 经 `wsl.exe -d <distro> --cd <linuxWorkDir> -- <cli> <args>` 跨到 WSL 侧执行；文件操作复用 `LocalFilesystem` 直读 UNC |
+
+要点：
+
+- **文件走 UNC**：wsl-local 项目路径以 `\\wsl$\` / `\\wsl.localhost\` UNC 形式存储，`LocalFilesystem` 直接读写 UNC，不经 `/mnt/` 转换。
+- **AI 经 wsl.exe**：`wslAgentRunner` 通过 `wsl.exe` 启动 WSL 内的 claude/codex，stdin/stdout 双向管道流式通信。
+- **argv JSON mangling 防护**：`wsl.exe --` 后的参数经 zsh 重展开会破坏 `--settings` 等 JSON 参数，用 `wslEncodeArg`（base64 编码）+ `windowsToWSLMntPath`（剥 `\\?\` 前缀）规避。
+- **WSLENV 透传**：`wslBuildEnv` / `wslForwardEnvKeys` 控制哪些环境变量经 `WSLENV` 透传到 WSL 侧。
+- **进程树清理**：`taskkill /T` 终止 wsl.exe 及其子进程树。
+
+`agent_target_env.go` 的 `agentClaudeRunnerFor` / `codexRunnerFor` / `agentCLIReady` 在 Windows 部署 + wsl-local 项目时消费此 runner。
+
 ### 3.5 环境推导修正
 
 `decorateProjectPresentation`（`app.go:2125-2142`）改为：
@@ -197,7 +215,7 @@ func (s *Server) decorateProjectPresentation(project *Project) {
 | 项 | 现状 | 本期改动 |
 |---|---|---|
 | `AUTO_CLAUDE_PATH` | 无（`ClaudePath` 硬编码 `"claude"`，`app.go:99`） | 新增环境变量，Windows 侧可配成 `.exe`/`.cmd` 路径；`CodexPath` 已有 `AUTO_CODEX_PATH` |
-| Windows 审批 helper | 无 | 新增 `apps/control-server/cmd/milevia-approval/`（Go 单文件 exe，见 3.4-3） |
+| Windows 审批 helper | ✅ 已落地 | `apps/control-server/cmd/approval-helper/main.go`（Go 单文件，打包为 `milevia-approval.exe`；目录名为 `approval-helper` 而非文档初版的 `milevia-approval`） |
 | `projects.runner_id` | 已有列与迁移 | 不动；分发以此为准 |
 | 前端 environment 消费 | 项目卡片标的 `environment` | 不变（值语义改对即可） |
 

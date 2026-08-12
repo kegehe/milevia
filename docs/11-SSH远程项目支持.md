@@ -134,12 +134,13 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 ### 2.3 非目标（明确不做）
 
 - **不在平台中管理 SSH 密钥对生成**——用户自行通过 `ssh-keygen` 生成，平台只使用已有密钥
-- **不实现 SSH 密码认证**——只支持密钥认证，避免在平台中存储密码
 - **不实现跳板机/堡垒机**——首期只支持直连 SSH
 - **不在远程服务器上自动安装 Claude Code**——要求远程服务器已安装好依赖
 - **不实现多跳 SSH**——不支持 `user@A → user@B → target` 的链路
 - **不跨 Runner 调度任务**——任务在哪个 Runner 的项目中就在哪个 Runner 执行
 - **不实现远程 Runner 自动注册**——首期手动添加 SSH 连接
+
+> **更新**：初版写"不实现 SSH 密码认证"，实际后续已支持密码认证（`ssh_connections.password` 列 + `ssh.Password(conn.Password)`）。见 §3.4.1。
 
 ## 3. 设计方案
 
@@ -260,6 +261,7 @@ CREATE TABLE IF NOT EXISTS ssh_connections (
     port            integer not null default 22,
     user            text not null,             -- SSH 用户名
     private_key_path text not null,            -- 私钥路径（控制平面本地的绝对路径）
+    password        text not null default '',  -- SSH 密码（为空则用密钥认证；通过 ALTER TABLE 增量添加）
     known_hosts     text not null default '',  -- 主机公钥（OpenSSH known_hosts 格式）
     root_path       text not null default '/', -- 远程服务器上可浏览的起始目录
     status          text not null default 'unknown',  -- unknown/connected/disconnected/error
@@ -274,7 +276,7 @@ CREATE TABLE IF NOT EXISTS ssh_connections (
 - `private_key_path` 存储控制平面本地的私钥文件路径，不存储私钥内容。私钥文件由用户自行放置在控制平面所在机器上
 - `known_hosts` 存储远程主机的公钥（OpenSSH known_hosts 格式的单行条目）。首次连接时使用 `ssh.InsecureIgnoreHostKey()` 临时信任，连接成功后通过 `session.HostKey()` 获取主机公钥，序列化后存入数据库。后续连接使用 `ssh.FixedHostKey()` 进行严格验证
 - `status` 字段支持连接状态展示，前端可以显示绿色/红色指示灯
-- 不存储密码，只支持密钥认证
+- 认证方式：**密钥与密码都支持**。`ssh_runner.go` 中 `conn.Password != ""` 时用 `ssh.Password(conn.Password)`，否则用私钥认证。`sanitizedSSHConnection` 暴露 `authMethod: "password"` 供前端展示。`password` 列通过 `ALTER TABLE` 增量添加，兼容旧库。
 
 ##### B. Runner 标识约定
 
@@ -538,10 +540,14 @@ func (reg *runnerRegistry) get(id string) (AgentRunner, bool) { ... }
 | `GET` | `/api/ssh-connections` | 列出所有 SSH 连接配置 |
 | `POST` | `/api/ssh-connections` | 添加 SSH 连接配置 |
 | `GET` | `/api/ssh-connections/{id}` | 获取单个连接详情 |
+| `PUT` | `/api/ssh-connections/{id}` | 更新连接配置（含密码字段） |
 | `DELETE` | `/api/ssh-connections/{id}` | 删除连接配置。先检查 `SELECT count(*) FROM projects WHERE runner='ssh-{id}'`，如有项目依赖则返回 409 拒绝删除；确认无依赖后断开连接、注销 Runner、删除记录 |
 | `POST` | `/api/ssh-connections/{id}/test` | 测试连接是否可用 |
 | `POST` | `/api/ssh-connections/{id}/connect` | 建立连接并注册 Runner |
 | `POST` | `/api/ssh-connections/{id}/disconnect` | 断开连接并注销 Runner |
+| `POST` | `/api/ssh-connections/preflight` | 添加前预检（探测主机可达性、认证方式） |
+| `GET` | `/api/ssh-profiles` | 列出 SSH profile（连接配置的展示态聚合，含脱敏后的认证方式等） |
+| `GET` | `/api/ssh-profiles/{id}` | 获取单个 SSH profile |
 
 ##### B. 调整现有 API
 
@@ -732,17 +738,31 @@ cmd.Env = append(os.Environ(),
 
 #### 3.5.2 解决方案
 
-**方案**：在创建 SSH Runner 时将 `ControlURL` 替换为控制平面的外部可达地址。用户需通过 `AUTO_CONTROL_URL` 环境变量设置一个远程服务器可达的地址（如 `http://192.168.1.50:8080`）。
+> **更新**：初版方案要求用户设置 `AUTO_CONTROL_URL` 为外部可达地址，实机局限大（NAT/防火墙后不可用）。实际实现改为 **SSH 隧道（remote port forwarding）** 方案，无需外部可达地址。
 
-`sshRunner.StartSession()` 中覆盖该值：
+**实际方案**：SSH Runner 在建立连接时开通一条远程端口转发隧道，把远程服务器上的某个本地端口映射回控制平面。远程 Claude Code 的 `AUTO_CONTROL_URL` 指向该远程本地端口（如 `http://127.0.0.1:{remotePort}`），回调经 SSH 隧道直达控制平面。
+
+`sshClient`（`ssh_runner.go`）持有隧道相关字段：
+
+```go
+type sshClient struct {
+    // ...
+    tunnel      *sshTunnel       // 远程端口转发隧道
+    tunnelReady chan struct{}     // 隧道就绪信号
+    tunnelWG    sync.WaitGroup    // 隧道 goroutine 生命周期
+    // ...
+}
+```
+
+`sshRunner.StartSession()` 中 `AUTO_CONTROL_URL` 指向隧道远端口：
 
 ```go
 func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (AgentSession, error) {
-    // 远程 Claude Code 需要能回调控制平面 —— 使用配置中的外部可达地址
+    // 远程 Claude Code 回调经 SSH 隧道回到控制平面，无需外部可达地址
     cmd := fmt.Sprintf(
-        "cd %s && AUTO_CONTROL_URL=%s AUTO_APPROVAL_CONVERSATION_ID=%s AUTO_APPROVAL_TOKEN=%s claude --input-format stream-json --output-format stream-json --verbose",
+        "cd %s && AUTO_CONTROL_URL=%s AUTO_APPROVAL_CONVERSATION_ID=%s AUTO_APPROVAL_TOKEN=%s claude ...",
         shellescape.Quote(req.ProjectPath),
-        shellescape.Quote(r.controlURL),     // 外部可达地址
+        shellescape.Quote(r.tunnelControlURL()),  // http://127.0.0.1:{remotePort}
         shellescape.Quote(req.ConversationID),
         shellescape.Quote(req.ApprovalToken),
     )
@@ -750,22 +770,22 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 }
 ```
 
-**约束**：
-- 用户必须在启动控制平面时设置 `AUTO_CONTROL_URL` 为远程服务器可达的地址（如局域网 IP）
-- 如果无法满足（如 NAT 后），审批模式改用 `full_control`（无需回调）
-- 使用 `full_control` 模式时不存在此问题 —— 不需要审批回调
+**优势**：
+- 无需用户配置外部可达地址，NAT/防火墙后也能用。
+- 回调流量全程走 SSH 加密通道。
+- 使用 `full_control` 模式时不触发审批回调，隧道仍可空闲保留。
 
 ### 3.6 安全设计
 
 | 安全点 | 设计 |
 |--------|------|
-| SSH 认证 | 只支持密钥认证，不存储密码 |
+| SSH 认证 | 密钥与密码都支持；密码存于 `ssh_connections.password` 列，为空则用密钥 |
 | 私钥安全 | 私钥路径存储在数据库，文件由用户自行管理权限（`chmod 600`） |
 | 主机验证 | 首次连接时自动获取主机指纹，保存到 `known_hosts` 字段；指纹变更时拒绝连接 |
 | 路径安全 | 远程浏览限制在 `SSHConnection.rootPath` 范围内；路径以 `rootPath` 为前缀始可访问 |
 | 数据传输 | 所有 SSH 流量加密 |
 | 凭据隔离 | 浏览器不接触 SSH 密钥；所有 SSH 操作在控制平面完成 |
-| 审批回调 | 远程服务器的 Claude Code 需能通过网络访问控制平面的 `AUTO_CONTROL_URL`；否则使用 `full_control` 模式 |
+| 审批回调 | 经 SSH 远程端口转发隧道回到控制平面，无需外部可达地址；`full_control` 模式不触发回调 |
 
 ### 3.7 错误处理与状态管理
 

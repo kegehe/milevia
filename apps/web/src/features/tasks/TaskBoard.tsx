@@ -374,6 +374,9 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
   const observerRef = useRef<IntersectionObserver | null>(null);
   const dragGestureActive = useRef(false);
   const dragClickSuppressedUntil = useRef(0);
+  // WebView2 上 dataTransfer 的自定义 MIME 数据往返不可靠（getData 常读回空）。
+  // 拖拽目标数据改用内存 ref 传递——仅保留 dataTransfer 触发拖拽，不再承担传参。
+  const dragPayloadRef = useRef<DragData | null>(null);
   // 用 useMemo 稳定 definitions 引用：否则勾选“显示历史已取消”时每次渲染都会生成新数组，
   // 导致下方的 IntersectionObserver effect 反复重建，新 observer 对仍在视口内的哨兵立即触发
   // 回调，形成连锁加载直到哨兵卸载——无限滚动会退化为一次性全量加载。
@@ -419,9 +422,14 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
     e.preventDefault();
     setDragOverColumn(null);
     setDragOverIndex(null);
-    const data = e.dataTransfer.getData("application/x-task-drag");
-    if (!data) return;
-    const dragData: DragData = JSON.parse(data);
+    // 优先读内存 payload（WebView2 可靠通道）；仅在缺失时回退 dataTransfer（浏览器通道）。
+    let dragData: DragData | null = dragPayloadRef.current;
+    if (!dragData) {
+      const data = e.dataTransfer.getData("application/x-task-drag");
+      if (!data) return;
+      dragData = JSON.parse(data) as DragData;
+    }
+    dragPayloadRef.current = null;
     const columnTasks = tasks.filter((t) => {
       const def = definitions.find((d) => d.id === columnID);
       if (!def) return false;
@@ -435,12 +443,14 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
     dragClickSuppressedUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS;
     setDraggingTaskID(taskID);
     const data: DragData = { taskID, sourceColumnID: columnID, sourceIndex: index };
+    dragPayloadRef.current = data;
     e.dataTransfer.setData("application/x-task-drag", JSON.stringify(data));
     e.dataTransfer.effectAllowed = "move";
   };
   const handleTaskDragEnd = () => {
     dragGestureActive.current = false;
     dragClickSuppressedUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS;
+    dragPayloadRef.current = null;
     setDraggingTaskID(null);
     setDragOverColumn(null);
     setDragOverIndex(null);

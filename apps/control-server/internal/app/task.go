@@ -1128,6 +1128,10 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(c
 	conversationID := expectedConversationID
 	if conversationID == "" {
 		err = s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and is_current=true`, task.ProjectID).Scan(&conversationID)
+	} else if orchestrated {
+		// Orchestrated dispatch targets a dedicated background conversation that
+		// is intentionally not the project's current one; accept it by ID alone.
+		err = s.db.QueryRowContext(ctx, `select id from conversations where id=? and project_id=?`, conversationID, task.ProjectID).Scan(&conversationID)
 	} else {
 		err = s.db.QueryRowContext(ctx, `select id from conversations where id=? and project_id=? and is_current=true`, conversationID, task.ProjectID).Scan(&conversationID)
 	}

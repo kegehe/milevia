@@ -711,7 +711,11 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
+		// errorText 对停止时管道关闭（os.ErrClosed）返回空，据此跳过上报，
+		// 避免正常停止在对话历史里留下"流错误 / file already closed"。
+		if text := errorText(err); text != "" {
+			sink.Event("stream.error", mustJSON(map[string]string{"error": text}))
+		}
 	}
 }
 
@@ -850,7 +854,10 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
+		// errorText 对停止时管道关闭（os.ErrClosed）返回空，据此跳过上报。
+		if text := errorText(err); text != "" {
+			session.emit("stream.error", mustJSON(map[string]string{"error": text}), false)
+		}
 	}
 }
 
@@ -861,7 +868,10 @@ func (session *claudeCLISession) readStderr(reader io.Reader) {
 		session.emit("stderr", mustJSON(map[string]string{"message": redactAgentText(scanner.Text())}), false)
 	}
 	if err := scanner.Err(); err != nil {
-		session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
+		// errorText 对停止时管道关闭（os.ErrClosed）返回空，据此跳过上报。
+		if text := errorText(err); text != "" {
+			session.emit("stream.error", mustJSON(map[string]string{"error": text}), false)
+		}
 	}
 }
 
@@ -1241,6 +1251,9 @@ func (r *claudeCLIRunner) readStderr(reader io.Reader, sink AgentRunSink) {
 		sink.Event("stderr", mustJSON(map[string]string{"message": redactAgentText(scanner.Text())}))
 	}
 	if err := scanner.Err(); err != nil {
-		sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
+		// errorText 对停止时管道关闭（os.ErrClosed）返回空，据此跳过上报。
+		if text := errorText(err); text != "" {
+			sink.Event("stream.error", mustJSON(map[string]string{"error": text}))
+		}
 	}
 }

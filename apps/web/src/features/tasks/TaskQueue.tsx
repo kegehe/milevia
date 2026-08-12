@@ -2,7 +2,7 @@ import { FormEvent, MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 
-import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, priorityLabels, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
+import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
@@ -16,6 +16,10 @@ const filters: { id: TaskFilter; label: string }[] = [
 ];
 
 type QueueDragData = { taskID: string; sourceIndex: number };
+
+// WebView2 上 dataTransfer 的自定义 MIME 数据往返不可靠（getData 常读回空），
+// 拖拽目标数据改走内存：拖拽源写入、拖放目标读取。行组件彼此独立，故用模块级 ref。
+const queueDragPayloadRef: { current: QueueDragData | null } = { current: null };
 type PendingConfirm = { title: string; message: React.ReactNode; danger?: boolean; onConfirm: () => void; onCancel: () => void } | null;
 type ExecutionPolicy = "approval_required" | "full_control" | "read_only" | "workspace_write";
 
@@ -210,6 +214,26 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
       })(),
       onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
     });
+  };
+
+  const inlineEdit = async (patch: { title: string; description: string; acceptanceCriteria: string; priority: Priority }): Promise<boolean> => {
+    if (!inlineDetail) return false;
+    if (!mountedRef.current) return false;
+    const taskID = inlineDetail.id;
+    // 不传 position：后端 Position 为指针，nil 时保留原值，避免用可能过期的 inlineDetail 快照
+    // 覆盖拖拽后的最新排序位（详情面板打开期间任务仍可被拖拽重排）。
+    const requestID = ++inlineRequest.current;
+    setInlineBusy("edit");
+    try {
+      await request(`/api/tasks/${taskID}`, { method: "PATCH", body: JSON.stringify(patch) });
+      if (!mountedRef.current || inlineRequest.current !== requestID) return false;
+      const next = await request<TaskDetail>(`/api/tasks/${taskID}`);
+      if (!mountedRef.current || inlineRequest.current !== requestID) return false;
+      setInlineDetail(next);
+      await loadTasks();
+      return true;
+    } catch (cause) { if (mountedRef.current && inlineRequest.current === requestID) fail(cause instanceof Error ? cause.message : "无法保存任务"); return false; }
+    finally { if (mountedRef.current && inlineRequest.current === requestID) setInlineBusy(""); }
   };
 
   const inlineReview = async (action: "accept" | "request_changes", note: string) => {
@@ -411,6 +435,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
         inlineDispatch={inlineDispatch}
         inlineTransition={inlineTransition}
         inlineDelete={inlineDelete}
+        inlineEdit={inlineEdit}
         inlineReview={inlineReview}
         openBoard={openBoard}
         confirmTransition={confirmTransition}
@@ -422,7 +447,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   </div>;
 }
 
-function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, inlineReview, openBoard, confirmTransition, setPinned }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void; setPinned: (taskID: string, pinned: boolean) => Promise<void> }) {
+function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, inlineEdit, inlineReview, openBoard, confirmTransition, setPinned }: { task: Task; index: number; open: () => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; inlineEdit: (patch: { title: string; description: string; acceptanceCriteria: string; priority: Priority }) => Promise<boolean>; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void; setPinned: (taskID: string, pinned: boolean) => Promise<void> }) {
   const [isDragging, setIsDragging] = useState(false);
   const [dragOverPosition, setDragOverPosition] = useState<"before" | "after" | null>(null);
   const [hoverOpen, setHoverOpen] = useState(false);
@@ -481,12 +506,14 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
     setIsDragging(true);
     didDragRef.current = true;
     const data: QueueDragData = { taskID: task.id, sourceIndex: index };
+    queueDragPayloadRef.current = data;
     e.dataTransfer.setData("application/x-queue-drag", JSON.stringify(data));
     e.dataTransfer.effectAllowed = "move";
   };
   const handleDragEnd = () => {
     setIsDragging(false);
     setDragOverPosition(null);
+    queueDragPayloadRef.current = null;
     setTimeout(() => { didDragRef.current = false; }, 200);
   };
   const handleClick = (e: React.MouseEvent) => {
@@ -511,9 +538,14 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
   const handleDropRow = (e: React.DragEvent) => {
     e.preventDefault(); e.stopPropagation();
     setDragOverPosition(null);
-    const data = e.dataTransfer.getData("application/x-queue-drag");
-    if (!data) return;
-    const dragData: QueueDragData = JSON.parse(data);
+    // 优先读内存 payload（WebView2 可靠通道）；仅在缺失时回退 dataTransfer（浏览器通道）。
+    let dragData: QueueDragData | null = queueDragPayloadRef.current;
+    if (!dragData) {
+      const data = e.dataTransfer.getData("application/x-queue-drag");
+      if (!data) return;
+      dragData = JSON.parse(data) as QueueDragData;
+    }
+    queueDragPayloadRef.current = null;
     if (dragData.taskID === task.id) return;
     const rect = e.currentTarget.getBoundingClientRect();
     void onDrop(dragData.taskID, e.clientY < rect.top + rect.height / 2 ? index : index + 1);
@@ -541,7 +573,7 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
         <button type="button" className="danger-text" draggable={false} disabled={reviewSubmitting} onClick={(event) => { event.stopPropagation(); closeReview(); }}>取消</button>
       </div>
     </div>}
-    {inlineDetailID === task.id && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} dispatchDisabled={dispatchDisabled} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} deleteTask={inlineDelete} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
+    {inlineDetailID === task.id && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} dispatchDisabled={dispatchDisabled} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} deleteTask={inlineDelete} edit={inlineEdit} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
     {hoverOpen && rowRef.current && createPortal(<TaskHoverCard task={task} anchor={rowRef.current} onEnter={showHover} onLeave={hideHover} />, document.body)}
   </article>;
 }
@@ -604,10 +636,16 @@ function DispatchConfirmation({ task, detail, loading, dispatching, dispatchDisa
   return <div className="backdrop task-dispatch-backdrop" role="dialog" aria-modal="true" aria-labelledby="task-dispatch-title"><section className="modal task-dispatch-dialog"><header><div><h2 id="task-dispatch-title">确认下发</h2></div><button type="button" title="关闭" disabled={dispatching} onClick={close}>x</button></header><div className="task-dispatch-body"><div className="task-dispatch-title"><span className={`task-status ${task.status}`}>{statusLabels[task.status]}</span><h3>{taskDisplayTitle(task)}</h3><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}优先级</em></div><p className="task-dispatch-description">{detail?.description || task.description}</p><dl><div><dt>当前权限</dt><dd>{policyLabel(permissionMode)}</dd></div><div><dt>状态检查</dt><dd className={canDispatch ? "eligible" : "blocked"}>{eligibility}</dd></div></dl></div><footer><button type="button" className="secondary" disabled={dispatching} onClick={openBoard}>查看完整详情</button><span><button type="button" className="secondary" disabled={dispatching} onClick={close}>取消</button><button type="button" className="primary" disabled={!canDispatch || dispatching} onClick={() => void dispatch()}>{dispatching ? "下发中" : "确认下发"}</button></span></footer></section></div>;
 }
 
-function InlineTaskDetail({ detail, loading, busy, dispatchDisabled, close, dispatch, transition, deleteTask, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; dispatchDisabled: boolean; close: () => void; dispatch: () => Promise<void>; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: () => void }) {
+function InlineTaskDetail({ detail, loading, busy, dispatchDisabled, close, dispatch, transition, deleteTask, edit, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; dispatchDisabled: boolean; close: () => void; dispatch: () => Promise<void>; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; edit: (patch: { title: string; description: string; acceptanceCriteria: string; priority: Priority }) => Promise<boolean>; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: () => void }) {
   const detailRef = useRef<HTMLDivElement>(null);
   const [localReviewNote, setLocalReviewNote] = useState("");
   const [localReviewSubmitting, setLocalReviewSubmitting] = useState(false);
+  // 内联编辑态：进入时用当前 detail 快照初始化，保存成功后由父组件刷新 detail 并退出编辑。
+  const [editing, setEditing] = useState(false);
+  const [editTitle, setEditTitle] = useState("");
+  const [editDescription, setEditDescription] = useState("");
+  const [editAcceptanceCriteria, setEditAcceptanceCriteria] = useState("");
+  const [editPriority, setEditPriority] = useState<Priority>("normal");
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -616,11 +654,34 @@ function InlineTaskDetail({ detail, loading, busy, dispatchDisabled, close, disp
 
   useEffect(() => { if (detailRef.current && detail) detailRef.current.scrollIntoView({ behavior: "smooth", block: "center" }); }, [detail]);
 
+  // 切换到其它任务（detail.id 变化）时退出编辑态，避免把上一任务的草稿带到新任务。
+  useEffect(() => { setEditing(false); }, [detail?.id]);
+
   if (loading) return <div className="task-inline-detail"><div className="task-inline-detail-body"><p className="task-inline-loading">加载任务详情...</p></div></div>;
   if (!detail) return <div className="task-inline-detail"><div className="task-inline-detail-body"><p className="task-inline-loading">无法加载任务详情。</p></div></div>;
 
   const queued = detail.status === "running" && detail.lastRun?.status === "queued";
   const reviewBusy = Boolean(busy) || localReviewSubmitting;
+  const editBusy = busy === "edit";
+  // 仅待处理/需处理状态可编辑：后端禁止在 running/awaiting_review 下改执行内容
+  // （会与进行中或待验收的 run 冲突，返回 409），与任务页详情弹窗的编辑入口一致。
+  const canEdit = detail.status === "todo" || detail.status === "action_required";
+
+  const startEdit = () => {
+    setEditTitle(detail.title);
+    setEditDescription(detail.description);
+    setEditAcceptanceCriteria(detail.acceptanceCriteria);
+    setEditPriority(detail.priority);
+    setEditing(true);
+  };
+  const cancelEdit = () => { if (!editBusy) setEditing(false); };
+  const saveEdit = async () => {
+    if (editBusy || !mountedRef.current) return;
+    if (!editDescription.trim()) return;
+    const ok = await edit({ title: editTitle.trim(), description: editDescription.trim(), acceptanceCriteria: editAcceptanceCriteria.trim(), priority: editPriority });
+    // 仅在保存成功（父组件已刷新 detail）后退出编辑态；失败时保留用户输入以便重试。
+    if (ok && mountedRef.current) setEditing(false);
+  };
 
   const doReview = async (action: "accept" | "request_changes") => {
     if (localReviewSubmitting) return;
@@ -638,8 +699,18 @@ function InlineTaskDetail({ detail, loading, busy, dispatchDisabled, close, disp
         <b>{taskDisplayTitle(detail)}</b>
         <span className={`task-inline-priority priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span>
       </div>
-      <button type="button" className="task-inline-close" title="关闭详情" disabled={reviewBusy} onClick={close}>x</button>
+      <button type="button" className="task-inline-close" title="关闭详情" disabled={reviewBusy || editBusy} onClick={close}>x</button>
     </div>
+    {editing ? <form className="task-inline-edit-form" onSubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
+      <label className="task-inline-edit-field"><span>任务名称 <small>可选</small></span><input maxLength={120} value={editTitle} disabled={editBusy} onChange={(event) => setEditTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label>
+      <label className="task-inline-edit-field"><span>任务说明</span><textarea required maxLength={12000} value={editDescription} disabled={editBusy} onChange={(event) => setEditDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label>
+      <label className="task-inline-edit-field"><span>验收条件 <small>可选</small></span><textarea maxLength={12000} value={editAcceptanceCriteria} disabled={editBusy} onChange={(event) => setEditAcceptanceCriteria(event.target.value)} placeholder="用可验证的结果描述完成标准。" /></label>
+      <label className="task-inline-edit-field task-inline-edit-priority"><span>优先级</span><select value={editPriority} disabled={editBusy} onChange={(event) => setEditPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      <div className="task-inline-edit-actions">
+        <button type="button" className="secondary" disabled={editBusy} onClick={cancelEdit}>取消</button>
+        <button type="submit" className="primary" disabled={editBusy || !editDescription.trim()}>{editBusy ? "保存中" : "保存"}</button>
+      </div>
+    </form> : <>
     <div className="task-inline-detail-body">
       {detail.description && <p className="task-inline-description">{detail.description}</p>}
       {detail.acceptanceCriteria && <div className="task-inline-section"><b>验收条件</b><p>{detail.acceptanceCriteria}</p></div>}
@@ -659,10 +730,12 @@ function InlineTaskDetail({ detail, loading, busy, dispatchDisabled, close, disp
         </div>
       </>}
       {detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}
+      {canEdit && <button className="secondary" disabled={Boolean(busy)} onClick={() => startEdit()}>编辑</button>}
       <span className="task-inline-actions-sep" />
       <button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button>
       <button className="secondary" disabled={reviewBusy} onClick={openBoard}>查看完整详情</button>
     </div>
+    </>}
   </div>;
 }
 

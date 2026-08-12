@@ -3561,7 +3561,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if err != nil {
 		return Message{}, "", nil, http.StatusConflict, err
 	}
-	if !conversation.IsCurrent {
+	if !conversation.IsCurrent && !(record != nil && record.Orchestrated) {
 		return Message{}, "", nil, http.StatusConflict, errors.New("activate this conversation before sending a message")
 	}
 	if record != nil && record.WorktreePath != "" {
@@ -4099,7 +4099,9 @@ func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) 
 	delete(s.streamingSetups, runID)
 	s.mu.Unlock()
 	status := "completed"
-	if stopped || errors.Is(runErr, context.Canceled) {
+	// os.ErrClosed 是停止/强杀进程后管道被关闭的副产物（尤其 SSH 路径
+	// readOutputLoop 把它作为 runErr 上报），应归为停止而非失败。
+	if stopped || errors.Is(runErr, context.Canceled) || errors.Is(runErr, os.ErrClosed) {
 		status = "stopped"
 	} else if runErr != nil {
 		status = "failed"
@@ -4676,6 +4678,7 @@ func (s *Server) allowedPathForRunner(path string, runnerID string) (string, err
 	// 回退到原有 allowedPath 逻辑
 	return s.allowedPath(path)
 }
+
 // gitBranch 返回给定目录当前所在的分支名。
 //
 // 用轻量 git symbolic-ref --short HEAD 取代全量 git status --porcelain=v2
@@ -4774,7 +4777,13 @@ func localizedHTTPErrorText(status int, err error) string {
 	case http.StatusInternalServerError:
 		fallback = "服务内部错误，请稍后重试。"
 	}
-	return localizedErrorText(err, fallback)
+	text := localizedErrorText(err, fallback)
+	// localizedErrorText 对管道关闭类错误返回空（供读循环跳过 stream.error）。
+	// HTTP 错误响应始终需要一条可读文案，这里回退到 fallback。
+	if text == "" {
+		return fallback
+	}
+	return text
 }
 
 func localizedErrorText(err error, fallback string) string {
@@ -4792,6 +4801,7 @@ func localizedErrorText(err error, fallback string) string {
 
 	translations := map[string]string{
 		"project not found":      "项目不存在或已被删除。",
+		"project worktree is not clean": "项目工作区存在未提交或未跟踪的更改。请提交、暂存或清理这些更改后重试任务编排。",
 		"conversation not found": "会话不存在或已被删除。",
 		"run not found":          "任务运行记录不存在。",
 		"invalid JSON request":   "请求内容不是有效的 JSON。",
@@ -4818,6 +4828,14 @@ func localizedErrorText(err error, fallback string) string {
 	}
 	if errors.Is(err, context.Canceled) {
 		return "操作已取消。"
+	}
+	// 进程被停止/强杀时，stdout/stderr 管道被关闭，bufio.Scanner 会拿到
+	// os.ErrClosed（"read |0: file already closed"）。这是正常停止，不是流
+	// 错误——返回空让读循环据此跳过 stream.error 上报，避免在对话历史里
+	// 留下"流错误 / file already closed"。strings.Contains 兜底是因为
+	// bufio.Scanner 包装后 errors.Is 不一定能 unwrap 到 os.ErrClosed。
+	if errors.Is(err, os.ErrClosed) || strings.Contains(message, "file already closed") {
+		return ""
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "操作超时，请稍后重试。"

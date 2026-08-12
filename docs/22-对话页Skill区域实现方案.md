@@ -105,8 +105,8 @@ export type Skill = { name: string; description: string; agent: SkillAgent; env:
 - 新增 `SkillTagIcon`（三组图标中的第三组）。
 
 ### 6.3 `apps/web/src/conversation.css`
-- `.skill-tags .quick-tag-heading`（紫色系）区分于绿色提示词 / 橙色命令。
-- `.skill-tag`（flex 两端对齐：名称 + 来源徽标）、`.skill-source.user|project|plugin` 三种徽标配色、`.skill-empty`/`.skill-loading`。
+- `.skill-tags .quick-tag-heading`（绿青色系 `#1f7a6b`）区分于绿色提示词 / 橙色命令。
+- `.skill-tag`（flex 两端对齐：名称 + 来源徽标）、`.skill-source-chip.user|project|plugin` 三种徽标配色、`.skill-empty`/`.skill-loading`。
 
 ## 7. 关键风险与取舍
 - **SSH 远端**是复杂度主要来源：用一条 `find+cat` 命令 + 本机解析，省往返；需处理 marker 分隔与路径注入，解析失败静默降级为空。

@@ -119,6 +119,55 @@ func wslEncodeArg(arg string) string {
 	return "$(echo " + encoded + " | base64 -d)"
 }
 
+// wslInnerToken 把单个参数编码为 WSL sh 脚本体内可安全插入的"双引号包裹的 base64 命令
+// 替换"token：`"$(echo <b64> | base64 -d)"`。与 wslEncodeArg 同源，但外层是双引号——
+// wslNativeCommand 里脚本体经外层 base64 解码为字面文本后被 sh 逐字解析，双引号保证命令
+// 替换结果不被字段切分，参数（尤其含空格/引号的 prompt）保持为单个 argv。
+func wslInnerToken(arg string) string {
+	encoded := base64.StdEncoding.EncodeToString([]byte(arg))
+	return `"$(echo ` + encoded + ` | base64 -d)"`
+}
+
+// wslNativeCommand 在 WSL 内经一条自包含 shell 脚本启动原生 CLI（codex / claude）。
+//
+// 形态为 `wsl.exe -d <distro> -- sh -c <base64脚本>`：`--` 让默认 shell（zsh）重展开
+// 那一个 base64 token（命令替换还原出脚本；不能用 `-e`——它会按空格把 -c 的实参在进 sh
+// 前拆开、引号丢失，实测 `export: bad variable name`）。脚本体为
+// `export PATH=...; cd "<workdir>"; exec <cli> <args>`：
+//   - wslPathPrefix 前置用户原生 npm bin 目录，确保 codex 解析到 WSL 原生二进制，
+//     而非 WSL PATH 混入的 Windows 挂载 npm shim（其在 Linux 平台缺平台可选二进制、
+//     一跑即崩）；
+//   - 工作目录在脚本内用 cd 显式设置，绕开 `--cd <linux绝对路径>` 在部分 WSL 版本上
+//     报 Wsl/ERROR_PATH_NOT_FOUND 的问题；
+//   - 每个参数经 wslInnerToken 双引号包裹的 base64 编码，命令替换不被字段切分。
+func (r *wslAgentRunner) wslNativeCommand(ctx context.Context, cli string, args []string, env []string, linuxWorkDir string) *exec.Cmd {
+	tokens := make([]string, 0, len(args))
+	for _, a := range args {
+		tokens = append(tokens, wslInnerToken(a))
+	}
+	script := wslPathPrefix()
+	if linuxWorkDir != "" {
+		script += "; cd " + wslInnerToken(linuxWorkDir)
+	}
+	asm := strings.Join(tokens, " ")
+	script += "; exec " + cli
+	if asm != "" {
+		script += " " + asm
+	}
+	cmdEnv, wslenv := wslBuildEnv(env)
+	if wslenv != "" {
+		cmdEnv = append(cmdEnv, "WSLENV="+wslenv)
+	}
+	// 用 `--` 形式（与 wslClaudeCommand 同）而非 `-e`：wsl.exe -e 会按空格把 -c 的
+	// 参数在进 sh 之前就被拆开、引号丢失（实测 `export: bad variable name`），而 `--`
+	// 交给默认 shell（zsh）重展开，base64 token 经命令替换无损还原为脚本。整条脚本作为
+	// 一个 base64 token 传给 sh -c，PATH 前缀与 cd 在脚本内生效。
+	cmd := exec.CommandContext(ctx, "wsl.exe", "-d", r.distro, "--", "sh", "-c", wslEncodeArg(script))
+	cmd.Env = cmdEnv
+	configureProcessGroup(cmd)
+	return cmd
+}
+
 // wslAgentRun 执行 Claude 或 Codex 的一次性会话（非流式 CLI Run）。
 func wslAgentRun(ctx context.Context, r *wslAgentRunner, request AgentRunRequest, sink AgentRunSink) error {
 	linuxWorkDir := r.wslLinuxWorkDir(request.ProjectPath)
@@ -227,17 +276,7 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy, request.Prompt)
 	}
 
-	cmdEnv, wslenv := wslBuildEnv(environment)
-	if wslenv != "" {
-		cmdEnv = append(cmdEnv, "WSLENV="+wslenv)
-	}
-	wslArgs := []string{"-d", r.distro, "--cd", linuxWorkDir, "--", r.codex.config.CodexPath}
-	for _, a := range args {
-		wslArgs = append(wslArgs, wslEncodeArg(a))
-	}
-	cmd := exec.CommandContext(ctx, "wsl.exe", wslArgs...)
-	cmd.Env = cmdEnv
-	configureProcessGroup(cmd)
+	cmd := r.wslNativeCommand(ctx, r.codex.config.CodexPath, args, environment, linuxWorkDir)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -41,6 +41,10 @@ button:disabled { cursor: not-allowed; }
 }
 .app-tooltip[data-side="top"]::after { bottom: -5px; }
 .app-tooltip[data-side="bottom"]::after { top: -5px; transform: translateX(-50%) rotate(225deg); }
+/* 结构化悬浮卡片：标题(技能名等) + 描述，标题加粗、描述常规。 */
+.app-tooltip[data-structured="true"] { font-weight: 400; white-space: normal; display: flex; flex-direction: column; gap: 3px; }
+.app-tooltip-title { font-weight: 700; }
+.app-tooltip-desc { font-weight: 400; color: #4d6b60; }
 @media (prefers-reduced-motion: reduce) { .app-tooltip { transition: none; } }
 .app-shell { min-height: 100vh; background: radial-gradient(circle at 90% 0%, #e5f4ea 0, transparent 26%), #f3f8f4; }
 .app-shell.project-open { background: #f3f4f8; }
@@ -90,8 +94,10 @@ button:disabled { cursor: not-allowed; }
 .project-state.ready i { background: #43a88f; }.project-state.running i { background: #2c7567; box-shadow: 0 0 0 4px #cbeadd; }.project-state.offline i { background: #a06f16; }
 .env-tag { display: grid; width: 26px; height: 26px; flex: none; place-items: center; border: 1px solid #b8d8ca; border-radius: 6px; padding: 0; color: #277566; background: #eaf7ef; line-height: 1; }
 .env-tag.windows { border-color: #b8d8ca; color: #277566; background: #eaf7ef; }
+.env-tag.wsl { border-color: #b8d8ca; color: #277566; background: #eaf7ef; }
 .env-tag-icon { width: 15px; height: 15px; }
 .env-tag-icon.windows { fill: currentColor; }
+.env-tag-icon.wsl { fill: currentColor; }
 .env-tag-icon.remote { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
 .project-card-title { align-self: center; position: relative; z-index: 1; min-width: 0; }
 .project-card-title h2 { margin: 0; overflow: hidden; color: #202a43; text-overflow: ellipsis; white-space: nowrap; font-size: 20px; }

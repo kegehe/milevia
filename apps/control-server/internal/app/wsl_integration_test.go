@@ -127,3 +127,31 @@ func TestWSLReadyCacheTTL(t *testing.T) {
 		t.Fatalf("expired call did not re-probe/refresh cache timestamp: at=%v", atExpired)
 	}
 }
+
+// TestWSLCodexNativeResolution 回归：wsl-local 项目的 codex 应经 wslNativeCommand 在 WSL 内
+// 解析到原生二进制（$HOME/.npm-global/bin），而非 Windows 挂载 npm shim（后者在 Linux 平台
+// 缺 @openai/codex-linux-x64、一跑即抛 "Missing optional dependency"）。真实 WSL 内执行
+// `codex --version`，命中原生则输出 "codex-cli <ver>"，命中 shim 则报 Missing。
+func TestWSLCodexNativeResolution(t *testing.T) {
+	distro, err := detectDefaultWSLDistro(context.Background())
+	if err != nil {
+		t.Skipf("no WSL, skip: %v", err)
+	}
+	home, err := detectWSLHome(context.Background(), distro)
+	if err != nil {
+		t.Skipf("no WSL home, skip: %v", err)
+	}
+	runner := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, distro)
+
+	cmd := runner.wslNativeCommand(context.Background(), "codex", []string{"--version"}, nil, home)
+	out, err := cmd.CombinedOutput()
+	text := strings.ReplaceAll(string(out), "\x00", "") // 剥 WSL NAT 公告的 NUL
+	t.Logf("codex --version (wsl) err=%v out=%q", err, text)
+	if strings.Contains(text, "Missing optional dependency") {
+		// Windows shared by Windows shim（PATH 里 /mnt/c 先于原生目录）。
+		t.Fatalf("codex in WSL still resolves to Windows npm shim: %s", text)
+	}
+	if !strings.Contains(text, "codex-cli ") {
+		t.Fatalf("expected native codex version output, got: %q", text)
+	}
+}

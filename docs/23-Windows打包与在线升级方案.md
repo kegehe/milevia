@@ -48,7 +48,7 @@ tauri build --bundles nsis  ->  Milevia_0.2.0_x64-setup.exe
 
 | 决策项 | 选择 | 影响 |
 |---|---|---|
-| 托管位置 | **GitHub Releases** | 大文件走 Releases 免费下载；`latest.json` 用 GitHub Pages 静态托管（独立公开仓库，见 §5.5） |
+| 托管位置 | **GitHub Releases** | 大文件走 Releases 免费下载；`latest.json` 用 GitHub Pages 静态托管（主仓根目录，见 §5.5） |
 | 升级触发 | **检查自动、安装手动** | 启动时后台静默检查；发现新版只在界面提示，用户点"一键升级"才下载安装，不打断正在跑的任务 |
 | Windows 代码签名 | **暂不（免费方案）** | 用户装包会遇"未知发布者"提示，点"仍要运行"即可；与 Tauri 升级签名相互独立，升级安全仍受保护 |
 
@@ -85,7 +85,7 @@ pnpm tauri signer generate -w "$env:USERPROFILE\.tauri\milevia-updater.key" -p $
 **② 安装并注册 updater 插件**
 
 - Rust 依赖：`apps/desktop/src-tauri/Cargo.toml` 增加 `tauri-plugin-updater`。
-- JS 依赖：`apps/desktop` 增加 `@tauri-apps/plugin-updater`（前端 `import { check } from '@tauri-apps/plugin-updater'`）——注意它是 JS sidecar 包，需 `pnpm add`。
+- JS 依赖：`apps/web` 增加 `@tauri-apps/plugin-updater`（前端 `import { check } from '@tauri-apps/plugin-updater'`）——注意它是 JS sidecar 包，需 `pnpm add`。`@tauri-apps/api` 同样装在 `apps/web`（非 `apps/desktop`）。
 - 注册命令：`apps/desktop/src-tauri/src/main.rs` 的 `tauri::Builder` 增加 `.plugin(tauri_plugin_updater::Builder::new().build())`。
 - `apps/desktop/src-tauri/tauri.conf.json` 增加：
 
@@ -127,7 +127,7 @@ Tauri updater 依赖 NSIS installer 的静默更新时间（`/UPDATE`），而 W
 - `features/updater/AppVersionTag.tsx`：`getVersion()` 显示当前版本，挂在 Dashboard 主界面右上角。
 - `App.tsx` 挂 `<UpdateBanner />`（`isDesktop()` 守卫，浏览器环境不渲染）；`DashboardPage.tsx` 的 `.dashboard-actions` 挂 `<AppVersionTag />`。
 
-> 新增前端依赖：`@tauri-apps/api`（`invoke`/`listen`/`getVersion`），仅桌面端使用，浏览器环境 no-op。
+> 新增前端依赖：`@tauri-apps/api`（`invoke`/`listen`/`getVersion`），装在 `apps/web`（桌面 WebView 复用 web 前端），仅桌面端使用，浏览器环境 no-op。
 
 ### 5.3 发版流水线（每次发版重复）
 
@@ -174,10 +174,12 @@ pnpm release 0.2.0 "这次更新的说明"
 
 ### 5.5 latest.json 托管选择
 
+> **更新**：本节原推荐"独立公开仓库 `milevia-update`"（因当时主仓为 private）。主仓现已改为 **public**，实际采用**当前仓库根目录**方案，`latest.json` 直接放主仓根，GitHub Pages 指向 main 分支根目录，URL 为 `https://kegehe.github.io/milevia/latest.json`。详见 `docs/24-GitHub发布流程与Pages配置说明.md`。下方保留原两种方案对比作参考。
+
 `latest.json` 只有一个文件，两种放法：
 
-- **独立公开仓库（推荐，因当前仓库为 private）**：新建公开仓库 `milevia-update` 并开启 GitHub Pages，把 `latest.json` 放仓库根，得到稳定 URL `https://<user>.github.io/milevia-update/latest.json`。大文件 `setup.exe` 仍走 Releases，不占 Pages 配额。
-- **当前仓库根目录**：仅当仓库为 **public** 时 Pages 才可公开访问（private 仓库的 Pages 免费版对匿名不可达）。
+- **独立公开仓库（原推荐，因当前仓库曾为 private）**：新建公开仓库 `milevia-update` 并开启 GitHub Pages，把 `latest.json` 放仓库根，得到稳定 URL `https://<user>.github.io/milevia-update/latest.json`。大文件 `setup.exe` 仍走 Releases，不占 Pages 配额。
+- **当前仓库根目录（✅ 实际采用）**：主仓已 public，`latest.json` 放仓库根，Pages 源为 main 分支根目录，URL `https://kegehe.github.io/milevia/latest.json`。
 
 > Pages 源建议用「分支源 / 根目录静态推送」，避免引入每次发版的 GitHub Actions 构建步骤；`latest.json` 本身就是确定性的小文件，直接静态提交最简单。
 

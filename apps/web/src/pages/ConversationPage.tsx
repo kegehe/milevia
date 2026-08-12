@@ -2074,6 +2074,15 @@ export default function ConversationPage() {
       ? `请使用技能 <${skill.name}>：${skill.description}`
       : `请使用技能 <${skill.name}>`;
 
+  // 技能描述过长时截断，供悬浮卡片展示，避免过长的描述撑爆卡片。
+  // 描述与技能名相同(或为空)时返回空串，悬浮卡片只显示标题不重复。
+  const truncateSkillDescription = (description: string | undefined, name: string, max = 120) => {
+    const text = (description || "").trim();
+    if (!text || text === name) return "";
+    if (text.length <= max) return text;
+    return `${text.slice(0, max).trimEnd()}…`;
+  };
+
   const useSkill = (skill: Skill) => {
     if (!conversation || sending || clearing || stopping || Boolean(shortcutBusy) || skillsLoading) return;
     setComposerText(mergeSkillPrompt(skill));
@@ -2135,7 +2144,7 @@ export default function ConversationPage() {
                 </button>
                 {!collapsed && <ul className="quick-tag-list">{group.map((skill) => (
                   <li key={skill.name} className="quick-tag-item skill-item">
-                    <button type="button" className="skill-tag" disabled={!conversation || sending || clearing || stopping || Boolean(shortcutBusy)} title={`${skill.description}\n${meta.title}`} onClick={() => useSkill(skill)}>
+                    <button type="button" className="skill-tag" disabled={!conversation || sending || clearing || stopping || Boolean(shortcutBusy)} data-tooltip-title={skill.name} data-tooltip-desc={truncateSkillDescription(skill.description, skill.name)} onClick={() => useSkill(skill)}>
                       <span className="skill-tag-text">{skill.name}</span>
                     </button>
                   </li>
@@ -2150,12 +2159,12 @@ export default function ConversationPage() {
     {createPortal(<div className={`head-actions-menu${showMobileActions ? " mobile-open" : ""}`}>
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
         <div className="head-actions">
+          <button className="conversation-head-action secondary" type="button" disabled={sending} onClick={openConversationHistory}><HistoryIcon /><span>历史</span></button>
+          <button className="conversation-head-action secondary" type="button" onClick={openAiConfig}><ProjectConfigIcon /><span>AI 配置</span></button>
           <div className="permission-menu">
             <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} type="button" aria-haspopup="menu" aria-expanded={showPermissionMenu} disabled={!!run || clearing || stopping || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}><PermissionModeIcon /><span>{permissionLabel}</span></button>
             {showPermissionMenu && <div className="permission-popover" role="menu">{isCodex ? <><button className={conversation?.permissionMode === "read_only" ? "selected" : ""} onClick={() => void changePermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={conversation?.permissionMode === "workspace_write" ? "selected" : ""} onClick={() => void changePermissionMode("workspace_write")}><b>项目内执行</b><span>可在当前项目范围内读写和执行。</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>不受沙箱限制，命令直接执行</span></button></> : <><button className={conversation?.permissionMode === "approval_required" ? "selected" : ""} onClick={() => void changePermissionMode("approval_required")}><b>默认权限</b><span>命令执行前需要确认</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>命令直接执行</span></button></>}</div>}
           </div>
-          <button className="conversation-head-action secondary" type="button" disabled={sending} onClick={openConversationHistory}><HistoryIcon /><span>历史</span></button>
-          <button className="conversation-head-action secondary" type="button" onClick={openAiConfig}><ProjectConfigIcon /><span>AI 配置</span></button>
           <button className="conversation-head-action new-conversation-action primary" type="button" disabled={!!run || sending || stopping} onClick={openNewConversationParam}><NewConversationIcon /><span>新会话</span></button>
         </div>
       </div>, document.querySelector('.head-actions-slot') || document.body)}

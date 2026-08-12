@@ -371,7 +371,11 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink, projectPath string) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
+		// errorText 对停止时管道关闭（os.ErrClosed）返回空，据此跳过上报，
+		// 避免正常停止在对话历史里留下"流错误 / file already closed"。
+		if text := errorText(err); text != "" {
+			sink.Event("stream.error", mustJSON(map[string]string{"error": text}))
+		}
 	}
 }
 

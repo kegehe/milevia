@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -63,6 +64,7 @@ type GitTaskRecord struct {
 	WorktreePath   string `json:"worktreePath"`
 	TaskCommitSHA  string `json:"taskCommitSha,omitempty"`
 	IntegrationSHA string `json:"integrationSha,omitempty"`
+	ConversationID string `json:"conversationId,omitempty"`
 }
 
 func (s *Server) migrateOrchestration(ctx context.Context) error {
@@ -160,6 +162,9 @@ create index if not exists verification_runs_job on verification_runs(job_id,cre
 	if err := ensureColumn(ctx, s.db, "task_orchestration_jobs", "policy_snapshot", "text not null default '{}'"); err != nil {
 		return fmt.Errorf("add orchestration policy snapshot: %w", err)
 	}
+	if err := ensureColumn(ctx, s.db, "git_task_records", "conversation_id", "text not null default ''"); err != nil {
+		return fmt.Errorf("add git_task_records conversation_id: %w", err)
+	}
 	if err := s.migrateReleaseSnapshotBranchScope(ctx); err != nil {
 		return fmt.Errorf("migrate release snapshot branch scope: %w", err)
 	}
@@ -249,6 +254,76 @@ drop table release_snapshots_legacy;`)
 
 func defaultOrchestrationConfig(projectID string) OrchestrationConfig {
 	return OrchestrationConfig{ProjectID: projectID, MainBranch: "main", DevBranch: "dev", VerificationCommands: []string{}, MaxFixRounds: 3}
+}
+
+// createOrchestrationConversation creates a dedicated background conversation
+// (is_current=0) for an orchestrated task so the entire execution — prompt,
+// implementation Run, verification commands, and independent review — is
+// visible in one place without disturbing the user's current conversation. It
+// inherits the agent, runner and profile from the project's current
+// conversation so the task runs in the same environment the user works in.
+func (s *Server) createOrchestrationConversation(ctx context.Context, project Project, task Task) (string, error) {
+	var agentID, permissionMode, runnerID, profileRevisionID string
+	err := s.db.QueryRowContext(ctx, `select agent_id,permission_mode,agent_runtime_id,coalesce(agent_profile_revision_id,'') from conversations where project_id=? and is_current=true`, project.ID).Scan(&agentID, &permissionMode, &runnerID, &profileRevisionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No current conversation — fall back to the project's runner and a
+		// default Claude Code policy.
+		agentID = "claude-code"
+		permissionMode = "approval_required"
+		runnerID = project.Runner
+		profileRevisionID = ""
+	} else if err != nil {
+		return "", err
+	}
+	if runnerID == "" {
+		runnerID = project.Runner
+	}
+	now := time.Now().UTC()
+	sessionID := uuid.NewString()
+	conversationID := uuid.NewString()
+	title := "编排：" + task.Title
+	if len(title) > 80 {
+		title = title[:80]
+	}
+	_, err = s.db.ExecContext(ctx, `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		conversationID, project.ID, sessionID, agentID, sessionID, runnerID, profileRevisionID, permissionMode, "idle", permissionMode, title, now, false, false, 0, now)
+	if err != nil {
+		return "", fmt.Errorf("create orchestration conversation: %w", err)
+	}
+	return conversationID, nil
+}
+
+// orchestrationConversationID loads the conversation ID recorded for a job from
+// git_task_records. It returns "" when no conversation has been associated yet.
+func (s *Server) orchestrationConversationID(ctx context.Context, jobID string) (string, error) {
+	var conversationID string
+	err := s.db.QueryRowContext(ctx, `select conversation_id from git_task_records where job_id=?`, jobID).Scan(&conversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return conversationID, err
+}
+
+// postOrchestrationMessage writes an assistant message into the job's
+// orchestration conversation and broadcasts it so the user sees it live in the
+// conversation view. It is used to surface verification command output and
+// independent review results that would otherwise be invisible.
+func (s *Server) postOrchestrationMessage(ctx context.Context, job OrchestrationJob, content string) {
+	conversationID, err := s.orchestrationConversationID(ctx, job.ID)
+	if err != nil || conversationID == "" {
+		return
+	}
+	now := time.Now().UTC()
+	messageID := uuid.NewString()
+	if _, err := s.db.ExecContext(ctx, `insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values (?,?,?,?,?,?,?)`, messageID, conversationID, "", "assistant", content, "", now); err != nil {
+		log.Printf("post orchestration message for job %s: %v", job.ID, err)
+		return
+	}
+	if _, err := s.db.ExecContext(ctx, `update conversations set last_activity_at=? where id=?`, now, conversationID); err != nil {
+		log.Printf("update conversation activity for job %s: %v", job.ID, err)
+	}
+	m := Message{ID: messageID, ConversationID: conversationID, Role: "assistant", Content: content, CreatedAt: now}
+	s.appendEvent("", conversationID, "assistant.message", mustJSON(m))
 }
 
 func (s *Server) orchestrationConfig(ctx context.Context, projectID string) (OrchestrationConfig, error) {
@@ -983,6 +1058,14 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 	worktree := filepath.Join(filepath.Dir(project.Path), ".auto-worktrees", project.ID, job.ID)
 	if job.Status == orchestrationQueued {
 		now := time.Now().UTC()
+		// Create a dedicated background conversation for this task so the
+		// entire orchestration process — prompt, implementation, verification,
+		// and review — is visible in one place. The conversation is not the
+		// project's current one, so it does not disturb the user's view.
+		conversationID, cerr := s.createOrchestrationConversation(ctx, project, task)
+		if cerr != nil {
+			return cerr
+		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -995,7 +1078,7 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			}
 		}
 		if err == nil {
-			_, err = tx.ExecContext(ctx, `insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,created_at,updated_at) values (?,?,?,?,?,?) on conflict(job_id) do update set base_dev_sha=excluded.base_dev_sha,task_branch=excluded.task_branch,worktree_path=excluded.worktree_path,updated_at=excluded.updated_at`, job.ID, base, branch, worktree, now, now)
+			_, err = tx.ExecContext(ctx, `insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values (?,?,?,?,?,?,?) on conflict(job_id) do update set base_dev_sha=excluded.base_dev_sha,task_branch=excluded.task_branch,worktree_path=excluded.worktree_path,conversation_id=excluded.conversation_id,updated_at=excluded.updated_at`, job.ID, base, branch, worktree, conversationID, now, now)
 		}
 		if err == nil {
 			_, err = tx.ExecContext(ctx, `insert into task_execution_intents (id,job_id,phase,attempt,status,created_at,updated_at) values (?,?,?,?,?,?,?) on conflict(job_id,phase,attempt) do nothing`, uuid.NewString(), job.ID, "implementation", job.Attempt+1, "pending", now, now)

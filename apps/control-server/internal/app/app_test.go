@@ -5104,6 +5104,11 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 		t.Fatalf("workspace error = %q", workspace)
 	}
 
+	dirtyWorktree := errorText(errors.New("project worktree is not clean"))
+	if dirtyWorktree != "项目工作区存在未提交或未跟踪的更改。请提交、暂存或清理这些更改后重试任务编排。" {
+		t.Fatalf("dirty worktree error = %q", dirtyWorktree)
+	}
+
 	unknown := localizedHTTPErrorText(http.StatusInternalServerError, errors.New("database connection refused"))
 	if unknown != "服务内部错误，请稍后重试。：database connection refused" {
 		t.Fatalf("unknown error = %q", unknown)
@@ -5187,6 +5192,68 @@ func TestLocalizedErrorSuppressesInternalUpdateWraps(t *testing.T) {
 	// 纯中文错误仍原样展示。
 	if direct := localizedErrorText(errors.New("更新服务超时，请稍后再试。"), "fallback"); direct != "更新服务超时，请稍后再试。" {
 		t.Fatalf("pure Chinese error not shown directly: %q", direct)
+	}
+}
+
+// TestLocalizedErrorTextSilencesPipeClosed 验证：进程被停止/强杀后，stdout/stderr
+// 管道被关闭会让 bufio.Scanner 拿到 os.ErrClosed（"file already closed"）。这是正常
+// 停止，不是流错误——localizedErrorText 必须返回空字符串，让读循环据此跳过
+// stream.error 上报，避免在对话历史里留下"流错误 / file already closed"。
+func TestLocalizedErrorTextSilencesPipeClosed(t *testing.T) {
+	// 直接的 os.ErrClosed。
+	if text := localizedErrorText(os.ErrClosed, "fallback"); text != "" {
+		t.Fatalf("os.ErrClosed should be silenced, got %q", text)
+	}
+	// 被 fmt.Errorf("%w") 包装后仍能识别（readOutputLoop 的 "read SSH stdout: %w" 形态）。
+	wrapped := fmt.Errorf("read SSH stdout: %w", os.ErrClosed)
+	if text := localizedErrorText(wrapped, "fallback"); text != "" {
+		t.Fatalf("wrapped os.ErrClosed should be silenced, got %q", text)
+	}
+	// 仅凭错误文本 "file already closed" 也要识别（bufio.Scanner 可能丢失 unwrap 链）。
+	if text := localizedErrorText(errors.New("read |0: file already closed"), "fallback"); text != "" {
+		t.Fatalf("file already closed text should be silenced, got %q", text)
+	}
+	// errorText（读循环实际调用的出口）同样返回空。
+	if text := errorText(os.ErrClosed); text != "" {
+		t.Fatalf("errorText(os.ErrClosed) should be empty, got %q", text)
+	}
+}
+
+// TestLocalizedHTTPErrorTextFallsBackOnPipeClosed 验证 HTTP 错误响应不会因为
+// localizedErrorText 返回空而输出空 error——应回退到可读的中文 fallback。
+func TestLocalizedHTTPErrorTextFallsBackOnPipeClosed(t *testing.T) {
+	text := localizedHTTPErrorText(http.StatusInternalServerError, os.ErrClosed)
+	if text == "" || strings.Contains(text, "file already closed") {
+		t.Fatalf("HTTP error should fall back to readable text, got %q", text)
+	}
+}
+
+// TestFinishStreamingRunTreatsPipeClosedAsStopped 验证：SSH 路径停止时
+// readOutputLoop 会把 os.ErrClosed 作为 runErr 上报。即使 server 级 stopping
+// 标志因时序未置位，finishStreamingRun 也必须把 os.ErrClosed 归为 stopped
+// 而非 failed，避免停止被记成失败。
+func TestFinishStreamingRunTreatsPipeClosedAsStopped(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','running',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run','conversation','running',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	// 不注册 session，模拟 stopping 标志因时序未置位的边界。runErr 为 os.ErrClosed
+	//（SSH readOutputLoop 的 "read SSH stdout: %w" 形态）。
+	server.finishStreamingRun("run", "conversation", fmt.Errorf("read SSH stdout: %w", os.ErrClosed))
+
+	var status string
+	if err := server.db.QueryRow(`select status from runs where id='run'`).Scan(&status); err != nil {
+		t.Fatalf("read run status: %v", err)
+	}
+	if status != "stopped" {
+		t.Fatalf("os.ErrClosed should be recorded as stopped, got %q", status)
 	}
 }
 

@@ -3,6 +3,27 @@
 > 日期: 2026-07-22
 > 目标: 分析当前 WSL-only 项目加载机制，设计将本地 Windows 项目目录纳入平台的完整方案。
 
+> ## ⚠️ 本方案已过时，保留作历史记录
+>
+> 本文档描述的是 2026-07-22 阶段的方案：**复用 WSL Runner 访问 `/mnt/c/...`，不新建 Runner**。
+>
+> 实际实现已远超此方案，改为 **Windows 原生 Runner + WSL 混合模式**，详见：
+> - `docs/17-Windows桌面端最终架构与实施方案.md` — Windows 桌面端整体架构
+> - `docs/20-按项目环境分发的Agent Runner一次性实现方案.md` — 按环境分发的 `windows-local` Runner
+> - `docs/26-Windows到WSL跨界Agent Runner实现.md` — Windows 宿主跨 WSL 执行的 `wsl-local` Runner
+>
+> ### 与本方案的关键差异
+>
+> | 本方案（已过时） | 实际实现 |
+> | --- | --- |
+> | 复用 WSL Runner，不建新 Runner | 新增 `windows-local` Runner（`win_agent_runner.go`）和 `wslAgentRunner`（`wsl_agent_runner.go`） |
+> | Windows 目录经 `/mnt/c/...` 访问 | Windows 宿主下 wsl-local 项目路径走 **UNC**（`\\wsl$\...`），文件操作复用 `LocalFilesystem` 直读 UNC |
+> | 在 Project 新增 `environment` 字段 | 未新增字段，改用 `projects.runner` 字段（值 `wsl-local` / `windows-local` / `ssh-{id}`）区分环境 |
+> | 修改 `allowedPath()` 支持 `/mnt/` 多根 | 实际实现 `allowedPathForRunner()`，按 runnerID 从 `runnerRegistry` 的 `meta.Roots` 动态校验，并处理 WSL UNC 路径 |
+> | `listRunners()` 硬编码单 Runner | 实际从 `runnerRegistry.list()` 动态读取，返回每个 Runner 的 Claude/Codex 双工具状态 |
+>
+> 下文为原始方案内容，仅供历史参考。
+
 ## 1. 现状分析
 
 ### 1.1 当前项目加载链路

@@ -191,6 +191,8 @@ Windows 打包前必须完成 SQLite 发布 POC，再决定驱动；不得在未
 
 ### 5.5 命令解释器与迁移语义
 
+> **实现说明**：本节原设计的 `shell` 字段（`cmd` / `powershell` / `wsl-shell`）**未落地**。实际采用更简单的 `execution_target` 方案（`auto` / `wsl` / `windows`，见 `docs/12` §3.2.1）。`project_runner.go` 的 `newProjectRunCommand()` 按 `RunExecutionTarget` 分派命令解释器：`windows` 目标在 Windows 上用 `cmd.exe /d /s /c`；`wsl` 目标用 `sh -c`；WSL 服务端跑 windows 目标用 PowerShell 桥接。下方保留原 `shell` 设计作参考。
+
 项目运行配置新增 `shell` 字段，取值为 `cmd`、`powershell` 或 `wsl-shell`，由 Runner 校验可用值：
 
 - `windows-local` 新项目默认 `cmd`，可显式选择 PowerShell；`envVars` 由后端以进程环境注入，不依赖 Shell 语法。

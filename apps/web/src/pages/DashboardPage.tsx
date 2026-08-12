@@ -11,6 +11,7 @@ import type { RunStatus } from "../features/run/run-model";
 import { statusColors, statusLabels } from "../features/run/run-model";
 import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order";
 import { AppVersionTag } from "../features/updater/AppVersionTag";
+import { isDesktop } from "../lib/runtime";
 
 function WindowsEnvironmentIcon() {
   return <svg className="env-tag-icon windows" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4v7H3v-5.5ZM13 3.5 21 2v9h-8v-7.5ZM3 13h7.5v7L3 18.5V13ZM13 13h8v9l-8-1.5V13Z" /></svg>;
@@ -18,6 +19,10 @@ function WindowsEnvironmentIcon() {
 
 function RemoteServerIcon() {
   return <svg className="env-tag-icon remote" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="6" rx="1.2" /><rect x="4" y="14" width="16" height="6" rx="1.2" /><path d="M8 7h.01M8 17h.01M12 7h5M12 17h5" /></svg>;
+}
+
+function WslEnvironmentIcon() {
+  return <svg className="env-tag-icon wsl" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 3v9.6L3.5 10 11 3ZM21 3v9.6L13.5 10 21 3ZM11 12.3V21L3.5 14.5 11 12.3ZM21 12.3V21l-7.5-6.5L21 12.3Z" /></svg>;
 }
 
 function SshConnectionIcon() {
@@ -130,7 +135,6 @@ export default function DashboardPage() {
     <header className="dashboard-bar">
       <a className="brand" href="/"><img className="brand-mark" src="/milevia-mark.svg" width="42" height="42" alt="" /><span className="brand-word"><strong>Mile</strong><em>via</em></span></a>
       <div className="dashboard-actions">
-        <AppVersionTag />
         <NotificationCenter />
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
@@ -158,6 +162,7 @@ export default function DashboardPage() {
         })()
           : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
     </section>
+    {isDesktop() && <div className="dashboard-version"><AppVersionTag /></div>}
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
   </main>;
 }
@@ -194,6 +199,7 @@ function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, 
         {runStatusLabel && <span className={`project-run-state run-state-${runStatus}`} title={`开发进程: ${statusLabels[runStatus]}`}><i style={{ background: statusColors[runStatus] }}></i>{runStatusLabel}</span>}
         {project.environment === "windows" && <span className="env-tag windows" title="Windows 项目" role="img" aria-label="Windows 项目"><WindowsEnvironmentIcon /></span>}
         {project.environment === "remote-linux" && <span className="env-tag remote" title="远程服务器" role="img" aria-label="远程服务器"><RemoteServerIcon /></span>}
+        {project.environment === "wsl" && <span className="env-tag wsl" title="WSL 项目" role="img" aria-label="WSL 项目"><WslEnvironmentIcon /></span>}
         <button className="project-card-delete" type="button" draggable={false} title="删除项目" onClick={(event) => { event.stopPropagation(); onDelete(); }} aria-label={`删除项目 ${project.name}`}>×</button>
       </span>
     </div>

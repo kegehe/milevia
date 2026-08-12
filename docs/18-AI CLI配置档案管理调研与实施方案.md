@@ -16,7 +16,9 @@
 
 选择 Profile 决定模型、版本与（受管档案）端点/密钥；认证由目标机器上已经登录的 CLI 或受管密钥处理。未选择 Profile，或把选择清空，都会回退到原有 CLI 配置。这是默认行为，不需要额外开关。项目可设置默认 Profile，新会话自动套用。
 
-## 2. 为什么不开放 API Key Profile
+## 2. 为什么不开放 API Key Profile（历史背景与当前边界）
+
+> **更新**：本节标题原为"不开放"的理由。当前 `api_key` 模式**已开放**（见 §4、§5 受管凭据）。本节保留的是早期不开放的安全分析，作为当前受管 Key 隔离边界的设计依据。
 
 此前的 Claude 方案曾将真实 Key 留在控制服务内存中，通过 loopback 凭据代理和临时 `apiKeyHelper` 文件向 Claude CLI 发放短期 capability。该方案不满足隔离要求：模型可执行的 Bash 与 CLI 同用户，能够通过进程列表或 `/proc` 找到 helper 路径、读取 capability，并调用本地代理。该 capability 等价于 API Key 的授权能力。
 
@@ -65,8 +67,10 @@ POST   /api/runners/{runnerID}/agent-profiles
 PATCH  /api/agent-profiles/{profileID}
 POST   /api/agent-profiles/{profileID}/validate
 POST   /api/agent-profiles/{profileID}/disable
+POST   /api/agent-profiles/{profileID}/enable          # 启用档案（与 disable 对称）
 POST   /api/agent-profile-revisions/{revisionID}/revoke
 PATCH  /api/projects/{projectID}/agent-profile
+GET    /api/projects/{projectID}/agent-config          # 聚合接口：项目级 AI 配置视图（见 docs/21）
 ```
 
 创建或编辑接受名称、模型、`authMode`（`cli_managed` 或 `api_key`）、`baseUrl`（api_key 时可选端点）与 `apiKey`（仅 api_key 时）。`keychain` / `env_ref` 模式与 `secretRef` 仍返回 400。页面提供“CLI 登录 / 受管 API Key”选择，以及“设为项目默认档案”一键应用。受管 Key 写入前端后不会在响应中回显。
