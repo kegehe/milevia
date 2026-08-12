@@ -143,12 +143,12 @@ type RunConfig struct {
 
 // RunStatusResponse 是 GET /status 的响应。
 type RunStatusResponse struct {
-	Status          RunStatus        `json:"status"`
+	Status          RunStatus          `json:"status"`
 	ExecutionTarget RunExecutionTarget `json:"executionTarget"`
-	StartedAt       *time.Time       `json:"startedAt"`
-	PID             *int             `json:"pid"`
-	ExitCode        *int             `json:"exitCode"`
-	RecentLogs      []LogEntry       `json:"recentLogs"`
+	StartedAt       *time.Time         `json:"startedAt"`
+	PID             *int               `json:"pid"`
+	ExitCode        *int               `json:"exitCode"`
+	RecentLogs      []LogEntry         `json:"recentLogs"`
 }
 
 type Server struct {
@@ -206,6 +206,8 @@ type Server struct {
 	notificationMu         sync.Mutex
 	orchestrationMu        sync.Mutex
 	orchestrationActive    map[string]bool
+	orchestrationCancels   map[string]context.CancelFunc
+	orchestrationDone      map[string]chan struct{}
 	orchestrationWG        sync.WaitGroup
 	orchestrationOwner     string
 	insightMu              sync.Mutex
@@ -522,7 +524,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}}
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return s.allowedOrigin(r.Header.Get("Origin")) }
 	if config.SessionToken != "" {
 		s.upgrader.Subprotocols = []string{s.websocketSessionProtocol()}
@@ -794,9 +796,9 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
 	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
 	r.Get("/api/projects/{projectID}/orchestration", s.listOrchestrationJobs)
-	r.Get("/api/projects/{projectID}/orchestration/releases", s.listReleaseSnapshots)
-	r.Post("/api/projects/{projectID}/orchestration/release", s.createReleaseSnapshot)
-	r.Post("/api/projects/{projectID}/orchestration/releases/{releaseID}/confirm-main", s.confirmReleaseMergedToMain)
+	r.Get("/api/projects/{projectID}/orchestration/batches", s.listOrchestrationBatches)
+	r.Post("/api/projects/{projectID}/orchestration/batches", s.createOrchestrationBatch)
+	r.Post("/api/projects/{projectID}/orchestration/batches/{batchID}/tasks", s.addTasksToOrchestrationBatch)
 	r.Post("/api/projects/{projectID}/orchestration/enqueue-batch", s.enqueueBatchForOrchestration)
 	r.Patch("/api/projects/{projectID}/orchestration/order", s.reorderOrchestrationJobs)
 	r.Get("/api/tasks/{taskID}", s.getTask)
@@ -809,8 +811,12 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/tasks/{taskID}/events", s.listTaskEvents)
 	r.Post("/api/tasks/{taskID}/dispatch", s.dispatchTask)
 	r.Post("/api/tasks/{taskID}/orchestration/enqueue", s.enqueueTaskForOrchestration)
+	r.Post("/api/tasks/{taskID}/orchestration/merge-main", s.mergeTaskBranchToMain)
 	r.Post("/api/tasks/{taskID}/orchestration/pause", s.pauseOrchestrationJob)
+	r.Post("/api/tasks/{taskID}/orchestration/stop", s.stopOrchestrationJob)
 	r.Post("/api/tasks/{taskID}/orchestration/resume", s.resumeOrchestrationJob)
+	r.Post("/api/tasks/{taskID}/orchestration/decision", s.submitOrchestrationDecision)
+	r.Post("/api/tasks/{taskID}/orchestration/cleanup", s.cleanupOrchestrationResources)
 	r.Delete("/api/tasks/{taskID}/orchestration/dequeue", s.dequeueTaskFromOrchestration)
 	r.Post("/api/tasks/{taskID}/review", s.reviewTask)
 	r.Post("/api/tasks/{taskID}/reopen", s.reopenTask)
@@ -841,6 +847,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/ws/conversations/{conversationID}", s.subscribe)
 	r.Route("/api/projects/{projectID}/run", func(r chi.Router) {
 		r.Get("/config", s.getRunConfig)
+		r.Get("/worktrees", s.listProjectRunWorktrees)
 		r.Put("/config", s.updateRunConfig)
 		r.Post("/start", s.startProjectRun)
 		r.Post("/stop", s.stopProjectRun)
@@ -2523,6 +2530,10 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
+	if s.isOrchestrationConversation(r.Context(), conversationID) {
+		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations are read-only"))
+		return
+	}
 	s.projectLifecycleMu.Lock()
 	locked := true
 	defer func() {
@@ -2826,6 +2837,10 @@ func (s *Server) listProjectInputHistory(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
+	if s.isOrchestrationConversation(r.Context(), conversationID) {
+		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations cannot be activated"))
+		return
+	}
 	// Activation changes the same current-conversation pointer as clear.
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
@@ -2880,6 +2895,10 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 		PermissionMode string `json:"permissionMode"`
 	}
 	if !decode(w, r, &input) {
+		return
+	}
+	if s.isOrchestrationConversation(r.Context(), chi.URLParam(r, "conversationID")) {
+		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations are read-only"))
 		return
 	}
 	// Keep permission changes ordered with conversation clearing and activation.
@@ -3507,6 +3526,9 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 	if content == "" {
 		return Message{}, "", nil, http.StatusBadRequest, errors.New("message is required")
 	}
+	if s.isOrchestrationConversation(ctx, conversationID) && (record == nil || !record.Orchestrated) {
+		return Message{}, "", nil, http.StatusConflict, errors.New("automatic orchestration conversations are read-only")
+	}
 
 	// Fast-path admission checks before hitting the database.
 	s.mu.Lock()
@@ -3757,6 +3779,12 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content strin
 		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectPath, content)
 	}()
 	return m, runID, record, http.StatusAccepted, nil
+}
+
+func (s *Server) isOrchestrationConversation(ctx context.Context, conversationID string) bool {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `select exists(select 1 from git_task_records where conversation_id=?)`, conversationID).Scan(&exists)
+	return err == nil && exists
 }
 
 func boolToInt(value bool) int {
@@ -4176,6 +4204,11 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 }
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "runID")
+	var conversationID string
+	if err := s.db.QueryRowContext(r.Context(), `select conversation_id from runs where id=?`, id).Scan(&conversationID); err == nil && s.isOrchestrationConversation(r.Context(), conversationID) {
+		writeError(w, http.StatusConflict, errors.New("stop automatic orchestration from the orchestration controls"))
+		return
+	}
 	force := r.URL.Query().Get("force") == "true"
 	status, code, err := s.stopRunByID(r.Context(), id, force)
 	if err != nil {
@@ -4486,8 +4519,15 @@ func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) 
 		log.Printf("persist %s event for run %s: %v", typ, runID, err)
 		return
 	}
-	data, _ := json.Marshal(e)
-	s.enqueueConversationEvent(conversationID, data)
+	s.broadcastConversationEvent(e)
+}
+
+// broadcastConversationEvent delivers an already constructed event without
+// persisting it. Most events belong to a Run and use appendEvent; orchestration
+// status messages deliberately have no Run, while events.run_id is required.
+func (s *Server) broadcastConversationEvent(event Event) {
+	data, _ := json.Marshal(event)
+	s.enqueueConversationEvent(event.ConversationID, data)
 }
 
 // enqueueConversationEvent keeps agent output independent from WebSocket I/O.
@@ -4801,13 +4841,20 @@ func localizedErrorText(err error, fallback string) string {
 	if strings.Contains(message, `exec: "sh": executable file not found`) {
 		return "自动编排无法执行验证命令：系统找不到 sh。请升级服务端到支持 Windows 命令解释器的版本后，恢复队列并重试。"
 	}
+	if strings.Contains(message, "'ls' is not recognized as an internal or external command") || strings.Contains(message, "'ls' 不是内部或外部命令") {
+		return "自动编排验证命令 ls 在当前 Windows 命令解释器中不可用。请重启应用以加载 PowerShell 验证支持后，再恢复队列重试。"
+	}
 
 	translations := map[string]string{
-		"project not found":      "项目不存在或已被删除。",
+		"project not found":             "项目不存在或已被删除。",
 		"project worktree is not clean": "项目工作区存在未提交或未跟踪的更改。请提交、暂存或清理这些更改后重试任务编排。",
-		"conversation not found": "会话不存在或已被删除。",
-		"run not found":          "任务运行记录不存在。",
-		"invalid JSON request":   "请求内容不是有效的 JSON。",
+		"automatic orchestration branch already exists for this task":                "该任务当天的自动编排分支已存在。请确认是否为上次任务遗留的分支，处理后再重试。",
+		"task branch is not ready to confirm":                                        "该任务分支尚未完成验证，暂时不能确认合并。",
+		"main does not contain this task branch commit":                              "main 尚未包含该任务分支的提交。请先合并分支，再确认完成。",
+		"task branch status changed before confirmation":                             "任务分支状态已变化，请刷新后重试确认。",
+		"conversation not found":                                                     "会话不存在或已被删除。",
+		"run not found":                                                              "任务运行记录不存在。",
+		"invalid JSON request":                                                       "请求内容不是有效的 JSON。",
 		"activate this conversation before sending a message":                        "请先激活该会话，再发送消息。",
 		"Codex is currently available only on the local WSL runner":                  "Codex 目前仅支持本地 WSL 运行器。",
 		"远程服务器上 Codex CLI 不可用或未登录":                                                   "远程服务器上 Codex CLI 不可用或未登录。",
@@ -5322,6 +5369,10 @@ func validateProjectRunConfig(project Project, cfg RunConfig) error {
 	if err := validateRunEnvironmentVariables(cfg.EnvVars); err != nil {
 		return err
 	}
+	return validateProjectRunWorkDir(project, cfg)
+}
+
+func validateProjectRunWorkDir(project Project, cfg RunConfig) error {
 	// SSH 远程项目的执行环境与工作目录在远端解析，跳过本地路径校验。
 	if !isLocalRunnerID(project.Runner) {
 		return nil
@@ -5329,8 +5380,40 @@ func validateProjectRunConfig(project Project, cfg RunConfig) error {
 	if _, err := resolveRunExecutionTarget(project.Path, cfg.ExecutionTarget); err != nil {
 		return err
 	}
+	if filepath.IsAbs(cfg.WorkDir) {
+		return errors.New("工作目录必须是项目内相对路径")
+	}
 	_, err := resolveProjectRunWorkDir(project.Path, cfg.WorkDir)
 	return err
+}
+
+func (s *Server) validateProjectRunConfigWithWorktree(ctx context.Context, project Project, cfg RunConfig) error {
+	if cfg.Command == "" {
+		return errors.New("请先配置启动命令")
+	}
+	if err := validateRunEnvironmentVariables(cfg.EnvVars); err != nil {
+		return err
+	}
+	return s.validateProjectRunWorkDirWithWorktree(ctx, project, cfg)
+}
+
+func (s *Server) validateProjectRunWorkDirWithWorktree(ctx context.Context, project Project, cfg RunConfig) error {
+	if !isLocalRunnerID(project.Runner) {
+		return nil
+	}
+	if filepath.IsAbs(cfg.WorkDir) {
+		var exists bool
+		err := s.db.QueryRowContext(ctx, `select exists(select 1 from task_orchestration_jobs job join git_task_records record on record.job_id=job.id where job.project_id=? and record.worktree_path=? and record.resources_cleaned_at is null)`, project.ID, cfg.WorkDir).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.New("工作目录必须是该项目可用的自动编排 worktree")
+		}
+		_, err = resolveProjectRunWorkDir(project.Path, cfg.WorkDir)
+		return err
+	}
+	return validateProjectRunWorkDir(project, cfg)
 }
 
 func validateRunEnvironmentVariables(envVars map[string]string) error {
@@ -5404,6 +5487,46 @@ func (s *Server) getRunConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, c)
 }
 
+// listProjectRunWorktrees exposes only orchestration worktrees that belong to
+// this project. The launcher still validates the chosen relative path, but the
+// selector prevents users from needing to discover internal worktree paths.
+func (s *Server) listProjectRunWorktrees(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !isLocalRunnerID(project.Runner) {
+		writeJSON(w, http.StatusOK, []OrchestrationWorktree{})
+		return
+	}
+	rows, err := s.db.QueryContext(r.Context(), `select job.task_id,job.id,record.task_branch,record.worktree_path,job.status from task_orchestration_jobs job join git_task_records record on record.job_id=job.id where job.project_id=? and record.worktree_path<>'' and record.resources_cleaned_at is null order by job.queue_position`, projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+	items := []OrchestrationWorktree{}
+	for rows.Next() {
+		var item OrchestrationWorktree
+		if err := rows.Scan(&item.TaskID, &item.JobID, &item.TaskBranch, &item.WorktreePath, &item.Status); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
 func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 	project, err := s.getProjectByID(r.Context(), projectID)
@@ -5428,7 +5551,7 @@ func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if _, err := resolveProjectRunWorkDir(project.Path, c.WorkDir); err != nil {
+		if err := s.validateProjectRunWorkDirWithWorktree(r.Context(), project, c); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -5487,7 +5610,7 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		cfg.EnvVars = map[string]string{}
 	}
 
-	if err := validateProjectRunConfig(project, cfg); err != nil {
+	if err := s.validateProjectRunConfigWithWorktree(r.Context(), project, cfg); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -5555,7 +5678,7 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 	if cfg.EnvVars == nil {
 		cfg.EnvVars = map[string]string{}
 	}
-	if err := validateProjectRunConfig(project, cfg); err != nil {
+	if err := s.validateProjectRunConfigWithWorktree(r.Context(), project, cfg); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}

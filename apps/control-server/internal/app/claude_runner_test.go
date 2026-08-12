@@ -33,6 +33,32 @@ func (sink *claudeOutputTestSink) AssistantText(text, _ string) {
 func (*claudeOutputTestSink) SessionIdentified(string) {}
 func (*claudeOutputTestSink) SessionInitialized()      {}
 
+func TestIndependentReviewClaudeRequestUsesExecutableReadOnlyMode(t *testing.T) {
+	tools := orchestrationReviewReadOnlyTools("claude-code")
+	if len(tools) == 0 {
+		t.Fatal("Claude independent review must restrict tools")
+	}
+	runner := &claudeCLIRunner{config: Config{PermissionMode: "acceptEdits"}}
+	args, err := runner.args(AgentRunRequest{
+		SessionID:      "review-session",
+		Prompt:         "review prompt",
+		PermissionMode: "read_only",
+		SkipSessionID:  true,
+		ReadOnlyTools:  tools,
+		PromptViaStdin: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--permission-mode default") || !strings.Contains(joined, "--allowedTools") {
+		t.Fatalf("independent review args do not use executable read-only mode: %q", args)
+	}
+	if strings.Contains(joined, "--permission-mode plan") || strings.Contains(joined, "--session-id") || strings.Contains(joined, "review-session") || strings.Contains(joined, "review prompt") {
+		t.Fatalf("independent review args still use waiting/session mode: %q", args)
+	}
+}
+
 func TestClaudeOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
 	const secret = "sk-claude-test-secret-value-12345"
 	runner := &claudeCLIRunner{}
@@ -642,7 +668,9 @@ func TestCodexReadOutputSilencesPipeClosed(t *testing.T) {
 	sink := &claudeOutputTestSink{}
 	readCodexJSONL(errClosedReader{}, sink, "")
 	for _, e := range sink.events {
-		var errEv struct{ Error string `json:"error"` }
+		var errEv struct {
+			Error string `json:"error"`
+		}
 		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
 			t.Fatalf("readCodexJSONL emitted stream.error on pipe close: %s", string(e))
 		}

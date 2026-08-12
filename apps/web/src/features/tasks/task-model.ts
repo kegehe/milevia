@@ -6,6 +6,8 @@ export type TaskFilter = "active" | "todo" | "running" | "awaiting_review";
 export type Dependency = { taskId: string; title: string; status: TaskStatus };
 export type Blocker = Dependency;
 export type TaskRun = { id: string; runId: string; sequence: number; status: string; createdAt: string; finishedAt?: string; failureReason: string };
+export type VerificationRun = { id: string; phase: "baseline" | "task" | "review" | string; command: string; reviewedSha?: string; status: "passed" | "failed" | string; exitCode: number; output?: string; createdAt: string; completedAt?: string };
+export type TaskEvent = { id: string; taskId: string; taskRunId?: string; type: string; payload: unknown; createdAt: string };
 export type Task = {
   id: string;
   title: string;
@@ -24,7 +26,7 @@ export type Task = {
   createdAt: string;
   updatedAt: string;
 };
-export type TaskDetail = Task & { promptPreview: string; canDispatch: boolean; blockReason?: string; runs: TaskRun[] };
+export type TaskDetail = Task & { promptPreview: string; canDispatch: boolean; blockReason?: string; runs: TaskRun[]; events: TaskEvent[]; verificationRuns: VerificationRun[] };
 
 export const priorityLabels: Record<Priority, string> = { urgent: "紧急", high: "高", normal: "普通", low: "低" };
 export const statusLabels: Record<TaskStatus, string> = { todo: "待处理", running: "执行中", awaiting_review: "待验收", action_required: "需处理", done: "已完成", cancelled: "已取消" };
@@ -35,7 +37,10 @@ export function taskDisplayStatus(task: Task): string {
   if (task.orchestrationStatus === "implementing") return "自动执行中";
   if (task.orchestrationStatus === "queued") return "自动队列中";
   if (task.orchestrationStatus === "paused") return "自动队列已暂停";
+  if (task.orchestrationStatus === "stopped") return "自动编排已停止";
+  if (task.orchestrationStatus === "removing") return "自动编排清理中";
   if (task.orchestrationStatus === "needs_human") return "自动编排需处理";
+  if (isTaskAwaitingMainMerge(task)) return "待合并 main";
   if (task.status === "running" && task.lastRun?.status === "queued") return "队列中";
   return statusLabels[task.status];
 }
@@ -45,7 +50,11 @@ export function taskDisplayStatusClass(task: Task): string {
 }
 
 export function isTaskOrchestrating(task: Task): boolean {
-  return ["queued", "preparing", "implementing", "checking"].includes(task.orchestrationStatus || "");
+  return ["queued", "preparing", "implementing", "checking", "removing"].includes(task.orchestrationStatus || "");
+}
+
+export function isTaskAwaitingMainMerge(task: Task): boolean {
+  return task.orchestrationStatus === "awaiting_main" || task.orchestrationStatus === "integrated_to_dev";
 }
 
 export function isTaskBlocked(task: Task): boolean {
@@ -87,7 +96,10 @@ export function taskQueueNote(task: Task): string {
   if (task.orchestrationStatus === "implementing") return "自动编排正在执行任务";
   if (task.orchestrationStatus === "queued") return "已进入自动编排队列";
   if (task.orchestrationStatus === "paused") return "自动编排已暂停";
+  if (task.orchestrationStatus === "stopped") return "自动编排已停止，可重新开始";
+  if (task.orchestrationStatus === "removing") return "自动编排正在停止执行并清理工作区";
   if (task.orchestrationStatus === "needs_human") return "自动编排需要人工处理";
+	if (isTaskAwaitingMainMerge(task)) return "分支已验证，可合并至 main";
   if (isTaskBlocked(task)) return `等待：${task.blockedBy.map((item) => item.title).join("、")}`;
   if (task.status === "awaiting_review") return "执行完成，等待人工确认";
   if (task.status === "action_required" && task.lastRun) {

@@ -12,6 +12,7 @@ import SSHManagerPage from "./pages/SSHManagerPage";
 import ProjectLayout from "./components/ProjectLayout";
 import ConversationPage from "./pages/ConversationPage";
 import TaskBoardPage from "./pages/TaskBoardPage";
+import OrchestrationPage from "./pages/OrchestrationPage";
 import GitWorkbenchPage from "./pages/GitWorkbenchPage";
 import ProjectRunPage from "./pages/ProjectRunPage";
 import InsightsPage from "./pages/InsightsPage";
@@ -58,6 +59,7 @@ export function App() {
               <Route path="conversations/:conversationId" element={<ConversationPage />} />
               <Route path="tasks" element={<TaskBoardPage />} />
               <Route path="tasks/:taskId" element={<TaskBoardPage />} />
+              <Route path="orchestration" element={<OrchestrationPage />} />
               <Route path="files" element={<FilesPage />} />
               <Route path="git" element={<GitWorkbenchPage />} />
               <Route path="run" element={<ProjectRunPage />} />

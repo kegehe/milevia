@@ -14,6 +14,7 @@ const taskStyles = await readFile(new URL("./tasks.css", import.meta.url), "utf8
 const gitWorkbench = await readFile(new URL("./features/git/GitWorkbench.tsx", import.meta.url), "utf8");
 const runPanel = await readFile(new URL("./features/run/ProjectRunPanel.tsx", import.meta.url), "utf8");
 const runStyles = await readFile(new URL("./run.css", import.meta.url), "utf8");
+const orchestrationPage = await readFile(new URL("./pages/OrchestrationPage.tsx", import.meta.url), "utf8");
 
 const workspaceStyles = stylesheet.slice(stylesheet.indexOf("/* Desktop conversation workspace:"));
 const conversationContentStyles = stylesheet.slice(stylesheet.indexOf("/* 对话内容："));
@@ -225,11 +226,13 @@ test("approval and task-board views keep working inside the workspace", () => {
 
 test("Git workbench and project runner are first-class workspace tabs", () => {
   // Types 在 lib/types.ts
-  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "files" \| "git" \| "run" \| "insights";/);
+  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "orchestration" \| "files" \| "git" \| "run" \| "insights";/);
   // ProjectLayout 管理 workspace tabs
   assert.match(projectLayout, /const \[workspaceTab, setWorkspaceTab\] = useState<WorkspaceTab>/);
   assert.match(projectLayout, /<nav className="workspace-tabs" role="tablist" aria-label="项目工作区" onKeyDown=\{navigateWorkspaceTabs\}>/);
   assert.match(projectLayout, /role="tab" aria-controls="workspace-panel-git"/);
+  assert.match(projectLayout, /role="tab" aria-controls="workspace-panel-orchestration"/);
+  assert.match(orchestrationPage, /id="workspace-panel-orchestration"[\s\S]*?role="tabpanel"[\s\S]*?aria-labelledby="workspace-tab-orchestration"/);
   assert.match(projectLayout, /const navigateWorkspaceTabs = \(event: React\.KeyboardEvent<HTMLElement>\) => \{/);
   assert.match(projectLayout, /\["ArrowLeft", "ArrowRight", "Home", "End"\]/);
   assert.doesNotMatch(projectLayout, /const \[showGit, setShowGit\]/);
@@ -303,13 +306,13 @@ test("clearing context starts a fresh conversation with the current agent and po
   assert.match(conversationPage, /message: "将开始一个新的空白会话，当前内容仍可在历史会话中恢复。"/);
   assert.match(conversationPage, /const clearCurrentConversation = async \(skipRunGuard = false\) => \{/);
   assert.match(conversationPage, /`\/api\/conversations\/\$\{conversationID\}\/clear`/);
-  assert.match(conversationPage, /if \(!conversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
-  assert.match(conversationPage, /if \(!conversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
+  assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
+  assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
   assert.match(conversationPage, /const isCurrentConversation = \(\) => !cancelled && conversationRef\.current\?\.id === conversation\.id;/);
   assert.match(conversationPage, /socket\.onmessage = \(raw\) => \{\s*if \(!isCurrentConversation\(\)\) return;/s);
   assert.match(conversationPage, /if \(sending \|\| clearing \|\| stopping \|\| shortcutBusy\) \{ closeHistory\(\); return; \}/);
-  assert.match(conversationPage, /disabled=\{!!run \|\| clearing \|\| stopping \|\| changingPermission\}/);
-  assert.match(conversationPage, /if \(!conversation \|\| conversation\.permissionMode === permissionMode \|\| run \|\| clearing \|\| stopping\) return;/);
+  assert.match(conversationPage, /disabled=\{readOnlyConversation \|\| !!run \|\| clearing \|\| stopping \|\| changingPermission\}/);
+  assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| conversation\.permissionMode === permissionMode \|\| run \|\| clearing \|\| stopping\) return;/);
   assert.match(conversationPage, /if \(!conversation \|\| run \|\| clearing \|\| stopping\) return;/);
   assert.match(conversationPage, /const current = list\.find\(\(item\) => item\.isCurrent\);/);
   assert.match(conversationPage, /if \(conversationRef\.current\?\.id !== conversationID\) return;\s*setConversation\(updated\);/s);
@@ -326,9 +329,9 @@ test("clearing context starts a fresh conversation with the current agent and po
   assert.match(taskQueue, /conversationIDRef\.current !== dispatchConversationID/);
   assert.match(taskQueue, /setDispatching\(false\);\s*setRedispatchingTaskID\(null\);/);
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
-  assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
-  assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
-  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{!text\.trim\(\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\}><ComposerActionIcon action="send" \/>/);
+  assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
+  assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
+  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| !text\.trim\(\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\}><ComposerActionIcon action="send" \/>/);
 });
 
 test("creating a conversation keeps the newly navigated route", () => {

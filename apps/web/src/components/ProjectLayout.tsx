@@ -24,6 +24,7 @@ function WorkspaceTabIcon({ tab }: { tab: WorkspaceTab }) {
   const paths: Record<WorkspaceTab, ReactNode> = {
     conversation: <><path d="M6.5 17.5 3.8 20v-11A3.5 3.5 0 0 1 7.3 5.5h9.4A3.5 3.5 0 0 1 20.2 9v5a3.5 3.5 0 0 1-3.5 3.5H6.5Z" /><path d="M8 11.5h8M8 14.5h5" /></>,
     tasks: <><path d="M8.5 6.5h10M8.5 12h10M8.5 17.5h10" /><path d="m4.7 6.5.9.9 1.8-2M4.7 12l.9.9 1.8-2M4.7 17.5l.9.9 1.8-2" /></>,
+    orchestration: <><circle cx="6" cy="6" r="2" /><circle cx="18" cy="12" r="2" /><circle cx="6" cy="18" r="2" /><path d="M8 6h3.5a4.5 4.5 0 0 1 0 9H8M15.8 10.8l-2.3 2.3 2.3 2.3" /></>,
     files: <><path d="M4.5 7.5A2.5 2.5 0 0 1 7 5h3l1.7 2H17A2.5 2.5 0 0 1 19.5 9.5v7A2.5 2.5 0 0 1 17 19H7a2.5 2.5 0 0 1-2.5-2.5v-9Z" /><path d="M4.8 9h14.4" /></>,
     git: <><circle cx="6" cy="6" r="2" /><circle cx="18" cy="18" r="2" /><circle cx="18" cy="6" r="2" /><path d="M8 6h5a3 3 0 0 1 3 3v7M8 6h5a3 3 0 0 1 3 3" /></>,
     run: <><path d="m9 7 7 5-7 5V7Z" /><path d="M5 5.5v13M19 5.5v13" /></>,
@@ -45,6 +46,7 @@ export default function ProjectLayout() {
   const getWorkspaceTab = useCallback((): WorkspaceTab => {
     const path = location.pathname;
     if (path.endsWith("/tasks") || path.includes("/tasks/")) return "tasks";
+    if (path.endsWith("/orchestration")) return "orchestration";
     if (path.endsWith("/files")) return "files";
     if (path.endsWith("/git")) return "git";
     if (path.endsWith("/run")) return "run";
@@ -64,6 +66,7 @@ export default function ProjectLayout() {
     switch (tab) {
       case "conversation": navigate(`${base}/conversations`); break;
       case "tasks": navigate(`${base}/tasks`); break;
+      case "orchestration": navigate(`${base}/orchestration`); break;
       case "files": navigate(`${base}/files`); break;
       case "git": navigate(`${base}/git`); break;
       case "run": navigate(`${base}/run`); break;
@@ -153,6 +156,7 @@ export default function ProjectLayout() {
     <nav className="workspace-tabs" role="tablist" aria-label="项目工作区" onKeyDown={navigateWorkspaceTabs}>
       <button data-workspace-tab="conversation" id="workspace-tab-conversation" type="button" role="tab" aria-controls="workspace-panel-conversation" aria-selected={workspaceTab === "conversation"} className={workspaceTab === "conversation" ? "active" : ""} onClick={() => selectWorkspaceTab("conversation")}><WorkspaceTabIcon tab="conversation" /><span>对话</span></button>
       <button data-workspace-tab="tasks" id="workspace-tab-tasks" type="button" role="tab" aria-controls="workspace-panel-tasks" aria-selected={workspaceTab === "tasks"} className={workspaceTab === "tasks" ? "active" : ""} onClick={() => selectWorkspaceTab("tasks")}><WorkspaceTabIcon tab="tasks" /><span>任务</span></button>
+      <button data-workspace-tab="orchestration" id="workspace-tab-orchestration" type="button" role="tab" aria-controls="workspace-panel-orchestration" aria-selected={workspaceTab === "orchestration"} className={workspaceTab === "orchestration" ? "active" : ""} onClick={() => selectWorkspaceTab("orchestration")}><WorkspaceTabIcon tab="orchestration" /><span>自动编排</span></button>
       <button data-workspace-tab="files" id="workspace-tab-files" type="button" role="tab" aria-controls="workspace-panel-files" aria-selected={workspaceTab === "files"} className={workspaceTab === "files" ? "active" : ""} onClick={() => selectWorkspaceTab("files")}><WorkspaceTabIcon tab="files" /><span>文件</span></button>
       {project.gitBranch !== "非 Git 目录" && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
       <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} onClick={() => selectWorkspaceTab("run")}><WorkspaceTabIcon tab="run" /><span>项目启动</span></button>

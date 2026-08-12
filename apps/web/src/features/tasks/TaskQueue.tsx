@@ -2,7 +2,7 @@ import { FormEvent, MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 
-import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
+import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskAwaitingMainMerge, isTaskOrchestrating, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
@@ -560,7 +560,7 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
     <div className="task-queue-row-actions">
       {canOfferDispatch(task) && <button type="button" className="task-queue-dispatch" draggable={false} disabled={dispatchDisabled} onClick={(event) => void confirm(event, task.id)}>下发</button>}
       {canRedispatch(task) && <button type="button" className="task-queue-redispatch" draggable={false} disabled={dispatchDisabled || redispatching} onClick={(event) => void redispatch(event, task.id)}>{redispatching ? "下发中" : "重新下发"}</button>}
-      {task.status === "awaiting_review" && !isTaskOrchestrating(task) && !isReviewing && <button type="button" className="task-queue-review secondary" draggable={false} onClick={(event) => { event.stopPropagation(); openReview(task.id); }}>验收</button>}
+      {task.status === "awaiting_review" && !isTaskOrchestrating(task) && !isTaskAwaitingMainMerge(task) && !isReviewing && <button type="button" className="task-queue-review secondary" draggable={false} onClick={(event) => { event.stopPropagation(); openReview(task.id); }}>验收</button>}
       <button type="button" className="task-queue-pin" draggable={false} disabled={pinning} title={task.pinned ? "取消置顶" : "置顶"} aria-label={task.pinned ? "取消置顶" : "置顶"} onClick={(event) => void handlePinToTop(event)}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.4 6L14 4H7.7L8 6 5 9.3c-.3.3-.5.7-.5 1.1 0 .4.3.6.6.6h4.2l-1.2 6.2c-.1.4.2.8.6.8.2 0 .4-.1.5-.2L15 12l3.9.1c.4 0 .6-.3.6-.6 0-.4-.2-.8-.5-1.1L14.4 6z" /></svg>
       </button>
@@ -722,7 +722,7 @@ function InlineTaskDetail({ detail, loading, busy, dispatchDisabled, close, disp
         {detail.canDispatch && <button className="primary" disabled={dispatchDisabled || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button>}
       </>}
       {detail.status === "running" && <button className="danger-text" disabled={Boolean(busy) || queued} onClick={() => void transition("stop")}>{queued ? "队列中" : busy === "stop" ? "停止中" : "停止任务"}</button>}
-      {detail.status === "awaiting_review" && <>
+      {detail.status === "awaiting_review" && !isTaskAwaitingMainMerge(detail) && <>
         <button className="secondary" disabled={reviewBusy} onClick={() => void doReview("accept")}>{localReviewSubmitting ? "提交中" : "确认完成"}</button>
         <div className="task-inline-review-reject">
           <textarea autoFocus required disabled={localReviewSubmitting} value={localReviewNote} onChange={(event) => setLocalReviewNote(event.target.value)} placeholder="说明需要修改的内容…" />

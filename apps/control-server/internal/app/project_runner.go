@@ -345,9 +345,16 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 func resolveProjectRunWorkDir(projectPath, configuredWorkDir string) (string, error) {
 	workDir := projectPath
 	if configuredWorkDir != "" {
-		workDir = filepath.Join(projectPath, configuredWorkDir)
+		// Absolute directories only reach this point after the API has resolved a
+		// recorded orchestration worktree. Configuration updates still reject
+		// arbitrary absolute paths, preserving the normal project boundary.
+		if filepath.IsAbs(configuredWorkDir) {
+			workDir = configuredWorkDir
+		} else {
+			workDir = filepath.Join(projectPath, configuredWorkDir)
+		}
 	}
-	if !isPathWithin(projectPath, workDir) {
+	if !filepath.IsAbs(configuredWorkDir) && !isPathWithin(projectPath, workDir) {
 		return "", errors.New("工作目录不能超出项目路径")
 	}
 
@@ -359,7 +366,7 @@ func resolveProjectRunWorkDir(projectPath, configuredWorkDir string) (string, er
 	if err != nil {
 		return "", fmt.Errorf("解析工作目录失败: %w", err)
 	}
-	if !isPathWithin(resolvedProjectPath, resolvedWorkDir) {
+	if !filepath.IsAbs(configuredWorkDir) && !isPathWithin(resolvedProjectPath, resolvedWorkDir) {
 		return "", errors.New("工作目录不能超出项目路径")
 	}
 	return resolvedWorkDir, nil

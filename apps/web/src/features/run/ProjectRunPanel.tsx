@@ -4,6 +4,7 @@ import { toAnsiSegments } from "./ansi";
 import { createWebSocket } from "../../lib/runtime";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
+type OrchestrationWorktree = { taskId: string; jobId: string; taskBranch: string; worktreePath: string; status: string };
 
 const MAX_LOG_ENTRIES = 2_000;
 const LOG_BOTTOM_THRESHOLD = 64;
@@ -48,6 +49,8 @@ function nextEnvironmentVariableKey(envVars: Record<string, string>): string {
 export function ProjectRunPanel({ projectID, request, fail, active, isRemote = false }: { projectID: string; request: Request; fail: (message: string) => void; active: boolean; isRemote?: boolean }) {
 	const [config, setConfig] = useState<RunConfig>({ workDir: "", command: "", envVars: {}, executionTarget: "auto" });
 	const [status, setStatus] = useState<RunStatusResponse | null>(null);
+	const [worktrees, setWorktrees] = useState<OrchestrationWorktree[]>([]);
+	const [worktreeSelection, setWorktreeSelection] = useState("");
 	const [logs, setLogs] = useState<LogEntry[]>([]);
 	const [hasNewLogs, setHasNewLogs] = useState(false);
 	const [busy, setBusy] = useState("");
@@ -84,6 +87,12 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 			if (activeProjectIDRef.current === projectID) fail(cause instanceof Error ? cause.message : "加载配置失败");
 		}
 	}, [basePath, request, fail, projectID]);
+	const loadWorktrees = useCallback(async () => {
+		try {
+			const items = await request<OrchestrationWorktree[]>(`${basePath}/worktrees`);
+			if (activeProjectIDRef.current === projectID) setWorktrees(items);
+		} catch { /* 普通项目仍可使用项目根目录启动。 */ }
+	}, [basePath, request, projectID]);
 	const updateConfig = (next: RunConfig) => {
 		configDirtyRef.current = true;
 		configRevisionRef.current += 1;
@@ -110,6 +119,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		clearedThroughLogIDRef.current = 0;
 		logNearBottomRef.current = true;
 		setConfig({ workDir: "", command: "", envVars: {}, executionTarget: "auto" });
+		setWorktreeSelection("");
 		setStatus(null);
 		setLogs([]);
 		setHasNewLogs(false);
@@ -122,6 +132,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		activeProjectIDRef.current = projectID;
 		void loadConfig();
 		void loadStatus();
+		void loadWorktrees();
 
 		const connect = () => {
 			if (disposed) return;
@@ -163,7 +174,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 			wsRef.current = null;
 			if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
 		};
-	}, [projectID, active, loadConfig, loadStatus, mergeIncomingLogs]);
+	}, [projectID, active, loadConfig, loadStatus, loadWorktrees, mergeIncomingLogs]);
 
 	useEffect(() => {
 		const terminal = logTerminalRef.current;
@@ -291,7 +302,8 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 						</div>
 						<div className="run-config-row">
 							<label>工作目录</label>
-							<input type="text" value={config.workDir} placeholder="留空使用项目根目录" onChange={(e) => updateConfig({ ...config, workDir: e.target.value })} />
+							<input type="text" value={config.workDir} placeholder={isRemote ? "远程工作目录，例如 /srv/app" : "留空使用项目根目录，也可填写项目子目录"} onChange={(e) => { setWorktreeSelection(""); updateConfig({ ...config, workDir: e.target.value }); }} />
+							{!isRemote && worktrees.length > 0 && <><select value={worktreeSelection} onChange={(e) => { const value = e.target.value; setWorktreeSelection(value); if (value) updateConfig({ ...config, workDir: value }); }}><option value="">选择自动编排 worktree 进行验收</option>{worktrees.map((worktree) => <option key={worktree.jobId} value={worktree.worktreePath}>{worktree.taskBranch || `任务 ${worktree.taskId.slice(0, 8)}`}{worktree.status === "released_to_main" ? "（已合并）" : ""}</option>)}</select><p className="run-config-hint">选择后会写入上方目录；也可继续填写项目内子目录。</p></>}
 						</div>
 						<div className="run-config-row">
 							<label>启动命令</label>

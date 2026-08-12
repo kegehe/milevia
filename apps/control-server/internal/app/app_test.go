@@ -1637,11 +1637,11 @@ func TestReorderShortcutsRejectsInvalidInput(t *testing.T) {
 	server := newTestServer(t)
 	// 无项目时 reorder 也要求 orderedIds 与可见集一致，用于校验 400 分支。
 	cases := []string{
-		`{"kind":"unknown","orderedIds":["x"]}`,              // 非法 kind
-		`{"kind":"prompt","orderedIds":[]}`,                  // 空数组
-		`{"orderedIds":["x"]}`,                               // 缺 kind
-		`{"kind":"prompt"}`,                                  // 缺 orderedIds（为空）
-		`{"kind":"prompt","orderedIds":["x","y"]}`,           // 含不可见 id
+		`{"kind":"unknown","orderedIds":["x"]}`,    // 非法 kind
+		`{"kind":"prompt","orderedIds":[]}`,        // 空数组
+		`{"orderedIds":["x"]}`,                     // 缺 kind
+		`{"kind":"prompt"}`,                        // 缺 orderedIds（为空）
+		`{"kind":"prompt","orderedIds":["x","y"]}`, // 含不可见 id
 	}
 	for _, payload := range cases {
 		rec := httptest.NewRecorder()
@@ -3364,6 +3364,20 @@ func TestTaskExposesActiveOrchestrationReviewStatus(t *testing.T) {
 	}
 }
 
+func TestOrchestrationReviewSinkStreamsTextAndAccumulatesJSON(t *testing.T) {
+	var streamed []string
+	sink := &orchestrationReviewSink{onText: func(content string) { streamed = append(streamed, content) }}
+	sink.AssistantText("{\"verdict\":", "")
+	sink.AssistantText("\"pass\"}", "")
+	sink.AssistantText("   ", "")
+	if got := sink.String(); got != "{\"verdict\":\"pass\"}" {
+		t.Fatalf("review output=%q", got)
+	}
+	if !reflect.DeepEqual(streamed, []string{"{\"verdict\":", "\"pass\"}"}) {
+		t.Fatalf("streamed output=%q", streamed)
+	}
+}
+
 func TestAutomaticOrchestrationIntegratesVerifiedTaskToDev(t *testing.T) {
 	server := newTestServer(t)
 	repo := t.TempDir()
@@ -3385,7 +3399,7 @@ func TestAutomaticOrchestrationIntegratesVerifiedTaskToDev(t *testing.T) {
 		}
 	}
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, repo, now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,?,1,?)`, repo, server.localRunnerID(), "main", now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle',0,1,?)`, now); err != nil {
@@ -3398,7 +3412,7 @@ func TestAutomaticOrchestrationIntegratesVerifiedTaskToDev(t *testing.T) {
 		}
 		return os.WriteFile(filepath.Join(request.ProjectPath, "implemented.txt"), []byte("done\n"), 0o600)
 	})
-	_, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values ('project',1,'main','dev','["test -f README.md"]',3,'',?)`, now)
+	_, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values ('project',1,'main','dev','["ls"]',3,'',?)`, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3414,20 +3428,197 @@ func TestAutomaticOrchestrationIntegratesVerifiedTaskToDev(t *testing.T) {
 		if err := server.db.QueryRow(`select status from task_orchestration_jobs where task_id=?`, taskID).Scan(&status); err != nil {
 			t.Fatal(err)
 		}
-		if status == "integrated_to_dev" {
+		if status == "awaiting_main" {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	if status != "integrated_to_dev" {
+	if status != "awaiting_main" {
 		var reason string
 		_ = server.db.QueryRow(`select last_error from task_orchestration_jobs where task_id=?`, taskID).Scan(&reason)
 		t.Fatalf("job status=%q reason=%q", status, reason)
 	}
-	output, err := server.gitOutput(context.Background(), repo, "show", "dev:implemented.txt")
-	if err != nil || strings.TrimSpace(output) != "done" {
-		t.Fatalf("dev integration missing implementation: output=%q err=%v", output, err)
+	var branch string
+	if err := server.db.QueryRow(`select task_branch from git_task_records where job_id=(select id from task_orchestration_jobs where task_id=?)`, taskID).Scan(&branch); err != nil {
+		t.Fatalf("load task branch: %v", err)
 	}
+	if !strings.HasPrefix(branch, "自动编排-") {
+		t.Fatalf("task branch = %q, want automatic orchestration branch", branch)
+	}
+	var orchestrationConversationID, taskRunConversationID string
+	if err := server.db.QueryRow(`select conversation_id from git_task_records where job_id=(select id from task_orchestration_jobs where task_id=?)`, taskID).Scan(&orchestrationConversationID); err != nil {
+		t.Fatalf("load orchestration conversation: %v", err)
+	}
+	if err := server.db.QueryRow(`select conversation_id from task_runs where task_id=? order by sequence desc limit 1`, taskID).Scan(&taskRunConversationID); err != nil {
+		t.Fatalf("load task run conversation: %v", err)
+	}
+	if orchestrationConversationID == "" || taskRunConversationID != orchestrationConversationID || orchestrationConversationID == "conversation" {
+		t.Fatalf("task run must use its dedicated conversation: record=%q task_run=%q", orchestrationConversationID, taskRunConversationID)
+	}
+	var isCurrent bool
+	if err := server.db.QueryRow(`select is_current from conversations where id=?`, orchestrationConversationID).Scan(&isCurrent); err != nil {
+		t.Fatalf("load orchestration conversation state: %v", err)
+	}
+	if isCurrent {
+		t.Fatal("orchestration conversation must not replace the current conversation")
+	}
+	output, err := server.gitOutput(context.Background(), repo, "show", branch+":implemented.txt")
+	if err != nil || strings.TrimSpace(output) != "done" {
+		t.Fatalf("task branch missing implementation: output=%q err=%v", output, err)
+	}
+}
+
+func TestOrchestrationConfigSelectsAgent(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/projects/project/orchestration/config", strings.NewReader(`{"enabled":false,"mainBranch":"main","agentId":"codex","verificationCommands":["true"],"maxFixRounds":3}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("save config: %d body=%s", response.Code, response.Body.String())
+	}
+	cfg, err := server.orchestrationConfig(context.Background(), "project")
+	if err != nil || cfg.AgentID != "codex" {
+		t.Fatalf("load config agent=%q err=%v", cfg.AgentID, err)
+	}
+	invalid := httptest.NewRecorder()
+	server.routes().ServeHTTP(invalid, httptest.NewRequest(http.MethodPut, "/api/projects/project/orchestration/config", strings.NewReader(`{"enabled":false,"mainBranch":"main","agentId":"other","verificationCommands":["true"],"maxFixRounds":3}`)))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid agent status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	emptyCommands := httptest.NewRecorder()
+	server.routes().ServeHTTP(emptyCommands, httptest.NewRequest(http.MethodPut, "/api/projects/project/orchestration/config", strings.NewReader(`{"enabled":true,"mainBranch":"main","agentId":"codex","verificationCommands":[],"maxFixRounds":3}`)))
+	if emptyCommands.Code != http.StatusBadRequest {
+		t.Fatalf("enabled config without verification commands status=%d body=%s", emptyCommands.Code, emptyCommands.Body.String())
+	}
+	disabledEmptyCommands := httptest.NewRecorder()
+	server.routes().ServeHTTP(disabledEmptyCommands, httptest.NewRequest(http.MethodPut, "/api/projects/project/orchestration/config", strings.NewReader(`{"enabled":false,"mainBranch":"main","agentId":"codex","verificationCommands":[],"maxFixRounds":3}`)))
+	if disabledEmptyCommands.Code != http.StatusOK {
+		t.Fatalf("disabled config without verification commands status=%d body=%s", disabledEmptyCommands.Code, disabledEmptyCommands.Body.String())
+	}
+}
+
+func TestOrchestrationConversationUsesConfiguredAgent(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	project := Project{ID: "project", Name: "project", Path: t.TempDir(), Runner: server.localRunnerID(), GitBranch: "main", CreatedAt: now}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,1,?)`, project.ID, project.Name, project.Path, project.Runner, project.GitBranch, now); err != nil {
+		t.Fatal(err)
+	}
+	conversationID, err := server.createOrchestrationConversation(context.Background(), project, Task{ID: "task", Title: "Run with Codex"}, OrchestrationConfig{AgentID: "codex"})
+	if err != nil {
+		t.Fatalf("create orchestration conversation: %v", err)
+	}
+	var agentID, permissionMode string
+	var isCurrent bool
+	if err := server.db.QueryRow(`select agent_id,permission_mode,is_current from conversations where id=?`, conversationID).Scan(&agentID, &permissionMode, &isCurrent); err != nil {
+		t.Fatal(err)
+	}
+	if agentID != "codex" || permissionMode != "workspace_write" || isCurrent {
+		t.Fatalf("conversation agent=%q permission=%q isCurrent=%v", agentID, permissionMode, isCurrent)
+	}
+}
+
+func TestPostOrchestrationMessageBroadcastsWithoutRunEvent(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Broadcast orchestration message")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'checking','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values ('job','','','',?,?,?)`, conversationID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	sub := &subscriber{send: make(chan []byte, 1)}
+	server.mu.Lock()
+	server.subscribers[conversationID] = map[*websocket.Conn]*subscriber{nil: sub}
+	server.mu.Unlock()
+
+	server.postOrchestrationMessage(context.Background(), OrchestrationJob{ID: "job"}, "verification passed")
+	select {
+	case payload := <-sub.send:
+		var event Event
+		if err := json.Unmarshal(payload, &event); err != nil {
+			t.Fatalf("decode broadcast event: %v", err)
+		}
+		if event.Type != "assistant.message" || event.RunID != "" {
+			t.Fatalf("broadcast event=%#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("orchestration message was not broadcast")
+	}
+	var messages, events int
+	if err := server.db.QueryRow(`select count(*) from messages where conversation_id=?`, conversationID).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.db.QueryRow(`select count(*) from events where conversation_id=?`, conversationID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 1 || events != 0 {
+		t.Fatalf("messages=%d events=%d, want one durable message and no invalid run event", messages, events)
+	}
+}
+
+func TestOrchestrationConversationRejectsExternalMessages(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Reject external orchestration message")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'queued','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values ('job','','','',?,?,?)`, conversationID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversationID+"/messages", strings.NewReader(`{"content":"do not interrupt"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("send to orchestration conversation: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestOrchestrationConversationRejectsExternalRunStop(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Reject external orchestration stop")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'implementing','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values ('job','','','',?,?,?)`, conversationID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run',?,'running',?)`, conversationID, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runs/run/stop", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stop orchestration run: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestResumeCommittedOrchestrationTaskKeepsTaskAwaitingReview(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Resume committed orchestration")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'needs_human',7,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,task_commit_sha,conversation_id,created_at,updated_at) values ('job','','branch','worktree','commit','',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/resume", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("resume: %d body=%s", response.Code, response.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskAwaitingReview)
 }
 
 func TestVerificationCommandArgsUsePlatformShell(t *testing.T) {
@@ -3436,7 +3627,7 @@ func TestVerificationCommandArgsUsePlatformShell(t *testing.T) {
 		wantBinary string
 		wantArgs   []string
 	}{
-		{goos: "windows", wantBinary: "cmd.exe", wantArgs: []string{"/d", "/s", "/c", "npm test"}},
+		{goos: "windows", wantBinary: "powershell.exe", wantArgs: []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "npm test"}},
 		{goos: "linux", wantBinary: "sh", wantArgs: []string{"-lc", "npm test"}},
 	}
 	for _, test := range tests {
@@ -3444,6 +3635,62 @@ func TestVerificationCommandArgsUsePlatformShell(t *testing.T) {
 		if binary != test.wantBinary || !reflect.DeepEqual(args, test.wantArgs) {
 			t.Fatalf("verification command for %s = %q %q, want %q %q", test.goos, binary, args, test.wantBinary, test.wantArgs)
 		}
+	}
+}
+
+func TestParseOrchestrationReviewExtractsJSONFromAgentNarration(t *testing.T) {
+	commit := "abc123"
+	output := "审查完成，以下是结果：\n```json\n{\"verdict\":\"pass\",\"blockingFindings\":[],\"nonBlockingFindings\":[],\"acceptanceCoverage\":[\"README updated\"],\"testGaps\":[],\"reviewedCommit\":\"abc123\"}\n```\n无需额外操作。"
+	review, err := parseOrchestrationReview(output, commit)
+	if err != nil {
+		t.Fatalf("parse narrated review: %v", err)
+	}
+	if review.Verdict != "pass" || review.ReviewedCommit != commit {
+		t.Fatalf("review=%#v", review)
+	}
+}
+
+func TestParseOrchestrationReviewRejectsUnstructuredAgentOutput(t *testing.T) {
+	if _, err := parseOrchestrationReview("README 已更新，建议提交改动。", "abc123"); err == nil {
+		t.Fatal("expected unstructured review output to be rejected")
+	}
+}
+
+func TestRetryOrchestrationJobAllowsConfiguredRepairRoundsAfterInitialAttempt(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Retry limit")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,attempt,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'checking',3,7,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	server.orchestrationMu.Lock()
+	server.orchestrationActive[projectID] = true
+	server.orchestrationMu.Unlock()
+	server.retryOrchestrationJob(context.Background(), OrchestrationJob{ID: "job", ProjectID: projectID, TaskID: taskID, Status: orchestrationChecking, Attempt: 3, LeaseToken: 7}, OrchestrationConfig{MaxFixRounds: 3}, errors.New("review failed"))
+	var status string
+	if err := server.db.QueryRow(`select status from task_orchestration_jobs where id='job'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != orchestrationQueued {
+		t.Fatalf("status after third repair round=%q, want queued", status)
+	}
+}
+
+func TestWindowsPowerShellVerificationCommandRunsLS(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-specific verification command")
+	}
+	cmd := newVerificationCommand(context.Background(), "ls | Out-Null")
+	cmd.Dir = t.TempDir()
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Windows verification command failed: %v: %s", err, output)
+	}
+}
+
+func TestAutomaticOrchestrationBranchUsesDateAndTaskShortID(t *testing.T) {
+	branch := automaticOrchestrationBranch(time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC), "12345678-90ab-cdef")
+	if branch != "自动编排-20260812-12345678" {
+		t.Fatalf("branch = %q", branch)
 	}
 }
 
@@ -3469,7 +3716,7 @@ func TestAutomaticOrchestrationDoesNotAdvanceDevWhenIntegrationVerificationFails
 	}
 	baseline := mustGitHead(t, repo)
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, repo, now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,?,1,?)`, repo, server.localRunnerID(), "main", now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle',0,1,?)`, now); err != nil {
@@ -3482,9 +3729,7 @@ func TestAutomaticOrchestrationDoesNotAdvanceDevWhenIntegrationVerificationFails
 		}
 		return os.WriteFile(filepath.Join(request.ProjectPath, "implemented.txt"), []byte("done\n"), 0o600)
 	})
-	// The project and task worktrees are on named branches, while the integration
-	// worktree is intentionally detached. This isolates the integration phase.
-	_, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values ('project',1,'main','dev','["git branch --show-current | grep -q ."]',1,'',?)`, now)
+	_, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values ('project',1,'main','dev','["false"]',1,'',?)`, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3508,12 +3753,12 @@ func TestAutomaticOrchestrationDoesNotAdvanceDevWhenIntegrationVerificationFails
 	if status != orchestrationNeedsHuman {
 		t.Fatalf("job status=%q, want %q", status, orchestrationNeedsHuman)
 	}
-	dev, err := server.gitOutput(context.Background(), repo, "rev-parse", "dev")
+	main, err := server.gitOutput(context.Background(), repo, "rev-parse", "main")
 	if err != nil {
-		t.Fatalf("read dev after failed integration verification: %v", err)
+		t.Fatalf("read main after failed verification: %v", err)
 	}
-	if strings.TrimSpace(dev) != baseline {
-		t.Fatalf("failed integration verification advanced dev: got=%s want=%s", strings.TrimSpace(dev), baseline)
+	if strings.TrimSpace(main) != baseline {
+		t.Fatalf("failed verification changed main: got=%s want=%s", strings.TrimSpace(main), baseline)
 	}
 }
 
@@ -3524,7 +3769,7 @@ func TestOrchestrationResumeClearsProjectFreeze(t *testing.T) {
 	if _, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,0,'main','dev','[]',3,'verification failed',?)`, projectID, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'needs_human',7,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,last_error,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'needs_human',7,'verification failed','{}',?,?)`, projectID, taskID, now, now); err != nil {
 		t.Fatal(err)
 	}
 	response := httptest.NewRecorder()
@@ -3532,15 +3777,104 @@ func TestOrchestrationResumeClearsProjectFreeze(t *testing.T) {
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("resume: %d body=%s", response.Code, response.Body.String())
 	}
-	var status, frozen string
-	if err := server.db.QueryRow(`select status from task_orchestration_jobs where id='job'`).Scan(&status); err != nil {
+	var status, frozen, lastError string
+	if err := server.db.QueryRow(`select status,last_error from task_orchestration_jobs where id='job'`).Scan(&status, &lastError); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.db.QueryRow(`select frozen_reason from project_orchestration_configs where project_id=?`, projectID).Scan(&frozen); err != nil {
 		t.Fatal(err)
 	}
-	if status != orchestrationQueued || frozen != "" {
-		t.Fatalf("resume must unfreeze the queue: status=%q frozen=%q", status, frozen)
+	if status != orchestrationQueued || frozen != "" || lastError != "" {
+		t.Fatalf("resume must restart cleanly: status=%q frozen=%q lastError=%q", status, frozen, lastError)
+	}
+}
+
+func TestStopOrchestrationJobPreservesWorktreeAndAllowsRestart(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Stop active orchestration")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,1,'main','dev','[]',3,'previous failure',?)`, projectID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,last_error,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'implementing',7,'previous failure','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,created_at,updated_at) values ('job','base','自动编排-20260812-12345678','D:/worktrees/job',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/stop", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("stop: %d body=%s", response.Code, response.Body.String())
+	}
+	var status, worktree, lastError string
+	if err := server.db.QueryRow(`select job.status,record.worktree_path,job.last_error from task_orchestration_jobs job join git_task_records record on record.job_id=job.id where job.id='job'`).Scan(&status, &worktree, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != orchestrationStopped || worktree != "D:/worktrees/job" || lastError != "" {
+		t.Fatalf("stopped job=%q worktree=%q lastError=%q", status, worktree, lastError)
+	}
+	assertTaskStatus(t, server, taskID, taskActionRequired)
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/resume", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("restart: %d body=%s", response.Code, response.Body.String())
+	}
+	if err := server.db.QueryRow(`select status,last_error from task_orchestration_jobs where id='job'`).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != orchestrationQueued || lastError != "" {
+		t.Fatalf("restarted job status=%q lastError=%q", status, lastError)
+	}
+}
+
+func TestStoppedOrchestrationJobIsSkippedByScheduler(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	stoppedTaskID := createTaskForTest(t, server.routes(), projectID, "Stopped orchestration")
+	queuedTaskID := createTaskForTest(t, server.routes(), projectID, "Queued orchestration")
+	now := time.Now().UTC()
+	for _, job := range []struct {
+		id, taskID, status string
+		position           int
+	}{
+		{"stopped", stoppedTaskID, orchestrationStopped, 1},
+		{"queued", queuedTaskID, orchestrationQueued, 2},
+	} {
+		if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,?,'{}',?,?)`, job.id, projectID, job.taskID, job.position, job.status, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, err := server.nextOrchestrationJob(context.Background(), projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job == nil || job.ID != "queued" {
+		t.Fatalf("next job=%#v, want queued job", job)
+	}
+}
+
+func TestListOrchestrationJobsReturnsWorktreePath(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "List worktree")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'paused','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,created_at,updated_at) values ('job','','自动编排-20260812-12345678','D:/worktrees/job',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/orchestration", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list: %d body=%s", response.Code, response.Body.String())
+	}
+	var jobs []OrchestrationJob
+	if err := json.Unmarshal(response.Body.Bytes(), &jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].WorktreePath != "D:/worktrees/job" {
+		t.Fatalf("jobs=%#v", jobs)
 	}
 }
 
@@ -3565,7 +3899,132 @@ func TestOrchestrationResumeMakesNeedsHumanTaskDispatchable(t *testing.T) {
 	assertTaskStatus(t, server, taskID, taskActionRequired)
 }
 
-func TestOrchestrationDependencyAcceptsIntegratedPredecessor(t *testing.T) {
+func TestOrchestrationPauseStopsAnActiveJob(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Pause active orchestration")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'implementing',7,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/pause", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("pause active job: %d body=%s", response.Code, response.Body.String())
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from task_orchestration_jobs where id='job'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != orchestrationPaused {
+		t.Fatalf("paused job status=%q", status)
+	}
+}
+
+func TestOrchestrationResumePausedCheckingTaskMakesItDispatchable(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Resume paused checking task")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'paused',7,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/resume", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("resume: %d body=%s", response.Code, response.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskActionRequired)
+}
+
+func TestPauseOrchestrationJobCancelsActiveWorker(t *testing.T) {
+	server := newTestServer(t)
+	cancelled := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	server.orchestrationMu.Lock()
+	server.orchestrationCancels["job"] = func() { cancel(); close(cancelled) }
+	server.orchestrationMu.Unlock()
+	server.cancelOrchestrationJob("job")
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("orchestration worker was not cancelled")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("orchestration cancellation callback was not invoked")
+	}
+}
+
+func TestEnqueueTaskIsIdempotentForAnExistingJob(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Idempotent orchestration enqueue")
+	task, err := server.taskByID(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := OrchestrationConfig{ProjectID: projectID, Enabled: true, AgentID: "claude-code", MainBranch: "main", VerificationCommands: []string{"true"}, MaxFixRounds: 1}
+	first, err := server.enqueueTask(context.Background(), task, cfg)
+	if err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	second, err := server.enqueueTask(context.Background(), task, cfg)
+	if err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("idempotent enqueue returned %q, want %q", second.ID, first.ID)
+	}
+	var count int
+	if err := server.db.QueryRow(`select count(*) from task_orchestration_jobs where task_id=?`, taskID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("job count=%d, want 1", count)
+	}
+}
+
+func TestIndependentReviewIntentIsPersistedBeforeAgentStarts(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Persist review intent")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,attempt,lease_token,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'checking',2,7,'{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	job := OrchestrationJob{ID: "job", ProjectID: projectID, TaskID: taskID, Attempt: 2, LeaseToken: 7}
+	intentID, err := server.beginIndependentReviewIntent(context.Background(), job, "abc123")
+	if err != nil {
+		t.Fatalf("begin review intent: %v", err)
+	}
+	var phase, intentStatus, sha, verificationStatus string
+	if err := server.db.QueryRow(`select intent.phase,intent.status,intent.reviewed_sha,verification.status from task_execution_intents intent join verification_runs verification on verification.id=intent.id where intent.id=?`, intentID).Scan(&phase, &intentStatus, &sha, &verificationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if phase != "review" || intentStatus != "running" || sha != "abc123" || verificationStatus != "running" {
+		t.Fatalf("review intent phase=%q status=%q sha=%q verification=%q", phase, intentStatus, sha, verificationStatus)
+	}
+}
+
+func TestWaitForOrchestrationJobShutdownWaitsForWorker(t *testing.T) {
+	server := newTestServer(t)
+	done := make(chan struct{})
+	server.orchestrationMu.Lock()
+	server.orchestrationDone["job"] = done
+	server.orchestrationMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := server.waitForOrchestrationJobShutdown(ctx, "job"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait error=%v, want deadline exceeded", err)
+	}
+	close(done)
+	if err := server.waitForOrchestrationJobShutdown(context.Background(), "job"); err != nil {
+		t.Fatalf("wait after worker exit: %v", err)
+	}
+}
+
+func TestOrchestrationDependencyAcceptsMergedPredecessor(t *testing.T) {
 	server, projectID, conversationID := seedTaskConversation(t)
 	predecessorID := createTaskForTest(t, server.routes(), projectID, "Integrated predecessor")
 	dependentID := createTaskForTest(t, server.routes(), projectID, "Dependent task")
@@ -3576,10 +4035,7 @@ func TestOrchestrationDependencyAcceptsIntegratedPredecessor(t *testing.T) {
 	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, predecessorID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('predecessor-job',?,?,1,'integrated_to_dev','{}',?,?)`, projectID, predecessorID, now, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,integration_sha,created_at,updated_at) values ('predecessor-job','base','task/predecessor','','integrated',?,?)`, now, now); err != nil {
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('predecessor-job',?,?,1,'released_to_main','{}',?,?)`, projectID, predecessorID, now, now); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := server.db.BeginTx(context.Background(), nil)
@@ -3589,8 +4045,226 @@ func TestOrchestrationDependencyAcceptsIntegratedPredecessor(t *testing.T) {
 	defer tx.Rollback()
 	err = server.validateTaskDispatchTx(context.Background(), tx, TaskRun{TaskID: dependentID, ConversationID: conversationID}, Conversation{ProjectID: projectID, ID: conversationID}, true)
 	if err != nil {
-		t.Fatalf("integrated predecessor should unblock orchestrated task: %v", err)
+		t.Fatalf("merged predecessor should unblock orchestrated task: %v", err)
 	}
+}
+
+func TestOrchestrationAwaitingMainRejectsManualAndBatchReview(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Awaiting main merge")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'awaiting_main','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	manual := httptest.NewRecorder()
+	server.routes().ServeHTTP(manual, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/review", bytes.NewBufferString(`{"action":"accept"}`)))
+	if manual.Code != http.StatusConflict {
+		t.Fatalf("manual review status=%d body=%s", manual.Code, manual.Body.String())
+	}
+
+	batch := httptest.NewRecorder()
+	server.routes().ServeHTTP(batch, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/tasks/review-all", bytes.NewBufferString(`{}`)))
+	if batch.Code != http.StatusOK {
+		t.Fatalf("batch review status=%d body=%s", batch.Code, batch.Body.String())
+	}
+	var result struct{ Accepted, Skipped, Total int }
+	if err := json.NewDecoder(batch.Body).Decode(&result); err != nil {
+		t.Fatalf("decode batch review: %v", err)
+	}
+	if result.Accepted != 0 || result.Skipped != 1 || result.Total != 1 {
+		t.Fatalf("batch review result=%+v", result)
+	}
+	assertTaskStatus(t, server, taskID, taskAwaitingReview)
+
+	if _, err := server.db.Exec(`update task_orchestration_jobs set status='integrated_to_dev' where id='job'`); err != nil {
+		t.Fatal(err)
+	}
+	legacyManual := httptest.NewRecorder()
+	server.routes().ServeHTTP(legacyManual, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/review", bytes.NewBufferString(`{"action":"accept"}`)))
+	if legacyManual.Code != http.StatusConflict {
+		t.Fatalf("legacy manual review status=%d body=%s", legacyManual.Code, legacyManual.Body.String())
+	}
+}
+
+func TestMergeTaskBranchToMainAndRecordsMerge(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test User"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "add", "README.md")
+	command.Dir = repo
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v: %s", err, output)
+	}
+	command = exec.Command("git", "commit", "-m", "baseline")
+	command.Dir = repo
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v: %s", err, output)
+	}
+	branch := "自动编排-20260812-12345678"
+	for _, args := range [][]string{{"checkout", "-b", branch}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "implemented.txt"), []byte("done\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "implemented.txt"}, {"commit", "-m", "task implementation"}, {"checkout", "main"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main-only.txt"), []byte("main change\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "main-only.txt"}, {"commit", "-m", "main change"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	readCommit := exec.Command("git", "rev-parse", branch)
+	readCommit.Dir = repo
+	commitOutput, err := readCommit.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read task branch commit: %v: %s", err, commitOutput)
+	}
+	commit := strings.TrimSpace(string(commitOutput))
+	if _, err := server.db.Exec(`update projects set path=?,git_branch='main' where id=?`, repo, projectID); err != nil {
+		t.Fatal(err)
+	}
+	taskID := createTaskForTest(t, server.routes(), projectID, "Confirm merged branch")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'awaiting_main','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,integration_sha,created_at,updated_at) values ('job',?,'自动编排-20260812-12345678','',?, ?,?)`, commit, commit, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/merge-main", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("merge task branch: %d body=%s", response.Code, response.Body.String())
+	}
+	readMain := exec.Command("git", "rev-parse", "main")
+	readMain.Dir = repo
+	mainOutput, err := readMain.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read main commit: %v: %s", err, mainOutput)
+	}
+	mergedCommit := strings.TrimSpace(string(mainOutput))
+	if mergedCommit == commit {
+		t.Fatal("expected a merge commit for diverged main and task branches")
+	}
+	containsTaskCommit := exec.Command("git", "merge-base", "--is-ancestor", commit, "main")
+	containsTaskCommit.Dir = repo
+	if output, err := containsTaskCommit.CombinedOutput(); err != nil {
+		t.Fatalf("main does not contain task commit: %v: %s", err, output)
+	}
+	var jobStatus string
+	if err := server.db.QueryRow(`select status from task_orchestration_jobs where id='job'`).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "released_to_main" {
+		t.Fatalf("job status=%q", jobStatus)
+	}
+	assertTaskStatus(t, server, taskID, taskDone)
+
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review',completed_at=null where id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`update task_orchestration_jobs set status='integrated_to_dev' where id='job'`); err != nil {
+		t.Fatal(err)
+	}
+	legacy := httptest.NewRecorder()
+	server.routes().ServeHTTP(legacy, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/merge-main", bytes.NewBufferString(`{}`)))
+	if legacy.Code != http.StatusNoContent {
+		t.Fatalf("merge already integrated branch: %d body=%s", legacy.Code, legacy.Body.String())
+	}
+	assertTaskStatus(t, server, taskID, taskDone)
+}
+
+func TestMergeTaskBranchToMainAbortsConflictAndPreservesState(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "shared.txt", "baseline\n")
+	runGitForTest(t, repo, "add", "shared.txt")
+	runGitForTest(t, repo, "commit", "-m", "baseline")
+	branch := "automatic-conflict-task"
+	runGitForTest(t, repo, "checkout", "-b", branch)
+	writeGitTestFile(t, repo, "shared.txt", "task change\n")
+	runGitForTest(t, repo, "commit", "-am", "task change")
+	commitOutput, err := exec.Command("git", "-C", repo, "rev-parse", branch).Output()
+	if err != nil {
+		t.Fatalf("read task commit: %v", err)
+	}
+	commit := strings.TrimSpace(string(commitOutput))
+	runGitForTest(t, repo, "checkout", "main")
+	writeGitTestFile(t, repo, "shared.txt", "main change\n")
+	runGitForTest(t, repo, "commit", "-am", "main change")
+	mainBeforeOutput, err := exec.Command("git", "-C", repo, "rev-parse", "main").Output()
+	if err != nil {
+		t.Fatalf("read main commit: %v", err)
+	}
+	mainBefore := strings.TrimSpace(string(mainBeforeOutput))
+	if _, err := server.db.Exec(`update projects set path=?,git_branch='main' where id=?`, repo, projectID); err != nil {
+		t.Fatal(err)
+	}
+	taskID := createTaskForTest(t, server.routes(), projectID, "Conflicting main merge")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update tasks set status='awaiting_review' where id=?`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('conflict-job',?,?,1,'awaiting_main','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,integration_sha,created_at,updated_at) values ('conflict-job',?,'automatic-conflict-task','',?, ?,?)`, mainBefore, commit, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/merge-main", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("conflicting merge status=%d body=%s", response.Code, response.Body.String())
+	}
+	mainAfterOutput, err := exec.Command("git", "-C", repo, "rev-parse", "main").Output()
+	if err != nil || strings.TrimSpace(string(mainAfterOutput)) != mainBefore {
+		t.Fatalf("main changed after conflict: output=%q err=%v", mainAfterOutput, err)
+	}
+	statusOutput, err := exec.Command("git", "-C", repo, "status", "--porcelain").Output()
+	if err != nil || strings.TrimSpace(string(statusOutput)) != "" {
+		t.Fatalf("repository not clean after conflict: output=%q err=%v", statusOutput, err)
+	}
+	var jobStatus string
+	if err := server.db.QueryRow(`select status from task_orchestration_jobs where id='conflict-job'`).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "awaiting_main" {
+		t.Fatalf("job status=%q want awaiting_main", jobStatus)
+	}
+	assertTaskStatus(t, server, taskID, taskAwaitingReview)
 }
 
 func TestOrchestrationRejectsStaleLeaseStateWrites(t *testing.T) {
@@ -5127,7 +5801,7 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 		t.Fatalf("dirty worktree error = %q", dirtyWorktree)
 	}
 
-	missingShell := errorText(errors.New(`dev baseline verification failed: ls: exec: "sh": executable file not found in %PATH%`))
+	missingShell := errorText(errors.New(`main baseline verification failed: ls: exec: "sh": executable file not found in %PATH%`))
 	if missingShell != "自动编排无法执行验证命令：系统找不到 sh。请升级服务端到支持 Windows 命令解释器的版本后，恢复队列并重试。" {
 		t.Fatalf("missing shell error = %q", missingShell)
 	}

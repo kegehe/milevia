@@ -82,13 +82,26 @@ type TaskEvent struct {
 	CreatedAt time.Time       `json:"createdAt"`
 }
 
+type VerificationRun struct {
+	ID          string     `json:"id"`
+	Phase       string     `json:"phase"`
+	Command     string     `json:"command"`
+	ReviewedSHA string     `json:"reviewedSha,omitempty"`
+	Status      string     `json:"status"`
+	ExitCode    int        `json:"exitCode"`
+	Output      string     `json:"output,omitempty"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	CompletedAt *time.Time `json:"completedAt,omitempty"`
+}
+
 type TaskDetail struct {
 	Task
-	PromptPreview string      `json:"promptPreview"`
-	CanDispatch   bool        `json:"canDispatch"`
-	BlockReason   string      `json:"blockReason,omitempty"`
-	Runs          []TaskRun   `json:"runs"`
-	Events        []TaskEvent `json:"events"`
+	PromptPreview    string            `json:"promptPreview"`
+	CanDispatch      bool              `json:"canDispatch"`
+	BlockReason      string            `json:"blockReason,omitempty"`
+	Runs             []TaskRun         `json:"runs"`
+	Events           []TaskEvent       `json:"events"`
+	VerificationRuns []VerificationRun `json:"verificationRuns"`
 }
 
 type taskInput struct {
@@ -361,7 +374,7 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	detail := TaskDetail{Task: task, PromptPreview: taskPrompt(task), Runs: []TaskRun{}, Events: []TaskEvent{}}
+	detail := TaskDetail{Task: task, PromptPreview: taskPrompt(task), Runs: []TaskRun{}, Events: []TaskEvent{}, VerificationRuns: []VerificationRun{}}
 	detail.CanDispatch, detail.BlockReason, err = s.taskDispatchEligibility(r.Context(), task, false)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -370,6 +383,9 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	detail.Runs, err = s.taskRuns(r.Context(), task.ID)
 	if err == nil {
 		detail.Events, err = s.taskEvents(r.Context(), task.ID)
+	}
+	if err == nil {
+		detail.VerificationRuns, err = s.verificationRunsForTask(r.Context(), task.ID)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -925,13 +941,36 @@ func (s *Server) hydrateTask(ctx context.Context, task *Task) error {
 		return err
 	}
 	var orchestrationUpdatedAt time.Time
-	err = s.db.QueryRowContext(ctx, `select status,updated_at from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human') order by updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt)
+	err = s.db.QueryRowContext(ctx, `select status,updated_at from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev') order by updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt)
 	if err == nil {
 		task.OrchestrationUpdatedAt = &orchestrationUpdatedAt
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	return nil
+}
+
+func (s *Server) verificationRunsForTask(ctx context.Context, taskID string) ([]VerificationRun, error) {
+	rows, err := s.db.QueryContext(ctx, `select verification.id,verification.phase,verification.command,verification.reviewed_sha,verification.status,verification.exit_code,verification.output,verification.created_at,verification.completed_at
+		from verification_runs verification join task_orchestration_jobs job on job.id=verification.job_id
+		where job.task_id=? order by verification.created_at desc`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []VerificationRun{}
+	for rows.Next() {
+		var item VerificationRun
+		var completedAt sql.NullTime
+		if err := rows.Scan(&item.ID, &item.Phase, &item.Command, &item.ReviewedSHA, &item.Status, &item.ExitCode, &item.Output, &item.CreatedAt, &completedAt); err != nil {
+			return nil, err
+		}
+		if completedAt.Valid {
+			item.CompletedAt = &completedAt.Time
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (s *Server) latestTaskRun(ctx context.Context, taskID string) (TaskRun, error) {
@@ -1182,6 +1221,10 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("automatic orchestration is still verifying this task"))
 		return
 	}
+	if s.isOrchestrationBranchAwaitingMain(r.Context(), task.ID) {
+		writeError(w, http.StatusConflict, errors.New("automatic orchestration branch must be merged into main before this task can be completed"))
+		return
+	}
 	if input.Action != "accept" && input.Action != "request_changes" {
 		writeError(w, http.StatusBadRequest, errors.New("review action must accept or request_changes"))
 		return
@@ -1268,7 +1311,7 @@ func (s *Server) reviewAllTasks(w http.ResponseWriter, r *http.Request) {
 	// 一律排除。该筛选与下方 UPDATE 处于同一事务、同一 Snapshot 连接（SQLite 写事务持有数据库锁），
 	// 从而把“检查编排状态”与“写入验收”放进同一个原子窗口，消除二者间的 TOCTOU 间隙。
 	// 全程只使用事务连接 tx，避免在 SQLite 单连接下对 s.db 再发查询导致死锁。
-	rows, err := tx.QueryContext(r.Context(), `select id from tasks where project_id=? and status=? and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking'))`, projectID, taskAwaitingReview)
+	rows, err := tx.QueryContext(r.Context(), `select id from tasks where project_id=? and status=? and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`, projectID, taskAwaitingReview)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1447,9 +1490,8 @@ func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun
 	dependencyArgs := []any{taskRun.TaskID, taskDone}
 	if orchestrated {
 		dependencyQuery = `select count(*) from task_dependencies dependency
-			left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status in ('integrated_to_dev','released_to_main')
-			left join git_task_records record on record.job_id=predecessor.id and record.integration_sha<>''
-			where dependency.task_id=? and record.job_id is null`
+			left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status='released_to_main'
+			where dependency.task_id=? and predecessor.id is null`
 		dependencyArgs = []any{taskRun.TaskID}
 	}
 	if err := tx.QueryRowContext(ctx, dependencyQuery, dependencyArgs...).Scan(&blockers); err != nil {

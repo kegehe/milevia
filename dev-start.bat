@@ -51,22 +51,25 @@ echo   Subsequent launches reuse caches and are much faster.
 echo.
 
 rem --- sidecar rebuild policy ------------------------------------------------
-rem  The Go sidecar (milevia-control.exe / milevia-approval.exe) uses go-sqlite3,
-rem  which requires CGO + gcc/mingw-w64 to rebuild. This machine has no gcc on
-rem  PATH, so by default we REUSE the existing binaries under
-rem  apps/desktop/binaries/ and skip the Go toolchain entirely. Frontend (apps/web)
-rem  and Rust still hot-reload normally.
+rem  The Go sidecar (milevia-control.exe / milevia-approval.exe) uses go-sqlite3
+rem  and therefore requires CGO + gcc/mingw-w64. Rebuild it automatically when
+rem  the toolchain is available so Go fixes are not silently omitted from dev
+rem  launches. Machines without gcc keep reusing the existing binaries.
 rem
-rem  To force a sidecar rebuild (e.g. after editing Go code), install mingw-w64,
-rem  set CGO_ENABLED=1, and run with MILEVIA_SKIP_SIDECAR=0:
-rem    set MILEVIA_SKIP_SIDECAR=0 && dev-start.bat
-
-if not defined MILEVIA_SKIP_SIDECAR set "MILEVIA_SKIP_SIDECAR=1"
+rem  Override the automatic choice with MILEVIA_SKIP_SIDECAR=1 or =0.
+if not defined MILEVIA_SKIP_SIDECAR (
+  where gcc >nul 2>nul
+  if errorlevel 1 (
+    set "MILEVIA_SKIP_SIDECAR=1"
+  ) else (
+    set "MILEVIA_SKIP_SIDECAR=0"
+  )
+)
 
 if "%MILEVIA_SKIP_SIDECAR%"=="1" (
   echo [Milevia] Reusing existing sidecar binaries ^(skipping Go rebuild^).
   echo   Edits to Go code under apps/control-server will NOT take effect.
-  echo   To rebuild the sidecar, install gcc and run with MILEVIA_SKIP_SIDECAR=0.
+  echo   Install gcc and run with MILEVIA_SKIP_SIDECAR=0 to rebuild the sidecar.
   echo.
   cd /d "%ROOT%apps\desktop"
   call pnpm exec tauri dev

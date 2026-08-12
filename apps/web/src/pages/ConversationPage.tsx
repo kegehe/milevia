@@ -396,7 +396,7 @@ function HistorySearchIcon() {
 
 type ConversationHistoryPage = { items: Conversation[]; nextCursor: string };
 
-function ConversationHistoryDialog({ conversations, activeID, busyID, close, activate, search, hasMore, loadingMore, loadMore }: { conversations: Conversation[]; activeID: string; busyID: string; close: () => void; activate: (item: Conversation) => Promise<void>; search: (query: string) => void; hasMore: boolean; loadingMore: boolean; loadMore: () => void }) {
+function ConversationHistoryDialog({ conversations, activeID, busyID, close, activate, view, search, hasMore, loadingMore, loadMore }: { conversations: Conversation[]; activeID: string; busyID: string; close: () => void; activate: (item: Conversation) => Promise<void>; view: (item: Conversation) => void; search: (query: string) => void; hasMore: boolean; loadingMore: boolean; loadMore: () => void }) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   useEffect(() => {
@@ -404,7 +404,11 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
     return () => window.clearTimeout(timer);
   }, [query, search]);
   useEffect(() => { setSelected(0); }, [conversations, query]);
-  const select = (item: Conversation) => { if (item.id !== activeID && item.status !== "running" && !busyID) void activate(item); };
+  const select = (item: Conversation) => {
+    if (busyID || item.id === activeID) return;
+    if (item.status === "running") { view(item); return; }
+    void activate(item);
+  };
   const keyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Escape") { event.preventDefault(); close(); return; }
     if (event.key === "ArrowDown") { event.preventDefault(); setSelected((index) => Math.min(conversations.length - 1, index + 1)); return; }
@@ -414,7 +418,7 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
   return <div className="backdrop history-backdrop" role="dialog" aria-modal="true" aria-labelledby="conversation-history-title"><section className="modal conversation-history"><header><div className="conversation-history-heading"><span className="conversation-history-mark"><HistoryIcon /></span><div><h2 id="conversation-history-title">会话历史</h2></div></div><button type="button" className="conversation-history-close" title="关闭" aria-label="关闭" onClick={close}><DialogCloseIcon /></button></header><div className="history-toolbar"><label className="history-search"><HistorySearchIcon /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={keyDown} placeholder="搜索会话标题或内容" /></label><span>{query ? `${conversations.length} 个匹配` : `${conversations.length} 个会话`}</span></div><div className="history-list">{conversations.length === 0 ? <p className="history-empty">没有匹配的会话</p> : conversations.map((item, index) => {
     const runningElsewhere = item.status === "running" && item.id !== activeID;
     const state = busyID === item.id ? "切换中" : item.id === activeID ? "当前会话" : runningElsewhere ? "运行中" : "";
-    return <button key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""} ${runningElsewhere ? "running" : ""}`} disabled={Boolean(busyID) || runningElsewhere} onMouseEnter={() => setSelected(index)} onClick={() => select(item)}><span className="history-item-main"><span className="history-item-title"><b>{item.title || "新会话"}</b><span className={`history-item-agent ${item.agentId === "codex" ? "codex" : "claude"}`}>{item.agentId === "codex" ? "Codex" : "Claude Code"}</span></span><small>{item.preview || "尚未发送消息"}</small></span><span className="history-item-meta">{state && <em>{state}</em>}<time>{formatHistoryTime(item.lastActivityAt)}</time></span></button>;
+    return <button key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""} ${runningElsewhere ? "running" : ""}`} disabled={Boolean(busyID)} onMouseEnter={() => setSelected(index)} onClick={() => runningElsewhere ? view(item) : select(item)}><span className="history-item-main"><span className="history-item-title"><b>{item.title || "新会话"}</b><span className={`history-item-agent ${item.agentId === "codex" ? "codex" : "claude"}`}>{item.agentId === "codex" ? "Codex" : "Claude Code"}</span></span><small>{item.preview || "尚未发送消息"}</small></span><span className="history-item-meta">{state && <em>{state}</em>}<time>{formatHistoryTime(item.lastActivityAt)}</time></span></button>;
   })}</div>{hasMore && <button className="secondary load-earlier-history" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "加载中" : "加载更多会话"}</button>}<footer><span>{busyID ? "正在切换会话" : `${conversations.length} 条记录`}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
 }
 
@@ -664,7 +668,10 @@ export default function ConversationPage() {
   const closeAgentExecution = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("execution"); return next; });
   const openUsage = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("usage", "true"); return next; });
   const openNewConversationParam = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("new", "true"); return next; });
-  const openAiConfig = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("config", "true"); return next; });
+  const openAiConfig = () => {
+    if (readOnlyConversation) return;
+    setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("config", "true"); return next; });
+  };
   const closeAiConfig = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("config"); return next; });
   const openExecutionParam = useCallback((runId: string) => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("execution", runId); return next; }), [setSearchParams]);
 
@@ -687,6 +694,7 @@ export default function ConversationPage() {
   const [changingPermission, setChangingPermission] = useState(false);
   // 弹窗状态 — 通过 URL search params 驱动
   const showHistory = searchParams.get("history") === "true";
+	const readOnlyConversation = searchParams.get("readonly") === "true";
   const showNewConversation = searchParams.get("new") === "true";
   const showUsage = searchParams.get("usage") === "true";
   const showAgentExecution = searchParams.get("execution");
@@ -955,7 +963,8 @@ export default function ConversationPage() {
     let cancelled = false;
     const abort = new AbortController();
     const isCurrentRoute = () => !cancelled && !conversationTransitionRef.current;
-    const activateCurrentRoute = async () => {
+		const activateCurrentRoute = async () => {
+			if (readOnlyConversation) return null;
       let release!: () => void;
       const previous = conversationActivationTail.current;
       conversationActivationTail.current = new Promise<void>((resolve) => { release = resolve; });
@@ -974,7 +983,11 @@ export default function ConversationPage() {
           const detail = await projectApi<{ conversation: Conversation & { projectId: string } }>(`/api/conversations/${urlConversationId}?limit=1`, { signal: abort.signal });
           if (!isCurrentRoute()) return;
           if (detail.conversation.projectId !== projectId) throw new Error("指定会话不属于当前项目");
-          if (detail.conversation.status === "running" && !detail.conversation.isCurrent) throw new Error("指定会话正在其他项目窗口中运行");
+			if (readOnlyConversation) {
+				resetConversationView(detail.conversation);
+				return;
+			}
+			if (detail.conversation.status === "running" && !detail.conversation.isCurrent) throw new Error("指定会话正在其他项目窗口中运行");
           const activated = await activateCurrentRoute();
           if (isCurrentRoute()) {
             if (!activated) return;
@@ -1011,7 +1024,7 @@ export default function ConversationPage() {
     }
     void loadConversation();
     return () => { cancelled = true; abort.abort(); };
-  }, [projectId, urlConversationId, clearing, fail, refreshConversationHistory, projectApi, navigate]);
+  }, [projectId, urlConversationId, readOnlyConversation, clearing, fail, refreshConversationHistory, projectApi, navigate]);
 
   // 加载快捷方式
   useEffect(() => {
@@ -1591,7 +1604,7 @@ export default function ConversationPage() {
 
   // 业务方法
   const sendContent = async (rawContent: string, clearDraft = true) => {
-    if (!conversation || sending || clearing || stopping || shortcutBusy) return;
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
     const content = rawContent.trim();
     if (!content) return;
     if (content === "/resume") {
@@ -1702,7 +1715,7 @@ export default function ConversationPage() {
   }, [isConversationIdle, pendingSendContent, clearing, sendContent, sending, shortcutBusy, stopping]);
 
   const runShortcut = async (shortcut: Shortcut, variables: Record<string, string> = {}, variablesReady = false) => {
-    if (!conversation || sending || clearing || stopping || shortcutBusy) return;
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
     const required = requiredShortcutVariables(shortcut.template);
     if (!variablesReady && required.length) { setShortcutVariables({ shortcut, variables }); return; }
     if (shortcut.defaultAction === "fill") {
@@ -1748,7 +1761,7 @@ export default function ConversationPage() {
   };
 
   const clearConversationContext = () => {
-    if (!conversation || sending || clearing || stopping || shortcutBusy) return;
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
     if (run) {
       // 运行中时先停止再清空
       setPendingConfirm({
@@ -1884,8 +1897,13 @@ export default function ConversationPage() {
     finally { setActivatingConversation(""); }
   };
 
+	const viewConversation = (item: Conversation) => {
+		closeHistory();
+		if (projectId) navigate(`/projects/${projectId}/conversations/${item.id}?readonly=true`);
+	};
+
   const changePermissionMode = async (permissionMode: PermissionMode) => {
-    if (!conversation || conversation.permissionMode === permissionMode || run || clearing || stopping) return;
+    if (!conversation || readOnlyConversation || conversation.permissionMode === permissionMode || run || clearing || stopping) return;
     if (permissionMode === "full_control") { setShowPermissionMenu(false); setShowFullControlConfirmation(true); return; }
     const conversationID = conversation.id;
     setChangingPermission(true);
@@ -1936,7 +1954,7 @@ export default function ConversationPage() {
   };
 
   const stopRun = async () => {
-    if (!conversation || !run || stopping) return;
+    if (!conversation || readOnlyConversation || !run || stopping) return;
     const conversationID = conversation.id;
     const routeVersion = conversationRouteVersion.current;
     const runID = run;
@@ -2084,15 +2102,15 @@ export default function ConversationPage() {
   };
 
   const useSkill = (skill: Skill) => {
-    if (!conversation || sending || clearing || stopping || Boolean(shortcutBusy) || skillsLoading) return;
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || skillsLoading) return;
     setComposerText(mergeSkillPrompt(skill));
     requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
   };
 
   const renderShortcutCell = (shortcut: Shortcut | undefined, kind: "prompt" | "command_request", placeholder = false) => {
     if (!shortcut && placeholder) return <div className="quick-tag-slot" aria-hidden="true" />;
-    if (!shortcut) return <button type="button" className={`quick-tag-empty${kind === "command_request" ? " command-tag" : ""}`} onClick={() => setShortcutEditor({ kind })}>{kind === "command_request" ? "添加命令" : "添加提示词"}</button>;
-    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={!shortcut.enabled || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.template}\n\n${shortcut.name}已停用`}><span className="quick-tag-text">{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</span></button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} aria-label={`编辑 ${shortcut.name}`} disabled={clearing || Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}><ShortcutMoreIcon /></button></div>;
+    if (!shortcut) return <button type="button" className={`quick-tag-empty${kind === "command_request" ? " command-tag" : ""}`} disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind })}>{kind === "command_request" ? "添加命令" : "添加提示词"}</button>;
+    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={readOnlyConversation || !shortcut.enabled || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.template}\n\n${shortcut.name}已停用`}><span className="quick-tag-text">{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</span></button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} aria-label={`编辑 ${shortcut.name}`} disabled={readOnlyConversation || clearing || Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}><ShortcutMoreIcon /></button></div>;
   };
 
   const reorderKind = useCallback(async (kind: SortableShortcutKind, orderedIDs: string[]) => {
@@ -2110,7 +2128,7 @@ export default function ConversationPage() {
 
   const renderPromptCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "prompt");
   const renderCommandCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "command_request");
-  const sortableDraggingDisabled = sending || clearing || stopping || Boolean(shortcutBusy);
+  const sortableDraggingDisabled = readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy);
 
   // Skill 组内容：标题 + 按来源分组的技能标签列表。技能点击填入输入框；加载中 / 空态单独呈现。
   const skillSourceMeta: Record<Skill["source"], { label: string; className: string; title: string }> = {
@@ -2144,7 +2162,7 @@ export default function ConversationPage() {
                 </button>
                 {!collapsed && <ul className="quick-tag-list">{group.map((skill) => (
                   <li key={skill.name} className="quick-tag-item skill-item">
-                    <button type="button" className="skill-tag" disabled={!conversation || sending || clearing || stopping || Boolean(shortcutBusy)} data-tooltip-title={skill.name} data-tooltip-desc={truncateSkillDescription(skill.description, skill.name)} onClick={() => useSkill(skill)}>
+                    <button type="button" className="skill-tag" disabled={readOnlyConversation || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} data-tooltip-title={skill.name} data-tooltip-desc={truncateSkillDescription(skill.description, skill.name)} onClick={() => useSkill(skill)}>
                       <span className="skill-tag-text">{skill.name}</span>
                     </button>
                   </li>
@@ -2160,25 +2178,25 @@ export default function ConversationPage() {
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
         <div className="head-actions">
           <button className="conversation-head-action secondary" type="button" disabled={sending} onClick={openConversationHistory}><HistoryIcon /><span>历史</span></button>
-          <button className="conversation-head-action secondary" type="button" onClick={openAiConfig}><ProjectConfigIcon /><span>AI 配置</span></button>
+          <button className="conversation-head-action secondary" type="button" disabled={readOnlyConversation} onClick={openAiConfig}><ProjectConfigIcon /><span>AI 配置</span></button>
           <div className="permission-menu">
-            <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} type="button" aria-haspopup="menu" aria-expanded={showPermissionMenu} disabled={!!run || clearing || stopping || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}><PermissionModeIcon /><span>{permissionLabel}</span></button>
+          <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} type="button" aria-haspopup="menu" aria-expanded={showPermissionMenu} disabled={readOnlyConversation || !!run || clearing || stopping || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}><PermissionModeIcon /><span>{permissionLabel}</span></button>
             {showPermissionMenu && <div className="permission-popover" role="menu">{isCodex ? <><button className={conversation?.permissionMode === "read_only" ? "selected" : ""} onClick={() => void changePermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={conversation?.permissionMode === "workspace_write" ? "selected" : ""} onClick={() => void changePermissionMode("workspace_write")}><b>项目内执行</b><span>可在当前项目范围内读写和执行。</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>不受沙箱限制，命令直接执行</span></button></> : <><button className={conversation?.permissionMode === "approval_required" ? "selected" : ""} onClick={() => void changePermissionMode("approval_required")}><b>默认权限</b><span>命令执行前需要确认</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>命令直接执行</span></button></>}</div>}
           </div>
-          <button className="conversation-head-action new-conversation-action primary" type="button" disabled={!!run || sending || stopping} onClick={openNewConversationParam}><NewConversationIcon /><span>新会话</span></button>
+          <button className="conversation-head-action new-conversation-action primary" type="button" disabled={readOnlyConversation || !!run || sending || stopping} onClick={openNewConversationParam}><NewConversationIcon /><span>新会话</span></button>
         </div>
       </div>, document.querySelector('.head-actions-slot') || document.body)}
     {/* 对话面板：快捷方式、对话内容和任务队列 */}
     <section className="conversation-canvas">
       <aside className="quick-tag-rail" aria-label="常用操作">
         <div className="quick-actions-row">
-          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           {renderSkillGroup()}
         </div>
         <div className="quick-actions-mobile">
-          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           {renderSkillGroup()}
         </div>
       </aside>
@@ -2199,17 +2217,17 @@ export default function ConversationPage() {
       </div>
       <form ref={composerRef} className={`composer${pendingApproval ? " has-approval" : ""}${isEmptyConversation ? " empty-session" : ""}`} onSubmit={(event) => void send(event)}>
         {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
-        <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={`描述希望${isCodex ? " Codex" : " Claude"}在当前项目中完成的工作...`} disabled={sending || clearing || stopping || Boolean(shortcutBusy)} />
-        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {isCodex ? "Codex" : "Claude"}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={!text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
+        <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望${isCodex ? " Codex" : " Claude"}在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} />
+        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={readOnlyConversation || sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {isCodex ? "Codex" : "Claude"}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
         {pendingSendContent && <div className="composer-pending"><span className="composer-pending-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2" /></svg></span><span className="composer-pending-text"><b>已预约发送</b><small>{run ? "等待当前任务完成..." : "等待子代理完成..."}<span className="composer-pending-preview">{pendingSendContent.length > 40 ? `${pendingSendContent.slice(0, 40)}…` : pendingSendContent}</span></small></span><button className="composer-pending-cancel" type="button" title="撤回预约并带回输入框" onClick={cancelScheduledSend}>取消</button></div>}
       </form>
       </section>
-      <aside className="task-queue-rail" aria-label="任务队列">
+      {!readOnlyConversation && <aside className="task-queue-rail" aria-label="任务队列">
         <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} />
-      </aside>
+      </aside>}
     </section>
     {showNewConversation && <NewConversationDialog runnerID={project.runner} close={closeNewConversation} create={newConversation} />}
-    {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} search={searchConversationHistory} hasMore={Boolean(conversationHistoryCursor)} loadingMore={loadingMoreConversationHistory} loadMore={loadMoreConversationHistory} />}
+    {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} view={viewConversation} search={searchConversationHistory} hasMore={Boolean(conversationHistoryCursor)} loadingMore={loadingMoreConversationHistory} loadMore={loadMoreConversationHistory} />}
     {showFullControlConfirmation && <FullControlConfirmationDialog close={() => setShowFullControlConfirmation(false)} confirm={confirmFullControl} changing={changingPermission} isCodex={isCodex} />}
     {showAgentExecution && agentExecutions.find((execution) => execution.runId === showAgentExecution) && <AgentExecutionDialog execution={agentExecutions.find((execution) => execution.runId === showAgentExecution)!} close={closeAgentExecution} />}
     {showUsage && <UsageDialog agentID={conversation?.agentId || "claude-code"} usage={usage} currentRun={currentUsage} close={closeUsage} />}

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskOrchestrating, sortQueueTasks, taskDisplayStatus, taskDisplayStatusClass, taskQueueNote, type Task } from "./task-model.ts";
+import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskAwaitingMainMerge, isTaskOrchestrating, sortQueueTasks, taskDisplayStatus, taskDisplayStatusClass, taskQueueNote, type Task } from "./task-model.ts";
 
 const makeTask = (id: string, overrides: Partial<Task> = {}): Task => ({
   id,
@@ -60,6 +60,15 @@ test("shows awaiting review note", () => {
   assert.equal(canRedispatch(review), false);
 });
 
+test("marks verified orchestration branches as awaiting main merge", () => {
+  for (const orchestrationStatus of ["awaiting_main", "integrated_to_dev"]) {
+    const task = makeTask(orchestrationStatus, { status: "awaiting_review", orchestrationStatus });
+    assert.equal(isTaskAwaitingMainMerge(task), true);
+    assert.equal(taskDisplayStatus(task), "待合并 main");
+    assert.match(taskQueueNote(task), /可合并至 main/);
+  }
+});
+
 test("makes an active independent review visible ahead of manual review", () => {
   const review = makeTask("review", { status: "awaiting_review", orchestrationStatus: "checking", orchestrationUpdatedAt: "2026-07-20T00:01:00Z" });
 
@@ -67,6 +76,15 @@ test("makes an active independent review visible ahead of manual review", () => 
   assert.equal(taskDisplayStatusClass(review), "orchestration-checking");
   assert.equal(isTaskOrchestrating(review), true);
   assert.match(taskQueueNote(review), /独立审查代理正在检查/);
+});
+
+test("shows orchestration cleanup as an active state", () => {
+  const task = makeTask("cleanup", { status: "action_required", orchestrationStatus: "removing" });
+
+  assert.equal(taskDisplayStatus(task), "自动编排清理中");
+  assert.equal(taskDisplayStatusClass(task), "orchestration-removing");
+  assert.equal(isTaskOrchestrating(task), true);
+  assert.match(taskQueueNote(task), /正在停止执行并清理工作区/);
 });
 
 test("orders equal-priority tasks by position before creation time", () => {
@@ -163,39 +181,19 @@ test("keeps file tabs in sync with renamed and removed paths", () => {
   assert.match(source, /prev\.filter\(\(file\) => !isPathAtOrBelow\(file\.path, removedPath\)\)/);
 });
 
-test("refreshes active orchestration jobs and renders their review status", () => {
+test("loads orchestration configuration for single-task enqueue", () => {
   const source = readFileSync(new URL("./TaskBoard.tsx", import.meta.url), "utf8");
 
-  assert.match(source, /\["queued", "preparing", "implementing", "checking"\]/);
-  assert.match(source, /loadOrchestration\(\)\.catch/);
+  assert.match(source, /request<OrchestrationConfig>\(`\/api\/projects\/\$\{projectID\}\/orchestration\/config`\)/);
+  assert.match(source, /await Promise\.all\(\[refresh\(detail\.id\), loadOrchestration\(\)\]\)/);
   assert.match(source, /taskDisplayStatus\(task\)/);
 });
 
-test("keeps strict-serial orchestration controls visible and records responsive", () => {
+test("keeps automatic orchestration as a dedicated workspace", () => {
   const source = readFileSync(new URL("./TaskBoard.tsx", import.meta.url), "utf8");
-  const styles = readFileSync(new URL("../../tasks.css", import.meta.url), "utf8");
-  const dialogSource = source.slice(source.indexOf("function OrchestrationDialog"), source.indexOf("function TaskDetailDialog"));
-  const mobileStyles = styles.slice(styles.indexOf("@media (max-width: 600px)"));
 
-  assert.match(dialogSource, /className="modal task-dialog orchestration-dialog"/);
-  assert.match(dialogSource, /className="orchestration-dialog-body"/);
-  assert.match(dialogSource, /className="orchestration-enabled"/);
-  assert.match(dialogSource, /orchestrationStatusLabel\(job\.status\)/);
-  assert.match(source, /integrated_to_dev:\s*"已集成 dev"/);
-  assert.match(dialogSource, /orchestration-release-branch/);
-  assert.doesNotMatch(dialogSource, /task-run-list/);
-  assert.match(dialogSource, /const operationRef = useRef\(false\);/);
-  assert.match(dialogSource, /if \(operationRef\.current\) return;/);
-  assert.doesNotMatch(dialogSource, /disabled=\{Boolean\(action\)\}/);
-  assert.match(dialogSource, /disabled=\{busy\} onClick=\{\(\) => void runAction/);
-  assert.match(dialogSource, /input required disabled=\{busy\}/);
-  assert.match(dialogSource, /textarea required disabled=\{busy\}/);
-  assert.match(styles, /\.orchestration-dialog form\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
-  assert.match(styles, /\.orchestration-dialog-body\s*\{[^}]*overflow-y:\s*auto;/);
-  assert.match(styles, /\.orchestration-enabled input\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;/s);
-  assert.match(styles, /\.orchestration-release-branch\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
-  assert.match(styles, /\.orchestration-status\[data-status="integrated_to_dev"\]/);
-  assert.match(mobileStyles, /\.orchestration-record-actions\s*\{[^}]*grid-column:\s*1;/);
+  assert.match(source, /navigate\(`\/projects\/\$\{projectID\}\/orchestration`\)/);
+  assert.doesNotMatch(source, /编排设置/);
 });
 
 test("prevents duplicate task review submissions", () => {
@@ -203,7 +201,10 @@ test("prevents duplicate task review submissions", () => {
 
   assert.match(source, /const \[reviewSubmitting, setReviewSubmitting\] = useState\(false\);/);
   assert.match(source, /if \(reviewSubmitting\) return;/);
-  assert.match(source, /disabled=\{reviewSubmitting\} onClick=\{\(\) => void submitReview\("request_changes"\)\}/);
+	assert.match(source, /disabled=\{reviewSubmitting\} onClick=\{\(\) => void submitReview\("request_changes"\)\}/);
+	assert.doesNotMatch(source, /task-detail-close" title="关闭" aria-label="关闭" disabled=\{reviewBusy\}/);
+	assert.match(source, /<h3>验证记录<\/h3>/);
+	assert.match(source, /verificationPhaseLabel\(run\.phase\)/);
 });
 
 test("defines a responsive task work rail", () => {
