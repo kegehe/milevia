@@ -1,11 +1,11 @@
 {
-  "version": "0.1.1",
-  "notes": "优化建议支持编辑/删除/发送到对话; 修复 Pass B 静默丢弃; 修复 SQLite 相关回归",
-  "pub_date": "2026-08-11T06:59:04.293Z",
+  "version": "0.1.2",
+  "notes": "任务编排、运行环境与对话请求可靠性增强",
+  "pub_date": "2026-08-17T03:48:24.517Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnc3dnUFNaK2hVYmlqc3B3TE9xV2VKdkkxUFVnQTQrTkY4M2k2ZkYwWFEwbFhROVVkWHZQTk1XWXRRRVIzVW84Wi9vL1VXdE4ycGxVdDJUT2NGcjkxZUFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NDMxNTQ0CWZpbGU6TWlsZXZpYV8wLjEuMV94NjQtc2V0dXAuZXhlCngvZjRnRmtWVjZTOTZNMWpoOThBWjdsTElqNFU4TjZTeGpRNkhYNUhPTFo5RGh4a3cyN0JXOThhZzcyOFFNVFplODNzSVgwUjR1KzdUVkwxa2dNSUR3PT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.1/Milevia_0.1.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczYxa3RpWGtGZ1AyN1pVWW1nQjVIRGZXY1BSbUt0Z1JBY1pqMVRHdVdMVmMxY0M0eUR0ejdCbjlvZXRWenRmNFBNZks2eDAwa3ZMeHJudzhuS3RuUGdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2OTM4NTA0CWZpbGU6TWlsZXZpYV8wLjEuMl94NjQtc2V0dXAuZXhlCkdHazMyZkIzOEh2UE1UcE5pRzJyTWpQTldjT2tMKzdMNDNVN242RStnUmhoK1Jzem5mZUF2NkRFbjh0U1dNOVRybDY4S2l2ZFNWdnhaYi8zSmlZeUF3PT0K",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.2/Milevia_0.1.2_x64-setup.exe"
     }
   }
 }

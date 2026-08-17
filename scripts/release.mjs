@@ -164,7 +164,9 @@ const manifest = {
 };
 
 const manifestOut = join(repoRoot, "release", "latest.json");
-writeFileSync(manifestOut, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+const manifestText = JSON.stringify(manifest, null, 2) + "\n";
+writeFileSync(manifestOut, manifestText, "utf8");
+writeFileSync(join(repoRoot, "latest.json"), manifestText, "utf8");
 console.log(`已生成升级清单：${manifestOut}`);
 console.log(`\n清单内容：\n${JSON.stringify(manifest, null, 2)}`);
 
@@ -198,9 +200,13 @@ function buildEnv() {
 
   const found = findCompilerDir();
   if (found) {
-    const sep = env.PATH.includes(";") ? ";" : ":";
-    if (!env.PATH.split(sep).some((p) => p.toLowerCase() === found.toLowerCase())) {
-      env.PATH = found + sep + env.PATH;
+    // Windows normally exposes `Path`, whereas inherited Node environments
+    // can expose `PATH`. Preserve the original spelling for child processes.
+    const pathKey = Object.prototype.hasOwnProperty.call(env, "Path") ? "Path" : "PATH";
+    const currentPath = env[pathKey] || "";
+    const sep = currentPath.includes(";") ? ";" : ":";
+    if (!currentPath.split(sep).some((p) => p.toLowerCase() === found.toLowerCase())) {
+      env[pathKey] = found + (currentPath ? sep + currentPath : "");
     }
   }
   const gcc = execFileSync("go", ["env", "CC"], { encoding: "utf8" }).trim();
