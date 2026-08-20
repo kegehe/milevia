@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -36,21 +37,30 @@ func TestHomeProjectStillRoutesThroughLocalRunner(t *testing.T) {
 	if err := json.NewDecoder(create.Body).Decode(&project); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if project.Environment != "wsl" {
-		t.Errorf("home project environment=%q; want wsl", project.Environment)
+	wantEnvironment := "wsl"
+	wantTarget := agentTargetEnvWSL
+	if runtime.GOOS == "windows" {
+		wantEnvironment = "windows"
+		wantTarget = agentTargetEnvWindows
+	}
+	if project.Environment != wantEnvironment {
+		t.Errorf("home project environment=%q; want %s", project.Environment, wantEnvironment)
 	}
 	if !project.AgentReady || !project.ClaudeReady {
 		t.Errorf("home project should be claude ready; project=%#v", project)
 	}
 	// 确认 resolver 对该 home 路径返回 wsl。
-	if got := server.resolveAgentTargetEnv(project.Runner, project.Path); got != agentTargetEnvWSL {
-		t.Errorf("resolveAgentTargetEnv(home)=%q; want wsl", got)
+	if got := server.resolveAgentTargetEnv(project.Runner, project.Path); got != wantTarget {
+		t.Errorf("resolveAgentTargetEnv(home)=%q; want %s", got, wantTarget)
 	}
 }
 
 // TestMntProjectResolvesToWindowsEnvironment 验证 /mnt/ 项目被如实标为 windows 环境，
 // 且 createProject 的就绪校验路由到 Windows 侧 runner（注入 stub，不触发真实 PowerShell）。
 func TestMntProjectResolvesToWindowsEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the /mnt path cross-environment routing is specific to a WSL host")
+	}
 	server := envFlowServer(t)
 
 	// 纯逻辑层：/mnt/ 路径 → windows（与真实挂载无关）。
@@ -74,6 +84,9 @@ func TestMntProjectResolvesToWindowsEnvironment(t *testing.T) {
 
 // TestAgentTargetEnvUnavailableWindows 验证跨界不可用时的中文明文（不静默回退 WSL）。
 func TestAgentTargetEnvUnavailableWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows target is local on a Windows host, not cross-environment")
+	}
 	server := envFlowServer(t)
 	server.windowsRunner = &countingReadyRunner{ready: false}
 

@@ -46,7 +46,10 @@ export function taskDisplayStatus(task: Task): string {
 }
 
 export function taskDisplayStatusClass(task: Task): string {
-  return task.orchestrationStatus ? `orchestration-${task.orchestrationStatus}` : task.status === "running" && task.lastRun?.status === "queued" ? "action_required" : task.status;
+  // 队列中的任务（status=running、lastRun=queued）仅等待执行，属于执行管线的一环：
+  // 沿用 running 的青色样式，而不是"需处理"（action_required）的琥珀色——后者语义是
+  // 需要人工处理，两者字体可能一致但颜色必须区分，避免排队态被误读为待人工处理。
+  return task.orchestrationStatus ? `orchestration-${task.orchestrationStatus}` : task.status;
 }
 
 export function isTaskOrchestrating(task: Task): boolean {

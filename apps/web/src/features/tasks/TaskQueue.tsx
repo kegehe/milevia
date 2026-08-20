@@ -51,6 +51,7 @@ function DispatchCloseIcon() {
 export function TaskQueue({ projectID, conversationID, permissionMode, request, fail, dispatchDisabled = false, onDispatched, openBoard }: { projectID: string; conversationID: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; dispatchDisabled?: boolean; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<TaskFilter>("active");
+  const [query, setQuery] = useState("");
   const [confirmingTaskID, setConfirmingTaskID] = useState<string | null>(null);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -114,7 +115,11 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     return () => window.clearInterval(interval);
   }, [loadTasks]);
 
-  const queueTasks = useMemo(() => sortQueueTasks(filterQueueTasks(tasks, filter)), [filter, tasks]);
+  const queueTasks = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    const filtered = term ? tasks.filter((task) => task.title.toLowerCase().includes(term) || task.description.toLowerCase().includes(term)) : tasks;
+    return sortQueueTasks(filterQueueTasks(filtered, filter));
+  }, [filter, query, tasks]);
   const taskCounts = useMemo(() => Object.fromEntries(filters.map((item) => [item.id, filterQueueTasks(tasks, item.id).length])) as Record<TaskFilter, number>, [tasks]);
   const confirmingTask = tasks.find((task) => task.id === confirmingTaskID);
 
@@ -482,6 +487,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     <div className="task-queue-panel">
       <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions">{taskCounts.awaiting_review > 0 && <button type="button" className="task-queue-review-all" disabled={approvingAll} title="一键验收全部待验收任务" aria-label="一键验收全部待验收任务" onClick={confirmReviewAll}>{approvingAll ? "验收中" : "一键验收"}{!approvingAll && <b>{taskCounts.awaiting_review}</b>}</button>}<button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button></div></header>
       {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => setQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
+      <div className="task-queue-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg><input type="search" value={query} placeholder="搜索任务…" aria-label="搜索任务" onChange={(event) => setQuery(event.target.value)} /></div>
       <nav className="task-queue-filters" aria-label="任务筛选">{filters.map((item) => <button type="button" key={item.id} className={filter === item.id ? "active" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<span>{taskCounts[item.id]}</span></button>)}</nav>
       <div className="task-queue-list">{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={(edit = false) => void openInlineDetail(task.id, edit)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} dispatchDisabled={dispatchDisabled} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop}
         inlineDetailID={inlineDetailID}
@@ -841,7 +847,7 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, dispa
   return <div className="task-inline-detail" ref={detailRef} onDragStart={(e) => e.stopPropagation()}>
     <div className="task-inline-detail-head">
       <div className="task-inline-detail-title">
-        <span className={`task-status ${queued ? "action_required" : detail.status}`}>{queued ? "队列中" : statusLabels[detail.status]}</span>
+        <span className={`task-status ${detail.status}`}>{queued ? "队列中" : statusLabels[detail.status]}</span>
         <b>{taskDisplayTitle(detail)}</b>
         <span className={`task-inline-priority priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span>
       </div>

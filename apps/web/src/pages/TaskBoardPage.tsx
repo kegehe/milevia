@@ -3,6 +3,7 @@
 import { useParams, useNavigate } from "react-router-dom";
 import { TaskBoard } from "../features/tasks/TaskBoard";
 import { useProjectContext } from "../stores/useProjectStore";
+import { TasksSubnav } from "./TasksSubnav";
 
 export default function TaskBoardPage() {
   const { projectId, taskId } = useParams<{ projectId: string; taskId?: string }>();
@@ -13,6 +14,7 @@ export default function TaskBoardPage() {
 
   return (
     <div className="workspace-tab-panel">
+      <TasksSubnav projectId={projectId} active="board" />
       <TaskBoard
         projectID={projectId}
         initialTaskID={taskId}

@@ -132,9 +132,11 @@ type GitRunner interface {
 	RestoreAll(context.Context, string, []string) error
 	DiscardInitialChanges(context.Context, string, []string) error
 	Commit(context.Context, string, string) error
+	AmendCommit(context.Context, string, string) error
 	ValidateUntrackedRemoval(string, []string) error
 	RemoveUntracked(string, []string) error
 	Fetch(context.Context, string, string) error
+	Pull(context.Context, string, string, string) error
 	Push(context.Context, string, string, string, bool) error
 	CreateBranch(context.Context, string, string, string) error
 	SwitchBranch(context.Context, string, string) error
@@ -221,6 +223,12 @@ func (runner *gitCLIRunner) Commit(ctx context.Context, repo, message string) er
 	return err
 }
 
+// AmendCommit 修改当前 HEAD 提交：合并已暂存改动并重写提交信息（commit --amend）。
+func (runner *gitCLIRunner) AmendCommit(ctx context.Context, repo, message string) error {
+	_, err := runner.backend.runGitStdin(ctx, repo, []string{"commit", "--amend", "--file=-"}, []byte(message+"\n"))
+	return err
+}
+
 func (runner *gitCLIRunner) ValidateUntrackedRemoval(repo string, paths []string) error {
 	return runner.backend.validateUntrackedRemoval(repo, paths)
 }
@@ -257,6 +265,25 @@ func (runner *gitCLIRunner) Fetch(ctx context.Context, repo, remote string) erro
 		return err
 	}
 	_, err := runner.backend.runGit(ctx, repo, "fetch", "--prune", remote)
+	return err
+}
+
+// Pull 拉取并合并远端更新，沿用推送侧的 non-fast-forward 拒绝策略：仅允许快进合并，
+// 本地与远端历史分叉时（--ff-only）直接失败，避免静默产生合并冲突或改写历史。
+func (runner *gitCLIRunner) Pull(ctx context.Context, repo, remote, branch string) error {
+	if remote == "" {
+		remote = "origin"
+	}
+	if branch == "" {
+		return errors.New("branch is required for pull")
+	}
+	if err := validateGitRef(remote); err != nil {
+		return err
+	}
+	if err := validateGitRef(branch); err != nil {
+		return err
+	}
+	_, err := runner.backend.runGit(ctx, repo, "-c", "merge.rebase=false", "pull", "--prune", "--ff-only", remote, branch)
 	return err
 }
 

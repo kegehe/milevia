@@ -23,6 +23,7 @@ type Filesystem interface {
 	// 读取操作（无需 workspace lease）
 	ReadDir(ctx context.Context, path string) ([]FileEntry, error)
 	ReadFile(ctx context.Context, path string) (*FileContent, error)
+	OpenRead(ctx context.Context, path string) (io.ReadCloser, FileInfo, error)
 	Stat(ctx context.Context, path string) (FileInfo, error)
 	Search(ctx context.Context, rootPath, query string) ([]FileEntry, error)
 
@@ -139,6 +140,27 @@ func (fs *LocalFilesystem) ReadFile(ctx context.Context, path string) (*FileCont
 		return &FileContent{Content: string(data), Version: contentVersion(data), Stat: fi}, nil
 	}
 	return &FileContent{Content: base64.StdEncoding.EncodeToString(data), Encoding: "base64", Version: contentVersion(data), Stat: fi}, nil
+}
+
+// OpenRead returns a validated file stream for image previews and downloads.
+// Unlike ReadFile it intentionally does not impose the text editor's 10MB limit.
+func (fs *LocalFilesystem) OpenRead(ctx context.Context, path string) (io.ReadCloser, FileInfo, error) {
+	info, err := fs.Stat(ctx, path)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	if info.IsDir {
+		return nil, FileInfo{}, errors.New("路径是目录，不是文件")
+	}
+	absPath, err := fs.resolvePath(path)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	f, err := os.Open(absPath)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	return f, info, nil
 }
 
 func (fs *LocalFilesystem) Stat(ctx context.Context, path string) (FileInfo, error) {
@@ -597,6 +619,31 @@ func (fs *SFTPFilesystem) ReadFile(ctx context.Context, path string) (*FileConte
 	return &FileContent{Content: base64.StdEncoding.EncodeToString(data), Encoding: "base64", Version: contentVersion(data), Stat: fi}, nil
 }
 
+// OpenRead returns a validated remote stream for image previews and downloads.
+// It deliberately bypasses maxFileSize, which only protects in-memory reads.
+func (fs *SFTPFilesystem) OpenRead(ctx context.Context, path string) (io.ReadCloser, FileInfo, error) {
+	info, err := fs.Stat(ctx, path)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	if info.IsDir {
+		return nil, FileInfo{}, errors.New("路径是目录，不是文件")
+	}
+	absPath, err := fs.resolvePath(ctx, path)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	sftpClient, err := fs.client.getSFTPClient(ctx)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	f, err := sftpClient.Open(absPath)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	return f, info, nil
+}
+
 func (fs *SFTPFilesystem) Stat(ctx context.Context, path string) (FileInfo, error) {
 	absPath, err := fs.resolvePath(ctx, path)
 	if err != nil {
@@ -955,7 +1002,7 @@ var binaryExts = map[string]bool{
 	".woff": true, ".woff2": true, ".ttf": true, ".eot": true, ".otf": true,
 	".mp3": true, ".mp4": true, ".wav": true, ".avi": true, ".mkv": true,
 	".mov": true, ".flv": true, ".wmv": true,
-	".sqlite": true, ".db": true,
+	".sqlite": true, ".sqlite3": true, ".db": true,
 	".class": true, ".o": true, ".pyc": true, ".pyd": true,
 	".wasm": true, ".swf": true,
 }

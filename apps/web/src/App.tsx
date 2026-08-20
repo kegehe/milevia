@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from "react-router-dom";
 import { ProjectProvider } from "./stores/useProjectStore";
+import { UIPreferencesProvider } from "./stores/useUIPreferences";
 import { NotificationProvider } from "./components/NotificationProvider";
 import { ProcessStatusProvider } from "./components/ProcessStatusProvider";
 import { TooltipProvider } from "./components/TooltipProvider";
@@ -12,12 +13,15 @@ import SSHManagerPage from "./pages/SSHManagerPage";
 import ProjectLayout from "./components/ProjectLayout";
 import ConversationPage from "./pages/ConversationPage";
 import TaskBoardPage from "./pages/TaskBoardPage";
+import ScheduledTasksPage from "./pages/ScheduledTasksPage";
 import OrchestrationPage from "./pages/OrchestrationPage";
 import GitWorkbenchPage from "./pages/GitWorkbenchPage";
 import ProjectRunPage from "./pages/ProjectRunPage";
 import InsightsPage from "./pages/InsightsPage";
 import FilesPage from "./pages/FilesPage";
 import AgentProfilesPage from "./pages/AgentProfilesPage";
+import SettingsPage from "./pages/SettingsPage";
+import TerminalPage from "./pages/TerminalPage";
 import { UpdateBanner } from "./features/updater/UpdateBanner";
 
 declare global {
@@ -43,33 +47,41 @@ export function App() {
   return (
     <BrowserRouter>
       <TooltipProvider>
-        <NotificationProvider>
-          <ProcessStatusProvider>
-          <ProjectProvider>
-            <NavigationBridge />
-            <UpdateBanner />
-            <Routes>
-            <Route path="/" element={<DashboardPage />} />
-            <Route path="/projects/import" element={<ImportProjectPage />} />
-            <Route path="/ssh-manager" element={<SSHManagerPage />} />
-            <Route path="/agent-profiles" element={<AgentProfilesPage />} />
-            <Route path="/projects/:projectId" element={<ProjectLayout />}>
-              <Route index element={<Navigate to="conversations" replace />} />
-              <Route path="conversations" element={<ConversationPage />} />
-              <Route path="conversations/:conversationId" element={<ConversationPage />} />
-              <Route path="tasks" element={<TaskBoardPage />} />
-              <Route path="tasks/:taskId" element={<TaskBoardPage />} />
-              <Route path="orchestration" element={<OrchestrationPage />} />
-              <Route path="files" element={<FilesPage />} />
-              <Route path="git" element={<GitWorkbenchPage />} />
-              <Route path="run" element={<ProjectRunPage />} />
-              <Route path="insights" element={<InsightsPage />} />
-            </Route>
-            <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
-          </ProjectProvider>
-          </ProcessStatusProvider>
-        </NotificationProvider>
+        <UIPreferencesProvider>
+          <NotificationProvider>
+            <ProcessStatusProvider>
+              <ProjectProvider>
+                <NavigationBridge />
+                <UpdateBanner />
+                <Routes>
+                  <Route path="/" element={<DashboardPage />} />
+                  <Route path="/projects/import" element={<ImportProjectPage />} />
+                  <Route path="/ssh-manager" element={<SSHManagerPage />} />
+                  <Route path="/agent-profiles" element={<AgentProfilesPage />} />
+                  <Route path="/settings" element={<SettingsPage />} />
+                  <Route path="/projects/:projectId" element={<ProjectLayout />}>
+                    <Route index element={<Navigate to="conversations" replace />} />
+                    <Route path="conversations" element={<ConversationPage />} />
+                    <Route path="conversations/:conversationId" element={<ConversationPage />} />
+                    <Route path="tasks" element={<Navigate to="tasks/board" replace />} />
+                    <Route path="tasks/board" element={<TaskBoardPage />} />
+                    <Route path="tasks/board/:taskId" element={<TaskBoardPage />} />
+                    <Route path="tasks/schedules" element={<ScheduledTasksPage />} />
+                    <Route path="tasks/schedules/:scheduledTaskId" element={<ScheduledTasksPage />} />
+                    <Route path="tasks/:taskId" element={<TaskBoardPage />} />
+                    <Route path="orchestration" element={<OrchestrationPage />} />
+                    <Route path="files" element={<FilesPage />} />
+                    <Route path="git" element={<GitWorkbenchPage />} />
+                    <Route path="run" element={<ProjectRunPage />} />
+                    <Route path="terminal" element={<TerminalPage />} />
+                    <Route path="insights" element={<InsightsPage />} />
+                  </Route>
+                  <Route path="*" element={<Navigate to="/" replace />} />
+                </Routes>
+              </ProjectProvider>
+            </ProcessStatusProvider>
+          </NotificationProvider>
+        </UIPreferencesProvider>
       </TooltipProvider>
     </BrowserRouter>
   );

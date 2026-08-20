@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type LogEntry, type RunConfig, type RunStatusResponse, runLogPresentation, runLogText, statusLabels } from "./run-model";
 import { type AnsiSegment, toAnsiSegments } from "./ansi";
+import { toast } from "sonner";
 import { linkifyText } from "./linkify";
 import { createWebSocket, openExternal } from "../../lib/runtime";
 
@@ -71,6 +72,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const [logs, setLogs] = useState<LogEntry[]>([]);
 	const [hasNewLogs, setHasNewLogs] = useState(false);
 	const [busy, setBusy] = useState("");
+	const [now, setNow] = useState(() => Date.now());
 	const logTerminalRef = useRef<HTMLDivElement>(null);
 	const logNearBottomRef = useRef(true);
 	const wsRef = useRef<WebSocket | null>(null);
@@ -204,6 +206,14 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		}
 	}, [logs]);
 
+	useEffect(() => {
+		if (status?.status !== "running" || !status.startedAt) return;
+		const refresh = () => setNow(Date.now());
+		refresh();
+		const timer = setInterval(refresh, 1_000);
+		return () => clearInterval(timer);
+	}, [status?.status, status?.startedAt]);
+
 	const handleLogScroll = () => {
 		const terminal = logTerminalRef.current;
 		if (!terminal) return;
@@ -230,6 +240,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		try {
 			await request(`${basePath}/config`, { method: "PUT", body: JSON.stringify(payload) });
 			if (revision === configRevisionRef.current) configDirtyRef.current = false;
+			toast.success("启动配置已保存");
 		}
 		catch (cause) { fail(cause instanceof Error ? cause.message : "保存配置失败"); }
 		finally { setBusy(""); }
@@ -282,7 +293,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const transitioning = status?.status === "starting" || status?.status === "stopping";
 	const statusLabel = status ? statusLabels[status.status] : statusLabels.stopped;
 	const statusKey = status?.status || "stopped";
-	const uptime = status?.startedAt ? formatUptime(new Date(status.startedAt)) : "";
+	const uptime = status?.startedAt ? formatUptime(new Date(status.startedAt), now) : "";
 
 	return <section id="workspace-panel-run" className="run-panel workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-run" hidden={!active}>
 			<div className="run-body">
@@ -322,7 +333,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 					</section>
 
 					<section className="run-config">
-						<header className="run-sidebar-heading"><div><span>启动配置</span><h3>命令与环境</h3></div><button type="button" className="run-save-config" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存"}</button></header>
+						<header className="run-sidebar-heading"><div><h3>命令与环境</h3></div><button type="button" className="run-save-config" disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : "保存"}</button></header>
 						<div className="run-config-row">
 							<label htmlFor="run-execution-target">运行环境</label>
 							<select id="run-execution-target" value={isRemote ? "auto" : (config.executionTarget || "auto")} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })} disabled={isRemote}>
@@ -384,8 +395,8 @@ function RestartIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" 
 function PlusIcon() { return <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M8 3v10M3 8h10" /></svg>; }
 function CloseIcon() { return <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="m4 4 8 8M12 4l-8 8" /></svg>; }
 
-function formatUptime(startedAt: Date): string {
-	const diff = Date.now() - startedAt.getTime();
+function formatUptime(startedAt: Date, now: number): string {
+	const diff = now - startedAt.getTime();
 	const seconds = Math.floor(diff / 1000);
 	if (seconds < 60) return `${seconds}s`;
 	const minutes = Math.floor(seconds / 60);

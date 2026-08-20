@@ -71,6 +71,13 @@ func TestWslNativeCommandScript(t *testing.T) {
 	}
 }
 
+func TestWSLCodexEnvironmentConvertsManagedHome(t *testing.T) {
+	environment := wslCodexEnvironment([]string{"PATH=C:\\Windows", "CODEX_HOME=D:\\Milevia Data\\codex\\profiles\\revision"})
+	if got := environment[1]; got != "CODEX_HOME=/mnt/d/Milevia Data/codex/profiles/revision" {
+		t.Fatalf("CODEX_HOME = %q", got)
+	}
+}
+
 // wslDecodeArgForTest 把 wslEncodeArg 的 $(echo <b64> | base64 -d) 形式还原为明文，
 // 用于断言脚本内容。纯测试辅助，不做任何进程拉起。
 func wslDecodeArgForTest(t *testing.T, arg string) string {

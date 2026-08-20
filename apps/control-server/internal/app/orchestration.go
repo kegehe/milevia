@@ -380,12 +380,12 @@ func (s *Server) createOrchestrationConversation(ctx context.Context, project Pr
 		return "", err
 	}
 	defer tx.Rollback()
-	profileRevisionID, err := s.profileForNewConversationTx(ctx, tx, nil, project.Runner, cfg.AgentID, project.ID)
+	selection, err := s.profileRouteForNewConversationTx(ctx, tx, nil, project.Runner, cfg.AgentID, project.ID)
 	if err != nil {
 		return "", err
 	}
-	_, err = tx.ExecContext(ctx, `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		conversationID, project.ID, sessionID, cfg.AgentID, sessionID, project.Runner, profileRevisionID, permissionMode, "idle", permissionMode, title, now, false, false, 0, now)
+	_, err = tx.ExecContext(ctx, `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		conversationID, project.ID, sessionID, cfg.AgentID, sessionID, project.Runner, selection.ProfileRevisionID, selection.RouteRevisionID, permissionMode, "idle", permissionMode, title, now, false, false, 0, now)
 	if err != nil {
 		return "", fmt.Errorf("create orchestration conversation: %w", err)
 	}

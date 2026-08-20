@@ -226,14 +226,15 @@ test("approval and task-board views keep working inside the workspace", () => {
   assert.match(workspaceStyles, /\.workspace-content > \.workspace-tab-panel\s*\{[^}]*min-height:\s*0;[^}]*flex:\s*1;[^}]*overflow:\s*auto;/);
 });
 
-test("Git workbench and project runner are first-class workspace tabs", () => {
+test("Git workbench, project runner, and terminal are first-class workspace tabs", () => {
   // Types 在 lib/types.ts
-  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "orchestration" \| "files" \| "git" \| "run" \| "insights";/);
+  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "orchestration" \| "files" \| "git" \| "run" \| "terminal" \| "insights";/);
   // ProjectLayout 管理 workspace tabs
   assert.match(projectLayout, /const \[workspaceTab, setWorkspaceTab\] = useState<WorkspaceTab>/);
   assert.match(projectLayout, /<nav className="workspace-tabs" role="tablist" aria-label="项目工作区" onKeyDown=\{navigateWorkspaceTabs\}>/);
   assert.match(projectLayout, /role="tab" aria-controls="workspace-panel-git"/);
   assert.match(projectLayout, /role="tab" aria-controls="workspace-panel-orchestration"/);
+  assert.match(projectLayout, /role="tab" aria-controls="workspace-panel-terminal"/);
   assert.match(orchestrationPage, /id="workspace-panel-orchestration"[\s\S]*?role="tabpanel"[\s\S]*?aria-labelledby="workspace-tab-orchestration"/);
   assert.match(projectLayout, /const navigateWorkspaceTabs = \(event: React\.KeyboardEvent<HTMLElement>\) => \{/);
   assert.match(projectLayout, /\["ArrowLeft", "ArrowRight", "Home", "End"\]/);
@@ -328,6 +329,13 @@ test("clearing context starts a fresh conversation with the current agent and po
   assert.match(conversationPage, /const current = list\.find\(\(item\) => item\.isCurrent\);/);
   assert.match(conversationPage, /if \(conversationRef\.current\?\.id !== conversationID\) return;\s*setConversation\(updated\);/s);
   assert.match(conversationPage, /const conversationTransitionRef = useRef\(false\);/);
+  assert.match(conversationPage, /const pendingConfirmBusyRef = useRef\(false\);/);
+  assert.match(conversationPage, /if \(conversationTransitionRef\.current \|\| !conversation \|\| sending \|\| clearing \|\| shortcutBusy \|\| \(!skipRunGuard && run\)\) return;/);
+  assert.match(conversationPage, /for \(let attempt = 0; attempt < 4; attempt\+\+\)/);
+  assert.match(conversationPage, /if \(status !== 409 \|\| attempt === 3\) throw cause;/);
+  assert.match(conversationPage, /busy=\{pendingConfirmBusy\}/);
+  assert.match(conversationPage, /if \(!run\) \{\s*return clearCurrentConversation\(\);/s);
+  assert.match(conversationPage, /setRun\(\(active\) => active === currentRun \? "" : active\);\s*return clearCurrentConversation\(true\);/s);
   assert.match(conversationPage, /const conversationRouteVersion = useRef\(0\);/);
   assert.match(conversationPage, /useLayoutEffect\(\(\) => \{\s*conversationRouteVersion\.current\+\+;/s);
   assert.match(conversationPage, /conversationRouteVersion\.current\+\+;/);

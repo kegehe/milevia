@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -126,6 +127,50 @@ func TestDesktopSessionProtectsHTTPAndWebSocket(t *testing.T) {
 	defer connection.Close()
 	if connection.Subprotocol() != server.websocketSessionProtocol() {
 		t.Fatalf("unexpected WebSocket protocol: %q", connection.Subprotocol())
+	}
+}
+
+func TestDesktopDownloadTicketAllowsOnlyItsBoundFile(t *testing.T) {
+	const token = "test-download-ticket-session"
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "archive.bin"), []byte{0, 1, 2, 255}, 0o644); err != nil {
+		t.Fatalf("write download fixture: %v", err)
+	}
+	server := newDesktopTestServer(t, Config{
+		DatabasePath: filepath.Join(t.TempDir(), "milevia.db"),
+		AllowedRoot:  root,
+		Mode:         "desktop-api",
+		SessionToken: token,
+	})
+	addFilesystemTestProject(t, server, root)
+
+	issue := httptest.NewRecorder()
+	issueRequest := httptest.NewRequest(http.MethodPost, "/api/projects/files/fs/download-ticket", strings.NewReader(`{"path":"archive.bin"}`))
+	issueRequest.Header.Set("X-Milevia-Session", token)
+	server.routes().ServeHTTP(issue, issueRequest)
+	if issue.Code != http.StatusOK {
+		t.Fatalf("issue download ticket: status=%d body=%s", issue.Code, issue.Body.String())
+	}
+	var result struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(issue.Body).Decode(&result); err != nil || result.URL == "" {
+		t.Fatalf("decode download ticket: url=%q err=%v", result.URL, err)
+	}
+
+	download := httptest.NewRecorder()
+	server.routes().ServeHTTP(download, httptest.NewRequest(http.MethodGet, result.URL, nil))
+	if download.Code != http.StatusOK || string(download.Body.Bytes()) != string([]byte{0, 1, 2, 255}) {
+		t.Fatalf("ticket download: status=%d body=%v", download.Code, download.Body.Bytes())
+	}
+	if download.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("ticket download cache policy: %q", download.Header().Get("Cache-Control"))
+	}
+
+	boundElsewhere := httptest.NewRecorder()
+	server.routes().ServeHTTP(boundElsewhere, httptest.NewRequest(http.MethodGet, strings.Replace(result.URL, "archive.bin", "other.bin", 1), nil))
+	if boundElsewhere.Code != http.StatusUnauthorized {
+		t.Fatalf("ticket was accepted for a different path: status=%d", boundElsewhere.Code)
 	}
 }
 

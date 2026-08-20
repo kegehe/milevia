@@ -4,7 +4,7 @@ import test from "node:test";
 
 const source = await readFile(new URL("./FileEditor.tsx", import.meta.url), "utf8");
 
-test("editor loading failures use a Chinese fallback", () => {
-  assert.match(source, /setLoadError\("无法加载编辑器，请刷新页面后重试。"\)/);
-  assert.doesNotMatch(source, /setLoadError\(err instanceof Error \? err\.message/);
+test("editor reuses the shared source viewer", () => {
+  assert.match(source, /import \{ CodeFileView \} from "\.\/CodeFileView"/);
+  assert.match(source, /<CodeFileView content=\{content\} filename=\{stat\.name\}/);
 });

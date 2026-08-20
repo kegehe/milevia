@@ -42,6 +42,41 @@ type SSHConnection struct {
 	UpdatedAt       time.Time  `json:"updatedAt"`
 }
 
+const sshPasswordCipherPrefix = "enc:v1:"
+
+func (s *Server) encryptSSHPassword(password string) (string, error) {
+	if password == "" {
+		return "", nil
+	}
+	if s.profileSecrets == nil {
+		return "", errors.New("SSH password encryption is unavailable")
+	}
+	ciphertext, err := s.profileSecrets.encrypt([]byte(password))
+	if err != nil {
+		return "", err
+	}
+	return sshPasswordCipherPrefix + ciphertext, nil
+}
+
+func (s *Server) decryptSSHPassword(password string) (string, error) {
+	if password == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(password, sshPasswordCipherPrefix) {
+		// Existing installations stored this field as plaintext. It is migrated at
+		// startup, but accepting it here keeps an interrupted upgrade recoverable.
+		return password, nil
+	}
+	if s.profileSecrets == nil {
+		return "", errors.New("SSH password decryption is unavailable")
+	}
+	plaintext, err := s.profileSecrets.decrypt(strings.TrimPrefix(password, sshPasswordCipherPrefix))
+	if err != nil {
+		return "", errors.New("SSH password could not be decrypted")
+	}
+	return plaintext, nil
+}
+
 // joinKeyPaths / splitKeyPaths 用换行分隔持久化候选私钥列表。文件系统路径在
 // 各平台都不允许包含换行符，因此无需转义。
 func joinKeyPaths(paths []string) string {
@@ -128,6 +163,42 @@ func (s *Server) migrateSSHConnections(ctx context.Context) error {
 	_, _ = s.db.ExecContext(ctx, `alter table ssh_connections add column password text not null default ''`)
 	// Add candidate private key list column for existing databases.
 	_, _ = s.db.ExecContext(ctx, `alter table ssh_connections add column private_key_paths text not null default ''`)
+	return s.migrateSSHConnectionPasswords(ctx)
+}
+
+func (s *Server) migrateSSHConnectionPasswords(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `select id,password from ssh_connections where password<>''`)
+	if err != nil {
+		return fmt.Errorf("read SSH passwords for migration: %w", err)
+	}
+	type passwordRow struct{ id, password string }
+	var passwords []passwordRow
+	for rows.Next() {
+		var row passwordRow
+		if err := rows.Scan(&row.id, &row.password); err != nil {
+			rows.Close()
+			return fmt.Errorf("read SSH password for migration: %w", err)
+		}
+		if !strings.HasPrefix(row.password, sshPasswordCipherPrefix) {
+			passwords = append(passwords, row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate SSH passwords for migration: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close SSH password migration rows: %w", err)
+	}
+	for _, row := range passwords {
+		ciphertext, err := s.encryptSSHPassword(row.password)
+		if err != nil {
+			return fmt.Errorf("encrypt SSH password for %s: %w", row.id, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `update ssh_connections set password=? where id=? and password=?`, ciphertext, row.id, row.password); err != nil {
+			return fmt.Errorf("migrate SSH password for %s: %w", row.id, err)
+		}
+	}
 	return nil
 }
 
@@ -577,7 +648,12 @@ func (s *Server) updateSSHConnection(w http.ResponseWriter, r *http.Request) {
 // connects it, writing the shared success/error handling. The connection struct
 // must already carry its final ID and secrets.
 func (s *Server) saveSSHConnection(w http.ResponseWriter, r *http.Request, c *SSHConnection, connect bool) {
-	_, err := s.db.ExecContext(r.Context(), `
+	storedPassword, err := s.encryptSSHPassword(c.Password)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("encrypt SSH password: %w", err))
+		return
+	}
+	_, err = s.db.ExecContext(r.Context(), `
 		insert into ssh_connections (id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,error_msg,created_at,updated_at,password)
 		values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set
@@ -585,7 +661,7 @@ func (s *Server) saveSSHConnection(w http.ResponseWriter, r *http.Request, c *SS
 			private_key_path=excluded.private_key_path, private_key_paths=excluded.private_key_paths,
 			known_hosts=excluded.known_hosts,
 			root_path=excluded.root_path, updated_at=excluded.updated_at, password=excluded.password`,
-		c.ID, c.Name, c.Host, c.Port, c.User, c.PrivateKeyPath, joinKeyPaths(c.PrivateKeyPaths), c.KnownHosts, c.RootPath, c.Status, c.ErrorMsg, c.CreatedAt, c.UpdatedAt, c.Password)
+		c.ID, c.Name, c.Host, c.Port, c.User, c.PrivateKeyPath, joinKeyPaths(c.PrivateKeyPaths), c.KnownHosts, c.RootPath, c.Status, c.ErrorMsg, c.CreatedAt, c.UpdatedAt, storedPassword)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("save ssh connection: %w", err))
 		return
@@ -621,6 +697,9 @@ func (s *Server) deleteSSHConnection(w http.ResponseWriter, r *http.Request) {
 	s.sshMu.Lock()
 	defer s.sshMu.Unlock()
 	runnerID := "ssh-" + id
+	if s.terminals != nil {
+		s.terminals.closeRunner(runnerID)
+	}
 	var projCount int
 	if err := s.db.QueryRowContext(r.Context(), `select count(*) from projects where coalesce(nullif(runner_id,''),runner)=?`, runnerID).Scan(&projCount); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -705,6 +784,9 @@ func (s *Server) disconnectSSHConnection(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	runnerID := "ssh-" + c.ID
+	if s.terminals != nil {
+		s.terminals.closeRunner(runnerID)
+	}
 	if err := s.ensureSSHRunnerInactive(r.Context(), runnerID); err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
@@ -743,6 +825,10 @@ func (s *Server) loadSSHConnection(ctx context.Context, id string) (*SSHConnecti
 	var keyPaths string
 	err := s.db.QueryRowContext(ctx, `select id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where id=?`, id).
 		Scan(&c.ID, &c.Name, &c.Host, &c.Port, &c.User, &c.PrivateKeyPath, &keyPaths, &c.KnownHosts, &c.RootPath, &c.Status, &c.LastSeen, &c.ErrorMsg, &c.CreatedAt, &c.UpdatedAt, &c.Password)
+	if err != nil {
+		return nil, err
+	}
+	c.Password, err = s.decryptSSHPassword(c.Password)
 	if err != nil {
 		return nil, err
 	}
@@ -838,6 +924,9 @@ func (s *Server) tryConnectAndRegister(ctx context.Context, c *SSHConnection) er
 	c.KnownHosts = knownHosts
 	c.RootPath = runner.rootPath
 	c.Status, c.ErrorMsg, c.LastSeen, c.UpdatedAt = "connected", "", &now, now
+	if hadOldRunner && s.terminals != nil {
+		s.terminals.closeRunner(runnerID)
+	}
 	s.runnerRegistry.register(runnerID, runner, meta)
 	if oldSSH, ok := oldRunner.(*sshRunner); ok {
 		_ = oldSSH.client.close()
@@ -883,6 +972,12 @@ func (s *Server) recoverSSHConnections(ctx context.Context) error {
 	}
 	for index := range connections {
 		c := &connections[index]
+		password, err := s.decryptSSHPassword(c.Password)
+		if err != nil {
+			log.Printf("[ssh] skip recovery for %q: password cannot be decrypted: %v", c.Name, err)
+			continue
+		}
+		c.Password = password
 		log.Printf("[ssh] recovering connection %q (%s@%s:%d)", c.Name, c.User, c.Host, c.Port)
 		if err := s.tryConnectAndRegister(ctx, c); err != nil {
 			log.Printf("[ssh] recovery failed for %q: %v", c.Name, err)

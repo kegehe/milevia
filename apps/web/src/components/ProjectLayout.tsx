@@ -28,6 +28,7 @@ function WorkspaceTabIcon({ tab }: { tab: WorkspaceTab }) {
     files: <><path d="M4.5 7.5A2.5 2.5 0 0 1 7 5h3l1.7 2H17A2.5 2.5 0 0 1 19.5 9.5v7A2.5 2.5 0 0 1 17 19H7a2.5 2.5 0 0 1-2.5-2.5v-9Z" /><path d="M4.8 9h14.4" /></>,
     git: <><circle cx="6" cy="6" r="2" /><circle cx="18" cy="18" r="2" /><circle cx="18" cy="6" r="2" /><path d="M8 6h5a3 3 0 0 1 3 3v7M8 6h5a3 3 0 0 1 3 3" /></>,
     run: <><path d="m9 7 7 5-7 5V7Z" /><path d="M5 5.5v13M19 5.5v13" /></>,
+    terminal: <><rect x="3.5" y="4" width="17" height="15.5" rx="2" /><path d="m7 9 2.5 2.5L7 14M12 14h4" /></>,
     insights: <><path d="M9.5 18.5h5M10 18.5l.6 2.4a.7.7 0 0 0 .68.51h1.44a.7.7 0 0 0 .68-.51L14 18.5" /><path d="M12 3.5a6 6 0 0 0-3 11.18c.73.48 1 1.35 1 2.32v.5h4v-.5c0-.97.27-1.84 1-2.32A6 6 0 0 0 12 3.5Z" /></>,
   };
   return <svg className="workspace-tab-icon" viewBox="0 0 24 24" aria-hidden="true">{paths[tab]}</svg>;
@@ -51,6 +52,7 @@ export default function ProjectLayout() {
     if (path.endsWith("/files")) return "files";
     if (path.endsWith("/git")) return "git";
     if (path.endsWith("/run")) return "run";
+    if (path.endsWith("/terminal")) return "terminal";
     if (path.endsWith("/insights")) return "insights";
     return "conversation";
   }, [location.pathname]);
@@ -71,6 +73,7 @@ export default function ProjectLayout() {
       case "files": navigate(`${base}/files`); break;
       case "git": navigate(`${base}/git`); break;
       case "run": navigate(`${base}/run`); break;
+      case "terminal": navigate(`${base}/terminal`); break;
       case "insights": navigate(`${base}/insights`); break;
     }
   }, [projectId, navigate]);
@@ -167,6 +170,7 @@ export default function ProjectLayout() {
       <button data-workspace-tab="files" id="workspace-tab-files" type="button" role="tab" aria-controls="workspace-panel-files" aria-selected={workspaceTab === "files"} className={workspaceTab === "files" ? "active" : ""} onClick={() => selectWorkspaceTab("files")}><WorkspaceTabIcon tab="files" /><span>文件</span></button>
       {project.gitBranch !== NON_GIT_BRANCH && <button data-workspace-tab="git" id="workspace-tab-git" type="button" role="tab" aria-controls="workspace-panel-git" aria-selected={workspaceTab === "git"} className={workspaceTab === "git" ? "active" : ""} onClick={() => selectWorkspaceTab("git")}><WorkspaceTabIcon tab="git" /><span>Git工作台</span></button>}
       <button data-workspace-tab="run" id="workspace-tab-run" type="button" role="tab" aria-controls="workspace-panel-run" aria-selected={workspaceTab === "run"} className={workspaceTab === "run" ? "active" : ""} onClick={() => selectWorkspaceTab("run")}><WorkspaceTabIcon tab="run" /><span>项目启动</span></button>
+      <button data-workspace-tab="terminal" id="workspace-tab-terminal" type="button" role="tab" aria-controls="workspace-panel-terminal" aria-selected={workspaceTab === "terminal"} className={workspaceTab === "terminal" ? "active" : ""} onClick={() => selectWorkspaceTab("terminal")}><WorkspaceTabIcon tab="terminal" /><span>终端</span></button>
       <button data-workspace-tab="insights" id="workspace-tab-insights" type="button" role="tab" aria-controls="workspace-panel-insights" aria-selected={workspaceTab === "insights"} className={workspaceTab === "insights" ? "active" : ""} onClick={() => selectWorkspaceTab("insights")}><WorkspaceTabIcon tab="insights" /><span>优化建议</span></button>
     </nav>
     <main className="workspace-content">

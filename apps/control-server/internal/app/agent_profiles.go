@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -61,6 +63,25 @@ type AgentProfileView struct {
 	AuthMode string            `json:"authMode"`
 	State    string            `json:"state"`
 	Env      map[string]string `json:"env,omitempty"`
+}
+
+// ProjectAgentRouteRevision is the immutable project-level selection of a
+// profile revision. The profile revision remains the runtime credential and
+// endpoint snapshot; this type records why that snapshot was selected.
+type ProjectAgentRouteRevision struct {
+	ID                string    `json:"id"`
+	ProjectID         string    `json:"projectId"`
+	AgentID           string    `json:"agentId"`
+	ProfileID         string    `json:"profileId,omitempty"`
+	ProfileRevisionID string    `json:"profileRevisionId,omitempty"`
+	Mode              string    `json:"mode"`
+	State             string    `json:"state"`
+	CreatedAt         time.Time `json:"createdAt"`
+}
+
+type profileRouteSelection struct {
+	ProfileRevisionID string
+	RouteRevisionID   string
 }
 
 // AgentRuntimeProfile only exists in the control service and local runner.
@@ -200,6 +221,37 @@ func (s *Server) migrateAgentProfiles(ctx context.Context) error {
 		`create trigger if not exists agent_profile_revisions_immutable before update on agent_profile_revisions
 			when new.id<>old.id or new.profile_id<>old.profile_id or new.revision<>old.revision or new.base_url<>old.base_url or new.model<>old.model or new.options_json<>old.options_json or new.protocol<>old.protocol or new.auth_mode<>old.auth_mode or new.secret_ref<>old.secret_ref or new.execution_mode<>old.execution_mode or new.created_at<>old.created_at or (old.state='revoked' and new.state<>old.state) or (old.state='deprecated' and new.state not in ('deprecated','revoked')) or (old.state='active' and new.state not in ('active','deprecated','revoked'))
 			begin select raise(abort, 'agent profile revisions are immutable'); end`,
+		`create table if not exists project_agent_routes (
+			project_id text not null references projects(id) on delete cascade,
+			agent_id text not null check(agent_id in ('claude-code','codex')),
+			current_revision_id text not null default '',
+			enabled integer not null default 1,
+			created_at datetime not null,
+			updated_at datetime not null,
+			primary key(project_id,agent_id)
+		)`,
+		`create table if not exists project_agent_route_revisions (
+			id text primary key,
+			project_id text not null references projects(id) on delete cascade,
+			agent_id text not null check(agent_id in ('claude-code','codex')),
+			profile_id text not null default '',
+			profile_revision_id text not null default '',
+			pool_revision_id text not null default '',
+			remote_route_revision_id text not null default '',
+			mode text not null check(mode in ('pinned','pool','cli_managed')),
+			state text not null default 'active' check(state in ('active','deprecated','revoked')),
+			created_at datetime not null
+		)`,
+		`create index if not exists project_agent_route_revisions_project_agent on project_agent_route_revisions(project_id,agent_id,created_at desc)`,
+		`create trigger if not exists project_agent_route_revisions_immutable before update on project_agent_route_revisions
+			when new.id<>old.id or new.project_id<>old.project_id or new.agent_id<>old.agent_id or new.profile_id<>old.profile_id or new.profile_revision_id<>old.profile_revision_id or new.pool_revision_id<>old.pool_revision_id or new.remote_route_revision_id<>old.remote_route_revision_id or new.mode<>old.mode or new.created_at<>old.created_at or (old.state='revoked' and new.state<>old.state) or (old.state='deprecated' and new.state not in ('deprecated','revoked')) or (old.state='active' and new.state not in ('active','deprecated','revoked'))
+			begin select raise(abort, 'project agent route revisions are immutable'); end`,
+		`create table if not exists project_agent_route_migrations (
+			project_id text primary key references projects(id) on delete cascade,
+			legacy_profile_id text not null default '',
+			result text not null,
+			created_at datetime not null
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -221,10 +273,151 @@ func (s *Server) migrateAgentProfiles(ctx context.Context) error {
 	if err := ensureColumn(ctx, s.db, "projects", "default_profile_id", "text not null default ''"); err != nil {
 		return fmt.Errorf("add projects.default_profile_id: %w", err)
 	}
-	return nil
+	if err := ensureColumn(ctx, s.db, "conversations", "project_agent_route_revision_id", "text not null default ''"); err != nil {
+		return fmt.Errorf("add conversations.project_agent_route_revision_id: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "runs", "project_agent_route_revision_id", "text not null default ''"); err != nil {
+		return fmt.Errorf("add runs.project_agent_route_revision_id: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "project_agent_route_revisions", "remote_route_revision_id", "text not null default ''"); err != nil {
+		return fmt.Errorf("add project route remote revision: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "project_agent_route_revisions", "pool_revision_id", "text not null default ''"); err != nil {
+		return fmt.Errorf("add project route pool revision: %w", err)
+	}
+	if err := s.ensureProjectRoutePoolConstraint(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateCredentialScheduling(ctx); err != nil {
+		return err
+	}
+	return s.migrateLegacyProjectProfileDefaults(ctx)
+}
+
+func (s *Server) ensureProjectRoutePoolConstraint(ctx context.Context) error {
+	var definition string
+	if err := s.db.QueryRowContext(ctx, `select coalesce(sql,'') from sqlite_master where type='table' and name='project_agent_route_revisions'`).Scan(&definition); err != nil {
+		return err
+	}
+	if strings.Contains(definition, "'pool'") {
+		return s.ensureProjectRouteImmutableTrigger(ctx)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `drop trigger if exists project_agent_route_revisions_immutable`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `alter table project_agent_route_revisions rename to project_agent_route_revisions_legacy`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `create table project_agent_route_revisions (id text primary key, project_id text not null references projects(id) on delete cascade, agent_id text not null check(agent_id in ('claude-code','codex')), profile_id text not null default '', profile_revision_id text not null default '', pool_revision_id text not null default '', remote_route_revision_id text not null default '', mode text not null check(mode in ('pinned','pool','cli_managed')), state text not null default 'active' check(state in ('active','deprecated','revoked')), created_at datetime not null)`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `insert into project_agent_route_revisions (id,project_id,agent_id,profile_id,profile_revision_id,pool_revision_id,remote_route_revision_id,mode,state,created_at) select id,project_id,agent_id,profile_id,profile_revision_id,'','',mode,state,created_at from project_agent_route_revisions_legacy`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `drop table project_agent_route_revisions_legacy`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `create index if not exists project_agent_route_revisions_project_agent on project_agent_route_revisions(project_id,agent_id,created_at desc)`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `create trigger project_agent_route_revisions_immutable before update on project_agent_route_revisions when new.id<>old.id or new.project_id<>old.project_id or new.agent_id<>old.agent_id or new.profile_id<>old.profile_id or new.profile_revision_id<>old.profile_revision_id or new.pool_revision_id<>old.pool_revision_id or new.remote_route_revision_id<>old.remote_route_revision_id or new.mode<>old.mode or new.created_at<>old.created_at or (old.state='revoked' and new.state<>old.state) or (old.state='deprecated' and new.state not in ('deprecated','revoked')) or (old.state='active' and new.state not in ('active','deprecated','revoked')) begin select raise(abort, 'project agent route revisions are immutable'); end`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Server) ensureProjectRouteImmutableTrigger(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `drop trigger if exists project_agent_route_revisions_immutable`); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `create trigger project_agent_route_revisions_immutable before update on project_agent_route_revisions when new.id<>old.id or new.project_id<>old.project_id or new.agent_id<>old.agent_id or new.profile_id<>old.profile_id or new.profile_revision_id<>old.profile_revision_id or new.pool_revision_id<>old.pool_revision_id or new.remote_route_revision_id<>old.remote_route_revision_id or new.mode<>old.mode or new.created_at<>old.created_at or (old.state='revoked' and new.state<>old.state) or (old.state='deprecated' and new.state not in ('deprecated','revoked')) or (old.state='active' and new.state not in ('active','deprecated','revoked')) begin select raise(abort, 'project agent route revisions are immutable'); end`)
+	return err
 }
 
 func validProfileAgent(agentID string) bool { return agentID == "claude-code" || agentID == "codex" }
+
+func (s *Server) migrateLegacyProjectProfileDefaults(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `select p.id,coalesce(nullif(p.runner_id,''),p.runner),coalesce(p.default_profile_id,'')
+		from projects p where coalesce(p.default_profile_id,'')<>''
+		and not exists (select 1 from project_agent_route_migrations m where m.project_id=p.id)`)
+	if err != nil {
+		return fmt.Errorf("read legacy project profile defaults: %w", err)
+	}
+	defer rows.Close()
+	type legacyDefault struct{ projectID, runnerID, profileID string }
+	items := []legacyDefault{}
+	for rows.Next() {
+		var item legacyDefault
+		if err := rows.Scan(&item.projectID, &item.runnerID, &item.profileID); err != nil {
+			return err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range items {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		var agentID, revisionID, state string
+		err = tx.QueryRowContext(ctx, `select p.agent_id,r.id,r.state from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id
+			where p.id=? and p.runner_id=? and p.enabled=1`, item.profileID, item.runnerID).Scan(&agentID, &revisionID, &state)
+		result := "migrated"
+		if errors.Is(err, sql.ErrNoRows) || !validProfileAgent(agentID) || state != "active" {
+			result = "cleared_unavailable_legacy_profile"
+			_, err = tx.ExecContext(ctx, `update projects set default_profile_id='' where id=?`, item.projectID)
+		} else if err == nil {
+			err = s.replaceProjectAgentRouteTx(ctx, tx, item.projectID, agentID, item.profileID, revisionID, "pinned")
+		}
+		if err == nil {
+			_, err = tx.ExecContext(ctx, `insert into project_agent_route_migrations (project_id,legacy_profile_id,result,created_at) values (?,?,?,?)`, item.projectID, item.profileID, result, time.Now().UTC())
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate project %s legacy profile: %w", item.projectID, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) replaceProjectAgentRouteTx(ctx context.Context, tx *sql.Tx, projectID, agentID, profileID, profileRevisionID, mode string) error {
+	return s.replaceProjectAgentRouteWithPoolTx(ctx, tx, projectID, agentID, profileID, profileRevisionID, "", mode)
+}
+
+func (s *Server) replaceProjectAgentRouteWithPoolTx(ctx context.Context, tx *sql.Tx, projectID, agentID, profileID, profileRevisionID, poolRevisionID, mode string) error {
+	if !validProfileAgent(agentID) || (mode != "pinned" && mode != "cli_managed" && mode != "pool") || (mode == "pinned" && (profileID == "" || profileRevisionID == "" || poolRevisionID != "")) || (mode == "pool" && (poolRevisionID == "" || profileID != "" || profileRevisionID != "")) || (mode == "cli_managed" && (profileID != "" || profileRevisionID != "" || poolRevisionID != "")) {
+		return errors.New("invalid project agent route")
+	}
+	now := time.Now().UTC()
+	routeRevisionID := uuid.NewString()
+	if _, err := tx.ExecContext(ctx, `update project_agent_route_revisions set state='deprecated' where id=(
+		select current_revision_id from project_agent_routes where project_id=? and agent_id=?
+	) and state='active'`, projectID, agentID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `insert into project_agent_route_revisions (id,project_id,agent_id,profile_id,profile_revision_id,pool_revision_id,mode,state,created_at) values (?,?,?,?,?,?,?, 'active',?)`, routeRevisionID, projectID, agentID, profileID, profileRevisionID, poolRevisionID, mode, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `insert into project_agent_routes (project_id,agent_id,current_revision_id,enabled,created_at,updated_at) values (?,?,?,?,?,?)
+		on conflict(project_id,agent_id) do update set current_revision_id=excluded.current_revision_id,enabled=1,updated_at=excluded.updated_at`, projectID, agentID, routeRevisionID, true, now, now); err != nil {
+		return err
+	}
+	return nil
+}
 
 var profileNamePattern = regexp.MustCompile(`^[\pL\pN][\pL\pN ._()-]{0,79}$`)
 var profileModelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
@@ -250,11 +443,37 @@ func validateManagedProfileInput(agentID, name, model, baseURL, authMode string)
 			if !httpEndpointPattern.MatchString(baseURL) {
 				return errors.New("profile base URL is invalid")
 			}
+			parsed, err := url.Parse(baseURL)
+			if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && !isLoopbackHost(parsed.Hostname())) {
+				return errors.New("production profile base URL must use HTTPS; HTTP is allowed only for loopback mocks")
+			}
 		}
 	default:
 		return errors.New("unsupported profile authentication mode")
 	}
 	return nil
+}
+
+func validateProfileOptions(agentID string, values map[string]string) error {
+	for key, value := range values {
+		key = strings.ToUpper(strings.TrimSpace(key))
+		if value == "" || strings.ContainsRune(value, '\x00') {
+			return errors.New("provider option is invalid")
+		}
+		switch key {
+		case "ANTHROPIC_VERSION", "ANTHROPIC_BETA":
+			if agentID != "claude-code" {
+				return errors.New("provider option is not supported by this agent")
+			}
+		default:
+			return errors.New("unsupported provider option")
+		}
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	return strings.EqualFold(host, "localhost") || net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
 }
 
 func profileProtocol(agentID, authMode string) string {
@@ -334,21 +553,23 @@ func (s *Server) listAgentProfiles(w http.ResponseWriter, r *http.Request) {
 type ProjectAgentConfigView struct {
 	// RunnerID is the project's execution runner; RunnerManaged is false for
 	// SSH / Windows-scheduled WSL where credentials are not injected locally.
-	RunnerID      string `json:"runnerId"`
-	RunnerManaged bool   `json:"runnerManaged"`
+	RunnerID      string                 `json:"runnerId"`
+	RunnerManaged bool                   `json:"runnerManaged"`
 	Claude        *ProjectAgentEntryView `json:"claude"`
 	Codex         *ProjectAgentEntryView `json:"codex"`
 }
 
 type ProjectAgentEntryView struct {
-	ProfileID string          `json:"profileId"`
-	Model     string          `json:"model,omitempty"`
-	BaseURL   string          `json:"baseUrl,omitempty"`
-	AuthMode  string          `json:"authMode"`
-	IsDefault bool            `json:"isDefault"`
-	Enabled   bool            `json:"enabled"`
-	State     string          `json:"state"`
-	Env       map[string]string `json:"env,omitempty"`
+	ProfileID      string            `json:"profileId"`
+	PoolRevisionID string            `json:"poolRevisionId,omitempty"`
+	Mode           string            `json:"mode"`
+	Model          string            `json:"model,omitempty"`
+	BaseURL        string            `json:"baseUrl,omitempty"`
+	AuthMode       string            `json:"authMode"`
+	IsDefault      bool              `json:"isDefault"`
+	Enabled        bool              `json:"enabled"`
+	State          string            `json:"state"`
+	Env            map[string]string `json:"env,omitempty"`
 }
 
 // getProjectAgentConfig returns the current AI configuration applied to new
@@ -370,74 +591,79 @@ func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
 		runnerID = s.localRunnerID()
 	}
 	view := ProjectAgentConfigView{RunnerID: runnerID, RunnerManaged: s.canManageProfileRunner(runnerID)}
-	// Load every profile on this runner + each target agent, then select the
-	// effective one per agent: the project's default_profile_id wins when it
-	// points at one of them, otherwise the currently-enabled profile.
-	rows, err := s.db.QueryContext(r.Context(), `select p.id,p.agent_id,p.enabled,p.is_default,r.revision,r.base_url,r.model,r.options_json,r.auth_mode,r.state
-		from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id
-		where p.runner_id=? and p.agent_id in ('claude-code','codex') order by p.agent_id,p.name`, runnerID)
+	// Route revisions are the source of truth. A project never falls back to an
+	// arbitrary runner-level profile: that would silently make two projects share
+	// credentials. The legacy column is consulted only during the short upgrade
+	// compatibility window when no route row exists yet.
+	rows, err := s.db.QueryContext(r.Context(), `select rr.agent_id,rr.mode,rr.pool_revision_id,rr.profile_id,p.enabled,r.revision,r.base_url,r.model,r.options_json,r.auth_mode,r.state
+		from project_agent_routes pr join project_agent_route_revisions rr on rr.id=pr.current_revision_id
+		left join agent_profiles p on p.id=rr.profile_id
+		left join agent_profile_revisions r on r.id=rr.profile_revision_id
+		where pr.project_id=? and pr.enabled=1 and rr.state='active' order by rr.agent_id`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer rows.Close()
-	type entryByAgent struct {
-		agentID string
-		entry   ProjectAgentEntryView
-	}
-	byAgentDefault := map[string]*ProjectAgentEntryView{}
-	candidates := []entryByAgent{}
+	byAgent := map[string]*ProjectAgentEntryView{}
 	for rows.Next() {
 		var entry ProjectAgentEntryView
-		var agentID string
-		var revision int
-		var optionsJSON string
-		if err := rows.Scan(&entry.ProfileID, &agentID, &entry.Enabled, &entry.IsDefault, &revision, &entry.BaseURL, &entry.Model, &optionsJSON, &entry.AuthMode, &entry.State); err != nil {
+		var agentID, mode, poolRevisionID string
+		var revision sql.NullInt64
+		var optionsJSON sql.NullString
+		var enabled sql.NullBool
+		var baseURL, model, authMode, state sql.NullString
+		if err := rows.Scan(&agentID, &mode, &poolRevisionID, &entry.ProfileID, &enabled, &revision, &baseURL, &model, &optionsJSON, &authMode, &state); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		entry.Env, _ = unmarshalProfileOptions(optionsJSON)
-		if project.DefaultProfileID != "" && entry.ProfileID == project.DefaultProfileID {
-			byAgentDefault[agentID] = &entry
-		} else {
-			candidates = append(candidates, entryByAgent{agentID: agentID, entry: entry})
-		}
+		entry.Mode, entry.PoolRevisionID, entry.IsDefault = mode, poolRevisionID, true
+		entry.Enabled = enabled.Bool
+		entry.BaseURL, entry.Model, entry.AuthMode, entry.State = baseURL.String, model.String, authMode.String, state.String
+		entry.Env, _ = unmarshalProfileOptions(optionsJSON.String)
+		byAgent[agentID] = &entry
 	}
 	if err := rows.Err(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	pick := func(agentID string, dflt *ProjectAgentEntryView) *ProjectAgentEntryView {
-		if dflt != nil {
-			dflt.IsDefault = true
-			return dflt
+	// Keep the aggregate view useful for projects created before independent
+	// routes existed: an agent without an explicit project route still exposes
+	// the enabled runner profile that would be selected for a new conversation.
+	for _, agentID := range []string{"claude-code", "codex"} {
+		if byAgent[agentID] != nil {
+			continue
 		}
-		// Prefer an enabled, active profile; fall back to any candidate.
-		var fallback *ProjectAgentEntryView
-		for index := range candidates {
-			c := candidates[index]
-			if c.agentID != agentID {
-				continue
-			}
-			entry := c.entry
-			if entry.Enabled && entry.State == "active" {
-				return &entry
-			}
-			if fallback == nil {
-				fallback = &entry
-			}
+		var entry ProjectAgentEntryView
+		var optionsJSON string
+		err := s.db.QueryRowContext(r.Context(), `select p.id,r.model,r.base_url,r.auth_mode,p.enabled,r.state,r.options_json
+			from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id
+			where p.runner_id=? and p.agent_id=? and p.enabled=1 and r.state='active'
+			order by case when p.id=? then 0 when p.is_default=1 then 1 else 2 end,p.name limit 1`, runnerID, agentID, project.DefaultProfileID).
+			Scan(&entry.ProfileID, &entry.Model, &entry.BaseURL, &entry.AuthMode, &entry.Enabled, &entry.State, &optionsJSON)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
 		}
-		return fallback
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		entry.Mode = "pinned"
+		entry.IsDefault = entry.ProfileID == project.DefaultProfileID
+		entry.Env, _ = unmarshalProfileOptions(optionsJSON)
+		byAgent[agentID] = &entry
 	}
-	// The two independent statements keep claude/codex mapping distinct from the
-	// agent_id string values used in the query.
-	view.Claude = pick("claude-code", byAgentDefault["claude-code"])
-	view.Codex = pick("codex", byAgentDefault["codex"])
+	view.Claude = byAgent["claude-code"]
+	view.Codex = byAgent["codex"]
 	writeJSON(w, http.StatusOK, view)
 }
 
 func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
+	if !s.canManageProfileRunner(runnerID) {
+		writeError(w, http.StatusConflict, errors.New("target Runner Agent is not installed; remote managed credentials are unavailable"))
+		return
+	}
 	var input struct {
 		AgentID   string            `json:"agentId"`
 		Name      string            `json:"name"`
@@ -457,6 +683,10 @@ func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 		input.AuthMode = "cli_managed"
 	}
 	if err := validateManagedProfileInput(input.AgentID, input.Name, input.Model, input.BaseURL, input.AuthMode); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateProfileOptions(input.AgentID, input.Env); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -499,6 +729,9 @@ func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil {
 		_, err = tx.ExecContext(r.Context(), `insert into agent_profile_revisions (id,profile_id,revision,base_url,model,options_json,protocol,auth_mode,secret_ref,state,execution_mode,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?)`, revision.ID, revision.ProfileID, revision.Revision, revision.BaseURL, revision.Model, optionsJSON, revision.Protocol, revision.AuthMode, revision.SecretRef, revision.State, revision.ExecutionMode, revision.CreatedAt)
+	}
+	if err == nil {
+		err = s.ensurePrivateQuotaGroupTx(r.Context(), tx, profile.ID, profile.RunnerID)
 	}
 	if err == nil {
 		err = tx.Commit()
@@ -594,40 +827,52 @@ func (s *Server) updateAgentProfile(w http.ResponseWriter, r *http.Request) {
 	if input.APIKey != nil {
 		newKey = strings.TrimSpace(*input.APIKey)
 	}
-	secretRef := current.SecretRef
-	// Track the prior managed key so it can be destroyed when leaving api_key.
-	retiredSecret := ""
-	if authMode == "cli_managed" && current.SecretRef != "" {
-		retiredSecret = current.SecretRef
-		secretRef = ""
-	}
-	// Rotate the managed key: always mint a fresh secret row so each revision
-	// keeps an independent, revocable credential snapshot. The previous
-	// revision's secret is left intact and destroyed only when that revision is
-	// revoked.
-	if authMode == "api_key" && newKey != "" && newKey != "********" {
-		stored, storeErr := s.profileSecrets.Store(tx, r.Context(), newKey)
-		if storeErr != nil {
-			writeError(w, 500, errors.New("managed credential could not be stored"))
-			return
-		}
-		secretRef = stored
-	} else if authMode == "api_key" && secretRef == "" {
-		// Promoted to api_key without a key: require one.
-		writeError(w, http.StatusBadRequest, errors.New("api_key profiles require a managed API key"))
-		return
-	}
 	// Request/environment overrides: keep current unless explicitly replaced.
 	env := current.Environment
 	if input.Env != nil {
 		env = input.Env
+	}
+	if err := validateProfileOptions(profile.AgentID, env); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 	optionsJSON, marshalErr := marshalProfileOptions(env)
 	if marshalErr != nil {
 		writeError(w, http.StatusBadRequest, marshalErr)
 		return
 	}
-	configChanged := model != current.Model || baseURL != current.BaseURL || authMode != current.AuthMode || secretRef != current.SecretRef || !mapsEqual(current.Environment, env)
+	configChangedWithoutSecret := model != current.Model || baseURL != current.BaseURL || authMode != current.AuthMode || !mapsEqual(current.Environment, env)
+	secretRef := current.SecretRef
+	if authMode == "cli_managed" {
+		secretRef = ""
+	} else if newKey != "" && newKey != "********" {
+		stored, storeErr := s.profileSecrets.Store(tx, r.Context(), newKey)
+		if storeErr != nil {
+			writeError(w, 500, errors.New("managed credential could not be stored"))
+			return
+		}
+		secretRef = stored
+	} else if configChangedWithoutSecret && current.AuthMode == "api_key" {
+		// Every API-key revision owns its secret row. Reusing a reference for a
+		// model/endpoint-only edit would let revoking one revision break another.
+		currentSecret, loadErr := s.profileSecrets.Load(tx, r.Context(), current.SecretRef)
+		if loadErr != nil || currentSecret == "" {
+			writeError(w, http.StatusConflict, errors.New("agent profile credential is unavailable"))
+			return
+		}
+		stored, storeErr := s.profileSecrets.Store(tx, r.Context(), currentSecret)
+		if storeErr != nil {
+			writeError(w, 500, errors.New("managed credential could not be stored"))
+			return
+		}
+		secretRef = stored
+	}
+	if authMode == "api_key" && secretRef == "" {
+		// Promoted to api_key without a key: require one.
+		writeError(w, http.StatusBadRequest, errors.New("api_key profiles require a managed API key"))
+		return
+	}
+	configChanged := configChangedWithoutSecret || secretRef != current.SecretRef
 	now := time.Now().UTC()
 	newRevision := current
 	if configChanged {
@@ -651,11 +896,6 @@ func (s *Server) updateAgentProfile(w http.ResponseWriter, r *http.Request) {
 	if err = tx.Commit(); err != nil {
 		writeError(w, 500, err)
 		return
-	}
-	// The prior managed key is no longer referenced by the current revision;
-	// destroy it once the transition commits.
-	if retiredSecret != "" {
-		_ = s.profileSecrets.Revoke(s.db, r.Context(), retiredSecret)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"profile": profile, "revision": newRevision})
 }
@@ -714,6 +954,10 @@ func (s *Server) disableAgentProfile(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		// A disabled profile can no longer back a project default.
 		_, err = s.db.ExecContext(r.Context(), `update projects set default_profile_id='' where default_profile_id=?`, profileID)
+	}
+	if err == nil {
+		_, err = s.db.ExecContext(r.Context(), `update project_agent_routes set enabled=0,updated_at=? where current_revision_id in (
+			select id from project_agent_route_revisions where profile_id=?)`, time.Now().UTC(), profileID)
 	}
 	if err != nil {
 		writeError(w, 500, err)
@@ -792,6 +1036,10 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 		_, err = tx.ExecContext(r.Context(), `update projects set default_profile_id='' where default_profile_id in (
 			select p.id from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id where r.id=?)`, revisionID)
 	}
+	if err == nil {
+		_, err = tx.ExecContext(r.Context(), `update project_agent_routes set enabled=0,updated_at=? where current_revision_id in (
+			select rr.id from project_agent_route_revisions rr where rr.profile_revision_id=?)`, time.Now().UTC(), revisionID)
+	}
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -829,6 +1077,17 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 		writeError(w, 500, err)
 		return
 	}
+	jobID := uuid.NewString()
+	jobState := "stopping"
+	var completedAt any
+	if len(runIDs) == 0 {
+		jobState = "completed"
+		completedAt = time.Now().UTC()
+	}
+	if _, err := tx.ExecContext(r.Context(), `insert into revocation_jobs (id,profile_revision_id,state,created_at,updated_at,completed_at) values (?,?,?,?,?,?) on conflict(profile_revision_id) do update set state=excluded.state,error='',updated_at=excluded.updated_at,completed_at=excluded.completed_at`, jobID, revisionID, jobState, time.Now().UTC(), time.Now().UTC(), completedAt); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, 500, err)
 		return
@@ -856,7 +1115,7 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 	for _, session := range sessions {
 		session.Stop()
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"state": "revoked", "stoppingRunCount": len(runIDs)})
+	writeJSON(w, http.StatusAccepted, map[string]any{"state": "revoked", "revocationJobId": jobID, "revocationJobState": jobState, "stoppingRunCount": len(runIDs)})
 }
 
 func (s *Server) canManageProfileRunner(runnerID string) bool {
@@ -866,60 +1125,152 @@ func (s *Server) canManageProfileRunner(runnerID string) bool {
 }
 
 func (s *Server) profileForNewConversationTx(ctx context.Context, tx *sql.Tx, requestedProfileID *string, runnerID, agentID, projectID string) (string, error) {
+	selection, err := s.profileRouteForNewConversationTx(ctx, tx, requestedProfileID, runnerID, agentID, projectID)
+	return selection.ProfileRevisionID, err
+}
+
+func (s *Server) profileRouteForNewConversationTx(ctx context.Context, tx *sql.Tx, requestedProfileID *string, runnerID, agentID, projectID string) (profileRouteSelection, error) {
 	var profileID string
 	if requestedProfileID != nil {
 		profileID = strings.TrimSpace(*requestedProfileID)
 	}
-	// fromDefault marks a fallback inherited from the project's configured default
-	// (rather than an explicit user selection). Fallbacks that don't fit the
-	// conversation's target agent degrade to the CLI's own config instead of
-	// failing the conversation, so a project can configure both Claude and Codex
-	// independently while the single default column covers whichever was set last.
-	fromDefault := false
-	// The explicit selection wins. When empty, fall back to the project's
-	// configured default profile, which lets a whole project ride one credential
-	// without repeating the choice on every conversation.
+	// An explicit selection wins. Without it, resolve the immutable revision of
+	// this project's route for the requested agent. The legacy column is read
+	// only for databases created before project_agent_routes existed.
+	var routeRevisionID, profileRevisionID string
 	if profileID == "" && projectID != "" {
-		var fallback string
-		err := tx.QueryRowContext(ctx, `select default_profile_id from projects where id=?`, projectID).Scan(&fallback)
+		var mode, state, poolRevisionID string
+		err := tx.QueryRowContext(ctx, `select rr.id,rr.profile_id,rr.profile_revision_id,rr.pool_revision_id,rr.mode,rr.state
+			from project_agent_routes pr join project_agent_route_revisions rr on rr.id=pr.current_revision_id
+			where pr.project_id=? and pr.agent_id=? and pr.enabled=1`, projectID, agentID).Scan(&routeRevisionID, &profileID, &profileRevisionID, &poolRevisionID, &mode, &state)
 		if err == nil {
-			profileID = strings.TrimSpace(fallback)
-			fromDefault = true
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", err
+			if state != "active" || (mode != "pinned" && mode != "cli_managed" && mode != "pool") {
+				return profileRouteSelection{}, errors.New("project agent route is not admissible")
+			}
+			if mode == "cli_managed" {
+				return profileRouteSelection{RouteRevisionID: routeRevisionID}, nil
+			}
+			if mode == "pool" {
+				// Defer choosing a member until the first run admission so that a
+				// queued conversation neither consumes nor freezes a credential.
+				return profileRouteSelection{RouteRevisionID: routeRevisionID}, nil
+			}
+			if mode == "pinned" && (profileID == "" || profileRevisionID == "") {
+				return profileRouteSelection{}, errors.New("project agent route is invalid")
+			}
+		} else if errors.Is(err, sql.ErrNoRows) {
+			var fallback string
+			err = tx.QueryRowContext(ctx, `select default_profile_id from projects where id=?`, projectID).Scan(&fallback)
+			if err == nil {
+				profileID = strings.TrimSpace(fallback)
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return profileRouteSelection{}, err
+			}
+		} else {
+			return profileRouteSelection{}, err
 		}
 	}
 	if profileID == "" {
-		return "", nil
+		return profileRouteSelection{}, nil
 	}
 	var revision AgentProfileRevision
-	err := tx.QueryRowContext(ctx, `select r.id,r.profile_id,r.revision,r.base_url,r.model,r.protocol,r.auth_mode,r.secret_ref,r.state,r.execution_mode,r.created_at
-		from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id
-		where p.runner_id=? and p.agent_id=? and p.enabled=1 and p.id=?`, runnerID, agentID, profileID).Scan(&revision.ID, &revision.ProfileID, &revision.Revision, &revision.BaseURL, &revision.Model, &revision.Protocol, &revision.AuthMode, &revision.SecretRef, &revision.State, &revision.ExecutionMode, &revision.CreatedAt)
+	query := `select r.id,r.profile_id,r.revision,r.base_url,r.model,r.protocol,r.auth_mode,r.secret_ref,r.state,r.execution_mode,r.created_at
+		from agent_profiles p join agent_profile_revisions r on r.profile_id=p.id
+		where p.runner_id=? and p.agent_id=? and p.enabled=1 and p.id=? and r.id=p.current_revision_id`
+	args := []any{runnerID, agentID, profileID}
+	if routeRevisionID != "" && profileRevisionID != "" {
+		query = `select r.id,r.profile_id,r.revision,r.base_url,r.model,r.protocol,r.auth_mode,r.secret_ref,r.state,r.execution_mode,r.created_at
+			from agent_profiles p join agent_profile_revisions r on r.profile_id=p.id
+			where p.runner_id=? and p.agent_id=? and p.enabled=1 and p.id=? and r.id=?`
+		args = append(args, profileRevisionID)
+	}
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&revision.ID, &revision.ProfileID, &revision.Revision, &revision.BaseURL, &revision.Model, &revision.Protocol, &revision.AuthMode, &revision.SecretRef, &revision.State, &revision.ExecutionMode, &revision.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		// A project default configured for a different agent is not an error: the
-		// CLI's own config takes over for conversations of the other agent.
-		if fromDefault {
-			return "", nil
-		}
-		return "", errors.New("agent profile is unavailable for this runner or agent")
+		return profileRouteSelection{}, errors.New("agent profile is unavailable for this runner or agent")
+	}
+	if err != nil {
+		return profileRouteSelection{}, err
+	}
+	if revision.State != "active" || revision.ExecutionMode != "isolated" || (revision.AuthMode != "cli_managed" && revision.AuthMode != "api_key") {
+		return profileRouteSelection{}, errors.New("agent profile revision is not admissible")
+	}
+	if revision.AuthMode == "cli_managed" && (revision.BaseURL != "" || revision.SecretRef != "") {
+		return profileRouteSelection{}, errors.New("agent profile revision is invalid")
+	}
+	if profileRevisionID != "" && revision.ID != profileRevisionID {
+		return profileRouteSelection{}, errors.New("project agent route profile revision is unavailable")
+	}
+	return profileRouteSelection{ProfileRevisionID: revision.ID, RouteRevisionID: routeRevisionID}, nil
+}
+
+func (s *Server) selectPoolProfileRevisionTx(ctx context.Context, tx *sql.Tx, routeRevisionID, runnerID, agentID string) (string, error) {
+	var poolRevisionID, strategy string
+	var projectMaxConcurrency int
+	err := tx.QueryRowContext(ctx, `select rr.pool_revision_id,pr.strategy,pr.project_max_concurrency from project_agent_route_revisions rr join credential_pool_revisions pr on pr.id=rr.pool_revision_id
+		where rr.id=? and rr.agent_id=? and rr.mode='pool' and rr.state='active' and pr.state='active'`, routeRevisionID, agentID).Scan(&poolRevisionID, &strategy, &projectMaxConcurrency)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errors.New("credential pool route is unavailable")
 	}
 	if err != nil {
 		return "", err
 	}
-	if revision.State != "active" || revision.ExecutionMode != "isolated" || (revision.AuthMode != "cli_managed" && revision.AuthMode != "api_key") {
-		if fromDefault {
-			return "", nil
-		}
-		return "", errors.New("agent profile revision is not admissible")
+	var projectActive int
+	if err := tx.QueryRowContext(ctx, `select count(*) from runs where project_agent_route_revision_id=? and status in ('queued','running')`, routeRevisionID).Scan(&projectActive); err != nil {
+		return "", err
 	}
-	if revision.AuthMode == "cli_managed" && (revision.BaseURL != "" || revision.SecretRef != "") {
-		if fromDefault {
-			return "", nil
-		}
-		return "", errors.New("agent profile revision is invalid")
+	if projectMaxConcurrency > 0 && projectActive >= projectMaxConcurrency {
+		return "", &quotaAdmissionError{retryAfter: 5 * time.Second}
 	}
-	return revision.ID, nil
+	rows, err := tx.QueryContext(ctx, `select r.id from credential_pool_revision_members m join agent_profiles p on p.id=m.profile_id join agent_profile_revisions r on r.id=m.profile_revision_id
+		where m.pool_revision_id=? and m.enabled=1 and p.enabled=1 and p.runner_id=? and p.agent_id=? and r.state in ('active','deprecated')
+		order by (select count(*) from quota_reservations q where q.profile_revision_id=r.id and q.state in ('reserved','running')),p.id`, poolRevisionID, runnerID, agentID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var candidates []string
+	for rows.Next() {
+		var revisionID string
+		if err := rows.Scan(&revisionID); err != nil {
+			return "", err
+		}
+		candidates = append(candidates, revisionID)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(candidates) == 0 {
+		return "", &quotaAdmissionError{retryAfter: 5 * time.Second}
+	}
+	offset := 0
+	if strategy == "round_robin" || strategy == "fair_queue" {
+		_ = tx.QueryRowContext(ctx, `select next_member_offset from credential_pool_state where pool_revision_id=?`, poolRevisionID).Scan(&offset)
+		if offset < 0 {
+			offset = 0
+		}
+		offset %= len(candidates)
+	}
+	var minimumRetry time.Duration
+	for step := 0; step < len(candidates); step++ {
+		index := (offset + step) % len(candidates)
+		retryAfter, probeErr := s.profileQuotaRetryAfterTx(ctx, tx, candidates[index])
+		if probeErr != nil {
+			return "", probeErr
+		}
+		if retryAfter == 0 {
+			if strategy == "round_robin" || strategy == "fair_queue" {
+				_, err = tx.ExecContext(ctx, `insert into credential_pool_state (pool_revision_id,next_member_offset,updated_at) values (?,?,?) on conflict(pool_revision_id) do update set next_member_offset=excluded.next_member_offset,updated_at=excluded.updated_at`, poolRevisionID, (index+1)%len(candidates), time.Now().UTC())
+				if err != nil {
+					return "", err
+				}
+			}
+			return candidates[index], nil
+		}
+		if minimumRetry == 0 || retryAfter < minimumRetry {
+			minimumRetry = retryAfter
+		}
+	}
+	return "", &quotaAdmissionError{retryAfter: minimumRetry}
 }
 
 func (s *Server) runtimeProfileTx(ctx context.Context, tx *sql.Tx, revisionID, runnerID, agentID string) (*AgentRuntimeProfile, error) {
@@ -949,9 +1300,6 @@ func (s *Server) runtimeProfileTx(ctx context.Context, tx *sql.Tx, revisionID, r
 			return nil, errors.New("agent profile revision is invalid")
 		}
 	case "api_key":
-		if state != "active" {
-			return nil, errors.New("agent profile revision is not admissible")
-		}
 		secret, loadErr := s.profileSecrets.Load(tx, ctx, secretRef)
 		if loadErr != nil || secret == "" {
 			return nil, errors.New("agent profile credential is unavailable")

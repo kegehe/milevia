@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -311,7 +313,66 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 }
 
 func (r *codexCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeProfile) ([]string, []string, func(), error) {
-	return nil, managedCLIEnvironment(profile, os.Environ()), func() {}, nil
+	environment := managedCLIEnvironment(profile, os.Environ())
+	if profile == nil || profile.AuthMode != "api_key" {
+		return nil, environment, func() {}, nil
+	}
+	// Always isolate CODEX_HOME for a managed key, including the official
+	// endpoint. Otherwise a user's persisted model_provider could redirect this
+	// process and its managed key to a different endpoint.
+	dir, err := r.codexProfileHome(profile)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("create isolated Codex provider directory: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, nil, nil, fmt.Errorf("create isolated Codex provider directory: %w", err)
+	}
+	// Codex uses this environment for provider authentication, but tool commands
+	// must never inherit the managed API key.
+	config := "[shell_environment_policy]\nexclude = [\"OPENAI_API_KEY\"]\n"
+	args := []string{"-c", `shell_environment_policy.exclude=["OPENAI_API_KEY"]`}
+	if profile.BaseURL != "" {
+		// Codex custom providers are configuration-backed, not a generic
+		// OPENAI_BASE_URL substitution. Keep the provider name and wire protocol
+		// under our control.
+		config += "\nmodel_provider = \"milevia\"\n\n[model_providers.milevia]\nname = \"Milevia managed provider\"\nbase_url = \"" + strings.ReplaceAll(profile.BaseURL, "\"", "") + "\"\nwire_api = \"responses\"\nenv_key = \"OPENAI_API_KEY\"\n"
+		args = append([]string{"-c", `model_provider="milevia"`}, args...)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(config), 0o600); err != nil {
+		return nil, nil, nil, fmt.Errorf("write isolated Codex provider config: %w", err)
+	}
+	environment = managedCLIEnvironment(profile, environment, "CODEX_HOME="+dir)
+	// This directory must survive the Run: Codex stores the thread rollout here,
+	// and a later `exec resume` needs to see the same files. It is scoped by the
+	// immutable profile revision, so credentials/configuration changes get a new
+	// isolated home without mixing threads between profiles.
+	return args, environment, func() {}, nil
+}
+
+func (r *codexCLIRunner) codexProfileHome(profile *AgentRuntimeProfile) (string, error) {
+	root := r.config.DataDir
+	if root == "" {
+		var err error
+		root, err = os.UserConfigDir()
+		if err != nil {
+			return "", err
+		}
+		root = filepath.Join(root, "milevia")
+	}
+	identity := "default"
+	if profile != nil && profile.RevisionID != "" {
+		identity = profile.RevisionID
+	} else if profile != nil {
+		digest := sha256.Sum256([]byte(profile.AgentID + "\x00" + profile.BaseURL + "\x00" + profile.Model))
+		identity = fmt.Sprintf("anonymous-%x", digest[:8])
+	}
+	// Revision IDs are UUIDs today, but keep the path safe if that contract
+	// changes; the digest also avoids placing endpoint/key material in a path.
+	if profile != nil && profile.RevisionID != "" {
+		digest := sha256.Sum256([]byte(identity))
+		identity = fmt.Sprintf("revision-%x", digest[:8])
+	}
+	return filepath.Join(root, "codex", "profiles", identity), nil
 }
 
 func codexSandbox(policy string) (string, error) {
@@ -389,6 +450,11 @@ func readCodexStderr(reader io.Reader, sink AgentRunSink) {
 			// codex exec emits this informational line when its /dev/null stdin is
 			// non-interactive. The prompt is already supplied through argv.
 			if text == codexAdditionalStdinNotice {
+				continue
+			}
+			// Codex 0.148 emits a bare `!` on stderr as a progress/status
+			// marker in JSON mode. It is not an actionable diagnostic.
+			if strings.Trim(text, "!?.:;,-_~ \t\r\n") == "" {
 				continue
 			}
 			sink.Event("stderr", mustJSON(map[string]string{"message": codexDiagnostic(text)}))
@@ -531,6 +597,12 @@ func enrichCodexFileChange(line json.RawMessage, projectPath string) json.RawMes
 // and symlink-based information leaks.
 func codexFileChangeDiff(projectRoot, gitDir, changePath, kind string) string {
 	cleanRoot := filepath.Clean(projectRoot)
+	// On Windows, EvalSymlinks can return a canonical path with a different
+	// casing or 8.3 component than filepath.Abs. Resolve the root too so the
+	// containment check compares like-for-like paths.
+	if resolvedRoot, err := filepath.EvalSymlinks(cleanRoot); err == nil {
+		cleanRoot = resolvedRoot
+	}
 	var absPath string
 	if filepath.IsAbs(changePath) {
 		absPath = filepath.Clean(changePath)
@@ -575,13 +647,17 @@ func codexFileChangeDiff(projectRoot, gitDir, changePath, kind string) string {
 // It handles the root-"/" edge case where appending a separator would
 // produce "//" and break the prefix check.
 func isWithinPath(target, root string) bool {
-	if target == root {
-		return true
+	target = filepath.Clean(target)
+	root = filepath.Clean(root)
+	if runtime.GOOS == "windows" {
+		target = strings.ToLower(target)
+		root = strings.ToLower(root)
 	}
-	if root == string(filepath.Separator) {
-		return strings.HasPrefix(target, root)
+	relative, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
 	}
-	return strings.HasPrefix(target, root+string(filepath.Separator))
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
 }
 
 // codexGitDiff runs `git diff HEAD -- <path>` in the project root and returns

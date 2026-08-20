@@ -7,10 +7,12 @@ import { api } from "../lib/api";
 import { createWebSocket } from "../lib/runtime";
 import {
   type NotificationEvent,
-  notificationConversationURL,
+  isWithinQuietHours,
+  notificationTargetURL,
   priorityForType,
   toastVariantForType,
 } from "../lib/notifications";
+import { useUIPreferences, type LocalPreferences } from "../stores/useUIPreferences";
 
 const UnreadNotificationContext = createContext(0);
 
@@ -20,6 +22,7 @@ export function useUnreadCount() {
 }
 
 export function NotificationProvider({ children }: { children: React.ReactNode }) {
+  const { localPreferences } = useUIPreferences();
   const [unreadCount, setUnreadCount] = useState(0);
   const navigate = useNavigate();
   const location = useLocation();
@@ -32,7 +35,9 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   const initializedRef = useRef(false); // 初始加载完成标志，防止 WebSocket 历史通知与初始加载竞态
   const channelRef = useRef<BroadcastChannel | null>(null);
   const pathnameRef = useRef(location.pathname);
+  const localPreferencesRef = useRef<LocalPreferences>(localPreferences);
   pathnameRef.current = location.pathname;
+  localPreferencesRef.current = localPreferences;
 
   const syncUnreadCount = useCallback(() => {
     setUnreadCount(unreadNotificationsRef.current.size);
@@ -155,7 +160,19 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         payload: event,
       });
 
-      const isHighPriority = event.priority === "high" || priorityForType(event.type) === "high";
+      const preferences = localPreferencesRef.current;
+      const mappedPriority = priorityForType(event.type);
+      const isHighPriority = event.priority === "high" || mappedPriority === "high";
+      const isNormalPriority = !isHighPriority && (event.priority === "normal" || mappedPriority === "normal");
+      const inQuietHours = preferences.quietHoursEnabled && isWithinQuietHours(new Date(), preferences.quietHoursStart, preferences.quietHoursEnd);
+      const shouldPresent = isHighPriority || (!inQuietHours && (isNormalPriority ? preferences.taskNotificationsEnabled : preferences.lowPriorityNotificationsEnabled));
+
+      // The notification center is an audit trail, so user display preferences
+      // only suppress transient alerts and never discard the underlying event.
+      if (!shouldPresent) {
+        markUnread(event);
+        return;
+      }
       const duration = isHighPriority ? Infinity : 8000;
       const variant = toastVariantForType(event.type);
 
@@ -166,7 +183,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         action: {
           label: "查看详情",
           onClick: () => {
-            navigate(notificationConversationURL(event));
+            navigate(notificationTargetURL(event));
             dismissNotification(event.id);
           },
         },
@@ -176,7 +193,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       markUnread(event);
 
       // 页面不可见时，显示浏览器桌面通知
-      if (document.visibilityState === "hidden" && Notification.permission === "granted") {
+      if (preferences.systemNotificationsEnabled && preferences.notifyWhenHidden && document.visibilityState === "hidden" && typeof Notification !== "undefined" && Notification.permission === "granted") {
         new Notification(event.title, {
           body: event.body,
           tag: event.id,
@@ -268,23 +285,6 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       channelRef.current = null;
     };
   }, [handleNotification, markDismissed, markAllDismissed]);
-
-  // 请求浏览器通知权限（延迟到用户交互后）
-  useEffect(() => {
-    const requestPermission = () => {
-      if (Notification.permission === "default") {
-        void Notification.requestPermission();
-      }
-      document.removeEventListener("click", requestPermission);
-      document.removeEventListener("keydown", requestPermission);
-    };
-    document.addEventListener("click", requestPermission);
-    document.addEventListener("keydown", requestPermission);
-    return () => {
-      document.removeEventListener("click", requestPermission);
-      document.removeEventListener("keydown", requestPermission);
-    };
-  }, []);
 
   // 监听 NotificationCenter 的已读事件，并同步其他标签页。
   useEffect(() => {

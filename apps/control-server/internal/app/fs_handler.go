@@ -1,12 +1,18 @@
 package app
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -20,7 +26,12 @@ func (s *Server) registerFSRoutes(r chi.Router) {
 		r.Get("/read", s.fsReadFile)
 		r.Get("/stat", s.fsStat)
 		r.Get("/raw", s.fsRawFile)
+		r.Get("/download", s.fsDownloadFile)
+		r.Post("/download-ticket", s.fsCreateDownloadTicket)
 		r.Get("/search", s.fsSearch)
+		r.Get("/sqlite/tables", s.fsSQLiteTables)
+		r.Get("/sqlite/schema", s.fsSQLiteSchema)
+		r.Get("/sqlite/rows", s.fsSQLiteRows)
 
 		// 写入操作（需 workspace lease）
 		r.Put("/write", s.fsWriteFile)
@@ -28,6 +39,61 @@ func (s *Server) registerFSRoutes(r chi.Router) {
 		r.Delete("/remove", s.fsRemove)
 		r.Post("/rename", s.fsRename)
 	})
+}
+
+const downloadTicketTTL = time.Minute
+
+type downloadTicketPayload struct {
+	ProjectID string `json:"projectId"`
+	Path      string `json:"path"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+
+// validDownloadTicket permits a short-lived, path-bound download navigation.
+// It is intentionally restricted to GET downloads because browser navigations
+// cannot attach the desktop session header.
+func (s *Server) validDownloadTicket(r *http.Request) bool {
+	const prefix = "/api/projects/"
+	const suffix = "/fs/download"
+	if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) || !strings.HasSuffix(r.URL.Path, suffix) {
+		return false
+	}
+	projectID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, prefix), suffix)
+	if projectID == "" || strings.Contains(projectID, "/") {
+		return false
+	}
+	parts := strings.Split(r.URL.Query().Get("ticket"), ".")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(s.config.SessionToken))
+	_, _ = mac.Write(payloadBytes)
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return false
+	}
+	var payload downloadTicketPayload
+	if json.Unmarshal(payloadBytes, &payload) != nil {
+		return false
+	}
+	return payload.ExpiresAt >= time.Now().UTC().Unix() && payload.ProjectID == projectID && payload.Path == r.URL.Query().Get("path")
+}
+
+func (s *Server) issueDownloadTicket(projectID, path string) (string, error) {
+	payloadBytes, err := json.Marshal(downloadTicketPayload{ProjectID: projectID, Path: path, ExpiresAt: time.Now().UTC().Add(downloadTicketTTL).Unix()})
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, []byte(s.config.SessionToken))
+	_, _ = mac.Write(payloadBytes)
+	return base64.RawURLEncoding.EncodeToString(payloadBytes) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
 // getFilesystem 根据项目的 runner 类型返回对应的 Filesystem 实现。
@@ -145,40 +211,108 @@ func (s *Server) fsRawFile(w http.ResponseWriter, r *http.Request) {
 		s.writeFSError(w, err)
 		return
 	}
-	content, err := fs.ReadFile(r.Context(), path)
+	stream, info, err := fs.OpenRead(r.Context(), path)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	defer stream.Close()
 	// 仅对图片类型响应原始内容
-	if !strings.HasPrefix(content.Stat.MimeType, "image/") {
+	if !strings.HasPrefix(info.MimeType, "image/") {
 		writeError(w, http.StatusUnsupportedMediaType, errors.New("仅支持图片类型的原始内容访问"))
 		return
 	}
-	var data []byte
-	if content.Encoding == "base64" {
-		data, err = base64.StdEncoding.DecodeString(content.Content)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	} else {
-		data = []byte(content.Content)
-	}
-	w.Header().Set("Content-Type", content.Stat.MimeType)
+	w.Header().Set("Content-Type", info.MimeType)
 	w.Header().Set("Cache-Control", "no-cache")
-	// SVG 可包含 <script>，强制下载而非内联显示
-	if content.Stat.MimeType == "image/svg+xml" {
-		// RFC 5987: 清理文件名防止 header 注入
-		safeName := strings.Map(func(r rune) rune {
-			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
-				return r
-			}
-			return '_'
-		}, filepath.Base(path))
-		w.Header().Set("Content-Disposition", "attachment; filename="+safeName)
+	if info.Size >= 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size))
 	}
-	w.Write(data)
+	// SVG 可包含 <script>，强制下载而非内联显示
+	if info.MimeType == "image/svg+xml" {
+		w.Header().Set("Content-Disposition", contentDispositionFilename(path))
+	}
+	if _, err := io.Copy(w, stream); err != nil {
+		return
+	}
+}
+
+func (s *Server) fsDownloadFile(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, errors.New("path 参数必填"))
+		return
+	}
+	fs, err := s.getFilesystem(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	stream, info, err := fs.OpenRead(r.Context(), path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	defer stream.Close()
+	contentType := info.MimeType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", contentDispositionFilename(path))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if info.Size >= 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size))
+	}
+	if _, err := io.Copy(w, stream); err != nil {
+		return
+	}
+}
+
+func (s *Server) fsCreateDownloadTicket(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Path == "" {
+		writeError(w, http.StatusBadRequest, errors.New("path parameter is required"))
+		return
+	}
+	fs, err := s.getFilesystem(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	info, err := fs.Stat(r.Context(), input.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if info.IsDir {
+		writeError(w, http.StatusBadRequest, errors.New("path is a directory"))
+		return
+	}
+	ticket, err := s.issueDownloadTicket(chi.URLParam(r, "projectID"), input.Path)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": "/api/projects/" + chi.URLParam(r, "projectID") + "/fs/download?path=" + url.QueryEscape(input.Path) + "&ticket=" + url.QueryEscape(ticket)})
+}
+
+func contentDispositionFilename(path string) string {
+	safeName := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '_'
+	}, filepath.Base(path))
+	if safeName == "" || safeName == "." {
+		safeName = "download"
+	}
+	return "attachment; filename=" + safeName
 }
 
 func (s *Server) fsSearch(w http.ResponseWriter, r *http.Request) {

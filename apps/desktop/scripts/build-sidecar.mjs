@@ -9,6 +9,7 @@ const binaries = resolve(desktopRoot, "binaries");
 const cacheFile = resolve(binaries, ".build-cache.json");
 const controlOutput = resolve(binaries, "milevia-control.exe");
 const approvalOutput = resolve(binaries, "milevia-approval.exe");
+const terminalBridgeOutput = resolve(binaries, "milevia-terminal-bridge.exe");
 
 if (process.platform !== "win32") {
   throw new Error("Windows desktop sidecar must be built on Windows so the CGO SQLite toolchain is reproducible.");
@@ -159,8 +160,9 @@ const fingerprint = computeFingerprint([...goSources, ...modFiles]);
 
 const controlNeeded = force || shouldRebuild(controlOutput, fingerprint);
 const approvalNeeded = force || shouldRebuild(approvalOutput, fingerprint);
+const terminalBridgeNeeded = force || shouldRebuild(terminalBridgeOutput, fingerprint);
 
-if (!controlNeeded && !approvalNeeded) {
+if (!controlNeeded && !approvalNeeded && !terminalBridgeNeeded) {
   process.stdout.write("Sidecar binaries are up to date (use --force to rebuild).\n");
   process.exit(0);
 }
@@ -171,5 +173,6 @@ mkdirSync(dirname(controlOutput), { recursive: true });
 
 if (controlNeeded) goBuild("control-server", controlOutput, "./cmd/control-server");
 if (approvalNeeded) goBuild("approval-helper", approvalOutput, "./cmd/approval-helper");
+if (terminalBridgeNeeded) goBuild("terminal bridge", terminalBridgeOutput, "./cmd/terminal-bridge");
 
 writeCache(fingerprint);

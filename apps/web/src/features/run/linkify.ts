@@ -8,6 +8,8 @@ export type LinkifyPart = {
   url?: string;
 };
 
+export type LineLink = { from: number; to: number; url: string };
+
 const urlPattern = /\bhttps?:\/\/[^\s<>"']+/gi;
 
 /** 剥离 URL 尾部不属于地址的句子标点，以及不配对的右括号。 */
@@ -41,4 +43,15 @@ export function linkifyText(text: string): LinkifyPart[] {
   if (cursor < text.length) parts.push({ text: text.slice(cursor) });
   if (parts.length === 0) parts.push({ text });
   return parts;
+}
+
+/** 把单行文本中的可点击链接映射回原始字符串的字符区间。 */
+export function computeLineLinks(text: string): LineLink[] {
+  const links: LineLink[] = [];
+  let offset = 0;
+  for (const part of linkifyText(text)) {
+    if (part.url) links.push({ from: offset, to: offset + part.text.length, url: part.url });
+    offset += part.text.length;
+  }
+  return links;
 }

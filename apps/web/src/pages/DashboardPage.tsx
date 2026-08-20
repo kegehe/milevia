@@ -12,6 +12,7 @@ import { statusColors, statusLabels } from "../features/run/run-model";
 import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order";
 import { AppVersionTag } from "../features/updater/AppVersionTag";
 import { isDesktop } from "../lib/runtime";
+import "./dashboard.css";
 
 function WindowsEnvironmentIcon() {
   return <svg className="env-tag-icon windows" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4v7H3v-5.5ZM13 3.5 21 2v9h-8v-7.5ZM3 13h7.5v7L3 18.5V13ZM13 13h8v9l-8-1.5V13Z" /></svg>;
@@ -29,6 +30,10 @@ function WslEnvironmentIcon() {
 
 function SshConnectionIcon() {
   return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2" /><path d="m7.5 9 2.5 2.5L7.5 14M12.5 14h4" /></svg>;
+}
+
+function SettingsIcon() {
+  return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" /><path d="m19.2 13.8 1.2.9-1.8 3.1-1.4-.6a7.8 7.8 0 0 1-1.8 1l-.2 1.5h-3.6l-.2-1.5a7.8 7.8 0 0 1-1.8-1l-1.4.6-1.8-3.1 1.2-.9a7.2 7.2 0 0 1 0-2.1l-1.2-.9 1.8-3.1 1.4.6a7.8 7.8 0 0 1 1.8-1l.2-1.5h3.6l.2 1.5a7.8 7.8 0 0 1 1.8 1l1.4-.6 1.8 3.1-1.2.9a7.2 7.2 0 0 1 0 2.1Z" /></svg>;
 }
 
 function ImportProjectIcon() {
@@ -138,6 +143,7 @@ export default function DashboardPage() {
       <a className="brand" href="/"><img className="brand-mark" src="/milevia-mark.svg" width="42" height="42" alt="" /><span className="brand-word"><strong>Mile</strong><em>via</em></span></a>
       <div className="dashboard-actions">
         <NotificationCenter />
+        <button type="button" className="dashboard-action dashboard-action-settings secondary" title="设置" aria-label="设置" onClick={() => navigate("/settings")}><SettingsIcon /></button>
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
       </div>
@@ -165,7 +171,7 @@ export default function DashboardPage() {
           : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
     </section>
     {isDesktop() && <div className="dashboard-version"><AppVersionTag /></div>}
-    {deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
+    {deleteTarget && <DeleteProjectDialog project={deleteTarget} status={projectStatuses[deleteTarget.id]} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
   </main>;
 }
 
@@ -219,6 +225,64 @@ function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, 
   </article>;
 }
 
-function DeleteProjectDialog({ project, busy, close, confirm }: { project: Project; busy: boolean; close: () => void; confirm: () => Promise<void> }) {
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-project-title"><section className="modal"><header><div><h2 id="delete-project-title">删除项目</h2></div><button title="关闭" disabled={busy} onClick={close}>x</button></header><p className="permission-confirmation">确定要从列表中删除项目 <b>{project.name}</b> 吗？此操作会同时删除该项目下的所有对话历史、任务、运行记录及相关数据。项目源文件不会被删除。</p><footer><button className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary danger" disabled={busy} onClick={() => void confirm()}>{busy ? "删除中" : "确认删除"}</button></footer></section></div>;
+function DeleteWarnIcon() {
+  return <svg className="delete-project-warn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.3 3.9 2.7 17.2A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-2.8L13.7 3.9a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4.5M12 17.5h.01" /></svg>;
+}
+
+function DeleteTrashIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13M10 11v5M14 11v5" /></svg>;
+}
+
+function DeleteProjectDialog({ project, status, busy, close, confirm }: { project: Project; status?: ProjectStatus; busy: boolean; close: () => void; confirm: () => Promise<void> }) {
+  // 环境标签：让用户一眼确认删除的是哪一类项目（本地 Windows / WSL / 远端服务器）。
+  const envLabel = project.environment === "windows" ? "Windows"
+    : project.environment === "wsl" ? "WSL"
+      : project.environment === "remote-linux" ? "Remote"
+        : project.environment;
+  const envIcon = project.environment === "windows" ? <WindowsEnvironmentIcon />
+    : project.environment === "wsl" ? <WslEnvironmentIcon />
+      : <RemoteServerIcon />;
+  const conversationCount = status?.conversationCount ?? 0;
+  return (
+    <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-project-title" onClick={(event) => { if (event.target === event.currentTarget && !busy) close(); }}>
+      <section className="modal delete-project-dialog">
+        <header>
+          <div className="delete-project-heading">
+            <span className="delete-project-mark"><DeleteTrashIcon /></span>
+            <div className="delete-project-heading-text">
+              <label>DELETE PROJECT</label>
+              <h2 id="delete-project-title">删除项目</h2>
+            </div>
+          </div>
+          <button type="button" className="delete-project-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg></button>
+        </header>
+        <div className="delete-project-body">
+          <p className="delete-project-lead"><DeleteWarnIcon /><span>即将删除项目 <b>{project.name}</b>，其下所有会话历史、任务、运行记录将一并清除。此操作<b>不可撤销</b>。</span></p>
+          <div className="delete-project-chip">
+            <span className="delete-project-chip-mark">{project.name.slice(0, 1).toUpperCase()}</span>
+            <div className="delete-project-chip-body">
+              <span className="delete-project-chip-path" title={project.fullPath}>{project.pathDisplay || project.fullPath}</span>
+              <span className="delete-project-chip-meta">
+                {project.environment && <span className="delete-project-chip-env" title={`${envLabel} 项目`} role="img" aria-label={`${envLabel} 项目`}>{envIcon}{envLabel}</span>}
+                {conversationCount > 0 && <span className="delete-project-chip-count">{`已建立 ${conversationCount} 个会话`}</span>}
+              </span>
+            </div>
+          </div>
+          <div className="delete-project-effects">
+            <div className="delete-project-effects-title"><DeleteWarnIcon />删除后将移除此项目的数据：</div>
+            <ul className="delete-project-effects-list">
+              <li>与该项目的全部对话历史记录</li>
+              <li>任务队列、运行记录与优化建议分析数据</li>
+              <li>项目本身及其工作列表条目</li>
+            </ul>
+            <p className="delete-project-effects-keep"><b>项目源文件不受影响</b>：仅移除 Milevia 内的数据，目录中的代码文件不会被删除。</p>
+          </div>
+        </div>
+        <footer className="delete-project-footer">
+          <button type="button" className="secondary" disabled={busy} onClick={close}>取消</button>
+          <button type="button" className="primary danger" disabled={busy} onClick={() => void confirm()}>{busy ? "删除中…" : "确认删除"}</button>
+        </footer>
+      </section>
+    </div>
+  );
 }

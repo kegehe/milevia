@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  clearExpiredConversationDrafts,
   conversationDraftKey,
   getConversationDraft,
   persistConversationDraft,
@@ -83,4 +84,14 @@ test("stored drafts retain only the most recent fifty conversations", () => {
   assert.equal(readConversationDraft("project", "conversation-0", storage), null);
   assert.equal(readConversationDraft("project", "conversation-50", storage), "草稿 50");
   assert.equal(Object.keys(readConversationDrafts(storage)).length, 50);
+});
+
+test("draft retention uses the configured age and clears expired entries", () => {
+  const key = "auto.conversation-draft.v2:project:conversation";
+  const updatedAt = Date.now() - 45 * 24 * 60 * 60 * 1_000;
+  const storage = memoryStorage({ [key]: JSON.stringify({ text: "保留期测试", updatedAt }) });
+
+  assert.equal(readConversationDraft("project", "conversation", storage, 90), "保留期测试");
+  assert.equal(clearExpiredConversationDrafts(30, storage), 1);
+  assert.equal(storage.getItem(key), null);
 });

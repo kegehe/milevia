@@ -16,11 +16,13 @@
 .project-config-agent.is-default { border-color: #9bc4af; background: #f2faf4; }
 .project-config-agent > header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; border: 0; padding: 0 0 10px; }.project-config-agent > header b { color: #19332c; font-size: 13.5px; }.project-config-agent > header small { color: #6d8494; font-size: 11.5px; }
 .project-config-fields { display: grid; gap: 11px; }
+.project-config-pool-route { border: 1px solid #b9d7d1; padding: 10px; color: #31594f; background: #eff8f5; font-size: 12px; line-height: 1.5; }
 .project-config-field { display: grid; gap: 5px; color: #49665c; font-size: 12px; }
 .project-config-field > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }.project-config-field > span small { color: #8aa093; font-size: 11px; }
 .project-config-field input { min-height: 36px; box-sizing: border-box; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 10px; color: #19332c; background: #fff; font: 13px ui-sans-serif, system-ui, sans-serif; }.project-config-field input:focus { border-color: #7fae9d; outline: 2px solid #d5ebe0; }
 .project-config-authmode { display: flex; gap: 6px; }.project-config-authmode button { min-height: 32px; flex: 1; border: 1px solid #c8dcd1; border-radius: 6px; padding: 6px 10px; color: #49665c; background: #f7fbf8; font-size: 12px; cursor: pointer; }.project-config-authmode button.active { border-color: #2c7567; color: #fff; background: #2c7567; }.project-config-authmode button:disabled { opacity: .6; cursor: default; }
 .project-config-agent > footer { border: 0; padding: 12px 0 0; justify-content: flex-end; }.project-config-agent > footer .primary { border-color: #9fbd46; color: #19332c; background: #c8e85a; font-weight: 700; }.project-config-agent > footer .primary:hover:not(:disabled) { background: #d8f47b; }
+.project-config-pool-select { min-height: 34px; max-width: 150px; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 7px; color: #31594f; background: #f7fbf8; font-size: 12px; }
 .project-config-clear { padding: 0 18px 14px; }.project-config-clear .secondary { color: #9b4632; border-color: #ecc7bc; background: #fff6f2; }
 .project-config-dialog-footer { border-top-color: #dcebe1; padding: 14px 18px; }.project-config-dialog-footer .secondary { border-color: #c8dcd1; color: #31594f; background: #f7fbf8; }
 .project-config-remote { padding: 22px 20px; color: #5f7169; font-size: 13px; line-height: 1.6; }.project-config-remote p { margin: 0 0 18px; }.project-config-remote p strong { color: #19332c; }

@@ -9,11 +9,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
 
 func TestLocalFilesystemWriteFilePreservesExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not preserve POSIX file modes")
+	}
 	root := t.TempDir()
 	path := filepath.Join(root, "script.sh")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\necho old\n"), 0o755); err != nil {
@@ -136,6 +140,9 @@ func TestLocalFilesystemRemoveRemovesSymlinkNotTarget(t *testing.T) {
 		t.Fatalf("create target file: %v", err)
 	}
 	if err := os.Symlink("target", filepath.Join(root, "link")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a symlink is not permitted for this Windows test user: %v", err)
+		}
 		t.Fatalf("create symlink: %v", err)
 	}
 
@@ -159,6 +166,9 @@ func TestLocalFilesystemRenameMovesSymlinkNotTarget(t *testing.T) {
 		t.Fatalf("create target: %v", err)
 	}
 	if err := os.Symlink("target.txt", filepath.Join(root, "link")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a symlink is not permitted for this Windows test user: %v", err)
+		}
 		t.Fatalf("create symlink: %v", err)
 	}
 
@@ -183,6 +193,9 @@ func TestLocalFilesystemWriteFileRejectsFinalSymlink(t *testing.T) {
 		t.Fatalf("create target: %v", err)
 	}
 	if err := os.Symlink("target.txt", filepath.Join(root, "link.txt")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a symlink is not permitted for this Windows test user: %v", err)
+		}
 		t.Fatalf("create symlink: %v", err)
 	}
 

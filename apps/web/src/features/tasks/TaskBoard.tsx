@@ -16,7 +16,8 @@ const columnDefinitions: { id: string; label: string; statuses: TaskStatus[] }[]
 const historicalCancelledColumn: { id: string; label: string; statuses: TaskStatus[] } = { id: "cancelled", label: "历史已取消", statuses: ["cancelled"] };
 
 type DragData = { taskID: string; sourceColumnID: string; sourceIndex: number };
-type PendingConfirm = { title: string; message: React.ReactNode; danger?: boolean; onConfirm: () => void; onCancel: () => void } | null;
+type DropPlacement = { beforeTaskID?: string; afterTaskID?: string };
+type PendingConfirm = { title: string; message: React.ReactNode; danger?: boolean; confirmLabel?: string; className?: string; icon?: React.ReactNode; onConfirm: () => void; onCancel: () => void } | null;
 type ExecutionPolicy = "approval_required" | "full_control" | "read_only" | "workspace_write";
 type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; agentId: "claude-code" | "codex"; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
 
@@ -53,6 +54,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   const navigate = useNavigate();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [view, setView] = useState<"board" | "list">("board");
+  const [query, setQuery] = useState("");
   const [showHistoricalCancelled, setShowHistoricalCancelled] = useState(false);
   const [editor, setEditor] = useState<EditorState>(null);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
@@ -108,7 +110,11 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     void loadDetail(initialTaskID).catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务详情"); });
   }, [fail, initialTaskID, loadDetail]);
 
-  const visibleTasks = useMemo(() => showHistoricalCancelled ? tasks : tasks.filter((task) => task.status !== "cancelled"), [showHistoricalCancelled, tasks]);
+  const activeTasks = useMemo(() => showHistoricalCancelled ? tasks : tasks.filter((task) => task.status !== "cancelled"), [showHistoricalCancelled, tasks]);
+  const visibleTasks = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    return term ? activeTasks.filter((task) => task.title.toLowerCase().includes(term) || task.description.toLowerCase().includes(term)) : activeTasks;
+  }, [activeTasks, query]);
   useEffect(() => {
     if (!batchMode || selectedIDs.size === 0) return;
     const currentIDs = new Set(tasks.map((t) => t.id));
@@ -182,6 +188,29 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     finally { if (mountedRef.current) setBusy(""); }
   };
 
+  // 下发前先弹确认框：展示将交给 Agent 执行的任务说明与执行权限，
+  // 重下发时额外提示已执行次数——每次下发都会启动一次新的 Agent 执行并消耗额度。
+  const beginDispatch = () => {
+    if (!detail) return;
+    if (!mountedRef.current) return;
+    const priorRuns = detail.runs.length;
+    setPendingConfirm({
+      title: priorRuns > 0 ? "重新下发任务" : "下发任务",
+      message: (
+        <>
+          <p className="task-dispatch-title">「{taskDisplayTitle(detail)}」</p>
+          <p className="task-dispatch-note">将使用<b>「{policyLabel(permissionMode)}」</b>权限，把任务说明交给 Agent 开始执行。</p>
+          {priorRuns > 0 && <p className="task-dispatch-warning">该任务此前已执行 <b>{priorRuns}</b> 次，重新下发将再次启动 Agent 执行并消耗额度。</p>}
+        </>
+      ),
+      className: "task-dispatch-dialog",
+      icon: <svg className="task-dispatch-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13l11-1L8 20l3-7-7 3L5 4l14 7.5" /><path d="M19 17v-3M19 21h.01" /></svg>,
+      confirmLabel: priorRuns > 0 ? "确认重新下发" : "确认下发",
+      onConfirm: () => { if (mountedRef.current) { setPendingConfirm(null); void dispatch(); } },
+      onCancel: () => { if (mountedRef.current) setPendingConfirm(null); },
+    });
+  };
+
   const enqueue = async () => {
     if (!detail) return;
     setBusy("enqueue");
@@ -235,7 +264,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   };
 
   const moveTask = async (taskID: string, direction: "up" | "down") => {
-    const ordered = [...visibleTasks].sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
+    const ordered = [...activeTasks].sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
     const index = ordered.findIndex((task) => task.id === taskID);
     const neighbor = ordered[index + (direction === "up" ? -1 : 1)];
     const task = ordered[index];
@@ -251,7 +280,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     finally { if (mountedRef.current) setBusy(""); }
   };
 
-  const handleDrop = async (taskID: string, targetColumnID: string, targetIndex: number) => {
+  const handleDrop = async (taskID: string, targetColumnID: string, placement: DropPlacement) => {
     const task = tasks.find((t) => t.id === taskID);
     if (!task) return;
     if (task.status === "cancelled") return;
@@ -263,15 +292,18 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     const sameColumn = sourceDef?.id === targetColumnID;
 
     if (sameColumn) {
-      const columnTasks = visibleTasks.filter((t) => targetDef.statuses.includes(t.status))
+      const columnTasks = tasks.filter((t) => targetDef.statuses.includes(t.status))
         .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
       const currentIndex = columnTasks.findIndex((t) => t.id === taskID);
       if (currentIndex < 0) return;
-      const reordered = [...columnTasks];
-      const [moved] = reordered.splice(currentIndex, 1);
-      const insertionIndex = currentIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      if (placement.beforeTaskID === taskID || placement.afterTaskID === taskID) return;
+      const reordered = columnTasks.filter((item) => item.id !== taskID);
+      const beforeIndex = placement.beforeTaskID && placement.beforeTaskID !== taskID ? reordered.findIndex((item) => item.id === placement.beforeTaskID) : -1;
+      const afterIndex = placement.afterTaskID && placement.afterTaskID !== taskID ? reordered.findIndex((item) => item.id === placement.afterTaskID) : -1;
+      const insertionIndex = beforeIndex >= 0 ? beforeIndex : afterIndex >= 0 ? afterIndex + 1 : reordered.length;
       if (insertionIndex === currentIndex) return;
-      reordered.splice(insertionIndex, 0, moved);
+      reordered.splice(insertionIndex, 0, task);
+      if (reordered.every((item, index) => item.id === columnTasks[index]?.id)) return;
       const prev = reordered[insertionIndex - 1];
       const next = reordered[insertionIndex + 1];
       let newPosition: number;
@@ -291,10 +323,13 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
       if (!mountedRef.current) return;
       setBusy("move");
       try {
-        const columnTasks = visibleTasks.filter((t) => targetDef.statuses.includes(t.status))
+        const columnTasks = tasks.filter((t) => targetDef.statuses.includes(t.status))
           .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-        const prev = columnTasks[targetIndex - 1];
-        const next = columnTasks[targetIndex];
+        const beforeIndex = placement.beforeTaskID ? columnTasks.findIndex((item) => item.id === placement.beforeTaskID) : -1;
+        const afterIndex = placement.afterTaskID ? columnTasks.findIndex((item) => item.id === placement.afterTaskID) : -1;
+        const insertionIndex = beforeIndex >= 0 ? beforeIndex : afterIndex >= 0 ? afterIndex + 1 : columnTasks.length;
+        const prev = columnTasks[insertionIndex - 1];
+        const next = columnTasks[insertionIndex];
         let newPosition: number;
         if (columnTasks.length === 0) newPosition = task.position;
         else if (!prev) newPosition = next ? next.position - 1 : task.position;
@@ -331,6 +366,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
             </label>
           </div>
           <div className="task-toolbar-group task-toolbar-commands">
+            <label className="task-toolbar-search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg><input type="search" value={query} placeholder="搜索任务…" aria-label="搜索任务" onChange={(event) => setQuery(event.target.value)} /></label>
             <button className="task-toolbar-action" onClick={() => navigate(`/projects/${projectID}/orchestration`)}><TaskToolbarIcon name="workflow" />自动编排</button>
             <button className="task-toolbar-action" onClick={enterBatchMode}><TaskToolbarIcon name="batch" />批量管理</button>
             <button className="task-toolbar-action task-toolbar-create" onClick={() => setEditor({})}><TaskToolbarIcon name="plus" />新建任务</button>
@@ -340,12 +376,12 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     </header>
     {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} /> : <TaskList tasks={visibleTasks} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
-    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} dispatch={dispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={visibleTasks.some((item) => item.position < detail.position)} canMoveDown={visibleTasks.some((item) => item.position > detail.position)} request={request} fail={fail} />}
-    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
+    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} beginDispatch={beginDispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={activeTasks.some((item) => item.position < detail.position)} canMoveDown={activeTasks.some((item) => item.position > detail.position)} request={request} fail={fail} />}
+    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} confirmLabel={pendingConfirm.confirmLabel} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </section>;
 }
 
-function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchMode, selectedIDs, toggleSelect }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, index: number) => Promise<void>; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void }) {
+function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchMode, selectedIDs, toggleSelect }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, placement: DropPlacement) => Promise<void>; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void }) {
   const [dragOverColumn, setDragOverColumn] = useState<string | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [draggingTaskID, setDraggingTaskID] = useState<string | null>(null);
@@ -419,7 +455,10 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
       return def.statuses.includes(t.status);
     }).sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
     const targetIndex = dragOverIndex !== null ? Math.min(dragOverIndex, columnTasks.length) : columnTasks.length;
-    await onDrop(dragData.taskID, columnID, targetIndex);
+    await onDrop(dragData.taskID, columnID, {
+      beforeTaskID: columnTasks[targetIndex]?.id,
+      afterTaskID: targetIndex > 0 ? columnTasks[targetIndex - 1]?.id : undefined,
+    });
   };
   const handleTaskDragStart = (e: React.DragEvent, taskID: string, columnID: string, index: number) => {
     dragGestureActive.current = true;
@@ -567,7 +606,7 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
   return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog task-editor-dialog"><header className="task-editor-header"><div><span>任务</span><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button type="button" className="task-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><form className="task-editor-form" onSubmit={(event) => void save(event)}><div className="task-form"><section className="task-form-section"><div className="task-form-section-head"><h3>基本信息</h3></div><div className="task-form-basic-grid"><label className="task-form-title">任务名称 <small>可选</small><input autoFocus maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div></section><section className="task-form-section"><div className="task-form-section-head"><h3>任务内容</h3></div><label>任务说明<textarea required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label></section></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
 }
 
-function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, dispatch, enqueue, orchestrationEnabled, transition, deleteTask, confirmTransition, edit, move, canMoveUp, canMoveDown, request, fail }: { detail: TaskDetail; permissionMode?: ExecutionPolicy; busy: string; close: () => void; refresh: () => Promise<void>; dispatch: () => Promise<void>; enqueue: () => Promise<void>; orchestrationEnabled: boolean; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; confirmTransition: () => void; edit: () => void; move: (taskID: string, direction: "up" | "down") => Promise<void>; canMoveUp: boolean; canMoveDown: boolean; request: Request; fail: (message: string) => void }) {
+function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, beginDispatch, enqueue, orchestrationEnabled, transition, deleteTask, confirmTransition, edit, move, canMoveUp, canMoveDown, request, fail }: { detail: TaskDetail; permissionMode?: ExecutionPolicy; busy: string; close: () => void; refresh: () => Promise<void>; beginDispatch: () => void; enqueue: () => Promise<void>; orchestrationEnabled: boolean; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; confirmTransition: () => void; edit: () => void; move: (taskID: string, direction: "up" | "down") => Promise<void>; canMoveUp: boolean; canMoveDown: boolean; request: Request; fail: (message: string) => void }) {
   const [reviewAction, setReviewAction] = useState<ReviewAction | null>(null);
   const [note, setNote] = useState("");
   const [reviewSubmitting, setReviewSubmitting] = useState(false);
@@ -589,7 +628,7 @@ function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, dispat
   };
   const reviewBusy = Boolean(busy) || reviewSubmitting || isTaskOrchestrating(detail) || isTaskAwaitingMainMerge(detail);
   const canResumeStoppedOrchestration = detail.orchestrationStatus === "stopped";
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-detail-title"><section className="modal task-dialog task-detail-dialog"><header className="task-detail-header"><div className="task-detail-heading"><h2 id="task-detail-title">{taskDisplayTitle(detail)}</h2><div><StatusBadge task={detail} /><span>更新于 {formatDate(detail.updatedAt)}</span></div></div><button type="button" className="task-detail-close" title="关闭" aria-label="关闭" onClick={close}>x</button></header><div className="task-detail-body"><div className="task-detail-meta"><span className={`priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span><span>执行权限：{policyLabel(permissionMode)}</span></div><section className="task-detail-section"><h3>任务说明</h3><p>{detail.description}</p></section><section className="task-detail-section"><h3>执行记录</h3>{detail.runs.length === 0 ? <p className="task-detail-empty">尚未下发。</p> : <div className="task-run-list"><div className="task-run-list-head"><span>次数</span><span>状态</span><span>时间</span></div>{detail.runs.map((run) => <div key={run.id}><b>第 {run.sequence} 次</b><span>{run.status}</span><time>{formatDate(run.createdAt)}</time>{run.failureReason && <small>{run.failureReason}</small>}</div>)}</div>}</section><section className="task-detail-section"><h3>验证记录</h3>{detail.verificationRuns.length === 0 ? <p className="task-detail-empty">尚无验证记录。</p> : <div className="verification-run-list">{detail.verificationRuns.map((run) => <details key={run.id} className="verification-run" open={run.status === "running"}><summary><b>{verificationPhaseLabel(run.phase)}</b><span className={`verification-status ${run.status}`}>{run.status === "running" ? "进行中" : run.status === "passed" ? "通过" : "失败"}</span><time>{formatDate(run.completedAt || run.createdAt)}</time></summary><p>{run.command}{run.reviewedSha ? ` @ ${run.reviewedSha.slice(0, 12)}` : ""}</p>{run.output && <pre>{run.output}</pre>}</details>)}</div>}</section>{reviewAction && <div className="task-review-sheet" ref={reviewSheetRef}><h3>要求修改</h3><textarea autoFocus required disabled={reviewSubmitting} value={note} onChange={(event) => setNote(event.target.value)} placeholder="说明需要补充或修改的内容" /><div><button className="secondary" disabled={reviewSubmitting} onClick={() => setReviewAction(null)}>返回</button><button className="primary" disabled={reviewSubmitting} onClick={() => void submitReview("request_changes")}>{reviewSubmitting ? "提交中" : "提交要求"}</button></div></div>}</div><footer className="task-detail-actions"><div className="task-detail-main-actions">{(detail.status === "todo" || detail.status === "action_required") && <><button className="secondary" disabled={Boolean(busy)} onClick={edit}>编辑</button><button className="secondary" disabled={Boolean(busy) || !canMoveUp} onClick={() => void move(detail.id, "up")}>上移</button><button className="secondary" disabled={Boolean(busy) || !canMoveDown} onClick={() => void move(detail.id, "down")}>下移</button></>}{detail.status === "awaiting_review" && <><button className="secondary" disabled={reviewBusy} onClick={() => setReviewAction("request_changes")}>要求修改</button><button className="primary" disabled={reviewBusy} onClick={() => void submitReview("accept")}>{reviewSubmitting ? "提交中" : "确认完成"}</button></>}{detail.status === "running" && <button className="task-detail-stop" disabled={Boolean(busy)} onClick={() => void transition("stop")}>{busy === "stop" ? "停止中" : "停止任务"}</button>}{(detail.status === "todo" || detail.status === "action_required") && <>{orchestrationEnabled && (canResumeStoppedOrchestration || !detail.orchestrationStatus) && <button className="secondary" disabled={Boolean(busy)} onClick={() => void enqueue()}>{busy === "enqueue" ? "处理中" : canResumeStoppedOrchestration ? "继续自动编排" : "加入自动队列"}</button>}<button className="primary" disabled={!detail.canDispatch || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button></>}{detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}</div><button className="task-detail-delete" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button></footer></section></div>;
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-detail-title"><section className="modal task-dialog task-detail-dialog"><header className="task-detail-header"><div className="task-detail-heading"><h2 id="task-detail-title">{taskDisplayTitle(detail)}</h2><div><StatusBadge task={detail} /><span>更新于 {formatDate(detail.updatedAt)}</span></div></div><button type="button" className="task-detail-close" title="关闭" aria-label="关闭" onClick={close}>x</button></header><div className="task-detail-body"><div className="task-detail-meta"><span className={`priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span><span>执行权限：{policyLabel(permissionMode)}</span></div><section className="task-detail-section"><h3>任务说明</h3><p>{detail.description}</p></section><section className="task-detail-section"><h3>执行记录</h3>{detail.runs.length === 0 ? <p className="task-detail-empty">尚未下发。</p> : <div className="task-run-list"><div className="task-run-list-head"><span>次数</span><span>状态</span><span>时间</span></div>{detail.runs.map((run) => <div key={run.id}><b>第 {run.sequence} 次</b><span>{run.status}</span><time>{formatDate(run.createdAt)}</time>{run.failureReason && <small>{run.failureReason}</small>}</div>)}</div>}</section><section className="task-detail-section"><h3>验证记录</h3>{detail.verificationRuns.length === 0 ? <p className="task-detail-empty">尚无验证记录。</p> : <div className="verification-run-list">{detail.verificationRuns.map((run) => <details key={run.id} className="verification-run" open={run.status === "running"}><summary><b>{verificationPhaseLabel(run.phase)}</b><span className={`verification-status ${run.status}`}>{run.status === "running" ? "进行中" : run.status === "passed" ? "通过" : "失败"}</span><time>{formatDate(run.completedAt || run.createdAt)}</time></summary><p>{run.command}{run.reviewedSha ? ` @ ${run.reviewedSha.slice(0, 12)}` : ""}</p>{run.output && <pre>{run.output}</pre>}</details>)}</div>}</section>{reviewAction && <div className="task-review-sheet" ref={reviewSheetRef}><h3>要求修改</h3><textarea autoFocus required disabled={reviewSubmitting} value={note} onChange={(event) => setNote(event.target.value)} placeholder="说明需要补充或修改的内容" /><div><button className="secondary" disabled={reviewSubmitting} onClick={() => setReviewAction(null)}>返回</button><button className="primary" disabled={reviewSubmitting} onClick={() => void submitReview("request_changes")}>{reviewSubmitting ? "提交中" : "提交要求"}</button></div></div>}</div><footer className="task-detail-actions"><div className="task-detail-main-actions">{(detail.status === "todo" || detail.status === "action_required") && <><button className="secondary" disabled={Boolean(busy)} onClick={edit}>编辑</button><button className="secondary" disabled={Boolean(busy) || !canMoveUp} onClick={() => void move(detail.id, "up")}>上移</button><button className="secondary" disabled={Boolean(busy) || !canMoveDown} onClick={() => void move(detail.id, "down")}>下移</button></>}{detail.status === "awaiting_review" && <><button className="secondary" disabled={reviewBusy} onClick={() => setReviewAction("request_changes")}>要求修改</button><button className="primary" disabled={reviewBusy} onClick={() => void submitReview("accept")}>{reviewSubmitting ? "提交中" : "确认完成"}</button></>}{detail.status === "running" && <button className="task-detail-stop" disabled={Boolean(busy)} onClick={() => void transition("stop")}>{busy === "stop" ? "停止中" : "停止任务"}</button>}{(detail.status === "todo" || detail.status === "action_required") && <>{orchestrationEnabled && (canResumeStoppedOrchestration || !detail.orchestrationStatus) && <button className="secondary" disabled={Boolean(busy)} onClick={() => void enqueue()}>{busy === "enqueue" ? "处理中" : canResumeStoppedOrchestration ? "继续自动编排" : "加入自动队列"}</button>}<button className="primary" disabled={!detail.canDispatch || Boolean(busy)} onClick={beginDispatch}>{busy === "dispatch" ? "下发中" : "下发任务"}</button></>}{detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}</div><button className="task-detail-delete" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button></footer></section></div>;
 }
 
 function formatDate(value: string): string {

@@ -2,6 +2,9 @@
  * 文件浏览器类型定义与工具函数
  */
 
+import type { FilePreviewKind } from "./source-language";
+export { detectLanguage } from "./source-language";
+
 // ─── API 响应类型 ───────────────────────────────────────────────────────────
 
 export interface FileEntry {
@@ -49,95 +52,11 @@ export interface OpenFile {
   language: string;
   isDirty: boolean;
   stat: FileInfo;
+  previewKind: FilePreviewKind;
+  contentLoaded: boolean;
 }
 
 // ─── 语言检测 ───────────────────────────────────────────────────────────────
-
-const extToLanguage: Record<string, string> = {
-  ".ts": "typescript",
-  ".tsx": "tsx",
-  ".js": "javascript",
-  ".jsx": "jsx",
-  ".mjs": "javascript",
-  ".cjs": "javascript",
-  ".css": "css",
-  ".scss": "scss",
-  ".less": "less",
-  ".html": "html",
-  ".htm": "html",
-  ".json": "json",
-  ".json5": "json",
-  ".jsonc": "json",
-  ".md": "markdown",
-  ".markdown": "markdown",
-  ".mdx": "markdown",
-  ".py": "python",
-  ".go": "go",
-  ".rs": "rust",
-  ".rb": "ruby",
-  ".java": "java",
-  ".kt": "kotlin",
-  ".scala": "scala",
-  ".c": "c",
-  ".cpp": "cpp",
-  ".h": "c",
-  ".hpp": "cpp",
-  ".cs": "csharp",
-  ".toml": "toml",
-  ".yaml": "yaml",
-  ".yml": "yaml",
-  ".xml": "xml",
-  ".svg": "xml",
-  ".sh": "bash",
-  ".bash": "bash",
-  ".zsh": "bash",
-  ".sql": "sql",
-  ".graphql": "graphql",
-  ".gql": "graphql",
-  ".vue": "html",
-  ".svelte": "html",
-  ".dart": "dart",
-  ".swift": "swift",
-  ".lua": "lua",
-  ".r": "r",
-  ".proto": "protobuf",
-  ".env": "bash",
-  ".gitignore": "bash",
-  ".dockerignore": "bash",
-  ".conf": "ini",
-  ".ini": "ini",
-  ".cfg": "ini",
-  ".log": "log",
-  ".diff": "diff",
-  ".patch": "diff",
-  ".txt": "text",
-  ".lock": "json",
-  ".map": "json",
-};
-
-const nameToLanguage: Record<string, string> = {
-  makefile: "makefile",
-  dockerfile: "dockerfile",
-  rakefile: "ruby",
-  gemfile: "ruby",
-  procfile: "text",
-  vagrantfile: "ruby",
-  license: "text",
-  readme: "markdown",
-  changelog: "markdown",
-};
-
-/**
- * 根据文件名检测语言类型
- */
-export function detectLanguage(filename: string): string {
-  const lower = filename.toLowerCase();
-  if (nameToLanguage[lower]) {
-    return nameToLanguage[lower];
-  }
-  const ext = lower.includes(".") ? "." + lower.split(".").pop()! : "";
-  return extToLanguage[ext] || "text";
-}
 
 /**
  * 获取文件图标键（用于 FileIcon 组件）
@@ -243,6 +162,9 @@ export function getFileIcon(entry: FileEntry): string {
     ".webp": "image",
     ".ico": "image",
     ".pdf": "file",
+    ".db": "sql",
+    ".sqlite": "sql",
+    ".sqlite3": "sql",
     ".zip": "zip",
     ".tar": "zip",
     ".gz": "zip",

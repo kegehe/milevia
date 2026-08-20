@@ -48,7 +48,7 @@ func TestCodexCustomProviderConnectivityPOC(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, codexPath, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config", "--json",
+	cmd := exec.CommandContext(ctx, codexPath, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config", "--skip-git-repo-check", "--json",
 		"-c", `model_provider="milevia_poc"`,
 		"-c", `model_providers.milevia_poc.name="Milevia POC"`,
 		"-c", `model_providers.milevia_poc.base_url="`+provider.URL+`/v1"`,
@@ -133,7 +133,7 @@ func TestCodexToolEnvironmentIsolationPOC(t *testing.T) {
 	home := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, codexPath, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config", "--json",
+	cmd := exec.CommandContext(ctx, codexPath, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--json",
 		"-c", `model_provider="milevia_poc"`,
 		"-c", `model_providers.milevia_poc.name="Milevia POC"`,
 		"-c", `model_providers.milevia_poc.base_url="`+provider.URL+`/v1"`,

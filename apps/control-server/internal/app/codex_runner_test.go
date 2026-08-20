@@ -68,6 +68,20 @@ func TestReadCodexStderrSkipsAdditionalStdinNotice(t *testing.T) {
 	}
 }
 
+func TestReadCodexStderrSkipsProgressPunctuation(t *testing.T) {
+	sink := &codexPayloadSink{}
+	readCodexStderr(strings.NewReader("!\nactual Codex diagnostic\n"), sink)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.events) != 1 || sink.events[0] != "stderr" {
+		t.Fatalf("events = %#v", sink.events)
+	}
+	if len(sink.payloads) != 1 || !strings.Contains(sink.payloads[0], "actual Codex diagnostic") {
+		t.Fatalf("payloads = %#v", sink.payloads)
+	}
+}
+
 func TestCodexSandbox(t *testing.T) {
 	if value, err := codexSandbox("workspace_write"); err != nil || value != "workspace-write" {
 		t.Fatalf("workspace policy = %q, %v", value, err)
@@ -120,7 +134,7 @@ func writeNpmCodexInstall(t *testing.T, dir, version string, executable bool) {
 
 func TestRollbackInterruptedNpmCodexInstall(t *testing.T) {
 	prefix := t.TempDir()
-	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@openai")
+	packageRoot := codexNpmCLIInstall.packageRoot(prefix)
 	current := filepath.Join(packageRoot, "codex")
 	backup := filepath.Join(packageRoot, ".codex-previous")
 	writeNpmCodexInstall(t, current, "0.147.0", false)
@@ -136,18 +150,15 @@ func TestRollbackInterruptedNpmCodexInstall(t *testing.T) {
 	if version, err := npmPackageVersion(current); err != nil || version != "0.146.1" {
 		t.Fatalf("active package version=%q err=%v, want 0.146.1", version, err)
 	}
-	if info, err := os.Stat(filepath.Join(current, "bin", "codex.js")); err != nil || info.Mode()&0o111 == 0 {
-		t.Fatalf("active binary is not executable: info=%v err=%v", info, err)
+	if info, err := os.Stat(filepath.Join(current, "bin", "codex.js")); err != nil || info.IsDir() || (runtime.GOOS != "windows" && info.Mode()&0o111 == 0) {
+		t.Fatalf("active binary is not usable: info=%v err=%v", info, err)
 	}
-	link := filepath.Join(prefix, "bin", "codex")
-	if target, err := os.Readlink(link); err != nil || target != "../lib/node_modules/@openai/codex/bin/codex.js" {
-		t.Fatalf("recovered CLI link target=%q err=%v", target, err)
-	}
+	assertNpmCLICommandForTest(t, prefix, codexNpmCLIInstall)
 }
 
 func TestRollbackInterruptedNpmCodexInstallRestoresMissingActivePackage(t *testing.T) {
 	prefix := t.TempDir()
-	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@openai")
+	packageRoot := codexNpmCLIInstall.packageRoot(prefix)
 	backup := filepath.Join(packageRoot, ".codex-previous")
 	writeNpmCodexInstall(t, backup, "0.146.1", true)
 
@@ -162,9 +173,7 @@ func TestRollbackInterruptedNpmCodexInstallRestoresMissingActivePackage(t *testi
 	if version, err := npmPackageVersion(active); err != nil || version != "0.146.1" {
 		t.Fatalf("active package version=%q err=%v, want 0.146.1", version, err)
 	}
-	if target, err := os.Readlink(filepath.Join(prefix, "bin", "codex")); err != nil || target != "../lib/node_modules/@openai/codex/bin/codex.js" {
-		t.Fatalf("recovered CLI link target=%q err=%v", target, err)
-	}
+	assertNpmCLICommandForTest(t, prefix, codexNpmCLIInstall)
 }
 
 func TestPrepareNpmCLIRecoveryRejectsOtherInstallation(t *testing.T) {
@@ -400,6 +409,9 @@ func TestEnrichCodexFileChangeRejectsSymlinkEscape(t *testing.T) {
 	// Create a symlink inside the project pointing to the outside file.
 	linkPath := filepath.Join(dir, "leaked.txt")
 	if err := os.Symlink(outsideFile, linkPath); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a symlink is not permitted for this Windows test user: %v", err)
+		}
 		t.Fatalf("create symlink: %v", err)
 	}
 	payload := json.RawMessage(`{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"leaked.txt","kind":"add"}],"status":"completed"}}`)
@@ -422,5 +434,90 @@ func TestTruncateUTF8PreservesCharBoundary(t *testing.T) {
 	}
 	if truncated != "你" {
 		t.Fatalf("truncated = %q, want %q", truncated, "你")
+	}
+}
+
+func TestCodexManagedProviderUsesIsolatedConfig(t *testing.T) {
+	runner := &codexCLIRunner{config: Config{DataDir: t.TempDir()}}
+	args, environment, cleanup, err := runner.profileLaunch(context.Background(), &AgentRuntimeProfile{RevisionID: "revision-1", AgentID: "codex", AuthMode: "api_key", Secret: "sk-test", BaseURL: "https://gateway.example.test/v1"})
+	if err != nil {
+		t.Fatalf("profile launch: %v", err)
+	}
+	defer cleanup()
+	if strings.Join(args, " ") != `-c model_provider="milevia" -c shell_environment_policy.exclude=["OPENAI_API_KEY"]` {
+		t.Fatalf("provider args=%q", args)
+	}
+	var home string
+	for _, item := range environment {
+		if strings.HasPrefix(item, "CODEX_HOME=") {
+			home = strings.TrimPrefix(item, "CODEX_HOME=")
+		}
+	}
+	content, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatalf("read provider config: %v", err)
+	}
+	for _, expected := range []string{`model_provider = "milevia"`, `wire_api = "responses"`, `env_key = "OPENAI_API_KEY"`, `exclude = ["OPENAI_API_KEY"]`} {
+		if !strings.Contains(string(content), expected) {
+			t.Fatalf("provider config missing %q: %s", expected, content)
+		}
+	}
+	cleanup()
+	if _, err := os.Stat(home); err != nil {
+		t.Fatalf("managed Codex home was removed after run: %v", err)
+	}
+}
+
+func TestCodexManagedOfficialAPIKeyUsesIsolatedConfig(t *testing.T) {
+	runner := &codexCLIRunner{config: Config{DataDir: t.TempDir()}}
+	args, environment, cleanup, err := runner.profileLaunch(context.Background(), &AgentRuntimeProfile{RevisionID: "revision-1", AgentID: "codex", AuthMode: "api_key", Secret: "sk-test"})
+	if err != nil {
+		t.Fatalf("profile launch: %v", err)
+	}
+	defer cleanup()
+	if strings.Join(args, " ") != `-c shell_environment_policy.exclude=["OPENAI_API_KEY"]` {
+		t.Fatalf("official provider args=%q", args)
+	}
+	var home string
+	for _, item := range environment {
+		if strings.HasPrefix(item, "CODEX_HOME=") {
+			home = strings.TrimPrefix(item, "CODEX_HOME=")
+		}
+	}
+	if home == "" {
+		t.Fatal("managed official provider did not set CODEX_HOME")
+	}
+	content, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatalf("read isolated config: %v", err)
+	}
+	if strings.Contains(string(content), "model_provider") || !strings.Contains(string(content), `exclude = ["OPENAI_API_KEY"]`) {
+		t.Fatalf("official provider config=%q", content)
+	}
+}
+
+func TestCodexManagedProfileReusesHomeForSameRevision(t *testing.T) {
+	runner := &codexCLIRunner{config: Config{DataDir: t.TempDir()}}
+	profile := &AgentRuntimeProfile{RevisionID: "revision-1", AgentID: "codex", AuthMode: "api_key", Secret: "sk-test"}
+	_, first, firstCleanup, err := runner.profileLaunch(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("first profile launch: %v", err)
+	}
+	defer firstCleanup()
+	_, second, secondCleanup, err := runner.profileLaunch(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("second profile launch: %v", err)
+	}
+	defer secondCleanup()
+	findHome := func(environment []string) string {
+		for _, item := range environment {
+			if strings.HasPrefix(item, "CODEX_HOME=") {
+				return strings.TrimPrefix(item, "CODEX_HOME=")
+			}
+		}
+		return ""
+	}
+	if firstHome, secondHome := findHome(first), findHome(second); firstHome == "" || firstHome != secondHome {
+		t.Fatalf("CODEX_HOME changed between turns: %q != %q", firstHome, secondHome)
 	}
 }

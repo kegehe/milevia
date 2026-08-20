@@ -24,6 +24,10 @@ export type ShortcutEditorState = { kind: ShortcutKind; shortcut?: Shortcut };
 export type SkillAgent = "claude-code" | "codex";
 export type SkillSource = "user" | "project" | "plugin";
 export type Skill = { name: string; description: string; agent: SkillAgent; env: "windows" | "wsl" | "remote-linux"; source: SkillSource };
+export type ScheduledTaskScheduleType = "once" | "daily" | "weekly";
+export type ScheduledTaskRunStatus = "queued" | "running" | "succeeded" | "failed" | "stopped" | "interrupted";
+export type ScheduledTaskRun = { id: string; scheduledTaskId: string; scheduledFor: string; status: ScheduledTaskRunStatus; titleSnapshot?: string; agentIdSnapshot?: AgentID; permissionModeSnapshot?: PermissionMode; profileRevisionSnapshot?: string; promptSnapshot: string; skillsSnapshot: string[]; conversationId?: string; runId?: string; failureReason?: string; createdAt: string; startedAt?: string; finishedAt?: string };
+export type ScheduledTask = { id: string; projectId: string; title: string; prompt: string; skills: string[]; agentId: AgentID; permissionMode: PermissionMode; scheduleType: ScheduledTaskScheduleType; timezone: string; runAt?: string; timeOfDay?: string; weekdays: number[]; enabled: boolean; nextRunAt?: string; lastRunAt?: string; createdAt: string; updatedAt: string; lastRun?: ScheduledTaskRun; runs?: ScheduledTaskRun[] };
 export type Event = { id: string; type: string; payload: unknown; runId: string; createdAt: string };
 export type Directory = { name: string; path: string };
 export type Approval = { approvalId: string; status: "pending" | "allow" | "deny"; toolName: string; toolInput: Record<string, unknown> };
@@ -48,7 +52,8 @@ export type TimelineItem =
   | { kind: "tool"; id: string; createdAt: string; action: ToolAction }
   | { kind: "system"; id: string; createdAt: string; system: SystemItem }
   | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
-export type WorkspaceTab = "conversation" | "tasks" | "orchestration" | "files" | "git" | "run" | "insights";
+export type WorkspaceTab = "conversation" | "tasks" | "orchestration" | "files" | "git" | "run" | "terminal" | "insights";
+export type TerminalSessionInfo = { id: string; projectId: string; environment: string; cwdDisplay?: string; status: "starting" | "running" | "exited" | "failed" | "closed"; createdAt: string };
 
 export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
 export type RunnerInfo = {
@@ -75,6 +80,29 @@ export type AgentProfile = {
   // records and every executable record are cli_managed.
   authMode: string;
   state: "active" | "deprecated" | "revoked";
+};
+
+export type QuotaGroup = {
+  id: string;
+  runnerId: string;
+  name: string;
+  scope: "credential" | "organization" | "workspace" | "model" | "ip";
+  scopeKey: string;
+  rpmLimit: number;
+  tpmLimit: number;
+  maxConcurrency: number;
+  enabled: boolean;
+};
+
+export type CredentialPool = {
+  id: string;
+  runnerId: string;
+  name: string;
+  enabled: boolean;
+  currentRevisionId: string;
+  strategy: "fair_queue" | "least_loaded" | "round_robin";
+  projectMaxConcurrency: number;
+  members: { profileId: string; profileRevisionId: string; name: string; agentId: AgentID; model: string; enabled: boolean }[];
 };
 
 export type CheckUpdateResult = {

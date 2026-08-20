@@ -4,28 +4,41 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-const STORAGE_KEY = "files:code-font-size";
+export const CODE_FONT_SIZE_STORAGE_KEY = "files:code-font-size";
 const MIN_SIZE = 12;
 const MAX_SIZE = 20;
 const DEFAULT_SIZE = 13;
 
-export function useCodeFontSize() {
-  const [fontSize, setFontSize] = useState<number>(() => {
-    if (typeof window === "undefined") return DEFAULT_SIZE;
-    const stored = window.localStorage.getItem(STORAGE_KEY);
-    const parsed = stored ? Number.parseInt(stored, 10) : NaN;
-    if (Number.isFinite(parsed) && parsed >= MIN_SIZE && parsed <= MAX_SIZE) {
-      return parsed;
-    }
+function normalizeCodeFontSize(value: number): number {
+  return Number.isFinite(value) ? Math.min(Math.max(Math.round(value), MIN_SIZE), MAX_SIZE) : DEFAULT_SIZE;
+}
+
+export function readCodeFontSize(): number {
+  if (typeof window === "undefined") return DEFAULT_SIZE;
+  try {
+    const parsed = Number.parseInt(window.localStorage.getItem(CODE_FONT_SIZE_STORAGE_KEY) ?? "", 10);
+    return Number.isFinite(parsed) && parsed >= MIN_SIZE && parsed <= MAX_SIZE ? parsed : DEFAULT_SIZE;
+  } catch {
     return DEFAULT_SIZE;
-  });
+  }
+}
+
+export function setCodeFontSize(value: number): number {
+  const fontSize = normalizeCodeFontSize(value);
+  if (typeof window === "undefined") return fontSize;
+  try {
+    window.localStorage.setItem(CODE_FONT_SIZE_STORAGE_KEY, String(fontSize));
+  } catch {
+    // localStorage 不可用时保持当前会话可用。
+  }
+  return fontSize;
+}
+
+export function useCodeFontSize() {
+  const [fontSize, setFontSize] = useState<number>(readCodeFontSize);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, String(fontSize));
-    } catch {
-      // 忽略写入失败（如隐私模式）
-    }
+    setCodeFontSize(fontSize);
   }, [fontSize]);
 
   const increase = useCallback(() => {

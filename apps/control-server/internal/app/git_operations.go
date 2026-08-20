@@ -393,6 +393,49 @@ func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, result)
 }
 
+// gitAmendCommit 修改最近一次提交（commit --amend）。
+func (s *Server) gitAmendCommit(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Message    string `json:"message"`
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	message := strings.TrimSpace(input.Message)
+	if message == "" || utf8.RuneCountInString(message) > 4000 || strings.ContainsRune(message, 0) {
+		writeError(w, http.StatusBadRequest, errors.New("Git commit message must be between 1 and 4000 characters"))
+		return
+	}
+	if firstLine := strings.Split(message, "\n")[0]; utf8.RuneCountInString(firstLine) > 72 {
+		writeError(w, http.StatusBadRequest, errors.New("Git commit subject must be at most 72 characters"))
+		return
+	}
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	if !hasGitHead(state.snapshot) {
+		writeError(w, http.StatusConflict, errors.New("repository has no commit to amend"))
+		return
+	}
+	for _, change := range state.changes {
+		if change.Conflicted {
+			writeError(w, http.StatusConflict, errors.New("resolve Git conflicts before amending"))
+			return
+		}
+	}
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "commit_amend", message, state.snapshot, func(runner GitRunner) error {
+		return runner.AmendCommit(r.Context(), repo, message)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
 func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Paths            []string `json:"paths"`
@@ -571,6 +614,60 @@ func (s *Server) gitFetch(w http.ResponseWriter, r *http.Request) {
 	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "fetch",
 		fmt.Sprintf("fetch %s", input.Remote), state.snapshot, func(runner GitRunner) error {
 			return runner.Fetch(r.Context(), repo, input.Remote)
+		})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func (s *Server) gitPull(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Remote     string `json:"remote"`
+		Branch     string `json:"branch"`
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.Remote == "" {
+		input.Remote = "origin"
+	}
+	if input.Branch == "" {
+		writeError(w, http.StatusBadRequest, errors.New("branch is required"))
+		return
+	}
+	if err := validateGitRef(input.Remote); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateGitRef(input.Branch); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	if !hasGitHead(state.snapshot) {
+		writeError(w, http.StatusConflict, errors.New("repository has no commit to pull against"))
+		return
+	}
+	if state.snapshot.Head.Detached || state.snapshot.Head.Branch == "" {
+		writeError(w, http.StatusConflict, errors.New("detached HEAD cannot pull"))
+		return
+	}
+	for _, change := range state.changes {
+		if change.Conflicted {
+			writeError(w, http.StatusConflict, errors.New("resolve Git conflicts before pulling"))
+			return
+		}
+	}
+	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "pull",
+		fmt.Sprintf("pull %s %s", input.Remote, input.Branch), state.snapshot, func(runner GitRunner) error {
+			return runner.Pull(r.Context(), repo, input.Remote, input.Branch)
 		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)

@@ -3,8 +3,9 @@ import { ProjectFileTree } from "./ProjectFileTree";
 import { FileViewer } from "./FileViewer";
 import { FileEditor } from "./FileEditor";
 import { FileTabs } from "./FileTabs";
-import type { FileContent, OpenFile } from "./file-model";
+import type { FileContent, FileInfo, OpenFile } from "./file-model";
 import { detectLanguage, isEditableFile } from "./file-model";
+import { getPreviewKind, isTextPreview } from "./source-language";
 import { FileIcon } from "./FileIcon";
 import { useCodeFontSize } from "./useCodeFontSize";
 
@@ -127,19 +128,23 @@ export function FilesPanel({
       pendingOpens.current.add(path);
 
       try {
-        const res = await request<FileContent>(
-          `/api/projects/${projectId}/fs/read?path=${encodeURIComponent(path)}`
-        );
+        const stat = await request<FileInfo>(`/api/projects/${projectId}/fs/stat?path=${encodeURIComponent(path)}`);
+        const previewKind = getPreviewKind(name, stat.isText, stat.mimeType, stat.size);
+        const res = isTextPreview(previewKind)
+          ? await request<FileContent>(`/api/projects/${projectId}/fs/read?path=${encodeURIComponent(path)}`)
+          : null;
         const lang = detectLanguage(name);
         const newFile: OpenFile = {
           path,
           name,
-          content: res.content,
-          originalContent: res.content,
-          version: res.version,
+          content: res?.content ?? "",
+          originalContent: res?.content ?? "",
+          version: res?.version ?? "",
           language: lang,
           isDirty: false,
-          stat: res.stat,
+          stat: res?.stat ?? stat,
+          previewKind,
+          contentLoaded: Boolean(res),
         };
 
         // 超出上限且无可关闭的干净标签时拒绝打开
@@ -260,7 +265,7 @@ export function FilesPanel({
     const currentActive = openFilesRef.current.find(
       (f) => f.path === activeFilePath
     );
-    if (currentActive && isEditableFile(currentActive.stat) && !readOnly) {
+    if (currentActive && currentActive.contentLoaded && isEditableFile(currentActive.stat) && !readOnly) {
       setEditingFile(currentActive.path);
     }
   }, [activeFilePath, readOnly]);
@@ -542,7 +547,7 @@ export function FilesPanel({
 
           {/* 文件内容区 */}
           {activeFile ? (
-            editingFile === activeFile.path ? (
+            editingFile === activeFile.path && activeFile.contentLoaded ? (
               <FileEditor
                 content={activeFile.content}
                 stat={activeFile.stat}
@@ -557,7 +562,9 @@ export function FilesPanel({
                 key={activeFile.path}
                 content={activeFile.content}
                 stat={activeFile.stat}
+                previewKind={activeFile.previewKind}
                 projectId={projectId}
+                request={request}
                 onEdit={enterEditMode}
                 readOnly={readOnly}
                 fontSize={fontSize}

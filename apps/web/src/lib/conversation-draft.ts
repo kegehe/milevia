@@ -1,7 +1,7 @@
 const STORAGE_PREFIX = "auto.conversation-draft.v2:";
 const LEGACY_STORAGE_KEY = "auto.conversation-drafts.v1";
 const MAX_STORED_DRAFTS = 50;
-const DRAFT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
+const DEFAULT_RETENTION_DAYS = 30;
 
 export type ConversationDrafts = Record<string, string>;
 
@@ -25,25 +25,72 @@ export function getConversationDraft(drafts: ConversationDrafts, projectID: stri
   return drafts[conversationDraftKey(projectID, conversationID)] || "";
 }
 
-export function readConversationDrafts(storage: DraftStorage | null = browserStorage()): ConversationDrafts {
+export function readConversationDrafts(storage: DraftStorage | null = browserStorage(), maxAgeDays = DEFAULT_RETENTION_DAYS): ConversationDrafts {
   if (!storage) return {};
   try {
-    return Object.fromEntries(pruneStoredDrafts(storage).map((draft) => [draft.draftKey, draft.text]));
+    return Object.fromEntries(pruneStoredDrafts(storage, "", maxAgeDays).map((draft) => [draft.draftKey, draft.text]));
   } catch {
     return {};
   }
 }
 
-export function readConversationDraft(projectID: string, conversationID: string, storage: DraftStorage | null = browserStorage()): string | null {
+export function countStoredConversationDrafts(maxAgeDays = DEFAULT_RETENTION_DAYS, storage: DraftStorage | null = browserStorage()): number {
+  if (!storage || !Number.isFinite(maxAgeDays) || maxAgeDays <= 0) return 0;
+  try {
+    return listStoredDrafts(storage, maxAgeDays).length;
+  } catch {
+    return 0;
+  }
+}
+
+export function clearExpiredConversationDrafts(maxAgeDays = DEFAULT_RETENTION_DAYS, storage: DraftStorage | null = browserStorage()): number {
+  if (!storage || !Number.isFinite(maxAgeDays) || maxAgeDays <= 0) return 0;
+  try {
+    const keys: string[] = [];
+    for (let index = 0; index < storage.length; index++) {
+      const key = storage.key(index);
+      if (key?.startsWith(STORAGE_PREFIX)) keys.push(key);
+    }
+    let cleared = 0;
+    for (const key of keys) {
+      const draft = parseStoredDraft(storage.getItem(key));
+      if (!draft || isExpired(draft, maxAgeDays)) {
+        storage.removeItem(key);
+        cleared++;
+      }
+    }
+    return cleared;
+  } catch {
+    return 0;
+  }
+}
+
+export function clearStoredConversationDrafts(storage: DraftStorage | null = browserStorage()): number {
+  if (!storage) return 0;
+  try {
+    const storageKeys: string[] = [];
+    for (let index = 0; index < storage.length; index++) {
+      const key = storage.key(index);
+      if (key?.startsWith(STORAGE_PREFIX)) storageKeys.push(key);
+    }
+    for (const key of storageKeys) storage.removeItem(key);
+    storage.removeItem(LEGACY_STORAGE_KEY);
+    return storageKeys.length;
+  } catch {
+    return 0;
+  }
+}
+
+export function readConversationDraft(projectID: string, conversationID: string, storage: DraftStorage | null = browserStorage(), maxAgeDays = DEFAULT_RETENTION_DAYS): string | null {
   if (!storage) return null;
   const storageKey = storageKeyFor(projectID, conversationID);
   try {
     const draft = parseStoredDraft(storage.getItem(storageKey));
-    if (!draft || isExpired(draft)) {
+    if (!draft || isExpired(draft, maxAgeDays)) {
       storage.removeItem(storageKey);
       const legacyDraft = getConversationDraft(readLegacyConversationDrafts(storage), projectID, conversationID);
       if (!legacyDraft) return null;
-      persistConversationDraft(projectID, conversationID, legacyDraft, storage);
+      persistConversationDraft(projectID, conversationID, legacyDraft, storage, maxAgeDays);
       return legacyDraft;
     }
     return draft.text;
@@ -53,7 +100,7 @@ export function readConversationDraft(projectID: string, conversationID: string,
 }
 
 // Each draft uses its own key so concurrent browser tabs never rewrite another draft's value.
-export function persistConversationDraft(projectID: string, conversationID: string, text: string, storage: DraftStorage | null = browserStorage()): boolean {
+export function persistConversationDraft(projectID: string, conversationID: string, text: string, storage: DraftStorage | null = browserStorage(), maxAgeDays = DEFAULT_RETENTION_DAYS): boolean {
   if (!storage) return false;
   const storageKey = storageKeyFor(projectID, conversationID);
   try {
@@ -62,9 +109,9 @@ export function persistConversationDraft(projectID: string, conversationID: stri
       storage.removeItem(storageKey);
       return true;
     }
-    pruneStoredDrafts(storage, storageKey);
+    pruneStoredDrafts(storage, storageKey, maxAgeDays);
     storage.setItem(storageKey, JSON.stringify({ text, updatedAt: Date.now() } satisfies StoredDraft));
-    pruneStoredDrafts(storage, storageKey);
+    pruneStoredDrafts(storage, storageKey, maxAgeDays);
     return true;
   } catch {
     return false;
@@ -99,8 +146,8 @@ function readLegacyConversationDrafts(storage: DraftStorage): ConversationDrafts
   }
 }
 
-function pruneStoredDrafts(storage: DraftStorage, preservedStorageKey = ""): StoredDraftEntry[] {
-  const drafts = listStoredDrafts(storage);
+function pruneStoredDrafts(storage: DraftStorage, preservedStorageKey = "", maxAgeDays = DEFAULT_RETENTION_DAYS): StoredDraftEntry[] {
+  const drafts = listStoredDrafts(storage, maxAgeDays);
   const excess = drafts.length - MAX_STORED_DRAFTS;
   if (excess <= 0) return drafts;
 
@@ -114,7 +161,7 @@ function pruneStoredDrafts(storage: DraftStorage, preservedStorageKey = ""): Sto
   return drafts.filter((draft) => !evicted.has(draft.storageKey));
 }
 
-function listStoredDrafts(storage: DraftStorage): StoredDraftEntry[] {
+function listStoredDrafts(storage: DraftStorage, maxAgeDays = DEFAULT_RETENTION_DAYS): StoredDraftEntry[] {
   const storageKeys: string[] = [];
   for (let index = 0; index < storage.length; index++) {
     const key = storage.key(index);
@@ -124,7 +171,7 @@ function listStoredDrafts(storage: DraftStorage): StoredDraftEntry[] {
   const drafts: StoredDraftEntry[] = [];
   for (const storageKey of storageKeys) {
     const draft = parseStoredDraft(storage.getItem(storageKey));
-    if (!draft || isExpired(draft)) {
+    if (!draft || isExpired(draft, maxAgeDays)) {
       storage.removeItem(storageKey);
       continue;
     }
@@ -145,8 +192,8 @@ function parseStoredDraft(raw: string | null): StoredDraft | null {
   }
 }
 
-function isExpired(draft: StoredDraft): boolean {
-  return Date.now() - draft.updatedAt > DRAFT_MAX_AGE_MS;
+function isExpired(draft: StoredDraft, maxAgeDays: number): boolean {
+  return Date.now() - draft.updatedAt > maxAgeDays * 24 * 60 * 60 * 1_000;
 }
 
 function browserStorage(): DraftStorage | null {

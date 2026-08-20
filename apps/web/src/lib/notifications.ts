@@ -14,10 +14,37 @@ export interface NotificationEvent {
   createdAt: string;
 }
 
+export function isClockTime(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{2}:\d{2}$/.test(value)) return false;
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours >= 0 && hours < 24 && minutes >= 0 && minutes < 60;
+}
+
 /** 通知统一进入所属项目的对话页面，不再跳转到任务详情。 */
 export function notificationConversationURL(event: Pick<NotificationEvent, "projectId" | "conversationId">): string {
   const baseURL = `/projects/${event.projectId}/conversations`;
   return event.conversationId ? `${baseURL}/${event.conversationId}` : baseURL;
+}
+
+/** 后端提供明确目标时优先跳转该页面，兼容旧通知时回退到所属会话。 */
+export function notificationTargetURL(event: Pick<NotificationEvent, "actionUrl" | "projectId" | "conversationId">): string {
+  return event.actionUrl || notificationConversationURL(event);
+}
+
+/** 判断当前本地时间是否落在有效的免打扰时段内，支持跨午夜区间。 */
+export function isWithinQuietHours(now: Date, start: string, end: string): boolean {
+  if (!isClockTime(start) || !isClockTime(end)) return false;
+  const toMinutes = (value: string) => {
+    const [hours, minutes] = value.split(":").map(Number);
+    return hours * 60 + minutes;
+  };
+  const startMinutes = toMinutes(start);
+  const endMinutes = toMinutes(end);
+  if (startMinutes === endMinutes) return false;
+  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+  return startMinutes < endMinutes
+    ? currentMinutes >= startMinutes && currentMinutes < endMinutes
+    : currentMinutes >= startMinutes || currentMinutes < endMinutes;
 }
 
 /** 需要发通知的任务/编排状态 */
@@ -33,7 +60,7 @@ export function priorityForType(type: string): "high" | "normal" | "low" {
   if (type.includes("action_required") || type.includes("needs_human") || type.includes("approval")) {
     return "high";
   }
-  if (type.includes("done") || type.includes("completed") || type.includes("succeeded")) {
+  if (type.includes("done") || type.includes("completed") || type.includes("succeeded") || type.includes("failed") || type.includes("error")) {
     return "normal";
   }
   return "low";

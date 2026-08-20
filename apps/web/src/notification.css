@@ -30,8 +30,6 @@
   border-color: #7fae9d;
   color: #1f6055;
   background: #e6f3eb;
-  box-shadow: 0 2px 5px #17362c12, inset 0 1px #ffffffb8;
-  transform: translateY(-1px);
 }
 
 .notification-bell-icon {

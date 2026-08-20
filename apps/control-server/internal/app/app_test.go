@@ -34,6 +34,17 @@ func requirePOSIXShell(t *testing.T) {
 	}
 }
 
+func longRunningProjectCommandForTest(prefix string) string {
+	command := "sleep 3600"
+	if runtime.GOOS == "windows" {
+		command = "ping 127.0.0.1 -t >NUL"
+	}
+	if prefix == "" {
+		return command
+	}
+	return prefix + " && " + command
+}
+
 // jsonBody marshals v into a JSON body. Test helpers used to build request bodies
 // by string concatenation, which breaks on Windows where paths contain backslashes
 // ("C:\Users\..." yields invalid JSON escapes such as \U). Marshalling keeps the
@@ -447,6 +458,22 @@ func newTestServer(t *testing.T) *Server {
 	}
 	t.Cleanup(server.Close)
 	return server
+}
+
+func TestSQLiteDSNWithConnectionPragmasPreservesExistingParameters(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  string
+	}{
+		{input: "data/milevia.db", want: "data/milevia.db?_busy_timeout=30000&_journal_mode=WAL"},
+		{input: "file:test.db?mode=memory", want: "file:test.db?mode=memory&_busy_timeout=30000&_journal_mode=WAL"},
+		{input: "file:test.db?", want: "file:test.db?_busy_timeout=30000&_journal_mode=WAL"},
+		{input: "file:test.db?mode=memory&", want: "file:test.db?mode=memory&_busy_timeout=30000&_journal_mode=WAL"},
+	} {
+		if got := sqliteDSNWithConnectionPragmas(tc.input); got != tc.want {
+			t.Fatalf("sqliteDSNWithConnectionPragmas(%q)=%q want %q", tc.input, got, tc.want)
+		}
+	}
 }
 
 func TestDecodeJSONRejectsOversizedBody(t *testing.T) {
@@ -1169,6 +1196,7 @@ func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
 
 func TestCodexUpdateEndpointsUseLocalCodexRunner(t *testing.T) {
 	server := newTestServer(t)
+	localRunnerID := server.localRunnerID()
 	codex := &updateTestRunner{checkAvailable: true, latestVersion: "0.146.0"}
 	server.codexRunner = codex
 	server.wslRunner = server.codexRunner
@@ -1180,7 +1208,7 @@ func TestCodexUpdateEndpointsUseLocalCodexRunner(t *testing.T) {
 	}
 
 	check := httptest.NewRecorder()
-	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/check-update", nil))
+	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/check-update", nil))
 	if check.Code != http.StatusOK {
 		t.Fatalf("check Codex update status=%d body=%s", check.Code, check.Body.String())
 	}
@@ -1197,7 +1225,7 @@ func TestCodexUpdateEndpointsUseLocalCodexRunner(t *testing.T) {
 	}
 
 	update := httptest.NewRecorder()
-	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil))
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil))
 	if update.Code != http.StatusOK || codex.updateCalls != 1 {
 		t.Fatalf("update Codex status=%d calls=%d body=%s", update.Code, codex.updateCalls, update.Body.String())
 	}
@@ -1205,19 +1233,20 @@ func TestCodexUpdateEndpointsUseLocalCodexRunner(t *testing.T) {
 
 func TestCodexUpdateIsIsolatedFromClaudeSessions(t *testing.T) {
 	server := newTestServer(t)
+	localRunnerID := server.localRunnerID()
 	codex := &blockingUpdateRunner{started: make(chan struct{}), release: make(chan struct{})}
 	server.codexRunner = codex
 	server.wslRunner = server.codexRunner
 	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
-	server.runnerRegistry.register("wsl-local", server.runner, server.wslLocalMeta())
+	server.runnerRegistry.register(localRunnerID, server.runner, server.localRunnerMeta())
 	server.mu.Lock()
-	server.sessions["claude"] = &activeAgentSession{agent: &idleAgentSession{done: make(chan error)}, runnerID: "wsl-local", agentID: "claude-code"}
+	server.sessions["claude"] = &activeAgentSession{agent: &idleAgentSession{done: make(chan error)}, runnerID: localRunnerID, agentID: "claude-code"}
 	server.mu.Unlock()
 
 	update := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil))
+		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil))
 		close(done)
 	}()
 	select {
@@ -1240,7 +1269,22 @@ func TestCodexUpdateIsIsolatedFromClaudeSessions(t *testing.T) {
 	if err := json.NewDecoder(status.Body).Decode(&runners); err != nil {
 		t.Fatalf("decode runner status: %v", err)
 	}
-	if len(runners) != 1 || runners[0].Claude.Status == "updating" || runners[0].Codex.Status != "updating" {
+	var local *struct {
+		ID     string `json:"id"`
+		Claude struct {
+			Status string `json:"status"`
+		} `json:"claude"`
+		Codex struct {
+			Status string `json:"status"`
+		} `json:"codex"`
+	}
+	for index := range runners {
+		if runners[index].ID == localRunnerID {
+			local = &runners[index]
+			break
+		}
+	}
+	if local == nil || local.Claude.Status == "updating" || local.Codex.Status != "updating" {
 		t.Fatalf("unexpected isolated update status: %#v", runners)
 	}
 
@@ -1257,17 +1301,18 @@ func TestCodexUpdateIsIsolatedFromClaudeSessions(t *testing.T) {
 
 func TestRunnerUpdatesAreSerializedAcrossAgents(t *testing.T) {
 	server := newTestServer(t)
+	localRunnerID := server.localRunnerID()
 	codex := &blockingUpdateRunner{started: make(chan struct{}), release: make(chan struct{})}
 	claude := &updateTestRunner{}
 	server.codexRunner = codex
 	server.wslRunner = server.codexRunner
 	server.runner = claude
-	server.runnerRegistry.register("wsl-local", claude, server.wslLocalMeta())
+	server.runnerRegistry.register(localRunnerID, claude, server.localRunnerMeta())
 
 	codexUpdate := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		server.routes().ServeHTTP(codexUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil))
+		server.routes().ServeHTTP(codexUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil))
 		close(done)
 	}()
 	select {
@@ -1277,7 +1322,7 @@ func TestRunnerUpdatesAreSerializedAcrossAgents(t *testing.T) {
 	}
 
 	claudeUpdate := httptest.NewRecorder()
-	server.routes().ServeHTTP(claudeUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+	server.routes().ServeHTTP(claudeUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/claude/update", nil))
 	if claudeUpdate.Code != http.StatusConflict || claude.updateCalls != 0 {
 		t.Fatalf("Claude update must wait for Codex update: status=%d calls=%d body=%s", claudeUpdate.Code, claude.updateCalls, claudeUpdate.Body.String())
 	}
@@ -1295,12 +1340,13 @@ func TestRunnerUpdatesAreSerializedAcrossAgents(t *testing.T) {
 
 func TestCodexUpdateSurvivesRequestCancellation(t *testing.T) {
 	server := newTestServer(t)
+	localRunnerID := server.localRunnerID()
 	runner := &requestContextUpdateRunner{started: make(chan struct{}), release: make(chan struct{})}
 	server.codexRunner = runner
 	server.wslRunner = server.codexRunner
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	request := httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/codex/update", nil).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil).WithContext(ctx)
 	response := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -6465,7 +6511,13 @@ func waitForRunStatus(t *testing.T, server *Server, conversationID, want string)
 
 func TestGitSnapshotParsesNULPathsAndMissingUpstream(t *testing.T) {
 	repo := newTempGitRepository(t)
-	writeGitTestFile(t, repo, "已修改\n文件.txt", "one\n")
+	path := "已修改\n文件.txt"
+	// Windows Win32 paths reject newlines. A non-ASCII path still verifies the
+	// NUL-delimited porcelain parser on that platform.
+	if runtime.GOOS == "windows" {
+		path = "已修改 文件.txt"
+	}
+	writeGitTestFile(t, repo, path, "one\n")
 
 	snapshot, err := newGitRunner().Snapshot(context.Background(), repo)
 	if err != nil {
@@ -6599,6 +6651,7 @@ func TestGitCommandEnvironmentDisablesInheritedAskpassAndDangerousProtocols(t *t
 }
 
 func TestGitSnapshotIgnoresStderrWhenParsingPorcelain(t *testing.T) {
+	requirePOSIXShell(t)
 	git := writeFakeGit(t, "printf '# branch.oid (initial)\\000# branch.head main\\000? actual.txt\\000'\nprintf '? stderr-injection.txt\\000' >&2\n")
 	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -6621,6 +6674,9 @@ func TestGitValidationRejectsSpecialRefAndPathspec(t *testing.T) {
 }
 
 func TestGitStageTreatsShortMagicFileNamesLiterally(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows filenames cannot contain the colon required by Git pathspec magic")
+	}
 	repo := newTempGitRepository(t)
 	writeGitTestFile(t, repo, "baseline.txt", "baseline\n")
 	runGitForTest(t, repo, "add", "baseline.txt")
@@ -6652,6 +6708,7 @@ func TestGitStageTreatsShortMagicFileNamesLiterally(t *testing.T) {
 }
 
 func TestGitCommandTimeoutTerminatesItsProcessGroup(t *testing.T) {
+	requirePOSIXShell(t)
 	marker := filepath.Join(t.TempDir(), "child-survived")
 	git := writeFakeGit(t, "(sleep 0.2; touch \"$MARKER\") &\nsleep 5\n")
 	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -6668,6 +6725,7 @@ func TestGitCommandTimeoutTerminatesItsProcessGroup(t *testing.T) {
 }
 
 func TestGitCommandStopsWhenCombinedOutputExceedsLimit(t *testing.T) {
+	requirePOSIXShell(t)
 	git := writeFakeGit(t, "head -c 1049600 /dev/zero\n")
 	t.Setenv("PATH", filepath.Dir(git)+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -7203,6 +7261,33 @@ func TestProjectGitCommitCreatesCommitFromStagedChanges(t *testing.T) {
 	}
 }
 
+func TestProjectGitAmendCommitRewritesSubject(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+	writeGitTestFile(t, repo, "readme.txt", "two\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "second commit")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	summary := gitSummaryForTest(t, server, "git-project")
+	amend := httptest.NewRecorder()
+	server.routes().ServeHTTP(amend, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/commits/amend", bytes.NewBufferString(`{"message":"amended subject","stateToken":"`+summary.StateToken+`"}`)))
+	if amend.Code != http.StatusAccepted {
+		t.Fatalf("amend status=%d body=%s", amend.Code, amend.Body.String())
+	}
+	commits, err := newGitRunner().Log(context.Background(), repo, "HEAD", 2)
+	if err != nil || len(commits) != 2 || commits[0].Subject != "amended subject" {
+		t.Fatalf("commits=%#v err=%v", commits, err)
+	}
+	operations, err := server.listGitOperations(context.Background(), "git-project", 1)
+	if err != nil || len(operations) != 1 || operations[0].Type != "commit_amend" || operations[0].Status != gitOperationSucceeded {
+		t.Fatalf("operations=%#v err=%v", operations, err)
+	}
+}
+
 func TestProjectGitDiscardRestoresWorktreeOrAllChanges(t *testing.T) {
 	server := newTestServer(t)
 	repo := newTempGitRepository(t)
@@ -7321,6 +7406,9 @@ func TestRemoveUntrackedFromRootRejectsAnEscapingSymlink(t *testing.T) {
 		t.Fatalf("rename nested directory: %v", err)
 	}
 	if err := os.Symlink(outside, filepath.Join(repo, "nested")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a symlink is not permitted for this Windows test user: %v", err)
+		}
 		t.Fatalf("create escaping symlink: %v", err)
 	}
 
@@ -7471,6 +7559,8 @@ func newTempGitRepository(t *testing.T) string {
 	runGitForTest(t, repo, "init", "-b", "main")
 	runGitForTest(t, repo, "config", "user.name", "Auto Test")
 	runGitForTest(t, repo, "config", "user.email", "auto@example.test")
+	// Make fixture content independent from a developer's global autocrlf setting.
+	runGitForTest(t, repo, "config", "core.autocrlf", "false")
 	return repo
 }
 
@@ -7820,7 +7910,8 @@ func TestProjectRunnerStartStop(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
-	runner := newProjectRunner("test-project", "", "echo hello && sleep 3600", nil, broadcast)
+	command := longRunningProjectCommandForTest("echo hello")
+	runner := newProjectRunner("test-project", "", command, nil, broadcast)
 
 	err := runner.Start(context.Background(), tmpDir)
 	if err != nil {
@@ -7868,7 +7959,8 @@ func TestProjectRunnerStartStop(t *testing.T) {
 func TestProjectRunnerRejectedStartKeepsCurrentConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalEnv := map[string]string{"PORT": "3000"}
-	runner := newProjectRunner("test-project", "", "sleep 3600", originalEnv, func(LogEntry) {})
+	command := longRunningProjectCommandForTest("")
+	runner := newProjectRunner("test-project", "", command, originalEnv, func(LogEntry) {})
 	if err := runner.Start(context.Background(), tmpDir); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -7885,7 +7977,7 @@ func TestProjectRunnerRejectedStartKeepsCurrentConfig(t *testing.T) {
 	runner.mu.RLock()
 	workDir, command, port := runner.workDir, runner.command, runner.envVars["PORT"]
 	runner.mu.RUnlock()
-	if workDir != "" || command != "sleep 3600" || port != "3000" {
+	if workDir != "" || command != longRunningProjectCommandForTest("") || port != "3000" {
 		t.Fatalf("rejected start changed configuration: workDir=%q command=%q PORT=%q", workDir, command, port)
 	}
 }
@@ -7941,6 +8033,15 @@ func TestRunExecutionTargetKeepsWSLProjectsAndAllowsOverride(t *testing.T) {
 	target, err := resolveRunExecutionTarget("/home/tangmaoke/projects/milevia", RunExecutionTargetAuto)
 	if err != nil {
 		t.Fatalf("resolve WSL target: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		if target != RunExecutionTargetWindows {
+			t.Fatalf("target=%q, want windows", target)
+		}
+		if _, err := resolveRunExecutionTarget("/mnt/d/projects/Programs/Floatory", RunExecutionTargetWSL); err == nil || !strings.Contains(err.Error(), "专用 WSL Runner") {
+			t.Fatalf("expected WSL runner requirement, got %v", err)
+		}
+		return
 	}
 	if target != RunExecutionTargetWSL {
 		t.Fatalf("target=%q, want wsl", target)
@@ -8270,7 +8371,7 @@ func TestRunLogSubscriptionReplaysHistoryBeforeLiveEntries(t *testing.T) {
 
 func TestProjectRunnerRetireStopsAndRejectsStart(t *testing.T) {
 	tmpDir := t.TempDir()
-	runner := newProjectRunner("retired-project", "", "sleep 3600", nil, func(LogEntry) {})
+	runner := newProjectRunner("retired-project", "", longRunningProjectCommandForTest(""), nil, func(LogEntry) {})
 	if err := runner.Start(context.Background(), tmpDir); err != nil {
 		t.Fatalf("start runner: %v", err)
 	}
@@ -8441,7 +8542,7 @@ func TestStartStopStatusAPI(t *testing.T) {
 	server, projectID := seedServerWithProject(t)
 
 	// 先保存配置
-	cfgBody := bytes.NewBufferString(`{"workDir":"","command":"echo hello && sleep 3600","envVars":{}}`)
+	cfgBody := jsonBody(t, map[string]any{"workDir": "", "command": longRunningProjectCommandForTest("echo hello"), "envVars": map[string]string{}})
 	resp := httptest.NewRecorder()
 	server.routes().ServeHTTP(resp, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", cfgBody))
 	if resp.Code != http.StatusOK {
@@ -8505,7 +8606,7 @@ func TestProjectRunStatusUsesNullForUnavailableLifecycleFields(t *testing.T) {
 		}
 	}
 
-	config := bytes.NewBufferString(`{"workDir":"","command":"sleep 3600","envVars":{}}`)
+	config := jsonBody(t, map[string]any{"workDir": "", "command": longRunningProjectCommandForTest(""), "envVars": map[string]string{}})
 	saved := httptest.NewRecorder()
 	handler.ServeHTTP(saved, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", config))
 	if saved.Code != http.StatusOK {
@@ -8580,7 +8681,7 @@ func TestClearProjectRunLogsAcknowledgesFailedRun(t *testing.T) {
 
 func TestDeleteProjectStopsManagedProcess(t *testing.T) {
 	server, projectID := seedServerWithProject(t)
-	config := bytes.NewBufferString(`{"workDir":"","command":"sleep 3600","envVars":{}}`)
+	config := jsonBody(t, map[string]any{"workDir": "", "command": longRunningProjectCommandForTest(""), "envVars": map[string]string{}})
 	response := httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", config))
 	if response.Code != http.StatusOK {
@@ -8860,6 +8961,44 @@ func TestProjectGitFetchAndPush(t *testing.T) {
 	server.routes().ServeHTTP(pushResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/push", bytes.NewBufferString(`{"remote":"origin","branch":"main","stateToken":"`+summary.StateToken+`"}`)))
 	if pushResp.Code != http.StatusAccepted {
 		t.Fatalf("push status=%d body=%s", pushResp.Code, pushResp.Body.String())
+	}
+}
+
+func TestProjectGitPullRecordsOperation(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "readme.txt", "one\n")
+	runGitForTest(t, repo, "add", "readme.txt")
+	runGitForTest(t, repo, "commit", "-m", "initial commit")
+
+	upstream := t.TempDir()
+	runGitForTest(t, upstream, "init", "--bare", "-b", "main")
+	runGitForTest(t, repo, "remote", "add", "origin", upstream)
+	runGitForTest(t, repo, "push", "origin", "main")
+
+	// Ahead on the upstream: another clone adds a commit and pushes it.
+	otherRepo := t.TempDir()
+	runGitForTest(t, otherRepo, "clone", upstream, ".")
+	runGitForTest(t, otherRepo, "config", "user.name", "Auto Test")
+	runGitForTest(t, otherRepo, "config", "user.email", "auto@example.test")
+	writeGitTestFile(t, otherRepo, "other.txt", "from other\n")
+	runGitForTest(t, otherRepo, "add", "other.txt")
+	runGitForTest(t, otherRepo, "commit", "-m", "commit from other")
+	runGitForTest(t, otherRepo, "push", "origin", "main")
+
+	seedGitProjectForTest(t, server, "git-project", repo)
+	summary := gitSummaryForTest(t, server, "git-project")
+
+	pullResp := httptest.NewRecorder()
+	server.routes().ServeHTTP(pullResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/pull", bytes.NewBufferString(`{"remote":"origin","branch":"main","stateToken":"`+summary.StateToken+`"}`)))
+	if pullResp.Code != http.StatusAccepted {
+		t.Fatalf("pull status=%d body=%s", pullResp.Code, pullResp.Body.String())
+	}
+
+	// pull 操作类型经变更记录持久化（真实快进验证需 HTTP/SSH 远端，file:// 传输被安全策略禁用）。
+	operations, err := server.listGitOperations(context.Background(), "git-project", 1)
+	if err != nil || len(operations) != 1 || operations[0].Type != "pull" {
+		t.Fatalf("operations=%#v err=%v", operations, err)
 	}
 }
 

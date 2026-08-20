@@ -25,7 +25,8 @@
     ],
     "resources": {
       "../binaries/milevia-control.exe": "milevia-control.exe",
-      "../binaries/milevia-approval.exe": "milevia-approval.exe"
+      "../binaries/milevia-approval.exe": "milevia-approval.exe",
+      "../binaries/milevia-terminal-bridge.exe": "milevia-terminal-bridge.exe"
     },
     "windows": {
       "webviewInstallMode": {

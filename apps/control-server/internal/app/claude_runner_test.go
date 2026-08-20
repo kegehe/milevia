@@ -504,7 +504,7 @@ func writeNpmClaudeInstall(t *testing.T, dir, version string, executable bool) {
 
 func TestRollbackInterruptedNpmClaudeInstall(t *testing.T) {
 	prefix := t.TempDir()
-	packageRoot := filepath.Join(prefix, "lib", "node_modules", "@anthropic-ai")
+	packageRoot := claudeNpmCLIInstall.packageRoot(prefix)
 	current := filepath.Join(packageRoot, "claude-code")
 	backup := filepath.Join(packageRoot, ".claude-code-previous")
 	writeNpmClaudeInstall(t, current, "2.1.224", false)
@@ -520,13 +520,10 @@ func TestRollbackInterruptedNpmClaudeInstall(t *testing.T) {
 	if version, err := claudePackageVersion(current); err != nil || version != "2.1.220" {
 		t.Fatalf("active package version=%q err=%v, want 2.1.220", version, err)
 	}
-	if info, err := os.Stat(filepath.Join(current, "bin", "claude.exe")); err != nil || info.Mode()&0o111 == 0 {
-		t.Fatalf("active binary is not executable: info=%v err=%v", info, err)
+	if info, err := os.Stat(filepath.Join(current, "bin", "claude.exe")); err != nil || info.IsDir() || (runtime.GOOS != "windows" && info.Mode()&0o111 == 0) {
+		t.Fatalf("active binary is not usable: info=%v err=%v", info, err)
 	}
-	link := filepath.Join(prefix, "bin", "claude")
-	if target, err := os.Readlink(link); err != nil || target != "../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" {
-		t.Fatalf("recovered CLI link target=%q err=%v", target, err)
-	}
+	assertNpmCLICommandForTest(t, prefix, claudeNpmCLIInstall)
 	entries, err := os.ReadDir(packageRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -745,7 +742,9 @@ func TestClaudeReadOutputAcceptsPlainStringMessage(t *testing.T) {
 		t.Errorf("assistant text = %q; want 纯字符串消息正文", sink.texts[0])
 	}
 	for _, e := range sink.events {
-		var errEv struct{ Error string `json:"error"` }
+		var errEv struct {
+			Error string `json:"error"`
+		}
 		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
 			t.Fatalf("unexpected stream.error event: %s", string(e))
 		}
@@ -767,7 +766,9 @@ func TestClaudeReadOutputSilencesPipeClosed(t *testing.T) {
 	sink := &claudeOutputTestSink{}
 	runner.readOutput(errClosedReader{}, sink)
 	for _, e := range sink.events {
-		var errEv struct{ Error string `json:"error"` }
+		var errEv struct {
+			Error string `json:"error"`
+		}
 		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
 			t.Fatalf("readOutput emitted stream.error on pipe close: %s", string(e))
 		}
@@ -777,7 +778,9 @@ func TestClaudeReadOutputSilencesPipeClosed(t *testing.T) {
 	sink = &claudeOutputTestSink{}
 	runner.readStderr(errClosedReader{}, sink)
 	for _, e := range sink.events {
-		var errEv struct{ Error string `json:"error"` }
+		var errEv struct {
+			Error string `json:"error"`
+		}
 		if err := json.Unmarshal(e, &errEv); err == nil && errEv.Error != "" {
 			t.Fatalf("readStderr emitted stream.error on pipe close: %s", string(e))
 		}

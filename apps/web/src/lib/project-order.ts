@@ -2,11 +2,11 @@
 // 维护一个 project id 数组，数组顺序即卡片展示顺序。
 // 新增项目追加到末尾；删除项目自动移除。拖拽重排后写回。
 
-const STORAGE_KEY = "milevia:project-order";
+export const PROJECT_ORDER_STORAGE_KEY = "milevia:project-order";
 
 function readRaw(): string[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(PROJECT_ORDER_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : [];
@@ -17,7 +17,7 @@ function readRaw(): string[] {
 
 function writeRaw(ids: string[]): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(ids));
+    localStorage.setItem(PROJECT_ORDER_STORAGE_KEY, JSON.stringify(ids));
   } catch {
     // localStorage 不可用时静默降级——顺序仅在内存中保留。
   }
@@ -65,4 +65,12 @@ export function moveProject(currentIds: string[], fromId: string, toId: string):
   next.splice(toIndex, 0, moved);
   writeRaw(next);
   return next;
+}
+
+export function resetProjectOrder(): void {
+  try {
+    localStorage.removeItem(PROJECT_ORDER_STORAGE_KEY);
+  } catch {
+    // localStorage 不可用时无需额外处理。
+  }
 }

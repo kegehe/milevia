@@ -107,6 +107,8 @@
 .git-hero-label { color: #71887e; font-size: 11px; }
 .git-hero-ref b { overflow: hidden; color: #19332c; text-overflow: ellipsis; white-space: nowrap; font-size: 21px; line-height: 1.25; }
 .git-hero-ref code { width: fit-content; color: #4f786d; font-size: 11px; }
+.git-hero-ref code.git-oid { justify-content: flex-start; color: #4f786d; }
+.git-hero-ref code.git-oid:hover { color: #1e6858; }
 
 .git-hero-stats { display: grid; grid-column: 2; grid-row: 1; grid-template-columns: repeat(3, minmax(52px, auto)); gap: 16px; margin: 0; }
 .git-hero-stats div { display: grid; gap: 3px; }
@@ -228,6 +230,8 @@
 .git-commit-panel textarea:disabled { color: #84998f; background: #f1f5f2; }
 .git-commit-panel footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .git-commit-panel footer span { color: #71887e; font-size: 11px; }
+.git-commit-actions { display: flex; align-items: center; gap: 7px; }
+.git-commit-actions button { white-space: nowrap; }
 
 .git-diff { overflow: hidden; border: 1px solid #bcd9cb; border-radius: 7px; background: #fff; }
 .git-diff > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px 10px 14px; border-bottom: 1px solid #d9e8df; background: #f5faf7; }
@@ -277,6 +281,34 @@
 .git-branch-switch-btn { display: inline-flex; align-items: center; justify-content: center; border: 1px solid #bcd9cb; border-radius: 4px; padding: 2px 8px; color: #286756; background: #edf7f1; font-size: 10px; font-weight: 650; cursor: pointer; white-space: nowrap; transition: background 160ms ease, color 160ms ease; }
 .git-branch-switch-btn:hover:not(:disabled) { background: #ddf1e5; }
 .git-branch-switch-btn:disabled { color: #84998f; background: #f1f4f2; cursor: default; }
+
+/* 分支 + 其提交历史的两栏布局 */
+.git-branch-layout { display: grid; grid-template-columns: minmax(0, 320px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.git-branch-list-pane { display: grid; gap: 6px; min-width: 0; overflow: hidden; border: 1px solid #d5e4dc; border-radius: 7px; background: #fff; }
+.git-branch-list-pane > .git-branches { border: 0; }
+.git-branch-list-pane > .git-branches + .git-branches { border-top: 1px solid #dce9e1; }
+.git-branches article { cursor: pointer; transition: background 150ms ease; }
+.git-branches article:hover { background: #f3f9f5; }
+.git-branches article.selected { background: #e6f4ec; }
+.git-branches article.selected b { color: #1e6858; }
+.git-branches article:focus-visible { outline: 2px solid #78b7a1; outline-offset: -2px; }
+.git-branches .git-branch-switch-btn { cursor: pointer; }
+.git-branch-history-pane { min-width: 0; overflow: hidden; border: 1px solid #d5e4dc; border-radius: 7px; background: #fff; }
+.git-branch-history-pane > .git-history { border-top: 0; }
+.git-branch-history-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-bottom: 1px solid #dce9e1; background: #f5faf7; }
+.git-branch-history-header h3 { margin: 0; color: #355e51; font-size: 12px; font-weight: 760; }
+.git-branch-history-header .git-branch-history-ref { overflow: hidden; color: #3d7b6d; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.git-branch-history-pane .git-history, .git-branch-history-pane .git-empty { min-height: 120px; }
+.git-branch-history-pane .git-empty { display: grid; place-items: center; color: #70877d; background: #fff; font-size: 12px; }
+
+/* 可点击复制的 commit id */
+code.git-oid { display: inline-flex; align-items: center; gap: 6px; color: #3d7b6d; cursor: pointer; transition: color 140ms ease; }
+code.git-oid:hover { color: #1e6858; text-decoration: underline; text-underline-offset: 2px; }
+code.git-oid:focus-visible { outline: 2px solid #78b7a1; outline-offset: 2px; border-radius: 3px; }
+code.git-oid.copied { color: #1e6858; }
+code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff; background: #38a57e; font-size: 10px; font-weight: 700; line-height: 1.5; white-space: nowrap; }
+.git-feed-list code.git-oid { display: inline; color: #3d7b6d; font-size: 10px; }
+.git-feed-list code.git-oid .git-oid-copied { font-size: 9px; }
 
 .git-operations article { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 14px; align-items: start; border-bottom: 1px solid #dce9e1; padding: 13px 5px; }
 .git-operation-status { width: fit-content; border-radius: 4px; padding: 4px 6px; color: #556f66; background: #edf2ef; font-size: 10px; font-weight: 750; }
@@ -340,10 +372,12 @@
   .git-branch-switch-btn { grid-column: 1 / -1; margin-top: 4px; justify-self: start; }
   .git-branch-toolbar { flex-wrap: wrap; }
   .git-branch-create { flex-wrap: wrap; }
+  .git-branch-layout { grid-template-columns: minmax(0, 1fr); }
   .git-operations article { grid-template-columns: 72px minmax(0, 1fr); }
   .git-operations time { grid-column: 2; }
   .git-commit-panel footer { align-items: stretch; flex-direction: column; }
   .git-commit-panel footer button { width: 100%; }
+  .git-commit-actions { align-items: stretch; flex-direction: column; }
   .git-change-list > div > button:first-child { grid-template-columns: 54px minmax(0, 1fr); }
   .git-change-list small { grid-column: 2; }
   .git-diff-code { max-height: 250px; font-size: 11px; }

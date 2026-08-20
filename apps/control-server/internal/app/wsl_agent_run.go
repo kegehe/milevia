@@ -60,6 +60,19 @@ func wslBuildEnv(managedEnv []string) (cmdEnv []string, wslenv string) {
 	return cmdEnv, wslenv
 }
 
+// wslCodexEnvironment makes the persistent managed CODEX_HOME accessible to
+// the Linux Codex process. The control service owns this directory on Windows,
+// while WSL sees the same files through /mnt/<drive>.
+func wslCodexEnvironment(environment []string) []string {
+	result := append([]string(nil), environment...)
+	for index, item := range result {
+		if home, found := strings.CutPrefix(item, "CODEX_HOME="); found {
+			result[index] = "CODEX_HOME=" + windowsToWSLMntPath(home)
+		}
+	}
+	return result
+}
+
 // wslLinuxWorkDir 把请求的 UNC 项目路径转为 WSL 内 Linux 路径；转换失败时回退到
 // WSL home（$HOME），保证 claude/codex 总有合法工作目录。
 func (r *wslAgentRunner) wslLinuxWorkDir(projectPath string) string {
@@ -271,6 +284,7 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 		return err
 	}
 	defer closeProfile()
+	environment = wslCodexEnvironment(environment)
 	args = append(args, profileArgs...)
 	if request.Profile != nil && request.Profile.Model != "" {
 		args = append(args, "-c", fmt.Sprintf("model=%q", request.Profile.Model))

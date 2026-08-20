@@ -6,7 +6,7 @@ export type GitDiff = { path: string; stage: "worktree" | "index"; content: stri
 export type GitCommit = { oid: string; parents: string[]; subject: string; author: string; authoredAt: string };
 export type GitBranch = { name: string; remote: boolean; current: boolean; upstream?: string };
 export type GitOperation = { id: string; projectId: string; type: GitOperationType; status: GitOperationStatus; requestSummary: string; beforeState: string; afterState: string; errorCode?: string; errorMessage?: string; requestedAt: string; startedAt?: string; finishedAt?: string };
-export type GitOperationType = "stage" | "unstage" | "stage_all" | "unstage_all" | "commit" | "discard_worktree" | "discard_all" | "fetch" | "push" | "create_branch" | "switch_branch";
+export type GitOperationType = "stage" | "unstage" | "stage_all" | "unstage_all" | "commit" | "commit_amend" | "discard_worktree" | "discard_all" | "fetch" | "pull" | "push" | "create_branch" | "switch_branch";
 export type GitOperationStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "needs_attention";
 
 export function groupChanges(changes: GitChange[]): { staged: GitChange[]; worktree: GitChange[] } {

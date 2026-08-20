@@ -18,6 +18,7 @@ import { TaskQueue } from "../features/tasks/TaskQueue";
 import { ProjectAiConfigDialog } from "../features/run/ProjectAiConfigDialog";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { useProjectContext } from "../stores/useProjectStore";
+import { useUIPreferences, type AppPreferences } from "../stores/useUIPreferences";
 import type {
   Conversation, Message, Event, Shortcut, ShortcutEditorState,
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
@@ -425,27 +426,61 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
   })}</div>{hasMore && <button className="secondary load-earlier-history" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "加载中" : "加载更多会话"}</button>}<footer><span>{busyID ? "正在切换会话" : `${conversations.length} 条记录`}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
 }
 
-function NewConversationDialog({ runnerID, close, create }: { runnerID: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => Promise<void> }) {
-  const [agentId, setAgentId] = useState<AgentID>("claude-code");
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>("full_control");
+function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsError, close, create }: { runnerID: string; defaults: AppPreferences; defaultsLoading: boolean; defaultsError: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => Promise<void> }) {
+  const permissionForAgent = (agent: AgentID): PermissionMode => agent === "codex" ? defaults.codexPermissionMode : defaults.claudePermissionMode;
+  const [agentId, setAgentId] = useState<AgentID>(defaults.defaultAgentId);
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => permissionForAgent(defaults.defaultAgentId));
   const [creating, setCreating] = useState(false);
   const [runner, setRunner] = useState<RunnerInfo | null>(null);
+  const [runnerLoading, setRunnerLoading] = useState(true);
   const [profiles, setProfiles] = useState<AgentProfile[]>([]);
   const [profileID, setProfileID] = useState("");
-  useEffect(() => { api<RunnerInfo[]>("/api/runners").then((items) => setRunner(items.find((item) => item.id === runnerID) || null)).catch(() => setRunner(null)); }, [runnerID]);
+  const agentSelectedByUser = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    agentSelectedByUser.current = false;
+    setRunnerLoading(true);
+    api<RunnerInfo[]>("/api/runners")
+      .then((items) => { if (!cancelled) setRunner(items.find((item) => item.id === runnerID) || null); })
+      .catch(() => { if (!cancelled) setRunner(null); })
+      .finally(() => { if (!cancelled) setRunnerLoading(false); });
+    return () => { cancelled = true; };
+  }, [runnerID]);
   useEffect(() => { api<AgentProfile[]>(`/api/runners/${runnerID}/agent-profiles`).then((items) => setProfiles(items)).catch(() => setProfiles([])); }, [runnerID]);
   const availableProfiles = useMemo(() => profiles.filter((profile) => profile.agentId === agentId && profile.enabled && profile.state === "active" && profile.authMode === "cli_managed"), [agentId, profiles]);
   useEffect(() => {
     if (availableProfiles.some((profile) => profile.id === profileID)) return;
     setProfileID("");
   }, [availableProfiles, profileID]);
-  const selectAgent = (next: AgentID) => { setAgentId(next); setProfileID(""); setPermissionMode(next === "codex" ? "workspace_write" : "full_control"); };
   const codexStatus = runner?.codex;
   const codexReady = codexStatus?.status === "ready";
 	const codexAvailable = codexReady;
-  const submit = async () => { if (agentId === "codex" && !codexAvailable) return; setCreating(true); try { await create(agentId, permissionMode, profileID || undefined); } finally { setCreating(false); } };
+  const claudeStatus = runner?.claude;
+  const claudeAvailable = claudeStatus?.status === "ready";
+  const capabilitiesLoading = defaultsLoading || runnerLoading;
+  const isAgentAvailable = (agent: AgentID) => agent === "codex" ? codexAvailable : claudeAvailable;
+  useEffect(() => {
+    if (capabilitiesLoading || defaultsError) return;
+    const preferredAgent = defaults.defaultAgentId;
+    const nextAgent = isAgentAvailable(preferredAgent)
+      ? preferredAgent
+      : isAgentAvailable("claude-code")
+        ? "claude-code"
+        : isAgentAvailable("codex")
+          ? "codex"
+          : preferredAgent;
+    if (agentSelectedByUser.current && isAgentAvailable(agentId)) return;
+    setAgentId(nextAgent);
+    setPermissionMode(permissionForAgent(nextAgent));
+  }, [agentId, capabilitiesLoading, claudeAvailable, codexAvailable, defaults.defaultAgentId, defaults.claudePermissionMode, defaults.codexPermissionMode, defaultsError]);
+  const selectAgent = (next: AgentID) => { agentSelectedByUser.current = true; setAgentId(next); setProfileID(""); setPermissionMode(permissionForAgent(next)); };
+  const submit = async () => { if (defaultsError || capabilitiesLoading || !isAgentAvailable(agentId)) return; setCreating(true); try { await create(agentId, permissionMode, profileID || undefined); } finally { setCreating(false); } };
   const codex = agentId === "codex";
-  return <div className="backdrop" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) close(); }}><section className="modal permission-dialog"><header><div><h2>新会话</h2></div><button title="关闭" onClick={close}>x</button></header><div className="permission-options"><button className={!codex ? "active" : ""} onClick={() => selectAgent("claude-code")}><b>Claude Code</b></button><button className={codex ? "active" : ""} disabled={Boolean(runner) && !codexAvailable} title={codexStatus?.reason} onClick={() => selectAgent("codex")}><b>Codex</b></button></div>{availableProfiles.length > 0 && <label className="conversation-profile-select"><span>AI 配置</span><select value={profileID} onChange={(event) => setProfileID(event.target.value)}><option value="">使用原有 CLI 配置</option>{availableProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.model ? ` (${profile.model})` : ""}</option>)}</select></label>}<div className="permission-options">{codex ? <><button className={permissionMode === "read_only" ? "active" : ""} onClick={() => setPermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={permissionMode === "workspace_write" ? "active" : ""} onClick={() => setPermissionMode("workspace_write")}><b>项目内执行</b><span>可在项目范围内读写和执行。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Codex 可直接执行命令，不受沙箱限制。</span></button></> : <><button className={permissionMode === "approval_required" ? "active" : ""} onClick={() => setPermissionMode("approval_required")}><b>默认权限</b><span>每条终端命令执行前等待确认。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Claude 可直接执行命令，不会等待确认。</span></button></>}</div><footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={creating || (codex && !codexAvailable)} onClick={() => void submit()}>{creating ? "创建中" : "创建会话"}</button></footer></section></div>;
+  const fallbackReason = !defaultsError && !capabilitiesLoading && !isAgentAvailable(defaults.defaultAgentId) && (claudeAvailable || codexAvailable)
+    ? `${defaults.defaultAgentId === "codex" ? "Codex" : "Claude Code"} 当前不可用，已选择可用的 Agent。`
+    : "";
+  const unavailableReason = agentId === "codex" ? codexStatus?.reason : claudeStatus?.reason;
+  return <div className="backdrop" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) close(); }}><section className="modal permission-dialog"><header><div><h2>新会话</h2></div><button title="关闭" onClick={close}>x</button></header>{capabilitiesLoading ? <p className="permission-confirmation">正在读取默认设置和 Runner 能力...</p> : defaultsError ? <p className="permission-confirmation">无法读取默认设置：{defaultsError}</p> : <>{fallbackReason && <p className="permission-confirmation">{fallbackReason}</p>}<div className="permission-options"><button className={!codex ? "active" : ""} disabled={!claudeAvailable} title={claudeStatus?.reason} onClick={() => selectAgent("claude-code")}><b>Claude Code</b></button><button className={codex ? "active" : ""} disabled={!codexAvailable} title={codexStatus?.reason} onClick={() => selectAgent("codex")}><b>Codex</b></button></div>{!claudeAvailable && !codexAvailable && <p className="permission-confirmation">当前 Runner 没有可用的 Agent。{unavailableReason || "请检查 CLI 安装与登录状态。"}</p>}{availableProfiles.length > 0 && <label className="conversation-profile-select"><span>AI 配置</span><select value={profileID} onChange={(event) => setProfileID(event.target.value)}><option value="">使用原有 CLI 配置</option>{availableProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.model ? ` (${profile.model})` : ""}</option>)}</select></label>}<div className="permission-options">{codex ? <><button className={permissionMode === "read_only" ? "active" : ""} onClick={() => setPermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={permissionMode === "workspace_write" ? "active" : ""} onClick={() => setPermissionMode("workspace_write")}><b>项目内执行</b><span>可在项目范围内读写和执行。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Codex 可直接执行命令，不受沙箱限制。</span></button></> : <><button className={permissionMode === "approval_required" ? "active" : ""} onClick={() => setPermissionMode("approval_required")}><b>默认权限</b><span>每条终端命令执行前等待确认。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Claude 可直接执行命令，不会等待确认。</span></button></>}</div></>}<footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={Boolean(defaultsError) || capabilitiesLoading || creating || !isAgentAvailable(agentId)} onClick={() => void submit()}>{creating ? "创建中" : "创建会话"}</button></footer></section></div>;
 }
 
 function FullControlConfirmationDialog({ close, confirm, changing, isCodex }: { close: () => void; confirm: () => Promise<void>; changing: boolean; isCodex?: boolean }) {
@@ -662,6 +697,7 @@ export default function ConversationPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { api: projectApi, setError, getConversationDraft, saveConversationDraft, flushConversationDraft } = useProjectContext();
+  const { appPreferences, appPreferencesLoading, appPreferencesError } = useUIPreferences();
   const { project } = useOutletContext<ProjectLayoutOutletContext>();
   const fail = setError;
   // 弹窗控制辅助函数 — 使用不可变模式创建新的 URLSearchParams
@@ -754,6 +790,7 @@ export default function ConversationPage() {
   const [hasMoreMessageHistory, setHasMoreMessageHistory] = useState(false);
   const [historyCursor, setHistoryCursor] = useState("");
   const [pendingConfirm, setPendingConfirm] = useState<{ title: string; message: React.ReactNode; confirmLabel?: string; danger?: boolean; className?: string; icon?: React.ReactNode; onConfirm: () => void; onCancel: () => void } | null>(null);
+  const [pendingConfirmBusy, setPendingConfirmBusy] = useState(false);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const [currentUserMessageIndex, setCurrentUserMessageIndex] = useState(-1);
   const [pendingPreviousUserMessageID, setPendingPreviousUserMessageID] = useState<string | null>(null);
@@ -766,6 +803,7 @@ export default function ConversationPage() {
   const userMessageElements = useRef(new Map<string, HTMLDivElement>());
   const userMessageIndexFrame = useRef<number | null>(null);
   const bottomSafeAreaFrame = useRef<number | null>(null);
+  const pendingConfirmBusyRef = useRef(false);
   const historyIndex = useRef<number | null>(null);
   const draftBeforeHistory = useRef("");
   const textRef = useRef("");
@@ -1844,7 +1882,7 @@ export default function ConversationPage() {
   };
 
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => {
-    if (sending || clearing || stopping || shortcutBusy || run || !projectId) { closeNewConversation(); return; }
+    if (conversationTransitionRef.current || sending || clearing || stopping || shortcutBusy || run || !projectId) { closeNewConversation(); return; }
     conversationTransitionRef.current = true;
     setClearing(true);
     try {
@@ -1858,9 +1896,11 @@ export default function ConversationPage() {
   };
 
   const clearConversationContext = () => {
-    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
+    if (conversationTransitionRef.current || !conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
     if (run) {
       // 运行中时先停止再清空
+      pendingConfirmBusyRef.current = false;
+      setPendingConfirmBusy(false);
       setPendingConfirm({
         title: "停止并清空",
         message: "当前对话正在运行中，将先停止运行（包括排队中的请求）再清空上下文。当前内容仍可在历史会话中恢复。",
@@ -1869,13 +1909,21 @@ export default function ConversationPage() {
         className: "conversation-clear-dialog is-running",
         icon: <ConversationClearIcon running />,
         onConfirm: () => {
-          setPendingConfirm(null);
-          void stopAndClearRef.current();
+          if (pendingConfirmBusyRef.current) return;
+          pendingConfirmBusyRef.current = true;
+          setPendingConfirmBusy(true);
+          void stopAndClearRef.current().finally(() => {
+            pendingConfirmBusyRef.current = false;
+            setPendingConfirmBusy(false);
+            setPendingConfirm(null);
+          });
         },
-        onCancel: () => setPendingConfirm(null),
+        onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
       });
       return;
     }
+    pendingConfirmBusyRef.current = false;
+    setPendingConfirmBusy(false);
     setPendingConfirm({
       title: "清空上下文",
       message: "将开始一个新的空白会话，当前内容仍可在历史会话中恢复。",
@@ -1883,10 +1931,16 @@ export default function ConversationPage() {
       className: "conversation-clear-dialog",
       icon: <ConversationClearIcon />,
       onConfirm: () => {
-        setPendingConfirm(null);
-        void clearCurrentConversation();
+        if (pendingConfirmBusyRef.current) return;
+        pendingConfirmBusyRef.current = true;
+        setPendingConfirmBusy(true);
+        void clearCurrentConversation().finally(() => {
+          pendingConfirmBusyRef.current = false;
+          setPendingConfirmBusy(false);
+          setPendingConfirm(null);
+        });
       },
-      onCancel: () => setPendingConfirm(null),
+      onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
     });
   };
 
@@ -1894,8 +1948,7 @@ export default function ConversationPage() {
     if (!conversation || stopping) return;
     // 运行可能已在确认框等待期间自然结束
     if (!run) {
-      void clearCurrentConversation();
-      return;
+      return clearCurrentConversation();
     }
     const currentRun = run;
     const conversationID = conversation.id;
@@ -1934,12 +1987,12 @@ export default function ConversationPage() {
     }
     // 只清空我们正在停止的 run，避免误清空其他新启动的 run
     setRun((active) => active === currentRun ? "" : active);
-    void clearCurrentConversation(true);
+    return clearCurrentConversation(true);
   };
   stopAndClearRef.current = stopAndClear;
 
   const clearCurrentConversation = async (skipRunGuard = false) => {
-    if (!conversation || sending || clearing || shortcutBusy || (!skipRunGuard && run)) return;
+    if (conversationTransitionRef.current || !conversation || sending || clearing || shortcutBusy || (!skipRunGuard && run)) return;
     // 用户主动清空会话：清空预约状态，让预约内容随之作废。
     // 这里不清写回输入框——resetConversationView 会用新会话草稿重置输入框，写回会被覆盖。
     clearScheduledSend();
@@ -1953,7 +2006,23 @@ export default function ConversationPage() {
     conversationTransitionRef.current = true;
     setClearing(true);
     try {
-      const next = await projectApi<Conversation>(`/api/conversations/${conversationID}/clear`, { method: "POST" });
+      let next: Conversation | null = null;
+      let lastCause: unknown;
+      // 刚结束一轮运行时，后端状态可能还没来得及落到 idle。对 409 做短暂退避，
+      // 避免用户必须关闭提示框并重新走一遍清空流程。
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          next = await projectApi<Conversation>(`/api/conversations/${conversationID}/clear`, { method: "POST" });
+          lastCause = undefined;
+          break;
+        } catch (cause) {
+          lastCause = cause;
+          const status = typeof cause === "object" && cause !== null ? (cause as { status?: unknown }).status : undefined;
+          if (status !== 409 || attempt === 3) throw cause;
+          await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        }
+      }
+      if (!next) throw lastCause ?? new Error("无法清除会话上下文");
       if (!clearStillOwnsView()) return;
       resetConversationView(next);
       if (projectId) navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
@@ -2323,7 +2392,7 @@ export default function ConversationPage() {
         <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} />
       </aside>}
     </section>
-    {showNewConversation && <NewConversationDialog runnerID={project.runner} close={closeNewConversation} create={newConversation} />}
+    {showNewConversation && <NewConversationDialog runnerID={project.runner} defaults={appPreferences} defaultsLoading={appPreferencesLoading} defaultsError={appPreferencesError} close={closeNewConversation} create={newConversation} />}
     {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} view={viewConversation} search={searchConversationHistory} hasMore={Boolean(conversationHistoryCursor)} loadingMore={loadingMoreConversationHistory} loadMore={loadMoreConversationHistory} />}
     {showFullControlConfirmation && <FullControlConfirmationDialog close={() => setShowFullControlConfirmation(false)} confirm={confirmFullControl} changing={changingPermission} isCodex={isCodex} />}
     {showAgentExecution && agentExecutions.find((execution) => execution.runId === showAgentExecution) && <AgentExecutionDialog execution={agentExecutions.find((execution) => execution.runId === showAgentExecution)!} close={closeAgentExecution} />}
@@ -2331,6 +2400,6 @@ export default function ConversationPage() {
     {showAiConfig && <ProjectAiConfigDialog projectId={project.id} runnerID={project.runner} close={closeAiConfig} />}
     {shortcutEditor && <ShortcutEditor projectID={project.id} state={shortcutEditor} close={() => setShortcutEditor(null)} refresh={refreshShortcuts} fail={fail} />}
     {shortcutVariables && <ShortcutVariablesDialog state={shortcutVariables} close={() => setShortcutVariables(null)} run={(variables) => { setShortcutVariables(null); void runShortcut(shortcutVariables.shortcut, variables, true); }} />}
-    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} confirmLabel={pendingConfirm.confirmLabel} danger={pendingConfirm.danger} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
+    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} confirmLabel={pendingConfirm.confirmLabel} danger={pendingConfirm.danger} busy={pendingConfirmBusy} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </>;
 }

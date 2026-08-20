@@ -5,7 +5,7 @@ import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import { useUnreadCount } from "./NotificationProvider";
 import { api } from "../lib/api";
-import { notificationConversationURL, type NotificationEvent } from "../lib/notifications";
+import { notificationTargetURL, type NotificationEvent } from "../lib/notifications";
 
 function NotificationBellIcon() {
   return (
@@ -132,7 +132,7 @@ export default function NotificationCenter() {
   };
 
   const handleNavigate = (notification: NotificationEvent) => {
-    navigate(notificationConversationURL(notification));
+    navigate(notificationTargetURL(notification));
     void handleDismiss(notification.id);
     setOpen(false);
   };

@@ -3,10 +3,12 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -119,7 +121,7 @@ func TestClaudeCLIManagedProfileLaunchHasNoCredentialOrEndpointInjection(t *test
 func TestAPIKeyManagedProfileRoundTripAndLaunch(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
-	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"claude-code","name":"Managed key profile","model":"claude-test","baseUrl":"https://api.example.com/v1","authMode":"api_key","apiKey":"sk-super-secret-value","env":{"ANTHROPIC_VERSION":"2023-06-01","X_CUSTOM":"1"}}`)))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"claude-code","name":"Managed key profile","model":"claude-test","baseUrl":"https://api.example.com/v1","authMode":"api_key","apiKey":"sk-super-secret-value","env":{"ANTHROPIC_VERSION":"2023-06-01"}}`)))
 	if response.Code != http.StatusCreated {
 		t.Fatalf("create api_key profile status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -146,7 +148,7 @@ func TestAPIKeyManagedProfileRoundTripAndLaunch(t *testing.T) {
 	if runtimeProfile.Secret != "sk-super-secret-value" || runtimeProfile.BaseURL != "https://api.example.com/v1" || runtimeProfile.AuthMode != "api_key" {
 		t.Fatalf("runtime profile=%#v", runtimeProfile)
 	}
-	if runtimeProfile.Env["ANTHROPIC_VERSION"] != "2023-06-01" || runtimeProfile.Env["X_CUSTOM"] != "1" {
+	if runtimeProfile.Env["ANTHROPIC_VERSION"] != "2023-06-01" {
 		t.Fatalf("runtime profile env=%#v", runtimeProfile.Env)
 	}
 	// Launch injects the managed key and endpoint into the CLI environment.
@@ -170,7 +172,7 @@ func TestAPIKeyManagedProfileRoundTripAndLaunch(t *testing.T) {
 func TestAPIKeyRotationMintsIndependentSecretPerRevision(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
-	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"claude-code","name":"Key profile","model":"m1","authMode":"api_key","apiKey":"key-one","env":{"X":"1"}}`)))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/agent-profiles", strings.NewReader(`{"agentId":"claude-code","name":"Key profile","model":"m1","authMode":"api_key","apiKey":"key-one","env":{"ANTHROPIC_BETA":"test"}}`)))
 	if response.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -181,7 +183,7 @@ func TestAPIKeyRotationMintsIndependentSecretPerRevision(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
 		t.Fatalf("decode create: %v", err)
 	}
-	if created.Revision.Environment["X"] != "1" {
+	if created.Revision.Environment["ANTHROPIC_BETA"] != "test" {
 		t.Fatalf("revision did not persist env: %#v", created.Revision.Environment)
 	}
 	secretForRevision := func(revisionID string) string {
@@ -192,7 +194,8 @@ func TestAPIKeyRotationMintsIndependentSecretPerRevision(t *testing.T) {
 		return ref
 	}
 	firstSecret := secretForRevision(created.Revision.ID)
-	// Edit model (no new key): the same secret row is reused and env preserved.
+	// Edit model without providing a new key. The new revision gets its own
+	// encrypted copy so either revision can later be revoked independently.
 	update := httptest.NewRecorder()
 	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPatch, "/api/agent-profiles/"+created.Profile.ID, strings.NewReader(`{"model":"m2"}`)))
 	if update.Code != http.StatusOK {
@@ -205,8 +208,9 @@ func TestAPIKeyRotationMintsIndependentSecretPerRevision(t *testing.T) {
 	if err := json.NewDecoder(update.Body).Decode(&updated); err != nil {
 		t.Fatalf("decode update: %v", err)
 	}
-	if updatedSecret := secretForRevision(updated.Revision.ID); updatedSecret != firstSecret {
-		t.Fatalf("model-only edit rotated secret: old=%q new=%q", firstSecret, updatedSecret)
+	updatedSecret := secretForRevision(updated.Revision.ID)
+	if updatedSecret == "" || updatedSecret == firstSecret {
+		t.Fatalf("model-only edit did not create an independent secret: old=%q new=%q", firstSecret, updatedSecret)
 	}
 	// Rotating the key mints a fresh secret; the old revision keeps its own.
 	rotate := httptest.NewRecorder()
@@ -220,8 +224,15 @@ func TestAPIKeyRotationMintsIndependentSecretPerRevision(t *testing.T) {
 	if err := json.NewDecoder(rotate.Body).Decode(&rotated); err != nil {
 		t.Fatalf("decode rotate: %v", err)
 	}
-	if rotatedSecret := secretForRevision(rotated.Revision.ID); rotatedSecret == "" || rotatedSecret == firstSecret {
-		t.Fatalf("rotation did not mint an independent secret: first=%q new=%q", firstSecret, rotatedSecret)
+	if rotatedSecret := secretForRevision(rotated.Revision.ID); rotatedSecret == "" || rotatedSecret == updatedSecret || rotatedSecret == firstSecret {
+		t.Fatalf("rotation did not mint an independent secret: first=%q model=%q new=%q", firstSecret, updatedSecret, rotatedSecret)
+	}
+	// Revoking the model-only revision must not revoke the original revision's
+	// independent secret snapshot.
+	revoke := httptest.NewRecorder()
+	server.routes().ServeHTTP(revoke, httptest.NewRequest(http.MethodPost, "/api/agent-profile-revisions/"+updated.Revision.ID+"/revoke", nil))
+	if revoke.Code != http.StatusAccepted {
+		t.Fatalf("revoke model revision status=%d body=%s", revoke.Code, revoke.Body.String())
 	}
 	// The old secret row still decrypts to the first key (preserved for the
 	// immutable earlier revision).
@@ -234,13 +245,77 @@ func TestAPIKeyRotationMintsIndependentSecretPerRevision(t *testing.T) {
 	if err != nil || oldKey != "key-one" {
 		t.Fatalf("old revision secret lost: key=%q err=%v", oldKey, err)
 	}
+	// Changing the current profile back to CLI-managed must not revoke a key
+	// still referenced by the immediately preceding immutable revision.
+	switchToCLI := httptest.NewRecorder()
+	server.routes().ServeHTTP(switchToCLI, httptest.NewRequest(http.MethodPatch, "/api/agent-profiles/"+created.Profile.ID, strings.NewReader(`{"authMode":"cli_managed"}`)))
+	if switchToCLI.Code != http.StatusOK {
+		t.Fatalf("switch to cli-managed status=%d body=%s", switchToCLI.Code, switchToCLI.Body.String())
+	}
+	rotatedSecret := secretForRevision(rotated.Revision.ID)
+	tx, err = server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin snapshot verification: %v", err)
+	}
+	keyBeforeCLI, err := server.profileSecrets.Load(tx, context.Background(), rotatedSecret)
+	_ = tx.Rollback()
+	if err != nil || keyBeforeCLI != "key-two" {
+		t.Fatalf("api-key snapshot lost after CLI switch: key=%q err=%v", keyBeforeCLI, err)
+	}
+}
+
+func TestRecoverInterruptedRunReleasesQuotaAndCompletesRevocation(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "recovery-model")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('recovery-project','recovery-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,status,created_at) values ('recovery-conversation','recovery-project','recovery-session','claude-code','recovery-session',?,'','running',?)`, server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin recovery setup: %v", err)
+	}
+	if _, err := tx.Exec(`update conversations set agent_profile_revision_id=? where id='recovery-conversation'`, profile.CurrentRevisionID); err != nil {
+		t.Fatalf("set conversation profile: %v", err)
+	}
+	if _, err := tx.Exec(`insert into runs (id,conversation_id,agent_id,agent_runtime_id,agent_profile_revision_id,status,created_at) values ('recovery-run','recovery-conversation','claude-code',?,?, 'running',?)`, server.localRunnerID(), profile.CurrentRevisionID, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	if err := server.reserveProfileQuotaTx(context.Background(), tx, "recovery-run", profile.CurrentRevisionID); err != nil {
+		t.Fatalf("reserve quota: %v", err)
+	}
+	if _, err := tx.Exec(`insert into revocation_jobs (id,profile_revision_id,state,error,created_at,updated_at) values ('recovery-revoke',?,'stopping','',?,?)`, profile.CurrentRevisionID, now, now); err != nil {
+		t.Fatalf("insert revocation job: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit recovery setup: %v", err)
+	}
+	if err := server.recoverInterruptedRuns(context.Background()); err != nil {
+		t.Fatalf("recover interrupted runs: %v", err)
+	}
+	var runStatus, reservationState, revocationState string
+	if err := server.db.QueryRow(`select status from runs where id='recovery-run'`).Scan(&runStatus); err != nil {
+		t.Fatalf("read recovered run: %v", err)
+	}
+	if err := server.db.QueryRow(`select state from quota_reservations where run_id='recovery-run'`).Scan(&reservationState); err != nil {
+		t.Fatalf("read recovered reservation: %v", err)
+	}
+	if err := server.db.QueryRow(`select state from revocation_jobs where id='recovery-revoke'`).Scan(&revocationState); err != nil {
+		t.Fatalf("read recovered revocation: %v", err)
+	}
+	if runStatus != "interrupted" || reservationState != "released" || revocationState != "completed" {
+		t.Fatalf("recovery state: run=%q reservation=%q revocation=%q", runStatus, reservationState, revocationState)
+	}
 }
 
 func TestManagedProfileSnapshotsRevisionAndRevocationCancelsRun(t *testing.T) {
 	server := newTestServer(t)
 	profile := createCLIManagedProfile(t, server, "claude-code", "claude-test-model")
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
 	started := make(chan AgentRunRequest, 1)
@@ -382,7 +457,7 @@ func TestProjectDefaultProfileAppliesToNewConversations(t *testing.T) {
 	server := newTestServer(t)
 	profile := createCLIManagedProfile(t, server, "claude-code", "claude-default")
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
 	// Set the project default through the one-click endpoint (non-empty path).
@@ -404,24 +479,18 @@ func TestProjectDefaultProfileAppliesToNewConversations(t *testing.T) {
 	if conversation.AgentProfileRevisionID != profile.CurrentRevisionID {
 		t.Fatalf("project default revision=%q want=%q", conversation.AgentProfileRevisionID, profile.CurrentRevisionID)
 	}
-	// The endpoint reports the configured default.
-	detail := httptest.NewRecorder()
-	server.routes().ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/projects/project", nil))
-	if detail.Code != http.StatusOK {
-		t.Fatalf("get project status=%d body=%s", detail.Code, detail.Body.String())
+	// New bindings are stored in a route revision, not the retired single
+	// projects.default_profile_id column.
+	var routeRevisionID, routedProfileID string
+	if err := server.db.QueryRow(`select pr.current_revision_id,rr.profile_id from project_agent_routes pr join project_agent_route_revisions rr on rr.id=pr.current_revision_id where pr.project_id=? and pr.agent_id=?`, "project", "claude-code").Scan(&routeRevisionID, &routedProfileID); err != nil {
+		t.Fatalf("read project route: %v", err)
 	}
-	var project struct {
-		DefaultProfileID string `json:"defaultProfileId"`
-	}
-	if err := json.NewDecoder(detail.Body).Decode(&project); err != nil {
-		t.Fatalf("decode project: %v", err)
-	}
-	if project.DefaultProfileID != profile.ID {
-		t.Fatalf("project default=%q want=%q", project.DefaultProfileID, profile.ID)
+	if routeRevisionID == "" || routedProfileID != profile.ID {
+		t.Fatalf("project route=%q profile=%q want=%q", routeRevisionID, routedProfileID, profile.ID)
 	}
 	// Clearing the default can be done via the dedicated endpoint.
 	clear := httptest.NewRecorder()
-	server.routes().ServeHTTP(clear, httptest.NewRequest(http.MethodPatch, "/api/projects/project/agent-profile", strings.NewReader(`{"profileId":""}`)))
+	server.routes().ServeHTTP(clear, httptest.NewRequest(http.MethodPatch, "/api/projects/project/agent-profile", strings.NewReader(`{"agentId":"claude-code","profileId":""}`)))
 	if clear.Code != http.StatusOK {
 		t.Fatalf("clear default status=%d body=%s", clear.Code, clear.Body.String())
 	}
@@ -437,13 +506,465 @@ func TestProjectDefaultProfileAppliesToNewConversations(t *testing.T) {
 	}
 }
 
+func TestProjectAgentRoutesKeepClaudeAndCodexIndependent(t *testing.T) {
+	server := newTestServer(t)
+	claude := createCLIManagedProfile(t, server, "claude-code", "claude-model")
+	codex := createCLIManagedProfile(t, server, "codex", "codex-model")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	for _, item := range []struct{ agentID, profileID string }{{"claude-code", claude.ID}, {"codex", codex.ID}} {
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/projects/project/agent-profile", strings.NewReader(`{"agentId":"`+item.agentID+`","profileId":"`+item.profileID+`"}`)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("set %s route status=%d body=%s", item.agentID, response.Code, response.Body.String())
+		}
+	}
+	for _, item := range []struct{ agentID, revisionID string }{{"claude-code", claude.CurrentRevisionID}, {"codex", codex.CurrentRevisionID}} {
+		tx, err := server.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		selection, err := server.profileRouteForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), item.agentID, "project")
+		_ = tx.Rollback()
+		if err != nil || selection.ProfileRevisionID != item.revisionID || selection.RouteRevisionID == "" {
+			t.Fatalf("%s selection=%#v err=%v", item.agentID, selection, err)
+		}
+	}
+	clear := httptest.NewRecorder()
+	server.routes().ServeHTTP(clear, httptest.NewRequest(http.MethodPatch, "/api/projects/project/agent-profile", strings.NewReader(`{"agentId":"claude-code","profileId":""}`)))
+	if clear.Code != http.StatusOK {
+		t.Fatalf("clear Claude route status=%d body=%s", clear.Code, clear.Body.String())
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin codex tx: %v", err)
+	}
+	selection, err := server.profileRouteForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "codex", "project")
+	_ = tx.Rollback()
+	if err != nil || selection.ProfileRevisionID != codex.CurrentRevisionID {
+		t.Fatalf("Codex route changed after Claude clear: %#v err=%v", selection, err)
+	}
+}
+
+func TestCredentialQuotaReservationLimitsConcurrentRuns(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "quota-model")
+	var groupID string
+	if err := server.db.QueryRow(`select quota_group_id from credential_quota_groups where profile_id=?`, profile.ID).Scan(&groupID); err != nil {
+		t.Fatalf("private quota group: %v", err)
+	}
+	if _, err := server.db.Exec(`update quota_groups set max_concurrency=1 where id=?`, groupID); err != nil {
+		t.Fatalf("set quota limit: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('quota-project','quota-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), time.Now().UTC()); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,status,created_at) values ('quota-conversation','quota-project','quota-session','claude-code','quota-session',?,'idle',?)`, server.localRunnerID(), time.Now().UTC()); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	for _, runID := range []string{"quota-run-1", "quota-run-2"} {
+		tx, err := server.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("begin %s: %v", runID, err)
+		}
+		if _, err := tx.Exec(`insert into runs (id,conversation_id,status,created_at) values (?,?,?,?)`, runID, "quota-conversation", "running", time.Now().UTC()); err != nil {
+			t.Fatalf("insert %s: %v", runID, err)
+		}
+		err = server.reserveProfileQuotaTx(context.Background(), tx, runID, profile.CurrentRevisionID)
+		if runID == "quota-run-1" {
+			if err != nil {
+				t.Fatalf("first reservation: %v", err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("commit first: %v", err)
+			}
+		} else {
+			_ = tx.Rollback()
+			var quotaErr *quotaAdmissionError
+			if !errors.As(err, &quotaErr) {
+				t.Fatalf("second reservation err=%v, want quota admission", err)
+			}
+		}
+	}
+}
+
+func TestAttachDisabledQuotaGroupReturnsConflict(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "disabled-quota-group")
+	var groupID string
+	if err := server.db.QueryRow(`select quota_group_id from credential_quota_groups where profile_id=?`, profile.ID).Scan(&groupID); err != nil {
+		t.Fatalf("private quota group: %v", err)
+	}
+	if _, err := server.db.Exec(`update quota_groups set enabled=0 where id=?`, groupID); err != nil {
+		t.Fatalf("disable quota group: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/quota-groups/"+groupID+"/profiles/"+profile.ID, nil))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "quota group is disabled") {
+		t.Fatalf("attach disabled quota group status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCredentialQuotaReservationIsIdempotent(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "quota-idempotent")
+	var groupID string
+	if err := server.db.QueryRow(`select quota_group_id from credential_quota_groups where profile_id=?`, profile.ID).Scan(&groupID); err != nil {
+		t.Fatalf("private quota group: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update quota_groups set rpm_limit=2,max_concurrency=1 where id=?`, groupID); err != nil {
+		t.Fatalf("set quota group: %v", err)
+	}
+	if _, err := server.db.Exec(`update quota_group_state set rpm_tokens=2,last_refilled_at=?,updated_at=? where quota_group_id=?`, now, now, groupID); err != nil {
+		t.Fatalf("seed quota state: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('idempotent-project','idempotent-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,status,created_at) values ('idempotent-conversation','idempotent-project','session','claude-code','session',?,'idle',?)`, server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`insert into runs (id,conversation_id,status,created_at) values ('idempotent-run','idempotent-conversation','running',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := server.reserveProfileQuotaTx(context.Background(), tx, "idempotent-run", profile.CurrentRevisionID); err != nil {
+			t.Fatalf("reserve attempt %d: %v", attempt+1, err)
+		}
+	}
+	var reservations int
+	var tokens float64
+	if err := tx.QueryRow(`select count(*) from quota_reservations where run_id='idempotent-run'`).Scan(&reservations); err != nil {
+		t.Fatalf("count reservations: %v", err)
+	}
+	if err := tx.QueryRow(`select rpm_tokens from quota_group_state where quota_group_id=?`, groupID).Scan(&tokens); err != nil {
+		t.Fatalf("read tokens: %v", err)
+	}
+	if reservations != 1 || tokens != 1 {
+		t.Fatalf("reservations=%d tokens=%v, want one reservation and one consumed RPM", reservations, tokens)
+	}
+}
+
+func TestCredentialSchedulingMigrationDoesNotRefillExhaustedBuckets(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "quota-restart")
+	var groupID string
+	if err := server.db.QueryRow(`select quota_group_id from credential_quota_groups where profile_id=?`, profile.ID).Scan(&groupID); err != nil {
+		t.Fatalf("private quota group: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update quota_groups set rpm_limit=1,tpm_limit=1 where id=?`, groupID); err != nil {
+		t.Fatalf("set quota limits: %v", err)
+	}
+	if _, err := server.db.Exec(`update quota_group_state set rpm_tokens=0,tpm_tokens=0,last_refilled_at=?,updated_at=? where quota_group_id=?`, now, now, groupID); err != nil {
+		t.Fatalf("exhaust quota state: %v", err)
+	}
+	if err := server.migrateCredentialScheduling(context.Background()); err != nil {
+		t.Fatalf("rerun scheduling migration: %v", err)
+	}
+	var rpm, tpm float64
+	if err := server.db.QueryRow(`select rpm_tokens,tpm_tokens from quota_group_state where quota_group_id=?`, groupID).Scan(&rpm, &tpm); err != nil {
+		t.Fatalf("read quota state: %v", err)
+	}
+	if rpm != 0 || tpm != 0 {
+		t.Fatalf("migration refilled exhausted bucket: rpm=%v tpm=%v", rpm, tpm)
+	}
+}
+
+func TestCredentialQuotaReconcilesReportedTPMUsage(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "quota-usage")
+	var groupID string
+	if err := server.db.QueryRow(`select quota_group_id from credential_quota_groups where profile_id=?`, profile.ID).Scan(&groupID); err != nil {
+		t.Fatalf("private quota group: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update quota_groups set tpm_limit=10000 where id=?`, groupID); err != nil {
+		t.Fatalf("set TPM limit: %v", err)
+	}
+	if _, err := server.db.Exec(`update quota_group_state set tpm_tokens=10000,last_refilled_at=?,updated_at=? where quota_group_id=?`, now, now, groupID); err != nil {
+		t.Fatalf("seed quota state: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('usage-project','usage-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,status,created_at) values ('usage-conversation','usage-project','session','claude-code','session',?,'idle',?)`, server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin reservation: %v", err)
+	}
+	if _, err := tx.Exec(`insert into runs (id,conversation_id,status,created_at) values ('usage-run','usage-conversation','running',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	if err := server.reserveProfileQuotaTx(context.Background(), tx, "usage-run", profile.CurrentRevisionID); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit reservation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into run_usage (run_id,conversation_id,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,completed_at) values ('usage-run','usage-conversation',300,100,100,100,?)`, now); err != nil {
+		t.Fatalf("insert usage: %v", err)
+	}
+	tx, err = server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin reconciliation: %v", err)
+	}
+	if err := server.reconcileQuotaUsageTx(context.Background(), tx, "usage-run"); err != nil {
+		t.Fatalf("reconcile usage: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit reconciliation: %v", err)
+	}
+	var tokens, reserved float64
+	if err := server.db.QueryRow(`select tpm_tokens from quota_group_state where quota_group_id=?`, groupID).Scan(&tokens); err != nil {
+		t.Fatalf("read TPM tokens: %v", err)
+	}
+	if err := server.db.QueryRow(`select reserved_tpm from quota_reservations where run_id='usage-run' and quota_group_id=?`, groupID).Scan(&reserved); err != nil {
+		t.Fatalf("read reserved TPM: %v", err)
+	}
+	if tokens != 9400 || reserved != 600 {
+		t.Fatalf("tokens=%v reserved=%v, want tokens=9400 reserved=600", tokens, reserved)
+	}
+}
+
+func TestCredentialPoolSkipsCoolingMember(t *testing.T) {
+	server := newTestServer(t)
+	first := createCLIManagedProfile(t, server, "claude-code", "pool-cooling-first")
+	second := createCLIManagedProfile(t, server, "claude-code", "pool-cooling-first")
+	response := httptest.NewRecorder()
+	body := `{"name":"cooling pool","strategy":"round_robin","profileIds":["` + first.ID + `","` + second.ID + `"]}`
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/credential-pools", strings.NewReader(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create pool status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		PoolRevisionID string `json:"poolRevisionId"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode pool: %v", err)
+	}
+	var firstGroupID string
+	if err := server.db.QueryRow(`select quota_group_id from credential_quota_groups where profile_id=?`, first.ID).Scan(&firstGroupID); err != nil {
+		t.Fatalf("first quota group: %v", err)
+	}
+	if _, err := server.db.Exec(`update quota_group_state set cooldown_until=?,updated_at=? where quota_group_id=?`, time.Now().UTC().Add(time.Minute), time.Now().UTC(), firstGroupID); err != nil {
+		t.Fatalf("cool first member: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('cooling-project','cooling-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	set := httptest.NewRecorder()
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPost, "/api/projects/cooling-project/agent-pool", strings.NewReader(`{"agentId":"claude-code","poolRevisionId":"`+created.PoolRevisionID+`"}`)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set pool status=%d body=%s", set.Code, set.Body.String())
+	}
+	config := httptest.NewRecorder()
+	server.routes().ServeHTTP(config, httptest.NewRequest(http.MethodGet, "/api/projects/cooling-project/agent-config", nil))
+	if config.Code != http.StatusOK {
+		t.Fatalf("get pool config status=%d body=%s", config.Code, config.Body.String())
+	}
+	var configView struct {
+		Claude struct {
+			Mode           string `json:"mode"`
+			PoolRevisionID string `json:"poolRevisionId"`
+		} `json:"claude"`
+	}
+	if err := json.NewDecoder(config.Body).Decode(&configView); err != nil {
+		t.Fatalf("decode pool config: %v", err)
+	}
+	if configView.Claude.Mode != "pool" || configView.Claude.PoolRevisionID != created.PoolRevisionID {
+		t.Fatalf("pool config=%#v want mode=pool revision=%q", configView.Claude, created.PoolRevisionID)
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	selection, err := server.profileRouteForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code", "cooling-project")
+	if err != nil {
+		t.Fatalf("route selection: %v", err)
+	}
+	selectedRevisionID, err := server.selectPoolProfileRevisionTx(context.Background(), tx, selection.RouteRevisionID, server.localRunnerID(), "claude-code")
+	if err != nil {
+		t.Fatalf("select pool member: %v", err)
+	}
+	if selectedRevisionID != second.CurrentRevisionID {
+		t.Fatalf("selected cooling member %q, want available member %q", selectedRevisionID, second.CurrentRevisionID)
+	}
+}
+
+func TestCredentialPoolPreservesMemberRevisionSnapshot(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "snapshot-model")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/credential-pools", strings.NewReader(`{"name":"snapshot pool","profileIds":["`+profile.ID+`"]}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create pool status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		PoolRevisionID string `json:"poolRevisionId"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode pool: %v", err)
+	}
+	var memberRevisionID string
+	if err := server.db.QueryRow(`select profile_revision_id from credential_pool_revision_members where pool_revision_id=? and profile_id=?`, created.PoolRevisionID, profile.ID).Scan(&memberRevisionID); err != nil {
+		t.Fatalf("read pool member revision: %v", err)
+	}
+	if memberRevisionID != profile.CurrentRevisionID {
+		t.Fatalf("member revision=%q want %q", memberRevisionID, profile.CurrentRevisionID)
+	}
+	update := httptest.NewRecorder()
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPatch, "/api/agent-profiles/"+profile.ID, strings.NewReader(`{"model":"rotated-model"}`)))
+	if update.Code != http.StatusOK {
+		t.Fatalf("rotate profile status=%d body=%s", update.Code, update.Body.String())
+	}
+	var rotated struct {
+		Profile AgentProfile `json:"profile"`
+	}
+	if err := json.NewDecoder(update.Body).Decode(&rotated); err != nil {
+		t.Fatalf("decode rotated profile: %v", err)
+	}
+	if rotated.Profile.CurrentRevisionID == memberRevisionID {
+		t.Fatal("profile rotation did not create a revision")
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('snapshot-project','snapshot-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	set := httptest.NewRecorder()
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPost, "/api/projects/snapshot-project/agent-pool", strings.NewReader(`{"agentId":"claude-code","poolRevisionId":"`+created.PoolRevisionID+`"}`)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set pool status=%d body=%s", set.Code, set.Body.String())
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	selection, err := server.profileRouteForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code", "snapshot-project")
+	if err != nil {
+		t.Fatalf("route selection: %v", err)
+	}
+	selected, err := server.selectPoolProfileRevisionTx(context.Background(), tx, selection.RouteRevisionID, server.localRunnerID(), "claude-code")
+	if err != nil || selected != memberRevisionID {
+		t.Fatalf("selected member revision=%q err=%v want=%q", selected, err, memberRevisionID)
+	}
+}
+
+func TestProjectRouteRevisionRejectsPoolSnapshotMutation(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "route-snapshot")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('route-project','route-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin route creation: %v", err)
+	}
+	if err := server.replaceProjectAgentRouteTx(context.Background(), tx, "route-project", "claude-code", profile.ID, profile.CurrentRevisionID, "pinned"); err != nil {
+		t.Fatalf("create route: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit route: %v", err)
+	}
+	var routeRevisionID string
+	if err := server.db.QueryRow(`select current_revision_id from project_agent_routes where project_id='route-project' and agent_id='claude-code'`).Scan(&routeRevisionID); err != nil {
+		t.Fatalf("read route revision: %v", err)
+	}
+	if _, err := server.db.Exec(`update project_agent_route_revisions set pool_revision_id='unexpected-pool' where id=?`, routeRevisionID); err == nil {
+		t.Fatal("pool revision snapshot mutation unexpectedly succeeded")
+	}
+}
+
+func TestRemoteCredentialPoolWritesAreRejectedWithoutRunnerAgent(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into runners (id,kind,display_name,config_json,enabled,last_error,created_at,updated_at) values ('ssh-pool','ssh','SSH pool','{}',1,'',?,?)`, now, now); err != nil {
+		t.Fatalf("insert remote runner: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/ssh-pool/credential-pools", strings.NewReader(`{"name":"remote pool","profileIds":["profile"]}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("remote pool status=%d body=%s, want conflict", response.Code, response.Body.String())
+	}
+}
+
+func TestRetryAfterFromRateLimitError(t *testing.T) {
+	if got := retryAfterFromError(errors.New("HTTP 429 Retry-After: 17")); got != 17*time.Second {
+		t.Fatalf("retry after=%s want 17s", got)
+	}
+	if got := retryAfterFromError(errors.New("Retry-After: 7200")); got != time.Hour {
+		t.Fatalf("bounded retry after=%s want 1h", got)
+	}
+}
+
+func TestCredentialPoolRouteSelectsAvailableProfile(t *testing.T) {
+	server := newTestServer(t)
+	first := createCLIManagedProfile(t, server, "claude-code", "pool-first")
+	second := createCLIManagedProfile(t, server, "claude-code", "pool-first")
+	response := httptest.NewRecorder()
+	body := `{"name":"shared pool","strategy":"least_loaded","profileIds":["` + first.ID + `","` + second.ID + `"]}`
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/"+server.localRunnerID()+"/credential-pools", strings.NewReader(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create pool status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		PoolRevisionID string `json:"poolRevisionId"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode pool: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('pool-project','pool-project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), time.Now().UTC()); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	set := httptest.NewRecorder()
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPost, "/api/projects/pool-project/agent-pool", strings.NewReader(`{"agentId":"claude-code","poolRevisionId":"`+created.PoolRevisionID+`"}`)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set pool status=%d body=%s", set.Code, set.Body.String())
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	selection, err := server.profileRouteForNewConversationTx(context.Background(), tx, nil, server.localRunnerID(), "claude-code", "pool-project")
+	if err != nil || selection.ProfileRevisionID != "" || selection.RouteRevisionID == "" {
+		_ = tx.Rollback()
+		t.Fatalf("queued pool selection=%#v err=%v", selection, err)
+	}
+	selectedRevisionID, err := server.selectPoolProfileRevisionTx(context.Background(), tx, selection.RouteRevisionID, server.localRunnerID(), "claude-code")
+	_ = tx.Rollback()
+	if err != nil || (selectedRevisionID != first.CurrentRevisionID && selectedRevisionID != second.CurrentRevisionID) {
+		t.Fatalf("admitted pool revision=%q err=%v", selectedRevisionID, err)
+	}
+}
+
 func TestCodexApiKeyProfileBypassesLoginReadiness(t *testing.T) {
 	server := newTestServer(t)
 	// A fake codex binary that exists but is NOT logged in (login status fails).
 	bin := filepath.Join(t.TempDir(), "fake-codex")
-	script := "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then exit 1; fi\nexit 0\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake codex: %v", err)
+	if runtime.GOOS == "windows" {
+		bin = filepath.Join(os.Getenv("SystemRoot"), "System32", "where.exe")
+		if _, err := os.Stat(bin); err != nil {
+			t.Skipf("where.exe is unavailable: %v", err)
+		}
+	} else {
+		script := "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then exit 1; fi\nexit 0\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake codex: %v", err)
+		}
 	}
 	server.codexRunner = &codexCLIRunner{config: Config{CodexPath: bin}}
 	// cli_managed still requires a login.
@@ -472,7 +993,7 @@ func TestAPIKeyProfileAsProjectDefaultBindsAndAdmitsAtRuntime(t *testing.T) {
 		t.Fatalf("decode create: %v", err)
 	}
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project-key','project-key',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project-key','project-key',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
 	// One-click: make the api_key profile the project default.
@@ -508,7 +1029,7 @@ func TestRevokingOrDisablingProjectDefaultClearsIt(t *testing.T) {
 			profile := createCLIManagedProfile(t, server, "claude-code", "")
 			now := time.Now().UTC()
 			projectID := "project-" + action
-			if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at,default_profile_id) values (?,?,?,'wsl-local','main',1,?,?)`, projectID, projectID, t.TempDir(), now, profile.ID); err != nil {
+			if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at,default_profile_id) values (?,?,?,?,'main',1,?,?)`, projectID, projectID, t.TempDir(), server.localRunnerID(), now, profile.ID); err != nil {
 				t.Fatalf("insert project: %v", err)
 			}
 			var endpoint string
@@ -537,7 +1058,7 @@ func TestConversationProfileRequestUsesInheritedConfigurationUnlessExplicitlySel
 	server := newTestServer(t)
 	profile := createCLIManagedProfile(t, server, "claude-code", "claude-default")
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
 	defaultResponse := httptest.NewRecorder()
