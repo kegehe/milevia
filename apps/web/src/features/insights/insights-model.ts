@@ -57,6 +57,7 @@ export type InsightVerificationRun = {
 };
 
 export type InsightsResponse = {
+  defaultAgent?: string;
   scan: InsightScan | null;
   findings: InsightFinding[];
   events: InsightEvent[];

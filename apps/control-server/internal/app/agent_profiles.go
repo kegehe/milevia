@@ -1077,6 +1077,30 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 		writeError(w, 500, err)
 		return
 	}
+	conversationRows, err := tx.QueryContext(r.Context(), `select id from conversations where agent_profile_revision_id=?`, revisionID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	conversationIDs := map[string]struct{}{}
+	for conversationRows.Next() {
+		var conversationID string
+		if err := conversationRows.Scan(&conversationID); err != nil {
+			conversationRows.Close()
+			writeError(w, 500, err)
+			return
+		}
+		conversationIDs[conversationID] = struct{}{}
+	}
+	if err := conversationRows.Err(); err != nil {
+		conversationRows.Close()
+		writeError(w, 500, err)
+		return
+	}
+	if err := conversationRows.Close(); err != nil {
+		writeError(w, 500, err)
+		return
+	}
 	jobID := uuid.NewString()
 	jobState := "stopping"
 	var completedAt any
@@ -1097,14 +1121,6 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 	for _, cancel := range s.profileRunCancels[revisionID] {
 		cancels = append(cancels, cancel)
 	}
-	sessions := map[string]AgentSession{}
-	for _, runID := range runIDs {
-		conversationID := s.runContexts[runID]
-		if session := s.sessions[conversationID]; session != nil {
-			session.stopping = true
-			sessions[conversationID] = session.agent
-		}
-	}
 	s.mu.Unlock()
 	if secretRef != "" {
 		_ = s.profileSecrets.Revoke(s.db, context.Background(), secretRef)
@@ -1112,10 +1128,8 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 	for _, cancel := range cancels {
 		cancel()
 	}
-	for _, session := range sessions {
-		session.Stop()
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"state": "revoked", "revocationJobId": jobID, "revocationJobState": jobState, "stoppingRunCount": len(runIDs)})
+	stoppingSessionCount := s.sessionManager.retireForProfileRevision(conversationIDs)
+	writeJSON(w, http.StatusAccepted, map[string]any{"state": "revoked", "revocationJobId": jobID, "revocationJobState": jobState, "stoppingRunCount": len(runIDs), "stoppingSessionCount": stoppingSessionCount})
 }
 
 func (s *Server) canManageProfileRunner(runnerID string) bool {

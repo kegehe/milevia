@@ -1178,16 +1178,16 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(c
 	}
 	conversationID := expectedConversationID
 	if conversationID == "" {
-		err = s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and is_current=true`, task.ProjectID).Scan(&conversationID)
-	} else if orchestrated {
-		// Orchestrated dispatch targets a dedicated background conversation that
-		// is intentionally not the project's current one; accept it by ID alone.
-		err = s.db.QueryRowContext(ctx, `select id from conversations where id=? and project_id=?`, conversationID, task.ProjectID).Scan(&conversationID)
+		// A task request without a target is legacy input. Choose a deterministic
+		// most-recent idle conversation instead of a browser-global selection.
+		err = s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and status in ('idle','running') order by case when status='idle' then 0 else 1 end,last_activity_at desc,id desc limit 1`, task.ProjectID).Scan(&conversationID)
 	} else {
-		err = s.db.QueryRowContext(ctx, `select id from conversations where id=? and project_id=? and is_current=true`, conversationID, task.ProjectID).Scan(&conversationID)
+		// Orchestrated dispatch targets a dedicated background conversation;
+		// regular dispatch likewise validates its explicit target by ownership.
+		err = s.db.QueryRowContext(ctx, `select id from conversations where id=? and project_id=? and status in ('idle','running')`, conversationID, task.ProjectID).Scan(&conversationID)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		return taskDispatchResult{}, http.StatusConflict, errors.New("conversation is no longer current")
+		return taskDispatchResult{}, http.StatusConflict, errors.New("conversation is unavailable for task dispatch")
 	}
 	if err != nil {
 		return taskDispatchResult{}, http.StatusInternalServerError, err

@@ -204,6 +204,28 @@
   font-size: 12px;
   font-weight: 700;
 }
+.insights-agent-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.insights-agent-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 6px 12px;
+  color: #41665b;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insights-agent-options label:hover { border-color: #a6cbbb; background: #f0f8f3; }
+.insights-agent-options label.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-agent-options input { accent-color: #2c7567; cursor: pointer; }
 .insights-theme-chips {
   display: flex;
   flex-wrap: wrap;

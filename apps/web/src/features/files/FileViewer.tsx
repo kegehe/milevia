@@ -15,6 +15,7 @@ interface FileViewerProps {
   stat: FileInfo;
   previewKind: FilePreviewKind;
   projectId: string;
+	conversationId?: string;
   request: <T>(path: string, init?: RequestInit) => Promise<T>;
   onEdit: () => void;
   readOnly: boolean;
@@ -25,7 +26,7 @@ interface FileViewerProps {
   canDecreaseFont: boolean;
 }
 
-export function FileViewer({ content, stat, previewKind, projectId, request, onEdit, readOnly, fontSize, onIncreaseFont, onDecreaseFont, canIncreaseFont, canDecreaseFont }: FileViewerProps) {
+export function FileViewer({ content, stat, previewKind, projectId, conversationId, request, onEdit, readOnly, fontSize, onIncreaseFont, onDecreaseFont, canIncreaseFont, canDecreaseFont }: FileViewerProps) {
   const [imageErrorPath, setImageErrorPath] = useState<string | null>(null);
   const [sqliteInvalidPath, setSqliteInvalidPath] = useState<string | null>(null);
   const imageError = imageErrorPath === stat.path;
@@ -52,30 +53,30 @@ export function FileViewer({ content, stat, previewKind, projectId, request, onE
           {canEdit && readOnly && <span className="file-viewer-readonly-hint">只读</span>}
         </div>
       </div>
-      {activePreviewKind === "image" && <ImagePreview projectId={projectId} stat={stat} failed={imageError} onError={handleImageError} />}
-      {activePreviewKind === "sqlite" && <SqliteViewer projectId={projectId} path={stat.path} request={request} onNotDatabase={handleNotDatabase} />}
+      {activePreviewKind === "image" && <ImagePreview projectId={projectId} conversationId={conversationId} stat={stat} failed={imageError} onError={handleImageError} />}
+      {activePreviewKind === "sqlite" && <SqliteViewer projectId={projectId} conversationId={conversationId} path={stat.path} request={request} onNotDatabase={handleNotDatabase} />}
       {activePreviewKind === "json" && <JsonViewer content={content} stat={stat} fontSize={fontSize} />}
-      {activePreviewKind === "markdown" && <MarkdownPreview content={content} projectId={projectId} baseDir={getDirPath(stat.path)} fontSize={fontSize} />}
+      {activePreviewKind === "markdown" && <MarkdownPreview content={content} projectId={projectId} conversationId={conversationId} baseDir={getDirPath(stat.path)} fontSize={fontSize} />}
       {activePreviewKind === "source" && <CodeFileView content={content} filename={stat.name} fontSize={fontSize} />}
-      {activePreviewKind === "large" && <FileMessage projectId={projectId} stat={stat} message="文本文件超过 10MB，无法在页面中打开。" />}
-      {activePreviewKind === "binary" && <FileMessage projectId={projectId} stat={stat} message={sqliteInvalid ? "该文件不是有效的 SQLite 数据库，无法直接预览。" : "该文件是二进制文件，无法直接预览。"} />}
+      {activePreviewKind === "large" && <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} message="文本文件超过 10MB，无法在页面中打开。" />}
+      {activePreviewKind === "binary" && <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} message={sqliteInvalid ? "该文件不是有效的 SQLite 数据库，无法直接预览。" : "该文件是二进制文件，无法直接预览。"} />}
     </div>
   );
 }
 
-function ImagePreview({ projectId, stat, failed, onError }: { projectId: string; stat: FileInfo; failed: boolean; onError: () => void }) {
-  const url = `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(stat.path)}`;
-  if (failed) return <FileMessage projectId={projectId} stat={stat} message="图片加载失败。" />;
+function ImagePreview({ projectId, conversationId, stat, failed, onError }: { projectId: string; conversationId?: string; stat: FileInfo; failed: boolean; onError: () => void }) {
+  const url = `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(stat.path)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
+  if (failed) return <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} message="图片加载失败。" />;
   return <div className="image-preview"><ProjectImage url={url} alt={stat.name} onError={onError} /></div>;
 }
 
-function FileMessage({ projectId, stat, message }: { projectId: string; stat: FileInfo; message: string }) {
-  const url = `/api/projects/${projectId}/fs/download?path=${encodeURIComponent(stat.path)}`;
+function FileMessage({ projectId, conversationId, stat, message }: { projectId: string; conversationId?: string; stat: FileInfo; message: string }) {
+  const url = `/api/projects/${projectId}/fs/download?path=${encodeURIComponent(stat.path)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   return <div className="binary-info"><FileIcon iconKey="file" size={48} /><div className="binary-info-name">{stat.name}</div><div className="binary-info-details"><div>{message}</div><div>类型：{stat.mimeType || "未知"}</div><div>大小：{formatSize(stat.size)}</div><div>修改时间：{stat.modTime}</div></div><DownloadLink url={url} filename={stat.name} /></div>;
 }
 
-function MarkdownPreview({ content, projectId, baseDir, fontSize }: { content: string; projectId: string; baseDir: string; fontSize: number }) {
-  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ a: ({ href, children }) => <a href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>, img: ({ src, alt }) => <MarkdownImage src={markdownImageUrl(src ?? "", baseDir, projectId)} alt={alt ?? ""} /> }}>{content}</ReactMarkdown></div>;
+function MarkdownPreview({ content, projectId, conversationId, baseDir, fontSize }: { content: string; projectId: string; conversationId?: string; baseDir: string; fontSize: number }) {
+  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ a: ({ href, children }) => <a href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>, img: ({ src, alt }) => <MarkdownImage src={markdownImageUrl(src ?? "", baseDir, projectId, conversationId)} alt={alt ?? ""} /> }}>{content}</ReactMarkdown></div>;
 }
 
 function MarkdownImage({ src, alt }: { src: string; alt: string }) {
@@ -171,10 +172,10 @@ function safeHref(href: string | undefined): string | undefined {
 
 function isExternal(href: string | undefined): boolean { return Boolean(href && /^(https?|ftp):|^\/\//i.test(href)); }
 
-function markdownImageUrl(src: string, baseDir: string, projectId: string): string {
+function markdownImageUrl(src: string, baseDir: string, projectId: string, conversationId?: string): string {
   if (/^(https?:|data:|\/\/)/i.test(src)) return src;
   const path = src.split(/[?#]/, 1)[0];
   const parts = baseDir.split("/").filter(Boolean);
   for (const part of path.split("/")) { if (!part || part === ".") continue; if (part === "..") parts.pop(); else parts.push(part); }
-  return `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(parts.join("/"))}`;
+  return `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(parts.join("/"))}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
 }

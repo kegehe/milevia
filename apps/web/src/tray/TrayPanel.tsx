@@ -75,6 +75,9 @@ export function TrayPanel() {
           <strong>Mile</strong>
           <em>via</em>
         </span>
+        <button type="button" className="tray-panel-close" title="关闭面板" aria-label="关闭面板" onClick={() => actions().close()}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+        </button>
       </header>
 
       <nav className="tray-panel-items" aria-label="Milevia 快捷操作">

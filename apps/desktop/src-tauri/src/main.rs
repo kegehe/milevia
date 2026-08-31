@@ -35,6 +35,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DESKTOP_ORIGIN: &str = "https://tauri.localhost";
 const DEV_ORIGIN: &str = "http://127.0.0.1:1420";
 const SIDECAR_READY_PREFIX: &str = "MILEVIA_READY=";
+// 首次打开大型 SQLite 数据库时，控制服务可能需要较长时间完成迁移/恢复。
+const SIDECAR_READY_TIMEOUT_SECS: u64 = 60;
 
 struct RunningSidecar {
     child: Child,
@@ -224,11 +226,12 @@ fn wait_for_ready(
         }
     });
 
-    match receiver.recv_timeout(Duration::from_secs(12)) {
+    match receiver.recv_timeout(Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS)) {
         Ok(Ok(url)) => Ok(url),
         Ok(Err(error)) => Err(error.into()),
         Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "控制服务启动超时（12 秒内未就绪）。\n程序：{}\nstderr:\n{}",
+            "控制服务启动超时（{} 秒内未就绪）。\n程序：{}\nstderr:\n{}",
+            SIDECAR_READY_TIMEOUT_SECS,
             binary_path.display(),
             stderr_lines.lock().unwrap()
         )

@@ -383,6 +383,46 @@ func TestManagedProfileSnapshotsRevisionAndRevocationCancelsRun(t *testing.T) {
 	}
 }
 
+func TestRevokingProfileRevisionStopsIdleNativeSession(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "claude-test-model")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,claude_initialized,agent_initialized,is_current,created_at) values ('conversation','project','session','claude-code','session',?,?,'approval_required','idle','approval_required',0,0,1,?)`, server.localRunnerID(), profile.CurrentRevisionID, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	session := newIdleAgentSession()
+	managed := &activeAgentSession{agent: session, runnerID: server.localRunnerID(), lastUsedAt: now}
+	server.mu.Lock()
+	server.sessions["conversation"] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession("conversation", managed)
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/agent-profile-revisions/"+profile.CurrentRevisionID+"/revoke", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("revoke status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		StoppingRunCount     int `json:"stoppingRunCount"`
+		StoppingSessionCount int `json:"stoppingSessionCount"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode revoke response: %v", err)
+	}
+	if result.StoppingRunCount != 0 || result.StoppingSessionCount != 1 {
+		t.Fatalf("unexpected revoke counts: %#v", result)
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("revocation did not stop the idle native session")
+	}
+	waitForManagedSessionRemoval(t, server, "conversation")
+}
+
 func TestManagedCLIEnvironmentRemovesInheritedCredentials(t *testing.T) {
 	profile := &AgentRuntimeProfile{RevisionID: "revision", AgentID: "codex", AuthMode: "cli_managed"}
 	env := managedCLIEnvironment(profile, []string{"PATH=/bin", "ANTHROPIC_API_KEY=secret", "openai_base_url=https://example.test", "SAFE=value"}, "AUTO_CONTROL_URL=http://127.0.0.1")

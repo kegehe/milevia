@@ -490,7 +490,8 @@ func (s *Server) notifyOrchestrationResumed(_ context.Context, projectID, taskID
 }
 
 // taskNotificationTarget 让任务相关通知回到发起该任务的会话。
-// 未关联执行记录时，回到项目的当前对话入口。
+// 未关联执行记录时，回到项目最近活动的会话入口。这只是通知回退，不能
+// 作为任何交互任务的隐式目标。
 func (s *Server) taskNotificationTarget(ctx context.Context, projectID, taskID string) (string, string) {
 	conversationID := ""
 	taskRun, err := s.latestTaskRun(ctx, taskID)
@@ -500,8 +501,8 @@ func (s *Server) taskNotificationTarget(ctx context.Context, projectID, taskID s
 		log.Printf("taskNotificationTarget: load task run for %s: %v", taskID, err)
 	}
 	if conversationID == "" {
-		if err := s.db.QueryRowContext(ctx, `select id from conversations where project_id=? and is_current=true`, projectID).Scan(&conversationID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			log.Printf("taskNotificationTarget: load current conversation for %s: %v", projectID, err)
+		if err := s.db.QueryRowContext(ctx, `select id from conversations where project_id=? order by last_activity_at desc,id desc limit 1`, projectID).Scan(&conversationID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("taskNotificationTarget: load recent conversation for %s: %v", projectID, err)
 		}
 	}
 	baseURL := "/projects/" + projectID + "/conversations"

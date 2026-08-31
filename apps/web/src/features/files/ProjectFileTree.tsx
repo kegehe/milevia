@@ -41,6 +41,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
 
 interface ProjectFileTreeProps {
   projectId: string;
+  conversationId?: string;
   request: <T>(path: string, init?: RequestInit) => Promise<T>;
   onFileSelect: (path: string, name: string) => void;
   onCreateFile: (dirPath: string) => void;
@@ -238,6 +239,7 @@ class FileTreeProvider {
 
 export function ProjectFileTree({
   projectId,
+  conversationId,
   request,
   onFileSelect,
   onCreateFile,
@@ -270,12 +272,13 @@ export function ProjectFileTree({
     async (path: string): Promise<FileEntry[]> => {
       const params = new URLSearchParams();
       if (path) params.set("path", path);
+		if (conversationId) params.set("conversationId", conversationId);
       const res = await request<TreeResponse>(
         `/api/projects/${projectId}/fs/tree?${params.toString()}`
       );
       return res.entries || [];
     },
-    [projectId, request]
+    [projectId, request, conversationId]
   );
 
   const provider = useMemo(
@@ -331,6 +334,7 @@ export function ProjectFileTree({
     if (!query) return;
     try {
       const params = new URLSearchParams({ query });
+		if (conversationId) params.set("conversationId", conversationId);
       const res = await request<SearchResponse>(
         `/api/projects/${projectId}/fs/search?${params.toString()}`
       );
@@ -343,7 +347,7 @@ export function ProjectFileTree({
     } catch (err) {
       showError(err instanceof Error ? err.message : "搜索失败");
     }
-  }, [searchQuery, projectId, request, onFileSelect, showError]);
+  }, [searchQuery, projectId, request, onFileSelect, showError, conversationId]);
 
   // 刷新
   const handleRefresh = useCallback(() => {

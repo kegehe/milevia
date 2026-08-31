@@ -60,16 +60,39 @@ test("persisted conversation history loads without waiting for the realtime sock
   assert.match(conversationPage, /let hasOpenedSocket = false;/);
   assert.match(conversationPage, /const reconnecting = hasOpenedSocket;\s*hasOpenedSocket = true;\s*if \(reconnecting\) \{\s*void reload\(\);\s*return;\s*}/s);
   assert.match(conversationPage, /const abort = new AbortController\(\);/);
-  assert.match(conversationPage, /const conversationActivationTail = useRef<Promise<void>>\(Promise\.resolve\(\)\);/);
-  assert.match(conversationPage, /const previous = conversationActivationTail\.current;\s*conversationActivationTail\.current = new Promise<void>\(\(resolve\) => \{ release = resolve; \}\);\s*await previous\.catch\(\(\) => undefined\);/s);
   assert.match(conversationPage, /`\/api\/conversations\/\$\{urlConversationId\}\?limit=1`, \{ signal: abort\.signal \}/);
-  assert.match(conversationPage, /if \(!isCurrentRoute\(\)\) return;[\s\S]*?const activated = await activateCurrentRoute\(\);/);
+  assert.match(conversationPage, /if \(!isCurrentRoute\(\)\) return;[\s\S]*?rememberConversationTab\(detail\.conversation\.id\)/);
+  assert.doesNotMatch(conversationPage, /\/api\/conversations\/\$\{urlConversationId\}\/activate/);
   assert.match(conversationPage, /return \(\) => \{ cancelled = true; abort\.abort\(\); \};/);
-  assert.match(conversationPage, /if \(detail\.conversation\.projectId !== projectId\) throw new Error\("指定会话不属于当前项目"\);/);
-  assert.match(conversationPage, /if \(conversationRef\.current\?\.id === activated\.id\) \{\s*setConversation\(activated\);\s*\} else \{\s*resetConversationView\(activated\);\s*\}/s);
+  assert.match(conversationPage, /if \(detail\.conversation\.projectId !== projectId\) \{\s*removeUnavailableConversationTabs\(\[urlConversationId\]\);\s*return;/s);
+  assert.match(conversationPage, /if \(conversationRef\.current\?\.id === detail\.conversation\.id\) setConversation\(detail\.conversation\);\s*else resetConversationView\(detail\.conversation\);/s);
+  assert.match(conversationPage, /const removeUnavailableConversationTabs = useCallback\(\(conversationIDs: string\[\]\) => \{/);
+  assert.match(conversationPage, /removeUnavailableConversationTabs\(data\.missingConversationIds \|\| \[\]\);/);
+  assert.match(conversationPage, /cause as \{ status\?: unknown \}\)\.status === 404\) \{\s*removeUnavailableConversationTabs\(\[urlConversationId\]\);/s);
   assert.match(conversationPage, /const params = new URLSearchParams\(\{ limit: "100" \}\);\s*if \(query\.trim\(\)\) params\.set\("q", query\.trim\(\)\);\s*if \(cursor\) params\.set\("cursor", cursor\);/s);
   assert.match(conversationPage, /const page = await projectApi<ConversationHistoryPage>/);
   assert.match(conversationPage, /setConversationHistoryCursor\(page\.nextCursor\);/);
+});
+
+test("background conversation polling preserves search results and advances activity cursors", () => {
+  assert.match(conversationPage, /after: state\.latestPositions\[conversationId\] \|\| state\.readPositions\[conversationId\]/);
+  assert.match(conversationPage, /if \(!historyQuery\.trim\(\)\) void requestConversationHistory\(""\)\.catch\(\(\) => undefined\);/);
+  assert.match(conversationPage, /\[conversationTabs\.openConversationIds\.length, historyQuery, projectId, requestConversationHistory, syncConversationActivity\]/);
+});
+
+test("invalid conversation routes always navigate away from an unavailable URL", () => {
+  assert.match(conversationPage, /const previous = conversationTabsRef\.current;\s*let next = previous;/s);
+  assert.match(conversationPage, /if \(next !== previous\) \{[\s\S]*?setConversationTabs\(next\);\s*\}/s);
+  assert.match(conversationPage, /if \(urlConversationId && unavailable\.has\(urlConversationId\)\) \{[\s\S]*?navigate\(next\.activeConversationId/s);
+});
+
+test("conversation tabs use roving keyboard navigation and name their panel", () => {
+  assert.match(conversationPage, /const navigateConversationTabs = \(event: React\.KeyboardEvent<HTMLElement>\) => \{/);
+  assert.match(conversationPage, /\["ArrowLeft", "ArrowRight", "Home", "End"\]/);
+  assert.match(conversationPage, /data-conversation-id=\{id\}[\s\S]*?role="tab" tabIndex=\{active \? 0 : -1\} aria-controls="conversation-panel"/);
+  assert.match(conversationPage, /className="conversation-tab-list" role="tablist" onKeyDown=\{navigateConversationTabs\}/);
+  assert.match(conversationPage, /className="chat-center" id="conversation-panel" role="tabpanel" aria-labelledby=/);
+  assert.match(stylesheet, /\.conversation-tab > button:first-child:focus-visible \{[^}]*outline: 2px solid #2b7b68;/s);
 });
 
 test("all composer text sources are cached and conversation switches use the target draft", () => {
@@ -135,14 +158,14 @@ test("conversation entries keep card styles separate from their layout and align
   assert.match(stylesheet, /\.scroll-btn-icon\s*\{[^}]*stroke:\s*currentColor;/s);
   assert.match(conversationPage, /<ScrollNavigationIcon direction="top"\s*\/>/);
   assert.match(conversationPage, /<ScrollNavigationIcon direction="bottom"\s*\/>/);
-  assert.match(stylesheet, /@media \(min-width: 821px\) and \(max-width: 1199px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*right:\s*56px;/s);
+  assert.match(stylesheet, /@media \(min-width: 821px\) and \(max-width: 1199px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*right:\s*16px;/s);
   assert.match(conversationContentStyles, /\.chat-center > \.timeline\s*\{[^}]*padding:\s*28px\s+24px\s+24px;/s);
   assert.match(conversationContentStyles, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+16px\s+max\(32px,\s*var\(--composer-height,\s*0px\)\)\s+16px;/s);
 });
 
 test("desktop canvas uses three working columns without a page inset", () => {
   assert.match(workspaceStyles, /\.conversation-canvas\s*\{[^}]*width:\s*100%;[^}]*grid-template-columns:\s*minmax\(260px,\s*300px\)\s+minmax\(440px,\s*1fr\)\s+minmax\(280px,\s*340px\);[^}]*margin:\s*0;/s);
-  assert.match(conversationPage, /<aside className="quick-tag-rail"[\s\S]*?<section className="chat-center">[\s\S]*?<aside className="task-queue-rail"/);
+  assert.match(conversationPage, /<aside className="quick-tag-rail"[\s\S]*?<section className="chat-center"[^>]*>\s*<ConversationTabStrip[\s\S]*?<section className="timeline"[\s\S]*?<aside className="task-queue-rail"/);
 });
 
 test("stop and clear retries with force and reports a force-stop failure", () => {
@@ -181,10 +204,11 @@ test("desktop conversation is a full-height three-column workspace", () => {
   assert.match(workspaceStyles, /\.quick-tag-rail\s*\{[^}]*align-self:\s*stretch;[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s);
   assert.match(workspaceStyles, /\.task-queue-rail\s*\{[^}]*display:\s*flex;[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*border-left:/s);
   assert.match(workspaceStyles, /\.task-queue-rail \.task-queue-list\s*\{[^}]*min-height:\s*0;[^}]*flex:\s*1;[^}]*overflow-y:\s*auto;/s);
-  assert.match(workspaceStyles, /\.chat-center\s*\{[^}]*display:\s*grid;[^}]*min-height:\s*0;[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+auto;/s);
+  assert.match(workspaceStyles, /\.chat-center\s*\{[^}]*display:\s*grid;[^}]*min-height:\s*0;[^}]*grid-template-rows:\s*auto\s+minmax\(0,\s*1fr\)\s+auto;/s);
+  assert.match(workspaceStyles, /\.chat-center\s*>\s*\.conversation-tab-strip\s*\{[^}]*min-width:\s*0;/s);
   assert.match(workspaceStyles, /\.chat-center > \.timeline\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s);
   assert.match(workspaceStyles, /\.chat-center > \.composer\s*\{[^}]*position:\s*static;/s);
-  assert.match(workspaceStyles, /@media \(min-width: 821px\) and \(max-width: 1199px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*position:\s*absolute;[^}]*top:\s*16px;[^}]*right:\s*56px;/s);
+  assert.match(workspaceStyles, /@media \(min-width: 821px\) and \(max-width: 1199px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*position:\s*absolute;[^}]*top:\s*56px;[^}]*right:\s*16px;/s);
   assert.match(workspaceStyles, /@media \(max-width: 820px\)[\s\S]*?\.conversation-canvas\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);[^}]*grid-template-rows:\s*auto\s+auto\s+minmax\(0,\s*1fr\);/s);
   assert.match(workspaceStyles, /@media \(max-width: 820px\)[\s\S]*?\.task-queue-rail\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/s);
 });
@@ -371,6 +395,10 @@ test("creating a conversation keeps the newly navigated route", () => {
   // The target route omits ?new, so a second search-param navigation here
   // would resolve against the old conversation route and undo this redirect.
   assert.doesNotMatch(newConversation[0], /navigate\(`\/projects\/\$\{projectId\}\/conversations\/\$\{next\.id\}`, \{ replace: true \}\);[\s\S]*closeNewConversation\(\);/);
+});
+
+test("new conversations start in the safe permission baseline for either CLI", () => {
+  assert.match(conversationPage, /const permissionForAgent = \(agent: AgentID\): PermissionMode => agent === "codex" \? "workspace_write" : "approval_required";/);
 });
 
 test("wide and narrow screens sort prompts and commands in separate vertical lists", () => {

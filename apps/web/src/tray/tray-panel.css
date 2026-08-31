@@ -61,6 +61,10 @@ html.tray-window body { padding: 0; }
 }
 .tray-panel-brand-name strong { font: inherit; }
 .tray-panel-brand-name em { color: #75982e; font: inherit; font-style: normal; }
+.tray-panel-close { display: grid; width: 26px; height: 26px; flex: none; place-items: center; margin-left: auto; border: 0; border-radius: 5px; padding: 0; color: #789087; background: transparent; cursor: pointer; }
+.tray-panel-close:hover { color: #8c3c2c; background: #fff0eb; }
+.tray-panel-close:focus-visible { outline: 2px solid #2b7b68; outline-offset: -2px; }
+.tray-panel-close svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-width: 2; }
 .tray-panel-brand-name::after {
   position: absolute;
   bottom: 0;

@@ -317,6 +317,40 @@ func (runner *returnedStreamingRunner) StartSession(context.Context, AgentSessio
 	return runner.session, nil
 }
 
+type recordingStreamingRunner struct {
+	mu       sync.Mutex
+	sessions []AgentSession
+	requests []AgentSessionRequest
+}
+
+func (*recordingStreamingRunner) Ready(context.Context) bool     { return true }
+func (*recordingStreamingRunner) Version(context.Context) string { return "2.1.216" }
+func (*recordingStreamingRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (*recordingStreamingRunner) Update(context.Context) (string, string, error) {
+	return "2.1.216", "2.1.217", nil
+}
+func (*recordingStreamingRunner) Run(context.Context, AgentRunRequest, AgentRunSink) error {
+	return errors.New("one-shot run is not expected")
+}
+func (runner *recordingStreamingRunner) StartSession(_ context.Context, request AgentSessionRequest) (AgentSession, error) {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	runner.requests = append(runner.requests, request)
+	if len(runner.sessions) == 0 {
+		return nil, errors.New("no session configured")
+	}
+	session := runner.sessions[0]
+	runner.sessions = runner.sessions[1:]
+	return session, nil
+}
+func (runner *recordingStreamingRunner) starts() []AgentSessionRequest {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return append([]AgentSessionRequest(nil), runner.requests...)
+}
+
 type errBlockingContext struct {
 	context.Context
 	blockCall int
@@ -379,6 +413,21 @@ func (session *idleAgentSession) Stop() {
 	session.once.Do(func() { close(session.done) })
 }
 func (session *idleAgentSession) Done() <-chan error { return session.done }
+
+func waitForManagedSessionRemoval(t *testing.T, server *Server, conversationID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		server.mu.Lock()
+		_, exists := server.sessions[conversationID]
+		server.mu.Unlock()
+		if !exists {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("session %s was not removed after it exited", conversationID)
+}
 
 type recordingSink struct {
 	mu          sync.Mutex
@@ -586,6 +635,225 @@ func TestCreateCodexConversationPersistsAgentAndPolicy(t *testing.T) {
 	}
 	if conversation.AgentID != "codex" || conversation.PermissionMode != "workspace_write" || conversation.ExecutionPolicy != "workspace_write" || conversation.AgentRuntimeID != "wsl-local" || conversation.AgentSessionID == "" {
 		t.Fatalf("conversation=%#v", conversation)
+	}
+	var workspace ConversationWorkspace
+	if err := server.db.QueryRow(`select w.id,w.conversation_id,w.generation,w.mode,w.path,w.branch,w.base_revision,w.state,w.created_at,w.archived_at from conversation_workspaces w join conversations c on c.active_workspace_id=w.id where c.id=?`, conversation.ID).Scan(&workspace.ID, &workspace.ConversationID, &workspace.Generation, &workspace.Mode, &workspace.Path, &workspace.Branch, &workspace.BaseRevision, &workspace.State, &workspace.CreatedAt, &workspace.ArchivedAt); err != nil {
+		t.Fatalf("read conversation workspace: %v", err)
+	}
+	if workspace.ID != "project-shared:"+conversation.ID || workspace.ConversationID != conversation.ID || workspace.Generation != 1 || workspace.Mode != "project_shared" || workspace.State != "ready" {
+		t.Fatalf("workspace=%#v", workspace)
+	}
+
+	// A new conversation created while this workspace is selected keeps the
+	// same physical workspace path, while receiving its own reference row.
+	request = httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations?new=true", strings.NewReader(fmt.Sprintf(`{"agentId":"codex","permissionMode":"workspace_write","workspaceId":%q}`, workspace.ID)))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create conversation on selected workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	var next Conversation
+	if err := json.NewDecoder(response.Body).Decode(&next); err != nil {
+		t.Fatalf("decode selected-workspace conversation: %v", err)
+	}
+	var nextWorkspace ConversationWorkspace
+	if err := server.db.QueryRow(`select w.id,w.conversation_id,w.generation,w.mode,w.path,w.branch,w.base_revision,w.state,w.created_at,w.archived_at from conversation_workspaces w join conversations c on c.active_workspace_id=w.id where c.id=?`, next.ID).Scan(&nextWorkspace.ID, &nextWorkspace.ConversationID, &nextWorkspace.Generation, &nextWorkspace.Mode, &nextWorkspace.Path, &nextWorkspace.Branch, &nextWorkspace.BaseRevision, &nextWorkspace.State, &nextWorkspace.CreatedAt, &nextWorkspace.ArchivedAt); err != nil {
+		t.Fatalf("read selected-workspace reference: %v", err)
+	}
+	if nextWorkspace.ID == workspace.ID || nextWorkspace.Path != workspace.Path || nextWorkspace.Mode != workspace.Mode || nextWorkspace.State != "ready" {
+		t.Fatalf("selected workspace was not inherited: source=%#v next=%#v", workspace, nextWorkspace)
+	}
+}
+
+func TestConversationIsolatedWorkspaceLifecycle(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main", repo}, {"-C", repo, "config", "user.email", "test@example.com"}, {"-C", repo, "config", "user.name", "Milevia Test"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("workspace test\n"), 0600); err != nil {
+		t.Fatalf("write repository file: %v", err)
+	}
+	if output, err := exec.Command("git", "-C", repo, "add", "README.md").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, output)
+	}
+	if output, err := exec.Command("git", "-C", repo, "commit", "-m", "initial").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v (%s)", err, output)
+	}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('workspace-project','workspace-project',?,'wsl-local','main',1,?)`, repo, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,is_current,created_at) values ('workspace-conversation','workspace-project','workspace-session','idle','approval_required',1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversation_workspaces (id,conversation_id,generation,mode,path,branch,state,created_at) values ('project-shared:workspace-conversation','workspace-conversation',1,'project_shared',?,'main','ready',?)`, repo, now); err != nil {
+		t.Fatalf("insert shared workspace: %v", err)
+	}
+	if _, err := server.db.Exec(`update conversations set active_workspace_id='project-shared:workspace-conversation' where id='workspace-conversation'`); err != nil {
+		t.Fatalf("bind shared workspace: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/workspace-conversation/workspaces", nil))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create isolated workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	var workspace ConversationWorkspace
+	if err := json.NewDecoder(response.Body).Decode(&workspace); err != nil {
+		t.Fatalf("decode isolated workspace: %v", err)
+	}
+	expectedPath := conversationWorktreePath(repo, "workspace-project", "workspace-conversation", 2)
+	if workspace.Mode != "isolated_worktree" || workspace.State != "ready" || workspace.Path != expectedPath || workspace.Branch != conversationWorktreeBranch("workspace-conversation", 2) || workspace.BaseRevision == "" {
+		t.Fatalf("workspace=%#v expectedPath=%q", workspace, expectedPath)
+	}
+	if _, err := os.Stat(filepath.Join(workspace.Path, "README.md")); err != nil {
+		t.Fatalf("isolated worktree missing committed file: %v", err)
+	}
+	if !isExpectedConversationWorktree(repo, "workspace-project", "workspace-conversation", 2, workspace.Path) {
+		t.Fatal("workspace path escaped the controlled root")
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/workspace-conversation/workspaces/"+workspace.ID+"/activate", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("activate isolated workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	var activeID string
+	if err := server.db.QueryRow(`select active_workspace_id from conversations where id='workspace-conversation'`).Scan(&activeID); err != nil {
+		t.Fatalf("read active workspace: %v", err)
+	}
+	if activeID != workspace.ID {
+		t.Fatalf("active workspace=%q want %q", activeID, workspace.ID)
+	}
+
+	// An active isolated workspace cannot be archived.
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/conversations/workspace-conversation/workspaces/"+workspace.ID, nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("archive active workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	// Create and activate a newer workspace, leaving the first one idle and
+	// eligible for archival. Its historical run snapshot must survive.
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/workspace-conversation/workspaces", nil))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create second isolated workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	var second ConversationWorkspace
+	if err := json.NewDecoder(response.Body).Decode(&second); err != nil {
+		t.Fatalf("decode second isolated workspace: %v", err)
+	}
+	if second.Generation != 3 {
+		t.Fatalf("second workspace generation=%d want 3", second.Generation)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,workspace_id,workspace_path,status,created_at,completed_at) values ('historical-workspace-run','workspace-conversation',?,?, 'completed',?,?)`, workspace.ID, workspace.Path, now, now); err != nil {
+		t.Fatalf("insert historical run: %v", err)
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/workspace-conversation/workspaces/"+second.ID+"/activate", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("activate second workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	if err := os.WriteFile(filepath.Join(workspace.Path, "README.md"), []byte("dirty workspace\n"), 0644); err != nil {
+		t.Fatalf("dirty isolated workspace: %v", err)
+	}
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/conversations/workspace-conversation/workspaces/"+workspace.ID, nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("archive dirty workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	if output, err := exec.Command("git", "-C", workspace.Path, "restore", "--", "README.md").CombinedOutput(); err != nil {
+		t.Fatalf("restore isolated workspace: %v (%s)", err, output)
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/conversations/workspace-conversation/workspaces/"+workspace.ID, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("archive isolated workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(workspace.Path); !os.IsNotExist(err) {
+		t.Fatalf("archived worktree still exists, stat err=%v", err)
+	}
+	listOutput, err := exec.Command("git", "-C", repo, "worktree", "list", "--porcelain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list worktrees: %v (%s)", err, listOutput)
+	}
+	if strings.Contains(string(listOutput), workspace.Path) {
+		t.Fatalf("archived worktree remains in git worktree list: %s", listOutput)
+	}
+	branchOutput, err := exec.Command("git", "-C", repo, "branch", "--list", workspace.Branch).CombinedOutput()
+	if err != nil {
+		t.Fatalf("list branches: %v (%s)", err, branchOutput)
+	}
+	if strings.TrimSpace(string(branchOutput)) != "" {
+		t.Fatalf("archived worktree branch remains: %s", branchOutput)
+	}
+	var archivedState string
+	if err := server.db.QueryRow(`select state from conversation_workspaces where id=?`, workspace.ID).Scan(&archivedState); err != nil {
+		t.Fatalf("read archived state: %v", err)
+	}
+	if archivedState != "archived" {
+		t.Fatalf("archived state=%q", archivedState)
+	}
+	var historicalCount int
+	if err := server.db.QueryRow(`select count(*) from runs where id='historical-workspace-run' and workspace_id=?`, workspace.ID).Scan(&historicalCount); err != nil {
+		t.Fatalf("read historical run: %v", err)
+	}
+	if historicalCount != 1 {
+		t.Fatal("historical run snapshot was deleted while archiving workspace")
+	}
+
+	// Switching back to the shared workspace makes the second worktree
+	// removable. Simulate a previous attempt that removed only its directory;
+	// the retry must clear the remaining Git metadata and branch.
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/workspace-conversation/workspaces/project-shared:workspace-conversation/activate", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("activate shared workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := os.RemoveAll(second.Path); err != nil {
+		t.Fatalf("remove second worktree directory: %v", err)
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/conversations/workspace-conversation/workspaces/"+second.ID, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("retry archive second workspace status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(repo), ".milevia-workspaces")); !os.IsNotExist(err) {
+		t.Fatalf("empty conversation worktree parents remain, stat err=%v", err)
+	}
+
+	// Project deletion must clean physical worktrees before cascading the
+	// conversation/workspace records.
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/workspace-conversation/workspaces", nil))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create workspace before project deletion status=%d body=%s", response.Code, response.Body.String())
+	}
+	var deletionWorkspace ConversationWorkspace
+	if err := json.NewDecoder(response.Body).Decode(&deletionWorkspace); err != nil {
+		t.Fatalf("decode workspace before project deletion: %v", err)
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/workspace-project", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete project with worktree status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(deletionWorkspace.Path); !os.IsNotExist(err) {
+		t.Fatalf("project deletion left worktree behind, stat err=%v", err)
+	}
+	branchOutput, err = exec.Command("git", "-C", repo, "branch", "--list", deletionWorkspace.Branch).CombinedOutput()
+	if err != nil {
+		t.Fatalf("list deleted project branch: %v (%s)", err, branchOutput)
+	}
+	if strings.TrimSpace(string(branchOutput)) != "" {
+		t.Fatalf("project deletion left worktree branch behind: %s", branchOutput)
 	}
 }
 
@@ -1412,6 +1680,13 @@ func TestSendMessagePersistsUsageFromRunnerLifecycle(t *testing.T) {
 	if usage.Session.TaskCount != 1 || usage.Session.AgentTurns != 1 || usage.Context.ContextInputTokens != 1200 || usage.Context.ContextWindow != 200000 || usage.Context.ToolCalls != 1 || !usage.Context.HasResult {
 		t.Fatalf("unexpected lifecycle usage: %#v session=%#v", usage.Context, usage.Session)
 	}
+	var workspacePath string
+	if err := server.db.QueryRow(`select workspace_path from runs where conversation_id='conversation'`).Scan(&workspacePath); err != nil {
+		t.Fatalf("read run workspace snapshot: %v", err)
+	}
+	if workspacePath != projectPath {
+		t.Fatalf("run workspace path=%q want %q", workspacePath, projectPath)
+	}
 }
 
 func TestShortcutPreviewAndRunReuseConversationLifecycle(t *testing.T) {
@@ -2076,14 +2351,14 @@ func TestConversationPermissionModeLifecycle(t *testing.T) {
 	request = httptest.NewRequest(http.MethodPost, "/api/conversations/historic/permission-mode", bytes.NewBufferString(`{"permissionMode":"full_control"}`))
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusConflict {
+	if response.Code != http.StatusOK {
 		t.Fatalf("historic switch status: %d body=%s", response.Code, response.Body.String())
 	}
 	var historicMode string
 	if err := server.db.QueryRow(`select permission_mode from conversations where id='historic'`).Scan(&historicMode); err != nil {
 		t.Fatalf("read historic permission mode: %v", err)
 	}
-	if historicMode != "approval_required" {
+	if historicMode != "full_control" {
 		t.Fatalf("historic permission mode changed: %q", historicMode)
 	}
 	if _, err := server.db.Exec(`update conversations set status='running' where id=?`, conversation.ID); err != nil {
@@ -2164,8 +2439,45 @@ func TestConversationHistoryListsSummariesAndActivatesPriorSession(t *testing.T)
 	}
 	response = httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/older/activate", nil))
-	if response.Code != http.StatusConflict {
+	if response.Code != http.StatusOK {
 		t.Fatalf("activate while active conversation is running status: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestNewConversationDoesNotRequireStoppingAnotherConversation(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,is_current,created_at) values ('running','project','running-session','claude-code','running-session','wsl-local','approval_required','running','approval_required',1,?)`, now); err != nil {
+		t.Fatalf("insert running conversation: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations?new=true", bytes.NewBufferString(`{"agentId":"claude-code","permissionMode":"approval_required"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create alongside running conversation status: %d body=%s", response.Code, response.Body.String())
+	}
+	var created Conversation
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created conversation: %v", err)
+	}
+	if created.ID == "running" || !created.IsCurrent {
+		t.Fatalf("unexpected created conversation: %#v", created)
+	}
+	var oldStatus string
+	if err := server.db.QueryRow(`select status from conversations where id='running'`).Scan(&oldStatus); err != nil {
+		t.Fatalf("read running conversation: %v", err)
+	}
+	if oldStatus != "running" {
+		t.Fatalf("new conversation altered background run status: %q", oldStatus)
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/running/activate", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("open running conversation status: %d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -2250,7 +2562,7 @@ func TestActivatedConversationResumesItsClaudeSession(t *testing.T) {
 	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
-	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values ('old','project','00000000-0000-4000-8000-000000000001','idle','approval_required','旧会话',?,1,0,?)`, now, now); err != nil {
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values ('old','project','00000000-0000-4000-8000-000000000001','archived','approval_required','旧会话',?,1,0,?)`, now, now); err != nil {
 		t.Fatalf("insert old conversation: %v", err)
 	}
 	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values ('current','project','00000000-0000-4000-8000-000000000002','idle','approval_required','当前会话',?,1,1,?)`, now, now); err != nil {
@@ -2505,6 +2817,66 @@ func TestConversationPageReturnsLatestWindowAndCursor(t *testing.T) {
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?cursor=not-a-valid-cursor", nil))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("invalid cursor status: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestConversationActivityReturnsProjectScopedIncrementalEvents(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC().Add(-time.Minute)
+	for _, projectID := range []string{"project", "other-project"} {
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,'wsl-local','main',1,?)`, projectID, projectID, t.TempDir(), now); err != nil {
+			t.Fatalf("insert project %s: %v", projectID, err)
+		}
+	}
+	for _, conversationID := range []string{"conversation-a", "conversation-b", "other-conversation"} {
+		projectID := "project"
+		if conversationID == "other-conversation" {
+			projectID = "other-project"
+		}
+		if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values (?,?,?,'idle',0,0,?)`, conversationID, projectID, "session-"+conversationID, now); err != nil {
+			t.Fatalf("insert conversation %s: %v", conversationID, err)
+		}
+		if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values (?,?,'completed',?)`, "run-"+conversationID, conversationID, now); err != nil {
+			t.Fatalf("insert run %s: %v", conversationID, err)
+		}
+	}
+	for _, eventID := range []string{"event-a", "event-b", "event-c"} {
+		if _, err := server.db.Exec(`insert into events (id,conversation_id,run_id,type,payload,created_at) values (?,?,'run-conversation-a','assistant.message','{}',?)`, eventID, "conversation-a", now); err != nil {
+			t.Fatalf("insert event %s: %v", eventID, err)
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations/activity", jsonBody(t, map[string]any{"cursors": []any{
+		map[string]any{"conversationId": "conversation-a", "after": map[string]any{"createdAt": now, "id": "event-a"}},
+		map[string]any{"conversationId": "conversation-b"},
+		map[string]any{"conversationId": "deleted-conversation"},
+	}}))
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("activity status: %d body=%s", response.Code, response.Body.String())
+	}
+	var result conversationActivityResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode activity response: %v", err)
+	}
+	if len(result.Conversations) != 2 || len(result.MissingConversationIDs) != 1 || result.MissingConversationIDs[0] != "deleted-conversation" || len(result.Conversations[0].Events) != 2 || result.Conversations[0].Events[0].ID != "event-b" || result.Conversations[0].LatestPosition == nil || result.Conversations[0].LatestPosition.ID != "event-c" || len(result.Conversations[1].Events) != 0 {
+		t.Fatalf("unexpected activity response: %#v", result)
+	}
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations/activity", jsonBody(t, map[string]any{"cursors": []any{map[string]any{"conversationId": "other-conversation"}}})))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("cross-project activity status: %d body=%s", response.Code, response.Body.String())
+	}
+
+	tooMany := make([]map[string]string, maxConversationActivityCursors+1)
+	for index := range tooMany {
+		tooMany[index] = map[string]string{"conversationId": fmt.Sprintf("conversation-%d", index)}
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations/activity", jsonBody(t, map[string]any{"cursors": tooMany})))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("too many cursors status: %d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -6794,6 +7166,27 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 	if code := httpErrorCode(errors.New("cannot stop a run while this conversation has other queued or running runs")); code != "active_runs_present" {
 		t.Fatalf("stop conflict code = %q", code)
 	}
+	workspaceOccupied := &projectWorkspaceOccupiedError{owner: "git:fetch"}
+	if code := httpErrorCode(workspaceOccupied); code != "workspace_occupied" {
+		t.Fatalf("workspace conflict code = %q", code)
+	}
+	details := httpErrorDetails(workspaceOccupied)
+	if details["ownerKind"] != "git_operation" || details["ownerSummary"] != "Git 操作正在使用项目工作区" {
+		t.Fatalf("workspace conflict details = %#v", details)
+	}
+	response := httptest.NewRecorder()
+	writeError(response, http.StatusConflict, workspaceOccupied)
+	var payload struct {
+		Error   string            `json:"error"`
+		Code    string            `json:"code"`
+		Details map[string]string `json:"details"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode workspace conflict response: %v", err)
+	}
+	if payload.Error != "项目工作区正被其他 AI 任务或 Git 操作占用，请等待当前操作完成后重试。" || payload.Code != "workspace_occupied" || !reflect.DeepEqual(payload.Details, details) {
+		t.Fatalf("workspace conflict response = %#v", payload)
+	}
 }
 
 func TestUpdateFailureSurfacesRealReason(t *testing.T) {
@@ -7422,6 +7815,125 @@ func TestRemoveUntrackedFromRootRejectsAnEscapingSymlink(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(outside, "remove.txt"))
 	if err != nil || string(content) != "outside\n" {
 		t.Fatalf("outside file changed: content=%q err=%v", content, err)
+	}
+}
+
+func TestListGitOperationsForWorkspaceSeparatesWorktrees(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	projectPath := t.TempDir()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('git-workspace-project','git-workspace-project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	shared := ConversationWorkspace{ID: "shared-workspace", Mode: "project_shared", Path: projectPath}
+	isolated := ConversationWorkspace{ID: "isolated-workspace", Mode: "isolated_worktree", Path: filepath.Join(t.TempDir(), "isolated")}
+	for _, operation := range []struct{ id, workspaceID, workspacePath string }{
+		{"shared-operation", shared.ID, shared.Path},
+		{"other-shared-operation", "project-shared:another-conversation", shared.Path},
+		{"isolated-operation", isolated.ID, isolated.Path},
+		{"legacy-root-operation", "", projectPath},
+	} {
+		if _, err := server.db.Exec(`insert into git_operations (id,project_id,workspace_id,workspace_path,type,status,request_summary,before_state,requested_at) values (?,'git-workspace-project',?,?, 'stage','succeeded','operation','{}',?)`, operation.id, operation.workspaceID, operation.workspacePath, now); err != nil {
+			t.Fatalf("insert %s: %v", operation.id, err)
+		}
+	}
+	isolatedOperations, err := server.listGitOperationsForWorkspace(context.Background(), "git-workspace-project", isolated, 10)
+	if err != nil {
+		t.Fatalf("list isolated operations: %v", err)
+	}
+	if len(isolatedOperations) != 1 || isolatedOperations[0].ID != "isolated-operation" || isolatedOperations[0].WorkspaceID != isolated.ID {
+		t.Fatalf("isolated operations=%#v", isolatedOperations)
+	}
+	sharedOperations, err := server.listGitOperationsForWorkspace(context.Background(), "git-workspace-project", shared, 10)
+	if err != nil {
+		t.Fatalf("list shared operations: %v", err)
+	}
+	sharedIDs := map[string]bool{}
+	for _, operation := range sharedOperations {
+		sharedIDs[operation.ID] = true
+	}
+	if len(sharedOperations) != 3 || !sharedIDs["legacy-root-operation"] || !sharedIDs["shared-operation"] || !sharedIDs["other-shared-operation"] {
+		t.Fatalf("shared operations=%#v", sharedOperations)
+	}
+}
+
+func TestMigrateRunWorkspaceColumnsUpgradesLegacySchema(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "legacy-runs.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`create table runs (id text primary key, conversation_id text not null, status text not null, created_at datetime not null)`); err != nil {
+		t.Fatalf("create legacy runs table: %v", err)
+	}
+	server := &Server{db: db}
+	if err := server.migrateRunWorkspaceColumns(context.Background()); err != nil {
+		t.Fatalf("migrate legacy runs table: %v", err)
+	}
+	var workspaceID string
+	if err := db.QueryRow(`select workspace_id from runs limit 1`).Scan(&workspaceID); err != sql.ErrNoRows {
+		t.Fatalf("read upgraded workspace_id column: %v", err)
+	}
+	var indexCount int
+	if err := db.QueryRow(`select count(*) from sqlite_master where type='index' and name='runs_workspace'`).Scan(&indexCount); err != nil {
+		t.Fatalf("read runs workspace index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("runs workspace index count=%d", indexCount)
+	}
+}
+
+func TestMigrateGitBackfillsLegacyOperationWorkspacePath(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	projectPath := t.TempDir()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('legacy-git-project','legacy-git-project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into git_operations (id,project_id,type,status,request_summary,before_state,requested_at) values ('legacy-git-operation','legacy-git-project','stage','succeeded','operation','{}',?)`, now); err != nil {
+		t.Fatalf("insert legacy operation: %v", err)
+	}
+	if err := server.migrateGit(context.Background()); err != nil {
+		t.Fatalf("migrate Git: %v", err)
+	}
+	var workspacePath string
+	if err := server.db.QueryRow(`select workspace_path from git_operations where id='legacy-git-operation'`).Scan(&workspacePath); err != nil {
+		t.Fatalf("read legacy operation: %v", err)
+	}
+	if !sameCleanPath(workspacePath, projectPath) {
+		t.Fatalf("legacy workspace path=%q want %q", workspacePath, projectPath)
+	}
+}
+
+func TestMigrateGitUpgradesLegacySchemaBeforeWorkspaceIndex(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "legacy-git.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`create table projects (id text primary key, path text not null);
+		create table git_operations (id text primary key, project_id text not null, type text not null, status text not null, request_summary text not null, before_state text not null default '{}', after_state text not null default '{}', error_code text not null default '', error_message text not null default '', requested_at datetime not null, started_at datetime, finished_at datetime);
+		insert into projects (id,path) values ('legacy-project','/tmp/legacy-project');
+		insert into git_operations (id,project_id,type,status,request_summary,before_state,requested_at) values ('legacy-operation','legacy-project','stage','succeeded','operation','{}',current_timestamp);`); err != nil {
+		t.Fatalf("create legacy Git schema: %v", err)
+	}
+	server := &Server{db: db}
+	if err := server.migrateGit(context.Background()); err != nil {
+		t.Fatalf("migrate legacy Git table: %v", err)
+	}
+	var workspacePath string
+	if err := db.QueryRow(`select workspace_path from git_operations where id='legacy-operation'`).Scan(&workspacePath); err != nil {
+		t.Fatalf("read upgraded Git operation: %v", err)
+	}
+	if workspacePath != "/tmp/legacy-project" {
+		t.Fatalf("workspace path=%q", workspacePath)
+	}
+	var indexCount int
+	if err := db.QueryRow(`select count(*) from sqlite_master where type='index' and name='git_operations_workspace_requested'`).Scan(&indexCount); err != nil {
+		t.Fatalf("read Git workspace index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("Git workspace index count=%d", indexCount)
 	}
 }
 
@@ -8478,6 +8990,237 @@ func TestRunConfigRejectsEscapingWorkDir(t *testing.T) {
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/projects/"+projectID+"/run/config", bytes.NewBufferString(`{"workDir":"../../outside","command":"npm run dev","envVars":{}}`)))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestConversationSessionManagerReapsExpiredIdleSession(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Date(2026, time.August, 21, 10, 0, 0, 0, time.UTC)
+	server.config.ConversationSessionIdleTTL = time.Minute
+	server.sessionManager.now = func() time.Time { return now }
+	session := newIdleAgentSession()
+	managed := &activeAgentSession{agent: session, runnerID: "runner", lastUsedAt: now.Add(-time.Minute)}
+	server.mu.Lock()
+	server.sessions["expired"] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession("expired", managed)
+
+	server.sessionManager.reapExpired()
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expired idle session was not stopped")
+	}
+	waitForManagedSessionRemoval(t, server, "expired")
+}
+
+func TestConversationSessionManagerKeepsRunningAndApprovedSessions(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Date(2026, time.August, 21, 10, 0, 0, 0, time.UTC)
+	server.config.ConversationSessionIdleTTL = time.Minute
+	server.sessionManager.now = func() time.Time { return now }
+	running := newIdleAgentSession()
+	approved := newIdleAgentSession()
+	server.mu.Lock()
+	server.sessions["running"] = &activeAgentSession{agent: running, runnerID: "runner", activeRunID: "run", runIDs: map[string]struct{}{"run": {}}, lastUsedAt: now.Add(-time.Hour)}
+	server.sessions["approved"] = &activeAgentSession{agent: approved, runnerID: "runner", lastUsedAt: now.Add(-time.Hour)}
+	server.approvals["approval"] = &approvalWaiter{conversationID: "approved", runID: "approval-run", decision: make(chan string, 1)}
+	server.mu.Unlock()
+
+	server.sessionManager.reapExpired()
+	for name, session := range map[string]*idleAgentSession{"running": running, "approved": approved} {
+		select {
+		case <-session.Done():
+			t.Fatalf("%s session was reclaimed while ineligible", name)
+		default:
+		}
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.sessions["running"] == nil || server.sessions["approved"] == nil {
+		t.Fatal("ineligible session was removed")
+	}
+}
+
+func TestConversationSessionManagerEvictsOldestIdleSessionForCapacity(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Date(2026, time.August, 21, 10, 0, 0, 0, time.UTC)
+	server.config.ConversationSessionsPerRunner = 2
+	server.sessionManager.now = func() time.Time { return now }
+	oldest := newDelayedDoneAgentSession()
+	newer := newIdleAgentSession()
+	oldManaged := &activeAgentSession{agent: oldest, runnerID: "runner", lastUsedAt: now.Add(-2 * time.Hour)}
+	newManaged := &activeAgentSession{agent: newer, runnerID: "runner", lastUsedAt: now.Add(-time.Hour)}
+	server.mu.Lock()
+	server.sessions["oldest"] = oldManaged
+	server.sessions["newer"] = newManaged
+	server.mu.Unlock()
+	go server.watchStreamingSession("oldest", oldManaged)
+	go server.watchStreamingSession("newer", newManaged)
+
+	server.streamMu.Lock()
+	err := server.sessionManager.ensureCapacity("next", "runner")
+	server.streamMu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "being reclaimed") {
+		t.Fatalf("capacity result=%v, want reclaiming conflict", err)
+	}
+	select {
+	case <-oldest.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("oldest idle session was not evicted")
+	}
+	select {
+	case <-newer.Done():
+		t.Fatal("newer idle session was evicted instead of the LRU session")
+	default:
+	}
+
+	// Until Done has removed the stopping entry, capacity is still occupied and
+	// a new turn cannot attach to that process.
+	server.streamMu.Lock()
+	err = server.sessionManager.ensureCapacity("next", "runner")
+	server.streamMu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "capacity is full") {
+		t.Fatalf("capacity while old session is stopping=%v, want full conflict", err)
+	}
+	close(oldest.release)
+	waitForManagedSessionRemoval(t, server, "oldest")
+	server.streamMu.Lock()
+	err = server.sessionManager.ensureCapacity("next", "runner")
+	server.streamMu.Unlock()
+	if err != nil {
+		t.Fatalf("capacity remained unavailable after watcher cleanup: %v", err)
+	}
+
+	newer.Stop()
+	waitForManagedSessionRemoval(t, server, "newer")
+}
+
+func TestRecreatedStreamingSessionResumesPersistedNativeSession(t *testing.T) {
+	server := newTestServer(t)
+	oldSession := newIdleAgentSession()
+	oldManaged := &activeAgentSession{agent: oldSession, runnerID: "runner", agentID: "claude-code"}
+	server.mu.Lock()
+	server.sessions["conversation"] = oldManaged
+	server.mu.Unlock()
+	go server.watchStreamingSession("conversation", oldManaged)
+	oldSession.Stop()
+	waitForManagedSessionRemoval(t, server, "conversation")
+
+	newSession := newIdleAgentSession()
+	runner := &recordingStreamingRunner{sessions: []AgentSession{newSession}}
+	conversation := Conversation{
+		ID:               "conversation",
+		AgentID:          "claude-code",
+		AgentSessionID:   "persisted-native-session",
+		AgentRuntimeID:   "runner",
+		AgentInitialized: true,
+		ExecutionPolicy:  "approval_required",
+	}
+	server.mu.Lock()
+	server.streamingSetups["resume-run"] = &streamingSetup{}
+	server.mu.Unlock()
+	started, err := server.streamingSession(context.Background(), runner, "resume-run", conversation, nil, "runner", t.TempDir())
+	if err != nil {
+		t.Fatalf("start replacement session: %v", err)
+	}
+	if started != newSession {
+		t.Fatal("replacement streaming session did not use the new native process")
+	}
+	starts := runner.starts()
+	if len(starts) != 1 || !starts[0].Resume || starts[0].SessionID != "persisted-native-session" {
+		t.Fatalf("replacement start did not resume persisted session: %#v", starts)
+	}
+	newSession.Stop()
+	waitForManagedSessionRemoval(t, server, "conversation")
+}
+
+func TestSessionConfigurationChangeRetiresOnlyIdleNativeSession(t *testing.T) {
+	server := newTestServer(t)
+	oldConfig := conversationSessionConfig{runnerID: "runner", agentID: "claude-code", projectPath: "C:/old-workspace", permissionMode: "approval_required", profileRevisionID: "profile-old"}
+	newConfig := oldConfig
+	newConfig.projectPath = "C:/new-workspace"
+	newConfig.profileRevisionID = "profile-new"
+	session := newDelayedDoneAgentSession()
+	managed := &activeAgentSession{agent: session, runnerID: "runner", agentID: "claude-code", config: oldConfig, configSet: true, lastUsedAt: time.Now().UTC()}
+	server.mu.Lock()
+	server.sessions["conversation"] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession("conversation", managed)
+
+	server.streamMu.Lock()
+	err := server.sessionManager.ensureConfiguration("conversation", newConfig)
+	server.streamMu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "configuration change") {
+		t.Fatalf("configuration change result=%v", err)
+	}
+	select {
+	case <-session.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("idle session was not stopped for its changed launch configuration")
+	}
+
+	server.streamMu.Lock()
+	err = server.sessionManager.ensureConfiguration("conversation", newConfig)
+	server.streamMu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "stopping") {
+		t.Fatalf("configuration change during shutdown=%v, want stopping conflict", err)
+	}
+	close(session.release)
+	waitForManagedSessionRemoval(t, server, "conversation")
+	server.streamMu.Lock()
+	err = server.sessionManager.ensureConfiguration("conversation", newConfig)
+	server.streamMu.Unlock()
+	if err != nil {
+		t.Fatalf("configuration remained blocked after native session exit: %v", err)
+	}
+}
+
+func TestPermissionModeWaitsForIdleNativeSessionToExit(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'runner','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,claude_initialized,agent_initialized,is_current,created_at) values ('conversation','project','session','claude-code','session','runner','approval_required','idle','approval_required',0,0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	session := newIdleAgentSession()
+	managed := &activeAgentSession{agent: session, runnerID: "runner", lastUsedAt: now}
+	server.mu.Lock()
+	server.sessions["conversation"] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession("conversation", managed)
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/permission-mode", bytes.NewBufferString(`{"permissionMode":"full_control"}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("initial permission update status=%d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("permission change did not stop the idle native session")
+	}
+	var permissionMode string
+	if err := server.db.QueryRow(`select permission_mode from conversations where id='conversation'`).Scan(&permissionMode); err != nil {
+		t.Fatalf("read unchanged permission mode: %v", err)
+	}
+	if permissionMode != "approval_required" {
+		t.Fatalf("permission mode changed before native session exit: %q", permissionMode)
+	}
+	waitForManagedSessionRemoval(t, server, "conversation")
+
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/permission-mode", bytes.NewBufferString(`{"permissionMode":"full_control"}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("retry permission update status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := server.db.QueryRow(`select permission_mode from conversations where id='conversation'`).Scan(&permissionMode); err != nil {
+		t.Fatalf("read updated permission mode: %v", err)
+	}
+	if permissionMode != "full_control" {
+		t.Fatalf("permission mode=%q, want full_control", permissionMode)
 	}
 }
 

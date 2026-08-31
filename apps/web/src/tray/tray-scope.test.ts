@@ -35,3 +35,11 @@ test("TrayPanel 挂载时添加、卸载时移除 tray-window 标记", () => {
   // 必须用 useLayoutEffect：标记要在首帧绘制前生效，窗口即便立即 show 也不闪实底。
   assert.match(source, /useLayoutEffect\([\s\S]*classList\.add\(["']tray-window["']\)/);
 });
+
+test("TrayPanel 提供可见的关闭面板操作", () => {
+  const source = readFileSync(new URL("./TrayPanel.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /className="tray-panel-close"/);
+  assert.match(source, /title="关闭面板"/);
+  assert.match(source, /onClick=\{\(\) => actions\(\)\.close\(\)\}/);
+});

@@ -1,11 +1,11 @@
 {
-  "version": "0.1.2",
-  "notes": "任务编排、运行环境与对话请求可靠性增强",
-  "pub_date": "2026-08-17T03:48:24.517Z",
+  "version": "0.1.3",
+  "notes": "多项目对话工作区、终端与文件工具链增强，稳定性与可靠性改进",
+  "pub_date": "2026-08-31T07:24:15.607Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczYxa3RpWGtGZ1AyN1pVWW1nQjVIRGZXY1BSbUt0Z1JBY1pqMVRHdVdMVmMxY0M0eUR0ejdCbjlvZXRWenRmNFBNZks2eDAwa3ZMeHJudzhuS3RuUGdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2OTM4NTA0CWZpbGU6TWlsZXZpYV8wLjEuMl94NjQtc2V0dXAuZXhlCkdHazMyZkIzOEh2UE1UcE5pRzJyTWpQTldjT2tMKzdMNDNVN242RStnUmhoK1Jzem5mZUF2NkRFbjh0U1dNOVRybDY4S2l2ZFNWdnhaYi8zSmlZeUF3PT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.2/Milevia_0.1.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNncy8yMUc5ZVVlQkJEOHZXWU5Vb3l2cDNXdUVVWkdYQW9KVmFNMkVDMENsOTRrWjFORVUvZnRKODhjY3IvSmJXbnI3UXhpRklqQ0oxclJwWlZWd0Q1dkFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4MTYxMDU1CWZpbGU6TWlsZXZpYV8wLjEuM194NjQtc2V0dXAuZXhlClBRRjRYQ0N0WVZMQm1ZR0ovdDhJTlZCeU1qM3BCMDlhVURBSldGMFpBczU3aGEzMHg3VDVHQVNJbkxNSElGWXBNckdjQkwzclF6a3g0LzQvWkpvd0JBPT0K",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.3/Milevia_0.1.3_x64-setup.exe"
     }
   }
 }

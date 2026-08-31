@@ -198,7 +198,7 @@ test("uses WebSocket history once and caps client-side run logs", () => {
 	assert.match(source, /LOG_BOTTOM_THRESHOLD/);
 	assert.doesNotMatch(source, /scrollIntoView/);
 	assert.match(source, /\.slice\(-MAX_LOG_ENTRIES\)/);
-	assert.match(source, /request<RunStatusResponse>\(`\$\{basePath\}\/logs\/clear`, \{ method: "POST" \}\)/);
+	assert.match(source, /request<RunStatusResponse>\(withWorkspace\(`\$\{basePath\}\/logs\/clear`\), \{ method: "POST" \}\)/);
 	assert.match(source, /setStatus\(next\)/);
 });
 

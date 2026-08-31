@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -40,6 +41,18 @@ type frame struct {
 	data []byte
 }
 
+type terminalStartupInfoEx struct {
+	windows.StartupInfo
+	attributeList []byte
+}
+
+var (
+	terminalKernel32                       = windows.NewLazySystemDLL("kernel32.dll")
+	terminalInitializeProcThreadAttributes = terminalKernel32.NewProc("InitializeProcThreadAttributeList")
+	terminalUpdateProcThreadAttribute      = terminalKernel32.NewProc("UpdateProcThreadAttribute")
+	terminalDeleteProcThreadAttributes     = terminalKernel32.NewProc("DeleteProcThreadAttributeList")
+)
+
 func main() {
 	typ, data, err := readFrame(os.Stdin)
 	if err != nil || typ != openFrame {
@@ -55,13 +68,15 @@ func main() {
 		writeFrame(os.Stdout, errorFrame, []byte("unsupported shell"))
 		return
 	}
-	inR, inW, err := os.Pipe()
+	inR, inW, err := newTerminalPipe()
 	if err != nil {
 		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
 		return
 	}
-	outR, outW, err := os.Pipe()
+	outR, outW, err := newTerminalPipe()
 	if err != nil {
+		_ = inR.Close()
+		_ = inW.Close()
 		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
 		return
 	}
@@ -75,16 +90,12 @@ func main() {
 		return
 	}
 	defer windows.ClosePseudoConsole(pty)
-	attrs, err := windows.NewProcThreadAttributeList(1)
+	si, releaseAttributes, err := newTerminalStartupInfo(pty)
 	if err != nil {
 		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
 		return
 	}
-	defer attrs.Delete()
-	if err = attrs.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&pty), unsafe.Sizeof(pty)); err != nil {
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
-		return
-	}
+	defer releaseAttributes()
 	readyMarker := "__MILEVIA_READY__"
 	command, _ := windows.UTF16PtrFromString("cmd.exe /d /q /k \"chcp 65001 >nul & echo " + readyMarker + "\"")
 	workDir, err := windows.UTF16PtrFromString(request.WorkDir)
@@ -92,9 +103,8 @@ func main() {
 		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
 		return
 	}
-	si := windows.StartupInfoEx{StartupInfo: windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))}, ProcThreadAttributeList: attrs.List()}
 	pi := windows.ProcessInformation{}
-	if err = windows.CreateProcess(nil, command, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT, nil, workDir, &si.StartupInfo, &pi); err != nil {
+	if err = windows.CreateProcess(nil, command, nil, nil, false, windows.EXTENDED_STARTUPINFO_PRESENT, nil, workDir, &si.StartupInfo, &pi); err != nil {
 		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
 		return
 	}
@@ -242,6 +252,43 @@ func main() {
 			}
 		}
 	}
+}
+
+func newTerminalStartupInfo(pty windows.Handle) (*terminalStartupInfoEx, func(), error) {
+	var size uintptr
+	result, _, callErr := terminalInitializeProcThreadAttributes.Call(0, 1, 0, uintptr(unsafe.Pointer(&size)))
+	if result != 0 || size == 0 {
+		return nil, nil, fmt.Errorf("query terminal process attributes: %w", callErr)
+	}
+	si := &terminalStartupInfoEx{attributeList: make([]byte, size)}
+	if result, _, callErr = terminalInitializeProcThreadAttributes.Call(uintptr(unsafe.Pointer(&si.attributeList[0])), 1, 0, uintptr(unsafe.Pointer(&size))); result == 0 {
+		return nil, nil, fmt.Errorf("initialize terminal process attributes: %w", callErr)
+	}
+	if result, _, callErr = terminalUpdateProcThreadAttribute.Call(
+		uintptr(unsafe.Pointer(&si.attributeList[0])),
+		0,
+		windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+		uintptr(pty),
+		unsafe.Sizeof(pty),
+		0,
+		0,
+	); result == 0 {
+		terminalDeleteProcThreadAttributes.Call(uintptr(unsafe.Pointer(&si.attributeList[0])))
+		return nil, nil, fmt.Errorf("set terminal pseudo-console attribute: %w", callErr)
+	}
+	si.Cb = uint32(unsafe.Sizeof(windows.StartupInfoEx{}))
+	si.Flags = windows.STARTF_USESTDHANDLES
+	return si, func() { terminalDeleteProcThreadAttributes.Call(uintptr(unsafe.Pointer(&si.attributeList[0]))) }, nil
+}
+
+// ConPTY requires synchronous pipe handles. Go's os.Pipe uses overlapped
+// handles on Windows, so the bridge creates these channels directly.
+func newTerminalPipe() (*os.File, *os.File, error) {
+	var read, write windows.Handle
+	if err := windows.CreatePipe(&read, &write, nil, 0); err != nil {
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(read), "terminal-pipe-read"), os.NewFile(uintptr(write), "terminal-pipe-write"), nil
 }
 
 func writeFrame(w io.Writer, typ byte, payload []byte) error {

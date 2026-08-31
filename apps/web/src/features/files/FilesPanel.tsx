@@ -11,6 +11,7 @@ import { useCodeFontSize } from "./useCodeFontSize";
 
 interface FilesPanelProps {
   projectId: string;
+  conversationId?: string;
   runner: string;
   request: <T>(path: string, init?: RequestInit) => Promise<T>;
   isWorkspaceOccupied: boolean;
@@ -35,11 +36,14 @@ function baseName(path: string): string {
 
 export function FilesPanel({
   projectId,
+  conversationId,
   runner,
   request,
   isWorkspaceOccupied,
   onAddToChat,
 }: FilesPanelProps) {
+	const workspaceQuery = conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : "";
+	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${workspaceQuery}`;
   const { fontSize, increase, decrease, canIncrease, canDecrease } = useCodeFontSize();
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
@@ -128,10 +132,10 @@ export function FilesPanel({
       pendingOpens.current.add(path);
 
       try {
-        const stat = await request<FileInfo>(`/api/projects/${projectId}/fs/stat?path=${encodeURIComponent(path)}`);
+		const stat = await request<FileInfo>(withWorkspace(`/api/projects/${projectId}/fs/stat?path=${encodeURIComponent(path)}`));
         const previewKind = getPreviewKind(name, stat.isText, stat.mimeType, stat.size);
         const res = isTextPreview(previewKind)
-          ? await request<FileContent>(`/api/projects/${projectId}/fs/read?path=${encodeURIComponent(path)}`)
+		  ? await request<FileContent>(withWorkspace(`/api/projects/${projectId}/fs/read?path=${encodeURIComponent(path)}`))
           : null;
         const lang = detectLanguage(name);
         const newFile: OpenFile = {
@@ -298,7 +302,7 @@ export function FilesPanel({
     setIsSaving(true);
 
     try {
-      const result = await request<{ version: string }>(`/api/projects/${projectId}/fs/write`, {
+      const result = await request<{ version: string }>(withWorkspace(`/api/projects/${projectId}/fs/write`), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: file.path, content: file.content, expectedVersion: file.version }),
@@ -329,7 +333,7 @@ export function FilesPanel({
       savingRef.current = false;
       setIsSaving(false);
     }
-  }, [projectId, request]);
+  }, [projectId, request, withWorkspace]);
 
   // 取消编辑
   const cancelEdit = useCallback(() => {
@@ -388,13 +392,13 @@ export function FilesPanel({
         ? `${showNewFileDialog.dirPath}/${newFileName.trim()}`
         : newFileName.trim();
       if (showNewFileDialog.type === "file") {
-        await request(`/api/projects/${projectId}/fs/write`, {
+        await request(withWorkspace(`/api/projects/${projectId}/fs/write`), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path, content: "", createOnly: true }),
         });
       } else {
-        await request(`/api/projects/${projectId}/fs/mkdir`, {
+        await request(withWorkspace(`/api/projects/${projectId}/fs/mkdir`), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
@@ -405,7 +409,7 @@ export function FilesPanel({
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建失败");
     }
-  }, [showNewFileDialog, newFileName, projectId, request]);
+  }, [showNewFileDialog, newFileName, projectId, request, withWorkspace]);
 
   // 重命名
   const handleRename = useCallback((path: string, name: string) => {
@@ -426,7 +430,7 @@ export function FilesPanel({
         ? showRenameDialog.path.substring(0, showRenameDialog.path.lastIndexOf("/"))
         : "";
       const newPath = dir ? `${dir}/${renameValue.trim()}` : renameValue.trim();
-      await request(`/api/projects/${projectId}/fs/rename`, {
+      await request(withWorkspace(`/api/projects/${projectId}/fs/rename`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ oldPath: showRenameDialog.path, newPath }),
@@ -452,7 +456,7 @@ export function FilesPanel({
     } catch (err) {
       setError(err instanceof Error ? err.message : "重命名失败");
     }
-  }, [showRenameDialog, renameValue, projectId, request]);
+  }, [showRenameDialog, renameValue, projectId, request, withWorkspace]);
 
   // 删除
   const handleDelete = useCallback((path: string, name: string, isDir: boolean) => {
@@ -464,7 +468,7 @@ export function FilesPanel({
     if (!showDeleteConfirm) return;
     try {
       await request(
-        `/api/projects/${projectId}/fs/remove?path=${encodeURIComponent(showDeleteConfirm.path)}`,
+        withWorkspace(`/api/projects/${projectId}/fs/remove?path=${encodeURIComponent(showDeleteConfirm.path)}`),
         { method: "DELETE" }
       );
       const removedPath = showDeleteConfirm.path;
@@ -516,6 +520,7 @@ export function FilesPanel({
         <div className={`files-tree ${mobileView === "editor" ? "hidden-mobile" : ""}`}>
           <ProjectFileTree
             projectId={projectId}
+            conversationId={conversationId}
             request={request}
             onFileSelect={openFile}
             onCreateFile={handleCreateFile}
@@ -564,6 +569,7 @@ export function FilesPanel({
                 stat={activeFile.stat}
                 previewKind={activeFile.previewKind}
                 projectId={projectId}
+                conversationId={conversationId}
                 request={request}
                 onEdit={enterEditMode}
                 readOnly={readOnly}

@@ -17,6 +17,7 @@ export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
 export type AgentID = "claude-code" | "codex";
 export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean; isOrchestration?: boolean };
+export type ConversationWorkspace = { id: string; conversationId: string; generation: number; mode: "project_shared" | "isolated_worktree" | string; path: string; branch?: string; baseRevision?: string; state: "provisioning" | "ready" | "active" | "failed" | "archived" | string; active?: boolean; createdAt: string; archivedAt?: string | null };
 export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 export type ShortcutKind = "prompt" | "snippet" | "command_request";
 export type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };
@@ -53,7 +54,7 @@ export type TimelineItem =
   | { kind: "system"; id: string; createdAt: string; system: SystemItem }
   | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
 export type WorkspaceTab = "conversation" | "tasks" | "orchestration" | "files" | "git" | "run" | "terminal" | "insights";
-export type TerminalSessionInfo = { id: string; projectId: string; environment: string; cwdDisplay?: string; status: "starting" | "running" | "exited" | "failed" | "closed"; createdAt: string };
+export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?: string; environment: string; cwdDisplay?: string; status: "starting" | "running" | "exited" | "failed" | "closed"; createdAt: string };
 
 export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
 export type RunnerInfo = {

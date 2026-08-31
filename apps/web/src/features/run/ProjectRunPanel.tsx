@@ -64,7 +64,7 @@ function LogSegment({ segment }: { segment: AnsiSegment }) {
 	})}</>;
 }
 
-export function ProjectRunPanel({ projectID, request, fail, active, isRemote = false }: { projectID: string; request: Request; fail: (message: string) => void; active: boolean; isRemote?: boolean }) {
+export function ProjectRunPanel({ projectID, conversationId, request, fail, active, isRemote = false }: { projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; active: boolean; isRemote?: boolean }) {
 	const [config, setConfig] = useState<RunConfig>({ workDir: "", command: "", envVars: {}, executionTarget: "auto" });
 	const [status, setStatus] = useState<RunStatusResponse | null>(null);
 	const [worktrees, setWorktrees] = useState<OrchestrationWorktree[]>([]);
@@ -86,7 +86,9 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const statusRequestVersionRef = useRef(0);
 	const renderedProjectIDRef = useRef(projectID);
 
+	const workspaceQuery = conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : "";
 	const basePath = `/api/projects/${projectID}/run`;
+	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
 	// 运行环境为 Windows cmd 时提示写法（反斜杠、不加 ./ 前缀）。优先用后端解析后的
 	// 真实目标（status.executionTarget，SSH 远端为 ""），未加载时退回配置近似判断。
 	const resolvedTarget = status?.executionTarget ?? (isRemote ? "" : config.executionTarget || "auto");
@@ -99,19 +101,19 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const loadConfig = useCallback(async () => {
 		const revision = configRevisionRef.current;
 		try {
-			const c = await request<RunConfig>(`${basePath}/config`);
+			const c = await request<RunConfig>(withWorkspace(`${basePath}/config`));
 			if (activeProjectIDRef.current === projectID && revision === configRevisionRef.current && !configDirtyRef.current) setConfig(c);
 		}
 		catch (cause) {
 			if (activeProjectIDRef.current === projectID) fail(cause instanceof Error ? cause.message : "加载配置失败");
 		}
-	}, [basePath, request, fail, projectID]);
+	}, [basePath, request, fail, projectID, conversationId]);
 	const loadWorktrees = useCallback(async () => {
 		try {
-			const items = await request<OrchestrationWorktree[]>(`${basePath}/worktrees`);
+			const items = await request<OrchestrationWorktree[]>(withWorkspace(`${basePath}/worktrees`));
 			if (activeProjectIDRef.current === projectID) setWorktrees(items);
 		} catch { /* 普通项目仍可使用项目根目录启动。 */ }
-	}, [basePath, request, projectID]);
+	}, [basePath, request, projectID, conversationId]);
 	const updateConfig = (next: RunConfig) => {
 		configDirtyRef.current = true;
 		configRevisionRef.current += 1;
@@ -121,12 +123,12 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const loadStatus = useCallback(async () => {
 		const requestVersion = ++statusRequestVersionRef.current;
 		try {
-			const s = await request<RunStatusResponse>(`${basePath}/status`);
+			const s = await request<RunStatusResponse>(withWorkspace(`${basePath}/status`));
 			if (activeProjectIDRef.current !== projectID || requestVersion !== statusRequestVersionRef.current) return;
 			setStatus(s);
 			mergeIncomingLogs(s.recentLogs);
 		} catch { /* 轮询忽略错误 */ }
-	}, [basePath, request, projectID, mergeIncomingLogs]);
+	}, [basePath, request, projectID, mergeIncomingLogs, conversationId]);
 
 	useEffect(() => {
 		if (renderedProjectIDRef.current === projectID) return;
@@ -155,7 +157,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 
 		const connect = () => {
 			if (disposed) return;
-			const ws = createWebSocket(`/ws/projects/${projectID}/run`);
+			const ws = createWebSocket(`/ws/projects/${projectID}/run${workspaceQuery}`);
 			wsRef.current = ws;
 
 			ws.onmessage = (raw: MessageEvent) => {
@@ -238,7 +240,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 		// 远程项目的执行环境固定为 auto，避免旧值被持久化。
 		const payload: RunConfig = isRemote ? { ...config, executionTarget: "auto" } : config;
 		try {
-			await request(`${basePath}/config`, { method: "PUT", body: JSON.stringify(payload) });
+			await request(withWorkspace(`${basePath}/config`), { method: "PUT", body: JSON.stringify(payload) });
 			if (revision === configRevisionRef.current) configDirtyRef.current = false;
 			toast.success("启动配置已保存");
 		}
@@ -248,21 +250,21 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 
 	const handleStart = async () => {
 		setBusy("start");
-		try { await request(`${basePath}/start`, { method: "POST" }); void loadStatus(); }
+		try { await request(withWorkspace(`${basePath}/start`), { method: "POST" }); void loadStatus(); }
 		catch (cause) { fail(cause instanceof Error ? cause.message : "启动失败"); }
 		finally { setBusy(""); }
 	};
 
 	const handleStop = async () => {
 		setBusy("stop");
-		try { await request(`${basePath}/stop`, { method: "POST" }); void loadStatus(); }
+		try { await request(withWorkspace(`${basePath}/stop`), { method: "POST" }); void loadStatus(); }
 		catch (cause) { fail(cause instanceof Error ? cause.message : "停止失败"); }
 		finally { setBusy(""); }
 	};
 
 	const handleRestart = async () => {
 		setBusy("restart");
-		try { await request(`${basePath}/restart`, { method: "POST" }); void loadStatus(); }
+		try { await request(withWorkspace(`${basePath}/restart`), { method: "POST" }); void loadStatus(); }
 		catch (cause) { fail(cause instanceof Error ? cause.message : "重启失败"); }
 		finally { setBusy(""); }
 	};
@@ -270,7 +272,7 @@ export function ProjectRunPanel({ projectID, request, fail, active, isRemote = f
 	const handleClearLogs = async () => {
 		setBusy("clear-logs");
 		try {
-			const next = await request<RunStatusResponse>(`${basePath}/logs/clear`, { method: "POST" });
+			const next = await request<RunStatusResponse>(withWorkspace(`${basePath}/logs/clear`), { method: "POST" });
 			if (activeProjectIDRef.current !== projectID) return;
 			// Only after the server confirms the clear should the local log state
 			// advance, otherwise a failed request would leave the UI empty while

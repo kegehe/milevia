@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -30,6 +31,8 @@ const (
 type GitOperation struct {
 	ID             string     `json:"id"`
 	ProjectID      string     `json:"projectId"`
+	WorkspaceID    string     `json:"workspaceId,omitempty"`
+	WorkspacePath  string     `json:"workspacePath,omitempty"`
 	Type           string     `json:"type"`
 	Status         string     `json:"status"`
 	RequestSummary string     `json:"requestSummary"`
@@ -43,11 +46,13 @@ type GitOperation struct {
 }
 
 type gitStateToken struct {
-	projectID    string
-	snapshot     GitSnapshot
-	changes      []GitChange
-	fingerprints map[string]string
-	expiresAt    time.Time
+	projectID     string
+	workspaceID   string
+	workspacePath string
+	snapshot      GitSnapshot
+	changes       []GitChange
+	fingerprints  map[string]string
+	expiresAt     time.Time
 }
 
 type gitSummaryResponse struct {
@@ -60,6 +65,8 @@ func (s *Server) migrateGit(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `create table if not exists git_operations (
 	id text primary key,
 	project_id text not null references projects(id) on delete cascade,
+	workspace_id text not null default '',
+	workspace_path text not null default '',
 	type text not null,
 	status text not null,
 	request_summary text not null,
@@ -77,6 +84,22 @@ func (s *Server) migrateGit(ctx context.Context) error {
 create index if not exists git_operations_project_requested on git_operations(project_id,requested_at desc);`)
 	if err != nil {
 		return fmt.Errorf("migrate Git operations: %w", err)
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"workspace_id", "text not null default ''"},
+		{"workspace_path", "text not null default ''"},
+	} {
+		if err := ensureColumn(ctx, s.db, "git_operations", column.name, column.definition); err != nil {
+			return fmt.Errorf("migrate Git operations %s: %w", column.name, err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `create index if not exists git_operations_workspace_requested on git_operations(project_id,workspace_id,requested_at desc)`); err != nil {
+		return fmt.Errorf("index Git operations by workspace: %w", err)
+	}
+	// Pre-workspace audit records always targeted the project's sole root.
+	// Retain that history in the shared workspace after an in-place upgrade.
+	if _, err := s.db.ExecContext(ctx, `update git_operations set workspace_path=(select path from projects where projects.id=git_operations.project_id) where workspace_id='' and workspace_path=''`); err != nil {
+		return fmt.Errorf("backfill legacy Git operation workspaces: %w", err)
 	}
 	return nil
 }
@@ -177,7 +200,12 @@ func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	observedAt := time.Now().UTC()
-	token := s.issueGitStateToken(chi.URLParam(r, "projectID"), snapshot, changes, fingerprints, observedAt)
+	workspace, resolveErr := s.resolveRequestWorkspaceFromRequest(r)
+	if resolveErr != nil {
+		writeError(w, http.StatusConflict, resolveErr)
+		return
+	}
+	token := s.issueGitStateToken(chi.URLParam(r, "projectID"), workspace.Workspace.ID, workspace.Workspace.Path, snapshot, changes, fingerprints, observedAt)
 	writeJSON(w, http.StatusOK, gitSummaryResponse{GitSnapshot: snapshot, ObservedAt: observedAt, StateToken: token})
 }
 
@@ -295,7 +323,7 @@ func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ
 		writeError(w, http.StatusConflict, errors.New("there are no eligible Git changes"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, typ, fmt.Sprintf("%s（%d 个文件）", label, len(paths)), state.snapshot, func(runner GitRunner) error {
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, typ, fmt.Sprintf("%s（%d 个文件）", label, len(paths)), state.snapshot, func(runner GitRunner) error {
 		return execute(r.Context(), runner, repo, paths)
 	})
 	if err != nil {
@@ -339,7 +367,7 @@ func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ st
 			return
 		}
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, typ, strings.Join(input.Paths, ", "), state.snapshot, func(runner GitRunner) error {
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, typ, strings.Join(input.Paths, ", "), state.snapshot, func(runner GitRunner) error {
 		return execute(r.Context(), runner, repo, input.Paths)
 	})
 	if err != nil {
@@ -383,7 +411,7 @@ func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("there are no staged Git changes to commit"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "commit", message, state.snapshot, func(runner GitRunner) error {
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "commit", message, state.snapshot, func(runner GitRunner) error {
 		return runner.Commit(r.Context(), repo, message)
 	})
 	if err != nil {
@@ -426,7 +454,7 @@ func (s *Server) gitAmendCommit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "commit_amend", message, state.snapshot, func(runner GitRunner) error {
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "commit_amend", message, state.snapshot, func(runner GitRunner) error {
 		return runner.AmendCommit(r.Context(), repo, message)
 	})
 	if err != nil {
@@ -499,7 +527,7 @@ func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, errors.New("untracked Git paths changed; refresh the repository"))
 			return
 		}
-		result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "discard_worktree", strings.Join(input.Paths, ", "), state.snapshot, func(runner GitRunner) error {
+		result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "discard_worktree", strings.Join(input.Paths, ", "), state.snapshot, func(runner GitRunner) error {
 			if len(tracked) > 0 {
 				if err := runner.RestoreWorktree(r.Context(), repo, tracked); err != nil {
 					return err
@@ -556,7 +584,7 @@ func (s *Server) gitDiscard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("untracked Git paths changed; refresh the repository"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "discard_all", summary, state.snapshot, func(runner GitRunner) error {
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "discard_all", summary, state.snapshot, func(runner GitRunner) error {
 		if initial {
 			if err := runner.DiscardInitialChanges(r.Context(), repo, tracked); err != nil {
 				return err
@@ -611,7 +639,7 @@ func (s *Server) gitFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "fetch",
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "fetch",
 		fmt.Sprintf("fetch %s", input.Remote), state.snapshot, func(runner GitRunner) error {
 			return runner.Fetch(r.Context(), repo, input.Remote)
 		})
@@ -665,7 +693,7 @@ func (s *Server) gitPull(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "pull",
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "pull",
 		fmt.Sprintf("pull %s %s", input.Remote, input.Branch), state.snapshot, func(runner GitRunner) error {
 			return runner.Pull(r.Context(), repo, input.Remote, input.Branch)
 		})
@@ -712,7 +740,7 @@ func (s *Server) gitPush(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "push",
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "push",
 		fmt.Sprintf("push %s %s", input.Remote, input.Branch), state.snapshot, func(runner GitRunner) error {
 			return runner.Push(r.Context(), repo, input.Remote, input.Branch, input.SetUpstream)
 		})
@@ -750,9 +778,15 @@ func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	release, acquired := s.acquireProjectWorkspace(projectID, "git:"+uuid.NewString())
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	workspaceKey := workspaceLeaseKey(workspace.Project, workspace.Workspace)
+	release, acquired := s.acquireWorkspace(workspaceKey, "git:"+uuid.NewString())
 	if !acquired {
-		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceKey))
 		return
 	}
 	defer release()
@@ -765,7 +799,7 @@ func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if input.StartPoint != "" {
 		summary = fmt.Sprintf("创建分支 %s（基于 %s）", input.Name, input.StartPoint)
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "create_branch",
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, workspace.Workspace.ID, workspace.Workspace.Path, repo, "create_branch",
 		summary, snapshot, func(runner GitRunner) error {
 			return runner.CreateBranch(r.Context(), repo, input.Name, input.StartPoint)
 		})
@@ -811,7 +845,7 @@ func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("already on the target branch"))
 		return
 	}
-	result, err := s.executeGitOperation(r.Context(), runner, projectID, repo, "switch_branch",
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "switch_branch",
 		fmt.Sprintf("切换到 %s", input.Branch), state.snapshot, func(runner GitRunner) error {
 			return runner.SwitchBranch(r.Context(), repo, input.Branch)
 		})
@@ -828,12 +862,18 @@ func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateT
 		return nil, "", "", gitStateToken{}, nil, false
 	}
 	projectID := chi.URLParam(r, "projectID")
-	release, acquired := s.acquireProjectWorkspace(projectID, "git:"+uuid.NewString())
-	if !acquired {
-		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
 		return nil, "", "", gitStateToken{}, nil, false
 	}
-	state, err := s.validateGitStateToken(r.Context(), runner, projectID, repo, stateToken)
+	workspaceKey := workspaceLeaseKey(workspace.Project, workspace.Workspace)
+	release, acquired := s.acquireWorkspace(workspaceKey, "git:"+uuid.NewString())
+	if !acquired {
+		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceKey))
+		return nil, "", "", gitStateToken{}, nil, false
+	}
+	state, err := s.validateGitStateToken(r.Context(), runner, projectID, workspace.Workspace.ID, repo, stateToken)
 	if err != nil {
 		release()
 		writeError(w, http.StatusConflict, err)
@@ -849,10 +889,14 @@ type gitOperationResult struct {
 }
 
 func (s *Server) executeGitOperation(ctx context.Context, runner GitRunner, projectID, repo, typ, summary string, before GitSnapshot, execute func(GitRunner) error) (gitOperationResult, error) {
+	return s.executeGitOperationForWorkspace(ctx, runner, projectID, "", "", repo, typ, summary, before, execute)
+}
+
+func (s *Server) executeGitOperationForWorkspace(ctx context.Context, runner GitRunner, projectID, workspaceID, workspacePath, repo, typ, summary string, before GitSnapshot, execute func(GitRunner) error) (gitOperationResult, error) {
 	now := time.Now().UTC()
 	beforeState, _ := json.Marshal(before)
-	operation := GitOperation{ID: uuid.NewString(), ProjectID: projectID, Type: typ, Status: gitOperationQueued, RequestSummary: summary, RequestedAt: now}
-	if _, err := s.db.ExecContext(ctx, `insert into git_operations (id,project_id,type,status,request_summary,before_state,requested_at) values (?,?,?,?,?,?,?)`, operation.ID, operation.ProjectID, operation.Type, operation.Status, operation.RequestSummary, string(beforeState), operation.RequestedAt); err != nil {
+	operation := GitOperation{ID: uuid.NewString(), ProjectID: projectID, WorkspaceID: workspaceID, WorkspacePath: workspacePath, Type: typ, Status: gitOperationQueued, RequestSummary: summary, RequestedAt: now}
+	if _, err := s.db.ExecContext(ctx, `insert into git_operations (id,project_id,workspace_id,workspace_path,type,status,request_summary,before_state,requested_at) values (?,?,?,?,?,?,?,?,?)`, operation.ID, operation.ProjectID, operation.WorkspaceID, operation.WorkspacePath, operation.Type, operation.Status, operation.RequestSummary, string(beforeState), operation.RequestedAt); err != nil {
 		return gitOperationResult{}, err
 	}
 	operation.Status, operation.StartedAt = gitOperationRunning, &now
@@ -972,7 +1016,7 @@ func gitChangeFingerprints(runner GitRunner, repo string, changes []GitChange) m
 	return result
 }
 
-func (s *Server) issueGitStateToken(projectID string, snapshot GitSnapshot, changes []GitChange, fingerprints map[string]string, now time.Time) string {
+func (s *Server) issueGitStateToken(projectID, workspaceID, workspacePath string, snapshot GitSnapshot, changes []GitChange, fingerprints map[string]string, now time.Time) string {
 	token := uuid.NewString()
 	expiresAt := now.Add(2 * time.Minute)
 	s.mu.Lock()
@@ -982,15 +1026,15 @@ func (s *Server) issueGitStateToken(projectID string, snapshot GitSnapshot, chan
 			delete(s.gitStateTokens, value)
 		}
 	}
-	s.gitStateTokens[token] = gitStateToken{projectID: projectID, snapshot: snapshot, changes: changes, fingerprints: fingerprints, expiresAt: expiresAt}
+	s.gitStateTokens[token] = gitStateToken{projectID: projectID, workspaceID: workspaceID, workspacePath: filepath.Clean(workspacePath), snapshot: snapshot, changes: changes, fingerprints: fingerprints, expiresAt: expiresAt}
 	return token
 }
 
-func (s *Server) validateGitStateToken(ctx context.Context, runner GitRunner, projectID, repo, token string) (gitStateToken, error) {
+func (s *Server) validateGitStateToken(ctx context.Context, runner GitRunner, projectID, workspaceID, repo, token string) (gitStateToken, error) {
 	s.mu.Lock()
 	record, found := s.gitStateTokens[token]
 	s.mu.Unlock()
-	if token == "" || !found || record.projectID != projectID || !record.expiresAt.After(time.Now().UTC()) {
+	if token == "" || !found || record.projectID != projectID || record.workspaceID != workspaceID || !sameCleanPath(record.workspacePath, repo) || !record.expiresAt.After(time.Now().UTC()) {
 		return gitStateToken{}, errors.New("Git state changed; refresh the repository")
 	}
 	snapshot, changes, fingerprints, err := readGitState(ctx, runner, repo)
@@ -1078,15 +1122,12 @@ func (s *Server) gitOperations(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	if _, err := s.projectPath(r.Context(), projectID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, errors.New("project not found"))
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-		}
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
 		return
 	}
-	operations, err := s.listGitOperations(r.Context(), projectID, limit)
+	operations, err := s.listGitOperationsForWorkspace(r.Context(), projectID, workspace.Workspace, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1097,8 +1138,7 @@ func (s *Server) gitOperations(w http.ResponseWriter, r *http.Request) {
 // getGitRunner 根据项目的 runner 类型返回对应的 GitRunner 与仓库路径。
 // 本地项目使用本地 exec.Command；SSH 项目通过 SSH 在远端执行 git。
 func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner, string, bool) {
-	projectID := chi.URLParam(r, "projectID")
-	project, err := s.getProjectByID(r.Context(), projectID)
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, errors.New("project not found"))
@@ -1107,9 +1147,10 @@ func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner
 		}
 		return nil, "", false
 	}
+	project := workspace.Project
 	if isLocalRunnerID(project.Runner) || project.Runner == "wsl-local" {
 		// wsl-local 也走本地 GitRunner 直读 UNC（与 fs_handler 复用 LocalFilesystem 一致）。
-		return newGitRunner(), project.Path, true
+		return newGitRunner(), workspace.Workspace.Path, true
 	}
 	runner, ok := s.runnerRegistry.get(project.Runner)
 	if !ok {
@@ -1121,7 +1162,7 @@ func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner
 		writeError(w, http.StatusInternalServerError, errors.New("runner 不是 SSH 类型"))
 		return nil, "", false
 	}
-	repo, err := sshR.canonicalProjectPath(r.Context(), project.Path)
+	repo, err := sshR.canonicalProjectPath(r.Context(), workspace.Workspace.Path)
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
 		return nil, "", false
@@ -1169,7 +1210,26 @@ func (s *Server) writeGitReadError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) listGitOperations(ctx context.Context, projectID string, limit int) ([]GitOperation, error) {
-	rows, err := s.db.QueryContext(ctx, `select id,project_id,type,status,request_summary,before_state,after_state,error_code,error_message,requested_at,started_at,finished_at from git_operations where project_id=? order by requested_at desc limit ?`, projectID, limit)
+	return s.listGitOperationsWhere(ctx, `project_id=?`, []any{projectID}, limit)
+}
+
+func (s *Server) listGitOperationsForWorkspace(ctx context.Context, projectID string, workspace ConversationWorkspace, limit int) ([]GitOperation, error) {
+	// Legacy records did not have a workspace ID. They belong to the shared
+	// project root only, never to an isolated worktree.
+	where := `project_id=? and workspace_id=?`
+	args := []any{projectID, workspace.ID}
+	if workspace.Mode == "project_shared" {
+		// Shared workspaces have per-conversation records but one physical root.
+		// Audit history must follow that root rather than a conversation-local ID.
+		where = `project_id=? and workspace_path=?`
+		args = []any{projectID, workspace.Path}
+	}
+	return s.listGitOperationsWhere(ctx, where, args, limit)
+}
+
+func (s *Server) listGitOperationsWhere(ctx context.Context, where string, args []any, limit int) ([]GitOperation, error) {
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `select id,project_id,workspace_id,workspace_path,type,status,request_summary,before_state,after_state,error_code,error_message,requested_at,started_at,finished_at from git_operations where `+where+` order by requested_at desc limit ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list Git operations: %w", err)
 	}
@@ -1178,7 +1238,7 @@ func (s *Server) listGitOperations(ctx context.Context, projectID string, limit 
 	for rows.Next() {
 		var operation GitOperation
 		var startedAt, finishedAt sql.NullTime
-		if err := rows.Scan(&operation.ID, &operation.ProjectID, &operation.Type, &operation.Status, &operation.RequestSummary, &operation.BeforeState, &operation.AfterState, &operation.ErrorCode, &operation.ErrorMessage, &operation.RequestedAt, &startedAt, &finishedAt); err != nil {
+		if err := rows.Scan(&operation.ID, &operation.ProjectID, &operation.WorkspaceID, &operation.WorkspacePath, &operation.Type, &operation.Status, &operation.RequestSummary, &operation.BeforeState, &operation.AfterState, &operation.ErrorCode, &operation.ErrorMessage, &operation.RequestedAt, &startedAt, &finishedAt); err != nil {
 			return nil, fmt.Errorf("read Git operation: %w", err)
 		}
 		if startedAt.Valid {

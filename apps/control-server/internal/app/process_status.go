@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,19 +52,11 @@ func (s *Server) listProjectProcessStatuses(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	s.runManagersMu.RLock()
 	items := make([]projectProcessStatusItem, 0, len(ids))
 	for _, id := range ids {
-		item := projectProcessStatusItem{ID: id, RunStatus: RunStatusStopped}
-		if runner, ok := s.runManagers[id]; ok {
-			snap := runner.LightStatusSnapshot()
-			item.RunStatus = snap.Status
-			item.RunPID = snap.PID
-			item.RunStartedAt = snap.StartedAt
-		}
-		items = append(items, item)
+		event := s.projectProcessStatusSnapshot(id)
+		items = append(items, projectProcessStatusItem{ID: id, RunStatus: event.Status, RunPID: event.PID, RunStartedAt: event.StartedAt})
 	}
-	s.runManagersMu.RUnlock()
 
 	writeJSON(w, http.StatusOK, items)
 }
@@ -182,22 +175,47 @@ func (s *Server) pushProcessStatusSnapshot(sub *processStatusSubscriber) {
 	if err != nil {
 		return
 	}
-	s.runManagersMu.RLock()
 	for _, id := range ids {
-		event := RunStatusEvent{ProjectID: id, Status: RunStatusStopped}
-		if runner, ok := s.runManagers[id]; ok {
-			snap := runner.LightStatusSnapshot()
-			event.Status = snap.Status
-			event.StartedAt = snap.StartedAt
-			event.PID = snap.PID
-		}
+		event := s.projectProcessStatusSnapshot(id)
 		select {
 		case sub.send <- event:
 		default:
 			// 快照积压：丢弃剩余帧即可，实时变更仍会收敛快照与真实状态。
 		}
 	}
-	s.runManagersMu.RUnlock()
+}
+
+// projectProcessStatusSnapshot reports the most active process among every
+// workspace owned by a project. The dashboard remains project-oriented while
+// isolated worktrees may run independently in the background.
+func (s *Server) projectProcessStatusSnapshot(projectID string) RunStatusEvent {
+	event := RunStatusEvent{ProjectID: projectID, Status: RunStatusStopped}
+	priority := map[RunStatus]int{
+		RunStatusStopped:  0,
+		RunStatusFailed:   1,
+		RunStatusStopping: 2,
+		RunStatusStarting: 3,
+		RunStatusRunning:  4,
+	}
+	s.runManagersMu.RLock()
+	defer s.runManagersMu.RUnlock()
+	for key, runner := range s.runManagers {
+		if key != projectID && !strings.HasPrefix(key, projectID+"|") {
+			continue
+		}
+		snapshot := runner.LightStatusSnapshot()
+		if priority[snapshot.Status] <= priority[event.Status] {
+			continue
+		}
+		event.Status = snapshot.Status
+		event.PID = snapshot.PID
+		event.StartedAt = snapshot.StartedAt
+	}
+	return event
+}
+
+func (s *Server) broadcastProjectProcessStatus(projectID string) {
+	s.broadcastProcessStatus(s.projectProcessStatusSnapshot(projectID))
 }
 
 // broadcastProcessStatus 不落库，直接推给所有订阅者；慢客户端满队列即断连。

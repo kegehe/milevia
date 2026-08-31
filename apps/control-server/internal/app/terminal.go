@@ -69,20 +69,20 @@ func (f terminalFactory) Open(ctx context.Context, spec TerminalSpec) (TerminalS
 }
 
 type terminalRecord struct {
-	session                          TerminalSession
-	projectID, runnerID, environment string
-	createdAt                        time.Time
-	mu                               sync.Mutex
-	state                            string
-	readyErr                         error
-	ready                            chan struct{}
-	seq                              uint64
-	replay                           []terminalChunk
-	subscriber                       *terminalSubscriber
-	closed                           bool
-	detachedAt                       time.Time
-	readerDone, waiterDone           bool
-	exitCode                         *int
+	session                                       TerminalSession
+	projectID, workspaceID, runnerID, environment string
+	createdAt                                     time.Time
+	mu                                            sync.Mutex
+	state                                         string
+	readyErr                                      error
+	ready                                         chan struct{}
+	seq                                           uint64
+	replay                                        []terminalChunk
+	subscriber                                    *terminalSubscriber
+	closed                                        bool
+	detachedAt                                    time.Time
+	readerDone, waiterDone                        bool
+	exitCode                                      *int
 }
 type terminalChunk struct {
 	seq  uint64
@@ -199,7 +199,11 @@ func newTerminalManager(s *Server) *terminalManager {
 	return &terminalManager{server: s, sessions: map[string]*terminalRecord{}, factory: terminalFactory{server: s}, projectGenerations: map[string]uint64{}, runnerGenerations: map[string]uint64{}, deletedProjects: map[string]bool{}, pending: map[uint64]terminalLease{}, shutdownCtx: shutdownCtx, shutdown: shutdown, startupTimeout: terminalStartupTimeout}
 }
 
-func (m *terminalManager) create(_ context.Context, project Project, cols, rows uint16) (*terminalRecord, error) {
+func (m *terminalManager) create(ctx context.Context, project Project, cols, rows uint16) (*terminalRecord, error) {
+	return m.createInWorkspace(ctx, project, "project-shared:"+project.ID, cols, rows)
+}
+
+func (m *terminalManager) createInWorkspace(_ context.Context, project Project, workspaceID string, cols, rows uint16) (*terminalRecord, error) {
 	if cols < 1 || cols > 500 || rows < 1 || rows > 200 {
 		return nil, errors.New("invalid terminal size")
 	}
@@ -228,7 +232,7 @@ func (m *terminalManager) create(_ context.Context, project Project, cols, rows 
 		return nil, err
 	}
 	createdAt := time.Now().UTC()
-	r := &terminalRecord{session: sess, projectID: project.ID, runnerID: project.RunnerID, environment: string(target), createdAt: createdAt, state: "starting", ready: make(chan struct{}), detachedAt: createdAt}
+	r := &terminalRecord{session: sess, projectID: project.ID, workspaceID: workspaceID, runnerID: project.RunnerID, environment: string(target), createdAt: createdAt, state: "starting", ready: make(chan struct{}), detachedAt: createdAt}
 	m.mu.Lock()
 	if !m.leaseValidLocked(leaseID) || len(m.sessions) >= terminalMaxProjects || m.projectSessionCountLocked(project.ID) >= terminalMaxPerProject {
 		m.mu.Unlock()
@@ -590,8 +594,10 @@ type terminalCreateRequest struct {
 }
 
 func (s *Server) createTerminal(w http.ResponseWriter, r *http.Request) {
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
 	projectID := chi.URLParam(r, "projectID")
-	p, err := s.getProjectByID(r.Context(), projectID)
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, 404, errors.New("project not found"))
@@ -600,6 +606,8 @@ func (s *Server) createTerminal(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	p := workspace.Project
+	p.Path = workspace.Workspace.Path
 	var req terminalCreateRequest
 	if !decodeOptional(w, r, &req) {
 		return
@@ -610,23 +618,28 @@ func (s *Server) createTerminal(w http.ResponseWriter, r *http.Request) {
 	if req.Rows == 0 {
 		req.Rows = 36
 	}
-	rec, err := s.terminals.create(r.Context(), p, req.Cols, req.Rows)
+	rec, err := s.terminals.createInWorkspace(r.Context(), p, workspace.Workspace.ID, req.Cols, req.Rows)
 	if err != nil {
 		writeError(w, 409, err)
 		return
 	}
-	writeJSON(w, 201, map[string]any{"id": rec.session.ID(), "projectId": projectID, "environment": rec.environment, "cwdDisplay": p.PathDisplay, "status": "starting", "createdAt": rec.createdAt})
+	writeJSON(w, 201, map[string]any{"id": rec.session.ID(), "projectId": projectID, "workspaceId": workspace.Workspace.ID, "environment": rec.environment, "cwdDisplay": p.Path, "status": "starting", "createdAt": rec.createdAt})
 }
 func (s *Server) listTerminals(w http.ResponseWriter, r *http.Request) {
 	pid := chi.URLParam(r, "projectID")
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	s.terminals.mu.Lock()
 	out := []map[string]any{}
 	for _, rec := range s.terminals.sessions {
-		if rec.projectID != pid {
+		if rec.projectID != pid || rec.workspaceID != workspace.Workspace.ID {
 			continue
 		}
 		rec.mu.Lock()
-		out = append(out, map[string]any{"id": rec.session.ID(), "projectId": pid, "environment": rec.environment, "status": rec.state, "createdAt": rec.createdAt})
+		out = append(out, map[string]any{"id": rec.session.ID(), "projectId": pid, "workspaceId": rec.workspaceID, "environment": rec.environment, "cwdDisplay": workspace.Workspace.Path, "status": rec.state, "createdAt": rec.createdAt})
 		rec.mu.Unlock()
 	}
 	s.terminals.mu.Unlock()
@@ -634,8 +647,13 @@ func (s *Server) listTerminals(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) deleteTerminal(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "sessionID")
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	rec, ok := s.terminals.get(sessionID)
-	if !ok || rec.projectID != chi.URLParam(r, "projectID") {
+	if !ok || rec.projectID != chi.URLParam(r, "projectID") || rec.workspaceID != workspace.Workspace.ID {
 		writeError(w, http.StatusNotFound, errors.New("terminal not found"))
 		return
 	}
@@ -678,8 +696,13 @@ func (s *Server) terminalWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.websocketWG.Done()
+	workspace, resolveErr := s.resolveRequestWorkspaceFromRequest(r)
+	if resolveErr != nil {
+		writeError(w, http.StatusConflict, resolveErr)
+		return
+	}
 	rec, ok := s.terminals.get(chi.URLParam(r, "sessionID"))
-	if !ok || rec.projectID != chi.URLParam(r, "projectID") {
+	if !ok || rec.projectID != chi.URLParam(r, "projectID") || rec.workspaceID != workspace.Workspace.ID {
 		writeError(w, 404, errors.New("terminal not found"))
 		return
 	}

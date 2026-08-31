@@ -7,6 +7,7 @@ type SQLiteRows = { columns: string[]; rows: SQLiteCell[][]; offset: number; lim
 
 interface SqliteViewerProps {
   projectId: string;
+	conversationId?: string;
   path: string;
   request: <T>(path: string, init?: RequestInit) => Promise<T>;
   onNotDatabase: () => void;
@@ -14,7 +15,7 @@ interface SqliteViewerProps {
 
 type RequestError = Error & { code?: string };
 
-export function SqliteViewer({ projectId, path, request, onNotDatabase }: SqliteViewerProps) {
+export function SqliteViewer({ projectId, conversationId, path, request, onNotDatabase }: SqliteViewerProps) {
   const [objects, setObjects] = useState<SQLiteObject[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [columns, setColumns] = useState<SQLiteColumn[]>([]);
@@ -29,7 +30,7 @@ export function SqliteViewer({ projectId, path, request, onNotDatabase }: Sqlite
     setError(null);
     setObjects([]);
     setSelected("");
-    void request<{ tables: SQLiteObject[] }>(`/api/projects/${projectId}/fs/sqlite/tables?path=${encodeURIComponent(path)}`)
+    void request<{ tables: SQLiteObject[] }>(`/api/projects/${projectId}/fs/sqlite/tables?path=${encodeURIComponent(path)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`)
       .then((response) => {
         if (cancelled) return;
         const next = response.tables ?? [];
@@ -46,7 +47,7 @@ export function SqliteViewer({ projectId, path, request, onNotDatabase }: Sqlite
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [onNotDatabase, path, projectId, request]);
+  }, [onNotDatabase, path, projectId, request, conversationId]);
 
   useEffect(() => {
     rowsRequestVersion.current++;
@@ -59,7 +60,7 @@ export function SqliteViewer({ projectId, path, request, onNotDatabase }: Sqlite
     setLoading(true);
     setError(null);
     const base = `/api/projects/${projectId}/fs/sqlite`;
-    const query = `path=${encodeURIComponent(path)}&table=${encodeURIComponent(selected)}`;
+    const query = `path=${encodeURIComponent(path)}&table=${encodeURIComponent(selected)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
     void Promise.all([
       request<{ columns: SQLiteColumn[] }>(`${base}/schema?${query}`),
       request<SQLiteRows>(`${base}/rows?${query}&limit=100&offset=0`),
@@ -70,14 +71,14 @@ export function SqliteViewer({ projectId, path, request, onNotDatabase }: Sqlite
     }).catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : "无法读取数据表"); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [path, projectId, request, selected]);
+  }, [path, projectId, request, selected, conversationId]);
 
   const changePage = (offset: number) => {
     if (!selected || offset < 0) return;
     const requestVersion = ++rowsRequestVersion.current;
     setLoading(true);
     setError(null);
-    const query = `path=${encodeURIComponent(path)}&table=${encodeURIComponent(selected)}&limit=100&offset=${offset}`;
+    const query = `path=${encodeURIComponent(path)}&table=${encodeURIComponent(selected)}&limit=100&offset=${offset}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
     void request<SQLiteRows>(`/api/projects/${projectId}/fs/sqlite/rows?${query}`)
       .then((page) => { if (requestVersion === rowsRequestVersion.current) setRows(page); })
       .catch((reason) => { if (requestVersion === rowsRequestVersion.current) setError(reason instanceof Error ? reason.message : "无法读取数据表"); })

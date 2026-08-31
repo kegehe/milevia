@@ -7,6 +7,7 @@ import { api } from "../lib/api";
 import { createWebSocket } from "../lib/runtime";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
 import type { TerminalSessionInfo } from "../lib/types";
+import { useActiveConversationId } from "../lib/use-active-conversation";
 import "../terminal.css";
 
 function terminalSequence(data: ArrayBuffer): bigint {
@@ -32,12 +33,14 @@ export default function TerminalPage() {
   const [replayTruncated, setReplayTruncated] = useState(false);
   const [connectionVersion, setConnectionVersion] = useState(0);
   projectIDRef.current = projectId;
+  const conversationId = useActiveConversationId(projectId);
+	const workspaceQuery = conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : "";
 
   const createSession = useCallback(() => {
     if (!projectId) return Promise.resolve(null);
     if (creatingRef.current?.projectId === projectId) return creatingRef.current.promise;
     const term = termRef.current;
-    const request = api<TerminalSessionInfo>(`/api/projects/${projectId}/terminal/sessions`, {
+    const request = api<TerminalSessionInfo>(`/api/projects/${projectId}/terminal/sessions${workspaceQuery}`, {
       method: "POST",
       body: JSON.stringify({ cols: term?.cols || 120, rows: term?.rows || 36 }),
     }).then((created) => {
@@ -55,12 +58,12 @@ export default function TerminalPage() {
       if (creatingRef.current?.promise === request) creatingRef.current = null;
     });
     return request;
-  }, [projectId]);
+  }, [projectId, workspaceQuery]);
 
   const refreshSessions = useCallback(async () => {
     if (!projectId) return [];
-    return api<TerminalSessionInfo[]>(`/api/projects/${projectId}/terminal/sessions`);
-  }, [projectId]);
+    return api<TerminalSessionInfo[]>(`/api/projects/${projectId}/terminal/sessions${workspaceQuery}`);
+  }, [projectId, workspaceQuery]);
 
   useEffect(() => {
     let cancelled = false;
@@ -95,7 +98,32 @@ export default function TerminalPage() {
       cursorBlink: true,
       scrollback: 5000,
       fontSize: 13,
-      theme: { background: "#101917", foreground: "#d4e7df", cursor: "#7dd3b0" },
+      fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, monospace',
+      lineHeight: 1.35,
+      letterSpacing: 0.15,
+      theme: {
+        background: "#10171b",
+        foreground: "#d7e3e7",
+        cursor: "#75d7b2",
+        cursorAccent: "#10171b",
+        selectionBackground: "#315b58",
+        black: "#172126",
+        red: "#f08b86",
+        green: "#75d7b2",
+        yellow: "#edc36b",
+        blue: "#88b9e8",
+        magenta: "#c2a0e8",
+        cyan: "#72cbd0",
+        white: "#d7e3e7",
+        brightBlack: "#6e828a",
+        brightRed: "#ffaaa3",
+        brightGreen: "#a2efd0",
+        brightYellow: "#f6d68d",
+        brightBlue: "#acd1f3",
+        brightMagenta: "#ddc2fa",
+        brightCyan: "#a0e9e9",
+        brightWhite: "#f4f8f9",
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -117,7 +145,7 @@ export default function TerminalPage() {
     setExitCode(null);
     setError("");
     setReplayTruncated(false);
-    const ws = createWebSocket(`/ws/projects/${projectId}/terminal/${activeID}`);
+    const ws = createWebSocket(`/ws/projects/${projectId}/terminal/${activeID}${workspaceQuery}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
     ws.onopen = () => {
@@ -176,7 +204,7 @@ export default function TerminalPage() {
   const closeActive = async () => {
     if (!projectId || !activeID) return;
     try {
-      await api<void>(`/api/projects/${projectId}/terminal/sessions/${activeID}`, { method: "DELETE" });
+      await api<void>(`/api/projects/${projectId}/terminal/sessions/${activeID}${workspaceQuery}`, { method: "DELETE" });
       sequencesRef.current.delete(activeID);
       const remaining = sessions.filter((item) => item.id !== activeID);
       setSessions(remaining);
@@ -190,25 +218,46 @@ export default function TerminalPage() {
 
   const selected = sessions.find((item) => item.id === activeID);
   const canReconnect = Boolean(activeID) && status !== "running" && status !== "connecting";
+  const statusLabel = status === "running" ? "运行中" : status === "connecting" ? "连接中" : status === "disconnected" ? "已断开" : status === "exited" ? "已退出" : status === "failed" ? "不可用" : "未启动";
   return <section className="terminal-page">
     <header className="terminal-toolbar">
-      <div className="terminal-title"><span>项目终端</span><h3>{project.name}</h3></div>
+      <div className="terminal-title">
+        <div className="terminal-title-heading"><span className="terminal-title-icon" aria-hidden="true"><TerminalIcon /></span><span className="terminal-kicker">项目终端</span></div>
+        <h3 title={project.name}>{project.name}</h3>
+      </div>
       <div className="terminal-actions">
-        <select aria-label="终端会话" value={activeID || ""} onChange={(event) => { setActiveID(event.target.value || null); setConnectionVersion((version) => version + 1); }}>
+        <label className="terminal-session-picker">
+          <span className="terminal-session-icon" aria-hidden="true"><SessionIcon /></span>
+          <select aria-label="终端会话" value={activeID || ""} onChange={(event) => { setActiveID(event.target.value || null); setConnectionVersion((version) => version + 1); }}>
           <option value="" disabled>选择终端</option>
           {sessions.map((item, index) => <option key={item.id} value={item.id}>终端 {index + 1} · {item.environment}</option>)}
-        </select>
-        <button type="button" onClick={() => void createSession()} disabled={sessions.length >= 3}>新建</button>
-        <button type="button" onClick={() => setConnectionVersion((version) => version + 1)} disabled={!canReconnect}>重连</button>
-        <button type="button" onClick={() => termRef.current?.clear()} disabled={!activeID}>清屏</button>
-        <button type="button" className="terminal-close" onClick={() => void closeActive()} disabled={!activeID}>关闭</button>
+          </select>
+        </label>
+        <div className="terminal-button-group">
+          <button type="button" aria-label="新建终端" onClick={() => void createSession()} disabled={sessions.length >= 3} title="新建终端"><PlusIcon /><span>新建</span></button>
+          <button type="button" aria-label="重新连接" onClick={() => setConnectionVersion((version) => version + 1)} disabled={!canReconnect} title="重新连接"><ReconnectIcon /><span>重连</span></button>
+          <button type="button" aria-label="清空终端输出" onClick={() => termRef.current?.clear()} disabled={!activeID} title="清空终端输出"><ClearIcon /><span>清屏</span></button>
+          <button type="button" aria-label="关闭当前终端" className="terminal-close" onClick={() => void closeActive()} disabled={!activeID} title="关闭当前终端"><CloseIcon /><span>关闭</span></button>
+        </div>
       </div>
-      <strong className={`terminal-status ${status}`}>{status === "running" ? "运行中" : status === "connecting" ? "连接中" : status === "disconnected" ? "已断开" : status === "exited" ? "已退出" : status === "failed" ? "不可用" : "未启动"}</strong>
+      <strong className={`terminal-status ${status}`}><i aria-hidden="true" />{statusLabel}</strong>
     </header>
-    <div className="terminal-meta">{selected ? `${selected.environment} · ${project.pathDisplay}` : "没有活动终端"}</div>
-    <div ref={hostRef} className="terminal-host" />
+    <div className="terminal-meta">
+      {selected ? <><span className="terminal-meta-environment">{selected.environment}</span><span className="terminal-meta-separator" aria-hidden="true">/</span><code title={project.pathDisplay}>{project.pathDisplay}</code></> : <span>没有活动终端</span>}
+      <span className="terminal-meta-count">{sessions.length}/3 会话</span>
+    </div>
+    <div ref={hostRef} className="terminal-host">
+      {(!activeID || selected?.projectId !== projectId) && <div className="terminal-empty"><span className="terminal-empty-icon" aria-hidden="true"><TerminalIcon /></span><strong>尚未选择终端</strong><span>创建一个新会话开始工作</span></div>}
+    </div>
     {status === "exited" && exitCode !== null && <p className="terminal-exit-code">exit code {exitCode}</p>}
     {replayTruncated && <p className="terminal-notice">{"\u90e8\u5206\u7ec8\u7aef\u8f93\u51fa\u5df2\u8fc7\u671f\uff0c\u65e0\u6cd5\u6062\u590d"}</p>}
     {error && <p className="terminal-error" role="alert">{error}</p>}
   </section>;
 }
+
+function TerminalIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2.5" /><path d="m7 9 3 3-3 3M13 15h4" /></svg>; }
+function SessionIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2" /><path d="M7 8h10M7 12h4M7 16h7" /></svg>; }
+function PlusIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>; }
+function ReconnectIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8a7 7 0 0 0-12-1L5 9" /><path d="M5 5v4h4M5 16a7 7 0 0 0 12 1l2-2" /><path d="M19 19v-4h-4" /></svg>; }
+function ClearIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 7 1 13h10l1-13M4 7h16M9 7V4h6v3M10 11v5M14 11v5" /></svg>; }
+function CloseIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>; }

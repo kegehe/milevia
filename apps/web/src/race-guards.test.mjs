@@ -98,6 +98,7 @@ test("orchestration workspace loads complete history and keeps a single-column m
   assert.match(orchestrationStyles, /\.orchestration-page \{ display: flex; height: 100%; min-height: 0; flex-direction: column; overflow: hidden; \}/);
   assert.match(orchestrationStyles, /\.orchestration-console \{ min-height: 0; flex: 1 1 0; grid-template-rows: minmax\(0, 1fr\); overflow: hidden; \}/);
   assert.match(orchestrationStyles, /\.orchestration-console > \* \{ min-height: 0; \}/);
+  assert.match(orchestrationStyles, /\.orchestration-conversation \{ position: relative;/);
   assert.match(orchestrationStyles, /\.orchestration-scroll-buttons \{ position: absolute; right: 18px; bottom: 18px; \}/);
   assert.match(orchestrationStyles, /\.orchestration-queue, \.orchestration-detail \{ overflow-y: auto; overflow-x: hidden; \}/);
   assert.match(orchestrationStyles, /@media \(max-width: 820px\) \{[\s\S]*?\.orchestration-console \{ grid-template-columns: 1fr; \}/);
@@ -117,4 +118,8 @@ test("Git, project dashboard, and SSH lists discard stale responses", () => {
   assert.match(runPanel, /const statusRequestVersionRef = useRef\(0\);/);
   assert.match(runPanel, /const requestVersion = \+\+statusRequestVersionRef\.current;/);
   assert.match(runPanel, /requestVersion !== statusRequestVersionRef\.current/);
+});
+
+test("Git operation history follows the selected conversation workspace", () => {
+  assert.match(gitWorkbench, /request<GitOperation\[\]>\(withWorkspace\(`\$\{base\}\/operations`\)\)/);
 });

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -44,50 +45,58 @@ func (s *Server) registerFSRoutes(r chi.Router) {
 const downloadTicketTTL = time.Minute
 
 type downloadTicketPayload struct {
-	ProjectID string `json:"projectId"`
-	Path      string `json:"path"`
-	ExpiresAt int64  `json:"expiresAt"`
+	ProjectID      string `json:"projectId"`
+	WorkspaceID    string `json:"workspaceId"`
+	ConversationID string `json:"conversationId,omitempty"`
+	Path           string `json:"path"`
+	ExpiresAt      int64  `json:"expiresAt"`
 }
 
 // validDownloadTicket permits a short-lived, path-bound download navigation.
 // It is intentionally restricted to GET downloads because browser navigations
 // cannot attach the desktop session header.
 func (s *Server) validDownloadTicket(r *http.Request) bool {
+	payload, ok := s.downloadTicketPayload(r)
+	return ok && payload.WorkspaceID != ""
+}
+
+func (s *Server) downloadTicketPayload(r *http.Request) (downloadTicketPayload, bool) {
 	const prefix = "/api/projects/"
 	const suffix = "/fs/download"
 	if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) || !strings.HasSuffix(r.URL.Path, suffix) {
-		return false
+		return downloadTicketPayload{}, false
 	}
 	projectID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, prefix), suffix)
 	if projectID == "" || strings.Contains(projectID, "/") {
-		return false
+		return downloadTicketPayload{}, false
 	}
 	parts := strings.Split(r.URL.Query().Get("ticket"), ".")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return false
+		return downloadTicketPayload{}, false
 	}
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return false
+		return downloadTicketPayload{}, false
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return false
+		return downloadTicketPayload{}, false
 	}
 	mac := hmac.New(sha256.New, []byte(s.config.SessionToken))
 	_, _ = mac.Write(payloadBytes)
 	if !hmac.Equal(signature, mac.Sum(nil)) {
-		return false
+		return downloadTicketPayload{}, false
 	}
 	var payload downloadTicketPayload
 	if json.Unmarshal(payloadBytes, &payload) != nil {
-		return false
+		return downloadTicketPayload{}, false
 	}
-	return payload.ExpiresAt >= time.Now().UTC().Unix() && payload.ProjectID == projectID && payload.Path == r.URL.Query().Get("path")
+	valid := payload.ExpiresAt >= time.Now().UTC().Unix() && payload.ProjectID == projectID && payload.ConversationID == r.URL.Query().Get("conversationId") && payload.Path == r.URL.Query().Get("path")
+	return payload, valid
 }
 
-func (s *Server) issueDownloadTicket(projectID, path string) (string, error) {
-	payloadBytes, err := json.Marshal(downloadTicketPayload{ProjectID: projectID, Path: path, ExpiresAt: time.Now().UTC().Add(downloadTicketTTL).Unix()})
+func (s *Server) issueDownloadTicket(projectID, workspaceID, conversationID, path string) (string, error) {
+	payloadBytes, err := json.Marshal(downloadTicketPayload{ProjectID: projectID, WorkspaceID: workspaceID, ConversationID: conversationID, Path: path, ExpiresAt: time.Now().UTC().Add(downloadTicketTTL).Unix()})
 	if err != nil {
 		return "", err
 	}
@@ -98,17 +107,21 @@ func (s *Server) issueDownloadTicket(projectID, path string) (string, error) {
 
 // getFilesystem 根据项目的 runner 类型返回对应的 Filesystem 实现。
 func (s *Server) getFilesystem(r *http.Request) (Filesystem, error) {
-	projectID := chi.URLParam(r, "projectID")
-	project, err := s.getProjectByID(r.Context(), projectID)
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		return nil, fmt.Errorf("项目不存在：%w", err)
+		return nil, err
 	}
+	return s.filesystemForWorkspace(r.Context(), workspace)
+}
+
+func (s *Server) filesystemForWorkspace(ctx context.Context, workspace resolvedConversationWorkspace) (Filesystem, error) {
+	project := workspace.Project
 
 	if isLocalRunnerID(project.Runner) || project.Runner == "wsl-local" {
 		// wsl-local 项目路径为 UNC（\\wsl$\...），Go 的 os 直读，复用 LocalFilesystem。
 		return &LocalFilesystem{
 			allowedRoot: s.config.AllowedRoot,
-			projectPath: project.Path,
+			projectPath: workspace.Workspace.Path,
 		}, nil
 	}
 
@@ -123,9 +136,9 @@ func (s *Server) getFilesystem(r *http.Request) (Filesystem, error) {
 	}
 	fs := &SFTPFilesystem{
 		client:   sshR.client,
-		rootPath: project.Path,
+		rootPath: workspace.Workspace.Path,
 	}
-	rootPath, err := fs.canonicalRoot(r.Context())
+	rootPath, err := fs.canonicalRoot(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +255,19 @@ func (s *Server) fsDownloadFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("path 参数必填"))
 		return
 	}
-	fs, err := s.getFilesystem(r)
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	if r.URL.Query().Get("ticket") != "" {
+		payload, valid := s.downloadTicketPayload(r)
+		if !valid || payload.WorkspaceID != workspace.Workspace.ID {
+			writeError(w, http.StatusUnauthorized, errors.New("download ticket does not match the active workspace"))
+			return
+		}
+	}
+	fs, err := s.filesystemForWorkspace(r.Context(), workspace)
 	if err != nil {
 		s.writeFSError(w, err)
 		return
@@ -280,7 +305,12 @@ func (s *Server) fsCreateDownloadTicket(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, errors.New("path parameter is required"))
 		return
 	}
-	fs, err := s.getFilesystem(r)
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	fs, err := s.filesystemForWorkspace(r.Context(), workspace)
 	if err != nil {
 		s.writeFSError(w, err)
 		return
@@ -294,12 +324,16 @@ func (s *Server) fsCreateDownloadTicket(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, errors.New("path is a directory"))
 		return
 	}
-	ticket, err := s.issueDownloadTicket(chi.URLParam(r, "projectID"), input.Path)
+	ticket, err := s.issueDownloadTicket(chi.URLParam(r, "projectID"), workspace.Workspace.ID, workspace.ConversationID, input.Path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"url": "/api/projects/" + chi.URLParam(r, "projectID") + "/fs/download?path=" + url.QueryEscape(input.Path) + "&ticket=" + url.QueryEscape(ticket)})
+	query := "path=" + url.QueryEscape(input.Path) + "&ticket=" + url.QueryEscape(ticket)
+	if workspace.ConversationID != "" {
+		query += "&conversationId=" + url.QueryEscape(workspace.ConversationID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": "/api/projects/" + chi.URLParam(r, "projectID") + "/fs/download?" + query})
 }
 
 func contentDispositionFilename(path string) string {
@@ -341,17 +375,20 @@ func (s *Server) fsSearch(w http.ResponseWriter, r *http.Request) {
 // ─── 写入操作 ───────────────────────────────────────────────────────────────
 
 func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
-	projectID := chi.URLParam(r, "projectID")
-
-	// 写入操作需要 workspace lease
-	release, ok := s.acquireProjectWorkspace(projectID, "fs:"+uuid.NewString())
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	// 写入操作需要实际目录级 workspace lease。
+	release, ok := s.acquireWorkspace(workspaceLeaseKey(workspace.Project, workspace.Workspace), "fs:"+uuid.NewString())
 	if !ok {
-		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceLeaseKey(workspace.Project, workspace.Workspace)))
 		return
 	}
 	defer release()
 
-	fs, err := s.getFilesystem(r)
+	fs, err := s.filesystemForWorkspace(r.Context(), workspace)
 	if err != nil {
 		s.writeFSError(w, err)
 		return
@@ -386,16 +423,19 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fsMkdir(w http.ResponseWriter, r *http.Request) {
-	projectID := chi.URLParam(r, "projectID")
-
-	release, ok := s.acquireProjectWorkspace(projectID, "fs:"+uuid.NewString())
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	release, ok := s.acquireWorkspace(workspaceLeaseKey(workspace.Project, workspace.Workspace), "fs:"+uuid.NewString())
 	if !ok {
-		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceLeaseKey(workspace.Project, workspace.Workspace)))
 		return
 	}
 	defer release()
 
-	fs, err := s.getFilesystem(r)
+	fs, err := s.filesystemForWorkspace(r.Context(), workspace)
 	if err != nil {
 		s.writeFSError(w, err)
 		return
@@ -420,16 +460,19 @@ func (s *Server) fsMkdir(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fsRemove(w http.ResponseWriter, r *http.Request) {
-	projectID := chi.URLParam(r, "projectID")
-
-	release, ok := s.acquireProjectWorkspace(projectID, "fs:"+uuid.NewString())
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	release, ok := s.acquireWorkspace(workspaceLeaseKey(workspace.Project, workspace.Workspace), "fs:"+uuid.NewString())
 	if !ok {
-		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceLeaseKey(workspace.Project, workspace.Workspace)))
 		return
 	}
 	defer release()
 
-	fs, err := s.getFilesystem(r)
+	fs, err := s.filesystemForWorkspace(r.Context(), workspace)
 	if err != nil {
 		s.writeFSError(w, err)
 		return
@@ -449,16 +492,19 @@ func (s *Server) fsRemove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fsRename(w http.ResponseWriter, r *http.Request) {
-	projectID := chi.URLParam(r, "projectID")
-
-	release, ok := s.acquireProjectWorkspace(projectID, "fs:"+uuid.NewString())
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		s.writeFSError(w, err)
+		return
+	}
+	release, ok := s.acquireWorkspace(workspaceLeaseKey(workspace.Project, workspace.Workspace), "fs:"+uuid.NewString())
 	if !ok {
-		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
+		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceLeaseKey(workspace.Project, workspace.Workspace)))
 		return
 	}
 	defer release()
 
-	fs, err := s.getFilesystem(r)
+	fs, err := s.filesystemForWorkspace(r.Context(), workspace)
 	if err != nil {
 		s.writeFSError(w, err)
 		return

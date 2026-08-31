@@ -1,7 +1,7 @@
 // 路由入口 — 从 2003 行精简为 ~50 行
 
 import { useEffect } from "react";
-import { BrowserRouter, Routes, Route, Navigate, useNavigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useNavigate, useParams } from "react-router-dom";
 import { ProjectProvider } from "./stores/useProjectStore";
 import { UIPreferencesProvider } from "./stores/useUIPreferences";
 import { NotificationProvider } from "./components/NotificationProvider";
@@ -43,6 +43,15 @@ function NavigationBridge() {
   return null;
 }
 
+// /tasks 归一到 /tasks/board 的中间跳转。这里不能用相对路径 <Navigate to="tasks/board">：
+// 相对路径会相对当前 URL（/projects/:pid/tasks）解析成 /projects/:pid/tasks/tasks/board，
+// 匹配不到任何路由，最终被 * 兜底重定向到项目总览（Dashboard）。改用绝对 /absolute 目标，
+// 从 :projectId 现场拼出完整路径，绕开该问题。
+function RedirectToTaskBoard() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <Navigate to={`/projects/${projectId}/tasks/board`} replace />;
+}
+
 export function App() {
   return (
     <BrowserRouter>
@@ -63,7 +72,7 @@ export function App() {
                     <Route index element={<Navigate to="conversations" replace />} />
                     <Route path="conversations" element={<ConversationPage />} />
                     <Route path="conversations/:conversationId" element={<ConversationPage />} />
-                    <Route path="tasks" element={<Navigate to="tasks/board" replace />} />
+                    <Route path="tasks" element={<RedirectToTaskBoard />} />
                     <Route path="tasks/board" element={<TaskBoardPage />} />
                     <Route path="tasks/board/:taskId" element={<TaskBoardPage />} />
                     <Route path="tasks/schedules" element={<ScheduledTasksPage />} />

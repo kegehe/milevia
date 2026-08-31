@@ -109,17 +109,26 @@ var insightThemeLabels = map[string]string{
 	insightThemeStability: "稳定性",
 }
 
-// scanRequest POST /insights/scan 的可选 body：选定方向（theme + types）。
+// scanRequest POST /insights/scan 的可选 body：选定 Agent 与分析方向（agent + theme + types）。
 // theme 空串 = 全面分析；types 空/全选 = 全查。两者都可省略，缺省等价于原全量扫描。
 type scanRequest struct {
+	Agent string   `json:"agent"`
 	Theme string   `json:"theme"`
 	Types []string `json:"types"`
 }
 
-// scanOpts 本次扫描的方向，供 prompt 组装与入库。
+// scanOpts 本次扫描的 Agent 与方向，供 prompt 组装与入库。
 type scanOpts struct {
+	Agent string
 	Theme string
 	Types []string // 已归一化、去重；空 = 全查
+}
+
+func normalizeScanAgent(agent string) string {
+	if agent == "claude-code" || agent == "codex" {
+		return agent
+	}
+	return ""
 }
 
 // normalizeScanTheme 把请求里的主题归一到白名单；非法/空 → ""（全面分析）。
@@ -157,7 +166,7 @@ func normalizeScanTypes(types []string) []string {
 
 // buildScanOpts 把 scanRequest 解析为规范化 scanOpts（供入库与 prompt 消费）。
 func buildScanOpts(req scanRequest) scanOpts {
-	return scanOpts{Theme: normalizeScanTheme(req.Theme), Types: normalizeScanTypes(req.Types)}
+	return scanOpts{Agent: normalizeScanAgent(req.Agent), Theme: normalizeScanTheme(req.Theme), Types: normalizeScanTypes(req.Types)}
 }
 
 // InsightScan 一条项目分析扫描（含两趟 agent 运行）的状态行。
@@ -224,6 +233,7 @@ type InsightEvent struct {
 
 // insightsResponse `GET /api/projects/{id}/insights` 的荷载。
 type insightsResponse struct {
+	DefaultAgent    string           `json:"defaultAgent"`
 	Scan            *InsightScan     `json:"scan"`
 	Findings        []InsightFinding `json:"findings"`
 	Events          []InsightEvent   `json:"events"`
@@ -233,6 +243,11 @@ type insightsResponse struct {
 	// Invalidated 是经验证已失效、从有效列表隐藏的建议（折叠展示，含 AI 判断依据）。
 	Invalidated  []InsightFinding        `json:"invalidated,omitempty"`
 	Verification *InsightVerificationRun `json:"verification,omitempty"`
+}
+
+type verifyInsightsRequest struct {
+	Agent      string   `json:"agent"`
+	FindingIDs []string `json:"findingIds"`
 }
 
 // pendingInsight 是 Pass A 产出的候选发现（尚未核实/去重），也是扫描用的内部表示。
@@ -1003,10 +1018,10 @@ func normalizeInsightReverifyStatus(status string, legacyExists *bool) (string, 
 // if the repository still matches the version observed before verification. This prevents
 // a late batch or a concurrent edit from making earlier, stale conclusions authoritative.
 func (s *Server) runInsightFindingsVerify(ctx context.Context, projectID string, targets []InsightFinding) {
-	s.runInsightFindingsVerifyRun(ctx, projectID, "", targets)
+	s.runInsightFindingsVerifyRun(ctx, projectID, "", "", targets)
 }
 
-func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, verificationID string, targets []InsightFinding) {
+func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, verificationID, agentID string, targets []InsightFinding) {
 	if len(targets) == 0 {
 		return
 	}
@@ -1050,7 +1065,10 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 	if revision.Available {
 		s.setInsightVerificationRunRevision(verifyCtx, verificationID, revision.RepoSHA)
 	}
-	agentID := s.currentInsightAgent(verifyCtx, projectID)
+	agentID = normalizeScanAgent(agentID)
+	if agentID == "" {
+		agentID = s.currentInsightAgent(verifyCtx, projectID)
+	}
 	results := make(map[string]insightReverifyResult, len(targets))
 
 	for start := 0; start < len(targets); start += insightVerifyBatchSize {
@@ -1229,7 +1247,7 @@ func (s *Server) resolveVerifyTargets(ctx context.Context, projectID string, ids
 }
 
 // verifyInsightFindings POST /api/projects/{projectID}/insights/verify
-// 对既有建议发起新一轮 AI 核验。可选 body {"findingIds":[...]}，缺省 = 全部有效建议。
+// 对既有建议发起新一轮 AI 核验。可选 body {"agent":"codex","findingIds":[...]}，缺省 = 全部有效建议。
 // 异步执行：先把目标置 pending 并返回 202，后台跑只读 agent 后逐条写回
 // valid/invalid/failed。单项目互斥：扫描/验证进行中返回 409。
 func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
@@ -1238,11 +1256,13 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	var req struct {
-		FindingIDs []string `json:"findingIds"`
-	}
+	var req verifyInsightsRequest
 	if !decodeOptional(w, r, &req) {
 		return
+	}
+	agentID := normalizeScanAgent(req.Agent)
+	if agentID == "" {
+		agentID = s.currentInsightAgent(r.Context(), projectID)
 	}
 	targets, err := s.resolveVerifyTargets(r.Context(), projectID, req.FindingIDs)
 	if err != nil {
@@ -1380,7 +1400,7 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 			delete(s.insightCancels, projectID)
 			s.insightMu.Unlock()
 		}()
-		s.runInsightFindingsVerifyRun(runCtx, projectID, verificationID, pendingTargets)
+		s.runInsightFindingsVerifyRun(runCtx, projectID, verificationID, agentID, pendingTargets)
 	}()
 }
 
@@ -1450,8 +1470,8 @@ func insightRunErrorMessage(prefix string, err error) string {
 	return prefix + "：" + msg
 }
 
-// currentInsightAgent 返回项目当前会话的 agentId（决定扫描/再验证用 claude 还是
-// codex）；无当前会话或缺省值时回退 claude-code。
+// currentInsightAgent 返回项目当前会话的 agentId（决定扫描/再验证用 claude
+// 还是 codex）；无当前会话或缺省值时回退 claude-code。它不能依赖浏览器窗口的活跃 Tab。
 func (s *Server) currentInsightAgent(ctx context.Context, projectID string) string {
 	agentID := "claude-code"
 	_ = s.db.QueryRowContext(ctx, `select agent_id from conversations where project_id=? and is_current=true`, projectID).Scan(&agentID)
@@ -1598,8 +1618,11 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 		return
 	}
 
-	// 决定用 claude 还是 codex：跟随项目当前会话的 agentId。
-	agentID := s.currentInsightAgent(ctx, projectID)
+	// 新客户端会明确指定 Agent；旧客户端未指定时沿用当前会话的兼容行为。
+	agentID := normalizeScanAgent(opts.Agent)
+	if agentID == "" {
+		agentID = s.currentInsightAgent(ctx, projectID)
+	}
 
 	emit("info", "开始优化建议分析…")
 
@@ -1804,6 +1827,10 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := buildScanOpts(req)
+	if opts.Agent == "" {
+		// 兼容未传 agent 的旧客户端，同时让扫描记录保存实际使用的 Agent。
+		opts.Agent = s.currentInsightAgent(r.Context(), projectID)
+	}
 	scanID := uuid.NewString()
 
 	s.insightMu.Lock()
@@ -1859,7 +1886,7 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.db.ExecContext(r.Context(), `insert into project_insight_scans
 		(id,project_id,status,agent,theme,focus_types,findings_count,suppressed_count,created_at,started_at)
 		values (?,?,?,?,?,?,0,0,?,?)`,
-		scanID, projectID, insightScanRunning, "", opts.Theme, strings.Join(opts.Types, ","), now, now); err != nil {
+		scanID, projectID, insightScanRunning, opts.Agent, opts.Theme, strings.Join(opts.Types, ","), now, now); err != nil {
 		runCancel()
 		s.insightMu.Lock()
 		delete(s.insightActive, projectID)
@@ -1870,7 +1897,7 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scan := InsightScan{ID: scanID, ProjectID: projectID, Status: insightScanRunning, Agent: "", Theme: opts.Theme, FocusTypes: opts.Types, FindingsCount: 0, SuppressedCount: 0, CreatedAt: now}
+	scan := InsightScan{ID: scanID, ProjectID: projectID, Status: insightScanRunning, Agent: opts.Agent, Theme: opts.Theme, FocusTypes: opts.Types, FindingsCount: 0, SuppressedCount: 0, CreatedAt: now}
 	writeJSON(w, http.StatusAccepted, scan)
 
 	// 后台执行扫描。Done 在扫描 goroutine 内调用，使 insightWG 精确跟踪扫描生命周期，
@@ -1949,7 +1976,7 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := insightsResponse{Findings: []InsightFinding{}, Events: []InsightEvent{}}
+	resp := insightsResponse{DefaultAgent: s.currentInsightAgent(r.Context(), projectID), Findings: []InsightFinding{}, Events: []InsightEvent{}}
 	resp.Verification = s.loadRunningInsightVerification(r.Context(), projectID)
 	row := s.db.QueryRowContext(r.Context(), `select id,project_id,status,error,agent,theme,focus_types,findings_count,suppressed_count,created_at,started_at,completed_at
 		from project_insight_scans where project_id=? order by created_at desc limit 1`, projectID)
@@ -1973,9 +2000,6 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 		}
 		if completedAt.Valid {
 			scan.CompletedAt = &completedAt.Time
-		}
-		if scan.Status == insightScanRunning {
-			scan.Agent = ""
 		}
 		resp.Scan = &scan
 		resp.HasScan = true
@@ -2289,18 +2313,18 @@ func (s *Server) addInsightToTask(w http.ResponseWriter, r *http.Request) {
 func (s *Server) convertInsightToTask(ctx context.Context, projectID string, f InsightFinding) (Task, bool, error) {
 	now := time.Now().UTC()
 	task := Task{
-		ID:                 uuid.NewString(),
-		ProjectID:          projectID,
-		Title:              truncateInsightRunes(f.Title, 120),
-		Description:        truncateInsightRunes(buildInsightTaskDescription(f), 12000),
-		Priority:           insightTaskPriority(f.Severity),
-		Position:           0,
-		Status:             taskTodo,
-		CreatedAt:          now,
-		UpdatedAt:          now,
-		DependsOn:          []TaskDependency{},
-		BlockedBy:          []TaskBlocker{},
-		Blocks:             []TaskDependency{},
+		ID:          uuid.NewString(),
+		ProjectID:   projectID,
+		Title:       truncateInsightRunes(f.Title, 120),
+		Description: truncateInsightRunes(buildInsightTaskDescription(f), 12000),
+		Priority:    insightTaskPriority(f.Severity),
+		Position:    0,
+		Status:      taskTodo,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		DependsOn:   []TaskDependency{},
+		BlockedBy:   []TaskBlocker{},
+		Blocks:      []TaskDependency{},
 	}
 	// 防御：正常流水线不会产出空白标题，但这是新的数据写入点，空标题任务会在任务板显示空白。
 	if task.Title == "" {

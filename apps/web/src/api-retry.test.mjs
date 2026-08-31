@@ -30,3 +30,26 @@ test("does not turn an aborted response body into an invalid-response error", as
     globalThis.fetch = originalFetch;
   }
 });
+
+test("preserves structured conflict details for actionable client feedback", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 409,
+    json: async () => ({
+      error: "项目工作区正被其他 AI 任务或 Git 操作占用，请等待当前操作完成后重试。",
+      code: "workspace_occupied",
+      details: { ownerKind: "git_operation", ownerSummary: "Git 操作正在使用项目工作区" },
+    }),
+  });
+  try {
+    await assert.rejects(api("/workspace", { method: "POST" }, 0), (cause) => {
+      return cause instanceof Error
+        && cause.message.includes("项目工作区")
+        && cause.code === "workspace_occupied"
+        && cause.details?.ownerKind === "git_operation";
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

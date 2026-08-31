@@ -27,6 +27,7 @@ import {
 } from "./insights-model";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
+type InsightAgent = "claude-code" | "codex";
 
 // 类型图标：贴合现有 20/24 描边图标风格。
 function TypeIcon({ type }: { type: InsightType }) {
@@ -60,6 +61,7 @@ export function InsightsPanel({ projectID, request, fail }: {
   const [openCount, setOpenCount] = useState(0);
   const [filter, setFilter] = useState<InsightFilter>("all");
   const [theme, setTheme] = useState<InsightTheme>("");
+  const [agent, setAgent] = useState<InsightAgent>("claude-code");
   const [focusTypes, setFocusTypes] = useState<InsightType[]>([]);
   const [busy, setBusy] = useState(false);
   const [invalidated, setInvalidated] = useState<InsightFinding[]>([]);
@@ -73,17 +75,25 @@ export function InsightsPanel({ projectID, request, fail }: {
   // 直到结果落库（loadInsights 会把它同步为"当前确实 pending 的 id"）。
   const [verifyInFlight, setVerifyInFlight] = useState<Set<string>>(new Set());
   const mountedRef = useRef(true);
+  const agentSelectionInitializedRef = useRef(false);
   const requestVersion = useRef(0);
   const scanIdRef = useRef<string | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
 
   const loadInsights = useCallback(async () => {
     const version = ++requestVersion.current;
-    const res = await request<{ scan: InsightScan | null; findings: InsightFinding[]; events: InsightEvent[]; hasScan: boolean; suppressedCount: number; openCount: number; invalidated?: InsightFinding[]; verification?: InsightVerificationRun | null }>(
+    const res = await request<{ defaultAgent?: string; scan: InsightScan | null; findings: InsightFinding[]; events: InsightEvent[]; hasScan: boolean; suppressedCount: number; openCount: number; invalidated?: InsightFinding[]; verification?: InsightVerificationRun | null }>(
       `/api/projects/${projectID}/insights`,
     );
     if (!mountedRef.current || version !== requestVersion.current) return;
     setScan(res.scan);
+    if (!agentSelectionInitializedRef.current) {
+      agentSelectionInitializedRef.current = true;
+      const initialAgent = res.scan?.agent ?? res.defaultAgent;
+      if (initialAgent === "claude-code" || initialAgent === "codex") {
+        setAgent(initialAgent);
+      }
+    }
     setFindings(res.findings);
     setInvalidated(res.invalidated ?? []);
     setVerification(res.verification ?? null);
@@ -112,6 +122,11 @@ export function InsightsPanel({ projectID, request, fail }: {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
+
+  useEffect(() => {
+    agentSelectionInitializedRef.current = false;
+    setAgent("claude-code");
+  }, [projectID]);
 
   useEffect(() => {
     void loadInsights().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载优化建议"); });
@@ -147,7 +162,7 @@ export function InsightsPanel({ projectID, request, fail }: {
       await request(`/api/projects/${projectID}/insights/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ theme, types: focusTypes }),
+        body: JSON.stringify({ agent, theme, types: focusTypes }),
       });
       if (!mountedRef.current || version !== requestVersion.current) return;
       // 触发后直接拉一次以立即进入 running。
@@ -183,6 +198,11 @@ export function InsightsPanel({ projectID, request, fail }: {
     setFocusTypes((prev) => (prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]));
   };
 
+  const selectAgent = (nextAgent: InsightAgent) => {
+    agentSelectionInitializedRef.current = true;
+    setAgent(nextAgent);
+  };
+
   // 验证全部有效建议：调 AI 复核每条在当前代码里是否仍然成立（项目可能已被
   // 其它任务迭代修改，或原分析因上下文限制判断不准）。异步执行，结果由轮询带回。
   const verifyAll = async () => {
@@ -201,7 +221,7 @@ export function InsightsPanel({ projectID, request, fail }: {
       await request(`/api/projects/${projectID}/insights/verify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ findingIds: [] }),
+        body: JSON.stringify({ agent, findingIds: [] }),
       });
     } catch (cause) {
       // POST 失败：清除本次加入的 in-flight，避免卡片停在"验证中"。
@@ -263,7 +283,7 @@ export function InsightsPanel({ projectID, request, fail }: {
       await request(`/api/projects/${projectID}/insights/verify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ findingIds: [id] }),
+        body: JSON.stringify({ agent, findingIds: [id] }),
       });
     } catch (cause) {
       // POST 失败：立即清除 in-flight，避免卡片停在"验证中"。
@@ -321,6 +341,19 @@ export function InsightsPanel({ projectID, request, fail }: {
 
       {!running && (
         <section className="insights-pickers" aria-label="选择分析方向">
+          <div className="insights-picker">
+            <span className="insights-picker-label">分析引擎</span>
+            <div className="insights-agent-options" role="radiogroup" aria-label="选择分析引擎">
+              <label className={agent === "claude-code" ? "active" : ""}>
+                <input type="radio" name="insight-agent" value="claude-code" checked={agent === "claude-code"} disabled={anyVerifying} onChange={() => selectAgent("claude-code")} />
+                Claude Code
+              </label>
+              <label className={agent === "codex" ? "active" : ""}>
+                <input type="radio" name="insight-agent" value="codex" checked={agent === "codex"} disabled={anyVerifying} onChange={() => selectAgent("codex")} />
+                Codex
+              </label>
+            </div>
+          </div>
           <div className="insights-picker">
             <span className="insights-picker-label">聚焦主题</span>
             <div className="insights-theme-chips" role="radiogroup" aria-label="聚焦主题">

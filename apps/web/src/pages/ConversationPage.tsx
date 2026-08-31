@@ -21,6 +21,7 @@ import { useProjectContext } from "../stores/useProjectStore";
 import { useUIPreferences, type AppPreferences } from "../stores/useUIPreferences";
 import type {
   Conversation, Message, Event, Shortcut, ShortcutEditorState,
+  ConversationWorkspace,
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
   AgentExecution, RunUsage, ConversationUsageResponse,
   RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
@@ -38,6 +39,10 @@ import {
   buildTimeline, buildAgentExecutions, subagentTextIndex,
   isSubagentMessage, flattenAgents, timelineContentVersion,
 } from "../lib/timeline";
+import {
+  MAX_OPEN_CONVERSATION_TABS, closeConversationTab, markConversationTabRead, openConversationTab, recordConversationActivity,
+  readConversationTabs, writeConversationTabs, type ConversationTabsState,
+} from "../lib/conversation-tabs";
 
 function requiresForceStop(cause: unknown): boolean {
   return typeof cause === "object" && cause !== null && (cause as { code?: unknown }).code === "active_runs_present";
@@ -396,6 +401,9 @@ function HistorySearchIcon() {
 }
 
 type ConversationHistoryPage = { items: Conversation[]; nextCursor: string };
+type ConversationActivityPosition = { createdAt: string; id: string };
+type ConversationActivityItem = { conversationId: string; events: Event[]; latestPosition?: ConversationActivityPosition | null; truncated: boolean };
+type ConversationActivityResponse = { conversations: ConversationActivityItem[]; missingConversationIds: string[] };
 
 function ConversationHistoryDialog({ conversations, activeID, busyID, close, activate, view, search, hasMore, loadingMore, loadMore }: { conversations: Conversation[]; activeID: string; busyID: string; close: () => void; activate: (item: Conversation) => Promise<void>; view: (item: Conversation) => void; search: (query: string) => void; hasMore: boolean; loadingMore: boolean; loadMore: () => void }) {
   const [query, setQuery] = useState("");
@@ -427,7 +435,8 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
 }
 
 function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsError, close, create }: { runnerID: string; defaults: AppPreferences; defaultsLoading: boolean; defaultsError: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => Promise<void> }) {
-  const permissionForAgent = (agent: AgentID): PermissionMode => agent === "codex" ? defaults.codexPermissionMode : defaults.claudePermissionMode;
+  // 新会话始终从安全基线开始；高权限模式必须由用户在弹窗中主动选择。
+  const permissionForAgent = (agent: AgentID): PermissionMode => agent === "codex" ? "workspace_write" : "approval_required";
   const [agentId, setAgentId] = useState<AgentID>(defaults.defaultAgentId);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => permissionForAgent(defaults.defaultAgentId));
   const [creating, setCreating] = useState(false);
@@ -472,7 +481,7 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
     if (agentSelectedByUser.current && isAgentAvailable(agentId)) return;
     setAgentId(nextAgent);
     setPermissionMode(permissionForAgent(nextAgent));
-  }, [agentId, capabilitiesLoading, claudeAvailable, codexAvailable, defaults.defaultAgentId, defaults.claudePermissionMode, defaults.codexPermissionMode, defaultsError]);
+  }, [agentId, capabilitiesLoading, claudeAvailable, codexAvailable, defaults.defaultAgentId, defaultsError]);
   const selectAgent = (next: AgentID) => { agentSelectedByUser.current = true; setAgentId(next); setProfileID(""); setPermissionMode(permissionForAgent(next)); };
   const submit = async () => { if (defaultsError || capabilitiesLoading || !isAgentAvailable(agentId)) return; setCreating(true); try { await create(agentId, permissionMode, profileID || undefined); } finally { setCreating(false); } };
   const codex = agentId === "codex";
@@ -572,6 +581,51 @@ function AgentExecutionDialog({ execution, close }: { execution: AgentExecution;
 function AgentTree({ agent, selectedID, select, depth }: { agent: AgentNode; selectedID: string; select: (id: string) => void; depth: number }) {
   const cappedDepth = Math.min(depth, 6);
   return <div className="agent-tree-branch"><button className={`agent-tree-row ${agent.id === selectedID ? "selected" : ""}`} style={{ paddingLeft: `${12 + cappedDepth * 16}px` }} onClick={() => select(agent.id)}><span className={`agent-status ${agent.status}`}></span><span><b>{agent.summary}</b><small>{agentStatusLabel(agent.status)} · {agent.logs.length} 条记录</small></span></button>{agent.children.map((child) => <AgentTree key={child.id} agent={child} selectedID={selectedID} select={select} depth={depth + 1} />)}</div>;
+}
+
+function ConversationTabStrip({ state, conversations, workspaceLabels, select, close, create }: {
+  state: ConversationTabsState;
+  conversations: Conversation[];
+  workspaceLabels: Record<string, string>;
+  select: (conversationId: string) => void;
+  close: (conversationId: string) => void;
+  create: () => void;
+}) {
+  const byID = new Map(conversations.map((conversation) => [conversation.id, conversation]));
+  const navigateConversationTabs = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+    const currentIndex = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    if (currentIndex < 0 || tabs.length === 0) return;
+    event.preventDefault();
+    const nextIndex = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    const nextTab = tabs[nextIndex];
+    nextTab.focus();
+    const conversationID = nextTab.dataset.conversationId;
+    if (conversationID) select(conversationID);
+  };
+  return <nav className="conversation-tab-strip" aria-label="已打开会话">
+    <div className="conversation-tab-list" role="tablist" onKeyDown={navigateConversationTabs}>
+      {state.openConversationIds.map((id) => {
+        const conversation = byID.get(id);
+        const active = state.activeConversationId === id;
+        const unread = state.unreadConversationIds.includes(id);
+        const label = conversation?.title || "会话";
+        const workspaceLabel = workspaceLabels[id] || "工作区";
+        const stateClass = conversation?.status === "running" ? "running" : conversation?.status === "archived" ? "archived" : "idle";
+        return <div className={`conversation-tab ${active ? "active" : ""} ${stateClass}`} role="presentation" key={id}>
+          <button data-conversation-id={id} id={`conversation-tab-${id}`} type="button" role="tab" tabIndex={active ? 0 : -1} aria-controls="conversation-panel" aria-selected={active} title={`${label} - ${workspaceLabel}`} onClick={() => select(id)}>
+            <span className="conversation-tab-state" aria-hidden="true" />
+            <span className="conversation-tab-copy"><span className="conversation-tab-label">{label}</span><span className="conversation-tab-workspace">{workspaceLabel}</span></span>
+            {unread && <span className="conversation-tab-unread" aria-label="有未读活动" />}
+            {conversation?.agentId === "codex" && <span className="conversation-tab-agent">Codex</span>}
+          </button>
+          <button type="button" className="conversation-tab-close" title={`关闭 ${label}`} aria-label={`关闭 ${label}`} onClick={() => close(id)}>x</button>
+        </div>;
+      })}
+    </div>
+    <button type="button" className="conversation-tab-add" title="新建会话" aria-label="新建会话" disabled={state.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS} onClick={create}>+</button>
+  </nav>;
 }
 
 function ApprovalBanner({ action, resolving, decide, scrollToCard }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void>; scrollToCard: () => void }) {
@@ -716,12 +770,108 @@ export default function ConversationPage() {
 
   // 对话核心状态
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const [conversationWorkspaces, setConversationWorkspaces] = useState<ConversationWorkspace[]>([]);
+  const [conversationWorkspaceLabels, setConversationWorkspaceLabels] = useState<Record<string, string>>({});
+  const [archiveWorkspaceID, setArchiveWorkspaceID] = useState("");
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [conversationHistory, setConversationHistory] = useState<Conversation[]>([]);
   const [historyQuery, setHistoryQuery] = useState("");
   const [conversationHistoryCursor, setConversationHistoryCursor] = useState("");
+  const [conversationTabs, setConversationTabs] = useState<ConversationTabsState>({ openConversationIds: [], activeConversationId: null, readPositions: {}, latestPositions: {}, unreadConversationIds: [] });
   const [loadingMoreConversationHistory, setLoadingMoreConversationHistory] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
+
+  useEffect(() => {
+    if (!conversation) {
+      setConversationWorkspaces([]);
+      return;
+    }
+    let cancelled = false;
+    void projectApi<ConversationWorkspace[]>(`/api/conversations/${conversation.id}/workspaces`)
+      .then((items) => {
+        if (cancelled) return;
+        setConversationWorkspaces(items);
+        const active = items.find((item) => item.active && item.state === "ready");
+        if (active) setConversationWorkspaceLabels((current) => ({ ...current, [conversation.id]: active.mode === "isolated_worktree" ? `工作区 #${active.generation}` : "项目工作区" }));
+      })
+      .catch((cause) => { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法读取会话工作区"); });
+    return () => { cancelled = true; };
+  }, [conversation?.id, fail, projectApi]);
+
+  useEffect(() => {
+    const openIDs = conversationTabs.openConversationIds;
+    if (openIDs.length === 0) return;
+    let cancelled = false;
+    void Promise.all(openIDs.map(async (conversationID) => {
+      try {
+        const items = await projectApi<ConversationWorkspace[]>(`/api/conversations/${conversationID}/workspaces`);
+        const active = items.find((item) => item.active && item.state === "ready");
+        return [conversationID, active ? (active.mode === "isolated_worktree" ? `工作区 #${active.generation}` : "项目工作区") : "工作区"] as const;
+      } catch {
+        return [conversationID, "工作区"] as const;
+      }
+    })).then((entries) => {
+      if (cancelled) return;
+      setConversationWorkspaceLabels((current) => ({ ...current, ...Object.fromEntries(entries) }));
+    });
+    return () => { cancelled = true; };
+  }, [conversationTabs.openConversationIds.join(","), projectApi]);
+
+  useEffect(() => {
+    const candidates = conversationWorkspaces.filter((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active);
+    if (!candidates.some((item) => item.id === archiveWorkspaceID)) {
+      setArchiveWorkspaceID(candidates[0]?.id || "");
+    }
+  }, [archiveWorkspaceID, conversationWorkspaces]);
+
+  const createIsolatedWorkspace = async () => {
+    if (!conversation || workspaceBusy || run || clearing || stopping || readOnlyConversation) return;
+    setWorkspaceBusy(true);
+    try {
+      const workspace = await projectApi<ConversationWorkspace>(`/api/conversations/${conversation.id}/workspaces`, { method: "POST" });
+      if (!workspace) return;
+      await projectApi(`/api/conversations/${conversation.id}/workspaces/${workspace.id}/activate`, { method: "POST" });
+      setConversationWorkspaces((items) => [
+        { ...workspace, active: true },
+        ...items.filter((item) => item.id !== workspace.id).map((item) => ({ ...item, active: false })),
+      ]);
+      setConversationWorkspaceLabels((current) => ({ ...current, [conversation.id]: `工作区 #${workspace.generation}` }));
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : "无法创建工作区");
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  };
+
+  const activateWorkspace = async (workspace: ConversationWorkspace) => {
+    if (!conversation || workspaceBusy || workspace.active || run || clearing || stopping || readOnlyConversation) return;
+    setWorkspaceBusy(true);
+    try {
+      await projectApi(`/api/conversations/${conversation.id}/workspaces/${workspace.id}/activate`, { method: "POST" });
+      setConversationWorkspaces((items) => items.map((item) => ({ ...item, active: item.id === workspace.id })));
+      setConversationWorkspaceLabels((current) => ({ ...current, [conversation.id]: workspace.mode === "isolated_worktree" ? `工作区 #${workspace.generation}` : "项目工作区" }));
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : "无法切换会话工作区");
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  };
+
+  const archiveWorkspace = async (workspace: ConversationWorkspace) => {
+    if (!conversation || workspaceBusy || workspace.active || workspace.mode !== "isolated_worktree" || run || clearing || stopping || readOnlyConversation) return;
+    if (!window.confirm(`移除工作区 #${workspace.generation}？仅当没有未提交变更且专用分支已合并时才能移除。该目录和专用分支将被移除，历史运行记录会保留。`)) return;
+    setWorkspaceBusy(true);
+    try {
+      await projectApi(`/api/conversations/${conversation.id}/workspaces/${workspace.id}`, { method: "DELETE" });
+      setConversationWorkspaces((items) => items.map((item) => item.id === workspace.id ? { ...item, state: "archived", archivedAt: new Date().toISOString() } : item));
+      setArchiveWorkspaceID((current) => current === workspace.id ? "" : current);
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : "无法移除工作区");
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  };
   const [text, setText] = useState("");
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyRefresh, setHistoryRefresh] = useState(0);
@@ -818,7 +968,8 @@ export default function ConversationPage() {
   const conversationTransitionRef = useRef(false);
   const conversationRouteVersion = useRef(0);
   const conversationHistoryRequestVersion = useRef(0);
-  const conversationActivationTail = useRef<Promise<void>>(Promise.resolve());
+  const conversationTabsRef = useRef<ConversationTabsState>(conversationTabs);
+  conversationTabsRef.current = conversationTabs;
   const stopRunRef = useRef<() => Promise<void>>(async () => {});
   const stopAndClearRef = useRef<() => Promise<void>>(async () => {});
   const pendingUserDrafts = useRef(new Map<string, string>());
@@ -842,6 +993,67 @@ export default function ConversationPage() {
   useLayoutEffect(() => {
     conversationRouteVersion.current++;
   }, [projectId, urlConversationId]);
+
+  useEffect(() => {
+    const restored = readConversationTabs(projectId || "");
+    conversationTabsRef.current = restored;
+    setConversationTabs(restored);
+  }, [projectId]);
+
+  const rememberConversationTab = useCallback((conversationID: string) => {
+    if (!projectId) return false;
+    const next = openConversationTab(conversationTabsRef.current, conversationID);
+    if (!next) return false;
+    conversationTabsRef.current = next;
+    writeConversationTabs(projectId, next);
+    setConversationTabs(next);
+    return true;
+  }, [projectId]);
+
+  const selectConversationTab = useCallback((conversationID: string) => {
+    if (!rememberConversationTab(conversationID)) {
+      fail(`每个项目最多同时打开 ${MAX_OPEN_CONVERSATION_TABS} 个会话，请先关闭一个 Tab。`);
+      return;
+    }
+    if (projectId && conversationID !== urlConversationId) navigate(`/projects/${projectId}/conversations/${conversationID}`);
+  }, [fail, navigate, projectId, rememberConversationTab, urlConversationId]);
+
+  const closeConversationTabFromUI = useCallback((conversationID: string) => {
+    if (!projectId) return;
+    const next = closeConversationTab(conversationTabsRef.current, conversationID);
+    conversationTabsRef.current = next;
+    writeConversationTabs(projectId, next);
+    setConversationTabs(next);
+    if (conversationID !== urlConversationId) return;
+    const nextID = next.activeConversationId;
+    navigate(nextID ? `/projects/${projectId}/conversations/${nextID}` : `/projects/${projectId}/conversations`);
+  }, [navigate, projectId, urlConversationId]);
+
+  const removeUnavailableConversationTabs = useCallback((conversationIDs: string[]) => {
+    if (!projectId || conversationIDs.length === 0) return;
+    const unavailable = new Set(conversationIDs);
+    const previous = conversationTabsRef.current;
+    let next = previous;
+    conversationIDs.forEach((conversationID) => { next = closeConversationTab(next, conversationID); });
+    if (next !== previous) {
+      conversationTabsRef.current = next;
+      writeConversationTabs(projectId, next);
+      setConversationTabs(next);
+    }
+    if (urlConversationId && unavailable.has(urlConversationId)) {
+      navigate(next.activeConversationId ? `/projects/${projectId}/conversations/${next.activeConversationId}` : `/projects/${projectId}/conversations`, { replace: true });
+    }
+  }, [navigate, projectId, urlConversationId]);
+
+  const markActiveConversationTabRead = useCallback(() => {
+    const conversationID = conversationRef.current?.id;
+    if (!projectId || !conversationID) return;
+    const next = markConversationTabRead(conversationTabsRef.current, conversationID);
+    if (next === conversationTabsRef.current) return;
+    conversationTabsRef.current = next;
+    writeConversationTabs(projectId, next);
+    setConversationTabs(next);
+  }, [projectId]);
 
   // 草稿归属于具体项目与会话。对话页卸载后，ProjectProvider 与浏览器缓存仍会保留它。
   useLayoutEffect(() => {
@@ -915,6 +1127,8 @@ export default function ConversationPage() {
   };
 
   const resetConversationView = (next: Conversation) => {
+    const previousConversationID = conversationRef.current?.id;
+    if (projectId && previousConversationID && previousConversationID !== next.id) flushConversationDraft(projectId, previousConversationID);
     const nextDraft = projectId ? getConversationDraft(projectId, next.id) : "";
     setComposerText(nextDraft, next.id);
     setMessages([]); setEvents([]); setRun(""); setUsage(null); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
@@ -942,6 +1156,54 @@ export default function ConversationPage() {
     setHistoryQuery("");
     return requestConversationHistory("");
   }, [requestConversationHistory]);
+
+  const reopenArchivedConversation = useCallback(async (conversationID: string, signal?: AbortSignal) => {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        const activated = await projectApi<Conversation>(`/api/conversations/${conversationID}/activate`, { method: "POST", signal });
+        if (activated.status !== "archived") return activated;
+      } catch (cause) {
+        const status = typeof cause === "object" && cause !== null ? (cause as { status?: unknown }).status : undefined;
+        if (status !== 409 || attempt === 7) throw cause;
+      }
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error("会话仍在停止，请稍后重试");
+  }, [projectApi]);
+
+  const syncConversationActivity = useCallback(async () => {
+    if (!projectId) return;
+    const state = conversationTabsRef.current;
+    if (state.openConversationIds.length === 0) return;
+    const data = await projectApi<ConversationActivityResponse>(`/api/projects/${projectId}/conversations/activity`, {
+      method: "POST",
+      body: JSON.stringify({ cursors: state.openConversationIds.map((conversationId) => ({ conversationId, after: state.latestPositions[conversationId] || state.readPositions[conversationId] })) }),
+    });
+    removeUnavailableConversationTabs(data.missingConversationIds || []);
+    let next = conversationTabsRef.current;
+    data.conversations.forEach((item) => {
+      const isActiveAtBottom = item.conversationId === conversationRef.current?.id && userNearBottom.current;
+      next = recordConversationActivity(next, item.conversationId, item.latestPosition || null, item.events.length > 0, isActiveAtBottom);
+    });
+    if (next === conversationTabsRef.current) return;
+    conversationTabsRef.current = next;
+    writeConversationTabs(projectId, next);
+    setConversationTabs(next);
+  }, [projectApi, projectId, removeUnavailableConversationTabs]);
+
+  // Background tabs share a bounded incremental activity poll instead of a
+  // WebSocket per tab. The selected tab still reloads complete persisted history.
+  useEffect(() => {
+    if (!projectId || conversationTabs.openConversationIds.length === 0) return;
+    const refreshBackgroundTabs = () => {
+      void syncConversationActivity().catch(() => undefined);
+      if (!historyQuery.trim()) void requestConversationHistory("").catch(() => undefined);
+    };
+    refreshBackgroundTabs();
+    const timer = window.setInterval(refreshBackgroundTabs, 8_000);
+    return () => window.clearInterval(timer);
+  }, [conversationTabs.openConversationIds.length, historyQuery, projectId, requestConversationHistory, syncConversationActivity]);
 
   const searchConversationHistory = useCallback((query: string) => {
     setHistoryQuery(query);
@@ -992,44 +1254,36 @@ export default function ConversationPage() {
     let cancelled = false;
     const abort = new AbortController();
     const isCurrentRoute = () => !cancelled && !conversationTransitionRef.current;
-		const activateCurrentRoute = async () => {
-			if (readOnlyConversation) return null;
-      let release!: () => void;
-      const previous = conversationActivationTail.current;
-      conversationActivationTail.current = new Promise<void>((resolve) => { release = resolve; });
-      await previous.catch(() => undefined);
-      try {
-        if (!isCurrentRoute()) return null;
-        return await projectApi<Conversation>(`/api/conversations/${urlConversationId}/activate`, { method: "POST", signal: abort.signal });
-      } finally {
-        release();
-      }
-    };
     async function loadConversation() {
       try {
         // 直接链接必须按 ID 查询，不能依赖历史列表的当前分页结果。
-        if (urlConversationId) {
-          const detail = await projectApi<{ conversation: Conversation & { projectId: string } }>(`/api/conversations/${urlConversationId}?limit=1`, { signal: abort.signal });
-          if (!isCurrentRoute()) return;
-          if (detail.conversation.projectId !== projectId) throw new Error("指定会话不属于当前项目");
-			if (readOnlyConversation || detail.conversation.isOrchestration) {
-				resetConversationView(detail.conversation);
-				return;
-			}
-			if (detail.conversation.status === "running" && !detail.conversation.isCurrent) throw new Error("指定会话正在其他项目窗口中运行");
-          const activated = await activateCurrentRoute();
-          if (isCurrentRoute()) {
-            if (!activated) return;
-            // 从 /conversations 自动跳到同一会话的详情 URL 时，消息请求可能已经完成。
-            // 保留同一会话的内容，避免这次路由确认把已加载历史重新清空。
-            if (conversationRef.current?.id === activated.id) {
-              setConversation(activated);
-            } else {
-              resetConversationView(activated);
+		if (urlConversationId) {
+			let detail = await projectApi<{ conversation: Conversation & { projectId: string } }>(`/api/conversations/${urlConversationId}?limit=1`, { signal: abort.signal });
+			if (!isCurrentRoute()) return;
+			if (detail.conversation.projectId !== projectId) {
+              removeUnavailableConversationTabs([urlConversationId]);
+              return;
             }
+			// A cleared history entry is readable but archived. Reopen it before
+			// rendering the composer so the next message resumes its native session.
+			if (detail.conversation.status === "archived" && !detail.conversation.isOrchestration) {
+				const activated = await reopenArchivedConversation(detail.conversation.id, abort.signal);
+				if (!isCurrentRoute()) return;
+				detail = { conversation: { ...activated, projectId: detail.conversation.projectId } };
+			}
+			if (!rememberConversationTab(detail.conversation.id)) {
+              fail(`每个项目最多同时打开 ${MAX_OPEN_CONVERSATION_TABS} 个会话，请先关闭一个 Tab。`);
+				const fallbackID = conversationTabsRef.current.activeConversationId;
+				if (fallbackID && fallbackID !== detail.conversation.id) navigate(`/projects/${projectId}/conversations/${fallbackID}`, { replace: true });
+				return;
+            }
+			setConversationHistory((current) => [detail.conversation, ...current.filter((item) => item.id !== detail.conversation.id)]);
+            // URL 代表这个窗口当前查看的会话；不再调用 activate，也不会影响
+            // 其他会话的后台运行或把它们变成只读。
+            if (conversationRef.current?.id === detail.conversation.id) setConversation(detail.conversation);
+            else resetConversationView(detail.conversation);
             void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
             return;
-          }
         }
 
         // 否则使用最新对话或创建新对话
@@ -1046,6 +1300,10 @@ export default function ConversationPage() {
         }
       } catch (cause) {
         if (!cancelled) {
+          if (urlConversationId && typeof cause === "object" && cause !== null && (cause as { status?: unknown }).status === 404) {
+            removeUnavailableConversationTabs([urlConversationId]);
+            return;
+          }
           fail(cause instanceof Error ? cause.message : "无法打开会话");
           if (urlConversationId) navigate(`/projects/${projectId}/conversations`, { replace: true });
         }
@@ -1053,7 +1311,7 @@ export default function ConversationPage() {
     }
     void loadConversation();
     return () => { cancelled = true; abort.abort(); };
-  }, [projectId, urlConversationId, readOnlyConversation, clearing, fail, refreshConversationHistory, projectApi, navigate]);
+  }, [projectId, urlConversationId, readOnlyConversation, clearing, fail, refreshConversationHistory, projectApi, navigate, rememberConversationTab, removeUnavailableConversationTabs, reopenArchivedConversation]);
 
   // 加载快捷方式
   useEffect(() => {
@@ -1407,8 +1665,9 @@ export default function ConversationPage() {
     }
     setHasNewContent(false);
     userNearBottom.current = true;
+    markActiveConversationTabRead();
     setCurrentUserMessageIndex(userMessages.length - 1);
-  }, [userMessages.length]);
+  }, [markActiveConversationTabRead, userMessages.length]);
 
   // 延迟一帧再滚动到底部，确保 DOM 已更新后再读取 scrollHeight
   const scrollToBottomNextFrame = useCallback((behavior: ScrollBehavior = "auto") => {
@@ -1504,7 +1763,10 @@ export default function ConversationPage() {
     if (!container) return;
     const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 64;
     userNearBottom.current = nearBottom;
-    if (nearBottom) setHasNewContent(false);
+    if (nearBottom) {
+      setHasNewContent(false);
+      markActiveConversationTabRead();
+    }
     scheduleCurrentUserMessageIndexUpdate();
   };
 
@@ -1528,6 +1790,7 @@ export default function ConversationPage() {
       userNearBottom.current = nearBottom;
       if (nearBottom) {
         setHasNewContent((prev) => prev ? false : prev);
+        markActiveConversationTabRead();
       }
       scheduleCurrentUserMessageIndexUpdate();
     };
@@ -1540,7 +1803,10 @@ export default function ConversationPage() {
       if (!container) return;
       const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 64;
       userNearBottom.current = nearBottom;
-      if (nearBottom) setHasNewContent((prev) => prev ? false : prev);
+      if (nearBottom) {
+        setHasNewContent((prev) => prev ? false : prev);
+        markActiveConversationTabRead();
+      }
       scheduleCurrentUserMessageIndexUpdate();
     };
     window.addEventListener("scroll", onScroll, { passive: true });
@@ -1550,7 +1816,7 @@ export default function ConversationPage() {
       window.removeEventListener("scroll", onScroll);
       media.removeEventListener("change", onLayoutChange);
     };
-  }, [scheduleCurrentUserMessageIndexUpdate]);
+  }, [markActiveConversationTabRead, scheduleCurrentUserMessageIndexUpdate]);
 
   useEffect(() => () => {
     if (userMessageIndexFrame.current !== null) cancelAnimationFrame(userMessageIndexFrame.current);
@@ -1882,11 +2148,18 @@ export default function ConversationPage() {
   };
 
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => {
-    if (conversationTransitionRef.current || sending || clearing || stopping || shortcutBusy || run || !projectId) { closeNewConversation(); return; }
+    if (conversationTransitionRef.current || sending || clearing || stopping || shortcutBusy || workspaceBusy || !projectId) { closeNewConversation(); return; }
+    if (conversationTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS) {
+      closeNewConversation();
+      fail(`每个项目最多同时打开 ${MAX_OPEN_CONVERSATION_TABS} 个会话，请先关闭一个 Tab。`);
+      return;
+    }
     conversationTransitionRef.current = true;
     setClearing(true);
     try {
-      const next = await projectApi<Conversation>(`/api/projects/${projectId}/conversations?new=true`, { method: "POST", body: JSON.stringify({ agentId, permissionMode, profileId: profileID || "" }) });
+      const activeWorkspaceID = conversationWorkspaces.find((item) => item.active)?.id || "";
+      const next = await projectApi<Conversation>(`/api/projects/${projectId}/conversations?new=true`, { method: "POST", body: JSON.stringify({ agentId, permissionMode, profileId: profileID || "", workspaceId: activeWorkspaceID }) });
+      rememberConversationTab(next.id);
       resetConversationView(next);
       navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
@@ -2051,21 +2324,29 @@ export default function ConversationPage() {
   };
 
   const activateConversation = async (item: Conversation) => {
-    if (!conversation || item.id === conversation.id || item.status === "running" || item.isOrchestration) { closeHistory(); return; }
+    if (!conversation || item.id === conversation.id || item.isOrchestration) { closeHistory(); return; }
     if (sending || clearing || stopping || shortcutBusy) { closeHistory(); return; }
-    setActivatingConversation(item.id);
-    try {
-      const next = await projectApi<Conversation>(`/api/conversations/${item.id}/activate`, { method: "POST" });
-      resetConversationView(next); closeHistory();
-      if (projectId) navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
-      void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
-    } catch (cause) { fail(cause instanceof Error ? cause.message : "无法切换会话"); }
-    finally { setActivatingConversation(""); }
+	    if (!conversationTabs.openConversationIds.includes(item.id) && conversationTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS) {
+	      closeHistory();
+	      fail(`每个项目最多同时打开 ${MAX_OPEN_CONVERSATION_TABS} 个会话，请先关闭一个 Tab。`);
+	      return;
+	    }
+	    setActivatingConversation(item.id);
+	    try {
+	      if (item.status === "archived") {
+	        await reopenArchivedConversation(item.id);
+	      }
+	      selectConversationTab(item.id);
+	      closeHistory();
+	    } catch (cause) {
+	      fail(cause instanceof Error ? cause.message : "无法恢复历史会话");
+	    } finally {
+	      setActivatingConversation("");
+	    }
   };
 
 	const viewConversation = (item: Conversation) => {
-		closeHistory();
-		if (projectId) navigate(`/projects/${projectId}/conversations/${item.id}?readonly=true`);
+		activateConversation(item);
 	};
 
   const changePermissionMode = async (permissionMode: PermissionMode) => {
@@ -2344,12 +2625,15 @@ export default function ConversationPage() {
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
         <div className="head-actions">
           <button className="conversation-head-action secondary" type="button" disabled={sending} onClick={openConversationHistory}><HistoryIcon /><span>历史</span></button>
+          {conversationWorkspaces.length > 0 && <label className="conversation-workspace-picker"><span>工作区</span><select aria-label="会话工作区" value={conversationWorkspaces.find((item) => item.active)?.id || ""} disabled={workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onChange={(event) => { const selected = conversationWorkspaces.find((item) => item.id === event.target.value); if (selected) void activateWorkspace(selected); }}><option value="" disabled>选择工作区</option>{conversationWorkspaces.filter((item) => item.state === "ready").map((item) => <option key={item.id} value={item.id}>{item.mode === "isolated_worktree" ? `工作区 #${item.generation}` : "项目工作区"}</option>)}</select></label>}
+          <button className="conversation-head-action secondary workspace-create-action" type="button" disabled={workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onClick={() => void createIsolatedWorkspace()} title="创建会话级 Git 工作区"><span>{workspaceBusy ? "处理中" : "新建工作区"}</span></button>
+          {conversationWorkspaces.some((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active) && <><label className="conversation-workspace-picker workspace-remove-picker"><span>移除目标</span><select aria-label="移除工作区" value={archiveWorkspaceID} disabled={workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onChange={(event) => setArchiveWorkspaceID(event.target.value)}>{conversationWorkspaces.filter((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active).map((item) => <option key={item.id} value={item.id}>工作区 #{item.generation}</option>)}</select></label><button className="conversation-head-action secondary workspace-remove-action" type="button" disabled={!archiveWorkspaceID || workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onClick={() => { const workspace = conversationWorkspaces.find((item) => item.id === archiveWorkspaceID); if (workspace) void archiveWorkspace(workspace); }} title="移除选中的闲置工作区"><span>移除工作区</span></button></>}
           <button className="conversation-head-action secondary" type="button" disabled={readOnlyConversation} onClick={openAiConfig}><ProjectConfigIcon /><span>AI 配置</span></button>
           <div className="permission-menu">
           <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} type="button" aria-haspopup="menu" aria-expanded={showPermissionMenu} disabled={readOnlyConversation || !!run || clearing || stopping || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}><PermissionModeIcon /><span>{permissionLabel}</span></button>
             {showPermissionMenu && <div className="permission-popover" role="menu">{isCodex ? <><button className={conversation?.permissionMode === "read_only" ? "selected" : ""} onClick={() => void changePermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={conversation?.permissionMode === "workspace_write" ? "selected" : ""} onClick={() => void changePermissionMode("workspace_write")}><b>项目内执行</b><span>可在当前项目范围内读写和执行。</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>不受沙箱限制，命令直接执行</span></button></> : <><button className={conversation?.permissionMode === "approval_required" ? "selected" : ""} onClick={() => void changePermissionMode("approval_required")}><b>默认权限</b><span>命令执行前需要确认</span></button><button className={conversation?.permissionMode === "full_control" ? "selected full" : ""} onClick={() => void changePermissionMode("full_control")}><b>完全控制</b><span>命令直接执行</span></button></>}</div>}
           </div>
-          <button className="conversation-head-action new-conversation-action primary" type="button" disabled={readOnlyConversation || !!run || sending || stopping} onClick={openNewConversationParam}><NewConversationIcon /><span>新会话</span></button>
+          <button className="conversation-head-action new-conversation-action primary" type="button" disabled={readOnlyConversation || sending || stopping || conversationTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS} onClick={openNewConversationParam}><NewConversationIcon /><span>新会话</span></button>
         </div>
       </div>, document.querySelector('.head-actions-slot') || document.body)}
     {/* 对话面板：快捷方式、对话内容和任务队列 */}
@@ -2366,7 +2650,8 @@ export default function ConversationPage() {
           {renderSkillGroup()}
         </div>
       </aside>
-      <section className="chat-center">
+      <section className="chat-center" id="conversation-panel" role="tabpanel" aria-labelledby={conversationTabs.activeConversationId ? `conversation-tab-${conversationTabs.activeConversationId}` : undefined}>
+      <ConversationTabStrip state={conversationTabs} conversations={conversationHistory} workspaceLabels={conversationWorkspaceLabels} select={selectConversationTab} close={closeConversationTabFromUI} create={openNewConversationParam} />
       <section className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
         <div ref={top} />
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}

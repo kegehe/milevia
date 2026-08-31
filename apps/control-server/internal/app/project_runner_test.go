@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -264,6 +265,38 @@ func TestListProjectProcessStatuses(t *testing.T) {
 	}
 	if idle.RunPID != nil {
 		t.Fatalf("project-idle RunPID = %v, want nil", *idle.RunPID)
+	}
+}
+
+func TestProjectProcessStatusIncludesIsolatedWorkspaceRunner(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now()
+	projectPath := t.TempDir()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('workspace-project','workspace-project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	isolationPath := filepath.Join(t.TempDir(), "isolated")
+	runner := newProjectRunner("workspace-project", "", "", nil, func(LogEntry) {})
+	runner.mu.Lock()
+	runner.status = RunStatusRunning
+	runner.startedAt = now
+	runner.pid = 9012
+	runner.mu.Unlock()
+	server.runManagersMu.Lock()
+	server.runManagers[runManagerKey("workspace-project", isolationPath)] = runner
+	server.runManagersMu.Unlock()
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/processes/statuses", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var items []projectProcessStatusItem
+	if err := json.NewDecoder(response.Body).Decode(&items); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(items) != 1 || items[0].RunStatus != RunStatusRunning || items[0].RunPID == nil || *items[0].RunPID != 9012 {
+		t.Fatalf("isolated workspace status=%+v", items)
 	}
 }
 

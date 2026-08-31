@@ -389,6 +389,9 @@ func (s *Server) createOrchestrationConversation(ctx context.Context, project Pr
 	if err != nil {
 		return "", fmt.Errorf("create orchestration conversation: %w", err)
 	}
+	if err := ensureSharedConversationWorkspaceTx(ctx, tx, conversationID, project.ID, now); err != nil {
+		return "", fmt.Errorf("create orchestration workspace: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}

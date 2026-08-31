@@ -641,7 +641,7 @@ func TestTriggerInsightScanPersistsThemeAndFocusTypes(t *testing.T) {
 	projectID := insightTestProject(t, server)
 	server.runner = &insightScriptRunner{outputs: []string{`[]`, `{"findings":[]}`}}
 
-	body := strings.NewReader(`{"theme":"security","types":["bug","style"]}`)
+	body := strings.NewReader(`{"agent":"codex","theme":"security","types":["bug","style"]}`)
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/scan", body))
 	if rec.Code != http.StatusAccepted {
@@ -651,16 +651,16 @@ func TestTriggerInsightScanPersistsThemeAndFocusTypes(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &scan); err != nil {
 		t.Fatalf("decode scan: %v", err)
 	}
-	if scan.Theme != "security" || len(scan.FocusTypes) != 2 || scan.FocusTypes[0] != "bug" || scan.FocusTypes[1] != "style" {
-		t.Fatalf("response theme/focus: %q %v", scan.Theme, scan.FocusTypes)
+	if scan.Agent != "codex" || scan.Theme != "security" || len(scan.FocusTypes) != 2 || scan.FocusTypes[0] != "bug" || scan.FocusTypes[1] != "style" {
+		t.Fatalf("response agent/theme/focus: %q %q %v", scan.Agent, scan.Theme, scan.FocusTypes)
 	}
 	// DB 行也应持久化（逗号串）。
-	var themeStr, focusStr string
-	if err := server.db.QueryRow(`select theme,focus_types from project_insight_scans where id=?`, scan.ID).Scan(&themeStr, &focusStr); err != nil {
+	var agentStr, themeStr, focusStr string
+	if err := server.db.QueryRow(`select agent,theme,focus_types from project_insight_scans where id=?`, scan.ID).Scan(&agentStr, &themeStr, &focusStr); err != nil {
 		t.Fatalf("scan row: %v", err)
 	}
-	if themeStr != "security" || focusStr != "bug,style" {
-		t.Errorf("persisted theme/focus: %q/%q want security/bug,style", themeStr, focusStr)
+	if agentStr != "codex" || themeStr != "security" || focusStr != "bug,style" {
+		t.Errorf("persisted agent/theme/focus: %q/%q/%q want codex/security/bug,style", agentStr, themeStr, focusStr)
 	}
 }
 
@@ -738,6 +738,18 @@ func TestNormalizeScanTypes(t *testing.T) {
 	}
 	if got := normalizeScanTypes(nil); got != nil {
 		t.Errorf("nil should stay nil: %v", got)
+	}
+}
+
+func TestNormalizeScanAgent(t *testing.T) {
+	if got := normalizeScanAgent("codex"); got != "codex" {
+		t.Errorf("codex: got %q", got)
+	}
+	if got := normalizeScanAgent("claude-code"); got != "claude-code" {
+		t.Errorf("claude-code: got %q", got)
+	}
+	if got := normalizeScanAgent("other"); got != "" {
+		t.Errorf("invalid agent: got %q want empty", got)
 	}
 }
 
@@ -2059,11 +2071,13 @@ func TestTriggerVerifyInsightAcceptsAndPersistsPending(t *testing.T) {
 
 	var mu sync.Mutex
 	calls := 0
+	var gotAgent string
 	started := make(chan struct{})
 	release := make(chan struct{})
-	server.runner = runnerFunc(func(_ context.Context, _ AgentRunRequest, sink AgentRunSink) error {
+	server.runner = runnerFunc(func(_ context.Context, request AgentRunRequest, sink AgentRunSink) error {
 		mu.Lock()
 		calls++
+		gotAgent = request.AgentID
 		first := calls == 1
 		mu.Unlock()
 		if first {
@@ -2072,8 +2086,9 @@ func TestTriggerVerifyInsightAcceptsAndPersistsPending(t *testing.T) {
 		<-release
 		return nil
 	})
+	server.codexRunner = server.runner
 
-	body := strings.NewReader(`{"findingIds":["` + f.ID + `"]}`)
+	body := strings.NewReader(`{"agent":"codex","findingIds":["` + f.ID + `"]}`)
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/verify", body))
 	if rec.Code != http.StatusAccepted {
@@ -2101,6 +2116,11 @@ func TestTriggerVerifyInsightAcceptsAndPersistsPending(t *testing.T) {
 
 	// 等 goroutine 进入 agent 运行再放行,随后轮询等它跑完（输出为空→标 failed）。
 	<-started
+	mu.Lock()
+	if gotAgent != "codex" {
+		t.Errorf("verification agent: got %q want codex", gotAgent)
+	}
+	mu.Unlock()
 	var repoSHA string
 	if err := server.db.QueryRow(`select repo_sha from project_insight_verification_runs where id=?`, resp.VerificationID).Scan(&repoSHA); err != nil {
 		t.Fatalf("read verification repo SHA: %v", err)
@@ -2264,7 +2284,7 @@ func TestInsightVerifyCancelledRunPersistsCancelled(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	server.runInsightFindingsVerifyRun(ctx, projectID, verificationID, []InsightFinding{f})
+	server.runInsightFindingsVerifyRun(ctx, projectID, verificationID, "", []InsightFinding{f})
 
 	result, _, _ := insightVerificationRow(t, server, f.ID)
 	if result != insightVerifyFailed {

@@ -4,6 +4,12 @@ import { apiURL, sessionHeaders } from "./runtime";
 
 const requestTimeoutMs = 15_000;
 
+export type APIError = Error & {
+  status: number;
+  code?: string;
+  details?: Record<string, string>;
+};
+
 function retryCountFor(init?: RequestInit): number {
   const method = (init?.method ?? "GET").toUpperCase();
   return method === "GET" || method === "HEAD" || method === "OPTIONS" ? 2 : 0;
@@ -49,14 +55,16 @@ export async function api<T>(path: string, init?: RequestInit, retries = retryCo
       const body = await response.json().catch(() => null);
       const message = body?.error || `请求失败（状态码 ${response.status}）`;
       if (response.status >= 400 && response.status < 500) {
-        const err = new Error(message) as Error & { status: number; code?: string };
+        const err = new Error(message) as APIError;
         err.status = response.status;
         if (typeof body?.code === "string") err.code = body.code;
+        if (body?.details && typeof body.details === "object" && !Array.isArray(body.details)) err.details = body.details as Record<string, string>;
         throw err;
       }
-      const err5xx = new Error(message) as Error & { status: number; code?: string };
+      const err5xx = new Error(message) as APIError;
       err5xx.status = response.status;
       if (typeof body?.code === "string") err5xx.code = body.code;
+      if (body?.details && typeof body.details === "object" && !Array.isArray(body.details)) err5xx.details = body.details as Record<string, string>;
       lastError = err5xx;
       if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
     } catch (cause: unknown) {

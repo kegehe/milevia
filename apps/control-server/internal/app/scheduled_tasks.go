@@ -1167,6 +1167,9 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 	if _, err := tx.ExecContext(ctx, `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at,origin) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, conversation.ID, conversation.ProjectID, conversation.ClaudeSessionID, conversation.AgentID, conversation.AgentSessionID, conversation.AgentRuntimeID, conversation.AgentProfileRevisionID, conversation.ProjectAgentRouteRevisionID, conversation.ExecutionPolicy, conversation.Status, conversation.PermissionMode, conversation.Title, conversation.LastActivityAt, conversation.ClaudeInitialized, conversation.AgentInitialized, conversation.IsCurrent, conversation.CreatedAt, "scheduled"); err != nil {
 		return Conversation{}, err
 	}
+	if err := ensureSharedConversationWorkspaceTx(ctx, tx, conversation.ID, conversation.ProjectID, conversation.CreatedAt); err != nil {
+		return Conversation{}, err
+	}
 	result, err := tx.ExecContext(ctx, `update scheduled_task_runs set conversation_id=? where id=? and status=? and conversation_id=''`, conversation.ID, run.ID, scheduledRunQueued)
 	if err != nil {
 		return Conversation{}, err

@@ -6,8 +6,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
-	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"unsafe"
@@ -19,7 +20,7 @@ import (
 type windowsTerminalSession struct {
 	id, projectID     string
 	process, pty, job windows.Handle
-	in, rawOut        *os.File
+	in, rawOut        windows.Handle
 	reader            *io.PipeReader
 	writer            *io.PipeWriter
 	ready             chan error
@@ -29,38 +30,50 @@ type windowsTerminalSession struct {
 	writeMu           sync.Mutex
 }
 
+type windowsTerminalStartupInfoEx struct {
+	windows.StartupInfo
+	attributeList []byte
+}
+
+var (
+	terminalKernel32                       = windows.NewLazySystemDLL("kernel32.dll")
+	terminalInitializeProcThreadAttributes = terminalKernel32.NewProc("InitializeProcThreadAttributeList")
+	terminalUpdateProcThreadAttribute      = terminalKernel32.NewProc("UpdateProcThreadAttribute")
+	terminalDeleteProcThreadAttributes     = terminalKernel32.NewProc("DeleteProcThreadAttributeList")
+)
+
 func openPlatformTerminal(ctx context.Context, spec TerminalSpec) (TerminalSession, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	inR, inW, err := os.Pipe()
+	inR, inW, err := newWindowsTerminalPipe()
 	if err != nil {
 		return nil, err
 	}
-	outR, outW, err := os.Pipe()
+	outR, outW, err := newWindowsTerminalPipe()
 	if err != nil {
-		_ = inR.Close()
-		_ = inW.Close()
+		_ = windows.CloseHandle(inR)
+		_ = windows.CloseHandle(inW)
 		return nil, err
 	}
-	cleanup := func() { _ = inR.Close(); _ = inW.Close(); _ = outR.Close(); _ = outW.Close() }
+	cleanup := func() {
+		_ = windows.CloseHandle(inR)
+		_ = windows.CloseHandle(inW)
+		_ = windows.CloseHandle(outR)
+		_ = windows.CloseHandle(outW)
+	}
 	ptyHandle := windows.Handle(0)
-	if err = windows.CreatePseudoConsole(windows.Coord{X: int16(spec.Cols), Y: int16(spec.Rows)}, windows.Handle(inR.Fd()), windows.Handle(outW.Fd()), 0, &ptyHandle); err != nil {
+	if err = windows.CreatePseudoConsole(windows.Coord{X: int16(spec.Cols), Y: int16(spec.Rows)}, inR, outW, 0, &ptyHandle); err != nil {
 		cleanup()
 		return nil, err
 	}
-	attrs, err := windows.NewProcThreadAttributeList(1)
+	si, releaseAttributes, err := newWindowsTerminalStartupInfo(ptyHandle)
 	if err != nil {
 		windows.ClosePseudoConsole(ptyHandle)
 		cleanup()
 		return nil, err
 	}
-	defer attrs.Delete()
-	if err = attrs.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&ptyHandle), unsafe.Sizeof(ptyHandle)); err != nil {
-		windows.ClosePseudoConsole(ptyHandle)
-		cleanup()
-		return nil, err
-	}
+	defer releaseAttributes()
 	readyMarker := "__MILEVIA_READY_" + uuid.NewString() + "__"
 	command, err := windowsTerminalCommand(spec, readyMarker)
 	if err != nil {
@@ -74,7 +87,6 @@ func openPlatformTerminal(ctx context.Context, spec TerminalSpec) (TerminalSessi
 		cleanup()
 		return nil, err
 	}
-	si := windows.StartupInfoEx{StartupInfo: windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))}, ProcThreadAttributeList: attrs.List()}
 	pi := windows.ProcessInformation{}
 	var workDir *uint16
 	if spec.RunnerID != "wsl-local" {
@@ -85,7 +97,7 @@ func openPlatformTerminal(ctx context.Context, spec TerminalSpec) (TerminalSessi
 			return nil, err
 		}
 	}
-	if err = windows.CreateProcess(nil, cmdline, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT, nil, workDir, &si.StartupInfo, &pi); err != nil {
+	if err = windows.CreateProcess(nil, cmdline, nil, nil, false, windows.EXTENDED_STARTUPINFO_PRESENT, nil, workDir, &si.StartupInfo, &pi); err != nil {
 		windows.ClosePseudoConsole(ptyHandle)
 		cleanup()
 		return nil, err
@@ -114,8 +126,8 @@ func openPlatformTerminal(ctx context.Context, spec TerminalSpec) (TerminalSessi
 		return nil, err
 	}
 	windows.CloseHandle(pi.Thread)
-	_ = inR.Close()
-	_ = outW.Close()
+	_ = windows.CloseHandle(inR)
+	_ = windows.CloseHandle(outW)
 	reader, writer := io.Pipe()
 	t := &windowsTerminalSession{id: uuid.NewString(), projectID: spec.ProjectID, process: pi.Process, pty: ptyHandle, job: job, in: inW, rawOut: outR, reader: reader, writer: writer, ready: make(chan error, 1), done: make(chan struct{})}
 	go t.consumeReady(readyMarker)
@@ -127,6 +139,43 @@ func openPlatformTerminal(ctx context.Context, spec TerminalSpec) (TerminalSessi
 	}()
 	return t, nil
 }
+
+func newWindowsTerminalStartupInfo(pty windows.Handle) (*windowsTerminalStartupInfoEx, func(), error) {
+	var size uintptr
+	result, _, callErr := terminalInitializeProcThreadAttributes.Call(0, 1, 0, uintptr(unsafe.Pointer(&size)))
+	if result != 0 || size == 0 {
+		return nil, nil, fmt.Errorf("query terminal process attributes: %w", callErr)
+	}
+	si := &windowsTerminalStartupInfoEx{attributeList: make([]byte, size)}
+	if result, _, callErr = terminalInitializeProcThreadAttributes.Call(uintptr(unsafe.Pointer(&si.attributeList[0])), 1, 0, uintptr(unsafe.Pointer(&size))); result == 0 {
+		return nil, nil, fmt.Errorf("initialize terminal process attributes: %w", callErr)
+	}
+	if result, _, callErr = terminalUpdateProcThreadAttribute.Call(
+		uintptr(unsafe.Pointer(&si.attributeList[0])),
+		0,
+		windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+		uintptr(pty),
+		unsafe.Sizeof(pty),
+		0,
+		0,
+	); result == 0 {
+		terminalDeleteProcThreadAttributes.Call(uintptr(unsafe.Pointer(&si.attributeList[0])))
+		return nil, nil, fmt.Errorf("set terminal pseudo-console attribute: %w", callErr)
+	}
+	si.Cb = uint32(unsafe.Sizeof(windows.StartupInfoEx{}))
+	si.Flags = windows.STARTF_USESTDHANDLES
+	return si, func() { terminalDeleteProcThreadAttributes.Call(uintptr(unsafe.Pointer(&si.attributeList[0]))) }, nil
+}
+
+// ConPTY only supports synchronous pipes. os.Pipe creates overlapped handles
+// on Windows, so use CreatePipe for the channels owned by the pseudoconsole.
+func newWindowsTerminalPipe() (windows.Handle, windows.Handle, error) {
+	var read, write windows.Handle
+	if err := windows.CreatePipe(&read, &write, nil, 0); err != nil {
+		return 0, 0, err
+	}
+	return read, write, nil
+}
 func (t *windowsTerminalSession) ID() string                 { return t.id }
 func (t *windowsTerminalSession) ProjectID() string          { return t.projectID }
 func (t *windowsTerminalSession) Environment() string        { return "windows" }
@@ -135,7 +184,9 @@ func (t *windowsTerminalSession) Read(p []byte) (int, error) { return t.reader.R
 func (t *windowsTerminalSession) Write(p []byte) (int, error) {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	return t.in.Write(p)
+	var written uint32
+	err := windows.WriteFile(t.in, p, &written, nil)
+	return int(written), err
 }
 func (t *windowsTerminalSession) Resize(c, r uint16) error {
 	return windows.ResizePseudoConsole(t.pty, windows.Coord{X: int16(c), Y: int16(r)})
@@ -143,8 +194,8 @@ func (t *windowsTerminalSession) Resize(c, r uint16) error {
 func (t *windowsTerminalSession) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
-		_ = t.in.Close()
-		_ = t.rawOut.Close()
+		_ = windows.CloseHandle(t.in)
+		_ = windows.CloseHandle(t.rawOut)
 		_ = t.reader.Close()
 		_ = t.writer.Close()
 		if t.process != 0 {
@@ -174,7 +225,11 @@ func (t *windowsTerminalSession) TerminalExitCode() *int {
 
 func windowsTerminalCommand(spec TerminalSpec, readyMarker string) (string, error) {
 	if spec.RunnerID != "wsl-local" {
-		return "cmd.exe /d /q /k \"chcp 65001 >nul & echo " + readyMarker + "\"", nil
+		systemDirectory, err := windows.GetSystemDirectory()
+		if err != nil {
+			return "", err
+		}
+		return quoteWindows(filepath.Join(systemDirectory, "cmd.exe")) + " /d /q /k \"chcp 65001 >nul & echo " + readyMarker + "\"", nil
 	}
 	workDir, ok := uncToWslPath(spec.WorkDir, spec.WSLDistro)
 	if !ok {
@@ -201,7 +256,9 @@ func (t *windowsTerminalSession) consumeReady(marker string) {
 	defer func() { sendReady(io.ErrUnexpectedEOF); _ = t.writer.Close() }()
 	chunk := make([]byte, 4096)
 	for {
-		n, err := t.rawOut.Read(chunk)
+		var count uint32
+		err := windows.ReadFile(t.rawOut, chunk, &count, nil)
+		n := int(count)
 		if n > 0 {
 			buffer = append(buffer, chunk[:n]...)
 			if index := bytes.Index(buffer, markerBytes); index >= 0 {
@@ -212,13 +269,22 @@ func (t *windowsTerminalSession) consumeReady(marker string) {
 					_, _ = t.writer.Write(after)
 				}
 				sendReady(nil)
-				_, _ = io.Copy(t.writer, t.rawOut)
-				return
+				break
 			}
 			if len(buffer) > 64<<10 {
 				sendReady(io.ErrUnexpectedEOF)
 				return
 			}
+		}
+		if err != nil {
+			return
+		}
+	}
+	for {
+		var count uint32
+		err := windows.ReadFile(t.rawOut, chunk, &count, nil)
+		if count > 0 {
+			_, _ = t.writer.Write(chunk[:count])
 		}
 		if err != nil {
 			return
