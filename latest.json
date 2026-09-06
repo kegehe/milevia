@@ -1,11 +1,11 @@
 {
-  "version": "0.1.3",
-  "notes": "多项目对话工作区、终端与文件工具链增强，稳定性与可靠性改进",
-  "pub_date": "2026-08-31T07:24:15.607Z",
+  "version": "0.1.4",
+  "notes": "新增 Android 远程控制端，完善扫码配对、会话与任务操作，并提升桌面端远程连接和运行稳定性。",
+  "pub_date": "2026-09-06T14:16:03.017Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNncy8yMUc5ZVVlQkJEOHZXWU5Vb3l2cDNXdUVVWkdYQW9KVmFNMkVDMENsOTRrWjFORVUvZnRKODhjY3IvSmJXbnI3UXhpRklqQ0oxclJwWlZWd0Q1dkFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4MTYxMDU1CWZpbGU6TWlsZXZpYV8wLjEuM194NjQtc2V0dXAuZXhlClBRRjRYQ0N0WVZMQm1ZR0ovdDhJTlZCeU1qM3BCMDlhVURBSldGMFpBczU3aGEzMHg3VDVHQVNJbkxNSElGWXBNckdjQkwzclF6a3g0LzQvWkpvd0JBPT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.3/Milevia_0.1.3_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczRlZFVtZlJKeVVFU0pQL1NIWFRjUlpXWFMxWU9vWXZGZk81YTFpcFVyNm1kU3ZhVW03Z0orYWJ4SXFoTy96eE9HNHp3aFBDTDUyemZkTU1mRFhTZGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NzA0MTYyCWZpbGU6TWlsZXZpYV8wLjEuNF94NjQtc2V0dXAuZXhlCkRkajJCVmNhcXowQzF5dHp6emNsa0N0dGFZeUJyakFjVkFlUmZpTE51cFlsMHpxeG9UTVRkY21MR1VMelhoOVR5VkpabHN2cVkzVXQzdW9XZWRCc0RnPT0K",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.4/Milevia_0.1.4_x64-setup.exe"
     }
   }
 }
