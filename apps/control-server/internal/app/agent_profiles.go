@@ -1174,10 +1174,18 @@ func (s *Server) profileRouteForNewConversationTx(ctx context.Context, tx *sql.T
 			}
 		} else if errors.Is(err, sql.ErrNoRows) {
 			var fallback string
-			err = tx.QueryRowContext(ctx, `select default_profile_id from projects where id=?`, projectID).Scan(&fallback)
+			// default_profile_id predates independent per-agent project routes. It
+			// may point at a Claude profile, so only inherit it when it belongs to
+			// the agent currently being started. Otherwise a Codex conversation
+			// (or insight scan) would fail before reaching its own CLI/profile.
+			err = tx.QueryRowContext(ctx, `select p.default_profile_id from projects p
+				join agent_profiles ap on ap.id=p.default_profile_id
+				where p.id=? and ap.runner_id=? and ap.agent_id=? and ap.enabled=1`, projectID, runnerID, agentID).Scan(&fallback)
 			if err == nil {
 				profileID = strings.TrimSpace(fallback)
-			} else if !errors.Is(err, sql.ErrNoRows) {
+			} else if errors.Is(err, sql.ErrNoRows) {
+				err = nil
+			} else {
 				return profileRouteSelection{}, err
 			}
 		} else {

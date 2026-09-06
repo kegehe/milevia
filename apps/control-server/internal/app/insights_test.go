@@ -58,6 +58,42 @@ func (r *insightScriptRunner) capturedRequests() []AgentRunRequest {
 	return out
 }
 
+// gatedInsightRunner 与 insightScriptRunner 类似，但首次 Run 进入后先阻塞直到 gate
+// 被放行，供测试在复核"第一批 agent 运行中"的瞬间读取 run 记录，断言进度消息已写入、
+// 批之间 processed_count 会推进。放行后各次调用按次序把罐装输出喂给 sink。
+type gatedInsightRunner struct {
+	mu      sync.Mutex
+	calls   int
+	outputs []string
+	entered chan struct{} // 首次 Run 进入即关闭（阻塞前），测试据此知道第一批已开始
+	gate    chan struct{} // 放行首次 Run：关闭后该次调用才把罐装输出喂给 sink 并返回
+}
+
+func (r *gatedInsightRunner) Ready(context.Context) bool { return true }
+func (r *gatedInsightRunner) Version(context.Context) string {
+	return "1.0"
+}
+func (r *gatedInsightRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (r *gatedInsightRunner) Update(context.Context) (string, string, error) {
+	return "", "", nil
+}
+func (r *gatedInsightRunner) Run(_ context.Context, _ AgentRunRequest, sink AgentRunSink) error {
+	r.mu.Lock()
+	r.calls++
+	idx := r.calls - 1
+	r.mu.Unlock()
+	if idx == 0 {
+		close(r.entered)
+		<-r.gate
+	}
+	if idx < len(r.outputs) && r.outputs[idx] != "" {
+		sink.AssistantText(r.outputs[idx], "")
+	}
+	return nil
+}
+
 // blockingInsightRunner 阻塞在 Run 直到 ctx 取消，模拟真实 agent 长时间运行中，
 // 供端到端取消测试使用（HTTP 触发扫描 → HTTP 取消 → worker 收到 ctx 取消 → 置 cancelled）。
 type blockingInsightRunner struct{}
@@ -186,6 +222,27 @@ func TestParseInsightCandidates(t *testing.T) {
 		t.Errorf("narration parse picked wrong json: %+v", items)
 	} else {
 		t.Log("narration parse ok")
+	}
+}
+
+func TestParseInsightToolActivityCodexEvents(t *testing.T) {
+	cases := []struct {
+		name, eventType, payload, want string
+	}{
+		{"turn started", "turn.started", `{}`, "模型正在分析项目"},
+		{"command started", "item.started", `{"item":{"type":"command_execution","command":"find ."}}`, "执行只读检查"},
+		{"command completed", "item.completed", `{"item":{"type":"command_execution","status":"completed"}}`, "完成只读检查"},
+		{"file change", "item.completed", `{"item":{"type":"file_change","changes":[]}}`, "读取文件变更"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, ok := parseInsightToolActivity(tc.eventType, json.RawMessage(tc.payload)); !ok || got != tc.want {
+				t.Fatalf("parseInsightToolActivity() = %q, %v; want %q, true", got, ok, tc.want)
+			}
+		})
+	}
+	if got, ok := parseInsightToolActivity("item.started", json.RawMessage(`{"item":{"type":"agent_message"}}`)); ok || got != "" {
+		t.Fatalf("agent_message unexpectedly produced progress: %q, %v", got, ok)
 	}
 }
 
@@ -603,6 +660,104 @@ func TestProjectRuntimeProfileNilWithoutDefault(t *testing.T) {
 	}
 	if profile != nil {
 		t.Errorf("expected nil profile, got %+v", profile)
+	}
+}
+
+func TestProjectRuntimeProfileUsesSelectedCodexRoute(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	claude := createCLIManagedProfile(t, server, "claude-code", "claude-model")
+	codex := createCLIManagedProfile(t, server, "codex", "codex-model")
+	if _, err := server.db.Exec(`update projects set runner=?,runner_id=?,default_profile_id=? where id=?`, server.localRunnerID(), server.localRunnerID(), claude.ID, projectID); err != nil {
+		t.Fatalf("set legacy default: %v", err)
+	}
+	set := httptest.NewRecorder()
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPatch, "/api/projects/"+projectID+"/agent-profile", strings.NewReader(`{"agentId":"codex","profileId":"`+codex.ID+`"}`)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set Codex project route: status=%d body=%s", set.Code, set.Body.String())
+	}
+	project, err := server.getProjectByID(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("load project: %v", err)
+	}
+	profile, err := server.projectRuntimeProfile(context.Background(), project, "codex")
+	if err != nil {
+		t.Fatalf("resolve Codex runtime profile: %v", err)
+	}
+	if profile == nil || profile.RevisionID != codex.CurrentRevisionID || profile.AgentID != "codex" {
+		t.Fatalf("Codex profile=%#v, want revision=%q", profile, codex.CurrentRevisionID)
+	}
+}
+
+func TestProjectRuntimeProfileIgnoresLegacyOtherAgentDefault(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	claude := createCLIManagedProfile(t, server, "claude-code", "claude-model")
+	if _, err := server.db.Exec(`update projects set runner=?,runner_id=?,default_profile_id=? where id=?`, server.localRunnerID(), server.localRunnerID(), claude.ID, projectID); err != nil {
+		t.Fatalf("set legacy default: %v", err)
+	}
+	project, err := server.getProjectByID(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("load project: %v", err)
+	}
+	profile, err := server.projectRuntimeProfile(context.Background(), project, "codex")
+	if err != nil {
+		t.Fatalf("Codex fallback should not use Claude default: %v", err)
+	}
+	if profile != nil {
+		t.Fatalf("Codex fallback profile=%#v, want nil", profile)
+	}
+}
+
+func TestInsightScanPassesCodexRouteProfileToRunner(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	if _, err := server.db.Exec(`update projects set runner=?,runner_id=? where id=?`, server.localRunnerID(), server.localRunnerID(), projectID); err != nil {
+		t.Fatalf("set local project runner: %v", err)
+	}
+	profile := createCLIManagedProfile(t, server, "codex", "codex-insight-model")
+	set := httptest.NewRecorder()
+	body := `{"agentId":"codex","profileId":"` + profile.ID + `"}`
+	server.routes().ServeHTTP(set, httptest.NewRequest(http.MethodPatch, "/api/projects/"+projectID+"/agent-profile", strings.NewReader(body)))
+	if set.Code != http.StatusOK {
+		t.Fatalf("set Codex project route: status=%d body=%s", set.Code, set.Body.String())
+	}
+	runner := &insightScriptRunner{outputs: []string{`[]`}}
+	server.codexRunner = runner
+	scanID := insertSyncInsightScanOpts(t, server, projectID, scanOpts{Agent: "codex"})
+	requests := runner.capturedRequests()
+	if len(requests) != 1 {
+		t.Fatalf("Codex scan calls=%d want 1", len(requests))
+	}
+	request := requests[0]
+	if request.AgentID != "codex" || request.PermissionMode != "read_only" {
+		t.Fatalf("Codex scan request agent/policy=%q/%q", request.AgentID, request.PermissionMode)
+	}
+	if request.Profile == nil || request.Profile.RevisionID != profile.CurrentRevisionID || request.Profile.Model != "codex-insight-model" {
+		t.Fatalf("Codex scan profile=%#v, want revision=%q/model codex-insight-model", request.Profile, profile.CurrentRevisionID)
+	}
+	var status string
+	if err := server.db.QueryRow(`select status from project_insight_scans where id=?`, scanID).Scan(&status); err != nil {
+		t.Fatalf("read scan status: %v", err)
+	}
+	if status != insightScanCompleted {
+		t.Fatalf("scan status=%q want %q", status, insightScanCompleted)
+	}
+}
+
+func TestRunReadOnlyAgentRejectsUnavailableCodexBeforeRun(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	if _, err := server.db.Exec(`update projects set runner=?,runner_id=? where id=?`, server.localRunnerID(), server.localRunnerID(), projectID); err != nil {
+		t.Fatalf("set local project runner: %v", err)
+	}
+	server.codexRunner = unavailableRunner{}
+	project, err := server.getProjectByID(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("load project: %v", err)
+	}
+	if _, err := server.runReadOnlyAgent(context.Background(), project, "codex", "return []", nil); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("runReadOnlyAgent error=%v, want unavailable Codex error", err)
 	}
 }
 
@@ -2139,6 +2294,125 @@ func TestTriggerVerifyInsightAcceptsAndPersistsPending(t *testing.T) {
 			t.Fatal("verify goroutine did not finish in time")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// insightReverifyChunkSize 决定复核按"批"推进进度的粒度：>6 条时切到约 3 批，
+// 保证整趟复核期间 processed_count 有可见的中间点，同时不把清单拆得过碎。
+func TestInsightReverifyChunkSize(t *testing.T) {
+	// 期望粒度：≤6 一批跑完；7~20 切到约 3 批（进度可见推进）；>20 维持原
+	// insightVerifyBatchSize 上限——大批本来就有批次间进度点，不再额外拆会话。
+	cases := []struct {
+		n, want int
+	}{
+		{n: 1, want: 1},
+		{n: 2, want: 2},
+		{n: 6, want: 6},
+		{n: 7, want: 3},
+		{n: 12, want: 4}, // 12 条 → 3 批，进度 0/12→4/12→8/12→12/12
+		{n: 20, want: 7},
+		{n: 21, want: 20},
+		{n: 30, want: 20},
+		{n: 50, want: 20},
+		{n: 100, want: 20},
+	}
+	for _, c := range cases {
+		if got := insightReverifyChunkSize(c.n); got != c.want {
+			t.Errorf("insightReverifyChunkSize(%d) = %d, want %d", c.n, got, c.want)
+		}
+	}
+}
+
+// 复核进度会跨批推进：12 条被切成 3 批，第一批 agent 运行中就应已把"第 1/3 批"的
+// 进度消息写入 run 记录（而不再是一整趟 agent 跑完才从 0 跳到 12）。
+func TestInsightVerifyAdvancesProgressAcrossBatches(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+
+	var items []string
+	for i := 0; i < 12; i++ {
+		items = append(items, fmt.Sprintf(`{"type":"bug","severity":"high","title":"建议%02d","summary":"s%d"}`, i+1, i+1))
+	}
+	findings := seedInsightFindings(t, server, projectID, "["+strings.Join(items, ",")+"]")
+	if len(findings) != 12 {
+		t.Fatalf("seeded findings: got %d want 12", len(findings))
+	}
+	targets, err := server.resolveVerifyTargets(context.Background(), projectID, nil)
+	if err != nil {
+		t.Fatalf("resolve verify targets: %v", err)
+	}
+	if len(targets) != 12 {
+		t.Fatalf("resolve verify targets: got %d want 12", len(targets))
+	}
+	now := time.Now().UTC()
+	for _, f := range targets {
+		server.setInsightVerification(context.Background(), projectID, f.ID, insightVerifyPending, "", now)
+	}
+	verificationID := "verify-progress-run"
+	if _, err := server.db.Exec(`insert into project_insight_verification_runs
+		(id,project_id,status,message,total_count,processed_count,created_at,started_at)
+		values (?,?,'running',?,?,0,?,?)`, verificationID, projectID, "正在准备验证", len(targets), now, now); err != nil {
+		t.Fatalf("insert verification run: %v", err)
+	}
+
+	chunk := insightReverifyChunkSize(len(targets))
+	if chunk != 4 {
+		t.Fatalf("chunk size for 12 targets: got %d want 4", chunk)
+	}
+	runner := &gatedInsightRunner{entered: make(chan struct{}), gate: make(chan struct{})}
+	for start := 0; start < len(targets); start += chunk {
+		end := min(start+chunk, len(targets))
+		verdicts := make([]string, 0, end-start)
+		for _, f := range targets[start:end] {
+			verdicts = append(verdicts, fmt.Sprintf(`{"id":%q,"status":"valid","reason":"仍在"}`, f.ID))
+		}
+		runner.outputs = append(runner.outputs, `{"findings":[`+strings.Join(verdicts, ",")+`]}`)
+	}
+	server.runner = runner
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.runInsightFindingsVerifyRun(context.Background(), projectID, verificationID, "claude-code", targets)
+	}()
+
+	// 第一批 agent 运行中：进度消息已写、processed_count 仍是 0（本批还没返回判定）。
+	<-runner.entered
+	var msg string
+	var processed int
+	if err := server.db.QueryRow(`select message,processed_count from project_insight_verification_runs where id=?`, verificationID).Scan(&msg, &processed); err != nil {
+		t.Fatalf("read verification run progress: %v", err)
+	}
+	if processed != 0 || !strings.Contains(msg, "第 1/3 批") {
+		t.Errorf("mid-run progress: processed=%d message=%q want 0 and containing 第 1/3 批", processed, msg)
+	}
+	close(runner.gate)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("verify run did not finish in time")
+	}
+	// 完成后 run 推进到 12/12，12 条建议全部写回 valid；确认真实拆成 3 趟 agent。
+	var status, finalMsg string
+	var finalProcessed int
+	if err := server.db.QueryRow(`select status,message,processed_count from project_insight_verification_runs where id=?`, verificationID).Scan(&status, &finalMsg, &finalProcessed); err != nil {
+		t.Fatalf("read verification run final: %v", err)
+	}
+	if status != insightScanCompleted || finalProcessed != len(targets) {
+		t.Errorf("final run: status=%q processed=%d want completed/%d", status, finalProcessed, len(targets))
+	}
+	for _, f := range findings {
+		result, _, _ := insightVerificationRow(t, server, f.ID)
+		if result != insightVerifyValid {
+			t.Errorf("finding %s result after verify: got %q want %q", f.ID, result, insightVerifyValid)
+		}
+	}
+	runner.mu.Lock()
+	calls := runner.calls
+	runner.mu.Unlock()
+	if calls != 3 {
+		t.Errorf("agent runs: got %d want 3 (chunked batches)", calls)
 	}
 }
 

@@ -1,0 +1,10 @@
+{
+  "name": "Milevia Remote",
+  "short_name": "Milevia",
+  "description": "Milevia remote task control",
+  "start_url": "/mobile",
+  "display": "standalone",
+  "background_color": "#f3f8f4",
+  "theme_color": "#f3f8f4",
+  "icons": [{"src": "/milevia-mark.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
+}

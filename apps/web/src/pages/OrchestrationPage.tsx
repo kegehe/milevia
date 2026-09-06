@@ -10,23 +10,20 @@ import "../conversation.css";
 import "../orchestration.css";
 
 type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; agentId: "claude-code" | "codex"; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
-type OrchestrationJob = { id: string; taskId: string; position: number; status: string; attempt?: number; baseDevSha?: string; targetBranch?: string; taskBranch?: string; worktreePath?: string; conversationId?: string; batchId?: string; humanDecision?: string; resourcesCleanedAt?: string; lastError?: string; createdAt?: string; updatedAt?: string };
+type OrchestrationJob = { id: string; projectId: string; taskId: string; taskTitle?: string; taskDescription?: string; position: number; status: string; attempt?: number; baseDevSha?: string; targetBranch?: string; taskBranch?: string; worktreePath?: string; conversationId?: string; batchId?: string; humanDecision?: string; resourcesCleanedAt?: string; lastError?: string; createdAt?: string; updatedAt?: string };
 type OrchestrationBatch = { id: string; name: string; conversationStrategy: "new" | "continue"; status: "active" | "needs_human" | "paused" | "awaiting_main" | "completed"; taskCount: number; completedCount: number; createdAt: string; updatedAt: string };
 type ConversationHistory = { conversation?: { agentId: AgentID }; activeRunId?: string | null; messages: Message[]; events: Event[]; hasMore: boolean; nextCursor: string };
 
 const runningStatuses = new Set(["preparing", "implementing", "checking"]);
 const refreshingStatuses = new Set(["queued", "preparing", "implementing", "checking"]);
-
-function normalizedVerificationCommands(value: string) {
-  return value.split("\n").map((item) => item.trim()).filter(Boolean);
-}
+const fallbackTaskTitle = "未命名任务";
 
 function uniqueTaskIDs(taskIDs: string[]) {
   return [...new Set(taskIDs)];
 }
 
 function statusLabel(status: string, targetBranch = "main") {
-  const labels: Record<string, string> = { queued: "等待执行", preparing: "准备工作区", implementing: "Agent 执行中", checking: "验证与审查", paused: "已暂停", stopped: "已停止", removing: "清理中", needs_human: "需要处理", awaiting_main: `待合并 ${targetBranch}`, integrated_to_dev: `待合并 ${targetBranch}`, released_to_main: `已合并 ${targetBranch}` };
+  const labels: Record<string, string> = { queued: "等待执行", preparing: "准备工作区", implementing: "Agent 执行中", checking: "收尾中", paused: "已暂停", stopped: "已停止", removing: "清理中", needs_human: "需要处理", awaiting_main: `待合并 ${targetBranch}`, integrated_to_dev: `待合并 ${targetBranch}`, released_to_main: `已合并 ${targetBranch}` };
   return labels[status] || status;
 }
 
@@ -35,7 +32,7 @@ function orchestrationActivityLabel(status: string, agentID: AgentID) {
   if (status === "queued") return "任务正在队列中等待执行";
   if (status === "preparing") return "正在准备独立工作区";
   if (status === "implementing") return `${agentName} 正在处理任务`;
-  if (status === "checking") return "正在验证变更并进行独立审查";
+  if (status === "checking") return "正在提交实现并收尾";
   return "";
 }
 
@@ -56,6 +53,15 @@ function shortSHA(value?: string) { return value ? value.slice(0, 12) : "--"; }
 
 function candidateSummary(task: Task) {
   return task.description.replace(/\s+/g, " ").trim() || "未填写任务内容";
+}
+
+function orchestrationPlanStatusLabel(batch: OrchestrationBatch) {
+  if (batch.taskCount === 0) return "暂无子任务";
+  if (batch.completedCount === batch.taskCount) return "子任务已全部完成";
+  if (batch.status === "needs_human") return "有子任务需要处理";
+  if (batch.status === "paused") return "有子任务已暂停";
+  if (["awaiting_main", "released_to_main", "integrated_to_dev"].includes(batch.status)) return "有子任务待合并";
+  return "子任务推进中";
 }
 
 function OrchestrationConversationMessage({ message, agentID }: { message: Message; agentID: "claude-code" | "codex" }) {
@@ -99,6 +105,7 @@ export default function OrchestrationPage() {
 	const [conversationStrategy, setConversationStrategy] = useState<"new" | "continue">("new");
 	const [decision, setDecision] = useState("");
   const mounted = useRef(true);
+  const tasksRef = useRef<Task[]>([]);
   const overviewRequestVersion = useRef(0);
   const selectedRequestVersion = useRef(0);
   const selectedRequestInFlight = useRef(0);
@@ -110,7 +117,11 @@ export default function OrchestrationPage() {
   const selectedID = params.get("job") || "";
   const scopedJobs = useMemo(() => batchFilterID ? jobs.filter((job) => job.batchId === batchFilterID) : jobs, [batchFilterID, jobs]);
   const selected = scopedJobs.find((job) => job.id === selectedID) || scopedJobs[0] || null;
-  const taskTitleByID = useMemo(() => new Map(tasks.map((task) => [task.id, task.title || "未命名任务"])), [tasks]);
+  const taskTitleByID = useMemo(() => {
+    const titles = new Map(tasks.map((task) => [task.id, task.title || fallbackTaskTitle]));
+    jobs.forEach((job) => { if (!titles.has(job.taskId) && job.taskTitle) titles.set(job.taskId, job.taskTitle); });
+    return titles;
+  }, [jobs, tasks]);
 
   const loadOverview = useCallback(async () => {
     if (!projectId) return;
@@ -126,6 +137,7 @@ export default function OrchestrationPage() {
     setJobs(nextJobs);
     setTasks(nextTasks);
 		setBatches(nextBatches);
+    tasksRef.current = nextTasks;
   }, [api, projectId]);
 
   const loadSelected = useCallback(async (historyMode: "full" | "latest" = "full") => {
@@ -153,7 +165,15 @@ export default function OrchestrationPage() {
         setDetail(nextDetail);
       } catch (cause) {
         if (mounted.current && requestVersion === selectedRequestVersion.current) {
-          setDetail(null);
+          const fallbackTask = tasksRef.current.find((task) => task.id === selected.taskId);
+          if (fallbackTask) {
+            setDetail({ ...fallbackTask, canDispatch: false, runs: [], events: [], verificationRuns: [] });
+          } else if (selected.taskTitle) {
+            const now = new Date().toISOString();
+            setDetail({ id: selected.taskId, title: selected.taskTitle, description: selected.taskDescription || "", priority: "normal", pinned: false, position: selected.position, status: "todo", dependsOn: [], blockedBy: [], blocks: [], canDispatch: false, runs: [], events: [], verificationRuns: [], createdAt: selected.createdAt || now, updatedAt: selected.updatedAt || now });
+          } else {
+            setDetail(null);
+          }
           setDetailError(cause instanceof Error ? cause.message : "无法加载任务详情");
         }
       }
@@ -256,6 +276,14 @@ export default function OrchestrationPage() {
   }, [jobs, tasks]);
 	const selectedDraftTasks = useMemo(() => uniqueTaskIDs(draftTaskIDs).map((taskID) => enqueueableTasks.find((task) => task.id === taskID)).filter((task): task is Task => Boolean(task)), [draftTaskIDs, enqueueableTasks]);
 	const visibleJobs = scopedJobs;
+	const activeBatch = batchFilterID ? batches.find((batch) => batch.id === batchFilterID) || null : null;
+	// 给每个列出的子任务提供“上移/下移”。排序接口要求一次提交整条项目内排队子任务，
+	// 所以箭头仅在当前可见组恰好就是全部可排序项时显示（单计划或默认全部列表均满足）。
+	const reorderableTaskIDs = visibleJobs
+		.filter((job) => job.status === "queued" || job.status === "paused")
+		.sort((left, right) => left.position - right.position)
+		.map((job) => job.taskId);
+	const showReorderArrows = reorderableTaskIDs.length > 0 && reorderableTaskIDs.length === queuedTaskIDs.length;
 
   useEffect(() => {
     if (selected?.id === selectedID) return;
@@ -271,6 +299,7 @@ export default function OrchestrationPage() {
     setDraftTaskIDs((previous) => uniqueTaskIDs(previous.filter((taskID) => candidateIDs.has(taskID))));
   }, [enqueueableTasks]);
   const selectJob = (job: OrchestrationJob) => {
+    if (job.batchId && batches.some((batch) => batch.id === job.batchId)) setBatchFilterID(job.batchId);
     selectedRequestVersion.current += 1;
     setDetail(null);
     setDetailLoading(true);
@@ -279,6 +308,34 @@ export default function OrchestrationPage() {
     setHistory(null);
     setParams({ job: job.id });
   };
+  // 三级队列视图：最上方选择一个「编排任务」，中间列出其全部子任务。
+  const planOrderedJobs = (batchID: string) => jobs.filter((job) => job.batchId === batchID).sort((left, right) => left.position - right.position);
+  // 选中编排任务后自动打开其实时状态最适合关注的一个子任务（正在运行的优先，
+  // 否则最新入队待执行的），避免右侧对话区停留在上一个编排任务的内容上。
+  const selectPlan = (batchID: string) => {
+    const job = selected?.batchId === batchID && selected ? selected : undefined;
+    const candidates = planOrderedJobs(batchID);
+    const target = job || candidates.find((item) => runningStatuses.has(item.status) || ["queued", "paused"].includes(item.status)) || candidates[0];
+    setBatchFilterID(batchID);
+    if (target) {
+      selectedRequestVersion.current += 1;
+      setDetail(null);
+      setDetailLoading(true);
+      setDetailError("");
+      historyRef.current = null;
+      setHistory(null);
+      setParams({ job: target.id });
+    }
+  };
+  // 首次进入且未通过 URL 指定任务时，自动聚焦最近创建的编排任务，让中间区域
+  // 有内容可展示；深度链接「job」或用户已选择时均不干扰。
+  useEffect(() => {
+    if (batchFilterID || selectedID) return;
+    if (!batches.length || !jobs.length) return;
+    // 若仍存在未归入任何「编排任务」的旧式单条入队任务，则留在“全部子任务”视图，
+    // 避免它们被默认聚焦最近计划而暂时隐藏；新建的项目通常都是批量编排、走不到这里。
+    if (!jobs.some((job) => !job.batchId)) setBatchFilterID(batches[0].id);
+  }, [batchFilterID, batches, jobs, selectedID]);
   const action = async (name: "pause" | "resume" | "stop" | "merge-main") => {
     if (!selected) return;
     setBusy(name);
@@ -392,12 +449,27 @@ export default function OrchestrationPage() {
     </header>
     {config?.frozenReason && <div className="orchestration-freeze" role="alert"><b>队列已冻结</b><span>{config.frozenReason}</span></div>}
     <div className="orchestration-console">
-      <aside className="orchestration-queue" aria-label="自动编排队列"><header><div><h2>队列</h2><span>{visibleJobs.length} 项</span></div><button type="button" title="刷新队列" aria-label="刷新队列" disabled={Boolean(busy)} onClick={() => void loadOverview()}>↻</button></header>{batches.length > 0 && <div className="orchestration-batch-filter"><label>编排任务<select value={batchFilterID} onChange={(event) => setBatchFilterID(event.target.value)}><option value="">全部 ({jobs.length})</option>{batches.map((batch) => <option key={batch.id} value={batch.id}>{batch.name} ({batch.completedCount}/{batch.taskCount})</option>)}</select></label>{batchFilterID && <button type="button" className="danger-text" disabled={Boolean(busy)} onClick={() => setConfirmDeleteBatch(true)}>归档编排任务</button>}</div>}{visibleJobs.length === 0 ? <p className="orchestration-empty">{batchFilterID ? "该编排任务暂无队列项。" : "暂无已入队任务。"}</p> : <ol>{visibleJobs.map((job) => {
-        const reorderable = !batchFilterID && (job.status === "queued" || job.status === "paused");
-        const removable = reorderable || job.status === "stopped";
-        const queuedIndex = queuedTaskIDs.indexOf(job.taskId);
-        return <li key={job.id}><button type="button" className={`${selected?.id === job.id ? "selected " : ""}${reorderable || removable ? "has-queue-actions" : ""}`} onClick={() => selectJob(job)}><span className={`orchestration-status-dot ${job.status}`} /><span className="orchestration-job-name"><b>#{job.position} {taskTitleByID.get(job.taskId) || "未命名任务"}</b><small>{statusLabel(job.status, job.targetBranch)}</small></span>{job.lastError && <i title={job.lastError}>!</i>}</button>{(reorderable || removable) && <div className="orchestration-queue-actions"><button type="button" title="上移" aria-label="上移" disabled={Boolean(busy) || queuedIndex <= 0} onClick={() => void moveJob(job.taskId, "up")}>↑</button><button type="button" title="下移" aria-label="下移" disabled={Boolean(busy) || queuedIndex < 0 || queuedIndex >= queuedTaskIDs.length - 1} onClick={() => void moveJob(job.taskId, "down")}>↓</button>{removable && <button type="button" title="移出队列" aria-label="移出队列" disabled={Boolean(busy)} onClick={() => void queueAction(`dequeue:${job.taskId}`, `/api/tasks/${job.taskId}/orchestration/dequeue`, { method: "DELETE" })}>{busy === `dequeue:${job.taskId}` ? "…" : "×"}</button>}</div>}</li>;
-      })}</ol>}<section className="orchestration-candidates" aria-labelledby="orchestration-candidates-title"><header><h3 id="orchestration-candidates-title">候选任务</h3><button type="button" className="secondary" disabled={Boolean(busy) || selectedEnqueue.size === 0} onClick={() => setBatchComposerOpen(true)}>{`加入 (${selectedEnqueue.size})`}</button></header>{enqueueableTasks.length ? <ul>{enqueueableTasks.map((task) => { const summary = candidateSummary(task); return <li key={task.id}><label title={summary}><input type="checkbox" disabled={Boolean(busy)} checked={selectedEnqueue.has(task.id)} onChange={() => toggleEnqueue(task.id)} /><span>{summary}</span></label></li>; })}</ul> : <p className="orchestration-empty">没有可加入队列的任务。</p>}</section></aside>
+      <aside className="orchestration-queue" aria-label="自动编排 — 三级队列视图">
+  <header className="orchestration-queue-toolbar"><div className="orchestration-queue-toolbar-top"><h2>自动编排</h2><span>{jobs.length} 条队列记录 · {batches.length} 个编排任务</span></div><button type="button" title="刷新队列" aria-label="刷新队列" disabled={Boolean(busy)} onClick={() => void loadOverview()}>↻</button></header>
+  <section className="orchestration-row orchestration-planpane" aria-labelledby="orchestration-plan-title">
+    <header><div><h3 id="orchestration-plan-title">① 编排任务 <i>创作计划</i></h3><span>{batches.length} 个</span></div><button type="button" className="primary" title="新建编排任务" aria-label="新建编排任务" disabled={Boolean(busy) || !config?.enabled} onClick={() => setBatchComposerOpen(true)}>+ 新建</button></header>
+    {batches.length ? <ol className="orchestration-planlist">{batches.map((batch) => <li key={batch.id}><button type="button" className={`orchestration-planitem${batchFilterID === batch.id ? " selected" : ""}`} disabled={Boolean(busy)} onClick={() => void selectPlan(batch.id)} title={batch.name}><span className={`orchestration-status-dot ${batch.status}`} /><span className="orchestration-planitem-main"><b>{batch.name}</b><small>{orchestrationPlanStatusLabel(batch)}</small></span><span className="orchestration-planitem-count">{batch.completedCount}/{batch.taskCount}</span></button></li>)}</ol> : <p className="orchestration-empty">还没有编排任务，点击右上角「新建编排任务」开始自动评审与合并。</p>}
+  </section>
+  <section className="orchestration-row orchestration-subtasks" aria-labelledby="orchestration-subtasks-title">
+    <header><div className="orchestration-subtasks-title"><h3 id="orchestration-subtasks-title">② 当前编排任务的子任务</h3>{activeBatch ? <small>{activeBatch.name}</small> : <small>全部子任务</small>}</div><div className="orchestration-subtasks-head-actions">{activeBatch && <button type="button" className="danger-text" title="归档当前编排任务" aria-label="归档并发编排" disabled={Boolean(busy)} onClick={() => setConfirmDeleteBatch(true)}>归档编排任务</button>}<span>{visibleJobs.length} 项</span></div></header>
+    {visibleJobs.length === 0 ? <p className="orchestration-empty">当前编排任务还没有子任务，可在下方候选任务中勾选后加入。</p> : <ol className="orchestration-joblist">{visibleJobs.map((job) => {
+      const queueable = job.status === "queued" || job.status === "paused";
+      const removable = queueable || job.status === "stopped";
+      const reorderIndex = reorderableTaskIDs.indexOf(job.taskId);
+      return <li key={job.id}><button type="button" className={`${selected?.id === job.id ? "selected " : ""}${removable ? "has-queue-actions" : ""}`} aria-current={selected?.id === job.id} onClick={() => selectJob(job)}><span className={`orchestration-status-dot ${job.status}`} /><span className="orchestration-job-name"><b>#{job.position} {taskTitleByID.get(job.taskId) || fallbackTaskTitle}</b><small>{statusLabel(job.status, job.targetBranch)}{job.attempt ? ` · 第 ${job.attempt} 轮` : ""}</small></span>{job.lastError && <i title={job.lastError}>!</i>}</button>{removable && <div className="orchestration-queue-actions">{showReorderArrows && reorderIndex > -1 && <>
+        <button type="button" title="上移" aria-label="上移" disabled={Boolean(busy) || reorderIndex <= 0} onClick={() => void moveJob(job.taskId, "up")}>↑</button>
+        <button type="button" title="下移" aria-label="下移" disabled={Boolean(busy) || reorderIndex < 0 || reorderIndex >= reorderableTaskIDs.length - 1} onClick={() => void moveJob(job.taskId, "down")}>↓</button>
+      </>}<button type="button" className="danger" title="移出队列" aria-label="移出队列" disabled={Boolean(busy) || !removable} onClick={() => void queueAction(`dequeue:${job.taskId}`, `/api/tasks/${job.taskId}/orchestration/dequeue`, { method: "DELETE" })}>{busy === `dequeue:${job.taskId}` ? "…" : "×"}</button></div>}</li>;
+    })}</ol>}
+  </section>  <section className="orchestration-row orchestration-candidates" aria-labelledby="orchestration-candidates-title">
+    <header><h3 id="orchestration-candidates-title">③ 候选任务 <i>可加入的 todo</i></h3><button type="button" className="secondary" disabled={Boolean(busy) || selectedEnqueue.size === 0} onClick={() => setBatchComposerOpen(true)}>{`加入 (${selectedEnqueue.size})`}</button></header>{enqueueableTasks.length ? <ul>{enqueueableTasks.map((task) => { const summary = candidateSummary(task); return <li key={task.id}><label title={summary}><input type="checkbox" disabled={Boolean(busy)} checked={selectedEnqueue.has(task.id)} onChange={() => toggleEnqueue(task.id)} /><span>{summary}</span></label></li>; })}</ul> : <p className="orchestration-empty">没有可加入队列的任务。</p>}
+  </section>
+</aside>
       <main className="orchestration-conversation">{selected ? <>
         <header><div><h2>完整对话</h2><span>{messages.length} 条消息</span></div><a href={selected.conversationId ? `/projects/${projectId}/conversations/${selected.conversationId}?readonly=true` : undefined} onClick={(event) => { if (!selected.conversationId) event.preventDefault(); }} aria-disabled={!selected.conversationId}>在对话页打开</a></header>
         <div className="orchestration-conversation-content" ref={conversationScrollRef} onScroll={updateCurrentUserMessageIndex}><section className="timeline orchestration-conversation-timeline">{messages.length ? messages.map((message) => <div key={message.id} ref={message.role === "user" ? (element) => { if (element) userMessageElements.current.set(message.id, element); else userMessageElements.current.delete(message.id); } : undefined}><OrchestrationConversationMessage message={message} agentID={selectedAgentID} /></div>) : <p className="orchestration-empty">暂无可显示的执行对话。</p>}{activityLabel && <div className="run-indicator orchestration-run-indicator" role="status"><span></span>{activityLabel}</div>}</section></div>
@@ -423,9 +495,6 @@ function OrchestrationSettings({ config, busy, close, save }: { config: Orchestr
   const [enabled, setEnabled] = useState(config.enabled);
   const [mainBranch, setMainBranch] = useState(config.mainBranch);
   const [agentId, setAgentId] = useState<OrchestrationConfig["agentId"]>(config.agentId);
-  const [commands, setCommands] = useState(config.verificationCommands.join("\n"));
   const [maxFixRounds, setMaxFixRounds] = useState(config.maxFixRounds);
-  const verificationCommands = normalizedVerificationCommands(commands);
-  const verificationError = enabled && verificationCommands.length === 0;
-  return <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="orchestration-settings-title"><header><div><p className="orchestration-eyebrow">PROJECT POLICY</p><h2 id="orchestration-settings-title">编排配置</h2></div><button type="button" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><label className="orchestration-setting-toggle"><input type="checkbox" checked={enabled} disabled={busy} onChange={(event) => setEnabled(event.target.checked)} />启用自动队列</label><div className="orchestration-settings-form"><label>稳定分支<input value={mainBranch} disabled={busy} required onChange={(event) => setMainBranch(event.target.value)} /></label><label>执行 Agent<select value={agentId} disabled={busy} onChange={(event) => setAgentId(event.target.value as OrchestrationConfig["agentId"])}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label><label className="wide">验证命令<textarea value={commands} aria-invalid={verificationError} disabled={busy} required placeholder="每行一条命令" onChange={(event) => setCommands(event.target.value)} />{verificationError && <small className="orchestration-field-error">启用自动编排时至少需要一条验证命令。</small>}</label><label>最大修复轮次<input type="number" min={1} max={10} value={maxFixRounds} disabled={busy} onChange={(event) => setMaxFixRounds(Number(event.target.value))} /></label></div><p>配置仅作用于之后加入队列的任务。</p><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button type="button" className="primary" disabled={busy || !mainBranch.trim() || verificationError} onClick={() => void save({ ...config, enabled, mainBranch: mainBranch.trim(), agentId, verificationCommands, maxFixRounds })}>{busy ? "保存中" : "保存配置"}</button></footer></section></div>;
+  return <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="orchestration-settings-title"><header><div><p className="orchestration-eyebrow">PROJECT POLICY</p><h2 id="orchestration-settings-title">编排配置</h2></div><button type="button" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><label className="orchestration-setting-toggle"><input type="checkbox" checked={enabled} disabled={busy} onChange={(event) => setEnabled(event.target.checked)} />启用自动队列</label><div className="orchestration-settings-form"><label>稳定分支<input value={mainBranch} disabled={busy} required onChange={(event) => setMainBranch(event.target.value)} /></label><label>执行 Agent<select value={agentId} disabled={busy} onChange={(event) => setAgentId(event.target.value as OrchestrationConfig["agentId"])}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label><label>最大修复轮次<input type="number" min={1} max={10} value={maxFixRounds} disabled={busy} onChange={(event) => setMaxFixRounds(Number(event.target.value))} /></label></div><p>配置仅作用于之后加入队列的任务。</p><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button type="button" className="primary" disabled={busy || !mainBranch.trim()} onClick={() => void save({ ...config, enabled, mainBranch: mainBranch.trim(), agentId, maxFixRounds })}>{busy ? "保存中" : "保存配置"}</button></footer></section></div>;
 }

@@ -78,17 +78,34 @@
 .settings-row b { color: #294e43; font-size: 13px; }
 .settings-row > div:first-child > span { max-width: 590px; color: #71887e; font-size: 12px; line-height: 1.45; }
 .settings-row select, .settings-time-control input {
-  min-height: 34px;
-  border: 1px solid #c5dad0;
-  border-radius: 6px;
+  min-height: 36px;
+  border: 1px solid #bfd6ca;
+  border-radius: 7px;
   padding: 0 9px;
-  color: #294e43;
+  color: #254b40;
   background: #fff;
   font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+  transition: border-color .14s ease, background .14s ease, box-shadow .14s ease;
 }
-.settings-row select:focus, .settings-time-control input:focus { border-color: #55a697; outline: 2px solid #cfede3; }
-.settings-row select:disabled, .settings-time-control input:disabled { color: #8a9f95; background: #f2f7f4; }
-.settings-row > .secondary, .settings-update-actions > .secondary, .settings-update-actions > .primary { min-height: 34px; padding: 7px 11px; font-size: 12px; }
+.settings-row select {
+  /* 隐藏原生箭头，改用自定义 SVG chevron */
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2368766f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  cursor: pointer;
+}
+.settings-row select:hover:not(:disabled) { border-color: #8eb9a7; }
+.settings-row select:focus, .settings-time-control input:focus { border-color: #479788; box-shadow: 0 0 0 3px #c9eadf; outline: none; }
+.settings-row select:focus-visible, .settings-time-control input:focus-visible { outline: none; }
+.settings-row select:disabled, .settings-time-control input:disabled { cursor: not-allowed; color: #93a69d; border-color: #d8e6de; background-color: #f3f8f4; }
+.settings-row select:disabled { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23adbdb4' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
+/* 下拉选项面板：跟随主题的浅色卡片 */
+.settings-row select option { color: #254b40; background: #fff; }
+.settings-row select option:checked { background-color: #e6f4ed; }
+.settings-row > .secondary, .settings-update-actions > .secondary, .settings-update-actions > .primary { min-height: 36px; padding: 7px 13px; font-size: 12px; }
 
 .settings-toggle { position: relative; display: inline-flex; width: 40px; height: 24px; flex: none; align-items: center; cursor: pointer; }
 .settings-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
@@ -106,8 +123,6 @@
 .font-size-control output { width: 35px; color: #315f54; font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
 .settings-inline-action { margin-left: 3px; }
 .settings-time-control > span { color: #71887e; font-size: 11px; }
-.settings-resource-link { display: inline-flex; align-items: center; gap: 7px; }
-.settings-resource-link svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .settings-update-actions { justify-content: flex-end; }
 
 .settings-confirm-dialog { width: min(480px, 100%); }

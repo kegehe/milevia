@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router-dom";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -117,18 +117,20 @@ export default function ScheduledTasksPage() {
   const [editor, setEditor] = useState<ScheduledTask | "new" | null>(null);
   const [busyID, setBusyID] = useState("");
   const [pendingDelete, setPendingDelete] = useState<PendingDelete>(null);
+  const loadGenerationRef = useRef(0);
 
   const load = useCallback(async () => {
     if (!projectId) return;
+    const generation = ++loadGenerationRef.current;
     const next = await projectApi<ScheduledTask[]>(`/api/projects/${projectId}/scheduled-tasks`);
-    setTasks(next);
+    if (generation === loadGenerationRef.current) setTasks(next);
   }, [projectApi, projectId]);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     void load().catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : "无法加载定时任务"); }).finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; loadGenerationRef.current += 1; };
   }, [load, setError]);
 
   useEffect(() => {

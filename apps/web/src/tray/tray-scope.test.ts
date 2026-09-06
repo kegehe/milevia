@@ -36,10 +36,14 @@ test("TrayPanel 挂载时添加、卸载时移除 tray-window 标记", () => {
   assert.match(source, /useLayoutEffect\([\s\S]*classList\.add\(["']tray-window["']\)/);
 });
 
-test("TrayPanel 提供可见的关闭面板操作", () => {
+test("TrayPanel 不设右上角 X 关闭按钮，Esc 仍可关闭", () => {
   const source = readFileSync(new URL("./TrayPanel.tsx", import.meta.url), "utf8");
 
-  assert.match(source, /className="tray-panel-close"/);
-  assert.match(source, /title="关闭面板"/);
-  assert.match(source, /onClick=\{\(\) => actions\(\)\.close\(\)\}/);
+  // 点击面板外部会失焦自动隐藏（Rust 侧 WindowEvent::Focused(false)→hide），
+  // 右上角的 X 属于冗余控件，不应存在。
+  assert.doesNotMatch(source, /tray-panel-close/);
+  assert.doesNotMatch(source, /title="关闭面板"/);
+  assert.doesNotMatch(source, /aria-label="关闭面板"/);
+  // 面板内保留 Esc 关闭作为键盘可达路径
+  assert.match(source, /key === "Escape"/);
 });

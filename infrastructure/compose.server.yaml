@@ -1,0 +1,24 @@
+name: milevia
+
+# 服务器部署变体：复用现有 PostgreSQL，不启动新的 PostgreSQL/Redis/MinIO。
+# 现有 PostgreSQL 容器必须位于 external Docker network `keyanjia-network`。
+services:
+  cloud-control:
+    build:
+      context: ..
+      dockerfile: apps/cloud-control/Dockerfile
+    environment:
+      MILEVIA_CLOUD_DATABASE_URL: ${MILEVIA_CLOUD_DATABASE_URL:?set PostgreSQL URL}
+      MILEVIA_CLOUD_AGENT_TOKENS: ${MILEVIA_CLOUD_AGENT_TOKENS:?set agent token JSON}
+      MILEVIA_CLOUD_USER_TOKEN: ${MILEVIA_CLOUD_USER_TOKEN:?set user token}
+      MILEVIA_CLOUD_APP_URL: ${MILEVIA_CLOUD_APP_URL:?set public URL}
+      MILEVIA_CLOUD_ADDR: :8090
+    ports:
+      - "127.0.0.1:${CLOUD_CONTROL_PORT:-8090}:8090"
+    networks:
+      - keyanjia-network
+    restart: unless-stopped
+
+networks:
+  keyanjia-network:
+    external: true

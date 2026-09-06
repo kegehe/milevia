@@ -16,6 +16,10 @@ function retryCountFor(init?: RequestInit): number {
 }
 
 export async function api<T>(path: string, init?: RequestInit, retries = retryCountFor(init)): Promise<T> {
+	return apiWithTimeout<T>(path, init, retries, requestTimeoutMs);
+}
+
+export async function apiWithTimeout<T>(path: string, init?: RequestInit, retries = retryCountFor(init), timeoutMs = requestTimeoutMs): Promise<T> {
   let lastError: unknown;
   const signal = init?.signal;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -24,7 +28,7 @@ export async function api<T>(path: string, init?: RequestInit, retries = retryCo
       const headers = sessionHeaders(init?.headers);
       if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
       const controller = new AbortController();
-      const timeout = globalThis.setTimeout(() => controller.abort(), requestTimeoutMs);
+      const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
       const abort = () => controller.abort();
       signal?.addEventListener("abort", abort, { once: true });
       let response: Response;
@@ -36,7 +40,7 @@ export async function api<T>(path: string, init?: RequestInit, retries = retryCo
         });
       } catch (cause) {
         if (controller.signal.aborted && !signal?.aborted) {
-          throw new Error("控制服务未在 15 秒内响应，请重启 Milevia 后重试。");
+          throw new Error(`控制服务未在 ${Math.round(timeoutMs / 1000)} 秒内响应，请重启 Milevia 后重试。`);
         }
         throw cause;
       } finally {

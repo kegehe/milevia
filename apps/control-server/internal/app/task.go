@@ -138,7 +138,7 @@ create table if not exists task_dependencies (
 create table if not exists task_runs (
 	id text primary key,
 	task_id text not null references tasks(id) on delete cascade,
-	conversation_id text not null references conversations(id) on delete restrict,
+	conversation_id text references conversations(id) on delete set null,
 	run_id text unique references runs(id) on delete set null,
 	sequence integer not null,
 	status text not null,
@@ -175,6 +175,116 @@ create index if not exists task_events_task_created on task_events(task_id,creat
 	}
 	if err := ensureColumn(ctx, s.db, "tasks", "pinned", "integer not null default 0"); err != nil {
 		return fmt.Errorf("add tasks.pinned: %w", err)
+	}
+	if err := s.migrateTaskRunConversationReference(ctx); err != nil {
+		return fmt.Errorf("migrate task run conversation reference: %w", err)
+	}
+	return nil
+}
+
+// migrateTaskRunConversationReference makes conversation deletion non-blocking
+// while retaining task-run audit history. Older databases used a restrictive,
+// non-null foreign key and therefore require a SQLite table rebuild.
+func (s *Server) migrateTaskRunConversationReference(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `pragma table_info(task_runs)`)
+	if err != nil {
+		return err
+	}
+	conversationNotNull := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "conversation_id" {
+			conversationNotNull = notNull != 0
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `pragma foreign_key_list(task_runs)`)
+	if err != nil {
+		return err
+	}
+	conversationDeleteAction := ""
+	for rows.Next() {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			rows.Close()
+			return err
+		}
+		if from == "conversation_id" {
+			conversationDeleteAction = strings.ToLower(onDelete)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !conversationNotNull && conversationDeleteAction == "set null" {
+		return nil
+	}
+
+	if _, err := s.db.ExecContext(ctx, `pragma foreign_keys=off`); err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	restoreForeignKeys := func() error {
+		_, err := s.db.ExecContext(ctx, `pragma foreign_keys=on`)
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		_ = restoreForeignKeys()
+		return fmt.Errorf("begin task_runs rebuild: %w", err)
+	}
+	for _, statement := range []string{
+		`create table task_runs_rebuilt (
+			id text primary key,
+			task_id text not null references tasks(id) on delete cascade,
+			conversation_id text references conversations(id) on delete set null,
+			run_id text unique references runs(id) on delete set null,
+			sequence integer not null,
+			status text not null,
+			prompt_snapshot text not null,
+			acceptance_snapshot text not null,
+			failure_reason text not null default '',
+			created_at datetime not null,
+			started_at datetime,
+			finished_at datetime
+		)`,
+		`insert into task_runs_rebuilt (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at)
+			select id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at from task_runs`,
+		`drop table task_runs`,
+		`alter table task_runs_rebuilt rename to task_runs`,
+		`create index if not exists task_runs_task_created on task_runs(task_id,created_at desc)`,
+		`create index if not exists task_runs_run on task_runs(run_id)`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			_ = tx.Rollback()
+			_ = restoreForeignKeys()
+			return fmt.Errorf("rebuild task_runs: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		_ = restoreForeignKeys()
+		return fmt.Errorf("commit task_runs rebuild: %w", err)
+	}
+	if err := restoreForeignKeys(); err != nil {
+		return fmt.Errorf("restore foreign keys after task_runs rebuild: %w", err)
 	}
 	return nil
 }
@@ -354,7 +464,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if err := recordTaskEventTx(r.Context(), tx, task.ID, "", "task.created", map[string]string{"status": task.Status}, now); err != nil {
+	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", "task.created", map[string]string{"status": task.Status}, now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -510,12 +620,12 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if err := recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependencies_replaced", map[string]any{"predecessorTaskIds": *input.PredecessorTaskIDs}, task.UpdatedAt); err != nil {
+		if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependencies_replaced", map[string]any{"predecessorTaskIds": *input.PredecessorTaskIDs}, task.UpdatedAt); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 	}
-	if err := recordTaskEventTx(r.Context(), tx, task.ID, "", "task.updated", map[string]string{"title": task.Title, "priority": task.Priority}, task.UpdatedAt); err != nil {
+	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", "task.updated", map[string]string{"title": task.Title, "priority": task.Priority}, task.UpdatedAt); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -676,7 +786,7 @@ func (s *Server) addTaskDependency(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("dependency already exists"))
 		return
 	}
-	if err := recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependency_added", map[string]string{"predecessorTaskId": predecessor.ID}, now); err != nil {
+	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependency_added", map[string]string{"predecessorTaskId": predecessor.ID}, now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -733,7 +843,7 @@ func (s *Server) deleteTaskDependency(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("dependency not found"))
 		return
 	}
-	if err := recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependency_removed", map[string]string{"predecessorTaskId": chi.URLParam(r, "predecessorTaskID")}, time.Now().UTC()); err != nil {
+	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependency_removed", map[string]string{"predecessorTaskId": chi.URLParam(r, "predecessorTaskID")}, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -823,7 +933,7 @@ func (s *Server) replaceTaskDependencies(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	if err := recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependencies_replaced", map[string]any{"predecessorTaskIds": ids}, now); err != nil {
+	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", "task.dependencies_replaced", map[string]any{"predecessorTaskIds": ids}, now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -977,7 +1087,7 @@ func (s *Server) verificationRunsForTask(ctx context.Context, taskID string) ([]
 }
 
 func (s *Server) latestTaskRun(ctx context.Context, taskID string) (TaskRun, error) {
-	return scanTaskRun(s.db.QueryRowContext(ctx, `select id,task_id,conversation_id,coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at from task_runs where task_id=? order by sequence desc limit 1`, taskID))
+	return scanTaskRun(s.db.QueryRowContext(ctx, `select id,task_id,coalesce(conversation_id,''),coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at from task_runs where task_id=? order by sequence desc limit 1`, taskID))
 }
 
 func (s *Server) wouldCreateTaskCycle(ctx context.Context, taskID, predecessorTaskID string) (bool, error) {
@@ -1001,7 +1111,7 @@ func (s *Server) wouldCreateTaskCycleTx(ctx context.Context, tx *sql.Tx, taskID,
 }
 
 func (s *Server) taskRuns(ctx context.Context, taskID string) ([]TaskRun, error) {
-	rows, err := s.db.QueryContext(ctx, `select id,task_id,conversation_id,coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at from task_runs where task_id=? order by sequence desc`, taskID)
+	rows, err := s.db.QueryContext(ctx, `select id,task_id,coalesce(conversation_id,''),coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at from task_runs where task_id=? order by sequence desc`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1049,9 +1159,19 @@ func (s *Server) taskEvents(ctx context.Context, taskID string) ([]TaskEvent, er
 	return items, rows.Err()
 }
 
-func recordTaskEventTx(ctx context.Context, tx *sql.Tx, taskID, taskRunID, typ string, payload any, now time.Time) error {
-	_, err := tx.ExecContext(ctx, `insert into task_events (id,task_id,task_run_id,type,payload,created_at) values (?,?,?,?,?,?)`, uuid.NewString(), taskID, nullTaskRunID(taskRunID), typ, mustJSON(payload), now)
-	return err
+func (s *Server) recordTaskEventTx(ctx context.Context, tx *sql.Tx, taskID, taskRunID, typ string, payload any, now time.Time) error {
+	eventID := uuid.NewString()
+	payloadJSON := mustJSON(payload)
+	if _, err := tx.ExecContext(ctx, `insert into task_events (id,task_id,task_run_id,type,payload,created_at) values (?,?,?,?,?,?)`, eventID, taskID, nullTaskRunID(taskRunID), typ, payloadJSON, now); err != nil {
+		return err
+	}
+	if !s.remoteRelayConfigured() {
+		return nil
+	}
+	// The task event and its remote delivery record share the same SQLite
+	// transaction. A crash cannot leave the cloud unaware of a committed state
+	// change, and a failed outbox write rolls back the business change as well.
+	return enqueueRemoteEventTx(ctx, tx, eventID, taskID, taskRunID, typ, payloadJSON, now)
 }
 
 func nullTaskRunID(value string) any {
@@ -1231,14 +1351,6 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("task is not awaiting review"))
 		return
 	}
-	if s.hasActiveOrchestrationJob(r.Context(), task.ID) {
-		writeError(w, http.StatusConflict, errors.New("automatic orchestration is still verifying this task"))
-		return
-	}
-	if s.isOrchestrationBranchAwaitingMain(r.Context(), task.ID) {
-		writeError(w, http.StatusConflict, errors.New("automatic orchestration branch must be merged into main before this task can be completed"))
-		return
-	}
 	if input.Action != "accept" && input.Action != "request_changes" {
 		writeError(w, http.StatusBadRequest, errors.New("review action must accept or request_changes"))
 		return
@@ -1259,7 +1371,7 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(r.Context(), `update tasks set status=?,updated_at=?,completed_at=case when ?='done' then ? else null end where id=? and status=?`, nextStatus, now, nextStatus, now, task.ID, taskAwaitingReview)
+	result, err := tx.ExecContext(r.Context(), `update tasks set status=?,updated_at=?,completed_at=case when ?='done' then ? else null end where id=? and status=? and not exists(select 1 from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`, nextStatus, now, nextStatus, now, task.ID, taskAwaitingReview, task.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1273,7 +1385,7 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("task status changed before review was recorded"))
 		return
 	}
-	if err := recordTaskEventTx(r.Context(), tx, task.ID, "", eventType, map[string]string{"note": input.Note}, now); err != nil {
+	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", eventType, map[string]string{"note": input.Note}, now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1361,7 +1473,7 @@ func (s *Server) reviewAllTasks(w http.ResponseWriter, r *http.Request) {
 	for _, id := range accepted {
 		args = append(args, id)
 	}
-	query := `update tasks set status=?,updated_at=?,completed_at=? where id in (` + placeholders + `) and status=?`
+	query := `update tasks set status=?,updated_at=?,completed_at=? where id in (` + placeholders + `) and status=? and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`
 	args = append(args, taskAwaitingReview)
 	result, err := tx.ExecContext(r.Context(), query, args...)
 	if err != nil {
@@ -1380,7 +1492,7 @@ func (s *Server) reviewAllTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, id := range accepted {
-		if err := recordTaskEventTx(r.Context(), tx, id, "", "task.accepted", map[string]string{"note": ""}, now); err != nil {
+		if err := s.recordTaskEventTx(r.Context(), tx, id, "", "task.accepted", map[string]string{"note": ""}, now); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1432,7 +1544,7 @@ func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eve
 		writeError(w, http.StatusConflict, errors.New("task status changed before transition was recorded"))
 		return
 	}
-	if err := recordTaskEventTx(r.Context(), tx, task.ID, "", eventType, map[string]string{"status": nextStatus}, now); err != nil {
+	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", eventType, map[string]string{"status": nextStatus}, now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1455,7 +1567,7 @@ func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var runID, taskRunStatus, conversationID string
-	err = s.db.QueryRowContext(r.Context(), `select run_id,status,conversation_id from task_runs where task_id=? and status in ('queued','running') order by created_at desc limit 1`, task.ID).Scan(&runID, &taskRunStatus, &conversationID)
+	err = s.db.QueryRowContext(r.Context(), `select run_id,status,coalesce(conversation_id,'') from task_runs where task_id=? and status in ('queued','running') order by created_at desc limit 1`, task.ID).Scan(&runID, &taskRunStatus, &conversationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusConflict, errors.New("task has no active execution"))
 		return
@@ -1582,5 +1694,5 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 	if taskChanged == 0 {
 		return fmt.Errorf("task %s: expected running but status had already changed", taskID)
 	}
-	return recordTaskEventTx(ctx, tx, taskID, taskRunID, "task.run_"+taskRunTerminalStatus, map[string]string{"runId": runID, "status": taskRunTerminalStatus}, now)
+	return s.recordTaskEventTx(ctx, tx, taskID, taskRunID, "task.run_"+taskRunTerminalStatus, map[string]string{"runId": runID, "status": taskRunTerminalStatus}, now)
 }

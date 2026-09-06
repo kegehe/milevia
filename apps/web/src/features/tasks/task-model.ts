@@ -32,7 +32,7 @@ export const priorityLabels: Record<Priority, string> = { urgent: "紧急", high
 export const statusLabels: Record<TaskStatus, string> = { todo: "待处理", running: "执行中", awaiting_review: "待验收", action_required: "需处理", done: "已完成", cancelled: "已取消" };
 
 export function taskDisplayStatus(task: Task): string {
-  if (task.orchestrationStatus === "checking") return "独立审查中";
+  if (task.orchestrationStatus === "checking") return "编排收尾中";
   if (task.orchestrationStatus === "preparing") return "准备执行";
   if (task.orchestrationStatus === "implementing") return "自动执行中";
   if (task.orchestrationStatus === "queued") return "自动队列中";
@@ -108,7 +108,7 @@ export function taskDisplayTitle(task: Task): string {
 }
 
 export function taskQueueNote(task: Task): string {
-  if (task.orchestrationStatus === "checking") return "独立审查代理正在检查本次提交";
+  if (task.orchestrationStatus === "checking") return "自动编排正在提交实现，等待人工验证";
   if (task.orchestrationStatus === "preparing") return "自动编排正在准备工作区";
   if (task.orchestrationStatus === "implementing") return "自动编排正在执行任务";
   if (task.orchestrationStatus === "queued") return "已进入自动编排队列";

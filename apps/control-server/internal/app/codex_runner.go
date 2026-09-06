@@ -335,7 +335,11 @@ func (r *codexCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeP
 		// Codex custom providers are configuration-backed, not a generic
 		// OPENAI_BASE_URL substitution. Keep the provider name and wire protocol
 		// under our control.
-		config += "\nmodel_provider = \"milevia\"\n\n[model_providers.milevia]\nname = \"Milevia managed provider\"\nbase_url = \"" + strings.ReplaceAll(profile.BaseURL, "\"", "") + "\"\nwire_api = \"responses\"\nenv_key = \"OPENAI_API_KEY\"\n"
+		// The managed endpoint currently exposes the Responses HTTP stream but
+		// does not provide a stable WebSocket upgrade path. Explicitly disable
+		// WebSockets so a dropped upgrade cannot consume the turn retry budget
+		// before falling back to HTTPS.
+		config += "\nmodel_provider = \"milevia\"\n\n[model_providers.milevia]\nname = \"Milevia managed provider\"\nbase_url = \"" + strings.ReplaceAll(profile.BaseURL, "\"", "") + "\"\nwire_api = \"responses\"\nenv_key = \"OPENAI_API_KEY\"\nsupports_websockets = false\nstream_max_retries = 2\nrequest_max_retries = 2\n"
 		args = append([]string{"-c", `model_provider="milevia"`}, args...)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(config), 0o600); err != nil {

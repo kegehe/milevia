@@ -38,9 +38,7 @@ func detectDefaultWSLDistro(ctx context.Context) (string, error) {
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(probeCtx, wslPath, "--list", "--quiet")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runWSLProbe(probeCtx, wslPath, "--list", "--quiet")
 	if err != nil {
 		return "", err
 	}
@@ -66,9 +64,7 @@ func detectWSLHome(ctx context.Context, distro string) (string, error) {
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(probeCtx, wslPath, "-d", distro, "-e", "sh", "-c", "echo $HOME")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runWSLProbe(probeCtx, wslPath, "-d", distro, "-e", "sh", "-c", "echo $HOME")
 	if err != nil {
 		return "", err
 	}
@@ -77,6 +73,36 @@ func detectWSLHome(ctx context.Context, distro string) (string, error) {
 		return "", errors.New("WSL home 探测为空")
 	}
 	return home, nil
+}
+
+// runWSLProbe uses direct buffers and explicit process cleanup so a cancelled
+// WSL probe cannot leave an inherited output pipe blocking the caller.
+func runWSLProbe(ctx context.Context, wslPath string, args ...string) ([]byte, error) {
+	cmd := exec.Command(wslPath, args...)
+	configureProcessGroup(cmd)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return nil, err
+		}
+		return stdout.Bytes(), nil
+	case <-ctx.Done():
+		terminateProcessGroup(cmd)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			_ = cmd.Process.Kill()
+		}
+		return nil, ctx.Err()
+	}
 }
 
 // decodeUTF16LE 把 UTF-16LE 字节流（可能带 BOM）解码为 UTF-8 字符串。

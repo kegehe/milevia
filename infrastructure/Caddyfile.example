@@ -1,0 +1,19 @@
+# 单域名部署示例。将 milevia.example.com 替换为你的真实域名，
+# 并将 /var/www/milevia/dist 替换为 apps/web/dist 的绝对路径。
+# Caddy 会自动处理 HTTPS，并自动透传 /v1/agent/connect 的 WebSocket 升级。
+milevia.example.com {
+    encode gzip zstd
+
+    # Cloud Control 健康检查和 API/WSS 共用同一入口。
+    handle /health {
+        reverse_proxy 127.0.0.1:8090
+    }
+    handle /v1/* {
+        reverse_proxy 127.0.0.1:8090
+    }
+
+    # 其余路径由移动 Web/PWA 提供，未知前端路由回退到 index.html。
+    root * /var/www/milevia/dist
+    try_files {path} /index.html
+    file_server
+}

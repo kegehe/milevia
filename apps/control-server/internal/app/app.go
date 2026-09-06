@@ -40,6 +40,10 @@ type Config struct {
 	CodexPath                     string
 	PermissionMode                string
 	ControlURL                    string
+	RemoteAgentToken              string
+	RemoteCloudURL                string
+	RemoteCloudToken              string
+	RemoteInstanceID              string
 	ApprovalHook                  string
 	NativeApprovalHook            bool
 	AgentUpdateTimeout            time.Duration
@@ -110,6 +114,10 @@ func ConfigFromEnv() Config {
 		CodexPath:                     codexPath,
 		PermissionMode:                mode,
 		ControlURL:                    controlURL,
+		RemoteAgentToken:              os.Getenv("AUTO_REMOTE_AGENT_TOKEN"),
+		RemoteCloudURL:                strings.TrimRight(os.Getenv("AUTO_REMOTE_CLOUD_URL"), "/"),
+		RemoteCloudToken:              os.Getenv("AUTO_REMOTE_CLOUD_TOKEN"),
+		RemoteInstanceID:              strings.TrimSpace(os.Getenv("AUTO_REMOTE_INSTANCE_ID")),
 		ApprovalHook:                  hook,
 		AgentUpdateTimeout:            durationFromEnv("AUTO_AGENT_UPDATE_TIMEOUT", defaultAgentUpdateTimeout),
 		ClaudeTurnIdleTimeout:         durationFromEnv("AUTO_CLAUDE_TURN_IDLE_TIMEOUT", defaultClaudeTurnIdleTimeout),
@@ -172,6 +180,7 @@ type RunStatusResponse struct {
 type Server struct {
 	db                     *sql.DB
 	config                 Config
+	storageMu              sync.Mutex
 	dataLock               *dataDirLock
 	httpMu                 sync.Mutex
 	httpServer             *http.Server
@@ -223,7 +232,10 @@ type Server struct {
 	notificationSubMu      sync.Mutex
 	processStatusSubs      map[*websocket.Conn]*processStatusSubscriber
 	processStatusSubMu     sync.Mutex
+	processStatusSequences map[string]uint64
+	processStatusEpoch     uint64
 	notificationMu         sync.Mutex
+	remoteCommandWake      chan struct{}
 	orchestrationMu        sync.Mutex
 	orchestrationActive    map[string]bool
 	orchestrationCancels   map[string]context.CancelFunc
@@ -625,8 +637,9 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}}
 	s.sessionManager = newConversationSessionManager(s)
+	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
 	s.upgrader.CheckOrigin = func(r *http.Request) bool { return s.allowedOrigin(r.Header.Get("Origin")) }
 	if config.SessionToken != "" {
@@ -656,6 +669,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		_ = dataLock.close()
 		return nil, err
 	}
+	s.startRemoteCommandWorker()
 	if err := s.recoverInterruptedScheduledTasks(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
@@ -829,6 +843,12 @@ func (s *Server) ServeListener(listener net.Listener, ready func(string)) error 
 	if err := s.dataLock.writeState(fmt.Sprintf("pid=%d\nstarted_at=%s\napi_base=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano), listenURL)); err != nil {
 		log.Printf("write data directory lock state: %v", err)
 	}
+	if s.config.DataDir != "" {
+		endpointPath := filepath.Join(s.config.DataDir, "milevia.endpoint")
+		if err := os.WriteFile(endpointPath, []byte(listenURL+"\n"), 0o600); err != nil {
+			log.Printf("write control endpoint: %v", err)
+		}
+	}
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- httpServer.Serve(listener) }()
 	if ready != nil {
@@ -874,12 +894,29 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	// Local Agent relay endpoints expose only durable control metadata. They do
+	// not provide arbitrary filesystem or shell access.
+	r.Route("/api/remote", func(remote chi.Router) {
+		remote.Use(s.remoteAgentOnly)
+		remote.Get("/overview", s.remoteOverview)
+		remote.Get("/snapshot", s.remoteSnapshot)
+		remote.Post("/pairing", s.createRemotePairing)
+		remote.Post("/pairing/confirm", s.confirmRemotePairing)
+		remote.Post("/status", s.updateRemoteStatus)
+		remote.Get("/outbox", s.remoteOutbox)
+		remote.Post("/outbox/ack", s.ackRemoteOutbox)
+		remote.Post("/outbox/fail", s.failRemoteOutbox)
+		remote.Post("/commands", s.enqueueRemoteCommand)
+		remote.Get("/commands/{commandID}", s.getRemoteCommand)
+		remote.Patch("/commands/{commandID}", s.updateRemoteCommand)
+	})
 	if s.config.Mode == "desktop-api" && s.config.SessionToken != "" {
 		r.Post("/api/internal/shutdown", s.shutdown)
 	}
 	r.Get("/api/preferences", s.getAppPreferences)
 	r.Patch("/api/preferences", s.updateAppPreferences)
 	r.Get("/api/runners", s.listRunners)
+	r.Get("/api/runners/{runnerID}/status", s.runnerStatus)
 	r.Get("/api/runners/{runnerID}/agent-capability", s.runnerAgentCapability)
 	r.Get("/api/runners/{runnerID}/agent-profiles", s.listAgentProfiles)
 	r.Post("/api/runners/{runnerID}/agent-profiles", s.createAgentProfile)
@@ -981,6 +1018,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/scheduled-tasks/{scheduledTaskID}/runs", s.listScheduledTaskRuns)
 	r.Get("/api/projects/{projectID}/conversations", s.listConversations)
 	r.Post("/api/projects/{projectID}/conversations", s.createConversation)
+	r.Delete("/api/projects/{projectID}/conversations", s.deleteProjectConversations)
 	r.Post("/api/projects/{projectID}/conversations/activity", s.listConversationActivity)
 	r.Post("/api/projects/{projectID}/terminal/sessions", s.createTerminal)
 	r.Get("/api/projects/{projectID}/terminal/sessions", s.listTerminals)
@@ -996,6 +1034,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/conversations/{conversationID}/input-history", s.listInputHistory)
 	r.Get("/api/conversations/{conversationID}/usage", s.getConversationUsage)
 	r.Post("/api/conversations/{conversationID}/clear", s.clearConversation)
+	r.Delete("/api/conversations/{conversationID}", s.deleteConversation)
 	r.Post("/api/conversations/{conversationID}/activate", s.activateConversation)
 	r.Post("/api/conversations/{conversationID}/permission-mode", s.setConversationPermissionMode)
 	r.Get("/api/conversations/{conversationID}/workspaces", s.listConversationWorkspaces)
@@ -1028,6 +1067,8 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/notifications", s.listNotifications)
 	r.Post("/api/notifications/{notificationID}/dismiss", s.dismissNotification)
 	r.Post("/api/notifications/dismiss-all", s.dismissAllNotifications)
+	r.Get("/api/system/storage", s.getStorageUsage)
+	r.Post("/api/system/storage/cleanup", s.cleanupStorage)
 	s.registerSSHRoutes(r)
 	s.registerFSRoutes(r)
 	if s.config.Mode == "web" && s.config.WebRoot != "" {
@@ -1081,6 +1122,15 @@ func (s *Server) websocketSessionProtocol() string {
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.config.SessionToken == "" || r.URL.Path == "/api/health" || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The local Agent relay authenticates through remoteAgentOnly (an
+		// explicit Agent token in production, or loopback in development),
+		// rather than the browser's short-lived desktop session. Keep this
+		// exception scoped to the relay namespace; every other desktop API
+		// endpoint still requires X-Milevia-Session.
+		if strings.HasPrefix(r.URL.Path, "/api/remote/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1528,6 +1578,9 @@ create index if not exists messages_conversation_primary_created on messages(con
 	}
 	if err := s.migrateTasks(ctx); err != nil {
 		return err
+	}
+	if err := s.migrateRemoteControl(ctx); err != nil {
+		return fmt.Errorf("migrate remote control: %w", err)
 	}
 	if err := s.migrateScheduledTasks(ctx); err != nil {
 		return err
@@ -2634,6 +2687,99 @@ type projectStatusItem struct {
 	InsightsMessage string `json:"insightsMessage"`
 }
 
+const maxConversationHistoryPerProject = 100
+
+// pruneConversationHistoryTx keeps the newest conversations for a project.
+// Active conversations and the current conversation are retained even when a
+// project temporarily has more than the configured limit.
+func pruneConversationHistoryTx(ctx context.Context, tx *sql.Tx, projectID string) error {
+	var count int
+	if err := tx.QueryRowContext(ctx, `select count(*) from conversations where project_id=?`, projectID).Scan(&count); err != nil {
+		return err
+	}
+	excess := count - maxConversationHistoryPerProject
+	if excess <= 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `select id from conversations where project_id=? and is_current=0 and status not in ('running','active') order by last_activity_at asc,created_at asc,id asc limit ?`, projectID, excess)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	ids := make([]string, 0, excess)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `update git_task_records set conversation_id='' where conversation_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `delete from conversations where id=?`, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) pruneConversationHistories(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `select id from projects`)
+	if err != nil {
+		return err
+	}
+	projectIDs := []string{}
+	for rows.Next() {
+		var projectID string
+		if err := rows.Scan(&projectID); err != nil {
+			rows.Close()
+			return err
+		}
+		projectIDs = append(projectIDs, projectID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, projectID := range projectIDs {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if err := pruneConversationHistoryTx(ctx, tx, projectID); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return nil
+}
+
+// StartBackgroundMaintenance starts work that may scan or cascade through a
+// large history database. Callers should invoke it after the HTTP listener is
+// available so maintenance cannot delay service readiness.
+func (s *Server) StartBackgroundMaintenance() {
+	go func() {
+		if err := s.pruneConversationHistories(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[maintenance] prune conversation history: %v", err)
+		}
+	}()
+}
+
 func (s *Server) listProjectStatuses(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(r.Context(), `
 		select
@@ -2804,19 +2950,30 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err = pruneConversationHistoryTx(r.Context(), tx, c.ProjectID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err = tx.Commit(); err != nil {
 		writeError(w, 500, err)
 		return
 	}
+	s.broadcastConversationEvent(Event{
+		ID:             uuid.NewString(),
+		ConversationID: c.ID,
+		Type:           "conversation.created",
+		Payload:        mustJSON(map[string]string{"conversationId": c.ID, "projectId": c.ProjectID}),
+		CreatedAt:      c.CreatedAt,
+	})
 	writeJSON(w, http.StatusCreated, c)
 }
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	limit := 100
+	limit := maxConversationHistoryPerProject
 	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
 		parsed, err := strconv.Atoi(rawLimit)
-		if err != nil || parsed < 1 || parsed > 100 {
-			writeError(w, http.StatusBadRequest, errors.New("limit must be between 1 and 100"))
+		if err != nil || parsed < 1 || parsed > maxConversationHistoryPerProject {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be between 1 and %d", maxConversationHistoryPerProject))
 			return
 		}
 		limit = parsed
@@ -2941,6 +3098,10 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err = pruneConversationHistoryTx(r.Context(), tx, fresh.ProjectID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err = tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2971,6 +3132,256 @@ func (s *Server) markConversationSessionStopping(conversationID string) AgentSes
 	}
 	session.stopping = true
 	return session.agent
+}
+
+// stopConversationSessions marks every managed session for the given
+// conversations as stopping and stops its native agent. It releases no lock:
+// callers must already hold projectLifecycleMu and must release it before
+// awaiting the actual process exits (Stop may block).
+func (s *Server) stopConversationSessions(conversationIDs []string) []AgentSession {
+	if len(conversationIDs) == 0 {
+		return nil
+	}
+	selected := make(map[string]struct{}, len(conversationIDs))
+	for _, id := range conversationIDs {
+		selected[id] = struct{}{}
+	}
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sessions := make([]AgentSession, 0, len(conversationIDs))
+	for conversationID, session := range s.sessions {
+		if _, ok := selected[conversationID]; !ok || session.stopping {
+			continue
+		}
+		session.stopping = true
+		sessions = append(sessions, session.agent)
+	}
+	return sessions
+}
+
+// deleteConversation permanently removes a single conversation and its
+// cascaded messages, runs, events, and workspaces. A running conversation is
+// rejected; orchestration-owned conversations are read-only.
+type deleteConversationsResult struct {
+	Deleted    int      `json:"deleted"`
+	Skipped    int      `json:"skipped"`
+	DeletedIDs []string `json:"deletedIds,omitempty"`
+}
+
+func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "conversationID")
+	if s.isOrchestrationConversation(r.Context(), conversationID) {
+		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations are read-only"))
+		return
+	}
+	s.projectLifecycleMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			s.projectLifecycleMu.Unlock()
+		}
+	}()
+
+	var projectID, status string
+	err := s.db.QueryRowContext(r.Context(), `select p.id,c.status from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&projectID, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if status != "idle" && status != "archived" {
+		writeError(w, http.StatusConflict, errors.New("stop the active agent run before deleting the conversation"))
+		return
+	}
+	// Remove the conversation's isolated Git worktrees before the row is
+	// dropped; after deletion the cascade makes them unreachable for project
+	// cleanup. Cleanup is best-effort so a Git failure never blocks history
+	// deletion.
+	cleanupCtx, cleanupCancel := context.WithTimeout(r.Context(), conversationWorktreeCleanupTimeout)
+	if err := s.removeConversationWorktrees(cleanupCtx, projectID, conversationID); err != nil {
+		log.Printf("delete conversation %s: remove isolated worktrees: %v", conversationID, err)
+	}
+	cleanupCancel()
+
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	// Keep task-run audit history after its conversation is removed. The
+	// conversation foreign key is ON DELETE SET NULL, while the task's
+	// last_task_run_id continues to point at the retained run record.
+	// git_task_records.conversation_id is a plain reference, not a foreign key;
+	// detach orchestration links instead of letting them dangle.
+	if _, err := tx.ExecContext(r.Context(), `update git_task_records set conversation_id='' where conversation_id=?`, conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	result, err := tx.ExecContext(r.Context(), `delete from conversations where id=?`, conversationID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed != 1 {
+		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Mark the old session before another lifecycle operation can reactivate
+	// the conversation. Stopping the underlying native process happens after
+	// releasing the global lock because it may block.
+	previousSession := s.markConversationSessionStopping(conversationID)
+	s.projectLifecycleMu.Unlock()
+	locked = false
+	if previousSession != nil {
+		previousSession.Stop()
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteProjectConversations permanently removes every deletable conversation
+// in a project. Running conversations are rejected up front; orchestration
+// conversations are read-only and reported as skipped.
+func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	s.projectLifecycleMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			s.projectLifecycleMu.Unlock()
+		}
+	}()
+
+	var exists bool
+	err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from projects where id=?)`, projectID).Scan(&exists)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+
+	rows, err := s.db.QueryContext(r.Context(), `select id,status from conversations where project_id=?`, projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	type conversationRef struct {
+		id     string
+		status string
+	}
+	all := []conversationRef{}
+	for rows.Next() {
+		var id, status string
+		if err := rows.Scan(&id, &status); err != nil {
+			rows.Close()
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		all = append(all, conversationRef{id: id, status: status})
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := rows.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Orchestration ownership is a separate query; the conversation rows must be
+	// closed first because the server's SQLite pool holds a single connection.
+	// Orchestration conversations are read-only and skipped even when an agent
+	// run is still active; only a non-orchestration running conversation rejects
+	// the bulk deletion.
+	ids := make([]string, 0, len(all))
+	skipped := 0
+	for _, item := range all {
+		if s.isOrchestrationConversation(r.Context(), item.id) {
+			skipped++
+			continue
+		}
+		if item.status != "idle" && item.status != "archived" {
+			writeError(w, http.StatusConflict, errors.New("stop the active agent run before deleting all conversations"))
+			return
+		}
+		ids = append(ids, item.id)
+	}
+
+	if len(ids) == 0 {
+		s.projectLifecycleMu.Unlock()
+		locked = false
+		writeJSON(w, http.StatusOK, deleteConversationsResult{Deleted: 0, Skipped: skipped})
+		return
+	}
+
+	// Remove isolated worktrees owned by the conversations being deleted before
+	// their workspace rows cascade away.
+	cleanupCtx, cleanupCancel := context.WithTimeout(r.Context(), conversationWorktreeCleanupTimeout)
+	for _, id := range ids {
+		if err := s.removeConversationWorktrees(cleanupCtx, projectID, id); err != nil {
+			log.Printf("delete project %s conversation %s worktrees: %v", projectID, id, err)
+		}
+	}
+	cleanupCancel()
+
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	// Delete exactly the collected deletable conversations. A scoped status
+	// predicate would also sweep skipped orchestration conversations, which must
+	// stay owned by their task records.
+	deleted := int64(0)
+	for _, id := range ids {
+		if _, err := tx.ExecContext(r.Context(), `update git_task_records set conversation_id='' where conversation_id=?`, id); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		result, err := tx.ExecContext(r.Context(), `delete from conversations where id=?`, id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		deleted += affected
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	sessions := s.stopConversationSessions(ids)
+	s.projectLifecycleMu.Unlock()
+	locked = false
+	for _, session := range sessions {
+		// Native process termination can block (notably Windows taskkill /T /F
+		// and WSL teardown). The conversation rows are already committed, so do
+		// not hold the HTTP request open while waiting for process exit.
+		go session.Stop()
+	}
+	writeJSON(w, http.StatusOK, deleteConversationsResult{Deleted: int(deleted), Skipped: skipped, DeletedIDs: ids})
 }
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
@@ -4226,6 +4637,9 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	default:
 		runnerObj = s.agentClaudeRunnerFor(target)
 	}
+	if runnerObj == nil {
+		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, conversation.AgentID)
+	}
 	if conversation.AgentID == "claude-code" && !runnerObj.Ready(ctx) {
 		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Claude Code")
 	}
@@ -4345,7 +4759,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			_, err = tx.ExecContext(ctx, `update tasks set status=?,last_task_run_id=?,updated_at=? where id=? and status in ('todo','action_required','awaiting_review')`, taskRunning, record.Task.ID, m.CreatedAt, record.Task.TaskID)
 		}
 		if err == nil {
-			err = recordTaskEventTx(ctx, tx, record.Task.TaskID, record.Task.ID, "task.dispatched", map[string]string{"runId": runID, "status": record.Task.Status}, m.CreatedAt)
+			err = s.recordTaskEventTx(ctx, tx, record.Task.TaskID, record.Task.ID, "task.dispatched", map[string]string{"runId": runID, "status": record.Task.Status}, m.CreatedAt)
 		}
 	}
 	if err == nil && record != nil && record.Scheduled != nil {
@@ -4378,6 +4792,16 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	if err = tx.Commit(); err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
 	}
+	// Mirror the persisted user message to the remote Agent relay so a mobile
+	// client can observe the new turn before the assistant finishes.
+	s.broadcastConversationEvent(Event{
+		ID:             uuid.NewString(),
+		ConversationID: conversation.ID,
+		RunID:          runID,
+		Type:           "user.message",
+		Payload:        mustJSON(m),
+		CreatedAt:      m.CreatedAt,
+	})
 	s.registerRunWorkspace(runID, releaseWorkspace)
 	workspaceAdmitted = true
 	s.startQuotaLeaseHeartbeat(runID)
@@ -5244,17 +5668,44 @@ func (s *Server) resolveRunApprovals(runID, decision string) {
 
 func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) {
 	e := Event{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Type: typ, Payload: payload, CreatedAt: time.Now().UTC()}
-	if _, err := s.db.ExecContext(context.Background(), `insert into events (id,conversation_id,run_id,type,payload,created_at) values ($1,$2,$3,$4,$5,$6)`, e.ID, e.ConversationID, e.RunID, e.Type, e.Payload, e.CreatedAt); err != nil {
+	// thinking_tokens are high-frequency telemetry. Keep them out of SQLite and
+	// the remote outbox; usage aggregation still runs from agentRunSink.Event.
+	if isThinkingTokensEvent(typ, payload) {
+		data, _ := json.Marshal(e)
+		s.enqueueConversationEvent(e.ConversationID, data)
+		return
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		log.Printf("begin persist %s event for run %s: %v", typ, runID, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(context.Background(), `insert into events (id,conversation_id,run_id,type,payload,created_at) values ($1,$2,$3,$4,$5,$6)`, e.ID, e.ConversationID, e.RunID, e.Type, e.Payload, e.CreatedAt); err != nil {
 		log.Printf("persist %s event for run %s: %v", typ, runID, err)
 		return
 	}
-	s.broadcastConversationEvent(e)
+	if s.remoteRelayConfigured() {
+		if err := enqueueRemoteEventTx(context.Background(), tx, e.ID, "", e.RunID, e.Type, e.Payload, e.CreatedAt); err != nil {
+			log.Printf("queue remote %s event for run %s: %v", typ, runID, err)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("commit persist %s event for run %s: %v", typ, runID, err)
+		return
+	}
+	data, _ := json.Marshal(e)
+	s.enqueueConversationEvent(e.ConversationID, data)
 }
 
 // broadcastConversationEvent delivers an already constructed event without
 // persisting it. Most events belong to a Run and use appendEvent; orchestration
 // status messages deliberately have no Run, while events.run_id is required.
 func (s *Server) broadcastConversationEvent(event Event) {
+	if err := s.enqueueRemoteEvent(context.Background(), event.ID, "", event.RunID, event.Type, event.Payload, event.CreatedAt); err != nil {
+		log.Printf("queue remote %s event: %v", event.Type, err)
+	}
 	data, _ := json.Marshal(event)
 	s.enqueueConversationEvent(event.ConversationID, data)
 }
@@ -5629,7 +6080,7 @@ func localizedErrorText(err error, fallback string) string {
 		"conversation not found":                                                     "会话不存在或已被删除。",
 		"run not found":                                                              "任务运行记录不存在。",
 		"invalid JSON request":                                                       "请求内容不是有效的 JSON。",
-		"conversation was cleared; start a new conversation from its history":       "该会话已清空，请先从历史记录恢复后再发送消息。",
+		"conversation was cleared; start a new conversation from its history":        "该会话已清空，请先从历史记录恢复后再发送消息。",
 		"activate this conversation before sending a message":                        "请先激活该会话，再发送消息。",
 		"Codex is currently available only on the local WSL runner":                  "Codex 目前仅支持本地 WSL 运行器。",
 		"远程服务器上 Codex CLI 不可用或未登录":                                                   "远程服务器上 Codex CLI 不可用或未登录。",
@@ -5890,6 +6341,101 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		result = []map[string]any{}
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// runnerStatus returns the capability status for one Runner. The full list
+// endpoint intentionally keeps its existing behavior for management pages,
+// while the new-conversation dialog avoids probing unrelated remote Runners.
+func (s *Server) runnerStatus(w http.ResponseWriter, r *http.Request) {
+	runnerID := chi.URLParam(r, "runnerID")
+	m, ok := s.runnerRegistry.getMeta(runnerID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("runner not found"))
+		return
+	}
+	entry := map[string]any{
+		"id":                m.ID,
+		"name":              m.Name,
+		"environment":       m.Environment,
+		"root":              m.Root,
+		"roots":             m.Roots,
+		"profileManagement": s.canManageProfileRunner(m.ID),
+	}
+	if m.Host != "" {
+		entry["host"] = m.Host
+	}
+	// Claude and Codex probes are independent and may each invoke a remote
+	// process. Run them concurrently so a slow environment does not add their
+	// individual probe timeouts together.
+	type claudeProbe struct {
+		version string
+		ok      bool
+	}
+	type codexProbe struct {
+		status  string
+		version string
+		reason  string
+	}
+	var claude claudeProbe
+	codex := codexProbe{status: "unavailable"}
+	var probes sync.WaitGroup
+	if runner, ok := s.runnerRegistry.get(m.ID); ok {
+		probes.Add(1)
+		go func() {
+			defer probes.Done()
+			claude.version = runner.Version(r.Context())
+			claude.ok = claude.version != ""
+		}()
+	}
+	probes.Add(1)
+	go func() {
+		defer probes.Done()
+		if isLocalRunnerID(m.ID) {
+			if s.codexRunner.Ready(r.Context()) {
+				codex.status = "ready"
+				codex.version = s.codexRunner.Version(r.Context())
+			} else {
+				codex.reason = "本地 Codex CLI 未安装或未登录"
+			}
+			return
+		}
+		runner, ok := s.runnerRegistry.get(m.ID)
+		if !ok {
+			return
+		}
+		codexR, ok := runner.(CodexCapableRunner)
+		if !ok {
+			codex.reason = "此 Runner 不支持 Codex"
+			return
+		}
+		if codexR.CodexReady(r.Context()) {
+			codex.status = "ready"
+			codex.version = codexR.CodexVersion(r.Context())
+		} else {
+			codex.reason = "远程服务器上 Codex CLI 未安装或未登录"
+		}
+	}()
+	probes.Wait()
+	if _, ok := s.runnerRegistry.get(m.ID); ok {
+		status := "ready"
+		if !claude.ok {
+			status = "unavailable"
+		}
+		s.runnerMaintenanceMu.Lock()
+		if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "claude-code"}] {
+			status = "updating"
+		}
+		s.runnerMaintenanceMu.Unlock()
+		entry["claude"] = map[string]string{"status": status, "version": claude.version}
+	}
+	codexStatus, codexVersion, codexReason := codex.status, codex.version, codex.reason
+	s.runnerMaintenanceMu.Lock()
+	if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "codex"}] {
+		codexStatus, codexReason = "updating", ""
+	}
+	s.runnerMaintenanceMu.Unlock()
+	entry["codex"] = map[string]string{"status": codexStatus, "version": codexVersion, "reason": codexReason}
+	writeJSON(w, http.StatusOK, entry)
 }
 
 func (s *Server) checkClaudeUpdate(w http.ResponseWriter, r *http.Request) {

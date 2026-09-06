@@ -14,26 +14,30 @@
 .markdown h5 { font-size: 13px; }
 .markdown h6 { font-size: 12px; }
 .markdown ul,.markdown ol { margin: 10px 0 14px; padding-left: 22px; }
-.markdown ul,
-.markdown ul li { padding-left: 0; list-style: none !important; }
-.markdown ul li::marker { content: ""; font-size: 0; }
+.markdown ul { list-style: disc; }
+.markdown ol { list-style: decimal; }
+.markdown ul li { padding-left: 0; list-style: inherit; }
+.markdown ul.contains-task-list,
+.markdown li.task-list-item { list-style: none; }
+.markdown ul.contains-task-list { padding-left: 0; }
+.markdown ul.contains-task-list > li:not(.task-list-item) { margin-left: 22px; list-style: disc; }
 .markdown ul ul { margin-left: 12px; padding-left: 12px; border-left: 1px solid #dce9e1; }
 .markdown ul ul,.markdown ul ol,.markdown ol ul,.markdown ol ol { margin: 4px 0; }
 .markdown li + li { margin-top: 6px; }
 .markdown li > input[type="checkbox"] { width: 14px; height: 14px; margin: 0 7px 0 0; vertical-align: -2px; accent-color: #55a697; }
 .markdown blockquote { margin: 14px 0; padding: 9px 13px; color: #49665c; background: #f3f9f5; border-left: 3px solid #75ae99; }
 .markdown code { border: 1px solid #d6e7dd; padding: 1px 5px; color: #285d4e; background: #eef7f1; border-radius: 4px; font: 0.88em ui-monospace,SFMono-Regular,Menlo,monospace; }
-.markdown a { color: #0d7253; text-decoration: underline; text-underline-offset: 2px; }
+.markdown a { color: #0d7253; text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; word-break: break-word; }
 .markdown-image-reference { display: inline-flex; align-items: center; gap: 4px; margin: 2px 0; padding: 4px 7px; border: 1px solid #d5e4dc; border-radius: 4px; color: #60796e; background: #f2f8f4; font-size: 12px; }
-.markdown pre { margin: 14px 0; padding: 13px 14px; overflow: auto; max-width: 100%; color: #e3efe8; background: #17362d; border-radius: 6px; white-space: pre; font: 12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; }
+.markdown pre { box-sizing: border-box; width: 100%; margin: 14px 0; padding: 13px 14px; overflow-x: auto; overflow-y: hidden; max-width: 100%; color: #e3efe8; background: #17362d; border-radius: 6px; white-space: pre; font: 12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; -webkit-overflow-scrolling: touch; }
 .markdown pre code { padding: 0; color: inherit; background: transparent; border: 0; font: inherit; }
 .markdown hr { height: 1px; margin: 18px 0; border: 0; background: #d5e4dc; }
-.markdown table { display: block; max-width: 100%; margin: 14px 0; overflow-x: auto; border: 1px solid #d4e4da; border-spacing: 0; border-radius: 7px; background: #fcfefd; font-size: 13px; line-height: 1.6; }
+.markdown table { display: block; width: max-content; min-width: 100%; max-width: 100%; box-sizing: border-box; margin: 14px 0; overflow-x: auto; border: 1px solid #d4e4da; border-spacing: 0; border-radius: 7px; background: #fcfefd; font-size: 13px; line-height: 1.6; -webkit-overflow-scrolling: touch; }
 .markdown th,.markdown td { min-width: 96px; border-right: 1px solid #dce9e1; border-bottom: 1px solid #dce9e1; padding: 10px 12px; vertical-align: top; }
 .markdown th:last-child,.markdown td:last-child { border-right: 0; }
 .markdown tr:last-child td { border-bottom: 0; }
 .markdown th { color: #1f4d42; background: #eaf5ee; font-weight: 750; white-space: nowrap; }
-.markdown td { color: #334f45; }
+.markdown td { color: #334f45; overflow-wrap: anywhere; word-break: break-word; }
 @media (max-width: 520px) { .markdown th,.markdown td { min-width: 84px; padding: 8px 10px; font-size: 13px; } }
 
 /* ─── 文件预览中的 Markdown ──────────────────────────────────────────────── */

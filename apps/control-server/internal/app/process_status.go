@@ -176,12 +176,15 @@ func (s *Server) pushProcessStatusSnapshot(sub *processStatusSubscriber) {
 		return
 	}
 	for _, id := range ids {
+		s.processStatusSubMu.Lock()
 		event := s.projectProcessStatusSnapshot(id)
+		event.Sequence = s.nextProcessStatusSequenceLocked(id)
 		select {
 		case sub.send <- event:
 		default:
 			// 快照积压：丢弃剩余帧即可，实时变更仍会收敛快照与真实状态。
 		}
+		s.processStatusSubMu.Unlock()
 	}
 }
 
@@ -215,13 +218,26 @@ func (s *Server) projectProcessStatusSnapshot(projectID string) RunStatusEvent {
 }
 
 func (s *Server) broadcastProjectProcessStatus(projectID string) {
-	s.broadcastProcessStatus(s.projectProcessStatusSnapshot(projectID))
+	s.processStatusSubMu.Lock()
+	toClose := s.broadcastProcessStatusLocked(s.projectProcessStatusSnapshot(projectID))
+	s.processStatusSubMu.Unlock()
+	s.closeSlowProcessStatusSubscribers(toClose)
 }
 
 // broadcastProcessStatus 不落库，直接推给所有订阅者；慢客户端满队列即断连。
 func (s *Server) broadcastProcessStatus(event RunStatusEvent) {
-	toClose := make([]*processStatusSubscriber, 0)
 	s.processStatusSubMu.Lock()
+	toClose := s.broadcastProcessStatusLocked(event)
+	s.processStatusSubMu.Unlock()
+	s.closeSlowProcessStatusSubscribers(toClose)
+}
+
+func (s *Server) broadcastProcessStatusLocked(event RunStatusEvent) []*processStatusSubscriber {
+	toClose := make([]*processStatusSubscriber, 0)
+	if s.processStatusSequences == nil {
+		s.processStatusSequences = make(map[string]uint64)
+	}
+	event.Sequence = s.nextProcessStatusSequenceLocked(event.ProjectID)
 	for conn, sub := range s.processStatusSubs {
 		select {
 		case sub.send <- event:
@@ -230,7 +246,24 @@ func (s *Server) broadcastProcessStatus(event RunStatusEvent) {
 			toClose = append(toClose, sub)
 		}
 	}
-	s.processStatusSubMu.Unlock()
+	return toClose
+}
+
+func (s *Server) nextProcessStatusSequenceLocked(projectID string) uint64 {
+	if s.processStatusSequences == nil {
+		s.processStatusSequences = make(map[string]uint64)
+	}
+	if s.processStatusSequences[projectID] == 0 {
+		if s.processStatusEpoch == 0 {
+			s.processStatusEpoch = uint64(time.Now().UnixMicro())
+		}
+		s.processStatusSequences[projectID] = s.processStatusEpoch
+	}
+	s.processStatusSequences[projectID]++
+	return s.processStatusSequences[projectID]
+}
+
+func (s *Server) closeSlowProcessStatusSubscribers(toClose []*processStatusSubscriber) {
 	for _, sub := range toClose {
 		log.Printf("[ws] /ws/processes subscriber queue full; closing slow client")
 		go sub.closeWithStatus(websocket.CloseTryAgainLater, "client is too slow")

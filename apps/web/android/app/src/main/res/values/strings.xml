@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Milevia</string>
+    <string name="title_activity_main">Milevia</string>
+    <string name="package_name">info.keyanjia.milevia</string>
+    <string name="custom_url_scheme">info.keyanjia.milevia</string>
+</resources>

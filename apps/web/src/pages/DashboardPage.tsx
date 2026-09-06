@@ -33,11 +33,16 @@ function SshConnectionIcon() {
 }
 
 function SettingsIcon() {
-  return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" /><path d="m19.2 13.8 1.2.9-1.8 3.1-1.4-.6a7.8 7.8 0 0 1-1.8 1l-.2 1.5h-3.6l-.2-1.5a7.8 7.8 0 0 1-1.8-1l-1.4.6-1.8-3.1 1.2-.9a7.2 7.2 0 0 1 0-2.1l-1.2-.9 1.8-3.1 1.4.6a7.8 7.8 0 0 1 1.8-1l.2-1.5h3.6l.2 1.5a7.8 7.8 0 0 1 1.8 1l1.4-.6 1.8 3.1-1.2.9a7.2 7.2 0 0 1 0 2.1Z" /></svg>;
+  // 齿轮为单线描边路径（8 齿 + 独立轮毂圆），1.8 描边下齿间不糊连。
+  return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2.9" /><path d="M20.17 10.56A8.3 8.3 0 0 1 20.17 13.44L17.51 12.97A5.6 5.6 0 0 1 16.59 15.21L18.80 16.76A8.3 8.3 0 0 1 16.76 18.80L15.21 16.59A5.6 5.6 0 0 1 12.97 17.51L13.44 20.17A8.3 8.3 0 0 1 10.56 20.17L11.03 17.51A5.6 5.6 0 0 1 8.79 16.59L7.24 18.80A8.3 8.3 0 0 1 5.20 16.76L7.41 15.21A5.6 5.6 0 0 1 6.49 12.97L3.83 13.44A8.3 8.3 0 0 1 3.83 10.56L6.49 11.03A5.6 5.6 0 0 1 7.41 8.79L5.20 7.24A8.3 8.3 0 0 1 7.24 5.20L8.79 7.41A5.6 5.6 0 0 1 11.03 6.49L10.56 3.83A8.3 8.3 0 0 1 13.44 3.83L12.97 6.49A5.6 5.6 0 0 1 15.21 7.41L16.76 5.20A8.3 8.3 0 0 1 18.80 7.24L16.59 8.79A5.6 5.6 0 0 1 17.51 11.03L20.17 10.56Z" /></svg>;
 }
 
 function ImportProjectIcon() {
   return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l1.8 2h9.2v8.2a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2V7.5Z" /><path d="M15.5 12.5v5M13 15h5" /></svg>;
+}
+
+function RemotePairingIcon() {
+  return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h6v2h-6z" /></svg>;
 }
 
 export default function DashboardPage() {
@@ -144,6 +149,7 @@ export default function DashboardPage() {
       <div className="dashboard-actions">
         <NotificationCenter />
         <button type="button" className="dashboard-action dashboard-action-settings secondary" title="设置" aria-label="设置" onClick={() => navigate("/settings")}><SettingsIcon /></button>
+        <button type="button" className="dashboard-action dashboard-action-remote secondary" title="远程控制" aria-label="远程控制" onClick={() => navigate("/mobile")}><RemotePairingIcon /><span>远程控制</span></button>
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
       </div>
@@ -250,7 +256,6 @@ function DeleteProjectDialog({ project, status, busy, close, confirm }: { projec
           <div className="delete-project-heading">
             <span className="delete-project-mark"><DeleteTrashIcon /></span>
             <div className="delete-project-heading-text">
-              <label>DELETE PROJECT</label>
               <h2 id="delete-project-title">删除项目</h2>
             </div>
           </div>

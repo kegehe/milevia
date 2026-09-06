@@ -1,4 +1,5 @@
 export const MAX_OPEN_CONVERSATION_TABS = 12;
+const MAX_CLOSED_CONVERSATION_IDS = 200;
 
 export type ConversationActivityPosition = {
   createdAt: string;
@@ -19,6 +20,10 @@ const tabListeners = new Map<string, Set<() => void>>();
 
 function storageKey(projectId: string): string {
   return `milevia.conversation-tabs.v1:${encodeURIComponent(projectId)}`;
+}
+
+function closedStorageKey(projectId: string): string {
+  return `milevia.closed-conversations.v1:${encodeURIComponent(projectId)}`;
 }
 
 const emptyState = (): ConversationTabsState => ({ openConversationIds: [], activeConversationId: null, readPositions: {}, latestPositions: {}, unreadConversationIds: [] });
@@ -71,6 +76,31 @@ export function writeConversationTabs(projectId: string, state: ConversationTabs
   if (!storage || !projectId) return;
   storage.setItem(storageKey(projectId), JSON.stringify(state));
   tabListeners.get(projectId)?.forEach((listener) => listener());
+}
+
+export function readClosedConversationIds(projectId: string, storage: StorageLike | null = typeof window === "undefined" ? null : window.sessionStorage): string[] {
+  if (!storage || !projectId) return [];
+  try {
+    const value = JSON.parse(storage.getItem(closedStorageKey(projectId)) || "null");
+    return Array.isArray(value) ? [...new Set(value.filter((id): id is string => typeof id === "string" && id.length > 0))] : [];
+  } catch {
+    return [];
+  }
+}
+
+export function markConversationTabClosed(projectId: string, conversationId: string, storage: StorageLike | null = typeof window === "undefined" ? null : window.sessionStorage): void {
+  if (!storage || !projectId || !conversationId) return;
+  const ids = readClosedConversationIds(projectId, storage).filter((id) => id !== conversationId);
+  ids.push(conversationId);
+  // Keep this auxiliary session state bounded even when a project has a long
+  // history of short-lived conversations.
+  storage.setItem(closedStorageKey(projectId), JSON.stringify(ids.slice(-MAX_CLOSED_CONVERSATION_IDS)));
+}
+
+export function clearConversationTabClosed(projectId: string, conversationId: string, storage: StorageLike | null = typeof window === "undefined" ? null : window.sessionStorage): void {
+  if (!storage || !projectId || !conversationId) return;
+  const ids = readClosedConversationIds(projectId, storage).filter((id) => id !== conversationId);
+  storage.setItem(closedStorageKey(projectId), JSON.stringify(ids));
 }
 
 export function subscribeConversationTabs(projectId: string, listener: () => void): () => void {

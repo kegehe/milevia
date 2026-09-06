@@ -15,5 +15,11 @@ export function AppVersionTag() {
   }, []);
 
   if (!isDesktop() || !version) return null;
-  return <span className="app-version-tag" title={`Milevia v${version}`}>v{version}</span>;
+  return (
+    <span className="app-version-tag" title={`Milevia v${version}`}>
+      {/* 复用品牌 logo（milevia-mark.svg），与顶部品牌栏同一份资源，避免图形漂移 */}
+      <img className="app-version-mark" src="/milevia-mark.svg" alt="" />
+      <span className="app-version-text">v{version}</span>
+    </span>
+  );
 }

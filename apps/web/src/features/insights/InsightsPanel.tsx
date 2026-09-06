@@ -62,7 +62,9 @@ export function InsightsPanel({ projectID, request, fail }: {
   const [filter, setFilter] = useState<InsightFilter>("all");
   const [theme, setTheme] = useState<InsightTheme>("");
   const [agent, setAgent] = useState<InsightAgent>("claude-code");
-  const [focusTypes, setFocusTypes] = useState<InsightType[]>([]);
+  // 默认全部分类选中：后端对"四类全勾选"会归一为空（全查），故 UI 初始即全部勾选，
+  // 既符合后端语义也让"全部分类"按钮保持激活态；用户仍可逐个取消来收窄。
+  const [focusTypes, setFocusTypes] = useState<InsightType[]>([...insightTypeOrder]);
   const [busy, setBusy] = useState(false);
   const [invalidated, setInvalidated] = useState<InsightFinding[]>([]);
   const [verification, setVerification] = useState<InsightVerificationRun | null>(null);
@@ -126,6 +128,7 @@ export function InsightsPanel({ projectID, request, fail }: {
   useEffect(() => {
     agentSelectionInitializedRef.current = false;
     setAgent("claude-code");
+    setFocusTypes([...insightTypeOrder]);
   }, [projectID]);
 
   useEffect(() => {
@@ -378,20 +381,22 @@ export function InsightsPanel({ projectID, request, fail }: {
           </div>
           <div className="insights-picker">
             <span className="insights-picker-label">查找类型</span>
-            <button
-              type="button"
-              className={`insights-select-all${allTypesSelected ? " active" : ""}`}
-              onClick={selectAllTypes}
-              disabled={allTypesSelected}
-            >
-              全部分类
-            </button>
-            {insightTypeOrder.map((type) => (
-              <label key={type} className="insights-type-option">
-                <input type="checkbox" checked={focusTypes.includes(type)} onChange={() => toggleType(type)} />
-                {insightTypeLabels[type]}
-              </label>
-            ))}
+            <div className="insights-type-options">
+              <button
+                type="button"
+                className={`insights-select-all${allTypesSelected ? " active" : ""}`}
+                onClick={selectAllTypes}
+                disabled={allTypesSelected}
+              >
+                全部分类
+              </button>
+              {insightTypeOrder.map((type) => (
+                <label key={type} className="insights-type-option">
+                  <input type="checkbox" checked={focusTypes.includes(type)} onChange={() => toggleType(type)} />
+                  {insightTypeLabels[type]}
+                </label>
+              ))}
+            </div>
           </div>
         </section>
       )}
@@ -427,24 +432,30 @@ export function InsightsPanel({ projectID, request, fail }: {
         </section>
       )}
 
-      {!running && verification?.status === "running" && (
-        <section className="insights-verification-progress" role="status">
-          <span className="insights-spinner" aria-hidden="true" />
-          <div>
-            <b>正在复核建议</b>
-            <small>{verification.message || "正在读取当前项目代码"} · {verification.processedCount}/{verification.totalCount}</small>
-          </div>
-          <button
-            type="button"
-            className="insight-stop"
-            disabled={busy}
-            onClick={() => void cancelScan()}
-            title="停止本次复核，结果不会保留"
-          >
-            停止
-          </button>
-        </section>
-      )}
+      {!running && verification?.status === "running" && (() => {
+        const verifyPct = verification.totalCount > 0
+          ? Math.min(100, Math.round((verification.processedCount / verification.totalCount) * 100))
+          : 0;
+        return (
+          <section className="insights-verification-progress" role="status">
+            <span className="insights-spinner" aria-hidden="true" />
+            <div className="insights-verification-copy">
+              <b>正在复核建议 <em>{verification.processedCount}/{verification.totalCount}</em></b>
+              <small>{verification.message || "正在读取当前项目代码"}</small>
+              <span className="insights-verification-track" aria-hidden="true"><i style={{ width: `${verifyPct}%` }} /></span>
+            </div>
+            <button
+              type="button"
+              className="insight-stop"
+              disabled={busy}
+              onClick={() => void cancelScan()}
+              title="停止本次复核，结果不会保留"
+            >
+              停止
+            </button>
+          </section>
+        );
+      })()}
 
       {failed && scan?.error && (
         <section className="insights-failed" role="alert">

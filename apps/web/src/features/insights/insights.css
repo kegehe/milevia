@@ -96,7 +96,34 @@
   background: #fbfbf2;
 }
 .insights-verification-progress b { display: block; color: #55583a; font-size: 13px; }
-.insights-verification-progress small { display: block; margin-top: 2px; color: #777a59; font-size: 11px; }
+.insights-verification-progress b em {
+  font-style: normal;
+  color: #8a8c57;
+  font-variant-numeric: tabular-nums;
+}
+.insights-verification-progress small {
+  display: block;
+  margin-top: 2px;
+  color: #777a59;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.insights-verification-copy { min-width: 0; flex: 1; }
+.insights-verification-track {
+  display: block;
+  height: 4px;
+  margin-top: 6px;
+  border-radius: 99px;
+  background: #ece6c4;
+  overflow: hidden;
+}
+.insights-verification-track i {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: #8a8c57;
+  transition: width .5s ease;
+}
 /* 分析信息滚动日志：里程碑 + agent 实时工具动作，随轮询滚动追加 */
 .insights-progress-log {
   display: grid;
@@ -246,11 +273,16 @@
 }
 .insights-theme-chips button:hover { border-color: #a6cbbb; background: #f0f8f3; }
 .insights-theme-chips button.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-type-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
 .insights-type-option {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-right: 14px;
   color: #41665b;
   font-size: 12px;
   font-weight: 600;
@@ -265,7 +297,6 @@
   border: 1px solid #d4e4da;
   border-radius: 99px;
   padding: 6px 12px;
-  margin-right: 14px;
   color: #41665b;
   background: #fff;
   font-size: 12px;

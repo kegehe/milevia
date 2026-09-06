@@ -27,7 +27,7 @@ import type {
   RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
   Skill,
 } from "../lib/types";
-import { api, asRecord } from "../lib/api";
+import { api, apiWithTimeout, asRecord } from "../lib/api";
 import { createWebSocket } from "../lib/runtime";
 import {
   formatTime, formatHistoryTime, formatTokens, formatDuration,
@@ -41,7 +41,7 @@ import {
 } from "../lib/timeline";
 import {
   MAX_OPEN_CONVERSATION_TABS, closeConversationTab, markConversationTabRead, openConversationTab, recordConversationActivity,
-  readConversationTabs, writeConversationTabs, type ConversationTabsState,
+  readClosedConversationIds, clearConversationTabClosed, markConversationTabClosed, readConversationTabs, writeConversationTabs, type ConversationTabsState,
 } from "../lib/conversation-tabs";
 
 function requiresForceStop(cause: unknown): boolean {
@@ -91,8 +91,33 @@ function HistoryIcon() {
   return <svg className="conversation-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9" /><path d="M4.5 4.8V9h4.2M12 7.8v4.7l3.1 1.8" /></svg>;
 }
 
+function ConversationDeleteIcon() {
+  return <svg className="conversation-delete-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 7h15M9 7V4.5h6V7M7 7l.8 12.5h8.4L17 7M10 11v5M14 11v5" /></svg>;
+}
+
 function NewConversationIcon() {
   return <svg className="conversation-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h9.7L19 9.8v8.7a1.8 1.8 0 0 1-1.8 1.8H6.8A1.8 1.8 0 0 1 5 18.5v-13Z" /><path d="M14.5 5.5v4.7H19M12 12v5M9.5 14.5h5" /></svg>;
+}
+
+function NewConversationDialogIcon() {
+  return <svg className="new-conversation-dialog-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 4.5h8.7l4.3 4.3v9.7a1.5 1.5 0 0 1-1.5 1.5H7a1.5 1.5 0 0 1-1.5-1.5v-14Z" /><path d="M14 4.5v4.6h4.5M12 11v5M9.5 13.5h5" /></svg>;
+}
+
+function AgentToolIcon({ agent }: { agent: AgentID }) {
+  return agent === "codex"
+    ? <svg className="new-conversation-agent-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.1 4.5h7.8l4.1 7.5-4.1 7.5H8.1L4 12l4.1-7.5Z" /><path d="m9.2 9.3 2.8 2.7-2.8 2.7M14.2 14.7h1.5" /></svg>
+    : <svg className="new-conversation-agent-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.8c4.5 0 7.5 3.1 7.5 7.2 0 4.7-3.5 8-8.2 8.4l-3.8 1.8.8-3.3C5.9 16.6 4.5 14.1 4.5 11c0-4.1 3-7.2 7.5-7.2Z" /><path d="M8.5 11.5h7M8.5 14.5h4.4" /></svg>;
+}
+
+function ConversationPermissionIcon({ mode }: { mode: PermissionMode }) {
+  if (mode === "read_only") return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5" /><path d="m14.2 14.2 4.3 4.3M8.5 10.5h4" /></svg>;
+  if (mode === "workspace_write") return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 6.5h15v11h-15zM8.5 10.5 11 13l-2.5 2.5M13.5 15.5h2.5" /></svg>;
+  if (mode === "approval_required") return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.8 19 6.5v5.1c0 4.2-2.8 7.4-7 8.9-4.2-1.5-7-4.7-7-8.9V6.5l7-2.7Z" /><path d="M12 8.5v3.8M12 16h.01" /></svg>;
+  return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.8 19 6.5v5.1c0 4.2-2.8 7.4-7 8.9-4.2-1.5-7-4.7-7-8.9V6.5l7-2.7Z" /><path d="m8.8 12 2.1 2.1 4.4-4.4" /></svg>;
+}
+
+function ProfileSelectIcon() {
+  return <svg className="new-conversation-profile-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h14v13H5zM8 9h8M8 12h8M8 15h4" /></svg>;
 }
 
 function ProjectConfigIcon() {
@@ -113,6 +138,10 @@ function ComposerActionIcon({ action }: { action: "clear" | "continue" | "send" 
   if (action === "continue") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h12M13 7.5l4.5 4.5-4.5 4.5" /></svg>;
   if (action === "schedule") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2M9.5 4.5v-2M14.5 4.5v-2M4.8 8.5l-1.5-1.5M12 2.5l1.6 1.6" /></svg>;
   return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 15 7.2-6.6 2.1-2.1 6.7-6.3-16Z" /><path d="m12.9 13.8 3-3" /></svg>;
+}
+
+function ComposerShortcutIcon() {
+  return <svg className="composer-shortcut-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>;
 }
 
 function ShortcutCategoryIcon({ kind }: { kind: "prompt" | "command" }) {
@@ -227,7 +256,7 @@ function ConversationClearIcon({ running = false }: { running?: boolean }) {
     : <svg className="conversation-clear-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5.5h10M9.5 5.5v-2h5v2M6.5 8l.8 10.5h9.4L17.5 8M10 11.5v4M14 11.5v4" /></svg>;
 }
 
-function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, usage, displayedModel, contextLabel, contextLevel, onShowUsage, stopping, onStop }: { runnerID: string; agentID: AgentID; run: string; runLabel: string; permissionMode?: string; usage: ConversationUsageResponse | null; displayedModel: string; contextLabel: string; contextLevel: string; onShowUsage: () => void; stopping: boolean; onStop: () => void }) {
+function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, usage, displayedModel, contextLabel, contextLevel, onShowUsage, readOnly, stopping, onStop }: { runnerID: string; agentID: AgentID; run: string; runLabel: string; permissionMode?: string; usage: ConversationUsageResponse | null; displayedModel: string; contextLabel: string; contextLevel: string; onShowUsage: () => void; readOnly: boolean; stopping: boolean; onStop: () => void }) {
   const [runner, setRunner] = useState<RunnerInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<CheckUpdateResult | null>(null);
@@ -338,6 +367,7 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
   return (<>
     <span className="composer-status-group">
       <span className={`runner-inline ${runnerStatusClass}${run ? " run-active" : ""}`} title={tool?.reason} role={run ? "status" : undefined} aria-live={run ? "polite" : undefined}><i aria-hidden="true"></i><span>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span></span>
+      {run && <button className="runner-stop" type="button" disabled={readOnly || stopping} onClick={onStop} title={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"} aria-label={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"}><span aria-hidden="true"></span>{stopping ? "停止中" : "停止"}</button>}
       {!run && tool?.status === "ready" && <button className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
       {!run && !updating && updateInfo?.updateAvailable && !updateInfo.error && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo.latestVersion}</button>}
       {!run && !updating && updateInfo && !updateInfo.updateAvailable && !updateInfo.error && <span className="runner-inline-uptodate" title={`${toolName} 已是最新版本`}>已是最新版本</span>}
@@ -405,7 +435,22 @@ type ConversationActivityPosition = { createdAt: string; id: string };
 type ConversationActivityItem = { conversationId: string; events: Event[]; latestPosition?: ConversationActivityPosition | null; truncated: boolean };
 type ConversationActivityResponse = { conversations: ConversationActivityItem[]; missingConversationIds: string[] };
 
-function ConversationHistoryDialog({ conversations, activeID, busyID, close, activate, view, search, hasMore, loadingMore, loadMore }: { conversations: Conversation[]; activeID: string; busyID: string; close: () => void; activate: (item: Conversation) => Promise<void>; view: (item: Conversation) => void; search: (query: string) => void; hasMore: boolean; loadingMore: boolean; loadMore: () => void }) {
+function ConversationHistoryDialog({ conversations, activeID, busyID, deletingID, deleteAllBusy, close, activate, view, search, deleteOne, deleteAll, hasMore, loadingMore, loadMore }: {
+  conversations: Conversation[];
+  activeID: string;
+  busyID: string;
+  deletingID: string;
+  deleteAllBusy: boolean;
+  close: () => void;
+  activate: (item: Conversation) => Promise<void>;
+  view: (item: Conversation) => void;
+  search: (query: string) => void;
+  deleteOne: (item: Conversation) => void;
+  deleteAll: () => void;
+  hasMore: boolean;
+  loadingMore: boolean;
+  loadMore: () => void;
+}) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   useEffect(() => {
@@ -430,13 +475,14 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, close, act
     const orchestration = item.isOrchestration === true;
     const runningElsewhere = item.status === "running" && item.id !== activeID;
     const state = busyID === item.id ? "切换中" : item.id === activeID ? "当前会话" : runningElsewhere ? "运行中" : orchestration ? "自动编排" : "";
-    return <button key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""} ${runningElsewhere ? "running" : ""}`} disabled={Boolean(busyID)} onMouseEnter={() => setSelected(index)} onClick={() => runningElsewhere || orchestration ? view(item) : select(item)}><span className="history-item-main"><span className="history-item-title"><b>{item.title || "新会话"}</b><span className={`history-item-agent ${item.agentId === "codex" ? "codex" : "claude"}`}>{item.agentId === "codex" ? "Codex" : "Claude Code"}</span>{orchestration && <span className="history-item-orchestration">自动编排</span>}</span><small>{item.preview || "尚未发送消息"}</small></span><span className="history-item-meta">{state && <em>{state}</em>}<time>{formatHistoryTime(item.lastActivityAt)}</time></span></button>;
-  })}</div>{hasMore && <button className="secondary load-earlier-history" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "加载中" : "加载更多会话"}</button>}<footer><span>{busyID ? "正在切换会话" : `${conversations.length} 条记录`}</span><button className="secondary" type="button" onClick={close}>关闭</button></footer></section></div>;
+    const isDeleting = deletingID === item.id;
+    const rowDisabled = Boolean(busyID) || isDeleting || Boolean(deleteAllBusy);
+    return <div key={item.id} className={`history-item ${busyID === item.id ? "activating" : ""} ${item.id === activeID ? "active" : ""} ${index === selected ? "selected" : ""} ${runningElsewhere ? "running" : ""}`} onMouseEnter={() => setSelected(index)}><button type="button" className="history-item-select" disabled={rowDisabled} onClick={() => runningElsewhere || orchestration ? view(item) : select(item)}><span className="history-item-main"><span className="history-item-title"><b>{item.title || "新会话"}</b><span className={`history-item-agent ${item.agentId === "codex" ? "codex" : "claude"}`}>{item.agentId === "codex" ? "Codex" : "Claude Code"}</span>{orchestration && <span className="history-item-orchestration">自动编排</span>}</span><small>{item.preview || "尚未发送消息"}</small></span><span className="history-item-meta">{state && <em>{state}</em>}<time>{formatHistoryTime(item.lastActivityAt)}</time></span></button>{!orchestration && <button type="button" className="history-item-delete" title="删除此会话" aria-label={`删除会话 ${item.title || "新会话"}`} disabled={rowDisabled} onClick={() => deleteOne(item)}><ConversationDeleteIcon /></button>}</div>;
+  })}</div>{hasMore && <button className="secondary load-earlier-history" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "加载中" : "加载更多会话"}</button>}<footer><span>{busyID ? "正在切换会话" : `${conversations.length} 条记录`}</span><div className="history-footer-actions"><button className="secondary history-delete-all" type="button" title="清除全部历史对话" disabled={Boolean(busyID) || deletingID !== "" || deleteAllBusy} onClick={deleteAll}>清除全部</button><button className="secondary" type="button" onClick={close}>关闭</button></div></footer></section></div>;
 }
 
 function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsError, close, create }: { runnerID: string; defaults: AppPreferences; defaultsLoading: boolean; defaultsError: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => Promise<void> }) {
-  // 新会话始终从安全基线开始；高权限模式必须由用户在弹窗中主动选择。
-  const permissionForAgent = (agent: AgentID): PermissionMode => agent === "codex" ? "workspace_write" : "approval_required";
+  const permissionForAgent = (agent: AgentID): PermissionMode => agent === "codex" ? defaults.codexPermissionMode : defaults.claudePermissionMode;
   const [agentId, setAgentId] = useState<AgentID>(defaults.defaultAgentId);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => permissionForAgent(defaults.defaultAgentId));
   const [creating, setCreating] = useState(false);
@@ -449,8 +495,8 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
     let cancelled = false;
     agentSelectedByUser.current = false;
     setRunnerLoading(true);
-    api<RunnerInfo[]>("/api/runners")
-      .then((items) => { if (!cancelled) setRunner(items.find((item) => item.id === runnerID) || null); })
+    api<RunnerInfo>(`/api/runners/${encodeURIComponent(runnerID)}/status`)
+      .then((item) => { if (!cancelled) setRunner(item); })
       .catch(() => { if (!cancelled) setRunner(null); })
       .finally(() => { if (!cancelled) setRunnerLoading(false); });
     return () => { cancelled = true; };
@@ -462,8 +508,7 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
     setProfileID("");
   }, [availableProfiles, profileID]);
   const codexStatus = runner?.codex;
-  const codexReady = codexStatus?.status === "ready";
-	const codexAvailable = codexReady;
+  const codexAvailable = codexStatus?.status === "ready";
   const claudeStatus = runner?.claude;
   const claudeAvailable = claudeStatus?.status === "ready";
   const capabilitiesLoading = defaultsLoading || runnerLoading;
@@ -482,14 +527,59 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
     setAgentId(nextAgent);
     setPermissionMode(permissionForAgent(nextAgent));
   }, [agentId, capabilitiesLoading, claudeAvailable, codexAvailable, defaults.defaultAgentId, defaultsError]);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape" && !creating) close(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [close, creating]);
   const selectAgent = (next: AgentID) => { agentSelectedByUser.current = true; setAgentId(next); setProfileID(""); setPermissionMode(permissionForAgent(next)); };
   const submit = async () => { if (defaultsError || capabilitiesLoading || !isAgentAvailable(agentId)) return; setCreating(true); try { await create(agentId, permissionMode, profileID || undefined); } finally { setCreating(false); } };
   const codex = agentId === "codex";
+  const selectedAgentName = codex ? "Codex" : "Claude Code";
   const fallbackReason = !defaultsError && !capabilitiesLoading && !isAgentAvailable(defaults.defaultAgentId) && (claudeAvailable || codexAvailable)
-    ? `${defaults.defaultAgentId === "codex" ? "Codex" : "Claude Code"} 当前不可用，已选择可用的 Agent。`
+    ? `${defaults.defaultAgentId === "codex" ? "Codex" : "Claude Code"} 当前不可用，已选择可用工具。`
     : "";
   const unavailableReason = agentId === "codex" ? codexStatus?.reason : claudeStatus?.reason;
-  return <div className="backdrop" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) close(); }}><section className="modal permission-dialog"><header><div><h2>新会话</h2></div><button title="关闭" onClick={close}>x</button></header>{capabilitiesLoading ? <p className="permission-confirmation">正在读取默认设置和 Runner 能力...</p> : defaultsError ? <p className="permission-confirmation">无法读取默认设置：{defaultsError}</p> : <>{fallbackReason && <p className="permission-confirmation">{fallbackReason}</p>}<div className="permission-options"><button className={!codex ? "active" : ""} disabled={!claudeAvailable} title={claudeStatus?.reason} onClick={() => selectAgent("claude-code")}><b>Claude Code</b></button><button className={codex ? "active" : ""} disabled={!codexAvailable} title={codexStatus?.reason} onClick={() => selectAgent("codex")}><b>Codex</b></button></div>{!claudeAvailable && !codexAvailable && <p className="permission-confirmation">当前 Runner 没有可用的 Agent。{unavailableReason || "请检查 CLI 安装与登录状态。"}</p>}{availableProfiles.length > 0 && <label className="conversation-profile-select"><span>AI 配置</span><select value={profileID} onChange={(event) => setProfileID(event.target.value)}><option value="">使用原有 CLI 配置</option>{availableProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.model ? ` (${profile.model})` : ""}</option>)}</select></label>}<div className="permission-options">{codex ? <><button className={permissionMode === "read_only" ? "active" : ""} onClick={() => setPermissionMode("read_only")}><b>仅分析</b><span>只读检查，不修改项目。</span></button><button className={permissionMode === "workspace_write" ? "active" : ""} onClick={() => setPermissionMode("workspace_write")}><b>项目内执行</b><span>可在项目范围内读写和执行。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Codex 可直接执行命令，不受沙箱限制。</span></button></> : <><button className={permissionMode === "approval_required" ? "active" : ""} onClick={() => setPermissionMode("approval_required")}><b>默认权限</b><span>每条终端命令执行前等待确认。</span></button><button className={permissionMode === "full_control" ? "active" : ""} onClick={() => setPermissionMode("full_control")}><b>完全控制</b><span>Claude 可直接执行命令，不会等待确认。</span></button></>}</div></>}<footer><button className="secondary" onClick={close}>取消</button><button className="primary" disabled={Boolean(defaultsError) || capabilitiesLoading || creating || !isAgentAvailable(agentId)} onClick={() => void submit()}>{creating ? "创建中" : "创建会话"}</button></footer></section></div>;
+  const permissionOptions: Array<{ mode: PermissionMode; title: string; detail: string }> = codex
+    ? [{ mode: "read_only", title: "仅分析", detail: "只读检查，不修改项目文件。" }, { mode: "workspace_write", title: "项目内执行", detail: "可在当前项目范围内读写和执行。" }, { mode: "full_control", title: "完全控制", detail: "直接执行命令，不受沙箱限制。" }]
+    : [{ mode: "approval_required", title: "默认权限", detail: "终端命令执行前需要确认。" }, { mode: "full_control", title: "完全控制", detail: "直接执行命令，不再等待确认。" }];
+  return <div className="backdrop new-conversation-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-conversation-title" onClick={(event) => { if (event.target === event.currentTarget && !creating) close(); }}>
+    <section className="modal new-conversation-dialog">
+      <header>
+        <div className="new-conversation-dialog-heading"><span className="new-conversation-dialog-mark"><NewConversationDialogIcon /></span><div><label>NEW CONVERSATION</label><h2 id="new-conversation-title">创建新会话</h2><p>选择本次会话使用的 CLI 工具和执行权限。</p></div></div>
+        <button className="new-conversation-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={creating} onClick={close}><DialogCloseIcon /></button>
+      </header>
+      <div className="new-conversation-dialog-body">
+        {capabilitiesLoading ? <div className="new-conversation-loading"><span></span>正在检查 CLI 工具和默认设置...</div> : defaultsError ? <p className="new-conversation-error">无法读取默认设置：{defaultsError}</p> : <>
+          {fallbackReason && <p className="new-conversation-notice">{fallbackReason}</p>}
+          <section className="new-conversation-section" aria-labelledby="new-conversation-agent-label">
+            <div className="new-conversation-section-heading"><div><span>01</span><h3 id="new-conversation-agent-label">选择 CLI 工具</h3></div><small>已登录的工具可立即使用</small></div>
+            <div className="new-conversation-agent-grid" role="radiogroup" aria-label="CLI 工具">
+              {(["claude-code", "codex"] as AgentID[]).map((agent) => {
+                const available = isAgentAvailable(agent);
+                const selected = agentId === agent;
+                const status = agent === "codex" ? codexStatus : claudeStatus;
+                const name = agent === "codex" ? "Codex" : "Claude Code";
+                const detail = agent === "codex" ? "OpenAI CLI" : "Anthropic CLI";
+                return <button key={agent} type="button" className={`new-conversation-agent-card${selected ? " selected" : ""}`} role="radio" aria-checked={selected} disabled={!available || creating} title={!available ? status?.reason || `${name} 不可用` : name} onClick={() => selectAgent(agent)}>
+                  <span className={`new-conversation-agent-mark ${agent === "codex" ? "codex" : "claude"}`}><AgentToolIcon agent={agent} /></span><span className="new-conversation-agent-copy"><b>{name}</b><small>{detail}</small></span>{agent === defaults.defaultAgentId && <em>默认</em>}<span className={`new-conversation-agent-state ${available ? "ready" : "unavailable"}`}>{available ? "已就绪" : "不可用"}</span>
+                </button>;
+              })}
+            </div>
+            {!claudeAvailable && !codexAvailable && <p className="new-conversation-error inline">当前 Runner 没有可用的 CLI 工具。{unavailableReason || "请检查 CLI 安装与登录状态。"}</p>}
+          </section>
+          {availableProfiles.length > 0 && <label className="new-conversation-profile-select"><span><ProfileSelectIcon />配置档案 <small>可选</small></span><select value={profileID} disabled={creating} onChange={(event) => setProfileID(event.target.value)}><option value="">使用 CLI 当前登录配置</option>{availableProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.model ? ` (${profile.model})` : ""}</option>)}</select></label>}
+          <section className="new-conversation-section new-conversation-permission-section" aria-labelledby="new-conversation-permission-label">
+            <div className="new-conversation-section-heading"><div><span>02</span><h3 id="new-conversation-permission-label">执行权限</h3></div><small>{selectedAgentName}</small></div>
+            <div className="new-conversation-permission-list" role="radiogroup" aria-label={`${selectedAgentName} 执行权限`}>
+              {permissionOptions.map((option) => <button key={option.mode} type="button" className={`new-conversation-permission-card${permissionMode === option.mode ? " selected" : ""}${option.mode === "full_control" ? " elevated" : ""}`} role="radio" aria-checked={permissionMode === option.mode} disabled={creating} onClick={() => setPermissionMode(option.mode)}><span className="new-conversation-permission-mark"><ConversationPermissionIcon mode={option.mode} /></span><span><b>{option.title}</b><small>{option.detail}</small></span><i aria-hidden="true"></i></button>)}
+            </div>
+          </section>
+        </>}
+      </div>
+      <footer><span className="new-conversation-summary">{capabilitiesLoading || defaultsError ? "" : `${selectedAgentName} · ${permissionOptions.find((option) => option.mode === permissionMode)?.title || "默认权限"}`}</span><button className="secondary" type="button" disabled={creating} onClick={close}>取消</button><button className="primary" type="button" disabled={Boolean(defaultsError) || capabilitiesLoading || creating || !isAgentAvailable(agentId)} onClick={() => void submit()}>{creating ? "创建中..." : "创建会话"}</button></footer>
+    </section>
+  </div>;
 }
 
 function FullControlConfirmationDialog({ close, confirm, changing, isCodex }: { close: () => void; confirm: () => Promise<void>; changing: boolean; isCodex?: boolean }) {
@@ -501,7 +591,7 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail }: { mess
   const isUser = message.role === "user";
   const agentName = agentID === "codex" ? "Codex" : "Claude";
   const [copied, setCopied] = useState(false);
-  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copiedTimer = useRef<number | null>(null);
 
   useEffect(() => () => {
     if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
@@ -583,13 +673,14 @@ function AgentTree({ agent, selectedID, select, depth }: { agent: AgentNode; sel
   return <div className="agent-tree-branch"><button className={`agent-tree-row ${agent.id === selectedID ? "selected" : ""}`} style={{ paddingLeft: `${12 + cappedDepth * 16}px` }} onClick={() => select(agent.id)}><span className={`agent-status ${agent.status}`}></span><span><b>{agent.summary}</b><small>{agentStatusLabel(agent.status)} · {agent.logs.length} 条记录</small></span></button>{agent.children.map((child) => <AgentTree key={child.id} agent={child} selectedID={selectedID} select={select} depth={depth + 1} />)}</div>;
 }
 
-function ConversationTabStrip({ state, conversations, workspaceLabels, select, close, create }: {
+function ConversationTabStrip({ state, conversations, workspaceLabels, select, close, create, openHistory }: {
   state: ConversationTabsState;
   conversations: Conversation[];
   workspaceLabels: Record<string, string>;
   select: (conversationId: string) => void;
   close: (conversationId: string) => void;
   create: () => void;
+  openHistory: () => void;
 }) {
   const byID = new Map(conversations.map((conversation) => [conversation.id, conversation]));
   const navigateConversationTabs = (event: React.KeyboardEvent<HTMLElement>) => {
@@ -618,12 +709,13 @@ function ConversationTabStrip({ state, conversations, workspaceLabels, select, c
             <span className="conversation-tab-state" aria-hidden="true" />
             <span className="conversation-tab-copy"><span className="conversation-tab-label">{label}</span><span className="conversation-tab-workspace">{workspaceLabel}</span></span>
             {unread && <span className="conversation-tab-unread" aria-label="有未读活动" />}
-            {conversation?.agentId === "codex" && <span className="conversation-tab-agent">Codex</span>}
+            {conversation && <span className="conversation-tab-agent">{conversation.agentId === "codex" ? "Codex" : "Claude Code"}</span>}
           </button>
           <button type="button" className="conversation-tab-close" title={`关闭 ${label}`} aria-label={`关闭 ${label}`} onClick={() => close(id)}>x</button>
         </div>;
       })}
     </div>
+    <button type="button" className="conversation-tab-history" title="会话历史" aria-label="会话历史" onClick={openHistory}><HistoryIcon /><span>历史</span></button>
     <button type="button" className="conversation-tab-add" title="新建会话" aria-label="新建会话" disabled={state.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS} onClick={create}>+</button>
   </nav>;
 }
@@ -889,6 +981,7 @@ export default function ConversationPage() {
   const showAgentExecution = searchParams.get("execution");
   const showAiConfig = searchParams.get("config") === "true";
   const [showMobileActions, setShowMobileActions] = useState(false);
+  const [showMobileShortcuts, setShowMobileShortcuts] = useState(false);
   const [showFullControlConfirmation, setShowFullControlConfirmation] = useState(false);
   const [showPermissionMenu, setShowPermissionMenu] = useState(false);
   // 预约发送：内容暂存到当前对话（含子代理）彻底空闲后再真正发出。
@@ -926,7 +1019,29 @@ export default function ConversationPage() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [showSendMenu]);
 
+  useEffect(() => {
+    if (!showMobileShortcuts) return;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      const target = event.target as HTMLElement;
+      if (target.closest(".mobile-shortcut-menu") || target.closest(".composer-mobile-shortcut-toggle")) return;
+      setShowMobileShortcuts(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowMobileShortcuts(false);
+    };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showMobileShortcuts]);
+
+  useEffect(() => { setShowMobileShortcuts(false); }, [conversation?.id]);
+
   const [activatingConversation, setActivatingConversation] = useState("");
+  const [deletingConversation, setDeletingConversation] = useState("");
+  const [deleteAllConversationsBusy, setDeleteAllConversationsBusy] = useState(false);
   const [usage, setUsage] = useState<ConversationUsageResponse | null>(null);
   const [shortcuts, setShortcuts] = useState<Shortcut[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -1004,6 +1119,10 @@ export default function ConversationPage() {
     if (!projectId) return false;
     const next = openConversationTab(conversationTabsRef.current, conversationID);
     if (!next) return false;
+    // A deliberate history/direct-link open is an explicit request to restore
+    // a conversation that was previously closed in this browser window. Only
+    // clear the marker after the tab was actually admitted.
+    clearConversationTabClosed(projectId, conversationID);
     conversationTabsRef.current = next;
     writeConversationTabs(projectId, next);
     setConversationTabs(next);
@@ -1020,6 +1139,7 @@ export default function ConversationPage() {
 
   const closeConversationTabFromUI = useCallback((conversationID: string) => {
     if (!projectId) return;
+    markConversationTabClosed(projectId, conversationID);
     const next = closeConversationTab(conversationTabsRef.current, conversationID);
     conversationTabsRef.current = next;
     writeConversationTabs(projectId, next);
@@ -1028,6 +1148,17 @@ export default function ConversationPage() {
     const nextID = next.activeConversationId;
     navigate(nextID ? `/projects/${projectId}/conversations/${nextID}` : `/projects/${projectId}/conversations`);
   }, [navigate, projectId, urlConversationId]);
+
+  const replaceConversationTab = useCallback((closedConversationID: string, nextConversationID: string) => {
+    if (!projectId) return;
+    markConversationTabClosed(projectId, closedConversationID);
+    const closed = closeConversationTab(conversationTabsRef.current, closedConversationID);
+    const next = openConversationTab(closed, nextConversationID);
+    if (!next) return;
+    conversationTabsRef.current = next;
+    writeConversationTabs(projectId, next);
+    setConversationTabs(next);
+  }, [projectId]);
 
   const removeUnavailableConversationTabs = useCallback((conversationIDs: string[]) => {
     if (!projectId || conversationIDs.length === 0) return;
@@ -1289,7 +1420,13 @@ export default function ConversationPage() {
         // 否则使用最新对话或创建新对话
         const list = await refreshConversationHistory();
         if (cancelled || conversationTransitionRef.current) return;
-        const next = list[0] ?? await projectApi<Conversation>(`/api/projects/${projectId}/conversations`, { method: "POST" });
+        // Returning to the project without a conversation ID must not reopen a
+        // tab the user deliberately closed. Restore the saved active tab first;
+        // otherwise use the newest history item that is not dismissed.
+        const restoredID = conversationTabsRef.current.activeConversationId;
+        const restored = restoredID ? list.find((item) => item.id === restoredID) : undefined;
+        const closed = new Set(readClosedConversationIds(projectId || ""));
+        const next = restored || list.find((item) => !closed.has(item.id)) || await projectApi<Conversation>(`/api/projects/${projectId}/conversations`, { method: "POST" });
         if (!cancelled && !conversationTransitionRef.current) {
           setConversation(next);
           if (list.length === 0) setConversationHistory([next]);
@@ -2171,13 +2308,13 @@ export default function ConversationPage() {
   const clearConversationContext = () => {
     if (conversationTransitionRef.current || !conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
     if (run) {
-      // 运行中时先停止再清空
+      // 运行中时先停止，再关闭当前会话并新建一个会话。
       pendingConfirmBusyRef.current = false;
       setPendingConfirmBusy(false);
       setPendingConfirm({
-        title: "停止并清空",
-        message: "当前对话正在运行中，将先停止运行（包括排队中的请求）再清空上下文。当前内容仍可在历史会话中恢复。",
-        confirmLabel: "停止并清空",
+        title: "停止并新建会话",
+        message: "当前对话正在运行中，将先停止运行（包括排队中的请求），关闭当前会话后再新建空白会话。当前内容仍可在历史会话中恢复。",
+        confirmLabel: "停止并新建",
         danger: true,
         className: "conversation-clear-dialog is-running",
         icon: <ConversationClearIcon running />,
@@ -2198,9 +2335,9 @@ export default function ConversationPage() {
     pendingConfirmBusyRef.current = false;
     setPendingConfirmBusy(false);
     setPendingConfirm({
-      title: "清空上下文",
-      message: "将开始一个新的空白会话，当前内容仍可在历史会话中恢复。",
-      confirmLabel: "开始新会话",
+      title: "关闭并新建会话",
+      message: "将关闭当前会话并打开一个新的空白会话。当前内容仍可在历史会话中恢复。",
+      confirmLabel: "关闭并新建",
       className: "conversation-clear-dialog",
       icon: <ConversationClearIcon />,
       onConfirm: () => {
@@ -2255,7 +2392,7 @@ export default function ConversationPage() {
     setStopping(false);
     if (!idle) {
       // 超时时不清空 run，因为后端可能仍在 running
-      fail("停止超时，请稍后重试清空操作。");
+      fail("停止超时，请稍后重试关闭并新建会话。");
       return;
     }
     // 只清空我们正在停止的 run，避免误清空其他新启动的 run
@@ -2266,7 +2403,7 @@ export default function ConversationPage() {
 
   const clearCurrentConversation = async (skipRunGuard = false) => {
     if (conversationTransitionRef.current || !conversation || sending || clearing || shortcutBusy || (!skipRunGuard && run)) return;
-    // 用户主动清空会话：清空预约状态，让预约内容随之作废。
+    // 用户主动关闭会话并新建：清空预约状态，让预约内容随之作废。
     // 这里不清写回输入框——resetConversationView 会用新会话草稿重置输入框，写回会被覆盖。
     clearScheduledSend();
     const conversationID = conversation.id;
@@ -2297,6 +2434,7 @@ export default function ConversationPage() {
       }
       if (!next) throw lastCause ?? new Error("无法清除会话上下文");
       if (!clearStillOwnsView()) return;
+      replaceConversationTab(conversationID, next.id);
       resetConversationView(next);
       if (projectId) navigate(`/projects/${projectId}/conversations/${next.id}`, { replace: true });
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
@@ -2308,6 +2446,7 @@ export default function ConversationPage() {
           const list = await refreshConversationHistory();
           const current = list.find((item) => item.isCurrent);
           if (clearStillOwnsView() && current && current.id !== conversationID) {
+            replaceConversationTab(conversationID, current.id);
             resetConversationView(current);
             if (projectId) navigate(`/projects/${projectId}/conversations/${current.id}`, { replace: true });
             return;
@@ -2347,6 +2486,87 @@ export default function ConversationPage() {
 
 	const viewConversation = (item: Conversation) => {
 		activateConversation(item);
+	};
+
+	const deleteHistoryConversation = (item: Conversation) => {
+		if (!projectId || deletingConversation || deleteAllConversationsBusy) return;
+		pendingConfirmBusyRef.current = false;
+		setPendingConfirmBusy(false);
+		setPendingConfirm({
+			title: "删除会话",
+			message: `将永久删除会话「${item.title || "新会话"}」及其全部消息，无法恢复。`,
+			confirmLabel: "删除",
+			danger: true,
+			className: "conversation-delete-dialog",
+			onConfirm: () => {
+				if (pendingConfirmBusyRef.current) return;
+				pendingConfirmBusyRef.current = true;
+				setPendingConfirmBusy(true);
+				void deleteHistoryConversationConfirmed(item.id).finally(() => {
+					pendingConfirmBusyRef.current = false;
+					setPendingConfirmBusy(false);
+					setPendingConfirm(null);
+				});
+			},
+			onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
+		});
+	};
+
+	const deleteHistoryConversationConfirmed = async (conversationID: string) => {
+		setDeletingConversation(conversationID);
+		try {
+			await projectApi(`/api/conversations/${conversationID}`, { method: "DELETE" });
+		} catch (cause) {
+			fail(cause instanceof Error ? cause.message : "无法删除会话");
+			return;
+		} finally {
+			setDeletingConversation("");
+		}
+		// 关闭该会话对应的 Tab；若它正是当前 URL 会话，会切到相邻 Tab 或新建会话。
+		removeUnavailableConversationTabs([conversationID]);
+		void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
+	};
+
+	const deleteAllHistoryConversations = () => {
+		if (!projectId || deletingConversation || deleteAllConversationsBusy) return;
+		pendingConfirmBusyRef.current = false;
+		setPendingConfirmBusy(false);
+		setPendingConfirm({
+			title: "清除全部历史对话",
+			message: "将永久删除该项目下的全部会话历史（自动编排会话只读保留），无法恢复。",
+			confirmLabel: "清除全部",
+			danger: true,
+			className: "conversation-delete-all-dialog",
+			onConfirm: () => {
+				if (pendingConfirmBusyRef.current) return;
+				pendingConfirmBusyRef.current = true;
+				setPendingConfirmBusy(true);
+				void deleteAllHistoryConversationsConfirmed().finally(() => {
+					pendingConfirmBusyRef.current = false;
+					setPendingConfirmBusy(false);
+					setPendingConfirm(null);
+				});
+			},
+			onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
+		});
+	};
+
+	const deleteAllHistoryConversationsConfirmed = async () => {
+		setDeleteAllConversationsBusy(true);
+		let deletedIDs: string[] = [];
+		try {
+			const result = await apiWithTimeout<{ deleted: number; skipped: number; deletedIds?: string[] }>(`/api/projects/${projectId}/conversations`, { method: "DELETE" }, 0, 120_000);
+			deletedIDs = result.deletedIds || [];
+		} catch (cause) {
+			fail(cause instanceof Error ? cause.message : "无法清除全部历史对话");
+			return;
+		} finally {
+			setDeleteAllConversationsBusy(false);
+		}
+		if (deletedIDs.length > 0) {
+			removeUnavailableConversationTabs(deletedIDs);
+		}
+		void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
 	};
 
   const changePermissionMode = async (permissionMode: PermissionMode) => {
@@ -2554,10 +2774,10 @@ export default function ConversationPage() {
     requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
   };
 
-  const renderShortcutCell = (shortcut: Shortcut | undefined, kind: "prompt" | "command_request", placeholder = false) => {
+  const renderShortcutCell = (shortcut: Shortcut | undefined, kind: "prompt" | "command_request", placeholder = false, beforeRun?: () => void) => {
     if (!shortcut && placeholder) return <div className="quick-tag-slot" aria-hidden="true" />;
-    if (!shortcut) return <button type="button" className={`quick-tag-empty${kind === "command_request" ? " command-tag" : ""}`} disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind })}>{kind === "command_request" ? "添加命令" : "添加提示词"}</button>;
-    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={readOnlyConversation || !shortcut.enabled || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void runShortcut(shortcut)} title={shortcut.enabled ? shortcut.template : `${shortcut.template}\n\n${shortcut.name}已停用`}><span className="quick-tag-text">{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</span></button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} aria-label={`编辑 ${shortcut.name}`} disabled={readOnlyConversation || clearing || Boolean(shortcutBusy)} onClick={() => setShortcutEditor({ kind: shortcut.kind, shortcut })}><ShortcutMoreIcon /></button></div>;
+    if (!shortcut) return <button type="button" className={`quick-tag-empty${kind === "command_request" ? " command-tag" : ""}`} disabled={readOnlyConversation} onClick={() => { beforeRun?.(); setShortcutEditor({ kind }); }}>{kind === "command_request" ? "添加命令" : "添加提示词"}</button>;
+    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}`} key={shortcut.id}><button type="button" disabled={readOnlyConversation || !shortcut.enabled || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => { beforeRun?.(); void runShortcut(shortcut); }} title={shortcut.enabled ? shortcut.template : `${shortcut.template}\n\n${shortcut.name}已停用`}><span className="quick-tag-text">{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</span></button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} aria-label={`编辑 ${shortcut.name}`} disabled={readOnlyConversation || clearing || Boolean(shortcutBusy)} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: shortcut.kind, shortcut }); }}><ShortcutMoreIcon /></button></div>;
   };
 
   const reorderKind = useCallback(async (kind: SortableShortcutKind, orderedIDs: string[]) => {
@@ -2575,6 +2795,8 @@ export default function ConversationPage() {
 
   const renderPromptCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "prompt");
   const renderCommandCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "command_request");
+  const renderMobilePromptCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "prompt", false, () => setShowMobileShortcuts(false));
+  const renderMobileCommandCell = (shortcut: Shortcut | undefined) => renderShortcutCell(shortcut, "command_request", false, () => setShowMobileShortcuts(false));
   const sortableDraggingDisabled = readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy);
 
   // Skill 组内容：标题 + 按来源分组的技能标签列表。技能点击填入输入框；加载中 / 空态单独呈现。
@@ -2644,14 +2866,9 @@ export default function ConversationPage() {
           <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           {renderSkillGroup()}
         </div>
-        <div className="quick-actions-mobile">
-          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-          {renderSkillGroup()}
-        </div>
       </aside>
       <section className="chat-center" id="conversation-panel" role="tabpanel" aria-labelledby={conversationTabs.activeConversationId ? `conversation-tab-${conversationTabs.activeConversationId}` : undefined}>
-      <ConversationTabStrip state={conversationTabs} conversations={conversationHistory} workspaceLabels={conversationWorkspaceLabels} select={selectConversationTab} close={closeConversationTabFromUI} create={openNewConversationParam} />
+      <ConversationTabStrip state={conversationTabs} conversations={conversationHistory} workspaceLabels={conversationWorkspaceLabels} select={selectConversationTab} close={closeConversationTabFromUI} create={openNewConversationParam} openHistory={openConversationHistory} />
       <section className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
         <div ref={top} />
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
@@ -2668,8 +2885,16 @@ export default function ConversationPage() {
       </div>
       <form ref={composerRef} className={`composer${pendingApproval ? " has-approval" : ""}${isEmptyConversation ? " empty-session" : ""}`} onSubmit={(event) => void send(event)}>
         {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
-        <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望${isCodex ? " Codex" : " Claude"}在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} />
-        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={readOnlyConversation || sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {isCodex ? "Codex" : "Claude"}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
+        <div className="composer-input-area">
+          <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望${isCodex ? " Codex" : " Claude"}在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} />
+          <button className={`composer-mobile-shortcut-toggle${showMobileShortcuts ? " open" : ""}`} type="button" title="快捷操作" aria-label="快捷操作" aria-controls="mobile-shortcut-menu" aria-expanded={showMobileShortcuts} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowMobileShortcuts((open) => !open)}><ComposerShortcutIcon /></button>
+        </div>
+        {showMobileShortcuts && <section className="mobile-shortcut-menu" id="mobile-shortcut-menu" aria-label="快捷操作">
+          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "prompt" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderMobilePromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "command_request" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderMobileCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          {renderSkillGroup()}
+        </section>}
+        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={readOnlyConversation || sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {isCodex ? "Codex" : "Claude"}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
         {pendingSendContent && <div className="composer-pending"><span className="composer-pending-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2" /></svg></span><span className="composer-pending-text"><b>已预约发送</b><small>{run ? "等待当前任务完成..." : "等待子代理完成..."}<span className="composer-pending-preview">{pendingSendContent.length > 40 ? `${pendingSendContent.slice(0, 40)}…` : pendingSendContent}</span></small></span><button className="composer-pending-cancel" type="button" title="撤回预约并带回输入框" onClick={cancelScheduledSend}>取消</button></div>}
       </form>
       </section>
@@ -2678,7 +2903,7 @@ export default function ConversationPage() {
       </aside>}
     </section>
     {showNewConversation && <NewConversationDialog runnerID={project.runner} defaults={appPreferences} defaultsLoading={appPreferencesLoading} defaultsError={appPreferencesError} close={closeNewConversation} create={newConversation} />}
-    {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} close={closeHistory} activate={activateConversation} view={viewConversation} search={searchConversationHistory} hasMore={Boolean(conversationHistoryCursor)} loadingMore={loadingMoreConversationHistory} loadMore={loadMoreConversationHistory} />}
+    {showHistory && <ConversationHistoryDialog conversations={conversationHistory} activeID={conversation?.id || ""} busyID={activatingConversation} deletingID={deletingConversation} deleteAllBusy={deleteAllConversationsBusy} close={closeHistory} activate={activateConversation} view={viewConversation} search={searchConversationHistory} deleteOne={deleteHistoryConversation} deleteAll={deleteAllHistoryConversations} hasMore={Boolean(conversationHistoryCursor)} loadingMore={loadingMoreConversationHistory} loadMore={loadMoreConversationHistory} />}
     {showFullControlConfirmation && <FullControlConfirmationDialog close={() => setShowFullControlConfirmation(false)} confirm={confirmFullControl} changing={changingPermission} isCodex={isCodex} />}
     {showAgentExecution && agentExecutions.find((execution) => execution.runId === showAgentExecution) && <AgentExecutionDialog execution={agentExecutions.find((execution) => execution.runId === showAgentExecution)!} close={closeAgentExecution} />}
     {showUsage && <UsageDialog agentID={conversation?.agentId || "claude-code"} usage={usage} currentRun={currentUsage} close={closeUsage} />}

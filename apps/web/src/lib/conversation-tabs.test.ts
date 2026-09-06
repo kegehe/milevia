@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MAX_OPEN_CONVERSATION_TABS, closeConversationTab, markConversationTabRead, openConversationTab, readConversationTabs, recordConversationActivity, writeConversationTabs } from "./conversation-tabs.ts";
+import { MAX_OPEN_CONVERSATION_TABS, clearConversationTabClosed, closeConversationTab, markConversationTabClosed, markConversationTabRead, openConversationTab, readClosedConversationIds, readConversationTabs, recordConversationActivity, writeConversationTabs } from "./conversation-tabs.ts";
 
 function memoryStorage(initial: Record<string, string> = {}) {
   const values = new Map(Object.entries(initial));
@@ -13,6 +13,29 @@ test("conversation tabs are project-scoped and restore only within the browser w
   writeConversationTabs("project-a", state, storage);
   assert.deepEqual(readConversationTabs("project-a", storage), state);
   assert.deepEqual(readConversationTabs("project-b", storage), { openConversationIds: [], activeConversationId: null, readPositions: {}, latestPositions: {}, unreadConversationIds: [] });
+});
+
+test("closed conversations are remembered separately from open tabs and can be explicitly restored", () => {
+  const storage = memoryStorage();
+  markConversationTabClosed("project-a", "conversation-a", storage);
+  markConversationTabClosed("project-a", "conversation-b", storage);
+  assert.deepEqual(readClosedConversationIds("project-a", storage), ["conversation-a", "conversation-b"]);
+  assert.deepEqual(readClosedConversationIds("project-b", storage), []);
+  clearConversationTabClosed("project-a", "conversation-a", storage);
+  assert.deepEqual(readClosedConversationIds("project-a", storage), ["conversation-b"]);
+  clearConversationTabClosed("project-a", "conversation-b", storage);
+  assert.deepEqual(readClosedConversationIds("project-a", storage), []);
+});
+
+test("closed conversation history is bounded", () => {
+  const storage = memoryStorage();
+  for (let index = 0; index < 205; index++) markConversationTabClosed("project-a", `conversation-${index}`, storage);
+  const closed = readClosedConversationIds("project-a", storage);
+  assert.equal(closed.length, 200);
+  assert.equal(closed[0], "conversation-5");
+  assert.equal(closed.at(-1), "conversation-204");
+  markConversationTabClosed("project-a", "conversation-5", storage);
+  assert.equal(readClosedConversationIds("project-a", storage).at(-1), "conversation-5");
 });
 
 test("opening and closing a tab retains a deterministic adjacent active tab", () => {

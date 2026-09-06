@@ -111,6 +111,7 @@ type logBroadcaster func(entry LogEntry)
 type RunStatusEvent struct {
 	ProjectID string     `json:"projectId"`
 	Status    RunStatus  `json:"status"`
+	Sequence  uint64     `json:"sequence,omitempty"`
 	StartedAt *time.Time `json:"startedAt,omitempty"`
 	PID       *int       `json:"pid,omitempty"`
 }

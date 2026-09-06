@@ -457,7 +457,7 @@ func TestCodexManagedProviderUsesIsolatedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read provider config: %v", err)
 	}
-	for _, expected := range []string{`model_provider = "milevia"`, `wire_api = "responses"`, `env_key = "OPENAI_API_KEY"`, `exclude = ["OPENAI_API_KEY"]`} {
+	for _, expected := range []string{`model_provider = "milevia"`, `wire_api = "responses"`, `env_key = "OPENAI_API_KEY"`, `supports_websockets = false`, `stream_max_retries = 2`, `request_max_retries = 2`, `exclude = ["OPENAI_API_KEY"]`} {
 		if !strings.Contains(string(content), expected) {
 			t.Fatalf("provider config missing %q: %s", expected, content)
 		}

@@ -84,7 +84,8 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	const configDirtyRef = useRef(false);
 	const configRevisionRef = useRef(0);
 	const statusRequestVersionRef = useRef(0);
-	const renderedProjectIDRef = useRef(projectID);
+	const workspaceGenerationRef = useRef(0);
+	const renderedWorkspaceKeyRef = useRef(`${projectID}:${conversationId || ""}`);
 
 	const workspaceQuery = conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : "";
 	const basePath = `/api/projects/${projectID}/run`;
@@ -100,18 +101,20 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 
 	const loadConfig = useCallback(async () => {
 		const revision = configRevisionRef.current;
+		const workspaceGeneration = workspaceGenerationRef.current;
 		try {
 			const c = await request<RunConfig>(withWorkspace(`${basePath}/config`));
-			if (activeProjectIDRef.current === projectID && revision === configRevisionRef.current && !configDirtyRef.current) setConfig(c);
+			if (activeProjectIDRef.current === projectID && workspaceGeneration === workspaceGenerationRef.current && revision === configRevisionRef.current && !configDirtyRef.current) setConfig(c);
 		}
 		catch (cause) {
-			if (activeProjectIDRef.current === projectID) fail(cause instanceof Error ? cause.message : "加载配置失败");
+			if (activeProjectIDRef.current === projectID && workspaceGeneration === workspaceGenerationRef.current) fail(cause instanceof Error ? cause.message : "加载配置失败");
 		}
 	}, [basePath, request, fail, projectID, conversationId]);
 	const loadWorktrees = useCallback(async () => {
+		const workspaceGeneration = workspaceGenerationRef.current;
 		try {
 			const items = await request<OrchestrationWorktree[]>(withWorkspace(`${basePath}/worktrees`));
-			if (activeProjectIDRef.current === projectID) setWorktrees(items);
+			if (activeProjectIDRef.current === projectID && workspaceGeneration === workspaceGenerationRef.current) setWorktrees(items);
 		} catch { /* 普通项目仍可使用项目根目录启动。 */ }
 	}, [basePath, request, projectID, conversationId]);
 	const updateConfig = (next: RunConfig) => {
@@ -131,8 +134,10 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	}, [basePath, request, projectID, mergeIncomingLogs, conversationId]);
 
 	useEffect(() => {
-		if (renderedProjectIDRef.current === projectID) return;
-		renderedProjectIDRef.current = projectID;
+		const workspaceKey = `${projectID}:${conversationId || ""}`;
+		if (renderedWorkspaceKeyRef.current === workspaceKey) return;
+		renderedWorkspaceKeyRef.current = workspaceKey;
+		workspaceGenerationRef.current += 1;
 
 		configDirtyRef.current = false;
 		configRevisionRef.current = 0;
@@ -145,7 +150,7 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 		setLogs([]);
 		setHasNewLogs(false);
 		setBusy("");
-	}, [projectID]);
+	}, [projectID, conversationId]);
 
 	useEffect(() => {
 		if (!active) return;
@@ -237,43 +242,50 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 		if (validationError) { fail(validationError); return; }
 		setBusy("save");
 		const revision = configRevisionRef.current;
+		const workspaceGeneration = workspaceGenerationRef.current;
 		// 远程项目的执行环境固定为 auto，避免旧值被持久化。
 		const payload: RunConfig = isRemote ? { ...config, executionTarget: "auto" } : config;
 		try {
 			await request(withWorkspace(`${basePath}/config`), { method: "PUT", body: JSON.stringify(payload) });
-			if (revision === configRevisionRef.current) configDirtyRef.current = false;
-			toast.success("启动配置已保存");
+			if (workspaceGeneration === workspaceGenerationRef.current && revision === configRevisionRef.current) {
+				configDirtyRef.current = false;
+				toast.success("启动配置已保存");
+			}
 		}
-		catch (cause) { fail(cause instanceof Error ? cause.message : "保存配置失败"); }
-		finally { setBusy(""); }
+		catch (cause) { if (workspaceGeneration === workspaceGenerationRef.current) fail(cause instanceof Error ? cause.message : "保存配置失败"); }
+		finally { if (workspaceGeneration === workspaceGenerationRef.current) setBusy(""); }
 	};
 
 	const handleStart = async () => {
 		setBusy("start");
-		try { await request(withWorkspace(`${basePath}/start`), { method: "POST" }); void loadStatus(); }
-		catch (cause) { fail(cause instanceof Error ? cause.message : "启动失败"); }
-		finally { setBusy(""); }
+		const workspaceGeneration = workspaceGenerationRef.current;
+		try { await request(withWorkspace(`${basePath}/start`), { method: "POST" }); if (workspaceGeneration === workspaceGenerationRef.current) void loadStatus(); }
+		catch (cause) { if (workspaceGeneration === workspaceGenerationRef.current) fail(cause instanceof Error ? cause.message : "启动失败"); }
+		finally { if (workspaceGeneration === workspaceGenerationRef.current) setBusy(""); }
 	};
 
 	const handleStop = async () => {
 		setBusy("stop");
-		try { await request(withWorkspace(`${basePath}/stop`), { method: "POST" }); void loadStatus(); }
-		catch (cause) { fail(cause instanceof Error ? cause.message : "停止失败"); }
-		finally { setBusy(""); }
+		const workspaceGeneration = workspaceGenerationRef.current;
+		try { await request(withWorkspace(`${basePath}/stop`), { method: "POST" }); if (workspaceGeneration === workspaceGenerationRef.current) void loadStatus(); }
+		catch (cause) { if (workspaceGeneration === workspaceGenerationRef.current) fail(cause instanceof Error ? cause.message : "停止失败"); }
+		finally { if (workspaceGeneration === workspaceGenerationRef.current) setBusy(""); }
 	};
 
 	const handleRestart = async () => {
 		setBusy("restart");
-		try { await request(withWorkspace(`${basePath}/restart`), { method: "POST" }); void loadStatus(); }
-		catch (cause) { fail(cause instanceof Error ? cause.message : "重启失败"); }
-		finally { setBusy(""); }
+		const workspaceGeneration = workspaceGenerationRef.current;
+		try { await request(withWorkspace(`${basePath}/restart`), { method: "POST" }); if (workspaceGeneration === workspaceGenerationRef.current) void loadStatus(); }
+		catch (cause) { if (workspaceGeneration === workspaceGenerationRef.current) fail(cause instanceof Error ? cause.message : "重启失败"); }
+		finally { if (workspaceGeneration === workspaceGenerationRef.current) setBusy(""); }
 	};
 
 	const handleClearLogs = async () => {
 		setBusy("clear-logs");
+		const workspaceGeneration = workspaceGenerationRef.current;
 		try {
 			const next = await request<RunStatusResponse>(withWorkspace(`${basePath}/logs/clear`), { method: "POST" });
-			if (activeProjectIDRef.current !== projectID) return;
+			if (activeProjectIDRef.current !== projectID || workspaceGeneration !== workspaceGenerationRef.current) return;
 			// Only after the server confirms the clear should the local log state
 			// advance, otherwise a failed request would leave the UI empty while
 			// the server still retains the logs (and loadStatus would filter them).
@@ -284,10 +296,12 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 			setHasNewLogs(false);
 			setStatus(next);
 		} catch (cause) {
-			fail(cause instanceof Error ? cause.message : "清除日志失败");
-			void loadStatus();
+			if (workspaceGeneration === workspaceGenerationRef.current) {
+				fail(cause instanceof Error ? cause.message : "清除日志失败");
+				void loadStatus();
+			}
 		} finally {
-			setBusy("");
+			if (workspaceGeneration === workspaceGenerationRef.current) setBusy("");
 		}
 	};
 

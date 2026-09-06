@@ -1,13 +1,17 @@
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const debugDesktopBinary = resolve(desktopRoot, "src-tauri/target/debug/milevia-desktop.exe");
+const agentEnvPath = resolve(desktopRoot, "../agent/.env.windows");
 const isWindows = process.platform === "win32";
 const packageManager = isWindows ? "pnpm.cmd" : "pnpm";
 const tauriCli = resolve(desktopRoot, "node_modules/@tauri-apps/cli/tauri.js");
 
 let activeChild = null;
+let agentChild = null;
 let stopping = false;
 
 function start(command, args) {
@@ -77,10 +81,78 @@ function stopLifecycleShells() {
   }
 }
 
+function agentAlreadyRunning() {
+  if (!isWindows) return false;
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command",
+    "@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'milevia-agent' }).Count -gt 0",
+  ], { encoding: "utf8", windowsHide: true });
+  return result.status === 0 && result.stdout.trim().toLowerCase() === "true";
+}
+
+function releaseDevPort() {
+  const port = 1420;
+  if (isWindows) {
+    const result = spawnSync("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-Command",
+      `$items = @(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue); ` +
+      `$items | ForEach-Object { ` +
+      `$p = Get-CimInstance Win32_Process -Filter \"ProcessId = $($_.OwningProcess)\"; ` +
+      `[pscustomobject]@{Pid=$_.OwningProcess; CommandLine=$p.CommandLine} ` +
+      `} | ConvertTo-Json -Compress`,
+    ], { encoding: "utf8", windowsHide: true });
+    let listeners;
+    try { listeners = JSON.parse(result.stdout?.trim() || "[]"); } catch { listeners = []; }
+    if (!Array.isArray(listeners)) listeners = [listeners];
+    for (const listener of listeners) {
+      const pid = Number(listener?.Pid);
+      const commandLine = String(listener?.CommandLine ?? "").toLowerCase();
+      const isMileviaVite = commandLine.includes("vite")
+        && commandLine.includes("1420")
+        && (commandLine.includes("milevia") || commandLine.includes("vite.config"));
+      if (Number.isInteger(pid) && pid > 0 && isMileviaVite) {
+        spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        const desktopProcesses = spawnSync("powershell.exe", [
+          "-NoProfile", "-NonInteractive", "-Command",
+          "@(Get-CimInstance Win32_Process -Filter \"Name = 'milevia-desktop.exe'\" | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress",
+        ], { encoding: "utf8", windowsHide: true });
+        let desktopEntries;
+        try { desktopEntries = JSON.parse(desktopProcesses.stdout?.trim() || "[]"); } catch { desktopEntries = []; }
+        if (!Array.isArray(desktopEntries)) desktopEntries = [desktopEntries];
+        const expectedBinary = debugDesktopBinary.replaceAll("\\", "/").toLowerCase();
+        for (const entry of desktopEntries) {
+          const desktopPid = Number(entry?.ProcessId);
+          const executablePath = String(entry?.ExecutablePath ?? "").replaceAll("\\", "/").toLowerCase();
+          if (Number.isInteger(desktopPid) && desktopPid > 0 && executablePath === expectedBinary) {
+            spawnSync("taskkill.exe", ["/PID", String(desktopPid), "/T", "/F"], {
+              stdio: "ignore",
+              windowsHide: true,
+            });
+          }
+        }
+      }
+    }
+    return;
+  }
+  const result = spawnSync("sh", ["-lc", `lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null`], { encoding: "utf8" });
+  for (const value of (result.stdout ?? "").split(/\s+/)) {
+    const pid = Number(value);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }).stdout ?? "";
+    if (command.includes("vite") && command.includes("1420") && (command.includes("milevia") || command.includes("vite.config"))) {
+      spawnSync("kill", ["-TERM", String(pid)], { stdio: "ignore" });
+    }
+  }
+}
+
 function stopAll(exitCode) {
   if (stopping) return;
   stopping = true;
   stopProcessTree(activeChild);
+  stopProcessTree(agentChild);
   stopLifecycleShells();
   process.exitCode = exitCode;
 }
@@ -89,6 +161,37 @@ process.once("SIGINT", () => stopAll(130));
 process.once("SIGTERM", () => stopAll(143));
 
 try {
+  // Reclaim a stale Vite listener left by an interrupted Milevia desktop run.
+  // The command-line guard prevents terminating an unrelated project that may
+  // happen to use the same development port.
+  releaseDevPort();
+  // Reuse the local Agent configuration for the desktop sidecar during
+  // development. The control server needs the cloud relay variables too;
+  // previously only start-agent.ps1 loaded them, leaving pairing disabled in
+  // the desktop app.
+  if (existsSync(agentEnvPath)) {
+    for (const line of readFileSync(agentEnvPath, "utf8").split(/\r?\n/)) {
+      const match = line.trim().match(/^([^#=][^=]*)=(.*)$/);
+      if (!match) continue;
+      const [, key, value] = match;
+      if (!process.env[key]) process.env[key] = value.trim();
+    }
+    process.env.AUTO_REMOTE_CLOUD_URL ||= process.env.MILEVIA_CLOUD_URL || "";
+    process.env.AUTO_REMOTE_CLOUD_TOKEN ||= process.env.MILEVIA_CLOUD_AGENT_TOKEN || "";
+    process.env.AUTO_REMOTE_INSTANCE_ID ||= process.env.MILEVIA_INSTANCE_ID || "";
+  }
+  // Keep the desktop and Cloud Control connected during development. The
+  // relay is a separate process because it owns the outbound WSS connection
+  // and forwards commands to the local control server.
+  const agentScript = resolve(desktopRoot, "../agent/start-agent.ps1");
+  if (isWindows && existsSync(agentScript) && process.env.MILEVIA_CLOUD_AGENT_TOKEN && !agentAlreadyRunning()) {
+    agentChild = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", agentScript], {
+      cwd: resolve(desktopRoot, "../agent"),
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    agentChild.once("exit", () => { agentChild = null; });
+  }
   const prepare = await start(packageManager, ["run", "prepare-assets"]);
   if (stopping) process.exit(130);
   if (prepare.code !== 0 && !stopping) throw new Error(`prepare-assets exited with code ${prepare.code ?? 1}`);

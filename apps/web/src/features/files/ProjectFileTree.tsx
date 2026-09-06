@@ -394,6 +394,8 @@ export function ProjectFileTree({
         <UncontrolledTreeEnvironment
           key={treeKey}
           dataProvider={provider}
+          // 文件侧栏较窄，显式保留清晰的层级缩进。
+          renderDepthOffset={16}
           getItemTitle={(item) => item.data.name}
           viewState={{}}
           canRename={!readOnly}

@@ -3,10 +3,14 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
 )
+
+const windowsProcessTerminateTimeout = 3 * time.Second
 
 // 隐藏由本进程派生出的所有子进程的控制台窗口。控制服务/审批钩子等都是控制台
 // 子系统程序，若不设置该标志，每次启动 AI、运行项目、审批命令时都会闪出一个
@@ -18,7 +22,12 @@ func configureProcessGroup(cmd *exec.Cmd) {
 
 func terminateProcessGroup(cmd *exec.Cmd) {
 	if cmd.Process != nil {
-		_ = exec.Command("taskkill", "/PID", fmt.Sprint(cmd.Process.Pid), "/T", "/F").Run()
+		ctx, cancel := context.WithTimeout(context.Background(), windowsProcessTerminateTimeout)
+		defer cancel()
+		// taskkill can wait indefinitely when a descendant is stuck in WSL or
+		// still owns a pipe. Bound the helper itself so Stop() cannot leak a
+		// goroutine forever.
+		_ = exec.CommandContext(ctx, "taskkill", "/PID", fmt.Sprint(cmd.Process.Pid), "/T", "/F").Run()
 	}
 }
 

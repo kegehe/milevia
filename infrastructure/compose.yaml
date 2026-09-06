@@ -1,6 +1,28 @@
 name: milevia
 
+# 单域名入口由外部 Caddy/Nginx 负责：
+#   /          -> apps/web/dist
+#   /health    -> cloud-control:8090/health
+#   /v1/*      -> cloud-control:8090/v1/*（包含 Agent WebSocket）
+# compose 只将 Cloud Control 绑定到本机，避免绕过反向代理直接暴露服务。
+
 services:
+  cloud-control:
+    build:
+      context: ..
+      dockerfile: apps/cloud-control/Dockerfile
+    environment:
+      MILEVIA_CLOUD_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MILEVIA_CLOUD_AGENT_TOKENS: ${MILEVIA_CLOUD_AGENT_TOKENS}
+      MILEVIA_CLOUD_USER_TOKEN: ${MILEVIA_CLOUD_USER_TOKEN}
+      MILEVIA_CLOUD_APP_URL: ${MILEVIA_CLOUD_APP_URL}
+      MILEVIA_CLOUD_ADDR: :8090
+    ports:
+      - "127.0.0.1:${CLOUD_CONTROL_PORT}:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   postgres:
     image: postgres:17-alpine
     environment:

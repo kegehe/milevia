@@ -22,7 +22,9 @@ import FilesPage from "./pages/FilesPage";
 import AgentProfilesPage from "./pages/AgentProfilesPage";
 import SettingsPage from "./pages/SettingsPage";
 import TerminalPage from "./pages/TerminalPage";
+import MobileRemotePage from "./pages/MobileRemotePage";
 import { UpdateBanner } from "./features/updater/UpdateBanner";
+import { Capacitor } from "@capacitor/core";
 
 declare global {
   interface Window {
@@ -53,8 +55,14 @@ function RedirectToTaskBoard() {
 }
 
 export function App() {
+  const nativeMobile = Capacitor.isNativePlatform();
+  // Keep the browser /mobile route isolated as well. This prevents desktop
+  // providers from opening local API/WebSocket connections while previewing
+  // the remote page on Windows.
+  const mobileRoute = typeof window !== "undefined" && window.location.pathname === "/mobile";
   return (
     <BrowserRouter>
+      {nativeMobile || mobileRoute ? <MobileRemotePage /> : <>
       <TooltipProvider>
         <UIPreferencesProvider>
           <NotificationProvider>
@@ -68,6 +76,7 @@ export function App() {
                   <Route path="/ssh-manager" element={<SSHManagerPage />} />
                   <Route path="/agent-profiles" element={<AgentProfilesPage />} />
                   <Route path="/settings" element={<SettingsPage />} />
+                  <Route path="/mobile" element={<MobileRemotePage />} />
                   <Route path="/projects/:projectId" element={<ProjectLayout />}>
                     <Route index element={<Navigate to="conversations" replace />} />
                     <Route path="conversations" element={<ConversationPage />} />
@@ -92,6 +101,7 @@ export function App() {
           </NotificationProvider>
         </UIPreferencesProvider>
       </TooltipProvider>
+      </>}
     </BrowserRouter>
   );
 }

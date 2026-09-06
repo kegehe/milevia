@@ -61,51 +61,120 @@ struct UpdateInfo {
     notes: Option<String>,
 }
 
-/// 启动时后台查询到的升级结果缓存；`None` 表示暂无可升级信息。
-struct UpdateCheck(Mutex<Option<UpdateInfo>>);
+const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// 静默拉取升级清单：成功且有新版则缓存信息，任何错误都吞掉（不阻断启动）。
-fn prime_update_check(app: &tauri::AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let Ok(updater) = app.updater() else {
-            return;
-        };
-        let Ok(Some(update)) = updater.check().await else {
-            return;
-        };
-        let info = UpdateInfo {
-            current_version: update.current_version,
-            version: update.version,
-            notes: update.body.clone(),
-        };
-        *app.state::<UpdateCheck>().0.lock().expect("update state lock") = Some(info);
-    });
-}
-
-/// 查询升级状态：返回本机版本号 + 是否发现新版本。前端启动时轮询一次。
-#[tauri::command]
-fn get_updater_status(app: tauri::AppHandle) -> UpdateInfoRepr {
-    let cached = app.state::<UpdateCheck>().0.lock().expect("update state lock").clone();
-    UpdateInfoRepr {
-        app_version: app.package_info().version.to_string(),
-        update: cached,
-    }
-}
-
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateInfoRepr {
     app_version: String,
+    status: String,
     update: Option<UpdateInfo>,
+    error: Option<String>,
+}
+
+struct UpdateCheck {
+    state: Mutex<UpdateCheckState>,
+}
+
+struct UpdateCheckState {
+    info: UpdateInfoRepr,
+    generation: u64,
+}
+
+async fn perform_update_check(app: &tauri::AppHandle) -> UpdateInfoRepr {
+    let app_version = app.package_info().version.to_string();
+    let update_check = app.state::<UpdateCheck>();
+    let generation = if let Ok(mut state) = update_check.state.lock() {
+        state.generation = state.generation.wrapping_add(1);
+        state.info.status = "checking".to_string();
+        state.info.error = None;
+        state.info.update = None;
+        state.generation
+    } else {
+        0
+    };
+    let result = async {
+        let updater = app
+            .updater_builder()
+            .timeout(UPDATE_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let update = updater.check().await.map_err(|error| error.to_string())?;
+        Ok::<Option<UpdateInfo>, String>(update.map(|update| UpdateInfo {
+            current_version: update.current_version,
+            version: update.version,
+            notes: update.body.clone(),
+        }))
+    }
+    .await;
+    let next = match result {
+        Ok(update) => UpdateInfoRepr {
+            app_version,
+            status: "complete".to_string(),
+            update,
+            error: None,
+        },
+        Err(error) => UpdateInfoRepr {
+            app_version,
+            status: "failed".to_string(),
+            update: None,
+            error: Some(error),
+        },
+    };
+    if let Ok(mut state) = update_check.state.lock() {
+        if state.generation == generation {
+            state.info = next.clone();
+            return next;
+        }
+        return state.info.clone();
+    }
+    next
+}
+
+fn prime_update_check(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        perform_update_check(&app).await;
+    });
+}
+
+#[tauri::command]
+fn get_updater_status(app: tauri::AppHandle) -> UpdateInfoRepr {
+    app.state::<UpdateCheck>()
+        .state
+        .lock()
+        .expect("update state lock")
+        .info
+        .clone()
+}
+
+#[tauri::command]
+async fn check_for_update_now(app: tauri::AppHandle) -> UpdateInfoRepr {
+    perform_update_check(&app).await
 }
 
 /// 下载并安装新版本，结束后重启应用。期间通过 `updater://progress` 事件回报进度。
+#[derive(serde::Serialize)]
+struct InstallUpdateResult {
+    installed: bool,
+}
+
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    let updater = app.updater().map_err(|error| error.to_string())?;
+async fn install_update(app: tauri::AppHandle) -> Result<InstallUpdateResult, String> {
+    let updater = app
+        .updater_builder()
+        .timeout(UPDATE_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| error.to_string())?;
     let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
-        return Ok(());
+        let update_check = app.state::<UpdateCheck>();
+        if let Ok(mut state) = update_check.state.lock() {
+            state.generation = state.generation.wrapping_add(1);
+            state.info.status = "complete".to_string();
+            state.info.update = None;
+            state.info.error = None;
+        }
+        return Ok(InstallUpdateResult { installed: false });
     };
     update
         .download_and_install(
@@ -121,7 +190,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     app.restart();
     #[allow(unreachable_code)]
-    Ok(())
+    Ok(InstallUpdateResult { installed: true })
 }
 
 const TRAY_PANEL_LABEL: &str = "tray-panel";
@@ -174,8 +243,11 @@ fn wait_for_ready(
     stdout: impl std::io::Read + Send + 'static,
     stderr: impl std::io::Read + Send + 'static,
     binary_path: std::path::PathBuf,
+    endpoint_path: std::path::PathBuf,
+    previous_endpoint_modified: Option<std::time::SystemTime>,
 ) -> Result<String, Box<dyn Error>> {
     let (sender, receiver) = mpsc::sync_channel(1);
+    let endpoint_sender = sender.clone();
     let stderr_lines = Arc::new(Mutex::new(String::new()));
 
     // Collect stderr into a buffer for diagnostics, while also echoing
@@ -223,6 +295,33 @@ fn wait_for_ready(
                 path_snapshot.display(),
                 stderr_snapshot.lock().unwrap()
             )));
+        }
+    });
+
+    // stdout is the fast path, while the endpoint file is a durable fallback.
+    // The health check that follows still authenticates the endpoint with the
+    // per-start session token, so a stale file cannot be accepted as ready.
+    thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
+        while std::time::Instant::now() < deadline {
+            let modified = std::fs::metadata(&endpoint_path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if modified.is_some() && modified <= previous_endpoint_modified {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(&endpoint_path) {
+                if let Some(url) = contents
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+                {
+                    let _ = endpoint_sender.send(Ok(url.to_string()));
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
         }
     });
 
@@ -284,6 +383,49 @@ fn wait_for_health(sidecar: &RunningSidecar) -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Directly launched debug binaries do not pass through `scripts/dev.mjs`.
+/// Load the local Agent env as a fallback so pairing still has Cloud Control
+/// settings, while preserving explicitly configured process variables.
+fn apply_debug_remote_env(command: &mut Command) {
+    #[cfg(debug_assertions)]
+    {
+        let env_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("agent")
+            .join(".env.windows");
+        let Ok(contents) = std::fs::read_to_string(env_path) else {
+            return;
+        };
+        let mut values = std::collections::HashMap::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            values.insert(key.trim(), value.trim());
+        }
+        for (target, source) in [
+            ("AUTO_REMOTE_CLOUD_URL", "MILEVIA_CLOUD_URL"),
+            ("AUTO_REMOTE_CLOUD_TOKEN", "MILEVIA_CLOUD_AGENT_TOKEN"),
+            ("AUTO_REMOTE_INSTANCE_ID", "MILEVIA_INSTANCE_ID"),
+        ] {
+            if env::var(target)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(value) = values.get(source).filter(|value| !value.is_empty()) {
+                command.env(target, value);
+            }
+        }
+    }
+}
+
 fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error>> {
     let data_dir = app.path().app_local_data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
@@ -311,7 +453,8 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
     let approval_binary_arg = approval_path.to_string_lossy().to_string();
     let session_token = Uuid::new_v4().simple().to_string();
     let parent_pid = std::process::id();
-    let mut child = Command::new(&sidecar_path)
+    let mut command = Command::new(&sidecar_path);
+    command
         .args([
             "--mode",
             "desktop-api",
@@ -333,8 +476,13 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 隐藏 sidecar 控制台窗口（见 CREATE_NO_WINDOW）。
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
+        .creation_flags(CREATE_NO_WINDOW);
+    apply_debug_remote_env(&mut command);
+    let endpoint_path = data_dir.join("milevia.endpoint");
+    let previous_endpoint_modified = std::fs::metadata(&endpoint_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let mut child = command.spawn()
         .map_err(|e| {
             format!(
                 "无法启动控制服务。\n程序：{}\n原因：{}\n请确认程序未被占用，且 CGO/SQLite 编译工具链正常。",
@@ -344,7 +492,13 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
         })?;
     let stdout = child.stdout.take().ok_or("无法获取控制服务 stdout 管道")?;
     let stderr = child.stderr.take().ok_or("无法获取控制服务 stderr 管道")?;
-    match wait_for_ready(stdout, stderr, sidecar_path.clone()) {
+    match wait_for_ready(
+        stdout,
+        stderr,
+        sidecar_path.clone(),
+        endpoint_path,
+        previous_endpoint_modified,
+    ) {
         Ok(api_base) => {
             let sidecar = RunningSidecar {
                 child,
@@ -450,6 +604,9 @@ fn runtime_init_script(api_base: &str, session_token: &str, mode: &str) -> Strin
   quit: () => window.__TAURI_INTERNALS__.invoke('quit_app'),
   resize: (w, h) => window.__TAURI_INTERNALS__.invoke('set_panel_size', { width: w, height: h }),
   navigateMain: (path) => window.__TAURI_INTERNALS__.invoke('navigate_main', { path }),
+  getUpdaterStatus: () => window.__TAURI_INTERNALS__.invoke('get_updater_status'),
+  checkForUpdate: () => window.__TAURI_INTERNALS__.invoke('check_for_update_now'),
+  installUpdate: () => window.__TAURI_INTERNALS__.invoke('install_update'),
 }, writable: false, configurable: false });"#,
         );
     }
@@ -457,7 +614,8 @@ fn runtime_init_script(api_base: &str, session_token: &str, mode: &str) -> Strin
 }
 
 fn create_main_window(app: &tauri::AppHandle, sidecar: &RunningSidecar) -> tauri::Result<()> {
-    let initialization_script = runtime_init_script(&sidecar.api_base, &sidecar.session_token, "app");
+    let initialization_script =
+        runtime_init_script(&sidecar.api_base, &sidecar.session_token, "app");
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Milevia")
         .inner_size(1440.0, 920.0)
@@ -505,26 +663,23 @@ fn restore_or_create_panel(
         return Ok(window);
     }
     let initialization_script = runtime_init_script(api_base, session_token, "tray");
-    let window = WebviewWindowBuilder::new(
-        app,
-        TRAY_PANEL_LABEL,
-        WebviewUrl::App("index.html".into()),
-    )
-    .title("Milevia")
-    .inner_size(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)
-    .decorations(false)
-    .transparent(true)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .resizable(false)
-    .shadow(false)
-    // 同上：统一 https scheme，避免 WebView2 将 http 升级后 wry 拦截失效导致黑屏。
-    .use_https_scheme(true)
-    .visible(false) // 先隐藏，待定位后再 show，避免在错误坐标闪一下
-    .initialization_script(&initialization_script)
-    .on_navigation(navigation_allowed)
-    .on_new_window(|_, _| NewWindowResponse::Deny)
-    .build()?;
+    let window =
+        WebviewWindowBuilder::new(app, TRAY_PANEL_LABEL, WebviewUrl::App("index.html".into()))
+            .title("Milevia")
+            .inner_size(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .shadow(false)
+            // 同上：统一 https scheme，避免 WebView2 将 http 升级后 wry 拦截失效导致黑屏。
+            .use_https_scheme(true)
+            .visible(false) // 先隐藏，待定位后再 show，避免在错误坐标闪一下
+            .initialization_script(&initialization_script)
+            .on_navigation(navigation_allowed)
+            .on_new_window(|_, _| NewWindowResponse::Deny)
+            .build()?;
     let w = window.clone();
     window.on_window_event(move |event| {
         match event {
@@ -614,6 +769,9 @@ fn open_tray_panel(app: &tauri::AppHandle, click_position: &PhysicalPosition<f64
     let _ = panel.set_always_on_top(true);
     let _ = panel.show();
     let _ = panel.set_focus();
+    // 通知面板前端"本次已打开"：品牌面板窗口常驻复用（关闭=隐藏、不会重挂载），
+    // 需靠这个事件让前端在每次打开时自动重跑一次更新检查（前端驱动 check）。
+    let _ = app.emit_to(TRAY_PANEL_LABEL, "tray://panel-opened", ());
 }
 
 /// 显示并聚焦主窗口（先隐藏托盘面板，避免焦点竞争导致面板误关）。
@@ -680,10 +838,14 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
     // “无图标”的托盘项，任务栏通知区不会渲染出任何可见图标。
     let tray = TrayIconBuilder::with_id("main-tray")
         // 去掉原生菜单，改由品牌覆盖层面板承载；左/右键都弹面板。
-        .icon(app.default_window_icon().map(Clone::clone).unwrap_or_else(|| {
-            Image::from_bytes(include_bytes!("../icons/icon.ico"))
-                .expect("内置图标必须可解码")
-        }))
+        .icon(
+            app.default_window_icon()
+                .map(Clone::clone)
+                .unwrap_or_else(|| {
+                    Image::from_bytes(include_bytes!("../icons/icon.ico"))
+                        .expect("内置图标必须可解码")
+                }),
+        )
         .show_menu_on_left_click(false);
 
     tray.on_tray_icon_event(|tray, event| {
@@ -720,12 +882,23 @@ fn main() {
             set_panel_size,
             navigate_main,
             get_updater_status,
+            check_for_update_now,
             install_update
         ])
         .setup(|app| {
             app.manage(ManagedSidecar(Mutex::new(None)));
             app.manage(TrayAnchor(Mutex::new(None)));
-            app.manage(UpdateCheck(Mutex::new(None)));
+            app.manage(UpdateCheck {
+                state: Mutex::new(UpdateCheckState {
+                    info: UpdateInfoRepr {
+                        app_version: app.package_info().version.to_string(),
+                        status: "checking".to_string(),
+                        update: None,
+                        error: None,
+                    },
+                    generation: 0,
+                }),
+            });
             let sidecar = start_sidecar(&app.handle()).map_err(|error| error.to_string())?;
             if let Err(error) = create_main_window(&app.handle(), &sidecar) {
                 let mut sidecar = sidecar;
@@ -744,7 +917,9 @@ fn main() {
                 return Err(error.into());
             }
             // 预建隐藏的品牌面板窗口：首次点击即可直接显示，避免首点延迟/空白。
-            if let Err(error) = restore_or_create_panel(&app.handle(), &panel_api_base, &panel_session_token) {
+            if let Err(error) =
+                restore_or_create_panel(&app.handle(), &panel_api_base, &panel_session_token)
+            {
                 eprintln!("[tray-panel] 预建面板失败（首次点击时将重建）: {error}");
             }
             // 后台静默检查更新，结果供主窗 `get_updater_status` 查询。

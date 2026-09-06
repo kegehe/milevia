@@ -75,11 +75,11 @@ const (
 // 每条扫描产出的发现数量上限（与服务端数量钳一致的硬顶）。
 const insightFindingsCap = 30
 
-// Pass B 与再验证使用同一批大小，保证候选数量不会在第二轮重新膨胀。
+// insightVerifyBatchSize 是 Pass B 与再验证共用的"单趟 agent 一次核验条数"上限：
+// 超过时分批串行跑，避免单趟 prompt 过大、agent 通读过多文件导致超时/上下文偏紧。
+// 再验证在 ≤20 条的常见区间还会用 insightReverifyChunkSize 进一步切小批，见其注释。
 const insightVerifyBatchSize = 20
 
-// insightVerifyBatchSize 单趟再验证 agent 一次核验的建议数上限。超过时分批串行跑，
-// 避免单趟 prompt 过大、agent 通读过多文件导致超时/上下文偏紧。
 // insightScanPassTimeout 是单趟只读 agent（Pass A 发现 / Pass B 核实）的执行上限。
 // 超时后进程会被终止，扫描置 failed 并明确提示"分析超时"（见 runReadOnlyAgent 的
 // scanCtx.Err() 分支），避免用户面对无解释的"项目分析失败"。
@@ -90,6 +90,30 @@ const insightVerifyRunTimeout = 30 * time.Minute
 
 // insightPersistenceTimeout 为服务关闭后写入任务终态预留时间。
 const insightPersistenceTimeout = 10 * time.Second
+
+// insightReverifyChunkSize 返回一次复核中单趟只读 agent 一次核验的建议条数。
+// 复核进度以"批"为粒度落库（processed_count / run.message），而单趟 agent 必须整批
+// 返回后才给出判定——若把整份清单（常见 ≤20 条）全装进一趟，复核全程（可能数分钟到
+// 十几分钟）进度会一直停在 0/N，再瞬间跳到完成，用户看到的就是"没有进度"。这里对
+// ≤20 条（原单趟装完的区间）切成约 3 批，让进度出现可见的中间点；超过 20 条维持原
+// insightVerifyBatchSize 上限（那些清单本来就有批次间进度点，不再额外拆出 agent 会话，
+// 也避免 prompt 无谓变小）。小清单（≤6 条）不切，省掉无谓的会话开销。
+func insightReverifyChunkSize(n int) int {
+	if n > insightVerifyBatchSize {
+		return insightVerifyBatchSize
+	}
+	if n <= 6 {
+		return n
+	}
+	chunk := (n + 2) / 3 // ceil(n/3)：目标约 3 批，兼顾进度粒度与 agent 会话数
+	if chunk < 2 {
+		chunk = 2
+	}
+	if chunk > n {
+		chunk = n
+	}
+	return chunk
+}
 
 // 主题方向枚举（空串 = 全面分析）。
 const (
@@ -373,26 +397,52 @@ func stripInsightCodeFences(s string) string {
 	return strings.Join(out, "\n")
 }
 
-// projectRuntimeProfile 兑现「随项目默认」取舍：把项目默认档案解析为运行时
-// Profile 注入 `AgentRunRequest.Profile`（model/baseUrl/受管 Key 与项目 AI 配置
-// 一致，而非 CLI 裸默认）。无默认档案时返回 nil（退化为 CLI 默认）。
+// projectRuntimeProfile resolves the selected agent's project route into a
+// runtime profile. Insights must follow the same per-agent routing as new
+// conversations: projects can configure Claude and Codex independently.
+// A legacy default is consulted only when it belongs to agentID (inside
+// profileRouteForNewConversationTx); no matching route/profile falls back to
+// the CLI's own credentials.
 func (s *Server) projectRuntimeProfile(ctx context.Context, project Project, agentID string) (*AgentRuntimeProfile, error) {
-	if project.DefaultProfileID == "" {
-		return nil, nil
+	runnerID := project.RunnerID
+	if runnerID == "" {
+		runnerID = project.Runner
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback() //nolint:errcheck // 只读解析，提交与否无关紧要
-	profile, err := s.runtimeProfileTx(ctx, tx, project.DefaultProfileID, project.RunnerID, agentID)
+	defer tx.Rollback() //nolint:errcheck // harmless after commit; cleans up error paths
+	selection, err := s.profileRouteForNewConversationTx(ctx, tx, nil, runnerID, agentID, project.ID)
 	if err != nil {
+		return nil, err
+	}
+	revisionID := selection.ProfileRevisionID
+	if revisionID == "" && selection.RouteRevisionID != "" {
+		var mode string
+		if err := tx.QueryRowContext(ctx, `select mode from project_agent_route_revisions where id=? and agent_id=?`, selection.RouteRevisionID, agentID).Scan(&mode); err != nil {
+			return nil, err
+		}
+		if mode == "pool" {
+			revisionID, err = s.selectPoolProfileRevisionTx(ctx, tx, selection.RouteRevisionID, runnerID, agentID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	profile, err := s.runtimeProfileTx(ctx, tx, revisionID, runnerID, agentID)
+	if err != nil {
+		return nil, err
+	}
+	// Pool selection advances credential_pool_state in this transaction. A
+	// rollback here would make round-robin selection restart at the same member.
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return profile, nil
 }
 
-// runReadOnlyAgent 封装「选 runner → 解析项目默认档案 → sink → 超时 → Run →
+// runReadOnlyAgent 封装「选 runner → 解析项目代理路由档案 → sink → 超时 → Run →
 // 收集助手文本」，供 Pass A（发现）/ Pass B（核实）复用。严格只读：Claude 用
 // `plan`、Codex 用 `read_only`，绕开 HTTP 层的 `validAgentPolicy`（见 docs/25 §5.2）。
 // 选 runner 与 startMessage（app.go:3556）同一语义：SSH 走 runnerRegistry、本机按
@@ -421,7 +471,14 @@ func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID,
 			runner = s.agentClaudeRunnerFor(target)
 		}
 		if runner == nil {
-			runner = s.runner // 兜底：remote/windowsAgentRunner 缺失时用服务端 runner
+			if agentID == "codex" {
+				// Never run a Codex request through the Claude runner. This can
+				// happen when a cross-environment runner (for example WSL) is not
+				// available; returning an explicit error is safer than silently
+				// launching the wrong CLI.
+				return "", fmt.Errorf("没有可用的 Codex 分析运行器")
+			}
+			runner = s.runner // Claude 的兼容回退：目标 runner 缺失时用服务端 runner
 		}
 		if runner == nil {
 			return "", fmt.Errorf("没有可用的分析运行器")
@@ -430,8 +487,28 @@ func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID,
 
 	profile, err := s.projectRuntimeProfile(ctx, project, agentID)
 	if err != nil {
-		return "", fmt.Errorf("resolve project default profile: %w", err)
+		return "", fmt.Errorf("resolve project agent profile: %w", err)
 	}
+	if agentID == "codex" {
+		ready := false
+		if capable, ok := runner.(CodexCapableRunner); ok {
+			// SSH and cross-environment runners probe Codex on the target host.
+			ready = capable.CodexReady(ctx)
+		} else if local, ok := runner.(*codexCLIRunner); ok && profile != nil && profile.AuthMode == "api_key" {
+			// Managed API-key profiles do not need persisted CLI login.
+			ready = local.BinaryReady()
+		} else {
+			ready = runner.Ready(ctx)
+		}
+		if !ready {
+			return "", errors.New("Codex CLI is unavailable or not logged in")
+		}
+	}
+	cleanupQuota, err := s.reserveInsightQuota(ctx, project, agentID, profile)
+	if err != nil {
+		return "", fmt.Errorf("reserve analysis quota: %w", err)
+	}
+	defer cleanupQuota()
 
 	sink := &insightLiveSink{onProgress: progress}
 	scanCtx, cancel := context.WithTimeout(ctx, insightScanPassTimeout)
@@ -461,6 +538,75 @@ func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID,
 	return strings.TrimSpace(sink.text.String()), nil
 }
 
+// reserveInsightQuota creates a short-lived internal run so read-only insight
+// calls use the same quota admission as ordinary conversations. The run is
+// deliberately not exposed to the conversation history and is removed after
+// the agent call, while quota_reservations remains auditable during execution.
+func (s *Server) reserveInsightQuota(ctx context.Context, project Project, agentID string, profile *AgentRuntimeProfile) (func(), error) {
+	if profile == nil {
+		return func() {}, nil
+	}
+	conversationID := "insight-quota-" + uuid.NewString()
+	runID := "insight-quota-" + uuid.NewString()
+	now := time.Now().UTC()
+	routeRevisionID := ""
+	runnerID := project.RunnerID
+	if runnerID == "" {
+		runnerID = project.Runner
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	cleanupTx := func() { _ = tx.Rollback() }
+	defer cleanupTx()
+	_ = tx.QueryRowContext(ctx, `select current_revision_id from project_agent_routes where project_id=? and agent_id=?`, project.ID, agentID).Scan(&routeRevisionID)
+	if _, err := tx.ExecContext(ctx, `insert into conversations
+		(id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at)
+		values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		conversationID, project.ID, conversationID, agentID, "", runnerID, profile.RevisionID, routeRevisionID,
+		"read_only", "active", "read_only", "Insight quota", now, 0, 0, 0, now); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `insert into runs
+		(id,conversation_id,agent_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,created_at)
+		values (?,?,?,?,?,?,?,?,?)`, runID, conversationID, agentID, runnerID, profile.RevisionID, routeRevisionID, "read_only", "running", now); err != nil {
+		return nil, err
+	}
+	if err := s.reserveProfileQuotaTx(ctx, tx, runID, profile.RevisionID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cleanup, cleanupErr := s.db.BeginTx(cleanupCtx, nil)
+		if cleanupErr != nil {
+			log.Printf("[insights] begin quota cleanup %s: %v", runID, cleanupErr)
+			return
+		}
+		if cleanupErr = s.releaseQuotaReservations(cleanupCtx, cleanup, runID); cleanupErr == nil {
+			_, cleanupErr = cleanup.ExecContext(cleanupCtx, `update runs set status='completed',completed_at=? where id=?`, time.Now().UTC(), runID)
+		}
+		if cleanupErr == nil {
+			_, cleanupErr = cleanup.ExecContext(cleanupCtx, `delete from runs where id=?`, runID)
+		}
+		if cleanupErr == nil {
+			_, cleanupErr = cleanup.ExecContext(cleanupCtx, `delete from conversations where id=?`, conversationID)
+		}
+		if cleanupErr != nil {
+			_ = cleanup.Rollback()
+			log.Printf("[insights] cleanup quota run %s: %v", runID, cleanupErr)
+			return
+		}
+		if cleanupErr = cleanup.Commit(); cleanupErr != nil {
+			log.Printf("[insights] commit quota cleanup %s: %v", runID, cleanupErr)
+		}
+	}, nil
+}
+
 // insightLiveSink 在收集助手文本（orchestrationReviewSink）之外，额外把 agent 实时
 // 的工具动作抽成进度消息。Event 回调运行在 runner 的输出读 goroutine 上，与扫描
 // goroutine 并发追加进度事件；消息去重 + 节流，避免刷屏（3 秒内同一条/同一类只报一次）。
@@ -486,9 +632,35 @@ func (sink *insightLiveSink) Event(eventType string, payload json.RawMessage) {
 }
 
 // parseInsightToolActivity 从 runner 事件里尽力提取一条“当前在做什么”的短信息。
-// 目前可靠识别 claude 的 assistant 事件中的 tool_use（Read/Glob/Grep/List 等，正是
-// 只读分析实际放行的工具）；codex/ssh 事件形态不同，解析不了返回 ("", false)，调用方忽略。
+// 识别 Claude assistant 事件中的 tool_use（Read/Glob/Grep/List 等）以及 Codex 的
+// turn/item 事件；SSH 使用相同的事件格式时也能获得粗粒度进度，未知事件返回 ("", false)。
 func parseInsightToolActivity(eventType string, payload json.RawMessage) (string, bool) {
+	// Codex emits structured item events rather than Claude's assistant/tool_use
+	// envelope. Surface those events as coarse-grained progress so a long
+	// read-only scan does not look stalled while the model is working.
+	if eventType == "turn.started" {
+		return "模型正在分析项目", true
+	}
+	if eventType == "item.started" || eventType == "item.completed" {
+		var envelope struct {
+			Item struct {
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return "", false
+		}
+		switch envelope.Item.Type {
+		case "command_execution":
+			if eventType == "item.started" {
+				return "执行只读检查", true
+			}
+			return "完成只读检查", true
+		case "file_change":
+			return "读取文件变更", true
+		}
+		return "", false
+	}
 	if eventType != "assistant" {
 		return "", false
 	}
@@ -1070,16 +1242,41 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 		agentID = s.currentInsightAgent(verifyCtx, projectID)
 	}
 	results := make(map[string]insightReverifyResult, len(targets))
-
-	for start := 0; start < len(targets); start += insightVerifyBatchSize {
-		end := min(start+insightVerifyBatchSize, len(targets))
+	// 按批推进进度：见 insightReverifyChunkSize 说明。进入/完成每批都落库一条消息，
+	// 避免整趟 agent（可能数分钟）期间 run 一直停留在"正在准备验证 · 0/N"。
+	chunk := insightReverifyChunkSize(len(targets))
+	batches := (len(targets) + chunk - 1) / chunk
+	for start := 0; start < len(targets); start += chunk {
+		end := min(start+chunk, len(targets))
 		batch := targets[start:end]
+		batchNo := start/chunk + 1
+		// 单批（小清单）不写"第 1/1 批"这类噪声，只留建议区间/进行中的动作。
+		batchPrefix := ""
+		if batches > 1 {
+			batchPrefix = fmt.Sprintf("第 %d/%d 批：", batchNo, batches)
+		}
+		startMsg := fmt.Sprintf("正在核实建议 %d-%d/%d", start+1, end, len(targets))
+		if len(targets) == 1 {
+			startMsg = "正在核实该条建议"
+		}
+		s.updateInsightVerificationRun(verifyCtx, verificationID, batchPrefix+startMsg, start)
 		unchanged, revisionErr := s.insightWorkspaceUnchanged(verifyCtx, project, revision)
 		if revisionErr != nil || !unchanged {
 			failAll("项目代码在验证中发生变化，已丢弃本轮结果，请重新验证")
 			return
 		}
-		batchResults, batchErr := s.runInsightReverifyBatch(verifyCtx, project, agentID, revision.RepoSHA, batch)
+		// 整批返回前进度数不会动（agent 一次只回整批判定），把实时工具动作（读取/
+		// 检索哪个文件）滚动写进 run.message，避免长时间盯着 0/N 误以为卡住。
+		activity := func(level, message string) {
+			if verifyCtx.Err() != nil {
+				return
+			}
+			if batches > 1 {
+				message = fmt.Sprintf("第 %d/%d 批：%s", batchNo, batches, message)
+			}
+			s.updateInsightVerificationRunMessage(verifyCtx, verificationID, message)
+		}
+		batchResults, batchErr := s.runInsightReverifyBatch(verifyCtx, project, agentID, revision.RepoSHA, batch, activity)
 		if batchErr != nil {
 			log.Printf("[insights] project=%s re-verify batch failed: %v", projectID, batchErr)
 			failAll(insightRunErrorMessage("建议验证失败", batchErr))
@@ -1088,7 +1285,8 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 		for id, result := range batchResults {
 			results[id] = result
 		}
-		s.updateInsightVerificationRun(verifyCtx, verificationID, fmt.Sprintf("正在核实 %d/%d 条建议", end, len(targets)), end)
+		s.updateInsightVerificationRun(verifyCtx, verificationID,
+			fmt.Sprintf("%s已完成 %d/%d 条建议", batchPrefix, end, len(targets)), end)
 	}
 
 	unchanged, revisionErr := s.insightWorkspaceUnchanged(verifyCtx, project, revision)
@@ -1133,9 +1331,9 @@ func persistInsightWrite(write func(context.Context)) {
 	write(persistCtx)
 }
 
-func (s *Server) runInsightReverifyBatch(ctx context.Context, project Project, agentID, repoSHA string, targets []InsightFinding) (map[string]insightReverifyResult, error) {
+func (s *Server) runInsightReverifyBatch(ctx context.Context, project Project, agentID, repoSHA string, targets []InsightFinding, progress func(level, message string)) (map[string]insightReverifyResult, error) {
 	cc := func(prompt string) (string, error) {
-		return s.runReadOnlyAgent(ctx, project, agentID, prompt, nil)
+		return s.runReadOnlyAgent(ctx, project, agentID, prompt, progress)
 	}
 	text, err := cc(buildInsightReverifyPrompt(project.Path, repoSHA, targets, false))
 	if err != nil {
@@ -1182,6 +1380,18 @@ func (s *Server) updateInsightVerificationRun(ctx context.Context, verificationI
 	}
 	if _, err := s.db.ExecContext(ctx, `update project_insight_verification_runs set message=?,processed_count=? where id=? and status='running'`, message, processed, verificationID); err != nil {
 		log.Printf("[insights] update verification run %s: %v", verificationID, err)
+	}
+}
+
+// updateInsightVerificationRunMessage 只滚动复核 run 的 message 不动 processed_count，
+// 供单趟 agent 运行中实时转发工具动作（读取/检索…）。status='running' 守卫保证 run
+// 结束后（比如用户停止）残留的进度回调不会把终态消息冲掉。
+func (s *Server) updateInsightVerificationRunMessage(ctx context.Context, verificationID, message string) {
+	if verificationID == "" || message == "" {
+		return
+	}
+	if _, err := s.db.ExecContext(ctx, `update project_insight_verification_runs set message=? where id=? and status='running'`, message, verificationID); err != nil {
+		log.Printf("[insights] update verification run message %s: %v", verificationID, err)
 	}
 }
 
@@ -2342,7 +2552,7 @@ func (s *Server) convertInsightToTask(ctx context.Context, projectID string, f I
 		task.ID, task.ProjectID, task.Title, task.Description, task.Priority, false, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
 		return Task{}, false, errors.New("创建任务失败，请重试")
 	}
-	if err := recordTaskEventTx(ctx, tx, task.ID, "", "task.created", map[string]string{"status": task.Status}, now); err != nil {
+	if err := s.recordTaskEventTx(ctx, tx, task.ID, "", "task.created", map[string]string{"status": task.Status}, now); err != nil {
 		return Task{}, false, errors.New("创建任务失败，请重试")
 	}
 	// 建议已转为任务：从列表删除（硬删）。

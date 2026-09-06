@@ -40,7 +40,7 @@ test("task views only apply their latest list, detail, and orchestration respons
   assert.match(orchestrationPage, /selectedRequestVersion\.current \+= 1;[\s\S]*?setDetail\(null\);[\s\S]*?setHistory\(null\);/);
 });
 
-test("orchestration workspace exposes plan, queue, decision and verification controls", () => {
+test("orchestration workspace exposes plan, queue and decision controls without mandatory verification", () => {
 	assert.match(orchestrationPage, /orchestration\/batches/);
 	assert.match(orchestrationPage, /orchestration\/batches\/\$\{existingBatch\.id\}\/tasks/);
   assert.match(orchestrationPage, /orchestration\/order/);
@@ -57,7 +57,9 @@ test("orchestration workspace exposes plan, queue, decision and verification con
 	assert.match(orchestrationPage, /\["released_to_main", "stopped", "needs_human"\]\.includes\(selected\.status\)/);
 	assert.match(orchestrationPage, /继承上一任务对话摘要/);
   assert.match(orchestrationPage, /const runningStatuses = new Set\(\["preparing", "implementing", "checking"\]\);/);
-  assert.match(orchestrationPage, /verificationError = enabled && verificationCommands\.length === 0/);
+  assert.match(orchestrationPage, /checking: "收尾中"/);
+  assert.doesNotMatch(orchestrationPage, /验证命令|启用自动编排时至少需要一条验证命令/);
+  assert.match(orchestrationPage, /最大修复轮次/);
   assert.match(orchestrationPage, /function candidateSummary\(task: Task\)/);
   assert.match(orchestrationPage, /const summary = candidateSummary\(task\); return <li key=\{task\.id\}><label title=\{summary\}>/);
   assert.doesNotMatch(orchestrationPage, /候选任务[\s\S]*?未命名任务/);

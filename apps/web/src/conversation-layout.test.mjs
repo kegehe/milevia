@@ -39,6 +39,10 @@ test("user messages can be copied from an icon-only control", () => {
 });
 
 test("stopping an unanswered direct prompt restores it to the composer", () => {
+  assert.match(conversationPage, /\{run && <button className="runner-stop" type="button" disabled=\{readOnly \|\| stopping\} onClick=\{onStop\}/);
+  assert.match(conversationPage, /onShowUsage=\{openUsage\} readOnly=\{readOnlyConversation\} stopping=\{stopping\}/);
+  assert.match(stylesheet, /\.runner-stop \{ display: none; \}/);
+  assert.match(stylesheet, /@media \(max-width: 820px\) \{[\s\S]*?\.runner-stop \{[\s\S]*?display:\s*inline-flex;[\s\S]*?\.composer-action\.composer-stop \{ display: none; \}/);
   assert.match(conversationPage, /const pendingUserDrafts = useRef\(new Map<string, string>\(\)\);/);
   assert.match(conversationPage, /const assistantOutputRuns = useRef\(new Set<string>\(\)\);/);
   assert.match(conversationPage, /const recordAssistantOutput = useCallback[\s\S]*?if \(outputs\.size > 128\)[\s\S]*?pendingUserDrafts\.current\.delete\(runID\);/);
@@ -93,6 +97,18 @@ test("conversation tabs use roving keyboard navigation and name their panel", ()
   assert.match(conversationPage, /className="conversation-tab-list" role="tablist" onKeyDown=\{navigateConversationTabs\}/);
   assert.match(conversationPage, /className="chat-center" id="conversation-panel" role="tabpanel" aria-labelledby=/);
   assert.match(stylesheet, /\.conversation-tab > button:first-child:focus-visible \{[^}]*outline: 2px solid #2b7b68;/s);
+});
+
+test("conversation tabs label both supported agents", () => {
+  assert.match(conversationPage, /conversation && <span className="conversation-tab-agent">\{conversation\.agentId === "codex" \? "Codex" : "Claude Code"\}<\/span>/);
+  assert.match(stylesheet, /\.conversation-tab-agent\s*\{[^}]*white-space:\s*nowrap;/s);
+});
+
+test("mobile conversation tabs replace the open-tab list with a history dialog trigger", () => {
+  assert.match(conversationPage, /function ConversationTabStrip\([\s\S]*?openHistory: \(\) => void;/);
+  assert.match(conversationPage, /className="conversation-tab-history"[\s\S]*?onClick=\{openHistory\}/);
+  assert.match(conversationPage, /<ConversationTabStrip[\s\S]*?openHistory=\{openConversationHistory\}/);
+  assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.conversation-tab-list \{ display: none; \}[\s\S]*?\.conversation-tab-history \{[\s\S]*?display: inline-flex;/);
 });
 
 test("all composer text sources are cached and conversation switches use the target draft", () => {
@@ -336,12 +352,14 @@ test("conversation controls navigate direct user messages and continue through o
   assert.match(stylesheet, /\.scroll-btn:disabled\s*\{/);
 });
 
-test("clearing context starts a fresh conversation with the current agent and policy", () => {
+test("clearing context closes the current tab and starts a fresh conversation with the current agent and policy", () => {
   assert.match(conversationPage, /const clearConversationContext = \(\) => \{/);
-  assert.match(conversationPage, /title: "清空上下文"/);
-  assert.match(conversationPage, /message: "将开始一个新的空白会话，当前内容仍可在历史会话中恢复。"/);
+  assert.match(conversationPage, /title: "关闭并新建会话"/);
+  assert.match(conversationPage, /message: "将关闭当前会话并打开一个新的空白会话。当前内容仍可在历史会话中恢复。"/);
   assert.match(conversationPage, /const clearCurrentConversation = async \(skipRunGuard = false\) => \{/);
   assert.match(conversationPage, /`\/api\/conversations\/\$\{conversationID\}\/clear`/);
+  assert.match(conversationPage, /const replaceConversationTab = useCallback\(\(closedConversationID: string, nextConversationID: string\) => \{[\s\S]*?closeConversationTab\(conversationTabsRef\.current, closedConversationID\);[\s\S]*?openConversationTab\(closed, nextConversationID\);/);
+  assert.match(conversationPage, /if \(!clearStillOwnsView\(\)\) return;\s*replaceConversationTab\(conversationID, next\.id\);\s*resetConversationView\(next\);/s);
   assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
   assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
   assert.match(conversationPage, /const isCurrentConversation = \(\) => !cancelled && conversationRef\.current\?\.id === conversation\.id;/);
@@ -387,6 +405,36 @@ test("/clear in the composer and the 清屏 shortcut route through the app clear
   assert.match(conversationPage, /const action = shortcut\.defaultAction === "confirm" \? "confirm" : "run";/);
 });
 
+test("history dialog deletes one conversation and clears all history", () => {
+  // 单条历史对话删除：先确认，再 DELETE，随后关闭对应 Tab 并刷新历史。
+  assert.match(conversationPage, /const deleteHistoryConversation = \(item: Conversation\) => \{/);
+  assert.match(conversationPage, /title: "删除会话"/);
+  assert.match(conversationPage, /confirmLabel: "删除"/);
+  assert.match(conversationPage, /const deleteHistoryConversationConfirmed = async \(conversationID: string\) => \{/);
+  assert.match(conversationPage, /`\/api\/conversations\/\$\{conversationID\}`, \{ method: "DELETE" \}\)/);
+  assert.match(conversationPage, /removeUnavailableConversationTabs\(\[conversationID\]\);/);
+  // 自动编排会话是只读系统会话，不渲染删除按钮。
+  assert.match(conversationPage, /!orchestration && <button type="button" className="history-item-delete"/);
+  assert.match(conversationPage, /title="删除此会话"/);
+
+  // 全部历史对话清除：确认后 DELETE 项目级端点，按返回的 deletedIds 关闭 Tab。
+  assert.match(conversationPage, /const deleteAllHistoryConversations = \(\) => \{/);
+  assert.match(conversationPage, /title: "清除全部历史对话"/);
+  assert.match(conversationPage, /confirmLabel: "清除全部"/);
+  assert.match(conversationPage, /const deleteAllHistoryConversationsConfirmed = async \(\) => \{/);
+	assert.match(conversationPage, /apiWithTimeout<\{ deleted: number; skipped: number; deletedIds\?: string\[\] \}>\(`\/api\/projects\/\$\{projectId\}\/conversations`, \{ method: "DELETE" \}, 0, 120_000\)/);
+  assert.match(conversationPage, /deletedIDs = result\.deletedIds \|\| \[\];/);
+  assert.match(conversationPage, /removeUnavailableConversationTabs\(deletedIDs\);/);
+  assert.match(conversationPage, /className="secondary history-delete-all"/);
+  assert.match(conversationPage, />清除全部<\/button>/);
+
+  // 样式配套：行内删除按钮与页脚批量清除按钮。
+  assert.match(stylesheet, /\.history-item-delete\s*\{[^}]*width:\s*28px;/s);
+  assert.match(stylesheet, /\.history-item-delete:hover:not\(:disabled\)[^{]*\{[^}]*color:\s*#c45034;/);
+  assert.match(stylesheet, /\.history-footer-actions\s*\{[^}]*display:\s*flex;[^}]*gap:\s*8px;/s);
+  assert.match(stylesheet, /\.history-footer-actions \.history-delete-all\s*\{[^}]*color:\s*#b04a2e;/);
+});
+
 test("creating a conversation keeps the newly navigated route", () => {
   const newConversation = conversationPage.match(/const newConversation = async[\s\S]*?\r?\n  };\r?\n\r?\n  const clearConversationContext/);
   assert.ok(newConversation, "newConversation handler should exist");
@@ -397,8 +445,8 @@ test("creating a conversation keeps the newly navigated route", () => {
   assert.doesNotMatch(newConversation[0], /navigate\(`\/projects\/\$\{projectId\}\/conversations\/\$\{next\.id\}`, \{ replace: true \}\);[\s\S]*closeNewConversation\(\);/);
 });
 
-test("new conversations start in the safe permission baseline for either CLI", () => {
-  assert.match(conversationPage, /const permissionForAgent = \(agent: AgentID\): PermissionMode => agent === "codex" \? "workspace_write" : "approval_required";/);
+test("new conversations start from the configured default permission", () => {
+  assert.match(conversationPage, /const permissionForAgent = \(agent: AgentID\): PermissionMode => agent === "codex" \? defaults\.codexPermissionMode : defaults\.claudePermissionMode;/);
 });
 
 test("wide and narrow screens sort prompts and commands in separate vertical lists", () => {
@@ -416,6 +464,19 @@ test("wide and narrow screens sort prompts and commands in separate vertical lis
   assert.match(conversationPage, /`\/api\/projects\/\$\{projectId\}\/shortcuts\/reorder`/);
   assert.match(conversationPage, /title=\{shortcut\.enabled \? shortcut\.template : `\$\{shortcut\.template\}\\n\\n\$\{shortcut\.name\}已停用`\}/);
   assert.doesNotMatch(stylesheet, /\.quick-actions-row\s*\{[^}]*overflow-x:\s*auto/s);
+});
+
+test("mobile shortcuts collapse into the composer action menu", () => {
+  assert.match(conversationPage, /const \[showMobileShortcuts, setShowMobileShortcuts\] = useState\(false\);/);
+  assert.match(conversationPage, /className=\{`composer-mobile-shortcut-toggle\$\{showMobileShortcuts \? " open" : ""\}`\}/);
+  assert.match(conversationPage, /aria-controls="mobile-shortcut-menu" aria-expanded=\{showMobileShortcuts\}/);
+  assert.match(conversationPage, /\{showMobileShortcuts && <section className="mobile-shortcut-menu" id="mobile-shortcut-menu" aria-label="快捷操作">/);
+  assert.match(conversationPage, /renderItem=\{renderMobilePromptCell\}/);
+  assert.match(conversationPage, /renderItem=\{renderMobileCommandCell\}/);
+  assert.match(conversationPage, /\{renderSkillGroup\(\)\}/);
+  assert.match(conversationPage, /if \(event\.key === "Escape"\) setShowMobileShortcuts\(false\);/);
+  assert.match(stylesheet, /@media \(max-width: 820px\) \{[\s\S]*?\.quick-tag-rail \{ display: none; \}[\s\S]*?\.composer-mobile-shortcut-toggle \{/);
+  assert.match(stylesheet, /\.mobile-shortcut-menu \{[\s\S]*?max-height: min\(44dvh, 360px\);[\s\S]*?overflow-y: auto;/);
 });
 
 test("agent work is progressive: primary chat stays clean and trace details remain available", () => {

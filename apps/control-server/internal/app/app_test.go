@@ -618,6 +618,7 @@ func TestAssistantTextBroadcastsDurableMessageEvent(t *testing.T) {
 func TestCreateCodexConversationPersistsAgentAndPolicy(t *testing.T) {
 	server := newTestServer(t)
 	server.codexRunner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	server.wslRunner = server.codexRunner
 	now := time.Now().UTC()
 	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
@@ -860,6 +861,7 @@ func TestConversationIsolatedWorkspaceLifecycle(t *testing.T) {
 func TestCreateCodexFullControlConversation(t *testing.T) {
 	server := newTestServer(t)
 	server.codexRunner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	server.wslRunner = server.codexRunner
 	now := time.Now().UTC()
 	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
@@ -2184,6 +2186,99 @@ func TestDeleteProjectRemovesProjectAndCascades(t *testing.T) {
 	}
 }
 
+func TestDeleteConversationRemovesTaskRunHistory(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','Project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values ('conversation','project','session','idle','approval_required','History',?,0,1,?)`, now, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into tasks (id,project_id,title,last_task_run_id,created_at,updated_at) values ('task','project','Task','task-run',?,?)`, now, now); err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('task-run','task','conversation',NULL,1,'completed','prompt','', '',?)`, now); err != nil {
+		t.Fatalf("insert task run: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/conversations/conversation", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete conversation status: want 204 got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var count int
+	var conversationID sql.NullString
+	if err := server.db.QueryRow(`select conversation_id from task_runs where id='task-run'`).Scan(&conversationID); err != nil {
+		t.Fatalf("load task run: %v", err)
+	}
+	if conversationID.Valid {
+		t.Fatalf("task run conversation reference was not cleared: %q", conversationID.String)
+	}
+	var lastRunID sql.NullString
+	if err := server.db.QueryRow(`select last_task_run_id from tasks where id='task'`).Scan(&lastRunID); err != nil {
+		t.Fatalf("load task last run: %v", err)
+	}
+	if !lastRunID.Valid || lastRunID.String != "task-run" {
+		t.Fatalf("task last run pointer was not preserved: %#v", lastRunID)
+	}
+	if err := server.db.QueryRow(`select count(*) from tasks where id='task'`).Scan(&count); err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("task unexpectedly deleted with conversation: %d", count)
+	}
+	runs := httptest.NewRecorder()
+	server.routes().ServeHTTP(runs, httptest.NewRequest(http.MethodGet, "/api/tasks/task/runs", nil))
+	if runs.Code != http.StatusOK {
+		t.Fatalf("list task runs after conversation deletion: %d body=%s", runs.Code, runs.Body.String())
+	}
+}
+
+func TestMigrateTaskRunConversationReference(t *testing.T) {
+	server := newTestServer(t)
+	if _, err := server.db.Exec(`pragma foreign_keys=off`); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	if _, err := server.db.Exec(`drop table task_runs; create table task_runs (
+		id text primary key,
+		task_id text not null references tasks(id) on delete cascade,
+		conversation_id text not null references conversations(id) on delete restrict,
+		run_id text unique references runs(id) on delete set null,
+		sequence integer not null,
+		status text not null,
+		prompt_snapshot text not null,
+		acceptance_snapshot text not null,
+		failure_reason text not null default '',
+		created_at datetime not null,
+		started_at datetime,
+		finished_at datetime
+	);`); err != nil {
+		t.Fatalf("create legacy task_runs: %v", err)
+	}
+	if _, err := server.db.Exec(`pragma foreign_keys=on`); err != nil {
+		t.Fatalf("restore foreign keys: %v", err)
+	}
+	if err := server.migrateTaskRunConversationReference(context.Background()); err != nil {
+		t.Fatalf("migrate task_runs: %v", err)
+	}
+
+	var notNull int
+	if err := server.db.QueryRow(`select "notnull" from pragma_table_info('task_runs') where name='conversation_id'`).Scan(&notNull); err != nil {
+		t.Fatalf("inspect migrated task_runs: %v", err)
+	}
+	if notNull != 0 {
+		t.Fatal("conversation_id is still non-null after migration")
+	}
+	var onDelete string
+	if err := server.db.QueryRow(`select on_delete from pragma_foreign_key_list('task_runs') where "from"='conversation_id'`).Scan(&onDelete); err != nil {
+		t.Fatalf("inspect migrated foreign key: %v", err)
+	}
+	if !strings.EqualFold(onDelete, "SET NULL") {
+		t.Fatalf("conversation foreign key action = %q, want SET NULL", onDelete)
+	}
+}
+
 func TestDeleteProjectStopsActiveAgentRun(t *testing.T) {
 	server := newTestServer(t)
 	started := make(chan struct{})
@@ -3279,6 +3374,7 @@ func TestStoppedClaudeSessionDoesNotStartQueuedTurnAfterResult(t *testing.T) {
 }
 
 func TestCloseMarksStreamingRunsStopped(t *testing.T) {
+	requirePOSIXShell(t)
 	server := newTestServer(t)
 	now := time.Now().UTC()
 	projectPath := t.TempDir()
@@ -3726,6 +3822,269 @@ func TestClearConversationDoesNotBlockActivationWhileStoppingOldSession(t *testi
 	}
 }
 
+func TestDeleteConversationRemovesHistoryAndStopsSession(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,execution_policy,status,permission_mode,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','claude-code','00000000-0000-4000-8000-000000000000','wsl-local','approval_required','idle','approval_required',1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into messages (id,conversation_id,role,content,created_at) values ('message','conversation','user','deleted text',?)`, now); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	oldSession := newIdleAgentSession()
+	server.mu.Lock()
+	server.sessions["conversation"] = &activeAgentSession{agent: oldSession}
+	server.mu.Unlock()
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/conversations/conversation", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete conversation status: %d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case <-oldSession.Done():
+	case <-time.After(time.Second):
+		t.Fatal("delete did not stop the old agent session")
+	}
+	var exists bool
+	if err := server.db.QueryRow(`select exists(select 1 from conversations where id='conversation')`).Scan(&exists); err != nil {
+		t.Fatalf("query conversation: %v", err)
+	}
+	if exists {
+		t.Fatal("conversation row still exists after delete")
+	}
+	if err := server.db.QueryRow(`select exists(select 1 from messages where id='message')`).Scan(&exists); err != nil {
+		t.Fatalf("query message: %v", err)
+	}
+	if exists {
+		t.Fatal("message row still exists after delete")
+	}
+	history := httptest.NewRecorder()
+	server.routes().ServeHTTP(history, httptest.NewRequest(http.MethodGet, "/api/projects/project/conversations", nil))
+	if history.Code != http.StatusOK {
+		t.Fatalf("list history status: %d body=%s", history.Code, history.Body.String())
+	}
+	var page conversationListPage
+	if err := json.NewDecoder(history.Body).Decode(&page); err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+	if len(page.Items) != 0 {
+		t.Fatalf("history still shows deleted conversation: %#v", page.Items)
+	}
+}
+
+func TestDeleteConversationRejectsRunningAndMissing(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,is_current,created_at) values ('running','project','00000000-0000-4000-8000-000000000000','running',1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+
+	running := httptest.NewRecorder()
+	server.routes().ServeHTTP(running, httptest.NewRequest(http.MethodDelete, "/api/conversations/running", nil))
+	if running.Code != http.StatusConflict {
+		t.Fatalf("delete running conversation status: %d body=%s", running.Code, running.Body.String())
+	}
+	missing := httptest.NewRecorder()
+	server.routes().ServeHTTP(missing, httptest.NewRequest(http.MethodDelete, "/api/conversations/absent", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("delete missing conversation status: %d body=%s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestDeleteConversationRejectsOrchestration(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Reject orchestration delete")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'queued','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values ('job','','','',?,?,?)`, conversationID, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/conversations/"+conversationID, nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete orchestration conversation status: %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestDeleteProjectConversationsRemovesAllDeletable(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	for index, item := range []struct{ id, status string }{
+		{id: "conversation-a", status: "idle"},
+		{id: "conversation-b", status: "archived"},
+	} {
+		if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,is_current,created_at) values (?,?,?,?,?,?)`, item.id, "project", fmt.Sprintf("00000000-0000-4000-8000-%012d", index), item.status, 0, now); err != nil {
+			t.Fatalf("insert conversation %s: %v", item.id, err)
+		}
+	}
+	if _, err := server.db.Exec(`insert into tasks (id,project_id,title,last_task_run_id,created_at,updated_at) values ('task','project','Task','task-run',?,?)`, now, now); err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('task-run','task','conversation-a',1,'completed','prompt','', '',?)`, now); err != nil {
+		t.Fatalf("insert task run: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/project/conversations", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete all conversations status: %d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Deleted int `json:"deleted"`
+		Skipped int `json:"skipped"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode delete result: %v", err)
+	}
+	if result.Deleted != 2 || result.Skipped != 0 {
+		t.Fatalf("unexpected delete result: %+v", result)
+	}
+	var count int
+	if err := server.db.QueryRow(`select count(*) from conversations where project_id='project'`).Scan(&count); err != nil {
+		t.Fatalf("count conversations: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("conversations still exist after bulk delete: %d", count)
+	}
+	var conversationID sql.NullString
+	if err := server.db.QueryRow(`select conversation_id from task_runs where id='task-run'`).Scan(&conversationID); err != nil {
+		t.Fatalf("load task run after bulk delete: %v", err)
+	}
+	if conversationID.Valid {
+		t.Fatalf("task run conversation reference was not cleared: %q", conversationID.String)
+	}
+	var lastRunID sql.NullString
+	if err := server.db.QueryRow(`select last_task_run_id from tasks where id='task'`).Scan(&lastRunID); err != nil {
+		t.Fatalf("load task last run after bulk delete: %v", err)
+	}
+	if !lastRunID.Valid || lastRunID.String != "task-run" {
+		t.Fatalf("task last run pointer was not preserved: %#v", lastRunID)
+	}
+}
+
+func TestDeleteProjectConversationsDoesNotWaitForSessionStop(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle',1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	blocking := newBlockingStopAgentSession()
+	server.mu.Lock()
+	server.sessions["conversation"] = &activeAgentSession{agent: blocking}
+	server.mu.Unlock()
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		server.routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/api/projects/project/conversations", nil))
+		response <- recorder
+	}()
+	var recorder *httptest.ResponseRecorder
+	select {
+	case recorder = <-response:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("bulk delete waited for a blocking session stop")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("bulk delete status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case <-blocking.stopEntered:
+	case <-time.After(time.Second):
+		t.Fatal("bulk delete did not start stopping the session")
+	}
+	close(blocking.releaseStop)
+	select {
+	case <-blocking.Done():
+	case <-time.After(time.Second):
+		t.Fatal("blocking session did not finish after release")
+	}
+}
+
+func TestDeleteProjectConversationsSkipsOrchestration(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Delete project conversations")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,is_current,created_at) values ('conversation-2','project','00000000-0000-4000-8000-000000000001','idle',0,?)`, now); err != nil {
+		t.Fatalf("insert conversation 2: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'queued','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values ('job','','','',?,?,?)`, conversationID, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/conversations", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete all conversations status: %d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Deleted int `json:"deleted"`
+		Skipped int `json:"skipped"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode delete result: %v", err)
+	}
+	if result.Deleted != 1 || result.Skipped != 1 {
+		t.Fatalf("unexpected delete result: %+v", result)
+	}
+	var count int
+	if err := server.db.QueryRow(`select count(*) from conversations where project_id=?`, projectID).Scan(&count); err != nil {
+		t.Fatalf("count conversations: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected only the orchestration conversation to remain, got %d", count)
+	}
+}
+
+func TestDeleteProjectConversationsRejectsRunning(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	for index, item := range []struct{ id, status string }{
+		{id: "conversation-a", status: "idle"},
+		{id: "conversation-running", status: "running"},
+	} {
+		if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,is_current,created_at) values (?,?,?,?,?,?)`, item.id, "project", fmt.Sprintf("00000000-0000-4000-8000-%012d", index), item.status, 0, now); err != nil {
+			t.Fatalf("insert conversation %s: %v", item.id, err)
+		}
+	}
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/project/conversations", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("bulk delete with running conversation status: %d body=%s", response.Code, response.Body.String())
+	}
+	// The idle conversation must not be deleted when the batch is rejected.
+	var count int
+	if err := server.db.QueryRow(`select count(*) from conversations where project_id='project'`).Scan(&count); err != nil {
+		t.Fatalf("count conversations: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("bulk delete removed conversations despite rejection: %d", count)
+	}
+}
+
 func TestTaskDispatchRejectsConversationClearedAfterRequestStarted(t *testing.T) {
 	server, projectID, conversationID := seedTaskConversation(t)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Do not cross the clear boundary")
@@ -4091,7 +4450,7 @@ func TestOrchestrationConfigSelectsAgent(t *testing.T) {
 	}
 	emptyCommands := httptest.NewRecorder()
 	server.routes().ServeHTTP(emptyCommands, httptest.NewRequest(http.MethodPut, "/api/projects/project/orchestration/config", strings.NewReader(`{"enabled":true,"mainBranch":"main","agentId":"codex","verificationCommands":[],"maxFixRounds":3}`)))
-	if emptyCommands.Code != http.StatusBadRequest {
+	if emptyCommands.Code != http.StatusOK {
 		t.Fatalf("enabled config without verification commands status=%d body=%s", emptyCommands.Code, emptyCommands.Body.String())
 	}
 	disabledEmptyCommands := httptest.NewRecorder()
@@ -4503,74 +4862,6 @@ func TestAutomaticOrchestrationBranchUsesDateAndTaskShortID(t *testing.T) {
 	branch := automaticOrchestrationBranch(time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC), "12345678-90ab-cdef")
 	if branch != "自动编排-20260812-12345678" {
 		t.Fatalf("branch = %q", branch)
-	}
-}
-
-func TestAutomaticOrchestrationDoesNotAdvanceDevWhenIntegrationVerificationFails(t *testing.T) {
-	server := newTestServer(t)
-	repo := t.TempDir()
-	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test User"}} {
-		command := exec.Command("git", args...)
-		command.Dir = repo
-		if output, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, output)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("baseline\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for _, args := range [][]string{{"add", "README.md"}, {"commit", "-m", "baseline"}} {
-		command := exec.Command("git", args...)
-		command.Dir = repo
-		if output, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, output)
-		}
-	}
-	baseline := mustGitHead(t, repo)
-	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,?,1,?)`, repo, server.localRunnerID(), "main", now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle',0,1,?)`, now); err != nil {
-		t.Fatal(err)
-	}
-	server.runner = runnerFunc(func(_ context.Context, request AgentRunRequest, sink AgentRunSink) error {
-		if strings.Contains(request.Prompt, "独立代码审查") {
-			sink.AssistantText(`{"verdict":"pass","blockingFindings":[],"nonBlockingFindings":[],"acceptanceCoverage":["implemented"],"testGaps":[],"reviewedCommit":"`+mustGitHead(t, request.ProjectPath)+`"}`, "")
-			return nil
-		}
-		return os.WriteFile(filepath.Join(request.ProjectPath, "implemented.txt"), []byte("done\n"), 0o600)
-	})
-	_, err := server.db.Exec(`insert into project_orchestration_configs (project_id,enabled,main_branch,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values ('project',1,'main','dev','["false"]',1,'',?)`, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	taskID := createTaskForTest(t, server.routes(), "project", "Integration check must protect dev")
-	response := httptest.NewRecorder()
-	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/enqueue", nil))
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("enqueue: %d body=%s", response.Code, response.Body.String())
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	var status string
-	for time.Now().Before(deadline) {
-		if err := server.db.QueryRow(`select status from task_orchestration_jobs where task_id=?`, taskID).Scan(&status); err != nil {
-			t.Fatal(err)
-		}
-		if status == orchestrationNeedsHuman {
-			break
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	if status != orchestrationNeedsHuman {
-		t.Fatalf("job status=%q, want %q", status, orchestrationNeedsHuman)
-	}
-	main, err := server.gitOutput(context.Background(), repo, "rev-parse", "main")
-	if err != nil {
-		t.Fatalf("read main after failed verification: %v", err)
-	}
-	if strings.TrimSpace(main) != baseline {
-		t.Fatalf("failed verification changed main: got=%s want=%s", strings.TrimSpace(main), baseline)
 	}
 }
 

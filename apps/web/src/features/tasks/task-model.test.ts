@@ -99,13 +99,13 @@ test("shows the orchestration snapshot target branch", () => {
   assert.match(taskQueueNote(task), /可合并至 release\/2026\.08/);
 });
 
-test("makes an active independent review visible ahead of manual review", () => {
+test("makes an active orchestration checkout visible ahead of manual review", () => {
   const review = makeTask("review", { status: "awaiting_review", orchestrationStatus: "checking", orchestrationUpdatedAt: "2026-07-20T00:01:00Z" });
 
-  assert.equal(taskDisplayStatus(review), "独立审查中");
+  assert.equal(taskDisplayStatus(review), "编排收尾中");
   assert.equal(taskDisplayStatusClass(review), "orchestration-checking");
   assert.equal(isTaskOrchestrating(review), true);
-  assert.match(taskQueueNote(review), /独立审查代理正在检查/);
+  assert.match(taskQueueNote(review), /正在提交实现，等待人工验证/);
 });
 
 test("shows orchestration cleanup as an active state", () => {
@@ -202,16 +202,17 @@ test("uses WebSocket history once and caps client-side run logs", () => {
 	assert.match(source, /setStatus\(next\)/);
 });
 
-test("resets runner state only when changing projects", () => {
+test("resets runner state only when changing workspaces", () => {
 	const source = readFileSync(new URL("../run/ProjectRunPanel.tsx", import.meta.url), "utf8");
 
 	assert.match(source, /const configDirtyRef = useRef\(false\);/);
 	assert.match(source, /const configRevisionRef = useRef\(0\);/);
-	assert.match(source, /revision === configRevisionRef\.current && !configDirtyRef\.current/);
-	assert.match(source, /if \(revision === configRevisionRef\.current\) configDirtyRef\.current = false;/);
+	assert.match(source, /workspaceGeneration === workspaceGenerationRef\.current && revision === configRevisionRef\.current && !configDirtyRef\.current/);
+	assert.match(source, /if \(workspaceGeneration === workspaceGenerationRef\.current && revision === configRevisionRef\.current\)/);
 	assert.match(source, /const updateConfig = \(next: RunConfig\) => \{\s*configDirtyRef\.current = true;\s*configRevisionRef\.current \+= 1;/s);
-	assert.match(source, /if \(renderedProjectIDRef\.current === projectID\) return;/);
-	assert.match(source, /renderedProjectIDRef\.current = projectID;[\s\S]*clearedThroughLogIDRef\.current = 0;/);
+	assert.match(source, /const workspaceKey = `\$\{projectID\}:\$\{conversationId \|\| ""\}`;/);
+	assert.match(source, /if \(renderedWorkspaceKeyRef\.current === workspaceKey\) return;/);
+	assert.match(source, /renderedWorkspaceKeyRef\.current = workspaceKey;[\s\S]*clearedThroughLogIDRef\.current = 0;/);
 });
 
 test("keeps file tabs in sync with renamed and removed paths", () => {

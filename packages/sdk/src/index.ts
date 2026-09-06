@@ -41,6 +41,9 @@ export function getPlatform(): Platform {
 
 /** 便捷断言：当前是否运行在桌面端 Tauri WebView 中。 */
 export function isDesktop(): boolean {
+  // Capacitor 原生包即使被宿主注入桌面运行时字段，也必须走移动端 UI。
+  const capacitor = (globalThis as typeof globalThis & { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
+  if (capacitor?.isNativePlatform?.()) return false;
   return getPlatform() === "desktop";
 }
 

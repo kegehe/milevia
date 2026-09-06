@@ -82,6 +82,7 @@ func main() {
 		})
 	}
 	if err := server.ServeListener(listener, func(url string) {
+		server.StartBackgroundMaintenance()
 		log.Printf("control server listening on %s", url)
 		fmt.Printf("MILEVIA_READY=%s\n", url)
 	}); err != nil {

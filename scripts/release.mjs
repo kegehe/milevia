@@ -14,7 +14,7 @@
 //   两者都会自动回落到默认位，通常无需设置。
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +44,7 @@ if (!/^\d+\.\d+\.\d+$/.test(nextVersion)) {
 const tauriConf = join(repoRoot, "apps/desktop/src-tauri/tauri.conf.json");
 const cargoToml = join(repoRoot, "apps/desktop/src-tauri/Cargo.toml");
 const desktopPkg = join(repoRoot, "apps/desktop/package.json");
+const androidDir = join(repoRoot, "apps/web/android");
 
 function readJson(file) { return JSON.parse(readFileSync(file, "utf8")); }
 function writeJson(file, obj) { writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8"); }
@@ -119,6 +120,29 @@ if (!existsSync(passfile)) throw new Error(`找不到口令文件：${passfile}`
 
 const releaseDir = join(repoRoot, "release");
 mkdirSync(releaseDir, { recursive: true });
+
+/* ── 3.5 Android 移动端安装包（Capacitor debug 签名，便于直接安装） ── */
+const mobileInstallerName = `Milevia_${nextVersion}_android.apk`;
+const mobileInstaller = join(releaseDir, mobileInstallerName);
+if (!noBuild) {
+  console.log("开始构建 Android 移动端安装包（Capacitor sync + assembleDebug）…");
+  execFileSync("pnpm", ["--dir", "apps/web", "exec", "cap", "sync", "android"], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    shell: process.platform === "win32",
+  });
+  execFileSync("gradlew.bat", ["assembleDebug"], {
+    cwd: androidDir,
+    stdio: "inherit",
+    shell: process.platform === "win32",
+  });
+}
+const mobileSource = join(androidDir, "app/build/outputs/apk/debug/app-debug.apk");
+if (!existsSync(mobileSource)) {
+  throw new Error(`未找到 Android 安装包：${mobileSource}\n请确认 Android SDK 和 Gradle 环境可用。`);
+}
+copyFileSync(mobileSource, mobileInstaller);
+console.log(`Android 安装包：${mobileInstaller}`);
 
 // 签名：位置参数 <FILE>；私钥路径与口令走环境变量（不进命令行，避免出现在进程/日志里）。
 // 直接调用 apps/desktop 里挂装的 tauri CLI JS 入口，绕开 pnpm 子命令解析问题。

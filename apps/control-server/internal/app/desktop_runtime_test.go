@@ -84,6 +84,17 @@ func TestDesktopSessionProtectsHTTPAndWebSocket(t *testing.T) {
 		t.Fatalf("missing session status: got %d want %d", unauthorized.Code, http.StatusUnauthorized)
 	}
 
+	// The Agent relay has its own authentication middleware and must not be
+	// blocked by the browser session middleware. With no explicit relay token,
+	// a loopback request is accepted by remoteAgentOnly in development.
+	remoteRequest := httptest.NewRequest(http.MethodGet, "/api/remote/snapshot", nil)
+	remoteRequest.RemoteAddr = "127.0.0.1:43210"
+	remote := httptest.NewRecorder()
+	server.routes().ServeHTTP(remote, remoteRequest)
+	if remote.Code != http.StatusOK {
+		t.Fatalf("local Agent relay status: got %d body=%s", remote.Code, remote.Body.String())
+	}
+
 	authorizedRequest := httptest.NewRequest(http.MethodGet, "/api/projects", nil)
 	authorizedRequest.Header.Set("X-Milevia-Session", token)
 	authorizedRequest.Header.Set("Origin", "https://tauri.localhost")

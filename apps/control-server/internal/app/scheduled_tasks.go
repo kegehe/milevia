@@ -279,17 +279,13 @@ func (s *Server) updateScheduledTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteScheduledTask(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "scheduledTaskID")
-	var active bool
-	err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from scheduled_task_runs where scheduled_task_id=? and status in ('queued','running'))`, id).Scan(&active)
+	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if active {
-		writeError(w, http.StatusConflict, errors.New("scheduled task has an active run"))
-		return
-	}
-	result, err := s.db.ExecContext(r.Context(), `delete from scheduled_tasks where id=?`, id)
+	defer tx.Rollback()
+	result, err := tx.ExecContext(r.Context(), `delete from scheduled_tasks where id=? and not exists(select 1 from scheduled_task_runs where scheduled_task_id=? and status in ('queued','running'))`, id, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -300,7 +296,24 @@ func (s *Server) deleteScheduledTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if changed == 0 {
-		writeError(w, http.StatusNotFound, errors.New("scheduled task not found"))
+		var exists, active bool
+		if err := tx.QueryRowContext(r.Context(), `select exists(select 1 from scheduled_tasks where id=?),exists(select 1 from scheduled_task_runs where scheduled_task_id=? and status in ('queued','running'))`, id, id).Scan(&exists, &active); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if active {
+			writeError(w, http.StatusConflict, errors.New("scheduled task has an active run"))
+			return
+		}
+		if !exists {
+			writeError(w, http.StatusNotFound, errors.New("scheduled task not found"))
+			return
+		}
+		writeError(w, http.StatusConflict, errors.New("scheduled task changed before deletion"))
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -383,6 +396,10 @@ func (s *Server) runScheduledTaskNow(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, errScheduledTaskAlreadyActive) {
 			writeError(w, http.StatusConflict, err)
+			return
+		}
+		if errors.Is(err, errScheduledTaskNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("scheduled task not found"))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err)
@@ -1005,6 +1022,7 @@ func (s *Server) claimDueScheduledTaskRuns(ctx context.Context, now time.Time) (
 }
 
 var errScheduledTaskAlreadyActive = errors.New("scheduled task already has an active run")
+var errScheduledTaskNotFound = errors.New("scheduled task not found")
 
 func (s *Server) enqueueScheduledTaskRun(ctx context.Context, task ScheduledTask, scheduledFor time.Time) (ScheduledTaskRun, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1012,6 +1030,13 @@ func (s *Server) enqueueScheduledTaskRun(ctx context.Context, task ScheduledTask
 		return ScheduledTaskRun{}, err
 	}
 	defer tx.Rollback()
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `select exists(select 1 from scheduled_tasks where id=?)`, task.ID).Scan(&exists); err != nil {
+		return ScheduledTaskRun{}, err
+	}
+	if !exists {
+		return ScheduledTaskRun{}, errScheduledTaskNotFound
+	}
 	var active bool
 	if err := tx.QueryRowContext(ctx, `select exists(select 1 from scheduled_task_runs where scheduled_task_id=? and status in ('queued','running'))`, task.ID).Scan(&active); err != nil {
 		return ScheduledTaskRun{}, err
@@ -1168,6 +1193,9 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 		return Conversation{}, err
 	}
 	if err := ensureSharedConversationWorkspaceTx(ctx, tx, conversation.ID, conversation.ProjectID, conversation.CreatedAt); err != nil {
+		return Conversation{}, err
+	}
+	if err := pruneConversationHistoryTx(ctx, tx, conversation.ProjectID); err != nil {
 		return Conversation{}, err
 	}
 	result, err := tx.ExecContext(ctx, `update scheduled_task_runs set conversation_id=? where id=? and status=? and conversation_id=''`, conversation.ID, run.ID, scheduledRunQueued)

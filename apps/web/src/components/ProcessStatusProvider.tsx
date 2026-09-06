@@ -26,6 +26,14 @@ function mergeEvent(
     runStatus: event.status,
     runUpdatedAt: Date.now(),
   };
+  if (event.sequence != null) {
+    if (existing.runSequence !== undefined && event.sequence <= existing.runSequence) return prev;
+    next.runSequence = event.sequence;
+  } else if (existing.runSequence !== undefined) {
+    // Legacy WebSocket/BroadcastChannel frames have no ordering information;
+    // once a sequenced stream is established they cannot safely replace it.
+    return prev;
+  }
   // pid/startedAt 仅在事件携带时更新，否则保留；stopped 表示进程已无意义，清空细节。
   if (event.status === "stopped") {
     delete next.runPid;
@@ -52,6 +60,7 @@ export function ProcessStatusProvider({ children }: { children: React.ReactNode 
   const [processStatuses, setProcessStatuses] = useState<ProjectProcessStatusMap>({});
   const wsRef = useRef<WebSocket | null>(null);
   const channelRef = useRef<BroadcastChannel | null>(null);
+  const restRequestVersionRef = useRef(0);
 
   const applyEvent = useCallback((event: RunStatusEvent) => {
     setProcessStatuses((prev) => mergeEvent(prev, event));
@@ -91,14 +100,17 @@ export function ProcessStatusProvider({ children }: { children: React.ReactNode 
           merged[id] = live;
           continue;
         }
-        merged[id] = next[id];
+        merged[id] = live.runSequence === undefined ? next[id] : { ...next[id], runSequence: live.runSequence };
       }
       return merged;
     });
   }, []);
 
   const poll = useCallback(() => {
-    void api<unknown>("/api/projects/processes/statuses").then(applyRest).catch(() => {});
+    const requestVersion = ++restRequestVersionRef.current;
+    void api<unknown>("/api/projects/processes/statuses").then((items) => {
+      if (requestVersion === restRequestVersionRef.current) applyRest(items);
+    }).catch(() => {});
   }, [applyRest]);
 
   // 初始 + 10s 兜底轮询

@@ -292,7 +292,7 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	if request.Resume {
 		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
 	} else {
-		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy, request.Prompt)
+		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy, request.Prompt)
 	}
 
 	cmd := r.wslNativeCommand(ctx, r.codex.config.CodexPath, args, environment, linuxWorkDir)

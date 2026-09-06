@@ -81,6 +81,8 @@ type OrchestrationJob struct {
 	ID                 string     `json:"id"`
 	ProjectID          string     `json:"projectId"`
 	TaskID             string     `json:"taskId"`
+	TaskTitle          string     `json:"taskTitle,omitempty"`
+	TaskDescription    string     `json:"taskDescription,omitempty"`
 	Position           int        `json:"position"`
 	Status             string     `json:"status"`
 	Attempt            int        `json:"attempt"`
@@ -392,6 +394,9 @@ func (s *Server) createOrchestrationConversation(ctx context.Context, project Pr
 	if err := ensureSharedConversationWorkspaceTx(ctx, tx, conversationID, project.ID, now); err != nil {
 		return "", fmt.Errorf("create orchestration workspace: %w", err)
 	}
+	if err := pruneConversationHistoryTx(ctx, tx, project.ID); err != nil {
+		return "", fmt.Errorf("prune conversation history: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
@@ -548,17 +553,6 @@ func validateOrchestrationConfig(cfg OrchestrationConfig) error {
 	if cfg.MaxFixRounds < 1 || cfg.MaxFixRounds > maxOrchestrationFixRounds {
 		return errors.New("maxFixRounds must be between 1 and 10")
 	}
-	if cfg.Enabled && len(cfg.VerificationCommands) == 0 {
-		return errors.New("at least one verification command is required when automatic orchestration is enabled")
-	}
-	if len(cfg.VerificationCommands) > 20 {
-		return errors.New("at most 20 verification commands are allowed")
-	}
-	for _, command := range cfg.VerificationCommands {
-		if strings.TrimSpace(command) == "" || len(command) > 2000 {
-			return errors.New("verification command is invalid")
-		}
-	}
 	return nil
 }
 
@@ -682,7 +676,7 @@ func (s *Server) enqueueTask(ctx context.Context, task Task, cfg OrchestrationCo
 		_, err = tx.ExecContext(ctx, `insert into orchestration_outbox (id,project_id,job_id,type,idempotency_key,status,created_at) values (?,?,?,?,?,?,?)`, uuid.NewString(), job.ProjectID, job.ID, "dispatch", "enqueue:"+job.ID, "pending", now)
 	}
 	if err == nil {
-		err = recordTaskEventTx(ctx, tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": job.ID, "position": job.Position}, now)
+		err = s.recordTaskEventTx(ctx, tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": job.ID, "position": job.Position}, now)
 	}
 	if err != nil {
 		return OrchestrationJob{}, err
@@ -894,7 +888,7 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 				_, err = tx.ExecContext(r.Context(), `insert into orchestration_outbox (id,project_id,job_id,type,idempotency_key,status,created_at) values (?,?,?,?,?,?,?)`, uuid.NewString(), projectID, jobID, "dispatch", "enqueue:"+jobID, "pending", now)
 			}
 			if err == nil {
-				err = recordTaskEventTx(r.Context(), tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": jobID, "batchId": batch.ID, "position": position}, now)
+				err = s.recordTaskEventTx(r.Context(), tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": jobID, "batchId": batch.ID, "position": position}, now)
 			}
 		}
 	}
@@ -1088,7 +1082,7 @@ func (s *Server) addTasksToOrchestrationBatch(w http.ResponseWriter, r *http.Req
 			_, err = tx.ExecContext(r.Context(), `insert into orchestration_outbox (id,project_id,job_id,type,idempotency_key,status,created_at) values (?,?,?,?,?,?,?)`, uuid.NewString(), projectID, jobID, "dispatch", "enqueue:"+jobID, "pending", now)
 		}
 		if err == nil {
-			err = recordTaskEventTx(r.Context(), tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": jobID, "batchId": batchID, "position": position}, now)
+			err = s.recordTaskEventTx(r.Context(), tx, task.ID, "", "orchestration.queued", map[string]any{"jobId": jobID, "batchId": batchID, "position": position}, now)
 		}
 	}
 	if err == nil {
@@ -1192,7 +1186,7 @@ func (s *Server) dequeueTaskFromOrchestration(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err = recordTaskEventTx(r.Context(), tx, taskID, "", "orchestration.dequeued", map[string]any{"jobId": jobID}, time.Now().UTC()); err != nil {
+	if err = s.recordTaskEventTx(r.Context(), tx, taskID, "", "orchestration.dequeued", map[string]any{"jobId": jobID}, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1327,7 +1321,7 @@ func (s *Server) reorderOrchestrationJobs(w http.ResponseWriter, r *http.Request
 
 func (s *Server) listOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
-	rows, err := s.db.QueryContext(r.Context(), `select job.id,job.project_id,job.task_id,job.queue_position,job.status,job.attempt,job.lease_token,job.base_dev_sha,coalesce(record.task_branch,''),coalesce(record.worktree_path,''),coalesce(record.conversation_id,''),job.batch_id,job.human_decision,record.resources_cleaned_at,job.last_error,job.policy_snapshot,job.created_at,job.updated_at from task_orchestration_jobs job left join git_task_records record on record.job_id=job.id where job.project_id=? order by job.queue_position`, projectID)
+	rows, err := s.db.QueryContext(r.Context(), `select job.id,job.project_id,job.task_id,coalesce(task.title,''),coalesce(task.description,''),job.queue_position,job.status,job.attempt,job.lease_token,job.base_dev_sha,coalesce(record.task_branch,''),coalesce(record.worktree_path,''),coalesce(record.conversation_id,''),job.batch_id,job.human_decision,record.resources_cleaned_at,job.last_error,job.policy_snapshot,job.created_at,job.updated_at from task_orchestration_jobs job left join tasks task on task.id=job.task_id left join git_task_records record on record.job_id=job.id where job.project_id=? order by job.queue_position`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1336,7 +1330,7 @@ func (s *Server) listOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
 	items := []OrchestrationJob{}
 	for rows.Next() {
 		var item OrchestrationJob
-		if err := rows.Scan(&item.ID, &item.ProjectID, &item.TaskID, &item.Position, &item.Status, &item.Attempt, &item.LeaseToken, &item.BaseDevSHA, &item.TaskBranch, &item.WorktreePath, &item.ConversationID, &item.BatchID, &item.HumanDecision, &item.ResourcesCleanedAt, &item.LastError, &item.PolicySnapshot, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.ProjectID, &item.TaskID, &item.TaskTitle, &item.TaskDescription, &item.Position, &item.Status, &item.Attempt, &item.LeaseToken, &item.BaseDevSHA, &item.TaskBranch, &item.WorktreePath, &item.ConversationID, &item.BatchID, &item.HumanDecision, &item.ResourcesCleanedAt, &item.LastError, &item.PolicySnapshot, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1566,7 +1560,7 @@ func (s *Server) stopOrchestrationJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err = recordTaskEventTx(r.Context(), tx, taskID, "", "orchestration.stopped", map[string]any{"jobId": jobID}, now); err != nil {
+	if err = s.recordTaskEventTx(r.Context(), tx, taskID, "", "orchestration.stopped", map[string]any{"jobId": jobID}, now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2010,9 +2004,7 @@ func (s *Server) resumeCommittedOrchestrationReview(ctx context.Context, job Orc
 	} else if job.Status != orchestrationChecking {
 		return errors.New("committed review is not ready to resume")
 	}
-	if err := s.runIndependentReview(ctx, project, job, cfg, record.WorktreePath, record.TaskCommitSHA); err != nil {
-		return err
-	}
+	// 编排不再运行独立审查：已提交的实现直接完成分支收尾，交由用户手动验证后合并。
 	return s.completeOrchestrationTaskBranch(ctx, project.Path, job, record.WorktreePath, record.TaskCommitSHA)
 }
 
@@ -2190,9 +2182,6 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 	if !isLocalRunnerID(project.Runner) {
 		return errors.New("automatic orchestration currently requires a local runner")
 	}
-	if len(cfg.VerificationCommands) == 0 {
-		return errors.New("verification commands must be configured before automatic orchestration")
-	}
 	task, err := s.taskByID(ctx, job.TaskID)
 	if err != nil {
 		return err
@@ -2269,7 +2258,7 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			_, err = tx.ExecContext(ctx, `insert into task_execution_intents (id,job_id,phase,attempt,status,created_at,updated_at) values (?,?,?,?,?,?,?) on conflict(job_id,phase,attempt) do nothing`, uuid.NewString(), job.ID, "implementation", job.Attempt+1, "pending", now, now)
 		}
 		if err == nil {
-			err = recordTaskEventTx(ctx, tx, task.ID, "", "orchestration.preparing", map[string]string{"baseDevSha": base, "branch": branch}, now)
+			err = s.recordTaskEventTx(ctx, tx, task.ID, "", "orchestration.preparing", map[string]string{"baseDevSha": base, "branch": branch}, now)
 		}
 		if err != nil {
 			tx.Rollback()
@@ -2416,13 +2405,8 @@ func (s *Server) completeOrchestrationImplementation(ctx context.Context, job Or
 		s.retryOrchestrationJob(ctx, job, cfg, err)
 		return
 	}
-	if err = s.gitCommand(ctx, worktree, "diff", "--check"); err == nil {
-		err = s.runVerificationCommands(ctx, job, worktree, job.BaseDevSHA, "task", cfg.VerificationCommands)
-	}
-	if err != nil {
-		s.retryOrchestrationJob(ctx, job, cfg, err)
-		return
-	}
+	// 编排不再自动运行验证命令与独立审查：实现提交后直接进入待合并状态，
+	// 由用户手动验证变更后再合并到目标分支。
 	if err = s.commitOrchestrationWorktree(ctx, worktree, job.TaskID); err != nil {
 		s.failOrchestrationJob(ctx, job, err)
 		return
@@ -2435,15 +2419,6 @@ func (s *Server) completeOrchestrationImplementation(ctx context.Context, job Or
 	commit = strings.TrimSpace(commit)
 	if err = s.recordTaskCommit(ctx, job, commit); err != nil {
 		s.failOrchestrationJob(ctx, job, err)
-		return
-	}
-	if err = s.runIndependentReview(ctx, project, job, cfg, worktree, commit); err != nil {
-		var protocolErr independentReviewProtocolError
-		if errors.As(err, &protocolErr) {
-			s.failOrchestrationJob(ctx, job, err)
-			return
-		}
-		s.retryOrchestrationJob(ctx, job, cfg, err)
 		return
 	}
 	if err = s.completeOrchestrationTaskBranch(ctx, project.Path, job, worktree, commit); err != nil {
@@ -2839,7 +2814,7 @@ func (s *Server) failOrchestrationJob(ctx context.Context, job OrchestrationJob,
 	if _, err = tx.ExecContext(ctx, `update project_orchestration_configs set frozen_reason=?,updated_at=? where project_id=?`, orchestrationFailureText(cause), now, job.ProjectID); err != nil {
 		return
 	}
-	if err = recordTaskEventTx(ctx, tx, job.TaskID, "", "orchestration.needs_human", map[string]any{"jobId": job.ID, "reason": orchestrationFailureText(cause)}, now); err != nil {
+	if err = s.recordTaskEventTx(ctx, tx, job.TaskID, "", "orchestration.needs_human", map[string]any{"jobId": job.ID, "reason": orchestrationFailureText(cause)}, now); err != nil {
 		return
 	}
 	if _, err = tx.ExecContext(ctx, `update orchestration_outbox set status='failed',completed_at=? where job_id=? and status='pending'`, now, job.ID); err != nil {

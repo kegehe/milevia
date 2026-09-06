@@ -41,6 +41,11 @@ packages/contracts/generated/
 agent/
 .superpowers/
 
+# The Agent source is tracked; keep the local Windows secret file ignored.
+!apps/agent/
+!apps/agent/start-agent.ps1
+apps/agent/.env.windows
+
 # Local convenience files
 /dev
 /package-lock.json

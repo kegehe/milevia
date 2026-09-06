@@ -202,6 +202,12 @@ func (s *Server) migrateCredentialScheduling(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Insight quota runs are intentionally ephemeral. If the process stopped
+	// before runReadOnlyAgent's cleanup callback ran, remove their synthetic
+	// conversations on the next startup so they never leak into history.
+	if _, err := s.db.ExecContext(ctx, `delete from conversations where id like 'insight-quota-%'`); err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, `update revocation_jobs set state='completed',completed_at=?,updated_at=? where state in ('pending','stopping') and not exists (select 1 from runs where runs.agent_profile_revision_id=revocation_jobs.profile_revision_id and runs.status in ('queued','running'))`, time.Now().UTC(), time.Now().UTC())
 	return err
 }

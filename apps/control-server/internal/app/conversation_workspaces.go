@@ -16,6 +16,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const conversationWorktreeCleanupTimeout = 5 * time.Second
+
 type workspaceGitRunner interface {
 	runGit(context.Context, string, ...string) ([]byte, error)
 }
@@ -161,9 +163,21 @@ func removeEmptyConversationWorktreeParents(projectPath, projectID, conversation
 // so preserving unmerged conversation branches would only leave unreachable
 // Git resources behind.
 func (s *Server) removeProjectConversationWorktrees(ctx context.Context, projectID string) error {
+	return s.removeConversationWorktrees(ctx, projectID, "")
+}
+
+// removeConversationWorktrees force-removes the isolated Git worktrees owned by
+// one conversation (or every project conversation when conversationID is empty).
+func (s *Server) removeConversationWorktrees(ctx context.Context, projectID, conversationID string) error {
+	filter := `where p.id=?`
+	args := []any{projectID}
+	if conversationID != "" {
+		filter += ` and c.id=?`
+		args = append(args, conversationID)
+	}
 	rows, err := s.db.QueryContext(ctx, `select p.path,w.conversation_id,w.generation,w.mode,w.path,w.branch,w.state
 		from conversation_workspaces w join conversations c on c.id=w.conversation_id join projects p on p.id=c.project_id
-		where p.id=? and w.mode='isolated_worktree'`, projectID)
+		`+filter+` and w.mode='isolated_worktree'`, args...)
 	if err != nil {
 		return err
 	}

@@ -113,8 +113,8 @@
   flex: none;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 9px;
+  gap: 7px;
+  padding: 3px 10px 3px 4px;
   border: 1px solid #cfe0d6;
   border-radius: 999px;
   color: #5f7a6e;
@@ -128,22 +128,26 @@
   user-select: none;
   box-shadow: 0 1px 3px #17362c14;
   backdrop-filter: blur(8px);
-  transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
+  transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease, transform 0.16s ease;
 }
 
-.app-version-tag::before {
-  content: "";
-  width: 6px;
-  height: 6px;
+/* 品牌 M 徽标（img 渲染 milevia-mark.svg）：比原绿色圆点更有辨识度，是 Milevia 的标识 */
+.app-version-mark {
+  width: 16px;
+  height: 16px;
   flex: none;
-  border-radius: 50%;
-  background: #2c7567;
-  box-shadow: 0 0 0 3px #cbeadd;
+  border-radius: 4px;
+  box-shadow: 0 1px 2px #17362c26;
+}
+
+.app-version-text {
+  letter-spacing: 0.02em;
 }
 
 .app-version-tag:hover {
   border-color: #9fbdc1;
   color: #2c6d5f;
   background: #eef6f0;
+  transform: translateY(-1px);
 }
 

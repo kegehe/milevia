@@ -1051,6 +1051,22 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	}
 }
 
+// remoteCodexBaseURLProbe 读取远端 ~/.codex/config.toml 顶层的 openai_base_url，
+// 无则退回 $OPENAI_BASE_URL；两者皆空时输出空串（由 runCodex 回退到远端默认配置）。
+const remoteCodexBaseURLProbe = `url=; if command -v awk >/dev/null 2>&1; then url=$(awk -F'"' '/^openai_base_url[[:space:]]*=/{print $2; exit}' ~/.codex/config.toml 2>/dev/null); fi; [ -n "$url" ] || url="$OPENAI_BASE_URL"; printf '%s' "$url"`
+
+// remoteCodexBaseURL returns the Codex endpoint the remote host points at for
+// launching new HTTPS threads, or "" when the host has none configured.
+func (r *sshRunner) remoteCodexBaseURL(ctx context.Context) string {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := r.client.execCommand(probeCtx, remoteCodexBaseURLProbe)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // runCodex executes one non-interactive Codex turn on the remote host over SSH.
 // It mirrors the local codexCLIRunner.Run command line, streaming JSONL on
 // stdout and diagnostic lines on stderr through the same sinks.
@@ -1060,12 +1076,29 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 		return err
 	}
 	configArg := fmt.Sprintf("sandbox_mode=%q", policy)
+	// New threads that can resolve a Codex endpoint are told to use a temporary
+	// HTTPS provider (that endpoint has no stable WebSocket path). Existing
+	// resumed threads keep the original command path and are intentionally not
+	// adapted here.
+	//
+	// The SSH runner has no profile-driven base URL like the local/WSL runners:
+	// the remote Codex owns its config/auth. Resolve the endpoint the remote
+	// already points at; when the remote has none configured, run Codex with its
+	// own provider/auth (the pre-change behavior) instead of aborting the run.
+	transportArgs := ""
+	if !request.Resume {
+		if baseURL := r.remoteCodexBaseURL(ctx); baseURL != "" {
+			transportArgs = "--disable responses_websockets -c model_provider=milevia -c model_providers.milevia.name=Milevia -c model_providers.milevia.base_url=" + shellQuote(baseURL) +
+				" -c model_providers.milevia.wire_api=responses -c model_providers.milevia.requires_openai_auth=true -c model_providers.milevia.supports_websockets=false -c model_providers.milevia.request_max_retries=2 -c model_providers.milevia.stream_max_retries=2 -c model_auto_compact_token_limit=80000 -c model_context_window=100000"
+		}
+	}
 	var cmd string
 	if request.Resume {
 		cmd = fmt.Sprintf("codex exec resume -c %s --json %s %s",
 			shellQuote(configArg), shellQuote(request.SessionID), shellQuote(request.Prompt))
 	} else {
-		cmd = fmt.Sprintf("codex exec -c %s --json --color never -C %s --sandbox %s %s",
+		cmd = fmt.Sprintf("codex exec %s -c %s --json --skip-git-repo-check --color never -C %s --sandbox %s %s",
+			transportArgs,
 			shellQuote(configArg), shellQuote(request.ProjectPath), policy, shellQuote(request.Prompt))
 	}
 	// Run from the project directory so Codex resolves relative paths correctly.
