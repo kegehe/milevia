@@ -25,9 +25,12 @@ func TestAppPreferencesDefaultAndPatch(t *testing.T) {
 	if preferences.DefaultAgentID != defaultAgentID || preferences.ClaudePermissionMode != defaultClaudePermission || preferences.CodexPermissionMode != defaultCodexPermission {
 		t.Fatalf("unexpected defaults: %#v", preferences)
 	}
+	if preferences.AutoReview {
+		t.Fatalf("autoReview should default to false, got %#v", preferences)
+	}
 
 	patch := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPatch, "/api/preferences", strings.NewReader(`{"defaultAgentId":"codex","codexPermissionMode":"read_only"}`))
+	request := httptest.NewRequest(http.MethodPatch, "/api/preferences", strings.NewReader(`{"defaultAgentId":"codex","codexPermissionMode":"read_only","autoReview":true}`))
 	request.Header.Set("Content-Type", "application/json")
 	server.routes().ServeHTTP(patch, request)
 	if patch.Code != http.StatusOK {
@@ -38,6 +41,9 @@ func TestAppPreferencesDefaultAndPatch(t *testing.T) {
 	}
 	if preferences.DefaultAgentID != "codex" || preferences.ClaudePermissionMode != defaultClaudePermission || preferences.CodexPermissionMode != "read_only" {
 		t.Fatalf("unexpected patched preferences: %#v", preferences)
+	}
+	if !preferences.AutoReview {
+		t.Fatalf("autoReview should have been persisted as true, got %#v", preferences)
 	}
 
 	var count int

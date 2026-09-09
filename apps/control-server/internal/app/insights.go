@@ -284,24 +284,35 @@ type pendingInsight struct {
 	Confirmed bool   `json:"confirmed"`
 }
 
+var (
+	insightCandidatesOutputSchema = json.RawMessage(`{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["bug","style","optimization","feature"]},"severity":{"type":"string","enum":["low","normal","high"]},"title":{"type":"string"},"summary":{"type":"string"},"fileHint":{"type":"string"}},"required":["type","severity","title","summary","fileHint"],"additionalProperties":false}}`)
+	insightVerifyOutputSchema     = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer","minimum":1},"confirmed":{"type":"boolean"},"reason":{"type":"string"}},"required":["index","confirmed","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
+	insightReverifyOutputSchema   = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["valid","invalid","uncertain"]},"reason":{"type":"string"}},"required":["id","status","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
+)
+
 // rawInsightParse 兼容多种 agent 输出形态：裸数组、{findings:[...]} 包裹、
 // Markdown 代码块（```json ... ```）、以及前后夹杂说明文字的 JSON。
 func parseInsightCandidates(raw string) ([]pendingInsight, error) {
-	candidates := extractInsightJSON(raw)
-	if candidates == "" {
+	values := extractInsightJSONValues(raw)
+	if len(values) == 0 {
 		return nil, errors.New("analysis returned empty output")
 	}
-	// 尝试裸数组。
-	var asSlice []pendingInsight
-	if err := json.Unmarshal([]byte(candidates), &asSlice); err == nil {
-		return asSlice, nil
-	}
-	// 尝试对象包裹 { "findings": [...] }。
-	var asObj struct {
-		Findings []pendingInsight `json:"findings"`
-	}
-	if err := json.Unmarshal([]byte(candidates), &asObj); err == nil {
-		return asObj.Findings, nil
+	// Prefer the last complete value matching the result contract. This avoids
+	// losing a valid final response to an earlier incomplete example or an
+	// unrelated JSON value in the model's explanation.
+	for index := len(values) - 1; index >= 0; index-- {
+		var asSlice []pendingInsight
+		if err := json.Unmarshal([]byte(values[index]), &asSlice); err == nil {
+			return asSlice, nil
+		}
+		var wrapper map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(values[index]), &wrapper); err != nil || wrapper["findings"] == nil {
+			continue
+		}
+		var findings []pendingInsight
+		if err := json.Unmarshal(wrapper["findings"], &findings); err == nil {
+			return findings, nil
+		}
 	}
 	return nil, errors.New("analysis output is not a valid JSON array")
 }
@@ -323,62 +334,35 @@ func insightJSONFirstDelim(s string) (byte, int) {
 //   - 取最后一个完整的顶层 [/{ … ]/}（Claude 会先叙述"我要分析…"再给最终 JSON，
 //     因此最终答案通常在后部；逐个候选并校验 JSON 合法性，取最后一个合法者）。
 func extractInsightJSON(raw string) string {
-	s := stripInsightCodeFences(raw)
-	s = strings.TrimSpace(s)
-	const maxTry = 64
-	lastValid := ""
-	for try := 0; try < maxTry; try++ {
-		open, idx := insightJSONFirstDelim(s)
-		if idx < 0 {
-			break
-		}
-		closeTok := byte(']')
-		if open == '{' {
-			closeTok = '}'
-		}
-		// 括号配对，忽略字符串内括号与转义。
-		depth := 0
-		inStr := false
-		escaped := false
-		end := -1
-		for i := idx; i < len(s); i++ {
-			c := s[i]
-			if inStr {
-				if escaped {
-					escaped = false
-				} else if c == '\\' {
-					escaped = true
-				} else if c == '"' {
-					inStr = false
-				}
-				continue
-			}
-			switch c {
-			case '"':
-				inStr = true
-			case open:
-				depth++
-			case closeTok:
-				depth--
-				if depth == 0 {
-					end = i + 1
-				}
-			}
-			if end >= 0 {
-				break
-			}
-		}
-		if end < 0 {
-			break
-		}
-		candidate := s[idx:end]
-		// 校验确实是合法 JSON；若是，记录为候选，继续看是否还有更靠后的 JSON。
-		if json.Valid([]byte(candidate)) {
-			lastValid = candidate
-		}
-		s = s[end:]
+	values := extractInsightJSONValues(raw)
+	if len(values) == 0 {
+		return ""
 	}
-	return lastValid
+	return values[len(values)-1]
+}
+
+// extractInsightJSONValues returns complete top-level objects and arrays in
+// encounter order. A malformed opening bracket is skipped so a later valid
+// final response remains recoverable.
+func extractInsightJSONValues(raw string) []string {
+	s := strings.TrimSpace(stripInsightCodeFences(raw))
+	const maxTry = 128
+	values := make([]string, 0, 1)
+	for try := 0; try < maxTry; try++ {
+		_, index := insightJSONFirstDelim(s)
+		if index < 0 {
+			break
+		}
+		var candidate json.RawMessage
+		decoder := json.NewDecoder(strings.NewReader(s[index:]))
+		if err := decoder.Decode(&candidate); err != nil || !json.Valid(candidate) {
+			s = s[index+1:]
+			continue
+		}
+		values = append(values, string(candidate))
+		s = s[index+len(candidate):]
+	}
+	return values
 }
 
 // stripInsightCodeFences 去掉 Markdown 的 ``` ... ``` 代码块围栏标记。
@@ -449,6 +433,10 @@ func (s *Server) projectRuntimeProfile(ctx context.Context, project Project, age
 // 目标环境；`agentClaudeRunnerFor/codexRunnerFor` 对 remote 返回 nil，故兜底 s.runner。
 // progress 非空时把 agent 的实时工具动作（读取/搜索…）作为分析进度回调给调用方。
 func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID, prompt string, progress func(level, message string)) (string, error) {
+	return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, nil, progress)
+}
+
+func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project, agentID, prompt string, outputSchema json.RawMessage, progress func(level, message string)) (string, error) {
 	var runner AgentRunner
 	policy := "plan"
 	isSSH := strings.HasPrefix(project.Runner, "ssh-")
@@ -526,6 +514,7 @@ func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID,
 		// codex 走其自身 read_only sandbox，不设此项。
 		ReadOnlyTools:  insightReadOnlyTools(agentID),
 		PromptViaStdin: len(insightReadOnlyTools(agentID)) > 0, // 用了 --allowedTools 就需 stdin 传 prompt
+		OutputSchema:   outputSchema,
 	}, sink); err != nil {
 		// 区分"跑满单趟上限被杀"（agent 进程被终止，cmd.Wait 的报错不含 deadline
 		// 语义，这里显式看 scanCtx.Err()）与真正的运行失败，让用户拿到准确原因。
@@ -628,7 +617,13 @@ func (sink *insightLiveSink) Event(eventType string, payload json.RawMessage) {
 	}
 	sink.lastMessage = message
 	sink.lastActivity = time.Now()
-	sink.onProgress("info", "正在"+message)
+	// 避免重复加进行时前缀：部分活动文案自身已含“正在”（如 Codex 的
+	// “模型正在分析项目”），再加“正在”会拼出“正在模型正在分析项目”。
+	if strings.Contains(message, "正在") {
+		sink.onProgress("info", message)
+	} else {
+		sink.onProgress("info", "正在"+message)
+	}
 }
 
 // parseInsightToolActivity 从 runner 事件里尽力提取一条“当前在做什么”的短信息。
@@ -966,7 +961,7 @@ func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID 
 	Confirmed bool `json:"confirmed"`
 }, error) {
 	cc := func(prompt string) (string, error) {
-		return s.runReadOnlyAgent(ctx, project, agentID, prompt, progress)
+		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightVerifyOutputSchema, progress)
 	}
 	// 首轮。
 	textB, err := cc(buildVerifyPrompt(project.Path, candidates))
@@ -1333,7 +1328,7 @@ func persistInsightWrite(write func(context.Context)) {
 
 func (s *Server) runInsightReverifyBatch(ctx context.Context, project Project, agentID, repoSHA string, targets []InsightFinding, progress func(level, message string)) (map[string]insightReverifyResult, error) {
 	cc := func(prompt string) (string, error) {
-		return s.runReadOnlyAgent(ctx, project, agentID, prompt, progress)
+		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightReverifyOutputSchema, progress)
 	}
 	text, err := cc(buildInsightReverifyPrompt(project.Path, repoSHA, targets, false))
 	if err != nil {
@@ -1881,7 +1876,7 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	// parseInsightCandidates 必然失败（这正是「分析代理未返回有效结果」的真因）。
 	// 补救：用一条强约束的"只输出 JSON"修正 prompt 重试一次；仍失败才判 scan failed。
 	emit("info", "第 1 轮：通读项目代码，收集候选发现…")
-	textA, err := s.runReadOnlyAgent(ctx, project, agentID, buildInsightScanPrompt(project.Path, repoSHA, alreadySurfaced, opts), emit)
+	textA, err := s.runReadOnlyAgentWithSchema(ctx, project, agentID, buildInsightScanPrompt(project.Path, repoSHA, alreadySurfaced, opts), insightCandidatesOutputSchema, emit)
 	if err != nil {
 		log.Printf("[insights] project=%s Pass A runner error: %v", projectID, err)
 		markFailed(insightRunErrorMessage("项目分析失败", err))
@@ -1893,7 +1888,7 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 			projectID, len(textA), truncateInsightLog(textA, 300))
 		// 修正 prompt 重试一次（同项目同方向，但明确"只输出数组"。）
 		emit("warn", "首轮输出不规范，正在要求 AI 补交结果…")
-		textA, err = s.runReadOnlyAgent(ctx, project, agentID, buildInsightRepairPromptWithHistory(project.Path, repoSHA, alreadySurfaced, opts), emit)
+		textA, err = s.runReadOnlyAgentWithSchema(ctx, project, agentID, buildInsightRepairPromptWithHistory(project.Path, repoSHA, alreadySurfaced, opts), insightCandidatesOutputSchema, emit)
 		if err != nil {
 			log.Printf("[insights] project=%s Pass A retry runner error: %v", projectID, err)
 			markFailed(insightRunErrorMessage("项目分析失败", err))

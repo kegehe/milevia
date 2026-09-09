@@ -47,6 +47,13 @@ export function isWithinQuietHours(now: Date, start: string, end: string): boole
     : currentMinutes >= startMinutes || currentMinutes < endMinutes;
 }
 
+/** 需要弹 Windows 系统通知的类型：仅“任务完成 / 等待审查”这类已完成语义。
+ * 弹窗文字固定为“有任务完成”，因此只匹配完成类事件；需要处理的（action_required、
+ * needs_human 等）仍走应用内提醒，避免文字与事件含义不符。 */
+export function isWindowsNotifyType(type: string): boolean {
+  return type === "task.done" || type === "task.awaiting_review";
+}
+
 /** 需要发通知的任务/编排状态 */
 export const NOTIFIABLE_STATUSES = new Set([
   "action_required",

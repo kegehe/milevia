@@ -64,6 +64,12 @@ public static class NativeConsole {
 	}
 }
 
+func TestWindowsTerminalCommandRejectsNonWSLPath(t *testing.T) {
+	if _, err := windowsTerminalCommand(TerminalSpec{RunnerID: "wsl-local", WorkDir: `C:\project`, WSLDistro: "Ubuntu"}, "__READY__"); err == nil {
+		t.Fatal("accepted a non-WSL working directory")
+	}
+}
+
 type terminalProbeResult struct {
 	output string
 	err    error
@@ -121,8 +127,37 @@ func TestWindowsTerminalCommandUsesWSLPathAndDistro(t *testing.T) {
 	}
 }
 
-func TestWindowsTerminalCommandRejectsNonWSLPath(t *testing.T) {
-	if _, err := windowsTerminalCommand(TerminalSpec{RunnerID: "wsl-local", WorkDir: `C:\project`, WSLDistro: "Ubuntu"}, "__READY__"); err == nil {
-		t.Fatal("accepted a non-WSL working directory")
+func TestWindowsTerminalCommandBuildsPowerShell(t *testing.T) {
+	command, err := windowsTerminalCommand(TerminalSpec{Shell: "powershell"}, "__READY__")
+	if err != nil {
+		t.Fatalf("build PowerShell terminal command: %v", err)
+	}
+	if !strings.Contains(command, `WindowsPowerShell\v1.0\powershell.exe`) {
+		t.Fatalf("PowerShell command missing powershell.exe path: %q", command)
+	}
+	if !strings.Contains(command, "-NoLogo -NoExit -Command") {
+		t.Fatalf("PowerShell command missing interactive flags: %q", command)
+	}
+	if !strings.Contains(command, "chcp 65001 | Out-Null") {
+		t.Fatalf("PowerShell command missing UTF-8 codepage switch: %q", command)
+	}
+	if !strings.Contains(command, "Write-Output __READY__") {
+		t.Fatalf("PowerShell command missing ready marker: %q", command)
+	}
+}
+
+func TestWindowsTerminalCommandDefaultsToCMD(t *testing.T) {
+	command, err := windowsTerminalCommand(TerminalSpec{}, "__READY__")
+	if err != nil {
+		t.Fatalf("build default terminal command: %v", err)
+	}
+	if !strings.Contains(command, `cmd.exe`) || !strings.Contains(command, "echo __READY__") {
+		t.Fatalf("default command is not cmd.exe with ready marker: %q", command)
+	}
+}
+
+func TestWindowsTerminalCommandRejectsUnknownShell(t *testing.T) {
+	if _, err := windowsTerminalCommand(TerminalSpec{Shell: "bash"}, "__READY__"); err == nil {
+		t.Fatal("accepted an unsupported shell token")
 	}
 }

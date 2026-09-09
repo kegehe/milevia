@@ -80,7 +80,16 @@ func openWindowsBridgeTerminal(ctx context.Context, spec TerminalSpec) (Terminal
 	}
 	reader, writer := io.Pipe()
 	t := &bridgeTerminalSession{id: uuid.NewString(), projectID: spec.ProjectID, cmd: cmd, stdin: stdin, reader: reader, writer: writer, ready: make(chan error, 1), waitDone: make(chan struct{}), consumeDone: make(chan struct{})}
-	openPayload, err := json.Marshal(terminalBridgeOpen{ProtocolVersion: terminalBridgeProtocolVersion, WorkDir: workDir, Shell: "cmd.exe", Cols: spec.Cols, Rows: spec.Rows})
+	shell := spec.Shell
+	if shell == "" {
+		shell = "cmd"
+	}
+	if shell == "cmd" {
+		// 旧版 bridge 只接受 "cmd.exe"，新 bridge 两种都收。cmd 保持旧令牌以免
+		// WSL 部署里指向旧 bridge 时默认终端退化；powershell 仅新 bridge 支持。
+		shell = "cmd.exe"
+	}
+	openPayload, err := json.Marshal(terminalBridgeOpen{ProtocolVersion: terminalBridgeProtocolVersion, WorkDir: workDir, Shell: shell, Cols: spec.Cols, Rows: spec.Rows})
 	if err != nil || t.writeFrame(bridgeOpenFrame, openPayload) != nil {
 		_ = t.Close()
 		_ = cmd.Wait()

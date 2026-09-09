@@ -12,8 +12,14 @@ import (
 
 func main() {
 	config := agent.ConfigFromEnv()
-	if config.InstanceID == "" || config.CloudURL == "" || config.CloudToken == "" || config.LocalURL == "" {
-		log.Fatal("MILEVIA_INSTANCE_ID, MILEVIA_CLOUD_URL, MILEVIA_CLOUD_AGENT_TOKEN and MILEVIA_LOCAL_URL are required")
+	hasStoredCredential := false
+	if config.CredentialFile != "" {
+		if _, err := os.Stat(config.CredentialFile); err == nil {
+			hasStoredCredential = true
+		}
+	}
+	if config.CloudURL == "" || config.LocalURL == "" || (!hasStoredCredential && config.EnrollmentToken == "" && (config.InstanceID == "" || config.CloudToken == "")) {
+		log.Fatal("MILEVIA_CLOUD_URL and MILEVIA_LOCAL_URL are required; provide an enrollment token or existing agent credentials")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

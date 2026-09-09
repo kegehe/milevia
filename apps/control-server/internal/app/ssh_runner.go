@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -811,6 +813,17 @@ func (r *sshRunner) CodexVersion(ctx context.Context) string {
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "codex-cli ")
 }
 
+// codexDefaultModel 返回远端 cli_managed（无档案模型）Codex 将使用的默认模型。
+// 远端 codex 默认读 $HOME/.codex/config.toml，经 SSH 原样 cat 后按顶层 model 键解析。
+// 读取/解析失败返回空串，调用方回退到仅显示工具名。
+func (r *sshRunner) codexDefaultModel(ctx context.Context) string {
+	out, err := r.client.execCommand(ctx, `cat "$HOME/.codex/config.toml" 2>/dev/null`)
+	if err != nil {
+		return ""
+	}
+	return codexModelFromConfig(out)
+}
+
 func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) {
 	local := r.CodexVersion(ctx)
 	if local == "" {
@@ -978,6 +991,12 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 		permissionArgs = "--permission-mode default --allowedTools " + shellQuote(strings.Join(request.ReadOnlyTools, " ")) +
 			" --settings " + shellQuote(settings)
 	}
+	if len(request.OutputSchema) > 0 {
+		if !json.Valid(request.OutputSchema) {
+			return errors.New("invalid Claude output schema")
+		}
+		permissionArgs += " --json-schema " + shellQuote(string(request.OutputSchema))
+	}
 	// Explicitly resume the tracked session so one-shot SSH runs stay in the
 	// same conversation context. Mirrors claudeCLIRunner.args. 会话无关的只读分析
 	//（SkipSessionID）不带会话参数，避免 plan 模式一次性调用走"待命"分支。
@@ -1086,6 +1105,19 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 	// already points at; when the remote has none configured, run Codex with its
 	// own provider/auth (the pre-change behavior) instead of aborting the run.
 	transportArgs := ""
+	schemaSetup := ""
+	schemaPath := ""
+	schemaArg := ""
+	if len(request.OutputSchema) > 0 {
+		schema, schemaErr := codexOutputSchema(request.OutputSchema)
+		if schemaErr != nil {
+			return schemaErr
+		}
+		schemaPath = "/tmp/milevia-codex-schema-" + uuid.NewString() + ".json"
+		encoded := base64.StdEncoding.EncodeToString(schema)
+		schemaSetup = fmt.Sprintf("printf '%%s' %s | base64 -d > %s && trap 'rm -f %s' EXIT && ", shellQuote(encoded), shellQuote(schemaPath), shellQuote(schemaPath))
+		schemaArg = " --output-schema " + shellQuote(schemaPath)
+	}
 	if !request.Resume {
 		if baseURL := r.remoteCodexBaseURL(ctx); baseURL != "" {
 			transportArgs = "--disable responses_websockets -c model_provider=milevia -c model_providers.milevia.name=Milevia -c model_providers.milevia.base_url=" + shellQuote(baseURL) +
@@ -1094,15 +1126,15 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 	}
 	var cmd string
 	if request.Resume {
-		cmd = fmt.Sprintf("codex exec resume -c %s --json %s %s",
-			shellQuote(configArg), shellQuote(request.SessionID), shellQuote(request.Prompt))
+		cmd = fmt.Sprintf("codex exec resume -c %s --json%s %s %s",
+			shellQuote(configArg), schemaArg, shellQuote(request.SessionID), shellQuote(request.Prompt))
 	} else {
-		cmd = fmt.Sprintf("codex exec %s -c %s --json --skip-git-repo-check --color never -C %s --sandbox %s %s",
+		cmd = fmt.Sprintf("codex exec %s -c %s --json --skip-git-repo-check --color never -C %s --sandbox %s%s %s",
 			transportArgs,
-			shellQuote(configArg), shellQuote(request.ProjectPath), policy, shellQuote(request.Prompt))
+			shellQuote(configArg), shellQuote(request.ProjectPath), policy, schemaArg, shellQuote(request.Prompt))
 	}
 	// Run from the project directory so Codex resolves relative paths correctly.
-	fullCmd := fmt.Sprintf("cd %s && %s", shellQuote(request.ProjectPath), cmd)
+	fullCmd := fmt.Sprintf("%scd %s && %s", schemaSetup, shellQuote(request.ProjectPath), cmd)
 
 	session, err := r.client.newSession(ctx)
 	if err != nil {
@@ -1607,6 +1639,11 @@ func readClaudeJSONLines(reader io.Reader, sink AgentRunSink) error {
 			continue
 		}
 		sink.Event(envelope.Type, line)
+		if envelope.Type == "result" {
+			if text := claudeStructuredOutputText(line); text != "" {
+				sink.AssistantText(text, envelope.ParentToolUseID)
+			}
+		}
 		if envelope.Type == "system" && envelope.Subtype == "init" {
 			var init struct {
 				SessionID string `json:"session_id"`

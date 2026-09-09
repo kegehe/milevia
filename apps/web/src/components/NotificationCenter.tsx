@@ -30,10 +30,22 @@ function NotificationReadAllIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 12 3 3 5-6M11 15l2 2 7-8" /></svg>;
 }
 
+export function formatNotificationTimeAgo(dateStr: string, now: number): string {
+  const seconds = Math.floor((now - new Date(dateStr).getTime()) / 1000);
+  if (seconds < 60) return "刚刚";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  return `${days} 天前`;
+}
+
 export default function NotificationCenter() {
   const unreadCount = useUnreadCount();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
   const [notifications, setNotifications] = useState<NotificationEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -88,6 +100,14 @@ export default function NotificationCenter() {
     };
   }, [open]);
 
+  // 相对时间依赖当前时刻；仅在下拉打开期间刷新，避免关闭时持续重渲染。
+  useEffect(() => {
+    if (!open) return;
+    setNow(Date.now());
+    const intervalId = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(intervalId);
+  }, [open]);
+
   // 点击外部或 Escape 键关闭
   useEffect(() => {
     if (!open) return;
@@ -137,17 +157,6 @@ export default function NotificationCenter() {
     setOpen(false);
   };
 
-  const timeAgo = (dateStr: string) => {
-    const seconds = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
-    if (seconds < 60) return "刚刚";
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes} 分钟前`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours} 小时前`;
-    const days = Math.floor(hours / 24);
-    return `${days} 天前`;
-  };
-
   return (
     <div className="notification-center" ref={containerRef}>
       <button
@@ -195,7 +204,7 @@ export default function NotificationCenter() {
                     <div className="notification-item-content">
                       <div className="notification-item-title">{n.title}</div>
                       <div className="notification-item-body">{n.body}</div>
-                      <div className="notification-item-time">{timeAgo(n.createdAt)}</div>
+                      <div className="notification-item-time">{formatNotificationTimeAgo(n.createdAt, now)}</div>
                       <div className="notification-item-actions">
                         <button
                           className="notification-item-view"

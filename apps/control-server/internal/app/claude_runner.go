@@ -52,6 +52,22 @@ type CodexCapableRunner interface {
 	CodexUpdate(context.Context) (previousVersion, currentVersion string, err error)
 }
 
+// autoUpdateSupportedRunner 是可选接口：报告该 runner 是否支持"应用内自动升级"。
+// 未实现此接口的 runner 视为支持（默认 true）。跨端 runner（Windows→WSL 的
+// wslAgentRunner、WSL→Windows 的 windowsAgentRunner）暂不支持应用内自动升级，
+// 实现并返回 false，使 check-update 能如实区分"可自动更新"与"有新版本但需到目标
+// 环境手动更新"——否则前端会把"无法自动升级"误渲染成"已是最新版本"。
+type autoUpdateSupportedRunner interface {
+	AutoUpdateSupported() bool
+}
+
+// codexAutoUpdateSupportedRunner 是 Codex 侧的对称可选接口（见 autoUpdateSupportedRunner）。
+// CodexCapableRunner 的包装 codexRunnerAdapter 据此把内层 runner 的 Codex 自动升级能力
+// 透出给 check-update 流程。
+type codexAutoUpdateSupportedRunner interface {
+	CodexAutoUpdateSupported() bool
+}
+
 type AgentSessionRequest struct {
 	SessionID      string
 	ProjectPath    string
@@ -104,6 +120,9 @@ type AgentRunRequest struct {
 	// claude 在同时使用 --allowedTools 时要求 --print 的输入必须经 stdin 提供，
 	// 传 argv 会报 "Input must be provided ... as a prompt argument" 而退出码 1。
 	PromptViaStdin bool
+	// OutputSchema constrains one-shot machine-consumed responses when the CLI
+	// supports JSON Schema output. Ordinary conversations leave it empty.
+	OutputSchema json.RawMessage
 }
 
 type AgentRunSink interface {
@@ -265,6 +284,26 @@ func (r *claudeCLIRunner) CheckUpdate(parent context.Context) (bool, string, err
 	}
 	latest := strings.TrimSpace(string(out))
 	return latest != local, latest, nil
+}
+
+// latestNpmPackageVersion 查询 npm registry 上指定包的最新版本号。
+// 跨端 runner（wsl/windows 对侧）的更新检查复用本查询：npm registry 的版本号跨平台
+// 唯一，与"目标环境用哪一端 npm"无关，因此在本机（control-server 所在侧）执行即可，
+// 无需再跨界拉起一次 npm。查询失败或返回空串时如实返回错误。
+func latestNpmPackageVersion(parent context.Context, packageName string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "npm", "view", packageName, "version")
+	configureProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("query latest %s version: %w", packageName, err)
+	}
+	latest := strings.TrimSpace(string(out))
+	if latest == "" {
+		return "", fmt.Errorf("latest %s version is empty", packageName)
+	}
+	return latest, nil
 }
 
 func (r *claudeCLIRunner) Update(parent context.Context) (string, string, error) {
@@ -624,6 +663,12 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	if request.Profile != nil && request.Profile.Model != "" {
 		args = append(args, "--model", request.Profile.Model)
 	}
+	if len(request.OutputSchema) > 0 {
+		if !json.Valid(request.OutputSchema) {
+			return nil, errors.New("invalid Claude output schema")
+		}
+		args = append(args, "--json-schema", string(request.OutputSchema))
+	}
 	// PromptViaStdin 时 prompt 走 stdin（ReadOnlyTools 需如此），不追加为 argv。
 	if !request.PromptViaStdin {
 		args = append(args, request.Prompt)
@@ -707,6 +752,11 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 			continue
 		}
 		sink.Event(envelope.Type, line)
+		if envelope.Type == "result" {
+			if text := claudeStructuredOutputText(line); text != "" {
+				sink.AssistantText(text, envelope.ParentToolUseID)
+			}
+		}
 		if envelope.Type == "system" && envelope.Subtype == "init" {
 			var init struct {
 				SessionID string `json:"session_id"`
@@ -731,6 +781,19 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": text}))
 		}
 	}
+}
+
+// claudeStructuredOutputText extracts the machine-readable response emitted by
+// Claude when --json-schema is enabled. It is carried on the terminal result
+// event rather than assistant.message.content.
+func claudeStructuredOutputText(payload json.RawMessage) string {
+	var result struct {
+		StructuredOutput json.RawMessage `json:"structured_output"`
+	}
+	if json.Unmarshal(payload, &result) != nil || len(result.StructuredOutput) == 0 || string(result.StructuredOutput) == "null" {
+		return ""
+	}
+	return string(result.StructuredOutput)
 }
 
 // parseContentParts extracts text content from a message content field that

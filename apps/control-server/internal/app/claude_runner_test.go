@@ -60,6 +60,26 @@ func TestIndependentReviewClaudeRequestUsesExecutableReadOnlyMode(t *testing.T) 
 	}
 }
 
+func TestClaudeArgsPassesStructuredOutputSchema(t *testing.T) {
+	runner := &claudeCLIRunner{}
+	schema := json.RawMessage(`{"type":"array","items":{"type":"string"}}`)
+	args, err := runner.args(AgentRunRequest{
+		Prompt:         "return json",
+		PermissionMode: "read_only",
+		SkipSessionID:  true,
+		OutputSchema:   schema,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsArguments(args, "--json-schema", string(schema)) {
+		t.Fatalf("structured output schema missing from args: %q", args)
+	}
+	if _, err := runner.args(AgentRunRequest{Prompt: "return json", PermissionMode: "read_only", SkipSessionID: true, OutputSchema: json.RawMessage(`{`)}); err == nil {
+		t.Fatal("invalid output schema should fail before Claude starts")
+	}
+}
+
 func TestClaudeOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
 	const secret = "sk-claude-test-secret-value-12345"
 	runner := &claudeCLIRunner{}
@@ -78,6 +98,15 @@ func TestClaudeOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
 	}
 	if len(sink.texts) != 1 || !strings.Contains(sink.texts[0], "[REDACTED]") {
 		t.Fatalf("assistant text was not redacted: %#v", sink.texts)
+	}
+}
+
+func TestClaudeReadOutputEmitsStructuredResult(t *testing.T) {
+	runner := &claudeCLIRunner{}
+	sink := &claudeOutputTestSink{}
+	runner.readOutput(strings.NewReader(`{"type":"result","subtype":"success","is_error":false,"structured_output":{"findings":[]}}`+"\n"), sink)
+	if len(sink.texts) != 1 || sink.texts[0] != `{"findings":[]}` {
+		t.Fatalf("structured result was not forwarded as assistant text: %#v", sink.texts)
 	}
 }
 

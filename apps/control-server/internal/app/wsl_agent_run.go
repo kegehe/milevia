@@ -279,7 +279,17 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 		return err
 	}
 	args := []string{"exec"}
-	profileArgs, environment, closeProfile, err := r.codex.profileLaunch(ctx, request.Profile)
+	var schemaPath string
+	if len(request.OutputSchema) > 0 {
+		path, cleanup, err := writeCodexOutputSchema(request.OutputSchema)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		schemaPath = windowsToWSLMntPath(path)
+		args = append(args, "--output-schema", schemaPath)
+	}
+	profileArgs, environment, closeProfile, err := r.codex.profileLaunchWithSkills(ctx, request.Profile, r.codexSkillsRoot)
 	if err != nil {
 		return err
 	}

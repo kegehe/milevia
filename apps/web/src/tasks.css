@@ -164,7 +164,7 @@
 .task-dispatch-heading > div { display: grid; min-width: 0; gap: 2px; }
 .task-dispatch-heading h2 { margin: 0; color: #1d4a3e; font-size: 17px; font-weight: 820; line-height: 1.25; }
 .task-dispatch-heading p { margin: 0; color: #7a9188; font-size: 11px; line-height: 1.4; }
-.task-dispatch-close { display: grid; width: 30px; height: 30px; min-width: 30px; box-sizing: border-box; flex: none; place-items: center; border: 1px solid #d0e1d8; border-radius: 6px; padding: 0; color: #668176; background: #fcfefc; line-height: 1; transition: border-color .16s ease, color .16s ease, background .16s ease; }.task-dispatch-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }.task-dispatch-close:disabled { opacity: .6; cursor: default; }
+.task-dispatch-dialog > header .task-dispatch-close { display: grid; width: 30px; height: 30px; min-width: 30px; box-sizing: border-box; flex: none; place-items: center; border: 1px solid #d0e1d8; border-radius: 6px; padding: 0; color: #668176; background: #fcfefc; line-height: 1; transition: border-color .16s ease, color .16s ease, background .16s ease; }.task-dispatch-dialog > header .task-dispatch-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }.task-dispatch-dialog > header .task-dispatch-close:disabled { opacity: .6; cursor: default; }
 .task-dispatch-close-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .task-dispatch-body { display: grid; gap: 15px; padding: 18px; }
 .task-dispatch-title { display: grid; gap: 7px; }
@@ -199,6 +199,7 @@
 .task-inline-run small { color: #879b91; }
 .task-inline-loading { margin: 0; color: #73887e; font-size: 12px; text-align: center; }
 .task-inline-detail-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 12px; border-top: 1px solid #dce9e1; padding-top: 11px; }
+.task-inline-detail-actions-compact { flex-wrap: nowrap; }
 .task-inline-detail-actions .primary, .task-inline-detail-actions .secondary, .task-inline-detail-actions .danger-text { border-radius: 4px; padding: 6px 11px; font-size: 11px; font-weight: 700; }
 .task-inline-detail-actions .primary { border: 1px solid #2c7567; color: #f8fdf9; background: #2c7567; }
 .task-inline-detail-actions .primary:hover:not(:disabled) { border-color: #1b5548; background: #1b5548; }
@@ -207,7 +208,6 @@
 .task-inline-detail-actions .secondary:hover:not(:disabled) { border-color: #4f9a8a; background: #dff1e6; }
 .task-inline-detail-actions .danger-text { border: 0; padding: 6px 3px; color: #ae4d39; background: transparent; }
 .task-inline-detail-actions .danger-text:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 3px; }
-.task-inline-actions-sep { width: 1px; height: 22px; flex: none; margin: 0 3px; background: #d2e3da; }
 .task-inline-review-reject { display: grid; width: 100%; gap: 6px; margin-top: 2px; border-left: 3px solid #75ad8f; padding-left: 9px; }
 .task-inline-review-reject textarea { width: 100%; min-height: 54px; max-height: 150px; box-sizing: border-box; resize: vertical; border: 1px solid #ccd5d9; border-radius: 5px; padding: 7px 9px; color: #19332c; background: #fff; font: inherit; font-size: 11px; line-height: 1.45; overflow-y: auto; }
 .task-inline-review-reject textarea:focus { border-color: #55a697; outline: 2px solid #cfede3; }
@@ -625,6 +625,11 @@
   box-shadow: 0 5px 14px #17362c10;
   transform: translateY(-1px);
 }
+.task-queue-row:has(.task-inline-detail) {
+  position: relative;
+  z-index: 2;
+  transform: none;
+}
 .task-queue-row.dragging { opacity: .4; box-shadow: none; transform: none; }
 .task-queue-row.drag-over-before { box-shadow: inset 0 2px 0 #55a697; }
 .task-queue-row.drag-over-after { box-shadow: inset 0 -2px 0 #55a697; }
@@ -780,4 +785,73 @@
 }
 @media (max-width: 520px) {
   .task-hover-card { width: calc(100vw - 24px); left: 12px !important; }
+}
+
+/* ---- 任务队列模块折叠按钮 ------------------------------------------------ */
+/* 折叠/展开控制只在宽屏栏内显示（中等宽度靠抽屉按钮，无需模块折叠箭头）。 */
+.task-queue-fold {
+  display: none;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 1px solid #d0e2d8;
+  border-radius: 6px;
+  padding: 0;
+  color: #416b5e;
+  background: #fbfefb;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease, transform .16s ease;
+}
+.task-queue-fold:hover:not(:disabled) { border-color: #8fbca9; color: #1f5d4e; background: #eaf6ee; }
+.task-queue-fold:disabled { opacity: .5; cursor: not-allowed; }
+.task-queue-fold-icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform .16s ease;
+}
+/* 展开态箭头朝上（点击收起）；折叠后翻转朝下（点击展开）。 */
+.task-queue-rail[data-collapsed="true"] .task-queue-fold-icon { transform: rotate(180deg); }
+
+@media (min-width: 1200px) {
+  .task-queue-fold { display: grid; }
+  .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle {
+    display: inline-flex;
+    width: 100%;
+    min-height: 38px;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-sizing: border-box;
+    border: 1px solid #cfe0d6;
+    border-radius: 7px;
+    padding: 8px 6px;
+    color: #315e50;
+    background: #f8fcf9;
+    font-size: 12px;
+    font-weight: 800;
+    white-space: nowrap;
+    box-shadow: 0 3px 10px #17362c12;
+    transition: border-color .16s ease, color .16s ease, background .16s ease;
+  }
+  .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle:hover { border-color: #8fbca9; color: #1f5d4e; background: #eaf6ee; }
+}
+
+/* 折叠态窄条内数量徽标：按钮里只有「任务 N」，保持与头部一致的圆形计数。 */
+@media (min-width: 1200px) {
+  .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle b {
+    display: grid;
+    min-width: 19px;
+    height: 19px;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    color: #2c7567;
+    background: #dff0e5;
+    font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
 }

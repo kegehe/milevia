@@ -1,6 +1,7 @@
 package cloud
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,11 +23,49 @@ func TestAgentAuthIsInstanceScoped(t *testing.T) {
 	s := &Server{config: Config{AgentTokens: map[string]string{"pc-a": "token-a", "pc-b": "token-b"}}}
 	req := httptest.NewRequest("GET", "/v1/agent/connect?instanceId=pc-a", nil)
 	req.Header.Set("X-Milevia-Agent-Token", "token-a")
-	if !s.agentAuth(req, "pc-a") {
-		t.Fatal("matching instance token was rejected")
+	if ok, err := s.agentAuth(req, "pc-a"); !ok || err != nil {
+		t.Fatalf("matching instance token was rejected: ok=%v err=%v", ok, err)
 	}
-	if s.agentAuth(req, "pc-b") {
-		t.Fatal("token for pc-a authenticated pc-b")
+	if ok, err := s.agentAuth(req, "pc-b"); ok || err != nil {
+		t.Fatalf("token for pc-a authenticated pc-b: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestAgentAuthDeniedDistinguishesDatabaseFailure ensures a DB lookup error
+// (transient availability/connection issue) is not reported as a 401, which the
+// Agent would interpret as credential revocation and re-enroll on. It must be a
+// 503 so the Agent simply backs off without discarding its stored secret.
+func TestAgentAuthDeniedDistinguishesDatabaseFailure(t *testing.T) {
+	if !agentAuthDenied(httptest.NewRecorder(), false, nil) {
+		t.Fatal("genuine rejection was not treated as a failure")
+	}
+	// The caller must produce 401 for ok=false with nil error, and 503 for a
+	// DB error. Verify the dispatch by driving each through a recorder.
+	for _, test := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "invalid credentials -> 401", err: nil, want: http.StatusUnauthorized},
+		{name: "db unavailable -> 503", err: errors.New("connection refused"), want: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if !agentAuthDenied(rec, false, test.err) {
+				t.Fatalf("denied reported no failure for %q", test.name)
+			}
+			if rec.Code != test.want {
+				t.Fatalf("%q status = %d, want %d", test.name, rec.Code, test.want)
+			}
+		})
+	}
+	// ok=true is not a denial and writes nothing.
+	rec := httptest.NewRecorder()
+	if agentAuthDenied(rec, true, errors.New("unused")) {
+		t.Fatal("authenticated request was treated as denied")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated request wrote a status: %d", rec.Code)
 	}
 }
 

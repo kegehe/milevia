@@ -42,9 +42,12 @@ struct RunningSidecar {
     child: Child,
     api_base: String,
     session_token: String,
+    local_agent_token: String,
 }
 
 struct ManagedSidecar(Mutex<Option<RunningSidecar>>);
+
+struct ManagedAgent(Mutex<Option<Child>>);
 
 /// 记住最近一次托盘点击的鼠标位置（物理像素），供面板内容加载后按实际高度重新贴齐。
 struct TrayAnchor(Mutex<Option<PhysicalPosition<f64>>>);
@@ -61,7 +64,10 @@ struct UpdateInfo {
     notes: Option<String>,
 }
 
-const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
+// GitHub release assets can be slow on some networks. Keep a generous total
+// limit, while still guaranteeing that a stalled download eventually fails.
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +85,7 @@ struct UpdateCheck {
 struct UpdateCheckState {
     info: UpdateInfoRepr,
     generation: u64,
+    installing: bool,
 }
 
 async fn perform_update_check(app: &tauri::AppHandle) -> UpdateInfoRepr {
@@ -96,7 +103,7 @@ async fn perform_update_check(app: &tauri::AppHandle) -> UpdateInfoRepr {
     let result = async {
         let updater = app
             .updater_builder()
-            .timeout(UPDATE_REQUEST_TIMEOUT)
+            .timeout(UPDATE_CHECK_TIMEOUT)
             .build()
             .map_err(|error| error.to_string())?;
         let update = updater.check().await.map_err(|error| error.to_string())?;
@@ -161,12 +168,57 @@ struct InstallUpdateResult {
 
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<InstallUpdateResult, String> {
+    {
+        let update_check = app.state::<UpdateCheck>();
+        let mut state = update_check
+            .state
+            .lock()
+            .map_err(|_| "更新状态锁不可用".to_string())?;
+        if state.installing {
+            return Err("已有更新正在进行，请等待当前操作结束".to_string());
+        }
+        state.installing = true;
+    }
+
+    let result = install_update_inner(&app).await;
+    if let Ok(mut state) = app.state::<UpdateCheck>().state.lock() {
+        state.installing = false;
+    }
+    match result {
+        Ok(installed) => Ok(installed),
+        Err(error) => {
+            let _ = app.emit(
+                "updater://progress",
+                serde_json::json!({
+                    "phase": "failed",
+                    "received": 0,
+                    "total": null,
+                    "error": error,
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateResult, String> {
     let updater = app
         .updater_builder()
-        .timeout(UPDATE_REQUEST_TIMEOUT)
+        // The updater client's timeout also applies to the asset download.
+        // Keep it generous for large packages on slow networks; the check
+        // itself is bounded separately below.
+        .timeout(UPDATE_DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|error| error.to_string())?;
-    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+    let _ = app.emit(
+        "updater://progress",
+        serde_json::json!({ "phase": "checking", "received": 0, "total": null }),
+    );
+    let update = tokio::time::timeout(UPDATE_CHECK_TIMEOUT, updater.check())
+        .await
+        .map_err(|_| "检查更新超过 45 秒仍未完成，请检查网络后重试".to_string())?
+        .map_err(|error| error.to_string())?;
+    let Some(update) = update else {
         let update_check = app.state::<UpdateCheck>();
         if let Ok(mut state) = update_check.state.lock() {
             state.generation = state.generation.wrapping_add(1);
@@ -176,18 +228,38 @@ async fn install_update(app: tauri::AppHandle) -> Result<InstallUpdateResult, St
         }
         return Ok(InstallUpdateResult { installed: false });
     };
-    update
-        .download_and_install(
+    let _ = app.emit(
+        "updater://progress",
+        serde_json::json!({ "phase": "starting", "received": 0, "total": null }),
+    );
+    let download = tokio::time::timeout(
+        UPDATE_DOWNLOAD_TIMEOUT,
+        update.download_and_install(
             |received, total| {
                 let _ = app.emit(
                     "updater://progress",
-                    serde_json::json!({ "received": received, "total": total }),
+                    serde_json::json!({ "phase": "downloading", "received": received, "total": total }),
                 );
             },
-            || {},
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+            || {
+                let _ = app.emit(
+                    "updater://progress",
+                    serde_json::json!({ "phase": "installing", "received": 0, "total": null }),
+                );
+            },
+        ),
+    )
+    .await;
+    match download {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error.to_string()),
+        Err(_) => {
+            return Err(format!(
+                "更新下载超过 {} 分钟仍未完成，请检查网络后重试",
+                UPDATE_DOWNLOAD_TIMEOUT.as_secs() / 60
+            ));
+        }
+    }
     app.restart();
     #[allow(unreachable_code)]
     Ok(InstallUpdateResult { installed: true })
@@ -229,6 +301,213 @@ fn approval_binary(_app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
     }
     #[cfg(not(debug_assertions))]
     Ok(_app.path().resource_dir()?.join("milevia-approval.exe"))
+}
+
+fn agent_binary(_app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
+    if let Ok(path) = env::var("MILEVIA_AGENT_BINARY") {
+        return Ok(PathBuf::from(path));
+    }
+    #[cfg(debug_assertions)]
+    {
+        return Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("binaries")
+            .join("milevia-agent.exe"));
+    }
+    #[cfg(not(debug_assertions))]
+    Ok(_app.path().resource_dir()?.join("milevia-agent.exe"))
+}
+
+fn agent_config_path(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn Error>> {
+    let data_dir = app.path().app_local_data_dir()?;
+    let local = data_dir.join("milevia-agent.env");
+    if local.exists() {
+        return Ok(local);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("agent")
+            .join(".env.windows");
+        if source.exists() {
+            return Ok(source);
+        }
+    }
+    let bundled = app.path().resource_dir()?.join("milevia-agent.env");
+    Ok(bundled)
+}
+
+fn load_agent_env(
+    command: &mut Command,
+    config_path: &PathBuf,
+    endpoint_path: &PathBuf,
+    local_agent_token: &str,
+    enrollment_token: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let contents = std::fs::read_to_string(config_path)?;
+    let mut required = std::collections::HashSet::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if matches!(
+            key,
+            "MILEVIA_INSTANCE_ID"
+                | "MILEVIA_CLOUD_URL"
+                | "MILEVIA_CLOUD_AGENT_TOKEN"
+                | "MILEVIA_LOCAL_URL"
+        ) {
+            command.env(key, value.trim());
+            if matches!(
+                key,
+                "MILEVIA_INSTANCE_ID" | "MILEVIA_CLOUD_URL" | "MILEVIA_CLOUD_AGENT_TOKEN"
+            ) && !value.trim().is_empty()
+            {
+                required.insert(key);
+            }
+        }
+    }
+    if !required.contains("MILEVIA_CLOUD_URL")
+        && env::var("MILEVIA_CLOUD_URL")
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    {
+        return Err("agent configuration is missing MILEVIA_CLOUD_URL".into());
+    }
+    let credential_path = endpoint_path
+        .parent()
+        .unwrap_or(endpoint_path)
+        .join("agent-credentials.bin");
+    let has_existing_credentials = (required.contains("MILEVIA_INSTANCE_ID")
+        || env::var("MILEVIA_INSTANCE_ID")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false))
+        && (required.contains("MILEVIA_CLOUD_AGENT_TOKEN")
+            || env::var("MILEVIA_CLOUD_AGENT_TOKEN")
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false));
+    let has_enrollment_token = enrollment_token
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || env::var("MILEVIA_AGENT_ENROLLMENT_TOKEN")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    if !has_existing_credentials && !credential_path.exists() && !has_enrollment_token {
+        return Err(
+            "Agent 尚未注册。请由管理员仅为本次启动提供 MILEVIA_AGENT_ENROLLMENT_TOKEN，注册成功后该令牌不再需要"
+                .into(),
+        );
+    }
+    command.env("MILEVIA_LOCAL_URL_FILE", endpoint_path);
+    command.env("MILEVIA_AGENT_CREDENTIAL_FILE", credential_path);
+    // 此令牌仅在本次桌面进程生命周期内存在；必须同时传给 sidecar 与 Agent。
+    // 它绝不写入配置、日志或安装包资源。
+    command.env("AUTO_REMOTE_AGENT_TOKEN", local_agent_token);
+    if let Some(token) = enrollment_token.filter(|token| !token.trim().is_empty()) {
+        // 仅注入这个新建 Agent 子进程；不得写入磁盘或继承到 sidecar。
+        command.env("MILEVIA_AGENT_ENROLLMENT_TOKEN", token.trim());
+    }
+    Ok(())
+}
+
+fn start_agent(
+    app: &tauri::AppHandle,
+    local_agent_token: &str,
+    enrollment_token: Option<&str>,
+) -> Result<Option<Child>, Box<dyn Error>> {
+    let binary = agent_binary(app)?;
+    if !binary.exists() {
+        return Err(format!("Agent binary not found: {}", binary.display()).into());
+    }
+    let config = agent_config_path(app)?;
+    if !config.exists() {
+        return Err(format!("Agent configuration not found: {}", config.display()).into());
+    }
+    let data_dir = app.path().app_local_data_dir()?;
+    let endpoint = data_dir.join("milevia.endpoint");
+    let agent_log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("milevia-agent.log"))?;
+    let agent_error_log = agent_log.try_clone()?;
+    let mut command = Command::new(binary);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(agent_log))
+        .stderr(Stdio::from(agent_error_log));
+    load_agent_env(
+        &mut command,
+        &config,
+        &endpoint,
+        local_agent_token,
+        enrollment_token,
+    )?;
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    match command.spawn() {
+        Ok(child) => Ok(Some(child)),
+        Err(error) => Err(format!("failed to start Agent: {error}").into()),
+    }
+}
+
+/// 启动一次首次注册。令牌只进入本次 Agent 子进程环境；注册成功后 Agent 会把
+/// 机器凭据存为 DPAPI 加密文件，令牌不会落盘，也不会包含在后续启动环境中。
+#[tauri::command]
+fn enroll_remote_agent(app: tauri::AppHandle, enrollment_token: String) -> Result<(), String> {
+    let token = enrollment_token.trim();
+    if token.is_empty() || token.len() > 4096 {
+        return Err("请输入有效的管理员注册令牌".into());
+    }
+    stop_agent(&app);
+    let local_agent_token = app
+        .state::<ManagedSidecar>()
+        .0
+        .lock()
+        .map_err(|_| "无法读取桌面服务状态")?
+        .as_ref()
+        .map(|sidecar| sidecar.local_agent_token.clone())
+        .ok_or("本地控制服务尚未启动")?;
+    let agent =
+        start_agent(&app, &local_agent_token, Some(token)).map_err(|error| error.to_string())?;
+    *app.state::<ManagedAgent>()
+        .0
+        .lock()
+        .map_err(|_| "无法保存 Agent 进程状态")? = agent;
+    Ok(())
+}
+
+fn stop_agent(app: &tauri::AppHandle) {
+    let state = app.state::<ManagedAgent>();
+    let Ok(mut guard) = state.0.lock() else {
+        return;
+    };
+    let Some(mut child) = guard.take() else {
+        return;
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn log_agent_startup_error(app: &tauri::AppHandle, error: &dyn Error) {
+    let Ok(data_dir) = app.path().app_local_data_dir() else {
+        eprintln!("[agent] startup configuration failed: {error}");
+        return;
+    };
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("milevia-agent.log"))
+    {
+        let _ = writeln!(log, "[desktop] Agent startup configuration failed: {error}");
+    }
+    eprintln!("[agent] startup configuration failed: {error}");
 }
 
 fn page_origin() -> &'static str {
@@ -426,7 +705,10 @@ fn apply_debug_remote_env(command: &mut Command) {
     }
 }
 
-fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error>> {
+fn start_sidecar(
+    app: &tauri::AppHandle,
+    local_agent_token: &str,
+) -> Result<RunningSidecar, Box<dyn Error>> {
     let data_dir = app.path().app_local_data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
     let data_dir_arg = data_dir.to_string_lossy().to_string();
@@ -477,6 +759,11 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
         .stderr(Stdio::piped())
         // 隐藏 sidecar 控制台窗口（见 CREATE_NO_WINDOW）。
         .creation_flags(CREATE_NO_WINDOW);
+    // 与 Agent 共享的进程内随机令牌；桌面模式不允许 loopback 无令牌回退。
+    command.env("AUTO_REMOTE_AGENT_TOKEN", local_agent_token);
+    // 首次注册令牌只属于 Agent；即使桌面宿主由带该环境变量的管理员命令启动，
+    // 也不能让 sidecar 继承它。
+    command.env_remove("MILEVIA_AGENT_ENROLLMENT_TOKEN");
     apply_debug_remote_env(&mut command);
     let endpoint_path = data_dir.join("milevia.endpoint");
     let previous_endpoint_modified = std::fs::metadata(&endpoint_path)
@@ -504,6 +791,7 @@ fn start_sidecar(app: &tauri::AppHandle) -> Result<RunningSidecar, Box<dyn Error
                 child,
                 api_base,
                 session_token,
+                local_agent_token: local_agent_token.to_owned(),
             };
             if let Err(error) = wait_for_health(&sidecar) {
                 let mut sidecar = sidecar;
@@ -809,6 +1097,46 @@ fn navigate_main(app: tauri::AppHandle, path: String) {
     }
 }
 
+/// 在 Windows 系统右下角弹一条系统通知。前端只在用户开启“Windows 弹窗通知”
+/// 且收到任务完成类通知时调用。
+///
+/// - 内容刻意不包含具体项目/任务名，统一显示“有任务完成”，避免在通知中心泄露细节。
+/// - `Duration::Short` 让系统按短时展示（会在一段时间后自动消失）。
+/// - 用户点击弹窗时（前台激活）调用回调：`on_activated` 闭包直接捕获本次 `path`，
+///   因此**每条弹窗点击都只跳到它对应的那条任务的项目**（无需中心的共享状态，
+///   也不存在多条弹窗互相覆盖导航目标的问题）。跳转复用托盘“跳转主窗口”同款实现。
+#[tauri::command]
+fn show_system_notification(app: tauri::AppHandle, path: String) {
+    let app_id = app.config().identifier.clone();
+    let callback_app = app.clone();
+    // 把本条弹窗自己的导航目标放进闭包，随 Toast 一起保存（每条调用独享一份）。
+    let target = path.clone();
+    let result = tauri_winrt_notification::Toast::new(app_id.as_str())
+        .title("Milevia")
+        .text1("有任务完成")
+        .duration(tauri_winrt_notification::Duration::Short)
+        .on_activated(move |_args| {
+            // WebView 必须在主线程操作，跳到该条弹窗对应的项目。
+            let app = callback_app.clone();
+            let target = target.clone();
+            let _ = callback_app.run_on_main_thread(move || {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                    let _ = window.eval(&format!(
+                        "window.__mileviaNavigate && window.__mileviaNavigate({target:?})"
+                    ));
+                }
+            });
+            Ok(())
+        })
+        .show();
+    if let Err(error) = result {
+        eprintln!("[notification] 显示系统通知失败: {error}");
+    }
+}
+
 /// 真正退出应用（触发 ExitRequested → 优雅停掉 sidecar）。
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
@@ -881,12 +1209,15 @@ fn main() {
             quit_app,
             set_panel_size,
             navigate_main,
+            show_system_notification,
+            enroll_remote_agent,
             get_updater_status,
             check_for_update_now,
             install_update
         ])
         .setup(|app| {
             app.manage(ManagedSidecar(Mutex::new(None)));
+            app.manage(ManagedAgent(Mutex::new(None)));
             app.manage(TrayAnchor(Mutex::new(None)));
             app.manage(UpdateCheck {
                 state: Mutex::new(UpdateCheckState {
@@ -897,9 +1228,12 @@ fn main() {
                         error: None,
                     },
                     generation: 0,
+                    installing: false,
                 }),
             });
-            let sidecar = start_sidecar(&app.handle()).map_err(|error| error.to_string())?;
+            let local_agent_token = Uuid::new_v4().simple().to_string();
+            let sidecar = start_sidecar(&app.handle(), &local_agent_token)
+                .map_err(|error| error.to_string())?;
             if let Err(error) = create_main_window(&app.handle(), &sidecar) {
                 let mut sidecar = sidecar;
                 stop_running_sidecar(&mut sidecar);
@@ -912,7 +1246,17 @@ fn main() {
                 .0
                 .lock()
                 .expect("sidecar state lock") = Some(sidecar);
+            match start_agent(&app.handle(), &local_agent_token, None) {
+                Ok(agent) => {
+                    *app.state::<ManagedAgent>()
+                        .0
+                        .lock()
+                        .expect("agent state lock") = agent;
+                }
+                Err(error) => log_agent_startup_error(&app.handle(), error.as_ref()),
+            }
             if let Err(error) = configure_tray(app) {
+                stop_agent(&app.handle());
                 stop_sidecar(&app.handle());
                 return Err(error.into());
             }
@@ -930,6 +1274,7 @@ fn main() {
         .expect("failed to build Milevia desktop host");
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { .. } = event {
+            stop_agent(app_handle);
             stop_sidecar(app_handle);
         }
     });

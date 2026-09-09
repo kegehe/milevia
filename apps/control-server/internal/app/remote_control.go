@@ -197,6 +197,13 @@ func (s *Server) remoteAgentOnly(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// 桌面宿主会为 sidecar 与 Agent 注入同一随机进程令牌。绝不能在
+		// desktop-api 模式降级为“任意 loopback 进程均可信”，否则本机其他
+		// 程序可篡改远程凭据或伪造 Agent 同步。
+		if s.config.Mode == "desktop-api" {
+			writeError(w, http.StatusUnauthorized, errors.New("remote agent token is not configured"))
+			return
+		}
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			host = r.RemoteAddr
@@ -228,22 +235,76 @@ func (s *Server) updateRemoteStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": input.Status})
 }
 
-func (s *Server) createRemotePairing(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimSpace(s.config.RemoteCloudURL) == "" || strings.TrimSpace(s.config.RemoteCloudToken) == "" {
-		writeError(w, http.StatusServiceUnavailable, errors.New("remote cloud pairing is not configured"))
+// updateRemoteCredentials receives the Agent's per-installation cloud
+// credential over the authenticated loopback channel. The token remains in
+// process memory; the Agent keeps the durable, DPAPI-protected copy.
+func (s *Server) updateRemoteCredentials(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		CloudURL   string `json:"cloudUrl"`
+		InstanceID string `json:"instanceId"`
+		AgentToken string `json:"agentToken"`
+	}
+	if !decode(w, r, &input) {
 		return
 	}
-	var instanceID string
-	if err := s.db.QueryRowContext(r.Context(), `select instance_id from remote_instance limit 1`).Scan(&instanceID); err != nil {
+	input.CloudURL = strings.TrimRight(strings.TrimSpace(input.CloudURL), "/")
+	input.InstanceID = strings.TrimSpace(input.InstanceID)
+	input.AgentToken = strings.TrimSpace(input.AgentToken)
+	if input.CloudURL == "" || input.InstanceID == "" || input.AgentToken == "" {
+		writeError(w, http.StatusBadRequest, errors.New("cloudUrl, instanceId and agentToken are required"))
+		return
+	}
+	parsed, err := url.Parse(input.CloudURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		writeError(w, http.StatusBadRequest, errors.New("cloudUrl must be an absolute HTTP(S) URL"))
+		return
+	}
+	if _, err := s.db.ExecContext(r.Context(), `update remote_instance set instance_id=?,updated_at=?`, input.InstanceID, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.config.RemoteCloudURL+"/v1/agent/pairings", nil)
+	s.remoteCredentialMu.Lock()
+	s.remoteCloudURL = input.CloudURL
+	s.remoteCloudToken = input.AgentToken
+	s.remoteInstanceID = input.InstanceID
+	s.remoteCredentialMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "configured", "instanceId": input.InstanceID})
+}
+
+func (s *Server) remoteCloudCredentials() (cloudURL, cloudToken, instanceID string) {
+	s.remoteCredentialMu.RLock()
+	cloudURL, cloudToken, instanceID = s.remoteCloudURL, s.remoteCloudToken, s.remoteInstanceID
+	s.remoteCredentialMu.RUnlock()
+	if cloudURL == "" {
+		cloudURL = strings.TrimRight(s.config.RemoteCloudURL, "/")
+	}
+	if cloudToken == "" {
+		cloudToken = s.config.RemoteCloudToken
+	}
+	if instanceID == "" {
+		instanceID = s.config.RemoteInstanceID
+	}
+	return strings.TrimRight(strings.TrimSpace(cloudURL), "/"), strings.TrimSpace(cloudToken), strings.TrimSpace(instanceID)
+}
+
+func (s *Server) createRemotePairing(w http.ResponseWriter, r *http.Request) {
+	cloudURL, cloudToken, instanceID := s.remoteCloudCredentials()
+	if cloudURL == "" || cloudToken == "" {
+		writeError(w, http.StatusServiceUnavailable, errors.New("remote Agent is not ready; wait for registration or check milevia-agent.log"))
+		return
+	}
+	if instanceID == "" {
+		if err := s.db.QueryRowContext(r.Context(), `select instance_id from remote_instance limit 1`).Scan(&instanceID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, cloudURL+"/v1/agent/pairings", nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	request.Header.Set("X-Milevia-Agent-Token", s.config.RemoteCloudToken)
+	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
 	request.Header.Set("X-Milevia-Instance-ID", instanceID)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -264,8 +325,9 @@ func (s *Server) createRemotePairing(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) confirmRemotePairing(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimSpace(s.config.RemoteCloudURL) == "" || strings.TrimSpace(s.config.RemoteCloudToken) == "" {
-		writeError(w, http.StatusServiceUnavailable, errors.New("remote cloud pairing is not configured"))
+	cloudURL, cloudToken, instanceID := s.remoteCloudCredentials()
+	if cloudURL == "" || cloudToken == "" {
+		writeError(w, http.StatusServiceUnavailable, errors.New("remote Agent is not ready; wait for registration or check milevia-agent.log"))
 		return
 	}
 	var input struct {
@@ -274,17 +336,18 @@ func (s *Server) confirmRemotePairing(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) || strings.TrimSpace(input.PairingID) == "" {
 		return
 	}
-	var instanceID string
-	if err := s.db.QueryRowContext(r.Context(), `select instance_id from remote_instance limit 1`).Scan(&instanceID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	if instanceID == "" {
+		if err := s.db.QueryRowContext(r.Context(), `select instance_id from remote_instance limit 1`).Scan(&instanceID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
-	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.config.RemoteCloudURL+"/v1/agent/pairings/"+url.PathEscape(input.PairingID)+"/confirm", nil)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, cloudURL+"/v1/agent/pairings/"+url.PathEscape(input.PairingID)+"/confirm", nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	request.Header.Set("X-Milevia-Agent-Token", s.config.RemoteCloudToken)
+	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
 	request.Header.Set("X-Milevia-Instance-ID", instanceID)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -387,7 +450,8 @@ func (s *Server) remoteRelayConfigured() bool {
 	// imply that an Agent is configured to drain the outbox. Require both cloud
 	// settings so standalone desktop installs do not accumulate undeliverable
 	// events indefinitely.
-	return strings.TrimSpace(s.config.RemoteCloudURL) != "" && strings.TrimSpace(s.config.RemoteCloudToken) != ""
+	cloudURL, cloudToken, _ := s.remoteCloudCredentials()
+	return cloudURL != "" && cloudToken != ""
 }
 
 func enqueueRemoteEventTx(ctx context.Context, tx *sql.Tx, eventID, taskID, taskRunID, typ string, payload []byte, now time.Time) error {

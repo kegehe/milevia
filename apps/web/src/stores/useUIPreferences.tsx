@@ -9,12 +9,14 @@ export type AppPreferences = {
   defaultAgentId: AgentID;
   claudePermissionMode: Extract<PermissionMode, "approval_required" | "full_control">;
   codexPermissionMode: Extract<PermissionMode, "read_only" | "workspace_write" | "full_control">;
+  autoReview: boolean;
   updatedAt?: string;
 };
 
 export type LocalPreferences = {
   systemNotificationsEnabled: boolean;
   notifyWhenHidden: boolean;
+  windowsToastsEnabled: boolean;
   taskNotificationsEnabled: boolean;
   lowPriorityNotificationsEnabled: boolean;
   quietHoursEnabled: boolean;
@@ -28,7 +30,7 @@ type UIPreferencesContextValue = {
   appPreferences: AppPreferences;
   appPreferencesLoading: boolean;
   appPreferencesError: string;
-  updateAppPreferences: (patch: Partial<Pick<AppPreferences, "defaultAgentId" | "claudePermissionMode" | "codexPermissionMode">>) => Promise<AppPreferences>;
+  updateAppPreferences: (patch: Partial<Pick<AppPreferences, "defaultAgentId" | "claudePermissionMode" | "codexPermissionMode" | "autoReview">>) => Promise<AppPreferences>;
   localPreferences: LocalPreferences;
   updateLocalPreferences: (patch: Partial<LocalPreferences>) => void;
   resetLocalPreferences: () => void;
@@ -40,11 +42,13 @@ const safeAppDefaults: AppPreferences = {
   defaultAgentId: "claude-code",
   claudePermissionMode: "approval_required",
   codexPermissionMode: "workspace_write",
+  autoReview: false,
 };
 
 const defaultLocalPreferences: LocalPreferences = {
   systemNotificationsEnabled: false,
   notifyWhenHidden: true,
+  windowsToastsEnabled: false,
   taskNotificationsEnabled: true,
   lowPriorityNotificationsEnabled: false,
   quietHoursEnabled: false,
@@ -79,6 +83,7 @@ function readLocalPreferences(): LocalPreferences {
     return {
       systemNotificationsEnabled: typeof value.systemNotificationsEnabled === "boolean" ? value.systemNotificationsEnabled : defaultLocalPreferences.systemNotificationsEnabled,
       notifyWhenHidden: typeof value.notifyWhenHidden === "boolean" ? value.notifyWhenHidden : defaultLocalPreferences.notifyWhenHidden,
+      windowsToastsEnabled: typeof value.windowsToastsEnabled === "boolean" ? value.windowsToastsEnabled : defaultLocalPreferences.windowsToastsEnabled,
       taskNotificationsEnabled: typeof value.taskNotificationsEnabled === "boolean" ? value.taskNotificationsEnabled : defaultLocalPreferences.taskNotificationsEnabled,
       lowPriorityNotificationsEnabled: typeof value.lowPriorityNotificationsEnabled === "boolean" ? value.lowPriorityNotificationsEnabled : defaultLocalPreferences.lowPriorityNotificationsEnabled,
       quietHoursEnabled: typeof value.quietHoursEnabled === "boolean" ? value.quietHoursEnabled : defaultLocalPreferences.quietHoursEnabled,
@@ -124,7 +129,7 @@ export function UIPreferencesProvider({ children }: { children: ReactNode }) {
     return () => document.removeEventListener("visibilitychange", refreshPermission);
   }, []);
 
-  const updateAppPreferences = useCallback(async (patch: Partial<Pick<AppPreferences, "defaultAgentId" | "claudePermissionMode" | "codexPermissionMode">>) => {
+  const updateAppPreferences = useCallback(async (patch: Partial<Pick<AppPreferences, "defaultAgentId" | "claudePermissionMode" | "codexPermissionMode" | "autoReview">>) => {
     const next = await api<AppPreferences>("/api/preferences", { method: "PATCH", body: JSON.stringify(patch) });
     setAppPreferences(next);
     setAppPreferencesError("");

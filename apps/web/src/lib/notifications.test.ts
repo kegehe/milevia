@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isWithinQuietHours, notificationConversationURL, notificationTargetURL, priorityForType, type NotificationEvent } from "./notifications";
+import { isWithinQuietHours, isWindowsNotifyType, notificationConversationURL, notificationTargetURL, priorityForType, type NotificationEvent } from "./notifications";
 
 test("failed and error notifications use normal priority", () => {
   assert.equal(priorityForType("task.done"), "normal");
@@ -44,6 +44,17 @@ test("免打扰时段支持日间与跨午夜区间", () => {
   assert.equal(isWithinQuietHours(new Date(2026, 7, 19, 22, 0), "22:00", "08:00"), true);
   assert.equal(isWithinQuietHours(new Date(2026, 7, 20, 7, 59), "22:00", "08:00"), true);
   assert.equal(isWithinQuietHours(new Date(2026, 7, 20, 8, 0), "22:00", "08:00"), false);
+});
+
+test("Windows 弹窗通知仅限任务完成类状态", () => {
+  // 完成语义 → 应触发
+  assert.equal(isWindowsNotifyType("task.done"), true);
+  assert.equal(isWindowsNotifyType("task.awaiting_review"), true);
+  // 需要处理/审批等 → 不应触发（文字为“有任务完成”，避免含义不符）
+  assert.equal(isWindowsNotifyType("task.action_required"), false);
+  assert.equal(isWindowsNotifyType("orchestration.needs_human"), false);
+  assert.equal(isWindowsNotifyType("approval.pending"), false);
+  assert.equal(isWindowsNotifyType("run.completed"), false);
 });
 
 test("无效或相同的免打扰时段不会静默所有通知", () => {

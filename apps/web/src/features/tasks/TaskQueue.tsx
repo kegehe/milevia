@@ -34,6 +34,11 @@ function TaskQueueIcon() {
   return <svg className="task-queue-title-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6.5h14M5 12h14M5 17.5h14M7.5 6.5v0M7.5 12v0M7.5 17.5v0" /></svg>;
 }
 
+// 头部折叠箭头：展开态朝上（点击收起任务队列），折叠后朝下（点击展开），旋转交给 CSS。
+function TaskQueueFoldIcon() {
+  return <svg className="task-queue-fold-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14.5 6-6 6 6" /></svg>;
+}
+
 // 一键验收确认弹窗标题图标：对勾徽标，与待验收态的语义呼应。
 function ReviewAllIcon() {
   return <svg className="review-all-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12.5 9.8 18 19.5 6.5" /></svg>;
@@ -48,7 +53,7 @@ function DispatchCloseIcon() {
   return <svg className="task-dispatch-close-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
 }
 
-export function TaskQueue({ projectID, conversationID, permissionMode, request, fail, dispatchDisabled = false, onDispatched, openBoard }: { projectID: string; conversationID: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; dispatchDisabled?: boolean; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void }) {
+export function TaskQueue({ projectID, conversationID, permissionMode, request, fail, dispatchDisabled = false, onDispatched, openBoard, collapsed = false, onToggleCollapsed }: { projectID: string; conversationID: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; dispatchDisabled?: boolean; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void; collapsed?: boolean; onToggleCollapsed?: () => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<TaskFilter>("active");
   const [query, setQuery] = useState("");
@@ -67,6 +72,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const [approvingAll, setApprovingAll] = useState(false);
   const [inlineDetailID, setInlineDetailID] = useState<string | null>(null);
   const [inlineEditRequestedID, setInlineEditRequestedID] = useState<string | null>(null);
+  const [inlineEditingID, setInlineEditingID] = useState<string | null>(null);
   const [inlineDetail, setInlineDetail] = useState<TaskDetail | null>(null);
   const [inlineDetailLoading, setInlineDetailLoading] = useState(false);
   const [inlineBusy, setInlineBusy] = useState("");
@@ -98,6 +104,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     setApprovingAll(false);
     setInlineDetailID(null);
     setInlineEditRequestedID(null);
+    setInlineEditingID(null);
     setInlineDetail(null);
     setInlineDetailLoading(false);
     setInlineBusy("");
@@ -155,6 +162,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     const requestID = ++inlineRequest.current;
     setInlineDetailID(taskID);
     setInlineEditRequestedID(edit ? taskID : null);
+    setInlineEditingID(null);
     setInlineDetail(null);
     setInlineDetailLoading(true);
     setInlineBusy("");
@@ -174,10 +182,25 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     inlineRequest.current++;
     setInlineDetailID(null);
     setInlineEditRequestedID(null);
+    setInlineEditingID(null);
     setInlineDetail(null);
     setInlineDetailLoading(false);
     setInlineBusy("");
   };
+
+  // Read-only details close when the pointer moves outside the detail panel; editing stays open.
+  useEffect(() => {
+    if (!inlineDetailID || inlineEditingID === inlineDetailID) return;
+    const handleOutsidePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const detailNode = target.closest(".task-inline-detail");
+      if (detailNode) return;
+      closeInlineDetail();
+    };
+    document.addEventListener("pointerdown", handleOutsidePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
+  }, [inlineDetailID, inlineEditingID]);
 
   const inlineDispatch = async () => {
     if (dispatchDisabled || !conversationID || !inlineDetail || !inlineDetail.canDispatch) return;
@@ -483,13 +506,13 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   };
 
   return <div className={`task-queue ${mobileOpen ? "mobile-open" : ""}`}>
-    <button type="button" className="task-queue-mobile-toggle" aria-expanded={mobileOpen} onClick={() => setMobileOpen((open) => !open)}>任务 <b>{taskCounts.active}</b></button>
+    <button type="button" className="task-queue-mobile-toggle" aria-expanded={collapsed ? false : mobileOpen} onClick={() => { if (collapsed) onToggleCollapsed?.(); setMobileOpen((open) => !open); }}>任务 <b>{taskCounts.active}</b></button>
     <div className="task-queue-panel">
-      <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions">{taskCounts.awaiting_review > 0 && <button type="button" className="task-queue-review-all" disabled={approvingAll} title="一键验收全部待验收任务" aria-label="一键验收全部待验收任务" onClick={confirmReviewAll}>{approvingAll ? "验收中" : "一键验收"}{!approvingAll && <b>{taskCounts.awaiting_review}</b>}</button>}<button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button></div></header>
+      <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions">{taskCounts.awaiting_review > 0 && <button type="button" className="task-queue-review-all" disabled={approvingAll} title="一键验收全部待验收任务" aria-label="一键验收全部待验收任务" onClick={confirmReviewAll}>{approvingAll ? "验收中" : "一键验收"}{!approvingAll && <b>{taskCounts.awaiting_review}</b>}</button>}<button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button><button type="button" className="task-queue-fold" title={collapsed ? "展开任务队列" : "收起任务队列"} aria-label={collapsed ? "展开任务队列" : "收起任务队列"} aria-expanded={!collapsed} onClick={() => onToggleCollapsed?.()}><TaskQueueFoldIcon /></button></div></header>
       {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => setQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
       <div className="task-queue-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg><input type="search" value={query} placeholder="搜索任务…" aria-label="搜索任务" onChange={(event) => setQuery(event.target.value)} /></div>
       <nav className="task-queue-filters" aria-label="任务筛选">{filters.map((item) => <button type="button" key={item.id} className={filter === item.id ? "active" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<span>{taskCounts[item.id]}</span></button>)}</nav>
-      <div className="task-queue-list">{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={(edit = false) => void openInlineDetail(task.id, edit)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} dispatchDisabled={dispatchDisabled} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop}
+      <div className="task-queue-list">{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={(edit = false) => void openInlineDetail(task.id, edit)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} dispatchDisabled={dispatchDisabled} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop} setInlineEditingID={setInlineEditingID}
         inlineDetailID={inlineDetailID}
         inlineDetail={inlineDetail}
         inlineEditRequestedID={inlineEditRequestedID}
@@ -512,7 +535,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   </div>;
 }
 
-function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, inlineDetailID, inlineDetail, inlineEditRequestedID, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, deleteTask, inlineEdit, inlineReview, openBoard, confirmTransition, setPinned }: { task: Task; index: number; open: (edit?: boolean) => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineEditRequestedID: string | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; deleteTask: (task: Task) => void; inlineEdit: (patch: { title: string; description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void; setPinned: (taskID: string, pinned: boolean) => Promise<void> }) {
+function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, setInlineEditingID, inlineDetailID, inlineDetail, inlineEditRequestedID, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, deleteTask, inlineEdit, inlineReview, openBoard, confirmTransition, setPinned }: { task: Task; index: number; open: (edit?: boolean) => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; setInlineEditingID: (taskID: string | null) => void; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineEditRequestedID: string | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; deleteTask: (task: Task) => void; inlineEdit: (patch: { title: string; description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void; setPinned: (taskID: string, pinned: boolean) => Promise<void> }) {
   const [isDragging, setIsDragging] = useState(false);
   const [dragOverPosition, setDragOverPosition] = useState<"before" | "after" | null>(null);
   const [hoverOpen, setHoverOpen] = useState(false);
@@ -644,7 +667,7 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
         <button type="button" className="danger-text" draggable={false} disabled={reviewSubmitting} onClick={(event) => { event.stopPropagation(); closeReview(); }}>取消</button>
       </div>
     </div>}
-    {inlineDetailID === task.id && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} initialEditing={inlineEditRequestedID === task.id} dispatchDisabled={dispatchDisabled} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} deleteTask={inlineDelete} edit={inlineEdit} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
+    {inlineDetailID === task.id && <InlineTaskDetail detail={inlineDetail} loading={inlineDetailLoading} busy={inlineBusy} initialEditing={inlineEditRequestedID === task.id} onEditingChange={(editing) => setInlineEditingID(editing ? task.id : null)} dispatchDisabled={dispatchDisabled} close={closeInlineDetail} dispatch={inlineDispatch} transition={inlineTransition} deleteTask={inlineDelete} edit={inlineEdit} review={inlineReview} openBoard={() => openBoard(inlineDetailID)} confirmTransition={confirmTransition} />}
     {hoverOpen && rowRef.current && createPortal(<TaskHoverCard task={task} anchor={rowRef.current} onEnter={showHover} onLeave={hideHover} />, document.body)}
   </article>;
 }
@@ -741,7 +764,7 @@ function DispatchConfirmation({ task, detail, loading, dispatching, dispatchDisa
   </div>;
 }
 
-function InlineTaskDetail({ detail, loading, busy, initialEditing = false, dispatchDisabled, close, dispatch, transition, deleteTask, edit, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; initialEditing?: boolean; dispatchDisabled: boolean; close: () => void; dispatch: () => Promise<void>; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; edit: (patch: { title: string; description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: () => void }) {
+function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEditingChange, dispatchDisabled, close, dispatch, transition, deleteTask, edit, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; initialEditing?: boolean; onEditingChange: (editing: boolean) => void; dispatchDisabled: boolean; close: () => void; dispatch: () => Promise<void>; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; edit: (patch: { title: string; description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: () => void }) {
   const detailRef = useRef<HTMLDivElement>(null);
   const editActionsRef = useRef<HTMLDivElement>(null);
   const [localReviewNote, setLocalReviewNote] = useState("");
@@ -778,6 +801,10 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, dispa
     setSaveError("");
     setEditing(true);
   }, [detail?.id, initialEditing]);
+
+  useEffect(() => {
+    onEditingChange(Boolean(detail && editing));
+  }, [detail, editing, onEditingChange]);
 
   // 快速编辑进入时，编辑表单可能比任务队列可见区域更高：若底部操作（保存/取消）被
   // 滚动容器截断，把它们滚入视野，避免看不到保存按钮而无法保存。仅在实际越出可视
@@ -844,7 +871,7 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, dispa
     finally { if (mountedRef.current) setLocalReviewSubmitting(false); }
   };
 
-  return <div className="task-inline-detail" ref={detailRef} onDragStart={(e) => e.stopPropagation()}>
+  return <div className="task-inline-detail" data-task-inline-detail-id={detail.id} ref={detailRef} onDragStart={(e) => e.stopPropagation()}>
     <div className="task-inline-detail-head">
       <div className="task-inline-detail-title">
         <span className={`task-status ${detail.status}`}>{queued ? "队列中" : statusLabels[detail.status]}</span>
@@ -868,9 +895,9 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, dispa
       {detail.runs.length > 0 && <div className="task-inline-section"><b>执行记录</b><div className="task-inline-runs">{detail.runs.map((run) => <span key={run.id} className="task-inline-run"><em>{run.status}</em><small>第 {run.sequence} 次 · {formatDate(run.createdAt)}</small></span>)}</div></div>}
       {detail.blockReason && <p className="task-dispatch-reason">{detail.blockReason}</p>}
     </div>
-    <div className="task-inline-detail-actions">
+    <div className={`task-inline-detail-actions${detail.status === "todo" || detail.status === "action_required" ? " task-inline-detail-actions-compact" : ""}`}>
       {(detail.status === "todo" || detail.status === "action_required") && <>
-        {detail.canDispatch && <button className="primary" disabled={dispatchDisabled || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发任务"}</button>}
+        {detail.canDispatch && <button className="primary" disabled={dispatchDisabled || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发"}</button>}
       </>}
       {detail.status === "running" && <button className="danger-text" disabled={Boolean(busy) || queued} onClick={() => void transition("stop")}>{queued ? "队列中" : busy === "stop" ? "停止中" : "停止任务"}</button>}
       {detail.status === "awaiting_review" && !isTaskAwaitingMainMerge(detail) && <>
@@ -882,9 +909,8 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, dispa
       </>}
       {detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}
       {canEdit && <button className="secondary" disabled={Boolean(busy)} onClick={() => startEdit()}>编辑</button>}
-      <span className="task-inline-actions-sep" />
-      <button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除任务"}</button>
-      <button className="secondary" disabled={reviewBusy} onClick={openBoard}>查看完整详情</button>
+      <button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除"}</button>
+      <button className="secondary" disabled={reviewBusy} onClick={openBoard}>详情</button>
     </div>
     </>}
   </div>;

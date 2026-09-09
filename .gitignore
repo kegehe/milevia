@@ -43,8 +43,13 @@ agent/
 
 # The Agent source is tracked; keep the local Windows secret file ignored.
 !apps/agent/
+!apps/agent/internal/
+!apps/agent/internal/*.go
+!apps/agent/internal/agent/
+!apps/agent/internal/agent/*.go
 !apps/agent/start-agent.ps1
 apps/agent/.env.windows
+apps/desktop/binaries/*.env
 
 # Local convenience files
 /dev
@@ -71,3 +76,4 @@ apps/web/test-results/
 *.sqlite
 *.sqlite3
 *.sqlite3-journal
+.tmp/

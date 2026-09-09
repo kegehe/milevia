@@ -1648,6 +1648,18 @@ func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun
 	return nil
 }
 
+// readAutoReviewEnabledTx reports whether automatic task acceptance is switched
+// on. It is read from the given connection (typically a transaction) so the
+// check can be part of the same atomic write window as the status transition.
+func (s *Server) readAutoReviewEnabledTx(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var enabled bool
+	err := tx.QueryRowContext(ctx, `select auto_review from app_preferences where id=1`).Scan(&enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return enabled, err
+}
+
 func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStatus, failureReason string, now time.Time) error {
 	var taskRunID, taskID, taskRunStatus string
 	err := tx.QueryRowContext(ctx, `select id,task_id,status from task_runs where run_id=?`, runID).Scan(&taskRunID, &taskID, &taskRunStatus)
@@ -1664,6 +1676,22 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 	switch runStatus {
 	case "completed":
 		taskRunTerminalStatus, taskStatus = "succeeded", taskAwaitingReview
+		// 自动验收开启时，任务成功完成即直接验收为 done，无需用户点击。
+		autoReview, err := s.readAutoReviewEnabledTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if autoReview {
+			// 与 reviewTask 的守卫一致：仍有自动编排作业在进行（含等待合并）时
+			// 不允许验收，回退为待验收，交由后续手动/编排流程处理。
+			var busy bool
+			if err := tx.QueryRowContext(ctx, `select exists(select 1 from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`, taskID).Scan(&busy); err != nil {
+				return err
+			}
+			if !busy {
+				taskStatus = taskDone
+			}
+		}
 	case "failed", "stopped", "interrupted":
 		taskRunTerminalStatus, taskStatus = runStatus, taskActionRequired
 	default:
@@ -1683,7 +1711,11 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 	if changed == 0 {
 		return fmt.Errorf("task run %s: expected queued/running but status was already terminal", taskRunID)
 	}
-	taskResult, err := tx.ExecContext(ctx, `update tasks set status=?,updated_at=? where id=? and status=?`, taskStatus, now, taskID, taskRunning)
+	var taskCompletedAt any
+	if taskStatus == taskDone {
+		taskCompletedAt = now
+	}
+	taskResult, err := tx.ExecContext(ctx, `update tasks set status=?,updated_at=?,completed_at=? where id=? and status=?`, taskStatus, now, taskCompletedAt, taskID, taskRunning)
 	if err != nil {
 		return err
 	}
@@ -1693,6 +1725,12 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 	}
 	if taskChanged == 0 {
 		return fmt.Errorf("task %s: expected running but status had already changed", taskID)
+	}
+	// 自动验收视为任务被自动接受，补记一条 task.accepted 事件便于审计追踪。
+	if taskStatus == taskDone {
+		if err := s.recordTaskEventTx(ctx, tx, taskID, taskRunID, "task.accepted", map[string]string{"runId": runID, "auto": "true"}, now); err != nil {
+			return err
+		}
 	}
 	return s.recordTaskEventTx(ctx, tx, taskID, taskRunID, "task.run_"+taskRunTerminalStatus, map[string]string{"runId": runID, "status": taskRunTerminalStatus}, now)
 }

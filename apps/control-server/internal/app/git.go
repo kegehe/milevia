@@ -25,6 +25,8 @@ var (
 	errGitOutputTooLarge      = errors.New("Git output exceeds the allowed size")
 	errGitTerminationTimedOut = errors.New("Git process did not exit after termination")
 	errGitPartiallyApplied    = errors.New("Git operation was only partially applied")
+	errGitInvalidCommitID     = errors.New("invalid Git commit object ID")
+	errGitCommitNotFound      = errors.New("Git object ID is not a commit in this repository")
 )
 
 type gitCommandError struct {
@@ -92,6 +94,29 @@ type GitCommit struct {
 	AuthoredAt time.Time `json:"authoredAt"`
 }
 
+// GitCommitFile 描述提交中单个文件的变更：状态徽标、增删行数与二进制标记。
+type GitCommitFile struct {
+	Path         string `json:"path"`
+	OriginalPath string `json:"originalPath,omitempty"`
+	Status       string `json:"status"`
+	Additions    int    `json:"additions"`
+	Deletions    int    `json:"deletions"`
+	Binary       bool   `json:"binary"`
+}
+
+// GitCommitDetail 是提交的完整元数据与变更文件清单，用于提交详情视图。
+type GitCommitDetail struct {
+	OID         string          `json:"oid"`
+	Parents     []string        `json:"parents"`
+	Author      string          `json:"author"`
+	AuthoredAt  time.Time       `json:"authoredAt"`
+	Committer   string          `json:"committer"`
+	CommittedAt time.Time       `json:"committedAt"`
+	Subject     string          `json:"subject"`
+	Message     string          `json:"message"`
+	Files       []GitCommitFile `json:"files"`
+}
+
 type GitBranch struct {
 	Name     string `json:"name"`
 	Remote   bool   `json:"remote"`
@@ -118,6 +143,8 @@ type gitBackend interface {
 	validateUntrackedRemoval(repo string, paths []string) error
 	// removeUntracked 删除仓库内给定相对路径的未跟踪文件。
 	removeUntracked(repo string, paths []string) error
+	// writeFile 覆盖写入仓库内已存在的相对路径文件（用于把手工编辑的冲突结果落盘）。
+	writeFile(repo, path string, content []byte) error
 }
 
 type GitRunner interface {
@@ -125,6 +152,9 @@ type GitRunner interface {
 	Changes(context.Context, string) ([]GitChange, error)
 	Diff(context.Context, string, string, GitDiffStage) (string, error)
 	Log(context.Context, string, string, int) ([]GitCommit, error)
+	LogPage(context.Context, string, string, int, int, string) ([]GitCommit, error)
+	CommitDetail(context.Context, string, string) (GitCommitDetail, error)
+	CommitDiff(context.Context, string, string, string, string) (string, error)
 	Branches(context.Context, string) ([]GitBranch, error)
 	Stage(context.Context, string, []string) error
 	Unstage(context.Context, string, []string) error
@@ -140,6 +170,17 @@ type GitRunner interface {
 	Push(context.Context, string, string, string, bool) error
 	CreateBranch(context.Context, string, string, string) error
 	SwitchBranch(context.Context, string, string) error
+	// ConflictOverview 返回冲突操作上下文（merge/rebase/cherry-pick…）与冲突文件清单。
+	ConflictOverview(context.Context, string) (GitConflictOverview, error)
+	// ConflictContent 返回单个冲突文件的三方（base/ours/theirs）与工作区内容。
+	ConflictContent(context.Context, string, string) (GitConflictContent, error)
+	// ResolveConflict 将 path 标记为已解决：action 为 ours/theirs/delete/working，
+	// working 时按 content 覆写工作区文件后再 git add。
+	ResolveConflict(context.Context, string, string, string, []byte) error
+	// AbortConflict 中止当前进行中的合并/变基/cherry-pick 等操作。
+	AbortConflict(context.Context, string) error
+	// FinishConflict 在所有冲突解决后完成当前操作（merge 提交、rebase/cherry-pick --continue）。
+	FinishConflict(context.Context, string) error
 	// lstat 返回仓库内相对路径的文件信息（用于变更指纹）。
 	lstat(repo, path string) (mode os.FileMode, size int64, mtimeNano int64, mtimeUnix int64, err error)
 	// readFile 读取仓库内相对路径的文件内容（用于未跟踪文件 diff）。
@@ -253,9 +294,14 @@ func hasGitHead(snapshot GitSnapshot) bool {
 	return isFullGitObjectID(snapshot.Head.OID)
 }
 
-type gitCLIRunner struct{ timeout time.Duration; backend gitBackend }
+type gitCLIRunner struct {
+	timeout time.Duration
+	backend gitBackend
+}
 
-func newGitRunner() GitRunner { return &gitCLIRunner{timeout: gitCommandTimeout, backend: newLocalGitBackend()} }
+func newGitRunner() GitRunner {
+	return &gitCLIRunner{timeout: gitCommandTimeout, backend: newLocalGitBackend()}
+}
 
 func (runner *gitCLIRunner) Fetch(ctx context.Context, repo, remote string) error {
 	if remote == "" {
@@ -374,11 +420,20 @@ func (runner *gitCLIRunner) Diff(ctx context.Context, repo, path string, stage G
 }
 
 func (runner *gitCLIRunner) Log(ctx context.Context, repo, ref string, limit int) ([]GitCommit, error) {
+	return runner.LogPage(ctx, repo, ref, limit, 0, "")
+}
+
+// LogPage 返回 Git 日志的一页提交，支持跳过前 skip 条并可选按提交信息关键字检索。
+// query 以字面量（?L 固定串）匹配，不按正则解释，避免用户输入触发意外行为。
+func (runner *gitCLIRunner) LogPage(ctx context.Context, repo, ref string, limit, skip int, query string) ([]GitCommit, error) {
 	if ref == "" {
 		ref = "HEAD"
 	}
 	if limit < 1 || limit > 100 {
 		return nil, errors.New("Git log limit must be between 1 and 100")
+	}
+	if skip < 0 {
+		return nil, errors.New("Git log skip must be non-negative")
 	}
 	if ref == "HEAD" {
 		snapshot, err := runner.Snapshot(ctx, repo)
@@ -393,7 +448,13 @@ func (runner *gitCLIRunner) Log(ctx context.Context, repo, ref string, limit int
 		return nil, err
 	}
 	format := "%H%x00%P%x00%an%x00%at%x00%s"
-	output, err := runner.backend.runGit(ctx, repo, "log", "-z", "--format="+format, "--max-count="+strconv.Itoa(limit), ref)
+	args := []string{"log", "-z", "--format=" + format, "--max-count=" + strconv.Itoa(limit), "--skip=" + strconv.Itoa(skip)}
+	// 关键字检索：字面量匹配（?F）且忽略大小写（-i），覆盖提交信息全文（主题与正文）。
+	if query != "" {
+		args = append(args, "--fixed-strings", "-i", "--grep="+query)
+	}
+	args = append(args, ref)
+	output, err := runner.backend.runGit(ctx, repo, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -424,10 +485,7 @@ func (runner *gitCLIRunner) validateLogRef(ctx context.Context, repo, ref string
 		return nil
 	}
 	if isFullGitObjectID(ref) {
-		if _, err := runner.backend.runGit(ctx, repo, "cat-file", "-e", ref+"^{commit}"); err != nil {
-			return errors.New("Git object ID is not a commit in this repository")
-		}
-		return nil
+		return runner.validateCommitOID(ctx, repo, ref)
 	}
 	branches, err := runner.Branches(ctx, repo)
 	if err != nil {
@@ -439,6 +497,215 @@ func (runner *gitCLIRunner) validateLogRef(ctx context.Context, repo, ref string
 		}
 	}
 	return errors.New("Git reference is not available in this repository")
+}
+
+// validateCommitOID 校验 oid 是本仓库中存在的提交对象。只接受完整对象 ID，
+// 拒绝短哈希与任意 ref，避免把用户输入透传给 git 命令行。
+func (runner *gitCLIRunner) validateCommitOID(ctx context.Context, repo, oid string) error {
+	if !isFullGitObjectID(oid) {
+		return errGitInvalidCommitID
+	}
+	if _, err := runner.backend.runGit(ctx, repo, "cat-file", "-e", oid+"^{commit}"); err != nil {
+		return errGitCommitNotFound
+	}
+	return nil
+}
+
+// CommitDetail 返回提交的完整元数据与变更文件清单。合并提交按第一个父提交计算差异
+// （与前端展示语义一致）。单次 git show 同时携带 --raw（状态字母）与 --numstat
+// （增删行数、二进制标记、重命名路径），两段输出由同一 diff 队列按相同顺序生成。
+func (runner *gitCLIRunner) CommitDetail(ctx context.Context, repo, oid string) (GitCommitDetail, error) {
+	if err := runner.validateCommitOID(ctx, repo, oid); err != nil {
+		return GitCommitDetail{}, err
+	}
+	format := "%H%x00%P%x00%an%x00%at%x00%cn%x00%ct%x00%B"
+	output, err := runner.backend.runGit(ctx, repo, "show", "--first-parent", "--raw", "-z", "--numstat", "--format="+format, oid)
+	if err != nil {
+		return GitCommitDetail{}, err
+	}
+	return parseGitCommitShow(output)
+}
+
+// CommitDiff 返回提交中单个文件的 unified diff。合并提交展示相对第一个父提交的差异；
+// 根提交由 git show 内置与空树对比，无需特判。重命名文件需同时传入新路径与原始路径：
+// pathspec 过滤发生在重命名检测之前，只按新路径过滤会把重命名退化成整文件新增，
+// 与 CommitDetail 的 numstat 统计（仅计入实际改动的行）不一致。
+func (runner *gitCLIRunner) CommitDiff(ctx context.Context, repo, oid, path, originalPath string) (string, error) {
+	if err := runner.validateCommitOID(ctx, repo, oid); err != nil {
+		return "", err
+	}
+	if err := validateGitPath(path); err != nil {
+		return "", err
+	}
+	if originalPath != "" {
+		if err := validateGitPath(originalPath); err != nil {
+			return "", err
+		}
+	}
+	args := []string{"--literal-pathspecs", "show", "--first-parent", "--no-ext-diff", "--no-textconv", "--format=", oid, "--", path}
+	if originalPath != "" {
+		args = append(args, originalPath)
+	}
+	output, err := runner.backend.runGit(ctx, repo, args...)
+	return string(output), err
+}
+
+// parseGitCommitShow 解析 git show --raw -z --numstat --format=<NUL 分隔格式> 的输出：
+// 前 7 个 NUL 分隔字段是提交元数据（oid、父提交、作者、时间、提交者、时间、完整信息），
+// 之后是差异段——先 --raw 记录（:mode mode sha sha STATUS），后接 --numstat 记录
+// （adds<TAB>dels<TAB>path）。重命名记录额外携带两个路径（原始在前、新路径在后）。
+// 提交信息不会包含 NUL，字段边界可靠。
+func parseGitCommitShow(raw []byte) (GitCommitDetail, error) {
+	tokens := bytes.Split(raw, []byte{0})
+	if len(tokens) < 7 {
+		return GitCommitDetail{}, errors.New("invalid Git commit detail output")
+	}
+	detail := GitCommitDetail{OID: string(tokens[0])}
+	if !isFullGitObjectID(detail.OID) {
+		return GitCommitDetail{}, errors.New("invalid Git commit detail output")
+	}
+	if len(tokens[1]) > 0 {
+		detail.Parents = strings.Fields(string(tokens[1]))
+	}
+	detail.Author = string(tokens[2])
+	authoredAt, err := strconv.ParseInt(string(tokens[3]), 10, 64)
+	if err != nil {
+		return GitCommitDetail{}, fmt.Errorf("parse Git commit timestamp: %w", err)
+	}
+	detail.AuthoredAt = time.Unix(authoredAt, 0).UTC()
+	detail.Committer = string(tokens[4])
+	committedAt, err := strconv.ParseInt(string(tokens[5]), 10, 64)
+	if err != nil {
+		return GitCommitDetail{}, fmt.Errorf("parse Git commit timestamp: %w", err)
+	}
+	detail.CommittedAt = time.Unix(committedAt, 0).UTC()
+	detail.Message = strings.TrimRight(string(tokens[6]), "\n")
+	detail.Subject, _, _ = strings.Cut(detail.Message, "\n")
+	files, err := parseGitShowFiles(tokens[7:])
+	if err != nil {
+		return GitCommitDetail{}, err
+	}
+	detail.Files = files
+	return detail, nil
+}
+
+// parseGitShowFiles 解析差异段并按出现顺序配对 --raw 与 --numstat 记录。
+func parseGitShowFiles(tokens [][]byte) ([]GitCommitFile, error) {
+	type rawEntry struct {
+		status, path, originalPath string
+	}
+	type statEntry struct {
+		additions, deletions int
+		binary               bool
+		path                 string
+	}
+	rawEntries := make([]rawEntry, 0, len(tokens))
+	statEntries := make([]statEntry, 0, len(tokens))
+	index := 0
+	if index < len(tokens) {
+		// 提交记录终止符之后差异段以换行开头，粘在第一个 token 上。
+		tokens[index] = bytes.TrimPrefix(tokens[index], []byte("\n"))
+	}
+	for index < len(tokens) {
+		token := string(tokens[index])
+		index++
+		if token == "" {
+			continue
+		}
+		if strings.HasPrefix(token, ":") {
+			fields := strings.Fields(token)
+			if len(fields) < 5 {
+				return nil, errors.New("invalid Git raw diff record")
+			}
+			status := fields[len(fields)-1]
+			if index >= len(tokens) {
+				return nil, errors.New("Git raw diff record has no path")
+			}
+			path := string(tokens[index])
+			index++
+			originalPath := ""
+			if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
+				if index >= len(tokens) {
+					return nil, errors.New("Git rename record has no source path")
+				}
+				originalPath = path
+				path = string(tokens[index])
+				index++
+			}
+			rawEntries = append(rawEntries, rawEntry{status: status, path: path, originalPath: originalPath})
+			continue
+		}
+		additions, rest, found := strings.Cut(token, "\t")
+		if !found {
+			return nil, errors.New("invalid Git numstat record")
+		}
+		deletions, path, found := strings.Cut(rest, "\t")
+		if !found {
+			return nil, errors.New("invalid Git numstat record")
+		}
+		stat := statEntry{binary: additions == "-" || deletions == "-"}
+		if !stat.binary {
+			parsed, err := strconv.Atoi(additions)
+			if err != nil {
+				return nil, fmt.Errorf("parse Git numstat additions: %w", err)
+			}
+			stat.additions = parsed
+			parsed, err = strconv.Atoi(deletions)
+			if err != nil {
+				return nil, fmt.Errorf("parse Git numstat deletions: %w", err)
+			}
+			stat.deletions = parsed
+		}
+		if path == "" {
+			// 重命名：后续两个 token 是原始路径与新路径，取新路径用于配对校验。
+			if index+1 >= len(tokens) {
+				return nil, errors.New("Git numstat rename record has no paths")
+			}
+			path = string(tokens[index+1])
+			index += 2
+		}
+		stat.path = path
+		statEntries = append(statEntries, stat)
+		continue
+	}
+	if len(rawEntries) != len(statEntries) {
+		return nil, errors.New("Git raw and numstat records do not match")
+	}
+	files := make([]GitCommitFile, 0, len(rawEntries))
+	for index, entry := range rawEntries {
+		if entry.path != statEntries[index].path {
+			return nil, errors.New("Git raw and numstat records do not match")
+		}
+		files = append(files, GitCommitFile{
+			Path:         entry.path,
+			OriginalPath: entry.originalPath,
+			Status:       gitFileStatus(entry.status),
+			Additions:    statEntries[index].additions,
+			Deletions:    statEntries[index].deletions,
+			Binary:       statEntries[index].binary,
+		})
+	}
+	return files, nil
+}
+
+// gitFileStatus 把 --raw 状态字母归一化为前端可枚举的稳定值；未知字母保留小写原样。
+func gitFileStatus(status string) string {
+	switch {
+	case status == "A":
+		return "added"
+	case status == "M":
+		return "modified"
+	case status == "D":
+		return "deleted"
+	case strings.HasPrefix(status, "R"):
+		return "renamed"
+	case strings.HasPrefix(status, "C"):
+		return "copied"
+	case status == "T":
+		return "typechanged"
+	default:
+		return strings.ToLower(status)
+	}
 }
 
 func isFullGitObjectID(value string) bool {
@@ -626,6 +893,31 @@ func (b *localGitBackend) lstat(repo, path string) (os.FileMode, int64, int64, i
 
 func (b *localGitBackend) readFile(repo, path string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(repo, path))
+}
+
+// writeFile 以覆盖写方式写入仓库内已存在文件。经由 os.OpenRoot 限定在仓库根内，
+// 避免路径穿越与符号链接逃逸（与 validateUntrackedRemoval/removeUntracked 同策略）。
+func (b *localGitBackend) writeFile(repo, path string, content []byte) error {
+	root, err := os.OpenRoot(repo)
+	if err != nil {
+		return fmt.Errorf("open Git repository root: %w", err)
+	}
+	defer root.Close()
+	if err := validateGitPath(path); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return fmt.Errorf("open Git path for writing: %w", err)
+	}
+	if _, err := file.Write(content); err != nil {
+		file.Close()
+		return fmt.Errorf("write Git path: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close Git path after writing: %w", err)
+	}
+	return nil
 }
 
 func (b *localGitBackend) validateUntrackedRemoval(repo string, paths []string) error {

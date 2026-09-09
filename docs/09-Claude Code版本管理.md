@@ -301,6 +301,27 @@ type AgentRunner interface {
 }
 ```
 
+> **更新：响应新增 `autoUpdatable` 三态语义**。成功/失败响应都带 `autoUpdatable`
+> 字段，用于区分"可应用内自动更新"与"有新版本但仅能到目标环境手动更新"：
+>
+> ```jsonc
+> {
+>   "updateAvailable": true,     // 有新版本（后端已真实对比 npm registry 最新版）
+>   "autoUpdatable": false,      // false=跨端 runner 暂不支持应用内升级
+>   "currentVersion": "2.1.216",
+>   "latestVersion": "2.1.217"
+> }
+> ```
+>
+> - 本地 / SSH runner 未实现可选接口，`autoUpdatable` 缺省为 `true`。
+> - 跨端 runner（Windows 部署的 `wsl-local`、WSL 部署的 Windows 对侧 runner）实现
+>   `autoUpdateSupportedRunner` / `codexAutoUpdateSupportedRunner` 并返回 `false`；
+>   其 `CheckUpdate` 也与本地 runner 一致真实查询 npm registry，不再把"本机当前版本"
+>   当最新版而谎报无更新。
+> - 前端据此三态渲染：`updateAvailable=false` → "已是最新版本"；`true && autoUpdatable`
+>   → "更新至 X"按钮；`true && !autoUpdatable` → "发现新版本 X · 需手动更新"提示（不给出
+>   点了必失败的更新按钮）。
+
 此端点不触发更新，仅做版本比对。不会改变 Runner 状态。
 
 ### 7.3 POST `/api/runners/{runnerId}/claude/update`

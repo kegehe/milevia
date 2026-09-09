@@ -157,6 +157,8 @@ AUTO_CLEAR_PORTS=1 pnpm dev
 | `AUTO_CLAUDE_TOOL_RESULT_TIMEOUT` | `5m` | 等待 Claude 下一条响应（工具结果后）的超时 |
 | `AUTO_CLAUDE_TURN_IDLE_TIMEOUT` | `30m` | Claude 空闲超时，超时后释放会话队列 |
 | `AUTO_APPROVAL_HOOK` | `../../scripts/claude-approval-hook.sh` | 默认权限下的命令审批 Hook |
+| `AUTO_TERMINAL_MAX_PROJECTS` | `24` | 项目终端全局并发会话上限（所有项目合计） |
+| `AUTO_TERMINAL_MAX_PER_PROJECT` | `8` | 单个项目可同时打开的终端会话上限 |
 | `VITE_CONTROL_URL` | `http://127.0.0.1:8080` | Vite 代理目标地址 |
 
 ## 项目结构
@@ -221,6 +223,8 @@ pnpm --filter @milevia/web build
 # 启动桌面开发模式（增量编译 sidecar，仅源码变更时重编）
 pnpm --filter @milevia/desktop dev
 
+# 发布安装包前注入部署注册令牌（不要提交到 Git）：
+$env:MILEVIA_AGENT_ENROLLMENT_TOKEN = "replace-with-deployment-token"
 # 如需强制重新编译 sidecar（忽略缓存）：
 node apps/desktop/scripts/build-sidecar.mjs --force
 ```

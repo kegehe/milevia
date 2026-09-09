@@ -111,6 +111,40 @@ func (s *Server) beginRunUsage(runID, conversationID string) {
 	s.usageMu.Unlock()
 }
 
+// seedRunUsageModel 在 run 开始前把 Codex 本次将使用的模型写入 usage accumulator。
+// Codex 的 exec --json 事件流只有 token 用量、不含模型名（见 runUsageAccumulator.collect
+// 中 turn.completed 分支），与 Claude Code 不同——后者能直接从 assistant/system 事件里拿到
+// model。因此 Codex 的模型必须在启动时从两个来源补齐：
+//   - 档案（profile）显式指定了模型时用档案值（run 会以 -c model= 传给 CLI）；
+//   - 否则（cli_managed 默认配置）向 runner 询问 config.toml 里的默认模型。
+//
+// 只设置一次且不覆盖已有值：Codex 事件流不会填 model，但保留给未来可能在事件里出现模型的
+// 情况。Claude Code 不需要此预置，其模型由事件驱动。
+func (s *Server) seedRunUsageModel(runID, agentID string, profile *AgentRuntimeProfile, runner AgentRunner) {
+	if agentID != "codex" {
+		return
+	}
+	var model string
+	if profile != nil {
+		model = profile.Model
+	}
+	if model == "" {
+		if resolver, ok := runner.(codexDefaultModelRunner); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			model = resolver.codexDefaultModel(ctx)
+		}
+	}
+	if model == "" {
+		return
+	}
+	s.usageMu.Lock()
+	if accumulator := s.runUsage[runID]; accumulator != nil && accumulator.model == "" {
+		accumulator.model = model
+	}
+	s.usageMu.Unlock()
+}
+
 // contextSnapshotTokens is the complete prompt size for one model call.
 // Cached input still occupies the model context and must be included when
 // measuring context-window utilisation.

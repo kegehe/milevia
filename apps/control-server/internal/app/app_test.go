@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -581,6 +582,73 @@ func TestFinishRunUpdatesRunAndConversation(t *testing.T) {
 	if runStatus != "completed" || conversationStatus != "idle" {
 		t.Fatalf("unexpected statuses: run=%q conversation=%q", runStatus, conversationStatus)
 	}
+}
+
+// seedRunningTaskForFinish inserts a running run and task_run and marks the task
+// running, mirroring finishRun's input state, then finishes it through
+// finishTaskRunTx directly.
+func finishRunningTaskForTest(t *testing.T, server *Server, projectID, conversationID, taskID string, runStatus string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run',?,'running',?)`, conversationID, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('tr',?,?, 'run',1,'running','prompt','criteria','',?)`, taskID, conversationID, now); err != nil {
+		t.Fatalf("insert task run: %v", err)
+	}
+	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskRunning, taskID); err != nil {
+		t.Fatalf("mark task running: %v", err)
+	}
+	tx, err := server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.finishTaskRunTx(context.Background(), tx, "run", runStatus, "", now); err != nil {
+		tx.Rollback()
+		t.Fatalf("finishTaskRunTx: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+func TestAutoAcceptEnablesMarkSuccessfulRunDone(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	if _, err := server.db.Exec(`update app_preferences set auto_review=1 where id=1`); err != nil {
+		t.Fatalf("enable auto review: %v", err)
+	}
+	taskID := createTaskForTest(t, server.routes(), projectID, "Auto accept task")
+	finishRunningTaskForTest(t, server, projectID, conversationID, taskID, "completed")
+	assertTaskStatus(t, server, taskID, taskDone)
+	var completedAt any
+	if err := server.db.QueryRow(`select completed_at from tasks where id=?`, taskID).Scan(&completedAt); err != nil {
+		t.Fatalf("read completed_at: %v", err)
+	}
+	if completedAt == nil {
+		t.Fatal("auto-accepted task should have completed_at set")
+	}
+}
+
+func TestAutoAcceptDisabledKeepsTaskAwaitingReview(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "Manual accept task")
+	finishRunningTaskForTest(t, server, projectID, conversationID, taskID, "completed")
+	assertTaskStatus(t, server, taskID, taskAwaitingReview)
+}
+
+func TestAutoAcceptSkipsTaskWithInFlightOrchestration(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	if _, err := server.db.Exec(`update app_preferences set auto_review=1 where id=1`); err != nil {
+		t.Fatalf("enable auto review: %v", err)
+	}
+	taskID := createTaskForTest(t, server.routes(), projectID, "Orchestrated auto accept task")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?,1,'implementing','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatalf("insert orchestration job: %v", err)
+	}
+	finishRunningTaskForTest(t, server, projectID, conversationID, taskID, "completed")
+	// 编排仍在实施/检查中时不应自动验收，回退为待验收交由编排/人工后续处理。
+	assertTaskStatus(t, server, taskID, taskAwaitingReview)
 }
 
 func TestAssistantTextBroadcastsDurableMessageEvent(t *testing.T) {
@@ -1295,6 +1363,81 @@ func TestBeginRunUsageDoesNotReportPriorRunContextAsCurrent(t *testing.T) {
 	usage := server.liveRunUsage("current", "running")
 	if usage == nil || usage.ContextInputTokens != 0 {
 		t.Fatalf("live usage=%#v, want no stale context snapshot", usage)
+	}
+}
+
+// defaultModelRunner 是一个可报告默认 Codex 模型的 AgentRunner 桩，供 seed 测试使用。
+type defaultModelRunner struct {
+	runnerFunc
+	model string
+}
+
+func (r defaultModelRunner) codexDefaultModel(context.Context) string { return r.model }
+
+func TestSeedRunUsageModelForCodex(t *testing.T) {
+	server := newTestServer(t)
+	server.beginRunUsage("run", "conversation")
+	server.seedRunUsageModel("run", "claude-code", &AgentRuntimeProfile{Model: "ignored"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "" {
+		t.Fatalf("claude run should not be pre-seeded, got %#v", usage)
+	}
+
+	server.seedRunUsageModel("run", "codex", &AgentRuntimeProfile{Model: "gpt-profile"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "gpt-profile" {
+		t.Fatalf("codex profile model was not seeded, got %#v", usage)
+	}
+
+	// 已有模型不能被再次 seed 覆盖（例如事件先到）。
+	server.seedRunUsageModel("run", "codex", &AgentRuntimeProfile{Model: "gpt-other"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "gpt-profile" {
+		t.Fatalf("seed overwrote an existing model, got %#v", usage)
+	}
+}
+
+func TestSeedRunUsageModelFallsBackToRunnerDefault(t *testing.T) {
+	server := newTestServer(t)
+	server.beginRunUsage("run", "conversation")
+	runner := defaultModelRunner{runnerFunc: runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }), model: "gpt-config"}
+	server.seedRunUsageModel("run", "codex", nil, runner)
+	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "gpt-config" {
+		t.Fatalf("runner default model was not seeded, got %#v", usage)
+	}
+}
+
+func TestSeedRunUsageModelPersistsThroughUsageAPI(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,agent_id,claude_session_id,status,claude_initialized,is_current,created_at) values ('conversation','project','codex','00000000-0000-4000-8000-000000000000','idle',0,1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,agent_id,status,created_at) values ('run','conversation','codex','running',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	server.beginRunUsage("run", "conversation")
+	server.seedRunUsageModel("run", "codex", &AgentRuntimeProfile{Model: "gpt-persisted"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	// Codex 的 turn.completed 事件只有用量、没有模型；seed 的模型必须保留下来。
+	server.collectUsageEvent("run", "conversation", "turn.completed", json.RawMessage(`{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":300,"output_tokens":80}}`))
+	if err := server.persistRunUsage("run", "completed"); err != nil {
+		t.Fatalf("persist usage: %v", err)
+	}
+	server.finishRun("run", "conversation", "completed", nil)
+	server.discardRunUsage("run")
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation/usage", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("get conversation usage status: %d body=%s", response.Code, response.Body.String())
+	}
+	var usage ConversationUsageResponse
+	if err := json.NewDecoder(response.Body).Decode(&usage); err != nil {
+		t.Fatalf("decode conversation usage: %v", err)
+	}
+	if usage.Context.Model != "gpt-persisted" || usage.Context.InputTokens != 1200 {
+		t.Fatalf("persisted codex usage context=%#v, want model gpt-persisted and input 1200", usage.Context)
 	}
 }
 
@@ -7252,6 +7395,43 @@ func TestGitChangesParseRenameDestinationAndSource(t *testing.T) {
 	}
 }
 
+func TestGitLogPageSearchAndSkip(t *testing.T) {
+	repo := newTempGitRepository(t)
+	for _, subject := range []string{"alpha init", "third party feat", "ALPHA docs", "chore cleanup"} {
+		writeGitTestFile(t, repo, "readme.txt", subject+"\n")
+		runGitForTest(t, repo, "add", "readme.txt")
+		runGitForTest(t, repo, "commit", "-m", subject)
+	}
+	runner := newGitRunner()
+
+	// 关键字检索：字面量、忽略大小写，命中提交信息（subject）。
+	matched, err := runner.LogPage(context.Background(), repo, "main", 100, 0, "alpha")
+	if err != nil {
+		t.Fatalf("search Git log: %v", err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("expected 2 matches, got %d: %#v", len(matched), matched)
+	}
+
+	// 分页跳过：skip=2 应只剩最后两个较新的提交。
+	paged, err := runner.LogPage(context.Background(), repo, "main", 100, 2, "")
+	if err != nil {
+		t.Fatalf("page Git log: %v", err)
+	}
+	if len(paged) != 2 || paged[0].Subject != "third party feat" || paged[1].Subject != "alpha init" {
+		t.Fatalf("unexpected paged commits: %#v", paged)
+	}
+
+	// 检索 + 分页组合：跳过一条命中后应只剩最旧的那条。
+	combo, err := runner.LogPage(context.Background(), repo, "main", 100, 1, "alpha")
+	if err != nil {
+		t.Fatalf("search-and-page Git log: %v", err)
+	}
+	if len(combo) != 1 || combo[0].Subject != "alpha init" {
+		t.Fatalf("unexpected search-and-page commits: %#v", combo)
+	}
+}
+
 func TestGitLogRejectsRevisionExpressions(t *testing.T) {
 	repo := newTempGitRepository(t)
 	writeGitTestFile(t, repo, "readme.txt", "one\n")
@@ -7795,6 +7975,259 @@ func TestProjectGitDiffRejectsUntrustedPathAndLogReference(t *testing.T) {
 	}
 }
 
+// seedCommitDetailFixture 创建包含根提交（新增+二进制）、二提交（修改+重命名+新增）
+// 与合并提交的仓库，返回仓库路径与三个提交的 OID。
+func seedCommitDetailFixture(t *testing.T, server *Server) (repoPath, root, second, merge string) {
+	t.Helper()
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "a.txt", "line1\nline2\nline3\n")
+	writeGitTestFile(t, repo, "b.bin", "bin\x00\x01data")
+	runGitForTest(t, repo, "add", "-A")
+	runGitForTest(t, repo, "commit", "-m", "root commit")
+	writeGitTestFile(t, repo, "a.txt", "line1\nline2-mod\nline3\nline4\n")
+	runGitForTest(t, repo, "mv", "b.bin", "c.bin")
+	writeGitTestFile(t, repo, "d.txt", "new\n")
+	runGitForTest(t, repo, "add", "-A")
+	runGitForTest(t, repo, "commit", "-m", "second commit")
+	runGitForTest(t, repo, "checkout", "-q", "-b", "side", "HEAD~1")
+	writeGitTestFile(t, repo, "s.txt", "side\n")
+	runGitForTest(t, repo, "add", "-A")
+	runGitForTest(t, repo, "commit", "-m", "side commit")
+	runGitForTest(t, repo, "checkout", "-q", "main")
+	runGitForTest(t, repo, "merge", "--no-ff", "-m", "merge side", "side")
+	seedGitProjectForTest(t, server, "git-project", repo)
+	commits, err := newGitRunner().Log(context.Background(), repo, "main", 10)
+	if err != nil {
+		t.Fatalf("read commit log: %v", err)
+	}
+	bySubject := map[string]string{}
+	for _, commit := range commits {
+		bySubject[commit.Subject] = commit.OID
+	}
+	root = bySubject["root commit"]
+	second = bySubject["second commit"]
+	merge = bySubject["merge side"]
+	if root == "" || second == "" || merge == "" {
+		t.Fatalf("fixture commits missing: %#v", bySubject)
+	}
+	return repo, root, second, merge
+}
+
+func TestProjectGitCommitDetailReportsFilesAndStats(t *testing.T) {
+	server := newTestServer(t)
+	_, root, second, merge := seedCommitDetailFixture(t, server)
+	handler := server.routes()
+
+	fetchDetail := func(oid string) GitCommitDetail {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/commits/"+oid, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("commit detail status=%d body=%s", response.Code, response.Body.String())
+		}
+		var detail GitCommitDetail
+		if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
+			t.Fatalf("decode commit detail: %v", err)
+		}
+		return detail
+	}
+
+	rootDetail := fetchDetail(root)
+	if rootDetail.OID != root || rootDetail.Subject != "root commit" || rootDetail.Message != "root commit" {
+		t.Fatalf("root detail meta mismatch: %#v", rootDetail)
+	}
+	if len(rootDetail.Parents) != 0 {
+		t.Fatalf("root commit should have no parents: %#v", rootDetail.Parents)
+	}
+	if len(rootDetail.Files) != 2 {
+		t.Fatalf("root files: %#v", rootDetail.Files)
+	}
+	if rootDetail.Files[0] != (GitCommitFile{Path: "a.txt", Status: "added", Additions: 3, Deletions: 0}) {
+		t.Fatalf("root a.txt: %#v", rootDetail.Files[0])
+	}
+	if !rootDetail.Files[1].Binary || rootDetail.Files[1].Status != "added" {
+		t.Fatalf("root b.bin should be a binary addition: %#v", rootDetail.Files[1])
+	}
+
+	secondDetail := fetchDetail(second)
+	if len(secondDetail.Files) != 3 {
+		t.Fatalf("second files: %#v", secondDetail.Files)
+	}
+	if secondDetail.Files[0] != (GitCommitFile{Path: "a.txt", Status: "modified", Additions: 2, Deletions: 1}) {
+		t.Fatalf("second a.txt: %#v", secondDetail.Files[0])
+	}
+	if secondDetail.Files[1].Status != "renamed" || secondDetail.Files[1].Path != "c.bin" || secondDetail.Files[1].OriginalPath != "b.bin" {
+		t.Fatalf("second rename: %#v", secondDetail.Files[1])
+	}
+	if secondDetail.Files[2] != (GitCommitFile{Path: "d.txt", Status: "added", Additions: 1, Deletions: 0}) {
+		t.Fatalf("second d.txt: %#v", secondDetail.Files[2])
+	}
+
+	// 合并提交按第一个父提交计算差异：仅 s.txt 相对 main 新增。
+	mergeDetail := fetchDetail(merge)
+	if len(mergeDetail.Parents) != 2 {
+		t.Fatalf("merge parents: %#v", mergeDetail.Parents)
+	}
+	if len(mergeDetail.Files) != 1 || mergeDetail.Files[0].Path != "s.txt" || mergeDetail.Files[0].Status != "added" {
+		t.Fatalf("merge files should be s.txt added vs first parent: %#v", mergeDetail.Files)
+	}
+}
+
+func TestProjectGitCommitDiffReturnsUnifiedPatch(t *testing.T) {
+	server := newTestServer(t)
+	_, root, second, _ := seedCommitDetailFixture(t, server)
+	handler := server.routes()
+
+	fetchDiff := func(oid, path string) (int, string) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/commits/"+oid+"/diff?path="+url.QueryEscape(path), nil))
+		return response.Code, response.Body.String()
+	}
+
+	status, body := fetchDiff(second, "a.txt")
+	if status != http.StatusOK {
+		t.Fatalf("commit diff status=%d body=%s", status, body)
+	}
+	var payload struct {
+		OID     string `json:"oid"`
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode commit diff: %v", err)
+	}
+	if payload.OID != second || payload.Path != "a.txt" {
+		t.Fatalf("commit diff payload: %#v", payload)
+	}
+	for _, expected := range []string{"@@ ", "-line2", "+line2-mod", "+line4"} {
+		if !strings.Contains(payload.Content, expected) {
+			t.Fatalf("commit diff content missing %q:\n%s", expected, payload.Content)
+		}
+	}
+
+	// 根提交的差异与空树对比，整个文件以新增行呈现。
+	status, body = fetchDiff(root, "a.txt")
+	if status != http.StatusOK {
+		t.Fatalf("root commit diff status=%d body=%s", status, body)
+	}
+	if !strings.Contains(body, "+line1") {
+		t.Fatalf("root commit diff should show added content: %s", body)
+	}
+
+	// 按原始路径查询重命名文件同样允许。
+	status, _ = fetchDiff(second, "b.bin")
+	if status != http.StatusOK {
+		t.Fatalf("rename original path diff status=%d", status)
+	}
+}
+
+func TestProjectGitCommitDiffShowsRenamePatchAndMessageBody(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "r.txt", "a\nb\nc\n")
+	runGitForTest(t, repo, "add", "-A")
+	runGitForTest(t, repo, "commit", "-m", "first")
+	runGitForTest(t, repo, "mv", "r.txt", "renamed.txt")
+	writeGitTestFile(t, repo, "renamed.txt", "a\nB\nc\nd\n")
+	runGitForTest(t, repo, "add", "-A")
+	runGitForTest(t, repo, "commit", "-m", "rename with edit")
+	writeGitTestFile(t, repo, "m.txt", "content\n")
+	runGitForTest(t, repo, "add", "-A")
+	runGitForTest(t, repo, "commit", "-m", "multi subject", "-m", "body line")
+	seedGitProjectForTest(t, server, "git-project", repo)
+
+	commits, err := newGitRunner().Log(context.Background(), repo, "HEAD", 10)
+	if err != nil {
+		t.Fatalf("read commit log: %v", err)
+	}
+	bySubject := map[string]string{}
+	for _, commit := range commits {
+		bySubject[commit.Subject] = commit.OID
+	}
+	handler := server.routes()
+
+	detailResponse := httptest.NewRecorder()
+	handler.ServeHTTP(detailResponse, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/commits/"+bySubject["multi subject"], nil))
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detailResponse.Code, detailResponse.Body.String())
+	}
+	var multi GitCommitDetail
+	if err := json.Unmarshal(detailResponse.Body.Bytes(), &multi); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if multi.Subject != "multi subject" || multi.Message != "multi subject\n\nbody line" {
+		t.Fatalf("multi-line message split: subject=%q message=%q", multi.Subject, multi.Message)
+	}
+
+	detailResponse = httptest.NewRecorder()
+	handler.ServeHTTP(detailResponse, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/commits/"+bySubject["rename with edit"], nil))
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detailResponse.Code, detailResponse.Body.String())
+	}
+	var renameDetail GitCommitDetail
+	if err := json.Unmarshal(detailResponse.Body.Bytes(), &renameDetail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if len(renameDetail.Files) != 1 {
+		t.Fatalf("rename files: %#v", renameDetail.Files)
+	}
+	file := renameDetail.Files[0]
+	if file.Status != "renamed" || file.Path != "renamed.txt" || file.OriginalPath != "r.txt" || file.Additions != 2 || file.Deletions != 1 {
+		t.Fatalf("rename detail: %#v", file)
+	}
+
+	diffResponse := httptest.NewRecorder()
+	handler.ServeHTTP(diffResponse, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/commits/"+bySubject["rename with edit"]+"/diff?path=renamed.txt", nil))
+	if diffResponse.Code != http.StatusOK {
+		t.Fatalf("rename diff status=%d body=%s", diffResponse.Code, diffResponse.Body.String())
+	}
+	body := diffResponse.Body.String()
+	for _, expected := range []string{"rename from r.txt", "rename to renamed.txt", "-b", "+B", "+d"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("rename diff missing %q:\n%s", expected, body)
+		}
+	}
+	if strings.Contains(body, "new file mode") {
+		t.Fatalf("rename diff degraded to a full addition:\n%s", body)
+	}
+}
+
+func TestProjectGitCommitRoutesRejectUntrustedInput(t *testing.T) {
+	server := newTestServer(t)
+	repoPath, _, second, _ := seedCommitDetailFixture(t, server)
+	handler := server.routes()
+
+	// HEAD 这类非对象 ID 输入直接拒绝，不透传给 git。
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/commits/HEAD", nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("non-OID ref should be rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	// 合法格式但不是提交对象（树对象）也应被 cat-file 校验拒绝。
+	treeOID := strings.TrimSpace(gitOutputForTest(t, repoPath, "rev-parse", second+"^{tree}"))
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/commits/"+treeOID, nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("tree OID should be rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	for _, requestPath := range []string{
+		"/api/projects/git-project/git/commits/shortoid123",
+		"/api/projects/git-project/git/commits/" + strings.Repeat("0", 40),
+		"/api/projects/git-project/git/commits/" + second + "/diff?path=not-in-commit.txt",
+		"/api/projects/git-project/git/commits/" + second + "/diff?path=" + url.QueryEscape(":(top)"),
+		"/api/projects/git-project/git/commits/" + second + "/diff?path=" + url.QueryEscape("/etc/passwd"),
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, requestPath, nil))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d body=%s", requestPath, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestProjectGitSummaryIssuesStateTokenAndStageRejectsStaleState(t *testing.T) {
 	server := newTestServer(t)
 	repo := newTempGitRepository(t)
@@ -8148,6 +8581,190 @@ func TestListGitOperationsForWorkspaceSeparatesWorktrees(t *testing.T) {
 	}
 }
 
+func TestListGitOperationsForWorkspaceFiltered(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	projectPath := t.TempDir()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('git-filter-project','git-filter-project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	workspace := ConversationWorkspace{ID: "filter-workspace", Mode: "project_shared", Path: projectPath}
+	rows := []struct{ id, typ, status, summary string }{
+		{"op-1", "commit", "succeeded", "commit initial"},
+		{"op-2", "push", "succeeded", "push origin main"},
+		{"op-3", "commit", "failed", "commit broken work"},
+		{"op-4", "fetch", "succeeded", "fetch origin"},
+		{"op-5", "commit", "needs_attention", "commit partial"},
+	}
+	for index, row := range rows {
+		at := now.Add(time.Duration(-index) * time.Second)
+		if _, err := server.db.Exec(`insert into git_operations (id,project_id,workspace_id,workspace_path,type,status,request_summary,error_message,before_state,requested_at) values (?,?,'filter-workspace',?,?,?,?,?,?,?)`, row.id, "git-filter-project", projectPath, row.typ, row.status, row.summary, "f-"+row.id, "{}", at); err != nil {
+			t.Fatalf("insert %s: %v", row.id, err)
+		}
+	}
+
+	byType, err := server.listGitOperationsForWorkspaceFiltered(context.Background(), "git-filter-project", workspace, gitOperationFilter{Type: "commit"}, 50, 0)
+	if err != nil {
+		t.Fatalf("filter by type: %v", err)
+	}
+	if len(byType) != 3 {
+		t.Fatalf("commit-type count=%d want 3: %#v", len(byType), byType)
+	}
+
+	byStatus, err := server.listGitOperationsForWorkspaceFiltered(context.Background(), "git-filter-project", workspace, gitOperationFilter{Status: gitOperationFailed}, 50, 0)
+	if err != nil {
+		t.Fatalf("filter by status: %v", err)
+	}
+	if len(byStatus) != 1 || byStatus[0].ID != "op-3" {
+		t.Fatalf("failed operations=%#v", byStatus)
+	}
+
+	byQuery, err := server.listGitOperationsForWorkspaceFiltered(context.Background(), "git-filter-project", workspace, gitOperationFilter{Query: "origin"}, 50, 0)
+	if err != nil {
+		t.Fatalf("filter by query: %v", err)
+	}
+	if len(byQuery) != 2 {
+		t.Fatalf("query count=%d want 2: %#v", len(byQuery), byQuery)
+	}
+
+	// 分页：按 requested_at 倒序，skip=2 应跳过最近的 op-1、op-2。
+	paged, err := server.listGitOperationsForWorkspaceFiltered(context.Background(), "git-filter-project", workspace, gitOperationFilter{}, 2, 2)
+	if err != nil {
+		t.Fatalf("paginate operations: %v", err)
+	}
+	if len(paged) != 2 || paged[0].ID != "op-3" || paged[1].ID != "op-4" {
+		t.Fatalf("paged operations=%#v", paged)
+	}
+
+	// 非法的类型/状态筛选应被校验拦截。
+	if err := validateGitOperationFilter(gitOperationFilter{Type: "not_a_type"}); err == nil {
+		t.Fatal("unknown operation type filter was accepted")
+	}
+	if err := validateGitOperationFilter(gitOperationFilter{Status: "not_a_status"}); err == nil {
+		t.Fatal("unknown operation status filter was accepted")
+	}
+}
+
+// TestGitOperationsHTTPFiltering 走真实 HTTP 路由验证操作记录的筛选/检索/分页/参数校验。
+func TestGitOperationsHTTPFiltering(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	seedGitProjectForTest(t, server, "git-http-ops", repo)
+	now := time.Now().UTC()
+	rows := []struct{ id, typ, status, summary string }{
+		{"op-1", "commit", "succeeded", "commit initial"},
+		{"op-2", "push", "failed", "push origin main"},
+		{"op-3", "commit", "failed", "commit broken work"},
+		{"op-4", "fetch", "succeeded", "fetch origin"},
+	}
+	for index, row := range rows {
+		at := now.Add(time.Duration(-index) * time.Second)
+		if _, err := server.db.Exec(`insert into git_operations (id,project_id,workspace_id,workspace_path,type,status,request_summary,error_message,before_state,requested_at) values (?,?,?,?,?,?,?,?,?,?)`, row.id, "git-http-ops", "project-shared:git-http-ops", repo, row.typ, row.status, row.summary, "f-"+row.id, "{}", at); err != nil {
+			t.Fatalf("insert %s: %v", row.id, err)
+		}
+	}
+	handler := server.routes()
+	get := func(path string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		return response
+	}
+	body := func(response *httptest.ResponseRecorder, wantStatus int) string {
+		t.Helper()
+		if response.Code != wantStatus {
+			t.Fatalf("%s status=%d body=%s", response.Result().Request.URL.String(), response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	// 组合筛选：type=commit 且 status=failed 只命中 op-3。
+	filtered := body(get("/api/projects/git-http-ops/git/operations?type=commit&status=failed"), http.StatusOK)
+	for _, hit := range []string{"op-3"} {
+		if !strings.Contains(filtered, hit) {
+			t.Fatalf("filtered dropped %s: %s", hit, filtered)
+		}
+	}
+	for _, miss := range []string{"op-1", "op-2", "op-4"} {
+		if strings.Contains(filtered, miss) {
+			t.Fatalf("filtered leaked %s: %s", miss, filtered)
+		}
+	}
+
+	// 关键字检索：summary 含 "origin" 的 op-2、op-4。
+	searched := body(get("/api/projects/git-http-ops/git/operations?q=origin"), http.StatusOK)
+	for _, hit := range []string{"op-2", "op-4"} {
+		if !strings.Contains(searched, hit) {
+			t.Fatalf("search dropped %s: %s", hit, searched)
+		}
+	}
+	for _, miss := range []string{"op-1", "op-3"} {
+		if strings.Contains(searched, miss) {
+			t.Fatalf("search leaked %s: %s", miss, searched)
+		}
+	}
+
+	// 分页：按 requested_at 倒序，skip=1 limit=2 应命中 op-2、op-3。
+	paged := body(get("/api/projects/git-http-ops/git/operations?limit=2&skip=1"), http.StatusOK)
+	for _, hit := range []string{"op-2", "op-3"} {
+		if !strings.Contains(paged, hit) {
+			t.Fatalf("paged dropped %s: %s", hit, paged)
+		}
+	}
+
+	// 参数校验：非法 type/status/skip/limit 应返回 400。
+	body(get("/api/projects/git-http-ops/git/operations?type=bogus"), http.StatusBadRequest)
+	body(get("/api/projects/git-http-ops/git/operations?status=bogus"), http.StatusBadRequest)
+	body(get("/api/projects/git-http-ops/git/operations?skip=-1"), http.StatusBadRequest)
+	body(get("/api/projects/git-http-ops/git/operations?limit=999"), http.StatusBadRequest)
+}
+
+// TestGitLogHTTPQueryAndSkip 走真实 HTTP 路由验证提交历史的关键字检索与分页。
+func TestGitLogHTTPQueryAndSkip(t *testing.T) {
+	server := newTestServer(t)
+	repo := newTempGitRepository(t)
+	for _, subject := range []string{"alpha init", "third party feat", "ALPHA docs", "chore cleanup"} {
+		writeGitTestFile(t, repo, "readme.txt", subject+"\n")
+		runGitForTest(t, repo, "add", "readme.txt")
+		runGitForTest(t, repo, "commit", "-m", subject)
+	}
+	seedGitProjectForTest(t, server, "git-http-log", repo)
+	handler := server.routes()
+	fetch := func(path string) []GitCommit {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		var commits []GitCommit
+		if err := json.Unmarshal(response.Body.Bytes(), &commits); err != nil {
+			t.Fatalf("%s unmarshal: %v", path, err)
+		}
+		return commits
+	}
+
+	// 关键字：忽略大小写，命中 "alpha init" 与 "ALPHA docs"。
+	matched := fetch("/api/projects/git-http-log/git/log?ref=main&q=alpha")
+	if len(matched) != 2 {
+		t.Fatalf("search matched %d want 2", len(matched))
+	}
+
+	// 分页：skip=2 应跳过最新两条，剩较旧的 "third party feat" 与 "alpha init"。
+	paged := fetch("/api/projects/git-http-log/git/log?ref=main&skip=2")
+	if len(paged) != 2 || paged[0].Subject != "third party feat" || paged[1].Subject != "alpha init" {
+		t.Fatalf("paged commits=%#v", paged)
+	}
+
+	// 非法 skip/limit 应返回 400。
+	for _, path := range []string{"/api/projects/git-http-log/git/log?ref=main&skip=-1", "/api/projects/git-http-log/git/log?ref=main&limit=0"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d want 400", path, response.Code)
+		}
+	}
+}
+
 func TestMigrateRunWorkspaceColumnsUpgradesLegacySchema(t *testing.T) {
 	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "legacy-runs.db"))
 	if err != nil {
@@ -8384,6 +9001,16 @@ func runGitForTest(t *testing.T, repo string, args ...string) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
+}
+
+func gitOutputForTest(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+	return string(output)
 }
 
 func writeFakeGit(t *testing.T, script string) string {

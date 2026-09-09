@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import {
   filterFindingsByType,
   insightFindingCounts,
@@ -142,13 +143,21 @@ export function InsightsPanel({ projectID, request, fail }: {
     verifyInFlight.size > 0 ||
     findings.some((f) => f.verificationResult === "pending") ||
     invalidated.some((f) => f.verificationResult === "pending");
+  // 页面不可见（窗口最小化/切到后台标签页）时暂停轮询，避免空耗请求与电量；
+  // 仅在从「不可见」回到「可见」的那一下补拉一次，补齐后台期间服务器侧已推进的状态。
+  const documentVisible = useDocumentVisible();
+  const prevDocumentVisible = useRef(documentVisible);
   useEffect(() => {
+    const becameVisible = documentVisible && !prevDocumentVisible.current;
+    prevDocumentVisible.current = documentVisible;
+    if (!documentVisible) return;
     if (scan?.status !== "running" && !anyVerifying) return;
+    if (becameVisible) void loadInsights().catch(() => undefined);
     const interval = window.setInterval(() => {
       void loadInsights().catch(() => undefined);
     }, 2_000);
     return () => window.clearInterval(interval);
-  }, [scan?.status, anyVerifying, loadInsights]);
+  }, [documentVisible, scan?.status, anyVerifying, loadInsights]);
 
   // 新进度事件到达时把日志滚到底部，始终展示最新一条分析信息。
   useEffect(() => {

@@ -230,7 +230,7 @@ test("desktop conversation is a full-height three-column workspace", () => {
 });
 
 test("task queue has one named landmark", () => {
-  assert.match(conversationPage, /<aside className="task-queue-rail" aria-label="任务队列">/);
+  assert.match(conversationPage, /<aside className="task-queue-rail" aria-label="任务队列"( data-collapsed=\{conversationPanels\.taskQueue \? "true" : undefined\})?>/);
   assert.match(taskQueue, /return <div className=\{`task-queue \$\{mobileOpen \? "mobile-open" : ""\}`\}>/);
   assert.doesNotMatch(taskQueue, /<section className=\{`task-queue[^>]*aria-label="任务队列"/);
 });
@@ -411,7 +411,7 @@ test("history dialog deletes one conversation and clears all history", () => {
   assert.match(conversationPage, /title: "删除会话"/);
   assert.match(conversationPage, /confirmLabel: "删除"/);
   assert.match(conversationPage, /const deleteHistoryConversationConfirmed = async \(conversationID: string\) => \{/);
-  assert.match(conversationPage, /`\/api\/conversations\/\$\{conversationID\}`, \{ method: "DELETE" \}\)/);
+  assert.match(conversationPage, /apiWithTimeout\(`\/api\/conversations\/\$\{conversationID\}`, \{ method: "DELETE" \}, 0, 120_000\)/);
   assert.match(conversationPage, /removeUnavailableConversationTabs\(\[conversationID\]\);/);
   // 自动编排会话是只读系统会话，不渲染删除按钮。
   assert.match(conversationPage, /!orchestration && <button type="button" className="history-item-delete"/);
@@ -502,4 +502,24 @@ test("known Codex stdin notices do not render as errors", () => {
   assert.match(timelineLib, /const ignoredCodexStderr = new Set\(\["Reading additional input from stdin\.\.\."\]\);/);
   assert.match(timelineLib, /function isIgnoredCLIStderr\(message: string\): boolean/);
   assert.match(timelineLib, /event\.type === "stderr"[\s\S]*?!isIgnoredCLIStderr\(payload\.message\)/);
+});
+
+test("conversation side modules collapse through header toggles and persist per project", () => {
+  // 折叠状态按项目持久化到 localStorage。
+  assert.match(conversationPage, /import \{ readConversationPanels, writeConversationPanels[\s\S]*?conversation-panels/);
+  assert.match(conversationPage, /const \[conversationPanelsState, setConversationPanelsState\] = useState<\{ projectId: string; collapsed: ConversationPanelsState \}>/);
+  assert.match(conversationPage, /const conversationPanels = conversationPanelsState\.collapsed;/);
+  assert.match(conversationPage, /writeConversationPanels\(projectId, conversationPanelsState\.collapsed\)/);
+  // 常用提示词 / 常用命令 / 技能三块标题行均可点击折叠。
+  assert.match(conversationPage, /className="quick-tag-heading-toggle"[\s\S]*?aria-expanded=\{!conversationPanels\.prompt\}[\s\S]*?toggleConversationPanel\("prompt"\)/);
+  assert.match(conversationPage, /className="quick-tag-heading-toggle"[\s\S]*?aria-expanded=\{!conversationPanels\.command\}[\s\S]*?toggleConversationPanel\("command"\)/);
+  assert.match(conversationPage, /renderSkillGroup\(\{ collapsible: true, collapsed: conversationPanels\.skills, onToggle: \(\) => toggleConversationPanel\("skills"\) \}\)/);
+  // 折叠箭头会随折叠状态翻转（展开朝上、折叠朝下）。
+  assert.match(stylesheet, /\.quick-tag-group\.collapsed \.quick-tag-heading-chevron \{[^}]*transform: rotate\(180deg\);/s);
+  // 任务队列标题提供折叠箭头；折叠后在宽屏收敛为右侧窄条。
+  assert.match(taskQueue, /task-queue-fold[\s\S]*?aria-expanded=\{!collapsed\}[\s\S]*?onClick=\{\(\) => onToggleCollapsed\?\.\(\)\}/);
+  assert.match(conversationPage, /data-collapsed=\{conversationPanels\.taskQueue \? "true" : undefined\}/);
+  assert.match(conversationPage, /collapsed=\{conversationPanels\.taskQueue\} onToggleCollapsed=\{\(\) => toggleConversationPanel\("taskQueue"\)\}/);
+  assert.match(stylesheet, /@media \(min-width: 1200px\)[\s\S]*?\.conversation-canvas\[data-queue-collapsed="true"\]/);
+  assert.match(stylesheet, /\.task-queue-rail\[data-collapsed="true"\] \.task-queue-panel \{\s*display:\s*none;\s*\}/);
 });

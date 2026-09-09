@@ -8,6 +8,7 @@ import { detectLanguage, isEditableFile } from "./file-model";
 import { getPreviewKind, isTextPreview } from "./source-language";
 import { FileIcon } from "./FileIcon";
 import { useCodeFontSize } from "./useCodeFontSize";
+import type { NavigationGuard } from "../../components/ProjectLayout";
 
 interface FilesPanelProps {
   projectId: string;
@@ -16,6 +17,7 @@ interface FilesPanelProps {
   request: <T>(path: string, init?: RequestInit) => Promise<T>;
   isWorkspaceOccupied: boolean;
   onAddToChat?: (path: string) => void;
+  registerNavigationGuard: (guard: NavigationGuard | null) => void;
 }
 
 const MAX_OPEN_TABS = 10;
@@ -41,6 +43,7 @@ export function FilesPanel({
   request,
   isWorkspaceOccupied,
   onAddToChat,
+  registerNavigationGuard,
 }: FilesPanelProps) {
 	const workspaceQuery = conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : "";
 	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${workspaceQuery}`;
@@ -65,6 +68,7 @@ export function FilesPanel({
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [pendingDiscard, setPendingDiscard] = useState<{ files: OpenFile[]; proceed: () => void } | null>(null);
   const [mobileView, setMobileView] = useState<"tree" | "editor">("tree");
   const treeRefreshRef = useRef<(() => void) | null>(null);
   const dialogRef = useRef<HTMLElement | null>(null);
@@ -81,6 +85,36 @@ export function FilesPanel({
   const readOnly = isWorkspaceOccupied;
   const activeFile = openFiles.find((f) => f.path === activeFilePath) || null;
   const activeDialog = showNewFileDialog ? "create" : showRenameDialog ? "rename" : showDeleteConfirm ? "delete" : null;
+
+  const requestDiscard = useCallback((files: OpenFile[], proceed: () => void) => {
+    const dirtyFiles = files.filter((file) => file.isDirty);
+    if (dirtyFiles.length === 0) {
+      proceed();
+      return;
+    }
+    setPendingDiscard({ files: dirtyFiles, proceed });
+  }, []);
+
+  const dirtyFiles = openFiles.filter((file) => file.isDirty);
+
+  useEffect(() => {
+    if (dirtyFiles.length === 0) {
+      registerNavigationGuard(null);
+      return;
+    }
+    registerNavigationGuard((proceed) => requestDiscard(openFilesRef.current, proceed));
+    return () => registerNavigationGuard(null);
+  }, [dirtyFiles.length, registerNavigationGuard, requestDiscard]);
+
+  useEffect(() => {
+    if (dirtyFiles.length === 0) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [dirtyFiles.length]);
 
   const closeActiveDialog = useCallback(() => {
     setShowNewFileDialog(null);
@@ -187,42 +221,46 @@ export function FilesPanel({
   // 关闭标签
   const closeTab = useCallback(
     (path: string) => {
-      setOpenFiles((prev) => prev.filter((f) => f.path !== path));
-      setActiveFilePath((prevActive) => {
-        if (prevActive !== path) return prevActive;
-        const current = openFilesRef.current.filter((f) => f.path !== path);
-        if (current.length > 0) {
-          const idx = openFilesRef.current.findIndex((f) => f.path === path);
-          const nextIdx = Math.min(idx, current.length - 1);
-          return current[nextIdx]?.path || null;
-        }
-        return null;
+      const file = openFilesRef.current.find((item) => item.path === path);
+      if (!file) return;
+      requestDiscard([file], () => {
+        setOpenFiles((prev) => prev.filter((f) => f.path !== path));
+        setActiveFilePath((prevActive) => {
+          if (prevActive !== path) return prevActive;
+          const current = openFilesRef.current.filter((f) => f.path !== path);
+          if (current.length > 0) {
+            const idx = openFilesRef.current.findIndex((f) => f.path === path);
+            return current[Math.min(idx, current.length - 1)]?.path || null;
+          }
+          return null;
+        });
+        if (editingFileRef.current === path) setEditingFile(null);
       });
-      if (editingFileRef.current === path) {
-        setEditingFile(null);
-      }
     },
-    []
+    [requestDiscard]
   );
 
   // 关闭其他标签
   const closeOthers = useCallback(
     (path: string) => {
-      setOpenFiles((prev) => prev.filter((f) => f.path === path));
-      setActiveFilePath(path);
-      if (editingFileRef.current && editingFileRef.current !== path) {
-        setEditingFile(null);
-      }
+      const toClose = openFilesRef.current.filter((file) => file.path !== path);
+      requestDiscard(toClose, () => {
+        setOpenFiles((prev) => prev.filter((f) => f.path === path));
+        setActiveFilePath(path);
+        if (editingFileRef.current && editingFileRef.current !== path) setEditingFile(null);
+      });
     },
-    []
+    [requestDiscard]
   );
 
   // 关闭所有标签
   const closeAll = useCallback(() => {
-    setOpenFiles([]);
-    setActiveFilePath(null);
-    setEditingFile(null);
-  }, []);
+    requestDiscard(openFilesRef.current, () => {
+      setOpenFiles([]);
+      setActiveFilePath(null);
+      setEditingFile(null);
+    });
+  }, [requestDiscard]);
 
   // 关闭左侧标签
   const closeLeft = useCallback(
@@ -231,17 +269,14 @@ export function FilesPanel({
       const idx = current.findIndex((f) => f.path === path);
       if (idx <= 0) return;
       const toClose = current.slice(0, idx);
-      const closedPaths = new Set(toClose.map((f) => f.path));
-      setOpenFiles((prev) => prev.filter((f) => !closedPaths.has(f.path)));
-      if (editingFileRef.current && closedPaths.has(editingFileRef.current)) {
-        setEditingFile(null);
-      }
-      setActiveFilePath((prevActive) => {
-        if (prevActive && closedPaths.has(prevActive)) return path;
-        return prevActive;
+      requestDiscard(toClose, () => {
+        const closedPaths = new Set(toClose.map((file) => file.path));
+        setOpenFiles((prev) => prev.filter((file) => !closedPaths.has(file.path)));
+        if (editingFileRef.current && closedPaths.has(editingFileRef.current)) setEditingFile(null);
+        setActiveFilePath((prevActive) => prevActive && closedPaths.has(prevActive) ? path : prevActive);
       });
     },
-    []
+    [requestDiscard]
   );
 
   // 关闭右侧标签
@@ -251,17 +286,14 @@ export function FilesPanel({
       const idx = current.findIndex((f) => f.path === path);
       if (idx < 0 || idx >= current.length - 1) return;
       const toClose = current.slice(idx + 1);
-      const closedPaths = new Set(toClose.map((f) => f.path));
-      setOpenFiles((prev) => prev.filter((f) => !closedPaths.has(f.path)));
-      if (editingFileRef.current && closedPaths.has(editingFileRef.current)) {
-        setEditingFile(null);
-      }
-      setActiveFilePath((prevActive) => {
-        if (prevActive && closedPaths.has(prevActive)) return path;
-        return prevActive;
+      requestDiscard(toClose, () => {
+        const closedPaths = new Set(toClose.map((file) => file.path));
+        setOpenFiles((prev) => prev.filter((file) => !closedPaths.has(file.path)));
+        if (editingFileRef.current && closedPaths.has(editingFileRef.current)) setEditingFile(null);
+        setActiveFilePath((prevActive) => prevActive && closedPaths.has(prevActive) ? path : prevActive);
       });
     },
-    []
+    [requestDiscard]
   );
 
   // 进入编辑模式
@@ -597,6 +629,19 @@ export function FilesPanel({
       </div>
 
       {/* 新建文件/目录对话框 */}
+      {pendingDiscard && (
+        <div className="files-dialog-backdrop" role="presentation">
+          <section className="files-dialog" role="dialog" aria-modal="true" aria-labelledby="discard-unsaved-title">
+            <header><h3 id="discard-unsaved-title">放弃未保存的更改？</h3></header>
+            <p>以下文件有未保存的编辑：{pendingDiscard.files.map((file) => file.name).join("、")}。继续操作将丢失这些更改。</p>
+            <div className="files-dialog-actions">
+              <button type="button" onClick={() => setPendingDiscard(null)}>取消</button>
+              <button type="button" className="primary danger" onClick={() => { const action = pendingDiscard.proceed; setPendingDiscard(null); action(); }}>放弃更改</button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {showNewFileDialog && (
         <div className="files-dialog-backdrop" onClick={closeActiveDialog}>
           <section ref={dialogRef} className="files-dialog" role="dialog" aria-modal="true" aria-labelledby="file-create-title" onClick={(e) => e.stopPropagation()}>

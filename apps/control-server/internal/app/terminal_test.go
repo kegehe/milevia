@@ -150,6 +150,37 @@ func TestTerminalRestoreProjectAllowsNewLease(t *testing.T) {
 	}
 }
 
+func TestTerminalManagerLimitsFallbackToDefaults(t *testing.T) {
+	manager := newTerminalManager(&Server{})
+	if got := manager.maxProjects(); got != defaultTerminalMaxProjects {
+		t.Fatalf("default max projects = %d, want %d", got, defaultTerminalMaxProjects)
+	}
+	if got := manager.maxPerProject(); got != defaultTerminalMaxPerProject {
+		t.Fatalf("default max per project = %d, want %d", got, defaultTerminalMaxPerProject)
+	}
+	if defaultTerminalMaxPerProject < 6 {
+		t.Fatalf("default terminal concurrency cap regressed to %d; the fixed cap of 3 was reported as too tight", defaultTerminalMaxPerProject)
+	}
+}
+
+func TestTerminalManagerLimitsReadFromConfig(t *testing.T) {
+	manager := newTerminalManager(&Server{config: Config{TerminalMaxProjects: 7, TerminalMaxPerProject: 5}})
+	if got := manager.maxProjects(); got != 7 {
+		t.Fatalf("max projects = %d, want 7", got)
+	}
+	if got := manager.maxPerProject(); got != 5 {
+		t.Fatalf("max per project = %d, want 5", got)
+	}
+	// 配置未设置（<=0）时仍回退到默认值，保证直接构造 &Server{} 的单测行为稳定。
+	fallback := newTerminalManager(&Server{config: Config{TerminalMaxProjects: 0, TerminalMaxPerProject: -1}})
+	if got := fallback.maxProjects(); got != defaultTerminalMaxProjects {
+		t.Fatalf("fallback max projects = %d, want %d", got, defaultTerminalMaxProjects)
+	}
+	if got := fallback.maxPerProject(); got != defaultTerminalMaxPerProject {
+		t.Fatalf("fallback max per project = %d, want %d", got, defaultTerminalMaxPerProject)
+	}
+}
+
 func TestTerminalCreateIsInvalidatedByShutdown(t *testing.T) {
 	session := &testTerminalSession{id: "terminal", ready: make(chan error, 1)}
 	factory := &blockingTerminalFactory{started: make(chan struct{}), release: make(chan struct{}), session: session}

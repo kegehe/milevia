@@ -169,6 +169,62 @@ func TestRemoteOutboxSkippedWithOnlyLocalAgentToken(t *testing.T) {
 	}
 }
 
+func TestRuntimeAgentCredentialsEnablePairingAndOutbox(t *testing.T) {
+	db := newRemoteTestDB(t)
+	defer db.Close()
+	s := &Server{db: db, config: Config{RemoteAgentToken: "local-agent-token"}}
+	if err := s.migrateRemoteControl(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/agent/pairings" {
+			t.Fatalf("path=%q", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Milevia-Agent-Token"); got != "dynamic-agent-token" {
+			t.Fatalf("agent token=%q", got)
+		}
+		if got := r.Header.Get("X-Milevia-Instance-ID"); got != "dynamic-instance-id" {
+			t.Fatalf("instance ID=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"pairingId":"pairing-1","code":"123456"}`))
+	}))
+	defer cloud.Close()
+	body := fmt.Sprintf(`{"cloudUrl":%q,"instanceId":"dynamic-instance-id","agentToken":"dynamic-agent-token"}`, cloud.URL)
+	credentialRequest := httptest.NewRequest(http.MethodPost, "/api/remote/credentials", strings.NewReader(body))
+	credentialRequest.Header.Set("X-Milevia-Agent-Token", "local-agent-token")
+	credentialResponse := httptest.NewRecorder()
+	s.remoteAgentOnly(http.HandlerFunc(s.updateRemoteCredentials)).ServeHTTP(credentialResponse, credentialRequest)
+	if credentialResponse.Code != http.StatusOK {
+		t.Fatalf("credential status=%d body=%s", credentialResponse.Code, credentialResponse.Body.String())
+	}
+	if !s.remoteRelayConfigured() {
+		t.Fatal("runtime credentials did not configure the remote relay")
+	}
+	pairingResponse := httptest.NewRecorder()
+	s.createRemotePairing(pairingResponse, httptest.NewRequest(http.MethodPost, "/api/remote/pairing", nil))
+	if pairingResponse.Code != http.StatusCreated {
+		t.Fatalf("pairing status=%d body=%s", pairingResponse.Code, pairingResponse.Body.String())
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordTaskEventTx(context.Background(), tx, "task-1", "", "task.created", map[string]string{"status": "todo"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var outbox int
+	if err := db.QueryRow(`select count(*) from remote_outbox`).Scan(&outbox); err != nil {
+		t.Fatal(err)
+	}
+	if outbox != 1 {
+		t.Fatalf("outbox=%d, want 1", outbox)
+	}
+}
+
 func TestRemoteOverviewScansSQLiteExpressionTimestamp(t *testing.T) {
 	db := newRemoteTestDB(t)
 	defer db.Close()

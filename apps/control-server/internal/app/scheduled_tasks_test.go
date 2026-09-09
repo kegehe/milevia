@@ -29,15 +29,15 @@ func TestScheduledTaskCreateListAndManualRun(t *testing.T) {
 	projectID := seedScheduledTaskProject(t, server)
 
 	payload := map[string]any{
-		"title":          "Nightly review",
-		"prompt":         "Review the project and report risks.",
-		"agentId":        "claude-code",
-		"permissionMode": "full_control",
+		"title":                "Nightly review",
+		"prompt":               "Review the project and report risks.",
+		"agentId":              "claude-code",
+		"permissionMode":       "full_control",
 		"fullControlConfirmed": true,
-		"scheduleType":   "daily",
-		"timezone":       "Asia/Shanghai",
-		"timeOfDay":      "23:30",
-		"enabled":        true,
+		"scheduleType":         "daily",
+		"timezone":             "Asia/Shanghai",
+		"timeOfDay":            "23:30",
+		"enabled":              true,
 	}
 	created := httptest.NewRecorder()
 	server.routes().ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/scheduled-tasks", jsonBody(t, payload)))

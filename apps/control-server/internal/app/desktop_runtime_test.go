@@ -84,15 +84,24 @@ func TestDesktopSessionProtectsHTTPAndWebSocket(t *testing.T) {
 		t.Fatalf("missing session status: got %d want %d", unauthorized.Code, http.StatusUnauthorized)
 	}
 
-	// The Agent relay has its own authentication middleware and must not be
-	// blocked by the browser session middleware. With no explicit relay token,
-	// a loopback request is accepted by remoteAgentOnly in development.
+	// 桌面模式绝不接受无令牌的 loopback Agent 请求，避免本机任意进程伪造
+	// 远程同步。桌面宿主会在启动 sidecar 与 Agent 时注入同一随机令牌。
 	remoteRequest := httptest.NewRequest(http.MethodGet, "/api/remote/snapshot", nil)
 	remoteRequest.RemoteAddr = "127.0.0.1:43210"
 	remote := httptest.NewRecorder()
 	server.routes().ServeHTTP(remote, remoteRequest)
-	if remote.Code != http.StatusOK {
-		t.Fatalf("local Agent relay status: got %d body=%s", remote.Code, remote.Body.String())
+	if remote.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated local Agent relay status: got %d body=%s", remote.Code, remote.Body.String())
+	}
+	// 同一随机令牌注入到 sidecar 与 Agent 后，本地 relay 正常可用。
+	server.config.RemoteAgentToken = "desktop-agent-token"
+	authenticatedRemoteRequest := httptest.NewRequest(http.MethodGet, "/api/remote/snapshot", nil)
+	authenticatedRemoteRequest.RemoteAddr = "127.0.0.1:43210"
+	authenticatedRemoteRequest.Header.Set("X-Milevia-Agent-Token", "desktop-agent-token")
+	authenticatedRemote := httptest.NewRecorder()
+	server.routes().ServeHTTP(authenticatedRemote, authenticatedRemoteRequest)
+	if authenticatedRemote.Code != http.StatusOK {
+		t.Fatalf("authenticated local Agent relay status: got %d body=%s", authenticatedRemote.Code, authenticatedRemote.Body.String())
 	}
 
 	authorizedRequest := httptest.NewRequest(http.MethodGet, "/api/projects", nil)

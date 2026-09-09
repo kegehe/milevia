@@ -19,6 +19,12 @@ import (
 // 跳过 wsl-local runner 注册，绝不影响 windows-local。本文件不加 build tag：
 // Linux 上 exec.LookPath("wsl.exe") 自然失败，函数内 OS 无关，CI 可编译。
 
+// wslDiscoveryProbeTimeout 是启动期 WSL 探测的兜底超时。探测 home 的
+// `wsl.exe -d <distro> -e sh -c 'echo $HOME'` 会冷启动 WSL 发行版（首次启动需拉起
+// 轻量虚拟机，实测可达数秒到十几秒），5s 档过紧会让冷启动场景下的 wsl-local 注册失败
+// 且进程存活期内不重试。这里放宽到 30s；探测仍以 ctx 自带截止时间为准（更早时提前返回）。
+const wslDiscoveryProbeTimeout = 30 * time.Second
+
 // wslExePath 返回 wsl.exe 的绝对路径；找不到时返回错误。
 func wslExePath() (string, error) {
 	return exec.LookPath("wsl.exe")
@@ -26,7 +32,7 @@ func wslExePath() (string, error) {
 
 // detectDefaultWSLDistro 返回 WSL 默认发行版名（如 "Ubuntu"）。
 // wsl.exe --list --quiet 的输出为 UTF-16LE（通常带 BOM），需解码后取第一个非空行。
-// ctx 无截止时间时兜底 5s 超时，避免 WSL 互操作挂起阻塞启动。
+// ctx 无截止时间时兜底 wslDiscoveryProbeTimeout 超时，避免 WSL 互操作挂起阻塞启动。
 func detectDefaultWSLDistro(ctx context.Context) (string, error) {
 	wslPath, err := wslExePath()
 	if err != nil {
@@ -35,7 +41,7 @@ func detectDefaultWSLDistro(ctx context.Context) (string, error) {
 	probeCtx := ctx
 	if _, hasDeadline := probeCtx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
+		probeCtx, cancel = context.WithTimeout(probeCtx, wslDiscoveryProbeTimeout)
 		defer cancel()
 	}
 	out, err := runWSLProbe(probeCtx, wslPath, "--list", "--quiet")
@@ -52,7 +58,8 @@ func detectDefaultWSLDistro(ctx context.Context) (string, error) {
 }
 
 // detectWSLHome 返回指定发行版内当前用户的 Linux home 路径（如 "/home/user"）。
-// wsl.exe -e sh -c '...' 的 stdout 为 UTF-8。
+// wsl.exe -e sh -c '...' 的 stdout 为 UTF-8。ctx 无截止时间时兜底
+// wslDiscoveryProbeTimeout——此命令会冷启动 WSL 发行版，超时过紧会导致注册失败。
 func detectWSLHome(ctx context.Context, distro string) (string, error) {
 	wslPath, err := wslExePath()
 	if err != nil {
@@ -61,7 +68,7 @@ func detectWSLHome(ctx context.Context, distro string) (string, error) {
 	probeCtx := ctx
 	if _, hasDeadline := probeCtx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
+		probeCtx, cancel = context.WithTimeout(probeCtx, wslDiscoveryProbeTimeout)
 		defer cancel()
 	}
 	out, err := runWSLProbe(probeCtx, wslPath, "-d", distro, "-e", "sh", "-c", "echo $HOME")

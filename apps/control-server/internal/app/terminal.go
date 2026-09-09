@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,16 +21,31 @@ import (
 )
 
 const (
-	terminalMaxProjects    = 12
-	terminalMaxPerProject  = 3
-	terminalMaxInput       = 64 << 10
-	terminalMaxOutputFrame = 256 << 10
-	terminalMaxReplay      = 1 << 20
-	terminalMaxQueue       = 1 << 20
-	terminalDetachedTTL    = 60 * time.Second
-	terminalStartupTimeout = 10 * time.Second
-	terminalShutdownWait   = 10 * time.Second
+	// defaultTerminalMaxProjects / defaultTerminalMaxPerProject 是并发会话上限的
+	// 默认值，可用 AUTO_TERMINAL_MAX_PROJECTS 与 AUTO_TERMINAL_MAX_PER_PROJECT
+	// 覆盖。旧默认 12 / 3 对同时跑构建、调试与多个 Shell 的重负载用户偏紧，改为
+	// 24 / 8 后仍按“每项目 + 全局”双上限约束资源占用。
+	defaultTerminalMaxProjects   = 24
+	defaultTerminalMaxPerProject = 8
+	terminalMaxInput             = 64 << 10
+	terminalMaxOutputFrame       = 256 << 10
+	terminalMaxReplay            = 1 << 20
+	terminalMaxQueue             = 1 << 20
+	terminalDetachedTTL          = 60 * time.Second
+	terminalStartupTimeout       = 10 * time.Second
+	terminalShutdownWait         = 10 * time.Second
+	// terminalElevationPromptTimeout 覆盖 UAC 弹窗的等待：ShellExecuteEx(runas)
+	// 会阻塞到用户点允许/取消。启动一个"管理员终端"的 Open 使用该更长上限，
+	// 普通终端仍用 terminalStartupTimeout。
+	terminalElevationPromptTimeout = 2 * time.Minute
 )
+
+// terminalShellToken 是 Windows 目标终端允许的 Shell 枚举。协议只透传受限令牌，
+// 具体可执行路径由各自平台实现解析，绝不让前端提交可执行路径。
+var terminalShellTokens = map[string]bool{
+	"cmd":        true,
+	"powershell": true,
+}
 
 var errTerminalStartupTimeout = errors.New("terminal startup timed out")
 
@@ -50,10 +67,26 @@ type TerminalSpec struct {
 	Target    string
 	WorkDir   string
 	WSLDistro string
-	Shell     string
-	Cols      uint16
-	Rows      uint16
+	// Shell 是受限的 Shell 令牌（"cmd"/"powershell"），仅对 Windows 目标有效；
+	// 为空时各平台按自身默认值处理。可执行路径由平台实现解析，不由调用方提供。
+	Shell string
+	// RunAsAdmin 请求以管理员权限启动该会话。平台 Open 负责实际实现：
+	// 控制服务已提权时子进程直接继承；未提权时经提权 bridge 承载。
+	RunAsAdmin bool
+	Cols       uint16
+	Rows       uint16
 }
+
+// terminalLaunchOptions 是控制层（manager）把 HTTP 请求里的 shell/提权意图
+// 传入 create 流程的载体，与平台 TerminalSpec 分开。
+type terminalLaunchOptions struct {
+	Shell      string
+	RunAsAdmin bool
+}
+
+// terminalElevationProvider 由能确知自身子进程是否以管理员令牌运行的分层会话实现。
+// 供 manager 在创建时记录 elevated 状态，透出给列表/创建响应。
+type terminalElevationProvider interface{ TerminalElevated() bool }
 
 type TerminalFactory interface {
 	Open(context.Context, TerminalSpec) (TerminalSession, error)
@@ -71,6 +104,8 @@ func (f terminalFactory) Open(ctx context.Context, spec TerminalSpec) (TerminalS
 type terminalRecord struct {
 	session                                       TerminalSession
 	projectID, workspaceID, runnerID, environment string
+	shell                                         string
+	elevated                                      bool
 	createdAt                                     time.Time
 	mu                                            sync.Mutex
 	state                                         string
@@ -199,11 +234,26 @@ func newTerminalManager(s *Server) *terminalManager {
 	return &terminalManager{server: s, sessions: map[string]*terminalRecord{}, factory: terminalFactory{server: s}, projectGenerations: map[string]uint64{}, runnerGenerations: map[string]uint64{}, deletedProjects: map[string]bool{}, pending: map[uint64]terminalLease{}, shutdownCtx: shutdownCtx, shutdown: shutdown, startupTimeout: terminalStartupTimeout}
 }
 
-func (m *terminalManager) create(ctx context.Context, project Project, cols, rows uint16) (*terminalRecord, error) {
-	return m.createInWorkspace(ctx, project, "project-shared:"+project.ID, cols, rows)
+// maxProjects / maxPerProject 返回并发会话上限。未在配置中显式设置（<=0，含单测
+// 直接构造的 &Server{}）时回退到包级默认值。
+func (m *terminalManager) maxProjects() int {
+	if m.server != nil && m.server.config.TerminalMaxProjects > 0 {
+		return m.server.config.TerminalMaxProjects
+	}
+	return defaultTerminalMaxProjects
+}
+func (m *terminalManager) maxPerProject() int {
+	if m.server != nil && m.server.config.TerminalMaxPerProject > 0 {
+		return m.server.config.TerminalMaxPerProject
+	}
+	return defaultTerminalMaxPerProject
 }
 
-func (m *terminalManager) createInWorkspace(_ context.Context, project Project, workspaceID string, cols, rows uint16) (*terminalRecord, error) {
+func (m *terminalManager) create(ctx context.Context, project Project, cols, rows uint16) (*terminalRecord, error) {
+	return m.createInWorkspace(ctx, project, "project-shared:"+project.ID, cols, rows, terminalLaunchOptions{})
+}
+
+func (m *terminalManager) createInWorkspace(ctx context.Context, project Project, workspaceID string, cols, rows uint16, opts terminalLaunchOptions) (*terminalRecord, error) {
 	if cols < 1 || cols > 500 || rows < 1 || rows > 200 {
 		return nil, errors.New("invalid terminal size")
 	}
@@ -221,20 +271,45 @@ func (m *terminalManager) createInWorkspace(_ context.Context, project Project, 
 	if strings.HasPrefix(project.RunnerID, "ssh-") {
 		target = agentTargetEnvRemote
 	}
-	spec := TerminalSpec{ProjectID: project.ID, RunnerID: project.RunnerID, Target: string(target), WorkDir: project.Path, WSLDistro: m.server.wslDistro, Cols: cols, Rows: rows}
+	shell := ""
+	if target == agentTargetEnvWindows {
+		shell = opts.Shell
+		if shell == "" {
+			shell = "cmd"
+		}
+		if !terminalShellTokens[shell] {
+			return nil, fmt.Errorf("unsupported terminal shell %q", opts.Shell)
+		}
+	}
+	// 提权只对"Windows 控制服务 + Windows 目标"有意义：WSL/SSH 会话各自有
+	// sudo/远端权限模型，不能经由 UAC 提权；非 Windows 部署没有 runas 通道。
+	if opts.RunAsAdmin && (runtime.GOOS != "windows" || target != agentTargetEnvWindows) {
+		return nil, errors.New("以管理员身份运行仅支持 Windows 控制服务上的 Windows 项目终端")
+	}
+	spec := TerminalSpec{ProjectID: project.ID, RunnerID: project.RunnerID, Target: string(target), WorkDir: project.Path, WSLDistro: m.server.wslDistroName(), Shell: shell, RunAsAdmin: opts.RunAsAdmin, Cols: cols, Rows: rows}
 	// A request context ends when the HTTP handler returns. It must not own a
 	// terminal process, so Open only receives the manager lifetime and startup
 	// deadline. Platform sessions detach their child process from this context.
-	openCtx, cancelOpen := context.WithTimeout(m.shutdownCtx, m.startupTimeout)
+	// UAC 弹窗会阻塞到用户点选，管理员会话用更长上限，普通会话仍用 startup 超时。
+	openTimeout := m.startupTimeout
+	if opts.RunAsAdmin {
+		openTimeout = terminalElevationPromptTimeout
+	}
+	openCtx, cancelOpen := context.WithTimeout(m.shutdownCtx, openTimeout)
 	defer cancelOpen()
 	sess, err := m.factory.Open(openCtx, spec)
 	if err != nil {
 		return nil, err
 	}
 	createdAt := time.Now().UTC()
-	r := &terminalRecord{session: sess, projectID: project.ID, workspaceID: workspaceID, runnerID: project.RunnerID, environment: string(target), createdAt: createdAt, state: "starting", ready: make(chan struct{}), detachedAt: createdAt}
+	r := &terminalRecord{session: sess, projectID: project.ID, workspaceID: workspaceID, runnerID: project.RunnerID, environment: string(target), shell: shell, createdAt: createdAt, state: "starting", ready: make(chan struct{}), detachedAt: createdAt}
+	if target == agentTargetEnvWindows {
+		if elevationProvider, ok := sess.(terminalElevationProvider); ok {
+			r.elevated = elevationProvider.TerminalElevated()
+		}
+	}
 	m.mu.Lock()
-	if !m.leaseValidLocked(leaseID) || len(m.sessions) >= terminalMaxProjects || m.projectSessionCountLocked(project.ID) >= terminalMaxPerProject {
+	if !m.leaseValidLocked(leaseID) || len(m.sessions) >= m.maxProjects() || m.projectSessionCountLocked(project.ID) >= m.maxPerProject() {
 		m.mu.Unlock()
 		_ = sess.Close()
 		_ = sess.Wait()
@@ -294,8 +369,8 @@ func (m *terminalManager) reserve(project Project) (uint64, error) {
 	if m.deletedProjects[project.ID] {
 		return 0, errors.New("project is being deleted")
 	}
-	if len(m.sessions)+len(m.pending) >= terminalMaxProjects {
-		return 0, errors.New("terminal session limit reached")
+	if len(m.sessions)+len(m.pending) >= m.maxProjects() {
+		return 0, fmt.Errorf("terminal session limit reached (max %d sessions across all projects)", m.maxProjects())
 	}
 	pendingForProject := 0
 	for _, lease := range m.pending {
@@ -303,8 +378,8 @@ func (m *terminalManager) reserve(project Project) (uint64, error) {
 			pendingForProject++
 		}
 	}
-	if m.projectSessionCountLocked(project.ID)+pendingForProject >= terminalMaxPerProject {
-		return 0, errors.New("project terminal session limit reached")
+	if m.projectSessionCountLocked(project.ID)+pendingForProject >= m.maxPerProject() {
+		return 0, fmt.Errorf("project terminal session limit reached (max %d concurrent sessions per project)", m.maxPerProject())
 	}
 	m.nextLease++
 	m.pending[m.nextLease] = terminalLease{projectID: project.ID, runnerID: project.RunnerID, projectGeneration: m.projectGenerations[project.ID], runnerGeneration: m.runnerGenerations[project.RunnerID]}
@@ -591,13 +666,36 @@ func (m *terminalManager) closeDetachedLater(id string, detachedAt time.Time) {
 type terminalCreateRequest struct {
 	Cols uint16 `json:"cols"`
 	Rows uint16 `json:"rows"`
+	// Shell 可选：windows 目标终端的受限 Shell 令牌（cmd/powershell），空则默认 cmd。
+	Shell string `json:"shell"`
+	// RunAsAdmin 请求以管理员权限运行该会话（仅 windows 目标终端可用）。
+	RunAsAdmin bool `json:"runAsAdmin"`
+}
+
+// terminalSessionJSON 组装创建/列表响应的公共字段。
+func terminalSessionJSON(rec *terminalRecord, projectID, cwdDisplay string) map[string]any {
+	return map[string]any{
+		"id":          rec.session.ID(),
+		"projectId":   projectID,
+		"workspaceId": rec.workspaceID,
+		"environment": rec.environment,
+		"shell":       rec.shell,
+		"elevated":    rec.elevated,
+		"cwdDisplay":  cwdDisplay,
+		"status":      rec.state,
+		"createdAt":   rec.createdAt,
+	}
 }
 
 func (s *Server) createTerminal(w http.ResponseWriter, r *http.Request) {
-	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
 	projectID := chi.URLParam(r, "projectID")
+	// 只在整个生命周期锁内做工作区解析（保证看到一致的 project/workspace 快照），
+	// 解析完成立即释放：createInWorkspace 可能阻塞在 UAC 授权（最长 2 分钟），
+	// 不能把全局 projectLifecycleMu 握在手上，否则会阻塞其他项目的删除/会话操作。
+	// 终端管理器自身的 lease + 代际校验负责与项目删除的竞态（list/delete 均不加此锁）。
+	s.projectLifecycleMu.Lock()
 	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	s.projectLifecycleMu.Unlock()
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, 404, errors.New("project not found"))
@@ -618,12 +716,17 @@ func (s *Server) createTerminal(w http.ResponseWriter, r *http.Request) {
 	if req.Rows == 0 {
 		req.Rows = 36
 	}
-	rec, err := s.terminals.createInWorkspace(r.Context(), p, workspace.Workspace.ID, req.Cols, req.Rows)
+	rec, err := s.terminals.createInWorkspace(r.Context(), p, workspace.Workspace.ID, req.Cols, req.Rows, terminalLaunchOptions{Shell: req.Shell, RunAsAdmin: req.RunAsAdmin})
 	if err != nil {
 		writeError(w, 409, err)
 		return
 	}
-	writeJSON(w, 201, map[string]any{"id": rec.session.ID(), "projectId": projectID, "workspaceId": workspace.Workspace.ID, "environment": rec.environment, "cwdDisplay": p.Path, "status": "starting", "createdAt": rec.createdAt})
+	// awaitReady 可能在响应序列化前把 state 从 starting 更新为 running/failed，
+	// 因此序列化需与状态写入同锁，避免数据竞争。
+	rec.mu.Lock()
+	payload := terminalSessionJSON(rec, projectID, p.Path)
+	rec.mu.Unlock()
+	writeJSON(w, 201, payload)
 }
 func (s *Server) listTerminals(w http.ResponseWriter, r *http.Request) {
 	pid := chi.URLParam(r, "projectID")
@@ -639,11 +742,19 @@ func (s *Server) listTerminals(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		rec.mu.Lock()
-		out = append(out, map[string]any{"id": rec.session.ID(), "projectId": pid, "workspaceId": rec.workspaceID, "environment": rec.environment, "cwdDisplay": workspace.Workspace.Path, "status": rec.state, "createdAt": rec.createdAt})
+		out = append(out, terminalSessionJSON(rec, pid, workspace.Workspace.Path))
 		rec.mu.Unlock()
 	}
+	maxPerProject := s.terminals.maxPerProject()
+	maxProjects := s.terminals.maxProjects()
 	s.terminals.mu.Unlock()
-	writeJSON(w, 200, out)
+	// 会话清单附带并发上限：界面禁用“新建”与计数都应以服务端配置为准，
+	// 不再在前端硬编码“最多 3 个”。
+	writeJSON(w, 200, map[string]any{
+		"sessions":      out,
+		"maxPerProject": maxPerProject,
+		"maxProjects":   maxProjects,
+	})
 }
 func (s *Server) deleteTerminal(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "sessionID")

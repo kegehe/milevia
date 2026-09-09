@@ -174,12 +174,18 @@ pnpm release 0.2.0 "这次更新的说明"
 
 ### 5.5 latest.json 托管选择
 
-> **更新**：本节原推荐"独立公开仓库 `milevia-update`"（因当时主仓为 private）。主仓现已改为 **public**，实际采用**当前仓库根目录**方案，`latest.json` 直接放主仓根，GitHub Pages 指向 main 分支根目录，URL 为 `https://kegehe.github.io/milevia/latest.json`。详见 `docs/24-GitHub发布流程与Pages配置说明.md`。下方保留原两种方案对比作参考。
+> **更新（2026-09）**：在线升级主源已从 GitHub 迁到**自建服务器** `keyanjia.info:8443` 的 `/updates/` 静态目录（国内可达，GitHub 在部分网络下不可达会导致"无法检查更新"）。`tauri.conf.json` 的 `plugins.updater.endpoints` 现为：
+> 1. `https://keyanjia.info:8443/updates/latest.json`（主，国内可达）；
+> 2. `https://kegehe.github.io/milevia/latest.json`（GitHub Pages 兜底）。
+>
+> `scripts/release.mjs` 生成的清单 `url` 默认指向自建服务器，并产出 `release/updates/`（安装包 + `latest.json`）整目录上传；`--deploy` 可一键 scp 到 `/var/www/milevia/dist/updates/`（服务器需先配置 `infrastructure/nginx-keyanjia-8443.conf.example` 中的 `location /updates/`，缺失文件返回 404 而非 SPA index.html）。GitHub Pages / Releases 仍可同步，仅作归档与兜底。已安装旧版（内置纯 GitHub 端点）的机器需手动安装一次新 exe 后，应用内升级才能连通新源。
+
+> **更新（历史）**：本节原推荐"独立公开仓库 `milevia-update`"（因当时主仓为 private）。主仓现已改为 **public**，实际采用**当前仓库根目录**方案，`latest.json` 直接放主仓根，GitHub Pages 指向 main 分支根目录，URL 为 `https://kegehe.github.io/milevia/latest.json`。详见 `docs/24-GitHub发布流程与Pages配置说明.md`。下方保留原两种方案对比作参考。
 
 `latest.json` 只有一个文件，两种放法：
 
 - **独立公开仓库（原推荐，因当前仓库曾为 private）**：新建公开仓库 `milevia-update` 并开启 GitHub Pages，把 `latest.json` 放仓库根，得到稳定 URL `https://<user>.github.io/milevia-update/latest.json`。大文件 `setup.exe` 仍走 Releases，不占 Pages 配额。
-- **当前仓库根目录（✅ 实际采用）**：主仓已 public，`latest.json` 放仓库根，Pages 源为 main 分支根目录，URL `https://kegehe.github.io/milevia/latest.json`。
+- **当前仓库根目录（✅ 历史实际采用，现为自建服务器主源的 GitHub 兜底）**：主仓已 public，`latest.json` 放仓库根，Pages 源为 main 分支根目录，URL `https://kegehe.github.io/milevia/latest.json`。
 
 > Pages 源建议用「分支源 / 根目录静态推送」，避免引入每次发版的 GitHub Actions 构建步骤；`latest.json` 本身就是确定性的小文件，直接静态提交最简单。
 

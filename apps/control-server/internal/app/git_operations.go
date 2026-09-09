@@ -856,6 +856,149 @@ func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, result)
 }
 
+// gitConflicts 返回冲突操作上下文与冲突文件清单（冲突解决视图的数据源）。
+func (s *Server) gitConflicts(w http.ResponseWriter, r *http.Request) {
+	runner, repo, ok := s.getGitRunner(w, r)
+	if !ok {
+		return
+	}
+	overview, err := runner.ConflictOverview(r.Context(), repo)
+	if err != nil {
+		s.writeGitReadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, overview)
+}
+
+// gitConflictContent 返回单个冲突文件的三方内容与工作区内容。
+func (s *Server) gitConflictContent(w http.ResponseWriter, r *http.Request) {
+	runner, repo, ok := s.getGitRunner(w, r)
+	if !ok {
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if err := validateGitPath(path); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	detail, err := runner.ConflictContent(r.Context(), repo, path)
+	if err != nil {
+		if errors.Is(err, errGitPathNotInConflict) {
+			writeError(w, http.StatusConflict, errors.New("该文件已不在冲突状态，请刷新后重试"))
+			return
+		}
+		s.writeGitReadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// gitConflictResolve 将一个冲突文件标记为已解决（采用一侧 / 删除 / 手工内容）。
+func (s *Server) gitConflictResolve(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Path       string  `json:"path"`
+		Action     string  `json:"action"`
+		Content    *string `json:"content"`
+		StateToken string  `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if err := validateGitPath(input.Path); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if input.Action != "ours" && input.Action != "theirs" && input.Action != "delete" && input.Action != "working" {
+		writeError(w, http.StatusBadRequest, errors.New("unsupported conflict resolve action"))
+		return
+	}
+	if input.Action == "working" && input.Content != nil && len(*input.Content) > gitOutputLimit {
+		writeError(w, http.StatusBadRequest, errors.New("resolved content exceeds the size limit"))
+		return
+	}
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	available := false
+	for _, change := range state.changes {
+		if change.Path == input.Path && change.Conflicted {
+			available = true
+			break
+		}
+	}
+	if !available {
+		writeError(w, http.StatusConflict, errors.New("Git path is no longer in conflict"))
+		return
+	}
+	var content []byte
+	if input.Content != nil {
+		content = []byte(*input.Content)
+	}
+	summary := "解决冲突：" + input.Path
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "resolve_conflict", summary, state.snapshot, func(runner GitRunner) error {
+		return runner.ResolveConflict(r.Context(), repo, input.Path, input.Action, content)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+// gitConflictAbort 中止当前进行中的合并/变基/cherry-pick/revert。
+func (s *Server) gitConflictAbort(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "conflict_abort", "中止当前合并/变基操作", state.snapshot, func(runner GitRunner) error {
+		return runner.AbortConflict(r.Context(), repo)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+// gitConflictContinue 在所有冲突文件解决后完成当前操作（merge 提交 / rebase|cPick --continue）。
+func (s *Server) gitConflictContinue(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	for _, change := range state.changes {
+		if change.Conflicted {
+			writeError(w, http.StatusConflict, errors.New("仍有未解决的冲突文件"))
+			return
+		}
+	}
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "conflict_continue", "完成当前合并/变基操作", state.snapshot, func(runner GitRunner) error {
+		return runner.FinishConflict(r.Context(), repo)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
 func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (GitRunner, string, string, gitStateToken, func(), bool) {
 	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
@@ -1086,7 +1229,16 @@ func (s *Server) gitLog(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	commits, err := runner.Log(r.Context(), repo, ref, limit)
+	skip := 0
+	if rawSkip := r.URL.Query().Get("skip"); rawSkip != "" {
+		parsed, err := strconv.Atoi(rawSkip)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, errors.New("Git log skip must be a non-negative integer"))
+			return
+		}
+		skip = parsed
+	}
+	commits, err := runner.LogPage(r.Context(), repo, ref, limit, skip, r.URL.Query().Get("q"))
 	if err != nil {
 		if validateGitRef(ref) != nil || strings.Contains(err.Error(), "reference is not available") || strings.Contains(err.Error(), "object ID is not a commit") {
 			writeError(w, http.StatusBadRequest, err)
@@ -1096,6 +1248,67 @@ func (s *Server) gitLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, commits)
+}
+
+// gitCommitDetail 返回单个提交的完整元数据与变更文件清单（提交详情视图的数据源）。
+func (s *Server) gitCommitDetail(w http.ResponseWriter, r *http.Request) {
+	runner, repo, ok := s.getGitRunner(w, r)
+	if !ok {
+		return
+	}
+	detail, err := runner.CommitDetail(r.Context(), repo, chi.URLParam(r, "oid"))
+	if err != nil {
+		s.writeGitCommitRequestError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// gitCommitDiff 返回提交中单个文件的 unified diff。与 gitDiff 一致，
+// 只允许查询该提交实际变更过的文件，不透传任意 pathspec。
+func (s *Server) gitCommitDiff(w http.ResponseWriter, r *http.Request) {
+	runner, repo, ok := s.getGitRunner(w, r)
+	if !ok {
+		return
+	}
+	oid := chi.URLParam(r, "oid")
+	path := r.URL.Query().Get("path")
+	if err := validateGitPath(path); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	detail, err := runner.CommitDetail(r.Context(), repo, oid)
+	if err != nil {
+		s.writeGitCommitRequestError(w, err)
+		return
+	}
+	// 命中后按文件记录的规范路径取 diff：重命名文件需要新旧两个路径才能得到 rename 补丁。
+	var matched *GitCommitFile
+	for index := range detail.Files {
+		if detail.Files[index].Path == path || detail.Files[index].OriginalPath == path {
+			matched = &detail.Files[index]
+			break
+		}
+	}
+	if matched == nil {
+		writeError(w, http.StatusBadRequest, errors.New("Git path is not part of this commit"))
+		return
+	}
+	diff, err := runner.CommitDiff(r.Context(), repo, oid, matched.Path, matched.OriginalPath)
+	if err != nil {
+		s.writeGitCommitRequestError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"oid": oid, "path": path, "content": diff})
+}
+
+// writeGitCommitRequestError 把提交 OID 相关的请求错误归为 400，其余交给通用读错误处理。
+func (s *Server) writeGitCommitRequestError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errGitInvalidCommitID) || errors.Is(err, errGitCommitNotFound) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.writeGitReadError(w, err)
 }
 
 func (s *Server) gitBranches(w http.ResponseWriter, r *http.Request) {
@@ -1122,17 +1335,64 @@ func (s *Server) gitOperations(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
+	skip := 0
+	if rawSkip := r.URL.Query().Get("skip"); rawSkip != "" {
+		parsed, err := strconv.Atoi(rawSkip)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, errors.New("Git operation skip must be a non-negative integer"))
+			return
+		}
+		skip = parsed
+	}
 	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	operations, err := s.listGitOperationsForWorkspace(r.Context(), projectID, workspace.Workspace, limit)
+	filter := gitOperationFilter{
+		Type:   r.URL.Query().Get("type"),
+		Status: r.URL.Query().Get("status"),
+		Query:  r.URL.Query().Get("q"),
+	}
+	if err := validateGitOperationFilter(filter); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	operations, err := s.listGitOperationsForWorkspaceFiltered(r.Context(), projectID, workspace.Workspace, filter, limit, skip)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, operations)
+}
+
+// gitOperationFilter 描述操作记录的条件筛选。空值表示不筛该维度。
+type gitOperationFilter struct {
+	Type   string
+	Status string
+	Query  string
+}
+
+// gitOperationTypes 记录当前业务可产生的所有操作类型，用于校验 type 筛选入参。
+var gitOperationTypes = map[string]bool{
+	"stage": true, "unstage": true, "stage_all": true, "unstage_all": true,
+	"commit": true, "commit_amend": true, "discard_worktree": true, "discard_all": true,
+	"fetch": true, "pull": true, "push": true, "create_branch": true, "switch_branch": true,
+	"resolve_conflict": true, "conflict_abort": true, "conflict_continue": true,
+}
+
+func validateGitOperationFilter(filter gitOperationFilter) error {
+	if filter.Type != "" && !gitOperationTypes[filter.Type] {
+		return fmt.Errorf("Git operation type %q is not valid", filter.Type)
+	}
+	if filter.Status != "" {
+		switch filter.Status {
+		case gitOperationQueued, gitOperationRunning, gitOperationSucceeded, gitOperationFailed, gitOperationCancelled, gitOperationNeedsAttention:
+		default:
+			return fmt.Errorf("Git operation status %q is not valid", filter.Status)
+		}
+	}
+	return nil
 }
 
 // getGitRunner 根据项目的 runner 类型返回对应的 GitRunner 与仓库路径。
@@ -1227,9 +1487,38 @@ func (s *Server) listGitOperationsForWorkspace(ctx context.Context, projectID st
 	return s.listGitOperationsWhere(ctx, where, args, limit)
 }
 
+// listGitOperationsForWorkspaceFiltered 在按 workspace 收敛的基础上叠加 type/status/关键字
+// 筛选与 skip 分页。条件全部走参数化拼装，杜绝注入。
+func (s *Server) listGitOperationsForWorkspaceFiltered(ctx context.Context, projectID string, workspace ConversationWorkspace, filter gitOperationFilter, limit, skip int) ([]GitOperation, error) {
+	where := `project_id=? and workspace_id=?`
+	args := []any{projectID, workspace.ID}
+	if workspace.Mode == "project_shared" {
+		where = `project_id=? and workspace_path=?`
+		args = []any{projectID, workspace.Path}
+	}
+	if filter.Type != "" {
+		where += ` and type=?`
+		args = append(args, filter.Type)
+	}
+	if filter.Status != "" {
+		where += ` and status=?`
+		args = append(args, filter.Status)
+	}
+	if filter.Query != "" {
+		where += ` and (request_summary like ? or error_message like ?)`
+		wildcard := "%" + filter.Query + "%"
+		args = append(args, wildcard, wildcard)
+	}
+	return s.listGitOperationsWherePage(ctx, where, args, limit, skip)
+}
+
 func (s *Server) listGitOperationsWhere(ctx context.Context, where string, args []any, limit int) ([]GitOperation, error) {
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `select id,project_id,workspace_id,workspace_path,type,status,request_summary,before_state,after_state,error_code,error_message,requested_at,started_at,finished_at from git_operations where `+where+` order by requested_at desc limit ?`, args...)
+	return s.listGitOperationsWherePage(ctx, where, args, limit, 0)
+}
+
+func (s *Server) listGitOperationsWherePage(ctx context.Context, where string, args []any, limit, skip int) ([]GitOperation, error) {
+	args = append(args, limit, skip)
+	rows, err := s.db.QueryContext(ctx, `select id,project_id,workspace_id,workspace_path,type,status,request_summary,before_state,after_state,error_code,error_message,requested_at,started_at,finished_at from git_operations where `+where+` order by requested_at desc, id desc limit ? offset ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list Git operations: %w", err)
 	}

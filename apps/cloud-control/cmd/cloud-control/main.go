@@ -25,13 +25,17 @@ func main() {
 	}
 	agentTokens, err := agentTokensFromEnv(os.Getenv("MILEVIA_CLOUD_AGENT_TOKENS"))
 	if err != nil {
-		log.Fatal(err)
+		if strings.TrimSpace(os.Getenv("MILEVIA_CLOUD_AGENT_TOKENS")) != "" || strings.TrimSpace(os.Getenv("MILEVIA_CLOUD_ENROLLMENT_TOKEN")) == "" {
+			log.Fatal(err)
+		}
+		agentTokens = map[string]string{}
 	}
 	server, err := cloud.New(ctx, cloud.Config{
-		DatabaseURL: databaseURL,
-		AgentTokens: agentTokens,
-		UserToken:   os.Getenv("MILEVIA_CLOUD_USER_TOKEN"),
-		AppURL:      os.Getenv("MILEVIA_CLOUD_APP_URL"),
+		DatabaseURL:     databaseURL,
+		AgentTokens:     agentTokens,
+		EnrollmentToken: os.Getenv("MILEVIA_CLOUD_ENROLLMENT_TOKEN"),
+		UserToken:       os.Getenv("MILEVIA_CLOUD_USER_TOKEN"),
+		AppURL:          os.Getenv("MILEVIA_CLOUD_APP_URL"),
 	})
 	if err != nil {
 		log.Fatal(err)

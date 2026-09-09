@@ -20,11 +20,14 @@ type UpdaterStatus = {
 };
 
 type ProgressEvent = {
+  phase?: "checking" | "starting" | "downloading" | "installing" | "failed";
   received: number;
   total: number | null;
+  error?: string;
 };
 
 type Progress = {
+  phase: "checking" | "starting" | "downloading" | "installing";
   percent: number | null; // 未知总大小时为 null
   receivedMb: number;
 };
@@ -34,7 +37,7 @@ export function UpdateBanner() {
   const [dismissed, setDismissed] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<Progress>({ percent: null, receivedMb: 0 });
+  const [progress, setProgress] = useState<Progress>({ phase: "starting", percent: null, receivedMb: 0 });
   const unlistenRef = useRef<(() => void) | null>(null);
   const errorDismissedRef = useRef(false);
   const installErrorRef = useRef(false);
@@ -90,8 +93,25 @@ export function UpdateBanner() {
     let disposed = false;
     listen<ProgressEvent>("updater://progress", (event) => {
       if (disposed) return;
-      const { received, total } = event.payload;
+      const { phase, received, total, error } = event.payload;
+      if (phase === "failed") {
+        setInstalling(false);
+        setProgress({ phase: "starting", percent: null, receivedMb: 0 });
+        errorDismissedRef.current = false;
+        installErrorRef.current = true;
+        setError(error || "更新下载失败，请检查网络后重试。");
+        return;
+      }
+      if (phase === "starting") {
+        setProgress({ phase, percent: null, receivedMb: 0 });
+        return;
+      }
+      if (phase === "checking") {
+        setProgress({ phase, percent: null, receivedMb: 0 });
+        return;
+      }
       setProgress({
+        phase: phase === "installing" ? "installing" : "downloading",
         percent: total ? (received / total) * 100 : null,
         receivedMb: received / 1024 / 1024,
       });
@@ -108,11 +128,12 @@ export function UpdateBanner() {
   const install = useCallback(async () => {
     setInstalling(true);
     setDismissed(false); // 保持横幅显示，切换为进度形态
+    setProgress({ phase: "checking", percent: null, receivedMb: 0 });
     try {
       const result = await invoke<{ installed: boolean }>("install_update");
       if (!result.installed) {
         setInstalling(false);
-        setProgress({ percent: null, receivedMb: 0 });
+        setProgress({ phase: "starting", percent: null, receivedMb: 0 });
         errorDismissedRef.current = false;
         installErrorRef.current = false;
         setError(null);
@@ -158,7 +179,13 @@ export function UpdateBanner() {
         </>
       ) : (
         <div className="update-banner-downloading">
-          <span>下载更新中…</span>
+          <span>
+            {progress.phase === "checking"
+              ? "正在检查更新..."
+              : progress.phase === "installing"
+                ? "正在安装更新..."
+                : "正在下载更新..."}
+          </span>
           <div className="update-banner-track" aria-hidden="true">
             <div
               className="update-banner-bar"

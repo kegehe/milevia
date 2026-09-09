@@ -75,6 +75,16 @@ func TestSSHOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
 	}
 }
 
+func TestSSHClaudeOutputEmitsStructuredResult(t *testing.T) {
+	sink := &sshOutputTestSink{}
+	if err := readClaudeJSONLines(strings.NewReader(`{"type":"result","subtype":"success","is_error":false,"structured_output":{"findings":[]}}`+"\n"), sink); err != nil {
+		t.Fatalf("read Claude JSONL: %v", err)
+	}
+	if len(sink.texts) != 1 || sink.texts[0] != `{"findings":[]}` {
+		t.Fatalf("structured result was not forwarded as assistant text: %#v", sink.texts)
+	}
+}
+
 func TestRemotePathWithinRoot(t *testing.T) {
 	cases := []struct {
 		root string
@@ -101,9 +111,14 @@ type fakeFileInfo struct {
 	isDir bool
 }
 
-func (f fakeFileInfo) Name() string       { return f.name }
-func (f fakeFileInfo) Size() int64        { return 0 }
-func (f fakeFileInfo) Mode() os.FileMode  { if f.isDir { return os.ModeDir }; return 0 }
+func (f fakeFileInfo) Name() string { return f.name }
+func (f fakeFileInfo) Size() int64  { return 0 }
+func (f fakeFileInfo) Mode() os.FileMode {
+	if f.isDir {
+		return os.ModeDir
+	}
+	return 0
+}
 func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
 func (f fakeFileInfo) IsDir() bool        { return f.isDir }
 func (f fakeFileInfo) Sys() any           { return nil }

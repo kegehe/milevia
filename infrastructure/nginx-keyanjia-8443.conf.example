@@ -36,6 +36,16 @@ server {
         proxy_send_timeout 1h;
     }
 
+    # 在线升级静态目录：latest.json + 安装包 exe。
+    # 与下面 SPA 兜底不同，缺失文件直接 404（不回落 index.html），
+    # 避免把 index.html 丢给 updater 导致归档解析/签名校验失败。
+    # 对应 tauri.conf.json 的 updater endpoints 指向 https://keyanjia.info:8443/updates/latest.json。
+    location /updates/ {
+        root /var/www/milevia/dist;
+        try_files $uri =404;
+        add_header Cache-Control "no-cache";
+    }
+
     location / {
         try_files $uri $uri/ /index.html;
     }

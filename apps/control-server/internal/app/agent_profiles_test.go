@@ -993,7 +993,7 @@ func TestCredentialPoolRouteSelectsAvailableProfile(t *testing.T) {
 
 func TestCodexApiKeyProfileBypassesLoginReadiness(t *testing.T) {
 	server := newTestServer(t)
-	// A fake codex binary that exists but is NOT logged in (login status fails).
+	// A fake codex binary that exists; authentication is supplied externally.
 	bin := filepath.Join(t.TempDir(), "fake-codex")
 	if runtime.GOOS == "windows" {
 		bin = filepath.Join(os.Getenv("SystemRoot"), "System32", "where.exe")
@@ -1007,9 +1007,10 @@ func TestCodexApiKeyProfileBypassesLoginReadiness(t *testing.T) {
 		}
 	}
 	server.codexRunner = &codexCLIRunner{config: Config{CodexPath: bin}}
-	// cli_managed still requires a login.
-	if profile := (*AgentRuntimeProfile)(nil); server.codexUsableForProfile(context.Background(), profile) {
-		t.Fatal("codex reported usable without login for cli_managed")
+	// CLI-managed authentication (for example CC Switch) does not require the
+	// local `codex login status` command to succeed during capability probing.
+	if profile := (*AgentRuntimeProfile)(nil); !server.codexUsableForProfile(context.Background(), profile) {
+		t.Fatal("codex reported unusable despite binary being present")
 	}
 	// An api_key profile injects its own key, so binary presence suffices.
 	apiKeyProfile := &AgentRuntimeProfile{AgentID: "codex", AuthMode: "api_key", Secret: "sk-x"}

@@ -475,9 +475,7 @@
 .new-conversation-dialog-mark { display: grid; width: 40px; height: 40px; flex: none; place-items: center; border: 1px solid #a9cfbb; border-radius: 7px; color: #216653; background: #e7f5ec; }
 .new-conversation-dialog-icon { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.75; }
 .new-conversation-dialog-heading > div { min-width: 0; }
-.new-conversation-dialog-heading label { display: block; color: #5b8173; font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0; }
-.new-conversation-dialog-heading h2 { margin: 4px 0 0; color: #193d32; font-size: 19px; font-weight: 820; line-height: 1.15; }
-.new-conversation-dialog-heading p { margin: 4px 0 0; color: #72887f; font-size: 11px; line-height: 1.35; }
+.new-conversation-dialog-heading h2 { margin: 0; color: #193d32; font-size: 19px; font-weight: 820; line-height: 1.15; }
 .new-conversation-dialog .new-conversation-dialog-close { display: grid; width: 32px; height: 32px; flex: none; place-items: center; border: 1px solid #c7ddd1; border-radius: 6px; padding: 0; color: #557568; background: #fbfefb; }
 .new-conversation-dialog .new-conversation-dialog-close:hover:not(:disabled) { border-color: #9ec5b4; color: #235f50; background: #eaf6ee; }
 .new-conversation-dialog-body { min-height: 0; overflow: auto; padding: 18px 20px 20px; }
@@ -2301,6 +2299,24 @@
   align-items: center;
   gap: 6px;
 }
+/* 标题行数量角标：样式呼应任务队列头部的计数，按此栏字号做成紧凑尺寸。
+   放在提示词/命令文字后，表示该组当前收录的条目数。 */
+.quick-tag-heading .quick-tag-count {
+  flex: none;
+  display: inline-grid;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  place-items: center;
+  border: 1px solid #bfdbca;
+  border-radius: 5px;
+  color: #2a6a5a;
+  background: #e6f2ea;
+  font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+/* 桌面左栏两列较窄（约 106px），标题内收紧图标到文字/角标的间距，
+   让数量角标与右侧新增按钮都能完整放下；移动端展开面板不受影响。 */
+.quick-tag-rail .quick-tag-heading-label { gap: 4px; }
 .quick-tag-heading-icon {
   width: 16px;
   height: 16px;
@@ -2392,6 +2408,7 @@
 }
 .command-tags .quick-tag-heading button:hover:not(:disabled),
 .command-tag-heading button:hover:not(:disabled) { border-color: #a9bf75; color: #4a6220; background: #ebf3d7; }
+.command-tags .quick-tag-heading .quick-tag-count { border-color: #d1dcb3; color: #5d762a; background: #eef3db; }
 .command-tags .quick-tag > button:first-child,
 .quick-tag.command-tag > button:first-child,
 .command-tags .quick-tag-empty,
@@ -3362,3 +3379,111 @@
 @media (prefers-reduced-motion: reduce) {
   .mobile-shortcut-menu { animation: none; }
 }
+
+/* ---- 侧栏模块折叠（常用提示词/常用命令/技能） ----------------------------- */
+/* 标题整行变成可点击的折叠按钮：保留文字/角标/图标，右端加小箭头。
+   需要压过 .command-tags .quick-tag-heading button 的边框/底色按钮样式。 */
+.quick-tag-heading .quick-tag-heading-toggle,
+.command-tags .quick-tag-heading .quick-tag-heading-toggle,
+.skill-tags .quick-tag-heading.skill-heading-toggle {
+  width: auto;
+  height: auto;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  box-sizing: border-box;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease;
+}
+/* 提示词/命令是“标题行内右侧的小切换钮”：占用标题剩余宽度，把新增 + 号推到右端。 */
+.quick-tag-heading .quick-tag-heading-toggle,
+.command-tags .quick-tag-heading .quick-tag-heading-toggle {
+  display: inline-flex;
+  flex: 1;
+  padding: 1px 2px;
+}
+/* 技能标题整行本身就是可点按钮：块级 flex 占满整行，复用 .quick-tag-heading 的 flex 布局。
+   padding 由 .quick-tag-heading 的常规标题样式提供，这里只重置按钮默认样式。 */
+.skill-tags .quick-tag-heading.skill-heading-toggle {
+  display: flex;
+  width: 100%;
+  padding-top: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+.quick-tag-heading .quick-tag-heading-toggle:hover:not(:disabled),
+.command-tags .quick-tag-heading .quick-tag-heading-toggle:hover:not(:disabled),
+.skill-tags .quick-tag-heading.skill-heading-toggle:hover:not(:disabled) {
+  border-color: transparent;
+  background: rgba(47, 104, 87, .08);
+}
+.command-tags .quick-tag-heading .quick-tag-heading-toggle:hover:not(:disabled) { background: rgba(116, 96, 40, .08); }
+.quick-tag-heading-toggle:focus-visible { outline: 2px solid #2b7b68; outline-offset: 1px; }
+.quick-tag-heading-toggle .quick-tag-heading-icon { flex: none; }
+.quick-tag-heading-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quick-tag-heading-chevron {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  margin-left: auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: .8;
+  transform: rotate(0deg);
+  transition: transform .16s ease, opacity .16s ease;
+}
+/* 展开态箭头朝上（点击收起）；折叠后翻转为朝下，暗示点击可展开下方内容。 */
+.quick-tag-group.collapsed .quick-tag-heading-chevron { transform: rotate(180deg); }
+/* 技能组标题里已有 skill-source-hint（margin-left:auto）负责右对齐，
+   折叠箭头不再用 auto 抢占剩余空间，贴着数量右侧即可。 */
+.skill-tags .quick-tag-heading-toggle .quick-tag-heading-chevron { margin-left: 2px; }
+
+/* ---- 任务队列栏折叠（宽屏桌面） ------------------------------------------ */
+@media (min-width: 1200px) {
+  .conversation-canvas[data-queue-collapsed="true"] { grid-template-columns: minmax(260px, 300px) minmax(440px, 1fr) minmax(0, 120px); }
+  .task-queue-rail[data-collapsed="true"] {
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 22px 10px;
+    border-left: 1px solid #cfe0d6;
+    overflow: visible;
+  }
+  .task-queue-rail[data-collapsed="true"] .task-queue {
+    display: block;
+    min-height: auto;
+    flex: none;
+    border-top: 0;
+    padding-top: 0;
+    overflow: visible;
+  }
+  .task-queue-rail[data-collapsed="true"] .task-queue-panel { display: none; }
+  .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle { display: inline-flex; }
+}
+
+/* 标题行内切换钮与右侧新增按钮之间留出间距（折叠图标贴紧 + 号）。 */
+.quick-tag-heading { gap: 6px; }
+
+/* 桌面左栏两列较窄：常用提示词/常用命令标题兼作折叠按钮后不再重复画类别图标，
+   把空间让给数量角标与折叠箭头，避免标题折行。技能组整行较宽，仍保留图标。 */
+.quick-actions-row .quick-tag-group:not(.skill-tags) .quick-tag-heading-toggle .quick-tag-heading-icon { display: none; }

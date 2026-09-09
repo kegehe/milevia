@@ -9,8 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -23,6 +27,7 @@ const (
 	inputFrame      = 2
 	resizeFrame     = 3
 	closeFrame      = 4
+	authFrame       = 10
 	outputFrame     = 16
 	readyFrame      = 17
 	exitFrame       = 18
@@ -54,30 +59,32 @@ var (
 )
 
 func main() {
-	typ, data, err := readFrame(os.Stdin)
+	in, out, closeTransport, err := openTransport()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer closeTransport()
+	typ, data, err := readFrame(in)
 	if err != nil || typ != openFrame {
-		writeFrame(os.Stdout, errorFrame, []byte("open frame required"))
+		writeFrame(out, errorFrame, []byte("open frame required"))
 		return
 	}
 	var request openRequest
 	if json.Unmarshal(data, &request) != nil || request.ProtocolVersion != protocolVersion || request.Cols == 0 || request.Rows == 0 || request.WorkDir == "" {
-		writeFrame(os.Stdout, errorFrame, []byte("invalid open request"))
-		return
-	}
-	if request.Shell != "" && request.Shell != "cmd.exe" {
-		writeFrame(os.Stdout, errorFrame, []byte("unsupported shell"))
+		writeFrame(out, errorFrame, []byte("invalid open request"))
 		return
 	}
 	inR, inW, err := newTerminalPipe()
 	if err != nil {
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	outR, outW, err := newTerminalPipe()
 	if err != nil {
 		_ = inR.Close()
 		_ = inW.Close()
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	defer inR.Close()
@@ -86,26 +93,31 @@ func main() {
 	defer outW.Close()
 	var pty windows.Handle
 	if err = windows.CreatePseudoConsole(windows.Coord{X: int16(request.Cols), Y: int16(request.Rows)}, windows.Handle(inR.Fd()), windows.Handle(outW.Fd()), 0, &pty); err != nil {
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	defer windows.ClosePseudoConsole(pty)
 	si, releaseAttributes, err := newTerminalStartupInfo(pty)
 	if err != nil {
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	defer releaseAttributes()
 	readyMarker := "__MILEVIA_READY__"
-	command, _ := windows.UTF16PtrFromString("cmd.exe /d /q /k \"chcp 65001 >nul & echo " + readyMarker + "\"")
+	shellCommand, shellErr := buildShellCommand(request.Shell, readyMarker)
+	if shellErr != nil {
+		writeFrame(out, errorFrame, []byte(shellErr.Error()))
+		return
+	}
+	command, _ := windows.UTF16PtrFromString(shellCommand)
 	workDir, err := windows.UTF16PtrFromString(request.WorkDir)
 	if err != nil {
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	pi := windows.ProcessInformation{}
 	if err = windows.CreateProcess(nil, command, nil, nil, false, windows.EXTENDED_STARTUPINFO_PRESENT, nil, workDir, &si.StartupInfo, &pi); err != nil {
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	job, err := windows.CreateJobObject(nil, nil)
@@ -113,7 +125,7 @@ func main() {
 		windows.CloseHandle(pi.Thread)
 		windows.TerminateProcess(pi.Process, 1)
 		windows.CloseHandle(pi.Process)
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
@@ -126,7 +138,7 @@ func main() {
 		if err == nil {
 			err = windows.ERROR_ACCESS_DENIED
 		}
-		writeFrame(os.Stdout, errorFrame, []byte(err.Error()))
+		writeFrame(out, errorFrame, []byte(err.Error()))
 		return
 	}
 	windows.CloseHandle(pi.Thread)
@@ -206,7 +218,7 @@ func main() {
 	go func() {
 		defer close(requests)
 		for {
-			typ, data, err := readFrame(os.Stdin)
+			typ, data, err := readFrame(in)
 			if err != nil {
 				return
 			}
@@ -223,7 +235,7 @@ func main() {
 			if !ok {
 				return
 			}
-			if writeFrame(os.Stdout, outgoing.typ, outgoing.data) != nil {
+			if writeFrame(out, outgoing.typ, outgoing.data) != nil {
 				return
 			}
 			if outgoing.typ == exitFrame || outgoing.typ == errorFrame {
@@ -289,6 +301,82 @@ func newTerminalPipe() (*os.File, *os.File, error) {
 		return nil, nil, err
 	}
 	return os.NewFile(uintptr(read), "terminal-pipe-read"), os.NewFile(uintptr(write), "terminal-pipe-write"), nil
+}
+
+// openTransport 选择帧传输通道：
+//   - 默认（无 -tcp 参数）：stdio 模式，WSL/本地 control-server 以子进程方式驱动；
+//   - -tcp <addr> -token <token>：提权模式，control-server 经 UAC 拉起本进程后，
+//     由本进程拨号回连并先发送 auth 帧（stdout 在 runas 下不可用）。
+func openTransport() (io.Reader, io.Writer, func(), error) {
+	addr := bridgeFlag("-tcp")
+	if addr == "" {
+		return os.Stdin, os.Stdout, func() {}, nil
+	}
+	conn, err := net.DialTimeout("tcp", addr, 15*time.Second)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("connect terminal bridge listener: %w", err)
+	}
+	if err := writeFrame(conn, authFrame, []byte(bridgeFlag("-token"))); err != nil {
+		_ = conn.Close()
+		return nil, nil, nil, fmt.Errorf("authenticate terminal bridge: %w", err)
+	}
+	return conn, conn, func() { _ = conn.Close() }, nil
+}
+
+func bridgeFlag(name string) string {
+	args := os.Args[1:]
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// buildShellCommand 按受限 Shell 令牌构造 CreateProcess 命令行。可执行路径由
+// 本桥接解析，绝不信任来自协议文本里的可执行路径。
+func buildShellCommand(shell, readyMarker string) (string, error) {
+	systemDirectory, err := windows.GetSystemDirectory()
+	if err != nil {
+		return "", err
+	}
+	switch shell {
+	case "", "cmd", "cmd.exe": // "cmd.exe" 兼容旧版 control-server 的 open 帧
+		return quoteCmdArg(filepath.Join(systemDirectory, "cmd.exe")) + " /d /q /k \"chcp 65001 >nul & echo " + readyMarker + "\"", nil
+	case "powershell":
+		powershell := filepath.Join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe")
+		init := "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; [Console]::InputEncoding=[System.Text.Encoding]::UTF8; chcp 65001 | Out-Null; Write-Output " + readyMarker
+		return quoteCmdArg(powershell) + " -NoLogo -NoExit -Command " + quoteCmdArg(init), nil
+	default:
+		return "", errors.New("unsupported shell: " + shell)
+	}
+}
+
+func quoteCmdArg(v string) string {
+	if v != "" && !strings.ContainsAny(v, " \t\n\v\"") {
+		return v
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	backslashes := 0
+	for _, r := range v {
+		if r == '\\' {
+			backslashes++
+			continue
+		}
+		if r == '"' {
+			b.WriteString(strings.Repeat(`\`, backslashes*2+1))
+			b.WriteRune(r)
+			backslashes = 0
+			continue
+		}
+		b.WriteString(strings.Repeat(`\`, backslashes))
+		b.WriteRune(r)
+		backslashes = 0
+	}
+	b.WriteString(strings.Repeat(`\`, backslashes*2))
+	b.WriteByte('"')
+	return b.String()
 }
 
 func writeFrame(w io.Writer, typ byte, payload []byte) error {

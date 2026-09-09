@@ -213,8 +213,11 @@ func (s *Server) windowsAgentRunner() AgentRunner {
 // wslAgentRunner 返回 Windows 服务端下跨到 WSL 侧的 AgentRunner。
 // 仅当 New() 探测到 WSL 并构造了 s.wslRunner 时可用；无 WSL 时返回 nil，调用方据此
 // 将 wsl 目标判为不可用（不静默回退本机 Windows claude）。WSL 服务端下本函数不会被
-// 调用（wsl 目标即本机 s.runner）。
+// 调用（wsl 目标即本机 s.runner）。wslRunner 可能在请求期被 ensureWSLRunner 补注册写入，
+// 读取经 wslMu 保护。
 func (s *Server) wslAgentRunner() AgentRunner {
+	s.wslMu.RLock()
+	defer s.wslMu.RUnlock()
 	return s.wslRunner
 }
 

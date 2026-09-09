@@ -163,6 +163,7 @@ input[type="range"]:disabled { cursor: not-allowed; opacity: .52; }
 .runner-inline-btn.update-available:hover { background: #e08a1a; color: #fff; }
 .runner-inline-error { color: #d14233; font-size: 10px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .runner-inline-uptodate { color: #2c8a73; font-size: 10px; font-weight: 650; white-space: nowrap; }
+.runner-inline-manual { color: #b97a12; font-size: 10px; font-weight: 650; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 .project-dashboard { width: min(1240px, calc(100% - 40px)); margin: 0 auto; padding: 72px 0; }
 .project-dashboard > header { display: flex; align-items: end; justify-content: space-between; gap: 32px; margin-bottom: 34px; }

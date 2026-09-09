@@ -36,6 +36,35 @@ func TestReadCodexJSONLStoresThreadAndAssistantText(t *testing.T) {
 	}
 }
 
+func TestCodexOutputSchemaWrapsArrayRoot(t *testing.T) {
+	schema, err := codexOutputSchema(json.RawMessage(`{"type":"array","items":{"type":"string"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Type       string                     `json:"type"`
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(schema, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != "object" || len(got.Properties["findings"]) == 0 || len(got.Required) != 1 || got.Required[0] != "findings" {
+		t.Fatalf("wrapped schema = %s", schema)
+	}
+}
+
+func TestCodexOutputSchemaRejectsNonObjectRoot(t *testing.T) {
+	for _, input := range []string{`null`, `"string"`, `true`} {
+		if _, err := codexOutputSchema(json.RawMessage(input)); err == nil {
+			t.Errorf("schema %s was accepted", input)
+		}
+	}
+	if got, err := codexOutputSchema(json.RawMessage(`{"properties":{"value":{"type":"string"}}}`)); err != nil || string(got) != `{"properties":{"value":{"type":"string"}}}` {
+		t.Fatalf("object schema without explicit type: got=%s err=%v", got, err)
+	}
+}
+
 func TestCodexOutputRedactsSensitiveValues(t *testing.T) {
 	sink := &codexPayloadSink{}
 	readCodexJSONL(strings.NewReader(`{"type":"item.completed","item":{"type":"agent_message","text":"OPENAI_API_KEY=sk-message-secret-value Authorization: Bearer bearer-message-secret"},"api_key":"json-secret","auth_path":"/home/alice/.codex/auth.json","environment":{"CODEX_HOME":"/home/alice/.codex"}}`+"\n"), sink, "")
@@ -91,6 +120,45 @@ func TestCodexSandbox(t *testing.T) {
 	}
 	if _, err := codexSandbox("approval_required"); err == nil {
 		t.Fatal("expected unsupported policy error")
+	}
+}
+
+func TestCodexModelFromConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  string
+		want string
+	}{
+		{name: "top-level model", cfg: "model_provider = \"custom\"\nmodel = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"high\"\n", want: "gpt-5.6-terra"},
+		{name: "single-quoted model", cfg: "model = 'gpt-test'\n", want: "gpt-test"},
+		{name: "spaces around equals", cfg: "model   =  \"gpt-x\"\n", want: "gpt-x"},
+		{name: "section model ignored", cfg: "model_provider = \"custom\"\nmodel = \"gpt-top\"\n\n[model_providers.custom]\nname = \"custom\"\nmodel = \"gpt-section\"\n", want: "gpt-top"},
+		{name: "only section model", cfg: "[model_providers.custom]\nmodel = \"gpt-section\"\n", want: ""},
+		{name: "empty", cfg: "", want: ""},
+		{name: "no model line", cfg: "model_provider = \"custom\"\n", want: ""},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := codexModelFromConfig([]byte(test.cfg)); got != test.want {
+				t.Fatalf("codexModelFromConfig(%q) = %q, want %q", test.cfg, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexDefaultModelReadsCODEXHome(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	runner := &codexCLIRunner{}
+	if got := runner.codexDefaultModel(context.Background()); got != "" {
+		t.Fatalf("missing config.toml should resolve empty, got %q", got)
+	}
+	cfg := "model_provider = \"custom\"\nmodel = \"gpt-5.6-terra\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.codexDefaultModel(context.Background()); got != "gpt-5.6-terra" {
+		t.Fatalf("codexDefaultModel = %q, want gpt-5.6-terra", got)
 	}
 }
 
@@ -519,5 +587,138 @@ func TestCodexManagedProfileReusesHomeForSameRevision(t *testing.T) {
 	}
 	if firstHome, secondHome := findHome(first), findHome(second); firstHome == "" || firstHome != secondHome {
 		t.Fatalf("CODEX_HOME changed between turns: %q != %q", firstHome, secondHome)
+	}
+}
+
+func TestProvisionCodexProfileSkillsPreservesNestedSystemSkills(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "skills")
+	skillFile := filepath.Join(source, ".system", "imagegen", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(skillFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(skillFile, []byte("---\nname: imagegen\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := t.TempDir()
+	if err := provisionCodexProfileSkills(source, profileHome); err != nil {
+		t.Fatalf("provision skills: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(profileHome, "skills", ".system", "imagegen", "SKILL.md")); err != nil {
+		t.Fatalf("nested system skill is unavailable in isolated CODEX_HOME: %v", err)
+	}
+	copyTarget := filepath.Join(t.TempDir(), "skills")
+	if err := syncCodexSkillTree(source, copyTarget); err != nil {
+		t.Fatalf("copy skills fallback: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(copyTarget, ".system", "imagegen", "SKILL.md")); err != nil {
+		t.Fatalf("nested system skill is unavailable after copying: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, ".system", "new-skill.md"), []byte("stale test file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(skillFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := provisionCodexProfileSkills(source, profileHome); err != nil {
+		t.Fatalf("resync skills: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(profileHome, "skills", ".system", "imagegen", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("removed skill was not removed from profile: %v", err)
+	}
+
+	// A source link is intentionally not copied, and must not leave a stale
+	// regular file in the fallback tree.
+	stalePath := filepath.Join(source, "stale-link")
+	if err := os.WriteFile(stalePath, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	copyStalePath := filepath.Join(copyTarget, "stale-link")
+	if err := os.WriteFile(copyStalePath, []byte("old copy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(stalePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(source, "missing"), stalePath); err != nil {
+		t.Logf("symlinks unavailable, skipping link-specific assertion: %v", err)
+	} else {
+		if err := syncCodexSkillTree(source, copyTarget); err != nil {
+			t.Fatalf("sync source links: %v", err)
+		}
+		if _, err := os.Lstat(copyStalePath); !os.IsNotExist(err) {
+			t.Fatalf("stale copy of skipped source link remains: %v", err)
+		}
+	}
+
+	// Switching a source entry between file and directory must be reflected in
+	// the fallback tree without an OpenFile/Mkdir conflict.
+	typeSwap := filepath.Join(source, "type-swap")
+	if err := os.WriteFile(typeSwap, []byte("file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncCodexSkillTree(source, copyTarget); err != nil {
+		t.Fatalf("sync regular file: %v", err)
+	}
+	if err := os.Remove(typeSwap); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(typeSwap, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncCodexSkillTree(source, copyTarget); err != nil {
+		t.Fatalf("sync file to directory: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(copyTarget, "type-swap")); err != nil || !info.IsDir() {
+		t.Fatalf("file-to-directory sync result: info=%v err=%v", info, err)
+	}
+	if err := os.RemoveAll(typeSwap); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(typeSwap, []byte("file again"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncCodexSkillTree(source, copyTarget); err != nil {
+		t.Fatalf("sync directory to file: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(copyTarget, "type-swap")); err != nil || info.IsDir() {
+		t.Fatalf("directory-to-file sync result: info=%v err=%v", info, err)
+	}
+}
+
+func TestProvisionCodexProfileSkillsDoesNotCopyIntoItself(t *testing.T) {
+	profileHome := t.TempDir()
+	source := filepath.Join(profileHome, "skills")
+	skillFile := filepath.Join(source, "example", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(skillFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("---\nname: example\n---\ncontent\n")
+	if err := os.WriteFile(skillFile, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := provisionCodexProfileSkills(source, profileHome); err != nil {
+		t.Fatalf("self-provisioning should be a no-op: %v", err)
+	}
+	got, err := os.ReadFile(skillFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("skill was modified by self-provisioning: %q", got)
+	}
+}
+
+func TestSyncCodexSkillTreeRejectsTargetSymlink(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := syncCodexSkillTree(source, target); err == nil {
+		t.Fatal("target symlink was followed")
 	}
 }

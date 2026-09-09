@@ -24,10 +24,11 @@ import (
 )
 
 type Config struct {
-	DatabaseURL string
-	AgentTokens map[string]string
-	UserToken   string
-	AppURL      string
+	DatabaseURL     string
+	AgentTokens     map[string]string
+	EnrollmentToken string
+	UserToken       string
+	AppURL          string
 }
 
 type Server struct {
@@ -90,7 +91,7 @@ func New(ctx context.Context, config Config) (*Server, error) {
 	if config.DatabaseURL == "" {
 		return nil, errors.New("database URL is required")
 	}
-	if len(config.AgentTokens) == 0 {
+	if len(config.AgentTokens) == 0 && strings.TrimSpace(config.EnrollmentToken) == "" {
 		return nil, errors.New("at least one instance-scoped agent token is required")
 	}
 	db, err := pgxpool.New(ctx, config.DatabaseURL)
@@ -174,6 +175,12 @@ create table if not exists cloud_access_tokens (
   expires_at timestamptz,
   revoked_at timestamptz
 );
+create table if not exists cloud_agent_credentials (
+  instance_id text primary key references cloud_instances(instance_id) on delete cascade,
+  token_hash text not null unique,
+  created_at timestamptz not null default now(),
+  revoked_at timestamptz
+);
 create index if not exists cloud_commands_pending on cloud_commands(instance_id,status,created_at);
 create index if not exists cloud_events_instance_sequence on cloud_events(instance_id,agent_sequence);
 `)
@@ -213,6 +220,10 @@ func (s *Server) Handler() http.Handler {
 	})
 	r.Group(func(r chi.Router) {
 		r.Use(s.cors)
+		r.Post("/v1/agent/register", s.agentRegister)
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(s.cors)
 		r.Post("/v1/pairings/claim", s.claimPairingByCode)
 		r.Post("/v1/pairings/{pairingID}/claim", s.claimPairing)
 		r.Get("/v1/pairings/{pairingID}/status", s.pairingStatus)
@@ -223,6 +234,40 @@ func (s *Server) Handler() http.Handler {
 	r.Post("/v1/agent/pairings", s.agentPairing)
 	r.Post("/v1/agent/pairings/{pairingID}/confirm", s.agentConfirmPairing)
 	return r
+}
+
+// agentRegister turns a short-lived deployment enrollment token into a unique
+// per-machine credential. The enrollment token is never stored in the DB and
+// should be rotated by the operator after provisioning a release build.
+func (s *Server) agentRegister(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(s.config.EnrollmentToken) == "" ||
+		subtle.ConstantTimeCompare([]byte(strings.TrimSpace(r.Header.Get("X-Milevia-Enrollment-Token"))), []byte(strings.TrimSpace(s.config.EnrollmentToken))) != 1 {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid enrollment token"))
+		return
+	}
+	var input struct {
+		Name string `json:"name"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	instanceID := newID()
+	var tokenBytes [32]byte
+	if _, err := rand.Read(tokenBytes[:]); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	agentToken := fmt.Sprintf("mva_%x", tokenBytes[:])
+	if _, err := s.db.Exec(r.Context(), `insert into cloud_instances(instance_id,name,status) values($1,$2,'offline')`, instanceID, strings.TrimSpace(input.Name)); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := s.db.Exec(r.Context(), `insert into cloud_agent_credentials(instance_id,token_hash) values($1,$2)`, instanceID, hashCode(agentToken)); err != nil {
+		_, _ = s.db.Exec(r.Context(), `delete from cloud_instances where instance_id=$1`, instanceID)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"instanceId": instanceID, "agentToken": agentToken})
 }
 
 func (s *Server) createPairing(w http.ResponseWriter, r *http.Request) {
@@ -268,8 +313,7 @@ func (s *Server) agentPairing(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, errors.New("X-Milevia-Instance-ID is required"))
 		return
 	}
-	if !s.agentAuth(r, instanceID) {
-		writeError(w, 401, errors.New("invalid agent token"))
+	if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
 		return
 	}
 	if err := s.ensureInstance(r.Context(), instanceID); err != nil {
@@ -296,7 +340,11 @@ func (s *Server) agentPairing(w http.ResponseWriter, r *http.Request) {
 // claimPairing but only activates it after observing this confirmation.
 func (s *Server) agentConfirmPairing(w http.ResponseWriter, r *http.Request) {
 	instanceID := strings.TrimSpace(r.Header.Get("X-Milevia-Instance-ID"))
-	if instanceID == "" || !s.agentAuth(r, instanceID) {
+	if instanceID != "" {
+		if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
+			return
+		}
+	} else {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid agent token"))
 		return
 	}
@@ -645,13 +693,54 @@ func appOrigin(rawURL string) string {
 	return scheme + "://" + host
 }
 
-func (s *Server) agentAuth(r *http.Request, instanceID string) bool {
+// agentAuth authenticates an Agent request. It returns ok=false with a nil
+// error for a genuine rejection (missing, mismatched or revoked credential),
+// and ok=false with a non-nil error when the database is momentarily
+// unavailable. Callers must distinguish the two: only the nil-error case
+// should be reported as 401, because the Agent treats 401 as "credential
+// revoked", discards its local DPAPI secret and re-enrolls. Reporting a
+// transient DB failure as 401 would cascade into re-registration and orphaned
+// instances on every connection during an outage.
+func (s *Server) agentAuth(r *http.Request, instanceID string) (bool, error) {
+	provided := r.Header.Get("X-Milevia-Agent-Token")
+	if s.db != nil {
+		var tokenHash string
+		var revokedAt *time.Time
+		err := s.db.QueryRow(r.Context(), `select token_hash,revoked_at from cloud_agent_credentials where instance_id=$1`, instanceID).Scan(&tokenHash, &revokedAt)
+		if err == nil {
+			if revokedAt != nil {
+				return false, nil
+			}
+			return subtle.ConstantTimeCompare([]byte(hashCode(provided)), []byte(tokenHash)) == 1, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			// The DB did not answer. Refuse to authenticate rather than fall
+			// through to the static config, and surface a 5xx (via agentAuthDenied)
+			// so the Agent does not misread this as revocation.
+			return false, err
+		}
+	}
+	// Legacy deployments keep static credentials in configuration. Only use
+	// that fallback when no database-backed credential exists for the instance;
+	// this ensures revocation cannot be bypassed by an old static entry.
 	expected, ok := s.config.AgentTokens[instanceID]
-	if !ok || expected == "" {
+	return ok && expected != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1, nil
+}
+
+// agentAuthDenied writes the authentication failure response and reports
+// whether the request must be rejected. ok=false with a DB/auth error is
+// surfaced as 503 so a transient database failure is not mistaken for revoked
+// credentials; ok=false with no error is a genuine rejection (401).
+func agentAuthDenied(w http.ResponseWriter, ok bool, authErr error) bool {
+	if ok {
 		return false
 	}
-	provided := r.Header.Get("X-Milevia-Agent-Token")
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+	if authErr != nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("agent authentication temporarily unavailable"))
+		return true
+	}
+	writeError(w, http.StatusUnauthorized, errors.New("invalid agent token"))
+	return true
 }
 
 func (s *Server) listInstances(w http.ResponseWriter, r *http.Request) {
@@ -709,9 +798,38 @@ func (s *Server) revokeInstanceTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, errors.New("instance access denied"))
 		return
 	}
-	if _, err := s.db.Exec(r.Context(), `update cloud_access_tokens set revoked_at=now() where instance_id=$1 and revoked_at is null`, instanceID); err != nil {
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	defer tx.Rollback(r.Context())
+	if _, err := tx.Exec(r.Context(), `update cloud_access_tokens set revoked_at=now() where instance_id=$1 and revoked_at is null`, instanceID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `update cloud_agent_credentials set revoked_at=now() where instance_id=$1 and revoked_at is null`, instanceID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `update cloud_instances set status='offline',updated_at=now() where instance_id=$1`, instanceID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Drop the active relay connection as soon as credentials are revoked. The
+	// Agent will fail subsequent reconnects until it is explicitly re-enrolled.
+	s.mu.Lock()
+	conn := s.connections[instanceID]
+	if conn != nil {
+		delete(s.connections, instanceID)
+	}
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "instanceId": instanceID})
 }
@@ -854,8 +972,7 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, errors.New("instanceId is required"))
 		return
 	}
-	if !s.agentAuth(r, instanceID) {
-		writeError(w, 401, errors.New("invalid agent token"))
+	if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
 		return
 	}
 	upgrader := websocket.Upgrader{ReadBufferSize: 64 << 10, WriteBufferSize: 64 << 10, CheckOrigin: func(*http.Request) bool { return true }}
@@ -938,8 +1055,7 @@ func (s *Server) agentEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, errors.New("X-Milevia-Instance-ID is required"))
 		return
 	}
-	if !s.agentAuth(r, instanceID) {
-		writeError(w, 401, errors.New("invalid agent token"))
+	if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
 		return
 	}
 	if err := s.ensureInstance(r.Context(), instanceID); err != nil {
@@ -969,8 +1085,7 @@ func (s *Server) agentSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, errors.New("X-Milevia-Instance-ID is required"))
 		return
 	}
-	if !s.agentAuth(r, instanceID) {
-		writeError(w, 401, errors.New("invalid agent token"))
+	if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
 		return
 	}
 	if err := s.ensureInstance(r.Context(), instanceID); err != nil {

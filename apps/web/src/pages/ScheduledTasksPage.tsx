@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router-dom";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { useProjectContext } from "../stores/useProjectStore";
 import type { AgentID, PermissionMode, ScheduledTask, ScheduledTaskRun, Skill } from "../lib/types";
 import { TasksSubnav } from "./TasksSubnav";
@@ -133,10 +134,18 @@ export default function ScheduledTasksPage() {
     return () => { cancelled = true; loadGenerationRef.current += 1; };
   }, [load, setError]);
 
+  // 仅页面可见时每 10s 轮询一次；最小化/切到后台时暂停，只在「不可见 → 可见」的
+  // 那一跳补拉一次，补齐后台期间变化的「下次运行 / 最近状态」，而不是等到下个周期。
+  const visible = useDocumentVisible();
+  const prevVisible = useRef(visible);
   useEffect(() => {
+    const becameVisible = visible && !prevVisible.current;
+    prevVisible.current = visible;
+    if (!visible) return;
+    if (becameVisible) void load().catch(() => undefined);
     const interval = window.setInterval(() => { void load().catch(() => undefined); }, 10_000);
     return () => window.clearInterval(interval);
-  }, [load]);
+  }, [visible, load]);
 
   useEffect(() => {
     if (!scheduledTaskId) return;

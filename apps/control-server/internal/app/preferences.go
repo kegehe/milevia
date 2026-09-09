@@ -21,13 +21,17 @@ type AppPreferences struct {
 	DefaultAgentID       string    `json:"defaultAgentId"`
 	ClaudePermissionMode string    `json:"claudePermissionMode"`
 	CodexPermissionMode  string    `json:"codexPermissionMode"`
-	UpdatedAt            time.Time `json:"updatedAt"`
+	// AutoReview auto-accepts tasks as soon as their run finishes successfully
+	// instead of leaving them waiting for a manual acceptance.
+	AutoReview bool      `json:"autoReview"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 type appPreferencesPatch struct {
 	DefaultAgentID       *string `json:"defaultAgentId"`
 	ClaudePermissionMode *string `json:"claudePermissionMode"`
 	CodexPermissionMode  *string `json:"codexPermissionMode"`
+	AutoReview           *bool   `json:"autoReview"`
 }
 
 func defaultAppPreferences() AppPreferences {
@@ -44,21 +48,27 @@ func (s *Server) migrateAppPreferences(ctx context.Context) error {
 		default_agent_id text not null default 'claude-code',
 		claude_permission_mode text not null default 'approval_required',
 		codex_permission_mode text not null default 'workspace_write',
+		auto_review integer not null default 0,
 		updated_at datetime not null
 	)`); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `insert into app_preferences (id,default_agent_id,claude_permission_mode,codex_permission_mode,updated_at)
-		values (1,?,?,?,?) on conflict(id) do nothing`, defaultAgentID, defaultClaudePermission, defaultCodexPermission, time.Now().UTC())
+	// existing databases predate the auto_review column; add it idempotently.
+	if err := ensureColumn(ctx, s.db, "app_preferences", "auto_review", "integer not null default 0"); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `insert into app_preferences (id,default_agent_id,claude_permission_mode,codex_permission_mode,auto_review,updated_at)
+		values (1,?,?,?,0,?) on conflict(id) do nothing`, defaultAgentID, defaultClaudePermission, defaultCodexPermission, time.Now().UTC())
 	return err
 }
 
 func (s *Server) readAppPreferences(ctx context.Context, queryRow func(context.Context, string, ...any) *sql.Row) (AppPreferences, error) {
 	preferences := defaultAppPreferences()
-	err := queryRow(ctx, `select default_agent_id,claude_permission_mode,codex_permission_mode,updated_at from app_preferences where id=1`).Scan(
+	err := queryRow(ctx, `select default_agent_id,claude_permission_mode,codex_permission_mode,auto_review,updated_at from app_preferences where id=1`).Scan(
 		&preferences.DefaultAgentID,
 		&preferences.ClaudePermissionMode,
 		&preferences.CodexPermissionMode,
+		&preferences.AutoReview,
 		&preferences.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -87,7 +97,7 @@ func (s *Server) updateAppPreferences(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &patch) {
 		return
 	}
-	if patch.DefaultAgentID == nil && patch.ClaudePermissionMode == nil && patch.CodexPermissionMode == nil {
+	if patch.DefaultAgentID == nil && patch.ClaudePermissionMode == nil && patch.CodexPermissionMode == nil && patch.AutoReview == nil {
 		writeError(w, http.StatusBadRequest, errors.New("at least one preference must be provided"))
 		return
 	}
@@ -113,17 +123,21 @@ func (s *Server) updateAppPreferences(w http.ResponseWriter, r *http.Request) {
 	if patch.CodexPermissionMode != nil {
 		preferences.CodexPermissionMode = *patch.CodexPermissionMode
 	}
+	if patch.AutoReview != nil {
+		preferences.AutoReview = *patch.AutoReview
+	}
 	if !validAppPreferences(preferences) {
 		writeError(w, http.StatusBadRequest, errors.New("invalid application preference"))
 		return
 	}
 	preferences.UpdatedAt = time.Now().UTC()
-	if _, err := tx.ExecContext(r.Context(), `insert into app_preferences (id,default_agent_id,claude_permission_mode,codex_permission_mode,updated_at)
-		values (1,?,?,?,?)
-		on conflict(id) do update set default_agent_id=excluded.default_agent_id,claude_permission_mode=excluded.claude_permission_mode,codex_permission_mode=excluded.codex_permission_mode,updated_at=excluded.updated_at`,
+	if _, err := tx.ExecContext(r.Context(), `insert into app_preferences (id,default_agent_id,claude_permission_mode,codex_permission_mode,auto_review,updated_at)
+		values (1,?,?,?,?,?)
+		on conflict(id) do update set default_agent_id=excluded.default_agent_id,claude_permission_mode=excluded.claude_permission_mode,codex_permission_mode=excluded.codex_permission_mode,auto_review=excluded.auto_review,updated_at=excluded.updated_at`,
 		preferences.DefaultAgentID,
 		preferences.ClaudePermissionMode,
 		preferences.CodexPermissionMode,
+		preferences.AutoReview,
 		preferences.UpdatedAt,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

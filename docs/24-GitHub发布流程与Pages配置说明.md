@@ -38,6 +38,8 @@
 
 ### 2.3 GitHub Pages（静态站点，托管 latest.json）
 
+> **更新（2026-09）**：GitHub Pages 现在是**兜底端点**，不再是主源。主源已迁至自建服务器 `https://keyanjia.info:8443/updates/latest.json`（国内可达），`tauri.conf.json` 的 `endpoints` 把 keyanjia 放在首位。发版时 `scripts/release.mjs` 默认生成指向自建服务器的清单，并用 `--deploy`（或 `scp -r release/updates/. host:/var/www/milevia/dist/updates/`）上传；Pages 上的 `latest.json` 仍会同步（release.mjs 同时写仓库根 `latest.json`），供 GitHub 可达网络兜底。下方是原 GitHub Pages 方案的说明，仍适用于兜底链路。
+
 - **是什么**：GitHub 免费提供的静态网页托管，URL 形如 `https://<用户名>.github.io/<仓库名>/`。适合放不依赖后端的静态文件。
 - **为什么 latest.json 要放这里**：updater 需要一个**固定、不随版本变化**的地址去查询"最新版本"。如果 endpoint 指向 `releases/download/v0.1.0/latest.json`，那永远只查 0.1.0，升级就废了。而 `https://kegehe.github.io/milevia/latest.json` 是固定地址，内容由每次发布更新——updater 永远查这同一个地址，就能发现新版本。
 - **配置位置**：仓库 Settings → Pages → Source 选 **Deploy from a branch** → Branch 选 `main`、目录选 `/`(root)。
@@ -46,7 +48,7 @@
 
 ### 2.4 endpoint（updater 查询地址）与 updater 工作链
 
-- `tauri.conf.json` 里的 `plugins.updater.endpoints` 是 **updater 去拉最新版本的地址**（本项目 = Pages 的 `latest.json`）。
+- `tauri.conf.json` 里的 `plugins.updater.endpoints` 是 **updater 去拉最新版本的地址**（本项目 = 自建服务器 `keyanjia.info:8443/updates/latest.json` 主源 + Pages 兜底）。
 - updater 流程：
   ```
   启动 → 请求 endpoint(latest.json) → 读到 version

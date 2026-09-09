@@ -12,10 +12,10 @@ import (
 
 func TestParseSkillFrontmatter(t *testing.T) {
 	cases := []struct {
-		name        string
-		content     string
-		wantName    string
-		wantDesc    string
+		name     string
+		content  string
+		wantName string
+		wantDesc string
 	}{
 		{
 			name: "normal",
@@ -31,13 +31,13 @@ This skill guides creation of frontend interfaces.
 			wantDesc: "Create distinctive interfaces. Use this skill when building web components.",
 		},
 		{
-			name: "multiline description with double quotes",
-			content: "---\nname: \"audit\"\ndescription: \"Audit and improve CLAUDE.md files.\"\n---\n",
+			name:     "multiline description with double quotes",
+			content:  "---\nname: \"audit\"\ndescription: \"Audit and improve CLAUDE.md files.\"\n---\n",
 			wantName: "audit",
 			wantDesc: "Audit and improve CLAUDE.md files.",
 		},
 		{
-			name: "nested block ignored",
+			name:    "nested block ignored",
 			content: "---\ntool:\n  name: bash\n  description: run shell\nname: bash-runner\ndescription: Run shell commands\n---\n",
 			// 嵌套块后的顶层 name/description 仍需正确取到；嵌套块内 description 不应污染。
 			wantName: "bash-runner",
@@ -56,8 +56,8 @@ This skill guides creation of frontend interfaces.
 			wantDesc: "",
 		},
 		{
-			name: "unknown key before name",
-			content: "---\nmodel: claude-4\nname: zed\ndescription: whatever\n---\n",
+			name:     "unknown key before name",
+			content:  "---\nmodel: claude-4\nname: zed\ndescription: whatever\n---\n",
 			wantName: "zed",
 			wantDesc: "whatever",
 		},
@@ -147,6 +147,25 @@ func TestScanAndResolveLocalSkills(t *testing.T) {
 	for _, sk := range skills {
 		if sk.Name == ".git" {
 			t.Fatalf("plugin tree leaked .git as a skill: %+v", sk)
+		}
+	}
+}
+
+func TestScanSkillTreeFindsCodexSystemSkills(t *testing.T) {
+	base := t.TempDir()
+	makeSkillTree(t, base, ".system", "imagegen", "Create raster images", false)
+	makeSkillTree(t, base, ".system", "skill-creator", "Create skills", false)
+
+	root := skillScanRoot{absPath: base, agent: skillAgentCodex, source: skillSourceUser, env: "windows", recursive: true}
+	skills := resolveSkillScans(scanSkillTree(context.Background(), root))
+	byName := map[string]Skill{}
+	for _, skill := range skills {
+		byName[skill.Name] = skill
+	}
+	for _, name := range []string{"imagegen", "skill-creator"} {
+		skill, ok := byName[name]
+		if !ok || skill.Agent != skillAgentCodex || skill.Source != skillSourceUser {
+			t.Fatalf("nested Codex skill %q missing or wrong: %+v", name, skill)
 		}
 	}
 }

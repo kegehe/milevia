@@ -24,16 +24,19 @@ import (
 // readOutput/readStderr/approvalHookCommand）组装参数与解析输出，仅进程拉起部分由
 // 本 runner 自行实现为 wsl.exe 版本，避免改动现有 runner 的执行路径。
 type wslAgentRunner struct {
-	config Config
-	distro string           // 探测到的默认发行版，如 "Ubuntu"
-	claude *claudeCLIRunner // 复用 args/sessionArgs/profileLaunch/readOutput/readStderr
-	codex  *codexCLIRunner  // 复用 codex Run 的 profileLaunch/args 组装
+	config          Config
+	distro          string           // 探测到的默认发行版，如 "Ubuntu"
+	claude          *claudeCLIRunner // 复用 args/sessionArgs/profileLaunch/readOutput/readStderr
+	codex           *codexCLIRunner  // 复用 codex Run 的 profileLaunch/args 组装
+	codexSkillsRoot string           // WSL 用户级 Codex skills 的 Windows UNC 路径
 
-	mu          sync.Mutex
-	claudeAt    time.Time // claudeReady 缓存写入时刻；零值表示未缓存
-	claudeCache bool      // claudeReady 缓存值
-	codexAt     time.Time // codexReady 缓存写入时刻；零值表示未缓存
-	codexCache  bool      // codexReady 缓存值
+	mu              sync.Mutex
+	claudeAt        time.Time // claudeReady 缓存写入时刻；零值表示未缓存
+	claudeCache     bool      // claudeReady 缓存值
+	codexAt         time.Time // codexReady 缓存写入时刻；零值表示未缓存
+	codexCache      bool      // codexReady 缓存值
+	codexModelAt    time.Time // codexDefaultModel 缓存写入时刻；零值表示未缓存
+	codexModelCache string    // codexDefaultModel 缓存值（空串也缓存，避免每次 run 都拉起 WSL 探测）
 }
 
 // wslReadyCacheTTL 是 wslAgentRunner 就绪探测结果的短时缓存 TTL。
@@ -122,6 +125,32 @@ func (r *wslAgentRunner) cachedReady(ctx context.Context, at *time.Time, cached 
 	return ready
 }
 
+// codexDefaultModel 返回 WSL 内 cli_managed（无档案模型）Codex 将使用的默认模型。
+// WSL 内 codex 默认读 $HOME/.codex/config.toml；经 wslBridgeProbe 原样 cat 后按顶层
+// model 键解析。带短时缓存：每个 run 只触发一次探测，避免连续对话时反复拉起 wsl.exe。
+// 读取/解析失败返回空串，调用方回退到仅显示工具名。
+func (r *wslAgentRunner) codexDefaultModel(ctx context.Context) string {
+	r.mu.Lock()
+	if !r.codexModelAt.IsZero() && time.Since(r.codexModelAt) < wslReadyCacheTTL {
+		cached := r.codexModelCache
+		r.mu.Unlock()
+		return cached
+	}
+	r.mu.Unlock()
+
+	out, err := r.wslBridgeProbe(ctx, `cat "$HOME/.codex/config.toml" 2>/dev/null`)
+	model := ""
+	if err == nil {
+		model = codexModelFromConfig([]byte(out))
+	}
+
+	r.mu.Lock()
+	r.codexModelAt = time.Now()
+	r.codexModelCache = model
+	r.mu.Unlock()
+	return model
+}
+
 func (r *wslAgentRunner) claudeReady(ctx context.Context) bool {
 	// 与原版 claudeCLIRunner.Ready 语义一致：验证 WSL 内 claude 已安装且已登录
 	// （auth status 可执行）。仅测 command -v 会误报未登录为就绪。
@@ -159,15 +188,44 @@ func (r *wslAgentRunner) Version(parent context.Context) string { return r.claud
 // CodexVersion implements CodexCapableRunner。
 func (r *wslAgentRunner) CodexVersion(parent context.Context) string { return r.codexVersion(parent) }
 
-// CheckUpdate implements AgentRunner。跨端更新检查仅透出 WSL 内探测到的版本。
+// CheckUpdate implements AgentRunner。与 claudeCLIRunner / sshRunner 语义一致：先取 WSL
+// 内探测到的本机版本，再查 npm registry 最新版并比较。npm registry 版本号跨平台唯一，
+// 故查询在本机执行即可（见 latestNpmPackageVersion），不用跨界再拉起一次 wsl.exe。
 func (r *wslAgentRunner) CheckUpdate(parent context.Context) (bool, string, error) {
-	return false, r.claudeVersion(parent), nil
+	local := normalizeClaudeVersion(r.claudeVersion(parent))
+	if local == "" {
+		return false, "", errors.New("WSL 内未安装 Claude Code")
+	}
+	latest, err := latestNpmPackageVersion(parent, "@anthropic-ai/claude-code")
+	if err != nil {
+		return false, "", err
+	}
+	return latest != local, latest, nil
 }
 
-// CodexCheckUpdate implements CodexCapableRunner。
+// CodexCheckUpdate implements CodexCapableRunner，与 codexCLIRunner 的语义一致。
 func (r *wslAgentRunner) CodexCheckUpdate(parent context.Context) (bool, string, error) {
-	return false, r.codexVersion(parent), nil
+	local := normalizeCodexVersion(r.codexVersion(parent))
+	if local == "" {
+		return false, "", errors.New("WSL 内未安装 Codex CLI")
+	}
+	latest, err := latestNpmPackageVersion(parent, "@openai/codex")
+	if err != nil {
+		return false, "", err
+	}
+	available, err := codexUpdateAvailable(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
 }
+
+// AutoUpdateSupported implements autoUpdateSupportedRunner。跨端（Windows→WSL）升级
+// 尚未就绪（见 Update），如实告知调用方不支持应用内自动升级。
+func (r *wslAgentRunner) AutoUpdateSupported() bool { return false }
+
+// CodexAutoUpdateSupported implements codexAutoUpdateSupportedRunner。
+func (r *wslAgentRunner) CodexAutoUpdateSupported() bool { return false }
 
 // Update implements AgentRunner。跨端升级如实提示降级，不伪造成功。
 func (r *wslAgentRunner) Update(parent context.Context) (string, string, error) {

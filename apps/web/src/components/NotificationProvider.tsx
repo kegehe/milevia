@@ -3,10 +3,12 @@
 import { createContext, useContext, useEffect, useRef, useCallback, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { Toaster, toast } from "sonner";
+import { invoke } from "@tauri-apps/api/core";
 import { api } from "../lib/api";
-import { createWebSocket } from "../lib/runtime";
+import { createWebSocket, isDesktop } from "../lib/runtime";
 import {
   type NotificationEvent,
+  isWindowsNotifyType,
   isWithinQuietHours,
   notificationTargetURL,
   priorityForType,
@@ -191,6 +193,16 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       });
 
       markUnread(event);
+
+      // Windows 系统右下角弹窗通知：用户开启 + 任务完成类 + 主窗口不在前台时发起。
+      // Rust 侧只显示“有任务完成”，不含项目/任务名；点击后跳到对应项目。
+      // 用 document.hasFocus() 判断主窗口是否在前台：聚焦时已有应用内 toast，不叠加
+      // 系统弹窗造成双重提醒；切到别处（窗口失焦/最小化）才弹系统弹窗进行提醒。
+      if (isDesktop() && preferences.windowsToastsEnabled && isWindowsNotifyType(event.type) && !document.hasFocus()) {
+        invoke("show_system_notification", { path: notificationTargetURL(event) }).catch(() => {
+          /* 系统通知失败不影响应用内提醒 */
+        });
+      }
 
       // 页面不可见时，显示浏览器桌面通知
       if (preferences.systemNotificationsEnabled && preferences.notifyWhenHidden && document.visibilityState === "hidden" && typeof Notification !== "undefined" && Notification.permission === "granted") {

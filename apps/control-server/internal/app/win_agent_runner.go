@@ -85,18 +85,48 @@ func (r *windowsAgentRunner) CodexReady(parent context.Context) bool { return r.
 func (r *windowsAgentRunner) Version(parent context.Context) string { return r.claudeVersion(parent) }
 
 // CodexVersion implements CodexCapableRunner。
-func (r *windowsAgentRunner) CodexVersion(parent context.Context) string { return r.codexVersion(parent) }
+func (r *windowsAgentRunner) CodexVersion(parent context.Context) string {
+	return r.codexVersion(parent)
+}
 
-// CheckUpdate implements AgentRunner。Windows 侧具体更新可用性由 CLI 自身暴露给调用方；
-// 本期跨端更新检查仅透出本机探测到的版本。
+// CheckUpdate implements AgentRunner。与 claudeCLIRunner / sshRunner 语义一致：先取
+// Windows 侧探测到的本机版本，再查 npm registry 最新版并比较（版本号跨平台唯一，见
+// latestNpmPackageVersion）。
 func (r *windowsAgentRunner) CheckUpdate(parent context.Context) (bool, string, error) {
-	return false, r.claudeVersion(parent), nil
+	local := normalizeClaudeVersion(r.claudeVersion(parent))
+	if local == "" {
+		return false, "", errors.New("Windows 侧未安装 Claude Code")
+	}
+	latest, err := latestNpmPackageVersion(parent, "@anthropic-ai/claude-code")
+	if err != nil {
+		return false, "", err
+	}
+	return latest != local, latest, nil
 }
 
-// CodexCheckUpdate implements CodexCapableRunner。
+// CodexCheckUpdate implements CodexCapableRunner，与 codexCLIRunner 的语义一致。
 func (r *windowsAgentRunner) CodexCheckUpdate(parent context.Context) (bool, string, error) {
-	return false, r.codexVersion(parent), nil
+	local := normalizeCodexVersion(r.codexVersion(parent))
+	if local == "" {
+		return false, "", errors.New("Windows 侧未安装 Codex CLI")
+	}
+	latest, err := latestNpmPackageVersion(parent, "@openai/codex")
+	if err != nil {
+		return false, "", err
+	}
+	available, err := codexUpdateAvailable(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
 }
+
+// AutoUpdateSupported implements autoUpdateSupportedRunner。跨端（WSL→Windows）升级
+// 尚未就绪（见 Update），如实告知调用方不支持应用内自动升级。
+func (r *windowsAgentRunner) AutoUpdateSupported() bool { return false }
+
+// CodexAutoUpdateSupported implements codexAutoUpdateSupportedRunner。
+func (r *windowsAgentRunner) CodexAutoUpdateSupported() bool { return false }
 
 // Update implements AgentRunner。跨端升级属 POC 边界，如实提示降级，不伪造成功。
 func (r *windowsAgentRunner) Update(parent context.Context) (string, string, error) {

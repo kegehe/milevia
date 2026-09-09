@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useOutletContext, useParams, useNavigate } from "react-router-dom";
+import { useOutletContext, useParams } from "react-router-dom";
 import { FilesPanel } from "../features/files/FilesPanel";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useActiveConversationId } from "../lib/use-active-conversation";
@@ -8,9 +8,8 @@ import "../files.css";
 
 export default function FilesPage() {
   const { projectId } = useParams<{ projectId: string }>();
-  const { project } = useOutletContext<ProjectLayoutOutletContext>();
+  const { project, registerNavigationGuard, navigateWithGuard } = useOutletContext<ProjectLayoutOutletContext>();
   const { api, projectStatuses } = useProjectContext();
-  const navigate = useNavigate();
   const conversationId = useActiveConversationId(projectId);
 
   // 检查当前项目是否有 AI 运行中
@@ -20,8 +19,8 @@ export default function FilesPage() {
   const handleAddToChat = useCallback((path: string) => {
     if (!projectId) return;
     sessionStorage.setItem("milevia_add_file_to_chat", path);
-    navigate(`/projects/${projectId}/conversations?addFile=true`);
-  }, [projectId, navigate]);
+    navigateWithGuard(`/projects/${projectId}/conversations?addFile=true`);
+  }, [projectId, navigateWithGuard]);
 
   if (!projectId || !project) return null;
   return (
@@ -32,6 +31,7 @@ export default function FilesPage() {
       request={api}
       isWorkspaceOccupied={isWorkspaceOccupied}
       onAddToChat={handleAddToChat}
+      registerNavigationGuard={registerNavigationGuard}
     />
   );
 }

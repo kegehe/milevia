@@ -10,6 +10,9 @@ const cacheFile = resolve(binaries, ".build-cache.json");
 const controlOutput = resolve(binaries, "milevia-control.exe");
 const approvalOutput = resolve(binaries, "milevia-approval.exe");
 const terminalBridgeOutput = resolve(binaries, "milevia-terminal-bridge.exe");
+const agentRoot = resolve(desktopRoot, "../agent");
+const agentOutput = resolve(binaries, "milevia-agent.exe");
+const agentConfigOutput = resolve(binaries, "milevia-agent.env");
 
 if (process.platform !== "win32") {
   throw new Error("Windows desktop sidecar must be built on Windows so the CGO SQLite toolchain is reproducible.");
@@ -151,18 +154,70 @@ function assertCgoBuild(outputPath, label) {
   }
 }
 
+// Prepare the only Agent config that may be bundled. It intentionally filters
+// per-machine credentials from the developer env file before any build work
+// begins, so a failed release build cannot leave a stale credential resource.
+function prepareAgentBootstrapConfig() {
+  // 发布包只允许包含公开的云端地址。注册令牌与本地 Agent 令牌均是秘密：
+  // 前者须由管理员在首次启动时按需注入，后者由桌面宿主每次启动随机生成。
+  const allowed = new Set(["MILEVIA_CLOUD_URL", "MILEVIA_LOCAL_URL"]);
+  const values = new Map();
+  if (existsSync(agentEnvSource)) {
+    readFileSync(agentEnvSource, "utf8").split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .forEach((line) => {
+        const separator = line.indexOf("=");
+        if (separator <= 0) return;
+        const key = line.slice(0, separator).trim();
+        if (allowed.has(key) && !values.has(key)) values.set(key, line.slice(separator + 1).trim());
+      });
+  }
+  if (process.env.MILEVIA_CLOUD_URL?.trim()) {
+    values.set("MILEVIA_CLOUD_URL", process.env.MILEVIA_CLOUD_URL.trim());
+  }
+  const configured = Boolean(values.get("MILEVIA_CLOUD_URL"));
+  mkdirSync(dirname(agentConfigOutput), { recursive: true });
+  if (!configured) {
+    writeFileSync(agentConfigOutput, "# Configure MILEVIA_CLOUD_URL for remote Agent enrollment\n", "utf8");
+    if (process.env.MILEVIA_ALLOW_UNCONFIGURED_AGENT !== "1") {
+      throw new Error(
+        "Release Agent configuration requires MILEVIA_CLOUD_URL. " +
+        "Provide MILEVIA_AGENT_ENROLLMENT_TOKEN only to the first local launch; " +
+        "set MILEVIA_ALLOW_UNCONFIGURED_AGENT=1 only for local development.",
+      );
+    }
+    return;
+  }
+  const lines = [...values.entries()].map(([key, value]) => `${key}=${value}`);
+  writeFileSync(agentConfigOutput, `${lines.join("\n")}\n`, "utf8");
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 const goSources = collectFiles(controlRoot, new Set([".go"]));
+const agentSources = collectFiles(agentRoot, new Set([".go"]));
 // go.mod / go.sum affect dependency resolution — must be part of fingerprint
-const modFiles = [resolve(controlRoot, "go.mod"), resolve(controlRoot, "go.sum")];
-const fingerprint = computeFingerprint([...goSources, ...modFiles]);
+const modFiles = [
+  resolve(controlRoot, "go.mod"), resolve(controlRoot, "go.sum"),
+  resolve(agentRoot, "go.mod"), resolve(agentRoot, "go.sum"),
+];
+const agentEnvSource = resolve(agentRoot, ".env.windows");
+const fingerprint = computeFingerprint([
+  ...goSources,
+  ...agentSources,
+  ...modFiles,
+  ...(existsSync(agentEnvSource) ? [agentEnvSource] : []),
+]);
+
+prepareAgentBootstrapConfig();
 
 const controlNeeded = force || shouldRebuild(controlOutput, fingerprint);
 const approvalNeeded = force || shouldRebuild(approvalOutput, fingerprint);
 const terminalBridgeNeeded = force || shouldRebuild(terminalBridgeOutput, fingerprint);
+const agentNeeded = force || shouldRebuild(agentOutput, fingerprint);
 
-if (!controlNeeded && !approvalNeeded && !terminalBridgeNeeded) {
+if (!controlNeeded && !approvalNeeded && !terminalBridgeNeeded && !agentNeeded && existsSync(agentConfigOutput)) {
   process.stdout.write("Sidecar binaries are up to date (use --force to rebuild).\n");
   process.exit(0);
 }
@@ -174,5 +229,15 @@ mkdirSync(dirname(controlOutput), { recursive: true });
 if (controlNeeded) goBuild("control-server", controlOutput, "./cmd/control-server");
 if (approvalNeeded) goBuild("approval-helper", approvalOutput, "./cmd/approval-helper");
 if (terminalBridgeNeeded) goBuild("terminal bridge", terminalBridgeOutput, "./cmd/terminal-bridge");
+
+if (agentNeeded) {
+  assertCgoReady();
+  execFileSync("go", ["build", "-trimpath", "-o", agentOutput, "./cmd/milevia-agent"], {
+    cwd: agentRoot,
+    stdio: "inherit",
+  });
+  assertCgoBuild(agentOutput, "milevia-agent");
+  process.stdout.write(`  agent -> ${basename(agentOutput)}\n`);
+}
 
 writeCache(fingerprint);

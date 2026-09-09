@@ -54,7 +54,10 @@ export type TimelineItem =
   | { kind: "system"; id: string; createdAt: string; system: SystemItem }
   | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
 export type WorkspaceTab = "conversation" | "tasks" | "orchestration" | "files" | "git" | "run" | "terminal" | "insights";
-export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?: string; environment: string; cwdDisplay?: string; status: "starting" | "running" | "exited" | "failed" | "closed"; createdAt: string };
+export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?: string; environment: string; shell?: string; elevated?: boolean; cwdDisplay?: string; status: "starting" | "running" | "exited" | "failed" | "closed"; createdAt: string };
+// GET .../terminal/sessions 的响应：会话清单 + 服务端下发的并发上限（界面禁用
+// “新建”和计数都以此为准，不再前端硬编码固定值）。
+export type TerminalSessionList = { sessions: TerminalSessionInfo[]; maxPerProject: number; maxProjects: number };
 
 export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
 export type RunnerInfo = {
@@ -108,6 +111,9 @@ export type CredentialPool = {
 
 export type CheckUpdateResult = {
   updateAvailable: boolean;
+  // 该 runner 是否支持"应用内自动更新"。缺省（旧服务端未返回）视为 true；
+  // 跨端 runner（wsl-local 等）为 false，表示有新版本但需到目标环境手动执行 claude/codex update。
+  autoUpdatable?: boolean;
   currentVersion: string;
   latestVersion?: string;
   error?: string;

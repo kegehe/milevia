@@ -1,7 +1,7 @@
 // 项目页共享布局：header、workspace tabs
 // 通过 Outlet context 向子路由传递 project 数据，避免重复加载
 
-import { useEffect, useState, useCallback, type ReactNode } from "react";
+import { useEffect, useState, useCallback, useRef, type ReactNode } from "react";
 import { Outlet, useParams, useNavigate, useLocation, Navigate } from "react-router-dom";
 import NotificationCenter from "./NotificationCenter";
 import { type Project, type WorkspaceTab, NON_GIT_BRANCH } from "../lib/types";
@@ -10,7 +10,11 @@ import { useProjectContext } from "../stores/useProjectStore";
 
 export interface ProjectLayoutOutletContext {
   project: Project;
+  registerNavigationGuard: (guard: NavigationGuard | null) => void;
+  navigateWithGuard: (to: string) => void;
 }
+
+export type NavigationGuard = (proceed: () => void) => void;
 
 function BackProjectsIcon() {
   return <svg className="back-projects-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5 8 12l6.5 6.5M8.5 12h8" /></svg>;
@@ -42,6 +46,18 @@ export default function ProjectLayout() {
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
   const { error: globalError, setError: setGlobalError, refreshStatuses } = useProjectContext();
+  const navigationGuardRef = useRef<NavigationGuard | null>(null);
+
+  const registerNavigationGuard = useCallback((guard: NavigationGuard | null) => {
+    navigationGuardRef.current = guard;
+  }, []);
+
+  const guardedNavigate = useCallback((to: string) => {
+    const proceed = () => navigate(to);
+    const guard = navigationGuardRef.current;
+    if (guard) guard(proceed);
+    else proceed();
+  }, [navigate]);
 
   // 确定当前工作区标签
   const getWorkspaceTab = useCallback((): WorkspaceTab => {
@@ -64,19 +80,18 @@ export default function ProjectLayout() {
   }, [getWorkspaceTab]);
 
   const selectWorkspaceTab = useCallback((tab: WorkspaceTab) => {
-    setWorkspaceTab(tab);
     const base = `/projects/${projectId}`;
     switch (tab) {
-      case "conversation": navigate(`${base}/conversations`); break;
-      case "tasks": navigate(`${base}/tasks`); break;
-      case "orchestration": navigate(`${base}/orchestration`); break;
-      case "files": navigate(`${base}/files`); break;
-      case "git": navigate(`${base}/git`); break;
-      case "run": navigate(`${base}/run`); break;
-      case "terminal": navigate(`${base}/terminal`); break;
-      case "insights": navigate(`${base}/insights`); break;
+      case "conversation": guardedNavigate(`${base}/conversations`); break;
+      case "tasks": guardedNavigate(`${base}/tasks`); break;
+      case "orchestration": guardedNavigate(`${base}/orchestration`); break;
+      case "files": guardedNavigate(`${base}/files`); break;
+      case "git": guardedNavigate(`${base}/git`); break;
+      case "run": guardedNavigate(`${base}/run`); break;
+      case "terminal": guardedNavigate(`${base}/terminal`); break;
+      case "insights": guardedNavigate(`${base}/insights`); break;
     }
-  }, [projectId, navigate]);
+  }, [projectId, guardedNavigate]);
 
   // 加载项目数据（仅一次，通过 context 共享给子路由）
 	// 用单项目接口而非全量 /api/projects：后者会对每个 SSH runner 同步探活，
@@ -117,7 +132,7 @@ export default function ProjectLayout() {
     return <main className="app-shell project-open">
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100vh", gap: "16px" }}>
         <p style={{ color: "#d14233", fontSize: "14px" }}>{error}</p>
-        <button className="primary" onClick={() => navigate("/")}>返回项目列表</button>
+        <button className="primary" onClick={() => guardedNavigate("/")}>返回项目列表</button>
       </div>
     </main>;
   }
@@ -156,7 +171,7 @@ export default function ProjectLayout() {
     {globalError && <div className="error" role="alert"><ErrorAlertIcon /><span>{globalError}</span><button type="button" title="关闭错误提示" aria-label="关闭错误提示" onClick={() => setGlobalError("")}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button></div>}
     <header className="project-head">
       <div className="project-heading">
-        <button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表" onClick={() => navigate("/")}><BackProjectsIcon /></button>
+        <button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表" onClick={() => guardedNavigate("/")}><BackProjectsIcon /></button>
         <h2>{project.name}</h2>
       </div>
       <div className="head-actions-slot">
@@ -174,7 +189,7 @@ export default function ProjectLayout() {
       <button data-workspace-tab="insights" id="workspace-tab-insights" type="button" role="tab" aria-controls="workspace-panel-insights" aria-selected={workspaceTab === "insights"} className={workspaceTab === "insights" ? "active" : ""} onClick={() => selectWorkspaceTab("insights")}><WorkspaceTabIcon tab="insights" /><span>优化建议</span></button>
     </nav>
     <main className="workspace-content">
-      <Outlet context={{ project } satisfies ProjectLayoutOutletContext} />
+      <Outlet context={{ project, registerNavigationGuard, navigateWithGuard: guardedNavigate } satisfies ProjectLayoutOutletContext} />
     </main>
   </div>;
 }

@@ -37,17 +37,41 @@ var (
 // persists its own thread; the server stores the thread ID returned as JSONL.
 type codexCLIRunner struct{ config Config }
 
+// codexDefaultModelRunner 由能报告“CLI 默认模型”的 Codex runner 实现（本机 / WSL / SSH）。
+// Codex 的 exec --json 事件流只含 token 用量、不含模型名，usage 追踪在 cli_managed
+// （无档案模型）场景下只能从 CLI 自己的 config.toml 读取默认模型，见 seedRunUsageModel。
+type codexDefaultModelRunner interface {
+	codexDefaultModel(ctx context.Context) string
+}
+
+var codexProfileSkillsMu sync.Mutex
+
 func newCodexCLIRunner(config Config) AgentRunner { return &codexCLIRunner{config: config} }
 
-func (r *codexCLIRunner) Ready(parent context.Context) bool {
-	if !r.BinaryReady() {
-		return false
+// codexCommandContext handles npm's Windows .cmd shim explicitly. CreateProcess
+// cannot launch a batch file directly, while `codex` resolved through PATHEXT
+// commonly points to codex.cmd.
+func codexCommandContext(ctx context.Context, path string, args ...string) *exec.Cmd {
+	if runtime.GOOS != "windows" {
+		return exec.CommandContext(ctx, path, args...)
 	}
-	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, r.config.CodexPath, "login", "status")
-	configureProcessGroup(cmd)
-	return cmd.Run() == nil
+	lower := strings.ToLower(path)
+	if !strings.HasSuffix(lower, ".cmd") && !strings.HasSuffix(lower, ".bat") {
+		return exec.CommandContext(ctx, path, args...)
+	}
+	// Pass the script path as the /c command and preserve each user argument as
+	// a separate process argument. Building one hand-quoted command string would
+	// mishandle prompts containing quotes or shell metacharacters.
+	return exec.CommandContext(ctx, "cmd.exe", append([]string{"/d", "/c", `"` + path + `"`}, args...)...)
+}
+
+func (r *codexCLIRunner) Ready(parent context.Context) bool {
+	// Readiness is an execution capability check, not an authentication check.
+	// Codex may be authenticated by CC Switch, CODEX_HOME, environment
+	// variables, or a managed API-key profile; all of those are valid without
+	// `codex login status` succeeding.  The actual run will report auth errors
+	// with the appropriate context if configuration is invalid.
+	return r.BinaryReady()
 }
 
 // BinaryReady reports whether the Codex binary is present, independent of any
@@ -61,7 +85,7 @@ func (r *codexCLIRunner) BinaryReady() bool {
 func (r *codexCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.config.CodexPath, "--version")
+	cmd := codexCommandContext(ctx, r.config.CodexPath, "--version")
 	configureProcessGroup(cmd)
 	out, err := cmd.Output()
 	if err != nil {
@@ -213,7 +237,7 @@ func (r *codexCLIRunner) Update(parent context.Context) (string, string, error) 
 	ctx, cancel := context.WithTimeout(parent, r.config.agentUpdateTimeout())
 	defer cancel()
 	var out bytes.Buffer
-	cmd := exec.CommandContext(ctx, r.config.CodexPath, "update")
+	cmd := codexCommandContext(ctx, r.config.CodexPath, "update")
 	configureProcessGroup(cmd)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -258,6 +282,16 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 		return err
 	}
 	args := []string{"exec"}
+	var schemaPath string
+	if len(request.OutputSchema) > 0 {
+		var cleanup func()
+		schemaPath, cleanup, err = writeCodexOutputSchema(request.OutputSchema)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		args = append(args, "--output-schema", schemaPath)
+	}
 	profileArgs, environment, closeProfile, err := r.profileLaunch(ctx, request.Profile)
 	if err != nil {
 		return err
@@ -272,7 +306,7 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	} else {
 		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, request.Prompt)
 	}
-	cmd := exec.Command(r.config.CodexPath, args...)
+	cmd := codexCommandContext(context.Background(), r.config.CodexPath, args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
 	configureProcessGroup(cmd)
@@ -312,7 +346,72 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	return nil
 }
 
-func (r *codexCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeProfile) ([]string, []string, func(), error) {
+func writeCodexOutputSchema(input json.RawMessage) (string, func(), error) {
+	schema, err := codexOutputSchema(input)
+	if err != nil {
+		return "", func() {}, err
+	}
+	file, err := os.CreateTemp("", "milevia-codex-schema-*.json")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("create Codex output schema: %w", err)
+	}
+	path := file.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	if _, err := file.Write(schema); err != nil {
+		file.Close()
+		cleanup()
+		return "", func() {}, fmt.Errorf("write Codex output schema: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("close Codex output schema: %w", err)
+	}
+	return path, cleanup, nil
+}
+
+// codexOutputSchema adapts the shared insight contracts for Codex's structured
+// output API, whose response schema must have an object at its root. The
+// insight parser already accepts the equivalent {"findings": [...]} envelope.
+func codexOutputSchema(schema json.RawMessage) (json.RawMessage, error) {
+	if !json.Valid(schema) {
+		return nil, errors.New("invalid Codex output schema")
+	}
+	trimmed := bytes.TrimSpace(schema)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("Codex output schema root must be a JSON object")
+	}
+	var root struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(schema, &root); err != nil {
+		return nil, errors.New("invalid Codex output schema")
+	}
+	if root.Type == "" || root.Type == "object" {
+		return schema, nil
+	}
+	if root.Type != "array" {
+		return nil, errors.New("Codex output schema root type must be object or array")
+	}
+	wrapped, err := json.Marshal(map[string]any{
+		"type":                 "object",
+		"properties":           map[string]json.RawMessage{"findings": schema},
+		"required":             []string{"findings"},
+		"additionalProperties": false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("wrap Codex output schema: %w", err)
+	}
+	return wrapped, nil
+}
+
+func (r *codexCLIRunner) profileLaunch(ctx context.Context, profile *AgentRuntimeProfile) ([]string, []string, func(), error) {
+	return r.profileLaunchWithSkills(ctx, profile, codexUserSkillsDir())
+}
+
+func (r *codexCLIRunner) profileLaunchWithSkills(_ context.Context, profile *AgentRuntimeProfile, skillsSource string) ([]string, []string, func(), error) {
+	if strings.TrimSpace(skillsSource) == "" {
+		skillsSource = codexUserSkillsDir()
+	}
 	environment := managedCLIEnvironment(profile, os.Environ())
 	if profile == nil || profile.AuthMode != "api_key" {
 		return nil, environment, func() {}, nil
@@ -326,6 +425,9 @@ func (r *codexCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeP
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, nil, nil, fmt.Errorf("create isolated Codex provider directory: %w", err)
+	}
+	if err := provisionCodexProfileSkills(skillsSource, dir); err != nil {
+		return nil, nil, nil, fmt.Errorf("make Codex skills available to isolated provider: %w", err)
 	}
 	// Codex uses this environment for provider authentication, but tool commands
 	// must never inherit the managed API key.
@@ -353,6 +455,177 @@ func (r *codexCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeP
 	return args, environment, func() {}, nil
 }
 
+// provisionCodexProfileSkills exposes the user's skills to a managed-profile
+// CODEX_HOME without inheriting its config or authentication files. A symlink
+// keeps the profile in sync with skill installs; on Windows installations that
+// disallow symlink creation, a regular-file copy provides the same layout.
+func provisionCodexProfileSkills(source, profileHome string) error {
+	if sourceAbs, sourceErr := filepath.Abs(source); sourceErr == nil {
+		if targetAbs, targetErr := filepath.Abs(filepath.Join(profileHome, "skills")); targetErr == nil && filepath.Clean(sourceAbs) == filepath.Clean(targetAbs) {
+			return nil
+		}
+	}
+	target := filepath.Join(profileHome, "skills")
+	info, err := os.Stat(source)
+	if errors.Is(err, os.ErrNotExist) {
+		codexProfileSkillsMu.Lock()
+		defer codexProfileSkillsMu.Unlock()
+		if removeErr := os.RemoveAll(target); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return removeErr
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("Codex skills path is not a directory: %s", source)
+	}
+
+	codexProfileSkillsMu.Lock()
+	defer codexProfileSkillsMu.Unlock()
+	if targetInfo, err := os.Lstat(target); err == nil {
+		if targetInfo.Mode()&os.ModeSymlink != 0 {
+			resolved, resolveErr := filepath.EvalSymlinks(target)
+			if resolveErr == nil && !isWSLUncPath(source) {
+				resolved, _ = filepath.Abs(resolved)
+				expected, _ := filepath.Abs(source)
+				if filepath.Clean(resolved) == filepath.Clean(expected) {
+					return nil
+				}
+			}
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+		} else if !targetInfo.IsDir() {
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !isWSLUncPath(source) {
+		if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
+			if err := os.Symlink(source, target); err == nil {
+				return nil
+			}
+		} else if err != nil {
+			return err
+		}
+	}
+	if err := syncCodexSkillTree(source, target); err != nil {
+		_ = os.RemoveAll(target)
+		return err
+	}
+	return nil
+}
+
+func syncCodexSkillTree(source, target string) error {
+	if sourceAbs, sourceErr := filepath.Abs(source); sourceErr == nil {
+		if targetAbs, targetErr := filepath.Abs(target); targetErr == nil && filepath.Clean(sourceAbs) == filepath.Clean(targetAbs) {
+			return nil
+		}
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if existing, statErr := os.Lstat(target); statErr == nil && existing.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("Codex skills target must not be a symbolic link: %s", target)
+	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
+		if entry.Type()&os.ModeSymlink != 0 {
+			// Do not reproduce links from a user skill tree, but do remove a
+			// stale copy from an earlier sync.
+			if err := os.RemoveAll(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			continue
+		}
+		if entry.IsDir() {
+			if existing, statErr := os.Lstat(targetPath); statErr == nil {
+				if existing.Mode()&os.ModeSymlink != 0 || !existing.IsDir() {
+					if err := os.RemoveAll(targetPath); err != nil {
+						return err
+					}
+				}
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				return statErr
+			}
+			if err := syncCodexSkillTree(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+		fileInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !fileInfo.Mode().IsRegular() {
+			if err := os.RemoveAll(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			continue
+		}
+		if existing, statErr := os.Lstat(targetPath); statErr == nil && (existing.Mode()&os.ModeSymlink != 0 || existing.IsDir()) {
+			if err := os.RemoveAll(targetPath); err != nil {
+				return err
+			}
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		input, err := os.Open(sourcePath)
+		if err != nil {
+			return err
+		}
+		output, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileInfo.Mode().Perm())
+		if err != nil {
+			_ = input.Close()
+			return err
+		}
+		_, err = io.Copy(output, input)
+		closeOutputErr := output.Close()
+		closeInputErr := input.Close()
+		if err != nil {
+			return err
+		}
+		if closeOutputErr != nil {
+			return closeOutputErr
+		}
+		if closeInputErr != nil {
+			return closeInputErr
+		}
+	}
+	targetEntries, err := os.ReadDir(target)
+	if err != nil {
+		return err
+	}
+	present := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		present[entry.Name()] = struct{}{}
+	}
+	for _, entry := range targetEntries {
+		if _, ok := present[entry.Name()]; !ok {
+			if err := os.RemoveAll(filepath.Join(target, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (r *codexCLIRunner) codexProfileHome(profile *AgentRuntimeProfile) (string, error) {
 	root := r.config.DataDir
 	if root == "" {
@@ -377,6 +650,56 @@ func (r *codexCLIRunner) codexProfileHome(profile *AgentRuntimeProfile) (string,
 		identity = fmt.Sprintf("revision-%x", digest[:8])
 	}
 	return filepath.Join(root, "codex", "profiles", identity), nil
+}
+
+// codexConfigModelPattern 匹配 config.toml 顶层 `model = "..."` / `model = '...'`。
+// Codex 的 config.toml 形如：
+//
+//	model_provider = "custom"
+//	model = "gpt-5.6-terra"
+//	model_reasoning_effort = "high"
+//
+//	[model_providers.custom]
+//	...
+//
+// 只有第一个 [section] 之前的顶层 model 才是当前生效模型；provider 段内同名键不读。
+var codexConfigModelPattern = regexp.MustCompile(`^[ \t]*model[ \t]*=[ \t]*("([^"]*)"|'([^']*)')`)
+
+// codexModelFromConfig 从 codex config.toml 文本中提取顶层生效的 model 名。
+// 找不到（使用官方 provider 内建默认、文件不存在或不可解析）时返回空串。
+func codexModelFromConfig(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			break // 进入 provider 段后不再属于顶层配置
+		}
+		if match := codexConfigModelPattern.FindStringSubmatch(trimmed); match != nil {
+			if match[2] != "" {
+				return match[2]
+			}
+			return match[3]
+		}
+	}
+	return ""
+}
+
+// codexDefaultModel 返回本机 cli_managed（无档案模型）Codex 将使用的默认模型。
+// 生效的 CODEX_HOME 取环境变量，否则为 ~/.codex（与 codex CLI 的解析一致）。
+// 读取或解析失败返回空串，调用方回退到仅显示工具名。
+func (r *codexCLIRunner) codexDefaultModel(ctx context.Context) string {
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		home = filepath.Join(userHome, ".codex")
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		return ""
+	}
+	return codexModelFromConfig(data)
 }
 
 func codexSandbox(policy string) (string, error) {

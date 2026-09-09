@@ -98,8 +98,8 @@ func TestWslPathWithin(t *testing.T) {
 		{"sibling prefix", `\\wsl$\Ubuntu\home\tangmaoke`, `\\wsl$\Ubuntu\home\tangmaokeX`, false},
 		{"different distro", root, `\\wsl$\Debian\home\tangmaoke\proj`, false},
 		{"localhost form", `\\wsl.localhost\Ubuntu\home`, `\\wsl.localhost\Ubuntu\home\x`, true},
-		{"dotdot escape", root, root + `\..\..\..\etc`, false},   // .. 穿越应被拒
-		{"dotdot within", root, root + `\a\..\b`, true},          // 内部 .. 归一后仍在 root 内
+		{"dotdot escape", root, root + `\..\..\..\etc`, false}, // .. 穿越应被拒
+		{"dotdot within", root, root + `\a\..\b`, true},        // 内部 .. 归一后仍在 root 内
 		{"root is wsl.localhost child", `\\wsl.localhost\Ubuntu`, `\\wsl.localhost\Ubuntu\home`, true},
 		{"non-unc", root, `C:\some`, false},
 		{"non-unc root", `C:\some`, `C:\some\x`, false},
@@ -186,8 +186,8 @@ func TestWindowsToWSLMntPath(t *testing.T) {
 
 func TestWslEncodeArg(t *testing.T) {
 	cases := []struct {
-		name   string
-		in     string
+		name    string
+		in      string
 		encoded bool // true => 应被 base64 包裹；false => 原样返回
 	}{
 		{"plain simple flag unchanged", "--verbose", false},

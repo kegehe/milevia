@@ -43,6 +43,7 @@ import {
   MAX_OPEN_CONVERSATION_TABS, closeConversationTab, markConversationTabRead, openConversationTab, recordConversationActivity,
   readClosedConversationIds, clearConversationTabClosed, markConversationTabClosed, readConversationTabs, writeConversationTabs, type ConversationTabsState,
 } from "../lib/conversation-tabs";
+import { readConversationPanels, writeConversationPanels, type ConversationPanelKey, type ConversationPanelsState } from "../lib/conversation-panels";
 
 function requiresForceStop(cause: unknown): boolean {
   return typeof cause === "object" && cause !== null && (cause as { code?: unknown }).code === "active_runs_present";
@@ -160,6 +161,12 @@ function SkillTagIcon() {
 
 function ShortcutMoreIcon() {
   return <svg className="quick-tag-control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 12h.01M12 12h.01M17.5 12h.01" /></svg>;
+}
+
+// 模块标题行的折叠指示箭头：展开时朝上（点击收起），折叠后朝下（点击展开），
+// 旋转由 .quick-tag-group.collapsed 统一驱动，不单独写死方向。
+function QuickTagChevron() {
+  return <svg className="quick-tag-heading-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6" /></svg>;
 }
 
 type SortableShortcutKind = "prompt" | "command_request";
@@ -363,14 +370,23 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
 
   const runnerStatusClass = run ? "running" : tool?.status || "unavailable";
 
+  // 有可更新的新版本，以及当前 runner 是否支持应用内自动更新（缺省视为支持；跨端 runner
+  // 如 wsl-local 由后端标为 false，此时提示"需手动更新"而不是给出点了必失败的更新按钮，
+  // 也不会把"无法自动升级"误渲染成"已是最新版本"）。
+  const hasUpdate = Boolean(updateInfo?.updateAvailable && !updateInfo.error);
+  const autoUpdatable = updateInfo?.autoUpdatable !== false;
+  const manualUpdateEnv = runner?.environment === "wsl" ? "WSL 内" : runner?.environment === "windows" ? "Windows 侧" : runner?.environment === "remote-linux" ? "远程服务器上" : "目标环境";
+  const manualUpdateCommand = agentPath === "codex" ? "codex update" : "claude update";
+
   const canShowUsage = Boolean(run) || tool?.status === "ready";
   return (<>
     <span className="composer-status-group">
       <span className={`runner-inline ${runnerStatusClass}${run ? " run-active" : ""}`} title={tool?.reason} role={run ? "status" : undefined} aria-live={run ? "polite" : undefined}><i aria-hidden="true"></i><span>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span></span>
       {run && <button className="runner-stop" type="button" disabled={readOnly || stopping} onClick={onStop} title={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"} aria-label={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"}><span aria-hidden="true"></span>{stopping ? "停止中" : "停止"}</button>}
       {!run && tool?.status === "ready" && <button className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
-      {!run && !updating && updateInfo?.updateAvailable && !updateInfo.error && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo.latestVersion}</button>}
-      {!run && !updating && updateInfo && !updateInfo.updateAvailable && !updateInfo.error && <span className="runner-inline-uptodate" title={`${toolName} 已是最新版本`}>已是最新版本</span>}
+      {!run && !updating && hasUpdate && autoUpdatable && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo?.latestVersion}</button>}
+      {!run && !updating && hasUpdate && !autoUpdatable && <span className="runner-inline-manual" title={`${toolName} 检测到新版本 ${updateInfo?.latestVersion ?? ""}，当前运行器暂不支持应用内自动更新，请在${manualUpdateEnv}手动执行 ${manualUpdateCommand}`}>发现新版本 {updateInfo?.latestVersion} · 需手动更新</span>}
+      {!run && !updating && updateInfo && !hasUpdate && !updateInfo.error && <span className="runner-inline-uptodate" title={`${toolName} 已是最新版本`}>已是最新版本</span>}
       {!run && !updating && updateInfo?.error && <span className="runner-inline-error" title={updateInfo.error}>{updateInfo.error}</span>}
       {canShowUsage ? <span className="composer-usage"><span className="composer-usage-model" title={displayedModel}>{displayedModel}</span><span className={`composer-usage-context ${contextLevel}`}>{contextLabel}</span><span className="composer-usage-count">{usage ? `${usage.session.taskCount} 次对话` : "加载中"}</span><button className="usage-trigger" type="button" onClick={onShowUsage}>使用状态</button></span> : <span className="composer-usage pending">用量将在工具就绪后显示</span>}
     </span>
@@ -481,6 +497,18 @@ function ConversationHistoryDialog({ conversations, activeID, busyID, deletingID
   })}</div>{hasMore && <button className="secondary load-earlier-history" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "加载中" : "加载更多会话"}</button>}<footer><span>{busyID ? "正在切换会话" : `${conversations.length} 条记录`}</span><div className="history-footer-actions"><button className="secondary history-delete-all" type="button" title="清除全部历史对话" disabled={Boolean(busyID) || deletingID !== "" || deleteAllBusy} onClick={deleteAll}>清除全部</button><button className="secondary" type="button" onClick={close}>关闭</button></div></footer></section></div>;
 }
 
+// formatToolVersion 把 CLI 上报的版本号归一化为展示文本：跨端 runner 的裸输出可能带
+// "codex-cli " 前缀 / " (Claude Code)" 后缀 / 前导 "v"，统一剥除后补回 "v" 前缀；
+// 空串返回空，由调用方回退到其它文案。
+function formatToolVersion(version: string | undefined): string {
+  const trimmed = (version ?? "")
+    .replace(/^codex-cli\s+/i, "")
+    .replace(/\s+\(Claude Code\)$/i, "")
+    .replace(/^v/i, "")
+    .trim();
+  return trimmed ? `v${trimmed}` : "";
+}
+
 function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsError, close, create }: { runnerID: string; defaults: AppPreferences; defaultsLoading: boolean; defaultsError: string; close: () => void; create: (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => Promise<void> }) {
   const permissionForAgent = (agent: AgentID): PermissionMode => agent === "codex" ? defaults.codexPermissionMode : defaults.claudePermissionMode;
   const [agentId, setAgentId] = useState<AgentID>(defaults.defaultAgentId);
@@ -488,6 +516,7 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
   const [creating, setCreating] = useState(false);
   const [runner, setRunner] = useState<RunnerInfo | null>(null);
   const [runnerLoading, setRunnerLoading] = useState(true);
+  const [runnerError, setRunnerError] = useState("");
   const [profiles, setProfiles] = useState<AgentProfile[]>([]);
   const [profileID, setProfileID] = useState("");
   const agentSelectedByUser = useRef(false);
@@ -495,9 +524,16 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
     let cancelled = false;
     agentSelectedByUser.current = false;
     setRunnerLoading(true);
+    setRunnerError("");
     api<RunnerInfo>(`/api/runners/${encodeURIComponent(runnerID)}/status`)
       .then((item) => { if (!cancelled) setRunner(item); })
-      .catch(() => { if (!cancelled) setRunner(null); })
+      .catch((cause: unknown) => {
+        if (cancelled) return;
+        setRunner(null);
+        // 状态接口 404（如 wsl-local 未注册）或超时时，把真实原因透出，而不是
+        // 误提示成“CLI 未安装/未登录”。
+        setRunnerError(cause instanceof Error ? cause.message : "无法读取 Runner 状态。");
+      })
       .finally(() => { if (!cancelled) setRunnerLoading(false); });
     return () => { cancelled = true; };
   }, [runnerID]);
@@ -546,14 +582,14 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
   return <div className="backdrop new-conversation-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-conversation-title" onClick={(event) => { if (event.target === event.currentTarget && !creating) close(); }}>
     <section className="modal new-conversation-dialog">
       <header>
-        <div className="new-conversation-dialog-heading"><span className="new-conversation-dialog-mark"><NewConversationDialogIcon /></span><div><label>NEW CONVERSATION</label><h2 id="new-conversation-title">创建新会话</h2><p>选择本次会话使用的 CLI 工具和执行权限。</p></div></div>
+        <div className="new-conversation-dialog-heading"><span className="new-conversation-dialog-mark"><NewConversationDialogIcon /></span><div><h2 id="new-conversation-title">创建新会话</h2></div></div>
         <button className="new-conversation-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={creating} onClick={close}><DialogCloseIcon /></button>
       </header>
       <div className="new-conversation-dialog-body">
         {capabilitiesLoading ? <div className="new-conversation-loading"><span></span>正在检查 CLI 工具和默认设置...</div> : defaultsError ? <p className="new-conversation-error">无法读取默认设置：{defaultsError}</p> : <>
           {fallbackReason && <p className="new-conversation-notice">{fallbackReason}</p>}
           <section className="new-conversation-section" aria-labelledby="new-conversation-agent-label">
-            <div className="new-conversation-section-heading"><div><span>01</span><h3 id="new-conversation-agent-label">选择 CLI 工具</h3></div><small>已登录的工具可立即使用</small></div>
+            <div className="new-conversation-section-heading"><div><span>01</span><h3 id="new-conversation-agent-label">选择 CLI 工具</h3></div></div>
             <div className="new-conversation-agent-grid" role="radiogroup" aria-label="CLI 工具">
               {(["claude-code", "codex"] as AgentID[]).map((agent) => {
                 const available = isAgentAvailable(agent);
@@ -561,12 +597,13 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
                 const status = agent === "codex" ? codexStatus : claudeStatus;
                 const name = agent === "codex" ? "Codex" : "Claude Code";
                 const detail = agent === "codex" ? "OpenAI CLI" : "Anthropic CLI";
+                const subtitle = formatToolVersion(status?.version) || detail;
                 return <button key={agent} type="button" className={`new-conversation-agent-card${selected ? " selected" : ""}`} role="radio" aria-checked={selected} disabled={!available || creating} title={!available ? status?.reason || `${name} 不可用` : name} onClick={() => selectAgent(agent)}>
-                  <span className={`new-conversation-agent-mark ${agent === "codex" ? "codex" : "claude"}`}><AgentToolIcon agent={agent} /></span><span className="new-conversation-agent-copy"><b>{name}</b><small>{detail}</small></span>{agent === defaults.defaultAgentId && <em>默认</em>}<span className={`new-conversation-agent-state ${available ? "ready" : "unavailable"}`}>{available ? "已就绪" : "不可用"}</span>
+                  <span className={`new-conversation-agent-mark ${agent === "codex" ? "codex" : "claude"}`}><AgentToolIcon agent={agent} /></span><span className="new-conversation-agent-copy"><b>{name}</b><small>{subtitle}</small></span>{agent === defaults.defaultAgentId && <em>默认</em>}<span className={`new-conversation-agent-state ${available ? "ready" : "unavailable"}`}>{available ? "已就绪" : "不可用"}</span>
                 </button>;
               })}
             </div>
-            {!claudeAvailable && !codexAvailable && <p className="new-conversation-error inline">当前 Runner 没有可用的 CLI 工具。{unavailableReason || "请检查 CLI 安装与登录状态。"}</p>}
+            {!claudeAvailable && !codexAvailable && <p className="new-conversation-error inline">当前 Runner 没有可用的 CLI 工具。{runnerError || unavailableReason || "请检查 CLI 安装与登录状态。"}</p>}
           </section>
           {availableProfiles.length > 0 && <label className="new-conversation-profile-select"><span><ProfileSelectIcon />配置档案 <small>可选</small></span><select value={profileID} disabled={creating} onChange={(event) => setProfileID(event.target.value)}><option value="">使用 CLI 当前登录配置</option>{availableProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.model ? ` (${profile.model})` : ""}</option>)}</select></label>}
           <section className="new-conversation-section new-conversation-permission-section" aria-labelledby="new-conversation-permission-label">
@@ -1048,6 +1085,22 @@ export default function ConversationPage() {
   const [skillsLoading, setSkillsLoading] = useState(false);
   // 技能按来源分组后，各来源组的折叠状态。插件组（系统/官方自带，含大量 marketplace 样板）默认折叠。
   const [skillGroupsCollapsed, setSkillGroupsCollapsed] = useState<Partial<Record<Skill["source"], boolean>>>({ plugin: true });
+  // 侧栏模块（常用提示词/常用命令/技能/任务队列）的折叠状态，按项目持久化。
+  // state 记录它属于哪个项目，持久化 effect 只在项目一致时才写回，
+  // 避免“切换项目”的那一帧把上一项目的折叠状态写进新项目。
+  const [conversationPanelsState, setConversationPanelsState] = useState<{ projectId: string; collapsed: ConversationPanelsState }>(() => ({ projectId: projectId || "", collapsed: readConversationPanels(projectId || "") }));
+  const conversationPanels = conversationPanelsState.collapsed;
+  useEffect(() => {
+    if (!projectId) return;
+    setConversationPanelsState((current) => current.projectId === projectId ? current : { projectId, collapsed: readConversationPanels(projectId) });
+  }, [projectId]);
+  useEffect(() => {
+    if (!projectId || conversationPanelsState.projectId !== projectId) return;
+    writeConversationPanels(projectId, conversationPanelsState.collapsed);
+  }, [conversationPanelsState, projectId]);
+  const toggleConversationPanel = useCallback((key: ConversationPanelKey) => {
+    setConversationPanelsState((current) => ({ ...current, collapsed: { ...current.collapsed, [key]: !current.collapsed[key] } }));
+  }, []);
   const [shortcutEditor, setShortcutEditor] = useState<ShortcutEditorState | null>(null);
   const [shortcutVariables, setShortcutVariables] = useState<{ shortcut: Shortcut; variables: Record<string, string> } | null>(null);
   const [shortcutBusy, setShortcutBusy] = useState("");
@@ -2515,7 +2568,9 @@ export default function ConversationPage() {
 	const deleteHistoryConversationConfirmed = async (conversationID: string) => {
 		setDeletingConversation(conversationID);
 		try {
-			await projectApi(`/api/conversations/${conversationID}`, { method: "DELETE" });
+			// 单条删除允许较长等待：级联删除会同步清掉消息/事件/运行记录，历史很长
+			// 的会话在慢速磁盘上可能超过默认 15s 请求超时。
+			await apiWithTimeout(`/api/conversations/${conversationID}`, { method: "DELETE" }, 0, 120_000);
 		} catch (cause) {
 			fail(cause instanceof Error ? cause.message : "无法删除会话");
 			return;
@@ -2809,38 +2864,51 @@ export default function ConversationPage() {
   const skillsBySource = (source: Skill["source"]) => skills.filter((skill) => skill.source === source);
   const toggleSkillGroup = (source: Skill["source"]) => setSkillGroupsCollapsed((prev) => ({ ...prev, [source]: !prev[source] }));
 
-  const renderSkillGroup = () => (
-    <div className="quick-tag-group skill-tags">
-      <div className="quick-tag-heading">
-        <span className="quick-tag-heading-label"><SkillTagIcon /><span>技能 (Skill)</span></span>
-        <span className="skill-source-hint" title="全部来源"> {skillsLoading ? "加载中" : `${skills.length} 个`}</span>
+  const renderSkillGroup = (options?: { collapsible?: boolean; collapsed?: boolean; onToggle?: () => void }) => {
+    const collapsible = Boolean(options?.collapsible);
+    const collapsed = collapsible && Boolean(options?.collapsed);
+    const toggle = options?.onToggle ?? (() => {});
+    const heading = collapsible
+      ? <button type="button" className="quick-tag-heading quick-tag-heading-toggle skill-heading-toggle" aria-expanded={!collapsed} title={collapsed ? "展开技能模块" : "折叠技能模块"} onClick={toggle}>
+          <span className="quick-tag-heading-label"><SkillTagIcon /><span>技能 (Skill)</span></span>
+          <span className="skill-source-hint" title="全部来源">{skillsLoading ? "加载中" : `${skills.length} 个`}</span>
+          <QuickTagChevron />
+        </button>
+      : <div className="quick-tag-heading">
+          <span className="quick-tag-heading-label"><SkillTagIcon /><span>技能 (Skill)</span></span>
+          <span className="skill-source-hint" title="全部来源"> {skillsLoading ? "加载中" : `${skills.length} 个`}</span>
+        </div>;
+    const body = skillsLoading ? <div className="quick-tag-list"><div className="quick-tag-empty skill-loading">加载中…</div></div>
+      : skills.length === 0 ? <div className="quick-tag-list"><div className="quick-tag-empty skill-empty">未发现 Skill</div></div>
+      : <div className="skill-source-groups">{skillSources.map((source) => {
+          const group = skillsBySource(source);
+          if (group.length === 0) return null;
+          const meta = skillSourceMeta[source];
+          const groupCollapsed = Boolean(skillGroupsCollapsed[source]);
+          return (
+            <div key={source} className={`skill-source-group${groupCollapsed ? " collapsed" : ""}`}>
+              <button type="button" className="skill-source-heading" onClick={() => toggleSkillGroup(source)} title={meta.title} aria-expanded={!groupCollapsed}>
+                <em className={`skill-source-chip ${meta.className}`}>{meta.label}</em>
+                <span className="skill-source-count">{group.length}</span>
+                <span className={`skill-source-chevron${groupCollapsed ? "" : " open"}`} aria-hidden="true" />
+              </button>
+              {!groupCollapsed && <ul className="quick-tag-list">{group.map((skill) => (
+                <li key={skill.name} className="quick-tag-item skill-item">
+                  <button type="button" className="skill-tag" disabled={readOnlyConversation || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} data-tooltip-title={skill.name} data-tooltip-desc={truncateSkillDescription(skill.description, skill.name)} onClick={() => useSkill(skill)}>
+                    <span className="skill-tag-text">{skill.name}</span>
+                  </button>
+                </li>
+              ))}</ul>}
+            </div>
+          );
+        })}</div>;
+    return (
+      <div className={`quick-tag-group skill-tags${collapsible && collapsed ? " collapsed" : ""}`}>
+        {heading}
+        {!(collapsible && collapsed) && body}
       </div>
-      {skillsLoading ? <div className="quick-tag-list"><div className="quick-tag-empty skill-loading">加载中…</div></div>
-        : skills.length === 0 ? <div className="quick-tag-list"><div className="quick-tag-empty skill-empty">未发现 Skill</div></div>
-        : <div className="skill-source-groups">{skillSources.map((source) => {
-            const group = skillsBySource(source);
-            if (group.length === 0) return null;
-            const meta = skillSourceMeta[source];
-            const collapsed = Boolean(skillGroupsCollapsed[source]);
-            return (
-              <div key={source} className={`skill-source-group${collapsed ? " collapsed" : ""}`}>
-                <button type="button" className="skill-source-heading" onClick={() => toggleSkillGroup(source)} title={meta.title} aria-expanded={!collapsed}>
-                  <em className={`skill-source-chip ${meta.className}`}>{meta.label}</em>
-                  <span className="skill-source-count">{group.length}</span>
-                  <span className={`skill-source-chevron${collapsed ? "" : " open"}`} aria-hidden="true" />
-                </button>
-                {!collapsed && <ul className="quick-tag-list">{group.map((skill) => (
-                  <li key={skill.name} className="quick-tag-item skill-item">
-                    <button type="button" className="skill-tag" disabled={readOnlyConversation || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} data-tooltip-title={skill.name} data-tooltip-desc={truncateSkillDescription(skill.description, skill.name)} onClick={() => useSkill(skill)}>
-                      <span className="skill-tag-text">{skill.name}</span>
-                    </button>
-                  </li>
-                ))}</ul>}
-              </div>
-            );
-          })}</div>}
-    </div>
-  );
+    );
+  };
 
   return <>
     {createPortal(<div className={`head-actions-menu${showMobileActions ? " mobile-open" : ""}`}>
@@ -2859,12 +2927,12 @@ export default function ConversationPage() {
         </div>
       </div>, document.querySelector('.head-actions-slot') || document.body)}
     {/* 对话面板：快捷方式、对话内容和任务队列 */}
-    <section className="conversation-canvas">
+    <section className="conversation-canvas" data-queue-collapsed={!readOnlyConversation && conversationPanels.taskQueue ? "true" : undefined}>
       <aside className="quick-tag-rail" aria-label="常用操作">
         <div className="quick-actions-row">
-          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-          {renderSkillGroup()}
+          <div className={`quick-tag-group${conversationPanels.prompt ? " collapsed" : ""}`}><div className="quick-tag-heading"><button type="button" className="quick-tag-heading-toggle" aria-expanded={!conversationPanels.prompt} title={conversationPanels.prompt ? "展开常用提示词" : "折叠常用提示词"} onClick={() => toggleConversationPanel("prompt")}><ShortcutCategoryIcon kind="prompt" /><span className="quick-tag-heading-title">常用提示词</span><b className="quick-tag-count">{promptShortcuts.length}</b><QuickTagChevron /></button><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div>{!conversationPanels.prompt && <ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} />}</div>
+          <div className={`quick-tag-group command-tags${conversationPanels.command ? " collapsed" : ""}`}><div className="quick-tag-heading"><button type="button" className="quick-tag-heading-toggle" aria-expanded={!conversationPanels.command} title={conversationPanels.command ? "展开常用命令" : "折叠常用命令"} onClick={() => toggleConversationPanel("command")}><ShortcutCategoryIcon kind="command" /><span className="quick-tag-heading-title">常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b><QuickTagChevron /></button><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div>{!conversationPanels.command && <ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} />}</div>
+          {renderSkillGroup({ collapsible: true, collapsed: conversationPanels.skills, onToggle: () => toggleConversationPanel("skills") })}
         </div>
       </aside>
       <section className="chat-center" id="conversation-panel" role="tabpanel" aria-labelledby={conversationTabs.activeConversationId ? `conversation-tab-${conversationTabs.activeConversationId}` : undefined}>
@@ -2890,16 +2958,16 @@ export default function ConversationPage() {
           <button className={`composer-mobile-shortcut-toggle${showMobileShortcuts ? " open" : ""}`} type="button" title="快捷操作" aria-label="快捷操作" aria-controls="mobile-shortcut-menu" aria-expanded={showMobileShortcuts} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowMobileShortcuts((open) => !open)}><ComposerShortcutIcon /></button>
         </div>
         {showMobileShortcuts && <section className="mobile-shortcut-menu" id="mobile-shortcut-menu" aria-label="快捷操作">
-          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "prompt" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderMobilePromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "command_request" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderMobileCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span><b className="quick-tag-count">{promptShortcuts.length}</b></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "prompt" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderMobilePromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+          <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "command_request" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderMobileCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           {renderSkillGroup()}
         </section>}
         <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={readOnlyConversation || sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {isCodex ? "Codex" : "Claude"}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || !text.trim() || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
         {pendingSendContent && <div className="composer-pending"><span className="composer-pending-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2" /></svg></span><span className="composer-pending-text"><b>已预约发送</b><small>{run ? "等待当前任务完成..." : "等待子代理完成..."}<span className="composer-pending-preview">{pendingSendContent.length > 40 ? `${pendingSendContent.slice(0, 40)}…` : pendingSendContent}</span></small></span><button className="composer-pending-cancel" type="button" title="撤回预约并带回输入框" onClick={cancelScheduledSend}>取消</button></div>}
       </form>
       </section>
-      {!readOnlyConversation && <aside className="task-queue-rail" aria-label="任务队列">
-        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} />
+      {!readOnlyConversation && <aside className="task-queue-rail" aria-label="任务队列" data-collapsed={conversationPanels.taskQueue ? "true" : undefined}>
+        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} collapsed={conversationPanels.taskQueue} onToggleCollapsed={() => toggleConversationPanel("taskQueue")} />
       </aside>}
     </section>
     {showNewConversation && <NewConversationDialog runnerID={project.runner} defaults={appPreferences} defaultsLoading={appPreferencesLoading} defaultsError={appPreferencesError} close={closeNewConversation} create={newConversation} />}

@@ -222,6 +222,39 @@ func (b *sshGitBackend) readFile(repo, rel string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// writeFile 覆盖写入远端仓库内已存在文件。拒绝符号链接，避免经由链接逃逸到仓库外。
+func (b *sshGitBackend) writeFile(repo, rel string, content []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := validateGitPath(rel); err != nil {
+		return err
+	}
+	sftpClient, err := b.client.getSFTPClient(ctx)
+	if err != nil {
+		return err
+	}
+	abs := path.Join(repo, rel)
+	info, err := sftpClient.Lstat(abs)
+	if err != nil {
+		return fmt.Errorf("read Git path before writing: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to write through a symbolic link")
+	}
+	f, err := sftpClient.OpenFile(abs, os.O_WRONLY|os.O_TRUNC)
+	if err != nil {
+		return fmt.Errorf("open Git path for writing: %w", err)
+	}
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		return fmt.Errorf("write Git path: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close Git path after writing: %w", err)
+	}
+	return nil
+}
+
 func (b *sshGitBackend) validateUntrackedRemoval(repo string, paths []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

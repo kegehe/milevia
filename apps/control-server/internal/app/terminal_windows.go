@@ -26,8 +26,11 @@ type windowsTerminalSession struct {
 	ready             chan error
 	done              chan struct{}
 	exitCode          uint32
-	closeOnce         sync.Once
-	writeMu           sync.Mutex
+	// elevated 记录该子进程是否以管理员令牌运行：控制服务本身提权时，
+	// CreateProcess 的子进程（cmd/powershell/wsl.exe）会继承提权令牌。
+	elevated  bool
+	closeOnce sync.Once
+	writeMu   sync.Mutex
 }
 
 type windowsTerminalStartupInfoEx struct {
@@ -45,6 +48,12 @@ var (
 func openPlatformTerminal(ctx context.Context, spec TerminalSpec) (TerminalSession, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	elevated := processIsElevated()
+	// 未提权的控制服务无法用 CreateProcess 直接开管理员子进程；把会话交给
+	// 提权 bridge（UAC runas）承载。控制服务已提权时跳过：子进程天然继承提权。
+	if spec.RunAsAdmin && !elevated && spec.RunnerID != "wsl-local" {
+		return openElevatedWindowsTerminal(ctx, spec)
 	}
 	inR, inW, err := newWindowsTerminalPipe()
 	if err != nil {
@@ -129,7 +138,7 @@ func openPlatformTerminal(ctx context.Context, spec TerminalSpec) (TerminalSessi
 	_ = windows.CloseHandle(inR)
 	_ = windows.CloseHandle(outW)
 	reader, writer := io.Pipe()
-	t := &windowsTerminalSession{id: uuid.NewString(), projectID: spec.ProjectID, process: pi.Process, pty: ptyHandle, job: job, in: inW, rawOut: outR, reader: reader, writer: writer, ready: make(chan error, 1), done: make(chan struct{})}
+	t := &windowsTerminalSession{id: uuid.NewString(), projectID: spec.ProjectID, process: pi.Process, pty: ptyHandle, job: job, in: inW, rawOut: outR, reader: reader, writer: writer, ready: make(chan error, 1), done: make(chan struct{}), elevated: elevated}
 	go t.consumeReady(readyMarker)
 	go func() {
 		_, _ = windows.WaitForSingleObject(pi.Process, windows.INFINITE)
@@ -179,6 +188,7 @@ func newWindowsTerminalPipe() (windows.Handle, windows.Handle, error) {
 func (t *windowsTerminalSession) ID() string                 { return t.id }
 func (t *windowsTerminalSession) ProjectID() string          { return t.projectID }
 func (t *windowsTerminalSession) Environment() string        { return "windows" }
+func (t *windowsTerminalSession) TerminalElevated() bool     { return t.elevated }
 func (t *windowsTerminalSession) Ready() <-chan error        { return t.ready }
 func (t *windowsTerminalSession) Read(p []byte) (int, error) { return t.reader.Read(p) }
 func (t *windowsTerminalSession) Write(p []byte) (int, error) {
@@ -229,7 +239,18 @@ func windowsTerminalCommand(spec TerminalSpec, readyMarker string) (string, erro
 		if err != nil {
 			return "", err
 		}
-		return quoteWindows(filepath.Join(systemDirectory, "cmd.exe")) + " /d /q /k \"chcp 65001 >nul & echo " + readyMarker + "\"", nil
+		switch spec.Shell {
+		case "", "cmd":
+			return quoteWindows(filepath.Join(systemDirectory, "cmd.exe")) + " /d /q /k \"chcp 65001 >nul & echo " + readyMarker + "\"", nil
+		case "powershell":
+			// PowerShell 交互式会话：先切 UTF-8（输出编码 + 控制台代码页），再输出
+			// ready 标记，随后 -NoExit 停在提示符。整段 init 不含双引号，外层引用即可。
+			powershell := filepath.Join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe")
+			init := "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; [Console]::InputEncoding=[System.Text.Encoding]::UTF8; chcp 65001 | Out-Null; Write-Output " + readyMarker
+			return quoteWindows(powershell) + " -NoLogo -NoExit -Command " + quoteWindows(init), nil
+		default:
+			return "", fmt.Errorf("unsupported terminal shell %q", spec.Shell)
+		}
 	}
 	workDir, ok := uncToWslPath(spec.WorkDir, spec.WSLDistro)
 	if !ok {

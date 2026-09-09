@@ -32,13 +32,13 @@ type Skill struct {
 }
 
 const (
-	skillAgentClaude        = "claude-code"
-	skillAgentCodex         = "codex"
-	skillSourceUser         = "user"
-	skillSourceProject      = "project"
-	skillSourcePlugin       = "plugin"
-	skillFile               = "SKILL.md"
-	skillFrontmatterDelim   = "---"
+	skillAgentClaude      = "claude-code"
+	skillAgentCodex       = "codex"
+	skillSourceUser       = "user"
+	skillSourceProject    = "project"
+	skillSourcePlugin     = "plugin"
+	skillFile             = "SKILL.md"
+	skillFrontmatterDelim = "---"
 	// remoteSkillOutputMarker 是远端 find+cat 输出中，分隔「路径」与「下一文件」的 ASCII 哨兵。
 	// 用长 ASCII 串（而非 NUL 字节）以兼容远端 /bin/sh（dash/busybox）对 printf 的处理；
 	// 该串几乎不可能出现在路径或 SKILL.md 正文中。
@@ -53,6 +53,9 @@ type skillScanRoot struct {
 	env     string // "windows"、"wsl" 或 "remote-linux"
 	// pluginRoot 为 true 表示 absPath 是 ~/.claude/plugins 树，需递归进入名为 skills 的目录。
 	pluginRoot bool
+	// recursive 表示技能根允许用分类目录包裹技能。Codex 内置技能位于
+	// ~/.codex/skills/.system/<name>/SKILL.md，而非一层目录。
+	recursive bool
 	// priority 用于同名去重：数值越大越优先（project > plugin > user）。
 	priority int
 }
@@ -130,6 +133,7 @@ func (s *Server) discoverLocalSkillRoots(target agentTargetEnv, projectPath stri
 		}
 		roots = append(roots, skillScanRoot{
 			absPath: abs, agent: agent, source: source, env: env, pluginRoot: pluginRoot,
+			recursive: agent == skillAgentCodex,
 			// 优先级递增装配：后 add 的（project）数值更大，同名去重时胜出。
 			priority: len(roots),
 		})
@@ -138,8 +142,9 @@ func (s *Server) discoverLocalSkillRoots(target agentTargetEnv, projectPath stri
 	if target == agentTargetEnvWSL {
 		// WSL 用户级 + 插件树：把 WSL Linux home 转成可读的 UNC 后纳入扫描。
 		// wslHome/wslDistro 未探测到（无 WSL）时跳过，退化为「仅项目级」。
-		if s.wslHome != "" && s.wslDistro != "" {
-			home := wslToUncPath(s.wslHome, s.wslDistro)
+		homePath, distro := s.wslUserHomeDistro()
+		if homePath != "" && distro != "" {
+			home := wslToUncPath(homePath, distro)
 			add(filepath.Join(home, ".claude", "skills"), skillAgentClaude, skillSourceUser, false)
 			add(filepath.Join(home, ".codex", "skills"), skillAgentCodex, skillSourceUser, false)
 			add(filepath.Join(home, ".claude", "plugins"), skillAgentClaude, skillSourcePlugin, true)
@@ -151,7 +156,7 @@ func (s *Server) discoverLocalSkillRoots(target agentTargetEnv, projectPath stri
 
 	// windows（本机）环境：用户级 + 项目级 + 插件树。
 	add(filepath.Join(homeDir(), ".claude", "skills"), skillAgentClaude, skillSourceUser, false)
-	add(filepath.Join(homeDir(), ".codex", "skills"), skillAgentCodex, skillSourceUser, false)
+	add(codexUserSkillsDir(), skillAgentCodex, skillSourceUser, false)
 	add(filepath.Join(homeDir(), ".claude", "plugins"), skillAgentClaude, skillSourcePlugin, true)
 	add(filepath.Join(projectPath, ".claude", "skills"), skillAgentClaude, skillSourceProject, false)
 	add(filepath.Join(projectPath, ".codex", "skills"), skillAgentCodex, skillSourceProject, false)
@@ -165,12 +170,25 @@ func homeDir() string {
 	return ""
 }
 
+// codexUserSkillsDir follows CODEX_HOME when it is explicitly configured.
+// That is the same skills location used by a CLI-managed Codex process.
+func codexUserSkillsDir() string {
+	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+		return filepath.Join(home, "skills")
+	}
+	return filepath.Join(homeDir(), ".codex", "skills")
+}
+
 // scanLocalSkills 对本地根目录执行扫描，返回原始技能记录（未解析 frontmatter）。
 func scanLocalSkills(ctx context.Context, roots []skillScanRoot) []skillScan {
 	var scans []skillScan
 	for _, root := range roots {
 		if root.pluginRoot {
 			scans = append(scans, scanPluginTree(ctx, root)...)
+			continue
+		}
+		if root.recursive {
+			scans = append(scans, scanSkillTree(ctx, root)...)
 			continue
 		}
 		entries, err := os.ReadDir(root.absPath)
@@ -188,6 +206,43 @@ func scanLocalSkills(ctx context.Context, roots []skillScanRoot) []skillScan {
 			scans = append(scans, skillScan{skillFile: skillMD, nameHint: entry.Name(), root: root})
 		}
 	}
+	return scans
+}
+
+// scanSkillTree discovers skills below a root that may contain category
+// directories. Codex distributes its built-in skills under .system, while
+// user-installed skills can still use the conventional one-level layout.
+func scanSkillTree(ctx context.Context, root skillScanRoot) []skillScan {
+	var scans []skillScan
+	var walk func(string)
+	walk = func(dir string) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if name == ".git" || name == ".hg" || name == "node_modules" {
+				continue
+			}
+			child := filepath.Join(dir, name)
+			skillMD := filepath.Join(child, skillFile)
+			if st, err := os.Stat(skillMD); err == nil && !st.IsDir() {
+				scans = append(scans, skillScan{skillFile: skillMD, nameHint: name, root: root})
+				continue
+			}
+			walk(child)
+		}
+	}
+	walk(root.absPath)
 	return scans
 }
 

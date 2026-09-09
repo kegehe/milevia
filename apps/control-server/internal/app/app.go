@@ -52,6 +52,8 @@ type Config struct {
 	ClaudeToolResultTimeout       time.Duration
 	ConversationSessionIdleTTL    time.Duration
 	ConversationSessionsPerRunner int
+	TerminalMaxProjects           int
+	TerminalMaxPerProject         int
 }
 
 const (
@@ -100,6 +102,19 @@ func ConfigFromEnv() Config {
 	codexPath := os.Getenv("AUTO_CODEX_PATH")
 	if codexPath == "" {
 		codexPath = "codex"
+		// GUI-launched desktop processes may inherit a stale PATH after npm
+		// installs Codex. Resolve the standard per-user npm shim explicitly.
+		if runtime.GOOS == "windows" {
+			for _, candidate := range []string{
+				filepath.Join(os.Getenv("APPDATA"), "npm", "codex.cmd"),
+				filepath.Join(os.Getenv("APPDATA"), "npm", "codex.exe"),
+			} {
+				if _, err := os.Stat(candidate); err == nil {
+					codexPath = candidate
+					break
+				}
+			}
+		}
 	}
 	claudePath := os.Getenv("AUTO_CLAUDE_PATH")
 	if claudePath == "" {
@@ -125,6 +140,8 @@ func ConfigFromEnv() Config {
 		ClaudeToolResultTimeout:       durationFromEnv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", defaultClaudeToolResultTimeout),
 		ConversationSessionIdleTTL:    durationFromEnv("AUTO_CONVERSATION_SESSION_IDLE_TTL", defaultConversationSessionIdleTTL),
 		ConversationSessionsPerRunner: positiveIntFromEnv("AUTO_CONVERSATION_SESSIONS_PER_RUNNER", defaultConversationSessionsPerRunner),
+		TerminalMaxProjects:           positiveIntFromEnv("AUTO_TERMINAL_MAX_PROJECTS", defaultTerminalMaxProjects),
+		TerminalMaxPerProject:         positiveIntFromEnv("AUTO_TERMINAL_MAX_PER_PROJECT", defaultTerminalMaxPerProject),
 	}
 }
 
@@ -178,18 +195,28 @@ type RunStatusResponse struct {
 }
 
 type Server struct {
-	db                     *sql.DB
-	config                 Config
-	storageMu              sync.Mutex
-	dataLock               *dataDirLock
-	httpMu                 sync.Mutex
-	httpServer             *http.Server
-	runner                 AgentRunner
-	codexRunner            AgentRunner
-	windowsRunner          AgentRunner
-	wslRunner              AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
-	wslDistro              string      // 探测到的默认 WSL 发行版名；空表示无 WSL
-	wslHome                string      // WSL 内当前用户的 Linux home 路径
+	db                 *sql.DB
+	config             Config
+	remoteCredentialMu sync.RWMutex
+	remoteCloudURL     string
+	remoteCloudToken   string
+	remoteInstanceID   string
+	storageMu          sync.Mutex
+	dataLock           *dataDirLock
+	httpMu             sync.Mutex
+	httpServer         *http.Server
+	runner             AgentRunner
+	codexRunner        AgentRunner
+	windowsRunner      AgentRunner
+	wslRunner          AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
+	wslDistro          string      // 探测到的默认 WSL 发行版名；空表示无 WSL
+	wslHome            string      // WSL 内当前用户的 Linux home 路径
+	// wslMu 保护 wslRunner/wslDistro/wslHome 三个字段。启动期在 New() 写一次，但
+	// ensureWSLRunner 可能于请求期补注册并再次写入，须与并发读者（wslAgentRunner()、
+	// discoverLocalSkillRoots、terminal.go 的 wslDistro 读取）错开。
+	wslMu                  sync.RWMutex
+	wslProbeMu             sync.Mutex // 串行化 wsl-local 的补注册探测：同一时刻仅一个 wsl.exe 探测在执行
+	wslProbeAt             time.Time  // 最近一次补注册探测的完成时刻（失败后据此冷却节流，避免高频轮询反复拉起 wsl.exe）
 	runnerRegistry         *runnerRegistry
 	runnerMaintenanceMu    sync.Mutex
 	runnerUpdating         map[runnerAgentKey]bool
@@ -246,6 +273,9 @@ type Server struct {
 	insightActive          map[string]bool
 	insightCancels         map[string]context.CancelFunc // 运行中的扫描/复核按项目可取消
 	insightWG              sync.WaitGroup
+	conflictSuggestMu      sync.Mutex
+	conflictSuggestions    map[string]*gitConflictSuggestion
+	conflictSuggestActive  map[string]bool
 	terminals              *terminalManager
 }
 
@@ -637,7 +667,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -692,20 +722,11 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	s.runnerRegistry.register(s.localRunnerID(), runner, s.localRunnerMeta())
 	// Windows 服务端：额外探测 WSL 并注册 wsl-local runner，使 Windows 桌面端可加载
 	// WSL 内的项目目录（UNC 路径），加载后 AI 经 wsl.exe 在 WSL 侧执行。无 WSL / 探测
-	// 失败时仅记日志跳过，绝不影响 windows-local（其注册在上行）。
+	// 失败时仅记日志跳过，绝不影响 windows-local（其注册在上行）。启动期 WSL 冷启动可能
+	// 超过探测超时而失败——此时 wsl-local 缺失，由 ensureWSLRunner 在后续请求中按需补注册。
 	if runtime.GOOS == "windows" {
-		if distro, err := detectDefaultWSLDistro(ctx); err == nil {
-			if home, err := detectWSLHome(ctx, distro); err == nil {
-				s.wslDistro = distro
-				s.wslHome = home
-				s.wslRunner = newWSLAgentRunner(s.config, distro)
-				s.runnerRegistry.register("wsl-local", s.wslRunner, s.wslLocalRunnerMeta(distro, home))
-				log.Printf("[wsl] registered wsl-local runner (distro=%s home=%s)", distro, home)
-			} else {
-				log.Printf("[wsl] home probe failed, wsl-local not registered: %v", err)
-			}
-		} else {
-			log.Printf("[wsl] no WSL detected, wsl-local not registered: %v", err)
+		if err := s.registerWSLRunner(ctx); err != nil {
+			log.Printf("[wsl] wsl-local not registered at startup, will lazy-register on demand: %v", err)
 		}
 	}
 	// Recover previously-connected SSH connections (failures are non-fatal).
@@ -898,6 +919,7 @@ func (s *Server) routes() http.Handler {
 	// not provide arbitrary filesystem or shell access.
 	r.Route("/api/remote", func(remote chi.Router) {
 		remote.Use(s.remoteAgentOnly)
+		remote.Post("/credentials", s.updateRemoteCredentials)
 		remote.Get("/overview", s.remoteOverview)
 		remote.Get("/snapshot", s.remoteSnapshot)
 		remote.Post("/pairing", s.createRemotePairing)
@@ -952,6 +974,8 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/git/changes", s.gitChanges)
 	r.Get("/api/projects/{projectID}/git/diff", s.gitDiff)
 	r.Get("/api/projects/{projectID}/git/log", s.gitLog)
+	r.Get("/api/projects/{projectID}/git/commits/{oid}", s.gitCommitDetail)
+	r.Get("/api/projects/{projectID}/git/commits/{oid}/diff", s.gitCommitDiff)
 	r.Get("/api/projects/{projectID}/git/branches", s.gitBranches)
 	r.Get("/api/projects/{projectID}/git/operations", s.gitOperations)
 	r.Post("/api/projects/{projectID}/git/stage", s.gitStage)
@@ -966,6 +990,14 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/push", s.gitPush)
 	r.Post("/api/projects/{projectID}/git/branches", s.gitCreateBranch)
 	r.Post("/api/projects/{projectID}/git/switch", s.gitSwitchBranch)
+	r.Get("/api/projects/{projectID}/git/conflicts", s.gitConflicts)
+	r.Get("/api/projects/{projectID}/git/conflicts/content", s.gitConflictContent)
+	r.Post("/api/projects/{projectID}/git/conflicts/resolve", s.gitConflictResolve)
+	r.Post("/api/projects/{projectID}/git/conflicts/abort", s.gitConflictAbort)
+	r.Post("/api/projects/{projectID}/git/conflicts/continue", s.gitConflictContinue)
+	r.Post("/api/projects/{projectID}/git/conflicts/suggest", s.gitConflictSuggest)
+	r.Get("/api/projects/{projectID}/git/conflicts/suggestions/{suggestionID}", s.gitConflictSuggestionStatus)
+	r.Post("/api/projects/{projectID}/git/conflicts/suggestions/{suggestionID}/cancel", s.gitConflictSuggestCancel)
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
 	r.Post("/api/projects/{projectID}/tasks/review-all", s.reviewAllTasks)
@@ -2126,6 +2158,11 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, p)
 		return
 	}
+	// 创建 WSL 项目依赖 wsl-local runner 的 roots 做范围校验与就绪探测；若启动期未注册
+	// （WSL 冷启动超时），这里先按需补注册，避免"无法创建/加载 WSL 项目"。
+	if runnerID == "wsl-local" {
+		s.ensureWSLRunner()
+	}
 	path, err := s.allowedPathForRunner(input.Path, runnerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -2777,6 +2814,9 @@ func (s *Server) StartBackgroundMaintenance() {
 		if err := s.pruneConversationHistories(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[maintenance] prune conversation history: %v", err)
 		}
+		if err := s.ensureConversationDeleteIntegrity(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[maintenance] conversation delete integrity: %v", err)
+		}
 	}()
 }
 
@@ -3172,7 +3212,13 @@ type deleteConversationsResult struct {
 
 func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
-	if s.isOrchestrationConversation(r.Context(), conversationID) {
+	// Root the destructive work in the service runtime context rather than the
+	// HTTP request context: the web client aborts a slow DELETE after its 15 s
+	// timeout, and cancelling the transaction mid-cascade would roll the
+	// deletion back, leaving the conversation in place so the user's retry just
+	// repeats the same stall. Deletion is an explicit, confirmed user intent, so
+	// once it starts it should commit even if the client has given up waiting.
+	if s.isOrchestrationConversation(s.runtimeCtx, conversationID) {
 		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations are read-only"))
 		return
 	}
@@ -3185,7 +3231,7 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	var projectID, status string
-	err := s.db.QueryRowContext(r.Context(), `select p.id,c.status from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&projectID, &status)
+	err := s.db.QueryRowContext(s.runtimeCtx, `select p.id,c.status from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&projectID, &status)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -3202,13 +3248,13 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	// dropped; after deletion the cascade makes them unreachable for project
 	// cleanup. Cleanup is best-effort so a Git failure never blocks history
 	// deletion.
-	cleanupCtx, cleanupCancel := context.WithTimeout(r.Context(), conversationWorktreeCleanupTimeout)
+	cleanupCtx, cleanupCancel := context.WithTimeout(s.runtimeCtx, conversationWorktreeCleanupTimeout)
 	if err := s.removeConversationWorktrees(cleanupCtx, projectID, conversationID); err != nil {
 		log.Printf("delete conversation %s: remove isolated worktrees: %v", conversationID, err)
 	}
 	cleanupCancel()
 
-	tx, err := s.db.BeginTx(r.Context(), nil)
+	tx, err := s.db.BeginTx(s.runtimeCtx, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -3219,11 +3265,11 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	// last_task_run_id continues to point at the retained run record.
 	// git_task_records.conversation_id is a plain reference, not a foreign key;
 	// detach orchestration links instead of letting them dangle.
-	if _, err := tx.ExecContext(r.Context(), `update git_task_records set conversation_id='' where conversation_id=?`, conversationID); err != nil {
+	if _, err := tx.ExecContext(s.runtimeCtx, `update git_task_records set conversation_id='' where conversation_id=?`, conversationID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	result, err := tx.ExecContext(r.Context(), `delete from conversations where id=?`, conversationID)
+	result, err := tx.ExecContext(s.runtimeCtx, `delete from conversations where id=?`, conversationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -3255,7 +3301,10 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 
 // deleteProjectConversations permanently removes every deletable conversation
 // in a project. Running conversations are rejected up front; orchestration
-// conversations are read-only and reported as skipped.
+// conversations are read-only and reported as skipped. The destructive work is
+// rooted in the service runtime context for the same reason as
+// deleteConversation: a client that times out must not cancel the cascade and
+// roll back an explicitly confirmed deletion.
 func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 	s.projectLifecycleMu.Lock()
@@ -3267,7 +3316,7 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 	}()
 
 	var exists bool
-	err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from projects where id=?)`, projectID).Scan(&exists)
+	err := s.db.QueryRowContext(s.runtimeCtx, `select exists(select 1 from projects where id=?)`, projectID).Scan(&exists)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -3277,7 +3326,7 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	rows, err := s.db.QueryContext(r.Context(), `select id,status from conversations where project_id=?`, projectID)
+	rows, err := s.db.QueryContext(s.runtimeCtx, `select id,status from conversations where project_id=?`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -3312,7 +3361,7 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 	ids := make([]string, 0, len(all))
 	skipped := 0
 	for _, item := range all {
-		if s.isOrchestrationConversation(r.Context(), item.id) {
+		if s.isOrchestrationConversation(s.runtimeCtx, item.id) {
 			skipped++
 			continue
 		}
@@ -3332,7 +3381,7 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 
 	// Remove isolated worktrees owned by the conversations being deleted before
 	// their workspace rows cascade away.
-	cleanupCtx, cleanupCancel := context.WithTimeout(r.Context(), conversationWorktreeCleanupTimeout)
+	cleanupCtx, cleanupCancel := context.WithTimeout(s.runtimeCtx, conversationWorktreeCleanupTimeout)
 	for _, id := range ids {
 		if err := s.removeConversationWorktrees(cleanupCtx, projectID, id); err != nil {
 			log.Printf("delete project %s conversation %s worktrees: %v", projectID, id, err)
@@ -3340,7 +3389,7 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 	}
 	cleanupCancel()
 
-	tx, err := s.db.BeginTx(r.Context(), nil)
+	tx, err := s.db.BeginTx(s.runtimeCtx, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -3351,11 +3400,11 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 	// stay owned by their task records.
 	deleted := int64(0)
 	for _, id := range ids {
-		if _, err := tx.ExecContext(r.Context(), `update git_task_records set conversation_id='' where conversation_id=?`, id); err != nil {
+		if _, err := tx.ExecContext(s.runtimeCtx, `update git_task_records set conversation_id='' where conversation_id=?`, id); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		result, err := tx.ExecContext(r.Context(), `delete from conversations where id=?`, id)
+		result, err := tx.ExecContext(s.runtimeCtx, `delete from conversations where id=?`, id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -4837,6 +4886,11 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	s.beginRunUsage(runID, conversation.ID)
 	go func() {
 		defer s.runWG.Done()
+		// Codex 事件流不带模型名，run 开始前把将使用的模型预置进 usage，
+		// 使底部模型/上下文栏在任务进行中与结束后都能显示具体模型。
+		// 放在后台 goroutine 内执行：WSL/SSH 探测默认模型可能需拉起远程进程，
+		// 不阻塞发送请求的 Accepted 响应。
+		s.seedRunUsageModel(runID, conversation.AgentID, profile, runnerObj)
 		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectPath, content)
 	}()
 	return m, runID, record, http.StatusAccepted, nil
@@ -5865,6 +5919,11 @@ func (s *Server) allowedPath(path string) (string, error) {
 func (s *Server) allowedPathForRunner(path string, runnerID string) (string, error) {
 	// WSL UNC 路径：filepath.EvalSymlinks 对 9P UNC 不可靠，改用字符串前缀匹配。
 	if isWSLUncPath(path) {
+		// roots 来自 registry 的 wsl-local meta；若启动期 WSL 探测失败导致 runner 缺失，
+		// 文件/目录操作会误判"path outside allowed roots"，先按需补注册。
+		if runnerID == "wsl-local" {
+			s.ensureWSLRunner()
+		}
 		meta, ok := s.runnerRegistry.getMeta(runnerID)
 		if !ok || len(meta.Roots) == 0 {
 			return "", errors.New("path is outside the Runner allowed roots")
@@ -6348,8 +6407,17 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 // while the new-conversation dialog avoids probing unrelated remote Runners.
 func (s *Server) runnerStatus(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
+	// Windows 服务端下 wsl-local 可能在启动期因 WSL 冷启动超时未注册（见 New()）。
+	// 补一次按需探测，使新会话弹窗在 WSL 可用后无需重启应用即可恢复；其余 runner 直查。
+	if runnerID == "wsl-local" {
+		s.ensureWSLRunner()
+	}
 	m, ok := s.runnerRegistry.getMeta(runnerID)
 	if !ok {
+		if runnerID == "wsl-local" {
+			writeError(w, http.StatusNotFound, errors.New("未检测到可用的 WSL 发行版（wsl-local 未注册）；请确认 WSL 已安装并设置了默认发行版，必要时重启 Milevia"))
+			return
+		}
 		writeError(w, http.StatusNotFound, errors.New("runner not found"))
 		return
 	}
@@ -6468,10 +6536,19 @@ func (s *Server) checkCodexUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner AgentRunner) {
+	// autoUpdatable 区分"可应用内自动更新"与"有新版本但仅能到目标环境手动更新"。
+	// 缺省视为支持（本地 / SSH runner）；跨端 runner（wsl-local 等）实现
+	// autoUpdateSupportedRunner 并返回 false，前端据此不再给出点了必失败的更新按钮，
+	// 也不会把"无法自动升级"误渲染成"已是最新版本"。
+	autoUpdatable := true
+	if ar, ok := runner.(autoUpdateSupportedRunner); ok {
+		autoUpdatable = ar.AutoUpdateSupported()
+	}
 	available, latestVersion, err := runner.CheckUpdate(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"updateAvailable": false,
+			"autoUpdatable":   autoUpdatable,
 			"currentVersion":  runner.Version(r.Context()),
 			"error":           errorText(err),
 		})
@@ -6479,6 +6556,7 @@ func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"updateAvailable": available,
+		"autoUpdatable":   autoUpdatable,
 		"currentVersion":  runner.Version(r.Context()),
 		"latestVersion":   latestVersion,
 	})
@@ -6529,6 +6607,15 @@ func (a codexRunnerAdapter) CheckUpdate(ctx context.Context) (bool, string, erro
 }
 func (a codexRunnerAdapter) Update(ctx context.Context) (string, string, error) {
 	return a.inner.CodexUpdate(ctx)
+}
+
+// AutoUpdateSupported implements autoUpdateSupportedRunner。Codex 侧的自动升级能力由
+// 内层 runner 的 CodexAutoUpdateSupported 决定；未实现该可选接口视为支持（默认 true）。
+func (a codexRunnerAdapter) AutoUpdateSupported() bool {
+	if c, ok := a.inner.(codexAutoUpdateSupportedRunner); ok {
+		return c.CodexAutoUpdateSupported()
+	}
+	return true
 }
 
 func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, agentID, agentName string, runner AgentRunner) {

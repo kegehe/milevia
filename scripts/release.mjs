@@ -7,11 +7,15 @@
 //   node scripts/release.mjs 0.1.1 "修复了…\n新增了…"
 //   node scripts/release.mjs --bump-only 0.1.1      # 只同步三处版本号，不打包
 //   node scripts/release.mjs 0.1.1 --no-build       # 不重新出包，签现有安装包（需已 build）
+//   node scripts/release.mjs 0.1.1 --deploy         # 打包+签名后 scp 上传到自托管更新源（需 MILEVIA_DEPLOY_TARGET）
 //
 // 环境变量：
-//   MILEVIA_PRIVKEY     私钥文件路径（默认 ~/.tauri/milevia-updater.key）
-//   MILEVIA_PASSFILE    私钥口令文件（默认 ~/.tauri/milevia-updater-password.txt）
-//   两者都会自动回落到默认位，通常无需设置。
+//   MILEVIA_PRIVKEY         私钥文件路径（默认 ~/.tauri/milevia-updater.key）
+//   MILEVIA_PASSFILE        私钥口令文件（默认 ~/.tauri/milevia-updater-password.txt）
+//   MILEVIA_DOWNLOAD_BASE   升级清单里安装包的下载基地址（默认自建服务器 https://keyanjia.info:8443/updates，
+//                           可覆盖成其它云存储源。加 `--deploy` 时它应指向服务器的 /updates/ 静态目录）。
+//   MILEVIA_DEPLOY_TARGET   `--deploy` 的 scp 目标目录（如 root@host:/var/www/milevia/dist/updates/）
+//                           两者通常无需设置。
 
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -25,6 +29,7 @@ const HOME = homedir();
 const args = process.argv.slice(2);
 const bumpOnly = args.includes("--bump-only");
 const noBuild = args.includes("--no-build");
+const deploy = args.includes("--deploy");
 const positional = args.filter((a) => !a.startsWith("--"));
 
 if (positional.length < 1) {
@@ -169,11 +174,10 @@ execFileSync(
 const signature = readFileSync(`${installer}.sig`, "utf8").trim();
 
 /* ── 4. 生成 latest.json ───────────────────────────────── */
-// latest.json 的 url 指向 GitHub Releases 下载地址。仓库信息已在 git remote 中，
-// 也可用 MILEVIA_DOWNLOAD_BASE 覆盖（例如日后换 Cloudflare R2）。
-const gh = readRemote();
-const downloadBase =
-  process.env.MILEVIA_DOWNLOAD_BASE || `https://github.com/${gh.owner}/${gh.repo}/releases/download/v${nextVersion}`;
+// 安装包下载基地址默认为自建服务器（keyanjia.info:8443，国内可达），
+// 以摆脱对 GitHub 的强依赖（GitHub Pages / Releases 在国内网络下不稳定会“无法检查更新”）。
+// 可用 MILEVIA_DOWNLOAD_BASE 覆盖成其它源（如 Cloudflare R2 / 对象存储）。
+const downloadBase = (process.env.MILEVIA_DOWNLOAD_BASE || "https://keyanjia.info:8443/updates").replace(/\/+$/, "");
 
 const manifest = {
   version: nextVersion,
@@ -187,32 +191,61 @@ const manifest = {
   },
 };
 
-const manifestOut = join(repoRoot, "release", "latest.json");
 const manifestText = JSON.stringify(manifest, null, 2) + "\n";
+const manifestOut = join(repoRoot, "release", "latest.json");
 writeFileSync(manifestOut, manifestText, "utf8");
 writeFileSync(join(repoRoot, "latest.json"), manifestText, "utf8");
-console.log(`已生成升级清单：${manifestOut}`);
+console.log(`已生成升级清单：${manifestOut}（url 指向 ${downloadBase}/）`);
 console.log(`\n清单内容：\n${JSON.stringify(manifest, null, 2)}`);
 
-/* ── 5. 打印后续动作（不自动 push / upload）────────────── */
-console.log("\n发布动作已完成（未上传）。下一步（在产品分支上手动确认后执行）:");
-console.log(`  git tag v${nextVersion}`);
-console.log("  git push origin " + `v${nextVersion}`);
-console.log(`  gh release create v${nextVersion} "${installer}" "release/latest.json" --notes "${notes.replace(/\\n/g, "\n")}"`);
-console.log("\n然后把 release/latest.json 同步到 GitHub Pages 根目录（当前 endpoints 指向处）。");
+// 供自托管源上传的目录：把【安装包 + latest.json】放一起，scp/rsync 整个目录即可。
+const updatesDir = join(repoRoot, "release", "updates");
+mkdirSync(updatesDir, { recursive: true });
+copyFileSync(installer, join(updatesDir, installerName));
+writeFileSync(join(updatesDir, "latest.json"), manifestText, "utf8");
+console.log(`已生成自托管上传目录：${updatesDir}`);
 
-/** 解析 git remote origin 得到 owner/repo，用于拼 release 下载地址。 */
-function readRemote() {
-  if (process.env.MILEVIA_DOWNLOAD_BASE) return { owner: "<owner>", repo: "<repo>" };
-  try {
-    const remote = execFileSync("git", ["remote", "get-url", "origin"], { cwd: repoRoot, encoding: "utf8" }).trim();
-    const m = remote.match(/github\.com[/:]([^/]+)\/([^/]+?)(\.git)?$/);
-    if (!m) throw new Error("无法从 git remote 解析 owner/repo");
-    return { owner: m[1], repo: m[2] };
-  } catch {
-    console.warn("〔警告〕无法解析 GitHub remote，latest.json 的 url 用了占位 <owner>/<repo>。用 MILEVIA_DOWNLOAD_BASE 指定下载基地址。");
-    return { owner: "<owner>", repo: "<repo>" };
+/* ── 5. 部署 + 打印后续动作 ────────────────────────────── */
+if (deploy) {
+  // 把 install 包与清单 scp 到服务器的 /updates/ 静态目录（对应 endpoints 的 keyanjia.info:8443/updates）。
+  // 需先保证远端 /var/www/milevia/dist/updates/ 存在。
+  const target = process.env.MILEVIA_DEPLOY_TARGET;
+  if (!target) {
+    throw new Error("--deploy 需要设置 MILEVIA_DEPLOY_TARGET（scp 目标目录，例如 root@host:/var/www/milevia/dist/updates/）");
   }
+  console.log(`正在通过 scp 上传到 ${target} …`);
+  execFileSync("scp", [join(updatesDir, installerName), join(updatesDir, "latest.json"), target], { stdio: "inherit" });
+  console.log(`已上传安装包与升级清单：${target}`);
+
+  // 上传后立即回读远程清单做自检：
+  //   - 若命中 SPA 兜底（文件缺失 + 未配 nginx /updates），会返回 200 + index.html，
+  //     updater 会因 JSON 解析失败【硬失败且不落到 GitHub 兜底端点】，这里必须当场拦截。
+  //   - 返回 404（已配 /updates 但文件缺失）同样拦截。
+  console.log(`正在校验远程清单 ${downloadBase}/latest.json …`);
+  const probe = await fetch(`${downloadBase}/latest.json`);
+  if (!probe.ok) {
+    throw new Error(`远程清单返回 HTTP ${probe.status}：请确认已把 release/updates 上传到服务器 /var/www/milevia/dist/updates/，且 nginx 已配置 location /updates/ 并 reload。`);
+  }
+  const probeText = await probe.text();
+  let remoteManifest;
+  try {
+    remoteManifest = JSON.parse(probeText);
+  } catch {
+    throw new Error(
+      "远程 /updates/latest.json 不是合法 JSON——很可能命中了 SPA 兜底（服务器返回了 index.html 而不是清单）。\n" +
+      "请先在服务器 Nginx 应用基础设施/nginx-keyanjia-8443.conf.example 里的 location /updates/ 并 reload，再重试 --deploy。",
+    );
+  }
+  if (remoteManifest.version !== nextVersion) {
+    throw new Error(`远程清单版本异常：期望 ${nextVersion}，实际 ${remoteManifest.version}。可能命中了旧缓存，请检查服务器文件与 CDN 缓存。`);
+  }
+  console.log(`校验通过：${downloadBase}/latest.json 已返回版本 ${nextVersion}。`);
+} else {
+  console.log("\n发布动作已完成（未上传，未加 --deploy）。下一步:");
+  console.log(`  上传自托管源（国内可达，先在服务器建好 updates 目录）：scp -r release/updates/. root@<your-server>:/var/www/milevia/dist/updates/`);
+  console.log(`     —— 或直接用：MILEVIA_DEPLOY_TARGET=root@host:/var/www/milevia/dist/updates/ node scripts/release.mjs ${nextVersion} --deploy`);
+  console.log(`  可选归档到 GitHub：git tag v${nextVersion} && git push origin v${nextVersion} && gh release create v${nextVersion} "${installer}" "release/latest.json" --notes "${notes.replace(/\\n/g, "\n")}"`);
+  console.log("\n注意：已安装旧版（内置 GitHub 端点）的机器无法走应用内升级，需手动安装一次新 exe 才能救活。");
 }
 
 /** 构建环境：sidecar（go-sqlite3）需要 CGO + 可运行的 C 编译器。

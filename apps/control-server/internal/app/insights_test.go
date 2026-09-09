@@ -223,6 +223,12 @@ func TestParseInsightCandidates(t *testing.T) {
 	} else {
 		t.Log("narration parse ok")
 	}
+	// 早期输出被截断时，不应因首个不闭合的 [ 直接放弃后面已完整的最终结果。
+	recovered := "初稿: [{\"type\":\"bug\"\n最终结果: [{\"type\":\"feature\",\"severity\":\"normal\",\"title\":\"可恢复\",\"summary\":\"后续有完整 JSON\"}]"
+	items, err = parseInsightCandidates(recovered)
+	if err != nil || len(items) != 1 || items[0].Title != "可恢复" {
+		t.Fatalf("parse after malformed prefix: items=%+v err=%v", items, err)
+	}
 }
 
 func TestParseInsightToolActivityCodexEvents(t *testing.T) {
@@ -323,6 +329,9 @@ func TestRunInsightScanPersistsConfirmedFindings(t *testing.T) {
 	}
 	if reqs[1].PermissionMode != "plan" {
 		t.Errorf("pass B policy: %q", reqs[1].PermissionMode)
+	}
+	if !json.Valid(reqs[0].OutputSchema) || !json.Valid(reqs[1].OutputSchema) {
+		t.Errorf("insight output schemas must be valid JSON: A=%q B=%q", reqs[0].OutputSchema, reqs[1].OutputSchema)
 	}
 
 	// 断言落库 + 计数。

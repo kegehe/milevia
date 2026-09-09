@@ -205,6 +205,7 @@ Claude Run / 提交 / 暂存 / 切换分支 / fetch / push
 ### 7.2 历史、同步与分支
 
 - 历史首期显示当前 HEAD 可达的最近 100 条提交：短 SHA、标题、作者、作者时间、父提交数；提交详情再按需加载 diff，禁止一次读取整个大仓库历史。
+- 提交详情（“分支”tab 中点击历史条目）按需加载：`GET /git/commits/{oid}` 返回完整提交信息与变更文件清单（状态徽标、增删行数、二进制标记、重命名原始路径），单次 `git show --first-parent --raw -z --numstat` 同时取得；`GET /git/commits/{oid}/diff?path=...` 返回单文件 unified diff，服务端校验 path 必须属于该提交的变更集；重命名文件同时按新旧两个路径过滤，保证显示 rename 补丁而非退化的整文件新增。合并提交按第一个父提交计算差异并在界面标注；根提交与空树对比。OID 只接受完整对象 ID 并经 `cat-file -e <oid>^{commit}` 校验。
 - “获取更新”只执行 `git fetch --prune <remote>`，不会改工作树；完成后重新计算 ahead/behind。它仍会更新 Git 元数据，因此与 Claude Run 和其他 Git 操作使用同一工作区租约。
 - “推送”默认 `git push <remote> HEAD:<branch>`，仅允许普通推送，不添加 `--force`。无 upstream 时，确认层明确询问远端与分支名，并以 `-u` 建立 upstream；受保护分支按项目策略禁用。
 - 分支列表以当前、本地、远端分组；创建和切换使用 `git switch`，不使用兼具恢复语义的 `checkout`。创建前服务端验证引用名，调用 `git check-ref-format --branch`。
@@ -228,6 +229,7 @@ POST /api/projects/{projectID}/git/unstage          { paths, stateToken }
 POST /api/projects/{projectID}/git/commits          { message, stateToken, taskIds? }
 GET  /api/projects/{projectID}/git/log?ref=HEAD&cursor=&limit=50
 GET  /api/projects/{projectID}/git/commits/{oid}
+GET  /api/projects/{projectID}/git/commits/{oid}/diff?path=...
 POST /api/projects/{projectID}/git/fetch            { remote, stateToken }
 POST /api/projects/{projectID}/git/push             { remote, branch, setUpstream, stateToken }
 GET  /api/projects/{projectID}/git/branches
