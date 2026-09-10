@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -37,6 +39,87 @@ type Server struct {
 	mu          sync.Mutex
 	connections map[string]*websocket.Conn
 	writeMu     sync.Mutex
+	// Rate limiters for the unauthenticated endpoints. The authenticated
+	// mobile API is polled by design and is not throttled here.
+	registerLimiter *rateLimiter
+	claimLimiter    *rateLimiter
+	statusLimiter   *rateLimiter
+}
+
+// rateLimiter is a per-client token bucket held in process memory. The current
+// deployment is a single node, so no shared store is needed; the goal is simply
+// to stop unauthenticated endpoints (machine registration, pairing claims) from
+// being hammered, and to bound the cost of a leaked enrollment token.
+type rateLimiter struct {
+	mu       sync.Mutex
+	buckets  map[string]bucket
+	capacity float64
+	refill   float64
+}
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func newRateLimiter(capacity, perMinute int) *rateLimiter {
+	return &rateLimiter{buckets: map[string]bucket{}, capacity: float64(capacity), refill: float64(perMinute) / 60}
+}
+
+func (l *rateLimiter) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.buckets) > 10000 {
+		for k, b := range l.buckets {
+			if now.Sub(b.last) > 10*time.Minute {
+				delete(l.buckets, k)
+			}
+		}
+	}
+	current, ok := l.buckets[key]
+	if !ok {
+		current = bucket{tokens: l.capacity, last: now}
+	}
+	if elapsed := now.Sub(current.last).Seconds(); elapsed > 0 {
+		current.tokens = math.Min(l.capacity, current.tokens+elapsed*l.refill)
+		current.last = now
+	}
+	if current.tokens < 1 {
+		l.buckets[key] = current
+		return false
+	}
+	current.tokens--
+	l.buckets[key] = current
+	return true
+}
+
+// clientIP identifies the caller for rate limiting. The documented deployment
+// terminates TLS at a reverse proxy on the same host, so X-Forwarded-For is the
+// only way to see the real client; RemoteAddr is the fallback for direct
+// access. Rate limiting is defence in depth here, not the only gate.
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
+			return first
+		}
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (s *Server) limit(limiter *rateLimiter, scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if limiter == nil || limiter.allow(scope+":"+clientIP(r), time.Now().UTC()) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Set("Retry-After", "60")
+			writeError(w, http.StatusTooManyRequests, errors.New("too many requests; please retry later"))
+		})
+	}
 }
 
 type instanceScopeKey struct{}
@@ -98,7 +181,14 @@ func New(ctx context.Context, config Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	s := &Server{db: db, config: config, connections: map[string]*websocket.Conn{}}
+	s := &Server{
+		db:              db,
+		config:          config,
+		connections:     map[string]*websocket.Conn{},
+		registerLimiter: newRateLimiter(10, 30),
+		claimLimiter:    newRateLimiter(10, 30),
+		statusLimiter:   newRateLimiter(60, 300),
+	}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -173,7 +263,9 @@ create table if not exists cloud_access_tokens (
   instance_id text not null references cloud_instances(instance_id) on delete cascade,
   created_at timestamptz not null default now(),
   expires_at timestamptz,
-  revoked_at timestamptz
+  revoked_at timestamptz,
+  pairing_id text not null default '',
+  activated_at timestamptz
 );
 create table if not exists cloud_agent_credentials (
   instance_id text primary key references cloud_instances(instance_id) on delete cascade,
@@ -192,6 +284,12 @@ create index if not exists cloud_events_instance_sequence on cloud_events(instan
 		`alter table pairing_sessions add column if not exists claim_attempts integer not null default 0`,
 		`alter table cloud_instances add column if not exists snapshot jsonb not null default '{"projects":[]}'::jsonb`,
 		`alter table cloud_instances add column if not exists snapshot_revision bigint not null default 0`,
+		`alter table cloud_access_tokens add column if not exists pairing_id text not null default ''`,
+		`alter table cloud_access_tokens add column if not exists activated_at timestamptz`,
+		// Tokens issued before desktop confirmation became mandatory carry no
+		// pairing link. Treat them as already activated so upgrading does not
+		// silently break an existing pairing. Re-running this is a no-op.
+		`update cloud_access_tokens set activated_at=now() where activated_at is null and pairing_id=''`,
 	} {
 		if _, err := s.db.Exec(ctx, statement); err != nil {
 			return fmt.Errorf("migrate cloud database: %w", err)
@@ -218,14 +316,25 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/events", s.listEvents)
 		r.Post("/pairings", s.createPairing)
 	})
+	// Registration and pairing are the only unauthenticated entry points, so
+	// they carry explicit rate limits. A leaked enrollment token or a scanned
+	// pairing QR code is worth far less when it cannot be replayed at speed.
 	r.Group(func(r chi.Router) {
 		r.Use(s.cors)
+		r.Use(s.limit(s.registerLimiter, "agent-register"))
 		r.Post("/v1/agent/register", s.agentRegister)
 	})
 	r.Group(func(r chi.Router) {
 		r.Use(s.cors)
+		r.Use(s.limit(s.claimLimiter, "pairing-claim"))
 		r.Post("/v1/pairings/claim", s.claimPairingByCode)
 		r.Post("/v1/pairings/{pairingID}/claim", s.claimPairing)
+	})
+	// Pairing status is polled by the phone every 1.5s while it waits for the
+	// desktop to confirm, so it gets a much looser budget than claim attempts.
+	r.Group(func(r chi.Router) {
+		r.Use(s.cors)
+		r.Use(s.limit(s.statusLimiter, "pairing-status"))
 		r.Get("/v1/pairings/{pairingID}/status", s.pairingStatus)
 	})
 	r.Get("/v1/agent/connect", s.agentConnect)
@@ -349,13 +458,31 @@ func (s *Server) agentConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pairingID := chi.URLParam(r, "pairingID")
-	result, err := s.db.Exec(r.Context(), `update pairing_sessions set status='confirmed' where pairing_id=$1 and instance_id=$2 and status='claimed' and expires_at>now()`, pairingID, instanceID)
+	// Confirming is what actually grants the phone access, so the pairing
+	// state and the token activation must commit together: a crash between
+	// them would otherwise leave a phone reading "confirmed" while its token
+	// still cannot authenticate.
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	result, err := tx.Exec(r.Context(), `update pairing_sessions set status='confirmed' where pairing_id=$1 and instance_id=$2 and status='claimed' and expires_at>now()`, pairingID, instanceID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if result.RowsAffected() != 1 {
 		writeError(w, http.StatusConflict, errors.New("pairing is not ready for confirmation"))
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `update cloud_access_tokens set activated_at=now() where pairing_id=$1 and activated_at is null and revoked_at is null`, pairingID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "confirmed", "pairingId": pairingID, "instanceId": instanceID})
@@ -480,11 +607,15 @@ func (s *Server) claimPairingSession(w http.ResponseWriter, r *http.Request, pai
 		return
 	}
 	accessToken := fmt.Sprintf("mvt_%x", tokenBytes[:])
-	if _, err := s.db.Exec(r.Context(), `insert into cloud_access_tokens(token_hash,instance_id,expires_at) values($1,$2,$3)`, hashCode(accessToken), instanceID, time.Now().UTC().Add(90*24*time.Hour)); err != nil {
+	// The token is recorded against its pairing session but stays inactive:
+	// userAuth rejects tokens with a null activated_at, and only the desktop
+	// side (agentConfirmPairing) can activate it. Claiming a QR code therefore
+	// grants nothing on its own — the person at the computer must confirm.
+	if _, err := s.db.Exec(r.Context(), `insert into cloud_access_tokens(token_hash,instance_id,expires_at,pairing_id) values($1,$2,$3,$4)`, hashCode(accessToken), instanceID, time.Now().UTC().Add(90*24*time.Hour), pairingID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "claimed", "pairingId": pairingID, "instanceId": instanceID, "accessToken": accessToken})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "claimed", "pairingId": pairingID, "instanceId": instanceID, "accessToken": accessToken, "pendingConfirmation": true})
 }
 
 func (s *Server) instanceSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -503,6 +634,16 @@ func (s *Server) instanceSnapshot(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, 500, err)
 		return
+	}
+	// A phone that already holds this revision needs nothing more. During an AI
+	// reply the phone re-fetches the snapshot repeatedly while the real updates
+	// arrive over the event stream, so answering with a small marker instead of
+	// the whole project/history payload saves a lot of mobile data.
+	if raw := strings.TrimSpace(r.URL.Query().Get("revision")); raw != "" {
+		if since, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && since > 0 && since == revision {
+			writeJSON(w, http.StatusOK, map[string]any{"unchanged": true, "snapshotRevision": revision, "observedAt": observed})
+			return
+		}
 	}
 	var value map[string]any
 	if json.Unmarshal(snapshot, &value) != nil {
@@ -625,9 +766,13 @@ func (s *Server) userAuth(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, errors.New("invalid user token"))
 			return
 		}
+		// activated_at is set only by the desktop-side confirmation. A token
+		// returned by claimPairing is therefore inert until someone at the
+		// computer approves the pairing, which is what makes the confirmation
+		// step a real authorization boundary rather than a client-side ritual.
 		var instanceID string
 		var expires *time.Time
-		err := s.db.QueryRow(r.Context(), `select instance_id,expires_at from cloud_access_tokens where token_hash=$1 and revoked_at is null`, hashCode(provided)).Scan(&instanceID, &expires)
+		err := s.db.QueryRow(r.Context(), `select instance_id,expires_at from cloud_access_tokens where token_hash=$1 and revoked_at is null and activated_at is not null`, hashCode(provided)).Scan(&instanceID, &expires)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && expires != nil && !expires.After(time.Now().UTC())) {
 			writeError(w, http.StatusUnauthorized, errors.New("invalid user token"))
 			return
@@ -691,6 +836,16 @@ func appOrigin(rawURL string) string {
 		host = strings.TrimSuffix(host, ":80")
 	}
 	return scheme + "://" + host
+}
+
+// agentOriginAllowed gates the Agent WebSocket upgrade. The Agent is not a
+// browser and sends no Origin header, which must stay acceptable; when an
+// Origin is present it has to belong to this deployment. Browsers cannot forge
+// Origin, so this blocks cross-site WebSocket attempts from other pages while
+// the Agent token remains the real gate.
+func (s *Server) agentOriginAllowed(origin string) bool {
+	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+	return origin == "" || isAllowedWebOrigin(origin, appOrigin(s.config.AppURL))
 }
 
 // agentAuth authenticates an Agent request. It returns ok=false with a nil
@@ -792,10 +947,48 @@ func (s *Server) instanceOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"instanceId": id, "name": name, "status": status, "lastAgentSequence": sequence, "lastSeenAt": seen})
 }
 
+// revokeInstanceTokens revokes access to one computer. Two very different
+// things can be revoked, so the caller states which:
+//
+//	scope=mobile (default): forget the phones paired with this computer. The
+//	    Agent credential and the relay connection stay untouched, because the
+//	    computer itself is not what the user asked to disconnect.
+//	scope=agent: additionally retire the machine's own credential, taking the
+//	    computer off the relay until an operator enrolls it again.
+//
+// Conflating the two — the original behaviour — meant "remove my phone"
+// silently unplugged the desktop as well, and on a release build the Agent had
+// no way to re-enroll on its own.
 func (s *Server) revokeInstanceTokens(w http.ResponseWriter, r *http.Request) {
 	instanceID := chi.URLParam(r, "instanceID")
 	if !authorizedInstance(r, instanceID) {
 		writeError(w, http.StatusForbidden, errors.New("instance access denied"))
+		return
+	}
+	scope := "mobile"
+	// A missing or chunked body simply means "use the default scope"; only a
+	// declared, non-empty body is parsed.
+	if r.ContentLength > 0 {
+		var input struct {
+			Scope string `json:"scope"`
+		}
+		if !decode(w, r, &input) {
+			return
+		}
+		if trimmed := strings.TrimSpace(input.Scope); trimmed != "" {
+			scope = trimmed
+		}
+	}
+	if scope != "mobile" && scope != "agent" {
+		writeError(w, http.StatusBadRequest, errors.New("scope must be either mobile or agent"))
+		return
+	}
+	if scope == "mobile" {
+		if _, err := s.db.Exec(r.Context(), `update cloud_access_tokens set revoked_at=now() where instance_id=$1 and revoked_at is null`, instanceID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "scope": "mobile", "instanceId": instanceID})
 		return
 	}
 	tx, err := s.db.Begin(r.Context())
@@ -831,7 +1024,7 @@ func (s *Server) revokeInstanceTokens(w http.ResponseWriter, r *http.Request) {
 	if conn != nil {
 		_ = conn.Close()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "instanceId": instanceID})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "scope": "agent", "instanceId": instanceID})
 }
 
 func (s *Server) createCommand(w http.ResponseWriter, r *http.Request) {
@@ -840,13 +1033,22 @@ func (s *Server) createCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, errors.New("instance access denied"))
 		return
 	}
-	exists, err := s.instanceExists(r.Context(), instanceID)
+	// Refuse commands aimed at a computer that is not connected. Accepting one
+	// would leave it queued, expire it minutes later, and leave the user
+	// believing the task had been dispatched — the command never reaches the
+	// machine because there is no relay connection to push it over.
+	var instanceStatus string
+	err := s.db.QueryRow(r.Context(), `select status from cloud_instances where instance_id=$1`, instanceID).Scan(&instanceStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("instance not found"))
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !exists {
-		writeError(w, http.StatusNotFound, errors.New("instance not found"))
+	if instanceStatus != "online" {
+		writeError(w, http.StatusConflict, errors.New("instance_offline: the computer is not connected right now"))
 		return
 	}
 	idempotency := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
@@ -916,7 +1118,19 @@ func (s *Server) getCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, errors.New("instance access denied"))
 		return
 	}
-	if _, err := s.db.Exec(r.Context(), `update cloud_commands set status='expired',updated_at=now() where command_id=$1 and instance_id=$2 and expires_at<=now() and status not in ('completed','failed','expired','cancelled','indeterminate')`, commandID, commandInstanceID); err != nil {
+	// expires_at bounds how long a command may wait for delivery, not how long
+	// it may run. Only commands that were never picked up expire; marking a
+	// received or executing command as expired would tell the user a running
+	// task had failed to start.
+	if _, err := s.db.Exec(r.Context(), `update cloud_commands set status='expired',updated_at=now() where command_id=$1 and instance_id=$2 and expires_at<=now() and status='queued'`, commandID, commandInstanceID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// A command that was delivered but never reached a terminal state (the
+	// Agent stopped mid-flight, for example) must not report "in progress"
+	// forever: the phone polls until it sees a terminal status, so a stall
+	// would mean endless polling over a result the user can never act on.
+	if _, err := s.db.Exec(r.Context(), `update cloud_commands set status='indeterminate',updated_at=now() where command_id=$1 and instance_id=$2 and status in ('received','executing') and updated_at < now() - interval '6 hours'`, commandID, commandInstanceID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -975,7 +1189,11 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 	if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
 		return
 	}
-	upgrader := websocket.Upgrader{ReadBufferSize: 64 << 10, WriteBufferSize: 64 << 10, CheckOrigin: func(*http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  64 << 10,
+		WriteBufferSize: 64 << 10,
+		CheckOrigin: func(r *http.Request) bool { return s.agentOriginAllowed(r.Header.Get("Origin")) },
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -1043,7 +1261,23 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := s.storeEvent(r.Context(), instanceID, envelope); err != nil {
-			return
+			if isEventConflict(err) {
+				// Dropping the connection here would be destructive: the Agent
+				// would reconnect, resend the same conflicting event, and never
+				// deliver the events queued behind it. Reject just this event
+				// so the Agent can discard it and continue with the next one.
+				_ = s.agentWrite(instanceID, conn, map[string]any{
+					"kind":          "event.reject",
+					"eventId":       envelope.EventID,
+					"agentSequence": envelope.AgentSequence,
+					"reason":        err.Error(),
+				})
+				continue
+			}
+			// Transient database failure: send neither an ack nor a reject, and
+			// keep the connection. The Agent still holds the event and will
+			// retry once the database recovers.
+			continue
 		}
 		s.agentWrite(instanceID, conn, map[string]any{"kind": "event.ack", "eventId": envelope.EventID, "agentSequence": envelope.AgentSequence})
 	}
@@ -1066,17 +1300,31 @@ func (s *Server) agentEvents(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &events) {
 		return
 	}
+	// Conflicting events are reported per-event instead of failing the whole
+	// batch: a single stale event must not force the Agent to replay healthy
+	// events behind it forever.
+	rejected := make([]map[string]any, 0)
+	accepted := 0
 	for _, event := range events {
 		if event.EventID == "" || event.AgentSequence <= 0 || event.Type == "" || len(event.Payload) == 0 || !json.Valid(event.Payload) || event.CreatedAt.IsZero() {
 			writeError(w, http.StatusBadRequest, errors.New("invalid event envelope"))
 			return
 		}
 		if err := s.storeEvent(r.Context(), instanceID, event); err != nil {
+			if isEventConflict(err) {
+				rejected = append(rejected, map[string]any{
+					"eventId":       event.EventID,
+					"agentSequence": event.AgentSequence,
+					"reason":        err.Error(),
+				})
+				continue
+			}
 			writeError(w, 500, err)
 			return
 		}
+		accepted++
 	}
-	writeJSON(w, 200, map[string]any{"accepted": len(events)})
+	writeJSON(w, 200, map[string]any{"accepted": accepted, "rejected": rejected})
 }
 
 func (s *Server) agentSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -1122,6 +1370,24 @@ func (s *Server) agentSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"status": "accepted", "snapshotRevision": revision})
 }
 
+// Permanent event conflicts. These describe a durably inconsistent event (the
+// same sequence carrying a different event, or the same event carrying a
+// different sequence). Retrying them can never succeed, so callers must drop
+// the event instead of reconnecting or backing off.
+var (
+	errEventInsertConflict   = errors.New("event insert conflict")
+	errEventSequenceConflict = errors.New("event sequence conflict")
+	errEventIDConflict       = errors.New("event id conflict")
+)
+
+// isEventConflict reports whether an error from storeEvent is a permanent
+// conflict rather than a transient database failure.
+func isEventConflict(err error) bool {
+	return errors.Is(err, errEventInsertConflict) ||
+		errors.Is(err, errEventSequenceConflict) ||
+		errors.Is(err, errEventIDConflict)
+}
+
 func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventEnvelope) error {
 	if err := s.ensureInstance(ctx, instanceID); err != nil {
 		return err
@@ -1142,18 +1408,18 @@ func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventE
 			var existingSequence int64
 			err = tx.QueryRow(ctx, `select agent_sequence from cloud_events where instance_id=$1 and event_id=$2`, instanceID, event.EventID).Scan(&existingSequence)
 			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("event insert conflict for instance %s", instanceID)
+				return fmt.Errorf("%w for instance %s", errEventInsertConflict, instanceID)
 			}
 			if err != nil {
 				return err
 			}
 			if existingSequence != event.AgentSequence {
-				return fmt.Errorf("event ID conflict for instance %s: %s", instanceID, event.EventID)
+				return fmt.Errorf("%w for instance %s: %s", errEventIDConflict, instanceID, event.EventID)
 			}
 		} else if err != nil {
 			return err
 		} else if existingID != event.EventID {
-			return fmt.Errorf("event sequence conflict for instance %s: sequence %d", instanceID, event.AgentSequence)
+			return fmt.Errorf("%w for instance %s: sequence %d", errEventSequenceConflict, instanceID, event.AgentSequence)
 		}
 	} else if err != nil {
 		return err
@@ -1171,7 +1437,14 @@ func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventE
 }
 
 func (s *Server) sendPendingCommands(ctx context.Context, instanceID string, conn *websocket.Conn) {
-	rows, err := s.db.Query(ctx, `select command_id,idempotency_key,type,project_id,task_id,payload,expires_at from cloud_commands where instance_id=$1 and status='queued' and expires_at>now() order by created_at limit 100`, instanceID)
+	// Re-deliver the never-delivered queue *and* the commands the Agent last
+	// reported as in-flight. The latter is what lets a command recover after an
+	// Agent restart: re-submitting is safe because the local side is
+	// idempotent by key and answers with the existing record, and the Agent
+	// then relays whatever terminal state that record has reached. Without
+	// this, a command that reached "received" before a crash would stay there
+	// forever (the old query only re-sent status='queued').
+	rows, err := s.db.Query(ctx, `select command_id,idempotency_key,type,project_id,task_id,payload,expires_at from cloud_commands where instance_id=$1 and ((status='queued' and expires_at>now()) or status in ('received','executing')) order by created_at limit 100`, instanceID)
 	if err != nil {
 		return
 	}

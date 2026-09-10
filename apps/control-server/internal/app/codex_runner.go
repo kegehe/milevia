@@ -298,6 +298,12 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	}
 	defer closeProfile()
 	args = append(args, profileArgs...)
+	// MCP 注入：Codex 没有 --mcp-config，改由 -c 点号路径逐 server 注入；密钥只写变量名
+	// （env_vars / env_http_headers），真值随进程环境提供，因此 argv 与配置文件都不含明文。
+	args = append(args, request.CodexMCPArgs...)
+	if len(request.MCPEnv) > 0 {
+		environment = append(environment, request.MCPEnv...)
+	}
 	if request.Profile != nil && request.Profile.Model != "" {
 		args = append(args, "-c", fmt.Sprintf("model=%q", request.Profile.Model))
 	}

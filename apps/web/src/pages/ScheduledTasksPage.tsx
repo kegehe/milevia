@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router-dom";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { useProjectContext } from "../stores/useProjectStore";
 import type { AgentID, PermissionMode, ScheduledTask, ScheduledTaskRun, Skill } from "../lib/types";
@@ -119,12 +120,18 @@ export default function ScheduledTasksPage() {
   const [busyID, setBusyID] = useState("");
   const [pendingDelete, setPendingDelete] = useState<PendingDelete>(null);
   const loadGenerationRef = useRef(0);
+  const tasksRef = useRef<ScheduledTask[]>([]);
 
   const load = useCallback(async () => {
     if (!projectId) return;
     const generation = ++loadGenerationRef.current;
     const next = await projectApi<ScheduledTask[]>(`/api/projects/${projectId}/scheduled-tasks`);
-    if (generation === loadGenerationRef.current) setTasks(next);
+    if (generation !== loadGenerationRef.current) return;
+    // 去重：定时任务几乎不变化，WS 事件与兜底轮询命中同一份数据时保持引用，
+    // 避免无意义的重渲染。load 是本页唯一写 tasks 的地方，tasksRef 因此始终同步。
+    if (JSON.stringify(tasksRef.current) === JSON.stringify(next)) return;
+    tasksRef.current = next;
+    setTasks(next);
   }, [projectApi, projectId]);
 
   useEffect(() => {
@@ -134,8 +141,9 @@ export default function ScheduledTasksPage() {
     return () => { cancelled = true; loadGenerationRef.current += 1; };
   }, [load, setError]);
 
-  // 仅页面可见时每 10s 轮询一次；最小化/切到后台时暂停，只在「不可见 → 可见」的
+  // 仅页面可见时每 30s 兜底轮询一次；最小化/切到后台时暂停，只在「不可见 → 可见」的
   // 那一跳补拉一次，补齐后台期间变化的「下次运行 / 最近状态」，而不是等到下个周期。
+  // 真正的实时刷新由 /ws/events（scheduled-tasks）事件驱动，轮询仅作兜底。
   const visible = useDocumentVisible();
   const prevVisible = useRef(visible);
   useEffect(() => {
@@ -143,9 +151,12 @@ export default function ScheduledTasksPage() {
     prevVisible.current = visible;
     if (!visible) return;
     if (becameVisible) void load().catch(() => undefined);
-    const interval = window.setInterval(() => { void load().catch(() => undefined); }, 10_000);
+    const interval = window.setInterval(() => { void load().catch(() => undefined); }, 30_000);
     return () => window.clearInterval(interval);
   }, [visible, load]);
+  useLiveStateEventsFor("scheduled-tasks", projectId, useCallback(() => {
+    void load().catch(() => undefined);
+  }, [load]));
 
   useEffect(() => {
     if (!scheduledTaskId) return;

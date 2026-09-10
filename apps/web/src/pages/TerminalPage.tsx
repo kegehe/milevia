@@ -4,6 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { api, type APIError } from "../lib/api";
+import { literalNameClass } from "../lib/utils";
 import { createWebSocket } from "../lib/runtime";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
 import type { TerminalSessionInfo, TerminalSessionList } from "../lib/types";
@@ -337,7 +338,7 @@ export default function TerminalPage() {
     <header className="terminal-toolbar">
       <div className="terminal-title">
         <div className="terminal-title-heading"><span className="terminal-title-icon" aria-hidden="true"><TerminalIcon /></span><span className="terminal-kicker">项目终端</span></div>
-        <h3 title={project.name}>{project.name}</h3>
+        <h3 title={project.name} className={literalNameClass(project.name)}>{project.name}</h3>
       </div>
       <div className="terminal-actions">
         <div className="terminal-button-group">

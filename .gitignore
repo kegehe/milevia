@@ -8,6 +8,10 @@ data/*
 !data/.gitkeep
 logs/
 
+# MCP runtime config files. 默认落在 <DataDir>/mcp-runtime（通常已被 data/* 覆盖），
+# 但 DataDir 可配置，故按目录名显式再排除一次，避免临时配置文件被误提交。
+mcp-runtime/
+
 # JavaScript tooling
 node_modules/
 .pnpm-store/
@@ -77,3 +81,7 @@ apps/web/test-results/
 *.sqlite3
 *.sqlite3-journal
 .tmp/
+
+# Local workbench data and build leftovers
+.workbuddy/
+_tmp_*

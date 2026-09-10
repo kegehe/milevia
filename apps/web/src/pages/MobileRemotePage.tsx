@@ -9,6 +9,7 @@ import { Capacitor } from "@capacitor/core";
 import { App as CapacitorApp } from "@capacitor/app";
 import type { PluginListenerHandle } from "@capacitor/core";
 import { BarcodeFormat, BarcodeScanner, LensFacing } from "@capacitor-mlkit/barcode-scanning";
+import { invoke } from "@tauri-apps/api/core";
 import "./mobile-remote.css";
 
 type Instance = { instanceId: string; name: string; status: string; lastAgentSequence: number; lastSeenAt?: string };
@@ -171,22 +172,55 @@ function pairingFromScan(value: string): { pairingID: string; code: string } {
   }
 }
 
+// The QR code has to point at an absolute http(s) address that the phone can
+// reach. The desktop WebView origin is a tauri:// URL, and a cloud deployment
+// without MILEVIA_CLOUD_APP_URL returns a relative path — falling back to the
+// local origin in either case would produce a code that no phone can open, so
+// return an empty string and let the caller explain the problem instead.
 function pairingURLWithCode(value: string | undefined, pairingID: string): string {
-  try {
-    const fallbackOrigin = globalThis.location?.origin || "https://keyanjia.info:8443";
-    const parsed = new URL(value || `${fallbackOrigin}/mobile`);
+  const candidates = [(value || "").trim(), cloudURL ? `${cloudURL}/mobile` : ""];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      continue;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
     parsed.searchParams.set("pairingId", pairingID);
     // Keep the short-lived pairing code out of URLs, where it can leak through
     // browser history, proxy logs, or referrer data.
     parsed.searchParams.delete("code");
     return parsed.toString();
-  } catch {
-    return `${globalThis.location?.origin || "https://keyanjia.info:8443"}/mobile?pairingId=${encodeURIComponent(pairingID)}`;
   }
+  return "";
 }
 
 function idempotencyKey() {
   return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+// 云端的错误原因是这里最准确的信号，但它以英文短语返回，而且不能靠状态码推断
+// 场景——409 既可能是配对码冲突，也可能是"电脑当前离线"。因此按原因做定向翻译，
+// 认不出的原因原样透出，避免给出与实际场景不符的提示。
+function localizeCloudError(raw: string, status: number): string {
+  const text = raw.toLowerCase();
+  if (text.includes("instance_offline")) return "电脑当前离线，请等电脑上线后再试";
+  if (text.includes("pairing is not ready for confirmation")) return "手机还没有提交校验码，请先扫码并输入校验码";
+  if (text.includes("too many pairing attempts")) return "配对尝试次数过多，请让电脑重新生成二维码";
+  if (text.includes("pairing code is ambiguous")) return "校验码发生冲突，请让电脑重新生成二维码";
+  if (text.includes("pairing code has expired or was already used")) return "配对码已过期或已被使用，请让电脑重新生成";
+  if (text.includes("pairing code is invalid")) return "配对码无效或已过期，请让电脑重新生成";
+  if (text.includes("pairing session not found")) return "配对会话不存在，请让电脑重新生成二维码";
+  if (text.includes("invalid user token")) return "云端令牌已失效，请重新配对";
+  if (text.includes("instance access denied")) return "当前令牌没有访问权限";
+  if (text.includes("instance not found")) return "找不到已配对的电脑";
+  if (text.includes("too many requests")) return "请求过于频繁，请稍后再试";
+  if (text.includes("idempotency key conflicts")) return "该操作与之前的请求冲突，请稍后重试";
+  if (text.includes("unsupported command type")) return "当前版本不支持该操作";
+  if (text.includes("payload must be valid json")) return "操作内容格式不正确或超过大小限制";
+  return raw || `请求失败 (${status})`;
 }
 
 async function cloud<T>(path: string, init?: RequestInit): Promise<T> {
@@ -204,13 +238,19 @@ async function cloud<T>(path: string, init?: RequestInit): Promise<T> {
     response = await fetch(`${cloudURL}${path}`, { ...init, headers, signal: controller.signal });
     const body = await response.json().catch(() => null);
     if (!response.ok) {
-      const message = response.status === 401 ? "云端令牌无效或已过期，请重新输入"
-        : response.status === 403 ? "当前令牌没有访问权限"
-        : response.status === 404 ? "配对会话不存在或配对码错误"
-        : response.status === 410 ? "配对码已过期或已使用"
-        : response.status === 409 ? "配对码已被使用或存在冲突，请让电脑重新生成验证码"
-        : body && typeof body.error === "string" ? body.error : `请求失败 (${response.status})`;
-      throw new Error(message);
+      if (response.status === 401) {
+        // The stored token is unusable: expired, revoked from the desktop, or
+        // never activated because the pairing was not confirmed. Keeping it
+        // would make every later request fail the same way, so drop it and let
+        // the page fall back to the pairing flow.
+        if (localStorage.getItem("milevia.cloud.token")) {
+          localStorage.removeItem("milevia.cloud.token");
+          globalThis.dispatchEvent(new Event("milevia:token-cleared"));
+        }
+        throw new Error("云端令牌已失效或被撤销，请重新配对");
+      }
+      const rawError = body && typeof body.error === "string" ? body.error : "";
+      throw new Error(localizeCloudError(rawError, response.status));
     }
     if (body === null || body === undefined) throw new Error("云端返回格式无效，请稍后重试");
     return body as T;
@@ -301,15 +341,27 @@ export default function MobileRemotePage() {
   const [pairingURL, setPairingURL] = useState("");
   const [pairingQR, setPairingQR] = useState("");
   const [pairingExpanded, setPairingExpanded] = useState(false);
+  const [pairingReadyForConfirm, setPairingReadyForConfirm] = useState(false);
+  const [pairingConfirmed, setPairingConfirmed] = useState(false);
+  // 桌面端远程服务状态：Agent 未注册时云端根本没有这台电脑，二维码无从生成。
+  const [agentStatus, setAgentStatus] = useState<{ ready: boolean; instanceId: string } | null>(null);
+  const [agentEnrollToken, setAgentEnrollToken] = useState("");
+  const [agentEnrollBusy, setAgentEnrollBusy] = useState(false);
+  const [agentEnrollMessage, setAgentEnrollMessage] = useState("");
+  const [agentEnrollWaiting, setAgentEnrollWaiting] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
   const [scanVideo, setScanVideo] = useState<HTMLVideoElement | null>(null);
   const nativeScanListener = useRef<PluginListenerHandle | null>(null);
   const conversationMenuRef = useRef<HTMLDivElement | null>(null);
   const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const manualCodeRef = useRef<HTMLInputElement | null>(null);
   const selectedConversationRef = useRef("");
   const pendingMessageRef = useRef(new Map<string, Map<string, PendingMessage>>());
-  const realtimeMessagesRef = useRef(new Map<string, { conversationId: string; message: Message }>());
+  // revision 记录这条实时消息到达时的快照版本。快照一旦前进到更新的版本，
+  // 就说明云端已经反映了那个时刻的状态（消息仍在，或者已被删除），此时不能再
+  // 把实时消息当作"快照还没包含"补回去，否则电脑端删掉的消息会在手机上复活。
+  const realtimeMessagesRef = useRef(new Map<string, { conversationId: string; message: Message; revision: number }>());
   const creatingProjectRef = useRef("");
   const instancesRequestGenerationRef = useRef(0);
   const snapshotRevisionRef = useRef(-1);
@@ -323,6 +375,20 @@ export default function MobileRemotePage() {
   const notifiedEventIDs = useRef(new Set<string>());
   const [commandState, setCommandState] = useState<CommandState | null>(null);
   const [pendingAccessToken, setPendingAccessToken] = useState("");
+
+  // 桌面端探测电脑端 Agent 是否已注册到云端。未注册时配对无法进行，页面应引导
+  // 用户做一次注册，而不是让用户反复点击注定返回 503 的"生成二维码"。
+  const loadAgentStatus = useCallback(async () => {
+    if (!isDesktop()) return false;
+    try {
+      const value = await api<{ ready?: boolean; instanceId?: string }>("/api/remote/agent-status");
+      setAgentStatus({ ready: Boolean(value?.ready), instanceId: value?.instanceId || "" });
+      return Boolean(value?.ready);
+    } catch {
+      setAgentStatus(null);
+      return false;
+    }
+  }, []);
 
   const markConversationProcessing = useCallback((conversationID: string, snapshotRevision: number) => {
     setProcessingConversations((current) => {
@@ -365,6 +431,9 @@ export default function MobileRemotePage() {
       void claimPairing(scanned.pairingID, scanned.code);
     } else {
       setPairingStatus("已识别配对会话，请输入电脑端显示的 6 位校验码");
+      // 二维码有意不含校验码（避免经浏览器历史或代理日志泄漏），扫码后必须
+      // 人工补输，因此直接聚焦输入框，省掉一次寻找动作。
+      window.setTimeout(() => manualCodeRef.current?.focus(), 0);
     }
     return true;
   }, []);
@@ -530,7 +599,9 @@ export default function MobileRemotePage() {
     const requestGeneration = ++snapshotLoadGenerationRef.current;
     setError("");
     try {
-      const value = await cloud<Snapshot>(`/v1/instances/${encodeURIComponent(instanceID)}/snapshot`);
+      // 带上已知版本号：云端在内容未变化时只回一个小标记，省掉一次全量传输。
+      const value = await cloud<Snapshot & { unchanged?: boolean }>(`/v1/instances/${encodeURIComponent(instanceID)}/snapshot?revision=${snapshotRevisionRef.current}`);
+      if (value?.unchanged) return null;
       if (!value || !Array.isArray(value.projects)) {
         throw new Error("云端返回了无效的项目快照");
       }
@@ -590,7 +661,9 @@ export default function MobileRemotePage() {
               return message;
             });
             const extras = [...realtimeMessages.values()]
-              .filter((item) => item.conversationId === entry.id && !entry.messages.some((message) => message.id === item.message.id))
+              .filter((item) => item.conversationId === entry.id
+                && item.revision >= value.snapshotRevision
+                && !entry.messages.some((message) => message.id === item.message.id))
               .map((item) => {
                 realtimeMessages.delete(item.message.id);
                 return item.message;
@@ -651,7 +724,7 @@ export default function MobileRemotePage() {
       if ((event.type === "user.message" || event.type === "assistant.message") && typeof payload.id === "string" && typeof payload.conversationId === "string" && typeof payload.content === "string") {
         const role: Message["role"] = event.type === "assistant.message" ? "assistant" : "user";
         const realtimeMessage: Message = { id: payload.id, runId: payload.runId, role, content: payload.content, createdAt: payload.createdAt || event.createdAt || new Date().toISOString() };
-        realtimeMessagesRef.current.set(realtimeMessage.id, { conversationId: payload.conversationId, message: realtimeMessage });
+        realtimeMessagesRef.current.set(realtimeMessage.id, { conversationId: payload.conversationId, message: realtimeMessage, revision: snapshotRevisionRef.current });
         if (realtimeMessagesRef.current.size > 500) {
           const oldest = realtimeMessagesRef.current.keys().next().value;
           if (oldest) realtimeMessagesRef.current.delete(oldest);
@@ -700,6 +773,23 @@ export default function MobileRemotePage() {
     }
   }, []);
 
+  // 云端判定令牌不可用时（过期、被电脑端撤销、或配对尚未确认）云请求层会清理
+  // 存储并广播该事件，这里把页面状态一起复位，回到配对流程，避免用户卡在一
+  // 串注定失败的请求里。
+  useEffect(() => {
+    const onTokenCleared = () => {
+      setToken("");
+      setInstances([]);
+      setInstanceID("");
+      setSnapshot(null);
+      setSelectedProject("");
+      setSelectedConversation("");
+      setPairingExpanded(true);
+      setPairingStatus("云端令牌已失效，请重新配对");
+    };
+    globalThis.addEventListener("milevia:token-cleared", onTokenCleared);
+    return () => globalThis.removeEventListener("milevia:token-cleared", onTokenCleared);
+  }, []);
   useEffect(() => {
     if (!token.trim()) return;
     void loadInstances();
@@ -804,6 +894,62 @@ export default function MobileRemotePage() {
     }, 1500);
     return () => window.clearInterval(timer);
   }, [pendingAccessToken, pairingID, loadInstances]);
+  // 桌面端跟踪配对会话：云端只允许在手机提交校验码之后确认，提前点击必然被
+  // 拒绝。让"确认绑定"跟着会话状态启用，用户就不必盲点并对着报错猜原因。
+  useEffect(() => {
+    if (mobileApp || !pairingID.trim() || pairingConfirmed) return;
+    let cancelled = false;
+    const poll = () => {
+      void api<{ status?: string }>(`/api/remote/pairing/status?pairingId=${encodeURIComponent(pairingID.trim())}`)
+        .then((state) => {
+          if (cancelled) return;
+          const status = String(state?.status || "");
+          if (status === "confirmed") {
+            setPairingConfirmed(true);
+            setPairingReadyForConfirm(false);
+            setPairingStatus("已确认绑定，手机可以开始使用");
+          } else if (status === "expired" || status === "cancelled") {
+            setPairingReadyForConfirm(false);
+            setPairingStatus("配对已失效，请重新生成二维码");
+          } else if (status === "claimed") {
+            setPairingReadyForConfirm(true);
+            setPairingStatus("手机已提交校验码，请点击确认绑定");
+          } else {
+            setPairingReadyForConfirm(false);
+          }
+        })
+        .catch(() => undefined);
+    };
+    poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [mobileApp, pairingID, pairingConfirmed]);
+  // 桌面端进入页面时探测一次远程服务状态。
+  useEffect(() => {
+    if (mobileApp) return;
+    void loadAgentStatus();
+  }, [mobileApp, loadAgentStatus]);
+  // 注册是异步的：Agent 子进程要连上云端并回报凭据后才可用，因此注册后轮询到
+  // 就绪或超时为止，让用户看到结果而不是自行猜测。
+  useEffect(() => {
+    if (!agentEnrollWaiting) return;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      attempts += 1;
+      void loadAgentStatus().then((ready) => {
+        if (ready) {
+          setAgentEnrollWaiting(false);
+          setAgentEnrollMessage("远程服务已就绪，现在可以生成二维码了。");
+          return;
+        }
+        if (attempts >= 15) {
+          setAgentEnrollWaiting(false);
+          setAgentEnrollMessage("仍未检测到注册结果，请查看应用数据目录下的 milevia-agent.log 后重试。");
+        }
+      });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [agentEnrollWaiting, loadAgentStatus]);
 
   const instance = instances.find((item) => item.instanceId === instanceID);
   const projects = snapshot?.projects || [];
@@ -1003,19 +1149,87 @@ export default function MobileRemotePage() {
     setBusy(true); setError("");
     try {
       await api(`/api/remote/pairing/confirm`, { method: "POST", body: JSON.stringify({ pairingId: pairingID.trim() }) });
+      setPairingConfirmed(true);
+      setPairingReadyForConfirm(false);
       setPairingStatus("已确认绑定，手机可以开始使用");
     } catch (cause) { setError(cause instanceof Error ? cause.message : "确认绑定失败"); }
     finally { setBusy(false); }
+  }
+
+  // 注册是电脑端的一次性部署动作：令牌只注入本次 Agent 子进程，注册成功后凭据
+  // 由 DPAPI 保存，令牌既不落盘也不会进入后续启动环境。
+  async function enrollRemoteAgent(event: FormEvent) {
+    event.preventDefault();
+    const token = agentEnrollToken.trim();
+    if (!token) return;
+    if (!isDesktop()) {
+      setAgentEnrollMessage("请在 Milevia 桌面应用中完成注册。");
+      return;
+    }
+    setAgentEnrollBusy(true);
+    setAgentEnrollMessage("");
+    try {
+      await invoke("enroll_remote_agent", { enrollmentToken: token });
+      setAgentEnrollToken("");
+      setAgentEnrollMessage("已提交注册，正在等待电脑端连接云端……");
+      setAgentEnrollWaiting(true);
+    } catch (cause) {
+      setAgentEnrollMessage(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setAgentEnrollBusy(false);
+    }
   }
 
   async function createDesktopPairing() {
     setBusy(true); setError("");
     try {
       const value = await api<{ pairingId: string; code: string; pairingURL?: string }>("/api/remote/pairing", { method: "POST" });
-      value.pairingURL = pairingURLWithCode(value.pairingURL, value.pairingId || "");
-      setPairingID(value.pairingId || ""); setPairingCode(value.code || ""); setPairingURL(value.pairingURL || ""); setPairingStatus("二维码已生成，有效期 5 分钟");
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "无法生成配对二维码"); }
+      const qrURL = pairingURLWithCode(value.pairingURL, value.pairingId || "");
+      setPairingID(value.pairingId || "");
+      setPairingCode(value.code || "");
+      setPairingURL(qrURL);
+      setPairingReadyForConfirm(false);
+      setPairingConfirmed(false);
+      if (qrURL) {
+        setPairingStatus("二维码已生成，有效期 5 分钟");
+      } else {
+        // 云端未配置公网地址时只能使用校验码。明确说出来，而不是留一块
+        // 空白让用户反复点击。
+        setPairingStatus("已生成校验码，请在手机上输入下方 6 位数字");
+        setError("云端未配置公网地址（MILEVIA_CLOUD_APP_URL），二维码不可用；请改用校验码配对。");
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法生成配对二维码");
+      // 最常见的原因是 Agent 还没注册，顺手刷新一次状态以便页面给出正确引导。
+      void loadAgentStatus();
+    }
     finally { setBusy(false); }
+  }
+
+  // 解除当前手机的绑定：先请云端吊销这台设备在该实例上的令牌，再清理本地
+  // 状态。云端不可达时仍然完成本地清理——用户的意图是让这台手机停止访问，
+  // 而不是修好一次网络请求，所以本地解绑不能依赖请求成功。
+  async function unbindDevice() {
+    const target = instanceID.trim();
+    setBusy(true); setError("");
+    try {
+      if (target) {
+        await cloud(`/v1/instances/${encodeURIComponent(target)}/revoke`, {
+          method: "POST",
+          body: JSON.stringify({ scope: "mobile" }),
+        });
+      }
+    } catch {
+      // 忽略云端错误：本地已经解除绑定，用户随时可以重新配对。
+    } finally {
+      localStorage.removeItem("milevia.cloud.token");
+      setToken(""); setInstances([]); setInstanceID(""); setSnapshot(null);
+      setSelectedProject(""); setSelectedConversation("");
+      setPairingURL(""); setPairingCode(""); setPairingID("");
+      setPairingStatus("已解除绑定，请重新配对");
+      setPairingExpanded(true);
+      setBusy(false);
+    }
   }
 
   async function createTask(event: FormEvent) {
@@ -1267,15 +1481,16 @@ export default function MobileRemotePage() {
     {editingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-edit-title"><form className="mobile-task-modal" onSubmit={(event) => void saveTaskEdit(event)}><header><h2 id="mobile-task-edit-title">编辑任务</h2><button type="button" onClick={() => setEditingTask(null)} disabled={busy} aria-label="关闭">×</button></header><label>标题<input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} required /></label><label>描述<textarea value={editDescription} onChange={(event) => setEditDescription(event.target.value)} rows={4} /></label><label>优先级<select value={editPriority} onChange={(event) => setEditPriority(event.target.value)}><option value="urgent">紧急</option><option value="high">高</option><option value="normal">普通</option><option value="low">低</option></select></label><footer><button type="button" onClick={() => setEditingTask(null)} disabled={busy}>取消</button><button type="submit" disabled={busy || !editTitle.trim()}>保存</button></footer></form></div>}
     {deletingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-delete-title"><section className="mobile-task-modal mobile-task-delete-modal"><header><h2 id="mobile-task-delete-title">删除任务</h2><button type="button" onClick={() => setDeletingTask(null)} disabled={busy} aria-label="关闭">×</button></header><p>确定删除“{taskSummary(deletingTask)}”吗？删除后无法恢复。</p><footer><button type="button" onClick={() => setDeletingTask(null)} disabled={busy}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmTaskDelete()} disabled={busy}>确认删除</button></footer></section></div>}
     <header className="mobile-remote-header"><div className="mobile-remote-title">{(!mobileApp || mobileView === "conversation") && <button className="mobile-back" type="button" onClick={goBack} title={mobileView === "conversation" ? "返回项目" : "返回"} aria-label={mobileView === "conversation" ? "返回项目" : "返回"}>←</button>}<div className="mobile-brand"><img className="mobile-brand-mark" src="/milevia-mark.svg" width="36" height="36" alt="" /><h1>{mobileApp && mobileView === "conversation" ? (project?.name || "项目对话") : "Milevia"}</h1></div></div><div className="mobile-header-actions">{notificationPermission === "default" && <button className="mobile-notification-button" type="button" onClick={() => void enableMobileNotifications()} title="开启后台通知">开启通知</button>}<button className="mobile-refresh" type="button" onClick={() => { void loadInstances(); void loadSnapshot(); }} title="刷新">刷新</button></div></header>
-    {(!mobileApp || showMobilePairing) && <section className="mobile-pairing"><div><h2>扫码配对</h2><p>{mobileApp ? "扫描电脑上的二维码即可自动完成配对。" : "点击生成二维码，用手机扫码后，再点击确认绑定。"}</p></div>{!mobileApp && <button className="mobile-pairing-generate" onClick={() => void createDesktopPairing()} disabled={busy}>生成二维码</button>}{mobileApp && <button className="mobile-pairing-generate" onClick={() => { scanAccepted.current = false; setScanError(""); setScanning(true); }} disabled={busy || scanning}>扫描二维码</button>}{scanning && <div className="mobile-pairing-scanner-shell"><video className="mobile-pairing-scanner" ref={setScanVideo} muted playsInline /><div className="mobile-pairing-scanner-frame" /><p>将二维码放入框内</p><button className="mobile-pairing-scan-cancel" onClick={() => setScanning(false)}>取消扫描</button></div>}{scanError && <small className="mobile-pairing-scan-error">{scanError}</small>}{pairingQR && <img className="mobile-pairing-qr" src={pairingQR} alt="Milevia 配对二维码" />}{!mobileApp && pairingID && <button className="mobile-pairing-confirm" onClick={() => void confirmDesktopPairing()} disabled={busy}>确认绑定</button>}{pairingStatus && <small>{pairingStatus}</small>}</section>}
-    {mobileApp && showMobilePairing && <section className="mobile-pairing-manual"><h2>使用校验码</h2><p>在电脑端生成校验码后，在此输入 6 位数字。</p><form onSubmit={(event) => void claimPairingByCode(event)}><input inputMode="numeric" pattern="[0-9]{6}" maxLength={6} value={manualPairingCode} onChange={(event) => setManualPairingCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位校验码" aria-label="6 位校验码" /><button type="submit" disabled={busy || manualPairingCode.length !== 6}>验证并配对</button></form>{token.trim() && <button className="mobile-pairing-collapse" type="button" onClick={() => setPairingExpanded(false)}>返回项目</button>}</section>}
+    {!mobileApp && agentStatus && !agentStatus.ready && <section className="mobile-agent-enroll"><div><h2>远程服务未就绪</h2><p>电脑端 Agent 尚未连接到云端，手机此时无法配对。请粘贴管理员提供的部署注册令牌完成一次注册；令牌只在本次注册使用，不会保存到磁盘，也不会进入安装包。</p></div><form onSubmit={(event) => void enrollRemoteAgent(event)}><input type="password" value={agentEnrollToken} onChange={(event) => setAgentEnrollToken(event.target.value)} placeholder="部署注册令牌" aria-label="部署注册令牌" autoComplete="off" /><button type="submit" disabled={agentEnrollBusy || !agentEnrollToken.trim()}>{agentEnrollBusy ? "提交中" : "注册远程服务"}</button></form>{agentEnrollMessage && <small>{agentEnrollMessage}</small>}</section>}
+    {(!mobileApp || showMobilePairing) && <section className="mobile-pairing"><div><h2>扫码配对</h2><p>{mobileApp ? "扫描电脑上的二维码，再输入电脑显示的 6 位校验码，等待电脑确认。" : "点击生成二维码，手机扫码后输入校验码，再点击确认绑定。"}</p></div>{!mobileApp && <button className="mobile-pairing-generate" onClick={() => void createDesktopPairing()} disabled={busy}>生成二维码</button>}{mobileApp && <button className="mobile-pairing-generate" onClick={() => { scanAccepted.current = false; setScanError(""); setScanning(true); }} disabled={busy || scanning}>扫描二维码</button>}{scanning && <div className="mobile-pairing-scanner-shell"><video className="mobile-pairing-scanner" ref={setScanVideo} muted playsInline /><div className="mobile-pairing-scanner-frame" /><p>将二维码放入框内</p><button className="mobile-pairing-scan-cancel" onClick={() => setScanning(false)}>取消扫描</button></div>}{scanError && <small className="mobile-pairing-scan-error">{scanError}</small>}{pairingQR && <img className="mobile-pairing-qr" src={pairingQR} alt="Milevia 配对二维码" />}{!mobileApp && pairingID && <button className="mobile-pairing-confirm" onClick={() => void confirmDesktopPairing()} disabled={busy || !pairingReadyForConfirm}>确认绑定</button>}{pairingStatus && <small>{pairingStatus}</small>}</section>}
+    {mobileApp && showMobilePairing && <section className="mobile-pairing-manual"><h2>使用校验码</h2><p>在电脑端生成校验码后，在此输入 6 位数字。</p><form onSubmit={(event) => void claimPairingByCode(event)}><input ref={manualCodeRef} inputMode="numeric" pattern="[0-9]{6}" maxLength={6} value={manualPairingCode} onChange={(event) => setManualPairingCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位校验码" aria-label="6 位校验码" /><button type="submit" disabled={busy || manualPairingCode.length !== 6}>验证并配对</button></form>{token.trim() && <button className="mobile-pairing-collapse" type="button" onClick={() => setPairingExpanded(false)}>返回项目</button>}</section>}
     {!mobileApp && pairingCode && <div className="mobile-pairing-code">校验码：<strong>{pairingCode}</strong></div>}
     {error && <div className="mobile-error" role="alert">{error}</div>}
     {commandState && <div className={`mobile-command-status ${commandState.status}`}>命令 {commandState.commandId}：{commandState.status}</div>}
     {(!mobileApp || mobileView === "projects") && instance && <section className="mobile-instance-status"><div><strong>{instance.name || instance.instanceId}</strong><span className={`mobile-status ${instance.status}`}>{instance.status}</span></div><small>事件序号 {instance.lastAgentSequence} · {instance.lastSeenAt ? new Date(instance.lastSeenAt).toLocaleString() : "尚未连接"}</small></section>}
     {(!mobileApp || mobileView === "projects") && <section className="mobile-summary"><span><b>{projects.length}</b><small>项目</small></span><span><b>{taskCount}</b><small>任务</small></span></section>}
     {mobileApp && mobileView === "projects" && <section className="mobile-project-picker"><div className="mobile-section-heading"><h2>选择项目</h2><span>{snapshot ? new Date(snapshot.observedAt).toLocaleTimeString() : "加载中"}</span></div>{projects.length === 0 ? <p className="mobile-empty">暂无项目或电脑尚未同步。</p> : projects.map((item) => { const environment = projectEnvironment(item); const running = item.running === true; return <button type="button" className="mobile-project-choice" key={item.id} onClick={() => void openMobileProject(item)} disabled={busy}><span className="mobile-project-choice-content"><strong>{item.name}</strong><span className="mobile-project-choice-status"><span className={`mobile-project-environment ${environment}`} title={`${projectEnvironmentLabel(environment)} 项目`}><ProjectEnvironmentIcon environment={environment} />{projectEnvironmentLabel(environment)}</span><span className={`mobile-project-running ${running ? "running" : "idle"}`}><i></i>{running ? "运行中" : "未运行"}</span></span><small>{item.gitBranch || "默认分支"} · {item.tasks.length} 个任务</small></span><b>{item.conversations?.length || 0} 个会话</b></button>; })}</section>}
-    {mobileApp && mobileView === "projects" && token.trim() && instances.length > 0 && !pairingExpanded && <button className="mobile-repair" type="button" onClick={() => setPairingExpanded(true)}>重新配对此设备</button>}
+    {mobileApp && mobileView === "projects" && token.trim() && instances.length > 0 && !pairingExpanded && <div className="mobile-pairing-actions"><button className="mobile-repair" type="button" onClick={() => setPairingExpanded(true)}>重新配对此设备</button><button className="mobile-unbind" type="button" onClick={() => void unbindDevice()} disabled={busy}>解除绑定</button></div>}
     {mobileApp && mobileView === "conversation" && project && <section className="mobile-conversation"><div className="mobile-conversation-toolbar"><div><h2>{conversation?.title || "暂无会话"}</h2><small>{conversation ? conversationStatusLabel(conversation.status) : "该项目还没有对话"}</small></div><div className="mobile-conversation-toolbar-actions"><div className="mobile-conversation-picker" ref={conversationMenuRef}><button className="mobile-conversation-picker-trigger" type="button" aria-label="选择会话" aria-haspopup="listbox" aria-expanded={conversationMenuOpen} onClick={() => setConversationMenuOpen((open) => !open)} disabled={conversations.length === 0}>{conversation?.title || "暂无会话"}<span aria-hidden="true">⌄</span></button>{conversationMenuOpen && <div className="mobile-conversation-options" role="listbox" aria-label="会话列表">{conversations.map((item) => <button type="button" role="option" aria-selected={item.id === conversation?.id} key={item.id} onClick={() => { setSelectedConversation(item.id); setConversationMenuOpen(false); }}>{item.title || "未命名会话"}<small>{conversationStatusLabel(item.status)}</small></button>)}</div>}</div><button type="button" className="mobile-new-conversation" onClick={() => void createConversationForProject(project)} disabled={busy} title="新建会话">新会话</button><button type="button" className="mobile-task-toggle" onClick={() => setTasksOpen(true)} aria-expanded={tasksOpen}>任务 <span>{project.tasks.length}</span></button></div></div>{conversationProcessing && <div className="mobile-agent-processing" role="status" aria-live="polite"><span className="mobile-agent-processing-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>{conversation ? conversationAgentLabel(conversation.agentId) : "Agent"} 正在处理...</span></div>}<div className="mobile-message-list">{conversation?.messages?.length ? conversation.messages.map((message) => <article className={`mobile-message ${message.role}`} key={message.id}><small>{message.role === "user" ? "我" : "Agent"} · {new Date(message.createdAt).toLocaleString()}</small><div className="mobile-message-markdown markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a> }}>{message.content}</ReactMarkdown></div></article>) : <p className="mobile-empty">{conversation ? "该会话暂无对话内容。" : "请先新建会话。"}</p>}</div>{tasksOpen && <><button type="button" className="mobile-task-drawer-backdrop" aria-label="关闭任务面板" onClick={() => setTasksOpen(false)} /><aside className="mobile-task-drawer" aria-label="任务与操作"><header><div><h3>任务与操作</h3><small>{project.tasks.length} 个任务</small></div><button type="button" onClick={() => setTasksOpen(false)} aria-label="关闭任务面板" title="关闭">×</button></header><nav className="mobile-task-filters" aria-label="任务状态分类" role="tablist">{taskFilters.map((filter) => { const count = filter.id === "all" ? project.tasks.length : project.tasks.filter((task) => task.status === filter.id).length; return <button type="button" role="tab" aria-selected={taskFilter === filter.id} className={taskFilter === filter.id ? "active" : ""} key={filter.id} onClick={() => setTaskFilter(filter.id)}>{filter.label}<span>{count}</span></button>; })}</nav><div className="mobile-task-list">{visibleTasks.length === 0 ? <p className="mobile-empty">当前分类没有任务。</p> : visibleTasks.map((task) => <div className="mobile-task" key={task.id}><div><strong>{taskSummary(task)}</strong><span className={`mobile-task-status ${taskStatusClass(task.status)}`}>{taskStatusLabel(task.status)}</span><small>{task.priority || "normal"}</small><details className="mobile-task-disclosure"><summary>查看详情</summary><p>{task.description?.trim() || "暂无任务描述"}</p><time dateTime={task.updatedAt}>更新于 {new Date(task.updatedAt).toLocaleString()}</time></details></div><div className="mobile-task-actions">{task.status === "todo" || task.status === "action_required" ? <button type="button" disabled={busy} onClick={() => void sendTaskCommand(task.id, "task.dispatch")}>下发</button> : null}{task.status === "awaiting_review" ? <button type="button" disabled={busy} onClick={() => void sendTaskCommand(task.id, "task.review")}>验收</button> : null}{task.status === "running" ? <button type="button" disabled={busy} onClick={() => void sendTaskCommand(task.id, "task.stop")}>停止</button> : null}</div></div>)}</div><div className="mobile-create"><h3>创建任务</h3><form onSubmit={createTask}><label>标题<input value={title} onChange={(event) => setTitle(event.target.value)} required placeholder="要处理的事情" /></label><label>描述<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="补充上下文（可选）" rows={3} /></label><button type="submit" disabled={busy || !title.trim()}>创建并排队</button></form></div></aside></>}<form className="mobile-composer" onSubmit={sendConversationMessage}><textarea ref={messageInputRef} value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversation ? "输入消息..." : "请先新建会话"} aria-label="输入消息" rows={1} disabled={busy || !conversation} /><button type="submit" disabled={busy || !conversation || !messageDraft.trim()} aria-label="发送消息" title="发送消息">↑</button></form></section>}
     {!mobileApp && <section className="mobile-projects"><div className="mobile-section-heading"><h2>项目与任务</h2><span>{snapshot ? new Date(snapshot.observedAt).toLocaleTimeString() : "加载中"}</span></div>{projects.length === 0 ? <p className="mobile-empty">暂无项目或电脑尚未同步。</p> : projects.map((item) => <article className={`mobile-project ${project?.id === item.id ? "selected" : ""}`} key={item.id} role="button" tabIndex={0} aria-expanded={project?.id === item.id} onClick={() => setSelectedProject(item.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedProject(item.id); } }}><header><div><h3>{item.name}</h3><small>{item.gitBranch || "默认分支"}</small></div><span>{item.tasks.length} 个任务</span></header>{project?.id === item.id && <div className="mobile-task-list">{item.tasks.length === 0 ? <p className="mobile-empty">还没有任务。</p> : item.tasks.map((task) => <div className="mobile-task" key={task.id}><div><strong>{task.title}</strong><small>{task.priority} · {task.status}</small></div><div className="mobile-task-actions"><button type="button" disabled={busy} onClick={(event) => { event.stopPropagation(); void sendTaskCommand(task.id, task.status === "running" ? "task.stop" : task.status === "awaiting_review" ? "task.review" : "task.dispatch"); }}>操作</button></div></div>)}</div>}</article>)}</section>}
     {!mobileApp && project && <section className="mobile-create"><h2>创建任务 · {project.name}</h2><form onSubmit={createTask}><label>标题<input value={title} onChange={(event) => setTitle(event.target.value)} required placeholder="要处理的事情" /></label><label>描述<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="补充上下文（可选）" rows={3} /></label><button type="submit" disabled={busy || !title.trim()}>创建并排队</button></form></section>}

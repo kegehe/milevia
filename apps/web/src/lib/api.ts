@@ -22,13 +22,18 @@ export async function api<T>(path: string, init?: RequestInit, retries = retryCo
 export async function apiWithTimeout<T>(path: string, init?: RequestInit, retries = retryCountFor(init), timeoutMs = requestTimeoutMs): Promise<T> {
   let lastError: unknown;
   const signal = init?.signal;
+  // 服务端忙（单 SQLite 连接被长事务占住、SSH/WSL 慢探测等）时，一次 15s 超时
+  // 往往只是瞬时抖动而非服务不可用。幂等方法（GET/HEAD/OPTIONS）最多给一次
+  // 放宽到 2x 的重试机会；仍超时才提示重启，避免单个慢请求误导用户。
+  let timeoutRetried = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const headers = sessionHeaders(init?.headers);
       if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+      const attemptTimeoutMs = timeoutRetried ? timeoutMs * 2 : timeoutMs;
       const controller = new AbortController();
-      const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+      const timeout = globalThis.setTimeout(() => controller.abort(), attemptTimeoutMs);
       const abort = () => controller.abort();
       signal?.addEventListener("abort", abort, { once: true });
       let response: Response;
@@ -40,7 +45,19 @@ export async function apiWithTimeout<T>(path: string, init?: RequestInit, retrie
         });
       } catch (cause) {
         if (controller.signal.aborted && !signal?.aborted) {
-          throw new Error(`控制服务未在 ${Math.round(timeoutMs / 1000)} 秒内响应，请重启 Milevia 后重试。`);
+          // 内部超时触发：重试过一次仍超时（或本次无重试资格）才给出最终错误。
+          const seconds = Math.round(attemptTimeoutMs / 1000);
+          lastError = new Error(
+            timeoutRetried
+              ? `控制服务持续未响应，请重启 Milevia 后重试。`
+              : `控制服务未在 ${seconds} 秒内响应，请稍后重试。`,
+          );
+          if (!timeoutRetried && attempt < retries) {
+            timeoutRetried = true;
+            await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+            continue;
+          }
+          throw lastError;
         }
         throw cause;
       } finally {

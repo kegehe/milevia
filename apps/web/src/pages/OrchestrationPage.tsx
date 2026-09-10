@@ -284,6 +284,21 @@ export default function OrchestrationPage() {
 		.sort((left, right) => left.position - right.position)
 		.map((job) => job.taskId);
 	const showReorderArrows = reorderableTaskIDs.length > 0 && reorderableTaskIDs.length === queuedTaskIDs.length;
+	// 空态可见性：还没有任何「编排任务」/子任务时隐藏子任务分区；候选分区仅在
+	// 确实还有可选任务时出现，避免左侧一列堆叠三行无意义的空提示。
+	const hasPlans = batches.length > 0;
+	const showSubtasksPane = hasPlans || jobs.length > 0;
+	const showCandidatesPane = enqueueableTasks.length > 0;
+	const planEmptyHint = !config?.enabled
+		? "自动编排尚未启用：请先点击上方「配置」启用自动队列，再创建编排任务。"
+		: enqueueableTasks.length > 0
+			? "还没有编排任务：勾选下方候选任务后，点击「+ 新建」创建第一个编排任务。"
+			: "还没有编排任务：可先到「管理任务」新建任务，再回来创建。";
+	const subtasksEmptyHint = activeBatch
+		? enqueueableTasks.length
+			? "该编排任务还没有子任务：可勾选下方候选任务加入。"
+			: "该编排任务还没有子任务：可先到「管理任务」新建任务后再加入。"
+		: "还没有子任务。";
 
   useEffect(() => {
     if (selected?.id === selectedID) return;
@@ -452,12 +467,12 @@ export default function OrchestrationPage() {
       <aside className="orchestration-queue" aria-label="自动编排 — 三级队列视图">
   <header className="orchestration-queue-toolbar"><div className="orchestration-queue-toolbar-top"><h2>自动编排</h2><span>{jobs.length} 条队列记录 · {batches.length} 个编排任务</span></div><button type="button" title="刷新队列" aria-label="刷新队列" disabled={Boolean(busy)} onClick={() => void loadOverview()}>↻</button></header>
   <section className="orchestration-row orchestration-planpane" aria-labelledby="orchestration-plan-title">
-    <header><div><h3 id="orchestration-plan-title">① 编排任务 <i>创作计划</i></h3><span>{batches.length} 个</span></div><button type="button" className="primary" title="新建编排任务" aria-label="新建编排任务" disabled={Boolean(busy) || !config?.enabled} onClick={() => setBatchComposerOpen(true)}>+ 新建</button></header>
-    {batches.length ? <ol className="orchestration-planlist">{batches.map((batch) => <li key={batch.id}><button type="button" className={`orchestration-planitem${batchFilterID === batch.id ? " selected" : ""}`} disabled={Boolean(busy)} onClick={() => void selectPlan(batch.id)} title={batch.name}><span className={`orchestration-status-dot ${batch.status}`} /><span className="orchestration-planitem-main"><b>{batch.name}</b><small>{orchestrationPlanStatusLabel(batch)}</small></span><span className="orchestration-planitem-count">{batch.completedCount}/{batch.taskCount}</span></button></li>)}</ol> : <p className="orchestration-empty">还没有编排任务，点击右上角「新建编排任务」开始自动评审与合并。</p>}
+    <header><div><h3 id="orchestration-plan-title">① 编排任务</h3>{batches.length > 0 && <span>{batches.length} 个</span>}</div><button type="button" className="primary" title="新建编排任务" aria-label="新建编排任务" disabled={Boolean(busy) || !config?.enabled} onClick={() => setBatchComposerOpen(true)}>+ 新建</button></header>
+    {batches.length ? <ol className="orchestration-planlist">{batches.map((batch) => <li key={batch.id}><button type="button" className={`orchestration-planitem${batchFilterID === batch.id ? " selected" : ""}`} disabled={Boolean(busy)} onClick={() => void selectPlan(batch.id)} title={batch.name}><span className={`orchestration-status-dot ${batch.status}`} /><span className="orchestration-planitem-main"><b>{batch.name}</b><small>{orchestrationPlanStatusLabel(batch)}</small></span><span className="orchestration-planitem-count">{batch.completedCount}/{batch.taskCount}</span></button></li>)}</ol> : <p className="orchestration-empty">{planEmptyHint}</p>}
   </section>
-  <section className="orchestration-row orchestration-subtasks" aria-labelledby="orchestration-subtasks-title">
-    <header><div className="orchestration-subtasks-title"><h3 id="orchestration-subtasks-title">② 当前编排任务的子任务</h3>{activeBatch ? <small>{activeBatch.name}</small> : <small>全部子任务</small>}</div><div className="orchestration-subtasks-head-actions">{activeBatch && <button type="button" className="danger-text" title="归档当前编排任务" aria-label="归档并发编排" disabled={Boolean(busy)} onClick={() => setConfirmDeleteBatch(true)}>归档编排任务</button>}<span>{visibleJobs.length} 项</span></div></header>
-    {visibleJobs.length === 0 ? <p className="orchestration-empty">当前编排任务还没有子任务，可在下方候选任务中勾选后加入。</p> : <ol className="orchestration-joblist">{visibleJobs.map((job) => {
+  {showSubtasksPane && <section className="orchestration-row orchestration-subtasks" aria-labelledby="orchestration-subtasks-title">
+    <header><div className="orchestration-subtasks-title"><h3 id="orchestration-subtasks-title">② 子任务</h3></div><div className="orchestration-subtasks-head-actions">{activeBatch && <button type="button" className="danger-text" title="归档当前编排任务" aria-label="归档当前编排任务" disabled={Boolean(busy)} onClick={() => setConfirmDeleteBatch(true)}>归档编排任务</button>}{visibleJobs.length > 0 && <span>{visibleJobs.length} 项</span>}</div></header>
+    {visibleJobs.length === 0 ? <p className="orchestration-empty">{subtasksEmptyHint}</p> : <ol className="orchestration-joblist">{visibleJobs.map((job) => {
       const queueable = job.status === "queued" || job.status === "paused";
       const removable = queueable || job.status === "stopped";
       const reorderIndex = reorderableTaskIDs.indexOf(job.taskId);
@@ -466,9 +481,10 @@ export default function OrchestrationPage() {
         <button type="button" title="下移" aria-label="下移" disabled={Boolean(busy) || reorderIndex < 0 || reorderIndex >= reorderableTaskIDs.length - 1} onClick={() => void moveJob(job.taskId, "down")}>↓</button>
       </>}<button type="button" className="danger" title="移出队列" aria-label="移出队列" disabled={Boolean(busy) || !removable} onClick={() => void queueAction(`dequeue:${job.taskId}`, `/api/tasks/${job.taskId}/orchestration/dequeue`, { method: "DELETE" })}>{busy === `dequeue:${job.taskId}` ? "…" : "×"}</button></div>}</li>;
     })}</ol>}
-  </section>  <section className="orchestration-row orchestration-candidates" aria-labelledby="orchestration-candidates-title">
-    <header><h3 id="orchestration-candidates-title">③ 候选任务 <i>可加入的 todo</i></h3><button type="button" className="secondary" disabled={Boolean(busy) || selectedEnqueue.size === 0} onClick={() => setBatchComposerOpen(true)}>{`加入 (${selectedEnqueue.size})`}</button></header>{enqueueableTasks.length ? <ul>{enqueueableTasks.map((task) => { const summary = candidateSummary(task); return <li key={task.id}><label title={summary}><input type="checkbox" disabled={Boolean(busy)} checked={selectedEnqueue.has(task.id)} onChange={() => toggleEnqueue(task.id)} /><span>{summary}</span></label></li>; })}</ul> : <p className="orchestration-empty">没有可加入队列的任务。</p>}
-  </section>
+  </section>}
+  {showCandidatesPane && <section className="orchestration-row orchestration-candidates" aria-labelledby="orchestration-candidates-title">
+    <header><h3 id="orchestration-candidates-title">③ 候选任务</h3><button type="button" className="secondary" disabled={Boolean(busy) || !config?.enabled || selectedEnqueue.size === 0} onClick={() => setBatchComposerOpen(true)}>{selectedEnqueue.size ? `加入 (${selectedEnqueue.size})` : "加入"}</button></header><ul>{enqueueableTasks.map((task) => { const summary = candidateSummary(task); return <li key={task.id}><label title={summary}><input type="checkbox" disabled={Boolean(busy) || !config?.enabled} checked={selectedEnqueue.has(task.id)} onChange={() => toggleEnqueue(task.id)} /><span>{summary}</span></label></li>; })}</ul>
+  </section>}
 </aside>
       <main className="orchestration-conversation">{selected ? <>
         <header><div><h2>完整对话</h2><span>{messages.length} 条消息</span></div><a href={selected.conversationId ? `/projects/${projectId}/conversations/${selected.conversationId}?readonly=true` : undefined} onClick={(event) => { if (!selected.conversationId) event.preventDefault(); }} aria-disabled={!selected.conversationId}>在对话页打开</a></header>

@@ -6,7 +6,7 @@ const page = await readFile(new URL("./pages/ImportProjectPage.tsx", import.meta
 
 test("Windows-mounted paths are displayed as Windows paths while request paths remain unchanged", () => {
   assert.match(page, /function displayPath\(path: string\): string/);
-  assert.match(page, /\^\(\[a-zA-Z\]\):\[\\\\\/\]\?\$/);
+  assert.match(page, /\^\(\[a-zA-Z\]\):\[\\\\\/\]\*\$/);
   assert.match(page, /\^\\\/mnt\\\/\(\[a-zA-Z\]\)\(\?:\\\/\(\.\*\)\)\?\$/);
   assert.match(page, /return rest \? `\$\{driveLabel\}.*rest\.replaceAll\("\/", "\\\\"\)\}` : driveLabel;/);
   assert.match(page, /<small>\{root\.drives \? root\.drives\.map\(\(drive\) => displayPath\(drive\.path\)\)\.join\("、"\) : displayPath\(root\.path\)\}<\/small>/);

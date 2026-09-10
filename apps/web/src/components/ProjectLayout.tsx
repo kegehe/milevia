@@ -6,6 +6,8 @@ import { Outlet, useParams, useNavigate, useLocation, Navigate } from "react-rou
 import NotificationCenter from "./NotificationCenter";
 import { type Project, type WorkspaceTab, NON_GIT_BRANCH } from "../lib/types";
 import { api } from "../lib/api";
+import { useLiveStateEventsFor } from "./LiveEventsProvider";
+import { literalNameClass } from "../lib/utils";
 import { useProjectContext } from "../stores/useProjectStore";
 
 export interface ProjectLayoutOutletContext {
@@ -122,9 +124,16 @@ export default function ProjectLayout() {
 	// 只调 /api/projects/statuses（纯 SQL 查询），不触发 refreshProjects 的远程探活。
 	useEffect(() => {
 		void refreshStatuses().catch(() => undefined);
-		const interval = window.setInterval(() => { void refreshStatuses().catch(() => undefined); }, 10_000);
+		const interval = window.setInterval(() => { void refreshStatuses().catch(() => undefined); }, 30_000);
 		return () => window.clearInterval(interval);
 	}, [refreshStatuses]);
+	// WS 事件驱动为主：运行起停/会话变化时实时刷新，固定轮询降为 30s 兜底。
+	useLiveStateEventsFor("projects", undefined, useCallback(() => {
+		void refreshStatuses().catch(() => undefined);
+	}, [refreshStatuses]));
+	useLiveStateEventsFor("all", undefined, useCallback(() => {
+		void refreshStatuses().catch(() => undefined);
+	}, [refreshStatuses]));
 
 	// 当前 project 是否对应当前路由的项目 id。
 	// 请求失败且无匹配数据时显示错误页。loading 期间 error 已被清空，不会误触发。
@@ -172,7 +181,7 @@ export default function ProjectLayout() {
     <header className="project-head">
       <div className="project-heading">
         <button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表" onClick={() => guardedNavigate("/")}><BackProjectsIcon /></button>
-        <h2>{project.name}</h2>
+        <h2 className={literalNameClass(project.name)}>{project.name}</h2>
       </div>
       <div className="head-actions-slot">
         <NotificationCenter />

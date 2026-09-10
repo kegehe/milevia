@@ -48,8 +48,9 @@ test("types: 新增 RunStatus/ProjectProcessStatus/RunStatusEvent，ProjectStatu
 });
 
 // App 根部挂载：Provider 树位于 NotificationProvider 与 ProjectProvider 之间
-test("App: 根部挂载 ProcessStatusProvider（Notification → ProcessStatus → Project）", () => {
-  assert.match(app, /<NotificationProvider>\s*\n\s*<ProcessStatusProvider>/);
+test("App: 根部挂载 ProcessStatusProvider 与 LiveEventsProvider（Notification → LiveEvents → ProcessStatus → Project）", () => {
+  assert.match(app, /<NotificationProvider>\s*\n\s*<LiveEventsProvider>/);
+  assert.match(app, /<LiveEventsProvider>\s*\n\s*<ProcessStatusProvider>/);
   assert.match(app, /<ProcessStatusProvider>\s*\n\s*<ProjectProvider>/);
 });
 

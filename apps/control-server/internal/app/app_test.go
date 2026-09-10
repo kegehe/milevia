@@ -3206,7 +3206,7 @@ func TestClaudeCLIArgsUseNewSessionUntilClaudeInit(t *testing.T) {
 
 func TestSSHPermissionArgsKeepReviewsReadOnly(t *testing.T) {
 	for _, permissionMode := range []string{"plan", "read_only"} {
-		args := sshClaudePermissionArgs(permissionMode, "curl example.test")
+		args := sshClaudePermissionArgs(permissionMode, "curl example.test", nil)
 		if args != "--permission-mode plan" {
 			t.Fatalf("%s permission args = %q, want plan mode", permissionMode, args)
 		}

@@ -24,6 +24,7 @@ import (
 
 // wslForwardEnvKeys 是需经 WSLENV 透传到 WSL 内的环境变量名前缀。managedCLIEnvironment
 // 返回的 KEY=VAL 中匹配这些前缀的变量，既设到 wsl.exe 进程 Env，又加入 WSLENV。
+// MCP_ 前缀承载 MCP 配置文件里 ${MCP_SEC_*} 占位符的密钥真值（见 mcp_config.go）。
 var wslForwardEnvKeys = []string{
 	"AUTO_",
 	"ANTHROPIC_",
@@ -31,6 +32,7 @@ var wslForwardEnvKeys = []string{
 	"CODEX_HOME",
 	"CODEX_",
 	"CLAUDE_",
+	"MCP_",
 }
 
 // wslBuildEnv 把 managedCLIEnvironment 产生的 env 列表（KEY=VAL）拆为：
@@ -38,7 +40,14 @@ var wslForwardEnvKeys = []string{
 //   - wslenv：需透传到 WSL 内的变量名列表（用 /u 后缀），拼成 WSLENV 值
 //
 // os.Environ() 已含 PATH/USERPROFILE 等 Windows 变量；额外注入的是 AUTO_*/凭据等。
-func wslBuildEnv(managedEnv []string) (cmdEnv []string, wslenv string) {
+func wslBuildEnv(managedEnv []string, extraForward ...string) (cmdEnv []string, wslenv string) {
+	extra := map[string]bool{}
+	for _, name := range extraForward {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			extra[strings.ToUpper(name)] = true
+		}
+	}
 	var forwarded []string
 	for _, item := range managedEnv {
 		cmdEnv = append(cmdEnv, item)
@@ -47,17 +56,35 @@ func wslBuildEnv(managedEnv []string) (cmdEnv []string, wslenv string) {
 			continue
 		}
 		upper := strings.ToUpper(name)
-		for _, prefix := range wslForwardEnvKeys {
-			if strings.HasPrefix(upper, prefix) {
-				forwarded = append(forwarded, name+"/u")
-				break
+		matched := extra[upper]
+		if !matched {
+			for _, prefix := range wslForwardEnvKeys {
+				if strings.HasPrefix(upper, prefix) {
+					matched = true
+					break
+				}
 			}
+		}
+		if matched {
+			forwarded = append(forwarded, name+"/u")
 		}
 	}
 	if len(forwarded) > 0 {
 		wslenv = strings.Join(forwarded, ":")
 	}
 	return cmdEnv, wslenv
+}
+
+// envNames 从 KEY=VAL 列表中取出变量名。
+func envNames(pairs []string) []string {
+	names := make([]string, 0, len(pairs))
+	for _, item := range pairs {
+		name, _, ok := strings.Cut(item, "=")
+		if ok && strings.TrimSpace(name) != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // wslCodexEnvironment makes the persistent managed CODEX_HOME accessible to
@@ -153,7 +180,7 @@ func wslInnerToken(arg string) string {
 //   - 工作目录在脚本内用 cd 显式设置，绕开 `--cd <linux绝对路径>` 在部分 WSL 版本上
 //     报 Wsl/ERROR_PATH_NOT_FOUND 的问题；
 //   - 每个参数经 wslInnerToken 双引号包裹的 base64 编码，命令替换不被字段切分。
-func (r *wslAgentRunner) wslNativeCommand(ctx context.Context, cli string, args []string, env []string, linuxWorkDir string) *exec.Cmd {
+func (r *wslAgentRunner) wslNativeCommand(ctx context.Context, cli string, args []string, env []string, linuxWorkDir string, extraForward ...string) *exec.Cmd {
 	tokens := make([]string, 0, len(args))
 	for _, a := range args {
 		tokens = append(tokens, wslInnerToken(a))
@@ -167,7 +194,7 @@ func (r *wslAgentRunner) wslNativeCommand(ctx context.Context, cli string, args 
 	if asm != "" {
 		script += " " + asm
 	}
-	cmdEnv, wslenv := wslBuildEnv(env)
+	cmdEnv, wslenv := wslBuildEnv(env, extraForward...)
 	if wslenv != "" {
 		cmdEnv = append(cmdEnv, "WSLENV="+wslenv)
 	}
@@ -197,11 +224,11 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 	if err != nil {
 		return err
 	}
-	environment, profileArgs, closeProfile, err := r.claude.profileLaunch(ctx, request.Profile, []string{
+	environment, profileArgs, closeProfile, err := r.claude.profileLaunch(ctx, request.Profile, append([]string{
 		"AUTO_CONTROL_URL=" + r.claude.config.ControlURL,
 		"AUTO_APPROVAL_RUN_ID=" + request.RunID,
 		"AUTO_APPROVAL_TOKEN=" + request.RunToken,
-	})
+	}, request.MCPEnv...))
 	if err != nil {
 		return err
 	}
@@ -299,13 +326,19 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	if request.Profile != nil && request.Profile.Model != "" {
 		args = append(args, "-c", fmt.Sprintf("model=%q", request.Profile.Model))
 	}
+	// MCP 注入：与本地 Codex 一致走 -c；密钥只写变量名，真值需随 wsl.exe 进程环境并经
+	// WSLENV 透传（变量名是任意的，故显式列入转发名单，见 wslBuildEnv）。
+	args = append(args, request.CodexMCPArgs...)
+	if len(request.MCPEnv) > 0 {
+		environment = append(environment, request.MCPEnv...)
+	}
 	if request.Resume {
 		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
 	} else {
 		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy, request.Prompt)
 	}
 
-	cmd := r.wslNativeCommand(ctx, r.codex.config.CodexPath, args, environment, linuxWorkDir)
+	cmd := r.wslNativeCommand(ctx, r.codex.config.CodexPath, args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -354,11 +387,11 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 	if err != nil {
 		return nil, err
 	}
-	environment, profileArgs, closeProfile, err := r.claude.profileLaunch(ctx, request.Profile, []string{
+	environment, profileArgs, closeProfile, err := r.claude.profileLaunch(ctx, request.Profile, append([]string{
 		"AUTO_CONTROL_URL=" + r.claude.config.ControlURL,
 		"AUTO_APPROVAL_CONVERSATION_ID=" + request.ConversationID,
 		"AUTO_APPROVAL_TOKEN=" + request.ApprovalToken,
-	})
+	}, request.MCPEnv...))
 	if err != nil {
 		return nil, err
 	}

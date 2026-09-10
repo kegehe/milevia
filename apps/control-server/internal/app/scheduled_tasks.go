@@ -232,6 +232,7 @@ func (s *Server) createScheduledTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.broadcastStateEvent(stEvScheduledTasks, projectID)
 	writeJSON(w, http.StatusCreated, task)
 }
 
@@ -274,11 +275,17 @@ func (s *Server) updateScheduledTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.broadcastStateEvent(stEvScheduledTasks, task.ProjectID)
 	writeJSON(w, http.StatusOK, task)
 }
 
 func (s *Server) deleteScheduledTask(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "scheduledTaskID")
+	var projectID string
+	if err := s.db.QueryRowContext(r.Context(), `select project_id from scheduled_tasks where id=?`, id).Scan(&projectID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -316,6 +323,7 @@ func (s *Server) deleteScheduledTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.broadcastStateEvent(stEvScheduledTasks, projectID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -379,6 +387,7 @@ func (s *Server) setScheduledTaskEnabled(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.broadcastStateEvent(stEvScheduledTasks, task.ProjectID)
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -406,6 +415,7 @@ func (s *Server) runScheduledTaskNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.launchScheduledTaskRun(s.runtimeCtx, run.ID)
+	s.broadcastStateEvent(stEvScheduledTasks, task.ProjectID)
 	updated, err := s.scheduledTaskRunByID(r.Context(), run.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1018,6 +1028,14 @@ func (s *Server) claimDueScheduledTaskRuns(ctx context.Context, now time.Time) (
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	// 到点被认领的任务：下次运行时间已推进、且新增了 queued 运行，定时任务页需要刷新。
+	broadcastProjectIDs := map[string]struct{}{}
+	for _, t := range tasks {
+		broadcastProjectIDs[t.ProjectID] = struct{}{}
+	}
+	for projectID := range broadcastProjectIDs {
+		s.broadcastStateEvent(stEvScheduledTasks, projectID)
+	}
 	return claimed, nil
 }
 
@@ -1212,6 +1230,8 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 	if err := tx.Commit(); err != nil {
 		return Conversation{}, err
 	}
+	// 为定时运行新建会话后，列表页的会话数/活跃标题会变化。
+	s.broadcastStateEvent(stEvProjects, conversation.ProjectID)
 	return conversation, nil
 }
 
@@ -1226,6 +1246,10 @@ func (s *Server) failScheduledTaskRun(runID, reason string) {
 	if err == nil && changed == 1 {
 		_, _ = s.db.ExecContext(context.Background(), `update scheduled_tasks set last_run_at=?,updated_at=? where id=(select scheduled_task_id from scheduled_task_runs where id=?)`, now, now, runID)
 		s.notifyScheduledTaskRun(runID)
+		var projectID string
+		if err := s.db.QueryRowContext(context.Background(), `select t.project_id from scheduled_tasks t join scheduled_task_runs r on r.scheduled_task_id=t.id where r.id=?`, runID).Scan(&projectID); err == nil {
+			s.broadcastStateEvent(stEvScheduledTasks, projectID)
+		}
 	}
 }
 

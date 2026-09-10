@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -733,6 +734,142 @@ type sshRunner struct {
 	turnIdleTimeout        time.Duration
 	initialResponseTimeout time.Duration
 	toolResultTimeout      time.Duration
+
+	// MCP 能力探测结果（按 runner 缓存；远端 claude 版本不可控）。
+	mcpMu         sync.Mutex
+	mcpChecked    bool
+	mcpInjectable bool
+	mcpStrictOK   bool
+	mcpVersion    string
+
+	// --bare 探测结果（按 runner 缓存一次；每次 listRunners 都探测代价过高）。
+	bareMu        sync.Mutex
+	bareChecked   bool
+	bareAvailable bool
+}
+
+// BareFlagAvailable 报告远端 CLI 的帮助里是否出现 `--bare`。结果缓存一次。
+// 语义同 claudeCLIRunner.BareFlagAvailable（docs/34 §13）。
+func (r *sshRunner) BareFlagAvailable(ctx context.Context) bool {
+	r.bareMu.Lock()
+	defer r.bareMu.Unlock()
+	if r.bareChecked {
+		return r.bareAvailable
+	}
+	r.bareChecked = true
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := r.client.execCommand(probeCtx, "claude --help")
+	if err != nil && len(out) == 0 {
+		return false
+	}
+	r.bareAvailable = strings.Contains(string(out), "--bare")
+	return r.bareAvailable
+}
+
+// mcpCapability 探测远端 Claude Code 是否支持 MCP 注入。
+//
+// 返回 injectable（是否可注入 --mcp-config）、strictOK（是否启用 --strict-mcp-config）与
+// 探测到的版本。strictOK 与 injectable 同档：只要支持 --mcp-config 就启用 strict。
+//
+// 早期实现把 strict 的硬门槛设为 ≥ 2.1.246（担心旧版会为「不加载的项目级 server」等待
+// 审批、在 -p 下挂起）。但实测 2.1.245 与 2.1.266 在 strict 下行为完全一致——都正确屏蔽
+// 项目 .mcp.json 且都不挂起（见 docs/34 §0.4）。保留该门槛只会让旧版远端白白失去 strict
+// 保护，把一个静默的安全缺口（擅自加载仓库根 .mcp.json）留给「避免一次可见的可用性
+// 风险」。故改为：strict 照常启用，版本低于 2.1.246 时只打一条可见警告。
+// 结果按 runner 缓存，避免每次 run 都拉起一次 claude --version。
+func (r *sshRunner) mcpCapability(ctx context.Context) (injectable bool, strictOK bool, version string) {
+	r.mcpMu.Lock()
+	defer r.mcpMu.Unlock()
+	if r.mcpChecked {
+		return r.mcpInjectable, r.mcpStrictOK, r.mcpVersion
+	}
+	r.mcpChecked = true
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := r.client.execCommand(probeCtx, "claude --version")
+	if err != nil {
+		return false, false, ""
+	}
+	version = normalizeClaudeVersion(strings.TrimSpace(string(out)))
+	r.mcpVersion = version
+	r.mcpInjectable = versionAtLeast(version, 2, 1, 0)
+	r.mcpStrictOK = r.mcpInjectable
+	return r.mcpInjectable, r.mcpStrictOK, r.mcpVersion
+}
+
+// versionAtLeast 比较形如 "2.1.266" 的版本号是否 ≥ major.minor.patch。
+// 解析失败返回 false（不确定一律按不支持处理，避免挂起）。
+func versionAtLeast(version string, major, minor, patch int) bool {
+	fields := strings.SplitN(strings.TrimSpace(version), ".", 3)
+	if len(fields) < 2 {
+		return false
+	}
+	nums := make([]int, 3)
+	for i, field := range fields {
+		if i >= 3 {
+			break
+		}
+		digits := field
+		for j, r := range field {
+			if r < '0' || r > '9' {
+				digits = field[:j]
+				break
+			}
+		}
+		if digits == "" {
+			return false
+		}
+		value := 0
+		for _, r := range digits {
+			value = value*10 + int(r-'0')
+		}
+		nums[i] = value
+	}
+	if nums[0] != major {
+		return nums[0] > major
+	}
+	if nums[1] != minor {
+		return nums[1] > minor
+	}
+	return nums[2] >= patch
+}
+
+// buildRemoteMCPSetup 生成 SSH 远程命令的 MCP 前置脚本与参数片段。
+// 形态与 schemaSetup（runCodex 的 base64 落盘 + trap 清理）同构。
+func buildRemoteMCPSetup(ctx context.Context, r *sshRunner, mcpJSON, mcpKey string, strictRequested bool, sink AgentRunSink) (setup string, arg string) {
+	if mcpJSON == "" {
+		return "", ""
+	}
+	injectable, strictOK, version := r.mcpCapability(ctx)
+	if !injectable {
+		notifyMCPMessage(sink, "远端 Claude Code 不支持 MCP 配置注入，本次已跳过 MCP。")
+		return "", ""
+	}
+	path := "/tmp/milevia-mcp-" + sanitizeMCPRunKey(mcpKey) + ".json"
+	encoded := base64.StdEncoding.EncodeToString([]byte(mcpJSON))
+	setup = fmt.Sprintf("printf '%%s' %s | base64 -d > %s && (chmod 600 %s 2>/dev/null || true) && trap 'rm -f %s' EXIT && ",
+		shellQuote(encoded), shellQuote(path), shellQuote(path), shellQuote(path))
+	arg = " --mcp-config " + shellQuote(path)
+	if strictRequested && strictOK {
+		arg += " --strict-mcp-config"
+		if !versionAtLeast(version, 2, 1, 246) {
+			// 软提示：实测该版本仍正确屏蔽项目 .mcp.json 且不挂起，故不关闭 strict；
+			// 万一遇到启动卡住，这条日志能直接指向远端 CLI 版本。
+			notifyMCPMessage(sink, "远端 Claude Code 版本 "+version+" 低于 2.1.246；已按实测结果照常启用严格模式，若任务启动卡住请升级远端 CLI。")
+		}
+	} else if strictRequested {
+		notifyMCPMessage(sink, "远端 Claude Code 无法启用 MCP 严格模式，本次已关闭以免会话挂起；项目 .mcp.json 的 server 可能被加载。")
+	}
+	return setup, arg
+}
+
+func notifyMCPMessage(sink AgentRunSink, message string) {
+	if sink == nil {
+		log.Printf("mcp: %s", message)
+		return
+	}
+	sink.Event("stderr", mustJSON(map[string]string{"message": message}))
 }
 
 func (r *sshRunner) canonicalProjectPath(ctx context.Context, requested string) (string, error) {
@@ -980,7 +1117,7 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 			request.RunToken,
 		)
 	}
-	permissionArgs := sshClaudePermissionArgs(request.PermissionMode, approvalHookCmd)
+	permissionArgs := sshClaudePermissionArgs(request.PermissionMode, approvalHookCmd, request.MCPAutoApproveTools)
 	if len(request.ReadOnlyTools) > 0 {
 		// 只读执行：default + 仅放行只读工具（与本地 claude runner 一致）。额外用
 		// --settings permissions.deny 把可写/可执行工具从模型工具集里真正移除。
@@ -1010,19 +1147,25 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	}
 	// --allowedTools（只读执行）要求 prompt 经 stdin 提供（`claude ... -` 读 stdin）；
 	// 否则按 argv 传 prompt。
+	// MCP：远端无本地落盘通道，改为在同一 shell 命令内 base64 写入 /tmp 并 trap 清理。
+	mcpSetup, mcpArg := buildRemoteMCPSetup(ctx, r, request.MCPConfigJSON, request.MCPKey, request.StrictMCP, sink)
 	var cmd string
 	if request.PromptViaStdin {
 		cmd = fmt.Sprintf(
-			"cd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json %s %s -",
+			"%scd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json%s %s %s -",
+			mcpSetup,
 			shellQuote(request.ProjectPath),
 			shellQuote(request.Prompt),
+			mcpArg,
 			permissionArgs,
 			sessionArg,
 		)
 	} else {
 		cmd = fmt.Sprintf(
-			"cd %s && claude -p --verbose --output-format stream-json %s %s %s",
+			"%scd %s && claude -p --verbose --output-format stream-json%s %s %s %s",
+			mcpSetup,
 			shellQuote(request.ProjectPath),
+			mcpArg,
 			permissionArgs,
 			sessionArg,
 			shellQuote(request.Prompt),
@@ -1200,7 +1343,7 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 			req.ApprovalToken,
 		)
 	}
-	permissionArgs := sshClaudePermissionArgs(req.PermissionMode, approvalHookCmd)
+	permissionArgs := sshClaudePermissionArgs(req.PermissionMode, approvalHookCmd, req.MCPAutoApproveTools)
 	// Pass the session ID explicitly so the remote CLI resumes the exact
 	// conversation Milevia tracked, instead of relying on the CLI's implicit
 	// "most recent session" behavior (which breaks after the session file ages
@@ -1211,9 +1354,12 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 	} else if req.SessionID != "" {
 		sessionArg = "--session-id " + shellQuote(req.SessionID)
 	}
+	mcpSetup, mcpArg := buildRemoteMCPSetup(ctx, r, req.MCPConfigJSON, req.MCPKey, req.StrictMCP, nil)
 	cmd := fmt.Sprintf(
-		"cd %s && claude -p --verbose --input-format stream-json --output-format stream-json --replay-user-messages %s %s",
+		"%scd %s && claude -p --verbose --input-format stream-json --output-format stream-json --replay-user-messages%s %s %s",
+		mcpSetup,
 		shellQuote(req.ProjectPath),
+		mcpArg,
 		permissionArgs,
 		sessionArg,
 	)
@@ -1268,7 +1414,7 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 	return sshSess, nil
 }
 
-func sshClaudePermissionArgs(permissionMode, approvalHookCmd string) string {
+func sshClaudePermissionArgs(permissionMode, approvalHookCmd string, autoApproveTools []string) string {
 	if permissionMode == "full_control" {
 		return "--dangerously-skip-permissions --permission-mode bypassPermissions"
 	}
@@ -1276,7 +1422,7 @@ func sshClaudePermissionArgs(permissionMode, approvalHookCmd string) string {
 		return "--permission-mode plan"
 	}
 	return fmt.Sprintf("--permission-mode acceptEdits --settings %s",
-		shellQuote(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"`+approvalHookCmd+`","timeout":310}]}]}}`))
+		shellQuote(mcpApprovalHooksSettingsJSON(approvalHookCmd, autoApproveTools)))
 }
 
 // sshAgentSession implements AgentSession for a remote SSH Claude process.

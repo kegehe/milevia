@@ -382,6 +382,7 @@ function ComposerRunnerInfo({ runnerID, agentID, run, runLabel, permissionMode, 
   return (<>
     <span className="composer-status-group">
       <span className={`runner-inline ${runnerStatusClass}${run ? " run-active" : ""}`} title={tool?.reason} role={run ? "status" : undefined} aria-live={run ? "polite" : undefined}><i aria-hidden="true"></i><span>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span></span>
+      {!run && tool?.bare && <span className="runner-inline-warn" title={tool.reason || "该版本已提供 --bare；上游计划将其设为 -p 的默认行为，届时 skills 与项目资产将不再自动发现。"}>--bare 风险</span>}
       {run && <button className="runner-stop" type="button" disabled={readOnly || stopping} onClick={onStop} title={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"} aria-label={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"}><span aria-hidden="true"></span>{stopping ? "停止中" : "停止"}</button>}
       {!run && tool?.status === "ready" && <button className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
       {!run && !updating && hasUpdate && autoUpdatable && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo?.latestVersion}</button>}
@@ -671,9 +672,27 @@ const Markdown = memo(function Markdown({ content }: { content: string }) {
   return <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>, img: MarkdownImage }}>{content}</ReactMarkdown>;
 });
 
+// MCP 工具名形如 mcp__<server>__<tool>；拆出可读的两段，避免界面直接显示原始标识。
+function mcpToolMeta(name: string): { server: string; tool: string } | null {
+  if (!name.startsWith("mcp__")) return null;
+  const rest = name.slice(5);
+  const sep = rest.indexOf("__");
+  if (sep < 0) return { server: rest, tool: "" };
+  return { server: rest.slice(0, sep), tool: rest.slice(sep + 2) };
+}
+
+function toolCardTitle(name: string): string {
+  if (name === "Bash") return "终端命令";
+  const mcp = mcpToolMeta(name);
+  if (mcp) return `MCP 工具调用 · ${mcp.server}`;
+  return name;
+}
+
 const ToolCard = memo(function ToolCard({ action, resolving, decide }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void> }) {
+  const mcp = mcpToolMeta(action.name);
   const command = typeof action.input.command === "string" ? action.input.command : "";
-  const description = typeof action.input.description === "string" ? action.input.description : action.name;
+  const description = typeof action.input.description === "string" ? action.input.description : mcp ? `${mcp.server} · ${mcp.tool}` : action.name;
+  const parameterPreview = mcp && !command ? JSON.stringify(action.input ?? {}, null, 2) : "";
   const approval = action.approval;
   const waiting = approval?.status === "pending" && !action.output;
   const denied = approval?.status === "deny";
@@ -686,7 +705,7 @@ const ToolCard = memo(function ToolCard({ action, resolving, decide }: { action:
   const outputLabel = failed ? isFileChange ? "查看文件变更" : "查看错误输出" : isFileChange ? "查看文件内容" : "查看命令输出";
   const outputPreview = output.replace(/\s+/g, " ").trim().slice(0, 180);
   const statusClass = failed ? "failed" : stopped || denied ? "denied" : waiting ? "pending" : "";
-  return <article className={`tool-card ${waiting ? "waiting" : ""}`}><header><div><span className="tool-icon" aria-hidden="true">{">_"}</span><div><b>{action.name === "Bash" ? "终端命令" : action.name}</b><small>{description}</small></div></div><div className="tool-meta"><time>{formatTime(action.createdAt)}</time><span className={`tool-status ${statusClass}`}>{status}</span></div></header>{command && <pre className="command"><code>{command}</code></pre>}{waiting && approval && <div className="approval-actions"><span>此命令将会在当前项目目录执行。</span><div><button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button><button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button></div></div>}{action.output && (shouldCollapseOutput ? <details><summary>{outputLabel}<span>{outputPreview}</span></summary><pre className="output">{output}</pre></details> : <pre className={`output inline ${failed ? "error-output" : ""}`}>{output}</pre>)}</article>;
+  return <article className={`tool-card ${waiting ? "waiting" : ""}`}><header><div><span className="tool-icon" aria-hidden="true">{">_"}</span><div><b>{toolCardTitle(action.name)}</b><small>{description}</small></div></div><div className="tool-meta"><time>{formatTime(action.createdAt)}</time><span className={`tool-status ${statusClass}`}>{status}</span></div></header>{command && <pre className="command"><code>{command}</code></pre>}{!command && parameterPreview && <pre className="command"><code>{parameterPreview}</code></pre>}{waiting && approval && <div className="approval-actions"><span>{mcp ? "该 MCP 工具调用将由本次会话执行。" : "此命令将会在当前项目目录执行。"}</span><div><button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button><button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button></div></div>}{action.output && (shouldCollapseOutput ? <details><summary>{outputLabel}<span>{outputPreview}</span></summary><pre className="output">{output}</pre></details> : <pre className={`output inline ${failed ? "error-output" : ""}`}>{output}</pre>)}</article>;
 });
 
 function AgentExecutionCard({ execution, open }: { execution: AgentExecution; open: () => void }) {
@@ -758,18 +777,21 @@ function ConversationTabStrip({ state, conversations, workspaceLabels, select, c
 }
 
 function ApprovalBanner({ action, resolving, decide, scrollToCard }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void>; scrollToCard: () => void }) {
+  const mcp = mcpToolMeta(action.name);
   const command = typeof action.input.command === "string" ? action.input.command : "";
   const description = typeof action.input.description === "string" ? action.input.description : "";
+  const fallback = mcp ? `${mcp.server} · ${mcp.tool}` : "";
+  const detail = command || (mcp ? JSON.stringify(action.input ?? {}) : "");
   const approval = action.approval;
   if (!approval) return null;
   return <div className="approval-banner">
     <div className="approval-banner-body">
       <span className="approval-banner-icon">⏳</span>
       <div className="approval-banner-info">
-        <b>等待确认命令执行</b>
-        <span>{description || command}</span>
+        <b>{mcp ? "等待确认 MCP 工具调用" : "等待确认命令执行"}</b>
+        <span>{description || command || fallback}</span>
       </div>
-      <code className="approval-banner-command">{command}</code>
+      {detail && <code className="approval-banner-command">{detail}</code>}
       <div className="approval-banner-actions">
         <button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button>
         <button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button>

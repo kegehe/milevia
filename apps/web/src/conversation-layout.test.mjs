@@ -209,7 +209,7 @@ test("head actions portal into the project header so the canvas grid stays clean
 test("project workspaces expose global request failures", () => {
   assert.match(projectLayout, /const \{ error: globalError, setError: setGlobalError, refreshStatuses \} = useProjectContext\(\);/);
   assert.match(projectLayout, /\{globalError && <div className="error" role="alert"><ErrorAlertIcon \/><span>\{globalError\}<\/span><button type="button" title="关闭错误提示" aria-label="关闭错误提示" onClick=\{\(\) => setGlobalError\(""\)\}><svg[\s\S]*?<\/svg><\/button><\/div>\}/);
-  assert.match(projectLayout, /<button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表"[\s\S]*?<BackProjectsIcon \/><\/button>\s*<h2>\{project\.name\}<\/h2>/);
+  assert.match(projectLayout, /<button className="back-projects" type="button" title="返回项目列表" aria-label="返回项目列表"[\s\S]*?<BackProjectsIcon \/><\/button>\s*<h2[^>]*>\{project\.name\}<\/h2>/);
   assert.doesNotMatch(projectLayout, /<label>\{project\.runner\}<\/label>/);
   assert.doesNotMatch(projectLayout, /<code>\{project\.pathDisplay\}<\/code>/);
 });

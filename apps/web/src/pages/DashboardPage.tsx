@@ -5,11 +5,13 @@ import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useProcessStatusMap } from "../components/ProcessStatusProvider";
+import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import NotificationCenter from "../components/NotificationCenter";
 import type { Project, ProjectFilter, ProjectStatus } from "../lib/types";
 import type { RunStatus } from "../features/run/run-model";
 import { statusColors, statusLabels } from "../features/run/run-model";
 import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order";
+import { literalNameClass } from "../lib/utils";
 import { AppVersionTag } from "../features/updater/AppVersionTag";
 import { isDesktop } from "../lib/runtime";
 import "./dashboard.css";
@@ -45,6 +47,11 @@ function RemotePairingIcon() {
   return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h6v2h-6z" /></svg>;
 }
 
+// MCP 用「插头」意象：外部工具通过 MCP 接入。
+function McpIcon() {
+  return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5" /><rect x="13" y="13" width="7" height="7" rx="1.5" /><path d="M11 7.5h4.5a1.5 1.5 0 0 1 1.5 1.5V11M13 16.5H8.5A1.5 1.5 0 0 1 7 15v-2" /></svg>;
+}
+
 export default function DashboardPage() {
   const { projects, projectStatuses, error, setError, refreshProjects, removeProject, api } = useProjectContext();
   const processStatuses = useProcessStatusMap();
@@ -56,9 +63,15 @@ export default function DashboardPage() {
   useEffect(() => {
     void refreshProjects().catch(() => undefined);
     const mounted = { current: true };
-    const interval = window.setInterval(() => { if (mounted.current) void refreshProjects().catch(() => undefined); }, 10_000);
+    // WS 事件驱动为主：数据变化时由 /ws/events 立即触发刷新；固定轮询降为 30s
+    // 兜底，只覆盖事件丢失 / WS 断连的窗口，避免状态未变化时仍每 10s 发请求。
+    const interval = window.setInterval(() => { if (mounted.current) void refreshProjects().catch(() => undefined); }, 30_000);
     return () => { mounted.current = false; window.clearInterval(interval); };
   }, [refreshProjects]);
+
+  const onRealtime = useCallback(() => { void refreshProjects().catch(() => undefined); }, [refreshProjects]);
+  useLiveStateEventsFor("projects", undefined, onRealtime);
+  useLiveStateEventsFor("all", undefined, onRealtime);
 
   const runningCount = Object.values(projectStatuses).filter((status) => status.running).length;
   const readyCount = projects.filter((project) => project.agentReady && !projectStatuses[project.id]?.running).length;
@@ -151,6 +164,7 @@ export default function DashboardPage() {
         <button type="button" className="dashboard-action dashboard-action-settings secondary" title="设置" aria-label="设置" onClick={() => navigate("/settings")}><SettingsIcon /></button>
         <button type="button" className="dashboard-action dashboard-action-remote secondary" title="远程控制" aria-label="远程控制" onClick={() => navigate("/mobile")}><RemotePairingIcon /><span>远程控制</span></button>
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
+        <button className="dashboard-action dashboard-action-mcp secondary" title="MCP连接" onClick={() => navigate("/mcp-manager")}><McpIcon /><span>MCP连接</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
       </div>
     </header>
@@ -205,6 +219,8 @@ function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, 
       ? `优化建议分析：${analysisTitle}`
       : "等待新的任务";
   const dragClass = isDragging ? " dragging" : isDropTarget ? " drop-target" : "";
+  // 目录名含下划线：标题改等宽渲染，避免 `_` 被正文无衬线字体弱化成“看起来像空格”。
+  const nameLiteral = literalNameClass(project.name);
   // 开发进程状态点徽标：已停止（进程未启动是常态）不显示，仅可视化进行中的状态。
   const runStatusLabel = runStatus !== "stopped" ? statusLabels[runStatus] : null;
   return <article className={`project-card task-card state-${stateClass}${dragClass}`} draggable onClick={open}
@@ -225,8 +241,8 @@ function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, 
         <button className="project-card-delete" type="button" draggable={false} title="删除项目" onClick={(event) => { event.stopPropagation(); onDelete(); }} aria-label={`删除项目 ${project.name}`}>×</button>
       </span>
     </div>
-    <div className="project-card-title"><span>项目</span><h2>{project.name}</h2><p>{taskTitle}</p></div>
-    <div className="project-card-meta"><span><small>会话</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b>{project.pathDisplay}</b></span></div>
+    <div className="project-card-title"><span>项目</span><h2 title={nameLiteral ? project.name : undefined} className={nameLiteral}>{project.name}</h2><p>{taskTitle}</p></div>
+    <div className="project-card-meta"><span><small>会话</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b className={literalNameClass(project.pathDisplay)}>{project.pathDisplay}</b></span></div>
     <footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话<i>→</i></b></footer>
   </article>;
 }

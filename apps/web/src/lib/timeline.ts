@@ -122,7 +122,16 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
       if (part.name === "Agent") continue;
       const input = asRecord(part.input);
       const command = typeof input.command === "string" ? input.command : "";
-      const matched = approvals.find((item) => !usedApprovals.has(item.approval.approvalId) && item.runId === event.runId && typeof item.approval.toolInput.command === "string" && item.approval.toolInput.command === command && new Date(item.createdAt).getTime() >= new Date(event.createdAt).getTime());
+      const toolUseId = String(part.id);
+      // 锚定优先用 tool_use_id（对 Bash 与 MCP 工具都成立）；旧事件没有该字段时
+      // 回退到 Bash 命令文本匹配，兼容历史数据。
+      const matched = approvals.find((item) => {
+        if (usedApprovals.has(item.approval.approvalId) || item.runId !== event.runId) return false;
+        if (new Date(item.createdAt).getTime() < new Date(event.createdAt).getTime()) return false;
+        if (item.approval.toolUseId) return item.approval.toolUseId === toolUseId;
+        const approvalCommand = item.approval.toolInput.command;
+        return typeof approvalCommand === "string" && approvalCommand !== "" && approvalCommand === command;
+      });
       if (matched) usedApprovals.add(matched.approval.approvalId);
       tools.push({
         id: String(part.id),

@@ -2681,3 +2681,26 @@ func TestTruncateInsightLogKeepsValidUTF8(t *testing.T) {
 		t.Fatalf("ascii truncate: %q", got)
 	}
 }
+
+// TestInsightRevisionFailureReason 验证版本快照读取失败被压成简短可读的原因：输出超限 /
+// 超时给出明确归类，gitCommandError 附带 stderr，其它错误回退到叶子系统错误。
+func TestInsightRevisionFailureReason(t *testing.T) {
+	tooLarge := fmt.Errorf("read Git workspace diff: %w", errGitOutputTooLarge)
+	if got := insightRevisionFailureReason(tooLarge); !strings.Contains(got, "大小限制") {
+		t.Fatalf("output-too-large reason = %q", got)
+	}
+	timeout := fmt.Errorf("read Git workspace status: %w", context.DeadlineExceeded)
+	if got := insightRevisionFailureReason(timeout); !strings.Contains(got, "超时") {
+		t.Fatalf("timeout reason = %q", got)
+	}
+	withStderr := &gitCommandError{command: "status", cause: errors.New("exit status 128"), stderr: "fatal: index.lock 已存在"}
+	if got := insightRevisionFailureReason(fmt.Errorf("read Git workspace status: %w", withStderr)); !strings.Contains(got, "index.lock") || !strings.Contains(got, "Git status") {
+		t.Fatalf("gitCommandError reason = %q", got)
+	}
+	if got := insightRevisionFailureReason(errors.New("resolve project Git runner: runner 离线")); !strings.Contains(got, "runner 离线") {
+		t.Fatalf("leaf reason = %q", got)
+	}
+	if got := insightRevisionFailureReason(nil); got != "" {
+		t.Fatalf("nil reason = %q", got)
+	}
+}

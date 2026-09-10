@@ -30,6 +30,10 @@ type wslAgentRunner struct {
 	codex           *codexCLIRunner  // 复用 codex Run 的 profileLaunch/args 组装
 	codexSkillsRoot string           // WSL 用户级 Codex skills 的 Windows UNC 路径
 
+	// --bare 探测结果缓存（每次 listRunners 都探测代价过高）。
+	bareOnce      sync.Once
+	bareAvailable bool
+
 	mu              sync.Mutex
 	claudeAt        time.Time // claudeReady 缓存写入时刻；零值表示未缓存
 	claudeCache     bool      // claudeReady 缓存值
@@ -184,6 +188,19 @@ func (r *wslAgentRunner) CodexReady(parent context.Context) bool { return r.code
 
 // Version implements AgentRunner（Claude 版本）。
 func (r *wslAgentRunner) Version(parent context.Context) string { return r.claudeVersion(parent) }
+
+// BareFlagAvailable implements bareFlagReporter：探测 WSL 内 CLI 是否已提供 --bare。
+// 语义见 claudeCLIRunner.BareFlagAvailable（docs/34 §13）。
+func (r *wslAgentRunner) BareFlagAvailable(ctx context.Context) bool {
+	r.bareOnce.Do(func() {
+		out, err := r.wslBridgeProbe(ctx, "claude --help")
+		if err != nil && out == "" {
+			return
+		}
+		r.bareAvailable = strings.Contains(out, "--bare")
+	})
+	return r.bareAvailable
+}
 
 // CodexVersion implements CodexCapableRunner。
 func (r *wslAgentRunner) CodexVersion(parent context.Context) string { return r.codexVersion(parent) }

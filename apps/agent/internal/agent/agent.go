@@ -58,7 +58,72 @@ type Agent struct {
 	conn                    *websocket.Conn
 	lastSnapshotFingerprint string
 	lastSnapshotSequence    int64
+	lastSnapshotUploadAt    time.Time
 	snapshotReady           bool
+	// credMu guards InstanceID/CloudToken: re-enrollment rewrites them while
+	// the snapshot and outbox goroutines read them concurrently.
+	credMu sync.RWMutex
+	// reEnrollMu serializes re-enrollment attempts and enforces a cooldown so
+	// a burst of rejections cannot trigger a registration storm.
+	reEnrollMu     sync.Mutex
+	lastReEnrollAt time.Time
+}
+
+// reEnrollCooldown bounds how often a rejected credential may be replaced.
+const reEnrollCooldown = 30 * time.Second
+
+// Full snapshot uploads are throttled. One AI reply advances the event
+// sequence many times, and each advance would otherwise push a complete
+// project/history payload to the cloud — and from there to every phone. Live
+// updates already travel over the event stream, so the snapshot only has to
+// converge promptly, not instantly. A burst of events (>= the outstanding
+// threshold) still uploads immediately, keeping large changes responsive.
+const (
+	snapshotMinUploadInterval    = 3 * time.Second
+	snapshotMinOutstandingEvents = 5
+)
+
+// credentials returns the current machine credential under the read lock.
+func (a *Agent) credentials() (string, string) {
+	a.credMu.RLock()
+	defer a.credMu.RUnlock()
+	return a.config.InstanceID, a.config.CloudToken
+}
+
+// setCredentials replaces the machine credential under the write lock.
+func (a *Agent) setCredentials(instanceID, token string) {
+	a.credMu.Lock()
+	defer a.credMu.Unlock()
+	a.config.InstanceID, a.config.CloudToken = instanceID, token
+}
+
+// reEnroll discards a credential the cloud has rejected and registers again.
+// The WebSocket handshake is not the only place a credential is presented —
+// snapshot uploads use plain HTTP — so both paths funnel through here.
+func (a *Agent) reEnroll(ctx context.Context) error {
+	if strings.TrimSpace(a.config.EnrollmentToken) == "" {
+		return errors.New("no enrollment token is available to re-register this machine")
+	}
+	a.reEnrollMu.Lock()
+	defer a.reEnrollMu.Unlock()
+	if !a.lastReEnrollAt.IsZero() && time.Since(a.lastReEnrollAt) < reEnrollCooldown {
+		return errors.New("re-enrollment is cooling down after a recent attempt")
+	}
+	a.lastReEnrollAt = time.Now()
+	a.setCredentials("", "")
+	if a.config.CredentialFile != "" {
+		_ = os.Remove(a.config.CredentialFile)
+	}
+	if err := a.register(ctx); err != nil {
+		return err
+	}
+	// The credential is already durable at this point. Publishing only informs
+	// the desktop UI, and the connect path retries it, so a failure here must
+	// not masquerade as a failed re-enrollment.
+	if err := a.publishCredentials(ctx); err != nil {
+		log.Printf("publish re-enrolled credentials to local control server: %v", err)
+	}
+	return nil
 }
 
 type outboxItem struct {
@@ -91,7 +156,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		return errors.New("cloud URL is required")
 	}
 	a.loadStoredCredential()
-	if a.config.InstanceID == "" || a.config.CloudToken == "" {
+	if instanceID, cloudToken := a.credentials(); instanceID == "" || cloudToken == "" {
 		if err := a.register(ctx); err != nil {
 			return fmt.Errorf("agent registration failed: %w", err)
 		}
@@ -125,10 +190,14 @@ func (a *Agent) publishCredentials(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	instanceID, cloudToken := a.credentials()
+	if instanceID == "" || cloudToken == "" {
+		return errors.New("agent credentials are not available yet")
+	}
 	return a.localPost(ctx, "/api/remote/credentials", map[string]string{
 		"cloudUrl":   cloudURL,
-		"instanceId": a.config.InstanceID,
-		"agentToken": a.config.CloudToken,
+		"instanceId": instanceID,
+		"agentToken": cloudToken,
 	}, nil)
 }
 
@@ -140,12 +209,14 @@ func (a *Agent) loadStoredCredential() {
 	if err != nil {
 		return
 	}
-	if a.config.InstanceID == "" {
-		a.config.InstanceID = credential.InstanceID
+	instanceID, token := a.credentials()
+	if instanceID == "" {
+		instanceID = credential.InstanceID
 	}
-	if a.config.CloudToken == "" {
-		a.config.CloudToken = credential.AgentToken
+	if token == "" {
+		token = credential.AgentToken
 	}
+	a.setCredentials(instanceID, token)
 }
 
 func (a *Agent) register(ctx context.Context) error {
@@ -181,7 +252,7 @@ func (a *Agent) register(ctx context.Context) error {
 	if value.InstanceID == "" || value.AgentToken == "" {
 		return errors.New("cloud returned incomplete agent credentials")
 	}
-	a.config.InstanceID, a.config.CloudToken = value.InstanceID, value.AgentToken
+	a.setCredentials(value.InstanceID, value.AgentToken)
 	if a.config.CredentialFile != "" {
 		if err := saveCredentialFile(a.config.CredentialFile, storedCredential{
 			InstanceID: value.InstanceID,
@@ -194,28 +265,22 @@ func (a *Agent) register(ctx context.Context) error {
 }
 
 func (a *Agent) runConnection(ctx context.Context) error {
-	endpoint, err := cloudWebSocketEndpoint(a.config.CloudURL, a.config.InstanceID)
+	instanceID, cloudToken := a.credentials()
+	endpoint, err := cloudWebSocketEndpoint(a.config.CloudURL, instanceID)
 	if err != nil {
 		return err
 	}
-	header := http.Header{"X-Milevia-Agent-Token": []string{a.config.CloudToken}}
+	header := http.Header{"X-Milevia-Agent-Token": []string{cloudToken}}
 	conn, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
 	if err != nil {
-		if response != nil && response.StatusCode == http.StatusUnauthorized && strings.TrimSpace(a.config.EnrollmentToken) != "" {
+		if response != nil && response.StatusCode == http.StatusUnauthorized {
 			// The cloud may have revoked this machine's credential. Discard the
 			// stale secret and enroll again so the next connection uses a fresh
 			// instance-scoped token.
-			a.config.InstanceID = ""
-			a.config.CloudToken = ""
-			if a.config.CredentialFile != "" {
-				_ = os.Remove(a.config.CredentialFile)
+			if reErr := a.reEnroll(ctx); reErr != nil {
+				return fmt.Errorf("cloud rejected agent credentials (%w); re-enrollment failed: %v", err, reErr)
 			}
-			if registerErr := a.register(ctx); registerErr != nil {
-				return fmt.Errorf("cloud rejected agent credentials (%w); re-enrollment failed: %v", err, registerErr)
-			}
-			if publishErr := a.publishCredentials(ctx); publishErr != nil {
-				return fmt.Errorf("cloud rejected agent credentials (%w); publish re-enrolled credentials: %v", err, publishErr)
-			}
+			return errors.New("re-enrolled after the cloud rejected the previous credential")
 		}
 		return err
 	}
@@ -299,6 +364,14 @@ func (a *Agent) runConnection(ctx context.Context) error {
 		default:
 		}
 	}
+	// Re-publish on every (re)connect. The local control server keeps these
+	// credentials in process memory only, so a publish that failed during the
+	// first connection attempt (local server still starting, port file not yet
+	// readable) would otherwise leave the desktop UI reporting "agent not
+	// ready" until the whole desktop app restarts.
+	if err := a.publishCredentials(connectionCtx); err != nil && connectionCtx.Err() == nil {
+		log.Printf("publish agent credentials to local control server: %v", err)
+	}
 	if err := a.localPost(connectionCtx, "/api/remote/status", map[string]string{"status": "online"}, nil); err != nil {
 		log.Printf("mark local remote status online: %v", err)
 	}
@@ -378,6 +451,13 @@ func (a *Agent) syncSnapshot(ctx context.Context) error {
 		if a.snapshotReady && overview.LastAgentSequence == a.lastSnapshotSequence {
 			return nil
 		}
+		// Throttle the steady drip of full snapshots during a long reply; a
+		// larger backlog uploads right away.
+		if a.snapshotReady &&
+			overview.LastAgentSequence-a.lastSnapshotSequence < snapshotMinOutstandingEvents &&
+			time.Since(a.lastSnapshotUploadAt) < snapshotMinUploadInterval {
+			return nil
+		}
 	}
 	var snapshot json.RawMessage
 	if err := a.localGet(ctx, "/api/remote/snapshot", &snapshot); err != nil {
@@ -401,20 +481,32 @@ func (a *Agent) syncSnapshot(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	instanceID, cloudToken := a.credentials()
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Milevia-Agent-Token", a.config.CloudToken)
-	request.Header.Set("X-Milevia-Instance-ID", a.config.InstanceID)
+	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
+	request.Header.Set("X-Milevia-Instance-ID", instanceID)
 	response, err := a.client.Do(request)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized {
+		// Snapshot uploads use plain HTTP, so they never pass through the
+		// WebSocket handshake that normally detects a revoked credential.
+		// Re-enroll here too; otherwise uploads would fail forever while the
+		// relay connection appeared healthy.
+		if reErr := a.reEnroll(ctx); reErr != nil {
+			return fmt.Errorf("cloud rejected agent credentials (401); re-enrollment failed: %w", reErr)
+		}
+		return errors.New("snapshot upload skipped: credentials were re-enrolled")
+	}
 	if response.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		return fmt.Errorf("cloud snapshot upload failed (%d): %s", response.StatusCode, strings.TrimSpace(string(body)))
 	}
 	a.lastSnapshotFingerprint = fingerprint
 	a.lastSnapshotSequence = sequence
+	a.lastSnapshotUploadAt = time.Now()
 	a.snapshotReady = true
 	return nil
 }
@@ -482,9 +574,24 @@ func (a *Agent) readCommands(ctx context.Context, conn *websocket.Conn, writeCh 
 			var eventAck struct {
 				Kind    string `json:"kind"`
 				EventID string `json:"eventId"`
+				Reason  string `json:"reason"`
 			}
-			if json.Unmarshal(raw, &eventAck) == nil && eventAck.Kind == "event.ack" && eventAck.EventID != "" {
-				_ = a.localPost(ctx, "/api/remote/outbox/ack", map[string]any{"eventIds": []string{eventAck.EventID}}, nil)
+			if json.Unmarshal(raw, &eventAck) == nil && eventAck.EventID != "" {
+				switch eventAck.Kind {
+				case "event.ack":
+					_ = a.localPost(ctx, "/api/remote/outbox/ack", map[string]any{"eventIds": []string{eventAck.EventID}}, nil)
+				case "event.reject":
+					// The cloud reported a durable conflict, so resending this
+					// event can never succeed. Drop it instead of leaving it at
+					// the head of the outbox, where it would block every event
+					// created after it.
+					log.Printf("cloud permanently rejected remote event %s: %s", eventAck.EventID, eventAck.Reason)
+					_ = a.localPost(ctx, "/api/remote/outbox/fail", map[string]any{
+						"eventIds":  []string{eventAck.EventID},
+						"error":     eventAck.Reason,
+						"permanent": true,
+					}, nil)
+				}
 			}
 			continue
 		}

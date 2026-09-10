@@ -1,11 +1,11 @@
 {
-  "version": "0.1.4",
-  "notes": "新增 Android 远程控制端，完善扫码配对、会话与任务操作，并提升桌面端远程连接和运行稳定性。",
-  "pub_date": "2026-09-06T14:16:03.017Z",
+  "version": "0.1.5",
+  "notes": "修复移动端远程控制无法配对的问题，新增远程服务注册引导；电脑离线时拒绝下发指令，长任务不再被误判过期，指令中断可自动恢复，并降低同步流量。",
+  "pub_date": "2026-09-10T12:06:48.404Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczRlZFVtZlJKeVVFU0pQL1NIWFRjUlpXWFMxWU9vWXZGZk81YTFpcFVyNm1kU3ZhVW03Z0orYWJ4SXFoTy96eE9HNHp3aFBDTDUyemZkTU1mRFhTZGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NzA0MTYyCWZpbGU6TWlsZXZpYV8wLjEuNF94NjQtc2V0dXAuZXhlCkRkajJCVmNhcXowQzF5dHp6emNsa0N0dGFZeUJyakFjVkFlUmZpTE51cFlsMHpxeG9UTVRkY21MR1VMelhoOVR5VkpabHN2cVkzVXQzdW9XZWRCc0RnPT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.4/Milevia_0.1.4_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczJra1lCcWhNV2hsN2oybW1RREp3eHBoN3lOOUV2VmtMZnZ0aks2WXJnazFrS0dQa2ZEbWs2bjlUY3NzelVVRFN5T1pJWTlpK1dZdEowSkdlMG5KM0FJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MDQyMDA4CWZpbGU6TWlsZXZpYV8wLjEuNV94NjQtc2V0dXAuZXhlCkdZemE1S0IwalA2Mm5hck5NNXNHMmMxSW1vTXRCK1RhUURiSWhHWkNvczhNSStSUHRhQmpmZ2IreVBOUWIySE9LZCt4cm94SXc0dGIrQ0dLSU1mZUFnPT0K",
+      "url": "https://keyanjia.info:8443/updates/Milevia_0.1.5_x64-setup.exe"
     }
   }
 }

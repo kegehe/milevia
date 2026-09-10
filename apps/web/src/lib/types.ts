@@ -31,7 +31,7 @@ export type ScheduledTaskRun = { id: string; scheduledTaskId: string; scheduledF
 export type ScheduledTask = { id: string; projectId: string; title: string; prompt: string; skills: string[]; agentId: AgentID; permissionMode: PermissionMode; scheduleType: ScheduledTaskScheduleType; timezone: string; runAt?: string; timeOfDay?: string; weekdays: number[]; enabled: boolean; nextRunAt?: string; lastRunAt?: string; createdAt: string; updatedAt: string; lastRun?: ScheduledTaskRun; runs?: ScheduledTaskRun[] };
 export type Event = { id: string; type: string; payload: unknown; runId: string; createdAt: string };
 export type Directory = { name: string; path: string };
-export type Approval = { approvalId: string; status: "pending" | "allow" | "deny"; toolName: string; toolInput: Record<string, unknown> };
+export type Approval = { approvalId: string; status: "pending" | "allow" | "deny"; toolName: string; toolInput: Record<string, unknown>; toolUseId?: string };
 export type ApprovalEvent = { approval: Approval; runId: string; createdAt: string };
 export type ToolOutput = { content: string; isError: boolean };
 export type ToolAction = { id: string; runId: string; name: string; input: Record<string, unknown>; createdAt: string; output?: ToolOutput; approval?: Approval; runStatus?: string };
@@ -39,6 +39,194 @@ export type AgentStatus = "pending" | "running" | "completed" | "failed" | "stop
 export type SSHProfile = { host: string; port: number; user: string; privateKeyPath: string };
 export type SSHConnection = { id: string; name: string; host: string; port: number; user: string; authMethod: "key" | "password"; privateKeyPath?: string; rootPath: string; status: string; lastSeen?: string | null; errorMsg?: string; createdAt?: string };
 export type SSHPreflightResult = { ok: boolean; claudeReady?: boolean; hostKey?: string; fingerprint?: string; checks?: Record<string, boolean>; error?: string; resolved?: SSHProfile };
+export type MCPTransport = "stdio" | "http" | "sse";
+export type MCPScope = "global" | "project";
+export type MCPServer = {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  transport: MCPTransport;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  scope: MCPScope;
+  projectId?: string;
+  environments: string[];
+  agents: string[];
+  enabled: boolean;
+  autoApproveTools?: string[];
+  startupTimeoutSec: number;
+  toolTimeoutSec: number;
+  source: string;
+  createdAt?: string;
+  updatedAt?: string;
+  // 读接口返回：属于加密引用的键名（明文永不回显）。
+  envSecretKeys?: string[];
+  headerSecretKeys?: string[];
+};
+export type MCPProjectView = {
+  projectId: string;
+  environment: string;
+  strictMode: boolean;
+  // 放行项目根目录的 .mcp.json（关闭 strict 的等价开关）。开启后项目自带的 MCP
+  // 配置会一并生效，代价是绕过了 Milevia 的白名单与审计，故需二次确认。
+  allowMcpJson: boolean;
+  // 项目 .mcp.json 中发现的 server 名（仅提示用；未放行时它们不会生效）。
+  mcpJsonServers: string[];
+  effective: { id: string; name: string; displayName: string; transport: MCPTransport; scope: MCPScope; enabled: boolean; origin: MCPScope }[];
+  bindings: MCPProjectBinding[];
+  warnings: string[];
+};
+export type MCPProjectBinding = {
+  serverId: string;
+  serverName: string;
+  displayName: string;
+  scope: MCPScope;
+  enabled: boolean;
+  // overridden 表示该项目显式关掉了这条全局 server（默认无覆盖即启用）。
+  overridden: boolean;
+};
+export type MCPToolFlag = { code: string; label: string; detail?: string; severity: "info" | "warn" | "danger"; note?: string };
+export type MCPToolInfo = {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema?: unknown;
+  // 该工具声明需要用户交互：-p 模式下会被直接拒绝，免审批白名单也覆盖不了。
+  requiresInteraction?: boolean;
+  flags?: MCPToolFlag[];
+};
+// resources / prompts 是 MCP 的可选原语。Claude Code 会用到它们；Codex 仅消费 tools。
+export type MCPResourceInfo = { uri: string; name?: string; title?: string; description?: string; mimeType?: string };
+export type MCPPromptInfo = { name: string; title?: string; description?: string; arguments?: unknown };
+export type MCPTestResult = {
+  ok: boolean;
+  serverId: string;
+  name: string;
+  displayName: string;
+  environment: string;
+  transport: MCPTransport;
+  protocolVersion?: string;
+  serverInfo?: unknown;
+  tools: MCPToolInfo[];
+  resources: MCPResourceInfo[];
+  prompts: MCPPromptInfo[];
+  toolCount: number;
+  flaggedCount: number;
+  durationMs: number;
+  error?: string;
+  hint?: string;
+};
+export type MCPImportSource = { kind: string; path: string; label: string; present: boolean; note?: string };
+export type MCPImportCandidate = {
+  source: string;
+  sourceLabel: string;
+  sourcePath: string;
+  name: string;
+  originalName: string;
+  displayName: string;
+  transport: MCPTransport;
+  command: string;
+  args: string[];
+  url: string;
+  envKeys: string[];
+  headerKeys: string[];
+  secretKeys: string[];
+  agents: string[];
+  scope: MCPScope;
+  projectId?: string;
+  conflict: boolean;
+  conflictWith?: string;
+  skipReason?: string;
+  // 解析到但未导入的键（如 Codex 的 bearer_token_env_var）——提示用户手工补配。
+  warnings?: string[];
+};
+export type MCPImportResult = { candidates: MCPImportCandidate[]; sources: MCPImportSource[]; imported: number; errors?: string[] };
+
+// —— 按环境预览（POST /api/mcp/preview，保存前调用） ——
+export type MCPPreviewInput = {
+  transport: MCPTransport;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  headers: Record<string, string>;
+  environment: string;
+  projectId: string;
+};
+export type MCPPreviewResult = {
+  environment: string;
+  projectPath: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  headers: Record<string, string>;
+  notes: string[];
+};
+
+// —— MCP 远程授权（OAuth 2.1 + PKCE，仅 http / sse） ——
+export type MCPOAuthStatus = {
+  serverId: string;
+  authorized: boolean;
+  scope?: string;
+  tokenType?: string;
+  expiresAt?: string;
+  expired: boolean;
+  hasRefreshToken: boolean;
+  hasClientSecret: boolean;
+  clientId?: string;
+  authorizationEndpoint?: string;
+  tokenEndpoint?: string;
+};
+export type MCPOAuthStart = {
+  flowId: string;
+  authorizationUrl: string;
+  redirectUri: string;
+  scope?: string;
+  clientId?: string;
+};
+export type MCPOAuthFlowStatus = {
+  flowId: string;
+  serverId: string;
+  status: "pending" | "done" | "error";
+  error?: string;
+};
+
+// —— MCP 调用审计 ——
+export type MCPAuditEntry = {
+  id: string;
+  serverName: string;
+  toolName: string;
+  conversationId: string;
+  runId: string;
+  projectId?: string;
+  argsPreview?: string;
+  decision?: string;
+  status?: string;
+  error?: string;
+  durationMs: number;
+  createdAt: string;
+};
+export type MCPAuditResponse = { entries: MCPAuditEntry[]; total: number };
+
+// —— 最近一次注入快照（GET /api/projects/{id}/mcp/status） ——
+export type MCPInjectionServer = { name: string; displayName: string; transport: string; origin: string };
+export type MCPInjectionStatus = {
+  projectId: string;
+  environment: string;
+  agentId: string;
+  strictMode: boolean;
+  serverCount: number;
+  servers: MCPInjectionServer[];
+  note?: string;
+  runKey?: string;
+  updatedAt: string;
+};
 export type AgentLog = { id: string; createdAt: string; kind: "text" | "tool" | "result" | "error"; title: string; detail: string; isError?: boolean };
 export type AgentNode = { id: string; runId: string; parentId?: string; name: string; summary: string; createdAt: string; status: AgentStatus; logs: AgentLog[]; children: AgentNode[] };
 export type AgentExecution = { runId: string; status: string; incomplete: boolean; agents: AgentNode[]; createdAt: string };
@@ -59,7 +247,7 @@ export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?:
 // “新建”和计数都以此为准，不再前端硬编码固定值）。
 export type TerminalSessionList = { sessions: TerminalSessionInfo[]; maxPerProject: number; maxProjects: number };
 
-export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
+export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string; /** CLI 已提供 --bare（上游计划将其设为 -p 默认，届时 skills 不再自动发现）。 */ bare?: boolean };
 export type RunnerInfo = {
   id: string;
   name: string;

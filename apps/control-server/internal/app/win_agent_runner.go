@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,9 @@ import (
 //     taskkill 清理）属 POC 边界，未就绪时如实报中文错误降级，不假装跑在 Windows 侧。
 type windowsAgentRunner struct {
 	config Config
+	// --bare 探测结果缓存（每次 listRunners 都探测代价过高）。
+	bareOnce      sync.Once
+	bareAvailable bool
 }
 
 func newWindowsAgentRunner(config Config) AgentRunner {
@@ -83,6 +87,19 @@ func (r *windowsAgentRunner) CodexReady(parent context.Context) bool { return r.
 
 // Version implements AgentRunner（Claude 版本）。
 func (r *windowsAgentRunner) Version(parent context.Context) string { return r.claudeVersion(parent) }
+
+// BareFlagAvailable implements bareFlagReporter：探测 Windows 侧 CLI 是否已提供 --bare。
+// 语义见 claudeCLIRunner.BareFlagAvailable（docs/34 §13）。
+func (r *windowsAgentRunner) BareFlagAvailable(ctx context.Context) bool {
+	r.bareOnce.Do(func() {
+		out, err := windowsBridgeProbe(ctx, "(claude --help 2>$null) | Out-String")
+		if err != nil && out == "" {
+			return
+		}
+		r.bareAvailable = strings.Contains(out, "--bare")
+	})
+	return r.bareAvailable
+}
 
 // CodexVersion implements CodexCapableRunner。
 func (r *windowsAgentRunner) CodexVersion(parent context.Context) string {

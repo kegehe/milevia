@@ -774,6 +774,10 @@ var insightReadOnlyDenyTools = []string{
 	"TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
 	// 网络检索：分析聚焦项目代码，避免跑题拖慢。
 	"WebFetch", "WebSearch",
+	// MCP 工具：只读分析不注入 MCP；这里再加一条 glob 兜底——即使将来某条只读路径
+	// 漏掉注入控制，deny 规则也会拦下所有 server 的全部 MCP 工具（deny 优先级最高，
+	// 且 hook 返回 allow 不覆盖 deny）。见 docs/34 §8.3。
+	"mcp__*",
 }
 
 // insightReadOnlySettingsJSON 组装只读执行的 --settings JSON（permissions.deny 硬拒
@@ -1222,10 +1226,14 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 		failAll("无法加载项目，请重试")
 		return
 	}
-	revision, err := s.insightWorkspaceRevision(verifyCtx, project)
-	if err != nil {
-		failAll("读取项目版本状态失败，请重试")
-		return
+	revision, revisionErr := s.insightWorkspaceRevision(verifyCtx, project)
+	if revisionErr != nil {
+		if verifyCtx.Err() != nil {
+			failAll("读取项目版本状态失败，请重试")
+			return
+		}
+		// 复核同样不因版本快照读不出而整体失败：降级为非 Git 语义继续推进（原因进日志）。
+		log.Printf("[insights] project=%s verify: read workspace revision failed, continue without version check: %v", projectID, revisionErr)
 	}
 	// 非 Git 项目（Available=false）仍可复核：insightWorkspaceUnchanged 对非 Git 恒返回
 	// unchanged，复核正常推进，只是没有版本一致性对账（repoSHA 为空，run 记录不写 revision）。
@@ -1675,6 +1683,41 @@ func insightRunErrorMessage(prefix string, err error) string {
 	return prefix + "：" + msg
 }
 
+// insightRevisionFailureReason 把读取工作区版本快照失败的底层错误压成一段简短可读的原因，
+// 用于写日志与进度事件附注；取不到可读原因时返回空串，调用方应省略附注。
+func insightRevisionFailureReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, errGitOutputTooLarge):
+		return "Git 输出超过大小限制（工作区改动或未跟踪文件过多）"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "Git 命令执行超时"
+	}
+	var commandErr *gitCommandError
+	if errors.As(err, &commandErr) {
+		if detail := strings.TrimSpace(commandErr.stderr); detail != "" {
+			return "Git " + commandErr.command + "：" + truncateInsightLog(redactAgentText(detail), 160)
+		}
+		return "Git " + commandErr.command + " 执行失败"
+	}
+	// 其它错误（git 可执行文件缺失、路径不可访问等）取最里层的系统错误描述。
+	leaf := err
+	for {
+		next := errors.Unwrap(leaf)
+		if next == nil {
+			break
+		}
+		leaf = next
+	}
+	text := strings.TrimSpace(redactAgentText(leaf.Error()))
+	if text == "" {
+		return ""
+	}
+	return truncateInsightLog(text, 160)
+}
+
 // currentInsightAgent 返回项目当前会话的 agentId（决定扫描/再验证用 claude
 // 还是 codex）；无当前会话或缺省值时回退 claude-code。它不能依赖浏览器窗口的活跃 Tab。
 func (s *Server) currentInsightAgent(ctx context.Context, projectID string) string {
@@ -1859,14 +1902,24 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 		return
 	}
 
-	workspaceRevision, err := s.insightWorkspaceRevision(ctx, project)
-	if err != nil {
-		markFailed("读取项目版本状态失败，请重新发起分析")
-		return
-	}
-	// 非 Git 项目（Available=false）仍可分析：版本一致性检查在 insightWorkspaceUnchanged
-	// 中对非 Git 恒返回 unchanged，分析可正常推进，只是不做跨阶段版本对账（repoSHA 为空）。
-	if !workspaceRevision.Available {
+	workspaceRevision, revisionErr := s.insightWorkspaceRevision(ctx, project)
+	if revisionErr != nil {
+		if ctx.Err() != nil {
+			markFailed("读取项目版本状态失败，请重新发起分析")
+			return
+		}
+		// Git 版本快照读不出来（命令超时 / 输出超限 / Git 报错）时不阻断分析：与非 Git
+		// 项目同一路径继续，只是失去跨阶段版本对账。底层原因写日志并随事件可见，避免
+		// 用户再遇到「读取项目版本状态失败」时无从排查。
+		log.Printf("[insights] project=%s read workspace revision failed, continue without version check: %v", projectID, revisionErr)
+		if reason := insightRevisionFailureReason(revisionErr); reason != "" {
+			emit("warn", "无法读取 Git 版本状态，本次分析将跳过版本一致性校验："+reason)
+		} else {
+			emit("warn", "无法读取 Git 版本状态，本次分析将跳过版本一致性校验")
+		}
+	} else if !workspaceRevision.Available {
+		// 非 Git 项目（Available=false）仍可分析：版本一致性检查在 insightWorkspaceUnchanged
+		// 中对非 Git 恒返回 unchanged，分析可正常推进，只是不做跨阶段版本对账（repoSHA 为空）。
 		emit("info", "当前项目不是 Git 仓库，分析将跳过版本一致性校验")
 	}
 	repoSHA := workspaceRevision.RepoSHA

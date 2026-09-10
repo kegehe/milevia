@@ -39,6 +39,17 @@ type remoteOutboxItem struct {
 	CreatedAt     time.Time       `json:"createdAt"`
 }
 
+// maxRemoteOutboxAttempts bounds delivery retries for a single event. Reaching
+// it removes the event from the delivery window (it stays in the table as a
+// durable record and is reported in the log), which is what stops one
+// permanently undeliverable event from blocking every event behind it.
+const maxRemoteOutboxAttempts = 20
+
+// remoteCommandTimeout bounds one remote command's execution. The command
+// worker is intentionally serial, so an unbounded execution would stall the
+// whole remote queue.
+const remoteCommandTimeout = 60 * time.Second
+
 type remoteSnapshot struct {
 	SnapshotRevision int64                   `json:"snapshotRevision"`
 	ObservedAt       time.Time               `json:"observedAt"`
@@ -183,11 +194,45 @@ create unique index if not exists processed_remote_commands_idempotency
 	return nil
 }
 
+// desktopPairingPaths are the only relay endpoints the desktop page itself
+// calls: generating a pairing QR code and confirming a pairing request. Both
+// describe an action taken by the person sitting at the computer, so they
+// cannot be driven by the Agent's process token alone. Keep this list explicit
+// and tiny — every other relay endpoint must stay Agent-only, otherwise a
+// compromised page session could synthesize Agent sync traffic.
+var desktopPairingPaths = map[string]bool{
+	"/api/remote/pairing":         true,
+	"/api/remote/pairing/confirm": true,
+	"/api/remote/pairing/status":  true,
+	"/api/remote/agent-status":    true,
+}
+
+// validDesktopSession reports whether the request carries the desktop page's
+// one-start session token. Only desktop-api mode issues that token; web mode
+// has no session and must never satisfy this check.
+func (s *Server) validDesktopSession(r *http.Request) bool {
+	if s.config.Mode != "desktop-api" {
+		return false
+	}
+	expected := strings.TrimSpace(s.config.SessionToken)
+	if expected == "" {
+		return false
+	}
+	provided := strings.TrimSpace(r.Header.Get("X-Milevia-Session"))
+	return provided != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
 // remoteAgentOnly keeps the relay API off the public desktop/web surface. A
 // deployment should set AUTO_REMOTE_AGENT_TOKEN; loopback is accepted only as
 // a development fallback when the relay runs beside control-server.
 func (s *Server) remoteAgentOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The desktop page holds the session token, not the Agent token, so
+		// pairing would otherwise be unreachable from the UI that triggers it.
+		if desktopPairingPaths[strings.TrimSuffix(r.URL.Path, "/")] && s.validDesktopSession(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if token := strings.TrimSpace(s.config.RemoteAgentToken); token != "" {
 			provided := r.Header.Get("X-Milevia-Agent-Token")
 			if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
@@ -365,6 +410,61 @@ func (s *Server) confirmRemotePairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, value)
+}
+
+// remotePairingStatus relays the cloud's pairing-session state to the desktop
+// page. The page cannot reach the cloud directly — its origin is the tauri
+// protocol, which the cloud's allowed-origin list rejects — so without this
+// relay the UI cannot tell that the phone has scanned and submitted, and the
+// user is left clicking "confirm" blind.
+func (s *Server) remotePairingStatus(w http.ResponseWriter, r *http.Request) {
+	pairingID := strings.TrimSpace(r.URL.Query().Get("pairingId"))
+	if pairingID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("pairingId is required"))
+		return
+	}
+	cloudURL, _, _ := s.remoteCloudCredentials()
+	if cloudURL == "" {
+		writeError(w, http.StatusServiceUnavailable, errors.New("remote cloud is not configured"))
+		return
+	}
+	// Pairing status carries no secret beyond the random session id, so the
+	// cloud serves it publicly and this relay adds no credential of its own.
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, cloudURL+"/v1/pairings/"+url.PathEscape(pairingID)+"/status", nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("cloud pairing status failed (%d)", response.StatusCode))
+		return
+	}
+	var value any
+	if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+// remoteAgentStatus tells the desktop page whether the computer-side Agent has
+// registered with the cloud and published its credential. Without it the page
+// cannot distinguish "the cloud is unreachable" from "this computer was never
+// enrolled", and clicking "generate QR code" would only ever return 503. The
+// agent token itself is never returned — only whether one exists.
+func (s *Server) remoteAgentStatus(w http.ResponseWriter, r *http.Request) {
+	cloudURL, cloudToken, instanceID := s.remoteCloudCredentials()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ready":      cloudURL != "" && cloudToken != "",
+		"cloudUrl":   cloudURL,
+		"instanceId": instanceID,
+	})
 }
 
 func (s *Server) enqueueRemoteCommand(w http.ResponseWriter, r *http.Request) {
@@ -674,7 +774,12 @@ func (s *Server) remoteOutbox(w http.ResponseWriter, r *http.Request) {
 			limit = parsed
 		}
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from remote_outbox where next_attempt_at is null or next_attempt_at<=? order by agent_sequence limit ?`, time.Now().UTC(), limit)
+	// Events that exhausted their delivery budget stay in the table as a
+	// durable record but leave the delivery window. Without this bound a
+	// single undeliverable event (for example one the cloud permanently
+	// rejects) would sit at the head of this ordered batch forever and starve
+	// every event behind it.
+	rows, err := s.db.QueryContext(r.Context(), `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from remote_outbox where (next_attempt_at is null or next_attempt_at<=?) and attempts < ? order by agent_sequence limit ?`, time.Now().UTC(), maxRemoteOutboxAttempts, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -735,10 +840,15 @@ func (s *Server) ackRemoteOutbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "acknowledged"})
 }
 
+// failRemoteOutbox schedules a retry for an event the cloud refused. With
+// permanent=true the event can never succeed (the cloud reported a durable
+// conflict), so it is dropped instead of being retried until it exhausts the
+// attempt budget and blocks the queue head.
 func (s *Server) failRemoteOutbox(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		EventIDs []string `json:"eventIds"`
-		Error    string   `json:"error"`
+		EventIDs  []string `json:"eventIds"`
+		Error     string   `json:"error"`
+		Permanent bool     `json:"permanent"`
 	}
 	if !decode(w, r, &input) {
 		return
@@ -756,8 +866,22 @@ func (s *Server) failRemoteOutbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	status := "scheduled"
 	for _, id := range input.EventIDs {
-		if strings.TrimSpace(id) == "" {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if input.Permanent {
+			// Keep the rejection visible in the service log; the row itself is
+			// removed so it cannot starve later events.
+			log.Printf("drop undeliverable remote event %s: %s", id, input.Error)
+			if _, err = tx.ExecContext(r.Context(), `delete from remote_outbox where event_id=?`, id); err != nil {
+				_ = tx.Rollback()
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			status = "dropped"
 			continue
 		}
 		_, err = tx.ExecContext(r.Context(), `update remote_outbox set attempts=attempts+1,next_attempt_at=datetime(?, '+' || min(3600, max(5, 5 * (1 << min(attempts, 8)))) || ' seconds'),last_error=? where event_id=?`, now, input.Error, id)
@@ -771,7 +895,7 @@ func (s *Server) failRemoteOutbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "scheduled"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
 }
 
 func (s *Server) getRemoteCommand(w http.ResponseWriter, r *http.Request) {
@@ -903,7 +1027,12 @@ func (s *Server) processOneRemoteCommand(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	result, execErr := s.executeRemoteCommand(ctx, command)
+	// A single worker goroutine drains this queue, so one slow command would
+	// otherwise hold up every command behind it. Bound each execution and let
+	// the failure surface as a normal command failure.
+	execCtx, cancel := context.WithTimeout(ctx, remoteCommandTimeout)
+	result, execErr := s.executeRemoteCommand(execCtx, command)
+	cancel()
 	finalStatus := "completed"
 	if execErr != nil {
 		finalStatus = "failed"

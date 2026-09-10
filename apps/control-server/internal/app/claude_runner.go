@@ -76,6 +76,17 @@ type AgentSessionRequest struct {
 	ConversationID string
 	ApprovalToken  string
 	Profile        *AgentRuntimeProfile
+	// MCP 注入（本地/WSL 用 MCPConfigPath；SSH 用 MCPConfigJSON 在远端落盘）。
+	MCPConfigPath string
+	MCPConfigJSON string
+	MCPKey        string
+	StrictMCP     bool
+	// MCPEnv 是配置文件里 ${MCP_SEC_*} 占位符对应的密钥环境变量（KEY=VAL），
+	// 仅 Windows/WSL 使用；SSH 远端改为 JSON 内联明文，此字段为空。
+	MCPEnv []string
+	// MCPAutoApproveTools 是本次运行生效的自动放行模式，随 --settings 写进
+	// permissions.allow 作为兜底（真正的放行判定在 hook handler 内，见 docs/34 §8.4）。
+	MCPAutoApproveTools []string
 }
 
 type AgentSession interface {
@@ -123,6 +134,22 @@ type AgentRunRequest struct {
 	// OutputSchema constrains one-shot machine-consumed responses when the CLI
 	// supports JSON Schema output. Ordinary conversations leave it empty.
 	OutputSchema json.RawMessage
+	// MCP 注入（本地/WSL 用 MCPConfigPath；SSH 用 MCPConfigJSON 在远端落盘）。
+	// StrictMCP 为真时附加 --strict-mcp-config，只加载此处显式传入的 server。
+	MCPConfigPath string
+	MCPConfigJSON string
+	MCPKey        string
+	StrictMCP     bool
+	// MCPEnv 是配置文件里 ${MCP_SEC_*} 占位符对应的密钥环境变量（KEY=VAL），
+	// 仅 Windows/WSL 使用；SSH 远端改为 JSON 内联明文，此字段为空。
+	MCPEnv []string
+	// CodexMCPArgs 是 Codex 的 MCP 注入参数（`-c mcp_servers.<name>...` 成对出现）。
+	// Codex 没有 --mcp-config，只能经 -c 点号路径注入；密钥走 env_vars（只写变量名，
+	// 真值由 MCPEnv 随进程环境提供），因此 argv 中不出现明文。
+	CodexMCPArgs []string
+	// MCPAutoApproveTools 是本次运行生效的自动放行模式，随 --settings 写进
+	// permissions.allow 作为兜底（真正的放行判定在 hook handler 内，见 docs/34 §8.4）。
+	MCPAutoApproveTools []string
 }
 
 type AgentRunSink interface {
@@ -137,6 +164,35 @@ type claudeCLIRunner struct {
 	// approvalHookOverride 允许跨端 runner（如 wslAgentRunner）注入自定义审批 hook
 	// 命令字符串。nil 时走默认（本机 NativeApprovalHook / sh 逻辑）。
 	approvalHookOverride func() string
+	// bareProbeOnce/bareProbeAvailable 缓存「CLI 是否已提供 --bare」的探测结果。
+	// 探测要拉起一次 `claude --help`，故每个 runner 只做一次（见 BareFlagAvailable）。
+	bareProbeOnce      sync.Once
+	bareProbeAvailable bool
+}
+
+// bareFlagReporter 是可选能力：runner 能报告其 CLI 是否已提供 `--bare`。
+//
+// 上游计划把 `--bare` 设为 `-p` 的默认行为，届时不再自动发现 skills / 项目资产，而
+// Milevia 依赖该自动发现（docs/34 §13）。这里只做「探测 + 告警」，不改变调用参数。
+type bareFlagReporter interface {
+	BareFlagAvailable(ctx context.Context) bool
+}
+
+// BareFlagAvailable 报告 CLI 的帮助里是否出现 `--bare`。结果缓存一次。
+func (r *claudeCLIRunner) BareFlagAvailable(parent context.Context) bool {
+	r.bareProbeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(parent, 8*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, r.config.ClaudePath, "--help")
+		configureProcessGroup(cmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil && len(out) == 0 {
+			// 探测不出来就当没有，避免误报。
+			return
+		}
+		r.bareProbeAvailable = strings.Contains(string(out), "--bare")
+	})
+	return r.bareProbeAvailable
 }
 
 type claudeCLISession struct {
@@ -447,11 +503,11 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	if err != nil {
 		return err
 	}
-	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, []string{
+	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, append([]string{
 		"AUTO_CONTROL_URL=" + r.config.ControlURL,
 		"AUTO_APPROVAL_RUN_ID=" + request.RunID,
 		"AUTO_APPROVAL_TOKEN=" + request.RunToken,
-	})
+	}, request.MCPEnv...))
 	if err != nil {
 		return err
 	}
@@ -540,11 +596,11 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 	if err != nil {
 		return nil, err
 	}
-	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, []string{
+	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, append([]string{
 		"AUTO_CONTROL_URL=" + r.config.ControlURL,
 		"AUTO_APPROVAL_CONVERSATION_ID=" + request.ConversationID,
 		"AUTO_APPROVAL_TOKEN=" + request.ApprovalToken,
-	})
+	}, request.MCPEnv...))
 	if err != nil {
 		return nil, err
 	}
@@ -636,23 +692,9 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 		args = append(args, "--permission-mode", "plan")
 	} else {
 		args = append(args, "--permission-mode", r.config.PermissionMode)
-		settings, err := json.Marshal(map[string]any{
-			"hooks": map[string]any{
-				"PreToolUse": []any{map[string]any{
-					"matcher": "Bash",
-					"hooks": []any{map[string]any{
-						"type":    "command",
-						"command": r.approvalHookCommand(),
-						"timeout": 310,
-					}},
-				}},
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("encode Claude approval settings: %w", err)
-		}
-		args = append(args, "--settings", string(settings))
+		args = append(args, "--settings", mcpApprovalHooksSettingsJSON(r.approvalHookCommand(), request.MCPAutoApproveTools))
 	}
+	args = appendMCPConfigArgs(args, request.MCPConfigPath, request.StrictMCP)
 	if request.SkipSessionID {
 		// 会话无关的一次性只读分析：不带 --session-id/--resume，避免 plan 模式走"待命"分支。
 	} else if request.Resume {
@@ -684,19 +726,9 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 		args = append(args, "--permission-mode", "plan")
 	} else {
 		args = append(args, "--permission-mode", r.config.PermissionMode)
-		settings, err := json.Marshal(map[string]any{
-			"hooks": map[string]any{
-				"PreToolUse": []any{map[string]any{
-					"matcher": "Bash",
-					"hooks":   []any{map[string]any{"type": "command", "command": r.approvalHookCommand(), "timeout": 310}},
-				}},
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("encode Claude approval settings: %w", err)
-		}
-		args = append(args, "--settings", string(settings))
+		args = append(args, "--settings", mcpApprovalHooksSettingsJSON(r.approvalHookCommand(), request.MCPAutoApproveTools))
 	}
+	args = appendMCPConfigArgs(args, request.MCPConfigPath, request.StrictMCP)
 	if request.Resume {
 		args = append(args, "--resume", request.SessionID)
 	} else {
@@ -710,6 +742,77 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 
 func (r *claudeCLIRunner) profileLaunch(_ context.Context, profile *AgentRuntimeProfile, additions []string) ([]string, []string, func(), error) {
 	return managedCLIEnvironment(profile, os.Environ(), additions...), nil, func() {}, nil
+}
+
+// mcpToolHookMatcher 是审批 hook 匹配的工具名：Bash 命令与全部 MCP 工具。
+const mcpToolHookMatcher = "Bash|mcp__.*"
+
+// mcpAuditHookMatcher 是审计回填 hook 匹配的工具名（只覆盖 MCP 工具）。
+const mcpAuditHookMatcher = "mcp__.*"
+
+// mcpApprovalHooksSettingsJSON 生成 --settings 里的 hooks 段。本地、WSL 与 SSH 三条
+// 路径共用，保证三端行为一致。
+//
+// 两个事件共用同一条 hook 命令：
+//   - PreToolUse（Bash 与 MCP）：阻塞等用户裁决；命中自动放行白名单时由服务端直接放行。
+//   - PostToolUse（仅 MCP）：回填调用审计的执行结果。服务端按 hook_event_name 分流后
+//     立即返回，不进入等待。只挂 MCP 是为了不给每次 Bash 调用多付一次网络往返。
+//
+// allowPatterns 是自动放行白名单里的 MCP 模式，同时写进 permissions.allow 作为兜底：
+// 真正的放行判定发生在 hook handler 内部（PreToolUse hook 是权限评估第 1 步且总会触发，
+// allow 规则在第 5 步，永远轮不到），这里只是为将来可能出现的「无 hook 路径」留一层保险
+// （docs/34 §8.4）。
+//
+// 用 json.Marshal 而不是手工拼串：hook 命令里可能含引号与反斜杠（尤其 SSH 的 curl 形态），
+// 手工拼接会生成非法 JSON。
+func mcpApprovalHooksSettingsJSON(command string, allowPatterns []string) string {
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"PreToolUse": []any{map[string]any{
+				"matcher": mcpToolHookMatcher,
+				"hooks":   []any{map[string]any{"type": "command", "command": command, "timeout": 310}},
+			}},
+			"PostToolUse": []any{map[string]any{
+				"matcher": mcpAuditHookMatcher,
+				"hooks":   []any{map[string]any{"type": "command", "command": command, "timeout": 60}},
+			}},
+		},
+	}
+	if allow := mcpPermissionsAllow(allowPatterns); len(allow) > 0 {
+		settings["permissions"] = map[string]any{"allow": allow}
+	}
+	encoded, err := json.Marshal(settings)
+	if err != nil {
+		// 参与编码的只有字符串、整型与字符串切片，实际不可能失败；真出现时退化为
+		// 「不挂 hook」，让任务照常运行而不是整体失败。
+		return "{}"
+	}
+	return string(encoded)
+}
+
+// mcpPermissionsAllow 从自动放行白名单里挑出可写进 permissions.allow 的规则。
+//
+// allow 语法要求 MCP 的 server 段是**字面量**：`mcp__<server>__*` 有效，`mcp__*` 这种
+// 无锚点写法会被忽略并告警，因此这里显式过滤掉。`Bash(...)` 形态照原样透传（allow 支持
+// `Bash(<命令>)` 前缀匹配），使兜底与白名单的语义尽量对齐。
+func mcpPermissionsAllow(patterns []string) []string {
+	out := []string{}
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		switch {
+		case pattern == "":
+			continue
+		case strings.HasPrefix(pattern, "mcp__"):
+			if !strings.Contains(strings.TrimPrefix(pattern, "mcp__"), "__") {
+				continue
+			}
+		case pattern == "Bash" || strings.HasPrefix(pattern, "Bash("):
+		default:
+			continue
+		}
+		out = append(out, pattern)
+	}
+	return dedupeStrings(out)
 }
 
 func (r *claudeCLIRunner) approvalHookCommand() string {

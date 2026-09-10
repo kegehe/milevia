@@ -6,6 +6,7 @@ import { ProjectProvider } from "./stores/useProjectStore";
 import { UIPreferencesProvider } from "./stores/useUIPreferences";
 import { NotificationProvider } from "./components/NotificationProvider";
 import { ProcessStatusProvider } from "./components/ProcessStatusProvider";
+import { LiveEventsProvider } from "./components/LiveEventsProvider";
 import { TooltipProvider } from "./components/TooltipProvider";
 import DashboardPage from "./pages/DashboardPage";
 import ImportProjectPage from "./pages/ImportProjectPage";
@@ -21,6 +22,7 @@ import InsightsPage from "./pages/InsightsPage";
 import FilesPage from "./pages/FilesPage";
 import AgentProfilesPage from "./pages/AgentProfilesPage";
 import SettingsPage from "./pages/SettingsPage";
+import McpManagerPage from "./pages/McpManagerPage";
 import TerminalPage from "./pages/TerminalPage";
 import MobileRemotePage from "./pages/MobileRemotePage";
 import { UpdateBanner } from "./features/updater/UpdateBanner";
@@ -66,6 +68,7 @@ export function App() {
       <TooltipProvider>
         <UIPreferencesProvider>
           <NotificationProvider>
+            <LiveEventsProvider>
             <ProcessStatusProvider>
               <ProjectProvider>
                 <NavigationBridge />
@@ -74,6 +77,7 @@ export function App() {
                   <Route path="/" element={<DashboardPage />} />
                   <Route path="/projects/import" element={<ImportProjectPage />} />
                   <Route path="/ssh-manager" element={<SSHManagerPage />} />
+                  <Route path="/mcp-manager" element={<McpManagerPage />} />
                   <Route path="/agent-profiles" element={<AgentProfilesPage />} />
                   <Route path="/settings" element={<SettingsPage />} />
                   <Route path="/mobile" element={<MobileRemotePage />} />
@@ -98,6 +102,7 @@ export function App() {
                 </Routes>
               </ProjectProvider>
             </ProcessStatusProvider>
+            </LiveEventsProvider>
           </NotificationProvider>
         </UIPreferencesProvider>
       </TooltipProvider>

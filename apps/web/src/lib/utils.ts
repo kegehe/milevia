@@ -12,6 +12,12 @@ export function contentToText(value: unknown): string {
   return value == null ? "" : String(value);
 }
 
+// 目录/仓库名常含下划线；正文无衬线字体下 `_` 太细又贴基线，容易被误读成空格。
+// 这类“字面目录名”统一挂 .literal-name（等宽渲染），保证下划线清晰可辨。
+export function literalNameClass(name: string | undefined | null): string | undefined {
+  return name && name.includes("_") ? "literal-name" : undefined;
+}
+
 export function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });

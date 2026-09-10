@@ -68,6 +68,10 @@ const (
 	httpReadTimeout                      = 30 * time.Second
 	httpIdleTimeout                      = 60 * time.Second
 	maxHTTPHeaderBytes                   = 1 << 20
+	// 默认慢请求日志阈值。http.Server 没有 WriteTimeout，handler 可以无限挂起
+	// 而不留任何现场；此阈值用于在请求仍卡住时把端点名打出来（可用环境变量
+	// MILEVIA_SLOW_REQUEST_LOG 覆盖，值为 time.ParseDuration 格式）。
+	defaultSlowRequestLogThreshold = 10 * time.Second
 )
 
 func ConfigFromEnv() Config {
@@ -249,6 +253,15 @@ type Server struct {
 	sessionMu              sync.Mutex
 	streamMu               sync.Mutex
 	approvals              map[string]*approvalWaiter
+	// mcpAutoApprove 保存各会话本次运行生效的 MCP 自动放行模式（按 conversationID）。
+	// hook handler 据此直接返回 allow，避免重建 pending（settings.permissions.allow 无效）。
+	mcpAutoApprove map[string][]string
+	// mcpOAuthFlows 保存进行中的远程 MCP OAuth 授权流程（按随机 state 索引）。
+	// 流程本身不落盘：发起后由用户在浏览器完成授权，回调命中即写入 token 并清理。
+	mcpOAuthFlows map[string]*mcpOAuthFlow
+	// mcpLastInject 记录每个项目最近一次 MCP 注入快照，供 GET /api/projects/{id}/mcp/status。
+	// 仅内存态：它是「当前运行了什么」的观测，不是用户配置。
+	mcpLastInject          map[string]projectMCPStatus
 	usageMu                sync.Mutex
 	runUsage               map[string]*runUsageAccumulator
 	runManagers            map[string]projectRunnerInterface
@@ -261,6 +274,8 @@ type Server struct {
 	processStatusSubMu     sync.Mutex
 	processStatusSequences map[string]uint64
 	processStatusEpoch     uint64
+	stateEventSubs         map[*websocket.Conn]*stateEventSubscriber
+	stateEventSubMu        sync.Mutex
 	notificationMu         sync.Mutex
 	remoteCommandWake      chan struct{}
 	orchestrationMu        sync.Mutex
@@ -341,6 +356,8 @@ type activeAgentSession struct {
 	stopping      bool
 	runIDs        map[string]struct{}
 	lastUsedAt    time.Time
+	// mcpCleanup 释放本次会话落盘的 MCP 运行时配置（会话结束时调用）。
+	mcpCleanup func()
 }
 
 // streamingSetup closes the gap between committing a streaming Run and
@@ -667,7 +684,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -700,6 +717,8 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		return nil, err
 	}
 	s.startRemoteCommandWorker()
+	// 清理上次异常退出遗留的 MCP 运行时临时配置（正常路径由 defer 删除）。
+	s.cleanupStaleMCPRuntimeFiles()
 	if err := s.recoverInterruptedScheduledTasks(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
@@ -776,6 +795,7 @@ func (s *Server) Close() {
 		s.closeAllRunLogSubscribers()
 		s.closeAllNotificationSubscribers()
 		s.closeAllProcessStatusSubscribers()
+		s.closeAllStateEventSubscribers()
 		if s.terminals != nil {
 			s.terminals.closeAll()
 		}
@@ -908,9 +928,44 @@ func (s *Server) newHTTPServer() *http.Server {
 	}
 }
 
+// slowRequestLogger 记录长时间未返回的 HTTP 请求（含仍卡住、尚未返回的）。
+// 服务端没有 WriteTimeout，handler 理论上可以无限挂起；这类在途检测能在请求
+// 还卡着的时候把端点名打到 stderr（桌面 dev 会回显 [control-server]），用于
+// 定位前端"控制服务未在 15 秒内响应"类超时的真实慢端点。
+// WebSocket 升级请求 hijack 后生命周期等于整条连接，天然长命，跳过；OPTIONS
+// 是 CORS 预检，也跳过。
+func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
+	threshold := durationFromEnv("MILEVIA_SLOW_REQUEST_LOG", defaultSlowRequestLogThreshold)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions || websocket.IsWebSocketUpgrade(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		started := time.Now()
+		finished := make(chan struct{})
+		defer close(finished)
+		go func() {
+			timer := time.NewTimer(threshold)
+			defer timer.Stop()
+			select {
+			case <-finished:
+			case <-timer.C:
+				log.Printf("[slow-request] %s %s still running after %s",
+					r.Method, r.URL.EscapedPath(), time.Since(started).Round(time.Millisecond))
+			}
+		}()
+		next.ServeHTTP(w, r)
+		if elapsed := time.Since(started); elapsed >= threshold {
+			log.Printf("[slow-request] %s %s completed in %s",
+				r.Method, r.URL.EscapedPath(), elapsed.Round(time.Millisecond))
+		}
+	})
+}
+
 func (s *Server) routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.cors)
+	r.Use(s.slowRequestLogger)
 	r.Use(s.requireSession)
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -924,6 +979,8 @@ func (s *Server) routes() http.Handler {
 		remote.Get("/snapshot", s.remoteSnapshot)
 		remote.Post("/pairing", s.createRemotePairing)
 		remote.Post("/pairing/confirm", s.confirmRemotePairing)
+		remote.Get("/pairing/status", s.remotePairingStatus)
+		remote.Get("/agent-status", s.remoteAgentStatus)
 		remote.Post("/status", s.updateRemoteStatus)
 		remote.Get("/outbox", s.remoteOutbox)
 		remote.Post("/outbox/ack", s.ackRemoteOutbox)
@@ -1096,12 +1153,14 @@ func (s *Server) routes() http.Handler {
 	r.Get("/ws/projects/{projectID}/terminal/{sessionID}", s.terminalWebSocket)
 	r.Get("/ws/notifications", s.subscribeNotifications)
 	r.Get("/ws/processes", s.subscribeProcessStatuses)
+	r.Get("/ws/events", s.subscribeStateEvents)
 	r.Get("/api/notifications", s.listNotifications)
 	r.Post("/api/notifications/{notificationID}/dismiss", s.dismissNotification)
 	r.Post("/api/notifications/dismiss-all", s.dismissAllNotifications)
 	r.Get("/api/system/storage", s.getStorageUsage)
 	r.Post("/api/system/storage/cleanup", s.cleanupStorage)
 	s.registerSSHRoutes(r)
+	s.registerMCPRoutes(r)
 	s.registerFSRoutes(r)
 	if s.config.Mode == "web" && s.config.WebRoot != "" {
 		r.NotFound(s.serveWebApp)
@@ -1170,6 +1229,14 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		// session. The handler validates this separate, per-run secret before it
 		// creates an approval waiter.
 		if r.URL.Path == "/api/internal/approvals/wait" && r.Header.Get("X-Auto-Approval-Token") != "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The MCP OAuth callback is a top-level browser navigation, so it cannot
+		// carry the desktop session header. It is guarded by the per-flow random
+		// state instead: redeeming the authorization code requires a state value
+		// that only the flow initiator and this server know.
+		if r.URL.Path == mcpOAuthCallbackPath {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1410,6 +1477,21 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	}
 	if err := s.migrateAppPreferences(ctx); err != nil {
 		return fmt.Errorf("migrate application preferences: %w", err)
+	}
+	if err := migrateMCPServers(ctx, s.db); err != nil {
+		return fmt.Errorf("migrate mcp servers: %w", err)
+	}
+	if err := migrateMCPProjectBindings(ctx, s.db); err != nil {
+		return fmt.Errorf("migrate mcp project bindings: %w", err)
+	}
+	if err := migrateMCPProjectSettings(ctx, s.db); err != nil {
+		return fmt.Errorf("migrate mcp project settings: %w", err)
+	}
+	if err := migrateMCPOAuthTokens(ctx, s.db); err != nil {
+		return fmt.Errorf("migrate mcp oauth tokens: %w", err)
+	}
+	if err := migrateMCPCallAudit(ctx, s.db); err != nil {
+		return fmt.Errorf("migrate mcp call audit: %w", err)
 	}
 	if err := s.migratePersistedRunners(ctx); err != nil {
 		return fmt.Errorf("migrate persisted runners: %w", err)
@@ -3005,6 +3087,8 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		Payload:        mustJSON(map[string]string{"conversationId": c.ID, "projectId": c.ProjectID}),
 		CreatedAt:      c.CreatedAt,
 	})
+	// 新建会话会改变列表页的会话数与活跃标题。
+	s.broadcastStateEvent(stEvProjects, c.ProjectID)
 	writeJSON(w, http.StatusCreated, c)
 }
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
@@ -4891,7 +4975,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		// 放在后台 goroutine 内执行：WSL/SSH 探测默认模型可能需拉起远程进程，
 		// 不阻塞发送请求的 Accepted 响应。
 		s.seedRunUsageModel(runID, conversation.AgentID, profile, runnerObj)
-		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectPath, content)
+		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectRunner, projectPath, content)
 	}()
 	return m, runID, record, http.StatusAccepted, nil
 }
@@ -5116,25 +5200,37 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	}
 	s.mu.Unlock()
 	token := uuid.NewString()
-	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile})
+	// 新建持久会话时才生成 MCP 配置（会话内工具集固定，运行中的会话不热更新）。
+	mcpKey := "sess-" + conversation.ID
+	injection := s.prepareMCPInjection(ctx, conversation.ProjectID, projectPath, conversation.AgentID, runnerID, mcpKey)
+	s.setMCPAutoApprove(conversation.ID, injection.AutoApproveTools)
+	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools})
 	if err != nil {
+		injection.done()
+		s.clearMCPAutoApprove(conversation.ID)
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		agent.Stop()
+		injection.done()
+		s.clearMCPAutoApprove(conversation.ID)
 		return nil, err
 	}
-	managed := &activeAgentSession{agent: agent, approvalToken: token, runnerID: runnerID, agentID: conversation.AgentID, config: newConversationSessionConfig(runnerID, conversation, profile, projectPath), configSet: true, runIDs: map[string]struct{}{runID: {}}, lastUsedAt: s.sessionManager.now()}
+	managed := &activeAgentSession{agent: agent, approvalToken: token, runnerID: runnerID, agentID: conversation.AgentID, config: newConversationSessionConfig(runnerID, conversation, profile, projectPath), configSet: true, runIDs: map[string]struct{}{runID: {}}, lastUsedAt: s.sessionManager.now(), mcpCleanup: injection.cleanup}
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
 		agent.Stop()
+		injection.done()
+		s.clearMCPAutoApprove(conversation.ID)
 		return nil, errors.New("control service is shutting down")
 	}
 	setup := s.streamingSetups[runID]
 	if setup == nil || setup.cancelled {
 		s.mu.Unlock()
 		agent.Stop()
+		injection.done()
+		s.clearMCPAutoApprove(conversation.ID)
 		return nil, context.Canceled
 	}
 	s.sessions[conversation.ID] = managed
@@ -5176,8 +5272,14 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 		delete(s.streamingSetups, runID)
 	}
 	delete(s.sessions, conversationID)
+	cleanup := managed.mcpCleanup
+	managed.mcpCleanup = nil
 	s.mu.Unlock()
 	s.streamMu.Unlock()
+	s.clearMCPAutoApprove(conversationID)
+	if cleanup != nil {
+		cleanup()
+	}
 	status := "failed"
 	runErr := errors.New("streaming agent session ended unexpectedly")
 	if stopping {
@@ -5193,8 +5295,12 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 	}
 }
 
-func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, profile *AgentRuntimeProfile, projectPath, prompt string) {
+func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, profile *AgentRuntimeProfile, runnerID, projectPath, prompt string) {
+	injection := s.prepareMCPInjection(ctx, c.ProjectID, projectPath, c.AgentID, runnerID, runID)
+	defer injection.done()
+	s.setMCPAutoApprove(c.ID, injection.AutoApproveTools)
 	defer func() {
+		s.clearMCPAutoApprove(c.ID)
 		s.unregisterProfileRunCancel(runID)
 		s.discardRunUsage(runID)
 		s.resolveRunApprovals(runID, "deny")
@@ -5205,15 +5311,22 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		s.mu.Unlock()
 	}()
 	err := runner.Run(ctx, AgentRunRequest{
-		SessionID:      c.sessionID(),
-		ProjectPath:    projectPath,
-		Prompt:         prompt,
-		PermissionMode: c.executionPolicy(),
-		Resume:         c.initialized(),
-		RunID:          runID,
-		RunToken:       runToken,
-		AgentID:        c.AgentID,
-		Profile:        profile,
+		SessionID:           c.sessionID(),
+		ProjectPath:         projectPath,
+		Prompt:              prompt,
+		PermissionMode:      c.executionPolicy(),
+		Resume:              c.initialized(),
+		RunID:               runID,
+		RunToken:            runToken,
+		AgentID:             c.AgentID,
+		Profile:             profile,
+		MCPConfigPath:       injection.localConfigPath(),
+		MCPConfigJSON:       injection.remoteJSON(),
+		MCPKey:              runID,
+		StrictMCP:           injection.Strict,
+		MCPEnv:              injection.Env,
+		CodexMCPArgs:        injection.CodexArgs,
+		MCPAutoApproveTools: injection.AutoApproveTools,
 	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, agentID: c.AgentID})
 	status := "completed"
 	if ctx.Err() != nil {
@@ -5406,6 +5519,11 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 		}
 		if scheduledRun, err := s.scheduledTaskRunByRunID(s.runtimeCtx, runID); err == nil {
 			s.notifyScheduledTaskRun(scheduledRun.ID)
+			if task, taskErr := s.scheduledTaskByID(s.runtimeCtx, scheduledRun.ScheduledTaskID); taskErr == nil {
+				s.broadcastStateEvent(stEvScheduledTasks, task.ProjectID)
+				// 定时运行结束会把该运行对应会话置闲，列表页 running/活跃标题随之变化。
+				s.broadcastStateEvent(stEvProjects, task.ProjectID)
+			}
 		}
 	}
 }
@@ -5607,14 +5725,20 @@ func (s *Server) waitForApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		ToolName  string          `json:"tool_name"`
-		ToolInput json.RawMessage `json:"tool_input"`
+		HookEventName string          `json:"hook_event_name"`
+		ToolName      string          `json:"tool_name"`
+		ToolInput     json.RawMessage `json:"tool_input"`
+		ToolUseID     string          `json:"tool_use_id"`
+		ToolResponse  json.RawMessage `json:"tool_response"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	if input.ToolName != "Bash" || len(input.ToolInput) == 0 {
-		writeError(w, http.StatusBadRequest, errors.New("only Bash tool approvals are supported"))
+	// 审批通道同时服务 Bash 与 MCP 工具（mcp__ 前缀）。MCP 工具若不命中审批 hook 就
+	// 会在 -p 非交互下被直接拒绝，因此这一放开是 MCP 功能能否跑通的前提，而非加固。
+	// 其余工具名仍被拒绝，避免校验被放得过宽。见 docs/34 §8。
+	if !isApprovableToolName(input.ToolName) || len(input.ToolInput) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("only Bash and MCP tool approvals are supported"))
 		return
 	}
 	approvalID := uuid.NewString()
@@ -5643,35 +5767,65 @@ func (s *Server) waitForApproval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	for _, active := range s.approvals {
-		if active.runID == runID {
-			s.mu.Unlock()
-			writeError(w, http.StatusConflict, errors.New("another command is already awaiting approval"))
-			return
-		}
+	// PostToolUse 复用同一条 hook 命令（见 mcpApprovalHooksSettingsJSON）：它只用于回填
+	// 调用审计的执行结果，不需要等待裁决，记录后立即返回空对象。
+	if input.HookEventName == "PostToolUse" {
+		s.mu.Unlock()
+		status, detail := mcpToolResultStatus(input.ToolResponse)
+		s.recordMCPCallFinish(r.Context(), conversationID, runID, input.ToolUseID, input.ToolName, status, detail)
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	// 自动放行白名单：命中即直接返回 allow，不产生 pending 事件、不弹审批。
+	// 必须在 hook handler 内判定——PreToolUse hook 是权限评估第 1 步且总会触发，
+	// 写在 settings.permissions.allow 里的规则永远轮不到（见 docs/34 §8.4）。
+	if patterns := s.runMCPAutoApprove(conversationID); mcpAutoApproveAllows(patterns, input.ToolName, input.ToolInput) {
+		s.mu.Unlock()
+		// 自动放行同样是一次真实调用，一并计入审计（decision=auto_allow）。
+		s.recordMCPCallStart(r.Context(), conversationID, runID, input.ToolUseID, input.ToolName, "auto_allow", input.ToolInput)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"hookSpecificOutput": map[string]any{
+				"hookEventName":            "PreToolUse",
+				"permissionDecision":       "allow",
+				"permissionDecisionReason": "工具调用已命中自动放行白名单（由项目操作者配置）。",
+			},
+		})
+		return
 	}
 	waiter.conversationID = conversationID
 	s.approvals[approvalID] = waiter
 	s.mu.Unlock()
 
-	pending := map[string]any{"approvalId": approvalID, "status": "pending", "toolName": input.ToolName, "toolInput": json.RawMessage(input.ToolInput)}
+	// 参数经上限截断后再落事件：MCP 工具参数可能极大（如整份文件内容），原样写入会话
+	// 事件会撑大数据库并拖慢前端。command 键保留原文，前端靠它锚定审批横幅（docs/34 §9）。
+	pending := map[string]any{"approvalId": approvalID, "status": "pending", "toolName": input.ToolName, "toolInput": truncateApprovalToolInput(input.ToolInput), "toolUseId": input.ToolUseID}
 	s.appendEvent(runID, conversationID, "approval.pending", mustJSON(pending))
 	decision := "deny"
+	// auditDecision 记录「为什么是这个结果」：用户裁决 / 客户端断开 / 超时。
+	auditDecision := "timeout"
 	select {
 	case decision = <-waiter.decision:
+		auditDecision = decision
 	case <-r.Context().Done():
+		auditDecision = "aborted"
 	case <-time.After(5 * time.Minute):
+		auditDecision = "timeout"
 	}
 	s.mu.Lock()
 	delete(s.approvals, approvalID)
 	s.mu.Unlock()
-	result := map[string]any{"approvalId": approvalID, "status": decision, "toolName": input.ToolName, "toolInput": json.RawMessage(input.ToolInput)}
+	s.recordMCPCallStart(r.Context(), conversationID, runID, input.ToolUseID, input.ToolName, auditDecision, input.ToolInput)
+	result := map[string]any{"approvalId": approvalID, "status": decision, "toolName": input.ToolName, "toolInput": truncateApprovalToolInput(input.ToolInput), "toolUseId": input.ToolUseID}
 	s.appendEvent(runID, conversationID, "approval."+decision, mustJSON(result))
+	reason := "Command " + decision + " by the project operator."
+	if strings.HasPrefix(input.ToolName, "mcp__") {
+		reason = "MCP tool call " + decision + " by the project operator."
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"hookSpecificOutput": map[string]any{
 			"hookEventName":            "PreToolUse",
 			"permissionDecision":       decision,
-			"permissionDecisionReason": "Command " + decision + " by the project operator.",
+			"permissionDecisionReason": reason,
 		},
 	})
 }
@@ -6311,7 +6465,7 @@ func (s *Server) wslLocalMeta() RunnerMeta {
 func (s *Server) windowsLocalMeta() RunnerMeta {
 	roots := []RootEntry{}
 	for drive := 'C'; drive <= 'Z'; drive++ {
-		path := string(drive) + `:\\`
+		path := string(drive) + `:\`
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
 			roots = append(roots, RootEntry{Name: "Windows (" + string(drive) + ":)", Path: path, Label: "windows"})
 		}
@@ -6356,10 +6510,20 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 				status = "updating"
 			}
 			s.runnerMaintenanceMu.Unlock()
-			entry["claude"] = map[string]string{
+			claudeEntry := map[string]any{
 				"status":  status,
 				"version": v,
 			}
+			// --bare 风险告警：上游计划把它设为 -p 的默认行为，届时 skills / 项目资产不再
+			// 自动发现，而 Milevia 依赖该自动发现（docs/34 §13）。探测结果按 runner 缓存，
+			// 只在 CLI 确实已提供 --bare 时告警——不猜版本号。
+			if v != "" && status == "ready" {
+				if reporter, ok := runner.(bareFlagReporter); ok && reporter.BareFlagAvailable(r.Context()) {
+					claudeEntry["bare"] = true
+					claudeEntry["reason"] = "该版本已提供 --bare；上游计划将其设为 -p 的默认行为，届时 skills 与项目资产将不再自动发现。"
+				}
+			}
+			entry["claude"] = claudeEntry
 		}
 		codexStatus := "unavailable"
 		codexVersion := ""
@@ -6786,6 +6950,8 @@ func (s *Server) projectRunManagerForWorkspace(ctx context.Context, project Proj
 	}
 	runner.setStatusListener(func(RunStatusEvent) {
 		s.broadcastProjectProcessStatus(projectID)
+		// 运行/停止切换通常伴随会话状态与活跃标题变化，顺带广播项目状态聚合失效信号。
+		s.broadcastStateEvent(stEvProjects, projectID)
 	})
 	s.runManagers[key] = runner
 	return runner, nil
