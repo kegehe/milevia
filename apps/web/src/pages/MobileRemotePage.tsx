@@ -11,6 +11,7 @@ import type { PluginListenerHandle } from "@capacitor/core";
 import { BarcodeFormat, BarcodeScanner, LensFacing } from "@capacitor-mlkit/barcode-scanning";
 import { invoke } from "@tauri-apps/api/core";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
+import { checkMobileUpdate, type MobileUpdateState } from "../features/updater/mobile-update";
 import "./mobile-remote.css";
 
 type Instance = { instanceId: string; name: string; status: string; lastAgentSequence: number; lastSeenAt?: string };
@@ -312,6 +313,8 @@ export default function MobileRemotePage() {
   // 使用移动端项目选择/对话布局，避免被桌面分支误判。
   const mobileApp = Capacitor.isNativePlatform() || !isDesktop();
   const [token, setToken] = useState(() => localStorage.getItem("milevia.cloud.token") || "");
+  const [mobileUpdate, setMobileUpdate] = useState<MobileUpdateState | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
   const [instances, setInstances] = useState<Instance[]>([]);
   const [instanceID, setInstanceID] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -878,6 +881,20 @@ export default function MobileRemotePage() {
   useEffect(() => {
     documentVisibleRef.current = documentVisible;
   }, [documentVisible]);
+
+  // 启动后在后台查一次手机端有没有新版本。Android 包没法自己下载安装，所以这里
+  // 只把结果做成一条横幅，点「立即更新」交给系统浏览器下载（见 mobile-update.ts）。
+  // 失败一律静默：更新提醒不值得在启动路径上打扰用户，也不该让页面出现红字。
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    const controller = new AbortController();
+    void checkMobileUpdate(controller.signal)
+      .then((next) => {
+        if (next) setMobileUpdate(next);
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, []);
   useEffect(() => {
     if (!token.trim()) return;
     void loadInstances();
@@ -1671,6 +1688,7 @@ export default function MobileRemotePage() {
     {editingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-edit-title"><form className="mobile-task-modal" onSubmit={(event) => void saveTaskEdit(event)}><header><h2 id="mobile-task-edit-title">编辑任务</h2><button type="button" onClick={() => setEditingTask(null)} disabled={busy} aria-label="关闭">×</button></header><label>标题<input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} required /></label><label>描述<textarea value={editDescription} onChange={(event) => setEditDescription(event.target.value)} rows={4} /></label><label>优先级<select value={editPriority} onChange={(event) => setEditPriority(event.target.value)}><option value="urgent">紧急</option><option value="high">高</option><option value="normal">普通</option><option value="low">低</option></select></label><footer><button type="button" onClick={() => setEditingTask(null)} disabled={busy}>取消</button><button type="submit" disabled={busy || !editTitle.trim()}>保存</button></footer></form></div>}
     {deletingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-delete-title"><section className="mobile-task-modal mobile-task-delete-modal"><header><h2 id="mobile-task-delete-title">删除任务</h2><button type="button" onClick={() => setDeletingTask(null)} disabled={busy} aria-label="关闭">×</button></header><p>确定删除“{taskSummary(deletingTask)}”吗？删除后无法恢复。</p><footer><button type="button" onClick={() => setDeletingTask(null)} disabled={busy}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmTaskDelete()} disabled={busy}>确认删除</button></footer></section></div>}
     <header className="mobile-remote-header"><div className="mobile-remote-title">{(!mobileApp || mobileView === "conversation") && <button className="mobile-back" type="button" onClick={goBack} title={mobileView === "conversation" ? "返回项目" : "返回"} aria-label={mobileView === "conversation" ? "返回项目" : "返回"}>←</button>}<div className="mobile-brand"><img className="mobile-brand-mark" src="/milevia-mark.svg" width="36" height="36" alt="" /><h1>{mobileApp && mobileView === "conversation" ? (project?.name || "项目对话") : "Milevia"}</h1></div></div><div className="mobile-header-actions">{notificationPermission === "default" && <button className="mobile-notification-button" type="button" onClick={() => void enableMobileNotifications()} title="开启后台通知">开启通知</button>}<button className="mobile-refresh" type="button" onClick={() => { void loadInstances(); void loadSnapshot(); }} title="刷新">刷新</button></div></header>
+    {mobileUpdate && !updateDismissed && <section className="mobile-update" role="status"><div className="mobile-update-text"><strong>发现新版本 v{mobileUpdate.release.version}</strong><small>当前 v{mobileUpdate.currentVersion}{mobileUpdate.release.size ? ` · ${(mobileUpdate.release.size / 1024 / 1024).toFixed(1)} MB` : ""}{mobileUpdate.release.notes ? ` · ${mobileUpdate.release.notes.slice(0, 40)}` : ""}</small></div><a className="mobile-update-action" href={mobileUpdate.release.url} target="_blank" rel="noreferrer">立即更新</a><button className="mobile-update-dismiss" type="button" onClick={() => setUpdateDismissed(true)} aria-label="稍后提醒" title="稍后提醒">✕</button></section>}
     {!mobileApp && agentStatus && !agentStatus.ready && <section className="mobile-agent-enroll"><div><h2>远程服务未就绪</h2><p>电脑端 Agent 尚未连接到云端，手机此时无法配对。请粘贴管理员提供的部署注册令牌完成一次注册；令牌只在本次注册使用，不会保存到磁盘，也不会进入安装包。</p></div><form onSubmit={(event) => void enrollRemoteAgent(event)}><input type="password" value={agentEnrollToken} onChange={(event) => setAgentEnrollToken(event.target.value)} placeholder="部署注册令牌" aria-label="部署注册令牌" autoComplete="off" /><button type="submit" disabled={agentEnrollBusy || !agentEnrollToken.trim()}>{agentEnrollBusy ? "提交中" : "注册远程服务"}</button></form>{agentEnrollMessage && <small>{agentEnrollMessage}</small>}</section>}
     {(!mobileApp || showMobilePairing) && <section className="mobile-pairing"><div><h2>扫码配对</h2><p>{mobileApp ? "扫描电脑上的二维码，再输入电脑显示的 6 位校验码，等待电脑确认。" : "点击生成二维码，手机扫码后输入校验码，再点击确认绑定。"}</p></div>{!mobileApp && <button className="mobile-pairing-generate" onClick={() => void createDesktopPairing()} disabled={busy}>生成二维码</button>}{mobileApp && <button className="mobile-pairing-generate" onClick={() => { scanAccepted.current = false; setScanError(""); setScanning(true); }} disabled={busy || scanning}>扫描二维码</button>}{scanning && <div className="mobile-pairing-scanner-shell"><video className="mobile-pairing-scanner" ref={setScanVideo} muted playsInline /><div className="mobile-pairing-scanner-frame" /><p>将二维码放入框内</p><button className="mobile-pairing-scan-cancel" onClick={() => setScanning(false)}>取消扫描</button></div>}{scanError && <small className="mobile-pairing-scan-error">{scanError}</small>}{pairingQR && <img className="mobile-pairing-qr" src={pairingQR} alt="Milevia 配对二维码" />}{!mobileApp && pairingID && <button className="mobile-pairing-confirm" onClick={() => void confirmDesktopPairing()} disabled={busy || !pairingReadyForConfirm}>确认绑定</button>}{pairingStatus && <small>{pairingStatus}</small>}</section>}
     {mobileApp && showMobilePairing && <section className="mobile-pairing-manual"><h2>使用校验码</h2><p>在电脑端生成校验码后，在此输入 6 位数字。</p><form onSubmit={(event) => void claimPairingByCode(event)}><input ref={manualCodeRef} inputMode="numeric" pattern="[0-9]{6}" maxLength={6} value={manualPairingCode} onChange={(event) => setManualPairingCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位校验码" aria-label="6 位校验码" /><button type="submit" disabled={busy || manualPairingCode.length !== 6}>验证并配对</button></form>{token.trim() && <button className="mobile-pairing-collapse" type="button" onClick={() => setPairingExpanded(false)}>返回项目</button>}</section>}

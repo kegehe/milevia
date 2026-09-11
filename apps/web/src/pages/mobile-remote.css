@@ -176,3 +176,14 @@ body.barcode-scanner-active .mobile-pairing-scanner { display: none; }
 .mobile-new-conversation-confirm { min-height: 44px; border-radius: 6px; padding: 8px 14px; font-weight: 750; cursor: pointer; }
 .mobile-new-conversation-cancel { border: 1px solid #c8dcd1; color: #416b5e; background: #f7fbf8; }
 .mobile-new-conversation-confirm { border: 1px solid #7d9e2f; color: #19332c; background: #c8e85a; }
+
+/* 应用内更新提示：只在原生端出现，样式与配对/入驻卡片同一套语言，
+   但用更醒目的青柠色边框表明"这里需要你操作一次"。 */
+.mobile-update { display: flex; align-items: center; gap: 12px; max-width: 860px; margin: 0 auto 14px; border: 1px solid #c8e85a; border-radius: 7px; padding: 12px 14px; background: #f6fceb; }
+.mobile-update-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.mobile-update-text strong { color: #243b34; font-size: 14px; }
+.mobile-update-text small { overflow: hidden; color: #5d7a6d; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-update-action { flex: none; min-height: 44px; display: inline-flex; align-items: center; border: 1px solid #7d9e2f; border-radius: 5px; padding: 9px 15px; color: #19332c; background: #c8e85a; font-size: 13px; font-weight: 750; text-decoration: none; }
+.mobile-update-action:hover { background: #d6f072; }
+.mobile-update-dismiss { flex: none; min-width: 44px; min-height: 44px; border: 1px solid #cfe0c8; border-radius: 5px; color: #5d7a6d; background: #fff; font-size: 14px; cursor: pointer; }
+@media (max-width: 620px) { .mobile-update { flex-wrap: wrap; }.mobile-update-text { flex-basis: 100%; }.mobile-update-text small { white-space: normal; }.mobile-update-action { flex: 1; justify-content: center; } }

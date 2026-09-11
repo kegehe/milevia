@@ -2,11 +2,19 @@ name: 部署云端连接服务
 
 # 只针对「手机端 ↔ 电脑端」的中转服务（apps/cloud-control）。
 # 手机端 App（apps/web/android）和电脑端（apps/desktop）的改动不会触发本流水线。
+#
+# 部署方式：runner 只负责静态检查与打包，把【源码】传到服务器，由服务器本地编译。
+# 为什么这么做：GitHub runner 在境外，往国内服务器传 10.2MB 二进制实测约 12.7KB/s，
+# 单是传输就要 14 分钟（整条流水线 15 分钟里 14 分钟花在这）；而传几百 KB 源码只要几秒，
+# 服务器编译这个规模的服务是秒级（首次会自动拉取 go.mod 要求的 Go 工具链，之后缓存复用）。
 on:
   push:
     branches: [main]
     paths:
-      - "apps/cloud-control/**"
+      # 只列真正影响二进制的文件：改 README / 文档不再触发一次生产部署。
+      - "apps/cloud-control/**/*.go"
+      - "apps/cloud-control/go.mod"
+      - "apps/cloud-control/go.sum"
       - "scripts/deploy-cloud-control.sh"
       - ".github/workflows/deploy-cloud-control.yml"
   workflow_dispatch:
@@ -38,24 +46,22 @@ jobs:
           go vet ./...
           go test ./...
 
-      - name: 交叉编译 Linux 二进制
-        working-directory: apps/cloud-control
-        env:
-          CGO_ENABLED: "0"
-          GOOS: linux
-          GOARCH: amd64
+      - name: 打包源码（服务器侧编译）
         run: |
           set -euo pipefail
-          go build -trimpath -ldflags "-s -w" -o "${RUNNER_TEMP}/cloud-control-linux" ./cmd/cloud-control
-          file "${RUNNER_TEMP}/cloud-control-linux" || true
-          ls -lh "${RUNNER_TEMP}/cloud-control-linux"
+          # 只传源码，不传编译产物：排除 .tmp 里的历史二进制，避免把 10MB 带上跨境链路。
+          tar czf "${RUNNER_TEMP}/cloud-control-src.tar.gz" \
+            -C apps/cloud-control \
+            --exclude='./.tmp' \
+            .
+          echo "源码包体积：$(du -h "${RUNNER_TEMP}/cloud-control-src.tar.gz" | cut -f1)"
 
       - name: 安装 sshpass
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
 
-      - name: 上传并在云端切换
+      - name: 上传源码并在云端构建部署
         env:
           # sshpass -e 从环境变量读密码，避免密码出现在进程列表里。
           SSHPASS: ${{ secrets.MILEVIA_DEPLOY_PASSWORD }}
@@ -84,6 +90,7 @@ jobs:
           SSH="sshpass -e ssh ${SSH_OPTS}"
           SCP="sshpass -e scp ${SSH_OPTS}"
 
-          ${SCP} "${RUNNER_TEMP}/cloud-control-linux" "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/cloud-control-linux.new"
+          # 只传源码包（几百 KB）与部署脚本；编译由服务器完成。
+          ${SCP} "${RUNNER_TEMP}/cloud-control-src.tar.gz" "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/cloud-control-src.tar.gz"
           ${SCP} scripts/deploy-cloud-control.sh "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/deploy-cloud-control.sh"
-          ${SSH} "${DEPLOY_USER}@${DEPLOY_HOST}" "bash /tmp/deploy-cloud-control.sh"
+          ${SSH} "${DEPLOY_USER}@${DEPLOY_HOST}" "SRC_ARCHIVE=/tmp/cloud-control-src.tar.gz bash /tmp/deploy-cloud-control.sh"

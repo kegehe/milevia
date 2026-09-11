@@ -5,7 +5,16 @@
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczJra1lCcWhNV2hsN2oybW1RREp3eHBoN3lOOUV2VmtMZnZ0aks2WXJnazFrS0dQa2ZEbWs2bjlUY3NzelVVRFN5T1pJWTlpK1dZdEowSkdlMG5KM0FJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MDQyMDA4CWZpbGU6TWlsZXZpYV8wLjEuNV94NjQtc2V0dXAuZXhlCkdZemE1S0IwalA2Mm5hck5NNXNHMmMxSW1vTXRCK1RhUURiSWhHWkNvczhNSStSUHRhQmpmZ2IreVBOUWIySE9LZCt4cm94SXc0dGIrQ0dLSU1mZUFnPT0K",
-      "url": "https://keyanjia.info:8443/updates/Milevia_0.1.5_x64-setup.exe"
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.5/Milevia_0.1.5_x64-setup.exe"
+    },
+    "android": {
+      "version": "0.1.6",
+      "versionCode": 4,
+      "notes": "手机端新增应用内检查更新（含备用更新源）：发现新版本时在页面顶部提示，点「立即更新」即可下载并安装新包。",
+      "pub_date": "2026-09-11T07:34:13.935Z",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.6/Milevia_0.1.6_android.apk",
+      "size": 29010648,
+      "sha256": "6c46145a473c1353140bf6a60afb41f829b8146b6d740a6e23d06dab1e37fa32"
     }
   }
 }
