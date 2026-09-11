@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- allowBackup 关闭：云端访问令牌保存在 WebView 的 localStorage 中，
+         开启系统备份会让它随 adb / 云备份一起离开设备。本项目所有业务数据都在
+         云端或电脑本地，关掉备份不会丢失任何用户数据。 -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"

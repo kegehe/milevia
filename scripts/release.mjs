@@ -16,6 +16,11 @@
 //                           可覆盖成其它云存储源。加 `--deploy` 时它应指向服务器的 /updates/ 静态目录）。
 //   MILEVIA_DEPLOY_TARGET   `--deploy` 的 scp 目标目录（如 root@host:/var/www/milevia/dist/updates/）
 //                           两者通常无需设置。
+//   MILEVIA_ANDROID_KEYSTORE / MILEVIA_ANDROID_KEYSTORE_PASSWORD /
+//   MILEVIA_ANDROID_KEY_ALIAS / MILEVIA_ANDROID_KEY_PASSWORD
+//                           Android 正式签名（可选）。也可改放 apps/web/android/keystore.properties，
+//                           内容为 storeFile=/abs/path/release.jks、storePassword=、keyAlias=、keyPassword=。
+//                           两者都没有时，Android 包回退 debug 签名（仅可内测）。
 
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -45,7 +50,9 @@ if (!/^\d+\.\d+\.\d+$/.test(nextVersion)) {
   throw new Error(`版本号必须形如 0.1.1（MAJOR.MINOR.PATCH），收到：${nextVersion}`);
 }
 
-/* ── 三处需要同步的版本文件 ─────────────────────────────── */
+/* ── 需要同步的版本文件 ─────────────────────────────────── */
+// 桌面三处：tauri.conf.json / Cargo.toml / desktop/package.json
+// 移动一处：android/app/build.gradle 的 versionCode + versionName（见 1.5）
 const tauriConf = join(repoRoot, "apps/desktop/src-tauri/tauri.conf.json");
 const cargoToml = join(repoRoot, "apps/desktop/src-tauri/Cargo.toml");
 const desktopPkg = join(repoRoot, "apps/desktop/package.json");
@@ -88,6 +95,32 @@ writeJson(desktopPkg, dpkg);
 
 console.log(`已同步三处版本号：tauri.conf.json / Cargo.toml / desktop/package.json → ${nextVersion}`);
 
+/* ── 1.5 Android 版本号（versionCode 必须单调递增，否则系统不认升级）── */
+const androidGradle = join(androidDir, "app/build.gradle");
+
+function readAndroidVersion(text, file) {
+  // 锚定行首，避免把注释里出现的 "versionCode 12" 之类文本当成真值。
+  const code = text.match(/^[ \t]*versionCode\s+(\d+)/m);
+  const name = text.match(/^[ \t]*versionName\s+"([^"]+)"/m);
+  if (!code || !name) {
+    throw new Error(`无法从 ${file} 解析 versionCode / versionName，请确认 app/build.gradle 格式未变。`);
+  }
+  return { code: Number(code[1]), name: name[1] };
+}
+
+const androidGradleSource = readFileSync(androidGradle, "utf8");
+const androidCurrent = readAndroidVersion(androidGradleSource, androidGradle);
+// 同一版本重跑（例如只补出包）不再递增，避免 versionCode 被无意义地抬高。
+const androidNextCode = androidCurrent.name === nextVersion ? androidCurrent.code : androidCurrent.code + 1;
+writeFileSync(
+  androidGradle,
+  androidGradleSource
+    .replace(/^([ \t]*versionCode\s+)\d+/m, `$1${androidNextCode}`)
+    .replace(/^([ \t]*versionName\s+")[^"]+(")/m, `$1${nextVersion}$2`),
+  "utf8",
+);
+console.log(`已同步 Android 版本号：versionCode ${androidCurrent.code} → ${androidNextCode}，versionName ${androidCurrent.name} → ${nextVersion}`);
+
 if (bumpOnly) {
   console.log("bump-only：仅升级版本号，未打包、未签名。");
   process.exit(0);
@@ -126,28 +159,46 @@ if (!existsSync(passfile)) throw new Error(`找不到口令文件：${passfile}`
 const releaseDir = join(repoRoot, "release");
 mkdirSync(releaseDir, { recursive: true });
 
-/* ── 3.5 Android 移动端安装包（Capacitor debug 签名，便于直接安装） ── */
+/* ── 3.5 Android 移动端安装包 ────────────────────────────── */
+// 有正式 keystore（android/keystore.properties 或 MILEVIA_ANDROID_* 环境变量）时出 release 包；
+// 否则退回 debug 包并告警 —— debug 包仅可用于内测，不能上架，也不能覆盖已发布的正式签名包。
+const hasAndroidKeystore =
+  existsSync(join(androidDir, "keystore.properties")) || Boolean(process.env.MILEVIA_ANDROID_KEYSTORE);
+const androidBuildType = hasAndroidKeystore ? "release" : "debug";
+const androidTask = hasAndroidKeystore ? "assembleRelease" : "assembleDebug";
 const mobileInstallerName = `Milevia_${nextVersion}_android.apk`;
 const mobileInstaller = join(releaseDir, mobileInstallerName);
+if (!hasAndroidKeystore) {
+  console.warn(
+    "〔警告〕未找到 Android 正式签名配置（apps/web/android/keystore.properties 或 MILEVIA_ANDROID_KEYSTORE 环境变量）：\n" +
+      "        本次输出的是 debug 签名包，仅可用于内测；上架或覆盖正式包前必须先配置正式 keystore。",
+  );
+}
 if (!noBuild) {
-  console.log("开始构建 Android 移动端安装包（Capacitor sync + assembleDebug）…");
+  console.log(`开始构建 Android 移动端安装包（Capacitor sync + ${androidTask}）…`);
   execFileSync("pnpm", ["--dir", "apps/web", "exec", "cap", "sync", "android"], {
     cwd: repoRoot,
     stdio: "inherit",
     shell: process.platform === "win32",
   });
-  execFileSync("gradlew.bat", ["assembleDebug"], {
+  execFileSync("gradlew.bat", [androidTask], {
     cwd: androidDir,
     stdio: "inherit",
     shell: process.platform === "win32",
   });
 }
-const mobileSource = join(androidDir, "app/build/outputs/apk/debug/app-debug.apk");
+const mobileSource = join(androidDir, `app/build/outputs/apk/${androidBuildType}/app-${androidBuildType}.apk`);
 if (!existsSync(mobileSource)) {
-  throw new Error(`未找到 Android 安装包：${mobileSource}\n请确认 Android SDK 和 Gradle 环境可用。`);
+  throw new Error(
+    `未找到 Android 安装包：${mobileSource}\n` +
+      `  当前按「${hasAndroidKeystore ? "已配置正式 keystore" : "未配置正式 keystore"}」选择了 ${androidTask}。\n` +
+      (noBuild
+        ? "  你带了 --no-build，请去掉该参数重新构建，或确认该 build type 的 APK 之前已经产出过。"
+        : "  请确认 Android SDK 与 Gradle 环境可用。"),
+  );
 }
 copyFileSync(mobileSource, mobileInstaller);
-console.log(`Android 安装包：${mobileInstaller}`);
+console.log(`Android 安装包（${androidBuildType} 签名）：${mobileInstaller}`);
 
 // 签名：位置参数 <FILE>；私钥路径与口令走环境变量（不进命令行，避免出现在进程/日志里）。
 // 直接调用 apps/desktop 里挂装的 tauri CLI JS 入口，绕开 pnpm 子命令解析问题。

@@ -10,6 +10,7 @@ import { App as CapacitorApp } from "@capacitor/app";
 import type { PluginListenerHandle } from "@capacitor/core";
 import { BarcodeFormat, BarcodeScanner, LensFacing } from "@capacitor-mlkit/barcode-scanning";
 import { invoke } from "@tauri-apps/api/core";
+import { useDocumentVisible } from "../lib/useDocumentVisible";
 import "./mobile-remote.css";
 
 type Instance = { instanceId: string; name: string; status: string; lastAgentSequence: number; lastSeenAt?: string };
@@ -362,6 +363,10 @@ export default function MobileRemotePage() {
   // 就说明云端已经反映了那个时刻的状态（消息仍在，或者已被删除），此时不能再
   // 把实时消息当作"快照还没包含"补回去，否则电脑端删掉的消息会在手机上复活。
   const realtimeMessagesRef = useRef(new Map<string, { conversationId: string; message: Message; revision: number }>());
+  // 流式增量：按 CLI 的 messageId 累积尚未落地为正式消息的助手文本。正式
+  // assistant.message 到达时用同一事件里的 agentMessageId 认领并替换占位内容，
+  // 因此这里不参与快照对账，下次快照整体覆盖时会自然清掉残留。
+  const streamingMessagesRef = useRef(new Map<string, { conversationId: string; content: string; createdAt: string }>());
   const creatingProjectRef = useRef("");
   const instancesRequestGenerationRef = useRef(0);
   const snapshotRevisionRef = useRef(-1);
@@ -375,6 +380,16 @@ export default function MobileRemotePage() {
   const notifiedEventIDs = useRef(new Set<string>());
   const [commandState, setCommandState] = useState<CommandState | null>(null);
   const [pendingAccessToken, setPendingAccessToken] = useState("");
+
+  // 页面可见性：切到后台时暂停轮询与快照兜底，回到前台立即补一次，省电又省流量。
+  const documentVisible = useDocumentVisible();
+  const documentVisibleRef = useRef(documentVisible);
+  // 上一次的可见性，用来识别「由隐藏转为可见」这个瞬间。
+  const wasDocumentVisibleRef = useRef(documentVisible);
+  // 消息列表是否「贴着底部」。用户主动向上翻阅时不能夺走滚动位置。
+  const stickToBottomRef = useRef(true);
+  // 安卓物理返回键的当前处理逻辑。放在 ref 里，监听只注册一次也能拿到最新状态。
+  const backHandlerRef = useRef<() => boolean>(() => false);
 
   // 桌面端探测电脑端 Agent 是否已注册到云端。未注册时配对无法进行，页面应引导
   // 用户做一次注册，而不是让用户反复点击注定返回 503 的"生成二维码"。
@@ -592,6 +607,7 @@ export default function MobileRemotePage() {
     // conversation ID appear to be processing in the new instance.
     pendingMessageRef.current.clear();
     realtimeMessagesRef.current.clear();
+    streamingMessagesRef.current.clear();
     setProcessingConversations({});
   }, [instanceID]);
   const loadSnapshot = useCallback(async (): Promise<Snapshot | null> => {
@@ -671,6 +687,34 @@ export default function MobileRemotePage() {
             return changed || extras.length > 0 ? { ...entry, messages: [...messages, ...extras] } : entry;
           }) }));
         }
+        // 增量不落库，因此不在快照里：整体覆盖会把正在输出的回复抹掉。这里按
+        // 累积内容把它补回，正式消息到达时替换、之后随快照自然消失。
+        const streaming = streamingMessagesRef.current;
+        if (streaming.size > 0) {
+          value.projects = value.projects.map((item) => {
+            const conversations = item.conversations.map((entry) => {
+              let touched = false;
+              const messages = entry.messages.map((message) => {
+                if (!message.id.startsWith("stream-")) return message;
+                const chunk = streaming.get(message.id.slice("stream-".length));
+                if (!chunk || chunk.conversationId !== entry.id) return message;
+                touched = true;
+                return { ...message, content: chunk.content };
+              });
+              const pending: Message[] = [];
+              for (const [messageID, chunk] of streaming) {
+                if (chunk.conversationId !== entry.id) continue;
+                const placeholderID = `stream-${messageID}`;
+                if (messages.some((message) => message.id === placeholderID)) continue;
+                pending.push({ id: placeholderID, role: "assistant", content: chunk.content, createdAt: chunk.createdAt });
+                touched = true;
+              }
+              return touched ? { ...entry, messages: [...messages, ...pending] } : entry;
+            });
+            const changed = conversations.some((entry, index) => entry !== item.conversations[index]);
+            return changed ? { ...item, conversations } : item;
+          });
+        }
         setSnapshot(value);
         localStorage.setItem(`milevia.snapshot.${instanceID}`, JSON.stringify(value));
       }
@@ -688,7 +732,16 @@ export default function MobileRemotePage() {
     try {
       const event = JSON.parse(String(raw.data)) as { eventId?: string; type?: string; payload?: unknown; createdAt?: string };
       if (!event || !event.type || !event.payload) return false;
-      const payload = event.payload as Partial<Message> & { conversationId?: string; projectId?: string; status?: string };
+      const payload = event.payload as Partial<Message> & {
+        conversationId?: string;
+        projectId?: string;
+        status?: string;
+        // 流式增量事件的字段：messageId 是 CLI 自己的消息 id，与最终
+        // assistant.message 上的 agentMessageId 一致，据此认领占位内容。
+        messageId?: string;
+        delta?: string;
+        agentMessageId?: string;
+      };
       if (event.type === "conversation.created" && typeof payload.conversationId === "string" && typeof payload.projectId === "string") {
         setSnapshot((current) => {
           if (!current) return current;
@@ -721,6 +774,32 @@ export default function MobileRemotePage() {
         }
         return true;
       }
+      if (event.type === "assistant.delta") {
+        const delta = typeof payload.delta === "string" ? payload.delta : "";
+        const conversationId = typeof payload.conversationId === "string" ? payload.conversationId : "";
+        if (typeof payload.messageId !== "string" || payload.messageId === "" || delta === "" || conversationId === "") return false;
+        const placeholderID = `stream-${payload.messageId}`;
+        const streaming = streamingMessagesRef.current;
+        const previous = streaming.get(payload.messageId);
+        const accumulated = {
+          conversationId,
+          content: (previous?.content || "") + delta,
+          createdAt: previous?.createdAt || event.createdAt || new Date().toISOString(),
+        };
+        streaming.set(payload.messageId, accumulated);
+        setSnapshot((current) => {
+          if (!current) return current;
+          return { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => {
+            if (entry.id !== conversationId) return entry;
+            const placeholder: Message = { id: placeholderID, role: "assistant", content: accumulated.content, createdAt: accumulated.createdAt };
+            const index = entry.messages.findIndex((message) => message.id === placeholderID);
+            return index < 0
+              ? { ...entry, messages: [...entry.messages, placeholder] }
+              : { ...entry, messages: entry.messages.map((message, at) => (at === index ? placeholder : message)) };
+          }) })) };
+        });
+        return true;
+      }
       if ((event.type === "user.message" || event.type === "assistant.message") && typeof payload.id === "string" && typeof payload.conversationId === "string" && typeof payload.content === "string") {
         const role: Message["role"] = event.type === "assistant.message" ? "assistant" : "user";
         const realtimeMessage: Message = { id: payload.id, runId: payload.runId, role, content: payload.content, createdAt: payload.createdAt || event.createdAt || new Date().toISOString() };
@@ -737,16 +816,22 @@ export default function MobileRemotePage() {
             if (pending.size === 0) pendingMessageRef.current.delete(payload.conversationId);
           }
         }
+        // 正式消息到达后由它取代流式占位，两者在同一次状态更新里交接，避免
+        // 中间出现「占位 + 正式」并存的重复帧。
+        const agentMessageID = typeof payload.agentMessageId === "string" ? payload.agentMessageId : "";
+        const placeholderID = agentMessageID ? `stream-${agentMessageID}` : "";
+        if (agentMessageID) streamingMessagesRef.current.delete(agentMessageID);
         setSnapshot((current) => {
           if (!current) return current;
           return { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => {
             if (entry.id !== payload.conversationId) return entry;
-            const exists = entry.messages.some((message) => message.id === payload.id);
-            const optimisticIndex = role === "user" ? entry.messages.findIndex((message) => message.id.startsWith("pending-") && message.role === "user" && message.content === payload.content) : -1;
-            if (exists) return entry;
+            const base = placeholderID === "" ? entry.messages : entry.messages.filter((message) => message.id !== placeholderID);
+            const exists = base.some((message) => message.id === payload.id);
+            const optimisticIndex = role === "user" ? base.findIndex((message) => message.id.startsWith("pending-") && message.role === "user" && message.content === payload.content) : -1;
+            if (exists) return base.length === entry.messages.length ? entry : { ...entry, messages: base };
             const messages = optimisticIndex >= 0
-              ? entry.messages.map((message, index) => index === optimisticIndex ? realtimeMessage : message)
-              : [...entry.messages, realtimeMessage];
+              ? base.map((message, index) => index === optimisticIndex ? realtimeMessage : message)
+              : [...base, realtimeMessage];
             return { ...entry, messages };
           }) })) };
         });
@@ -791,11 +876,16 @@ export default function MobileRemotePage() {
     return () => globalThis.removeEventListener("milevia:token-cleared", onTokenCleared);
   }, []);
   useEffect(() => {
+    documentVisibleRef.current = documentVisible;
+  }, [documentVisible]);
+  useEffect(() => {
     if (!token.trim()) return;
     void loadInstances();
+    // 后台不轮询。visibilitychange 会重跑本效果，因此回到前台时上面这句会立刻补一次。
+    if (!documentVisible) return;
     const timer = window.setInterval(() => { void loadInstances(); }, 5000);
     return () => window.clearInterval(timer);
-  }, [token, loadInstances]);
+  }, [token, loadInstances, documentVisible]);
   useEffect(() => { void loadSnapshot(); }, [loadSnapshot]);
   useEffect(() => {
     if (!instanceID) return;
@@ -808,7 +898,17 @@ export default function MobileRemotePage() {
     // SSE is the normal fast path. Keep a slower safety poll for proxies or
     // networks that silently drop events, without competing with every event
     // refresh and increasing full-snapshot traffic threefold.
-    let fallbackTimer: number | null = window.setInterval(() => { void loadSnapshot(); }, 15_000);
+    // SSE 是快速通道，仍保留一个较慢的快照兜底，兼容会静默丢事件的代理与网络。
+    // 后台不跑兜底轮询（SSE 连接本身保留），回到前台由可见性效果补刷一次快照。
+    let fallbackTimer: number | null = null;
+    const startFallbackTimer = () => {
+      if (fallbackTimer !== null) return;
+      fallbackTimer = window.setInterval(() => {
+        if (!documentVisibleRef.current) return;
+        void loadSnapshot();
+      }, 15_000);
+    };
+    startFallbackTimer();
     let refreshTimer: number | null = null;
     const scheduleSnapshotRefresh = (delay: number) => {
       // Trailing throttle: a busy assistant stream cannot keep postponing
@@ -816,6 +916,9 @@ export default function MobileRemotePage() {
       if (refreshTimer !== null) return;
       refreshTimer = window.setTimeout(() => {
         refreshTimer = null;
+        // 后台不拉快照：SSE 事件在后台仍会到达，若不拦住，前面「隐藏时暂停
+        // 轮询」就会被这条路径完全抵消。回到前台时可见性效果会整体补刷一次。
+        if (!documentVisibleRef.current) return;
         void loadSnapshot();
       }, delay);
     };
@@ -832,14 +935,17 @@ export default function MobileRemotePage() {
             if (event.lastEventId) lastEventID = event.lastEventId;
             notifyHiddenMobileEvent(event);
             const isMessage = applyRealtimeEvent(event);
-            scheduleSnapshotRefresh(isMessage ? 1000 : 500);
+            // 消息内容已经随事件到达，不需要为它再拉整份快照：那会让手机在每条
+            // 助手消息后重新下载全部项目与会话，是移动端延迟最大的单一来源。结构性
+            // 事件（任务、会话生命周期）仍需对账，漏掉的事件由慢速兜底轮询收敛。
+            if (!isMessage) scheduleSnapshotRefresh(500);
           }, controller.signal);
           if (stopped || controller.signal.aborted) break;
           await wait(retryDelay);
           retryDelay = 1000;
         } catch {
           if (stopped || controller.signal.aborted) break;
-          if (fallbackTimer === null) fallbackTimer = window.setInterval(() => { void loadSnapshot(); }, 15_000);
+          startFallbackTimer();
           await wait(retryDelay);
           retryDelay = Math.min(retryDelay * 2, 30_000);
         }
@@ -853,6 +959,16 @@ export default function MobileRemotePage() {
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
     };
   }, [instanceID, loadSnapshot, applyRealtimeEvent, notifyHiddenMobileEvent]);
+  // 回到前台补刷一次快照，避免用户先看到后台期间的旧状态。
+  // 只在「隐藏 → 可见」的瞬间触发：实例切换等其它原因引起的重跑不需要额外拉快照。
+  // （实例列表由上面的轮询效果在可见性变化时自动补拉，这里不重复。）
+  useEffect(() => {
+    const wasVisible = wasDocumentVisibleRef.current;
+    wasDocumentVisibleRef.current = documentVisible;
+    if (!documentVisible || wasVisible) return;
+    if (!instanceID) return;
+    void loadSnapshot();
+  }, [documentVisible, instanceID, loadSnapshot]);
   useEffect(() => {
     let cancelled = false;
     if (!pairingURL) {
@@ -962,6 +1078,75 @@ export default function MobileRemotePage() {
   })), [project?.conversations]);
   const conversation = conversations.find((item) => item.id === selectedConversation) || conversations.find((item) => item.isCurrent) || conversations[0];
   const conversationProcessing = Boolean(conversation && (conversation.status === "running" || processingConversations[conversation.id]));
+  const conversationMessageCount = conversation?.messages?.length ?? 0;
+  // 流式回复只更新最后一条消息的 content、不改变条数，所以还要盯着它的长度，
+  // 否则「贴底跟随」在 AI 正在输出时不会生效。
+  const lastMessageLength = conversationMessageCount > 0
+    ? (conversation?.messages?.[conversationMessageCount - 1]?.content?.length ?? 0)
+    : 0;
+
+  // 消息列表不是独立滚动容器（整页滚动），因此监听 window。
+  // 「贴近底部」留 100px 容差：足以吸收地址栏收放带来的视口变化，又不会在用户
+  // 轻微上滑阅读时把视口拽回底部。
+  useEffect(() => {
+    const onScroll = () => {
+      const root = document.documentElement;
+      stickToBottomRef.current = root.scrollHeight - window.scrollY - window.innerHeight < 100;
+    };
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+    };
+  }, []);
+  // 新消息到达、AI 正在流式输出、或切换会话时，只要用户本就贴着底部就继续跟随；
+  // 用户正在向上翻阅历史时不打扰。
+  useEffect(() => {
+    if (!mobileApp || mobileView !== "conversation") return;
+    if (!stickToBottomRef.current) return;
+    window.scrollTo({ top: document.documentElement.scrollHeight });
+  }, [mobileApp, mobileView, selectedConversation, conversationMessageCount, lastMessageLength, conversationProcessing]);
+
+  // 安卓物理返回键：与页内「←」保持同一顺序——先关弹层，再退出会话视图，最后最小化应用。
+  // 不注册监听时 Capacitor 的默认返回回调会吞掉事件，返回键等于完全失效。
+  useEffect(() => {
+    backHandlerRef.current = () => {
+      // 弹层正在提交时，与弹层内「关闭/取消」按钮的 disabled 规则保持一致：
+      // 吞掉返回事件，避免中途丢弃已经在进行的请求。
+      if (busy && (editingTask || deletingTask || newConversationProject)) return true;
+      if (editingTask) { setEditingTask(null); return true; }
+      if (deletingTask) { setDeletingTask(null); return true; }
+      if (newConversationProject) { cancelNewConversation(); return true; }
+      if (scanning) { setScanning(false); return true; }
+      if (tasksOpen) { setTasksOpen(false); return true; }
+      if (conversationMenuOpen) { setConversationMenuOpen(false); return true; }
+      if (pairingExpanded) { setPairingExpanded(false); return true; }
+      if (mobileApp && mobileView === "conversation") {
+        setMobileView("projects");
+        setTasksOpen(false);
+        return true;
+      }
+      return false;
+    };
+  });
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    let listener: PluginListenerHandle | null = null;
+    let cancelled = false;
+    void CapacitorApp.addListener("backButton", () => {
+      // 没有可回退的层级时最小化应用（与页内返回按钮一致，符合 Android 根页面返回习惯）。
+      if (!backHandlerRef.current()) void CapacitorApp.minimizeApp().catch(() => undefined);
+    }).then((handle) => {
+      if (cancelled) { void handle.remove(); return; }
+      listener = handle;
+    }).catch(() => undefined);
+    return () => {
+      cancelled = true;
+      if (listener) void listener.remove();
+    };
+  }, []);
 
   // Normalize an older cached snapshot as well as network responses. This
   // keeps revision comparisons numeric during offline recovery.
@@ -1302,6 +1487,9 @@ export default function MobileRemotePage() {
     const clientRequestId = idempotencyKey();
     const createdAt = new Date().toISOString();
     const optimisticID = `pending-${clientRequestId}`;
+    // 发送时无条件恢复贴底跟随：键盘弹出会因 adjustResize 缩小视口、把「贴底」
+    // 判定顶掉，若不在这里重置，用户发完消息不会自动跟随自己的新消息与回复。
+    stickToBottomRef.current = true;
     const pending = pendingMessageRef.current.get(conversationID) || new Map<string, PendingMessage>();
     pending.set(clientRequestId, { requestId: clientRequestId, content, createdAt });
     pendingMessageRef.current.set(conversationID, pending);
@@ -1417,6 +1605,8 @@ export default function MobileRemotePage() {
 
   async function openMobileProject(projectValue: Project) {
     setSelectedProject(projectValue.id);
+    // 进入项目时强制跟到底部，避免带着上一个会话的滚动位置。
+    stickToBottomRef.current = true;
     setTasksOpen(false);
     setPairingExpanded(false);
     const existingConversation = projectValue.conversations?.find((entry) => entry.isCurrent) || projectValue.conversations?.[0];

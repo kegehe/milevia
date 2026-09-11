@@ -1,5 +1,30 @@
 apply plugin: 'com.android.application'
 
+// 正式签名配置：优先读 android/keystore.properties（本机文件，已加入 .gitignore），
+// 其次读环境变量（便于 CI 不落盘）。两者都没有时回退 debug 签名，保证内测包仍能产出，
+// 但会明确告警 —— debug 签名的包不能上架，也无法覆盖已发布的正式签名包。
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def hasReleaseKeystore = false
+
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+    hasReleaseKeystore = true
+} else {
+    def envKeystore = System.getenv("MILEVIA_ANDROID_KEYSTORE")
+    if (envKeystore) {
+        keystoreProperties["storeFile"] = envKeystore
+        keystoreProperties["storePassword"] = System.getenv("MILEVIA_ANDROID_KEYSTORE_PASSWORD")
+        keystoreProperties["keyAlias"] = System.getenv("MILEVIA_ANDROID_KEY_ALIAS")
+        keystoreProperties["keyPassword"] = System.getenv("MILEVIA_ANDROID_KEY_PASSWORD")
+        hasReleaseKeystore = true
+    }
+}
+
+// 注意：签名配置的完整性校验放在 android {} 块内（见下方 signingConfigs 之前）。
+// 不要在块外提前 throw —— 那样 build script 会中断在 android {} 之前，
+// Gradle 会连带报出「does not specify compileSdk」这种误导性的次生错误。
+
 android {
     namespace = "info.keyanjia.milevia"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,8 +32,10 @@ android {
         applicationId "info.keyanjia.milevia"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2
-        versionName "0.1.4"
+        // versionCode / versionName 由 scripts/release.mjs 在发版时同步递增，
+        // 请勿手工修改，否则包内版本会再次与发布版本脱节。
+        versionCode 3
+        versionName "0.1.5"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,10 +43,47 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    // 签名配置存在但不完整时必须硬失败：否则会静默回退成 debug 签名，
+    // 产出一个看起来像正式包、实际既不能上架也不能覆盖已发布正式包的 APK。
+    // 位置刻意放在 compileSdk 赋值之后，避免报错时连带产生误导性的次生错误。
+    if (hasReleaseKeystore) {
+        def requiredKeys = ["storeFile", "storePassword", "keyAlias", "keyPassword"]
+        def missingKeys = requiredKeys.findAll { !keystoreProperties[it] }
+        if (missingKeys) {
+            throw new GradleException(
+                    "Android 正式签名配置不完整，缺少：${missingKeys.join(', ')}。\n" +
+                    "  请在 apps/web/android/keystore.properties 补齐这四项，或改用环境变量 " +
+                    "MILEVIA_ANDROID_KEYSTORE / MILEVIA_ANDROID_KEYSTORE_PASSWORD / " +
+                    "MILEVIA_ANDROID_KEY_ALIAS / MILEVIA_ANDROID_KEY_PASSWORD。")
+        }
+        def storeFilePath = keystoreProperties["storeFile"]
+        if (!file(storeFilePath).exists()) {
+            throw new GradleException(
+                    "Android 签名文件不存在：${storeFilePath}\n" +
+                    "  相对路径按 apps/web/android/app 解析，建议改用绝对路径。")
+        }
+    }
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            release {
+                storeFile file(keystoreProperties["storeFile"])
+                storePassword keystoreProperties["storePassword"]
+                keyAlias keystoreProperties["keyAlias"]
+                keyPassword keystoreProperties["keyPassword"]
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (hasReleaseKeystore) {
+                signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
+                logger.warn("〔Milevia〕未找到 keystore.properties 或 MILEVIA_ANDROID_KEYSTORE 环境变量：" +
+                        "release 包将回退使用 debug 签名。该包仅可用于内测，不能上架，也不能覆盖已发布的正式签名包。")
+            }
         }
     }
 }
