@@ -1,0 +1,89 @@
+name: 部署云端连接服务
+
+# 只针对「手机端 ↔ 电脑端」的中转服务（apps/cloud-control）。
+# 手机端 App（apps/web/android）和电脑端（apps/desktop）的改动不会触发本流水线。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/cloud-control/**"
+      - "scripts/deploy-cloud-control.sh"
+      - ".github/workflows/deploy-cloud-control.yml"
+  workflow_dispatch:
+
+# 同一时间只允许一次部署，避免两个提交互相抢容器。
+concurrency:
+  group: deploy-cloud-control
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: 构建并部署
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 Go 工具链
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/cloud-control/go.mod
+          cache-dependency-path: apps/cloud-control/go.sum
+
+      - name: 静态检查与单元测试
+        working-directory: apps/cloud-control
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: 交叉编译 Linux 二进制
+        working-directory: apps/cloud-control
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w" -o "${RUNNER_TEMP}/cloud-control-linux" ./cmd/cloud-control
+          file "${RUNNER_TEMP}/cloud-control-linux" || true
+          ls -lh "${RUNNER_TEMP}/cloud-control-linux"
+
+      - name: 安装 sshpass
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: 上传并在云端切换
+        env:
+          # sshpass -e 从环境变量读密码，避免密码出现在进程列表里。
+          SSHPASS: ${{ secrets.MILEVIA_DEPLOY_PASSWORD }}
+          DEPLOY_HOST: ${{ secrets.MILEVIA_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.MILEVIA_DEPLOY_USER }}
+          # 可选：填入服务器主机公钥可防中间人窃取密码；留空则首次连接自动信任。
+          DEPLOY_HOST_KEY: ${{ secrets.MILEVIA_DEPLOY_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSHPASS}" ] || [ -z "${DEPLOY_HOST}" ] || [ -z "${DEPLOY_USER}" ]; then
+            echo "::error::缺少部署凭据。请在仓库 Settings → Secrets and variables → Actions 中配置 MILEVIA_DEPLOY_PASSWORD、MILEVIA_DEPLOY_HOST、MILEVIA_DEPLOY_USER。"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "${DEPLOY_HOST_KEY}" ]; then
+            printf '%s\n' "${DEPLOY_HOST_KEY}" > ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+            HOST_OPTS="-o StrictHostKeyChecking=yes"
+          else
+            echo "::warning::未配置 MILEVIA_DEPLOY_HOST_KEY，本次将自动信任服务器主机公钥（存在中间人风险，密码可能被截获）。"
+            HOST_OPTS="-o StrictHostKeyChecking=accept-new"
+          fi
+
+          SSH_OPTS="-o PreferredAuthentications=password -o PubkeyAuthentication=no ${HOST_OPTS} -o ConnectTimeout=20 -o ServerAliveInterval=15"
+          SSH="sshpass -e ssh ${SSH_OPTS}"
+          SCP="sshpass -e scp ${SSH_OPTS}"
+
+          ${SCP} "${RUNNER_TEMP}/cloud-control-linux" "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/cloud-control-linux.new"
+          ${SCP} scripts/deploy-cloud-control.sh "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/deploy-cloud-control.sh"
+          ${SSH} "${DEPLOY_USER}@${DEPLOY_HOST}" "bash /tmp/deploy-cloud-control.sh"
