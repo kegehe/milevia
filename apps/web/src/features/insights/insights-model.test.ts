@@ -8,12 +8,16 @@ import {
   insightThemeLabels,
   insightThemes,
   insightTypeLabels,
+  insightLinkedTaskLabel,
   insightVerificationLabels,
+  isInsightDismissed,
+  maxInsightEventSeq,
   normalizeInsightSeverity,
   normalizeInsightTheme,
   normalizeInsightType,
   normalizeInsightVerification,
   sortFindings,
+  toggleInsightType,
   type InsightFinding,
   type InsightType,
 } from "./insights-model.ts";
@@ -138,4 +142,35 @@ test("finding carries verification fields through sorting", () => {
   );
   assert.equal(sorted[0].verificationNote, "src/List.tsx 仍未做分页");
   assert.equal(normalizeInsightVerification(sorted[1].verificationResult), "invalid");
+});
+
+test("toggleInsightType keeps at least one type selected", () => {
+  // 取消到只剩一项时，再取消应保持原样：空数组在后端等价于"全查"，与用户意图相反。
+  assert.deepEqual(toggleInsightType(["bug"], "bug"), ["bug"]);
+  assert.deepEqual(toggleInsightType(["bug", "style"], "bug"), ["style"]);
+  assert.deepEqual(toggleInsightType(["bug"], "feature"), ["bug", "feature"]);
+});
+
+test("maxInsightEventSeq returns the largest seq", () => {
+  assert.equal(maxInsightEventSeq([]), 0);
+  assert.equal(maxInsightEventSeq([
+    { id: "a", seq: 3, ts: "t", level: "info", message: "m" },
+    { id: "b", seq: 11, ts: "t", level: "info", message: "m" },
+    { id: "c", seq: 7, ts: "t", level: "info", message: "m" },
+  ]), 11);
+});
+
+test("insightLinkedTaskLabel describes the linked task state", () => {
+  assert.equal(insightLinkedTaskLabel(makeFinding("a")), null);
+  assert.equal(insightLinkedTaskLabel(makeFinding("a", { linkedTaskStatus: "todo" })), "已转为任务 · 待办");
+  assert.equal(insightLinkedTaskLabel(makeFinding("a", { linkedTaskStatus: "running" })), "已转为任务 · 进行中");
+  // 终态后可重新添加（后端不再拦截）。
+  assert.equal(insightLinkedTaskLabel(makeFinding("a", { linkedTaskStatus: "done" })), "已转为任务 · 已完成（可重新添加）");
+  assert.equal(insightLinkedTaskLabel(makeFinding("a", { linkedTaskStatus: "cancelled" })), "已转为任务 · 已取消（可重新添加）");
+});
+
+test("isInsightDismissed only matches the dismissed status", () => {
+  assert.equal(isInsightDismissed(makeFinding("a")), false);
+  assert.equal(isInsightDismissed(makeFinding("a", { status: "open" })), false);
+  assert.equal(isInsightDismissed(makeFinding("a", { status: "dismissed" })), true);
 });

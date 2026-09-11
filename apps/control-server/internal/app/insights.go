@@ -18,6 +18,8 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,8 +87,44 @@ const insightVerifyBatchSize = 20
 // scanCtx.Err() 分支），避免用户面对无解释的"项目分析失败"。
 const insightScanPassTimeout = 20 * time.Minute
 
+// insightScanRunTimeout 是一次完整扫描（Pass A → 可能的修正重试 → Pass B 分批 ×
+// 可能的修正重试 → 落库）的总预算。单趟上限是"每趟"的：最坏情况（Pass A 重试 +
+// Pass B 两批各重试）会累计到 6 趟，没有总预算就会拖到 2 小时。
+//
+// 取值口径：**必须宽于"成功扫描的合理最坏情况"**——预算若落在合法慢扫描的耗时区间里，
+// 它自己就成了失败来源（跑满 30 分钟然后把结果全丢掉，是最差的组合）。两趟各十几分钟的
+// 扫描是正常的，故取 45 分钟（与 insightVerifyRunTimeout 一致），仍远低于理论最坏 120 分钟。
+// 注意：扫描期间**不持有**项目工作区租约，因此放宽这个值不会让任何项目的占用时间变长，
+// 只是让慢扫描有机会跑完（代价是更长时间窗口内工作区可能被改动、结果被判作废）。
+const insightScanRunTimeout = 45 * time.Minute
+
+// insightPublishLeaseWait 是发布结果（落库）前等待项目工作区空闲的上限；实际等待还会被
+// 本次运行的剩余总预算夹住（取二者较小值）。结果已经算好、只差写不进去——等一小会儿
+// 好过把整趟分析的成果丢掉，但也不能无限等：等待本身就意味着项目正被别的任务改写，
+// 拖得越久结果越可能过期，用户也越久看不到结论。超时则明确告知本次结果未写入。
+const insightPublishLeaseWait = 2 * time.Minute
+
+// insightFindingsListLimit 是列表接口单次返回的建议条数上限（有效 / 已失效 / 已忽略
+// 各自独立计数）。建议跨扫描去重累积，理论上可无限增长；这里兜底防止响应体失控，
+// 触顶时响应带 truncated 标记，前端如实展示"仅显示最近 N 条"。
+const insightFindingsListLimit = 500
+
+// insightHistoryPromptLimit 是喂给发现 agent 的「历史已报告清单」条数上限。
+// 超过时只给最近这些条（按创建时间倒序），避免 prompt 随项目历史无限膨胀；
+// 去重判定不受影响——指纹集合始终来自全部历史行，且最终由 DB 唯一索引兜底。
+const insightHistoryPromptLimit = 100
+
+// insightHistorySummaryLimit 是「历史已报告」清单里每条说明的截断长度（够模型辨认同一
+// 问题即可，不必整段回灌）。截断按 rune 计，避免中文被切半。
+const insightHistorySummaryLimit = 80
+
+// insightRejectionReasonLimit 是单条「被核实剔除」原因写入 scan 行的截断长度。
+const insightRejectionReasonLimit = 200
+
 // 再验证可以分批，但整个请求必须有总上限，避免单批超时累计成无限后台任务。
-const insightVerifyRunTimeout = 30 * time.Minute
+// 批次之间彼此独立发布（见 runInsightFindingsVerifyRun），因此这个总预算被触顶时
+// 只影响尚未跑完的尾批，已发布的批次不受影响。
+const insightVerifyRunTimeout = 45 * time.Minute
 
 // insightPersistenceTimeout 为服务关闭后写入任务终态预留时间。
 const insightPersistenceTimeout = 10 * time.Second
@@ -98,6 +136,9 @@ const insightPersistenceTimeout = 10 * time.Second
 // ≤20 条（原单趟装完的区间）切成约 3 批，让进度出现可见的中间点；超过 20 条维持原
 // insightVerifyBatchSize 上限（那些清单本来就有批次间进度点，不再额外拆出 agent 会话，
 // 也避免 prompt 无谓变小）。小清单（≤6 条）不切，省掉无谓的会话开销。
+//
+// 批次独立发布（见 runInsightFindingsVerifyRun）之后，"切小批"还多了一层作用：
+// 单批失败只影响该批，切得越细，一次失败牵连的建议越少。
 func insightReverifyChunkSize(n int) int {
 	if n > insightVerifyBatchSize {
 		return insightVerifyBatchSize
@@ -193,6 +234,18 @@ func buildScanOpts(req scanRequest) scanOpts {
 	return scanOpts{Agent: normalizeScanAgent(req.Agent), Theme: normalizeScanTheme(req.Theme), Types: normalizeScanTypes(req.Types)}
 }
 
+// insightFindingStatus* 是 project_insights.status 的取值。当前只有两态：
+// open（在有效列表中）与 dismissed（用户点了「不再提示」，折叠展示、不再被扫描上报）。
+// 已失效（verification_result='invalid'）是独立的一维状态，不占用 status。
+const (
+	insightStatusOpen      = "open"
+	insightStatusDismissed = "dismissed"
+)
+
+// insightSuppressionSuperseded 是 project_insight_suppressions.reason 的取值：
+// 建议被用户编辑（title/summary 变了），编辑前的旧指纹记入该表，永不再次上报。
+const insightSuppressionSuperseded = "superseded"
+
 // InsightScan 一条项目分析扫描（含两趟 agent 运行）的状态行。
 type InsightScan struct {
 	ID              string     `json:"id"`
@@ -204,9 +257,18 @@ type InsightScan struct {
 	FocusTypes      []string   `json:"focusTypes,omitempty"` // 本次扫描限定查找的类型（空=全查）
 	FindingsCount   int        `json:"findingsCount"`
 	SuppressedCount int        `json:"suppressedCount"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	StartedAt       *time.Time `json:"startedAt,omitempty"`
-	CompletedAt     *time.Time `json:"completedAt,omitempty"`
+	// Rejected 是本次扫描中「第 2 轮独立核实判为不成立」而被丢弃的候选，附 AI 给出的
+	// 判定依据。规则 2（必须核实）的可审计性来源：用户能看到被剔除的是什么、为什么。
+	Rejected    []InsightRejection `json:"rejected,omitempty"`
+	CreatedAt   time.Time          `json:"createdAt"`
+	StartedAt   *time.Time         `json:"startedAt,omitempty"`
+	CompletedAt *time.Time         `json:"completedAt,omitempty"`
+}
+
+// InsightRejection 一条被核实环节剔除的候选发现（不落 project_insights）。
+type InsightRejection struct {
+	Title  string `json:"title"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // InsightFinding 一条用户可读的优化建议卡片。
@@ -228,6 +290,18 @@ type InsightFinding struct {
 	VerificationResult string     `json:"verificationResult,omitempty"`
 	VerificationNote   string     `json:"verificationNote,omitempty"`
 	VerifiedAt         *time.Time `json:"verifiedAt,omitempty"`
+
+	// LinkedTaskStatus 是该建议已转成的任务的当前状态（todo/running/done/…），
+	// 仅在本项目存在同指纹任务时非空，由 listInsights 计算，不落库。
+	// 用于在卡片上提示"已转为任务"，并阻止为同一问题重复建任务。
+	LinkedTaskStatus string `json:"linkedTaskStatus,omitempty"`
+	LinkedTaskTitle  string `json:"linkedTaskTitle,omitempty"`
+}
+
+// insightTaskTerminal 判断任务是否已到终态（终态意味着"该问题已被处理过一轮"，
+// 此时允许再次为同一建议建任务；未完任务则视为重复，拒绝重复建任务）。
+func insightTaskTerminal(status string) bool {
+	return status == taskDone || status == taskCancelled
 }
 
 // InsightVerificationRun 是一次异步再验证任务的可观察状态。
@@ -265,8 +339,16 @@ type insightsResponse struct {
 	SuppressedCount int              `json:"suppressedCount"`
 	OpenCount       int              `json:"openCount"` // 当前有效建议总数（== len(Findings)），供前端区分"本次新增"
 	// Invalidated 是经验证已失效、从有效列表隐藏的建议（折叠展示，含 AI 判断依据）。
-	Invalidated  []InsightFinding        `json:"invalidated,omitempty"`
+	Invalidated []InsightFinding        `json:"invalidated,omitempty"`
 	Verification *InsightVerificationRun `json:"verification,omitempty"`
+	// Dismissed 是用户点了「不再提示」的建议（折叠展示，可恢复）。它们不再出现在
+	// 有效列表中，也不会被后续扫描再次上报；手动删除或恢复会解除这一状态。
+	Dismissed []InsightFinding `json:"dismissed,omitempty"`
+	// Truncated 为 true 表示列表触到了 insightFindingsListLimit，前端据此提示
+	// "仅显示最近 N 条"，避免用户以为建议凭空消失。
+	Truncated bool `json:"truncated,omitempty"`
+	// FindingsLimit 是列表上限，供前端在 truncated 时展示准确文案。
+	FindingsLimit int `json:"findingsLimit,omitempty"`
 }
 
 type verifyInsightsRequest struct {
@@ -519,6 +601,13 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 		// 区分"跑满单趟上限被杀"（agent 进程被终止，cmd.Wait 的报错不含 deadline
 		// 语义，这里显式看 scanCtx.Err()）与真正的运行失败，让用户拿到准确原因。
 		if scanCtx.Err() == context.DeadlineExceeded {
+			// scanCtx 是从本次运行的 ctx 派生出来的，两者的 deadline 都可能触发。父 ctx
+			// 也已结束时说明是**整趟运行的总预算**用尽（不是这一趟跑满 20 分钟）——
+			// 报错必须区分，否则用户会按"单趟超时"去重试，而其实该缩小范围。
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("分析超时：已超出本次运行的总时长上限（%d 分钟），已中止。可缩小分析范围（选择聚焦主题或更少的查找类型）后重试",
+					int(insightScanRunTimeout.Minutes()))
+			}
 			return "", fmt.Errorf("分析超时：超过 %d 分钟未完成。项目可能较大或模型处理较慢，请稍后重试或更换更快的模型档案",
 				int(insightScanPassTimeout.Minutes()))
 		}
@@ -709,21 +798,38 @@ func parseInsightToolActivity(eventType string, payload json.RawMessage) (string
 // appendInsightEvent 追加一条分析进度事件（seq 自增）。单连接 SQLite 串行化所有写入，
 // 用子查询取 max(seq)+1 一步完成，跨 goroutine（扫描 goroutine + sink 读 goroutine）
 // 并发追加也不会撞 seq。
+//
+// 每次追加都广播一次项目状态失效信号：项目总览卡片的「优化建议分析中」徽标与副标题
+// 进度文案都来自 /api/projects/statuses，没有这条广播就只能等 30s 兜底轮询。事件本身
+// 已被 sink 节流（同一动作/同类 3 秒最多一条），因此广播频率与进度更新频率一致。
 func (s *Server) appendInsightEvent(ctx context.Context, scanID, level, message string) {
 	if message == "" || scanID == "" {
 		return
 	}
-	_, err := s.db.ExecContext(ctx, `insert into project_insight_events (id,scan_id,seq,ts,level,message)
+	if _, err := s.db.ExecContext(ctx, `insert into project_insight_events (id,scan_id,seq,ts,level,message)
 		select ?, ?, coalesce(max(seq),0)+1, ?, ?, ? from project_insight_events where scan_id=?`,
-		uuid.NewString(), scanID, time.Now().UTC(), level, message, scanID)
-	if err != nil {
+		uuid.NewString(), scanID, time.Now().UTC(), level, message, scanID); err != nil {
 		log.Printf("[insights] append progress event scan=%s: %v", scanID, err)
+		return
+	}
+	// 读一下所属项目再广播；项目已被删除时静默（事件本身会随级联删除消失）。
+	var projectID string
+	if err := s.db.QueryRowContext(ctx, `select project_id from project_insight_scans where id=?`, scanID).Scan(&projectID); err == nil {
+		s.broadcastStateEvent(stEvProjects, projectID)
 	}
 }
 
-// loadInsightEvents 返回某次扫描的全部进度事件（按 seq 升序）。
-func (s *Server) loadInsightEvents(ctx context.Context, scanID string) []InsightEvent {
-	rows, err := s.db.QueryContext(ctx, `select id,seq,ts,level,message from project_insight_events where scan_id=? order by seq asc`, scanID)
+// loadInsightEvents 返回某次扫描的进度事件（按 seq 升序）。sinceSeq > 0 时只返回
+// seq 大于它的增量部分——前端 2s 轮询据此只取新事件，避免每次把整份日志重传。
+func (s *Server) loadInsightEvents(ctx context.Context, scanID string, sinceSeq int) []InsightEvent {
+	query := `select id,seq,ts,level,message from project_insight_events where scan_id=?`
+	args := []any{scanID}
+	if sinceSeq > 0 {
+		query += ` and seq>?`
+		args = append(args, sinceSeq)
+	}
+	query += ` order by seq asc`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		log.Printf("[insights] load progress events scan=%s: %v", scanID, err)
 		return nil
@@ -758,7 +864,20 @@ func insightReadOnlyTools(agentID string) []string {
 // PowerShell 跑 git diff、写文件），因此配合 --settings permissions.deny 把这些
 // 工具从模型工具集里真正移除，保证"只读分析"物理上只读、也不会因 git 式全量
 // 探索把单次扫描拖到超时。与 insightReadOnlyTools 配套：白名单声明意图，
-// deny 清单真正落地。工具名与 claude init 事件里的 tools 列表一一对应。
+// deny 清单真正落地。
+//
+// 维护口径（重要）：deny 清单必须覆盖"当前 CLI 版本里所有可写/可执行/可产生副作用的
+// 工具"，即"allow 之外的一切"。核对方式：跑一次 `claude -p --output-format stream-json`
+// 读 init 事件里的 tools 数组，与本清单逐项比对（实测 2.1.266 的列表为：
+// Task/CronCreate/CronDelete/CronList/DesignSync/Edit/EnterWorktree/ExitWorktree/
+// Glob/Grep/ListAgents/LSP/NotebookEdit/PowerShell/PushNotification/Read/ReportFindings/
+// ScheduleWakeup/SendMessage/Skill/TaskOutput/TaskStop/WebFetch/WebSearch/Workflow/Write）。
+// 其中 Read/Glob/Grep 是 allow 的三个只读工具，其余全部在此 deny；LSP/ListAgents 虽是
+// 只读工具，但分析不需要它们，一并拒掉以保持"allow 之外一律不可用"这一不变量。
+// 注意：枚举式硬拒对"未来版本新增的工具"没有免疫力——若 CLI 升级新增了可执行工具，
+// 它会默认可用。CLI 自 2.1 起提供真正的白名单 `--tools`，但远端（WSL/SSH）侧版本无法
+// 在本地核实，贸然加上会让旧版远端 CLI 直接报错，故暂未启用；升级远端后应改为
+// `--tools "Read,Glob,Grep"` 这种正向白名单，届时本清单可以退役。
 var insightReadOnlyDenyTools = []string{
 	// Shell：跑命令（git diff、改文件…）。跨端命名都拒。
 	"Bash", "PowerShell",
@@ -770,18 +889,23 @@ var insightReadOnlyDenyTools = []string{
 	"CronCreate", "CronDelete", "CronList", "ScheduleWakeup",
 	// 项目/设计同步、通知/上报。
 	"DesignSync", "EnterWorktree", "ExitWorktree", "PushNotification", "ReportFindings",
-	// 任务管理。
+	// 任务管理（含读取/停止他人任务）。
 	"TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
 	// 网络检索：分析聚焦项目代码，避免跑题拖慢。
 	"WebFetch", "WebSearch",
+	// 只读但分析用不到的工具：拒掉以维持"allow 之外一律不可用"。
+	"LSP", "ListAgents",
 	// MCP 工具：只读分析不注入 MCP；这里再加一条 glob 兜底——即使将来某条只读路径
 	// 漏掉注入控制，deny 规则也会拦下所有 server 的全部 MCP 工具（deny 优先级最高，
 	// 且 hook 返回 allow 不覆盖 deny）。见 docs/34 §8.3。
 	"mcp__*",
 }
 
-// insightReadOnlySettingsJSON 组装只读执行的 --settings JSON（permissions.deny 硬拒
-// 清单），供 claude 本地/WSL/SSH 只读路径共用。失败返回错误（理论上不会发生）。
+// insightReadOnlySettingsJSON 组装只读执行的 --settings JSON（permissions.deny
+// 硬拒清单）。本地 claude runner（insights + orchestration 独立审查共用）、WSL 与
+// SSH 三条只读路径都消费它，因此清单是两者共同的下界：
+// 对 orchestration 的 `Read/Glob/Grep/List/ReadMultiToolInfo` 白名单而言，本清单
+// 新增的项都不在其 allow 内——即"同样只读、只是更难以绕过"。失败返回错误（理论上不会发生）。
 func insightReadOnlySettingsJSON() (string, error) {
 	settings, err := json.Marshal(map[string]any{
 		"permissions": map[string]any{
@@ -943,10 +1067,13 @@ func insightVerifyCandidateDetails(candidates []pendingInsight) string {
 }
 
 // insightVerifyVerdict 是 Pass B 核实结果的解码目标。
+// Reason 承载模型给出的判定依据：confirmed=false 时它就是"为什么剔除"，
+// 会被写进 scan 行的 rejected 列表展示给用户（规则 2 的可审计性）。
 type insightVerifyVerdict struct {
 	Findings []struct {
-		Index     int  `json:"index"`
-		Confirmed bool `json:"confirmed"`
+		Index     int    `json:"index"`
+		Confirmed bool   `json:"confirmed"`
+		Reason    string `json:"reason"`
 	} `json:"findings"`
 }
 
@@ -960,24 +1087,43 @@ type insightVerifyVerdict struct {
 //   - 其余：核实结果解析失败（模型没给合法 JSON 对象）。这二者在 UI 提示文案上应区别。
 var errInsightVerifyRunner = errors.New("核实代理运行失败")
 
-func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID string, candidates []pendingInsight, progress func(level, message string)) ([]struct {
-	Index     int  `json:"index"`
-	Confirmed bool `json:"confirmed"`
-}, error) {
+// insightVerifyOutcome 是一条候选的核实结论（含模型给出的判定依据）。
+type insightVerifyOutcome struct {
+	Index     int
+	Confirmed bool
+	Reason    string
+}
+
+func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID string, candidates []pendingInsight, progress func(level, message string)) ([]insightVerifyOutcome, error) {
 	cc := func(prompt string) (string, error) {
 		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightVerifyOutputSchema, progress)
+	}
+	decode := func(text string) ([]insightVerifyOutcome, error) {
+		verdict, err := decodeInsightVerdict(text)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateInsightVerdict(verdict, len(candidates)); err != nil {
+			return nil, err
+		}
+		out := make([]insightVerifyOutcome, 0, len(verdict.Findings))
+		for _, item := range verdict.Findings {
+			out = append(out, insightVerifyOutcome{
+				Index:     item.Index,
+				Confirmed: item.Confirmed,
+				Reason:    truncateInsightLog(strings.TrimSpace(item.Reason), insightRejectionReasonLimit),
+			})
+		}
+		return out, nil
 	}
 	// 首轮。
 	textB, err := cc(buildVerifyPrompt(project.Path, candidates))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInsightVerifyRunner, err)
 	}
-	verdict, vErr := decodeInsightVerdict(textB)
+	outcomes, vErr := decode(textB)
 	if vErr == nil {
-		vErr = validateInsightVerdict(verdict, len(candidates))
-	}
-	if vErr == nil {
-		return verdict.Findings, nil
+		return outcomes, nil
 	}
 	log.Printf("[insights] project=%s Pass B parse failed on first attempt: %v", project.ID, vErr)
 	// 修正 prompt 重试一次。
@@ -985,14 +1131,11 @@ func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID 
 	if err != nil {
 		return nil, fmt.Errorf("%w（重试）: %v", errInsightVerifyRunner, err)
 	}
-	verdict, vErr = decodeInsightVerdict(textB)
-	if vErr == nil {
-		vErr = validateInsightVerdict(verdict, len(candidates))
-	}
+	outcomes, vErr = decode(textB)
 	if vErr != nil {
 		return nil, fmt.Errorf("核实代理未返回有效结果: %v (raw len=%d)", vErr, len(textB))
 	}
-	return verdict.Findings, nil
+	return outcomes, nil
 }
 
 // decodeInsightVerdict 从 agent 输出抽最外层 JSON 并解码为核实对象。
@@ -1011,8 +1154,8 @@ func decodeInsightVerdict(text string) (insightVerifyVerdict, error) {
 // runInsightVerifyBatches keeps the initial confirmation pass within the same
 // prompt budget as re-verification. Each verdict has local indexes, so convert
 // them to the original candidate index before returning.
-func (s *Server) runInsightVerifyBatches(ctx context.Context, project Project, agentID string, candidates []pendingInsight, progress func(level, message string)) (map[int]bool, error) {
-	verified := make(map[int]bool, len(candidates))
+func (s *Server) runInsightVerifyBatches(ctx context.Context, project Project, agentID string, candidates []pendingInsight, progress func(level, message string)) (map[int]insightVerifyOutcome, error) {
+	verified := make(map[int]insightVerifyOutcome, len(candidates))
 	for start := 0; start < len(candidates); start += insightVerifyBatchSize {
 		end := min(start+insightVerifyBatchSize, len(candidates))
 		if progress != nil && len(candidates) > insightVerifyBatchSize {
@@ -1023,7 +1166,7 @@ func (s *Server) runInsightVerifyBatches(ctx context.Context, project Project, a
 			return nil, err
 		}
 		for _, item := range verdict {
-			verified[start+item.Index] = item.Confirmed
+			verified[start+item.Index] = item
 		}
 	}
 	return verified, nil
@@ -1162,7 +1305,7 @@ func setInsightVerificationPendingIfUnchanged(ctx context.Context, tx *sql.Tx, p
 }
 
 // resolveVerifyTargets 解析待验证建议：指定 ids → 逐条校验归属（防越权，任一非法
-// 即报错）；空 ids → 全部"有效"（未失效）建议。返回空列表表示无建议可验证。
+// 即报错）；空 ids → 全部"有效"（未失效且未被「不再提示」）建议。返回空列表表示无建议可验证。
 type insightReverifyResult struct {
 	status string
 	reason string
@@ -1185,42 +1328,77 @@ func normalizeInsightReverifyStatus(status string, legacyExists *bool) (string, 
 	}
 }
 
-// runInsightFindingsVerify collects all batches first, then publishes their results only
-// if the repository still matches the version observed before verification. This prevents
-// a late batch or a concurrent edit from making earlier, stale conclusions authoritative.
+// runInsightFindingsVerify 见 runInsightFindingsVerifyRun。
 func (s *Server) runInsightFindingsVerify(ctx context.Context, projectID string, targets []InsightFinding) {
 	s.runInsightFindingsVerifyRun(ctx, projectID, "", "", targets)
 }
 
+// insightVerifyAbortNote 把运行上下文的终止原因转成用户可读文案；未终止返回空串。
+func insightVerifyAbortNote(ctx context.Context) string {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return "验证已取消"
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "验证超时，未完成部分请重新验证"
+	default:
+		return ""
+	}
+}
+
+// runInsightFindingsVerifyRun 对既有建议跑一轮只读复核。
+//
+// 批次彼此独立发布：每批跑完就立刻在租约内复核版本并落库，某批失败或被中止只影响它
+// 自己与尚未开始的后续批次，此前已发布的结论一律保留。原实现是"所有批次先收集、最后
+// 一次性发布"，任何一批出错都会把此前已成功的批次一起作废——用户付了费却什么都拿不到。
+//
+// 版本一致性仍然成立：每批发布前都会确认工作区自本次复核开始起未被修改，因此所有已发布
+// 的结论都针对同一个版本；一旦发现变化，立即停止发布剩余批次并把它们标为可重试的失败。
 func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, verificationID, agentID string, targets []InsightFinding) {
 	if len(targets) == 0 {
 		return
 	}
 	verifyCtx, cancel := context.WithTimeout(ctx, insightVerifyRunTimeout)
 	defer cancel()
-	// failAll 把复核整体置为失败（或取消）并复原目标建议。ctx 被取消（用户停止 /
-	// 项目删除）时按"已取消"记录复核运行，建议写回 failed（可重试）——复核结果枚举
-	// 没有 cancelled 值，且取消不等于 AI 判定，复原为可重试的失败最接近语义。
+
+	// 已失效建议是 AI 上次确认的终局判定：复验失败/无结论一律保持失效，不复活进有效列表。
+	fallbackStatus := func(f InsightFinding) string {
+		if f.VerificationResult == insightVerifyInvalid {
+			return insightVerifyInvalid
+		}
+		return insightVerifyFailed
+	}
+	// persistFailures 把一批建议写回"失败"（已失效的保持失效）。不结束复核运行记录。
+	persistFailures := func(batch []InsightFinding, note string) {
+		now := time.Now().UTC()
+		persistInsightWrite(func(persistCtx context.Context) {
+			for _, f := range batch {
+				s.setInsightVerificationIfUnchanged(persistCtx, projectID, f, fallbackStatus(f), note, now)
+			}
+		})
+	}
+	// failAll 把全部目标置为失败（或取消）并结束复核运行。仅用于批次尚未开始时就能
+	// 确定整趟跑不下去的失败（取项目失败、版本快照失败等）。
 	failAll := func(note string) {
 		status := insightScanFailed
 		if errors.Is(verifyCtx.Err(), context.Canceled) {
 			status = insightScanCancelled
 			note = "验证已取消"
 		}
-		now := time.Now().UTC()
 		persistInsightWrite(func(persistCtx context.Context) {
 			for _, f := range targets {
-				// 已失效建议是 AI 上次确认的终局判定：复验失败不应把它"复活"进有效列表，
-				// 保持失效（它可能在请求时已被置为 pending，这里写回 invalid 复原）。
-				if f.VerificationResult == insightVerifyInvalid {
-					s.setInsightVerificationIfUnchanged(persistCtx, projectID, f, insightVerifyInvalid, note, now)
-					continue
-				}
-				s.setInsightVerificationIfUnchanged(persistCtx, projectID, f, insightVerifyFailed, note, now)
+				s.setInsightVerificationIfUnchanged(persistCtx, projectID, f, fallbackStatus(f), note, time.Now().UTC())
 			}
 			s.finishInsightVerificationRun(persistCtx, verificationID, status, note, len(targets))
 		})
 	}
+	// 复核 worker 跑在裸 goroutine 里（net/http 的 panic 兜底覆盖不到），一次 panic 会
+	// 带走整个控制服务。这里兜底：记录堆栈、把本轮置为可重试的失败，绝不让进程退出。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[insights] project=%s re-verify panic: %v\n%s", projectID, r, debug.Stack())
+			failAll("验证内部错误，请重试")
+		}
+	}()
 	project, err := s.getProjectByID(verifyCtx, projectID)
 	if err != nil {
 		failAll("无法加载项目，请重试")
@@ -1244,11 +1422,53 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 	if agentID == "" {
 		agentID = s.currentInsightAgent(verifyCtx, projectID)
 	}
-	results := make(map[string]insightReverifyResult, len(targets))
+	// publishBatch 在租约内复核版本并落库一批结论。返回 false 表示未写入（附原因）。
+	publishBatch := func(batch []InsightFinding, results map[string]insightReverifyResult, fallbackNote string) (bool, string) {
+		ok, reason := s.publishInsightResult(verifyCtx, project, revision, "insight-verify:"+verificationID,
+			func() {
+				s.updateInsightVerificationRunMessage(verifyCtx, verificationID, "结果已就绪，正在等待项目空闲以写入…")
+			},
+			func(publishCtx context.Context) error {
+			now := time.Now().UTC()
+			for _, f := range batch {
+				result, hasResult := results[f.ID]
+				if !hasResult {
+					s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, fallbackStatus(f), fallbackNote, now)
+					continue
+				}
+				// 已失效建议复验：仅 valid 判定才把它恢复进有效列表；invalid/uncertain 保持
+				// 失效，避免一次失败的复验推翻此前 AI 已确认的失效结论。
+				if f.VerificationResult == insightVerifyInvalid && result.status != "valid" {
+					reason := result.reason
+					if result.status == "uncertain" {
+						reason = "AI 无法确认：" + reason
+					}
+					s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, insightVerifyInvalid, reason, now)
+					continue
+				}
+				dbStatus := insightVerifyFailed
+				if result.status == "valid" {
+					dbStatus = insightVerifyValid
+				} else if result.status == "invalid" {
+					dbStatus = insightVerifyInvalid
+				}
+				if result.status == "uncertain" {
+					result.reason = "AI 无法确认：" + result.reason
+				}
+				s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, dbStatus, result.reason, now)
+			}
+			return nil
+		})
+		return ok, reason
+	}
+
 	// 按批推进进度：见 insightReverifyChunkSize 说明。进入/完成每批都落库一条消息，
 	// 避免整趟 agent（可能数分钟）期间 run 一直停留在"正在准备验证 · 0/N"。
 	chunk := insightReverifyChunkSize(len(targets))
 	batches := (len(targets) + chunk - 1) / chunk
+	processed := 0
+	failedBatches := 0
+	abortNote := ""
 	for start := 0; start < len(targets); start += chunk {
 		end := min(start+chunk, len(targets))
 		batch := targets[start:end]
@@ -1258,15 +1478,19 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 		if batches > 1 {
 			batchPrefix = fmt.Sprintf("第 %d/%d 批：", batchNo, batches)
 		}
+		if note := insightVerifyAbortNote(verifyCtx); note != "" {
+			abortNote = note
+			break
+		}
 		startMsg := fmt.Sprintf("正在核实建议 %d-%d/%d", start+1, end, len(targets))
 		if len(targets) == 1 {
 			startMsg = "正在核实该条建议"
 		}
-		s.updateInsightVerificationRun(verifyCtx, verificationID, batchPrefix+startMsg, start)
-		unchanged, revisionErr := s.insightWorkspaceUnchanged(verifyCtx, project, revision)
-		if revisionErr != nil || !unchanged {
-			failAll("项目代码在验证中发生变化，已丢弃本轮结果，请重新验证")
-			return
+		s.updateInsightVerificationRun(verifyCtx, verificationID, batchPrefix+startMsg, processed)
+		// 早退：工作区已变则后续批次不再开跑，避免继续消耗 agent 调用（已发布的批次保留）。
+		if unchanged, revisionErr := s.insightWorkspaceUnchanged(verifyCtx, project, revision); revisionErr != nil || !unchanged {
+			abortNote = "项目代码在验证中发生变化，已丢弃本轮结果，请重新验证"
+			break
 		}
 		// 整批返回前进度数不会动（agent 一次只回整批判定），把实时工具动作（读取/
 		// 检索哪个文件）滚动写进 run.message，避免长时间盯着 0/N 误以为卡住。
@@ -1281,48 +1505,57 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 		}
 		batchResults, batchErr := s.runInsightReverifyBatch(verifyCtx, project, agentID, revision.RepoSHA, batch, activity)
 		if batchErr != nil {
-			log.Printf("[insights] project=%s re-verify batch failed: %v", projectID, batchErr)
-			failAll(insightRunErrorMessage("建议验证失败", batchErr))
-			return
+			log.Printf("[insights] project=%s re-verify batch %d/%d failed: %v", projectID, batchNo, batches, batchErr)
+			// 整趟被取消/超时：中止剩余批次（各批是独立的 agent 调用，继续跑没有意义）。
+			if note := insightVerifyAbortNote(verifyCtx); note != "" {
+				abortNote = note
+				break
+			}
+			// 本批自身失败（agent 报错 / 输出不合契约）：只标记本批，继续跑后续批次。
+			failedBatches++
+			persistFailures(batch, insightRunErrorMessage("建议验证失败", batchErr))
+			processed = end
+			continue
 		}
-		for id, result := range batchResults {
-			results[id] = result
+		if published, reason := publishBatch(batch, batchResults, "结果未能写入项目，请重新验证"); !published {
+			// 发布失败（已取消 / 超预算 / 租约等不到 / 工作区已变 / 写库失败）：本批结果
+			// 未落库，且工作区状态已不可信，中止剩余批次，避免继续花 agent 调用去产出
+			// 同样写不进去的结论。reason 由 publishInsightResult 保证非空。
+			persistFailures(batch, reason)
+			abortNote = reason
+			processed = end
+			break
 		}
+		processed = end
 		s.updateInsightVerificationRun(verifyCtx, verificationID,
 			fmt.Sprintf("%s已完成 %d/%d 条建议", batchPrefix, end, len(targets)), end)
 	}
 
-	unchanged, revisionErr := s.insightWorkspaceUnchanged(verifyCtx, project, revision)
-	if revisionErr != nil || !unchanged {
-		failAll("项目代码在验证中发生变化，已丢弃本轮结果，请重新验证")
+	if abortNote == "" {
+		// 正常跑完所有批次：成功批次已逐批落库。
+		if failedBatches == 0 {
+			persistInsightWrite(func(persistCtx context.Context) {
+				s.finishInsightVerificationRun(persistCtx, verificationID, insightScanCompleted, "验证完成", len(targets))
+			})
+			return
+		}
+		note := fmt.Sprintf("验证完成：%d/%d 批成功，%d 批失败（失败的建议已标记为可重试）", batches-failedBatches, batches, failedBatches)
+		persistInsightWrite(func(persistCtx context.Context) {
+			s.finishInsightVerificationRun(persistCtx, verificationID, insightScanFailed, note, len(targets))
+		})
 		return
 	}
-	now := time.Now().UTC()
+
+	// 中止：剩余未处理的批次统一置为可重试的失败，已发布的批次保持已发布。
+	if remaining := targets[processed:]; len(remaining) > 0 {
+		persistFailures(remaining, abortNote)
+	}
+	status := insightScanFailed
+	if errors.Is(verifyCtx.Err(), context.Canceled) {
+		status = insightScanCancelled
+	}
 	persistInsightWrite(func(persistCtx context.Context) {
-		for _, f := range targets {
-			result := results[f.ID]
-			// 已失效建议复验：仅 valid 判定才把它恢复进有效列表；invalid/uncertain 保持
-			// 失效，避免一次失败的复验推翻此前 AI 已确认的失效结论。
-			if f.VerificationResult == insightVerifyInvalid && result.status != "valid" {
-				reason := result.reason
-				if result.status == "uncertain" {
-					reason = "AI 无法确认：" + reason
-				}
-				s.setInsightVerificationIfUnchanged(persistCtx, projectID, f, insightVerifyInvalid, reason, now)
-				continue
-			}
-			dbStatus := insightVerifyFailed
-			if result.status == "valid" {
-				dbStatus = insightVerifyValid
-			} else if result.status == "invalid" {
-				dbStatus = insightVerifyInvalid
-			}
-			if result.status == "uncertain" {
-				result.reason = "AI 无法确认：" + result.reason
-			}
-			s.setInsightVerificationIfUnchanged(persistCtx, projectID, f, dbStatus, result.reason, now)
-		}
-		s.finishInsightVerificationRun(persistCtx, verificationID, insightScanCompleted, "验证完成", len(targets))
+		s.finishInsightVerificationRun(persistCtx, verificationID, status, abortNote, processed)
 	})
 }
 
@@ -1383,7 +1616,9 @@ func (s *Server) updateInsightVerificationRun(ctx context.Context, verificationI
 	}
 	if _, err := s.db.ExecContext(ctx, `update project_insight_verification_runs set message=?,processed_count=? where id=? and status='running'`, message, processed, verificationID); err != nil {
 		log.Printf("[insights] update verification run %s: %v", verificationID, err)
+		return
 	}
+	s.broadcastInsightVerificationRun(ctx, verificationID)
 }
 
 // updateInsightVerificationRunMessage 只滚动复核 run 的 message 不动 processed_count，
@@ -1395,6 +1630,20 @@ func (s *Server) updateInsightVerificationRunMessage(ctx context.Context, verifi
 	}
 	if _, err := s.db.ExecContext(ctx, `update project_insight_verification_runs set message=? where id=? and status='running'`, message, verificationID); err != nil {
 		log.Printf("[insights] update verification run message %s: %v", verificationID, err)
+		return
+	}
+	s.broadcastInsightVerificationRun(ctx, verificationID)
+}
+
+// broadcastInsightVerificationRun 广播复核进度变化，让项目总览卡片的进度文案实时跟上
+// （同 appendInsightEvent 的理由：状态来自 /projects/statuses，不广播就靠 30s 兜底）。
+func (s *Server) broadcastInsightVerificationRun(ctx context.Context, verificationID string) {
+	if verificationID == "" {
+		return
+	}
+	var projectID string
+	if err := s.db.QueryRowContext(ctx, `select project_id from project_insight_verification_runs where id=?`, verificationID).Scan(&projectID); err == nil {
+		s.broadcastStateEvent(stEvProjects, projectID)
 	}
 }
 
@@ -1419,13 +1668,108 @@ func (s *Server) finishInsightVerificationRun(ctx context.Context, verificationI
 			return ""
 		}(), message, processed, time.Now().UTC(), verificationID); err != nil {
 		log.Printf("[insights] finish verification run %s: %v", verificationID, err)
+		return
 	}
+	s.broadcastInsightVerificationRun(ctx, verificationID)
+}
+
+// acquireWorkspaceWait 在 wait 时间内反复尝试获取工作区租约（见 acquireWorkspace：
+// 同一 key 同时只允许一个 owner）。用于「结果已算好、只差落库」的场景——此时不该因为
+// 项目正被别的任务占用就把整趟分析的成果丢掉，但也不能无限等，故带上限。
+// ctx 取消（用户停止 / 项目删除）立即返回 false。
+func (s *Server) acquireWorkspaceWait(ctx context.Context, key, owner string, wait time.Duration) (func(), bool) {
+	deadline := time.Now().Add(wait)
+	for {
+		if release, ok := s.acquireWorkspace(key, owner); ok {
+			return release, true
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return nil, false
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// publishInsightResult 在项目工作区租约内发布一次结果：等待租约（上限
+// insightPublishLeaseWait，且不超过本次运行的剩余预算）→ 确认工作区自 revision 起
+// 未被修改 → 执行 publish 写库。
+//
+// 这是「只读分析不独占工作区」方案的收口点：分析阶段允许用户继续在项目里工作，
+// 代价是工作区一旦变化，本次结果就不再成立。租约在这里只覆盖"最终版本复核 + 写库"
+// 这一小段，使二者对所有 Milevia 发起的写入是原子的——不会出现"复核通过后有写入
+// 溜进来、结果仍被当成有效"的窗口。
+//
+// onWait 只在"第一次没抢到租约、确实需要等"时回调一次，供调用方告诉用户"结果已算好，
+// 正在等项目空闲以写入"——顺利的情况下不该出现这句话。
+//
+// 返回 ok=false 表示没能发布，reason 为用户可读原因（已取消 / 预算用尽 / 工作区被占用 /
+// 工作区已变化 / 版本状态读不出 / 写库失败）。reason 一定非空，调用方可直接展示。
+func (s *Server) publishInsightResult(ctx context.Context, project Project, revision insightWorkspaceRevision, owner string, onWait func(), publish func(context.Context) error) (bool, string) {
+	// 先判上下文：已取消/已超预算就没必要再去碰工作区（否则会落到下面那些"看起来
+	// 像是工作区问题"的分支，把真实原因盖掉）。
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return false, "已取消"
+	}
+	if ctx.Err() != nil {
+		return false, "已超出本次运行的时间预算，结果未写入，请重新发起"
+	}
+	wait := insightPublishLeaseWait
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+	}
+	if wait <= 0 {
+		return false, "已超出本次运行的时间预算，结果未写入，请重新发起"
+	}
+	// 先试一次：空闲时直接拿到，不打扰用户。
+	release, acquired := s.acquireWorkspace(project.ID, owner)
+	if !acquired {
+		if onWait != nil {
+			onWait()
+		}
+		release, acquired = s.acquireWorkspaceWait(ctx, project.ID, owner, wait)
+	}
+	if !acquired {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return false, "已取消"
+		}
+		// 项目工作区被别的任务占用，且剩余时间不够继续等。文案要说清是占用问题，
+		// 而不是让用户以为模型分析出了问题。
+		return false, "项目工作区正被其他任务占用，未能在剩余时间内写入结果，请稍后重新发起"
+	}
+	defer release()
+	unchanged, revisionErr := s.insightWorkspaceUnchanged(ctx, project, revision)
+	if revisionErr != nil {
+		// 读不出快照与"工作区变了"是两回事，别混成同一句话。上下文已结束时优先报真实原因。
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return false, "已取消"
+		}
+		if ctx.Err() != nil {
+			return false, "已超出本次运行的时间预算，结果未写入，请重新发起"
+		}
+		log.Printf("[insights] project=%s publish: read workspace revision failed: %v", project.ID, revisionErr)
+		return false, "无法读取项目版本状态，本次结果未写入，请重新发起"
+	}
+	if !unchanged {
+		return false, "项目代码在处理过程中发生变化，已丢弃本轮结果，请重新发起"
+	}
+	if err := publish(ctx); err != nil {
+		log.Printf("[insights] project=%s publish: %v", project.ID, err)
+		return false, "写入分析结果失败，请重试"
+	}
+	return true, ""
 }
 
 func (s *Server) resolveVerifyTargets(ctx context.Context, projectID string, ids []string) ([]InsightFinding, error) {
 	if len(ids) == 0 {
 		rows, err := s.db.QueryContext(ctx, `select `+insightFindingColumns+` from project_insights
-			where project_id=? and coalesce(verification_result,'')<>'invalid' order by created_at asc`, projectID)
+			where project_id=? and coalesce(verification_result,'')<>'invalid' and coalesce(status,?)<>?
+			order by created_at asc`, projectID, insightStatusOpen, insightStatusDismissed)
 		if err != nil {
 			return nil, errors.New("读取待验证建议失败，请重试")
 		}
@@ -1442,7 +1786,9 @@ func (s *Server) resolveVerifyTargets(ctx context.Context, projectID string, ids
 		return out, nil
 	}
 	// 显式 ids：逐条校验归属（防越权，任一非法即报错），并去重避免同一条被
-	// 重复写/重复出现在 agent prompt 里。
+	// 重复写/重复出现在 agent prompt 里。「已忽略」在此与无 ids 分支同样跳过：调用方
+	// 不该因为传了 id 就能复核一条用户已明确表示不再提示的建议。已失效的仍允许核对
+	// （那是"重新验证"的正当用法——复核判 valid 才会把它恢复进有效列表）。
 	var out []InsightFinding
 	seen := map[string]bool{}
 	for _, id := range ids {
@@ -1453,6 +1799,9 @@ func (s *Server) resolveVerifyTargets(ctx context.Context, projectID string, ids
 		f, ok := s.loadInsightFinding(ctx, projectID, id)
 		if !ok {
 			return nil, errors.New("建议不存在或已被删除，请刷新后重试")
+		}
+		if f.Status == insightStatusDismissed {
+			continue
 		}
 		out = append(out, f)
 	}
@@ -1511,9 +1860,11 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	s.insightWG.Add(1)
 	s.insightMu.Unlock()
 
-	// 整个 worker 生命周期持有租约。应用内 Git、文件和 agent 写入使用同一租约，
-	// 因而无法在最终版本检查后、复核结果提交前修改工作区。
-	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, "insight-verify:"+verificationID)
+	// 准入检查（不是长期占用）：复核全程只读、不独占工作区，用户可以在复核期间继续用
+	// 项目；但若此刻项目正被别的任务改写，结论几乎必然在落库时被判作废，所以此时直接
+	// 让用户稍后再来。检查后立即释放：真正的互斥只发生在每批"版本复核 + 写库"那一小段
+	// （见 publishInsightResult）。
+	releaseAdmission, acquired := s.acquireProjectWorkspace(projectID, "insight-verify:"+verificationID)
 	if !acquired {
 		runCancel()
 		s.insightMu.Lock()
@@ -1524,12 +1875,7 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("项目工作区正在被其他任务修改，请稍候再试"))
 		return
 	}
-	workerStarted := false
-	defer func() {
-		if !workerStarted {
-			releaseWorkspace()
-		}
-	}()
+	releaseAdmission()
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		runCancel()
@@ -1599,19 +1945,27 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"findingIds": ids, "verificationId": verificationID})
 
+	// 让项目总览卡片的进度文案立刻亮起，而不是等 30s 兜底轮询。
+	s.broadcastStateEvent(stEvProjects, projectID)
+
 	// 后台执行。Done 在 goroutine 内调用，使 insightWG 精确跟踪验证生命周期，
 	// 供 Close() 等待（与 triggerInsightScan 同语义）。runCtx 已在登记 active 时创建：
 	// 项目被删除/用户停止时取消它，避免 agent 继续跑完无用功。
-	workerStarted = true
 	go func() {
 		defer s.insightWG.Done()
-		defer releaseWorkspace()
 		defer runCancel()
 		defer func() {
 			s.insightMu.Lock()
 			delete(s.insightActive, projectID)
 			delete(s.insightCancels, projectID)
 			s.insightMu.Unlock()
+		}()
+		// 兜底：worker 跑在裸 goroutine 里，panic 若逃逸会带走整个控制服务。
+		// runInsightFindingsVerifyRun 内部已自兜底（并写下终态），这里防的是它的外层。
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[insights] project=%s verify worker panic: %v\n%s", projectID, r, debug.Stack())
+			}
 		}()
 		s.runInsightFindingsVerifyRun(runCtx, projectID, verificationID, agentID, pendingTargets)
 	}()
@@ -1628,6 +1982,36 @@ var insightFpStripRE = regexp.MustCompile(`[\s\p{P}]+`)
 // insightFingerprint 把 title+summary 归一化为去重指纹（规则 1）：去空白/标点、转小写。
 func insightFingerprint(title, summary string) string {
 	return strings.ToLower(insightFpStripRE.ReplaceAllString(title+summary, ""))
+}
+
+// insightSurfacedLine 组装一行喂给发现 agent 的「历史已报告」条目。带上说明（截断）
+// 才能让模型识别"换个措辞的同一问题"；只给标题时它很容易把同一件事换个说法再报一次。
+func insightSurfacedLine(title, summary string) string {
+	title = strings.TrimSpace(title)
+	summary = truncateInsightLog(strings.TrimSpace(summary), insightHistorySummaryLimit)
+	if summary == "" {
+		return title
+	}
+	return title + " —— " + summary
+}
+
+// insightRejectionSummary 把被剔除候选压成一行短文案（最多 limit 条），供进度事件展示。
+func insightRejectionSummary(rejected []InsightRejection, limit int) string {
+	parts := make([]string, 0, min(limit, len(rejected)))
+	for i, r := range rejected {
+		if i >= limit {
+			break
+		}
+		if r.Reason == "" {
+			parts = append(parts, r.Title)
+			continue
+		}
+		parts = append(parts, r.Title+"（"+r.Reason+"）")
+	}
+	if len(rejected) > limit {
+		parts = append(parts, fmt.Sprintf("…另 %d 条", len(rejected)-limit))
+	}
+	return strings.Join(parts, "；")
 }
 
 // validateAndNormalize 钳制单个候选：合法 type/severity、非空 title、附指纹。
@@ -1859,6 +2243,14 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 			}
 		})
 	}
+	// 扫描 worker 跑在裸 goroutine 里（net/http 的 panic 兜底覆盖不到），一次 panic 会带走
+	// 整个控制服务（所有项目）。这里兜底：记录堆栈 + 把本次扫描置为可重试的失败。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[insights] project=%s scan panic: %v\n%s", projectID, r, debug.Stack())
+			markFailed("分析内部错误，请重试")
+		}
+	}()
 
 	project, err := s.getProjectByID(ctx, projectID)
 	if err != nil {
@@ -1875,12 +2267,18 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	emit("info", "开始优化建议分析…")
 
 	// 历史已报告指纹 + 清单（规则 1）：供 prompt 提示与落库去重。
-	prevRows, err := s.db.QueryContext(ctx, `select title,summary from project_insights where project_id=? and coalesce(verification_result,'')<>'invalid'`, projectID)
+	// 指纹集合来自全部历史行（含用户点了「不再提示」的，见 insightStatusDismissed）；
+	// 喂给模型的清单只取最近 insightHistoryPromptLimit 条，避免 prompt 随历史无限膨胀。
+	// 「已失效」行不参与：它们允许被重新发现（见落库处的复活语义）。
+	prevRows, err := s.db.QueryContext(ctx, `select title,summary from project_insights
+		where project_id=? and (coalesce(verification_result,'')<>'invalid' or status=?)
+		order by created_at desc`, projectID, insightStatusDismissed)
 	if err != nil {
 		markFailed("读取历史建议失败，请重试")
 		return
 	}
 	var alreadySurfaced []string
+	promptListFull := false
 	seenFP := map[string]struct{}{}
 	for prevRows.Next() {
 		var t, sm string
@@ -1889,8 +2287,12 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 			markFailed("读取历史建议失败，请重试")
 			return
 		}
-		alreadySurfaced = append(alreadySurfaced, t)
 		seenFP[insightFingerprint(t, sm)] = struct{}{}
+		if len(alreadySurfaced) < insightHistoryPromptLimit {
+			alreadySurfaced = append(alreadySurfaced, insightSurfacedLine(t, sm))
+		} else {
+			promptListFull = true
+		}
 	}
 	if err := prevRows.Err(); err != nil {
 		prevRows.Close()
@@ -1900,6 +2302,33 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	if err := prevRows.Close(); err != nil {
 		markFailed("读取历史建议失败，请重试")
 		return
+	}
+	// 「永不再报告」的指纹（用户编辑建议后遗留的旧指纹，见 project_insight_suppressions）：
+	// 它们没有对应的建议行可查，只能从这张表补齐，否则编辑前的原文会被再报一次。
+	suppRows, err := s.db.QueryContext(ctx, `select fingerprint from project_insight_suppressions where project_id=?`, projectID)
+	if err != nil {
+		markFailed("读取历史建议失败，请重试")
+		return
+	}
+	for suppRows.Next() {
+		var fingerprint string
+		if err := suppRows.Scan(&fingerprint); err != nil {
+			suppRows.Close()
+			markFailed("读取历史建议失败，请重试")
+			return
+		}
+		if fingerprint != "" {
+			seenFP[fingerprint] = struct{}{}
+		}
+	}
+	if err := suppRows.Err(); err != nil {
+		suppRows.Close()
+		markFailed("读取历史建议失败，请重试")
+		return
+	}
+	suppRows.Close()
+	if promptListFull {
+		emit("info", fmt.Sprintf("历史建议较多，已只把最近 %d 条交给分析器（去重仍覆盖全部历史）", insightHistoryPromptLimit))
 	}
 
 	workspaceRevision, revisionErr := s.insightWorkspaceRevision(ctx, project)
@@ -1968,7 +2397,8 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 		return
 	}
 
-	verified := map[int]bool{}
+	verified := map[int]insightVerifyOutcome{}
+	var rejected []InsightRejection
 	if len(candidates) > 0 {
 		emit("info", fmt.Sprintf("第 2 轮：逐项核实 %d 条候选…", len(candidates)))
 		verdict, bErr := s.runInsightVerifyBatches(ctx, project, agentID, candidates, emit)
@@ -1982,14 +2412,30 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 			}
 			return
 		}
+		verified = verdict
+		// 被核实剔除的候选连同 AI 给出的依据一并记下：规则 2（必须核实）唯一的可审计
+		// 来源，用户需要看到"哪几条被剔除、为什么"，否则无从发现模型误判。
+		for idx, c := range candidates {
+			outcome, ok := verified[idx+1]
+			if !ok || outcome.Confirmed {
+				continue
+			}
+			rejected = append(rejected, InsightRejection{
+				Title:  truncateInsightRunes(c.Title, 60),
+				Reason: truncateInsightRunes(strings.TrimSpace(outcome.Reason), insightRejectionReasonLimit),
+			})
+		}
 		confirmed := 0
-		for _, isConfirmed := range verdict {
-			if isConfirmed {
+		for _, outcome := range verified {
+			if outcome.Confirmed {
 				confirmed++
 			}
 		}
-		verified = verdict
 		emit("success", fmt.Sprintf("核实完成，确认 %d 条有效", confirmed))
+		if len(rejected) > 0 {
+			summary := fmt.Sprintf("核实剔除 %d 条未通过的候选：%s", len(rejected), insightRejectionSummary(rejected, 5))
+			emit("warn", summary)
+		}
 	}
 
 	// 归一化 + 去重（规则 1）+ 落库。
@@ -2002,7 +2448,7 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 		// 用 validateInsightVerdict 强制逐条判定（漏判/越界/重复都会让核实失败并终止扫描），
 		// 因此走到这里时 verified 应覆盖全部候选；此处"未覆盖按确认"仅是防御性兜底，
 		// 防止未来放宽校验时误吞真实发现。
-		if confirmed, ok := verified[idx+1]; ok && !confirmed {
+		if outcome, ok := verified[idx+1]; ok && !outcome.Confirmed {
 			continue
 		}
 		norm, ok := validateAndNormalize(c)
@@ -2016,56 +2462,66 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 		seenFP[norm.fingerprint] = struct{}{}
 		accepted = append(accepted, norm)
 	}
-	log.Printf("[insights] project=%s Post-B candidates=%d accepted=%d suppressed=%d", projectID, len(candidates), len(accepted), suppressed)
-	unchanged, revisionErr = s.insightWorkspaceUnchanged(ctx, project, workspaceRevision)
-	if revisionErr != nil || !unchanged {
-		markFailed("项目代码在分析中发生变化，已丢弃本轮结果，请重新发起")
-		return
-	}
+	log.Printf("[insights] project=%s Post-B candidates=%d accepted=%d suppressed=%d rejected=%d", projectID, len(candidates), len(accepted), suppressed, len(rejected))
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	// 落库。只读分析阶段并不持有工作区租约（用户可以在分析期间继续用项目），因此这里在
+	// 租约内先复核"工作区自扫描开始起未被修改"，再写库——publishInsightResult 负责等待
+	// 租约、复核版本、执行写入。工作区已变或租约等不到时，本次结果作废并明确告知用户。
+	rejectedJSON, err := json.Marshal(rejected)
 	if err != nil {
-		markFailed("写入分析结果失败，请重试")
-		return
+		log.Printf("[insights] project=%s marshal rejections: %v", projectID, err)
+		rejectedJSON = []byte("[]")
 	}
-	defer tx.Rollback() //nolint:errcheck
 	inserted := 0
-	for idx := range accepted {
-		f := &accepted[idx]
-		f.ID = uuid.NewString()
-		f.ProjectID = projectID
-		f.ScanID = scanID
-		f.CreatedAt = now
-		res, err := tx.ExecContext(ctx, `insert into project_insights
-			(id,project_id,scan_id,type,severity,title,summary,file_hint,fingerprint,status,created_at,updated_at)
-			values (?,?,?,?,?,?,?,?,?,?,?,?)
-			on conflict(project_id,fingerprint) do update set
-				scan_id=excluded.scan_id,type=excluded.type,severity=excluded.severity,title=excluded.title,
-				summary=excluded.summary,file_hint=excluded.file_hint,status=excluded.status,
-				verification_result='',verification_note='',verified_at=null,updated_at=excluded.updated_at
-			where project_insights.verification_result='invalid'`,
-			f.ID, f.ProjectID, f.ScanID, f.Type, f.Severity, f.Title, f.Summary, f.FileHint, f.fingerprint, f.Status, now, now)
-		if err != nil {
-			_ = tx.Rollback()
-			markFailed("写入分析结果失败，请重试")
-			return
-		}
-		if n, _ := res.RowsAffected(); n == 1 {
-			inserted++
-		} else {
-			suppressed++
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `update project_insight_scans
-		set status=?,agent=?,theme=?,focus_types=?,findings_count=?,suppressed_count=?,completed_at=?,repo_sha=? where id=?`,
-		insightScanCompleted, agentID, opts.Theme, strings.Join(opts.Types, ","), inserted, suppressed, now, repoSHA, scanID); err != nil {
-		_ = tx.Rollback()
-		markFailed("更新扫描状态失败，请重试")
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		_ = tx.Rollback()
-		markFailed("写入分析结果失败，请重试")
+	published, publishReason := s.publishInsightResult(ctx, project, workspaceRevision, "insight-publish:"+scanID,
+		func() { emit("info", "分析结果已就绪，正在等待项目空闲以写入…") },
+		func(publishCtx context.Context) error {
+			tx, err := s.db.BeginTx(publishCtx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback() //nolint:errcheck
+			inserted = 0
+			for idx := range accepted {
+				f := &accepted[idx]
+				f.ID = uuid.NewString()
+				f.ProjectID = projectID
+				f.ScanID = scanID
+				f.CreatedAt = now
+				// 复活语义：已失效（verification_result='invalid'）的建议允许被重新发现、
+				// 重新进入有效列表（问题可能确实没修好）。但用户显式点了「不再提示」
+				// （status='dismissed'）的不复活——那是用户的决定，不是 AI 的判定。
+				res, err := tx.ExecContext(publishCtx, `insert into project_insights
+					(id,project_id,scan_id,type,severity,title,summary,file_hint,fingerprint,status,created_at,updated_at)
+					values (?,?,?,?,?,?,?,?,?,?,?,?)
+					on conflict(project_id,fingerprint) do update set
+						scan_id=excluded.scan_id,type=excluded.type,severity=excluded.severity,title=excluded.title,
+						summary=excluded.summary,file_hint=excluded.file_hint,status=excluded.status,
+						verification_result='',verification_note='',verified_at=null,updated_at=excluded.updated_at
+					where project_insights.verification_result='invalid' and project_insights.status<>?`,
+					f.ID, f.ProjectID, f.ScanID, f.Type, f.Severity, f.Title, f.Summary, f.FileHint, f.fingerprint, insightStatusOpen, now, now, insightStatusDismissed)
+				if err != nil {
+					return err
+				}
+				if n, _ := res.RowsAffected(); n == 1 {
+					inserted++
+				} else {
+					suppressed++
+				}
+			}
+			// completed_at 取当前时刻而非上面的 now：等待租约可能耗掉一段时间（上限
+			// insightPublishLeaseWait），用户看到的"完成时间"应该是真正写完的时间。
+			if _, err := tx.ExecContext(publishCtx, `update project_insight_scans
+				set status=?,agent=?,theme=?,focus_types=?,findings_count=?,suppressed_count=?,completed_at=?,repo_sha=?,rejected_json=? where id=?`,
+				insightScanCompleted, agentID, opts.Theme, strings.Join(opts.Types, ","), inserted, suppressed, time.Now().UTC(), repoSHA, string(rejectedJSON), scanID); err != nil {
+				return err
+			}
+			return tx.Commit()
+		})
+	if !published {
+		// publishReason 一定非空且已区分取消/超预算/工作区占用/工作区变化/写库失败，
+		// markFailed 会在上下文被取消时按"已取消"收尾。
+		markFailed(publishReason)
 		return
 	}
 	emit("success", fmt.Sprintf("分析完成，新增 %d 条建议，忽略 %d 条重复", inserted, suppressed))
@@ -2114,16 +2570,19 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	}
 	// 先创建取消句柄并随 insightActive 一起登记，再解锁：让 cancel 端点也能命中
 	// "启动中"这一瞬间（置 active 到 goroutine 就绪之间），避免启动窗口内取消被当作
-	// no-op。runCancel 由 goroutine 的 defer 调用；若中途早退（工作区/落库失败）则在此
-	// 显式调用，幂等无副作用。
-	runCtx, runCancel := context.WithCancel(s.runtimeCtx)
+	// no-op。总预算 insightScanRunTimeout 从这一刻开始计，保证扫描不会无限期跑下去
+	// （单趟上限是"每趟"的，没有总预算时多趟 + 重试会累计成小时级）。
+	runCtx, runCancel := context.WithTimeout(s.runtimeCtx, insightScanRunTimeout)
 	s.insightActive[projectID] = true
 	s.insightCancels[projectID] = runCancel
 	s.insightWG.Add(1)
 	s.insightMu.Unlock()
 
-	// 整个只读扫描持有工作区租约，使最终工作区指纹检查与 Milevia 发起的所有写入串行。
-	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, "insight-scan:"+scanID)
+	// 准入检查（不是长期占用）：分析全程只读、不独占工作区，用户可以在分析期间继续
+	// 用项目；但若此刻项目正被别的任务改写，分析出的结论几乎必然在落库时被判作废，
+	// 因此此时直接告诉用户稍后再来，而不是让他白等一场。检查后立即释放，真正的互斥
+	// 只发生在"最终版本复核 + 写库"那一小段（见 publishInsightResult）。
+	releaseAdmission, acquired := s.acquireProjectWorkspace(projectID, "insight-scan:"+scanID)
 	if !acquired {
 		runCancel()
 		s.insightMu.Lock()
@@ -2134,12 +2593,7 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("项目工作区正在被其他任务修改，请稍候再试"))
 		return
 	}
-	workerStarted := false
-	defer func() {
-		if !workerStarted {
-			releaseWorkspace()
-		}
-	}()
+	releaseAdmission()
 	now := time.Now().UTC()
 	if _, err := s.db.ExecContext(r.Context(), `insert into project_insight_scans
 		(id,project_id,status,agent,theme,focus_types,findings_count,suppressed_count,created_at,started_at)
@@ -2158,20 +2612,28 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	scan := InsightScan{ID: scanID, ProjectID: projectID, Status: insightScanRunning, Agent: opts.Agent, Theme: opts.Theme, FocusTypes: opts.Types, FindingsCount: 0, SuppressedCount: 0, CreatedAt: now}
 	writeJSON(w, http.StatusAccepted, scan)
 
+	// 让项目总览卡片的「优化建议分析中」徽标立刻亮起，而不是等 30s 兜底轮询。
+	s.broadcastStateEvent(stEvProjects, projectID)
+
 	// 后台执行扫描。Done 在扫描 goroutine 内调用，使 insightWG 精确跟踪扫描生命周期，
 	// 供 Close() 等待（而非在 HTTP handler 返回时就 Done，那会让 Close 立即通过）。
 	// runCtx 已在登记 active 时创建：项目被删除/用户停止时取消它，避免 agent
 	// 继续跑完剩余阶段做无用功。
-	workerStarted = true
 	go func() {
 		defer s.insightWG.Done()
-		defer releaseWorkspace()
 		defer runCancel()
 		defer func() {
 			s.insightMu.Lock()
 			delete(s.insightActive, projectID)
 			delete(s.insightCancels, projectID)
 			s.insightMu.Unlock()
+		}()
+		// 兜底：worker 跑在裸 goroutine 里，panic 若逃逸会带走整个控制服务。
+		// runProjectInsightScan 内部已自兜底（并写下扫描终态），这里防的是它的外层。
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[insights] project=%s scan worker panic: %v\n%s", projectID, r, debug.Stack())
+			}
 		}()
 		s.runProjectInsightScan(runCtx, projectID, scanID, opts)
 	}()
@@ -2236,13 +2698,13 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 
 	resp := insightsResponse{DefaultAgent: s.currentInsightAgent(r.Context(), projectID), Findings: []InsightFinding{}, Events: []InsightEvent{}}
 	resp.Verification = s.loadRunningInsightVerification(r.Context(), projectID)
-	row := s.db.QueryRowContext(r.Context(), `select id,project_id,status,error,agent,theme,focus_types,findings_count,suppressed_count,created_at,started_at,completed_at
+	row := s.db.QueryRowContext(r.Context(), `select id,project_id,status,error,agent,theme,focus_types,findings_count,suppressed_count,created_at,started_at,completed_at,coalesce(rejected_json,'')
 		from project_insight_scans where project_id=? order by created_at desc limit 1`, projectID)
 	var scan InsightScan
 	var errMsg sql.NullString
-	var themeStr, focusStr sql.NullString
+	var themeStr, focusStr, rejectedJSON sql.NullString
 	var startedAt, completedAt sql.NullTime
-	err := row.Scan(&scan.ID, &scan.ProjectID, &scan.Status, &errMsg, &scan.Agent, &themeStr, &focusStr, &scan.FindingsCount, &scan.SuppressedCount, &scan.CreatedAt, &startedAt, &completedAt)
+	err := row.Scan(&scan.ID, &scan.ProjectID, &scan.Status, &errMsg, &scan.Agent, &themeStr, &focusStr, &scan.FindingsCount, &scan.SuppressedCount, &scan.CreatedAt, &startedAt, &completedAt, &rejectedJSON)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, errors.New("读取分析结果失败，请重试"))
 		return
@@ -2253,6 +2715,13 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 		if len(focusStr.String) > 0 {
 			scan.FocusTypes = strings.Split(focusStr.String, ",")
 		}
+		// 被核实剔除的候选（含 AI 给出的依据）：规则 2 的可审计性来源，只在完成态才有内容。
+		if raw := strings.TrimSpace(rejectedJSON.String); raw != "" && raw != "[]" {
+			var rejected []InsightRejection
+			if json.Unmarshal([]byte(raw), &rejected) == nil {
+				scan.Rejected = rejected
+			}
+		}
 		if startedAt.Valid {
 			scan.StartedAt = &startedAt.Time
 		}
@@ -2262,13 +2731,32 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 		resp.Scan = &scan
 		resp.HasScan = true
 		resp.SuppressedCount = scan.SuppressedCount
-		resp.Events = s.loadInsightEvents(r.Context(), scan.ID)
+		// 进度事件只在扫描进行中才有意义（前端也只在 running 时渲染日志）。扫描结束后
+		// 不再随每次 GET 把整份日志重传一遍。
+		//
+		// 轮询可带 sinceScan + sinceSeq 只取增量。**必须带上 sinceScan**：客户端手上的
+		// 游标可能属于上一次扫描，而新扫描的 seq 从 1 重新开始，若只按 seq 过滤会把新扫描
+		// 开头的事件永久漏掉（它们的 seq 小于旧游标）。id 不匹配就当作首次拉取，返回全量。
+		if scan.Status == insightScanRunning {
+			sinceSeq := 0
+			if r.URL.Query().Get("sinceScan") == scan.ID {
+				if parsed, convErr := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("sinceSeq"))); convErr == nil && parsed > 0 {
+					sinceSeq = parsed
+				}
+			}
+			resp.Events = s.loadInsightEvents(r.Context(), scan.ID, sinceSeq)
+		}
 
 		// 规则 1：发现跨扫描去重累积。展示的是本项目"当前仍有效的建议全集"
 		//（union 而非只看最新一次扫描），否则"仅命中重复的新扫描"会让既有建议从视图消失。
-		// 经验证已失效（verification_result='invalid'）的建议不在此列，单独折叠返回。
-		rows, err := s.db.QueryContext(r.Context(), `select `+insightFindingColumns+` from project_insights where project_id=? and coalesce(verification_result,'')<>'invalid' order by
-			case severity when 'high' then 0 when 'normal' then 1 else 2 end, created_at asc`, projectID)
+		// 经验证已失效（verification_result='invalid'）的建议不在此列，单独折叠返回；
+		// 用户点了「不再提示」（status='dismissed'）的同样不进有效列表，另作折叠。
+		// 排序按严重度优先、同级取较新者，配合 insightFindingsListLimit 的截断语义：
+		// 触顶时丢掉的是"较旧的次要建议"，而不是任意条目。
+		rows, err := s.db.QueryContext(r.Context(), `select `+insightFindingColumns+` from project_insights
+			where project_id=? and coalesce(verification_result,'')<>'invalid' and coalesce(status,?)<>? order by
+			case severity when 'high' then 0 when 'normal' then 1 else 2 end, created_at desc limit ?`,
+			projectID, insightStatusOpen, insightStatusDismissed, insightFindingsListLimit+1)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, errors.New("读取分析结果失败，请重试"))
 			return
@@ -2284,9 +2772,17 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rows.Close()
+		resp.FindingsLimit = insightFindingsListLimit
+		if len(resp.Findings) > insightFindingsListLimit {
+			resp.Findings = resp.Findings[:insightFindingsListLimit]
+			resp.Truncated = true
+		}
 
 		// 已失效建议（验证判定不再成立）：按最近验证时间倒序返回，供前端折叠展示原因。
-		invRows, err := s.db.QueryContext(r.Context(), `select `+insightFindingColumns+` from project_insights where project_id=? and coalesce(verification_result,'')='invalid' order by coalesce(verified_at,created_at) desc`, projectID)
+		invRows, err := s.db.QueryContext(r.Context(), `select `+insightFindingColumns+` from project_insights
+			where project_id=? and coalesce(verification_result,'')='invalid' and coalesce(status,?)<>?
+			order by coalesce(verified_at,created_at) desc limit ?`,
+			projectID, insightStatusOpen, insightStatusDismissed, insightFindingsListLimit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, errors.New("读取分析结果失败，请重试"))
 			return
@@ -2302,6 +2798,36 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		invRows.Close()
+
+		// 用户点了「不再提示」的建议：折叠展示，可恢复（恢复后重新进入有效列表）。
+		disRows, err := s.db.QueryContext(r.Context(), `select `+insightFindingColumns+` from project_insights
+			where project_id=? and coalesce(status,?)=? order by created_at desc limit ?`,
+			projectID, insightStatusOpen, insightStatusDismissed, insightFindingsListLimit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("读取分析结果失败，请重试"))
+			return
+		}
+		for disRows.Next() {
+			if f, err := scanInsightFinding(disRows.Scan); err == nil {
+				resp.Dismissed = append(resp.Dismissed, f)
+			}
+		}
+		if err := disRows.Err(); err != nil {
+			disRows.Close()
+			writeError(w, http.StatusInternalServerError, errors.New("读取分析结果失败，请重试"))
+			return
+		}
+		disRows.Close()
+
+		// 建议已转成任务的状态标注：让卡片能显示"已转为任务 · 进行中"，并阻止为同一
+		// 问题重复建任务（见 convertInsightToTask 的重复防护）。
+		linked := s.loadInsightLinkedTasks(r.Context(), projectID)
+		for i := range resp.Findings {
+			if task, ok := linked[insightFingerprint(resp.Findings[i].Title, resp.Findings[i].Summary)]; ok {
+				resp.Findings[i].LinkedTaskStatus = task.Status
+				resp.Findings[i].LinkedTaskTitle = task.Title
+			}
+		}
 		resp.OpenCount = len(resp.Findings)
 		writeJSON(w, http.StatusOK, resp)
 		return
@@ -2310,11 +2836,45 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// insightUpdateRequest PATCH /insights/{findingID} 的可选 body：仅允许改 title/summary/severity。
+// insightLinkedTask 是建议指纹到任务状态的投影（用于卡片标注与重复建任务防护）。
+type insightLinkedTask struct {
+	Status string
+	Title  string
+}
+
+// loadInsightLinkedTasks 返回本项目"由优化建议转成的任务"的指纹 → 任务状态映射。
+// 同一指纹可能有多个历史任务（完成后又转了一次），这里取**最新**的那个：转换在
+// "同指纹已有未完成任务"时被拒绝（见 convertInsightToTask），因此同一指纹最多只会
+// 有一个未完成任务，且它必然是最新的——取最新即等价于"要看的那个任务"。
+func (s *Server) loadInsightLinkedTasks(ctx context.Context, projectID string) map[string]insightLinkedTask {
+	rows, err := s.db.QueryContext(ctx, `select source_insight_fingerprint,status,title from tasks
+		where project_id=? and coalesce(source_insight_fingerprint,'')<>'' order by created_at desc`, projectID)
+	if err != nil {
+		log.Printf("[insights] project=%s load linked tasks: %v", projectID, err)
+		return nil
+	}
+	defer rows.Close()
+	out := map[string]insightLinkedTask{}
+	for rows.Next() {
+		var fingerprint, status, title string
+		if err := rows.Scan(&fingerprint, &status, &title); err != nil {
+			continue
+		}
+		if _, seen := out[fingerprint]; seen {
+			continue // DESC 顺序：先到的是最新的，后续更旧的一律忽略
+		}
+		out[fingerprint] = insightLinkedTask{Status: status, Title: title}
+	}
+	return out
+}
+
+// insightUpdateRequest PATCH /insights/{findingID} 的可选 body：只允许改
+// title/summary/severity/type 这四个展示字段（fingerprint 由 title+summary 派生）。
 type insightUpdateRequest struct {
 	Title    *string `json:"title"`
 	Summary  *string `json:"summary"`
 	Severity *string `json:"severity"`
+	Type     *string `json:"type"`
 }
 
 // insightFindingColumns 是查询 project_insights 全部展示列的前缀（含再验证三列）。
@@ -2388,8 +2948,8 @@ func (s *Server) updateInsightFinding(w http.ResponseWriter, r *http.Request) {
 	if !decodeOptional(w, r, &input) {
 		return
 	}
-	if input.Title == nil && input.Summary == nil && input.Severity == nil {
-		writeError(w, http.StatusBadRequest, errors.New("请至少提供 title/summary/severity 之一"))
+	if input.Title == nil && input.Summary == nil && input.Severity == nil && input.Type == nil {
+		writeError(w, http.StatusBadRequest, errors.New("请至少提供 title/summary/severity/type 之一"))
 		return
 	}
 	// 合并输入：未提供的字段沿用原值。
@@ -2407,6 +2967,12 @@ func (s *Server) updateInsightFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	if sev != insightSeverityLow && sev != insightSeverityNormal && sev != insightSeverityHigh {
 		sev = insightSeverityNormal
+	}
+	// 类型可改：模型把"bug"报成"optimization"时，用户应能就地纠正，而不是删掉重报
+	// （删掉重报会让同一问题在下次扫描里以原类型再次出现）。非法值归一为 optimization。
+	itemType := f.Type
+	if input.Type != nil {
+		itemType = normalizeInsightTypeOrDefault(strings.TrimSpace(*input.Type))
 	}
 	if title == "" {
 		writeError(w, http.StatusBadRequest, errors.New("标题不能为空"))
@@ -2433,12 +2999,69 @@ func (s *Server) updateInsightFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 编辑即改变建议内容：上一轮验证（valid/invalid/failed）随之失效，重置为未验证。
-	if _, err := tx.ExecContext(r.Context(), `update project_insights set title=?,summary=?,severity=?,fingerprint=?,verification_result='',verification_note='',verified_at=NULL,updated_at=? where id=? and project_id=?`,
-		title, summary, sev, newFP, now, findingID, projectID); err != nil {
+	// 顺带把用户「不再提示」的旧指纹记进 superseded 指纹表：否则下次扫描会把编辑前的
+	// 原文当成一条新建议再报一次，与编辑后的卡片并存。
+	oldFP := insightFingerprint(f.Title, f.Summary)
+	if _, err := tx.ExecContext(r.Context(), `update project_insights set title=?,summary=?,severity=?,type=?,fingerprint=?,verification_result='',verification_note='',verified_at=NULL,updated_at=? where id=? and project_id=?`,
+		title, summary, sev, itemType, newFP, now, findingID, projectID); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存失败，请重试"))
 		return
 	}
+	if oldFP != "" && oldFP != newFP {
+		if _, err := tx.ExecContext(r.Context(), `insert into project_insight_suppressions (project_id,fingerprint,reason,created_at) values (?,?,?,?)
+			on conflict(project_id,fingerprint) do nothing`, projectID, oldFP, insightSuppressionSuperseded, now); err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("保存失败，请重试"))
+			return
+		}
+	}
 	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("保存失败，请重试"))
+		return
+	}
+	updated, ok := s.loadInsightFinding(r.Context(), projectID, findingID)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("保存失败，请重试"))
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// normalizeInsightTypeOrDefault 把任意字符串归一到四类枚举之一（非法值回退 optimization）。
+func normalizeInsightTypeOrDefault(value string) string {
+	for _, known := range insightTypeOrder {
+		if value == known {
+			return value
+		}
+	}
+	return insightOptimization
+}
+
+// setInsightDismissed POST /api/projects/{projectID}/insights/{findingID}/dismiss
+// 把一条建议标为「不再提示」：从有效列表移入折叠区，且后续扫描不再上报它。
+// 与"删除"的区别：删除是硬删（下次扫描会重新报告），不再提示是用户对该问题的明确
+// 处置（保留记录、可恢复、不再打扰）。
+func (s *Server) setInsightDismissed(w http.ResponseWriter, r *http.Request) {
+	s.updateInsightDismissed(w, r, insightStatusDismissed)
+}
+
+// clearInsightDismissed DELETE /api/projects/{projectID}/insights/{findingID}/dismiss
+// 恢复一条被「不再提示」的建议，让它重新回到有效列表（并再次参与复核/转任务）。
+func (s *Server) clearInsightDismissed(w http.ResponseWriter, r *http.Request) {
+	s.updateInsightDismissed(w, r, insightStatusOpen)
+}
+
+func (s *Server) updateInsightDismissed(w http.ResponseWriter, r *http.Request, status string) {
+	projectID := r.PathValue("projectID")
+	findingID := r.PathValue("findingID")
+	if !s.projectExists(r.Context(), projectID) {
+		http.NotFound(w, r)
+		return
+	}
+	if _, ok := s.loadInsightFinding(r.Context(), projectID, findingID); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := s.db.ExecContext(r.Context(), `update project_insights set status=? where id=? and project_id=?`, status, findingID, projectID); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存失败，请重试"))
 		return
 	}
@@ -2460,6 +3083,11 @@ func (s *Server) updateInsightFinding(w http.ResponseWriter, r *http.Request) {
 // 不复存在）。这是有意为之：任务尚未真正修复前，问题仍可能存在，必须允许再次被
 // 扫描发现并再次处置。不要改成软删/标记已处理/仅隐藏，否则该问题会被指纹去重吞掉、
 // 永远不再上报。与手动"删除"按钮（deleteInsightFinding）语义一致。见 docs/25 §4.1/§6.7。
+//
+// 与之配套的重复防护（不是去重的替代）：任务本身记下来源指纹
+// （tasks.source_insight_fingerprint），同一指纹已存在"未完成任务"时拒绝再次转换——
+// 问题仍可被重新发现、仍可再次处置（等该任务到终态即可），但不会为同一个问题反复
+// 堆出多个任务。删除/编辑建议不受影响。
 
 // insightSeverityLabels 供任务说明组装：严重度 → 用户可读的中文标签。
 var insightSeverityLabels = map[string]string{
@@ -2535,14 +3163,19 @@ func (s *Server) addInsightToTask(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// 与 UI 一致：建议复核中或已被判失效时不允许转任务。复核未出结果前转任务可能为
-	// 不存在的问题建任务；已失效则是为已修复/伪问题建任务，浪费一次任务执行。
+	// 与 UI 一致：建议复核中、已被判失效、或已被用户「不再提示」时不允许转任务。复核未出
+	// 结果前转任务可能为不存在的问题建任务；已失效则是为已修复/伪问题建任务；已忽略则是
+	// 用户已明确表示不需要处理，转任务违背其意图。
 	if f.VerificationResult == insightVerifyPending {
 		writeError(w, http.StatusConflict, errors.New("该建议正在复核中，请稍后再试"))
 		return
 	}
 	if f.VerificationResult == insightVerifyInvalid {
 		writeError(w, http.StatusConflict, errors.New("该建议已失效，请刷新后重试"))
+		return
+	}
+	if f.Status == insightStatusDismissed {
+		writeError(w, http.StatusConflict, errors.New("该建议已设为不再提示，请先恢复后再转任务"))
 		return
 	}
 	// 防御：正常流水线（扫描/PATCH）不会产出空白标题，但这是数据写入点，空标题任务
@@ -2556,8 +3189,13 @@ func (s *Server) addInsightToTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 并发防重：另一请求（双标签页/重复点击）已先转走并硬删该建议 → 视为已被处理。
+	// 并发防重：另一请求（双标签页/重复点击）已先转走并硬删该建议，或同一问题已有未完成
+	// 任务 → 区分文案，让用户知道是"已被处理"还是"已有一个未完成任务"。
 	if !converted {
+		if linked, ok := s.loadInsightLinkedTasks(r.Context(), projectID)[insightFingerprint(f.Title, f.Summary)]; ok && !insightTaskTerminal(linked.Status) {
+			writeError(w, http.StatusConflict, errors.New("该问题已转为任务且尚未完成（「"+linked.Title+"」），请先在任务板处理"))
+			return
+		}
 		writeError(w, http.StatusConflict, errors.New("该建议已被处理，请刷新后重试"))
 		return
 	}
@@ -2566,10 +3204,12 @@ func (s *Server) addInsightToTask(w http.ResponseWriter, r *http.Request) {
 
 // convertInsightToTask 在同一事务里把一条建议转成任务并硬删建议，返回 (task, converted, err)：
 //   - converted=true：任务已创建、建议已删除。
-//   - converted=false, err=nil：建议已不存在或被并发处理（含复核中突变），未创建任务，调用方按跳过处理。
+//   - converted=false, err=nil：建议已不存在、被并发处理（含复核中/已失效/已忽略突变），或
+//     同一问题已存在未完成任务，未创建任务，调用方按跳过处理。
 //   - err != nil：真实失败（已包装用户可读信息）。
 func (s *Server) convertInsightToTask(ctx context.Context, projectID string, f InsightFinding) (Task, bool, error) {
 	now := time.Now().UTC()
+	fingerprint := insightFingerprint(f.Title, f.Summary)
 	task := Task{
 		ID:          uuid.NewString(),
 		ProjectID:   projectID,
@@ -2593,11 +3233,22 @@ func (s *Server) convertInsightToTask(ctx context.Context, projectID string, f I
 		return Task{}, false, errors.New("创建任务失败，请重试")
 	}
 	defer tx.Rollback() //nolint:errcheck
+	// 重复防护：同一建议指纹已有"未完成任务"时不再新建。问题的再次发现完全不受影响
+	// （扫描仍会重新报告它），只是不再为同一个问题反复堆任务；等该任务进入终态后即可
+	// 再次转换。这里在事务内查询，与并发转换串行。
+	var openLinked int
+	if err := tx.QueryRowContext(ctx, `select count(*) from tasks where project_id=? and source_insight_fingerprint=?
+		and status not in (?,?)`, projectID, fingerprint, taskDone, taskCancelled).Scan(&openLinked); err != nil {
+		return Task{}, false, errors.New("创建任务失败，请重试")
+	}
+	if openLinked > 0 {
+		return Task{}, false, nil
+	}
 	if err := tx.QueryRowContext(ctx, `select coalesce(max(position),0)+1 from tasks where project_id=?`, projectID).Scan(&task.Position); err != nil {
 		return Task{}, false, errors.New("创建任务失败，请重试")
 	}
-	if _, err := tx.ExecContext(ctx, `insert into tasks (id,project_id,title,description,priority,pinned,position,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?)`,
-		task.ID, task.ProjectID, task.Title, task.Description, task.Priority, false, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `insert into tasks (id,project_id,title,description,priority,pinned,position,status,created_at,updated_at,source_insight_fingerprint) values (?,?,?,?,?,?,?,?,?,?,?)`,
+		task.ID, task.ProjectID, task.Title, task.Description, task.Priority, false, task.Position, task.Status, task.CreatedAt, task.UpdatedAt, fingerprint); err != nil {
 		return Task{}, false, errors.New("创建任务失败，请重试")
 	}
 	if err := s.recordTaskEventTx(ctx, tx, task.ID, "", "task.created", map[string]string{"status": task.Status}, now); err != nil {
@@ -2606,9 +3257,11 @@ func (s *Server) convertInsightToTask(ctx context.Context, projectID string, f I
 	// 建议已转为任务：从列表删除（硬删）。
 	// 【规则 · 勿改】硬删 = 下次扫描会重新报告同一问题（指纹消失）。这是有意的：
 	// 任务未真正修复前问题仍可能存在，必须允许再被发现。勿改为软删/已处理/仅隐藏。
-	// WHERE 追加防护：批量转换时复核可能刚把该建议置为 pending 或判为 invalid，
-	// 跳过避免为未定论/已失效问题建任务（单条端点同样受益于这层并发防护）。
-	res, err := tx.ExecContext(ctx, `delete from project_insights where id=? and project_id=? and coalesce(verification_result,'')<>'pending' and coalesce(verification_result,'')<>'invalid'`, f.ID, projectID)
+	// WHERE 追加防护：批量转换时复核可能刚把该建议置为 pending 或判为 invalid、用户
+	// 也可能刚点了「不再提示」，跳过避免为未定论/已失效/已忽略的问题建任务。
+	res, err := tx.ExecContext(ctx, `delete from project_insights where id=? and project_id=?
+		and coalesce(verification_result,'')<>'pending' and coalesce(verification_result,'')<>'invalid'
+		and coalesce(status,?)<>?`, f.ID, projectID, insightStatusOpen, insightStatusDismissed)
 	if err != nil {
 		return Task{}, false, errors.New("删除建议失败，请重试")
 	}
@@ -2627,14 +3280,15 @@ func (s *Server) convertInsightToTask(ctx context.Context, projectID string, f I
 	return task, true, nil
 }
 
-// resolveToTaskTargets 解析批量转任务的目标建议：缺省 = 全部未失效建议（已失效单独折叠展示，
-// 复核中保留 —— 由 convertInsightToTask 的 pending 删除防护在事务内判定为"跳过"并计数）。
-// 显式 ids 逐条校验归属并跳过已失效/不存在的；不存在的 id 忽略。批量是尽力而为，一条不该阻塞其余。
+// resolveToTaskTargets 解析批量转任务的目标建议：缺省 = 全部未失效且未被「不再提示」的建议
+// （已失效/已忽略单独折叠展示，复核中保留 —— 由 convertInsightToTask 的 pending 删除防护在
+// 事务内判定为"跳过"并计数）。显式 ids 逐条校验归属并跳过已失效/已忽略/不存在的；不存在的
+// id 忽略。批量是尽力而为，一条不该阻塞其余。
 func (s *Server) resolveToTaskTargets(ctx context.Context, projectID string, ids []string) ([]InsightFinding, error) {
 	if len(ids) == 0 {
 		rows, err := s.db.QueryContext(ctx, `select `+insightFindingColumns+` from project_insights
-			where project_id=? and coalesce(verification_result,'')<>'invalid'
-			order by created_at asc`, projectID)
+			where project_id=? and coalesce(verification_result,'')<>'invalid' and coalesce(status,?)<>?
+			order by created_at asc`, projectID, insightStatusOpen, insightStatusDismissed)
 		if err != nil {
 			return nil, errors.New("读取建议失败，请重试")
 		}
@@ -2661,7 +3315,7 @@ func (s *Server) resolveToTaskTargets(ctx context.Context, projectID string, ids
 		if !ok {
 			continue
 		}
-		if f.VerificationResult == insightVerifyInvalid {
+		if f.VerificationResult == insightVerifyInvalid || f.Status == insightStatusDismissed {
 			continue
 		}
 		out = append(out, f)

@@ -954,8 +954,9 @@ func TestValidateInsightVerdictRejectsInvalidIndexes(t *testing.T) {
 		out := insightVerifyVerdict{}
 		for _, index := range indexes {
 			out.Findings = append(out.Findings, struct {
-				Index     int  `json:"index"`
-				Confirmed bool `json:"confirmed"`
+				Index     int    `json:"index"`
+				Confirmed bool   `json:"confirmed"`
+				Reason    string `json:"reason"`
 			}{Index: index, Confirmed: true})
 		}
 		return out
@@ -1573,7 +1574,7 @@ func TestRunInsightScanEmitsProgressEvents(t *testing.T) {
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	scanID := insertSyncInsightScan(t, server, projectID)
 
-	events := server.loadInsightEvents(context.Background(), scanID)
+	events := server.loadInsightEvents(context.Background(), scanID, 0)
 	if len(events) == 0 {
 		t.Fatal("expected progress events, got none")
 	}
@@ -1605,25 +1606,52 @@ func TestRunInsightScanEmitsProgressEvents(t *testing.T) {
 	}
 }
 
-func TestListInsightsIncludesProgressEvents(t *testing.T) {
+// 进度事件只随「进行中」的扫描返回：扫描完成后前端不渲染日志，不应再让每次 GET 把
+// 整份历史日志重传一遍（轮询时用 sinceSeq 只取增量）。
+func TestListInsightsReturnsProgressEventsOnlyWhileRunning(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
 	passA := `[{"type":"bug","severity":"high","title":"a","summary":"s"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
-	_ = insertSyncInsightScan(t, server, projectID)
+	scanID := insertSyncInsightScan(t, server, projectID)
 
+	// 完成态：不再返回事件（日志在扫描期间已实时展示过）。
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/insights", nil))
 	resp := insightDecode[insightsResponse](t, rec, http.StatusOK)
 	if resp.Scan == nil || resp.Scan.Status != insightScanCompleted {
 		t.Fatalf("scan: %+v", resp.Scan)
 	}
+	if len(resp.Events) != 0 {
+		t.Fatalf("completed scan should not return progress events, got %d", len(resp.Events))
+	}
+	// 扫描期间写入的事件仍然留在库里（完成态只是不随响应返回）。
+	if stored := server.loadInsightEvents(context.Background(), scanID, 0); len(stored) == 0 {
+		t.Fatal("expected progress events persisted for the scan")
+	}
+	// 把扫描改回 running：此时应返回全部事件，且带 sinceSeq 时只返回增量。
+	if _, err := server.db.Exec(`update project_insight_scans set status='running' where id=?`, scanID); err != nil {
+		t.Fatalf("set scan running: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/insights", nil))
+	resp = insightDecode[insightsResponse](t, rec, http.StatusOK)
 	if len(resp.Events) == 0 {
-		t.Fatal("expected events in list response")
+		t.Fatal("expected events in list response while running")
 	}
 	if !strings.Contains(resp.Events[len(resp.Events)-1].Message, "分析完成") {
 		t.Errorf("last event should be completion, got %q", resp.Events[len(resp.Events)-1].Message)
+	}
+	lastSeq := resp.Events[len(resp.Events)-1].Seq
+	server.appendInsightEvent(context.Background(), scanID, "info", "增量事件")
+	rec = httptest.NewRecorder()
+	// 增量游标必须带上所属扫描 id（sinceScan）：游标只对同一次扫描有效，
+	// 否则新扫描从 1 重开的 seq 会被旧游标永久过滤掉。
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/projects/%s/insights?sinceScan=%s&sinceSeq=%d", projectID, scanID, lastSeq), nil))
+	incremental := insightDecode[insightsResponse](t, rec, http.StatusOK)
+	if len(incremental.Events) != 1 || incremental.Events[0].Message != "增量事件" {
+		t.Fatalf("sinceSeq should return only newer events, got %+v", incremental.Events)
 	}
 }
 

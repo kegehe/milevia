@@ -6,17 +6,20 @@ import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import {
   filterFindingsByType,
   insightFindingCounts,
+  insightLinkedTaskLabel,
   insightSeverityLabels,
   insightThemeLabels,
   insightThemes,
   insightTypeLabels,
   insightTypeOrder,
   insightVerificationLabels,
+  maxInsightEventSeq,
   normalizeInsightSeverity,
   normalizeInsightTheme,
   normalizeInsightType,
   normalizeInsightVerification,
   sortFindings,
+  toggleInsightType,
   type InsightEvent,
   type InsightFilter,
   type InsightFinding,
@@ -49,10 +52,12 @@ function formatLogTime(ts: string): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-export function InsightsPanel({ projectID, request, fail }: {
+export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   projectID: string;
   request: Request;
   fail: (message: string) => void;
+  // 点击卡片的"查看文件"时跳转到文件页并打开该文件（未提供则只展示路径）。
+  onOpenFile?: (path: string) => void;
 }) {
   const [scan, setScan] = useState<InsightScan | null>(null);
   const [findings, setFindings] = useState<InsightFinding[]>([]);
@@ -60,16 +65,22 @@ export function InsightsPanel({ projectID, request, fail }: {
   const [hasScan, setHasScan] = useState(false);
   const [suppressed, setSuppressed] = useState(0);
   const [openCount, setOpenCount] = useState(0);
+  const [truncated, setTruncated] = useState(false);
+  const [findingsLimit, setFindingsLimit] = useState(0);
   const [filter, setFilter] = useState<InsightFilter>("all");
   const [theme, setTheme] = useState<InsightTheme>("");
   const [agent, setAgent] = useState<InsightAgent>("claude-code");
   // 默认全部分类选中：后端对"四类全勾选"会归一为空（全查），故 UI 初始即全部勾选，
-  // 既符合后端语义也让"全部分类"按钮保持激活态；用户仍可逐个取消来收窄。
+  // 既符合后端语义也让"全部分类"按钮保持激活态；用户仍可逐个取消来收窄（最后一项
+  // 由 toggleInsightType 拦住，见那里的说明）。
   const [focusTypes, setFocusTypes] = useState<InsightType[]>([...insightTypeOrder]);
   const [busy, setBusy] = useState(false);
   const [invalidated, setInvalidated] = useState<InsightFinding[]>([]);
+  const [dismissed, setDismissed] = useState<InsightFinding[]>([]);
   const [verification, setVerification] = useState<InsightVerificationRun | null>(null);
   const [showInvalidated, setShowInvalidated] = useState(false);
+  const [showDismissed, setShowDismissed] = useState(false);
+  const [showRejected, setShowRejected] = useState(false);
   const [verifyAllBusy, setVerifyAllBusy] = useState(false);
   const [addAllBusy, setAddAllBusy] = useState(false);
   // 「全部添加为任务」的确认框：批量转换会一次硬删全部建议，误触成本高，需确认。
@@ -82,11 +93,21 @@ export function InsightsPanel({ projectID, request, fail }: {
   const requestVersion = useRef(0);
   const scanIdRef = useRef<string | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
+  // 已拉取到的最大事件 seq：轮询时只取增量，避免每次把整份日志重传。
+  const eventSeqRef = useRef(0);
 
   const loadInsights = useCallback(async () => {
     const version = ++requestVersion.current;
-    const res = await request<{ defaultAgent?: string; scan: InsightScan | null; findings: InsightFinding[]; events: InsightEvent[]; hasScan: boolean; suppressedCount: number; openCount: number; invalidated?: InsightFinding[]; verification?: InsightVerificationRun | null }>(
-      `/api/projects/${projectID}/insights`,
+    // 增量拉取进度事件：把「上一次拿到事件的扫描 id + 该扫描的最大 seq」一起交给服务端，
+    // 由它判断游标是否属于当前这次扫描。只按 seq 过滤是不行的——客户端手上的游标可能
+    // 属于上一次扫描，而新扫描的 seq 从 1 重开，会把它开头的事件永久漏掉。
+    const cursorScan = scanIdRef.current;
+    const sinceSeq = cursorScan !== null ? eventSeqRef.current : 0;
+    const cursorQuery = cursorScan !== null && sinceSeq > 0
+      ? `?sinceScan=${encodeURIComponent(cursorScan)}&sinceSeq=${sinceSeq}`
+      : "";
+    const res = await request<{ defaultAgent?: string; scan: InsightScan | null; findings: InsightFinding[]; events: InsightEvent[]; hasScan: boolean; suppressedCount: number; openCount: number; invalidated?: InsightFinding[]; dismissed?: InsightFinding[]; truncated?: boolean; findingsLimit?: number; verification?: InsightVerificationRun | null }>(
+      `/api/projects/${projectID}/insights${cursorQuery}`,
     );
     if (!mountedRef.current || version !== requestVersion.current) return;
     setScan(res.scan);
@@ -99,23 +120,34 @@ export function InsightsPanel({ projectID, request, fail }: {
     }
     setFindings(res.findings);
     setInvalidated(res.invalidated ?? []);
+    setDismissed(res.dismissed ?? []);
+    setTruncated(res.truncated === true);
+    setFindingsLimit(res.findingsLimit ?? 0);
     setVerification(res.verification ?? null);
     // 同步 in-flight 集合：只保留当前确实 pending 的建议。结果到达（valid/invalid/
     // failed）后自动清除，轮询随之停止；POST 后立即刷新也能借此拿到 pending。
     const pending = new Set<string>();
     for (const f of res.findings) if (f.verificationResult === "pending") pending.add(f.id);
     for (const f of res.invalidated ?? []) if (f.verificationResult === "pending") pending.add(f.id);
+    for (const f of res.dismissed ?? []) if (f.verificationResult === "pending") pending.add(f.id);
     setVerifyInFlight(pending);
-    // 进度事件按 id 去重追加；切换了新扫描（scan id 变化）则整体替换，避免新旧日志混排。
+    // 进度事件：切换了扫描（scan id 变化）则整体替换，避免新旧日志混排。服务端在
+    // sinceScan 与当前扫描不符时会返回全量，因此替换用的 incoming 一定是完整的。
     const scanId = res.scan?.id ?? null;
     const scanChanged = scanId !== scanIdRef.current;
+    const incoming = res.events ?? [];
     scanIdRef.current = scanId;
-    setEvents((prev) => {
-      if (scanChanged) return res.events ?? [];
-      const known = new Set(prev.map((event) => event.id));
-      const fresh = (res.events ?? []).filter((event) => !known.has(event.id));
-      return fresh.length > 0 ? [...prev, ...fresh] : prev;
-    });
+    if (scanChanged) {
+      eventSeqRef.current = maxInsightEventSeq(incoming);
+      setEvents(incoming);
+    } else {
+      eventSeqRef.current = Math.max(eventSeqRef.current, maxInsightEventSeq(incoming));
+      setEvents((prev) => {
+        const known = new Set(prev.map((event) => event.id));
+        const fresh = incoming.filter((event) => !known.has(event.id));
+        return fresh.length > 0 ? [...prev, ...fresh] : prev;
+      });
+    }
     setHasScan(res.hasScan);
     setSuppressed(res.suppressedCount);
     setOpenCount(res.openCount ?? res.findings.length);
@@ -130,6 +162,10 @@ export function InsightsPanel({ projectID, request, fail }: {
     agentSelectionInitializedRef.current = false;
     setAgent("claude-code");
     setFocusTypes([...insightTypeOrder]);
+    // 切换项目：清掉上一个项目的事件游标与日志，避免把两个项目的进度混排。
+    scanIdRef.current = null;
+    eventSeqRef.current = 0;
+    setEvents([]);
   }, [projectID]);
 
   useEffect(() => {
@@ -142,7 +178,8 @@ export function InsightsPanel({ projectID, request, fail }: {
     verification?.status === "running" ||
     verifyInFlight.size > 0 ||
     findings.some((f) => f.verificationResult === "pending") ||
-    invalidated.some((f) => f.verificationResult === "pending");
+    invalidated.some((f) => f.verificationResult === "pending") ||
+    dismissed.some((f) => f.verificationResult === "pending");
   // 页面不可见（窗口最小化/切到后台标签页）时暂停轮询，避免空耗请求与电量；
   // 仅在从「不可见」回到「可见」的那一下补拉一次，补齐后台期间服务器侧已推进的状态。
   const documentVisible = useDocumentVisible();
@@ -169,15 +206,16 @@ export function InsightsPanel({ projectID, request, fail }: {
   const startScan = async () => {
     if (busy) return;
     setBusy(true);
-    const version = ++requestVersion.current;
     try {
       await request(`/api/projects/${projectID}/insights/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ agent, theme, types: focusTypes }),
       });
-      if (!mountedRef.current || version !== requestVersion.current) return;
-      // 触发后直接拉一次以立即进入 running。
+      if (!mountedRef.current) return;
+      // 触发后直接拉一次以立即进入 running。不在此处比较 requestVersion：翻页请求
+      // 自身有版本保护，而"跳过这次刷新"会让 UI 停在没有 scan 的旧状态上——此时轮询
+      // 还没启动（它由 scan.status==='running' 驱动），界面会一直不动。
       await loadInsights();
     } catch (cause) {
       if (mountedRef.current) fail(cause instanceof Error ? cause.message : "启动分析失败，请重试");
@@ -207,7 +245,7 @@ export function InsightsPanel({ projectID, request, fail }: {
   };
 
   const toggleType = (type: InsightType) => {
-    setFocusTypes((prev) => (prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]));
+    setFocusTypes((prev) => toggleInsightType(prev, type));
   };
 
   const selectAgent = (nextAgent: InsightAgent) => {
@@ -309,6 +347,22 @@ export function InsightsPanel({ projectID, request, fail }: {
     }
     if (!mountedRef.current) return;
     await loadInsights().catch(() => undefined);
+  };
+
+  // 「不再提示」/「恢复」：用户对某条建议的显式处置。标记后该建议移入折叠区，且后续
+  // 扫描不再上报它（与"删除"不同：删除是硬删，下次扫描会重新报告）。
+  const setDismissedState = async (id: string, nextDismissed: boolean) => {
+    try {
+      await request(`/api/projects/${projectID}/insights/${id}/dismiss`, {
+        method: nextDismissed ? "POST" : "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: nextDismissed ? "{}" : undefined,
+      });
+      if (!mountedRef.current) return;
+      await loadInsights().catch(() => undefined);
+    } catch (cause) {
+      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "操作失败，请重试");
+    }
   };
   // 空 = 全查（后端语义），故 "全部分类" 是一个单向"全选"动作而非可切换的开关——
   // 不存在有意义的"关掉=不查"状态（清空仍等价于全查）。全选后 user 仍可逐个取消来收窄。
@@ -487,13 +541,23 @@ export function InsightsPanel({ projectID, request, fail }: {
             {scan && scan.findingsCount > 0 && <span className="insights-new">本次新增 {scan.findingsCount} 条</span>}
             {focusLabel && <span className="insights-focus">{focusLabel}</span>}
             {suppressed > 0 && <span className="insights-suppressed">已忽略 {suppressed} 条此前报告过的建议</span>}
+            {scan && scan.rejected && scan.rejected.length > 0 && (
+              <button
+                type="button"
+                className={`insights-rejected-toggle${showRejected ? " active" : ""}`}
+                onClick={() => setShowRejected((v) => !v)}
+                title="查看本次分析在第 2 轮独立核实中被剔除的候选及其原因"
+              >
+                核实剔除 {scan.rejected.length} 条
+              </button>
+            )}
             <span className="insights-summary-actions">
               <button
                 type="button"
                 className="insight-add-all"
                 onClick={() => setConfirmAddAll(true)}
                 disabled={running || busy || addAllBusy || openCount === 0}
-                title="把当前全部有效建议一键添加为任务（复核中/已失效的自动跳过）"
+                title="把当前全部有效建议一键添加为任务（复核中/已失效/已忽略的自动跳过）"
               >
                 {addAllBusy ? "正在添加…" : "全部添加为任务"}
               </button>
@@ -516,8 +580,41 @@ export function InsightsPanel({ projectID, request, fail }: {
                   已失效 {invalidated.length} 条
                 </button>
               )}
+              {dismissed.length > 0 && (
+                <button
+                  type="button"
+                  className={`insight-dismissed-toggle${showDismissed ? " active" : ""}`}
+                  onClick={() => setShowDismissed((v) => !v)}
+                  title="查看已设为「不再提示」的建议（这些建议不会被后续分析再次上报）"
+                >
+                  已忽略 {dismissed.length} 条
+                </button>
+              )}
             </span>
           </div>
+
+          {truncated && (
+            <section className="insights-notice" role="status">
+              建议数量较多，仅显示前 {findingsLimit || openCount} 条；处理掉一部分后即可看到其余建议。
+            </section>
+          )}
+
+          {scan && scan.rejected && scan.rejected.length > 0 && showRejected && (
+            <section className="insights-rejected" aria-label="被核实剔除的候选">
+              <div className="insights-rejected-head">
+                <b>第 2 轮核实剔除的候选</b>
+                <small>这些候选在独立核实中被判定为不成立（伪需求 / 假 bug / 项目已具备），未写入建议列表。若认为判断有误，可点「开始分析」重新分析或在编辑后自行添加。</small>
+              </div>
+              <ul>
+                {scan.rejected.map((item, index) => (
+                  <li key={`${item.title}-${index}`}>
+                    <b>{item.title}</b>
+                    {item.reason ? <span>{item.reason}</span> : <span className="muted">（未给出原因）</span>}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
 
           <div className="insights-filters" role="tablist" aria-label="按类型筛选">
             <button type="button" className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>全部 <small>{counts.all}</small></button>
@@ -536,9 +633,11 @@ export function InsightsPanel({ projectID, request, fail }: {
                 projectID={projectID}
                 request={request}
                 onDeleted={() => void loadInsights()}
+                onDismissed={(next) => void setDismissedState(finding.id, next)}
                 fail={fail}
                 verifying={verifyInFlight.has(finding.id)}
                 onVerify={() => void verifyFinding(finding.id)}
+                onOpenFile={onOpenFile}
               />
             ))}
             {visible.length === 0 && <li className="insights-none">当前筛选下没有发现。</li>}
@@ -558,10 +657,38 @@ export function InsightsPanel({ projectID, request, fail }: {
                     projectID={projectID}
                     request={request}
                     onDeleted={() => void loadInsights()}
+                    onDismissed={(next) => void setDismissedState(finding.id, next)}
                     fail={fail}
                     invalidated
                     verifying={verifyInFlight.has(finding.id)}
                     onVerify={() => void verifyFinding(finding.id)}
+                    onOpenFile={onOpenFile}
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {dismissed.length > 0 && showDismissed && (
+            <section className="insights-dismissed" aria-label="已忽略建议">
+              <div className="insights-dismissed-head">
+                <b>已设为不再提示的建议</b>
+                <small>这些建议不会再出现在后续分析的结果里（分析器不会再报告同一问题）。恢复后会重新进入有效列表。</small>
+              </div>
+              <ul className="insights-list">
+                {dismissed.map((finding) => (
+                  <InsightsFindingCard
+                    key={finding.id}
+                    finding={finding}
+                    projectID={projectID}
+                    request={request}
+                    onDeleted={() => void loadInsights()}
+                    onDismissed={(next) => void setDismissedState(finding.id, next)}
+                    fail={fail}
+                    dismissed
+                    verifying={verifyInFlight.has(finding.id)}
+                    onVerify={() => void verifyFinding(finding.id)}
+                    onOpenFile={onOpenFile}
                   />
                 ))}
               </ul>
@@ -641,25 +768,30 @@ function InsightVerifyBadge({ result, note, verifiedAt }: {
   return null;
 }
 
-function InsightsFindingCard({ finding, projectID, request, onDeleted, fail, invalidated = false, verifying = false, onVerify }: {
+function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismissed, fail, invalidated = false, dismissed = false, verifying = false, onVerify, onOpenFile }: {
   finding: InsightFinding;
   projectID: string;
   request: Request;
   onDeleted: () => void;
+  // 切换「不再提示」状态（true=设为不再提示，false=恢复）。
+  onDismissed: (nextDismissed: boolean) => void;
   fail: (message: string) => void;
   invalidated?: boolean;
+  dismissed?: boolean;
   // 面板级 in-flight 标记：POST 后立即为 true，轮询拿到 pending 后仍为 true，
   // 结果落库（loadInsights 同步 verifyInFlight）后变回 false。
   verifying?: boolean;
   onVerify?: () => void;
+  onOpenFile?: (path: string) => void;
 }) {
   const type = normalizeInsightType(finding.type);
   const severity = normalizeInsightSeverity(finding.severity);
   const verificationResult = normalizeInsightVerification(finding.verificationResult);
   const isVerifying = verifying || verificationResult === "pending";
+  const linkedLabel = insightLinkedTaskLabel(finding);
   const [editing, setEditing] = useState(false);
   const [confirming, setConfirming] = useState(false);
-  const [draft, setDraft] = useState({ title: finding.title, summary: finding.summary, severity });
+  const [draft, setDraft] = useState({ title: finding.title, summary: finding.summary, severity, type });
   const [saving, setSaving] = useState(false);
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -668,7 +800,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, fail, inv
   }, []);
 
   const beginEdit = () => {
-    setDraft({ title: finding.title, summary: finding.summary, severity });
+    setDraft({ title: finding.title, summary: finding.summary, severity, type });
     setEditing(true);
   };
 
@@ -683,7 +815,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, fail, inv
       await request(`/api/projects/${projectID}/insights/${finding.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, summary: draft.summary.trim(), severity: draft.severity }),
+        body: JSON.stringify({ title, summary: draft.summary.trim(), severity: draft.severity, type: draft.type }),
       });
       setEditing(false);
       onDeleted(); // 触发父级 loadInsights 刷新
@@ -711,6 +843,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, fail, inv
   // 【规则 · 勿改】转任务后必须硬删（而非软删/标记已处理/仅隐藏）：下次扫描会重新
   // 报告同一问题（指纹消失），因为任务执行完之前问题可能仍然存在。改动这里会破坏
   // "问题可被再次发现"的语义。后端对应注释见 insights.go convertInsightToTask。
+  // 同一问题已有未完成任务时后端会拒绝（409），避免反复堆重复任务。
   const addToTask = async () => {
     if (saving) return;
     setSaving(true);
@@ -742,6 +875,12 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, fail, inv
           <textarea value={draft.summary} onChange={(e) => setDraft((d) => ({ ...d, summary: e.target.value }))} rows={3} placeholder="面向用户的两三句说明" />
         </label>
         <label className="insight-edit-field insight-edit-severity">
+          <span>类型</span>
+          <select value={draft.type} onChange={(e) => setDraft((d) => ({ ...d, type: e.target.value as InsightType }))}>
+            {insightTypeOrder.map((t) => <option key={t} value={t}>{insightTypeLabels[t]}</option>)}
+          </select>
+        </label>
+        <label className="insight-edit-field insight-edit-severity">
           <span>严重度</span>
           <select value={draft.severity} onChange={(e) => setDraft((d) => ({ ...d, severity: e.target.value as InsightFinding["severity"] }))}>
             <option value="high">高</option>
@@ -758,7 +897,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, fail, inv
   }
 
   return (
-    <li className={`insight-card${invalidated ? " invalidated" : ""}`}>
+    <li className={`insight-card${invalidated ? " invalidated" : ""}${dismissed ? " dismissed" : ""}`}>
       <span className={`insight-card-type insight-type-${type}`}><TypeIcon type={type} />{insightTypeLabels[type]}</span>
       <b>{finding.title}</b>
       <p>{finding.summary}</p>
@@ -773,32 +912,44 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, fail, inv
       )}
       <div className="insight-card-foot">
         <span className={`insight-severity insight-severity-${severity}`}>{insightSeverityLabels[severity]}</span>
-        {finding.fileHint && <span className="insight-file" title={finding.fileHint}>{finding.fileHint}</span>}
+        {finding.fileHint && (
+          onOpenFile
+            ? <button type="button" className="insight-file link" title={`打开 ${finding.fileHint}`} onClick={() => onOpenFile(finding.fileHint!)}>{finding.fileHint}</button>
+            : <span className="insight-file" title={finding.fileHint}>{finding.fileHint}</span>
+        )}
+        {linkedLabel && <span className={`insight-linked-task${finding.linkedTaskStatus === "done" || finding.linkedTaskStatus === "cancelled" ? " terminal" : ""}`} title={finding.linkedTaskTitle || undefined}>{linkedLabel}</span>}
         <InsightVerifyBadge result={verificationResult} note={finding.verificationNote} verifiedAt={finding.verifiedAt} />
       </div>
       <div className="insight-card-actions">
-        <button
-          type="button"
-          className="insight-action"
-          onClick={onVerify}
-          disabled={isVerifying || saving}
-          title="调用 AI 复核此建议在当前代码里是否仍然成立（项目可能已被其它任务迭代修改）"
-        >
-          {isVerifying ? <InsightVerifySpinner /> : <VerifyIcon />}
-          {isVerifying ? "验证中…" : verificationResult !== "" || invalidated ? "重新验证" : "验证"}
-        </button>
-        {!invalidated && (
+        {!dismissed && (
+          <button
+            type="button"
+            className="insight-action"
+            onClick={onVerify}
+            disabled={isVerifying || saving}
+            title="调用 AI 复核此建议在当前代码里是否仍然成立（项目可能已被其它任务迭代修改）"
+          >
+            {isVerifying ? <InsightVerifySpinner /> : <VerifyIcon />}
+            {isVerifying ? "验证中…" : verificationResult !== "" || invalidated ? "重新验证" : "验证"}
+          </button>
+        )}
+        {!invalidated && !dismissed && (
           <button type="button" className="insight-action" onClick={() => void addToTask()} disabled={saving || isVerifying} title="添加到任务，通过任务下发执行（复核中暂不可转）"><AddTaskIcon />添加到任务</button>
         )}
         {!invalidated && (
           <button type="button" className="insight-action" onClick={beginEdit} disabled={saving} title="编辑此建议">编辑</button>
+        )}
+        {dismissed ? (
+          <button type="button" className="insight-action" onClick={() => onDismissed(false)} disabled={saving} title="恢复此建议，让它重新进入有效列表">恢复</button>
+        ) : (
+          <button type="button" className="insight-action" onClick={() => onDismissed(true)} disabled={saving || isVerifying} title="不再提示：此建议移入已忽略列表，后续分析也不再上报同一问题">不再提示</button>
         )}
         <button type="button" className="insight-action danger" onClick={() => setConfirming(true)} disabled={saving} title="删除此建议">删除</button>
       </div>
       {confirming && createPortal(
         <ConfirmDialog
           title="删除建议"
-          message={<>确定删除"<b>{finding.title}</b>"？删除后无法恢复，下次扫描该问题可能再次出现。</>}
+          message={<>确定删除"<b>{finding.title}</b>"？删除后无法恢复，下次扫描该问题可能再次出现。若只是不想再看到它，请改用「不再提示」。</>}
           confirmLabel="删除"
           danger
           busy={saving}

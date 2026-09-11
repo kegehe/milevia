@@ -214,3 +214,9 @@ export function getBaseName(path: string): string {
   const idx = path.lastIndexOf("/");
   return idx >= 0 ? path.substring(idx + 1) : path;
 }
+
+// ─── 跨页面深链用的会话内传参 key ────────────────────────────────────────────
+// 其它页面跳到文件页时，通过 sessionStorage 传"要打开哪个文件"（与"添加到对话"的
+// milevia_add_file_to_chat 同一套路）。放在 feature 模块里而不是某个页面里，避免
+// 页面之间互相 import。
+export const OPEN_FILE_STORAGE_KEY = "milevia_open_file";

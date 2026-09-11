@@ -18,6 +18,11 @@ interface FilesPanelProps {
   isWorkspaceOccupied: boolean;
   onAddToChat?: (path: string) => void;
   registerNavigationGuard: (guard: NavigationGuard | null) => void;
+  // 进入面板时自动打开的文件（相对项目根的路径）。用于从其它页面深链跳到某个文件，
+  // 例如优化建议卡片的「查看文件」。只在挂载后消费一次。
+  initialPath?: string | null;
+  // initialPath 被消费后回调，让持有方清掉它（避免下次进入又打开同一个文件）。
+  onInitialPathConsumed?: () => void;
 }
 
 const MAX_OPEN_TABS = 10;
@@ -44,6 +49,8 @@ export function FilesPanel({
   isWorkspaceOccupied,
   onAddToChat,
   registerNavigationGuard,
+  initialPath,
+  onInitialPathConsumed,
 }: FilesPanelProps) {
 	const workspaceQuery = conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : "";
 	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${workspaceQuery}`;
@@ -217,6 +224,18 @@ export function FilesPanel({
     },
     [projectId, request] // openFilesRef / pendingOpens 是 ref 不需要作为依赖
   );
+
+  // 深链打开指定文件（如优化建议卡片的「查看文件」）。只消费一次：打开后通知持有方清掉，
+  // 否则下次回到文件页会再次自动打开同一个文件。
+  const initialPathConsumedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const target = initialPath?.trim();
+    if (!target || initialPathConsumedRef.current === target) return;
+    initialPathConsumedRef.current = target;
+    const name = target.split(/[\\/]/).pop() || target;
+    void openFile(target, name);
+    onInitialPathConsumed?.();
+  }, [initialPath, openFile, onInitialPathConsumed]);
 
   // 关闭标签
   const closeTab = useCallback(

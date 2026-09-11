@@ -18,6 +18,8 @@ export type InsightScan = {
   focusTypes?: string[];
   findingsCount: number;
   suppressedCount: number;
+  // 本次扫描被核实环节剔除的候选（含依据）。
+  rejected?: InsightRejection[];
   createdAt: string;
   startedAt?: string | null;
   completedAt?: string | null;
@@ -39,7 +41,35 @@ export type InsightFinding = {
   verificationResult?: InsightVerificationResult;
   verificationNote?: string;
   verifiedAt?: string | null;
+  // 该建议已转成的任务的状态/标题（后端按指纹关联，仅存在同指纹任务时非空）。
+  linkedTaskStatus?: string;
+  linkedTaskTitle?: string;
 };
+
+// 「已转任务」对用户可见的文案：任务到终态后说明可以重新处理。
+export const insightTaskStatusLabels: Record<string, string> = {
+  todo: "待办",
+  running: "进行中",
+  awaiting_review: "待复核",
+  action_required: "需处理",
+  done: "已完成",
+  cancelled: "已取消",
+};
+
+/** 已关联任务的展示文案；任务已完成/取消时提示可重新转任务。 */
+export function insightLinkedTaskLabel(finding: InsightFinding): string | null {
+  const status = finding.linkedTaskStatus;
+  if (!status) return null;
+  const label = insightTaskStatusLabels[status] ?? status;
+  const terminal = status === "done" || status === "cancelled";
+  const base = `已转为任务 · ${label}`;
+  return terminal ? `${base}（可重新添加）` : base;
+}
+
+// 「不再提示」状态：用户显式处置过的建议，折叠展示、不再被扫描上报。
+export function isInsightDismissed(finding: InsightFinding): boolean {
+  return finding.status === "dismissed";
+}
 
 // 建议再验证的结果状态，与后端 insightVerify* 常量一一对应。
 export type InsightVerificationResult = "" | "pending" | "valid" | "invalid" | "failed";
@@ -56,6 +86,13 @@ export type InsightVerificationRun = {
   completedAt?: string | null;
 };
 
+// 一条被「第 2 轮独立核实」剔除的候选（含 AI 给出的依据）。规则 2 的可审计性来源：
+// 用户需要看到哪几条被剔除、为什么，否则无从发现模型误判。
+export type InsightRejection = {
+  title: string;
+  reason?: string;
+};
+
 export type InsightsResponse = {
   defaultAgent?: string;
   scan: InsightScan | null;
@@ -67,6 +104,11 @@ export type InsightsResponse = {
   verification?: InsightVerificationRun | null;
   // 经验证已失效、从有效列表隐藏的建议（折叠展示，含 AI 判断依据）。
   invalidated?: InsightFinding[];
+  // 用户点了「不再提示」的建议（折叠展示，可恢复）。
+  dismissed?: InsightFinding[];
+  // 列表触到后端上限（findingsLimit）时为 true，前端提示"仅显示最近 N 条"。
+  truncated?: boolean;
+  findingsLimit?: number;
 };
 
 // 一条分析过程中的进度消息（"分析信息"滚动展示）。level 与后端一一对应。
@@ -165,6 +207,28 @@ export function sortFindings(findings: InsightFinding[]): InsightFinding[] {
 export function filterFindingsByType(findings: InsightFinding[], filter: InsightFilter): InsightFinding[] {
   if (filter === "all") return findings;
   return findings.filter((f) => normalizeInsightType(f.type) === filter);
+}
+
+/**
+ * 切换一个查找类型的勾选。**至少保留一项**：后端把"空数组"与"全选"都归一为"全查"，
+ * 因此取消最后一项得到的不是"什么都不查"，而是"查全部"——与用户意图正好相反。
+ * 这里直接拦住，避免出现"一项没勾却查得最多"的迷惑状态。
+ */
+export function toggleInsightType(types: InsightType[], type: InsightType): InsightType[] {
+  if (types.includes(type)) {
+    if (types.length <= 1) return types;
+    return types.filter((t) => t !== type);
+  }
+  return [...types, type];
+}
+
+/** 进度事件里最大的 seq（用于增量拉取；无事件时为 0）。 */
+export function maxInsightEventSeq(events: InsightEvent[]): number {
+  let max = 0;
+  for (const event of events) {
+    if (event.seq > max) max = event.seq;
+  }
+  return max;
 }
 
 export function insightFindingCounts(findings: InsightFinding[]): Record<InsightFilter, number> {

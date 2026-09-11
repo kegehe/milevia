@@ -1,6 +1,7 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useOutletContext, useParams } from "react-router-dom";
 import { FilesPanel } from "../features/files/FilesPanel";
+import { OPEN_FILE_STORAGE_KEY } from "../features/files/file-model";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useActiveConversationId } from "../lib/use-active-conversation";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
@@ -11,6 +12,12 @@ export default function FilesPage() {
   const { project, registerNavigationGuard, navigateWithGuard } = useOutletContext<ProjectLayoutOutletContext>();
   const { api, projectStatuses } = useProjectContext();
   const conversationId = useActiveConversationId(projectId);
+  // 只读一次：消费后立刻清掉，避免下次进入文件页又自动打开同一个文件。
+  const [initialPath, setInitialPath] = useState<string | null>(() => sessionStorage.getItem(OPEN_FILE_STORAGE_KEY));
+  const consumeInitialPath = useCallback(() => {
+    sessionStorage.removeItem(OPEN_FILE_STORAGE_KEY);
+    setInitialPath(null);
+  }, []);
 
   // 检查当前项目是否有 AI 运行中
   const status = projectStatuses[projectId ?? ""];
@@ -32,6 +39,8 @@ export default function FilesPage() {
       isWorkspaceOccupied={isWorkspaceOccupied}
       onAddToChat={handleAddToChat}
       registerNavigationGuard={registerNavigationGuard}
+      initialPath={initialPath}
+      onInitialPathConsumed={consumeInitialPath}
     />
   );
 }
