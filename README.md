@@ -223,7 +223,9 @@ pnpm --filter @milevia/web build
 # 启动桌面开发模式（增量编译 sidecar，仅源码变更时重编）
 pnpm --filter @milevia/desktop dev
 
-# 发布安装包前注入部署注册令牌（不要提交到 Git）：
+# 首次注册：注册令牌不会进入安装包（构建脚本只导出公开的云端地址）。
+# 在目标机器上为桌面进程设置该环境变量，Agent 子进程会继承它自动注册一次；
+# 也可以启动后在桌面页的输入框里粘贴。
 $env:MILEVIA_AGENT_ENROLLMENT_TOKEN = "replace-with-deployment-token"
 # 如需强制重新编译 sidecar（忽略缓存）：
 node apps/desktop/scripts/build-sidecar.mjs --force

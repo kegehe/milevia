@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
 	"net"
@@ -33,6 +34,54 @@ type Config struct {
 	AppURL          string
 }
 
+// eventBroker fans PostgreSQL notifications out to the connected mobile event
+// streams. The deployment is a single node, so no external pub/sub is needed;
+// the point is that a freshly stored event wakes every stream immediately
+// instead of costing each connected phone a full poll interval of dead time.
+type eventBroker struct {
+	mu   sync.Mutex
+	subs map[chan string]string
+}
+
+func newEventBroker() *eventBroker {
+	return &eventBroker{subs: map[chan string]string{}}
+}
+
+// subscribe registers a listener for exactly one instance. Filtering here rather
+// than inside the stream matters twice over: a stream is never woken by another
+// computer's events, and it can therefore collapse its own backlog after a drain
+// without ever swallowing a wake-up meant for a different instance.
+func (b *eventBroker) subscribe(instanceID string) chan string {
+	ch := make(chan string, 64)
+	b.mu.Lock()
+	b.subs[ch] = instanceID
+	b.mu.Unlock()
+	return ch
+}
+
+func (b *eventBroker) unsubscribe(ch chan string) {
+	b.mu.Lock()
+	if _, ok := b.subs[ch]; ok {
+		delete(b.subs, ch)
+		close(ch)
+	}
+	b.mu.Unlock()
+}
+
+func (b *eventBroker) publish(instanceID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch, subscribed := range b.subs {
+		if subscribed != instanceID {
+			continue
+		}
+		select {
+		case ch <- instanceID:
+		default:
+		}
+	}
+}
+
 type Server struct {
 	db          *pgxpool.Pool
 	config      Config
@@ -44,6 +93,10 @@ type Server struct {
 	registerLimiter *rateLimiter
 	claimLimiter    *rateLimiter
 	statusLimiter   *rateLimiter
+	// events carries LISTEN notifications to the mobile event streams.
+	events *eventBroker
+	// listenCancel stops the dedicated LISTEN connection when the server closes.
+	listenCancel context.CancelFunc
 }
 
 // rateLimiter is a per-client token bucket held in process memory. The current
@@ -168,6 +221,26 @@ type eventEnvelope struct {
 const (
 	cloudEventRetentionPerInstance = 5000
 	cloudEventPruneInterval        = 100
+	// eventNotifyChannel is the PostgreSQL NOTIFY channel carrying instance IDs.
+	// Only the instance ID travels in the payload, which keeps it far below the
+	// 8000 byte NOTIFY limit and avoids duplicating event bodies.
+	eventNotifyChannel = "milevia_events"
+	// mobileStreamFallbackInterval bounds how long a mobile stream can stay
+	// stale if a notification is lost — while the LISTEN connection reconnects,
+	// or when a subscriber channel overflowed. Notifications are the fast path;
+	// this only guarantees convergence.
+	mobileStreamFallbackInterval = 2 * time.Second
+	// cloudEventBatchSize is the most events one page of a drain reads.
+	cloudEventBatchSize = 100
+	// cloudEventCatchUpPerDrain caps how many events a single drain delivers
+	// before returning. A client resuming from a very old cursor is caught up
+	// over several drains instead of pinning the handler in one long loop.
+	cloudEventCatchUpPerDrain = 500
+	// cloudEventBackfillWindow is how far behind the cursor an out-of-order
+	// upload is still picked up. It must not exceed cloudEventBatchSize: the
+	// backfill reads the window oldest-first with a limit, so a wider window
+	// would fill up with already-sent rows and hide a late arrival beyond them.
+	cloudEventBackfillWindow = cloudEventBatchSize
 )
 
 func New(ctx context.Context, config Config) (*Server, error) {
@@ -188,15 +261,80 @@ func New(ctx context.Context, config Config) (*Server, error) {
 		registerLimiter: newRateLimiter(10, 30),
 		claimLimiter:    newRateLimiter(10, 30),
 		statusLimiter:   newRateLimiter(60, 300),
+		events:          newEventBroker(),
 	}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
+	// The LISTEN connection deliberately does not inherit the caller's context:
+	// it has to outlive whatever request or startup context created the server,
+	// and only stops on Close.
+	listenCtx, cancel := context.WithCancel(context.Background())
+	s.listenCancel = cancel
+	go s.runEventListener(listenCtx)
 	return s, nil
 }
 
+// runEventListener keeps a dedicated connection subscribed to eventNotifyChannel
+// and forwards matching notifications to the in-process broker.
+//
+// pgxpool cannot be used here: a pooled connection may be handed to another
+// caller at any time, which would silently end the subscription. Reconnects are
+// retried with bounded backoff, and mobile streams keep a fallback poll so a
+// listener outage degrades latency instead of stalling updates.
+func (s *Server) runEventListener(ctx context.Context) {
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := s.listenOnce(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("postgres LISTEN %s unavailable: %v", eventNotifyChannel, err)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (s *Server) listenOnce(ctx context.Context) error {
+	conn, err := pgx.Connect(ctx, s.config.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}()
+	if _, err := conn.Exec(ctx, "listen "+eventNotifyChannel); err != nil {
+		return err
+	}
+	for {
+		notification, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			return err
+		}
+		if notification.Channel == eventNotifyChannel && notification.Payload != "" {
+			s.events.publish(notification.Payload)
+		}
+	}
+}
+
 func (s *Server) Close() {
+	// Stop the LISTEN connection before closing the pool it was created from.
+	if s.listenCancel != nil {
+		s.listenCancel()
+	}
 	s.mu.Lock()
 	connections := make([]*websocket.Conn, 0, len(s.connections))
 	for _, conn := range s.connections {
@@ -696,17 +834,65 @@ func (s *Server) mobileEventStream(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
-	// Keep relay latency below the Agent outbox interval while avoiding a
-	// tight database polling loop for every connected mobile client.
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	// PostgreSQL notifications are the fast path: a stored event wakes this
+	// stream within one round trip instead of waiting out a poll interval. The
+	// slow fallback poll exists only so that a missed notification — during a
+	// LISTEN reconnect, or when this subscriber's channel overflowed — costs
+	// latency rather than correctness.
+	notifications := s.events.subscribe(instanceID)
+	defer s.events.unsubscribe(notifications)
+	fallback := time.NewTicker(mobileStreamFallbackInterval)
+	defer fallback.Stop()
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
-	// A reconnect or concurrent upload can deliver sequences out of order. Keep
-	// a bounded sent set and rescan the retained tail so a late lower sequence
-	// is still delivered instead of being hidden by the largest cursor.
+	// collapseNotifications drops wake-ups that the upcoming read is about to
+	// satisfy. storeEvent notifies once per stored event, so a batch of 100
+	// events would otherwise cost 100 further queries that all come back empty.
+	// Only this instance's wake-ups are ever queued here, so collapsing cannot
+	// swallow a notification belonging to another computer.
+	collapseNotifications := func() {
+		for {
+			select {
+			case <-notifications:
+			default:
+				return
+			}
+		}
+	}
+	// Sequences are assigned locally, so an upload that overtakes another can
+	// only land a little behind the cursor. One batch of slack absorbs that.
 	sentSequences := make(map[int64]struct{})
-	firstPoll := true
+	// A stream with no resume cursor starts at the live edge instead of
+	// replaying the retained history. The client fetches a full snapshot on
+	// load, so a replay would push thousands of stored events to a phone that
+	// already has their result — and, because delivery is bounded per pass,
+	// those stale events would delay the live ones behind them.
+	if lastSequence == 0 {
+		if newest, err := s.instanceEventCursor(r.Context(), instanceID); err == nil {
+			lastSequence = newest
+		}
+	}
+	// Deliver whatever is already queued before blocking, so a fresh connection
+	// does not start with an empty round trip of waiting.
+	ok, more := s.drainInstanceEvents(r.Context(), instanceID, &lastSequence, sentSequences, writeEvent)
+	if !ok {
+		return
+	}
+	// catchUp re-enters the drain without waiting for a wake-up. It carries the
+	// case where a drain hit its per-pass cap with events still waiting, so a
+	// client resuming far behind converges in one go instead of at one cap per
+	// notification.
+	catchUp := make(chan struct{}, 1)
+	scheduleCatchUp := func(pending bool) {
+		if !pending {
+			return
+		}
+		select {
+		case catchUp <- struct{}{}:
+		default:
+		}
+	}
+	scheduleCatchUp(more)
 	for {
 		select {
 		case <-r.Context().Done():
@@ -714,45 +900,121 @@ func (s *Server) mobileEventStream(w http.ResponseWriter, r *http.Request) {
 		case <-keepalive.C:
 			fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
-		case <-ticker.C:
-			fromSequence := lastSequence
-			if !firstPoll {
-				fromSequence = lastSequence - cloudEventRetentionPerInstance
+			continue
+		case <-notifications:
+		case <-catchUp:
+		case <-fallback.C:
+		}
+		// Every wake-up means the same thing: look at the events again. Drop the
+		// wake-ups this pass is about to satisfy first, so a batch of stored
+		// events costs one query instead of one per event; anything that arrives
+		// while the read below is in flight stays queued and causes another
+		// pass, so collapsing here cannot swallow an event.
+		collapseNotifications()
+		ok, more := s.drainInstanceEvents(r.Context(), instanceID, &lastSequence, sentSequences, writeEvent)
+		if !ok {
+			return
+		}
+		scheduleCatchUp(more)
+	}
+}
+
+// instanceEventCursor returns the newest stored sequence for an instance, used
+// to start a cursorless stream at the live edge.
+func (s *Server) instanceEventCursor(ctx context.Context, instanceID string) (int64, error) {
+	var newest int64
+	err := s.db.QueryRow(ctx, `select coalesce(max(agent_sequence),0) from cloud_events where instance_id=$1`, instanceID).Scan(&newest)
+	return newest, err
+}
+
+// drainInstanceEvents delivers everything the stream has not sent yet.
+//
+// Two passes, because one query cannot do both jobs:
+//
+//   - Forward catch-up walks strictly newer sequences in full batches, so a
+//     cursor that is far behind still reaches the live edge. The single query
+//     this replaced scanned a retention-wide window ordered ascending, so once
+//     an instance had more events than one batch, the result was filled entirely
+//     with rows that had already been sent: the newest events were unreachable
+//     and the stream stalled until the client reconnected. Any instance past
+//     100 events was affected.
+//   - Backfill rescans the last batch of sequences for an upload that arrived
+//     out of order, which is bounded so it cannot crowd out the forward pass.
+//
+// It reports whether the stream should keep running, and whether a full batch
+// was still waiting when the per-pass cap was reached — the caller uses that to
+// come straight back instead of waiting for the next wake-up.
+func (s *Server) drainInstanceEvents(ctx context.Context, instanceID string, lastSequence *int64, sentSequences map[int64]struct{}, writeEvent func(eventEnvelope)) (ok bool, more bool) {
+	delivered := 0
+	pending := false
+	for {
+		rows, err := s.db.Query(ctx, `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from cloud_events where instance_id=$1 and agent_sequence>$2 order by agent_sequence limit $3`, instanceID, *lastSequence, cloudEventBatchSize)
+		if err != nil {
+			return false, false
+		}
+		batch := 0
+		for rows.Next() {
+			var event eventEnvelope
+			var payload []byte
+			if err := rows.Scan(&event.EventID, &event.AgentSequence, &event.Type, &event.TaskID, &event.TaskRunID, &payload, &event.CreatedAt); err != nil {
+				rows.Close()
+				return false, false
 			}
-			if fromSequence < 0 {
-				fromSequence = 0
-			}
-			firstPoll = false
-			for sequence := range sentSequences {
-				if sequence <= fromSequence {
-					delete(sentSequences, sequence)
-				}
-			}
-			rows, err := s.db.Query(r.Context(), `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from cloud_events where instance_id=$1 and agent_sequence>$2 order by agent_sequence limit 100`, instanceID, fromSequence)
-			if err != nil {
-				return
-			}
-			for rows.Next() {
-				var event eventEnvelope
-				var payload []byte
-				if err := rows.Scan(&event.EventID, &event.AgentSequence, &event.Type, &event.TaskID, &event.TaskRunID, &payload, &event.CreatedAt); err != nil {
-					rows.Close()
-					return
-				}
-				event.InstanceID = instanceID
-				event.Payload = json.RawMessage(payload)
-				if _, alreadySent := sentSequences[event.AgentSequence]; alreadySent {
-					continue
-				}
-				writeEvent(event)
-				sentSequences[event.AgentSequence] = struct{}{}
-				if event.AgentSequence > lastSequence {
-					lastSequence = event.AgentSequence
-				}
-			}
-			rows.Close()
+			event.InstanceID = instanceID
+			event.Payload = json.RawMessage(payload)
+			writeEvent(event)
+			sentSequences[event.AgentSequence] = struct{}{}
+			*lastSequence = event.AgentSequence
+			batch++
+			delivered++
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return false, false
+		}
+		if batch < cloudEventBatchSize {
+			break
+		}
+		if delivered >= cloudEventCatchUpPerDrain {
+			// A full batch went out and the cap was reached, so there is almost
+			// certainly more behind it.
+			pending = true
+			break
 		}
 	}
+	windowFloor := *lastSequence - cloudEventBackfillWindow
+	for sequence := range sentSequences {
+		if sequence <= windowFloor {
+			delete(sentSequences, sequence)
+		}
+	}
+	if windowFloor < 0 {
+		windowFloor = 0
+	}
+	rows, err := s.db.Query(ctx, `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from cloud_events where instance_id=$1 and agent_sequence>$2 and agent_sequence<=$3 order by agent_sequence limit $4`, instanceID, windowFloor, *lastSequence, cloudEventBatchSize)
+	if err != nil {
+		return false, false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var event eventEnvelope
+		var payload []byte
+		if err := rows.Scan(&event.EventID, &event.AgentSequence, &event.Type, &event.TaskID, &event.TaskRunID, &payload, &event.CreatedAt); err != nil {
+			return false, false
+		}
+		if _, alreadySent := sentSequences[event.AgentSequence]; alreadySent {
+			continue
+		}
+		event.InstanceID = instanceID
+		event.Payload = json.RawMessage(payload)
+		writeEvent(event)
+		sentSequences[event.AgentSequence] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return false, false
+	}
+	return true, pending
 }
 
 func (s *Server) userAuth(next http.Handler) http.Handler {
@@ -1192,7 +1454,7 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  64 << 10,
 		WriteBufferSize: 64 << 10,
-		CheckOrigin: func(r *http.Request) bool { return s.agentOriginAllowed(r.Header.Get("Origin")) },
+		CheckOrigin:     func(r *http.Request) bool { return s.agentOriginAllowed(r.Header.Get("Origin")) },
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -1422,6 +1684,12 @@ func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventE
 			return fmt.Errorf("%w for instance %s: sequence %d", errEventSequenceConflict, instanceID, event.AgentSequence)
 		}
 	} else if err != nil {
+		return err
+	}
+	// Waking the mobile streams is done inside the transaction on purpose:
+	// PostgreSQL delivers a NOTIFY only when the transaction commits, so a
+	// rolled-back or conflicting event never wakes a stream for nothing.
+	if _, err := tx.Exec(ctx, `select pg_notify($1, $2)`, eventNotifyChannel, instanceID); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

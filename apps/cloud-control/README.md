@@ -20,9 +20,12 @@ Web app and Cloud Control are served behind the same reverse proxy.
 每台电脑独立的实例 ID 和 Agent Token。注册令牌必须放在部署环境中并在发布后轮换；
 新凭据保存在云端数据库，旧的 `MILEVIA_CLOUD_AGENT_TOKENS` 仅用于兼容既有设备。
 
-发布桌面安装包时，在构建机设置同名的 `MILEVIA_AGENT_ENROLLMENT_TOKEN`，构建脚本会将
-它写入仅含引导配置的资源文件；不会复制开发机 `.env.windows` 中的静态实例凭据。注册令牌
-当前是共享部署令牌，适合受控分发；生产化多租户部署应进一步改为一次性、限时注册票据。
+注册令牌不会进入安装包。构建脚本只把公开的 `MILEVIA_CLOUD_URL` 与 `MILEVIA_LOCAL_URL`
+写入仅含引导配置的资源文件（见 `apps/desktop/scripts/build-sidecar.mjs` 的键白名单），
+也不会复制开发机 `.env.windows` 中的静态实例凭据。目标机器首次启动时，由管理员在桌面页
+粘贴令牌，或先为桌面进程设置同名的 `MILEVIA_AGENT_ENROLLMENT_TOKEN` 环境变量（Agent
+子进程会继承）再启动，完成一次注册即可。注册令牌当前是共享部署令牌，适合受控分发；
+生产化多租户部署应进一步改为一次性、限时注册票据。
 
 默认监听 `:8090`，可通过 `MILEVIA_CLOUD_ADDR` 修改。
 
