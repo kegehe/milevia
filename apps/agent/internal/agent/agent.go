@@ -83,6 +83,31 @@ const (
 	snapshotMinOutstandingEvents = 5
 )
 
+// Outbox long polling. The local control server holds /api/remote/outbox open
+// until the outbox gains a row, so a new event reaches the relay in one round
+// trip rather than on a poll tick.
+const (
+	// outboxLongPollSeconds matches the server-side cap. Staying under the
+	// Agent's own HTTP client timeout keeps the held request from being the
+	// thing that trips it.
+	outboxLongPollSeconds = 20
+	// outboxIdleFallback paces the loop when the local server answers at once
+	// instead of holding the request — either it predates long polling, or it
+	// had nothing to wait for. Without this the loop would busy-poll the local
+	// API, which is exactly what the old fixed ticker existed to prevent.
+	outboxIdleFallback = 200 * time.Millisecond
+	// outboxAckGrace paces the loop while the rows it just read are still in
+	// the outbox because the cloud has not acknowledged them yet. Rows are only
+	// deleted by /api/remote/outbox/ack, so without this pause the long poll
+	// hands back the same batch as fast as the local database answers and the
+	// relay re-sends every row on each pass. Re-sending is kept deliberately
+	// (rather than skipped) because it is also the recovery path for an
+	// acknowledgement lost in flight.
+	outboxAckGrace = 200 * time.Millisecond
+	// outboxRetryDelay keeps a failing local read from spinning.
+	outboxRetryDelay = 2 * time.Second
+)
+
 // credentials returns the current machine credential under the read lock.
 func (a *Agent) credentials() (string, string) {
 	a.credMu.RLock()
@@ -340,30 +365,15 @@ func (a *Agent) runConnection(ctx context.Context) error {
 	// Outbox reads touch the local SQLite-backed HTTP API and can briefly wait
 	// behind a writer. Keep that wait away from the WebSocket control loop so a
 	// slow local read cannot delay pings, disconnect handling, or commands.
-	outboxWake := make(chan struct{}, 1)
+	//
+	// The read is a long poll: the local server holds the request until the
+	// outbox actually gains a row, so an event reaches the relay in one round
+	// trip instead of waiting out a poll tick.
 	outboxDone := make(chan struct{})
 	go func() {
 		defer close(outboxDone)
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-connectionCtx.Done():
-				return
-			case <-ticker.C:
-			case <-outboxWake:
-			}
-			if err := a.syncOutbox(connectionCtx, writeCh); err != nil && connectionCtx.Err() == nil {
-				log.Printf("event sync failed: %v", err)
-			}
-		}
+		a.runOutboxPump(connectionCtx, writeCh)
 	}()
-	wakeOutbox := func() {
-		select {
-		case outboxWake <- struct{}{}:
-		default:
-		}
-	}
 	// Re-publish on every (re)connect. The local control server keeps these
 	// credentials in process memory only, so a publish that failed during the
 	// first connection attempt (local server still starting, port file not yet
@@ -412,7 +422,6 @@ func (a *Agent) runConnection(ctx context.Context) error {
 				return connectionCtx.Err()
 			}
 			wakeSnapshot()
-			wakeOutbox()
 		}
 	}
 }
@@ -670,20 +679,96 @@ func (a *Agent) monitorCommand(ctx context.Context, commandID string, writeCh ch
 	}
 }
 
-func (a *Agent) syncOutbox(ctx context.Context, writeCh chan<- any) error {
+// runOutboxPump forwards queued events to the relay for as long as the
+// connection lives.
+//
+// The read is a long poll, so in the steady state this costs one open request
+// and no traffic. The pacing lives in syncOutbox, which is what keeps the loop
+// from becoming a busy poll against the local API.
+func (a *Agent) runOutboxPump(ctx context.Context, writeCh chan<- any) {
+	// lastBatch is the signature of the previous read, so the pump can tell a
+	// genuinely new batch from one that is still waiting for its
+	// acknowledgement. Only this goroutine touches it.
+	var lastBatch string
+	for {
+		err := a.syncOutbox(ctx, writeCh, &lastBatch)
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			continue
+		}
+		log.Printf("event sync failed: %v", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(outboxRetryDelay):
+		}
+	}
+}
+
+// syncOutbox forwards the pending outbox rows to the relay, then returns.
+//
+// Two forms of pacing keep the caller's loop off the local API: an immediately
+// answered empty read is walked at outboxIdleFallback, and a batch that comes
+// back unchanged is walked at outboxAckGrace. The change in behaviour is what
+// pays for the long poll — one event now leaves the outbox in a single round
+// trip instead of on a tick.
+func (a *Agent) syncOutbox(ctx context.Context, writeCh chan<- any, lastBatch *string) error {
 	var items []outboxItem
-	if err := a.localGet(ctx, "/api/remote/outbox?limit=100", &items); err != nil {
+	started := time.Now()
+	// The wait parameter asks the local server to hold this request open until
+	// the outbox changes. A local server too old to know the parameter simply
+	// answers immediately, which the pacing below absorbs.
+	if err := a.localGet(ctx, fmt.Sprintf("/api/remote/outbox?limit=100&wait=%d", outboxLongPollSeconds), &items); err != nil {
 		return err
 	}
+	if len(items) == 0 {
+		*lastBatch = ""
+		// An empty answer that came back instantly means the request was not
+		// held. Pace the next attempt so this loop cannot become a busy poll.
+		if time.Since(started) < time.Second {
+			return sleepOrCancel(ctx, outboxIdleFallback)
+		}
+		return nil
+	}
+	signature := outboxBatchSignature(items)
+	repeated := signature == *lastBatch
+	*lastBatch = signature
 	for _, item := range items {
 		if !sendMessage(ctx, writeCh, map[string]any{"kind": "event", "eventId": item.EventID, "agentSequence": item.AgentSequence, "instanceId": a.config.InstanceID, "type": item.Type, "taskId": item.TaskID, "taskRunId": item.TaskRunID, "payload": item.Payload, "createdAt": item.CreatedAt}) {
 			return ctx.Err()
 		}
 	}
-	if len(items) == 0 {
-		return nil
+	if repeated {
+		// These rows are still queued, so the cloud has not acknowledged them.
+		// Hold off before reading them again.
+		return sleepOrCancel(ctx, outboxAckGrace)
 	}
 	return nil
+}
+
+// outboxBatchSignature identifies a read batch by the ids the server returned,
+// which are ordered by agent_sequence.
+func outboxBatchSignature(items []outboxItem) string {
+	var builder strings.Builder
+	for _, item := range items {
+		builder.WriteString(item.EventID)
+		builder.WriteByte('\n')
+	}
+	return builder.String()
+}
+
+// sleepOrCancel waits for d and reports the context error if it ended first.
+func sleepOrCancel(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func sendMessage(ctx context.Context, writeCh chan<- any, value any) bool {

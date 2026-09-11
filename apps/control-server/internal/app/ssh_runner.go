@@ -1152,7 +1152,7 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	var cmd string
 	if request.PromptViaStdin {
 		cmd = fmt.Sprintf(
-			"%scd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json%s %s %s -",
+			"%scd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s -",
 			mcpSetup,
 			shellQuote(request.ProjectPath),
 			shellQuote(request.Prompt),
@@ -1162,7 +1162,7 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 		)
 	} else {
 		cmd = fmt.Sprintf(
-			"%scd %s && claude -p --verbose --output-format stream-json%s %s %s %s",
+			"%scd %s && claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s %s",
 			mcpSetup,
 			shellQuote(request.ProjectPath),
 			mcpArg,
@@ -1356,7 +1356,7 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 	}
 	mcpSetup, mcpArg := buildRemoteMCPSetup(ctx, r, req.MCPConfigJSON, req.MCPKey, req.StrictMCP, nil)
 	cmd := fmt.Sprintf(
-		"%scd %s && claude -p --verbose --input-format stream-json --output-format stream-json --replay-user-messages%s %s %s",
+		"%scd %s && claude -p --verbose --input-format stream-json --output-format stream-json --include-partial-messages --replay-user-messages%s %s %s",
 		mcpSetup,
 		shellQuote(req.ProjectPath),
 		mcpArg,
@@ -1509,6 +1509,12 @@ func (s *sshAgentSession) readOutputLoop() error {
 			continue
 		}
 		s.noteStreamEvent(envelope.Type, envelope.Message.Content)
+		// Partial-message envelopes arrive once per token. Consume them into
+		// coalesced deltas rather than emitting one relay event per token.
+		if envelope.Type == "stream_event" {
+			handleClaudePartialMessage(line, s.turnSink())
+			continue
+		}
 		s.emit(envelope.Type, line, envelope.Type == "system" && envelope.Subtype == "init")
 		if envelope.Type == "result" {
 			s.finishCurrent(resultError(line))
@@ -1669,6 +1675,19 @@ func (s *sshAgentSession) assistantText(content, parentToolUseID string) {
 	}
 }
 
+// turnSink returns the sink of the in-flight turn, or nil when no turn is
+// active. A stream line can legitimately arrive between turns, so callers must
+// tolerate nil; handleClaudePartialMessage treats it as "no sink" because the
+// optional interfaces it looks for are simply not satisfied.
+func (s *sshAgentSession) turnSink() AgentRunSink {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return nil
+	}
+	return s.current.sink
+}
+
 func (s *sshAgentSession) finishCurrent(err error) {
 	s.mu.Lock()
 	current := s.current
@@ -1782,6 +1801,13 @@ func readClaudeJSONLines(reader io.Reader, sink AgentRunSink) error {
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
+			continue
+		}
+		// Partial-message envelopes arrive once per token. Consume them into
+		// coalesced deltas instead of persisting and relaying one relay event
+		// per token.
+		if envelope.Type == "stream_event" {
+			handleClaudePartialMessage(line, sink)
 			continue
 		}
 		sink.Event(envelope.Type, line)

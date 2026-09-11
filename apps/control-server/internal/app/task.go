@@ -176,6 +176,15 @@ create index if not exists task_events_task_created on task_events(task_id,creat
 	if err := ensureColumn(ctx, s.db, "tasks", "pinned", "integer not null default 0"); err != nil {
 		return fmt.Errorf("add tasks.pinned: %w", err)
 	}
+	// 优化建议转任务时记下来源建议指纹（建议本身随即被硬删，只剩这个指纹）：
+	// 供建议卡片标注"已转为任务 · 进行中"，并阻止为同一问题重复建任务。
+	// 必须在这里补列——上面的 create table 对已存在的表不会补列。
+	if err := ensureColumn(ctx, s.db, "tasks", "source_insight_fingerprint", "text not null default ''"); err != nil {
+		return fmt.Errorf("add tasks.source_insight_fingerprint: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `create index if not exists tasks_source_insight_fingerprint on tasks(project_id,source_insight_fingerprint);`); err != nil {
+		return fmt.Errorf("index tasks.source_insight_fingerprint: %w", err)
+	}
 	if err := s.migrateTaskRunConversationReference(ctx); err != nil {
 		return fmt.Errorf("migrate task run conversation reference: %w", err)
 	}
@@ -1171,7 +1180,7 @@ func (s *Server) recordTaskEventTx(ctx context.Context, tx *sql.Tx, taskID, task
 	// The task event and its remote delivery record share the same SQLite
 	// transaction. A crash cannot leave the cloud unaware of a committed state
 	// change, and a failed outbox write rolls back the business change as well.
-	return enqueueRemoteEventTx(ctx, tx, eventID, taskID, taskRunID, typ, payloadJSON, now)
+	return s.enqueueRemoteEventTx(ctx, tx, eventID, taskID, taskRunID, typ, payloadJSON, now)
 }
 
 func nullTaskRunID(value string) any {

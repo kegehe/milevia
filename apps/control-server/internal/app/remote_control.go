@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -554,7 +555,7 @@ func (s *Server) remoteRelayConfigured() bool {
 	return cloudURL != "" && cloudToken != ""
 }
 
-func enqueueRemoteEventTx(ctx context.Context, tx *sql.Tx, eventID, taskID, taskRunID, typ string, payload []byte, now time.Time) error {
+func (s *Server) enqueueRemoteEventTx(ctx context.Context, tx *sql.Tx, eventID, taskID, taskRunID, typ string, payload []byte, now time.Time) error {
 	payload = compactRemoteEventPayload(typ, payload)
 	if _, err := tx.ExecContext(ctx, `update remote_instance set last_agent_sequence=last_agent_sequence+1,updated_at=?`, now); err != nil {
 		return err
@@ -563,8 +564,17 @@ func enqueueRemoteEventTx(ctx context.Context, tx *sql.Tx, eventID, taskID, task
 	if err := tx.QueryRowContext(ctx, `select last_agent_sequence from remote_instance limit 1`).Scan(&sequence); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `insert into remote_outbox(event_id,agent_sequence,type,task_id,task_run_id,payload,created_at) values(?,?,?,?,?,?,?)`, eventID, sequence, typ, taskID, taskRunID, string(payload), now)
-	return err
+	if _, err := tx.ExecContext(ctx, `insert into remote_outbox(event_id,agent_sequence,type,task_id,task_run_id,payload,created_at) values(?,?,?,?,?,?,?)`, eventID, sequence, typ, taskID, taskRunID, string(payload), now); err != nil {
+		return err
+	}
+	// Wake any held long-poll request so the Agent forwards this event now
+	// rather than on its next tick. This fires from inside the caller's
+	// transaction: waking a moment early only costs a re-read (see
+	// remoteOutboxWakeGrace), while waking late would cost a poll interval on
+	// every single event. Callers that own their transaction also wake once
+	// more after commit, which makes the common path exact.
+	s.wakeRemoteOutbox()
+	return nil
 }
 
 // Remote events are notifications; the complete conversation content is
@@ -593,10 +603,33 @@ func (s *Server) enqueueRemoteEvent(ctx context.Context, eventID, taskID, taskRu
 		return err
 	}
 	defer tx.Rollback()
-	if err := enqueueRemoteEventTx(ctx, tx, eventID, taskID, taskRunID, typ, payload, now); err != nil {
+	if err := s.enqueueRemoteEventTx(ctx, tx, eventID, taskID, taskRunID, typ, payload, now); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Wake again after the commit so a held poll sees the row on its first
+	// read instead of paying the grace re-read.
+	s.wakeRemoteOutbox()
+	return nil
+}
+
+// enqueueRemoteDelta relays an incremental assistant chunk to the mobile relay
+// without persisting it or broadcasting it to local subscribers.
+//
+// Deltas are phone-facing only. The desktop transcript is built from the raw CLI
+// envelopes, while every event that goes through appendEvent is stored in the
+// conversation's event history and reloaded with it — so persisting one row per
+// chunk would bloat that history, and every client's event timeline, for a
+// payload no local view renders.
+func (s *Server) enqueueRemoteDelta(runID string, payload []byte) {
+	if !s.remoteRelayConfigured() {
+		return
+	}
+	if err := s.enqueueRemoteEvent(context.Background(), uuid.NewString(), "", runID, "assistant.delta", payload, time.Now().UTC()); err != nil {
+		log.Printf("queue remote assistant.delta event: %v", err)
+	}
 }
 
 func (s *Server) remoteOverview(w http.ResponseWriter, r *http.Request) {
@@ -767,22 +800,80 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
-func (s *Server) remoteOutbox(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 500 {
-			limit = parsed
-		}
+const (
+	// maxRemoteOutboxWaitSeconds bounds how long one long-poll may be held. It
+	// stays well under the Agent's HTTP client timeout so a held request is
+	// never the thing that trips it.
+	maxRemoteOutboxWaitSeconds = 25
+	// remoteOutboxWakeGrace covers the window between a writer inserting into
+	// remote_outbox inside its transaction and that transaction committing. A
+	// wake-up is sent from inside the transaction, so the first read after a
+	// wake-up can legitimately see nothing yet; re-reading once after this
+	// pause makes the fast path deterministic without polling in the steady
+	// state.
+	remoteOutboxWakeGrace = 15 * time.Millisecond
+)
+
+// remoteOutboxWaker broadcasts "the remote outbox changed" to every held
+// long-poll request.
+//
+// A buffered channel (the shape used for remoteCommandWake, where exactly one
+// worker consumes the signal) would be wrong here: it can only wake one waiter,
+// and a signal sent while nobody is selecting is consumed by the next waiter
+// even though it refers to an already-drained row. Closing and replacing the
+// channel wakes all current waiters, and a waiter that captures the channel
+// before its read can never miss a wake-up that lands mid-flight.
+type remoteOutboxWaker struct {
+	mu   sync.Mutex
+	next chan struct{}
+}
+
+func newRemoteOutboxWaker() *remoteOutboxWaker {
+	return &remoteOutboxWaker{next: make(chan struct{})}
+}
+
+func (w *remoteOutboxWaker) wait() <-chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.next
+}
+
+func (w *remoteOutboxWaker) wake() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	close(w.next)
+	w.next = make(chan struct{})
+}
+
+// outboxWaker lazily creates the waker so tests that build a Server literal
+// still get a working long-poll instead of a nil dereference.
+func (s *Server) outboxWaker() *remoteOutboxWaker {
+	s.remoteOutboxWakeMu.Lock()
+	defer s.remoteOutboxWakeMu.Unlock()
+	if s.remoteOutboxWake == nil {
+		s.remoteOutboxWake = newRemoteOutboxWaker()
 	}
+	return s.remoteOutboxWake
+}
+
+func (s *Server) wakeRemoteOutbox() {
+	s.remoteOutboxWakeMu.Lock()
+	waker := s.remoteOutboxWake
+	s.remoteOutboxWakeMu.Unlock()
+	if waker != nil {
+		waker.wake()
+	}
+}
+
+func (s *Server) readRemoteOutbox(ctx context.Context, limit int) ([]remoteOutboxItem, error) {
 	// Events that exhausted their delivery budget stay in the table as a
 	// durable record but leave the delivery window. Without this bound a
 	// single undeliverable event (for example one the cloud permanently
 	// rejects) would sit at the head of this ordered batch forever and starve
 	// every event behind it.
-	rows, err := s.db.QueryContext(r.Context(), `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from remote_outbox where (next_attempt_at is null or next_attempt_at<=?) and attempts < ? order by agent_sequence limit ?`, time.Now().UTC(), maxRemoteOutboxAttempts, limit)
+	rows, err := s.db.QueryContext(ctx, `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from remote_outbox where (next_attempt_at is null or next_attempt_at<=?) and attempts < ? order by agent_sequence limit ?`, time.Now().UTC(), maxRemoteOutboxAttempts, limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, err
 	}
 	defer rows.Close()
 	items := make([]remoteOutboxItem, 0)
@@ -790,17 +881,95 @@ func (s *Server) remoteOutbox(w http.ResponseWriter, r *http.Request) {
 		var item remoteOutboxItem
 		var payload string
 		if err := rows.Scan(&item.EventID, &item.AgentSequence, &item.Type, &item.TaskID, &item.TaskRunID, &payload, &item.CreatedAt); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return nil, err
 		}
 		item.Payload = json.RawMessage(payload)
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *Server) remoteOutbox(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 500 {
+			limit = parsed
+		}
+	}
+	// wait seconds lets the Agent hold the request open instead of asking every
+	// 200ms. Absent or invalid, this stays a plain read so older Agents are
+	// unaffected.
+	wait := time.Duration(0)
+	if raw := r.URL.Query().Get("wait"); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+			if seconds > maxRemoteOutboxWaitSeconds {
+				seconds = maxRemoteOutboxWaitSeconds
+			}
+			wait = time.Duration(seconds) * time.Second
+		}
+	}
+	if wait <= 0 {
+		items, err := s.readRemoteOutbox(r.Context(), limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 		return
 	}
-	writeJSON(w, http.StatusOK, items)
+
+	deadline := time.Now().Add(wait)
+	gracePending := false
+	for {
+		// Capture the wake channel before reading. A wake-up sent while this
+		// read is in flight closes the channel we already hold, so the select
+		// below returns immediately instead of waiting out the whole window.
+		pending := s.outboxWaker().wait()
+		items, err := s.readRemoteOutbox(r.Context(), limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if len(items) > 0 || !time.Now().Before(deadline) {
+			writeJSON(w, http.StatusOK, items)
+			return
+		}
+		if gracePending {
+			// Woken but still empty: the writer had not committed yet. Pause
+			// once so the next read observes the committed row.
+			gracePending = false
+			if !sleepWithContext(r.Context(), remoteOutboxWakeGrace) {
+				return
+			}
+			continue
+		}
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-r.Context().Done():
+			timer.Stop()
+			return
+		case <-pending:
+			gracePending = true
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+}
+
+// sleepWithContext reports whether the full duration elapsed before the request
+// was cancelled.
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s *Server) ackRemoteOutbox(w http.ResponseWriter, r *http.Request) {

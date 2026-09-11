@@ -205,6 +205,11 @@ type Server struct {
 	remoteCloudURL     string
 	remoteCloudToken   string
 	remoteInstanceID   string
+	// remoteOutboxWake broadcasts "the remote outbox changed" to held long-poll
+	// requests so the Agent learns about a new event immediately instead of on
+	// its next poll tick.
+	remoteOutboxWakeMu sync.Mutex
+	remoteOutboxWake   *remoteOutboxWaker
 	storageMu          sync.Mutex
 	dataLock           *dataDirLock
 	httpMu             sync.Mutex
@@ -933,11 +938,19 @@ func (s *Server) newHTTPServer() *http.Server {
 // 还卡着的时候把端点名打到 stderr（桌面 dev 会回显 [control-server]），用于
 // 定位前端"控制服务未在 15 秒内响应"类超时的真实慢端点。
 // WebSocket 升级请求 hijack 后生命周期等于整条连接，天然长命，跳过；OPTIONS
-// 是 CORS 预检，也跳过。
+// 是 CORS 预检，也跳过；长轮询是刻意挂起，同样跳过——否则 Agent 的 outbox 拉取
+// 每 20 秒就会刷两条"慢请求"，把真正需要它报警的端点淹掉。
+// longPollRequest reports whether the request is held open on purpose. The
+// Agent's outbox poll waits for a change by design, so how long it takes says
+// nothing about server health and must not be reported as a slow endpoint.
+func longPollRequest(r *http.Request) bool {
+	return r.URL.Path == "/api/remote/outbox" && r.URL.Query().Get("wait") != ""
+}
+
 func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
 	threshold := durationFromEnv("MILEVIA_SLOW_REQUEST_LOG", defaultSlowRequestLogThreshold)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions || websocket.IsWebSocketUpgrade(r) {
+		if r.Method == http.MethodOptions || websocket.IsWebSocketUpgrade(r) || longPollRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1068,6 +1081,9 @@ func (s *Server) routes() http.Handler {
 	r.Delete("/api/projects/{projectID}/insights/{findingID}", s.deleteInsightFinding)
 	r.Patch("/api/projects/{projectID}/insights/{findingID}", s.updateInsightFinding)
 	r.Post("/api/projects/{projectID}/insights/{findingID}/to-task", s.addInsightToTask)
+	// 「不再提示」：POST 标记、DELETE 恢复（语义见 insights.go setInsightDismissed）。
+	r.Post("/api/projects/{projectID}/insights/{findingID}/dismiss", s.setInsightDismissed)
+	r.Delete("/api/projects/{projectID}/insights/{findingID}/dismiss", s.clearInsightDismissed)
 	r.Get("/api/projects/{projectID}/input-history", s.listProjectInputHistory)
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
 	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
@@ -1510,6 +1526,11 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	if err := ensureColumn(ctx, s.db, "project_insight_scans", "focus_types", "text not null default ''"); err != nil {
 		return fmt.Errorf("add insight scan focus types: %w", err)
 	}
+	// 本次扫描被「第 2 轮独立核实」剔除的候选（JSON 数组：[{title,reason}]）。规则 2
+	// （必须核实）唯一可审计的来源：用户能看到哪几条被剔除、AI 给出的依据是什么。
+	if err := ensureColumn(ctx, s.db, "project_insight_scans", "rejected_json", "text not null default ''"); err != nil {
+		return fmt.Errorf("add insight scan rejections: %w", err)
+	}
 	// 建议再验证（re-verify）：验证状态/说明/时间存于建议行本身，供前端轮询与折叠展示。
 	// verification_result 取值：''(未验证) | pending(验证中) | valid(仍存在) | invalid(已失效) | failed(失败)。
 	if err := ensureColumn(ctx, s.db, "project_insights", "verification_result", "text not null default ''"); err != nil {
@@ -1520,6 +1541,20 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	}
 	if err := ensureColumn(ctx, s.db, "project_insights", "verified_at", "datetime"); err != nil {
 		return fmt.Errorf("add insight verified at: %w", err)
+	}
+	// project_insight_suppressions：本项目内"永不再报告"的建议指纹。目前只有一种来源——
+	// 用户编辑了建议（title/summary 变了），旧指纹（编辑前的原文）记进来，否则下次扫描
+	// 会把编辑前的写法当成一条新建议再报一次，与编辑后的卡片并存。
+	// 用户显式「不再提示」不走这张表：它落在 project_insights.status='dismissed' 上，
+	// 因为那条建议本身还要在折叠区展示、还要可恢复。
+	if _, err := s.db.ExecContext(ctx, `create table if not exists project_insight_suppressions (
+		project_id text not null references projects(id) on delete cascade,
+		fingerprint text not null,
+		reason text not null default '',
+		created_at datetime not null,
+		primary key (project_id, fingerprint)
+	);`); err != nil {
+		return fmt.Errorf("create insight suppressions: %w", err)
 	}
 	// 服务启动时，上次遗留的 pending 验证必然已不在此进程内跑（进程重启即中止），
 	// 一律回退为未验证，避免前端对该建议永久轮询"验证中"。
@@ -5344,6 +5379,64 @@ type agentRunSink struct {
 	conversationID string
 	agentID        string
 	streaming      bool
+
+	// assistantMessageID is the CLI's own id for the reply currently streaming.
+	// Sharing it between the incremental deltas and the finished message lets a
+	// client update that reply in place instead of showing a duplicate.
+	assistantMessageID string
+	// deltaBuffer holds assistant text not yet emitted. Deltas are coalesced so
+	// that one relay event per token never reaches the outbox or the cloud.
+	deltaBuffer    strings.Builder
+	deltaEmittedAt time.Time
+}
+
+// assistantMessageEvent is the relayed form of a finished assistant message. It
+// embeds the stored message and adds the CLI's own id, so a client that already
+// rendered deltas can match them without that id having to become a database key.
+type assistantMessageEvent struct {
+	Message
+	AgentMessageID string `json:"agentMessageId,omitempty"`
+}
+
+// SetAssistantMessageID adopts the CLI's id for the reply that is starting.
+func (sink *agentRunSink) SetAssistantMessageID(messageID string) {
+	sink.assistantMessageID = messageID
+	// A new message starts clean: anything buffered belonged to the previous one.
+	sink.deltaBuffer.Reset()
+	sink.deltaEmittedAt = time.Time{}
+}
+
+// AssistantDelta records incremental assistant text and emits it once enough has
+// accumulated. Emitting per token would multiply the local event log, the
+// desktop outbox and the cloud's event table for a single reply.
+func (sink *agentRunSink) AssistantDelta(delta string) {
+	if sink.assistantMessageID == "" || delta == "" {
+		return
+	}
+	sink.deltaBuffer.WriteString(delta)
+	if sink.deltaBuffer.Len() < assistantDeltaMaxBytes &&
+		time.Since(sink.deltaEmittedAt) < assistantDeltaMinInterval {
+		return
+	}
+	sink.flushAssistantDelta()
+}
+
+func (sink *agentRunSink) flushAssistantDelta() {
+	if sink.assistantMessageID == "" || sink.deltaBuffer.Len() == 0 {
+		return
+	}
+	text := sink.deltaBuffer.String()
+	sink.deltaBuffer.Reset()
+	sink.deltaEmittedAt = time.Now()
+	// Relay-only: see enqueueRemoteDelta for why this must not be persisted as a
+	// conversation event.
+	sink.server.enqueueRemoteDelta(sink.runID, mustJSON(map[string]string{
+		"messageId": sink.assistantMessageID,
+		// The conversation travels with the delta: multi-session tabs mean the
+		// client cannot assume the streaming reply belongs to the open view.
+		"conversationId": sink.conversationID,
+		"delta":          text,
+	}))
 }
 
 func (sink *agentRunSink) Event(eventType string, payload json.RawMessage) {
@@ -5352,6 +5445,15 @@ func (sink *agentRunSink) Event(eventType string, payload json.RawMessage) {
 }
 
 func (sink *agentRunSink) AssistantText(content, parentToolUseID string) {
+	// The finished message supersedes whatever the incremental path streamed, so
+	// drop the unflushed tail rather than emitting a delta that is about to be
+	// overwritten. The CLI's id rides along on the event so a client can replace
+	// the placeholder it built from deltas, while the stored row keeps its own
+	// unique id so a replayed message can never collide with an existing one.
+	agentMessageID := sink.assistantMessageID
+	sink.assistantMessageID = ""
+	sink.deltaBuffer.Reset()
+	sink.deltaEmittedAt = time.Time{}
 	m := Message{ID: uuid.NewString(), ConversationID: sink.conversationID, RunID: sink.runID, Role: "assistant", Content: content, ParentToolUseID: parentToolUseID, CreatedAt: time.Now().UTC()}
 	if _, err := sink.server.db.ExecContext(context.Background(), `insert into messages (id,conversation_id,run_id,role,content,parent_tool_use_id,created_at) values ($1,$2,$3,$4,$5,$6,$7)`, m.ID, m.ConversationID, m.RunID, m.Role, m.Content, m.ParentToolUseID, m.CreatedAt); err != nil {
 		log.Printf("persist assistant message for run %s: %v", sink.runID, err)
@@ -5363,7 +5465,7 @@ func (sink *agentRunSink) AssistantText(content, parentToolUseID string) {
 	}
 	// Raw CLI events differ by runtime. Broadcast the durable message as a
 	// runtime-neutral event so every client can render it immediately.
-	sink.server.appendEvent(sink.runID, sink.conversationID, "assistant.message", mustJSON(m))
+	sink.server.appendEvent(sink.runID, sink.conversationID, "assistant.message", mustJSON(assistantMessageEvent{Message: m, AgentMessageID: agentMessageID}))
 }
 
 func (sink *agentRunSink) SessionIdentified(sessionID string) {
@@ -5893,15 +5995,22 @@ func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) 
 		log.Printf("persist %s event for run %s: %v", typ, runID, err)
 		return
 	}
+	relayed := false
 	if s.remoteRelayConfigured() {
-		if err := enqueueRemoteEventTx(context.Background(), tx, e.ID, "", e.RunID, e.Type, e.Payload, e.CreatedAt); err != nil {
+		if err := s.enqueueRemoteEventTx(context.Background(), tx, e.ID, "", e.RunID, e.Type, e.Payload, e.CreatedAt); err != nil {
 			log.Printf("queue remote %s event for run %s: %v", typ, runID, err)
 			return
 		}
+		relayed = true
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("commit persist %s event for run %s: %v", typ, runID, err)
 		return
+	}
+	if relayed {
+		// Wake again after the commit so a held long-poll sees the row on its
+		// first read instead of paying the grace re-read.
+		s.wakeRemoteOutbox()
 	}
 	data, _ := json.Marshal(e)
 	s.enqueueConversationEvent(e.ConversationID, data)

@@ -675,7 +675,7 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 }
 
 func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
-	args := []string{"-p", "--verbose", "--output-format", "stream-json"}
+	args := []string{"-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages"}
 	if len(request.ReadOnlyTools) > 0 {
 		// 只读执行：default 模式 + 仅放行只读工具。
 		// 实测 --allowedTools 在本版本并不限制非白名单工具（模型仍可调 PowerShell
@@ -719,7 +719,7 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 }
 
 func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, error) {
-	args := []string{"-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json", "--replay-user-messages"}
+	args := []string{"-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--replay-user-messages"}
 	if request.PermissionMode == "full_control" {
 		args = append(args, "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions")
 	} else if isReadOnlyClaudeRequest(request.PermissionMode) {
@@ -835,6 +835,70 @@ func needsClaudeApprovalHook(permissionMode string) bool {
 	return permissionMode != "full_control" && !isReadOnlyClaudeRequest(permissionMode)
 }
 
+// Incremental assistant output.
+//
+// Claude Code only emits token-level deltas when it is started with
+// --include-partial-messages, and the raw stream is far too chatty to relay: one
+// event per token would multiply the desktop outbox, the cloud's event table and
+// every connected phone for each reply. Deltas are therefore coalesced into
+// modest chunks, only visible text is forwarded, and the finished assistant
+// message stays authoritative — a client that already rendered deltas simply
+// replaces that placeholder when the real message lands.
+const (
+	assistantDeltaMinInterval = 120 * time.Millisecond
+	assistantDeltaMaxBytes    = 4 << 10
+)
+
+// assistantMessageIDSetter lets a sink adopt the CLI's own assistant message id.
+// The id in message_start is the same one the completed assistant envelope
+// carries, so incremental and final updates can be tied together.
+type assistantMessageIDSetter interface {
+	SetAssistantMessageID(messageID string)
+}
+
+// assistantDeltaSink receives coalesced incremental assistant text. A sink that
+// does not implement it skips the incremental path entirely and still receives
+// the finished message through AssistantText.
+type assistantDeltaSink interface {
+	AssistantDelta(delta string)
+}
+
+// handleClaudePartialMessage turns one raw streaming envelope into a coalesced
+// assistant.delta. Everything except visible text is ignored: thinking deltas
+// are excluded for the same reason thinking_tokens never reach the transcript,
+// and block boundaries carry no content of their own.
+func handleClaudePartialMessage(line json.RawMessage, sink AgentRunSink) {
+	var envelope struct {
+		Event struct {
+			Type    string `json:"type"`
+			Message *struct {
+				ID string `json:"id"`
+			} `json:"message"`
+			Delta *struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(line, &envelope); err != nil {
+		return
+	}
+	switch envelope.Event.Type {
+	case "message_start":
+		if setter, ok := sink.(assistantMessageIDSetter); ok && envelope.Event.Message != nil {
+			setter.SetAssistantMessageID(envelope.Event.Message.ID)
+		}
+	case "content_block_delta":
+		delta := envelope.Event.Delta
+		if delta == nil || delta.Type != "text_delta" || delta.Text == "" {
+			return
+		}
+		if target, ok := sink.(assistantDeltaSink); ok {
+			target.AssistantDelta(delta.Text)
+		}
+	}
+}
+
 func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
@@ -852,6 +916,13 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
+			continue
+		}
+		// Partial-message envelopes arrive once per token. They are consumed
+		// into coalesced deltas here rather than persisted and relayed one by
+		// one, which would flood both the local event log and the cloud.
+		if envelope.Type == "stream_event" {
+			handleClaudePartialMessage(line, sink)
 			continue
 		}
 		sink.Event(envelope.Type, line)
