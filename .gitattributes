@@ -1,1 +1,49 @@
 dev.sh text eol=lf
+
+# 换行策略（显式声明，覆盖 core.autocrlf=true 的检出行为）。
+#
+# 背景：仓库原本只给 dev.sh 指定了 eol，其余文本文件在 Windows 上检出即 CRLF；
+# 而 apps/web 的测试直接用 `\n` 锚点读源码做断言（例如 mobile-remote-agent.test.mjs
+# 用 `/async function refreshNow\(\) \{[\s\S]*?\n  \}\n\n  function saveToken/` 抠函数体），
+# 工作区一旦是 CRLF，这些锚点就静默失配、报"找不到某个函数"，看起来像代码被改坏了
+# （2026-09-12 实际踩到，排查了三轮）。统一成 LF 后本地编辑与 CI 行为一致。
+* text=auto eol=lf
+
+# Windows 专用脚本必须保持 CRLF，否则 cmd / PowerShell 解析可能异常。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.nsh text eol=crlf
+
+# 二进制：不做换行转换，也不参与文本 diff。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.bmp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.apk binary
+*.aab binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.db binary
+*.sqlite binary
+*.key binary
+*.pem binary
+*.keystore binary
+*.jks binary
+*.p12 binary
+*.zip binary
+*.gz binary
+*.mp4 binary
+*.mov binary
+*.webm binary
+*.jar binary

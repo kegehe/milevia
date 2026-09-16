@@ -1,7 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
-import { isTaskAwaitingMainMerge, isTaskOrchestrating, priorityLabels, Request, Task, TaskDetail, TaskStatus, Priority, VerificationRun, taskDisplayStatus, taskDisplayStatusClass, taskDisplayTitle } from "./task-model";
+import { anchorForSlot, compareTaskOrder, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Request, Task, TaskDetail, TaskStatus, Priority, VerificationRun, taskDisplayStatus, taskDisplayStatusClass, taskDisplayTitle } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 type EditorState = { task?: Task } | null;
 type ReviewAction = "accept" | "request_changes";
@@ -19,7 +19,7 @@ type DragData = { taskID: string; sourceColumnID: string; sourceIndex: number };
 type DropPlacement = { beforeTaskID?: string; afterTaskID?: string };
 type PendingConfirm = { title: string; message: React.ReactNode; danger?: boolean; confirmLabel?: string; className?: string; icon?: React.ReactNode; onConfirm: () => void; onCancel: () => void } | null;
 type ExecutionPolicy = "approval_required" | "full_control" | "read_only" | "workspace_write";
-type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; agentId: "claude-code" | "codex"; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
+type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; devBranch: string; agentId: "claude-code" | "codex"; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
 
 const DRAG_CLICK_SUPPRESSION_MS = 400;
 // 看板每列初始渲染数量；滚动到底部后再追加一批，避免一次性渲染过长的列。
@@ -115,6 +115,14 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     const term = query.trim().toLowerCase();
     return term ? activeTasks.filter((task) => task.title.toLowerCase().includes(term) || task.description.toLowerCase().includes(term)) : activeTasks;
   }, [activeTasks, query]);
+  // 看板的列是写死的六个状态，而后端 `tasks.status` 没有 CHECK 约束（task.go）——
+  // 真出现没建模的状态值，这条任务哪一列都不属于，看板会**静默少一条**。
+  // 列数/拖拽落点都依赖固定列，改不了；那就至少说出来，别让"看不见"变成"没有"。
+  // （「列表」视图有兜底分组，能看见也能清理，所以提示里指向它。）
+  const uncoveredStatusCount = useMemo(() => {
+    const covered = new Set([...columnDefinitions, historicalCancelledColumn].flatMap((definition) => definition.statuses));
+    return tasks.filter((task) => !covered.has(task.status)).length;
+  }, [tasks]);
   useEffect(() => {
     if (!batchMode || selectedIDs.size === 0) return;
     const currentIDs = new Set(tasks.map((t) => t.id));
@@ -137,6 +145,26 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   };
   const selectAll = () => { setSelectedIDs(new Set(visibleTasks.map((t) => t.id))); };
   const deselectAll = () => { setSelectedIDs(new Set()); };
+  // 勾选态一律按 `every/some` 在可见集合上算，别拿「已选个数」和「可见个数」直接比大小：
+  // 选中项可能来自上一次搜索（清理 effect 只删"已不存在的任务"，不删"被过滤掉的"），
+  // 两边数量碰巧相等时顶部复选框会显示全选，实际却还有可见任务没被勾上。
+  const visibleSelection = useMemo(() => {
+    let picked = 0;
+    for (const task of visibleTasks) if (selectedIDs.has(task.id)) picked++;
+    return { total: visibleTasks.length, all: visibleTasks.length > 0 && picked === visibleTasks.length, partial: picked > 0 && picked < visibleTasks.length };
+  }, [selectedIDs, visibleTasks]);
+  // 按「分类」（= 一个状态组，看板列与列表分组共用）批量勾选：未全选则补齐，已全选则清空。
+  const toggleGroup = (ids: string[]) => {
+    if (ids.length === 0) return;
+    let picked = 0;
+    for (const id of ids) if (selectedIDs.has(id)) picked++;
+    const shouldSelect = picked < ids.length;
+    setSelectedIDs((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) { if (shouldSelect) next.add(id); else next.delete(id); }
+      return next;
+    });
+  };
   const batchDelete = () => {
     if (selectedIDs.size === 0) return;
     const currentTaskIDs = new Set(tasks.map((t) => t.id));
@@ -263,17 +291,41 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     });
   };
 
+  // ↑/↓ 的作用范围 = 用户当前看到的顺序：看板视图里是「同一列内」的先后（同状态任务），
+  // 列表视图里是全局 position 顺序。原来一律按全局顺序取邻居，于是在看板里点第 2 张卡的
+  // 「上移」，换位对象是同列以外的任务（别的列/别的状态），当前列看上去毫无变化。
+  const scopeList = (all: Task[]) => (showHistoricalCancelled ? all : all.filter((task) => task.status !== "cancelled"));
+  const moveScope = (task: Task, all: Task[] = activeTasks): Task[] => {
+    const definition = view === "board" ? columnDefinitions.find((item) => item.statuses.includes(task.status)) : undefined;
+    const scoped = definition ? all.filter((item) => definition.statuses.includes(item.status)) : all;
+    return [...scoped].sort(compareTaskOrder);
+  };
+
   const moveTask = async (taskID: string, direction: "up" | "down") => {
-    const ordered = [...activeTasks].sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-    const index = ordered.findIndex((task) => task.id === taskID);
-    const neighbor = ordered[index + (direction === "up" ? -1 : 1)];
-    const task = ordered[index];
-    if (!task || !neighbor) return;
+    const task = activeTasks.find((item) => item.id === taskID);
+    if (!task) return;
     if (!mountedRef.current) return;
     setBusy("move");
     try {
-      const position = direction === "up" ? neighbor.position - 0.5 : neighbor.position + 0.5;
-      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, priority: task.priority, position }) });
+      // 邻居与 position 都按**服务端最新列表**算：本地 tasks 最长可能落后一个轮询周期
+      // （另一个视图/另一台设备刚重排过），用过期快照算出来的位置会与真实顺序错位。
+      const latest = await loadTasks();
+      if (!mountedRef.current) return;
+      const refreshed = latest.find((item) => item.id === taskID);
+      if (!refreshed) return;
+      const ordered = moveScope(refreshed, scopeList(latest));
+      const index = ordered.findIndex((item) => item.id === taskID);
+      const neighbor = ordered[index + (direction === "up" ? -1 : 1)];
+      if (index < 0 || !neighbor) return;
+      // 与相邻任务「换位」= 插到邻居的 before/after。原来用 neighbor.position ± 0.5，
+      // 连续上移会在密集列表里算出重复 position，顺序随即退化到 createdAt 兜底。
+      const position = positionForMove(latest, task.id, neighbor.id, direction === "up" ? "before" : "after");
+      // 算不出安全落点（锚点被删／历史数据有重复 position）：不写服务端，提示用户重试。
+      if (position === null) {
+        fail("任务顺序数据异常，已重新同步，请再试一次");
+        return;
+      }
+      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: refreshed.title, description: refreshed.description, priority: refreshed.priority, position }) });
       if (!mountedRef.current) return;
       await refresh(task.id);
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
@@ -292,28 +344,30 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     const sameColumn = sourceDef?.id === targetColumnID;
 
     if (sameColumn) {
-      const columnTasks = tasks.filter((t) => targetDef.statuses.includes(t.status))
-        .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-      const currentIndex = columnTasks.findIndex((t) => t.id === taskID);
-      if (currentIndex < 0) return;
-      if (placement.beforeTaskID === taskID || placement.afterTaskID === taskID) return;
-      const reordered = columnTasks.filter((item) => item.id !== taskID);
-      const beforeIndex = placement.beforeTaskID && placement.beforeTaskID !== taskID ? reordered.findIndex((item) => item.id === placement.beforeTaskID) : -1;
-      const afterIndex = placement.afterTaskID && placement.afterTaskID !== taskID ? reordered.findIndex((item) => item.id === placement.afterTaskID) : -1;
-      const insertionIndex = beforeIndex >= 0 ? beforeIndex : afterIndex >= 0 ? afterIndex + 1 : reordered.length;
-      if (insertionIndex === currentIndex) return;
-      reordered.splice(insertionIndex, 0, task);
-      if (reordered.every((item, index) => item.id === columnTasks[index]?.id)) return;
-      const prev = reordered[insertionIndex - 1];
-      const next = reordered[insertionIndex + 1];
-      let newPosition: number;
-      if (!prev) newPosition = next ? next.position - 1 : task.position;
-      else if (!next) newPosition = prev.position + 1;
-      else newPosition = (prev.position + next.position) / 2;
+      // 没有任何锚点（列被搜索过滤成空）时不猜位置：保持原 position，不发请求。
+      const anchor = placement.beforeTaskID ?? placement.afterTaskID;
+      if (!anchor || anchor === taskID) return;
+      const where: "before" | "after" = placement.beforeTaskID ? "before" : "after";
       if (!mountedRef.current) return;
       setBusy("move");
       try {
-        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, priority: task.priority, position: newPosition }) });
+        // position 必须按**服务端最新列表**算（本地 tasks 最长落后一个轮询周期，
+        // 用过期快照算出的位置会与真实顺序错位）；锚点仍是用户拖拽时看到的那一行，
+        // 所以"放到这一行之前/之后"的意图完整保留。
+        const latest = await loadTasks();
+        if (!mountedRef.current) return;
+        // 已经是这个位置（"拖到自己正下方"等无效手势）：不写，免得把间隙越挤越小
+        if (isSameSlot(latest, task.id, anchor, where)) return;
+        const newPosition = positionForMove(latest, task.id, anchor, where);
+        // 算不出安全落点（锚点被删／历史数据有重复 position）：不写服务端并提示，列表刚拉过已是新的。
+        if (newPosition === null) {
+          fail("任务顺序数据异常，已重新同步，请再试一次");
+          return;
+        }
+        // title/description/priority 用最新的值回填：PATCH 会无条件重写这三项，
+        // 用本地旧快照会把别的端刚改的文案覆盖回去。
+        const refreshed = latest.find((item) => item.id === taskID) ?? task;
+        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: refreshed.title, description: refreshed.description, priority: refreshed.priority, position: newPosition }) });
         if (!mountedRef.current) return;
         await refresh();
       } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
@@ -323,19 +377,28 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
       if (!mountedRef.current) return;
       setBusy("move");
       try {
-        const columnTasks = tasks.filter((t) => targetDef.statuses.includes(t.status))
-          .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-        const beforeIndex = placement.beforeTaskID ? columnTasks.findIndex((item) => item.id === placement.beforeTaskID) : -1;
-        const afterIndex = placement.afterTaskID ? columnTasks.findIndex((item) => item.id === placement.afterTaskID) : -1;
-        const insertionIndex = beforeIndex >= 0 ? beforeIndex : afterIndex >= 0 ? afterIndex + 1 : columnTasks.length;
-        const prev = columnTasks[insertionIndex - 1];
-        const next = columnTasks[insertionIndex];
+        // 只用来判断"目标列是不是空的"（空列 = 换列不改位置），同样按用户可见范围判断。
+        const visibleColumn = visibleTasks.filter((t) => targetDef.statuses.includes(t.status))
+          .sort(compareTaskOrder);
+        const anchor = placement.beforeTaskID ?? placement.afterTaskID ?? null;
+        // 位置按服务端最新列表算（同列分支的理由一致）；空列则保留原 position 不改全局顺序。
+        const latest = await loadTasks();
+        if (!mountedRef.current) return;
+        const refreshed = latest.find((item) => item.id === taskID) ?? task;
         let newPosition: number;
-        if (columnTasks.length === 0) newPosition = task.position;
-        else if (!prev) newPosition = next ? next.position - 1 : task.position;
-        else if (!next) newPosition = prev.position + 1;
-        else newPosition = (prev.position + next.position) / 2;
-        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, priority: task.priority, position: newPosition, status: targetStatus }) });
+        if (visibleColumn.length === 0 || !anchor) {
+          // 空列（或目标列被搜索过滤成空）：换列不改动全局队列顺序，保留原 position。
+          // position 互不相同，保留原值不会与其它任务撞位。
+          newPosition = refreshed.position;
+        } else {
+          const computed = positionForMove(latest, task.id, anchor, placement.beforeTaskID ? "before" : "after");
+          if (computed === null) {
+            fail("任务顺序数据异常，已重新同步，请再试一次");
+            return;
+          }
+          newPosition = computed;
+        }
+        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: refreshed.title, description: refreshed.description, priority: refreshed.priority, position: newPosition, status: targetStatus }) });
         if (!mountedRef.current) return;
         await refresh();
       } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法移动任务"); }
@@ -343,12 +406,22 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     }
   };
 
+  // 详情弹窗里 ↑/↓ 的可用性：与 moveTask 用同一份顺序，避免"按钮亮着但点了没反应"。
+  const moveOrder = detail ? moveScope(detail) : [];
+  const moveIndex = detail ? moveOrder.findIndex((item) => item.id === detail.id) : -1;
+
   return <section className="task-workspace" aria-label="项目任务">
     <header className="task-workspace-head">
       <div className="task-workspace-actions">
         {batchMode ? <>
           <div className="task-batch-bar">
-            <label className="task-batch-select-all"><input type="checkbox" checked={selectedIDs.size === visibleTasks.length && visibleTasks.length > 0} ref={(el) => { if (el) el.indeterminate = selectedIDs.size > 0 && selectedIDs.size < visibleTasks.length; }} onChange={() => selectedIDs.size === visibleTasks.length ? deselectAll() : selectAll()} />全选</label>
+            <label className="task-batch-select-all" title={query.trim() ? "只选中当前搜索出的任务" : "选中全部任务"}>
+              <input className="task-check" type="checkbox" checked={visibleSelection.all} disabled={visibleSelection.total === 0} ref={(el) => { if (el) el.indeterminate = visibleSelection.partial; }} onChange={() => (visibleSelection.all ? deselectAll() : selectAll())} aria-label="全选当前可见任务" />
+              <span>全选</span>
+            </label>
+            {/* 搜索框在批量模式下被整块换掉，筛选条件因此在界面上"消失"了 —— 若不说明，
+                「点列头」选出来的其实是筛过的那几条，用户会以为选的是整列。 */}
+            <span className="task-batch-hint" data-scope={query.trim() ? "filtered" : "all"}>{query.trim() ? `筛选生效：只作用于搜索出的 ${visibleTasks.length} 项` : view === "board" ? "点列头复选框可整列选择" : "点分组头复选框可整组选择"}</span>
             <span className="task-batch-count">已选 {selectedIDs.size} 项</span>
             <button className="danger" disabled={selectedIDs.size === 0 || batchDeleting} onClick={batchDelete}>{batchDeleting ? "删除中" : `删除 (${selectedIDs.size})`}</button>
             <button className="secondary" disabled={batchDeleting} onClick={exitBatchMode}>取消</button>
@@ -374,14 +447,14 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
         </>}
       </div>
     </header>
-    {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} /> : <TaskList tasks={visibleTasks} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} />}
+    {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <>{uncoveredStatusCount > 0 && <p className="task-board-note" role="status">有 <b>{uncoveredStatusCount}</b> 条任务的状态不在看板列里，切到「列表」可查看与清理。</p>}<TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} /></> : <TaskList tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
-    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} beginDispatch={beginDispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={activeTasks.some((item) => item.position < detail.position)} canMoveDown={activeTasks.some((item) => item.position > detail.position)} request={request} fail={fail} />}
+    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} beginDispatch={beginDispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={moveIndex > 0} canMoveDown={moveIndex >= 0 && moveIndex < moveOrder.length - 1} request={request} fail={fail} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} confirmLabel={pendingConfirm.confirmLabel} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </section>;
 }
 
-function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchMode, selectedIDs, toggleSelect }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, placement: DropPlacement) => Promise<void>; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void }) {
+function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchMode, selectedIDs, toggleSelect, toggleGroup }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; onDrop: (taskID: string, columnID: string, placement: DropPlacement) => Promise<void>; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void; toggleGroup: (ids: string[]) => void }) {
   const [dragOverColumn, setDragOverColumn] = useState<string | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [draggingTaskID, setDraggingTaskID] = useState<string | null>(null);
@@ -401,7 +474,7 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
   // 回调，形成连锁加载直到哨兵卸载——无限滚动会退化为一次性全量加载。
   const definitions = useMemo(() => showHistoricalCancelled ? [...columnDefinitions, historicalCancelledColumn] : columnDefinitions, [showHistoricalCancelled]);
   const grouped = (definition: typeof columnDefinitions[number]) => tasks.filter((task) => definition.statuses.includes(task.status))
-    .sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
+    .sort(compareTaskOrder);
 
   // IntersectionObserver 观察各列底部的哨兵元素，进入视口即扩大该列可见数量。
   useEffect(() => {
@@ -453,12 +526,26 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
       const def = definitions.find((d) => d.id === columnID);
       if (!def) return false;
       return def.statuses.includes(t.status);
-    }).sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-    const targetIndex = dragOverIndex !== null ? Math.min(dragOverIndex, columnTasks.length) : columnTasks.length;
-    await onDrop(dragData.taskID, columnID, {
-      beforeTaskID: columnTasks[targetIndex]?.id,
-      afterTaskID: targetIndex > 0 ? columnTasks[targetIndex - 1]?.id : undefined,
+    }).sort(compareTaskOrder);
+    // 落点只看**本次 drop 事件的坐标**（落在第几行、上半还是下半），不读 dragOverIndex：
+    // 那是 dragover 写下的 React state，跨列移动或在列内空白处松手时可能残留着别的列/上一个
+    // 位置的下标，落点会差一格甚至退化成"插到末尾"。坐标口径与侧栏队列行内落点完全一致。
+    const renderedRows = [...(columnRefs.current[columnID]?.querySelectorAll<HTMLElement>(".task-item") || [])];
+    const hitIndex = renderedRows.findIndex((row) => {
+      const rect = row.getBoundingClientRect();
+      return e.clientY < rect.top + rect.height / 2;
     });
+    // 命中某行上半 = 插到它前面；落在所有行下半/列内空白 = 插到已渲染部分的末尾
+    const targetIndex = hitIndex >= 0 ? hitIndex : renderedRows.length;
+    // 槽位（targetIndex）是"插入线"位置（0..n）；翻译成"锚点 + 侧别"由 anchorForSlot 统一负责
+    // （取槽位上一行的 after、贴头取首行的 before），看板与侧栏共用同一条规则。
+    const target = anchorForSlot(columnTasks, targetIndex);
+    if (!target) {
+      // 目标列在可见范围内为空：不带锚点，交给 handleDrop 保留原 position（换列不改全局顺序）
+      await onDrop(dragData.taskID, columnID, {});
+      return;
+    }
+    await onDrop(dragData.taskID, columnID, target.placement === "before" ? { beforeTaskID: target.anchorID } : { afterTaskID: target.anchorID });
   };
   const handleTaskDragStart = (e: React.DragEvent, taskID: string, columnID: string, index: number) => {
     dragGestureActive.current = true;
@@ -506,6 +593,8 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
     const hidden = Math.max(0, items.length - visible.length);
     const isDragOver = dragOverColumn === definition.id;
     const acceptsDrops = definition.id !== "cancelled";
+    // 列头复选框 = 「只选/只清这一列」。原来只有顶部一个全选，想清掉「已完成」得一列一列手工勾。
+    const picked = batchMode ? items.filter((task) => selectedIDs.has(task.id)).length : 0;
     return <section
       className={`task-board-column column-${definition.id}${isDragOver ? " drag-over" : ""}`}
       key={definition.id}
@@ -514,7 +603,7 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
       onDragLeave={acceptsDrops ? (e) => handleColumnDragLeave(e, definition.id) : undefined}
       onDrop={acceptsDrops ? (e) => handleColumnDrop(e, definition.id) : undefined}
     >
-      <header><h3>{definition.label}</h3><b>{items.length}</b></header>
+      <header><h3>{definition.label}</h3><span className="task-board-column-tools">{batchMode && <input className="task-check" type="checkbox" checked={items.length > 0 && picked === items.length} disabled={items.length === 0} ref={(el) => { if (el) el.indeterminate = picked > 0 && picked < items.length; }} onChange={() => toggleGroup(items.map((task) => task.id))} aria-label={`${items.length > 0 && picked === items.length ? "取消选择" : "全选"}「${definition.label}」列 ${items.length} 个任务`} title={`${items.length > 0 && picked === items.length ? "取消选择" : "全选"}「${definition.label}」列`} />}<b>{items.length}</b></span></header>
       <div>
         {visible.map((task, index) => (
           <TaskItem key={task.id} task={task} open={open} columnID={definition.id} index={index} isDragging={draggingTaskID === task.id} dropTarget={dragOverColumn === definition.id && dragOverIndex === index} draggable={!batchMode && isDraggable(task, definition.id)} onDragStart={handleTaskDragStart} onDragEnd={handleTaskDragEnd} onDragOver={handleTaskDragOver} batchMode={batchMode} selected={selectedIDs.has(task.id)} toggleSelect={toggleSelect} />
@@ -526,9 +615,38 @@ function TaskBoardColumns({ tasks, showHistoricalCancelled, open, onDrop, batchM
   })}</div>;
 }
 
-function TaskList({ tasks, open, batchMode, selectedIDs, toggleSelect }: { tasks: Task[]; open: (taskID: string) => void; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void }) {
-  const sorted = [...tasks].sort((left, right) => left.position - right.position || new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() || left.title.localeCompare(right.title, "zh-CN"));
-  return <div className={`task-list${batchMode ? " batch-mode" : ""}`}><div className="task-list-head">{batchMode && <span className="task-list-check-col"></span>}<span>任务</span><span>状态</span><span>优先级</span><span>最近更新</span></div>{sorted.map((task) => { const title = taskDisplayTitle(task); const description = task.description.trim(); return <button key={task.id} className={`task-list-row${batchMode && selectedIDs.has(task.id) ? " batch-selected" : ""}`} onClick={() => open(task.id)}>{batchMode && <span className="task-list-check-col"><span className={`task-batch-check${selectedIDs.has(task.id) ? " checked" : ""}`}></span></span>}<span><b>{title}</b>{description && description !== title.trim() && <small>{description}</small>}</span><StatusBadge task={task} /><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}</em><time>{formatDate(task.updatedAt)}</time></button>; })}</div>;
+function TaskList({ tasks, showHistoricalCancelled, open, batchMode, selectedIDs, toggleSelect, toggleGroup }: { tasks: Task[]; showHistoricalCancelled: boolean; open: (taskID: string) => void; batchMode: boolean; selectedIDs: Set<string>; toggleSelect: (taskID: string) => void; toggleGroup: (ids: string[]) => void }) {
+  const sorted = [...tasks].sort(compareTaskOrder);
+  const renderRow = (task: Task) => {
+    const title = taskDisplayTitle(task);
+    const description = task.description.trim();
+    const selected = batchMode && selectedIDs.has(task.id);
+    return <button key={task.id} className={`task-list-row${selected ? " batch-selected" : ""}`} aria-pressed={batchMode ? selected : undefined} onClick={() => open(task.id)}>{batchMode && <span className="task-list-check-col"><span className={`task-batch-check${selected ? " checked" : ""}`} aria-hidden="true"></span></span>}<span className="task-list-main"><b>{title}</b>{description && description !== title.trim() && <small>{description}</small>}</span><StatusBadge task={task} /><em className={`priority-${task.priority}`}>{priorityLabels[task.priority]}</em><time>{formatDate(task.updatedAt)}</time></button>;
+  };
+  const head = <div className="task-list-head">{batchMode && <span className="task-list-check-col"></span>}<span>任务</span><span>状态</span><span>优先级</span><span>最近更新</span></div>;
+  // 列表原本是一条扁平队列，看不出「分类」也就无从只选某一类。批量模式改为按状态分组，
+  // 每组给一个「全选本组」的复选框，与看板列头的能力对齐；退出批量后顺序完全照旧。
+  if (!batchMode) return <div className="task-list">{head}{sorted.map(renderRow)}</div>;
+  const definitions = showHistoricalCancelled ? [...columnDefinitions, historicalCancelledColumn] : columnDefinitions;
+  const groups = definitions.map((definition) => ({ definition, items: sorted.filter((task) => definition.statuses.includes(task.status)) })).filter((group) => group.items.length > 0);
+  // 兜底组：后端的 `tasks.status` 只是 `text not null default 'todo'`、**没有 CHECK 约束**
+  // （见 control-server/internal/app/task.go），前端这个 union 是类型不是运行时保证。
+  // 真出现没建模的状态值时，分组不能把它悄悄吞掉 —— 非批量列表能看到多少行，批量模式就必须看到多少行。
+  const knownStatuses = new Set(definitions.flatMap((definition) => definition.statuses));
+  const unknownItems = sorted.filter((task) => !knownStatuses.has(task.status));
+  if (unknownItems.length > 0) groups.push({ definition: { id: "unknown-status", label: "其他状态", statuses: [] }, items: unknownItems });
+  return <div className="task-list batch-mode">{head}{groups.map(({ definition, items }) => {
+    const ids = items.map((task) => task.id);
+    const picked = items.filter((task) => selectedIDs.has(task.id)).length;
+    return <section className="task-list-group" key={definition.id}>
+      <header className="task-list-group-head">
+        <span className="task-list-check-col"><input className="task-check" type="checkbox" checked={items.length > 0 && picked === items.length} ref={(el) => { if (el) el.indeterminate = picked > 0 && picked < items.length; }} onChange={() => toggleGroup(ids)} aria-label={`${items.length > 0 && picked === items.length ? "取消选择" : "全选"}「${definition.label}」${items.length} 个任务`} title={`${items.length > 0 && picked === items.length ? "取消选择" : "全选"}「${definition.label}」`} /></span>
+        <span className="task-list-group-label">{definition.label}<b>{items.length}</b></span>
+        {picked > 0 && <span className="task-list-group-picked">已选 {picked}</span>}
+      </header>
+      {items.map(renderRow)}
+    </section>;
+  })}</div>;
 }
 
 function TaskItem({ task, open, columnID, index, isDragging, dropTarget, draggable, onDragStart, onDragEnd, onDragOver, batchMode, selected, toggleSelect }: { task: Task; open: (taskID: string) => void; columnID: string; index: number; isDragging: boolean; dropTarget: boolean; draggable: boolean; onDragStart: (e: React.DragEvent, taskID: string, columnID: string, index: number) => void; onDragEnd: () => void; onDragOver: (e: React.DragEvent, columnID: string, index: number) => void; batchMode: boolean; selected: boolean; toggleSelect: (taskID: string) => void }) {
@@ -551,6 +669,7 @@ function TaskItem({ task, open, columnID, index, isDragging, dropTarget, draggab
   };
   return <button
     className={`task-item priority-${task.priority}${isDragging ? " dragging" : ""}${dropTarget ? " drop-target" : ""}${!draggable ? " not-draggable" : ""}${batchMode && selected ? " batch-selected" : ""}`}
+    aria-pressed={batchMode ? selected : undefined}
     draggable={draggable}
     onMouseDown={handleMouseDown}
     onMouseMove={handleMouseMove}
@@ -569,8 +688,8 @@ function TaskItem({ task, open, columnID, index, isDragging, dropTarget, draggab
     onDragEnd={() => { dragged.current = false; dragAttempted.current = false; mouseDownRef.current = null; suppressClickUntil.current = Date.now() + DRAG_CLICK_SUPPRESSION_MS; onDragEnd(); }}
     onDragOver={(e) => { if (draggable) onDragOver(e, columnID, index); }}
   >
-    {batchMode && <span className={`task-batch-check${selected ? " checked" : ""}`} onClick={(e) => { e.stopPropagation(); toggleSelect(task.id); }}></span>}
-    <div className="task-item-top"><StatusBadge task={task} /><span className={`task-item-priority priority-${task.priority}`} title={`${priorityLabels[task.priority]}优先级`} aria-label={`${priorityLabels[task.priority]}优先级`} /></div>
+    {/* 复选框与状态徽标同一行：原来它独占一个网格行，批量模式下每张卡会凭空高出约 26px。 */}
+    <div className="task-item-top">{batchMode && <span className={`task-batch-check${selected ? " checked" : ""}`} aria-hidden="true" onClick={(e) => { e.stopPropagation(); toggleSelect(task.id); }}></span>}<StatusBadge task={task} /><span className={`task-item-priority priority-${task.priority}`} title={`${priorityLabels[task.priority]}优先级`} aria-label={`${priorityLabels[task.priority]}优先级`} /></div>
     <b>{title}</b>
     {description && description !== title.trim() && <p>{description}</p>}
     <small className="task-item-updated">更新于 {formatDate(task.updatedAt)}</small>
@@ -596,7 +715,11 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
     if (!mountedRef.current) return;
     setBusy(true);
     try {
-      const payload = { title, description, priority, position: task?.position || 0 };
+      // 新建：position 传 0 = 服务端约定的"追加到队列末尾"哨兵值（改写成 max(position)+1）。
+      // 编辑：**不带** position —— 后端 Position 为指针，缺省即保留原值。不要回传编辑器打开时的
+      // 快照值：面板开着期间（最长可能一个轮询周期）任务可能被拖拽重排，回传旧值会把它顶回去。
+      // 这与队列内联编辑的约定一致（见 TaskQueue.inlineEdit）。
+      const payload = task ? { title, description, priority } : { title, description, priority, position: 0 };
       const result = await request<Task>(task ? `/api/tasks/${task.id}` : `/api/projects/${projectID}/tasks`, { method: task ? "PATCH" : "POST", body: JSON.stringify(payload) });
       if (!mountedRef.current) return;
       await saved(result.id);

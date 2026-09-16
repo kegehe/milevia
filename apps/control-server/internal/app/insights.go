@@ -64,6 +64,20 @@ const (
 	insightScanCancelled = "cancelled"
 )
 
+// 优化建议后台任务的「种类」。互斥按（项目 × 种类）而不是只按项目：扫描与复核是两条
+// 互不干扰的只读流水线（各自持有自己的 agent 会话、各自的版本快照与落库事务），
+// 让用户在一次漫长的初扫期间仍能复核既有建议，靠的就是这里把它们分开占用。
+// 同类之间仍然互斥：两个扫描会争同一份历史指纹快照与同一条 running 扫描行，
+// 两个复核会把同一批建议并发置为 pending 再互相覆盖判定，都不成立。
+const (
+	insightRunScan   = "scan"
+	insightRunVerify = "verify"
+)
+
+// insightRunKey 组合（项目, 种类）占用键。用 NUL 分隔：项目 id 是 UUID、种类是固定
+// 枚举，不会出现拼接歧义。
+func insightRunKey(projectID, kind string) string { return projectID + "\x00" + kind }
+
 // 建议再验证（re-verify）结果状态枚举。验证状态存于 project_insights 行本身
 // （verification_result/note/verified_at），由 GET /insights 轮询带回，不新建
 // 独立验证任务表。值与前端 InsightVerificationResult 一一对应。
@@ -103,6 +117,29 @@ const insightScanRunTimeout = 45 * time.Minute
 // 好过把整趟分析的成果丢掉，但也不能无限等：等待本身就意味着项目正被别的任务改写，
 // 拖得越久结果越可能过期，用户也越久看不到结论。超时则明确告知本次结果未写入。
 const insightPublishLeaseWait = 2 * time.Minute
+
+// insightQuotaWaitMax 是只读分析调用在凭据额度不可用时"排队"等待的上限（同样被本次
+// 运行剩余预算夹住）。
+//
+// 为什么需要排队：扫描与复核现在可以并发（见 insightRunScan/insightRunVerify），但它们
+// 共用同一份凭据——进度是逐趟 agent 调用推进的，而每趟都要先过凭据额度组的并发准入。
+// 默认的私有凭据额度组 max_concurrency=1，于是"扫描 Pass A 正在跑"期间复核的第一次
+// 调用必然被拒。直接失败会让用户刚发起的复核立刻变成一堆"验证失败"（还要看到一条英文
+// 内部错误），而扫描在趟与趟之间会释放额度、用户也可能正看着别的运行结束——等一小会儿
+// 往往就能拿到。等待期间通过 progress 明说在排队，用户随时可停止（ctx 取消立即返回）。
+//
+// 取值口径：与 insightPublishLeaseWait 同一量级——够跨过"另一趟调用刚好收尾"的窗口，
+// 又不至于让用户长期盯着一份假的"复核中"。超时则以可读原因如实失败，不做无限等待。
+const insightQuotaWaitMax = 2 * time.Minute
+
+// insightQuotaPollInterval 是排队期间重试额度准入的间隔（见 reserveInsightQuotaWithWait）。
+const insightQuotaPollInterval = time.Second
+
+// errInsightQuotaWaitTimeout 是"排队等凭据额度等到预算用尽"的终局错误（见
+// reserveInsightQuotaWithWait）。它描述的不是某一趟调用失败，而是这一整段时间内都拿不到
+// 额度：复核的其余批次没有理由各再等一遍，调用方应把它当作整趟中止
+// （见 runInsightFindingsVerifyRun 对它的处理）；扫描则直接以它的文案收尾。
+var errInsightQuotaWaitTimeout = errors.New("凭据额度组的并发已占满（可能正有其他分析或对话在跑），排队等待后仍未释放。请稍后重试，或在「AI 档案」里提高该额度组的并发上限。")
 
 // insightFindingsListLimit 是列表接口单次返回的建议条数上限（有效 / 已失效 / 已忽略
 // 各自独立计数）。建议跨扫描去重累积，理论上可无限增长；这里兜底防止响应体失控，
@@ -248,15 +285,15 @@ const insightSuppressionSuperseded = "superseded"
 
 // InsightScan 一条项目分析扫描（含两趟 agent 运行）的状态行。
 type InsightScan struct {
-	ID              string     `json:"id"`
-	ProjectID       string     `json:"projectId"`
-	Status          string     `json:"status"`
-	Error           string     `json:"error,omitempty"`
-	Agent           string     `json:"agent"`
-	Theme           string     `json:"theme,omitempty"`      // 本次扫描聚焦主题（''=全面分析）
-	FocusTypes      []string   `json:"focusTypes,omitempty"` // 本次扫描限定查找的类型（空=全查）
-	FindingsCount   int        `json:"findingsCount"`
-	SuppressedCount int        `json:"suppressedCount"`
+	ID              string   `json:"id"`
+	ProjectID       string   `json:"projectId"`
+	Status          string   `json:"status"`
+	Error           string   `json:"error,omitempty"`
+	Agent           string   `json:"agent"`
+	Theme           string   `json:"theme,omitempty"`      // 本次扫描聚焦主题（''=全面分析）
+	FocusTypes      []string `json:"focusTypes,omitempty"` // 本次扫描限定查找的类型（空=全查）
+	FindingsCount   int      `json:"findingsCount"`
+	SuppressedCount int      `json:"suppressedCount"`
 	// Rejected 是本次扫描中「第 2 轮独立核实判为不成立」而被丢弃的候选，附 AI 给出的
 	// 判定依据。规则 2（必须核实）的可审计性来源：用户能看到被剔除的是什么、为什么。
 	Rejected    []InsightRejection `json:"rejected,omitempty"`
@@ -339,7 +376,7 @@ type insightsResponse struct {
 	SuppressedCount int              `json:"suppressedCount"`
 	OpenCount       int              `json:"openCount"` // 当前有效建议总数（== len(Findings)），供前端区分"本次新增"
 	// Invalidated 是经验证已失效、从有效列表隐藏的建议（折叠展示，含 AI 判断依据）。
-	Invalidated []InsightFinding        `json:"invalidated,omitempty"`
+	Invalidated  []InsightFinding        `json:"invalidated,omitempty"`
 	Verification *InsightVerificationRun `json:"verification,omitempty"`
 	// Dismissed 是用户点了「不再提示」的建议（折叠展示，可恢复）。它们不再出现在
 	// 有效列表中，也不会被后续扫描再次上报；手动删除或恢复会解除这一状态。
@@ -509,16 +546,19 @@ func (s *Server) projectRuntimeProfile(ctx context.Context, project Project, age
 }
 
 // runReadOnlyAgent 封装「选 runner → 解析项目代理路由档案 → sink → 超时 → Run →
-// 收集助手文本」，供 Pass A（发现）/ Pass B（核实）复用。严格只读：Claude 用
+// 收集助手文本」，供 Pass A（发现）/ Pass B（核实）/ 再复核复用。严格只读：Claude 用
 // `plan`、Codex 用 `read_only`，绕开 HTTP 层的 `validAgentPolicy`（见 docs/25 §5.2）。
 // 选 runner 与 startMessage（app.go:3556）同一语义：SSH 走 runnerRegistry、本机按
 // 目标环境；`agentClaudeRunnerFor/codexRunnerFor` 对 remote 返回 nil，故兜底 s.runner。
 // progress 非空时把 agent 的实时工具动作（读取/搜索…）作为分析进度回调给调用方。
 func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID, prompt string, progress func(level, message string)) (string, error) {
-	return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, nil, progress)
+	return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, nil, insightQuotaWaitMax, progress)
 }
 
-func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project, agentID, prompt string, outputSchema json.RawMessage, progress func(level, message string)) (string, error) {
+// quotaWait 是额度不可用时排队等待的上限（0 = 立即失败，见 reserveInsightQuotaWithWait）。
+// 优化建议的调用方传 insightQuotaWaitMax：扫描与复核可并发，额度冲突是常态而非异常；
+// 其它调用方（如冲突解法的单次建议）要保持"要么马上给结果、要么明确失败"，传 0。
+func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project, agentID, prompt string, outputSchema json.RawMessage, quotaWait time.Duration, progress func(level, message string)) (string, error) {
 	var runner AgentRunner
 	policy := "plan"
 	isSSH := strings.HasPrefix(project.Runner, "ssh-")
@@ -574,8 +614,14 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 			return "", errors.New("Codex CLI is unavailable or not logged in")
 		}
 	}
-	cleanupQuota, err := s.reserveInsightQuota(ctx, project, agentID, profile)
+	cleanupQuota, err := s.reserveInsightQuotaWithWait(ctx, project, agentID, profile, quotaWait, progress)
 	if err != nil {
+		// 排队超时给出的已经是可直接展示的中文原因（见 reserveInsightQuotaWithWait），
+		// 别再套一层英文包装——包装会被 localizedErrorText 连着"reserve analysis quota:"
+		// 一起带进卡片文案（其余路径保持原有的包装，便于排查真实的额度/建表失败）。
+		if errors.Is(err, errInsightQuotaWaitTimeout) {
+			return "", err
+		}
 		return "", fmt.Errorf("reserve analysis quota: %w", err)
 	}
 	defer cleanupQuota()
@@ -591,7 +637,9 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 		RunID:          uuid.NewString(),
 		AgentID:        agentID,
 		Profile:        profile,
-		SkipSessionID:  true, // 一次性只读分析：避免 plan 模式带 --session-id 走"待命"
+		// 一次性只读分析没有会话上下文，模型只可能来自档案；不显式传就会被丢成 CLI 默认。
+		Model:         runModel("", profile),
+		SkipSessionID: true, // 一次性只读分析：避免 plan 模式带 --session-id 走"待命"
 		// 只读执行（claude）：default + 仅放行只读工具，能执行但不改文件、不挂审批。
 		// codex 走其自身 read_only sandbox，不设此项。
 		ReadOnlyTools:  insightReadOnlyTools(agentID),
@@ -683,6 +731,57 @@ func (s *Server) reserveInsightQuota(ctx context.Context, project Project, agent
 			log.Printf("[insights] commit quota cleanup %s: %v", runID, cleanupErr)
 		}
 	}, nil
+}
+
+// reserveInsightQuotaWithWait 在凭据额度暂时不可用时排队等待后重试，见 insightQuotaWaitMax。
+// wait<=0 时等价于直接调用 reserveInsightQuota（立即失败）。只有"额度暂时不可用"
+// （quotaAdmissionError：并发已满 / 冷却中 / RPM、TPM 用尽）才排队；其它错误立即上抛。
+// 等待期间通过 progress 明说在排队——用户的感受是"在等"，而不是"卡住了"，且随时可停止。
+func (s *Server) reserveInsightQuotaWithWait(ctx context.Context, project Project, agentID string, profile *AgentRuntimeProfile, wait time.Duration, progress func(level, message string)) (func(), error) {
+	if wait <= 0 {
+		return s.reserveInsightQuota(ctx, project, agentID, profile)
+	}
+	deadline := time.Now().Add(wait)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	announced := false
+	for {
+		cleanup, err := s.reserveInsightQuota(ctx, project, agentID, profile)
+		if err == nil {
+			return cleanup, nil
+		}
+		var quotaErr *quotaAdmissionError
+		if !errors.As(err, &quotaErr) || ctx.Err() != nil {
+			return nil, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			// 排队也等不到：如实告诉用户"是被别的运行占着额度"，并给出可操作的去处，
+			// 而不是把跨端的英文内部错误抛到卡片上。
+			return nil, errInsightQuotaWaitTimeout
+		}
+		if !announced && progress != nil {
+			announced = true
+			progress("info", "凭据额度暂时不可用，正在排队等待其他分析让出…")
+		}
+		next := quotaErr.retryAfter
+		if next <= 0 || next > insightQuotaPollInterval {
+			// 不照抄服务端给的退避：额度冲突在本机就是一次 SQLite 读，1 秒一次可以忽略；
+			// 而并发冲突建议的 5 秒退避比扫描"趟与趟之间"的间隙还长，严格照做会让排队
+			// 几乎必然等不到释放出来的窗口（配额组冷却/RPM 用尽这类长退避同样被 2 分钟
+			// 总预算兜住，不会真的刷屏）。
+			next = insightQuotaPollInterval
+		}
+		if next > remaining {
+			next = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(next):
+		}
+	}
 }
 
 // insightLiveSink 在收集助手文本（orchestrationReviewSink）之外，额外把 agent 实时
@@ -1096,7 +1195,7 @@ type insightVerifyOutcome struct {
 
 func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID string, candidates []pendingInsight, progress func(level, message string)) ([]insightVerifyOutcome, error) {
 	cc := func(prompt string) (string, error) {
-		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightVerifyOutputSchema, progress)
+		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightVerifyOutputSchema, insightQuotaWaitMax, progress)
 	}
 	decode := func(text string) ([]insightVerifyOutcome, error) {
 		verdict, err := decodeInsightVerdict(text)
@@ -1429,36 +1528,36 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 				s.updateInsightVerificationRunMessage(verifyCtx, verificationID, "结果已就绪，正在等待项目空闲以写入…")
 			},
 			func(publishCtx context.Context) error {
-			now := time.Now().UTC()
-			for _, f := range batch {
-				result, hasResult := results[f.ID]
-				if !hasResult {
-					s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, fallbackStatus(f), fallbackNote, now)
-					continue
-				}
-				// 已失效建议复验：仅 valid 判定才把它恢复进有效列表；invalid/uncertain 保持
-				// 失效，避免一次失败的复验推翻此前 AI 已确认的失效结论。
-				if f.VerificationResult == insightVerifyInvalid && result.status != "valid" {
-					reason := result.reason
-					if result.status == "uncertain" {
-						reason = "AI 无法确认：" + reason
+				now := time.Now().UTC()
+				for _, f := range batch {
+					result, hasResult := results[f.ID]
+					if !hasResult {
+						s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, fallbackStatus(f), fallbackNote, now)
+						continue
 					}
-					s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, insightVerifyInvalid, reason, now)
-					continue
+					// 已失效建议复验：仅 valid 判定才把它恢复进有效列表；invalid/uncertain 保持
+					// 失效，避免一次失败的复验推翻此前 AI 已确认的失效结论。
+					if f.VerificationResult == insightVerifyInvalid && result.status != "valid" {
+						reason := result.reason
+						if result.status == "uncertain" {
+							reason = "AI 无法确认：" + reason
+						}
+						s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, insightVerifyInvalid, reason, now)
+						continue
+					}
+					dbStatus := insightVerifyFailed
+					if result.status == "valid" {
+						dbStatus = insightVerifyValid
+					} else if result.status == "invalid" {
+						dbStatus = insightVerifyInvalid
+					}
+					if result.status == "uncertain" {
+						result.reason = "AI 无法确认：" + result.reason
+					}
+					s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, dbStatus, result.reason, now)
 				}
-				dbStatus := insightVerifyFailed
-				if result.status == "valid" {
-					dbStatus = insightVerifyValid
-				} else if result.status == "invalid" {
-					dbStatus = insightVerifyInvalid
-				}
-				if result.status == "uncertain" {
-					result.reason = "AI 无法确认：" + result.reason
-				}
-				s.setInsightVerificationIfUnchanged(publishCtx, projectID, f, dbStatus, result.reason, now)
-			}
-			return nil
-		})
+				return nil
+			})
 		return ok, reason
 	}
 
@@ -1509,6 +1608,14 @@ func (s *Server) runInsightFindingsVerifyRun(ctx context.Context, projectID, ver
 			// 整趟被取消/超时：中止剩余批次（各批是独立的 agent 调用，继续跑没有意义）。
 			if note := insightVerifyAbortNote(verifyCtx); note != "" {
 				abortNote = note
+				break
+			}
+			// 等凭据额度等到预算用尽：不是本批的问题，而是这段时间内谁都拿不到额度，
+			// 后续批次各再等一遍只会让用户多等几倍时间，直接中止整趟（原因如实告知）。
+			if errors.Is(batchErr, errInsightQuotaWaitTimeout) {
+				persistFailures(batch, insightRunErrorMessage("建议验证失败", batchErr))
+				abortNote = "等待凭据额度超时，已中止本轮验证，请稍后重新发起"
+				processed = end
 				break
 			}
 			// 本批自身失败（agent 报错 / 输出不合契约）：只标记本批，继续跑后续批次。
@@ -1569,7 +1676,7 @@ func persistInsightWrite(write func(context.Context)) {
 
 func (s *Server) runInsightReverifyBatch(ctx context.Context, project Project, agentID, repoSHA string, targets []InsightFinding, progress func(level, message string)) (map[string]insightReverifyResult, error) {
 	cc := func(prompt string) (string, error) {
-		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightReverifyOutputSchema, progress)
+		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightReverifyOutputSchema, insightQuotaWaitMax, progress)
 	}
 	text, err := cc(buildInsightReverifyPrompt(project.Path, repoSHA, targets, false))
 	if err != nil {
@@ -1811,7 +1918,8 @@ func (s *Server) resolveVerifyTargets(ctx context.Context, projectID string, ids
 // verifyInsightFindings POST /api/projects/{projectID}/insights/verify
 // 对既有建议发起新一轮 AI 核验。可选 body {"agent":"codex","findingIds":[...]}，缺省 = 全部有效建议。
 // 异步执行：先把目标置 pending 并返回 202，后台跑只读 agent 后逐条写回
-// valid/invalid/failed。单项目互斥：扫描/验证进行中返回 409。
+// valid/invalid/failed。同类互斥：该项目已有复核在跑时返回 409；扫描是另一种类，
+// 不受阻塞（见 insightRunScan/insightRunVerify）。
 func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	projectID := r.PathValue("projectID")
 	if !s.projectExists(r.Context(), projectID) {
@@ -1838,27 +1946,21 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	verificationID := uuid.NewString()
 
-	s.insightMu.Lock()
-	s.mu.Lock()
-	closing := s.closing
-	s.mu.Unlock()
-	if closing {
-		s.insightMu.Unlock()
-		writeError(w, http.StatusServiceUnavailable, errors.New("服务正在关闭，请稍后再试"))
+	// 与扫描同样的登记语义，但种类是 verify：同项目的复核与扫描互不阻塞（用户可以在
+	// 一次漫长的初扫期间复核既有建议），同类之间仍互斥——两个复核会把同一批建议并发
+	// 置为 pending 再互相覆盖判定。
+	// 这里不做扫描那样的"DB 残留 running 行"兜底：复核的 running 行只用于展示进度，
+	// 启动时迁移已把残留行置 failed（app.go 的 insight 迁移），而多一条兜底反而会在
+	// 旧的 running 行没被清掉时把用户永久挡在复核之外。
+	runCtx, release, ok, closing := s.beginInsightRun(projectID, insightRunVerify, 0)
+	if !ok {
+		if closing {
+			writeError(w, http.StatusServiceUnavailable, errors.New("服务正在关闭，请稍后再试"))
+			return
+		}
+		writeError(w, http.StatusConflict, errors.New("该项目正在复核建议，请稍候再试"))
 		return
 	}
-	if s.insightActive[projectID] {
-		s.insightMu.Unlock()
-		writeError(w, http.StatusConflict, errors.New("项目正在分析/验证中，请稍候再试"))
-		return
-	}
-	// 先创建取消句柄并随 insightActive 一起登记：让 cancel 端点也能命中"启动中"瞬间。
-	// runCancel 由 goroutine 的 defer 调用；早退路径（工作区/事务失败）显式调用，幂等。
-	runCtx, runCancel := context.WithCancel(s.runtimeCtx)
-	s.insightActive[projectID] = true
-	s.insightCancels[projectID] = runCancel
-	s.insightWG.Add(1)
-	s.insightMu.Unlock()
 
 	// 准入检查（不是长期占用）：复核全程只读、不独占工作区，用户可以在复核期间继续用
 	// 项目；但若此刻项目正被别的任务改写，结论几乎必然在落库时被判作废，所以此时直接
@@ -1866,24 +1968,14 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	// （见 publishInsightResult）。
 	releaseAdmission, acquired := s.acquireProjectWorkspace(projectID, "insight-verify:"+verificationID)
 	if !acquired {
-		runCancel()
-		s.insightMu.Lock()
-		delete(s.insightActive, projectID)
-		delete(s.insightCancels, projectID)
-		s.insightMu.Unlock()
-		s.insightWG.Done()
+		release()
 		writeError(w, http.StatusConflict, errors.New("项目工作区正在被其他任务修改，请稍候再试"))
 		return
 	}
 	releaseAdmission()
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
-		runCancel()
-		s.insightMu.Lock()
-		delete(s.insightActive, projectID)
-		delete(s.insightCancels, projectID)
-		s.insightMu.Unlock()
-		s.insightWG.Done()
+		release()
 		writeError(w, http.StatusInternalServerError, errors.New("启动建议验证失败，请重试"))
 		return
 	}
@@ -1896,12 +1988,7 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	for _, f := range targets {
 		pending, err := setInsightVerificationPendingIfUnchanged(r.Context(), tx, projectID, f, now)
 		if err != nil {
-			runCancel()
-			s.insightMu.Lock()
-			delete(s.insightActive, projectID)
-			delete(s.insightCancels, projectID)
-			s.insightMu.Unlock()
-			s.insightWG.Done()
+			release()
 			writeError(w, http.StatusInternalServerError, errors.New("启动建议验证失败，请重试"))
 			return
 		}
@@ -1911,12 +1998,7 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(pendingTargets) == 0 {
-		runCancel()
-		s.insightMu.Lock()
-		delete(s.insightActive, projectID)
-		delete(s.insightCancels, projectID)
-		s.insightMu.Unlock()
-		s.insightWG.Done()
+		release()
 		writeError(w, http.StatusConflict, errors.New("建议已被更新，请刷新后重新验证"))
 		return
 	}
@@ -1924,22 +2006,12 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 		(id,project_id,status,message,total_count,processed_count,created_at,started_at)
 		values (?,?,'running',?, ?,0,?,?)`,
 		verificationID, projectID, "正在准备验证", len(pendingTargets), now, now); err != nil {
-		runCancel()
-		s.insightMu.Lock()
-		delete(s.insightActive, projectID)
-		delete(s.insightCancels, projectID)
-		s.insightMu.Unlock()
-		s.insightWG.Done()
+		release()
 		writeError(w, http.StatusInternalServerError, errors.New("启动建议验证失败，请重试"))
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		runCancel()
-		s.insightMu.Lock()
-		delete(s.insightActive, projectID)
-		delete(s.insightCancels, projectID)
-		s.insightMu.Unlock()
-		s.insightWG.Done()
+		release()
 		writeError(w, http.StatusInternalServerError, errors.New("启动建议验证失败，请重试"))
 		return
 	}
@@ -1948,18 +2020,11 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	// 让项目总览卡片的进度文案立刻亮起，而不是等 30s 兜底轮询。
 	s.broadcastStateEvent(stEvProjects, projectID)
 
-	// 后台执行。Done 在 goroutine 内调用，使 insightWG 精确跟踪验证生命周期，
-	// 供 Close() 等待（与 triggerInsightScan 同语义）。runCtx 已在登记 active 时创建：
+	// 后台执行。release 在 goroutine 内调用，使 insightWG 精确跟踪验证生命周期，
+	// 供 Close() 等待（与 triggerInsightScan 同语义）。runCtx 已在登记时创建：
 	// 项目被删除/用户停止时取消它，避免 agent 继续跑完无用功。
 	go func() {
-		defer s.insightWG.Done()
-		defer runCancel()
-		defer func() {
-			s.insightMu.Lock()
-			delete(s.insightActive, projectID)
-			delete(s.insightCancels, projectID)
-			s.insightMu.Unlock()
-		}()
+		defer release()
 		// 兜底：worker 跑在裸 goroutine 里，panic 若逃逸会带走整个控制服务。
 		// runInsightFindingsVerifyRun 内部已自兜底（并写下终态），这里防的是它的外层。
 		defer func() {
@@ -2358,7 +2423,7 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	// parseInsightCandidates 必然失败（这正是「分析代理未返回有效结果」的真因）。
 	// 补救：用一条强约束的"只输出 JSON"修正 prompt 重试一次；仍失败才判 scan failed。
 	emit("info", "第 1 轮：通读项目代码，收集候选发现…")
-	textA, err := s.runReadOnlyAgentWithSchema(ctx, project, agentID, buildInsightScanPrompt(project.Path, repoSHA, alreadySurfaced, opts), insightCandidatesOutputSchema, emit)
+	textA, err := s.runReadOnlyAgentWithSchema(ctx, project, agentID, buildInsightScanPrompt(project.Path, repoSHA, alreadySurfaced, opts), insightCandidatesOutputSchema, insightQuotaWaitMax, emit)
 	if err != nil {
 		log.Printf("[insights] project=%s Pass A runner error: %v", projectID, err)
 		markFailed(insightRunErrorMessage("项目分析失败", err))
@@ -2370,7 +2435,7 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 			projectID, len(textA), truncateInsightLog(textA, 300))
 		// 修正 prompt 重试一次（同项目同方向，但明确"只输出数组"。）
 		emit("warn", "首轮输出不规范，正在要求 AI 补交结果…")
-		textA, err = s.runReadOnlyAgentWithSchema(ctx, project, agentID, buildInsightRepairPromptWithHistory(project.Path, repoSHA, alreadySurfaced, opts), insightCandidatesOutputSchema, emit)
+		textA, err = s.runReadOnlyAgentWithSchema(ctx, project, agentID, buildInsightRepairPromptWithHistory(project.Path, repoSHA, alreadySurfaced, opts), insightCandidatesOutputSchema, insightQuotaWaitMax, emit)
 		if err != nil {
 			log.Printf("[insights] project=%s Pass A retry runner error: %v", projectID, err)
 			markFailed(insightRunErrorMessage("项目分析失败", err))
@@ -2527,8 +2592,53 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	emit("success", fmt.Sprintf("分析完成，新增 %d 条建议，忽略 %d 条重复", inserted, suppressed))
 }
 
+// beginInsightRun 登记一次「项目 × 种类」的优化建议后台运行，返回其运行上下文与释放
+// 函数。同一项目的同类任务已在运行时 ok=false（调用方据此回 409）；服务正在关闭时
+// ok=false 且 closing=true（调用方回 503）。timeout>0 时给运行上下文加总预算。
+//
+// 登记（而不是等到 goroutine 起来）就先占位，是为了让 cancel 端点能命中"启动到就绪"
+// 之间的窗口；调用方在每条早退路径上都要 release，成功交给后台 goroutine defer release。
+// release 幂等性不做保证：调用方必须保证恰好调用一次（与 insightWG.Add/Done 配对）。
+func (s *Server) beginInsightRun(projectID, kind string, timeout time.Duration) (context.Context, func(), bool, bool) {
+	s.insightMu.Lock()
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing {
+		s.insightMu.Unlock()
+		return nil, nil, false, true
+	}
+	key := insightRunKey(projectID, kind)
+	if s.insightActive[key] {
+		s.insightMu.Unlock()
+		return nil, nil, false, false
+	}
+	runCtx, runCancel := context.WithCancel(s.runtimeCtx)
+	if timeout > 0 {
+		// 换成带总预算的上下文：上面的 cancel 必须先释放，否则它连同父 ctx 一直挂在
+		// 运行时上下文上（withTimeout 自己会派生新的取消句柄）。
+		runCancel()
+		runCtx, runCancel = context.WithTimeout(s.runtimeCtx, timeout)
+	}
+	s.insightActive[key] = true
+	s.insightCancels[key] = runCancel
+	s.insightWG.Add(1)
+	s.insightMu.Unlock()
+	return runCtx, func() {
+		// 先摘掉登记再取消：取消之后进来的 cancel 请求看到"没有运行中任务"，
+		// 与旧实现的收尾顺序一致（避免把已结束的运行报成"已取消"）。
+		s.insightMu.Lock()
+		delete(s.insightActive, key)
+		delete(s.insightCancels, key)
+		s.insightMu.Unlock()
+		runCancel()
+		s.insightWG.Done()
+	}, true, false
+}
+
 // triggerInsightScan POST /api/projects/{id}/insights/scan
-// 单项目互斥：已有 running 扫描返回 409；否则插入 running 扫描行并后台执行。
+// 单（项目 × 种类）互斥：已有 running 扫描返回 409；否则插入 running 扫描行并后台执行。
+// 复核是另一种类，不受这里阻塞（见 insightRunScan/insightRunVerify 注释）。
 func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	projectID := r.PathValue("projectID")
 	if !s.projectExists(r.Context(), projectID) {
@@ -2547,36 +2657,24 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	}
 	scanID := uuid.NewString()
 
-	s.insightMu.Lock()
-	s.mu.Lock()
-	closing := s.closing
-	s.mu.Unlock()
-	if closing {
-		s.insightMu.Unlock()
-		writeError(w, http.StatusServiceUnavailable, errors.New("服务正在关闭，请稍后再试"))
-		return
-	}
-	if s.insightActive[projectID] {
-		s.insightMu.Unlock()
+	// 总预算 insightScanRunTimeout 从登记这一刻开始计，保证扫描不会无限期跑下去
+	// （单趟上限是"每趟"的，没有总预算时多趟 + 重试会累计成小时级）。
+	runCtx, release, ok, closing := s.beginInsightRun(projectID, insightRunScan, insightScanRunTimeout)
+	if !ok {
+		if closing {
+			writeError(w, http.StatusServiceUnavailable, errors.New("服务正在关闭，请稍后再试"))
+			return
+		}
 		writeError(w, http.StatusConflict, errors.New("项目正在分析中，请稍候再试"))
 		return
 	}
 	// 兜底：进程恢复后若 DB 残留上次未完成的 running 行，也视为占用。
 	var runningExists int
 	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from project_insight_scans where project_id=? and status='running')`, projectID).Scan(&runningExists); err == nil && runningExists == 1 {
-		s.insightMu.Unlock()
+		release()
 		writeError(w, http.StatusConflict, errors.New("项目正在分析中，请稍候再试"))
 		return
 	}
-	// 先创建取消句柄并随 insightActive 一起登记，再解锁：让 cancel 端点也能命中
-	// "启动中"这一瞬间（置 active 到 goroutine 就绪之间），避免启动窗口内取消被当作
-	// no-op。总预算 insightScanRunTimeout 从这一刻开始计，保证扫描不会无限期跑下去
-	// （单趟上限是"每趟"的，没有总预算时多趟 + 重试会累计成小时级）。
-	runCtx, runCancel := context.WithTimeout(s.runtimeCtx, insightScanRunTimeout)
-	s.insightActive[projectID] = true
-	s.insightCancels[projectID] = runCancel
-	s.insightWG.Add(1)
-	s.insightMu.Unlock()
 
 	// 准入检查（不是长期占用）：分析全程只读、不独占工作区，用户可以在分析期间继续
 	// 用项目；但若此刻项目正被别的任务改写，分析出的结论几乎必然在落库时被判作废，
@@ -2584,12 +2682,7 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	// 只发生在"最终版本复核 + 写库"那一小段（见 publishInsightResult）。
 	releaseAdmission, acquired := s.acquireProjectWorkspace(projectID, "insight-scan:"+scanID)
 	if !acquired {
-		runCancel()
-		s.insightMu.Lock()
-		delete(s.insightActive, projectID)
-		delete(s.insightCancels, projectID)
-		s.insightMu.Unlock()
-		s.insightWG.Done()
+		release()
 		writeError(w, http.StatusConflict, errors.New("项目工作区正在被其他任务修改，请稍候再试"))
 		return
 	}
@@ -2599,12 +2692,7 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 		(id,project_id,status,agent,theme,focus_types,findings_count,suppressed_count,created_at,started_at)
 		values (?,?,?,?,?,?,0,0,?,?)`,
 		scanID, projectID, insightScanRunning, opts.Agent, opts.Theme, strings.Join(opts.Types, ","), now, now); err != nil {
-		runCancel()
-		s.insightMu.Lock()
-		delete(s.insightActive, projectID)
-		delete(s.insightCancels, projectID)
-		s.insightMu.Unlock()
-		s.insightWG.Done()
+		release()
 		writeError(w, http.StatusInternalServerError, errors.New("启动分析失败，请重试"))
 		return
 	}
@@ -2615,19 +2703,12 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	// 让项目总览卡片的「优化建议分析中」徽标立刻亮起，而不是等 30s 兜底轮询。
 	s.broadcastStateEvent(stEvProjects, projectID)
 
-	// 后台执行扫描。Done 在扫描 goroutine 内调用，使 insightWG 精确跟踪扫描生命周期，
-	// 供 Close() 等待（而非在 HTTP handler 返回时就 Done，那会让 Close 立即通过）。
-	// runCtx 已在登记 active 时创建：项目被删除/用户停止时取消它，避免 agent
-	// 继续跑完剩余阶段做无用功。
+	// 后台执行扫描。release 在扫描 goroutine 内调用，使 insightWG 精确跟踪扫描生命周期，
+	// 供 Close() 等待（而非在 HTTP handler 返回时就释放，那会让 Close 立即通过）。
+	// runCtx 已在登记时创建：项目被删除/用户停止时取消它，避免 agent 继续跑完剩余阶段
+	// 做无用功。
 	go func() {
-		defer s.insightWG.Done()
-		defer runCancel()
-		defer func() {
-			s.insightMu.Lock()
-			delete(s.insightActive, projectID)
-			delete(s.insightCancels, projectID)
-			s.insightMu.Unlock()
-		}()
+		defer release()
 		// 兜底：worker 跑在裸 goroutine 里，panic 若逃逸会带走整个控制服务。
 		// runProjectInsightScan 内部已自兜底（并写下扫描终态），这里防的是它的外层。
 		defer func() {
@@ -2639,36 +2720,66 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// insightCancelRequest 是 POST /insights/cancel 的可选 body：只停止指定种类，
+// 缺省（空 body / 空 kind）= 停止该项目下全部运行中的优化建议任务。
+type insightCancelRequest struct {
+	Kind string `json:"kind"`
+}
+
 // cancelInsightScan POST /api/projects/{projectID}/insights/cancel
-// 停止该项目运行中的优化建议扫描或复核（若有）。取消通过 context 传播给 worker
-// goroutine：agent 进程被终止，扫描/复核记录置为 cancelled（见 runProjectInsightScan
-// 的 markFailed 与 runInsightFindingsVerifyRun 的 failAll 对 context.Canceled 的处理）。
-// 无运行中的任务时幂等返回 202（cancelled=false），避免双连击报错。
+// 停止该项目运行中的优化建议扫描和/或复核。取消通过 context 传播给 worker goroutine：
+// agent 进程被终止，扫描/复核记录置为 cancelled（见 runProjectInsightScan 的 markFailed
+// 与 runInsightFindingsVerifyRun 的 failAll 对 context.Canceled 的处理）。
+//
+// 扫描与复核可以并发（见 insightRunScan/insightRunVerify），因此 body 支持 kind 只停一种：
+// 面板上扫描与复核各有自己的「停止」，两种同时进行时点其中一个不该把另一个也杀掉。
+// 旧的空 body 调用等价于"全停"，保持向后兼容。无运行中的任务时幂等返回 202（cancelled=false）。
 func (s *Server) cancelInsightScan(w http.ResponseWriter, r *http.Request) {
 	projectID := r.PathValue("projectID")
 	if !s.projectExists(r.Context(), projectID) {
 		http.NotFound(w, r)
 		return
 	}
-	s.insightMu.Lock()
-	cancel := s.insightCancels[projectID]
-	running := s.insightActive[projectID]
-	s.insightMu.Unlock()
-	cancelled := running && cancel != nil
-	if cancelled {
-		cancel()
+	var req insightCancelRequest
+	if !decodeOptional(w, r, &req) {
+		return
+	}
+	var kinds []string
+	switch strings.TrimSpace(req.Kind) {
+	case "":
+		kinds = []string{insightRunScan, insightRunVerify}
+	case insightRunScan, insightRunVerify:
+		kinds = []string{req.Kind}
+	default:
+		writeError(w, http.StatusBadRequest, errors.New("未知的取消目标"))
+		return
+	}
+	cancelled := false
+	for _, kind := range kinds {
+		if s.cancelInsightRunKind(projectID, kind) {
+			cancelled = true
+		}
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"cancelled": cancelled})
 }
 
-// cancelInsightRun 取消该项目运行中的优化建议扫描/复核（若有）。供项目删除时中止
-// 无用的 agent 运行；goroutine 收到取消后会中止 agent 并自行清理 insightActive。
-func (s *Server) cancelInsightRun(projectID string) {
+// cancelInsightRunKind 取消该项目指定种类的运行，返回是否确实有运行被取消。
+func (s *Server) cancelInsightRunKind(projectID, kind string) bool {
 	s.insightMu.Lock()
-	cancel := s.insightCancels[projectID]
+	cancel := s.insightCancels[insightRunKey(projectID, kind)]
 	s.insightMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+// cancelInsightRun 取消该项目下所有运行中的优化建议任务（扫描 + 复核）。供项目删除时
+// 中止无用的 agent 运行；goroutine 收到取消后会中止 agent 并自行清理登记。
+func (s *Server) cancelInsightRun(projectID string) {
+	for _, kind := range []string{insightRunScan, insightRunVerify} {
+		s.cancelInsightRunKind(projectID, kind)
 	}
 }
 
@@ -3140,11 +3251,7 @@ func buildInsightTaskDescription(f InsightFinding) string {
 
 // truncateInsightRunes 按 rune 数截断（中文安全），超长截断。
 func truncateInsightRunes(s string, limit int) string {
-	runes := []rune(strings.TrimSpace(s))
-	if len(runes) <= limit {
-		return string(runes)
-	}
-	return string(runes[:limit])
+	return truncateRunes(strings.TrimSpace(s), limit)
 }
 
 // addInsightToTask POST /api/projects/{projectID}/insights/{findingID}/to-task
@@ -3244,6 +3351,8 @@ func (s *Server) convertInsightToTask(ctx context.Context, projectID string, f I
 	if openLinked > 0 {
 		return Task{}, false, nil
 	}
+	// 追加到队列末尾：position = 当前最大值 +1。队列按 position 升序展示（见 createTask
+	// 的写入契约注释），所以建议转出来的任务同样排在最后，不会插到已有任务中间。
 	if err := tx.QueryRowContext(ctx, `select coalesce(max(position),0)+1 from tasks where project_id=?`, projectID).Scan(&task.Position); err != nil {
 		return Task{}, false, errors.New("创建任务失败，请重试")
 	}

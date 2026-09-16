@@ -115,18 +115,17 @@ func (s *Server) beginRunUsage(runID, conversationID string) {
 // Codex 的 exec --json 事件流只有 token 用量、不含模型名（见 runUsageAccumulator.collect
 // 中 turn.completed 分支），与 Claude Code 不同——后者能直接从 assistant/system 事件里拿到
 // model。因此 Codex 的模型必须在启动时从两个来源补齐：
-//   - 档案（profile）显式指定了模型时用档案值（run 会以 -c model= 传给 CLI）；
+//   - runModel 已经解析出非空模型时用它（run 会以 -c model= 传给 CLI，可能来自会话覆盖）；
 //   - 否则（cli_managed 默认配置）向 runner 询问 config.toml 里的默认模型。
 //
 // 只设置一次且不覆盖已有值：Codex 事件流不会填 model，但保留给未来可能在事件里出现模型的
 // 情况。Claude Code 不需要此预置，其模型由事件驱动。
-func (s *Server) seedRunUsageModel(runID, agentID string, profile *AgentRuntimeProfile, runner AgentRunner) {
+//
+// model 由调用方传入而不是在这里从 profile 取：会话级覆盖已经在 runModel 里折叠进
+// request.Model，这里再读 profile 会让"喂给 CLI 的模型"与"显示用的模型"分叉。
+func (s *Server) seedRunUsageModel(runID, agentID, model string, runner AgentRunner) {
 	if agentID != "codex" {
 		return
-	}
-	var model string
-	if profile != nil {
-		model = profile.Model
 	}
 	if model == "" {
 		if resolver, ok := runner.(codexDefaultModelRunner); ok {

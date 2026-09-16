@@ -42,16 +42,21 @@ test("task views only apply their latest list, detail, and orchestration respons
 
 test("orchestration workspace exposes plan, queue and decision controls without mandatory verification", () => {
 	assert.match(orchestrationPage, /orchestration\/batches/);
-	assert.match(orchestrationPage, /orchestration\/batches\/\$\{existingBatch\.id\}\/tasks/);
+	// 新建只负责建计划；任务一律在候选列表里勾选后追加到当前计划。
+	assert.match(orchestrationPage, /orchestration\/batches\/\$\{activeBatch\.id\}\/tasks/);
+	assert.match(orchestrationPage, /const addCandidatesToBatch = async \(\) =>/);
   assert.match(orchestrationPage, /orchestration\/order/);
   assert.match(orchestrationPage, /orchestration\/dequeue/);
   assert.match(orchestrationPage, /merge-main/);
 	assert.match(orchestrationPage, /orchestration\/decision/);
 	assert.match(orchestrationPage, /orchestration\/cleanup/);
   assert.match(orchestrationPage, /conversationStrategy/);
-	assert.match(orchestrationPage, /const \[draftTaskIDs, setDraftTaskIDs\] = useState<string\[\]>\(\[\]\);/);
-	assert.match(orchestrationPage, /const selectedDraftTasks = useMemo/);
-	assert.match(orchestrationPage, /moveDraftTask\(task\.id, "up"\)/);
+	// 弹窗只收集名称、上下文继承与执行配置，不再有「加入到」下拉与启用开关。
+	assert.match(orchestrationPage, /const \[batchPolicy, setBatchPolicy\] = useState<BatchPolicyDraft>\(defaultBatchPolicy\);/);
+	assert.match(orchestrationPage, /const createBatch = async \(\) => \{[\s\S]*?method: "POST",[\s\S]*?maxFixRounds: batchPolicy\.maxFixRounds/);
+	assert.doesNotMatch(orchestrationPage, /加入到/);
+	assert.doesNotMatch(orchestrationPage, /启用自动队列|启用自动编排/);
+	assert.doesNotMatch(orchestrationPage, /orchestration-eyebrow|EXECUTION PLAN|PROJECT POLICY/);
 	assert.match(orchestrationPage, /batchFilterID/);
 	assert.doesNotMatch(orchestrationPage, /batches\.slice\(0, 5\)/);
 	assert.match(orchestrationPage, /\["released_to_main", "stopped", "needs_human"\]\.includes\(selected\.status\)/);
@@ -67,6 +72,7 @@ test("orchestration workspace exposes plan, queue and decision controls without 
   assert.match(orchestrationPage, /id="workspace-panel-orchestration"[\s\S]*?role="tabpanel"[\s\S]*?aria-labelledby="workspace-tab-orchestration"/);
   assert.match(orchestrationStyles, /\.orchestration-queue \.orchestration-queue-actions button\s*\{[^}]*width:\s*21px;[^}]*min-height:\s*21px;/s);
 	assert.match(orchestrationStyles, /\.orchestration-head-actions \{ flex-wrap: wrap; \}/);
+	assert.match(orchestrationStyles, /\.orchestration-composer-dialog \{/);
 });
 
 test("orchestration workspace loads complete history and keeps a single-column mobile layout", () => {

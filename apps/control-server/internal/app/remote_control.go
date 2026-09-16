@@ -55,6 +55,14 @@ type remoteSnapshot struct {
 	SnapshotRevision int64                   `json:"snapshotRevision"`
 	ObservedAt       time.Time               `json:"observedAt"`
 	Projects         []remoteSnapshotProject `json:"projects"`
+	// Shortcuts 是电脑端的「常用提示词 / 常用命令」库，手机端输入条的「＋」面板与桌面端
+	// 左侧快捷栏展示同一份数据（用户明确要求"同源"）。
+	//
+	// 放在顶层而不是每个项目里：一份快捷方式可能被多个项目共用（shortcut_projects 是多对多），
+	// 每个项目复制一遍既膨胀负载又会出现"同一份数据在快照里有两个版本"。作用域信息随
+	// projectIds 一起下发，由手机端按当前项目过滤（规则与 listShortcuts 的 SQL 完全一致：
+	// scope='local' 或绑定到该项目）。
+	Shortcuts []remoteSnapshotShortcut `json:"shortcuts"`
 }
 
 type remoteSnapshotProject struct {
@@ -67,6 +75,27 @@ type remoteSnapshotProject struct {
 	CreatedAt     time.Time                    `json:"createdAt"`
 	Tasks         []remoteSnapshotTask         `json:"tasks"`
 	Conversations []remoteSnapshotConversation `json:"conversations"`
+	// Skills 是该项目在当前会话所用 CLI 下可用的技能（扫描本机 / 远端文件系统得到）。
+	// 挂在项目上而不是顶层：技能是"项目 + CLI"两个维度的产物（项目级 SKILL.md 目录会覆盖
+	// 用户级同名技能），脱离项目就没有意义。详见 skills.go 的 discoverSkillsForProject。
+	Skills []Skill `json:"skills"`
+}
+
+// remoteSnapshotShortcut 是 Shortcut 的裁剪版：只带手机端渲染与执行需要的字段。
+// 刻意不下发 createdAt/updatedAt —— 手机端一次都没用上，白白让每个快照都多几百字节。
+type remoteSnapshotShortcut struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Description   string   `json:"description"`
+	Kind          string   `json:"kind"`
+	Template      string   `json:"template"`
+	Scope         string   `json:"scope"`
+	DefaultAction string   `json:"defaultAction"`
+	GroupName     string   `json:"groupName,omitempty"`
+	Pinned        bool     `json:"pinned"`
+	Enabled       bool     `json:"enabled"`
+	SortOrder     int      `json:"sortOrder"`
+	ProjectIDs    []string `json:"projectIds"`
 }
 
 type remoteSnapshotTask struct {
@@ -86,6 +115,10 @@ type remoteSnapshotConversation struct {
 	LastActivityAt time.Time               `json:"lastActivityAt"`
 	IsCurrent      bool                    `json:"isCurrent"`
 	Messages       []remoteSnapshotMessage `json:"messages"`
+	// Notices 是最近的状态/诊断事件原文（API 重试、上下文压缩、执行失败等）。
+	// 实时的 outbox 事件只在运行中送达，手机重进页面或中途刷新时看不到它们，
+	// 所以快照要一并回放，否则"执行失败"这类关键信息一刷新就消失了。
+	Notices []remoteSnapshotNotice `json:"notices"`
 }
 
 type remoteSnapshotMessage struct {
@@ -96,6 +129,17 @@ type remoteSnapshotMessage struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+// remoteSnapshotNotice carries one status/diagnostic event verbatim: the phone
+// parses it with the same rules the desktop timeline uses, so the two surfaces
+// cannot drift into describing the same event differently.
+type remoteSnapshotNotice struct {
+	ID        string          `json:"id"`
+	RunID     string          `json:"runId,omitempty"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt time.Time       `json:"createdAt"`
+}
+
 // Mobile receives durable message events in real time. The snapshot is only a
 // bounded recovery/bootstrap view, so do not rebuild every historical
 // conversation on each sync. Older desktop history remains in SQLite and is
@@ -104,7 +148,23 @@ const (
 	remoteSnapshotConversationsPerProject = 1
 	remoteSnapshotMessagesPerConversation = 20
 	remoteSnapshotMessageContentLimit     = 2000
+	remoteSnapshotNoticesPerConversation  = 24
+	remoteSnapshotNoticePayloadLimit      = 4096
+	// 快捷方式库的配额。库是用户手工维护的，正常几十条；给上限是为了防"导入了上千条提示词"
+	// 把每个快照都撑到几百 KB（快照每次有事件推进就要重传一次，3 秒节流）。
+	remoteSnapshotShortcuts             = 200
+	remoteSnapshotShortcutTemplateLimit = 2000
+	// 技能扫描（本地目录 / 远端 SSH find+cat）比一次 SQL 贵得多，而技能只在安装/卸载时才变。
+	// 快照路径单独走一层 60 秒缓存，桌面端的 listSkills 仍然是实时扫描、不受影响。
+	remoteSnapshotSkillsTTL = 60 * time.Second
 )
+
+// remoteNoticeTypesSQL 是快照回放要带的"运行状态/诊断"事件类型（SQL 片段，值全部是
+// 本文件的字面常量，不含任何用户输入）。approval.% 用 LIKE 覆盖 pending/allow/deny/
+// aborted/timeout："卡在等工具确认"是重新打开会话时最需要看到的状态，漏掉它用户只会
+// 以为程序死了。stderr 刻意不在其中——它逐行产生，几十行会把配额挤爆，而且真正的原因
+// 通常已经在 run.failed / error 的 detail 里；实时通道仍会把它聚合成一条"CLI 输出"。
+const remoteNoticeTypesSQL = `type in ('system','run.failed','run.interrupted','error','turn.failed','stream.error') or type like 'approval.%'`
 
 type remoteCommand struct {
 	CommandID      string          `json:"commandId"`
@@ -475,7 +535,11 @@ func (s *Server) enqueueRemoteCommand(w http.ResponseWriter, r *http.Request) {
 	}
 	command.Type = strings.TrimSpace(command.Type)
 	command.IdempotencyKey = strings.TrimSpace(command.IdempotencyKey)
-	allowed := map[string]bool{"task.create": true, "task.update": true, "task.delete": true, "task.dispatch": true, "task.stop": true, "task.review": true, "task.reopen": true, "conversation.create": true, "conversation.message": true}
+	// conversation.shortcut 让手机端触发电脑端**同一条**快捷方式执行路径
+	// （/api/conversations/{id}/shortcuts/{id}/preview|run）：模板里的 ${project.path}
+	// 这类变量只有电脑端渲染得出来，命令类快捷方式的 shell 包装也只在服务端有一份实现，
+	// 手机端本地拼一遍就会与桌面端分叉。详见 executeRemoteCommand。
+	allowed := map[string]bool{"task.create": true, "task.update": true, "task.delete": true, "task.dispatch": true, "task.stop": true, "task.review": true, "task.reopen": true, "conversation.create": true, "conversation.message": true, "conversation.shortcut": true}
 	if !allowed[command.Type] || command.IdempotencyKey == "" {
 		writeError(w, http.StatusBadRequest, errors.New("type and idempotencyKey are required and must be supported"))
 		return
@@ -556,7 +620,16 @@ func (s *Server) remoteRelayConfigured() bool {
 }
 
 func (s *Server) enqueueRemoteEventTx(ctx context.Context, tx *sql.Tx, eventID, taskID, taskRunID, typ string, payload []byte, now time.Time) error {
-	payload = compactRemoteEventPayload(typ, payload)
+	return s.enqueueRemoteEventTxWithConversation(ctx, tx, eventID, taskID, taskRunID, "", typ, payload, now)
+}
+
+// enqueueRemoteEventTxWithConversation is the conversation-aware form of
+// enqueueRemoteEventTx. The outbox row has no conversation column and the CLI
+// payloads carry none either, so without stamping the identifier here a relayed
+// status event (API retry, context compaction) or execution failure arrives on
+// the phone with nothing to attribute it to.
+func (s *Server) enqueueRemoteEventTxWithConversation(ctx context.Context, tx *sql.Tx, eventID, taskID, taskRunID, conversationID, typ string, payload []byte, now time.Time) error {
+	payload = compactRemoteEventPayload(typ, remoteEventPayloadWithConversation(payload, conversationID))
 	if _, err := tx.ExecContext(ctx, `update remote_instance set last_agent_sequence=last_agent_sequence+1,updated_at=?`, now); err != nil {
 		return err
 	}
@@ -577,6 +650,38 @@ func (s *Server) enqueueRemoteEventTx(ctx context.Context, tx *sql.Tx, eventID, 
 	return nil
 }
 
+// remoteEventPayloadWithConversation stamps the conversation identifier into the
+// relayed copy of an event payload.
+//
+// The desktop transcript keeps the original payload; only the outbox copy is
+// decorated. Mobile needs it because status/diagnostic events (API retry,
+// context compaction, execution failure) are produced by the CLI and therefore
+// carry no conversation field of their own, while the outbox envelope has no
+// conversation column either — without this stamp the phone can only guess which
+// conversation a "正在压缩上下文" or "执行失败" notice belongs to.
+func remoteEventPayloadWithConversation(payload []byte, conversationID string) []byte {
+	if conversationID == "" || len(payload) == 0 {
+		return payload
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(payload, &object) != nil || object == nil {
+		return payload
+	}
+	if _, exists := object["conversationId"]; exists {
+		return payload
+	}
+	encoded, err := json.Marshal(conversationID)
+	if err != nil {
+		return payload
+	}
+	object["conversationId"] = encoded
+	merged, err := json.Marshal(object)
+	if err != nil {
+		return payload
+	}
+	return merged
+}
+
 // Remote events are notifications; the complete conversation content is
 // recovered from the snapshot. Keep large assistant/tool payloads out of the
 // Agent WebSocket frame, whose read limit is intentionally conservative.
@@ -595,6 +700,12 @@ func compactRemoteEventPayload(typ string, payload []byte) []byte {
 // the event was not created inside an existing business transaction (for
 // example, orchestration status messages).
 func (s *Server) enqueueRemoteEvent(ctx context.Context, eventID, taskID, taskRunID, typ string, payload []byte, now time.Time) error {
+	return s.enqueueRemoteEventWithConversation(ctx, eventID, taskID, taskRunID, "", typ, payload, now)
+}
+
+// enqueueRemoteEventWithConversation is enqueueRemoteEvent plus the conversation
+// stamp described on remoteEventPayloadWithConversation.
+func (s *Server) enqueueRemoteEventWithConversation(ctx context.Context, eventID, taskID, taskRunID, conversationID, typ string, payload []byte, now time.Time) error {
 	if !s.remoteRelayConfigured() {
 		return nil
 	}
@@ -603,7 +714,7 @@ func (s *Server) enqueueRemoteEvent(ctx context.Context, eventID, taskID, taskRu
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.enqueueRemoteEventTx(ctx, tx, eventID, taskID, taskRunID, typ, payload, now); err != nil {
+	if err := s.enqueueRemoteEventTxWithConversation(ctx, tx, eventID, taskID, taskRunID, conversationID, typ, payload, now); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -669,13 +780,168 @@ func parseRemoteTimestamp(value any) (time.Time, error) {
 	}
 }
 
+// remoteConversationNotices replays the recent status/diagnostic events of one
+// conversation in ascending order, so the phone timeline can interleave them
+// with messages using a single rule.
+func (s *Server) remoteConversationNotices(ctx context.Context, conversationID string) ([]remoteSnapshotNotice, error) {
+	query := fmt.Sprintf(`select id,run_id,type,payload,created_at from events where conversation_id=? and (%s) order by created_at desc,id desc limit ?`, remoteNoticeTypesSQL)
+	rows, err := s.db.QueryContext(ctx, query, conversationID, remoteSnapshotNoticesPerConversation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]remoteSnapshotNotice, 0, remoteSnapshotNoticesPerConversation)
+	for rows.Next() {
+		var item remoteSnapshotNotice
+		var runID sql.NullString
+		var payload string
+		if err := rows.Scan(&item.ID, &runID, &item.Type, &payload, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		item.RunID = runID.String
+		// Payloads that exceed the relay budget degrade to an empty object: a
+		// truncated JSON document would be worse than no detail at all, and the
+		// notice itself still tells the phone what happened.
+		if len(payload) > remoteSnapshotNoticePayloadLimit {
+			payload = "{}"
+		}
+		item.Payload = json.RawMessage(payload)
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for left, right := 0, len(items)-1; left < right; left, right = left+1, right-1 {
+		items[left], items[right] = items[right], items[left]
+	}
+	return items, nil
+}
+
+// remoteSnapshotShortcuts 读取手机端要用的快捷方式库。
+//
+// 与 listShortcuts 共用同一张表，但**不按项目过滤**：一次把 (local + 所有项目绑定) 全取回来，
+// 由手机端按 projectIds 自行过滤。这样做的好处是负载只有一份、且不会出现"同一份数据在快照里
+// 有两个版本"；代价是手机端多几行过滤代码，而那几行正好也能被单测固定住。
+//
+// 排序必须与 listShortcuts **逐字一致**（`order by s.sort_order,s.name`），否则同一条库在两端的
+// 顺序会不同。曾经这里多写了一个 `s.pinned desc`，理由是"与桌面端 sortQueueTasks 的置顶语义对齐"
+// —— 那是任务队列的函数，与快捷方式无关；桌面端并不提升 pinned。实际影响很小（编辑器新建时恒写
+// pinned=1、种子也全是 1，所以 pinned desc 目前是个空操作），但它是一处任人误信的假注释，删掉。
+func (s *Server) remoteSnapshotShortcuts(ctx context.Context) ([]remoteSnapshotShortcut, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		select s.id,s.name,s.description,s.kind,s.template,s.scope,s.default_action,s.group_name,s.pinned,s.enabled,s.sort_order,s.created_at,s.updated_at
+		from shortcuts s
+		order by s.sort_order, s.name
+		limit ?`, remoteSnapshotShortcuts)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]remoteSnapshotShortcut, 0)
+	for rows.Next() {
+		shortcut, err := scanShortcut(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		items = append(items, remoteSnapshotShortcut{
+			ID:            shortcut.ID,
+			Name:          shortcut.Name,
+			Description:   shortcut.Description,
+			Kind:          shortcut.Kind,
+			Template:      truncateUTF8(shortcut.Template, remoteSnapshotShortcutTemplateLimit),
+			Scope:         shortcut.Scope,
+			DefaultAction: shortcut.DefaultAction,
+			GroupName:     shortcut.GroupName,
+			Pinned:        shortcut.Pinned,
+			Enabled:       shortcut.Enabled,
+			SortOrder:     shortcut.SortOrder,
+			ProjectIDs:    []string{},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return items, nil
+	}
+	// 绑定关系一次查完再回填：逐条调 shortcutProjectIDs 会变成 N+1 次查询，而这个函数
+	// 每 3 秒就可能被跑一次。
+	bindings, err := s.db.QueryContext(ctx, `select shortcut_id, project_id from shortcut_projects`)
+	if err != nil {
+		return nil, err
+	}
+	byShortcut := make(map[string][]string, len(items))
+	for bindings.Next() {
+		var shortcutID, projectID string
+		if err := bindings.Scan(&shortcutID, &projectID); err != nil {
+			bindings.Close()
+			return nil, err
+		}
+		byShortcut[shortcutID] = append(byShortcut[shortcutID], projectID)
+	}
+	if err := bindings.Err(); err != nil {
+		bindings.Close()
+		return nil, err
+	}
+	bindings.Close()
+	for index := range items {
+		if projectIDs, ok := byShortcut[items[index].ID]; ok {
+			items[index].ProjectIDs = projectIDs
+		}
+	}
+	return items, nil
+}
+
+// snapshotSkillsEntry 是快照路径的技能扫描缓存项。
+type snapshotSkillsEntry struct {
+	skills []Skill
+	at     time.Time
+}
+
+// remoteSnapshotSkills 取某个项目的技能列表（按该项目当前会话的 CLI 过滤），带 60 秒缓存。
+// 扫描本身复用 discoverSkillsForProject —— 绝不在快照里另写一套扫描逻辑：项目级 SKILL.md
+// 覆盖用户级同名技能这类规则只应有一处实现，否则手机端和桌面端会列出不同的技能。
+func (s *Server) remoteSnapshotSkills(ctx context.Context, project Project, agentID string) []Skill {
+	key := project.ID + "\x00" + project.Runner + "\x00" + agentID
+	s.snapshotSkillsMu.Lock()
+	if entry, ok := s.snapshotSkillsCache[key]; ok && time.Since(entry.at) < remoteSnapshotSkillsTTL {
+		s.snapshotSkillsMu.Unlock()
+		return entry.skills
+	}
+	s.snapshotSkillsMu.Unlock()
+	// 扫描放在锁外：SSH 远端的 find+cat 可能耗时几百毫秒，持锁会让整个快照组装串行化。
+	// 并发重复扫描同一 key 是可接受的（结果一致、只是多花一次 IO），换来的是互不阻塞。
+	skills := s.discoverSkillsForProject(ctx, project, agentID)
+	if skills == nil {
+		skills = []Skill{}
+	}
+	s.snapshotSkillsMu.Lock()
+	if s.snapshotSkillsCache == nil {
+		s.snapshotSkillsCache = make(map[string]snapshotSkillsEntry)
+	}
+	s.snapshotSkillsCache[key] = snapshotSkillsEntry{skills: skills, at: time.Now()}
+	s.snapshotSkillsMu.Unlock()
+	return skills
+}
+
 func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	var revision int64
 	if err := s.db.QueryRowContext(r.Context(), `select last_agent_sequence from remote_instance limit 1`).Scan(&revision); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	snapshot := remoteSnapshot{SnapshotRevision: revision, ObservedAt: time.Now().UTC(), Projects: make([]remoteSnapshotProject, 0)}
+	snapshot := remoteSnapshot{SnapshotRevision: revision, ObservedAt: time.Now().UTC(), Projects: make([]remoteSnapshotProject, 0), Shortcuts: make([]remoteSnapshotShortcut, 0)}
+	// 快捷方式库与项目/任务无关，先取一次填到顶层。取失败不让整个快照失败：
+	// 手机端拿到一份"没有快捷方式"的快照，仍能看会话、发消息，比整页空白好得多。
+	if shortcuts, err := s.remoteSnapshotShortcuts(r.Context()); err == nil {
+		snapshot.Shortcuts = shortcuts
+	} else {
+		log.Printf("remote snapshot: load shortcuts: %v", err)
+	}
 	rows, err := s.db.QueryContext(r.Context(), `
 		select
 			p.id,
@@ -734,8 +1000,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		taskRows.Close()
-		project.Conversations = make([]remoteSnapshotConversation, 0)
-		// The active conversation is enough to make a project immediately usable
+		project.Conversations = make([]remoteSnapshotConversation, 0)		// The active conversation is enough to make a project immediately usable
 		// on mobile. Do not turn a recovery snapshot into a full history export.
 		conversationRows, err := s.db.QueryContext(r.Context(), `select id,title,status,agent_id,last_activity_at,is_current from conversations where project_id=? order by is_current desc,last_activity_at desc,id desc limit ?`, project.ID, remoteSnapshotConversationsPerProject)
 		if err != nil {
@@ -793,6 +1058,26 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			}
 			for left, right := 0, len(conversation.Messages)-1; left < right; left, right = left+1, right-1 {
 				conversation.Messages[left], conversation.Messages[right] = conversation.Messages[right], conversation.Messages[left]
+			}
+			notices, err := s.remoteConversationNotices(r.Context(), conversation.ID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			conversation.Notices = notices
+		}
+		// 技能按"项目 + CLI"两个维度扫描，CLI 取该项目当前会话的 agentId（每个项目在快照里
+		// 只带 1 个会话，所以这里就是手机端打开该项目时会看到的那一个）。
+		//
+		// 没有会话的项目直接跳过扫描：手机端打不开这种项目（点进去是"选 Agent 建会话"），
+		// 而扫描本地技能目录会顺带触发 WSL 探测、远端 runner 更是要走一次 SSH find+cat ——
+		// 每个项目每 60 秒白跑一次不值得。
+		project.Skills = []Skill{}
+		if len(project.Conversations) > 0 {
+			if stored, err := s.getProjectByID(r.Context(), project.ID); err == nil {
+				project.Skills = s.remoteSnapshotSkills(r.Context(), stored, project.Conversations[0].AgentID)
+			} else {
+				log.Printf("remote snapshot: load project %s for skills: %v", project.ID, err)
 			}
 		}
 		snapshot.Projects = append(snapshot.Projects, *project)
@@ -1027,7 +1312,8 @@ func (s *Server) failRemoteOutbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(input.Error) > 2000 {
-		input.Error = input.Error[:2000]
+		// last_error 会在手机端诊断里显示，按字节限额截断时要退到完整字符边界。
+		input.Error = truncateUTF8(input.Error, 2000)
 	}
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(r.Context(), nil)
@@ -1263,6 +1549,44 @@ func (s *Server) executeRemoteCommand(ctx context.Context, command remoteCommand
 		}
 		return s.executeRemoteHTTPCommand(ctx, http.MethodPost, "/api/conversations/"+input.ConversationID+"/messages", "", "", input.ConversationID, s.sendMessage, mustJSON(input))
 	}
+	if command.Type == "conversation.shortcut" {
+		var input struct {
+			ConversationID string            `json:"conversationId"`
+			ShortcutID     string            `json:"shortcutId"`
+			Action         string            `json:"action"`
+			Variables      map[string]string `json:"variables,omitempty"`
+		}
+		if err := json.Unmarshal(command.Payload, &input); err != nil {
+			return nil, errors.New("conversation shortcut payload is invalid")
+		}
+		input.ConversationID = strings.TrimSpace(input.ConversationID)
+		input.ShortcutID = strings.TrimSpace(input.ShortcutID)
+		input.Action = strings.TrimSpace(input.Action)
+		if input.ConversationID == "" || input.ShortcutID == "" {
+			return nil, errors.New("conversationId and shortcutId are required")
+		}
+		// preview 与 run 走各自原本的 handler：渲染规则（含 ${project.path} 这类电脑端才有的
+		// 变量）、命令类快捷方式的 shell 包装、confirm 的前置校验、shortcut_runs 审计记录，
+		// 全部复用同一份实现，手机端不可能和桌面端跑出不同结果。
+		//   fill  → 只渲染，内容回给手机端填进它自己的输入框（桌面端的 fill 是填桌面输入框，
+		//           在手机上那个语义无意义，所以这里只取渲染结果）。
+		//   run / confirm → 真的执行，与桌面端点击完全一致。
+		if input.Action == "fill" {
+			return s.executeRemoteHTTPCommand(ctx, http.MethodPost,
+				"/api/conversations/"+input.ConversationID+"/shortcuts/"+input.ShortcutID+"/preview",
+				"", "", input.ConversationID, s.previewShortcut,
+				mustJSON(map[string]any{"variables": input.Variables}),
+				"shortcutID", input.ShortcutID)
+		}
+		if input.Action != "run" && input.Action != "confirm" {
+			return nil, errors.New("shortcut action must be fill, run or confirm")
+		}
+		return s.executeRemoteHTTPCommand(ctx, http.MethodPost,
+			"/api/conversations/"+input.ConversationID+"/shortcuts/"+input.ShortcutID+"/run",
+			"", "", input.ConversationID, s.runShortcut,
+			mustJSON(map[string]any{"variables": input.Variables, "action": input.Action}),
+			"shortcutID", input.ShortcutID)
+	}
 	if command.Type == "task.create" {
 		if command.ProjectID == "" {
 			return nil, errors.New("projectId is required")
@@ -1304,7 +1628,7 @@ func (s *Server) executeRemoteCommand(ctx context.Context, command remoteCommand
 	return s.executeRemoteHTTPCommand(ctx, method, path, "", command.TaskID, "", handler, command.Payload)
 }
 
-func (s *Server) executeRemoteHTTPCommand(ctx context.Context, method, path, projectID, taskID, conversationID string, handler http.HandlerFunc, payload json.RawMessage) (any, error) {
+func (s *Server) executeRemoteHTTPCommand(ctx context.Context, method, path, projectID, taskID, conversationID string, handler http.HandlerFunc, payload json.RawMessage, extraParams ...string) (any, error) {
 	req := httptest.NewRequest(method, path, strings.NewReader(string(payload))).WithContext(ctx)
 	rctx := chi.NewRouteContext()
 	if projectID != "" {
@@ -1316,11 +1640,30 @@ func (s *Server) executeRemoteHTTPCommand(ctx context.Context, method, path, pro
 	if conversationID != "" {
 		rctx.URLParams.Add("conversationID", conversationID)
 	}
+	// extraParams 是 "名,值,名,值" 形式的补充路由参数。handler 用 chi.URLParam 取参数，
+	// 而这里合成的请求没有真的走路由匹配 —— 少放一个参数，handler 里读到的就是空字符串。
+	// 用可变参数而不是再加形参：现有十几个调用点全都不用动。
+	for index := 0; index+1 < len(extraParams); index += 2 {
+		if extraParams[index] == "" {
+			continue
+		}
+		rctx.URLParams.Add(extraParams[index], extraParams[index+1])
+	}
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	response := httptest.NewRecorder()
 	handler(response, req)
 	if response.Code >= 400 {
-		return nil, fmt.Errorf("task command failed (%d): %s", response.Code, strings.TrimSpace(response.Body.String()))
+		// 这条文案会原样出现在手机端（「快捷方式执行失败：…」），所以：
+		//   · 不能写死 "task" —— 同一个 helper 也服务 conversation.* 命令；
+		//   · 能取到 {"error": "..."} 就只取那一句，别把整个 JSON 与 HTTP 码糊给用户看。
+		detail := strings.TrimSpace(response.Body.String())
+		var failure struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &failure); err == nil && failure.Error != "" {
+			detail = failure.Error
+		}
+		return nil, fmt.Errorf("remote command failed (%d): %s", response.Code, detail)
 	}
 	var value any
 	if response.Body.Len() > 0 {

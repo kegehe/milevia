@@ -2,7 +2,7 @@ import { FormEvent, MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 
-import { canOfferDispatch, canRedispatch, filterQueueTasks, isTaskAwaitingMainMerge, isTaskOrchestrating, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
+import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
@@ -114,6 +114,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     const requestVersion = ++tasksRequestVersion.current;
     const next = await request<Task[]>(`/api/projects/${projectID}/tasks`);
     if (mountedRef.current && requestVersion === tasksRequestVersion.current) setTasks(next);
+    return next;
   }, [projectID, request]);
 
   useEffect(() => { void loadTasks().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务队列"); }); }, [fail, loadTasks]);
@@ -405,21 +406,43 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const handleQueueDrop = async (taskID: string, targetIndex: number) => {
     const task = tasks.find((t) => t.id === taskID);
     if (!task) return;
-    const currentIndex = queueTasks.findIndex((t) => t.id === taskID);
-    if (currentIndex < 0 || currentIndex === targetIndex) return;
-    const reordered = [...queueTasks];
-    const [moved] = reordered.splice(currentIndex, 1);
-    const insertionIndex = currentIndex < targetIndex ? targetIndex - 1 : targetIndex;
-    reordered.splice(insertionIndex, 0, moved);
-    const prev = reordered[insertionIndex - 1];
-    const next = reordered[insertionIndex + 1];
-    let newPosition: number;
-    if (!prev) newPosition = next ? next.position - 1 : task.position;
-    else if (!next) newPosition = prev.position + 1;
-    else newPosition = (prev.position + next.position) / 2;
+    // 锚点规则见 anchorForSlot：取「落点上一行 + after」（贴头则取首行 + before）。
+    const target = anchorForSlot(queueTasks, targetIndex);
+    if (!target || target.anchorID === taskID) return;
     if (!mountedRef.current) return;
     try {
-      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: task.title, description: task.description, priority: task.priority, position: newPosition }) });
+      // position 必须按**服务端最新列表**算：本地 tasks 最长可能落后一个轮询周期
+      // （另一个视图/另一台设备刚重排过），用过期快照算出来的位置会与真实顺序错位——
+      // 用户看到的就是"我拖到这里，它却落在别处"。锚点仍然取自用户拖拽时看到的那一行，
+      // 所以"放到这一行之前/之后"的意图被完整保留。
+      const latest = await loadTasks();
+      if (!mountedRef.current) return;
+      // 已经是这个位置（"拖到自己正下方"等无效手势）且没有置顶要解除：真正无操作，不写，
+      // 免得把间隙越挤越小。注意置顶任务即使位置没变也必须写——否则置顶没被解除，
+      // 界面依旧把它渲染在最前，"拖到别处"看起来毫无变化。
+      const sameSlot = isSameSlot(latest, taskID, target.anchorID, target.placement);
+      const unpin = Boolean(task.pinned);
+      if (sameSlot && !unpin) return;
+      let position: number | null = null;
+      if (!sameSlot) {
+        position = positionForMove(latest, taskID, target.anchorID, target.placement);
+        // 算不出安全落点（锚点已被删／历史数据里有重复 position）：列表刚拉过已是新的，
+        // 不改服务端数据，提示用户重试即可。
+        if (position === null) {
+          fail("任务顺序数据异常，已重新同步，请再试一次");
+          return;
+        }
+      }
+      // 拖动置顶任务时同时解除置顶（拖拽本身就是"把它放到这里"的新意图；置顶也可由
+      // 「取消置顶」按钮单独解除，那里不改 position）。后端 Position/Pinned 都是指针，
+      // 不带该字段即保留原值，所以只在需要时才放进去。
+      // title/description/priority 用刚拉到的最新值回填：PATCH 会无条件重写这三项，
+      // 用本地旧快照会把别的端（手机远程页等）刚改的文案覆盖回去。
+      const refreshed = latest.find((item) => item.id === taskID) ?? task;
+      const body: Record<string, unknown> = { title: refreshed.title, description: refreshed.description, priority: refreshed.priority };
+      if (position !== null) body.position = position;
+      if (unpin) body.pinned = false;
+      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify(body) });
       if (!mountedRef.current) return;
       await loadTasks();
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
@@ -463,7 +486,10 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     pinLockRef.current = true;
     // 置顶只切换 pinned 标记，不改 position：pinned 优先排序会让它稳居第一，
     // 而保留原 position 使取消置顶时自然回到原位，也避免 position 反复减一负向漂移。
-    const patch = (t: Task, p: boolean) => JSON.stringify({ title: t.title, description: t.description, priority: t.priority, pinned: p, position: t.position });
+    // 【勿改】这里**不能**回传 t.position：tasks 快照最多可能过期 10s（轮询周期），
+    // 期间别的端（手机远程页）拖拽改过的位置会被这个旧值覆盖回去。后端 Position 是指针，
+    // 不带该字段就会保留原值，所以"不改 position"必须靠不带，而不是靠回传旧值。
+    const patch = (t: Task, p: boolean) => JSON.stringify({ title: t.title, description: t.description, priority: t.priority, pinned: p });
     try {
       if (pinned) {
         // 单置顶：点谁谁到第一个，同时取消其它任务原来的置顶。
@@ -487,6 +513,8 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     if (!mountedRef.current) return;
     setQuickCreating(true);
     try {
+      // position: 0 是服务端约定的"追加到队列末尾"哨兵值：服务端会把它改写成
+      // max(position)+1（见 control-server task.go createTask），所以新建任务恒在队列最后。
       await request<Task>(`/api/projects/${projectID}/tasks`, { method: "POST", body: JSON.stringify({ title: "", description: quickDescription.trim(), priority: "normal", position: 0 }) });
       if (!mountedRef.current) return;
       setQuickDescription("");

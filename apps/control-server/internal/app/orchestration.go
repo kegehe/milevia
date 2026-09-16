@@ -44,6 +44,24 @@ const (
 	orchestrationWorktreeRemoveDelay    = 750 * time.Millisecond
 )
 
+// 编排会话标题的长度上限按字符计：标题直接显示在会话列表里，按字节截断会把中文
+// 从字中间切开，列表里留下半个乱码字符。这里与 conversationTitle 的 80 对齐。
+const (
+	orchestrationConversationTitlePrefix = "编排："
+	orchestrationConversationTitleLimit  = 80
+)
+
+// orchestrationBatchContextContentLimit 是单条历史消息进入下一任务提示时的字节上限。
+const orchestrationBatchContextContentLimit = 1000
+
+// Default branch roles. They mirror the column defaults of
+// project_orchestration_configs and act as the fallback for rows written before
+// the dev branch could be edited.
+const (
+	defaultOrchestrationMainBranch = "main"
+	defaultOrchestrationDevBranch  = "dev"
+)
+
 type independentReviewProtocolError struct{ cause error }
 
 func (err independentReviewProtocolError) Error() string {
@@ -138,7 +156,7 @@ type GitTaskRecord struct {
 func (s *Server) migrateOrchestration(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `create table if not exists project_orchestration_configs (
 	project_id text primary key references projects(id) on delete cascade,
-	enabled integer not null default 0,
+	enabled integer not null default 1,
 	main_branch text not null default 'main',
 	dev_branch text not null default 'dev',
 	agent_id text not null default 'claude-code',
@@ -269,6 +287,13 @@ create index if not exists task_orchestration_jobs_batch on task_orchestration_j
 	if err := ensureColumn(ctx, s.db, "task_execution_intents", "reviewed_sha", "text not null default ''"); err != nil {
 		return fmt.Errorf("add orchestration review intent SHA: %w", err)
 	}
+	// Automatic orchestration no longer has an opt-in switch: the execution
+	// policy is chosen when a plan is created, and that is what arms the queue.
+	// Projects disabled back when the switch still existed would otherwise be
+	// stuck, since the UI no longer offers a way to turn them back on.
+	if _, err := s.db.ExecContext(ctx, `update project_orchestration_configs set enabled=1,updated_at=? where enabled<>1`, time.Now().UTC()); err != nil {
+		return fmt.Errorf("enable automatic orchestration: %w", err)
+	}
 	if err := s.migrateReleaseSnapshotBranchScope(ctx); err != nil {
 		return fmt.Errorf("migrate release snapshot branch scope: %w", err)
 	}
@@ -356,8 +381,13 @@ drop table release_snapshots_legacy;`)
 	return tx.Commit()
 }
 
+// defaultOrchestrationConfig mirrors the column defaults of
+// project_orchestration_configs so that a project without a saved row reports
+// the same policy that a first save would persist. The dev branch is part of
+// that policy: leaving it empty would let a round-tripped save clear it. The
+// queue is enabled by default — there is no opt-in switch any more.
 func defaultOrchestrationConfig(projectID string) OrchestrationConfig {
-	return OrchestrationConfig{ProjectID: projectID, MainBranch: "main", AgentID: "claude-code", VerificationCommands: []string{}, MaxFixRounds: 3}
+	return OrchestrationConfig{ProjectID: projectID, Enabled: true, MainBranch: defaultOrchestrationMainBranch, AgentID: "claude-code", DevBranch: defaultOrchestrationDevBranch, VerificationCommands: []string{}, MaxFixRounds: 3}
 }
 
 // createOrchestrationConversation creates a dedicated background conversation
@@ -373,10 +403,7 @@ func (s *Server) createOrchestrationConversation(ctx context.Context, project Pr
 	now := time.Now().UTC()
 	sessionID := uuid.NewString()
 	conversationID := uuid.NewString()
-	title := "编排：" + task.Title
-	if len(title) > 80 {
-		title = title[:80]
-	}
+	title := truncateRunes(orchestrationConversationTitlePrefix+task.Title, orchestrationConversationTitleLimit)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
@@ -449,9 +476,9 @@ func (s *Server) batchContext(ctx context.Context, job OrchestrationJob) (string
 		if content == "" {
 			continue
 		}
-		if len(content) > 1000 {
-			content = content[:1000]
-		}
+		// 这是追加到下一任务提示里的上下文，按字节限额控制体积，但要退到完整字符
+		// 边界，否则中文会被切出乱码字符并随摘要消息显示在会话里。
+		content = truncateUTF8(content, orchestrationBatchContextContentLimit)
 		entries = append(entries, role+": "+content)
 	}
 	if err := rows.Err(); err != nil {
@@ -491,6 +518,30 @@ func (s *Server) postOrchestrationMessage(ctx context.Context, job Orchestration
 	s.broadcastConversationEvent(Event{ID: uuid.NewString(), ConversationID: conversationID, Type: "assistant.message", Payload: mustJSON(m), CreatedAt: now})
 }
 
+// execContexter is satisfied by both *sql.DB and *sql.Tx, so the policy write
+// can run standalone or inside an enqueue transaction.
+type execContexter interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// saveOrchestrationPolicy persists the policy a queue job is about to snapshot.
+// Every enqueue path calls it so a project with queue jobs always has a config
+// row: the freeze-on-failure and unfreeze paths update that row, and a missing
+// row would make them silently no-op. Columns left out of the update keep their
+// stored value — notably frozen_reason, which a new plan must not clear.
+//
+// It is the single writer of this row: the settings endpoint shares it so the
+// dev branch (dropped once by a hand-written copy of this statement) can never
+// diverge between the two paths again.
+func saveOrchestrationPolicy(ctx context.Context, db execContexter, projectID string, cfg OrchestrationConfig, now time.Time) error {
+	commands, err := json.Marshal(cfg.VerificationCommands)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `insert into project_orchestration_configs (project_id,enabled,main_branch,agent_id,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,?,?,?,?,?,?,coalesce((select frozen_reason from project_orchestration_configs where project_id=?),''),?) on conflict(project_id) do update set enabled=excluded.enabled,main_branch=excluded.main_branch,agent_id=excluded.agent_id,dev_branch=excluded.dev_branch,verification_commands=excluded.verification_commands,max_fix_rounds=excluded.max_fix_rounds,updated_at=excluded.updated_at`, projectID, cfg.Enabled, cfg.MainBranch, cfg.AgentID, cfg.DevBranch, string(commands), cfg.MaxFixRounds, projectID, now)
+	return err
+}
+
 func (s *Server) orchestrationConfig(ctx context.Context, projectID string) (OrchestrationConfig, error) {
 	cfg := defaultOrchestrationConfig(projectID)
 	var commands string
@@ -504,6 +555,11 @@ func (s *Server) orchestrationConfig(ctx context.Context, projectID string) (Orc
 	if err := json.Unmarshal([]byte(commands), &cfg.VerificationCommands); err != nil {
 		return cfg, fmt.Errorf("decode verification commands: %w", err)
 	}
+	if strings.TrimSpace(cfg.DevBranch) == "" {
+		// Rows created before the dev branch was editable, or saved before the
+		// update statement persisted it, can hold an empty value.
+		cfg.DevBranch = defaultOrchestrationDevBranch
+	}
 	return cfg, nil
 }
 
@@ -516,7 +572,7 @@ func orchestrationTargetBranch(projectID, policySnapshot string) string {
 		_ = json.Unmarshal([]byte(policySnapshot), &cfg)
 	}
 	if strings.TrimSpace(cfg.MainBranch) == "" {
-		return "main"
+		return defaultOrchestrationMainBranch
 	}
 	return cfg.MainBranch
 }
@@ -546,6 +602,9 @@ func (s *Server) orchestrationConfigForJob(ctx context.Context, projectID, polic
 func validateOrchestrationConfig(cfg OrchestrationConfig) error {
 	if !validOrchestrationBranch(cfg.MainBranch) {
 		return errors.New("main branch is invalid")
+	}
+	if !validOrchestrationBranch(cfg.DevBranch) {
+		return errors.New("dev branch is invalid")
 	}
 	if cfg.AgentID != "claude-code" && cfg.AgentID != "codex" {
 		return errors.New("automatic orchestration agent is invalid")
@@ -590,13 +649,14 @@ func (s *Server) updateOrchestrationConfig(w http.ResponseWriter, r *http.Reques
 	if cfg.AgentID == "" {
 		cfg.AgentID = "claude-code"
 	}
+	if strings.TrimSpace(cfg.DevBranch) == "" {
+		cfg.DevBranch = defaultOrchestrationDevBranch
+	}
 	if err := validateOrchestrationConfig(cfg); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	commands, _ := json.Marshal(cfg.VerificationCommands)
-	_, err := s.db.ExecContext(r.Context(), `insert into project_orchestration_configs (project_id,enabled,main_branch,agent_id,dev_branch,verification_commands,max_fix_rounds,frozen_reason,updated_at) values (?,?,?,?,?,?,?,coalesce((select frozen_reason from project_orchestration_configs where project_id=?),''),?) on conflict(project_id) do update set enabled=excluded.enabled,main_branch=excluded.main_branch,agent_id=excluded.agent_id,verification_commands=excluded.verification_commands,max_fix_rounds=excluded.max_fix_rounds,updated_at=excluded.updated_at`, projectID, cfg.Enabled, cfg.MainBranch, cfg.AgentID, cfg.DevBranch, string(commands), cfg.MaxFixRounds, projectID, time.Now().UTC())
-	if err != nil {
+	if err := saveOrchestrationPolicy(r.Context(), s.db, projectID, cfg, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -652,7 +712,12 @@ func (s *Server) enqueueTask(ctx context.Context, task Task, cfg OrchestrationCo
 		return OrchestrationJob{}, err
 	}
 	defer tx.Rollback()
-	if err = tx.QueryRowContext(ctx, `select coalesce(max(queue_position),0)+1 from task_orchestration_jobs where project_id=?`, task.ProjectID).Scan(&job.Position); err == nil {
+	// 队列任务必须对应一行项目编排策略：任务失败时的「冻结队列」是 update 这张表的，
+	// 缺行会让冻结静默失效、队列继续往下跑。
+	if err = saveOrchestrationPolicy(ctx, tx, task.ProjectID, cfg, now); err == nil {
+		err = tx.QueryRowContext(ctx, `select coalesce(max(queue_position),0)+1 from task_orchestration_jobs where project_id=?`, task.ProjectID).Scan(&job.Position)
+	}
+	if err == nil {
 		var result sql.Result
 		result, err = tx.ExecContext(ctx, `insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,?,?,?,?) on conflict(task_id) do nothing`, job.ID, job.ProjectID, job.TaskID, job.Position, job.Status, job.PolicySnapshot, job.CreatedAt, job.UpdatedAt)
 		if err == nil {
@@ -787,10 +852,17 @@ func validOrchestrationConversationStrategy(value string) bool {
 	return value == "new" || value == "continue"
 }
 
-// createOrchestrationBatch creates a named execution plan and atomically puts
-// its selected tasks on the existing project-serial queue in the supplied
-// order. Existing single-task enqueue remains available for backwards
-// compatibility, but new plans always receive a batch identity.
+// createOrchestrationBatch creates a named execution plan. The plan is created
+// empty: the dialog only collects the plan name, the conversation policy and
+// the execution policy, and tasks are appended afterwards through
+// addTasksToOrchestrationBatch as the user picks them from the candidate list.
+//
+// The policy fields are persisted as the project policy so every task added to
+// the queue afterwards snapshots them, and creating a plan is what arms
+// automatic orchestration — there is no separate enable switch.
+//
+// TaskIDs is still accepted so an existing client can create a plan and enqueue
+// its tasks in one request, but it is optional and may be empty.
 func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 	if !s.projectExists(r.Context(), projectID) {
@@ -801,6 +873,12 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 		Name                 string   `json:"name"`
 		TaskIDs              []string `json:"taskIds"`
 		ConversationStrategy string   `json:"conversationStrategy"`
+		// Policy overrides are pointers so an omitted field keeps the current
+		// project policy instead of silently resetting it.
+		MainBranch   *string `json:"mainBranch"`
+		DevBranch    *string `json:"devBranch"`
+		AgentID      *string `json:"agentId"`
+		MaxFixRounds *int    `json:"maxFixRounds"`
 	}
 	if !decode(w, r, &input) {
 		return
@@ -810,8 +888,8 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, errors.New("batch name must be between 1 and 120 characters"))
 		return
 	}
-	if len(input.TaskIDs) == 0 || len(input.TaskIDs) > 100 {
-		writeError(w, http.StatusBadRequest, errors.New("a batch must contain between 1 and 100 tasks"))
+	if len(input.TaskIDs) > 100 {
+		writeError(w, http.StatusBadRequest, errors.New("a batch can contain at most 100 tasks"))
 		return
 	}
 	if input.ConversationStrategy == "" {
@@ -826,8 +904,23 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !cfg.Enabled {
-		writeError(w, http.StatusConflict, errOrchestrationDisabled)
+	if input.MainBranch != nil {
+		cfg.MainBranch = strings.TrimSpace(*input.MainBranch)
+	}
+	if input.DevBranch != nil {
+		cfg.DevBranch = strings.TrimSpace(*input.DevBranch)
+	}
+	if input.AgentID != nil {
+		cfg.AgentID = strings.TrimSpace(*input.AgentID)
+	}
+	if input.MaxFixRounds != nil {
+		cfg.MaxFixRounds = *input.MaxFixRounds
+	}
+	// Creating a plan is the moment the execution policy is decided, so it is
+	// also what arms the project queue.
+	cfg.Enabled = true
+	if err := validateOrchestrationConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	seen := make(map[string]bool, len(input.TaskIDs))
@@ -874,7 +967,12 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(r.Context(), `insert into orchestration_batches (id,project_id,name,conversation_strategy,created_at,updated_at) values (?,?,?,?,?,?)`, batch.ID, batch.ProjectID, batch.Name, batch.ConversationStrategy, now, now); err == nil {
+	// The plan and the policy it was created with commit together: a plan that
+	// exists must always be backed by the policy its dialog showed.
+	if err = saveOrchestrationPolicy(r.Context(), tx, projectID, cfg, now); err == nil {
+		_, err = tx.ExecContext(r.Context(), `insert into orchestration_batches (id,project_id,name,conversation_strategy,created_at,updated_at) values (?,?,?,?,?,?)`, batch.ID, batch.ProjectID, batch.Name, batch.ConversationStrategy, now, now)
+	}
+	if err == nil {
 		var position int
 		err = tx.QueryRowContext(r.Context(), `select coalesce(max(queue_position),0) from task_orchestration_jobs where project_id=?`, projectID).Scan(&position)
 		for _, task := range tasks {
@@ -946,7 +1044,11 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 			return
 		}
 		item.CompletedCount = item.TaskCount - active - blocked - paused - awaitingMain
-		if blocked > 0 {
+		// A plan is created before its tasks are picked, so an empty plan is a
+		// fresh plan rather than a finished one.
+		if item.TaskCount == 0 {
+			item.Status = "active"
+		} else if blocked > 0 {
 			item.Status = "needs_human"
 		} else if paused > 0 {
 			item.Status = "paused"
@@ -2630,6 +2732,8 @@ func (s *Server) runIndependentReview(ctx context.Context, project Project, job 
 			RunID:          uuid.NewString(),
 			AgentID:        cfg.AgentID,
 			Profile:        profile,
+			// 编排评审同样没有会话级模型覆盖，模型只来自档案；不显式传会退化成 CLI 默认。
+			Model:          runModel("", profile),
 			SkipSessionID:  true,
 			ReadOnlyTools:  readOnlyTools,
 			PromptViaStdin: len(readOnlyTools) > 0,
@@ -3090,10 +3194,15 @@ func (s *Server) createReleaseSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	sha, err := s.gitOutput(r.Context(), project.Path, "rev-parse", cfg.DevBranch)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeError(w, http.StatusConflict, fmt.Errorf("dev branch %s is unavailable: %w", cfg.DevBranch, err))
 		return
 	}
 	sha = strings.TrimSpace(sha)
+	// 快照分支名取 SHA 前 12 位，短 SHA 会让 branch 名退化成不稳定的部分串。
+	if len(sha) < 12 {
+		writeError(w, http.StatusConflict, fmt.Errorf("dev branch %s did not resolve to a commit SHA", cfg.DevBranch))
+		return
+	}
 	branch := "release/" + sha[:12]
 	var existing ReleaseSnapshot
 	err = s.db.QueryRowContext(r.Context(), `select id,project_id,dev_sha,branch,status,created_at,confirmed_at from release_snapshots where project_id=? and dev_sha=? order by created_at desc limit 1`, projectID, sha).Scan(&existing.ID, &existing.ProjectID, &existing.DevSHA, &existing.Branch, &existing.Status, &existing.CreatedAt, &existing.ConfirmedAt)
@@ -3155,24 +3264,34 @@ func (s *Server) confirmReleaseMergedToMain(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err = s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", item.DevSHA, cfg.MainBranch); err != nil {
-		writeError(w, http.StatusConflict, errors.New("main does not contain the fixed release snapshot"))
+		// 带上实际校验的分支名：稳定分支可在界面改，写死 "main" 会让人找错地方。
+		writeError(w, http.StatusConflict, fmt.Errorf("%s does not contain the fixed release snapshot %s", cfg.MainBranch, item.DevSHA))
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select job.id,record.integration_sha from task_orchestration_jobs job join git_task_records record on record.job_id=job.id where job.project_id=? and job.status='integrated_to_dev'`, projectID)
+	// Sweep every job whose integrated commit is contained in the snapshot. main is
+	// already known to contain the snapshot SHA, so each of those commits is
+	// provably published. awaiting_main jobs qualify exactly when their work
+	// reached main through the snapshot rather than through an explicit
+	// task-branch merge, which is what mergeTaskBranchToMain records.
+	rows, err := s.db.QueryContext(r.Context(), `select job.id,job.task_id,coalesce(record.integration_sha,'') from task_orchestration_jobs job join git_task_records record on record.job_id=job.id where job.project_id=? and job.status in ('integrated_to_dev','awaiting_main')`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	jobIDs := []string{}
+	type releasedJob struct{ ID, TaskID string }
+	jobIDs := []releasedJob{}
 	for rows.Next() {
-		var jobID, integrationSHA string
-		if err := rows.Scan(&jobID, &integrationSHA); err != nil {
+		var jobID, taskID, integrationSHA string
+		if err := rows.Scan(&jobID, &taskID, &integrationSHA); err != nil {
 			rows.Close()
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if strings.TrimSpace(integrationSHA) == "" {
+			continue
+		}
 		if s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", integrationSHA, item.DevSHA) == nil {
-			jobIDs = append(jobIDs, jobID)
+			jobIDs = append(jobIDs, releasedJob{ID: jobID, TaskID: taskID})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -3188,11 +3307,25 @@ func (s *Server) confirmReleaseMergedToMain(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(r.Context(), `update release_snapshots set status='released_to_main',confirmed_at=? where id=? and status='awaiting_main'`, now, item.ID)
-	for _, jobID := range jobIDs {
-		if err == nil {
-			_, err = tx.ExecContext(r.Context(), `update task_orchestration_jobs set status='released_to_main',updated_at=? where id=? and status='integrated_to_dev'`, now, jobID)
+	result, err := tx.ExecContext(r.Context(), `update release_snapshots set status='released_to_main',confirmed_at=? where id=? and status='awaiting_main'`, now, item.ID)
+	if err == nil {
+		// 两次确认并发时上面读到的 awaiting_main 可能已经过期，这里以实际写中的行数为准，
+		// 否则第二个请求会带着"确认成功"的 200 返回，而它什么也没做。
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			writeError(w, http.StatusConflict, errors.New("release snapshot was already confirmed"))
+			return
 		}
+	}
+	for _, job := range jobIDs {
+		if err != nil {
+			break
+		}
+		if _, err = tx.ExecContext(r.Context(), `update task_orchestration_jobs set status='released_to_main',updated_at=? where id=? and status in ('integrated_to_dev','awaiting_main')`, now, job.ID); err != nil {
+			break
+		}
+		// 与 mergeTaskBranchToMain 保持一致：已发布的任务同时收口成 done，
+		// 否则任务看板会停留在等待验收。
+		_, err = tx.ExecContext(r.Context(), `update tasks set status=?,completed_at=?,updated_at=? where id=? and status in (?,?)`, taskDone, now, now, job.TaskID, taskAwaitingReview, taskActionRequired)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)

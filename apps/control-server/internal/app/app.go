@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -52,8 +53,11 @@ type Config struct {
 	ClaudeToolResultTimeout       time.Duration
 	ConversationSessionIdleTTL    time.Duration
 	ConversationSessionsPerRunner int
-	TerminalMaxProjects           int
-	TerminalMaxPerProject         int
+	// ConversationSessionExitGrace 是会话被要求停止之后，仍愿意等待其进程真正
+	// 退出的上限；超过它就不再让这条会话占着停止位（见 waitForStreamingSessionExit）。
+	ConversationSessionExitGrace time.Duration
+	TerminalMaxProjects          int
+	TerminalMaxPerProject        int
 }
 
 const (
@@ -63,11 +67,14 @@ const (
 	defaultAgentUpdateTimeout            = 15 * time.Minute
 	defaultConversationSessionIdleTTL    = 30 * time.Minute
 	defaultConversationSessionsPerRunner = 4
-	maxJSONBodyBytes                     = 16 * 1024 * 1024
-	httpReadHeaderTimeout                = 5 * time.Second
-	httpReadTimeout                      = 30 * time.Second
-	httpIdleTimeout                      = 60 * time.Second
-	maxHTTPHeaderBytes                   = 1 << 20
+	// 60s 是正常退出路径的最坏耗时（读循环有 30s 兜底）的两倍余量：给足正常路径，
+	// 同时保证卡住的会话在一分钟内自愈，而不是永远不可用。
+	defaultConversationSessionExitGrace = 60 * time.Second
+	maxJSONBodyBytes                    = 16 * 1024 * 1024
+	httpReadHeaderTimeout               = 5 * time.Second
+	httpReadTimeout                     = 30 * time.Second
+	httpIdleTimeout                     = 60 * time.Second
+	maxHTTPHeaderBytes                  = 1 << 20
 	// 默认慢请求日志阈值。http.Server 没有 WriteTimeout，handler 可以无限挂起
 	// 而不留任何现场；此阈值用于在请求仍卡住时把端点名打出来（可用环境变量
 	// MILEVIA_SLOW_REQUEST_LOG 覆盖，值为 time.ParseDuration 格式）。
@@ -144,6 +151,7 @@ func ConfigFromEnv() Config {
 		ClaudeToolResultTimeout:       durationFromEnv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", defaultClaudeToolResultTimeout),
 		ConversationSessionIdleTTL:    durationFromEnv("AUTO_CONVERSATION_SESSION_IDLE_TTL", defaultConversationSessionIdleTTL),
 		ConversationSessionsPerRunner: positiveIntFromEnv("AUTO_CONVERSATION_SESSIONS_PER_RUNNER", defaultConversationSessionsPerRunner),
+		ConversationSessionExitGrace:  durationFromEnv("AUTO_CONVERSATION_SESSION_EXIT_GRACE", defaultConversationSessionExitGrace),
 		TerminalMaxProjects:           positiveIntFromEnv("AUTO_TERMINAL_MAX_PROJECTS", defaultTerminalMaxProjects),
 		TerminalMaxPerProject:         positiveIntFromEnv("AUTO_TERMINAL_MAX_PER_PROJECT", defaultTerminalMaxPerProject),
 	}
@@ -211,25 +219,41 @@ type Server struct {
 	remoteOutboxWakeMu sync.Mutex
 	remoteOutboxWake   *remoteOutboxWaker
 	storageMu          sync.Mutex
-	dataLock           *dataDirLock
-	httpMu             sync.Mutex
-	httpServer         *http.Server
-	runner             AgentRunner
-	codexRunner        AgentRunner
-	windowsRunner      AgentRunner
-	wslRunner          AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
-	wslDistro          string      // 探测到的默认 WSL 发行版名；空表示无 WSL
-	wslHome            string      // WSL 内当前用户的 Linux home 路径
+	// storageReclaiming 为真表示后台正在做一次性空间回收（VACUUM，会长时间独占唯一那条
+	// SQLite 连接）。对外暴露在存储用量接口里，让设置页能说明"这段时间为什么卡"。
+	storageReclaiming atomic.Bool
+	dataLock          *dataDirLock
+	httpMu            sync.Mutex
+	httpServer        *http.Server
+	runner            AgentRunner
+	codexRunner       AgentRunner
+	windowsRunner     AgentRunner
+	wslRunner         AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
+	wslDistro         string      // 探测到的默认 WSL 发行版名；空表示无 WSL
+	wslHome           string      // WSL 内当前用户的 Linux home 路径
 	// wslMu 保护 wslRunner/wslDistro/wslHome 三个字段。启动期在 New() 写一次，但
 	// ensureWSLRunner 可能于请求期补注册并再次写入，须与并发读者（wslAgentRunner()、
 	// discoverLocalSkillRoots、terminal.go 的 wslDistro 读取）错开。
-	wslMu                  sync.RWMutex
-	wslProbeMu             sync.Mutex // 串行化 wsl-local 的补注册探测：同一时刻仅一个 wsl.exe 探测在执行
-	wslProbeAt             time.Time  // 最近一次补注册探测的完成时刻（失败后据此冷却节流，避免高频轮询反复拉起 wsl.exe）
-	runnerRegistry         *runnerRegistry
-	runnerMaintenanceMu    sync.Mutex
-	runnerUpdating         map[runnerAgentKey]bool
-	runnerUpdateExecuting  map[string]bool
+	wslMu                 sync.RWMutex
+	wslProbeMu            sync.Mutex // 串行化 wsl-local 的补注册探测：同一时刻仅一个 wsl.exe 探测在执行
+	wslProbeAt            time.Time  // 最近一次补注册探测的完成时刻（失败后据此冷却节流，避免高频轮询反复拉起 wsl.exe）
+	runnerRegistry        *runnerRegistry
+	runnerMaintenanceMu   sync.Mutex
+	runnerUpdating        map[runnerAgentKey]bool
+	runnerUpdateExecuting map[string]bool
+	// modelCatalogMu 保护 Codex 模型目录的单条缓存。探测要拉起 CLI（WSL/SSH 还要跨端），
+	// 而目录只随 CLI 版本变化，故按 runner+项目路径缓存一小段时间（见 conversation_models.go）。
+	modelCatalogMu      sync.Mutex
+	modelCatalogAt      time.Time
+	modelCatalogKey     string
+	modelCatalogOptions []AgentModelOption
+	modelCatalogNote    string
+	// commandCatalogMu 保护 Claude 命令目录的单条缓存（见 project_commands.go）：
+	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
+	// 串行地拉起一次探针进程。
+	commandCatalogMu       sync.Mutex
+	commandCatalogEntry    *commandCatalogEntry
+	commandProbeMu         sync.Mutex
 	projectLifecycleMu     sync.Mutex
 	sshMu                  sync.Mutex
 	sshPrepare             func(context.Context, SSHConnection) (*sshRunner, RunnerMeta, error)
@@ -290,13 +314,24 @@ type Server struct {
 	orchestrationWG        sync.WaitGroup
 	orchestrationOwner     string
 	insightMu              sync.Mutex
-	insightActive          map[string]bool
-	insightCancels         map[string]context.CancelFunc // 运行中的扫描/复核按项目可取消
+	insightActive          map[string]bool               // 键为 insightRunKey(projectID, kind)：扫描与复核各自独立占用
+	insightCancels         map[string]context.CancelFunc // 同上；运行中的扫描/复核按项目+种类可取消
 	insightWG              sync.WaitGroup
-	conflictSuggestMu      sync.Mutex
-	conflictSuggestions    map[string]*gitConflictSuggestion
-	conflictSuggestActive  map[string]bool
-	terminals              *terminalManager
+	// availabilityMu 保护 codexProbeCache：各 SSH runner / 跨端目标的 codex 连通性
+	// 探测结果短 TTL 缓存。项目列表接口只读这里，绝不同步探测远端
+	// （探测与列表解耦的来龙去脉见 project_availability.go）。
+	availabilityMu  sync.Mutex
+	codexProbeCache map[string]codexProbeCacheEntry
+	// snapshotSkillsMu 保护 snapshotSkillsCache：**快照专用**的技能列表短 TTL 缓存。
+	// 技能扫描（尤其 SSH 远端的 find+cat）比一次 SQL 贵几个数量级，而快照只要有事件推进
+	// 就会重建（3 秒节流）。技能只在安装/卸载时变化，60 秒的陈旧窗口完全够用。
+	// 桌面端的 listSkills 不经过这里，仍是实时扫描。
+	snapshotSkillsMu      sync.Mutex
+	snapshotSkillsCache   map[string]snapshotSkillsEntry
+	conflictSuggestMu     sync.Mutex
+	conflictSuggestions   map[string]*gitConflictSuggestion
+	conflictSuggestActive map[string]bool
+	terminals             *terminalManager
 }
 
 // runnerAgentKey scopes CLI maintenance to one tool on one Runner.
@@ -359,10 +394,35 @@ type activeAgentSession struct {
 	configSet     bool
 	activeRunID   string
 	stopping      bool
+	// stoppingSince 是进入 stopping 的时刻，由 markStopping 维护。它是 watcher
+	// 判断"进程迟迟不退出"的唯一依据：没有它，任何一次杀不掉的进程都会让这条
+	// 会话永远停在 stopping（见 waitForStreamingSessionExit）。
+	stoppingSince time.Time
 	runIDs        map[string]struct{}
 	lastUsedAt    time.Time
 	// mcpCleanup 释放本次会话落盘的 MCP 运行时配置（会话结束时调用）。
 	mcpCleanup func()
+}
+
+// markStopping 把会话标记为正在退役并记录起始时刻。调用方必须持有 Server.mu。
+// 重复调用不会刷新起始时刻：停止是一个状态，不是一个可以续期的动作。
+func (session *activeAgentSession) markStopping() {
+	if session.stopping {
+		return
+	}
+	session.stopping = true
+	session.stoppingSince = time.Now()
+}
+
+// logStoppingRejection 记录一次因为会话正在停止而被拒绝的准入。这类拒绝以前完全
+// 静默，排查时只能靠重启前后对比去猜；带上"已经停了多久"，一眼就能看出进程是不是
+// 卡住不退（正常退役只需秒级，卡住的会一直增长到 exitGrace 被兜底释放）。
+func logStoppingRejection(stage, conversationID string, stoppingSince time.Time) {
+	if stoppingSince.IsZero() {
+		log.Printf("conversation %s: rejecting %s: native agent session is stopping", conversationID, stage)
+		return
+	}
+	log.Printf("conversation %s: rejecting %s: native agent session has been stopping for %s", conversationID, stage, time.Since(stoppingSince).Round(time.Second))
 }
 
 // streamingSetup closes the gap between committing a streaming Run and
@@ -413,23 +473,27 @@ type Conversation struct {
 	ProjectID string `json:"projectId"`
 	// ClaudeSessionID is retained for clients and databases created before the
 	// agent-neutral session migration. New execution code uses AgentSessionID.
-	ClaudeSessionID             string    `json:"claudeSessionId,omitempty"`
-	AgentID                     string    `json:"agentId"`
-	AgentSessionID              string    `json:"agentSessionId"`
-	AgentRuntimeID              string    `json:"agentRuntimeId"`
-	AgentProfileRevisionID      string    `json:"agentProfileRevisionId,omitempty"`
-	ProjectAgentRouteRevisionID string    `json:"projectAgentRouteRevisionId,omitempty"`
-	ExecutionPolicy             string    `json:"executionPolicy"`
-	Status                      string    `json:"status"`
-	PermissionMode              string    `json:"permissionMode"`
-	Title                       string    `json:"title"`
-	Preview                     string    `json:"preview,omitempty"`
-	LastActivityAt              time.Time `json:"lastActivityAt"`
-	ClaudeInitialized           bool      `json:"-"`
-	AgentInitialized            bool      `json:"-"`
-	IsCurrent                   bool      `json:"isCurrent"`
-	IsOrchestration             bool      `json:"isOrchestration,omitempty"`
-	CreatedAt                   time.Time `json:"createdAt"`
+	ClaudeSessionID             string `json:"claudeSessionId,omitempty"`
+	AgentID                     string `json:"agentId"`
+	AgentSessionID              string `json:"agentSessionId"`
+	AgentRuntimeID              string `json:"agentRuntimeId"`
+	AgentProfileRevisionID      string `json:"agentProfileRevisionId,omitempty"`
+	ProjectAgentRouteRevisionID string `json:"projectAgentRouteRevisionId,omitempty"`
+	ExecutionPolicy             string `json:"executionPolicy"`
+	Status                      string `json:"status"`
+	PermissionMode              string `json:"permissionMode"`
+	// ModelOverride 是会话级模型覆盖（如 "opus"、"gpt-5.5"）。空串表示跟随项目
+	// 配置（agent profile 的 model）或 CLI 自己的默认模型。它只影响 CLI 参数
+	// --model / -c model=，不参与凭据注入。
+	ModelOverride     string    `json:"modelOverride,omitempty"`
+	Title             string    `json:"title"`
+	Preview           string    `json:"preview,omitempty"`
+	LastActivityAt    time.Time `json:"lastActivityAt"`
+	ClaudeInitialized bool      `json:"-"`
+	AgentInitialized  bool      `json:"-"`
+	IsCurrent         bool      `json:"isCurrent"`
+	IsOrchestration   bool      `json:"isOrchestration,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
 }
 
 // ConversationWorkspace is an immutable conversation reference to an
@@ -689,7 +753,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -787,7 +851,7 @@ func (s *Server) Close() {
 			runIDs = append(runIDs, runID)
 		}
 		for _, session := range s.sessions {
-			session.stopping = true
+			session.markStopping()
 			sessions = append(sessions, session.agent)
 		}
 		s.mu.Unlock()
@@ -1033,6 +1097,9 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/directories/mkdir", s.createDirectory)
 	r.Post("/api/projects/validate", s.validateProject)
 	r.Get("/api/projects", s.listProjects)
+	// 连通性探测独立于列表刷新：远端/跨端 codex 就绪度只在这里求值（见
+	// project_availability.go），列表接口不再同步探活。
+	r.Get("/api/projects/availability", s.listProjectAvailability)
 	r.Get("/api/projects/statuses", s.listProjectStatuses)
 	r.Get("/api/projects/processes/statuses", s.listProjectProcessStatuses)
 	r.Post("/api/projects", s.createProject)
@@ -1088,6 +1155,11 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
 	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
 	r.Get("/api/projects/{projectID}/orchestration", s.listOrchestrationJobs)
+	// 发布快照：把开发分支当前 HEAD 固定成 release/<sha> 供人工验收，并在用户确认
+	// main 已包含该快照后，把快照内已集成的任务标记为已发布。
+	r.Get("/api/projects/{projectID}/orchestration/releases", s.listReleaseSnapshots)
+	r.Post("/api/projects/{projectID}/orchestration/releases", s.createReleaseSnapshot)
+	r.Post("/api/projects/{projectID}/orchestration/releases/{releaseID}/confirm", s.confirmReleaseMergedToMain)
 	r.Get("/api/projects/{projectID}/orchestration/batches", s.listOrchestrationBatches)
 	r.Post("/api/projects/{projectID}/orchestration/batches", s.createOrchestrationBatch)
 	r.Post("/api/projects/{projectID}/orchestration/batches/{batchID}/tasks", s.addTasksToOrchestrationBatch)
@@ -1130,6 +1202,7 @@ func (s *Server) routes() http.Handler {
 	r.Delete("/api/projects/{projectID}/terminal/sessions/{sessionID}", s.deleteTerminal)
 	r.Get("/api/projects/{projectID}/shortcuts", s.listShortcuts)
 	r.Get("/api/projects/{projectID}/skills", s.listSkills)
+	r.Get("/api/projects/{projectID}/commands", s.projectCommands)
 	r.Put("/api/projects/{projectID}/shortcuts/reorder", s.reorderShortcuts)
 	r.Post("/api/shortcuts/defaults", s.seedDefaultShortcuts)
 	r.Post("/api/shortcuts", s.createShortcut)
@@ -1142,6 +1215,8 @@ func (s *Server) routes() http.Handler {
 	r.Delete("/api/conversations/{conversationID}", s.deleteConversation)
 	r.Post("/api/conversations/{conversationID}/activate", s.activateConversation)
 	r.Post("/api/conversations/{conversationID}/permission-mode", s.setConversationPermissionMode)
+	r.Post("/api/conversations/{conversationID}/model", s.setConversationModel)
+	r.Get("/api/conversations/{conversationID}/models", s.conversationModels)
 	r.Get("/api/conversations/{conversationID}/workspaces", s.listConversationWorkspaces)
 	r.Post("/api/conversations/{conversationID}/workspaces", s.createConversationWorktree)
 	r.Post("/api/conversations/{conversationID}/workspaces/{workspaceID}/activate", s.activateConversationWorkspace)
@@ -1515,6 +1590,10 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	if err := s.migrateAgentProfiles(ctx); err != nil {
 		return err
 	}
+	// 一次性修复 v1 种子数据里已失效的 `/review` 默认命令（见函数注释与 docs/37 §2.4）。
+	if err := s.migrateLegacyReviewShortcut(ctx, time.Now().UTC()); err != nil {
+		return fmt.Errorf("migrate legacy review shortcut: %w", err)
+	}
 	if err := ensureColumn(ctx, s.db, "project_run_configs", "execution_target", "text not null default 'auto'"); err != nil {
 		return fmt.Errorf("add project run execution target: %w", err)
 	}
@@ -1630,6 +1709,9 @@ create table if not exists app_metadata (key text primary key, value text not nu
 		{"agent_runtime_id", "text not null default ''"},
 		{"execution_policy", "text not null default 'approval_required'"},
 		{"active_workspace_id", "text not null default ''"},
+		// 会话级模型覆盖：空串表示跟随项目配置 / CLI 默认（与 permission_mode 一样
+		// 是"用户随时可切的执行参数"，不是凭据，故不进 agent_profile_revisions）。
+		{"model_override", "text not null default ''"},
 	} {
 		if err := ensureColumn(ctx, s.db, "conversations", column.name, column.definition); err != nil {
 			return fmt.Errorf("add conversation %s: %w", column.name, err)
@@ -2263,8 +2345,9 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			if lookupErr == nil {
 				existing.RunnerID = existing.Runner
 				s.decorateProjectPresentation(&existing)
-				// SSH 项目的 codex 就绪由 decorateProjectAvailability 走 sshCodexReady，
-				// 忽略此参数；传 false 避免对本机 codex 做无意义的探测。
+				// SSH 项目的 codex 就绪由 decorateProjectAvailability 按 runner 探测远端
+				// （见 projectCodexProbe），本机 codexReady 参数不参与；传 false 避免
+				// 对本机 codex 做无意义的探测。
 				s.decorateProjectAvailability(&existing, false)
 				writeJSON(w, http.StatusOK, existing)
 				return
@@ -2510,7 +2593,7 @@ func (s *Server) signalProjectStop(ctx context.Context, projectID string) (map[s
 	}
 	for conversationID, session := range s.sessions {
 		if _, ok := conversationIDs[conversationID]; ok {
-			session.stopping = true
+			session.markStopping()
 			sessions = append(sessions, session.agent)
 			if session.activeRunID != "" {
 				runIDs[session.activeRunID] = struct{}{}
@@ -2571,80 +2654,40 @@ func (s *Server) waitProjectAgentsStop(ctx context.Context, conversationIDs map[
 	}
 }
 
+// listProjects 返回项目列表，**不做任何远端/跨端连通性探测**。
+//
+// 远端主机慢或离线时本接口仍在毫秒级返回，项目卡片不会被拖住：探活已拆到
+// GET /api/projects/availability（见 project_availability.go）。因此这里只做本机
+// exec.LookPath 级的廉价 codex 判定（整份列表只求值一次），远端/跨端 codex 就绪度
+// 一律回落到"无法确定即不可用"，由 availability 接口单独提供、前端异步合并。
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `select id,name,path,coalesce(nullif(runner_id,''),runner),git_branch,claude_ready,created_at from projects order by created_at desc`)
+	projects, err := s.projectRowsForListing(r.Context())
 	if err != nil {
 		writeError(w, 500, err)
 		return
 	}
-	projects := []Project{}
-	for rows.Next() {
-		var p Project
-		if err := rows.Scan(&p.ID, &p.Name, &p.Path, &p.Runner, &p.GitBranch, &p.ClaudeReady, &p.CreatedAt); err != nil {
-			rows.Close()
-			writeError(w, 500, err)
-			return
-		}
-		p.RunnerID = p.Runner
-		projects = append(projects, p)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		writeError(w, 500, err)
-		return
-	}
-	if err := rows.Close(); err != nil {
-		writeError(w, 500, err)
-		return
-	}
 
-	localCodexReady := s.codexRunner.Ready(r.Context())
-	// Cache remote Codex readiness per SSH runner so we don't issue redundant
-	// remote checks when many projects share the same connection.
-	sshCodexCache := map[string]bool{}
-	// Cache the cross-boundary Windows Codex readiness (WSL server + windows target)
-	// so many /mnt/ projects probe the Windows side only once per listing.
-	windowsCodexReady := -1 // -1 = 未缓存（每次首次使用时探测）
-	// Cache the cross-boundary WSL Codex readiness (Windows server + wsl-local runner)
-	// so many WSL projects probe the WSL side only once per listing.
-	wslCodexReady := -1
+	// 本机 codex 就绪只是 exec.LookPath（无远端 I/O），整个列表只求值一次。
+	localCodexReady := false
+	localCodexProbed := false
 	for index := range projects {
 		p := &projects[index]
 		s.decorateProjectPresentation(p)
-		if isLocalRunnerID(p.Runner) && s.resolveAgentTargetEnv(p.Runner, p.Path) == agentTargetEnvWindows && runtime.GOOS != "windows" {
-			if windowsCodexReady < 0 {
-				windowsCodexReady = 0
-				if s.codexReadyForTarget(r.Context(), agentTargetEnvWindows) {
-					windowsCodexReady = 1
-				}
+		probe := s.projectCodexProbe(p)
+		switch {
+		case probe.key == "":
+			p.CodexReady = false
+		case probe.local:
+			if !localCodexProbed {
+				localCodexProbed = true
+				localCodexReady = probe.run(r.Context())
 			}
-			p.CodexReady = windowsCodexReady == 1
-			p.AgentReady = p.ClaudeReady || p.CodexReady
-		} else if p.Runner == "wsl-local" {
-			// Windows 服务端下 wsl-local 项目跨到 WSL 侧探测 codex 就绪，缓存避免重复 probe。
-			if wslCodexReady < 0 {
-				wslCodexReady = 0
-				if w := s.wslAgentRunner(); w != nil {
-					if cr, ok := w.(CodexCapableRunner); ok && cr.CodexReady(r.Context()) {
-						wslCodexReady = 1
-					}
-				}
-			}
-			p.CodexReady = wslCodexReady == 1
-			p.AgentReady = p.ClaudeReady || p.CodexReady
-		} else if isLocalRunnerID(p.Runner) {
-			s.decorateProjectAvailability(p, localCodexReady)
-		} else if strings.HasPrefix(p.Runner, "ssh-") {
-			if cached, ok := sshCodexCache[p.Runner]; ok {
-				p.CodexReady = cached
-				p.AgentReady = p.ClaudeReady || p.CodexReady
-			} else {
-				s.decorateProjectAvailability(p, localCodexReady)
-				sshCodexCache[p.Runner] = p.CodexReady
-			}
-		} else {
-			s.decorateProjectAvailability(p, localCodexReady)
+			p.CodexReady = localCodexReady
+		default:
+			// 远端 / 跨端：不在列表接口同步探测，交由 availability 接口。
+			p.CodexReady = false
 		}
+		p.AgentReady = p.ClaudeReady || p.CodexReady
 	}
 	writeJSON(w, 200, projects)
 }
@@ -2652,7 +2695,7 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 // getProject returns a single project by ID. Unlike listProjects it performs no
 // remote Codex/Claude readiness probing, so it returns immediately even when an
 // SSH runner is slow or unreachable. Callers that need the current readiness
-// state should use listProjects or the statuses endpoint instead.
+// state should use GET /api/projects/availability instead.
 func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 	if projectID == "" {
@@ -2767,49 +2810,25 @@ func (s *Server) setProjectDefaultProfile(w http.ResponseWriter, r *http.Request
 
 // decorateProjectAvailability fills a project's Codex and combined Agent readiness
 // by the project's own target environment (docs/20). localCodexReady is a cached
-// probe for the server-local environment used by listProjects; for projects whose
+// probe for the server-local environment used by createProject; for projects whose
 // target environment differs from the server (e.g. WSL server + /mnt/ project),
 // the readiness is probed against that environment so the UI never reports "ready"
 // for a CLI that actually lives on the other side.
+//
+// 探测对象由 projectCodexProbe 统一推导，与 GET /api/projects/availability 使用
+// 同一套口径（见 project_availability.go）。列表刷新不调用本函数，避免被远端拖住。
 func (s *Server) decorateProjectAvailability(project *Project, localCodexReady bool) {
-	switch {
-	case isLocalRunnerID(project.Runner):
-		target := s.resolveAgentTargetEnv(project.Runner, project.Path)
-		if target == agentTargetEnvWSL || (target == agentTargetEnvWindows && runtime.GOOS == "windows") {
-			project.CodexReady = localCodexReady
-		} else {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			project.CodexReady = s.codexReadyForTarget(ctx, target)
-		}
-	case project.Runner == "wsl-local":
-		// Windows 服务端 + wsl-local：Codex 在 WSL 侧，探测其真实就绪，不误用本机 Windows codex。
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		project.CodexReady = s.codexReadyForTarget(ctx, agentTargetEnvWSL)
-	case strings.HasPrefix(project.Runner, "ssh-"):
-		project.CodexReady = s.sshCodexReady(project.Runner)
-	default:
+	switch probe := s.projectCodexProbe(project); {
+	case probe.key == "":
 		project.CodexReady = false
+	case probe.local:
+		project.CodexReady = localCodexReady
+	default:
+		ctx, cancel := context.WithTimeout(context.Background(), projectAvailabilityProbeTimeout)
+		defer cancel()
+		project.CodexReady = probe.run(ctx)
 	}
 	project.AgentReady = project.ClaudeReady || project.CodexReady
-}
-
-// sshCodexReady reports whether Codex is available on the remote host behind the
-// given SSH runner. It returns false when the runner is disconnected or the
-// remote Codex CLI is not installed/logged in.
-func (s *Server) sshCodexReady(runnerID string) bool {
-	r, ok := s.runnerRegistry.get(runnerID)
-	if !ok {
-		return false
-	}
-	codexR, ok := r.(CodexCapableRunner)
-	if !ok {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return codexR.CodexReady(ctx)
 }
 
 func (s *Server) decorateProjectPresentation(project *Project) {
@@ -2927,12 +2946,27 @@ func (s *Server) pruneConversationHistories(ctx context.Context) error {
 // large history database. Callers should invoke it after the HTTP listener is
 // available so maintenance cannot delay service readiness.
 func (s *Server) StartBackgroundMaintenance() {
+	// WSL 保活与数据库维护互不依赖，各自一个 goroutine：唤醒发行版要等冷启动（可达
+	// 数十秒），不能让它排在历史裁剪后面，否则用户第一次点开 WSL 项目时它还没跑完。
+	s.startWSLKeepAlive()
+	s.startEventRetentionLoop()
 	go func() {
 		if err := s.pruneConversationHistories(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[maintenance] prune conversation history: %v", err)
 		}
 		if err := s.ensureConversationDeleteIntegrity(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[maintenance] conversation delete integrity: %v", err)
+		}
+		// 空间回收排在最后，并且先让开启动后的交互窗口：这是一次性的大动作（VACUUM），
+		// 期间会独占唯一那条 SQLite 连接。
+		if err := s.waitForIdleWindow(s.runtimeCtx, storageReclaimStartDelay); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("[maintenance] storage reclaim skipped: %v", err)
+			}
+			return
+		}
+		if err := s.ensureStorageReclaimed(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[maintenance] storage reclaim: %v", err)
 		}
 	}()
 }
@@ -3085,7 +3119,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var existing Conversation
-		err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where project_id=$1 and is_current=1`, projectID).Scan(&existing.ID, &existing.ProjectID, &existing.ClaudeSessionID, &existing.AgentID, &existing.AgentSessionID, &existing.AgentRuntimeID, &existing.AgentProfileRevisionID, &existing.ProjectAgentRouteRevisionID, &existing.ExecutionPolicy, &existing.Status, &existing.PermissionMode, &existing.Title, &existing.LastActivityAt, &existing.ClaudeInitialized, &existing.AgentInitialized, &existing.IsCurrent, &existing.CreatedAt)
+		err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where project_id=$1 and is_current=1`, projectID).Scan(&existing.ID, &existing.ProjectID, &existing.ClaudeSessionID, &existing.AgentID, &existing.AgentSessionID, &existing.AgentRuntimeID, &existing.AgentProfileRevisionID, &existing.ProjectAgentRouteRevisionID, &existing.ExecutionPolicy, &existing.Status, &existing.PermissionMode, &existing.ModelOverride, &existing.Title, &existing.LastActivityAt, &existing.ClaudeInitialized, &existing.AgentInitialized, &existing.IsCurrent, &existing.CreatedAt)
 		if err == nil {
 			if err = tx.Commit(); err != nil {
 				writeError(w, 500, err)
@@ -3155,7 +3189,7 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),''),exists(select 1 from git_task_records r where r.conversation_id=c.id) from conversations c where c.project_id=? and (?='' or lower(c.title) like '%' || lower(?) || '%' or exists(select 1 from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' and lower(m.content) like '%' || lower(?) || '%'))`
+	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),''),exists(select 1 from git_task_records r where r.conversation_id=c.id) from conversations c where c.project_id=? and (?='' or lower(c.title) like '%' || lower(?) || '%' or exists(select 1 from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' and lower(m.content) like '%' || lower(?) || '%'))`
 	args := []any{chi.URLParam(r, "projectID"), query, query, query}
 	if cursor.ID != "" {
 		statement += ` and (c.last_activity_at < ? or (c.last_activity_at = ? and c.id < ?))`
@@ -3172,7 +3206,7 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 	items := []Conversation{}
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.AgentProfileRevisionID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt, &c.Preview, &c.IsOrchestration); err != nil {
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.AgentProfileRevisionID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.ModelOverride, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt, &c.Preview, &c.IsOrchestration); err != nil {
 			writeError(w, 500, err)
 			return
 		}
@@ -3215,7 +3249,7 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 	var previous Conversation
 	var projectRunner string
 	var previousWorkspaceID string
-	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,c.active_workspace_id,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.AgentProfileRevisionID, &previous.ProjectAgentRouteRevisionID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &previousWorkspaceID, &projectRunner)
+	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,c.active_workspace_id,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.AgentProfileRevisionID, &previous.ProjectAgentRouteRevisionID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.ModelOverride, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &previousWorkspaceID, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -3234,7 +3268,7 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 	// A cleared conversation remains readable history, but must never accept a
 	// later turn: its native session is being stopped below. Preserve another
 	// tab's last-selected marker when clearing a background conversation.
-	fresh := Conversation{ID: uuid.NewString(), ProjectID: previous.ProjectID, ClaudeSessionID: sessionID, AgentID: previous.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, AgentProfileRevisionID: previous.AgentProfileRevisionID, ProjectAgentRouteRevisionID: previous.ProjectAgentRouteRevisionID, ExecutionPolicy: previous.executionPolicy(), Status: "idle", PermissionMode: previous.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: previous.IsCurrent, CreatedAt: now}
+	fresh := Conversation{ID: uuid.NewString(), ProjectID: previous.ProjectID, ClaudeSessionID: sessionID, AgentID: previous.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, AgentProfileRevisionID: previous.AgentProfileRevisionID, ProjectAgentRouteRevisionID: previous.ProjectAgentRouteRevisionID, ExecutionPolicy: previous.executionPolicy(), Status: "idle", PermissionMode: previous.PermissionMode, ModelOverride: previous.ModelOverride, Title: "新会话", LastActivityAt: now, IsCurrent: previous.IsCurrent, CreatedAt: now}
 	result, err := tx.ExecContext(r.Context(), `update conversations set is_current=0,status='archived' where id=? and status='idle'`, previous.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -3249,7 +3283,7 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("conversation changed while clearing"))
 		return
 	}
-	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, fresh.ID, fresh.ProjectID, fresh.ClaudeSessionID, fresh.AgentID, fresh.AgentSessionID, fresh.AgentRuntimeID, fresh.AgentProfileRevisionID, fresh.ProjectAgentRouteRevisionID, fresh.ExecutionPolicy, fresh.Status, fresh.PermissionMode, fresh.Title, fresh.LastActivityAt, fresh.ClaudeInitialized, fresh.AgentInitialized, fresh.IsCurrent, fresh.CreatedAt); err != nil {
+	if _, err = tx.ExecContext(r.Context(), `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, fresh.ID, fresh.ProjectID, fresh.ClaudeSessionID, fresh.AgentID, fresh.AgentSessionID, fresh.AgentRuntimeID, fresh.AgentProfileRevisionID, fresh.ProjectAgentRouteRevisionID, fresh.ExecutionPolicy, fresh.Status, fresh.PermissionMode, fresh.ModelOverride, fresh.Title, fresh.LastActivityAt, fresh.ClaudeInitialized, fresh.AgentInitialized, fresh.IsCurrent, fresh.CreatedAt); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -3289,7 +3323,7 @@ func (s *Server) markConversationSessionStopping(conversationID string) AgentSes
 	if session == nil || session.stopping {
 		return nil
 	}
-	session.stopping = true
+	session.markStopping()
 	return session.agent
 }
 
@@ -3314,7 +3348,7 @@ func (s *Server) stopConversationSessions(conversationIDs []string) []AgentSessi
 		if _, ok := selected[conversationID]; !ok || session.stopping {
 			continue
 		}
-		session.stopping = true
+		session.markStopping()
 		sessions = append(sessions, session.agent)
 	}
 	return sessions
@@ -3544,9 +3578,9 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 	s.projectLifecycleMu.Unlock()
 	locked = false
 	for _, session := range sessions {
-		// Native process termination can block (notably Windows taskkill /T /F
-		// and WSL teardown). The conversation rows are already committed, so do
-		// not hold the HTTP request open while waiting for process exit.
+		// Native process termination can be slow (WSL / SSH teardown, and the
+		// process-tree sweep that runs after it). The conversation rows are
+		// already committed, so do not hold the HTTP request open for it.
 		go session.Stop()
 	}
 	writeJSON(w, http.StatusOK, deleteConversationsResult{Deleted: int(deleted), Skipped: skipped, DeletedIDs: ids})
@@ -3569,7 +3603,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var c Conversation
-	err = s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at,exists(select 1 from git_task_records r where r.conversation_id=conversations.id) from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.AgentProfileRevisionID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt, &c.IsOrchestration)
+	err = s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at,exists(select 1 from git_task_records r where r.conversation_id=conversations.id) from conversations where id=$1`, id).Scan(&c.ID, &c.ProjectID, &c.ClaudeSessionID, &c.AgentID, &c.AgentSessionID, &c.AgentRuntimeID, &c.AgentProfileRevisionID, &c.ExecutionPolicy, &c.Status, &c.PermissionMode, &c.ModelOverride, &c.Title, &c.LastActivityAt, &c.ClaudeInitialized, &c.AgentInitialized, &c.IsCurrent, &c.CreatedAt, &c.IsOrchestration)
 	if err != nil {
 		writeError(w, 404, errors.New("conversation not found"))
 		return
@@ -3876,7 +3910,7 @@ func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	var conversation Conversation
-	err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
+	err = tx.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -3932,7 +3966,7 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 	defer s.projectLifecycleMu.Unlock()
 	conversationID := chi.URLParam(r, "conversationID")
 	var conversation Conversation
-	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
+	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -4197,7 +4231,9 @@ func (s *Server) seedDefaultShortcuts(w http.ResponseWriter, r *http.Request) {
 		{"审查改动", "prompt", "请审查当前项目尚未提交的改动，指出风险、测试缺口和建议。", "常用提示词", "run"},
 		{"清屏", "command_request", "/clear", "常用命令", "confirm"},
 		{"压缩上下文", "command_request", "/compact", "常用命令", "confirm"},
-		{"代码审查", "command_request", "/review", "常用命令", "confirm"},
+		// 曾经是 `/review`：它已不在 Claude Code 2.1.266 的命令目录里（隐藏但可用，
+		// 跑一次会真的执行、要花钱），换成目录内的技能命令（见 docs/37 §2.4）。
+		{"代码审查", "command_request", "/code-review", "常用命令", "confirm"},
 	}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -4246,6 +4282,49 @@ func (s *Server) seedDefaultShortcuts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"seeded": true, "created": created})
+}
+
+// migrateLegacyReviewShortcut 修复 v1 种子数据里那条已失效的默认命令。
+//
+// common_shortcuts_v1 把「代码审查」写成 `/review`，而 Claude Code 2.1.266 的命令目录里
+// 已经没有它（隐藏但仍可执行：跑一次会真的审查、要花钱，却不在任何可见列表里，见
+// docs/37 §2.4）。defaults 数组只对新库生效，已有库需要一次定向修复。
+//
+// 只命中与种子完全一致的那一行（本地范围 + 命令类型 + 同名 + 同模板），用户改过的、
+// 或另建的条目一律不动；修复写 shortcut_audit_events，与其它快捷方式管理操作同一套审计。
+func (s *Server) migrateLegacyReviewShortcut(ctx context.Context, now time.Time) error {
+	const fixedKey = "common_shortcuts_review_fix_v1"
+	var value string
+	err := s.db.QueryRowContext(ctx, `select value from app_metadata where key=?`, fixedKey).Scan(&value)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect shortcut fix marker: %w", err)
+	}
+	var id string
+	err = s.db.QueryRowContext(ctx, `select id from shortcuts where scope='local' and kind='command_request' and name='代码审查' and template='/review'`).Scan(&id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("find legacy review shortcut: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if id != "" {
+		if _, err := tx.ExecContext(ctx, `update shortcuts set template='/code-review', updated_at=? where id=?`, now, id); err != nil {
+			return fmt.Errorf("repair legacy review shortcut: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `insert into shortcut_audit_events (id,shortcut_id,action,payload,created_at) values (?,?,?,?,?)`,
+			uuid.NewString(), id, "updated", mustJSON(map[string]any{"from": "/review", "to": "/code-review", "source": "migration"}), now); err != nil {
+			return fmt.Errorf("audit legacy review shortcut: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `insert into app_metadata (key,value) values (?,?)`, fixedKey, now.Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("record shortcut fix marker: %w", err)
+	}
+	return tx.Commit()
 }
 
 func (s *Server) saveShortcut(w http.ResponseWriter, r *http.Request, id string, created bool) {
@@ -4378,7 +4457,7 @@ func (s *Server) deleteShortcut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) shortcutForConversation(ctx context.Context, shortcutID, conversationID string) (Shortcut, Conversation, Project, error) {
 	var conversation Conversation
 	var project Project
-	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.id,p.name,p.path,coalesce(nullif(p.runner_id,''),p.runner),p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.id,p.name,p.path,coalesce(nullif(p.runner_id,''),p.runner),p.git_branch,p.claude_ready,p.created_at from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &project.ID, &project.Name, &project.Path, &project.Runner, &project.GitBranch, &project.ClaudeReady, &project.CreatedAt)
 	if err != nil {
 		return Shortcut{}, Conversation{}, Project{}, err
 	}
@@ -4525,6 +4604,13 @@ func (s *Server) runShortcut(w http.ResponseWriter, r *http.Request) {
 	content, err := renderShortcut(shortcut, conversation, project, input.Variables)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 斜杠命令由 CLI 自己解释，而 Codex 的 `codex exec` 不解析斜杠命令（斜杠只存在于
+	// 它的 TUI 层）：把 `/compact` 当普通提示词发过去，模型会去读一个叫 compact 的文件。
+	// 界面按会话 agent 置灰入口，这里再兜一层，保证任何调用方都拿不到这种运行（docs/37 §3.6）。
+	if conversation.AgentID == "codex" && slashCommandName(content) != "" {
+		writeError(w, http.StatusBadRequest, errors.New("Codex 不支持斜杠命令：请改用自定义 shell 命令，或新建 Claude 会话"))
 		return
 	}
 	shortcutRun := &ShortcutRun{ID: uuid.NewString(), ShortcutID: shortcut.ID, ConversationID: conversationID, RenderedContent: content, Action: input.Action, Status: "accepted", CreatedAt: time.Now().UTC()}
@@ -4716,7 +4802,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	var conversation Conversation
 	var projectPath string
 	var projectRunner string
-	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ProjectAgentRouteRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
+	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ProjectAgentRouteRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, "", nil, http.StatusNotFound, errors.New("conversation not found")
 	}
@@ -5009,7 +5095,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		// 使底部模型/上下文栏在任务进行中与结束后都能显示具体模型。
 		// 放在后台 goroutine 内执行：WSL/SSH 探测默认模型可能需拉起远程进程，
 		// 不阻塞发送请求的 Accepted 响应。
-		s.seedRunUsageModel(runID, conversation.AgentID, profile, runnerObj)
+		s.seedRunUsageModel(runID, conversation.AgentID, runModel(conversation.ModelOverride, profile), runnerObj)
 		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectRunner, projectPath, content)
 	}()
 	return m, runID, record, http.StatusAccepted, nil
@@ -5026,6 +5112,22 @@ func boolToInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+// runModel 解析一次运行实际要使用的模型：会话级覆盖 > 档案模型 > 空串（交给 CLI 自己的
+// 配置）。这是全链路唯一的优先级判定点——构造 AgentRunRequest/AgentSessionRequest 时算好
+// 再作为普通参数下传，runner 一律只读 request.Model（见 AgentRunRequest.Model 的说明）。
+//
+// override 传会话的 ModelOverride；没有会话上下文的运行路径（洞察扫描、编排评审）传空串，
+// 它们本来就只该用档案模型。
+func runModel(override string, profile *AgentRuntimeProfile) string {
+	if model := strings.TrimSpace(override); model != "" {
+		return model
+	}
+	if profile != nil {
+		return strings.TrimSpace(profile.Model)
+	}
+	return ""
 }
 
 func (s *Server) acquireProjectWorkspace(projectID, owner string) (func(), bool) {
@@ -5177,12 +5279,12 @@ func (s *Server) submitStreamingRunWithProfile(ctx context.Context, runner Strea
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
 	}
-	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID, Profile: profile}
+	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID, Profile: profile, Model: runModel(conversation.ModelOverride, profile)}
 	if err := s.beginStreamingRun(ctx, runID); err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
 	}
-	if err := session.Send(request, &agentRunSink{server: s, runID: runID, conversationID: conversation.ID, agentID: conversation.AgentID, streaming: true}); err != nil {
+	if err := session.Send(request, &agentRunSink{server: s, runID: runID, conversationID: conversation.ID, projectID: conversation.ProjectID, agentID: conversation.AgentID, streaming: true}); err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
 	}
@@ -5212,7 +5314,9 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	s.mu.Lock()
 	if session := s.sessions[conversation.ID]; session != nil {
 		if session.stopping {
+			stoppingSince := session.stoppingSince
 			s.mu.Unlock()
+			logStoppingRejection("streaming turn", conversation.ID, stoppingSince)
 			return nil, errors.New("conversation is stopping")
 		}
 		setup := s.streamingSetups[runID]
@@ -5239,7 +5343,7 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	mcpKey := "sess-" + conversation.ID
 	injection := s.prepareMCPInjection(ctx, conversation.ProjectID, projectPath, conversation.AgentID, runnerID, mcpKey)
 	s.setMCPAutoApprove(conversation.ID, injection.AutoApproveTools)
-	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools})
+	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, Model: runModel(conversation.ModelOverride, profile), MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools})
 	if err != nil {
 		injection.done()
 		s.clearMCPAutoApprove(conversation.ID)
@@ -5283,8 +5387,14 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 // watchStreamingSession keeps the workspace lease held until the underlying
 // process has actually exited. A stopped session may still flush output after
 // Stop returns, so its active runs must not be finalized early.
+//
+// 等待有上限：只有会话被要求停止之后才开始计时（见 waitForStreamingSessionExit），
+// 到点仍不退出就放弃等待、照常释放——宁可冒"进程可能还活着"的风险，也不能让这条
+// 会话永久停在 stopping。
 func (s *Server) watchStreamingSession(conversationID string, managed *activeAgentSession) {
-	<-managed.agent.Done()
+	if !s.waitForStreamingSessionExit(managed) {
+		log.Printf("conversation %s: native agent process has not exited %s after it was stopped; releasing its session so the conversation can accept new turns again (its runs are finalized as stopped; its workspace lease is released with them)", conversationID, s.sessionManager.exitGrace())
+	}
 
 	// Block new streaming admission while removing this stopped session and
 	// snapshotting its admitted runs. A new session may start once the lock is
@@ -5330,6 +5440,62 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 	}
 }
 
+// conversationSessionExitPoll 是"进程是否已退出"的巡检间隔，会按宽限期缩小以
+// 保证测试与短宽限期也能及时响应。
+const (
+	conversationSessionExitPollFloor = 20 * time.Millisecond
+	conversationSessionExitPollCeil  = 5 * time.Second
+)
+
+// waitForStreamingSessionExit 等到会话进程真正退出，返回"是否等到了"。
+//
+// 会话还没被要求停止时这里无限期等待：正常运行的进程本来就不该被回收。一旦它被
+// 标记 stopping，等待就有了上限——一个杀不掉的进程曾让会话永久停在 stopping，
+// 每条新消息都只换来"会话正在停止，请稍后再试。"，只有重启控制服务才能恢复
+// （Windows 侧 taskkill 曾被 3 秒上限掐断，详见 process_windows.go）。到达上限仍
+// 不退出时放弃等待：宁可承担"疑似仍活着的进程"继续占着工作区的风险，也不能让整条
+// 会话永久不可用。两种情况都在调用方留下日志。
+func (s *Server) waitForStreamingSessionExit(managed *activeAgentSession) bool {
+	grace := s.sessionManager.exitGrace()
+	poll := grace / 4
+	if poll < conversationSessionExitPollFloor {
+		poll = conversationSessionExitPollFloor
+	}
+	if poll > conversationSessionExitPollCeil {
+		poll = conversationSessionExitPollCeil
+	}
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	done := managed.agent.Done()
+	for {
+		select {
+		case <-done:
+			return true
+		case <-ticker.C:
+			// 进程可能恰好在 ticker 触发前退出，而 select 在两个 case 同时就绪时
+			// 随机选取；这里先无阻塞确认一次，免得明明已经退出却走"超时释放"分支，
+			// 留下一条误导性的日志。
+			select {
+			case <-done:
+				return true
+			default:
+			}
+			s.mu.Lock()
+			stopping := managed.stopping
+			if stopping && managed.stoppingSince.IsZero() {
+				// 兜底：绕过 markStopping 直接置位的会话也应该有起点，否则它会
+				// 退化成"无限期等待"。
+				managed.stoppingSince = time.Now()
+			}
+			elapsed := time.Since(managed.stoppingSince)
+			s.mu.Unlock()
+			if stopping && elapsed >= grace {
+				return false
+			}
+		}
+	}
+}
+
 func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, profile *AgentRuntimeProfile, runnerID, projectPath, prompt string) {
 	injection := s.prepareMCPInjection(ctx, c.ProjectID, projectPath, c.AgentID, runnerID, runID)
 	defer injection.done()
@@ -5355,6 +5521,7 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		RunToken:            runToken,
 		AgentID:             c.AgentID,
 		Profile:             profile,
+		Model:               runModel(c.ModelOverride, profile),
 		MCPConfigPath:       injection.localConfigPath(),
 		MCPConfigJSON:       injection.remoteJSON(),
 		MCPKey:              runID,
@@ -5362,7 +5529,7 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		MCPEnv:              injection.Env,
 		CodexMCPArgs:        injection.CodexArgs,
 		MCPAutoApproveTools: injection.AutoApproveTools,
-	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, agentID: c.AgentID})
+	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, projectID: c.ProjectID, agentID: c.AgentID})
 	status := "completed"
 	if ctx.Err() != nil {
 		status = "stopped"
@@ -5377,6 +5544,7 @@ type agentRunSink struct {
 	server         *Server
 	runID          string
 	conversationID string
+	projectID      string
 	agentID        string
 	streaming      bool
 
@@ -5442,6 +5610,12 @@ func (sink *agentRunSink) flushAssistantDelta() {
 func (sink *agentRunSink) Event(eventType string, payload json.RawMessage) {
 	sink.server.appendEvent(sink.runID, sink.conversationID, eventType, payload)
 	sink.server.collectUsageEvent(sink.runID, sink.conversationID, eventType, payload)
+	// 顺带采样 CLI 的命令目录（docs/37）：init 事件是"当前 CLI 到底支持哪些斜杠命令"
+	// 的唯一完整来源，而每次真实运行本来就会产生一条。只认 system 事件，避免在每条
+	// 事件上白付一次反序列化。
+	if eventType == "system" {
+		sink.server.observeCommandCatalog(sink.projectID, payload)
+	}
 }
 
 func (sink *agentRunSink) AssistantText(content, parentToolUseID string) {
@@ -5512,9 +5686,10 @@ func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) 
 		delete(session.runIDs, runID)
 		if errors.Is(runErr, errClaudeTurnIdleTimeout) {
 			// The CLI has stopped accepting turns after its watchdog fires. Keep
-			// the session unavailable until Done removes it, rather than letting a
-			// new Run reuse a known-stopped process.
-			session.stopping = true
+			// the session unavailable until Done removes it (or the exit grace
+			// releases it), rather than letting a new Run reuse a known-stopped
+			// process. The watchdog already killed the process itself.
+			session.markStopping()
 		}
 		if session.activeRunID == runID {
 			session.activeRunID = ""
@@ -5659,7 +5834,7 @@ func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string
 	if setupStop {
 		setup.cancelled = true
 		if setup.ownsSession && session == setup.session {
-			session.stopping = true
+			session.markStopping()
 			setupAgent = session.agent
 		}
 	}
@@ -5688,7 +5863,7 @@ func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string
 		}
 		s.mu.Lock()
 		if s.sessions[conversationID] == session {
-			session.stopping = true
+			session.markStopping()
 		}
 		s.mu.Unlock()
 		session.agent.Stop()
@@ -5721,7 +5896,7 @@ func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string
 			}
 			s.mu.Lock()
 			if s.sessions[queuedConversationID] == session {
-				session.stopping = true
+				session.markStopping()
 			}
 			s.mu.Unlock()
 			session.agent.Stop()
@@ -5785,7 +5960,7 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 	var session AgentSession
 	s.mu.Lock()
 	if activeSession := s.sessions[conversationID]; activeSession != nil {
-		activeSession.stopping = true
+		activeSession.markStopping()
 		session = activeSession.agent
 	}
 	for _, run := range activeRuns {
@@ -5997,7 +6172,8 @@ func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) 
 	}
 	relayed := false
 	if s.remoteRelayConfigured() {
-		if err := s.enqueueRemoteEventTx(context.Background(), tx, e.ID, "", e.RunID, e.Type, e.Payload, e.CreatedAt); err != nil {
+		// 带上会话标识：手机端要按会话归属"重试中 / 上下文压缩 / 执行失败"这类状态事件。
+		if err := s.enqueueRemoteEventTxWithConversation(context.Background(), tx, e.ID, "", e.RunID, e.ConversationID, e.Type, e.Payload, e.CreatedAt); err != nil {
 			log.Printf("queue remote %s event for run %s: %v", typ, runID, err)
 			return
 		}
@@ -6020,7 +6196,7 @@ func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) 
 // persisting it. Most events belong to a Run and use appendEvent; orchestration
 // status messages deliberately have no Run, while events.run_id is required.
 func (s *Server) broadcastConversationEvent(event Event) {
-	if err := s.enqueueRemoteEvent(context.Background(), event.ID, "", event.RunID, event.Type, event.Payload, event.CreatedAt); err != nil {
+	if err := s.enqueueRemoteEventWithConversation(context.Background(), event.ID, "", event.RunID, event.ConversationID, event.Type, event.Payload, event.CreatedAt); err != nil {
 		log.Printf("queue remote %s event: %v", event.Type, err)
 	}
 	data, _ := json.Marshal(event)
@@ -6507,6 +6683,19 @@ func compactConversationText(content string, limit int) string {
 	return string(runes[:limit]) + "..."
 }
 
+// truncateRunes 按字符（rune）数截断，中文等多字节字符不会被从中间切开。
+// limit 为负数时视为 0。截断结果不加省略号，调用方需要提示语时自行拼接。
+func truncateRunes(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit])
+}
+
 func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func shellQuote(value string) string {
@@ -6622,15 +6811,6 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 			claudeEntry := map[string]any{
 				"status":  status,
 				"version": v,
-			}
-			// --bare 风险告警：上游计划把它设为 -p 的默认行为，届时 skills / 项目资产不再
-			// 自动发现，而 Milevia 依赖该自动发现（docs/34 §13）。探测结果按 runner 缓存，
-			// 只在 CLI 确实已提供 --bare 时告警——不猜版本号。
-			if v != "" && status == "ready" {
-				if reporter, ok := runner.(bareFlagReporter); ok && reporter.BareFlagAvailable(r.Context()) {
-					claudeEntry["bare"] = true
-					claudeEntry["reason"] = "该版本已提供 --bare；上游计划将其设为 -p 的默认行为，届时 skills 与项目资产将不再自动发现。"
-				}
 			}
 			entry["claude"] = claudeEntry
 		}

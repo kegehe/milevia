@@ -9,6 +9,6 @@ test("scheduled retries reuse a client request ID", () => {
   assert.match(page, /pendingSendRequestIDRef\.current = crypto\.randomUUID\(\);/);
   assert.match(page, /const clientRequestId = options\.clientRequestId \?\? crypto\.randomUUID\(\);/);
   assert.match(page, /JSON\.stringify\(\{ content, clientRequestId \}\)/);
-  assert.match(page, /sendContentRef\.current\(content, true, \{ restoreOnFailure: last, notifyFailure: last, clientRequestId \}\)/);
+  assert.match(page, /sendContentRef\.current\(draft, true, \{ restoreOnFailure: last, notifyFailure: last, clientRequestId, skillRefs: refs \}\)/);
   assert.match(page, /pendingSendRequestIDRef\.current = null;/);
 });

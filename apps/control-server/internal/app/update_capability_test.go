@@ -44,7 +44,7 @@ func (autoUpdateUnsupportedCodexRunner) CodexAutoUpdateSupported() bool { return
 
 // 能力标记的单元验证：真实跨端 runner 应如实报告不支持应用内自动升级，且不依赖 WSL/Windows 侧。
 func TestCrossEndRunnersReportNoAutoUpdate(t *testing.T) {
-	wsl := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, "Ubuntu")
+	wsl := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, "Ubuntu", nil)
 	if wsl.AutoUpdateSupported() {
 		t.Fatal("wslAgentRunner should not support in-app Claude auto update")
 	}

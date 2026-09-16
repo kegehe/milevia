@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { apiURL, isDesktop, sessionHeaders } from "../../lib/runtime";
+import { markdownCodeComponents } from "../../components/MarkdownCodeBlock";
 import type { FileInfo } from "./file-model";
 import { formatSize, getDirPath, isEditableFile } from "./file-model";
 import type { FilePreviewKind } from "./source-language";
@@ -76,7 +77,7 @@ function FileMessage({ projectId, conversationId, stat, message }: { projectId: 
 }
 
 function MarkdownPreview({ content, projectId, conversationId, baseDir, fontSize }: { content: string; projectId: string; conversationId?: string; baseDir: string; fontSize: number }) {
-  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ a: ({ href, children }) => <a href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>, img: ({ src, alt }) => <MarkdownImage src={markdownImageUrl(src ?? "", baseDir, projectId, conversationId)} alt={alt ?? ""} /> }}>{content}</ReactMarkdown></div>;
+  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>, img: ({ src, alt }) => <MarkdownImage src={markdownImageUrl(src ?? "", baseDir, projectId, conversationId)} alt={alt ?? ""} /> }}>{content}</ReactMarkdown></div>;
 }
 
 function MarkdownImage({ src, alt }: { src: string; alt: string }) {

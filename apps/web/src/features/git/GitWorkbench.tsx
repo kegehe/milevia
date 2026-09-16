@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, 
 
 import { toast } from "sonner";
 
-import { changeState, commitFileStatusLabel, formatGitTime, groupChanges, shortOID, type GitBranch, type GitChange, type GitCommit, type GitCommitDetail, type GitCommitFile, type GitConflictOverview, type GitDiff, type GitOperation, type GitSnapshot } from "./git-model";
+import { changeState, commitFileStatusLabel, formatGitTime, groupChanges, isMergeCommit, shortOID, type GitBranch, type GitChange, type GitCommit, type GitCommitDetail, type GitCommitFile, type GitConflictOverview, type GitDiff, type GitOperation, type GitSnapshot } from "./git-model";
 import { ConflictSolveView } from "./ConflictSolveView";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
@@ -522,15 +522,15 @@ function CopyOID({ oid, title }: { oid: string; title?: string }) {
   return <code className={copied ? "git-oid copied" : "git-oid"} title={title ?? `点击复制完整提交 ID：${oid}`} role="button" tabIndex={0} aria-label={`复制提交 ID ${oid}`} onClick={copy} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); void copy(event); } }}>{copied ? <span className="git-oid-copied">已复制</span> : shortOID(oid)}</code>;
 }
 
-function CommitHistory({ commits, loading, selectedOID, onSelect }: { commits: GitCommit[]; loading: boolean; selectedOID?: string; onSelect: (commit: GitCommit) => void }) {
+export function CommitHistory({ commits, loading, selectedOID, onSelect }: { commits: GitCommit[]; loading: boolean; selectedOID?: string; onSelect: (commit: GitCommit) => void }) {
   if (loading) return <div className="git-empty">正在读取该分支的历史</div>;
   if (commits.length === 0) return <div className="git-empty">该分支没有可显示的提交记录</div>;
-  return <div className="git-history">{commits.map((commit) => <article key={commit.oid} className={commit.oid === selectedOID ? "selected" : ""} title="点击查看该提交的变更" tabIndex={0} onClick={() => onSelect(commit)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(commit); } }}><CopyOID oid={commit.oid} /><div><b>{commit.subject || "(无提交说明)"}</b><span>{commit.parents.length > 1 ? <i className="git-commit-merge-badge" title="合并提交">合并</i> : null}{commit.author} · {formatGitTime(commit.authoredAt)}</span></div></article>)}</div>;
+  return <div className="git-history">{commits.map((commit) => <article key={commit.oid} className={commit.oid === selectedOID ? "selected" : ""} title="点击查看该提交的变更" tabIndex={0} onClick={() => onSelect(commit)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(commit); } }}><CopyOID oid={commit.oid} /><div><b>{commit.subject || "(无提交说明)"}</b><span>{isMergeCommit(commit) ? <i className="git-commit-merge-badge" title="合并提交">合并</i> : null}{commit.author} · {formatGitTime(commit.authoredAt)}</span></div></article>)}</div>;
 }
 
 // 提交详情视图：头部提交摘要，正文为提交信息全文 + 文件列表|差异内容双栏（与“变更”tab 同构）。
 function CommitDetailView({ commit, detail, loading, error, selectedFile, fileDiff, fileDiffLoading, onOpenFile, onCloseFile, onBack }: { commit: GitCommit; detail: GitCommitDetail | null; loading: boolean; error: string; selectedFile: GitCommitFile | null; fileDiff: GitDiff | null; fileDiffLoading: boolean; onOpenFile: (file: GitCommitFile) => void; onCloseFile: () => void; onBack: () => void }) {
-  const isMerge = commit.parents.length > 1;
+  const isMerge = isMergeCommit(commit);
   const body = detail && detail.message !== detail.subject ? detail.message.slice(detail.subject.length).replace(/^\n+/, "") : "";
   return <div className="git-commit-detail">
     <header className="git-commit-detail-header">

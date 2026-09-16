@@ -14,7 +14,8 @@
       "pub_date": "2026-09-11T07:34:13.935Z",
       "url": "https://github.com/kegehe/milevia/releases/download/v0.1.6/Milevia_0.1.6_android.apk",
       "size": 29010648,
-      "sha256": "6c46145a473c1353140bf6a60afb41f829b8146b6d740a6e23d06dab1e37fa32"
+      "sha256": "6c46145a473c1353140bf6a60afb41f829b8146b6d740a6e23d06dab1e37fa32",
+      "signature": "6c46145a473c1353140bf6a60afb41f829b8146b6d740a6e23d06dab1e37fa32"
     }
   }
 }

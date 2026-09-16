@@ -9,7 +9,7 @@ import (
 // TestEnsureWSLRunnerNoOpWhenRegistered 保证已注册 wsl-local 时 ensureWSLRunner 是廉价
 // 快路径：不探测、不替换已存在的 runner。GOOS 无关，任何平台都成立。
 func TestEnsureWSLRunnerNoOpWhenRegistered(t *testing.T) {
-	s := &Server{runnerRegistry: newRunnerRegistry()}
+	s := &Server{runnerRegistry: newRunnerRegistry(), runtimeCtx: context.Background()}
 	stub := &noopRunner{}
 	s.runnerRegistry.register("wsl-local", stub, RunnerMeta{ID: "wsl-local", Environment: "wsl"})
 	s.ensureWSLRunner()
@@ -38,7 +38,7 @@ func TestEnsureWSLRunnerRecoversWhenMissing(t *testing.T) {
 	if _, err := detectDefaultWSLDistro(context.Background()); err != nil {
 		t.Skipf("no WSL on this host, skip: %v", err)
 	}
-	s := &Server{runnerRegistry: newRunnerRegistry()}
+	s := &Server{runnerRegistry: newRunnerRegistry(), runtimeCtx: context.Background()}
 	s.ensureWSLRunner()
 	if _, ok := s.runnerRegistry.getMeta("wsl-local"); !ok {
 		t.Fatal("ensureWSLRunner did not register wsl-local even though WSL is present")

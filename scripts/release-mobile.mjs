@@ -176,6 +176,12 @@ setPlatform(manifest, "android", {
   url: `${downloadBase}/${apkFileName}`,
   size: apkSize,
   sha256: apkSha256,
+  // Tauri 更新器把 platforms 读成 HashMap<String, { url, signature }>，signature 不是可选项 ——
+  // 任何一段缺它都会让【整份清单】反序列化失败，报 "missing field `signature`"，而且这发生在
+  // 版本比较之前：哪怕版本相同、根本不该更新，桌面端的检查更新也会直接报错。
+  // android 不是 Tauri 的 target、这个字段永远不会被读取，但不给就会连累桌面端。
+  // 这里放 APK 的 sha256（真实校验值），而不是伪造一个 minisign 签名。
+  signature: apkSha256,
 });
 
 mkdirSync(updatesDir, { recursive: true });

@@ -16,7 +16,27 @@
     </style>
 
 
+    <!-- 启动页主题。四条属性有版本分工，缺任何一条都会出现"换台手机看到两种启动页"：
+
+         · android:background —— Android 11 及以下实际看到的那一层（decor view 上的背景）。
+           刻意用 layer-list 而非位图，理由见 drawable/launch_screen.xml。
+         · windowSplashScreenBackground / windowSplashScreenAnimatedIcon —— Android 12+
+           的系统启动画面 API 自己读取，它不铺 android:background。不显式指定时系统会退回
+           「白底 + 应用图标」。androidx 的 Theme.SplashScreen 在 API 31+ 上会把这两个 attr
+           接到 android:windowSplashScreenBackground / AnimatedIcon 上（见 aapt2 dump 出的
+           (v31) 变体），所以写在这份通用 values 里就能同时覆盖高低两个版本，不需要
+           values-v31/。
+         · postSplashScreenTheme —— MainActivity 里调用的 installSplashScreen()
+           （androidx.core:core-splashscreen）会用它重设 Activity 主题。不指定的话默认值会
+           把主题重新设回 splash 主题，覆盖掉 BridgeActivity.onCreate 设好的
+           AppTheme.NoActionBar。
+
+         这四个 attr 都由 androidx 在无 API 限定的 attrs.xml 里定义，可以直接写在通用
+         values 下。 -->
     <style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">
-        <item name="android:background">@drawable/splash</item>
+        <item name="android:background">@drawable/launch_screen</item>
+        <item name="windowSplashScreenBackground">@color/launch_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/launch_mark</item>
+        <item name="postSplashScreenTheme">@style/AppTheme.NoActionBar</item>
     </style>
 </resources>

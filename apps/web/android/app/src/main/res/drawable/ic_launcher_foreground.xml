@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标的前景层（API 26+ 走这个，低版本仍用 mipmap-*/ic_launcher.png）。
+
+     内容是 Milevia 的 M 标记，颜色与 apps/web/public/milevia-mark.svg 同源。
+
+     坐标已按安全区收缩过一遍：108×108 画布上，系统只在中间 72×72 内展示内容，
+     圆形遮罩机型（Pixel 等）更严格——可见区就是直径 72 的内切圆。原来的写法
+     （M 的含描边范围 72×60、圆角点在 x16..88 / y24..84）会把左竖两端伸到圆外，
+     实测 x=22 处可见 y 仅 37.5..70.5，而笔画本身要到 30..78，两端会被削平。
+
+     现在含描边的整体范围是 54×45，四角到中心 (54,54) 的距离约 35.1，稳定落在
+     半径 36 之内，方形、圆角方、圆形遮罩下都不会被裁。改这里前先按同样方式复核。
+
+     形状必须与 drawable/ic_launcher_monochrome.xml（Android 13+ 主题化图标用）保持一致。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M31.5,72 L31.5,36 L48,57 L64.5,36 L64.5,72"
+        android:strokeColor="#C8E85A"
+        android:strokeWidth="9"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M76.5,36 L76.5,72"
+        android:strokeColor="#91B438"
+        android:strokeWidth="9"
+        android:strokeLineCap="round" />
+</vector>

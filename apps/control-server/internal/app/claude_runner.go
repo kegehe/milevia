@@ -76,6 +76,10 @@ type AgentSessionRequest struct {
 	ConversationID string
 	ApprovalToken  string
 	Profile        *AgentRuntimeProfile
+	// Model 是本次会话实际要使用的模型（会话覆盖 > 档案模型 > 空串=CLI 默认），
+	// 由控制服务在构造请求时解析完毕（runModel）。runner 只做"非空就拼参数"，
+	// 一律不读 Profile.Model（见 AgentRunRequest.Model）。
+	Model string
 	// MCP 注入（本地/WSL 用 MCPConfigPath；SSH 用 MCPConfigJSON 在远端落盘）。
 	MCPConfigPath string
 	MCPConfigJSON string
@@ -114,8 +118,15 @@ type AgentRunRequest struct {
 	// AgentID identifies which CLI ("claude-code" or "codex") this run targets.
 	// SSH runners consult it to dispatch to the correct remote command.
 	AgentID string
-	// Profile resolves model/baseUrl/managed-key injection for this run.
+	// Profile resolves baseUrl/managed-key injection for this run (and is the
+	// fallback source of the model, already folded into Model below).
 	Profile *AgentRuntimeProfile
+	// Model 是本次运行实际要使用的模型（会话覆盖 > 档案模型 > 空串=CLI 默认），
+	// 由控制服务在构造请求时解析完毕（runModel）。runner 只做"非空就拼参数"，
+	// 一律不读 Profile.Model——模型只有一个来源，避免两处取值分叉。
+	// 构造处必须显式传：忘了传不会报错，只会静默退化成 CLI 默认模型，
+	// 所以 TestEveryRunRequestSetsModel 会扫描源码把这种遗漏变成测试失败。
+	Model string
 	// SkipSessionID 让一次性 Run 不带 --session-id/--resume。会话无关的只读分析
 	//（投递式扫描）需要它：规划模式的 Claude 在带 --session-id 的一次性 -p 调用下
 	// 会进入"待命"而非执行，导致扫描收到 "I'll wait for your request"。
@@ -164,35 +175,6 @@ type claudeCLIRunner struct {
 	// approvalHookOverride 允许跨端 runner（如 wslAgentRunner）注入自定义审批 hook
 	// 命令字符串。nil 时走默认（本机 NativeApprovalHook / sh 逻辑）。
 	approvalHookOverride func() string
-	// bareProbeOnce/bareProbeAvailable 缓存「CLI 是否已提供 --bare」的探测结果。
-	// 探测要拉起一次 `claude --help`，故每个 runner 只做一次（见 BareFlagAvailable）。
-	bareProbeOnce      sync.Once
-	bareProbeAvailable bool
-}
-
-// bareFlagReporter 是可选能力：runner 能报告其 CLI 是否已提供 `--bare`。
-//
-// 上游计划把 `--bare` 设为 `-p` 的默认行为，届时不再自动发现 skills / 项目资产，而
-// Milevia 依赖该自动发现（docs/34 §13）。这里只做「探测 + 告警」，不改变调用参数。
-type bareFlagReporter interface {
-	BareFlagAvailable(ctx context.Context) bool
-}
-
-// BareFlagAvailable 报告 CLI 的帮助里是否出现 `--bare`。结果缓存一次。
-func (r *claudeCLIRunner) BareFlagAvailable(parent context.Context) bool {
-	r.bareProbeOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(parent, 8*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, r.config.ClaudePath, "--help")
-		configureProcessGroup(cmd)
-		out, err := cmd.CombinedOutput()
-		if err != nil && len(out) == 0 {
-			// 探测不出来就当没有，避免误报。
-			return
-		}
-		r.bareProbeAvailable = strings.Contains(string(out), "--bare")
-	})
-	return r.bareProbeAvailable
 }
 
 type claudeCLISession struct {
@@ -702,8 +684,8 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	} else {
 		args = append(args, "--session-id", request.SessionID)
 	}
-	if request.Profile != nil && request.Profile.Model != "" {
-		args = append(args, "--model", request.Profile.Model)
+	if request.Model != "" {
+		args = append(args, "--model", request.Model)
 	}
 	if len(request.OutputSchema) > 0 {
 		if !json.Valid(request.OutputSchema) {
@@ -734,8 +716,8 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 	} else {
 		args = append(args, "--session-id", request.SessionID)
 	}
-	if request.Profile != nil && request.Profile.Model != "" {
-		args = append(args, "--model", request.Profile.Model)
+	if request.Model != "" {
+		args = append(args, "--model", request.Model)
 	}
 	return args, nil
 }

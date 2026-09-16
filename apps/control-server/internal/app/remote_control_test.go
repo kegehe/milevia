@@ -299,6 +299,77 @@ func TestRemoteSnapshotIsBoundedToCurrentConversation(t *testing.T) {
 	}
 }
 
+// 手机端「＋」面板要与电脑端左侧快捷栏同源，快照就必须把快捷方式库发下去。这条测试固定四件事：
+// ① 库挂在**顶层**（一份数据被多个项目共用，复制到每个项目里会出现"同一份数据两个版本"）；
+// ② 绑定关系随 projectIds 一起下发（手机端据此按项目过滤）；
+// ③ 排序与 listShortcuts 一致（置顶 → sort_order → name），否则两端顺序不同；
+// ④ 超长模板按 remoteSnapshotShortcutTemplateLimit 截断（一条超长提示词会撑大每一个快照）。
+func TestRemoteSnapshotCarriesShortcutLibrary(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('shortcut-project','P',?,'local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatal(err)
+	}
+	insertShortcut := func(id, name, kind, template, scope string, pinned, enabled, sortOrder int) {
+		if _, err := server.db.Exec(`insert into shortcuts (id,name,description,kind,template,scope,default_action,group_name,pinned,enabled,sort_order,created_at,updated_at) values (?,?,'',?,?,?,  'fill','',?,?,?,?,?)`,
+			id, name, kind, template, scope, pinned, enabled, sortOrder, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertShortcut("s-later", "后添加的提示词", "prompt", "模板", "local", 0, 1, 20)
+	insertShortcut("s-pinned", "置顶提示词", "prompt", "模板", "local", 1, 1, 30)
+	insertShortcut("s-project", "项目提示词", "command_request", "npm test", "project", 0, 1, 10)
+	insertShortcut("s-long", "超长提示词", "prompt", strings.Repeat("x", remoteSnapshotShortcutTemplateLimit+500), "local", 0, 1, 40)
+	if _, err := server.db.Exec(`insert into shortcut_projects (shortcut_id,project_id) values ('s-project','shortcut-project')`); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.remoteSnapshot(response, httptest.NewRequest(http.MethodGet, "/api/remote/snapshot", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var snapshot remoteSnapshot
+	if err := json.Unmarshal(response.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Shortcuts) != 4 {
+		t.Fatalf("shortcuts=%d want 4 (%+v)", len(snapshot.Shortcuts), snapshot.Shortcuts)
+	}
+	// 顺序必须与桌面端 listShortcuts 的 `order by s.sort_order,s.name` 完全一致 —— 不提升 pinned。
+	// 这条用例就是为此存在的：曾经这里多写了一个 `pinned desc`（并配上一句"对齐桌面端置顶语义"
+	// 的错注释），当时只有"置顶恒在最前"这个错误期望能测出来。
+	order := make([]string, 0, len(snapshot.Shortcuts))
+	byID := map[string]remoteSnapshotShortcut{}
+	for _, shortcut := range snapshot.Shortcuts {
+		order = append(order, shortcut.ID)
+		byID[shortcut.ID] = shortcut
+	}
+	// s-project(10) < s-later(20) < s-pinned(30) < s-long(40)；s-pinned 虽然 pinned=1 也不能提前。
+	if got := strings.Join(order, ","); got != "s-project,s-later,s-pinned,s-long" {
+		t.Fatalf("order=%s want s-project,s-later,s-pinned,s-long（pinned 不得提升）", got)
+	}
+	// 绑定关系：只有 s-project 绑了项目，其余发空数组（不是 null —— 手机端会直接 .includes）。
+	if got := strings.Join(byID["s-project"].ProjectIDs, ","); got != "shortcut-project" {
+		t.Fatalf("s-project projectIds=%q", got)
+	}
+	for _, id := range []string{"s-pinned", "s-later", "s-long"} {
+		if byID[id].ProjectIDs == nil || len(byID[id].ProjectIDs) != 0 {
+			t.Fatalf("%s projectIds=%v want empty slice", id, byID[id].ProjectIDs)
+		}
+	}
+	if len(byID["s-long"].Template) != remoteSnapshotShortcutTemplateLimit {
+		t.Fatalf("long template length=%d want %d", len(byID["s-long"].Template), remoteSnapshotShortcutTemplateLimit)
+	}
+	// 每个项目都要带上技能数组（哪怕是空的）：手机端读 project.skills 渲染技能组，
+	// 字段缺失会让"没有技能"与"这个字段还不存在"两种状态在客户端无法区分。
+	for index := range snapshot.Projects {
+		if snapshot.Projects[index].Skills == nil {
+			t.Fatalf("project %s skills is nil", snapshot.Projects[index].ID)
+		}
+	}
+}
+
 func TestRemoteCommandIdempotencyConflict(t *testing.T) {
 	db := newRemoteTestDB(t)
 	defer db.Close()

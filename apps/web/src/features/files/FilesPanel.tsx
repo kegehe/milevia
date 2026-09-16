@@ -4,7 +4,7 @@ import { FileViewer } from "./FileViewer";
 import { FileEditor } from "./FileEditor";
 import { FileTabs } from "./FileTabs";
 import type { FileContent, FileInfo, OpenFile } from "./file-model";
-import { detectLanguage, isEditableFile } from "./file-model";
+import { detectLanguage, getDirPath, isEditableFile } from "./file-model";
 import { getPreviewKind, isTextPreview } from "./source-language";
 import { FileIcon } from "./FileIcon";
 import { useCodeFontSize } from "./useCodeFontSize";
@@ -53,7 +53,12 @@ export function FilesPanel({
   onInitialPathConsumed,
 }: FilesPanelProps) {
 	const workspaceQuery = conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : "";
-	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${workspaceQuery}`;
+	// 记忆化：它被三个提交回调写在依赖里，每次渲染都换新函数会让那三个回调白重建，
+	// 也让「依赖列表」失去意义（submitDelete 曾经因此漏了它）。
+	const withWorkspace = useCallback(
+		(path: string) => `${path}${path.includes("?") ? "&" : "?"}${workspaceQuery}`,
+		[workspaceQuery]
+	);
   const { fontSize, increase, decrease, canIncrease, canDecrease } = useCodeFontSize();
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
@@ -77,11 +82,16 @@ export function FilesPanel({
   const [isSaving, setIsSaving] = useState(false);
   const [pendingDiscard, setPendingDiscard] = useState<{ files: OpenFile[]; proceed: () => void } | null>(null);
   const [mobileView, setMobileView] = useState<"tree" | "editor">("tree");
-  const treeRefreshRef = useRef<(() => void) | null>(null);
+  // 刷新文件树：只重新拉取发生变化的目录，避免整棵树折叠、丢失滚动位置
+  const treeRefreshRef = useRef<((dirPath?: string, preferPath?: string) => void) | null>(null);
   const dialogRef = useRef<HTMLElement | null>(null);
   const dialogOpenerRef = useRef<HTMLElement | null>(null);
   const pendingOpens = useRef<Set<string>>(new Set());
   const savingRef = useRef(false);
+  // 删除确认的「删除」按钮是默认焦点（回车即确认），且弹窗在请求返回前不会关闭；
+  // 双击、连按回车都会再触发一次 submitDelete，这里用 ref 做同步的防重复提交
+  // （与上面的 savingRef 同一套路）。
+  const deleteInFlightRef = useRef(false);
 
   // 用 ref 跟踪 openFiles 最新值，避免陈旧闭包问题
   const openFilesRef = useRef(openFiles);
@@ -91,7 +101,7 @@ export function FilesPanel({
 
   const readOnly = isWorkspaceOccupied;
   const activeFile = openFiles.find((f) => f.path === activeFilePath) || null;
-  const activeDialog = showNewFileDialog ? "create" : showRenameDialog ? "rename" : showDeleteConfirm ? "delete" : null;
+  const activeDialog = showNewFileDialog ? "create" : showRenameDialog ? "rename" : showDeleteConfirm ? "delete" : pendingDiscard ? "discard" : null;
 
   const requestDiscard = useCallback((files: OpenFile[], proceed: () => void) => {
     const dirtyFiles = files.filter((file) => file.isDirty);
@@ -127,6 +137,8 @@ export function FilesPanel({
     setShowNewFileDialog(null);
     setShowRenameDialog(null);
     setShowDeleteConfirm(null);
+    // ESC / 点遮罩 = 取消放弃，用户的未保存编辑照旧留着
+    setPendingDiscard(null);
   }, []);
 
   useEffect(() => {
@@ -136,7 +148,17 @@ export function FilesPanel({
     }
     const dialog = dialogRef.current;
     const focusableSelector = 'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])';
-    const focusFirst = () => dialog?.querySelector<HTMLElement>("input:not(:disabled), button:not(:disabled)")?.focus();
+    // 默认焦点的优先级：显式标记 data-autofocus（删除确认里的「删除」按钮，回车即确认）
+    // → 输入框（新建 / 重命名弹窗，回车即提交）→ 第一个可聚焦按钮。
+    // 顺序不能省：右上角关闭按钮在 DOM 里排在输入框前面，若直接用 "input, button"
+    // 会按文档序命中「x」，默认焦点被抢走，回车就变成了取消。
+    const focusFirst = () => {
+      const target =
+        dialog?.querySelector<HTMLElement>("[data-autofocus]:not(:disabled)") ??
+        dialog?.querySelector<HTMLElement>("input:not(:disabled)") ??
+        dialog?.querySelector<HTMLElement>("button:not(:disabled)");
+      target?.focus();
+    };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); closeActiveDialog(); return; }
       if (event.key !== "Tab" || !dialog) return;
@@ -151,8 +173,14 @@ export function FilesPanel({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      dialogOpenerRef.current?.focus();
+      // 焦点归还必须延后一帧。回车按下时浏览器对该次 keydown 的默认动作（激活「当时
+      // 获得焦点」的元素）发生在监听器与微任务之后：若在这里同步把焦点还给触发按钮，
+      // 紧接着的默认动作就会再点它一次——表现为回车提交后弹窗刚关又被重新打开。
+      const opener = dialogOpenerRef.current;
       dialogOpenerRef.current = null;
+      requestAnimationFrame(() => {
+        if (opener?.isConnected) opener.focus();
+      });
     };
   }, [activeDialog, closeActiveDialog]);
 
@@ -456,7 +484,7 @@ export function FilesPanel({
         });
       }
       setShowNewFileDialog(null);
-      treeRefreshRef.current?.();
+      treeRefreshRef.current?.(showNewFileDialog.dirPath);
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建失败");
     }
@@ -503,7 +531,8 @@ export function FilesPanel({
       setActiveFilePath((path) => (path ? remapPath(path, oldPath, newPath) : null));
       setEditingFile((path) => (path ? remapPath(path, oldPath, newPath) : null));
       setShowRenameDialog(null);
-      treeRefreshRef.current?.();
+      // 第二个参数：如果焦点原本在被改名的条目上，让它落到改名后的新路径上
+      treeRefreshRef.current?.(getDirPath(newPath), newPath);
     } catch (err) {
       setError(err instanceof Error ? err.message : "重命名失败");
     }
@@ -516,7 +545,8 @@ export function FilesPanel({
   }, []);
 
   const submitDelete = useCallback(async () => {
-    if (!showDeleteConfirm) return;
+    if (!showDeleteConfirm || deleteInFlightRef.current) return;
+    deleteInFlightRef.current = true;
     try {
       await request(
         withWorkspace(`/api/projects/${projectId}/fs/remove?path=${encodeURIComponent(showDeleteConfirm.path)}`),
@@ -531,11 +561,13 @@ export function FilesPanel({
         path && isPathAtOrBelow(path, removedPath) ? null : path
       );
       setShowDeleteConfirm(null);
-      treeRefreshRef.current?.();
+      treeRefreshRef.current?.(getDirPath(removedPath));
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败");
+    } finally {
+      deleteInFlightRef.current = false;
     }
-  }, [showDeleteConfirm, projectId, request]);
+  }, [showDeleteConfirm, projectId, request, withWorkspace]);
 
   // 自动清除错误
   useEffect(() => {
@@ -647,14 +679,16 @@ export function FilesPanel({
         </div>
       </div>
 
-      {/* 新建文件/目录对话框 */}
+      {/* 放弃未保存的更改（关标签 / 关闭全部 / 导航守卫都会走到这里） */}
       {pendingDiscard && (
-        <div className="files-dialog-backdrop" role="presentation">
-          <section className="files-dialog" role="dialog" aria-modal="true" aria-labelledby="discard-unsaved-title">
+        <div className="files-dialog-backdrop" onClick={closeActiveDialog} role="presentation">
+          <section ref={dialogRef} className="files-dialog" role="dialog" aria-modal="true" aria-labelledby="discard-unsaved-title" onClick={(e) => e.stopPropagation()}>
             <header><h3 id="discard-unsaved-title">放弃未保存的更改？</h3></header>
             <p>以下文件有未保存的编辑：{pendingDiscard.files.map((file) => file.name).join("、")}。继续操作将丢失这些更改。</p>
             <div className="files-dialog-actions">
-              <button type="button" onClick={() => setPendingDiscard(null)}>取消</button>
+              {/* 默认焦点给「取消」而不是破坏性的「放弃更改」：这个弹窗可能由回车/导航触发，
+                  误按回车不能直接丢掉用户没保存的编辑。 */}
+              <button type="button" data-autofocus onClick={closeActiveDialog}>取消</button>
               <button type="button" className="primary danger" onClick={() => { const action = pendingDiscard.proceed; setPendingDiscard(null); action(); }}>放弃更改</button>
             </div>
           </section>
@@ -717,7 +751,7 @@ export function FilesPanel({
               {showDeleteConfirm.isDir ? " 及其所有内容" : ""}吗？此操作不可撤销。
             </p>
             <div className="files-dialog-actions">
-              <button type="button" className="danger" onClick={submitDelete}>
+              <button type="button" className="danger" data-autofocus onClick={submitDelete}>
                 删除
               </button>
               <button type="button" onClick={closeActiveDialog}>取消</button>

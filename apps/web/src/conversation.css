@@ -428,6 +428,12 @@
 .history-item em { flex: none; color: #758198; font-size: 11px; font-style: normal; }
 .history-item.active em { color: #277566; }
 .history-empty { margin: 0; padding: 30px 8px; color: #758198; text-align: center; font-size: 13px; }
+/* 加载中的空列表：换措辞 + 减弱对比 + 呼吸。别让"还在请求"看起来像"一条记录都没有"。 */
+.history-loading { color: #93a1b0; animation: history-loading-pulse 1.4s ease-in-out infinite; }
+@keyframes history-loading-pulse { 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { .history-loading { animation: none; } }
+/* 请求失败的空列表：同样不能写成"没有匹配的会话"——失败意味着我们并不知道有没有。 */
+.history-error { color: #c45034; }
 .conversation-history footer small { color: #758198; font-size: 12px; }
 
 /* ---- 快捷方式编辑器 ------------------------------------------------------- */
@@ -466,6 +472,51 @@
 }
 .shortcut-editor .danger-text:hover:not(:disabled) { border-color: #ca5a3e; color: #8b3020; background: #fde8e3; }
 .shortcut-editor .danger-text:disabled { opacity: .45; }
+
+/* ---- 命令选择器（docs/37）------------------------------------------------- */
+/* 命令类的默认入口：从 CLI 真实可用的命令里选。列表有自己的滚动区，避免把弹窗撑高。 */
+.command-picker-modes { display: flex; gap: 6px; border: 1px solid #d8e7de; border-radius: 8px; padding: 3px; background: #f4f9f6; }
+.command-picker-modes button { flex: 1; border: 1px solid transparent; border-radius: 6px; padding: 7px 10px; color: #557365; background: transparent; font-size: 12px; font-weight: 750; transition: color .16s ease, background .16s ease, border-color .16s ease; }
+.command-picker-modes button:hover:not(:disabled) { color: #1f5a4a; background: #e6f3ea; }
+.command-picker-modes button.active { border-color: #a9cfbb; color: #1b5646; background: #fff; box-shadow: 0 1px 3px #17362c14; }
+.command-picker-modes button:disabled { color: #9aaea4; cursor: not-allowed; }
+.command-picker { display: grid; gap: 8px; }
+.command-picker-hint { margin: 0; color: #6d8378; font-size: 12px; line-height: 1.5; }
+.command-picker-search { width: 100%; }
+.command-picker-list { display: grid; max-height: 264px; gap: 10px; overflow-y: auto; border: 1px solid #dce9e1; border-radius: 8px; padding: 8px; background: #fbfefc; }
+.command-picker-empty { margin: 0; padding: 12px 4px; color: #7d9188; font-size: 12px; text-align: center; }
+.command-picker-group { display: grid; gap: 5px; }
+.command-picker-group-title { margin: 0; color: #6d8378; font: 800 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; text-transform: uppercase; }
+.command-picker-item { display: grid; gap: 2px; border: 1px solid #d3e4da; border-radius: 7px; padding: 8px 10px; color: #22483d; background: #fff; text-align: left; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
+.command-picker-item:hover { border-color: #8fbcaa; background: #f2faf5; transform: translateX(2px); }
+.command-picker-item.selected { border-color: #46977f; background: #eef8f2; box-shadow: inset 0 0 0 1px #83baa766; }
+.command-picker-name { display: flex; align-items: baseline; gap: 6px; color: #1c5345; font: 800 12px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.command-picker-name code { color: #6f8a7e; font-size: 11px; font-weight: 700; }
+.command-picker-label { color: #2c5b4d; font-size: 12px; font-weight: 750; }
+.command-picker-flag { margin-left: 6px; border: 1px solid #e3d2bd; border-radius: 4px; padding: 0 4px; color: #9a7050; font-size: 10px; font-style: normal; font-weight: 700; }
+.command-picker-desc { color: #758c81; font-size: 11px; line-height: 1.45; }
+.command-picker-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.command-picker-chosen { color: #46695d; font-size: 12px; }
+.command-picker-chosen code { color: #1c5345; font-weight: 800; }
+
+/* 命令标签上的失效/不可用标记：! 徽标 + 颜色，具体原因在 title 里说明。
+   带标记的标签要把按钮改成 flex 行，否则 .quick-tag-text 是块级元素，徽标会另起一行
+   把标签撑高。 */
+.quick-tag-warn { flex: none; align-self: center; padding-right: 3px; color: #b4703a; font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.quick-tag.stale > button:first-child,
+.quick-tag.blocked > button:first-child { display: flex; align-items: center; gap: 5px; }
+.quick-tag.stale > button:first-child .quick-tag-text,
+.quick-tag.blocked > button:first-child .quick-tag-text { min-width: 0; flex: 1; }
+.quick-tag.stale > button:first-child { border-color: #e5c9a4; color: #8a6338; background: #fdf7ee; }
+.quick-tag.blocked > button:first-child { border-style: dashed; color: #93a49b; background: #f4f6f4; }
+.quick-tag.blocked .quick-tag-warn { color: #8f9c95; }
+.quick-tag.blocked .quick-tag-warn { color: #8f9c95; }
+
+/* 输入框里的斜杠命令提示：只提示、不阻断（目录有 TTL，硬拦会误伤刚建的命令）。 */
+.composer-slash-hint { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 6px; padding: 6px 10px; border: 1px solid #ecdcbf; border-radius: 7px; color: #7d6234; background: #fdf9f0; font-size: 12px; line-height: 1.4; }
+.composer-slash-hint code { color: #8a5a1f; font-weight: 800; }
+.composer-slash-hint button { border: 1px solid #e0c9a0; border-radius: 6px; padding: 3px 8px; color: #6f4f1c; background: #fff; font-size: 12px; font-weight: 750; }
+.composer-slash-hint button:hover { border-color: #c9a86f; background: #fdf3e2; }
 
 /* ---- 新会话工具选择 ------------------------------------------------------ */
 .new-conversation-backdrop { padding: 24px; background: rgb(19 38 31 / 46%); backdrop-filter: blur(3px); }
@@ -1113,6 +1164,25 @@
   flex: 1;
   overflow: auto;
 }
+/* 工作区面板错误边界：子面板渲染抛错时只替换该面板（尺寸与滚动行为对齐上面的
+   .workspace-tab-panel），而不是白掉整页。 */
+.workspace-content > .workspace-panel-error {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  overflow: auto;
+  padding: 40px 24px;
+  color: #4c5a6b;
+  text-align: center;
+}
+.workspace-panel-error-icon { width: 28px; height: 28px; fill: none; stroke: #d4523e; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.workspace-panel-error b { color: #202a36; font-size: 14px; }
+.workspace-panel-error p { margin: 0; font-size: 13px; line-height: 1.55; }
+.workspace-panel-error pre { box-sizing: border-box; max-width: min(680px, 100%); margin: 0; border: 1px solid #ecd6d0; border-radius: 7px; padding: 10px 12px; color: #8a4a38; background: #fdf6f3; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: left; white-space: pre-wrap; word-break: break-word; }
+.workspace-panel-error .secondary { margin-top: 2px; }
 
 /* 对话画布：快捷操作、对话内容和任务队列三栏独立滚动。 */
 .conversation-tab-strip {
@@ -2098,6 +2168,93 @@
   transition: border-color .16s ease, color .16s ease, background .16s ease;
 }
 .composer-usage .usage-trigger:hover { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
+/* 底部模型选择器：触发按钮沿用原"模型文本"的位置与观感，只是变成可点。 */
+.composer-usage .composer-model-trigger {
+  display: inline-flex;
+  max-width: 168px;
+  min-height: 27px;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 4px 7px;
+  color: #416b5e;
+  background: transparent;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.composer-usage .composer-model-trigger:hover:not(:disabled),
+.composer-usage .composer-model-trigger.open { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
+.composer-usage .composer-model-trigger:disabled { cursor: default; opacity: .68; }
+.composer-usage .composer-model-trigger.busy { opacity: .55; }
+.composer-model-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-model-caret {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 4px solid currentColor;
+  opacity: .7;
+}
+/* 弹层走 portal + fixed 定位（见 ComposerModelPicker），因此这里只负责外观。 */
+.model-menu {
+  position: fixed;
+  z-index: 80;
+  display: flex;
+  max-height: min(420px, 62vh);
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  border: 1px solid #c9ddd3;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fbfefb;
+  box-shadow: 7px 7px 0 #d8e8de;
+}
+.model-menu header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.model-menu header label { display: block; color: #7a9187; font-size: 9px; font-weight: 750; letter-spacing: .08em; }
+.model-menu header b { color: #19332c; font-size: 12px; }
+.model-menu-close { border: 0; padding: 0 2px; color: #7a9187; background: transparent; font-size: 15px; line-height: 1; cursor: pointer; }
+.model-menu-close:hover { color: #19332c; }
+.model-menu-list { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.model-menu-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: #416b5e;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.model-menu-item:hover:not(:disabled) { background: #eef7f1; }
+.model-menu-item.selected { border-color: #9fc9b7; background: #eaf7ef; }
+.model-menu-item:disabled { cursor: default; opacity: .6; }
+.model-menu-item > span { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.model-menu-item b { color: #19332c; font-size: 12px; font-weight: 750; }
+.model-menu-item small { overflow: hidden; color: #7a9187; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.model-menu-alias { margin-left: 5px; border-radius: 4px; padding: 1px 4px; color: #416b5e; background: #e2f0e8; font-size: 9px; font-style: normal; font-weight: 750; }
+.model-menu-loading,
+.model-menu-empty { margin: 0; padding: 6px 2px; color: #7a9187; font-size: 11px; }
+.model-menu-custom { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid #e2efe7; padding-top: 7px; }
+.model-menu-custom label { color: #597268; font-size: 10px; font-weight: 750; }
+.model-menu-custom > div { display: flex; gap: 6px; }
+.model-menu-custom input { min-width: 0; flex: 1; border: 1px solid #c5dcd0; border-radius: 5px; padding: 5px 7px; color: #19332c; background: #fff; font-size: 11px; }
+.model-menu-custom input:focus { border-color: #7fae9d; outline: none; }
+.model-menu-custom button { min-height: 28px; border: 1px solid #1f6055; border-radius: 5px; padding: 4px 10px; color: #fff; background: #1f6055; font-size: 11px; font-weight: 750; cursor: pointer; }
+.model-menu-custom button:disabled { cursor: default; opacity: .45; }
+.model-menu-current { margin: 0; color: #597268; font-size: 10px; }
+.model-menu-current b { color: #19332c; }
+.model-menu-note { margin: 0; color: #7a9187; font-size: 10px; line-height: 1.5; }
+.model-menu-hint { margin: 0; border-top: 1px solid #e2efe7; padding-top: 6px; color: #8ba398; font-size: 10px; line-height: 1.5; }
 .composer-actions {
   display: inline-flex;
   flex: none;
@@ -3311,6 +3468,19 @@
 }
 
 /* 移动端将快捷方式从页面固定区收进输入框的展开面板，避免首屏被操作项挤占。 */
+/* 已引用的技能：一颗可删除的胶囊，坐在输入框上方。
+   点技能**不再**把「技能名 + 描述」整段铺进 textarea —— 技能描述动辄上百字，会把草稿顶满三行，
+   而 setComposerText 是整体覆盖，用户写到一半的内容会被无声吃掉。现在正文留给用户自己写，
+   发送那一刻才在 composeSkillMessage 里展开成完整引用指令。 */
+.composer-skill-refs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+.composer-skill-ref { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; border: 1px solid #b3d9cb; border-radius: 999px; background: #eef7f2; padding-left: 9px; }
+.composer-skill-ref-name { display: inline-flex; min-width: 0; align-items: center; gap: 5px; padding: 4px 0; color: #1f6b57; font-size: 12px; font-weight: 700; }
+.composer-skill-ref-name svg { flex: none; width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-linejoin: round; stroke-width: 2; }
+.composer-skill-ref-name > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-skill-ref-remove { flex: none; border: 0; border-radius: 999px; padding: 0 8px 1px; color: #5c8477; background: transparent; font-size: 14px; line-height: 1.6; }
+.composer-skill-ref-remove:hover:not(:disabled) { color: #fff; background: #2c7567; }
+.composer-skill-ref-remove:disabled { color: #9db3a9; }
+.composer-skill-ref-hint { color: #7d968b; font-size: 11px; }
 .composer-input-area { position: relative; }
 .composer-mobile-shortcut-toggle,
 .mobile-shortcut-menu { display: none; }

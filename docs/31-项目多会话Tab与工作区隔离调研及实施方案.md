@@ -143,7 +143,8 @@ Claude 的流式 Session 是常驻进程。多会话后，不能因为用户曾�
 - Tab 关闭不停止运行中的 Run；Run 结束后的 Session 可进入空闲状态。
 - 空闲 TTL 默认 30 分钟、每 Runner 默认最多 4 个常驻 Session；可分别由 `AUTO_CONVERSATION_SESSION_IDLE_TTL` 与 `AUTO_CONVERSATION_SESSIONS_PER_RUNNER` 配置。扫描间隔为 TTL 的四分之一，最短 1 秒、最长 1 分钟。
 - 达到上限时，先驱逐无运行、无审批、无队列的最久未使用 Session。驱逐时先标记 `stopping`，异步停止进程，并仅由既有 watcher 在 `Done` 后移除内存记录。
-- 正在停止的 Session 仍占用容量；在 watcher 移除前，新建 Session 返回可重试的 409，不能连接到即将退出的旧进程，也不会继续级联驱逐健康 Session。
+- 空闲、无 Run、无审批的 Session 被标记 `stopping` 后，watcher 最多再等 `AUTO_CONVERSATION_SESSION_EXIT_GRACE`（默认 60 秒）等它真正退出；超时即释放该 Session（其 Run 按 stopped 结算、工作区租约随之释放），并打一行日志。这道上限是必须的：Windows 上唯一能保证原生进程退出的手段是 `TerminateProcess`，而曾用的 `taskkill` 在被超时掐断时会静默失败（实测本机 taskkill 连"查一个不存在的 PID"都要 30 秒以上），进程不退则 `Done` 永不触发，该会话会永久返回 409「会话正在停止，请稍后再试。」，只能靠重启控制服务恢复。进程树回收同样不依赖 `taskkill`：用 Toolhelp 快照枚举后代再逐个 `TerminateProcess`（见 `process_windows.go`）。
+- 正在停止的 Session 仍占用容量；在 watcher 移除前，新建 Session 返回可重试的 409，不能连接到即将退出的旧进程，也不会继续级联驱逐健康 Session。该 409 的每次拒绝都会记录会话已停止多久，便于区分"正常退役的几秒"与"卡住不退"。
 - 修改空闲会话的权限模式时，先标记并停止旧 Session；watcher 确认退出前不写入新权限并返回可重试的 409，下一次发送将以新权限启动进程。
 - 撤销 Agent profile revision 时，停止所有绑定该 revision 的原生 Session（包括没有活动 Run 的 Session），并取消关联中的 Run；Session 退出前不会再次接受该 revision 的新 Turn。
 - 每个原生 Session 保存启动配置指纹（Runner、Agent、工作目录、权限和 profile revision）。新 Turn 发现指纹不一致时，只回收无运行、无审批、无队列的旧进程；运行中 Session 返回明确冲突，必须先按既有 Run 生命周期停止后重试。

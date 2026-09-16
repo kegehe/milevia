@@ -22,6 +22,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
@@ -1004,9 +1005,12 @@ func TestListProjectsChecksCodexOnce(t *testing.T) {
 	codex := &countingReadyRunner{ready: true}
 	server.codexRunner = codex
 	now := time.Now().UTC()
+	// 用服务端本机 runner：本机 codex 就绪是 exec.LookPath 级廉价探测，可以在列表接口
+	// 同步求值，但整个列表只应求值一次（远端/跨端探测已拆到 availability 接口）。
+	localRunner := server.localRunnerID()
 	for index := 0; index < 3; index++ {
 		projectID := fmt.Sprintf("project-%d", index)
-		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, filepath.Join(server.config.AllowedRoot, projectID), "wsl-local", "main", 0, now); err != nil {
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, filepath.Join(server.config.AllowedRoot, projectID), localRunner, "main", 0, now); err != nil {
 			t.Fatalf("insert project %d: %v", index, err)
 		}
 	}
@@ -1020,14 +1024,126 @@ func TestListProjectsChecksCodexOnce(t *testing.T) {
 	}
 }
 
-func TestListProjectsReleasesSQLiteConnectionBeforeReadinessCheck(t *testing.T) {
+// TestProjectAvailabilityChecksCodexOnce 是连通性探测接口的去重回归：多个项目共享
+// 同一个本机 runner 时只探一次 codex 就绪。
+func TestProjectAvailabilityChecksCodexOnce(t *testing.T) {
 	server := newTestServer(t)
-	codex := &admissionBlockingRunner{readyStarted: make(chan struct{}), releaseReady: make(chan struct{})}
+	codex := &countingReadyRunner{ready: true}
 	server.codexRunner = codex
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'windows-local','main',0,?)`, server.config.AllowedRoot, now); err != nil {
-		t.Fatalf("insert project: %v", err)
+	localRunner := server.localRunnerID()
+	for index := 0; index < 3; index++ {
+		projectID := fmt.Sprintf("project-%d", index)
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`, projectID, projectID, filepath.Join(server.config.AllowedRoot, projectID), localRunner, "main", 0, now); err != nil {
+			t.Fatalf("insert project %d: %v", index, err)
+		}
 	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/availability", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("availability status=%d body=%s", response.Code, response.Body.String())
+	}
+	if codex.calls != 1 {
+		t.Fatalf("Codex readiness checks=%d, want 1", codex.calls)
+	}
+}
+
+// TestProjectListingEndpointsReleaseSQLiteConnectionBeforeReadinessCheck 回归：两个
+// 列表相关接口都必须先读完并释放 SQLite 连接，再做耗时就绪探测——否则一次慢探测会
+// 把共享连接占住，拖垮整个服务。
+func TestProjectListingEndpointsReleaseSQLiteConnectionBeforeReadinessCheck(t *testing.T) {
+	for _, endpoint := range []string{"/api/projects", "/api/projects/availability"} {
+		t.Run(endpoint, func(t *testing.T) {
+			server := newTestServer(t)
+			codex := &admissionBlockingRunner{readyStarted: make(chan struct{}), releaseReady: make(chan struct{})}
+			server.codexRunner = codex
+			now := time.Now().UTC()
+			if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',0,?)`, server.config.AllowedRoot, server.localRunnerID(), now); err != nil {
+				t.Fatalf("insert project: %v", err)
+			}
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, endpoint, nil))
+			}()
+			select {
+			case <-codex.readyStarted:
+			case <-time.After(time.Second):
+				t.Fatal("listing did not reach readiness check")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			var projectCount int
+			if err := server.db.QueryRowContext(ctx, `select count(*) from projects`).Scan(&projectCount); err != nil {
+				t.Fatalf("database query blocked by project readiness check: %v", err)
+			}
+			if projectCount != 1 {
+				t.Fatalf("project count=%d, want 1", projectCount)
+			}
+			close(codex.releaseReady)
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("listing did not complete")
+			}
+			if response.Code != http.StatusOK {
+				t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+// recordingCodexRunner 是实现了 CodexCapableRunner 的 SSH runner 测试替身，
+// 记录远端 codex 就绪探测被调用的次数。
+type recordingCodexRunner struct {
+	runnerFunc
+	ready bool
+	mu    sync.Mutex
+	calls int
+}
+
+func (runner *recordingCodexRunner) CodexReady(context.Context) bool {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	runner.calls++
+	return runner.ready
+}
+
+func (*recordingCodexRunner) CodexVersion(context.Context) string { return "0.146.0" }
+
+func (*recordingCodexRunner) CodexCheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+
+func (*recordingCodexRunner) CodexUpdate(context.Context) (string, string, error) {
+	return "", "", nil
+}
+
+func (runner *recordingCodexRunner) callCount() int {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return runner.calls
+}
+
+// TestListProjectsDoesNotProbeRemoteReadiness 是本次修复的核心回归：项目列表接口
+// 不再同步探测远端连通性——某台远端主机慢或离线时列表仍应立即返回，远端就绪度由
+// /api/projects/availability 按 runner 去重后单独提供。
+func TestListProjectsDoesNotProbeRemoteReadiness(t *testing.T) {
+	server := newTestServer(t)
+	remote := &recordingCodexRunner{
+		runnerFunc: runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }),
+		ready:      true,
+	}
+	server.runnerRegistry.register("ssh-remote", remote, RunnerMeta{ID: "ssh-remote", Name: "slow-host", Environment: "remote-linux"})
+	now := time.Now().UTC()
+	for index := 0; index < 2; index++ {
+		projectID := fmt.Sprintf("remote-project-%d", index)
+		if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,'ssh-remote','main',0,?)`, projectID, projectID, "/srv/apps/"+projectID, now); err != nil {
+			t.Fatalf("insert project %d: %v", index, err)
+		}
+	}
+
 	response := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -1035,27 +1151,56 @@ func TestListProjectsReleasesSQLiteConnectionBeforeReadinessCheck(t *testing.T) 
 		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects", nil))
 	}()
 	select {
-	case <-codex.readyStarted:
-	case <-time.After(time.Second):
-		t.Fatal("list projects did not reach readiness check")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	var projectCount int
-	if err := server.db.QueryRowContext(ctx, `select count(*) from projects`).Scan(&projectCount); err != nil {
-		t.Fatalf("database query blocked by project readiness check: %v", err)
-	}
-	if projectCount != 1 {
-		t.Fatalf("project count=%d, want 1", projectCount)
-	}
-	close(codex.releaseReady)
-	select {
 	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("list projects did not complete")
+	case <-time.After(2 * time.Second):
+		t.Fatal("list projects blocked on remote readiness probe")
 	}
 	if response.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+	}
+	if calls := remote.callCount(); calls != 0 {
+		t.Fatalf("list projects probed remote codex %d times, want 0", calls)
+	}
+	var projects []Project
+	if err := json.NewDecoder(response.Body).Decode(&projects); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(projects) != 2 {
+		t.Fatalf("projects=%d, want 2", len(projects))
+	}
+	for _, project := range projects {
+		if project.CodexReady || project.AgentReady {
+			t.Fatalf("list must not assume remote readiness without probing: %#v", project)
+		}
+	}
+
+	// 连通性探测独立发起：两个项目共享一条 SSH 连接，只探一次。
+	availability := httptest.NewRecorder()
+	server.routes().ServeHTTP(availability, httptest.NewRequest(http.MethodGet, "/api/projects/availability", nil))
+	if availability.Code != http.StatusOK {
+		t.Fatalf("availability status=%d body=%s", availability.Code, availability.Body.String())
+	}
+	var items []projectAvailabilityItem
+	if err := json.NewDecoder(availability.Body).Decode(&items); err != nil {
+		t.Fatalf("decode availability: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("availability items=%d, want 2", len(items))
+	}
+	for _, item := range items {
+		if !item.CodexReady || !item.AgentReady {
+			t.Fatalf("codex-capable ssh runner should report ready: %#v", item)
+		}
+	}
+	if calls := remote.callCount(); calls != 1 {
+		t.Fatalf("availability probed remote codex %d times, want 1 (deduped per runner)", calls)
+	}
+
+	// 短 TTL 内重复请求不再触碰远端（吸收 WS 事件抖动带来的重复刷新）。
+	repeat := httptest.NewRecorder()
+	server.routes().ServeHTTP(repeat, httptest.NewRequest(http.MethodGet, "/api/projects/availability", nil))
+	if calls := remote.callCount(); calls != 1 {
+		t.Fatalf("repeat availability probed remote codex %d times, want 1 (TTL cache)", calls)
 	}
 }
 
@@ -1377,18 +1522,18 @@ func (r defaultModelRunner) codexDefaultModel(context.Context) string { return r
 func TestSeedRunUsageModelForCodex(t *testing.T) {
 	server := newTestServer(t)
 	server.beginRunUsage("run", "conversation")
-	server.seedRunUsageModel("run", "claude-code", &AgentRuntimeProfile{Model: "ignored"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	server.seedRunUsageModel("run", "claude-code", "ignored", runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
 	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "" {
 		t.Fatalf("claude run should not be pre-seeded, got %#v", usage)
 	}
 
-	server.seedRunUsageModel("run", "codex", &AgentRuntimeProfile{Model: "gpt-profile"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	server.seedRunUsageModel("run", "codex", "gpt-profile", runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
 	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "gpt-profile" {
 		t.Fatalf("codex profile model was not seeded, got %#v", usage)
 	}
 
 	// 已有模型不能被再次 seed 覆盖（例如事件先到）。
-	server.seedRunUsageModel("run", "codex", &AgentRuntimeProfile{Model: "gpt-other"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	server.seedRunUsageModel("run", "codex", "gpt-other", runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
 	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "gpt-profile" {
 		t.Fatalf("seed overwrote an existing model, got %#v", usage)
 	}
@@ -1398,7 +1543,7 @@ func TestSeedRunUsageModelFallsBackToRunnerDefault(t *testing.T) {
 	server := newTestServer(t)
 	server.beginRunUsage("run", "conversation")
 	runner := defaultModelRunner{runnerFunc: runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }), model: "gpt-config"}
-	server.seedRunUsageModel("run", "codex", nil, runner)
+	server.seedRunUsageModel("run", "codex", "", runner)
 	if usage := server.liveRunUsage("run", "running"); usage == nil || usage.Model != "gpt-config" {
 		t.Fatalf("runner default model was not seeded, got %#v", usage)
 	}
@@ -1418,7 +1563,7 @@ func TestSeedRunUsageModelPersistsThroughUsageAPI(t *testing.T) {
 	}
 
 	server.beginRunUsage("run", "conversation")
-	server.seedRunUsageModel("run", "codex", &AgentRuntimeProfile{Model: "gpt-persisted"}, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
+	server.seedRunUsageModel("run", "codex", "gpt-persisted", runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }))
 	// Codex 的 turn.completed 事件只有用量、没有模型；seed 的模型必须保留下来。
 	server.collectUsageEvent("run", "conversation", "turn.completed", json.RawMessage(`{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":300,"output_tokens":80}}`))
 	if err := server.persistRunUsage("run", "completed"); err != nil {
@@ -4603,6 +4748,76 @@ func TestOrchestrationConfigSelectsAgent(t *testing.T) {
 	}
 }
 
+// TestOrchestrationConfigPersistsDevBranch guards the dev branch field of the
+// settings panel: saving must update the column of an existing row, not only
+// insert it, and an omitted or empty value must fall back to the default.
+func TestOrchestrationConfigPersistsDevBranch(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatal(err)
+	}
+	save := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPut, "/api/projects/project/orchestration/config", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, request)
+		return response
+	}
+	storedDevBranch := func() string {
+		t.Helper()
+		var branch string
+		if err := server.db.QueryRow(`select dev_branch from project_orchestration_configs where project_id='project'`).Scan(&branch); err != nil {
+			t.Fatalf("load stored dev branch: %v", err)
+		}
+		return branch
+	}
+	// A project that never saved a policy reports the schema default, otherwise
+	// the panel would round-trip an empty branch back into the first save.
+	cfg, err := server.orchestrationConfig(context.Background(), "project")
+	if err != nil || cfg.DevBranch != "dev" {
+		t.Fatalf("unsaved config dev branch=%q err=%v", cfg.DevBranch, err)
+	}
+	if response := save(`{"enabled":false,"mainBranch":"main","devBranch":"develop","agentId":"codex","verificationCommands":["true"],"maxFixRounds":3}`); response.Code != http.StatusOK {
+		t.Fatalf("create config: %d body=%s", response.Code, response.Body.String())
+	}
+	if branch := storedDevBranch(); branch != "develop" {
+		t.Fatalf("created dev branch=%q", branch)
+	}
+	// The dev branch is the regression: the update branch of the upsert used to
+	// drop it, so a later save never reached the column.
+	if response := save(`{"enabled":false,"mainBranch":"main","devBranch":"integration","agentId":"codex","verificationCommands":["true"],"maxFixRounds":3}`); response.Code != http.StatusOK {
+		t.Fatalf("update config: %d body=%s", response.Code, response.Body.String())
+	}
+	if branch := storedDevBranch(); branch != "integration" {
+		t.Fatalf("updated dev branch=%q", branch)
+	}
+	// The panel renders the value it loads back from the API, so the saved value
+	// must also survive the read path that feeds it, with the field name the web
+	// client decodes.
+	if loaded, err := server.orchestrationConfig(context.Background(), "project"); err != nil || loaded.DevBranch != "integration" {
+		t.Fatalf("reloaded dev branch=%q err=%v", loaded.DevBranch, err)
+	}
+	getConfig := httptest.NewRecorder()
+	server.routes().ServeHTTP(getConfig, httptest.NewRequest(http.MethodGet, "/api/projects/project/orchestration/config", nil))
+	if getConfig.Code != http.StatusOK || !strings.Contains(getConfig.Body.String(), `"devBranch":"integration"`) {
+		t.Fatalf("get config: %d body=%s", getConfig.Code, getConfig.Body.String())
+	}
+	if response := save(`{"enabled":false,"mainBranch":"main","agentId":"codex","verificationCommands":["true"],"maxFixRounds":3}`); response.Code != http.StatusOK {
+		t.Fatalf("save without dev branch: %d body=%s", response.Code, response.Body.String())
+	}
+	if branch := storedDevBranch(); branch != "dev" {
+		t.Fatalf("defaulted dev branch=%q", branch)
+	}
+	if response := save(`{"enabled":false,"mainBranch":"main","devBranch":"bad branch","agentId":"codex","verificationCommands":["true"],"maxFixRounds":3}`); response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid dev branch status=%d body=%s", response.Code, response.Body.String())
+	}
+	if branch := storedDevBranch(); branch != "dev" {
+		t.Fatalf("dev branch changed after a rejected save: %q", branch)
+	}
+}
+
 func TestOrchestrationConversationUsesConfiguredAgent(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC()
@@ -4621,6 +4836,75 @@ func TestOrchestrationConversationUsesConfiguredAgent(t *testing.T) {
 	}
 	if agentID != "codex" || permissionMode != "workspace_write" || isCurrent {
 		t.Fatalf("conversation agent=%q permission=%q isCurrent=%v", agentID, permissionMode, isCurrent)
+	}
+}
+
+// 长中文任务名不能按字节截断，否则会话列表里会出现半个多字节字符（乱码）。
+func TestOrchestrationConversationTitleTruncatesByRunes(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	project := Project{ID: "project", Name: "project", Path: t.TempDir(), Runner: server.localRunnerID(), GitBranch: "main", CreatedAt: now}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,1,?)`, project.ID, project.Name, project.Path, project.Runner, project.GitBranch, now); err != nil {
+		t.Fatal(err)
+	}
+	seq := 0
+	titleFor := func(taskTitle string) string {
+		t.Helper()
+		seq++
+		conversationID, err := server.createOrchestrationConversation(context.Background(), project, Task{ID: strconv.Itoa(seq), Title: taskTitle}, OrchestrationConfig{AgentID: "claude-code"})
+		if err != nil {
+			t.Fatalf("create orchestration conversation for %q: %v", taskTitle, err)
+		}
+		var title string
+		if err := server.db.QueryRow(`select title from conversations where id=?`, conversationID).Scan(&title); err != nil {
+			t.Fatal(err)
+		}
+		if !utf8.ValidString(title) {
+			t.Fatalf("title for %q is not valid UTF-8: %q", taskTitle, title)
+		}
+		return title
+	}
+	room := orchestrationConversationTitleLimit - utf8.RuneCountInString(orchestrationConversationTitlePrefix)
+	longTaskTitle := strings.Repeat("中文任务名", 40)
+	longTitle := titleFor(longTaskTitle)
+	if got := utf8.RuneCountInString(longTitle); got != orchestrationConversationTitleLimit {
+		t.Fatalf("long title has %d runes, want %d: %q", got, orchestrationConversationTitleLimit, longTitle)
+	}
+	// 截断后的标题必须是任务标题前 room 个字符的原样拼接，而不是其中任意位置被切开的字节。
+	if want := orchestrationConversationTitlePrefix + string([]rune(longTaskTitle)[:room]); longTitle != want {
+		t.Fatalf("long title = %q, want %q", longTitle, want)
+	}
+	if got := titleFor("修复登录超时"); got != orchestrationConversationTitlePrefix+"修复登录超时" {
+		t.Fatalf("short title = %q, want it preserved", got)
+	}
+}
+
+// rune 截断的边界行为：正好等于上限时原样返回，超限时按字符切。
+func TestTruncateRunes(t *testing.T) {
+	cases := []struct {
+		name, in string
+		limit    int
+		want     string
+	}{
+		{name: "under limit", in: "修复登录超时", limit: 80, want: "修复登录超时"},
+		{name: "exactly limit", in: "修复登录", limit: 4, want: "修复登录"},
+		{name: "over limit", in: "修复登录超时", limit: 4, want: "修复登录"},
+		{name: "never splits a rune", in: "修复登录超时", limit: 5, want: "修复登录超"},
+		{name: "counts runes not bytes", in: "a修b复c", limit: 3, want: "a修b"},
+		{name: "four byte rune", in: "修🚀复", limit: 2, want: "修🚀"},
+		{name: "ascii", in: "orchestrate", limit: 5, want: "orche"},
+		{name: "zero limit", in: "修复", limit: 0, want: ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := truncateRunes(testCase.in, testCase.limit)
+			if got != testCase.want {
+				t.Fatalf("truncateRunes(%q, %d) = %q, want %q", testCase.in, testCase.limit, got, testCase.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("truncateRunes(%q, %d) = %q is not valid UTF-8", testCase.in, testCase.limit, got)
+			}
+		})
 	}
 }
 
@@ -7054,6 +7338,168 @@ func TestArchiveOrchestrationBatchPreservesQueuedJobContext(t *testing.T) {
 	}
 }
 
+func TestCreateOrchestrationBatchTakesPolicyAndLeavesTasksForLater(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskA := createTaskForTest(t, server.routes(), projectID, "plan task A")
+	taskB := createTaskForTest(t, server.routes(), projectID, "plan task B")
+	// 新建只提交名称、上下文继承与执行配置：没有任务，也没有「启用自动队列」开关。
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"policy plan","conversationStrategy":"continue","mainBranch":"main","devBranch":"develop","agentId":"codex","maxFixRounds":5}`)))
+	if create.Code != http.StatusAccepted {
+		t.Fatalf("create batch: %d body=%s", create.Code, create.Body.String())
+	}
+	var batch OrchestrationBatch
+	if err := json.Unmarshal(create.Body.Bytes(), &batch); err != nil {
+		t.Fatalf("decode batch: %v", err)
+	}
+	// 创建计划即选定执行策略，并顺带打开项目队列。
+	cfg, err := server.orchestrationConfig(context.Background(), projectID)
+	if err != nil || !cfg.Enabled || cfg.DevBranch != "develop" || cfg.AgentID != "codex" || cfg.MaxFixRounds != 5 {
+		t.Fatalf("policy after create: cfg=%+v err=%v", cfg, err)
+	}
+	list := httptest.NewRecorder()
+	server.routes().ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/orchestration/batches", nil))
+	var listed []OrchestrationBatch
+	if err := json.Unmarshal(list.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode batches: %v body=%s", err, list.Body.String())
+	}
+	// 空计划是「刚建好」而不是「已完成」，否则它一进列表就是灰的。
+	if len(listed) != 1 || listed[0].ID != batch.ID || listed[0].TaskCount != 0 || listed[0].Status != "active" {
+		t.Fatalf("empty plan listing=%+v", listed)
+	}
+	// 任务事后从候选列表加入，并沿用创建计划时定下的策略快照。
+	add := httptest.NewRecorder()
+	server.routes().ServeHTTP(add, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID+"/tasks", bytes.NewBufferString(`{"taskIds":["`+taskA+`","`+taskB+`"]}`)))
+	if add.Code != http.StatusNoContent {
+		t.Fatalf("add tasks: %d body=%s", add.Code, add.Body.String())
+	}
+	if got := queuePositionForTest(t, server, taskA); got != 1 {
+		t.Fatalf("taskA position=%d want 1", got)
+	}
+	if got := queuePositionForTest(t, server, taskB); got != 2 {
+		t.Fatalf("taskB position=%d want 2", got)
+	}
+	var snapshot string
+	if err := server.db.QueryRow(`select policy_snapshot from task_orchestration_jobs where task_id=?`, taskA).Scan(&snapshot); err != nil {
+		t.Fatalf("load policy snapshot: %v", err)
+	}
+	var snapshotConfig OrchestrationConfig
+	if err := json.Unmarshal([]byte(snapshot), &snapshotConfig); err != nil || snapshotConfig.AgentID != "codex" || snapshotConfig.MaxFixRounds != 5 {
+		t.Fatalf("job snapshot agent=%q rounds=%d err=%v", snapshotConfig.AgentID, snapshotConfig.MaxFixRounds, err)
+	}
+}
+
+// 创建计划会把弹窗里的执行配置写回项目策略，但验证命令不在弹窗里：省略的字段
+// 必须保持原值，尤其命令不能丢——丢了会直接改掉之后每个任务的收尾校验。
+func TestCreateOrchestrationBatchKeepsOmittedPolicyFields(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"keeps policy","agentId":"codex"}`)))
+	if create.Code != http.StatusAccepted {
+		t.Fatalf("create batch: %d body=%s", create.Code, create.Body.String())
+	}
+	cfg, err := server.orchestrationConfig(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.VerificationCommands) != 1 || cfg.VerificationCommands[0] != "true" {
+		t.Fatalf("verification commands lost: %#v", cfg.VerificationCommands)
+	}
+	if cfg.AgentID != "codex" || cfg.MainBranch != "main" || cfg.DevBranch != "dev" || cfg.MaxFixRounds != 3 {
+		t.Fatalf("omitted policy fields were not preserved: %+v", cfg)
+	}
+}
+
+// 单条入队也必须先落一行项目编排策略：任务失败时的「冻结队列」是 update 这张表的，
+// 缺行会让冻结静默失效，队列继续往下跑而不是停下来等人处理。
+func TestEnqueueTaskLeavesAPolicyRowBehind(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "single enqueue")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/enqueue", bytes.NewBufferString(`{}`)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("enqueue: %d body=%s", response.Code, response.Body.String())
+	}
+	var frozenReason string
+	if err := server.db.QueryRow(`select coalesce((select frozen_reason from project_orchestration_configs where project_id=?),'<no row>')`, projectID).Scan(&frozenReason); err != nil {
+		t.Fatalf("load policy row: %v", err)
+	}
+	if frozenReason == "<no row>" {
+		t.Fatal("enqueue left the project without a policy row; freeze-on-failure would be dropped")
+	}
+}
+
+func TestCreateOrchestrationBatchRejectsUnknownBranch(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"bad plan","mainBranch":"..bad"}`)))
+	if create.Code != http.StatusBadRequest {
+		t.Fatalf("invalid branch: %d want 400 body=%s", create.Code, create.Body.String())
+	}
+}
+
+// 「继承上一任务对话摘要」要在「先建计划、后加任务」的新流程下依然成立：队列位置
+// 是加入时分配的，后加的任务必须还能按 queue_position 找到它前面的那一条。
+func TestBatchContextFollowsTasksAddedAfterPlanCreation(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskA := createTaskForTest(t, server.routes(), projectID, "context first")
+	taskB := createTaskForTest(t, server.routes(), projectID, "context second")
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"context plan","conversationStrategy":"continue"}`)))
+	if create.Code != http.StatusAccepted {
+		t.Fatalf("create batch: %d body=%s", create.Code, create.Body.String())
+	}
+	var batch OrchestrationBatch
+	if err := json.Unmarshal(create.Body.Bytes(), &batch); err != nil {
+		t.Fatalf("decode batch: %v", err)
+	}
+	add := httptest.NewRecorder()
+	server.routes().ServeHTTP(add, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID+"/tasks", bytes.NewBufferString(`{"taskIds":["`+taskA+`","`+taskB+`"]}`)))
+	if add.Code != http.StatusNoContent {
+		t.Fatalf("add tasks: %d body=%s", add.Code, add.Body.String())
+	}
+	jobs := map[string]OrchestrationJob{}
+	rows, err := server.db.Query(`select id,project_id,task_id,batch_id,queue_position from task_orchestration_jobs where project_id=?`, projectID)
+	if err != nil {
+		t.Fatalf("load jobs: %v", err)
+	}
+	for rows.Next() {
+		var job OrchestrationJob
+		if err := rows.Scan(&job.ID, &job.ProjectID, &job.TaskID, &job.BatchID, &job.Position); err != nil {
+			rows.Close()
+			t.Fatalf("scan job: %v", err)
+		}
+		jobs[job.TaskID] = job
+	}
+	rows.Close()
+	first, second := jobs[taskA], jobs[taskB]
+	if first.Position != 1 || second.Position != 2 {
+		t.Fatalf("queue positions: first=%d second=%d", first.Position, second.Position)
+	}
+	if first.BatchID != batch.ID || second.BatchID != batch.ID {
+		t.Fatalf("jobs not attached to the plan: first=%q second=%q", first.BatchID, second.BatchID)
+	}
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values (?,?,?,?,?,?,?)`, first.ID, "sha", "task/first", "", conversationID, now, now); err != nil {
+		t.Fatalf("insert git record: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into messages (id,conversation_id,role,content,created_at) values ('prior-message',?,?,?,?)`, conversationID, "user", "上一轮改好了支付回调", now); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	// 计划里的第一条没有前序，不该凭空带上别的对话。
+	if context, err := server.batchContext(context.Background(), first); err != nil || context != "" {
+		t.Fatalf("first job context=%q err=%v", context, err)
+	}
+	context, err := server.batchContext(context.Background(), second)
+	if err != nil {
+		t.Fatalf("second job context: %v", err)
+	}
+	if !strings.Contains(context, "上一轮改好了支付回调") {
+		t.Fatalf("second job did not inherit the previous task context: %q", context)
+	}
+}
+
 func TestEnqueueBatchRejectsDuplicates(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	enableOrchestrationForTest(t, server, projectID)
@@ -7922,6 +8368,20 @@ func TestProjectGitReadRoutesReportRepositoryState(t *testing.T) {
 	handler.ServeHTTP(summary, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/summary", nil))
 	if !strings.Contains(summary.Body.String(), `"untracked":1`) {
 		t.Fatalf("summary did not report untracked file: %s", summary.Body.String())
+	}
+
+	// 仓库只有一个根提交：parents 必须序列化成空数组而不是 null，
+	// 否则前端按 string[] 读 .length 时会抛错并把整个 Git 工作台打成空白。
+	log := httptest.NewRecorder()
+	handler.ServeHTTP(log, httptest.NewRequest(http.MethodGet, "/api/projects/git-project/git/log?ref=HEAD&limit=10", nil))
+	if log.Code != http.StatusOK {
+		t.Fatalf("log status=%d body=%s", log.Code, log.Body.String())
+	}
+	if !strings.Contains(log.Body.String(), `"parents":[]`) {
+		t.Fatalf("root commit parents should serialize as an empty array: %s", log.Body.String())
+	}
+	if strings.Contains(log.Body.String(), `"parents":null`) {
+		t.Fatalf("root commit parents must not serialize as null: %s", log.Body.String())
 	}
 
 	diff := httptest.NewRecorder()
@@ -9930,6 +10390,122 @@ func TestConversationSessionManagerReapsExpiredIdleSession(t *testing.T) {
 		t.Fatal("expired idle session was not stopped")
 	}
 	waitForManagedSessionRemoval(t, server, "expired")
+}
+
+// 会话被要求停止后进程迟迟不退出时（历史上 Windows 端 taskkill 被 3 秒上限掐断
+// 就是这样），会话不能因此永久停在 stopping——否则这条会话每条新消息都只换来
+// "会话正在停止，请稍后再试。"，只有重启控制服务才能恢复。
+func TestWatchStreamingSessionReleasesSessionWhoseProcessNeverExits(t *testing.T) {
+	server := newTestServer(t)
+	server.config.ConversationSessionExitGrace = 40 * time.Millisecond
+	// 这个 session 的 Done 只由 close(release) 关闭，Stop() 不会自己退出进程。
+	session := newDelayedDoneAgentSession()
+	managed := &activeAgentSession{agent: session, runnerID: "runner", runIDs: map[string]struct{}{}}
+	server.mu.Lock()
+	server.sessions["stuck"] = managed
+	managed.markStopping()
+	server.mu.Unlock()
+	go server.watchStreamingSession("stuck", managed)
+
+	waitForManagedSessionRemoval(t, server, "stuck")
+
+	select {
+	case <-session.Done():
+		t.Fatal("session exited on its own; the test did not exercise the stuck path")
+	default:
+	}
+	// 会话必须能重新接受新消息，而不是继续返回 conversation is stopping。
+	server.streamMu.Lock()
+	err := server.sessionManager.ensureCapacity("stuck", "runner")
+	server.streamMu.Unlock()
+	if err != nil {
+		t.Fatalf("conversation stayed unavailable after the exit grace: %v", err)
+	}
+}
+
+// 历史对话必须能继续对话：旧会话（闲置被回收、或进程卡着不退）被释放之后，
+// 这条对话再发消息应当被接受，并按既有 session id 起新一轮，而不是永久 409。
+func TestConversationAcceptsNewTurnsAfterStuckSessionIsReleased(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	server.config.ConversationSessionExitGrace = 40 * time.Millisecond
+	// Done 永不关闭：模拟一个杀不掉的旧进程（历史上 taskkill 被超时掐断就是这样）。
+	stuck := newDelayedDoneAgentSession()
+	server.runner = blockingStreamingRunner{session: stuck}
+	server.wslRunner = server.runner
+
+	server.mu.Lock()
+	managed := &activeAgentSession{agent: stuck, runnerID: "wsl-local", runIDs: map[string]struct{}{}}
+	server.sessions[conversationID] = managed
+	managed.markStopping()
+	server.mu.Unlock()
+	go server.watchStreamingSession(conversationID, managed)
+
+	// 还在停止中就先拒绝：绝不能把新一轮挂到正在退出的旧进程上。
+	stopping := httptest.NewRecorder()
+	server.routes().ServeHTTP(stopping, httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversationID+"/messages", bytes.NewBufferString(`{"content":"继续"}`)))
+	if stopping.Code != http.StatusConflict {
+		t.Fatalf("send while stopping status=%d body=%s, want 409", stopping.Code, stopping.Body.String())
+	}
+
+	// 兜底释放之后必须能继续对话。
+	waitForManagedSessionRemoval(t, server, conversationID)
+	resumed := httptest.NewRecorder()
+	server.routes().ServeHTTP(resumed, httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversationID+"/messages", bytes.NewBufferString(`{"content":"继续"}`)))
+	if resumed.Code != http.StatusAccepted {
+		t.Fatalf("send after release status=%d body=%s, want 202", resumed.Code, resumed.Body.String())
+	}
+}
+
+// 停止时刻缺失（例如绕过 markStopping 直接置位 stopping）也必须能自愈，
+// 不能因为 stoppingSince 是零值就退化成"无限期等待"。
+func TestWatchStreamingSessionReleasesStoppingSessionWithoutTimestamp(t *testing.T) {
+	server := newTestServer(t)
+	server.config.ConversationSessionExitGrace = 40 * time.Millisecond
+	session := newDelayedDoneAgentSession()
+	managed := &activeAgentSession{agent: session, runnerID: "runner", stopping: true}
+	server.mu.Lock()
+	server.sessions["untimed"] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession("untimed", managed)
+
+	waitForManagedSessionRemoval(t, server, "untimed")
+}
+
+// 宽限期只约束"已被要求停止"的会话：正常运行的进程等多久都不该被释放，
+// 否则长跑任务会在运行中被拆掉会话。
+func TestWatchStreamingSessionKeepsRunningSessionBeyondExitGrace(t *testing.T) {
+	server := newTestServer(t)
+	server.config.ConversationSessionExitGrace = 40 * time.Millisecond
+	session := newDelayedDoneAgentSession()
+	managed := &activeAgentSession{agent: session, runnerID: "runner", activeRunID: "run", runIDs: map[string]struct{}{"run": {}}}
+	server.mu.Lock()
+	server.sessions["busy"] = managed
+	server.mu.Unlock()
+	go server.watchStreamingSession("busy", managed)
+
+	time.Sleep(200 * time.Millisecond)
+
+	server.mu.Lock()
+	exists := server.sessions["busy"] == managed
+	server.mu.Unlock()
+	if !exists {
+		t.Fatal("running session was released although it was never asked to stop")
+	}
+	// 收尾：只有 Stop() 之后 Done 才会随 release 关闭。
+	session.Stop()
+	close(session.release)
+	waitForManagedSessionRemoval(t, server, "busy")
+}
+
+func TestConversationSessionExitGraceUsesDefaultUnlessConfigured(t *testing.T) {
+	server := newTestServer(t)
+	if got := server.sessionManager.exitGrace(); got != defaultConversationSessionExitGrace {
+		t.Fatalf("exitGrace=%s, want default %s", got, defaultConversationSessionExitGrace)
+	}
+	server.config.ConversationSessionExitGrace = time.Minute
+	if got := server.sessionManager.exitGrace(); got != time.Minute {
+		t.Fatalf("exitGrace=%s, want configured 1m", got)
+	}
 }
 
 func TestConversationSessionManagerKeepsRunningAndApprovedSessions(t *testing.T) {

@@ -4,6 +4,7 @@
 import { useEffect, useState, useCallback, useRef, type ReactNode } from "react";
 import { Outlet, useParams, useNavigate, useLocation, Navigate } from "react-router-dom";
 import NotificationCenter from "./NotificationCenter";
+import { WorkspacePanelErrorBoundary } from "./WorkspacePanelErrorBoundary";
 import { type Project, type WorkspaceTab, NON_GIT_BRANCH } from "../lib/types";
 import { api } from "../lib/api";
 import { useLiveStateEventsFor } from "./LiveEventsProvider";
@@ -96,9 +97,9 @@ export default function ProjectLayout() {
   }, [projectId, guardedNavigate]);
 
   // 加载项目数据（仅一次，通过 context 共享给子路由）
-	// 用单项目接口而非全量 /api/projects：后者会对每个 SSH runner 同步探活，
-	// 进入项目时被阻塞数秒。不重置 project 以避免请求期间全屏闪烁；但切换项目时
-	// 仍需 setLoading(true) 兜底，否则数据到达前会误显错误页。
+	// 用单项目接口而非全量 /api/projects：单项目接口不做任何探活，进入项目时不会被
+	// 远端主机拖住；全量列表还要等整份列表数据，没必要。不重置 project 以避免请求期间
+	// 全屏闪烁；但切换项目时仍需 setLoading(true) 兜底，否则数据到达前会误显错误页。
 	useEffect(() => {
 		if (!projectId) return;
 		let cancelled = false;
@@ -121,7 +122,7 @@ export default function ProjectLayout() {
   }, [projectId]);
 
 	// 项目页期间持续刷新项目状态（运行中/会话数等），供 FilesPage 等子路由使用。
-	// 只调 /api/projects/statuses（纯 SQL 查询），不触发 refreshProjects 的远程探活。
+	// 只调 /api/projects/statuses（纯 SQL 查询），不触发全量列表与连通性探测。
 	useEffect(() => {
 		void refreshStatuses().catch(() => undefined);
 		const interval = window.setInterval(() => { void refreshStatuses().catch(() => undefined); }, 30_000);
@@ -198,7 +199,11 @@ export default function ProjectLayout() {
       <button data-workspace-tab="insights" id="workspace-tab-insights" type="button" role="tab" aria-controls="workspace-panel-insights" aria-selected={workspaceTab === "insights"} className={workspaceTab === "insights" ? "active" : ""} onClick={() => selectWorkspaceTab("insights")}><WorkspaceTabIcon tab="insights" /><span>优化建议</span></button>
     </nav>
     <main className="workspace-content">
-      <Outlet context={{ project, registerNavigationGuard, navigateWithGuard: guardedNavigate } satisfies ProjectLayoutOutletContext} />
+      {/* 子面板渲染抛错时只替换该面板：全站唯一的 ErrorBoundary，不要删。
+          resetKey 用 pathname，切标签/子路由后自动复位。 */}
+      <WorkspacePanelErrorBoundary resetKey={location.pathname}>
+        <Outlet context={{ project, registerNavigationGuard, navigateWithGuard: guardedNavigate } satisfies ProjectLayoutOutletContext} />
+      </WorkspacePanelErrorBoundary>
     </main>
   </div>;
 }

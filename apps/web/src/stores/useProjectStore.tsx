@@ -1,7 +1,7 @@
 // 项目级全局状态管理 — React Context
 
 import { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
-import type { Project, ProjectStatus } from "../lib/types";
+import type { Project, ProjectAvailability, ProjectStatus } from "../lib/types";
 import { api as apiFn } from "../lib/api";
 import {
   conversationDraftKey,
@@ -12,6 +12,7 @@ import {
   readConversationDraft,
   updateConversationDraft,
 } from "../lib/conversation-draft";
+import { coalesceRefresh } from "../lib/refresh-coalesce";
 import { useUIPreferences } from "./useUIPreferences";
 
 interface ProjectContextValue {
@@ -20,6 +21,7 @@ interface ProjectContextValue {
   error: string;
   setError: (msg: string) => void;
   refreshProjects: () => Promise<void>;
+  refreshAvailability: () => Promise<void>;
   refreshStatuses: () => Promise<void>;
   removeProject: (projectID: string) => void;
   getConversationDraft: (projectID: string, conversationID: string) => string;
@@ -32,6 +34,17 @@ interface ProjectContextValue {
 const ProjectContext = createContext<ProjectContextValue | null>(null);
 
 type PendingConversationDraft = { projectID: string; conversationID: string; text: string };
+
+/** 把一个每次渲染都换身份的刷新函数包成稳定引用 + 并发合并的刷新入口。 */
+function useCoalescedRefresh(run: () => Promise<void>): () => Promise<void> {
+  const runRef = useRef(run);
+  runRef.current = run;
+  const coalescedRef = useRef<(() => Promise<void>) | null>(null);
+  if (coalescedRef.current === null) {
+    coalescedRef.current = coalesceRefresh(() => runRef.current());
+  }
+  return coalescedRef.current;
+}
 
 // 判断两批项目状态是否等价。用于 10 秒轮询去重：只在实际数据变化时才更新状态，
 // 避免每次轮询都产生新的状态对象引用，触发 Provider 及所有消费组件无意义整体重渲染。
@@ -82,6 +95,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const pendingConversationDrafts = useRef(new Map<string, PendingConversationDraft>());
   const pendingDraftTimers = useRef(new Map<string, number>());
   const projectRequestVersion = useRef(0);
+  // 连通性探测独立编号：只用于丢弃"被更新一轮探测超越"的过期响应。刻意不复用
+  // projectRequestVersion——列表请求失败时版本已自增却不会发起探活，会导致一次
+  // 本来有效的探活结果被误丢弃，就绪度迟迟不刷新。
+  const availabilityRequestVersion = useRef(0);
   const statusRequestVersion = useRef(0);
   // 镜像当前 projectStatuses，供轮询去重在组件外对比（状态值语义稳定，引用比较不可靠）。
   const statusesRef = useRef<Record<string, ProjectStatus>>({});
@@ -168,7 +185,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     return clearStoredConversationDrafts();
   }, []);
 
-  const refreshStatuses = useCallback(async () => {
+  const refreshStatuses = useCoalescedRefresh(async () => {
     const requestVersion = ++statusRequestVersion.current;
     try {
       const statusList = await apiFn<{ id: string; running: number; conversationCount: number; activeTitle: string; insightsRunning: number; insightsMessage: string }[]>("/api/projects/statuses");
@@ -188,23 +205,62 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     } catch {
       // 失败时保留上一次已知的状态，不覆盖。
     }
-  }, []);
+  });
 
-  const refreshProjects = useCallback(async () => {
+  // 连通性探测独立于列表刷新：/api/projects 已不再同步探活（远端主机慢或离线时
+  // 会拖住整个列表页），codex/agent 就绪度改由本函数单独拉取、按项目 id 合并。
+  // 失败时保留上一次已知就绪度，不把卡片误判为不可用。
+  const refreshAvailability = useCoalescedRefresh(async () => {
+    const requestVersion = ++availabilityRequestVersion.current;
+    try {
+      // 探活本身在服务端有超时与短 TTL 缓存；这里不重试，避免超时后再叠一轮远端探测。
+      const items = await apiFn<ProjectAvailability[]>("/api/projects/availability", undefined, 0);
+      // 期间已发起更新一轮的探测：丢弃这次过期结果，避免旧结果覆盖新结果。
+      if (requestVersion !== availabilityRequestVersion.current) return;
+      const byId = new Map(items.map((item) => [item.id, item]));
+      const current = projectsRef.current;
+      let changed = false;
+      const next = current.map((project) => {
+        const item = byId.get(project.id);
+        if (!item) return project;
+        if (project.claudeReady === item.claudeReady && project.codexReady === item.codexReady && project.agentReady === item.agentReady) return project;
+        changed = true;
+        return { ...project, claudeReady: item.claudeReady, codexReady: item.codexReady, agentReady: item.agentReady };
+      });
+      if (!changed) return;
+      projectsRef.current = next;
+      setProjects(next);
+    } catch {
+      // 保留上一次已知的连通性状态。
+    }
+  });
+
+  const refreshProjects = useCoalescedRefresh(async () => {
     const requestVersion = ++projectRequestVersion.current;
     try {
       const list = await apiFn<Project[]>("/api/projects");
       if (requestVersion !== projectRequestVersion.current) return;
-      // 数据未变化则保持现有引用，避免 10 秒轮询每次都触发 Provider 重渲染。
-      if (!projectsEqual(projectsRef.current, list)) {
-        projectsRef.current = list;
-        setProjects(list);
+      // 列表接口不再同步探活，它返回的 codex/agent 就绪度只是落库值。这里保留上一次
+      // 已探明的连通性，避免卡片在"已就绪/不可用"之间闪一下；真实值随后由
+      // refreshAvailability 异步刷新。
+      const known = new Map(projectsRef.current.map((project) => [project.id, project]));
+      const merged = list.map((project) => {
+        const previous = known.get(project.id);
+        if (!previous) return project;
+        return { ...project, codexReady: previous.codexReady, agentReady: project.claudeReady || previous.codexReady };
+      });
+      // 数据未变化则保持现有引用，避免轮询每次都触发 Provider 重渲染。
+      if (!projectsEqual(projectsRef.current, merged)) {
+        projectsRef.current = merged;
+        setProjects(merged);
       }
+      // 连通性探测不阻塞列表：拿到列表即返回，探测结果异步合并。
+      void refreshAvailability();
       await refreshStatuses();
     } catch (cause) {
       if (requestVersion === projectRequestVersion.current) setError(cause instanceof Error ? cause.message : "无法加载项目列表");
     }
-  }, [refreshStatuses]);
+  });
 
   // 乐观删除：立即从内存列表移除，避免依赖后续网络刷新（可能被并发轮询
   // 的"最新发起者"竞态覆盖，导致已删项目残留到下次手动刷新）。
@@ -222,6 +278,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     error,
     setError,
     refreshProjects,
+    refreshAvailability,
     refreshStatuses,
     removeProject,
     getConversationDraft,
@@ -229,7 +286,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     flushConversationDraft,
     clearConversationDrafts,
     api: apiFn,
-  }), [projects, projectStatuses, error, refreshProjects, refreshStatuses, removeProject, getConversationDraft, saveConversationDraft, flushConversationDraft, clearConversationDrafts]);
+  }), [projects, projectStatuses, error, refreshProjects, refreshAvailability, refreshStatuses, removeProject, getConversationDraft, saveConversationDraft, flushConversationDraft, clearConversationDrafts]);
 
   return (
     <ProjectContext.Provider value={value}>

@@ -225,15 +225,17 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   };
 
   // 停止运行中的扫描/复核：取消通过 context 传播给后台 worker，agent 进程被终止，
-  // 扫描/复核记录置为 cancelled。取消是异步的，POST 后立即拉一次让状态尽快收敛。
-  const cancelScan = async () => {
+  // 扫描/复核记录置为 cancelled。kind 指明停哪一种——扫描与复核现在可以同时进行
+  // （见后端 insightRunScan/insightRunVerify），各自的「停止」只该停自己那个。
+  // 取消是异步的，POST 后立即拉一次让状态尽快收敛。
+  const cancelScan = async (kind: "scan" | "verify") => {
     if (busy) return;
     setBusy(true);
     try {
       await request(`/api/projects/${projectID}/insights/cancel`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({ kind }),
       });
       if (!mountedRef.current) return;
       await loadInsights().catch(() => undefined);
@@ -255,8 +257,10 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
 
   // 验证全部有效建议：调 AI 复核每条在当前代码里是否仍然成立（项目可能已被
   // 其它任务迭代修改，或原分析因上下文限制判断不准）。异步执行，结果由轮询带回。
+  // 复核与扫描互不阻塞（后端按"项目 × 种类"分别占用）：一次漫长的初扫进行中也能发起，
+  // 两者共用凭据时后端会先排队等待额度，面板上仍显示"正在复核"而不是直接报错。
   const verifyAll = async () => {
-    if (verifyAllBusy || running || busy) return;
+    if (verifyAllBusy || busy) return;
     setVerifyAllBusy(true);
     const targets = findings.map((f) => f.id);
     // 先把全部有效建议标记为 in-flight，保证轮询启动（即使随后刷新失败）。
@@ -393,14 +397,14 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
             type="button"
             className="insight-stop"
             disabled={busy}
-            onClick={() => void cancelScan()}
+            onClick={() => void cancelScan("scan")}
             title="停止本次分析，已收集的结果不会保留，可随时重新发起"
           >
             {busy ? "正在停止…" : "停止分析"}
           </button>
         ) : (
-          <button type="button" className="primary" disabled={busy || anyVerifying} onClick={() => void startScan()}>
-            {anyVerifying ? "正在验证…" : "开始分析"}
+          <button type="button" className="primary" disabled={busy} onClick={() => void startScan()}>
+            开始分析
           </button>
         )}
       </header>
@@ -495,7 +499,9 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
         </section>
       )}
 
-      {!running && verification?.status === "running" && (() => {
+      {/* 复核可与扫描同时进行：两者各有进度块，扫描进行中也要显示复核进度，
+          否则用户会以为复核没在跑（正是"边扫边核"场景的关键反馈）。 */}
+      {verification?.status === "running" && (() => {
         const verifyPct = verification.totalCount > 0
           ? Math.min(100, Math.round((verification.processedCount / verification.totalCount) * 100))
           : 0;
@@ -511,7 +517,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
               type="button"
               className="insight-stop"
               disabled={busy}
-              onClick={() => void cancelScan()}
+              onClick={() => void cancelScan("verify")}
               title="停止本次复核，结果不会保留"
             >
               停止
@@ -534,7 +540,9 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
         </section>
       )}
 
-      {hasScan && !running && !failed && (
+      {/* 扫描进行中同样展示既有建议列表：复核与扫描可以并行，而"验证"入口就在卡片上，
+          把列表藏起来会让这次能力在实际界面上到不了手。 */}
+      {hasScan && !failed && (
         <>
           <div className="insights-summary">
             <span>共 {openCount} 条有效建议</span>
@@ -565,8 +573,8 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                 type="button"
                 className="insight-verify-all"
                 onClick={() => void verifyAll()}
-                disabled={running || busy || verifyAllBusy || anyVerifying || openCount === 0}
-                title="调用 AI 复核当前全部有效建议是否仍然成立（项目可能已被其它任务迭代修改）"
+                disabled={busy || verifyAllBusy || anyVerifying || openCount === 0}
+                title="调用 AI 复核当前全部有效建议是否仍然成立（项目可能已被其它任务迭代修改；分析进行中也可以发起，两者共用凭据时后端会先排队等额度）"
               >
                 {verifyAllBusy || anyVerifying ? "正在验证…" : "验证全部"}
               </button>

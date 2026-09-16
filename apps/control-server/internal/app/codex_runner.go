@@ -51,6 +51,17 @@ func newCodexCLIRunner(config Config) AgentRunner { return &codexCLIRunner{confi
 // codexCommandContext handles npm's Windows .cmd shim explicitly. CreateProcess
 // cannot launch a batch file directly, while `codex` resolved through PATHEXT
 // commonly points to codex.cmd.
+//
+// 2026-09-15 修正：此前把脚本路径按 `"path"` 手工加引号，实测在 Windows 上**必失败**——
+// Go 的参数转义是面向 CommandLineToArgvW 的，会把引号转义成 \"，而 cmd.exe 解析的是 /c
+// 之后的原始命令行，于是它把带引号的整串当成命令名去找，报
+// 「'"C:\...\codex.cmd"' 不是内部或外部命令」。后果不只是模型目录探测失败：任何
+// windows-local 项目上的 Codex 都起不来，而 LookPath 仍报告二进制"存在"（所以 UI 上
+// 看到的是 codex 就绪、版本号却是空的）。
+//
+// 修法：路径不含空白时不加引号（npm shim 位于 %APPDATA%\npm\codex.cmd，永远不含空白），
+// 每个用户参数仍作为独立 argv 交给 Go 转义——绝不能手工拼命令串，否则含引号/shell 元字符
+// 的 prompt 会被破坏。含空白的安装路径无法用单个 token 表达，仍按旧方式处理（未验证可用）。
 func codexCommandContext(ctx context.Context, path string, args ...string) *exec.Cmd {
 	if runtime.GOOS != "windows" {
 		return exec.CommandContext(ctx, path, args...)
@@ -59,10 +70,11 @@ func codexCommandContext(ctx context.Context, path string, args ...string) *exec
 	if !strings.HasSuffix(lower, ".cmd") && !strings.HasSuffix(lower, ".bat") {
 		return exec.CommandContext(ctx, path, args...)
 	}
-	// Pass the script path as the /c command and preserve each user argument as
-	// a separate process argument. Building one hand-quoted command string would
-	// mishandle prompts containing quotes or shell metacharacters.
-	return exec.CommandContext(ctx, "cmd.exe", append([]string{"/d", "/c", `"` + path + `"`}, args...)...)
+	script := path
+	if strings.ContainsAny(path, " \t") {
+		script = `"` + path + `"`
+	}
+	return exec.CommandContext(ctx, "cmd.exe", append([]string{"/d", "/c", script}, args...)...)
 }
 
 func (r *codexCLIRunner) Ready(parent context.Context) bool {
@@ -276,13 +288,38 @@ func rollbackInterruptedNpmCodexInstall(prefix, previous string) (string, error)
 	return rollbackInterruptedNpmInstall(prefix, previous, codexNpmCLIInstall)
 }
 
+// codexExecArgs 装配本地 `codex exec` 的参数（本机 Codex 是"能不能把模型传下去"唯一
+// 没有被测试覆盖的路径，抽成纯函数后可直接断言，见 TestCodexExecArgsPassModel）。
+//
+// profileArgs 由 profileLaunch 产出（凭据/端点注入），schemaPath 非空时先落 --output-schema，
+// policy 是调用方已校验过的 sandbox 值（与 SSH 侧的 buildSSHCodexExecCommand 同形，
+// 保持纯函数、不吞错误）。参数顺序与既有实现逐一对应：resume 分支不带 -C/--sandbox 是既有行为。
+func codexExecArgs(request AgentRunRequest, profileArgs []string, schemaPath, policy string) []string {
+	args := []string{"exec"}
+	if schemaPath != "" {
+		args = append(args, "--output-schema", schemaPath)
+	}
+	args = append(args, profileArgs...)
+	// MCP 注入：Codex 没有 --mcp-config，改由 -c 点号路径逐 server 注入；密钥只写变量名
+	// （env_vars / env_http_headers），真值随进程环境提供，因此 argv 与配置文件都不含明文。
+	args = append(args, request.CodexMCPArgs...)
+	if request.Model != "" {
+		args = append(args, "-c", fmt.Sprintf("model=%q", request.Model))
+	}
+	if request.Resume {
+		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
+	} else {
+		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, request.Prompt)
+	}
+	return args
+}
+
 func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
 	policy, err := codexSandbox(request.PermissionMode)
 	if err != nil {
 		return err
 	}
-	args := []string{"exec"}
-	var schemaPath string
+	schemaPath := ""
 	if len(request.OutputSchema) > 0 {
 		var cleanup func()
 		schemaPath, cleanup, err = writeCodexOutputSchema(request.OutputSchema)
@@ -290,28 +327,16 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 			return err
 		}
 		defer cleanup()
-		args = append(args, "--output-schema", schemaPath)
 	}
 	profileArgs, environment, closeProfile, err := r.profileLaunch(ctx, request.Profile)
 	if err != nil {
 		return err
 	}
 	defer closeProfile()
-	args = append(args, profileArgs...)
-	// MCP 注入：Codex 没有 --mcp-config，改由 -c 点号路径逐 server 注入；密钥只写变量名
-	// （env_vars / env_http_headers），真值随进程环境提供，因此 argv 与配置文件都不含明文。
-	args = append(args, request.CodexMCPArgs...)
 	if len(request.MCPEnv) > 0 {
 		environment = append(environment, request.MCPEnv...)
 	}
-	if request.Profile != nil && request.Profile.Model != "" {
-		args = append(args, "-c", fmt.Sprintf("model=%q", request.Profile.Model))
-	}
-	if request.Resume {
-		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
-	} else {
-		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, request.Prompt)
-	}
+	args := codexExecArgs(request, profileArgs, schemaPath, policy)
 	cmd := codexCommandContext(context.Background(), r.config.CodexPath, args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
@@ -706,6 +731,25 @@ func (r *codexCLIRunner) codexDefaultModel(ctx context.Context) string {
 		return ""
 	}
 	return codexModelFromConfig(data)
+}
+
+// codexModelCatalog 列出本机 Codex 的可用模型目录（modelCatalogRunner 实现）。
+// `codex debug models` 输出 JSON 目录，含 slug / display_name / description / visibility；
+// 属调试子命令，解析失败或版本不支持时返回错误，由调用方回退到静态表。
+func (r *codexCLIRunner) codexModelCatalog(ctx context.Context) ([]AgentModelOption, error) {
+	cmd := codexCommandContext(ctx, r.config.CodexPath, "debug", "models")
+	// 与 Version()/Run() 一致地设置进程组：超时取消时能把 cmd.exe 及其拉起的
+	// codex 子进程一起收掉，不留孤儿。
+	configureProcessGroup(cmd)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("run codex debug models: %w", err)
+	}
+	options := parseCodexModelCatalog(output)
+	if len(options) == 0 {
+		return nil, errors.New("codex debug models returned no usable model")
+	}
+	return options, nil
 }
 
 func codexSandbox(policy string) (string, error) {

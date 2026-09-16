@@ -2,16 +2,51 @@
 .mobile-remote-header, .mobile-section-heading, .mobile-instance-status > div, .mobile-project > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .mobile-header-actions { display: flex; align-items: center; gap: 8px; }
 .mobile-remote-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.mobile-back { display: grid; place-items: center; width: 34px; height: 34px; flex: none; border: 1px solid #8fb9a5; border-radius: 5px; color: #2c7567; background: #fff; font-size: 20px; line-height: 1; cursor: pointer; }
-.mobile-back:hover { background: #eef8f1; }
+/* ── 头部工具条（返回 / 开启通知 / 刷新 / 会话页的 ⋯）──────────────────────
+   这几颗按钮共用一套"软胶囊"：38px 高、`#eaf4ef` 底 + `#256a5b` 字，尺寸与配色同一档
+   （有文字/字形的刷新、开启通知、⋯ 都带一条 `#cfe4da` 细描边，只有圆形返回键不描边
+   —— 这条差别直接决定热区外扩量：带边框的走 -4px，返回键走 -3px，理由见下面那条【规则 · 勿改】。）
+   改动理由（原来这三颗都是 44px 的描边方块，其中刷新还是实心 #2c7567）：
+     · 头部在 23px 的标题旁边并排三块 44px 的方框，视线上比标题还重；
+     · 实心绿是这一页的"主操作"色（发送按钮用它），刷新占用之后主次就打架了，
+       所以刷新改成浅绿底，实心绿只留给发送。
+     · 返回键的箭头原来是文本字形 "←"，字重/基线/宽度由各平台字体决定（Windows、
+       Android、iOS 三处渲染都不一样，和旁边的 SVG 图标对不齐），换成 SVG 描边箭头
+       之后三端像素一致。 */
+.mobile-back { position: relative; display: grid; place-items: center; width: 38px; height: 38px; flex: none; border: 0; border-radius: 999px; padding: 0; color: #256a5b; background: #eaf4ef; cursor: pointer; }
+.mobile-back svg { width: 18px; height: 18px; }
+/* 视觉尺寸收到 38px，热区必须补回 44px：::after 是按钮自己的伪元素，外扩 3px 之后
+   (38 + 3 + 3 = 44) 落在按钮上的点击仍然算在这个按钮头上，等于"看着小了、按着没小"。
+   这 3px 只跨在相邻留白上：返回键右边是 gap: 10px 的品牌组（一张装饰图 + 标题，都不可交互），
+   刷新键右边是页面 padding（≥10px）。相邻的两颗按钮之间是 gap: 8px，两侧各扩 3px 之后
+   还剩 2px 中立带 —— elementFromPoint 实测过：环内落点归按钮自己，环外 4px 就归容器了。
+   注意外扩量是**按有没有边框**分的，见下一条。 */
+.mobile-back::after { position: absolute; inset: -3px; content: ""; }
+/* 【规则 · 勿改】带 1px 边框的按钮必须用 -4px，不能跟着返回键写 -3px。
+   inset 的参照系是**定位祖先的 padding box**（= 边框盒去掉那 1px 边框），所以
+   -3px 只把热区扩到 36 + 3 + 3 = 42，比 44 少 2px。返回键 border: 0 所以 38 + 3 + 3 = 44 成立；
+   实测过：⋯ 按钮右侧 border-box 外 2px 处 elementFromPoint 已落到 <main> 上（正好压在
+   ::after 的右边界上，半开区间判为界外），左侧则因为亚像素取整侥幸命中——同一份 CSS
+   两侧表现不一致，正是"热区偏小 2px"的典型症状。 */
+.mobile-refresh::after, .mobile-notification-button::after, .mobile-header-menu-button::after { position: absolute; inset: -4px; content: ""; }
 .mobile-remote-header { max-width: 860px; margin: 0 auto 16px; }
 .mobile-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .mobile-brand-mark { width: 36px; height: 36px; flex: none; border-radius: 9px; box-shadow: 0 2px 5px rgba(25, 51, 44, .16); }
 .mobile-remote h1 { margin: 0; overflow: hidden; color: #182034; font-size: 30px; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-remote h2 { margin: 0; color: #243b34; font-size: 17px; }
-.mobile-refresh, .mobile-token-form button, .mobile-create button, .mobile-task-actions button { border: 1px solid #8fb9a5; border-radius: 5px; padding: 9px 13px; color: #fff; background: #2c7567; font-weight: 700; }
-.mobile-notification-button { min-height: 44px; border: 1px solid #8fb9a5; border-radius: 5px; padding: 8px 10px; color: #2c7567; background: #fff; font-size: 12px; font-weight: 700; }
-.mobile-refresh:disabled, .mobile-create button:disabled, .mobile-task-actions button:disabled { opacity: .5; }
+.mobile-token-form button, .mobile-create button, .mobile-task-actions button { border: 1px solid #8fb9a5; border-radius: 5px; padding: 9px 13px; color: #fff; background: #2c7567; font-weight: 700; }
+/* `white-space: nowrap` 与刷新胶囊的文字同理，但这里更要紧：这条按钮是**纯文字** flex 项，
+   min-content 默认只有"一个汉字宽"，会话视图里被标题一挤就塌成一列竖排的「开启通知」
+   （实测 390px + 长项目名：38×66px、4 行，头部被顶高一倍）。nowrap 之后 min-content = 整条文字，
+   挤不动，宽度由内容定（74×38）。同样**不要加 flex: none**：实测它单独存在时去掉也不会塌，
+   属于不承重的"保险"（两条同时去掉才塌，说明 nowrap 一条就够）。 */
+.mobile-notification-button { position: relative; min-height: 38px; border: 1px solid #cfe4da; border-radius: 999px; padding: 0 12px; color: #256a5b; background: #eaf4ef; font-size: 12px; font-weight: 700; white-space: nowrap; }
+/* `.mobile-refresh` 故意不在这一组里：它唯一的 disabled 场景就是"正在刷新"（disabled 与
+   aria-busy 同时置位），而半透明的浅色胶囊在浅色页面上几乎消失 —— 实测「刷新」文字对比度
+   2.06:1（透明 0.5 之后文字与底色都往页面底色上合）。忙碌态改由下面的
+   `.mobile-refresh[aria-busy="true"]` 换底色表达，保持全不透明（5.32:1）。
+   实心块时代这条只有 2.1:1，问题一直存在，只是那时看不出"胶囊不见了"。 */
+.mobile-create button:disabled, .mobile-task-actions button:disabled { opacity: .5; }
 .mobile-toolbar, .mobile-instance-status, .mobile-summary, .mobile-projects, .mobile-create { max-width: 860px; margin: 0 auto 14px; border: 1px solid #d1e3d7; border-radius: 7px; padding: 14px; background: #fbfefb; }
 .mobile-pairing { max-width: 860px; margin: 0 auto 14px; border: 1px solid #c8ded2; border-radius: 7px; padding: 14px; background: #eef8f1; }.mobile-pairing h2 { margin: 0 0 4px; }.mobile-pairing p { margin: 0; color: #6f887c; font-size: 12px; }.mobile-pairing form { display: grid; grid-template-columns: 1fr 130px auto; gap: 8px; margin-top: 11px; }.mobile-pairing button { border: 1px solid #8fb9a5; border-radius: 5px; padding: 9px 13px; color: #fff; background: #2c7567; font-weight: 700; }.mobile-pairing small { display: block; margin-top: 8px; color: #277566; font-size: 12px; }
 .mobile-agent-enroll { max-width: 860px; margin: 0 auto 14px; border: 1px solid #e0c9a8; border-radius: 7px; padding: 14px; background: #fdf7ee; }
@@ -25,12 +60,6 @@
 .mobile-pairing-code { display: block; margin-top: 10px; color: #19332c; }.mobile-command-status { max-width: 860px; margin: 0 auto 12px; border: 1px solid #c8ded2; border-radius: 5px; padding: 9px 12px; background: #eef8f1; font-size: 12px; }.mobile-command-status.failed, .mobile-command-status.expired, .mobile-command-status.indeterminate { border-color: #e3b7b0; color: #9b3e33; background: #fff4f1; }
 .mobile-pairing-manual { max-width: 860px; margin: 0 auto 14px; border: 1px solid #c8ded2; border-radius: 7px; padding: 14px; background: #fff; }.mobile-pairing-manual h2 { margin: 0 0 4px; color: #243b34; font-size: 17px; }.mobile-pairing-manual p { margin: 0 0 10px; color: #6f887c; font-size: 12px; }.mobile-pairing-manual form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }.mobile-pairing-manual button { border: 1px solid #8fb9a5; border-radius: 5px; padding: 9px 13px; color: #fff; background: #2c7567; font-weight: 700; }.mobile-pairing-collapse { margin-top: 10px; color: #2c7567 !important; background: #fff !important; }
 .mobile-pairing-generate { margin-top: 10px; }.mobile-pairing-qr { display: block; width: 240px; height: 240px; margin-top: 12px; border: 8px solid #fff; border-radius: 4px; }
-.mobile-pairing-scanner { display: block; width: min(100%, 360px); aspect-ratio: 4 / 3; margin-top: 12px; border: 2px solid #78ad99; border-radius: 6px; object-fit: cover; background: #19332c; }
-.mobile-pairing-scanner-shell { position: fixed; z-index: 10; inset: 0; display: grid; align-content: center; justify-items: center; gap: 16px; padding: 24px; color: #fff; background: rgba(8, 20, 16, .72); }
-.mobile-pairing-scanner-shell p { color: #fff; font-size: 14px; }
-.mobile-pairing-scanner-frame { position: fixed; width: min(72vw, 300px); aspect-ratio: 1; border: 3px solid #baf2c9; border-radius: 8px; pointer-events: none; }
-.mobile-pairing-scan-cancel { min-height: 44px; border: 1px solid #fff; border-radius: 5px; padding: 10px 16px; color: #19332c; background: #fff; font-weight: 700; }
-.mobile-pairing-scan-error { color: #9b3e33 !important; }
 .mobile-toolbar { display: grid; grid-template-columns: 1fr minmax(180px, .6fr); gap: 12px; }
 .mobile-token-form, .mobile-instance-select, .mobile-create form { display: grid; gap: 6px; color: #567468; font-size: 12px; font-weight: 700; }
 .mobile-token-form { grid-template-columns: 1fr auto; align-items: end; }
@@ -42,11 +71,120 @@
 .mobile-section-heading { margin-bottom: 10px; }.mobile-section-heading span { color: #82968d; font-size: 12px; }.mobile-project { margin-top: 8px; border: 1px solid #d5e5dc; border-radius: 6px; padding: 12px; cursor: pointer; }.mobile-project.selected { border-color: #78ad99; box-shadow: 0 0 0 2px #e0f2e7; }.mobile-project h3 { margin: 0 0 4px; color: #294e43; font-size: 14px; }.mobile-project > header > span { color: #6d887b; font-size: 12px; }.mobile-task-list { display: grid; gap: 7px; margin-top: 12px; border-top: 1px solid #e3eee7; padding-top: 9px; }.mobile-task { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.mobile-task > div:first-child { display: grid; min-width: 0; gap: 3px; }.mobile-task strong { overflow: hidden; color: #315448; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }.mobile-task-actions { display: flex; flex: none; gap: 5px; }.mobile-task-actions button { padding: 6px 9px; font-size: 12px; }.mobile-create form { gap: 10px; }.mobile-create form label { display: grid; gap: 5px; }.mobile-create button { width: fit-content; }.mobile-empty { color: #7a9186; font-size: 12px; }.mobile-error { max-width: 860px; margin: 0 auto 14px; border: 1px solid #e5b8aa; border-radius: 6px; padding: 10px 12px; color: #933d2e; background: #fff1ed; font-size: 12px; }
 @media (max-width: 620px) { .mobile-remote { padding: 18px 12px 36px; padding-top: calc(18px + env(safe-area-inset-top)); padding-bottom: calc(36px + env(safe-area-inset-bottom)); }.mobile-remote h1 { font-size: 26px; }.mobile-toolbar { grid-template-columns: 1fr; }.mobile-token-form { grid-template-columns: 1fr auto; }.mobile-pairing form { grid-template-columns: 1fr 1fr; }.mobile-pairing button { grid-column: 1 / -1; }.mobile-summary { justify-content: flex-start; gap: 24px; }.mobile-task { align-items: flex-start; flex-direction: column; }.mobile-task-actions { align-self: flex-end; } }
 
-body.barcode-scanner-active, body.barcode-scanner-active #root, body.barcode-scanner-active .mobile-remote { background: transparent; }
-body.barcode-scanner-active .mobile-remote > *:not(.mobile-pairing) { visibility: hidden; }
-body.barcode-scanner-active .mobile-pairing { position: static; border: 0; padding: 0; background: transparent; }
-body.barcode-scanner-active .mobile-pairing > :not(.mobile-pairing-scanner-shell) { visibility: hidden; }
-body.barcode-scanner-active .mobile-pairing-scanner { display: none; }
+/* ── 扫码取景层 ──────────────────────────────────────────────────────────────
+   改这一块之前先读懂两条硬约束，它们是"扫码看不到摄像头"那类问题的全部来源：
+
+   ① 原生分支的摄像头画面不在 DOM 里。`@capacitor-mlkit/barcode-scanning` 的
+      `startScan()` 把 CameraX 的 PreviewView 插到 WebView **下面**
+      （`((ViewGroup) webView.getParent()).addView(previewView, 0)`，见 BarcodeScanner.java），
+      所以能不能看见画面，只取决于 WebView 自身和它上面**每一层** DOM 有没有把画面盖住。
+   ② 清底必须**逐层点名**，漏一层就等于没改。本页有底色的层一共四个：`:root` 与 `body`
+      （`style.css` 各给了一条 `#f3f8f4`）、`#root`、以及 `.mobile-remote` 自己那条
+      `background: #f3f8f4`。漏掉 `.mobile-remote` 那一次，症状就是取景窗里仍然是页面底色
+      —— 像素探针 `.tmp/probe-scan-overlay.mjs` 的仿真抽样当场抓到。
+      另外 `body.barcode-scanner-active` 清的是 body 的底色，**跟 html 上的 `:root` 规则
+      管不到同一个元素**：只把类名挂在 body 上，根元素那层不透明画布底色永远清不掉，
+      所以 JS 侧 `setScannerActive()` 必须同时挂 <html> 与 <body>（选择器以 html 为准）。
+
+   取景框的写法：遮罩**不能**是铺满屏幕的深色块（那会把摄像头一起盖掉），要用
+   "取景窗 + 超大字距 box-shadow"——影子只画在窗口之外，窗口内部是真透明，画面从洞里
+   透出来。窗口取 min(68vw, 260px)：390px 屏上 265px、320px 屏上 218px，既框得住电脑
+   屏幕上的二维码，四角又留得下遮罩。 */
+html.barcode-scanner-active,
+html.barcode-scanner-active body,
+html.barcode-scanner-active #root,
+html.barcode-scanner-active .mobile-remote { background: transparent; }
+/* .mobile-remote 平时是 overflow-x: hidden（它的 overflow-y 会被算成 auto），会把取景窗
+   那圈 100vmax 的影子裁掉；扫码期间除本层之外的所有子元素都已 visibility: hidden，
+   不可能再撑出横向溢出，所以这里把它放开是安全的。 */
+html.barcode-scanner-active .mobile-remote { overflow: visible; }
+/* 被隐藏的区块仍然占布局（visibility 不脱流），高度没变 —— 不做这一条，扫码时还能滚到
+   下面那片空页，横向也可能冒出一条滚动条。锁在 html/body 上而不是 .mobile-remote：
+   锁根元素才能同时管住文档滚动与紧贴它的取景层。 */
+html.barcode-scanner-active, html.barcode-scanner-active body { overflow: hidden; overscroll-behavior: none; }
+/* 只留取景层：其余同级区块一律不绘制（visibility: hidden 同时移出焦点与无障碍树）。 */
+html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: hidden; }
+
+.mobile-scan { position: fixed; z-index: 60; inset: 0; display: flex; flex-direction: column; box-sizing: border-box; padding: 18px 20px; padding-top: max(18px, env(safe-area-inset-top)); padding-bottom: max(22px, env(safe-area-inset-bottom)); color: #eefaf3; }
+/* 只有"原生 + 正在扫描"背后真的有摄像头（data-backdrop="camera"），这一层必须保持透明，
+   画面才透得上；其余情况（Web 分支自己用 <video> 画、原生相机起不来之后的报错态）背后
+   什么都没有，必须自己铺底 —— 否则清掉根元素底色之后会直接露出浏览器画布。 */
+.mobile-scan[data-backdrop="solid"] { background: #0a1714; }
+/* 画面垫在最底下：z-index: -1 把它放到 .mobile-scan 这个层叠上下文的负层，
+   于是上面那些"正常流"的遮罩影子仍然盖得住它（不然遮罩改到正常流里之后，
+   绝对定位的 <video> 会反过来压住遮罩 —— 整块遮罩就等于没了）。 */
+.mobile-scan-video { position: absolute; z-index: -1; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+/* 挖空罩。它是 flex 列里**会伸缩的那一段**（不是 inset: 0 铺满整屏）：
+   取景窗要在"上方文案"和"下方按钮"之间的空当里居中，而不是按整屏居中 ——
+   矮视口（横屏手机 844×390、分屏）下整屏居中会让窗口同时压住文案和按钮（实测过）。
+   pointer-events: none 让它整体不挡交互，底部的按钮单独抬上来。
+
+   居中用 flex 而不是 grid：grid 的隐式行是 auto 尺寸，落在里面的百分比 max-height 会与
+   行高互相依赖（循环），Chromium 直接把它当 `none` —— 实测窗口根本不会缩（260 顶着不降）。
+   flex 容器的百分比 max-height 参照的是容器内容盒（由 flex: 1 定死），解析得出来。 */
+.mobile-scan-mask { position: relative; z-index: 0; display: flex; flex: 1; min-height: 0; align-items: center; justify-content: center; pointer-events: none; }
+/* 尺寸由**高度**驱动 + aspect-ratio 反推宽度，这样"永远正方形"这件事只有一个来源；
+   max-height: 100% 再让它自动缩到上面那段空当里（空当多高就多大，横屏 + 报错卡挤压时同样成立）。
+   overflow: hidden 只裁窗口内部（扫描线不会溢出圆角），不影响窗口自己的 box-shadow ——
+   影子画在边框盒之外，本来就不受本元素的 overflow 影响。 */
+.mobile-scan-window { position: relative; height: min(68vw, 260px); max-height: 100%; aspect-ratio: 1; overflow: hidden; border: 1px solid rgba(186, 242, 201, .3); border-radius: 26px; box-shadow: 0 0 0 100vmax rgba(6, 17, 14, .72); }
+.mobile-scan-corner { position: absolute; width: 30px; height: 30px; border: 3px solid #8ce7b0; }
+.mobile-scan-corner.top-left { top: 10px; left: 10px; border-right: 0; border-bottom: 0; border-radius: 10px 0 0 0; }
+.mobile-scan-corner.top-right { top: 10px; right: 10px; border-left: 0; border-bottom: 0; border-radius: 0 10px 0 0; }
+.mobile-scan-corner.bottom-left { bottom: 10px; left: 10px; border-top: 0; border-right: 0; border-radius: 0 0 0 10px; }
+.mobile-scan-corner.bottom-right { right: 10px; bottom: 10px; border-top: 0; border-left: 0; border-radius: 0 0 10px 0; }
+.mobile-scan-laser { position: absolute; right: 14px; left: 14px; height: 2px; border-radius: 2px; background: linear-gradient(90deg, transparent, #8ce7b0 18%, #d8ffe8 50%, #8ce7b0 82%, transparent); box-shadow: 0 0 10px 2px rgba(140, 231, 176, .5); animation: mobile-scan-sweep 2.6s cubic-bezier(.45, 0, .55, 1) infinite; }
+@keyframes mobile-scan-sweep { 0% { top: 8%; opacity: 0; } 14% { opacity: 1; } 86% { opacity: 1; } 100% { top: 92%; opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .mobile-scan-laser { top: 50%; animation: none; } }
+/* 失败态窗口里没有画面可看（相机没起来），空着会被读成"卡住"，所以给一句说明。 */
+.mobile-scan-window-note { position: absolute; inset: 0; display: grid; place-items: center; color: #7fa593; font-size: 13px; letter-spacing: .04em; }
+/* z-index: 1 —— 文案与底部按钮要压在遮罩那圈 100vmax 影子之上。
+   DOM 顺序是「文案 → 遮罩 → 按钮」（遮罩得待在两者之间才能当伸缩段），
+   三者又都是定位元素，光靠 DOM 顺序会让后画的遮罩把文案压暗。 */
+.mobile-scan-text { position: relative; z-index: 1; text-align: center; text-shadow: 0 1px 8px rgba(4, 14, 11, .8); }
+.mobile-scan-text strong { display: block; font-size: 17px; font-weight: 750; }
+.mobile-scan-text small { display: block; margin-top: 6px; color: #b6d6c6; font-size: 12.5px; line-height: 1.55; }
+/* 吸底不靠 margin-top: auto —— 上方那段"可伸缩的遮罩"已经把剩余空间吃掉了，
+   再写一层 auto 只是同一件事的第二个来源（两处同时存在时谁生效取决于实现细节）。 */
+.mobile-scan-footer { position: relative; z-index: 1; display: grid; gap: 12px; }
+.mobile-scan-error { display: grid; justify-items: start; gap: 9px; margin: 0; border: 1px solid rgba(255, 173, 162, .45); border-radius: 14px; padding: 12px 14px; color: #ffdcd6; background: rgba(58, 18, 14, .8); font-size: 13px; line-height: 1.55; }
+.mobile-scan-settings { min-height: 38px; border: 1px solid rgba(255, 220, 214, .55); border-radius: 999px; padding: 0 16px; color: #ffe9e5; background: transparent; font: inherit; font-size: 13px; font-weight: 750; }
+.mobile-scan-actions { display: flex; align-items: center; justify-content: center; gap: 12px; }
+.mobile-scan-cancel { min-height: 48px; border: 1px solid rgba(238, 250, 243, .5); border-radius: 999px; padding: 0 26px; color: #eefaf3; background: rgba(9, 24, 19, .6); font: inherit; font-size: 15px; font-weight: 750; }
+/* 失败态的主操作是"重新扫描"：取消那一颗此时降级成"关闭"，所以实心态只给重试。 */
+.mobile-scan-retry { min-height: 48px; border: 1px solid #8ce7b0; border-radius: 999px; padding: 0 26px; color: #0c1f18; background: #8ce7b0; font: inherit; font-size: 15px; font-weight: 750; }
+.mobile-scan-torch { display: grid; width: 48px; height: 48px; flex: none; place-items: center; border: 1px solid rgba(238, 250, 243, .5); border-radius: 999px; color: #eefaf3; background: rgba(9, 24, 19, .6); }
+.mobile-scan-torch svg { width: 21px; height: 21px; }
+.mobile-scan-torch[aria-pressed="true"] { border-color: #8ce7b0; color: #0c1f18; background: #8ce7b0; }
+/* 取景层里没有可聚焦的浅色控件，统一用亮青描边代替页面的琥珀色外描边。 */
+.mobile-scan button:focus-visible { outline: 3px solid #8ce7b0; outline-offset: 3px; }
+/* 矮视口（横屏手机 844×390、分屏）下把纵向空间让给取景窗：窗口尺寸由高度驱动，上方
+   文案每多占一行，窗口就少一行。实测窗口高度（同一份代码、只改视口）：
+   390×844 → 260px，844×390 → 255px，844×320 → 185px，700×260 → 125px，720×200 → 65px。
+   65px 已经框不住电脑屏幕上的二维码了，所以分两级收起次要内容：
+   ① ≤560px 收起说明小字（标题留着 —— 用户还得知道自己在扫什么）；
+   ② ≤340px 连标题一起收起，并收紧内边距与按钮间距，把省下的全给窗口。
+   第二级的阈值特意压在 340（而不是 400）：常见横屏尺寸 812×375 / 844×390 落在线外，
+   那两档窗口有 240~255px、本来就够用，不该为了多 5px 丢掉引导标题。
+   两级都只影响观感，不改变任何交互入口（按钮一律留在屏上）。 */
+@media (max-height: 560px) { .mobile-scan-text small { display: none; } }
+@media (max-height: 340px) {
+  .mobile-scan-text { display: none; }
+  .mobile-scan { padding: 10px 16px; padding-top: max(10px, env(safe-area-inset-top)); padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  .mobile-scan-footer { gap: 8px; }
+}
+/* 失败态（data-phase="error"）本来就没有画面，取景窗里只写着"相机未开启"；而它多出的
+   那张报错卡会把窗口挤小（实测 844×390 → 222px、720×200 → 76px），越挤越像"布局坏了"。
+   这一档干脆把空框收掉，让报错与按钮拿回全部空间，并整层居中 —— 此时文案已被上面的规则
+   收起，剩下的就是"为什么失败 + 怎么重试"，信息不缺。只作用于极矮视口：竖屏 844px 高度下
+   窗口有 260px，留着那个框反而更能说明"相机没起来"。 */
+@media (max-height: 340px) {
+  .mobile-scan[data-phase="error"] { justify-content: center; }
+  .mobile-scan[data-phase="error"] .mobile-scan-mask { display: none; }
+}
+/* 注：产物里上面两条 `max-height` 会被压缩器规范化成 range 语法（`@media (height<=560px)`）——
+   功能等价，但要求 WebView ≥ Chromium 104。本产物已经在用 `100dvh`（需 108+），门槛没有提高。 */
+.mobile-scan button:active { transform: scale(.97); }
 
 .mobile-project-picker, .mobile-conversation { max-width: 860px; margin: 0 auto 14px; }
 .mobile-repair { display: block; margin: 4px auto 0; border: 0; padding: 8px; color: #52766a; background: transparent; font-size: 12px; text-decoration: underline; cursor: pointer; }
@@ -54,42 +192,254 @@ body.barcode-scanner-active .mobile-pairing-scanner { display: none; }
 .mobile-pairing-actions .mobile-repair { margin: 0; }
 .mobile-unbind { border: 0; padding: 8px; color: #9a3f38; background: transparent; font-size: 12px; text-decoration: underline; cursor: pointer; }
 .mobile-unbind:disabled { opacity: .5; cursor: default; }
-.mobile-project-choice { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid #c8ded2; border-radius: 7px; padding: 16px; margin: 0 0 10px; color: #19332c; background: #fff; text-align: left; }
-.mobile-project-choice:hover, .mobile-project-choice:focus-visible { border-color: #2c7567; background: #f4fbf6; }
-.mobile-project-choice-content { display: grid; min-width: 0; gap: 6px; }.mobile-project-choice strong { font-size: 18px; }.mobile-project-choice small { overflow: hidden; color: #789187; text-overflow: ellipsis; white-space: nowrap; }.mobile-project-choice b { color: #2c7567; white-space: nowrap; font-size: 12px; }.mobile-project-choice-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }.mobile-project-environment, .mobile-project-running { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #c8ded2; border-radius: 999px; padding: 3px 6px; color: #52766a; background: #f8fcf9; font-size: 12px; font-weight: 700; line-height: 1.2; white-space: nowrap; }.mobile-project-environment svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }.mobile-project-environment.windows { color: #356bb2; background: #f2f7ff; border-color: #cbdcf5; }.mobile-project-environment.windows svg { fill: currentColor; stroke: none; }.mobile-project-environment.wsl { color: #6d5b94; background: #f7f4fc; border-color: #ddd4ed; }.mobile-project-environment.wsl svg { stroke: none; }.mobile-project-environment.remote-linux { color: #267567; background: #eef9f4; border-color: #c7e7d8; }.mobile-project-running i { display: block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }.mobile-project-running.running { color: #25705f; border-color: #b8dacb; background: #e8f5ed; }.mobile-project-running.running i { box-shadow: 0 0 0 3px #cfeadc; animation: mobile-project-running-pulse 1.4s ease-in-out infinite; }.mobile-project-running.idle { color: #74867f; background: #f4f7f5; }
+/* ── 项目卡片 ────────────────────────────────────────────────────────────────
+   整张卡就是一个按钮。三列 grid：[环境图标块] [内容 1fr] [›]。
+   内容列必须写 minmax(0, 1fr)：auto 轨道会按"最长那条内容"的 min-content 撑开，
+   把右侧箭头挤出卡片，而 .mobile-remote 是 overflow-x: hidden —— 挤出去的部分
+   会被静默裁掉（320px + 长项目名必然触发）。
+
+   信息分层：左侧图标块承载"这是哪台机器上的项目"（环境色底 + 环境图标），所以第二行
+   的元信息即使被省略号截断也不会丢关键信息 —— 元信息按"越靠前越重要"排序
+   （环境 · 分支 · 任务数 · 会话数），窄屏上先被牺牲的只会是尾巴上的计数。
+   运行状态保留文字而不只给一个圆点：它是"现在能不能连上去"的唯一先验。 */
+/* 圆角与同屏的任务队列卡片（.mobile-task-panel .mobile-task 也是 12px）保持一致：
+   两处都是"卡片列表"，7px 留给信息面板，14px 会和任务面板对不上。 */
+.mobile-project-choice { width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; border: 1px solid #dfeae4; border-radius: 12px; padding: 14px; margin: 0 0 10px; color: #19332c; background: #fff; text-align: left; cursor: pointer; box-shadow: 0 1px 2px rgba(25, 51, 44, .05); transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+.mobile-project-choice:disabled { opacity: .6; cursor: default; }
+/* 聚焦环交给 .mobile-remote button:focus-visible 那条全局琥珀色 outline（页面统一约定），
+   这里不再叠一层 border/shadow —— 两套焦点样式同时出现只会互相打架。 */
+/* 悬停只给精确指针：触屏上 hover 会粘在刚点过的那张卡上，看起来像还按着没松手。 */
+@media (hover: hover) and (pointer: fine) {
+  .mobile-project-choice:not(:disabled):hover { border-color: #a9cfbc; box-shadow: 0 8px 20px -12px rgba(25, 51, 44, .5); transform: translateY(-1px); }
+}
+.mobile-project-choice:not(:disabled):active { transform: translateY(0); box-shadow: 0 1px 2px rgba(25, 51, 44, .08); }
+.mobile-project-mark { display: grid; width: 44px; height: 44px; place-items: center; border: 1px solid #d5e7dd; border-radius: 13px; color: #3d6a5c; background: #f1f8f4; }
+.mobile-project-mark svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+.mobile-project-mark.windows { color: #2f6cba; border-color: #ccdcf4; background: linear-gradient(160deg, #f3f8ff, #dfeafb); }
+.mobile-project-mark.windows svg { fill: currentColor; stroke: none; }
+.mobile-project-mark.wsl { color: #6a569b; border-color: #ded5ef; background: linear-gradient(160deg, #f9f5fd, #ece5f8); }
+.mobile-project-mark.wsl svg { stroke: none; }
+.mobile-project-mark.remote-linux { color: #1f7a68; border-color: #c3e5d6; background: linear-gradient(160deg, #f1faf6, #d9f0e5); }
+.mobile-project-choice-content { display: grid; min-width: 0; gap: 5px; }
+/* flex-start 而不是 center：项目名可以是两行（实测 17 字），居中会让胶囊飘在两行中间，
+   和名字的第一行对不上。 */
+.mobile-project-choice-head { display: flex; min-width: 0; align-items: flex-start; gap: 8px; }
+/* 项目名最多两行：只给一行会把长名字（实测 17 字）截得太狠，不封顶又会让卡片高矮参差。 */
+.mobile-project-choice strong { display: -webkit-box; overflow: hidden; flex: 1; min-width: 0; color: #1c3a31; font-size: 16px; font-weight: 750; line-height: 1.35; word-break: break-word; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+/* line-height 必须显式给：这个 <small> 继承的是全局行高，卡片高度会跟着全局值漂
+   （实测同一张卡在 1 行名字下忽高忽低，量到 72 / 77.3 两个数）。 */
+.mobile-project-choice-meta { overflow: hidden; color: #7b9187; font-size: 12px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-project-choice-chevron { color: #a3bcaf; font-size: 22px; line-height: 1; }
+/* 运行状态做成不加边框的实底色胶囊：整卡已经有一圈边框，胶囊再描一道边就是"卡里套卡"，
+   视觉噪音全落在描边上了。
+
+   变体用 data-state 而不是第二个类名：style.css 里有一条全局的 `.ready, .running { padding: 6px 9px }`
+   （裸类名，见那边的 .head-actions 状态药丸），本组件的 `running` 类名会被它一起命中、
+   与 `.mobile-project-running` 同权重、又排在后面 —— 于是"运行中"那颗胶囊凭空多出
+   4px/3px padding（实测 26.3px vs 未运行的 20.3px），卡片高度也跟着飘。
+   属性选择器不参与这套类名碰撞，且这条同源性不会随样式表顺序改变。 */
+.mobile-project-running { display: inline-flex; flex: none; align-items: center; gap: 4px; border-radius: 999px; padding: 3px 7px; color: #74867f; background: #f1f5f3; font-size: 11px; font-weight: 800; line-height: 1.3; white-space: nowrap; }
+.mobile-project-running i { display: block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.mobile-project-running[data-state="running"] { color: #1f6d58; background: #e4f5eb; }
+.mobile-project-running[data-state="running"] i { box-shadow: 0 0 0 3px #cfeadc; animation: mobile-project-running-pulse 1.4s ease-in-out infinite; }
 @keyframes mobile-project-running-pulse { 50% { opacity: .5; } }
-.mobile-conversation-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #dbe9e0; padding: 4px 0 14px; }.mobile-conversation-toolbar h2 { margin: 0 0 5px; }.mobile-conversation-toolbar small { color: #789187; }.mobile-conversation-picker { position: relative; width: min(45%, 220px); }.mobile-conversation-picker-trigger { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 44px; gap: 8px; border: 1px solid #c5dad0; border-radius: 5px; padding: 9px 10px; color: #19332c; background: #fff; font: inherit; text-align: left; }.mobile-conversation-picker-trigger span { color: #2c7567; font-size: 18px; }.mobile-conversation-options { position: absolute; z-index: 8; top: calc(100% + 6px); right: 0; left: 0; display: grid; max-height: 260px; overflow: auto; border: 1px solid #c5dad0; border-radius: 5px; padding: 4px; background: #fff; box-shadow: 0 6px 20px rgba(25, 51, 44, .16); }.mobile-conversation-options button { display: grid; gap: 3px; border: 0; border-radius: 4px; padding: 9px 8px; color: #19332c; background: transparent; font: inherit; text-align: left; }.mobile-conversation-options button:hover, .mobile-conversation-options button[aria-selected="true"] { background: #eaf7ef; }.mobile-conversation-options small { color: #789187; font-size: 12px; }
-.mobile-conversation-toolbar-actions { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.mobile-agent-processing { display: flex; min-height: 38px; box-sizing: border-box; align-items: center; gap: 9px; margin-top: 10px; border: 1px solid #b8dcca; border-radius: 6px; padding: 8px 11px; color: #216b58; background: #eef9f2; font-size: 12px; font-weight: 750; }
+/* ── 会话视图顶栏：一行标题 + ⋯ 菜单 ──────────────────────────────────────
+   原来会话页顶部是两段：一段是「会话标题 + 状态」的标题条，一段是「历史 / 新会话 / 任务」
+   三个常驻按钮。390×800 实测这两段加起来吃掉 199px（屏幕顶到第一条消息），接近四分之一屏 ——
+   而这三个入口和输入条「＋」面板的「会话」组**完全重复**，等于拿最贵的顶部空间换了一次重复。
+   现在归并成一行：标题栏的 h1 改成**会话名**（用户此刻关心的是哪条对话，不是哪个项目），
+   刷新与三个入口收进右侧 ⋯。实测顶部吃掉 70px。 */
+/* 会话名会比项目名长，且右边多了 ⋯ —— 品牌方块在会话里是纯噪声，让位给标题。 */
+.mobile-conversation-mode .mobile-brand-mark { display: none; }
+/* 非「就绪」才出现的状态胶囊：排队中 / 执行中 / 已完成 / 失败 / 已停止。
+   挂在标题后面而不是单独占一行 —— 「失败」和「已停止」必须一眼可见，但不值一行高度。 */
+.mobile-conversation-state { flex: none; border: 1px solid transparent; border-radius: 999px; padding: 3px 9px; color: #216b58; background: #e4f5eb; font-size: 11px; font-weight: 750; line-height: 1.5; white-space: nowrap; }
+.mobile-conversation-state-queued { color: #6b6a37; background: #f6f5e3; }
+.mobile-conversation-state-running { color: #14584a; background: #d9f0e4; }
+.mobile-conversation-state-completed { color: #3f6b5e; background: #eef3f1; }
+.mobile-conversation-state-failed, .mobile-conversation-state-stopped { color: #9b3e33; background: #fdeeea; }
+.mobile-header-menu { position: relative; flex: none; }
+/* 38×38 与返回键同一档；热区由文件顶部那条 ::after 统一外扩到 44（带边框 ⇒ -4px，别改成 -3px）。 */
+.mobile-header-menu-button { position: relative; display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid #cfe4da; border-radius: 999px; padding: 0; color: #256a5b; background: #eaf4ef; font: inherit; font-size: 19px; font-weight: 800; line-height: 1; }
+/* 展开态用"浅底加深描边"，**不**整颗填成实心深绿：填实之后 ⋯ 字形和右上角标（同为浅色）
+   会糊成一团深绿块，看不出是个按钮。定案与刷新胶囊的忙碌态一致 —— 状态靠底色变化表达。 */
+.mobile-header-menu-button[aria-expanded="true"] { border-color: #2c7567; color: #1d5b4e; background: #dcefe4; }
+/* 「还有几个任务没跑完」是唯一一眼可见的状态信号，收进菜单就等于看不见了 ——
+   做成 ⋯ 上的角标；角标为 0 时整个元素不渲染。位置贴右上，别压住 ⋯ 字形本身。 */
+.mobile-header-menu-badge { position: absolute; top: -4px; right: -3px; display: grid; min-width: 17px; height: 17px; place-items: center; border: 2px solid #f3f8f4; border-radius: 999px; padding: 0 4px; color: #fff; background: #2c7567; font-size: 10px; font-weight: 800; line-height: 1; }
+/* 下拉面板从 ⋯ 下方展开、右对齐。不能超出屏幕：min-width 用 min() 夹住窄屏。 */
+.mobile-header-menu-sheet { position: absolute; z-index: 40; top: calc(100% + 8px); right: 0; display: grid; min-width: min(216px, calc(100vw - 32px)); gap: 2px; border: 1px solid #dfeae4; border-radius: 14px; padding: 6px; background: #fff; box-shadow: 0 12px 30px rgba(25, 51, 44, .16); }
+.mobile-header-menu-sheet button { display: flex; min-height: 44px; align-items: center; justify-content: space-between; gap: 12px; border: 0; border-radius: 9px; padding: 8px 12px; color: #1d4b40; background: transparent; font: inherit; font-size: 14px; font-weight: 650; text-align: left; }
+/* 「执行 Agent」是信息行、不是操作行：不做 hover、不进 tab 序列、与下面的菜单项用一条线隔开。
+   Agent 名从标题栏挪到这里 —— 会话名要独占那一行最大的字，Agent 是次级信息。 */
+.mobile-header-menu-info { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px 9px; color: #587568; font-size: 12px; font-weight: 700; line-height: 1.5; }
+.mobile-header-menu-info small { flex: none; color: #1d4b40; font-size: 12.5px; font-weight: 750; }
+.mobile-header-menu-sheet button:hover { background: #eef7f2; }
+/* 禁用态用配色、不用 opacity：菜单面板是纯白底，半透明文字在浅色页面上会糊成一片
+   （与刷新胶囊 / 发送键同一条定案）。#64857a on #fff = 4.86:1。 */
+.mobile-header-menu-sheet button:disabled { color: #64857a; }
+.mobile-header-menu-sheet button small { flex: none; color: #587568; font-size: 12px; font-weight: 700; line-height: 1.5; }
+.mobile-header-menu-sheet button:disabled small { color: #7b948a; }
+.mobile-header-menu-separator { height: 1px; margin: 4px 6px; background: #eef4f0; }
+/* 处理状态条是消息列表的最后一个网格项（跟在最后一条消息后面），它与上一条消息的间距
+   由 .mobile-message-list 的 gap 提供，所以自身不再留 margin。 */
+.mobile-agent-processing { display: flex; min-height: 38px; box-sizing: border-box; align-items: center; gap: 9px; margin-top: 0; border: 1px solid #b8dcca; border-radius: 6px; padding: 8px 11px; color: #216b58; background: #eef9f2; font-size: 12px; font-weight: 750; }
 .mobile-agent-processing-dots { display: inline-flex; align-items: center; gap: 4px; }
 .mobile-agent-processing-dots i { display: block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: mobile-agent-processing-dot 1.15s ease-in-out infinite; }
 .mobile-agent-processing-dots i:nth-child(2) { animation-delay: .16s; }
 .mobile-agent-processing-dots i:nth-child(3) { animation-delay: .32s; }
 @keyframes mobile-agent-processing-dot { 0%, 60%, 100% { opacity: .3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
 @media (prefers-reduced-motion: reduce) { .mobile-agent-processing-dots i { animation: none; opacity: .75; } }
-.mobile-new-conversation, .mobile-task-toggle { min-height: 44px; border: 1px solid #8fb9a5; border-radius: 5px; padding: 8px 10px; color: #2c7567; background: #fff; font: inherit; font-size: 12px; font-weight: 700; white-space: nowrap; }
-.mobile-new-conversation:hover, .mobile-task-toggle:hover { background: #eaf7ef; }
-.mobile-task-toggle span { display: inline-grid; min-width: 20px; min-height: 20px; place-items: center; margin-left: 3px; border-radius: 999px; color: #fff; background: #2c7567; font-size: 12px; }
-.mobile-message-list { display: grid; gap: 10px; padding: 14px 0; }.mobile-message { max-width: 88%; border: 1px solid #d4e4da; border-radius: 8px; padding: 11px 13px; background: #fff; }.mobile-message.user { justify-self: end; border-color: #a8d2bc; background: #eaf7ef; }.mobile-message small { color: #789187; font-size: 12px; }.mobile-message p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
-.mobile-message-markdown { margin-top: 6px; min-width: 0; overflow-wrap: anywhere; }
-.mobile-message-markdown pre { max-width: 100%; overflow-x: auto; }
-.mobile-message-markdown p { margin: 0 0 10px; white-space: normal; }
+/* 列宽必须用 minmax(0, 1fr) 钉死：默认的 auto 轨道会按"最宽那条消息"的 min-content
+   撑开——消息里的长代码行（pre 不换行）、宽表格（width: max-content）、大截图
+   （img 没有 max-width）都能把这一列顶到 1500px 以上。.mobile-remote 是
+   overflow-x: hidden，超出部分被直接裁掉，于是整屏消息都只剩左边一部分。 */
+.mobile-message-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 0; }
+/* min-width: 0 是第二道闸：grid 项的自动最小尺寸等于 min-content，只要还有内容撑得住这个
+   下限，气泡就会被顶出屏幕。实测（390px，注入还原法）：只去掉轨道那条、或只去掉这条，
+   都不复现；两条同时去掉才爆（气泡 1530px / 轨道 1628px）。两条都留是因为它们各自只挡
+   一种压力来源，而图片那条约束（markdown.css 的 `.markdown img`）是独立承重的——
+   单独还原它就会溢出 1258px。宽内容一律改为在气泡内部横向滚动。 */
+/* 气泡形状：圆角 16px，靠屏幕那一侧的底角收到 5px —— 尖角指向发送者，是移动端气泡的通用做法。
+   两种角色都必须**显式**写 justify-self：grid 项默认 stretch，Agent 消息会不管内容多少都撑满
+   整条 86%（那句"我把输入条改成…"就是一大块白），这是"卡片不好看"的主因之一。
+   描边同时压到近乎不可见的 #e0ebe4、改由一层极淡投影做分离，去掉 1px 全框的"表格感"。 */
+/* 宽度只有一个来源（94%）：原来这里写 86%、`@media (max-width: 620px)` 里又写 94%，
+   手机上永远走后者 —— 前者等于死值，看着改了其实没生效。 */
+.mobile-message { min-width: 0; max-width: 94%; justify-self: start; border: 1px solid #e0ebe4; border-radius: 16px 16px 16px 5px; padding: 10px 13px; background: #fff; box-shadow: 0 1px 3px rgba(25, 51, 44, .05); }
+/* ── 「我」的消息：实心深绿 + 白字（微信 / iMessage 风）────────────────────────
+   2026-09-13 从 4 个候选方案里选定：对话里我的输入通常短、Agent 的输出通常长，
+   实心块让"谁在说话"一眼可辨。深底上的**每一处前景色都必须显式覆盖**——
+   markdown.css 的标题 / 引用 / 行内代码 / 链接 / 图片引用胶囊都是深绿系（#1d4438 / #285d4e /
+   #0d7253），压在 #2c7567 上直接看不见；代码块内的 code 还要再恢复继承。 */
+.mobile-message.user { justify-self: end; border-color: #2c7567; border-radius: 16px 16px 5px 16px; color: #fff; background: #2c7567; }
+.mobile-message.user small { color: #c2e7d8; }
+.mobile-message.user .mobile-message-markdown { color: #fff; }
+.mobile-message.user .mobile-message-markdown :is(h1, h2, h3, h4, h5, h6) { color: #fff; border-left-color: #7fd3b4; }
+.mobile-message.user .mobile-message-markdown a { color: #e6f6ee; }
+.mobile-message.user .mobile-message-markdown code { border-color: rgba(255, 255, 255, .26); color: #fff; background: rgba(255, 255, 255, .16); }
+.mobile-message.user .mobile-message-markdown :is(blockquote, .markdown-image-reference) { border-color: rgba(255, 255, 255, .26); color: #e6f6ee; background: rgba(255, 255, 255, .12); }
+/* 结构化排版里列表符号也用主题色——深绿底上要挑更亮的一档才看得见。 */
+.mobile-message.user .mobile-message-markdown :is(ul, ol) li::marker { color: #9fdcc4; }
+/* 表格 / 分隔线 / 嵌套列表竖线在浅色气泡里是"浅底深字"，压到深绿上会变成突兀的浅色块 ——
+   一并换成半透明白。td 用纯白而不是 #eefaf4：后者在半透明底上只有 4.27:1，够不上正文的 4.5。 */
+.mobile-message.user .mobile-message-markdown table { border-color: rgba(255, 255, 255, .26); background: rgba(255, 255, 255, .1); }
+.mobile-message.user .mobile-message-markdown th, .mobile-message.user .mobile-message-markdown td { border-color: rgba(255, 255, 255, .2); }
+.mobile-message.user .mobile-message-markdown th { color: #fff; background: rgba(255, 255, 255, .14); }
+.mobile-message.user .mobile-message-markdown td { color: #fff; }
+.mobile-message.user .mobile-message-markdown hr { background: rgba(255, 255, 255, .26); }
+.mobile-message.user .mobile-message-markdown ul ul { border-left-color: rgba(255, 255, 255, .26); }
+.mobile-message.user .mobile-message-markdown pre { color: #eefaf4; background: rgba(0, 0, 0, .24); }
+.mobile-message.user .mobile-message-markdown pre code { border: 0; color: inherit; background: transparent; }
+/* 角色 + 时间是次要信息：11px、低对比度、显式 line-height（<small> 继承全局行高会让同一个组件
+   在不同上下文里量出两个高度）。时间本身也收窄了——见 messageTime。 */
+.mobile-message small { display: block; color: #587568; font-size: 11px; font-weight: 600; line-height: 1.45; }
+/* 裸 <p> 的兜底。移动端消息全部走 ReactMarkdown（下面 `.mobile-message-markdown p` 那条才是
+   实际生效的），所以这里**故意不设 line-height**：它曾经是"在容器上调行高完全没效果"的元凶
+   （直接声明压过继承），去掉之后行高统一由 markdown 那条按方案调整。 */
+.mobile-message p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mobile-message-markdown { margin-top: 6px; min-width: 0; overflow-wrap: anywhere; font-size: 15px; }
+/* ── 气泡内容排版（结构化简报风，2026-09-13 从 4 个候选里选定 D）─────────────
+   正文 15px / 1.66 行高 / 12px 段距；标题带左侧主题色竖条、列表符号用主题色、
+   加粗用主题色，引用带粗色条 + 斜体 —— 扫读最快。
+   **行高必须写在 `p` 上**：`.mobile-message p { line-height: 1.55 }` 是直接声明，
+   容器上的 line-height（靠继承）打不过它（实测候选 B/C/D 第一版行高全被压回 1.55 倍）。 */
+.mobile-message-markdown p { margin: 0 0 12px; line-height: 1.66; white-space: normal; }
+.mobile-message-markdown :is(h1, h2, h3, h4, h5, h6) { margin: 18px 0 8px; padding-left: 9px; border-left: 3px solid #4c9c83; font-size: 1.02em; }
+.mobile-message-markdown ul, .mobile-message-markdown ol { padding-left: 19px; }
+.mobile-message-markdown ul li::marker { color: #4c9c83; }
+.mobile-message-markdown ol li::marker { color: #4c9c83; font-weight: 700; }
+/* 加粗用主题色，但**只限 Agent 气泡**：「我」的气泡是实心深绿，深绿加粗会直接看不见。 */
+.mobile-message:not(.user) .mobile-message-markdown strong { color: #1f6b57; }
+.mobile-message-markdown blockquote { border-left-width: 4px; border-left-color: #4c9c83; font-style: italic; }
+.mobile-message-markdown code { border-color: #c3e2d3; color: #14604b; background: #e9f7ef; }
+/* overscroll-behavior-x: contain 防止在代码块/表格里横向拖动时触发浏览器的返回手势。 */
+.mobile-message-markdown pre { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
+.mobile-message-markdown table { overscroll-behavior-x: contain; }
 .mobile-message-markdown > :last-child { margin-bottom: 0; }
-.mobile-task-drawer-backdrop { position: fixed; z-index: 19; inset: 0; border: 0; background: rgba(13, 34, 27, .34); cursor: pointer; }
-.mobile-task-drawer { position: fixed; z-index: 20; top: 0; right: 0; bottom: 0; display: flex; width: min(390px, calc(100vw - 22px)); flex-direction: column; overflow-y: auto; border-left: 1px solid #c8ded2; padding: 18px 16px; padding-top: max(18px, env(safe-area-inset-top)); padding-bottom: max(18px, env(safe-area-inset-bottom)); color: #19332c; background: #fbfefb; box-shadow: -10px 0 28px rgba(25, 51, 44, .18); }
-.mobile-task-drawer > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #dbe9e0; padding-bottom: 13px; }.mobile-task-drawer > header h3 { margin: 0 0 4px; font-size: 17px; }.mobile-task-drawer > header small { color: #789187; }.mobile-task-drawer > header > button { width: 44px; height: 44px; border: 1px solid #c5dad0; border-radius: 5px; color: #52766a; background: #fff; font-size: 22px; line-height: 1; }
-.mobile-task-filters { display: flex; gap: 6px; margin-top: 14px; overflow-x: auto; border-bottom: 1px solid #dbe9e0; padding-bottom: 7px; scrollbar-width: thin; }
-.mobile-task-filters button { display: inline-flex; min-height: 44px; flex: none; align-items: center; gap: 5px; border: 1px solid #cfe0d6; border-radius: 999px; padding: 8px 13px; color: #52766a; background: #fff; font: inherit; font-size: 12px; font-weight: 750; white-space: nowrap; }
+/* 运行状态卡（API 重试 / 上下文压缩 / 后台任务 / 执行失败）。
+   它是"对话进行到哪一步"的旁注，不是对话内容本身，所以做成一档更弱的整行提示：
+   浅底、细左边条、比气泡小一号的字。三列 grid 里 minmax(0, 1fr) 与 min-width: 0
+   和第二道闸同理——详情或标题里可能有长 URL / 长 token 数字，任何一列被撑宽都会
+   再把 .mobile-message-list 顶出屏幕，被 overflow-x: hidden 静默裁掉。 */
+.mobile-notice { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 9px; min-width: 0; border: 1px solid #dbe9e0; border-left: 3px solid #6b7fa3; border-radius: 6px; padding: 9px 11px; color: #3a465e; background: #f6f9f7; font-size: 12px; }
+.mobile-notice-icon { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #4a5d80; background: #dde3ef; font-size: 12px; line-height: 1; }
+.mobile-notice-text { min-width: 0; }
+.mobile-notice-text strong { display: block; color: #35505f; font-size: 13px; font-weight: 750; overflow-wrap: anywhere; }
+.mobile-notice-text small { display: block; margin-top: 2px; color: #6d7d8c; font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+.mobile-notice-time { flex: none; color: #9aa7b2; font-size: 11px; white-space: nowrap; }
+/* 变体类名必须带 mobile-notice- 前缀。裸类名（尤其 `.error`）会命中 style.css 里的
+   全局组件样式——那里 .error 是右上角固定的提示条（position: fixed / top: 16px /
+   max-width: min(480px, 100vw - 32px)），实测（320px）错误卡被钉成固定定位、宽度只剩
+   288px，整张卡脱离消息列表浮在屏幕右上角。变体配色本身照抄桌面 .system-card：
+   重试琥珀、失败/错误红、压缩蓝灰，同一个状态在电脑和手机必须是同一种颜色。 */
+.mobile-notice-compact { border-left-color: #6b7fa3; background: #f0f3f9; }
+.mobile-notice-compact_boundary { border-left-color: #5a6b8a; background: #f4f6fa; }
+.mobile-notice-compact_result { border-left-color: #2c7567; background: #eef6f4; }
+.mobile-notice-compact_result .mobile-notice-icon { color: #2c7567; background: #d6e9e4; }
+.mobile-notice-compact_result.mobile-notice-failed { border-left-color: #c65343; background: #fff5f3; }
+.mobile-notice-compact_result.mobile-notice-failed .mobile-notice-icon { color: #9d3a2b; background: #ffe6d9; }
+.mobile-notice-compact_result.mobile-notice-failed .mobile-notice-text strong { color: #8f3a2c; }
+.mobile-notice-api_retry { border-left-color: #b8923a; background: #fbf7ed; }
+.mobile-notice-api_retry .mobile-notice-icon { color: #8a6c2a; background: #f0e8d0; }
+.mobile-notice-task { border-left-color: #7a6b9a; background: #f6f3fa; }
+.mobile-notice-task .mobile-notice-icon { color: #5d4f86; background: #e5ddf2; }
+.mobile-notice-task.mobile-notice-success { border-left-color: #2c7567; background: #eef6f4; }
+.mobile-notice-task.mobile-notice-success .mobile-notice-icon { color: #2c7567; background: #d6e9e4; }
+.mobile-notice-task.mobile-notice-failed { border-left-color: #c65343; background: #fff5f3; }
+.mobile-notice-task.mobile-notice-failed .mobile-notice-icon { color: #9d3a2b; background: #ffe6d9; }
+.mobile-notice-error { border-left-color: #c65343; background: #fff5f3; }
+.mobile-notice-error .mobile-notice-icon { color: #9d3a2b; background: #ffe6d9; }
+.mobile-notice-error .mobile-notice-text strong { color: #8f3a2c; }
+/* 任务队列面板：整页弹层（原来是贴右侧的抽屉）。抽屉在手机上只有 min(390px, 100vw-22px) 宽，
+   标题与 7 个分类只好挤成两行、内容还得各自滚动；改成占满视口的一页之后，头栏与分类栏固定、
+   只有任务列表在滚，"一打开就能看全所有分类"才成立。
+   padding 分四条写：不含 env() 的 `padding: 12px 14px` 是兜底——老 WebView / 不支持 env() 的
+   浏览器会把含 env() 的整条声明丢掉，合成一条写就等于完全没 padding（内容贴死屏幕四边，
+   docs/33 记过这个坑）。padding-inline 的 max() 在宽屏（平板 / 桌面浏览器）居中限宽。 */
+.mobile-task-panel { position: fixed; z-index: 20; inset: 0; display: flex; flex-direction: column; box-sizing: border-box; padding: 12px 14px; padding-top: max(12px, env(safe-area-inset-top)); padding-inline: max(14px, calc((100% - 560px) / 2)); padding-bottom: max(12px, env(safe-area-inset-bottom)); color: #19332c; background: #f4faf6; }
+.mobile-task-panel-header { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 10px; }
+/* 打开面板时是程序化聚焦（面板 tabIndex=-1），不该画聚焦环——面板本身不是可交互控件。 */
+.mobile-task-panel:focus { outline: none; }
+.mobile-task-panel-header h3 { margin: 0 0 3px; font-size: 19px; }
+.mobile-task-panel-header small { color: #6f8a7f; font-size: 12px; }
+.mobile-task-panel-close { display: grid; width: 44px; height: 44px; flex: none; place-items: center; border: 1px solid #c5dad0; border-radius: 5px; color: #52766a; background: #fff; font-size: 22px; line-height: 1; }
+/* 面板正文自己滚动：flex 列里必须配 min-height: 0，否则溢出高度按内容算，滚动条会落到面板外层。 */
+.mobile-task-panel-body { display: flex; flex: 1; min-height: 0; flex-direction: column; overflow-y: auto; overscroll-behavior: contain; padding-top: 4px; }
+/* 分类栏：7 个分类做成一行等宽的分段块。抽屉时代它们横排一行要 577px（实测每个胶囊 67~79px），
+   只能换行平铺成三行，用户还得上下找；现在每格只放"标签 + 计数"两行小字，宽度瓶颈是 3 个中文字
+   （12px 字号 = 36px），390px 屏每格 47px、320px 屏按 11px 字号仍有富余 —— 一行放下，
+   既不用滑动也不用换行。 */
+.mobile-task-filters { display: grid; flex: none; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; margin-top: 10px; border-bottom: 1px solid #dbe9e0; padding-bottom: 10px; }
+.mobile-task-filters button { display: grid; min-width: 0; min-height: 48px; place-content: center; gap: 2px; border: 1px solid #d3e3da; border-radius: 10px; padding: 4px 1px; color: #52766a; background: #fff; font: inherit; font-size: 12px; font-weight: 700; line-height: 1; white-space: nowrap; }
 .mobile-task-filters button.active { border-color: #2c7567; color: #fff; background: #2c7567; }
-.mobile-task-filters button span { min-width: 16px; text-align: center; font-size: 12px; opacity: .8; }
-.mobile-task-drawer .mobile-task-list { margin-top: 0; border-top: 0; padding-top: 8px; }.mobile-task-drawer .mobile-task { align-items: flex-start; border-bottom: 1px solid #e3eee7; padding: 10px 0; }.mobile-task-drawer .mobile-task > div:first-child { gap: 5px; }.mobile-task-drawer .mobile-task strong { display: -webkit-box; overflow: hidden; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }.mobile-task-status { display: inline-flex; width: fit-content; align-items: center; border-radius: 999px; padding: 3px 7px; color: #52766a; background: #edf6ef; font-size: 12px; font-weight: 800; }.mobile-task-status.status-running { color: #176b57; background: #dff3e8; }.mobile-task-status.status-awaiting_review { color: #8b5b1e; background: #fff1ce; }.mobile-task-status.status-failed, .mobile-task-status.status-blocked { color: #9b3e33; background: #fff0ec; }.mobile-task-status.status-completed, .mobile-task-status.status-done { color: #316c51; background: #e3f2e7; }.mobile-task-status.status-cancelled { color: #708078; background: #edf1ee; }
+.mobile-task-filters button > span { color: #7d998d; font-size: 10px; font-weight: 800; line-height: 1; }
+.mobile-task-filters button.active > span { color: #cfe7dd; }
+.mobile-task-panel .mobile-task-list { gap: 10px; margin-top: 0; border-top: 0; padding-top: 8px; }
+/* 卡片恒为纵向排列：面板正文在宽屏下也被 padding-inline 限宽到 560px，标题＋右侧按钮的横向
+   布局在这个宽度里会把标题挤成窄条（2026-09-12 实测截图）。
+   整页面板有浅绿底，卡片就做成白底圆角块——原来靠一条底边框分隔，在整页宽度下每张卡片的
+   起止位置反而看不清楚。 */
+.mobile-task-panel .mobile-task { flex-direction: column; align-items: stretch; gap: 8px; border: 1px solid #e0ece5; border-radius: 12px; padding: 12px; background: #fff; }
+/* 标题独占一行；状态胶囊与优先级并到同一行——原来这三个元素各占一行，折叠状态下白白多出两行高度。 */
+.mobile-task-panel .mobile-task > div:first-child { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 4px 8px; }
+.mobile-task-panel .mobile-task > div:first-child > strong { grid-column: 1 / -1; }
+.mobile-task-panel .mobile-task strong { display: -webkit-box; overflow: hidden; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+/* 操作行与"查看详情"分开两行：按钮紧跟元信息（右对齐），详情开关留在卡片最底部，
+   避免"删除"看起来像挂在详情开关旁边的孤零零一个按钮。 */
+.mobile-task-panel .mobile-task-actions { align-self: flex-end; gap: 6px; }
+.mobile-task-panel .mobile-task-disclosure { margin-top: 0; border-top: 1px solid #eef5f0; }
+.mobile-task-status { display: inline-flex; width: fit-content; align-items: center; border-radius: 999px; padding: 3px 7px; color: #52766a; background: #edf6ef; font-size: 12px; font-weight: 800; }.mobile-task-status.status-running { color: #176b57; background: #dff3e8; }.mobile-task-status.status-awaiting_review { color: #8b5b1e; background: #fff1ce; }.mobile-task-status.status-failed, .mobile-task-status.status-blocked { color: #9b3e33; background: #fff0ec; }.mobile-task-status.status-completed, .mobile-task-status.status-done { color: #316c51; background: #e3f2e7; }.mobile-task-status.status-cancelled { color: #708078; background: #edf1ee; }
 .mobile-task-disclosure { margin-top: 4px; color: #607c70; font-size: 12px; }
 .mobile-task-disclosure summary { min-height: 32px; padding: 6px 0; color: #2c7567; cursor: pointer; }
 .mobile-task-disclosure summary::after { content: "⌄"; margin-left: 6px; }
 .mobile-task-disclosure[open] summary::after { display: inline-block; transform: rotate(180deg); }
 .mobile-task-disclosure p { margin: 0 0 5px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
 .mobile-task-disclosure time { color: #789187; font-size: 12px; }
-.mobile-task-drawer .mobile-create { margin: 14px 0 0; border: 0; border-top: 1px solid #dbe9e0; border-radius: 0; padding: 16px 0 0; }
+/* 「创建任务」和任务卡片一样做成白底圆角块：整页面板里它原来只是一条分割线下的裸表单，
+   标题还沿用 h3 的默认字号（22px，比面板标题「任务队列」还大），层级是反的。 */
+.mobile-task-panel .mobile-create { margin: 16px 0 0; border: 1px solid #e0ece5; border-radius: 12px; padding: 14px; background: #fff; }
+.mobile-task-panel .mobile-create h3 { margin: 0 0 10px; color: #294e43; font-size: 15px; }
 .mobile-task-modal-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 16px; background: rgba(13, 34, 27, .42); }
 .mobile-task-modal { width: min(100%, 420px); display: grid; gap: 12px; box-sizing: border-box; border: 1px solid #c8ded2; border-radius: 9px; padding: 18px; background: #fff; box-shadow: 0 18px 48px rgba(25, 51, 44, .24); }
 .mobile-task-modal header, .mobile-task-modal footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -103,44 +453,126 @@ body.barcode-scanner-active .mobile-pairing-scanner { display: none; }
 .mobile-task-modal .mobile-task-delete-confirm { border-color: #b0523f; color: #fff; background: #b0523f; }
 .mobile-task-delete { border-color: #e5b8aa !important; color: #9b3e33 !important; background: #fff4f1 !important; }
 .mobile-task-delete:disabled { opacity: .5; }
-.mobile-composer { position: fixed; z-index: 4; right: max(12px, calc((100vw - 860px) / 2)); bottom: 0; bottom: env(safe-area-inset-bottom); left: max(12px, calc((100vw - 860px) / 2)); display: flex; align-items: flex-end; gap: 8px; border: 1px solid #bad4c4; border-radius: 7px; padding: 8px; background: #fff; box-shadow: 0 4px 18px rgba(25, 51, 44, .16); }
-.mobile-composer textarea { min-width: 0; min-height: 40px; flex: 1; max-height: 120px; resize: none; line-height: 1.4; }
-.mobile-composer button { display: none; place-items: center; width: 46px; height: 40px; border: 1px solid #8fb9a5; border-radius: 5px; padding: 0; color: #fff; background: #2c7567; font-size: 22px; font-weight: 700; }
-.mobile-composer button:not(:disabled) { display: grid; }
-.mobile-composer button:disabled { opacity: .5; }
-.mobile-conversation-mode { padding-top: 14px; padding-top: calc(14px + env(safe-area-inset-top)); padding-bottom: 86px; }.mobile-conversation-mode .mobile-remote-header { margin-bottom: 10px; }.mobile-conversation-mode .mobile-remote h1 { font-size: 23px; }
-@media (max-width: 620px) { .mobile-conversation-toolbar { align-items: stretch; flex-direction: column; }.mobile-conversation-picker { width: 100%; }.mobile-conversation-toolbar-actions { width: 100%; }.mobile-conversation-toolbar-actions > * { flex: 1; }.mobile-conversation-toolbar-actions .mobile-conversation-picker { flex: 2; }.mobile-message { max-width: 94%; } }
+/* ── 输入区（整盒 + 单行内嵌，对齐 DeepSeek / ChatGPT 的移动端）────────────
+   一颗大圆角盒子，里面是**一行**：[＋] [文字] [发送] —— 两颗按钮既在输入框里面，
+   又和文字同一行（多行输入时按钮贴底、落到右下角），比"文字在上、按钮行在下"紧凑得多。
+   外壳仍负责 贴底 / 白底 / 顶部圆角 / 安全区 —— 旧写法把整条
+   `bottom: env(safe-area-inset-bottom)`，在有手势条的机型上会让输入条整体离开屏幕下缘、
+   中间露出一条没有遮罩的缝，滚动内容从缝里穿过去。
+   左右内边距复刻上方内容列的规则（≤380 是 10px、≤620 是 12px；更宽时取 max(16px, 4vw, 居中偏移)），
+   盒子的左右边缘因此与消息列对齐 —— 更早那版悬浮方块在 768px 上比消息列靠外约 19px。 */
+/* 外壳只负责「贴底固定」与安全区，不再自己画白底 / 圆角 / 上边框 / 投影 —— 那些交给输入框盒子本身。
+   原先外壳是通栏白底，盒子浮在里面，底部就多出一条 8px 高的白色横带（用户看到的"没铺满的白底"）。
+   外壳透明之后必须配 pointer-events: none，否则它整条会盖住底下的内容（子元素再把点击收回来）。 */
+.mobile-composer-shell { position: fixed; z-index: 4; right: 0; bottom: 0; left: 0; display: flex; flex-direction: column; pointer-events: none; }
+.mobile-composer-shell > * { pointer-events: auto; }
+.mobile-composer, .mobile-composer-tools { padding-right: max(12px, calc((100vw - 860px) / 2)); padding-left: max(12px, calc((100vw - 860px) / 2)); }
+@media (min-width: 621px) { .mobile-composer, .mobile-composer-tools { padding-right: max(16px, 4vw, calc((100vw - 860px) / 2)); padding-left: max(16px, 4vw, calc((100vw - 860px) / 2)); } }
+.mobile-composer { display: flex; flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px; padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+/* 盒子自己承担描边与聚焦指示（textarea 不再画自己的焦点环，见下面的 outline: none）。 */
+.mobile-composer-box { display: flex; align-items: flex-end; gap: 6px; width: 100%; min-width: 0; border: 1px solid #cfe0d7; border-radius: 22px; padding: 6px; background: #fff; box-shadow: 0 4px 14px rgba(25, 51, 44, .1); transition: border-color .16s ease, box-shadow .16s ease; }
+.mobile-composer-box:focus-within { border-color: #2c7567; box-shadow: 0 0 0 3px rgba(44, 117, 103, .13); }
+/* 与页面其它动效一致：用户在系统里关掉动画时，边框/阴影的过渡也一并去掉。 */
+@media (prefers-reduced-motion: reduce) { .mobile-composer-box { transition: none; } }
+/* 已引用的技能：输入框上方的一行可删除胶囊。
+   点技能**不再**把「技能名 + 描述」整段塞进 textarea —— 技能描述动辄上百字，手机上会铺满整屏，
+   而 setMessageDraft 是整体覆盖，用户写到一半的草稿会被无声吃掉。现在正文留给用户自己写，
+   发送那一刻才由 composeSkillMessage 展开成完整引用指令（与桌面端 .composer-skill-refs 同一形态）。
+   这一行没有描述文字，只有技能名：要"看清楚描述"，按钮本身有 title、点开面板里的胶囊也有。 */
+.mobile-skill-refs { display: flex; flex: 0 0 100%; width: 100%; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.mobile-skill-ref { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; border: 1px solid #b3d9cb; border-radius: 999px; padding-left: 12px; background: #eef7f2; }
+.mobile-skill-ref-name { overflow: hidden; padding: 5px 0; color: #1f6b57; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+/* 这两条必须带 .mobile-composer 前缀：`.mobile-composer button` 是"类 + 元素"，
+   特异性比单个类高，不带前缀就会被 38px 的方块尺寸盖掉。 */
+.mobile-composer .mobile-skill-ref-remove { position: relative; display: grid; flex: none; width: 28px; height: 28px; place-items: center; border: 0; border-radius: 999px; padding: 0; color: #4d7d6d; background: transparent; font-size: 15px; }
+/* 视觉 28px、热区靠 ::after 外扩 8px 补到 44 —— 与输入条那两颗按钮同一套做法。 */
+.mobile-composer .mobile-skill-ref-remove::after { position: absolute; inset: -8px; content: ""; border-radius: inherit; }
+.mobile-composer .mobile-skill-ref-remove:disabled { color: #9db3a9; }
+.mobile-skill-ref-hint { color: #7d968b; font-size: 11px; }
+/* 单行高度要与两侧 38px 圆钮齐平：23.2（1.45 行高）+ 上下各 7px ≈ 38。 */
+.mobile-composer textarea { min-width: 0; flex: 1; min-height: 38px; max-height: 140px; resize: none; overflow-y: auto; border: 0; border-radius: 0; padding: 7px 4px; background: transparent; line-height: 1.45; }
+/* 按钮视觉 38px，热区靠 ::after 外扩 3px 补回 44 —— 与头部那三颗同一套做法：
+   伪元素属于按钮自己，落在环上的点击仍归它。两颗按钮都常驻（旧实现里发送键在草稿为空时
+   display: none，一打字就凭空出现，把输入框宽度挤掉一颗按钮、光标跟着跳）。 */
+.mobile-composer button { position: relative; display: grid; flex: none; place-items: center; width: 38px; height: 38px; border: 0; border-radius: 999px; padding: 0; }
+.mobile-composer button::after { position: absolute; inset: -3px; content: ""; border-radius: inherit; }
+.mobile-composer .mobile-composer-tool { color: #2c7567; background: #edf5f1; }
+.mobile-composer .mobile-composer-tool[aria-expanded="true"] { color: #fff; background: #2c7567; }
+.mobile-composer .mobile-composer-send { color: #fff; background: #2c7567; }
+/* 禁用态「浅底 + 深灰绿箭头」实测 3.5:1（更浅的 #93ab9f 只有 2.18:1，按钮会像丢了）。
+   沿用刷新胶囊的定案：禁用/忙碌不走 opacity，半透明在浅色页面上会糊成一片。 */
+.mobile-composer .mobile-composer-send:disabled { color: #64857a; background: #e9f0ec; }
+/* textarea 在 Chromium 里"只要聚焦就命中 :focus-visible"，画出来的是盒子内部的一圈描边，
+   会和盒子自己的边框叠成双层；焦点指示改由 .mobile-composer-box:focus-within 承担
+   （整盒变绿 + 3px 外发光，键盘用户同样看得见）。 */
+.mobile-remote .mobile-composer textarea:focus-visible { outline: none; }
+/* 工具面板在同一外壳内向上展开（普通流堆叠，不必再算输入条高度）。 */
+/* 面板限高：三组胶囊折行之后能长到 360px，会把消息区压到几乎没有。
+   外壳已经透明，所以面板自带白底 / 描边 / 投影，做成浮在输入框上方的一张独立卡片。 */
+/* 面板限高从 min(320px,44vh) 提到 min(400px,50vh)：里面现在有四组（同源三组 + 本地输入组），
+   320px 时"技能"和"输入"都落在折叠线以下，换行/清空草稿要滚动才够得着。 */
+.mobile-composer-tools { display: grid; gap: 12px; max-height: min(400px, 50vh); overflow-y: auto; margin-top: 6px; border: 1px solid #dbe9e0; border-radius: 16px; padding-top: 12px; padding-bottom: 12px; background: #fff; box-shadow: 0 -4px 16px rgba(25, 51, 44, .08); }
+.mobile-tool-group { display: grid; gap: 8px; }
+.mobile-tool-group > h3 { display: flex; align-items: center; gap: 6px; margin: 0; color: #587568; font-size: 12px; font-weight: 800; line-height: 1.4; }
+.mobile-tool-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+/* 触控高度与页面其它控件同一档（≥44），免得面板里这三组胶囊是全页唯一"矮一截"的按钮。 */
+.mobile-tool-chips button { min-height: 44px; border: 1px solid #cfe3d8; border-radius: 999px; padding: 8px 14px; color: #23564a; background: #f5faf7; font-size: 13px; font-weight: 700; }
+/* 禁用态统一到与发送键同一档的 #64857a（3.79:1）：原来的 #9db3a9 只有 2.08:1，胶囊像消失了。 */
+.mobile-tool-chips button:disabled { border-color: #e3ece7; color: #64857a; background: #f5f8f6; }
+/* 分组标题里的条数（与桌面端 quick-tag-count 同义）："电脑端有哪些"先看条数就知道，
+   不用把胶囊一条条数过去。0 条时下面直接给空态说明，条数仍显示 0 —— 隐藏了反而像没这一组。 */
+.mobile-tool-group > h3 span, .mobile-tool-subgroup > h4 span { color: #587568; font-size: 11px; font-weight: 700; }
+/* 电脑端没有任何条目时的空态：说明"数据来自电脑端"，而不是让用户以为面板坏了。 */
+.mobile-tool-empty { margin: 0; border: 1px dashed #dbe9e0; border-radius: 10px; padding: 10px 12px; color: #587568; font-size: 12px; line-height: 1.6; }
+/* 技能按来源再分一层（项目 > 用户 > 系统/官方），与桌面端 skill-source-group 的结构对齐。 */
+.mobile-tool-subgroups { display: grid; gap: 10px; }
+.mobile-tool-subgroup { display: grid; gap: 6px; }
+.mobile-tool-subgroup > h4 { display: flex; justify-self: start; align-items: center; gap: 6px; margin: 0; border-radius: 999px; padding: 3px 9px; color: #1f5b4c; background: #eef7f2; font-size: 11px; font-weight: 750; line-height: 1.5; }
+/* defaultAction=confirm 的快捷方式在手机上先弹确认框：命令会在电脑端执行，模板要能看清。
+   长模板自己滚动，别把弹窗顶出屏幕。 */
+.mobile-shortcut-confirm-template { max-height: 168px; overflow-y: auto; margin: 0; border: 1px solid #dfeae4; border-radius: 8px; padding: 10px 12px; color: #1d4b40; background: #f5faf7; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mobile-conversation-mode { padding-top: 14px; padding-top: calc(14px + env(safe-area-inset-top)); padding-bottom: 84px; padding-bottom: calc(var(--mobile-composer-height, 68px) + 16px); }.mobile-conversation-mode .mobile-remote-header { margin-bottom: 4px; }.mobile-conversation-mode .mobile-remote h1 { font-size: 23px; }
 
 /* Mobile touch and keyboard refinements. Keep the page comfortable at both
    narrow phone widths and large WebView device-pixel ratios. */
 .mobile-remote { width: 100%; overflow-x: hidden; -webkit-tap-highlight-color: transparent; }
 .mobile-remote button, .mobile-remote input, .mobile-remote textarea, .mobile-remote summary { touch-action: manipulation; }
 .mobile-remote button:focus-visible, .mobile-remote input:focus-visible, .mobile-remote textarea:focus-visible, .mobile-remote summary:focus-visible { outline: 3px solid #f0b94d; outline-offset: 2px; }
-.mobile-back { width: 44px; height: 44px; }
-.mobile-refresh, .mobile-pairing button, .mobile-token-form button, .mobile-create button, .mobile-task-actions button { min-height: 44px; }
-.mobile-refresh { min-width: 76px; }
-.mobile-project-choice { min-height: 88px; }
-.mobile-project-choice b { display: inline-flex; align-items: center; gap: 5px; }
-.mobile-project-choice b::after { content: "›"; color: #78a994; font-size: 20px; line-height: 1; }
-.mobile-task-disclosure summary { min-height: 52px; align-items: center; list-style: none; }
+/* 头部三颗按钮的高度在这里不参与 44px 那一组（它们已经被收成 38px + 3px 外扩热区，
+   见页面顶部 .mobile-back 那段说明）——加回这一组会让它们又长回 44px。 */
+.mobile-pairing button, .mobile-token-form button, .mobile-create button, .mobile-task-actions button { min-height: 44px; }
+/* 卡片高度交给内容算（图标块 44 + 上下 padding 28 = 72px）：原来钉死 88px，多出来的
+   那 16px 是一条没有内容的空白带。 */
+.mobile-project-choice { min-height: 72px; }
+/* 摘要行改用 flex：文字垂直居中、箭头推到最右，高度从 52px 收到 44px——原来文字贴在 52px 高的
+   顶边，下面整块是空白（用户说的"折叠状态下还有很多空白"就出在这里）。 */
+.mobile-task-disclosure summary { display: flex; align-items: center; justify-content: space-between; min-height: 44px; list-style: none; }
 .mobile-task-disclosure summary::-webkit-details-marker { display: none; }
 .mobile-task-disclosure summary::after { flex: none; color: #2c7567; content: "⌄"; font-size: 20px; line-height: 1; transition: transform .16s ease; }
 .mobile-task-disclosure[open] summary::after { transform: rotate(180deg); }
-.mobile-task-disclosure summary span { margin-left: auto; }
 .mobile-message-list { min-height: 120px; }
-.mobile-message p { margin-bottom: 0; }
-.mobile-composer { bottom: 0; bottom: env(safe-area-inset-bottom); padding: 8px; }
-.mobile-composer textarea { min-height: 42px; max-height: 120px; overflow-y: auto; }
-.mobile-composer button { min-width: 44px; min-height: 44px; }
-.mobile-conversation-mode { padding-bottom: 112px; padding-bottom: calc(112px + env(safe-area-inset-bottom)); }
+/* 这里原本有一条 `.mobile-message p { margin-bottom: 0 }`：它在 `.mobile-message-markdown p`
+   （margin: 0 0 10px）之后、同特异性，于是把气泡里**所有段落的间距都压成了 0** ——
+   多段回复挤成一坨。段落间距统一由 markdown 那一段管，这里不再覆盖。 */
+/* 输入条的尺寸、触控尺寸与底部安全区已经并入上面「输入区（整盒 + 单行内嵌）」那一段
+   （textarea min-height 38 / max-height 140 / 按钮视觉 38 而热区 ≥44），这里不再二次覆盖。 */
+/* 分类栏是 7 等分一行：320px 屏每格只剩 37px，12px 的三字标签（36px）会顶到格边，降一档字号。 */
+@media (max-width: 359px) {
+  .mobile-task-filters button { font-size: 11px; }
+  .mobile-task-filters button > span { font-size: 9px; }
+}
 @media (max-width: 380px) {
   .mobile-remote { padding-left: 10px; padding-right: 10px; }
+  /* 页面在这一档把左右 padding 收到 10px，输入条要跟着收，否则边缘比消息列多出 2px。 */
+  .mobile-composer, .mobile-composer-tools { padding-left: 10px; padding-right: 10px; }
   .mobile-remote-header { gap: 10px; }
   .mobile-remote h1 { font-size: 24px; }
-  .mobile-project-choice { gap: 10px; padding: 13px; }
-  .mobile-project-choice strong { font-size: 16px; }
-  .mobile-project-choice b { font-size: 12px; }
-  .mobile-conversation-toolbar h2 { font-size: 18px; }
+  .mobile-project-choice { gap: 10px; padding: 12px; }
+  .mobile-project-mark { width: 40px; height: 40px; border-radius: 12px; }
+  .mobile-project-mark svg { width: 20px; height: 20px; }
+  .mobile-project-choice strong { font-size: 15px; }
+  .mobile-project-choice-meta { font-size: 11px; }
+  .mobile-project-running { padding: 2px 6px; font-size: 11px; }
 }
 
 .mobile-new-conversation-backdrop {
@@ -172,6 +604,40 @@ body.barcode-scanner-active .mobile-pairing-scanner { display: none; }
 .mobile-agent-options button.active { border-color: #5f9d88; color: #174e43; background: #e5f4eb; box-shadow: 0 0 0 2px #bfe2cf; }
 .mobile-agent-options strong { font-size: 14px; }
 .mobile-agent-options small { color: #71887e; font-size: 12px; }
+
+/* 会话历史弹窗：一行一个会话。标题单行截断（长标题不再把条目撑高），元信息单独一行。 */
+.mobile-conversation-history-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #17362c66;
+}
+.mobile-conversation-history-dialog {
+  display: flex;
+  width: min(100%, 420px);
+  max-height: min(78dvh, 640px);
+  box-sizing: border-box;
+  flex-direction: column;
+  border: 1px solid #c8dcd1;
+  border-radius: 10px;
+  padding: 18px;
+  background: #fff;
+  box-shadow: 0 18px 48px #17362c38;
+}
+.mobile-conversation-history-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mobile-conversation-history-dialog > header h2 { margin: 0; color: #19332c; font-size: 20px; }
+.mobile-conversation-history-dialog > header small { display: block; margin-top: 4px; color: #6b8178; font-size: 12px; }
+.mobile-conversation-history-dialog > header > button { width: 36px; height: 36px; flex: none; border: 0; border-radius: 6px; color: #607d71; background: transparent; font-size: 24px; line-height: 1; cursor: pointer; }
+/* min-height: 0 让列表在 flex 列里真能收缩，从而自己滚动而不是把弹窗顶出屏幕。 */
+.mobile-conversation-history-list { display: grid; min-height: 0; gap: 6px; margin: 14px 0 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; list-style: none; }
+.mobile-conversation-history-item { display: grid; min-width: 0; gap: 3px; border: 1px solid #d7e6dd; border-radius: 7px; padding: 10px 12px; color: #19332c; background: #f8fcf9; font: inherit; text-align: left; cursor: pointer; }
+.mobile-conversation-history-item strong { overflow: hidden; font-size: 14px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-conversation-history-item small { overflow: hidden; color: #71887e; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-conversation-history-item:hover, .mobile-conversation-history-item:focus-visible { border-color: #5f9d88; background: #eef8f2; }
+.mobile-conversation-history-item.active { border-color: #5f9d88; background: #e5f4eb; box-shadow: 0 0 0 2px #bfe2cf; }
 .mobile-new-conversation-cancel,
 .mobile-new-conversation-confirm { min-height: 44px; border-radius: 6px; padding: 8px 14px; font-weight: 750; cursor: pointer; }
 .mobile-new-conversation-cancel { border: 1px solid #c8dcd1; color: #416b5e; background: #f7fbf8; }
@@ -187,3 +653,44 @@ body.barcode-scanner-active .mobile-pairing-scanner { display: none; }
 .mobile-update-action:hover { background: #d6f072; }
 .mobile-update-dismiss { flex: none; min-width: 44px; min-height: 44px; border: 1px solid #cfe0c8; border-radius: 5px; color: #5d7a6d; background: #fff; font-size: 14px; cursor: pointer; }
 @media (max-width: 620px) { .mobile-update { flex-wrap: wrap; }.mobile-update-text { flex-basis: 100%; }.mobile-update-text small { white-space: normal; }.mobile-update-action { flex: 1; justify-content: center; } }
+
+/* 「刷新」按钮的即时反馈。原先点下去只调了两个 load 函数：没有 loading、没有结果、
+   时间戳也不变，用户完全看不出有没有生效。现在按钮自带 spinner（忙碌时旋转 + 底色加深），
+   结果由下方状态条给出，失败/最新/已刷新各说各的。忙碌态是 disabled + aria-busy 同时置位，
+   但**不走 opacity**（浅色胶囊半透明会在浅色页面上消失，实测对比度掉到 2.06:1）。
+   按钮本身换成和返回键同一套"软胶囊"（38px 高、浅绿底 + 绿字）：
+   原来它是 76×44 的实心 #2c7567 色块，独占整个头部的视觉重心，和发送按钮抢主色；
+   现在宽度由内容算（图标 13 + gap 5 + 文字 24 + padding 22 + border 2 = 66px），
+   高度 38px，底色与描边都退到"次级操作"那一档。图标顺手从 12px 提到 13px ——
+   原先 12px 是为了让加图标不加宽（配 min-width: 76px 用），那条约束随实心块一起作废了。 */
+.mobile-refresh { position: relative; display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 5px; border: 1px solid #cfe4da; border-radius: 999px; padding: 0 11px; color: #256a5b; background: #eaf4ef; font: inherit; font-size: 12px; font-weight: 700; }
+.mobile-refresh-icon { flex: none; }
+/* 文字必须 nowrap：按钮是 inline-flex，span 默认可收缩，而头部这一行在会话视图里是"标题挤按钮"的
+   （标题 overflow: hidden 只保住自己不被撑破，剩下的宽度按 base 大小分摊）。
+   span 有 nowrap 之后它的 min-content 就是整条文字，收缩落不到它头上 —— 只能去标题那里
+   （标题 overflow: hidden，最多被截断）。实测 320px 会话视图：去掉 nowrap → 胶囊 54px（"刷新"
+   溢出自己的盒子、左右 padding 被吃掉）；保留 nowrap → 66px。
+   **不要再给它加 flex: none**：实测单独去掉/加上它，胶囊都是 66px，属于不承重的"保险"。 */
+.mobile-refresh span { white-space: nowrap; }
+.mobile-refresh[aria-busy="true"] { background: #dcefe4; border-color: #bcdccb; }
+.mobile-refresh[aria-busy="true"] .mobile-refresh-icon { animation: mobile-refresh-spin .9s linear infinite; }
+@keyframes mobile-refresh-spin { to { transform: rotate(360deg); } }
+/* 悬停只给精确指针：触屏上 hover 会粘在刚点过的按钮上（同 .mobile-project-choice）。 */
+@media (hover: hover) and (pointer: fine) {
+  .mobile-back:hover, .mobile-refresh:hover, .mobile-notification-button:hover { background: #dcefe4; }
+}
+.mobile-back:active, .mobile-refresh:active, .mobile-notification-button:active { background: #d2e9dc; }
+
+/* 刷新结果条：紧跟头部，是"点了刷新到底发生了什么"的唯一权威回答。
+   时间戳用 margin-left: auto 贴右，内容再长也不会把它挤出去（文字自己换行）。 */
+.mobile-refresh-status { display: flex; align-items: center; gap: 8px; max-width: 860px; margin: 0 auto 14px; border: 1px solid #c8ded2; border-radius: 7px; padding: 10px 12px; color: #2c7567; background: #eef8f1; font-size: 12px; font-weight: 700; }
+.mobile-refresh-status-text { min-width: 0; overflow-wrap: anywhere; }
+.mobile-refresh-status time { flex: none; margin-left: auto; color: #6f887c; font-weight: 600; white-space: nowrap; }
+.mobile-refresh-status-success { border-color: #8fb9a5; color: #216b58; background: #e6f5ec; }
+.mobile-refresh-status-unchanged { border-color: #cfded6; color: #567468; background: #f4f8f6; }
+.mobile-refresh-status-failed { border-color: #e5b8aa; color: #9b3e33; background: #fff1ed; }
+.mobile-refresh-spinner { width: 13px; height: 13px; flex: none; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: mobile-refresh-spin .9s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .mobile-refresh[aria-busy="true"] .mobile-refresh-icon, .mobile-refresh-spinner { animation: none; }
+  .mobile-project-running[data-state="running"] i { animation: none; }
+}

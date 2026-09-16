@@ -1,7 +1,7 @@
 # 对话页 Skill 区域实现方案
 
-> 日期：2026-08-09
-> 目标：在对话页左侧「常用命令」之下新增「技能 (Skill)」区域，自动读取当前环境里安装的 Claude Code / Codex 全部 skill，点击后把「技能名 + 描述」填入输入框，便于手写提示词时引用。
+> 日期：2026-08-09（2026-09-14 修订第 3/6.2/8 节：点击不再整段填入输入框）
+> 目标：在对话页左侧「常用命令」之下新增「技能 (Skill)」区域，自动读取当前环境里安装的 Claude Code / Codex 全部 skill，点击后在输入框上方挂一颗可删除的引用胶囊（发送那一刻才展开成「技能名 + 描述」），便于手写提示词时引用。
 
 ## 1. 问题与目标
 
@@ -12,7 +12,7 @@
   -> 文件系统扫描（当前环境 user/project/plugin 的 skills 目录）
   -> 解析 SKILL.md frontmatter（name / description）
   -> 按会话 agentId 过滤展示在 Skill 区
-  -> 点击 -> 技能名 + 描述 填入输入框
+  -> 点击 -> 挂一颗可删除的引用胶囊（发送时展开为「技能名 + 描述」）
 ```
 
 ## 2. 范围与非目标
@@ -21,7 +21,7 @@
 - 在对话页常用命令之下显示 Skill 区；
 - 读取当前环境（Windows / WSL 项目 / SSH 远端）可用的 Claude Code 与 Codex skill；
 - 来源覆盖：用户级、项目级、Claude 插件树（`.claude/plugins` 内 `skills` 目录）；
-- 点击 skill → 把「技能名 + 描述」填入输入框并聚焦；
+- 点击 skill → 在输入框上方挂一颗可删除的引用胶囊并聚焦输入框；
 - 按当前会话 `agentId`（claude-code / codex）过滤展示对应 CLI 的技能。
 
 ### 2.2 本阶段不做
@@ -35,7 +35,12 @@
 
 1. **文件系统是唯一真实来源。** skill 的权威信息就是 `<name>/SKILL.md` 的 frontmatter；不依赖任何 CLI 子命令或返回格式。
 2. **读"CLI 真正运行的环境"那一侧。** skill 发现复用 `resolveAgentTargetEnv` + `runnerRegistry` 的 Runner 分发：Windows 项目读本机 `%USERPROFILE%\.claude`，SSH 远端项目读远端 `$HOME/.claude` 等，而不是服务端本机路径。
-3. **只填入、不发送。** skill 点击仅 `setComposerText`，与快捷方式的 `defaultAction === "fill"` 行为一致；发送与否由用户决定。
+3. **只挂引用、不发送，也不碰用户已经写好的正文。** skill 点击只入队一颗引用胶囊（`addSkillRef`），
+   与快捷方式的 `defaultAction === "fill"` 一样不自动发送；发送与否由用户决定。
+   2026-09-14 修订：原先是直接把「技能名 + 描述」`setComposerText` 进输入框 —— 技能描述动辄上百字，
+   会铺满输入框；更要命的是整体覆盖会**把用户写到一半的草稿静默吃掉**（比"难看"严重得多）。
+   现在正文归用户，展开推迟到发送那一刻（`composeSkillMessage`：引用在前、正文在后、中间空一行），
+   发出去的文本与旧实现**逐字一致**（见第 6.2 节的 `mergeSkillPrompt`）。
 4. **空态不报错。** 目录不存在、远端未就绪或解析失败都静默返回空列表，Skill 区显示"未发现 Skill"。
 5. **容忍陌生与坏 frontmatter。** 只取 `name`/`description`，忽略一切未知键；`name`/`description` 缺失时回退为目录名。
 
@@ -100,7 +105,18 @@ export type Skill = { name: string; description: string; agent: SkillAgent; env:
 - state：`skills: Skill[]`、`skillsLoading: boolean`。
 - 加载 effect：项目 + `conversation.agentId` 确定后 `GET /api/projects/{projectId}/skills?agentId=...` → `setSkills`，失败静默置空。
 - `mergeSkillPrompt(skill)`：`description` 与 `name` 不同时返回 `请使用技能 <name>：description`，否则 `请使用技能 <name>`。
-- `useSkill(skill)`：`setComposerText(mergeSkillPrompt(skill))` + 聚焦 textarea。
+  （文案本身没变，仍是与手机端 `skillPrompt` 逐字一致的那一句。）
+- `skillRefs: Skill[]` + `addSkillRef(skill)` / `removeSkillRef(skill)`：已挂上的引用（同名同来源去重）。
+- `useSkill(skill)`：只调 `addSkillRef` + 聚焦 textarea，**不再动 `text`**。
+- `composeSkillMessage(draft, refs)`：发送那一刻才把引用与正文拼成上线文本 ——
+  「引用在前、正文在后、中间空一行」；只挂技能、一个字没写也能发（与旧行为一致）。
+- `sendContent(rawContent, clearDraft, { skillRefs })` 里 `draft`（用户正文）与 `content`（上线文本）
+  是两份东西：**所有"写回输入框"的路径只许用 `draft`** —— 失败回填（catch 里 `setComposerText(draft)`
+  + `setSkillRefs(refs)`）、撤回草稿（`pendingUserDrafts`）、上箭头历史（`appendInputHistory`）都只存正文。
+  用 `content` 就会把整段技能描述重新灌回输入框，等于把这次修订原地撤销。
+- `conversation.id` 一变就清 `skillRefs`（兜底 effect）：引用没有跨会话的意义（草稿是按会话持久化后
+  各自取回的，引用不是）。主路径是 `resetConversationView` 里那一次显式清理；`/resume` 分支同样清
+  （它不会发出去，但输入框被清空，留着就是一颗孤儿胶囊）。
 - `renderSkillGroup()`：标题 + 技能标签列表（桌面 `quick-actions-row` 与移动 `quick-actions-mobile` 各渲染一份）；加载中 / 空态（"未发现 Skill"）分别呈现；每个标签 `title` 悬浮显示描述 + 来源。
 - 新增 `SkillTagIcon`（三组图标中的第三组）。
 
@@ -116,5 +132,9 @@ export type Skill = { name: string; description: string; agent: SkillAgent; env:
 ## 8. 验证
 1. `cd apps/control-server && go test ./internal/app/ -run 'Skill' -v`
 2. 起 control server，`curl /api/projects/{id}/skills?agentId=claude-code` 返回本机 skill 列表（含插件来源）。
-3. 前端：打开项目对话页 → 常用命令下出现 Skill 区 → 点击某 skill → 输入框出现「技能名+描述」→ 正常发送。
+3. 前端：打开项目对话页 → 常用命令下出现 Skill 区 → 点击某 skill → **输入框上方出现一颗引用胶囊，
+   正文与光标不动**（旧行为是把整段描述铺进输入框）→ 再点第二颗可叠加、点 × 可摘掉 →
+   发送后消息正文是「请使用技能 …」+ 空行 + 你自己写的内容。
+   （真浏览器验收：`apps/web/.tmp/probe-skill-refs-desktop.mjs`，10 条断言；手机端同构行为在
+   `apps/web/.tmp/shoot-composer-preview.mjs` 末段。）
 4. SSH 项目：Skill 区显示远端 skill 或空态且不报错。

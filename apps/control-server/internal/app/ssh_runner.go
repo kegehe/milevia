@@ -741,30 +741,6 @@ type sshRunner struct {
 	mcpInjectable bool
 	mcpStrictOK   bool
 	mcpVersion    string
-
-	// --bare 探测结果（按 runner 缓存一次；每次 listRunners 都探测代价过高）。
-	bareMu        sync.Mutex
-	bareChecked   bool
-	bareAvailable bool
-}
-
-// BareFlagAvailable 报告远端 CLI 的帮助里是否出现 `--bare`。结果缓存一次。
-// 语义同 claudeCLIRunner.BareFlagAvailable（docs/34 §13）。
-func (r *sshRunner) BareFlagAvailable(ctx context.Context) bool {
-	r.bareMu.Lock()
-	defer r.bareMu.Unlock()
-	if r.bareChecked {
-		return r.bareAvailable
-	}
-	r.bareChecked = true
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	out, err := r.client.execCommand(probeCtx, "claude --help")
-	if err != nil && len(out) == 0 {
-		return false
-	}
-	r.bareAvailable = strings.Contains(string(out), "--bare")
-	return r.bareAvailable
 }
 
 // mcpCapability 探测远端 Claude Code 是否支持 MCP 注入。
@@ -961,6 +937,19 @@ func (r *sshRunner) codexDefaultModel(ctx context.Context) string {
 	return codexModelFromConfig(out)
 }
 
+// codexModelCatalog 列出远端 Codex 的模型目录（modelCatalogRunner 实现）。
+func (r *sshRunner) codexModelCatalog(ctx context.Context) ([]AgentModelOption, error) {
+	out, err := r.client.execCommand(ctx, "codex debug models 2>/dev/null")
+	if err != nil {
+		return nil, err
+	}
+	options := parseCodexModelCatalog(out)
+	if len(options) == 0 {
+		return nil, errors.New("codex debug models returned no usable model (ssh)")
+	}
+	return options, nil
+}
+
 func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) {
 	local := r.CodexVersion(ctx)
 	if local == "" {
@@ -1145,32 +1134,18 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 			sessionArg = "--session-id " + shellQuote(request.SessionID)
 		}
 	}
+	// 模型选择与本地 runner 对齐：会话/档案指定的模型经 shellQuote 拼进远端命令
+	// （远端 claude 的 --model）。此前 SSH 路径完全没有模型参数，"项目 AI 配置里
+	// 填的模型"在 SSH 项目上会静默失效。
+	modelArg := ""
+	if request.Model != "" {
+		modelArg = " --model " + shellQuote(request.Model)
+	}
 	// --allowedTools（只读执行）要求 prompt 经 stdin 提供（`claude ... -` 读 stdin）；
 	// 否则按 argv 传 prompt。
 	// MCP：远端无本地落盘通道，改为在同一 shell 命令内 base64 写入 /tmp 并 trap 清理。
 	mcpSetup, mcpArg := buildRemoteMCPSetup(ctx, r, request.MCPConfigJSON, request.MCPKey, request.StrictMCP, sink)
-	var cmd string
-	if request.PromptViaStdin {
-		cmd = fmt.Sprintf(
-			"%scd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s -",
-			mcpSetup,
-			shellQuote(request.ProjectPath),
-			shellQuote(request.Prompt),
-			mcpArg,
-			permissionArgs,
-			sessionArg,
-		)
-	} else {
-		cmd = fmt.Sprintf(
-			"%scd %s && claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s %s",
-			mcpSetup,
-			shellQuote(request.ProjectPath),
-			mcpArg,
-			permissionArgs,
-			sessionArg,
-			shellQuote(request.Prompt),
-		)
-	}
+	cmd := buildSSHClaudeRunCommand(request, mcpSetup, mcpArg, permissionArgs, sessionArg, modelArg)
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
@@ -1229,6 +1204,51 @@ func (r *sshRunner) remoteCodexBaseURL(ctx context.Context) string {
 	return strings.TrimSpace(string(out))
 }
 
+// buildSSHClaudeRunCommand 拼装远端一次性 Claude 命令。抽成纯函数是为了能直接断言参数
+// 装配（尤其是 --model 的引号与位置），Run 与测试共用同一份拼装逻辑。
+func buildSSHClaudeRunCommand(request AgentRunRequest, mcpSetup, mcpArg, permissionArgs, sessionArg, modelArg string) string {
+	if request.PromptViaStdin {
+		// --allowedTools（只读执行）要求 prompt 经 stdin 提供（`claude ... -` 读 stdin）。
+		return fmt.Sprintf(
+			"%scd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s%s -",
+			mcpSetup,
+			shellQuote(request.ProjectPath),
+			shellQuote(request.Prompt),
+			mcpArg,
+			permissionArgs,
+			sessionArg,
+			modelArg,
+		)
+	}
+	return fmt.Sprintf(
+		"%scd %s && claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s%s %s",
+		mcpSetup,
+		shellQuote(request.ProjectPath),
+		mcpArg,
+		permissionArgs,
+		sessionArg,
+		modelArg,
+		shellQuote(request.Prompt),
+	)
+}
+
+// buildSSHCodexExecCommand 拼装远端一次性 Codex 命令（同上，纯函数以便断言）。
+// 参数顺序刻意与本地 codexCLIRunner.Run 保持一致：模型覆盖紧跟在 exec（或 MCP 参数）之后、
+// resume/sandbox 之前——这条顺序在生产里已被档案带模型的会话反复验证过，SSH 没有真机可测，
+// 更不该自创一种新排布。
+func buildSSHCodexExecCommand(request AgentRunRequest, transportArgs, configArg, schemaArg, policy string) string {
+	modelArg := ""
+	if request.Model != "" {
+		modelArg = fmt.Sprintf(" -c %s", shellQuote(fmt.Sprintf("model=%q", request.Model)))
+	}
+	if request.Resume {
+		return fmt.Sprintf("codex exec%s resume -c %s --json%s %s %s",
+			modelArg, shellQuote(configArg), schemaArg, shellQuote(request.SessionID), shellQuote(request.Prompt))
+	}
+	return fmt.Sprintf("codex exec %s%s -c %s --json --skip-git-repo-check --color never -C %s --sandbox %s%s %s",
+		transportArgs, modelArg, shellQuote(configArg), shellQuote(request.ProjectPath), policy, schemaArg, shellQuote(request.Prompt))
+}
+
 // runCodex executes one non-interactive Codex turn on the remote host over SSH.
 // It mirrors the local codexCLIRunner.Run command line, streaming JSONL on
 // stdout and diagnostic lines on stderr through the same sinks.
@@ -1267,15 +1287,10 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 				" -c model_providers.milevia.wire_api=responses -c model_providers.milevia.requires_openai_auth=true -c model_providers.milevia.supports_websockets=false -c model_providers.milevia.request_max_retries=2 -c model_providers.milevia.stream_max_retries=2 -c model_auto_compact_token_limit=80000 -c model_context_window=100000"
 		}
 	}
-	var cmd string
-	if request.Resume {
-		cmd = fmt.Sprintf("codex exec resume -c %s --json%s %s %s",
-			shellQuote(configArg), schemaArg, shellQuote(request.SessionID), shellQuote(request.Prompt))
-	} else {
-		cmd = fmt.Sprintf("codex exec %s -c %s --json --skip-git-repo-check --color never -C %s --sandbox %s%s %s",
-			transportArgs,
-			shellQuote(configArg), shellQuote(request.ProjectPath), policy, schemaArg, shellQuote(request.Prompt))
-	}
+	// 模型与本地 Codex runner 对齐：-c model="..." 由 buildSSHCodexExecCommand 按与本地
+	// 相同的参数顺序拼进远端命令。此前 SSH 路径完全没有模型参数，"项目 AI 配置里填的模型"
+	// 在 SSH 项目上会静默失效。
+	cmd := buildSSHCodexExecCommand(request, transportArgs, configArg, schemaArg, policy)
 	// Run from the project directory so Codex resolves relative paths correctly.
 	fullCmd := fmt.Sprintf("%scd %s && %s", schemaSetup, shellQuote(request.ProjectPath), cmd)
 
@@ -1355,13 +1370,20 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 		sessionArg = "--session-id " + shellQuote(req.SessionID)
 	}
 	mcpSetup, mcpArg := buildRemoteMCPSetup(ctx, r, req.MCPConfigJSON, req.MCPKey, req.StrictMCP, nil)
+	// 长驻远端会话同样按会话/档案指定的模型启动；模型变化会经
+	// conversationSessionManager 退役旧会话后带新 --model 重启。
+	modelArg := ""
+	if req.Model != "" {
+		modelArg = " --model " + shellQuote(req.Model)
+	}
 	cmd := fmt.Sprintf(
-		"%scd %s && claude -p --verbose --input-format stream-json --output-format stream-json --include-partial-messages --replay-user-messages%s %s %s",
+		"%scd %s && claude -p --verbose --input-format stream-json --output-format stream-json --include-partial-messages --replay-user-messages%s %s %s%s",
 		mcpSetup,
 		shellQuote(req.ProjectPath),
 		mcpArg,
 		permissionArgs,
 		sessionArg,
+		modelArg,
 	)
 
 	stdin, err := session.StdinPipe()

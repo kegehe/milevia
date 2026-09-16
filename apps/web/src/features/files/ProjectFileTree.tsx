@@ -1,16 +1,20 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Tree,
   TreeItem,
   TreeItemIndex,
   UncontrolledTreeEnvironment,
 } from "react-complex-tree";
+import type { TreeEnvironmentRef } from "react-complex-tree";
 import type { FileEntry, TreeResponse, SearchResponse } from "./file-model";
 import { getFileIcon } from "./file-model";
 import { FileIcon } from "./FileIcon";
 
 // sessionStorage key：暂存要添加到对话的文件路径
 const ADD_TO_CHAT_KEY = "milevia_add_file_to_chat";
+
+// 树 id，用于向环境查询/修改视图状态（展开项、选中项、焦点项）
+const TREE_ID = "file-tree";
 
 async function copyToClipboard(text: string): Promise<boolean> {
   if (navigator.clipboard?.writeText) {
@@ -50,7 +54,10 @@ interface ProjectFileTreeProps {
   onDelete: (path: string, name: string, isDir: boolean) => void;
   onAddToChat?: (path: string) => void;
   readOnly: boolean;
-  refreshRef?: React.MutableRefObject<(() => void) | null>;
+  // 刷新文件树。传 dirPath 表示只重新拉取该目录的子项（删除/新建/重命名等
+  // 定点更新用，保留其它目录的展开状态）；preferPath 是刷新后希望保持焦点的路径
+  // （改名后的新路径）。都不传则做一次全量刷新。
+  refreshRef?: React.MutableRefObject<((dirPath?: string, preferPath?: string) => void) | null>;
 }
 
 interface FileTreeItemData {
@@ -71,7 +78,10 @@ function TreeActionIcon({ name }: { name: "new-file" | "new-folder" | "refresh" 
 
 // ─── Provider ────────────────────────────────────────────────────────────────
 
-class FileTreeProvider {
+// 具名导出以便单测直接驱动它（与 git-model.ts 导出 CommitHistory 同一惯例）：
+// 「重新列举目录时保留已加载子项」「清掉已消失条目」这两条不变量都是纯逻辑，
+// 用真实 provider + 假 fetch 测比源码 grep 可靠。
+export class FileTreeProvider {
   private items: Map<string, TreeItem<FileTreeItemData>> = new Map();
   private listeners: Set<(changedItemIds: TreeItemIndex[]) => void> = new Set();
   private fetchFn: (path: string) => Promise<FileEntry[]>;
@@ -164,17 +174,25 @@ class FileTreeProvider {
         const childIndices: TreeItemIndex[] = [];
         for (const entry of entries) {
           const index = entry.path;
-          const treeItem: TreeItem<FileTreeItemData> = {
-            index,
-            data: {
-              name: entry.name,
-              path: entry.path,
-              isDir: entry.isDir,
-              icon: getFileIcon(entry),
-            },
-            isFolder: entry.isDir,
-            children: entry.isDir ? [] : undefined,
+          const data: FileTreeItemData = {
+            name: entry.name,
+            path: entry.path,
+            isDir: entry.isDir,
+            icon: getFileIcon(entry),
           };
+          // 复用目录中仍然存在的条目，保留它已经加载过的子项。否则「刷新父目录」
+          // 会把已展开的子目录内容清空（表现为展开却空白，且因为不再是展开动作、
+          // onExpandItem 不会再触发，只能靠手动折叠再展开救回来）。
+          const previous = this.items.get(String(index));
+          const treeItem: TreeItem<FileTreeItemData> =
+            previous && previous.isFolder === entry.isDir
+              ? { ...previous, data, isFolder: entry.isDir }
+              : {
+                  index,
+                  data,
+                  isFolder: entry.isDir,
+                  children: entry.isDir ? [] : undefined,
+                };
           this.items.set(String(index), treeItem);
           childIndices.push(index);
         }
@@ -183,6 +201,14 @@ class FileTreeProvider {
         if (parent) {
           parent.children = childIndices;
         }
+        // 丢弃从根不可达的条目（被删除的文件/目录、重命名后失效的旧子树）。
+        // 既避免 items 无限增长，也避免"删掉再用同名新建"时复用回旧的子项。
+        //
+        // 这里不能只在 parent 存在时清理：父目录如果在本次请求飞行途中被删掉并被
+        // prune 移出 map，本次写进去的子项就成了"谁也不指向"的孤儿，之后不会再有人
+        // 清理它们，等这个路径被重新创建时就会带着旧子项复活。孤儿不可能可达，
+        // 直接清掉即可，下一次 loadChildren 会把它们重新拉回来。
+        this.pruneUnreachable();
         // 同时通知 parent 和所有子项，让 UncontrolledTreeEnvironment 一次性写入 currentItems
         this.notifyChange([parentIndex, ...childIndices]);
       } catch (err) {
@@ -210,6 +236,52 @@ class FileTreeProvider {
    */
   refreshDir(parentPath: string, parentIndex: string) {
     return this.loadChildren(parentPath, parentIndex, true);
+  }
+
+  /**
+   * 补拉「环境认为已展开、但缓存里还没有内容」的目录。
+   *
+   * 用在 provider 被重建（切换项目/会话）之后：环境的展开状态还在，但这些目录在新缓存里
+   * 只是空壳（children = []），界面就成了"展开着却空白"，而因为不再是展开动作，
+   * onExpandItem 不会补触发。
+   *
+   * 三条硬约束：
+   * - **按深度升序、逐个 await**。深层目录的条目要等它父目录的列举结果落进缓存后才存在，
+   *   并发跑或顺序反了都会被 loadChildren 里的孤儿清理丢掉，等于没补。
+   * - **只补缓存里已有的目录条目**。查不到说明磁盘上已经删掉、或它的父目录没列出来
+   *   （例如它的祖先被折叠着），这时补拉会白跑一趟甚至报 404。
+   * - **已有内容的目录跳过**，否则每次展开都会把它重复拉一遍。
+   */
+  async restoreExpandedDirs(expandedPaths: TreeItemIndex[], skipPath?: string): Promise<void> {
+    const ordered = [...new Set(expandedPaths.map(String))]
+      .filter((path) => path && path !== skipPath)
+      .sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+    for (const path of ordered) {
+      const item = this.items.get(path);
+      if (!item?.isFolder) continue;
+      if ((item.children?.length ?? 0) > 0) continue;
+      await this.loadChildren(path, path);
+    }
+  }
+
+  /**
+   * 从根开始标记可达条目，未标记的（已删除 / 改名后失效）从缓存里移除。
+   * 只能清理已经被父目录列举过、但如今不再挂载的条目。
+   */
+  private pruneUnreachable() {
+    const reachable = new Set<string>();
+    const walk = (index: string) => {
+      if (reachable.has(index)) return;
+      reachable.add(index);
+      const item = this.items.get(index);
+      for (const child of item?.children ?? []) {
+        walk(String(child));
+      }
+    };
+    walk("root");
+    for (const key of [...this.items.keys()]) {
+      if (!reachable.has(key)) this.items.delete(key);
+    }
   }
 
   /**
@@ -263,6 +335,7 @@ export function ProjectFileTree({
     isDir: boolean;
   } | null>(null);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  const environmentRef = useRef<TreeEnvironmentRef<FileTreeItemData, never> | null>(null);
 
   const showError = useCallback((message: string) => {
     setError(message);
@@ -286,24 +359,97 @@ export function ProjectFileTree({
     [fetchDir, showError]
   );
 
-  // 初始加载根目录
+  // 补拉「环境认为已展开、但缓存里还没内容」的目录，见 provider.restoreExpandedDirs。
+  const restoreExpandedDirs = useCallback(
+    async (skipPath?: string) => {
+      const expanded = environmentRef.current?.viewState[TREE_ID]?.expandedItems ?? [];
+      if (expanded.length === 0) return;
+      await provider.restoreExpandedDirs(expanded, skipPath);
+    },
+    [provider]
+  );
+
+  // 初始加载根目录。provider 被重建（切换项目/会话）时同样走这里：新缓存里只有根目录，
+  // 之前展开过的目录会变成空壳，所以根目录拉完再按展开状态补拉一次。
   useEffect(() => {
-    void provider.loadChildren("", "root");
-  }, [provider]);
+    void provider
+      .loadChildren("", "root")
+      .then(() => restoreExpandedDirs());
+  }, [provider, restoreExpandedDirs]);
+
+  /**
+   * 收敛环境的焦点与选中项。
+   *
+   * 定点刷新不会重建环境，因此删除/改名之后 viewState 里可能残留指向已不存在条目的
+   * focusedItem / selectedItems；而 react-complex-tree 的热键是拿它直接查
+   * environment.items 的（回车 → onPrimaryAction、F2 → 重命名），命中环境里还留着的
+   * 旧条目就会去打开 / 重命名一个已经被删掉的文件。这里把它们挪到仍然存在的条目上。
+   *
+   * 延时到宏任务：环境写入新条目是异步的（onDidChangeTreeData → getTreeItems →
+   * writeItems），必须等它落地后再改视图状态，否则拿到的是还没更新的 items。
+   */
+  const settleEnvironmentSelection = useCallback(
+    (dirPath: string, preferPath?: string) => {
+      window.setTimeout(() => {
+        const environment = environmentRef.current;
+        const state = environment?.viewState[TREE_ID];
+        if (!environment || !state) return;
+        // 环境里的 items 只增不减，判存活要以数据源为准
+        const alive = (id: TreeItemIndex) => provider.getItem(String(id)) !== undefined;
+        const selected = state.selectedItems ?? [];
+        const keptSelected = selected.filter(alive);
+        if (keptSelected.length !== selected.length) {
+          environment.selectItems(keptSelected, TREE_ID);
+        }
+        // 只在焦点确实指向已消失的条目时才动它；没有焦点时交给环境自己初始化。
+        if (state.focusedItem === undefined || alive(state.focusedItem)) return;
+        // 落点：改名后的新路径（改名时传进来）→ 仍被选中的条目 →
+        // 刚刷新的目录里第一个条目 → 该目录本身
+        const parentIndex = dirPath || "root";
+        const fallback =
+          (preferPath !== undefined && alive(preferPath) ? preferPath : undefined) ??
+          keptSelected[0] ??
+          provider.getItem(parentIndex)?.children?.[0] ??
+          (dirPath || undefined);
+        if (fallback !== undefined && environment.items[fallback] !== undefined) {
+          environment.focusItem(fallback, TREE_ID, false);
+        }
+      }, 0);
+    },
+    [provider]
+  );
+
+  /**
+   * 刷新文件树：
+   * - 传 dirPath：只重新拉取该目录的子项。展开状态由 UncontrolledTreeEnvironment
+   *   自己保管，只要不重建它，其余目录的展开状态与滚动位置都不会丢。
+   *   preferPath 是刷新后希望保持焦点的路径（如改名后的新路径）。
+   * - 不传：全量刷新（工具栏「刷新」），清缓存并重建环境，展开状态会重置。
+   */
+  const refreshTree = useCallback(
+    (dirPath?: string, preferPath?: string) => {
+      if (dirPath === undefined) {
+        provider.refreshAll();
+        setTreeKey((k) => k + 1);
+        void provider.loadChildren("", "root", true);
+        return;
+      }
+      void provider
+        .refreshDir(dirPath, dirPath || "root")
+        .then(() => settleEnvironmentSelection(dirPath, preferPath));
+    },
+    [provider, settleEnvironmentSelection]
+  );
 
   // 暴露刷新方法给父组件
   useEffect(() => {
     if (refreshRef) {
-      refreshRef.current = () => {
-        provider.refreshAll();
-        setTreeKey((k) => k + 1);
-        void provider.loadChildren("", "root", true);
-      };
+      refreshRef.current = refreshTree;
     }
     return () => {
       if (refreshRef) refreshRef.current = null;
     };
-  }, [provider, refreshRef]);
+  }, [provider, refreshRef, refreshTree]);
 
   // 自动清除错误
   useEffect(() => {
@@ -351,10 +497,8 @@ export function ProjectFileTree({
 
   // 刷新
   const handleRefresh = useCallback(() => {
-    provider.refreshAll();
-    setTreeKey((k) => k + 1);
-    void provider.loadChildren("", "root", true);
-  }, [provider]);
+    refreshTree();
+  }, [refreshTree]);
 
   return (
     <div className="file-tree-container">
@@ -393,6 +537,7 @@ export function ProjectFileTree({
       <div className="file-tree-body">
         <UncontrolledTreeEnvironment
           key={treeKey}
+          ref={environmentRef}
           dataProvider={provider}
           // 文件侧栏较窄，显式保留清晰的层级缩进。
           renderDepthOffset={16}
@@ -403,10 +548,11 @@ export function ProjectFileTree({
           canDropOnFolder={false}
           canDragAndDrop={false}
           onPrimaryAction={(item) => {
-            // item 是 TreeItem<FileTreeItemData> 对象
-            if (!item.data.isDir) {
-              onFileSelect(item.data.path, item.data.name);
-            }
+            // 环境里的 items 只增不减：被删掉的条目可能还留着旧引用，
+            // 这里以数据源为准，避免回车打开一个已经不存在的文件。
+            const entry = item?.data;
+            if (!entry || entry.isDir || !provider.getItem(entry.path)) return;
+            onFileSelect(entry.path, entry.name);
           }}
           onExpandItem={(item) => {
             // item 是 TreeItem<FileTreeItemData> 对象
@@ -414,7 +560,11 @@ export function ProjectFileTree({
               const children = item.children || [];
               // 无子项时加载；已有子项时直接复用（刷新通过右键菜单）
               if (children.length === 0) {
-                void provider.loadChildren(item.data.path, String(item.index));
+                void provider
+                  .loadChildren(item.data.path, String(item.index))
+                  // 展开的目录里可能还记着更深的展开项（曾经展开过后折叠了祖先，
+                  // 环境里仍留在 expandedItems 里），顺手把那些空壳一起补上。
+                  .then(() => restoreExpandedDirs(item.data.path));
               }
             }
           }}
@@ -454,7 +604,7 @@ export function ProjectFileTree({
             );
           }}
         >
-          <Tree treeId="file-tree" rootItem="root" treeLabel="文件浏览器" />
+          <Tree treeId={TREE_ID} rootItem="root" treeLabel="文件浏览器" />
         </UncontrolledTreeEnvironment>
       </div>
 
@@ -490,7 +640,7 @@ export function ProjectFileTree({
           {contextMenu.isDir && (
             <button
               onClick={() => {
-                void provider.refreshDir(contextMenu.path, contextMenu.path || "root");
+                refreshTree(contextMenu.path);
                 setContextMenu(null);
               }}
             >

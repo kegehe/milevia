@@ -229,7 +229,9 @@ func (s *Server) gitConflictSuggest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) runConflictSuggestion(ctx context.Context, project Project, record *gitConflictSuggestion, detail GitConflictContent, oursLabel, theirsLabel string) {
 	prompt := buildConflictSuggestionPrompt(record.Path, oursLabel, theirsLabel, detail)
-	text, runErr := s.runReadOnlyAgentWithSchema(ctx, project, record.Agent, prompt, conflictSuggestionOutputSchema, nil)
+	// quotaWait=0：冲突解法是用户当场等结果的一次性建议，额度被占就该立刻回明确失败，
+	// 而不是让编辑器里的人在等待条上多停两分钟（排队语义只给后台的优化建议扫描/复核）。
+	text, runErr := s.runReadOnlyAgentWithSchema(ctx, project, record.Agent, prompt, conflictSuggestionOutputSchema, 0, nil)
 
 	s.conflictSuggestMu.Lock()
 	defer s.conflictSuggestMu.Unlock()

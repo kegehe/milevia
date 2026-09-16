@@ -44,8 +44,10 @@ export function formatDuration(value: number): string {
   return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
+// 没有费用数据（缺失、NaN）和「确实没花钱」在数值上都是 0，打印 $0.0000 会让人误以为
+// 已经统计过且结果为 0。这类无数据的场合统一走占位符，与同组其它指标的 "--" 保持一致。
 export function formatCost(value: number): string {
-  return Number.isFinite(value) && value > 0 ? `$${value.toFixed(4)}` : "$0.0000";
+  return Number.isFinite(value) && value > 0 ? `$${value.toFixed(4)}` : "--";
 }
 
 export function runDuration(run: import("./types").RunUsage | undefined, now: number): number {

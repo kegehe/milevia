@@ -422,6 +422,14 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// position 的写入契约（前端任务队列的排序依赖它，改之前先读 docs/07 与本注释）：
+	//   · 请求没带 position 或带 0 —— 视为「追加到队列末尾」，写成 max(position)+1。
+	//     前端的「新建任务」「快速创建」都走这条路，因此新任务恒在队列最后；
+	//     0 是哨兵值而不是合法位置（要排到最前请走 PATCH，见 updateTask：那里 0 完全合法，
+	//     也是 TestTaskUpdatePositionAllowsZero 覆盖的行为，别把这个哨兵挪到 PATCH 上）。
+	//   · 显式带非 0 position —— 按给定值写入（留给"插入到指定位置"这类调用方）。
+	// 队列按 position 升序展示（不按状态或优先级分组），所以任何"新任务要排在最后"的
+	// 写入路径都必须给出比现有全部 position 更大的值。
 	now := time.Now().UTC()
 	position := 0.0
 	if input.Position != nil {

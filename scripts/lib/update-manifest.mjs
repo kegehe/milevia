@@ -39,8 +39,45 @@ export function setPlatform(manifest, key, entry) {
   return manifest;
 }
 
+/**
+ * 校验清单里每个平台段都满足 Tauri 更新器的结构要求，不满足就抛错。
+ *
+ * 为什么必须在写入前拦住：Tauri 的 `ReleaseManifestPlatform` 是
+ * `{ url: Url, signature: String }`（signature 不是 Option），而 `platforms` 是
+ * `HashMap<String, ReleaseManifestPlatform>` —— **任何一段缺 signature 都会让整份清单
+ * 反序列化失败**，而且这个失败发生在**版本比较之前**：哪怕版本相同、根本不该更新，
+ * 客户端的「检查更新」也会直接报 `missing field 'signature'`。
+ *
+ * 手机端的 android 段不是 Tauri 的 target、永远读不到这个字段，但结构上必须给一个，
+ * 否则会连累桌面端。2026-09-11 就是因为往 platforms 里塞了不含 signature 的 android 段，
+ * 导致已安装的桌面端全部报更新失败。这里做成写入入口的硬校验，杜绝重犯。
+ */
+function assertTauriCompatible(manifest, file) {
+  const platforms = manifest?.platforms;
+  if (!platforms || typeof platforms !== "object") return;
+  for (const [key, entry] of Object.entries(platforms)) {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`${file}: platforms.${key} 不是对象`);
+    }
+    for (const field of ["url", "signature"]) {
+      if (typeof entry[field] !== "string" || entry[field] === "") {
+        throw new Error(
+          `${file}: platforms.${key} 缺少可用的 "${field}"。\n` +
+            "  Tauri 更新器要求 platforms 里每一段都是 { url, signature }，缺了会让整份清单反序列化失败，\n" +
+            "  客户端会直接报 “missing field `signature`”（且与版本号无关）。\n" +
+            "  即使是 Tauri 用不到的段（如 android），也必须给 signature —— 可放该文件的 sha256 作为占位。",
+        );
+      }
+    }
+    if (!/^https?:\/\//.test(entry.url)) {
+      throw new Error(`${file}: platforms.${key}.url 不是 http(s) 地址：${entry.url}`);
+    }
+  }
+}
+
 /** 写清单：统一两空格缩进 + 末尾换行，避免每次发布都产生无意义的 diff。 */
 export function writeManifest(file, manifest) {
+  assertTauriCompatible(manifest, file);
   writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n", "utf8");
 }
 

@@ -4,8 +4,8 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
 
-import { groupChanges, type GitOperation, type GitSnapshot } from "./git-model.ts";
-import { GitBar, GitWorkbench, parseDiffContent } from "./GitWorkbench.tsx";
+import { groupChanges, isMergeCommit, type GitCommit, type GitOperation, type GitSnapshot } from "./git-model.ts";
+import { CommitHistory, GitBar, GitWorkbench, parseDiffContent } from "./GitWorkbench.tsx";
 
 test("keeps staged and worktree entries for the same path distinct", () => {
   const grouped = groupChanges([
@@ -15,6 +15,24 @@ test("keeps staged and worktree entries for the same path distinct", () => {
 
   assert.deepEqual(grouped.staged.map((change) => change.path), ["app.go"]);
   assert.deepEqual(grouped.worktree.map((change) => change.path), ["app.go", "new.txt"]);
+});
+
+test("treats a commit with missing parents as a non-merge commit", () => {
+  // 根提交没有父提交，服务端可能把 parents 序列化成 null。直接读 .length 会抛错，
+  // 而 Git 工作台没有错误边界，一次抛错会让整页变空白。
+  assert.equal(isMergeCommit({ parents: null as unknown as string[] }), false);
+  assert.equal(isMergeCommit({ parents: [] }), false);
+  assert.equal(isMergeCommit({ parents: ["abc"] }), false);
+  assert.equal(isMergeCommit({ parents: ["abc", "def"] }), true);
+});
+
+test("never reads commit.parents.length directly", () => {
+  // 回归闸门：根提交的 parents 可能是 null，只有 isMergeCommit 能安全判断合并提交。
+  // 谁把 .parents.length 写回来，分支页就会再次整页空白。
+  const source = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
+
+  assert.doesNotMatch(source, /parents\.length/);
+  assert.match(source, /isMergeCommit\(commit\)/);
 });
 
 test("renders unified diffs with aligned old and new line numbers", () => {
@@ -104,6 +122,21 @@ test("ssr smoke: workbench initial render executes without throwing", () => {
 
   assert.match(html, /git-workbench/);
   assert.match(html, /正在读取仓库状态/);
+});
+
+test("ssr smoke: commit history renders a root commit whose parents are null", () => {
+  // 服务端对根提交返回 parents:null。这条渲染路径曾经直接读 .length 抛错，
+  // 把整个 Git 工作台打成空白；这里断言它不再抛错、也不误报"合并"徽标。
+  const commits: GitCommit[] = [
+    { oid: "c9283c7c1234567890abcdef1234567890abcd", parents: null as unknown as string[], subject: "首个提交", author: "tangmaoke", authoredAt: "2026-06-05T14:33:35Z" },
+    { oid: "f26ce29c1234567890abcdef1234567890abcd", parents: ["c9283c7c1234567890abcdef1234567890abcd"], subject: "桌面端", author: "tangmaoke", authoredAt: "2026-09-09T09:02:57Z" },
+  ];
+
+  const html = renderToString(createElement(CommitHistory, { commits, loading: false, onSelect: noop }));
+
+  assert.match(html, /首个提交/);
+  assert.match(html, /桌面端/);
+  assert.doesNotMatch(html, /git-commit-merge-badge/);
 });
 
 test("ssr smoke: GitBar loaded state renders branch, sync badge and actions", () => {

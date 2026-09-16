@@ -22,6 +22,9 @@ type conversationSessionConfig struct {
 	projectPath       string
 	permissionMode    string
 	profileRevisionID string
+	// model 是进程启动参数里的 --model / -c model=。它一旦变化，长驻进程必须
+	// 退役重启（下一条消息带新模型 --resume），否则会话会一直用旧模型。
+	model string
 }
 
 func newConversationSessionConfig(runnerID string, conversation Conversation, profile *AgentRuntimeProfile, projectPath string) conversationSessionConfig {
@@ -35,6 +38,7 @@ func newConversationSessionConfig(runnerID string, conversation Conversation, pr
 		projectPath:       projectPath,
 		permissionMode:    conversation.executionPolicy(),
 		profileRevisionID: profileRevisionID,
+		model:             runModel(conversation.ModelOverride, profile),
 	}
 }
 
@@ -54,6 +58,14 @@ func (m *conversationSessionManager) sessionsPerRunner() int {
 		return defaultConversationSessionsPerRunner
 	}
 	return m.server.config.ConversationSessionsPerRunner
+}
+
+// exitGrace 是会话被要求停止之后，仍愿意等它真正退出的上限。
+func (m *conversationSessionManager) exitGrace() time.Duration {
+	if m.server.config.ConversationSessionExitGrace <= 0 {
+		return defaultConversationSessionExitGrace
+	}
+	return m.server.config.ConversationSessionExitGrace
 }
 
 func (m *conversationSessionManager) start() {
@@ -87,11 +99,13 @@ func (m *conversationSessionManager) ensureCapacity(conversationID, runnerID str
 	s := m.server
 	s.mu.Lock()
 	if existing := s.sessions[conversationID]; existing != nil {
-		if existing.stopping {
-			s.mu.Unlock()
+		stopping := existing.stopping
+		stoppingSince := existing.stoppingSince
+		s.mu.Unlock()
+		if stopping {
+			logStoppingRejection("conversation admission", conversationID, stoppingSince)
 			return errors.New("conversation is stopping")
 		}
-		s.mu.Unlock()
 		return nil
 	}
 
@@ -143,7 +157,7 @@ func (m *conversationSessionManager) ensureConfiguration(conversationID string, 
 		s.mu.Unlock()
 		return errors.New("conversation configuration changed while a native agent session is active; stop it before retrying")
 	}
-	session.stopping = true
+	session.markStopping()
 	agent := session.agent
 	s.mu.Unlock()
 	go agent.Stop()
@@ -192,7 +206,7 @@ func (m *conversationSessionManager) retireForConfiguration(conversationID strin
 		s.streamMu.Unlock()
 		return false
 	}
-	session.stopping = true
+	session.markStopping()
 	agent := session.agent
 	s.mu.Unlock()
 	s.streamMu.Unlock()
@@ -216,7 +230,7 @@ func (m *conversationSessionManager) retireForProfileRevision(conversationIDs ma
 		if _, selected := conversationIDs[conversationID]; !selected || session.stopping {
 			continue
 		}
-		session.stopping = true
+		session.markStopping()
 		agents = append(agents, session.agent)
 	}
 	s.mu.Unlock()
@@ -266,7 +280,7 @@ func (m *conversationSessionManager) markStoppingLocked(candidates []sessionCand
 		if current != candidate.session || !m.idleLocked(candidate.conversationID, current) {
 			continue
 		}
-		current.stopping = true
+		current.markStopping()
 		agents = append(agents, current.agent)
 	}
 	return agents

@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const stylesheet = await readFile(new URL("./conversation.css", import.meta.url), "utf8");
+// 原理：剪贴板实现已抽到 lib/clipboard.ts（消息复制与代码块复制共用）。
+const clipboard = await readFile(new URL("./lib/clipboard.ts", import.meta.url), "utf8");
 // 代码已重构，相关代码现在分布在这些文件中：
 const types = await readFile(new URL("./lib/types.ts", import.meta.url), "utf8");
 const timelineLib = await readFile(new URL("./lib/timeline.ts", import.meta.url), "utf8");
@@ -27,11 +29,14 @@ test("message bubbles use their content width without exceeding the reading meas
 });
 
 test("user messages can be copied from an icon-only control", () => {
-  assert.match(conversationPage, /navigator\.clipboard\?\.writeText/);
-  assert.match(conversationPage, /await navigator\.clipboard\.writeText\(content\);\s*return;\s*} catch \{/s);
-  assert.match(conversationPage, /catch \{[\s\S]*?copyWithLegacyClipboard\(content\);/);
-  assert.match(conversationPage, /document\.execCommand\("copy"\)/);
-  assert.match(conversationPage, /try \{\s*textarea\.select\(\);[\s\S]*?\} finally \{\s*textarea\.remove\(\);\s*\}/);
+  // 剪贴板实现：现代 API 优先，非安全上下文 / 权限拒绝时退回 execCommand。
+  assert.match(clipboard, /navigator\.clipboard\?\.writeText/);
+  assert.match(clipboard, /await navigator\.clipboard\.writeText\(content\);\s*return true;\s*} catch \{/s);
+  assert.match(clipboard, /document\.execCommand\("copy"\)/);
+  assert.match(clipboard, /try \{\s*textarea\.select\(\);[\s\S]*?\} finally \{\s*textarea\.remove\(\);\s*\}/);
+  // 消息按钮在写入失败时给出提示，而不是静默失败。
+  assert.match(conversationPage, /import \{ copyToClipboard \} from "\.\.\/lib\/clipboard";/);
+  assert.match(conversationPage, /if \(!\(await copyToClipboard\(message\.content\)\)\) \{/);
   assert.match(conversationPage, /isUser && <button className=\{`message-copy/);
   assert.match(conversationPage, /title=\{copied \? "已复制" : "复制消息"\}/);
   assert.match(stylesheet, /\.message-copy\s*\{[^}]*width:\s*26px;[^}]*height:\s*26px;[^}]*background:\s*transparent;/s);
@@ -40,7 +45,8 @@ test("user messages can be copied from an icon-only control", () => {
 
 test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /\{run && <button className="runner-stop" type="button" disabled=\{readOnly \|\| stopping\} onClick=\{onStop\}/);
-  assert.match(conversationPage, /onShowUsage=\{openUsage\} readOnly=\{readOnlyConversation\} stopping=\{stopping\}/);
+  // 允许中间插入新的底部栏 prop（例如模型选择器的 onModelFail），但三者必须都接着。
+  assert.match(conversationPage, /onShowUsage=\{openUsage\}[\s\S]{0,200}?readOnly=\{readOnlyConversation\} stopping=\{stopping\}/);
   assert.match(stylesheet, /\.runner-stop \{ display: none; \}/);
   assert.match(stylesheet, /@media \(max-width: 820px\) \{[\s\S]*?\.runner-stop \{[\s\S]*?display:\s*inline-flex;[\s\S]*?\.composer-action\.composer-stop \{ display: none; \}/);
   assert.match(conversationPage, /const pendingUserDrafts = useRef\(new Map<string, string>\(\)\);/);
@@ -80,14 +86,65 @@ test("persisted conversation history loads without waiting for the realtime sock
 
 test("background conversation polling preserves search results and advances activity cursors", () => {
   assert.match(conversationPage, /after: state\.latestPositions\[conversationId\] \|\| state\.readPositions\[conversationId\]/);
-  assert.match(conversationPage, /if \(!historyQuery\.trim\(\)\) void requestConversationHistory\(""\)\.catch\(\(\) => undefined\);/);
+  assert.match(conversationPage, /if \(!historyQuery\.trim\(\)\) void requestConversationHistory\("", "", false, true\)\.catch\(\(\) => undefined\);/);
   assert.match(conversationPage, /\[conversationTabs\.openConversationIds\.length, historyQuery, projectId, requestConversationHistory, syncConversationActivity\]/);
+});
+
+test("opening the history dialog issues one refresh and never renders a pending list as empty", () => {
+  const page = conversationPage.replace(/\r\n/g, "\n");
+  // ① 被超越的刷新必须自报家门，不能返回空数组让调用方误判成"项目里没有会话"。
+  assert.match(page, /type ConversationHistoryResult = \{ items: Conversation\[\]; stale: boolean \};/);
+  assert.match(page, /const requestVersion = background \? conversationHistoryRequestVersion\.current : \+\+conversationHistoryRequestVersion\.current;/);
+  assert.match(page, /if \(requestVersion !== conversationHistoryRequestVersion\.current\) return \{ items: \[\], stale: true \};/);
+  assert.match(page, /return \{ items: page\.items, stale: false \};/);
+  // ② 无 id 分支只重试、绝不拿 stale 的空白去判空 —— 那会 POST 出一个凭空多出来的会话，
+  //    并把历史列表覆盖成那一条。
+  assert.match(page, /if \(result\.stale\) return;\n\s*const list = result\.items;/);
+  assert.match(page, /for \(let attempt = 0; result\.stale && attempt < 3 && !cancelled && !conversationTransitionRef\.current; attempt\+\+\) \{/);
+  assert.doesNotMatch(page, /const list = await refreshConversationHistory\(\);/);
+  // ③ 打开弹窗时父组件已经刷过一次，弹窗不该再补一次必然被作废的搜索。
+  assert.match(page, /if \(query === historyQuery\) return;\n\s*const timer = window\.setTimeout\(\(\) => search\(query\), 200\);/);
+  // ④ 空列表的三种真相必须分开：还在请求 / 请求失败 / 真的没有。
+  assert.match(page, /const emptyText = loading \? "正在加载会话…" : error \? `会话列表加载失败：\$\{error\}` : "没有匹配的会话";/);
+  assert.match(page, /const emptyClass = loading \? "history-empty history-loading" : error \? "history-empty history-error" : "history-empty";/);
+  assert.match(conversationPage, /<p className=\{emptyClass\}>\{emptyText\}<\/p>/);
+  assert.match(conversationPage, /historyQuery=\{historyQuery\} loading=\{historyLoading\} error=\{historyError\}/);
+  assert.match(page, /if \(!background && requestVersion === conversationHistoryRequestVersion\.current\) \{\n\s*setHistoryError\(cause instanceof Error \? cause\.message : "无法加载会话列表"\);\n\s*\}/);
+  assert.match(page, /setHistoryError\(""\);/);
+  assert.match(stylesheet, /\.history-loading \{[^}]*animation: history-loading-pulse/);
+  assert.match(stylesheet, /@keyframes history-loading-pulse/);
+  assert.match(stylesheet, /@media \(prefers-reduced-motion: reduce\) \{ \.history-loading \{ animation: none; \} \}/);
+  assert.match(stylesheet, /\.history-error \{\s*color: #c45034; \}/);
+  // ⑤ 只有最后一次请求才有资格结束加载态，否则会先闪一下"没有匹配的会话"。
+  assert.match(page, /if \(!background && requestVersion === conversationHistoryRequestVersion\.current\) setHistoryLoading\(false\);/);
+  // ⑥ 同一种刷新只发一次：打开弹窗与"切回对话 Tab 后的会话恢复"要的是同一份列表，
+  //    各发一次的话后发的那次必然把先发的作废掉。键里必须带 projectId —— 直接从一个项目
+  //    跳到另一个项目时本组件不重挂载，少了它新项目会复用上一个项目正在飞行的请求。
+  assert.match(page, /const conversationHistoryInflight = useRef\(new Map<string, Promise<ConversationHistoryResult>>\(\)\);/);
+  assert.match(page, /const key = `\$\{projectId\}\|\$\{background \? "bg" : "fg"\}\|\$\{query\}\|\$\{cursor\}\|\$\{append \? "1" : "0"\}`;/);
+  assert.match(page, /const running = inflight\.get\(key\);\n\s*if \(running\) return running;/);
+  assert.match(page, /inflight\.delete\(key\);\n\s*\/\/ 只有"最后一次"请求才有资格结束加载态/);
+  // ⑦ 内部"补全/纠正 URL"的导航统一带上弹窗参数，不能顺手把用户刚打开的弹窗关掉。
+  assert.match(page, /const DIALOG_SEARCH_PARAMS = \["history", "new", "usage", "execution", "config"\] as const;/);
+  assert.match(page, /const conversationURL = useCallback\(\(conversationID\?: string\) => \{/);
+  assert.match(page, /DIALOG_SEARCH_PARAMS\.forEach\(\(name\) => \{ const value = searchParamsRef\.current\.get\(name\); if \(value !== null\) carried\.set\(name, value\); \}\);/);
+  assert.match(page, /return `\$\{base\}\$\{query \? `\?\$\{query\}` : ""\}`;/);
+  // 恢复会话 / 切到相邻会话 / 打开失败回退，三处都要走它。
+  assert.match(page, /navigate\(conversationURL\(next\.id\), \{ replace: true \}\);/);
+  assert.match(page, /navigate\(conversationURL\(next\.activeConversationId \|\| undefined\), \{ replace: true \}\);/);
+  assert.match(page, /navigate\(conversationURL\(fallbackID\), \{ replace: true \}\);/);
+  assert.match(page, /if \(urlConversationId\) navigate\(conversationURL\(\), \{ replace: true \}\);/);
+  assert.match(page, /readOnlyConversation, clearing, fail, refreshConversationHistory, projectApi, navigate, conversationURL, rememberConversationTab/);
+  // ⑧ 切项目后旧项目那份列表结果必须被认出且丢弃（不是"新项目没有会话"）。
+  assert.match(page, /const projectIDRef = useRef\(projectId\);\n\s*projectIDRef\.current = projectId;/);
+  assert.match(page, /if \(requestProjectID !== projectIDRef\.current\) return \{ items: \[\], stale: true \};/);
+  assert.match(page, /const requestProjectID = projectId;/);
 });
 
 test("invalid conversation routes always navigate away from an unavailable URL", () => {
   assert.match(conversationPage, /const previous = conversationTabsRef\.current;\s*let next = previous;/s);
   assert.match(conversationPage, /if \(next !== previous\) \{[\s\S]*?setConversationTabs\(next\);\s*\}/s);
-  assert.match(conversationPage, /if \(urlConversationId && unavailable\.has\(urlConversationId\)\) \{[\s\S]*?navigate\(next\.activeConversationId/s);
+  assert.match(conversationPage, /if \(urlConversationId && unavailable\.has\(urlConversationId\)\) \{[\s\S]*?navigate\(conversationURL\(next\.activeConversationId \|\| undefined\), \{ replace: true \}\);/s);
 });
 
 test("conversation tabs use roving keyboard navigation and name their panel", () => {
@@ -137,10 +194,12 @@ test("scheduled send holds input until the conversation plus subagents go idle",
   assert.match(conversationPage, /const cancelScheduledSend = \(\) => \{[\s\S]*?setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);/s);
   // 空闲判定：主回合结束 且 没有任何子代理仍在运行
   assert.match(conversationPage, /const isConversationIdle = useCallback\(\(\) => \{[\s\S]*?if \(run\) return false;[\s\S]*?for \(const execution of agentExecutions\)[\s\S]*?agent\.status === "running" \|\| agent\.status === "pending"\) return false;/s);
-  // 触发：空闲才真正 sendContent
-  assert.match(conversationPage, /if \(!isConversationIdle\(\)\) return false;\s*[\s\S]*?await sendContent(?:Ref\.current)?\(content[,;]/s);
-  // 预约进行中的提示条与取消按钮
-  assert.match(conversationPage, /pendingSendContent && <div className="composer-pending"/);
+  // 触发：空闲才真正 sendContent（第一个参数是用户正文 draft，技能引用另走 skillRefs 选项）
+  assert.match(conversationPage, /if \(!isConversationIdle\(\)\) return false;\s*[\s\S]*?await sendContent(?:Ref\.current)?\(draft[,;]/s);
+  // 预约进行中的提示条与取消按钮。
+  // 判据是 `!== null` 而不是真值：只引用了一颗技能、一行正文都没写时 content 是空串，
+  // 用真值判断会让"预约条"整条消失（预约其实已经生效），用户看不到也取消不掉。
+  assert.match(conversationPage, /pendingSendContent !== null && <div className="composer-pending"/);
   assert.match(conversationPage, /composer-pending-cancel[\s\S]*?onClick=\{cancelScheduledSend\}/);
   assert.match(stylesheet, /\.send-menu\s*\{\s*position:\s*absolute;[\s\S]*?bottom:\s*calc\(100%\s*\+\s*8px\);/s);
   assert.match(stylesheet, /\.composer-pending\s*\{[\s\S]*?border:\s*1px solid #d0c98a;/s);
@@ -149,8 +208,12 @@ test("scheduled send holds input until the conversation plus subagents go idle",
 test("user-triggered stop or clear cancels a pending scheduled send", () => {
   // 用户主动停止（stopRun）时清空预约，避免停止后又把预约自动发射开启新一轮；不写回输入框以保留草稿恢复
   assert.match(conversationPage, /const stopRun = async \(\) => \{[\s\S]*?clearScheduledSend\(\);/s);
-  // 用户主动清空（clearCurrentConversation）时清空预约，避免内容落入被清空的旧会话草稿或被 reset 覆盖
-  assert.match(conversationPage, /const clearCurrentConversation = async \(skipRunGuard = false\) => \{[\s\S]*?clearScheduledSend\(\);/s);
+  // 用户主动清空（clearCurrentConversation）时清空预约，避免内容落入被清空的旧会话草稿或被 reset 覆盖。
+  // 断言必须锁在这个函数体里：文件后面（stopRun）还有一处 clearScheduledSend()，用 `[\s\S]*?` 跨过去
+  // 会被那一处满足 —— 把这里那句删掉也照样绿（2026-09-12 已用变异证明）。先抠函数体再断言。
+  const clearBody = conversationPage.match(/const clearCurrentConversation = async \(skipRunGuard = false\) => \{[\s\S]*?\n  \};/)?.[0] ?? "";
+  assert.ok(clearBody, "找不到 clearCurrentConversation");
+  assert.match(clearBody, /clearScheduledSend\(\);/);
   // 只有用户主动点"撤回预约"按钮才把内容写回输入框
   assert.match(conversationPage, /const cancelScheduledSend = \(\) => \{[\s\S]*?clearScheduledSend\(\);[\s\S]*?setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);/s);
   // 普通发送（含键盘 Enter 提交）会收起发送方式下拉
@@ -158,8 +221,17 @@ test("user-triggered stop or clear cancels a pending scheduled send", () => {
 });
 
 test("a failed send restores its draft only while the original conversation remains active", () => {
-  assert.match(conversationPage, /const conversationID = conversation\.id;\s*const clientRequestId = options\.clientRequestId \?\? crypto\.randomUUID\(\);\s*const routeVersion = conversationRouteVersion\.current;\s*setSending\(true\);/s);
+  assert.match(conversationPage, /const conversationID = conversation\.id;\s*const clientRequestId = options\.clientRequestId \?\? crypto\.randomUUID\(\);\s*const routeVersion = conversationRouteVersion\.current;\s*const content = composeSkillMessage\(draft, refs\);\s*setSending\(true\);/s);
   assert.match(conversationPage, /catch \(cause\) \{\s*if \(conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return false;\s*if \(notifyFailure\) fail\(cause instanceof Error \? cause\.message : "无法发送消息"\);\s*if \(clearDraft && restoreOnFailure\) \{/s);
+});
+
+test("switching conversations from the history dialog closes it before moving the tab", () => {
+  // 顺序不能反。closeHistory 走的是 setSearchParams —— React Router 的相对导航按**闭包里的旧 location**
+  // 解析 pathname，所以它会把 selectConversationTab 刚 push 出去的新会话 URL 覆盖回旧会话；
+  // 症状是"在历史弹窗里点另一个会话，怎么点都切不过去"。真浏览器证据（两次 pushState c2 → c1）见
+  // .tmp/probe-skill-refs-desktop.mjs 的"切会话"段，变异见 .tmp/mutation-skill-refs.py 的 m16。
+  assert.match(conversationPage, /closeHistory\(\);\s*\n\s*selectConversationTab\(item\.id\);/);
+  assert.doesNotMatch(conversationPage, /selectConversationTab\(item\.id\);\s*\n\s*closeHistory\(\);/);
 });
 
 test("conversation entries keep card styles separate from their layout and align user messages to the reading column", () => {
@@ -299,7 +371,7 @@ test("Git workbench, project runner, and terminal are first-class workspace tabs
 test("switching projects does not render an outlet with the previous project context", () => {
   // 切换项目时，若 project 与当前路由 id 不匹配，显示全屏 loading 而非带旧 project 的 outlet。
   assert.match(projectLayout, /if \(loading \|\| !project \|\| project\.id !== projectId\)/);
-  // 用单项目接口而非全量列表，避免远程探活阻塞。
+  // 用单项目接口而非全量列表：不必为一屏数据拉整份列表，且单项目接口不做任何探活。
   assert.match(projectLayout, /api<Project>\(`\/api\/projects\/\$\{projectId\}`\)/);
   // 不再重置 setProject(null)——保留旧数据但靠 id 不匹配守卫，避免全屏闪烁。
   assert.doesNotMatch(projectLayout, /setProject\(null\);/);
@@ -368,7 +440,7 @@ test("clearing context closes the current tab and starts a fresh conversation wi
   assert.match(conversationPage, /disabled=\{readOnlyConversation \|\| !!run \|\| clearing \|\| stopping \|\| changingPermission\}/);
   assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| conversation\.permissionMode === permissionMode \|\| run \|\| clearing \|\| stopping\) return;/);
   assert.match(conversationPage, /if \(!conversation \|\| run \|\| clearing \|\| stopping\) return;/);
-  assert.match(conversationPage, /const current = list\.find\(\(item\) => item\.isCurrent\);/);
+  assert.match(conversationPage, /const current = result\.items\.find\(\(item\) => item\.isCurrent\);/);
   assert.match(conversationPage, /if \(conversationRef\.current\?\.id !== conversationID\) return;\s*setConversation\(updated\);/s);
   assert.match(conversationPage, /const conversationTransitionRef = useRef\(false\);/);
   assert.match(conversationPage, /const pendingConfirmBusyRef = useRef\(false\);/);
@@ -392,13 +464,15 @@ test("clearing context closes the current tab and starts a fresh conversation wi
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
   assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
   assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
-  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| !text\.trim\(\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\}><ComposerActionIcon action="send" \/>/);
+  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| \(!text\.trim\(\) && skillRefs\.length === 0\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\}><ComposerActionIcon action="send" \/>/);
 });
 
 test("/clear in the composer and the 清屏 shortcut route through the app clear flow", () => {
   // /clear 是 CLI 的"清屏"命令，但 headless 模式下 CLI 只发 conversation_reset、
   // 不会在应用界面清空历史。输入框键入 /clear 必须拦截并走应用自己的清空流程。
-  assert.match(conversationPage, /if \(content === "\/clear"\) \{[\s\S]*?clearConversationContext\(\);[\s\S]*?return false;/s);
+  // 判据用 draft（用户写的正文）而不是 content（拼上技能引用后的上线文本）：
+  // 拦截必须在拼接之前完成，否则带着引用的 "/clear" 会绕过这条分支直接发给 CLI。
+  assert.match(conversationPage, /if \(draft === "\/clear"\) \{[\s\S]*?clearConversationContext\(\);[\s\S]*?return false;/s);
   // 模板恰好为 /clear 的快捷项（默认"清屏"）同样拦截，不再 POST 给后端/CLI。
   assert.match(conversationPage, /if \(shortcut\.template\.trim\(\) === "\/clear"\) \{[\s\S]*?clearConversationContext\(\);[\s\S]*?return;/s);
   // 其它斜杠命令（/compact 等）仍原样发送，保证原生 CLI 命令链路不受影响。
@@ -462,7 +536,9 @@ test("wide and narrow screens sort prompts and commands in separate vertical lis
   assert.match(conversationPage, /function ShortcutSortableList\(/);
   assert.match(conversationPage, /const reorderKind = useCallback\(async \(kind/s);
   assert.match(conversationPage, /`\/api\/projects\/\$\{projectId\}\/shortcuts\/reorder`/);
-  assert.match(conversationPage, /title=\{shortcut\.enabled \? shortcut\.template : `\$\{shortcut\.template\}\\n\\n\$\{shortcut\.name\}已停用`\}/);
+  // 标签的 title 现在承载三种状态（可用 / 当前 CLI 未提供 / Codex 不可用，见 docs/37），
+  // 但"停用"仍是默认分支的那句提示，这里锁住它没有被顺手丢掉。
+  assert.match(conversationPage, /: shortcut\.enabled \? shortcut\.template : `\$\{shortcut\.template\}\\n\\n\$\{shortcut\.name\}已停用`;/);
   assert.doesNotMatch(stylesheet, /\.quick-actions-row\s*\{[^}]*overflow-x:\s*auto/s);
 });
 

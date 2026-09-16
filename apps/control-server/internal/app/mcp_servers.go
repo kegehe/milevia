@@ -132,6 +132,10 @@ func (s *Server) registerMCPRoutes(r chi.Router) {
 	r.Post("/api/mcp/servers/{serverID}/test", s.testMCPServer)
 	// 按环境预览占位符解析结果（保存前调用，故走表单字段而非 serverID）。
 	r.Post("/api/mcp/preview", s.previewMCPServer)
+	// 在目标环境检查模板声明的运行时依赖是否存在（同样是保存前调用）。
+	r.Post("/api/mcp/runtime-check", s.checkMCPRuntimes)
+	// 保存前试连一条尚未落库的配置（「一键连接」向导的最后一步）。
+	r.Post("/api/mcp/test-draft", s.testMCPDraft)
 	r.Post("/api/mcp/import", s.importMCPServers)
 	r.Put("/api/mcp/servers/{serverID}/auto-approve", s.updateMCPServerAutoApprove)
 	// 远程 MCP 的 OAuth 2.1 授权（P2）。回调由浏览器直接跳转，故在 requireSession 中放行。
@@ -834,30 +838,189 @@ func isUniqueConstraint(err error) bool {
 	return strings.Contains(msg, "unique constraint") || strings.Contains(msg, "constraint failed")
 }
 
-// mcpPreset 是内置模板（P0 只提供只读清单，供前端快速创建）。
+// mcpPresetCredential 描述一条模板需要用户自己提供的凭据。
+//
+// Target 决定它落在表单的哪个字段：env（stdio 的环境变量）或 header（http 的请求头）。
+// 模板只做声明 —— 真值仍由用户在表单里以明文填写、保存时自动加密为 sec_ 引用。
+type mcpPresetCredential struct {
+	Key         string `json:"key"`
+	Target      string `json:"target"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	// ValuePrefix 是填值时要替用户补上的前缀（如 "Bearer "）。
+	//
+	// 有它，用户在向导里只需要粘 token 本身，不必知道 Authorization 头必须带 Bearer ——
+	// 「不懂也能用」的一部分就是**别让用户去记格式**。空表示直接使用用户输入。
+	ValuePrefix string `json:"valuePrefix,omitempty"`
+	// DocsURL 是申请该凭据的地址（如 GitHub 的 token 设置页）。
+	DocsURL string `json:"docsUrl,omitempty"`
+}
+
+// 凭据落点。前端据此决定把提示写进「环境变量」还是「请求头」。
+const (
+	mcpPresetCredentialEnv    = "env"
+	mcpPresetCredentialHeader = "header"
+)
+
+// mcpPresetRequirement 描述一条模板在目标环境需要的可执行程序。
+//
+// 这里只声明「需要什么」，是否真的存在由 POST /api/mcp/runtime-check 在目标环境实测 ——
+// 目的是把「保存 → 测试 → 失败 → 回改」的返工提前到保存之前。
+type mcpPresetRequirement struct {
+	Command string `json:"command"`
+	Label   string `json:"label"`
+	Hint    string `json:"hint,omitempty"`
+}
+
+// mcpPreset 是内置服务目录（只读清单，供前端「一键连接」使用）。
+//
+// **目录的筛选标准（2026-09-15 定，比字段更要紧）**：面向「不懂 MCP 的用户」，进目录的服务
+// 必须满足 ①用户认得这个服务名 ②只需要「点一次浏览器授权」或「填一个凭据」就能用。
+// 一条只写启动命令、要用户自己去别处查依赖与凭据的条目，价值只是省几次敲键盘 —— 不进目录。
 type mcpPreset struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	DisplayName  string   `json:"displayName"`
-	Description  string   `json:"description"`
-	Transport    string   `json:"transport"`
-	Command      string   `json:"command,omitempty"`
-	Args         []string `json:"args,omitempty"`
-	URL          string   `json:"url,omitempty"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	// Description 与 Summary 是同一句话：前者被「手动配置（高级）」表单预填，后者给目录卡片用。
+	// 两个字段并存只是为了不改动既有前端字段名，不要把两处写成不同文案 —— 那会让用户在两处
+	// 看到对同一个服务的两种说法。
+	Description string `json:"description"`
+	// Summary 是给不懂 MCP 的用户看的一句话：连上之后能干什么。
+	Summary string `json:"summary"`
+	// Category 用于目录分组；顺序由本文件决定，前端不本地重排。
+	Category string `json:"category"`
+	// Icon 是前端图标键；前端只实现固定几个键，未知键退化为通用图标。
+	Icon string `json:"icon"`
+
+	Transport string   `json:"transport"`
+	Command   string   `json:"command,omitempty"`
+	Args      []string `json:"args,omitempty"`
+	URL       string   `json:"url,omitempty"`
+
 	Environments []string `json:"environments"`
+
+	Requires    []mcpPresetRequirement `json:"requires,omitempty"`
+	Credentials []mcpPresetCredential  `json:"credentials,omitempty"`
+	// OAuth 表示该服务支持浏览器授权（用户只需点一次，不用自己去申请 Token）。
+	// 为真且 Credentials 为空时，就是真正的「一键连接」。
+	OAuth bool `json:"oauth,omitempty"`
+
+	DocsURL string `json:"docsUrl,omitempty"`
+	// Note 用于说明该条目与上游版本/废弃情况相关的事项，在表单里原样展示。
+	Note string `json:"note,omitempty"`
+}
+
+// 目录分组。
+const (
+	mcpPresetCategoryCommon = "常用服务"
+	mcpPresetCategoryLocal  = "本机运行"
+)
+
+// mcpGitHubRemoteURL 是 GitHub 官方托管的远程 MCP server。
+//
+// 原来的 github 模板指向 `@modelcontextprotocol/server-github`，该 npm 包 2025-04 已归档弃用
+// （官方开发迁至 github/github-mcp-server，且旧包硬 pin SDK 1.0.1、协议协商停在 2024-11-05）。
+// 远程托管形态是最省事的一种：环境无关，且 PAT（Authorization 头）与 OAuth 2.1 都支持。
+const mcpGitHubRemoteURL = "https://api.githubcopilot.com/mcp/"
+
+// mcpGitHubDocsURL 是官方仓库，两种形态都指向这里。
+const mcpGitHubDocsURL = "https://github.com/github/github-mcp-server"
+
+// mcpPresetEnvironmentsAll 是所有目录条目共用的适用环境。
+//
+// 远程托管形态天然环境无关；本地形态的实际可用性由「运行时依赖检查」在目标环境实测回答，
+// 不靠这里的静态声明 —— 声明成子集只会让用户白白少一个可选项。
+func mcpPresetEnvironmentsAll() []string {
+	return []string{string(agentTargetEnvWindows), string(agentTargetEnvWSL), string(agentTargetEnvRemote)}
+}
+
+// mcpRemotePreset 造一条「远程托管」目录条目。URL 均取自各服务官方文档。
+func mcpRemotePreset(id, name, display, summary, icon, rawURL string, oauth bool, credentials []mcpPresetCredential, docsURL string) mcpPreset {
+	return mcpPreset{
+		ID: id, Name: name, DisplayName: display,
+		Description: summary, Summary: summary,
+		Category: mcpPresetCategoryCommon, Icon: icon,
+		Transport: mcpTransportHTTP, URL: rawURL,
+		Environments: mcpPresetEnvironmentsAll(),
+		OAuth:        oauth, Credentials: credentials, DocsURL: docsURL,
+	}
+}
+
+// mcpLocalPreset 造一条「在目标环境拉起进程」目录条目。
+func mcpLocalPreset(id, name, display, summary, icon, command string, args []string, requires []mcpPresetRequirement, credentials []mcpPresetCredential, docsURL string) mcpPreset {
+	return mcpPreset{
+		ID: id, Name: name, DisplayName: display,
+		Description: summary, Summary: summary,
+		Category: mcpPresetCategoryLocal, Icon: icon,
+		Transport: mcpTransportStdio, Command: command, Args: args,
+		Environments: mcpPresetEnvironmentsAll(),
+		Requires:     requires, Credentials: credentials, DocsURL: docsURL,
+	}
 }
 
 func mcpPresetCatalog() []mcpPreset {
-	all := []string{string(agentTargetEnvWindows), string(agentTargetEnvWSL), string(agentTargetEnvRemote)}
-	return []mcpPreset{
-		{ID: "filesystem", Name: "filesystem", DisplayName: "文件系统", Description: "读取/写入指定目录的文件（官方 filesystem server）", Transport: mcpTransportStdio, Command: "npx", Args: []string{"-y", "@modelcontextprotocol/server-filesystem", "${PROJECT_DIR}"}, Environments: all},
-		{ID: "fetch", Name: "fetch", DisplayName: "网页抓取", Description: "抓取网页并转换为 Markdown（官方 fetch server）", Transport: mcpTransportStdio, Command: "uvx", Args: []string{"mcp-server-fetch"}, Environments: all},
-		{ID: "github", Name: "github", DisplayName: "GitHub", Description: "读写 GitHub 仓库、Issue、PR（需 GITHUB_PERSONAL_ACCESS_TOKEN）", Transport: mcpTransportStdio, Command: "npx", Args: []string{"-y", "@modelcontextprotocol/server-github"}, Environments: all},
-		{ID: "playwright", Name: "playwright", DisplayName: "Playwright 浏览器", Description: "驱动浏览器完成自动化操作", Transport: mcpTransportStdio, Command: "npx", Args: []string{"-y", "@playwright/mcp@latest"}, Environments: all},
-		{ID: "context7", Name: "context7", DisplayName: "Context7 文档", Description: "按需拉取最新库文档", Transport: mcpTransportStdio, Command: "npx", Args: []string{"-y", "@upstash/context7-mcp"}, Environments: all},
-		{ID: "memory", Name: "memory", DisplayName: "记忆知识图谱", Description: "基于知识图谱的长期记忆", Transport: mcpTransportStdio, Command: "npx", Args: []string{"-y", "@modelcontextprotocol/server-memory"}, Environments: all},
-		{ID: "http-example", Name: "remote-example", DisplayName: "远程 MCP（示例）", Description: "Streamable HTTP 形式的远程 MCP server", Transport: mcpTransportHTTP, URL: "https://example.com/mcp", Environments: all},
+	node := []mcpPresetRequirement{{Command: "npx", Label: "Node.js", Hint: "npx 随 Node.js 一起安装，Windows / WSL / 远端各自独立，需分别安装。"}}
+	githubToken := []mcpPresetCredential{{
+		Key: "Authorization", Target: mcpPresetCredentialHeader, Label: "GitHub Personal Access Token",
+		ValuePrefix: "Bearer ",
+		Description: "不想授权 OAuth 时也可以填一个 Token。推荐最小权限 scope：repo、read:org。",
+		DocsURL:     "https://github.com/settings/tokens",
+	}}
+
+	// 「常用服务」：远程托管 + OAuth，用户只需点一次浏览器授权（或填一个凭据）。
+	common := []mcpPreset{
+		mcpRemotePreset("notion", "notion", "Notion", "读写你的 Notion 页面与数据库", "docs",
+			"https://mcp.notion.com/mcp", true, nil, "https://developers.notion.com/docs/mcp"),
+		mcpRemotePreset("linear", "linear", "Linear", "查找、创建、更新 Linear 工单", "tasks",
+			"https://mcp.linear.app/mcp", true, nil, "https://linear.app/docs/mcp"),
+		mcpRemotePreset("sentry", "sentry", "Sentry", "查看线上报错与告警，定位问题", "alert",
+			"https://mcp.sentry.dev/mcp", true, nil, "https://docs.sentry.io/product/sentry-mcp/"),
+		mcpRemotePreset("slack", "slack", "Slack", "读取频道与线程，发送消息", "chat",
+			"https://mcp.slack.com/mcp", true, nil, "https://docs.slack.dev/mcp/"),
+		mcpRemotePreset("atlassian", "atlassian", "Jira / Confluence", "读写 Jira 工单与 Confluence 文档", "docs",
+			"https://mcp.atlassian.com/v1/sse", true, nil, "https://www.atlassian.com/platform/remote-mcp-server"),
+		mcpRemotePreset("github", "github", "GitHub", "查看与修改代码仓库、Issue、PR", "code",
+			mcpGitHubRemoteURL, true, githubToken, mcpGitHubDocsURL),
+		mcpRemotePreset("stripe", "stripe", "Stripe", "查询支付、订阅与客户", "pay",
+			"https://mcp.stripe.com", true, []mcpPresetCredential{{
+				Key: "Authorization", Target: mcpPresetCredentialHeader, Label: "Stripe Restricted Key",
+				ValuePrefix: "Bearer ",
+				Description: "不想授权 OAuth 时也可以填受限密钥。",
+				DocsURL:     "https://dashboard.stripe.com/apikeys",
+			}}, "https://docs.stripe.com/mcp"),
 	}
+
+	// 「本机运行」：需要在目标环境装一个运行时。仍然进目录（用户可能就是要它），
+	// 但不占「一键连接」的主推位 —— 依赖是否满足由运行时检查实答。
+	local := []mcpPreset{
+		mcpLocalPreset("filesystem", "filesystem", "项目文件", "让 AI 读写这个项目里的文件", "files",
+			"npx", []string{"-y", "@modelcontextprotocol/server-filesystem", "${PROJECT_DIR}"}, node, nil,
+			"https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"),
+		mcpLocalPreset("playwright", "playwright", "浏览器", "让 AI 操作网页（打开、点击、截图）", "browser",
+			"npx", []string{"-y", "@playwright/mcp@latest"},
+			[]mcpPresetRequirement{{Command: "npx", Label: "Node.js", Hint: "首次运行会下载浏览器内核，耗时较长。"}}, nil,
+			"https://github.com/microsoft/playwright-mcp"),
+		mcpLocalPreset("fetch", "fetch", "网页抓取", "让 AI 直接读网页内容", "browser",
+			"uvx", []string{"mcp-server-fetch"},
+			[]mcpPresetRequirement{{Command: "uvx", Label: "uv", Hint: "uvx 来自 uv（Astral），不能用 npx 替代该服务。"}}, nil,
+			"https://github.com/modelcontextprotocol/servers/tree/main/src/fetch"),
+		mcpLocalPreset("memory", "memory", "长期记忆", "让 AI 记住跨会话的信息", "memory",
+			"npx", []string{"-y", "@modelcontextprotocol/server-memory"}, node, nil,
+			"https://github.com/modelcontextprotocol/servers/tree/main/src/memory"),
+		mcpLocalPreset("context7", "context7", "库文档", "查最新版本的库文档", "docs",
+			"npx", []string{"-y", "@upstash/context7-mcp"}, node, nil,
+			"https://github.com/upstash/context7"),
+		mcpLocalPreset("github-local", "github-local", "GitHub（本地容器）", "网络受限时在本地容器里跑 GitHub 工具", "code",
+			"docker", []string{"run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"},
+			[]mcpPresetRequirement{{Command: "docker", Label: "Docker", Hint: "Windows / WSL 需 Docker Desktop，远端需已安装 docker 且当前用户可执行。"}},
+			[]mcpPresetCredential{{
+				Key: "GITHUB_PERSONAL_ACCESS_TOKEN", Target: mcpPresetCredentialEnv, Label: "GitHub Personal Access Token",
+				Description: "在下方「环境变量」里填成 GITHUB_PERSONAL_ACCESS_TOKEN=<你的 PAT>，保存时自动加密。推荐最小权限 scope：repo、read:org。",
+				DocsURL:     "https://github.com/settings/tokens",
+			}}, mcpGitHubDocsURL),
+	}
+
+	return append(common, local...)
 }
 
 func (s *Server) listMCPPresets(w http.ResponseWriter, r *http.Request) {

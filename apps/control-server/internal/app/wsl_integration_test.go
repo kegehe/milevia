@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // 集成验证：在真实 WSL 环境（本机有 Ubuntu）实测探测链路。无 WSL 时跳过。
@@ -35,7 +34,7 @@ func TestWSLDiscoveryIntegration(t *testing.T) {
 	}
 
 	// wslAgentRunner 就绪 / 版本探测（真实 WSL 内执行；WSL 无 claude 时读就绪为 false）
-	runner := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, distro)
+	runner := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, distro, nil)
 	ready := runner.Ready(context.Background())
 	t.Logf("claude ready in WSL: %v", ready)
 	if ready {
@@ -78,56 +77,6 @@ func TestWSLDiscoveryIntegration(t *testing.T) {
 	}
 }
 
-// TestWSLReadyCacheTTL 验证 cachedReady 的 TTL 缓存语义：TTL 内复用不再探测，
-// TTL 过期后重新探测。用 codex 的轻量探测（command -v codex）做真实 WSL probe。
-func TestWSLReadyCacheTTL(t *testing.T) {
-	distro, err := detectDefaultWSLDistro(context.Background())
-	if err != nil {
-		t.Skipf("no WSL, skip: %v", err)
-	}
-	runner := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, distro)
-
-	// 首次调用触发探测并写入缓存。
-	first := runner.codexReady(context.Background())
-	runner.mu.Lock()
-	at := runner.codexAt
-	cached := runner.codexCache
-	runner.mu.Unlock()
-	if at.IsZero() {
-		t.Fatal("codexReady did not populate cache timestamp")
-	}
-	if cached != first {
-		t.Fatalf("cache value=%v differs from result=%v", cached, first)
-	}
-
-	// TTL 内再次调用应命中缓存：时间戳不被刷新，缓存值保持一致。
-	runner.mu.Lock()
-	runner.codexAt = at.Add(-1 * time.Millisecond) // 保持 fresh（寿命 < TTL）
-	runner.mu.Unlock()
-	second := runner.codexReady(context.Background())
-	runner.mu.Lock()
-	atAfter := runner.codexAt
-	runner.mu.Unlock()
-	if !atAfter.Equal(at.Add(-1 * time.Millisecond)) {
-		t.Fatalf("cache-hit call refreshed timestamp: before=%v after=%v", at.Add(-1*time.Millisecond), atAfter)
-	}
-	if second != first {
-		t.Fatalf("cache value changed between hits: %v -> %v", first, second)
-	}
-
-	// 过期后再次调用应重新探测并刷新时间戳。
-	runner.mu.Lock()
-	runner.codexAt = time.Now().Add(-wslReadyCacheTTL - time.Second) // 过期
-	runner.mu.Unlock()
-	runner.codexReady(context.Background())
-	runner.mu.Lock()
-	atExpired := runner.codexAt
-	runner.mu.Unlock()
-	if !atExpired.After(time.Now().Add(-2 * time.Second)) {
-		t.Fatalf("expired call did not re-probe/refresh cache timestamp: at=%v", atExpired)
-	}
-}
-
 // TestWSLCodexNativeResolution 回归：wsl-local 项目的 codex 应经 wslNativeCommand 在 WSL 内
 // 解析到原生二进制（$HOME/.npm-global/bin），而非 Windows 挂载 npm shim（后者在 Linux 平台
 // 缺 @openai/codex-linux-x64、一跑即抛 "Missing optional dependency"）。真实 WSL 内执行
@@ -141,7 +90,7 @@ func TestWSLCodexNativeResolution(t *testing.T) {
 	if err != nil {
 		t.Skipf("no WSL home, skip: %v", err)
 	}
-	runner := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, distro)
+	runner := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, distro, nil)
 
 	cmd := runner.wslNativeCommand(context.Background(), "codex", []string{"--version"}, nil, home)
 	out, err := cmd.CombinedOutput()

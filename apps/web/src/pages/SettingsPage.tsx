@@ -23,9 +23,24 @@ type StorageUsage = {
   databaseBytes: number;
   walBytes: number;
   shmBytes: number;
+  pageSize: number;
+  pageCount: number;
+  freelistPages: number;
+  freelistBytes: number;
+  // 后台正在做一次性空间回收（VACUUM，会长时间独占数据库）。这段时间所有数据库接口
+  // 都会变慢，界面上要说明白，免得被当成新的卡死。
+  reclaiming: boolean;
+  // 为 false 表示统计中途超时，数字不全。
+  measurementComplete: boolean;
+  tables: Array<{ name: string; rows: number; payloadBytes?: number; payloadEstimated?: boolean }>;
+};
+// 清理接口单独返回精确的 thinking_tokens 条数：它只在这个动作里扫一次全表，
+// 日常的占用面板不再为它付代价。
+type StorageCleanupResult = {
+  after: StorageUsage;
+  freedBytes: number;
   thinkingTokenEvents: number;
   thinkingTokenBytes: number;
-  tables: Array<{ name: string; rows: number; payloadBytes?: number }>;
 };
 
 function formatBytes(value: number): string {
@@ -84,26 +99,49 @@ export default function SettingsPage() {
   const [storageConfirmOpen, setStorageConfirmOpen] = useState(false);
   const draftCount = useMemo(() => countStoredConversationDrafts(localPreferences.draftRetentionDays), [draftVersion, localPreferences.draftRetentionDays]);
 
-  const loadStorage = async () => {
+  // quiet 用于后台轮询：不动 loading 态、失败也不弹 toast，免得每 5 秒闪一次或刷屏。
+  const loadStorage = async (quiet = false) => {
     if (!isDesktop()) return;
-    setStorageLoading(true);
-    try { setStorage(await apiWithTimeout<StorageUsage>("/api/system/storage", undefined, 1, 60_000)); }
-    catch (cause) { toast.error(cause instanceof Error ? cause.message : "无法读取数据占用"); }
-    finally { setStorageLoading(false); }
+    if (!quiet) setStorageLoading(true);
+    try { setStorage(await apiWithTimeout<StorageUsage>("/api/system/storage", undefined, 0, 30_000)); }
+    catch (cause) { if (!quiet) toast.error(cause instanceof Error ? cause.message : "无法读取数据占用"); }
+    finally { if (!quiet) setStorageLoading(false); }
   };
 
   const cleanupStorage = async () => {
     setStorageConfirmOpen(false);
     setStorageCleaning(true);
     try {
-      const result = await apiWithTimeout<{ after: StorageUsage; freedBytes: number }>("/api/system/storage/cleanup", { method: "POST", body: "{}" }, 0, 120_000);
+      // 这次调用可能触发整库重写（VACUUM），服务端给出的上限是 15 分钟且刻意不受客户端
+      // abort 影响，所以这里不重试、给足时间。
+      const result = await apiWithTimeout<StorageCleanupResult>("/api/system/storage/cleanup", { method: "POST", body: "{}" }, 0, 900_000);
       setStorage(result.after);
-      toast.success(`已清理思考事件，释放 ${formatBytes(result.freedBytes)}`);
+      const removed = result.thinkingTokenEvents > 0 ? `已删除 ${result.thinkingTokenEvents.toLocaleString()} 条思考事件，` : "";
+      toast.success(`${removed}释放 ${formatBytes(result.freedBytes)}`);
     } catch (cause) { toast.error(cause instanceof Error ? cause.message : "清理失败"); }
     finally { setStorageCleaning(false); }
   };
 
   useEffect(() => { void loadStorage(); }, []);
+
+  // 后台正在整理数据库空间时轮询刷新：整库重写期间所有数据库接口都会变慢，这一段
+  // 不主动刷新的话，用户只会看到一个过期的数字，然后把"卡"当成新故障。
+  //
+  // 用「上一次跑完再排下一次」而不是 setInterval：整理期间一次读取就可能耗时数秒，
+  // 固定间隔会让请求互相叠加 —— 那正是要避免的连接池压力。
+  useEffect(() => {
+    if (!storage?.reclaiming) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      if (cancelled) return;
+      await loadStorage(true);
+      if (cancelled) return;
+      timer = window.setTimeout(() => void poll(), 5_000);
+    };
+    timer = window.setTimeout(() => void poll(), 5_000);
+    return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
+  }, [storage?.reclaiming]);
 
   useEffect(() => {
     if (!isDesktop()) return;
@@ -210,7 +248,7 @@ export default function SettingsPage() {
 
 
   return <main className="settings-page">
-    {storageConfirmOpen && <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-clean-storage-title"><section className="modal settings-confirm-dialog"><header><div><h2 id="settings-clean-storage-title">清理思考事件</h2></div><button type="button" title="关闭" onClick={() => setStorageConfirmOpen(false)}>x</button></header><p>将删除数据库中的 thinking_tokens 遥测并执行 VACUUM 回收空间。会话消息、任务、任务结果和用量统计不会被删除；清理期间请不要运行任务。</p><footer><button type="button" className="secondary" onClick={() => setStorageConfirmOpen(false)}>取消</button><button type="button" className="primary danger" onClick={() => void cleanupStorage()}>确认清理</button></footer></section></div>}
+    {storageConfirmOpen && <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-clean-storage-title"><section className="modal settings-confirm-dialog"><header><div><h2 id="settings-clean-storage-title">清理数据库</h2></div><button type="button" title="关闭" onClick={() => setStorageConfirmOpen(false)}>x</button></header><p>将删除数据库中遗留的 thinking_tokens 遥测，并回收文件里已释放的页（必要时会重写整个数据库文件，期间其它操作会明显变慢）。会话消息、任务、任务结果和用量统计不会被删除；清理期间请不要运行任务。</p><footer><button type="button" className="secondary" onClick={() => setStorageConfirmOpen(false)}>取消</button><button type="button" className="primary danger" onClick={() => void cleanupStorage()}>确认清理</button></footer></section></div>}
     <header className="settings-header">
       <div className="settings-header-main"><button type="button" className="settings-back" title="返回首页" aria-label="返回首页" onClick={() => navigate("/")}><BackIcon /></button><div><span className="settings-kicker"><SettingsIcon />应用</span><h1>Milevia 设置</h1></div></div>
       <span className="settings-device-label">仅作用于当前设备</span>
@@ -226,7 +264,7 @@ export default function SettingsPage() {
 
         <section id="tasks" className="settings-section"><header><div><p>任务</p><h2>任务验收</h2></div>{appPreferencesLoading && <span className="settings-loading">读取中</span>}</header>{appPreferencesError && <p className="settings-error">{appPreferencesError}</p>}<div className="settings-row"><div><b>自动验收任务</b><span>开启后，执行成功的任务会自动验收并从队列消失，无需手动确认；默认关闭。失败或被中断的任务仍会进入「需处理」等待处理。</span></div><Toggle label="自动验收任务" checked={appPreferences.autoReview} disabled={appPreferencesLoading} onChange={(checked) => void saveAppPreferences({ autoReview: checked })} /></div></section>
 
-        <section id="data" className="settings-section"><header><div><p>数据</p><h2>本地草稿与偏好</h2></div></header><div className="settings-row"><div><b>自动保存未发送草稿</b><span>关闭后停止写入新草稿，已有草稿不会被删除。</span></div><Toggle label="自动保存未发送草稿" checked={localPreferences.draftAutoSave} onChange={(checked) => updateLocalPreferences({ draftAutoSave: checked })} /></div><div className="settings-row"><div><b>草稿保留期限</b><span>缩短期限时会立即清理过期草稿。</span></div><select aria-label="草稿保留期限" value={localPreferences.draftRetentionDays} onChange={(event) => updateLocalPreferences({ draftRetentionDays: Number(event.target.value) as 7 | 30 | 90 })}><option value="7">7 天</option><option value="30">30 天</option><option value="90">90 天</option></select></div><div className="settings-row settings-danger-row"><div><b>清除未发送草稿</b><span>当前设备有 {draftCount} 条可清除草稿，不会影响项目、会话或任务。</span></div><button type="button" className="secondary" disabled={draftCount === 0} onClick={() => setClearDraftsOpen(true)}>清除草稿</button></div><div className="settings-row settings-danger-row"><div><b>恢复本地界面偏好</b><span>仅恢复通知、代码字号和项目卡片排序，不会删除项目或任何凭据。</span></div><button type="button" className="secondary" onClick={() => setResetLocalOpen(true)}>恢复默认</button></div>{isDesktop() && <><div className="settings-row settings-storage-row"><div><b>应用数据库占用</b><span>{storageLoading ? "正在读取占用..." : storage ? <>数据库总量 {formatBytes(storage.databaseBytes)}；消息负载 {formatBytes(tableBytes(storage, "messages"))}；会话事件负载 {formatBytes(tableBytes(storage, "events"))}；任务事件负载 {formatBytes(tableBytes(storage, "task_events"))}；thinking_tokens {storage.thinkingTokenEvents.toLocaleString()} 条（{formatBytes(storage.thinkingTokenBytes)}）</> : "暂时无法读取数据占用"}</span></div><button type="button" className="secondary" disabled={storageLoading} onClick={() => void loadStorage()}>刷新</button></div><div className="settings-row settings-danger-row"><div><b>清理思考事件</b><span>删除高频 thinking_tokens 遥测并回收数据库空间，不会删除会话消息、任务或结果；运行中的任务需要先完成。</span></div><button type="button" className="secondary" disabled={!storage || storage.thinkingTokenEvents === 0 || storageCleaning} onClick={() => setStorageConfirmOpen(true)}>{storageCleaning ? "清理中" : "清理数据"}</button></div></>}{isDesktop() && <div className="settings-row"><div><b>应用数据目录</b><span>打开当前设备保存应用数据和本地草稿的目录。</span></div><button type="button" className="secondary" disabled={openingDataDirectory} onClick={() => void openDataDirectory()}>{openingDataDirectory ? "打开中" : "打开目录"}</button></div>}</section>
+        <section id="data" className="settings-section"><header><div><p>数据</p><h2>本地草稿与偏好</h2></div></header><div className="settings-row"><div><b>自动保存未发送草稿</b><span>关闭后停止写入新草稿，已有草稿不会被删除。</span></div><Toggle label="自动保存未发送草稿" checked={localPreferences.draftAutoSave} onChange={(checked) => updateLocalPreferences({ draftAutoSave: checked })} /></div><div className="settings-row"><div><b>草稿保留期限</b><span>缩短期限时会立即清理过期草稿。</span></div><select aria-label="草稿保留期限" value={localPreferences.draftRetentionDays} onChange={(event) => updateLocalPreferences({ draftRetentionDays: Number(event.target.value) as 7 | 30 | 90 })}><option value="7">7 天</option><option value="30">30 天</option><option value="90">90 天</option></select></div><div className="settings-row settings-danger-row"><div><b>清除未发送草稿</b><span>当前设备有 {draftCount} 条可清除草稿，不会影响项目、会话或任务。</span></div><button type="button" className="secondary" disabled={draftCount === 0} onClick={() => setClearDraftsOpen(true)}>清除草稿</button></div><div className="settings-row settings-danger-row"><div><b>恢复本地界面偏好</b><span>仅恢复通知、代码字号和项目卡片排序，不会删除项目或任何凭据。</span></div><button type="button" className="secondary" onClick={() => setResetLocalOpen(true)}>恢复默认</button></div>{isDesktop() && <><div className="settings-row settings-storage-row"><div><b>应用数据库占用</b><span>{storageLoading ? "正在读取占用..." : storage ? <>{storage.reclaiming ? "正在整理数据库空间（期间其它操作会变慢）…" : ""}数据库总量 {formatBytes(storage.databaseBytes)}；可回收空间 {formatBytes(storage.freelistBytes)}；消息负载约 {formatBytes(tableBytes(storage, "messages"))}；会话事件负载约 {formatBytes(tableBytes(storage, "events"))}{storage.measurementComplete ? "" : "（统计未跑完，数字不全）"}</> : "暂时无法读取数据占用"}</span></div><button type="button" className="secondary" disabled={storageLoading} onClick={() => void loadStorage()}>刷新</button></div><div className="settings-row settings-danger-row"><div><b>清理数据库</b><span>删除遗留的 thinking_tokens 遥测，并回收数据库文件里已释放的页；不会删除会话消息、任务或结果。运行中的任务需要先完成，整库整理期间操作会变慢。</span></div><button type="button" className="secondary" disabled={storageCleaning} onClick={() => setStorageConfirmOpen(true)}>{storageCleaning ? "清理中" : "清理数据"}</button></div></>}{isDesktop() && <div className="settings-row"><div><b>应用数据目录</b><span>打开当前设备保存应用数据和本地草稿的目录。</span></div><button type="button" className="secondary" disabled={openingDataDirectory} onClick={() => void openDataDirectory()}>{openingDataDirectory ? "打开中" : "打开目录"}</button></div>}</section>
 
         <section id="about" className="settings-section"><header><div><p>关于</p><h2>Milevia</h2></div></header><div className="settings-row"><div><b>运行环境</b><span>{isDesktop() ? "桌面端，本地偏好仅保存在当前设备。" : "Web 环境，本地偏好仅保存在当前浏览器。"}</span></div><span className="settings-value">{isDesktop() ? "桌面端" : "Web"}</span></div>{isDesktop() && <div className="settings-row"><div><b>当前版本</b><span>{updaterError || updaterStatus?.status === "failed" ? (updaterError || updaterStatus?.error || "更新检查失败，请稍后重试。") : updaterStatus?.status === "checking" ? "正在检查更新…" : updaterStatus?.update ? `发现新版本 v${updaterStatus.update.version}${updaterStatus.update.notes ? `：${updaterStatus.update.notes.trim().slice(0, 80)}` : ""}` : updaterStatus ? "当前已是最新版本。" : "正在读取更新状态。"}</span></div><div className="settings-update-actions"><button type="button" className="secondary" disabled={checkingUpdate || installingUpdate} onClick={() => void checkForUpdate()}>{checkingUpdate ? "检查中" : "检查更新"}</button>{updaterStatus?.status === "complete" && updaterStatus.update ? <button type="button" className="primary" disabled={checkingUpdate || installingUpdate} onClick={() => void installUpdate()}>{installingUpdate ? "升级中" : "立即升级"}</button> : <span className="settings-value">v{updaterStatus?.appVersion ?? "-"}</span>}</div></div>}</section>
       </div>

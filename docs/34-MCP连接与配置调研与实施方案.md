@@ -38,7 +38,7 @@
 | 18 | 前端「2 处」 | 数量对，但两个组件内部约 **6 处**分支要改，且 MCP 工具名会原样显示成 `mcp__github__create_issue`，需可读化 | `ConversationPage.tsx:674-689`（ToolCard）、`:760-775`（ApprovalBanner，标题在 `:769`） |
 | 19 | 未提同一 run 的并发审批 | `waitForApproval` 对同一 run **只允许 1 个待审批**（并发请求 409）。MCP 工具在一个回合内**并行调用**的概率远高于 Bash；第二个调用的 hook 会因 `curl -f` 收到 409 而失败 → 非阻塞错误 → `-p` 下最终被拒。建议服务端对同 run 审批**排队**，或返回结构化 `deny` + 可读原因，而不是让 hook 抛错 | `app.go:5696-5702`；`scripts/claude-approval-hook.sh`（`curl --fail`） |
 | 20 | Codex `-c` 注入（只说用点号路径） | 两个实现细节：① `-c` 的值按 **TOML** 解析，Windows 路径反斜杠与引号必须做 **TOML 转义**（不能只做 shell quote），应使用 TOML 编码器构造；② `env_vars` 在 **SSH 远端**上没有安全通道 —— 变量须存在于远端 Codex 进程环境，而 `export VAR=…` 会出现在远端 shell 的 argv/`ps` 里，**破坏「密钥不进 argv」原则**。Claude 有落盘通道，Codex-SSH 没有等价物，需单独设计 | — |
-| 21 | 未提上游 `--bare` | Claude 官方将把 **`--bare` 设为 `-p` 的默认模式**；bare **不读取** 项目 `.mcp.json`、项目 CLAUDE.md、队友 hooks、插件与 skills 的自动发现。Milevia 依赖 skills 自动发现（`skills.go:148-162`，**未传** `--plugin-dir`）→ 该变更会在未来某个版本**静默破坏 skills**。列为前瞻风险，需纳入版本探测 | Claude Code headless 文档「`--bare` … will become the default for `-p` in a future release」 |
+| 21 | 未提上游 `--bare` | Claude 官方将把 **`--bare` 设为 `-p` 的默认模式**；bare **不读取** 项目 `.mcp.json`、项目 CLAUDE.md、队友 hooks、插件与 skills 的自动发现。Milevia 依赖 skills 自动发现（`skills.go:148-162`，**未传** `--plugin-dir`）→ 该变更会在未来某个版本**静默破坏 skills**。列为前瞻风险，需纳入版本探测（曾按 §19.8 实现，因无可执行动作已于 §25 撤回；风险本身仍在） | Claude Code headless 文档「`--bare` … will become the default for `-p` in a future release」 |
 
 ### 0.3 复核中**被证伪、无需改动**的两条
 
@@ -528,7 +528,7 @@ Windows/WSL 的临时文件在进程结束后 `defer` 删除；异常退出时�
 | **审批参数入时间线** | MCP 工具参数可能很大或含敏感值，会写进会话事件 | `toolInput` 设上限 / 截断后再落事件与前端展示 |
 | **过度授权** | 一个 MCP 拿到过宽凭据（如 GitHub admin token） | UI 与文档明确建议只读/最小权限凭据；对 `admin`/`*:*` 等特征给出提示 |
 | **工具返回值的间接注入** | 工具返回值里嵌指令，间接操控模型 | 高风险写操作走审批（§8）；P2 可接注入分类器 |
-| **上游默认行为变更** | `--bare` 将成为 `-p` 默认，不再自动发现 skills / 项目资产 | 纳入 CLI 版本探测与告警（§13） |
+| **上游默认行为变更** | `--bare` 将成为 `-p` 默认，不再自动发现 skills / 项目资产 | 风险仍在（§13）；探测与告警的实现在 §25 已撤回，届时需改为显式传参 |
 
 ---
 
@@ -674,7 +674,7 @@ MCP 连接
 | **requiresUserInteraction** | 带该标记的 MCP 工具在 `-p` 下无法被 hook-allow 拯救 | 记录为已知限制，UI 给出可操作提示 |
 | **Codex 无 strict 等价物** | 用户自己的 `~/.codex/config.toml` MCP 无法屏蔽 | UI 明示；文档说明能力差异 |
 | **WSL 动态环境变量** | `wslForwardEnvKeys` 是静态前缀表，MCP 密钥变量名任意 | 扩展为「静态前缀 + 本次动态集合」（§7.4） |
-| **上游 `--bare` 成为 `-p` 默认** | bare 不自动发现 skills / 项目资产；Milevia 依赖 skills 自动发现（`skills.go:148-162`） | 纳入 CLI 版本探测与告警；届时需改为显式传参（如 `--plugin-dir` / `--settings`） |
+| **上游 `--bare` 成为 `-p` 默认** | bare 不自动发现 skills / 项目资产；Milevia 依赖 skills 自动发现（`skills.go:148-162`） | 探测与 UI 告警曾按 §19.8 实现，因无可执行动作已于 §25 撤回；风险仍在，届时需改为显式传参（如 `--plugin-dir` / `--settings`） |
 | **远端依赖缺失** | stdio MCP 常在远端不可用（无 Node/Python） | 连接测试在目标环境执行（P1）；P0 至少在 UI 提示 |
 | **会话中途工具集变化** | 用户改配置后长会话行为不可复现 | 已定：只影响新建会话（§10.3），UI 明说 |
 | **OAuth token 存储位置** | 需与 `profile-master.key` 同级的加密存储 | P2 设计时统一，勿另起密钥体系 |
@@ -1115,6 +1115,9 @@ func resolveMCPPlaceholders(value string, target agentTargetEnv, projectPath str
 
 ### 19.8 H. `--bare` 纳入版本探测与告警（4 类 runner + 前端）
 
+> **⚠️ 本节实现已于 2026-09-15 撤回**（理由与范围见 §25）。保留原文仅作历史记录与实现参考，
+> 描述的不是当前代码。
+
 **背景（§13 前瞻风险）**：上游计划把 `--bare` 设为 `-p` 的**默认行为**，届时 CLI 将**不再自动发现 skills / 项目资产**——而 Milevia 依赖该自动发现（§22 对话页 Skill 区、项目级 AI 配置）。
 
 **取舍：探测而非版本猜测**。是否为 `-p` 默认取决于**上游未来版本**，Milevia 无法预判，按版本号猜会产生误报。改为**探测 CLI `--help` 里是否已出现 `--bare`**；结果按 runner **缓存一次**（`sync.Once`），避免每次 `listRunners` 都付一次进程启动代价。
@@ -1393,3 +1396,423 @@ Playwright（headless Chromium，仓库 `apps/web` 已带 `playwright@1.62.1`）
 - 后端定向测试全绿；前端单测 210/210；仅 2 个**既有环境性失败**（隔离 `CODEX_HOME` 缺内置 `.system` skill、Windows 非特权符号链接），与本轮无关。
 - 运行期卫生：`mcp-runtime` 无残留文件（用后即删生效）；服务日志除浏览器关闭导致的 WS 断开噪声与 WSL 注册警告外无异常。
 - 测试脚本可重复执行，固定在临时目录：`e2e_mcp.py`（API）、`ui_test.cjs`（UI）、`echo-mcp.js`（回显用 MCP server）、`shots/*.png`（截图）。
+
+---
+
+## 23. 模板缺陷修复与连接体验审计（2026-09-15）
+
+**起因**：用户提出「MCP 的连接与配置过程太麻烦，有没有更好的方式，参考一下 WorkBuddy 的连接器」。
+先做了一轮只读审计（前端 `McpManagerPage.tsx` + 后端 9 个 `mcp_*.go` + 本文档），给出问题清单与改造建议；
+**本轮只落地其中「已知缺陷」部分**，改造类目全部挂账（§23.6）。
+
+### 23.1 审计结论：短板在「默认值从哪来」和「反馈什么时候到」
+
+| | 现在的 Milevia（配置表模型） | WorkBuddy（连接器安装模型） |
+| --- | --- | --- |
+| 入口 | 首页按钮 → 一个大表单 | 连接器市场 / 自定义向导 |
+| 用户要提供 | 命令、参数、环境变量、传输类型、作用域 × 3 环境 × 2 Agent、白名单 glob | 基础信息 → 认证方式 → MCP Server URL |
+| 配置来自 | **用户自己**（模板也只给启动命令） | **连接器包**（`connector-meta.json` + `mcp.json` + `icon.svg` + `skills/`） |
+| 认证 | 手填凭据；OAuth 需**先建好 server** | MCP OAuth 2.1：填完 URL 自动建凭据，无需手填 Client ID/Secret |
+| 生效 | 保存后**才能测试**；失败要回改 | 点一次「信任」 |
+| 工具权限 | 只有「免审批」开关（藏在测试结果里） | 工具级过滤 |
+
+**结论**：**安全治理层是 Milevia 领先**（`--strict-mcp-config` 默认开、凭据 AES-GCM + 占位符不落盘、
+hook-allow 审批链路、只读任务不注入 + `mcp__*` deny、投毒/过度授权检测、调用审计 —— WorkBuddy 的公开
+文档里没有对应的审计层），**短板全在默认值来源与反馈时机**。因此改造方向是「把能力收进默认值与折叠区」，
+**不是砍掉能力**。
+
+### 23.2 已修缺陷
+
+#### (1) GitHub 模板指向已归档的 npm 包（最硬的一条）
+
+`@modelcontextprotocol/server-github` **已于 2025-04 归档弃用**，官方开发迁至
+[`github/github-mcp-server`](https://github.com/github/github-mcp-server)。旧包还有一个更实质的问题：
+它**硬 pin `@modelcontextprotocol/sdk@1.0.1`**，协议协商封顶在 `2024-11-05`，拿不到结构化工具输出 /
+elicitation / 工具注解。用户点「GitHub」模板 → `npx -y @modelcontextprotocol/server-github` → 必然失败。
+
+**修法**：换成官方两种形态，各带自己的依赖与凭据声明：
+
+| 模板 | 形态 | 凭据 | 依赖 |
+| --- | --- | --- | --- |
+| `github`（GitHub（远程托管）） | http → `https://api.githubcopilot.com/mcp/` | `Authorization: Bearer <PAT>`（请求头） | 无（**环境无关**，故适用全部三种环境） |
+| `github-local`（GitHub（本地容器）） | stdio → `docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server` | `GITHUB_PERSONAL_ACCESS_TOKEN`（环境变量） | `docker` |
+
+> `-e GITHUB_PERSONAL_ACCESS_TOKEN` **不带值**：docker 从自身进程环境转发，而该变量正是 Milevia 在
+> 「环境变量」里注入的那一个 —— 因此密钥仍然不进 argv，与 §16.2 的占位符方案一致。
+>
+> http 形态另有一条收益：**可以改用已有的 OAuth 2.1**（§18.1），卡片上的「授权」按钮即可走浏览器登录。
+
+#### (2) 模板不声明依赖与凭据
+
+`mcpPreset` 原只有 `ID/Name/DisplayName/Description/Transport/Command/Args/URL/Environments`。
+`startCreate(preset)` 也只拷这几个字段 —— 用户点完 GitHub 模板，仍要自己知道有
+`GITHUB_PERSONAL_ACCESS_TOKEN` 这回事。
+
+**修法**：`mcpPreset` 增 `Requires` / `Credentials` / `DocsURL` / `Note`：
+
+```go
+type mcpPresetRequirement struct { Command, Label, Hint string }
+type mcpPresetCredential struct { Key, Target, Label, Description, DocsURL string } // Target: env | header
+```
+
+前端配套（四条，都为了「把还差什么提到点击之前」）：
+
+- 模板区由一排按钮改为**卡片**，带徽标：`需 Node.js` / `需 Docker` / `填 GitHub Personal Access Token`。
+- 表单内新增「**模板要求**」区块：依赖（含 hint）+ 凭据（键名 / 落点 / 说明 / 「去申请」按钮）。
+- 凭据提示**以 `#` 注释行预填进环境变量 / 请求头文本框**：
+
+  ```text
+  # GITHUB_PERSONAL_ACCESS_TOKEN=<GitHub Personal Access Token>      ← env
+  # Authorization=Bearer <GitHub Personal Access Token>              ← header
+  ```
+
+  `parseKeyValueLines` 本就跳过 `#` 开头的行，所以既让用户看到该填哪个 key、填成什么形态，
+  又不会因为留空而写进一条空值；http 形态自带 `Bearer ` 前缀，用户不用去查格式。
+  **值位置只允许出现「待替换的占位符」，行尾不许追加说明文字** —— 这条是被测试逼出来的：
+  初版写成 `# KEY=<必填>  ← 说明`，用户照提示取消注释后解析出
+  `KEY=xx  ← 说明`，token 末尾多一段可见尾巴，**表现为 401 而不是「没填」**，排查成本极高。
+  说明统一放在表单的「模板要求」区块里（那里同时给出申请链接）。
+  **两处规则必须同步，已写成回归测试**。
+- 解析、模板要求、运行时检查的命令选取抽到 `apps/web/src/features/mcp/mcp-model.ts`（纯模块）。
+  原因见 §23.6 末条：这几条规则**取决于优先级 / 顺序**，靠扫源码验不出来。
+- `transportLabel()` 把 `stdio/http/sse` 渲染成「本地进程 / 远程 HTTP / 远程 SSE」。
+
+#### (3) 内置了一条只用于演示的模板
+
+`{ID: "http-example", URL: "https://example.com/mcp"}` —— 它会以「远程 MCP（示例）」出现在正式模板列表里，
+用户点进去必然连接失败。**已删除**（`example.com` 占位地址与「示例」字样都写进了回归测试）。
+
+#### (4) 运行时依赖只在「连接测试」里才暴露，而测试在保存之后
+
+见 §23.3。
+
+#### (5) 过期文案 + 顺带修掉的一个真实缺口
+
+- Agent 选项仍写着 `Codex（P1 起支持）`，而 P1 的 Codex `-c` 注入 2026-09-10 就完成了（§17.4）。
+- **顺带发现并修掉**：`testMCPServer` 的 `ConnID` 取的是前端传入的 `connectionId`，但测试对话框
+  （`runTest`）**从不传这个字段**，于是「目标环境 = SSH 远端」**永远**以
+  「远端测试需要指定 SSH 连接」失败 —— 一个从未成功过的分支。新增
+  `mcpConnectionIDFromRunner(runnerID, explicit)`：显式传入优先，否则从项目的 `runnerID` 反推
+  （SSH runner 的 id 恒为 `ssh-<connectionID>`，见 `ssh_connection.go`）。
+  **非 `ssh-` 前缀一律返回空** —— 项目的 runner 是本机 / WSL 时，把 runnerID 当连接 id 传下去只会得到
+  「该 SSH 连接当前未建立」这种指向错误原因的提示。
+
+### 23.3 新增 `POST /api/mcp/runtime-check`
+
+**要解决的问题**：`/api/mcp/servers/{id}/test` 依赖 **已落库的 serverID**（内部 `fetchStoredMCPServer` 查库），
+而 `/api/mcp/preview` 只解析占位符、不真的连。于是用户只能走
+**「填完一屏 → 保存 → 测 试 → 发现 npx 不存在 → 回改 → 再保存」**，至少三个来回。
+
+**实现**：新接口**接收表单 / 模板给出的命令名**，在目标环境实测其是否存在，不落库、不启动 server。
+
+| 目标环境 | 做法 | 说明 |
+| --- | --- | --- |
+| windows | `exec.LookPath` | 按 `PATHEXT` 展开，能找到 `npx.cmd` |
+| wsl | `runner.wslBridgeProbe(ctx, script)` | 复用既有通道，自动带 `wslPathPrefix`（`$HOME/.npm-global/bin` 等），与解析 claude/codex 二进制同一口径 |
+| remote-linux | `client.execCommand(ctx, script)` | 连接 id 经 `mcpConnectionIDFromRunner` 反推 |
+
+两个关键取舍：
+
+- **脚本一律写成 `command -v X || echo <marker>`**，让整体退出码恒为 0。否则「命令确实没装」会与
+  「通道本身坏了」（WSL 不可用、SSH 未连接）一样表现为非零退出，前端就无法区分该提示
+  **「去装一下」** 还是 **「先把连接建起来」**。响应因此分成两层：`error`（通道级，items 里的「未找到」
+  不成立）与 `items[].found`。
+- **命令名进 shell 前必须白名单化**：`^[A-Za-z0-9][A-Za-z0-9._+-]*$`。非法项不拼进 shell，
+  而是作为一条带 `error` 的独立结论回传（模板目录里的正常取值 `npx/uvx/docker/node/python3` 都在范围内）。
+
+前端放在「按环境预览」区（与占位符解析同处：那条配置在这个环境里长什么样、跑不跑得起来），
+命令来自模板的 `requires`，模板不含依赖时回落当前表单的启动命令（仅 stdio）。
+
+### 23.4 验证
+
+**测试**
+
+- 新增 `mcp_presets_test.go`（9 例）：模板目录形状（id/name 唯一、name 合法、字段与传输类型自洽、
+  依赖声明可被运行时检查支持、**凭据落点合法且真的被启动参数引用**）、不得指向已归档包、
+  不得出现占位地址与「示例」字样、GitHub 两形态的固定结论、stdio 模板必须声明其启动命令的运行时；
+  运行时检查的脚本形态 / 输出解析 / 命令名白名单 / 连接 id 反推。
+- 新增 `apps/web/src/features/mcp/mcp-model.test.ts`（7 例）：解析器与注释规则的成对性
+  （含「提示永远不会变成值」与「取消注释后值里无残留说明」两条往返断言）、凭据按落点分流、
+  **运行时检查命令的优先级**、传输类型文案。
+- 新增 `apps/web/src/mcp-manager.test.mjs`（7 例）：页面接线（模板元信息的写入与清理、
+  预填与解析共用同一份实现、运行时检查接口与渲染分支）、模板卡片与「模板要求」区块、
+  过期文案、类型声明、新增样式的类名前缀。
+
+**结果**
+
+- `go build ./...`、`go vet ./internal/app/` 通过；本轮改动的三个 Go 文件 `gofmt -l` 干净
+  （`gofmt -l` 仍会列出 7 个**非本轮**文件，与 §20.1 记录的一致，未动）。
+- 定向 Go 测试 **25 例全绿**（含本轮新增 9 例）。
+- 前端 `tsc -b && vite build` 通过；`pnpm test` **352/352**（本轮新增 14 例）。
+
+**变异检验**（`.tmp/mcp-mutation.py`，**13 处，13 挡住、0 漏网**，每条都在 `finally` 里逐字节还原并 sha1 自证）：
+
+| # | 变异 | 被谁挡住 |
+| --- | --- | --- |
+| G1 | github 模板地址改回 `example.com` | `TestMCPGitHubPresetsPointAtOfficialServer` + `...NoPlaceholderEndpoints` |
+| G2 | 运行时探测脚本去掉 `\|\| echo <marker>` 兜底 | `TestMCPRuntimeProbeScriptAlwaysSucceeds` |
+| G3 | 连接 id 反推不再校验 `ssh-` 前缀 | `TestMCPConnectionIDFromRunner`（本机 runner 被当成连接） |
+| G4 | `github-local` 凭据落点从 env 改成 header | `TestMCPPresetCatalogIsWellFormed`（stdio 不该有请求头凭据） |
+| G5 | 清空 playwright 模板的依赖声明 | `TestMCPStdioPresetsDeclareRuntimeRequires` |
+| M1 | 解析器不再跳过注释行 | mcp-model：提示行变成了值 |
+| M2 | 凭据提示不再写成注释 | mcp-model：解析器读到了提示行 |
+| M4 | 凭据提示不再按落点分流 | mcp-model：env / header 混在一起 |
+| M5 | 凭据提示在**值位置**追加说明文字 | mcp-model：取消注释后值里带残留说明 |
+| M3 | **运行时检查的命令优先级写反** | mcp-model：`["docker"]` 变成了 `["node"]` |
+| P1 | Codex 文案退回过期版本 | mcp-manager：`P1 起支持` |
+| P2 | 编辑既有 server 时不清模板要求 | mcp-manager：`startEdit` 切片里没有 `setPresetMeta(null)` |
+| P3 | 运行时检查的命令选取绕过模型层 | mcp-manager：`runtimeCommands` 不再走 `runtimeCommandsFor` |
+
+> **M3 是这轮唯一的真漏网**（首版），修法见 §23.6 末段。M4 首轮报「跳空」是因为它的锚点写在
+> `presetGuidanceLines` 被重写之前 —— 脚本的「锚点命中次数 ≠ 1 就报跳空」这条自检把它暴露了出来，
+> 修正锚点后正常挡住。**这也是「变异脚本的锚点必须随代码演进同步」的实证**。
+
+**未验证的部分（如实声明）**
+
+- **全量后端测试未执行**：本机 sandbox 对 `wsl.exe` 是**直接中止整条命令**（不是早期记录的
+  「打印提示但退出码仍为 0」），凡构造 `Server` 的用例（`newTestServer` → runner 注册 → WSL 补注册探测）
+  都跑不了。纯函数用例已逐一点名跑过，全绿；要跑全量需在沙箱外执行。
+- **`runtime-check` 的三条分支未做端到端实跑**（Windows 分支在本机可跑，WSL / SSH 需对应环境）。
+  已覆盖的部分是脚本生成、输出解析与命令名白名单的单测。
+
+### 23.5 挂账：需要产品决策的改造（**不是缺陷**）
+
+按杠杆排序，供后续排期：
+
+| # | 项 | 要点 |
+| --- | --- | --- |
+| 1 | **粘贴 JSON 快路径** | 现实中拿到 MCP 配置的路径 90% 是从 README / 网页复制一段 `mcpServers`。现在**只能扫本地文件**（`mcp_import.go`），没有「粘贴文本」入口。解析层（`collectImportCandidates` / `looksLikeSecretKey` / `sanitizeImportedServerName`）全部现成，只差一个「从文本而不是从文件」的入口 |
+| 2 | **草稿态试连** | 需要一个接受**表单字段**的测试接口（复用 `probeMCPServer`），才能把测试并入向导最后一步 |
+| 3 | **三步向导 + 高级折叠** | 作用域 / 环境 / Agent / 白名单 / 超时全部折叠并给默认值（全局 + 全环境 + 需审批） |
+| 4 | **OAuth 提到「建 server」之前** | 后端 `discoverMCPOAuthEndpoints` / `registerMCPOAuthClient`（动态注册）已具备，只是编排顺序倒置 |
+| 5 | **工具策略与连接解耦 + 逐工具禁用** | 现在工具级免审批只能在「测试连接」的结果里勾，且只有 enabled / autoApprove，**没有 disable**（WorkBuddy / Codex 有工具级过滤） |
+| 6 | **首屏降噪** | 0 个 server 时先问「怎么连」，项目视图 / `.mcp.json` 放行 / strict 说明折叠或后置 |
+
+### 23.6 一条必须记下的教训
+
+**模板的价值不在「省几次敲键盘」，而在「把用户本来要去别处查的信息带过来」。**
+一条只写了启动命令的模板，用户仍然要自己知道「要装 Node 还是 Docker」「要填哪个 key、申请地址在哪」，
+于是必然走成「保存 → 测试 → 失败 → 回改」——**模板省下的输入量，被返工次数吐了回去**。
+配套的两条硬规则：
+
+- 凡是「接入外部能力」的模板，必须同时声明 **运行时依赖**（且该依赖能被真实检查）与
+  **所需凭据**（键名 + 落点 + 申请链接）。
+- 凡是「配置正确性只能靠运行才知道」的东西，**检查口必须能在保存前调用**；依赖已落库 id 的接口
+  做不到这一点（`/servers/{id}/test` 就是反例）。
+- 凭据提示**可以教格式，但不能教在值的位置上**：行尾说明会被并进值里，故障表现为 401 而非「没填」。
+
+**另有一条测试方法论上的教训（本轮被变异检验逼出来的）**：最初的回归测试里，
+「模板声明的依赖优先于表单命令」这条**优先级**是用正则扫页面源码来验的，于是把优先级写反
+（`fromPreset` 过滤成空数组）**照样绿** —— 文本里 `presetMeta?.requires` 与 `return fromPreset`
+都还在。修法不是把正则写得更长，而是**把这段逻辑抽成纯函数**（`features/mcp/mcp-model.ts`）直接调用断言。
+判据：**「结果取决于几行代码的顺序 / 优先级」的逻辑，一律抽出来做行为断言；扫源码只用来守
+「接线是否还在」（谁 import 谁、调哪个接口、文案是什么）**。
+
+---
+
+## 24. 「一键连接」：让不懂 MCP 的用户也能连上（2026-09-15）
+
+**起因**：§23 交付后用户把目标说明确了 —— **「MCP 连接的规则要简化到用户不懂也能用」**。
+§23.5 挂账的 6 项里，「粘贴 JSON」「三步向导」「OAuth 提前」「首屏降噪」其实都是这一件事的侧面，
+所以本轮不再逐项做，而是按目标整体重构主路径。
+
+### 24.1 口径与可验收判据
+
+**口径**：用户不需要懂 MCP 协议细节（stdio/http、npx、env 变量名、`${PROJECT_DIR}`、
+作用域 × 环境 × Agent、白名单 glob），**但可以有 GitHub Token 这类凭据**。
+协议细节是**实现细节**，该由目录条目和自动检测承担，不该由用户回答。
+
+**可验收判据**（写下来是为了能被检查，而不是"感觉简单了"）：
+
+1. **默认路径上用户输入 ≤ 1 项**：一个 Token，或一次浏览器授权点击；
+2. **界面上不出现 MCP 概念词**（向导里连"目标环境"都不许出现 —— 已写成断言）；
+3. **连不上时给的是「下一步动作」**（"这台电脑还缺 Node.js"），不是错误码。
+
+### 24.2 三层收口：概念去哪了
+
+| MCP 概念 | 以前 | 现在 |
+| --- | --- | --- |
+| 传输类型 stdio/http/sse | 表单必选 | 由目录条目决定，界面不出现 |
+| 启动命令 / 参数 / 环境变量 | 表单必填 | 只在「高级设置 → 手动配置」 |
+| `${PROJECT_DIR}` 等占位符 | 用户要自己写 | 条目自带 |
+| 作用域 / 3 环境 / 2 Agent | 三组复选框 | 默认全局 + 全部；**能不能跑交给自动检测** |
+| 自动放行 glob | 手写 `mcp__github__*` | 向导里一个勾选框：「以后不用再问」 |
+| strict / `.mcp.json` 放行 / 注入快照 / 审计 | 主管理页内联 | 「高级设置」折叠区（默认收起） |
+
+主界面因此变成三段：**已连接**（服务卡片）→ **可以连接的服务**（目录）→ **高级设置**（折叠）。
+工具栏只剩一个「高级设置」开关 —— 断言里明确禁止「手动配置 / 导入 / 审计」再出现在工具栏上。
+
+### 24.3 目录：筛选标准比字段更要紧
+
+`mcpPreset` 增 `Summary`（给用户看的一句话）、`Category`、`Icon`、`OAuth`；
+`mcpPresetCredential` 增 `ValuePrefix`（见 §24.5）。**但真正要紧的是筛选标准**：
+
+> 进目录的服务必须满足 ①用户认得这个服务名 ②只需要「点一次浏览器授权」或「填一个凭据」就能用。
+
+这条被写成测试 `TestMCPCommonPresetsAreOneClick`：`常用服务` 分组的条目**必须声明 OAuth、
+必须没有本地依赖、必须是远程形态、必须给官方文档**；另加「条目数不得少于 5」。
+
+目录从原来的 6 条（`filesystem / fetch / github / playwright / context7 / memory` —— 全是开发者视角）
+换成 13 条，分两组：
+
+**常用服务（远程托管 + OAuth，环境无关，点一次授权即可）**
+
+| 服务 | 端点 | 认证 |
+| --- | --- | --- |
+| Notion | `https://mcp.notion.com/mcp` | OAuth |
+| Linear | `https://mcp.linear.app/mcp` | OAuth |
+| Sentry | `https://mcp.sentry.dev/mcp` | OAuth |
+| Slack | `https://mcp.slack.com/mcp` | OAuth |
+| Jira / Confluence | `https://mcp.atlassian.com/v1/sse` | OAuth |
+| GitHub | `https://api.githubcopilot.com/mcp/` | OAuth 或 PAT |
+| Stripe | `https://mcp.stripe.com` | OAuth 或 Restricted Key |
+
+URL 全部取自各服务官方文档（不编造端点）；每条都附官方文档地址，用户能自己核对。
+
+**本机运行（需要在目标环境装一个运行时）**：项目文件 `filesystem`(npx)、浏览器 `playwright`(npx)、
+网页抓取 `fetch`(uvx)、长期记忆 `memory`(npx)、库文档 `context7`(npx)、
+GitHub 本地容器 `github-local`(docker)。这一组仍进目录（用户可能就是要它），
+但卡片上直接写「先装 Node.js / Docker」，不占一键路径的位置。
+
+### 24.4 新增接口 `POST /api/mcp/test-draft`（草稿态试连）
+
+**为什么必须新开一个**：`/api/mcp/servers/{id}/test` 依赖**已落库的 serverID**，于是一个
+「先试试能不能连」的朴素需求必然变成「先保存 → 再测 → 失败回改」——**配错了还要先污染一次配置库**。
+
+`test-draft` 直接接收表单字段与明文凭据（与创建接口同一信任模型：明文只出现在本地回环请求
+与本次进程内存里，不落库、不回显），复用同一条探针通道 `probeMCPServer`。
+
+顺带把两个测试入口共用的响应填充抽成 `fillMCPTestResponse`，并补上 `Tools` 的 nil 兜底
+（原来只兜了 Resources / Prompts；`tools` 编成 `null` 时前端按 `T[]` 读会整块渲染失败）。
+
+**同时修掉一个连带缺陷**：`buildRemoteStdioProbeCommand` 无条件拼 `cd <projectPath> && `，
+未指定工作目录时变成 `cd ''` → 整个远端探测脚本以「没有那个文件或目录」失败，而错误指向 cwd。
+草稿态试连常常没有项目，很容易踩到，故改为无工作目录时不拼 `cd`。
+
+### 24.5 向导：两屏（加上目录共三屏）与三条路径
+
+**屏 1 = 服务目录本身**（点卡片即进入），不套第二层模态。
+**屏 2 = 只问缺的那一项**；**屏 3 = 自动检查 → 完成**。
+
+| 路径 | 条件 | 流程 | 验证方式 |
+| --- | --- | --- | --- |
+| 纯授权 | 有 OAuth 且无凭据声明 | 屏 2 点「用浏览器登录 {服务名}」→ **先落库** → OAuth → 轮询 | **已落库**的 `/test` |
+| 填凭据 | 有凭据声明 | 屏 2 填密钥 → 屏 3 | `/test-draft` |
+| 无需准备 | 无凭据、无授权 | 直接进屏 3 | `/test-draft` |
+
+三个关键取舍：
+
+- **OAuth 必须先落库**（回调要按 serverID 存令牌），所以只有这一条路径会先创建 server。
+  代价是「取消」不能假装什么都没发生 —— `closeWizard` 会提示「已保存，可在列表里完成授权或删除」。
+- **OAuth 路径的验证必须走已落库的接口**：草稿态试连拿不到服务端保存的令牌。
+  断言里明确禁止它出现 `test-draft`。
+- **屏 3 先查依赖、再试连**，且**缺依赖时提前返回** —— 否则「要去装东西」和「凭据不对」
+  会混成同一条错误（顺序也被断言锁住）。
+
+**ValuePrefix：别让用户记格式。** http 形态的凭据落在 `Authorization` 头，值必须是
+`Bearer <token>`。让用户在向导里填完整格式，等于要求他知道 Bearer 是什么；
+所以条目声明 `ValuePrefix: "Bearer "`，用户只粘 token 本身，前缀由 `buildDraftServerPayload` 补。
+漏了它的表现是 401 而不是「没填」，因此写成两条测试：Go 侧不变式
+（`Authorization` 凭据必须有 `ValuePrefix`；env 落点不许有）+ 前端行为断言。
+
+### 24.6 「以后不用再问」＝ 一次信任
+
+默认「每次确认」是安全默认，但连上后每次调用都弹审批，不懂的用户会直接判定「坏了」——
+门槛只是从"配置复杂"挪到了"审批烦"。所以屏 3 有一个勾选框：
+
+> ☑ 以后调用 {服务名} 的能力不用再问我
+
+勾上即写入 `autoApproveTools: ["mcp__<name>__*"]`（与工具级白名单共用同一套语法），
+并注明"随时可以在「管理」里改回去"。**这条不做，前面两屏再简单也白搭。**
+
+### 24.7 前端纯逻辑层扩大（`features/mcp/mcp-model.ts`）
+
+「用户要不要动手、动哪一步」全部收进纯函数，页面只负责渲染：
+
+| 函数 | 回答的问题 |
+| --- | --- |
+| `connectPlanFor` | 能不能授权 / 要不要填密钥 / 要不要先装东西 |
+| `presetBadges` | 卡片上那行「要准备什么」（只用人话，断言里禁止出现协议名词） |
+| `cardActionLabel` | 按钮文案（纯授权服务直说「用浏览器登录」） |
+| `wizardStartsAt` | 向导从哪一屏开始（什么都不需要的条目别让用户白点一次「下一步」） |
+| `credentialsSatisfied` | 凭据屏能不能往下走（能授权 ⇒ 一个字不填也放行） |
+| `groupPresetsByCategory` | 按服务端顺序分组，不本地重排 |
+| `buildDraftServerPayload` | 创建体：默认值全给上 + 补 `ValuePrefix` + 信任开关 |
+
+### 24.8 验证
+
+- Go 新增/扩充：目录不变式（目录字段齐全、Description 与 Summary 一致、分组已知、
+  `Authorization` 必须有 `ValuePrefix`、env 落点不许有）、`TestMCPCommonPresetsAreOneClick`、
+  `TestMCPLocalPresetsAreHonestAboutDependencies`、`TestResolveMCPDraftValues`、
+  `TestBuildRemoteStdioProbeCommandSkipsEmptyCwd`。**定向 Go 测试 30 例全绿**；本轮改动的
+  三个 Go 文件 `gofmt -l` 干净，`go vet` 通过。
+- 前端新增 12 例行为断言（`mcp-model.test.ts`）+ 6 例接线断言（`mcp-manager.test.mjs`）；
+  `tsc -b && vite build` 通过，`pnpm test` **370/370**。
+- **变异检验**（`.tmp/mcp-mutation.py`，**39 处，39 挡住、0 漏网**，逐条独立进程执行、
+  `finally` 里逐字节还原并 sha1 自证）：
+
+| 组 | 处数 | 覆盖 |
+| --- | --- | --- |
+| G1–G11 | 11 | 后端目录（地址、依赖声明、凭据落点、`ValuePrefix`、分组筛选标准、面向用户的一句话）、运行时探测脚本兜底、连接 id 反推、空工作目录不拼 `cd`、草稿值占位符解析 |
+| M1–M15 | 15 | 前端纯逻辑：注释行规则、凭据提示的前缀与落点、运行时检查命令优先级、徽标人话、向导起点、凭据屏放行、创建体默认值与凭据前缀、分组不重排、试连与创建共用同一份凭据整理 |
+| P1–P13 | 13 | 页面接线：高级区默认收起且工具栏不再放回入口、向导三屏与不出现协议名词、先查依赖再试连、缺依赖提前返回、OAuth 先落库并用已落库接口验证、取消时如实告知、已连接卡片不暴露传输类型、目录卡片展示「要准备什么」、图标自带尺寸 |
+
+> **首轮有一处真漏网（P12）**：断言写成 `assert.match(page, /const closeWizard = \(\) => \{[\s\S]*?if \(wizardServer\) \{/)`
+> —— `[\s\S]*?` 一路跨到了 `finishWizard` 里那处同名判断，于是删掉 `closeWizard` 里的提示也照样绿。
+> 修法是**先切片再断言**（`sliceBetween(page, "const closeWizard = ", "const wizardDraftPayload = ")`）。
+> 这正是 §23.6 与项目 TOOLING 里记过的那条坑，本轮在自己的测试里又踩了一次 —— 说明「切片」这件事
+> 必须当成写断言的默认动作，而不是"想起才做"。
+
+**过程中发现并修掉的另一个真缺陷（草稿试连不带凭据）**：`test-draft` 读的是请求里的
+`env` / `headers`，而创建体把凭据放在 `envSecrets` / `headerSecrets`（服务端加密通道）。
+向导最初直接把创建体发给 `test-draft`，于是**试连根本没带凭据** —— 一个完全正确的 token 也会
+返回「连不上」，而用户会去反复检查那个 token。修法是抽出 `draftProbeValues`，
+让「创建」与「试连」共用同一份凭据整理（前缀只补一次），并配三条断言：
+模型层两个消费者必须给出同一份值、试连按落点分流、页面调用必须带上它。
+
+### 24.9 一条必须记下的教训
+
+**默认值本身就是功能。** 本轮做减法时最有价值的动作不是"少显示几个字段"，而是**替用户把答不出来的
+选择题答掉**：作用域、适用环境、Agent、启用状态全部给最宽/最常见的默认。用户答不出来的问题不该问 ——
+问了只会让人怀疑"我是不是得先搞懂才能用"。
+
+配套两条：
+
+- **目录的筛选标准比条目数量重要**：一条只写启动命令的条目，等于把「查依赖、查凭据格式」原样丢回给用户。
+  宁可少放几条，也不要放"点进去必然失败"的条目（这正是 §23.2 里删掉 `example.com` 的同一条理由）。
+- **凡是有中间状态的路径，取消时必须如实告知**：OAuth 路径先落库，所以「取消」要说明它已存在，
+  否则用户以为没连上、列表里却多了一条。
+
+---
+
+## 25. 撤回 `--bare` 告警（2026-09-15）
+
+**改动**：移除对话页「--bare 风险」徽章与支撑它的探测链路。
+
+**理由**：§19.8 的探测只回答「`--help` 里有没有 `--bare`」这个**开关是否存在**，看不出它是否
+**已成为 `-p` 的默认**。而在它成为默认之前，这条提示对用户没有任何可执行动作 —— 既不是故障，
+也无需处理，只会在每个可用环境上常驻（实测本机 2.1.266 即命中）。常驻的告警会被学会忽略，
+真出事那天反而失效。
+
+**撤回了什么**（全链路，避免留死代码）：
+
+- 前端：`ConversationPage.tsx` 徽章、`types.ts` 的 `ToolStatus.bare`、`style.css` 的
+  `.runner-inline-warn`（该类名仅此一处使用）。
+- 后端：`app.go` `listRunners` 中的 `bare` 写入分支、`claude_runner.go` 的
+  `bareFlagReporter` 接口与 `BareFlagAvailable`、以及四类 runner（`claudeCLIRunner` /
+  `sshRunner` / `windowsAgentRunner` / `wslAgentRunner`）各自的探测字段与缓存。
+
+**§13 表格中的上游风险条目仍然有效**，只是不再由 UI 呈现。真到上游改默认那天，症状是
+**Skill 区失灵 + CLAUDE.md 不进上下文**（§19.8 所述的降级清单不变）。届时按下面从源码复现：
+
+```bash
+git show ab7d601:apps/control-server/internal/app/claude_runner.go | grep -n -A 15 BareFlagAvailable
+```
+
+本文档中另外三处提及「纳入探测与告警」的位置（§0.2 #21、§9 风险表、§13 风险表）已同步改写为
+「已撤回、风险仍在」，避免文档把读者引向不存在的代码。
+
+**教训（与 §19.10 同源）**：**没有可执行动作的告警不是告警，是噪音。** 探测能力本身是对的
+（不猜版本号），但「探测到即常驻提示」这个 UI 决定错了 —— 前瞻风险的合适归宿是文档与
+发布检查项，不是每个用户的进度条。
+

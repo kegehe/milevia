@@ -468,7 +468,10 @@ func (runner *gitCLIRunner) LogPage(ctx context.Context, repo, ref string, limit
 		if err != nil {
 			return nil, fmt.Errorf("parse Git commit timestamp: %w", err)
 		}
-		commit := GitCommit{OID: string(fields[index]), Author: string(fields[index+2]), AuthoredAt: time.Unix(unix, 0).UTC(), Subject: string(fields[index+4])}
+		// Parents 必须初始化为非 nil 切片：根提交没有父提交，留成 nil 会被 encoding/json
+		// 序列化成 null，而前端按 string[] 使用（读 .length 判断是否合并提交），拿到 null
+		// 会直接抛错并清空整个页面。
+		commit := GitCommit{OID: string(fields[index]), Parents: []string{}, Author: string(fields[index+2]), AuthoredAt: time.Unix(unix, 0).UTC(), Subject: string(fields[index+4])}
 		if len(fields[index+1]) > 0 {
 			commit.Parents = strings.Fields(string(fields[index+1]))
 		}
@@ -560,7 +563,8 @@ func parseGitCommitShow(raw []byte) (GitCommitDetail, error) {
 	if len(tokens) < 7 {
 		return GitCommitDetail{}, errors.New("invalid Git commit detail output")
 	}
-	detail := GitCommitDetail{OID: string(tokens[0])}
+	// 同 LogPage：根提交的 Parents 留成 nil 会序列化为 null，必须显式给空切片。
+	detail := GitCommitDetail{OID: string(tokens[0]), Parents: []string{}}
 	if !isFullGitObjectID(detail.OID) {
 		return GitCommitDetail{}, errors.New("invalid Git commit detail output")
 	}

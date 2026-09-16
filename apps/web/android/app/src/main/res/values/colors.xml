@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动页底色。刻意与 Web 首屏 .mobile-remote 的 background 保持同一个值
+         (#f3f8f4)，这样启动页淡出到 App 首屏时不出现色变。改这里就必须同步改
+         apps/web/src/pages/mobile-remote.css 里的同名颜色。 -->
+    <color name="launch_background">#f3f8f4</color>
+</resources>

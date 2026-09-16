@@ -208,6 +208,20 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
         // Keep it generous for large packages on slow networks; the check
         // itself is bounded separately below.
         .timeout(UPDATE_DOWNLOAD_TIMEOUT)
+        // 交给安装程序之前先自己停掉子进程。Windows 上 updater 启动安装包后直接
+        // `std::process::exit(0)`（tauri-plugin-updater 的 `install_inner`），
+        // `RunEvent::ExitRequested` 不会触发，`run()` 回调里的 stop_agent/stop_sidecar
+        // 也就没机会执行；而 milevia-control.exe 只能靠 parent-watch 发现自己成了孤儿，
+        // 安装程序覆写它时它往往还在运行 —— 于是必弹"无法打开要写入的文件"。
+        // 这里优雅停掉：既让安装程序能立刻覆写文件，也让 SQLite 正常收尾
+        // （否则升级后首次启动可能卡在"库被锁定"）。
+        .on_before_exit({
+            let app = app.clone();
+            move || {
+                stop_agent(&app);
+                stop_sidecar(&app);
+            }
+        })
         .build()
         .map_err(|error| error.to_string())?;
     let _ = app.emit(

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 及以下的启动背景：品牌底色 + 居中品牌标记。
+
+     刻意用 layer-list + vector 而不是一张位图：位图会被按屏幕比例拉伸，
+     比例越极端（20:9 之类的机型）标记变形越明显；vector 按 dp 固定尺寸居中，
+     与屏幕长宽比无关，且不用为每个密度和横竖屏各备一张图。
+
+     gravity 属性需要 API 23，本工程 minSdk 24，可直接使用。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/launch_background" />
+    <item
+        android:drawable="@drawable/launch_mark"
+        android:gravity="center" />
+</layer-list>

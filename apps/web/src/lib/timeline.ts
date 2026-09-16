@@ -90,6 +90,167 @@ export function getApproval(event: Event): Approval | null {
   };
 }
 
+// ---- system 事件 → system timeline items ----
+// Claude CLI 的斜杠命令（如 /compact）和后台任务会产生 system 类型事件，
+// 这些事件携带重要的会话状态信息（压缩进度、token 统计、API 重试、后台任务等），
+// 需要解析并展示在时间线上。
+//
+// 抽成纯函数是因为手机端也要展示同一批事件：同一条事件在电脑上说
+// "API 重试中 · 第 2/5 次重试：服务过载"，在手机上必须是同一句话，
+// 各写一份枚举迟早会漂移。tool_progress 是长时间运行工具的心跳事件
+// （每 ~31s 一次），与 ToolCard 的"执行中"状态指示器冗余、多次心跳会产生
+// 噪音卡片，这里直接返回 null。
+export function systemItemFromEvent(event: Event): SystemItem | null {
+  if (event.type !== "system") return null;
+  const payload = asRecord(event.payload);
+  const subtype = String(payload.subtype || "");
+  const base = { id: event.id, createdAt: event.createdAt, runId: event.runId };
+  if (subtype === "status") {
+    const status = String(payload.status || "");
+    const compactResult = String(payload.compact_result || "");
+    if (status === "compacting") {
+      return { ...base, variant: "compact", title: "正在压缩上下文", detail: "Claude 正在压缩对话上下文以释放 token 空间…" };
+    }
+    if (compactResult === "success") {
+      return { ...base, variant: "compact_result", title: "上下文压缩完成" };
+    }
+    if (compactResult) {
+      // metadata.state 让手机端不必再抄一遍"有 detail 就是失败"的判定：压缩失败
+      // 必须显示成故障色，而不是跟着成功一起变绿。
+      return { ...base, variant: "compact_result", title: "上下文压缩失败", detail: `压缩结果：${compactResult}`, metadata: { state: "failed" } };
+    }
+    return null;
+  }
+  if (subtype === "compact_boundary") {
+    const meta = asRecord(payload.compact_metadata);
+    const preTokens = Number(meta.pre_tokens) || 0;
+    const postTokens = Number(meta.post_tokens) || 0;
+    const dropped = Number(meta.cumulative_dropped_tokens) || 0;
+    const durationMs = Number(meta.duration_ms) || 0;
+    const parts: string[] = [];
+    if (preTokens && postTokens) parts.push(`${formatTokens(preTokens)} → ${formatTokens(postTokens)}`);
+    if (dropped) parts.push(`减少 ${formatTokens(dropped)}`);
+    if (durationMs) parts.push(`耗时 ${formatDuration(durationMs)}`);
+    return {
+      ...base, variant: "compact_boundary", title: "上下文压缩摘要",
+      detail: parts.join(" · ") || undefined,
+      metadata: meta as Record<string, unknown>,
+    };
+  }
+  if (subtype === "api_retry") {
+    const attempt = Number(payload.attempt) || 0;
+    const maxRetries = Number(payload.max_retries) || 0;
+    const errorStatus = Number(payload.error_status) || 0;
+    // 常见错误码/标识本地化，其余原样展示。
+    const errorLabel = (() => {
+      const raw = String(payload.error || "").trim();
+      if (!raw) return "";
+      const known: Record<string, string> = { rate_limit: "速率限制", overloaded: "服务过载", server_error: "服务器错误", timeout: "请求超时" };
+      return known[raw] || raw;
+    })();
+    const errorPart = errorLabel ? `：${errorLabel}${errorStatus ? ` (${errorStatus})` : ""}` : errorStatus ? ` (${errorStatus})` : "";
+    return {
+      ...base, variant: "api_retry", title: "API 重试中",
+      detail: attempt && maxRetries ? `第 ${attempt}/${maxRetries} 次重试${errorPart}` : undefined,
+    };
+  }
+  if (subtype === "task_started" || subtype === "task_notification" || subtype === "task_updated" || subtype === "background_tasks_changed") {
+    let title = "后台任务";
+    let detail = "";
+    let state: "success" | "failed" | "info" = "info";
+    if (subtype === "task_started") {
+      title = "后台任务启动";
+      detail = String(payload.description || payload.summary || "").trim();
+    } else if (subtype === "task_notification") {
+      const taskStatus = String(payload.status || "");
+      // CLI 有时用英文模板生成 summary，需要逐模版提取描述并本地化；
+      // 匹配不到就原样展示，保证任何英文原文都至少能被读到。
+      const rawSummary = String(payload.summary || "").trim();
+      const bgMatch = rawSummary.match(/^Background command "(.+)" (completed|failed) \(exit code (\d+)\)$/);
+      // 「上一会话的后台代理没有完成记录」——通常是会话退出时该代理仍在运行或尚未回写。
+      const recordMatch = rawSummary.match(/^No completion record was found for background agent "([^"]*)"(?: from the previous session)?\.?/);
+      // 摘要模板优先提供 detail，taskStatus 决定最终标题与状态；两者信息都尽量保留。
+      const matchedDetail = bgMatch
+        ? `${bgMatch[2] === "failed" ? "失败" : "完成"}（退出码 ${bgMatch[3]}）${bgMatch[1]}`
+        : recordMatch
+          ? `「${recordMatch[1]}」可能仍在运行，或其进程已在会话退出后终止。`
+          : rawSummary;
+      // No-completion-record 本质是「无记录」的中性态，而非成功/失败二分；
+      // 一旦摘要命中 recordMatch，就以它为准，压制可能自相矛盾的 taskStatus。
+      if (recordMatch) { title = "后台代理未找到完成记录"; state = "info"; }
+      else if (taskStatus === "failed") { title = "后台任务失败"; state = "failed"; }
+      else if (taskStatus === "completed") { title = "后台任务完成"; state = "success"; }
+      else if (bgMatch) {
+        title = bgMatch[2] === "failed" ? "后台任务失败" : "后台任务完成";
+        state = bgMatch[2] === "failed" ? "failed" : "success";
+      } else { title = "后台任务通知"; }
+      detail = matchedDetail;
+    } else if (subtype === "task_updated") {
+      const patch = asRecord(payload.patch);
+      if (patch.is_backgrounded) { title = "任务转入后台"; }
+      else return null; // 无意义的状态更新，跳过
+    } else {
+      // background_tasks_changed
+      const tasks = Array.isArray(payload.tasks) ? payload.tasks.map(asRecord) : [];
+      if (tasks.length === 0) { title = "后台任务已全部完成"; }
+      else {
+        title = "后台任务列表更新";
+        detail = tasks.map((t) => String(t.description || t.task_type || "")).filter(Boolean).join("、");
+      }
+    }
+    return {
+      ...base, variant: "task", title, detail: detail || undefined,
+      metadata: { state },
+    };
+  }
+  // 其它 system 子类型（init 等）不展示在时间线上
+  return null;
+}
+
+// EventDiagnostic 是失败类事件解析出的一条诊断。deferFallback 标记「这条信息
+// 只是进程退出码、没有可读原因」，桌面端会等同一 run 有没有更详细的诊断再决定
+// 是否展示它（见 buildTimeline）。
+export type EventDiagnostic = { title: string; detail: string; deferFallback: boolean };
+
+// eventDiagnostic 解析失败类事件。桌面与手机共用：CLI 的失败诊断散落在
+// run.failed / error / turn.failed / stream.error 四种类型里，各自字段还不一样，
+// 解析规则只能有一份。
+export function eventDiagnostic(event: Event): EventDiagnostic | null {
+  const payload = asRecord(event.payload);
+  const rawDetail = firstText(
+    payload.message,
+    payload.detail,
+    payload.reason,
+    typeof payload.error === "string" ? payload.error : "",
+    asRecord(payload.error).message,
+    asRecord(payload.error).detail,
+    asRecord(payload.error).reason,
+    asRecord(payload.error).code,
+  );
+  const detail = localizedErrorDetail(rawDetail, "任务执行失败，请查看任务日志后重试。");
+  if (event.type === "run.failed" || event.type === "run.interrupted") {
+    return { title: event.type === "run.interrupted" ? "执行中断" : "执行失败", detail, deferFallback: isGenericCodexExit(rawDetail) };
+  }
+  if (event.type === "error" || event.type === "turn.failed") {
+    return { title: "执行错误", detail, deferFallback: false };
+  }
+  if (event.type === "stream.error") {
+    return { title: "流错误", detail, deferFallback: false };
+  }
+  return null;
+}
+
+// cliOutputDiagnostic 把一次运行的多行 stderr 合成一条诊断。
+//
+// CLI 是每条 stderr 一个事件（进度行、编译器提示、真实报错混在一起），逐条展示会刷屏，
+// 所以桌面按 run 聚合成一条"CLI 输出"；手机端也共用这条聚合规则（它把后续行并进同一条卡），
+// 两个界面对同一次失败给出的原因才会是同一段文字。
+export function cliOutputDiagnostic(messages: string[]): { title: string; detail: string } | null {
+  const kept = messages.map((message) => message.trim()).filter((message) => message && !isIgnoredCLIStderr(message));
+  if (kept.length === 0) return null;
+  return { title: "CLI 输出", detail: localizedErrorDetail(kept.join("\n"), "工具输出异常，请查看任务日志后重试。") };
+}
+
 export function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
   const results = new Map<string, ToolOutput>();
   const runStatuses = new Map<string, string>();
@@ -187,130 +348,12 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
   }
   tools.push(...codexTools.values());
 
-  // ---- system 事件 → system timeline items ----
-  // Claude CLI 的斜杠命令（如 /compact）和后台任务会产生 system 类型事件，
-  // 这些事件携带重要的会话状态信息（压缩进度、token 统计、API 重试、后台任务等），
-  // 需要解析并展示在时间线上。
+  // system 事件（上下文压缩、API 重试、后台任务）的解析与手机端共用一份实现：
+  // 见 systemItemFromEvent，这里只负责收集。
   const systemItems: SystemItem[] = [];
   for (const event of events) {
-    // tool_progress 是长时间运行工具的心跳事件（每 ~31s 一次），
-    // 与 ToolCard 的"执行中"状态指示器冗余，且多次心跳会产生噪音卡片，故不展示。
-    if (event.type === "tool_progress") continue;
-    if (event.type !== "system") continue;
-    const payload = asRecord(event.payload);
-    const subtype = String(payload.subtype || "");
-    if (subtype === "status") {
-      const status = String(payload.status || "");
-      const compactResult = String(payload.compact_result || "");
-      if (status === "compacting") {
-        systemItems.push({
-          id: event.id, createdAt: event.createdAt, runId: event.runId,
-          variant: "compact", title: "正在压缩上下文",
-          detail: "Claude 正在压缩对话上下文以释放 token 空间…",
-        });
-      } else if (compactResult === "success") {
-        systemItems.push({
-          id: event.id, createdAt: event.createdAt, runId: event.runId,
-          variant: "compact_result", title: "上下文压缩完成",
-        });
-      } else if (compactResult && compactResult !== "success") {
-        systemItems.push({
-          id: event.id, createdAt: event.createdAt, runId: event.runId,
-          variant: "compact_result", title: "上下文压缩失败",
-          detail: `压缩结果：${compactResult}`,
-        });
-      }
-      continue;
-    }
-    if (subtype === "compact_boundary") {
-      const meta = asRecord(payload.compact_metadata);
-      const preTokens = Number(meta.pre_tokens) || 0;
-      const postTokens = Number(meta.post_tokens) || 0;
-      const dropped = Number(meta.cumulative_dropped_tokens) || 0;
-      const durationMs = Number(meta.duration_ms) || 0;
-      const parts: string[] = [];
-      if (preTokens && postTokens) parts.push(`${formatTokens(preTokens)} → ${formatTokens(postTokens)}`);
-      if (dropped) parts.push(`减少 ${formatTokens(dropped)}`);
-      if (durationMs) parts.push(`耗时 ${formatDuration(durationMs)}`);
-      systemItems.push({
-        id: event.id, createdAt: event.createdAt, runId: event.runId,
-        variant: "compact_boundary", title: "上下文压缩摘要",
-        detail: parts.join(" · ") || undefined,
-        metadata: meta as Record<string, unknown>,
-      });
-      continue;
-    }
-    if (subtype === "api_retry") {
-      const attempt = Number(payload.attempt) || 0;
-      const maxRetries = Number(payload.max_retries) || 0;
-      const errorStatus = Number(payload.error_status) || 0;
-      // 常见错误码/标识本地化，其余原样展示。
-      const errorLabel = (() => {
-        const raw = String(payload.error || "").trim();
-        if (!raw) return "";
-        const known: Record<string, string> = { rate_limit: "速率限制", overloaded: "服务过载", server_error: "服务器错误", timeout: "请求超时" };
-        return known[raw] || raw;
-      })();
-      const errorPart = errorLabel ? `：${errorLabel}${errorStatus ? ` (${errorStatus})` : ""}` : errorStatus ? ` (${errorStatus})` : "";
-      systemItems.push({
-        id: event.id, createdAt: event.createdAt, runId: event.runId,
-        variant: "api_retry", title: "API 重试中",
-        detail: attempt && maxRetries ? `第 ${attempt}/${maxRetries} 次重试${errorPart}` : undefined,
-      });
-      continue;
-    }
-    if (subtype === "task_started" || subtype === "task_notification" || subtype === "task_updated" || subtype === "background_tasks_changed") {
-      let title = "后台任务";
-      let detail = "";
-      let state: "success" | "failed" | "info" = "info";
-      if (subtype === "task_started") {
-        title = "后台任务启动";
-        detail = String(payload.description || payload.summary || "").trim();
-      } else if (subtype === "task_notification") {
-        const taskStatus = String(payload.status || "");
-        // CLI 有时用英文模板生成 summary，需要逐模版提取描述并本地化；
-        // 匹配不到就原样展示，保证任何英文原文都至少能被读到。
-        const rawSummary = String(payload.summary || "").trim();
-        const bgMatch = rawSummary.match(/^Background command "(.+)" (completed|failed) \(exit code (\d+)\)$/);
-        // 「上一会话的后台代理没有完成记录」——通常是会话退出时该代理仍在运行或尚未回写。
-        const recordMatch = rawSummary.match(/^No completion record was found for background agent "([^"]*)"(?: from the previous session)?\.?/);
-        // 摘要模板优先提供 detail，taskStatus 决定最终标题与状态；两者信息都尽量保留。
-        const matchedDetail = bgMatch
-          ? `${bgMatch[2] === "failed" ? "失败" : "完成"}（退出码 ${bgMatch[3]}）${bgMatch[1]}`
-          : recordMatch
-            ? `「${recordMatch[1]}」可能仍在运行，或其进程已在会话退出后终止。`
-            : rawSummary;
-        // No-completion-record 本质是「无记录」的中性态，而非成功/失败二分；
-        // 一旦摘要命中 recordMatch，就以它为准，压制可能自相矛盾的 taskStatus。
-        if (recordMatch) { title = "后台代理未找到完成记录"; state = "info"; }
-        else if (taskStatus === "failed") { title = "后台任务失败"; state = "failed"; }
-        else if (taskStatus === "completed") { title = "后台任务完成"; state = "success"; }
-        else if (bgMatch) {
-          title = bgMatch[2] === "failed" ? "后台任务失败" : "后台任务完成";
-          state = bgMatch[2] === "failed" ? "failed" : "success";
-        } else { title = "后台任务通知"; }
-        detail = matchedDetail;
-      } else if (subtype === "task_updated") {
-        const patch = asRecord(payload.patch);
-        if (patch.is_backgrounded) { title = "任务转入后台"; }
-        else continue; // 无意义的状态更新，跳过
-      } else {
-        // background_tasks_changed
-        const tasks = Array.isArray(payload.tasks) ? payload.tasks.map(asRecord) : [];
-        if (tasks.length === 0) { title = "后台任务已全部完成"; }
-        else {
-          title = "后台任务列表更新";
-          detail = tasks.map((t) => String(t.description || t.task_type || "")).filter(Boolean).join("、");
-        }
-      }
-      systemItems.push({
-        id: event.id, createdAt: event.createdAt, runId: event.runId,
-        variant: "task", title, detail: detail || undefined,
-        metadata: { state },
-      });
-      continue;
-    }
-    // 其它 system 子类型（init 等）不展示在时间线上
+    const item = systemItemFromEvent(event);
+    if (item) systemItems.push(item);
   }
 
   const errorItems: TimelineItem[] = [];
@@ -331,27 +374,11 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
   };
   for (const event of events) {
     const payload = asRecord(event.payload);
-    const rawDetail = firstText(
-      payload.message,
-      payload.detail,
-      payload.reason,
-      typeof payload.error === "string" ? payload.error : "",
-      asRecord(payload.error).message,
-      asRecord(payload.error).detail,
-      asRecord(payload.error).reason,
-      asRecord(payload.error).code,
-    );
-    const detail = localizedErrorDetail(rawDetail, "任务执行失败，请查看任务日志后重试。");
-    if (event.type === "run.failed" || event.type === "run.interrupted") {
-      if (detail && !isGenericCodexExit(rawDetail)) {
-        addDiagnostic(event, event.type === "run.interrupted" ? "执行中断" : "执行失败", detail);
-      } else if (detail) {
-        fallbackTerminalFailures.push({ event, detail });
-      }
-    } else if (event.type === "error" || event.type === "turn.failed") {
-      addDiagnostic(event, "执行错误", detail);
-    } else if (event.type === "stream.error") {
-      addDiagnostic(event, "流错误", detail);
+    const diagnostic = eventDiagnostic(event);
+    if (diagnostic) {
+      // 只有退出码、没有可读原因的失败先记下：同一次运行里若已有更详细的诊断，这条不必重复展示。
+      if (diagnostic.deferFallback) fallbackTerminalFailures.push({ event, detail: diagnostic.detail });
+      else addDiagnostic(event, diagnostic.title, diagnostic.detail);
     }
     if (event.type === "stderr" && typeof payload.message === "string" && payload.message.trim() && !isIgnoredCLIStderr(payload.message)) {
       const existing = stderrDiagnostics.get(event.runId);
@@ -363,7 +390,8 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
   // while retaining the complete output, instead of showing a card for every
   // progress line and compiler message.
   for (const { event, messages } of stderrDiagnostics.values()) {
-    addDiagnostic(event, "CLI 输出", localizedErrorDetail(messages.join("\n"), "工具输出异常，请查看任务日志后重试。"));
+    const diagnostic = cliOutputDiagnostic(messages);
+    if (diagnostic) addDiagnostic(event, diagnostic.title, diagnostic.detail);
   }
   // The process exit code is useful only when the CLI provided no actionable
   // diagnostic in JSONL or stderr for the same run.

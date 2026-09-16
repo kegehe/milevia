@@ -164,8 +164,6 @@ input[type="range"]:disabled { cursor: not-allowed; opacity: .52; }
 .runner-inline-error { color: #d14233; font-size: 10px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .runner-inline-uptodate { color: #2c8a73; font-size: 10px; font-weight: 650; white-space: nowrap; }
 .runner-inline-manual { color: #b97a12; font-size: 10px; font-weight: 650; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* --bare 风险提示：上游将其设为 -p 默认后 skills 不再自动发现（docs/34 §13）。 */
-.runner-inline-warn { border: 1px solid #e8c68a; border-radius: 4px; padding: 1px 6px; color: #8a6a24; background: #fdf5e2; font-size: 10px; font-weight: 700; white-space: nowrap; cursor: help; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 .project-dashboard { width: min(1240px, calc(100% - 40px)); margin: 0 auto; padding: 72px 0; }
 .project-dashboard > header { display: flex; align-items: end; justify-content: space-between; gap: 32px; margin-bottom: 34px; }
@@ -456,6 +454,45 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 .mcp-tool-flag { border: 1px solid #d8cba8; border-radius: 4px; padding: 1px 6px; color: #8a6a24; background: #fdf5e2; font-size: 10px; font-weight: 760; }
 .mcp-tool-flag.is-danger { border-color: #efc0b3; color: #a8452f; background: #fdeee9; }
 .mcp-tool-flag.is-info { border-color: #c5d8cf; color: #4a6f64; background: #eef6f1; }
+
+/* 模板卡片（2026-09-15）：把「需要什么运行时、要填哪个凭据」提到点击之前，
+   避免用户点了模板、保存完、测试失败之后才发现缺东西。 */
+.mcp-preset-grid { display: grid; gap: 9px; }
+.mcp-preset-card { display: grid; gap: 6px; border: 1px solid #d1e2d8; border-radius: 7px; padding: 11px 12px; background: #fcfffd; }
+.mcp-preset-card > header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mcp-preset-card > header b { color: #254b40; font-size: 12px; }
+.mcp-preset-card > p { margin: 0; color: #4c6b60; font-size: 11px; line-height: 1.5; }
+.mcp-preset-meta { display: flex; flex-wrap: wrap; gap: 5px; }
+.mcp-preset-block { display: grid; gap: 6px; }
+.mcp-preset-block > h4 { margin: 0; color: #254b40; font-size: 11px; font-weight: 780; letter-spacing: .2px; }
+.mcp-preset-credential { display: grid; gap: 4px; border: 1px solid #d1e2d8; border-left: 3px solid #bcd8c8; border-radius: 7px; padding: 10px 12px; background: #fcfffd; }
+.mcp-preset-credential > header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mcp-preset-credential > header b { color: #254b40; font-size: 12px; }
+.mcp-preset-credential > code { border-radius: 4px; padding: 2px 6px; overflow-wrap: anywhere; color: #3f5a51; background: #f2f7f4; font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mcp-preset-credential > p { margin: 0; color: #4c6b60; font-size: 11px; line-height: 1.5; }
+
+/* 「一键连接」：服务目录 + 向导（2026-09-15）。
+   这一层只服务两件事：① 卡片一眼看清「是什么服务、要不要自己动手」② 向导每一步只有一个明确动作。 */
+
+/* 图标必须自带尺寸：内联 SVG 没有宽高约束时会按 300×150 撑破布局。
+   `.ssh-dialog-mark` 只规定了它自己那一层的尺寸（且选择器认的是 `.ssh-icon`），管不到这里。 */
+.mcp-service-icon { display: block; width: 20px; height: 20px; flex: none; }
+.mcp-service-mark { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 20px; height: 20px; margin-right: 7px; color: #3f6257; vertical-align: -4px; }
+
+.mcp-catalog-group { display: grid; gap: 8px; }
+.mcp-catalog-group + .mcp-catalog-group { margin-top: 14px; }
+.mcp-catalog-group > h4 { margin: 0; color: #4a6f64; font-size: 11px; font-weight: 780; letter-spacing: .2px; }
+
+.mcp-wizard-steps { display: flex; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.mcp-wizard-steps > li { flex: 1; border: 1px solid #d1e2d8; border-radius: 6px; padding: 6px 8px; color: #7a9187; background: #f6f9f7; font-size: 11px; font-weight: 760; text-align: center; }
+.mcp-wizard-steps > li.is-active { border-color: #2c7567; color: #235f50; background: #eaf6ee; }
+.mcp-wizard-steps > li.is-done { border-color: #bcd8c8; color: #4a6f64; background: #fcfffd; }
+.mcp-wizard-error { color: #a8452f; }
+.mcp-wizard-trust { display: flex; align-items: center; gap: 8px; border: 1px solid #d8cba8; border-radius: 7px; padding: 10px 12px; color: #8a6a24; background: #fdf5e2; font-size: 12px; font-weight: 700; cursor: pointer; }
+.mcp-wizard-trust input { width: 15px; height: 15px; flex: none; margin: 0; accent-color: #b8860b; }
+
+/* 高级设置：用左侧竖条与主路径区分开，别让用户以为连个 GitHub 也要先懂这些。 */
+.mcp-advanced { border-left: 3px solid #d3d1c7; }
 
 .mcp-import-list { display: grid; gap: 8px; }
 .mcp-import-item { display: flex; align-items: flex-start; gap: 9px; border: 1px solid #d1e2d8; border-radius: 7px; padding: 10px 12px; background: #fcfffd; }

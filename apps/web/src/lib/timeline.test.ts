@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildTimeline } from "./timeline.ts";
-import type { Event } from "./types.ts";
+import type { Event, TimelineItem } from "./types.ts";
 
 const at = "2026-07-30T11:29:00.000Z";
 
@@ -14,7 +14,9 @@ test("localizes 'No completion record' background-task notices in Chinese", () =
   const timeline = buildTimeline([], [
     event("sys", "system", { type: "system", subtype: "task_notification", summary: 'No completion record was found for background agent "审查News/订阅/日报页面" from the previous session. It may have been stopped, or it may have been running when the previous Claude Code process exited — either way its transcript is saved on disk, so its progress is not lost.' }),
   ]);
-  const system = timeline.find((item): item is { kind: "system"; system: { variant: string; title: string; detail?: string } } => item.kind === "system");
+  // 从 TimelineItem 直接提取 system 成员，别手抄形状：手写谓词要么漏字段、要么把
+  // variant 写成宽的 string，会因不可赋值给 TimelineItem 而整段收窄失效（TS2677）。
+  const system = timeline.find((item): item is Extract<TimelineItem, { kind: "system" }> => item.kind === "system");
   assert.ok(system, "expected a system item");
   assert.equal(system.system.title, "后台代理未找到完成记录");
   assert.equal(system.system.detail, "「审查News/订阅/日报页面」可能仍在运行，或其进程已在会话退出后终止。");

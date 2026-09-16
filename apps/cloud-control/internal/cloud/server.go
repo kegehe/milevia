@@ -1322,7 +1322,11 @@ func (s *Server) createCommand(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) || input.Type == "" {
 		return
 	}
-	allowed := map[string]bool{"task.create": true, "task.update": true, "task.delete": true, "task.dispatch": true, "task.stop": true, "task.review": true, "task.reopen": true, "conversation.create": true, "conversation.message": true}
+	// conversation.shortcut 让手机端触发电脑端同一套快捷方式渲染/执行路径
+	// （preview 取渲染后的正文用于填入手机输入框，run/confirm 直接执行）。
+	// 白名单必须与 control-server 的 enqueueRemoteCommand 保持一致：两边任一处漏加，
+	// 手机端拿到的就是一个语焉不详的 400。
+	allowed := map[string]bool{"task.create": true, "task.update": true, "task.delete": true, "task.dispatch": true, "task.stop": true, "task.review": true, "task.reopen": true, "conversation.create": true, "conversation.message": true, "conversation.shortcut": true}
 	if !allowed[input.Type] {
 		writeError(w, 400, errors.New("unsupported command type"))
 		return

@@ -26,7 +26,7 @@ func (s *Server) registerWSLRunner(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	wslRunner := newWSLAgentRunner(s.config, distro)
+	wslRunner := newWSLAgentRunner(s.config, distro, s.runtimeCtx)
 	wslRunner.codexSkillsRoot = filepath.Join(wslToUncPath(home, distro), ".codex", "skills")
 	s.wslMu.Lock()
 	s.wslRunner = wslRunner
@@ -64,7 +64,10 @@ func (s *Server) ensureWSLRunner() {
 	if !s.wslProbeAt.IsZero() && time.Since(s.wslProbeAt) < wslEnsureRetryInterval {
 		return // 冷却期内不再拉起 wsl.exe
 	}
-	probeCtx, cancel := context.WithTimeout(context.Background(), 2*wslDiscoveryProbeTimeout)
+	// 用 runtimeCtx 而不是 context.Background()：这条探测最坏要吃满 60s，而补注册可能
+	// 发生在后台保活线程里 —— 挂在 runWG 上的 goroutine 若在这里阻塞，Close() 的
+	// runWG.Wait() 就得跟着等一分钟。仍然不是请求 ctx，客户端断开不会半途取消。
+	probeCtx, cancel := context.WithTimeout(s.runtimeCtx, 2*wslDiscoveryProbeTimeout)
 	defer cancel()
 	err := s.registerWSLRunner(probeCtx)
 	// 无论成败都在结束后记录，冷却从本次探测完成算起：长时间探测（冷启动）结束后，

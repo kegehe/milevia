@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Milevia 品牌标记：深墨绿圆角方块 + 黄绿 M，与 apps/web/public/milevia-mark.svg
+     以及桌面端图标同源。
+
+     内容占画布的 64/96（约 67%），刻意留出四周空白：Android 12+ 的系统启动画面会
+     把 windowSplashScreenAnimatedIcon 裁成内切圆，自适应图标的前景安全区也是中间
+     66%。标记若顶满画布，四角会被裁掉。
+
+     固有尺寸 288dp —— 必须与 Android 12+ 系统启动画面分配给图标的容器尺寸一致。
+     Android 12+ 会把这份矢量缩放填满 288dp 的容器（Pixel 5 实测内容占屏宽 47%），
+     而 Android 11 及以下走 layer-list 的 gravity="center"，直接用固有尺寸渲染。
+     原来写 128dp 时，低版本实测只占屏宽 21.7%，比高版本的 47% 小一半还多 ——
+     同一台手机换个系统版本就会看到两种大小的启动页。改这个值前两个版本都要实测。
+
+     lint 的 VectorRaster 建议矢量不超过 200×200，这里显式豁免：本矢量只有 3 条 path，
+     栅格化开销可忽略，而 Android 12+ 本来就会把它放大到 288dp 渲染；降到 200dp 以下
+     只会让低版本变小、两个版本又对不上。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:width="288dp"
+    android:height="288dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96"
+    tools:ignore="VectorRaster">
+    <path
+        android:fillColor="#19332C"
+        android:pathData="M32,16 H64 A16,16 0 0 1 80,32 V64 A16,16 0 0 1 64,80 H32 A16,16 0 0 1 16,64 V32 A16,16 0 0 1 32,16 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,62 L29,35 L42,52 L54,35 L54,62"
+        android:strokeColor="#C8E85A"
+        android:strokeWidth="7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M62,35 L62,62"
+        android:strokeColor="#91B438"
+        android:strokeWidth="7"
+        android:strokeLineCap="round" />
+</vector>

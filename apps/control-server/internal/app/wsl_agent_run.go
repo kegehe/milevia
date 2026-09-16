@@ -19,8 +19,9 @@ import (
 // 命令形态：wsl.exe -d <distro> --cd <linuxWorkDir> -- <cli> <args>
 //   - --cd 设置 WSL 内工作目录（request.ProjectPath 为 UNC，经 uncToWslPath 转换）。
 //   - 环境变量经 WSLENV 透传到 WSL 内进程（/u 后缀不转路径）。
-//   - 进程清理走 configureProcessGroup / terminateProcessGroup（Windows 上 taskkill /T
-//     杀进程树，含 wsl.exe 拉起的 WSL 内 cli 进程）。
+//   - 进程清理走 configureProcessGroup / terminateProcessGroup（主进程立即终止 +
+//     枚举回收 Windows 侧后代，见 process_windows.go）；wsl.exe 被杀后 WSL 内那个
+//     cli 进程随之结束。
 
 // wslForwardEnvKeys 是需经 WSLENV 透传到 WSL 内的环境变量名前缀。managedCLIEnvironment
 // 返回的 KEY=VAL 中匹配这些前缀的变量，既设到 wsl.exe 进程 Env，又加入 WSLENV。
@@ -323,8 +324,8 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	defer closeProfile()
 	environment = wslCodexEnvironment(environment)
 	args = append(args, profileArgs...)
-	if request.Profile != nil && request.Profile.Model != "" {
-		args = append(args, "-c", fmt.Sprintf("model=%q", request.Profile.Model))
+	if request.Model != "" {
+		args = append(args, "-c", fmt.Sprintf("model=%q", request.Model))
 	}
 	// MCP 注入：与本地 Codex 一致走 -c；密钥只写变量名，真值需随 wsl.exe 进程环境并经
 	// WSLENV 透传（变量名是任意的，故显式列入转发名单，见 wslBuildEnv）。

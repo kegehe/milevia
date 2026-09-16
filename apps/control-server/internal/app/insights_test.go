@@ -264,7 +264,7 @@ func TestTriggerInsightScanRejectsConcurrent(t *testing.T) {
 		t.Fatalf("insert running scan: %v", err)
 	}
 	server.insightMu.Lock()
-	server.insightActive[projectID] = true
+	server.insightActive[insightRunKey(projectID, insightRunScan)] = true
 	server.insightMu.Unlock()
 
 	rec := httptest.NewRecorder()
@@ -2013,7 +2013,7 @@ func TestCancelInsightRun(t *testing.T) {
 	projectID := insightTestProject(t, server)
 	runCtx, runCancel := context.WithCancel(context.Background())
 	server.insightMu.Lock()
-	server.insightCancels[projectID] = runCancel
+	server.insightCancels[insightRunKey(projectID, insightRunScan)] = runCancel
 	server.insightMu.Unlock()
 	done := make(chan struct{})
 	go func() {
@@ -2039,8 +2039,8 @@ func TestCancelInsightScanHTTP(t *testing.T) {
 	// 运行中的扫描：注入 cancel 句柄，命中后 runCtx 应被取消。
 	runCtx, runCancel := context.WithCancel(context.Background())
 	server.insightMu.Lock()
-	server.insightActive[projectID] = true
-	server.insightCancels[projectID] = runCancel
+	server.insightActive[insightRunKey(projectID, insightRunScan)] = true
+	server.insightCancels[insightRunKey(projectID, insightRunScan)] = runCancel
 	server.insightMu.Unlock()
 
 	rec := httptest.NewRecorder()
@@ -2057,8 +2057,8 @@ func TestCancelInsightScanHTTP(t *testing.T) {
 
 	// 模拟 worker 收尾清理（真实 goroutine 的 defer 会删除 active/cancel 句柄）。
 	server.insightMu.Lock()
-	delete(server.insightActive, projectID)
-	delete(server.insightCancels, projectID)
+	delete(server.insightActive, insightRunKey(projectID, insightRunScan))
+	delete(server.insightCancels, insightRunKey(projectID, insightRunScan))
 	server.insightMu.Unlock()
 
 	// 无运行任务：幂等 202 + cancelled=false，双连击不报错。
@@ -2113,8 +2113,8 @@ func TestCancelInsightScanEndToEnd(t *testing.T) {
 			t.Fatalf("read scan status: %v", err)
 		}
 		server.insightMu.Lock()
-		active := server.insightActive[projectID]
-		_, hasCancel := server.insightCancels[projectID]
+		active := server.insightActive[insightRunKey(projectID, insightRunScan)]
+		_, hasCancel := server.insightCancels[insightRunKey(projectID, insightRunScan)]
 		server.insightMu.Unlock()
 		if status == insightScanCancelled && !active && !hasCancel {
 			break
@@ -2205,13 +2205,189 @@ func TestTriggerVerifyInsightRejectsConcurrent(t *testing.T) {
 	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
 
 	server.insightMu.Lock()
-	server.insightActive[projectID] = true
+	server.insightActive[insightRunKey(projectID, insightRunVerify)] = true
 	server.insightMu.Unlock()
 
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/verify", strings.NewReader(`{"findingIds":["`+f.ID+`"]}`)))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status: got %d want %d", rec.Code, http.StatusConflict)
+	}
+}
+
+// 扫描运行中仍可复核既有建议：扫描与复核占用同一个（项目 × 种类）互斥键的不同格子，
+// 长扫描不再挡住用户对旧建议发起的复核——这正是面板上"边扫边核"的场景。
+func TestVerifyInsightFindingsAllowedWhileScanRunning(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+
+	// 扫描在跑：内存占用 + DB 里一条 running 扫描行（与 triggerInsightScan 的判定口径一致）。
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	if _, err := server.db.Exec(`insert into project_insight_scans (id,project_id,status,created_at,started_at) values (?,?,'running',?,?)`,
+		"running-scan", projectID, now, now); err != nil {
+		t.Fatalf("insert running scan: %v", err)
+	}
+	server.insightMu.Lock()
+	server.insightActive[insightRunKey(projectID, insightRunScan)] = true
+	server.insightMu.Unlock()
+
+	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[{"id":"` + f.ID + `","exists":true,"reason":"仍在"}]}`}}
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/verify", strings.NewReader(`{"findingIds":["`+f.ID+`"]}`)))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("verify during scan: got %d want %d (body %s)", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+
+	// 不只是"没被拒"：复核必须真的跑完并写回判定（占用的扫描键不影响它）。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		result, _, _ := insightVerificationRow(t, server, f.ID)
+		if result == insightVerifyValid {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("verification did not settle as valid during scan: result=%q", result)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// 反方向：复核进行中仍可发起扫描。
+func TestTriggerInsightScanAllowedWhileVerifying(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	server.runner = &insightScriptRunner{outputs: []string{`[]`, `{"findings":[]}`}}
+
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	if _, err := server.db.Exec(`insert into project_insight_verification_runs (id,project_id,status,message,total_count,processed_count,created_at,started_at)
+		values (?,?,'running','正在核实',1,0,?,?)`, "running-verify", projectID, now, now); err != nil {
+		t.Fatalf("insert running verification: %v", err)
+	}
+	server.insightMu.Lock()
+	server.insightActive[insightRunKey(projectID, insightRunVerify)] = true
+	server.insightMu.Unlock()
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/scan", nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("scan during verify: got %d want %d (body %s)", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+}
+
+// 取消端点支持按种类停止：面板上扫描与复核各有自己的「停止」，停一个不该把另一个也杀掉；
+// 缺省（空 body）仍是"全停"，保持旧客户端语义；未知 kind 明确报 400。
+func TestCancelInsightScanByKind(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	scanCtx, scanCancel := context.WithCancel(context.Background())
+	verifyCtx, verifyCancel := context.WithCancel(context.Background())
+	server.insightMu.Lock()
+	server.insightActive[insightRunKey(projectID, insightRunScan)] = true
+	server.insightCancels[insightRunKey(projectID, insightRunScan)] = scanCancel
+	server.insightActive[insightRunKey(projectID, insightRunVerify)] = true
+	server.insightCancels[insightRunKey(projectID, insightRunVerify)] = verifyCancel
+	server.insightMu.Unlock()
+
+	// 只停扫描：复核的运行上下文必须原样。
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/cancel", strings.NewReader(`{"kind":"scan"}`)))
+	body := insightDecode[map[string]any](t, rec, http.StatusAccepted)
+	if cancelled, _ := body["cancelled"].(bool); !cancelled {
+		t.Fatalf("scan-only cancel: got cancelled=%v want true (body %s)", body["cancelled"], rec.Body.String())
+	}
+	select {
+	case <-scanCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("scan-only cancel did not cancel the scan run")
+	}
+	select {
+	case <-verifyCtx.Done():
+		t.Fatal("scan-only cancel also cancelled the verify run")
+	default:
+	}
+
+	// 未知 kind：400，且不动运行中的任务。
+	recUnknown := httptest.NewRecorder()
+	server.routes().ServeHTTP(recUnknown, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/cancel", strings.NewReader(`{"kind":"bogus"}`)))
+	if recUnknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown kind: got %d want %d (body %s)", recUnknown.Code, http.StatusBadRequest, recUnknown.Body.String())
+	}
+	select {
+	case <-verifyCtx.Done():
+		t.Fatal("unknown cancel kind must not cancel anything")
+	default:
+	}
+
+	// 空 body（旧客户端）：扫描与复核一起停。
+	recAll := httptest.NewRecorder()
+	server.routes().ServeHTTP(recAll, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/cancel", nil))
+	if cancelled, _ := insightDecode[map[string]any](t, recAll, http.StatusAccepted)["cancelled"].(bool); !cancelled {
+		t.Fatalf("legacy cancel-all: got cancelled=false want true (body %s)", recAll.Body.String())
+	}
+	select {
+	case <-verifyCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("legacy cancel-all did not cancel the verify run")
+	}
+}
+
+// 凭据额度不可用时的排队语义：wait=0 立即失败（交互式调用要的是快速结论），有预算时
+// 先排队、额度一释放就拿到准入，始终等不到则以可读原因失败（不把英文内部错误抛给用户）。
+func TestReserveInsightQuotaWithWait(t *testing.T) {
+	server := newTestServer(t)
+	profile := createCLIManagedProfile(t, server, "claude-code", "insight-quota-wait")
+	runtime := &AgentRuntimeProfile{RevisionID: profile.CurrentRevisionID, AgentID: "claude-code"}
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('quota-project','quota-project',?,?,'main',1,?)`,
+		t.TempDir(), server.localRunnerID(), time.Now().UTC()); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	project := Project{ID: "quota-project", Path: t.TempDir(), Runner: server.localRunnerID(), RunnerID: server.localRunnerID()}
+
+	// 私有额度组默认 max_concurrency=1：先占住这一格。
+	held, err := server.reserveInsightQuota(context.Background(), project, "claude-code", runtime)
+	if err != nil {
+		t.Fatalf("hold quota: %v", err)
+	}
+
+	// wait=0：立刻失败，不排队。
+	if cleanup, err := server.reserveInsightQuotaWithWait(context.Background(), project, "claude-code", runtime, 0, nil); err == nil {
+		cleanup()
+		t.Fatal("wait=0 must fail immediately while the quota group is full")
+	}
+
+	// 有等待预算、且额度随后释放：排队（progress 明说在等）后拿到准入。
+	var messages []string
+	progress := func(level, message string) { messages = append(messages, message) }
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		held()
+	}()
+	cleanup, err := server.reserveInsightQuotaWithWait(context.Background(), project, "claude-code", runtime, 3*time.Second, progress)
+	if err != nil {
+		t.Fatalf("queued reservation after the slot is released: %v", err)
+	}
+	cleanup()
+	if len(messages) == 0 {
+		t.Error("a queued reservation must tell the user it is waiting")
+	}
+
+	// 额度始终不释放：等满预算后以可读中文原因失败。
+	held2, err := server.reserveInsightQuota(context.Background(), project, "claude-code", runtime)
+	if err != nil {
+		t.Fatalf("re-hold quota: %v", err)
+	}
+	defer held2()
+	_, err = server.reserveInsightQuotaWithWait(context.Background(), project, "claude-code", runtime, 1200*time.Millisecond, nil)
+	if err == nil {
+		t.Fatal("queued reservation must fail once the wait budget is exhausted")
+	}
+	// 复核按这个哨兵错误判断"整趟都别再等了"（见 runInsightFindingsVerifyRun）。
+	if !errors.Is(err, errInsightQuotaWaitTimeout) {
+		t.Errorf("wait timeout error = %v, want errInsightQuotaWaitTimeout", err)
+	}
+	if !strings.Contains(err.Error(), "并发") || strings.Contains(err.Error(), "credential quota") {
+		t.Errorf("wait timeout must report a readable Chinese reason, got %q", err.Error())
 	}
 }
 

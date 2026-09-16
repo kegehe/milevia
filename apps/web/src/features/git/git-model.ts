@@ -50,6 +50,13 @@ export function commitFileStatusLabel(status: string): string {
 
 export function shortOID(oid: string): string { return oid.slice(0, 8); }
 
+// 提交是否为合并提交（父提交多于一个）。
+// 必须容忍 parents 缺失：根提交没有父提交，旧版服务端会把它序列化成 null，
+// 直接读 .length 会抛错。本页没有错误边界，一次抛错会让整个工作台变空白。
+export function isMergeCommit(commit: Pick<GitCommit, "parents">): boolean {
+  return (commit.parents?.length ?? 0) > 1;
+}
+
 export function formatGitTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });

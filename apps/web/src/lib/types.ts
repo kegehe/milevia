@@ -5,6 +5,9 @@
 export const NON_GIT_BRANCH = "非 Git 目录";
 
 export type Project = { id: string; name: string; pathDisplay: string; fullPath: string; runner: string; environment: string; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
+// /api/projects/availability 的单项：项目连通性探测结果（远端 / 跨端 codex 就绪）。
+// 列表接口不再同步探活，这份结果由前端单独拉取后按项目 id 合并。
+export type ProjectAvailability = { id: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
 export type ProjectStatus = { running: boolean; conversationCount: number; activeTitle: string; insightsRunning: boolean; insightsMessage: string };
 // 开发进程运行状态（/api/projects/processes/statuses + /ws/processes）。
 // 与会话状态 ProjectStatus 语义独立，由 ProcessStatusProvider 单独拥有。
@@ -16,12 +19,21 @@ export type RunStatusEvent = { projectId: string; status: RunStatus; sequence?: 
 export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
 export type AgentID = "claude-code" | "codex";
-export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean; isOrchestration?: boolean };
+export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; modelOverride?: string; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean; isOrchestration?: boolean };
+// 底部模型选择器的候选项与当前生效信息（GET /api/conversations/{id}/models）。
+export type AgentModelOption = { id: string; label?: string; description?: string; alias?: boolean };
+export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[]; customAllowed: boolean; note?: string };
 export type ConversationWorkspace = { id: string; conversationId: string; generation: number; mode: "project_shared" | "isolated_worktree" | string; path: string; branch?: string; baseRevision?: string; state: "provisioning" | "ready" | "active" | "failed" | "archived" | string; active?: boolean; createdAt: string; archivedAt?: string | null };
 export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 export type ShortcutKind = "prompt" | "snippet" | "command_request";
 export type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };
 export type ShortcutEditorState = { kind: ShortcutKind; shortcut?: Shortcut };
+// 命令选择器的一项（GET /api/projects/{id}/commands，见 docs/37）。命令名不含前导 `/`。
+export type AgentCommandGroup = "builtin" | "skill" | "project" | "user" | "plugin" | "other";
+export type AgentCommandOption = { name: string; label?: string; description?: string; argumentHint?: string; group: AgentCommandGroup; recommended?: boolean; terminalOnly?: boolean };
+// 命令目录。authoritative 为 true 时目录来自 CLI 本身，才能用它判断某条命令是否已失效；
+// static/scan 下的"没找到"不能当作失效（会误报）。
+export type ProjectCommands = { projectId: string; agentId: AgentID; env: string; source: "run" | "probe" | "scan" | "static"; authoritative: boolean; commands: AgentCommandOption[]; claudeCodeVersion?: string; refreshedAt?: string; customAllowed: boolean; note?: string };
 export type SkillAgent = "claude-code" | "codex";
 export type SkillSource = "user" | "project" | "plugin";
 export type Skill = { name: string; description: string; agent: SkillAgent; env: "windows" | "wsl" | "remote-linux"; source: SkillSource };
@@ -169,6 +181,55 @@ export type MCPPreviewResult = {
   notes: string[];
 };
 
+// —— 内置模板（GET /api/mcp/presets） ——
+// 模板除了「启动命令是什么」，还要说清「需要装什么、要填哪个 key」——
+// 否则用户仍要去别处查，模板就只剩省几次敲键盘。
+export type MCPPresetCredential = {
+  key: string;
+  // 凭据落在表单的哪个字段：env=环境变量，header=请求头。
+  target: "env" | "header";
+  label: string;
+  description: string;
+  // 填值时要替用户补上的前缀（如 "Bearer "）。有它，用户在向导里只需粘 token 本身。
+  valuePrefix?: string;
+  docsUrl?: string;
+};
+export type MCPPresetRequirement = { command: string; label: string; hint?: string };
+export type MCPPreset = {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  // 给不懂 MCP 的用户看的一句话：连上之后能干什么。
+  summary: string;
+  // 目录分组；顺序由服务端给，前端不本地重排。
+  category: string;
+  // 图标键；前端只实现固定几个键，未知键退化为通用图标。
+  icon: string;
+  transport: MCPTransport;
+  command?: string;
+  args?: string[];
+  url?: string;
+  environments: string[];
+  requires?: MCPPresetRequirement[];
+  credentials?: MCPPresetCredential[];
+  // 支持浏览器授权（用户点一次即可，不用自己去申请 Token）。
+  oauth?: boolean;
+  docsUrl?: string;
+  note?: string;
+};
+
+// —— 运行时依赖检查（POST /api/mcp/runtime-check，保存前调用） ——
+// 与「连接测试」的分工：测试会真的拉起 server 且必须已落库，本接口只回答
+// 「这条配置在当前环境跑不跑得起来」，因此能在保存之前用。
+export type MCPRuntimeCheckItem = { command: string; found: boolean; path?: string; error?: string };
+export type MCPRuntimeCheckResult = {
+  environment: string;
+  items: MCPRuntimeCheckItem[];
+  // 通道级失败（SSH 未连接、WSL 不可用）。非空时 items 里的「未找到」不成立。
+  error?: string;
+};
+
 // —— MCP 远程授权（OAuth 2.1 + PKCE，仅 http / sse） ——
 export type MCPOAuthStatus = {
   serverId: string;
@@ -247,7 +308,7 @@ export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?:
 // “新建”和计数都以此为准，不再前端硬编码固定值）。
 export type TerminalSessionList = { sessions: TerminalSessionInfo[]; maxPerProject: number; maxProjects: number };
 
-export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string; /** CLI 已提供 --bare（上游计划将其设为 -p 默认，届时 skills 不再自动发现）。 */ bare?: boolean };
+export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
 export type RunnerInfo = {
   id: string;
   name: string;
