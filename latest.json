@@ -1,21 +1,21 @@
 {
-  "version": "0.1.6",
-  "notes": "新增会话级模型选择与常用命令目录、MCP 一键连接向导、编排发布快照；修复项目页偶发 15 秒超时与桌面端升级时的文件占用报错。",
-  "pub_date": "2026-09-16T07:37:28.648Z",
+  "version": "0.1.7",
+  "notes": "修复后台任务期间状态误判与历史消息乱序；远程控制页新增「已绑定手机」卡片，可查看手机名与最近同步并直接解绑；扫码配对重新带上校验码、扫码即提交，无需手输；修复升级安装后首次启动白屏、会话「加载更早记录」点不掉；项目优化建议支持多选批量删除。",
+  "pub_date": "2026-09-19T10:57:24.438Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnc3lIQk5sSWcxSG0rMkUyOWVlYUQ4dUhteXNQYUZKWjJ1OUJqRUowcU9jcEUyWjUzcHFhdzZPdWt3UjNpeTBrSURPQkZxQjZYN1h5cUlBZ0szUzdsMndrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NTQ0MjQ4CWZpbGU6TWlsZXZpYV8wLjEuNl94NjQtc2V0dXAuZXhlCmhHSlVDNUc0WDdYOTc1VzJ6bmxTZFREM0orOE1PdlB2NmtPdmlSZERNOFZGeDQwNEJDUndUd09wR1EzTFlyV1BSSFQzOEUyS1UzQytIT3R3THVGNUR3PT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.6/Milevia_0.1.6_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNncy9MS2tURXpzb25ka1dPS2dPakFic2k1WUZsZWlQRzcvMFgrMmxkMW9zU3Z1dEV0TnNxRUpySHhqMlBoNFJyYTRDTVNGTFkrMkhWQW1LNG56N3NESWdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5ODE1NDQ0CWZpbGU6TWlsZXZpYV8wLjEuN194NjQtc2V0dXAuZXhlCnlEbDcwN1c2R1VnZE1pN0lmVkVNNDlNclFPRGhQNnI1ZFo1N21XaTM1NGNHajVoZUlES1JiK2pDeW9Wd3FSUnZnTmlnM281ZFMrWDV5OUhsTlFScUR3PT0K",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.7/Milevia_0.1.7_x64-setup.exe"
     },
     "android": {
-      "version": "0.1.7",
-      "versionCode": 5,
-      "notes": "手机端改为事件驱动渲染、助手回复逐字显示；全新品牌启动页与自适应图标，远程页与项目列表卡片重做，返回键与安全区适配修复。",
-      "pub_date": "2026-09-16T07:40:54.029Z",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.7/Milevia_0.1.7_android.apk",
-      "size": 28361199,
-      "sha256": "f8deb8690e7482052744c122ca6d808996878340328a272e77ad33d0613c1760",
-      "signature": "f8deb8690e7482052744c122ca6d808996878340328a272e77ad33d0613c1760"
+      "version": "0.1.8",
+      "versionCode": 6,
+      "notes": "一台手机可绑定多台电脑，项目页顶部可随时切换或解绑；任务增删改在手机上立即生效并标注同步中，新增搜索、状态计数与悬浮新建；新建会话与发送消息不再等待电脑端往返；项目卡片支持长按拖动排序；修复键盘弹起后会话不自动贴底。",
+      "pub_date": "2026-09-19T10:59:20.345Z",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.8/Milevia_0.1.8_android.apk",
+      "size": 28387179,
+      "sha256": "dda8636145f6d7c148ca7b19cca8e285e28f4945b43d5bc81d07987ac0657201",
+      "signature": "dda8636145f6d7c148ca7b19cca8e285e28f4945b43d5bc81d07987ac0657201"
     }
   }
 }
