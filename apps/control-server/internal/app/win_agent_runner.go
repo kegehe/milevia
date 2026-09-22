@@ -68,11 +68,13 @@ func (r *windowsAgentRunner) codexReady(ctx context.Context) bool {
 }
 func (r *windowsAgentRunner) claudeVersion(ctx context.Context) string {
 	out, _ := windowsBridgeProbe(ctx, "(claude --version 2>$null) | Out-String")
-	return strings.TrimSpace(out)
+	// 归一化在源头做（与其它三个 runner 一致）：否则 Version() 报出去的是
+	// "2.1.266 (Claude Code)"，而界面/登记表里期待的是纯版本号。
+	return agentVersionFromOutput(out)
 }
 func (r *windowsAgentRunner) codexVersion(ctx context.Context) string {
 	out, _ := windowsBridgeProbe(ctx, "(codex --version 2>$null) | Out-String")
-	return strings.TrimSpace(out)
+	return agentVersionFromOutput(out)
 }
 
 // Ready implements AgentRunner（Claude 就绪，用于 claude 分发与 createProject 校验）。
@@ -93,7 +95,7 @@ func (r *windowsAgentRunner) CodexVersion(parent context.Context) string {
 // Windows 侧探测到的本机版本，再查 npm registry 最新版并比较（版本号跨平台唯一，见
 // latestNpmPackageVersion）。
 func (r *windowsAgentRunner) CheckUpdate(parent context.Context) (bool, string, error) {
-	local := normalizeClaudeVersion(r.claudeVersion(parent))
+	local := r.claudeVersion(parent)
 	if local == "" {
 		return false, "", errors.New("Windows 侧未安装 Claude Code")
 	}
@@ -101,12 +103,19 @@ func (r *windowsAgentRunner) CheckUpdate(parent context.Context) (bool, string, 
 	if err != nil {
 		return false, "", err
 	}
-	return latest != local, latest, nil
+	// 用 semver 比较，与其余三个 runner 一致。原先这里是 `latest != local`：装了比
+	// registry 更新的预发布版时，会把**降级**报成"有更新可用"。这是同类缺陷的漏网者
+	// —— 当时只改了 Claude / Codex / SSH / WSL，漏了 Windows 侧这一份。
+	available, err := updateAvailableFrom(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
 }
 
 // CodexCheckUpdate implements CodexCapableRunner，与 codexCLIRunner 的语义一致。
 func (r *windowsAgentRunner) CodexCheckUpdate(parent context.Context) (bool, string, error) {
-	local := normalizeCodexVersion(r.codexVersion(parent))
+	local := r.codexVersion(parent)
 	if local == "" {
 		return false, "", errors.New("Windows 侧未安装 Codex CLI")
 	}
@@ -114,15 +123,18 @@ func (r *windowsAgentRunner) CodexCheckUpdate(parent context.Context) (bool, str
 	if err != nil {
 		return false, "", err
 	}
-	available, err := codexUpdateAvailable(local, latest)
+	available, err := updateAvailableFrom(local, latest)
 	if err != nil {
 		return false, latest, err
 	}
 	return available, latest, nil
 }
 
-// AutoUpdateSupported implements autoUpdateSupportedRunner。跨端（WSL→Windows）升级
-// 尚未就绪（见 Update），如实告知调用方不支持应用内自动升级。
+// AutoUpdateSupported implements autoUpdateSupportedRunner。
+//
+// WSL→Windows 这条方向**不在平台内安装/升级的范围内**（docs/42 §17.7）：托管工具链
+// 那套落点与执行通道都是围绕"Linux 目标环境"做的，而这条方向的目标恰好是 Windows。
+// 如实报 false，界面据此给"需手动更新"，而不是一个点了必失败的按钮。
 func (r *windowsAgentRunner) AutoUpdateSupported() bool { return false }
 
 // CodexAutoUpdateSupported implements codexAutoUpdateSupportedRunner。
@@ -130,12 +142,12 @@ func (r *windowsAgentRunner) CodexAutoUpdateSupported() bool { return false }
 
 // Update implements AgentRunner。跨端升级属 POC 边界，如实提示降级，不伪造成功。
 func (r *windowsAgentRunner) Update(parent context.Context) (string, string, error) {
-	return "", "", errors.New("跨端（WSL→Windows）升级 Claude Code 尚未就绪，请在 Windows 侧自行更新")
+	return "", "", errors.New("平台不为 WSL→Windows 这条方向提供安装或升级；请在 Windows 侧自行更新 Claude Code")
 }
 
 // CodexUpdate implements CodexCapableRunner。
 func (r *windowsAgentRunner) CodexUpdate(parent context.Context) (string, string, error) {
-	return "", "", errors.New("跨端（WSL→Windows）升级 Codex 尚未就绪，请在 Windows 侧自行更新")
+	return "", "", errors.New("平台不为 WSL→Windows 这条方向提供安装或升级；请在 Windows 侧自行更新 Codex")
 }
 
 // Run implements AgentRunner。跨端一次性会话属 POC 边界：Claude 一次性 Run 与 Codex

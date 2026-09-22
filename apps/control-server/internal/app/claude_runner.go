@@ -172,6 +172,8 @@ type AgentRunSink interface {
 
 type claudeCLIRunner struct {
 	config Config
+	// paths 是可注入的路径解析器；nil 时回落到 config.ClaudePath（测试里常用）。
+	paths *agentPathResolver
 	// approvalHookOverride 允许跨端 runner（如 wslAgentRunner）注入自定义审批 hook
 	// 命令字符串。nil 时走默认（本机 NativeApprovalHook / sh 逻辑）。
 	approvalHookOverride func() string
@@ -191,6 +193,29 @@ type claudeCLISession struct {
 	turnIdleTimeout        time.Duration
 	initialResponseTimeout time.Duration
 	toolResultTimeout      time.Duration
+
+	// lastTurnSink 是最近一个回合的 sink。回合收尾之后 CLI 仍会继续产出——
+	// 后台任务（run_in_background 的 Bash / 后台子代理）正是在主回合 result
+	// 之后才回报完成通知。这些事件属于**同一个 run**，必须继续沿它的 sink
+	// 落库并广播，而不是被扣进 pending 等下一次发言（那会让消息延迟到用户
+	// 下次说话时才成批涌出，进程退出时更是直接丢失）。
+	lastTurnSink AgentRunSink
+
+	// backgroundTasks 记录"仍在运行的后台任务"（task_id → 描述）。
+	// Claude Code 在 run_in_background 下会先给出主回合的 result、后台任务随后
+	// 才回报，所以收到 result 时不能立刻宣告回合结束（见 finishTurnOrWaitForBackground）。
+	backgroundTasks map[string]string
+	// pendingResult 暂存"result 已经到了、但还在等后台任务回报"的回合结果。
+	pendingResult *claudePendingResult
+	// backgroundGeneration 让过期的等待定时器失效（每次重新武装都自增）。
+	backgroundGeneration uint64
+	// backgroundTimer 是等待后台任务的兜底定时器，见 armBackgroundWaitTimer。
+	backgroundTimer *time.Timer
+}
+
+// claudePendingResult 是"主回合已给出 result、但仍有后台任务在跑"时暂存的回合结果。
+type claudePendingResult struct {
+	err error
 }
 
 type claudeSessionTurn struct {
@@ -279,17 +304,30 @@ func (err *claudeTurnStallError) ErrorDetails() map[string]string {
 	}
 }
 
-func newClaudeCLIRunner(config Config) AgentRunner {
-	return &claudeCLIRunner{config: config}
+func newClaudeCLIRunner(config Config, paths *agentPathResolver) AgentRunner {
+	return &claudeCLIRunner{config: config, paths: paths}
+}
+
+// claudeBinary 是取 claude 可执行文件的唯一入口。
+//
+// 原先这里写的是 r.config.ClaudePath —— 一个启动时定死的值。平台把工具装到
+// 托管目录之后，那样写就永远找不到它，于是会表现成"装好了但界面还说没装"。
+func (r *claudeCLIRunner) claudeBinary() string {
+	if r.paths != nil {
+		if path := r.paths.Path("claude-code"); path != "" {
+			return path
+		}
+	}
+	return r.config.ClaudePath
 }
 
 func (r *claudeCLIRunner) Ready(parent context.Context) bool {
-	if _, err := exec.LookPath(r.config.ClaudePath); err != nil {
+	if _, err := exec.LookPath(r.claudeBinary()); err != nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "auth", "status")
+	cmd := exec.CommandContext(ctx, r.claudeBinary(), "auth", "status")
 	configureProcessGroup(cmd)
 	return cmd.Run() == nil
 }
@@ -297,14 +335,14 @@ func (r *claudeCLIRunner) Ready(parent context.Context) bool {
 func (r *claudeCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "--version")
+	cmd := exec.CommandContext(ctx, r.claudeBinary(), "--version")
 	configureProcessGroup(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
 	// Output is "2.1.216 (Claude Code)" — extract the version number.
-	return strings.TrimSuffix(strings.TrimSpace(string(out)), " (Claude Code)")
+	return agentVersionFromOutput(string(out))
 }
 
 func (r *claudeCLIRunner) CheckUpdate(parent context.Context) (bool, string, error) {
@@ -312,16 +350,17 @@ func (r *claudeCLIRunner) CheckUpdate(parent context.Context) (bool, string, err
 	if local == "" {
 		return false, "", errors.New("Claude Code is not installed")
 	}
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "npm", "view", "@anthropic-ai/claude-code", "version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	latest, err := latestAgentVersion(parent, "claude-code")
 	if err != nil {
-		return false, "", fmt.Errorf("query latest version: %w", err)
+		return false, "", err
 	}
-	latest := strings.TrimSpace(string(out))
-	return latest != local, latest, nil
+	// 用 semver 比较，而不是原先的 `latest != local` 字符串不等：那个写法在装了
+	// 比 registry 更新的预发布版时，会把**降级**报成"有更新可用"（见 semver.go）。
+	available, err := updateAvailableFrom(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
 }
 
 // latestNpmPackageVersion 查询 npm registry 上指定包的最新版本号。
@@ -349,10 +388,10 @@ func (r *claudeCLIRunner) Update(parent context.Context) (string, string, error)
 	if previous == "" {
 		return "", "", errors.New("Claude Code is not installed")
 	}
-	recovery, recoveryErr := prepareNpmCLIRecovery(parent, r.config.ClaudePath, claudeNpmCLIInstall)
+	recovery, recoveryErr := prepareNpmCLIRecovery(parent, r.claudeBinary(), claudeNpmCLIInstall)
 	ctx, cancel := context.WithTimeout(parent, r.config.agentUpdateTimeout())
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.config.ClaudePath, "update")
+	cmd := exec.CommandContext(ctx, r.claudeBinary(), "update")
 	configureProcessGroup(cmd)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -501,7 +540,7 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	} else {
 		args = append(args[:len(args)-1], append(profileArgs, args[len(args)-1])...)
 	}
-	cmd := exec.Command(r.config.ClaudePath, args...)
+	cmd := exec.Command(r.claudeBinary(), args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
 	configureProcessGroup(cmd)
@@ -587,7 +626,7 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 		return nil, err
 	}
 	args = append(args, profileArgs...)
-	cmd := exec.Command(r.config.ClaudePath, args...)
+	cmd := exec.Command(r.claudeBinary(), args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
 	configureProcessGroup(cmd)
@@ -885,7 +924,7 @@ func (r *claudeCLIRunner) readOutput(reader io.Reader, sink AgentRunSink) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		line, err := sanitizeAgentJSONL(scanner.Bytes())
+		line, err := sanitizeAgentJSONL(decodeAgentOutputBytes(scanner.Bytes()))
 		if err != nil {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 			continue
@@ -1040,6 +1079,7 @@ func (session *claudeCLISession) Stop() {
 		return
 	}
 	session.stopped = true
+	session.clearBackgroundWaitLocked()
 	session.stopTurnTimerLocked(session.current)
 	cmd := session.cmd
 	session.mu.Unlock()
@@ -1058,7 +1098,7 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		line, err := sanitizeAgentJSONL(scanner.Bytes())
+		line, err := sanitizeAgentJSONL(decodeAgentOutputBytes(scanner.Bytes()))
 		if err != nil {
 			session.emit("stream.error", mustJSON(map[string]string{"error": errorText(err)}), false)
 			continue
@@ -1082,8 +1122,11 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 				session.assistantText(p, envelope.ParentToolUseID)
 			}
 		}
+		// 先让事件走完 sink，再更新后台任务跟踪：task_notification 这类通知本身
+		// 属于当前回合，应当在正确的回合上下文里下发，然后才可能触发回合收尾。
+		session.noteBackgroundTaskEvent(envelope.Type, envelope.Subtype, line)
 		if envelope.Type == "result" {
-			session.finishCurrent(resultError(line))
+			session.finishTurnOrWaitForBackground(resultError(line))
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -1100,7 +1143,7 @@ func (session *claudeCLISession) readStderr(reader io.Reader) {
 	// 同 readStderr：解码 wsl.exe 的 UTF-16LE 主机侧警告；非 WSL 路径行为不变。
 	scanner.Split(wslStderrSplit)
 	for scanner.Scan() {
-		session.emit("stderr", mustJSON(map[string]string{"message": redactAgentText(scanner.Text())}), false)
+		session.emit("stderr", mustJSON(map[string]string{"message": redactAgentText(decodeAgentOutputLine(scanner.Bytes()))}), false)
 	}
 	if err := scanner.Err(); err != nil {
 		// errorText 对停止时管道关闭（os.ErrClosed）返回空，据此跳过上报。
@@ -1115,14 +1158,20 @@ func (session *claudeCLISession) emit(eventType string, payload json.RawMessage,
 	if initialized {
 		session.initSeen = true
 	}
-	turn := session.current
-	if turn == nil {
+	// 归属规则：优先当前回合；当前回合已收尾时归给最近一个回合——后台任务
+	// 在 result 之后回报的事件本来就是它启动的，必须继续落库并广播，而不是
+	// 攒进 pending 等下一次发言（那既是消息延迟，也是进程退出时的丢失）。
+	sink := session.lastTurnSink
+	if turn := session.current; turn != nil {
+		sink = turn.sink
+	}
+	if sink == nil {
 		session.pending = append(session.pending, claudeSessionEvent{typ: eventType, payload: payload})
 		session.mu.Unlock()
 		return
 	}
 	session.mu.Unlock()
-	turn.sink.Event(eventType, payload)
+	sink.Event(eventType, payload)
 	if initialized {
 		// The init event carries the CLI-assigned session_id. Persist it so a
 		// later process restart resumes the exact session even if the
@@ -1131,18 +1180,199 @@ func (session *claudeCLISession) emit(eventType string, payload json.RawMessage,
 			SessionID string `json:"session_id"`
 		}
 		if json.Unmarshal(payload, &init) == nil && init.SessionID != "" {
-			turn.sink.SessionIdentified(init.SessionID)
+			sink.SessionIdentified(init.SessionID)
 		}
-		turn.sink.SessionInitialized()
+		sink.SessionInitialized()
+	}
+}
+
+// noteBackgroundTaskEvent 跟踪"仍在运行的后台任务"，供 finishTurnOrWaitForBackground
+// 判断主回合的 result 能不能真的收尾。
+//
+// 判定一律保守：只有明确读出"有后台任务在跑"才推迟收尾，读不出来就按老行为立即收尾。
+// 宁可短暂显示空闲，也不能让回合永远挂在运行中。
+func (session *claudeCLISession) noteBackgroundTaskEvent(eventType, subtype string, payload json.RawMessage) {
+	if eventType != "system" {
+		return
+	}
+	switch subtype {
+	case "task_started":
+		var started struct {
+			TaskID         string `json:"task_id"`
+			Description    string `json:"description"`
+			IsBackgrounded *bool  `json:"is_backgrounded"`
+		}
+		if json.Unmarshal(payload, &started) != nil || started.TaskID == "" {
+			return
+		}
+		// 前台子代理在同一回合内就返回，不能算作待等任务（否则正常回合会被挂住）。
+		if started.IsBackgrounded == nil || !*started.IsBackgrounded {
+			return
+		}
+		session.mu.Lock()
+		if session.backgroundTasks == nil {
+			session.backgroundTasks = make(map[string]string)
+		}
+		session.backgroundTasks[started.TaskID] = started.Description
+		session.mu.Unlock()
+		return
+	case "task_notification":
+		var notification struct {
+			TaskID string `json:"task_id"`
+		}
+		if json.Unmarshal(payload, &notification) != nil || notification.TaskID == "" {
+			return
+		}
+		session.mu.Lock()
+		delete(session.backgroundTasks, notification.TaskID)
+		session.mu.Unlock()
+		session.releaseTurnIfBackgroundTasksSettled()
+		return
+	case "background_tasks_changed":
+		// 这是后台任务列表的权威快照，用它整体替换本地跟踪（不能按增量合并：
+		// 漏掉一次通知就会留下一个永远清不掉的幽灵任务，把回合挂住）。
+		var changed struct {
+			Tasks []struct {
+				TaskID         string `json:"task_id"`
+				Description    string `json:"description"`
+				Status         string `json:"status"`
+				IsBackgrounded *bool  `json:"is_backgrounded"`
+			} `json:"tasks"`
+		}
+		if json.Unmarshal(payload, &changed) != nil {
+			return
+		}
+		active := make(map[string]string)
+		unreadable := 0
+		for _, task := range changed.Tasks {
+			taskID := strings.TrimSpace(task.TaskID)
+			if taskID == "" {
+				unreadable++
+				continue
+			}
+			if backgroundTaskSettled(task.Status) {
+				continue
+			}
+			if task.IsBackgrounded != nil && !*task.IsBackgrounded {
+				continue
+			}
+			active[taskID] = task.Description
+		}
+		// tasks 非空却一个 task_id 都读不出来：说明这份快照的字段名与预期不符
+		// （前端也只读过 tasks[].description / task_type，没有读过 task_id）。
+		// 此时拿空表替换跟踪会被误判成"没有后台任务"而立刻收尾 —— 保留原跟踪更保守。
+		if len(changed.Tasks) > 0 && unreadable == len(changed.Tasks) {
+			return
+		}
+		session.mu.Lock()
+		session.backgroundTasks = active
+		session.mu.Unlock()
+		session.releaseTurnIfBackgroundTasksSettled()
+		return
+	}
+}
+
+// backgroundTaskSettled 判断一个后台任务是否已经收敛（终态）。
+func backgroundTaskSettled(status string) bool {
+	switch status {
+	case "completed", "failed", "stopped", "cancelled":
+		return true
+	}
+	return false
+}
+
+// finishTurnOrWaitForBackground 处理 result：还有后台任务在跑就先记下结果，
+// 等它们收敛后再收尾（Claude Code 在 run_in_background 下正是这个顺序）。
+func (session *claudeCLISession) finishTurnOrWaitForBackground(err error) {
+	session.mu.Lock()
+	if session.stopped {
+		session.mu.Unlock()
+		return
+	}
+	if session.current == nil || len(session.backgroundTasks) == 0 {
+		session.mu.Unlock()
+		session.finishCurrent(err)
+		return
+	}
+	session.pendingResult = &claudePendingResult{err: err}
+	session.backgroundGeneration++
+	generation := session.backgroundGeneration
+	session.stopTurnTimerLocked(session.current)
+	session.mu.Unlock()
+	session.armBackgroundWaitTimer(generation)
+}
+
+// releaseTurnIfBackgroundTasksSettled 在后台任务收敛后补上被推迟的回合终点。
+func (session *claudeCLISession) releaseTurnIfBackgroundTasksSettled() {
+	session.mu.Lock()
+	if session.pendingResult == nil || len(session.backgroundTasks) > 0 || session.current == nil {
+		session.mu.Unlock()
+		return
+	}
+	pending := session.pendingResult
+	session.clearBackgroundWaitLocked()
+	session.mu.Unlock()
+	session.finishCurrent(pending.err)
+}
+
+// armBackgroundWaitTimer 给"等后台任务回报"上兜底：后台任务可能永远不回报
+// （上游记录的完成记录丢失场景），到点就放弃等待、按主回合的结果正常收尾。
+// 放弃之后迟到的事件仍会沿 lastTurnSink 落库，所以这里只失去"状态还亮着"，不丢内容。
+//
+// 上限复用 AUTO_CLAUDE_TURN_IDLE_TIMEOUT：把它调小，后台任务的等待上限会一起变短
+// （迟到的事件照样落库，只是状态会更早从"执行中"退出）。
+func (session *claudeCLISession) armBackgroundWaitTimer(generation uint64) {
+	timeout := session.turnIdleTimeout
+	if timeout <= 0 {
+		timeout = defaultClaudeTurnIdleTimeout
+	}
+	timer := time.AfterFunc(timeout, func() {
+		session.mu.Lock()
+		if session.stopped || session.backgroundGeneration != generation || session.pendingResult == nil {
+			session.mu.Unlock()
+			return
+		}
+		pending := session.pendingResult
+		session.clearBackgroundWaitLocked()
+		session.mu.Unlock()
+		session.finishCurrent(pending.err)
+	})
+	// 挂上去必须在锁内：clearBackgroundWaitLocked 与 releaseTurnIfBackgroundTasksSettled
+	// 都在锁内读写这个字段，锁外赋值构成数据竞争（`go test -race` 会当场报）。
+	session.mu.Lock()
+	if session.stopped || session.backgroundGeneration != generation {
+		// 建计时器与挂上去之间会话已收尾或被重新武装：这一个立刻作废。
+		session.mu.Unlock()
+		timer.Stop()
+		return
+	}
+	session.backgroundTimer = timer
+	session.mu.Unlock()
+}
+
+// clearBackgroundWaitLocked 放弃等待后台任务，并让已挂起的等待定时器失效。
+// 调用方须持有 session.mu。
+func (session *claudeCLISession) clearBackgroundWaitLocked() {
+	session.backgroundGeneration++
+	session.pendingResult = nil
+	// 跟踪表一并清掉：残留的任务会让**下一个回合**的 result 被幽灵任务再次推迟。
+	session.backgroundTasks = nil
+	if session.backgroundTimer != nil {
+		session.backgroundTimer.Stop()
+		session.backgroundTimer = nil
 	}
 }
 
 func (session *claudeCLISession) assistantText(content, parentToolUseID string) {
 	session.mu.Lock()
-	turn := session.current
+	// 同 emit：回合收尾之后到达的助手文本（后台代理的最终汇报）仍归最近一个回合。
+	sink := session.lastTurnSink
+	if turn := session.current; turn != nil {
+		sink = turn.sink
+	}
 	session.mu.Unlock()
-	if turn != nil {
-		turn.sink.AssistantText(content, parentToolUseID)
+	if sink != nil {
+		sink.AssistantText(content, parentToolUseID)
 	}
 }
 
@@ -1186,6 +1416,7 @@ func (session *claudeCLISession) finishCurrent(err error) {
 func (session *claudeCLISession) finish(err error) {
 	session.mu.Lock()
 	session.stopped = true
+	session.clearBackgroundWaitLocked()
 	turns := make([]*claudeSessionTurn, 0, 1+len(session.queued))
 	if session.current != nil {
 		session.stopTurnTimerLocked(session.current)
@@ -1207,6 +1438,7 @@ func (session *claudeCLISession) abortFailedStart(current *claudeSessionTurn, er
 		session.current = nil
 	}
 	session.stopped = true
+	session.clearBackgroundWaitLocked()
 	queued := session.queued
 	session.queued = nil
 	cmd := session.cmd
@@ -1220,6 +1452,8 @@ func (session *claudeCLISession) abortFailedStart(current *claudeSessionTurn, er
 func (session *claudeCLISession) startCurrentLocked(turn *claudeSessionTurn) error {
 	pending := session.pending
 	session.pending = nil
+	// 绑定"最近回合的 sink"：本回合收尾之后到达的后台任务事件仍要落到这个 run 上。
+	session.lastTurnSink = turn.sink
 	startTurn(turn, session.initSeen)
 	for _, event := range pending {
 		turn.sink.Event(event.typ, event.payload)
@@ -1335,6 +1569,12 @@ func (session *claudeCLISession) noteStreamEvent(eventType string, content json.
 	default:
 		return
 	}
+	// 正在等后台任务回报时，看门狗交给 backgroundTimer 统一负责，这里不再另起
+	// 回合空闲计时器：否则同一次等待会有两个超时来源，报错措辞还会说成
+	// "长时间无输出"，而后台任务其实一直在跑。
+	if session.pendingResult != nil {
+		return
+	}
 	session.startTurnTimerLocked(turn)
 }
 
@@ -1345,6 +1585,7 @@ func (session *claudeCLISession) failStalledTurn(current *claudeSessionTurn, gen
 		return
 	}
 	session.stopped = true
+	session.clearBackgroundWaitLocked()
 	current.idleGeneration++
 	current.idleTimer = nil
 	stallErr := &claudeTurnStallError{phase: current.waitPhase, lastEvent: current.lastEvent, toolName: current.lastToolName, timeout: session.timeoutForPhase(current.waitPhase)}
@@ -1492,7 +1733,7 @@ func (r *claudeCLIRunner) readStderrCapture(reader io.Reader, sink AgentRunSink,
 	// 非 WSL 路径（无 NUL 字节）退化为普通按行切分，行为不变。
 	scanner.Split(wslStderrSplit)
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := decodeAgentOutputLine(scanner.Bytes())
 		if capture != nil {
 			capture.append(line)
 		}

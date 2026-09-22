@@ -846,6 +846,32 @@
   background: var(--file-bg-soft);
 }
 
+/* 手机端：软键盘弹出时把编辑器压进"还看得见"的那一段，让「保存」留在键盘上方。
+   变量由 FileEditor 按 visualViewport 实测写入（见那边的说明：量的是编辑器顶边到
+   键盘顶边的距离，不是整个可视高度）。变量没来的那一帧用 none 兜底 = 不压缩。 */
+.mobile-files .file-editor {
+  max-height: var(--file-editor-visible-height, none);
+}
+
+/* 手机端不给下载入口时的那句说明，与下载按钮占同一块位置。 */
+.binary-info-download-note {
+  color: var(--file-text-muted, #6b8178);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Markdown 里的项目内插图取不到时的占位。它替代的是 <img>，所以用一行灰字说清
+   "这张图在手机上拿不到"，而不是留一个破图图标。 */
+.markdown-image-unavailable {
+  display: inline-block;
+  border: 1px dashed var(--file-border, #d9e8df);
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: var(--file-text-muted, #6b8178);
+  background: var(--file-bg-soft, #f5faf7);
+  font-size: 12px;
+}
+
 .file-editor-save {
   border: 1px solid var(--file-primary);
   border-radius: 5px;
@@ -1094,3 +1120,27 @@
 .file-tree-body [data-rct-tree] [data-rct-item-container] {
   padding-left: calc(var(--depthOffset, 0px) - 16px + 7px) !important;
 }
+
+/* ─── 手机端（文件视图接进手机页）───────────────────────────────────────────── */
+
+/* 目录树在手机上是**全屏**的（查看器推进来盖住它），没有"并排可拖宽"这回事。
+   `resize: horizontal` 会在右下角画出一个抓取点，而它拖了不会有任何效果 ——
+   留着只会让人以为这里能调宽。`min-width: 200px` 同理：窄屏上是死约束。 */
+.mobile-files .files-tree { width: 100%; min-width: 0; resize: none; }
+
+/* 手机端工具栏收窄：字号 A-/A+ 收进 ⋯ 之类留给后续，这里只保证「编辑」不被挤掉。
+   路径那一栏允许收缩并省略，它旁边的主操作必须始终可点。 */
+.mobile-files .file-viewer-file-path { min-width: 0; }
+.mobile-files .file-viewer-actions { flex: none; }
+
+/* 标签栏在手机上横向滑动，不换行。 */
+.mobile-files .file-tabs { overflow-x: auto; overscroll-behavior-x: contain; }
+
+/* 「取树时被隐藏/裁掉了什么」的说明行。它是一句状态而不是警告，所以用中性配色，
+   但必须看得见 —— 看不到它的用户会以为这棵树就是项目全貌。 */
+.file-tree-summary { margin: 0; border-bottom: 1px solid var(--file-border); padding: 6px 12px; color: var(--file-text-muted, #6b8178); background: var(--file-bg-soft, #f5faf7); font-size: 11px; line-height: 1.5; }
+
+/* 「这个目录读不到」的角标。服务端批量取树时只把读不到的目录标出来，不让整棵树失败 ——
+   界面必须说出来：不说它就和空目录长得一模一样，用户会以为什么都没有，而真相是"没读到"。
+   用文字而不是图标：一个没有图例的小角标在手机上等于没写。 */
+.file-tree-item-unreadable { flex: none; margin-left: auto; border-radius: 999px; padding: 0 6px; color: #8a5a12; background: #fbf0d9; font-family: inherit; font-size: 10px; font-weight: 700; line-height: 1.7; }

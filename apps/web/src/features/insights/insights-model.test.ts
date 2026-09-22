@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   filterFindingsByType,
   insightFindingCounts,
+  insightSelectionSummary,
   insightSeverityLabels,
   insightThemeLabels,
   insightThemes,
@@ -16,7 +17,10 @@ import {
   normalizeInsightTheme,
   normalizeInsightType,
   normalizeInsightVerification,
+  pruneInsightSelection,
   sortFindings,
+  toggleInsightSelection,
+  toggleInsightSelectionAll,
   toggleInsightType,
   type InsightFinding,
   type InsightType,
@@ -167,6 +171,53 @@ test("insightLinkedTaskLabel describes the linked task state", () => {
   // 终态后可重新添加（后端不再拦截）。
   assert.equal(insightLinkedTaskLabel(makeFinding("a", { linkedTaskStatus: "done" })), "已转为任务 · 已完成（可重新添加）");
   assert.equal(insightLinkedTaskLabel(makeFinding("a", { linkedTaskStatus: "cancelled" })), "已转为任务 · 已取消（可重新添加）");
+});
+
+// ─── 批量删除：选择集 ─────────────────────────────────────────────────────
+
+test("toggleInsightSelection adds and removes without mutating the source set", () => {
+  const base = new Set(["a"]);
+  const added = toggleInsightSelection(base, "b");
+  assert.deepEqual([...added].sort(), ["a", "b"]);
+  const removed = toggleInsightSelection(added, "a");
+  assert.deepEqual([...removed], ["b"]);
+  // 原集合必须原地不动：React 靠引用比较发现变化，原地改同一个 Set 会让界面不更新。
+  assert.deepEqual([...base], ["a"]);
+  assert.notEqual(added, base);
+});
+
+test("toggleInsightSelectionAll fills a partial selection and clears a complete one", () => {
+  const ids = ["a", "b", "c"];
+  const partial = toggleInsightSelectionAll(new Set(["a"]), ids);
+  assert.deepEqual([...partial].sort(), ["a", "b", "c"]);
+  // 已经全选 → 整体取消（一个按钮两种动作，与任务看板的组头复选框同义）。
+  assert.deepEqual([...toggleInsightSelectionAll(partial, ids)], []);
+  // 别的范围（折叠区）选中的 id 不受影响。
+  const mixed = toggleInsightSelectionAll(new Set(["z"]), ids);
+  assert.deepEqual([...toggleInsightSelectionAll(mixed, ids)], ["z"]);
+});
+
+test("toggleInsightSelectionAll on an empty list is a no-op, not a clear", () => {
+  // 空列表若被判成"已全选"，点一下会把已有的选择清空 —— 空列表上这个按钮本来就该没有动作。
+  assert.deepEqual([...toggleInsightSelectionAll(new Set(["a"]), [])], ["a"]);
+});
+
+test("pruneInsightSelection drops ids that are no longer listed", () => {
+  const selected = new Set(["a", "b", "c"]);
+  assert.deepEqual([...pruneInsightSelection(selected, ["b", "c", "d"])].sort(), ["b", "c"]);
+  assert.deepEqual([...pruneInsightSelection(selected, [])], []);
+  assert.deepEqual([...selected].sort(), ["a", "b", "c"]);
+});
+
+test("insightSelectionSummary decides all/partial with every/some, not by counts", () => {
+  const ids = ["a", "b"];
+  assert.deepEqual(insightSelectionSummary(new Set(), ids), { total: 2, picked: 0, all: false, partial: false });
+  assert.deepEqual(insightSelectionSummary(new Set(["a"]), ids), { total: 2, picked: 1, all: false, partial: true });
+  assert.deepEqual(insightSelectionSummary(new Set(["a", "b"]), ids), { total: 2, picked: 2, all: true, partial: false });
+  // 关键反例：选择集里有可见列表之外的 id 时，个数「碰巧相等」也不能判成全选。
+  assert.deepEqual(insightSelectionSummary(new Set(["a", "z"]), ids), { total: 2, picked: 1, all: false, partial: true });
+  // 空列表：不是全选（否则按钮会显示成"取消选择全选"）。
+  assert.deepEqual(insightSelectionSummary(new Set(["z"]), []), { total: 0, picked: 0, all: false, partial: false });
 });
 
 test("isInsightDismissed only matches the dismissed status", () => {

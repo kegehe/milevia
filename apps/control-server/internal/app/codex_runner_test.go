@@ -176,7 +176,7 @@ func TestCodexCheckUpdateQueriesOfficialNPMPackage(t *testing.T) {
 		t.Fatalf("write npm fixture: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	runner := newCodexCLIRunner(Config{CodexPath: codexPath})
+	runner := newCodexCLIRunner(Config{CodexPath: codexPath}, nil)
 	available, latest, err := runner.CheckUpdate(context.Background())
 	if err != nil || !available || latest != "0.146.0" {
 		t.Fatalf("Codex update check: available=%t latest=%q err=%v", available, latest, err)
@@ -353,9 +353,9 @@ func TestCodexUpdateAvailableUsesSemverOrdering(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := codexUpdateAvailable(test.local, test.latest)
+			got, err := updateAvailableFrom(test.local, test.latest)
 			if err != nil || got != test.want {
-				t.Fatalf("codexUpdateAvailable(%q, %q) = %t, %v; want %t", test.local, test.latest, got, err, test.want)
+				t.Fatalf("updateAvailableFrom(%q, %q) = %t, %v; want %t", test.local, test.latest, got, err, test.want)
 			}
 		})
 	}
@@ -369,7 +369,7 @@ func TestCodexRunForceTerminatesCancelledProcess(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"), 0o755); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
-	runner := newCodexCLIRunner(Config{CodexPath: path})
+	runner := newCodexCLIRunner(Config{CodexPath: path}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {

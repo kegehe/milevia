@@ -67,6 +67,10 @@ type Agent struct {
 	// a burst of rejections cannot trigger a registration storm.
 	reEnrollMu     sync.Mutex
 	lastReEnrollAt time.Time
+	// rpcSlots 是中继请求（文件与 Git）的并发闸门（见 rpc_relay.go）。懒初始化，好让直接构造
+	// Agent 的测试不必先跑一遍 New。
+	rpcSlots     chan struct{}
+	rpcSlotsOnce sync.Once
 }
 
 // reEnrollCooldown bounds how often a rejected credential may be replaced.
@@ -104,8 +108,38 @@ const (
 	// (rather than skipped) because it is also the recovery path for an
 	// acknowledgement lost in flight.
 	outboxAckGrace = 200 * time.Millisecond
+	// outboxAckStallThreshold 是一批事件"原样退回来"多久之后才算真的卡住。
+	//
+	// 它存在的唯一目的是把正常路径和故障路径分开：回执是攒 250ms 成批提交的，所以
+	// 每次发完读第二遍时那批行必然还在 outbox 里（这正是"重复"的常见来源，与故障
+	// 无关）。一秒钟之内不升级退避，正常收发的额外等待就只有 outboxAckGrace 本身。
+	outboxAckStallThreshold = time.Second
+	// outboxAckBackoffMaxShift bounds the exponential backoff applied once a
+	// batch has been stalled that long: 200ms << 5 = 6.4s.
+	//
+	// 一个固定 200ms 的等待在正常情况下就够用了（云端确认一到，行就被删掉，
+	// 下一轮读到的是新的一批）。但真机上出现过队列里有一批**永远确认不掉**的行
+	// （云端既不发 ack 也不发 reject，见 cloud-control 对 storeEvent 错误的分类），
+	// 这时固定 200ms 就变成"每秒把同一批事件重推 5 次"：云端对每一条重发再回一次
+	// ack，agent 再确认一次。实测一条连接 4.5 小时被灌了 792 MB 下行，绝大部分是
+	// 这种对同一批老事件的重复回执，读循环也被它拖住。
+	//
+	// 退避不会拖慢正常投递：只要云端在确认，行就会被删掉，批次内容随之改变，
+	// 计时随即归零。只有真的卡住的那批才会越等越久。
+	outboxAckBackoffMaxShift = 5
 	// outboxRetryDelay keeps a failing local read from spinning.
 	outboxRetryDelay = 2 * time.Second
+)
+
+// 关连接与守活。老实现里这几个等待都没有上限，真机上出现过 agent 卡死在里面：
+// 进程活着、零个 TCP 连接、CPU 0%、日志停在断线那一刻，`Run` 的重连循环再也
+// 没有跑过一次（2026-09-17 07:35 之后一直如此）。
+const (
+	// agentShutdownGrace 是关连接时等每个后台 goroutine 收尾的上限。
+	agentShutdownGrace = 15 * time.Second
+	// agentWriteQueueStallTimeout 是心跳能容忍的写队列拥塞上限。超过它说明连接
+	// 实际已经卡住（对端不读，或 writer 卡在一次写里），宁可断开重连。
+	agentWriteQueueStallTimeout = 20 * time.Second
 )
 
 // credentials returns the current machine credential under the read lock.
@@ -317,6 +351,7 @@ func (a *Agent) runConnection(ctx context.Context) error {
 	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(45 * time.Second)) })
 	connectionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	acks := newOutboxAckQueue()
 	writeCh := make(chan any, 128)
 	writeDone := make(chan struct{})
 	writeErr := make(chan error, 1)
@@ -337,7 +372,18 @@ func (a *Agent) runConnection(ctx context.Context) error {
 		}
 	}()
 	readErr := make(chan error, 1)
-	go func() { readErr <- a.readCommands(connectionCtx, conn, writeCh) }()
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		readErr <- a.readCommands(connectionCtx, conn, writeCh, acks)
+	}()
+	// 云端回执的落地单独跑一个 goroutine 成批提交。放在读循环里同步发 HTTP 的话，
+	// 事件洪峰期间读循环会把全部时间花在确认上，下行的命令挤不进来（见 outbox_ack.go）。
+	ackDone := make(chan struct{})
+	go func() {
+		defer close(ackDone)
+		a.runOutboxAckQueue(connectionCtx, acks)
+	}()
 	// Snapshots are recovery data, never part of the command/event hot path.
 	// Coalesce tick requests so a slow local SQLite read cannot delay WSS
 	// commands, command status, or outbox events.
@@ -386,13 +432,23 @@ func (a *Agent) runConnection(ctx context.Context) error {
 		log.Printf("mark local remote status online: %v", err)
 	}
 	wakeSnapshot()
+	// 关连接时每个后台 goroutine 都要被等到，否则 runConnection 永远返回不了，
+	// Run 的重连循环也就再也不会跑一次 —— 真机上出现过这个状态（进程活着、零个
+	// TCP 连接、CPU 0%、日志停在断线那一刻）。所以这些等待一律带超时：宁可丢掉
+	// 一个卡住的 goroutine 重新连一次，也不能让整台电脑从此失联。
+	//
+	// 五个等待**共用一个期限**，不是各给一份：各给 15 秒的话最坏就是 75 秒，
+	// 把重连拖到一分多钟 —— 那和"卡死"在用户眼里差不多。正常路径上五个 channel
+	// 都是微秒级关闭，这个期限只在真出问题时才起作用。
 	shutdown := func() {
 		cancel()
 		_ = conn.Close()
-		<-writeDone
-		<-readErr
-		<-snapshotDone
-		<-outboxDone
+		deadline := time.Now().Add(agentShutdownGrace)
+		waitForBackground("websocket writer", writeDone, deadline)
+		waitForBackground("command reader", readDone, deadline)
+		waitForBackground("ack flusher", ackDone, deadline)
+		waitForBackground("snapshot sync", snapshotDone, deadline)
+		waitForBackground("outbox pump", outboxDone, deadline)
 	}
 	ticker := time.NewTicker(750 * time.Millisecond)
 	defer ticker.Stop()
@@ -402,24 +458,18 @@ func (a *Agent) runConnection(ctx context.Context) error {
 			shutdown()
 			return nil
 		case err := <-readErr:
-			cancel()
-			_ = conn.Close()
-			<-writeDone
-			<-snapshotDone
-			<-outboxDone
+			shutdown()
 			return err
 		case err := <-writeErr:
-			cancel()
-			_ = conn.Close()
-			<-writeDone
-			<-readErr
-			<-snapshotDone
-			<-outboxDone
+			shutdown()
 			return err
 		case <-ticker.C:
-			if !sendMessage(connectionCtx, writeCh, map[string]string{"kind": "ping"}) {
+			// 写队列灌满说明连接实际已经卡住（对端不读，或者 writer 卡在一次
+			// 写里）。老实现会一直阻塞在 sendMessage 上：既不报错也不重连，
+			// 整个 agent 就此静默。宁可断开重连。
+			if !sendMessageWithin(connectionCtx, writeCh, map[string]string{"kind": "ping"}, agentWriteQueueStallTimeout) {
 				shutdown()
-				return connectionCtx.Err()
+				return agentWriteStallError(connectionCtx)
 			}
 			wakeSnapshot()
 		}
@@ -564,7 +614,7 @@ func cloudHTTPURL(rawURL string) (string, error) {
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-func (a *Agent) readCommands(ctx context.Context, conn *websocket.Conn, writeCh chan<- any) error {
+func (a *Agent) readCommands(ctx context.Context, conn *websocket.Conn, writeCh chan<- any, acks *outboxAckQueue) error {
 	for {
 		var raw json.RawMessage
 		if err := conn.ReadJSON(&raw); err != nil {
@@ -578,6 +628,19 @@ func (a *Agent) readCommands(ctx context.Context, conn *websocket.Conn, writeCh 
 			_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 			continue
 		}
+		// 中继请求必须在 `var cmd command` 之前处理：下面那段会把"没有 commandId 的帧"
+		// 当成事件回执解析，而 rpc.request 既没有 commandId 也没有 eventId —— 它会被
+		// 静默丢弃，手机端只会看到超时。
+		if kind.Kind == "rpc.request" {
+			var request rpcRequest
+			if json.Unmarshal(raw, &request) == nil && request.RequestID != "" {
+				if err := conn.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+					return err
+				}
+				a.dispatchRPCRequest(ctx, request, writeCh)
+			}
+			continue
+		}
 		var cmd command
 		if json.Unmarshal(raw, &cmd) != nil || cmd.CommandID == "" {
 			var eventAck struct {
@@ -588,30 +651,30 @@ func (a *Agent) readCommands(ctx context.Context, conn *websocket.Conn, writeCh 
 			if json.Unmarshal(raw, &eventAck) == nil && eventAck.EventID != "" {
 				switch eventAck.Kind {
 				case "event.ack":
-					_ = a.localPost(ctx, "/api/remote/outbox/ack", map[string]any{"eventIds": []string{eventAck.EventID}}, nil)
+					// 只入队，不在这里发 HTTP：本地确认一条一次请求会把读循环
+					// 占死，下行的命令就挤不进来了（见 outbox_ack.go）。
+					acks.enqueue(outboxAck{eventID: eventAck.EventID})
 				case "event.reject":
 					// The cloud reported a durable conflict, so resending this
 					// event can never succeed. Drop it instead of leaving it at
 					// the head of the outbox, where it would block every event
 					// created after it.
 					log.Printf("cloud permanently rejected remote event %s: %s", eventAck.EventID, eventAck.Reason)
-					_ = a.localPost(ctx, "/api/remote/outbox/fail", map[string]any{
-						"eventIds":  []string{eventAck.EventID},
-						"error":     eventAck.Reason,
-						"permanent": true,
-					}, nil)
+					acks.enqueue(outboxAck{eventID: eventAck.EventID, reason: eventAck.Reason, drop: true})
 				}
 			}
 			continue
 		}
 		if err := a.submitLocalCommand(ctx, cmd); err != nil {
-			if !sendMessage(ctx, writeCh, commandStatus{Kind: "command.status", CommandID: cmd.CommandID, Status: "failed", Result: json.RawMessage(fmt.Sprintf(`{"error":%q}`, err.Error()))}) {
-				return ctx.Err()
+			// 状态回执也带超时：写队列被事件灌满时，老实现会无限期阻塞在读循环里 ——
+			// 读循环一停，新的命令就再也读不进来，整条下行链路静默。宁可断开重连。
+			if !sendMessageWithin(ctx, writeCh, commandStatus{Kind: "command.status", CommandID: cmd.CommandID, Status: "failed", Result: json.RawMessage(fmt.Sprintf(`{"error":%q}`, err.Error()))}, agentWriteQueueStallTimeout) {
+				return agentWriteStallError(ctx)
 			}
 			continue
 		}
-		if !sendMessage(ctx, writeCh, commandStatus{Kind: "command.status", CommandID: cmd.CommandID, Status: "received"}) {
-			return ctx.Err()
+		if !sendMessageWithin(ctx, writeCh, commandStatus{Kind: "command.status", CommandID: cmd.CommandID, Status: "received"}, agentWriteQueueStallTimeout) {
+			return agentWriteStallError(ctx)
 		}
 		go a.monitorCommand(ctx, cmd.CommandID, writeCh)
 	}
@@ -688,10 +751,13 @@ func (a *Agent) monitorCommand(ctx context.Context, commandID string, writeCh ch
 func (a *Agent) runOutboxPump(ctx context.Context, writeCh chan<- any) {
 	// lastBatch is the signature of the previous read, so the pump can tell a
 	// genuinely new batch from one that is still waiting for its
-	// acknowledgement. Only this goroutine touches it.
+	// acknowledgement. batchStalledSince records when that batch first came back
+	// unchanged, which is what drives the backoff in syncOutbox.
+	// Only this goroutine touches either of them.
 	var lastBatch string
+	var batchStalledSince time.Time
 	for {
-		err := a.syncOutbox(ctx, writeCh, &lastBatch)
+		err := a.syncOutbox(ctx, writeCh, &lastBatch, &batchStalledSince)
 		if ctx.Err() != nil {
 			return
 		}
@@ -709,12 +775,11 @@ func (a *Agent) runOutboxPump(ctx context.Context, writeCh chan<- any) {
 
 // syncOutbox forwards the pending outbox rows to the relay, then returns.
 //
-// Two forms of pacing keep the caller's loop off the local API: an immediately
-// answered empty read is walked at outboxIdleFallback, and a batch that comes
-// back unchanged is walked at outboxAckGrace. The change in behaviour is what
-// pays for the long poll — one event now leaves the outbox in a single round
-// trip instead of on a tick.
-func (a *Agent) syncOutbox(ctx context.Context, writeCh chan<- any, lastBatch *string) error {
+// Three forms of pacing keep the caller's loop off the local API: an immediately
+// answered empty read is walked at outboxIdleFallback, a batch that comes back
+// unchanged is walked at outboxAckGrace with an exponential backoff on top
+// (outboxAckBackoffMaxShift), and a failing read is walked by the caller.
+func (a *Agent) syncOutbox(ctx context.Context, writeCh chan<- any, lastBatch *string, batchStalledSince *time.Time) error {
 	var items []outboxItem
 	started := time.Now()
 	// The wait parameter asks the local server to hold this request open until
@@ -725,6 +790,7 @@ func (a *Agent) syncOutbox(ctx context.Context, writeCh chan<- any, lastBatch *s
 	}
 	if len(items) == 0 {
 		*lastBatch = ""
+		*batchStalledSince = time.Time{}
 		// An empty answer that came back instantly means the request was not
 		// held. Pace the next attempt so this loop cannot become a busy poll.
 		if time.Since(started) < time.Second {
@@ -736,15 +802,34 @@ func (a *Agent) syncOutbox(ctx context.Context, writeCh chan<- any, lastBatch *s
 	repeated := signature == *lastBatch
 	*lastBatch = signature
 	for _, item := range items {
-		if !sendMessage(ctx, writeCh, map[string]any{"kind": "event", "eventId": item.EventID, "agentSequence": item.AgentSequence, "instanceId": a.config.InstanceID, "type": item.Type, "taskId": item.TaskID, "taskRunId": item.TaskRunID, "payload": item.Payload, "createdAt": item.CreatedAt}) {
+		instanceID, _ := a.credentials()
+		if !sendMessage(ctx, writeCh, map[string]any{"kind": "event", "eventId": item.EventID, "agentSequence": item.AgentSequence, "instanceId": instanceID, "type": item.Type, "taskId": item.TaskID, "taskRunId": item.TaskRunID, "payload": item.Payload, "createdAt": item.CreatedAt}) {
 			return ctx.Err()
 		}
 	}
 	if repeated {
 		// These rows are still queued, so the cloud has not acknowledged them.
-		// Hold off before reading them again.
-		return sleepOrCancel(ctx, outboxAckGrace)
+		// Hold off before reading them again, and back off further the longer the
+		// same batch keeps coming back: a row the cloud can never acknowledge (it
+		// is neither accepted nor rejected — see cloud-control's error
+		// classification) would otherwise keep this loop re-sending the same
+		// hundred events five times a second for as long as the connection lives.
+		//
+		// 退避的判据是"这批原样退回来**多久了**"，不是"重复了几轮"。轮次判据在
+		// 正常路径上也会误伤：回执现在是攒 250ms 成批提交的，所以泵读第二遍时那批
+		// 行**必然**还没被删掉 —— 按轮次算的话，一次普通的收发就会白白多等几百毫秒。
+		// 按时间算则只在真的卡住（超过 outboxAckStallThreshold）之后才开始拉长。
+		if batchStalledSince.IsZero() {
+			*batchStalledSince = time.Now()
+		}
+		stalled := time.Since(*batchStalledSince)
+		shift := 0
+		if stalled > outboxAckStallThreshold {
+			shift = min(int(stalled/outboxAckStallThreshold), outboxAckBackoffMaxShift)
+		}
+		return sleepOrCancel(ctx, outboxAckGrace<<shift)
 	}
+	*batchStalledSince = time.Time{}
 	return nil
 }
 
@@ -771,6 +856,29 @@ func sleepOrCancel(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// waitForBackground 等到 done 关闭、或到期限为止，返回是否等到了。
+//
+// 期限是**绝对时刻**而不是时长：一次收尾要等五个后台 goroutine，共用一个期限
+// 总等待才有上界；各给一份的话总时间随数量线性增长（五个各 15 秒 = 75 秒），
+// 把重连拖到用户以为是卡死。正常路径上五个 channel 都是微秒级关闭，期限只在
+// 真出问题时才起作用。
+func waitForBackground(name string, done <-chan struct{}, deadline time.Time) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		log.Printf("agent connection shutdown: skipping %s, the shutdown grace is already spent", name)
+		return false
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		log.Printf("agent connection shutdown: %s did not stop in time; abandoning it and reconnecting", name)
+		return false
+	}
+}
+
 func sendMessage(ctx context.Context, writeCh chan<- any, value any) bool {
 	select {
 	case writeCh <- value:
@@ -778,6 +886,30 @@ func sendMessage(ctx context.Context, writeCh chan<- any, value any) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// sendMessageWithin 是 sendMessage 的带超时版本：写队列一时排不下是正常的，
+// 排不下超过 timeout 则说明连接已经卡死，调用方应当断开重连而不是继续等。
+func sendMessageWithin(ctx context.Context, writeCh chan<- any, value any, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case writeCh <- value:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+// agentWriteStallError 把"写队列排不下"翻译成读循环该返回的错误：
+// 连接正常结束时返回 ctx 的错误（不触发重连日志噪声），否则报写队列卡死。
+func agentWriteStallError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errors.New("agent relay write queue stalled")
 }
 
 func (a *Agent) localGet(ctx context.Context, path string, target any) error {

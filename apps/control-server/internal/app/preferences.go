@@ -18,9 +18,14 @@ const (
 // conversations. They do not alter existing conversations or enforce access
 // control beyond the validation already performed by conversation endpoints.
 type AppPreferences struct {
-	DefaultAgentID       string    `json:"defaultAgentId"`
-	ClaudePermissionMode string    `json:"claudePermissionMode"`
-	CodexPermissionMode  string    `json:"codexPermissionMode"`
+	DefaultAgentID string `json:"defaultAgentId"`
+	// ClaudePermissionMode / CodexPermissionMode 是历史存储列，值由
+	// agentPermissionModes() 汇总进下面的 AgentPermissionModes 供前端遍历；
+	// 前端改用 AgentPermissionModes 后这两个字段可随列一起删除。
+	ClaudePermissionMode string `json:"claudePermissionMode"`
+	CodexPermissionMode  string `json:"codexPermissionMode"`
+	// AgentPermissionModes 按工具目录索引「每个工具的默认权限模式」。
+	AgentPermissionModes map[string]string `json:"agentPermissionModes,omitempty"`
 	// AutoReview auto-accepts tasks as soon as their run finishes successfully
 	// instead of leaving them waiting for a manual acceptance.
 	AutoReview bool      `json:"autoReview"`
@@ -77,10 +82,47 @@ func (s *Server) readAppPreferences(ctx context.Context, queryRow func(context.C
 	return preferences, err
 }
 
+// legacyPermissionColumn 把工具 ID 映射到它在偏好表里对应的历史列。
+//
+// 这是存储层的历史包袱，只此一处：表里仍是 claude_permission_mode /
+// codex_permission_mode 两列。新增工具时需要补一列（或把这两列并成一个 JSON 列），
+// 但**读取方一律走 agentPermissionModes()**，因此调用方无需跟改。
+var legacyPermissionColumn = map[string]func(*AppPreferences) *string{
+	"claude-code": func(p *AppPreferences) *string { return &p.ClaudePermissionMode },
+	"codex":       func(p *AppPreferences) *string { return &p.CodexPermissionMode },
+}
+
+// agentPermissionModes 给出「每个工具的默认权限模式」，按工具目录里的 ID 索引。
+//
+// 目录里的每个工具都会出现在结果里：历史列没值时回落到目录声明的默认模式，
+// 因此新增工具即使还没有专属列也会有正确默认值，而不是空串。
+func (p AppPreferences) agentPermissionModes() map[string]string {
+	out := make(map[string]string, len(agentCatalogEntries))
+	for _, entry := range agentCatalog() {
+		mode := ""
+		if column, ok := legacyPermissionColumn[entry.ID]; ok {
+			mode = *column(&p)
+		}
+		if mode == "" {
+			mode = entry.DefaultPermissionMode
+		}
+		out[entry.ID] = mode
+	}
+	return out
+}
+
 func validAppPreferences(preferences AppPreferences) bool {
-	return (preferences.DefaultAgentID == "claude-code" || preferences.DefaultAgentID == "codex") &&
-		validAgentPolicy("claude-code", preferences.ClaudePermissionMode) &&
-		validAgentPolicy("codex", preferences.CodexPermissionMode)
+	if !validProfileAgent(preferences.DefaultAgentID) {
+		return false
+	}
+	// 逐个工具按目录校验，而不是写死 claude / codex 两条。这样新增工具时
+	// 「它的默认权限模式合不合法」自动被覆盖。
+	for agentID, mode := range preferences.agentPermissionModes() {
+		if !validAgentPolicy(agentID, mode) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) getAppPreferences(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +131,7 @@ func (s *Server) getAppPreferences(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, preferences)
+	writeJSON(w, http.StatusOK, withAgentPermissionModes(preferences))
 }
 
 func (s *Server) updateAppPreferences(w http.ResponseWriter, r *http.Request) {
@@ -147,5 +189,14 @@ func (s *Server) updateAppPreferences(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, preferences)
+	writeJSON(w, http.StatusOK, withAgentPermissionModes(preferences))
+}
+
+// withAgentPermissionModes 在响应前把按工具索引的默认权限模式补齐。
+//
+// 单独一步而不是在读取时直接赋值：存储里只有两个历史列，这个映射是**派生视图**。
+// 让"派生"只发生在响应的唯一出口，避免读取路径上多出一份可能与列不一致的副本。
+func withAgentPermissionModes(preferences AppPreferences) AppPreferences {
+	preferences.AgentPermissionModes = preferences.agentPermissionModes()
+	return preferences
 }

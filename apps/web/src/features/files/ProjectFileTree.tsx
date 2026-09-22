@@ -65,6 +65,14 @@ interface FileTreeItemData {
   path: string;
   isDir: boolean;
   icon: string;
+  /**
+   * 这个目录**读不到**（权限不足、或读到一半被删掉）。服务端在批量取树时只把它标出来、
+   * 不让整棵树失败（见 control-server 的 readTree），所以界面必须说出来。
+   *
+   * 不说的话它和"空目录"长得一模一样 —— 用户会以为什么都没有，而真相是"没读到"。
+   * 这正是本项目明令禁止的那种写法：把"读不到"写成"没有"。
+   */
+  unreadable?: boolean;
 }
 
 function TreeActionIcon({ name }: { name: "new-file" | "new-folder" | "refresh" }) {
@@ -179,6 +187,7 @@ export class FileTreeProvider {
             path: entry.path,
             isDir: entry.isDir,
             icon: getFileIcon(entry),
+            unreadable: entry.unreadable,
           };
           // 复用目录中仍然存在的条目，保留它已经加载过的子项。否则「刷新父目录」
           // 会把已展开的子目录内容清空（表现为展开却空白，且因为不再是展开动作、
@@ -309,6 +318,22 @@ export class FileTreeProvider {
 
 // ─── 组件 ────────────────────────────────────────────────────────────────────
 
+/**
+ * 把一次取树的"完整性"折成一句话。
+ *
+ * 两个来源必须分开说：`truncated` 是**这次没取全**（条目超配额），
+ * `skippedDirs` 是**按约定跳过的依赖目录**（node_modules 等，属预期行为）。
+ * 合成一句"部分内容已隐藏"会让用户分不清"项目就是这样"还是"工具没给我看全"。
+ * 两者都没有时返回 null —— 不摆一句"全部显示"占位。
+ */
+function treeSummaryText(res: TreeResponse): string | null {
+  const parts: string[] = [];
+  if (res.truncated) parts.push("条目太多，只显示了前面一部分");
+  const skipped = Number(res.skippedDirs) || 0;
+  if (skipped > 0) parts.push(`已隐藏 ${skipped} 个依赖目录`);
+  return parts.length ? parts.join(" · ") : null;
+}
+
 export function ProjectFileTree({
   projectId,
   conversationId,
@@ -325,6 +350,14 @@ export function ProjectFileTree({
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * 这次取树"是不是全给了"的一句话说明（手机端一次多拿几层时才可能出现）。
+   *
+   * 它存在的理由：服务端会按忽略名单跳掉 node_modules 这类目录、也会在条目超配额时裁剪。
+   * 这两件事**必须让用户看见** —— 否则他看到的就是一棵"少了几个目录"的树，
+   * 而以为那就是项目全貌。跳依赖目录与"没取全"是两件事，措辞也分开。
+   */
+  const [treeSummary, setTreeSummary] = useState<string | null>(null);
   // 全量刷新时递增，强制 UncontrolledTreeEnvironment 重建以清除内部 currentItems/viewState 残留
   const [treeKey, setTreeKey] = useState(0);
   const [contextMenu, setContextMenu] = useState<{
@@ -349,6 +382,9 @@ export function ProjectFileTree({
       const res = await request<TreeResponse>(
         `/api/projects/${projectId}/fs/tree?${params.toString()}`
       );
+      // 只有根那一次带 depth（手机端），也就只有它知道"这次是不是取全了"。
+      // 子目录是命中适配器缓存的切片，读它们的 truncated/skippedDirs 没有意义。
+      if (!path) setTreeSummary(treeSummaryText(res));
       return res.entries || [];
     },
     [projectId, request, conversationId]
@@ -502,8 +538,7 @@ export function ProjectFileTree({
 
   return (
     <div className="file-tree-container">
-      <div className="file-tree-toolbar">
-        <div className="file-tree-search">
+      <div className="file-tree-toolbar">        <div className="file-tree-search">
           <input
             type="text"
             placeholder="搜索文件..."
@@ -533,6 +568,10 @@ export function ProjectFileTree({
           <button onClick={() => setError(null)}>×</button>
         </div>
       )}
+
+      {/* 取树时被隐藏/裁掉的部分要说出来。看不到这句的用户会以为这棵树就是项目全貌，
+          而实际上 node_modules 这类目录被跳过了。 */}
+      {treeSummary && <p className="file-tree-summary" role="status">{treeSummary}</p>}
 
       <div className="file-tree-body">
         <UncontrolledTreeEnvironment
@@ -589,6 +628,12 @@ export function ProjectFileTree({
                   <FileIcon iconKey={item.data.icon} expanded={item.data.isDir && context.isExpanded} size={16} />
                 </span>
                 <span className="file-tree-item-name">{title}</span>
+                {/* 读不到的目录必须说出来：不说它就和空目录长得一模一样。
+                    文字而不是图标 —— 一个没有图例的小角标在手机上等于没写。
+                    ⚠️ 解释只放在**这个角标**里，不要塞进 `getItemTitle`：
+                    那个返回值同时被当成行内可见标签用，塞进去会变成
+                    「locked（这个目录读不到）  读不到」——同一句话说两遍。 */}
+                {item.data.unreadable && <span className="file-tree-item-unreadable" title="这个目录读不到">读不到</span>}
               </div>
             );
           }}

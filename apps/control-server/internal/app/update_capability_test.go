@@ -42,14 +42,18 @@ func (autoUpdateUnsupportedCodexRunner) CodexUpdate(context.Context) (string, st
 }
 func (autoUpdateUnsupportedCodexRunner) CodexAutoUpdateSupported() bool { return false }
 
-// 能力标记的单元验证：真实跨端 runner 应如实报告不支持应用内自动升级，且不依赖 WSL/Windows 侧。
+// 能力标记的单元验证：能力必须如实反映**现在**能做什么，不依赖 WSL/Windows 侧。
+//
+// WSL 侧已支持应用内升级（平台装的走 npm 重装、用户自装的走 WSL 内的 `<cli> update`）；
+// 原先它报 false，是"跨端升级尚未就绪"的旧状态 —— 那个状态在安装通道做通之后就不成立，
+// 留着会让同一件事在界面两处给出相反结论。
 func TestCrossEndRunnersReportNoAutoUpdate(t *testing.T) {
 	wsl := newWSLAgentRunner(Config{ClaudePath: "claude", CodexPath: "codex"}, "Ubuntu", nil)
-	if wsl.AutoUpdateSupported() {
-		t.Fatal("wslAgentRunner should not support in-app Claude auto update")
+	if !wsl.AutoUpdateSupported() {
+		t.Fatal("WSL 的升级已实现，应当报支持应用内自动升级")
 	}
-	if wsl.CodexAutoUpdateSupported() {
-		t.Fatal("wslAgentRunner should not support in-app Codex auto update")
+	if !wsl.CodexAutoUpdateSupported() {
+		t.Fatal("WSL 的 Codex 升级已实现，应当报支持")
 	}
 	win := newWindowsAgentRunner(Config{})
 	if ar, ok := win.(autoUpdateSupportedRunner); !ok || ar.AutoUpdateSupported() {

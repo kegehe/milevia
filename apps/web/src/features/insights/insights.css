@@ -687,3 +687,165 @@
   text-underline-offset: 2px;
 }
 .insight-file.link:hover { color: #2c7567; }
+/* ─── 批量删除（多选 / 全部删除）────────────────────────────────────────────
+   视觉语言与任务看板的「批量管理」对齐：选择条紧贴列表上方，危险动作用实底红、
+   范围说明用文字而不是靠按钮禁用（禁用只说明"现在不行"，不说明"删的是哪些"）。
+   复选框与 tasks.css 的 .task-check 同尺寸同勾法：同一个应用里同一件事的小方框
+   长得不一样，本身就是一种误导。 */
+
+/* 汇总行上的模式开关（选中态 = 正在多选） */
+.insight-bulk-toggle {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 4px 12px;
+  color: #41665b;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insight-bulk-toggle:hover:not(:disabled) { border-color: #a6cbbb; background: #f0f8f3; }
+.insight-bulk-toggle.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insight-bulk-toggle:disabled { cursor: default; opacity: 0.6; }
+
+/* 选择条：全选 + 范围说明 + 已选计数 + 两个删除动作 */
+.insights-bulk {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+  border: 1px solid #cfe0d6;
+  border-radius: 8px;
+  padding: 9px 12px;
+  background: #f7fbf9;
+}
+.insights-bulk-select-all {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #c6dbd0;
+  border-radius: 6px;
+  padding: 0 11px;
+  color: #315e50;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 760;
+  cursor: pointer;
+  transition: border-color .16s ease, background .16s ease;
+}
+.insights-bulk-select-all:hover { border-color: #8db6a6; background: #eff7f1; }
+.insights-bulk-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: #6f8b80;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 筛选生效时的范围提示用暖色：它说明的是"选择范围被改小了"，比发现性提示更需要被看见。 */
+.insights-bulk-hint[data-scope="filtered"] { color: #8b6524; }
+.insights-bulk-count {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+  color: #547066;
+  font-size: 12px;
+  font-weight: 760;
+  white-space: nowrap;
+}
+.insights-bulk-count b { color: #1f5b4c; }
+.insights-bulk .danger {
+  min-height: 30px;
+  border: 1px solid #c0463a;
+  border-radius: 6px;
+  padding: 0 12px;
+  color: #fff;
+  background: #c0463a;
+  font-size: 12px;
+  font-weight: 760;
+  cursor: pointer;
+  transition: background .16s ease, border-color .16s ease;
+}
+.insights-bulk .danger:hover:not(:disabled) { border-color: #a33a30; background: #a33a30; }
+/* 「全部删除」用描边版：两个都是红的，但"删我勾的那些"与"删全部"必须一眼分得开。 */
+.insights-bulk .danger.ghost { border-color: #e6bdb2; color: #a73c2a; background: #fff; }
+.insights-bulk .danger.ghost:hover:not(:disabled) { border-color: #d99e91; background: #fff2ef; }
+.insights-bulk .danger:disabled { cursor: default; opacity: 0.5; }
+
+/* 复选框：选择条的全选框与卡片上的共用一套外观（原生 input，可 Tab 到、空格切换）。
+   悬停规则必须显式排除已选/半选：`:hover` 是 (0,1,0)+伪类，而 `:checked` 也是 (0,1,0)，
+   单靠书写顺序容易在后续改动里翻车 —— 与 tasks.css 里那条坑同源。 */
+.insight-check {
+  appearance: none;
+  -webkit-appearance: none;
+  display: grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  box-sizing: border-box;
+  place-items: center;
+  margin: 0;
+  border: 1.5px solid #a9c4b6;
+  border-radius: 5px;
+  background: #fff;
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+}
+.insight-check::after {
+  content: "";
+  width: 9px;
+  height: 5px;
+  margin-top: -3px;
+  border-left: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  border-radius: 1px;
+  opacity: 0;
+  transform: rotate(-45deg) scale(.55);
+  transition: opacity .13s ease, transform .13s ease;
+}
+.insight-check:hover:not(:disabled):not(:checked):not(:indeterminate) { border-color: #4f9a8a; background: #f2faf5; }
+.insight-check:checked,
+.insight-check:indeterminate { border-color: #2c7567; background: #2c7567; box-shadow: 0 0 0 3px #d3ede0; }
+.insight-check:checked::after { opacity: 1; transform: rotate(-45deg) scale(1); }
+.insight-check:indeterminate::after { width: 9px; height: 0; margin-top: 0; border-bottom-width: 2px; border-left-width: 0; opacity: 1; transform: none; }
+.insight-check:focus-visible { border-color: #2c7567; outline: 2px solid #78aa98; outline-offset: 2px; }
+.insight-check:disabled { border-color: #d5e2da; background: #f2f6f3; cursor: not-allowed; }
+
+/* 卡片首行：复选框 + 类型徽标共用一行（单独占一个网格行会让每张卡凭空长高一行）。
+   `min-width: 0` 让长徽标在窄屏也能收缩，不至于把复选框挤出去。 */
+.insight-card-top {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+/* 选择模式：整卡可点（控件优先，见 InsightsPanel 的 isCardControl） */
+.insight-card.selectable { cursor: pointer; }
+/* 选中态用 inset 描边而不是 box-shadow 外扩：外层 hover 的阴影与位移是另一条规则，
+   两者叠在一起时不该互相覆盖。规则排在被它盖住的 `.insight-card:hover`（更早）之后。 */
+.insight-card.selected {
+  border-color: #86b8a6;
+  background: #f2faf5;
+  box-shadow: inset 0 0 0 1px #a7d3c1;
+}
+.insight-card.selected:hover {
+  border-color: #6ea895;
+  background: #eef8f2;
+  box-shadow: inset 0 0 0 1px #a7d3c1, 0 7px 16px #17362c14;
+  transform: translateY(-2px);
+}
+
+@media (max-width: 820px) {
+  .insights-bulk-count { margin-left: 0; }
+  .insights-bulk-hint { white-space: normal; }
+  /* 窄屏只收起"发现性提示"，**说明范围的那条不能藏**（与任务看板批量栏同一条约定）：
+     480px 实测发现性提示会被压成半句（"…也能一起勾"的尾巴被裁），留着不如收起来 ——
+     卡片上的复选框本身就是可发现的；而"筛选生效：只作用于「有 bug」下的 N 条"说的是
+     「选择范围被改小了」，藏起来就会出现"全选只选了一半"的困惑。 */
+  .insights-bulk-hint[data-scope="all"] { display: none; }
+}

@@ -162,7 +162,7 @@ func probeClaudeCommandCatalog(ctx context.Context, claudePath, projectPath stri
 	}
 	cmd := exec.Command(claudePath, args...)
 	cmd.Dir = projectPath
-	cmd.Env = os.Environ()
+	cmd.Env = appendUTF8ChildEnv(os.Environ())
 	configureProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -198,7 +198,7 @@ func probeClaudeCommandCatalog(ctx context.Context, claudePath, projectPath stri
 		scanner.Buffer(make([]byte, 64*1024), 64*1024)
 		scanner.Split(wslStderrSplit)
 		for scanner.Scan() {
-			stderrTail.append(scanner.Text())
+			stderrTail.append(decodeAgentOutputLine(scanner.Bytes()))
 		}
 	}()
 
@@ -210,7 +210,10 @@ func probeClaudeCommandCatalog(ctx context.Context, claudePath, projectPath stri
 		// init 事件带 tools/skills/plugins 等数组，单行可达数 KB；给足上限。
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 		for scanner.Scan() {
-			line := append([]byte(nil), scanner.Bytes()...)
+			// 必须拷贝：scanner.Bytes() 的底层数组在下次 Scan 后即被复用，而 line 要
+			// 经 channel 交给另一个 goroutine；decodeAgentOutputBytes 在无需转码时会
+			// 原样返回入参，不能依赖它来复制。
+			line := append([]byte(nil), decodeAgentOutputBytes(scanner.Bytes())...)
 			select {
 			case lines <- line:
 			case <-stop:
@@ -271,10 +274,11 @@ func probeClaudeCommandCatalog(ctx context.Context, claudePath, projectPath stri
 
 // claudeCommandCatalog 实现 claudeCommandCatalogRunner（本机 runner）。
 func (r *claudeCLIRunner) claudeCommandCatalog(ctx context.Context, projectPath string) (claudeCommandCatalog, error) {
-	if r.config.ClaudePath == "" {
+	binary := r.claudeBinary()
+	if binary == "" {
 		return claudeCommandCatalog{}, errors.New("Claude CLI path is not configured")
 	}
-	return probeClaudeCommandCatalog(ctx, r.config.ClaudePath, projectPath)
+	return probeClaudeCommandCatalog(ctx, binary, projectPath)
 }
 
 // ---------------------------------------------------------------------------

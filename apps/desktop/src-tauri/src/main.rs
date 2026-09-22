@@ -424,6 +424,12 @@ fn load_agent_env(
     // 此令牌仅在本次桌面进程生命周期内存在；必须同时传给 sidecar 与 Agent。
     // 它绝不写入配置、日志或安装包资源。
     command.env("AUTO_REMOTE_AGENT_TOKEN", local_agent_token);
+    // 宿主自己的 PID：Agent 靠它盯住父进程，父进程一消失就自行退出。
+    // 没有这个参数时，宿主被强杀 / 崩溃 / 升级覆写留下的 Agent 会变成孤儿，带着**上一次会话**
+    // 的本地令牌继续跑 —— 那个令牌对新 control-server 必然无效，而云端仍会把手机的命令投给它，
+    // 结果是一律 401 invalid agent token（见 apps/agent/internal/agent/parent_watch_windows.go）。
+    // control-server 一直有这个参数（见 start_sidecar），Agent 这边过去漏了。
+    command.arg("--parent-pid").arg(std::process::id().to_string());
     if let Some(token) = enrollment_token.filter(|token| !token.trim().is_empty()) {
         // 仅注入这个新建 Agent 子进程；不得写入磁盘或继承到 sidecar。
         command.env("MILEVIA_AGENT_ENROLLMENT_TOKEN", token.trim());
@@ -495,6 +501,47 @@ fn enroll_remote_agent(app: tauri::AppHandle, enrollment_token: String) -> Resul
         .lock()
         .map_err(|_| "无法保存 Agent 进程状态")? = agent;
     Ok(())
+}
+
+/// 在系统文件管理器里打开应用数据目录。
+///
+/// 排障要看 `milevia-agent.log`，它就落在 `app_local_data_dir()` 下 —— 让用户自己从
+/// `%LOCALAPPDATA%` 一路点进去不现实，所以给一个入口。设置页的「数据」一节与远程控制页的
+/// 服务卡片都用它（前端两处的 `invoke("open_app_data_directory")` 是一致的）。
+///
+/// ⚠️ 这个命令**前端一直在调、宿主却从没注册过**（2026-09-17 复查发现）：两处按钮点下去
+/// 只会拿到 Tauri 的 "command not found" 回绝，用户看到的是 `setError` 那条红字。
+/// 教训：加前端 `invoke("…")` 时，`invoke_handler` 那张表必须一起改 —— 两侧没有共享的类型，
+/// 编译期抓不到，只有真机点下去才知道。
+#[tauri::command]
+fn open_app_data_directory(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("定位应用数据目录失败：{error}"))?;
+    // 目录可能还没被建出来（全新安装、Agent 一次都没跑过）。先建再开，否则文件管理器
+    // 会弹一句"找不到路径"——那时候用户只会以为按钮坏了。
+    std::fs::create_dir_all(&dir).map_err(|error| format!("创建应用数据目录失败：{error}"))?;
+    open_directory(&dir)
+}
+
+/// 用系统文件管理器打开一个目录。
+///
+/// Windows 走 `explorer`：它**成功时也返回非 0 退出码**，所以这里只看 `spawn` 有没有失败，
+/// 不能去等退出状态（等了就会把成功当失败，反过来报一个假错误）。
+#[cfg(windows)]
+fn open_directory(dir: &std::path::Path) -> Result<(), String> {
+    Command::new("explorer")
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开目录失败：{error}"))
+}
+
+/// 其它平台目前没有发布产物，明确回一句而不是假装成功。
+#[cfg(not(windows))]
+fn open_directory(dir: &std::path::Path) -> Result<(), String> {
+    Err(format!("当前平台暂不支持打开目录：{}", dir.display()))
 }
 
 fn stop_agent(app: &tauri::AppHandle) {
@@ -1208,6 +1255,109 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+// ── 升级后首启白屏：宿主层清理 ──────────────────────────────────────────────
+//
+// 症状：升级安装后被自动拉起的第一次启动是白屏，手动重启一次就恢复。
+//
+// 链路（真机上逐条验证过）：
+//   1. 旧版本（≤ v0.1.6）的桌面端在 `https://tauri.localhost` 上注册过 Service Worker，
+//      把当时的应用外壳 index.html 连同 `/assets/index-<旧hash>.js` 一起写进了
+//      `EBWebView/Default/Service Worker/CacheStorage`；
+//   2. 升级时安装程序覆盖文件，首启的导航由那份仍然注册着的旧 SW 接管；它的
+//      network-first `fetch` 在宿主/浏览器进程交接的那一刻打不通，于是拿缓存里的
+//      **旧外壳**兜底；
+//   3. 旧外壳引用的 `/assets/index-<旧hash>.js` 在新版本里已不存在，而 Tauri 的资源
+//      处理器对**任何找不到的路径**都兜底返回 index.html + `text/html`；
+//   4. `<script type="module">` 拿到 HTML → MIME 校验失败 → React 不挂载 → 白屏。
+//
+// 为什么只在前端修不住：出白屏的那一次跑起来的正是**旧包**，新包里的清理代码
+// （前端 `purgeServiceWorkerState`）没有机会执行，只能救「新包已经跑起来」之后的机器。
+// 所以必须在新宿主建窗之前，从宿主侧把这些会跨版本残留的缓存目录删掉。
+const WEBVIEW_CACHE_DIRS: [&str; 3] = ["Service Worker", "Cache", "Code Cache"];
+/// 版本标记文件，放在应用数据目录根下（不属于 WebView2 自己的目录）。
+const WEBVIEW_CACHE_MARKER: &str = ".webview-cache-version";
+
+/// 在新宿主创建任何 webview 之前清掉上一版本残留的 WebView2 缓存。
+fn purge_stale_webview_cache(app: &tauri::AppHandle) {
+    let Ok(local_data) = app.path().app_local_data_dir() else {
+        return;
+    };
+    if !local_data.is_dir() {
+        return;
+    }
+    if purge_webview_cache(&local_data, &app.package_info().version.to_string()) {
+        return;
+    }
+    // 发布版是 GUI 子系统，没有控制台：这条线索必须落到日志文件里，
+    // 否则线上再出白屏时我们手上什么都没有。
+    const MESSAGE: &str = "未能清理上一版本残留的 WebView2 缓存（可能仍被上个进程占用），下次启动重试";
+    eprintln!("[webview-cache] {MESSAGE}");
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(local_data.join("milevia-agent.log"))
+    {
+        let _ = writeln!(log, "[desktop] webview-cache: {MESSAGE}");
+    }
+}
+
+/// 清理重试的上界。上一版宿主的 WebView2 浏览器进程可能还没退干净，目录会短暂被占用，
+/// 所以删不掉时多试几轮；但总等待时间有上界，且不随目录个数放大（否则最坏情况会把启动卡住好几秒）。
+const PURGE_ROUNDS: u32 = 10;
+const PURGE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 按版本号清理一次。返回值表示「本次没有需要上报的失败」：
+/// - 版本一致 → 无需清理；
+/// - 删干净了 → 已落版本标记；
+/// - 还没有 WebView2 配置目录（全新安装的首次启动）→ 无可清理，且**故意不落标记**，
+///   等下次启动目录已经建出来，再真正检查一遍。
+///
+/// 抽成纯函数便于测试。标记只在**真正检查过 profile** 之后才落：写早了会漏掉一次清理
+/// （下次升级又白屏），漏写则只是多检查一次，代价小得多。
+fn purge_webview_cache(local_data: &std::path::Path, version: &str) -> bool {
+    let marker = local_data.join(WEBVIEW_CACHE_MARKER);
+    if std::fs::read_to_string(&marker).is_ok_and(|saved| saved.trim() == version) {
+        return true;
+    }
+    let default_dir = local_data.join("EBWebView").join("Default");
+    if !default_dir.is_dir() {
+        // 全新安装时 WebView2 还没建过配置目录（要等第一次建窗才建出来），现在没有可清的东西。
+        // 若将来 WebView2 换了目录层级，这条日志会每次启动都出现 —— 这正是要的效果：
+        // 宁可吵，也不要让「清理」悄悄变成空操作而没人发现。
+        eprintln!(
+            "[webview-cache] 未发现 WebView2 配置目录，本次跳过（下次启动再检查）：{}",
+            default_dir.display()
+        );
+        return true;
+    }
+    // 用 `is_dir` 而不是 `exists` 筛选：万一真有同名文件挡在那里，`remove_dir_all` 会永远失败，
+    // 那样每次启动都要白等一整轮重试。这种情况直接跳过。
+    let mut pending: Vec<PathBuf> = WEBVIEW_CACHE_DIRS
+        .iter()
+        .map(|name| default_dir.join(name))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    for round in 1..=PURGE_ROUNDS {
+        let mut still_there = Vec::new();
+        for dir in pending {
+            if std::fs::remove_dir_all(&dir).is_err() {
+                still_there.push(dir);
+            }
+        }
+        pending = still_there;
+        if pending.is_empty() {
+            break;
+        }
+        if round < PURGE_ROUNDS {
+            thread::sleep(PURGE_RETRY_INTERVAL);
+        }
+    }
+    if !pending.is_empty() {
+        return false;
+    }
+    std::fs::write(&marker, version).is_ok()
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -1225,11 +1375,15 @@ fn main() {
             navigate_main,
             show_system_notification,
             enroll_remote_agent,
+            open_app_data_directory,
             get_updater_status,
             check_for_update_now,
             install_update
         ])
         .setup(|app| {
+            // 必须排在所有 webview 创建之前：升级后首启的白屏正是上一版残留的
+            // Service Worker 外壳喂出来的，建窗之后再清就已经晚了。
+            purge_stale_webview_cache(&app.handle());
             app.manage(ManagedSidecar(Mutex::new(None)));
             app.manage(ManagedAgent(Mutex::new(None)));
             app.manage(TrayAnchor(Mutex::new(None)));
@@ -1292,4 +1446,111 @@ fn main() {
             stop_sidecar(app_handle);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个「老版本残留」的假数据目录：三块缓存目录各放一个文件，
+    /// 外加一块必须被保住的应用数据（Local Storage 里是用户的界面偏好）。
+    fn fake_local_data(version_marker: Option<&str>) -> PathBuf {
+        let root = env::temp_dir().join(format!("milevia-cache-test-{}", Uuid::new_v4()));
+        let default = root.join("EBWebView").join("Default");
+        for name in WEBVIEW_CACHE_DIRS {
+            std::fs::create_dir_all(default.join(name)).unwrap();
+            std::fs::write(default.join(name).join("stale-entry"), b"old").unwrap();
+        }
+        std::fs::create_dir_all(default.join("Local Storage")).unwrap();
+        std::fs::write(default.join("Local Storage").join("keep"), b"user-pref").unwrap();
+        if let Some(version) = version_marker {
+            std::fs::write(root.join(WEBVIEW_CACHE_MARKER), version).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn purges_previous_version_cache_and_keeps_app_data() {
+        let root = fake_local_data(None);
+        let default = root.join("EBWebView").join("Default");
+
+        assert!(purge_webview_cache(&root, "0.1.8"));
+
+        for name in WEBVIEW_CACHE_DIRS {
+            assert!(!default.join(name).exists(), "{name} 应当被清掉");
+        }
+        assert!(default.join("Local Storage").join("keep").exists(), "应用数据不能被动");
+        assert_eq!(
+            std::fs::read_to_string(root.join(WEBVIEW_CACHE_MARKER)).unwrap(),
+            "0.1.8"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn skips_purge_when_version_is_unchanged() {
+        let root = fake_local_data(Some("0.1.8"));
+
+        assert!(purge_webview_cache(&root, "0.1.8"));
+
+        let default = root.join("EBWebView").join("Default");
+        assert!(
+            default.join("Cache").join("stale-entry").exists(),
+            "版本没变就不该动缓存"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn purges_again_when_version_changed() {
+        let root = fake_local_data(Some("0.1.7"));
+        let default = root.join("EBWebView").join("Default");
+
+        assert!(purge_webview_cache(&root, "0.1.8"));
+
+        assert!(!default.join("Service Worker").exists(), "换版本必须重新清一次");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tolerates_a_file_where_a_cache_dir_is_expected() {
+        // WebView2 的目录层级将来若变化（比如某一块变成文件），清理不能卡住启动：
+        // 跳过它、照常写版本标记，而不是每次启动都白等一轮重试。
+        let root = env::temp_dir().join(format!("milevia-cache-test-{}", Uuid::new_v4()));
+        let default = root.join("EBWebView").join("Default");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.join("Cache"), b"not a dir").unwrap();
+
+        assert!(purge_webview_cache(&root, "0.1.8"));
+
+        assert!(default.join("Cache").is_file(), "同名文件不该被动");
+        assert_eq!(
+            std::fs::read_to_string(root.join(WEBVIEW_CACHE_MARKER)).unwrap(),
+            "0.1.8"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fresh_install_defers_until_profile_exists() {
+        let root = env::temp_dir().join(format!("milevia-cache-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 首次启动：WebView2 还没建过配置目录 → 无可清理，也不能「没检查就宣告干净」
+        assert!(purge_webview_cache(&root, "0.1.8"));
+        assert!(
+            !root.join(WEBVIEW_CACHE_MARKER).exists(),
+            "没看过 profile 就不该落版本标记"
+        );
+
+        // 建过窗之后目录存在了：这次才真正检查并落标记
+        let default = root.join("EBWebView").join("Default");
+        std::fs::create_dir_all(default.join("Cache")).unwrap();
+        assert!(purge_webview_cache(&root, "0.1.8"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(WEBVIEW_CACHE_MARKER)).unwrap(),
+            "0.1.8"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

@@ -156,8 +156,10 @@ test("conversation tabs use roving keyboard navigation and name their panel", ()
   assert.match(stylesheet, /\.conversation-tab > button:first-child:focus-visible \{[^}]*outline: 2px solid #2b7b68;/s);
 });
 
-test("conversation tabs label both supported agents", () => {
-  assert.match(conversationPage, /conversation && <span className="conversation-tab-agent">\{conversation\.agentId === "codex" \? "Codex" : "Claude Code"\}<\/span>/);
+test("conversation tabs label the active tool from the catalog", () => {
+  // 工具名来自服务端目录（agentDisplayName），不再是一句"不是 codex 就是 Claude Code"
+  // 的三元式 —— 那种写法会把新增工具静默标成 Claude Code。
+  assert.match(conversationPage, /conversation && <span className="conversation-tab-agent">\{agentDisplayName\(conversation\.agentId\)\}<\/span>/);
   assert.match(stylesheet, /\.conversation-tab-agent\s*\{[^}]*white-space:\s*nowrap;/s);
 });
 
@@ -324,9 +326,12 @@ test("conversation content reserves space for its controls without legacy footer
 });
 
 test("Codex and Claude use the same version check and update controls", () => {
-  assert.match(conversationPage, /const agentPath = agentID === "codex" \? "codex" : "claude";/);
-  assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/\$\{agentPath\}\/check-update/);
-  assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/\$\{agentPath\}\/update/);
+  // 两个工具走**同一条**泛化端点，工具由 agentID 带上。原先那句
+  // `agentID === "codex" ? "codex" : "claude"` 是"把工具名映射成路径段"，
+  // 新增工具会被指向 Claude 的路径；这里额外钉住它不许回来。
+  assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/agents\/\$\{encodeURIComponent\(agentID\)\}\/check-update/);
+  assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/agents\/\$\{encodeURIComponent\(agentID\)\}\/update/);
+  assert.doesNotMatch(conversationPage, /agentPath/);
   assert.match(conversationPage, /!run && tool\?\.status === "ready" && <button className="runner-inline-btn"/);
   assert.match(conversationPage, /确认更新 \{toolName\}/);
   assert.doesNotMatch(conversationPage, /status: "ready" as const/);
@@ -354,7 +359,7 @@ test("Git workbench, project runner, and terminal are first-class workspace tabs
   assert.doesNotMatch(projectLayout, /const \[showRun, setShowRun\]/);
   assert.match(workspaceStyles, /\.workspace-tabs\s*\{[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;/s);
   assert.match(workspaceStyles, /\.workspace-content\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*flex:\s*1;[^}]*overflow:\s*hidden;/s);
-  assert.match(gitWorkbench, /useEffect\(\(\) => \{ if \(active\) void reload\(\)\.catch\(\(\) => undefined\); \}, \[active, reload\]\);/);
+  assert.match(gitWorkbench, /useEffect\(\(\) => \{ if \(active && isGitRepo\) void reload\(\)\.catch\(\(\) => undefined\); \}, \[active, isGitRepo, reload\]\);/);
   assert.match(runPanel, /if \(!active\) return;/);
   // 左右分栏：.run-body 水平排列，左侧日志 flex:1，右侧侧栏保持受控宽度并可独立滚动。
   assert.match(runStyles, /\.run-body\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
@@ -377,13 +382,28 @@ test("switching projects does not render an outlet with the previous project con
   assert.doesNotMatch(projectLayout, /setProject\(null\);/);
 });
 
-test("non-git projects cannot open the Git workspace via direct /git access", () => {
-  // 与顶部标签栏一致：非 Git 项目不展示 Git 工作台入口，直接访问 /git（含末尾斜杠）
-  // 重定向到默认工作区，避免打开无法工作的空页面。
-  assert.match(projectLayout, /location\.pathname\.replace\([^)]*\)\.endsWith\("\/git"\)/);
-  assert.match(projectLayout, /project\.gitBranch === NON_GIT_BRANCH/);
-  assert.match(projectLayout, /import \{ type Project, type WorkspaceTab, NON_GIT_BRANCH \} from "\.\.\/lib\/types";/);
-  assert.match(projectLayout, /<Navigate to=\{`\/projects\/\$\{project\.id\}\/conversations`\} replace \/>/);
+test("non-git projects still open the Git workspace with an init empty state", () => {
+  // 非 git 项目不再被重定向到默认工作区，顶部标签栏始终渲染 Git 工作台入口。
+  assert.doesNotMatch(projectLayout, /project\.gitBranch === NON_GIT_BRANCH/);
+  assert.doesNotMatch(projectLayout, /endsWith\("\/git"\).*NON_GIT_BRANCH/);
+  assert.match(projectLayout, /data-workspace-tab="git"/);
+  // 工作台把非 git 状态传入，渲染「初始化 Git 仓库」空态，并走 /git/init 初始化。
+  assert.match(gitWorkbench, /initialIsGitRepo/);
+  assert.match(gitWorkbench, /git-init-empty/);
+  assert.match(gitWorkbench, /\/git\/init/);
+  assert.match(gitWorkbench, /未初始化 Git 仓库/);
+  // 空态只在非 git 时跳出，不再尝试读取仓库状态。
+  assert.match(gitWorkbench, /if \(active && isGitRepo\)/);
+});
+
+test("new-conversation dialog offers a jump to the CLI tools manager when none is available", () => {
+  // 无可用工具时给出「去管理 CLI 工具」入口，点击关闭弹窗并跳到 /cli-tools。
+  assert.match(conversationPage, /new-conversation-manage-tools/);
+  assert.match(conversationPage, /去管理 CLI 工具/);
+  assert.match(conversationPage, /navigate\("\/cli-tools"\)/);
+  assert.match(conversationPage, /runnableAgentEntries\.length > 0 && !runnableAgentEntries\.some\(\(entry\) => isAgentAvailable\(catalogAgentID\(entry\)\)\)/);
+  // 配套样式存在。
+  assert.match(stylesheet, /\.new-conversation-manage-tools\s*\{/);
 });
 
 test("conversation follows streaming updates and explicitly follows dispatched messages", () => {
@@ -520,7 +540,9 @@ test("creating a conversation keeps the newly navigated route", () => {
 });
 
 test("new conversations start from the configured default permission", () => {
-  assert.match(conversationPage, /const permissionForAgent = \(agent: AgentID\): PermissionMode => agent === "codex" \? defaults\.codexPermissionMode : defaults\.claudePermissionMode;/);
+  // 默认权限模式由服务端偏好按工具索引给出；拿不到时用目录声明的默认值，
+  // 而不是回落到另一个工具的设置。
+  assert.match(conversationPage, /const permissionForAgent = \(agent: AgentID\): PermissionMode => defaults\.agentPermissionModes\?\.\[agent\] \?\? agentEntry\(agent\)\?\.defaultPermissionMode/);
 });
 
 test("wide and narrow screens sort prompts and commands in separate vertical lists", () => {

@@ -4,13 +4,14 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useProjectContext } from "../stores/useProjectStore";
 import type { AgentID, Event, Message } from "../lib/types";
+import { agentDisplayName, agentEntry, agentPermissionModes, permissionCopy, catalogAgentID, useAgentCatalog } from "../lib/agent-registry";
 import type { Task, TaskDetail } from "../features/tasks/task-model";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
 import "../markdown.css";
 import "../conversation.css";
 import "../orchestration.css";
 
-type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; devBranch: string; agentId: "claude-code" | "codex"; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
+type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; devBranch: string; agentId: AgentID; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
 type OrchestrationJob = { id: string; projectId: string; taskId: string; taskTitle?: string; taskDescription?: string; position: number; status: string; attempt?: number; baseDevSha?: string; targetBranch?: string; taskBranch?: string; worktreePath?: string; conversationId?: string; batchId?: string; humanDecision?: string; resourcesCleanedAt?: string; lastError?: string; createdAt?: string; updatedAt?: string };
 type OrchestrationBatch = { id: string; name: string; conversationStrategy: "new" | "continue"; status: "active" | "needs_human" | "paused" | "awaiting_main" | "completed"; taskCount: number; completedCount: number; createdAt: string; updatedAt: string };
 type ReleaseSnapshot = { id: string; projectId: string; devSha: string; branch: string; status: string; createdAt: string; confirmedAt?: string };
@@ -18,7 +19,7 @@ type ConversationHistory = { conversation?: { agentId: AgentID }; activeRunId?: 
 
 const runningStatuses = new Set(["preparing", "implementing", "checking"]);
 // 新建编排任务时一次定好的执行配置：创建后写入项目编排配置，之后加入队列的任务都沿用快照。
-type BatchPolicyDraft = { mainBranch: string; devBranch: string; agentId: "claude-code" | "codex"; maxFixRounds: number };
+type BatchPolicyDraft = { mainBranch: string; devBranch: string; agentId: AgentID; maxFixRounds: number };
 const refreshingStatuses = new Set(["queued", "preparing", "implementing", "checking"]);
 const fallbackTaskTitle = "未命名任务";
 
@@ -30,7 +31,7 @@ function statusLabel(status: string, targetBranch = "main") {
 }
 
 function orchestrationActivityLabel(status: string, agentID: AgentID) {
-  const agentName = agentID === "codex" ? "Codex" : "Claude Code";
+  const agentName = agentDisplayName(agentID);
   if (status === "queued") return "任务正在队列中等待执行";
   if (status === "preparing") return "正在准备独立工作区";
   if (status === "implementing") return `${agentName} 正在处理任务`;
@@ -84,10 +85,10 @@ function releaseStatusLabel(status: string, mainBranch: string) {
   return labels[status] || status;
 }
 
-function OrchestrationConversationMessage({ message, agentID }: { message: Message; agentID: "claude-code" | "codex" }) {
+function OrchestrationConversationMessage({ message, agentID }: { message: Message; agentID: AgentID }) {
   const isUser = message.role === "user";
-  const agentName = agentID === "codex" ? "Codex" : "Claude";
-  return <div className="timeline-entry message-entry"><article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentID === "codex" ? "<>" : "C"}</span><b>{isUser ? "你" : agentName}</b><time>{formatDate(message.createdAt)}</time></header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a> }}>{message.content}</ReactMarkdown></div></article></div>;
+  const agentName = agentDisplayName(agentID);
+  return <div className="timeline-entry message-entry"><article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatDate(message.createdAt)}</time></header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a> }}>{message.content}</ReactMarkdown></div></article></div>;
 }
 
 function ScrollNavigationIcon({ direction }: { direction: "top" | "previous" | "next" | "bottom" }) {
@@ -100,6 +101,7 @@ function ScrollNavigationIcon({ direction }: { direction: "top" | "previous" | "
 }
 
 export default function OrchestrationPage() {
+  const agentOptions = useAgentCatalog();
   const { projectId } = useParams<{ projectId: string }>();
   const { api, setError } = useProjectContext();
   const navigate = useNavigate();
@@ -642,7 +644,9 @@ export default function OrchestrationPage() {
 					<div className="orchestration-composer-grid">
 						<label>稳定分支<input value={batchPolicy.mainBranch} disabled={Boolean(busy)} aria-invalid={!mainBranchValid} placeholder="main" onChange={(event) => setBatchPolicy((previous) => ({ ...previous, mainBranch: event.target.value }))} /></label>
 						<label>开发分支<input value={batchPolicy.devBranch} disabled={Boolean(busy)} aria-invalid={!devBranchValid} placeholder="dev" onChange={(event) => setBatchPolicy((previous) => ({ ...previous, devBranch: event.target.value }))} /></label>
-						<label>执行 Agent<select value={batchPolicy.agentId} disabled={Boolean(busy)} onChange={(event) => setBatchPolicy((previous) => ({ ...previous, agentId: event.target.value as BatchPolicyDraft["agentId"] }))}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label>
+						<label>执行 Agent<select value={batchPolicy.agentId} disabled={Boolean(busy)} onChange={(event) => setBatchPolicy((previous) => ({ ...previous, agentId: event.target.value as BatchPolicyDraft["agentId"] }))}>{agentOptions.length === 0
+							? <option value={batchPolicy.agentId}>读取工具目录中…</option>
+							: agentOptions.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select></label>
 						<label>最大修复轮次<input type="number" min={1} max={10} value={batchPolicy.maxFixRounds} disabled={Boolean(busy)} aria-invalid={!maxFixRoundsValid} onChange={(event) => setBatchPolicy((previous) => ({ ...previous, maxFixRounds: Number(event.target.value) }))} /></label>
 					</div>
 					{batchPolicyIssue ? <p className="orchestration-composer-error" role="status">{batchPolicyIssue}</p> : <p className="orchestration-composer-note">该配置会写入项目编排策略，对所有之后加入队列的任务生效；开发分支用于生成发布验收快照。</p>}

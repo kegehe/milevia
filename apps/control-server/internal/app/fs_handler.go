@@ -159,12 +159,28 @@ func (e *runnerOfflineError) Error() string {
 
 func (s *Server) fsReadDir(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
+	// depth 缺省为 1，与加入这个参数之前完全一致：桌面端不传它，拿到的仍是扁平的
+	// 一层 entries。手机端显式传 depth（默认 3）拿带 children 的子树，把"每个目录
+	// 一次往返"压成"每棵树一次"。
+	depth, err := fsTreeDepth(r.URL.Query().Get("depth"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	fs, err := s.getFilesystem(r)
 	if err != nil {
 		s.writeFSError(w, err)
 		return
 	}
-	entries, err := fs.ReadDir(r.Context(), path)
+	budget := &fsTreeBudget{remaining: fsTreeMaxTotalEntry}
+	var entries []FileEntry
+	if depth <= 1 {
+		// 单层：不走忽略名单。桌面端一直看得到 node_modules，静默改掉它的可见范围
+		// 是越权改行为 —— 需要裁剪的是手机端那棵树，不是这一层。
+		entries, err = fs.ReadDir(r.Context(), path)
+	} else {
+		entries, err = readTree(r.Context(), fs, path, depth, budget)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -172,7 +188,11 @@ func (s *Server) fsReadDir(w http.ResponseWriter, r *http.Request) {
 	if entries == nil {
 		entries = []FileEntry{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries":     entries,
+		"truncated":   budget.truncated,
+		"skippedDirs": budget.skipped,
+	})
 }
 
 func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {

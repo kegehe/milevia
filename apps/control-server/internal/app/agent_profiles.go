@@ -116,7 +116,7 @@ var profileCredentialKeys = []string{
 // managed key overrides them.
 func managedCLIEnvironment(profile *AgentRuntimeProfile, inherited []string, additions ...string) []string {
 	blocked := map[string]struct{}{}
-	effective := make([]string, 0, len(additions))
+	effective := make([]string, 0, len(additions)+len(utf8ChildEnv()))
 	for _, item := range additions {
 		effective = append(effective, item)
 		if name, _, found := strings.Cut(item, "="); found {
@@ -148,6 +148,17 @@ func managedCLIEnvironment(profile *AgentRuntimeProfile, inherited []string, add
 			}
 			// The model is selected via --model (Claude) / -c model= (Codex),
 			// not via an environment variable, so no *_MODEL is injected.
+		}
+	}
+	// UTF-8 输出变量优先级最低：只在 additions 与 profile.Env 都没定义同名变量时才
+	// 追加，让显式配置能覆盖默认值。名字无条件登记进 blocked，用于剔除继承来的旧值
+	// ——环境块里出现两个同名变量时哪个生效是实现定义的（例如 glibc 的 getenv 取
+	// 第一个），不能指望「后者覆盖前者」。
+	utf8Defaults := utf8ChildEnv()
+	effective = append(effective, envEntriesMissingFrom(utf8Defaults, effective)...)
+	for _, item := range utf8Defaults {
+		if name, _, found := strings.Cut(item, "="); found {
+			blocked[strings.ToUpper(name)] = struct{}{}
 		}
 	}
 	result := make([]string, 0, len(inherited)+len(effective))
@@ -338,8 +349,6 @@ func (s *Server) ensureProjectRouteImmutableTrigger(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `create trigger project_agent_route_revisions_immutable before update on project_agent_route_revisions when new.id<>old.id or new.project_id<>old.project_id or new.agent_id<>old.agent_id or new.profile_id<>old.profile_id or new.profile_revision_id<>old.profile_revision_id or new.pool_revision_id<>old.pool_revision_id or new.remote_route_revision_id<>old.remote_route_revision_id or new.mode<>old.mode or new.created_at<>old.created_at or (old.state='revoked' and new.state<>old.state) or (old.state='deprecated' and new.state not in ('deprecated','revoked')) or (old.state='active' and new.state not in ('active','deprecated','revoked')) begin select raise(abort, 'project agent route revisions are immutable'); end`)
 	return err
 }
-
-func validProfileAgent(agentID string) bool { return agentID == "claude-code" || agentID == "codex" }
 
 func (s *Server) migrateLegacyProjectProfileDefaults(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `select p.id,coalesce(nullif(p.runner_id,''),p.runner),coalesce(p.default_profile_id,'')
@@ -553,10 +562,14 @@ func (s *Server) listAgentProfiles(w http.ResponseWriter, r *http.Request) {
 type ProjectAgentConfigView struct {
 	// RunnerID is the project's execution runner; RunnerManaged is false for
 	// SSH / Windows-scheduled WSL where credentials are not injected locally.
-	RunnerID      string                 `json:"runnerId"`
-	RunnerManaged bool                   `json:"runnerManaged"`
-	Claude        *ProjectAgentEntryView `json:"claude"`
-	Codex         *ProjectAgentEntryView `json:"codex"`
+	RunnerID      string `json:"runnerId"`
+	RunnerManaged bool   `json:"runnerManaged"`
+	// Agents 按工具 ID 索引（也就是工具目录里的全部工具）。前端遍历它，
+	// 不再分别读下面两个具名字段。
+	Agents map[string]*ProjectAgentEntryView `json:"agents"`
+	// Claude / Codex 是过渡兼容字段，值由 Agents 派生，前端改用 Agents 后可删。
+	Claude *ProjectAgentEntryView `json:"claude,omitempty"`
+	Codex  *ProjectAgentEntryView `json:"codex,omitempty"`
 }
 
 type ProjectAgentEntryView struct {
@@ -630,7 +643,7 @@ func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
 	// Keep the aggregate view useful for projects created before independent
 	// routes existed: an agent without an explicit project route still exposes
 	// the enabled runner profile that would be selected for a new conversation.
-	for _, agentID := range []string{"claude-code", "codex"} {
+	for _, agentID := range supportedAgentIDs() {
 		if byAgent[agentID] != nil {
 			continue
 		}
@@ -653,6 +666,9 @@ func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
 		entry.Env, _ = unmarshalProfileOptions(optionsJSON)
 		byAgent[agentID] = &entry
 	}
+	view.Agents = byAgent
+	// Claude / Codex 两个具名字段是过渡兼容：它们的值全部来自上面按目录构建的
+	// byAgent（同一份来源），因此不会与 Agents 分叉。前端改用 Agents 遍历后即可删除。
 	view.Claude = byAgent["claude-code"]
 	view.Codex = byAgent["codex"]
 	writeJSON(w, http.StatusOK, view)

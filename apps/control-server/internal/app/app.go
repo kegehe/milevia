@@ -110,24 +110,16 @@ func ConfigFromEnv() Config {
 	if hook == "" {
 		hook = "../../scripts/claude-approval-hook.sh"
 	}
-	codexPath := os.Getenv("AUTO_CODEX_PATH")
+	// 这里**只**保留"环境变量显式覆盖"这一档。平台兜底（GUI 进程继承到 npm 安装之前的
+	// 陈旧 PATH 时，按 npm 全局包的实际落点再找一次）交给 agentPathResolver 统一处理，
+	// 两个工具一视同仁 —— 原先只给 Codex 写了那段，而且它把"发现到的路径"直接写进 Config，
+	// 从值上看起来与用户显式指定无法区分，于是会盖掉登记表里的实测路径
+	// （解析顺序见 agent_paths.go，登记表那档是"平台自己装出来的"，不该被一次探测顶掉）。
+	codexPath := strings.TrimSpace(os.Getenv("AUTO_CODEX_PATH"))
 	if codexPath == "" {
 		codexPath = "codex"
-		// GUI-launched desktop processes may inherit a stale PATH after npm
-		// installs Codex. Resolve the standard per-user npm shim explicitly.
-		if runtime.GOOS == "windows" {
-			for _, candidate := range []string{
-				filepath.Join(os.Getenv("APPDATA"), "npm", "codex.cmd"),
-				filepath.Join(os.Getenv("APPDATA"), "npm", "codex.exe"),
-			} {
-				if _, err := os.Stat(candidate); err == nil {
-					codexPath = candidate
-					break
-				}
-			}
-		}
 	}
-	claudePath := os.Getenv("AUTO_CLAUDE_PATH")
+	claudePath := strings.TrimSpace(os.Getenv("AUTO_CLAUDE_PATH"))
 	if claudePath == "" {
 		claudePath = "claude"
 	}
@@ -213,6 +205,18 @@ type Server struct {
 	remoteCloudURL     string
 	remoteCloudToken   string
 	remoteInstanceID   string
+	// remoteAgentHeartbeatAt 是"最近一次听到本机 Agent 说话"的时刻（Unix 纳秒，0 = 从未）。
+	// Agent 每 750ms 心跳一次、每次都打 /api/remote/overview，那个处理器只被 Agent 令牌
+	// 放行（`/api/remote/overview` **不在** desktopPairingPaths 里，否则页面自己就能刷这个
+	// 读数，这一档就永远是绿的），所以这里记到的就是本机 Agent 的心跳。电脑端远程控制页要
+	// 回答"这台电脑还活着吗"，但 `ready` 只说明"凭据存在"——进程死了它照样是 true。
+	//
+	// ⚠️ 语义边界：心跳从 `agent.syncSnapshot` 发，而那条 ticker 长在 `runConnection` 里 ——
+	// **只在 Agent 与云端连接建立期间才跑**。所以"心跳停"= Agent 没在跑**或**它连不上云端，
+	// 页面文案不许咬定其中一种（见 features/remote/desktop-service.ts 的 stale 档）。
+	//
+	// 放在内存里而不是写库：心跳频率是 1.3 次/秒，落盘会把唯一的 SQLite 连接打满。
+	remoteAgentHeartbeatAt atomic.Int64
 	// remoteOutboxWake broadcasts "the remote outbox changed" to held long-poll
 	// requests so the Agent learns about a new event immediately instead of on
 	// its next poll tick.
@@ -225,12 +229,19 @@ type Server struct {
 	dataLock          *dataDirLock
 	httpMu            sync.Mutex
 	httpServer        *http.Server
-	runner            AgentRunner
-	codexRunner       AgentRunner
-	windowsRunner     AgentRunner
-	wslRunner         AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
-	wslDistro         string      // 探测到的默认 WSL 发行版名；空表示无 WSL
-	wslHome           string      // WSL 内当前用户的 Linux home 路径
+	// paths 回答"某个工具现在该用哪个可执行文件"。原先这是 Config 里两个不可变字段，
+	// 被直接读 18 处 —— 平台把工具装到自己的目录之后（托管 prefix 不在 PATH 上），
+	// 那 18 处全都不会知道。所有取值一律经它（见 agent_paths.go）。
+	paths *agentPathResolver
+	// runtimes 负责托管 Node 运行时的版本清单、下载与校验（见 runtime_manager.go）。
+	runtimes        *nodeRuntimeManager
+	runner          AgentRunner
+	codexRunner     AgentRunner
+	codebuddyRunner AgentRunner
+	windowsRunner   AgentRunner
+	wslRunner       AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
+	wslDistro       string      // 探测到的默认 WSL 发行版名；空表示无 WSL
+	wslHome         string      // WSL 内当前用户的 Linux home 路径
 	// wslMu 保护 wslRunner/wslDistro/wslHome 三个字段。启动期在 New() 写一次，但
 	// ensureWSLRunner 可能于请求期补注册并再次写入，须与并发读者（wslAgentRunner()、
 	// discoverLocalSkillRoots、terminal.go 的 wslDistro 读取）错开。
@@ -736,6 +747,9 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		_ = dataLock.close()
 		return nil, fmt.Errorf("configure SQLite: %w", err)
 	}
+	// 解析器在 runner 之前建好并注入：runner 只在启动时构造一次，之后再改 Config
+	// 是没用的（Config 按值复制）。
+	paths := newAgentPathResolver(config)
 	if runner == nil {
 		approvalHook, err := filepath.Abs(config.ApprovalHook)
 		if err != nil {
@@ -749,11 +763,12 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 			return nil, fmt.Errorf("approval hook is unavailable: %s", approvalHook)
 		}
 		config.ApprovalHook = approvalHook
-		runner = newClaudeCLIRunner(config)
+		runner = newClaudeCLIRunner(config, paths)
 	}
-	codexRunner := newCodexCLIRunner(config)
+	codexRunner := newCodexCLIRunner(config, paths)
+	codebuddyRunner := newCodebuddyManageRunner(config, paths)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, dataLock: dataLock, runner: runner, codexRunner: codexRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -778,6 +793,14 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		pool.Close()
 		_ = dataLock.close()
 		return nil, err
+	}
+	// 把登记表里的实测路径载入解析器。顺序在 migrate 之后：表是 migrate 建的。
+	// 载入失败不阻断启动（解析器还有 PATH 与平台兜底两级），但要如实记下来，
+	// 否则"装过的东西忽然找不到了"会没有任何线索。
+	if recorded, err := s.loadAgentInstallations(ctx, s.localRunnerID()); err != nil {
+		log.Printf("[agents] 读取安装登记表失败，本次启动将回落到 PATH 查找：%v", err)
+	} else {
+		s.paths.load(recorded)
 	}
 	if err := s.recoverInterruptedRuns(ctx); err != nil {
 		runtimeStop()
@@ -1047,8 +1070,18 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	// Local Agent relay endpoints expose only durable control metadata. They do
-	// not provide arbitrary filesystem or shell access.
+	// Local Agent relay endpoints. 除 /api/remote/rpc 之外都只暴露控制类元数据；
+	// 那个端点提供**项目沙箱内**的文件读写、以及该仓库的 Git 操作（28 个领域动作，
+	// 全部复用既有 handler）。路径一律经 Filesystem 的 resolvePath / resolveMutationPath /
+	// remotePathWithinRoot 与 Git 侧的 validateGitPath 校验，出不了项目根；
+	// 引用（ref / branch / startPoint）只能来自服务端列出的引用或严格校验的 SHA，
+	// 不接受任意 revision 表达式。**不提供任何 Shell、命令执行、任意 `git` 子命令
+	// 或任意 URL 转发能力。**
+	//
+	// 它存在的理由是手机端要能查看/编辑项目文件、并完成受控的 Git 操作，
+	// 而这条通道是唯一一条不把文件内容与 diff 落进云端库的路径 —— 详见 docs/40、docs/41
+	// 与 remote_relay.go 顶部。改动这个命名空间的边界时，必须同时更新这段说明：
+	// 一句已经失实的"这里只有控制类元数据"比没有注释更危险。
 	r.Route("/api/remote", func(remote chi.Router) {
 		remote.Use(s.remoteAgentOnly)
 		remote.Post("/credentials", s.updateRemoteCredentials)
@@ -1058,6 +1091,8 @@ func (s *Server) routes() http.Handler {
 		remote.Post("/pairing/confirm", s.confirmRemotePairing)
 		remote.Get("/pairing/status", s.remotePairingStatus)
 		remote.Get("/agent-status", s.remoteAgentStatus)
+		remote.Get("/bindings", s.remoteBindings)
+		remote.Post("/bindings/revoke", s.remoteRevokeBindings)
 		remote.Post("/status", s.updateRemoteStatus)
 		remote.Get("/outbox", s.remoteOutbox)
 		remote.Post("/outbox/ack", s.ackRemoteOutbox)
@@ -1065,12 +1100,18 @@ func (s *Server) routes() http.Handler {
 		remote.Post("/commands", s.enqueueRemoteCommand)
 		remote.Get("/commands/{commandID}", s.getRemoteCommand)
 		remote.Patch("/commands/{commandID}", s.updateRemoteCommand)
+		// 手机端的远程调用（文件 + Git）。Agent 只把帧原样转给这一个端点，
+		// op 到具体 handler 的映射留在本进程（唯一一份名单，就地校验）。
+		remote.Post("/rpc", s.relayRPCRequest)
 	})
 	if s.config.Mode == "desktop-api" && s.config.SessionToken != "" {
 		r.Post("/api/internal/shutdown", s.shutdown)
 	}
 	r.Get("/api/preferences", s.getAppPreferences)
 	r.Patch("/api/preferences", s.updateAppPreferences)
+	// 工具目录：平台支持哪些 AI CLI 工具、每个工具叫什么、支持哪些权限模式。
+	// 前端一律读它，不再自己维护名单（见 agent_catalog.go 的说明）。
+	r.Get("/api/agents", s.listAgents)
 	r.Get("/api/runners", s.listRunners)
 	r.Get("/api/runners/{runnerID}/status", s.runnerStatus)
 	r.Get("/api/runners/{runnerID}/agent-capability", s.runnerAgentCapability)
@@ -1089,6 +1130,28 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/agent-profiles/{profileID}/disable", s.disableAgentProfile)
 	r.Post("/api/agent-profile-revisions/{revisionID}/revoke", s.revokeAgentProfileRevision)
 	r.Get("/api/agent-profile-revisions/{revisionID}/revocation-job", s.getRevocationJob)
+	// 泛化路由：工具由 URL 参数指定，后端查目录。前端一律用这条，
+	// 新增工具时不必再为它加一对路径（也不必在界面里把工具名映射成路径段）。
+	r.Post("/api/runners/{runnerID}/agents/{agentID}/check-update", s.checkAgentStatus)
+	r.Post("/api/runners/{runnerID}/agents/{agentID}/install", s.installAgentStatus)
+	r.Post("/api/runners/{runnerID}/agents/{agentID}/update", s.updateAgentStatus)
+	r.Post("/api/runners/{runnerID}/agents/{agentID}/login", s.runAgentLogin)
+	r.Get("/api/runners/{runnerID}/agents/{agentID}/login-status", s.agentLoginStatus)
+	// 托管 Node 运行时：它是工具的前置，不是目录里的工具，所以单独一组路由。
+	r.Get("/api/runtimes/catalog", s.listRuntimeCatalog)
+	r.Post("/api/runners/{runnerID}/runtime/install", s.installRuntime)
+	// 某个 Runner 上"运行时 + 每个工具"的状态汇总：管理页唯一的数据来源。
+	r.Get("/api/runners/{runnerID}/agents", s.listRunnerAgents)
+	// 跨端安装的逐主机授权与审计（默认关、可撤销）。
+	r.Post("/api/runners/{runnerID}/remote-install/grant", s.grantRunnerInstall)
+	r.Delete("/api/runners/{runnerID}/remote-install/grant", s.revokeRunnerInstall)
+	r.Get("/api/runners/{runnerID}/install-audit", s.listInstallAuditHandler)
+	// 故障诊断与修复（docs/43）。诊断**只读**、不进列表热路径（它要跑多次子进程、
+	// 扫目录、读审计）；修复是写操作，走与安装/升级同一套闸门。
+	r.Get("/api/runners/{runnerID}/agents/{agentID}/diagnose", s.diagnoseAgentHandler)
+	r.Get("/api/runners/{runnerID}/diagnostics", s.listRunnerDiagnostics)
+	r.Post("/api/runners/{runnerID}/agents/{agentID}/repair", s.repairAgentHandler)
+	// 过渡路由：内部委托给上面两条，仅服务尚未切换的旧前端。切换完成后删除。
 	r.Post("/api/runners/{runnerID}/claude/check-update", s.checkClaudeUpdate)
 	r.Post("/api/runners/{runnerID}/claude/update", s.updateClaude)
 	r.Post("/api/runners/{runnerID}/codex/check-update", s.checkCodexUpdate)
@@ -1116,6 +1179,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/git/branches", s.gitBranches)
 	r.Get("/api/projects/{projectID}/git/operations", s.gitOperations)
 	r.Post("/api/projects/{projectID}/git/stage", s.gitStage)
+	r.Post("/api/projects/{projectID}/git/init", s.gitInit)
 	r.Post("/api/projects/{projectID}/git/unstage", s.gitUnstage)
 	r.Post("/api/projects/{projectID}/git/stage-all", s.gitStageAll)
 	r.Post("/api/projects/{projectID}/git/unstage-all", s.gitUnstageAll)
@@ -1144,6 +1208,9 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/insights/cancel", s.cancelInsightScan)
 	r.Post("/api/projects/{projectID}/insights/verify", s.verifyInsightFindings)
 	r.Post("/api/projects/{projectID}/insights/to-task", s.addInsightToTasks)
+	// 批量删除：body 给 findingIds（删选中的）或 scope（open/invalidated/dismissed/all），
+	// 两者都不给一律 400 —— 语义见 insights.go insightDeleteRequest。
+	r.Post("/api/projects/{projectID}/insights/delete", s.deleteInsightFindings)
 	r.Get("/api/projects/{projectID}/insights", s.listInsights)
 	r.Delete("/api/projects/{projectID}/insights/{findingID}", s.deleteInsightFinding)
 	r.Patch("/api/projects/{projectID}/insights/{findingID}", s.updateInsightFinding)
@@ -1822,6 +1889,12 @@ create index if not exists messages_conversation_primary_created on messages(con
 	if err := s.migrateNotifications(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateAgentInstallations(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateRunnerInstallGrants(ctx); err != nil {
+		return err
+	}
 	return s.migrateGit(ctx)
 }
 
@@ -1951,12 +2024,8 @@ func validPermissionMode(mode string) bool {
 	return mode == "approval_required" || mode == "full_control" || mode == "read_only" || mode == "workspace_write"
 }
 
-func validAgentPolicy(agentID, policy string) bool {
-	if agentID == "codex" {
-		return policy == "read_only" || policy == "workspace_write" || policy == "full_control"
-	}
-	return agentID == "claude-code" && (policy == "approval_required" || policy == "full_control")
-}
+// validAgentPolicy 现在读工具目录（agent_catalog.go），因为"某个工具支持哪些权限
+// 模式"与"支持哪些工具"是同一类事实，必须只有一份。
 
 func (c Conversation) sessionID() string {
 	if c.AgentSessionID != "" {
@@ -2250,8 +2319,8 @@ func (s *Server) validateProject(w http.ResponseWriter, r *http.Request) {
 			"agentReady":    claudeReady || codexReady,
 			"performance":   "remote",
 			"runnerName":    meta.Name,
-			"claudeVersion": normalizeClaudeVersion(sshR.Version(r.Context())),
-			"codexVersion":  normalizeCodexVersion(sshR.CodexVersion(r.Context())),
+			"claudeVersion": agentVersionFromOutput(sshR.Version(r.Context())),
+			"codexVersion":  agentVersionFromOutput(sshR.CodexVersion(r.Context())),
 		})
 		return
 	}
@@ -2306,10 +2375,9 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if !sshR.Ready(r.Context()) {
-			writeError(w, http.StatusBadRequest, errors.New("远程服务器上 Claude Code 不可用"))
-			return
-		}
+		// 不在加载时强制要求远端已装 Claude：环境不可用时项目照常登记，就绪度如实回落，
+		// 用户后续可在 CLI 工具管理页安装。claudeReady 仍在下方写入项目行。
+		claudeReady := sshR.Ready(r.Context())
 		branch, gitReady := "", false
 		if out, err := sshR.client.execCommand(r.Context(), fmt.Sprintf("cd %s && git rev-parse --abbrev-ref HEAD 2>/dev/null", shellQuote(path))); err == nil {
 			branch = strings.TrimSpace(string(out))
@@ -2332,9 +2400,9 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			Runner:      runnerID,
 			RunnerID:    runnerID,
 			GitBranch:   branch,
-			ClaudeReady: true,
+			ClaudeReady: claudeReady,
 			CodexReady:  codexReady,
-			AgentReady:  true, // Claude Code is confirmed ready above
+			AgentReady:  claudeReady || codexReady,
 			CreatedAt:   time.Now().UTC(),
 		}
 		s.decorateProjectPresentation(&p)
@@ -2371,10 +2439,8 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	branch, gitReady := gitBranch(r.Context(), path)
 	target := s.resolveAgentTargetEnv(runnerID, path)
 	claudeReady, codexReady := s.agentCLIReady(r.Context(), target)
-	if !claudeReady && !codexReady {
-		writeError(w, http.StatusBadRequest, errors.New("该 Runner 环境中 Claude Code 与 Codex CLI 均不可用或未登录"))
-		return
-	}
+	// 不在加载时强制要求本机已装 Claude/Codex：环境不可用时项目照常登记，就绪度如实回落，
+	// 用户后续可在 CLI 工具管理页安装，或直接加载空目录/非 git 项目。
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		name = filepath.Base(path)
@@ -2950,6 +3016,8 @@ func (s *Server) StartBackgroundMaintenance() {
 	// 数十秒），不能让它排在历史裁剪后面，否则用户第一次点开 WSL 项目时它还没跑完。
 	s.startWSLKeepAlive()
 	s.startEventRetentionLoop()
+	// 出队表也要有上界：投递不出去的事件若无限堆积，会拖住整个中继（见该文件的说明）。
+	s.startRemoteOutboxRetentionLoop()
 	go func() {
 		if err := s.pruneConversationHistories(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[maintenance] prune conversation history: %v", err)
@@ -3642,7 +3710,10 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
 		messages[left], messages[right] = messages[right], messages[left]
 	}
-	eventQuery := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=?`
+	// 分页只走可回放事件：过程遥测（stream_event、thinking_tokens 等）一条都渲染不出来，
+	// 却能让 hasMore 永远为真 —— 界面上"加载更早记录"按钮就再也点不掉。详见
+	// replayableEventsPredicate。
+	eventQuery := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=? and ` + replayableEventsPredicate("events")
 	eventArgs := []any{id}
 	if cursor.Event != nil {
 		eventQuery += ` and (created_at < ? or (created_at = ? and id < ?))`
@@ -3697,6 +3768,8 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 			activeRunID = &runID
 		}
 	}
+	// hasMore 的语义是"还有更早的**内容**可以翻"，两端都按这个口径算：messages 取不到更多、
+	// 可回放事件也取不到更多时它才是 false。客户端据此显示"加载更早记录"按钮。
 	hasMore := hasMoreMessages || hasMoreEvents
 	if !hasMore {
 		nextCursor = conversationPageCursor{}
@@ -4853,6 +4926,9 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	isSSH := strings.HasPrefix(projectRunner, "ssh-")
 	runnerObj := s.runner // default to the server-level runner (tests may replace it)
 	switch {
+	case conversation.AgentID == "codebuddy":
+		// CodeBuddy 走本机独立 runner（StreamingAgentRunner，多回合流式会话）。
+		runnerObj = s.codebuddyRunner
 	case conversation.AgentID == "codex" && isSSH:
 		r, ok := s.runnerRegistry.get(projectRunner)
 		if !ok {
@@ -4896,6 +4972,9 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 	if conversation.AgentID == "claude-code" && !runnerObj.Ready(ctx) {
 		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Claude Code")
+	}
+	if conversation.AgentID == "codebuddy" && !runnerObj.Ready(ctx) {
+		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "CodeBuddy Code")
 	}
 	streamingRunner, streaming := runnerObj.(StreamingAgentRunner)
 	// Codex runs one-shot turns (non-streaming) even on SSH runners, which
@@ -6205,7 +6284,9 @@ func (s *Server) broadcastConversationEvent(event Event) {
 
 // enqueueConversationEvent keeps agent output independent from WebSocket I/O.
 // A slow client is removed once its bounded queue is full; it can reconnect and
-// recover durable events through the conversation HTTP endpoint.
+// recover durable events through the conversation HTTP endpoint. That endpoint
+// replays only the events a client can render, so process telemetry dropped here
+// is not recovered — nothing reads it (see replayableEventsPredicate).
 func (s *Server) enqueueConversationEvent(conversationID string, data []byte) {
 	toClose := make([]*subscriber, 0)
 	s.mu.Lock()
@@ -6795,58 +6876,15 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 		if m.Host != "" {
 			entry["host"] = m.Host
 		}
-		// Fetch Claude version from each runner.
-		if runner, ok := s.runnerRegistry.get(m.ID); ok {
-			v := runner.Version(r.Context())
-			status := "ready"
-			if v == "" {
-				status = "unavailable"
-			}
-			// Reflect in-progress updates so the frontend can show "更新中...".
-			s.runnerMaintenanceMu.Lock()
-			if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "claude-code"}] {
-				status = "updating"
-			}
-			s.runnerMaintenanceMu.Unlock()
-			claudeEntry := map[string]any{
-				"status":  status,
-				"version": v,
-			}
-			entry["claude"] = claudeEntry
+		// 探测目录里每个工具的状态。两个旧字段由 agents[] **派生**（同源），
+		// 不再各自探测一遍 —— 原先这里与 runnerStatus 是两段近乎逐行重复的代码。
+		_, runnerRegistered := s.runnerRegistry.get(m.ID)
+		agents := s.probeAgents(r.Context(), m)
+		entry["agents"] = agents
+		for key, value := range legacyAgentFields(agents, runnerRegistered) {
+			entry[key] = value
 		}
-		codexStatus := "unavailable"
-		codexVersion := ""
-		codexReason := ""
-		if isLocalRunnerID(m.ID) {
-			if s.codexRunner.Ready(r.Context()) {
-				codexStatus = "ready"
-				codexVersion = s.codexRunner.Version(r.Context())
-			} else {
-				codexReason = "本机 Codex CLI 未安装或未登录"
-			}
-		} else if runner, ok := s.runnerRegistry.get(m.ID); ok {
-			if codexR, ok := runner.(CodexCapableRunner); ok {
-				if codexR.CodexReady(r.Context()) {
-					codexStatus = "ready"
-					codexVersion = codexR.CodexVersion(r.Context())
-				} else {
-					codexReason = "远程服务器上 Codex CLI 未安装或未登录"
-				}
-			} else {
-				codexReason = "此 Runner 不支持 Codex"
-			}
-		}
-		s.runnerMaintenanceMu.Lock()
-		if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "codex"}] {
-			codexStatus = "updating"
-			codexReason = ""
-		}
-		s.runnerMaintenanceMu.Unlock()
-		entry["codex"] = map[string]string{
-			"status":  codexStatus,
-			"version": codexVersion,
-			"reason":  codexReason,
-		}
+
 		result = append(result, entry)
 	}
 	if result == nil {
@@ -6885,118 +6923,23 @@ func (s *Server) runnerStatus(w http.ResponseWriter, r *http.Request) {
 	if m.Host != "" {
 		entry["host"] = m.Host
 	}
-	// Claude and Codex probes are independent and may each invoke a remote
-	// process. Run them concurrently so a slow environment does not add their
-	// individual probe timeouts together.
-	type claudeProbe struct {
-		version string
-		ok      bool
+	// 工具之间互相独立，且每个探测都可能拉起一个远端进程。probeAgents 内部并发跑，
+	// 因此一个慢环境不会把各工具的超时串起来累加。
+	_, runnerRegistered := s.runnerRegistry.get(m.ID)
+	agents := s.probeAgents(r.Context(), m)
+	entry["agents"] = agents
+	for key, value := range legacyAgentFields(agents, runnerRegistered) {
+		entry[key] = value
 	}
-	type codexProbe struct {
-		status  string
-		version string
-		reason  string
-	}
-	var claude claudeProbe
-	codex := codexProbe{status: "unavailable"}
-	var probes sync.WaitGroup
-	if runner, ok := s.runnerRegistry.get(m.ID); ok {
-		probes.Add(1)
-		go func() {
-			defer probes.Done()
-			claude.version = runner.Version(r.Context())
-			claude.ok = claude.version != ""
-		}()
-	}
-	probes.Add(1)
-	go func() {
-		defer probes.Done()
-		if isLocalRunnerID(m.ID) {
-			if s.codexRunner.Ready(r.Context()) {
-				codex.status = "ready"
-				codex.version = s.codexRunner.Version(r.Context())
-			} else {
-				codex.reason = "本地 Codex CLI 未安装或未登录"
-			}
-			return
-		}
-		runner, ok := s.runnerRegistry.get(m.ID)
-		if !ok {
-			return
-		}
-		codexR, ok := runner.(CodexCapableRunner)
-		if !ok {
-			codex.reason = "此 Runner 不支持 Codex"
-			return
-		}
-		if codexR.CodexReady(r.Context()) {
-			codex.status = "ready"
-			codex.version = codexR.CodexVersion(r.Context())
-		} else {
-			codex.reason = "远程服务器上 Codex CLI 未安装或未登录"
-		}
-	}()
-	probes.Wait()
-	if _, ok := s.runnerRegistry.get(m.ID); ok {
-		status := "ready"
-		if !claude.ok {
-			status = "unavailable"
-		}
-		s.runnerMaintenanceMu.Lock()
-		if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "claude-code"}] {
-			status = "updating"
-		}
-		s.runnerMaintenanceMu.Unlock()
-		entry["claude"] = map[string]string{"status": status, "version": claude.version}
-	}
-	codexStatus, codexVersion, codexReason := codex.status, codex.version, codex.reason
-	s.runnerMaintenanceMu.Lock()
-	if s.runnerUpdating[runnerAgentKey{runnerID: m.ID, agentID: "codex"}] {
-		codexStatus, codexReason = "updating", ""
-	}
-	s.runnerMaintenanceMu.Unlock()
-	entry["codex"] = map[string]string{"status": codexStatus, "version": codexVersion, "reason": codexReason}
+
 	writeJSON(w, http.StatusOK, entry)
-}
-
-func (s *Server) checkClaudeUpdate(w http.ResponseWriter, r *http.Request) {
-	runnerID := chi.URLParam(r, "runnerID")
-	runner, ok := s.runnerRegistry.get(runnerID)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("runner not found"))
-		return
-	}
-	s.checkAgentUpdate(w, r, runner)
-}
-
-func (s *Server) checkCodexUpdate(w http.ResponseWriter, r *http.Request) {
-	runnerID := chi.URLParam(r, "runnerID")
-	if isLocalRunnerID(runnerID) {
-		s.checkAgentUpdate(w, r, s.codexRunner)
-		return
-	}
-	runner, ok := s.runnerRegistry.get(runnerID)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("runner not found"))
-		return
-	}
-	codexR, ok := runner.(CodexCapableRunner)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("此 Runner 不支持 Codex"))
-		return
-	}
-	s.checkAgentUpdate(w, r, codexRunnerAdapter{codexR})
 }
 
 func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner AgentRunner) {
 	// autoUpdatable 区分"可应用内自动更新"与"有新版本但仅能到目标环境手动更新"。
-	// 缺省视为支持（本地 / SSH runner）；跨端 runner（wsl-local 等）实现
-	// autoUpdateSupportedRunner 并返回 false，前端据此不再给出点了必失败的更新按钮，
-	// 也不会把"无法自动升级"误渲染成"已是最新版本"。
-	autoUpdatable := true
-	if ar, ok := runner.(autoUpdateSupportedRunner); ok {
-		autoUpdatable = ar.AutoUpdateSupported()
-	}
+	// 判据只有一处（agentAutoUpdatable）—— 管理页读的是同一个，两处各判一次
+	// 就会对同一件事给出相反结论（一处给按钮、一处说"需手动更新"）。
+	autoUpdatable := agentAutoUpdatable(runner)
 	available, latestVersion, err := runner.CheckUpdate(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
@@ -7013,36 +6956,6 @@ func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner
 		"currentVersion":  runner.Version(r.Context()),
 		"latestVersion":   latestVersion,
 	})
-}
-
-func (s *Server) updateClaude(w http.ResponseWriter, r *http.Request) {
-	runnerID := chi.URLParam(r, "runnerID")
-	runner, ok := s.runnerRegistry.get(runnerID)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("runner not found"))
-		return
-	}
-
-	s.updateAgent(w, r, runnerID, "claude-code", "Claude Code", runner)
-}
-
-func (s *Server) updateCodex(w http.ResponseWriter, r *http.Request) {
-	runnerID := chi.URLParam(r, "runnerID")
-	if isLocalRunnerID(runnerID) {
-		s.updateAgent(w, r, runnerID, "codex", "Codex", s.codexRunner)
-		return
-	}
-	runner, ok := s.runnerRegistry.get(runnerID)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("runner not found"))
-		return
-	}
-	codexR, ok := runner.(CodexCapableRunner)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("此 Runner 不支持 Codex"))
-		return
-	}
-	s.updateAgent(w, r, runnerID, "codex", "Codex", codexRunnerAdapter{codexR})
 }
 
 // codexRunnerAdapter exposes a CodexCapableRunner (e.g. an SSH runner) through
@@ -7071,57 +6984,128 @@ func (a codexRunnerAdapter) AutoUpdateSupported() bool {
 	return true
 }
 
-func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, agentID, agentName string, runner AgentRunner) {
-	// Serialize updates with run admission. startMessage keeps this lock until
-	// its run record is committed, closing the check-then-start race.
+// beginAgentMaintenance 是安装与升级**共用**的闸门。
+//
+// 三件事必须一起做，而且必须在同一处做（原先只有 updateAgent 里有，安装若各写
+// 一份就一定会有一条路忘记检查活跃会话）：
+//  1. 与 run admission 串行（startMessage 会持有同一把锁直到 run 记录落库，
+//     从而关掉"检查通过之后、任务又起来了"这个窗口）；
+//  2. 拒绝有活跃会话/排队运行的环境，并**给出具体数量**而不是笼统的"忙"；
+//  3. 登记维护状态，让界面能显示"更新中…"。
+//
+// 返回的第二个值为 false 时表示响应已经写好，调用方直接 return 即可。
+func (s *Server) beginAgentMaintenance(w http.ResponseWriter, r *http.Request, runnerID, agentID, agentName string) (func(), bool) {
 	maintenanceKey := runnerAgentKey{runnerID: runnerID, agentID: agentID}
 	s.runnerMaintenanceMu.Lock()
 	if s.runnerUpdateExecuting[runnerID] {
 		s.runnerMaintenanceMu.Unlock()
 		writeError(w, http.StatusConflict, errors.New("another AI CLI is already being updated on this runner"))
-		return
+		return nil, false
 	}
 
-	var active bool
-	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from runs where agent_runtime_id=? and agent_id=? and status in ('queued','running'))`, runnerID, agentID).Scan(&active); err != nil {
+	// 运行时是所有工具的**前置**：换 node 会影响这台机器上任何一个正在跑的工具，
+	// 所以这一档的活跃检查要比"这个工具自己"宽一档。否则对话正在跑时照样放行，
+	// 而到位动作（mv node）会在会话底下把运行时换掉。
+	anyAgent := agentID == runtimeAgentID
+	var active int
+	var activeErr error
+	if anyAgent {
+		activeErr = s.db.QueryRowContext(r.Context(),
+			`select count(*) from runs where agent_runtime_id=? and status in ('queued','running')`, runnerID).Scan(&active)
+	} else {
+		activeErr = s.db.QueryRowContext(r.Context(),
+			`select count(*) from runs where agent_runtime_id=? and agent_id=? and status in ('queued','running')`, runnerID, agentID).Scan(&active)
+	}
+	if err := activeErr; err != nil {
 		s.runnerMaintenanceMu.Unlock()
 		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, false
 	}
-	if active {
+	if active > 0 {
 		s.runnerMaintenanceMu.Unlock()
-		writeError(w, http.StatusConflict, fmt.Errorf("cannot update %s while this runner has active conversations", agentName))
-		return
+		writeError(w, http.StatusConflict, fmt.Errorf("cannot update %s while this runner has %d active or queued run(s)", agentName, active))
+		return nil, false
 	}
 	s.mu.Lock()
 	for _, session := range s.sessions {
-		if session.runnerID == runnerID && (session.agentID == agentID || (session.agentID == "" && agentID == "claude-code")) {
+		if session.runnerID == runnerID && (anyAgent || session.agentID == agentID || (session.agentID == "" && agentID == "claude-code")) {
 			s.mu.Unlock()
 			s.runnerMaintenanceMu.Unlock()
 			writeError(w, http.StatusConflict, fmt.Errorf("cannot update %s while this runner has an active session", agentName))
-			return
+			return nil, false
 		}
 	}
 	s.mu.Unlock()
 	s.runnerUpdateExecuting[runnerID] = true
 	s.runnerUpdating[maintenanceKey] = true
 	s.runnerMaintenanceMu.Unlock()
-	defer func() {
+	return func() {
 		s.runnerMaintenanceMu.Lock()
 		delete(s.runnerUpdateExecuting, runnerID)
 		delete(s.runnerUpdating, maintenanceKey)
 		s.runnerMaintenanceMu.Unlock()
-	}()
+	}, true
+}
+
+// crossUpdateUsesNpmInstall 回答"这次跨端升级会不会走 npm 重装"。
+//
+// 只有平台自己装的（登记为 npm 类）才走重装 —— 那与 install 是同一条代码路径，
+// 所以也要过同一道授权闸门。用户用官方安装器装的仍走 CLI 自带的 update，
+// 那是本次改动之前就有的行为，不在此列。
+func (s *Server) crossUpdateUsesNpmInstall(ctx context.Context, runnerID, agentID string) bool {
+	if isLocalRunnerID(runnerID) {
+		return false
+	}
+	recorded, hasRecord, err := s.recordedInstallation(ctx, runnerID, agentID)
+	if err != nil {
+		// 读不到登记时**保守地要求授权**：这一档只影响"要不要过闸门"，
+		// 取安全方向（多要一次授权）比放行一个可能会走 npm 重装的操作要好。
+		return true
+	}
+	if !hasRecord {
+		return false
+	}
+	return recorded.InstallKind == installKindNpmManaged || recorded.InstallKind == installKindNpmSystem
+}
+
+func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, agentID, agentName string, runner AgentRunner) {
+	if s.crossUpdateUsesNpmInstall(r.Context(), runnerID, agentID) && !s.remoteInstallAllowed(r.Context(), runnerID) {
+		writeError(w, http.StatusForbidden, fmt.Errorf("尚未授权在 %s 上安装；请先在该主机上确认一次", runnerID))
+		return
+	}
+	release, ok := s.beginAgentMaintenance(w, r, runnerID, agentID, agentName)
+	if !ok {
+		return
+	}
+	defer release()
 
 	updateCtx, cancel := context.WithTimeout(s.runtimeCtx, s.config.agentUpdateTimeout())
 	defer cancel()
-	previousVersion, currentVersion, err := runner.Update(updateCtx)
+	previousVersion, currentVersion, err := s.performAgentUpdate(updateCtx, runnerID, agentID, runner)
 	if err != nil {
+		// 升级同样要留痕：跨端升级会在目标环境里重跑 npm（或执行 CLI 自带的 update），
+		// 与安装是同一量级的写操作。
+		_ = s.recordInstallAudit(updateCtx, installAuditEntry{
+			RunnerID: runnerID, AgentID: agentID, Action: "update",
+			FromVersion: previousVersion, Result: "failed", Detail: errorText(err),
+		})
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success":         false,
 			"previousVersion": previousVersion,
 			"currentVersion":  currentVersion,
 			"error":           errorText(err),
+		})
+		return
+	}
+	if err := s.recordInstallAudit(updateCtx, installAuditEntry{
+		RunnerID: runnerID, AgentID: agentID, Action: "update",
+		FromVersion: previousVersion, ToVersion: currentVersion, Result: "succeeded",
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"success":         false,
+			"previousVersion": previousVersion,
+			"currentVersion":  currentVersion,
+			"error":           errorText(fmt.Errorf("升级已完成（%s → %s），但审计记录写入失败：%w", previousVersion, currentVersion, err)),
 		})
 		return
 	}
@@ -7814,4 +7798,104 @@ func (s *Server) closeAllRunLogSubscribers() {
 		}(sub)
 	}
 	closeWG.Wait()
+}
+
+// performAgentUpdate 按"该工具当前是怎么装上的"选升级路径（docs/42 §6.3）。
+//
+// 平台（或系统 npm）装的 → 直接重装最新版：布局是我们能算出来的，确定性最高，
+// 而且与"安装"走同一条代码，于是不存在两条路行为不一致的可能。
+// 只有**用户自己用官方安装器装的**才交给 CLI 自带的 update —— 那种布局我们不知道，
+// 硬去猜会猜错，而猜错的表现是"升级之后跑不起来"。
+//
+// 注意这里**不**做闸门：调用方（updateAgent / installAgentFor）已经持有了。
+func (s *Server) performAgentUpdate(ctx context.Context, runnerID, agentID string, runner AgentRunner) (string, string, error) {
+	// 平台装的（登记为 npm 类）一律走"重装最新版"：布局是我们定的，直接指定包与
+	// 版本确定性最高，而且 install 与 update 变成同一条代码路径（docs/42 §6.3）。
+	// 用户自己装的走 CLI 自带的 update —— 那是既有行为，不在这里动。
+	recorded, hasRecord, err := s.recordedInstallation(ctx, runnerID, agentID)
+	if err != nil {
+		// 读不到登记就不知道"这份工具是怎么装上的"，也就不知道能不能接管升级 ——
+		// 这时**不能**退化成"让 CLI 自己 update"（那可能改错东西），如实报错。
+		return "", "", err
+	}
+	if hasRecord && (recorded.InstallKind == installKindNpmManaged || recorded.InstallKind == installKindNpmSystem) {
+		installation, err := s.installAgentCLIFor(ctx, runnerID, agentID, "latest")
+		if err != nil {
+			// 登记了版本但升级失败时，previous 仍要如实报出来。
+			return recorded.Version, "", err
+		}
+		return recorded.Version, installation.Version, nil
+	}
+	return runner.Update(ctx)
+}
+
+// installAgentFor 是 POST /api/runners/{runnerID}/agents/{agentID}/install。
+//
+// 与升级共用同一个闸门与同一条 npm 路径；差别只有"允许指定版本"这一点，
+// 而版本号要过白名单（parseSemver）才允许拼进命令。
+func (s *Server) installAgentFor(w http.ResponseWriter, r *http.Request, runnerID, agentID string) {
+	entry, ok := agentByID(agentID)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("不支持的工具 %s", agentID))
+		return
+	}
+	if !entry.SupportsInstall {
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("%s 不在平台内安装", entry.Name))
+		return
+	}
+	// 跨端安装 = 在别人的机器上执行任意 npm 包代码并落一整套运行时，因此**必须**
+	// 先有逐主机授权（docs/42 §9.1）。界面不给按钮不等于 API 会拒绝 —— 闸门只能
+	// 落在服务端这一侧，否则"逐主机授权"就只是一句界面文案。
+	if !s.remoteInstallAllowed(r.Context(), runnerID) {
+		writeError(w, http.StatusForbidden, fmt.Errorf("尚未授权在 %s 上安装；请先在该主机上确认一次", runnerID))
+		return
+	}
+	var request struct {
+		Version string `json:"version"`
+	}
+	if !decodeOptional(w, r, &request) {
+		return
+	}
+
+	release, ok := s.beginAgentMaintenance(w, r, runnerID, agentID, entry.Name)
+	if !ok {
+		return
+	}
+	defer release()
+
+	installCtx, cancel := context.WithTimeout(s.runtimeCtx, s.config.agentUpdateTimeout())
+	defer cancel()
+	// 审计的 from 要读**这次操作之前**的版本：原先两端都填安装结果，
+	// 审计里看不出"从哪个版本换到了哪个版本"。
+	previousVersion := ""
+	if recorded, _, err := s.recordedInstallation(installCtx, runnerID, agentID); err == nil {
+		previousVersion = recorded.Version
+	}
+
+	installation, err := s.installAgentCLIFor(installCtx, runnerID, agentID, request.Version)
+	if err != nil {
+		// 失败也留痕：往一台机器上装东西失败，与成功一样需要可追溯 ——
+		// 尤其是跨端（那是别人的生产机器）。
+		_ = s.recordInstallAudit(installCtx, installAuditEntry{
+			RunnerID: runnerID, AgentID: agentID, Action: "install",
+			FromVersion: previousVersion, Result: "failed", Detail: errorText(err),
+		})
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.recordInstallAudit(installCtx, installAuditEntry{
+		RunnerID: runnerID, AgentID: agentID, Action: "install",
+		FromVersion: previousVersion, ToVersion: installation.Version, Result: "succeeded",
+	}); err != nil {
+		// 说清"已经装好了、只是没记上"：否则用户会以为失败而重装一遍。
+		writeError(w, http.StatusInternalServerError,
+			fmt.Errorf("%s 已安装（%s），但审计记录写入失败：%w", entry.Name, installation.Version, err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":     true,
+		"version":     installation.Version,
+		"binaryPath":  installation.BinaryPath,
+		"installKind": installation.InstallKind,
+	})
 }

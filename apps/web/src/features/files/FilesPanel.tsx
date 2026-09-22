@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
 import { ProjectFileTree } from "./ProjectFileTree";
-import { FileViewer } from "./FileViewer";
+import { FileViewer, type FileViewerMedia } from "./FileViewer";
 import { FileEditor } from "./FileEditor";
 import { FileTabs } from "./FileTabs";
 import type { FileContent, FileInfo, OpenFile } from "./file-model";
 import { detectLanguage, getDirPath, isEditableFile } from "./file-model";
 import { getPreviewKind, isTextPreview } from "./source-language";
+import { contentOmittedFrom } from "./mobile-fs-request";
 import { FileIcon } from "./FileIcon";
 import { useCodeFontSize } from "./useCodeFontSize";
 import type { NavigationGuard } from "../../components/ProjectLayout";
@@ -23,6 +24,27 @@ interface FilesPanelProps {
   initialPath?: string | null;
   // initialPath 被消费后回调，让持有方清掉它（避免下次进入又打开同一个文件）。
   onInitialPathConsumed?: () => void;
+  // 手机端才传的两个能力，见 FileViewer 的 props 说明。
+  media?: FileViewerMedia;
+  disableDownload?: boolean;
+  /**
+   * 手机端布局。它决定三件事：编辑器开软换行 + 软键盘避让、不给下载入口、
+   * 以及"保存"按钮不带 Ctrl+S 后缀（手机上没有那个键）。
+   */
+  mobile?: boolean;
+  ref?: Ref<FilesPanelHandle>;
+}
+
+/**
+ * 让外层（手机页）能替安卓返回键"退一层"。
+ *
+ * 面板内部的"文件列表 ⇄ 查看器"是它自己的状态，外层看不见；而返回键的顺序是
+ * 目录 → 视图 → 最小化。把这件事暴露成一个方法，比在外层猜一个布尔量再回传进去可靠：
+ * 面板永远是那个知道"现在还有没有上一层"的地方。
+ */
+export interface FilesPanelHandle {
+  /** 退出查看器回到文件列表。返回 false 表示已经在文件列表上（外层该退整个视图了）。 */
+  showTree: () => boolean;
 }
 
 const MAX_OPEN_TABS = 10;
@@ -51,6 +73,10 @@ export function FilesPanel({
   registerNavigationGuard,
   initialPath,
   onInitialPathConsumed,
+  media,
+  disableDownload,
+  mobile,
+  ref,
 }: FilesPanelProps) {
 	const workspaceQuery = conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : "";
 	// 记忆化：它被三个提交回调写在依赖里，每次渲染都换新函数会让那三个回调白重建，
@@ -82,6 +108,15 @@ export function FilesPanel({
   const [isSaving, setIsSaving] = useState(false);
   const [pendingDiscard, setPendingDiscard] = useState<{ files: OpenFile[]; proceed: () => void } | null>(null);
   const [mobileView, setMobileView] = useState<"tree" | "editor">("tree");
+  // 返回键要能"退一层"，但"现在到底有没有上一层"只有这里知道 ——
+  // 外层拿不到 mobileView，也不该去猜一个布尔量再回传进来。
+  useImperativeHandle(ref, () => ({
+    showTree: () => {
+      if (mobileView === "tree") return false;
+      setMobileView("tree");
+      return true;
+    },
+  }), [mobileView]);
   // 刷新文件树：只重新拉取发生变化的目录，避免整棵树折叠、丢失滚动位置
   const treeRefreshRef = useRef<((dirPath?: string, preferPath?: string) => void) | null>(null);
   const dialogRef = useRef<HTMLElement | null>(null);
@@ -203,9 +238,20 @@ export function FilesPanel({
       try {
 		const stat = await request<FileInfo>(withWorkspace(`/api/projects/${projectId}/fs/stat?path=${encodeURIComponent(path)}`));
         const previewKind = getPreviewKind(name, stat.isText, stat.mimeType, stat.size);
-        const res = isTextPreview(previewKind)
-		  ? await request<FileContent>(withWorkspace(`/api/projects/${projectId}/fs/read?path=${encodeURIComponent(path)}`))
-          : null;
+        // 读内容。手机端有一条**桌面端不存在**的正常结局：服务端按上限决定不给内容
+        // （文件太大 / 不是文本）。那不是失败，所以不能让它落进下面的 catch 变成一个
+        // 红字提示 —— 而要记成"只给元信息"的标签页。见 OpenFile.omitted。
+        let res: FileContent | null = null;
+        let omitted: OpenFile["omitted"];
+        if (isTextPreview(previewKind)) {
+          try {
+            res = await request<FileContent>(withWorkspace(`/api/projects/${projectId}/fs/read?path=${encodeURIComponent(path)}`));
+          } catch (error) {
+            const reason = contentOmittedFrom(error);
+            if (!reason) throw error;
+            omitted = reason;
+          }
+        }
         const lang = detectLanguage(name);
         const newFile: OpenFile = {
           path,
@@ -218,6 +264,12 @@ export function FilesPanel({
           stat: res?.stat ?? stat,
           previewKind,
           contentLoaded: Boolean(res),
+          omitted,
+          // 服务端对"能不能改"的判定（只有手机端会给）。少了这两行，那条
+          // 256–320 KiB 的只读带就形同不存在：界面会照 `isEditableFile` 亮出
+          // 「编辑」，用户改完按保存才失败。见 FileContent.editable。
+          editable: res?.editable,
+          readOnlyReason: res?.readOnlyReason,
         };
 
         // 超出上限且无可关闭的干净标签时拒绝打开
@@ -644,6 +696,7 @@ export function FilesPanel({
                 onSave={saveFile}
                 onCancel={cancelEdit}
                 fontSize={fontSize}
+                mobile={mobile}
               />
             ) : (
               <FileViewer
@@ -651,9 +704,15 @@ export function FilesPanel({
                 content={activeFile.content}
                 stat={activeFile.stat}
                 previewKind={activeFile.previewKind}
+                omittedMessage={activeFile.omitted?.message}
+                editable={activeFile.editable}
+                readOnlyReason={activeFile.readOnlyReason}
                 projectId={projectId}
                 conversationId={conversationId}
                 request={request}
+                media={media}
+                disableDownload={disableDownload}
+                mobile={mobile}
                 onEdit={enterEditMode}
                 readOnly={readOnly}
                 fontSize={fontSize}

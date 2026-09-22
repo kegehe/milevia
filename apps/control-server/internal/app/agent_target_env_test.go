@@ -179,28 +179,32 @@ func (s *stubRunner) CheckUpdate(context.Context) (bool, string, error) {
 }
 func (s *stubRunner) Update(context.Context) (string, string, error) { return "", "", nil }
 
-// TestNormalizeAgentVersions 验证 version 归一化剥除 CLI 自带前后缀，
-// 确保跨端 runner 裸输出不会把 " (Claude Code)"/"codex-cli " 带进前端展示。
-func TestNormalizeAgentVersions(t *testing.T) {
+// TestAgentVersionFromOutputUnwrapsProductNameOnEitherSide 验证版本号提取对
+// "产品名在前" 与 "产品名在后" 两种真实输出都成立。
+//
+// 输入全部是**实测抓到的真实输出**：Claude 的产品名在后、Codex 的在前。
+// 这条用例之所以重要，是因为它覆盖的正是曾经出过的事故：目录里那份配置按"后缀"剥，
+// 于是 Codex 静默不生效 —— 界面显示 0.155.1，登记表里是 "codex-cli 0.155.1"。
+func TestAgentVersionFromOutputUnwrapsProductNameOnEitherSide(t *testing.T) {
 	cases := []struct {
 		name string
-		fn   func(string) string
 		in   string
 		want string
 	}{
-		{name: "claude bare", fn: normalizeClaudeVersion, in: "2.1.216", want: "2.1.216"},
-		{name: "claude with suffix", fn: normalizeClaudeVersion, in: "2.1.216 (Claude Code)", want: "2.1.216"},
-		{name: "claude with suffix and whitespace", fn: normalizeClaudeVersion, in: "  2.1.216 (Claude Code)  ", want: "2.1.216"},
-		{name: "claude empty", fn: normalizeClaudeVersion, in: "", want: ""},
-		{name: "codex bare", fn: normalizeCodexVersion, in: "0.1.0", want: "0.1.0"},
-		{name: "codex with prefix", fn: normalizeCodexVersion, in: "codex-cli 0.1.0", want: "0.1.0"},
-		{name: "codex with prefix and whitespace", fn: normalizeCodexVersion, in: "  codex-cli 0.1.0  ", want: "0.1.0"},
-		{name: "codex empty", fn: normalizeCodexVersion, in: "", want: ""},
+		{name: "claude 真实输出（产品名在后）", in: "2.1.266 (Claude Code)", want: "2.1.266"},
+		{name: "claude 带空白", in: "  2.1.266 (Claude Code)  \n", want: "2.1.266"},
+		{name: "codex 真实输出（产品名在前）", in: "codex-cli 0.155.1", want: "0.155.1"},
+		{name: "codex 带空白", in: "  codex-cli 0.155.1  ", want: "0.155.1"},
+		{name: "已经是纯版本号", in: "2.1.216", want: "2.1.216"},
+		{name: "预发布版", in: "codex-cli 0.156.0-alpha.14", want: "0.156.0-alpha.14"},
+		{name: "node 的 v 前缀", in: "v24.21.0", want: "24.21.0"},
+		{name: "空输出保持为空", in: "", want: ""},
+		{name: "读不出格式时原样返回（不编一个值）", in: "unknown", want: "unknown"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := c.fn(c.in); got != c.want {
-				t.Errorf("normalize(%q) = %q; want %q", c.in, got, c.want)
+			if got := agentVersionFromOutput(c.in); got != c.want {
+				t.Errorf("agentVersionFromOutput(%q) = %q; want %q", c.in, got, c.want)
 			}
 		})
 	}

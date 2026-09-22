@@ -47,8 +47,9 @@ func TestWSLProbeCacheFirstCallProbesSynchronously(t *testing.T) {
 	if !runner.codexReady(context.Background()) {
 		t.Fatal("first probe should report ready")
 	}
-	if got := runner.codexVersion(context.Background()); got != "codex-cli 0.153.2" {
-		t.Fatalf("version = %q, want %q", got, "codex-cli 0.153.2")
+	// codexVersion 在源头就归一化（产品名在前的形态也一样剥掉）。
+	if got := runner.codexVersion(context.Background()); got != "0.153.2" {
+		t.Fatalf("version = %q, want %q", got, "0.153.2")
 	}
 	// 就绪与版本共用同一个探测键，第二次调用必须命中缓存。
 	if got := probe.callCount(); got != 1 {
@@ -79,7 +80,7 @@ func TestWSLProbeCacheStaleValueReturnedWithoutBlocking(t *testing.T) {
 	runner.codexVersion(context.Background())
 
 	// 把条目改成过期，并让下一次真实探测卡住，便于断言请求线程没有被拖住。
-	staleValue := "codex-cli 1.0.0"
+	staleValue := "1.0.0"
 	gate := make(chan struct{})
 	probe.gate = gate
 	probe.value = "codex-cli 2.0.0"

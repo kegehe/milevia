@@ -140,6 +140,17 @@
 .git-empty { display: grid; min-height: 280px; place-items: center; }
 .git-list-empty { padding: 24px 16px; }
 
+/* 非 git 项目的「初始化 Git 仓库」空态。 */
+.git-init-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 320px; padding: 24px; text-align: center; color: #5f7a6e; }
+.git-init-empty-mark { display: grid; place-items: center; width: 46px; height: 46px; border-radius: 50%; color: #2c7567; background: #e8f4ee; }
+.git-init-empty-mark > svg { width: 24px; height: 24px; }
+.git-init-empty h3 { margin: 0; color: #2c3e37; font-size: 15px; }
+.git-init-empty p { margin: 0; max-width: 340px; font-size: 12px; line-height: 1.6; }
+.git-init-empty .primary { min-height: 34px; border-radius: 6px; padding: 0 16px; font-size: 13px; font-weight: 700; border-color: #267b67; color: #f8fdf9; background: #2c7567; margin-top: 4px; }
+.git-init-empty .primary:hover:not(:disabled) { border-color: #1c5b4d; background: #1f6556; }
+.git-init-empty .primary:disabled { border-color: #c9d6ce; color: #809188; background: #dce7df; }
+.git-init-empty-note { color: #86988f; font-size: 11px; }
+
 .git-conflict-banner { display: flex; align-items: center; gap: 10px; border: 1px solid #ebc6bd; border-radius: 7px; padding: 10px 13px; color: #8a2d22; background: #fff6f3; font-size: 12px; }
 .git-conflict-banner b { flex: none; }
 .git-conflict-banner span { color: #9d4636; }
@@ -513,3 +524,278 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
   .git-conflict-banner-actions { width: 100%; margin-left: 0; }
   .git-conflict-solve-toolbar .primary { margin-left: 0; }
 }
+
+/* ── 手机端（GitWorkbench 的 mobile 变体，见 docs/41 §6.2）─────────────────────
+   每条都用 `[data-mobile="true"]` 限定，且用**两段选择器**而不是靠书写位置：
+   桌面端一个字都不变，胜负由特异性决定、与 import 顺序无关。
+
+   390px 的屏本来就会命中上面那个 680px 断点（它已经把两栏压成一栏），
+   所以这里只补"手机应用"与"窄浏览器"不同的那几件事 —— 不要重复那一段。 */
+
+/* diff 必须**软换行**。基准样式是 `white-space: pre` + `min-width: max-content`（横向滚），
+   在手机上每一行都会拖出去一屏；而行首还有两列行号，实际可用宽度更窄。
+   这与文件查看器是同一条约定：手机上看代码不能靠横向滚（第 40 篇为它栽过一次）。 */
+.git-workbench[data-mobile="true"] .git-diff-code { overflow-x: hidden; }
+.git-workbench[data-mobile="true"] .git-diff-line { grid-template-columns: 36px 36px 16px minmax(0, 1fr); min-width: 0; }
+/* 行号的盒子是固定列宽 + border-box：内边距直接决定"几位数放得下"。
+   手机上收紧成 7/3（content 26px）⇒ 11px 等宽的四位数也放得下。 */
+.git-workbench[data-mobile="true"] .git-diff-line .git-diff-number { padding: 0 7px 0 3px; }
+.git-workbench[data-mobile="true"] .git-diff-line code { padding-right: 10px; white-space: pre-wrap; word-break: break-word; }
+/* ⚠️ meta / hunk 行必须**单独还原成单列**。
+   它们的两列行号与前缀是 `display: none`，剩下的 code 会被自动放进**第 1 列**；
+   上面那条四列模板的特异性（0,3,0）高于基准里的 `.git-diff-line.meta`（0,2,0），
+   所以不还原的话，这两行的正文会被塞进 34px 那一列、按字符折断成
+   `a/sr` / `c/lo` 这种样子 —— 而软换行那条断言**照样通过**（挤窄了当然不溢出）。
+   这条是看截图发现的，不是断言发现的。 */
+.git-workbench[data-mobile="true"] .git-diff-line.meta,
+.git-workbench[data-mobile="true"] .git-diff-line.hunk { grid-template-columns: minmax(0, 1fr); }
+
+/* 变更条目在手机上**不要**退化成上下两行。
+   680px 断点把 `.git-change-list > div` 压成了一列，于是每个文件占两行
+   （路径一行、操作图标一行）—— 三个文件就白吃 108px，而这一屏正是要"一眼扫完改了什么"。
+   两列（路径 1fr + 操作 auto）在 390px 上放得下：路径是 `text-overflow: ellipsis` 的。 */
+.git-workbench[data-mobile="true"] .git-change-list > div { grid-template-columns: minmax(0, 1fr) auto; }
+
+/* 两级推进：详情（diff / 冲突解决）开着时，列表整块让位 —— 而不是排在它上面 300px 处，
+   让用户以为"点了文件却什么都没发生"。 */
+.git-changes-view[data-mobile="true"] { gap: 12px; }
+.git-changes-view[data-mobile="true"] .git-changes-sidebar { overflow: visible; }
+.git-workbench[data-mobile="true"] .git-changes-content { flex-direction: column; }
+.git-workbench[data-mobile="true"][data-detail="open"] .git-changes-sidebar { display: none; }
+
+/* 操作记录的筛选：手机端用胶囊替代原生 <select>（那个的弹层由系统绘制、样式管不到）。 */
+.git-ops-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.git-ops-chips button { border: 1px solid #d5e4dc; border-radius: 999px; padding: 4px 11px; color: #4a6559; background: #fff; font-size: 12px; line-height: 1.5; cursor: pointer; transition: background 160ms ease, color 160ms ease, border-color 160ms ease; }
+.git-ops-chips button[aria-pressed="true"] { border-color: #2b7c52; color: #fff; background: #2b7c52; }
+
+/* 冲突总览读不到时的说明行：它必须与"冲突横幅"长得不一样 ——
+   两者说的是完全不同的事（一个是我们没读到，一个是仓库真的有冲突）。 */
+.git-conflict-unavailable { display: grid; gap: 3px; border: 1px solid #e5d9c0; border-radius: 7px; padding: 10px 12px; background: #fdf8ec; }
+.git-conflict-unavailable b { color: #8a5a1e; font-size: 12px; }
+.git-conflict-unavailable span { color: #7d6a4a; font-size: 11px; line-height: 1.6; }
+
+/* ── 手机端外壳（MobileGitPanel）──────────────────────────────────────────────
+   错误与提示**长在 Git 视图自己的地盘里**，不走页面级那条 `.mobile-error`。
+   理由不是审美：`MobileRemotePage` 里已经有三处记录了同一件事 ——
+   页面级那条在弹层遮罩之下，用户根本看不到（见 docs/41 §6.2）。
+   两者还要**长得不一样**：红的是"这次操作失败了"，中性的是"已为你处理，请继续"。 */
+.mobile-git { display: flex; min-height: 0; flex: 1; flex-direction: column; }
+.mobile-git-error, .mobile-git-notice { display: flex; align-items: flex-start; gap: 8px; flex: none; margin: 0 12px 8px; border-radius: 7px; padding: 9px 11px; font-size: 12px; line-height: 1.6; }
+.mobile-git-error { border: 1px solid #ecc9c0; color: #8a2d22; background: #fff6f3; }
+.mobile-git-notice { border: 1px solid #cfe0d6; color: #2b6a52; background: #f1f8f4; }
+.mobile-git-error span, .mobile-git-notice span { min-width: 0; flex: 1; }
+.mobile-git-error button, .mobile-git-notice button { flex: none; display: grid; width: 28px; height: 28px; margin: -4px -5px -4px 0; place-items: center; border: 0; color: inherit; background: none; font-size: 18px; line-height: 1; cursor: pointer; }
+
+/* ── 手机端的排版尺度（390×844 实测后定）─────────────────────────────────────
+   实测值 → 改后值（都在手机上量过，桌面上不变）：
+
+     变更行路径 12px→13、状态标签 10px→11、分组计数 10px→11
+     diff 代码 11px→13（与文件查看器的代码字号 13px 同一档）
+     分组图标按钮 28×28→34×34、GitBar 的刷新/记录 32×32→40×40
+     变更行右侧的操作按钮 36 宽→40 宽、行内边距 11→12
+     页签 34 高→38 高、胶囊 28 高→34 高
+     操作记录弹层的「审计记录」小标签 9px→11px（9px 在手机上几乎读不出来）
+
+   两条为什么不改：
+     · **提交面板的 textarea 保持 16px** —— 小于 16px 的输入框在 iOS 上获得焦点会
+       触发整页缩放（`mobile-remote.css` 里对同一件事有注释）。
+     · **`.git-bar-actions` 的「拉取/获取/推送」由 16px 降到 14px**：它们与「提交」
+       现在是同一个字号，看不出主次；高度不减（padding 补回来），热区仍是 40px。
+
+   为什么全部用 `[data-mobile="true"]`：那段 680px 断点也命中"桌面端被拖窄的窗口"，
+   在那里不动字号才是对的。两段选择器的特异性也天然盖过基准样式，与书写位置无关。 */
+
+/* ① 正文层级：能读清。 */
+.git-workbench[data-mobile="true"] .git-bar-label { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-sync-badge { font-size: 12px; }
+/* 这一条只管三颗**文字**按钮（拉取/获取/推送）。它的选择器也会命中同排的两颗图标
+   按钮，那两颗在 ④ 段里显式把 padding 压回 0 —— 见那里的说明。 */
+.git-workbench[data-mobile="true"] .git-bar-actions button { padding: 10px 14px; font-size: 14px; }
+.git-workbench[data-mobile="true"] .git-tab-list button { height: 38px; font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-change-list b { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-change-kind { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-change-list small { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-group-actions > span { min-width: 22px; height: 22px; border-radius: 11px; font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-commit-panel > label { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-commit-panel footer span { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-diff-placeholder h3 { font-size: 15px; }
+.git-workbench[data-mobile="true"] .git-diff-placeholder p { font-size: 13px; }
+
+/* ② 冲突相关的说明文字：它是"仓库出事了"的那条信息，不能小。 */
+.git-workbench[data-mobile="true"] .git-conflict-banner { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-conflict-banner b { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-conflict-banner-actions button { padding: 7px 13px; font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-conflict-unavailable b { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-conflict-unavailable span { font-size: 12px; }
+
+/* ③ diff 阅读区：11px 的代码在手机上要凑近看。基准是 `font: 12px/1.65`，
+   680px 断点把它压到 11px；这里按**文件查看器的代码字号**（13px）对齐。
+
+   ⚠️ 行号必须**显式**压回 11px：它跟着 `.git-diff-code` 继承，代码一涨它就一起涨，
+   而 `.git-diff-number` 是固定列宽 + `box-sizing: border-box` ⇒ 13px 等宽下**三位数**
+   就会顶出盒子、溢到左边那一列去。行号内边距与列宽的调整跟着上面那几条
+   `.git-diff-line` 规则一起写（收紧成 7/3、两列 34→36px：content 26px，四位数也放得下）。 */
+.git-workbench[data-mobile="true"] .git-diff-code { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-diff-line { min-height: 22px; }
+.git-workbench[data-mobile="true"] .git-diff-line .git-diff-number { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-diff-line.meta,
+.git-workbench[data-mobile="true"] .git-diff-line.hunk { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-diff header span { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-diff header b { font-size: 13px; }
+
+/* ④ 触控尺寸：手指不是鼠标。 */
+.git-workbench[data-mobile="true"] .git-icon-btn { width: 34px; height: 34px; border-radius: 8px; }
+.git-workbench[data-mobile="true"] .git-change-list > div > button:first-child { padding: 12px 13px 12px 14px; }
+.git-workbench[data-mobile="true"] .git-change-list .git-inline-actions .git-inline-icon { width: 40px; min-width: 40px; }
+.git-workbench[data-mobile="true"] .git-close { width: 34px; height: 34px; }
+
+/* ⑤ 操作记录弹层。 */
+.git-workbench[data-mobile="true"] .git-ops-popover > header span { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-ops-popover > header h3 { font-size: 15px; }
+.git-workbench[data-mobile="true"] .git-ops-popover > header .git-confirmation-close { width: 32px; height: 32px; min-width: 32px; flex-basis: 32px; }
+.git-workbench[data-mobile="true"] .git-ops-chips button { padding: 6px 13px; font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-ops-load-more { padding: 13px; font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-operations b { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-operations p,
+.git-workbench[data-mobile="true"] .git-operations small { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-operations time { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-operation-status { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-history b { font-size: 14px; }
+.git-workbench[data-mobile="true"] .git-history span,
+.git-workbench[data-mobile="true"] .git-history code { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-branch-toolbar button { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-branch-group-title { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-branches small { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-branch-switch-btn { padding: 5px 11px; font-size: 11px; }
+
+/* ⑥ 冲突解决视图：它整屏都是"看懂这段差异"的活，字号不能比正文小。 */
+.git-workbench[data-mobile="true"] .git-conflict-solve-head span { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-conflict-state { padding: 3px 10px; font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-conflict-solve-meta { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-conflict-nav button { width: 30px; height: 30px; }
+.git-workbench[data-mobile="true"] .git-conflict-nav span { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-conflict-solve-toolbar button { padding: 7px 13px; font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-conflict-ai > header > span { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-conflict-ai-status { padding: 3px 10px; font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-conflict-ai-hint,
+.git-workbench[data-mobile="true"] .git-conflict-ai-explanation { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-conflict-ai footer button { padding: 7px 13px; font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-conflict-block-no { font-size: 11px; }
+/* AI 模型的胶囊行（手机端专用，替代原生 `<select>`；桌面端那一支仍是下拉）。
+   尺寸与间距跟着同一排的按钮走（上面 `.git-conflict-solve-toolbar button` 那条），
+   这里只补选中态 —— 用 aria-pressed 当样式钩子，不新造裸类名。 */
+.git-workbench[data-mobile="true"] .git-conflict-ai-launch { flex-wrap: wrap; }
+.git-workbench[data-mobile="true"] .git-conflict-ai-agents { display: inline-flex; gap: 6px; }
+.git-workbench[data-mobile="true"] .git-conflict-ai-agents button[aria-pressed="true"] { border-color: #267b67; color: #fff; background: #2c7567; }
+
+/* 提交历史「读不到」那一档（与「这条分支没有提交」是两件事）。
+   卡片式而不是一行灰字：空态里有下一步动作（点顶部刷新重试）。 */
+.git-history-error { display: grid; gap: 3px; border: 1px solid #e5d9c0; border-radius: 7px; padding: 10px 12px; background: #fdf8ec; }
+.git-history-error b { color: #8a5a1e; font-size: 12px; }
+.git-history-error span { color: #7d6a4a; font-size: 11px; line-height: 1.6; }
+.git-history-error small { color: #8a7a5e; font-size: 11px; }
+.git-history-error-inline { margin: 0; border-top: 1px solid #eadfc8; padding: 9px 12px; color: #8a5a1e; background: #fdf8ec; font-size: 11px; line-height: 1.6; }
+.git-workbench[data-mobile="true"] .git-history-error b { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-history-error span,
+.git-workbench[data-mobile="true"] .git-history-error small,
+.git-workbench[data-mobile="true"] .git-history-error-inline { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-conflict-block-actions button { padding: 7px 11px; font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-conflict-editor > header { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-conflict-nontext p { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-conflict-nontext button { padding: 7px 13px; font-size: 12px; }
+
+/* ⑦ 确认弹层：它是"按下去就不可撤销"的那一层，读数与按钮都要最大方。 */
+.git-workbench[data-mobile="true"] .git-confirmation-dialog > header span { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-confirmation-body { font-size: 14px; }
+.git-workbench[data-mobile="true"] .git-confirmation-risk p { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-confirmation-scope > span { font-size: 11px; }
+.git-workbench[data-mobile="true"] .git-confirmation-scope small { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-confirmation-check { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-confirmation-check input { width: 20px; height: 20px; }
+.git-workbench[data-mobile="true"] .git-confirmation-dialog > footer button { min-height: 42px; font-size: 14px; }
+
+/* ⑧ 会话子态的错误/提示条。 */
+.mobile-git-error, .mobile-git-notice { font-size: 13px; }
+
+/* ⑨ 顺序：手机端把**提交面板放到两组列表之后**。
+   它在 DOM 里夹在「已暂存」与「工作区」之间（桌面端两栏并排时那样最合理），
+   但在单列的手机上，一个 266px 高的提交框会把工作区列表顶到屏幕外面 ——
+   "改了哪些文件"要往下滑一屏才看得到。`order` 只改视觉顺序，不动 DOM。 */
+.git-workbench[data-mobile="true"] .git-changes-sidebar > .git-commit-panel { order: 1; }
+
+/* ⑩ 没选文件时，手机端把整个「文件内容」区收掉。
+   两个理由，一个是文案、一个是布局：
+     · 占位提示写的是"从**左侧**工作区或已暂存列表中点击文件" —— 单列布局里没有左侧，
+       而这块又排在提交面板**之后**（要滑过整屏才看到），提示指的方向还是错的；
+     · 680px 断点给它 `min-height: 300px` 带边框 ⇒ 收不掉的话末尾永远挂着一个空白大盒子。
+   `:has()` 这个文件里已经在用（`.git-conflict-block-panes:has(.base)`）。
+   选文件之后这里渲染的是 diff / 冲突解决视图，那时 `:has()` 为假，照常显示。 */
+.git-workbench[data-mobile="true"] .git-changes-content:has(> .git-diff-placeholder) { display: none; }
+
+/* ⑪ 冲突横幅在手机上**竖着排**：它是 `display: flex` 的一行（桌面端标题与说明并排），
+   在 334px 里说明文字只剩 150px 宽、要折三行。改成列之后两行说明各占满整行，
+   "已完成"那一档的两个按钮也跟着占满（680px 断点已经给了 width: 100%）。 */
+.git-workbench[data-mobile="true"] .git-conflict-banner { flex-direction: column; align-items: flex-start; gap: 5px; }
+.git-workbench[data-mobile="true"] .git-conflict-banner.finished { flex-wrap: nowrap; }
+
+/* ── 左基线统一 + 顶端收成一块（2026-09-21 第二轮：布局）──────────────────────
+   量出来的事实：一屏里有**三条**左基线 —— 外壳底座 12；`.git-bar` 与 `.git-tab-list`
+   的内容 24；而内容卡片在 **28**（12 + `.git-workbench-body` 的 16）。
+   单看每一处都"有理由"，合起来就是"没对齐"。现在：
+     · body 的左右内边距收到 12 ⇒ 卡片落在 **24**，与顶栏内容、页签内容同一条线；
+     · 卡片内部另用卡片自己的内边距（标题 15 / 行 14）⇒ 全屏只剩"外 24 / 内 38"两条线。
+   同一次调整里把顶端三行收成**一块**（去掉中间那条分隔线）。 */
+.git-workbench[data-mobile="true"] .git-workbench-body { padding-right: 12px; padding-left: 12px; }
+/* 顶栏与页签本来就是同一块顶端区，中间那条线只是把三行切成两段 —— 去掉它，
+   并把页签条自带的浅底改成与顶栏同色：于是"分支 + 动作 + 页签"是一整块白，
+   只有**一条**线把它和内容分开（页签自带的那条）。 */
+.git-workbench[data-mobile="true"] .git-bar { border-bottom: 0; }
+.git-workbench[data-mobile="true"] .git-tabs { background: #fff; }
+/* 页签条的内边距在 680px 断点被收成 `padding-left: 8px` ⇒ 第一颗页签落在 20，
+   而卡片与顶栏内容在 24 —— 差 4px，眼睛不一定看得出，但"缩进不齐"就是这么来的。
+   回到 12，让三者的左边界落在同一条线上。（这条是**探针量出来的**，不是看出来的。） */
+.git-workbench[data-mobile="true"] .git-tab-list { padding-right: 12px; padding-left: 12px; }
+/* 「当前引用」这个标签与那截 OID 在手机上是噪音：下一行已经写着分支名了，
+   而 OID 的含义是"点一下复制完整 ID"，看不出来得先点（技能菜单位里也看不到完整值）。 */
+.git-workbench[data-mobile="true"] .git-bar-label,
+.git-workbench[data-mobile="true"] .git-bar-name code.git-oid { display: none; }
+/* 一行五颗按钮：三颗文字按钮**等分**、两颗图标按钮**定宽**，高度统一到 40。
+   （原来字数按钮 39、图标按钮 36，且三颗文字按钮宽度跟着字数走。） */
+.git-workbench[data-mobile="true"] .git-bar-actions { flex-wrap: nowrap; }
+.git-workbench[data-mobile="true"] .git-bar-actions > button { display: inline-flex; min-height: 40px; align-items: center; justify-content: center; }
+.git-workbench[data-mobile="true"] .git-bar-actions > button.secondary { min-width: 0; flex: 1 1 0; }
+/* ⚠️ 图标按钮必须**显式**把内边距压回 0。
+   上面 ①「`.git-bar-actions button { padding: 10px 14px }`」是为了给三颗**文字**按钮
+   撑够热区，但它的选择器也命中了这两颗图标按钮（特异性 (0,3,0) 高于基准的 `padding: 0`）。
+   两个都设 width/height + 全局 border-box ⇒ 内容区只剩 `40 − 14×2 − 1×2 = 10px`，
+   而图标是 16px —— **实测 svg 被压成 10.0×16.0**（横向压扁、非等比）。
+   我原来的溢出判据没抓到它：图标是"被压缩"而不是"溢出"，`svgOverflowX` 量出来是 0。
+   ⇒ 这类问题的判据要量**宽高比对不对**，不是量有没有超出。 */
+.git-workbench[data-mobile="true"] .git-bar-actions .git-refresh,
+.git-workbench[data-mobile="true"] .git-bar-actions .git-ops-trigger { width: 40px; height: 40px; flex: 0 0 40px; padding: 0; border-radius: 8px; }
+
+/* 详情层的两行标题并成一行（"工作区差异 src/long.ts" 本来就该在一条线上读）；
+   并把「← 变更列表」从"一颗带边框的按钮"降成**低调的返回链接** ——
+   它是导航，没必要和内容卡片抢同样的视觉重量。 */
+.git-workbench[data-mobile="true"] .git-diff > header div { display: flex; align-items: baseline; gap: 8px; }
+/* 这条是 `.git-mobile-back` 的**唯一**定义。原先它有三处：一条无 `[data-mobile]` 限定的
+   基础样式、④ 段里的"按钮形态"、以及这里 —— 后两条互相覆盖，留下"padding 被这里盖掉、
+   min-height 仍来自 ④ 段"的半生效状态。**半死的规则最容易被误读**（读代码的人会以为
+   padding 还是 8px 14px）。元素只在手机端渲染（`{mobile && …}`），所以限定 `[data-mobile]`
+   是准确的；`min-height: 36px` 保留垂直热区，`padding: 0` 让左边界与卡片内容同在 24。 */
+.git-workbench[data-mobile="true"] .git-mobile-back { display: inline-flex; min-height: 36px; align-items: center; align-self: flex-start; margin: 0 0 6px; border: 0; border-radius: 6px; padding: 0; color: #2c7567; background: none; font-size: 13px; font-weight: 700; cursor: pointer; }
+/* 外层 `.git-changes-content` 在手机端是**多余的盒子**：里面装的 diff / 冲突视图自己就有边框
+   （它俩是并列的两种详情），而 680px 断点还给它 min-height: 300px —— 短 diff 下面会空出一截。
+   去掉外层边框与最小高度，"← 变更列表"就落在卡片**外面**，不再套一层。 */
+.git-workbench[data-mobile="true"] .git-changes-content { min-height: 0; border: 0; border-radius: 0; background: transparent; }
+/* ⚠️ 上面那条把外层收掉之后，**边框必须补回给里面的卡片**：
+   `.git-changes-content > .git-diff` 与 `.git-conflict-solve` 在基准样式里是
+   `border: 0`（故意让外层提供那一圈边）。只删外层不补里层，详情卡片会整片"没有边" ——
+   源码断言查不出来（两边都在），是**看截图**发现的（第一版就漏了这一步）。 */
+.git-workbench[data-mobile="true"] .git-changes-content > .git-diff,
+.git-workbench[data-mobile="true"] .git-changes-content > .git-conflict-solve { overflow: hidden; border: 1px solid #d5e4dc; border-radius: 7px; }
+
+/* 提交区的主次：原来两颗**通栏**按钮叠在一起（还都可能是禁用的灰），分不出谁是主。
+   「提交」保持通栏主按钮；「修改最近一次提交」降成一条低调的文字按钮。 */
+.git-workbench[data-mobile="true"] .git-commit-panel { padding: 14px; }
+.git-workbench[data-mobile="true"] .git-commit-actions .git-amend-btn { min-height: 36px; border-color: transparent; color: #4a7a6a; background: transparent; font-size: 13px; font-weight: 650; }

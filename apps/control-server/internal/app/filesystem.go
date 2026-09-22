@@ -41,6 +41,15 @@ type FileEntry struct {
 	IsDir   bool   `json:"isDir"`
 	Size    int64  `json:"size,omitempty"`
 	ModTime string `json:"modTime,omitempty"`
+
+	// Children 只在 /fs/tree 带 depth>1 时出现（见 fs_tree.go）。桌面端的扁平
+	// 调用不传 depth，这两个字段都不会出现，行为逐字节不变。
+	//
+	// 两个字段都带 omitempty：空切片被省略而不是编成 null，调用方按
+	// `children ?? []` 处理即可。判据分工是明确的 —— children 缺席且 unreadable
+	// 为 false 就是**空目录**，unreadable 为 true 才是**读不到**。
+	Children   []FileEntry `json:"children,omitempty"`
+	Unreadable bool        `json:"unreadable,omitempty"`
 }
 
 // FileInfo 文件元信息。

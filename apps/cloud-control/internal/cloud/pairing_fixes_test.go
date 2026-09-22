@@ -103,3 +103,28 @@ func TestAgentOriginAllowedKeepsNonBrowserClientsWorking(t *testing.T) {
 		t.Fatal("a foreign origin must be rejected")
 	}
 }
+
+// 平台是**闭集**，不是自由文本。它会被渲染到电脑端屏幕上，也会被存进库里，
+// 所以"手机报什么就存什么"是不行的 —— 这一条测试守的就是那道收口。
+// 空串是**正常结果**（旧版手机端压根不上报这个字段），不是错误。
+func TestSanitizePlatformKeepsAClosedSet(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want string
+	}{
+		{"android", "android"},
+		{"Android", "android"},
+		{"  IOS  ", "ios"},
+		{"web", "web"},
+		// 不上报 / 不认识的一律塌成空串：电脑端据此整行不渲染，而不是显示一个空格子。
+		{"", ""},
+		{"   ", ""},
+		{"windows", ""},
+		{"android; drop table cloud_access_tokens", ""},
+		{"<script>", ""},
+	} {
+		if got := sanitizePlatform(test.raw); got != test.want {
+			t.Fatalf("sanitizePlatform(%q) = %q, want %q", test.raw, got, test.want)
+		}
+	}
+}

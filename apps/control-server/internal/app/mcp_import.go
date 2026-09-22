@@ -345,10 +345,7 @@ func buildImportCandidate(originalName string, server claudeMCPServer, scope, pr
 
 // collectCodexImportCandidates 调用 `codex mcp list --json` 取得 Codex 侧 server 清单。
 func (s *Server) collectCodexImportCandidates(ctx context.Context) ([]mcpImportCandidate, string, bool) {
-	binary := strings.TrimSpace(s.config.CodexPath)
-	if binary == "" {
-		binary = "codex"
-	}
+	binary := strings.TrimSpace(s.agentBinary("codex"))
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, binary, "mcp", "list", "--json")
@@ -609,10 +606,7 @@ func (s *Server) lookupImportValues(ctx context.Context, candidate mcpImportCand
 }
 
 func (s *Server) codexImportValues(ctx context.Context, name string) (map[string]string, map[string]string, bool) {
-	binary := strings.TrimSpace(s.config.CodexPath)
-	if binary == "" {
-		binary = "codex"
-	}
+	binary := strings.TrimSpace(s.agentBinary("codex"))
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, binary, "mcp", "list", "--json")

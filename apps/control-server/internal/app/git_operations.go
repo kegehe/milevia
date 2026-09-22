@@ -209,6 +209,42 @@ func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, gitSummaryResponse{GitSnapshot: snapshot, ObservedAt: observedAt, StateToken: token})
 }
 
+// gitInit 在项目目录初始化一个 Git 仓库（git init -b main）。
+//
+// 与其它 Git 写操作不同，init 面向**尚无仓库状态**的场景（非 git / 空目录项目），
+// 没有既有的 stateToken 或工作区租约可验，故不走 executeGitOperationForWorkspace；
+// 用 gitRunnerForProject（仅依赖 projectID，不依赖 workspace）解析仓库路径，
+// 适合全新空项目。操作是幂等的：已是仓库时 git init 返回成功。
+// 成功后把探测到的分支名写回项目行，供列表/标签页/工作台一致显示。
+func (s *Server) gitInit(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	// 与删除/建工作区串行，避免初始化过程中项目被删除留下孤立 .git。
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
+	runner, repo, err := s.gitRunnerForProject(r.Context(), projectID)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	if _, err := runner.runGit(r.Context(), repo, "init", "-b", "main"); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("git init: %w", err))
+		return
+	}
+	// unborn HEAD 时 symbolic-ref 仍返回初始分支名（main）。
+	branch := ""
+	if out, err := runner.runGit(r.Context(), repo, "symbolic-ref", "--short", "HEAD"); err == nil {
+		branch = strings.TrimSpace(string(out))
+	}
+	if branch == "" {
+		branch = "非 Git 目录"
+	}
+	if _, err := s.db.ExecContext(r.Context(), `update projects set git_branch=? where id=?`, branch, projectID); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("update project git branch: %w", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"gitBranch": branch, "gitReady": true})
+}
+
 func (s *Server) gitChanges(w http.ResponseWriter, r *http.Request) {
 	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {

@@ -1,0 +1,326 @@
+/* ── 电脑端「远程控制」页（2026-09-17，方案 B「两栏工作台」）─────────────────────
+   这一屏是**桌面管理页**，只由 `!mobileApp` 那一支渲染（见 MobileRemotePage.tsx 里
+   `<main className={`mobile-remote${mobileApp ? "" : " desktop-remote"}`}>` 那一段）。
+   手机页那套 `.mobile-*` 骨架照旧服务手机端，两边不共用布局。
+
+   三条硬约束：
+
+   ① **类名一律带 `desktop-remote-` 前缀，不写裸词。** 这一页与手机页共用同一个组件，
+      `.error` / `.empty` / `.card` 这种裸词会与 mobile-remote.css 里的同名类串味
+      （那套表里已经有 `.mobile-status` 这类只差一个前缀的类名）。变体一律走 `data-*`
+      属性选择器（`data-state` / `data-tone` / `data-ready` / `data-done`），不另造类名。
+
+   ② **覆盖手机页的规则要用两段选择器。** `.mobile-remote` / `.mobile-refresh-status` /
+      `.mobile-pairing-notice` 这些在 mobile-remote.css 里都是 (0,1,0)，而本文件在它之后
+      引入；写成 `.mobile-remote.desktop-remote .x`（0,2,0）就与引入顺序无关 ——
+      以后谁调整 import 顺序都不会让这一页塌回 860px 的卡片列。
+
+   ③ **页头/内容列与设置页、Agent 档案页同源**：`min(1120px, calc(100% - 48px))` +
+      `min-height: 96px` 页头 + `border-bottom: 1px #cfe0d6`。别再退回手机页那套
+      30px 大标题 + 圆形返回胶囊 —— 同一个应用里两种"页"的语言不一样，用户会以为
+      点错了地方（本轮审计的 C1/C2）。 */
+
+.mobile-remote.desktop-remote { padding: 0 0 72px; }
+
+/* 页头 ─────────────────────────────────────────────────────────────────────── */
+.desktop-remote-header {
+  display: flex;
+  width: min(1120px, calc(100% - 48px));
+  min-height: 96px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin: 0 auto;
+  border-bottom: 1px solid #cfe0d6;
+}
+.desktop-remote-head-main { display: flex; min-width: 0; align-items: center; gap: 14px; }
+/* 36px 返回**方块**（不是手机页的 38px 圆胶囊）：设置页的 .settings-back 就是这个尺寸，
+   两处保持一致，用户在管理页之间来回走才不会觉得换了套皮肤。 */
+.desktop-remote-back {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  place-items: center;
+  border: 1px solid #c8dcd1;
+  border-radius: 7px;
+  padding: 0;
+  color: #31594f;
+  background: #f7fbf8;
+}
+.desktop-remote-back:hover:not(:disabled) { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
+.desktop-remote-back:focus-visible { outline: 2px solid #f6be4e; outline-offset: 2px; }
+.desktop-remote-head-text { min-width: 0; }
+.desktop-remote-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #5c8174;
+  font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .6px;
+}
+.desktop-remote-kicker svg { width: 13px; height: 13px; flex: none; }
+.desktop-remote-head-text h1 { margin: 6px 0 0; color: #19332c; font-size: 24px; line-height: 1.15; }
+.desktop-remote-head-actions { display: flex; flex: none; align-items: center; gap: 10px; }
+
+/* 服务状态胶囊。五档各有一个色，**"未注册"和"读不到"必须长得不一样** ——
+   前者是要用户去注册的事实，后者是本机服务没响应的故障。 */
+.desktop-remote-service {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #c8ded2;
+  border-radius: 999px;
+  padding: 6px 12px;
+  color: #216b58;
+  background: #e6f5ec;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.desktop-remote-led { width: 8px; height: 8px; flex: none; border-radius: 999px; background: #3fa87a; }
+.desktop-remote-service[data-state="loading"] { border-color: #cfded6; color: #567468; background: #f4f8f6; }
+.desktop-remote-service[data-state="loading"] .desktop-remote-led { background: #9bb3a9; }
+.desktop-remote-service[data-state="unregistered"] { border-color: #e0c9a8; color: #6b4a1c; background: #fdf7ee; }
+.desktop-remote-service[data-state="unregistered"] .desktop-remote-led { background: #d9a441; }
+/* 收不到心跳：凭据还在（所以不是"未注册"），但手机端收不到东西。
+   用告警色而不是故障色 —— 两种原因（没在跑 / 连不上云端）都还不确定，但都可修。
+   文案口径见 features/remote/desktop-service.ts 的 stale 档。 */
+.desktop-remote-service[data-state="stale"] { border-color: #e5b8aa; color: #8c3a2c; background: #fff1ed; }
+.desktop-remote-service[data-state="stale"] .desktop-remote-led { background: #c4553f; }
+.desktop-remote-service[data-state="failed"] { border-color: #e5b8aa; color: #8c3a2c; background: #fff1ed; }
+.desktop-remote-service[data-state="failed"] .desktop-remote-led { background: #c4553f; }
+
+/* 页头那颗「手机在线」胶囊。**刻意不跟服务胶囊长一个样**：两颗都是胶囊时，
+   一实一空是最省解释的层级 —— 实心＝"有设备正连着"，描边＝"没在同步"。
+   把两者做成同一套配色，用户会把"手机离线"读成"远程服务有问题"。
+   三档措辞来自 features/remote/desktop-phone.ts 的 headerChip。 */
+.desktop-remote-phone-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #1f6055;
+  border-radius: 999px;
+  padding: 6px 12px;
+  color: #fff;
+  background: #1f6055;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.desktop-remote-phone-chip .desktop-remote-led { background: #8ce0b4; }
+/* 「未同步」「已绑定手机」两档一律描边：它们都是**没有进展**的状态，
+   不该抢走"远程服务运行中"那颗实心胶囊的注意力。 */
+.desktop-remote-phone-chip[data-state="idle"],
+.desktop-remote-phone-chip[data-state="never"] { border-color: #e0c9a8; color: #6b4a1c; background: #fdf7ee; }
+.desktop-remote-phone-chip[data-state="idle"] .desktop-remote-led,
+.desktop-remote-phone-chip[data-state="never"] .desktop-remote-led { background: #d9a441; }
+/* stale＝"我们读不到最新读数了"。走告警色（同服务胶囊的 stale/failed），
+   但**不用故障红** —— 绑定关系本身没坏，坏的只是这一次重读。 */
+.desktop-remote-phone-chip[data-state="stale"] { border-color: #e5b8aa; color: #8c3a2c; background: #fff1ed; }
+.desktop-remote-phone-chip[data-state="stale"] .desktop-remote-led { background: #c4553f; }
+/* unsupported（云端版本较旧）：灰底，不给告警色 —— 这不是故障，只是本机读不到这一项。 */
+.desktop-remote-phone-chip[data-state="unsupported"] { border-color: #cfded6; color: #567468; background: #f4f8f6; }
+.desktop-remote-phone-chip[data-state="unsupported"] .desktop-remote-led { background: #9bb3a9; }
+
+/* 内容列与两栏网格 ─────────────────────────────────────────────────────────── */
+.desktop-remote-body { width: min(1120px, calc(100% - 48px)); margin: 0 auto; padding: 28px 0 0; }
+.desktop-remote-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 22px; align-items: start; }
+.desktop-remote-main { display: grid; min-width: 0; gap: 14px; }
+/* 侧栏跟手：主栏里的二维码会随"生成/过期"变高变矮，状态不该跟着滚出视口。 */
+.desktop-remote-aside { position: sticky; top: 16px; display: grid; min-width: 0; gap: 14px; }
+
+.desktop-remote-card { border: 1px solid #c8ded2; border-radius: 9px; padding: 18px; background: #fff; }
+.desktop-remote-card.soft { border-color: #d1e3d7; background: #fbfefb; }
+.desktop-remote-card.amber { border-color: #e0c9a8; background: #fdf7ee; }
+.desktop-remote-card h2 { margin: 0; color: #243b34; font-size: 15px; }
+.desktop-remote-card.amber h2 { color: #6b4a1c; }
+.desktop-remote-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.desktop-remote-card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.desktop-remote-note { margin: 6px 0 14px; color: #6f887c; font-size: 12px; line-height: 1.7; }
+.desktop-remote-note b { color: #294e43; }
+
+/* 按钮：三档尺寸 / 四套配色。全部 ≥32px（窄屏下也不缩到 28px 那种点不准的尺寸）。 */
+.desktop-remote-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 40px;
+  border: 1px solid #8fb9a5;
+  border-radius: 7px;
+  padding: 0 16px;
+  color: #fff;
+  background: #2c7567;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.desktop-remote-btn:disabled { cursor: not-allowed; }
+.desktop-remote-btn:focus-visible { outline: 2px solid #f6be4e; outline-offset: 2px; }
+.desktop-remote-btn.ghost { border-color: #c8dcd1; color: #2c7567; background: #fff; }
+.desktop-remote-btn.ghost:hover:not(:disabled) { border-color: #7fae9d; background: #eaf5ee; }
+.desktop-remote-btn.ghost:disabled { color: #9bb3a9; background: #f4f8f6; }
+.desktop-remote-btn.amber { border-color: #b98f4c; background: #a8762c; }
+.desktop-remote-btn.amber:disabled { opacity: .6; }
+.desktop-remote-btn.warn { border-color: #e0b3a6; color: #9b3e33; background: #fff; }
+.desktop-remote-btn.sm { min-height: 32px; border-radius: 6px; padding: 0 11px; font-size: 12px; }
+/* 「确认绑定」两态：手机没提交前是"等待手机扫码…"的占位（浅色、不可点），
+   提交后才是实心主色。用 data-ready 而不是 :disabled —— disabled 只有灰，说不出在等什么。 */
+.desktop-remote-btn.confirm { width: 100%; }
+.desktop-remote-btn.confirm[data-ready="false"] { border-color: #cfded6; color: #7b9187; background: #f1f6f3; }
+.desktop-remote-btn.confirm[data-ready="true"] { box-shadow: 0 2px 8px rgba(44, 117, 103, .25); }
+
+/* 主栏 · 注册引导 ─────────────────────────────────────────────────────────── */
+.desktop-remote-enroll { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.desktop-remote-enroll input { border: 1px solid #d8c3a0; border-radius: 7px; padding: 9px 11px; color: #19332c; background: #fff; font: inherit; }
+.desktop-remote-card.amber .desktop-remote-note { color: #8a6f45; }
+
+/* 主栏 · 扫码配对 ─────────────────────────────────────────────────────────── */
+.desktop-remote-pairing-body { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 28px; align-items: start; }
+.desktop-remote-qr-wrap { position: relative; display: inline-block; flex: none; }
+.desktop-remote-qr { display: block; width: 260px; height: 260px; border: 8px solid #fff; border-radius: 6px; box-shadow: 0 1px 6px rgba(25, 51, 44, .14); }
+.desktop-remote-qr-wrap[data-expired="true"] .desktop-remote-qr,
+.desktop-remote-qr-wrap[data-spent="true"] .desktop-remote-qr { filter: grayscale(1); opacity: .3; }
+.desktop-remote-qr-dead {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border-radius: 6px;
+  padding: 0 18px;
+  color: #9b3e33;
+  background: rgba(255, 246, 243, .82);
+  text-align: center;
+}
+.desktop-remote-qr-dead strong { font-size: 14px; }
+.desktop-remote-qr-dead small { color: #9b3e33; font-size: 11px; line-height: 1.5; }
+.desktop-remote-pairing-side { display: grid; min-width: 0; gap: 12px; align-content: start; justify-items: start; }
+
+/* 三步引导：第 2 步是整条流程最容易卡住的地方（手机扫完其实什么都没发生），
+   用编号 + 完成态把它写成有先后关系的清单。 */
+.desktop-remote-steps { display: grid; gap: 9px; margin: 0; padding: 0; list-style: none; counter-reset: desktop-remote-step; }
+.desktop-remote-steps li { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 9px; align-items: start; color: #3d5a51; font-size: 12.5px; line-height: 1.5; }
+.desktop-remote-steps li::before {
+  counter-increment: desktop-remote-step;
+  content: counter(desktop-remote-step);
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 999px;
+  color: #1f6055;
+  background: #eaf5ee;
+  font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.desktop-remote-steps li[data-done="true"]::before { color: #fff; background: #2c7567; }
+
+.desktop-remote-code { display: flex; align-items: center; gap: 10px; }
+.desktop-remote-code-label { color: #6f887c; font-size: 12px; }
+.desktop-remote-code strong { color: #19332c; font: 800 26px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .14em; font-variant-numeric: tabular-nums; }
+.desktop-remote-countdown { margin: 0; color: #6f887c; font-size: 12px; font-weight: 700; }
+.desktop-remote-countdown[data-expired="true"] { color: #9b3e33; }
+.desktop-remote-empty { margin: 0; border: 1px dashed #cfded6; border-radius: 8px; padding: 22px 14px; color: #6f887c; background: #fbfefb; font-size: 12.5px; text-align: center; }
+.desktop-remote-warn {
+  display: flex;
+  gap: 9px;
+  margin-top: 16px;
+  border: 1px solid #e5b8aa;
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #9b3e33;
+  background: #fff1ed;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.desktop-remote-warn b { color: #8c3a2c; }
+
+/* 侧栏 · 远程服务 ─────────────────────────────────────────────────────────── */
+.desktop-remote-chip {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #c8ded2;
+  border-radius: 999px;
+  padding: 3px 9px;
+  color: #216b58;
+  background: #e6f5ec;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.desktop-remote-chip[data-state="loading"] { border-color: #cfded6; color: #567468; background: #f4f8f6; }
+.desktop-remote-chip[data-state="unregistered"] { border-color: #e0c9a8; color: #6b4a1c; background: #fdf7ee; }
+.desktop-remote-chip[data-state="stale"],
+.desktop-remote-chip[data-state="failed"] { border-color: #e5b8aa; color: #8c3a2c; background: #fff1ed; }
+/* 键值对用 dt/dd 而不是"标签 + 冒号 + 值"：实例 ID 很长，两列网格能保证所有值左缘对齐。 */
+.desktop-remote-kv { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 7px 12px; margin: 12px 0 0; font-size: 12px; }
+.desktop-remote-kv dt { color: #82968d; }
+.desktop-remote-kv dd { min-width: 0; margin: 0; color: #294e43; font-weight: 600; overflow-wrap: anywhere; }
+.desktop-remote-kv dd code { color: #31594c; font: 600 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.desktop-remote-hint { margin: 10px 0 0; color: #6f887c; font-size: 11.5px; line-height: 1.65; }
+.desktop-remote-hint[data-tone="warn"] { color: #8c3a2c; }
+
+/* 侧栏 · 已绑定手机 ───────────────────────────────────────────────────────── */
+.desktop-remote-phone { display: flex; align-items: center; gap: 11px; margin-top: 12px; }
+/* `position: relative` 是给状态灯当定位锚的（灯绝对定位在图标块右下角）。 */
+.desktop-remote-phone-mark { position: relative; display: grid; width: 36px; height: 36px; flex: none; place-items: center; border-radius: 9px; color: #1f6055; background: #eaf5ee; }
+.desktop-remote-phone-mark svg { width: 19px; height: 19px; }
+/* 状态灯：颜色必须跟状态走。它唯一的价值是"扫一眼就知道手机还在不在"，
+   未同步时还亮着绿灯等于骗人。描边色取卡片底色（.soft 是 #fbfefb），像从图标块上挖出来。
+   这套做法与手机端「当前电脑」卡上的 `.mobile-device-led` 一致，别各造一套。 */
+.desktop-remote-phone-led { position: absolute; right: -2px; bottom: -2px; width: 12px; height: 12px; border: 2px solid #fbfefb; border-radius: 50%; background: #3fa87a; }
+.desktop-remote-phone-mark[data-state="idle"] .desktop-remote-phone-led,
+.desktop-remote-phone-mark[data-state="never"] .desktop-remote-phone-led { background: #d9a441; }
+/* 没有读数 ≠ 故障：灰灯，别用告警色。 */
+.desktop-remote-phone-mark[data-state="unsupported"] .desktop-remote-phone-led { background: #9bb3a9; }
+/* 读数过期：这时握着的是**上一次**读到的状态，绿灯会变成"骗人"那一类
+   （同 mobile-remote.css 的"离线时还亮着绿灯等于骗人"）。用告警色，
+   和页头那颗 stale 胶囊同色 —— 同一个状态在两处必须长得一样。 */
+.desktop-remote-phone-mark[data-state="stale"] .desktop-remote-phone-led { background: #c4553f; }
+.desktop-remote-phone-who { min-width: 0; flex: 1; }
+.desktop-remote-phone-who strong { display: block; color: #19332c; font-size: 14px; overflow-wrap: anywhere; }
+.desktop-remote-phone-who small { display: block; margin-top: 2px; color: #6f887c; font-size: 11.5px; }
+/* 名字右侧那颗状态胶囊，和页头那颗说的是同一件事（页头给完整句，这里给一个词）。
+   `flex: none` + 名字容器的 `min-width: 0` 一起保证长手机名挤不走它。 */
+.desktop-remote-phone-state { flex: none; border-radius: 999px; padding: 2px 8px; color: #286452; background: #e4f6e9; font-size: 11px; font-weight: 800; }
+.desktop-remote-phone-state[data-state="idle"],
+.desktop-remote-phone-state[data-state="never"] { color: #8a5a1c; background: #fff1ce; }
+/* 读数过期：同页头那颗 stale 胶囊的配色。这里写「读不到」而不是「未同步」——
+   后者把"我们读不到"说成手机的事实。 */
+.desktop-remote-phone-state[data-state="stale"] { color: #8c3a2c; background: #fff1ed; }
+
+/* 共用条（刷新状态 / 配对状态行 / 错误）在这两栏里的排布 ─────────────────────
+   这三条是**手机端那套组件**（同样渲染在电脑端），它们自带 `max-width: 860px;
+   margin: 0 auto` 的"居中内容列"写法。在这一页要把它们换成**本页那条内容列**
+   （`min(1120px, 100% - 48px)`）并左对齐 —— 只清 `max-width` 是不够的：清掉之后
+   元素会撑满 `<main>` 的内边距盒，而这一页的 `<main>` 没有左右内边距，于是状态条
+   **满屏出血**（实测 1440 视口下宽 1440、x=0），和下面 1120 宽的两栏对不齐。
+   两段选择器 → 与引入顺序无关。 */
+.mobile-remote.desktop-remote .mobile-refresh-status,
+.mobile-remote.desktop-remote .mobile-pairing-notice,
+.mobile-remote.desktop-remote .mobile-error {
+  width: min(1120px, calc(100% - 48px));
+  max-width: none;
+  margin: 16px auto 0;
+}
+
+/* 窄窗口降级 ───────────────────────────────────────────────────────────────
+   1020px 以下两栏挤不下（主栏二维码 260 + 侧栏 320 + 间距）。**降级必须写在无断点
+   规则之后**，否则同特异性的宽度声明会被上面的网格定义反压回去（tasks.css 踩过一次）。 */
+@media (max-width: 1020px) {
+  .desktop-remote-grid { grid-template-columns: minmax(0, 1fr); }
+  .desktop-remote-aside { position: static; }
+}
+@media (max-width: 720px) {
+  .desktop-remote-header { min-height: 76px; }
+  .desktop-remote-head-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .desktop-remote-pairing-body { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .desktop-remote-qr { width: 100%; height: auto; max-width: 260px; aspect-ratio: 1; }
+  .desktop-remote-enroll { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .desktop-remote-btn { transition: none; }
+}

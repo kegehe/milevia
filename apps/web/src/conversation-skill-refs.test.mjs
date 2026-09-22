@@ -56,15 +56,25 @@ test("the reference is expanded only at send time, and both ends agree on the te
   }
   // 手机端也走同一条拼接规则。
   assert.match(mobilePage, /function composeSkillMessage\(text: string, refs: RemoteSkill\[\]\): string \{/);
-  assert.match(mobilePage, /const content = composeSkillMessage\(draft, skillRefs\);/);
+  // 2026-09-20 起正文还可能带着"引用某条消息"（消息操作面板的「引用到输入框」）：
+  // 先由 withQuoteBlock 拼成「引用块 + 正文」，再交给 composeSkillMessage 加技能指令。
+  // 顺序因此严格是 **技能 → 引用 → 正文**：技能那段文案仍由 composeSkillMessage 唯一生成
+  // （在调用点重拼一次就等于把"两端逐字一致"那道闸门交给两个人守）。
+  assert.match(mobilePage, /const content = composeSkillMessage\(withQuoteBlock\(draft, quoteRef\), skillRefs\);/);
+  assert.match(mobilePage, /function withQuoteBlock\(text: string, quote: MessageQuote \| null\): string \{/);
+  // 引用块的行前缀：**空行也要带 ">"**（markdown 把空行当作引用结束，不补就会被拆成两截）。
+  assert.match(mobilePage, /return body\.split\("\\n"\)\.map\(\(line\) => \(line \? `> \$\{line\}` : ">"\)\)\.join\("\\n"\);/);
+  // 超长引用必须显式写明已截断 —— 悄悄截断比不截断更糟（用户以为整段都发过去了）。
+  assert.match(mobilePage, /const QUOTE_MAX_CHARS = \d+;/);
+  assert.match(mobilePage, /（引用内容过长，已截断）/);
 });
 
 test("every write-back path keeps the draft and the reference separate", () => {
   // 失败回填只许回 draft。
   assert.match(conversationPage, /const draft = rawContent\.trim\(\);/);
   assert.match(conversationPage, /setComposerText\(draft, conversationID\);\s*setSkillRefs\(refs\);/s);
-  assert.match(mobilePage, /setMessageDraft\(draft\);\s*setSkillRefs\(skillRefs\);/s);
-  assert.match(mobilePage, /setMessageDraft\(\(current\) => current\.trim\(\) \? current : draft\);/);
+  // 手机端失败回填：正文与引用一起还回去，且都带"用户已经打了新的字就不覆盖"的守卫。
+  assert.match(mobilePage, /setMessageDraft\(\(current\) => current\.trim\(\) \? current : draft\);\s*setSkillRefs\(\(current\) => current\.length > 0 \? current : skillRefs\);/s);
   // 撤回 / 上箭头重发恢复的是"用户自己写的东西"，不是拼好的上线文本。
   assert.match(conversationPage, /pendingUserDrafts\.current\.set\(data\.runId, draft\)/);
   assert.match(conversationPage, /if \(draft\) appendInputHistory\(draft\);/);
@@ -100,8 +110,11 @@ test("skill references never leak across conversations", () => {
   assert.match(conversationPage, /useEffect\(\(\) => \{ setSkillRefs\(\[\]\); \}, \[conversation\?\.id\]\);/);
   // 手机端：清引用与清草稿同处一个 effect（换项目 / 换会话），别让它孤零零挂在别处 ——
   // 分成两个 effect 的话，以后删掉任何一个都能让"引用跨会话漂移"重新出现。
-  const mobileResetBody = mobilePage.match(/useEffect\(\(\) => \{\s*setMessageDraft\(""\);[\s\S]*?\n  \}, \[selectedProject, selectedConversation\]\);/)?.[0] ?? "";
+  // 锚点取那个 effect 里的守卫（换 id 不等于换会话的那段），不取 effect 的第一行：
+  // 守卫写在清草稿**之前**，用 `useEffect(() => { setMessageDraft("")` 作锚点会失配。
+  const mobileResetBody = mobilePage.match(/const swap = conversationIDSwapRef\.current;[\s\S]*?\n  \}, \[selectedProject, selectedConversation\]\);/)?.[0] ?? "";
   assert.ok(mobileResetBody, "找不到手机端换会话时清草稿的 effect");
+  assert.match(mobileResetBody, /setMessageDraft\(""\);/);
   assert.match(mobileResetBody, /setSkillRefs\(\[\]\);/);
 });
 

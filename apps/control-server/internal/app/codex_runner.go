@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +34,11 @@ var (
 
 // codexCLIRunner runs one non-interactive Codex turn per platform Run. Codex
 // persists its own thread; the server stores the thread ID returned as JSONL.
-type codexCLIRunner struct{ config Config }
+type codexCLIRunner struct {
+	config Config
+	// paths 是可注入的路径解析器；nil 时回落到 config.CodexPath（测试里常用）。
+	paths *agentPathResolver
+}
 
 // codexDefaultModelRunner 由能报告“CLI 默认模型”的 Codex runner 实现（本机 / WSL / SSH）。
 // Codex 的 exec --json 事件流只含 token 用量、不含模型名，usage 追踪在 cli_managed
@@ -46,7 +49,9 @@ type codexDefaultModelRunner interface {
 
 var codexProfileSkillsMu sync.Mutex
 
-func newCodexCLIRunner(config Config) AgentRunner { return &codexCLIRunner{config: config} }
+func newCodexCLIRunner(config Config, paths *agentPathResolver) AgentRunner {
+	return &codexCLIRunner{config: config, paths: paths}
+}
 
 // codexCommandContext handles npm's Windows .cmd shim explicitly. CreateProcess
 // cannot launch a batch file directly, while `codex` resolved through PATHEXT
@@ -77,6 +82,16 @@ func codexCommandContext(ctx context.Context, path string, args ...string) *exec
 	return exec.CommandContext(ctx, "cmd.exe", append([]string{"/d", "/c", script}, args...)...)
 }
 
+// codexBinary 是取 codex 可执行文件的唯一入口（理由同 claudeBinary）。
+func (r *codexCLIRunner) codexBinary() string {
+	if r.paths != nil {
+		if path := r.paths.Path("codex"); path != "" {
+			return path
+		}
+	}
+	return r.config.CodexPath
+}
+
 func (r *codexCLIRunner) Ready(parent context.Context) bool {
 	// Readiness is an execution capability check, not an authentication check.
 	// Codex may be authenticated by CC Switch, CODEX_HOME, environment
@@ -90,20 +105,20 @@ func (r *codexCLIRunner) Ready(parent context.Context) bool {
 // CLI login state. A managed api_key profile injects its own credential, so it
 // only needs the binary, not a persisted login.
 func (r *codexCLIRunner) BinaryReady() bool {
-	_, err := exec.LookPath(r.config.CodexPath)
+	_, err := exec.LookPath(r.codexBinary())
 	return err == nil
 }
 
 func (r *codexCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	cmd := codexCommandContext(ctx, r.config.CodexPath, "--version")
+	cmd := codexCommandContext(ctx, r.codexBinary(), "--version")
 	configureProcessGroup(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "codex-cli "))
+	return agentVersionFromOutput(string(out))
 }
 
 func (r *codexCLIRunner) CheckUpdate(parent context.Context) (bool, string, error) {
@@ -111,133 +126,15 @@ func (r *codexCLIRunner) CheckUpdate(parent context.Context) (bool, string, erro
 	if local == "" {
 		return false, "", errors.New("Codex CLI is not installed")
 	}
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "npm", "view", "@openai/codex", "version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	latest, err := latestAgentVersion(parent, "codex")
 	if err != nil {
-		return false, "", fmt.Errorf("query latest Codex version: %w", err)
+		return false, "", err
 	}
-	latest := strings.TrimSpace(string(out))
-	if latest == "" {
-		return false, "", errors.New("latest Codex version is empty")
-	}
-	available, err := codexUpdateAvailable(local, latest)
+	available, err := updateAvailableFrom(local, latest)
 	if err != nil {
 		return false, latest, err
 	}
 	return available, latest, nil
-}
-
-type codexSemver struct {
-	major int
-	minor int
-	patch int
-	pre   []string
-}
-
-func codexUpdateAvailable(local, latest string) (bool, error) {
-	localVersion, err := parseCodexSemver(local)
-	if err != nil {
-		return false, fmt.Errorf("parse local Codex version: %w", err)
-	}
-	latestVersion, err := parseCodexSemver(latest)
-	if err != nil {
-		return false, fmt.Errorf("parse latest Codex version: %w", err)
-	}
-	return compareCodexSemver(latestVersion, localVersion) > 0, nil
-}
-
-func parseCodexSemver(raw string) (codexSemver, error) {
-	value := strings.TrimPrefix(strings.TrimSpace(raw), "v")
-	value, _, _ = strings.Cut(value, "+")
-	core, prerelease, hasPrerelease := strings.Cut(value, "-")
-	parts := strings.Split(core, ".")
-	if len(parts) != 3 {
-		return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
-	}
-	parsed := codexSemver{}
-	for index, target := range []*int{&parsed.major, &parsed.minor, &parsed.patch} {
-		if parts[index] == "" || (len(parts[index]) > 1 && parts[index][0] == '0') {
-			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
-		}
-		value, err := strconv.Atoi(parts[index])
-		if err != nil || value < 0 {
-			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
-		}
-		*target = value
-	}
-	if !hasPrerelease {
-		return parsed, nil
-	}
-	if prerelease == "" {
-		return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
-	}
-	for _, identifier := range strings.Split(prerelease, ".") {
-		if identifier == "" {
-			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
-		}
-		for _, character := range identifier {
-			if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || character == '-') {
-				return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
-			}
-		}
-		if _, err := strconv.Atoi(identifier); err == nil && len(identifier) > 1 && identifier[0] == '0' {
-			return codexSemver{}, fmt.Errorf("invalid semantic version %q", raw)
-		}
-		parsed.pre = append(parsed.pre, identifier)
-	}
-	return parsed, nil
-}
-
-func compareCodexSemver(left, right codexSemver) int {
-	for _, pair := range [][2]int{{left.major, right.major}, {left.minor, right.minor}, {left.patch, right.patch}} {
-		if pair[0] < pair[1] {
-			return -1
-		}
-		if pair[0] > pair[1] {
-			return 1
-		}
-	}
-	if len(left.pre) == 0 && len(right.pre) > 0 {
-		return 1
-	}
-	if len(left.pre) > 0 && len(right.pre) == 0 {
-		return -1
-	}
-	for index := 0; index < len(left.pre) && index < len(right.pre); index++ {
-		leftNumber, leftErr := strconv.Atoi(left.pre[index])
-		rightNumber, rightErr := strconv.Atoi(right.pre[index])
-		if leftErr == nil && rightErr != nil {
-			return -1
-		}
-		if leftErr != nil && rightErr == nil {
-			return 1
-		}
-		if leftErr == nil && rightErr == nil {
-			if leftNumber < rightNumber {
-				return -1
-			}
-			if leftNumber > rightNumber {
-				return 1
-			}
-			continue
-		}
-		if left.pre[index] < right.pre[index] {
-			return -1
-		}
-		if left.pre[index] > right.pre[index] {
-			return 1
-		}
-	}
-	if len(left.pre) < len(right.pre) {
-		return -1
-	}
-	if len(left.pre) > len(right.pre) {
-		return 1
-	}
-	return 0
 }
 
 func (r *codexCLIRunner) Update(parent context.Context) (string, string, error) {
@@ -245,11 +142,11 @@ func (r *codexCLIRunner) Update(parent context.Context) (string, string, error) 
 	if previous == "" {
 		return "", "", errors.New("Codex CLI is not installed")
 	}
-	recovery, recoveryErr := prepareNpmCLIRecovery(parent, r.config.CodexPath, codexNpmCLIInstall)
+	recovery, recoveryErr := prepareNpmCLIRecovery(parent, r.codexBinary(), codexNpmCLIInstall)
 	ctx, cancel := context.WithTimeout(parent, r.config.agentUpdateTimeout())
 	defer cancel()
 	var out bytes.Buffer
-	cmd := codexCommandContext(ctx, r.config.CodexPath, "update")
+	cmd := codexCommandContext(ctx, r.codexBinary(), "update")
 	configureProcessGroup(cmd)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -337,7 +234,7 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 		environment = append(environment, request.MCPEnv...)
 	}
 	args := codexExecArgs(request, profileArgs, schemaPath, policy)
-	cmd := codexCommandContext(context.Background(), r.config.CodexPath, args...)
+	cmd := codexCommandContext(context.Background(), r.codexBinary(), args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
 	configureProcessGroup(cmd)
@@ -737,7 +634,7 @@ func (r *codexCLIRunner) codexDefaultModel(ctx context.Context) string {
 // `codex debug models` 输出 JSON 目录，含 slug / display_name / description / visibility；
 // 属调试子命令，解析失败或版本不支持时返回错误，由调用方回退到静态表。
 func (r *codexCLIRunner) codexModelCatalog(ctx context.Context) ([]AgentModelOption, error) {
-	cmd := codexCommandContext(ctx, r.config.CodexPath, "debug", "models")
+	cmd := codexCommandContext(ctx, r.codexBinary(), "debug", "models")
 	// 与 Version()/Run() 一致地设置进程组：超时取消时能把 cmd.exe 及其拉起的
 	// codex 子进程一起收掉，不留孤儿。
 	configureProcessGroup(cmd)
@@ -769,7 +666,7 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink, projectPath string) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
-		line, err := sanitizeCodexJSONL(scanner.Bytes())
+		line, err := sanitizeCodexJSONL(decodeAgentOutputBytes(scanner.Bytes()))
 		if err != nil {
 			sink.Event("stream.error", mustJSON(map[string]string{"error": errorText(err)}))
 			continue
@@ -823,7 +720,7 @@ func readCodexStderr(reader io.Reader, sink AgentRunSink) {
 	// 同 claude readStderr：解码 wsl.exe 的 UTF-16LE 主机侧警告；非 WSL 路径行为不变。
 	scanner.Split(wslStderrSplit)
 	for scanner.Scan() {
-		if text := strings.TrimSpace(scanner.Text()); text != "" {
+		if text := strings.TrimSpace(decodeAgentOutputLine(scanner.Bytes())); text != "" {
 			// codex exec emits this informational line when its /dev/null stdin is
 			// non-interactive. The prompt is already supplied through argv.
 			if text == codexAdditionalStdinNotice {

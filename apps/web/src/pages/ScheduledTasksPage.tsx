@@ -6,6 +6,7 @@ import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { useProjectContext } from "../stores/useProjectStore";
 import type { AgentID, PermissionMode, ScheduledTask, ScheduledTaskRun, Skill } from "../lib/types";
+import { agentDisplayName, agentEntry, agentPermissionModes, permissionCopy, catalogAgentID, useAgentCatalog } from "../lib/agent-registry";
 import { TasksSubnav } from "./TasksSubnav";
 
 type ScheduleForm = {
@@ -88,9 +89,8 @@ function formFromTask(task: ScheduledTask): ScheduleForm {
 }
 
 function permissionOptions(agentID: AgentID): { value: PermissionMode; label: string }[] {
-  return agentID === "codex"
-    ? [{ value: "read_only", label: "只读分析" }, { value: "workspace_write", label: "项目内执行" }, { value: "full_control", label: "完全控制" }]
-    : [{ value: "approval_required", label: "需审批" }, { value: "full_control", label: "完全控制" }];
+  // 可选模式与文案都来自工具目录（服务端的能力声明），不再按工具名写两套。
+  return agentPermissionModes(agentID).map((mode) => ({ value: mode, label: permissionCopy[mode].title }));
 }
 
 function scheduleDescription(task: ScheduledTask) {
@@ -111,6 +111,7 @@ function ScheduleIcon() {
 }
 
 export default function ScheduledTasksPage() {
+  const agentOptions = useAgentCatalog();
   const { projectId, scheduledTaskId } = useParams<{ projectId: string; scheduledTaskId?: string }>();
   const navigate = useNavigate();
   const { api: projectApi, setError } = useProjectContext();
@@ -240,7 +241,7 @@ export default function ScheduledTasksPage() {
           <div className="scheduled-task-main">
             <div className="scheduled-task-title"><span className="scheduled-status-dot" data-status={task.lastRun?.status || "idle"} /><div><h3>{task.title}</h3><p>{scheduleDescription(task)}</p></div></div>
             <p className="scheduled-task-prompt">{task.prompt}</p>
-            <div className="scheduled-task-meta"><span>{task.agentId === "codex" ? "Codex" : "Claude Code"}</span><span>{permissionOptions(task.agentId).find((item) => item.value === task.permissionMode)?.label || task.permissionMode}</span>{task.skills.length > 0 && <span>{task.skills.length} 个技能</span>}</div>
+            <div className="scheduled-task-meta"><span>{agentDisplayName(task.agentId)}</span><span>{permissionOptions(task.agentId).find((item) => item.value === task.permissionMode)?.label || task.permissionMode}</span>{task.skills.length > 0 && <span>{task.skills.length} 个技能</span>}</div>
           </div>
           <div className="scheduled-task-timing"><span>下次运行</span><b>{task.enabled ? formatDateTime(task.nextRunAt, task.timezone) : "已暂停"}</b><small>最近：{runStatusLabel(task.lastRun)}</small>{task.lastRun?.failureReason && <em title={task.lastRun.failureReason}>{task.lastRun.failureReason}</em>}</div>
           <div className="scheduled-task-actions">
@@ -258,6 +259,7 @@ export default function ScheduledTasksPage() {
 }
 
 function ScheduledTaskEditor({ projectId, task, request, onClose, onSaved, onFail }: { projectId: string; task?: ScheduledTask; request: <T>(path: string, init?: RequestInit) => Promise<T>; onClose: () => void; onSaved: () => Promise<void>; onFail: (message: string) => void }) {
+  const agentOptions = useAgentCatalog();
   const [form, setForm] = useState<ScheduleForm>(() => task ? formFromTask(task) : defaultForm());
   const [skills, setSkills] = useState<Skill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(true);
@@ -278,7 +280,7 @@ function ScheduledTaskEditor({ projectId, task, request, onClose, onSaved, onFai
 
   const changeAgent = (agentId: AgentID) => {
     const options = permissionOptions(agentId);
-    setForm((current) => ({ ...current, agentId, permissionMode: options.some((option) => option.value === current.permissionMode) ? current.permissionMode : agentId === "codex" ? "workspace_write" : "approval_required" }));
+    setForm((current) => ({ ...current, agentId, permissionMode: options.some((option) => option.value === current.permissionMode) ? current.permissionMode : (agentEntry(agentId)?.defaultPermissionMode ?? "approval_required") }));
   };
 
   const toggleSkill = (name: string) => setForm((current) => ({ ...current, skills: current.skills.includes(name) ? current.skills.filter((item) => item !== name) : [...current.skills, name] }));
@@ -316,7 +318,7 @@ function ScheduledTaskEditor({ projectId, task, request, onClose, onSaved, onFai
       <form className="schedule-task-form" onSubmit={submit}>
         <div className="schedule-form-scroll">
           <section><h3>任务内容</h3><label>名称<input value={form.title} maxLength={120} required placeholder="例如：工作日晚间代码检查" onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} /></label><label>提示词<textarea value={form.prompt} required placeholder="描述需要 Agent 完成的检查、分析或维护工作。" onChange={(event) => setForm((current) => ({ ...current, prompt: event.target.value }))} /></label></section>
-          <section><h3>执行方式</h3><div className="schedule-form-grid"><label>Agent<select value={form.agentId} onChange={(event) => changeAgent(event.target.value as AgentID)}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label><label>权限<select value={form.permissionMode} onChange={(event) => setForm((current) => ({ ...current, permissionMode: event.target.value as PermissionMode }))}>{permissionChoices.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label></div></section>
+          <section><h3>执行方式</h3><div className="schedule-form-grid"><label>Agent<select value={form.agentId} onChange={(event) => changeAgent(event.target.value as AgentID)}>{agentOptions.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select></label><label>权限<select value={form.permissionMode} onChange={(event) => setForm((current) => ({ ...current, permissionMode: event.target.value as PermissionMode }))}>{permissionChoices.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label></div></section>
           <section><h3>执行时间</h3><div className="schedule-type-switch"><button type="button" className={form.scheduleType === "once" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, scheduleType: "once" }))}>单次</button><button type="button" className={form.scheduleType === "daily" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, scheduleType: "daily" }))}>每天</button><button type="button" className={form.scheduleType === "weekly" ? "active" : ""} onClick={() => setForm((current) => ({ ...current, scheduleType: "weekly" }))}>每周</button></div><div className="schedule-form-grid">{form.scheduleType === "once" ? <label>执行时间<input type="datetime-local" value={form.runAt} required onChange={(event) => setForm((current) => ({ ...current, runAt: event.target.value }))} /></label> : <label>执行时间<input type="time" value={form.timeOfDay} required onChange={(event) => setForm((current) => ({ ...current, timeOfDay: event.target.value }))} /></label>}<label>时区<input value={form.timezone} required placeholder="Asia/Shanghai" onChange={(event) => setForm((current) => ({ ...current, timezone: event.target.value }))} /></label></div>{form.scheduleType === "weekly" && <div className="weekday-picker" role="group" aria-label="执行星期">{weekdayOptions.map((day) => <button key={day.value} type="button" className={form.weekdays.includes(day.value) ? "active" : ""} aria-pressed={form.weekdays.includes(day.value)} onClick={() => toggleWeekday(day.value)}>{day.label}</button>)}</div>}<label className="schedule-enabled"><input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />保存后立即启用</label></section>
           <section><div className="schedule-skills-heading"><h3>调用技能</h3><span>{skillsLoading ? "正在读取…" : `${skills.length} 个可用`}</span></div>{skills.length === 0 && !skillsLoading ? <p className="schedule-skills-empty">当前 Agent 未发现可调用技能。</p> : <div className="schedule-skill-list">{skills.map((skill) => <label className="schedule-skill-option" key={skill.name} data-tooltip-title={skill.name} data-tooltip-desc={skill.description}><input type="checkbox" checked={form.skills.includes(skill.name)} onChange={() => toggleSkill(skill.name)} /><span><b>{skill.name}</b><small>{skill.description}</small></span><em>{skill.source === "project" ? "项目" : skill.source === "plugin" ? "插件" : "用户"}</em></label>)}</div>}</section>
           {task?.runs && task.runs.length > 0 && <section className="schedule-history"><h3>运行记录</h3>{task.runs.map((run) => <div key={run.id}><span className={`scheduled-run-status ${run.status}`}>{runStatusLabel(run)}</span><time>{formatDateTime(run.createdAt, task.timezone)}</time>{run.failureReason && <small>{run.failureReason}</small>}</div>)}</section>}

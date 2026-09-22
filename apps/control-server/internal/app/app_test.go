@@ -3203,6 +3203,90 @@ func TestConversationPageReturnsLatestWindowAndCursor(t *testing.T) {
 	}
 }
 
+// 过程遥测不参与历史分页。它们一条都渲染不出来，却能把 hasMore 永远点亮 —— 真机上单个
+// 会话有 6 万条 stream_event、全库有 35 万条 thinking_tokens 遥测，而 messages 最多的
+// 一个会话才 284 条，于是"加载更早记录"按钮永远挂着，点一次画面毫无变化。
+func TestConversationPagePagesReplayableEventsOnly(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC().Add(-time.Hour)
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,title,last_activity_at,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle','approval_required','conversation',?,1,1,?)`, now, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('run','conversation','completed',?)`, now); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	insertEvent := func(id, eventType, payload string, createdAt time.Time) {
+		t.Helper()
+		if _, err := server.db.Exec(`insert into events (id,conversation_id,run_id,type,payload,created_at) values (?,?,?,?,?,?)`, id, "conversation", "run", eventType, payload, createdAt); err != nil {
+			t.Fatalf("insert %s event %s: %v", eventType, id, err)
+		}
+	}
+	// 可回放事件，时间戳依次递增：旧的压缩边界 + 三条助手事件。
+	insertEvent("compact-0", "system", `{"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":1000,"post_tokens":100}}`, now)
+	for index := 0; index < 3; index++ {
+		insertEvent(fmt.Sprintf("content-%d", index), "assistant", `{}`, now.Add(time.Duration(index+1)*time.Millisecond))
+	}
+	// 过程遥测：每种都远超 limit，且时间戳全都晚于内容事件（分页按 created_at 倒序取，
+	// 所以旧实现下第一页会整页都是这些渲染不出来的东西）。
+	telemetryBase := now.Add(time.Minute)
+	for _, telemetry := range []struct{ eventType, idPrefix string }{
+		{"stream_event", "stream-"},
+		{"tool_progress", "progress-"},
+		{"usage.updated", "usage-"},
+	} {
+		seedEvents(t, server, "conversation", "run", telemetry.eventType, telemetry.idPrefix, 50, telemetryBase)
+	}
+	// thinking_tokens 是"type=system + payload 里带 subtype"的历史遗留形态（appendEvent
+	// 早已不再持久化它），同样渲染不出来；system 的其它子类型必须原样保留。
+	for index := 0; index < 50; index++ {
+		insertEvent(fmt.Sprintf("thinking-%06d", index), "system", `{"type":"system","subtype":"thinking_tokens","estimated_tokens":875}`, telemetryBase)
+	}
+	if count := countEvents(t, server, "conversation"); count != 204 {
+		t.Fatalf("seeded %d events, want 204", count)
+	}
+
+	type conversationPage struct {
+		Events          []Event `json:"events"`
+		HasMore         bool    `json:"hasMore"`
+		HasMoreMessages bool    `json:"hasMoreMessages"`
+		NextCursor      string  `json:"nextCursor"`
+	}
+	readPage := func(query string) conversationPage {
+		t.Helper()
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?"+query, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("page status: %d body=%s", response.Code, response.Body.String())
+		}
+		var page conversationPage
+		if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
+			t.Fatalf("decode page: %v", err)
+		}
+		return page
+	}
+
+	// 第一页只装得下两条真实内容 —— 200 条遥测一条都不占位。
+	first := readPage("limit=2")
+	if len(first.Events) != 2 || first.Events[0].ID != "content-1" || first.Events[1].ID != "content-2" {
+		t.Fatalf("unexpected first page: %#v", first.Events)
+	}
+	if !first.HasMore || first.NextCursor == "" {
+		t.Fatalf("first page should still offer earlier content: %#v", first)
+	}
+	// 第二页翻到内容尽头：此时库里还剩 200 条遥测没取过，但 hasMore 必须是 false，
+	// 否则界面上那个"加载更早记录"按钮又会永远挂着。
+	second := readPage("limit=2&cursor=" + url.QueryEscape(first.NextCursor))
+	if len(second.Events) != 2 || second.Events[0].ID != "compact-0" || second.Events[1].ID != "content-0" {
+		t.Fatalf("unexpected second page: %#v", second.Events)
+	}
+	if second.HasMore || second.NextCursor != "" || second.HasMoreMessages {
+		t.Fatalf("telemetry kept hasMore alive: hasMore=%v cursor=%q", second.HasMore, second.NextCursor)
+	}
+}
+
 func TestConversationActivityReturnsProjectScopedIncrementalEvents(t *testing.T) {
 	server := newTestServer(t)
 	now := time.Now().UTC().Add(-time.Minute)
@@ -11347,7 +11431,14 @@ func TestListRunnersReportsCodexOnSSHCodexCapableRunner(t *testing.T) {
 	t.Fatal("ssh-codex runner not found in list")
 }
 
-func TestListRunnersReportsCodexUnavailableOnNonCodexRunner(t *testing.T) {
+// TestListRunnersReportsCodexUnsupportedOnNonCodexRunner 盯住"不支持"与"未安装"的分档。
+//
+// 原名是 ...ReportsCodexUnavailableOnNonCodexRunner，断言 status == "unavailable"。
+// 那是把两件不同的事压成了一档：这个 Runner 是**根本不提供** Codex，而不是
+// **提供了但没装**。两者对用户的下一步动作完全不同（换执行环境 vs 去安装），
+// 界面文案也必须不同。现在状态码与一直存在的那句 reason（"此 Runner 不支持 Codex"）
+// 终于说的是同一件事。前端 ToolStatus 已同步加入 "unsupported"。
+func TestListRunnersReportsCodexUnsupportedOnNonCodexRunner(t *testing.T) {
 	server := newTestServer(t)
 	server.runnerRegistry.register("ssh-plain", runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }), RunnerMeta{ID: "ssh-plain", Name: "plain-host", Environment: "remote-linux"})
 
@@ -11365,8 +11456,26 @@ func TestListRunnersReportsCodexUnavailableOnNonCodexRunner(t *testing.T) {
 			continue
 		}
 		codex, _ := entry["codex"].(map[string]any)
-		if codex["status"] != "unavailable" {
-			t.Fatalf("expected ssh-plain codex unavailable, got %#v", codex)
+		if codex["status"] != "unsupported" {
+			t.Fatalf("expected ssh-plain codex unsupported, got %#v", codex)
+		}
+		if codex["reason"] != "此 Runner 不支持 Codex" {
+			t.Fatalf("expected a reason naming the unsupported runner, got %#v", codex["reason"])
+		}
+		// 同一次响应里的新字段必须与过渡字段同源。
+		agents, _ := entry["agents"].([]any)
+		var found bool
+		for _, item := range agents {
+			agent, _ := item.(map[string]any)
+			if agent["id"] == "codex" {
+				found = true
+				if agent["status"] != codex["status"] {
+					t.Fatalf("agents[] 与过渡字段不一致：%#v vs %#v", agent, codex)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("agents[] 里没有 codex，新增字段没接上")
 		}
 		return
 	}

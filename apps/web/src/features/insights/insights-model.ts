@@ -231,6 +231,68 @@ export function maxInsightEventSeq(events: InsightEvent[]): number {
   return max;
 }
 
+// ─── 批量删除：选择集（纯函数，便于单测）──────────────────────────────────
+//
+// 选择集一律是不可变 `Set`：所有操作返回**新集合**，让 React 的 `useState` 靠引用比较
+// 就能发现变化（原地 `add/delete` 后 setState 同一个引用 = 界面不动）。
+
+/** 勾选 / 取消一条。 */
+export function toggleInsightSelection(selected: ReadonlySet<string>, id: string): Set<string> {
+  const next = new Set(selected);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  return next;
+}
+
+/**
+ * 「全选当前列表」：传入的一批**全都已选**时整体取消，否则整体补上。
+ * 与任务看板里分组头复选框的语义一致 —— 一个按钮两种动作，已全选时按钮的可访问名要改口，
+ * 否则读屏用户听到的动作与结果正好相反。
+ */
+export function toggleInsightSelectionAll(selected: ReadonlySet<string>, ids: readonly string[]): Set<string> {
+  const next = new Set(selected);
+  const complete = ids.length > 0 && ids.every((id) => next.has(id));
+  for (const id of ids) {
+    if (complete) next.delete(id);
+    else next.add(id);
+  }
+  return next;
+}
+
+/**
+ * 丢掉已经不在列表里的 id。每次刷新（含 2s 轮询）后都要做：否则被删掉 / 已转任务 /
+ * 刚被判失效的建议会留在选择集里 —— 界面显示「已选 3 条」，列表上却一条都看不到，
+ * 而且删除请求会带着这些幽灵 id 发出去（让后端 skipped 计数凭空变大）。
+ */
+export function pruneInsightSelection(selected: ReadonlySet<string>, keep: readonly string[]): Set<string> {
+  const alive = new Set(keep);
+  const next = new Set<string>();
+  for (const id of selected) if (alive.has(id)) next.add(id);
+  return next;
+}
+
+/** 「全选」复选框与范围提示的读数。 */
+export type InsightSelectionSummary = {
+  // 传入集合（当前筛选下的可见列表）的总数与其中已选数。
+  total: number;
+  picked: number;
+  // 按 every/some 算，**不要**拿个数比大小：选择集里可能还有别的范围（已失效/已忽略折叠区）
+  // 选中的 id，个数碰巧相等时复选框会显示"全选"，实际却还有可见建议没勾上。
+  all: boolean;
+  partial: boolean;
+};
+
+export function insightSelectionSummary(selected: ReadonlySet<string>, ids: readonly string[]): InsightSelectionSummary {
+  let picked = 0;
+  for (const id of ids) if (selected.has(id)) picked += 1;
+  return {
+    total: ids.length,
+    picked,
+    all: ids.length > 0 && picked === ids.length,
+    partial: picked > 0 && picked < ids.length,
+  };
+}
+
 export function insightFindingCounts(findings: InsightFinding[]): Record<InsightFilter, number> {
   const counts: Record<InsightFilter, number> = { all: findings.length, bug: 0, style: 0, optimization: 0, feature: 0 };
   for (const f of findings) counts[normalizeInsightType(f.type)] += 1;

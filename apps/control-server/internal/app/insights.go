@@ -227,7 +227,7 @@ type scanOpts struct {
 }
 
 func normalizeScanAgent(agent string) string {
-	if agent == "claude-code" || agent == "codex" {
+	if validProfileAgent(agent) {
 		return agent
 	}
 	return ""
@@ -374,7 +374,10 @@ type insightsResponse struct {
 	Events          []InsightEvent   `json:"events"`
 	HasScan         bool             `json:"hasScan"`
 	SuppressedCount int              `json:"suppressedCount"`
-	OpenCount       int              `json:"openCount"` // 当前有效建议总数（== len(Findings)），供前端区分"本次新增"
+	// OpenCount 是**当前有效建议的真实总数**，供前端展示"共 N 条"，也是三个"全部…"动作
+	// （验证 / 添加为任务 / 删除）确认框里的那个数字。它**不**等于 len(Findings)：后者受
+	// insightFindingsListLimit 截断，而那几个动作在后端是全量执行的。截断由 Truncated 单独提示。
+	OpenCount int `json:"openCount"`
 	// Invalidated 是经验证已失效、从有效列表隐藏的建议（折叠展示，含 AI 判断依据）。
 	Invalidated  []InsightFinding        `json:"invalidated,omitempty"`
 	Verification *InsightVerificationRun `json:"verification,omitempty"`
@@ -2809,6 +2812,17 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 
 	resp := insightsResponse{DefaultAgent: s.currentInsightAgent(r.Context(), projectID), Findings: []InsightFinding{}, Events: []InsightEvent{}}
 	resp.Verification = s.loadRunningInsightVerification(r.Context(), projectID)
+	// openCount 必须是**真实总数**，不能取截断后的 findings 长度：它是汇总行「共 N 条有效建议」
+	// 与三个"全部…"动作（验证 / 添加为任务 / 删除）确认框上的那个数字，而这些动作在后端都是
+	// **全量**执行（resolveVerifyTargets / resolveToTaskTargets / scope=open 都没有 limit）。
+	// 报 500（截断上限）而实际处理 800，就是让用户在按下不可逆的按钮之前读到一个假数字。
+	// 列表本身截断到 insightFindingsListLimit，由 truncated 单独提示。
+	if err := s.db.QueryRowContext(r.Context(), `select count(*) from project_insights
+		where project_id=? and coalesce(verification_result,'')<>'invalid' and coalesce(status,?)<>?`,
+		projectID, insightStatusOpen, insightStatusDismissed).Scan(&resp.OpenCount); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("读取分析结果失败，请重试"))
+		return
+	}
 	row := s.db.QueryRowContext(r.Context(), `select id,project_id,status,error,agent,theme,focus_types,findings_count,suppressed_count,created_at,started_at,completed_at,coalesce(rejected_json,'')
 		from project_insight_scans where project_id=? order by created_at desc limit 1`, projectID)
 	var scan InsightScan
@@ -2939,11 +2953,9 @@ func (s *Server) listInsights(w http.ResponseWriter, r *http.Request) {
 				resp.Findings[i].LinkedTaskTitle = task.Title
 			}
 		}
-		resp.OpenCount = len(resp.Findings)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	resp.OpenCount = len(resp.Findings)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -3038,6 +3050,157 @@ func (s *Server) deleteInsightFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// insightDeleteRequest 是 POST /insights/delete 的 body：批量硬删建议。
+//
+// 二选一（**必须给其中一个**）：
+//   - `findingIds` 非空 → 删这些 id（跨项目/已不存在的自动跳过，不报错）；
+//   - `findingIds` 为空 → 走 `scope` 范围删：`open`（有效建议）/ `invalidated`（已失效）/
+//     `dismissed`（已忽略）/ `all`（本项目全部）。
+//
+// **scope 必须显式点名**：空 body 一律 400，而不是"缺省 = 全部"。批量硬删不可恢复，
+// 一个少写了字段的请求（或旧客户端重放）不该把整个项目的建议清空；"缺省即全部"这种便利
+// 只留给「添加到任务」那类可追溯、可再从任务板找回来的动作。
+type insightDeleteRequest struct {
+	FindingIDs []string `json:"findingIds"`
+	Scope      string   `json:"scope"`
+}
+
+// 批量删除的范围取值。
+const (
+	insightDeleteScopeOpen        = "open"
+	insightDeleteScopeInvalidated = "invalidated"
+	insightDeleteScopeDismissed   = "dismissed"
+	insightDeleteScopeAll         = "all"
+)
+
+// insightDeleteChunk 每批 delete 的最大 id 数。SQLite 的变量数有上限（默认 999），
+// 上限 500 条建议 + 1 个 projectID 本来也放得下，但这里是"用户勾了多少就删多少"，
+// 不跟着列表上限走 —— 分批是唯一不依赖那个数字的写法。
+const insightDeleteChunk = 200
+
+// insightDeleteScopeWhere 把 scope 翻成 where 片段与参数。三个片段与 listInsights 的
+// 三条列表查询**逐一对应**（有效 / 已失效 / 已忽略），保证「全部删除」删掉的就是汇总行
+// 上那个数字所指的那些建议。改了列表的谓词就要同步改这里，否则"显示 3 条、删掉 5 条"。
+func insightDeleteScopeWhere(scope string) (where string, args []any, ok bool) {
+	switch scope {
+	case insightDeleteScopeOpen:
+		return ` and coalesce(verification_result,'')<>'invalid' and coalesce(status,?)<>?`,
+			[]any{insightStatusOpen, insightStatusDismissed}, true
+	case insightDeleteScopeInvalidated:
+		return ` and coalesce(verification_result,'')='invalid' and coalesce(status,?)<>?`,
+			[]any{insightStatusOpen, insightStatusDismissed}, true
+	case insightDeleteScopeDismissed:
+		return ` and coalesce(status,?)=?`,
+			[]any{insightStatusOpen, insightStatusDismissed}, true
+	case insightDeleteScopeAll:
+		return "", nil, true
+	}
+	return "", nil, false
+}
+
+// dedupeInsightIDs 按首次出现顺序去重，并丢掉空白 id（前端理论上不会给空的，
+// 但计数要按"实际请求的那几条"算，重复 id 不能在 skipped 里虚增）。
+func dedupeInsightIDs(ids []string) []string {
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// deleteInsightFindings POST /api/projects/{projectID}/insights/delete
+// 批量硬删除，语义与单条 DELETE 完全一致（移除行 + 指纹，下次扫描同问题会被重新报告）。
+// 返回 {deleted, skipped}：skipped 仅统计"显式给了一批 id、但其中有几条不属于本项目
+// 或已经不在了"，用于前端提示"选中的有几条已经不在列表里"，不是错误。
+//
+// 只删 project_insights；由建议转成的任务（tasks.source_insight_fingerprint）不受影响 ——
+// 删建议的语义是"不想再看这条建议"，不是"撤销已经下发的任务"。
+func (s *Server) deleteInsightFindings(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("projectID")
+	if !s.projectExists(r.Context(), projectID) {
+		http.NotFound(w, r)
+		return
+	}
+	var req insightDeleteRequest
+	if !decodeOptional(w, r, &req) {
+		return
+	}
+	ids := dedupeInsightIDs(req.FindingIDs)
+	if len(ids) == 0 {
+		where, scopeArgs, ok := insightDeleteScopeWhere(strings.TrimSpace(req.Scope))
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("请提供 findingIds，或将 scope 设为 open / invalidated / dismissed / all 之一"))
+			return
+		}
+		res, err := s.db.ExecContext(r.Context(), `delete from project_insights where project_id=?`+where, append([]any{projectID}, scopeArgs...)...)
+		if err != nil {
+			log.Printf("[insights] project=%s batch delete scope=%s: %v", projectID, req.Scope, err)
+			writeError(w, http.StatusInternalServerError, errors.New("删除失败，请重试"))
+			return
+		}
+		deleted, err := res.RowsAffected()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("删除失败，请重试"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": int(deleted), "skipped": 0})
+		return
+	}
+	// 显式 ids：分批 delete，逐批累加受影响行数。where 里带 project_id，跨项目的 id 天然 0 行；
+	// 不存在的 id 同样 0 行 —— 两者都只影响 skipped 计数，不是错误。
+	//
+	// **全部批次包在同一个事务里**：分批只是为了绕开 SQLite 的变量数上限，语义上"删除选中"
+	// 是一次动作。若不包事务，第 2 批失败时第 1 批已经落库，而响应是"删除失败，请重试" ——
+	// 用户看到"失败"却已经有半批没了（列表少人、toast 说失败），而且前端会保留整份选择集，
+	// 重试后那半批只能记进 skipped，看起来像"这些建议本来就不在"。包事务后要么全删、要么全不删，
+	// "删除失败，请重试"才是句真话。
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("删除失败，请重试"))
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交成功后回滚是 no-op
+	deleted := 0
+	for start := 0; start < len(ids); start += insightDeleteChunk {
+		end := start + insightDeleteChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, projectID)
+		placeholders := make([]string, 0, len(chunk))
+		for _, id := range chunk {
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
+		res, err := tx.ExecContext(r.Context(), `delete from project_insights where project_id=? and id in (`+strings.Join(placeholders, ",")+`)`, args...)
+		if err != nil {
+			log.Printf("[insights] project=%s batch delete %d ids: %v", projectID, len(chunk), err)
+			writeError(w, http.StatusInternalServerError, errors.New("删除失败，请重试"))
+			return
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("删除失败，请重试"))
+			return
+		}
+		deleted += int(affected)
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[insights] project=%s batch delete commit: %v", projectID, err)
+		writeError(w, http.StatusInternalServerError, errors.New("删除失败，请重试"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "skipped": len(ids) - deleted})
 }
 
 // updateInsightFinding PATCH /api/projects/{projectID}/insights/{findingID}

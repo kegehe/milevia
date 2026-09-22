@@ -7,9 +7,17 @@ interface CodeFileViewProps {
   fontSize: number;
   editable?: boolean;
   onChange?: (value: string) => void;
+  /**
+   * 软换行。手机端**必须**开：代码在窄屏上横向滚动是没法读的，
+   * 而且横向滚动和"从边缘滑出返回手势"会互相抢事件。
+   *
+   * `EditorView` 不用新增依赖 —— `@uiw/react-codemirror` 已经
+   * `export * from '@codemirror/view'` 了。
+   */
+  wrap?: boolean;
 }
 
-export function CodeFileView({ content, filename, fontSize, editable = false, onChange }: CodeFileViewProps) {
+export function CodeFileView({ content, filename, fontSize, editable = false, onChange, wrap = false }: CodeFileViewProps) {
   const [EditorModule, setEditorModule] = useState<typeof import("@uiw/react-codemirror") | null>(null);
   const [extensions, setExtensions] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -23,13 +31,14 @@ export function CodeFileView({ content, filename, fontSize, editable = false, on
       .then(([module, nextExtensions]) => {
         if (cancelled) return;
         setEditorModule(module);
-        setExtensions(nextExtensions as any[]);
+        const languageExtensions = nextExtensions as any[];
+        setExtensions(wrap ? [...languageExtensions, module.EditorView.lineWrapping] : languageExtensions);
       })
       .catch(() => {
         if (!cancelled) setError("无法加载源码查看器，请刷新页面后重试。");
       });
     return () => { cancelled = true; };
-  }, [filename]);
+  }, [filename, wrap]);
 
   if (error) return <div className="file-editor-error"><p>{error}</p></div>;
   if (!EditorModule) return <div className="file-editor-loading"><div className="file-editor-spinner" /><span>加载源码查看器...</span></div>;

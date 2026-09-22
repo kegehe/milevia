@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import type { AgentID, AgentProfile, CredentialPool, QuotaGroup, RunnerInfo } from "../lib/types";
+import { agentDisplayName, agentEntry, agentPermissionModes, permissionCopy, catalogAgentID, useAgentCatalog } from "../lib/agent-registry";
 import "../agent-profiles.css";
 
 type ProfileAuthMode = "cli_managed" | "api_key";
@@ -27,6 +28,8 @@ const emptyPoolDraft = (): PoolDraft => ({ name: "", strategy: "fair_queue", pro
 type PendingConfirm = { kind: "disable" | "revoke"; profile: AgentProfile };
 
 export default function AgentProfilesPage() {
+  // 工具清单来自服务端目录：新增工具时这个下拉会自动多出一项。
+  const agentOptions = useAgentCatalog();
   const navigate = useNavigate();
   const [runners, setRunners] = useState<RunnerInfo[]>([]);
   const [runnerID, setRunnerID] = useState("");
@@ -239,18 +242,18 @@ export default function AgentProfilesPage() {
         {loading ? <p className="agent-profiles-loading">正在读取配置档案...</p>
           : profiles.length === 0 ? <div className="agent-profiles-empty"><h2>还没有配置档案</h2><p>新建一个档案后，可在新会话中选择它。</p></div>
             : <div className="agent-profiles-list">{profiles.map((profile) => <article key={profile.id} className={`agent-profile-row${profile.enabled ? "" : " disabled"}`}>
-              <div className="agent-profile-name"><b>{profile.name}</b><span>{profile.agentId === "codex" ? "Codex" : "Claude Code"}</span></div>
+              <div className="agent-profile-name"><b>{profile.name}</b><span>{agentDisplayName(profile.agentId)}</span></div>
               <div><small>模型</small><strong>{profile.model || "CLI 默认"}</strong></div>
               <div><small>认证</small><strong>{profile.authMode === "cli_managed" ? "CLI 登录" : "受管 API Key"}</strong></div>
               <div><small>版本</small><strong>r{profile.revision}</strong></div>
               <div className="agent-profile-actions"><button type="button" className="secondary" disabled={!profile.enabled || profile.state !== "active" || Boolean(testingID)} onClick={() => void validate(profile)}>{testingID === profile.id ? "检测中" : "检测"}</button><button type="button" className="secondary" disabled={!profile.enabled || profile.state !== "active"} onClick={() => { setQuotaProfile(profile); setQuotaDraft(emptyQuotaDraft()); setEditingQuotaGroup(null); setQuotaAttachmentID(""); }}>额度</button><button type="button" className="secondary" disabled={!profile.enabled || profile.state !== "active"} onClick={() => setDraft(draftForProfile(profile))}>编辑</button>{profile.enabled ? <button type="button" className="secondary" onClick={() => void disable(profile)}>停用</button> : <button type="button" className="secondary" disabled={profile.state !== "active"} onClick={() => void enable(profile)}>启用</button>}<button type="button" className="danger-text" disabled={profile.state !== "active"} onClick={() => void revoke(profile)}>撤销</button></div>
             </article>)}</div>}
-        {pools.length > 0 && <section className="credential-pools-section"><header><div><h2>凭据池</h2><p>池成员固定到创建时的版本；只允许相同 Agent、协议、端点与模型。</p></div></header><div className="credential-pools-list">{pools.map((pool) => <article key={pool.id}><div><b>{pool.name}</b><small>{pool.strategy} · 项目并发 {pool.projectMaxConcurrency}</small></div><p>{pool.members.map((member) => `${member.name} (${member.agentId === "codex" ? "Codex" : "Claude"}${member.model ? ` · ${member.model}` : ""})`).join("，")}</p></article>)}</div></section>}
+        {pools.length > 0 && <section className="credential-pools-section"><header><div><h2>凭据池</h2><p>池成员固定到创建时的版本；只允许相同 Agent、协议、端点与模型。</p></div></header><div className="credential-pools-list">{pools.map((pool) => <article key={pool.id}><div><b>{pool.name}</b><small>{pool.strategy} · 项目并发 {pool.projectMaxConcurrency}</small></div><p>{pool.members.map((member) => `${member.name} (${agentDisplayName(member.agentId)}${member.model ? ` · ${member.model}` : ""})`).join("，")}</p></article>)}</div></section>}
       </section>}
     {draft && <div className="backdrop" role="dialog" aria-modal="true" onClick={(event) => { if (event.target === event.currentTarget && !saving) setDraft(null); }}><form className="modal agent-profile-editor" onSubmit={(event) => void save(event)}>
       <header><div><h2>{draft.id ? "编辑配置档案" : "新建配置档案"}</h2></div><button type="button" title="关闭" disabled={saving} onClick={() => setDraft(null)}>x</button></header>
       <div className="agent-profile-editor-body">
-        {!draft.id && <label>工具<select value={draft.agentId} onChange={(event) => setDraft({ ...draft, agentId: event.target.value as AgentID })}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label>}
+        {!draft.id && <label>工具<select value={draft.agentId} onChange={(event) => setDraft({ ...draft, agentId: event.target.value as AgentID })}>{agentOptions.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select></label>}
         <label>名称<input autoFocus required maxLength={80} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
         <label>认证方式<select value={draft.authMode} onChange={(event) => setDraft({ ...draft, authMode: event.target.value as ProfileAuthMode, baseUrl: event.target.value === "api_key" ? draft.baseUrl : "" })}><option value="cli_managed">CLI 登录</option><option value="api_key">受管 API Key</option></select></label>
         <label>模型<input maxLength={128} value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder="留空使用 CLI 默认模型" /></label>

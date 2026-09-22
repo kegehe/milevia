@@ -25,9 +25,53 @@ interface FileViewerProps {
   onDecreaseFont: () => void;
   canIncreaseFont: boolean;
   canDecreaseFont: boolean;
+  /**
+   * 手机端才传：图片字节要从中继取回来（见 `MobileFsRequest.resolveMedia`）。
+   *
+   * 桌面端不传，仍然走 `/fs/raw` 那条 URL 路径 —— 那是本机接口，浏览器直接导航过去
+   * 就能拿到字节（session 头由 `ProjectImage` 自己补）。手机端两条都不成立：
+   * `/fs/raw` 是一次浏览器导航带不了令牌，而手机的 WebView 也到不了电脑的本机端口。
+   */
+  media?: FileViewerMedia;
+  /** 手机端不提供文件下载；为 true 时不给「下载」按钮，改成一句说明。 */
+  disableDownload?: boolean;
+  /**
+   * 手机端布局：只读源码也要**软换行**。
+   *
+   * 查看与编辑必须一致 —— 只在编辑器里开换行的话，用户看完再点"编辑"，同一段代码
+   * 会从"一行到底、右半边被裁掉"变成"折行显示"，位置全变。而 `CodeFileView` 的默认
+   * 是不换行（桌面端要横向滚动看长行），所以这里必须显式传下去。
+   */
+  mobile?: boolean;
+  /**
+   * 服务端省掉了文件内容时的说明（文件太大 / 不是文本）。
+   *
+   * 非空时**只渲染元信息卡**，不看 `previewKind` —— 因为这时候根本没有内容可渲染，
+   * 而 `previewKind` 是按扩展名算的，一个大 .ts 文件会算出 "source"，
+   * 按它渲染就是一个空白编辑器，用户会以为文件是空的。
+   */
+  omittedMessage?: string;
+  /**
+   * 服务端判定的"这个文件能不能改"（只有手机端会给，桌面端为 undefined）。
+   *
+   * 必须在**服务端**判：能不能编辑取决于内容发不发得回去（要减掉 JSON 转义与中继信封的
+   * 余量），客户端按扩展名自己判会多出一条 256–320 KiB 的"可编辑"带，用户改完按保存才失败。
+   */
+  editable?: boolean;
+  /** `editable` 为 false 时的原因，用来在工具条上说清"为什么不能改"。 */
+  readOnlyReason?: "file_too_large" | "binary_file";
 }
 
-export function FileViewer({ content, stat, previewKind, projectId, conversationId, request, onEdit, readOnly, fontSize, onIncreaseFont, onDecreaseFont, canIncreaseFont, canDecreaseFont }: FileViewerProps) {
+/** 手机端的图片字节来源。 */
+export interface FileViewerMedia {
+  resolve(path: string): Promise<MediaResolution>;
+}
+
+export type MediaResolution =
+  | { kind: "ready"; base64: string; mimeType: string }
+  | { kind: "unavailable"; message: string };
+
+export function FileViewer({ content, stat, previewKind, projectId, conversationId, request, onEdit, readOnly, fontSize, onIncreaseFont, onDecreaseFont, canIncreaseFont, canDecreaseFont, media, disableDownload, mobile, omittedMessage, editable, readOnlyReason }: FileViewerProps) {
   const [imageErrorPath, setImageErrorPath] = useState<string | null>(null);
   const [sqliteInvalidPath, setSqliteInvalidPath] = useState<string | null>(null);
   const imageError = imageErrorPath === stat.path;
@@ -35,7 +79,14 @@ export function FileViewer({ content, stat, previewKind, projectId, conversation
   const handleImageError = useCallback(() => setImageErrorPath(stat.path), [stat.path]);
   const handleNotDatabase = useCallback(() => setSqliteInvalidPath(stat.path), [stat.path]);
   const activePreviewKind = previewKind === "sqlite" && sqliteInvalid ? "binary" : previewKind;
-  const canEdit = isEditableFile(stat) && activePreviewKind !== "large" && activePreviewKind !== "sqlite";
+  // `editable === false` 是服务端的判定，优先级高于下面的本地判据：它知道内容能不能
+  // 原样发回去，而 `isEditableFile` 只看扩展名与 isText。
+  const serverReadOnly = editable === false;
+  // 没有内容可渲染时，编辑按钮也不能亮：那会把用户带进一个空编辑器，
+  // 而它一保存就把整个文件覆盖成空的。
+  const canEdit = !omittedMessage && !serverReadOnly && isEditableFile(stat) && activePreviewKind !== "large" && activePreviewKind !== "sqlite";
+  const readOnlyHint = readOnlyReason === "binary_file" ? "只读 · 非文本文件" : "只读 · 文件较大";
+
 
   return (
     <div className="file-viewer text-viewer">
@@ -52,37 +103,119 @@ export function FileViewer({ content, stat, previewKind, projectId, conversation
           </div>
           {canEdit && !readOnly && <button type="button" className="file-viewer-edit-btn" onClick={onEdit}>编辑</button>}
           {canEdit && readOnly && <span className="file-viewer-readonly-hint">只读</span>}
+          {/* 服务端说不能改时，按钮根本不渲染 —— 所以那句解释必须**另起一支**，
+              否则用户只看到一个没有「编辑」的工具条，看不出是文件太大还是别的什么。
+              内容被省略时不再重复：正文那张元信息卡已经说清了。 */}
+          {!canEdit && !omittedMessage && serverReadOnly && <span className="file-viewer-readonly-hint">{readOnlyHint}</span>}
         </div>
       </div>
-      {activePreviewKind === "image" && <ImagePreview projectId={projectId} conversationId={conversationId} stat={stat} failed={imageError} onError={handleImageError} />}
-      {activePreviewKind === "sqlite" && <SqliteViewer projectId={projectId} conversationId={conversationId} path={stat.path} request={request} onNotDatabase={handleNotDatabase} />}
-      {activePreviewKind === "json" && <JsonViewer content={content} stat={stat} fontSize={fontSize} />}
-      {activePreviewKind === "markdown" && <MarkdownPreview content={content} projectId={projectId} conversationId={conversationId} baseDir={getDirPath(stat.path)} fontSize={fontSize} />}
-      {activePreviewKind === "source" && <CodeFileView content={content} filename={stat.name} fontSize={fontSize} />}
-      {activePreviewKind === "large" && <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} message="文本文件超过 10MB，无法在页面中打开。" />}
-      {activePreviewKind === "binary" && <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} message={sqliteInvalid ? "该文件不是有效的 SQLite 数据库，无法直接预览。" : "该文件是二进制文件，无法直接预览。"} />}
+      {omittedMessage !== undefined
+        ? <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} message={omittedMessage} disableDownload={disableDownload} />
+        : <>
+          {activePreviewKind === "image" && <ImagePreview projectId={projectId} conversationId={conversationId} media={media} disableDownload={disableDownload} stat={stat} failed={imageError} onError={handleImageError} />}
+          {activePreviewKind === "sqlite" && <SqliteViewer projectId={projectId} conversationId={conversationId} path={stat.path} request={request} onNotDatabase={handleNotDatabase} />}
+          {activePreviewKind === "json" && <JsonViewer content={content} stat={stat} fontSize={fontSize} />}
+          {activePreviewKind === "markdown" && <MarkdownPreview content={content} projectId={projectId} conversationId={conversationId} baseDir={getDirPath(stat.path)} fontSize={fontSize} media={media} />}
+          {activePreviewKind === "source" && <CodeFileView content={content} filename={stat.name} fontSize={fontSize} wrap={mobile} />}
+          {activePreviewKind === "large" && <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} disableDownload={disableDownload} message="文本文件超过 10MB，无法在页面中打开。" />}
+          {activePreviewKind === "binary" && <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} disableDownload={disableDownload} message={sqliteInvalid ? "该文件不是有效的 SQLite 数据库，无法直接预览。" : "该文件是二进制文件，无法直接预览。"} />}
+        </>}
     </div>
   );
 }
 
-function ImagePreview({ projectId, conversationId, stat, failed, onError }: { projectId: string; conversationId?: string; stat: FileInfo; failed: boolean; onError: () => void }) {
+/**
+ * 手机端：把中继取回来的字节变成 `<img>` 能用的地址。
+ *
+ * 用 object URL 而不是 `data:` —— CSP 经常会拦 `data:`，而且一长串 base64 留在
+ * 元素属性里既费内存又会出现在 DOM 检查器里。object URL 必须在卸载时撤销，
+ * 所以这件事只能由一个 React 组件做：适配器是纯模块，管不了生命周期。
+ */
+function useMobileMedia(media: FileViewerMedia | undefined, path: string): { url: string | null; message: string | null } {
+  const [state, setState] = useState<{ url: string | null; message: string | null }>({ url: null, message: null });
+  useEffect(() => {
+    if (!media) return;
+    let cancelled = false;
+    let createdUrl = "";
+    setState({ url: null, message: null });
+    void media
+      .resolve(path)
+      .then((resolution) => {
+        if (cancelled) return;
+        if (resolution.kind === "unavailable") {
+          setState({ url: null, message: resolution.message });
+          return;
+        }
+        const url = URL.createObjectURL(base64ToBlob(resolution.base64, resolution.mimeType));
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        createdUrl = url;
+        setState({ url, message: null });
+      })
+      .catch(() => {
+        if (!cancelled) setState({ url: null, message: "读不到这个图片" });
+      });
+    return () => {
+      cancelled = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  }, [media, path]);
+  return state;
+}
+
+function base64ToBlob(base64: string, mimeType: string): Blob {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return new Blob([bytes], { type: mimeType });
+}
+
+function ImagePreview({ projectId, conversationId, media, disableDownload, stat, failed, onError }: { projectId: string; conversationId?: string; media?: FileViewerMedia; disableDownload?: boolean; stat: FileInfo; failed: boolean; onError: () => void }) {
+  const mobile = useMobileMedia(media, stat.path);
+  if (media) {
+    // 拿不到字节时把**原因**说出来（超过内联上限 / 不是图片 / 电脑离线），
+    // 一句"图片加载失败"会让用户以为是文件坏了或者网络有问题。
+    if (mobile.message) return <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} disableDownload={disableDownload} message={mobile.message} />;
+    if (!mobile.url) return <div className="image-preview"><span className="image-preview-loading" role="status" aria-label="图片加载中" /></div>;
+    return <div className="image-preview"><img src={mobile.url} alt={stat.name} onError={onError} /></div>;
+  }
   const url = `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(stat.path)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   if (failed) return <FileMessage projectId={projectId} conversationId={conversationId} stat={stat} message="图片加载失败。" />;
   return <div className="image-preview"><ProjectImage url={url} alt={stat.name} onError={onError} /></div>;
 }
 
-function FileMessage({ projectId, conversationId, stat, message }: { projectId: string; conversationId?: string; stat: FileInfo; message: string }) {
-  const url = `/api/projects/${projectId}/fs/download?path=${encodeURIComponent(stat.path)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
-  return <div className="binary-info"><FileIcon iconKey="file" size={48} /><div className="binary-info-name">{stat.name}</div><div className="binary-info-details"><div>{message}</div><div>类型：{stat.mimeType || "未知"}</div><div>大小：{formatSize(stat.size)}</div><div>修改时间：{stat.modTime}</div></div><DownloadLink url={url} filename={stat.name} /></div>;
+function FileMessage({ projectId, conversationId, stat, message, disableDownload }: { projectId: string; conversationId?: string; stat: FileInfo; message: string; disableDownload?: boolean }) {
+  // 手机端连下载地址都不拼：那个 URL 在手机上没有任何一条路径能走通，
+  // 摆在 DOM 里只会让人以为"点一下就能下载"。
+  const url = disableDownload ? "" : `/api/projects/${projectId}/fs/download?path=${encodeURIComponent(stat.path)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
+  return <div className="binary-info"><FileIcon iconKey="file" size={48} /><div className="binary-info-name">{stat.name}</div><div className="binary-info-details"><div>{message}</div><div>类型：{stat.mimeType || "未知"}</div><div>大小：{formatSize(stat.size)}</div><div>修改时间：{stat.modTime}</div></div>{disableDownload ? <div className="binary-info-download-note">手机端不提供文件下载，请在电脑上获取。</div> : <DownloadLink url={url} filename={stat.name} />}</div>;
 }
 
-function MarkdownPreview({ content, projectId, conversationId, baseDir, fontSize }: { content: string; projectId: string; conversationId?: string; baseDir: string; fontSize: number }) {
-  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>, img: ({ src, alt }) => <MarkdownImage src={markdownImageUrl(src ?? "", baseDir, projectId, conversationId)} alt={alt ?? ""} /> }}>{content}</ReactMarkdown></div>;
+function MarkdownPreview({ content, projectId, conversationId, baseDir, fontSize, media }: { content: string; projectId: string; conversationId?: string; baseDir: string; fontSize: number; media?: FileViewerMedia }) {
+  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>, img: ({ src, alt }) => <MarkdownImage src={src ?? ""} alt={alt ?? ""} baseDir={baseDir} projectId={projectId} conversationId={conversationId} media={media} /> }}>{content}</ReactMarkdown></div>;
 }
 
-function MarkdownImage({ src, alt }: { src: string; alt: string }) {
-  if (!src.startsWith("/api/")) return <img src={src} alt={alt} loading="lazy" />;
-  return <ProjectImage url={src} alt={alt} loading="lazy" />;
+function MarkdownImage({ src, alt, baseDir, projectId, conversationId, media }: { src: string; alt: string; baseDir: string; projectId: string; conversationId?: string; media?: FileViewerMedia }) {
+  const relative = markdownImagePath(src, baseDir);
+  // 外链（http/https/data/协议相对）由 <img> 直接加载，不经项目文件通道。
+  if (relative === null) return <img src={src} alt={alt} loading="lazy" />;
+  if (media) return <MarkdownProjectImage media={media} path={relative} alt={alt} />;
+  return <ProjectImage url={rawFileUrl(projectId, relative, conversationId)} alt={alt} loading="lazy" />;
+}
+
+/**
+ * Markdown 里的项目内插图（手机端）。
+ *
+ * 一张图读不出来**不能**把整篇文档带崩：拿不到就退回 alt 文本的占位，
+ * 与桌面端 `<img>` 挂掉时的表现一致。
+ */
+function MarkdownProjectImage({ media, path, alt }: { media: FileViewerMedia; path: string; alt: string }) {
+  const state = useMobileMedia(media, path);
+  if (state.message) return <span className="markdown-image-unavailable" role="img" aria-label={alt}>{alt || "图片"}</span>;
+  if (!state.url) return <span className="image-preview-loading" role="status" aria-label="图片加载中" />;
+  return <img src={state.url} alt={alt} loading="lazy" />;
 }
 
 function ProjectImage({ url, alt, onError, loading }: { url: string; alt: string; onError?: () => void; loading?: "eager" | "lazy" }) {
@@ -173,10 +306,21 @@ function safeHref(href: string | undefined): string | undefined {
 
 function isExternal(href: string | undefined): boolean { return Boolean(href && /^(https?|ftp):|^\/\//i.test(href)); }
 
-function markdownImageUrl(src: string, baseDir: string, projectId: string, conversationId?: string): string {
-  if (/^(https?:|data:|\/\/)/i.test(src)) return src;
+/**
+ * 把 Markdown 里的图片地址折成**项目内相对路径**；返回 null 表示这个地址不该走
+ * 项目文件通道（外链、data URI、或者本来就已经是绝对接口地址）。
+ *
+ * 折成相对路径而不是直接拼 URL：手机端要用同一个路径去中继取字节，
+ * 两端必须从同一个值出发，否则"桌面能看到、手机看不到"会变成一个查不出来的差异。
+ */
+function markdownImagePath(src: string, baseDir: string): string | null {
+  if (/^(https?:|data:|\/\/|\/api\/)/i.test(src)) return null;
   const path = src.split(/[?#]/, 1)[0];
   const parts = baseDir.split("/").filter(Boolean);
   for (const part of path.split("/")) { if (!part || part === ".") continue; if (part === "..") parts.pop(); else parts.push(part); }
-  return `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(parts.join("/"))}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
+  return parts.join("/");
+}
+
+function rawFileUrl(projectId: string, relativePath: string, conversationId?: string): string {
+  return `/api/projects/${projectId}/fs/raw?path=${encodeURIComponent(relativePath)}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ""}`;
 }

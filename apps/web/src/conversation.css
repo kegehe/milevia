@@ -545,6 +545,9 @@
 .new-conversation-dialog .new-conversation-agent-card:disabled { color: #86978f; background: #f5f7f5; cursor: not-allowed; opacity: 1; }
 .new-conversation-agent-mark { display: grid; width: 34px; height: 34px; grid-row: 1 / span 2; place-items: center; border: 1px solid #bcdacb; border-radius: 6px; color: #277565; background: #e8f5ed; }
 .new-conversation-agent-mark.codex { border-color: #b8cadd; color: #365f83; background: #ebf2f8; }
+/* 基类沿用的是 Claude 的绿。目录里新增、还没做过视觉设计的工具必须给中性色，
+   否则它在界面上看起来"就是 Claude"——而名字已经正确，只有颜色在说谎。 */
+.new-conversation-agent-mark:not(.claude-code):not(.codex) { border-color: #dcdcd6; color: #6b6b66; background: #f4f3f0; }
 .new-conversation-agent-card:disabled .new-conversation-agent-mark { border-color: #d7e0da; color: #8b9a92; background: #eef1ef; }
 .new-conversation-agent-icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.75; }
 .new-conversation-agent-copy { display: grid; min-width: 0; gap: 3px; }
@@ -579,6 +582,10 @@
 .new-conversation-loading { display: flex; align-items: center; gap: 9px; color: #59776b; background: #f4faf6; }
 .new-conversation-loading > span { width: 13px; height: 13px; flex: none; border: 2px solid #bdd8cb; border-top-color: #347d68; border-radius: 50%; animation: new-conversation-spinner .7s linear infinite; }
 .new-conversation-error { color: #9d4936; background: #fff2ef; }.new-conversation-error.inline { margin-top: 10px; }
+.new-conversation-no-tool { display: flex; flex-direction: column; gap: 9px; }
+.new-conversation-no-tool .new-conversation-error.inline { margin-top: 0; }
+.new-conversation-manage-tools { align-self: flex-start; min-height: 30px; border: 1px solid #267b67; border-radius: 6px; color: #eefcf5; background: #2c7567; padding: 0 12px; font-size: 12px; font-weight: 700; }
+.new-conversation-manage-tools:hover:not(:disabled) { border-color: #1c5b4d; background: #1f6556; }
 .new-conversation-notice { margin-bottom: 15px; border: 1px solid #e7d3a6; color: #86601d; background: #fff9e9; }
 .new-conversation-dialog > footer { min-height: 64px; flex: none; border-top-color: #d8e7de; padding: 12px 20px; background: #f8fcf9; }
 .new-conversation-summary { min-width: 0; flex: 1; overflow: hidden; color: #6b8378; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
@@ -2108,6 +2115,12 @@
 .runner-inline.unavailable,
 .runner-inline.needs_auth { border-color: #ead4a8; color: #85671c; background: #fff8e8; }
 
+/* 「这个执行环境不提供该工具」与「提供了但没装」是两件事，视觉上也要分开：
+   unavailable 是琥珀色（在这里能修，所以提示要显眼），unsupported 用中性灰
+   （在这里无事可做，显眼只会误导用户去点一个不存在的安装入口）。 */
+.runner-inline.unsupported { border-color: #e2e0d9; color: #8a8a84; background: #faf9f6; }
+.runner-inline.unsupported i { background: #a9a7a0; }
+
 /* 更新失败弹窗：失败原因通常比普通提示长（可能带 CLI 输出），
    需要独立滚动区域，避免被弹窗 max-height 裁剪而看不到报错。 */
 .update-error-dialog .update-error-reason {
@@ -3378,6 +3391,8 @@
   font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .history-item-agent.codex { border-color: #d5e2b7; color: #61782d; background: #f5f8ea; }
+/* 同上：新增工具给中性色，不要继承 Claude 的绿。 */
+.history-item-agent:not(.claude-code):not(.codex) { border-color: #dcdcd6; color: #6b6b66; background: #f4f3f0; }
 .history-item-orchestration {
   flex: none;
   border: 1px solid #cdbfe8;

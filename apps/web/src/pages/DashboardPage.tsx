@@ -52,8 +52,11 @@ function McpIcon() {
   return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5" /><rect x="13" y="13" width="7" height="7" rx="1.5" /><path d="M11 7.5h4.5a1.5 1.5 0 0 1 1.5 1.5V11M13 16.5H8.5A1.5 1.5 0 0 1 7 15v-2" /></svg>;
 }
 
-export default function DashboardPage() {
-  const { projects, projectStatuses, error, setError, refreshProjects, removeProject, api } = useProjectContext();
+function CliToolsIcon() {
+  return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" /><path d="M7.5 10.5 10 13l-2.5 2.5M12.5 15.5h4" /></svg>;
+}
+
+export default function DashboardPage() {  const { projects, projectStatuses, error, setError, refreshProjects, removeProject, api } = useProjectContext();
   const processStatuses = useProcessStatusMap();
   const navigate = useNavigate();
   const [filter, setFilter] = useState<ProjectFilter>("all");
@@ -165,6 +168,7 @@ export default function DashboardPage() {
         <button type="button" className="dashboard-action dashboard-action-remote secondary" title="远程控制" aria-label="远程控制" onClick={() => navigate("/mobile")}><RemotePairingIcon /><span>远程控制</span></button>
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
         <button className="dashboard-action dashboard-action-mcp secondary" title="MCP连接" onClick={() => navigate("/mcp-manager")}><McpIcon /><span>MCP连接</span></button>
+        <button className="dashboard-action dashboard-action-cli-tools secondary" title="CLI 工具" onClick={() => navigate("/cli-tools")}><CliToolsIcon /><span>CLI 工具</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
       </div>
     </header>

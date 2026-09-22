@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AgentID } from "../../lib/types";
+import { agentDisplayName, catalogAgentID, useAgentCatalog } from "../../lib/agent-registry";
 import "./project-ai-config.css";
 
 // GET /api/projects/{id}/agent-config 的只读视图。
@@ -22,6 +23,9 @@ type AgentEntry = {
 type AgentConfigView = {
   runnerId: string;
   runnerManaged: boolean;
+  // 按工具目录索引的视图（服务端派生）。claude / codex 两个键是过渡兼容，
+  // 值由 agents 派生，前端不再分别读它们。
+  agents?: Record<string, AgentEntry | null>;
   claude?: AgentEntry | null;
   codex?: AgentEntry | null;
 };
@@ -31,11 +35,6 @@ type CredentialPool = {
   members: { agentId: AgentID }[];
 };
 
-const AGENT_IDS: { id: AgentID; label: string; detail: string }[] = [
-  { id: "claude-code", label: "Claude Code", detail: "Anthropic 官方 CLI" },
-  { id: "codex", label: "Codex", detail: "OpenAI CLI" },
-];
-
 function AuthModeSwitch({ mode, onChange, disabled }: { mode: string; onChange: (next: "cli_managed" | "api_key") => void; disabled: boolean }) {
   return <div className="project-config-authmode">
     <button type="button" className={mode === "cli_managed" ? "active" : ""} disabled={disabled} onClick={() => onChange("cli_managed")}>使用 CLI 登录</button>
@@ -44,6 +43,8 @@ function AuthModeSwitch({ mode, onChange, disabled }: { mode: string; onChange: 
 }
 
 export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectId: string; runnerID: string; close: () => void }) {
+  // 工具清单来自服务端目录，本文件不再自己维护一份。
+  const agents = useAgentCatalog();
   const [config, setConfig] = useState<AgentConfigView | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -76,7 +77,7 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
   useEffect(() => { void refresh(); }, [refresh]);
 
   const manageable = config?.runnerManaged ?? true;
-  const entryFor = (agentId: AgentID): AgentEntry | null | undefined => (agentId === "codex" ? config?.codex : config?.claude);
+  const entryFor = (agentId: AgentID): AgentEntry | null | undefined => config?.agents?.[agentId] ?? null;
   const draftFor = (agentId: AgentID): { model: string; baseUrl: string; authMode: "cli_managed" | "api_key"; apiKey: string } => {
     const draft = drafts[agentId];
     const entry = entryFor(agentId);
@@ -134,7 +135,7 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
       // 设为本项目默认，新会话自动套用。
       await api(`/api/projects/${projectId}/agent-profile`, { method: "PATCH", body: JSON.stringify({ agentId, profileId }) });
       setDrafts((current) => ({ ...current, [agentId]: { model: draft.model, baseUrl: draft.baseUrl, authMode: draft.authMode, apiKey: "" } }));
-      setNotice(`已保存${agentId === "codex" ? " Codex" : " Claude Code"}配置，新会话将自动应用。`);
+      setNotice(`已保存 ${agentDisplayName(agentId)} 配置，新会话将自动应用。`);
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法保存配置");
@@ -151,7 +152,7 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
     setNotice("");
     try {
       await api(`/api/projects/${projectId}/agent-profile`, { method: "PATCH", body: JSON.stringify({ agentId, profileId: "" }) });
-      setNotice(`已清空${agentId === "codex" ? " Codex" : " Claude Code"}配置，之后新会话使用 CLI 原有配置。`);
+      setNotice(`已清空 ${agentDisplayName(agentId)} 配置，之后新会话使用 CLI 原有配置。`);
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法清空配置");
@@ -166,7 +167,7 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
     setSaving(true); setSavingAgent(agentId); setError(""); setNotice("");
     try {
       await api(`/api/projects/${projectId}/agent-pool`, { method: "POST", body: JSON.stringify({ agentId, poolRevisionId }) });
-      setNotice(`已为 ${agentId === "codex" ? "Codex" : "Claude Code"} 应用凭据池。`);
+      setNotice(`已为 ${agentDisplayName(agentId)} 应用凭据池。`);
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法应用凭据池");
@@ -191,7 +192,10 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
         {notice && <div className="project-config-notice" role="status">{notice}</div>}
         {loading && !config ? <p className="project-config-loading">正在读取…</p>
           : <div className="project-config-agents">
-            {AGENT_IDS.map(({ id, label, detail }) => {
+            {agents.map((catalogEntry) => {
+              const id = catalogAgentID(catalogEntry);
+              const label = catalogEntry.name;
+              const detail = `${catalogEntry.vendor} CLI`;
               const entry = entryFor(id);
               const draft = draftFor(id);
               const busy = saving && savingAgent === id;

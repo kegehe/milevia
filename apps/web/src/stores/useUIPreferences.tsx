@@ -1,7 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { Capacitor } from "@capacitor/core";
 import { api } from "../lib/api";
 import type { AgentID, PermissionMode } from "../lib/types";
-import { isClockTime } from "../lib/notifications";
+import { isDesktop } from "../lib/runtime";
+import { isClockTime, webNotificationsSupported } from "../lib/notifications";
 
 const STORAGE_KEY = "milevia:settings:v1";
 
@@ -9,6 +11,9 @@ export type AppPreferences = {
   defaultAgentId: AgentID;
   claudePermissionMode: Extract<PermissionMode, "approval_required" | "full_control">;
   codexPermissionMode: Extract<PermissionMode, "read_only" | "workspace_write" | "full_control">;
+  // 按工具目录索引的默认权限模式（服务端派生视图）。新代码读它，不再分别读上面两个
+  // 历史字段 —— 那两个字段是存储层的历史包袱，前端不该再去理解它们的对应关系。
+  agentPermissionModes?: Partial<Record<string, PermissionMode>>;
   autoReview: boolean;
   updatedAt?: string;
 };
@@ -60,8 +65,21 @@ const defaultLocalPreferences: LocalPreferences = {
 
 const UIPreferencesContext = createContext<UIPreferencesContextValue | null>(null);
 
+/**
+ * 当前环境能不能真的用上 Web Notification（判定依据见 lib/notifications.ts）。
+ * 桌面端与原生包里这条 API 是死路：权限永远拿不到 granted、`new Notification()` 也没人渲染，
+ * 所以这里一律报"不支持"，而不是把 WebView2 那个无法被用户改掉的 denied 当成"被拒绝"摆出去。
+ */
+function webNotificationsAvailable(): boolean {
+  return webNotificationsSupported({
+    hasNotificationAPI: typeof Notification !== "undefined",
+    isDesktop: isDesktop(),
+    isNativePlatform: Capacitor.isNativePlatform(),
+  });
+}
+
 function getNotificationPermission(): NotificationPermission | "unsupported" {
-  if (typeof Notification === "undefined") return "unsupported";
+  if (!webNotificationsAvailable()) return "unsupported";
   return Notification.permission;
 }
 
@@ -145,7 +163,7 @@ export function UIPreferencesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const requestSystemNotificationPermission = useCallback(async () => {
-    if (typeof Notification === "undefined") return "unsupported" as const;
+    if (!webNotificationsAvailable()) return "unsupported" as const;
     const permission = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
     setNotificationPermission(permission);
     if (permission === "granted") updateLocalPreferences({ systemNotificationsEnabled: true });

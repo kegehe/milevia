@@ -1,17 +1,33 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { Capacitor } from "@capacitor/core";
 import "./style.css";
 import "./markdown.css";
 import "./notification.css";
 import { App } from "./App";
 import { getDesktopRuntime, isDesktop } from "./lib/runtime";
+import { purgeServiceWorkerState, serviceWorkerPolicy } from "./lib/service-worker";
 import { TrayPanel } from "./tray/TrayPanel";
 
 // 托盘面板窗口通过 Rust 注入 mode:"tray" 分流渲染：绕过主应用路由，
 // 只挂载轻量的品牌弹出面板（不含 WebSocket 轮询等主窗逻辑）。
 const isTray = getDesktopRuntime()?.mode === "tray";
 
-if (!isTray && "serviceWorker" in navigator && window.location.protocol.startsWith("http")) {
+// Service Worker 只在「真正的网页」上注册：桌面端（Tauri）与手机 App（Capacitor）
+// 的页面资源都是随包的本地文件，缓存它们没有收益，只会让 SW 缓存里的旧外壳引用
+// 新安装包里已不存在的 /assets/index-<hash>.js，升级后第一次启动白屏
+// （完整链路见 lib/service-worker.ts 顶部）。应用外壳走的是「主动注销 + 清缓存」，
+// 否则已经装过旧版本的机器不会因为这次改动而恢复。
+const serviceWorkerDecision = serviceWorkerPolicy({
+  isTray,
+  isDesktop: isDesktop(),
+  isNativePlatform: Capacitor.isNativePlatform(),
+  protocol: window.location.protocol,
+});
+if (serviceWorkerDecision === "purge") {
+  void purgeServiceWorkerState();
+} else if (serviceWorkerDecision === "register" && "serviceWorker" in navigator) {
+  // 浏览器不支持 Service Worker 时 navigator.serviceWorker 根本不存在，直接注册会抛错。
   window.addEventListener("load", () => { void navigator.serviceWorker.register("/sw.js"); });
 }
 

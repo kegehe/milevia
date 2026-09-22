@@ -28,10 +28,18 @@ func TestRemoteRelayAcceptsDesktopSessionForPairingOnly(t *testing.T) {
 		{"session token may confirm a pairing", "/api/remote/pairing/confirm", map[string]string{"X-Milevia-Session": "sess-1"}, true},
 		{"session token may poll the pairing status", "/api/remote/pairing/status", map[string]string{"X-Milevia-Session": "sess-1"}, true},
 		{"session token may read the agent status", "/api/remote/agent-status", map[string]string{"X-Milevia-Session": "sess-1"}, true},
+		{"session token may read which phone is bound", "/api/remote/bindings", map[string]string{"X-Milevia-Session": "sess-1"}, true},
+		{"session token may unbind the current phone", "/api/remote/bindings/revoke", map[string]string{"X-Milevia-Session": "sess-1"}, true},
 		{"a trailing slash still resolves to the pairing endpoint", "/api/remote/pairing/", map[string]string{"X-Milevia-Session": "sess-1"}, true},
 		{"session token may not drain the outbox", "/api/remote/outbox", map[string]string{"X-Milevia-Session": "sess-1"}, false},
 		{"session token may not submit command results", "/api/remote/commands", map[string]string{"X-Milevia-Session": "sess-1"}, false},
 		{"session token may not forge credentials", "/api/remote/credentials", map[string]string{"X-Milevia-Session": "sess-1"}, false},
+		// /api/remote/rpc 是这个命名空间里唯一提供文件读写的端点（见 app.go 里那段说明）。
+		// 它必须**只认 Agent 令牌**：桌面页会话已经能通过 X-Milevia-Session 调本机
+		// 全部 /api/projects/* 接口，再让它多一条"以 Agent 身份操作项目文件"的路，
+		// 等于给一个被 XSS 拿到的页面加一条绕过 session 边界的出口。
+		{"session token may not read project files", "/api/remote/rpc", map[string]string{"X-Milevia-Session": "sess-1"}, false},
+		{"the agent token may use the file relay", "/api/remote/rpc", map[string]string{"X-Milevia-Agent-Token": "agent-1"}, true},
 		{"a wrong session token is rejected", "/api/remote/pairing", map[string]string{"X-Milevia-Session": "nope"}, false},
 		{"missing credentials are rejected", "/api/remote/pairing", nil, false},
 		{"the agent token still works on relay endpoints", "/api/remote/outbox", map[string]string{"X-Milevia-Agent-Token": "agent-1"}, true},

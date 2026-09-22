@@ -18,9 +18,6 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
-	"unicode/utf8"
-
-	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 // RunStatus 表示项目运行进程的状态。
@@ -266,8 +263,9 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 	windowsPIDReady := pr.windowsPIDReady
 	pr.mu.Unlock()
 
-	// 设置环境变量
-	pr.cmd.Env = os.Environ()
+	// 设置环境变量：先补齐 UTF-8 输出变量（见 output_encoding.go），再叠加本次运行的
+	// 自定义变量——后者排在末尾，可覆盖默认值。
+	pr.cmd.Env = appendUTF8ChildEnv(os.Environ())
 	for k, v := range pr.envVars {
 		pr.cmd.Env = append(pr.cmd.Env, k+"="+v)
 	}
@@ -604,22 +602,8 @@ func (pr *projectRunner) decodeWindowsOutput() bool {
 	return pr.executionTarget == RunExecutionTargetWindows
 }
 
-// gbkDecoder 复用的 GBK→UTF-8 解码器，避免每行重建。
-var gbkDecoder = simplifiedchinese.GBK.NewDecoder()
-
-// decodeRunOutputLine 把一行输出规范化为 UTF-8。transcode 为 false 时原样返回；
-// 为 true 时，若整行已是合法 UTF-8 则原样返回（避免把已按 UTF-8 输出的程序二次
-// 破坏），否则尝试按 GBK 解码。
-func decodeRunOutputLine(line []byte, transcode bool) string {
-	if !transcode || utf8.Valid(line) || len(line) == 0 {
-		return string(line)
-	}
-	decoded, err := gbkDecoder.Bytes(line)
-	if err != nil {
-		return string(line)
-	}
-	return string(decoded)
-}
+// gbkDecoder 与 decodeRunOutputLine 见 output_encoding.go——那里集中了子进程输出的
+// 编码处理，本文件只是调用方之一。
 
 func (pr *projectRunner) recordWindowsStartError(text string) {
 	text = strings.TrimSpace(text)

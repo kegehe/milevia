@@ -34,6 +34,11 @@ var wslForwardEnvKeys = []string{
 	"CODEX_",
 	"CLAUDE_",
 	"MCP_",
+	// WSL 内同样是 Windows 项目路径（/mnt/<盘符>/）在跑 python 脚本，同样会按 GBK
+	// 输出中文；这两个变量必须透传，否则 UTF-8 注入到 wsl.exe 就断了（见
+	// output_encoding.go 的 utf8ChildEnv）。
+	"PYTHONIOENCODING",
+	"PYTHONUTF8",
 }
 
 // wslBuildEnv 把 managedCLIEnvironment 产生的 env 列表（KEY=VAL）拆为：
@@ -126,7 +131,7 @@ func (r *wslAgentRunner) wslClaudeCommand(ctx context.Context, args []string, en
 	if wslenv != "" {
 		cmdEnv = append(cmdEnv, "WSLENV="+wslenv)
 	}
-	wslArgs := []string{"-d", r.distro, "--cd", linuxWorkDir, "--", r.claude.config.ClaudePath}
+	wslArgs := []string{"-d", r.distro, "--cd", linuxWorkDir, "--", r.claude.claudeBinary()}
 	for _, a := range args {
 		wslArgs = append(wslArgs, wslEncodeArg(a))
 	}
@@ -339,7 +344,7 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy, request.Prompt)
 	}
 
-	cmd := r.wslNativeCommand(ctx, r.codex.config.CodexPath, args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
+	cmd := r.wslNativeCommand(ctx, r.codex.codexBinary(), args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -23,6 +23,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -86,8 +87,7 @@ type Server struct {
 	db          *pgxpool.Pool
 	config      Config
 	mu          sync.Mutex
-	connections map[string]*websocket.Conn
-	writeMu     sync.Mutex
+	connections map[string]*agentConnection
 	// Rate limiters for the unauthenticated endpoints. The authenticated
 	// mobile API is polled by design and is not throttled here.
 	registerLimiter *rateLimiter
@@ -95,9 +95,54 @@ type Server struct {
 	statusLimiter   *rateLimiter
 	// events carries LISTEN notifications to the mobile event streams.
 	events *eventBroker
+	// rpcHub 是远程调用的请求-响应通道（见 rpc.go）。用 once 懒初始化，这样直接构造
+	// Server 的测试与旧部署都不需要显式初始化它。
+	rpcHub     *rpcRequestHub
+	rpcHubOnce sync.Once
 	// listenCancel stops the dedicated LISTEN connection when the server closes.
 	listenCancel context.CancelFunc
 }
+
+// agentConnection 是一条已注册的中继连接，连同它自己的写锁。
+//
+// 写锁是**每条连接**的，不是全局的。gorilla 的 websocket.Conn 不允许并发写，
+// 所以每条连接必须串行化自己的写；但老实现用的是一把全局锁，把"检查连接是否仍是
+// 当前连接 + 写一帧"整体包住。于是任意一条连接的写一旦阻塞（对端不读、socket
+// 缓冲写满），**所有实例**的中继写都被压在同一个锁后面 —— 包括手机刚下发、
+// 等着送到电脑端的命令。
+//
+// 真机实测（2026-09-16）：事件洪峰期间云端向一台电脑推送的确认在 4.5 小时里
+// 累计 792 MB，那条连接一旦写不动，命令投递就排在同一个锁后面，往返从 3 秒
+// 劣化到 75 秒，越过了手机端 30 秒的等待上限。
+type agentConnection struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+// writeJSON 串行化这条连接上的写，并给每次写设上限：没有写截止时间的阻塞写会
+// 一直占着写锁，把该实例的读取循环也一起钉死（读取循环里每一帧事件都要回一个
+// 确认，写不出去就读不了下一条）。
+//
+// 写失败（含写超时）必须**关掉连接**。gorilla 的约定是：写超时之后这条连接处于
+// 未定义状态，可能已经发出去了半帧；而这里的调用方基本都不看返回值（回执路径是
+// `_ = s.agentWrite(...)`），继续在一条半帧连接上写只会让对端解出垃圾帧。关掉之后
+// 读循环会立刻报错、连接被注销、Agent 自己重连 —— 这正是我们要的收敛方向。
+func (c *agentConnection) writeJSON(value any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(agentWriteTimeout))
+	if err := c.conn.WriteJSON(value); err != nil {
+		_ = c.conn.Close()
+		return err
+	}
+	return nil
+}
+
+func (c *agentConnection) Close() error { return c.conn.Close() }
+
+// agentWriteTimeout 是向 Agent 写一帧的上限。控制帧都很小，正常网络下远低于它；
+// 超过它说明这条连接已经写不动了，应当让写失败、由上层断开重连，而不是无限等。
+const agentWriteTimeout = 15 * time.Second
 
 // rateLimiter is a per-client token bucket held in process memory. The current
 // deployment is a single node, so no shared store is needed; the goal is simply
@@ -257,7 +302,7 @@ func New(ctx context.Context, config Config) (*Server, error) {
 	s := &Server{
 		db:              db,
 		config:          config,
-		connections:     map[string]*websocket.Conn{},
+		connections:     map[string]*agentConnection{},
 		registerLimiter: newRateLimiter(10, 30),
 		claimLimiter:    newRateLimiter(10, 30),
 		statusLimiter:   newRateLimiter(60, 300),
@@ -336,11 +381,11 @@ func (s *Server) Close() {
 		s.listenCancel()
 	}
 	s.mu.Lock()
-	connections := make([]*websocket.Conn, 0, len(s.connections))
+	connections := make([]*agentConnection, 0, len(s.connections))
 	for _, conn := range s.connections {
 		connections = append(connections, conn)
 	}
-	s.connections = map[string]*websocket.Conn{}
+	s.connections = map[string]*agentConnection{}
 	s.mu.Unlock()
 	for _, conn := range connections {
 		_ = conn.Close()
@@ -424,6 +469,19 @@ create index if not exists cloud_events_instance_sequence on cloud_events(instan
 		`alter table cloud_instances add column if not exists snapshot_revision bigint not null default 0`,
 		`alter table cloud_access_tokens add column if not exists pairing_id text not null default ''`,
 		`alter table cloud_access_tokens add column if not exists activated_at timestamptz`,
+		// 手机名。这张表在 2026-09-17 之前没有任何"手机身份"字段，于是"这台电脑现在
+		// 被哪台手机占着"无从显示，换绑时也没法告诉用户"你要顶掉的是谁"。claim 时由
+		// 手机上报（旧版本不发这个字段，落在默认空串上，不影响配对）。
+		`alter table cloud_access_tokens add column if not exists device_name text not null default ''`,
+		// 手机的"最近同步时刻"。在此之前桌面端只能答"绑过谁"，答不了"现在还在不在用" ——
+		// 用户对着手机说"明明连着"，电脑上却一个字都没有。写入点在 userAuth（每次手机带令牌
+		// 请求都会经过），并且**必须节流**：手机端当前设备是 5 秒一次轮询，逐次写会在
+		// cloud_access_tokens 上每 5 秒产生一个死元组，而这张表的每次读都要顺带判一遍
+		// 令牌有效性 —— 没必要为一条"最近活动"读数付这个代价。详见 userAuth 里的说明。
+		`alter table cloud_access_tokens add column if not exists last_used_at timestamptz`,
+		// 手机平台（android / ios / web）。旧版本不报这个字段，落在默认空串上，
+		// 桌面端据此**整行不渲染**，而不是显示一个空格子。
+		`alter table cloud_access_tokens add column if not exists platform text not null default ''`,
 		// Tokens issued before desktop confirmation became mandatory carry no
 		// pairing link. Treat them as already activated so upgrading does not
 		// silently break an existing pairing. Re-running this is a no-op.
@@ -449,6 +507,10 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/instances/{instanceID}/snapshot", s.instanceSnapshot)
 		r.Get("/stream", s.mobileEventStream)
 		r.Post("/instances/{instanceID}/commands", s.createCommand)
+		// 文件读写。用 POST + body 里的 op 而不是一对 REST 路径：它是一次
+		// 请求-响应 RPC（见 rpc.go），路径按业务资源展开只会让"有哪些操作"
+		// 散到路由表里，而它必须是集中的一份。
+		r.Post("/instances/{instanceID}/rpc", s.mobileRPCRequest)
 		r.Post("/instances/{instanceID}/revoke", s.revokeInstanceTokens)
 		r.Get("/commands/{commandID}", s.getCommand)
 		r.Get("/events", s.listEvents)
@@ -480,6 +542,8 @@ func (s *Server) Handler() http.Handler {
 	r.Post("/v1/agent/snapshot", s.agentSnapshot)
 	r.Post("/v1/agent/pairings", s.agentPairing)
 	r.Post("/v1/agent/pairings/{pairingID}/confirm", s.agentConfirmPairing)
+	r.Get("/v1/agent/bindings", s.agentBindings)
+	r.Post("/v1/agent/bindings/revoke", s.agentRevokeBindings)
 	return r
 }
 
@@ -615,6 +679,14 @@ func (s *Server) agentConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("pairing is not ready for confirmation"))
 		return
 	}
+	// 这台电脑同一时间只服务一台手机：确认新手机的那一刻，把该电脑上其它手机令牌
+	// 全部作废（"顶替"）。**必须和下面那句激活在同一个事务里** —— 拆成两步就会出现
+	// "两台手机同时有效"的窗口，而那正是这条约束要禁止的状态。
+	// 旧手机随后会拿到 401：它已有的降级路径会把用户送回配对页，文案见手机端 401 分支。
+	if _, err := tx.Exec(r.Context(), `update cloud_access_tokens set revoked_at=now() where instance_id=$1 and revoked_at is null and pairing_id<>$2`, instanceID, pairingID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if _, err := tx.Exec(r.Context(), `update cloud_access_tokens set activated_at=now() where pairing_id=$1 and activated_at is null and revoked_at is null`, pairingID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -624,6 +696,81 @@ func (s *Server) agentConfirmPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "confirmed", "pairingId": pairingID, "instanceId": instanceID})
+}
+
+// agentBindings reports which phones currently hold an active token for this
+// computer. The desktop uses it to answer "现在是谁在用这台电脑" before it
+// generates a QR code — without it, confirming a new phone silently kicks the
+// old one with nothing on screen having said so.
+//
+// Same shape as the other agent endpoints: the machine proves itself with
+// X-Milevia-Agent-Token and may only read its own instance.
+func (s *Server) agentBindings(w http.ResponseWriter, r *http.Request) {
+	instanceID := strings.TrimSpace(r.Header.Get("X-Milevia-Instance-ID"))
+	if instanceID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("X-Milevia-Instance-ID is required"))
+		return
+	}
+	if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `select device_name,activated_at,created_at,last_used_at,platform from cloud_access_tokens where instance_id=$1 and revoked_at is null and activated_at is not null order by activated_at desc`, instanceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var deviceName string
+		var activatedAt time.Time
+		var createdAt time.Time
+		// 三个可空/可缺的字段，措辞完全不同（见前端 desktop-phone.ts）：
+		//   last_used_at 为 null  → "绑定后还没同步过"（迁移后的老行就是这种）
+		//   整个键缺失           → 云端版本还不提供这项（页面不许把两者说成一句）
+		//   platform 为空串       → 手机没上报，那一行整条不渲染
+		var lastUsedAt *time.Time
+		var platform string
+		if err := rows.Scan(&deviceName, &activatedAt, &createdAt, &lastUsedAt, &platform); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		items = append(items, map[string]any{
+			"deviceName":  deviceName,
+			"activatedAt": activatedAt,
+			"createdAt":   createdAt,
+			"lastUsedAt":  lastUsedAt,
+			"platform":    platform,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"instanceId": instanceID, "bindings": items})
+}
+
+// agentRevokeBindings 让坐在电脑前的人**主动**把当前手机解绑。
+//
+// 这是"换手机"的另一半：顶替发生在确认新手机的那一刻，但用户也可能只是想先断开
+// （手机丢了、要借给别人用）。它和 revokeInstanceTokens(scope=mobile) 的区别只有一个：
+// 调用方是这台电脑自己（agent 令牌 + 自己的 instance 头），不是手机令牌或运营者令牌 ——
+// 电脑端页面根本拿不到手机令牌，只能用"我是这台机器"来证明自己有权断开自己的手机。
+func (s *Server) agentRevokeBindings(w http.ResponseWriter, r *http.Request) {
+	instanceID := strings.TrimSpace(r.Header.Get("X-Milevia-Instance-ID"))
+	if instanceID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("X-Milevia-Instance-ID is required"))
+		return
+	}
+	if ok, authErr := s.agentAuth(r, instanceID); agentAuthDenied(w, ok, authErr) {
+		return
+	}
+	result, err := s.db.Exec(r.Context(), `update cloud_access_tokens set revoked_at=now() where instance_id=$1 and revoked_at is null`, instanceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "instanceId": instanceID, "revoked": result.RowsAffected()})
 }
 
 func (s *Server) pairingStatus(w http.ResponseWriter, r *http.Request) {
@@ -647,24 +794,30 @@ func (s *Server) pairingStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) claimPairing(w http.ResponseWriter, r *http.Request) {
 	pairingID := chi.URLParam(r, "pairingID")
 	var input struct {
-		Code string `json:"code"`
+		Code       string `json:"code"`
+		DeviceName string `json:"deviceName"`
+		Platform   string `json:"platform"`
 	}
 	if !decode(w, r, &input) || len(strings.TrimSpace(input.Code)) != 6 {
 		return
 	}
-	s.claimPairingSession(w, r, pairingID, strings.TrimSpace(input.Code))
+	s.claimPairingSession(w, r, pairingID, strings.TrimSpace(input.Code), sanitizeDeviceName(input.DeviceName), sanitizePlatform(input.Platform))
 }
 
 // claimPairingByCode is the camera-free pairing path. Pairing codes are
 // short-lived and rate-limited by the same claim counter as QR claims.
 func (s *Server) claimPairingByCode(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Code string `json:"code"`
+		Code       string `json:"code"`
+		DeviceName string `json:"deviceName"`
+		Platform   string `json:"platform"`
 	}
 	if !decode(w, r, &input) || len(strings.TrimSpace(input.Code)) != 6 {
 		return
 	}
 	code := strings.TrimSpace(input.Code)
+	deviceName := sanitizeDeviceName(input.DeviceName)
+	platform := sanitizePlatform(input.Platform)
 	rows, err := s.db.Query(r.Context(), `select pairing_id from pairing_sessions where code_hash=$1 and status='pending' and expires_at>now() limit 2`, hashCode(code))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -694,10 +847,47 @@ func (s *Server) claimPairingByCode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("pairing code is ambiguous; generate a new code"))
 		return
 	}
-	s.claimPairingSession(w, r, pairingID, code)
+	s.claimPairingSession(w, r, pairingID, code, deviceName, platform)
 }
 
-func (s *Server) claimPairingSession(w http.ResponseWriter, r *http.Request, pairingID, code string) {
+// sanitizeDeviceName keeps the phone-reported name to something a desktop
+// screen can show: no control characters, no unbounded length. It is display
+// only — never authorized against — so an empty result simply means "unknown
+// phone", and the UI falls back to a generic label.
+func sanitizeDeviceName(raw string) string {
+	trimmed := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(raw))
+	runes := []rune(trimmed)
+	if len(runes) > 64 {
+		runes = runes[:64]
+	}
+	return strings.TrimSpace(string(runes))
+}
+
+// sanitizePlatform keeps the phone-reported platform to one of a handful of
+// known words. Unlike the device name it is a closed set — a client that sends
+// "android; drop table" must not end up on a desktop screen or, worse, in a
+// path where someone later treats it as trusted. An unknown value collapses to
+// the empty string, and the desktop hides the row rather than showing a guess.
+// Old app builds do not send this field at all, so empty is the normal case.
+func sanitizePlatform(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "android":
+		return "android"
+	case "ios":
+		return "ios"
+	case "web":
+		return "web"
+	default:
+		return ""
+	}
+}
+
+func (s *Server) claimPairingSession(w http.ResponseWriter, r *http.Request, pairingID, code, deviceName, platform string) {
 	var attempts int
 	err := s.db.QueryRow(r.Context(), `update pairing_sessions set claim_attempts=claim_attempts+1 where pairing_id=$1 and status='pending' and expires_at>now() and claim_attempts<10 returning claim_attempts`, pairingID).Scan(&attempts)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -749,7 +939,7 @@ func (s *Server) claimPairingSession(w http.ResponseWriter, r *http.Request, pai
 	// userAuth rejects tokens with a null activated_at, and only the desktop
 	// side (agentConfirmPairing) can activate it. Claiming a QR code therefore
 	// grants nothing on its own — the person at the computer must confirm.
-	if _, err := s.db.Exec(r.Context(), `insert into cloud_access_tokens(token_hash,instance_id,expires_at,pairing_id) values($1,$2,$3,$4)`, hashCode(accessToken), instanceID, time.Now().UTC().Add(90*24*time.Hour), pairingID); err != nil {
+	if _, err := s.db.Exec(r.Context(), `insert into cloud_access_tokens(token_hash,instance_id,expires_at,pairing_id,device_name,platform) values($1,$2,$3,$4,$5,$6)`, hashCode(accessToken), instanceID, time.Now().UTC().Add(90*24*time.Hour), pairingID, deviceName, platform); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1034,7 +1224,8 @@ func (s *Server) userAuth(next http.Handler) http.Handler {
 		// step a real authorization boundary rather than a client-side ritual.
 		var instanceID string
 		var expires *time.Time
-		err := s.db.QueryRow(r.Context(), `select instance_id,expires_at from cloud_access_tokens where token_hash=$1 and revoked_at is null and activated_at is not null`, hashCode(provided)).Scan(&instanceID, &expires)
+		hashed := hashCode(provided)
+		err := s.db.QueryRow(r.Context(), `select instance_id,expires_at from cloud_access_tokens where token_hash=$1 and revoked_at is null and activated_at is not null`, hashed).Scan(&instanceID, &expires)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && expires != nil && !expires.After(time.Now().UTC())) {
 			writeError(w, http.StatusUnauthorized, errors.New("invalid user token"))
 			return
@@ -1043,6 +1234,33 @@ func (s *Server) userAuth(next http.Handler) http.Handler {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		// 「这台手机刚刚还在用」。桌面端侧栏那张「已绑定手机」卡上的在线/最近同步全靠它 ——
+		// 在此之前那张卡只能答"绑过谁"，答不了"现在还在不在用"，于是用户在手机上看到"已连接"、
+		// 在电脑上看到一片沉默。
+		//
+		// 四件事必须一起成立，少一件这条读数就不可信：
+		//   ① **节流**：手机端"当前设备"5 秒轮询一次 `/v1/instances`，逐次写等于每 5 秒在
+		//      cloud_access_tokens 上留一个死元组。窗口取 30 秒 —— 宁可让"在线"晚 30 秒
+		//      翻成"未同步"，也不要把这条观测量的写入放大 6 倍。
+		//   ② **条件写在 SQL 的 where 里**，不在 Go 里比时间。这是唯一正确的做法：
+		//      比较用的 `now()` 和赋值的 `now()` 来自同一个时钟，多副本 / 多进程部署下
+		//      不会因为某台机器时钟偏了就开始每次都写。
+		//   ③ **写失败绝不让请求失败**：鉴权已经过了，这只是一条观测量的落库。
+		//      在这里回 500 等于"因为记不上一条活动时间就把用户挡在门外"。
+		//   ④ 用 `now()` 而不是 Go 的 `time.Now()`（同上）。
+		//
+		// ⚠️ **这个 30 秒窗口和手机端 5 秒的轮询间隔，一起决定了桌面端「在线」的判定阈值**
+		//      （见 `apps/web/src/features/remote/desktop-phone.ts`：两次写入的真实间隔是
+		//      30+5=35 秒，阈值取 90 秒 ≈ 2.6 倍）。**改这个窗口必须回去重算那个阈值** ——
+		//      窗口调大到 120 秒而阈值不动，手机明明在用也会被判成"未同步"。
+		//      这条耦合跨了语言和仓库目录，没有编译器帮忙，只能靠这两处注释互相指认。
+		//
+		// ⚠️ 读侧（桌面浏览器）拿这个时刻和自己的 `Date.now()` 相减算年龄 —— 那是**两台机器**
+		//      的时钟。桌面时钟若明显快于云端，年龄会被算大，一台在线的手机会被报成"未同步"
+		//      （反过来偏慢会被算成负数，而负数按"新鲜"处理，是安全的那一侧）。
+		//      两台机器正常都跟着 NTP 走，偏差远小于 45 秒的判定阈值，因此不做额外校正；
+		//      真出现"手机明明在用却显示未同步"且 age 接近一个整分钟的偏移，先查桌面时钟。
+		_, _ = s.db.Exec(r.Context(), `update cloud_access_tokens set last_used_at=now() where token_hash=$1 and (last_used_at is null or last_used_at < now() - interval '30 seconds')`, hashed)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), instanceScopeKey{}, instanceID)))
 	})
 }
@@ -1335,6 +1553,10 @@ func (s *Server) createCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("payload must be valid JSON and smaller than 256 KiB"))
 		return
 	}
+	// 命令 payload 同样落进 jsonb 列，同样要挡住 NUL 转义（见 event_payload.go）。
+	// 这里不报 400 而是静默替换：这条路径上的 NUL 只可能来自电脑端自己拼进去的
+	// 文本，替换掉比让整条命令 500 更符合用户预期。
+	input.Payload = sanitizeJSONNUL(input.Payload)
 	expires := time.Now().UTC().Add(5 * time.Minute)
 	if input.ExpiresAt != nil {
 		expires = input.ExpiresAt.UTC()
@@ -1397,6 +1619,14 @@ func (s *Server) getCommand(w http.ResponseWriter, r *http.Request) {
 	// forever: the phone polls until it sees a terminal status, so a stall
 	// would mean endless polling over a result the user can never act on.
 	if _, err := s.db.Exec(r.Context(), `update cloud_commands set status='indeterminate',updated_at=now() where command_id=$1 and instance_id=$2 and status in ('received','executing') and updated_at < now() - interval '6 hours'`, commandID, commandInstanceID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// 电脑端此刻没有中继连接、命令也早就过了宽限期：它不会被投递，也不会在重连后
+	// 被补投（状态已经不是 queued）。老实现让它留在 queued 直到 5 分钟后过期，
+	// 手机端只能一路轮询到 30 秒上限再报"仍在处理中" —— 为一个已知结果白等半分钟。
+	// 手机端在轮询这个端点，所以在这里判定一定会被执行到，不需要额外的后台任务。
+	if err := s.failStaleQueuedCommand(r.Context(), commandID, commandInstanceID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1466,27 +1696,39 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(512 << 10)
 	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+	session := &agentConnection{conn: conn}
 	s.mu.Lock()
 	if previous := s.connections[instanceID]; previous != nil {
 		_ = previous.Close()
 	}
-	s.connections[instanceID] = conn
+	s.mu.Unlock()
+	// 顶替掉旧连接之后，挂在旧连接上的中继请求再也不会有人回答（回话会走新连接，
+	// 但它带的是旧 requestId，永远对不上）。在这里落成明确失败，比让手机端干等
+	// 20 秒超时有用得多。
+	//
+	// **必须在新连接装上之前**做这件事：装好之后再清理会连带把刚注册、
+	// 正等着这条新连接回答的请求一起误杀。中间那一小段里 connections 是空的，
+	// 此时到达的请求会拿到 instance_offline —— 那是真话，不是误报。
+	s.failRPCRequestsForInstance(instanceID)
+	s.mu.Lock()
+	s.connections[instanceID] = session
 	s.mu.Unlock()
 	defer func() {
 		wasCurrent := false
 		s.mu.Lock()
-		if s.connections[instanceID] == conn {
+		if s.connections[instanceID] == session {
 			delete(s.connections, instanceID)
 			wasCurrent = true
 		}
 		s.mu.Unlock()
 		if wasCurrent {
 			_, _ = s.db.Exec(context.Background(), `update cloud_instances set status='offline',updated_at=now() where instance_id=$1 and status='online'`, instanceID)
+			s.failRPCRequestsForInstance(instanceID)
 		}
 		_ = conn.Close()
 	}()
 	_, _ = s.db.Exec(r.Context(), `insert into cloud_instances(instance_id,status,last_seen_at) values($1,'online',now()) on conflict(instance_id) do update set status='online',last_seen_at=now(),updated_at=now()`, instanceID)
-	s.sendPendingCommands(r.Context(), instanceID, conn)
+	s.sendPendingCommands(r.Context(), instanceID, session)
 	for {
 		var raw json.RawMessage
 		if err := conn.ReadJSON(&raw); err != nil {
@@ -1498,7 +1740,7 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(raw, &kind)
 		if kind.Kind == "ping" {
-			s.agentWrite(instanceID, conn, map[string]string{"kind": "pong"})
+			s.agentWrite(instanceID, session, map[string]string{"kind": "pong"})
 			continue
 		}
 		if kind.Kind == "command.status" {
@@ -1513,6 +1755,17 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 					result = json.RawMessage(`{}`)
 				}
 				_, _ = s.db.Exec(r.Context(), `update cloud_commands set status=$3,result=$4::jsonb,updated_at=now() where command_id=$1 and instance_id=$2 and status not in ('completed','failed','expired','cancelled','indeterminate')`, status.CommandID, instanceID, status.Status, result)
+			}
+			continue
+		}
+		if kind.Kind == "rpc.response" {
+			// 中继请求的回答（文件与 Git 共用这条通道，见 rpc.go）。它在**读循环里同步投递**而不是起 goroutine：
+			// 投递只是往一个缓冲为 1 的 channel 写一次、不阻塞，而读循环每帧都要尽快
+			// 回到 ReadJSON —— 起 goroutine 反而会在事件洪峰时积压大量小任务。
+			if !s.resolveAgentRPCResponse(raw) {
+				// 认不出来的 requestId：超时的、客户端已经断开放弃的、或者对端重复回话的。
+				// 三种都是正常的收敛路径，丢掉即可，绝不能因此断开连接。
+				continue
 			}
 			continue
 		}
@@ -1532,7 +1785,7 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 				// would reconnect, resend the same conflicting event, and never
 				// deliver the events queued behind it. Reject just this event
 				// so the Agent can discard it and continue with the next one.
-				_ = s.agentWrite(instanceID, conn, map[string]any{
+				_ = s.agentWrite(instanceID, session, map[string]any{
 					"kind":          "event.reject",
 					"eventId":       envelope.EventID,
 					"agentSequence": envelope.AgentSequence,
@@ -1545,7 +1798,7 @@ func (s *Server) agentConnect(w http.ResponseWriter, r *http.Request) {
 			// retry once the database recovers.
 			continue
 		}
-		s.agentWrite(instanceID, conn, map[string]any{"kind": "event.ack", "eventId": envelope.EventID, "agentSequence": envelope.AgentSequence})
+		s.agentWrite(instanceID, session, map[string]any{"kind": "event.ack", "eventId": envelope.EventID, "agentSequence": envelope.AgentSequence})
 	}
 }
 
@@ -1613,6 +1866,10 @@ func (s *Server) agentSnapshot(w http.ResponseWriter, r *http.Request) {
 	if !decodeWithLimit(w, r, &snapshot, 32<<20) || !json.Valid(snapshot) {
 		return
 	}
+	// 上游快照里可能带上带 NUL 转义的对话原文，而 snapshot 列是 jsonb —— 同样的
+	// 拒绝（见 event_payload.go）。不洗掉的话整份快照都写不进去，手机端就会一直
+	// 停在上一版快照上。
+	snapshot = sanitizeJSONNUL(snapshot)
 	var snapshotObject map[string]json.RawMessage
 	if json.Unmarshal(snapshot, &snapshotObject) != nil {
 		writeError(w, http.StatusBadRequest, errors.New("snapshot must be a JSON object"))
@@ -1654,6 +1911,34 @@ func isEventConflict(err error) bool {
 		errors.Is(err, errEventIDConflict)
 }
 
+// permanentEventStoreError 把"重发一万次也不会成功"的数据库错误升级成永久冲突。
+//
+// 这是本系统最贵的一个坑：agentConnect 对非冲突错误一律按**临时故障**处理 ——
+// 既不回 ack 也不回 reject，理由是"数据库恢复后 Agent 会重试"。这个假设对连接
+// 类故障成立，对**数据本身存不进去**（SQLSTATE 22xxx 数据异常 / 23xxx 完整性约束）
+// 完全不成立：同一份数据重试多少次都是同样的失败。
+//
+// 真机后果（2026-09-16）：若干条 payload 里带 NUL 转义的事件永远存不进 jsonb，
+// 云端对它们永远沉默，本地 outbox 的行永远删不掉，队头被钉死，111 万条事件全堵在
+// 后面，一条 WebSocket 连接 4.5 小时被灌了 792 MB 的重复确认。
+//
+// 兜底性质：payload 已经在 storeEvent 里洗过一遍 NUL，这条路径正常情况下不会走到。
+// 留着它是为了让**任何**未来的同类数据异常都变成一次明确的 event.reject，
+// 而不是又一次静默的永久重试。
+func permanentEventStoreError(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
+		return nil
+	}
+	switch pgErr.Code[:2] {
+	case "22", "23":
+		// 22 = data exception，23 = integrity constraint violation。
+		return fmt.Errorf("%w: %s", errEventInsertConflict, pgErr.Message)
+	default:
+		return nil
+	}
+}
+
 func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventEnvelope) error {
 	if err := s.ensureInstance(ctx, instanceID); err != nil {
 		return err
@@ -1663,6 +1948,10 @@ func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventE
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// NUL 转义在 jsonb 里存不下（见 event_payload.go）。不先洗掉的话这条事件会永远
+	// 入库失败，而失败又被当成临时故障 —— 既没有 ack 也没有 reject，本地 outbox
+	// 那行就永远删不掉。
+	event.Payload = sanitizeJSONNUL(event.Payload)
 	// The unique constraints make the insert atomic; the follow-up checks turn
 	// a concurrent retry into a successful no-op while still rejecting conflicts.
 	var insertedID string
@@ -1688,6 +1977,9 @@ func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventE
 			return fmt.Errorf("%w for instance %s: sequence %d", errEventSequenceConflict, instanceID, event.AgentSequence)
 		}
 	} else if err != nil {
+		if permanent := permanentEventStoreError(err); permanent != nil {
+			return permanent
+		}
 		return err
 	}
 	// Waking the mobile streams is done inside the transaction on purpose:
@@ -1708,7 +2000,7 @@ func (s *Server) storeEvent(ctx context.Context, instanceID string, event eventE
 	return err
 }
 
-func (s *Server) sendPendingCommands(ctx context.Context, instanceID string, conn *websocket.Conn) {
+func (s *Server) sendPendingCommands(ctx context.Context, instanceID string, session *agentConnection) {
 	// Re-deliver the never-delivered queue *and* the commands the Agent last
 	// reported as in-flight. The latter is what lets a command recover after an
 	// Agent restart: re-submitting is safe because the local side is
@@ -1728,7 +2020,7 @@ func (s *Server) sendPendingCommands(ctx context.Context, instanceID string, con
 		if rows.Scan(&id, &idempotency, &typ, &projectID, &taskID, &payload, &expires) != nil {
 			return
 		}
-		if err := s.agentWrite(instanceID, conn, map[string]any{"commandId": id, "idempotencyKey": idempotency, "type": typ, "projectId": projectID, "taskId": taskID, "payload": json.RawMessage(payload), "expiresAt": expires}); err != nil {
+		if err := s.agentWrite(instanceID, session, map[string]any{"commandId": id, "idempotencyKey": idempotency, "type": typ, "projectId": projectID, "taskId": taskID, "payload": json.RawMessage(payload), "expiresAt": expires}); err != nil {
 			return
 		}
 	}
@@ -1736,9 +2028,13 @@ func (s *Server) sendPendingCommands(ctx context.Context, instanceID string, con
 
 func (s *Server) pushCommand(instanceID, commandID string) {
 	s.mu.Lock()
-	conn := s.connections[instanceID]
+	session := s.connections[instanceID]
 	s.mu.Unlock()
-	if conn == nil {
+	if session == nil {
+		// 这台电脑此刻没有中继连接。这里**不**直接判失败：Agent 重连之后
+		// sendPendingCommands 会把 queued 的命令补投出去，一次几秒的抖动不该被
+		// 当成故障。真正的判定在 getCommand 里带一个宽限期做（手机端每 500ms
+		// 轮询一次，所以那个判定一定会被执行到）。
 		return
 	}
 	var idempotency, typ, projectID, taskID string
@@ -1747,9 +2043,50 @@ func (s *Server) pushCommand(instanceID, commandID string) {
 	if err := s.db.QueryRow(context.Background(), `select idempotency_key,type,project_id,task_id,payload,expires_at from cloud_commands where command_id=$1`, commandID).Scan(&idempotency, &typ, &projectID, &taskID, &payload, &expires); err != nil {
 		return
 	}
-	if err := s.agentWrite(instanceID, conn, map[string]any{"commandId": commandID, "idempotencyKey": idempotency, "type": typ, "projectId": projectID, "taskId": taskID, "payload": json.RawMessage(payload), "expiresAt": expires}); err != nil {
+	if err := s.agentWrite(instanceID, session, map[string]any{"commandId": commandID, "idempotencyKey": idempotency, "type": typ, "projectId": projectID, "taskId": taskID, "payload": json.RawMessage(payload), "expiresAt": expires}); err != nil {
 		return
 	}
+}
+
+// commandDeliveryGrace 是一条命令在"电脑端没有中继连接"状态下还能等的时长。
+//
+// 取 8 秒：Agent 断线后的重连退避是 1/2/4/8/16/30 秒，宽限期要盖住头几次重试，
+// 否则一次几秒的网络抖动就会把命令判死；同时又必须远小于手机端 30 秒的等待上限，
+// 让用户在超时之前就拿到明确原因。宽限期内 Agent 接单就照常投递，超过就落 failed，
+// 并且因为状态已经不是 queued，重连后的 sendPendingCommands 也不会再补投它 ——
+// 不会出现"手机说失败了、电脑端过一会儿又执行了"。
+var commandDeliveryGrace = 8 * time.Second
+
+// failUndeliverableCommand 把一条投不出去的命令直接落成终态。
+//
+// 只动 queued：命令已经被 Agent 接单（received/executing）时不能覆盖它的状态 ——
+// 那会把一条正在执行的命令说成失败。
+func (s *Server) failUndeliverableCommand(commandID, reason string) {
+	_, _ = s.db.Exec(context.Background(), `update cloud_commands set status='failed',result=jsonb_build_object('error',$2::text),updated_at=now() where command_id=$1 and status='queued'`, commandID, reason)
+}
+
+// hasRelayConnection 报告这台电脑此刻有没有活着的中继连接。
+//
+// 判据只能是内存里的连接表：cloud_instances.status 会被快照上传重新写成 online，
+// 即使 WS 早就不在了（真机 2026-09-17 07:35 之后就是这个状态，status=online、
+// last_seen_at 停在那一刻，而 agent 进程一个 TCP 连接都没有）。
+func (s *Server) hasRelayConnection(instanceID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connections[instanceID] != nil
+}
+
+// failStaleQueuedCommand 把"电脑端没有连接、且已经等过宽限期"的 queued 命令落成 failed。
+//
+// 只动 queued 且只动超过宽限期的：宽限期内 Agent 可能正好重连并接单。
+func (s *Server) failStaleQueuedCommand(ctx context.Context, commandID, instanceID string) error {
+	if s.hasRelayConnection(instanceID) {
+		return nil
+	}
+	_, err := s.db.Exec(ctx, `update cloud_commands set status='failed',result=jsonb_build_object('error',$3::text),updated_at=now() where command_id=$1 and instance_id=$2 and status='queued' and created_at < now() - $4::interval`,
+		commandID, instanceID, "电脑端当前不在线，请确认电脑上的 Milevia 正在运行并已连接",
+		fmt.Sprintf("%d milliseconds", commandDeliveryGrace.Milliseconds()))
+	return err
 }
 
 func (s *Server) ensureInstance(ctx context.Context, instanceID string) error {
@@ -1772,16 +2109,17 @@ func validCommandStatus(status string) bool {
 	}
 }
 
-func (s *Server) agentWrite(instanceID string, conn *websocket.Conn, value any) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+// agentWrite 把一帧控制数据写给某个实例。锁只覆盖"这条连接"（见 agentConnection），
+// 不再是一把全局锁：一条连接写不动不能连累其他实例，也不能连累同一实例上正要
+// 下发的命令。
+func (s *Server) agentWrite(instanceID string, conn *agentConnection, value any) error {
 	s.mu.Lock()
 	current := s.connections[instanceID]
 	s.mu.Unlock()
 	if current != conn {
 		return errors.New("agent connection is no longer current")
 	}
-	return conn.WriteJSON(value)
+	return conn.writeJSON(value)
 }
 
 func newID() string {

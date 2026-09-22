@@ -23,9 +23,11 @@ import FilesPage from "./pages/FilesPage";
 import AgentProfilesPage from "./pages/AgentProfilesPage";
 import SettingsPage from "./pages/SettingsPage";
 import McpManagerPage from "./pages/McpManagerPage";
+import CliToolsPage from "./pages/CliToolsPage";
 import TerminalPage from "./pages/TerminalPage";
 import MobileRemotePage from "./pages/MobileRemotePage";
 import { UpdateBanner } from "./features/updater/UpdateBanner";
+import { loadAgentCatalog } from "./lib/agent-registry";
 import { Capacitor } from "@capacitor/core";
 
 declare global {
@@ -62,6 +64,12 @@ export function App() {
   // providers from opening local API/WebSocket connections while previewing
   // the remote page on Windows.
   const mobileRoute = typeof window !== "undefined" && window.location.pathname === "/mobile";
+  // 工具目录只在启动时拉一次：它是"平台支持哪些工具"的唯一来源，界面各处（工具名、
+  // 权限选项、斜杠命令能力）都从它取。失败不在这里提示 —— registry 里留着 error，
+  // 由真正需要渲染工具清单的地方按"读不到"处理。
+  useEffect(() => {
+    void loadAgentCatalog().catch(() => undefined);
+  }, []);
   return (
     <BrowserRouter>
       {nativeMobile || mobileRoute ? <MobileRemotePage /> : <>
@@ -78,6 +86,7 @@ export function App() {
                   <Route path="/projects/import" element={<ImportProjectPage />} />
                   <Route path="/ssh-manager" element={<SSHManagerPage />} />
                   <Route path="/mcp-manager" element={<McpManagerPage />} />
+                  <Route path="/cli-tools" element={<CliToolsPage />} />
                   <Route path="/agent-profiles" element={<AgentProfilesPage />} />
                   <Route path="/settings" element={<SettingsPage />} />
                   <Route path="/mobile" element={<MobileRemotePage />} />

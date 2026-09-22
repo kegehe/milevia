@@ -87,15 +87,15 @@ func (s *Server) agentCLIReady(ctx context.Context, target agentTargetEnv) (clau
 
 // agentCLIVersion 返回目标环境下 Claude 与 Codex CLI 的版本号（检测失败返回空串）。
 // 与 agentCLIReady 采用同一套按目标环境的路由，保证"版本显示的是项目所在环境那端"。
-// 用于加载/校验项目时把已就绪 CLI 的版本展示给用户。返回前统一剥除 CLI 自带的后缀
-// /前缀（" (Claude Code)"、"codex-cli "），避免跨端 runner 未归一化导致显示不一致。
+// 用于加载/校验项目时把已就绪 CLI 的版本展示给用户。返回前统一交给
+// agentVersionFromOutput 归一化（判据只有那一处），避免跨端 runner 未归一化导致显示不一致。
 func (s *Server) agentCLIVersion(ctx context.Context, target agentTargetEnv) (claudeVersion, codexVersion string) {
 	switch target {
 	case agentTargetEnvWindows:
 		if runtime.GOOS == "windows" {
-			return normalizeClaudeVersion(s.runner.Version(ctx)), normalizeCodexVersion(s.codexRunner.Version(ctx))
+			return agentVersionFromOutput(s.runner.Version(ctx)), agentVersionFromOutput(s.codexRunner.Version(ctx))
 		}
-		return normalizeClaudeVersion(s.windowsAgentRunner().Version(ctx)), normalizeCodexVersion(s.codexVersionForTarget(ctx, target))
+		return agentVersionFromOutput(s.windowsAgentRunner().Version(ctx)), agentVersionFromOutput(s.codexVersionForTarget(ctx, target))
 	case agentTargetEnvRemote:
 		// 远端由 sshRunner 驱动，无单一本机引用，由调用处按 runner_id 处理。
 		return "", ""
@@ -105,22 +105,10 @@ func (s *Server) agentCLIVersion(ctx context.Context, target agentTargetEnv) (cl
 			if w == nil {
 				return "", ""
 			}
-			return normalizeClaudeVersion(w.Version(ctx)), normalizeCodexVersion(s.codexVersionForTarget(ctx, target))
+			return agentVersionFromOutput(w.Version(ctx)), agentVersionFromOutput(s.codexVersionForTarget(ctx, target))
 		}
-		return normalizeClaudeVersion(s.runner.Version(ctx)), normalizeCodexVersion(s.codexRunner.Version(ctx))
+		return agentVersionFromOutput(s.runner.Version(ctx)), agentVersionFromOutput(s.codexRunner.Version(ctx))
 	}
-}
-
-// normalizeClaudeVersion 归一化 claude --version 的输出为纯版本号。
-// 跨端 / 本机 runner 的裸输出可能带 " (Claude Code)" 后缀，统一剥除。
-func normalizeClaudeVersion(version string) string {
-	return strings.TrimSuffix(strings.TrimSpace(version), " (Claude Code)")
-}
-
-// normalizeCodexVersion 归一化 codex --version 的输出为纯版本号。
-// 跨端 / 本机 runner 的裸输出可能带 "codex-cli " 前缀，统一剥除。
-func normalizeCodexVersion(version string) string {
-	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(version), "codex-cli "))
 }
 
 // codexVersionForTarget 返回目标环境下 Codex CLI 的版本号。

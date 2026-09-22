@@ -3,10 +3,13 @@ import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
+import type { AgentID } from "../../lib/types";
+import { catalogAgentID, knownAgentID, useAgentCatalog } from "../../lib/agent-registry";
 import {
   filterFindingsByType,
   insightFindingCounts,
   insightLinkedTaskLabel,
+  insightSelectionSummary,
   insightSeverityLabels,
   insightThemeLabels,
   insightThemes,
@@ -18,7 +21,10 @@ import {
   normalizeInsightTheme,
   normalizeInsightType,
   normalizeInsightVerification,
+  pruneInsightSelection,
   sortFindings,
+  toggleInsightSelection,
+  toggleInsightSelectionAll,
   toggleInsightType,
   type InsightEvent,
   type InsightFilter,
@@ -31,7 +37,7 @@ import {
 } from "./insights-model";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
-type InsightAgent = "claude-code" | "codex";
+type InsightAgent = AgentID;
 
 // 类型图标：贴合现有 20/24 描边图标风格。
 function TypeIcon({ type }: { type: InsightType }) {
@@ -42,6 +48,14 @@ function TypeIcon({ type }: { type: InsightType }) {
     feature: <path d="M12 5v14M5 12h14" />,
   };
   return <svg className="insight-type-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{icons[type]}</svg>;
+}
+
+// 选择模式下整张卡都可以点（命中区域太小的话，批量删除会变成"瞄准复选框"的体力活）。
+// 但卡片里本来就有按钮/链接，**控件优先**：判据取「最近的可交互祖先」，与卡片拖拽那条规则同源
+// ——点「编辑」「查看文件」不该顺带把这张卡选上。真正的勾选控件是卡片上那颗原生复选框
+// （可 Tab 到、可用空格切换），整卡点击只是鼠标的顺路。
+function isCardControl(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && target.closest("button,a,input,select,textarea,label") !== null;
 }
 
 // 把进度事件时间戳格式化为 HH:MM:SS（日志行紧凑展示）。
@@ -59,6 +73,8 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   // 点击卡片的"查看文件"时跳转到文件页并打开该文件（未提供则只展示路径）。
   onOpenFile?: (path: string) => void;
 }) {
+  // 分析引擎清单来自服务端工具目录：新增工具时这里自动多一个单选项。
+  const agentOptions = useAgentCatalog();
   const [scan, setScan] = useState<InsightScan | null>(null);
   const [findings, setFindings] = useState<InsightFinding[]>([]);
   const [events, setEvents] = useState<InsightEvent[]>([]);
@@ -85,6 +101,13 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   const [addAllBusy, setAddAllBusy] = useState(false);
   // 「全部添加为任务」的确认框：批量转换会一次硬删全部建议，误触成本高，需确认。
   const [confirmAddAll, setConfirmAddAll] = useState(false);
+  // 批量删除：选择模式 + 选择集（跨有效 / 已失效 / 已忽略三个列表共用一份 id 集）。
+  // 确认框用 null | "selected" | "all" 表达"没弹 / 删选中的 / 删全部有效"，避免两个 boolean
+  // 同时为真的歧义。
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState<null | "selected" | "all">(null);
   // 验证中的建议 id 集合：驱动轮询。即使 POST 后的立即刷新失败，轮询仍会继续
   // 直到结果落库（loadInsights 会把它同步为"当前确实 pending 的 id"）。
   const [verifyInFlight, setVerifyInFlight] = useState<Set<string>>(new Set());
@@ -113,14 +136,25 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
     setScan(res.scan);
     if (!agentSelectionInitializedRef.current) {
       agentSelectionInitializedRef.current = true;
-      const initialAgent = res.scan?.agent ?? res.defaultAgent;
-      if (initialAgent === "claude-code" || initialAgent === "codex") {
+      const initialAgent = knownAgentID(res.scan?.agent ?? res.defaultAgent);
+      // 服务端可能报出一个前端还不认识的工具；那种情况保持当前选择，
+      // 而不是回落成某一个已知工具（那会把"不知道"说成"就是它"）。
+      if (initialAgent) {
         setAgent(initialAgent);
       }
     }
     setFindings(res.findings);
     setInvalidated(res.invalidated ?? []);
     setDismissed(res.dismissed ?? []);
+    // 选择集跟着刷新收敛：被删掉 / 已转任务 / 刚被判失效的建议不该继续挂在选择集里，
+    // 否则界面写着「已选 3 条」而列表上一条都看不到，删除请求还会带着这些幽灵 id 出去。
+    // 没变化时返回原引用：2 秒轮询下每次换身份会让整棵树白重渲染。
+    const listedIds = [...res.findings, ...(res.invalidated ?? []), ...(res.dismissed ?? [])].map((f) => f.id);
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const next = pruneInsightSelection(prev, listedIds);
+      return next.size === prev.size ? prev : next;
+    });
     setTruncated(res.truncated === true);
     setFindingsLimit(res.findingsLimit ?? 0);
     setVerification(res.verification ?? null);
@@ -166,6 +200,9 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
     scanIdRef.current = null;
     eventSeqRef.current = 0;
     setEvents([]);
+    // 选择集是"上一个项目的 id"，留着必然全部失配（删除按钮还会带着它们发出去）。
+    setSelectMode(false);
+    setSelected(new Set());
   }, [projectID]);
 
   useEffect(() => {
@@ -329,6 +366,82 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
     }
   };
 
+  // ─── 批量删除 ──────────────────────────────────────────────────────────
+  //
+  // 两条路径共用一个端点（POST /insights/delete）：删选中的给 findingIds，删全部给 scope。
+  // 都是**硬删**，与卡片上的单条「删除」完全同义 —— 指纹一起消失，下次扫描该问题可能再次
+  // 出现。确认框里必须把这句话说全，否则用户会以为删除等于"这个问题已经不存在了"。
+
+  const toggleSelect = (id: string) => setSelected((prev) => toggleInsightSelection(prev, id));
+
+  // 退出选择模式时清空选择集：留着它，下次进来会看到"已选 N 条"却没有勾选动作发生过。
+  const exitSelectMode = () => {
+    setSelectMode(false);
+    setSelected(new Set());
+  };
+
+  // 删选中的：整批一次请求。后端把"已不在列表里"的条数算进 skipped 并在提示里说明，
+  // 不当失败（另一台设备/另一个标签页刚删掉的情况很常见）。
+  const deleteSelected = async () => {
+    const ids = [...selected];
+    if (bulkDeleting) return;
+    // 确认框开着的时候列表还在轮询：选中的建议若全被别处删掉，选择集会当场收敛成空。
+    // 此时**必须收起确认框**（否则它顶着"删除 0 条"永远挂着，点确认还什么都不发生）。
+    if (ids.length === 0) {
+      setConfirmBulkDelete(null);
+      toast.info("选中的建议已不在列表里，无需删除");
+      return;
+    }
+    setBulkDeleting(true);
+    try {
+      const res = await request<{ deleted: number; skipped: number }>(`/api/projects/${projectID}/insights/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ findingIds: ids }),
+      });
+      // 一条都没删掉（全被别处删过了）不能说成"成功删除 0 条"——那是"没做成"。
+      if (res.deleted > 0) {
+        const parts = [`已删除 ${res.deleted} 条建议`];
+        if (res.skipped > 0) parts.push(`另有 ${res.skipped} 条已不在列表里，未处理`);
+        toast.success(parts.join("，"));
+      } else {
+        toast.info(`选中的 ${res.skipped} 条建议已不在列表里，未做改动`);
+      }
+      setConfirmBulkDelete(null);
+      setSelected(new Set());
+      await loadInsights().catch(() => undefined);
+    } catch (cause) {
+      // 失败时**保留选择集**并把确认框留在屏上：后端把整批包在一个事务里，失败即一条都没删，
+      // 所以"还能再点一次"是真的。若后端改成部分成功（分批不包事务），这里就必须改成重新拉列表。
+      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "批量删除失败，请重试");
+    } finally {
+      if (mountedRef.current) setBulkDeleting(false);
+    }
+  };
+
+  // 删全部有效建议：范围由后端按与列表同一套谓词解析（未失效且未被「不再提示」），
+  // 所以截断（>findingsLimit）时也能一次删干净，不会只删掉看得见的那部分。
+  const deleteAllOpen = async () => {
+    if (bulkDeleting) return;
+    setBulkDeleting(true);
+    try {
+      const res = await request<{ deleted: number; skipped: number }>(`/api/projects/${projectID}/insights/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "open" }),
+      });
+      if (res.deleted > 0) toast.success(`已删除全部 ${res.deleted} 条有效建议`);
+      else toast.info("当前没有可删除的有效建议");
+      setConfirmBulkDelete(null);
+      setSelected(new Set());
+      await loadInsights().catch(() => undefined);
+    } catch (cause) {
+      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "批量删除失败，请重试");
+    } finally {
+      if (mountedRef.current) setBulkDeleting(false);
+    }
+  };
+
   // 单个建议验证：加入 in-flight 集合保证轮询启动，POST 成功后立即刷新拿到 pending。
   const verifyFinding = async (id: string) => {
     if (verifyInFlight.has(id)) return;
@@ -378,6 +491,14 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   const counts = insightFindingCounts(findings);
   const sorted = sortFindings(findings);
   const visible = filterFindingsByType(sorted, filter);
+  // 「全选」的作用域 = 当前筛选下的可见有效建议。选择集里可能还有折叠区（已失效 / 已忽略）
+  // 勾上的 id，所以「已选 N 条」按选择集全局算，「全选」复选框的 all/partial 按可见集合算。
+  const visibleIds = visible.map((f) => f.id);
+  const bulkSelection = insightSelectionSummary(selected, visibleIds);
+  // 已选里来自折叠区的条数：确认框要说清"这次不止删列表上看得见的那些"。
+  const selectedFoldedCount =
+    invalidated.filter((f) => selected.has(f.id)).length + dismissed.filter((f) => selected.has(f.id)).length;
+  const hasDeletable = findings.length > 0 || invalidated.length > 0 || dismissed.length > 0;
   // 上次扫描的聚焦方向（用于结果汇总行展示）。
   const lastTheme = normalizeInsightTheme(scan?.theme);
   const lastFocus = (scan?.focusTypes ?? []).map(normalizeInsightType);
@@ -414,14 +535,13 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
           <div className="insights-picker">
             <span className="insights-picker-label">分析引擎</span>
             <div className="insights-agent-options" role="radiogroup" aria-label="选择分析引擎">
-              <label className={agent === "claude-code" ? "active" : ""}>
-                <input type="radio" name="insight-agent" value="claude-code" checked={agent === "claude-code"} disabled={anyVerifying} onChange={() => selectAgent("claude-code")} />
-                Claude Code
-              </label>
-              <label className={agent === "codex" ? "active" : ""}>
-                <input type="radio" name="insight-agent" value="codex" checked={agent === "codex"} disabled={anyVerifying} onChange={() => selectAgent("codex")} />
-                Codex
-              </label>
+              {agentOptions.map((entry) => {
+                const id = catalogAgentID(entry);
+                return <label key={id} className={agent === id ? "active" : ""}>
+                  <input type="radio" name="insight-agent" value={id} checked={agent === id} disabled={anyVerifying} onChange={() => selectAgent(id)} />
+                  {entry.name}
+                </label>;
+              })}
             </div>
           </div>
           <div className="insights-picker">
@@ -578,6 +698,15 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
               >
                 {verifyAllBusy || anyVerifying ? "正在验证…" : "验证全部"}
               </button>
+              <button
+                type="button"
+                className={`insight-bulk-toggle${selectMode ? " active" : ""}`}
+                onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
+                disabled={!selectMode && (busy || !hasDeletable)}
+                title="进入多选，批量删除建议（可勾选若干条删除，或一次清空全部有效建议）"
+              >
+                {selectMode ? "退出多选" : "多选"}
+              </button>
               {invalidated.length > 0 && (
                 <button
                   type="button"
@@ -603,7 +732,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
 
           {truncated && (
             <section className="insights-notice" role="status">
-              建议数量较多，仅显示前 {findingsLimit || openCount} 条；处理掉一部分后即可看到其余建议。
+              有效建议共 {openCount} 条，列表仅显示最近 {findingsLimit || openCount} 条；处理掉一部分后即可看到其余。「全部添加为任务」「验证全部」「全部删除」作用于全部 {openCount} 条，不只是上面看到的这些。
             </section>
           )}
 
@@ -621,6 +750,59 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                   </li>
                 ))}
               </ul>
+            </section>
+          )}
+
+          {/* 选择条：一个「全选」、一句范围说明、一个已选计数、两个删除动作。
+              两条删除路径的差别必须写在按钮上（选中 N 条 vs 全部有效），否则用户点了
+              「全部删除」会以为它只删自己勾的那几条。 */}
+          {selectMode && (
+            <section className="insights-bulk" role="group" aria-label="批量删除建议">
+              <label
+                className="insights-bulk-select-all"
+                title={filter === "all" ? "选中当前列表里的全部有效建议" : `只选中「${insightTypeLabels[filter]}」筛选出的建议`}
+              >
+                <input
+                  type="checkbox"
+                  className="insight-check"
+                  checked={bulkSelection.all}
+                  disabled={bulkSelection.total === 0}
+                  ref={(el) => { if (el) el.indeterminate = bulkSelection.partial; }}
+                  onChange={() => setSelected((prev) => toggleInsightSelectionAll(prev, visibleIds))}
+                  aria-label={bulkSelection.all ? "取消选择当前列表" : "全选当前列表"}
+                />
+                <span>{bulkSelection.all ? "取消全选" : "全选"}</span>
+              </label>
+              <span className="insights-bulk-hint" data-scope={filter === "all" ? "all" : "filtered"}>
+                {filter === "all"
+                  ? "点卡片或复选框即可勾选；展开的「已失效 / 已忽略」也能一起勾"
+                  : `筛选生效：全选只作用于「${insightTypeLabels[filter]}」下的 ${bulkSelection.total} 条`}
+              </span>
+              <span className="insights-bulk-count">已选 <b>{selected.size}</b> 条</span>
+              <button
+                type="button"
+                className="danger"
+                disabled={bulkDeleting || selected.size === 0}
+                onClick={() => setConfirmBulkDelete("selected")}
+                title="批量删除勾选的建议（硬删，无法恢复）"
+              >
+                {bulkDeleting && confirmBulkDelete === "selected" ? "删除中…" : `删除选中 (${selected.size})`}
+              </button>
+              {/* 复核进行中不给「全部删除」：它会把这批建议删掉，而复核 worker 已经按批次
+                  把它们送给 agent 了 —— 那些调用既停不下来也已经花掉，进度条还会继续数到 N
+                  （用户看到"复核 300/500"而列表是空的）。想立刻清空就先点复核进度块上的「停止」。
+                  「删除选中」不受这条限制：它等价于逐张点卡片上的「删除」，本来就是允许的。 */}
+              <button
+                type="button"
+                className="danger ghost"
+                disabled={bulkDeleting || openCount === 0 || anyVerifying}
+                onClick={() => setConfirmBulkDelete("all")}
+                title={anyVerifying
+                  ? "复核进行中：先停止复核（或等它跑完）再全部删除，否则这些建议会被白核一遍"
+                  : "删除当前全部有效建议（不含「已失效 / 已忽略」折叠区；硬删，无法恢复）"}
+              >
+                {bulkDeleting && confirmBulkDelete === "all" ? "删除中…" : "全部删除"}
+              </button>
             </section>
           )}
 
@@ -643,6 +825,9 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                 onDeleted={() => void loadInsights()}
                 onDismissed={(next) => void setDismissedState(finding.id, next)}
                 fail={fail}
+                selectable={selectMode}
+                selected={selected.has(finding.id)}
+                onToggleSelect={() => toggleSelect(finding.id)}
                 verifying={verifyInFlight.has(finding.id)}
                 onVerify={() => void verifyFinding(finding.id)}
                 onOpenFile={onOpenFile}
@@ -668,6 +853,9 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                     onDismissed={(next) => void setDismissedState(finding.id, next)}
                     fail={fail}
                     invalidated
+                    selectable={selectMode}
+                    selected={selected.has(finding.id)}
+                    onToggleSelect={() => toggleSelect(finding.id)}
                     verifying={verifyInFlight.has(finding.id)}
                     onVerify={() => void verifyFinding(finding.id)}
                     onOpenFile={onOpenFile}
@@ -694,6 +882,9 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                     onDismissed={(next) => void setDismissedState(finding.id, next)}
                     fail={fail}
                     dismissed
+                    selectable={selectMode}
+                    selected={selected.has(finding.id)}
+                    onToggleSelect={() => toggleSelect(finding.id)}
                     verifying={verifyInFlight.has(finding.id)}
                     onVerify={() => void verifyFinding(finding.id)}
                     onOpenFile={onOpenFile}
@@ -703,6 +894,39 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
             </section>
           )}
         </>
+      )}
+
+      {confirmBulkDelete === "selected" && createPortal(
+        <ConfirmDialog
+          title="删除选中的建议"
+          message={<>
+            确定删除选中的 <b>{selected.size}</b> 条建议？删除后无法恢复，下次扫描时这些问题可能重新出现（如果它们还没被修好）。若只是想不再看到某条，用「不再提示」更好。
+            {selectedFoldedCount > 0 && <>其中 {selectedFoldedCount} 条来自「已失效 / 已忽略」折叠区。</>}
+          </>}
+          confirmLabel={`删除 ${selected.size} 条`}
+          danger
+          busy={bulkDeleting}
+          onConfirm={() => void deleteSelected()}
+          onCancel={() => setConfirmBulkDelete(null)}
+        />,
+        document.body,
+      )}
+
+      {confirmBulkDelete === "all" && createPortal(
+        <ConfirmDialog
+          title="删除全部有效建议"
+          message={<>
+            确定删除当前全部 <b>{openCount}</b> 条有效建议？删除后无法恢复，下次扫描时这些问题可能重新出现（如果它们还没被修好）。「已失效 / 已忽略」折叠区里的建议不受影响。
+            {truncated && <>列表当前只显示前 {findingsLimit || openCount} 条，本次会一并删除列表之外的有效建议。</>}
+            {running && <>分析仍在进行，结束后新发现的建议仍会出现在列表里。</>}
+          </>}
+          confirmLabel="全部删除"
+          danger
+          busy={bulkDeleting}
+          onConfirm={() => void deleteAllOpen()}
+          onCancel={() => setConfirmBulkDelete(null)}
+        />,
+        document.body,
       )}
 
       {confirmAddAll && createPortal(
@@ -776,7 +1000,7 @@ function InsightVerifyBadge({ result, note, verifiedAt }: {
   return null;
 }
 
-function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismissed, fail, invalidated = false, dismissed = false, verifying = false, onVerify, onOpenFile }: {
+function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismissed, fail, invalidated = false, dismissed = false, selectable = false, selected = false, onToggleSelect, verifying = false, onVerify, onOpenFile }: {
   finding: InsightFinding;
   projectID: string;
   request: Request;
@@ -786,6 +1010,10 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
   fail: (message: string) => void;
   invalidated?: boolean;
   dismissed?: boolean;
+  // 批量删除：选择模式下卡片上出现复选框，且整卡可点（控件优先，见 isCardControl）。
+  selectable?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
   // 面板级 in-flight 标记：POST 后立即为 true，轮询拿到 pending 后仍为 true，
   // 结果落库（loadInsights 同步 verifyInFlight）后变回 false。
   verifying?: boolean;
@@ -905,8 +1133,24 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
   }
 
   return (
-    <li className={`insight-card${invalidated ? " invalidated" : ""}${dismissed ? " dismissed" : ""}`}>
-      <span className={`insight-card-type insight-type-${type}`}><TypeIcon type={type} />{insightTypeLabels[type]}</span>
+    <li
+      className={`insight-card${invalidated ? " invalidated" : ""}${dismissed ? " dismissed" : ""}${selectable ? " selectable" : ""}${selectable && selected ? " selected" : ""}`}
+      onClick={selectable ? (event) => { if (isCardControl(event.target)) return; onToggleSelect?.(); } : undefined}
+    >
+      {/* 复选框与类型徽标同一行：新增一个网格行会让每张卡凭空长高一行（任务看板批量管理踩过同一个坑）。 */}
+      <div className="insight-card-top">
+        {selectable && (
+          <input
+            type="checkbox"
+            className="insight-check"
+            checked={selected}
+            onChange={() => onToggleSelect?.()}
+            aria-label={`选择「${finding.title}」`}
+            title={selected ? "取消选择" : "选择此建议"}
+          />
+        )}
+        <span className={`insight-card-type insight-type-${type}`}><TypeIcon type={type} />{insightTypeLabels[type]}</span>
+      </div>
       <b>{finding.title}</b>
       <p>{finding.summary}</p>
       {/* AI 验证的判断依据：仍存在/失效/失败的说明。失败 note 已自带失败语义，不再加前缀。 */}

@@ -7,6 +7,13 @@ import { CodeFileView } from "../files/CodeFileView";
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type ResolveAction = "ours" | "theirs" | "delete" | "working";
 type SuggestionStatus = "running" | "completed" | "failed" | "cancelled";
+// ⚠️ 已知例外（docs/42 §15）：本组件桌面端与手机端共用，而**手机端目前读不到
+// 工具目录**（手机走云端 /api/remote/*，控制服务的 GET /api/agents 不在那条通道上）。
+// 因此这里暂时保留按工具 ID 的清单；强行改成读目录会让手机端把工具显示成裸 id，
+// 那是比现在更差的退化。正确修法是把工具目录放进手机快照（或让云端转发该端点），
+// 那是一条 REMOTE-CONTRACT 变更，单独排期。
+/** AI 建议可选的模型。手机端渲染成胶囊（不用原生 `<select>`），桌面端仍是下拉。 */
+const AI_AGENT_OPTIONS = [{ value: "claude-code", label: "Claude" }, { value: "codex", label: "Codex" }] as const;
 type ConflictSuggestion = {
   id: string;
   projectId: string;
@@ -28,6 +35,14 @@ interface ConflictSolveViewProps {
   oursLabel: string;
   theirsLabel: string;
   busy: boolean;
+  /**
+   * 手机端形态：AI 模型那一项用胶囊代替原生 `<select>`。
+   *
+   * 原生 `<select>` 的弹层由系统绘制、样式一行都管不到 —— 这条在本项目是手机端的硬规则
+   * （操作记录的筛选栏就是为此从 `<select>` 换成胶囊的）。这一处是漏网的：它只有两个选项
+   * （Claude / Codex），胶囊放得下，而且与旁边那排按钮同一种手感。
+   */
+  mobile?: boolean;
   onResolve: (path: string, action: ResolveAction, content?: string) => void;
   onOpenFile: (path: string) => void;
   onClose: () => void;
@@ -46,7 +61,7 @@ function snippet(text: string, maxLines = 5): string {
   return shown.join("\n");
 }
 
-export function ConflictSolveView({ projectID, conversationId, path, conflictPaths, request, fail, oursLabel, theirsLabel, busy, onResolve, onOpenFile, onClose }: ConflictSolveViewProps) {
+export function ConflictSolveView({ projectID, conversationId, path, conflictPaths, request, fail, oursLabel, theirsLabel, busy, mobile = false, onResolve, onOpenFile, onClose }: ConflictSolveViewProps) {
   const [content, setContent] = useState<GitConflictContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -175,7 +190,14 @@ export function ConflictSolveView({ projectID, conversationId, path, conflictPat
       {showWholeOurs ? <button type="button" className="secondary" disabled={busy} onClick={() => onResolve(path, "ours")} title="整文件采用当前侧">整体采用当前</button> : null}
       {showWholeTheirs ? <button type="button" className="secondary" disabled={busy} onClick={() => onResolve(path, "theirs")} title="整文件采用传入侧">整体采用传入</button> : null}
       {showDeleteFile ? <button type="button" className="secondary danger" disabled={busy} onClick={() => onResolve(path, "delete")} title="将该文件以删除收场">删除文件</button> : null}
-      {editable ? <label className="git-conflict-ai-launch"><select value={suggestAgent} disabled={busy || suggestStarting || suggestion?.status === "running"} onChange={(event) => setSuggestAgent(event.target.value as "claude-code" | "codex")} aria-label="AI 模型"><option value="claude-code">Claude</option><option value="codex">Codex</option></select><button type="button" className="secondary" disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => void startSuggestion()}>{suggestStarting ? "启动中…" : suggestion?.status === "running" ? "AI 生成中…" : "AI 生成建议"}</button></label> : null}
+      {editable ? (mobile
+        ? <div className="git-conflict-ai-launch" role="group" aria-label="AI 模型">
+          <div className="git-conflict-ai-agents">
+            {AI_AGENT_OPTIONS.map((option) => <button type="button" key={option.value} className="secondary" aria-pressed={suggestAgent === option.value} disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => setSuggestAgent(option.value)}>{option.label}</button>)}
+          </div>
+          <button type="button" className="secondary" disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => void startSuggestion()}>{suggestStarting ? "启动中…" : suggestion?.status === "running" ? "AI 生成中…" : "AI 生成建议"}</button>
+        </div>
+        : <label className="git-conflict-ai-launch"><select value={suggestAgent} disabled={busy || suggestStarting || suggestion?.status === "running"} onChange={(event) => setSuggestAgent(event.target.value as "claude-code" | "codex")} aria-label="AI 模型"><option value="claude-code">Claude</option><option value="codex">Codex</option></select><button type="button" className="secondary" disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => void startSuggestion()}>{suggestStarting ? "启动中…" : suggestion?.status === "running" ? "AI 生成中…" : "AI 生成建议"}</button></label>) : null}
       {canMarkResolved ? <button type="button" className="primary" onClick={() => workingText !== null && onResolve(path, "working", workingText)}>标记为已解决</button> : null}
     </div>
 

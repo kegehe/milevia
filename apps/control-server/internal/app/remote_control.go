@@ -146,10 +146,42 @@ type remoteSnapshotNotice struct {
 // deliberately outside the mobile relay's hot path.
 const (
 	remoteSnapshotConversationsPerProject = 1
-	remoteSnapshotMessagesPerConversation = 20
-	remoteSnapshotMessageContentLimit     = 2000
-	remoteSnapshotNoticesPerConversation  = 24
-	remoteSnapshotNoticePayloadLimit      = 4096
+	// 手机端每个会话最多带这么多条消息。它只是防"几千条短消息"的兜底，真正起作用的是
+	// 下面的**总字节预算**：条数上限卡死 20 时，实测的几个活跃会话在手机上只能看到
+	// 27~115 条里的 20 条（字符数只剩 30%~53%），而这点量根本撑不起"翻一下刚才说了什么"，
+	// 于是用户看到的就是"移动端会丢掉一些历史信息"。
+	remoteSnapshotMessagesPerConversation = 200
+	// remoteSnapshotMessageBudget 是单个会话的**内容字节**预算，从最新往回装、装不下为止。
+	//
+	// 用字节而不是条数当闸门：一条 3 万字符的长回复和一条"好"占的配额天差地别，按条数算
+	// 只能取两者的较大公约数（旧的 20 条 × 2000 字符），要么裁掉一半对话，要么让快照爆炸。
+	// 24 KiB 的取值依据是真机实测：抽查的会话里最大的一个全量消息只有 20.7 KB，也就是说
+	// 正常对话在手机上可以**一条不落**地看到底部这一整段。
+	//
+	// 它不包含每条消息的 JSON 固定开销（id/role/createdAt 约 190 字节/条），所以单会话
+	// 序列化后的真实上限 ≈ 24 KiB + 200 条 × 190 B ≈ 62 KB —— 条数上限把开销也一起封住了。
+	// 8 个项目全满约 500 KB，远小于云端 32 MB 的快照上限，所以没有为此再压窗口。
+	remoteSnapshotMessageBudget = 24 << 10
+	// remoteSnapshotMessageReserve 是**留给其余消息**的预算下限：任何一条消息最多吃掉
+	// (预算 - reserve)。
+	//
+	// 没有这条，一条超长粘贴就会把整个窗口挤成一条：实测库里最长的一条消息 47 KB，
+	// 预算只有 24 KB，它一旦落在最新那条，手机重进页面就只剩这一条消息 —— 用户看到的现象
+	// 与"历史记录没了"一模一样。留下 6 KiB，任何输入下窗口都至少还装得下二十来条短消息。
+	// 代价是超过 18 KiB 的消息在手机上会被截断（实测全库 11364 条里只有 8 条，0.07%），
+	// 且带截断标记、桌面端原文不动。
+	remoteSnapshotMessageReserve = 6 << 10
+	// remoteSnapshotMessageMinBytes 是单条消息值得带回去的最小字节数：预算见底时，与其
+	// 塞进去半句话，不如整条不带。
+	remoteSnapshotMessageMinBytes = 512
+	// remoteSnapshotMessageTruncated 是截断标记。以前超长消息是**静默**截断的：手机上看到的
+	// 就是一段完整的话，用户没有任何办法知道后半段没了。宁可多一行提示词，也不能假装完整。
+	remoteSnapshotMessageTruncated       = "\n\n…（内容过长，手机上已截断）"
+	remoteSnapshotNoticesPerConversation = 24
+	remoteSnapshotNoticePayloadLimit     = 4096
+	// remoteSnapshotNoticeFieldChars 是单条 payload 里**每个字符串字段**的上限。超预算的
+	// payload 按字段裁剪（见 shrinkNoticePayload），而不是整条换成 {}。
+	remoteSnapshotNoticeFieldChars = 1000
 	// 快捷方式库的配额。库是用户手工维护的，正常几十条；给上限是为了防"导入了上千条提示词"
 	// 把每个快照都撑到几百 KB（快照每次有事件推进就要重传一次，3 秒节流）。
 	remoteSnapshotShortcuts             = 200
@@ -165,6 +197,21 @@ const (
 // 以为程序死了。stderr 刻意不在其中——它逐行产生，几十行会把配额挤爆，而且真正的原因
 // 通常已经在 run.failed / error 的 detail 里；实时通道仍会把它聚合成一条"CLI 输出"。
 const remoteNoticeTypesSQL = `type in ('system','run.failed','run.interrupted','error','turn.failed','stream.error') or type like 'approval.%'`
+
+// remoteNoticeReplayPredicate 是快照运行记录的完整取数条件：类型命中 remoteNoticeTypesSQL、
+// 不是渲染不出来的空转子类型（unrenderedSystemSubtypePredicate）、也不是历史遗留的
+// thinking_tokens。
+//
+// "哪些 system 事件渲染不出来"这条判定与会话历史分页共用一份实现（见 event_replay.go），
+// 因为两边答错的代价是同一个：窗口是按条数算的，一条占位却不出卡片的事件，顶掉的就是
+// 一条真内容。手机端这边窗口只有 24 格（remoteSnapshotNoticesPerConversation），
+// 真机实测过滤前只有 4~10 格是真卡片 —— 一张"后台任务启动"卡片 2~4 分钟就被挤出去，
+// 手机上刚看到、退出再进来就没了。
+//
+// 三段都必须压在 limit 之前 —— 先取 24 条再过滤，窗口仍是被心跳占满的那 24 条。
+func remoteNoticeReplayPredicate(alias string) string {
+	return "(" + remoteNoticeTypesSQL + ") and not " + unrenderedSystemSubtypePredicate(alias) + " and not " + thinkingTokensPredicate(alias)
+}
 
 type remoteCommand struct {
 	CommandID      string          `json:"commandId"`
@@ -266,6 +313,12 @@ var desktopPairingPaths = map[string]bool{
 	"/api/remote/pairing/confirm": true,
 	"/api/remote/pairing/status":  true,
 	"/api/remote/agent-status":    true,
+	// 当前绑定的是哪台手机。它和生成二维码一样属于"坐在电脑前的人要看的信息"，
+	// 所以也走会话令牌这条路；只读，不改任何状态。
+	"/api/remote/bindings": true,
+	// 主动断开当前手机（手机丢了 / 准备换设备）。它是**坐在电脑前的人**的动作，
+	// 和「确认绑定」同一性质：都是电脑端在处置自己的绑定关系。
+	"/api/remote/bindings/revoke": true,
 }
 
 // validDesktopSession reports whether the request carries the desktop page's
@@ -514,18 +567,101 @@ func (s *Server) remotePairingStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 
+// remoteRevokeBindings 是「解除绑定」按钮的后半段：把这台电脑当前绑定的手机断开。
+// 手机丢了、或者准备换设备时，用户必须能在电脑前自己处置 —— 否则只能靠手机来解绑，
+// 而那台手机可能已经不在了。
+func (s *Server) remoteRevokeBindings(w http.ResponseWriter, r *http.Request) {
+	cloudURL, cloudToken, instanceID := s.remoteCloudCredentials()
+	if cloudURL == "" || cloudToken == "" || instanceID == "" {
+		writeError(w, http.StatusServiceUnavailable, errors.New("remote Agent is not ready; wait for registration or check milevia-agent.log"))
+		return
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, cloudURL+"/v1/agent/bindings/revoke", nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
+	request.Header.Set("X-Milevia-Instance-ID", instanceID)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("cloud unbind failed (%d)", response.StatusCode))
+		return
+	}
+	var value any
+	if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
 // remoteAgentStatus tells the desktop page whether the computer-side Agent has
 // registered with the cloud and published its credential. Without it the page
 // cannot distinguish "the cloud is unreachable" from "this computer was never
 // enrolled", and clicking "generate QR code" would only ever return 503. The
 // agent token itself is never returned — only whether one exists.
+//
+// lastAgentHeartbeatAt 回答的是另一个问题：**服务还活着吗**。ready 只看凭据在不在，
+// Agent 进程崩了它依然是 true —— 于是页面会显示"已就绪"，而手机端其实什么都收不到。
+// 心跳时刻让页面能把"收不到心跳"这一档说出来。空字符串表示这次进程启动后还没听到过心跳
+// （刚启动 / 从没连上）。⚠️ 心跳只在 Agent 与云端连接建立期间才有（见 remoteOverview），
+// 所以它是"没在跑"与"连不上云端"两种原因的共同表现，调用方不许只挑一种说。
 func (s *Server) remoteAgentStatus(w http.ResponseWriter, r *http.Request) {
 	cloudURL, cloudToken, instanceID := s.remoteCloudCredentials()
+	heartbeat := ""
+	if nanos := s.remoteAgentHeartbeatAt.Load(); nanos > 0 {
+		heartbeat = time.Unix(0, nanos).UTC().Format(time.RFC3339)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ready":      cloudURL != "" && cloudToken != "",
-		"cloudUrl":   cloudURL,
-		"instanceId": instanceID,
+		"ready":                cloudURL != "" && cloudToken != "",
+		"cloudUrl":             cloudURL,
+		"instanceId":           instanceID,
+		"lastAgentHeartbeatAt": heartbeat,
 	})
+}
+
+// remoteBindings relays "现在绑在这台电脑上的是哪台手机"。
+//
+// 一台电脑同一时间只服务一台手机（云端在确认绑定的事务里顶替），所以配对卡片在
+// 生成二维码之前必须能说出"你要顶掉的是谁" —— 没有这个信息，用户点完确认才发现
+// 另一台手机被踢掉，只能事后猜。只读、且只读自己这台实例。
+func (s *Server) remoteBindings(w http.ResponseWriter, r *http.Request) {
+	cloudURL, cloudToken, instanceID := s.remoteCloudCredentials()
+	if cloudURL == "" || cloudToken == "" || instanceID == "" {
+		// 还没注册远程服务时不算错误：页面按"没有绑定信息"渲染即可，
+		// 把 503 抛给用户只会让他以为绑定坏了。
+		writeJSON(w, http.StatusOK, map[string]any{"instanceId": "", "bindings": []any{}, "ready": false})
+		return
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, cloudURL+"/v1/agent/bindings", nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
+	request.Header.Set("X-Milevia-Instance-ID", instanceID)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("cloud bindings lookup failed (%d)", response.StatusCode))
+		return
+	}
+	var value any
+	if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
 }
 
 func (s *Server) enqueueRemoteCommand(w http.ResponseWriter, r *http.Request) {
@@ -744,6 +880,9 @@ func (s *Server) enqueueRemoteDelta(runID string, payload []byte) {
 }
 
 func (s *Server) remoteOverview(w http.ResponseWriter, r *http.Request) {
+	// 这个端点就是 Agent 的心跳：它在 750ms 的 tick 里无条件打一次（见 agent.syncSnapshot
+	// 开头那次 localGet，它在任何节流判断之前）。记下来才能回答"远程服务到底在不在跑"。
+	s.remoteAgentHeartbeatAt.Store(time.Now().UnixNano())
 	var item RemoteInstance
 	// SQLite returns an expression such as coalesce(...) as text even when both
 	// source columns contain timestamps. Scan the raw value and normalize it so
@@ -783,8 +922,11 @@ func parseRemoteTimestamp(value any) (time.Time, error) {
 // remoteConversationNotices replays the recent status/diagnostic events of one
 // conversation in ascending order, so the phone timeline can interleave them
 // with messages using a single rule.
+//
+// 取的是"真能渲染成卡片"的那些：窗口定长，被心跳占掉的位置就是用户看不到的卡片
+// （见 unrenderedSystemSubtypePredicate）。
 func (s *Server) remoteConversationNotices(ctx context.Context, conversationID string) ([]remoteSnapshotNotice, error) {
-	query := fmt.Sprintf(`select id,run_id,type,payload,created_at from events where conversation_id=? and (%s) order by created_at desc,id desc limit ?`, remoteNoticeTypesSQL)
+	query := fmt.Sprintf(`select id,run_id,type,payload,created_at from events where conversation_id=? and %s order by created_at desc,id desc limit ?`, remoteNoticeReplayPredicate("events"))
 	rows, err := s.db.QueryContext(ctx, query, conversationID, remoteSnapshotNoticesPerConversation)
 	if err != nil {
 		return nil, err
@@ -799,13 +941,7 @@ func (s *Server) remoteConversationNotices(ctx context.Context, conversationID s
 			return nil, err
 		}
 		item.RunID = runID.String
-		// Payloads that exceed the relay budget degrade to an empty object: a
-		// truncated JSON document would be worse than no detail at all, and the
-		// notice itself still tells the phone what happened.
-		if len(payload) > remoteSnapshotNoticePayloadLimit {
-			payload = "{}"
-		}
-		item.Payload = json.RawMessage(payload)
+		item.Payload = json.RawMessage(shrinkNoticePayload(payload))
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -815,6 +951,83 @@ func (s *Server) remoteConversationNotices(ctx context.Context, conversationID s
 		items[left], items[right] = items[right], items[left]
 	}
 	return items, nil
+}
+
+// shrinkNoticePayload 把超出中继预算的 payload 裁到预算之内，**保留 JSON 结构**。
+//
+// 以前这里是 `payload = "{}"`，理由是"截断的 JSON 还不如没有，反正事件本身已经告诉手机
+// 发生了什么"。后半句是错的：手机的渲染完全由 payload 里的 subtype 驱动
+// （noticeFromEventFields → systemItemFromEvent），payload 变成 {} 之后整张卡片直接消失，
+// 手机什么也看不到，而那一条事件照样占着窗口的一个位置。
+//
+// 真机上撞到的正是"后台任务"：task_notification 的 summary 是后台代理交回来的整份报告，
+// 三四千字符很常见（实测 5384 字节的一条），于是**同一张卡片实时看得到、退出再进来就没了**
+// ——实时通道的预算是 256 KiB（compactRemoteEventPayload），快照这边却是 4 KiB。
+//
+// 现在按字段裁：字符串逐字段截到 remoteSnapshotNoticeFieldChars，结构（subtype/status/
+// task_id…）原样保留，手机仍然渲染得出"后台任务完成 + 截短后的摘要"。预算还是超（字段特别
+// 多或者嵌套结构特别大）就把每个字段的上限折半再来一次；连下限都压不进去才退回 {}——
+// 到那一步说明这条事件的形状已经不适合进快照了。
+//
+// **返回值一定不超预算**（除非入参本来就没超）：预算存在的意义就是给快照封顶，任何一条
+// 溜过去都会把它重新变成"最坏情况不可知"。所以裁不动的一律退 {}，包括根本不是 JSON 对象的
+// 那些——手机端本来也只认对象，退 {} 与保留原样在它那边是同一个结果，差别只在字节数。
+//
+// **已知缺口（当前形状下不可达，但换一种形状就会踩到）**：只有**字符串字段**会被裁。
+// 如果一个超大 payload 的体积长在数组/嵌套对象上（例如 background_tasks_changed 的 tasks
+// 里塞了几百个任务），字符串裁剪帮不上忙，这一条最终会退成 {} —— 卡片又消失一次。
+// 没有顺手加"截断数组"是因为那种降级会说谎：tasks 变空之后客户端渲染的是
+// "后台任务已全部完成"（见 timeline.ts 的 background_tasks_changed 分支），而事实并非如此；
+// 宁可不显示，也不能显示一句反话。真出现这种事件时，正确做法是给该子类型单独定降级规则，
+// 而不是在这里通用地砍数组。实测库里 12 条超预算的 notice 全是字符串字段撑大的
+// （task_notification 的 summary），这条路径一次都没走到。
+func shrinkNoticePayload(payload string) string {
+	if len(payload) <= remoteSnapshotNoticePayloadLimit {
+		return payload
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &fields); err != nil {
+		return `{}`
+	}
+	fieldLimit := remoteSnapshotNoticeFieldChars
+	for {
+		trimmed, err := json.Marshal(truncateNoticeFields(fields, fieldLimit))
+		if err != nil {
+			return `{}`
+		}
+		if len(trimmed) <= remoteSnapshotNoticePayloadLimit {
+			return string(trimmed)
+		}
+		if fieldLimit <= remoteSnapshotNoticeFieldChars/8 {
+			return `{}`
+		}
+		fieldLimit /= 2
+	}
+}
+
+// truncateNoticeFields 把每个字符串字段截到 limit 个字符（按 rune 边界，中文不会被切半个）。
+// 数字、布尔、null 和嵌套结构原样返回：结构里可能有手机端要用的判定字段
+// （例如 task_updated 的 patch.is_backgrounded），截断它们只会让卡片判错。
+func truncateNoticeFields(fields map[string]json.RawMessage, limit int) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(fields))
+	for key, raw := range fields {
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			out[key] = raw
+			continue
+		}
+		if len(text) <= limit {
+			out[key] = raw
+			continue
+		}
+		encoded, err := json.Marshal(truncateUTF8(text, limit))
+		if err != nil {
+			out[key] = raw
+			continue
+		}
+		out[key] = encoded
+	}
+	return out
 }
 
 // remoteSnapshotShortcuts 读取手机端要用的快捷方式库。
@@ -1000,7 +1213,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		taskRows.Close()
-		project.Conversations = make([]remoteSnapshotConversation, 0)		// The active conversation is enough to make a project immediately usable
+		project.Conversations = make([]remoteSnapshotConversation, 0) // The active conversation is enough to make a project immediately usable
 		// on mobile. Do not turn a recovery snapshot into a full history export.
 		conversationRows, err := s.db.QueryContext(r.Context(), `select id,title,status,agent_id,last_activity_at,is_current from conversations where project_id=? order by is_current desc,last_activity_at desc,id desc limit ?`, project.ID, remoteSnapshotConversationsPerProject)
 		if err != nil {
@@ -1025,14 +1238,14 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 		conversationRows.Close()
 		if len(project.Conversations) > 0 {
 			conversation := &project.Conversations[0]
-			// The newest message is rendered immediately on mobile and must not be
-			// truncated. Older messages stay bounded to keep the recovery snapshot
-			// small; the realtime event path carries their full content when live.
+			// 消息从最新往回装，装到预算用尽为止（详见 remoteSnapshotMessageBudget）。
+			// 每条最多吃掉「预算 - reserve」，超出的部分截断并留下标记。
 			messageRows, err := s.db.QueryContext(r.Context(), `select id,run_id,role,content,created_at from messages where conversation_id=? and parent_tool_use_id='' order by created_at desc,id desc limit ?`, conversation.ID, remoteSnapshotMessagesPerConversation)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
+			remaining := remoteSnapshotMessageBudget
 			messageIndex := 0
 			for messageRows.Next() {
 				var message remoteSnapshotMessage
@@ -1041,9 +1254,24 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
-				if messageIndex > 0 {
-					message.Content = truncateUTF8(message.Content, remoteSnapshotMessageContentLimit)
+				// 任何一条消息最多吃掉 预算 - reserve（见 remoteSnapshotMessageReserve）：
+				// 既让最新那条能完整显示（只要它没超这个数），也保证无论**哪一条**特别长，
+				// 窗口都不会被它挤空。其余按剩余预算裁到装不下为止。
+				allowance := remaining
+				if allowance > remoteSnapshotMessageBudget-remoteSnapshotMessageReserve {
+					allowance = remoteSnapshotMessageBudget - remoteSnapshotMessageReserve
 				}
+				if len(message.Content) > allowance {
+					// 预算不够就到此为止：再往前的更旧，一条都不带了。
+					// 手机端目前没有"翻更早的消息"这条路（它只看快照），所以这里的取舍是
+					// "边界往前挪到哪"，而不是"少了能补回来"。
+					if allowance < remoteSnapshotMessageMinBytes {
+						break
+					}
+					cut := allowance - len(remoteSnapshotMessageTruncated)
+					message.Content = truncateUTF8(message.Content, cut) + remoteSnapshotMessageTruncated
+				}
+				remaining -= len(message.Content)
 				conversation.Messages = append(conversation.Messages, message)
 				messageIndex++
 			}
@@ -1156,6 +1384,16 @@ func (s *Server) readRemoteOutbox(ctx context.Context, limit int) ([]remoteOutbo
 	// single undeliverable event (for example one the cloud permanently
 	// rejects) would sit at the head of this ordered batch forever and starve
 	// every event behind it.
+	//
+	// ⚠️ 这里**不要**再加 `created_at >= 窗口` 这样的过滤条件。加过一版，真机库上
+	// （138 万行积压）实测：无过滤 0.8ms、加过滤 2659ms —— 因为符合条件的行都在
+	// agent_sequence 的**末尾**，扫描要走过整张表才能凑够 limit 的条数，而每一次
+	// 读取都持着那条唯一的 SQLite 连接，等于把整个服务按在地上。合成库上对照过
+	// 多种写法（含建 (created_at, agent_sequence) 索引、子查询定下界），只要存在
+	// 大量过期行，就都退化成全表扫描。
+	//
+	// 过期行由 remote_outbox_retention.go 的清理**删掉**（每 5 分钟一趟，启动后
+	// 几秒就开始），所以"不投递过期事件"这件事由删除保证，不由读取时的谓词保证。
 	rows, err := s.db.QueryContext(ctx, `select event_id,agent_sequence,type,task_id,task_run_id,payload,created_at from remote_outbox where (next_attempt_at is null or next_attempt_at<=?) and attempts < ? order by agent_sequence limit ?`, time.Now().UTC(), maxRemoteOutboxAttempts, limit)
 	if err != nil {
 		return nil, err
@@ -1628,7 +1866,14 @@ func (s *Server) executeRemoteCommand(ctx context.Context, command remoteCommand
 	return s.executeRemoteHTTPCommand(ctx, method, path, "", command.TaskID, "", handler, command.Payload)
 }
 
-func (s *Server) executeRemoteHTTPCommand(ctx context.Context, method, path, projectID, taskID, conversationID string, handler http.HandlerFunc, payload json.RawMessage, extraParams ...string) (any, error) {
+// invokeLocalHandler 合成一次对本进程既有 handler 的调用，返回原始状态码与响应体。
+//
+// 它把"httptest + 手工 chi 路由上下文"这套做法抽出来给两条路径共用：
+//
+//   - executeRemoteHTTPCommand（任务 / 会话命令）：只要成功值，错误压成一句话；
+//   - relayRPCRequest（文件操作，见 remote_relay.go）：**要保留状态码**，手机端得据此
+//     区分"版本冲突 / lease 占用 / 参数错误"，全压成文案就没法做重试与提示分支。
+func invokeLocalHandler(ctx context.Context, method, path, projectID, taskID, conversationID string, handler http.HandlerFunc, payload json.RawMessage, extraParams ...string) (int, []byte) {
 	req := httptest.NewRequest(method, path, strings.NewReader(string(payload))).WithContext(ctx)
 	rctx := chi.NewRouteContext()
 	if projectID != "" {
@@ -1652,22 +1897,27 @@ func (s *Server) executeRemoteHTTPCommand(ctx context.Context, method, path, pro
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	response := httptest.NewRecorder()
 	handler(response, req)
-	if response.Code >= 400 {
+	return response.Code, response.Body.Bytes()
+}
+
+func (s *Server) executeRemoteHTTPCommand(ctx context.Context, method, path, projectID, taskID, conversationID string, handler http.HandlerFunc, payload json.RawMessage, extraParams ...string) (any, error) {
+	status, body := invokeLocalHandler(ctx, method, path, projectID, taskID, conversationID, handler, payload, extraParams...)
+	if status >= 400 {
 		// 这条文案会原样出现在手机端（「快捷方式执行失败：…」），所以：
 		//   · 不能写死 "task" —— 同一个 helper 也服务 conversation.* 命令；
 		//   · 能取到 {"error": "..."} 就只取那一句，别把整个 JSON 与 HTTP 码糊给用户看。
-		detail := strings.TrimSpace(response.Body.String())
+		detail := strings.TrimSpace(string(body))
 		var failure struct {
 			Error string `json:"error"`
 		}
-		if err := json.Unmarshal(response.Body.Bytes(), &failure); err == nil && failure.Error != "" {
+		if err := json.Unmarshal(body, &failure); err == nil && failure.Error != "" {
 			detail = failure.Error
 		}
-		return nil, fmt.Errorf("remote command failed (%d): %s", response.Code, detail)
+		return nil, fmt.Errorf("remote command failed (%d): %s", status, detail)
 	}
 	var value any
-	if response.Body.Len() > 0 {
-		_ = json.Unmarshal(response.Body.Bytes(), &value)
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &value)
 	}
 	return value, nil
 }

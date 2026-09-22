@@ -1015,6 +1015,261 @@ func TestDeleteInsightFindingNotFound(t *testing.T) {
 	}
 }
 
+// ─── 批量删除（POST /insights/delete）────────────────────────────────────
+
+// insightDeleteResult 批量删除接口的返回体。
+type insightDeleteResult struct {
+	Deleted int `json:"deleted"`
+	Skipped int `json:"skipped"`
+}
+
+// insightRowCount 数项目下满足额外条件的建议行数（where 由调用方给，测试内的常量片段）。
+func insightRowCount(t *testing.T, server *Server, projectID, where string, args ...any) int {
+	t.Helper()
+	query := `select count(*) from project_insights where project_id=?`
+	if where != "" {
+		query += " and " + where
+	}
+	var n int
+	if err := server.db.QueryRow(query, append([]any{projectID}, args...)...).Scan(&n); err != nil {
+		t.Fatalf("count insights (%s): %v", where, err)
+	}
+	return n
+}
+
+// insightIDByTitle 按标题取建议 id：比"按 rowid 猜下标"稳，改动插入顺序也不会误判。
+func insightIDByTitle(t *testing.T, server *Server, projectID, title string) string {
+	t.Helper()
+	var id string
+	if err := server.db.QueryRow(`select id from project_insights where project_id=? and title=?`, projectID, title).Scan(&id); err != nil {
+		t.Fatalf("load insight id by title %q: %v", title, err)
+	}
+	return id
+}
+
+// postInsightDelete 打一次批量删除接口，返回记录器（断言一律用 insightDecode）。
+func postInsightDelete(t *testing.T, server *Server, projectID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/delete", strings.NewReader(body)))
+	return rec
+}
+
+// seedInsightTrio 落三条建议（标题固定为 甲/乙/丙），供批量删除的三种范围共用。
+func seedInsightTrio(t *testing.T, server *Server, projectID string) {
+	t.Helper()
+	passA := `[{"type":"bug","severity":"high","title":"甲","summary":"s1"},{"type":"style","severity":"normal","title":"乙","summary":"s2"},{"type":"feature","severity":"low","title":"丙","summary":"s3"}]`
+	seedInsightFindings(t, server, projectID, passA)
+	if got := insightRowCount(t, server, projectID, ""); got != 3 {
+		t.Fatalf("seed trio: got %d findings want 3", got)
+	}
+}
+
+// markInsightInvalid 直接改库把一条建议置为"已失效"，省掉一趟复核 agent。
+// （复核路径本身由既有用例覆盖，这里只关心列表/删除的范围谓词。）
+func markInsightInvalid(t *testing.T, server *Server, findingID string) {
+	t.Helper()
+	if _, err := server.db.Exec(`update project_insights set verification_result='invalid',verification_note='已失效',verified_at=? where id=?`, time.Now().UTC().Format("2006-01-02 15:04:05"), findingID); err != nil {
+		t.Fatalf("mark invalid: %v", err)
+	}
+}
+
+func TestDeleteInsightFindingsByIDs(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	seedInsightTrio(t, server, projectID)
+
+	keep := insightIDByTitle(t, server, projectID, "丙")
+	rec := postInsightDelete(t, server, projectID, `{"findingIds":["`+insightIDByTitle(t, server, projectID, "甲")+`","`+insightIDByTitle(t, server, projectID, "乙")+`"]}`)
+	res := insightDecode[insightDeleteResult](t, rec, http.StatusOK)
+	if res.Deleted != 2 || res.Skipped != 0 {
+		t.Fatalf("delete by ids: deleted/skipped = %d/%d want 2/0", res.Deleted, res.Skipped)
+	}
+	// 指定的两条硬删，没被点名的那条必须还在。
+	if n := insightRowCount(t, server, projectID, ""); n != 1 {
+		t.Errorf("rows left: got %d want 1", n)
+	}
+	if n := insightRowCount(t, server, projectID, `id=?`, keep); n != 1 {
+		t.Errorf("untouched finding disappeared: got %d want 1", n)
+	}
+	rec2 := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/insights", nil))
+	resp := insightDecode[insightsResponse](t, rec2, http.StatusOK)
+	if len(resp.Findings) != 1 || resp.Findings[0].Title != "丙" {
+		t.Errorf("list after batch delete: %+v", resp.Findings)
+	}
+}
+
+// 重复 id 不能虚增 skipped（前端选择集是 Set，重复只可能来自调用方拼错，
+// 但计数要按"实际请求到的建议条数"算）。
+func TestDeleteInsightFindingsDeduplicatesIDs(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	seedInsightTrio(t, server, projectID)
+	id := insightIDByTitle(t, server, projectID, "甲")
+	rec := postInsightDelete(t, server, projectID, `{"findingIds":["`+id+`","`+id+`"]}`)
+	res := insightDecode[insightDeleteResult](t, rec, http.StatusOK)
+	if res.Deleted != 1 || res.Skipped != 0 {
+		t.Fatalf("duplicate ids: deleted/skipped = %d/%d want 1/0", res.Deleted, res.Skipped)
+	}
+}
+
+func TestDeleteInsightFindingsSkipsCrossProjectAndUnknownIDs(t *testing.T) {
+	server := newTestServer(t)
+	projectA := insightTestProjectID(t, server, "insight-a")
+	projectB := insightTestProjectID(t, server, "insight-b")
+	seedInsightTrio(t, server, projectA)
+	seedInsightTrio(t, server, projectB)
+	foreign := insightIDByTitle(t, server, projectB, "甲")
+	mine := insightIDByTitle(t, server, projectA, "甲")
+
+	rec := postInsightDelete(t, server, projectA, `{"findingIds":["`+foreign+`","`+mine+`","ghost"]}`)
+	res := insightDecode[insightDeleteResult](t, rec, http.StatusOK)
+	if res.Deleted != 1 || res.Skipped != 2 {
+		t.Fatalf("mixed ids: deleted/skipped = %d/%d want 1/2", res.Deleted, res.Skipped)
+	}
+	// 越权防护：另一个项目的建议一条都不能少。
+	if n := insightRowCount(t, server, projectB, `id=?`, foreign); n != 1 {
+		t.Errorf("cross-project finding must survive: got %d want 1", n)
+	}
+	if n := insightRowCount(t, server, projectA, ""); n != 2 {
+		t.Errorf("own project rows: got %d want 2", n)
+	}
+}
+
+// scope=open 删的必须与汇总行「共 N 条有效建议」完全同集：已失效 / 已忽略的折叠区一条不动。
+func TestDeleteInsightFindingsScopeOpenKeepsFoldedLists(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	seedInsightTrio(t, server, projectID)
+	invalidID := insightIDByTitle(t, server, projectID, "乙")
+	markInsightInvalid(t, server, invalidID)
+	dismissID := insightIDByTitle(t, server, projectID, "丙")
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/"+dismissID+"/dismiss", strings.NewReader("{}")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dismiss: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	res := insightDecode[insightDeleteResult](t, postInsightDelete(t, server, projectID, `{"scope":"open"}`), http.StatusOK)
+	if res.Deleted != 1 {
+		t.Fatalf("scope=open deleted: got %d want 1", res.Deleted)
+	}
+	if n := insightRowCount(t, server, projectID, `coalesce(verification_result,'')='invalid'`); n != 1 {
+		t.Errorf("invalidated finding must survive scope=open: got %d want 1", n)
+	}
+	if n := insightRowCount(t, server, projectID, `status='dismissed'`); n != 1 {
+		t.Errorf("dismissed finding must survive scope=open: got %d want 1", n)
+	}
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/insights", nil))
+	resp := insightDecode[insightsResponse](t, rec, http.StatusOK)
+	if len(resp.Findings) != 0 || len(resp.Invalidated) != 1 || len(resp.Dismissed) != 1 {
+		t.Errorf("after scope=open: findings=%d invalidated=%d dismissed=%d want 0/1/1", len(resp.Findings), len(resp.Invalidated), len(resp.Dismissed))
+	}
+}
+
+func TestDeleteInsightFindingsScopeFoldedLists(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	seedInsightTrio(t, server, projectID)
+	markInsightInvalid(t, server, insightIDByTitle(t, server, projectID, "乙"))
+	dismissID := insightIDByTitle(t, server, projectID, "丙")
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/"+dismissID+"/dismiss", strings.NewReader("{}")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dismiss: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	if res := insightDecode[insightDeleteResult](t, postInsightDelete(t, server, projectID, `{"scope":"dismissed"}`), http.StatusOK); res.Deleted != 1 {
+		t.Errorf("scope=dismissed: got %d want 1", res.Deleted)
+	}
+	if res := insightDecode[insightDeleteResult](t, postInsightDelete(t, server, projectID, `{"scope":"invalidated"}`), http.StatusOK); res.Deleted != 1 {
+		t.Errorf("scope=invalidated: got %d want 1", res.Deleted)
+	}
+	if n := insightRowCount(t, server, projectID, `coalesce(verification_result,'')='invalid'`); n != 0 {
+		t.Errorf("invalidated rows should be gone: got %d want 0", n)
+	}
+	if n := insightRowCount(t, server, projectID, `status='dismissed'`); n != 0 {
+		t.Errorf("dismissed rows should be gone: got %d want 0", n)
+	}
+	// 有效列表不受两个折叠范围影响。
+	if n := insightRowCount(t, server, projectID, ``); n != 1 {
+		t.Errorf("open rows: got %d want 1", n)
+	}
+}
+
+func TestDeleteInsightFindingsScopeAll(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	seedInsightTrio(t, server, projectID)
+	markInsightInvalid(t, server, insightIDByTitle(t, server, projectID, "乙"))
+	res := insightDecode[insightDeleteResult](t, postInsightDelete(t, server, projectID, `{"scope":"all"}`), http.StatusOK)
+	if res.Deleted != 3 {
+		t.Fatalf("scope=all: got %d want 3", res.Deleted)
+	}
+	if n := insightRowCount(t, server, projectID, ""); n != 0 {
+		t.Errorf("rows left: got %d want 0", n)
+	}
+}
+
+// 指向不明一律 400：批量硬删不可恢复，不能让"少写一个字段"变成"清空整个项目"。
+func TestDeleteInsightFindingsRequiresExplicitTarget(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty body":          ``,
+		"empty object":        `{}`,
+		"empty ids array":     `{"findingIds":[]}`,
+		"unknown scope":       `{"scope":"everything"}`,
+		"scope wrong case":    `{"scope":"Open"}`,
+		"blank id in a batch": `{"findingIds":["","   "]}`, // 去空后等于没给目标
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := newTestServer(t)
+			projectID := insightTestProject(t, server)
+			seedInsightTrio(t, server, projectID)
+			rec := postInsightDelete(t, server, projectID, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("body %q: got %d want %d (%s)", body, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			// 400 之后一条都不许少。
+			if n := insightRowCount(t, server, projectID, ""); n != 3 {
+				t.Errorf("400 must not delete anything: got %d want 3", n)
+			}
+		})
+	}
+}
+
+func TestDeleteInsightFindingsUnknownProject(t *testing.T) {
+	server := newTestServer(t)
+	insightTestProject(t, server)
+	rec := postInsightDelete(t, server, "nope", `{"scope":"all"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown project: got %d want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// 建议删掉以后，由它转出来的任务不受影响（两个概念：不想再看这条建议 ≠ 撤销已下发的任务）。
+func TestDeleteInsightFindingsKeepsConvertedTasks(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	seedInsightTrio(t, server, projectID)
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/"+insightIDByTitle(t, server, projectID, "甲")+"/to-task", strings.NewReader(`{}`)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("to-task: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if res := insightDecode[insightDeleteResult](t, postInsightDelete(t, server, projectID, `{"scope":"all"}`), http.StatusOK); res.Deleted != 2 {
+		t.Fatalf("scope=all after to-task: got %d want 2", res.Deleted)
+	}
+	var tasks int
+	if err := server.db.QueryRow(`select count(*) from tasks where project_id=?`, projectID).Scan(&tasks); err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	if tasks != 1 {
+		t.Errorf("converted task must survive finding deletion: got %d want 1", tasks)
+	}
+}
+
 func TestAddInsightToTaskCreatesTaskAndRemovesFinding(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
@@ -1558,11 +1813,106 @@ func TestListInsightsOpenCount(t *testing.T) {
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/insights", nil))
 	resp := insightDecode[insightsResponse](t, rec, http.StatusOK)
+	// 没截断时两者一致（截断时 openCount 反而**大**于 len(findings)，见下一条用例）。
+	if resp.Truncated {
+		t.Fatalf("这条用例不该触发截断：findings=%d limit=%d", len(resp.Findings), resp.FindingsLimit)
+	}
 	if resp.OpenCount != len(resp.Findings) {
 		t.Errorf("openCount: got %d want %d", resp.OpenCount, len(resp.Findings))
 	}
 	if resp.OpenCount != 2 {
 		t.Errorf("openCount value: got %d want 2", resp.OpenCount)
+	}
+}
+
+// openCount 是**真实总数**，不跟着列表截断走：它是汇总行与三个"全部…"确认框上的数字，
+// 而那三个动作（验证 / 添加为任务 / 删除）在后端都是全量执行 —— 报截断上限会让用户在
+// 按下不可逆的按钮之前读到一个假数字。
+func TestListInsightsOpenCountIgnoresTruncation(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	if _, err := server.db.Exec(`insert into project_insight_scans (id,project_id,status,created_at,started_at,completed_at) values (?,?,'completed',?,?,?)`,
+		"scan-many", projectID, now, now, now); err != nil {
+		t.Fatalf("insert scan: %v", err)
+	}
+	total := insightFindingsListLimit + 5
+	// 走一个事务：505 条各自一个隐式事务在 Windows 上要十几秒。
+	tx, err := server.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	stmt, err := tx.Prepare(`insert into project_insights (id,project_id,scan_id,type,severity,title,summary,file_hint,fingerprint,status,created_at,updated_at)
+		values (?,?,?,'bug','normal',?,'s','',?,'open',?,?)`)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	for i := 0; i < total; i++ {
+		// fingerprint 必须互不相同：表上有 (project_id,fingerprint) 唯一索引。
+		if _, err := stmt.Exec(fmt.Sprintf("f-%d", i), projectID, "scan-many", fmt.Sprintf("建议 %d", i), fmt.Sprintf("fp-%d", i), now, now); err != nil {
+			t.Fatalf("insert finding %d: %v", i, err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/insights", nil))
+	resp := insightDecode[insightsResponse](t, rec, http.StatusOK)
+	if !resp.Truncated || len(resp.Findings) != insightFindingsListLimit {
+		t.Fatalf("truncation: truncated=%v findings=%d want true/%d", resp.Truncated, len(resp.Findings), insightFindingsListLimit)
+	}
+	if resp.OpenCount != total {
+		t.Errorf("openCount must be the real total: got %d want %d", resp.OpenCount, total)
+	}
+}
+
+// 同一个谓词也用在批量删除的 scope=open 上：截断时"全部删除"要一次删干净，
+// 而不是只删看得见的那批（两者共用一套 SQL 片段，这条用例把关系钉住）。
+func TestDeleteInsightFindingsScopeOpenDeletesBeyondListLimit(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	if _, err := server.db.Exec(`insert into project_insight_scans (id,project_id,status,created_at,started_at,completed_at) values (?,?,'completed',?,?,?)`,
+		"scan-many", projectID, now, now, now); err != nil {
+		t.Fatalf("insert scan: %v", err)
+	}
+	total := insightFindingsListLimit + 5
+	tx, err := server.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	stmt, err := tx.Prepare(`insert into project_insights (id,project_id,scan_id,type,severity,title,summary,file_hint,fingerprint,status,created_at,updated_at)
+		values (?,?,?,'bug','normal',?,'s','',?,'open',?,?)`)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	for i := 0; i < total; i++ {
+		if _, err := stmt.Exec(fmt.Sprintf("f-%d", i), projectID, "scan-many", fmt.Sprintf("建议 %d", i), fmt.Sprintf("fp-%d", i), now, now); err != nil {
+			t.Fatalf("insert finding %d: %v", i, err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// 其中一条改为已忽略：scope=open 不该碰它。
+	dismissID := "f-3"
+	if _, err := server.db.Exec(`update project_insights set status='dismissed' where id=?`, dismissID); err != nil {
+		t.Fatalf("dismiss: %v", err)
+	}
+	res := insightDecode[insightDeleteResult](t, postInsightDelete(t, server, projectID, `{"scope":"open"}`), http.StatusOK)
+	if res.Deleted != total-1 {
+		t.Errorf("scope=open must delete beyond the list limit: got %d want %d", res.Deleted, total-1)
+	}
+	if n := insightRowCount(t, server, projectID, ""); n != 1 {
+		t.Errorf("only the dismissed row should survive: got %d want 1", n)
+	}
+	if n := insightRowCount(t, server, projectID, `id=?`, dismissID); n != 1 {
+		t.Errorf("dismissed row must survive scope=open: got %d want 1", n)
 	}
 }
 

@@ -360,12 +360,15 @@ func (r *wslAgentRunner) codexReady(ctx context.Context) bool {
 }
 
 func (r *wslAgentRunner) claudeVersion(ctx context.Context) string {
-	// 输出形如 "2.1.218 (Claude Code)"，剥离后缀与原版 Version 一致。
-	return strings.TrimSuffix(r.probe(ctx, wslProbeKeyClaudeVersion, wslProbeCommandClaudeVer).value, " (Claude Code)")
+	// 输出形如 "2.1.218 (Claude Code)"：归一化交给唯一那处实现（agentVersionFromOutput）。
+	return agentVersionFromOutput(r.probe(ctx, wslProbeKeyClaudeVersion, wslProbeCommandClaudeVer).value)
 }
 
 func (r *wslAgentRunner) codexVersion(ctx context.Context) string {
-	return r.probe(ctx, wslProbeKeyCodexCLI, wslProbeCommandCodexVer).value
+	// 输出形如 "codex-cli 0.155.1"（产品名在**前**）。原先这里原样返回、由调用处
+	// 再归一化一次；现在两个 runner 的 Version() 口径一致 —— 否则同一个 Codex
+	// 在 Windows 上显示 0.155.1、在 WSL 上显示 "codex-cli 0.155.1"。
+	return agentVersionFromOutput(r.probe(ctx, wslProbeKeyCodexCLI, wslProbeCommandCodexVer).value)
 }
 
 // Ready implements AgentRunner（Claude 就绪，用于 claude 分发与 createProject 校验）。
@@ -384,7 +387,7 @@ func (r *wslAgentRunner) CodexVersion(parent context.Context) string { return r.
 // 内探测到的本机版本，再查 npm registry 最新版并比较。npm registry 版本号跨平台唯一，
 // 故查询在本机执行即可（见 latestNpmPackageVersion），不用跨界再拉起一次 wsl.exe。
 func (r *wslAgentRunner) CheckUpdate(parent context.Context) (bool, string, error) {
-	local := normalizeClaudeVersion(r.claudeVersion(parent))
+	local := r.claudeVersion(parent)
 	if local == "" {
 		return false, "", errors.New("WSL 内未安装 Claude Code")
 	}
@@ -392,12 +395,18 @@ func (r *wslAgentRunner) CheckUpdate(parent context.Context) (bool, string, erro
 	if err != nil {
 		return false, "", err
 	}
-	return latest != local, latest, nil
+	// 与 Codex 侧（以及本机）同一条判据：semver 比较，**不是**字符串不等 ——
+	// 本地装了比 registry 更新的预发布版时，字符串不等会把降级报成"有更新"。
+	available, err := updateAvailableFrom(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
 }
 
 // CodexCheckUpdate implements CodexCapableRunner，与 codexCLIRunner 的语义一致。
 func (r *wslAgentRunner) CodexCheckUpdate(parent context.Context) (bool, string, error) {
-	local := normalizeCodexVersion(r.codexVersion(parent))
+	local := r.codexVersion(parent)
 	if local == "" {
 		return false, "", errors.New("WSL 内未安装 Codex CLI")
 	}
@@ -405,29 +414,26 @@ func (r *wslAgentRunner) CodexCheckUpdate(parent context.Context) (bool, string,
 	if err != nil {
 		return false, "", err
 	}
-	available, err := codexUpdateAvailable(local, latest)
+	available, err := updateAvailableFrom(local, latest)
 	if err != nil {
 		return false, latest, err
 	}
 	return available, latest, nil
 }
 
-// AutoUpdateSupported implements autoUpdateSupportedRunner。跨端（Windows→WSL）升级
-// 尚未就绪（见 Update），如实告知调用方不支持应用内自动升级。
-func (r *wslAgentRunner) AutoUpdateSupported() bool { return false }
+// AutoUpdateSupported implements autoUpdateSupportedRunner。
+//
+// 跨端（Windows→WSL）的升级**现在支持**：平台装的那份走 npm 重装，用户自己装的走
+// WSL 内的 `<cli> update`（两条路都在 wsl_agent_update.go 里）。
+//
+// 原先是 false —— 那是"跨端升级尚未就绪"的旧状态，在安装通道做通之后就不成立了。
+// 留着它会让同一件事在界面两处给出相反结论：管理页给升级按钮、对话页说"需手动更新"。
+func (r *wslAgentRunner) AutoUpdateSupported() bool { return true }
 
 // CodexAutoUpdateSupported implements codexAutoUpdateSupportedRunner。
-func (r *wslAgentRunner) CodexAutoUpdateSupported() bool { return false }
+func (r *wslAgentRunner) CodexAutoUpdateSupported() bool { return true }
 
-// Update implements AgentRunner。跨端升级如实提示降级，不伪造成功。
-func (r *wslAgentRunner) Update(parent context.Context) (string, string, error) {
-	return "", "", errors.New("跨端（Windows→WSL）升级 Claude Code 尚未就绪，请在 WSL 内自行更新")
-}
-
-// CodexUpdate implements CodexCapableRunner。
-func (r *wslAgentRunner) CodexUpdate(parent context.Context) (string, string, error) {
-	return "", "", errors.New("跨端（Windows→WSL）升级 Codex 尚未就绪，请在 WSL 内自行更新")
-}
+// Update / CodexUpdate 见 wsl_agent_update.go（与 SSH 侧共用一套升级编排）。
 
 // Run implements AgentRunner。经 wsl.exe 在 WSL 内执行 Claude/Codex 一次性会话。
 // 详见 wslAgentRun。

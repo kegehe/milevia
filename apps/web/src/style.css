@@ -146,6 +146,9 @@ input[type="range"]:disabled { cursor: not-allowed; opacity: .52; }
 .runner-inline.ready i { background: #43a88f; }
 .runner-inline.running i { background: #2c7567; box-shadow: 0 0 0 3px #cbeadd; }
 .runner-inline.unavailable i, .runner-inline.needs_auth i { background: #a06f16; }
+/* 见 conversation.css 的说明：unsupported（该环境不提供）与 unavailable（没装）
+   必须分档，前者中性灰、后者琥珀色。 */
+.runner-inline.unsupported i { background: #a9a7a0; }
 .runner-inline.updating i { background: #e8a010; animation: pulse 1s ease-in-out infinite; }
 .composer-status-group { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
 .composer-usage { display: inline-flex; align-items: center; gap: 6px; color: #637680; font-size: 11px; white-space: nowrap; }
@@ -340,6 +343,23 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px sol
 .task-card .project-card-meta { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 0; border-top-color: #dce9e1; padding-top: 12px; }.task-card .project-card-meta > span { display: grid; min-width: 0; gap: 3px; }.task-card .project-card-meta > span + span { border-left: 1px solid #dce9e1; padding-left: 13px; }.task-card .project-card-meta small { color: #7a9086; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }.task-card .project-card-meta b { overflow: hidden; color: #284d43; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .task-card footer { margin-top: 12px; border-top: 1px solid #e3eee7; padding-top: 11px; color: #5e786d; font-size: 12px; }.task-card footer b { display: inline-flex; align-items: center; gap: 6px; color: #245d52; }.task-card footer i { display: inline-grid; width: 18px; height: 18px; place-items: center; border-radius: 50%; line-height: 1; font-size: 12px; font-style: normal; color: #f7fcf8; background: #2c7567; }
 
+/* 卡片「按住浮起 → 拖动排序」的浮起层——桌面端与手机端共用这一份原语。
+   判定与阈值在 lib/card-drag.ts，指针与动画在 lib/use-card-drag.ts；
+   「原位占位槽」由各页面自己定义（手机端见 mobile-remote.css 的 .mobile-project-choice.is-drag-slot）。 */
+/* 两层分工不能混：
+   外层只做 translate（**不能有 transition**，否则会拖在指针后面），
+   内层做 scale/rotate 与阴影（**必须有 transition**，抬起这一下才是弹出来的）。 */
+.card-drag-ghost { position: fixed; z-index: 60; top: 0; left: 0; pointer-events: none; will-change: transform; }
+.card-drag-ghost-inner { position: relative; width: 100%; height: 100%; transform: scale(1); transform-origin: 50% 42%; transition: transform .2s cubic-bezier(.2,.9,.25,1); }
+.card-drag-ghost.is-lifted .card-drag-ghost-inner { transform: scale(1.035) rotate(1.1deg); }
+/* 浮起期间整页锁住选中：否则拖动会一路刷出一片蓝色选区。 */
+body.card-drag-active { user-select: none; -webkit-user-select: none; cursor: grabbing; }
+
+@media (prefers-reduced-motion: reduce) {
+  .card-drag-ghost-inner { transition: none; }
+}
+
+/* 桌面端项目卡片继续用原生 HTML5 拖放（这里只是它的样式，逻辑在 DashboardPage 里）。 */
 /* 拖拽重排：悬停指针手、按下握拳、拖动半透明、放置目标高亮 */
 .task-card { cursor: pointer; }
 .task-card:active { cursor: grabbing; }

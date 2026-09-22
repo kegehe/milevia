@@ -116,7 +116,7 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 	if agentID == "" {
 		agentID = "claude-code"
 	}
-	if agentID != "claude-code" && agentID != "codex" {
+	if !validProfileAgent(agentID) {
 		return mcpInjection{}
 	}
 	target := s.resolveAgentTargetEnv(runnerID, projectPath)

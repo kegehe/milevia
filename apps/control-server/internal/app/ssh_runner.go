@@ -767,7 +767,7 @@ func (r *sshRunner) mcpCapability(ctx context.Context) (injectable bool, strictO
 	if err != nil {
 		return false, false, ""
 	}
-	version = normalizeClaudeVersion(strings.TrimSpace(string(out)))
+	version = agentVersionFromOutput(string(out))
 	r.mcpVersion = version
 	r.mcpInjectable = versionAtLeast(version, 2, 1, 0)
 	r.mcpStrictOK = r.mcpInjectable
@@ -873,7 +873,7 @@ func (r *sshRunner) Version(ctx context.Context) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSuffix(strings.TrimSpace(string(out)), " (Claude Code)")
+	return agentVersionFromOutput(string(out))
 }
 
 func (r *sshRunner) CheckUpdate(ctx context.Context) (bool, string, error) {
@@ -886,26 +886,31 @@ func (r *sshRunner) CheckUpdate(ctx context.Context) (bool, string, error) {
 		return false, "", err
 	}
 	latest := strings.TrimSpace(string(out))
-	return latest != local, latest, nil
+	if latest == "" {
+		return false, "", errors.New("latest Claude Code version is empty")
+	}
+	// 与 Codex 侧（以及本机）同一条判据：semver 比较，**不是**字符串不等。
+	// 字符串不等会把"本地是比 registry 更新的预发布版"报成"有更新可用"，
+	// 用户点下去就把自己降级了。
+	available, err := updateAvailableFrom(local, latest)
+	if err != nil {
+		return false, latest, err
+	}
+	return available, latest, nil
 }
 
+// Update implements AgentRunner。
+//
+// 编排（确认来源 → 执行 → 健康检查 → 必要时回滚）与 WSL 侧共用一套实现，
+// 差别只在"怎么在那边跑命令"（见 cross_npm_update.go）。
 func (r *sshRunner) Update(ctx context.Context) (string, string, error) {
-	previous := r.Version(ctx)
-	if previous == "" {
-		return "", "", errors.New("远程服务器上未安装 Claude Code")
-	}
-	recovery, recoveryErr := r.prepareRemoteNpmCLIRecovery(ctx, claudeNpmCLIInstall)
-	out, err := r.client.execCommand(ctx, "claude update")
-	if err != nil {
-		return r.finishRemoteNpmUpdate(previous, "Claude Code", r.Version, fmt.Errorf("远程执行 claude update 失败：%w%s", err, updateOutputDetail(string(out))), recovery, recoveryErr)
-	}
-	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	current := r.Version(healthCtx)
-	if current == "" {
-		return r.finishRemoteNpmUpdate(previous, "Claude Code", r.Version, errors.New("远程 Claude Code 更新后未通过健康检查"), recovery, recoveryErr)
-	}
-	return previous, current, nil
+	return runCrossCLIUpdate(ctx, "远程服务器上", "claude", "Claude Code", claudeNpmCLIInstall, r.execRemote, r.Version)
+}
+
+// execRemote 在远端跑一条脚本（crossCommandRunner 的 SSH 实现）。
+func (r *sshRunner) execRemote(ctx context.Context, script string) (string, error) {
+	out, err := r.client.execCommand(ctx, script)
+	return string(out), err
 }
 
 // codexLoginStatusCommand mirrors the local codex runner's readiness check on
@@ -923,7 +928,7 @@ func (r *sshRunner) CodexVersion(ctx context.Context) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimPrefix(strings.TrimSpace(string(out)), "codex-cli ")
+	return agentVersionFromOutput(string(out))
 }
 
 // codexDefaultModel 返回远端 cli_managed（无档案模型）Codex 将使用的默认模型。
@@ -963,7 +968,7 @@ func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) 
 	if latest == "" {
 		return false, "", errors.New("latest Codex version is empty")
 	}
-	available, err := codexUpdateAvailable(local, latest)
+	available, err := updateAvailableFrom(local, latest)
 	if err != nil {
 		return false, latest, err
 	}
@@ -971,77 +976,17 @@ func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) 
 }
 
 func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
-	previous := r.CodexVersion(ctx)
-	if previous == "" {
-		return "", "", errors.New("远程服务器上未安装 Codex CLI")
-	}
-	recovery, recoveryErr := r.prepareRemoteNpmCLIRecovery(ctx, codexNpmCLIInstall)
-	out, err := r.client.execCommand(ctx, "codex update")
-	if err != nil {
-		return r.finishRemoteNpmUpdate(previous, "Codex", r.CodexVersion, fmt.Errorf("远程执行 codex update 失败：%w%s", err, updateOutputDetail(string(out))), recovery, recoveryErr)
-	}
-	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	current := r.CodexVersion(healthCtx)
-	if current == "" {
-		return r.finishRemoteNpmUpdate(previous, "Codex", r.CodexVersion, errors.New("远程 Codex 更新后未通过健康检查"), recovery, recoveryErr)
-	}
-	return previous, current, nil
+	return runCrossCLIUpdate(ctx, "远程服务器上", "codex", "Codex CLI", codexNpmCLIInstall, r.execRemote, r.CodexVersion)
 }
 
+// remoteNpmCLIRecovery 是一条"升级失败时可以回滚到哪"的信息。
+// SSH 与 WSL 共用（编排见 cross_npm_update.go）。
 type remoteNpmCLIRecovery struct {
 	prefix  string
 	install npmCLIInstall
 }
 
-// prepareRemoteNpmCLIRecovery accepts only the npm package that provides the
-// exact command being updated. This keeps a failed native or custom install
-// from changing an unrelated global npm package.
-func (r *sshRunner) prepareRemoteNpmCLIRecovery(ctx context.Context, install npmCLIInstall) (remoteNpmCLIRecovery, error) {
-	expected := pathpkg.Join("$prefix", "lib", "node_modules", install.scope, install.packageName, "bin", install.binFile)
-	command := fmt.Sprintf(`set -eu
-prefix=$(npm prefix -g)
-command_path=$(command -v %s)
-resolved=$(readlink -f -- "$command_path")
-expected=$(readlink -f -- "%s")
-[ "$resolved" = "$expected" ]
-printf '%%s\n' "$prefix"`, install.commandName, expected)
-	out, err := r.client.execCommand(ctx, command)
-	if err != nil {
-		return remoteNpmCLIRecovery{}, fmt.Errorf("确认远程 npm 全局安装来源失败：%w", err)
-	}
-	prefix := strings.TrimSpace(string(out))
-	if prefix == "" {
-		return remoteNpmCLIRecovery{}, errors.New("远程 npm global prefix 为空")
-	}
-	return remoteNpmCLIRecovery{prefix: prefix, install: install}, nil
-}
-
-func (r *sshRunner) finishRemoteNpmUpdate(previous, displayName string, version func(context.Context) string, updateErr error, recovery remoteNpmCLIRecovery, recoveryErr error) (string, string, error) {
-	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	if version(healthCtx) != "" {
-		cancel()
-		return previous, "", updateErr
-	}
-	cancel()
-	if recoveryErr != nil {
-		return previous, "", fmt.Errorf("%w；自动回滚不可用：%v", updateErr, recoveryErr)
-	}
-	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	_, err := r.client.execCommand(recoveryCtx, remoteNpmRollbackCommand(recovery.prefix, previous, recovery.install))
-	recoveryCancel()
-	if err != nil {
-		return previous, "", fmt.Errorf("%w；自动回滚失败：%v", updateErr, err)
-	}
-	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	current := version(verifyCtx)
-	verifyCancel()
-	if current != previous {
-		return previous, "", fmt.Errorf("%w；自动回滚失败：rollback health check failed (version %q)", updateErr, current)
-	}
-	return previous, previous, fmt.Errorf("%w；已自动回滚到 %s %s", updateErr, displayName, previous)
-}
-
+// remoteNpmRollbackCommand 生成"回滚到某个版本"的脚本（SSH 与 WSL 共用）。
 func remoteNpmRollbackCommand(prefix, previous string, install npmCLIInstall) string {
 	packageRoot := pathpkg.Join(prefix, "lib", "node_modules", install.scope)
 	active := pathpkg.Join(packageRoot, install.packageName)

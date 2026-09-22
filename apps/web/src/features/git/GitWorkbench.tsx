@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
 import { toast } from "sonner";
 
@@ -43,13 +43,60 @@ function gitPullTarget(snapshot: GitSnapshot | null): { remote: string; branch: 
   return { remote: "origin", branch: snapshot?.head.branch || "" };
 }
 
-export function GitWorkbench({ projectID, conversationId, request, fail, active }: { projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; active: boolean }) {
+/** 手机端的返回键要问"里面还有没有上一层"，而那一层只有这里知道。 */
+export interface GitWorkbenchHandle {
+  /**
+   * 退出详情层（diff / 冲突解决）回到列表。返回 false 表示已经在最外层，
+   * 宿主该退出整个 Git 视图了。
+   */
+  showTopLevel: () => boolean;
+  /**
+   * 重新读一遍仓库状态。
+   *
+   * 手机端顶栏 ⋯ 菜单里的「刷新仓库状态」走它，而不是让宿主去重取云端快照 ——
+   * 那两件事语义完全不同（一个是"再读一眼仓库"，另一个是"重新同步整个页面"）。
+   */
+  reload: () => void;
+}
+
+interface GitWorkbenchProps {
+  projectID: string;
+  conversationId?: string;
+  request: Request;
+  fail: (message: string) => void;
+  active: boolean;
+  /**
+   * 手机端形态：变更列表与 diff **两级推进**（桌面端是两栏并排），
+   * 操作记录的原生 `<select>` 换成胶囊，diff 软换行。
+   *
+   * 与 `FilesPanel` 的 `mobile` 同构 —— 那一支的实际体量只有"一个 prop + 一批 CSS"，
+   * 见 docs/41 §6.2。
+   */
+  mobile?: boolean;
+  /**
+   * 项目当前是不是 git 仓库（桌面端由 project.gitBranch 判定）。
+   *
+   * 非 git 项目也能进入 Git 工作台：为 false 时渲染「初始化 Git 仓库」空态，
+   * 不再尝试读取仓库状态（后端 git 接口对非 git 目录会失败）。
+   */
+  initialIsGitRepo?: boolean;
+  /** git init 成功后由宿主刷新项目（更新 gitBranch），默认空操作。 */
+  onGitInitialized?: () => void | Promise<void>;
+}
+
+export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(function GitWorkbench({ projectID, conversationId, request, fail, active, mobile = false, initialIsGitRepo = true, onGitInitialized }, ref) {
   const [tab, setTab] = useState<Tab>("changes");
   const [snapshot, setSnapshot] = useState<GitSnapshot | null>(null);
+  // 非 git 项目一开始就是 false；git init 成功后置 true 并正常加载仓库。
+  const [isGitRepo, setIsGitRepo] = useState(initialIsGitRepo);
+  const [initializingRepo, setInitializingRepo] = useState(false);
   const [changes, setChanges] = useState<GitChange[]>([]);
   const [branches, setBranches] = useState<GitBranch[]>([]);
   const [operations, setOperations] = useState<GitOperation[]>([]);
   const [conflictOverview, setConflictOverview] = useState<GitConflictOverview | null>(null);
+  // 冲突总览的**第三档：读不到**。没有它，"这次没读到"会被渲染成"没有冲突" ——
+  // 那正是本项目明令禁止的"把读不到写成没有"（详见 reload 里的说明）。
+  const [conflictsState, setConflictsState] = useState<"loading" | "ready" | "unavailable">("loading");
   const [selectedDiff, setSelectedDiff] = useState<GitDiff | null>(null);
   const [conflictPath, setConflictPath] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -59,9 +106,12 @@ export function GitWorkbench({ projectID, conversationId, request, fail, active 
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const diffRequest = useRef(0);
   const reloadRequest = useRef(0);
+  // 刷新出口。`reload` 在下面才定义（它依赖若干个 state 回调），而 ref 句柄要能调它，
+  // 所以中间隔一层 ref —— 直接引用会撞上"用到未初始化的 const"。
+  const reloadRef = useRef<(manual?: boolean) => Promise<void>>(async () => undefined);
   const conflictPathRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
-	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
+  const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
@@ -83,28 +133,51 @@ export function GitWorkbench({ projectID, conversationId, request, fail, active 
     requestAnimationFrame(() => document.getElementById(`git-tab-${next}`)?.focus());
   };
 
+  // 手机端「列表 ⇄ 详情」那一层是**派生**的，不是独立状态：详情有没有开着完全由
+  // selectedDiff / conflictPath 决定。独立记一个布尔必然有一天与它们不同步，
+  // 而症状是"返回键吃掉一次、界面上什么都不发生"（第 40 篇踩过同一个形状）。
+  const mobileDetailOpen = selectedDiff !== null || conflictPath !== null;
+  useImperativeHandle(ref, () => ({
+    showTopLevel: () => {
+      if (conflictPathRef.current) { closeConflict(); return true; }
+      if (selectedDiff) { closeDiff(); return true; }
+      return false;
+    },
+    reload: () => { void reloadRef.current(true); },
+  }), [selectedDiff]);
+
   const reload = useCallback(async (manual = false) => {
     const requestID = ++reloadRequest.current;
     if (manual) { if (!mountedRef.current) return; setRefreshing(true); }
     else { if (!mountedRef.current) return; setLoading(true); }
     try {
       const base = `/api/projects/${projectID}/git`;
-      // conflicts 只读总览：偶尔失败不应拖垮整个工作台，单独降级为空。
-      const [nextSnapshot, nextChanges, nextBranches, nextOperations, nextConflicts] = await Promise.all([
+      // conflicts 只读总览：它单独失败不该拖垮整个工作台。
+      //
+      // ⚠️ 但它**不能**降级成"空"（第一版是 `.catch(() => null)`）。那个写法把"这次没读到"
+      // 渲染成了"没有冲突"，而仓库真的处在冲突中时，用户看到的会是一个完全正常的仓库，
+      // 一个字都不说 —— 正撞在本项目"把读不到写成没有"的红线上。
+      // 更糟的是触发是**竞态的**（并发被拒时哪一条被拒不确定），所以症状是
+      // "这次看得见、下次看不见"。这里改成三档：读到 / 读取中 / **读不到**。
+      const conflictsPromise = request<GitConflictOverview>(withWorkspace(`${base}/conflicts`))
+        .then((value) => ({ ok: true as const, value }))
+        .catch(() => ({ ok: false as const, value: null }));
+      const [nextSnapshot, nextChanges, nextBranches, nextOperations, conflictsResult] = await Promise.all([
         request<GitSnapshot>(withWorkspace(`${base}/summary`)),
         request<GitChange[]>(withWorkspace(`${base}/changes`)),
         request<GitBranch[]>(withWorkspace(`${base}/branches`)),
         request<GitOperation[]>(withWorkspace(`${base}/operations`)),
-        request<GitConflictOverview>(withWorkspace(`${base}/conflicts`)).catch(() => null),
+        conflictsPromise,
       ]);
       if (!mountedRef.current || requestID !== reloadRequest.current) return;
       setSnapshot(nextSnapshot);
       setChanges(nextChanges);
       setBranches(nextBranches);
       setOperations(nextOperations);
-      setConflictOverview(nextConflicts);
+      setConflictOverview(conflictsResult.value);
+      setConflictsState(conflictsResult.ok ? "ready" : "unavailable");
       // 正在解决的路径已不在冲突清单中（已解决/中止）时，退出该文件的解决视图。
-      if (conflictPathRef.current && nextConflicts && !nextConflicts.files.some((file) => file.path === conflictPathRef.current)) closeConflict();
+      if (conflictPathRef.current && conflictsResult.value && !conflictsResult.value.files.some((file) => file.path === conflictPathRef.current)) closeConflict();
     } catch (cause) {
       if (mountedRef.current && requestID === reloadRequest.current) fail(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
     } finally {
@@ -115,7 +188,8 @@ export function GitWorkbench({ projectID, conversationId, request, fail, active 
     }
   }, [projectID, request, fail, conversationId]);
 
-  useEffect(() => { if (active) void reload().catch(() => undefined); }, [active, reload]);
+  useEffect(() => { reloadRef.current = reload; }, [reload]);
+  useEffect(() => { if (active && isGitRepo) void reload().catch(() => undefined); }, [active, isGitRepo, reload]);
 
   const grouped = useMemo(() => groupChanges(changes), [changes]);
   const changeCount = changes.length;
@@ -170,6 +244,24 @@ export function GitWorkbench({ projectID, conversationId, request, fail, active 
   const switchBranch = (branch: string) => mutate("switch-branch", "switch", { branch }, () => setConfirmation(null));
   const pullTarget = gitPullTarget(snapshot);
 
+  // 非 git 项目在空态里发起 git init：成功后置 isGitRepo、通知宿主刷新项目、再加载仓库状态。
+  const initializeRepo = async () => {
+    if (!mountedRef.current || initializingRepo) return;
+    setInitializingRepo(true);
+    try {
+      const result = await request<{ gitBranch: string; gitReady: boolean }>(`/api/projects/${projectID}/git/init`, { method: "POST" });
+      if (result.gitReady) {
+        setIsGitRepo(true);
+        void onGitInitialized?.();
+        void reload(true);
+      }
+    } catch (cause) {
+      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法初始化 Git 仓库");
+    } finally {
+      if (mountedRef.current) setInitializingRepo(false);
+    }
+  };
+
   const resolveConflict = (path: string, action: ResolveAction, content?: string) => {
     const payload: Record<string, unknown> = { path, action };
     if (content !== undefined) payload.content = content;
@@ -202,22 +294,33 @@ export function GitWorkbench({ projectID, conversationId, request, fail, active 
     }
   };
 
-  return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active}>
-    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestRefresh={() => void reload(true)} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} />
+  if (!isGitRepo) {
+    return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active} data-mobile={mobile ? "true" : undefined}>
+      <div className="git-init-empty">
+        <span className="git-init-empty-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.5V15M8.7 9.3v5.4M15.3 9.3v5.4M12 8a.9.9 0 1 0 .01 0" /></svg></span>
+        <h3>未初始化 Git 仓库</h3>
+        <p>当前项目目录还不是 Git 仓库。初始化后将在此查看文件变更、分支与提交历史。</p>
+        <button className="primary" type="button" disabled={initializingRepo} onClick={() => void initializeRepo()}>{initializingRepo ? "正在初始化..." : "初始化 Git 仓库"}</button>
+        <p className="git-init-empty-note">初始化后建议先提交一个初始 commit，方能使用隔离工作区 / 自动编排。</p>
+      </div>
+    </section>;
+  }
+  return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active} data-mobile={mobile ? "true" : undefined} data-detail={mobileDetailOpen ? "open" : undefined}>
+    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} requestRefresh={() => void reload(true)} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} />
     <nav className="git-tabs" aria-label="Git工作台视图">
       <div className="git-tab-list" role="tablist" aria-label="Git工作台视图">{tabs.map((item) => <button type="button" key={item.id} id={`git-tab-${item.id}`} role="tab" aria-controls={`git-view-${item.id}`} className={tab === item.id ? "active" : ""} aria-selected={tab === item.id} tabIndex={tab === item.id ? 0 : -1} onClick={() => selectTab(item.id)} onKeyDown={(event) => handleTabKeyDown(event, item.id)}>{item.label}{item.id === "changes" && changeCount > 0 ? <b>{changeCount}</b> : null}</button>)}</div>
     </nav>
     <main className={`git-workbench-body${tab === "changes" ? " changes-active" : ""}`}>
       {loading ? <div className="git-empty">正在读取仓库状态</div> : !snapshot ? <div className="git-empty">无法读取仓库状态</div> : <>
-        {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
+        {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
         {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch) => setConfirmation({ type: "switch-branch", branch })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
       </>}
     </main>
     {confirmation && <GitConfirmation confirmation={confirmation} snapshot={snapshot} conflictOverview={conflictOverview} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} commitAmend={commitAmend} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pullRemote={pullRemote} pushBranch={pushBranch} switchBranch={switchBranch} abortConflict={abortConflict} finishConflict={finishConflict} />}
   </section>;
-}
+});
 
-export function GitBar({ snapshot, loading, mutating, refreshing, operations, projectID, conversationId, request, fail, requestRefresh, requestFetch, requestPull, requestPush }: { snapshot: GitSnapshot | null; loading: boolean; mutating: string; refreshing: boolean; operations: GitOperation[]; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; requestRefresh: () => void; requestFetch: () => void; requestPull: () => void; requestPush: () => void }) {
+export function GitBar({ snapshot, loading, mutating, refreshing, operations, projectID, conversationId, request, fail, mobile = false, requestRefresh, requestFetch, requestPull, requestPush }: { snapshot: GitSnapshot | null; loading: boolean; mutating: string; refreshing: boolean; operations: GitOperation[]; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; mobile?: boolean; requestRefresh: () => void; requestFetch: () => void; requestPull: () => void; requestPush: () => void }) {
   const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   const [opsOpen, setOpsOpen] = useState(false);
   const [opsItems, setOpsItems] = useState<GitOperation[]>([]);
@@ -279,7 +382,7 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, [opsOpen]);
-  return <div className="git-bar" ref={barRef}>
+  return <div className="git-bar" ref={barRef} data-mobile={mobile ? "true" : undefined}>
     <div className="git-bar-ref">
       {loading && !snapshot ? <><span className="git-bar-label">当前引用</span><span className="git-bar-loading">正在读取仓库状态…</span></> : <>
         <span className="git-bar-label">当前引用</span>
@@ -297,7 +400,7 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
       <button type="button" className={`git-refresh${refreshing ? " spinning" : ""}`} title={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} aria-label={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} disabled={refreshing || Boolean(mutating)} onClick={requestRefresh}><RefreshIcon /></button>
       <button type="button" className={`git-ops-trigger${opsOpen ? " active" : ""}${needsAttention ? " attention" : ""}`} title="操作记录" aria-label="操作记录" aria-expanded={opsOpen} aria-controls="git-ops-popover" disabled={operations.length === 0} onClick={() => setOpsOpen(!opsOpen)}><HistoryIcon />{needsAttention ? <i className="git-ops-dot" aria-hidden="true" /> : null}</button>
     </div>
-    {opsOpen && <div id="git-ops-popover" className="git-ops-popover" role="dialog" aria-label="操作记录"><header><div><span>审计记录</span><h3>操作记录</h3></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" onClick={() => setOpsOpen(false)}><CloseIcon /></button></header><div className="git-ops-popover-body"><div className="git-ops-filters"><select value={opsType} aria-label="按操作类型筛选" onChange={(event) => setOpsType(event.target.value)}><option value="">全部类型</option>{OPERATION_TYPE_VALUES.map((value) => <option key={value} value={value}>{operationTypeLabel(value)}</option>)}</select><select value={opsStatus} aria-label="按操作状态筛选" onChange={(event) => setOpsStatus(event.target.value)}><option value="">全部状态</option>{OPERATION_STATUS_VALUES.map((value) => <option key={value} value={value}>{operationStatusLabel(value)}</option>)}</select><div className="git-ops-search"><input type="text" value={opsQuery} placeholder="搜索操作…" aria-label="搜索操作记录" onChange={(event) => setOpsQuery(event.target.value)} />{opsQuery ? <button type="button" className="git-history-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setOpsQuery("")}>×</button> : null}</div></div><Operations operations={opsItems} loading={opsLoading} />{opsHasMore && !opsLoading ? <button type="button" className="git-ops-load-more" onClick={loadMoreOps}>加载更多操作</button> : null}</div></div>}
+    {opsOpen && <div id="git-ops-popover" className="git-ops-popover" role="dialog" aria-label="操作记录"><header><div><span>审计记录</span><h3>操作记录</h3></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" onClick={() => setOpsOpen(false)}><CloseIcon /></button></header><div className="git-ops-popover-body"><div className="git-ops-filters">{mobile ? <><FilterChips label="按操作类型筛选" value={opsType} options={[{ value: "", label: "全部类型" }, ...OPERATION_TYPE_VALUES.map((value) => ({ value, label: operationTypeLabel(value) }))]} onChange={setOpsType} /><FilterChips label="按操作状态筛选" value={opsStatus} options={[{ value: "", label: "全部状态" }, ...OPERATION_STATUS_VALUES.map((value) => ({ value, label: operationStatusLabel(value) }))]} onChange={setOpsStatus} /></> : <><select value={opsType} aria-label="按操作类型筛选" onChange={(event) => setOpsType(event.target.value)}><option value="">全部类型</option>{OPERATION_TYPE_VALUES.map((value) => <option key={value} value={value}>{operationTypeLabel(value)}</option>)}</select><select value={opsStatus} aria-label="按操作状态筛选" onChange={(event) => setOpsStatus(event.target.value)}><option value="">全部状态</option>{OPERATION_STATUS_VALUES.map((value) => <option key={value} value={value}>{operationStatusLabel(value)}</option>)}</select></>}<div className="git-ops-search"><input type="text" value={opsQuery} placeholder="搜索操作…" aria-label="搜索操作记录" onChange={(event) => setOpsQuery(event.target.value)} />{opsQuery ? <button type="button" className="git-history-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setOpsQuery("")}>×</button> : null}</div></div><Operations operations={opsItems} loading={opsLoading} />{opsHasMore && !opsLoading ? <button type="button" className="git-ops-load-more" onClick={loadMoreOps}>加载更多操作</button> : null}</div></div>}
   </div>;
 }
 
@@ -313,12 +416,27 @@ function CloseIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" fi
 
 function HistoryIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M3.2 8a4.8 4.8 0 1 1 1.4 3.4" /><path d="M3 4.2v3.4h3.4" /><path d="M8 5v3l2 1.4" /></svg>; }
 
-function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview, conflictPath, openConflict, closeConflict, resolveConflict, requestAbortConflict, requestFinishConflict, projectID, conversationId, request, fail, mutatePath, stageAll, unstageAll, requestDiscardWorktree, requestDiscardAll, requestCommit, requestAmend, commitMessage, setCommitMessage, mutating, changeCount }: {
+/**
+ * 筛选用的胶囊行（**只在手机端**替代原生 `<select>`）。
+ *
+ * 原生 `<select>` 在手机端本项目明令不用：它的弹层由系统绘制、样式一行都管不到，
+ * 而这页的其余分类栏（任务队列等）一直是胶囊行。桌面端保持 `<select>` 不变 ——
+ * 那里它更好用（可键盘操作、选项多时不需要横向滚动）。
+ */
+function FilterChips({ label, value, options, onChange }: { label: string; value: string; options: Array<{ value: string; label: string }>; onChange: (value: string) => void }) {
+  return <div className="git-ops-chips" role="group" aria-label={label}>
+    {options.map((item) => <button type="button" key={item.value || "all"} className={value === item.value ? "active" : ""} aria-pressed={value === item.value} onClick={() => onChange(item.value)}>{item.label}</button>)}
+  </div>;
+}
+
+function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview, conflictsState, conflictPath, openConflict, closeConflict, resolveConflict, requestAbortConflict, requestFinishConflict, projectID, conversationId, request, fail, mobile, mutatePath, stageAll, unstageAll, requestDiscardWorktree, requestDiscardAll, requestCommit, requestAmend, commitMessage, setCommitMessage, mutating, changeCount }: {
   grouped: { staged: GitChange[]; worktree: GitChange[] };
   selectedDiff: GitDiff | null;
   openDiff: (change: GitChange, stage: "worktree" | "index") => Promise<void>;
   closeDiff: () => void;
   conflictOverview: GitConflictOverview | null;
+  /** 冲突总览的三档。`unavailable` 必须**显式**渲染，不许落回"没有冲突"。 */
+  conflictsState: "loading" | "ready" | "unavailable";
   conflictPath: string | null;
   openConflict: (path: string) => void;
   closeConflict: () => void;
@@ -329,6 +447,7 @@ function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview,
   conversationId?: string;
   request: Request;
   fail: (message: string) => void;
+  mobile?: boolean;
   mutatePath: (action: "stage" | "unstage", path: string) => void;
   stageAll: () => void;
   unstageAll: () => void;
@@ -349,8 +468,11 @@ function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview,
     else { closeConflict(); void openDiff(change, stage); }
   };
   const contextPhrase = context && context.operationType !== "none" && context.theirsLabel ? `${context.theirsLabel} → ${context.oursLabel}` : "";
-  return <div className="git-changes-view">
+  return <div className="git-changes-view" data-mobile={mobile ? "true" : undefined}>
     <div className="git-changes-sidebar">
+      {/* 冲突总览读不到时**必须说出来**。它与"没有冲突"是两件事：仓库真的处在冲突中
+          而这一栏读不到时，界面若不吭声，用户看到的就是一个完全正常的仓库。 */}
+      {conflictsState === "unavailable" && <div className="git-conflict-unavailable" role="status"><b>读不到冲突状态</b><span>这次没能从电脑上读到仓库的冲突信息。下方文件列表里的「冲突」标记仍然可靠；点顶部的刷新可以重试。</span></div>}
       {conflictedCount > 0
         ? <div className="git-conflict-banner" role="alert"><b>⚠ {conflictedCount} 个冲突文件需要解决</b><span>{operationVerb && contextPhrase ? `正在${operationVerb} ${contextPhrase}，点击文件逐块处理` : "在下方工作区列表中点击文件进入解决视图"}</span></div>
         : context?.canFinish
@@ -361,9 +483,12 @@ function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview,
       <section className="git-change-group"><header><h3>工作区</h3><div className="git-group-actions"><span>{grouped.worktree.length}</span><button type="button" className={`git-icon-btn${mutating === "stage-all" ? " spinning" : ""}`} title={mutating === "stage-all" ? "暂存中" : conflictedCount > 0 ? "存在冲突文件，请先逐个解决" : "全部暂存"} aria-label="全部暂存" disabled={mutating !== "" || grouped.worktree.length === 0 || conflictedCount > 0} onClick={stageAll}>{mutating === "stage-all" ? <PendingIcon /> : <PlusIcon />}</button><button type="button" className="git-icon-btn danger" title="撤销全部未提交改动" aria-label="撤销全部未提交改动" disabled={mutating !== "" || changeCount === 0} onClick={requestDiscardAll}><UndoIcon /></button></div></header><ChangeList changes={grouped.worktree} stage="worktree" openDiff={openFile} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="工作区没有变更" /></section>
     </div>
     <section className="git-changes-content" aria-label="文件内容">
+      {/* 手机端是「列表 ⇄ 详情」两级推进（桌面端两栏并排，不需要这颗按钮）。
+          它同时也是"当前有没有上一层"的可见答案。 */}
+      {mobile && (selectedDiff || conflictPath) && <button type="button" className="git-mobile-back" onClick={() => { closeConflict(); closeDiff(); }}>← 变更列表</button>}
       {conflictPath
-        ? <ConflictSolveView key={conflictPath} projectID={projectID} conversationId={conversationId} path={conflictPath} conflictPaths={(conflictOverview?.files.map((file) => file.path) ?? [conflictPath])} request={request} fail={fail} oursLabel={context?.oursLabel || "当前"} theirsLabel={context?.theirsLabel || "传入"} busy={mutating !== ""} onResolve={resolveConflict} onOpenFile={openConflict} onClose={closeConflict} />
-        : selectedDiff ? <DiffViewer diff={selectedDiff} close={closeDiff} /> : <div className="git-diff-placeholder"><div className="git-diff-placeholder-icon" aria-hidden="true"><PendingIcon /></div><h3>选择一个文件查看变更</h3><p>从左侧工作区或已暂存列表中点击文件，差异内容会显示在这里。</p></div>}
+        ? <ConflictSolveView key={conflictPath} projectID={projectID} conversationId={conversationId} path={conflictPath} conflictPaths={(conflictOverview?.files.map((file) => file.path) ?? [conflictPath])} request={request} fail={fail} oursLabel={context?.oursLabel || "当前"} theirsLabel={context?.theirsLabel || "传入"} busy={mutating !== ""} mobile={mobile} onResolve={resolveConflict} onOpenFile={openConflict} onClose={closeConflict} />
+        : selectedDiff ? <DiffViewer diff={selectedDiff} close={closeDiff} /> : <div className="git-diff-placeholder"><div className="git-diff-placeholder-icon" aria-hidden="true"><PendingIcon /></div><h3>选择一个文件查看变更</h3><p>从变更列表里点击文件，差异内容会显示在这里。</p></div>}
     </section>
   </div>;
 }
@@ -522,8 +647,11 @@ function CopyOID({ oid, title }: { oid: string; title?: string }) {
   return <code className={copied ? "git-oid copied" : "git-oid"} title={title ?? `点击复制完整提交 ID：${oid}`} role="button" tabIndex={0} aria-label={`复制提交 ID ${oid}`} onClick={copy} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); void copy(event); } }}>{copied ? <span className="git-oid-copied">已复制</span> : shortOID(oid)}</code>;
 }
 
-export function CommitHistory({ commits, loading, selectedOID, onSelect }: { commits: GitCommit[]; loading: boolean; selectedOID?: string; onSelect: (commit: GitCommit) => void }) {
+export function CommitHistory({ commits, loading, error = "", selectedOID, onSelect }: { commits: GitCommit[]; loading: boolean; error?: string; selectedOID?: string; onSelect: (commit: GitCommit) => void }) {
   if (loading) return <div className="git-empty">正在读取该分支的历史</div>;
+  // 「读不到」绝不能写成「没有」：前者是关于我们这次读取的，后者是关于仓库的事实。
+  // 空态里有下一步动作（点顶部的刷新重试），所以按项目约定走**卡片**，不是一行灰字。
+  if (error !== "" && commits.length === 0) return <div className="git-history-error" role="status"><b>读不到提交历史</b><span>{error}</span><small>点顶部的「刷新仓库状态」可以重试。</small></div>;
   if (commits.length === 0) return <div className="git-empty">该分支没有可显示的提交记录</div>;
   return <div className="git-history">{commits.map((commit) => <article key={commit.oid} className={commit.oid === selectedOID ? "selected" : ""} title="点击查看该提交的变更" tabIndex={0} onClick={() => onSelect(commit)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(commit); } }}><CopyOID oid={commit.oid} /><div><b>{commit.subject || "(无提交说明)"}</b><span>{isMergeCommit(commit) ? <i className="git-commit-merge-badge" title="合并提交">合并</i> : null}{commit.author} · {formatGitTime(commit.authoredAt)}</span></div></article>)}</div>;
 }
@@ -547,20 +675,26 @@ function CommitDetailView({ commit, detail, loading, error, selectedFile, fileDi
         {loading ? <div className="git-empty">正在读取提交详情</div> : !detail ? <div className="git-empty">暂无提交详情</div> : detail.files.length === 0 ? <div className="git-empty">该提交没有文件变更</div> : detail.files.map((file) => <button type="button" key={file.path} className={selectedFile?.path === file.path ? "selected" : ""} title="点击查看该文件的差异" onClick={() => onOpenFile(file)}><span className={`git-commit-file-status ${file.status}`}>{commitFileStatusLabel(file.status)}</span><span className="git-commit-file-path"><b>{file.path}</b>{file.originalPath ? <small>{file.originalPath}</small> : null}</span><span className="git-commit-file-stats">{file.binary ? <i>二进制</i> : <><i className="additions">+{file.additions}</i><i className="deletions">-{file.deletions}</i></>}</span></button>)}
       </div>
       <section className="git-changes-content" aria-label="文件差异">
-        {fileDiff ? <DiffViewer diff={fileDiff} close={onCloseFile} /> : <div className="git-diff-placeholder"><div className="git-diff-placeholder-icon" aria-hidden="true"><PendingIcon /></div><h3>{fileDiffLoading ? "正在读取差异" : "选择一个文件查看变更"}</h3><p>{fileDiffLoading ? "差异内容即将显示。" : "从左侧变更文件列表中点击文件，该提交中的差异内容会显示在这里。"}</p></div>}
+        {fileDiff ? <DiffViewer diff={fileDiff} close={onCloseFile} /> : <div className="git-diff-placeholder"><div className="git-diff-placeholder-icon" aria-hidden="true"><PendingIcon /></div><h3>{fileDiffLoading ? "正在读取差异" : "选择一个文件查看变更"}</h3><p>{fileDiffLoading ? "差异内容即将显示。" : "从变更文件列表里点击文件，该提交中的差异会显示在这里。"}</p></div>}
       </section>
     </div>}
   </div>;
 }
 
 function Branches({ branches, mutating, projectID, conversationId, request, fail, requestSwitchBranch, requestCreateBranch }: { branches: GitBranch[]; mutating: string; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; requestSwitchBranch: (branch: string) => void; requestCreateBranch: (name: string, startPoint: string) => void }) {
-	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
+  const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   const [showForm, setShowForm] = useState(false);
   const [newName, setNewName] = useState("");
   const [startPoint, setStartPoint] = useState("");
   const [selected, setSelected] = useState("");
   const [branchCommits, setBranchCommits] = useState<GitCommit[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  // 「读不到提交历史」必须与「这条分支真的没有提交」分开渲染。
+  // 原来只有 loading / 空 两态，于是 git.log 失败时列表区写的是"该分支没有可显示的
+  // 提交记录" —— 一句关于**数据**的断言，而真相是**没读到**。这是本项目的红线
+  // （`mobile-remote-agent` 那条"没有冲突"的教训同族）。提交详情那侧一直有 error 档，
+  // 历史列表这里漏了，症状不对称。
+  const [historyError, setHistoryError] = useState("");
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
   const [pendingQuery, setPendingQuery] = useState("");
@@ -608,11 +742,14 @@ function Branches({ branches, mutating, projectID, conversationId, request, fail
     if (!projectID || !effectiveSelection) return;
     const requestID = ++historyRequest.current;
     setHistoryLoading(true);
+    setHistoryError("");
     const params = new URLSearchParams({ ref: effectiveSelection, limit: String(HISTORY_PAGE_SIZE) });
     if (pendingQuery) params.set("q", pendingQuery);
     request<GitCommit[]>(withWorkspace(`/api/projects/${projectID}/git/log?${params.toString()}`))
       .then((commits) => { if (requestID === historyRequest.current) { setHistoryHasMore(commits.length === HISTORY_PAGE_SIZE); setBranchCommits(commits); } })
-      .catch((cause) => { if (requestID === historyRequest.current) { setHistoryHasMore(false); setBranchCommits([]); fail(cause instanceof Error ? cause.message : "无法读取该分支的历史"); } })
+      // 落成**就地**的那一档（与提交详情同一种做法），不再往页面级错误条上抛：
+      // 两处说同一件事时，用户关掉错误条之后剩下的那句就成了唯一的说法 —— 而它是假的。
+      .catch((cause) => { if (requestID === historyRequest.current) { setHistoryHasMore(false); setBranchCommits([]); setHistoryError(cause instanceof Error ? cause.message : "无法读取该分支的历史"); } })
       .finally(() => { if (requestID === historyRequest.current) setHistoryLoading(false); });
     return () => { historyRequest.current++; };
     // withWorkspace 仅追加 conversationId，纳入依赖会导致每次渲染重复拉取。
@@ -625,11 +762,13 @@ function Branches({ branches, mutating, projectID, conversationId, request, fail
     const skip = branchCommits.length;
     const requestID = ++historyRequest.current;
     setHistoryLoading(true);
+    setHistoryError("");
     const params = new URLSearchParams({ ref: effectiveSelection, limit: String(HISTORY_PAGE_SIZE), skip: String(skip) });
     if (pendingQuery) params.set("q", pendingQuery);
     request<GitCommit[]>(withWorkspace(`/api/projects/${projectID}/git/log?${params.toString()}`))
       .then((commits) => { if (requestID === historyRequest.current) { setHistoryHasMore(commits.length === HISTORY_PAGE_SIZE); setBranchCommits((prev) => [...prev, ...commits]); } })
-      .catch((cause) => { if (requestID === historyRequest.current) fail(cause instanceof Error ? cause.message : "无法读取该分支的历史"); })
+      // 「加载更多」失败时列表还在，所以那一档显示在**列表下方**，不顶掉已有内容。
+      .catch((cause) => { if (requestID === historyRequest.current) setHistoryError(cause instanceof Error ? cause.message : "无法读取该分支的历史"); })
       .finally(() => { if (requestID === historyRequest.current) setHistoryLoading(false); });
   };
 
@@ -710,8 +849,10 @@ function Branches({ branches, mutating, projectID, conversationId, request, fail
       <div className="git-branch-history-pane" aria-label={selectedCommit ? `提交 ${selectedCommit.oid} 的详情` : `分支 ${effectiveSelection} 的提交历史`}>
         {selectedCommit ? <CommitDetailView commit={selectedCommit} detail={commitDetail} loading={detailLoading} error={detailError} selectedFile={selectedFile} fileDiff={fileDiff} fileDiffLoading={fileDiffLoading} onOpenFile={openCommitFile} onCloseFile={closeCommitFile} onBack={closeCommit} /> : <>
           <header className="git-branch-history-header"><h3>提交历史</h3><div className="git-history-search"><input type="text" value={historyQuery} placeholder="搜索提交信息…" aria-label="按提交信息搜索" onChange={(event) => setHistoryQuery(event.target.value)} />{historyQuery ? <button type="button" className="git-history-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setHistoryQuery("")}>×</button> : null}</div><code className="git-branch-history-ref">{effectiveSelection}</code></header>
-          <CommitHistory commits={branchCommits} loading={historyLoading} onSelect={openCommit} />
+          <CommitHistory commits={branchCommits} loading={historyLoading} error={historyError} onSelect={openCommit} />
           {historyHasMore && !historyLoading ? <button type="button" className="git-history-load-more" onClick={loadMoreHistory}>加载更多提交</button> : null}
+          {/* 「加载更多」失败：列表还在，所以只在下面补一行说明，不顶掉已读到的内容。 */}
+          {historyError !== "" && branchCommits.length > 0 ? <p className="git-history-error-inline" role="status">{historyError}</p> : null}
         </>}
       </div>
     </div>

@@ -156,7 +156,7 @@ func (s *Server) gitConflictSuggest(w http.ResponseWriter, r *http.Request) {
 	if input.Agent == "" {
 		input.Agent = "claude-code"
 	}
-	if input.Agent != "claude-code" && input.Agent != "codex" {
+	if !validProfileAgent(input.Agent) {
 		writeError(w, http.StatusBadRequest, errors.New("unsupported agent"))
 		return
 	}

@@ -44,6 +44,9 @@ server {
         root /var/www/milevia/dist;
         try_files $uri =404;
         add_header Cache-Control "no-cache";
+        # 手机端是 Android WebView（origin=https://localhost），用 fetch 读这份清单属于跨源请求；
+        # 缺这个头浏览器会直接拦掉，App 只能退回 GitHub 备用源（那份会落后一版，表现为"没有更新"）。
+        add_header Access-Control-Allow-Origin "*" always;
     }
 
     location / {

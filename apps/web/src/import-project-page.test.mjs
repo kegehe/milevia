@@ -39,7 +39,9 @@ test("directory-dependent actions wait for directory loading", () => {
   assert.match(page, /const \[loadingDirectory, setLoadingDirectory\] = useState\(false\);/);
   assert.match(page, /const \[directoryReady, setDirectoryReady\] = useState\(false\);/);
   assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| creatingDirectory \|\| !directoryReady\}/);
-  assert.match(page, /disabled=\{!result\?\.agentReady \|\| busy \|\| loadingDirectory \|\| !directoryReady\}/);
+  // 确认加载不再要求 agentReady：环境不可用（空目录/无工具）也能加载。
+  assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| !directoryReady \|\| !result\}/);
+  assert.doesNotMatch(page, /!result\?\.agentReady \|\| busy \|\| loadingDirectory/);
 });
 
 test("validation and project creation cannot update a stale import view", () => {

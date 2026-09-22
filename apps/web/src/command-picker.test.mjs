@@ -46,7 +46,8 @@ test("the picker fills the template from the selected command", () => {
 test("a stale command is only flagged when the catalog is authoritative", () => {
   const availability = conversationPage.match(/const commandAvailability = useCallback\([\s\S]*?\n  \}, \[[^\]]*\]\);/)?.[0] ?? "";
   assert.ok(availability, "找不到 commandAvailability");
-  assert.match(availability, /conversation\?\.agentId === "codex"\) return "unsupported";/);
+  // 判据来自目录的能力声明（slashCommands），不再写死 codex。
+  assert.match(availability, /conversation && !agentSupportsSlashCommands\(conversation\.agentId\)\) return "unsupported";/);
   assert.match(availability, /commandCatalog\?\.authoritative && !commandCatalog\.commands\.some/);
   // 自定义 shell 命令不是斜杠命令，与命令目录无关，永远可用。
   assert.match(availability, /if \(!commandName\) return "ok";/);
@@ -54,10 +55,10 @@ test("a stale command is only flagged when the catalog is authoritative", () => 
 
 test("codex conversations do not offer slash commands", () => {
   // 编辑器里 CLI 命令那一档对 Codex 禁用，并说明原因。
-  assert.match(conversationPage, /const supportsCLICommands = agentID !== "codex";/);
+  assert.match(conversationPage, /const supportsCLICommands = agentSupportsSlashCommands\(agentID\);/);
   assert.match(conversationPage, /disabled=\{!supportsCLICommands\} onClick=\{\(\) => setMode\("cli"\)\}/);
   // 发送路径上再拦一层：任何调用方都不该把 `/xxx` 当普通提示词发给 Codex。
-  assert.match(conversationPage, /const slashName = slashCommandName\(draft\);\n    if \(slashName && conversation\.agentId === "codex"\) \{/);
+  assert.match(conversationPage, /const slashName = slashCommandName\(draft\);\n    if \(slashName && !agentSupportsSlashCommands\(conversation\.agentId\)\) \{/);
 });
 
 test("typing an unknown slash command warns instead of blocking", () => {

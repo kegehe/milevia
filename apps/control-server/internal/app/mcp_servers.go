@@ -218,7 +218,7 @@ func normalizeMCPAgents(values []string) []string {
 	out := []string{}
 	for _, v := range values {
 		v = strings.TrimSpace(v)
-		if v != "claude-code" && v != "codex" {
+		if !validProfileAgent(v) {
 			continue
 		}
 		if seen[v] {

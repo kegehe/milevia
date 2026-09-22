@@ -13,6 +13,16 @@ export interface FileEntry {
   isDir: boolean;
   size?: number;
   modTime?: string;
+  /**
+   * 只在带 `depth` 的 `/fs/tree` 响应里出现（手机端一次多拿几层时）。
+   * 桌面端的扁平调用不带它，所以是可选的。
+   *
+   * 判据分工：`children` 缺席且 `unreadable` 不为真 ⇒ **空目录**；
+   * `unreadable` 为真 ⇒ **这个目录读不到**（权限、或读到一半被删掉）。
+   * 两者都不能靠"有没有 children"单独区分，别把它们合成一个字段。
+   */
+  children?: FileEntry[];
+  unreadable?: boolean;
 }
 
 export interface FileInfo {
@@ -31,10 +41,30 @@ export interface FileContent {
   encoding?: "base64";
   version: string;
   stat: FileInfo;
+  /**
+   * 服务端判定的"这个文件能不能改"。**只有手机端会有**（走 `/fs/open`），桌面端是
+   * undefined，界面回落到 `isEditableFile(stat)` 那个本地判据。
+   *
+   * 为什么必须信服务端：能不能编辑不取决于文件本身，而取决于**内容能不能原样发回去** ——
+   * 那要减去 JSON 转义与中继信封的余量，而这两个数只有服务端知道。客户端按扩展名
+   * 自己判，会把一个 300 KiB 的源码文件标成可编辑，用户改完按保存才失败。
+   */
+  editable?: boolean;
+  /** `editable` 为 false 时的原因，用来在界面上说清"为什么不能改"。 */
+  readOnlyReason?: "file_too_large" | "binary_file";
 }
 
 export interface TreeResponse {
   entries: FileEntry[];
+  /** 条目太多、这次没取全（配额被裁）。**必须如实告诉用户**，不能静默丢弃。 */
+  truncated?: boolean;
+  /**
+   * 因忽略名单跳过的依赖/构建目录数（node_modules、.git、dist 等）。
+   *
+   * 它与 `truncated` 是两件事：跳过依赖目录是**预期行为**（"隐藏了 3 个依赖目录"），
+   * `truncated` 才是"这次没取全"。合成一个布尔量就没法对用户说清是哪一种。
+   */
+  skippedDirs?: number;
 }
 
 export interface SearchResponse {
@@ -54,6 +84,23 @@ export interface OpenFile {
   stat: FileInfo;
   previewKind: FilePreviewKind;
   contentLoaded: boolean;
+  /**
+   * 服务端**故意没给内容**时（文件太大 / 不是文本）的原因与说明。
+   *
+   * 非空时这个标签页只能渲染元信息卡：内容字段是空的，而 `previewKind` 是按扩展名
+   * 算出来的（一个大 .ts 文件仍然算出 "source"）—— 按它渲染就是一个空白编辑器，
+   * 用户会以为文件是空的。手机端才有这个状态。
+   */
+  omitted?: { message: string; reason: "too_large" | "binary" };
+  /**
+   * 服务端说了"这个文件不能编辑"（`/fs/open` 的 `editable: false`）。只有手机端会有。
+   *
+   * 它与 `omitted` 是两件事：`omitted` 是**连内容都没给**，这个是**给了完整内容但
+   * 不该改**（内容大到发不回去）。手机端有一条 256–320 KiB 的只读带，桌面端没有，
+   * 所以这里必须是可选字段：桌面端为 undefined，一概沿用原来的本地判据。
+   */
+  editable?: boolean;
+  readOnlyReason?: "file_too_large" | "binary_file";
 }
 
 // ─── 语言检测 ───────────────────────────────────────────────────────────────

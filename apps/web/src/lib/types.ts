@@ -308,15 +308,25 @@ export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?:
 // “新建”和计数都以此为准，不再前端硬编码固定值）。
 export type TerminalSessionList = { sessions: TerminalSessionInfo[]; maxPerProject: number; maxProjects: number };
 
-export type ToolStatus = { status: "ready" | "unavailable" | "needs_auth" | "updating"; version: string; reason?: string };
+// 工具状态。unsupported 与 unavailable 是两件事，必须分开处理：
+//   unsupported —— 这个 Runner 根本不提供该工具（要换执行环境）；
+//   unavailable —— 提供了但目标环境上没装或不可执行（要去安装）。
+// 合并成一档会让界面给出错误的下一步动作。
+export type ToolStatusKind = "ready" | "unavailable" | "needs_auth" | "updating" | "unsupported";
+export type ToolStatus = { status: ToolStatusKind; version?: string; reason?: string };
+// 单个 Runner 上"每个工具的状态"，与 claude / codex 两个过渡字段同源（后端派生）。
+// 前端应遍历它，而不是各自读那两个键 —— 新增工具时不必再改每一处。
+export type RunnerAgentStatus = ToolStatus & { id: string };
 export type RunnerInfo = {
   id: string;
   name: string;
   environment: string;
   root: string;
   profileManagement?: boolean;
-  claude: ToolStatus;
+  // claude / codex 是过渡字段（后端由 agents[] 派生），改用 agents 后可删。
+  claude?: ToolStatus;
   codex?: ToolStatus;
+  agents?: RunnerAgentStatus[];
 };
 
 export type AgentProfile = {
