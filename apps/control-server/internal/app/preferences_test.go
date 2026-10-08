@@ -55,6 +55,30 @@ func TestAppPreferencesDefaultAndPatch(t *testing.T) {
 	}
 }
 
+// 手机端的 conversation.create 现在会显式带 permissionMode，但"没带"的路径依然存在
+// （老版本手机端、或其他调用方）。空权限的派生不能再按 claude/codex 二元式回落 ——
+// codebuddy 的权限面不含 approval_required，落到 Claude 的偏好会被 validAgentPolicy
+// 拒成 400。新工具的默认权限必须来自目录的 DefaultPermissionMode。
+func TestNewConversationDerivesCatalogDefaultPermissionForNewAgents(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/project/conversations?new=true", strings.NewReader(`{"agentId":"codebuddy"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var conversation Conversation
+	if err := json.NewDecoder(response.Body).Decode(&conversation); err != nil {
+		t.Fatalf("decode conversation: %v", err)
+	}
+	if conversation.AgentID != "codebuddy" || conversation.PermissionMode != "workspace_write" {
+		t.Fatalf("conversation defaults=%+v want codebuddy/workspace_write", conversation)
+	}
+}
+
 func TestNewConversationUsesApplicationDefaultsWhenRequestOmitsThem(t *testing.T) {
 	server := newTestServer(t)
 	server.codexRunner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -54,6 +55,15 @@ type runnerAgentsView struct {
 	Items       []runnerAgentView `json:"items"`
 	// RemoteInstallAllowed：跨端安装是否已被逐主机授权（docs/42 §9.1）。
 	RemoteInstallAllowed bool `json:"remoteInstallAllowed"`
+	// ProbedAt 是这份"工具状态"读数的取得时刻。**缓存命中时它就是上一次探测的时间**
+	// —— 字段的用途是让界面说明"这份读数是多久以前拿的"（报告是快照，不写时间会变成
+	// 此刻的事实）。用指针而不是 time.Time：零值会被前端念成"1月1日 08:00"，那是一句凭空的谎话。
+	//
+	// ⚠️ 现状（2026-09-29 复查）：前端**还没有**读它 —— 全仓 `probedAt` 只出现在这里与
+	// 它的测试里。也就是说这个"避免把快照当此刻事实"的保护目前只做了一半；
+	// 要么在读数那一栏把时刻显示出来，要么就别在注释里宣称已经做到了。
+	// 留着字段是因为它已被序列化契约与 `TestAgentViewReplaysSameProbedAt`（缓存回放的判据）依赖。
+	ProbedAt *time.Time `json:"probedAt,omitempty"`
 }
 
 // resolveProbeTarget 解析 {runnerID}，并把**两件不同的事**分开：
@@ -105,10 +115,14 @@ func (s *Server) listRunnerAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	statuses := s.probeAgents(r.Context(), meta)
+	// force=true（手动「重新检查」）才绕过读数缓存，见 agent_readings.go。
+	statuses, probedAt := s.probeAgentsFor(r.Context(), meta, forceRefresh(r))
 	view := runnerAgentsView{
 		RunnerID: meta.ID, Environment: meta.Environment, ProbeOK: true,
 		Items: make([]runnerAgentView, 0, len(statuses)),
+	}
+	if !probedAt.IsZero() {
+		view.ProbedAt = &probedAt
 	}
 	recorded := map[string]string{}
 	recordedKind := map[string]string{}

@@ -1,12 +1,13 @@
-// 对话页侧栏模块的折叠状态（常用提示词/常用命令/技能/任务队列）。
+// 对话页侧栏模块的折叠状态（常用提示词+常用命令/技能/任务队列）。
+// 常用提示词与常用命令合并在一个整体折叠里（shortcuts）。
 // 按项目持久化到 localStorage，切换项目/重进页面时保持用户上次的折叠偏好。
 
-export type ConversationPanelKey = "prompt" | "command" | "skills" | "taskQueue";
+export type ConversationPanelKey = "shortcuts" | "skills" | "taskQueue";
 
 export type ConversationPanelsState = Record<ConversationPanelKey, boolean>;
 
 export function defaultConversationPanels(): ConversationPanelsState {
-  return { prompt: false, command: false, skills: false, taskQueue: false };
+  return { shortcuts: false, skills: false, taskQueue: false };
 }
 
 function storageKey(projectId: string): string {
@@ -22,8 +23,7 @@ export function readConversationPanels(projectId: string): ConversationPanelsSta
     const value = parsed as Partial<ConversationPanelsState>;
     const defaults = defaultConversationPanels();
     return {
-      prompt: typeof value.prompt === "boolean" ? value.prompt : defaults.prompt,
-      command: typeof value.command === "boolean" ? value.command : defaults.command,
+      shortcuts: typeof value.shortcuts === "boolean" ? value.shortcuts : defaults.shortcuts,
       skills: typeof value.skills === "boolean" ? value.skills : defaults.skills,
       taskQueue: typeof value.taskQueue === "boolean" ? value.taskQueue : defaults.taskQueue,
     };

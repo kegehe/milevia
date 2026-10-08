@@ -1,8 +1,25 @@
+/** 一条具名启动命令。一个项目可以保存多条（开发/预发/生产参数不同，或不同的启动方式），
+ *  启动时选中其中一条执行。 */
+export interface RunCommand {
+	/** 标识这一条；选中、去重、列表 key 都以它为准。 */
+	id: string;
+	/** 展示名，如「开发环境」；留空时界面回落到命令文本。 */
+	name: string;
+	/** 实际执行的命令行。 */
+	command: string;
+	/** 这条命令专属的环境变量，启动时叠加在全局环境变量之上（同名覆盖）。 */
+	envVars?: Record<string, string>;
+}
+
 export interface RunConfig {
 	workDir: string;
+	/** 所选命令的文本镜像（后端维护）。界面以 commands 为准，这个字段只为兼容旧契约保留。 */
 	command: string;
 	envVars: Record<string, string>;
 	executionTarget: 'auto' | 'wsl' | 'windows';
+	commands: RunCommand[];
+	/** 上次选中的命令 ID。 */
+	selectedCommandId: string;
 }
 
 export type RunStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'failed';
@@ -14,7 +31,45 @@ export interface RunStatusResponse {
 	startedAt: string | null;
 	pid: number | null;
 	exitCode: number | null;
+	/** 当前（或最近一次）运行实际执行的命令行文本；用来判断"跑的是哪一条"。 */
+	command?: string;
 	recentLogs: LogEntry[];
+}
+
+/** 生成命令 ID。非安全上下文（如局域网 http）没有 crypto.randomUUID，退回时间戳+随机串。 */
+export function newRunCommandID(): string {
+	return globalThis.crypto?.randomUUID?.() || `run-cmd-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** 新建一条空白启动命令（名称与命令都留给用户填）。 */
+export function createRunCommand(): RunCommand {
+	return { id: newRunCommandID(), name: '', command: '' };
+}
+
+/** 命令在界面上的称呼：优先名称，其次命令文本，都没有时用序号占位。 */
+export function runCommandLabel(command: RunCommand, index = 0): string {
+	return command.name.trim() || command.command.trim() || `命令 ${index + 1}`;
+}
+
+/** 这条命令是否"真实存在"。空命令的行只是「添加一条」留下的壳：后端保存时会丢弃，
+ *  所以它既不该被选中，也不该被当成启动目标 —— 否则会发出一个后端不认识的命令 ID。 */
+export function isRunnableCommand(command: RunCommand): boolean {
+	return command.command.trim() !== '';
+}
+
+/** 当前选中的命令：选中项必须是一条**有命令文本的**行；否则回落到第一条这样的行。
+ *  一条都没有时返回 undefined（对应"请先配置启动命令"，此时界面上没有任何圆点被选中，
+ *  与后端"命令列表为空"的判定一致）。 */
+export function selectedRunCommand(config: RunConfig): RunCommand | undefined {
+	const commands = config.commands || [];
+	return commands.find((item) => item.id === config.selectedCommandId && isRunnableCommand(item)) || commands.find(isRunnableCommand);
+}
+
+/** 命令列表的不可变更新：顺带修正选中项并同步 command 镜像，保证界面与后端规范化后的
+ *  形态一致（选中项要么指向一条有命令文本的条目，要么为空）。 */
+export function withRunCommands(config: RunConfig, commands: RunCommand[], selectedCommandId = config.selectedCommandId): RunConfig {
+	const selected = selectedRunCommand({ ...config, commands, selectedCommandId });
+	return { ...config, commands, selectedCommandId: selected?.id || '', command: selected?.command || '' };
 }
 
 export interface LogEntry {

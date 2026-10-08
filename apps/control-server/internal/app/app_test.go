@@ -5765,7 +5765,7 @@ func TestListOrchestrationBatchesUsesSingleSQLiteConnection(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	taskID := createTaskForTest(t, server.routes(), projectID, "List batch")
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into orchestration_batches (id,project_id,name,conversation_strategy,created_at,updated_at) values ('batch',?,'Batch','new',?,?)`, projectID, now, now); err != nil {
+	if _, err := server.db.Exec(`insert into orchestration_batches (id,project_id,name,conversation_strategy,started_at,created_at,updated_at) values ('batch',?,'Batch','new',?,?,?)`, projectID, now, now, now); err != nil {
 		t.Fatalf("insert batch: %v", err)
 	}
 	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,batch_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job',?,?, 'batch',1,'queued','{}',?,?)`, projectID, taskID, now, now); err != nil {
@@ -7386,42 +7386,6 @@ func TestEnqueueBatchAddsTasksInOrder(t *testing.T) {
 	}
 }
 
-func TestArchiveOrchestrationBatchPreservesQueuedJobContext(t *testing.T) {
-	server, projectID, _ := seedTaskConversation(t)
-	enableOrchestrationForTest(t, server, projectID)
-	taskID := createTaskForTest(t, server.routes(), projectID, "archived batch task")
-	create := httptest.NewRecorder()
-	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"context plan","taskIds":["`+taskID+`"],"conversationStrategy":"continue"}`)))
-	if create.Code != http.StatusAccepted {
-		t.Fatalf("create batch: %d body=%s", create.Code, create.Body.String())
-	}
-	var batch OrchestrationBatch
-	if err := json.Unmarshal(create.Body.Bytes(), &batch); err != nil {
-		t.Fatalf("decode batch: %v", err)
-	}
-	archive := httptest.NewRecorder()
-	server.routes().ServeHTTP(archive, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID, nil))
-	if archive.Code != http.StatusNoContent {
-		t.Fatalf("archive batch: %d body=%s", archive.Code, archive.Body.String())
-	}
-	var jobBatchID string
-	if err := server.db.QueryRow(`select batch_id from task_orchestration_jobs where task_id=?`, taskID).Scan(&jobBatchID); err != nil {
-		t.Fatalf("load job batch ID: %v", err)
-	}
-	if jobBatchID != batch.ID {
-		t.Fatalf("job batch ID=%q want %q", jobBatchID, batch.ID)
-	}
-	var archivedAt any
-	if err := server.db.QueryRow(`select archived_at from orchestration_batches where id=?`, batch.ID).Scan(&archivedAt); err != nil || archivedAt == nil {
-		t.Fatalf("archived plan record missing: archivedAt=%v err=%v", archivedAt, err)
-	}
-	list := httptest.NewRecorder()
-	server.routes().ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/orchestration/batches", nil))
-	if list.Code != http.StatusOK || bytes.Contains(list.Body.Bytes(), []byte(batch.ID)) {
-		t.Fatalf("archived batch remained visible: %d body=%s", list.Code, list.Body.String())
-	}
-}
-
 func TestCreateOrchestrationBatchTakesPolicyAndLeavesTasksForLater(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	taskA := createTaskForTest(t, server.routes(), projectID, "plan task A")
@@ -7447,8 +7411,9 @@ func TestCreateOrchestrationBatchTakesPolicyAndLeavesTasksForLater(t *testing.T)
 	if err := json.Unmarshal(list.Body.Bytes(), &listed); err != nil {
 		t.Fatalf("decode batches: %v body=%s", err, list.Body.String())
 	}
-	// 空计划是「刚建好」而不是「已完成」，否则它一进列表就是灰的。
-	if len(listed) != 1 || listed[0].ID != batch.ID || listed[0].TaskCount != 0 || listed[0].Status != "active" {
+	// 空计划是「刚建好」而不是「已完成」；而且新建的计划默认未开始——子任务加进去只会排队，
+	// 必须点过「开始执行」才会被调度器取走。
+	if len(listed) != 1 || listed[0].ID != batch.ID || listed[0].TaskCount != 0 || listed[0].Status != "not_started" || listed[0].Started {
 		t.Fatalf("empty plan listing=%+v", listed)
 	}
 	// 任务事后从候选列表加入，并沿用创建计划时定下的策略快照。
@@ -7492,6 +7457,133 @@ func TestCreateOrchestrationBatchKeepsOmittedPolicyFields(t *testing.T) {
 	}
 	if cfg.AgentID != "codex" || cfg.MainBranch != "main" || cfg.DevBranch != "dev" || cfg.MaxFixRounds != 3 {
 		t.Fatalf("omitted policy fields were not preserved: %+v", cfg)
+	}
+}
+
+// "这个任务已经有编排记录了"这条 409 必须是**中文且给出出路**。
+//
+// 它原来是一句纯英文（`task 1234 already has an orchestration record`），过不了
+// localizedErrorText 的直通判据 → 用户看到"当前操作与进行中的操作冲突，请稍后重试。：
+// task 1234 already has an orchestration record"：既没有"进行中的操作"（那一行常常早就
+// 结束了），也没告诉用户该走「重新下发」。建计划 / 往计划里加任务两条路径共用它。
+func TestOrchestrationRecordConflictExplainsItself(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "record conflict")
+	ctx := context.Background()
+
+	write := func(status string) string {
+		t.Helper()
+		if _, err := server.db.Exec(`delete from task_orchestration_jobs where project_id=?`, projectID); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,?,?,?,?)`,
+			"job-"+status, projectID, taskID, 1, status, "{}", now, now); err != nil {
+			t.Fatal(err)
+		}
+		// 与真实出口一致：writeError 会把文案过一遍 localizedHTTPErrorText。
+		return localizedHTTPErrorText(http.StatusConflict, server.orchestrationRecordConflict(ctx, taskID))
+	}
+
+	// 进行中：让用户等它结束 / 先停掉它。
+	inFlight := write(orchestrationImplementing)
+	if !containsChinese(inFlight) || !strings.Contains(inFlight, "正在实施") {
+		t.Fatalf("进行中的情形没说清那一行在干什么：%q", inFlight)
+	}
+	if strings.Contains(inFlight, taskFailureFallbackPrefix) || strings.Contains(inFlight, "操作冲突") {
+		t.Fatalf("文案被套了兜底前缀：%q", inFlight)
+	}
+
+	// 已收口：与单条入队那条同源（指的是同一条出路）。
+	settled := write(orchestrationApplied)
+	if !containsChinese(settled) || !strings.Contains(settled, "重新下发") {
+		t.Fatalf("已收口的情形没指出下一步：%q", settled)
+	}
+	if strings.Contains(settled, taskFailureFallbackPrefix) || strings.Contains(settled, "操作冲突") {
+		t.Fatalf("文案被套了兜底前缀：%q", settled)
+	}
+	// 不许残留英文（直通判据的硬要求）：这两句里连产品名都不该有，只有中文与标点。
+	for _, text := range []string{inFlight, settled} {
+		if englishPhraseBeforeChinese(text) != "" {
+			t.Fatalf("文案里出现了英文短语：%q", text)
+		}
+	}
+}
+
+// orchestrationJobWillRun 与 nextOrchestrationJob 的 SQL 排除列表是**两份**状态集合，
+// 这正是本项目反复踩过的那类"同一集合多处各写一份"。这里用**行为**交叉校验而不是抄字面量：
+// 对每个状态各塞一行作业，问一次调度器，两者必须给出同一个答案。
+// 将来任一侧加了新状态而另一边忘了改，这条就会红。
+func TestOrchestrationJobWillRunMatchesScheduler(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	// 作业行的 task_id 有外键，必须用真实任务；同一行反复换状态即可（每轮先删掉上一次的）。
+	taskID := createTaskForTest(t, server.routes(), projectID, "will run cross-check")
+	statuses := []string{
+		orchestrationQueued, orchestrationPreparing, orchestrationImplementing, orchestrationChecking,
+		orchestrationNeedsHuman, orchestrationPaused, orchestrationStopped, orchestrationRemoving,
+		orchestrationApplied, "released_to_main", "integrated_to_dev", "awaiting_main",
+	}
+	for _, status := range statuses {
+		if _, err := server.db.Exec(`delete from task_orchestration_jobs where project_id=?`, projectID); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,queue_position,status,policy_snapshot,created_at,updated_at) values (?,?,?,?,?,?,?,?)`,
+			"job-"+status, projectID, taskID, 1, status, "{}", now, now); err != nil {
+			t.Fatal(err)
+		}
+		next, err := server.nextOrchestrationJob(context.Background(), projectID)
+		if err != nil {
+			t.Fatalf("%s：调度器查询失败：%v", status, err)
+		}
+		scheduled := next != nil
+		if got := orchestrationJobWillRun(status); got != scheduled {
+			t.Fatalf("状态 %s：orchestrationJobWillRun=%v 而调度器会取=%v —— 两份状态集合已经不一致（"+
+				"enqueue 的幂等分支会按前者回 202，用户看到成功而队列永不执行）", status, got, scheduled)
+		}
+	}
+}
+
+// 幂等分支只对"还能被调度器取走"的作业成立。
+//
+// 已收口的那一行（直接模式 applied_to_branch / 已合并 released_to_main / 已进 dev /
+// 待合并）永远不会再被调度器取走，而任务本身仍是可入队的 action_required —— 看板照旧
+// 渲染「加入自动队列」。原来这里不看状态就 commit + kick + 202，于是界面报"成功"、
+// 状态毫无变化，用户可以反复点、每次都"成功"（2026-09-29 定位）。
+func TestEnqueueOnSettledOrchestrationIsRefused(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	enableOrchestrationForTest(t, server, projectID)
+	taskID := createTaskForTest(t, server.routes(), projectID, "settled enqueue")
+	first := httptest.NewRecorder()
+	server.routes().ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/enqueue", bytes.NewBufferString(`{}`)))
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("首次入队: %d body=%s", first.Code, first.Body.String())
+	}
+	// 收口到直接模式的终态（真实写入点在 orchestration.go 的 advanceOrchestrationJob 一侧）。
+	if _, err := server.db.Exec(`update task_orchestration_jobs set status=? where task_id=?`, orchestrationApplied, taskID); err != nil {
+		t.Fatal(err)
+	}
+	second := httptest.NewRecorder()
+	server.routes().ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/orchestration/enqueue", bytes.NewBufferString(`{}`)))
+	if second.Code != http.StatusConflict {
+		t.Fatalf("已收口后再次入队必须回 409（而不是 202 的假成功）: %d body=%s", second.Code, second.Body.String())
+	}
+	body := second.Body.String()
+	// 回执要指一条出路，而且要能直通本地化判据（含中文、没有残留英文，否则会被套上
+	// "操作失败，请稍后重试。"那层兜底）。
+	if !strings.Contains(body, "重新下发") {
+		t.Fatalf("回执没有指出下一步（重新下发）: %s", body)
+	}
+	if !containsChinese(body) || strings.Contains(body, taskFailureFallbackPrefix) || strings.Contains(body, "操作失败，请稍后重试。") {
+		t.Fatalf("回执被套了兜底前缀或没有可读中文: %s", body)
+	}
+	// 队列那一行不许被改成 queued：那等于把已经落地的编排又跑一遍。
+	var status string
+	if err := server.db.QueryRow(`select status from task_orchestration_jobs where task_id=?`, taskID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != orchestrationApplied {
+		t.Fatalf("作业状态被改动了（已收口的编排不该被重新排队）: %s", status)
 	}
 }
 
@@ -7582,6 +7674,422 @@ func TestBatchContextFollowsTasksAddedAfterPlanCreation(t *testing.T) {
 	if !strings.Contains(context, "上一轮改好了支付回调") {
 		t.Fatalf("second job did not inherit the previous task context: %q", context)
 	}
+}
+
+// 编排任务（batch）在后端只是一张标签表：调度器按 queue_position 取活，从不读
+// batch_id。所以删除的正确形态是「删掉标签、把子任务脱组」，而不是连 job 一起删——
+// 已编排的任务受审计保留策略保护（见 deleteTask），删 job 会静默重开硬删除的口子。
+func TestDeleteOrchestrationBatchDetachesJobsAndKeepsTasks(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskA := createTaskForTest(t, server.routes(), projectID, "detach released")
+	taskB := createTaskForTest(t, server.routes(), projectID, "detach stopped")
+	batch := createBatchForTest(t, server, projectID, "finished plan", taskA, taskB)
+	// 只有终态子任务（已合并 / 已停止）的计划才允许删除。
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`update task_orchestration_jobs set status='released_to_main',updated_at=? where task_id=?`, now, taskA); err != nil {
+		t.Fatalf("release job: %v", err)
+	}
+	if _, err := server.db.Exec(`update task_orchestration_jobs set status='stopped',updated_at=? where task_id=?`, now, taskB); err != nil {
+		t.Fatalf("stop job: %v", err)
+	}
+	// 给 taskA 挂上真实的 Git 记录：弹窗向用户承诺"worktree、任务分支与执行对话都不受影响"，
+	// 这条断言就是守它——将来谁把删除改成顺带清理 Git 资源，这里会红。
+	var releasedJobID string
+	if err := server.db.QueryRow(`select id from task_orchestration_jobs where task_id=?`, taskA).Scan(&releasedJobID); err != nil {
+		t.Fatalf("load job id: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,created_at,updated_at) values (?,'base','task/detach-me','D:/worktrees/detach',?,?)`, releasedJobID, now, now); err != nil {
+		t.Fatalf("insert git record: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID, nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete batch: %d body=%s", response.Code, response.Body.String())
+	}
+	var batchCount int
+	if err := server.db.QueryRow(`select count(*) from orchestration_batches where id=?`, batch.ID).Scan(&batchCount); err != nil {
+		t.Fatalf("count batches: %v", err)
+	}
+	if batchCount != 0 {
+		t.Fatalf("batch row survived the delete: %d", batchCount)
+	}
+	var jobCount, attached int
+	if err := server.db.QueryRow(`select count(*), coalesce(sum(case when batch_id<>'' then 1 else 0 end),0) from task_orchestration_jobs where project_id=?`, projectID).Scan(&jobCount, &attached); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if jobCount != 2 || attached != 0 {
+		t.Fatalf("jobs=%d attached=%d, want 2 detached", jobCount, attached)
+	}
+	var taskCount int
+	if err := server.db.QueryRow(`select count(*) from tasks where project_id=?`, projectID).Scan(&taskCount); err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	if taskCount != 2 {
+		t.Fatalf("tasks=%d, want both tasks kept", taskCount)
+	}
+	var keptBranch, keptWorktree string
+	if err := server.db.QueryRow(`select task_branch,worktree_path from git_task_records where job_id=?`, releasedJobID).Scan(&keptBranch, &keptWorktree); err != nil {
+		t.Fatalf("git record must survive the delete: %v", err)
+	}
+	if keptBranch != "task/detach-me" || keptWorktree != "D:/worktrees/detach" {
+		t.Fatalf("git record changed: branch=%q worktree=%q", keptBranch, keptWorktree)
+	}
+	// 删除后列表里不再有它，脱组的子任务会落到「全部子任务」视图。
+	list := httptest.NewRecorder()
+	server.routes().ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/orchestration/batches", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("list batches: %d body=%s", list.Code, list.Body.String())
+	}
+	var batches []OrchestrationBatch
+	if err := json.Unmarshal(list.Body.Bytes(), &batches); err != nil {
+		t.Fatalf("decode batches: %v", err)
+	}
+	if len(batches) != 0 {
+		t.Fatalf("batches=%#v, want none", batches)
+	}
+}
+
+func TestDeleteOrchestrationBatchRejectsUnfinishedJobs(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	queuedTask := createTaskForTest(t, server.routes(), projectID, "still queued")
+	batch := createBatchForTest(t, server, projectID, "running plan", queuedTask)
+	// removing 是唯一只在清理进行中短暂存在的状态（进程中途死掉会留下它，重启时由
+	// recoverOrchestration 清掉）。它必须挡删除——用黑名单写这个守卫最容易漏掉它，
+	// 因为它在正常流程里几乎看不到。
+	for _, status := range []string{"queued", "preparing", "implementing", "checking", "paused", "needs_human", "awaiting_main", "integrated_to_dev", "removing"} {
+		// 任何一个可能再跑（或还在等人处理）的子任务都必须挡住删除，否则它会在
+		// 恢复执行时静默丢掉所在计划的对话上下文。
+		if _, err := server.db.Exec(`update task_orchestration_jobs set status=? where task_id=?`, status, queuedTask); err != nil {
+			t.Fatalf("set status %s: %v", status, err)
+		}
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID, nil))
+		if response.Code != http.StatusConflict {
+			t.Fatalf("delete with %s job: %d body=%s", status, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), "还有未结束的子任务") {
+			t.Fatalf("delete with %s job body=%s", status, response.Body.String())
+		}
+	}
+	var batchCount, attached int
+	if err := server.db.QueryRow(`select count(*) from orchestration_batches where id=?`, batch.ID).Scan(&batchCount); err != nil {
+		t.Fatalf("count batches: %v", err)
+	}
+	if err := server.db.QueryRow(`select count(*) from task_orchestration_jobs where task_id=? and batch_id=?`, queuedTask, batch.ID).Scan(&attached); err != nil {
+		t.Fatalf("count attached jobs: %v", err)
+	}
+	if batchCount != 1 || attached != 1 {
+		t.Fatalf("a refused delete must change nothing: batch=%d attached=%d", batchCount, attached)
+	}
+}
+
+// 空计划（建完还没加子任务）是最常见的删除场景，守卫不该因为「没有子任务」而拒绝——
+// 反过来，将来若有人把守卫改成「必须至少有一条 job」这里会立刻红。
+func TestDeleteOrchestrationBatchAllowsEmptyPlan(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	batch := createBatchForTest(t, server, projectID, "empty plan")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID, nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete empty batch: %d body=%s", response.Code, response.Body.String())
+	}
+	var batchCount int
+	if err := server.db.QueryRow(`select count(*) from orchestration_batches where project_id=?`, projectID).Scan(&batchCount); err != nil {
+		t.Fatalf("count batches: %v", err)
+	}
+	if batchCount != 0 {
+		t.Fatalf("batches=%d, want the empty plan removed", batchCount)
+	}
+}
+
+// 计划里混有已结束和未结束的子任务时，必须整体拒绝——「已经做完的那部分」不能成为
+// 放行的理由，而且已结束那条也不能被顺手脱组（它是同一批进度的一部分，删除必须原子）。
+func TestDeleteOrchestrationBatchRejectsMixedStatuses(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	doneTask := createTaskForTest(t, server.routes(), projectID, "already released")
+	queuedTask := createTaskForTest(t, server.routes(), projectID, "still queued")
+	batch := createBatchForTest(t, server, projectID, "mixed plan", doneTask, queuedTask)
+	if _, err := server.db.Exec(`update task_orchestration_jobs set status='released_to_main',updated_at=? where task_id=?`, time.Now().UTC(), doneTask); err != nil {
+		t.Fatalf("release job: %v", err)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID, nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("delete mixed plan: %d body=%s", response.Code, response.Body.String())
+	}
+	var attached int
+	if err := server.db.QueryRow(`select count(*) from task_orchestration_jobs where batch_id=?`, batch.ID).Scan(&attached); err != nil {
+		t.Fatalf("count attached: %v", err)
+	}
+	if attached != 2 {
+		t.Fatalf("attached=%d, want both jobs still on the plan", attached)
+	}
+}
+
+// 删除只能作用于目标计划：同项目里另一个计划的子任务不能被脱组，别的项目也不能借自己的
+// projectID 删掉本项目的计划（存在性检查必须带 project_id）。
+func TestDeleteOrchestrationBatchOnlyTouchesItsOwnPlan(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('other-project','other',?,?,?,?,?)`, t.TempDir(), "wsl-local", "main", true, now); err != nil {
+		t.Fatalf("insert second project: %v", err)
+	}
+	keepTask := createTaskForTest(t, server.routes(), projectID, "keep plan task")
+	dropTask := createTaskForTest(t, server.routes(), projectID, "drop plan task")
+	keepPlan := createBatchForTest(t, server, projectID, "keep plan", keepTask)
+	dropPlan := createBatchForTest(t, server, projectID, "drop plan", dropTask)
+	if _, err := server.db.Exec(`update task_orchestration_jobs set status='stopped',updated_at=? where task_id in (?,?)`, now, keepTask, dropTask); err != nil {
+		t.Fatalf("stop jobs: %v", err)
+	}
+	// 换一个真实存在的 projectID 去删这条计划：必须 404，而不是按 id 命中。
+	other := httptest.NewRecorder()
+	server.routes().ServeHTTP(other, httptest.NewRequest(http.MethodDelete, "/api/projects/other-project/orchestration/batches/"+dropPlan.ID, nil))
+	if other.Code != http.StatusNotFound {
+		t.Fatalf("cross-project delete: %d body=%s", other.Code, other.Body.String())
+	}
+	if !strings.Contains(other.Body.String(), "编排任务不存在或已被删除") {
+		t.Fatalf("cross-project delete body=%s", other.Body.String())
+	}
+	var stillThere int
+	if err := server.db.QueryRow(`select count(*) from orchestration_batches where id=?`, dropPlan.ID).Scan(&stillThere); err != nil {
+		t.Fatalf("count drop plan: %v", err)
+	}
+	if stillThere != 1 {
+		t.Fatalf("a cross-project delete must change nothing, batches=%d", stillThere)
+	}
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/"+dropPlan.ID, nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete plan: %d body=%s", response.Code, response.Body.String())
+	}
+	// 另一个计划的子任务必须原样留在自己的计划里。
+	var keptBatchID string
+	if err := server.db.QueryRow(`select batch_id from task_orchestration_jobs where task_id=?`, keepTask).Scan(&keptBatchID); err != nil {
+		t.Fatalf("load kept job: %v", err)
+	}
+	if keptBatchID != keepPlan.ID {
+		t.Fatalf("the other plan's job was detached: batch_id=%q want %q", keptBatchID, keepPlan.ID)
+	}
+	var batchCount int
+	if err := server.db.QueryRow(`select count(*) from orchestration_batches where project_id=?`, projectID).Scan(&batchCount); err != nil {
+		t.Fatalf("count batches: %v", err)
+	}
+	if batchCount != 1 {
+		t.Fatalf("batches=%d, want only the kept plan left", batchCount)
+	}
+}
+
+// 计划级闸门：新建的计划默认「未开始」，子任务停在队列里，调度器取不到它；点过开始才取到。
+func TestOrchestrationBatchStartGatesTheScheduler(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "gated task")
+	batch := createBatchForTest(t, server, projectID, "gated plan", taskID)
+	// 加入队列不等于可以跑：这正是用户要的那个闸门。
+	if job, err := server.nextOrchestrationJob(context.Background(), projectID); err != nil || job != nil {
+		t.Fatalf("unstarted plan must not be schedulable: job=%+v err=%v", job, err)
+	}
+	start := httptest.NewRecorder()
+	server.routes().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID+"/start", nil))
+	if start.Code != http.StatusNoContent {
+		t.Fatalf("start batch: %d body=%s", start.Code, start.Body.String())
+	}
+	job, err := server.nextOrchestrationJob(context.Background(), projectID)
+	if err != nil || job == nil {
+		t.Fatalf("started plan must be schedulable: job=%+v err=%v", job, err)
+	}
+	if job.TaskID != taskID || job.BatchID != batch.ID {
+		t.Fatalf("scheduled the wrong job: %+v", job)
+	}
+	// 列表里也要如实反映：未开始 → 开始后回到按子任务派生的状态。
+	var listed []OrchestrationBatch
+	list := httptest.NewRecorder()
+	server.routes().ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/orchestration/batches", nil))
+	if err := json.Unmarshal(list.Body.Bytes(), &listed); err != nil || len(listed) != 1 {
+		t.Fatalf("decode batches: %v body=%s", err, list.Body.String())
+	}
+	if !listed[0].Started || listed[0].Status != "active" {
+		t.Fatalf("started plan listing=%+v", listed[0])
+	}
+}
+
+// 闸门必须是「过滤」而不是「阻塞」：未开始的计划占着队首时，后面已开始的计划仍要能跑，
+// 否则一个还没提交的草稿会把整个项目队列卡死（docs/14 §4.1 的「不跳过」在这里是有意破例的）。
+func TestOrchestrationBatchGateDoesNotBlockStartedPlans(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	draftA := createTaskForTest(t, server.routes(), projectID, "draft head")
+	draftB := createTaskForTest(t, server.routes(), projectID, "draft head two")
+	live := createTaskForTest(t, server.routes(), projectID, "live plan task")
+	draftPlan := createBatchForTest(t, server, projectID, "draft plan", draftA, draftB)
+	livePlan := createBatchForTest(t, server, projectID, "live plan", live)
+	// 位置是「追加到项目队尾」，所以草稿计划占着队首两条，已开始的计划排在后面。
+	if !(queuePositionForTest(t, server, draftA) < queuePositionForTest(t, server, draftB) && queuePositionForTest(t, server, draftB) < queuePositionForTest(t, server, live)) {
+		t.Fatalf("expected the draft plan to own the queue head: a=%d b=%d live=%d", queuePositionForTest(t, server, draftA), queuePositionForTest(t, server, draftB), queuePositionForTest(t, server, live))
+	}
+	start := httptest.NewRecorder()
+	server.routes().ServeHTTP(start, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/"+livePlan.ID+"/start", nil))
+	if start.Code != http.StatusNoContent {
+		t.Fatalf("start live plan: %d body=%s", start.Code, start.Body.String())
+	}
+	job, err := server.nextOrchestrationJob(context.Background(), projectID)
+	if err != nil || job == nil || job.BatchID != livePlan.ID {
+		t.Fatalf("a gated plan must not block the queue behind it: job=%+v err=%v", job, err)
+	}
+	// 再把草稿也启动：队首回到位置更靠前的那条，说明顺序没有被闸门打乱。
+	startDraft := httptest.NewRecorder()
+	server.routes().ServeHTTP(startDraft, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/"+draftPlan.ID+"/start", nil))
+	if startDraft.Code != http.StatusNoContent {
+		t.Fatalf("start draft plan: %d body=%s", startDraft.Code, startDraft.Body.String())
+	}
+	job, err = server.nextOrchestrationJob(context.Background(), projectID)
+	if err != nil || job == nil || job.TaskID != draftA {
+		t.Fatalf("queue order must hold among started plans: job=%+v err=%v", job, err)
+	}
+}
+
+// 开始是幂等的，而且要能区分「计划不存在」和「本来就已开始」——不能把重复点击报成 404，
+// 那会让用户以为计划被删了。
+func TestStartOrchestrationBatchIsIdempotent(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	batch := createBatchForTest(t, server, projectID, "idempotent plan")
+	start := func(attempt int) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID+"/start", nil))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("start attempt %d: %d body=%s", attempt, response.Code, response.Body.String())
+		}
+	}
+	start(1)
+	var startedAt string
+	if err := server.db.QueryRow(`select coalesce(started_at,'') from orchestration_batches where id=?`, batch.ID).Scan(&startedAt); err != nil {
+		t.Fatalf("load started_at: %v", err)
+	}
+	if startedAt == "" {
+		t.Fatal("start must record a timestamp")
+	}
+
+	// 第二次点击不能把开始时间又刷一遍（那就成了"每次点都算重新开始"）。
+	//
+	// ⚠️ 断言方式：先往库里塞一个**哨兵值**，再点第二次，看它有没有被改写。
+	// 直接比较两次读到的真实时间是不行的 —— 两次点击落在同一秒时，"改写了"与"没改"长得一样
+	// （这条原来连比较都没有：两次点击都做完之后才读了一遍，等于没有任何断言，2026-09-29 复查）。
+	const sentinel = "2020-01-01 00:00:00"
+	if _, err := server.db.Exec(`update orchestration_batches set started_at=? where id=?`, sentinel, batch.ID); err != nil {
+		t.Fatal(err)
+	}
+	start(2)
+	var after string
+	if err := server.db.QueryRow(`select coalesce(started_at,'') from orchestration_batches where id=?`, batch.ID).Scan(&after); err != nil {
+		t.Fatalf("reload started_at: %v", err)
+	}
+	if after != sentinel {
+		t.Fatalf("重复点击改写了开始时间：哨兵 %q 变成了 %q", sentinel, after)
+	}
+	missing := httptest.NewRecorder()
+	server.routes().ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/missing/start", nil))
+	if missing.Code != http.StatusNotFound || !strings.Contains(missing.Body.String(), "编排任务不存在或已被删除") {
+		t.Fatalf("start unknown batch: %d body=%s", missing.Code, missing.Body.String())
+	}
+}
+
+// 未开始的计划不能直接删除，只要它还有子任务。这不是保守：删除会把子任务脱组（batch_id=”），
+// 而脱组的作业在闸门判定里等同于「单条入队」→ 会立刻开跑，正好是用户最不想要的。守卫是承重的。
+func TestDeleteUnstartedBatchStaysBlockedWhileItHasQueuedJobs(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "draft task")
+	batch := createBatchForTest(t, server, projectID, "draft plan", taskID)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID, nil))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "还有未结束的子任务") {
+		t.Fatalf("delete unstarted plan: %d body=%s", response.Code, response.Body.String())
+	}
+	var attached string
+	if err := server.db.QueryRow(`select batch_id from task_orchestration_jobs where task_id=?`, taskID).Scan(&attached); err != nil {
+		t.Fatalf("load job: %v", err)
+	}
+	if attached != batch.ID {
+		t.Fatalf("a refused delete must not detach the job: batch_id=%q", attached)
+	}
+}
+
+// 引入闸门时已经存在的计划必须视为已开始（否则升级后平台上所有排队/在跑的计划一起停住），
+// 而**之后**新建的计划不能被同一段回填补成已开始——回填只能发生在列新建那一次。
+func TestOrchestrationBatchStartMigrationBackfillsOnlyOnce(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := server.migrateOrchestration(ctx); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+	// 造一个「闸门之前就存在」的库：把列删掉，按老表结构插一条计划，再跑一次迁移。
+	if _, err := server.db.Exec(`alter table orchestration_batches drop column started_at`); err != nil {
+		t.Fatalf("drop column: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into orchestration_batches (id,project_id,name,conversation_strategy,created_at,updated_at) values ('legacy',?,'老计划','new',?,?)`, projectID, now, now); err != nil {
+		t.Fatalf("insert legacy batch: %v", err)
+	}
+	if err := server.migrateOrchestration(ctx); err != nil {
+		t.Fatalf("migrate with legacy row: %v", err)
+	}
+	var legacyStarted bool
+	if err := server.db.QueryRow(`select started_at is not null from orchestration_batches where id='legacy'`).Scan(&legacyStarted); err != nil {
+		t.Fatalf("load legacy plan: %v", err)
+	}
+	if !legacyStarted {
+		t.Fatal("a plan that predates the gate must be treated as started")
+	}
+	// 再建一个新计划，然后重复跑迁移：它必须仍然是「未开始」。
+	fresh := createBatchForTest(t, server, projectID, "fresh plan")
+	if err := server.migrateOrchestration(ctx); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	var freshStarted bool
+	if err := server.db.QueryRow(`select started_at is not null from orchestration_batches where id=?`, fresh.ID).Scan(&freshStarted); err != nil {
+		t.Fatalf("load fresh plan: %v", err)
+	}
+	if freshStarted {
+		t.Fatal("the backfill must only run when the column is first added, otherwise every restart starts unstarted plans")
+	}
+}
+
+func TestDeleteOrchestrationBatchRejectsUnknownBatch(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/"+projectID+"/orchestration/batches/missing", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("delete unknown batch: %d body=%s", response.Code, response.Body.String())
+	}
+	// 文案也要锁住：删掉 app.go 里那条映射后接口照样 404，只有断言正文才能发现译文退化。
+	if !strings.Contains(response.Body.String(), "编排任务不存在或已被删除") {
+		t.Fatalf("delete unknown batch body=%s", response.Body.String())
+	}
+}
+
+// createBatchForTest 走真实 HTTP 建计划并把任务追加进去，返回建好的计划。
+func createBatchForTest(t *testing.T, server *Server, projectID, name string, taskIDs ...string) OrchestrationBatch {
+	t.Helper()
+	create := httptest.NewRecorder()
+	server.routes().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"`+name+`","conversationStrategy":"continue"}`)))
+	if create.Code != http.StatusAccepted {
+		t.Fatalf("create batch %q: %d body=%s", name, create.Code, create.Body.String())
+	}
+	var batch OrchestrationBatch
+	if err := json.Unmarshal(create.Body.Bytes(), &batch); err != nil {
+		t.Fatalf("decode batch: %v", err)
+	}
+	if len(taskIDs) == 0 {
+		return batch
+	}
+	quoted := make([]string, 0, len(taskIDs))
+	for _, taskID := range taskIDs {
+		quoted = append(quoted, `"`+taskID+`"`)
+	}
+	add := httptest.NewRecorder()
+	server.routes().ServeHTTP(add, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches/"+batch.ID+"/tasks", bytes.NewBufferString(`{"taskIds":[`+strings.Join(quoted, ",")+`]}`)))
+	if add.Code != http.StatusNoContent {
+		t.Fatalf("add tasks to %q: %d body=%s", name, add.Code, add.Body.String())
+	}
+	return batch
 }
 
 func TestEnqueueBatchRejectsDuplicates(t *testing.T) {
@@ -8164,12 +8672,23 @@ func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {
 	if mixed != "请求参数无效，请检查后重试。：无法读取目录：permission denied" {
 		t.Fatalf("mixed error = %q", mixed)
 	}
-	if code := httpErrorCode(errors.New("cannot stop a run while this conversation has other queued or running runs")); code != "active_runs_present" {
+	// 判据是错误类型而不是文案：这条以前比的是英文整串，翻译那串文案时码会静默变空。
+	if code := httpErrorCode(errActiveRunsPresent); code != "active_runs_present" {
 		t.Fatalf("stop conflict code = %q", code)
+	}
+	// 文案本身也要能直接上屏（中文、含"停止"语义，不再需要翻译表条目）。
+	if text := errorText(errActiveRunsPresent); text != errActiveRunsPresent.Error() {
+		t.Fatalf("stop conflict text = %q", text)
 	}
 	workspaceOccupied := &projectWorkspaceOccupiedError{owner: "git:fetch"}
 	if code := httpErrorCode(workspaceOccupied); code != "workspace_occupied" {
 		t.Fatalf("workspace conflict code = %q", code)
+	}
+	// runner 离线这条：fs 与 remote-relay 早就在给这个码，git 那条路径漏了 ——
+	// 而手机端的码表里列着 `runner_offline` 并注释"两边都能命中"（清单里列着、
+	// 实际永不命中，正是那类静默失效）。判据是错误类型，不是文案。
+	if code := httpErrorCode(&runnerOfflineError{RunnerID: "ssh-1"}); code != "runner_offline" {
+		t.Fatalf("runner offline code = %q", code)
 	}
 	details := httpErrorDetails(workspaceOccupied)
 	if details["ownerKind"] != "git_operation" || details["ownerSummary"] != "Git 操作正在使用项目工作区" {
@@ -8254,6 +8773,85 @@ func TestLocalizedErrorSuppressesInternalUpdateWraps(t *testing.T) {
 	// 纯中文错误仍原样展示。
 	if direct := localizedErrorText(errors.New("更新服务超时，请稍后再试。"), "fallback"); direct != "更新服务超时，请稍后再试。" {
 		t.Fatalf("pure Chinese error not shown directly: %q", direct)
+	}
+}
+
+// TestNoChangesToCommitTellsUserWhatToLookAt 隔离工作树模式的实现守卫必须自己说话。
+//
+// 「implementation produced no changes to commit」是一条英文内部错误，任它落到通用
+// fallback 上，用户看到的是「任务执行失败，请查看任务日志后重试。：implementation
+// produced no changes to commit」——既没有日志可看，同一条任务重试也必然同样失败。
+// 所以这里同时钉两件事：给出可读原因，且不再出现"查看任务日志"这种误导。
+func TestNoChangesToCommitTellsUserWhatToLookAt(t *testing.T) {
+	// 原样报出。
+	plain := localizedErrorText(errors.New("implementation produced no changes to commit"), "任务执行失败，请查看任务日志后重试。")
+	if !strings.Contains(plain, "没有产生任何文件改动") || strings.Contains(plain, "查看任务日志") || strings.Contains(plain, "implementation produced") {
+		t.Fatalf("no-changes guard text = %q", plain)
+	}
+	// 被包装一层后仍要认得出来：精确匹配会在这里静默失效，退回原来那句误导文案。
+	wrapped := localizedErrorText(fmt.Errorf("commit orchestration worktree: %w", errors.New("implementation produced no changes to commit")), "任务执行失败，请查看任务日志后重试。")
+	if wrapped != plain {
+		t.Fatalf("wrapped no-changes guard text = %q, want %q", wrapped, plain)
+	}
+	// 编排收尾走的是 errorText（通用前缀），落库的 last_error 与界面展示都取它。
+	if stored := errorText(errors.New("implementation produced no changes to commit")); strings.Contains(stored, "implementation produced") {
+		t.Fatalf("errorText leaked the raw English error: %q", stored)
+	}
+}
+
+// TestTaskFailureFallbackPrefixIsShared 钉住"两处剥前缀"与 errorText 用的是同一份常量。
+//
+// orchestration.go 把 task_runs.failure_reason 提升成作业 last_error 时要剥掉这层前缀，
+// insights.go 让优化建议扫描的原因直接可见时也要剥。这两处原先各写了一份字面量：改 app.go
+// 那句文案时它们不会报错，只会**静默失配**，用户看到一句多余的"请查看任务日志后重试。"
+// 这条用例把前缀形状变成断言——只改文案而不同步常量，这里会红。
+func TestTaskFailureFallbackPrefixIsShared(t *testing.T) {
+	if taskFailureFallbackPrefix != taskFailureFallback+"：" {
+		t.Fatalf("prefix = %q, want %q：", taskFailureFallbackPrefix, taskFailureFallback)
+	}
+	// 未翻译的英文错误必须正好被这句前缀引出，两处的 TrimPrefix 才有东西可剥。
+	text := errorText(errors.New("some untranslated detail"))
+	if !strings.HasPrefix(text, taskFailureFallbackPrefix) {
+		t.Fatalf("errorText 未按 fallback 前缀引出：%q", text)
+	}
+	if stripped := strings.TrimPrefix(text, taskFailureFallbackPrefix); stripped != "some untranslated detail" {
+		t.Fatalf("剥前缀后 = %q", stripped)
+	}
+}
+
+// TestScheduledRunRetryReasonJudgesByTypeNotText 定时任务派发失败的分流判据是错误类型。
+//
+// 原先这里用 strings.Contains(err.Error(), "project workspace is occupied")。那条文案由
+// *projectWorkspaceOccupiedError 产出，是可以被翻译、被改措辞的——把它当判据，改文案的
+// 那一刻限流分支会静默失效、退化成"执行失败"，而没有任何测试会红（docs/41 §15.1 有一起
+// 同类事故）。所以用例里特意喂一条**文案相同但类型不同**的错误，断言它不算等待。
+func TestScheduledRunRetryReasonJudgesByTypeNotText(t *testing.T) {
+	occupied := &projectWorkspaceOccupiedError{owner: "conversation:1"}
+	for _, testCase := range []struct {
+		name string
+		err  error
+	}{
+		{"裸的占用错误", occupied},
+		{"被 %w 包装过的占用错误", fmt.Errorf("start message: %w", occupied)},
+	} {
+		reason := scheduledRunRetryReason(http.StatusConflict, testCase.err)
+		if reason == "" {
+			t.Fatalf("%s：工作区被占用的 409 必须走等待分支，而不是记为执行失败", testCase.name)
+		}
+		// 这个字段直接写进 failure_reason 并被定时任务页渲染，必须是中文。
+		if containsUntranslatedEnglish(reason) {
+			t.Fatalf("%s：等待原因必须是中文，得到 %q", testCase.name, reason)
+		}
+	}
+	if reason := scheduledRunRetryReason(http.StatusTooManyRequests, errors.New("quota")); reason == "" {
+		t.Fatal("凭据额度不足的 429 必须走等待分支")
+	}
+	// 判据不是文案：一句逐字相同的英文，只要不是那个类型，就仍是真失败。
+	if reason := scheduledRunRetryReason(http.StatusConflict, errors.New("project workspace is occupied by another run or Git operation")); reason != "" {
+		t.Fatalf("纯文案不构成等待理由，得到 %q", reason)
+	}
+	if reason := scheduledRunRetryReason(http.StatusInternalServerError, occupied); reason != "" {
+		t.Fatalf("非冲突状态码不构成等待理由，得到 %q", reason)
 	}
 }
 
@@ -11533,4 +12131,111 @@ func TestListProjectInputHistory(t *testing.T) {
 			t.Fatalf("history=%v want=%v", history, want)
 		}
 	}
+}
+
+// TestRealLeaksNeverShowTheMisleadingPrefix 是"英文文案"这个问题的**实测样本**回归哨兵。
+//
+// 下面这些不是构造出来的：它们来自一个真实用户库（117 次 TaskRun、11180 条消息）里
+// 全部落到 task_runs.failure_reason / task_orchestration_jobs.last_error 并显示在界面上的
+// 英文错误，逐条去重后就是这几条。比任何手写用例都更能说明"用户实际会看到什么"。
+//
+// 断言刻意只钉两件事，不钉具体措辞——文案改了不该让这条红，但下面这两种退化必须红：
+//  1. 又出现了"任务执行失败，请查看任务日志后重试。"这层前缀。它同时意味着两件坏事：
+//     用户被告知去查一份并不存在的日志，而且被建议重试一件重试必然同样失败的事。
+//  2. 句子开头还是英文——也就是本地化根本没生效。
+//
+// 说明：进程退出那几条后面跟着的 "exit status 1"/"Process exited…" 是 Go 的进程状态
+// 描述，按设计**保留原样**（它是用户拿去搜索的唯一线索），所以这里不要求"一个英文字母
+// 都不剩"，只要求中文在前、且没有那层误导前缀。
+func TestRealLeaksNeverShowTheMisleadingPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"Claude 进程异常退出", fmt.Errorf(claudeExitPrefix+"%w", errors.New("exit status 1"))},
+		{"Codex 进程异常退出", fmt.Errorf(codexExitPrefix+"%w", errors.New("exit status 1"))},
+		{"Claude 自报 API 错误", errors.New(mapClaudeAPIError("api_error"))},
+		{"远程 Claude 会话退出", fmt.Errorf("远程 Claude 会话运行失败：%w", errors.New("Process exited with status 137 from signal KILL"))},
+		// 一次性 SSH 运行那条路径（Run，不是 StartSession）。它原来报"远程 Claude 退出：…"，
+		// 前缀里没有"失败"两字 → 被套上误导前缀；2026-09-29 修的。这条哨兵当时只覆盖了
+		// StartSession，所以漏了它 —— 两条路径各要一条。
+		{"远程 Claude 一次性运行退出", fmt.Errorf("%s%s", sshClaudeExitPrefix, "exit 137")},
+		{"编排实现守卫", errors.New("implementation produced no changes to commit")},
+		{"Claude 会话未收尾就结束", fmt.Errorf(claudeExitPrefix+"%w", errors.New("Claude 会话在完成未结束的对话轮次之前就结束了"))},
+	}
+	for _, testCase := range cases {
+		text := errorText(testCase.err)
+		if text == "" {
+			t.Fatalf("%s：errorText 返回空，用户什么都看不到", testCase.name)
+		}
+		if strings.Contains(text, taskFailureFallbackPrefix) {
+			t.Fatalf("%s：又套上了那句误导前缀（没有日志可查、重试也必然同样失败）：%q", testCase.name, text)
+		}
+		if !containsChinese(text) {
+			t.Fatalf("%s：结果里没有中文，本地化没生效：%q", testCase.name, text)
+		}
+		// 句首允许出现产品名与技术术语（Claude、Codex、API…），但不允许出现一段英文
+		// 短语——那意味着用户第一眼看到的还是英文。
+		if head := englishPhraseBeforeChinese(text); head != "" {
+			t.Fatalf("%s：句子以英文短语开头（%q）：%q", testCase.name, head, text)
+		}
+	}
+}
+
+// 这几条链上**没有"任务日志"可查**：兜底句必须是它们各自的，不能落回 errorText 那句
+// （"任务执行失败，请查看任务日志后重试。" —— 终端页 / 冲突面板都没有任务日志）。
+//
+// 为什么用源码断言而不是端到端：终端启动失败要造一个 ready 超时的会话、冲突建议解析失败
+// 要伪造 AI 返回，都不宜在单测里稳定构造，而"选哪个兜底句"这个决定只发生在各自的调用点上。
+// 判据**与措辞解耦**：只要求那些调用点走 localizedErrorText（而不是 errorText）——
+// 改措辞不该让它红，接错兜底才该红。
+func TestSurfacesWithoutTaskLogsDoNotUseTheTaskFallback(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("读 %s: %v", name, err)
+		}
+		return string(data)
+	}
+	for _, testCase := range []struct {
+		file      string
+		forbidden []string
+	}{
+		{"terminal.go", []string{"errorText(readyErr)"}},
+		{"git_conflict_suggest.go", []string{"errorText(parseErr)", "errorText(runErr)"}},
+	} {
+		source := read(testCase.file)
+		if !strings.Contains(source, "localizedErrorText(") {
+			t.Errorf("%s 没有用 localizedErrorText —— 兜底句会落回面向任务页的那句", testCase.file)
+		}
+		for _, forbidden := range testCase.forbidden {
+			if strings.Contains(source, forbidden) {
+				t.Errorf("%s 里又出现了 %s（面向任务页的兜底，而这条链上没有任务日志）", testCase.file, forbidden)
+			}
+		}
+	}
+
+	// CodeBuddy 的退出前缀是三个同族前缀之一（claudeExitPrefix / sshClaudeExitPrefix），
+	// 必须含"失败"：后面跟的是 Go 的英文进程状态描述。
+	if !strings.Contains(codebuddyExitPrefix, "失败") {
+		t.Errorf("codebuddyExitPrefix 里没有「失败」：%q", codebuddyExitPrefix)
+	}
+	if got := errorText(errors.New(codebuddyExitPrefix + "exit status 1")); strings.Contains(got, taskFailureFallbackPrefix) {
+		t.Errorf("CodeBuddy 退出错误被套上了任务页兜底：%q", got)
+	}
+}
+
+// englishPhraseBeforeChinese 取第一个汉字之前的英文短语（剔除产品名、技术术语与标点）。
+// 返回空串表示"第一个汉字之前没有实质英文"。
+func englishPhraseBeforeChinese(text string) string {
+	index := strings.IndexFunc(text, func(r rune) bool { return r >= 0x4E00 && r <= 0x9FFF })
+	if index < 0 {
+		return strings.TrimSpace(text)
+	}
+	head := strings.TrimSpace(text[:index])
+	for _, term := range []string{"Claude", "Codex", "Agent", "API", "CLI", "Git", "SSH", "WSL", "AI", "HTTP", "JSON"} {
+		head = strings.ReplaceAll(head, term, "")
+	}
+	return strings.TrimSpace(strings.Trim(head, " \t:：,，.。、-—（）()[]"))
 }

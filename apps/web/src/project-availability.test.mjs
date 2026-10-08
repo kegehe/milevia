@@ -46,3 +46,19 @@ test("项目刷新走并发合并，WS 事件风暴不会占满浏览器连接�
   assert.match(projectStore, /const refreshProjects = useCoalescedRefresh\(async \(\) => \{/);
   assert.doesNotMatch(projectStore, /const refreshProjects = useCallback\(/);
 });
+
+test("状态标签计数与筛选结果同源（跑着任务但工具不可用的项目不再重复计数）", () => {
+  // 标签数曾用 agentReady 单独统计：正在执行、但 agentReady=false 的项目会同时落进
+  // 「不可用」，而列表按「进行中」归类，标签数字于是比实际条目多。
+  // 现在三态计数与 filter 共用同一个 projectState 判定。
+  assert.match(dashboardPage, /const projectState = \(project: Project\): ProjectState =>/);
+  assert.match(dashboardPage, /const countByState = \(state: ProjectState\) => projects\.filter\(\(project\) => projectState\(project\) === state\)\.length;/);
+  assert.match(dashboardPage, /const runningCount = countByState\("running"\);/);
+  assert.match(dashboardPage, /const readyCount = countByState\("ready"\);/);
+  assert.match(dashboardPage, /const offlineCount = countByState\("offline"\);/);
+  // 列表侧继续用同一判定，保证标签数 == 列表条目数。
+  assert.match(dashboardPage, /projectState\(project\) === filter/);
+  // 防止回退到独立统计口径。
+  assert.doesNotMatch(dashboardPage, /offlineCount = projects\.filter\(\(project\) => !project\.agentReady\)/);
+  assert.doesNotMatch(dashboardPage, /runningCount = Object\.values\(projectStatuses\)/);
+});

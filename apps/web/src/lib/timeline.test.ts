@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildTimeline } from "./timeline.ts";
+import { buildTimeline, eventDiagnostic } from "./timeline.ts";
 import type { Event, TimelineItem } from "./types.ts";
 
 const at = "2026-07-30T11:29:00.000Z";
@@ -75,6 +75,28 @@ test("appends original English turn failure details after the Chinese fallback",
   assert.deepEqual(fallback.filter((item) => item.kind === "error").map((item) => item.detail), ["任务执行失败，请查看任务日志后重试。：Codex exited: exit status 1"]);
 });
 
+test("keeps a Chinese-led runner failure verbatim instead of re-wrapping it", () => {
+  // 服务端已经把这类错误本地化过了（中文包装 + Go 的英文退出描述）。判据是“含失败就直通”，
+  // 与 app.go 的 localizedErrorText 逐条一致。少了这条，同一句错误在桌面端会多套一层
+  // “任务执行失败，请查看任务日志后重试。”，与手机端给出的形态不一致。
+  const timeline = buildTimeline([], [event("terminal", "run.failed", { error: "Codex 运行失败：exit status 1" })]);
+  const details = timeline.filter((item) => item.kind === "error").map((item) => item.detail);
+  assert.deepEqual(details, ["Codex 运行失败：exit status 1"]);
+});
+
+test("defers a bare Codex exit status in both wordings", () => {
+  // 这个判据原先没有任何用例守着。它必须同时认中文与英文两种措辞：英文那份是 events 表里
+  // 的历史事件（回放时原文不变），中文那份是新服务端产出的形态。
+  for (const wording of ["Codex exited: exit status 1", "Codex 运行失败：exit status 1"]) {
+    const diagnostic = eventDiagnostic(event("terminal", "run.failed", { error: wording }));
+    assert.ok(diagnostic, `没有解析出诊断：${wording}`);
+    assert.equal(diagnostic.deferFallback, true, `没有被判定为可延后：${wording}`);
+  }
+  // 带上可读原因就不再是“只有退出码”，不该被压着。
+  const detailed = eventDiagnostic(event("terminal", "run.failed", { error: "Codex 运行失败：exit status 1（CLI：rate limit）" }));
+  assert.equal(detailed?.deferFallback, false);
+});
+
 test("coalesces multiple CLI stderr events from one run into one diagnostic", () => {
   const timeline = buildTimeline([], [
     event("stderr-1", "stderr", { message: "> @milevia/web@0.0.1 build" }),
@@ -125,4 +147,26 @@ test("formats Codex file_change with readable Chinese labels", () => {
   assert.ok(action.input.description.includes("新增"), `description should contain 新增: ${action.input.description}`);
   assert.ok(action.input.description.includes("修改"), `description should contain 修改: ${action.input.description}`);
   assert.ok(action.output?.content.includes("新增"), `output should contain 新增: ${action.output?.content}`);
+});
+
+// 失败诊断的判据顺序必须与服务端一致：**先判内部错误，再判中文直通**。
+//
+// 两个判据都在 localizedErrorDetail 里，顺序决定一条"含中文 + 带 Go 栈帧痕迹"的错误
+// 会不会原样上屏。服务端 localizedErrorText 明确先判 isInternalError
+// （"Checked first so a wrapped '… 失败' message can never carry a stack trace to the UI"）；
+// 前端原来把中文分支排在前面，于是同一条错误在桌面端会把 `.go:` / `panic:` 带给用户，
+// 而服务端那边是兜底句 —— 两端形态不一致（2026-09-29 对齐）。
+test("含中文的 Go 内部错误也要被换成兜底句（判据顺序与服务端一致）", () => {
+  const diagnostic = eventDiagnostic(event("e1", "run.failed", {
+    error: "任务执行失败：panic: runtime error (cli/runner.go:42)",
+  }));
+  assert.ok(diagnostic, "这条事件应当解析出诊断");
+  assert.equal(
+    diagnostic.detail,
+    "任务执行失败，请查看任务日志后重试。",
+    "含中文的栈帧被原样上屏了 —— isInternalError 又被排到中文分支后面",
+  );
+  // 反面：普通的中文失败原因**不许**被换成兜底句（那正是"失败"分支存在的理由）。
+  const readable = eventDiagnostic(event("e2", "run.failed", { error: "Codex 运行失败：exit status 1" }));
+  assert.equal(readable?.detail, "Codex 运行失败：exit status 1");
 });

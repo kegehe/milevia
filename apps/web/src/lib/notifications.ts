@@ -88,8 +88,12 @@ export function toastVariantForType(type: string): "error" | "warning" | "succes
  * 把渲染交给宿主 `NotificationReceived`，而 wry 两者都没实现 —— 结果是权限恒为 denied，
  * 且这个 denied 会被持久化进应用自己的 EBWebView profile（用户在桌面端没有任何入口去改它）。
  * Tauri 官方的通知插件正是因为这条 API 在 webview 里不可用，注入脚本直接覆盖了
- * `window.Notification`。原生包（Capacitor）同理：Android WebView 不把 Web Notification
- * 接到系统通知栏，且清单里没声明 `POST_NOTIFICATIONS`。
+ * `window.Notification`。
+ *
+ * 原生包（Capacitor）同理不行：Android WebView 不把 Web Notification 接到系统通知栏。
+ * 注意这不代表"手机端没有系统通知"——原生包走的是另一条通道（`@capacitor/local-notifications`
+ * 的本地通知，判定与接线见 lib/mobile-notify.ts 与 MobileRemotePage）。本函数问的是
+ * "Web Notification 这条 API 能不能用"，在原生包里答案仍然是不能用。
  */
 export function webNotificationsSupported(env: {
   hasNotificationAPI: boolean;

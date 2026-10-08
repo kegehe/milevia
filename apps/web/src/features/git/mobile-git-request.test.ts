@@ -232,6 +232,24 @@ test("a stable error code wins over the message text", () => {
   assert.equal(classifyGitFailure("Git state changed; refresh the repository", "something_new"), "stale_state");
 });
 
+// Git 三态与运行器离线现在都有码了。这一条只喂**认不出来的文案** + 码：
+// 文案判据（FAILURE_MATCHERS）在这里完全帮不上忙，能判对就说明走的确实是码那条路。
+//
+// 为什么值得单独钉：这几个码是 2026-09 才补的，在此之前手机端只能靠英文子串
+// （"Git state changed" / "no longer available" / "no eligible Git changes"）——
+// 服务端一旦翻译或改措辞，分类就会静默失效，而没有任何测试会红。
+test("the new git failure codes classify without any matching text", () => {
+  const cases: Array<[string, string]> = [
+    ["git_state_changed", "stale_state"],
+    ["git_paths_gone", "changes_gone"],
+    ["git_no_changes", "nothing_to_do"],
+    ["runner_offline", "runner_offline"],
+  ];
+  for (const [code, kind] of cases) {
+    assert.equal(classifyGitFailure("这段文案不在任何 needle 表里", code), kind, code);
+  }
+});
+
 test("a business failure keeps the server sentence and its status", async () => {
   const { transport } = makeTransport(() => failure(409, "project workspace is occupied by another run or Git operation"));
   const adapter = createMobileGitRequest({ transport });

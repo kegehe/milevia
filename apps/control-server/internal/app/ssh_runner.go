@@ -1017,6 +1017,53 @@ rm -f %s
 ln -s %s %s`, shellQuote(packageRoot), shellQuote(active), shellQuote(previous), install.packageName, install.packageName, binary, binary, install.packageName, shellQuote(pathpkg.Join(prefix, "bin")), shellQuote(command), shellQuote(target), shellQuote(command))
 }
 
+// sshClaudeExitPrefix 是**一次性 SSH 运行**失败的前缀，是 claudeExitPrefix 的远程版本。
+//
+// 必须含"失败"：localizedErrorText 的直通判据是"含中文 且（含「失败」或没有残留英文）"，
+// 而这条消息后面必然跟着一段英文（退出描述或 stderr），少了这两个字就会被套上
+// "任务执行失败，请查看任务日志后重试。" —— 一句指不到原因、还让用户去翻并不存在的
+// "任务日志"的误导文案（2026-09-29 实测：原来的"远程 Claude 退出："正是如此，
+// 而同一次改动里 StartSession 那条已经改成了含"失败"的文案，一次性路径漏了）。
+const sshClaudeExitPrefix = "远程 Claude 运行失败："
+
+// sshExitSummary 把 SSH 的等待错误压成**有界**的短形态。
+//
+// 不能直接把 waitErr 交给 %w：ssh.ExitError 的文案是 Waitmsg.String()，里面除了
+// "Process exited with status 137 from signal KILL"（47 字节）还会拼上
+// ". Reason was: <远端给的字符串>" —— 那一段的长度**由远端 sshd 决定**，不受我们控制，
+// 它会把详情段的字节预算整个挤掉。这里自己拼一个短且稳定的形态：状态码与信号名，
+// 两者都还是远端给的，所以同样要限长。
+func sshExitSummary(err error) string {
+	var exitErr *ssh.ExitError
+	if errors.As(err, &exitErr) {
+		summary := fmt.Sprintf("exit %d", exitErr.ExitStatus())
+		if signal := strings.TrimSpace(exitErr.Signal()); signal != "" {
+			summary += "（" + truncateBytesHead(signal, 12) + "）"
+		}
+		return summary
+	}
+	return truncateBytesHead(err.Error(), 40)
+}
+
+// truncateBytesHead 按**字节**限长并保留开头（UTF-8 安全，不会切出半个字符）。
+//
+// 为什么不复用 truncateRunes：这里的预算是**字节**预算（insightRunErrorMessage 的 240
+// 是 len()），而 runes 与 bytes 在中文上差三倍 —— 第一版就是这么写的，被
+// TestSSHExitSummaryIsBounded 当场抓住（40 runes 的中文 = 120 字节）。
+func truncateBytesHead(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut]
+}
+
 func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
 	if request.AgentID == "codex" {
 		return r.runCodex(ctx, request, sink)
@@ -1105,11 +1152,17 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	}
 
 	done := make(chan error, 1)
+	// 与本地/WSL 的一次性运行一致：包一层 sink 记下 CLI 自报的失败原因，并缓存 stderr 尾部。
+	// SSH 这条路径原来只报"远程 Claude 退出：<status>"，API 级失败（上游 4xx/限流/超限）与
+	// 远端崩溃的真因分别在 stdout 的 result 事件和 stderr 里，取不到就永远是一句无信息量的
+	// 退出状态——而远程项目恰恰是最难就地排查的。
+	recorded := &claudeResultErrorSink{AgentRunSink: sink}
+	var stderrTail = &stderrCapture{}
 	go func() {
-		done <- readClaudeJSONLines(stdout, sink)
+		done <- readClaudeJSONLines(stdout, recorded)
 	}()
 	go func() {
-		readStderrLines(stderr, sink)
+		readStderrLines(stderr, recorded, stderrTail)
 	}()
 
 	select {
@@ -1127,10 +1180,31 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 			return err
 		}
 		if waitErr != nil {
-			return fmt.Errorf("远程 Claude 退出：%w", waitErr)
+			return sshClaudeRunFailureError(waitErr, recorded.failureResult(), stderrTail.tail())
 		}
 		return nil
 	}
+}
+
+// sshClaudeRunFailureError 组装"一次性 SSH 运行失败"的整条错误：
+// `前缀 + 有界摘要 + 按剩余预算收窄的详情段`。
+//
+// ⚠️ 整条组装**只在这里**，是为了让它可被直接测试：算式曾经只存在于调用点，
+// 而调用点要靠真实 SSH 失败才能驱动（`ssh.ExitError` 的字段私有、造不出来），
+// 于是测试只能**自己重算一遍算式**——把调用点改坏它照样绿（2026-09-29 复查用变异
+// 实测过：改成沿用本地的 180 后整条 257 字节、被 insightRunErrorMessage 截掉末尾，
+// 而那条测试仍然 PASS）。抽成函数之后，测试驱动的是真正发出去的那条串。
+func sshClaudeRunFailureError(waitErr error, failure json.RawMessage, stderrTail string) error {
+	summary := sshExitSummary(waitErr)
+	// 详情段的内容额度 = 240 - 前缀 - 摘要 - 括号。括号取较大的那个
+	// （claudeDetailWrapperBytes = "（stderr：…）" 的 15 字节）：这一段是走 CLI 分支
+	// 还是 stderr 分支由运行结果决定，事先不知道，按大的算才不会挤破外层截断。
+	// 必须按实际长度反推：SSH 这三段加起来比本地那套长，沿用本地的 180 会超出
+	// insightRunErrorMessage 的截断，而它保留开头、切掉末尾 —— 被切掉的恰好是
+	// 最想保住的报错原文。
+	detailBudget := insightRunMessageBytes - len(sshClaudeExitPrefix) - len(summary) - claudeDetailWrapperBytes
+	detail := claudeRunFailureDetailWithin(detailBudget, failure, stderrTail)
+	return fmt.Errorf("%s%s%s", sshClaudeExitPrefix, summary, detail)
 }
 
 // remoteCodexBaseURLProbe 读取远端 ~/.codex/config.toml 顶层的 openai_base_url，
@@ -1367,7 +1441,17 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 		// Read stdout in a loop, dispatching events to the current turn's sink.
 		err := sshSess.readOutputLoop()
 		if waitErr := session.Wait(); err == nil && waitErr != nil {
-			err = fmt.Errorf("远程 Claude 会话退出：%w", waitErr)
+			// 两件事一起管：
+			//  · "失败"两字是承重的：waitErr 是 Go 的进程状态描述（英文，如
+			//    "Process exited with status 137 from signal KILL"），句子里有残留英文
+			//    就过不了 localizedErrorText 的直通判据，用户会看到一句"请查看任务日志后重试。
+			//    ：远程 Claude 会话退出：Process exited…"——既指不到原因又建议重试。
+			//  · 走**有界摘要**（与一次性路径同一条理由）：Waitmsg.String() 除了进程状态
+			//    还会拼上远端 sshd 给的 ". Reason was: <任意文本>"，长度与内容都由远端决定。
+			//    这里不再包 %w：这条链上没有消费 *ssh.ExitError 身份的地方（断言它的两处
+			//    —— ssh_project_runner 与 terminal —— 断的都是它们自己 session.Wait() 的
+			//    返回值），而用户可见的那半句换成摘要后与一次性路径同形。
+			err = fmt.Errorf("远程 Claude 会话运行失败：%s", sshExitSummary(waitErr))
 		}
 		sshSess.finish(err)
 		close(sshSess.processDone)
@@ -1809,14 +1893,19 @@ func readClaudeJSONLines(reader io.Reader, sink AgentRunSink) error {
 	return nil
 }
 
-// readStderrLines reads lines from stderr and emits them as stream.error events.
-func readStderrLines(reader io.Reader, sink AgentRunSink) {
+// readStderrLines reads lines from stderr, emits them as stream.error events, and
+// accumulates a bounded tail into capture so a failed one-shot run can report why
+// (capture 为 nil 时只发事件，行为与改动前一致)。
+func readStderrLines(reader io.Reader, sink AgentRunSink, capture *stderrCapture) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		text := strings.TrimSpace(scanner.Text())
 		if text == "" {
 			continue
+		}
+		if capture != nil {
+			capture.append(text)
 		}
 		if sink != nil {
 			sink.Event("stderr", mustJSON(map[string]string{"message": redactAgentText(text)}))

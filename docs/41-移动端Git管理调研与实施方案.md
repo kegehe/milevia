@@ -719,8 +719,17 @@ MaxBytes 判据改成量 handler 响应体（而不是序列化后的帧）→ �
 2. **不做 `reset --hard` / `rebase` / `cherry-pick` / tag / 删除分支**（第 08 篇的边界，服务端本来就没有）。
 3. **不做 `stage` 的逐 hunk 暂存**（第 08 篇 §7.1 的边界）。
 4. **冲突解决的逐块选择**在手机上建议后置（阶段 C 先给整文件级操作）。
-5. **共享错误契约的两处英文**（`Git state changed; refresh the repository`、
-   `runner_offline`）不在本期单方面改 —— 要连桌面端一起评估。
+5. ~~**共享错误契约的两处英文**（`Git state changed; refresh the repository`、
+   `runner_offline`）不在本期单方面改 —— 要连桌面端一起评估。~~
+   **已于 2026-09-27 按"给码"解决**：评估的结论是这两句不必改文案，改的是判据 ——
+   `httpErrorCode` 现在为 Git 三态与运行器离线各给一个稳定码
+   （`git_state_changed` / `git_paths_gone` / `git_no_changes` / `runner_offline`），
+   手机端 `classifyGitFailure` 码优先、文案只作兜底。文案保持英文不动，因为旧客户端与
+   旧云端仍按它匹配；码是加法，不会让任何已有匹配失效。`runner_offline` 另外在三个
+   `writeJSON` 出口补了 `code` 字段。两个方向的钉子：
+   `TestGitFailureCodesSurviveTheRelay`（服务端：码经中继穿到底）与
+   `mobile-git-request.test.ts` 的"the new git failure codes classify without any matching text"
+   （客户端：文案认不出也要判对）。
 6. **不做 Git 状态的轮询**：沿用「进视图加载 + 手动刷新 + 写成功后重载」。
    二期若要做实时，复用既有事件通道发轻量事件（只带 `head.oid` 与 revision），
    与第 40 篇 §7.6 的 `fs.changed` 是同一件事，**应该一起做一次**。

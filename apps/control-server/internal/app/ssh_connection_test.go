@@ -59,7 +59,12 @@ func TestSSHOutputRedactsCredentialsBeforeEmitting(t *testing.T) {
 	if err := readClaudeJSONLines(strings.NewReader(`{"type":"assistant","api_key":"`+secret+`","message":{"content":[{"type":"text","text":"Authorization: Bearer `+secret+`"}]}}`+"\n"), sink); err != nil {
 		t.Fatalf("read Claude JSONL: %v", err)
 	}
-	readStderrLines(strings.NewReader("ANTHROPIC_API_KEY="+secret+"\n"), sink)
+	// capture 与事件两条路都不许泄漏凭据：前者会进错误信息，后者会进事件流。
+	capture := &stderrCapture{}
+	readStderrLines(strings.NewReader("ANTHROPIC_API_KEY="+secret+"\n"), sink, capture)
+	if tail := claudeStderrDetail(capture.tail()); strings.Contains(tail, secret) {
+		t.Fatalf("credential leaked in stderr detail: %s", tail)
+	}
 	for _, payload := range sink.events {
 		if strings.Contains(string(payload), secret) {
 			t.Fatalf("credential leaked in event: %s", payload)

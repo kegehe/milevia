@@ -38,11 +38,13 @@ type Task struct {
 	LastRun                   *TaskRun         `json:"lastRun,omitempty"`
 	OrchestrationStatus       string           `json:"orchestrationStatus,omitempty"`
 	OrchestrationTargetBranch string           `json:"orchestrationTargetBranch,omitempty"`
-	OrchestrationUpdatedAt    *time.Time       `json:"orchestrationUpdatedAt,omitempty"`
-	CreatedAt                 time.Time        `json:"createdAt"`
-	UpdatedAt                 time.Time        `json:"updatedAt"`
-	CompletedAt               *time.Time       `json:"completedAt,omitempty"`
-	CancelledAt               *time.Time       `json:"cancelledAt,omitempty"`
+	// OrchestrationPending 表示该任务所属的编排任务还没点「开始执行」，所以在队列里等着。
+	OrchestrationPending   bool       `json:"orchestrationPending,omitempty"`
+	OrchestrationUpdatedAt *time.Time `json:"orchestrationUpdatedAt,omitempty"`
+	CreatedAt              time.Time  `json:"createdAt"`
+	UpdatedAt              time.Time  `json:"updatedAt"`
+	CompletedAt            *time.Time `json:"completedAt,omitempty"`
+	CancelledAt            *time.Time `json:"cancelledAt,omitempty"`
 }
 
 type TaskDependency struct {
@@ -1070,7 +1072,14 @@ func (s *Server) hydrateTask(ctx context.Context, task *Task) error {
 	}
 	var orchestrationUpdatedAt time.Time
 	var policySnapshot string
-	err = s.db.QueryRowContext(ctx, `select status,updated_at,policy_snapshot from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev') order by updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt, &policySnapshot)
+	// OrchestrationPending 单独一个字段、不改 OrchestrationStatus 的取值：闸门未开的子任务
+	// 仍然是 queued（队列里的位置、能否重下发这些判断都依赖这个值），只是"还没被计划放行"，
+	// 任务看板需要把这层区别说出来。
+	// 两个终态刻意不在这个列表里：released_to_main（已合并）与 applied_to_branch（直接模式
+	// 已把改动写进工作目录、编排已结束）。前端 canRedispatch 只看本字段是否非空，把它加进来
+	// 会让「重新下发」按钮消失，而后端 orchestrationOwnsTask 同样排除这两个终态、是允许重下发的
+	// ——多一个少一个都会造成前后端不一致。已结束的编排任务在任务页看起来就是普通「待验收」。
+	err = s.db.QueryRowContext(ctx, `select job.status,job.updated_at,job.policy_snapshot,(job.status='queued' and job.batch_id<>'' and exists (select 1 from orchestration_batches batch where batch.id=job.batch_id and batch.started_at is null)) from task_orchestration_jobs job where job.task_id=? and job.status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev') order by job.updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt, &policySnapshot, &task.OrchestrationPending)
 	if err == nil {
 		task.OrchestrationUpdatedAt = &orchestrationUpdatedAt
 		task.OrchestrationTargetBranch = orchestrationTargetBranch(task.ProjectID, policySnapshot)
@@ -1282,7 +1291,7 @@ func (s *Server) dispatchTaskByID(ctx context.Context, taskID string) (taskDispa
 }
 
 func (s *Server) dispatchTaskByIDForConversation(ctx context.Context, taskID, conversationID string) (taskDispatchResult, int, error) {
-	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, "", "", "", conversationID)
+	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, "", "", "", conversationID, "")
 }
 
 func (s *Server) dispatchTaskByIDInWorkspace(ctx context.Context, taskID, worktreePath string) (taskDispatchResult, int, error) {
@@ -1294,10 +1303,10 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithContext(ctx context.Context, tas
 }
 
 func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntent(ctx context.Context, taskID, worktreePath, repairContext, executionIntentID string) (taskDispatchResult, int, error) {
-	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, worktreePath, repairContext, executionIntentID, "")
+	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, worktreePath, repairContext, executionIntentID, "", "")
 }
 
-func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx context.Context, taskID, worktreePath, repairContext, executionIntentID, expectedConversationID string) (taskDispatchResult, int, error) {
+func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx context.Context, taskID, worktreePath, repairContext, executionIntentID, expectedConversationID, workspaceInstruction string) (taskDispatchResult, int, error) {
 	task, err := s.taskByID(ctx, taskID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return taskDispatchResult{}, http.StatusNotFound, errors.New("task not found")
@@ -1331,6 +1340,12 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(c
 	}
 	now := time.Now().UTC()
 	prompt := taskPrompt(task)
+	// workspaceInstruction 是执行方式自带的硬约束说明（当前只有编排的"直接在已有分支上跑"
+	// 会传）：它讲的是"这次在哪干活、不要做什么"，与 repairContext 的"上一轮哪里错了"
+	// 不是一回事，所以单独一段、独立于修复提示词。
+	if strings.TrimSpace(workspaceInstruction) != "" {
+		prompt += "\n\n" + strings.TrimSpace(workspaceInstruction)
+	}
 	if strings.TrimSpace(repairContext) != "" {
 		prompt += "\n\n上轮检查或审查发现的问题：\n" + strings.TrimSpace(repairContext) + "\n\n请只修复这些问题，并重新运行相关检查。"
 	}
@@ -1644,8 +1659,10 @@ func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun
 	dependencyQuery := `select count(*) from task_dependencies dependency join tasks predecessor on predecessor.id=dependency.predecessor_task_id where dependency.task_id=? and predecessor.status<>?`
 	dependencyArgs := []any{taskRun.TaskID, taskDone}
 	if orchestrated {
+		// 与 orchestrationDependenciesIntegrated 共用同一份终态集合，见该常量的注释：
+		// 只改一处会让编排放行而这里拒绝，用户拿到一句看不出根因的冲突。
 		dependencyQuery = `select count(*) from task_dependencies dependency
-			left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status='released_to_main'
+			left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status in (` + orchestrationIntegratedStatuses + `)
 			where dependency.task_id=? and predecessor.id is null`
 		dependencyArgs = []any{taskRun.TaskID}
 	}

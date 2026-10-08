@@ -9,13 +9,18 @@ import { DEVICE_ALIAS_MAX_LENGTH, addOrReplaceDevice, activeDevice, deviceDispla
 import { MOBILE_PROJECT_ORDER_STORAGE_KEY, dismissMobileDragHint, persistOrder, readMobileDragHint, sortProjectIds } from "../lib/project-order";
 import { useCardDragReorder } from "../lib/use-card-drag";
 import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval } from "../lib/timeline";
-import type { SystemVariant } from "../lib/types";
+import type { SystemVariant, PermissionMode } from "../lib/types";
+import { AgentLogo } from "../components/AgentLogo";
+import { ExternalLink } from "../components/ExternalLink";
+import type { AgentLogoKey } from "../lib/cli-tools-view";
+import { permissionCopy } from "../lib/agent-registry";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
 import { priorityLabels, statusLabels, type Priority } from "../features/tasks/task-model";
 // 电脑端那一屏的纯逻辑（五个服务档位 / 心跳措辞 / 实例 ID 缩写 / 刷新的结果文案）。
 // 抽成模块的理由见文件头：那是一条**优先级级联**，扫源码正则验不出"哪一档赢"
 // （2026-09-17 变异检验实测漏网），必须用行为断言守。
 import { desktopServiceView, heartbeatAgoText, refreshDesktopStatusMessage, shortInstanceID } from "../features/remote/desktop-service";
+import { cloudClientWaitMs } from "../features/remote/cloud-budget";
 // 「已绑定手机」那一段的纯逻辑（绑定项归一化 / 最近同步的四档 / 平台文案）。
 // 和上面同一个理由：`lastUsedAt` 的 undefined 与 null 必须走不同分支，合并成一个
 // 就跟「还没回来」写成「没有数据」是同一个错，而那种错源码级断言看不出来。
@@ -41,9 +46,20 @@ import { Capacitor } from "@capacitor/core";
 import { App as CapacitorApp } from "@capacitor/app";
 import type { PluginListenerHandle } from "@capacitor/core";
 import { BarcodeFormat, BarcodeScanner, LensFacing } from "@capacitor-mlkit/barcode-scanning";
+import { LocalNotifications } from "@capacitor/local-notifications";
 import { invoke } from "@tauri-apps/api/core";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
-import { checkMobileUpdate, type MobileUpdateState } from "../features/updater/mobile-update";
+import {
+  MOBILE_NOTIFICATION_CHANNEL,
+  mobileNotificationContent,
+  notificationBackend,
+  notificationIDFromEventID,
+  pickNotificationProject,
+  shouldNotifyWhileAway,
+  toNotificationPermission,
+} from "../lib/mobile-notify";
+import { checkMobileUpdate, readMobileAppInfo, type MobileUpdateState } from "../features/updater/mobile-update";
+import { formatAppVersion } from "../features/updater/android-release";
 // markdown 渲染的样式依赖必须由本页面自己声明：真机上 main.tsx 全局引入过它，
 // 所以"少这一行"在真机看不出来 —— 但任何绕过 main.tsx 的入口（预览夹具、单页测试）
 // 都会渲染出裸的 pre / blockquote / 复制按钮。页面自包含更稳。
@@ -232,8 +248,34 @@ function conversationStatusLabel(status: string): string {
 // 那是比现在更差的退化。正确修法是把工具目录放进手机快照（或让云端转发该端点），
 // 那是一条 REMOTE-CONTRACT 变更，单独排期。
 function conversationAgentLabel(agentId: string): string {
-  return agentId === "codex" ? "Codex" : "Claude Code";
+  return MOBILE_AGENTS.find((agent) => agent.id === agentId)?.name ?? agentId;
 }
+
+// 手机端可新建的工具清单。**维护规则**：这里必须与电脑端目录
+// （`apps/control-server/internal/app/agent_catalog.go` 的 agentCatalogEntries）保持一致 ——
+// 名称、厂商、权限面取自目录；目录加了新工具而这里没跟，手机端就少一个可选项。
+// 权限面与默认权限同样来自目录（PermissionModes / DefaultPermissionMode）；
+// 手机端没有设置页偏好的通道，默认权限一律用目录声明值。
+type MobileAgentID = "claude-code" | "codex" | "codebuddy";
+type MobileAgent = {
+  id: MobileAgentID;
+  name: string;
+  vendor: string;
+  logo: AgentLogoKey;
+  /** 目录声明的权限面（PermissionModes）。 */
+  permissionModes: PermissionMode[];
+  /** 目录声明的默认权限（DefaultPermissionMode）。 */
+  defaultPermission: PermissionMode;
+};
+const MOBILE_AGENTS: MobileAgent[] = [
+  { id: "claude-code", name: "Claude Code", vendor: "Anthropic", logo: "claude",
+    permissionModes: ["approval_required", "full_control"], defaultPermission: "approval_required" },
+  { id: "codex", name: "Codex", vendor: "OpenAI", logo: "openai",
+    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+  { id: "codebuddy", name: "CodeBuddy Code", vendor: "腾讯云", logo: "codebuddy",
+    // vendor 有意译成中文（目录原文是 "Tencent Cloud"）—— 界面语言是中文。
+    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+];
 
 // 状态卡图标沿用桌面时间线那一套字形，两端看到的是同一个符号。
 const noticeIcons: Record<RemoteNotice["variant"], string> = { compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", task: "▸", error: "!" };
@@ -602,7 +644,14 @@ const configuredCloudURL = (import.meta.env.VITE_CLOUD_URL as string | undefined
 const cloudURL = Capacitor.isNativePlatform()
   ? configuredCloudURL || "https://keyanjia.info:8443"
   : import.meta.env.DEV ? "" : configuredCloudURL;
-const cloudRequestTimeoutMs = 15_000;
+/**
+ * 手机端自己的等待上限 —— 判据与两个数都挪到了 `features/remote/cloud-budget.ts`。
+ *
+ * 为什么不留在这里：它必须**大于**它请云端等的那个数（否则手机先报"超时"、云端还在等
+ * 一个早就丢掉的响应），而这条不变量原先被这里的 15 秒常量破坏了 —— 云端默认就等 20 秒
+ * （`apps/cloud-control/internal/cloud/rpc.go` 的 `rpcDefaultTimeout`）。埋在页面里的
+ * 常量没法单测，所以抽成纯函数，由 `cloud-budget.test.ts` 直接跑。
+ */
 
 type BarcodeDetectorResult = { rawValue?: string };
 type BarcodeDetectorLike = new (options?: { formats?: string[] }) => { detect(source: HTMLVideoElement): Promise<BarcodeDetectorResult[]> };
@@ -747,6 +796,24 @@ function instanceStatusLabel(status: string): string {
  * 判据在 `lib/project-path.ts`，那边有独立用例。**误判比漏判糟得多**：漏了用户还能自己找，
  * 误了就多一个点下去报错的按钮。
  */
+/**
+ * 手机页正文里的外链，**分平台**。
+ *
+ * 为什么不能统一用 `ExternalLink`：这一页在桌面壳里也会被渲染（首页「远程控制」→ `/mobile`），
+ * 那时裸 `target="_blank"` 会被两个窗口的 `NewWindowResponse::Deny` 吃掉（点了没反应）；
+ * 但手机上反过来 —— Capacitor 8 既没开 `setSupportMultipleWindows` 也没实现 `onCreateWindow`，
+ * 所以 `window.open` 是**空操作**，外链正是靠裸锚点被 WebView 当成同窗导航、再经
+ * `shouldOverrideUrlLoading → Bridge.launchIntent`（`Intent.ACTION_VIEW`）进系统浏览器的。
+ * 那边一旦改成走 openExternal，手机上的链接就会全部失效。
+ *
+ * 分平台判据用 `isDesktop()`：它内建 Capacitor 判据（原生包一律 false），所以手机这条路
+ * 不可能被这段改到。Web 浏览器版（手机浏览器打开 `/mobile`）同样走裸锚点，也是对的。
+ */
+function MobileMarkdownLink({ href, children }: { href?: string; children: ReactNode }) {
+  if (isDesktop()) return <ExternalLink href={href} target="_blank" rel="noreferrer">{children}</ExternalLink>;
+  return <a href={href} target="_blank" rel="noreferrer">{children}</a>;
+}
+
 function MobileInlineCode({ className, children, onOpenFile }: { className?: string; children?: ReactNode; onOpenFile: (path: string) => void }) {
   const text = typeof children === "string" ? children : "";
   const isBlock = typeof className === "string" && className.includes("language-");
@@ -771,12 +838,16 @@ function localizeCloudError(raw: string, status: number): string {
   if (text.includes("idempotency key conflicts")) return "该操作与之前的请求冲突，请稍后重试";
   if (text.includes("unsupported command type")) return "当前版本不支持该操作";
   if (text.includes("payload must be valid json")) return "操作内容格式不正确或超过大小限制";
-  return raw || `请求失败 (${status})`;
+  // 认不出的原因以前是整条原样返回——用户看到的就是一句纯英文。
+  // 至少给它一个中文外壳：原文保留在后面，既是排障线索，也还能拿去搜。
+  return raw ? `云端服务异常：${raw}` : `请求失败 (${status})`;
 }
 
 // deviceToken 用来代表"某一台**非当前**的电脑"发请求（切换面板里的在线状态就是逐台探测
 // 出来的）。不传就是当前设备 —— 13 处业务调用都属于后者，不需要知道多设备的存在。
-async function cloud<T>(path: string, init?: RequestInit, deviceToken?: string): Promise<T> {
+// waitMs 是本方**请云端等**的那个数（RPC 通道的 timeoutMs）；它同时决定本方等多久，
+// 理由见 cloudBudgetMs。
+async function cloud<T>(path: string, init?: RequestInit, deviceToken?: string, waitMs?: number): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
   // 这次请求代表"当前选中的那台电脑"。手机端要连多台，全靠这里只读一个设备表 ——
@@ -784,7 +855,7 @@ async function cloud<T>(path: string, init?: RequestInit, deviceToken?: string):
   const token = deviceToken ?? readActiveToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const controller = new AbortController();
-  const timeout = globalThis.setTimeout(() => controller.abort(), cloudRequestTimeoutMs);
+  const timeout = globalThis.setTimeout(() => controller.abort(), cloudClientWaitMs(waitMs));
   const abort = () => controller.abort();
   if (init?.signal?.aborted) controller.abort();
   else init?.signal?.addEventListener("abort", abort, { once: true });
@@ -815,7 +886,11 @@ async function cloud<T>(path: string, init?: RequestInit, deviceToken?: string):
     return body as T;
   } catch (cause) {
     if (controller.signal.aborted && !init?.signal?.aborted) {
-      throw new Error("云端请求超时，请检查手机网络后重试");
+      // 长操作这一档不能说"失败"：电脑侧多半还在跑（这条通道本来就是"提议等待"的，
+      // 等满了只说明这次没等到答复，不说明那件事没做成）。
+      throw new Error(waitMs && waitMs > 0
+        ? "这次操作等太久仍未回话。电脑侧可能仍在继续执行 —— 稍后刷新即可看到结果，不要重复提交。"
+        : "云端请求超时，请检查手机网络后重试");
     }
     throw cause;
   } finally {
@@ -923,6 +998,10 @@ export default function MobileRemotePage() {
   const [token, setToken] = useState(() => readActiveToken());
   const [mobileUpdate, setMobileUpdate] = useState<MobileUpdateState | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  // 当前安装的包版本文案（`v0.1.8 (6)`）。移动端此前一处都不显示版本 —— 桌面端有
+  // Dashboard 角落的 AppVersionTag，而它带 isDesktop() 守卫，移动端整页只挂这一个组件，
+  // 于是"我装的是哪一版"没有来源。读不到时为 null，那一行整个不渲染（不摆空占位）。
+  const [appVersionLabel, setAppVersionLabel] = useState<string | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
   const [instanceID, setInstanceID] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -931,7 +1010,9 @@ export default function MobileRemotePage() {
   // 会话历史改成按钮 + 弹窗（原来是下拉框：长标题会把选项撑得非常高）。
   const [conversationHistoryOpen, setConversationHistoryOpen] = useState(false);
   const [newConversationProject, setNewConversationProject] = useState<Project | null>(null);
-  const [newConversationAgent, setNewConversationAgent] = useState<"claude-code" | "codex">("claude-code");
+  const [newConversationAgent, setNewConversationAgent] = useState<MobileAgentID>("claude-code");
+  // 执行权限随所选工具重置（切工具的副作用写在 selectMobileAgent 里，不用 effect 猜意图）。
+  const [newConversationPermission, setNewConversationPermission] = useState<PermissionMode>(MOBILE_AGENTS[0].defaultPermission);
   const [mobileView, setMobileView] = useState<"projects" | "conversation">("projects");
   // 手机上的"侧滑返回"（Chrome/WebView 的返回手势、iOS 边缘手势）本质是**历史后退**。
   // 只在 React state 里切视图时历史里没有这一层，手势就什么也不做——所以进项目要真的压一层历史。
@@ -959,8 +1040,8 @@ export default function MobileRemotePage() {
   // 必须先问一声 —— 复用面板与桌面端同一条确认流程，不另造一个提示。
   const filesGuardRef = useRef<NavigationGuard | null>(null);
   const [tasksOpen, setTasksOpen] = useState(false);
-  // 会话视图的顶栏只有「返回 + 会话名 + ⋯」这一行：刷新、历史会话、新会话、任务队列都收进 ⋯ 菜单。
-  // 原来它们各占一行（标题条 + 一行三个按钮），实测吃掉 199px —— 接近 390×800 屏幕的四分之一。
+  // 会话视图的顶栏：返回 + 会话名 + 刷新 + ⋯。刷新直接露在顶栏上（一键同步，不再藏进菜单），
+  // 历史会话、新会话、任务队列收进 ⋯ 菜单。原来各占一行吃掉 199px——接近 390×800 屏幕的四分之一。
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   // 任务队列是个整页模态层：打开时焦点要搬进面板、关闭时还给触发它的那颗按钮（见下面的焦点 effect）。
   const taskPanelRef = useRef<HTMLElement | null>(null);
@@ -1061,16 +1142,28 @@ export default function MobileRemotePage() {
   const refreshingRef = useRef(false);
   const [processingConversations, setProcessingConversations] = useState<ProcessingConversations>({});
   const [error, setError] = useState("");
-  // 通知权限的初值。
-  // ⚠️ 原生包里**没有通知通道**：`capacitor.plugins.json` 只注册了扫码与 App 两个插件，
-  //    `AndroidManifest.xml` 也没声明 `POST_NOTIFICATIONS`，而 Android WebView 不会把
-  //    Web Notification 接到系统通知栏 —— 所以这里在原生平台直接判 `unsupported`，
-  //    把那颗"点了永远拿不到权限"的「开启通知」收起来，而不是在顶栏留一颗哑按钮
-  //    （2026-09-20 可用性排查的结论）。
-  //    手机浏览器里 Web Notification 是真能用的，所以只在原生平台短路。
-  //    将来给原生包接上本地通知（`@capacitor/local-notifications` + manifest 权限声明）之后，
-  //    把 `Capacitor.isNativePlatform()` 这一项去掉就能恢复入口。
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(() => Capacitor.isNativePlatform() || typeof Notification === "undefined" ? "unsupported" : Notification.permission);
+  // 通知权限的初值。两条通道，判定与理由见 lib/mobile-notify.ts 顶部：
+  //   · 原生包（Capacitor）：@capacitor/local-notifications 的**本地通知** —— App 自己把
+  //     已经拿到的事件丢进系统通知栏，不经过任何服务器。权限只能**异步**读
+  //     （checkPermissions 返回 Promise），所以初值先给 "default"：既让那两颗「开启通知」
+  //     入口立刻渲染，也不会在读数回来前把它误显示成"已被拒绝"。真值由下面的接线 effect 收敛。
+  //   · 手机浏览器：Web Notification，权限是同步读的。
+  // 这里曾经在原生平台直接判 `unsupported`——当时确实没有通知通道（2026-09-20 的结论）。
+  // 接上插件后那个短路已无依据：插件的权限态经 toNotificationPermission 映射回同一套
+  // `NotificationPermission` 口径，两处入口的 `=== "default"` 判定因此一个字都不用改。
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(
+    () => {
+      const backend = notificationBackend({ isNativePlatform: Capacitor.isNativePlatform(), hasNotificationAPI: typeof Notification !== "undefined" });
+      if (backend === "native") return "default";
+      return backend === "web" ? Notification.permission : "unsupported";
+    },
+  );
+  // 已授权的镜像。notifyHiddenMobileEvent 是 [] 依赖的 useCallback，读 state 会拿到旧值，
+  // 而"此刻能不能发通知"必须读当前值 —— 所以用 ref，由接线 effect 与 enableMobileNotifications 维护。
+  const notificationGrantedRef = useRef(false);
+  // 原生侧的"用户切走了"信号，来自 Capacitor 的 appStateChange（见下面的接线 effect）。
+  // 同样必须是 ref：回调只注册一次，读 state 会永远停在注册那一刻。
+  const nativeInBackgroundRef = useRef(false);
   const [pairingCode, setPairingCode] = useState(() => new URLSearchParams(location.search).get("code") || "");
   const [manualPairingCode, setManualPairingCode] = useState("");
   const [pairingID, setPairingID] = useState(() => new URLSearchParams(location.search).get("pairingId") || new URLSearchParams(location.search).get("pairing_id") || "");
@@ -1215,6 +1308,14 @@ export default function MobileRemotePage() {
   const emptyThreadRef = useRef(false);
   // 安卓物理返回键的当前处理逻辑。放在 ref 里，监听只注册一次也能拿到最新状态。
   const backHandlerRef = useRef<() => boolean>(() => false);
+  // 点了系统通知之后要跳去哪个会话。同样放 ref：插件的监听只注册一次，
+  // 而跳转要用到 snapshot / 各个 setter 的最新值（理由同 backHandlerRef）。
+  const notificationTapRef = useRef<(extra: { projectId?: string; conversationId?: string; taskId?: string }) => void>(() => undefined);
+  // 点通知时快照里还没有那个项目（冷启动、或刚切电脑）就先挂在这里，等快照到了再认领。
+  const pendingNotificationTargetRef = useRef<{ projectId: string; conversationId: string; taskId: string } | null>(null);
+  // 通知渠道的创建是异步的，而"首条通知到达"可能早于它完成 —— channelId 指向尚未创建的
+  // 渠道时通知**不会发出**（不是退回默认渠道），这是个静默失败，所以发之前要等这一条。
+  const notificationChannelRef = useRef<Promise<unknown> | null>(null);
 
   // 桌面端探测电脑端 Agent 是否已注册到云端。未注册时配对无法进行，页面应引导
   // 用户做一次注册，而不是让用户反复点击注定返回 503 的"生成二维码"。
@@ -1876,17 +1977,59 @@ export default function MobileRemotePage() {
   }, []);
 
   const notifyHiddenMobileEvent = useCallback((raw: MessageEvent) => {
-    if (!document.hidden || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const isNative = Capacitor.isNativePlatform();
+    // 用户不在看时才提醒。原生侧多一条 appStateChange 信号（两条取或，理由见 mobile-notify.ts）。
+    if (!shouldNotifyWhileAway({ isNative, nativeInBackground: nativeInBackgroundRef.current, documentHidden: document.hidden })) return;
+    // 浏览器的授权状态是同步可读的，照旧实时判；原生侧的授权在"开启通知"那一刻已经过插件，
+    // 这里读 ref 镜像（schedule 自 8.3.0 起会自己补请求权限，那会在用户没预期的时刻弹系统框，
+    // 所以宁可先判）。
+    if (!isNative && (typeof Notification === "undefined" || Notification.permission !== "granted")) return;
+    if (isNative && !notificationGrantedRef.current) return;
     try {
-      const event = JSON.parse(String(raw.data)) as { eventId?: string; type?: string; payload?: unknown };
-      if (!event.eventId || notifiedEventIDs.current.has(event.eventId)) return;
-      // Conversation messages are already visible when the user returns. Task
-      // and run state changes are the events that need an interruption notice.
-      if (!event.type || !/^(task\.|run\.|approval\.)/.test(event.type)) return;
-      notifiedEventIDs.current.add(event.eventId);
-      const payload = event.payload && typeof event.payload === "object" ? event.payload as { summary?: unknown; status?: unknown } : {};
-      const detail = typeof payload.summary === "string" ? payload.summary : typeof payload.status === "string" ? `状态：${payload.status}` : event.type;
-      new Notification("Milevia", { body: detail, tag: event.eventId });
+      const event = JSON.parse(String(raw.data)) as { eventId?: string; type?: string; taskId?: string; payload?: unknown };
+      // 提成局部常量：下面的 schedule 走的是 then 回调，TS 不会把外面的收窄带进闭包。
+      const eventID = event.eventId;
+      if (!eventID || notifiedEventIDs.current.has(eventID)) return;
+      // 会话消息回到 App 就能看到，不值得打断；要提醒的是任务/运行的状态变化与等待审批。
+      // 判据与文案取法都收在 mobile-notify.ts 里（纯函数，可单测）。
+      const content = mobileNotificationContent(event);
+      if (!content) return;
+      notifiedEventIDs.current.add(eventID);
+      if (isNative) {
+        // 本地通知：纯本地 API 调用，不经过任何服务器，也不依赖 FCM/厂商推送通道。
+        // 前提只有一个 —— App 进程还活着（切后台后能撑多久由系统决定，见 docs/33 的审计）。
+        // 先等渠道建好：channelId 指向尚未创建的渠道时通知会**静默不发**。
+        void (notificationChannelRef.current ?? Promise.resolve())
+          .then(() => LocalNotifications.schedule({
+            notifications: [{
+              // 插件的 id 必须是 32 位整数，事件 id 是字符串，取稳定哈希。
+              // 稳定才意味着同一条事件的重复投递会覆盖同一条通知，而不是在通知栏里堆一串。
+              id: notificationIDFromEventID(eventID),
+              title: content.title,
+              body: content.body,
+              channelId: MOBILE_NOTIFICATION_CHANNEL.id,
+              // 点通知要跳回对应会话，目标只能靠 extra 带过去（通知本身会跨进程存活）。
+              // taskId 是 task.* 事件的唯一线索 —— 那类 payload 里没有项目/会话字段。
+              extra: { projectId: content.projectId, conversationId: content.conversationId, taskId: content.taskId },
+              autoCancel: true,
+              // ⚠️ 必须显式声明"不要精确闹钟"。插件的默认值是 `true`，而它在 `schedule()` 上
+              // 会检查 `canScheduleExactAlarms()`：没有"闹钟和提醒"权限时（Android 14+ 默认
+              // 不授予，本应用 targetSdk 36）插件会 **`startActivityForResult` 打开系统设置页
+              // 然后直接 return** —— 通知不发出、这个 call 一直悬着（既不 resolve 也不 reject，
+              // 所以下面的 catch 永远看不到），用户还平白被弹到设置页；直到他从设置页返回，
+              // 插件才继续排程。而这条通知根本没有 `schedule` 字段（即时投递），
+              // 精确闹钟对即时通知没有任何意义，白担这一跳。
+              // 见 @capacitor/local-notifications 8.3.1 的 definitions.d.ts（`@default true`）
+              // 与 LocalNotificationsPlugin.kt 的 honorExact 分支。
+              isExactNotification: false,
+            }],
+          }))
+          .catch(() => {
+            // 系统通知失败不影响应用内提醒（与桌面端同一条原则）。
+          });
+        return;
+      }
+      new Notification(content.title, { body: content.body, tag: eventID });
     } catch {
       // Malformed events are recovered by the normal snapshot refresh.
     }
@@ -1962,6 +2105,19 @@ export default function MobileRemotePage() {
       })
       .catch(() => undefined);
     return () => controller.abort();
+  }, []);
+  // 读一次"当前安装的包版本"给 ⋯ 菜单底部那行用。与上面那次更新检查**分开**：
+  // 那条只在有新版本时才带得回版本号，没有更新时读完即弃（见 readMobileAppInfo）。
+  // 失败静默：版本号读不到就不显示那一行，不打扰用户、也不编一个版本出来。
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    let cancelled = false;
+    void readMobileAppInfo()
+      .then((info) => {
+        if (!cancelled && info) setAppVersionLabel(formatAppVersion(info.version, info.build));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
   }, []);
   useEffect(() => {
     if (!token.trim()) return;
@@ -2369,7 +2525,7 @@ export default function MobileRemotePage() {
       cloud<MobileRpcReply>(`/v1/instances/${encodeURIComponent(instanceID)}/rpc`, {
         method: "POST",
         body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
-      });
+      }, undefined, timeoutMs);
   }, [instanceID, project?.id, conversation?.id, conversationPending]);
   // 文件适配器**持有缓存**（内容 + 子树），所以绝不能在每次渲染时重建 ——
   // 重建就是缓存清零，用户在目录里点两下会不停重新拉取。
@@ -2389,6 +2545,36 @@ export default function MobileRemotePage() {
     }
     return entries.sort((left, right) => left.at - right.at);
   }, [conversation]);
+  // 分组：同一个人**连着**说的几条，要在版面上读起来像"一段话"而不是"几次独立发言"。
+  // （气泡本来就有左右对齐与尖角在表达"谁在说"，但"谁连着说"这件事此前完全没有表达 ——
+  //   两条我连发、两条不同人说，间距与圆角一模一样。）
+  //
+  // 判据只看**紧邻的时间线条目**：中间夹了一张状态卡（notice）就不算连着 ——
+  // 状态卡是"这一步发生了什么"的旁注，它一插进来，上一句与下一句在读者眼里已经不是一口气说完的了。
+  // 而且这也与 DOM 相邻性严格对应（消息与状态卡混排在同一个列表里），
+  // 于是"紧邻同角色" ⇔ "这两个 .mobile-message 是相邻兄弟"，样式那边才能只用相邻兄弟选择器的前提。
+  //
+  // ⚠️ 刻意**不用 `:has()`** 来实现（`:has(+ .mobile-message.user)` 这类）：本文件的基础样式门槛
+  // 是 Chromium 108，项目不为基础样式另开一个浏览器门槛（见 `.mobile-empty-mode` 那段说明）。
+  // 所以判据在这里算一次、以 data-group 落到元素上，样式那边只读属性、不重算。
+  //
+  // 四个取值（缺一个就会出现"组内那条还带着尖角"或"新起的一段被贴住"这类错）：
+  //   solo  —— 前后都不是同角色（自己一句）        → 全部圆角，前距 12px
+  //   first —— 后面还接着同角色（一段话的开头）    → 收掉指向下方的尖角
+  //   mid   —— 前后都接着同角色（一段话的中间）    → 收掉尖角 + 内侧上角拍平 + 前距 5px
+  //   last  —— 前面接着同角色（一段话的结尾）      → 内侧上角拍平 + 前距 5px（尖角留着）
+  const messageGroups = useMemo(() => {
+    const groups = new Map<string, "solo" | "first" | "mid" | "last">();
+    conversationTimeline.forEach((entry, index) => {
+      if (entry.kind !== "message") return;
+      const before = conversationTimeline[index - 1];
+      const after = conversationTimeline[index + 1];
+      const joinedBefore = before?.kind === "message" && before.message.role === entry.message.role;
+      const joinedAfter = after?.kind === "message" && after.message.role === entry.message.role;
+      groups.set(entry.key, joinedBefore && joinedAfter ? "mid" : joinedBefore ? "last" : joinedAfter ? "first" : "solo");
+    });
+    return groups;
+  }, [conversationTimeline]);
   // 图标行**是否真的开着**：`messageActionId` 记的是"哪条消息的 id"，而那条消息可能已经不在这份
   // 快照里了（换会话已经清了，但云端重新下发一份不含它的快照不会走那条路）。这种"谁也不对应"的
   // 状态必须当成**关着**，否则按一次返回键只会把它清掉、界面上什么都不发生 —— 用户读到的是
@@ -2647,6 +2833,103 @@ export default function MobileRemotePage() {
     return () => {
       cancelled = true;
       if (listener) void listener.remove();
+    };
+  }, []);
+
+  // 点系统通知 → 回到对应会话。
+  // 每次渲染刷新（无依赖数组）：插件的监听只注册一次，而跳转要读最新的 projects 与 setter
+  //（同 backHandlerRef 的做法）。
+  // 快照里还没有该项目时（冷启动、或刚切到另一台电脑）先挂起，交给下面的认领 effect ——
+  // 否则直接 setSelectedProject 会被"selectedProject 不在 projects 里就清空"那条收敛
+  // effect 立刻抹掉，用户点了通知却停在项目列表上。
+  useEffect(() => {
+    notificationTapRef.current = (extra) => {
+      const target = {
+        projectId: typeof extra?.projectId === "string" ? extra.projectId : "",
+        conversationId: typeof extra?.conversationId === "string" ? extra.conversationId : "",
+        taskId: typeof extra?.taskId === "string" ? extra.taskId : "",
+      };
+      // 两个定位依据都没有就无从跳起（老版本发出去的通知、或事件本身没带）。
+      if (!target.projectId && !target.taskId) return;
+      const projectValue = pickNotificationProject(projects, target);
+      if (!projectValue) {
+        pendingNotificationTargetRef.current = target;
+        return;
+      }
+      // 这次直接跳成了，清掉上一次留下的挂起值 —— 否则它在快照变化时还会再跳一次。
+      pendingNotificationTargetRef.current = null;
+      applyNotificationTarget(projectValue, target.conversationId);
+    };
+  });
+
+  // 认领挂起的通知跳转：快照里真的出现该项目的那一刻再切视图。
+  // 项目已被删除时它一直不出现，挂起值就自然作废（无需超时清理：下一次点击会覆盖它）。
+  useEffect(() => {
+    const pending = pendingNotificationTargetRef.current;
+    if (!pending) return;
+    const projectValue = pickNotificationProject(projects, pending);
+    if (!projectValue) return;
+    pendingNotificationTargetRef.current = null;
+    applyNotificationTarget(projectValue, pending.conversationId);
+  }, [projects]);
+
+  // 原生包的通知接线：建渠道 + 收权限真值 + 注册"点通知"与"前后台"两个监听。
+  // 结构照抄上面 backButton 那段（cancelled 标志 + handle.remove()），只在原生平台跑。
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    let cancelled = false;
+    let actionListener: PluginListenerHandle | null = null;
+    let stateListener: PluginListenerHandle | null = null;
+
+    // 渠道必须先建：channelId 指向不存在的渠道时通知**不会发出**（不是退回默认渠道）。
+    // 重复创建同名渠道是幂等的，且它创建后配置不可改（改重要性只能换 id）——
+    // 所以重要性等参数一次定死在 MOBILE_NOTIFICATION_CHANNEL 里。
+    // 记下这条 promise：发通知前要等它，否则启动瞬间到达的事件会静默丢掉。
+    // 失败也照样放行（catch 成 undefined）：渠道可能上一次启动就建好了，不该因为这一跳失败
+    // 就永久发不出通知；真建不出来时 schedule 自己会失败。
+    notificationChannelRef.current = LocalNotifications.createChannel({ ...MOBILE_NOTIFICATION_CHANNEL }).catch(() => undefined);
+
+    // 权限真值只能异步读。API 32 及以下（含目标机 HarmonyOS 4.x）直接返回 granted、不弹框。
+    //
+    // 提成函数是因为它要在**两个**时机跑：挂载时，以及每次回到前台。只在挂载时读一次的话
+    // 状态不会收敛 —— 用户去系统设置里把通知打开再回来，ref 还是 false（本会话再也发不出
+    // 通知），而两颗「开启通知」入口只判 `=== "default"` 也不会重新出现，只能杀进程重来
+    // （2026-09-29 复查）。
+    const syncNotificationPermission = () => {
+      void LocalNotifications.checkPermissions()
+        .then((status) => {
+          if (cancelled) return;
+          const permission = toNotificationPermission(status?.display);
+          setNotificationPermission(permission);
+          notificationGrantedRef.current = permission === "granted";
+        })
+        .catch(() => undefined);
+    };
+    syncNotificationPermission();
+
+    // 点通知（含"App 被杀后由通知冷启动"这条路径）。
+    void LocalNotifications.addListener("localNotificationActionPerformed", ({ notification }) => {
+      notificationTapRef.current((notification?.extra || {}) as { projectId?: string; conversationId?: string; taskId?: string });
+    }).then((handle) => {
+      if (cancelled) { void handle.remove(); return; }
+      actionListener = handle;
+    }).catch(() => undefined);
+
+    // 前后台。Android WebView 里 visibilitychange 是否可靠触发没有验证记录，这条是原生侧
+    // 更可靠的信号；两条取或（见 mobile-notify.ts 的 shouldNotifyWhileAway）。
+    void CapacitorApp.addListener("appStateChange", ({ isActive }) => {
+      nativeInBackgroundRef.current = !isActive;
+      // 回到前台顺手重读一次通知权限：用户很可能刚去系统设置里改过它（见上面那个函数）。
+      if (isActive) syncNotificationPermission();
+    }).then((handle) => {
+      if (cancelled) { void handle.remove(); return; }
+      stateListener = handle;
+    }).catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+      if (actionListener) void actionListener.remove();
+      if (stateListener) void stateListener.remove();
     };
   }, []);
 
@@ -3218,8 +3501,17 @@ export default function MobileRemotePage() {
   // `setInstances([])` 等第一次 /v1/instances 回来补电脑名 → `void loadInstances()`。
 
   async function enableMobileNotifications() {
-    if (typeof Notification === "undefined") return;
     try {
+      // 原生包走插件申请（Android 13+ 才会弹系统框；API 32 及以下直接返回 granted）。
+      // 走插件的另一层意义：Android 上只有经过它，系统通知栏才认这个权限态。
+      if (Capacitor.isNativePlatform()) {
+        const status = await LocalNotifications.requestPermissions();
+        const permission = toNotificationPermission(status?.display);
+        setNotificationPermission(permission);
+        notificationGrantedRef.current = permission === "granted";
+        return;
+      }
+      if (typeof Notification === "undefined") return;
       const permission = await Notification.requestPermission();
       setNotificationPermission(permission);
     } catch {
@@ -4336,7 +4628,7 @@ export default function MobileRemotePage() {
   //
   // 老实现是"发命令 → await 等终态（最长 30 秒）→ 才切视图"，期间整屏 busy：SSE 一断，
   // 用户点了「创建会话」就是对着一个按钮全灰的弹层干等半分钟。
-  async function createConversationForProject(projectValue: Project, agentId?: "claude-code" | "codex") {
+  async function createConversationForProject(projectValue: Project, agentId?: MobileAgentID, permissionMode?: PermissionMode) {
     if (!agentId) {
       openNewConversation(projectValue);
       return;
@@ -4371,7 +4663,9 @@ export default function MobileRemotePage() {
       const accepted = await cloud<AcceptedCommand>(`/v1/instances/${encodeURIComponent(instanceID)}/commands`, {
         method: "POST",
         headers: { "Idempotency-Key": idempotencyKey() },
-        body: JSON.stringify({ type: "conversation.create", projectId: projectValue.id, payload: { agentId } }),
+        // permissionMode 显式带上：手机端的意图在手机端说清，不依赖服务端的空权限派生
+        // （派生只是兜底；默认值取自目录声明 MOBILE_AGENTS.defaultPermission）。
+        body: JSON.stringify({ type: "conversation.create", projectId: projectValue.id, payload: { agentId, permissionMode } }),
       });
       setCommandState(accepted);
       const tracked = pendingConversationsRef.current.get(pendingID);
@@ -4419,12 +4713,26 @@ export default function MobileRemotePage() {
       return;
     }
     setNewConversationAgent("claude-code");
+    // 权限必须一起重置：弹窗上次开在 Codex（workspace_write）上被取消后，
+    // 这里只重置工具不重置权限，就会渲染出 claude-code + workspace_write 的
+    // 非法组合（没有任何分段显示选中），直接创建会被服务端 400。
+    setNewConversationPermission(MOBILE_AGENTS[0].defaultPermission);
     setNewConversationProject(projectValue);
   }
 
   function openNewConversation(projectValue: Project) {
+    // 每次打开都回到目录默认：claude-code + 它的默认权限。权限不残留上一次的选择 ——
+    // 「清空某个状态」的副作用写在触发它的事件里（打开弹窗），不用 effect 猜意图。
     setNewConversationAgent("claude-code");
+    setNewConversationPermission(MOBILE_AGENTS[0].defaultPermission);
     setNewConversationProject(projectValue);
+  }
+
+  /** 换工具时权限跟着该工具的目录默认走（不同工具的权限面不同，旧选择可能不适用）。 */
+  function selectMobileAgent(agentID: MobileAgentID) {
+    setNewConversationAgent(agentID);
+    const agent = MOBILE_AGENTS.find((item) => item.id === agentID);
+    if (agent) setNewConversationPermission(agent.defaultPermission);
   }
 
   function cancelNewConversation() {
@@ -4437,7 +4745,7 @@ export default function MobileRemotePage() {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
       const requestController = new AbortController();
-      const requestTimeout = window.setTimeout(() => requestController.abort(), Math.min(remaining, cloudRequestTimeoutMs));
+      const requestTimeout = window.setTimeout(() => requestController.abort(), Math.min(remaining, cloudClientWaitMs()));
       try {
         const response = await cloud<CommandState & { command?: { commandId?: string } }>(`/v1/commands/${encodeURIComponent(commandID)}`, { signal: requestController.signal });
         const state = normalizeCommandState(response, commandID);
@@ -4592,6 +4900,23 @@ export default function MobileRemotePage() {
     setMobileView("conversation");
   }
 
+  // 切到系统通知指定的项目 / 会话。复用与 openMobileProject 相同的三个原语。
+  // 只在会话视图里换目标时 enterConversationView 不会重复压历史（它自带 conversationHistoryRef 守卫）；
+  // 换会话要清的浮层由 `[selectedProject, selectedConversation]` 那条 effect 统一处理，这里不重写。
+  function applyNotificationTarget(projectValue: Project, conversationId: string) {
+    setSelectedProject(projectValue.id);
+    // 通知没带会话 id 时挑当前会话。**不能只 setSelectedProject 就完事**：mobileView 仍停在
+    // "projects"，用户点了通知还钉在项目列表上，看起来像通知点了没反应。
+    // 挑法与 openMobileProject 一致（isCurrent 优先，其次第一条）；一条会话都没有时只切项目，
+    // 不替用户弹"新建会话"——那是用户主动进项目才该发生的事。
+    const target = projectValue.conversations?.find((entry) => entry.id === conversationId)
+      || projectValue.conversations?.find((entry) => entry.isCurrent)
+      || projectValue.conversations?.[0];
+    if (!target) return;
+    setSelectedConversation(target.id);
+    enterConversationView();
+  }
+
   // 离开项目会话视图（页内「←」、安卓返回键、项目消失、重新配对）：视图立刻切回项目列表，
   // 同时把我们压的那层历史退掉。注意"退历史"只在这里做——系统侧滑触发的那次 popstate 里
   // 历史已经退过了，再退一次会把用户直接带出应用。
@@ -4706,7 +5031,6 @@ export default function MobileRemotePage() {
       <strong>这个项目还没有会话</strong>
       <p>新建一条会话就能和 Agent 对话。会话留在电脑上，可以随时回来接着聊。</p>
       <button type="button" className="mobile-empty-start-primary" disabled={busy} onClick={() => { if (project) openNewConversation(project); }}>新建会话</button>
-      <small className="mobile-empty-start-note">创建时可以选择用 Claude Code 还是 Codex 执行。</small>
     </div>
   ) : conversationProcessing ? null : (
     <div className="mobile-empty-start" data-kind="no-message" data-tools={composerToolsOpen ? "open" : "closed"}>
@@ -4824,13 +5148,10 @@ export default function MobileRemotePage() {
         </div>
       </div>
     </div>}
-    {mobileApp ? <header className="mobile-remote-header" ref={headerRef}><div className="mobile-remote-title">{(!mobileApp || mobileView === "conversation") && <button className="mobile-back" type="button" onClick={goBack} title={mobileBackLabel} aria-label={mobileBackLabel}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5" /><path d="M11 18l-6-6 6-6" /></svg></button>}<div className="mobile-brand"><img className="mobile-brand-mark" src="/milevia-mark.svg" width="36" height="36" alt="" /><h1>{filesHeaderActive ? "项目文件" : gitHeaderActive ? "Git 工作台" : showConversationTitle ? (project?.name || "项目对话") : "Milevia"}</h1></div>{filesHeaderActive && project?.gitBranch && <span className="mobile-files-workspace" title="当前项目分支；手机端快照里还没有每个会话的工作区信息">{project.gitBranch}</span>}{conversationHeaderActive && conversationState && <span className={`mobile-conversation-state mobile-conversation-state-${conversation?.status}`}>{conversationState}</span>}</div><div className="mobile-header-actions">{!conversationHeaderActive && notificationPermission === "default" && <button className="mobile-notification-button" type="button" onClick={() => void enableMobileNotifications()} title="开启后台通知">开启通知</button>}{!conversationHeaderActive && <button className="mobile-refresh" type="button" onClick={() => void refreshNow()} disabled={refreshing} aria-busy={refreshing} title="从电脑端重新同步"><svg className="mobile-refresh-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg><span>刷新</span></button>}{filesHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-files-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="文件操作" title="文件操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-files-menu-sheet" role="menu" aria-label="文件操作"><div className="mobile-header-menu-info"><span>项目文件</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadFiles(); }}><span>刷新文件</span><small>重新读取目录与内容</small></button></div>}</div>}{gitHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-git-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="Git 操作" title="Git 操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-git-menu-sheet" role="menu" aria-label="Git 操作"><div className="mobile-header-menu-info"><span>Git 工作台</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadGit(); }}><span>刷新仓库状态</span><small>重新读取变更、分支与提交</small></button></div>}</div>}{conversationHeaderActive && project && !subHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-header-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="更多操作" title="更多操作">{activeTaskCount > 0 && <span className="mobile-header-menu-badge" aria-hidden="true">{activeTaskCount}</span>}<span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-header-menu-sheet" role="menu" aria-label="更多操作">{activeDeviceRecord && <div className="mobile-header-menu-info mobile-header-menu-device"><span>当前电脑</span><small>{deviceDisplayName(activeDeviceRecord)} · {activeDeviceRecord.revoked ? "绑定已失效" : activeDeviceRecord.status === "online" ? "在线" : "离线"}</small></div>}{conversation && <div className="mobile-header-menu-info"><span>执行 Agent</span><small>{conversationAgentLabel(conversation.agentId)}</small></div>}<button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void refreshNow(); }} disabled={refreshing} aria-busy={refreshing}><span>刷新</span><small>{refreshing ? "同步中…" : "重新同步电脑端"}</small></button>{notificationPermission === "default" && <button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void enableMobileNotifications(); }}><span>开启通知</span><small>后台提醒</small></button>}<div className="mobile-header-menu-separator" role="none" /><button type="button" role="menuitem" onClick={() => openFiles()}><span>项目文件</span><small>查看与编辑</small></button><button type="button" role="menuitem" onClick={() => openGit()}><span>Git 工作台</span><small>变更 · 差异 · 提交</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setConversationHistoryOpen(true); }} disabled={conversations.length === 0}><span>历史会话</span><small>{conversations.length}</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void createConversationForProject(project); }} disabled={busy}><span>新会话</span><small>新建</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setTasksOpen(true); }}><span>任务队列</span><small>{project.tasks.length}</small></button></div>}</div>}</div></header> : <header className="desktop-remote-header">
+    {mobileApp ? <header className="mobile-remote-header" ref={headerRef}><div className="mobile-remote-title">{(!mobileApp || mobileView === "conversation") && <button className="mobile-back" type="button" onClick={goBack} title={mobileBackLabel} aria-label={mobileBackLabel}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5" /><path d="M11 18l-6-6 6-6" /></svg></button>}<div className="mobile-brand"><img className="mobile-brand-mark" src="/milevia-mark.svg" width="36" height="36" alt="" /><h1>{filesHeaderActive ? "项目文件" : gitHeaderActive ? "Git 工作台" : showConversationTitle ? (project?.name || "项目对话") : "Milevia"}</h1></div>{filesHeaderActive && project?.gitBranch && <span className="mobile-files-workspace" title="当前项目分支；手机端快照里还没有每个会话的工作区信息">{project.gitBranch}</span>}{conversationHeaderActive && conversationState && <span className={`mobile-conversation-state mobile-conversation-state-${conversation?.status}`}>{conversationState}</span>}</div><div className="mobile-header-actions">{!conversationHeaderActive && notificationPermission === "default" && <button className="mobile-notification-button" type="button" onClick={() => void enableMobileNotifications()} title="开启后台通知">开启通知</button>}{!conversationHeaderActive && <button className="mobile-refresh" type="button" onClick={() => void refreshNow()} disabled={refreshing} aria-busy={refreshing} title="从电脑端重新同步"><svg className="mobile-refresh-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg><span>刷新</span></button>}{filesHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-files-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="文件操作" title="文件操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-files-menu-sheet" role="menu" aria-label="文件操作"><div className="mobile-header-menu-info"><span>项目文件</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadFiles(); }}><span>刷新文件</span><small>重新读取目录与内容</small></button></div>}</div>}{gitHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-git-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="Git 操作" title="Git 操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-git-menu-sheet" role="menu" aria-label="Git 操作"><div className="mobile-header-menu-info"><span>Git 工作台</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadGit(); }}><span>刷新仓库状态</span><small>重新读取变更、分支与提交</small></button></div>}</div>}{conversationHeaderActive && project && !subHeaderActive && <><button className="mobile-refresh" type="button" onClick={() => void refreshNow()} disabled={refreshing} aria-busy={refreshing} title="从电脑端重新同步"><svg className="mobile-refresh-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg><span>刷新</span></button><div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-header-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="更多操作" title="更多操作">{activeTaskCount > 0 && <span className="mobile-header-menu-badge" aria-hidden="true">{activeTaskCount}</span>}<span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-header-menu-sheet" role="menu" aria-label="更多操作">{activeDeviceRecord && <div className="mobile-header-menu-info mobile-header-menu-device"><span>当前电脑</span><small>{deviceDisplayName(activeDeviceRecord)} · {activeDeviceRecord.revoked ? "绑定已失效" : activeDeviceRecord.status === "online" ? "在线" : "离线"}</small></div>}{conversation && <div className="mobile-header-menu-info"><span>执行 Agent</span><small>{conversationAgentLabel(conversation.agentId)}</small></div>}{notificationPermission === "default" && <button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void enableMobileNotifications(); }}><span>开启通知</span><small>后台提醒</small></button>}<div className="mobile-header-menu-separator" role="none" /><button type="button" role="menuitem" onClick={() => openFiles()}><span>项目文件</span><small>查看与编辑</small></button><button type="button" role="menuitem" onClick={() => openGit()}><span>Git 工作台</span><small>变更 · 差异 · 提交</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setConversationHistoryOpen(true); }} disabled={conversations.length === 0}><span>历史会话</span><small>{conversations.length}</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void createConversationForProject(project); }} disabled={busy}><span>新会话</span><small>新建</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setTasksOpen(true); }}><span>任务队列</span><small>{project.tasks.length}</small></button>{appVersionLabel && <div className="mobile-header-menu-version"><span>Milevia</span><small>{appVersionLabel}</small></div>}</div>}</div></>}</div></header> : <header className="desktop-remote-header">
       <div className="desktop-remote-head-main">
         <button className="desktop-remote-back" type="button" onClick={goBack} aria-label="返回项目总览" title="返回项目总览"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5" /><path d="M11 18l-6-6 6-6" /></svg></button>
         <div className="desktop-remote-head-text">
-          {/* kicker 是电脑端管理页的通用写法（设置页 / Agent 档案页同一套）：一行小字带上
-              "这是哪一面"，比把品牌名放大成 30px 更能回答"我在哪"。 */}
-          <span className="desktop-remote-kicker"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="12" rx="1.5" /><path d="M8 20h8" /><path d="M12 16v4" /></svg>REMOTE CONTROL</span>
           <h1>远程控制</h1>
         </div>
       </div>
@@ -4917,7 +5238,6 @@ export default function MobileRemotePage() {
               </div>
               <button className="mobile-pairing-code-submit" type="submit" disabled={busy || manualPairingCode.length !== 6}>验证并配对</button>
             </form>
-            <p className="mobile-pairing-tip">扫到码后会停在这一页等你确认 —— 「确认绑定」要在电脑上点。</p>
           </>}
       </div>
     </section>}
@@ -4953,7 +5273,6 @@ export default function MobileRemotePage() {
               <h2 id="desktop-remote-pairing-title">用手机扫这个二维码</h2>
               <button className="desktop-remote-btn ghost sm" type="button" onClick={() => void createDesktopPairing()} disabled={busy}>{pairingID ? "重新生成" : "生成二维码"}</button>
             </header>
-            <p className="desktop-remote-note">扫码只是"提交申请"；真正的授权是你在<b>这台电脑上</b>点下「确认绑定」。</p>
             {pairingQR ? <div className="desktop-remote-pairing-body">
               <div className="desktop-remote-qr-wrap" data-expired={pairingExpired ? "true" : "false"} data-spent={pairingConfirmed ? "true" : "false"}>
                 <img className="desktop-remote-qr" src={pairingQR} alt="Milevia 配对二维码" />
@@ -4997,12 +5316,11 @@ export default function MobileRemotePage() {
               <dt>实例 ID</dt><dd>{desktopInstanceID ? <code title={desktopInstanceID}>{shortInstanceID(desktopInstanceID)}</code> : "—"}</dd>
               <dt>最近心跳</dt><dd>{agentStatus?.ready ? heartbeatAgoText(heartbeatAgeMs) : "—"}</dd>
             </dl>
-            {desktopService.hint && <p className="desktop-remote-hint" data-tone={desktopService.state === "failed" || desktopService.state === "stale" ? "warn" : "plain"}>{desktopService.hint}</p>}
+            {desktopService.hint && <p className="desktop-remote-hint" data-tone={desktopService.state === "failed" ? "warn" : "plain"}>{desktopService.hint}</p>}
             <div className="desktop-remote-card-actions">
               <button className="desktop-remote-btn ghost sm" type="button" onClick={() => void openAgentDataDirectory()}>打开数据目录</button>
               {agentStatus?.ready && <button className="desktop-remote-btn ghost sm" type="button" onClick={() => setReenrollOpen(true)} disabled={reenrollOpen}>重新注册</button>}
             </div>
-            <p className="desktop-remote-hint">排障看数据目录下的 milevia-agent.log。</p>
           </section>
           <section className="desktop-remote-card soft" aria-labelledby="desktop-remote-bound-title">
             <header className="desktop-remote-card-head"><h2 id="desktop-remote-bound-title">已绑定手机</h2>{boundPhone && <button className="desktop-remote-btn warn sm" type="button" onClick={() => void revokeBindings()} disabled={busy}>解除绑定</button>}</header>
@@ -5166,7 +5484,7 @@ export default function MobileRemotePage() {
       initialPath={filesInitialPath}
       onInitialPathConsumed={() => setFilesInitialPath(null)}
     /></section>}
-    {mobileApp && mobileView === "conversation" && project && !subHeaderActive && <section className="mobile-conversation"><div className="mobile-message-list" data-empty={showConversationEmpty ? "true" : undefined}>{conversationTimeline.length ? conversationTimeline.map((entry, index) => entry.kind === "message" ? <article className={`mobile-message ${entry.message.role}`} key={entry.key} data-transient={isTransientMessage(entry.message) ? "true" : undefined} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} data-actions={messageActionId === entry.message.id ? "open" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><div className="mobile-message-head"><small>{entry.message.role === "user" ? "我" : "Agent"} · {messageTime(entry.message.createdAt)}{isStreamingMessage(entry.message) && <span className="mobile-message-writing" role="img" aria-label="正在写入"><i aria-hidden="true" /><i aria-hidden="true" /><i aria-hidden="true" /></span>}</small><div className="mobile-message-head-actions">{messageActionId === entry.message.id && <div className="mobile-message-actions" id={`mobile-message-actions-${index}`} ref={messageActionsRef} role="group" aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作${isTransientMessage(entry.message) ? `（${transientReason(entry.message, "row")}）` : ""}`}><button type="button" className="mobile-message-action-icon" data-copy-state={messageCopyState} aria-label={messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请重试" : "复制这条消息"} title="复制 Markdown 原文" onClick={() => void copyMessageBody(entry.message.content)}><MessageActionIcon kind={messageCopyState === "idle" ? "copy" : messageCopyState} /></button><span className="mobile-message-action-status" role="status" aria-live="polite">{messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请检查剪贴板权限" : ""}</span><button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label={`引用${entry.message.role === "user" ? "我" : "Agent"}这条消息到输入框`} title={isTransientMessage(entry.message) ? transientReason(entry.message, "quote") : "引用到输入框"} onClick={() => quoteMessage({ id: entry.message.id, role: entry.message.role, content: entry.message.content })}><MessageActionIcon kind="quote" /></button>{entry.message.role === "user" && <button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label="把这条消息的原文填回输入框" title={isTransientMessage(entry.message) ? transientReason(entry.message, "resend") : "填回输入框，改完再发"} onClick={() => resendMessage(entry.message.content)}><MessageActionIcon kind="resend" /></button>}</div>}<button type="button" className="mobile-message-more" aria-expanded={messageActionId === entry.message.id} aria-controls={messageActionId === entry.message.id ? `mobile-message-actions-${index}` : undefined} aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作`} title="更多操作" onClick={(event) => { if (messageActionId === entry.message.id) { closeMessageActions(); return; } openMessageActions(event.currentTarget, entry.message.id); }}>⋯</button></div></div><div className="mobile-message-markdown markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>, code: ({ className, children }) => <MobileInlineCode className={className} onOpenFile={openFiles}>{children}</MobileInlineCode> }}>{entry.message.content}</ReactMarkdown></div></article> : <article className={`mobile-notice mobile-notice-${entry.notice.variant}${entry.notice.state ? ` mobile-notice-${entry.notice.state}` : ""}`} key={entry.key} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><span className="mobile-notice-icon" aria-hidden="true">{noticeIcons[entry.notice.variant]}</span><div className="mobile-notice-text"><strong>{entry.notice.title}</strong>{entry.notice.detail && <small>{entry.notice.detail}</small>}</div>{noticeTime(entry.notice.createdAt) && <time className="mobile-notice-time">{noticeTime(entry.notice.createdAt)}</time>}</article>) : conversationEmpty}{conversationProcessing && <div className="mobile-agent-processing" data-agent={processingAgent.tone} role="status" aria-live="polite">{/* 状态条的三格读音各有来源，判据全在 lib/processing-indicator.ts ——
+    {mobileApp && mobileView === "conversation" && project && !subHeaderActive && <section className="mobile-conversation"><div className="mobile-message-list" data-empty={showConversationEmpty ? "true" : undefined}>{conversationTimeline.length ? conversationTimeline.map((entry, index) => entry.kind === "message" ? <article className={`mobile-message ${entry.message.role}`} key={entry.key} data-group={messageGroups.get(entry.key)} data-transient={isTransientMessage(entry.message) ? "true" : undefined} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} data-actions={messageActionId === entry.message.id ? "open" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><div className="mobile-message-head"><small>{entry.message.role === "user" ? "我" : "Agent"} · {messageTime(entry.message.createdAt)}{isStreamingMessage(entry.message) && <span className="mobile-message-writing" role="img" aria-label="正在写入"><i aria-hidden="true" /><i aria-hidden="true" /><i aria-hidden="true" /></span>}</small><div className="mobile-message-head-actions">{messageActionId === entry.message.id && <div className="mobile-message-actions" id={`mobile-message-actions-${index}`} ref={messageActionsRef} role="group" aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作${isTransientMessage(entry.message) ? `（${transientReason(entry.message, "row")}）` : ""}`}><button type="button" className="mobile-message-action-icon" data-copy-state={messageCopyState} aria-label={messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请重试" : "复制这条消息"} title="复制 Markdown 原文" onClick={() => void copyMessageBody(entry.message.content)}><MessageActionIcon kind={messageCopyState === "idle" ? "copy" : messageCopyState} /></button><span className="mobile-message-action-status" role="status" aria-live="polite">{messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请检查剪贴板权限" : ""}</span><button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label={`引用${entry.message.role === "user" ? "我" : "Agent"}这条消息到输入框`} title={isTransientMessage(entry.message) ? transientReason(entry.message, "quote") : "引用到输入框"} onClick={() => quoteMessage({ id: entry.message.id, role: entry.message.role, content: entry.message.content })}><MessageActionIcon kind="quote" /></button>{entry.message.role === "user" && <button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label="把这条消息的原文填回输入框" title={isTransientMessage(entry.message) ? transientReason(entry.message, "resend") : "填回输入框，改完再发"} onClick={() => resendMessage(entry.message.content)}><MessageActionIcon kind="resend" /></button>}</div>}<button type="button" className="mobile-message-more" aria-expanded={messageActionId === entry.message.id} aria-controls={messageActionId === entry.message.id ? `mobile-message-actions-${index}` : undefined} aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作`} title="更多操作" onClick={(event) => { if (messageActionId === entry.message.id) { closeMessageActions(); return; } openMessageActions(event.currentTarget, entry.message.id); }}>⋯</button></div></div><div className="mobile-message-markdown markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <MobileMarkdownLink href={href}>{children}</MobileMarkdownLink>, code: ({ className, children }) => <MobileInlineCode className={className} onOpenFile={openFiles}>{children}</MobileInlineCode> }}>{entry.message.content}</ReactMarkdown></div></article> : <article className={`mobile-notice mobile-notice-${entry.notice.variant}${entry.notice.state ? ` mobile-notice-${entry.notice.state}` : ""}`} key={entry.key} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><span className="mobile-notice-icon" aria-hidden="true">{noticeIcons[entry.notice.variant]}</span><div className="mobile-notice-text"><strong>{entry.notice.title}</strong>{entry.notice.detail && <small>{entry.notice.detail}</small>}</div>{noticeTime(entry.notice.createdAt) && <time className="mobile-notice-time">{noticeTime(entry.notice.createdAt)}</time>}</article>) : conversationEmpty}{conversationProcessing && <div className="mobile-agent-processing" data-agent={processingAgent.tone} role="status" aria-live="polite">{/* 状态条的三格读音各有来源，判据全在 lib/processing-indicator.ts ——
       这一格里**不许再出现任何条件判断**，否则就是"服务端算了一套、界面又另判一套"。
       ① 品牌徽标：把 Agent 名从"和正文同字号同色的一句话"里拆出来，变成一眼可辨的标签
          （旧版里「Claude Code」与「正在处理...」长得一模一样，扫过去分不清身份和状态）。
@@ -5245,14 +5563,56 @@ export default function MobileRemotePage() {
 <div className="mobile-tool-group"><h3>常用命令<span>{commandShortcuts.length}</span></h3>{commandShortcuts.length === 0 ? <p className="mobile-tool-empty">电脑端还没有添加常用命令。</p> : <div className="mobile-tool-chips">{commandShortcuts.map((item) => <button type="button" key={item.id} disabled={busy || !conversation || Boolean(shortcutBusy)} onClick={() => void applyShortcut(item)} title={item.template}>{shortcutBusy === item.id ? "处理中" : item.name}</button>)}</div>}</div>
 <div className="mobile-tool-group"><h3>技能<span>{projectSkills.length}</span></h3>{projectSkills.length === 0 ? <p className="mobile-tool-empty">电脑端未发现可用技能。</p> : <div className="mobile-tool-subgroups">{skillGroups.map((group) => <div className="mobile-tool-subgroup" key={group.source}><h4>{group.label}<span>{group.items.length}</span></h4><div className="mobile-tool-chips">{group.items.map((skill) => <button type="button" key={`${group.source}-${skill.name}`} disabled={busy || !conversation} onClick={() => fillSkill(skill)} title={skill.description}>{skill.name}</button>)}</div></div>)}</div>}</div>
 <div className="mobile-tool-group"><h3>输入</h3><div className="mobile-tool-chips"><button type="button" disabled={busy || !conversation} onClick={insertComposerLineBreak}>换行</button><button type="button" disabled={!messageDraft && skillRefs.length === 0 && !quoteRef} onClick={() => { setMessageDraft(""); setSkillRefs([]); setQuoteRef(null); setComposerToolsOpen(false); }}>清空草稿</button></div></div>
-</section>}<form className="mobile-composer" onSubmit={sendConversationMessage}>{skillRefs.length > 0 && <div className="mobile-skill-refs" role="group" aria-label="已引用的技能">{skillRefs.map((skill) => <span className="mobile-skill-ref" key={`${skill.source}-${skill.name}`}><span className="mobile-skill-ref-name" title={skill.description || skill.name}>{skill.name}</span><button type="button" className="mobile-skill-ref-remove" title={`移除技能 ${skill.name}`} aria-label={`移除技能 ${skill.name}`} disabled={busy} onClick={() => removeSkillRef(skill)}>×</button></span>)}<span className="mobile-skill-ref-hint">发送时展开为完整引用</span></div>}
+</section>}<form className="mobile-composer" onSubmit={sendConversationMessage}>{skillRefs.length > 0 && <div className="mobile-skill-refs" role="group" aria-label="已引用的技能">{skillRefs.map((skill) => <span className="mobile-skill-ref" key={`${skill.source}-${skill.name}`}><span className="mobile-skill-ref-name" title={skill.description || skill.name}>{skill.name}</span><button type="button" className="mobile-skill-ref-remove" title={`移除技能 ${skill.name}`} aria-label={`移除技能 ${skill.name}`} disabled={busy} onClick={() => removeSkillRef(skill)}>×</button></span>)}</div>}
 {/* 被引用的消息（消息操作面板里的「引用到输入框」）：与技能引用同一形态的一行胶囊 ——
     正文留给用户自己写、发送那一刻才展开成引用块。**只挂一条**（见 MessageQuote）。
     正文必须夹列宽 + 单行省略：这里回显的是别人写的内容，长度不可控
     （本文件记过四次的「回显用户输入」坑，第四例就是它）。 */}
 {quoteRef && <div className="mobile-quote-refs" role="group" aria-label="已引用的消息"><span className="mobile-quote-ref"><MessageActionIcon kind="quote" /><span className="mobile-quote-ref-text" title={quoteRef.content}>{quoteRef.content}</span><button type="button" className="mobile-quote-ref-remove" title="取消引用" aria-label={`取消引用${quoteRef.role === "user" ? "我" : "Agent"}的这条消息`} disabled={busy} onClick={() => setQuoteRef(null)}>×</button></span><span className="mobile-quote-ref-hint">发送时展开为引用块</span></div>}
 <div className="mobile-composer-box"><button type="button" className="mobile-composer-tool" aria-label="工具" title="工具" aria-expanded={composerToolsOpen} aria-controls="mobile-composer-tools" onClick={() => setComposerToolsOpen((open) => !open)} disabled={busy}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg></button><textarea ref={messageInputRef} value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversation ? "输入消息..." : "请先新建会话"} aria-label="输入消息" rows={1} disabled={busy || !conversation} /><button type="submit" className="mobile-composer-send" disabled={busy || !conversation || (!messageDraft.trim() && skillRefs.length === 0 && !quoteRef)} aria-label="发送消息" title="发送消息"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg></button></div></form></div></section>}
-    {newConversationProject && <div className="mobile-new-conversation-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-new-conversation-title"><section className="mobile-new-conversation-dialog"><header><div><h2 id="mobile-new-conversation-title">新会话</h2><p>选择执行 Agent</p></div><button type="button" onClick={cancelNewConversation} disabled={busy} aria-label="关闭">×</button></header><div className="mobile-agent-options" role="radiogroup" aria-label="选择执行 Agent"><button type="button" role="radio" aria-checked={newConversationAgent === "claude-code"} className={newConversationAgent === "claude-code" ? "active" : ""} onClick={() => setNewConversationAgent("claude-code")}><strong>Claude Code</strong><small>使用 Claude Code 执行</small></button><button type="button" role="radio" aria-checked={newConversationAgent === "codex"} className={newConversationAgent === "codex" ? "active" : ""} onClick={() => setNewConversationAgent("codex")}><strong>Codex</strong><small>使用 Codex 执行</small></button></div><footer><button type="button" className="mobile-new-conversation-cancel" onClick={cancelNewConversation} disabled={busy}>取消</button><button type="button" className="mobile-new-conversation-confirm" onClick={() => void createConversationForProject(newConversationProject, newConversationAgent)} disabled={busy}>创建会话</button></footer></section></div>}
+    {newConversationProject && <div className="mobile-new-conversation-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-new-conversation-title"><section className="mobile-new-conversation-dialog">
+      <div className="mobile-sheet-grabber" aria-hidden="true"></div>
+      <header><div><h2 id="mobile-new-conversation-title">新会话</h2><p>选择执行工具</p></div><button type="button" onClick={cancelNewConversation} disabled={busy} aria-label="关闭">×</button></header>
+      {/* 方案 A（2026-09-24）：横向徽标大卡 —— 图形主导的"选应用"形态。
+          真实官方图标来自与桌面端同一份资产（AgentLogo）；徽标类（CodeBuddy）由
+          data-logo-badge 铺满图位，裸图形（Claude/OpenAI）坐在品牌浅底上居中。
+          副标题是厂商，不是"已就绪"—— 手机快照里没有每个工具的就绪读数，
+          写"已就绪"就是把"读不到"写成"没有"。 */}
+      <div className="mobile-agent-app-grid" role="radiogroup" aria-label="选择执行工具">
+        {MOBILE_AGENTS.map((agent) => {
+          const selected = newConversationAgent === agent.id;
+          return <button key={agent.id} type="button" role="radio" aria-checked={selected}
+            className={`mobile-agent-app${selected ? " selected" : ""}`}
+            onClick={() => selectMobileAgent(agent.id)}>
+            <span className="mobile-agent-app-icon" data-logo={agent.logo}>
+              <AgentLogo logo={agent.logo} size={30}/>
+            </span>
+            <b>{agent.name}</b>
+            <small>{agent.vendor}</small>
+            {selected && <i className="mobile-agent-app-check" aria-hidden="true">✓</i>}
+          </button>;
+        })}
+      </div>
+      {/* 执行权限：桌面端新会话弹窗的「02 执行权限」对齐到这里 —— 手机端建的会话
+          之前只能吃电脑端设置页的默认权限（桌面端配了「完全控制」时手机会静默拿到）。
+          档位清单来自目录（MOBILE_AGENTS.permissionModes），文案与桌面端同一份 permissionCopy。 */}
+      <div className="mobile-permission">
+        <span className="mobile-permission-label">执行权限</span>
+        <div className="mobile-permission-segments" role="radiogroup"
+          aria-label={`${MOBILE_AGENTS.find((agent) => agent.id === newConversationAgent)?.name ?? ""} 执行权限`}>
+          {(MOBILE_AGENTS.find((agent) => agent.id === newConversationAgent)?.permissionModes ?? []).map((mode) => <button
+            key={mode}
+            type="button"
+            role="radio"
+            aria-checked={newConversationPermission === mode}
+            className={newConversationPermission === mode ? "active" : ""}
+            onClick={() => setNewConversationPermission(mode)}
+          >{permissionCopy[mode].title}</button>)}
+        </div>
+        <p className="mobile-permission-hint">{permissionCopy[newConversationPermission].detail}</p>
+      </div>
+      <footer><button type="button" className="mobile-new-conversation-cancel" onClick={cancelNewConversation} disabled={busy}>取消</button><button type="button" className="mobile-new-conversation-confirm" onClick={() => void createConversationForProject(newConversationProject, newConversationAgent, newConversationPermission)} disabled={busy}>创建会话</button></footer>
+    </section></div>}
     {conversationHistoryOpen && <div className="mobile-conversation-history-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-conversation-history-title" onClick={(event) => { if (event.target === event.currentTarget) setConversationHistoryOpen(false); }}><section className="mobile-conversation-history-dialog"><header><div><h2 id="mobile-conversation-history-title">历史会话</h2><small>{conversations.length} 个会话</small></div><button type="button" onClick={() => setConversationHistoryOpen(false)} aria-label="关闭历史会话">×</button></header>{conversations.length === 0 ? <p className="mobile-empty">该项目还没有会话。</p> : <ul className="mobile-conversation-history-list">{conversations.map((item) => <li key={item.id}><button type="button" className={`mobile-conversation-history-item${item.id === conversation?.id ? " active" : ""}`} aria-current={item.id === conversation?.id ? "true" : undefined} onClick={() => { setSelectedConversation(item.id); setConversationHistoryOpen(false); }}><strong>{item.title || "未命名会话"}</strong><small>{conversationStatusLabel(item.status)}{item.lastActivityAt ? ` · ${new Date(item.lastActivityAt).toLocaleString()}` : ""}</small></button></li>)}</ul>}</section></div>}
   </main>;
 }

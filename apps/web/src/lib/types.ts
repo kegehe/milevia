@@ -20,6 +20,8 @@ export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
 export type AgentID = "claude-code" | "codex";
 export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; modelOverride?: string; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean; isOrchestration?: boolean };
+// 托盘面板"最近会话"（GET /api/conversations/recent）：会话摘要 + 所属项目名。
+export type RecentConversation = Conversation & { projectId: string; projectName: string };
 // 底部模型选择器的候选项与当前生效信息（GET /api/conversations/{id}/models）。
 export type AgentModelOption = { id: string; label?: string; description?: string; alias?: boolean };
 export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[]; customAllowed: boolean; note?: string };

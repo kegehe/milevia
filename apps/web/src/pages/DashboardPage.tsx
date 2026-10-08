@@ -76,11 +76,15 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
   useLiveStateEventsFor("projects", undefined, onRealtime);
   useLiveStateEventsFor("all", undefined, onRealtime);
 
-  const runningCount = Object.values(projectStatuses).filter((status) => status.running).length;
-  const readyCount = projects.filter((project) => project.agentReady && !projectStatuses[project.id]?.running).length;
-  const offlineCount = projects.filter((project) => !project.agentReady).length;
   type ProjectState = "running" | "ready" | "offline";
+  // 状态判定必须与筛选共用同一个函数：先前标签数用 agentReady 单独统计，
+  // 会把"正在跑任务但工具暂时不可用"的项目同时算进「不可用」，
+  // 而点进去却按「进行中」归类，导致标签数字比列表实际条目多。
   const projectState = (project: Project): ProjectState => projectStatuses[project.id]?.running ? "running" : project.agentReady ? "ready" : "offline";
+  const countByState = (state: ProjectState) => projects.filter((project) => projectState(project) === state).length;
+  const runningCount = countByState("running");
+  const readyCount = countByState("ready");
+  const offlineCount = countByState("offline");
 
   // 卡片顺序固定，由 localStorage 持久化，不随运行状态变化。
   // orderVersion 用于在拖拽重排后触发重新计算（localStorage 变化本身不会触发渲染）。
@@ -168,7 +172,7 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
         <button type="button" className="dashboard-action dashboard-action-remote secondary" title="远程控制" aria-label="远程控制" onClick={() => navigate("/mobile")}><RemotePairingIcon /><span>远程控制</span></button>
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
         <button className="dashboard-action dashboard-action-mcp secondary" title="MCP连接" onClick={() => navigate("/mcp-manager")}><McpIcon /><span>MCP连接</span></button>
-        <button className="dashboard-action dashboard-action-cli-tools secondary" title="CLI 工具" onClick={() => navigate("/cli-tools")}><CliToolsIcon /><span>CLI 工具</span></button>
+        <button className="dashboard-action dashboard-action-cli-tools secondary" title="Cli管理" onClick={() => navigate("/cli-tools")}><CliToolsIcon /><span>Cli管理</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
       </div>
     </header>

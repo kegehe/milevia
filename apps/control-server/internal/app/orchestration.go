@@ -22,19 +22,45 @@ import (
 )
 
 const (
-	orchestrationQueued        = "queued"
-	orchestrationPreparing     = "preparing"
-	orchestrationImplementing  = "implementing"
-	orchestrationChecking      = "checking"
-	orchestrationNeedsHuman    = "needs_human"
-	orchestrationPaused        = "paused"
-	orchestrationStopped       = "stopped"
-	orchestrationRemoving      = "removing"
+	orchestrationQueued       = "queued"
+	orchestrationPreparing    = "preparing"
+	orchestrationImplementing = "implementing"
+	orchestrationChecking     = "checking"
+	orchestrationNeedsHuman   = "needs_human"
+	orchestrationPaused       = "paused"
+	orchestrationStopped      = "stopped"
+	orchestrationRemoving     = "removing"
+	// orchestrationApplied 是"直接在已有分支上跑"这条路线的终态：Agent 已经改完文件、
+	// 改动留在项目工作目录里等用户自己 commit。没有待合并的分支，也没有 worktree 要清理。
+	orchestrationApplied       = "applied_to_branch"
 	orchestrationLeaseDuration = 30 * time.Second
 	orchestrationLeaseRenewal  = 10 * time.Second
+	// 直接模式撞上"项目工作区被占用"后的重试间隔。占用通常来自用户自己的会话，几秒就释放。
+	orchestrationWorkspaceRetryDelay = 5 * time.Second
 )
 
+const (
+	// 编排执行方式。worktree 是默认路线：从目标分支拉一条临时分支、在独立工作树里实施，
+	// 完成后由用户合并；branch 是直接路线：在项目工作目录里、用户指定的已有分支上改，
+	// 不建分支、不建工作树、不提交、不合并。
+	orchestrationModeWorktree = "worktree"
+	orchestrationModeBranch   = "branch"
+)
+
+// orchestrationIntegratedStatuses 是"前置作业已落地、后继任务可以开工"的终态集合。
+// 依赖就绪判定有两份 SQL —— orchestrationDependenciesIntegrated 与
+// validateTaskDispatchTx 里的那份事务内副本 —— 必须共用这一份常量：只改一处的话，
+// 编排自己会放行、派发事务却拒绝，用户看到的是一句看不出根因的
+// "task has unfinished predecessor tasks"。
+const orchestrationIntegratedStatuses = "'released_to_main','applied_to_branch'"
+
 var errOrchestrationWaiting = errors.New("orchestration queue head is waiting")
+
+// errOrchestrationWorkspaceBusy 表示直接模式派发时项目工作区正被用户自己的会话/操作占用。
+// 它与 errOrchestrationWaiting 一样属于"现在做不了、等一会儿再来"，绝不能被当成
+// failOrchestrationJob 的输入——那会 needs_human 并冻结整个项目队列，而用户完全不知道
+// 是自己打字导致的。
+var errOrchestrationWorkspaceBusy = errors.New("orchestration direct mode workspace is busy")
 
 const maxIndependentReviewAttempts = 3
 const maxOrchestrationFixRounds = 10
@@ -93,6 +119,14 @@ type OrchestrationConfig struct {
 	VerificationCommands []string `json:"verificationCommands"`
 	MaxFixRounds         int      `json:"maxFixRounds"`
 	FrozenReason         string   `json:"frozenReason,omitempty"`
+	// ExecutionMode 与 TargetBranch 是**计划级**参数，跟着作业快照走：
+	// 它们由选定的编排任务写入 policy_snapshot，但 saveOrchestrationPolicy 不写
+	// project_orchestration_configs，所以项目行里不存在这两列。放在这里是因为
+	// orchestrationConfigForJob 解码快照时就顺手带上了，执行期与列表展示都无需反查
+	// 批次行 —— 计划被删除后作业会脱组（batch_id 清空），那时快照是唯一还记得
+	// "这次改动落在哪个分支上"的地方。
+	ExecutionMode string `json:"executionMode,omitempty"`
+	TargetBranch  string `json:"targetBranch,omitempty"`
 }
 
 type OrchestrationJob struct {
@@ -115,24 +149,32 @@ type OrchestrationJob struct {
 	ResourcesCleanedAt *time.Time `json:"resourcesCleanedAt,omitempty"`
 	LastError          string     `json:"lastError,omitempty"`
 	TargetBranch       string     `json:"targetBranch,omitempty"`
-	PolicySnapshot     string     `json:"-"`
-	CreatedAt          time.Time  `json:"createdAt"`
-	UpdatedAt          time.Time  `json:"updatedAt"`
+	// ExecutionMode 是这条作业实际走的路线（plan 级参数的投影），前端据此把「任务分支/
+	// 工作区」换成「直接写入/项目目录」，并隐藏合并与清理入口。
+	ExecutionMode  string    `json:"executionMode,omitempty"`
+	PolicySnapshot string    `json:"-"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 // OrchestrationBatch is a user-visible execution plan. Jobs remain strictly
 // serial per project, while a batch provides the lifecycle boundary, name and
 // conversation policy for a deliberately selected group of tasks.
 type OrchestrationBatch struct {
-	ID                   string    `json:"id"`
-	ProjectID            string    `json:"projectId"`
-	Name                 string    `json:"name"`
-	ConversationStrategy string    `json:"conversationStrategy"`
-	Status               string    `json:"status"`
-	TaskCount            int       `json:"taskCount"`
-	CompletedCount       int       `json:"completedCount"`
-	CreatedAt            time.Time `json:"createdAt"`
-	UpdatedAt            time.Time `json:"updatedAt"`
+	ID                   string `json:"id"`
+	ProjectID            string `json:"projectId"`
+	Name                 string `json:"name"`
+	ConversationStrategy string `json:"conversationStrategy"`
+	Status               string `json:"status"`
+	// Started 为 false 表示计划还没点过「开始执行」：子任务都停在队列里等，调度器不取。
+	Started        bool      `json:"started"`
+	TaskCount      int       `json:"taskCount"`
+	CompletedCount int       `json:"completedCount"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+	// 计划级执行方式：worktree（默认，隔离工作树）或 branch（直接在 TargetBranch 上改）。
+	ExecutionMode string `json:"executionMode"`
+	TargetBranch  string `json:"targetBranch,omitempty"`
 }
 
 type OrchestrationWorktree struct {
@@ -151,6 +193,10 @@ type GitTaskRecord struct {
 	TaskCommitSHA  string `json:"taskCommitSha,omitempty"`
 	IntegrationSHA string `json:"integrationSha,omitempty"`
 	ConversationID string `json:"conversationId,omitempty"`
+	// ExecutionMode 记录这条作业**实际**走的路线。直接模式下 TaskBranch 与
+	// WorktreePath 刻意留空：清理路径会对非空值执行 git branch -D / git worktree
+	// remove --force，把用户的分支名或项目目录写进去等于让清理按钮去删它们。
+	ExecutionMode string `json:"executionMode,omitempty"`
 }
 
 func (s *Server) migrateOrchestration(ctx context.Context) error {
@@ -184,7 +230,6 @@ create table if not exists orchestration_batches (
 	project_id text not null references projects(id) on delete cascade,
 	name text not null,
 	conversation_strategy text not null default 'new',
-	archived_at datetime,
 	created_at datetime not null,
 	updated_at datetime not null
 );
@@ -262,14 +307,33 @@ create index if not exists verification_runs_job on verification_runs(job_id,cre
 	if err := ensureColumn(ctx, s.db, "task_orchestration_jobs", "batch_id", "text not null default ''"); err != nil {
 		return fmt.Errorf("add orchestration batch: %w", err)
 	}
-	if err := ensureColumn(ctx, s.db, "orchestration_batches", "archived_at", "datetime"); err != nil {
-		return fmt.Errorf("add orchestration batch archive timestamp: %w", err)
+	// 计划级「开始执行」闸门：started_at 为空表示计划还没开始，其子任务停在队列里等。
+	// 引入闸门之前就已经存在的计划必须视为已开始，否则升级后平台上所有排队/在跑的计划
+	// 会一起停住。回填只在列新建那一次执行——无条件回填会把之后新建的「未开始」计划在
+	// 每次启动时误标成已开始。
+	if added, err := addColumnIfMissing(ctx, s.db, "orchestration_batches", "started_at", "datetime"); err != nil {
+		return fmt.Errorf("add orchestration batch start timestamp: %w", err)
+	} else if added {
+		if _, err := s.db.ExecContext(ctx, `update orchestration_batches set started_at=coalesce(created_at,?) where started_at is null`, time.Now().UTC()); err != nil {
+			return fmt.Errorf("backfill orchestration batch start timestamp: %w", err)
+		}
 	}
 	if err := ensureColumn(ctx, s.db, "task_orchestration_jobs", "human_decision", "text not null default ''"); err != nil {
 		return fmt.Errorf("add orchestration decision: %w", err)
 	}
 	if err := ensureColumn(ctx, s.db, "task_orchestration_jobs", "execution_context", "text not null default ''"); err != nil {
 		return fmt.Errorf("add orchestration execution context: %w", err)
+	}
+	// 计划级执行方式（隔离工作树 / 直接在已有分支上跑）。默认值就是升级前唯一的
+	// 行为，所以不需要回填——现存的计划和作业记录读出来全是 worktree。
+	if err := ensureColumn(ctx, s.db, "orchestration_batches", "execution_mode", "text not null default 'worktree'"); err != nil {
+		return fmt.Errorf("add orchestration batch execution mode: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "orchestration_batches", "target_branch", "text not null default ''"); err != nil {
+		return fmt.Errorf("add orchestration batch target branch: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "git_task_records", "execution_mode", "text not null default 'worktree'"); err != nil {
+		return fmt.Errorf("add git_task_records execution mode: %w", err)
 	}
 	if err := ensureColumn(ctx, s.db, "git_task_records", "resources_cleaned_at", "datetime"); err != nil {
 		return fmt.Errorf("add orchestration cleanup timestamp: %w", err)
@@ -387,7 +451,63 @@ drop table release_snapshots_legacy;`)
 // that policy: leaving it empty would let a round-tripped save clear it. The
 // queue is enabled by default — there is no opt-in switch any more.
 func defaultOrchestrationConfig(projectID string) OrchestrationConfig {
-	return OrchestrationConfig{ProjectID: projectID, Enabled: true, MainBranch: defaultOrchestrationMainBranch, AgentID: "claude-code", DevBranch: defaultOrchestrationDevBranch, VerificationCommands: []string{}, MaxFixRounds: 3}
+	// ExecutionMode 必须显式给默认值：老作业的 policy_snapshot 里没有这个字段，
+	// orchestrationConfigForJob 是先构造默认值再反序列化覆盖，靠这一行把"缺省即隔离
+	// 工作树"钉死，否则散落各处的空串判断迟早会漏一处。
+	return OrchestrationConfig{ProjectID: projectID, Enabled: true, MainBranch: defaultOrchestrationMainBranch, AgentID: "claude-code", DevBranch: defaultOrchestrationDevBranch, VerificationCommands: []string{}, MaxFixRounds: 3, ExecutionMode: orchestrationModeWorktree}
+}
+
+// orchestrationJobWorkspace 给出这条作业实际干活的位置。直接模式必须落在项目目录本身：
+// 记录里的 worktree_path 是空的（见 GitTaskRecord.ExecutionMode 的注释），照抄它的后果
+// 不是"没有工作区"，而是后面 os.MkdirAll(filepath.Dir("")) 与 os.Stat("") 双双得手，
+// 于是走进 `git worktree add -b "" "" <base>` —— 每一次第二轮起的重试都会炸在
+// "create task worktree" 上。传项目目录时 os.Stat 成功，worktree-add 整块自然跳过。
+func orchestrationJobWorkspace(projectPath, recordedWorktree string, direct bool) string {
+	if direct {
+		return projectPath
+	}
+	return recordedWorktree
+}
+
+// directModeWorkspaceInstruction 是直接模式追加到任务提示词里的约束。agent 在编排会话里
+// 拿的是 full_control 权限，这段提示词是唯一的软约束；越权的兜底校验在收尾阶段
+// （见 completeOrchestrationOnBranch）。
+func directModeWorkspaceInstruction(branch string) string {
+	return "本次任务直接在项目工作目录中实施（不是隔离工作树），目标分支是 " + branch + "：请在该分支上直接修改文件。\n" +
+		"必须遵守：\n" +
+		"- 不要创建任何提交（不要 git add / git commit / git rebase），改动留在工作目录里由用户自己提交；\n" +
+		"- 不要切换分支、不要新建分支、不要 git stash / git clean / git reset，不要改动 .git；\n" +
+		"- 工作区里可能已有用户尚未提交的改动，不要回滚或覆盖它们，只改本任务需要的文件。"
+}
+
+// isProjectWorkspaceOccupied 识别"项目工作区正被占用"这一类冲突。它在直接模式下不是
+// 失败而是"稍后再试"：agent 要用的正是用户此刻可能在聊天/浏览的那个目录。
+func isProjectWorkspaceOccupied(err error) bool {
+	var occupied *projectWorkspaceOccupiedError
+	return errors.As(err, &occupied)
+}
+
+// orchestrationPlanConfig 只解快照、不碰数据库，用于拿计划级参数（执行方式、目标分支）。
+// 会查库的 orchestrationConfigForJob 是另一回事：它还要为老快照补验证命令。
+func orchestrationPlanConfig(projectID, policySnapshot string) OrchestrationConfig {
+	cfg := defaultOrchestrationConfig(projectID)
+	if strings.TrimSpace(policySnapshot) != "" {
+		_ = json.Unmarshal([]byte(policySnapshot), &cfg)
+	}
+	return cfg
+}
+
+// orchestrationPlanBranch 是"这个作业的改动最终落在哪个分支"：直接模式取计划选定的分支，
+// 隔离工作树模式取项目的稳定分支（即合并目标）。只用于展示与直接模式的派发，
+// mergeTaskBranchToMain 仍走 orchestrationTargetBranch 的语义，不要混用。
+func orchestrationPlanBranch(cfg OrchestrationConfig) string {
+	if cfg.ExecutionMode == orchestrationModeBranch && strings.TrimSpace(cfg.TargetBranch) != "" {
+		return strings.TrimSpace(cfg.TargetBranch)
+	}
+	if strings.TrimSpace(cfg.MainBranch) == "" {
+		return defaultOrchestrationMainBranch
+	}
+	return cfg.MainBranch
 }
 
 // createOrchestrationConversation creates a dedicated background conversation
@@ -728,6 +848,15 @@ func (s *Server) enqueueTask(ctx context.Context, task Task, cfg OrchestrationCo
 			if changed == 0 {
 				err = tx.QueryRowContext(ctx, `select id,project_id,task_id,queue_position,status,attempt,lease_token,base_dev_sha,last_error,policy_snapshot,created_at,updated_at from task_orchestration_jobs where task_id=?`, task.ID).Scan(&job.ID, &job.ProjectID, &job.TaskID, &job.Position, &job.Status, &job.Attempt, &job.LeaseToken, &job.BaseDevSHA, &job.LastError, &job.PolicySnapshot, &job.CreatedAt, &job.UpdatedAt)
 				if err == nil {
+					// 幂等分支：这个任务已经有一行作业了。但**"已有一行"不等于"会被执行"**——
+					// 已收口的编排行永远不会再被调度器取走（nextOrchestrationJob 的排除列表）。
+					// 原来这里不看状态就 commit + kick + 202，于是对一条已经结束的编排点
+					// 「加入自动队列」会得到"成功"而状态毫无变化，可反复点、每次都"成功"
+					// （2026-09-29 定位：直接模式收口成 applied_to_branch 之后，任务仍是可入队的
+					// action_required，看板照旧渲染这颗按钮）。
+					if !orchestrationJobWillRun(job.Status) {
+						return OrchestrationJob{}, orchestrationSettledError(job.Status)
+					}
 					if err = tx.Commit(); err != nil {
 						return OrchestrationJob{}, err
 					}
@@ -756,7 +885,7 @@ func (s *Server) enqueueTask(ctx context.Context, task Task, cfg OrchestrationCo
 // errorStatusForEnqueue maps enqueue errors to the HTTP status code a handler
 // should return. Business-rule violations are 409; anything else is 500.
 func errorStatusForEnqueue(err error) int {
-	if errors.Is(err, errOrchestrationDisabled) || errors.Is(err, errOrchestrationTaskIneligible) {
+	if errors.Is(err, errOrchestrationDisabled) || errors.Is(err, errOrchestrationTaskIneligible) || errors.Is(err, errOrchestrationSettled) {
 		return http.StatusConflict
 	}
 	if errors.Is(err, errOrchestrationTaskNotFound) {
@@ -772,6 +901,54 @@ var errOrchestrationDisabled = errors.New("automatic orchestration is not enable
 var errOrchestrationTaskIneligible = errors.New("only todo or action-required tasks can enter the automatic queue")
 var errOrchestrationTaskNotFound = errors.New("task not found")
 var errOrchestrationTaskForeign = errors.New("task does not belong to this project")
+
+// errOrchestrationSettled 表示"这个任务已有一行作业、而且那一行不会再被调度器取走"。
+// 它与 errOrchestrationTaskIneligible 不同：任务本身是**可以**入队的，是上一次编排已经结束，
+// 直接入队会得到一个永远不执行的队列行（界面却报成功，见 orchestrationJobWillRun）。
+//
+// 与同组其它哨兵不同，这一条的**文案本身就是给用户看的**（经 writeError 直接上屏）：
+// localizedErrorText 的直通判据要求"含中文且没有残留英文"，写成英文就会被套上
+// "操作失败，请稍后重试。"这层什么都没说的兜底。所以它必须是中文。
+var errOrchestrationSettled = errors.New("这条任务的上一次自动编排已经结束")
+
+// orchestrationJobWillRun 报告一个已有作业行会不会被调度器取走。
+//
+// 判据与 nextOrchestrationJob 的 SQL **状态排除列表**逐项对应（那份是权威，改它就要改这里）：
+// 已落地到主干的（released_to_main / integrated_to_dev）、直接模式的终态
+// （applied_to_branch）、等待人工合并的（awaiting_main）、已停止的、正在清理的，
+// 调度器都不会再取。enqueue 的幂等分支必须问一句：把"已有一行"当成"已进队列"，
+// 用户就会对着一条**已经结束**的编排拿到 202 + "成功"。
+//
+// ⚠️ 它**不覆盖**调度器那条计划闸门（`batch_id=” or exists(… batch.started_at is not null)`）：
+// 一条 `queued` 的作业若属于**还没点「开始执行」**的计划，调度器同样取不走，而这里返回 true。
+// 这与单条入队的语义相符 —— "这一行还活着，没有理由拒绝"，而计划闸门表达的是
+// "这批活用户还没提交"，不是"这一行无效"。UI 上也不可达：这类任务的
+// orchestrationStatus 是 `queued`，任务看板只在 `!orchestrationStatus || stopped` 时
+// 才渲染「加入自动队列」。交叉校验测试（TestOrchestrationJobWillRunMatchesScheduler）
+// 只覆盖状态集合这一半，覆盖不了闸门 —— 别把它的通过读成"两者完全等价"。
+func orchestrationJobWillRun(status string) bool {
+	switch status {
+	case "released_to_main", "integrated_to_dev", orchestrationApplied, "awaiting_main", orchestrationStopped, orchestrationRemoving:
+		return false
+	}
+	return true
+}
+
+// orchestrationSettledError 给"上一次编排已经结束"配一句可操作的说明。
+// 文案里不出现英文：localizedErrorText 的直通判据要求"含中文且没有残留英文"，
+// 混进一个英文单词就会被套上"操作失败，请稍后重试。"这层什么都没说的兜底。
+func orchestrationSettledError(status string) error {
+	if status == orchestrationStopped {
+		return fmt.Errorf("%w。这一行处于已停止状态，请用「继续自动编排」恢复它", errOrchestrationSettled)
+	}
+	// 状态文案与"已经有编排记录"那条报错共用一份（orchestrationStatusText），
+	// 免得同一个状态在两处被说成两种样子。
+	label := orchestrationStatusText(status)
+	if label == "" {
+		label = "已结束"
+	}
+	return fmt.Errorf("%w（%s），队列不会再执行它。请用「重新下发」重新开始一次编排", errOrchestrationSettled, label)
+}
 
 // enqueueBatchTasks adds multiple tasks to the project's orchestration queue in
 // the order given. Tasks already in the queue are skipped so a partial failure
@@ -873,6 +1050,11 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 		Name                 string   `json:"name"`
 		TaskIDs              []string `json:"taskIds"`
 		ConversationStrategy string   `json:"conversationStrategy"`
+		// ExecutionMode 是**计划级**选择：worktree（默认，拉临时分支 + 独立工作树，
+		// 完成后由用户合并）或 branch（直接在 TargetBranch 上改，不建分支、不建工作树、
+		// 不形成提交、也没有可合并的东西）。
+		ExecutionMode string `json:"executionMode"`
+		TargetBranch  string `json:"targetBranch"`
 		// Policy overrides are pointers so an omitted field keeps the current
 		// project policy instead of silently resetting it.
 		MainBranch   *string `json:"mainBranch"`
@@ -899,6 +1081,32 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, errors.New("conversationStrategy must be new or continue"))
 		return
 	}
+	input.ExecutionMode = strings.TrimSpace(input.ExecutionMode)
+	if input.ExecutionMode == "" {
+		input.ExecutionMode = orchestrationModeWorktree
+	}
+	if input.ExecutionMode != orchestrationModeWorktree && input.ExecutionMode != orchestrationModeBranch {
+		writeError(w, http.StatusBadRequest, errors.New("executionMode must be worktree or branch"))
+		return
+	}
+	input.TargetBranch = strings.TrimSpace(input.TargetBranch)
+	if input.ExecutionMode == orchestrationModeBranch {
+		// 直接模式要求目标分支此刻就存在。等到派发才发现的话，第一批子任务会直接走
+		// failOrchestrationJob —— 那是 needs_human 加整个项目队列冻结，代价太大。
+		if !validOrchestrationBranch(input.TargetBranch) {
+			writeError(w, http.StatusBadRequest, errors.New("direct mode target branch is invalid"))
+			return
+		}
+		project, projectErr := s.getProjectByID(r.Context(), projectID)
+		if projectErr != nil {
+			writeError(w, http.StatusInternalServerError, projectErr)
+			return
+		}
+		if err := s.gitCommand(r.Context(), project.Path, "show-ref", "--verify", "--quiet", "refs/heads/"+input.TargetBranch); err != nil {
+			writeError(w, http.StatusConflict, fmt.Errorf("direct mode requires an existing local branch: %s", input.TargetBranch))
+			return
+		}
+	}
 	cfg, err := s.orchestrationConfig(r.Context(), projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -915,6 +1123,13 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 	}
 	if input.MaxFixRounds != nil {
 		cfg.MaxFixRounds = *input.MaxFixRounds
+	}
+	// 执行方式是计划级参数，进了作业快照（saveOrchestrationPolicy 不写这两列，
+	// 所以项目行里依然只有项目级策略），这样执行期和列表展示都不用反查批次行。
+	cfg.ExecutionMode = input.ExecutionMode
+	cfg.TargetBranch = ""
+	if input.ExecutionMode == orchestrationModeBranch {
+		cfg.TargetBranch = input.TargetBranch
 	}
 	// Creating a plan is the moment the execution policy is decided, so it is
 	// also what arms the project queue.
@@ -949,13 +1164,13 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if s.hasOrchestrationJob(r.Context(), taskID) {
-			writeError(w, http.StatusConflict, fmt.Errorf("task %s already has an orchestration record", taskID))
+			writeError(w, http.StatusConflict, s.orchestrationRecordConflict(r.Context(), taskID))
 			return
 		}
 		tasks = append(tasks, task)
 	}
 	now := time.Now().UTC()
-	batch := OrchestrationBatch{ID: uuid.NewString(), ProjectID: projectID, Name: input.Name, ConversationStrategy: input.ConversationStrategy, Status: "active", CreatedAt: now, UpdatedAt: now}
+	batch := OrchestrationBatch{ID: uuid.NewString(), ProjectID: projectID, Name: input.Name, ConversationStrategy: input.ConversationStrategy, Status: "active", ExecutionMode: input.ExecutionMode, TargetBranch: cfg.TargetBranch, CreatedAt: now, UpdatedAt: now}
 	policy, err := json.Marshal(cfg)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -970,7 +1185,7 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 	// The plan and the policy it was created with commit together: a plan that
 	// exists must always be backed by the policy its dialog showed.
 	if err = saveOrchestrationPolicy(r.Context(), tx, projectID, cfg, now); err == nil {
-		_, err = tx.ExecContext(r.Context(), `insert into orchestration_batches (id,project_id,name,conversation_strategy,created_at,updated_at) values (?,?,?,?,?,?)`, batch.ID, batch.ProjectID, batch.Name, batch.ConversationStrategy, now, now)
+		_, err = tx.ExecContext(r.Context(), `insert into orchestration_batches (id,project_id,name,conversation_strategy,execution_mode,target_branch,created_at,updated_at) values (?,?,?,?,?,?,?,?)`, batch.ID, batch.ProjectID, batch.Name, batch.ConversationStrategy, batch.ExecutionMode, batch.TargetBranch, now, now)
 	}
 	if err == nil {
 		var position int
@@ -1008,7 +1223,7 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, errors.New("project not found"))
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,name,conversation_strategy,created_at,updated_at from orchestration_batches where project_id=? and archived_at is null order by created_at desc`, projectID)
+	rows, err := s.db.QueryContext(r.Context(), `select id,project_id,name,conversation_strategy,started_at,execution_mode,target_branch,created_at,updated_at from orchestration_batches where project_id=? order by created_at desc`, projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1016,11 +1231,13 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 	items := []OrchestrationBatch{}
 	for rows.Next() {
 		var item OrchestrationBatch
-		if err := rows.Scan(&item.ID, &item.ProjectID, &item.Name, &item.ConversationStrategy, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		var startedAt sql.NullTime
+		if err := rows.Scan(&item.ID, &item.ProjectID, &item.Name, &item.ConversationStrategy, &startedAt, &item.ExecutionMode, &item.TargetBranch, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			rows.Close()
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		item.Started = startedAt.Valid
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -1044,9 +1261,13 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 			return
 		}
 		item.CompletedCount = item.TaskCount - active - blocked - paused - awaitingMain
-		// A plan is created before its tasks are picked, so an empty plan is a
-		// fresh plan rather than a finished one.
-		if item.TaskCount == 0 {
+		// 未开始的计划优先于一切派生状态：它的子任务全是 queued，按下面的推导会落到
+		// 「active」，那会让①栏把一个还没提交的草稿画成正在执行。
+		if !item.Started {
+			item.Status = "not_started"
+		} else if item.TaskCount == 0 {
+			// A plan is created before its tasks are picked, so an empty plan is a
+			// fresh plan rather than a finished one.
 			item.Status = "active"
 		} else if blocked > 0 {
 			item.Status = "needs_human"
@@ -1061,38 +1282,6 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 		}
 	}
 	writeJSON(w, http.StatusOK, items)
-}
-
-// deleteOrchestrationBatch archives a plan from the user-facing list. Queue
-// jobs retain their batch ID so inherited conversation context stays intact.
-func (s *Server) deleteOrchestrationBatch(w http.ResponseWriter, r *http.Request) {
-	projectID, batchID := chi.URLParam(r, "projectID"), chi.URLParam(r, "batchID")
-	tx, err := s.db.BeginTx(r.Context(), nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-	now := time.Now().UTC()
-	result, err := tx.ExecContext(r.Context(), `update orchestration_batches set archived_at=?,updated_at=? where id=? and project_id=? and archived_at is null`, now, now, batchID, projectID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if changed != 1 {
-		writeError(w, http.StatusNotFound, errors.New("orchestration batch not found"))
-		return
-	}
-	if err = tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // addTasksToOrchestrationBatch permits a running plan to grow without
@@ -1119,14 +1308,24 @@ func (s *Server) addTasksToOrchestrationBatch(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusConflict, errOrchestrationDisabled)
 		return
 	}
-	var batchExists bool
-	if err = s.db.QueryRowContext(r.Context(), `select exists(select 1 from orchestration_batches where id=? and project_id=? and archived_at is null)`, batchID, projectID).Scan(&batchExists); err != nil {
+	// 这里重新快照的是**当前项目策略**（不是建计划时的），所以计划级的执行方式必须
+	// 从批次行补回来，否则后加的子任务会退回默认的隔离工作树。
+	var batchMode, batchBranch string
+	if err = s.db.QueryRowContext(r.Context(), `select execution_mode,coalesce(target_branch,'') from orchestration_batches where id=? and project_id=?`, batchID, projectID).Scan(&batchMode, &batchBranch); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("orchestration batch not found"))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !batchExists {
-		writeError(w, http.StatusNotFound, errors.New("orchestration batch not found"))
-		return
+	if batchMode == "" {
+		batchMode = orchestrationModeWorktree
+	}
+	cfg.ExecutionMode = batchMode
+	cfg.TargetBranch = ""
+	if batchMode == orchestrationModeBranch {
+		cfg.TargetBranch = batchBranch
 	}
 	seen := map[string]bool{}
 	tasks := make([]Task, 0, len(input.TaskIDs))
@@ -1154,7 +1353,7 @@ func (s *Server) addTasksToOrchestrationBatch(w http.ResponseWriter, r *http.Req
 			return
 		}
 		if s.hasOrchestrationJob(r.Context(), taskID) {
-			writeError(w, http.StatusConflict, fmt.Errorf("task %s already has an orchestration record", taskID))
+			writeError(w, http.StatusConflict, s.orchestrationRecordConflict(r.Context(), taskID))
 			return
 		}
 		tasks = append(tasks, task)
@@ -1199,6 +1398,99 @@ func (s *Server) addTasksToOrchestrationBatch(w http.ResponseWriter, r *http.Req
 		return
 	}
 	s.kickProjectOrchestrator(projectID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// startOrchestrationBatch releases a plan's queue gate. Jobs of an unstarted plan are
+// plain `queued` rows that the scheduler skips, so this only has to record the start
+// time and wake the orchestrator — no Git or filesystem work is involved, which is why
+// it needs neither the workspace lock nor a status guard. It is idempotent: starting an
+// already-started plan (or double-clicking) is a no-op that still kicks the queue.
+func (s *Server) startOrchestrationBatch(w http.ResponseWriter, r *http.Request) {
+	projectID, batchID := chi.URLParam(r, "projectID"), chi.URLParam(r, "batchID")
+	if !s.projectExists(r.Context(), projectID) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(r.Context(), `update orchestration_batches set started_at=?,updated_at=? where id=? and project_id=? and started_at is null`, now, now, batchID, projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed, _ := result.RowsAffected(); changed == 0 {
+		// 没写中只有两种可能：计划不存在，或者本来就已经开始了。区分开，否则重复点击
+		// 会拿到 404，用户会以为计划被删了。
+		var exists bool
+		if err = s.db.QueryRowContext(r.Context(), `select exists(select 1 from orchestration_batches where id=? and project_id=?)`, batchID, projectID).Scan(&exists); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !exists {
+			writeError(w, http.StatusNotFound, errors.New("orchestration batch not found"))
+			return
+		}
+	}
+	s.kickProjectOrchestrator(projectID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteOrchestrationBatch removes a plan without touching the tasks it grouped.
+// A plan is only a label: the scheduler picks jobs by queue_position and never
+// reads batch_id, so detaching its jobs leaves every execution, worktree and
+// task branch intact. The jobs themselves are kept on purpose — an orchestrated
+// task is retained for audit and cannot be hard deleted (see deleteTask), so
+// dropping its job row would silently re-open that path.
+func (s *Server) deleteOrchestrationBatch(w http.ResponseWriter, r *http.Request) {
+	projectID, batchID := chi.URLParam(r, "projectID"), chi.URLParam(r, "batchID")
+	if !s.projectExists(r.Context(), projectID) {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
+	var batchExists bool
+	if err = tx.QueryRowContext(r.Context(), `select exists(select 1 from orchestration_batches where id=? and project_id=?)`, batchID, projectID).Scan(&batchExists); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !batchExists {
+		writeError(w, http.StatusNotFound, errors.New("orchestration batch not found"))
+		return
+	}
+	// Fail closed on everything that is not provably finished: a job that can
+	// still run would silently lose the batch conversation it inherits, and the
+	// user should get the chance to stop or remove it first. Listing the allowed
+	// statuses rather than the blocked ones keeps a future status blocking by default.
+	// applied_to_branch 是直接模式的终态：作业已经改完、改动留在工作目录里，不会再
+	// 跑第二轮，所以它和 released_to_main 一样属于"已结束"，必须放行——否则直接模式
+	// 的计划永远删不掉。
+	var unfinished int
+	if err = tx.QueryRowContext(r.Context(), `select count(*) from task_orchestration_jobs where batch_id=? and status not in ('released_to_main',?,?)`, batchID, orchestrationStopped, orchestrationApplied).Scan(&unfinished); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if unfinished > 0 {
+		writeError(w, http.StatusConflict, fmt.Errorf("orchestration batch still has unfinished tasks: %d", unfinished))
+		return
+	}
+	now := time.Now().UTC()
+	if _, err = tx.ExecContext(r.Context(), `update task_orchestration_jobs set batch_id='',updated_at=? where batch_id=?`, now, batchID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `delete from orchestration_batches where id=? and project_id=?`, batchID, projectID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1436,7 +1728,12 @@ func (s *Server) listOrchestrationJobs(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		item.TargetBranch = orchestrationTargetBranch(item.ProjectID, item.PolicySnapshot)
+		// 计划级参数一次解码同时拿到执行方式与"改动落在哪个分支"：直接模式是计划选定的
+		// 分支，隔离工作树模式仍是合并目标（稳定分支）。这样计划被删除、作业脱组之后
+		// 也不会退化成用项目当前的 main_branch 去渲染一个「已写入 master」的作业。
+		planCfg := orchestrationPlanConfig(item.ProjectID, item.PolicySnapshot)
+		item.ExecutionMode = planCfg.ExecutionMode
+		item.TargetBranch = orchestrationPlanBranch(planCfg)
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -1487,6 +1784,8 @@ func (s *Server) cleanupOrchestrationResources(w http.ResponseWriter, r *http.Re
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// applied_to_branch（直接模式终态）刻意不在允许集里：那条路线没有任务分支也没有工作树，
+	// 没有任何 Git 资源可清，接口在这里返回 409 是准确的，不是缺一条白名单。
 	if job.Status != "released_to_main" && job.Status != orchestrationStopped && job.Status != orchestrationNeedsHuman {
 		writeError(w, http.StatusConflict, errors.New("pause or stop the orchestration task before cleaning its resources"))
 		return
@@ -2062,10 +2361,25 @@ func (s *Server) processProjectOrchestration(ctx context.Context, projectID stri
 			return
 		}
 	}
-	if err := s.prepareAndDispatchOrchestrationJob(jobCtx, *job, cfg); err != nil && !errors.Is(err, errOrchestrationWaiting) && !errors.Is(err, context.Canceled) {
-		s.failOrchestrationJob(jobCtx, *job, err)
-		return
+	if err := s.prepareAndDispatchOrchestrationJob(jobCtx, *job, cfg); err != nil {
+		if errors.Is(err, errOrchestrationWorkspaceBusy) {
+			// 项目工作区被用户占着（他自己的会话/文件树/Git 操作）。作业留在 preparing，
+			// 稍后再来；不能当成失败，否则一次"用户正在打字"就会冻结整个项目队列。
+			s.scheduleOrchestrationRetry(job.ProjectID)
+			return
+		}
+		if !errors.Is(err, errOrchestrationWaiting) && !errors.Is(err, context.Canceled) {
+			s.failOrchestrationJob(jobCtx, *job, err)
+			return
+		}
 	}
+}
+
+// scheduleOrchestrationRetry 安排一次短延重试。编排循环本身是事件驱动的：没有这个定时器，
+// "工作区被占用"这类可重试状态会一直等下一个人为的 kick（用户加子任务、点开始执行），
+// 而这里的占用通常几秒就释放了。
+func (s *Server) scheduleOrchestrationRetry(projectID string) {
+	time.AfterFunc(orchestrationWorkspaceRetryDelay, func() { s.kickProjectOrchestrator(projectID) })
 }
 
 // resumeCommittedOrchestrationReview continues from an implementation commit.
@@ -2152,9 +2466,13 @@ func (s *Server) waitForOrchestrationJobShutdown(ctx context.Context, jobID stri
 	}
 }
 
+// nextOrchestrationJob 取本项目下一个**可跑**的作业。未开始的计划（batch.started_at 为空）
+// 对调度器不可见：这是有别于「依赖未就绪就等待」的语义（见 docs/14 §4.1），因为计划闸门
+// 表达的是"用户还没提交这批活"，若让它阻塞队首，一个未开始的计划就会把后面已开始的计划
+// 一起卡死。batch_id 为空是任务页单条入队的历史形态，照旧立即跑。
 func (s *Server) nextOrchestrationJob(ctx context.Context, projectID string) (*OrchestrationJob, error) {
 	var job OrchestrationJob
-	err := s.db.QueryRowContext(ctx, `select id,project_id,task_id,queue_position,status,attempt,lease_token,base_dev_sha,last_error,policy_snapshot,batch_id,human_decision,execution_context,created_at,updated_at from task_orchestration_jobs where project_id=? and status not in ('integrated_to_dev','awaiting_main','released_to_main','stopped','removing') order by queue_position limit 1`, projectID).Scan(&job.ID, &job.ProjectID, &job.TaskID, &job.Position, &job.Status, &job.Attempt, &job.LeaseToken, &job.BaseDevSHA, &job.LastError, &job.PolicySnapshot, &job.BatchID, &job.HumanDecision, &job.ExecutionContext, &job.CreatedAt, &job.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `select id,project_id,task_id,queue_position,status,attempt,lease_token,base_dev_sha,last_error,policy_snapshot,batch_id,human_decision,execution_context,created_at,updated_at from task_orchestration_jobs where project_id=? and status not in ('integrated_to_dev','awaiting_main','released_to_main','applied_to_branch','stopped','removing') and (batch_id='' or exists (select 1 from orchestration_batches batch where batch.id=task_orchestration_jobs.batch_id and batch.started_at is not null)) order by queue_position limit 1`, projectID).Scan(&job.ID, &job.ProjectID, &job.TaskID, &job.Position, &job.Status, &job.Attempt, &job.LeaseToken, &job.BaseDevSHA, &job.LastError, &job.PolicySnapshot, &job.BatchID, &job.HumanDecision, &job.ExecutionContext, &job.CreatedAt, &job.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -2245,15 +2563,63 @@ func (s *Server) hasOrchestrationJob(ctx context.Context, taskID string) bool {
 	return err == nil && exists
 }
 
+// orchestrationStatusText 把作业状态说成一句人能读的话（认不出的状态回空串）。
+// 两处"这个任务已经有编排记录了"的报错共用它，措辞只此一份。
+func orchestrationStatusText(status string) string {
+	return map[string]string{
+		orchestrationQueued:       "排队中",
+		orchestrationPreparing:    "正在准备",
+		orchestrationImplementing: "正在实施",
+		orchestrationChecking:     "正在校验",
+		orchestrationNeedsHuman:   "等待人工处理",
+		orchestrationPaused:       "已暂停",
+		orchestrationStopped:      "已停止",
+		orchestrationRemoving:     "正在清理",
+		orchestrationApplied:      "已把改动直接写入目标分支",
+		"released_to_main":        "已合并到目标分支",
+		"integrated_to_dev":       "已集成到开发分支",
+		"awaiting_main":           "等待合并到主线",
+	}[status]
+}
+
+// orchestrationRecordConflict 是"这个任务已经有一行编排作业"时的报错，**必须中文且给出出路**。
+//
+// 它替代了原来那句 `fmt.Errorf("task %s already has an orchestration record")`：
+// 纯英文过不了 localizedErrorText 的直通判据，用户看到的是
+// "当前操作与进行中的操作冲突，请稍后重试。：task 1234 already has an orchestration record"
+// —— 既没有"进行中的操作"（有时那一行早就结束了），也没告诉用户该走「重新下发」。
+//
+// 两种情形不能共用一句话：
+//   - 那一行还活着（调度器会取）→ 让用户等它结束或先停掉它；
+//   - 那一行已经收口（released_to_main / applied_to_branch …）→ 复用单条入队那条文案，
+//     指的是同一条出路（「重新下发」）。
+func (s *Server) orchestrationRecordConflict(ctx context.Context, taskID string) error {
+	var status string
+	err := s.db.QueryRowContext(ctx, `select status from task_orchestration_jobs where task_id=? order by updated_at desc limit 1`, taskID).Scan(&status)
+	if err != nil {
+		// 查不到（并发删掉了）就退回一句不指路的实情，别编状态。
+		return errors.New("这条任务已经有一条自动编排记录，请刷新后重试")
+	}
+	if !orchestrationJobWillRun(status) {
+		return orchestrationSettledError(status)
+	}
+	label := orchestrationStatusText(status)
+	if label == "" {
+		label = "进行中"
+	}
+	return fmt.Errorf("这条任务已经有一条自动编排记录（%s）。请等它结束，或先在编排页停止它，再重新加入", label)
+}
+
 // sqlQueryer 是 *sql.DB 与 *sql.Tx 的最小公共查询接口，供跨 DB/事务复用的查询辅助使用。
 type sqlQueryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // orchestrationOwnsTask 判断任务是否仍被"编排感知"的 job 持有执行上下文（即存在未合并的
-// orchestration job）。released_to_main 是终态（已合并进目标分支），编排已结束，不再
-// 阻止手动重新下发。判定集合与前端 hydrateTask 的 orchestrationStatus 查询完全一致
-// （同样排除 released_to_main），避免"前端显示可重新下发、后端 409"的前后端不一致。
+// orchestration job）。两个终态都排除在外：released_to_main（已合并进目标分支）与
+// applied_to_branch（直接模式已把改动写进工作目录、编排已经结束）——它们不再阻止手动
+// 重新下发。判定集合与前端 hydrateTask 的 orchestrationStatus 查询必须一致（同样排除这两
+// 个终态），否则会出现"前端显示可重新下发、后端 409"（或反向）的前后端不一致。
 func orchestrationOwnsTask(ctx context.Context, q sqlQueryer, taskID string) (bool, error) {
 	var owns bool
 	err := q.QueryRowContext(ctx, `select exists(select 1 from task_orchestration_jobs
@@ -2263,7 +2629,9 @@ func orchestrationOwnsTask(ctx context.Context, q sqlQueryer, taskID string) (bo
 
 func (s *Server) orchestrationDependenciesIntegrated(ctx context.Context, taskID string) (bool, error) {
 	var unresolved int
-	err := s.db.QueryRowContext(ctx, `select count(*) from task_dependencies dependency left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status='released_to_main' where dependency.task_id=? and predecessor.id is null`, taskID).Scan(&unresolved)
+	// 终态集合走 orchestrationIntegratedStatuses：validateTaskDispatchTx 里有一份
+	// 事务内的同款查询，两处口径必须完全一致（见该常量的注释）。
+	err := s.db.QueryRowContext(ctx, `select count(*) from task_dependencies dependency left join task_orchestration_jobs predecessor on predecessor.task_id=dependency.predecessor_task_id and predecessor.status in (`+orchestrationIntegratedStatuses+`) where dependency.task_id=? and predecessor.id is null`, taskID).Scan(&unresolved)
 	return unresolved == 0, err
 }
 
@@ -2296,7 +2664,28 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 	} else if !ready {
 		return errOrchestrationWaiting
 	}
-	if err := s.gitCommand(ctx, project.Path, "show-ref", "--verify", "--quiet", "refs/heads/"+cfg.MainBranch); err != nil {
+	// 计划级执行方式。直接模式（branch）不铸分支、不建工作树、不提交也不合并：
+	// agent 直接在项目工作目录里改，改动留在原地等用户自己 commit。
+	direct := cfg.ExecutionMode == orchestrationModeBranch
+	targetBranch := ""
+	if direct {
+		targetBranch = strings.TrimSpace(cfg.TargetBranch)
+		if !validOrchestrationBranch(targetBranch) {
+			return errors.New("direct mode target branch is missing")
+		}
+		// 分支必须已存在，且工作区必须正检出它。Milevia 绝不替用户切分支：宁可在派发前
+		// 停下并说清楚，也不要悄悄把改动写到另一个分支上。
+		if err := s.gitCommand(ctx, project.Path, "show-ref", "--verify", "--quiet", "refs/heads/"+targetBranch); err != nil {
+			return fmt.Errorf("direct mode target branch check: %w", err)
+		}
+		current, err := s.gitOutput(ctx, project.Path, "branch", "--show-current")
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(current) != targetBranch {
+			return fmt.Errorf("direct mode requires the project worktree to be on %s (currently on %s)", targetBranch, strings.TrimSpace(current))
+		}
+	} else if err := s.gitCommand(ctx, project.Path, "show-ref", "--verify", "--quiet", "refs/heads/"+cfg.MainBranch); err != nil {
 		return fmt.Errorf("main branch check: %w", err)
 	}
 	var base, branch, worktree string
@@ -2306,6 +2695,14 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			base, branch, worktree = record.BaseDevSHA, record.TaskBranch, record.WorktreePath
 		} else if !errors.Is(recordErr, sql.ErrNoRows) {
 			return recordErr
+		} else if direct {
+			base, err = s.gitOutput(ctx, project.Path, "rev-parse", targetBranch)
+			if err != nil {
+				return err
+			}
+			base = strings.TrimSpace(base)
+			branch = ""
+			worktree = project.Path
 		} else {
 			// The task branch is created from the committed main branch SHA and
 			// checked out into an isolated worktree, so uncommitted or untracked
@@ -2321,6 +2718,16 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			}
 			base = strings.TrimSpace(base)
 			worktree = filepath.Join(filepath.Dir(project.Path), ".auto-worktrees", project.ID, job.ID)
+		}
+		worktree = orchestrationJobWorkspace(project.Path, worktree, direct)
+		// 写进 git_task_records 的路径与运行时用的路径**不同**：直接模式下运行时工作区是
+		// 项目目录，而记录里的 worktree_path 必须留空——清理路径会对非空值执行
+		// os.Stat + `git worktree remove --force`，把项目目录写进去等于让「清理资源」
+		// 去删用户的仓库根。（branch 在直接模式下本来就是空串，同理不会被 git branch -D。）
+		recordedWorktree := worktree
+		recordMode := orchestrationModeWorktree
+		if direct {
+			recordedWorktree, recordMode = "", orchestrationModeBranch
 		}
 		now := time.Now().UTC()
 		// Create a dedicated background conversation for this task so the
@@ -2354,13 +2761,13 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			_, err = tx.ExecContext(ctx, `update task_orchestration_jobs set execution_context=? where id=?`, continuityContext, job.ID)
 		}
 		if err == nil && recordErr != nil {
-			_, err = tx.ExecContext(ctx, `insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,created_at,updated_at) values (?,?,?,?,?,?,?) on conflict(job_id) do update set base_dev_sha=excluded.base_dev_sha,task_branch=excluded.task_branch,worktree_path=excluded.worktree_path,conversation_id=excluded.conversation_id,updated_at=excluded.updated_at`, job.ID, base, branch, worktree, conversationID, now, now)
+			_, err = tx.ExecContext(ctx, `insert into git_task_records (job_id,base_dev_sha,task_branch,worktree_path,conversation_id,execution_mode,created_at,updated_at) values (?,?,?,?,?,?,?,?) on conflict(job_id) do update set base_dev_sha=excluded.base_dev_sha,task_branch=excluded.task_branch,worktree_path=excluded.worktree_path,conversation_id=excluded.conversation_id,execution_mode=excluded.execution_mode,updated_at=excluded.updated_at`, job.ID, base, branch, recordedWorktree, conversationID, recordMode, now, now)
 		}
 		if err == nil {
 			_, err = tx.ExecContext(ctx, `insert into task_execution_intents (id,job_id,phase,attempt,status,created_at,updated_at) values (?,?,?,?,?,?,?) on conflict(job_id,phase,attempt) do nothing`, uuid.NewString(), job.ID, "implementation", job.Attempt+1, "pending", now, now)
 		}
 		if err == nil {
-			err = s.recordTaskEventTx(ctx, tx, task.ID, "", "orchestration.preparing", map[string]string{"baseDevSha": base, "branch": branch}, now)
+			err = s.recordTaskEventTx(ctx, tx, task.ID, "", "orchestration.preparing", map[string]string{"baseDevSha": base, "branch": branch, "executionMode": recordMode}, now)
 		}
 		if err != nil {
 			tx.Rollback()
@@ -2379,6 +2786,10 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			return recordErr
 		}
 		base, branch, worktree = record.BaseDevSHA, record.TaskBranch, record.WorktreePath
+		// 重试/续跑同样要落在项目目录上。记录里的 worktree_path 在直接模式下是空的，
+		// 直接用会让下面的 os.Stat("") 命中 ErrNotExist，从而走进
+		// `git worktree add -b "" "" <base>` —— 每次第二轮起的重试都会炸在这里。
+		worktree = orchestrationJobWorkspace(project.Path, worktree, direct)
 	}
 	conversationID, err := s.orchestrationConversationID(ctx, job.ID)
 	if err != nil {
@@ -2435,9 +2846,20 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 		}
 		repairContext += "用户已作出以下业务决策，请据此继续：\n" + strings.TrimSpace(job.HumanDecision)
 	}
-	_, _, err = s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, task.ID, worktree, repairContext, executionIntentID, conversationID)
+	instruction := ""
+	if direct {
+		instruction = directModeWorkspaceInstruction(targetBranch)
+	}
+	_, _, err = s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, task.ID, worktree, repairContext, executionIntentID, conversationID, instruction)
 	if err != nil {
-		return fmt.Errorf("dispatch implementation: %s", err)
+		// 直接模式在项目工作目录里跑，派发要抢的是项目级工作区租约。用户此刻正在这个
+		// 项目里聊天/用文件树是很正常的事，那不是失败而是"稍后再试"：把它当成需要人工
+		// 介入的失败会直接 needs_human + 冻结整个项目队列，而用户完全不知道是自己打字
+		// 导致的。哨兵由 processProjectOrchestration 识别并安排短延重试。
+		if direct && isProjectWorkspaceOccupied(err) {
+			return errOrchestrationWorkspaceBusy
+		}
+		return fmt.Errorf("dispatch implementation: %w", err)
 	}
 	result, err := s.db.ExecContext(ctx, `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=? and lease_token=?`, orchestrationImplementing, time.Now().UTC(), job.ID, orchestrationPreparing, job.LeaseToken)
 	if err != nil {
@@ -2478,8 +2900,8 @@ func (s *Server) completeOrchestrationImplementation(ctx context.Context, job Or
 	if err := s.assertOrchestrationLease(ctx, job); err != nil {
 		return
 	}
-	var taskStatus, worktree string
-	err := s.db.QueryRowContext(ctx, `select task.status,record.worktree_path from task_orchestration_jobs job join tasks task on task.id=job.task_id join git_task_records record on record.job_id=job.id where job.id=?`, job.ID).Scan(&taskStatus, &worktree)
+	var taskStatus, worktree, recordMode, baseDevSHA string
+	err := s.db.QueryRowContext(ctx, `select task.status,record.worktree_path,coalesce(record.execution_mode,''),record.base_dev_sha from task_orchestration_jobs job join tasks task on task.id=job.task_id join git_task_records record on record.job_id=job.id where job.id=?`, job.ID).Scan(&taskStatus, &worktree, &recordMode, &baseDevSHA)
 	if err != nil {
 		s.retryOrchestrationJob(ctx, job, cfg, err)
 		return
@@ -2505,6 +2927,13 @@ func (s *Server) completeOrchestrationImplementation(ctx context.Context, job Or
 	project, err := s.getProjectByID(ctx, job.ProjectID)
 	if err != nil {
 		s.retryOrchestrationJob(ctx, job, cfg, err)
+		return
+	}
+	// 直接模式没有提交、没有任务分支、没有要合并的东西：改完就收口成 applied_to_branch，
+	// 任务留在 awaiting_review 等用户自己验收与提交。判断依据取记录里的 execution_mode
+	// 而不是当前策略：策略在入队之后可能被改，记录才是这条作业实际走过的路。
+	if recordMode == orchestrationModeBranch {
+		s.completeOrchestrationOnBranch(ctx, job, project, cfg, baseDevSHA)
 		return
 	}
 	// 编排不再自动运行验证命令与独立审查：实现提交后直接进入待合并状态，
@@ -2540,7 +2969,9 @@ func (s *Server) orchestrationImplementationFailure(ctx context.Context, job Orc
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
-	return strings.TrimSpace(strings.TrimPrefix(failureReason, "任务执行失败，请查看任务日志后重试。：")), err
+	// 剥的是 errorText 的通用兜底前缀（见 taskFailureFallbackPrefix）：这里只要 Agent 那截
+	// 可执行的原因，不要把面向任务页的"请查看任务日志后重试"带进作业 last_error。
+	return strings.TrimSpace(strings.TrimPrefix(failureReason, taskFailureFallbackPrefix)), err
 }
 
 func (s *Server) advanceOrchestrationJob(ctx context.Context, job OrchestrationJob, from, to string) error {
@@ -2556,6 +2987,54 @@ func (s *Server) advanceOrchestrationJob(ctx context.Context, job OrchestrationJ
 		return errors.New("orchestration job state changed")
 	}
 	return nil
+}
+
+// completeOrchestrationOnBranch 收口直接模式的作业：agent 已经改完，改动就留在项目工作
+// 目录里，调度器不提交、不建分支、也没有可合并的东西。作业进入 applied_to_branch（终态），
+// 任务留在 awaiting_review 等用户在任务页验收。
+//
+// 必须可重入：崩溃恢复会让它在 checking 状态下再跑一次，所以状态推进一律带状态守卫。
+func (s *Server) completeOrchestrationOnBranch(ctx context.Context, job OrchestrationJob, project Project, cfg OrchestrationConfig, baseDevSHA string) {
+	target := strings.TrimSpace(cfg.TargetBranch)
+	if target == "" {
+		target = orchestrationPlanBranch(cfg)
+	}
+	current, err := s.gitOutput(ctx, project.Path, "branch", "--show-current")
+	if err != nil {
+		s.failOrchestrationJob(ctx, job, err)
+		return
+	}
+	// agent 在编排会话里拿的是 full_control 权限，"不要切分支"只是提示词里的软约束。
+	// 真被切走了必须让人看见：这时改动落在别的分支上，记成「已写入 <目标分支>」是谎报。
+	if current = strings.TrimSpace(current); current != target {
+		onBranch := current
+		if onBranch == "" {
+			onBranch = "detached HEAD"
+		}
+		s.failOrchestrationJob(ctx, job, fmt.Errorf("direct mode task ended on %s instead of %s", onBranch, target))
+		return
+	}
+	// agent 自己提交了：改动进了提交里，任务照常收口（reset --soft 就能退回未提交状态），
+	// 但必须明确说出来——"不自动提交"是用户选定的语义，静默接受等于骗人。
+	if head, headErr := s.gitOutput(ctx, project.Path, "rev-parse", "HEAD"); headErr == nil && strings.TrimSpace(baseDevSHA) != "" && strings.TrimSpace(head) != strings.TrimSpace(baseDevSHA) {
+		note := fmt.Sprintf("直接模式约定不创建提交，但检测到分支 %s 的 HEAD 已从 %s 变为 %s，Agent 可能自行提交了改动。请自行确认该提交的内容。", target, shortGitSHA(baseDevSHA), shortGitSHA(head))
+		s.postOrchestrationMessage(ctx, job, note)
+		_, _ = s.db.ExecContext(ctx, `update task_orchestration_jobs set last_error=?,updated_at=? where id=? and lease_token=?`, note, time.Now().UTC(), job.ID, job.LeaseToken)
+	}
+	if err := s.advanceOrchestrationJob(ctx, job, orchestrationChecking, orchestrationApplied); err != nil {
+		return
+	}
+	_, _ = s.db.ExecContext(ctx, `update orchestration_outbox set status='completed',completed_at=? where job_id=? and status='pending'`, time.Now().UTC(), job.ID)
+	// 与隔离工作树那条路一样：让当前 worker 先释放内存里的守卫，再去取下一个严格串行的作业。
+	time.AfterFunc(50*time.Millisecond, func() { s.kickProjectOrchestrator(job.ProjectID) })
+}
+
+func shortGitSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func (s *Server) commitOrchestrationWorktree(ctx context.Context, worktree, taskID string) error {
@@ -2999,11 +3478,16 @@ func (s *Server) runVerificationCommands(ctx context.Context, job OrchestrationJ
 
 func (s *Server) orchestrationTaskRecord(ctx context.Context, jobID string) (GitTaskRecord, error) {
 	var record GitTaskRecord
-	err := s.db.QueryRowContext(ctx, `select job_id,base_dev_sha,task_branch,worktree_path,task_commit_sha,integration_sha,conversation_id from git_task_records where job_id=?`, jobID).Scan(&record.JobID, &record.BaseDevSHA, &record.TaskBranch, &record.WorktreePath, &record.TaskCommitSHA, &record.IntegrationSHA, &record.ConversationID)
+	err := s.db.QueryRowContext(ctx, `select job_id,base_dev_sha,task_branch,worktree_path,task_commit_sha,integration_sha,conversation_id,coalesce(execution_mode,'') from git_task_records where job_id=?`, jobID).Scan(&record.JobID, &record.BaseDevSHA, &record.TaskBranch, &record.WorktreePath, &record.TaskCommitSHA, &record.IntegrationSHA, &record.ConversationID, &record.ExecutionMode)
 	return record, err
 }
 
 func (s *Server) removeOrchestrationGitResources(ctx context.Context, repo, projectID, jobID, worktree, branch string) error {
+	// 第二道锁（第一道是直接模式刻意不往记录里写这两个值）：项目目录本身绝不是可移除的
+	// 工作树。真让它落到下面，`git worktree remove --force <repo>` 就是在删用户的仓库根。
+	if worktree != "" && sameCleanPath(worktree, repo) {
+		return fmt.Errorf("refusing to remove the project worktree %s as a task worktree", worktree)
+	}
 	if worktree != "" {
 		if _, err := os.Stat(worktree); err == nil {
 			if err := s.removeOrchestrationWorktree(ctx, repo, projectID, jobID, worktree); err != nil {

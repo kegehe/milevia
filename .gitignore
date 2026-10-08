@@ -85,3 +85,11 @@ apps/web/test-results/
 # Local workbench data and build leftovers
 .workbuddy/
 _tmp_*
+
+# 设计与排查产物（截图、设计稿、脚本输出）。都是本地产物、体量可达几十 MB，
+# 一次 git add -A 就会把二进制塞进仓库：outputs/ 实测 37 MB。
+outputs/
+apps/outputs/
+
+# 本地 AI 工具的工作目录（与上面的 .agents/ .claude/ 同类）
+.trae/

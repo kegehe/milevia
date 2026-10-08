@@ -7,26 +7,32 @@ import type { AgentID, Event, Message } from "../lib/types";
 import { agentDisplayName, agentEntry, agentPermissionModes, permissionCopy, catalogAgentID, useAgentCatalog } from "../lib/agent-registry";
 import type { Task, TaskDetail } from "../features/tasks/task-model";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
+import { ExternalLink } from "../components/ExternalLink";
 import "../markdown.css";
 import "../conversation.css";
 import "../orchestration.css";
 
 type OrchestrationConfig = { projectId: string; enabled: boolean; mainBranch: string; devBranch: string; agentId: AgentID; verificationCommands: string[]; maxFixRounds: number; frozenReason?: string };
-type OrchestrationJob = { id: string; projectId: string; taskId: string; taskTitle?: string; taskDescription?: string; position: number; status: string; attempt?: number; baseDevSha?: string; targetBranch?: string; taskBranch?: string; worktreePath?: string; conversationId?: string; batchId?: string; humanDecision?: string; resourcesCleanedAt?: string; lastError?: string; createdAt?: string; updatedAt?: string };
-type OrchestrationBatch = { id: string; name: string; conversationStrategy: "new" | "continue"; status: "active" | "needs_human" | "paused" | "awaiting_main" | "completed"; taskCount: number; completedCount: number; createdAt: string; updatedAt: string };
+type OrchestrationJob = { id: string; projectId: string; taskId: string; taskTitle?: string; taskDescription?: string; position: number; status: string; attempt?: number; baseDevSha?: string; targetBranch?: string; taskBranch?: string; worktreePath?: string; conversationId?: string; batchId?: string; humanDecision?: string; resourcesCleanedAt?: string; lastError?: string; createdAt?: string; updatedAt?: string; executionMode?: ExecutionMode };
+type OrchestrationBatch = { id: string; name: string; conversationStrategy: "new" | "continue"; status: "not_started" | "active" | "needs_human" | "paused" | "awaiting_main" | "completed"; started: boolean; taskCount: number; completedCount: number; createdAt: string; updatedAt: string; executionMode?: ExecutionMode; targetBranch?: string };
+// 计划的执行方式：worktree = 隔离工作树（默认，拉临时分支、完成后合并）；branch = 直接写入
+// 项目工作目录里那个已存在的分支（不建分支、不提交、不合并）。
+type ExecutionMode = "worktree" | "branch";
+type GitBranchOption = { name: string; remote: boolean; current: boolean };
 type ReleaseSnapshot = { id: string; projectId: string; devSha: string; branch: string; status: string; createdAt: string; confirmedAt?: string };
 type ConversationHistory = { conversation?: { agentId: AgentID }; activeRunId?: string | null; messages: Message[]; events: Event[]; hasMore: boolean; nextCursor: string };
 
 const runningStatuses = new Set(["preparing", "implementing", "checking"]);
 // 新建编排任务时一次定好的执行配置：创建后写入项目编排配置，之后加入队列的任务都沿用快照。
-type BatchPolicyDraft = { mainBranch: string; devBranch: string; agentId: AgentID; maxFixRounds: number };
+// executionMode 与 targetBranch 是**计划级**的：它们只写进这个计划的子任务快照，不改项目配置。
+type BatchPolicyDraft = { mainBranch: string; devBranch: string; agentId: AgentID; maxFixRounds: number; executionMode: ExecutionMode; targetBranch: string };
 const refreshingStatuses = new Set(["queued", "preparing", "implementing", "checking"]);
 const fallbackTaskTitle = "未命名任务";
 
-const defaultBatchPolicy: BatchPolicyDraft = { mainBranch: "main", devBranch: "dev", agentId: "claude-code", maxFixRounds: 3 };
+const defaultBatchPolicy: BatchPolicyDraft = { mainBranch: "main", devBranch: "dev", agentId: "claude-code", maxFixRounds: 3, executionMode: "worktree", targetBranch: "" };
 
 function statusLabel(status: string, targetBranch = "main") {
-  const labels: Record<string, string> = { queued: "等待执行", preparing: "准备工作区", implementing: "Agent 执行中", checking: "收尾中", paused: "已暂停", stopped: "已停止", removing: "清理中", needs_human: "需要处理", awaiting_main: `待合并 ${targetBranch}`, integrated_to_dev: `待合并 ${targetBranch}`, released_to_main: `已合并 ${targetBranch}` };
+  const labels: Record<string, string> = { queued: "等待执行", preparing: "准备工作区", implementing: "Agent 执行中", checking: "收尾中", paused: "已暂停", stopped: "已停止", removing: "清理中", needs_human: "需要处理", awaiting_main: `待合并 ${targetBranch}`, integrated_to_dev: `待合并 ${targetBranch}`, released_to_main: `已合并 ${targetBranch}`, applied_to_branch: `已写入 ${targetBranch}` };
   return labels[status] || status;
 }
 
@@ -70,12 +76,28 @@ function validMaxFixRounds(value: number) {
 }
 
 function orchestrationPlanStatusLabel(batch: OrchestrationBatch) {
+  // 未开始优先于一切：这时子任务全是 queued，按下面推导会落到「子任务推进中」，
+  // 会让一个还没提交的草稿看起来正在跑。
+  if (!batch.started) return "未开始";
   if (batch.taskCount === 0) return "暂无子任务";
   if (batch.completedCount === batch.taskCount) return "子任务已全部完成";
   if (batch.status === "needs_human") return "有子任务需要处理";
   if (batch.status === "paused") return "有子任务已暂停";
   if (["awaiting_main", "released_to_main", "integrated_to_dev"].includes(batch.status)) return "有子任务待合并";
   return "子任务推进中";
+}
+
+// 直接写入的计划必须一眼可辨：它的子任务改的是用户自己的工作目录，而且不会留下可回滚的
+// 分支或提交。标记是**附加**信息，不替代进度文案——"有子任务待合并"这类状态照旧要说出来。
+function orchestrationPlanModeLabel(batch: OrchestrationBatch) {
+  if (batch.executionMode !== "branch") return "";
+  return `直接写入 ${batch.targetBranch || "目标分支"}`;
+}
+
+function orchestrationPlanLabel(batch: OrchestrationBatch) {
+  const mode = orchestrationPlanModeLabel(batch);
+  const status = orchestrationPlanStatusLabel(batch);
+  return mode ? `${mode} · ${status}` : status;
 }
 
 // 发布快照的状态沿用任务状态名：awaiting_main = 固定快照已生成、等用户合入稳定分支；
@@ -88,7 +110,7 @@ function releaseStatusLabel(status: string, mainBranch: string) {
 function OrchestrationConversationMessage({ message, agentID }: { message: Message; agentID: AgentID }) {
   const isUser = message.role === "user";
   const agentName = agentDisplayName(agentID);
-  return <div className="timeline-entry message-entry"><article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatDate(message.createdAt)}</time></header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a> }}>{message.content}</ReactMarkdown></div></article></div>;
+  return <div className="timeline-entry message-entry"><article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatDate(message.createdAt)}</time></header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <ExternalLink href={href} target="_blank" rel="noreferrer">{children}</ExternalLink> }}>{message.content}</ReactMarkdown></div></article></div>;
 }
 
 function ScrollNavigationIcon({ direction }: { direction: "top" | "previous" | "next" | "bottom" }) {
@@ -100,10 +122,23 @@ function ScrollNavigationIcon({ direction }: { direction: "top" | "previous" | "
   </svg>;
 }
 
+// 右栏「所属编排任务」区块：说明当前子任务属于哪个计划，并给出该计划的计划级动作。
+// 「开始执行」只在计划还没开始时出现——那是用户要的那道闸门：加进队列的子任务不会自己跑。
+// 计划级动作单独成块，不和上面的子任务级操作混在一排。区块的可访问名直接用标题
+// （与「执行过程」一致），不再额外挂 aria-label，否则同一句话会被读两遍。
+function OrchestrationPlanPanel({ batch, busyKey, onDelete, onStart }: { batch: OrchestrationBatch; busyKey: string; onDelete: () => void; onStart: () => void }) {
+  // 「启动中」只在**这一次启动**进行中时写：原来传的是布尔（有任意操作在跑就为真），
+  // 于是删别的计划、提交决策时，这个按钮也会写着"启动中" —— 而它其实没在启动（2026-09-29 复查）。
+  // 禁用仍然按"任意操作进行中"保守处理。
+  const starting = busyKey === `start-batch:${batch.id}`;
+  const busy = Boolean(busyKey);
+  return <section className="orchestration-plan-link"><header><h3>所属编排任务</h3><span>{orchestrationPlanLabel(batch)}</span></header><div className="orchestration-plan-link-body"><span className="orchestration-plan-link-main"><b title={batch.name}>{batch.name}</b><small>{batch.completedCount}/{batch.taskCount} 子任务</small></span>{!batch.started && <button type="button" className="primary" title="开始按顺序执行这个编排任务里的子任务" aria-label="开始执行" disabled={busy} onClick={onStart}>{starting ? "启动中" : "开始执行"}</button>}<button type="button" className="danger-text" title="删除这个编排任务（子任务会保留在「全部子任务」中）" aria-label="删除编排任务" disabled={busy} onClick={onDelete}>删除编排任务</button></div></section>;
+}
+
 export default function OrchestrationPage() {
   const agentOptions = useAgentCatalog();
   const { projectId } = useParams<{ projectId: string }>();
-  const { api, setError } = useProjectContext();
+  const { api, projects, setError } = useProjectContext();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const [config, setConfig] = useState<OrchestrationConfig | null>(null);
@@ -118,8 +153,8 @@ export default function OrchestrationPage() {
   const [busy, setBusy] = useState("");
 	const [confirmMerge, setConfirmMerge] = useState(false);
 	const [confirmCleanup, setConfirmCleanup] = useState(false);
-	const [confirmDeleteBatch, setConfirmDeleteBatch] = useState(false);
 	const [confirmRelease, setConfirmRelease] = useState<ReleaseSnapshot | null>(null);
+	const [confirmDeleteBatch, setConfirmDeleteBatch] = useState<OrchestrationBatch | null>(null);
 	const [branchSettingsOpen, setBranchSettingsOpen] = useState(false);
 	const [branchDraft, setBranchDraft] = useState({ mainBranch: "", devBranch: "" });
 	const [closeLockingProcesses, setCloseLockingProcesses] = useState(false);
@@ -128,6 +163,9 @@ export default function OrchestrationPage() {
 	const [batchFilterID, setBatchFilterID] = useState("");
 	const [conversationStrategy, setConversationStrategy] = useState<"new" | "continue">("new");
 	const [batchPolicy, setBatchPolicy] = useState<BatchPolicyDraft>(defaultBatchPolicy);
+	// 「直接写入」模式的目标分支下拉：只在打开弹窗时拉一次本地分支列表。
+	const [branchOptions, setBranchOptions] = useState<GitBranchOption[]>([]);
+	const [branchOptionsError, setBranchOptionsError] = useState("");
 	const [decision, setDecision] = useState("");
   const mounted = useRef(true);
   const tasksRef = useRef<Task[]>([]);
@@ -253,13 +291,17 @@ export default function OrchestrationPage() {
   useEffect(() => { void loadOverview().catch((cause) => setError(cause instanceof Error ? cause.message : "无法加载自动编排")); }, [loadOverview, setError]);
   useEffect(() => { void loadSelected().catch((cause) => setError(cause instanceof Error ? cause.message : "无法加载编排任务详情")); }, [loadSelected, setError]);
   useEffect(() => {
-    if (!jobs.some((job) => refreshingStatuses.has(job.status))) return;
+    // 未开始的计划里，子任务会一直停在 queued；只有用户点「开始执行」才可能变化，为它每 5 秒
+    // 空转轮询没有意义（一个放着不动的草稿会让页面永久刷新）。
+    const startedBatchIDs = new Set(batches.filter((batch) => batch.started).map((batch) => batch.id));
+    const needsRefresh = (job: OrchestrationJob) => refreshingStatuses.has(job.status) && (job.status !== "queued" || !job.batchId || startedBatchIDs.has(job.batchId));
+    if (!jobs.some(needsRefresh)) return;
     const timer = window.setInterval(() => {
       void loadOverview().catch(() => undefined);
-      if (selected && refreshingStatuses.has(selected.status)) void loadSelected("latest").catch(() => undefined);
+      if (selected && needsRefresh(selected)) void loadSelected("latest").catch(() => undefined);
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [jobs, loadOverview, loadSelected, selected?.id, selected?.status]);
+  }, [jobs, batches, loadOverview, loadSelected, selected?.id, selected?.status]);
 
   const counts = useMemo(() => ({ active: jobs.filter((job) => runningStatuses.has(job.status)).length, waiting: jobs.filter((job) => job.status === "queued").length, blocked: jobs.filter((job) => job.status === "needs_human").length }), [jobs]);
   const messages = useMemo(() => history?.messages || [], [history]);
@@ -302,6 +344,15 @@ export default function OrchestrationPage() {
   }, [jobs, tasks]);
 	const visibleJobs = scopedJobs;
 	const activeBatch = batchFilterID ? batches.find((batch) => batch.id === batchFilterID) || null : null;
+	// 右栏「所属编排任务」按子任务反查它属于哪个计划，而不是用 batchFilterID：筛选可以指向
+	// 另一个计划，而这里要说清的正是「当前这个子任务属于谁」。子任务脱组后 batch_id 为空，
+	// 没有可删的计划，整块不显示。
+	const selectedBatch = selected?.batchId ? batches.find((batch) => batch.id === selected.batchId) || null : null;
+	// 右栏要显示的计划。空计划（一个子任务都没有）没有任何子任务可选中，右栏拿不到 selected，
+	// 那时只有①栏正在筛选的计划能说明用户指的是谁——不兜这一层，空计划就没有任何删除入口
+	// （②栏的归档按钮已经移除，①栏行也恢复成纯选择），废弃计划会永久堆积。
+	// 过滤视图下 selectedBatch 与 activeBatch 恒等，这个兜底不会指向另一个计划。
+	const panelBatch = selectedBatch ?? activeBatch;
 	// 给每个列出的子任务提供“上移/下移”。排序接口要求一次提交整条项目内排队子任务，
 	// 所以箭头仅在当前可见组恰好就是全部可排序项时显示（单计划或默认全部列表均满足）。
 	const reorderableTaskIDs = visibleJobs
@@ -323,13 +374,35 @@ export default function OrchestrationPage() {
 	const mainBranchValid = validOrchestrationBranch(batchPolicy.mainBranch.trim());
 	const devBranchValid = validOrchestrationBranch(batchPolicy.devBranch.trim());
 	const maxFixRoundsValid = validMaxFixRounds(batchPolicy.maxFixRounds);
+	// 「直接写入」的前置条件。服务端只接受本地 runner 跑自动编排
+	// （isLocalRunnerID：windows-local / wsl-local 或空），这里做同一判断，
+	// 免得用户在远端项目上选完才吃 400/409。
+	const batchProject = projects.find((item) => item.id === projectId) || null;
+	const localRunner = !batchProject || batchProject.runner === "" || batchProject.runner === "windows-local" || batchProject.runner === "wsl-local";
+	const currentBranchName = branchOptions.find((branch) => branch.current)?.name || "";
+	const targetBranchDraft = batchPolicy.targetBranch.trim();
+	const directModeSelected = batchPolicy.executionMode === "branch";
+	const directModeBlockedReason = !localRunner
+		? "「直接写入」目前只支持本地运行器的项目。"
+		: branchOptionsError
+			? `无法读取项目分支列表：${branchOptionsError}`
+			: branchOptions.length === 0
+				? "项目里还没有可选的本地分支，无法指定目标分支。"
+				: "";
+	// 选了非当前检出的分支不硬拦（用户可能在弹窗打开之后才切分支），但一直提示；
+	// 服务端派发前以当时的 HEAD 为准，不一致会停下并要求用户自己切。
+	const targetBranchMismatch = directModeSelected && Boolean(currentBranchName) && Boolean(targetBranchDraft) && targetBranchDraft !== currentBranchName;
 	const batchPolicyIssue = !mainBranchValid
 		? "稳定分支格式无效：需以字母或数字开头，只能包含字母、数字、. _ / -，且不能以 / 结尾或包含 .."
 		: !devBranchValid
 			? "开发分支格式无效：需以字母或数字开头，只能包含字母、数字、. _ / -，且不能以 / 结尾或包含 .."
 			: !maxFixRoundsValid
 				? "最大修复轮次需为 1~10 之间的整数。"
-				: "";
+				: directModeSelected && directModeBlockedReason
+					? directModeBlockedReason
+					: directModeSelected && !validOrchestrationBranch(targetBranchDraft)
+						? "目标分支无效：请从项目已有的本地分支里选择。"
+						: "";
 	const subtasksEmptyHint = activeBatch
 		? enqueueableTasks.length
 			? "该编排任务还没有子任务：可勾选下方候选任务加入。"
@@ -451,8 +524,24 @@ export default function OrchestrationPage() {
       devBranch: current.devBranch || defaultBatchPolicy.devBranch,
       agentId: current.agentId || defaultBatchPolicy.agentId,
       maxFixRounds: current.maxFixRounds || defaultBatchPolicy.maxFixRounds,
+      executionMode: "worktree",
+      targetBranch: "",
     });
+    // 本地分支列表只服务「直接写入」下拉，失败或慢都不该拖住建计划这一步：弹窗先开，
+    // 列表在后台补上。拉不到就禁用「直接写入」并说明原因，比让用户选完才吃 409 好。
+    setBranchOptions([]);
+    setBranchOptionsError("");
     setBatchComposerOpen(true);
+    void (async () => {
+      try {
+        const branches = await api<GitBranchOption[]>(`/api/projects/${projectId}/git/branches`);
+        if (!mounted.current) return;
+        setBranchOptions(branches.filter((branch) => !branch.remote));
+      } catch (cause) {
+        if (!mounted.current) return;
+        setBranchOptionsError(cause instanceof Error ? cause.message : "无法读取项目分支列表");
+      }
+    })();
   };
   const closeBatchComposer = () => {
     setBatchName("");
@@ -467,7 +556,7 @@ export default function OrchestrationPage() {
     try {
       const batch = await api<OrchestrationBatch>(`/api/projects/${projectId}/orchestration/batches`, {
         method: "POST",
-        body: JSON.stringify({ name, conversationStrategy, mainBranch: batchPolicy.mainBranch.trim(), devBranch: batchPolicy.devBranch.trim(), agentId: batchPolicy.agentId, maxFixRounds: batchPolicy.maxFixRounds }),
+        body: JSON.stringify({ name, conversationStrategy, mainBranch: batchPolicy.mainBranch.trim(), devBranch: batchPolicy.devBranch.trim(), agentId: batchPolicy.agentId, maxFixRounds: batchPolicy.maxFixRounds, executionMode: batchPolicy.executionMode, targetBranch: batchPolicy.executionMode === "branch" ? batchPolicy.targetBranch.trim() : "" }),
       });
       closeBatchComposer();
       // 计划此时已经建成：刷新失败只能报「刷新失败」，否则用户会以为没建上而重复创建。
@@ -484,6 +573,44 @@ export default function OrchestrationPage() {
     if (!taskIDs.length) return;
     if (await queueAction("add-tasks", `/api/projects/${projectId}/orchestration/batches/${activeBatch.id}/tasks`, { method: "POST", body: JSON.stringify({ taskIds: taskIDs }) })) setSelectedEnqueue(new Set());
   };
+	// 放行一个计划：闸门一开，调度器才会按 queue_position 依次取它的子任务。与删除同一形态——
+	// 接口一返回成功就按成功收尾，刷新失败只报「刷新失败」，不能把已经生效的开始误报成失败
+	// （那会让用户反复点，而重复点击本身是幂等的）。
+	const startBatch = async (batch: OrchestrationBatch) => {
+		if (!projectId) return;
+		setBusy(`start-batch:${batch.id}`);
+		try {
+			await api(`/api/projects/${projectId}/orchestration/batches/${batch.id}/start`, { method: "POST", body: "{}" });
+			setBatches((previous) => previous.map((item) => (item.id === batch.id ? { ...item, started: true, status: "active" } : item)));
+			try { await Promise.all([loadOverview(), loadSelected()]); }
+			catch (cause) { setError(`编排任务已开始执行，但队列列表刷新失败：${cause instanceof Error ? cause.message : "请点右上角刷新"}`); }
+		} catch (cause) { setError(cause instanceof Error ? cause.message : "无法开始执行编排任务"); }
+		finally { if (mounted.current) setBusy(""); }
+	};
+	// 删除编排任务只摘掉分组标签：子任务连同它们的 worktree、分支和执行对话都保留，
+	// 脱组后会落到「全部子任务」视图。成功后必须清掉 batchFilterID——留着会让列表按
+	// 一个已不存在的 id 过滤成空。是否有未结束子任务由服务端判定（前端分不清
+	// 「只有 stopped」和「有 paused」，两者在 batch.status 里是同一个桶）。
+	// 刻意不走 queueAction：它把「刷新失败」也归到操作失败里，而这里刷新失败只是列表
+	// 陈旧，会让已经删掉的计划继续占着筛选——②栏空掉、脱组的子任务看不见。删除一旦
+	// 返回成功就按成功收尾，刷新失败单独报，与 createBatch 的处理一致。
+	const deleteBatch = async (batch: OrchestrationBatch) => {
+		if (!projectId) return;
+		setBusy(`delete-batch:${batch.id}`);
+		try {
+			await api(`/api/projects/${projectId}/orchestration/batches/${batch.id}`, { method: "DELETE" });
+			// 本地先把这次删除的效果落下来——服务端做的正是同一件事（删 batch 行 + 把子任务
+			// batch_id 清空）。刷新是 best-effort，若只靠刷新，刷新失败时界面会一直留着一个
+			// 已经不存在的计划，再点删除只会拿到 404；顺带也省掉「等刷新才有反应」的延迟。
+			setBatches((previous) => previous.filter((item) => item.id !== batch.id));
+			setJobs((previous) => previous.map((job) => (job.batchId === batch.id ? { ...job, batchId: "" } : job)));
+			setBatchFilterID("");
+			setConfirmDeleteBatch(null);
+			try { await Promise.all([loadOverview(), loadSelected()]); }
+			catch (cause) { setError(`编排任务已删除，但队列列表刷新失败：${cause instanceof Error ? cause.message : "请点右上角刷新"}`); }
+		} catch (cause) { setError(cause instanceof Error ? cause.message : "无法删除编排任务"); }
+		finally { if (mounted.current) setBusy(""); }
+	};
 	const submitDecision = async () => {
 		if (!selected || !decision.trim()) return;
 		if (await queueAction("decision", `/api/tasks/${selected.taskId}/orchestration/decision`, { method: "POST", body: JSON.stringify({ decision: decision.trim() }) })) setDecision("");
@@ -494,17 +621,6 @@ export default function OrchestrationPage() {
 			setConfirmCleanup(false);
 			setCloseLockingProcesses(false);
 		}
-	};
-	const deleteBatch = async () => {
-		if (!projectId || !batchFilterID) return;
-		setBusy("delete-batch");
-		try {
-			await api(`/api/projects/${projectId}/orchestration/batches/${batchFilterID}`, { method: "DELETE" });
-			setConfirmDeleteBatch(false);
-			setBatchFilterID("");
-			await loadOverview();
-		} catch (cause) { setError(cause instanceof Error ? cause.message : "无法归档编排任务"); }
-		finally { if (mounted.current) setBusy(""); }
 	};
 	const dequeueSelected = async () => {
 		if (!selected || !["queued", "paused", "stopped"].includes(selected.status)) return;
@@ -565,10 +681,10 @@ export default function OrchestrationPage() {
   <header className="orchestration-queue-toolbar"><div className="orchestration-queue-toolbar-top"><h2>自动编排</h2><span>{jobs.length} 条队列记录 · {batches.length} 个编排任务</span></div><button type="button" title="刷新队列" aria-label="刷新队列" disabled={Boolean(busy)} onClick={() => void loadOverview()}>↻</button></header>
   <section className="orchestration-row orchestration-planpane" aria-labelledby="orchestration-plan-title">
     <header><div><h3 id="orchestration-plan-title">① 编排任务</h3>{batches.length > 0 && <span>{batches.length} 个</span>}</div><button type="button" className="primary" title="新建编排任务" aria-label="新建编排任务" disabled={Boolean(busy)} onClick={() => void openBatchComposer()}>+ 新建</button></header>
-    {batches.length ? <ol className="orchestration-planlist">{batches.map((batch) => <li key={batch.id}><button type="button" className={`orchestration-planitem${batchFilterID === batch.id ? " selected" : ""}`} disabled={Boolean(busy)} onClick={() => void selectPlan(batch.id)} title={batch.name}><span className={`orchestration-status-dot ${batch.status}`} /><span className="orchestration-planitem-main"><b>{batch.name}</b><small>{orchestrationPlanStatusLabel(batch)}</small></span><span className="orchestration-planitem-count">{batch.completedCount}/{batch.taskCount}</span></button></li>)}</ol> : <p className="orchestration-empty">{planEmptyHint}</p>}
+    {batches.length ? <ol className="orchestration-planlist">{batches.map((batch) => <li key={batch.id}><button type="button" className={`orchestration-planitem${batchFilterID === batch.id ? " selected" : ""}`} disabled={Boolean(busy)} onClick={() => void selectPlan(batch.id)} title={batch.name}><span className={`orchestration-status-dot ${batch.status}`} /><span className="orchestration-planitem-main"><b>{batch.name}</b><small>{orchestrationPlanLabel(batch)}</small></span><span className="orchestration-planitem-count">{batch.completedCount}/{batch.taskCount}</span></button></li>)}</ol> : <p className="orchestration-empty">{planEmptyHint}</p>}
   </section>
   {showSubtasksPane && <section className="orchestration-row orchestration-subtasks" aria-labelledby="orchestration-subtasks-title">
-    <header><div className="orchestration-subtasks-title"><h3 id="orchestration-subtasks-title">② 子任务</h3></div><div className="orchestration-subtasks-head-actions">{activeBatch && <button type="button" className="danger-text" title="归档当前编排任务" aria-label="归档当前编排任务" disabled={Boolean(busy)} onClick={() => setConfirmDeleteBatch(true)}>归档编排任务</button>}{visibleJobs.length > 0 && <span>{visibleJobs.length} 项</span>}</div></header>
+    <header><div className="orchestration-subtasks-title"><h3 id="orchestration-subtasks-title">② 子任务</h3></div><div className="orchestration-subtasks-head-actions">{visibleJobs.length > 0 && <span>{visibleJobs.length} 项</span>}</div></header>
     {visibleJobs.length === 0 ? <p className="orchestration-empty">{subtasksEmptyHint}</p> : <ol className="orchestration-joblist">{visibleJobs.map((job) => {
       const queueable = job.status === "queued" || job.status === "paused";
       const removable = queueable || job.status === "stopped";
@@ -598,17 +714,19 @@ export default function OrchestrationPage() {
         <div className="scroll-buttons orchestration-scroll-buttons"><button type="button" className="scroll-btn scroll-to-top" title="回到顶部" aria-label="回到顶部" onClick={scrollToTop}><ScrollNavigationIcon direction="top" /></button><button type="button" className="scroll-btn scroll-to-previous-message" title="上一条我的消息" aria-label="上一条我的消息" disabled={currentUserMessageIndex <= 0} onClick={() => scrollToUserMessage(currentUserMessageIndex - 1)}><ScrollNavigationIcon direction="previous" /></button><button type="button" className="scroll-btn scroll-to-next-message" title="下一条我的消息" aria-label="下一条我的消息" disabled={currentUserMessageIndex < 0 || currentUserMessageIndex >= userMessages.length - 1} onClick={() => scrollToUserMessage(currentUserMessageIndex + 1)}><ScrollNavigationIcon direction="next" /></button><button type="button" className="scroll-btn scroll-to-bottom" title="回到底部" aria-label="回到底部" onClick={scrollToBottom}><ScrollNavigationIcon direction="bottom" /></button></div>
       </> : <div className="orchestration-empty-main"><h2>选择一个编排任务</h2><p>从左侧队列查看完整对话和任务详情。</p></div>}</main>
       <aside className="orchestration-detail" aria-label="任务详情">{selected ? <>
-        <header className="orchestration-detail-head"><div><div className="orchestration-detail-kicker"><span className={`orchestration-status-tag ${selected.status}`}>{statusLabel(selected.status, selected.targetBranch)}</span><time>更新于 {formatDate(selected.updatedAt)}</time></div><h2>{detail?.title || (detailLoading ? "加载任务详情中..." : "任务详情不可用")}</h2><p>{detail?.description || (detailLoading ? "正在加载任务详情。" : detailError || "暂时无法获取该任务详情。")}</p>{detailError && <button type="button" className="orchestration-detail-retry" onClick={() => void loadSelected()}>重试</button>}</div><div className="orchestration-detail-actions">{["queued", "preparing", "implementing", "checking"].includes(selected.status) && <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void action("pause")}>{busy === "pause" ? "暂停中" : "暂停"}</button>}{["paused", "stopped"].includes(selected.status) && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void action("resume")}>{busy === "resume" ? "处理中" : "继续执行"}</button>}{["preparing", "implementing", "checking", "paused", "needs_human"].includes(selected.status) && <button type="button" className="danger-text" disabled={Boolean(busy)} onClick={() => void action("stop")}>{busy === "stop" ? "停止中" : "停止"}</button>}{["awaiting_main", "integrated_to_dev"].includes(selected.status) && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => setConfirmMerge(true)}>合并至 {selected.targetBranch || "目标分支"}</button>}{selected.taskBranch && !selected.resourcesCleanedAt && ["released_to_main", "stopped", "needs_human"].includes(selected.status) && <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setConfirmCleanup(true)}>清理资源</button>}{["queued", "paused", "stopped"].includes(selected.status) && <button type="button" className="danger-text" disabled={Boolean(busy)} onClick={() => void dequeueSelected()}>{busy === `dequeue:${selected.taskId}` ? "移出中" : "移出队列"}</button>}</div></header>
+        <header className="orchestration-detail-head"><div><div className="orchestration-detail-kicker"><span className={`orchestration-status-tag ${selected.status}`}>{statusLabel(selected.status, selected.targetBranch)}</span><time>更新于 {formatDate(selected.updatedAt)}</time></div><h2>{detail?.title || (detailLoading ? "加载任务详情中..." : "任务详情不可用")}</h2><p>{detail?.description || (detailLoading ? "正在加载任务详情。" : detailError || "暂时无法获取该任务详情。")}</p>{detailError && <button type="button" className="orchestration-detail-retry" onClick={() => void loadSelected()}>重试</button>}</div><div className="orchestration-detail-actions">{["queued", "preparing", "implementing", "checking"].includes(selected.status) && <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void action("pause")}>{busy === "pause" ? "暂停中" : "暂停"}</button>}{["paused", "stopped"].includes(selected.status) && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void action("resume")}>{busy === "resume" ? "处理中" : "继续执行"}</button>}{["preparing", "implementing", "checking", "paused", "needs_human"].includes(selected.status) && <button type="button" className="danger-text" disabled={Boolean(busy)} onClick={() => void action("stop")}>{busy === "stop" ? "停止中" : "停止"}</button>}{["awaiting_main", "integrated_to_dev"].includes(selected.status) && selected.executionMode !== "branch" && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => setConfirmMerge(true)}>合并至 {selected.targetBranch || "目标分支"}</button>}{selected.taskBranch && selected.executionMode !== "branch" && !selected.resourcesCleanedAt && ["released_to_main", "stopped", "needs_human"].includes(selected.status) && <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setConfirmCleanup(true)}>清理资源</button>}{["queued", "paused", "stopped"].includes(selected.status) && <button type="button" className="danger-text" disabled={Boolean(busy)} onClick={() => void dequeueSelected()}>{busy === `dequeue:${selected.taskId}` ? "移出中" : "移出队列"}</button>}</div></header>
         {selected.lastError && <div className="orchestration-job-error"><b>需要处理</b><span>{selected.lastError}</span></div>}
 				{selected.status === "needs_human" && <section className="orchestration-decision"><h3>需要人工决策</h3><p>提交的内容会写入本次编排对话，并作为下一次执行的上下文。</p><textarea value={decision} disabled={Boolean(busy)} placeholder="说明业务规则、取舍或下一步处理方式" onChange={(event) => setDecision(event.target.value)} /><button type="button" className="primary" disabled={Boolean(busy) || !decision.trim()} onClick={() => void submitDecision()}>{busy === "decision" ? "提交中" : "提交决策并继续"}</button></section>}
-        <section className="orchestration-facts" aria-label="Git 记录"><div><span>任务分支</span><code title={selected.taskBranch}>{selected.taskBranch || "--"}</code></div><div><span>基线 SHA</span><code title={selected.baseDevSha}>{shortSHA(selected.baseDevSha)}</code></div><div><span>工作区</span><code title={selected.worktreePath}>{selected.worktreePath || "已清理"}</code></div><div><span>已执行轮次</span><b>{selected.attempt || 0}</b></div></section>
+        {selected.executionMode === "branch" ? <section className="orchestration-facts" aria-label="Git 记录"><div><span>执行方式</span><code>直接写入</code></div><div><span>目标分支</span><code title={selected.targetBranch}>{selected.targetBranch || "--"}</code></div><div><span>基线 SHA</span><code title={selected.baseDevSha}>{shortSHA(selected.baseDevSha)}</code></div><div><span>已执行轮次</span><b>{selected.attempt || 0}</b></div></section> : <section className="orchestration-facts" aria-label="Git 记录"><div><span>任务分支</span><code title={selected.taskBranch}>{selected.taskBranch || "--"}</code></div><div><span>基线 SHA</span><code title={selected.baseDevSha}>{shortSHA(selected.baseDevSha)}</code></div><div><span>工作区</span><code title={selected.worktreePath}>{selected.worktreePath || "已清理"}</code></div><div><span>已执行轮次</span><b>{selected.attempt || 0}</b></div></section>}
+        {selected.executionMode === "branch" && selected.status === "applied_to_branch" && <p className="orchestration-direct-note" role="note">改动就在你的项目工作目录里，本页面不会替你提交；确认无误后在任务页验收。</p>}
+        {panelBatch && <OrchestrationPlanPanel batch={panelBatch} busyKey={busy} onDelete={() => setConfirmDeleteBatch(panelBatch)} onStart={() => void startBatch(panelBatch)} />}
         <section className="orchestration-timeline"><header><h3>执行过程</h3><span>{detail?.events.length || 0} 条事件</span></header>{detail?.events.length ? <ol>{detail.events.slice().reverse().map((event) => <li key={event.id}><time>{formatDate(event.createdAt)}</time><span className={`timeline-marker ${event.type.includes("failed") || event.type.includes("changes") || event.type.includes("needs_human") ? "warn" : ""}`} /><div><b>{eventLabel(event.type)}</b><small>{event.type}</small></div></li>)}</ol> : <p className="orchestration-empty">执行事件将在任务开始后出现。</p>}</section>
-      </> : <div className="orchestration-empty-main"><h2>选择一个编排任务</h2><p>从左侧队列查看任务详情。</p></div>}</aside>
+      </> : <>{panelBatch && <OrchestrationPlanPanel batch={panelBatch} busyKey={busy} onDelete={() => setConfirmDeleteBatch(panelBatch)} onStart={() => void startBatch(panelBatch)} />}{panelBatch ? <p className="orchestration-empty">该编排任务还没有子任务：可在 ③ 候选任务里勾选加入，或直接删除这个编排任务。</p> : <div className="orchestration-empty-main"><h2>选择一个编排任务</h2><p>从左侧队列查看任务详情。</p></div>}</>}</aside>
     </div>
     {confirmMerge && selected && <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-confirm" role="dialog" aria-modal="true" aria-labelledby="merge-main-title"><h2 id="merge-main-title">合并至 {selected.targetBranch || "目标分支"}</h2><p>将 <code>{selected.taskBranch}</code> 合并到任务入队时锁定的 <code>{selected.targetBranch || "目标分支"}</code>。发生冲突时会中止合并并保留任务状态。</p><footer><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setConfirmMerge(false)}>取消</button><button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void action("merge-main")}>{busy === "merge-main" ? "合并中" : "确认合并"}</button></footer></section></div>}
-		{confirmDeleteBatch && batchFilterID && <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-confirm" role="dialog" aria-modal="true" aria-labelledby="delete-batch-title"><h2 id="delete-batch-title">归档编排任务</h2><p>该计划将从列表隐藏，但队列任务、对话上下文、执行记录及 worktree 都会保留，不会影响正在等待或执行的任务。</p><footer><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setConfirmDeleteBatch(false)}>取消</button><button type="button" className="danger" disabled={Boolean(busy)} onClick={() => void deleteBatch()}>{busy === "delete-batch" ? "归档中" : "确认归档"}</button></footer></section></div>}
 		{confirmCleanup && selected && <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-confirm" role="dialog" aria-modal="true" aria-labelledby="cleanup-title"><h2 id="cleanup-title">清理 worktree 与分支</h2>{selected.status === "released_to_main" ? <p>该任务已合并至 <code>{selected.targetBranch || "目标分支"}</code>，将移除对应 worktree 和任务分支。</p> : <p className="orchestration-cleanup-warning">此任务尚未合并至 <code>{selected.targetBranch || "目标分支"}</code>。清理会删除 worktree 和任务分支，未合并提交将无法通过本页面恢复。</p>}<label className="orchestration-force-close"><input type="checkbox" checked={closeLockingProcesses} disabled={Boolean(busy)} onChange={(event) => setCloseLockingProcesses(event.target.checked)} /><span>关闭正在占用此 worktree 的程序后清理</span><small>可能会强制关闭 VS Code、终端或 AI CLI 中打开该目录的进程；其中未保存内容会丢失。</small></label><footer><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => { setConfirmCleanup(false); setCloseLockingProcesses(false); }}>取消</button><button type="button" className="danger" disabled={Boolean(busy)} onClick={() => void cleanup(selected.status !== "released_to_main")}>{busy === "cleanup" ? "清理中" : selected.status === "released_to_main" ? "确认清理" : "我确认未合并也清理"}</button></footer></section></div>}
 		{confirmRelease && <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-confirm" role="dialog" aria-modal="true" aria-labelledby="release-confirm-title"><h2 id="release-confirm-title">确认快照已合入 {mainBranchName}</h2><p>将校验 <code>{mainBranchName}</code> 是否已包含固定快照 <code>{confirmRelease.branch}</code>（<code>{shortSHA(confirmRelease.devSha)}</code>）。校验通过后，快照内的任务会标记为已发布并收口为完成；未包含时不会改动任何记录。</p><footer><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setConfirmRelease(null)}>取消</button><button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void confirmReleaseMerged()}>{busy === `release-confirm:${confirmRelease.id}` ? "确认中" : "确认已合入"}</button></footer></section></div>}
+		{confirmDeleteBatch && <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-confirm" role="dialog" aria-modal="true" aria-labelledby="delete-batch-title"><h2 id="delete-batch-title">删除编排任务「{confirmDeleteBatch.name}」</h2><p>只删除这条编排任务本身：它的 <b>{confirmDeleteBatch.taskCount}</b> 个子任务会保留在「全部子任务」中，worktree、任务分支与执行对话都不受影响。</p>{confirmDeleteBatch.conversationStrategy === "continue" && <p className="orchestration-cleanup-warning">该编排任务启用了「继承上一任务对话摘要」，脱组后这些子任务再次执行时不再继承上一任务的对话。</p>}<p>只有没有任何未结束子任务时才能删除。若有：等待中或暂停中的先移出队列，执行中的先停止，「待合并」的先合并至目标分支。</p><footer><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setConfirmDeleteBatch(null)}>取消</button><button type="button" className="danger" disabled={Boolean(busy)} onClick={() => void deleteBatch(confirmDeleteBatch)}>{busy === `delete-batch:${confirmDeleteBatch.id}` ? "删除中" : "确认删除"}</button></footer></section></div>}
 		{branchSettingsOpen && <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-composer-dialog" role="dialog" aria-modal="true" aria-labelledby="branch-settings-title">
 			<header className="orchestration-composer-head">
 				<div><h2 id="branch-settings-title">编排分支设置</h2><p>稳定分支是任务合并目标，开发分支是发布快照的来源。</p></div>
@@ -628,7 +746,7 @@ export default function OrchestrationPage() {
 		</section></div>}
 		{batchComposerOpen && <div className="orchestration-confirm-backdrop" role="presentation"><section className="orchestration-composer-dialog" role="dialog" aria-modal="true" aria-labelledby="batch-title">
 			<header className="orchestration-composer-head">
-				<div><h2 id="batch-title">新建编排任务</h2><p>先定好名称与执行配置；创建后再到下方「候选任务」勾选加入。</p></div>
+				<div><h2 id="batch-title">新建编排任务</h2></div>
 				<button type="button" title="关闭" aria-label="关闭" disabled={Boolean(busy)} onClick={closeBatchComposer}>x</button>
 			</header>
 			<div className="orchestration-composer-body">
@@ -638,6 +756,16 @@ export default function OrchestrationPage() {
 						<label className="wide">名称<input autoFocus maxLength={120} value={batchName} disabled={Boolean(busy)} placeholder="例如：支付流程修复" onChange={(event) => setBatchName(event.target.value)} /></label>
 						<label className="wide">后续任务上下文<select value={conversationStrategy} disabled={Boolean(busy)} onChange={(event) => setConversationStrategy(event.target.value as "new" | "continue")}><option value="new">不继承上一任务上下文</option><option value="continue">继承上一任务对话摘要</option></select><small>每个任务都会新建执行会话并使用自己的 worktree；仅将上一任务的对话摘要带入下一任务。</small></label>
 					</div>
+				</section>
+				<section className="orchestration-composer-section">
+					<h3>执行方式</h3>
+					<div className="orchestration-composer-grid">
+						<label className="wide">子任务在哪跑<select value={batchPolicy.executionMode} disabled={Boolean(busy)} onChange={(event) => { const nextMode = event.target.value as ExecutionMode; setBatchPolicy((previous) => ({ ...previous, executionMode: nextMode, targetBranch: nextMode === "branch" ? previous.targetBranch || currentBranchName : previous.targetBranch })); }}><option value="worktree">隔离工作树（默认）</option><option value="branch" disabled={Boolean(directModeBlockedReason)}>直接写入已有分支</option></select><small>{directModeSelected ? "Agent 直接在项目工作目录里改文件：不建分支、不建工作区、不自动提交，也没有需要合并的东西。" : "从目标分支拉一条临时分支到独立工作区实施，完成后由你确认合并。"}</small></label>
+						{directModeSelected && <label className="wide">目标分支<select aria-label="目标分支" value={targetBranchDraft} disabled={Boolean(busy)} aria-invalid={!validOrchestrationBranch(targetBranchDraft)} onChange={(event) => setBatchPolicy((previous) => ({ ...previous, targetBranch: event.target.value }))}>{branchOptions.map((branch) => <option key={branch.name} value={branch.name}>{branch.current ? `${branch.name}（当前检出）` : branch.name}</option>)}</select><small>{currentBranchName ? `项目工作区当前检出 ${currentBranchName}；执行时会校验，不一致会停下并要求你先自己切分支。` : "执行时会校验项目工作区正检出所选分支。"}</small></label>}
+					</div>
+					{directModeSelected && (targetBranchMismatch
+						? <p className="orchestration-composer-warning" role="status">{`项目工作区当前检出 ${currentBranchName}，与所选目标分支 ${targetBranchDraft} 不一致：开始执行前请先在项目目录里切到 ${targetBranchDraft}。Milevia 不会替你切换分支。`}</p>
+						: <p className="orchestration-composer-warning" role="note">直接写入模式下 Agent 会在项目工作目录中直接修改文件，不会自动提交、不会创建分支、也不会切换分支。目录里可能已有你尚未提交的改动，Agent 被要求不得回退它们——请自行确认后再验收。本项目在该任务运行期间会被独占，其他会话的 AI 任务需排队。</p>)}
 				</section>
 				<section className="orchestration-composer-section">
 					<h3>执行配置</h3>

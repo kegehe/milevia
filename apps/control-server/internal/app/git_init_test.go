@@ -46,9 +46,15 @@ func TestGitInitEndpoint(t *testing.T) {
 		t.Fatalf("insert project: %v", err)
 	}
 
+	// ⚠️ 必须走**真实路由**，不能直接调 server.gitInit(w, r)：处理器用
+	// `chi.URLParam(r, "projectID")` 取路径参数，而 chi 的 URL 参数只挂在路由上下文里，
+	// 直接调时它是空串 —— 于是 getProjectByID("") 查不到行，被 handler 的
+	// `writeError(w, http.StatusConflict, err)` 报成"当前操作与进行中的操作冲突"，
+	// 看起来像并发冲突，实际是测试自己没给参数（2026-09-26 定位；这条一直红，掩盖了
+	// 真实回归信号）。同目录的其它端点级用例也是走 routes() 的。
 	r := httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/git/init", nil)
 	w := httptest.NewRecorder()
-	server.gitInit(w, r)
+	server.routes().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("git init status = %d body=%s", w.Code, w.Body.String())
 	}

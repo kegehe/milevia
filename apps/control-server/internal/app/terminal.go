@@ -732,7 +732,7 @@ func (s *Server) listTerminals(w http.ResponseWriter, r *http.Request) {
 	pid := chi.URLParam(r, "projectID")
 	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	s.terminals.mu.Lock()
@@ -760,7 +760,7 @@ func (s *Server) deleteTerminal(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "sessionID")
 	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	rec, ok := s.terminals.get(sessionID)
@@ -809,7 +809,7 @@ func (s *Server) terminalWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer s.websocketWG.Done()
 	workspace, resolveErr := s.resolveRequestWorkspaceFromRequest(r)
 	if resolveErr != nil {
-		writeError(w, http.StatusConflict, resolveErr)
+		writeProjectResolveError(w, resolveErr)
 		return
 	}
 	rec, ok := s.terminals.get(chi.URLParam(r, "sessionID"))
@@ -868,7 +868,13 @@ func (s *Server) terminalWebSocket(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(readyErr, errTerminalStartupTimeout) {
 			code = "start_timeout"
 		}
-		_ = sub.enqueue(terminalControlFrame(map[string]any{"type": "error", "code": code, "message": readyErr.Error()}))
+		// 只本地化 message；code（start_failed/start_timeout）是协议字段，前端按它分支，
+		// 不要动。前端（TerminalPage）把 message 当文案直接显示，不做文本匹配。
+		//
+		// 兜底句用**终端自己的**：errorText 的兜底是"任务执行失败，请查看任务日志后重试。"，
+		// 而终端没有任务日志可查（那句话会把用户指向一个不存在的地方）。
+		// 与 localizedHTTPErrorText 按状态给专属兜底是同一个规矩。
+		_ = sub.enqueue(terminalControlFrame(map[string]any{"type": "error", "code": code, "message": localizedErrorText(readyErr, "终端启动失败，请稍后重试。")}))
 		return
 	}
 	if ctl.Cols > 0 && ctl.Rows > 0 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -575,10 +576,18 @@ func (s *Server) fsRename(w http.ResponseWriter, r *http.Request) {
 // writeFSError 处理 Filesystem 相关错误，区分 runner 离线和其他错误。
 func (s *Server) writeFSError(w http.ResponseWriter, err error) {
 	if offline, ok := err.(*runnerOfflineError); ok {
+		// code 是给客户端的稳定判据；error 那句英文留着当兼容（旧客户端按它匹配）。
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error":    "runner_offline",
+			"code":     "runner_offline",
 			"runnerId": offline.RunnerID,
 		})
+		return
+	}
+	// "项目不存在"落到这里时曾经被报成 400「请求参数无效」—— 那是在指责用户把参数写错了，
+	// 而真实情况是项目已经没了（同一个判据见 writeProjectResolveError）。
+	if errors.Is(err, sql.ErrNoRows) {
+		writeMissingProject(w)
 		return
 	}
 	writeError(w, http.StatusBadRequest, err)

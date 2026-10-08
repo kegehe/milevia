@@ -122,6 +122,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		}},
 		SlashCommands: true,
 		MCPInjection:  "config-file",
+		// Claude 长驻会话（StartSession）已实现并经活 harness 验证，可参与项目对话。
+		RunnableInProject: true,
 	},
 	{
 		ID:                "codex",
@@ -149,6 +151,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// Codex 没有斜杠命令目录：远端命令面不提供该自报清单。
 		SlashCommands: false,
 		MCPInjection:  "cli-args",
+		// Codex 走一次性回合（非流式 Run），已在项目对话中接通，可参与对话。
+		RunnableInProject: true,
 	},
 	{
 		ID:                "codebuddy",

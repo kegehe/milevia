@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isNewerRelease, parseAndroidRelease, resolveAndroidRelease } from "./android-release";
+import { formatAppVersion, isNewerRelease, parseAndroidRelease, resolveAndroidRelease } from "./android-release";
 
 const valid = {
   version: "0.1.6",
@@ -62,6 +62,16 @@ test("非法 sha256 与 size 被忽略而不是照单全收", () => {
   assert.ok(release);
   assert.equal(release.sha256, undefined);
   assert.equal(release.size, undefined);
+});
+
+test("版本徽标文案带上构建号，构建号缺失时不留空括号", () => {
+  assert.equal(formatAppVersion("0.1.8", "6"), "v0.1.8 (6)");
+  // 构建号为空串 / 只有空白 / 整个没给，都退回只给版本号。
+  assert.equal(formatAppVersion("0.1.8", ""), "v0.1.8");
+  assert.equal(formatAppVersion("0.1.8", "   "), "v0.1.8");
+  assert.equal(formatAppVersion("0.1.8"), "v0.1.8");
+  // 版本号两侧的空白要去掉：manifest / 原生桥回传的字符串可能带换行。
+  assert.equal(formatAppVersion(" 0.1.8 ", " 6 "), "v0.1.8 (6)");
 });
 
 test("versionCode 更大才算有新版本（不能用字符串比较）", () => {

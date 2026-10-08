@@ -92,22 +92,47 @@ export function createWebSocket(path: string): WebSocket {
 }
 
 /**
+ * 外链放行的协议 —— **桌面端与 Web 端各一份**。
+ *
+ * 导出它，是因为前端 `ExternalLink` 的判据（`apps/web/src/lib/external-link.ts`）必须读同一份：
+ * 两处各写一份必然漂移，而漂移的表现恰是"判据说能开、SDK 却静默丢弃"＝点了没反应。
+ * 协议名一律带冒号、小写（`URL.protocol` 的形态）。
+ */
+export function externalLinkProtocols(desktop: boolean): readonly string[] {
+  return desktop ? DESKTOP_PROTOCOLS : WEB_PROTOCOLS;
+}
+
+const WEB_PROTOCOLS = ["http:", "https:"] as const;
+const DESKTOP_PROTOCOLS = ["http:", "https:", "mailto:"] as const;
+
+/**
  * 在系统默认浏览器中打开外部链接。
- * - 桌面端：调用 Rust `open_external` command，由系统浏览器打开（WebView 本身不导航）
+ * - 桌面端：调用 Rust `open_external` command，由系统协议处理器打开（WebView 本身不导航）
  * - Web 端：开新标签页
- * 仅放行 http/https，避免把日志/文本里的任意字符串交给系统协议处理器。
+ *
+ * 白名单**分平台**（`externalLinkProtocols`）：桌面端多放行 `mailto:` —— 宿主那条路会把它
+ * 交给系统邮件客户端，与 Web/手机端点 `mailto:` 的原生行为一致；Web 端这一档落到
+ * `window.open`，多放行只会让浏览器拿到自己处理不了的协议（换一个空标签页），所以 Web 端
+ * 不动。两档都只认**枚举出来的协议**，不认 `file:`/`javascript:`/自定义 scheme —— 这个参数
+ * 最终会被交给系统协议处理器。
+ *
+ * 平台判据用 `isDesktop()`（而不是裸 `getDesktopRuntime()`）：它内建 Capacitor 判据，
+ * 与 `ExternalLink` 用的是同一个判据；否则"原生包被注入了桌面运行时字段"这种边角上，
+ * 两边会做出不同判断。
  */
 export async function openExternal(url: string): Promise<void> {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
+    // 解析不了的静默丢弃。注意 `//host`（协议相对地址）也走这一支：调用方
+    // （`ExternalLink` → `lib/external-link.ts`）必须先把它归一成绝对地址再送进来。
     return;
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+  const desktop = isDesktop();
+  if (!externalLinkProtocols(desktop).includes(parsed.protocol)) return;
 
-  const runtime = getDesktopRuntime();
-  if (runtime) {
+  if (desktop) {
     const internals = (window as unknown as {
       __TAURI_INTERNALS__?: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
     }).__TAURI_INTERNALS__;

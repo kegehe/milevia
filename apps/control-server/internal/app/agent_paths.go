@@ -241,6 +241,13 @@ func (s *Server) recordAgentInstallation(ctx context.Context, installation agent
 	if s.paths != nil && isLocalRunnerID(installation.RunnerID) {
 		s.paths.Remember(installation.AgentID, installation.BinaryPath)
 	}
+	// 登记了一条新安装 ⇒ 这台机器上"工具状态"的读数立刻过时。
+	//
+	// 放在这里（而不是各个安装实现里）是因为它是**唯一的**登记入口：本机与跨端的
+	// CLI 安装、运行时安装都经过它（agent_install.go:236、agent_install_cross.go:129、
+	// runtime_install.go:254、runtime_install_cross.go:121）—— 漏一处就会留下
+	// "装完了界面还说没装"。
+	s.invalidateAgentReadings(installation.RunnerID)
 	return nil
 }
 

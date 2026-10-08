@@ -1,130 +1,298 @@
-/* CLI 工具管理页。
+/* Cli管理页（路由 `/cli-tools`）。
    配色与本项目其它页面共用同一套（#f3f8f4 底 / #19332c 字 / #cfe0d6 边框 /
-   #2c7567 强调）。注意别把"小红书/视频用的暖米白色板"搬到这里 —— 那是另一套。 */
+   #2c7567 强调）。注意别把"小红书/视频用的暖米白色板"搬到这里 —— 那是另一套。
+
+   ⚠️ **中性色也必须用带绿的灰**，别再引入暖灰：次文字 `#31594f`、说明/标签 `#4c6b60`、
+   安静文字 `#748b81`、注脚 `#809188`；分隔线 `#e3ece7`、面板底 `#f7fbf8`、
+   胶囊底 `#f2f5f3`、牌面底 `#f0f4f2`（全部取自 `style.css` 里已有的值）。
+   这一页原来自带一套暖灰（`#4b4b47` / `#8a8a84` / `#e7e4dd`…），是全仓唯一一份 ——
+   放在 #f3f8f4 上会发米、发旧，像另一个应用。语义色（琥珀 / 红）本来就同族，不动。
+
+   ⚠️ 本页的结构约定（改之前先读这四条，它们都是踩过坑的）：
+   1. 变体一律走 `data-*`，**不拼动态类名**（拼出来的类名一旦取值意外就是个没人样式化的
+      死类；`data-*` 至少能被 grep 到）。
+   2. **虚线只属于"没查成"那一族**（`.cli-tools-status[data-tone="unknown"]` 与
+      `.cli-tools-icon[data-icon="unknown"]`）。「未安装」是实线灰 —— 把"没装"画成
+      "没查成"是两种完全不同的意思，用户会去做错事。
+   3. 卡片右上角的状态图标六档观感各不相同（`.cli-tools-icon[data-icon]`），
+      它是"一眼看出该管哪张"的载体，色值不要合并。
+   4. 动画一律配 `prefers-reduced-motion` 降级块，且降级块里要**显式列出同一个选择器**
+      （靠继承或书写顺序都会被特异性压过，本项目已经栽过三次）。 */
 
 .cli-tools-shell { display: flex; flex-direction: column; min-height: 100vh; background: #f3f8f4; color: #19332c; }
-.cli-tools-shell .dashboard-bar { display: flex; align-items: center; gap: 12px; padding: 14px 20px; }
-.cli-tools-title { margin: 0; font-size: 16px; font-weight: 600; }
-.cli-tools-back { min-height: 32px; }
-.cli-tools-bar-actions { margin-left: auto; display: flex; gap: 8px; }
-.cli-tools-refresh { min-height: 32px; }
 
-.cli-tools-section { width: min(920px, 100%); margin: 0 auto; padding: 8px 20px 48px; }
-.cli-tools-intro { margin: 0 0 16px; color: #6b6b66; font-size: 13px; line-height: 1.7; }
+/* 顶栏：内容左边距与下面那条 1224 的内容栏对齐（居中容器里的标题歪在一边很显眼）。
+   2026-09-25 顶栏改版（方案 B「单行精致」）：行结构不动，只把层级做足 ——
+   返回收成圆形图标钮（纯导航，弱化）、标题前加终端徽标并放大到 17.5px。 */
+.cli-tools-shell .cli-tools-bar { display: flex; align-items: center; gap: 12px; padding: 14px max(20px, calc((100% - 1224px) / 2)); }
+/* 返回：38px 圆钮。这里自己声明 38px —— 与右侧 .secondary「重新检查」从主题档拿到的
+   38px 同高（此前那条"顶栏按钮必须与首页顶栏同高"的教训不变，只是返回不再是 .secondary）。 */
+.cli-tools-back { display: grid; place-items: center; flex: none; width: 38px; height: 38px; padding: 0;
+  border: 1px solid #c8dcd1; border-radius: 50%; color: #31594f; background: #f7fbf8;
+  font-size: 15px; font-weight: 700; line-height: 1; }
+.cli-tools-back:hover:not(:disabled) { border-color: #8eb9aa; background: #eaf5ee; color: #1f6055; }
+/* 标题前的终端徽标：27px，与卡片 28px 牌同一档观感。 */
+.cli-tools-badge { display: grid; place-items: center; flex: none; width: 27px; height: 27px; border-radius: 8px;
+  background: #e5f4ea; color: #2c7567; font-family: ui-monospace, monospace; font-size: 12px; font-weight: 700; }
+.cli-tools-title { margin: 0; font-size: 17.5px; font-weight: 700; letter-spacing: .01em; }
+/* 重新检查仍是 .secondary：高度由 style.css 主题基础档统一给 38px，**别在这里另写**。 */
+.cli-tools-refresh { display: inline-flex; align-items: center; gap: 6px; }
+.cli-tools-refresh-glyph { font-size: 13px; color: #748b81; }
+.cli-tools-shell .cli-tools-bar-actions { margin-left: auto; display: flex; gap: 12px; align-items: center; }
 
-.cli-tools-loading,
-.cli-tools-probe,
-.cli-tools-error {
-  padding: 16px 18px;
-  border-radius: 12px;
-  border: 1px solid #cfe0d6;
-  background: #fff;
-  font-size: 13px;
-  line-height: 1.7;
-}
-.cli-tools-loading { color: #8a8a84; }
-/* "无法检测"与"未安装"必须是两句话、两种观感：前者可操作的是环境，后者才是去装东西。 */
-.cli-tools-probe { border-color: #f0d9a8; background: #fff8e8; color: #85671c; display: grid; gap: 4px; }
-.cli-tools-probe b { font-size: 14px; }
-.cli-tools-probe small { color: #9a7d2c; }
+/* 多环境时的选择器（只有一个环境时整块不渲染）。
+   ⚠️ 同样必须带 `.cli-tools-shell` 前缀：`.dashboard-bar > div`（(0,1,1)）会把
+   无前缀的 `gap: 2px` 压成 16px，「内嵌轨道」的观感就散了（存量坑，2026-09-25 复查修正）。
+   每一项就是环境名本身（Windows / WSL，见 `runnerLabel`）—— 不在名字底下再重复一遍环境词。
+   观感是"内嵌轨道 + 选中项浮起"，与顶栏那排实心按钮区分开：它是切换视角，不是执行动作。 */
+.cli-tools-shell .cli-tools-env { display: flex; gap: 2px; margin-left: 10px; padding: 3px; border: 1px solid #cfe0d6; border-radius: 10px; background: #e9f1ec; }
+.cli-tools-env-item { border: 0; border-radius: 7px; padding: 5px 15px; color: #4c6b60; background: transparent;
+  font-size: 12.5px; font-weight: 700; line-height: 1.5; }
+.cli-tools-env-item:hover { color: #225c50; }
+.cli-tools-env-item[aria-selected="true"] { background: #fff; color: #225c50; box-shadow: 0 1px 2px rgba(25, 51, 44, .12); }
+
+.cli-tools-body { width: min(1224px, 100% - 48px); margin: 0 auto; padding: 6px 0 0; }
+
+/* ── 三态块（读取中 / 读失败 / 真的没有）────────────────────────────────────
+   三档观感必须分开：读失败是红的且带重试，"正在读"是平的，"真的没有"是卡片式空态
+   且必须带下一步动作（本页既有约定：有下一步动作的空态禁止"一行灰字"）。 */
+.cli-tools-block { margin: 12px 0; padding: 14px 18px; border-radius: 12px; border: 1px solid #cfe0d6; background: #fff; font-size: 13px; line-height: 1.7; }
+.cli-tools-pending { color: #748b81; }
+.cli-tools-warn { border-color: #f0d9a8; background: #fff8e8; color: #85671c; display: grid; gap: 4px; justify-items: start; }
+.cli-tools-warn b { font-size: 14px; }
+.cli-tools-warn small { color: #9a7d2c; }
 .cli-tools-error { border-color: #f2c8c0; background: #fdf3f1; color: #a4462f; display: grid; gap: 8px; justify-items: start; }
+.cli-tools-empty { background: #fff; display: grid; gap: 10px; justify-items: start; }
+.cli-tools-empty b { font-size: 14px; }
+.cli-tools-empty span { color: #4c6b60; font-size: 12.5px; }
 
-.cli-tools-runners { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-.cli-tools-runner {
-  display: grid; gap: 2px; justify-items: start;
-  padding: 8px 14px; border: 1px solid #cfe0d6; border-radius: 10px;
-  background: #fff; color: #19332c; cursor: pointer; font-size: 13px;
+/* 「正在读取」的骨架行：占位的高度与形状和真实卡片一致。
+   ⚠️ 它必须带一个可读的名字（role="status" + aria-label）—— 纯灰块对读屏和
+   文本断言都是"什么都没有"，那就等于把"正在读"写成了"没有"。 */
+.cli-tools-skeleton { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; margin: 12px 0; }
+.cli-tools-skeleton-card { display: grid; gap: 10px; border: 1px solid #e3ece7; border-radius: 13px; background: #fff; padding: 16px; }
+.cli-tools-skeleton-mark { width: 28px; height: 28px; border-radius: 8px; background: #eef3f0; }
+.cli-tools-skeleton-line { height: 11px; border-radius: 6px; background: #eef3f0; }
+.cli-tools-skeleton-line[data-w="long"] { width: 62%; }
+.cli-tools-skeleton-line[data-w="short"] { width: 38%; }
+.cli-tools-skeleton-pill { height: 28px; width: 72px; border-radius: 8px; background: #f1f5f2; }
+
+/* ── 顶部横幅：只在"有事"时存在。它要说的是"有一件事需要你处理"。 ────────── */
+.cli-tools-banner { display: flex; align-items: center; gap: 12px; margin: 12px 0; padding: 11px 16px; border-radius: 11px;
+  border: 1px solid #f0d9a8; background: #fff8e8; color: #85671c; font-size: 12.5px; }
+.cli-tools-banner[data-tone="bad"] { border-color: #f2c8c0; background: #fdf3f1; color: #a4462f; }
+/* 进行中：中性偏冷色，**不能**用 bad 那一档的红色 —— 那是"出事了"，而这条说的是
+   "正在做，请等"，把两者画成一样会让用户在一条正常的升级里以为坏了。 */
+.cli-tools-banner[data-tone="busy"] { border-color: #c8dbd4; background: #f2f7f5; color: #2c7567; }
+.cli-tools-banner-mark { display: grid; place-items: center; flex: none; width: 18px; height: 18px; border-radius: 50%;
+  background: #85671c; color: #fff; font-size: 11px; font-weight: 700; }
+.cli-tools-banner[data-tone="bad"] .cli-tools-banner-mark { background: #a4462f; }
+.cli-tools-banner[data-tone="busy"] .cli-tools-banner-mark { background: #2c7567; }
+.cli-tools-banner > span:nth-child(2) { flex: 1; }
+.cli-tools-banner .primary { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+
+/* 文字按钮（"看看是什么问题""这个页面是怎么判断的？"）。 */
+.cli-tools-link { border: 0; padding: 0 2px; color: #2c7567; background: transparent; font-size: 12px;
+  text-decoration: underline; text-decoration-color: #bcdacb; text-underline-offset: 3px; }
+
+/* ── 区块标题行：左边区块名与计数，右边是**这一区的**动作 ────────────────── */
+.cli-tools-sechead { display: flex; align-items: center; gap: 10px; margin: 20px 0 11px; }
+.cli-tools-sechead h2 { margin: 0; font-size: 13.5px; font-weight: 700; letter-spacing: .01em; }
+.cli-tools-count { display: inline-flex; align-items: center; height: 20px; padding: 0 9px; border-radius: 999px;
+  border: 1px solid #e3ece7; background: #f2f5f3; color: #748b81; font-size: 11.5px; font-weight: 700; }
+/* （这里原来还有一条 sechead-actions 规则：整页零引用，2026-09-29 复查后删掉。
+   本仓对"没人命中的死规则"的处置是删掉 —— 与页脚那批同理。） */
+
+/* ── 工具卡网格：一屏看完。9 个工具就是 3×3 ──────────────────────────────── */
+.cli-tools-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
+.cli-tools-card { display: flex; flex-direction: column; border: 1px solid #cfe0d6; border-radius: 13px;
+  background: #fff; padding: 14px 16px 0; box-shadow: 0 1px 2px rgba(25, 51, 44, .04); }
+/* 边框色按**状态**给，但只有"要处理"的两档加色 —— 「读不到」那一档只由状态行与图标表达
+   （整张卡画成虚线会被读成"这个工具坏了"，而它可能只是这次没查到）。 */
+.cli-tools-card[data-tone="warn"] { border-color: #f0d9a8; }
+.cli-tools-card[data-tone="bad"] { border-color: #f2c8c0; }
+
+.cli-tools-card-head { display: flex; align-items: center; gap: 10px; }
+.cli-tools-card-head b { font-size: 14px; font-weight: 700; letter-spacing: .01em; }
+.cli-tools-mark { display: grid; place-items: center; flex: none; width: 28px; height: 28px; border-radius: 8px;
+  font-family: ui-monospace, monospace; font-size: 11px; font-weight: 700; letter-spacing: .02em;
+  background: #f0f4f2; color: #31594f; }
+/* 官方产品图标（AgentLogo）：官方 SVG 原样引用，只管尺寸。
+   裸图形（Claude 星芒 / OpenAI 扭结）居中留白 —— 那是牌面该有的密度；
+   徽标类（CodeBuddy，自带紫色底）则铺满整块牌子 —— 它自己就是底色，
+   缩在中间会变成"小徽标浮在大底板上"。 */
+.cli-tools-mark img { display: block; width: 18px; height: 18px; }
+.cli-tools-mark img[data-logo-badge] { width: 100%; height: 100%; border-radius: inherit; }
+.cli-tools-mark[data-brand="anthropic"] { background: #fdf1ec; color: #c2603f; }
+.cli-tools-mark[data-brand="openai"] { background: #eaf6f2; color: #1f7a68; }
+.cli-tools-mark[data-brand="other"] { background: #eef1fd; color: #3457c8; }
+
+/* 右上角的状态图标：六档观感各不相同。它是"扫一眼就知道该管哪张"的载体。 */
+.cli-tools-icon { display: grid; place-items: center; flex: none; width: 20px; height: 20px; margin-left: auto;
+  border: 1px solid #d7e0da; border-radius: 50%; background: #fff; color: #4c6b60; font-size: 11px; font-weight: 700; }
+.cli-tools-icon[data-icon="ok"] { border-color: #bcdacb; background: #eaf5ee; color: #225c50; }
+.cli-tools-icon[data-icon="update"] { border-color: #bcdacb; background: #eaf5ee; color: #2c7567; }
+.cli-tools-icon[data-icon="alert"] { border-color: #f0d9a8; background: #fff8e8; color: #85671c; }
+/* 「未安装」：**实线**灰空心圆。虚线是留给"没查成"那一档的。 */
+.cli-tools-icon[data-icon="off"] { border-color: #d4d9d5; background: #fafbfa; color: #809188; }
+/* 「读不到」：虚线圆 —— 与上面那档一眼可分。 */
+.cli-tools-icon[data-icon="unknown"] { border-style: dashed; border-color: #9aa8a1; background: #f2f5f3; color: #4c6b60; }
+.cli-tools-icon[data-icon="loading"] { border: 2px solid #e2eae6; border-top-color: #7fa79b; background: transparent;
+  animation: cli-tools-spin .9s linear infinite; }
+@keyframes cli-tools-spin { to { transform: rotate(360deg); } }
+/* ⚠️ 降级块必须**显式写出同一个选择器**：靠父级或书写顺序都压不过上面那条动画规则
+   （本项目为此栽过三次 —— 最近一次是 prefers-reduced-motion 里的 animation: none
+   被同等选择器按特异性压过）。 */
+@media (prefers-reduced-motion: reduce) {
+  .cli-tools-icon[data-icon="loading"] { animation: none; }
 }
-.cli-tools-runner small { color: #8a8a84; font-size: 11px; }
-.cli-tools-runner.selected { border-color: #2c7567; box-shadow: inset 0 0 0 1px #2c7567; }
-.cli-tools-current { margin: 0 0 14px; font-size: 12px; color: #6b6b66; }
 
-.cli-tools-card {
-  margin-bottom: 14px; padding: 16px 18px;
-  border: 1px solid #cfe0d6; border-radius: 12px; background: #fff;
+/* 两行读数：标签左、值右。这是整张卡里唯一"密"的地方。 */
+.cli-tools-readings { display: grid; gap: 7px; margin: 12px 0 0; }
+.cli-tools-readings > div { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; }
+.cli-tools-readings dt { color: #748b81; }
+.cli-tools-readings dd { margin: 0 0 0 auto; font-family: ui-monospace, monospace; font-size: 12.5px; color: #31594f; }
+.cli-tools-readings dd[data-tone="new"] { color: #225c50; font-weight: 700; }
+.cli-tools-readings dd[data-tone="none"] { color: #809188; }
+.cli-tools-readings dd[data-tone="loading"] { color: #809188; font-family: inherit; }
+
+/* 一句话状态。**"没查成"那一档是虚线灰**（与"没问题"一眼可分）。 */
+.cli-tools-status { display: flex; gap: 8px; margin: 12px 0 0; font-size: 12px; line-height: 1.7; color: #748b81; }
+.cli-tools-status[data-tone="ok"] { color: #225c50; }
+.cli-tools-status[data-tone="warn"] { color: #85671c; }
+.cli-tools-status[data-tone="bad"] { color: #a4462f; }
+.cli-tools-status[data-tone="unknown"] { color: #4c6b60; }
+.cli-tools-status[data-tone="unknown"]::before { content: ""; flex: none; align-self: stretch;
+  border-left: 3px dashed #9aa8a1; }
+
+/* 说明那一句：默认是纯陈述（灰），只有"有一件事你做不到"才是 amber。
+   全都染琥珀的后果是真正要留意的那些被淹没在同样的颜色里。 */
+.cli-tools-note { margin: 0; color: #748b81; font-size: 12px; line-height: 1.7; }
+.cli-tools-note[data-tone="warn"] { color: #85671c; }
+.cli-tools-status + .cli-tools-note { margin-top: 6px; }
+.cli-tools-hintline { margin: 0; color: #748b81; font-size: 12px; line-height: 1.7; }
+
+/* 「上次修复解决了什么」。绿色是**有依据的**：它只在症状码真的从报告里消失时才出现。 */
+.cli-tools-resolved { margin: 8px 0 0; padding: 8px 12px; border-radius: 8px; border: 1px solid #bcdacb;
+  background: #eaf5ee; color: #2c7566; font-size: 12px; line-height: 1.7; }
+
+/* 卡片底部动作条：推到卡底，让同一行的卡按钮对齐。 */
+.cli-tools-card-actions { display: flex; gap: 8px; align-items: center; margin: auto -16px 0; padding: 11px 16px;
+  border-top: 1px solid #eef3f0; background: #fcfdfc; border-radius: 0 0 13px 13px; }
+.cli-tools-card-actions .primary, .cli-tools-card-actions .secondary { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+
+/* ── 运行依赖（2026-09-25 仪表行改版，docs/42 §28）───────────────────────
+   徽标立身份 → 大数字读数「N / M」做主角 → 右侧状态点 + 动作。
+   ⚠️ 这一栏不在 .dashboard-bar 里，没有它那两条祖先选择器的特异性问题；但
+   变体一律走 data-*（本页结构约定第 1 条）。 */
+.cli-tools-dep { padding-bottom: 0; }
+.cli-tools-dep-bar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 12px 16px;
+  border: 1px solid #cfe0d6; border-radius: 11px; background: #fff; }
+/* Node 徽标：与顶栏终端徽标同一套语言，大一档（34px）压得住这行的分量。
+   「没装」档转中性灰 —— 没装是实态，不冒充读数，也不借用"装好了"的绿。 */
+.cli-tools-dep-mark { display: grid; place-items: center; flex: none; width: 34px; height: 34px; border-radius: 9px;
+  background: #e5f4ea; color: #2c7567; font: 700 15px ui-monospace, monospace; }
+.cli-tools-dep-mark[data-tone="missing"] { background: #f0f4f2; color: #809188; }
+.cli-tools-dep-who { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.cli-tools-dep-who b { font-size: 13.5px; }
+.cli-tools-dep-who small { color: #748b81; font-size: 11.5px; }
+.cli-tools-dep-who small code { font-size: 11px; color: #4c6b60; }
+/* 大数字读数：这一栏存在的理由就是这句"够不够用"，让它当主角。
+   tabular-nums 让 N 变化时不跳宽。 */
+.cli-tools-dep-meter { display: flex; align-items: baseline; gap: 6px; margin-left: 14px; padding-left: 18px; border-left: 1px solid #e3ece7; }
+.cli-tools-dep-meter b { color: #225c50; font-size: 21px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.cli-tools-dep-meter > span { color: #748b81; font-size: 11.5px; }
+.cli-tools-dep-right { margin-left: auto; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.cli-tools-dep-right .secondary, .cli-tools-dep-right .primary { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+/* 状态点读数：绿点=已是最新，琥珀点=可升级（语义色琥珀族，与横幅同源）。 */
+.cli-tools-dep-state { display: inline-flex; align-items: center; gap: 6px; color: #58772f; font-size: 12px; font-weight: 700; }
+.cli-tools-dep-state::before { content: ""; width: 7px; height: 7px; flex: none; border-radius: 50%; background: #8aac45; }
+.cli-tools-dep-state[data-tone="update"] { color: #85671c; }
+.cli-tools-dep-state[data-tone="update"]::before { background: #c6a34c; }
+/* 第三档：**没查成**（服务端没取到 Node 版本索引，latestVersion 为空）。
+   灰色、不是绿的：这一档绝不能说"已是最新"，否则就是把"读不到"写成"没有"。
+   色值同 `.cli-tools-status[data-tone="unknown"]`，全页"没查成"只有一种观感。 */
+.cli-tools-dep-state[data-tone="unknown"] { color: #4c6b60; }
+.cli-tools-dep-state[data-tone="unknown"]::before { background: #8fa39a; }
+.cli-tools-dep .cli-tools-note { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+/* 未授权的授权入口。**与"运行时装没装"无关**（原先它被嵌在"运行时装没装"的分支里，
+   于是远端机器——Node 早就装好——永远看不到它，见 CliToolsPage.tsx 里那段注释）。
+   观感上它是这一栏里的一个动作，不是读数：左边一句说明压灰，按钮站前面。 */
+.cli-tools-dep-grant { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: 10px 0 0; padding: 11px 16px; border: 1px solid #bcdacb; border-radius: 11px;
+  background: #eaf5ee; font-size: 12.5px; color: #31594f; }
+.cli-tools-dep-grant > button { margin-left: auto; min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+
+/* ── 页脚 ────────────────────────────────────────────────────────────────
+   2026-09-23 这里的三块（汇总那句 / 「这个页面是怎么判断的？」及其说明面板 /
+   「本次检查范围：Windows」）整块删掉了 —— 它们是元信息，不是判断，用户明确指出是噪音。
+   ⚠️ 删它们的前提是**没有事实因此失联**（每一条都另有出口，见 `CliToolsPage.tsx` 里那段注释），
+   以及**唯一不能删的那块仍在**：`.cli-tools-warn` 的「这次没检查成功」。
+   要加回"元信息"之前先读一遍那段注释 —— 别又把噪音长回来。 */
+
+/* ── 手动安装命令（默认折叠）─────────────────────────────────────────────
+   这一块是**手册**，不是这一屏的下一步：默认收起来，用户要的时候自己展开。
+   ⚠️ 它有意留在 `probeOk` 那道门之外（通道探测不到时最需要它），
+   所以样式上也要能独立站着，不依赖卡片区的任何东西。 */
+.cli-tools-manual { padding-bottom: 24px; }
+.cli-tools-manual > details { border: 1px solid #cfe0d6; border-radius: 11px; background: #fff; }
+/* 折叠头。整条可点，`cursor: pointer` 是原生 summary 在部分浏览器里唯一缺的那点提示。 */
+.cli-tools-manual > details > summary { display: flex; align-items: center; gap: 10px;
+  padding: 11px 16px; cursor: pointer; list-style: none; }
+.cli-tools-manual > details > summary::-webkit-details-marker { display: none; }
+/* 展开箭头。`data-*` 那条约定管的是"类名不拼"，这里靠原生 `[open]` 属性选择器，
+   没有第二份状态可漂移。 */
+.cli-tools-manual > details > summary::after { content: "▾"; margin-left: auto; color: #809188;
+  transition: transform 0.15s ease; }
+.cli-tools-manual > details[open] > summary::after { transform: rotate(180deg); }
+.cli-tools-manual > details > summary h2 { margin: 0; font-size: 13.5px; font-weight: 700; }
+.cli-tools-manual-list { margin: 0; padding: 0 16px 14px; list-style: none; display: grid; gap: 8px; }
+.cli-tools-manual-list > li { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 9px 12px; border: 1px solid #e3ece7; border-radius: 9px; background: #f7fbf8; }
+.cli-tools-manual-name { flex: none; min-width: 92px; font-size: 12.5px; font-weight: 700; color: #225c50; }
+.cli-tools-manual-list code { flex: 1; min-width: 0; overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace; font-size: 12px; color: #31594f; }
+.cli-tools-manual-copy { flex: none; min-height: 28px; padding: 0 12px; font-size: 12px; }
+/* 复制反馈走 `data-state`（本页第 1 条约定：变体不拼类名）。
+   只有 "copied" 一档：失败走 toast，不给按钮留一个没人设的状态。 */
+.cli-tools-manual-copy[data-state="copied"] { border-color: #2c7567; color: #225c50; }
+
+/* 折叠箭头的那点过渡要配降级块，且**显式列出同一个选择器**（本页第 4 条约定）。 */
+@media (prefers-reduced-motion: reduce) {
+  .cli-tools-manual > details > summary::after { transition: none; }
 }
-.cli-tools-card > header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.cli-tools-card h2 { margin: 0; font-size: 15px; font-weight: 600; }
 
-.cli-tools-badge {
-  margin-left: auto; padding: 3px 10px; border-radius: 999px;
-  font-size: 12px; border: 1px solid #dcdcd6; background: #f4f3f0; color: #6b6b66;
-}
-.cli-tools-badge.ready { border-color: #bcdacb; background: #eaf5ee; color: #2c7567; }
-.cli-tools-badge.pending { border-color: #ead4a8; background: #fff8e8; color: #85671c; }
-.cli-tools-badge.missing { border-color: #cfe0d6; background: #f4f3f0; color: #8a8a84; }
+/* ── 详情抽屉：所有"给排障用"的素材都在这里 ──────────────────────────────── */
+.cli-tools-detail { width: min(760px, 100% - 32px); max-height: min(840px, calc(100dvh - 60px)); display: flex; flex-direction: column; }
+.cli-tools-detail > header { display: flex; align-items: center; gap: 12px; }
+.cli-tools-detail > header h2 { margin: 0; font-size: 17px; }
+.cli-tools-detail-state { margin-left: auto; max-width: 46%; font-size: 12px; color: #748b81; text-align: right; }
+.cli-tools-detail-state[data-tone="ok"] { color: #225c50; }
+.cli-tools-detail-state[data-tone="warn"] { color: #85671c; }
+.cli-tools-detail-state[data-tone="bad"] { color: #a4462f; }
+.cli-tools-detail-body { flex: 1; min-height: 0; overflow: auto; padding: 14px 20px 4px; display: grid; gap: 12px; }
+.cli-tools-detail > footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid #e3ece7; }
+.cli-tools-detail > footer button { min-height: 32px; border-radius: 6px; padding: 0 12px; font-size: 12px; }
 
-.cli-tools-facts { margin: 0 0 12px; display: grid; gap: 6px; font-size: 12px; }
+.cli-tools-facts { margin: 0; display: grid; gap: 6px; font-size: 12px; }
 .cli-tools-facts > div { display: flex; gap: 10px; align-items: baseline; }
-.cli-tools-facts dt { flex: 0 0 76px; color: #8a8a84; }
+.cli-tools-facts dt { flex: 0 0 76px; color: #748b81; }
 .cli-tools-facts dd { margin: 0; word-break: break-all; }
-.cli-tools-path { font-family: var(--font-mono, ui-monospace, monospace); color: #4b4b47; }
+.cli-tools-path { font-family: ui-monospace, monospace; color: #31594f; }
 
-.cli-tools-note { margin: 0 0 10px; color: #85671c; font-size: 12px; line-height: 1.7; }
-.cli-tools-hint { color: #8a8a84; font-size: 12px; }
-.cli-tools-uptodate { color: #2c7567; font-size: 12px; }
-.cli-tools-inline-error { color: #a4462f; font-size: 12px; }
-
-.cli-tools-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-
-.cli-tools-confirm .cli-tools-confirm-body { margin: 0; padding: 0 20px 12px; font-size: 13px; line-height: 1.8; color: #4b4b47; }
-.cli-tools-confirm .cli-tools-confirm-body code { padding: 1px 6px; border-radius: 4px; background: #f4f3f0; font-size: 12px; }
-.cli-tools-confirm-env { margin: 0; padding: 0 20px 16px; font-size: 12px; color: #6b6b66; }
-
-/* 登录面板 */
-.cli-tools-login { width: min(480px, 100% - 32px); }
-.cli-tools-login > header { display: flex; align-items: center; gap: 12px; }
-.cli-tools-login > header h2 { font-size: 17px; margin: 0; }
-.cli-tools-login-ok { margin-left: auto; border-radius: 999px; padding: 3px 10px; color: #eefcf5; background: #2c7567; font-size: 12px; }
-.cli-tools-login-body { display: flex; flex-direction: column; gap: 10px; padding: 14px 20px 16px; font-size: 13px; line-height: 1.7; color: #4b4b47; }
-.cli-tools-login-hint { margin: 0; color: #86601d; font-size: 12px; }
-.cli-tools-login-url { margin: 0; overflow-wrap: anywhere; }
-.cli-tools-login-url a { color: #1f6556; }
-.cli-tools-login-code { font-family: ui-monospace, monospace; }
-.cli-tools-login > footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid #e7e4dd; }
-.cli-tools-login > footer button { min-height: 32px; border-radius: 6px; padding: 0 12px; font-size: 12px; }
-
-@media (max-width: 680px) {
-  .cli-tools-shell .dashboard-bar { flex-wrap: wrap; }
-  .cli-tools-facts dt { flex-basis: 68px; }
-  .cli-tools-actions { flex-direction: column; align-items: stretch; }
-  .cli-tools-actions > button { width: 100%; }
-}
-
-/* ── 故障诊断（docs/43） ────────────────────────────────────────────────────
+/* ── 故障诊断（docs/43）──────────────────────────────────────────────────
    四档观感必须**各不相同**：没有问题 / 发现问题 / 该环境不提供 / 检测没查成。
    把"没查成"画得跟"没问题"一样，用户就会以为这台机器一切正常 —— 那正是
-   这一整块存在要消灭的错。变体走 data-tone（项目约定：别用裸词做类名）。 */
+   这一整块存在要消灭的错。变体走 data-*（项目约定：别用裸词做类名）。 */
+.cli-tools-diagnosis { display: grid; gap: 12px; padding: 12px 14px; border: 1px solid #e3ece7;
+  border-radius: 10px; background: #f7fbf8; }
+.cli-tools-diagnosis-empty { margin: 0; color: #4c6b60; font-size: 12px; }
 
-.cli-tools-diagnosis-line {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
-  margin-top: 12px; padding: 8px 12px; border-radius: 10px;
-  border: 1px solid #dcdcd6; background: #f4f3f0; color: #6b6b66; font-size: 12px;
-}
-.cli-tools-diagnosis-line b { font-size: 13px; }
-.cli-tools-diagnosis-line button { margin-left: auto; min-height: 28px; }
-.cli-tools-diagnosis-line[data-tone="ok"] { border-color: #bcdacb; background: #eaf5ee; color: #2c7567; }
-.cli-tools-diagnosis-line[data-tone="warn"] { border-color: #f0d9a8; background: #fff8e8; color: #85671c; }
-.cli-tools-diagnosis-line[data-tone="bad"] { border-color: #f2c8c0; background: #fdf3f1; color: #a4462f; }
-/* unknown 用灰**且带虚边框**：它与 ok 必须一眼可分，因为它说的是"没查成"。 */
-.cli-tools-diagnosis-line[data-tone="unknown"] { border-color: #b4b2a9; border-style: dashed; background: #f4f3f0; color: #5f5e5a; }
-
-.cli-tools-diagnosis {
-  margin-top: 10px; padding: 12px 14px; border-radius: 10px;
-  border: 1px solid #e7e4dd; background: #fbfaf8; display: grid; gap: 12px;
-}
-.cli-tools-diagnosis-empty { margin: 0; color: #6b6b66; font-size: 12px; }
-/* 「上次修复解决了什么」。绿色是**有依据的**：它只在症状码真的从报告里消失时才出现。 */
-.cli-tools-resolved {
-  margin: 0; padding: 8px 12px; border-radius: 8px;
-  border: 1px solid #bcdacb; background: #eaf5ee; color: #2c7566; font-size: 12px; line-height: 1.7;
-}
-
-.cli-tools-issue { display: grid; gap: 6px; padding: 10px 12px; border-radius: 8px; background: #fff; border: 1px solid #e7e4dd; }
+.cli-tools-issue { display: grid; gap: 6px; padding: 10px 12px; border-radius: 8px; background: #fff; border: 1px solid #e3ece7; }
 .cli-tools-issue[data-severity="blocker"] { border-color: #f2c8c0; }
 .cli-tools-issue[data-severity="warning"] { border-color: #f0d9a8; }
 .cli-tools-issue-summary { margin: 0; font-size: 13px; line-height: 1.7; color: #19332c; display: flex; gap: 8px; align-items: baseline; }
-.cli-tools-severity { flex: 0 0 auto; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid #dcdcd6; background: #f4f3f0; color: #6b6b66; }
+.cli-tools-severity { flex: 0 0 auto; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid #d7e0da; background: #f2f5f3; color: #4c6b60; }
 /* 变体只认 data-*：页面不再拼 `cli-tools-severity-<值>` 那种动态类名（拼出来的类名一旦
    取值出乎意料就是个没人样式化的死类，而 data-* 至少能被 grep 到）。info 档没有专属规则
    —— 它就该是最朴素的灰胶囊。 */
@@ -132,37 +300,67 @@
 .cli-tools-severity[data-severity="warning"] { border-color: #f0d9a8; background: #fff8e8; color: #85671c; }
 
 .cli-tools-issue-evidence { margin: 0; padding-left: 18px; display: grid; gap: 3px; }
-.cli-tools-issue-evidence code { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: #4b4b47; word-break: break-all; }
+.cli-tools-issue-evidence code { font-family: ui-monospace, monospace; font-size: 12px; color: #31594f; word-break: break-all; }
 .cli-tools-issue-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .cli-tools-issue-actions > button { min-height: 30px; font-size: 12px; }
-.cli-tools-issue-manual { margin: 0; color: #8a8a84; font-size: 12px; line-height: 1.7; }
+.cli-tools-issue-manual { margin: 0; color: #748b81; font-size: 12px; line-height: 1.7; }
 
-.cli-tools-diagnosis-actions { display: flex; justify-content: flex-end; }
-.cli-tools-diagnosis-actions > button { min-height: 32px; font-size: 12px; }
-
-.cli-tools-diagnosis-block h3 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: #6b6b66; }
+.cli-tools-diagnosis-block h3 { margin: 0 0 6px; font-size: 12px; font-weight: 700; color: #4c6b60; }
 .cli-tools-diagnosis-block p { margin: 0 0 4px; }
 .cli-tools-paths { width: 100%; border-collapse: collapse; font-size: 12px; }
-.cli-tools-paths td { padding: 4px 8px; border-top: 1px solid #efede8; vertical-align: top; word-break: break-all; }
-.cli-tools-paths td:first-child { white-space: nowrap; color: #8a8a84; }
-.cli-tools-paths td:nth-child(3), .cli-tools-paths td:nth-child(4) { white-space: nowrap; color: #4b4b47; }
+.cli-tools-paths td { padding: 4px 8px; border-top: 1px solid #eef3f0; vertical-align: top; word-break: break-all; }
+.cli-tools-paths td:first-child { white-space: nowrap; color: #748b81; }
+.cli-tools-paths td:nth-child(3), .cli-tools-paths td:nth-child(4) { white-space: nowrap; color: #31594f; }
 /* 上次失败的原文：等宽、可换行、限高可滚 —— 它是排查的唯一线索，不能因为长就被截掉。 */
 .cli-tools-failure {
   margin: 0; max-height: 160px; overflow: auto; padding: 8px 10px; border-radius: 8px;
-  background: #f4f3f0; color: #4b4b47; font-family: var(--font-mono, ui-monospace, monospace);
+  background: #f2f5f3; color: #31594f; font-family: ui-monospace, monospace;
   font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all;
 }
 
+/* ── 确认框 ─────────────────────────────────────────────────────────────── */
+.cli-tools-confirm .cli-tools-confirm-body { margin: 0; padding: 0 20px 12px; font-size: 13px; line-height: 1.8; color: #31594f; }
+.cli-tools-confirm .cli-tools-confirm-body code { padding: 1px 6px; border-radius: 4px; background: #f2f5f3; font-size: 12px; }
+.cli-tools-confirm-env { margin: 0; padding: 0 20px 16px; font-size: 12px; color: #4c6b60; }
 /* 修复确认框：逐步列出将要做什么 —— 用户点的是一次"改我机器"的动作。 */
 .cli-tools-confirm-steps { margin: 0 0 8px; padding-left: 20px; display: grid; gap: 8px; }
 .cli-tools-confirm-steps li { display: grid; gap: 2px; }
 .cli-tools-confirm-steps b { font-size: 13px; color: #19332c; }
-.cli-tools-confirm-steps span { font-size: 12px; color: #6b6b66; line-height: 1.7; }
-.cli-tools-limits { display: grid; gap: 4px; }
+.cli-tools-confirm-steps span { font-size: 12px; color: #4c6b60; line-height: 1.7; }
 
+/* ── 登录面板 ───────────────────────────────────────────────────────────── */
+.cli-tools-login { width: min(480px, 100% - 32px); }
+.cli-tools-login > header { display: flex; align-items: center; gap: 12px; }
+.cli-tools-login > header h2 { font-size: 17px; margin: 0; }
+.cli-tools-login-ok { margin-left: auto; border-radius: 999px; padding: 3px 10px; color: #eefcf5; background: #2c7567; font-size: 12px; }
+.cli-tools-login-body { display: flex; flex-direction: column; gap: 10px; padding: 14px 20px 16px; font-size: 13px; line-height: 1.7; color: #31594f; }
+.cli-tools-login-url { margin: 0; overflow-wrap: anywhere; }
+.cli-tools-login-url a { color: #1f6556; }
+.cli-tools-login-code { font-family: ui-monospace, monospace; }
+.cli-tools-login > footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid #e3ece7; }
+.cli-tools-login > footer button { min-height: 32px; border-radius: 6px; padding: 0 12px; font-size: 12px; }
+
+/* ── 响应式：3 列 → 2 列 → 1 列 ─────────────────────────────────────────── */
+@media (max-width: 1040px) {
+  .cli-tools-grid, .cli-tools-skeleton { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 680px) {
-  .cli-tools-paths { display: block; overflow-x: auto; }
-  .cli-tools-diagnosis-line button { margin-left: 0; }
+  .cli-tools-shell .cli-tools-bar { flex-wrap: wrap; }
+  .cli-tools-body { width: min(1224px, 100% - 28px); }
+  .cli-tools-grid, .cli-tools-skeleton { grid-template-columns: minmax(0, 1fr); }
+  .cli-tools-banner { flex-wrap: wrap; }
+  .cli-tools-dep-right { margin-left: 0; }
+  /* 窄屏下仪表行换行：满足度独占一行时左边那条竖分隔线是游离的，去掉。 */
+  .cli-tools-dep-meter { margin-left: 0; padding-left: 0; border-left: 0; }
+  /* 窄屏下动作按钮铺满（有下一步动作的地方不能挤成两半）。 */
+  .cli-tools-card-actions { flex-direction: column; align-items: stretch; }
+  .cli-tools-card-actions > button { width: 100%; }
   .cli-tools-issue-actions { flex-direction: column; }
   .cli-tools-issue-actions > button { width: 100%; }
+  /* 「所有位置」那张表横向可滚，别把页面撑破。 */
+  .cli-tools-paths { display: block; overflow-x: auto; }
+  /* 命令会换行，于是「复制」自己占一行 —— 铺满（与卡片动作同一条窄屏约定）。 */
+  .cli-tools-manual-list > li { align-items: stretch; flex-direction: column; }
+  .cli-tools-manual-name { min-width: 0; }
+  .cli-tools-manual-copy { width: 100%; }
 }

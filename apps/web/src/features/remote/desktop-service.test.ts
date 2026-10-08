@@ -62,7 +62,7 @@ test("desktop service freshness threshold and liveness stay pinned to the design
   assert.equal(isAgentAlive(Number.NaN), false);
 });
 
-test("desktop service text covers every state and only stale/failed carry a fix", () => {
+test("desktop service text covers every state and only failed/unregistered carry a fix", () => {
   const loading = desktopServiceView("loading", null, null);
   const failed = desktopServiceView("failed", null, null);
   const unregistered = desktopServiceView("loaded", UNREGISTERED, null);
@@ -81,19 +81,20 @@ test("desktop service text covers every state and only stale/failed carry a fix"
     assert.ok(item.chip.length <= 4, `胶囊过长：${item.chip}`);
     assert.ok(item.label.length >= item.chip.length, "整句不该比胶囊短");
   }
-  // "正常"两档不给 hint（没事别说话）；出问题的两档必须给能照着做的修法。
+  // "正常"两档不给 hint（没事别说话）；读失败与未注册给能照着做的修法。
   assert.equal(live.hint, "");
   assert.equal(loading.hint, "");
   assert.match(failed.hint, /重启 Milevia/);
-  assert.match(stale.hint, /收不到本机 Agent 的心跳/);
-  // ⚠️ **心跳停的两种原因都要说出来**：那条 ticker 只在 `runConnection`（连着云端时）里跑，
-  // 所以"收不到心跳"既可能是 Agent 没在运行，也可能只是连不上云端。只写其中一种，
-  // 就会把另一种情况的用户指去错的动作（重启进程 / 查网络，是两件事）。
-  // 2026-09-17 复查时发现旧文案写的是"Agent 未在运行 / 重启 Milevia 之后重试"，正是这个毛病。
-  assert.match(stale.hint, /没在运行/);
-  assert.match(stale.hint, /连不上云端/);
-  assert.match(stale.hint, /旧数据/);
   assert.match(unregistered.hint, /注册/);
+  // ⚠️ stale **也不给 hint**：页头那颗整句＋侧栏「无心跳」胶囊与「最近心跳 N 前」
+  // 已经把这件事说了两遍，卡片底下再摊一段长说明是第三次（2026-09-25 用户点名删掉）。
+  assert.equal(stale.hint, "");
+  // 删的是建议句，不是判据的诚实：**措辞仍不许把原因说死**。那条 ticker 只在
+  // `runConnection`（连着云端时）里跑，所以"没有心跳"既可能是 Agent 没在运行，
+  // 也可能只是暂时连不上云端 —— 只报观测到的事实，不替用户挑原因。
+  // （2026-09-17 复查时旧文案写的是"Agent 未在运行 / 重启 Milevia 之后重试"，正是这个毛病。）
+  assert.match(stale.label, /没有心跳/);
+  assert.doesNotMatch(stale.label, /未运行|没在运行|重启/);
 });
 
 test("heartbeat age is phrased in human units with two distinct empty cases", () => {

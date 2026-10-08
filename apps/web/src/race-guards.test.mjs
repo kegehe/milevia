@@ -84,7 +84,9 @@ test("orchestration workspace loads complete history and keeps a single-column m
   assert.match(orchestrationPage, /\} while \(cursor\);/);
   assert.match(orchestrationPage, /requestVersion !== selectedRequestVersion\.current\) return;/);
   assert.match(orchestrationPage, /if \(historyMode === "latest" && selectedRequestInFlight\.current !== 0\) return;/);
-  assert.match(orchestrationPage, /if \(selected && refreshingStatuses\.has\(selected\.status\)\) void loadSelected\("latest"\)/);
+  // 计划级闸门引入后，轮询条件换成 needsRefresh（未开始计划的排队子任务不触发刷新），
+  // 但「选中项在刷新时也要拉一次最新历史」这层意图不变。
+  assert.match(orchestrationPage, /if \(selected && needsRefresh\(selected\)\) void loadSelected\("latest"\)/);
   const conversationPanel = orchestrationPage.match(/<main className="orchestration-conversation">[\s\S]*?<\/main>/)?.[0] || "";
   assert.match(conversationPanel, /<h2>完整对话<\/h2>/);
   assert.doesNotMatch(conversationPanel, /<section className="orchestration-timeline">/);

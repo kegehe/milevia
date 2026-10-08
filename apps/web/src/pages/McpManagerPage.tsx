@@ -1,15 +1,20 @@
-// MCP 连接管理页 — 管理注入到 AI 会话的外部 MCP server。
-// 与 SSH 管理页同构：以 DashboardPage 为底、弹出管理面板；复用 ssh-* 样式类。
+// MCP 连接管理页（路由 `/mcp-manager`）— 管理注入到 AI 会话的外部 MCP server。
+//
+// 独立页面（方案 A · 单栏分节长页）：顶栏（返回 / 标题 / 高级设置切换）＋
+// 从上到下「我的服务 → 服务目录 → 高级设置（默认收起）」，与 Cli 管理页同一套骨架。
+// 页面名与首页入口的 `title` / `<span>` 写同一个字符串「MCP连接」—— 改名时三处一起动。
+// 连接向导 / 手动配置 / 导入 / 审计等子流程仍以模态弹层呈现（`ssh-form-backdrop`）。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 import { useProjectContext } from "../stores/useProjectStore";
 import { openExternal } from "../lib/runtime";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { ServiceLogo } from "../components/ServiceLogo";
 import type { MCPAuditEntry, MCPAuditResponse, MCPImportCandidate, MCPImportResult, MCPInjectionStatus, MCPOAuthStatus, MCPPreset, MCPPreviewResult, MCPProjectView, MCPRuntimeCheckResult, MCPScope, MCPServer, MCPTestResult, MCPTransport } from "../lib/types";
-import { buildDraftServerPayload, cardActionLabel, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseKeyValueLines, parseLines, presetBadges, presetGuidanceLines, runtimeCommandsFor, wizardStartsAt, type MCPSecretInput } from "../features/mcp/mcp-model";
-import DashboardPage from "./DashboardPage";
+import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseKeyValueLines, parseLines, presetGuidanceLines, runtimeCommandsFor, wizardStartsAt, type MCPSecretInput } from "../features/mcp/mcp-model";
+import "./mcp-manager.css";
 
 const ENVIRONMENT_OPTIONS: { id: string; label: string }[] = [
   { id: "windows", label: "Windows" },
@@ -190,8 +195,11 @@ function formFromServer(server: MCPServer): FormState {
 }
 
 export default function McpManagerPage() {
-  const { api, projects } = useProjectContext();
+  const { api, projects, refreshProjects } = useProjectContext();
   const navigate = useNavigate();
+  // 独立页不再渲染 DashboardPage，项目列表要自己拉：直接刷新 / 托盘跳转进来时，
+  // 手动配置、导入、项目视图的项目下拉才有内容。refreshProjects 是合并刷新，重复调用无副作用。
+  useEffect(() => { void refreshProjects(); }, [refreshProjects]);
   const [servers, setServers] = useState<MCPServer[]>([]);
   const [presets, setPresets] = useState<MCPPreset[]>([]);
   // 表单来自哪个模板：用于在表单里展示「模板要求」（运行时依赖 + 需要填的凭据）。
@@ -201,6 +209,17 @@ export default function McpManagerPage() {
   const [runtimeResult, setRuntimeResult] = useState<MCPRuntimeCheckResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [localError, setLocalError] = useState("");
+  /**
+   * 「服务列表这次读到了吗」——**只由 loadServers 写**。
+   *
+   * 与 localError 分开：localError 还承担"取消向导时清理半成品失败"这类与列表无关的提示，
+   * 用它当判据时，一次清理失败就会把真实的空态（"还没有配置任何服务"）改口成
+   * "读不到服务列表"，计数也从 0 变成"—"。目录那一路早就有独立的 presetsError，
+   * 服务列表这一路没跟上（2026-09-29 复查）。
+   */
+  const [serversError, setServersError] = useState("");
+  // 目录读取的失败单独记账：读失败与「目录为空」必须分开渲染。
+  const [presetsError, setPresetsError] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
@@ -267,15 +286,23 @@ export default function McpManagerPage() {
   // 高级设置：手动配置 / 从现有配置导入 / 项目视图 / 调用审计。
   // 这些是排障与治理入口，不是「连一个服务」的必经步骤，默认收起。
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // 关闭向导的同步闸（防同 tick 双击发出两个 DELETE）。
+  const wizardClosingRef = useRef(false);
 
   const loadServers = useCallback(async () => {
     setLoading(true);
     try {
       const list = await api<MCPServer[]>("/api/mcp/servers");
       setServers(Array.isArray(list) ? list : []);
+      setServersError("");
       setLocalError("");
     } catch (cause) {
-      setLocalError(cause instanceof Error ? cause.message : "无法加载 MCP 配置");
+      const message = cause instanceof Error ? cause.message : "无法加载 MCP 配置";
+      // 两处都要落：serversError 服务「空态 vs 读失败」的判据，localError 是页面顶部那条横幅。
+      // 分开是因为 localError 还有第二个写入点（取消向导时清理失败，见 closeWizard）——
+      // 那个不该让"服务列表"显示成"读不到"（2026-09-29 复查）。
+      setServersError(message);
+      setLocalError(message);
     } finally {
       setLoading(false);
     }
@@ -283,16 +310,20 @@ export default function McpManagerPage() {
 
   useEffect(() => { void loadServers(); }, [loadServers]);
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        const list = await api<MCPPreset[]>("/api/mcp/presets");
-        setPresets(Array.isArray(list) ? list : []);
-      } catch {
-        setPresets([]);
-      }
-    })();
+  // 目录的读取是独立一路：读失败必须与「目录为空」分开 —— 合并起来就是把
+  // 「读不到」写成「没有」，用户会以为平台一共就只能连这几个服务。
+  const loadPresets = useCallback(async () => {
+    setPresetsError("");
+    try {
+      const list = await api<MCPPreset[]>("/api/mcp/presets");
+      setPresets(Array.isArray(list) ? list : []);
+    } catch (cause) {
+      setPresets([]);
+      setPresetsError(cause instanceof Error ? cause.message : "无法加载服务目录");
+    }
   }, [api]);
+
+  useEffect(() => { void loadPresets(); }, [loadPresets]);
 
   const loadProjectView = useCallback(async (projectId: string) => {
     setViewProjectId(projectId);
@@ -337,7 +368,8 @@ export default function McpManagerPage() {
       setForm(emptyForm());
       setPresetMeta(null);
     }
-    setLocalError("");
+    // 不在这里清 localError：它还承担「服务列表读失败」的记忆 —— 打开又关掉表单后，
+    // 列表区该回到读失败块，而不是把「读不到」伪装成「还没有配置任何服务」。
     setPreviewResult(null);
     setRuntimeResult(null);
     setShowForm(true);
@@ -348,7 +380,6 @@ export default function McpManagerPage() {
     setForm(formFromServer(server));
     // 编辑既有 server 时不再展示模板要求：它反映的是当初的模板，不是当前配置的事实。
     setPresetMeta(null);
-    setLocalError("");
     setPreviewResult(null);
     setRuntimeResult(null);
     setShowForm(true);
@@ -359,7 +390,6 @@ export default function McpManagerPage() {
     setShowForm(false);
     setEditingId(null);
     setPresetMeta(null);
-    setLocalError("");
     setPreviewResult(null);
     setRuntimeResult(null);
   };
@@ -437,12 +467,30 @@ export default function McpManagerPage() {
     setWizardStep(wizardStartsAt(preset));
   };
 
-  const closeWizard = () => {
-    if (wizardBusy) return;
-    // OAuth 路径会先落库：这时「取消」不能假装什么都没发生 —— 否则用户以为没连上，
-    // 列表里却多了一条（名字还被占着）。
-    if (wizardServer) {
-      toast.message(`「${wizardServer.displayName || wizardServer.name}」已保存，可在列表里完成授权或删除`);
+  const closeWizard = async () => {
+    // wizardClosingRef 是同步闸：wizardBusy 是异步 state，同一 tick 里的第二次点击
+    // 读到的还是旧值，会发出第二个 DELETE（404 后反而报「清理失败」）。
+    if (wizardBusy || wizardClosingRef.current) return;
+    // OAuth 路径会先落库（回调要按 serverID 存令牌），所以「取消」时列表里可能躺着一条
+    // 从没连上的记录。凡是**试连没有通过**的半成品，取消时一律删掉 —— 不然用户只是点了
+    // 一下连接、什么都没连上，列表里却多出一条「已启用」的服务。只有 wizardResult.ok
+    // （真实连接验证通过）的才留下。
+    const leftover = wizardServer;
+    if (leftover && wizardResult?.ok !== true) {
+      wizardClosingRef.current = true;
+      setWizardBusy(true);
+      try {
+        await api(`/api/mcp/servers/${leftover.id}`, { method: "DELETE" });
+        toast.message(`已取消连接「${leftover.displayName || leftover.name}」，没有保存任何东西`);
+        await loadServers();
+      } catch (cause) {
+        setLocalError(cause instanceof Error ? cause.message : "清理未完成的连接失败，请稍后在列表里手动删除");
+      } finally {
+        wizardClosingRef.current = false;
+        setWizardBusy(false);
+      }
+    } else if (leftover) {
+      toast.message(`「${leftover.displayName || leftover.name}」已保存，可在列表里管理`);
     }
     setWizard(null);
     setWizardServer(null);
@@ -615,7 +663,8 @@ export default function McpManagerPage() {
       setEditingId(null);
       await loadServers();
     } catch (cause) {
-      setLocalError(cause instanceof Error ? cause.message : "保存失败");
+      // 表单弹层盖着页面，localError 横幅在背板后面看不见 —— 保存失败必须用 toast。
+      toast.error(cause instanceof Error ? cause.message : "保存失败");
     } finally {
       setSaving(false);
     }
@@ -935,58 +984,71 @@ export default function McpManagerPage() {
   const wizardHasSecret = Object.values(wizardSecrets).some((value) => value.trim() !== "");
 
   return <>
-    <DashboardPage />
-    <div className="backdrop ssh-manager-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-manager-title">
-      <section className="modal ssh-manager-dialog">
-        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-manager-title">外部能力</h2><p>让 AI 用上 GitHub、Notion、Slack 这类外部服务</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" onClick={() => navigate("/")}><CloseIcon /></button></header>
-        <div className="ssh-manager-toolbar"><span>{loading ? "正在同步" : servers.length > 0 ? `已连接 ${servers.length} 个服务` : "还没有连接任何服务"}</span><div className="ssh-toolbar-actions"><button className="secondary" type="button" onClick={() => setShowAdvanced((value) => !value)}>{showAdvanced ? "收起高级设置" : "高级设置"}</button></div></div>
-        {localError && <div className="ssh-error" role="alert"><span>{localError}</span><button type="button" title="关闭提示" aria-label="关闭提示" onClick={() => setLocalError("")}><CloseIcon /></button></div>}
-        <div className="ssh-manager-body">
-          {/* 已连接：卡片按「服务」呈现，不暴露传输类型 / 环境 / Agent 这些用户答不出来的字段。 */}
-          <div className="ssh-form-section"><header><h3>已连接</h3><p>连上之后，AI 在执行任务时就能调用这些服务。</p></header>
-            {loading ? <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在读取…</p>
-              : servers.length === 0 ? <p className="ssh-form-notice">还没有连接任何服务。从下面的目录里挑一个，点「连接」按提示走完就行。</p>
-              : <div className="ssh-connection-list">{servers.map((server) => <article className={`ssh-connection-card is-${server.enabled ? "connected" : "unknown"}`} key={server.id}>
-                <div className="ssh-connection-main">
-                  <span className="ssh-status"><i></i>{server.enabled ? "已连接" : "已停用"}</span>
-                  <h3><span className="mcp-service-mark"><PresetIcon name={presetIconKey(server.name, presets)} /></span>{server.displayName || server.name}</h3>
-                  <p>{server.envSecretKeys?.length || server.headerSecretKeys?.length ? "已保存凭据" : server.transport === "stdio" ? "在本机运行" : "远程服务"}{server.scope === "project" ? ` · 仅用于「${projectName.get(server.projectId || "") || server.projectId}」` : ""}</p>
-                </div>
-                <div className="ssh-connection-actions">
-                  <button className="ssh-action-button mcp-test-button" type="button" title="测试连接" aria-label={`测试 ${server.name}`} onClick={() => openTest(server)}>测试</button>
-                  {server.transport !== "stdio" && <button className="ssh-action-button" type="button" title="OAuth 授权" aria-label={`授权 ${server.name}`} onClick={() => void openOAuth(server)}>授权</button>}
-                  <button className="ssh-action-button" type="button" title={server.enabled ? "停用" : "启用"} aria-label={`切换 ${server.name}`} onClick={() => void toggleEnabled(server)}>{server.enabled ? "停用" : "启用"}</button>
-                  <button className="ssh-action-button" type="button" title="管理" aria-label={`管理 ${server.name}`} onClick={() => startEdit(server)}><EditIcon /></button>
-                  <button className="ssh-action-button danger" type="button" title="删除" aria-label={`删除 ${server.name}`} onClick={() => setDeleteTarget(server)}><TrashIcon /></button>
-                </div>
-              </article>)}</div>}
-          </div>
-          {/* 服务目录 = 向导的第一屏：用户看到的是服务名与「要不要自己动手准备」，不是模板参数。 */}
-          {presets.length > 0 && <div className="ssh-form-section"><header><h3>可以连接的服务</h3><p>点「连接」按提示走完就行，不需要先了解 MCP 是什么。</p></header>
-            {groupPresetsByCategory(presets).map((group) => <div className="mcp-catalog-group" key={group.category || "other"}>
-              {group.category && <h4>{group.category}</h4>}
-              <div className="mcp-preset-grid">{group.items.map((preset) => <article key={preset.id} className="mcp-preset-card">
-                <header><span className="mcp-service-mark"><PresetIcon name={preset.icon} /></span><b>{preset.displayName || preset.name}</b></header>
+    <div className="mcp-shell">
+      <header className="mcp-bar">
+        <button className="secondary" type="button" onClick={() => navigate("/")}>返回</button>
+        <h1 className="mcp-title">MCP连接</h1>
+        <div className="mcp-bar-actions"><button className="secondary" type="button" onClick={() => setShowAdvanced((value) => !value)}>{showAdvanced ? "收起高级设置" : "高级设置"}</button></div>
+      </header>
+      <main className="mcp-body">
+        {localError && <div className="ssh-error mcp-error" role="alert"><span>{localError}</span><button type="button" title="关闭提示" aria-label="关闭提示" onClick={() => setLocalError("")}><CloseIcon /></button></div>}
+        {/* 已连接 → 「我的服务」：列表里的每一条只是**配置存在且启用**，并不代表连接验证过
+            （验证只发生在向导的试连/测试里）。把 enabled 说成「已连接」是最典型的口径错误 ——
+            用户点了连接又中途放弃，也会看到一条「已连接」。 */}
+        <section className="mcp-section">
+          <header><h2>我的服务<span className="mcp-count">{loading ? "正在同步…" : serversError ? "—" : servers.length}</span></h2></header>
+          {loading ? <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在读取…</p>
+            : servers.length === 0 && serversError ? <div className="mcp-empty mcp-read-fail" role="alert"><b>读不到服务列表</b><button className="secondary" type="button" onClick={() => void loadServers()}>重试</button></div>
+            : servers.length === 0 ? <div className="mcp-empty"><b>还没有配置任何服务</b><span>从下面的目录里挑一个，点「连接」按提示走完就行。</span></div>
+            : <div className="ssh-connection-list mcp-conn-list">{servers.map((server) => <article className={`ssh-connection-card is-${server.enabled ? "connected" : "unknown"}`} key={server.id}>
+              <div className="ssh-connection-main">
+                <span className="ssh-status"><i></i>{server.enabled ? "已启用" : "已停用"}</span>
+                <h3><span className="mcp-service-mark"><ServiceLogo service={server.name} fallback={<PresetIcon name={presetIconKey(server.name, presets)} />} /></span>{server.displayName || server.name}</h3>
+                <p>{server.envSecretKeys?.length || server.headerSecretKeys?.length ? "已保存凭据" : server.transport === "stdio" ? "在本机运行" : "远程服务"}{server.scope === "project" ? ` · 仅用于「${projectName.get(server.projectId || "") || server.projectId}」` : ""}</p>
+              </div>
+              <div className="ssh-connection-actions">
+                <button className="ssh-action-button mcp-test-button" type="button" title="测试连接" aria-label={`测试 ${server.name}`} onClick={() => openTest(server)}>测试</button>
+                {server.transport !== "stdio" && <button className="ssh-action-button" type="button" title="OAuth 授权" aria-label={`授权 ${server.name}`} onClick={() => void openOAuth(server)}>授权</button>}
+                <button className="ssh-action-button" type="button" title={server.enabled ? "停用" : "启用"} aria-label={`切换 ${server.name}`} onClick={() => void toggleEnabled(server)}>{server.enabled ? "停用" : "启用"}</button>
+                <button className="ssh-action-button" type="button" title="管理" aria-label={`管理 ${server.name}`} onClick={() => startEdit(server)}><EditIcon /></button>
+                <button className="ssh-action-button danger" type="button" title="删除" aria-label={`删除 ${server.name}`} onClick={() => setDeleteTarget(server)}><TrashIcon /></button>
+              </div>
+            </article>)}</div>}
+        </section>
+        {/* 服务目录 = 向导的第一屏：用户看到的是服务名与「要不要自己动手准备」，不是模板参数。
+            读失败单独成块（带重试）—— 静默消失会让用户以为平台一共只有这几个服务。 */}
+        {presetsError ? <section className="mcp-section">
+          <header><h2>可以连接的服务</h2></header>
+          <div className="mcp-empty mcp-read-fail" role="alert"><b>读不到服务目录</b><button className="secondary" type="button" onClick={() => void loadPresets()}>重试</button></div>
+        </section>
+        : presets.length > 0 && <section className="mcp-section">
+          <header><h2>可以连接的服务</h2></header>
+          {groupPresetsByCategory(presets).map((group) => <div className="mcp-catalog-group" key={group.category || "other"}>
+            {group.category && <h4>{group.category}</h4>}
+            <div className="mcp-preset-grid">{group.items.map((preset) => <article key={preset.id} className="mcp-preset-card">
+              <div className="mcp-preset-main">
+                <header><span className="mcp-service-mark"><ServiceLogo service={preset.name} fallback={<PresetIcon name={preset.icon} />} /></span><b>{preset.displayName || preset.name}</b></header>
                 <p>{preset.summary || preset.description}</p>
-                <div className="mcp-preset-meta">{presetBadges(preset).map((badge) => <span key={badge} className="mcp-tool-flag is-info">{badge}</span>)}</div>
-                <div className="ssh-preflight-checks"><button className="primary" type="button" onClick={() => openWizard(preset)}>{cardActionLabel(preset)}</button></div>
-              </article>)}</div>
-            </div>)}
-          </div>}
-          {/* 高级设置：排障与治理入口。默认收起 —— 它们不是「连一个服务」的必经步骤，
-              摆在一级界面上只会让不懂 MCP 的用户以为连个 GitHub 也要先看懂这些。 */}
-          {showAdvanced && <div className="ssh-form-section mcp-advanced"><header><h3>高级设置</h3><p>排障与治理入口，日常连接用不到。</p></header>
+              </div>
+              <div className="mcp-preset-action"><button className="primary" type="button" onClick={() => openWizard(preset)}>连接</button></div>
+            </article>)}</div>
+          </div>)}
+        </section>}
+        {/* 高级设置：排障与治理入口。默认收起 —— 它们不是「连一个服务」的必经步骤，
+            摆在一级界面上只会让不懂 MCP 的用户以为连个 GitHub 也要先看懂这些。 */}
+        {showAdvanced && <section className="mcp-section mcp-advanced">
+          <div className="ssh-form-section"><header><h3>高级设置</h3></header>
             <div className="ssh-preflight-checks">
               <button className="secondary" type="button" onClick={() => startCreate()}><McpIcon />手动配置</button>
               <button className="secondary" type="button" onClick={() => { setImportOpen(true); setImportPreview(null); void loadImportPreview(""); }}>从现有配置导入</button>
               <button className="secondary" type="button" onClick={() => { setAuditOpen(true); setAuditFilter(""); void loadAudit(""); }}>调用审计</button>
             </div>
-            <div className="ssh-form-section"><header><h3>项目视图</h3><p>查看某个项目当前实际生效的服务（只读）；也可以在这里放行项目自带的 .mcp.json。</p></header>
+            <div className="ssh-form-section"><header><h3>项目视图</h3></header>
             <label className="ssh-field">选择项目<select value={viewProjectId} onChange={(event) => void loadProjectView(event.target.value)}><option value="">未选择</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
             {viewLoading && <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在读取项目 MCP 视图…</p>}
             {projectView && !viewLoading && <div className="ssh-preflight valid"><header><span><McpIcon /></span><div><h4>{`环境：${projectView.environment}`}</h4><p>{projectView.strictMode ? "已启用严格模式（默认）" : "未启用严格模式"}</p></div></header>
               <div className="ssh-preflight-checks">{projectView.effective.length === 0 ? <span>该项目暂无生效的 MCP server</span> : projectView.effective.map((entry) => <span key={entry.id}>{entry.displayName || entry.name} <b>{entry.origin === "project" ? "项目" : "全局"}</b></span>)}</div>
-              {projectView.bindings.length > 0 && <div className="ssh-form-section"><header><h3>项目开关</h3><p>关闭后该项目不再注入该 server，不影响其他项目。</p></header>
+              {projectView.bindings.length > 0 && <div className="ssh-form-section"><header><h3>项目开关</h3></header>
                 <div className="ssh-preflight-checks">{projectView.bindings.map((binding) => <button key={binding.serverId} className={binding.enabled ? "" : "secondary"} type="button" disabled={bindingBusy === binding.serverId} onClick={() => void toggleBinding(binding.serverId, !binding.enabled)}>
                   {binding.displayName || binding.serverName}：{binding.enabled ? "已启用" : "已关闭"}{binding.overridden ? "（项目覆盖）" : ""}
                 </button>)}</div>
@@ -1003,14 +1065,13 @@ export default function McpManagerPage() {
               {projectView.warnings.map((warning) => <p key={warning}>{warning}</p>)}
             </div>}
             </div>
-          </div>}
-        </div>
-        <footer><button className="secondary" type="button" onClick={() => navigate("/")}>关闭</button></footer>
-      </section>
+          </div>
+        </section>}
+      </main>
     </div>
     {wizard && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-wizard-title">
       <section className="modal ssh-connection-dialog">
-        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><PresetIcon name={wizard.icon} /></span><div><h2 id="mcp-wizard-title">连接 {wizard.displayName}</h2><p>{wizard.summary || wizard.description}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={wizardBusy} onClick={closeWizard}><CloseIcon /></button></header>
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><ServiceLogo service={wizard.name} fallback={<PresetIcon name={wizard.icon} />} /></span><div><h2 id="mcp-wizard-title">连接 {wizard.displayName}</h2><p>{wizard.summary || wizard.description}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={wizardBusy} onClick={() => void closeWizard()}><CloseIcon /></button></header>
         <div className="ssh-form-body">
           <ol className="mcp-wizard-steps">
             <li className={wizardStep === "credential" ? "is-active" : "is-done"}>1 准备</li>
@@ -1054,7 +1115,7 @@ export default function McpManagerPage() {
           </div>}
         </div>
         <footer>
-          <button className="secondary" type="button" disabled={wizardBusy} onClick={closeWizard}>取消</button>
+          <button className="secondary" type="button" disabled={wizardBusy} onClick={() => void closeWizard()}>取消</button>
           {wizardStep === "credential" && (wizardHasSecret || !wizardPlan.canOAuth) && <button className="primary" type="button" disabled={wizardBusy || !credentialsSatisfied(wizard, wizardSecrets)} onClick={() => { setWizardStep("check"); void runWizardCheck(); }}>下一步</button>}
           {wizardStep === "done" && <button className="primary" type="button" disabled={wizardBusy} onClick={() => void finishWizard()}>{wizardBusy ? "保存中…" : "完成"}</button>}
         </footer>
@@ -1089,7 +1150,7 @@ export default function McpManagerPage() {
             </div>}
             {presetMeta.docsUrl && <p className="ssh-form-notice">参考文档：{presetMeta.docsUrl}</p>}
           </section> : null}
-          <section className="ssh-form-section"><header><h3>传输方式</h3><p>stdio 在目标环境拉起本地进程；http/sse 连接远程服务。</p></header>
+          <section className="ssh-form-section"><header><h3>传输方式</h3></header>
             <label className="ssh-field">类型<select value={form.transport} onChange={(event) => setField("transport", event.target.value as MCPTransport)}><option value="stdio">stdio（本地进程）</option><option value="http">http（Streamable HTTP）</option><option value="sse">sse（兼容旧版）</option></select></label>
             {form.transport === "stdio" ? <div className="ssh-fields">
               <label className="ssh-field">启动命令<input type="text" value={form.command} onChange={(event) => setField("command", event.target.value)} placeholder="npx" /></label>
@@ -1116,7 +1177,7 @@ export default function McpManagerPage() {
             <div className="ssh-auth-method">{ENVIRONMENT_OPTIONS.map((option) => <label key={option.id} className={form.environments.includes(option.id) ? "active" : ""}><input type="checkbox" checked={form.environments.includes(option.id)} onChange={() => toggleIn("environments", option.id)} />{option.label}</label>)}</div>
             <div className="ssh-auth-method">{AGENT_OPTIONS.map((option) => <label key={option.id} className={form.agents.includes(option.id) ? "active" : ""}><input type="checkbox" checked={form.agents.includes(option.id)} onChange={() => toggleIn("agents", option.id)} />{option.label}</label>)}</div>
           </section>
-          <section className="ssh-form-section"><header><h3>按环境预览</h3><p>保存前先确认这条配置在目标环境里长什么样、跑不跑得起来。</p></header>
+          <section className="ssh-form-section"><header><h3>按环境预览</h3></header>
             <div className="ssh-fields">
               <label className="ssh-field">预览环境<select value={previewEnvironment} onChange={(event) => { setPreviewEnvironment(event.target.value); setPreviewResult(null); setRuntimeResult(null); }}>{ENVIRONMENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
             </div>
@@ -1154,7 +1215,7 @@ export default function McpManagerPage() {
       <section className="modal ssh-connection-dialog">
         <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-test-title">测试连接</h2><p>{testTarget.displayName || testTarget.name} · {testTarget.transport}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={testRunning} onClick={() => { setTestTarget(null); setTestResult(null); }}><CloseIcon /></button></header>
         <div className="ssh-form-body">
-          <section className="ssh-form-section"><header><h3>目标环境</h3><p>测试会在该环境真实拉起 server 并执行 initialize + tools/list。stdio 型 server 依赖该环境已安装对应运行时。</p></header>
+          <section className="ssh-form-section"><header><h3>目标环境</h3></header>
             <label className="ssh-field">环境<select value={testEnvironment} onChange={(event) => setTestEnvironment(event.target.value)}>{ENVIRONMENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
             {!testTarget.environments.includes(testEnvironment) && <p className="ssh-form-notice">该 server 未声明适用于此环境，实跑会按当前选择执行。</p>}
             <div className="ssh-preflight-checks"><button className="primary" type="button" disabled={testRunning} onClick={() => void runTest()}>{testRunning ? "测试中…" : "开始测试"}</button></div>
@@ -1203,7 +1264,7 @@ export default function McpManagerPage() {
     </div>}
     {importOpen && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-import-title">
       <section className="modal ssh-connection-dialog">
-        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-import-title">从现有配置导入</h2><p>读取 Claude 与 Codex 的 MCP 配置，确认后写入 Milevia</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={importRunning} onClick={() => { setImportOpen(false); setImportPreview(null); }}><CloseIcon /></button></header>
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-import-title">从现有配置导入</h2></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={importRunning} onClick={() => { setImportOpen(false); setImportPreview(null); }}><CloseIcon /></button></header>
         <div className="ssh-form-body">
           <section className="ssh-form-section"><header><h3>来源</h3><p>选择项目可一并读取该项目专属的 Claude 配置与 .mcp.json。</p></header>
             <label className="ssh-field">项目（可选）<select value={importProjectId} onChange={(event) => void loadImportPreview(event.target.value)}><option value="">不指定</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
@@ -1255,14 +1316,14 @@ export default function McpManagerPage() {
     </div>}
     {auditOpen && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-audit-title">
       <section className="modal ssh-connection-dialog">
-        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-audit-title">调用审计</h2><p>最近 2000 次 MCP 工具调用的裁决与结果</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={auditClearing} onClick={() => setAuditOpen(false)}><CloseIcon /></button></header>
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-audit-title">调用审计</h2></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={auditClearing} onClick={() => setAuditOpen(false)}><CloseIcon /></button></header>
         <div className="ssh-form-body">
-          <section className="ssh-form-section"><header><h3>筛选</h3><p>参数中命中疑似凭据的键会被替换为 ***，不会落库明文。</p></header>
+          <section className="ssh-form-section"><header><h3>筛选</h3></header>
             <label className="ssh-field">server<select value={auditFilter} onChange={(event) => { setAuditFilter(event.target.value); void loadAudit(event.target.value); }}><option value="">全部</option>{servers.map((server) => <option key={server.id} value={server.name}>{server.displayName || server.name}</option>)}</select></label>
             <div className="ssh-preflight-checks"><button className="secondary" type="button" disabled={auditLoading} onClick={() => void loadAudit(auditFilter)}>{auditLoading ? "读取中…" : "刷新"}</button><button className="secondary" type="button" disabled={auditClearing || auditEntries.length === 0} onClick={() => void clearAudit()}>{auditClearing ? "清空中…" : "清空记录"}</button></div>
           </section>
           {!auditLoading && auditEntries.length === 0 && <section className="ssh-form-section"><p className="ssh-form-notice">暂无调用记录。AI 调用 MCP 工具后会在此出现。</p></section>}
-          {auditEntries.length > 0 && <section className="ssh-form-section"><header><h3>{`显示 ${auditEntries.length} / ${auditTotal} 条`}</h3></header>
+          {auditEntries.length > 0 && <section className="ssh-form-section"><header><h3>{`显示 ${auditEntries.length} / ${auditTotal} 条（最多保留最近 2000 次）`}</h3></header>
             <div className="mcp-audit-list">{auditEntries.map((entry) => <article key={entry.id} className="mcp-audit-item">
               <header><b>{entry.toolName}</b><span className={`mcp-tool-flag is-${decisionSeverity(entry.decision)}`}>{decisionLabel(entry.decision)}</span>{entry.status && entry.status !== "pending" && <span className={`mcp-tool-flag is-${statusSeverity(entry.status)}`}>{entry.status === "ok" ? "执行成功" : "执行出错"}</span>}</header>
               <small>{entry.serverName} · {new Date(entry.createdAt).toLocaleString("zh-CN")}{entry.durationMs > 0 ? ` · ${entry.durationMs} ms` : ""}</small>

@@ -253,7 +253,7 @@ export default function SSHManagerPage() {
     <DashboardPage />
     <div className="backdrop ssh-manager-backdrop" role="dialog" aria-modal="true" aria-labelledby="ssh-manager-title">
       <section className="modal ssh-manager-dialog">
-        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><SshIcon /></span><div><h2 id="ssh-manager-title">SSH连接</h2><p>管理远程开发环境与项目目录</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" onClick={() => navigate("/")}><CloseIcon /></button></header>
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><SshIcon /></span><div><h2 id="ssh-manager-title">SSH连接</h2></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" onClick={() => navigate("/")}><CloseIcon /></button></header>
         <div className="ssh-manager-toolbar"><span>{loading ? "正在同步连接状态" : `${connections.length} 个已保存连接`}</span><button className="primary ssh-add-button" type="button" onClick={startCreate}><SshIcon />添加连接</button></div>
         {localError && <div className="ssh-error" role="alert"><span>{localError}</span><button type="button" title="关闭提示" aria-label="关闭提示" onClick={clearError}><CloseIcon /></button></div>}
         <div className="ssh-manager-body">

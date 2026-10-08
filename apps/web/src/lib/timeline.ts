@@ -46,13 +46,27 @@ function isInternalError(message: string): boolean {
 function localizedErrorDetail(value: unknown, fallback: string): string {
   const detail = typeof value === "string" ? value.trim() : "";
   if (!detail) return fallback;
-  // Pure Chinese without untranslated English \u2014 display directly.
+  // Internal Go errors (stack traces, panics) — keep the fallback only.
+  //
+  // ⚠️ 这一条必须排在中文分支**之前**，与 app.go 的 localizedErrorText 同序：服务端先判
+  // isInternalError（那里的注释写着 "Checked first so a wrapped '… 失败' message can never
+  // carry a stack trace to the UI"），再判中文直通。顺序反了的话，一条**含中文**又带
+  // `.go:`/`panic:` 的错误会在前端原样上屏（把 Go 栈帧带给用户），而服务端会换成兜底句
+  // —— 同一个错误在两端的形态不一致，正是这个文件反复强调要避免的那件事
+  // （2026-09-29 对齐：原来这一条排在中文分支之后）。
+  if (isInternalError(detail)) return fallback;
+  // 含中文时按 server 侧 localizedErrorText 的**同一条判据**决定要不要套兜底前缀：
+  // 有“失败”就直通，否则要求剔除技术术语后没有残留英文。
+  //
+  // 那个“失败”分支不是可有可无的：进程退出这类错误的真实形态是「中文包装 + Go 的
+  // 英文退出描述」（如 “Codex 运行失败：exit status 1”），只有它能让这句直通；
+  // 少了它，桌面端与手机端会在同一条错误上给出不同形态（这里多套一层“请查看任务日志
+  // 后重试。”，服务端那边不套）——镜像必须与 app.go 逐条对齐。
   if (/[\u4e00-\u9fff]/.test(detail)) {
+    if (detail.includes("失败")) return detail;
     const withoutTechnicalTerms = detail.replace(allowedTechnicalTerms, "");
     if (!/[A-Za-z]{3,}/.test(withoutTechnicalTerms)) return detail;
   }
-  // Internal Go errors (stack traces, panics) \u2014 keep the fallback only.
-  if (isInternalError(detail)) return fallback;
   // English or mixed-language errors \u2014 keep the fallback as a prefix, then
   // append the original error so users can see the real cause.
   return fallback + "\uff1a" + detail;
@@ -74,8 +88,17 @@ function eventErrorDetail(payload: Record<string, any>): string {
   ), "任务执行失败，请查看任务日志后重试。");
 }
 
+// Codex 的裸退出诊断：只有退出码、没有可读原因。桌面端靠它决定这条失败要不要
+// 先压着——同一个 run 里若还有更详细的诊断，就不必重复展示（见 buildTimeline 的
+// fallbackTerminalFailures）。
+//
+// 两种措辞都要认，缺一不可：
+//  - 英文那份是**历史事件**。events 表里的旧记录会经 HTTP 分页与 WS 回放原样带出来，
+//    已落库的原文不会因为服务端换了文案而改变；
+//  - 中文那份是 2026-09 之后服务端产出的形态（codexExitPrefix + Go 的退出描述）。
+// 只认英文的话，新事件的 deferFallback 恒为 false，界面会多出一条只有退出码的卡。
 function isGenericCodexExit(detail: string): boolean {
-  return /^Codex exited: exit status \d+\.?$/.test(detail.trim());
+  return /^(?:Codex exited: |Codex 运行失败：)exit status \d+\.?$/.test(detail.trim());
 }
 
 export function getApproval(event: Event): Approval | null {
@@ -146,7 +169,9 @@ export function systemItemFromEvent(event: Event): SystemItem | null {
       const raw = String(payload.error || "").trim();
       if (!raw) return "";
       const known: Record<string, string> = { rate_limit: "速率限制", overloaded: "服务过载", server_error: "服务器错误", timeout: "请求超时" };
-      return known[raw] || raw;
+      // 未登记的标识符也给中文外壳：原样英文会在「API 重试中」这句中文里显得突兀，
+      // 而它本身是机器码（如 authentication_error），保留在括号里不影响搜索。
+      return known[raw] || `接口错误（${raw}）`;
     })();
     const errorPart = errorLabel ? `：${errorLabel}${errorStatus ? ` (${errorStatus})` : ""}` : errorStatus ? ` (${errorStatus})` : "";
     return {

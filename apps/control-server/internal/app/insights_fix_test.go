@@ -50,10 +50,15 @@ func (r *nthBatchRunner) Run(_ context.Context, req AgentRunRequest, sink AgentR
 	return nil
 }
 
-// insightPromptCandidateIDs 从再验证 prompt 的候选清单里取出 id，跳过输出契约里的示例 id。
+// insightPromptCandidateIDs 从再验证 prompt 的候选清单里取出 id。只扫 "Candidates:"
+// 之后的部分：输出契约的示例里也有 {"id":…}，按整段扫会把示例的占位符当成候选 id
+// （占位符文案一改，这里就会静默多出几条假候选）。
 func insightPromptCandidateIDs(prompt string) []string {
+	_, rest, ok := strings.Cut(prompt, "Candidates:")
+	if !ok {
+		return nil
+	}
 	var ids []string
-	rest := prompt
 	for {
 		i := strings.Index(rest, `{"id":`)
 		if i < 0 {
@@ -68,12 +73,8 @@ func insightPromptCandidateIDs(prompt string) []string {
 		if end < 0 {
 			return ids
 		}
-		id := rest[:end]
+		ids = append(ids, rest[:end])
 		rest = rest[end:]
-		if id == "candidate-id" {
-			continue
-		}
-		ids = append(ids, id)
 	}
 }
 
@@ -131,12 +132,18 @@ func TestInsightPublishFailsWhenWorkspaceBusy(t *testing.T) {
 
 	// 用短预算的 ctx 驱动扫描：落库阶段等租约的时长会被剩余预算夹住，因而很快就
 	// 放弃写入（真实运行时预算由 triggerInsightScan 的 insightScanRunTimeout 给）。
+	//
+	// ⚠️ 预算必须**明显大于流水线本身**（Pass A/B + 两次版本探测，空载实测 0.1~0.3 秒）。
+	// 原来给 700ms，满载时流程自己就把它吃光了 —— 扫描会在 Pass A 之后那道
+	// "项目代码在分析中发生变化 / 超出时间预算"的守卫上提前退出，于是这条用例拿到的
+	// 是另一句话，与"工作区被占用"无关（2026-09-29 一次满载的全量跑就是这么假失败的）。
+	// 留 10 倍余量，"等租约"那一步才是撞预算的那一步。
 	scanID := "scan-busy-" + projectID
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
 	if _, err := server.db.Exec(`insert into project_insight_scans (id,project_id,status,created_at,started_at) values (?,?,'running',?,?)`, scanID, projectID, now, now); err != nil {
 		t.Fatalf("insert scan: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	server.runProjectInsightScan(ctx, projectID, scanID, scanOpts{})
 
@@ -238,6 +245,187 @@ func TestInsightReverifyBatchFailureKeepsEarlierBatches(t *testing.T) {
 	if failed != chunk {
 		t.Fatalf("失败批次应为可重试失败，got failed=%d want %d", failed, chunk)
 	}
+}
+
+// ─── 再验证 id 归位（2026-09-28 生产事故回归）──────────────────────────────
+//
+// 事故：6 条一批的再验证输出里，1 条把 a4e9d6ab-eef2-43fc-b0f8-… 抄成 …-b0b8-…，
+// 单字符之差被当成"未知建议"，整批 6 条结论作废（同批其余 5 条、另两批同模型输出
+// 都逐字符正确，是纯随机手滑）。修复后：单字符笔误归位到该建议；归位不了才走修正
+// 重试；重试仍不行才判该批失败。
+
+const reverifyTypoID = "a4e9d6ab-eef2-43fc-b0b8-251a6d5826ec" // 事故里模型实际回传的 id
+const reverifyRealID = "a4e9d6ab-eef2-43fc-b0f8-251a6d5826ec" // 真实 id
+
+// 归位的三级匹配各自命中，以及"命中不唯一时宁可不命中"。
+func TestMatchReverifyTargetID(t *testing.T) {
+	targets := []InsightFinding{{ID: reverifyRealID}, {ID: "0f0050f7-8040-439b-849f-4f4125b21aa7"}}
+	cases := []struct {
+		name string
+		raw  string
+		want string // "" = 不命中
+	}{
+		{"精确", reverifyRealID, reverifyRealID},
+		{"大写", strings.ToUpper(reverifyRealID), reverifyRealID},
+		{"首尾空白与包裹引号", ` "` + reverifyRealID + `" `, reverifyRealID},
+		{"抄错一个字符", reverifyTypoID, reverifyRealID},
+		{"少抄一个字符", reverifyRealID[:20] + reverifyRealID[21:], reverifyRealID},
+		{"多抄一个字符", reverifyRealID[:20] + "0" + reverifyRealID[20:], reverifyRealID},
+		{"截断成前缀", reverifyRealID[:8], reverifyRealID},
+		{"完全未知", "11111111-2222-3333-4444-555555555555", ""},
+		{"空串", "   ", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := matchReverifyTargetID(targets, tc.raw)
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("matchReverifyTargetID(%q) = %q, want no match", tc.raw, got)
+				}
+				return
+			}
+			if !ok || got != tc.want {
+				t.Fatalf("matchReverifyTargetID(%q) = (%q, %v), want %q", tc.raw, got, ok, tc.want)
+			}
+		})
+	}
+}
+
+// 前缀命中不唯一时必须放弃归位：猜错会把判定挂到别的建议上，比整批失败更糟。
+func TestMatchReverifyTargetIDRejectsAmbiguousPrefix(t *testing.T) {
+	targets := []InsightFinding{
+		{ID: "abcdefgh-1111-1111-1111-111111111111"},
+		{ID: "abcdefgh-2222-2222-2222-222222222222"},
+	}
+	if got, ok := matchReverifyTargetID(targets, "abcdefgh"); ok {
+		t.Fatalf("ambiguous prefix matched %q, want no match", got)
+	}
+}
+
+// 笔误不得绕过"重复返回同一条建议"的判定：一次正确 + 一次笔误都归位到同一条建议。
+func TestMatchReverifyVerdictRejectsTypoDuplicate(t *testing.T) {
+	verdict, err := decodeInsightVerifyExisting(`{"findings":[` +
+		`{"id":"` + reverifyRealID + `","status":"valid","reason":"a"},` +
+		`{"id":"` + reverifyTypoID + `","status":"valid","reason":"b"}]}`)
+	if err != nil {
+		t.Fatalf("decode verdict: %v", err)
+	}
+	if _, err := matchReverifyVerdict([]InsightFinding{{ID: reverifyRealID}}, verdict); err == nil {
+		t.Fatal("typo duplicate was accepted, want duplicate rejection")
+	}
+}
+
+// 非法状态与缺条目一样属契约违约（"这趟输出不可用"），由调用方决定是否修正重试。
+func TestMatchReverifyVerdictRejectsInvalidStatus(t *testing.T) {
+	verdict, err := decodeInsightVerifyExisting(
+		`{"findings":[{"id":"` + reverifyRealID + `","status":"maybe","reason":"拿不准"}]}`)
+	if err != nil {
+		t.Fatalf("decode verdict: %v", err)
+	}
+	if _, err := matchReverifyVerdict([]InsightFinding{{ID: reverifyRealID}}, verdict); err == nil {
+		t.Fatal("invalid status was accepted, want rejection")
+	}
+	if _, ok := normalizeInsightReverifyStatus("maybe", nil); ok {
+		t.Fatal("normalizeInsightReverifyStatus accepted an unknown status")
+	}
+}
+
+// 三态结论的大小写/空白不值得为它浪费一次修正重试。
+func TestNormalizeInsightReverifyStatusToleratesCaseAndSpace(t *testing.T) {
+	for _, raw := range []string{"valid", "Valid", " VALID ", "invalid", "Uncertain"} {
+		if _, ok := normalizeInsightReverifyStatus(raw, nil); !ok {
+			t.Errorf("normalizeInsightReverifyStatus(%q) rejected a valid status", raw)
+		}
+	}
+	if _, ok := normalizeInsightReverifyStatus("maybe", nil); ok {
+		t.Error("normalizeInsightReverifyStatus accepted an unknown status")
+	}
+}
+
+// 端到端：单字符笔误归位成功，整批结论保留，且不为此多花一次 agent 调用。
+func TestReverifyAcceptsIdTypoWithoutExtraAgentRun(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+
+	server.runner = &insightScriptRunner{outputs: []string{
+		`{"findings":[{"id":"` + flipOneHexChar(t, f.ID) + `","status":"valid","reason":"仍在"}]}`,
+	}}
+	runSyncInsightVerify(t, server, projectID, []string{f.ID})
+
+	result, _, _ := insightVerificationRow(t, server, f.ID)
+	if result != insightVerifyValid {
+		t.Fatalf("verification_result: got %q want %q (id 单字符笔误应归位而非作废整批)", result, insightVerifyValid)
+	}
+	if got := stubCalls(server.runner); got != 1 {
+		t.Errorf("agent runs: got %d want 1 (归位成功不该再花一次 agent 调用)", got)
+	}
+}
+
+// 端到端：完全未知的 id 属可修正的契约违约 → 修正重试一次，重试给对就用重试结果。
+func TestReverifyRetriesUnknownID(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+
+	server.runner = &insightScriptRunner{outputs: []string{
+		`{"findings":[{"id":"11111111-2222-3333-4444-555555555555","status":"valid","reason":"乱编的 id"}]}`,
+		`{"findings":[{"id":"` + f.ID + `","status":"valid","reason":"确认仍在"}]}`,
+	}}
+	runSyncInsightVerify(t, server, projectID, []string{f.ID})
+
+	result, _, _ := insightVerificationRow(t, server, f.ID)
+	if result != insightVerifyValid {
+		t.Fatalf("verification_result: got %q want %q", result, insightVerifyValid)
+	}
+	if got := stubCalls(server.runner); got != 2 {
+		t.Errorf("agent runs: got %d want 2 (verify + repair retry)", got)
+	}
+}
+
+// 端到端：重试后仍是未知 id → 该批标可重试失败，note 说明原因。
+func TestReverifyUnknownIDAfterRetryMarksFailed(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+
+	bad := `{"findings":[{"id":"11111111-2222-3333-4444-555555555555","status":"valid","reason":"乱编的 id"}]}`
+	server.runner = &insightScriptRunner{outputs: []string{bad, bad}}
+	runSyncInsightVerify(t, server, projectID, []string{f.ID})
+
+	result, note, _ := insightVerificationRow(t, server, f.ID)
+	if result != insightVerifyFailed {
+		t.Fatalf("verification_result: got %q want %q", result, insightVerifyFailed)
+	}
+	if !strings.Contains(note.String, "未知建议") {
+		t.Errorf("note should explain the unknown id: %q", note.String)
+	}
+	if got := stubCalls(server.runner); got != 2 {
+		t.Errorf("agent runs: got %d want 2 (verify + repair retry)", got)
+	}
+}
+
+// flipOneHexChar 把 id 里第一个十六进制字符换成相邻字符，构造"抄错一个字符"。
+func flipOneHexChar(t *testing.T, id string) string {
+	t.Helper()
+	for i := 0; i < len(id); i++ {
+		var next byte
+		switch c := id[i]; {
+		case c >= '0' && c <= '8':
+			next = c + 1
+		case c == '9':
+			next = '0'
+		case c >= 'a' && c <= 'e':
+			next = c + 1
+		case c == 'f':
+			next = 'a'
+		default:
+			continue // UUID 的分隔符
+		}
+		return id[:i] + string(next) + id[i+1:]
+	}
+	t.Fatalf("id %q has no hex character to flip", id)
+	return ""
 }
 
 // 「不再提示」：建议从有效列表移入折叠区，且后续扫描不再上报它。
@@ -456,6 +644,62 @@ func TestListInsightsIgnoresCursorFromAnotherScan(t *testing.T) {
 	incremental := insightDecode[insightsResponse](t, rec, http.StatusOK)
 	if len(incremental.Events) != 1 || incremental.Events[0].Message != "又一条" {
 		t.Fatalf("matching cursor should return only newer events, got %+v", incremental.Events)
+	}
+}
+
+// deadlineExceededCtx 是一个**确定性地**报告"已超时"的 context：只实现 Context 的四个方法。
+// 之所以要它：`context.WithTimeout` 要等定时器落地，Windows 的定时器粒度约 15ms，
+// 于是"超预算"这一档用真 ctx 写出来就是靠时序的（第一版那么写，三次里假失败一次）。
+type deadlineExceededCtx struct{}
+
+func (deadlineExceededCtx) Deadline() (time.Time, bool) { return time.Now().Add(-time.Second), true }
+func (deadlineExceededCtx) Done() <-chan struct{}       { return nil }
+func (deadlineExceededCtx) Err() error                  { return context.DeadlineExceeded }
+func (deadlineExceededCtx) Value(any) any               { return nil }
+
+// "读不出项目版本状态"与"项目代码变了"是两回事，**不许混成同一句话**。
+//
+// 原来 Pass A/B 之间那道守卫把两者合并：`if revisionErr != nil || !unchanged` → 一律说
+// "项目代码在分析中发生变化，已丢弃本轮结果"。上下文预算耗尽（或 git 探测失败）时
+// revisionErr 非空，用户按"代码变了"去查永远查不出东西 —— 真实原因是"这一次没跑成"。
+// 2026-09-29 由一次满载全量的偶发失败日志反查出来（那条用例期望"工作区被占用"，
+// 实际拿到"项目代码在分析中发生变化"）；发布那条路径早就分开了，缺的是 Pass A/B 这处。
+//
+// 直接测判断函数：真正造出"探测中途超预算"的场景要靠时序，测不稳。
+func TestInsightRevisionAbortTextNeverClaimsCodeChanged(t *testing.T) {
+	projectID := "p"
+	probeErr := errors.New("git rev-parse failed")
+
+	// 探测成功：不产生文案（调用方按"真的变了"处理）。
+	if got := insightRevisionAbortText(context.Background(), projectID, "test", nil); got != "" {
+		t.Fatalf("探测成功时不该有文案，得到 %q", got)
+	}
+
+	// 取消：优先报真实原因。
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := insightRevisionAbortText(cancelled, projectID, "test", probeErr); got != "已取消" {
+		t.Fatalf("取消时应当报「已取消」，得到 %q", got)
+	}
+
+	// 超预算：报超预算，不报"读不出"。
+	//
+	// 用桩而不是 context.WithTimeout：后者要等定时器真的落地，而 Windows 的定时器粒度
+	// 约 15ms —— 第一版就是拿 WithTimeout(1ns) + Sleep(1ms) 写的，三次里第一次
+	// Err() 还是 nil，测试自己假失败了一次。超预算这一档必须**确定性**地构造。
+	if got := insightRevisionAbortText(deadlineExceededCtx{}, projectID, "test", probeErr); !strings.Contains(got, "时间预算") {
+		t.Fatalf("超预算时应当报时间预算，得到 %q", got)
+	}
+
+	// 其它探测失败：报"读不出"，且**任何一档都不许出现"发生变化"**。
+	got := insightRevisionAbortText(context.Background(), projectID, "test", probeErr)
+	if !strings.Contains(got, "无法读取项目版本状态") {
+		t.Fatalf("探测失败时应当如实说读不出，得到 %q", got)
+	}
+	for _, text := range []string{got, "已取消"} {
+		if strings.Contains(text, "发生变化") {
+			t.Fatalf("把探测失败说成了「代码发生变化」——那是假原因：%q", text)
+		}
 	}
 }
 

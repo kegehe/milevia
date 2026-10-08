@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -24,11 +25,11 @@ import (
 //   - 续聊：--resume <session_id>。
 //
 // ⚠️ 权限/审批：CodeBuddy 没有 Claude 那套逐命令网页审批（approval hook），
-// 需要自己的 --permission-mode（plan/acceptEdits）与 --dangerously-skip-permissions。
+// 需要自己的 --permission-mode（plan）与 --dangerously-skip-permissions。
 // 因此 `approval_required` 这类依赖平台审批回调的模式不适用于 CodeBuddy —— 目录里
-// 只给它列了 read_only/workspace_write/full_control 三档，full_control ↔
-// --dangerously-skip-permissions，read_only ↔ --permission-mode plan，
-// 其余 ↔ --permission-mode acceptEdits。
+// 只给它列了 read_only/workspace_write/full_control 三档：read_only ↔
+// --permission-mode plan，workspace_write/full_control ↔ --dangerously-skip-permissions
+// （headless -p 下执行授权操作的必要参数；实测 acceptEdits 不是合法值，见 codebuddySessionArgs）。
 type codebuddyCLIRunner struct {
 	paths *agentPathResolver
 }
@@ -46,6 +47,16 @@ func (r *codebuddyCLIRunner) codebuddyBinary() string {
 	}
 	return ""
 }
+
+// codebuddyExitPrefix 是 CodeBuddy 会话异常结束时的固定前缀。
+//
+// 必须含"失败"：它后面跟着 Go 的进程状态描述（英文，如 "exit status 1"），而
+// localizedErrorText 的直通判据是"含中文 且（含失败 或 没有残留英文）"——
+// 少了这两个字，用户看到的是
+// "任务执行失败，请查看任务日志后重试。：CodeBuddy 会话退出: exit status 1"。
+// 与 claudeExitPrefix / sshClaudeExitPrefix 同一条规矩，有测试守着
+// （TestSurfacesWithoutTaskLogsDoNotUseTheTaskFallback）。
+const codebuddyExitPrefix = "CodeBuddy 会话运行失败："
 
 // codebuddyCommand 把可执行文件与参数构造成 *exec.Cmd，兼容 Windows npm 的 .cmd shim
 // （与 codexCommandContext 同款：.cmd/.bat 需经 cmd.exe /d /c 启动）。
@@ -154,6 +165,13 @@ func codebuddySessionArgs(request AgentSessionRequest) []string {
 	if request.Resume && request.SessionID != "" {
 		args = append(args, "--resume", request.SessionID)
 	}
+	// 模型与 MCP 注入参数与 Claude Code 同构（官方 CLI 参考确认 --model、--mcp-config、
+	// --strict-mcp-config 均受支持）：不传它们，模型切换与项目 MCP 配置会在会话里静默失效，
+	// 界面却已显示"已生效/已注入"。
+	if request.Model != "" {
+		args = append(args, "--model", request.Model)
+	}
+	args = appendMCPConfigArgs(args, request.MCPConfigPath, request.StrictMCP)
 	return args
 }
 
@@ -165,6 +183,13 @@ func (r *codebuddyCLIRunner) StartSession(ctx context.Context, request AgentSess
 	}
 	cmd := codebuddyCommand(ctx, bin, codebuddySessionArgs(request)...)
 	cmd.Dir = request.ProjectPath
+	// MCP 密钥在本机以 ${VAR} 占位符注入 --mcp-config 文件、真值随进程环境走
+	// （mcp_config.go 的 useEnvRefs 分支），因此必须把 MCPEnv 带进子进程环境，
+	// 否则占位符无法展开。合并沿用 managedCLIEnvironment：additions 在前、并从继承
+	// 环境剔除同名键 —— 环境块里两个同名变量哪个生效是实现定义的，不能指望后者覆盖前者。
+	if len(request.MCPEnv) > 0 {
+		cmd.Env = managedCLIEnvironment(nil, os.Environ(), request.MCPEnv...)
+	}
 	configureProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -206,7 +231,12 @@ func (r *codebuddyCLIRunner) StartSession(ctx context.Context, request AgentSess
 		case <-time.After(30 * time.Second):
 		}
 		if err != nil {
-			err = errors.New("CodeBuddy 会话退出: " + err.Error())
+			// 前缀必须含"失败"：后面跟的是 Go 的进程状态描述（英文），少了这两个字
+			// 就过不了 localizedErrorText 的直通判据，用户看到的会是
+			// "任务执行失败，请查看任务日志后重试。：CodeBuddy 会话退出: exit status 1"
+			// —— 一句指不到原因、还建议重试的误导文案
+			// （与 claudeExitPrefix / sshClaudeExitPrefix 同一条规矩，有测试钉着）。
+			err = errors.New(codebuddyExitPrefix + err.Error())
 		}
 		session.finish(err)
 	}()

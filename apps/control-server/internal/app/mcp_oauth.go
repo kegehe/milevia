@@ -400,6 +400,16 @@ func (s *Server) storeMCPOAuthToken(ctx context.Context, flow *mcpOAuthFlow, tok
 		return err
 	}
 	defer tx.Rollback()
+	// 令牌只能落在仍然存在的 server 上：一键连接向导取消半成品时会删掉 server（连令牌
+	// 一起吊销），而浏览器里的授权可能在那之后才完成 —— 迟到的回调不能把孤儿令牌行
+	// 重新 upsert 回来（那样它永远不会再被清理）。
+	var exists int
+	if err := tx.QueryRowContext(ctx, `select 1 from mcp_servers where id=?`, flow.ServerID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("MCP server 已被删除，丢弃本次授权结果")
+		}
+		return err
+	}
 	created := []string{}
 	rollback := func() {
 		for _, id := range created {
@@ -786,24 +796,39 @@ func (s *Server) getMCPServerOAuth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
-func (s *Server) deleteMCPServerOAuth(w http.ResponseWriter, r *http.Request) {
-	serverID := chi.URLParam(r, "serverID")
-	ctx := r.Context()
+// revokeMCPOAuthToken 删除某 server 存放的 OAuth 令牌行，并吊销其密钥引用。
+// 令牌不存在（ErrNoRows）不算错误。删除 server 时必须调用它 —— 否则「取消向导的
+// 半成品」和「删除已授权的 server」都会在 mcp_oauth_tokens 里留下永远无人能用的
+// access/refresh 令牌。
+func (s *Server) revokeMCPOAuthToken(ctx context.Context, serverID string) error {
 	row, err := s.loadMCPOAuthToken(ctx, serverID)
 	if errors.Is(err, sql.ErrNoRows) {
-		w.WriteHeader(http.StatusNoContent)
-		return
+		return nil
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return err
+	}
+	// ⚠️ 顺序承重：**先吊销密文，再删令牌行**。
+	// 反过来（2026-09-29 之前就是这样）时，Revoke 一旦因为库忙/锁失败，这行已经被删掉了
+	// —— sec_ 引用再没有任何地方记录，那几个密文行就永久残留，用户连重试的入口都没有。
+	// Revoke 本身是幂等的 UPDATE（已吊销的再调一次匹配 0 行、返回 nil），所以这个顺序
+	// 失败后重试是安全的。
+	for _, ref := range []string{row.AccessTokenRef, row.RefreshTokenRef, row.ClientSecretRef} {
+		if err := s.profileSecrets.Revoke(s.db, ctx, ref); err != nil {
+			// 不回滚、也不吞：如实报出来让用户重试（令牌行还在，下一次能重新找到这些引用）。
+			return fmt.Errorf("吊销 MCP 授权凭据失败：%w", err)
+		}
 	}
 	if _, err := s.db.ExecContext(ctx, `delete from mcp_oauth_tokens where server_id=?`, serverID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) deleteMCPServerOAuth(w http.ResponseWriter, r *http.Request) {
+	if err := s.revokeMCPOAuthToken(r.Context(), chi.URLParam(r, "serverID")); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
-	}
-	for _, ref := range []string{row.AccessTokenRef, row.RefreshTokenRef, row.ClientSecretRef} {
-		_ = s.profileSecrets.Revoke(s.db, ctx, ref)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

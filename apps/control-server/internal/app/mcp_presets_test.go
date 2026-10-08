@@ -78,12 +78,9 @@ func TestMCPPresetCatalogIsWellFormed(t *testing.T) {
 			t.Errorf("模板 %s 的 Description 与 Summary 不一致（同一句话，两处口径会漂移）", preset.ID)
 		}
 		switch preset.Category {
-		case mcpPresetCategoryCommon, mcpPresetCategoryLocal:
+		case mcpPresetCategoryCommon:
 		default:
 			t.Errorf("模板 %s 的分组未知：%s", preset.ID, preset.Category)
-		}
-		if preset.Category == mcpPresetCategoryLocal && preset.Transport != mcpTransportStdio {
-			t.Errorf("「%s」分组的条目 %s 应为 stdio，实际 %s", mcpPresetCategoryLocal, preset.ID, preset.Transport)
 		}
 
 		// 依赖声明必须能被运行时检查真的检查得了，且要有可读名称。
@@ -192,18 +189,15 @@ func TestMCPGitHubPresetsPointAtOfficialServer(t *testing.T) {
 		t.Errorf("http 形态的 github 模板应适用于全部环境，实际 %v", remote.Environments)
 	}
 
-	local, ok := findMCPPreset("github-local")
-	if !ok {
-		t.Fatal("缺少 github-local 模板")
+	// 「本机运行」分组（含 github-local）已暂时下线（2026-09-24）——这里守着它不许悄悄回来：
+	// 本地形态要用户先装运行时，目录恢复它必须是一个显式决定。
+	if _, ok := findMCPPreset("github-local"); ok {
+		t.Error("github-local 已随「本机运行」分组下线，不应出现在目录里")
 	}
-	if local.Transport != mcpTransportStdio || local.Command != "docker" {
-		t.Errorf("github-local 模板应为 stdio + docker，实际 %s / %s", local.Transport, local.Command)
-	}
-	if !strings.Contains(strings.Join(local.Args, " "), "ghcr.io/github/github-mcp-server") {
-		t.Errorf("github-local 模板应使用官方镜像，实际 %v", local.Args)
-	}
-	if len(local.Requires) != 1 || local.Requires[0].Command != "docker" {
-		t.Errorf("github-local 模板应声明 docker 依赖，实际 %+v", local.Requires)
+	for _, preset := range mcpPresetCatalog() {
+		if preset.Transport == mcpTransportStdio {
+			t.Errorf("模板 %s 是 stdio 形态：本地形态已暂时下线，目录里只应有远程托管条目", preset.ID)
+		}
 	}
 }
 
@@ -258,23 +252,8 @@ func TestMCPCommonPresetsAreOneClick(t *testing.T) {
 	}
 }
 
-// TestMCPLocalPresetsAreHonestAboutDependencies 锁住「本机运行」分组的诚实性：既然它要用户
-// 先装东西，就必须把要装什么说清楚（requires 非空且带可读名称），不能只给一条命令。
-func TestMCPLocalPresetsAreHonestAboutDependencies(t *testing.T) {
-	for _, preset := range mcpPresetCatalog() {
-		if preset.Category != mcpPresetCategoryLocal {
-			continue
-		}
-		if len(preset.Requires) == 0 {
-			t.Errorf("「本机运行」条目 %s 未声明任何运行时依赖", preset.ID)
-		}
-		for _, require := range preset.Requires {
-			if require.Label == "" {
-				t.Errorf("条目 %s 的依赖 %s 缺少可读名称（用户看不懂 npx 是什么）", preset.ID, require.Command)
-			}
-		}
-	}
-}
+// TestMCPLocalPresetsAreHonestAboutDependencies 已随「本机运行」分组暂时下线（2026-09-24）。
+// 恢复本地形态时重建：既然要用户先装东西，就必须把要装什么说清楚（requires 非空且带可读名称）。
 
 // ---------------------------------------------------------------------------
 // 运行时检查

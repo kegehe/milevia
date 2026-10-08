@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { apiURL, isDesktop, sessionHeaders } from "../../lib/runtime";
 import { markdownCodeComponents } from "../../components/MarkdownCodeBlock";
+import { ExternalLink } from "../../components/ExternalLink";
 import type { FileInfo } from "./file-model";
 import { formatSize, getDirPath, isEditableFile } from "./file-model";
 import type { FilePreviewKind } from "./source-language";
@@ -194,7 +195,7 @@ function FileMessage({ projectId, conversationId, stat, message, disableDownload
 }
 
 function MarkdownPreview({ content, projectId, conversationId, baseDir, fontSize, media }: { content: string; projectId: string; conversationId?: string; baseDir: string; fontSize: number; media?: FileViewerMedia }) {
-  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>, img: ({ src, alt }) => <MarkdownImage src={src ?? ""} alt={alt ?? ""} baseDir={baseDir} projectId={projectId} conversationId={conversationId} media={media} /> }}>{content}</ReactMarkdown></div>;
+  return <div className="file-viewer-markdown markdown" style={{ fontSize: `${fontSize}px` }}><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <ExternalLink href={safeHref(href)} {...(isExternal(href) ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</ExternalLink>, img: ({ src, alt }) => <MarkdownImage src={src ?? ""} alt={alt ?? ""} baseDir={baseDir} projectId={projectId} conversationId={conversationId} media={media} /> }}>{content}</ReactMarkdown></div>;
 }
 
 function MarkdownImage({ src, alt, baseDir, projectId, conversationId, media }: { src: string; alt: string; baseDir: string; projectId: string; conversationId?: string; media?: FileViewerMedia }) {

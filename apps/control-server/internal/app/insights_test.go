@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -361,6 +362,74 @@ func TestRunInsightScanPersistsConfirmedFindings(t *testing.T) {
 	}
 }
 
+// 两个扫描 prompt 都是 Sprintf 模板：动词与参数错配会渲染出 "%!s(MISSING)" 这类字面量并
+// 原样发给模型（不报错、只变傻）。文案改动——比如把"只输出数组"改成"findings 对象"——
+// 最容易碰坏这里，所以把渲染结果钉一道。
+func TestInsightScanPromptsRenderWithoutFormatMismatch(t *testing.T) {
+	withTheme := scanOpts{Theme: insightThemePerf, Types: []string{insightBug, insightStyle}}
+	noTheme := scanOpts{}
+	surfaced := []string{"历史建议 A", "历史建议 B"}
+	prompts := []string{
+		buildInsightScanPrompt("/tmp/project", "abc123", surfaced, withTheme),
+		buildInsightScanPrompt("/tmp/project", "abc123", nil, noTheme),
+		buildInsightRepairPrompt("/tmp/project", "abc123", withTheme),
+		buildInsightRepairPromptWithHistory("/tmp/project", "abc123", surfaced, noTheme),
+	}
+	for index, prompt := range prompts {
+		if strings.Contains(prompt, "%!") {
+			t.Fatalf("prompt %d has a Sprintf verb/argument mismatch: %q", index, prompt)
+		}
+		// 渲染后仍须保留这些关键约束：把 Sprintf 改坏会连内容一起吃掉。
+		for _, want := range []string{"/tmp/project", "abc123"} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("prompt %d lost %q: %q", index, want, prompt)
+			}
+		}
+	}
+}
+
+// 走 --json-schema 的 schema 顶层必须是 object。CLI 会把它当作 StructuredOutput
+// 工具的 input_schema，而 OpenAI 兼容上游（经中转把 input_schema 原样转发成
+// function.parameters 时）要求顶层为 object——顶层为 array 会被上游以 HTTP 400
+// 拒绝，claude 随即 exit 1 且 stderr 为空，界面只剩一句裸的退出描述（claudeExitPrefix
+// + "exit status 1"）（2026-09-16 起优化建议扫描全挂的真因，见 insightCandidatesOutputSchema
+// 上方注释）。此测试把该不变量钉住，避免日后又改回裸数组。
+func TestInsightOutputSchemasAreObjectTyped(t *testing.T) {
+	schemas := map[string]json.RawMessage{
+		"candidates": insightCandidatesOutputSchema,
+		"verify":     insightVerifyOutputSchema,
+		"reverify":   insightReverifyOutputSchema,
+	}
+	for name, schema := range schemas {
+		var decoded struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(schema, &decoded); err != nil {
+			t.Fatalf("%s: invalid schema JSON: %v", name, err)
+		}
+		if decoded.Type != "object" {
+			t.Errorf("%s: top-level type must be %q, got %q", name, "object", decoded.Type)
+		}
+	}
+	// 载荷形状：候选发现必须是 findings 数组（parseInsightCandidates 按此解包）。
+	var candidates struct {
+		Properties map[string]struct {
+			Type string `json:"type"`
+		} `json:"properties"`
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal(insightCandidatesOutputSchema, &candidates); err != nil {
+		t.Fatalf("candidates schema: %v", err)
+	}
+	if candidates.Properties["findings"].Type != "array" {
+		t.Errorf("candidates schema must expose findings as an array, got %q",
+			candidates.Properties["findings"].Type)
+	}
+	if !slices.Contains(candidates.Required, "findings") {
+		t.Errorf("candidates schema must require findings, got %v", candidates.Required)
+	}
+}
+
 func TestRunInsightScanBadJSONFails(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
@@ -413,9 +482,13 @@ func TestRunInsightScanRetriesBadPassA(t *testing.T) {
 	if reqs[0].Prompt == reqs[1].Prompt {
 		t.Errorf("retry prompt should differ from first Pass A prompt")
 	}
-	// 重试 prompt 必须含强约束表白（"必须是且仅是一个 JSON 数组"）。
-	if !strings.Contains(reqs[1].Prompt, "JSON 数组") {
-		t.Errorf("repair prompt missing strict JSON-array instruction")
+	// 重试 prompt 必须含强约束表白（"必须是且仅是一个 JSON 对象"），且形状要和
+	// insightCandidatesOutputSchema 一致（findings 包裹）。
+	if !strings.Contains(reqs[1].Prompt, "必须是且仅是一个 JSON 对象") {
+		t.Errorf("repair prompt missing strict JSON-object instruction")
+	}
+	if !strings.Contains(reqs[1].Prompt, `{"findings":[ ... ]}`) {
+		t.Errorf("repair prompt missing findings wrapper: %q", reqs[1].Prompt)
 	}
 	// 产物应落库。
 	var n int
@@ -2079,10 +2152,23 @@ func TestInsightRunErrorMessage(t *testing.T) {
 			excludes: []string{"项目分析失败：分析超时"},
 		},
 		{
+			// 夹具用真实前缀而不是字面量：进程退出的错误形态是
+			// claudeExitPrefix + Go 的退出描述，写死成英文的话这条用例测的就不是
+			// 服务端真正产出的那个串了（改前缀时它还照样绿）。
 			name:     "runner error strips task-log fallback wrapper",
 			prefix:   "项目分析失败",
-			err:      fmt.Errorf("Claude exited: %w", errors.New("exit status 1")),
-			contains: []string{"Claude exited"},
+			err:      fmt.Errorf(claudeExitPrefix+"%w", errors.New("exit status 1")),
+			contains: []string{"exit status 1"},
+			excludes: []string{"任务执行失败，请查看任务日志后重试。"},
+		},
+		{
+			// 兜底前缀真正会出现的情形只剩"没被翻译的英文错误"这一类。上面那条
+			// 现在根本不会套前缀（句子里有中文的"失败"），所以要单独留一条喂纯英文，
+			// 否则 insights.go 里那次 TrimPrefix 就没有任何用例覆盖了。
+			name:     "untranslated english error still strips the task-log fallback wrapper",
+			prefix:   "项目分析失败",
+			err:      errors.New("some untranslated detail"),
+			contains: []string{"some untranslated detail"},
 			excludes: []string{"任务执行失败，请查看任务日志后重试。"},
 		},
 		{
@@ -2289,8 +2375,9 @@ func TestVerifyInsightFindingMissingResultMarksFailed(t *testing.T) {
 	projectID := insightTestProject(t, server)
 	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
 
-	// agent 给了合法 JSON 却漏掉该 id → 标 failed，不能静默留在 pending。
-	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[]}`}}
+	// agent 给了合法 JSON 却漏掉该 id → 契约违约触发修正重试，重试仍漏 → 标 failed，
+	// 不能静默留在 pending（两份输出都漏，才走到"重试后仍不可用"）。
+	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[]}`, `{"findings":[]}`}}
 	runSyncInsightVerify(t, server, projectID, []string{f.ID})
 
 	result, note, _ := insightVerificationRow(t, server, f.ID)
@@ -2299,6 +2386,9 @@ func TestVerifyInsightFindingMissingResultMarksFailed(t *testing.T) {
 	}
 	if !strings.Contains(note.String, "未给出") {
 		t.Errorf("note should explain missing result: %q", note.String)
+	}
+	if got := stubCalls(server.runner); got != 2 {
+		t.Errorf("agent runs: got %d want 2 (contract violation must be retried once)", got)
 	}
 }
 
@@ -3256,5 +3346,54 @@ func TestInsightRevisionFailureReason(t *testing.T) {
 	}
 	if got := insightRevisionFailureReason(nil); got != "" {
 		t.Fatalf("nil reason = %q", got)
+	}
+}
+
+// 扫描的限时被显式关闭（insightScanPassTimeout / insightScanRunTimeout = 0，"不要限时"）：
+// 这条用例把 0 的语义钉住——0 必须是"**没有 deadline**"，而不是"立即超时"。写反了
+// （例如 where timeout > 0 判断失误、或误用 context.WithTimeout(ctx, 0)）会让每一次扫描
+// 刚起步就被判超时，而现象看起来仍是"分析超时"，很难一眼看穿。
+func TestInsightRunWithoutBudgetHasNoDeadline(t *testing.T) {
+	if insightScanPassTimeout != 0 || insightScanRunTimeout != 0 {
+		t.Fatalf("扫描限时应为 0（不限时），实际 pass=%v run=%v；若有意恢复限制，请同步更新本用例",
+			insightScanPassTimeout, insightScanRunTimeout)
+	}
+	server := newTestServer(t)
+	const projectID = "insight-no-budget-project"
+
+	runCtx, release, ok, closing := server.beginInsightRun(projectID, insightRunScan, insightScanRunTimeout)
+	if !ok || closing {
+		t.Fatalf("begin run: ok=%v closing=%v", ok, closing)
+	}
+	// release 内部会 insightWG.Done()，重复调用会 panic（负计数），所以包一层幂等。
+	released := false
+	releaseOnce := func() {
+		if !released {
+			released = true
+			release()
+		}
+	}
+	defer releaseOnce()
+	if deadline, hasDeadline := runCtx.Deadline(); hasDeadline {
+		t.Fatalf("0 预算不应派生 deadline，实际 deadline=%v", deadline)
+	}
+	if err := runCtx.Err(); err != nil {
+		t.Fatalf("0 预算的运行上下文不应已结束：%v", err)
+	}
+	// 登记仍然生效：同一项目同一 kind 不允许并发（互斥与可取消性不因"不限时"而丢失）。
+	if _, _, second, _ := server.beginInsightRun(projectID, insightRunScan, 0); second {
+		t.Fatal("同一项目同一 kind 的第二次登记应被拒绝")
+	}
+	// 取消能力必须在：不限时之后它就是唯一的兜底。
+	server.cancelInsightRunKind(projectID, insightRunScan)
+	if err := runCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应为 context.Canceled，实际 %v", err)
+	}
+	// release 之后可再次登记，不会被上一次占住。
+	releaseOnce()
+	if _, releaseAgain, ok, _ := server.beginInsightRun(projectID, insightRunScan, 0); !ok {
+		t.Fatal("release 之后应能重新登记")
+	} else {
+		releaseAgain()
 	}
 }

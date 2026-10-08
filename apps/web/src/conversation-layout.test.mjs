@@ -28,7 +28,7 @@ test("message bubbles use their content width without exceeding the reading meas
   assert.match(conversationContentStyles, /\.message\s*>\s*\.markdown\s*\{\s*width:\s*fit-content;\s*max-width:\s*100%;/);
 });
 
-test("user messages can be copied from an icon-only control", () => {
+test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
   // 剪贴板实现：现代 API 优先，非安全上下文 / 权限拒绝时退回 execCommand。
   assert.match(clipboard, /navigator\.clipboard\?\.writeText/);
   assert.match(clipboard, /await navigator\.clipboard\.writeText\(content\);\s*return true;\s*} catch \{/s);
@@ -37,7 +37,9 @@ test("user messages can be copied from an icon-only control", () => {
   // 消息按钮在写入失败时给出提示，而不是静默失败。
   assert.match(conversationPage, /import \{ copyToClipboard \} from "\.\.\/lib\/clipboard";/);
   assert.match(conversationPage, /if \(!\(await copyToClipboard\(message\.content\)\)\) \{/);
-  assert.match(conversationPage, /isUser && <button className=\{`message-copy/);
+  // 复制按钮不区分角色：用户消息与 AI 回复都带一个（AI 回复此前只能靠框选整段复制）。
+  assert.doesNotMatch(conversationPage, /isUser && <button className=\{`message-copy/);
+  assert.match(conversationPage, /<\/div><button className=\{`message-copy\$\{copied \? " copied" : ""\}`\}/);
   assert.match(conversationPage, /title=\{copied \? "已复制" : "复制消息"\}/);
   assert.match(stylesheet, /\.message-copy\s*\{[^}]*width:\s*26px;[^}]*height:\s*26px;[^}]*background:\s*transparent;/s);
   assert.match(stylesheet, /\.message-copy::before,[\s\S]*?\.message-copy::after/);
@@ -87,7 +89,34 @@ test("persisted conversation history loads without waiting for the realtime sock
 test("background conversation polling preserves search results and advances activity cursors", () => {
   assert.match(conversationPage, /after: state\.latestPositions\[conversationId\] \|\| state\.readPositions\[conversationId\]/);
   assert.match(conversationPage, /if \(!historyQuery\.trim\(\)\) void requestConversationHistory\("", "", false, true\)\.catch\(\(\) => undefined\);/);
-  assert.match(conversationPage, /\[conversationTabs\.openConversationIds\.length, historyQuery, projectId, requestConversationHistory, syncConversationActivity\]/);
+  assert.match(conversationPage, /\[conversationTabs\.openConversationIds\.length, documentVisible, historyQuery, projectId, requestConversationHistory, syncConversationActivity\]/);
+  // 窗口不可见时不轮询：这一轮固定两个请求（会话动态 + 会话列表），后台空跑最费。
+  // 闸门放在 refreshBackgroundTabs() 之前，所以"隐藏"那一跳也不会顺手多打一轮；
+  // 可见性变化会重跑本效果，回到前台的补拉由它下面那句 refreshBackgroundTabs() 负责。
+  assert.match(conversationPage, /if \(!documentVisible\) return;\s*const refreshBackgroundTabs = \(\) => \{/);
+  assert.match(conversationPage, /refreshBackgroundTabs\(\);\s*const timer = window\.setInterval\(refreshBackgroundTabs, 8_000\);/);
+});
+
+test("the HTTP fallback poll also pauses while the window is hidden", () => {
+  assert.match(conversationPage, /import \{ useDocumentVisible \} from "\.\.\/lib\/useDocumentVisible";/);
+  assert.match(conversationPage, /const documentVisible = useDocumentVisible\(\);/);
+  // 这条效果 setup 时不主动拉取（首次加载交给 WebSocket 那侧），所以回到前台必须显式
+  // 补一次；「由隐藏转为可见」那一跳靠这个 ref 认出来。ref 必须在 !run 守卫之前无条件
+  // 同步，否则 run 为空的那些可见性变化不更新它，下次启动运行会被误判成"刚从后台回来"。
+  assert.match(conversationPage, /const prevRunPollVisible = useRef\(documentVisible\);/);
+  assert.match(conversationPage, /const becameVisible = documentVisible && !prevRunPollVisible\.current;\s*prevRunPollVisible\.current = documentVisible;\s*if \(!run \|\| !conversation\?\.id\) return undefined;[\s\S]*?if \(!documentVisible\) return undefined;/);
+  assert.match(conversationPage, /if \(becameVisible\) void poll\(\);\s*const interval = window\.setInterval\(\(\) => \{ void poll\(\); \}, 15_000\);/);
+  assert.match(conversationPage, /\}, \[documentVisible, run, conversation\?\.id, projectApi, recordAssistantOutput\]\);/);
+});
+
+test("task queue polling pauses while the window is hidden", () => {
+  // 任务队列挂在对话页的侧栏上，裸 10s 轮询会跟着对话页一起在后台空跑。
+  assert.match(taskQueue, /import \{ useDocumentVisible \} from "\.\.\/\.\.\/lib\/useDocumentVisible";/);
+  assert.match(taskQueue, /const documentVisible = useDocumentVisible\(\);/);
+  assert.match(taskQueue, /const prevVisibleRef = useRef\(documentVisible\);/);
+  assert.match(taskQueue, /const becameVisible = documentVisible && !prevVisibleRef\.current;\s*prevVisibleRef\.current = documentVisible;\s*if \(!documentVisible\) return;\s*if \(becameVisible\) void loadTasks\(\)\.catch\(\(\) => undefined\);/);
+  assert.match(taskQueue, /const interval = window\.setInterval\(\(\) => \{ void loadTasks\(\)\.catch\(\(\) => undefined\); \}, 10_000\);/);
+  assert.match(taskQueue, /\}, \[documentVisible, loadTasks\]\);/);
 });
 
 test("opening the history dialog issues one refresh and never renders a pending list as empty", () => {
@@ -161,6 +190,25 @@ test("conversation tabs label the active tool from the catalog", () => {
   // 的三元式 —— 那种写法会把新增工具静默标成 Claude Code。
   assert.match(conversationPage, /conversation && <span className="conversation-tab-agent">\{agentDisplayName\(conversation\.agentId\)\}<\/span>/);
   assert.match(stylesheet, /\.conversation-tab-agent\s*\{[^}]*white-space:\s*nowrap;/s);
+});
+
+test("the new-conversation tool icon defers to the shared official-logo criteria", () => {
+  // 官方图标判据只有一份（lib/cli-tools-view.ts 的 agentLogoKey，与 Cli管理页同源）——
+  // 弹窗里不再按工具 ID 逐个手绘图形；手绘 SVG 只剩"没有官方图标"那一档的中性兜底。
+  assert.match(conversationPage, /function AgentToolIcon\(\{ agent \}: \{ agent: AgentID \}\) \{\s*\n\s*const logo = agentLogoKey\(agent\);/);
+  assert.match(conversationPage, /import \{ agentLogoKey \} from "\.\.\/lib\/cli-tools-view";/);
+  // 反面：弹窗组件里不许再出现按工具 ID 分支画图标的老写法（它会把新增工具画成
+  // 兜底图形之外的东西，或把某个已知工具的图标盖到别的工具头上）。
+  assert.doesNotMatch(conversationPage, /if \(agent === "claude-code"\) return <svg className="new-conversation-agent-icon"/);
+  // 不可用的卡片上，官方图标要随卡片一起置灰（img 不吃 color，必须另有 filter）。
+  assert.match(stylesheet, /\.new-conversation-agent-card:disabled \.new-conversation-agent-mark img \{[^}]*filter: grayscale\(1\);/s);
+  // 徽标类图标（自带底色，CodeBuddy）铺满整块牌子，牌子的底色与边框让位 ——
+  // 缩在中间就是"小徽标浮在大底板上"。
+  assert.match(stylesheet, /\.new-conversation-agent-mark:has\(img\[data-logo-badge\]\) \{ border-color: transparent; background: transparent; \}/);
+  assert.match(stylesheet, /\.new-conversation-agent-mark img\[data-logo-badge\] \{ width: 100%; height: 100%; border-radius: inherit; \}/);
+  // 中性档规则 (0,3,0) 必须排除徽标类，否则会压过 :has 让位规则 (0,2,1)，
+  // 紫色徽标外圈留一圈灰底灰边（换视角审查实测抓到过）。
+  assert.match(stylesheet, /\.new-conversation-agent-mark:not\(\.claude-code\):not\(\.codex\):not\(\.codebuddy\) \{/);
 });
 
 test("mobile conversation tabs replace the open-tab list with a history dialog trigger", () => {
@@ -608,10 +656,12 @@ test("conversation side modules collapse through header toggles and persist per 
   assert.match(conversationPage, /const \[conversationPanelsState, setConversationPanelsState\] = useState<\{ projectId: string; collapsed: ConversationPanelsState \}>/);
   assert.match(conversationPage, /const conversationPanels = conversationPanelsState\.collapsed;/);
   assert.match(conversationPage, /writeConversationPanels\(projectId, conversationPanelsState\.collapsed\)/);
-  // 常用提示词 / 常用命令 / 技能三块标题行均可点击折叠。
-  assert.match(conversationPage, /className="quick-tag-heading-toggle"[\s\S]*?aria-expanded=\{!conversationPanels\.prompt\}[\s\S]*?toggleConversationPanel\("prompt"\)/);
-  assert.match(conversationPage, /className="quick-tag-heading-toggle"[\s\S]*?aria-expanded=\{!conversationPanels\.command\}[\s\S]*?toggleConversationPanel\("command"\)/);
+  // 常用提示词 + 常用命令合并为一个整体折叠（.quick-shortcuts），技能为独立折叠。
+  assert.match(conversationPage, /className="quick-tag-heading-toggle"[\s\S]*?aria-expanded=\{!conversationPanels\.shortcuts\}[\s\S]*?toggleConversationPanel\("shortcuts"\)/);
   assert.match(conversationPage, /renderSkillGroup\(\{ collapsible: true, collapsed: conversationPanels\.skills, onToggle: \(\) => toggleConversationPanel\("skills"\) \}\)/);
+  // 折叠状态里不再有独立的 prompt / command 键。
+  assert.match(conversationPage, /toggleConversationPanel\("shortcuts"\)/);
+  assert.doesNotMatch(conversationPage, /conversationPanels\.(prompt|command)/);
   // 折叠箭头会随折叠状态翻转（展开朝上、折叠朝下）。
   assert.match(stylesheet, /\.quick-tag-group\.collapsed \.quick-tag-heading-chevron \{[^}]*transform: rotate\(180deg\);/s);
   // 任务队列标题提供折叠箭头；折叠后在宽屏收敛为右侧窄条。

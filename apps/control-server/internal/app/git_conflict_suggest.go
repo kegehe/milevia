@@ -243,13 +243,19 @@ func (s *Server) runConflictSuggestion(ctx context.Context, project Project, rec
 			record.ErrorMessage = "AI 建议已取消"
 		} else {
 			record.Status = gitConflictSuggestStatusFailed
-			record.ErrorMessage = runErr.Error()
+			// 走本地化而不是裸 err.Error()：这条 ErrorMessage 会经 API 回到冲突面板
+			// 直接显示，裸英文会原样上屏（本地化层完全被绕过）。
+			// 兜底句是**冲突建议自己的**：errorText 的兜底是"任务执行失败，请查看任务日志
+			// 后重试。"，而冲突面板没有任务日志可查 —— 拼出来是
+			// "任务执行失败，请查看任务日志后重试。：解析 AI 返回的 JSON: …"。
+			// （AI 自报的原因如"Claude 运行失败：exit status 1"含"失败"二字，照旧直通。）
+			record.ErrorMessage = localizedErrorText(runErr, "生成合并建议失败，请重试。")
 		}
 	} else {
 		merged, explanation, parseErr := parseConflictSuggestionJSON(text)
 		if parseErr != nil {
 			record.Status = gitConflictSuggestStatusFailed
-			record.ErrorMessage = parseErr.Error()
+			record.ErrorMessage = localizedErrorText(parseErr, "生成合并建议失败，请重试。")
 		} else {
 			record.Status = gitConflictSuggestStatusCompleted
 			record.Merged = merged

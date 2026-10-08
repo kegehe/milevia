@@ -22,6 +22,10 @@ const rootStyles = normalize(await readFile(new URL("./style.css", import.meta.u
 // 电脑端那一屏（`!mobileApp`）自己的样式表。它与手机页共用组件，所以必须单独读进来断言 ——
 // 混在 mobile-remote.css 里的话，"这一页到底有没有桌面页头"就又变成靠肉眼看了。
 const desktopStyles = normalize(await readFile(new URL("./pages/desktop-remote.css", import.meta.url), "utf8"));
+// 手机端"当前安装的包版本"那条链（读原生 App.getInfo → 拼版本文案）。它跨两个模块：
+// 读值带 Capacitor（不能直接跑），拼文案是纯函数（在 android-release.test.ts 里跑）。
+const mobileUpdateLib = normalize(await readFile(new URL("./features/updater/mobile-update.ts", import.meta.url), "utf8"));
+const androidReleaseLib = normalize(await readFile(new URL("./features/updater/android-release.ts", import.meta.url), "utf8"));
 
 // 消息列表**开标签**的锚点。不要写死成 `'<div className="mobile-message-list">'`：
 // 2026-09-17 给它加了 `data-empty` 之后，两处"夹逼"用例的锚点一起失配，
@@ -35,13 +39,17 @@ function messageListOpen() {
 }
 
 test("mobile new conversations choose and submit the selected agent", () => {
-  assert.match(page, /newConversationAgent.*useState<"claude-code" \| "codex">/s);
-  assert.match(page, /payload: \{ agentId \}/);
-  // 必须写成"同一行、紧挨着"：原来的 /role="radio"[\s\S]*newConversationAgent === "claude-code"/
-  // 会被同一按钮后面 onClick 里的同名表达式满足 —— 把 aria-checked 断掉也照样绿（已实测）。
-  assert.match(page, /role="radio" aria-checked=\{newConversationAgent === "claude-code"\}/);
-  assert.match(page, /role="radio" aria-checked=\{newConversationAgent === "codex"\}/);
-  assert.match(page, /createConversationForProject\(newConversationProject, newConversationAgent\)/);
+  // 2026-09-24 改版：两个写死的按钮 → 遍历 MOBILE_AGENTS（与电脑端目录对齐的三工具清单，
+  // 含 CodeBuddy）；选中态收敛成一个 selected 变量，aria-checked 仍逐卡渲染。
+  assert.match(page, /const \[newConversationAgent, setNewConversationAgent\] = useState<MobileAgentID>/);
+  assert.match(page, /MOBILE_AGENTS\.map\(\(agent\) => \{/);
+  assert.match(page, /role="radio" aria-checked=\{selected\}/);
+  // 换工具必须重置权限（不同工具的权限面不同，旧选择可能不适用）：
+  // 副作用写在 selectMobileAgent 里，不用 effect 猜意图。
+  assert.match(page, /function selectMobileAgent\(agentID: MobileAgentID\) \{[\s\S]*?setNewConversationPermission\(agent\.defaultPermission\)/);
+  // 创建命令显式带 permissionMode：服务端对空权限的回落是按 claude/codex 二元式写死的，
+  // codebuddy 落到 Claude 的偏好档（approval_required）会被 validAgentPolicy 拒成 400。
+  assert.match(page, /createConversationForProject\(newConversationProject, newConversationAgent, newConversationPermission\)/);
 });
 
 test("mobile processing indicator waits for durable completion", () => {
@@ -335,8 +343,14 @@ test("mobile message bubbles size to their content and point at the sender", () 
   // 圆角 16px，尖角那一侧收到 5px（Agent 左下、用户右下）。
   assert.match(styles, /\.mobile-message\s*\{[^}]*border-radius:\s*16px 16px 16px 5px;/s);
   assert.match(styles, /\.mobile-message\.user\s*\{[^}]*border-radius:\s*16px 16px 5px 16px;/s);
-  // 不再靠 1px 全框分层：描边压淡 + 一层极淡投影。
-  assert.match(styles, /\.mobile-message\s*\{[^}]*box-shadow:\s*0 1px 3px/s);
+  // 不再靠 1px 全框分层：描边压淡 + 两层投影。
+  // 2026-09-22 从「单层 5%」改成两层 —— 原读数是：卡片底与页面底的对比度只有 **1.07:1**，
+  // 单层 5% 的投影托不住边界，卡片在户外光下没有边。两层里贴边那层画边界、扩散那层给高度。
+  assert.match(styles, /\.mobile-message\s*\{[^}]*box-shadow:\s*0 1px 2px rgba\(25, 51, 44, \.06\), 0 10px 20px -14px/s);
+  // 描边同步再压淡一档（#e0ebe4 → #e7f0ea）：边界整个交给光影，别让线 + 影两层各说各话。
+  assert.match(styles, /\.mobile-message\s*\{[^}]*border:\s*1px solid #e7f0ea;/s);
+  // 实心深绿气泡也要有厚度：外层两层 + 一条 1px 内高光当「顶面」。
+  assert.match(styles, /\.mobile-message\.user\s*\{[^}]*box-shadow:[^;]*inset 0 1px 0 rgba\(255, 255, 255, \.16\)/s);
   // 元信息：11px + 显式行高（<small> 继承全局行高会让同一组件量出两个高度）。
   assert.match(styles, /\.mobile-message small\s*\{[^}]*font-size:\s*11px;[^}]*line-height:\s*1\.45;/s);
   // 「我」的消息是实心深绿 + 白字（2026-09-13 从 4 个候选里选定）。
@@ -344,7 +358,10 @@ test("mobile message bubbles size to their content and point at the sender", () 
   assert.match(styles, /\.mobile-message\.user\s*\{[^}]*color:\s*#fff;/s);
   // 深底上每一处前景色都要显式覆盖：markdown 的标题 / 行内代码 / 链接都是深绿系，
   // 压在 #2c7567 上直接看不见；代码块里的 code 还要再恢复继承。
-  assert.match(styles, /\.mobile-message\.user small\s*\{[^}]*color:\s*#c2e7d8;/s);
+  // ⚠️ 2026-09-22 换过色：11px 不算大字号，门槛 4.5:1，而 #c2e7d8 压在 #2c7567 上
+  // 实测只有 **4.08:1** —— 这是一处**既有的**不过关，本轮落在同一个元素上顺带修掉。
+  // #d8f2e6 = **4.62:1**。改这个值之前先算，别凭「看起来够亮」。
+  assert.match(styles, /\.mobile-message\.user small\s*\{[^}]*color:\s*#d8f2e6;/s);
   assert.match(styles, /\.mobile-message\.user \.mobile-message-markdown :is\(h1, h2, h3, h4, h5, h6\)\s*\{[^}]*color:\s*#fff;/s);
   assert.match(styles, /\.mobile-message\.user \.mobile-message-markdown a\s*\{[^}]*color:\s*#e6f6ee;/s);
   assert.match(styles, /\.mobile-message\.user \.mobile-message-markdown code\s*\{[^}]*background:\s*rgba\(255, 255, 255, \.16\);/s);
@@ -365,6 +382,94 @@ test("mobile message bubbles size to their content and point at the sender", () 
   assert.doesNotMatch(page, /new Date\(entry\.message\.createdAt\)\.toLocaleString\(\)/);
   // 跨年要带年份，否则"12/31 19:41"会被读成今年的。
   assert.match(page, /parsed\.getFullYear\(\) === now\.getFullYear\(\)/);
+});
+
+test("messages from one speaker in a row read as a single utterance, and the signature line is a footnote", () => {
+  // 2026-09-22。两件事同源：都是把**已有的结构信息**用在版面上，而不是加装饰。
+  //
+  // ① 分组。此前「我连发两条」与「两个人在说」在版面上**完全一样**：间距都是 12px、
+  //    都各带尖角、圆角都是 16/16/16/5。左右对齐只说明了「谁在说」，
+  //    没有任何东西说明「谁**连着**说」。
+  // ② 署名行。它占了整整 30px（为 44px 热区付的代价，不能减），但它此前**没有把任何东西分开** ——
+  //    字色与正文同属一个色系、字号只差 4px，扫过去只是白占了一行。
+  //
+  // 判据在页面里算，样式只读属性（不用 :has()，理由见下）。
+  assert.match(page, /const messageGroups = useMemo\(\(\) => \{/);
+  assert.match(page, /const joinedBefore = before\?\.kind === "message" && before\.message\.role === entry\.message\.role;/);
+  assert.match(page, /const joinedAfter = after\?\.kind === "message" && after\.message\.role === entry\.message\.role;/);
+  assert.match(page, /joinedBefore && joinedAfter \? "mid" : joinedBefore \? "last" : joinedAfter \? "first" : "solo"/);
+  assert.match(page, /data-group=\{messageGroups\.get\(entry\.key\)\}/);
+  // ⚠️ 只看**紧邻**的时间线条目：中间夹了状态卡（notice）就不算连着 ——
+  // 状态卡是"这一步发生了什么"的旁注，它一插进来，上一句与下一句就不是一口气说完的了。
+  // 这一条同时保证了样式那边的前提：「紧邻同角色」⇔「两个 .mobile-message 是**相邻兄弟**」。
+  assert.match(page, /if \(entry\.kind !== "message"\) return;/);
+
+  // 四个取值都要有对应样式，缺一个就会出现"组内那条还带着尖角"或"新起的一段被贴住"。
+  assert.match(styles, /\.mobile-message\[data-group="mid"\], \.mobile-message\[data-group="last"\] \{ margin-top: -7px; \}/);
+  // ⚠️⚠️ 角色侧一律写 `:not(.user)`，**不能**写 `.agent` —— 2026-09-22 复查抓到的真缺陷：
+  // 气泡类名是 `mobile-message ${role}`、role 的取值是 "user" / "assistant"，
+  // 于是 `.mobile-message.agent[…]` 是**永不命中的死选择器** —— Agent 侧那两条圆角规则全部零效果
+  //（只有间距生效），而"零效果"没有任何可见症状：截图正常、下面这些只读**声明**的断言也照样全绿。
+  // 真正挡得住它的是紧随其后的 `roleClasses` 守卫（把 CSS 里的角色类与 Message 类型联合绑起来）。
+  assert.match(styles, /\.mobile-message:not\(\.user\)\[data-group="mid"\], \.mobile-message:not\(\.user\)\[data-group="last"\] \{ border-top-left-radius: 6px; \}/);
+  assert.match(styles, /\.mobile-message\.user\[data-group="mid"\], \.mobile-message\.user\[data-group="last"\] \{ border-top-right-radius: 6px; \}/);
+  // 尖角在**不同边**：Agent 左下、用户右下（尖角一律朝发送者那一侧）。收尖角的规则也要各写一条。
+  assert.match(styles, /\.mobile-message:not\(\.user\)\[data-group="first"\], \.mobile-message:not\(\.user\)\[data-group="mid"\] \{ border-bottom-left-radius: 16px; \}/);
+  assert.match(styles, /\.mobile-message\.user\[data-group="first"\], \.mobile-message\.user\[data-group="mid"\] \{ border-bottom-right-radius: 16px; \}/);
+
+  // ── 角色类名守卫（2026-09-22 复查补）────────────────────────────────────
+  // 气泡的"角色"是**类名**（`mobile-message ${entry.message.role}`），所以样式里任何
+  // `.mobile-message.<词>` 都必须是一个**页面真的会产出的角色**，否则那条规则永不命中。
+  // 而"永不命中"在本文件里是隐形的：上面那几条断言都只读**声明**，
+  // 声明写得再对，选择器与 DOM 对不上时它们一条都不会红（本轮抓到的缺陷正是这个形状）。
+  // 判据：把 `Message` 类型的 role 联合解析出来，CSS 里的角色类必须是它的子集。
+  const roleUnion = page.match(/type Message = \{[^}]*role:\s*([^;]+);/);
+  assert.ok(roleUnion, "解析不到 `Message` 的 role 联合 —— 这条守卫的前提是那个类型还在原处");
+  const messageRoles = [...roleUnion[1].matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(messageRoles.sort(), ["assistant", "user"],
+    `Message.role 的取值变了：${JSON.stringify(messageRoles)} —— 改它之前先回来看样式里按角色写的那几条圆角规则`);
+  // ⚠️ 对 `styleRules`（剥过注释）比：解释这条缺陷的注释里原样写着 `.mobile-message.agent`。
+  const roleClassesInStyles = [...new Set([...styleRules.matchAll(/\.mobile-message\.([a-zA-Z_-]+)/g)].map((match) => match[1]))];
+  const unknownRoleClasses = roleClassesInStyles.filter((name) => !messageRoles.includes(name));
+  assert.deepEqual(unknownRoleClasses, [],
+    `样式里出现了页面永远不会产出的角色类名：${JSON.stringify(unknownRoleClasses)} —— 这类选择器永不命中，而且**不会让任何东西变红**`);
+  assert.ok(roleClassesInStyles.includes("user"), "守卫自身要能看见角色类（否则它可能只是匹配不到任何东西）");
+  // ⚠️ 间距必须是**消息自己的负外边距**，不能改列表的 gap：gap 是列表级的，一改会把
+  // 状态卡（.mobile-notice）的间距一起改掉 —— 而状态卡不该受"消息分组"影响。
+  assert.doesNotMatch(styleRules, /\.mobile-message-list \{[^}]*gap: 0/s);
+  // ⚠️ 项目刻意**不用 :has()**（基础样式门槛是 Chromium 108，不为它另开一个门槛）。
+  // 这条拿剥过注释的 styleRules 比：解释"为什么不用 :has()"的注释里原样写着它。
+  assert.doesNotMatch(styleRules, /:has\(/);
+
+  // 入场幅度与分组绑定：续接的那条只走 6px，新起一段的走 14px。
+  // 位移量本身就在说"这是接着说"还是"我另起一句" —— 与间距收到 5px、内侧上角拍平是同一件事。
+  const motionAt = styleRules.indexOf("@keyframes mobile-arrive-in");
+  assert.ok(motionAt >= 0, "找不到动效那一段");
+  const motion = styleRules.slice(motionAt);
+  assert.match(motion, /@keyframes mobile-arrive-next \{ from \{ opacity: 0; transform: translateY\(6px\) scale\(\.99\); \} to \{ opacity: 1; transform: none; \} \}/);
+  assert.match(motion, /\.mobile-message\[data-arrive="true"\]\[data-group="mid"\],\n\.mobile-message\[data-arrive="true"\]\[data-group="last"\] \{ animation: mobile-arrive-next 200ms cubic-bezier\(\.25, \.8, \.25, 1\) backwards; \}/);
+
+  // ③ 署名行的分界线。用 ::after 而不是 border-bottom：分界线要做"横向划出来"那条动画，
+  //    border 没法单独做 transform（改 border 会改布局）。
+  // ⚠️ 这 8px 与下面那条 margin-top: 0 是**一起改的**，断言也要成对写 ——
+  // 它们描述同一次位移：原本留「⋯」热区呼吸的那 8px 从 markdown 的上外边距搬进了 head 的内边距。
+  // 只改一处会让正文起点或分界线位置跑掉，而这两条断言会当场红。
+  assert.match(styles, /\.mobile-message-head \{ position: relative;[^}]*padding-bottom: 8px; \}/);
+  // 整条规则逐字钉住（含 height: 1px）：变异实测把 height 改成 0（等于分界线没了）时，只写「有 background 与 transform-origin」那种宽正则**不会红**。
+  assert.match(styles, /\.mobile-message-head::after \{ position: absolute; right: 0; bottom: 0; left: 0; height: 1px; content: ""; background: rgba\(25, 51, 44, \.09\); transform-origin: left; \}/);
+  assert.match(styles, /\.mobile-message\.user \.mobile-message-head::after \{ background: rgba\(255, 255, 255, \.26\); \}/);
+  // ⚠️ 加了 padding-bottom 之后「⋯ 热区下沿 → 正文首行」的余量必须重算：这条行的盒子正好
+  // 也往下长 7px，而热区下沿在元信息行下方 7px ⇒ 余量从 1px 变成 8px（**变安全**）。
+  // 探针里有一条实测它的断言，这里只钉住"那个 8px 的 margin 没被顺手改小"。
+  // 与上面那条成对：两者之和必须仍等于 8（= 热区 7px + 1px 余量），正文起点才不会动。
+  assert.match(styles, /\.mobile-message-head \+ \.mobile-message-markdown \{ margin-top: 0; \}/);
+
+  // 入场时"先内容、后署名"：署名行晚 90ms 淡入、分界线从左侧划出。
+  // ⚠️ 淡入的靶子必须是 head 里的 **<small>**，不能是整个 .mobile-message-head ——
+  // head 里还住着常驻的「⋯」按钮，把它一起藏掉等于让一个可点控件消失 280ms。
+  assert.match(motion, /\.mobile-message\[data-arrive="true"\] \.mobile-message-head > small \{ animation: mobile-head-in 190ms cubic-bezier\(\.25, \.8, \.25, 1\) 90ms backwards; \}/);
+  assert.match(motion, /\.mobile-message\[data-arrive="true"\] \.mobile-message-head::after \{ animation: mobile-head-rule 280ms cubic-bezier\(\.3, \.9, \.3, 1\) 60ms backwards; \}/);
+  assert.doesNotMatch(motion, /\[data-arrive="true"\] \.mobile-message-head \{ animation:/, "别把整个署名行（含「⋯」）一起淡出");
 });
 
 test("mobile message bubbles reveal an icon action row instead of opening a sheet", () => {
@@ -446,8 +551,13 @@ test("mobile message bubbles reveal an icon action row instead of opening a shee
   assert.match(styles, /\.mobile-message\.user \.mobile-message-action-icon:disabled \{ color: #a9d8c6; background: transparent; \}/);
   assert.match(styles, /\.mobile-message\.user \.mobile-message-action-icon \{/);
   // 热区外扩 7px 的下沿在"距气泡顶 47px"，正文首行的行盒必须从 48px 之后开始 ——
-  // 这个 8px 是算出来的（10 + 30 + 8），不是审美取值；调小它就会让热区压住正文首行。
-  assert.match(styles, /\.mobile-message-head \+ \.mobile-message-markdown \{ margin-top: 8px; \}/);
+  // ⚠️ 热区外扩 7px 的下沿落在「距气泡顶 47px」，正文首行的行盒必须从 48px 之后开始 ——
+  // 这条恒等式（10 + 30 + 8 = 48）没变，但那个 8px 的**位置变了**：2026-09-22 加署名行分界线时，
+  // 它从 markdown 的上外边距搬进了 head 的 padding-bottom（head 现在是 30 + 8 = 38px）。
+  // 搬家的理由：分界线画在 head 的底边上，若 8px 仍留在 markdown，分界线就会正好压在
+  // 「⋯」热区的最后一格上（探针底部探针 ring.b + 6 当场量到，热区实际少 1px）。
+  // **两处之和必须仍然等于 8**；只改一处会让正文起点或分界线位置跑掉。
+  assert.match(styles, /\.mobile-message-head \+ \.mobile-message-markdown \{ margin-top: 0; \}/);
 
   // ④ 复制：走两端共用的 lib/clipboard，反馈**就地**（那颗图标自己换成勾），不弹页面级提示。
   //    图标行不是浮层，没有第二处可以写"已复制"三个字 —— 所以 sr-only 的播报必须有，
@@ -638,7 +748,7 @@ test("mobile conversation card motion only animates genuinely new entries, and e
   // ── 全局约束 ①：只动 transform / opacity ────────────────────────────────
   // 这一页是整页滚动 + 有「贴底跟随」判据（scrollHeight 每帧参与运算）——
   // 任何改布局的动画都会每帧改动 scrollHeight，与它直接打架。
-  for (const name of ["mobile-arrive-in", "mobile-notice-in", "mobile-action-pop", "mobile-action-check-nudge", "mobile-quote-ref-in"]) {
+  for (const name of ["mobile-arrive-in", "mobile-arrive-next", "mobile-head-in", "mobile-head-rule", "mobile-notice-in", "mobile-action-pop", "mobile-action-check-nudge", "mobile-quote-ref-in"]) {
     const block = motion.match(new RegExp(`@keyframes ${name} \\{[^}]*\\}`))?.[0] || "";
     assert.ok(block, `缺关键帧 ${name}`);
     assert.doesNotMatch(block, /(?:^|[^\w-])(?:height|width|margin|padding|top|left|right|bottom)\s*:/, `${name} 不许动布局属性`);
@@ -652,7 +762,14 @@ test("mobile conversation card motion only animates genuinely new entries, and e
 
   // ── 全局约束 ③：每条动效都有降级分支，判据是"降级后信息不丢" ─────────────
   for (const rule of [
-    '\\.mobile-message\\[data-arrive="true"\\], \\.mobile-notice\\[data-arrive="true"\\] \\{ animation: none; \\}',
+    // 2026-09-22 这条降级规则扩过**两次**，两次都因为"只停了一部分"而出问题：
+    //   第一次：新增的「署名行淡入」与「分界线划出」没停 ⇒ 降级下分界线会从 0 宽度「划」出来一次；
+    //   第二次（复查抓到，更隐蔽）：新增的 `[data-arrive="true"][data-group="mid"|"last"]`
+    //     是 **(0,3,0)** 而这条降级规则只有 (0,2,0) ⇒ **与书写顺序无关地**压过它，
+    //     于是开了"减少动态"之后组内续接的那条**仍然会滑入**。
+    //     这正是 MOBILE-UI.md 记过的那个级联坑（(0,3,0) 盖过 (0,2,0)，只能显式写）。
+    // 所以这条断言必须把**四个选择器**都钉住：少一个就等于少停一条动效。
+    '\\.mobile-message\\[data-arrive="true"\\]\\[data-group="mid"\\],\\s*\\.mobile-message\\[data-arrive="true"\\]\\[data-group="last"\\],\\s*\\.mobile-message\\[data-arrive="true"\\] \\.mobile-message-head > small,\\s*\\.mobile-message\\[data-arrive="true"\\] \\.mobile-message-head::after \\{ animation: none; \\}',
     "\\.mobile-message-actions \\.mobile-message-action-icon,",
     "\\.mobile-action-check \\{ stroke-dasharray: none; animation: none; \\}",
     "\\.mobile-quote-refs \\.mobile-quote-ref \\{ animation: none; \\}",
@@ -1178,13 +1295,39 @@ test("mobile never loses its device entry points when the instance read fails", 
   // 设备面板本身只吃本地设备表（`readDevices()`），不需要云端读数 —— 这是"入口能兜底"的前提。
   assert.match(page, /function openDevicesSheet\(\) \{\s*setDevices\(readDevices\(\)\);/);
 
-  // 原生包里没有通知通道：`capacitor.plugins.json` 只有扫码与 App 两个插件、`AndroidManifest.xml`
-  // 也没有 `POST_NOTIFICATIONS`，而 Android WebView 不会把 Web Notification 接到系统通知栏。
-  // 所以那颗「开启通知」在原生平台必须收起 —— 留着它就是一颗"点了永远拿不到权限"的哑按钮。
-  assert.match(page, /\(\) => Capacitor\.isNativePlatform\(\) \|\| typeof Notification === "undefined" \? "unsupported" : Notification\.permission\)/);
-  // 两个入口（顶栏那颗 + ⋯ 菜单里那项）都只认 "default"，所以判 unsupported 就能一起收起来。
+  // 通知：原生包接的是 @capacitor/local-notifications 的**本地通知** —— App 自己把已经从 SSE
+  // 拿到的事件丢进系统通知栏，不经过任何服务器。这里曾经在原生平台判 `unsupported` 把入口收起，
+  // 那是因为当时确实没有通知通道（Android WebView 不把 Web Notification 接到通知栏）；
+  // 接上插件后那个短路已无依据，留着它会让华为/小米上永远看不到那颗「开启通知」。
+  assert.doesNotMatch(page, /Capacitor\.isNativePlatform\(\) \|\| typeof Notification === "undefined" \? "unsupported"/);
+  // 原生平台的权限初值给 "default"（真值由 checkPermissions 异步收敛），两处入口才会渲染。
+  assert.match(page, /if \(backend === "native"\) return "default"/);
+  // 两个入口（顶栏那颗 + ⋯ 菜单里那项）都只认 "default"；插件权限经 toNotificationPermission
+  // 映射回同一口径，所以这两处一个字都不用改。
   assert.ok((page.match(/notificationPermission === "default"/g) || []).length >= 2,
-    "顶栏与 ⋯ 菜单里的通知入口都只认 default（判 unsupported 才能把两处一起收起）");
+    "顶栏与 ⋯ 菜单里的通知入口都只认 default");
+  // 渠道必须先建好再发：channelId 指向不存在的渠道时通知会**静默不发**（不是退回默认渠道），
+  // 所以发之前要等 createChannel 那条 promise —— 启动瞬间到达的事件正好落在这个窗口里。
+  assert.match(page, /notificationChannelRef\.current = LocalNotifications\.createChannel\(\{ \.\.\.MOBILE_NOTIFICATION_CHANNEL \}\)/);
+  assert.match(page, /void \(notificationChannelRef\.current \?\? Promise\.resolve\(\)\)/);
+  assert.match(page, /LocalNotifications\.schedule\(\{/);
+  assert.match(page, /channelId: MOBILE_NOTIFICATION_CHANNEL\.id/);
+  // extra 必须带 taskId：task.* 事件的 payload 里没有项目/会话字段（控制端只给显式传了
+  // 会话 id 的那条重载补写），taskId 是点通知后唯一能定位到项目的线索。
+  assert.match(page, /extra: \{ projectId: content\.projectId, conversationId: content\.conversationId, taskId: content\.taskId \}/);
+  // 点通知要能回到对应会话；目标可能只有 taskId，靠 pickNotificationProject 反查项目。
+  assert.match(page, /LocalNotifications\.addListener\("localNotificationActionPerformed"/);
+  assert.match(page, /pickNotificationProject\(projects, target\)/);
+  assert.match(page, /pickNotificationProject\(projects, pending\)/);
+  // 跳到项目时**必须同时进会话视图**：只 setSelectedProject 的话 mobileView 仍停在 "projects"，
+  // 用户点了通知还钉在项目列表上，看起来像点了没反应。没带会话 id 时挑当前会话（与
+  // openMobileProject 同口径）。
+  assert.match(page, /function applyNotificationTarget\(projectValue: Project, conversationId: string\) \{/);
+  assert.match(page, /projectValue\.conversations\?\.find\(\(entry\) => entry\.isCurrent\)/);
+  // 前后台不能只看 document.hidden：Android WebView 里 visibilitychange 是否可靠触发
+  // 没有验证记录，若它不触发，通知就永远发不出去。原生侧补 appStateChange，两条取或。
+  assert.match(page, /CapacitorApp\.addListener\("appStateChange"/);
+  assert.match(page, /shouldNotifyWhileAway\(\{ isNative, nativeInBackground: nativeInBackgroundRef\.current, documentHidden: document\.hidden \}\)/);
 });
 
 test("mobile one-phone-many-desktops: device bar, switcher sheet and per-device state", () => {
@@ -1907,7 +2050,7 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   // 两套 ⋯ 菜单**互斥渲染**：文件面板上那四项（历史会话/新会话/任务队列/重新同步）点开是
   // 另一件事，硬塞进同一张表里会让"刷新"在文件视图里变成重新同步快照。
   assert.match(page, /\{filesHeaderActive && <div className="mobile-header-menu">/);
-  assert.match(page, /\{conversationHeaderActive && project && !subHeaderActive && <div className="mobile-header-menu">/);
+  assert.match(page, /\{conversationHeaderActive && project && !subHeaderActive && <><button className="mobile-refresh"/);
   assert.match(page, /<div className="mobile-header-menu-sheet" id="mobile-files-menu-sheet" role="menu" aria-label="文件操作">/);
   // 历史列表继续用带后缀的 title —— 那里一行只有标题，多这一截反而有用，别一起改掉。
   assert.match(page, /title: `\$\{item\.title \|\| "未命名会话"\} · \$\{conversationAgentLabel\(item\.agentId\)\}`/);
@@ -1939,6 +2082,30 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   assert.match(page, /activeTaskCount > 0 && <span className="mobile-header-menu-badge" aria-hidden="true">\{activeTaskCount\}<\/span>/);
   assert.match(page, /task\.status !== "done" && task\.status !== "cancelled"/);
 
+  // ⋯ 菜单最底部那行「应用版本」。移动端此前**一处都不显示版本**：桌面端那颗
+  // AppVersionTag 带 isDesktop() 守卫、且只挂在 DashboardPage 上，而 Capacitor 原生包里
+  // isDesktop() 恒为 false、整页只挂 MobileRemotePage —— 于是"我装的是哪一版"没有来源。
+  // 守三件事：菜单里真的渲染它、值来自原生 App.getInfo、读不到时整行不出现（不摆空占位）。
+  assert.match(page, /className="mobile-header-menu-version"><span>Milevia<\/span><small>\{appVersionLabel\}<\/small>/);
+  assert.match(page, /\{appVersionLabel && <div className="mobile-header-menu-version">/);
+  assert.match(page, /readMobileAppInfo\(\)[\s\S]*?setAppVersionLabel\(formatAppVersion\(info\.version, info\.build\)\)/);
+  // 读值那条链的两条硬性质（拿**函数体**来断，别把注释原文写进锚点 —— 改一句措辞就误报）：
+  //   ① 非原生端**先**返回 null（Web 端 App.getInfo() 会抛 unimplemented，不能走到它）；
+  //   ② 异常必须被吞成 null：读不到版本不该在启动路径上冒红字。
+  // ⚠️ 函数体必须**切到函数自己的收尾大括号**为止。用 `slice(indexOf(...))` 一路切到文件尾
+  // 是错的：后面的 checkMobileUpdate 里同样有一句 `if (!Capacitor.isNativePlatform()) return null;`
+  // 与 `return null;`，配上 `[\s\S]*?` 会跨函数命中，两条断言双双退化成永真
+  // （2026-09-24 变异检验实测：去掉守卫、把 catch 改成抛出，两条都还报 PASS）。
+  const readAppInfoFn = mobileUpdateLib.match(/export async function readMobileAppInfo\(\)[\s\S]*?\n\}/)?.[0] ?? "";
+  assert.match(readAppInfoFn, /^export async function readMobileAppInfo\(\): Promise<MobileAppInfo \| null> \{[\s\S]*?if \(!Capacitor\.isNativePlatform\(\)\) return null;/);
+  assert.match(readAppInfoFn, /catch \{[\s\S]*?return null;/);
+  assert.match(androidReleaseLib, /export function formatAppVersion\(version: string, build\?: string\): string \{/);
+  // 样式：它是**信息行**，不是菜单项 —— 不能进 `.mobile-header-menu-sheet button` 那条
+  // min-height: 44 的规则（点不动的东西给 44 会让人以为可以点）。
+  assert.match(styleRules, /\.mobile-header-menu-version \{[^}]*font-size: 11px;/s);
+  assert.match(styleRules, /\.mobile-header-menu-version small \{[^}]*font-family: ui-monospace/s);
+  assert.doesNotMatch(styleRules, /\.mobile-header-menu-version[^{]*\{[^}]*min-height: 44px/s);
+
   // 关闭路径：点面板外 + Esc。Esc 必须把焦点还给 ⋯，否则键盘用户掉在 document.body 上、
   // 只能从头 Tab 一遍（本页其它浮层早就有这个约定）。
   assert.match(page, /if \(target instanceof Element && target\.closest\("\.mobile-header-menu"\)\) return;/);
@@ -1957,10 +2124,9 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   assert.match(page, /\{conversationHeaderActive && conversationState && <span className=\{`mobile-conversation-state mobile-conversation-state-\$\{conversation\?\.status\}`\}>\{conversationState\}<\/span>\}/);
   assert.match(styles, /\.mobile-conversation-state-failed, \.mobile-conversation-state-stopped \{ color: #9b3e33; background: #fdeeea; \}/);
 
-  // 两个视图各留各的入口，互不干扰：刷新胶囊只在非会话视图渲染，⋯ 只在会话视图渲染。
+  // 两个视图各有刷新入口：项目/设置等非会话视图直接画刷新胶囊；会话视图把刷新胶囊摆在 ⋯ 左边（同一条件内，互斥于文件那套）。
   assert.match(page, /\{!conversationHeaderActive && <button className="mobile-refresh"/);
-  // 文件面板打开时这一套让位给文件那套（两套互斥，见文件视图那条用例）。
-  assert.match(page, /\{conversationHeaderActive && project && !subHeaderActive && <div className="mobile-header-menu">/);
+  assert.match(page, /\{conversationHeaderActive && project && !subHeaderActive && <><button className="mobile-refresh"/);
 });
 
 test("mobile web exposes notification permission when the browser supports it", () => {
@@ -1968,6 +2134,30 @@ test("mobile web exposes notification permission when the browser supports it", 
   assert.match(page, /setNotificationPermission\(permission\)/);
   assert.match(page, /onClick=\{\(\) => void enableMobileNotifications\(\)\}/);
   assert.doesNotMatch(page, /Notification\.permission !== "granted" && <button className="mobile-notification-button"/);
+});
+
+// 本地通知必须显式声明 `isExactNotification: false`。
+//
+// 插件的默认值是 `true`，而它在 `schedule()` 上会先看 `canScheduleExactAlarms()`：
+// 没有「闹钟和提醒」权限时（Android 14+ 默认不授予，本应用 targetSdk 36）插件
+// `startActivityForResult` 打开系统设置页后**直接 return** —— 通知不发出、这个 call
+// 一直悬着（不 resolve 也不 reject，所以 `.catch` 看不到），用户还被平白弹到设置页。
+// 这条通知没有 `schedule` 字段（即时投递），精确闹钟对它毫无意义。
+// 判据钉在"那个字段真的出现在 schedule 的载荷里"，而不是"有一次 commit 提过它"。
+test("native local notifications opt out of exact alarms", () => {
+  const schedule = page.match(/LocalNotifications\.schedule\(\{[\s\S]*?\}\)/)?.[0] ?? "";
+  assert.notEqual(schedule, "", "找不到 LocalNotifications.schedule 调用，锚点需要跟着实现更新");
+  assert.match(schedule, /isExactNotification: false/);
+});
+
+// 通知权限必须在**回到前台时**重读，不能只在挂载时读一次。
+//
+// 只读一次的话状态不会收敛：用户去系统设置里把通知打开再回到 App，ref 仍是 false
+// （本会话再也发不出通知），而两颗「开启通知」入口只判 `=== "default"` 也不会重新出现
+// —— 只能杀进程重来（2026-09-29 复查）。
+test("通知权限在回到前台时重读", () => {
+  assert.match(page, /const syncNotificationPermission = \(\) => \{/);
+  assert.match(page, /if \(isActive\) syncNotificationPermission\(\);/);
 });
 
 test("legacy QR URLs automatically submit their embedded pairing code", () => {
@@ -2628,10 +2818,10 @@ test("mobile conversation empty state is a card with a next step, not a bare gra
   // 写在按钮自己的 `text-overflow: ellipsis` 对匿名项不生效（长名字会被硬切）。
   assert.match(page, /<span>\{shortcutBusy === item\.id \? "填入中…" : item\.name\}<\/span>/);
   assert.match(styles, /\.mobile-empty-starters button > span \{ overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; \}/);
-  // 对比度是**算出来的**：`.mobile-empty-start-note` 最初抄了 `.mobile-section-heading span` 的
-  // #82968d（白底 3.14:1），12px 正文档过不了 4.5 的闸门。真浏览器里也有一条算对比度的断言。
-  assert.match(styles, /\.mobile-empty-start-note \{ justify-self: stretch;[^}]*color: #5f7a6e;/s);
-  assert.doesNotMatch(styles, /\.mobile-empty-start-note \{[^}]*#82968d/s);
+  // 对比度闸门还在：空态卡里的小字**不许**抄 `.mobile-section-heading span` 的 #82968d
+  // （白底 3.14:1，12px 正文档过不了 4.5 的闸门）。原来这条钉在 `.mobile-empty-start-note`
+  // 那个具体元素上，note 已按要求删掉，改成对整张空态卡兜一条 —— lesson 不跟着元素消失。
+  assert.doesNotMatch(styles, /\.mobile-empty-start[^{]*\{[^}]*#82968d/s);
   // 居中靠"空态下把会话视图变成一根撑满视口的弹性列"，**不是**"减 N px"的算术 ——
   // 后者要把顶栏、输入条、页面 padding、会话块 margin 逐个扣掉，少减一个就凭空多出一条
   // 页面滚动（第一版栽了两回：会话块的 14px 下边距、刷新状态条出现后多出来的那一条）。
@@ -2953,7 +3143,7 @@ test("mobile conversation creation and message send never wait for the desktop",
   //
   // 不变式：**手机端的操作在本机的这一刻就完成**，那条命令只是事后发给电脑端的一条通知。
   // 下面每条断言都对应一种会让它退回去的写法。
-  const createBody = page.match(/async function createConversationForProject\(projectValue: Project, agentId\?: "claude-code" \| "codex"\) \{[\s\S]*?\n  \}\n/)?.[0] ?? "";
+  const createBody = page.match(/async function createConversationForProject\(projectValue: Project, agentId\?: MobileAgentID, permissionMode\?: PermissionMode\) \{[\s\S]*?\n  \}\n/)?.[0] ?? "";
   assert.ok(createBody, "找不到 createConversationForProject");
   const enterAt = createBody.indexOf("enterConversationView();");
   const waitAt = createBody.indexOf("await waitForCommand(");
@@ -3166,7 +3356,7 @@ test("mobile file view is a sub-state of the conversation, wired to the relay ad
   assert.match(filesPanel, /const reason = contentOmittedFrom\(error\);\n\s*if \(!reason\) throw error;\n\s*omitted = reason;/);
 
   // ⑦ 编辑器：手机端必须软换行（窄屏上横向滚代码没法读，还会和边缘返回手势抢事件）。
-  assert.match(codeFileView, /setExtensions\(wrap \? \[\.\.\.languageExtensions, module\.EditorView\.lineWrapping\] : languageExtensions\);/);
+  assert.match(codeFileView, /setExtensions\(\s*wrap\s*\? \[\.\.\.languageExtensions, module\.EditorView\.lineWrapping, \.\.\.viewExtras\]\s*: \[\.\.\.languageExtensions, \.\.\.viewExtras\]\s*\);/);
   assert.match(fileEditor, /<CodeFileView content=\{content\} filename=\{stat\.name\} fontSize=\{fontSize\} editable onChange=\{onChange\} wrap=\{mobile\} \/>/);
   // 软键盘避让：量的是"编辑器顶边到键盘顶边"，不是整个可视高度 ——
   // 编辑器上方还压着 sticky 顶栏，只按可视高度压，工具栏仍会落在键盘下面。
@@ -3342,7 +3532,17 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   //    （"project workspace is occupied…" → "项目工作区正被其他 AI 任务或 Git 操作占用…"），
   //    只按原文匹配的分支在真实链路上永远不命中 —— 而单测喂原文照样绿。
   //    服务端的 httpErrorCode 正是为"别把行为耦合到本地化文案上"而存在的。
-  assert.match(adapter, /const FAILURE_CODES: Record<string, MobileGitFailureKind> = \{\n\s*workspace_occupied: "workspace_busy",\n\s*\};/);
+  //    码表逐条钉住，而不是拿整块正则去比形状：后者加一条码就碎，而它真正要守的是
+  //    "这些判据都在"。少一条就意味着那一档失败在真实链路上退回文案匹配（静默失效）。
+  for (const entry of [
+    'workspace_occupied: "workspace_busy"',
+    'git_state_changed: "stale_state"',
+    'git_paths_gone: "changes_gone"',
+    'git_no_changes: "nothing_to_do"',
+    'runner_offline: "runner_offline"',
+  ]) {
+    assert.ok(adapter.includes(entry), `FAILURE_CODES 缺少判据：${entry}`);
+  }
   assert.match(adapter, /classifyGitFailure\(message, reply\?\.code\)/);
   // 没有码的那些只能匹配文案，所以本地化之后的中文写法也必须留着。
   assert.match(adapter, /\{ kind: "workspace_busy", needle: "项目工作区正被其他 AI 任务或 Git 操作占用" \},/);

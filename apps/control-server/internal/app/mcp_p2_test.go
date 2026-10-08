@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -682,5 +684,55 @@ func TestPreviewMCPServerRejectsUnknownEnvironment(t *testing.T) {
 	server.previewMCPServer(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestMCPDeleteServerRevokesOAuthTokens 删除 server 必须连 OAuth 令牌一起吊销（2026-09-24）。
+// 背景：一键连接向导的 OAuth 路径「先落库再授权」，取消半成品使 DELETE 成了常规路径 ——
+// 若只删 mcp_servers 行，mcp_oauth_tokens 里会留下永远无人能用的 access/refresh 令牌。
+func TestMCPDeleteServerRevokesOAuthTokens(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	serverID := insertTestMCPServerURL(t, s, "oauth-github", "global", "", "http", "https://example.com/mcp", []string{"claude-code"})
+	// 用真实存在的密钥引用插令牌行 —— 这样「引用已吊销」才是可断言的事实
+	//（凭空的 sec_ 字符串吊销与否，Load 都一样失败）。
+	csRef, err := s.profileSecrets.Store(s.db, ctx, "client-secret-plain")
+	if err != nil {
+		t.Fatalf("store client secret: %v", err)
+	}
+	atRef, err := s.profileSecrets.Store(s.db, ctx, "access-token-plain")
+	if err != nil {
+		t.Fatalf("store access token: %v", err)
+	}
+	rtRef, err := s.profileSecrets.Store(s.db, ctx, "refresh-token-plain")
+	if err != nil {
+		t.Fatalf("store refresh token: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.db.ExecContext(ctx,
+		`insert into mcp_oauth_tokens (`+mcpOAuthTokenColumns+`,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		serverID, "https://api.example.com", "https://auth.example.com", "https://token.example.com", "", "client-id", csRef, atRef, rtRef, "read", "Bearer", nil, now, now); err != nil {
+		t.Fatalf("insert oauth token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/mcp/servers/"+serverID, nil)
+	req = withURLParam(req, "serverID", serverID)
+	rec := httptest.NewRecorder()
+	s.deleteMCPServer(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete server 应 204，实际 %d：%s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := s.loadMCPOAuthToken(ctx, serverID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("删除 server 后 OAuth 令牌应一并删除，实际 err=%v", err)
+	}
+	if _, err := s.fetchStoredMCPServer(ctx, serverID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("server 行应已删除，实际 err=%v", err)
+	}
+	// 密钥引用必须真被吊销：Load 不出来才算干净（循环被删掉时这里会红）。
+	for _, ref := range []string{csRef, atRef, rtRef} {
+		if _, err := s.profileSecrets.Load(s.db, ctx, ref); err == nil {
+			t.Errorf("密钥引用 %s 应已吊销，但仍能加载出明文", ref)
+		}
 	}
 }

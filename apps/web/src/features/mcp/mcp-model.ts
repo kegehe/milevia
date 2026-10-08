@@ -92,46 +92,19 @@ export type MCPConnectPlan = {
   canOAuth: boolean;
   /** 需要用户自己填凭据（不想授权时才用得上）。 */
   needsCredential: boolean;
-  /** 需要在目标环境先装运行时；是否真的存在由运行时检查实答。 */
-  needsInstall: boolean;
+  // needsInstall 已删（2026-09-24）：唯一读者是已删除的 presetBadges / cardActionLabel；
+  // 「要不要先装运行时」现在只由向导检查屏按 preset.requires 现场实答。
 };
 
 export function connectPlanFor(preset: MCPPreset | null): MCPConnectPlan {
   return {
     canOAuth: !!preset?.oauth,
     needsCredential: (preset?.credentials || []).length > 0,
-    needsInstall: (preset?.requires || []).length > 0,
   };
 }
 
-// presetBadges 给出目录卡片上那行「需要准备什么」。
-//
-// 口径：**只说用户要不要动手**，不带任何协议名词（不出现 stdio / npx / 环境变量 / 作用域）。
-export function presetBadges(preset: MCPPreset): string[] {
-  const plan = connectPlanFor(preset);
-  const badges: string[] = [];
-  if (plan.needsInstall) {
-    for (const item of preset.requires || []) badges.push(`先装 ${item.label}`);
-  }
-  if (plan.canOAuth) {
-    badges.push(plan.needsCredential ? "可授权，也可填密钥" : "点一次授权即可");
-  } else if (plan.needsCredential) {
-    badges.push(`需要 ${(preset.credentials || [])[0].label}`);
-  } else if (!plan.needsInstall) {
-    badges.push("无需准备");
-  }
-  return badges;
-}
-
-// cardActionLabel 是目录卡片上的按钮文案：OAuth 服务直接说「用浏览器登录」，
-// 比一个笼统的「连接」更能让不懂的人敢点。
-export function cardActionLabel(preset: MCPPreset): string {
-  const plan = connectPlanFor(preset);
-  if (plan.canOAuth && !plan.needsCredential) return "用浏览器登录";
-  if (plan.needsInstall) return "检查并连接";
-  return "连接";
-}
-
+// 目录卡片不再展示「要准备什么」徽标行（2026-09-24 起，presetBadges 已随 UI 删除）；
+// 卡片按钮统一「连接」。准备事项改由向导的凭据屏 / 检查屏逐步告知。
 // wizardStartsAt 决定向导从哪一屏开始。
 //
 // 不需要用户提供任何东西的条目（本地起步、无凭据）直接进检查屏 —— 让用户白点一次「下一步」
@@ -238,4 +211,48 @@ export function buildDraftServerPayload(
     // 「以后不用再问我」= 放行该服务的全部工具，与工具级白名单共用同一套语法。
     autoApproveTools: trust ? [`mcp__${preset.name}__*`] : [],
   };
+}
+
+// ── 官方服务图标 ─────────────────────────────────────────────────────────────
+//
+// 目录条目会随时间增加，前端不该为一个新服务发一次版：所以这里按**预设名**维护
+// 一份白名单（与 `AgentLogo` 的 `agentLogoKey` 同一约定），白名单外的服务回落到
+// 页面原有的示意图标 —— 画错品牌 logo 的风险由「回落」兜住，而不是猜一个近似的。
+export const SERVICE_LOGO_KEYS = [
+  "github",
+  "notion",
+  "linear",
+  "sentry",
+  "slack",
+  "jira",
+  "stripe",
+  "playwright",
+  "context7",
+] as const;
+export type ServiceLogoKey = (typeof SERVICE_LOGO_KEYS)[number];
+
+export function serviceLogoKey(presetName: string): ServiceLogoKey | null {
+  switch (presetName) {
+    case "github":
+    case "github-local":
+      return "github";
+    case "atlassian":
+      return "jira";
+    case "notion":
+      return "notion";
+    case "linear":
+      return "linear";
+    case "sentry":
+      return "sentry";
+    case "slack":
+      return "slack";
+    case "stripe":
+      return "stripe";
+    case "playwright":
+      return "playwright";
+    case "context7":
+      return "context7";
+    default:
+      return null;
+  }
 }

@@ -65,6 +65,37 @@ func (s *Server) resolveRequestWorkspaceFromRequest(r *http.Request) (resolvedCo
 	return s.resolveRequestWorkspace(r.Context(), chi.URLParam(r, "projectID"), r.URL.Query().Get("conversationId"))
 }
 
+// writeMissingProject 是"项目不存在"的**唯一**回应点。
+//
+// 分开写是因为需要它的地方不止一处：解析请求上下文的失败（git / terminal / app.go），
+// 以及 fs 那一族自己的错误映射（`writeFSError` / `writeSQLitePreviewError` —— 它们此前
+// 把同一件事报成"请求参数无效"，等于指责用户输错了参数）。一个结论一个出口，
+// 免得下一处新写的错误映射又给出第三种说法。
+func writeMissingProject(w http.ResponseWriter) {
+	writeError(w, http.StatusNotFound, errors.New("project not found"))
+}
+
+// writeProjectResolveError 按**真实原因**回应"解析请求里的项目/工作区"这一步的失败。
+//
+// `sql.ErrNoRows` 在这一步只可能来自 `getProjectByID` —— 也就是**项目不存在**。而它此前
+// 被一律写成 409「当前操作与进行中的操作冲突，请稍后重试」：那句话是在**让用户去重试一件
+// 永远不会成功的事**（项目已经没了，重试多少次都一样）。同一个仓库里 `getGitRunner`
+// 早就在这个位置分开了（git_operations.go 的那个 404 分支），其余十几处是漏网的。
+//
+// 除 `ErrNoRows` 之外的失败保持 409：它们是"工作区没准备好 / 不属于这个项目"这类**真的**
+// 与当前状态冲突的情况（见 resolveRequestWorkspace 的另外两个返回点）。
+//
+// 文案用 `getGitRunner` 已经在用的那个英文哨兵（localizedErrorText 的翻译表里是
+// "项目不存在或已被删除。"）：中文串是新造的，会绕过那张表 —— 同一个意思在仓库里
+// 只该有一个来源。
+func writeProjectResolveError(w http.ResponseWriter, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		writeMissingProject(w)
+		return
+	}
+	writeError(w, http.StatusConflict, err)
+}
+
 func workspaceLeaseKey(project Project, workspace ConversationWorkspace) string {
 	if workspace.Mode == "project_shared" || sameCleanPath(workspace.Path, project.Path) {
 		return project.ID
@@ -269,7 +300,7 @@ func (s *Server) createConversationWorktree(w http.ResponseWriter, r *http.Reque
 
 	gitRunner, repo, err := s.gitRunnerForProject(r.Context(), project.ID)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	runner, ok := gitRunner.(workspaceGitRunner)
@@ -455,7 +486,7 @@ func (s *Server) archiveConversationWorkspace(w http.ResponseWriter, r *http.Req
 	defer release()
 	runner, repo, err := s.gitRunnerForProject(r.Context(), project.ID)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	git, ok := runner.(workspaceGitRunner)

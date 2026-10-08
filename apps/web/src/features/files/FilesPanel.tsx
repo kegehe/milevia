@@ -4,7 +4,7 @@ import { FileViewer, type FileViewerMedia } from "./FileViewer";
 import { FileEditor } from "./FileEditor";
 import { FileTabs } from "./FileTabs";
 import type { FileContent, FileInfo, OpenFile } from "./file-model";
-import { detectLanguage, getDirPath, isEditableFile } from "./file-model";
+import { detectLanguage, getDirPath, isEditableFile, validateFileName } from "./file-model";
 import { getPreviewKind, isTextPreview } from "./source-language";
 import { contentOmittedFrom } from "./mobile-fs-request";
 import { FileIcon } from "./FileIcon";
@@ -502,15 +502,6 @@ export function FilesPanel({
   }, []);
 
   // 提交新建
-  // 校验文件名是否包含路径遍历字符
-  const validateFileName = (name: string): string | null => {
-    const trimmed = name.trim();
-    if (!trimmed) return "文件名不能为空";
-    if (trimmed.includes("/") || trimmed.includes("\\")) return "文件名不能包含路径分隔符";
-    if (trimmed.includes("..")) return "文件名不能包含 ..";
-    return null;
-  };
-
   const submitNewFile = useCallback(async () => {
     if (!showNewFileDialog || !newFileName.trim()) return;
     const nameError = validateFileName(newFileName);
@@ -665,6 +656,7 @@ export function FilesPanel({
             onAddToChat={onAddToChat}
             readOnly={readOnly}
             refreshRef={treeRefreshRef}
+            activePath={activeFilePath || undefined}
           />
         </div>
 

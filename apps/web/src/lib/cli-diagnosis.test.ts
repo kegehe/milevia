@@ -3,15 +3,15 @@ import test from "node:test";
 import {
   describeRepair,
   diagnoseMoment,
-  diagnosisBadge,
   diagnosisEmptyText,
-  diagnosisLabel,
   diagnosisMetaLine,
   diagnosisTone,
   isConclusiveDiagnosis,
+  normalizeDiagnosis,
+  normalizeDiagnostics,
   offeredRemedies,
   pathFactState,
-  preflightNotes,
+  preflightNote,
   resolvedIssues,
   resolvedSummary,
   skippedDiagnosisText,
@@ -31,26 +31,34 @@ function diagnosis(partial: Partial<AgentDiagnosis>): AgentDiagnosis {
   };
 }
 
-// 这条是本组最要紧的：**"没查成"绝不能念成"没有问题"**。
+// 这条是本组最要紧的：**"没查成"绝不能念成"没问题"**。
 // 它是本项目反复出现的那一族错（把读不到写成没有），而诊断结论是用户唯一
 // 能读到"这台机器到底怎么样"的地方。
-test("未知状态一律念成「检测未完成」，绝不回落到「没有问题」", () => {
+//
+// ⚠️ 这条要求现在由**两处**合起来守，两边都必须绿：
+//   ① 这里 —— 认不出的状态一律落到 unknown 观感，绝不落到 ok；
+//   ② `cli-tools-view.test.ts` —— 一份没结论的报告（零症状 + unknown）绝不能被
+//      念成「已是最新，不用管它」，卡片必须说「这次没检查成功」。
+// 少任何一边，用户都可能在一次没查成之后以为一切正常。
+test("认不出的结论一律落到 unknown 观感，绝不落到 ok", () => {
   for (const status of ["unknown", "channel-failed", "", "something-new-from-a-newer-server"]) {
-    assert.equal(diagnosisLabel(status), "检测未完成", `status=${status}`);
-    assert.notEqual(diagnosisLabel(status), "没有问题");
+    assert.equal(diagnosisTone(status), "unknown", `status=${status}`);
+    assert.notEqual(diagnosisTone(status), "ok");
+    assert.equal(isConclusiveDiagnosis(diagnosis({ status })), false, `status=${status} 不该被当成有结论`);
   }
-  assert.equal(diagnosisLabel("ok"), "没有问题");
+  assert.equal(diagnosisTone("ok"), "ok");
+  assert.equal(isConclusiveDiagnosis(diagnosis({ status: "ok" })), true);
 });
 
-test("五种真相各有各的说法，两两不同", () => {
-  const statuses = ["ok", "broken", "not-installed", "unknown", "unsupported"];
-  const labels = statuses.map(diagnosisLabel);
-  assert.equal(new Set(labels).size, statuses.length, `文案重复：${labels.join(" / ")}`);
-  // 每个状态一个专属观感；`ok` 与"没查成"必须不同档（前者绿、后者灰且虚线）。
+test("五种真相各有各的观感，且 ok 与没查成必须不同档", () => {
   assert.equal(diagnosisTone("ok"), "ok");
   assert.equal(diagnosisTone("broken"), "bad");
+  // 未安装 / 该环境不提供：同一档（都要用户做点什么），但都不是"没问题"。
+  assert.equal(diagnosisTone("not-installed"), "warn");
+  assert.equal(diagnosisTone("unsupported"), "warn");
   assert.equal(diagnosisTone("unknown"), "unknown");
-  assert.notEqual(diagnosisTone("ok"), diagnosisTone("unknown"));
+  // 三档互不相同：绿 / 琥珀 / 灰且虚线 —— 一眼可分是这条的要点。
+  assert.equal(new Set(["ok", "broken", "not-installed", "unknown"].map(diagnosisTone)).size, 4);
   // 认不出的状态要落到 unknown 这一档，而不是 ok。
   assert.equal(diagnosisTone("brand-new-status"), "unknown");
 });
@@ -140,33 +148,21 @@ test("pathFactState 把五种读数分开说，尤其「没查」不许念成结
 
 // 「没有问题」与「有问题」之间还有一档：**能用，但有几处会绊住你**。
 // 只念 status 会让界面出现「没有问题 · 2 项症状」这种自相矛盾的一行。
-test("diagnosisBadge 同时看结论与症状，ok 但有需要留意的就不念成没有问题", () => {
-  const clean = diagnosisBadge(diagnosis({ status: "ok", issues: [] }));
-  assert.equal(clean.label, "没有问题");
-  assert.equal(clean.tone, "ok");
-
-  const warned = diagnosisBadge(diagnosis({
+//
+// ⚠️ 这一档的判据已经搬到 `lib/cli-tools-view.ts` 的 `buildToolCard`（卡片上那一句
+// 状态就是它），所以断言跟着搬到 `cli-tools-view.test.ts`：那里用真的调用去验
+// "info 不算要留意""ok 但有 warning 就不说已是最新"。这里不再留一份。
+// 结论 → 观感这一段仍然在这儿，所以下面钉的是 tone 而不是标签文案。
+test("结论的观感：ok / broken / unknown 各成一体，认不出的状态落到 unknown", () => {
+  assert.equal(diagnosisTone(diagnosis({ status: "ok" }).status), "ok");
+  assert.equal(diagnosisTone(diagnosis({ status: "broken" }).status), "bad");
+  assert.equal(diagnosisTone("brand-new-status"), "unknown");
+  // 观感是"结论"的函数，与症状无关 —— 症状那一段在 buildToolCard 里合成。
+  const withIssues = diagnosis({
     status: "ok",
     issues: [{ code: "command-shim-missing", severity: "warning", summary: "入口没了", evidence: [], remedies: [] }],
-  }));
-  assert.match(warned.label, /要留意/);
-  assert.notEqual(warned.tone, "ok");
-  assert.doesNotMatch(warned.label, /没有问题/);
-
-  // info 是事实说明（例如"官方安装器装的，平台不接管升级"），不算"要留意"。
-  const info = diagnosisBadge(diagnosis({
-    status: "ok",
-    issues: [{ code: "native-unmanaged", severity: "info", summary: "官方安装器", evidence: [], remedies: [] }],
-  }));
-  assert.equal(info.label, "没有问题");
-
-  // 用不了的仍然是"发现问题"，不会被"要留意"盖过去。
-  const broken = diagnosisBadge(diagnosis({
-    status: "broken",
-    issues: [{ code: "binary-broken", severity: "blocker", summary: "半装", evidence: [], remedies: [] }],
-  }));
-  assert.equal(broken.label, "发现问题");
-  assert.equal(broken.tone, "bad");
+  });
+  assert.equal(diagnosisTone(withIssues.status), "ok");
 });
 
 // 「没执行」与「执行失败」是两件事。合并的后果：用户收到一句"修复失败"，
@@ -272,18 +268,50 @@ test("skippedDiagnosisText 分清「不必详查」与「根本没查」", () =>
   assert.notEqual(ready, broken);
 });
 
-test("preflightNotes 判据一致时只说一句，分歧时才补第二句", () => {
-  assert.deepEqual(preflightNotes({ installOk: true, upgradeOk: true }), []);
-  // 安装与升级共用同一句（服务端就是这么算的）⇒ 不重复说两遍。
-  const shared = preflightNotes({ installOk: false, installReason: "没有可用的 npm", upgradeOk: false, upgradeReason: "没有可用的 npm" });
-  assert.equal(shared.length, 1);
-  assert.match(shared[0], /没有可用的 npm/);
-  // 真分歧时两条都要说 —— 那正是这两个字段存在的理由。
-  const split = preflightNotes({ installOk: false, installReason: "装不了", upgradeOk: false, upgradeReason: "升不了" });
-  assert.equal(split.length, 2);
-  assert.match(split[1], /升级也不行/);
-  // 只有安装失败时不说升级那句（它没失败）。
-  assert.equal(preflightNotes({ installOk: false, installReason: "装不了", upgradeOk: true }).length, 1);
+test("preflightNote 只说一句，且不预设「能装、不能升」这种不存在的组合", () => {
+  assert.equal(preflightNote(undefined), "");
+  assert.equal(preflightNote({ installOk: true, upgradeOk: true }), "");
+  const shared = preflightNote({ installOk: false, installReason: "没有可用的 npm", upgradeOk: false, upgradeReason: "没有可用的 npm" });
+  assert.match(shared, /没有可用的 npm/);
+  // ⚠️ 这一条是"删掉死分支"的证据：服务端把两个结论写在同一个判断里
+  // （agent_diagnose.go:856 的 diagnosePreflightLocal，成功时两个都 true、
+  //  失败时 UpgradeReason = InstallReason），所以"安装可行而升级不可行"产生不出来。
+  // 原先会为那种组合补一句「升级**也**不行：…」——「也」预设了前一句存在，而前一句
+  // 恰恰不会出现。夹具手工造出服务端产生不了的组合，正是本项目踩过的坑。
+  const split = preflightNote({ installOk: false, installReason: "装不了", upgradeOk: false, upgradeReason: "升不了" });
+  assert.doesNotMatch(split, /也/, "「也」预设了前一句存在，而它产生不出来");
+  assert.doesNotMatch(split, /升不了/, "安装那一句就是唯一的一句（两者在服务端同源）");
+  // 唯一那句用的是 install 而不是 upgrade：upgradeOk 的消费者是升级按钮的判据。
+  assert.match(preflightNote({ installOk: false, installReason: "装不了", upgradeOk: true }), /装不了/);
+});
+
+test("线协议省掉数组字段时，收口成空数组而不是让页面白屏", () => {
+  // 2026-09-23 真实点击抓到的：服务端一旦少发一个 limitations，详情抽屉就在 .length 上
+  // 抛异常，React 树整个崩掉 —— 用户看到的是**整页空白**。服务端两处构造点确实都初始化了
+  // 这三个切片，但前端不能靠这个约定活着（同上，边界收口一次，下游按非空用）。
+  const bare = normalizeDiagnosis({ agentId: "claude-code", status: "ok", version: "", diagnosedAt: "" } as never);
+  assert.deepEqual(bare.issues, []);
+  assert.deepEqual(bare.paths, []);
+  assert.deepEqual(bare.limitations, []);
+  // null 与"缺席"一样收口（JSON 里 null 与缺失都可能出现）。
+  const nulled = normalizeDiagnosis({
+    agentId: "claude-code", status: "ok", version: "", diagnosedAt: "",
+    issues: null, paths: null, limitations: null,
+  });
+  assert.deepEqual(nulled.issues, []);
+  // 症状内部的数组同样收口 —— 否则列表能渲染、点开就崩。
+  const issue = normalizeDiagnosis({
+    agentId: "claude-code", status: "broken", version: "", diagnosedAt: "",
+    issues: [{ code: "x", severity: "blocker", summary: "坏了" } as never],
+  }).issues[0];
+  assert.deepEqual(issue.evidence, []);
+  assert.deepEqual(issue.remedies, []);
+  // ⚠️ 收口的是**结构**，不是判断：status 一个字段都不改（"有没有结论"永远看它）。
+  assert.equal(bare.status, "ok");
+  const diagnostics = normalizeDiagnostics({ runnerId: "r", probeOk: true } as never);
+  assert.deepEqual(diagnostics.items, []);
+  assert.deepEqual(diagnostics.skipped, []);
+  assert.deepEqual(diagnostics.limitations, []);
 });
 
 test("diagnosisMetaLine 必须带上「什么时候测的」", () => {

@@ -21,6 +21,8 @@ export type Task = {
   blocks: Dependency[];
   lastRun?: TaskRun;
   orchestrationStatus?: string;
+  /** 所属编排任务尚未点「开始执行」时为 true：仍在排队，但不会自己跑。 */
+  orchestrationPending?: boolean;
   orchestrationTargetBranch?: string;
   orchestrationUpdatedAt?: string;
   createdAt: string;
@@ -35,6 +37,8 @@ export function taskDisplayStatus(task: Task): string {
   if (task.orchestrationStatus === "checking") return "编排收尾中";
   if (task.orchestrationStatus === "preparing") return "准备执行";
   if (task.orchestrationStatus === "implementing") return "自动执行中";
+  // 所属计划还没点「开始执行」：也是排队，但不是在等调度器轮到自己。
+  if (task.orchestrationPending) return "等待计划开始";
   if (task.orchestrationStatus === "queued") return "自动队列中";
   if (task.orchestrationStatus === "paused") return "自动队列已暂停";
   if (task.orchestrationStatus === "stopped") return "自动编排已停止";
@@ -115,6 +119,7 @@ export function taskQueueNote(task: Task): string {
   if (task.orchestrationStatus === "checking") return "自动编排正在提交实现，等待人工验证";
   if (task.orchestrationStatus === "preparing") return "自动编排正在准备工作区";
   if (task.orchestrationStatus === "implementing") return "自动编排正在执行任务";
+  if (task.orchestrationPending) return "已加入编排任务，等计划开始后才执行";
   if (task.orchestrationStatus === "queued") return "已进入自动编排队列";
   if (task.orchestrationStatus === "paused") return "自动编排已暂停";
   if (task.orchestrationStatus === "stopped") return "自动编排已停止，可重新开始";

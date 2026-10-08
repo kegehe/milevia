@@ -62,24 +62,36 @@ func prepareNpmCLIRecovery(ctx context.Context, command string, install npmCLIIn
 	if prefix == "" {
 		return npmCLIRecovery{}, errors.New("npm global prefix is empty")
 	}
+	if err := verifyNpmCLICommand(commandPath, prefix, install); err != nil {
+		return npmCLIRecovery{}, err
+	}
+	return npmCLIRecovery{prefix: prefix, install: install}, nil
+}
+
+// verifyNpmCLICommand 核对"这个命令确实由该 prefix 下的这个 npm 全局包提供"。
+//
+// 抽出来的理由与 installAgentCLIWithPlan 一样：原地修复要拿它去**逐个候选 prefix**
+// 试（系统 npm 全局、托管工具链），而判据只能有一份 —— 两边各写一遍，迟早会出现
+// "回滚认得出、修复认不出"这种同一件事两个结论的局面。
+func verifyNpmCLICommand(commandPath, prefix string, install npmCLIInstall) error {
 	if runtime.GOOS == "windows" {
 		if !sameCleanPath(commandPath, install.commandPath(prefix)) {
-			return npmCLIRecovery{}, errors.New("CLI command is not the npm global command shim")
+			return errors.New("CLI command is not the npm global command shim")
 		}
-		return npmCLIRecovery{prefix: prefix, install: install}, nil
+		return nil
 	}
 	actual, err := filepath.EvalSymlinks(commandPath)
 	if err != nil {
-		return npmCLIRecovery{}, fmt.Errorf("resolve CLI command: %w", err)
+		return fmt.Errorf("resolve CLI command: %w", err)
 	}
 	expected, err := filepath.EvalSymlinks(install.binaryPath(prefix))
 	if err != nil {
-		return npmCLIRecovery{}, fmt.Errorf("resolve npm package command: %w", err)
+		return fmt.Errorf("resolve npm package command: %w", err)
 	}
 	if !sameCleanPath(actual, expected) {
-		return npmCLIRecovery{}, errors.New("CLI command does not resolve to the npm global package")
+		return errors.New("CLI command does not resolve to the npm global package")
 	}
-	return npmCLIRecovery{prefix: prefix, install: install}, nil
+	return nil
 }
 
 func sameCleanPath(left, right string) bool {

@@ -34,12 +34,22 @@ type AgentStatus struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// probeAgents 汇总某个 Runner 上目录里全部工具的状态。
+// probeAgents 汇总某个 Runner 上目录里全部工具的状态（**走读数缓存**，见 agent_readings.go）。
+//
+// ⚠️ 签名与两个调用点（listRunners / runnerStatus）**刻意一个字都不动**：
+// TestRunnerEndpointsShareOneProbePath 用源码断言钉着它们必须调用这个方法。
+// 要绕过缓存请用 probeAgentsFor —— 缓存做在本方法**内部**，而不是在调用点上。
+func (s *Server) probeAgents(ctx context.Context, meta RunnerMeta) []AgentStatus {
+	statuses, _ := s.probeAgentsFor(ctx, meta, false)
+	return statuses
+}
+
+// probeAgentsUncached 是真正的探测（每次都跑，不看缓存）。
 //
 // 工具之间互相独立、且每个探测都可能拉起一个远端进程，因此并发跑 —— 原先只有
 // runnerStatus 这样做，listRunners 是串行的；合并后两边都是并发，逐个探测的超时
 // 不再相加。
-func (s *Server) probeAgents(ctx context.Context, meta RunnerMeta) []AgentStatus {
+func (s *Server) probeAgentsUncached(ctx context.Context, meta RunnerMeta) []AgentStatus {
 	entries := agentCatalog()
 	out := make([]AgentStatus, len(entries))
 	var probes sync.WaitGroup
@@ -196,6 +206,21 @@ func (s *Server) agentMaintenanceActive(runnerID, agentID string) bool {
 	s.runnerMaintenanceMu.Lock()
 	defer s.runnerMaintenanceMu.Unlock()
 	return s.runnerUpdating[runnerAgentKey{runnerID: runnerID, agentID: agentID}]
+}
+
+// anyMaintenanceActive 报告该机器上是否有**任何**工具正在安装/升级。
+//
+// 读数缓存用它决定"要不要绕过缓存"（见 agent_readings.go 的 probeAgentsFor）：维护位是
+// 动态状态，回放一份旧读数会让别的客户端在工具正被替换时看到"可用"。
+func (s *Server) anyMaintenanceActive(runnerID string) bool {
+	s.runnerMaintenanceMu.Lock()
+	defer s.runnerMaintenanceMu.Unlock()
+	for key := range s.runnerUpdating {
+		if key.runnerID == runnerID {
+			return true
+		}
+	}
+	return false
 }
 
 // legacyAgentFields 由 agents[] 派生 claude / codex 两个旧字段。

@@ -67,7 +67,9 @@ test("Web Notification 只在浏览器可用：桌面端与原生包一律判不
   // 桌面端：WebView2 的 PermissionRequested / NotificationReceived 都无人处理，
   // 权限拿不到 granted 且 denied 会被写进应用自己的 profile —— 必须判"不支持"而不是"被拒绝"。
   assert.equal(webNotificationsSupported({ hasNotificationAPI: true, isDesktop: true, isNativePlatform: false }), false);
-  // 原生包：Android WebView 不接系统通知栏，清单也没声明 POST_NOTIFICATIONS。
+  // 原生包：Android WebView 不接系统通知栏。它自己的系统通知走另一条通道
+  //（@capacitor/local-notifications 的本地通知，见 lib/mobile-notify.ts），
+  // 那条通道不影响这里的结论 —— 本函数问的就是"Web Notification 这条 API 能不能用"。
   assert.equal(webNotificationsSupported({ hasNotificationAPI: true, isDesktop: false, isNativePlatform: true }), false);
   // 浏览器：非安全上下文里这条 API 压根不存在。
   assert.equal(webNotificationsSupported({ hasNotificationAPI: false, isDesktop: false, isNativePlatform: false }), false);

@@ -108,18 +108,36 @@ export type MobileGitFailureKind =
   | "runner_offline"
   | "other";
 
-/** 稳定错误码 → 种类。码表来自 control-server 的 httpErrorCode，改那边要同时看这里。 */
+/**
+ * 稳定错误码 → 种类。码表来自 control-server 的 `httpErrorCode`，改那边要同时看这里。
+ *
+ * **新增失败种类一律先加码，不要加 needle。** 码是服务端显式声明的判据，文案只是它顺带
+ * 带出来的说法——说法会被翻译、会被改措辞，而改了这边不会报错，只会静默失效
+ * （docs/41 §15.1 记录过一次真实事故："工作区被占用"那一档在真实链路上永远不命中，
+ * 而单测喂的是本地化之前的英文，照样绿）。
+ *
+ * `runner_offline` 那条的 error 字段本身就是这个标识符（不是一句人话），
+ * 现在服务端也一并给了 code，两边都能命中。
+ */
 const FAILURE_CODES: Record<string, MobileGitFailureKind> = {
   workspace_occupied: "workspace_busy",
+  git_state_changed: "stale_state",
+  git_paths_gone: "changes_gone",
+  git_no_changes: "nothing_to_do",
+  runner_offline: "runner_offline",
 };
 
 /**
- * 没有码的失败只能匹配文案。**它们都是"会原样上路"的那一类**：
- * 未登记进翻译表的英文句子会被 `localizedErrorText` 变成 `中文兜底句：原文`，
- * 原文仍以子串形式存在，所以这些 needle 依然命中。
+ * **兼容层，只服务"拿不到码"的情况**（旧版服务端、或某些绕过 writeError 的出口）。
  *
- * 两条纪律：① 只有确认过"服务端不会整句替换它"的句子才能写在这里；
- * ② 服务端一旦给某条加了翻译，这里必须跟着改 —— 否则是静默失效，不会有任何测试红。
+ * 上面那些种类现在都有码了，正常链路上根本走不到这里。留着的价值是：旧版服务端
+ * （比如用户还没升级的那台电脑）仍然只给文案，那时这些 needle 是唯一的判据。
+ *
+ * 因此纪律变了：**不要往这里加新种类**。要加新种类就先去 control-server 的
+ * `httpErrorCode` 里给它一个码。这里只会随旧版本淘汰而变短，不会变长。
+ *
+ * 顺带说明 needle 为什么能匹配到中文串：未登记进翻译表的英文句子会被
+ * `localizedErrorText` 变成 `中文兜底句：原文`，原文仍以子串形式存在。
  */
 const FAILURE_MATCHERS: Array<{ kind: MobileGitFailureKind; needle: string }> = [
   { kind: "stale_state", needle: "Git state changed" },

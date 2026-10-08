@@ -580,15 +580,18 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	}()
 
 	var stderrTail = &stderrCapture{}
+	// sink 先包一层：把 CLI 在 result 事件里自报的失败原因记下来，失败时用于拼错误
+	// （见 claudeResultErrorDetail）。事件本身照常转发，调用方无感。
+	recorded := &claudeResultErrorSink{AgentRunSink: sink}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		r.readOutput(stdout, sink)
+		r.readOutput(stdout, recorded)
 	}()
 	go func() {
 		defer wg.Done()
-		r.readStderrCapture(stderr, sink, stderrTail)
+		r.readStderrCapture(stderr, recorded, stderrTail)
 	}()
 	// PromptViaStdin：后台 goroutine 写 prompt 再关 stdin。绝不能在此主流程同步写——
 	// 大 prompt 超出 OS 管道缓冲时会阻塞，而此时 reader 才刚启动，claude 提前大量输出
@@ -602,12 +605,12 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	}
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
-		// 附上 claude 自己写的 stderr 尾部，让"Claude exited: exit status 1"带上真实原因
-		// （API 错误/上下文超限/权限问题等），否则用户只能看到一个裸退出码。
-		if detail := claudeStderrDetail(stderrTail.tail()); detail != "" {
-			return fmt.Errorf("Claude exited: %w %s", err, detail)
+		// 失败原因的选择规则见 claudeRunFailureDetail：CLI 自报的可读原因优先，
+		// 其次是 stderr，最后才是 CLI 只给出枚举时的机器可读值。
+		if detail := claudeRunFailureDetail(recorded.failureResult(), stderrTail.tail()); detail != "" {
+			return fmt.Errorf(claudeExitPrefix+"%w %s", err, detail)
 		}
-		return fmt.Errorf("Claude exited: %w", err)
+		return fmt.Errorf(claudeExitPrefix+"%w", err)
 	}
 	return nil
 }
@@ -681,10 +684,10 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 		case <-time.After(30 * time.Second):
 		}
 		if err == nil && session.hasTurns() {
-			err = errors.New("Claude session exited before completing active turns")
+			err = errors.New("Claude 会话在完成未结束的对话轮次之前就结束了")
 		}
 		if err != nil {
-			err = fmt.Errorf("Claude exited: %w", err)
+			err = fmt.Errorf(claudeExitPrefix+"%w", err)
 		}
 		session.finish(err)
 		close(session.processDone)
@@ -1677,6 +1680,37 @@ func resultError(payload json.RawMessage) error {
 	return errors.New(message)
 }
 
+// claudeCLIErrorCodes 把 Claude CLI 在 result 事件里自报的**机器枚举**翻成可读中文。
+//
+// 这些值是封闭集合（CLI 的 terminal_reason / subtype），不是自由文本——这与 stderr、
+// 上游 API 报文那类"要原样留给用户去搜"的外部输出完全不同，所以可以翻。
+// 表里没有的一律按原样带出：宁可显示一句英文，也不猜一个可能错的中文。
+var claudeCLIErrorCodes = map[string]string{
+	"api_error": "API 调用失败",
+	// 必须含"失败"：2026-09-29 独立复查实测，这一条原来写的是"达到单次运行的最大轮次上限"，
+	// 少了那两个字就过不了直通判据（括号里的 error_max_turns 是英文），用户看到的是
+	// "任务执行失败，请查看任务日志后重试。：Claude 执行出错：达到单次运行的最大轮次上限
+	// （error_max_turns）"—— 既没有日志可查，重试也必然同样撞上限。
+	// 这条不变量有测试守着（TestClaudeCLIErrorCodeTextsAllCarryFailureWord）。
+	"error_max_turns":        "超出单次运行的轮次上限而失败",
+	"error_during_execution": "执行过程中失败",
+}
+
+// claudeCLIErrorCodeText 给机器枚举配一句中文，并把原值留在括号里。
+//
+// 保留原值是有意的：它是用户拿去搜索、也是提 issue 时唯一能被 CLI 作者认出来的东西。
+// 同时这也让结果句子里必然带"失败"二字——mapClaudeAPIError 的调用方要过
+// localizedErrorText 的直通判据，否则用户看到的是"请查看任务日志后重试。：…"。
+// ⚠️ 那句"必然"是**表的不变量**，不是自动成立的：新增映射时必须自己保证，
+// 测试会拦（见上）。
+func claudeCLIErrorCodeText(code string) string {
+	code = strings.TrimSpace(code)
+	if readable, ok := claudeCLIErrorCodes[code]; ok {
+		return readable + "（" + code + "）"
+	}
+	return code
+}
+
 // mapClaudeAPIError translates known Claude CLI error messages into
 // user-friendly Chinese text. Unknown messages pass through unchanged.
 func mapClaudeAPIError(raw string) string {
@@ -1701,7 +1735,9 @@ func mapClaudeAPIError(raw string) string {
 	case strings.Contains(lower, "overloaded"):
 		return "API 服务当前负载过高，请稍后重试。"
 	default:
-		return "Claude 执行出错：" + raw
+		// raw 可能是 CLI 的机器枚举（api_error / error_max_turns），也可能是上游的一整段
+		// 英文报文。前者查表翻成中文并保留原值，后者原样带出——那段英文是用户唯一的线索。
+		return "Claude 执行出错：" + claudeCLIErrorCodeText(raw)
 	}
 }
 
@@ -1807,26 +1843,234 @@ func (c *stderrCapture) tail() string {
 	return strings.Join(c.lines, " ")
 }
 
+// maxAgentDetailBytes 是附加段内容的字节上限。提到包级是因为它和错误前缀的**合计**
+// 受 insightRunErrorMessage 的 240 字节截断约束（见 claudeExitPrefix），测试要能同时
+// 引用这两个值来钉住这条预算，而不是各自抄一份字面量。
+const maxAgentDetailBytes = 180
+
+// insightRunMessageBytes 是 insightRunErrorMessage 对整条错误文案的截断上限
+// （insights.go 里那个 240）。提成包级常量是因为"前缀 + 退出描述 + 详情段"三段的合计
+// 预算要按它反推 —— 散着写三份字面量，改一处不会报错，只会静默把最有用的原因截掉。
+const insightRunMessageBytes = 240
+
+// claudeExitPrefix 是"Claude CLI 进程异常结束"这类错误的固定前缀（本地 / WSL 路径）。
+//
+// 长度与用词都是承重的，两个约束：
+//
+//  1. **必须含"失败"**。localizedErrorText 的直通判据是"含中文 且（含「失败」或没有残留
+//     英文）"。进程退出的错误后面必然跟着 Go 的英文退出描述（"exit status 1"），少了
+//     "失败"两字就过不了直通，用户看到的会是"任务执行失败，请查看任务日志后重试。：…"
+//     ——一句既指不到原因、又建议你重试的误导文案。
+//  2. **长度受 240 字节预算约束**。前缀 + 退出描述 + 详情段必须 ≤ insightRunMessageBytes，
+//     否则 insightRunErrorMessage 的截断（保留开头、切掉末尾）会把最有用的原因末尾切掉。
+//     本形态 22 + 16（"exit status 137 "）+ 195（详情段上限）= 233，余量 7 字节 ——
+//     注意 Windows 上崩溃进程的退出码是十位（"exit status 3221225477"），那时是
+//     22 + 23 + 195 = **恰好 240**，余量为 0（truncateInsightLog 用 `<=`，所以还没被切）。
+//     claude_runner_test.go 的预算断言按 POSIX 的 16 字节算，是偏乐观的一侧。
+const claudeExitPrefix = "Claude 运行失败："
+
+// agentDetailTail 把附加段内容有界到 maxAgentDetailBytes，并保留**末尾**
+// （最有用的报错通常在最后几行）。截断点向前推进到 UTF-8 字符起始字节，避免从
+// 多字节字符（中文）中间截断产生 U+FFFD 替换符。
+func agentDetailTail(clean string) string {
+	return agentDetailTailWithin(clean, maxAgentDetailBytes)
+}
+
+// agentDetailTailWithin 是 agentDetailTail 的可限定长度版本：SSH 那条路径的退出描述
+// 更长（见 sshClaudeExitPrefix），必须把详情段压得更短才装得进同一条预算。
+func agentDetailTailWithin(clean string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(clean) <= max {
+		return clean
+	}
+	start := len(clean) - max
+	for start < len(clean) && (clean[start]&0xC0) == 0x80 {
+		start++
+	}
+	return clean[start:]
+}
+
+// agentDetailText 把一段原始报错文本规整成可展示的附加段内容：去首尾空白、去 ANSI、
+// 脱敏、有界保留末尾。空结果返回空串（调用方据此判断"没有内容可拼"）。
+func agentDetailText(text string) string {
+	return agentDetailTextWithin(text, maxAgentDetailBytes)
+}
+
+// agentDetailTextWithin 同上，但首尾空白/ANSI/脱敏照做，长度改用调用方给的预算。
+func agentDetailTextWithin(text string, max int) string {
+	return agentDetailTailWithin(redactAgentText(stripAnsi(strings.TrimSpace(text))), max)
+}
+
 // claudeStderrDetail 把一次性运行捕获的 stderr 尾部转成错误信息附加段
 // "（stderr：…）"。空捕获返回空串（不拼任何括号）。结果有界且保留末尾
 // （最有用的报错信息通常在后几行），并做脱敏 + 去 ANSI。
-// maxDetailBytes 取 180：加上 "Claude exited: exit status 1（stderr：…）" 前缀后仍能
-// 落入 insightRunErrorMessage 的 240 字符截断（其保留开头、截断末尾）之内，避免
-// 关键的末尾原因被截掉。
+// 长度上限同 claudeRunFailureDetail 的其它分支：加上 claudeExitPrefix 与退出描述
+// （"exit status 1"）后仍能落入 insightRunErrorMessage 的 240 字节截断（其保留开头、
+// 截断末尾）之内，避免关键的末尾原因被截掉。
 func claudeStderrDetail(tail string) string {
-	clean := redactAgentText(stripAnsi(strings.TrimSpace(tail)))
+	return claudeStderrDetailWithin(tail, maxAgentDetailBytes)
+}
+
+// claudeDetailWrapperBytes 是附加段括号的字节数，取**较大的那个**（"（stderr：" + "）" = 15；
+// "（CLI：…）" 是 12）。按预算反推时可用的额度时用大的那个才对 —— 同一段内容走哪个分支
+// 由运行结果决定，调用方事先并不知道。
+const claudeDetailWrapperBytes = len("（stderr：）")
+
+// claudeStderrDetailWithin 是 claudeStderrDetail 的可限定长度版本，budget 算**内容**
+// （括号另计，与 maxAgentDetailBytes 同一口径）。
+func claudeStderrDetailWithin(tail string, budget int) string {
+	clean := agentDetailTextWithin(tail, budget)
 	if clean == "" {
 		return ""
 	}
-	const maxDetailBytes = 180
-	if len(clean) > maxDetailBytes {
-		start := len(clean) - maxDetailBytes
-		// 向后推进到下一个 UTF-8 字符起始字节，避免从多字节字符（中文）中间
-		// 截断产生 U+FFFD 替换符。
-		for start < len(clean) && (clean[start]&0xC0) == 0x80 {
-			start++
-		}
-		clean = clean[start:] // 保留末尾（含关键报错）
-	}
 	return "（stderr：" + clean + "）"
+}
+
+// claudeResultErrorSink 包一层调用方的 sink，记下 CLI 在 stream-json 的 result 事件里
+// 自报的失败。API 级失败（上游 4xx/5xx、限流、上下文超限、单趟上限）只走 stdout 的
+// 事件流，stderr 往往一个字节都没有——失败时若不从这里取，用户最终只能看到裸的
+// 退出描述（claudeExitPrefix + "exit status 1"）。事件本身照常转发，调用方无感。
+type claudeResultErrorSink struct {
+	AgentRunSink
+	mu      sync.Mutex
+	failure json.RawMessage
+}
+
+func (s *claudeResultErrorSink) Event(eventType string, payload json.RawMessage) {
+	if eventType == "result" {
+		if _, isFailure := decodeClaudeResultError(payload); isFailure {
+			s.mu.Lock()
+			// 覆盖式记录：一次运行通常只有一个终结 result；真出现多个时以最后一个为准
+			// （更接近终止状态）。成功收尾不会进这里，也就不会污染失败信息。
+			s.failure = append(json.RawMessage(nil), payload...)
+			s.mu.Unlock()
+		}
+	}
+	s.AgentRunSink.Event(eventType, payload)
+}
+
+// failureResult 返回最近一次"自报失败"的 result 事件原文，没有则为 nil。
+func (s *claudeResultErrorSink) failureResult() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failure
+}
+
+// 下面两个方法让包装层对调用方 sink 的**可选能力**保持透明。
+//
+// readOutput 会对 sink 做可选接口断言（assistantMessageIDSetter / assistantDeltaSink，
+// 见 handleClaudePartialMessage），断言失败时那两个分支被**静默跳过**——包装层若不显式
+// 实现并转发，"增量输出 / 采纳 assistant message id"这类能力就被无声吞掉。内层 sink 没
+// 实现对应能力时转发目标也不存在：两个调用点都没有 else 分支，故"什么都不做"与原行为
+// （断言失败跳过）等价。
+//
+// 维护提示：若 readOutput 里又出现新的可选接口断言，必须在这里同步补一个转发方法。
+func (s *claudeResultErrorSink) SetAssistantMessageID(messageID string) {
+	if setter, ok := s.AgentRunSink.(assistantMessageIDSetter); ok {
+		setter.SetAssistantMessageID(messageID)
+	}
+}
+
+func (s *claudeResultErrorSink) AssistantDelta(delta string) {
+	if target, ok := s.AgentRunSink.(assistantDeltaSink); ok {
+		target.AssistantDelta(delta)
+	}
+}
+
+// claudeResultError 是 result 事件里与失败相关的字段。
+type claudeResultError struct {
+	Subtype        string
+	TerminalReason string
+	APIErrorStatus *int
+	Result         string
+}
+
+// decodeClaudeResultError 解析 result 事件；非失败（is_error 为假或缺失、JSON 非法）
+// 时第二个返回值为假。
+func decodeClaudeResultError(payload json.RawMessage) (claudeResultError, bool) {
+	var raw struct {
+		IsError        bool   `json:"is_error"`
+		Subtype        string `json:"subtype"`
+		TerminalReason string `json:"terminal_reason"`
+		APIErrorStatus *int   `json:"api_error_status"`
+		Result         string `json:"result"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &raw) != nil || !raw.IsError {
+		return claudeResultError{}, false
+	}
+	return claudeResultError{
+		Subtype:        raw.Subtype,
+		TerminalReason: raw.TerminalReason,
+		APIErrorStatus: raw.APIErrorStatus,
+		Result:         raw.Result,
+	}, true
+}
+
+// claudeResultMachineDetail 把机器可读的失败原因转成附加段。terminal_reason 与 subtype
+// 都可能是**无害值**（实测 API 400 那次的 subtype 正是 "success"，而 "completed" 也是
+// terminal_reason 的常态），这类值当失败原因展示只会误导，必须跳过；两者都取不到
+// 有用值时返回空串（宁可不拼，也不给用户一句"completed"）。
+func claudeResultMachineDetail(reported claudeResultError) string {
+	return claudeResultMachineDetailWithin(reported, maxAgentDetailBytes)
+}
+
+// claudeResultMachineDetailWithin 是上面那条的可限定长度版本，budget 算**内容**
+// （括号另计）。
+func claudeResultMachineDetailWithin(reported claudeResultError, budget int) string {
+	reason := ""
+	for _, candidate := range []string{reported.TerminalReason, reported.Subtype} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" && candidate != "success" && candidate != "completed" {
+			reason = candidate
+			break
+		}
+	}
+	if reason == "" {
+		return ""
+	}
+	if reported.APIErrorStatus != nil {
+		reason = fmt.Sprintf("HTTP %d %s", *reported.APIErrorStatus, reason)
+	}
+	clean := agentDetailTextWithin(reason, budget)
+	if clean == "" {
+		return ""
+	}
+	return "（CLI：" + clean + "）"
+}
+
+// claudeRunFailureDetail 选出一条用于错误信息的失败原因附加段。优先级：
+//  1. CLI 在 result 里自报的**可读**原因（如 "API Error: 400 …"）——最有用；
+//  2. stderr 尾部——CLI 没给可读原因时，它通常比裸枚举更有信息量
+//     （真崩溃、启动失败、远端报错都只出现在这里）；
+//  3. CLI 只给出枚举时的机器可读值（api_error / error_max_turns，可能带 HTTP 状态码）。
+//
+// 三者都取不到时返回空串，调用方保持裸错误。failure 为 nil（没收到 result 事件）或
+// stderr 为空串都属正常输入。
+func claudeRunFailureDetail(failure json.RawMessage, stderr string) string {
+	return claudeRunFailureDetailWithin(maxAgentDetailBytes, failure, stderr)
+}
+
+// claudeRunFailureDetailWithin 同上，但把附加段的**内容**收窄到 budget 字节
+// （括号另计，口径同 maxAgentDetailBytes —— 这一点很容易写错：把 budget 当成"整段"
+// 会让本地路径的 CLI 分支从 192 悄悄缩到 180，而那条路径的字节预算是有测试钉着的）。
+//
+// 存在的理由：SSH 那条路径的前缀与退出描述都更长（见 sshClaudeExitPrefix），沿用本地
+// 那 180 字节的内容上限会超出 insightRunMessageBytes 的预算 —— 外层截断保留开头、切掉末尾，
+// 被切掉的恰好是这里最想保住的报错原文。
+func claudeRunFailureDetailWithin(budget int, failure json.RawMessage, stderr string) string {
+	reported, selfReported := decodeClaudeResultError(failure)
+	if selfReported {
+		if readable := agentDetailTextWithin(reported.Result, budget); readable != "" {
+			return "（CLI：" + readable + "）"
+		}
+	}
+	if detail := claudeStderrDetailWithin(stderr, budget); detail != "" {
+		return detail
+	}
+	if !selfReported {
+		return ""
+	}
+	return claudeResultMachineDetailWithin(reported, budget)
 }

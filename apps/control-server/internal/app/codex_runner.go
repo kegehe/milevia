@@ -22,6 +22,11 @@ import (
 
 const maxCodexDiagnosticBytes = 4 * 1024
 
+// codexExitPrefix 是"Codex CLI 进程异常结束"这类错误的固定前缀。
+// 与 claudeExitPrefix 同理：必须含"失败"才过得了 localizedErrorText 的直通判据
+// （后面必然跟着 Go 的英文退出描述），长度也受同一份 240 字节预算约束。
+const codexExitPrefix = "Codex 运行失败："
+
 const codexAdditionalStdinNotice = "Reading additional input from stdin..."
 
 var (
@@ -269,7 +274,7 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	go func() { defer wg.Done(); readCodexStderr(stderr, sink) }()
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("Codex exited: %w", err)
+		return fmt.Errorf(codexExitPrefix+"%w", err)
 	}
 	return nil
 }

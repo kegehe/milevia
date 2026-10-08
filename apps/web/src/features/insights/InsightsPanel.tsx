@@ -97,6 +97,8 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   const [showInvalidated, setShowInvalidated] = useState(false);
   const [showDismissed, setShowDismissed] = useState(false);
   const [showRejected, setShowRejected] = useState(false);
+  // 方案F：分析设置区可折叠（默认展开——刚进页面先看到引擎/方向再点开始最顺）。
+  const [showSettings, setShowSettings] = useState(true);
   const [verifyAllBusy, setVerifyAllBusy] = useState(false);
   const [addAllBusy, setAddAllBusy] = useState(false);
   // 「全部添加为任务」的确认框：批量转换会一次硬删全部建议，误触成本高，需确认。
@@ -489,6 +491,8 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   const running = scan?.status === "running";
   const failed = scan?.status === "failed";
   const counts = insightFindingCounts(findings);
+  // 横幅统计 chip 用：高严重度条数（severity 可能是线上原值，过一遍归一）。
+  const highCount = findings.filter((f) => normalizeInsightSeverity(f.severity) === "high").length;
   const sorted = sortFindings(findings);
   const visible = filterFindingsByType(sorted, filter);
   // 「全选」的作用域 = 当前筛选下的可见有效建议。选择集里可能还有折叠区（已失效 / 已忽略）
@@ -508,30 +512,69 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
 
   return (
     <div className="insights">
-      <header className="insights-head">
-        <div className="insights-heading">
-          <h2>优化建议</h2>
-          <p>AI 主动通读项目，找出可优化点、可新增功能、已有 bug 与样式问题；每条在报告时已独立核实，并可随时对既有建议再验证，确认其在当前代码里是否仍然成立。</p>
+      {/* 方案F：深绿头版横幅——标题/统计 chip/主操作都在横幅上，深底只承载「判断 + 主行动」，
+          排障素材仍留在下方面板（「如实」不等于「全摊开」）。 */}
+      <header className="insights-banner">
+        <div className="insights-banner-in">
+          <div className="insights-banner-copy">
+            <h2>优化建议</h2>
+            <p>AI 主动通读项目，找出可优化点、可新增功能、已有 bug 与样式问题；每条在报告时已独立核实，并可随时对既有建议再验证，确认其在当前代码里是否仍然成立。</p>
+            {hasScan && (
+              <div className="insights-banner-stats">
+                <span className="insights-stat-chip"><b>{openCount}</b> 条有效</span>
+                {scan && scan.findingsCount > 0 && <span className="insights-stat-chip"><b className="up">+{scan.findingsCount}</b> 本次新增</span>}
+                {highCount > 0 && <span className="insights-stat-chip"><b>{highCount}</b> 条高严重度</span>}
+                {focusLabel && <span className="insights-stat-chip">{focusLabel}</span>}
+              </div>
+            )}
+          </div>
+          <div className="insights-banner-acts">
+            {running ? (
+              <button
+                type="button"
+                className="insight-stop"
+                disabled={busy}
+                onClick={() => void cancelScan("scan")}
+                title="停止本次分析，已收集的结果不会保留，可随时重新发起"
+              >
+                {busy ? "正在停止…" : "停止分析"}
+              </button>
+            ) : (
+              <button type="button" className="insight-banner-primary" disabled={busy} onClick={() => void startScan()}>
+                开始分析
+              </button>
+            )}
+            <button
+              type="button"
+              className="insight-banner-ghost"
+              onClick={() => void verifyAll()}
+              disabled={busy || verifyAllBusy || anyVerifying || openCount === 0}
+              title="调用 AI 复核当前全部有效建议是否仍然成立（项目可能已被其它任务迭代修改；分析进行中也可以发起，两者共用凭据时后端会先排队等额度）"
+            >
+              {verifyAllBusy || anyVerifying ? "正在验证…" : "验证全部建议"}
+            </button>
+          </div>
         </div>
-        {running ? (
-          <button
-            type="button"
-            className="insight-stop"
-            disabled={busy}
-            onClick={() => void cancelScan("scan")}
-            title="停止本次分析，已收集的结果不会保留，可随时重新发起"
-          >
-            {busy ? "正在停止…" : "停止分析"}
-          </button>
-        ) : (
-          <button type="button" className="primary" disabled={busy} onClick={() => void startScan()}>
-            开始分析
-          </button>
-        )}
       </header>
+
+      {/* 浮层白面板：上缘压住横幅（负 margin），所有内容都住在这张卡里 */}
+      <div className="insights-panel">
 
       {!running && (
         <section className="insights-pickers" aria-label="选择分析方向">
+          <div className="insights-pickers-head">
+            <span className="insights-pickers-title">分析设置</span>
+            <button
+              type="button"
+              className="insights-pickers-toggle"
+              onClick={() => setShowSettings((v) => !v)}
+              aria-expanded={showSettings}
+            >
+              {showSettings ? "收起 ▴" : "展开 ▾"}
+            </button>
+          </div>
+          {showSettings && (
+          <div className="insights-pickers-body">
           <div className="insights-picker">
             <span className="insights-picker-label">分析引擎</span>
             <div className="insights-agent-options" role="radiogroup" aria-label="选择分析引擎">
@@ -585,6 +628,8 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
               ))}
             </div>
           </div>
+          </div>
+          )}
         </section>
       )}
 
@@ -665,9 +710,8 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
       {hasScan && !failed && (
         <>
           <div className="insights-summary">
+            {/* 有效数是动作行的锚（「全部…」都作用于它）；新增/聚焦已在横幅 chip 上，不再重复。 */}
             <span>共 {openCount} 条有效建议</span>
-            {scan && scan.findingsCount > 0 && <span className="insights-new">本次新增 {scan.findingsCount} 条</span>}
-            {focusLabel && <span className="insights-focus">{focusLabel}</span>}
             {suppressed > 0 && <span className="insights-suppressed">已忽略 {suppressed} 条此前报告过的建议</span>}
             {scan && scan.rejected && scan.rejected.length > 0 && (
               <button
@@ -689,15 +733,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
               >
                 {addAllBusy ? "正在添加…" : "全部添加为任务"}
               </button>
-              <button
-                type="button"
-                className="insight-verify-all"
-                onClick={() => void verifyAll()}
-                disabled={busy || verifyAllBusy || anyVerifying || openCount === 0}
-                title="调用 AI 复核当前全部有效建议是否仍然成立（项目可能已被其它任务迭代修改；分析进行中也可以发起，两者共用凭据时后端会先排队等额度）"
-              >
-                {verifyAllBusy || anyVerifying ? "正在验证…" : "验证全部"}
-              </button>
+              {/* 「验证全部」已上移到横幅（与「开始分析」同列）；这里保留批量与折叠区开关。 */}
               <button
                 type="button"
                 className={`insight-bulk-toggle${selectMode ? " active" : ""}`}
@@ -895,6 +931,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
           )}
         </>
       )}
+      </div>
 
       {confirmBulkDelete === "selected" && createPortal(
         <ConfirmDialog
@@ -1137,7 +1174,11 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
       className={`insight-card${invalidated ? " invalidated" : ""}${dismissed ? " dismissed" : ""}${selectable ? " selectable" : ""}${selectable && selected ? " selected" : ""}`}
       onClick={selectable ? (event) => { if (isCardControl(event.target)) return; onToggleSelect?.(); } : undefined}
     >
-      {/* 复选框与类型徽标同一行：新增一个网格行会让每张卡凭空长高一行（任务看板批量管理踩过同一个坑）。 */}
+      {/* 方案F 骨架：类型色「图标章」在左，正文在右。复选框与类型徽标同一行
+          （新增一个网格行会让每张卡凭空长高一行，任务看板批量管理踩过同一个坑）；
+          徽标只留文字——图标已由左侧的章承担，同一事实不在卡片上画两遍。 */}
+      <span className={`insight-stamp insight-type-${type}`} aria-hidden="true"><TypeIcon type={type} /></span>
+      <div className="insight-card-body">
       <div className="insight-card-top">
         {selectable && (
           <input
@@ -1149,7 +1190,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
             title={selected ? "取消选择" : "选择此建议"}
           />
         )}
-        <span className={`insight-card-type insight-type-${type}`}><TypeIcon type={type} />{insightTypeLabels[type]}</span>
+        <span className={`insight-card-type insight-type-${type}`}>{insightTypeLabels[type]}</span>
       </div>
       <b>{finding.title}</b>
       <p>{finding.summary}</p>
@@ -1197,6 +1238,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
           <button type="button" className="insight-action" onClick={() => onDismissed(true)} disabled={saving || isVerifying} title="不再提示：此建议移入已忽略列表，后续分析也不再上报同一问题">不再提示</button>
         )}
         <button type="button" className="insight-action danger" onClick={() => setConfirming(true)} disabled={saving} title="删除此建议">删除</button>
+      </div>
       </div>
       {confirming && createPortal(
         <ConfirmDialog

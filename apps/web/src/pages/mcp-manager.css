@@ -1,0 +1,77 @@
+/* MCP 连接管理页（路由 `/mcp-manager`）—— 独立页面壳（方案 A · 单栏分节长页）。
+   配色与本项目其它页面共用同一套（#f3f8f4 底 / #19332c 字 / #cfe0d6 边框 / #2c7567 强调），
+   中性色取 style.css 里已有的带绿灰（次文字 #31594f / 说明 #4c6b60 / 安静 #748b81 /
+   注脚 #809188），别引入暖灰。
+
+   页面骨架与 Cli 管理页同构：顶栏（返回 / 标题 / 高级设置切换）＋
+   1224px 内容栏里从上到下「我的服务 → 服务目录 → 高级设置（默认收起）」。
+   弹窗内的卡片 / 按钮 / 表单样式仍来自 style.css 的 ssh-* / mcp-*；这里只补两类规则：
+   ① 原先作用域限定在 `.ssh-manager-dialog` 里的规则，页面上要有等价版本（见 style.css
+   里已并列补上的 `.mcp-shell` 选择器）；
+   ② 页面自己的分节头、栅格（连接卡两列 / 目录卡三列）与空态。 */
+
+.mcp-shell { display: flex; flex-direction: column; min-height: 100vh; background: #f3f8f4; color: #19332c; }
+
+/* 顶栏：内容左边距与内容栏对齐（居中容器里的标题歪在一边很显眼，同 cli-tools-bar）。 */
+.mcp-shell .mcp-bar { display: flex; align-items: center; gap: 12px; padding: 14px max(20px, calc((100% - 1224px) / 2)); border-bottom: 1px solid #e3ece7; }
+.mcp-title { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: .01em; }
+.mcp-bar-actions { margin-left: auto; display: flex; gap: 8px; }
+
+.mcp-body { width: min(1224px, 100% - 48px); margin: 0 auto; padding: 6px 0 32px; }
+
+/* 页面级错误条：ssh-error 的留白是按弹窗（左右 20px）写的，页面里要通栏。 */
+.mcp-shell .mcp-error { margin: 14px 0 0; }
+
+/* ── 分节：标题平铺在底色上，内容才是卡片 ─────────────────────────────────── */
+.mcp-section { margin-top: 26px; }
+.mcp-section > header { margin-bottom: 12px; }
+.mcp-section > header h2 { margin: 0; display: flex; align-items: center; gap: 8px; color: #19332c; font-size: 18px; font-weight: 700; }
+.mcp-count { min-width: 22px; padding: 1px 9px; border-radius: 99px; color: #4c6b60; background: #f2f5f3; font-size: 11.5px; font-weight: 700; text-align: center; }
+
+/* 我的服务卡片两列；窄屏回落单列。 */
+.mcp-shell .mcp-conn-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* 服务目录：分类标题 + 三列卡片。
+   卡片内部左右分布：左边是图标 + 服务名 + 一句说明 + 「要准备什么」，
+   右边是「连接」按钮（垂直居中）—— 按钮不再单独占一行。 */
+.mcp-shell .mcp-preset-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
+.mcp-shell .mcp-preset-card { display: flex; align-items: center; gap: 12px; padding: 15px 16px; }
+.mcp-preset-main { display: grid; flex: 1; min-width: 0; gap: 6px; }
+.mcp-preset-main > header { display: flex; align-items: center; gap: 8px; }
+.mcp-preset-main > header b { overflow: hidden; color: #254b40; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+.mcp-preset-main > p { margin: 0; color: #4c6b60; font-size: 12px; line-height: 1.5; }
+.mcp-preset-action { display: flex; flex: none; align-items: center; }
+.mcp-preset-action .primary { min-height: 32px; }
+
+/* 官方品牌图标：<img> 在牌位里块状排布，避免基线空隙。 */
+.mcp-service-mark img { display: block; }
+.ssh-dialog-mark img { display: block; }
+
+/* 连接卡的动作按钮：弹窗时代是 30px 图标方块（「授权/停用/启用」两个字会竖排折行）。
+   页面上按钮带文字，宽度放开、文字不折行；纯图标按钮（管理/删除）靠 padding 保持可点。
+   font-size 在这里声明 —— style.css 的 .mcp-test-button 规则只剩弹窗半边。 */
+.mcp-shell .ssh-connection-actions .ssh-action-button { width: auto; min-width: 30px; height: 30px; padding: 0 10px; white-space: nowrap; font-size: 11px; font-weight: 700; }
+
+/* 空态：卡片式、带下一步（本项目约定：有下一步动作的空态禁止「一行灰字」）。 */
+.mcp-empty { display: grid; gap: 6px; justify-items: start; border: 1px dashed #c8ddd2; border-radius: 12px; padding: 18px 20px; background: #fff; }
+.mcp-empty b { font-size: 14px; color: #294e43; }
+.mcp-empty span { color: #4c6b60; font-size: 12.5px; }
+
+/* 读失败：与「真的没有」观感必须分开（红调 + 重试），消息文本由页首错误条承载。 */
+.mcp-read-fail { border: 1px solid #f2c8c0; border-radius: 12px; background: #fdf3f1; }
+.mcp-read-fail b { color: #a4462f; }
+.mcp-read-fail button { margin-top: 2px; }
+
+/* 高级设置（默认收起）：与常规分节同构，内容里的 ssh-form-section 维持弹窗里的卡片语言。 */
+.mcp-shell .mcp-advanced > .ssh-form-section { border-left: 3px solid #d3d1c7; }
+
+/* 窄屏：卡片栅格逐级回落单列。 */
+@media (max-width: 1000px) {
+  .mcp-shell .mcp-preset-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .mcp-shell .mcp-conn-list { grid-template-columns: 1fr; }
+}
+@media (max-width: 560px) {
+  .mcp-shell .mcp-preset-grid { grid-template-columns: 1fr; }
+}

@@ -17,6 +17,8 @@ import "../run.css";
 import { TaskQueue } from "../features/tasks/TaskQueue";
 import { ProjectAiConfigDialog } from "../features/run/ProjectAiConfigDialog";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { AgentLogo } from "../components/AgentLogo";
+import { agentLogoKey } from "../lib/cli-tools-view";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useUIPreferences, type AppPreferences } from "../stores/useUIPreferences";
 import type {
@@ -50,7 +52,9 @@ import {
 } from "../lib/conversation-tabs";
 import { readConversationPanels, writeConversationPanels, type ConversationPanelKey, type ConversationPanelsState } from "../lib/conversation-panels";
 import { copyToClipboard } from "../lib/clipboard";
+import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
+import { ExternalLink } from "../components/ExternalLink";
 
 function requiresForceStop(cause: unknown): boolean {
   return typeof cause === "object" && cause !== null && (cause as { code?: unknown }).code === "active_runs_present";
@@ -84,24 +88,13 @@ function NewConversationDialogIcon() {
   return <svg className="new-conversation-dialog-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 4.5h8.7l4.3 4.3v9.7a1.5 1.5 0 0 1-1.5 1.5H7a1.5 1.5 0 0 1-1.5-1.5v-14Z" /><path d="M14 4.5v4.6h4.5M12 11v5M9.5 13.5h5" /></svg>;
 }
 
-// 工具图标：按工具 ID 逐个给出图形（SVG 是纯前端资产，不可能由服务端下发，
-// 所以这里必然有一份按工具的映射），但**兜底是一个中性图形**，
-// 绝不能落到某个已知工具的图标上 —— 那会让新工具看起来像是 Claude。
+// 工具图标：优先**官方产品图标**（判据是 `lib/cli-tools-view.ts` 的 `agentLogoKey` ——
+// 按工具 ID 白名单，与 Cli管理页同一份，不在这里再认一遍）。白名单之外回落到
+// **中性图形**，绝不能落到某个已知工具的图标上 —— 那会让新工具看起来像是 Claude。
 function AgentToolIcon({ agent }: { agent: AgentID }) {
-  if (agent === "claude-code") return <svg className="new-conversation-agent-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.8c4.5 0 7.5 3.1 7.5 7.2 0 4.7-3.5 8-8.2 8.4l-3.8 1.8.8-3.3C5.9 16.6 4.5 14.1 4.5 11c0-4.1 3-7.2 7.5-7.2Z" /><path d="M8.5 11.5h7M8.5 14.5h4.4" /></svg>;
-  if (agent === "codex") return <svg className="new-conversation-agent-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.1 4.5h7.8l4.1 7.5-4.1 7.5H8.1L4 12l4.1-7.5Z" /><path d="m9.2 9.3 2.8 2.7-2.8 2.7M14.2 14.7h1.5" /></svg>;
+  const logo = agentLogoKey(agent);
+  if (logo) return <AgentLogo logo={logo} size={18} />;
   return <svg className="new-conversation-agent-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 20 8v8l-8 4.5L4 16V8l8-4.5Z" /><path d="M12 3.5V12m0 0 8-4m-8 4-8-4" /></svg>;
-}
-
-function ConversationPermissionIcon({ mode }: { mode: PermissionMode }) {
-  if (mode === "read_only") return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5" /><path d="m14.2 14.2 4.3 4.3M8.5 10.5h4" /></svg>;
-  if (mode === "workspace_write") return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 6.5h15v11h-15zM8.5 10.5 11 13l-2.5 2.5M13.5 15.5h2.5" /></svg>;
-  if (mode === "approval_required") return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.8 19 6.5v5.1c0 4.2-2.8 7.4-7 8.9-4.2-1.5-7-4.7-7-8.9V6.5l7-2.7Z" /><path d="M12 8.5v3.8M12 16h.01" /></svg>;
-  return <svg className="new-conversation-permission-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.8 19 6.5v5.1c0 4.2-2.8 7.4-7 8.9-4.2-1.5-7-4.7-7-8.9V6.5l7-2.7Z" /><path d="m8.8 12 2.1 2.1 4.4-4.4" /></svg>;
-}
-
-function ProfileSelectIcon() {
-  return <svg className="new-conversation-profile-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h14v13H5zM8 9h8M8 12h8M8 15h4" /></svg>;
 }
 
 function ProjectConfigIcon() {
@@ -513,7 +506,10 @@ function ComposerRunnerInfo({ runnerID, agentID, conversationID, modelOverride, 
     // 手动检查先清空旧结果以便 UI 反映"检查中"；静默检查保留旧结果，避免后台失败时抹掉已有结论。
     if (!silent) setUpdateInfo(null);
     try {
-      const result = await api<CheckUpdateResult>(`/api/runners/${runnerID}/agents/${encodeURIComponent(agentID)}/check-update`, { method: "POST" });
+      // ⚠️ 带 force：这一页**自己**有一套检查窗口（localStorage 记时间戳，10 分钟内不自动
+      // 复查、之后每 30 分钟静默复查）。服务端若再缓存一层，用户点「检查更新」就会拿到
+      // 那份缓存读数 —— 而这句话的意思恰恰是"现在去查一次"。
+      const result = await api<CheckUpdateResult>(`/api/runners/${runnerID}/agents/${encodeURIComponent(agentID)}/check-update?force=true`, { method: "POST" });
       setUpdateInfo(result);
       // 记录检查时间戳，供自动检查的缓存窗口使用。
       try { window.localStorage.setItem(cacheKey, String(Date.now())); } catch { /* localStorage 可能在隐私模式下不可用 */ }
@@ -781,8 +777,8 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
   const catalogState = useAgentCatalogState();
   const catalogEntries = catalogState.entries;
   // 对话只能选「已实现 AgentRunner、可真正运行」的工具。目录里还有"已收录但尚未接通
-  // 对话运行"的工具（如 CodeBuddy，runnableInProject=false）：它们出现在管理页可安装
-  // 可登录，但**不在新建会话里被列为可选项**，避免出现一个点了跑不起来的卡片。
+  // 对话运行"的工具（runnableInProject=false）：它们出现在管理页可安装可登录，但
+  // **不在新建会话里被列为可选项**，避免出现一个点了跑不起来的卡片。
   // 用 useMemo 固定引用：filter 每次渲染生成新数组，若直接进下方 useEffect 依赖会造成
   // 每次渲染都重跑那个"选默认 Agent"的 effect（值相同 setState 会跳过，但仍是无效负
   // 载，且横竖与目录稳定性无关）。
@@ -826,6 +822,9 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
           {fallbackReason && <p className="new-conversation-notice">{fallbackReason}</p>}
           <section className="new-conversation-section" aria-labelledby="new-conversation-agent-label">
             <div className="new-conversation-section-heading"><div><span>01</span><h3 id="new-conversation-agent-label">选择 CLI 工具</h3></div></div>
+            {/* 方案 B（2026-09-24，与手机端新会话同一套语言）：三列徽标大卡，图形主导。
+                副标题 = 版本 + 厂商；就绪/不可用仍是一行独立读数（不可用必须显式说，
+                不能只靠卡片变灰）；「默认」角标挪到左上，右上让给选中勾。 */}
             <div className="new-conversation-agent-grid" role="radiogroup" aria-label="CLI 工具">
               {runnableAgentEntries.map((entry) => {
                 const agent = catalogAgentID(entry);
@@ -833,21 +832,43 @@ function NewConversationDialog({ runnerID, defaults, defaultsLoading, defaultsEr
                 const selected = agentId === agent;
                 const status = runnerAgentStatus(runner, agent);
                 const name = entry.name;
-                const subtitle = formatToolVersion(status?.version) || `${entry.vendor} CLI`;
+                const subtitle = [formatToolVersion(status?.version), entry.vendor].filter(Boolean).join(" · ");
                 return <button key={agent} type="button" className={`new-conversation-agent-card${selected ? " selected" : ""}`} role="radio" aria-checked={selected} disabled={!available || creating} title={!available ? status?.reason || `${name} 不可用` : name} onClick={() => selectAgent(agent)}>
-                  <span className={`new-conversation-agent-mark ${agent}`}><AgentToolIcon agent={agent} /></span><span className="new-conversation-agent-copy"><b>{name}</b><small>{subtitle}</small></span>{agent === defaults.defaultAgentId && <em>默认</em>}<span className={`new-conversation-agent-state ${available ? "ready" : "unavailable"}`}>{available ? "已就绪" : "不可用"}</span>
+                  <span className={`new-conversation-agent-mark ${agent}`}><AgentToolIcon agent={agent} /></span>
+                  <span className="new-conversation-agent-copy"><b>{name}</b><small>{subtitle}</small></span>
+                  <span className={`new-conversation-agent-state ${available ? "ready" : "unavailable"}`}>{available ? "已就绪" : "不可用"}</span>
+                  {selected && <i className="new-conversation-agent-check" aria-hidden="true">✓</i>}
+                  {agent === defaults.defaultAgentId && <em className="new-conversation-agent-default">默认</em>}
                 </button>;
               })}
             </div>
             {runnableAgentEntries.length > 0 && !runnableAgentEntries.some((entry) => isAgentAvailable(catalogAgentID(entry))) && <div className="new-conversation-no-tool"><p className="new-conversation-error inline">当前没有可用的 CLI 工具。{runnerError || unavailableReason || "请先安装并登录，再回来创建会话。"}</p><button type="button" className="new-conversation-manage-tools" onClick={() => { close(); navigate("/cli-tools"); }}>去管理 CLI 工具</button></div>}
           </section>
-          {availableProfiles.length > 0 && <label className="new-conversation-profile-select"><span><ProfileSelectIcon />配置档案 <small>可选</small></span><select value={profileID} disabled={creating} onChange={(event) => setProfileID(event.target.value)}><option value="">使用 CLI 当前登录配置</option>{availableProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.model ? ` (${profile.model})` : ""}</option>)}</select></label>}
           <section className="new-conversation-section new-conversation-permission-section" aria-labelledby="new-conversation-permission-label">
             <div className="new-conversation-section-heading"><div><span>02</span><h3 id="new-conversation-permission-label">执行权限</h3></div><small>{selectedAgentName}</small></div>
-            <div className="new-conversation-permission-list" role="radiogroup" aria-label={`${selectedAgentName} 执行权限`}>
-              {permissionOptions.map((option) => <button key={option.mode} type="button" className={`new-conversation-permission-card${permissionMode === option.mode ? " selected" : ""}${option.mode === "full_control" ? " elevated" : ""}`} role="radio" aria-checked={permissionMode === option.mode} disabled={creating} onClick={() => setPermissionMode(option.mode)}><span className="new-conversation-permission-mark"><ConversationPermissionIcon mode={option.mode} /></span><span><b>{option.title}</b><small>{option.detail}</small></span><i aria-hidden="true"></i></button>)}
+            {/* 权限从纵向卡列表改为分段控件（与手机端同语言）：档位少（2~3）时
+                分段比逐档卡片更轻；每档的说明收敛成分段下方的一行提示，选中哪档念哪档。 */}
+            <div className="new-conversation-permission-seg" role="radiogroup" aria-label={`${selectedAgentName} 执行权限`}>
+              {permissionOptions.map((option) => <button key={option.mode} type="button" role="radio" aria-checked={permissionMode === option.mode}
+                className={permissionMode === option.mode ? "active" : ""}
+                title={option.detail} disabled={creating} onClick={() => setPermissionMode(option.mode)}>{option.title}</button>)}
             </div>
+            <p className="new-conversation-permission-hint">{permissionOptions.find((option) => option.mode === permissionMode)?.detail}</p>
           </section>
+          {/* 配置档案（胶囊行，方案 1）：所有档案一眼可见、选哪个点哪个，不再藏进下拉。
+              档案是低频高级选项，整行放在权限之后、创建按钮之前。 */}
+          {availableProfiles.length > 0 && <div className="new-conversation-profile-chips" role="radiogroup" aria-label="配置档案（可选）">
+            <span className="new-conversation-profile-chips-label">配置档案<small>可选</small></span>
+            <button type="button" role="radio" aria-checked={profileID === ""} className={`new-conversation-profile-chip${profileID === "" ? " selected" : ""}`} disabled={creating} onClick={() => setProfileID("")}>
+              <span className="new-conversation-profile-dot" aria-hidden="true"></span><b>CLI 当前登录配置</b>
+            </button>
+            {availableProfiles.map((profile) => <button key={profile.id} type="button" role="radio" aria-checked={profileID === profile.id}
+              className={`new-conversation-profile-chip${profileID === profile.id ? " selected" : ""}`} disabled={creating}
+              onClick={() => setProfileID(profile.id)}>
+              <span className="new-conversation-profile-dot" aria-hidden="true"></span><b>{profile.name}</b>
+              {profile.model && <span className="new-conversation-profile-model">{profile.model}</span>}
+            </button>)}
+          </div>}
         </>}
       </div>
       <footer><span className="new-conversation-summary">{capabilitiesLoading || defaultsError ? "" : `${selectedAgentName} · ${permissionOptions.find((option) => option.mode === permissionMode)?.title || "默认权限"}`}</span><button className="secondary" type="button" disabled={creating} onClick={close}>取消</button><button className="primary" type="button" disabled={Boolean(defaultsError) || capabilitiesLoading || creating || !isAgentAvailable(agentId)} onClick={() => void submit()}>{creating ? "创建中..." : "创建会话"}</button></footer>
@@ -880,7 +901,7 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail }: { mess
     copiedTimer.current = window.setTimeout(() => setCopied(false), 1_500);
   };
 
-  return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div>{isUser && <button className={`message-copy${copied ? " copied" : ""}`} type="button" title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()} />}</article>;
+  return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div><button className={`message-copy${copied ? " copied" : ""}`} type="button" title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()} /></article>;
 });
 
 const SystemCard = memo(function SystemCard({ system }: { system: SystemItem }) {
@@ -899,11 +920,11 @@ const ErrorCard = memo(function ErrorCard({ item, projectId, onViewTask }: { ite
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   const label = alt?.trim() || "未命名图片";
   const externalImage = src && /^https:\/\//i.test(src) ? src : "";
-  return <span className="markdown-image-reference" role="note">图片：{externalImage ? <a href={externalImage} target="_blank" rel="noreferrer">{label}</a> : label}</span>;
+  return <span className="markdown-image-reference" role="note">图片：{externalImage ? <ExternalLink href={externalImage} target="_blank" rel="noreferrer">{label}</ExternalLink> : label}</span>;
 }
 
 const Markdown = memo(function Markdown({ content }: { content: string }) {
-  return <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>, img: MarkdownImage }}>{content}</ReactMarkdown>;
+  return <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <ExternalLink href={href} target="_blank" rel="noreferrer">{children}</ExternalLink>, img: MarkdownImage }}>{content}</ReactMarkdown>;
 });
 
 // MCP 工具名形如 mcp__<server>__<tool>；拆出可读的两段，避免界面直接显示原始标识。
@@ -1224,6 +1245,11 @@ export default function ConversationPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
 
+  // 页面可见性：窗口最小化或切到后台时返回 false，用来给本页的两处轮询加闸。
+  // 后台标签页会把 setInterval 限流到 ≥1 分钟，隐藏期间的轮询既不准也白费请求与电量。
+  // 实时性由 WebSocket 兜底（它不受定时器限流影响），回到前台时各效果会重跑并立即补一次。
+  const documentVisible = useDocumentVisible();
+
   useEffect(() => {
     if (!conversation) {
       setConversationWorkspaces([]);
@@ -1412,7 +1438,7 @@ export default function ConversationPage() {
   // 现在记成一颗可删除的胶囊，发送那一刻才由 composeSkillMessage 展开成完整引用指令 ——
   // 发出去的文本与旧实现逐字一致，变的只是"用户在输入框里看到什么"。
   const [skillRefs, setSkillRefs] = useState<Skill[]>([]);
-  // 侧栏模块（常用提示词/常用命令/技能/任务队列）的折叠状态，按项目持久化。
+  // 侧栏模块（常用提示词+常用命令合并为一个整体折叠、技能、任务队列）的折叠状态，按项目持久化。
   // state 记录它属于哪个项目，持久化 effect 只在项目一致时才写回，
   // 避免“切换项目”的那一帧把上一项目的折叠状态写进新项目。
   const [conversationPanelsState, setConversationPanelsState] = useState<{ projectId: string; collapsed: ConversationPanelsState }>(() => ({ projectId: projectId || "", collapsed: readConversationPanels(projectId || "") }));
@@ -1778,6 +1804,9 @@ export default function ConversationPage() {
   // 列表刷新走 background=true：轮询只"顺手刷新"，不作废前台的刷新（见 requestConversationHistory）。
   useEffect(() => {
     if (!projectId || conversationTabs.openConversationIds.length === 0) return;
+    // 窗口不可见时既不拉也不起定时器——这里每轮固定两个请求，后台空跑最费。可见性变化会
+    // 重跑本效果，所以回到前台时下面那句会立刻补一次，不必等到下个周期。
+    if (!documentVisible) return;
     const refreshBackgroundTabs = () => {
       void syncConversationActivity().catch(() => undefined);
       if (!historyQuery.trim()) void requestConversationHistory("", "", false, true).catch(() => undefined);
@@ -1785,7 +1814,7 @@ export default function ConversationPage() {
     refreshBackgroundTabs();
     const timer = window.setInterval(refreshBackgroundTabs, 8_000);
     return () => window.clearInterval(timer);
-  }, [conversationTabs.openConversationIds.length, historyQuery, projectId, requestConversationHistory, syncConversationActivity]);
+  }, [conversationTabs.openConversationIds.length, documentVisible, historyQuery, projectId, requestConversationHistory, syncConversationActivity]);
 
   const searchConversationHistory = useCallback((query: string) => {
     setHistoryQuery(query);
@@ -2161,8 +2190,20 @@ export default function ConversationPage() {
   }, [conversation?.id, fail, refreshUsage]);
 
   // HTTP 轮询回退
+  // 上一次的可见性，用来识别「由隐藏转为可见」那一跳：本效果在 setup 时不主动拉取
+  // （首次加载交给 WebSocket 那侧），所以回到前台必须显式补一次，否则运行指示会停在
+  // 后台的旧状态上，一直等到下个周期。
+  const prevRunPollVisible = useRef(documentVisible);
   useEffect(() => {
+    // 先无条件同步可见性：这样 becameVisible 只会在真正的「隐藏 → 可见」那一跳为真。
+    // 若把它放到下面的 !run 守卫之后，run 为空的那些可见性变化不会更新 ref，等下次
+    // 启动运行的瞬间就会误判成"刚从后台回来"，白打一次请求。
+    const becameVisible = documentVisible && !prevRunPollVisible.current;
+    prevRunPollVisible.current = documentVisible;
     if (!run || !conversation?.id) return undefined;
+    // 窗口不可见时停掉回退轮询。实时性由 WebSocket 保证（它不受后台定时器限流影响），
+    // 这条只是连接不可靠时的兜底，隐藏期间没有兜底的价值。
+    if (!documentVisible) return undefined;
     let cancelled = false;
     const poll = async () => {
       try {
@@ -2187,12 +2228,13 @@ export default function ConversationPage() {
         // silently ignore
       }
     };
+    if (becameVisible) void poll();
     const interval = window.setInterval(() => { void poll(); }, 15_000);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [run, conversation?.id, projectApi, recordAssistantOutput]);
+  }, [documentVisible, run, conversation?.id, projectApi, recordAssistantOutput]);
 
   // 对话切换时重置输入历史浏览状态（历史本身按项目保留，不清空）
   useEffect(() => {
@@ -3445,12 +3487,12 @@ export default function ConversationPage() {
     const toggle = options?.onToggle ?? (() => {});
     const heading = collapsible
       ? <button type="button" className="quick-tag-heading quick-tag-heading-toggle skill-heading-toggle" aria-expanded={!collapsed} title={collapsed ? "展开技能模块" : "折叠技能模块"} onClick={toggle}>
-          <span className="quick-tag-heading-label"><SkillTagIcon /><span>技能 (Skill)</span></span>
+          <span className="quick-tag-heading-label"><SkillTagIcon /><span className="quick-tag-heading-title">技能 (Skill)</span></span>
           <span className="skill-source-hint" title="全部来源">{skillsLoading ? "加载中" : `${skills.length} 个`}</span>
           <QuickTagChevron />
         </button>
       : <div className="quick-tag-heading">
-          <span className="quick-tag-heading-label"><SkillTagIcon /><span>技能 (Skill)</span></span>
+          <span className="quick-tag-heading-label"><SkillTagIcon /><span className="quick-tag-heading-title">技能 (Skill)</span></span>
           <span className="skill-source-hint" title="全部来源"> {skillsLoading ? "加载中" : `${skills.length} 个`}</span>
         </div>;
     const body = skillsLoading ? <div className="quick-tag-list"><div className="quick-tag-empty skill-loading">加载中…</div></div>
@@ -3505,8 +3547,17 @@ export default function ConversationPage() {
     <section className="conversation-canvas" data-queue-collapsed={!readOnlyConversation && conversationPanels.taskQueue ? "true" : undefined}>
       <aside className="quick-tag-rail" aria-label="常用操作">
         <div className="quick-actions-row">
-          <div className={`quick-tag-group${conversationPanels.prompt ? " collapsed" : ""}`}><div className="quick-tag-heading"><button type="button" className="quick-tag-heading-toggle" aria-expanded={!conversationPanels.prompt} title={conversationPanels.prompt ? "展开常用提示词" : "折叠常用提示词"} onClick={() => toggleConversationPanel("prompt")}><ShortcutCategoryIcon kind="prompt" /><span className="quick-tag-heading-title">常用提示词</span><b className="quick-tag-count">{promptShortcuts.length}</b><QuickTagChevron /></button><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button></div>{!conversationPanels.prompt && <ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} />}</div>
-          <div className={`quick-tag-group command-tags${conversationPanels.command ? " collapsed" : ""}`}><div className="quick-tag-heading"><button type="button" className="quick-tag-heading-toggle" aria-expanded={!conversationPanels.command} title={conversationPanels.command ? "展开常用命令" : "折叠常用命令"} onClick={() => toggleConversationPanel("command")}><ShortcutCategoryIcon kind="command" /><span className="quick-tag-heading-title">常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b><QuickTagChevron /></button><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button></div>{!conversationPanels.command && <ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} />}</div>
+          <div className={`quick-tag-group quick-shortcuts${conversationPanels.shortcuts ? " collapsed" : ""}`}>
+            <div className="quick-tag-heading">
+              <button type="button" className="quick-tag-heading-toggle" aria-expanded={!conversationPanels.shortcuts} title={conversationPanels.shortcuts ? "展开常用提示词 / 常用命令" : "折叠常用提示词 / 常用命令"} onClick={() => toggleConversationPanel("shortcuts")}><ShortcutCategoryIcon kind="prompt" /><span className="quick-tag-heading-title">常用提示词 / 常用命令</span><b className="quick-tag-count">{promptShortcuts.length + commandShortcuts.length}</b><QuickTagChevron /></button>
+              <button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button>
+              <button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button>
+            </div>
+            {!conversationPanels.shortcuts && <>
+              <div className="quick-shortcuts-sub"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span><b className="quick-tag-count">{promptShortcuts.length}</b></span></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+              <div className="quick-shortcuts-sub command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b></span></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
+            </>}
+          </div>
           {renderSkillGroup({ collapsible: true, collapsed: conversationPanels.skills, onToggle: () => toggleConversationPanel("skills") })}
         </div>
       </aside>
@@ -3533,7 +3584,6 @@ export default function ConversationPage() {
             <span className="composer-skill-ref-name" title={truncateSkillDescription(skill.description, skill.name) || skill.name}><SkillTagIcon /><span>{skill.name}</span></span>
             <button type="button" className="composer-skill-ref-remove" title={`移除技能 ${skill.name}`} aria-label={`移除技能 ${skill.name}`} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => removeSkillRef(skill)}>×</button>
           </span>)}
-          <span className="composer-skill-ref-hint">发送时展开为完整引用</span>
         </div>}
         {composerSlashHint && <div className="composer-slash-hint" role="status">
           <span>当前 CLI 的命令目录里没有 <code>/{composerSlashHint.commandName}</code>{composerSlashHint.suggestion ? "，" : "，发送后只会得到一句 Unknown command。"}</span>

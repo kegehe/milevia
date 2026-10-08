@@ -69,6 +69,59 @@ export type AgentDiagnosis = {
   diagnosedAt: string;
 };
 
+/**
+ * **线协议上**的诊断报告：三个数组字段按"可能缺席"声明。
+ *
+ * 为什么不让它们直接是 `T[]`：服务端两处构造点确实都把它们初始化成空切片
+ * （`agent_diagnose.go:264` 与 `:362`），所以正常情况下不会缺席。但前端**不能靠这个
+ * 约定活着** —— 一个 `null` 会在 `.length` 上抛异常，而那个异常的后果是**整页白屏**
+ * （2026-09-23 由 `apps/web/.tmp/probe-cli-tools-page.mjs` 的真实点击抓到：抽屉一开，
+ *  React 树整个崩掉，`body` 变成空的）。
+ *
+ * 处置照本项目对线协议字段的纪律：**边界上收口一次**（`normalizeDiagnosis`），
+ * 下游一律按非空数组使用；类型分开写，让 tsc 在收口点当守门人。
+ */
+export type AgentDiagnosisWire = Omit<AgentDiagnosis, "issues" | "paths" | "limitations"> & {
+  issues?: DiagnoseIssue[] | null;
+  paths?: DiagnosePathFact[] | null;
+  limitations?: string[] | null;
+};
+
+/** 批量诊断的线协议形状（`skipped` 同理：缺席时不能变成"没有跳过任何工具"以上下文为准）。 */
+export type RunnerDiagnosticsViewWire = Omit<RunnerDiagnosticsView, "items" | "skipped" | "limitations"> & {
+  items?: AgentDiagnosisWire[] | null;
+  skipped?: string[] | null;
+  limitations?: string[] | null;
+};
+
+/**
+ * 把线协议上的一份报告收成"下游可以直接用"的形状。
+ *
+ * ⚠️ 它**不是**在把"读不到"补成"没有"：补齐的是**字段结构**（数组缺席 → 空数组），
+ * 而"这一轮到底有没有得出结论"由 `status` 决定，那一个字段从不补齐、也不猜。
+ */
+export function normalizeDiagnosis(raw: AgentDiagnosisWire): AgentDiagnosis {
+  return {
+    ...raw,
+    issues: (raw.issues ?? []).map((issue) => ({
+      ...issue,
+      evidence: issue.evidence ?? [],
+      remedies: issue.remedies ?? [],
+    })),
+    paths: raw.paths ?? [],
+    limitations: raw.limitations ?? [],
+  };
+}
+
+export function normalizeDiagnostics(raw: RunnerDiagnosticsViewWire): RunnerDiagnosticsView {
+  return {
+    ...raw,
+    items: (raw.items ?? []).map(normalizeDiagnosis),
+    skipped: raw.skipped ?? [],
+    limitations: raw.limitations ?? [],
+  };
+}
+
 export type RunnerDiagnosticsView = {
   runnerId: string;
   probeOk: boolean;
@@ -85,26 +138,21 @@ export type RepairResult = { success: boolean; applied: RepairStep[]; diagnosis:
 /** 诊断结论的四种观感。`unknown` 是"没查成"，**不能**与 `ok` 合并。 */
 export type DiagnosisTone = "ok" | "warn" | "bad" | "unknown";
 
-// 五种真相各说各的：没有问题 / 发现了问题 / 真的没装 / 该环境不提供 /
-// **检测没查成**。最后那一档尤其不能并进"没有问题"。
-const DIAGNOSIS_LABELS: Record<string, string> = {
-  ok: "没有问题",
-  broken: "发现问题",
-  "not-installed": "未安装",
-  unknown: "检测未完成",
-  unsupported: "该环境不提供",
-};
+// 五种真相各有各的结论，但**页面不再把它们念成五个词**（那是被删掉的一层）：
+//   ok / broken / not-installed / unsupported / unknown。
+// 现在只有一处需要把"结论"翻译成给人看的话 —— `lib/cli-tools-view.ts` 的
+// `buildToolCard`：它按 status 落 tone、按症状落那一句状态，而 `unknown` 那一档
+// 走的是「这次没检查成功」这条独立路径（绝不允许落到"没有问题"）。
+// 原来这里有一张 `DIAGNOSIS_LABELS` 表与 `diagnosisLabel` / `diagnosisBadge`，
+// 随着首屏不再显示"结论徽标"而失去了消费点 —— 本项目对"算了但没人读"的处置是删掉，
+// 而不是留着当摆设。
 
 /**
- * 结论怎么念。
+ * 结论的观感。`unknown` 是"没查成"，**不能**与 `ok` 合并。
  *
- * 认不出的状态一律按"检测未完成"说 —— 那是最保守也最不会误导的一档。
- * 反过来说：**不许回落到"没有问题"**，那会把一次没查成伪装成一切正常。
+ * 认不出的状态一律按 unknown 说 —— 那是最保守也最不会误导的一档。
+ * 反过来说：**不许回落到 ok**，那会把一次没查成伪装成一切正常。
  */
-export function diagnosisLabel(status: string): string {
-  return DIAGNOSIS_LABELS[status] ?? "检测未完成";
-}
-
 export function diagnosisTone(status: string): DiagnosisTone {
   switch (status) {
     case "ok":
@@ -270,35 +318,20 @@ export function diagnosisMetaLine(diagnosis: AgentDiagnosis): string {
 }
 
 /**
- * 预检要说的话。
+ * 预检要说的话 —— **只有一句**。
  *
- * 安装与升级在服务端共用同一套判据（`resolveAgentInstallPlan` + `checkRuntimeGate`），
- * 所以两者一致时**只说一句**；不一致时补第二句 —— 那正是这两个字段存在的理由，
- * 而不是把它们摆在响应里没人读。
- */
-export function preflightNotes(preflight: DiagnosePreflight): string[] {
-  const notes: string[] = [];
-  if (!preflight.installOk && preflight.installReason) {
-    notes.push(`现在装不了：${preflight.installReason}`);
-  }
-  if (!preflight.upgradeOk && preflight.upgradeReason && preflight.upgradeReason !== preflight.installReason) {
-    notes.push(`升级也不行：${preflight.upgradeReason}`);
-  }
-  return notes;
-}
-
-/**
- * 徽标怎么念 —— 判据要**同时**看结论与症状。
+ * 原先这里会补第二句「升级**也**不行：…」（条件是 `installOk && !upgradeOk`，且理由与
+ * 安装那句不同）。那个分支在本项目里**不可达**：服务端把两个结论写在同一个判断里
+ * （`agent_diagnose.go:856` 的 `diagnosePreflightLocal` 只调一次
+ * `resolveAgentInstallPlan` + `checkRuntimeGate`，成功时两个都置 true、失败时
+ * `UpgradeReason = InstallReason`），还有一条 Go 测试钉着"升级理由必须等于安装理由"。
+ * 留着一句带「也」的话，等于承认存在"能装、不能升"这种情形 —— 而它产生不出来，
+ * 只会让后面读这段代码的人去猜那是什么时候发生的。
  *
- * `status=ok` 说的是"现在能用"，而 warning 级症状说的是"能跑，但有几处会绊住你"。
- * 只念前半句会得到「没有问题 · 2 项症状」这种自相矛盾的一行 —— 而消灭这种矛盾正是
- * 这一整轮的目的。info 级不算（那是事实说明，不是需要注意的事）。
+ * `upgradeOk` 并没有因此没人读：**升级按钮的判据**读的正是它（见 `lib/cli-tools-view.ts`
+ * 的 `buildToolCard`）。判据同源，消费点各按自己的语义取。
  */
-export function diagnosisBadge(diagnosis: AgentDiagnosis): { label: string; tone: DiagnosisTone } {
-  const tone = diagnosisTone(diagnosis.status);
-  const noteworthy = diagnosis.issues.filter((issue) => issue.severity !== "info").length;
-  if (diagnosis.status === "ok" && noteworthy > 0) {
-    return { label: `能用，有 ${noteworthy} 项要留意`, tone: "warn" };
-  }
-  return { label: diagnosisLabel(diagnosis.status), tone };
+export function preflightNote(preflight?: DiagnosePreflight): string {
+  if (!preflight || preflight.installOk) return "";
+  return `现在做不了：${preflight.installReason || "原因未知"}`;
 }

@@ -32,6 +32,30 @@ export type MobileUpdateState = {
   release: AndroidRelease;
 };
 
+/** 当前安装的 Android 包版本（versionName + versionCode）。 */
+export type MobileAppInfo = { version: string; build: string };
+
+/**
+ * 读取当前安装的包版本。**与 checkMobileUpdate 分开**：那条只在"有新版本"时才返回，
+ * 没有更新时版本号读完即弃 —— 于是"我装的是哪一版"在界面上就永远没有来源
+ * （移动端此前正因此一处都不显示版本）。
+ *
+ * 非原生端返回 null：浏览器 / 桌面没有"已安装的包版本"这回事，而且 Web 端
+ * `App.getInfo()` 会抛 unimplemented（见 @capacitor/app 的 web 实现）。
+ */
+export async function readMobileAppInfo(): Promise<MobileAppInfo | null> {
+  if (!Capacitor.isNativePlatform()) return null;
+  try {
+    const info = await App.getInfo();
+    const version = typeof info?.version === "string" ? info.version.trim() : "";
+    if (!version) return null;
+    return { version, build: typeof info?.build === "string" ? info.build.trim() : "" };
+  } catch {
+    // 读不到就当作"不知道"，不编一个版本号出来。
+    return null;
+  }
+}
+
 /**
  * 查询是否有可用的 Android 新版本。仅在原生端生效；Web 端返回 null。
  * 读不到自身 versionCode 时不提示更新（宁可漏报也不要让用户装上一个装不上的包）。

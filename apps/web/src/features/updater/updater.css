@@ -23,7 +23,7 @@
 .update-banner-text strong {
   color: #7a4d00;
   font-size: 13px;
-  font-weight: 750;
+  font-weight: 700;
 }
 .update-banner-text span {
   color: #9a6a10;
@@ -73,7 +73,7 @@
 .update-banner-downloading > span:first-child {
   color: #7a4d00;
   font-size: 12px;
-  font-weight: 650;
+  font-weight: 700;
   white-space: nowrap;
 }
 .update-banner-track {
@@ -98,10 +98,10 @@
   white-space: nowrap;
 }
 
-/* 项目总览左下角的版本号徽标 */
+/* 项目总览右下角的版本号徽标（与 .dashboard-bar 的左右内边距同一套间距） */
 .dashboard-version {
   position: fixed;
-  left: clamp(20px, 4vw, 68px);
+  right: clamp(20px, 4vw, 68px);
   bottom: 14px;
   z-index: 5;
   display: flex;

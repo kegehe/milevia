@@ -11,10 +11,12 @@ import test from "node:test";
 // 这个分工是被变异检验逼出来的：最初把「模板依赖优先于表单命令」也写成源码正则，
 // 结果把优先级改反照样绿 —— 文本里 `requires` 与 `return fromPreset` 都还在。
 
-const [page, types, styles] = await Promise.all([
+const [page, types, styles, pageStyles, dashboard] = await Promise.all([
   readFile(new URL("./pages/McpManagerPage.tsx", import.meta.url), "utf8"),
   readFile(new URL("./lib/types.ts", import.meta.url), "utf8"),
   readFile(new URL("./style.css", import.meta.url), "utf8"),
+  readFile(new URL("./pages/mcp-manager.css", import.meta.url), "utf8"),
+  readFile(new URL("./pages/DashboardPage.tsx", import.meta.url), "utf8"),
 ]);
 
 // sliceBetween 取出一段函数体 / 一段 JSX。
@@ -37,24 +39,49 @@ const startWizardOAuth = sliceBetween(page, "const startWizardOAuth = ", "const 
 const finishWizard = sliceBetween(page, "const finishWizard = ", "const performSave = ");
 const startEdit = sliceBetween(page, "const startEdit = ", "const closeForm = ");
 const closeForm = sliceBetween(page, "const closeForm = ", "const submit = ");
-const toolbar = sliceBetween(page, 'className="ssh-manager-toolbar"', "{localError &&");
-const advancedBlock = sliceBetween(page, "{showAdvanced && <div", "<h3>项目视图</h3>");
+const topbar = sliceBetween(page, 'className="mcp-bar"', "{localError &&");
+const advancedBlock = sliceBetween(page, "{showAdvanced && <section", "<h3>项目视图</h3>");
 const wizardJsx = sliceBetween(page, "{wizard && <div", "{showForm && <div");
-const connectedBlock = sliceBetween(page, "<h3>已连接</h3>", "<h3>可以连接的服务</h3>");
+const connectedBlock = sliceBetween(page, "<h2>我的服务", "可以连接的服务</h2>");
+
+test("独立页面壳：不再是「Dashboard + 弹窗背板」，页面名与首页入口写同一个字符串", () => {
+  // 旧形态的三件套不许回来：以 Dashboard 为底、全屏背板、dialog 语义的页面根。
+  assert.doesNotMatch(page, /<DashboardPage\s*\/>/);
+  assert.doesNotMatch(page, /ssh-manager-backdrop/);
+  assert.doesNotMatch(page, /aria-modal="true"[^>]*aria-labelledby="mcp-manager-title"/);
+  // 新壳：独立页面 + 顶栏返回。
+  assert.match(page, /className="mcp-shell"/);
+  assert.match(topbar, /onClick=\{\(\) => navigate\("\/"\)\}>返回</);
+  // 项目列表自己拉：独立页不再渲染 DashboardPage（它是原先 refreshProjects 的唯一调用方），
+  // 直接刷新 / 托盘跳转进来时，表单与导入的项目下拉才有内容。
+  assert.match(page, /void refreshProjects\(\);/);
+  // 页面名只有一个来源：顶栏 h1 与首页入口的 title / <span> 写同一个字符串。
+  // （改名字时三处一起动 —— 与 Cli 管理页同一条纪律。）
+  const h1 = page.match(/<h1 className="mcp-title">([^<]+)<\/h1>/)?.[1];
+  assert.ok(h1, "页面顶栏应有 h1 标题");
+  assert.match(dashboard, new RegExp(`title="${h1}"[\\s\\S]{0,120}navigate\\("/mcp-manager"\\)`));
+  assert.match(dashboard, new RegExp(`<span>${h1}</span>`));
+});
 
 test("主路径只有一条：点目录卡片进向导，其余能力收进「高级设置」", () => {
   assert.match(page, /const \[showAdvanced, setShowAdvanced\] = useState\(false\);/);
   assert.match(page, /onClick=\{\(\) => openWizard\(preset\)\}/);
-  assert.match(page, /\{showAdvanced && <div className="ssh-form-section mcp-advanced">/);
+  assert.match(page, /\{showAdvanced && <section className="mcp-section mcp-advanced">/);
 
-  // 工具栏只留「高级设置」这一个开关：手动配置 / 导入 / 审计全部收进高级区。
-  assert.match(toolbar, /高级设置/);
-  assert.doesNotMatch(toolbar, /手动配置|从现有配置导入|调用审计/);
+  // 顶栏只留「高级设置」这一个开关：手动配置 / 导入 / 审计全部收进高级区。
+  assert.match(topbar, /高级设置/);
+  assert.doesNotMatch(topbar, /手动配置|从现有配置导入|调用审计/);
   assert.match(advancedBlock, /手动配置/);
   assert.match(advancedBlock, /从现有配置导入/);
   assert.match(advancedBlock, /调用审计/);
-  // 目录卡片必须带「要准备什么」这一行 —— 那是用户决定点不点它的唯一依据。
-  assert.match(page, /\{presetBadges\(preset\)\.map/);
+  // 「要准备什么」徽标行已随 UI 删除（presetBadges 一并移除），不许悄悄长回来。
+  assert.doesNotMatch(page, /presetBadges|mcp-preset-meta|点一次授权即可|可授权，也可填密钥/);
+  // 目录卡片的按钮：统一只叫「连接」（cardActionLabel 已删，不许再出现第二份文案口径），
+  // 且按钮与左侧标题/描述左右分布（mcp-preset-main 左、mcp-preset-action 右），不单独占一行。
+  assert.doesNotMatch(page, /cardActionLabel/);
+  const presetCard = sliceBetween(page, 'className="mcp-preset-card"', "</article>");
+  assert.match(presetCard, /<div className="mcp-preset-main">/);
+  assert.match(presetCard, /<div className="mcp-preset-action"><button className="primary" type="button" onClick=\{\(\) => openWizard\(preset\)\}>连接<\/button><\/div>/);
 });
 
 test("向导三屏：起点由模型层决定，界面上不留协议名词", () => {
@@ -104,10 +131,8 @@ test("OAuth 路径先落库再授权，并用已落库的测试接口验证", ()
   // 验证只能走已落库的接口：草稿态试连拿不到服务端保存的令牌。
   assert.match(startWizardOAuth, /`\/api\/mcp\/servers\/\$\{created\.id\}\/test`/);
   assert.doesNotMatch(startWizardOAuth, /test-draft/);
-  // 先落库再取消，不能假装什么都没发生。
-  // **必须切片断言**：整文件匹配 `if (wizardServer) {` 会被 finishWizard 里那处满足，
-  // 删掉这里的代码也照样绿（P12 变异实测漏网过一次）。
-  assert.match(closeWizard, /if \(wizardServer\) \{[\s\S]*?toast\.message\(`「\$\{wizardServer\.displayName/);
+  // 先落库再取消，不能假装什么都没发生 —— 取消时清掉半成品（见「取消向导」用例，
+  // 那里也用切片断言守着 DELETE 路径）。
 });
 
 test("「完成」才写库，且「以后不用再问」只落到白名单", () => {
@@ -122,6 +147,58 @@ test("已连接的卡片按「服务」呈现，不再暴露传输类型与环�
   assert.match(connectedBlock, /PresetIcon name=\{presetIconKey\(server\.name, presets\)\}/);
   assert.doesNotMatch(connectedBlock, /环境：\{server\.environments\.join/);
   assert.doesNotMatch(connectedBlock, /\{server\.transport\} · /);
+});
+
+test("状态口径：enabled 只能说「已启用」，不许说成「已连接」", () => {
+  // 「已连接」是一个**连接事实**，而列表里的每一条只是配置存在且启用 ——
+  // 点了连接又中途放弃的人也会在这里看到一条记录（OAuth 路径会先落库）。
+  assert.match(connectedBlock, /\{server\.enabled \? "已启用" : "已停用"\}/);
+  assert.doesNotMatch(connectedBlock, /已连接/);
+  assert.match(connectedBlock, /<h2>我的服务/);
+});
+
+test("三态：读失败与「真的没有」分开渲染，目录读失败不许静默消失", () => {
+  // 服务列表：读失败是红调失败块 + 重试；只有读成功且为空才出「还没有配置」空态卡。
+  //
+  // ⚠️ 判据必须是**只由 loadServers 写**的那个状态（serversError），不能复用 localError：
+  // localError 还承担"取消向导时清理半成品失败"这类与列表无关的提示，用它当判据时
+  // 一次清理失败就会把真实空态改口成"读不到服务列表"、计数也从 0 变成「—」
+  // （2026-09-29 复查修的就是这个，与目录那一路的 presetsError 同构）。
+  assert.match(connectedBlock, /servers\.length === 0 && serversError \? <div className="mcp-empty mcp-read-fail"/);
+  assert.match(connectedBlock, /<b>读不到服务列表<\/b>/);
+  assert.match(connectedBlock, /onClick=\{\(\) => void loadServers\(\)\}>重试</);
+  // 计数在读失败时显示「—」，不许把「读不到」显示成 0。
+  assert.match(connectedBlock, /serversError \? "—" : servers\.length/);
+  // 反面对照：这两个判据都不许再读 localError —— 读回来的就是原来那个混用的状态。
+  assert.doesNotMatch(connectedBlock, /localError \? "—"/);
+  assert.doesNotMatch(connectedBlock, /servers\.length === 0 && localError/);
+  // 目录读失败单独成块（带重试），不许静默消失成「平台只有这几个服务」。
+  assert.match(page, /presetsError \? <section className="mcp-section">/);
+  assert.match(page, /<b>读不到服务目录<\/b>/);
+  assert.match(page, /onClick=\{\(\) => void loadPresets\(\)\}>重试</);
+});
+
+test("取消向导：没有验证通过的半成品一律删掉，不留「从没连上」的记录", () => {
+  // OAuth 路径先落库是技术必然（回调要按 id 存令牌），但用户点了连接又放弃时，
+  // 那条记录必须清掉 —— 否则列表里躺着一条从没连上的「已启用」。
+  assert.match(closeWizard, /wizardResult\?\.ok !== true/);
+  assert.match(closeWizard, /\/api\/mcp\/servers\/\$\{leftover\.id\}`, \{ method: "DELETE" \}/);
+  assert.match(closeWizard, /没有保存任何东西/);
+  // 验证通过的（wizardResult.ok）才保留，并如实告诉用户它已存在。
+  assert.match(closeWizard, /else if \(leftover\) \{[\s\S]*?已保存，可在列表里管理/);
+});
+
+test("服务牌位走官方图标：白名单内用 ServiceLogo，白名单外回落示意图标", async () => {
+  // 判据只有一份（serviceLogoKey），三个渲染点都经它走：已连接卡 / 目录卡 / 向导弹窗头。
+  const mark = "service={server.name} fallback={<PresetIcon name={presetIconKey(server.name, presets)} />}";
+  assert.match(connectedBlock, new RegExp(`<ServiceLogo ${mark.replace(/[{}()]/g, "\\$&")} />`));
+  assert.match(page, /<ServiceLogo service=\{preset\.name\} fallback=\{<PresetIcon name=\{preset\.icon\} \/>\} \/>/);
+  assert.match(page, /<ServiceLogo service=\{wizard\.name\} fallback=\{<PresetIcon name=\{wizard\.icon\} \/>\} \/>/);
+  // 资产在位：白名单里的每个键都要有一份官方 SVG —— 少一份就是一次运行时 404。
+  for (const key of ["github", "notion", "linear", "sentry", "slack", "jira", "stripe", "playwright", "context7"]) {
+    const asset = await readFile(new URL(`./assets/mcp-${key}.svg`, import.meta.url), "utf8");
+    assert.match(asset, /<svg[\s\S]+<\/svg>/, `assets/mcp-${key}.svg 不是一份 SVG`);
+  }
 });
 
 test("解析与凭据提示共用模型层，页面里不留第二份实现", () => {
@@ -155,9 +232,57 @@ test("类型声明了目录字段、依赖与凭据落点", () => {
 });
 
 test("新增样式都带组件前缀，且图标自带尺寸", () => {
-  for (const className of ["mcp-preset-grid", "mcp-preset-card", "mcp-preset-meta", "mcp-preset-block", "mcp-preset-credential", "mcp-catalog-group", "mcp-service-mark", "mcp-wizard-steps", "mcp-wizard-trust", "mcp-advanced"]) {
+  for (const className of ["mcp-preset-grid", "mcp-preset-card", "mcp-preset-block", "mcp-preset-credential", "mcp-catalog-group", "mcp-service-mark", "mcp-wizard-steps", "mcp-wizard-trust", "mcp-advanced"]) {
     assert.ok(styles.includes(`.${className}`), `style.css 缺少 .${className}`);
   }
   // 内联 SVG 不给宽高会按 300×150 撑破布局；`.ssh-dialog-mark` 那条规则认的是 `.ssh-icon`，管不到它。
   assert.match(styles, /\.mcp-service-icon \{ display: block; width: 20px; height: 20px; flex: none; \}/);
+});
+
+test("独立页壳的样式在 mcp-manager.css：弹窗里限定的按钮规则在页面有等价版本", () => {
+  // 页面壳三件套 + 分节 + 空态卡片（有下一步动作的空态禁止「一行灰字」）。
+  for (const className of ["mcp-shell", "mcp-bar", "mcp-body", "mcp-section", "mcp-empty"]) {
+    assert.ok(pageStyles.includes(`.${className}`), `mcp-manager.css 缺少 .${className}`);
+  }
+  // 目录卡片的左右分布：mcp-preset-main 左（标题/描述/徽标）、mcp-preset-action 右（按钮）。
+  for (const className of ["mcp-preset-main", "mcp-preset-action"]) {
+    assert.ok(pageStyles.includes(`.${className}`), `mcp-manager.css 缺少 .${className}`);
+  }
+  assert.match(pageStyles, /\.mcp-shell \.mcp-preset-card \{ display: flex; align-items: center; gap: 12px; padding: 15px 16px; \}/);
+  // 原先作用域限定在 .ssh-manager-dialog 的按钮规则，页面上要有 .mcp-shell 等价版本
+  //（少一半就是「弹窗里能点、页面上没样式」的半截迁移）。
+  // ⚠️ 断言的是**完整选择器组**：只匹配单个选择器会被同组其它选择器的子串
+  // 骗过（本轮复查实测：.connect 错位成 base，子串检查照样绿）。
+  for (const group of [
+    ".mcp-shell .ssh-action-button, .ssh-manager-dialog .ssh-action-button {",
+    ".mcp-shell .ssh-action-button:hover:not(:disabled), .ssh-manager-dialog .ssh-action-button:hover:not(:disabled) {",
+    ".mcp-shell .ssh-action-button.connect, .ssh-manager-dialog .ssh-action-button.connect {",
+    ".mcp-shell .ssh-action-button.connect:hover:not(:disabled), .ssh-manager-dialog .ssh-action-button.connect:hover:not(:disabled) {",
+    ".mcp-shell .ssh-action-button.danger:hover:not(:disabled), .ssh-manager-dialog .ssh-action-button.danger:hover:not(:disabled) {",
+  ]) {
+    assert.ok(styles.includes(group), `style.css 缺少选择器组：${group}`);
+  }
+  // .mcp-test-button 的宽度规则只剩弹窗半边 —— 页面上的版本在 mcp-manager.css
+  //（留在 style.css 会形成半截迁移：宽度是死值，只有 font-size 生效）。
+  assert.ok(styles.includes(".ssh-manager-dialog .ssh-action-button.mcp-test-button {"), "style.css 缺少弹窗侧 .mcp-test-button 规则");
+  assert.doesNotMatch(styles, /\.mcp-shell \.ssh-action-button\.mcp-test-button/);
+  assert.match(pageStyles, /\.mcp-shell \.ssh-connection-actions \.ssh-action-button \{[^}]*font-size: 11px/);
+  // 变体迁移错位的兜底：mcp-shell 侧的 base 规则里不许混进 connect 的绿色
+  //（错位的形状是「.mcp-shell .ssh-action-button, … .connect」——所有按钮常态变绿）。
+  assert.doesNotMatch(styles, /\.mcp-shell \.ssh-action-button, \.ssh-manager-dialog \.ssh-action-button\.connect \{/);
+  // 栅格：连接卡两列 / 目录卡三列，窄屏回落。
+  assert.match(pageStyles, /\.mcp-shell \.mcp-conn-list \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\); \}/);
+  assert.match(pageStyles, /\.mcp-shell \.mcp-preset-grid \{ grid-template-columns: repeat\(3, minmax\(0, 1fr\)\); gap: 13px; \}/);
+  // 官方图标用 <img> 渲染，牌位里要块状排布（inline 基线空隙会把卡片撑歪）。
+  assert.match(pageStyles, /\.mcp-service-mark img \{ display: block; \}/);
+  // 动作按钮：弹窗时代是 30px 图标方块，页面上带文字的按钮必须放开宽度，否则「授权/停用」竖排折行。
+  assert.match(pageStyles, /\.mcp-shell \.ssh-connection-actions \.ssh-action-button \{ width: auto; min-width: 30px; height: 30px; padding: 0 10px; white-space: nowrap; font-size: 11px; font-weight: 700; \}/);
+});
+
+test("审计保留上限这条事实在界面上有出口，且不靠弹窗副标题", () => {
+  // 2026-09-26 按用户要求删掉弹窗副标题「最近 2000 次 MCP 工具调用的裁决与结果」时，
+  // 上限这个数字挪进了列表计数那一行 —— 服务端 mcpAuditRetention=2000 在读接口裁剪，
+  // 界面上没有第二处说它，删干净等于把事实一起删了。
+  assert.match(page, /最多保留最近 2000 次/);
+  assert.doesNotMatch(page, /最近 2000 次 MCP 工具调用的裁决与结果/);
 });

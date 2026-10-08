@@ -44,7 +44,16 @@ func (s *Server) diagnoseAgentHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.buildAgentDiagnosis(r.Context(), meta, entry))
+	report := s.buildAgentDiagnosis(r.Context(), meta, entry)
+	// 这次详查是**实测**，它的结论可能推翻缓存里那份批量报告（比如那份说"就绪"、
+	// 而这次查出"二进制坏了"）。不作废的话，用户切走再回来会看到旧报告把这次的结论
+	// 盖回去 —— 同一台机器上两份报告给出相反结论，而界面无从分辨该信哪个。
+	//
+	// 连读数一起作废（而不是只清诊断）：上面那次 probeAgent 已经实测过状态，缓存里
+	// 那份可能比它旧；只清诊断会让下一轮批量诊断拿旧读数去判"值不值得详查"，于是刚查
+	// 出问题的工具反而不被详查、显示成"本轮没有详查"。
+	s.invalidateAgentReadings(meta.ID)
+	writeJSON(w, http.StatusOK, report)
 }
 
 // runnerDiagnosticsView 是 GET /api/runners/{runnerID}/diagnostics 的响应。
@@ -90,7 +99,20 @@ func (s *Server) listRunnerDiagnostics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	statuses := s.probeAgents(r.Context(), meta)
+	force := forceRefresh(r)
+	// 缓存命中就直接回放：这份报告里的 `diagnosedAt` 保持**原来**那个时刻，界面已有的
+	// `diagnosisMetaLine` 会自动说明"诊断于 …"—— 不必再为它加字段。
+	//
+	// ⚠️ 缓存查询放在 `!probeOK` 之后：通道坏掉那一档是"一个工具都没查"，
+	// 它本来就不该被缓存住（否则"没查"会被钉住）。
+	if !force {
+		if cached, ok := s.cachedAgentDiagnostics(meta.ID); ok {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+	}
+
+	statuses, _ := s.probeAgentsFor(r.Context(), meta, force)
 	if !isLocalRunnerID(meta.ID) {
 		// 跨端的详查要在目标环境里跑只读脚本，尚未接通（docs/43 §10 第 6 步）。
 		// 仍然逐个给出受限报告 —— 那里至少会如实说"没查成"。
@@ -138,6 +160,9 @@ func (s *Server) listRunnerDiagnostics(w http.ResponseWriter, r *http.Request) {
 	wait.Wait()
 	view.Items = append(view.Items, reports...)
 	writeJSON(w, http.StatusOK, view)
+	// 挂到这一轮读数上。读数在深查期间变过的话 storeAgentDiagnostics 会拒收
+	// —— 报告是照着那份读数算出来的，读数一变它就不作数了。
+	s.storeAgentDiagnostics(meta.ID, view, statuses)
 }
 
 // needsDeepDiagnosis 回答"这个工具值不值得详查"。

@@ -261,7 +261,7 @@ func probeClaudeCommandCatalog(ctx context.Context, claudePath, projectPath stri
 				case <-stderrDone:
 				case <-time.After(200 * time.Millisecond):
 				}
-				return claudeCommandCatalog{}, fmt.Errorf("Claude exited before the init event%s", claudeStderrDetail(stderrTail.tail()))
+				return claudeCommandCatalog{}, fmt.Errorf("Claude 启动失败：还没读到 init 事件进程就结束了%s", claudeStderrDetail(stderrTail.tail()))
 			}
 			if catalog, ok := parseClaudeCommandCatalog(line); ok {
 				return catalog, nil

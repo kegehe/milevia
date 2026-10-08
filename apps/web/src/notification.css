@@ -108,7 +108,7 @@
 
 .notification-header-title-group > div { display: grid; gap: 1px; }
 
-.notification-header-title { color: #19332c; font-size: 13px; font-weight: 800; }
+.notification-header-title { color: #19332c; font-size: 13px; font-weight: 700; }
 .notification-header-title-group small { color: #71887e; font-size: 10px; }
 
 .notification-dismiss-all {
@@ -245,7 +245,7 @@
 
 .notification-item-title {
   font-size: 13px;
-  font-weight: 750;
+  font-weight: 700;
   color: #19332c;
   line-height: 1.35;
 }
@@ -336,7 +336,7 @@
 
 [data-sonner-toast] [data-title] {
   color: #19332c !important;
-  font-weight: 750 !important;
+  font-weight: 700 !important;
   font-size: 13px !important;
   line-height: 1.35 !important;
 }
@@ -353,10 +353,10 @@
 }
 
 /* 键盘聚焦反馈 —— sonner 默认用 box-shadow 做描边但被上方 !important 覆盖，改用 outline 补回 */
-[data-sonner-toast]:focus-visible {
-  outline: 3px solid #f6be4e !important;
+[data-sonner-toast]:focus-visible { 
+  outline: 2px solid #2b7b68 !important;
   outline-offset: 2px !important;
-}
+ }
 
 /* 图标圆角方块，呼应站点 env-tag / item-icon */
 [data-sonner-toast] [data-icon] {
@@ -411,13 +411,15 @@
   background: #245d52 !important;
   border-color: #245d52 !important;
 }
-/* action 按钮键盘聚焦 —— 用站点统一焦点色，覆盖 sonner 默认黑色描边 */
+/* action 按钮键盘聚焦 —— 覆盖 sonner 默认黑色描边。
+   box-shadow 的 spread 是**向外**扩散的，环落在 toast 的浅色底上（不是压在按钮自身的
+   深青底上），所以和站点其余部分一样用深绿。 */
 [data-sonner-toast] [data-button]:focus-visible {
-  box-shadow: 0 0 0 3px #f6be4e !important;
+  box-shadow: 0 0 0 3px #2b7b68 !important;
 }
-/* 关闭按钮键盘聚焦 —— 同样覆盖 sonner 默认黑色描边 */
+/* 关闭按钮键盘聚焦 —— 同样覆盖 sonner 默认黑色描边，同样是向外扩散的环。 */
 [data-sonner-toast] [data-close-button]:focus-visible {
-  box-shadow: 0 0 0 3px #f6be4e !important;
+  box-shadow: 0 0 0 3px #2b7b68 !important;
 }
 
 /* 尊重「减少动态效果」偏好 —— 与 sonner 自身的 reduced-motion 规则一致 */

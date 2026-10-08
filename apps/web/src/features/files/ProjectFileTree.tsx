@@ -7,7 +7,7 @@ import {
 } from "react-complex-tree";
 import type { TreeEnvironmentRef } from "react-complex-tree";
 import type { FileEntry, TreeResponse, SearchResponse } from "./file-model";
-import { getFileIcon } from "./file-model";
+import { getDirPath, getFileIcon } from "./file-model";
 import { FileIcon } from "./FileIcon";
 
 // sessionStorage key：暂存要添加到对话的文件路径
@@ -15,6 +15,12 @@ const ADD_TO_CHAT_KEY = "milevia_add_file_to_chat";
 
 // 树 id，用于向环境查询/修改视图状态（展开项、选中项、焦点项）
 const TREE_ID = "file-tree";
+
+// 搜索结果列表的 id 与列表项 id 前缀：输入框按 combobox 的写法指向它们
+// （aria-controls / aria-activedescendant），键盘选中的那条才能被读屏念出来。
+// 与 TREE_ID 同一个前提：页面上同时只会有一棵树。
+const SEARCH_LIST_ID = "file-tree-search-results";
+const SEARCH_OPTION_ID_PREFIX = "file-tree-search-option-";
 
 async function copyToClipboard(text: string): Promise<boolean> {
   if (navigator.clipboard?.writeText) {
@@ -58,6 +64,11 @@ interface ProjectFileTreeProps {
   // 定点更新用，保留其它目录的展开状态）；preferPath 是刷新后希望保持焦点的路径
   // （改名后的新路径）。都不传则做一次全量刷新。
   refreshRef?: React.MutableRefObject<((dirPath?: string, preferPath?: string) => void) | null>;
+  /**
+   * 当前打开着的文件路径。搜索结果里据此标出"已打开"——
+   * 多结果之间来回切换时，得先看得见自己现在站在哪一条上。缺省（不传）则不标。
+   */
+  activePath?: string;
 }
 
 interface FileTreeItemData {
@@ -334,6 +345,43 @@ function treeSummaryText(res: TreeResponse): string | null {
   return parts.length ? parts.join(" · ") : null;
 }
 
+/**
+ * 服务端 `/fs/search` 的硬上限。本地与 SFTP 两条后端各写了一遍，但都是 100
+ * （apps/control-server/internal/app/filesystem.go 的 LocalFilesystem.Search / SFTPFilesystem.Search，
+ * 后者是 `find … | head -100`）；两边也都只回**文件**、不回目录，所以这里可以按文件处理。
+ *
+ * 命中数正好等于它时，多半是**被截断了**，但也可能真的刚好这么多 —— 所以界面上的措辞
+ * 是"只列出前 N 个"，而不是断言"还有更多"。
+ */
+const SEARCH_RESULT_LIMIT = 100;
+
+/** 搜索结果的条数说明。到上限时必须说出来，否则用户会以为这就是全部命中。 */
+export function searchResultSummary(count: number): string {
+  if (count >= SEARCH_RESULT_LIMIT) return `只列出前 ${SEARCH_RESULT_LIMIT} 个`;
+  return `${count} 个匹配`;
+}
+
+/**
+ * 把 `text` 按 `query` 切成"命中 / 未命中"交替的片段，供界面把命中的那几个字标出来。
+ *
+ * 多条结果里同一个文件名的重复度很高（`index.ts` 满项目都是），只标命中的位置，
+ * 用户才能一眼看出"为什么它算命中"。大小写不敏感，与服务端 `Search` 的判据一致。
+ */
+export function splitSearchMatch(text: string, query: string): { text: string; hit: boolean }[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [{ text, hit: false }];
+  const haystack = text.toLowerCase();
+  const parts: { text: string; hit: boolean }[] = [];
+  let from = 0;
+  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, from)) {
+    if (at > from) parts.push({ text: text.slice(from, at), hit: false });
+    parts.push({ text: text.slice(at, at + needle.length), hit: true });
+    from = at + needle.length;
+  }
+  if (from < text.length) parts.push({ text: text.slice(from), hit: false });
+  return parts;
+}
+
 export function ProjectFileTree({
   projectId,
   conversationId,
@@ -346,10 +394,31 @@ export function ProjectFileTree({
   onAddToChat,
   readOnly,
   refreshRef,
+  activePath,
 }: ProjectFileTreeProps) {
   const [searchQuery, setSearchQuery] = useState("");
+  /**
+   * 上一次搜索的结果列表。null = 没有在列结果。
+   *
+   * 这个状态存在的理由：以前搜索命中多条时**只打开第一条**，其余匹配项无从查看，
+   * 用户只能反复改关键词一个个试。现在命中多条就列出来让他挑，挑中的那条标出来，
+   * 列表留在原地可以来回切（命中恰好一条仍然直接打开，不多一次点击）。
+   */
+  const [searchResults, setSearchResults] = useState<{
+    /** 这份结果对应的查询词，用来在列表标题里说清"列的是什么的匹配"。 */
+    query: string;
+    entries: FileEntry[];
+    activeIndex: number;
+  } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * 有一次搜索正在飞。
+   *
+   * 服务端对 `/fs/search` **没有预算**（全树遍历，见 lib/api.ts 的长任务表），慢是合法的。
+   * 不给指示的话，用户按下回车后界面上什么都不动，会以为没生效而反复按 —— 每次按都真发一次请求。
+   */
+  const [searchPending, setSearchPending] = useState(false);
   /**
    * 这次取树"是不是全给了"的一句话说明（手机端一次多拿几层时才可能出现）。
    *
@@ -369,6 +438,41 @@ export function ProjectFileTree({
   } | null>(null);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const environmentRef = useRef<TreeEnvironmentRef<FileTreeItemData, never> | null>(null);
+  // 结果列表容器。键盘上下选中的那条要跟着滚进可视区，否则用 ↑↓ 选到列表外的项时看不见。
+  const searchListRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  /**
+   * 搜索请求的序号，用来丢弃过期响应。输入一变、或又发了一次搜索，先前那次的结果就不作数。
+   *
+   * 没有它就有这条：输入「inde」回车（请求在飞）→ 接着敲成「index」→ 那次响应回来，
+   * 列表挂出来的却是「inde」的命中，而输入框里写着「index」。点下去打开的是**上一个词**
+   * 命中的文件 —— 正是这次要修的毛病换了个样子重现。
+   */
+  const searchSeqRef = useRef(0);
+
+  /**
+   * 作废"当前这一次"搜索：还在飞的响应回来会被丢掉，界面也不再显示"搜索中"。
+   *
+   * 改词、刷树都算改换了前提，都要走这里 —— 三处各写一遍 `searchSeqRef.current += 1`
+   * 迟早会漏掉一处，而漏掉的那处表现出来的正是这次要修的那类毛病（过期的东西挂在屏幕上）。
+   */
+  const invalidateSearch = useCallback(() => {
+    searchSeqRef.current += 1;
+    setSearchPending(false);
+  }, []);
+
+  /**
+   * 换了项目 / 会话就等于换了工作区，上一个工作区的搜索结果（路径、"已打开"标记）在这里没有意义。
+   *
+   * 项目切换时整个页面本来就会卸载重挂（ProjectLayout 在 project.id 不匹配时只渲染"加载项目中"，
+   * 不渲染 Outlet），会话切换却**不会** —— 树那边对此是有准备的（见下面 provider 重建那段注释），
+   * 所以搜索状态得自己清。还在飞的那次搜索也要一并作废，否则它会把旧工作区的结果挂上来。
+   */
+  useEffect(() => {
+    invalidateSearch();
+    setSearchResults(null);
+    setSearchQuery("");
+  }, [projectId, conversationId, invalidateSearch]);
 
   const showError = useCallback((message: string) => {
     setError(message);
@@ -464,6 +568,10 @@ export function ProjectFileTree({
    */
   const refreshTree = useCallback(
     (dirPath?: string, preferPath?: string) => {
+      // 结果列表是**某一刻**树快照上的命中：新建/改名/删除之后它列的路径可能已经不存在，
+      // 点下去只会得到一个"文件不存在"。刷了树就把它撤掉，让用户重搜一次。
+      setSearchResults(null);
+      invalidateSearch(); // 顺手作废还在飞的那次搜索，免得它把旧结果又挂回来
       if (dirPath === undefined) {
         provider.refreshAll();
         setTreeKey((k) => k + 1);
@@ -474,7 +582,7 @@ export function ProjectFileTree({
         .refreshDir(dirPath, dirPath || "root")
         .then(() => settleEnvironmentSelection(dirPath, preferPath));
     },
-    [provider, settleEnvironmentSelection]
+    [provider, settleEnvironmentSelection, invalidateSearch]
   );
 
   // 暴露刷新方法给父组件
@@ -510,26 +618,118 @@ export function ProjectFileTree({
     };
   }, [contextMenu]);
 
+  // 打开搜索结果里的第 index 条。列表不关 —— 用户接下来多半还要切到别的匹配项上。
+  const openSearchResult = useCallback(
+    (index: number) => {
+      const entry = searchResults?.entries[index];
+      if (!entry) return;
+      setSearchResults({ ...searchResults, activeIndex: index });
+      onFileSelect(entry.path, entry.name);
+      // 点一条不可聚焦的 div 会把焦点从输入框带走，↑↓/回车随后就没反应了 ——
+      // 用完这个列表的人正是要接着切下一条的，所以把焦点还回去。
+      // 触屏上不还：还了会弹出软键盘，而手机端点开文件后整棵树随即被推进去（白弹一次）。
+      const el = searchInputRef.current;
+      if (el && window.matchMedia?.("(hover: hover)").matches !== false) el.focus();
+    },
+    [searchResults, onFileSelect]
+  );
+
+  // 移动高亮项，到头回卷。
+  const moveSearchActive = useCallback((delta: number) => {
+    setSearchResults((prev) => {
+      if (!prev || prev.entries.length === 0) return prev;
+      const len = prev.entries.length;
+      return { ...prev, activeIndex: (prev.activeIndex + delta + len) % len };
+    });
+  }, []);
+
   // 搜索
   const handleSearch = useCallback(async () => {
     const query = searchQuery.trim();
-    if (!query) return;
+    if (!query) {
+      setSearchResults(null);
+      return;
+    }
+    const seq = ++searchSeqRef.current;
+    setSearchPending(true);
     try {
       const params = new URLSearchParams({ query });
 		if (conversationId) params.set("conversationId", conversationId);
       const res = await request<SearchResponse>(
         `/api/projects/${projectId}/fs/search?${params.toString()}`
       );
-      if (res.entries && res.entries.length > 0) {
-        const first = res.entries[0];
-        if (first) onFileSelect(first.path, first.name);
-      } else {
+      // 等这段时间里词被改过、或又搜过一次：这份结果已经不是用户要看的了，丢掉。
+      if (seq !== searchSeqRef.current) return;
+      const entries = res.entries || [];
+      if (entries.length === 0) {
+        setSearchResults(null);
         showError("未找到匹配的文件");
+        return;
       }
+      // 只命中一条就直接打开：没有"挑哪一个"的问题，多一次点击纯属仪式感。
+      // 命中多条则列出来让用户自己挑 —— 直接打开第一条正是以前那个毛病的来源。
+      const only = entries[0];
+      if (entries.length === 1 && only) {
+        setSearchResults(null);
+        onFileSelect(only.path, only.name);
+        setError(null); // 上一次"未找到"的红条不能留在屏幕上，这次明明找到了
+        return;
+      }
+      setSearchResults({ query, entries, activeIndex: 0 });
+      setError(null);
     } catch (err) {
+      if (seq !== searchSeqRef.current) return;
+      setSearchResults(null);
       showError(err instanceof Error ? err.message : "搜索失败");
+    } finally {
+      // 只有"这一趟仍是最新的一趟"时才由它收尾；否则收尾权在更新那趟（或改词/刷树）手上，
+      // 这里清掉会把它们的"搜索中"也一并抹掉。
+      if (seq === searchSeqRef.current) setSearchPending(false);
     }
   }, [searchQuery, projectId, request, onFileSelect, showError, conversationId]);
+
+  // 键盘操作都挂在输入框上（焦点一直在那儿）：↑↓ 换选中项，回车打开，Esc 收起。
+  const handleSearchKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        // 列表开着时回车是"打开高亮那条"，没开才是"搜一次"。
+        // 搜索不受取树的 loading 影响（两条链路互不依赖），所以这里不再等它 ——
+        // 否则展开一个目录的那几秒里，回车会静悄悄什么都不做。
+        if (searchResults) openSearchResult(searchResults.activeIndex);
+        else void handleSearch();
+        return;
+      }
+      // Esc 排在最前：它要管的是"列表开着"和"搜索还在飞"两种状态，而下面那行
+      // `if (!searchResults) return` 会把第二种挡在外面 —— 在飞时按 Esc 就成了没反应，
+      // 几百毫秒后列表照样冒出来。
+      if (e.key === "Escape") {
+        // 没东西可取消时别吞掉 Esc（树那边可能还有别的用途）。
+        if (!searchResults && !searchPending) return;
+        e.preventDefault();
+        // "我不要这个列表了"：光把已摆出来的收起来不够，在飞的那次也得作废。
+        invalidateSearch();
+        setSearchResults(null);
+        return;
+      }
+      if (!searchResults) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        moveSearchActive(1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        moveSearchActive(-1);
+      }
+    },
+    [searchResults, searchPending, handleSearch, openSearchResult, moveSearchActive, invalidateSearch]
+  );
+
+  // 键盘换行后把选中项滚进可视区。`block: "nearest"` 保证已经在视野里时不动。
+  useEffect(() => {
+    if (!searchResults) return;
+    const active = searchListRef.current?.querySelector<HTMLElement>("[data-active='true']");
+    active?.scrollIntoView({ block: "nearest" });
+  }, [searchResults]);
 
   // 刷新
   const handleRefresh = useCallback(() => {
@@ -542,9 +742,26 @@ export function ProjectFileTree({
           <input
             type="text"
             placeholder="搜索文件..."
+            ref={searchInputRef}
+            // 输入框 + 下方结果列表 = 一个 combobox：键盘的 ↑↓/回车都落在输入框上，
+            // 选中项通过 aria-activedescendant 指出去（列表项本身不可聚焦）。
+            role="combobox"
+            aria-expanded={searchResults !== null}
+            // 列表没摆出来时这个 id 在文档里不存在，别留一个指空的 aria-controls。
+            aria-controls={searchResults ? SEARCH_LIST_ID : undefined}
+            aria-autocomplete="list"
+            aria-activedescendant={
+              searchResults ? `${SEARCH_OPTION_ID_PREFIX}${searchResults.activeIndex}` : undefined
+            }
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !loading && handleSearch()}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              // 结果列表必须和输入框里的词对得上。改了词还挂着旧结果，
+              // 用户点下去打开的是"上一个词"命中的文件，而屏幕上写着新词。
+              invalidateSearch();
+              setSearchResults(null);
+            }}
+            onKeyDown={handleSearchKeyDown}
           />
         </div>
         {!readOnly && <>
@@ -561,6 +778,92 @@ export function ProjectFileTree({
           <TreeActionIcon name="refresh" />
         </button>
       </div>
+
+      {/* 搜索在飞时的一行说明。`/fs/search` 是全树遍历、服务端没给它预算，慢是正常的；
+          没有这一行，用户会以为回车没生效而反复按。 */}
+      {searchPending && (
+        <p className="file-tree-search-pending" role="status">搜索中…</p>
+      )}
+
+      {/* 搜索命中的文件列表。以前这里直接把第一条打开、其余匹配无从查看，
+          用户只能反复改关键词一个个试。列表不随打开动作关闭 —— 要的就是在结果之间来回切。 */}
+      {searchResults && (
+        <div className="file-tree-search-results">
+          <div className="file-tree-search-results-head">
+            {/* 拆成两个 span：窄侧栏下被截掉的应该是关键词（它自己就在上面的输入框里），
+                而不是"几个匹配"这句真正要读的信息。 */}
+            <span className="file-tree-search-results-query">「{searchResults.query}」</span>
+            <span className="file-tree-search-results-count">{searchResultSummary(searchResults.entries.length)}</span>
+            <span className="file-tree-search-results-hint">↑↓ 选择 · 回车打开</span>
+            <button
+              type="button"
+              className="file-tree-search-results-close"
+              onClick={() => setSearchResults(null)}
+              title="关闭结果列表"
+              aria-label="关闭结果列表"
+            >
+              ×
+            </button>
+          </div>
+          <div
+            className="file-tree-search-results-list"
+            id={SEARCH_LIST_ID}
+            ref={searchListRef}
+            role="listbox"
+            aria-label="匹配的文件"
+          >
+            {searchResults.entries.map((entry, index) => {
+              const active = index === searchResults.activeIndex;
+              return (
+                <div
+                  key={entry.path}
+                  id={`${SEARCH_OPTION_ID_PREFIX}${index}`}
+                  role="option"
+                  aria-selected={active}
+                  data-active={active ? "true" : undefined}
+                  className={`file-tree-search-result ${active ? "active" : ""}`}
+                  // 路径会按侧栏宽度截断，而"同名文件靠哪条目录区分"全靠这一行 —— 给全路径备着。
+                  title={entry.path}
+                  onClick={() => openSearchResult(index)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    // 必须 stopPropagation：下面那个 document 上的 contextmenu 监听是"关菜单"用的，
+                    // 让它跑到就会把刚开的菜单立刻关掉（树里的行也是这么处理的）。
+                    e.stopPropagation();
+                    // 与树里的行共用一套菜单：右键一条搜索结果该和右键树里的文件一样。
+                    // 桌面端正式版抑制了 WebView2 的默认右键菜单（main.tsx），
+                    // 不接这套菜单的话这里右键**完全没反应**。
+                    setContextMenu({
+                      x: e.clientX,
+                      y: e.clientY,
+                      path: entry.path,
+                      name: entry.name,
+                      isDir: false,
+                    });
+                  }}
+                  onMouseEnter={() => {
+                    // 鼠标划过就跟着改高亮，否则 ↑↓ 的选中项和鼠标下面的那条会错位。
+                    if (!active) setSearchResults((prev) => (prev ? { ...prev, activeIndex: index } : prev));
+                  }}
+                >
+                  <FileIcon iconKey={getFileIcon(entry)} size={15} />
+                  <span className="file-tree-search-result-name">
+                    {splitSearchMatch(entry.name, searchResults.query).map((part, i) =>
+                      part.hit ? (
+                        <mark key={i} className="file-tree-search-result-hit">{part.text}</mark>
+                      ) : (
+                        <span key={i}>{part.text}</span>
+                      )
+                    )}
+                  </span>
+                  {activePath === entry.path && <span className="file-tree-search-result-open">已打开</span>}
+                  <span className="file-tree-search-result-dir">{getDirPath(entry.path) || "项目根目录"}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="file-tree-error" role="alert">

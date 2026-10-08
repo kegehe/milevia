@@ -231,6 +231,8 @@ $env:MILEVIA_AGENT_ENROLLMENT_TOKEN = "replace-with-deployment-token"
 node apps/desktop/scripts/build-sidecar.mjs --force
 ```
 
+> 本地启动桌面端与手机端（模拟器出包、真机安装、手机浏览器调试，以及"原生包连的是哪个后端"）的完整步骤见 [docs/44-本地启动桌面端与移动端.md](docs/44-本地启动桌面端与移动端.md)。
+
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request。

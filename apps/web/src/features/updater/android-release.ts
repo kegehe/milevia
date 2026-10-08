@@ -58,6 +58,19 @@ export function isNewerRelease(release: AndroidRelease | null, currentVersionCod
   return release.versionCode > currentVersionCode;
 }
 
+/**
+ * 版本徽标的文案：`v0.1.8 (6)`。
+ *
+ * 为什么把 versionCode 一起给：更新比对的依据就是 versionCode（见 isNewerRelease），
+ * 排障时"我装的是哪一版"也必须能对到清单里的那个数字，只给 versionName 会答不上来。
+ * 读不到构建号（或为空）时退回只给版本号，不摆一个空括号。
+ */
+export function formatAppVersion(version: string, build?: string): string {
+  const cleanVersion = version.trim();
+  const cleanBuild = (build ?? "").trim();
+  return cleanBuild ? `v${cleanVersion} (${cleanBuild})` : `v${cleanVersion}`;
+}
+
 /** 取一份清单的原始内容（抛错表示这个源不可用）。注入进来是为了能直接单测下面的多源逻辑。 */
 export type ManifestFetcher = (url: string) => Promise<unknown>;
 

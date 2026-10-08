@@ -585,6 +585,72 @@ func TestRemoteCommandWorkerMarksExecutionFailure(t *testing.T) {
 	if status != "failed" || !strings.Contains(result, "error") {
 		t.Fatalf("status=%s result=%s", status, result)
 	}
+	// 判据打在**真正发出去的那份 payload** 上，而不是中间函数：手机端的
+	// commandFailureDetail 取的就是 result.error，然后拼在"快捷方式执行失败："后面直接上屏
+	// （docs/41 §15.1 的教训——判据必须量真正发出去的那个东西）。
+	//
+	// ⚠️ 这条用例**区分不出**"绕过本地化"那类回归（2026-09-29 复查用 git stash 实测过）：
+	// 它的 fixture 走的是 HTTP handler，detail 本身已是中文（"任务不存在或已被删除。"），
+	// 于是新旧两种写法产出**逐字节相同**的串 —— 任何断言都抓不到。
+	// 真正有区分度的是 TestRemoteCommandFailureUsesItsOwnFallback（用英文底层原因造出差异）。
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		t.Fatalf("回执不是合法 JSON：%s", result)
+	}
+	if !containsChinese(payload.Error) {
+		t.Fatalf("回执里的失败原因没有中文（手机端会原样显示英文）：%q", payload.Error)
+	}
+	if strings.Contains(payload.Error, taskFailureFallbackPrefix) {
+		t.Fatalf("回执里带上了面向任务页的兜底前缀：%q", payload.Error)
+	}
+}
+
+// 一次性远程命令失败时，回执里的兜底句必须是**远程命令自己的**。
+//
+// 判据打在真正发出去的那份 payload 上，并且刻意用一个**底层原因是英文**的命令类型
+// （未知类型 → "remote command type is not implemented"）：只有这种情形下两种兜底
+// 才产出不同文案，才验得出"用的是哪一个"。原来这条链用的是 errorText —— 它面向任务页，
+// 兜底是"任务执行失败，请查看任务日志后重试。"，而手机端那条链上没有任务日志可看，
+// 拼出来是两层前缀（"快捷方式执行失败：任务执行失败，请查看任务日志后重试。：…"）。
+func TestRemoteCommandFailureUsesItsOwnFallback(t *testing.T) {
+	db := newRemoteTestDB(t)
+	defer db.Close()
+	s := &Server{db: db, runtimeCtx: context.Background()}
+	if err := s.migrateRemoteControl(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	request := `{"commandId":"cmd-unknown","type":"task.unknown-thing","idempotencyKey":"idem-unknown","payload":{}}`
+	if _, err := db.Exec(`insert into processed_remote_commands(command_id,idempotency_key,type,status,result,received_at,updated_at,expires_at,request_payload,request_hash) values(?,?,?,?,?,?,?,?,?,?)`, "cmd-unknown", "idem-unknown", "task.unknown-thing", "queued", "{}", now, now, now.Add(time.Minute), request, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	s.processOneRemoteCommand(context.Background())
+
+	var status, result string
+	if err := db.QueryRow(`select status,result from processed_remote_commands where command_id='cmd-unknown'`).Scan(&status, &result); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("status=%s result=%s", status, result)
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		t.Fatalf("回执不是合法 JSON：%s", result)
+	}
+	if strings.Contains(payload.Error, taskFailureFallbackPrefix) {
+		t.Fatalf("回执里带上了面向任务页的兜底前缀（手机端没有任务日志可查）：%q", payload.Error)
+	}
+	if !strings.Contains(payload.Error, "远程命令") {
+		t.Fatalf("回执没有用远程命令自己的兜底句：%q", payload.Error)
+	}
+	// 原始原因（英文）必须还在：它是用户拿去搜索的唯一线索。
+	if !containsUntranslatedEnglish(payload.Error) {
+		t.Fatalf("原始原因被吞了：%q", payload.Error)
+	}
 }
 
 // 一条超长消息不能把整个窗口挤成一条。

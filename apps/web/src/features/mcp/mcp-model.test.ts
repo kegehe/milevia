@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildDraftServerPayload, cardActionLabel, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseKeyValueLines, parseLines, presetBadges, presetGuidanceLines, runtimeCommandsFor, transportLabel, wizardStartsAt } from "./mcp-model.ts";
+import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseKeyValueLines, parseLines, presetGuidanceLines, runtimeCommandsFor, serviceLogoKey, transportLabel, wizardStartsAt } from "./mcp-model.ts";
 import type { MCPPreset } from "../../lib/types.ts";
 
 // 2026-09-15 修的模板缺陷里，凡是「靠几行代码的顺序 / 优先级成立」的规则都放在这里做**行为**断言。
@@ -164,31 +164,18 @@ test("凭据占位符带上条目声明的前缀，用户不用记 Bearer", () =
 });
 
 test("connectPlanFor 分别回答「能不能授权 / 要不要填密钥 / 要不要先装东西」", () => {
-  assert.deepEqual(connectPlanFor(oauthOnly), { canOAuth: true, needsCredential: false, needsInstall: false });
-  assert.deepEqual(connectPlanFor(remoteGitHub), { canOAuth: true, needsCredential: true, needsInstall: false });
-  assert.deepEqual(connectPlanFor(localGitHub), { canOAuth: false, needsCredential: true, needsInstall: true });
-  assert.deepEqual(connectPlanFor(localNoSetup), { canOAuth: false, needsCredential: false, needsInstall: true });
-  assert.deepEqual(connectPlanFor(null), { canOAuth: false, needsCredential: false, needsInstall: false });
+  assert.deepEqual(connectPlanFor(oauthOnly), { canOAuth: true, needsCredential: false });
+  assert.deepEqual(connectPlanFor(remoteGitHub), { canOAuth: true, needsCredential: true });
+  assert.deepEqual(connectPlanFor(localGitHub), { canOAuth: false, needsCredential: true });
+  assert.deepEqual(connectPlanFor(localNoSetup), { canOAuth: false, needsCredential: false });
+  assert.deepEqual(connectPlanFor(null), { canOAuth: false, needsCredential: false });
 });
 
-test("目录卡片徽标只说用户要不要动手，不带协议名词", () => {
-  assert.deepEqual(presetBadges(oauthOnly), ["点一次授权即可"]);
-  assert.deepEqual(presetBadges(remoteGitHub), ["可授权，也可填密钥"]);
-  assert.deepEqual(presetBadges(localGitHub), ["先装 Docker", "需要 GitHub Personal Access Token"]);
-  assert.deepEqual(presetBadges(localNoSetup), ["先装 Node.js"]);
-  // 用户不懂 MCP：这些词一个都不该出现在目录上。
-  for (const preset of [oauthOnly, remoteGitHub, localGitHub, localNoSetup]) {
-    for (const badge of presetBadges(preset)) {
-      assert.doesNotMatch(badge, /stdio|http|sse|npx|uvx|环境变量|请求头|作用域/, `徽标出现协议名词：${badge}`);
-    }
-  }
-});
+// 目录卡片徽标行已随 UI 删除（2026-09-24，presetBadges 一并移除）——
+// 准备事项改由向导的凭据屏 / 检查屏逐步告知。
 
-test("卡片按钮文案对纯授权服务直说「用浏览器登录」", () => {
-  assert.equal(cardActionLabel(oauthOnly), "用浏览器登录");
-  assert.equal(cardActionLabel(remoteGitHub), "连接");
-  assert.equal(cardActionLabel(localNoSetup), "检查并连接");
-});
+// 卡片按钮文案已统一为字面量「连接」（2026-09-24，cardActionLabel 随之删除）——
+// 页面里不该再出现第二份按钮文案口径。
 
 test("向导起点：能授权的条目先问准备，什么都不需要的直接进检查", () => {
   assert.equal(wizardStartsAt(oauthOnly), "credential");
@@ -280,3 +267,18 @@ test("试连凭据按落点分流，空白不参与", () => {
   assert.deepEqual(draftProbeValues(oauthOnly, {}), { env: {}, headers: {} });
 });
 
+
+test("serviceLogoKey：官方图标按预设名白名单映射，认不出回落 null", () => {
+  // 已有官方资产的九个服务。
+  assert.equal(serviceLogoKey("github"), "github");
+  assert.equal(serviceLogoKey("github-local"), "github"); // 本地容器版共用 GitHub 官方图标
+  assert.equal(serviceLogoKey("atlassian"), "jira"); // 目录条目是「Jira / Confluence」，牌位放 Jira 官方标
+  for (const name of ["notion", "linear", "sentry", "slack", "stripe", "playwright", "context7"]) {
+    assert.equal(serviceLogoKey(name), name);
+  }
+  // 白名单外（filesystem / fetch / memory / 未知的未来条目）回落 null → 页面退回示意图标。
+  assert.equal(serviceLogoKey("filesystem"), null);
+  assert.equal(serviceLogoKey("fetch"), null);
+  assert.equal(serviceLogoKey("memory"), null);
+  assert.equal(serviceLogoKey("some-future-service"), null);
+});

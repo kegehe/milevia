@@ -186,6 +186,10 @@ type RunConfig struct {
 	Command         string             `json:"command"`
 	EnvVars         map[string]string  `json:"envVars"`
 	ExecutionTarget RunExecutionTarget `json:"executionTarget"`
+	// Commands 是这个项目保存的多条启动命令（见 project_run_commands.go）。
+	Commands []RunCommand `json:"commands"`
+	// SelectedCommandID 是上次选中的命令 ID；启动/重启默认跑它。
+	SelectedCommandID string `json:"selectedCommandId"`
 }
 
 // RunStatusResponse 是 GET /status 的响应。
@@ -195,7 +199,11 @@ type RunStatusResponse struct {
 	StartedAt       *time.Time         `json:"startedAt"`
 	PID             *int               `json:"pid"`
 	ExitCode        *int               `json:"exitCode"`
-	RecentLogs      []LogEntry         `json:"recentLogs"`
+	// Command 是当前（或最近一次）运行实际执行的命令行文本。前端拿它跟保存的命令
+	// 列表比对，就能回答"现在跑的是哪一条"。恒为 runner 里生效的那条，
+	// 不会因为用户在页面上改了选中项而变化。
+	Command    string     `json:"command,omitempty"`
+	RecentLogs []LogEntry `json:"recentLogs"`
 }
 
 type Server struct {
@@ -259,6 +267,15 @@ type Server struct {
 	modelCatalogKey     string
 	modelCatalogOptions []AgentModelOption
 	modelCatalogNote    string
+	// agentReadingsMu 保护"这台机器上的工具状态"读数缓存（按 runnerID 一条），
+	// agentUpdateChecksMu 保护"最新版本"读数缓存（按 runner+agent 一条）。
+	// 两份都只活在内存里：它们是**读数**不是事实，重启后重新探一遍即可。
+	// 两个 map 一律懒初始化（见 agent_readings.go）—— 测试夹具大量使用
+	// `&Server{...}` 字面量，不能要求它们先建 map。
+	agentReadingsMu     sync.Mutex
+	agentReadings       map[string]agentReading
+	agentUpdateChecksMu sync.Mutex
+	agentUpdateChecks   map[agentUpdateCheckKey]agentUpdateCheck
 	// commandCatalogMu 保护 Claude 命令目录的单条缓存（见 project_commands.go）：
 	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
 	// 串行地拉起一次探针进程。
@@ -505,6 +522,12 @@ type Conversation struct {
 	IsCurrent         bool      `json:"isCurrent"`
 	IsOrchestration   bool      `json:"isOrchestration,omitempty"`
 	CreatedAt         time.Time `json:"createdAt"`
+}
+
+// recentConversations 返回结构：内嵌 Conversation 全部摘要字段并追加所属项目名。
+type RecentConversation struct {
+	Conversation
+	ProjectName string `json:"projectName"`
 }
 
 // ConversationWorkspace is an immutable conversation reference to an
@@ -1062,10 +1085,66 @@ func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
 	})
 }
 
+// detachWriteContext 让**写操作**不因为客户端挂断而中止。
+//
+// ── 为什么 ─────────────────────────────────────────────────────────────────
+//
+// 客户端断开（关页面、切走、浏览器自己的超时 abort）时，net/http 会取消
+// `Request.Context()`。于是正在跑的 `git push`、npm 安装、终端起进程会在服务端被
+// **杀掉**，而工作区里留下的是半成品 —— 用户看到的是"失败"，实际是"被中止了"。
+// 这不是误报，是真失败，而且是最坏的一种：它把一个用户没打算取消的操作变成了中断。
+//
+// 这条道理本项目早就认过：docs/42 §19.2 B「installRuntime 用 r.Context() 且无超时 ⇒
+// 关页面就取消远端安装（在那边留下半装文件）」，当时的修法是改用 s.runtimeCtx。
+// 本次把它从"某一个 handler"推广成一条**写操作的统一规则** —— 否则每加一个会跑外部
+// 进程的 handler，都要再有人想起来一次。
+//
+// ── 边界（三条，都有具体反例，不是洁癖）──────────────────────────────────
+//
+//  1. **只动非幂等方法**。GET 里混着长轮询（`/api/remote/outbox?wait=`）与文件下载，
+//     它们的生命周期**本来就等于**连接 —— 客户端走了它们就该结束，脱开只会留下
+//     一堆没人要的 goroutine。
+//  2. **不动 `/api/internal/`**。`POST /api/internal/approvals/wait`（waitForApproval）
+//     是刻意挂在连接上的 5 分钟长轮询，"客户端断开 → deny"正是它的语义：审批钩子
+//     进程一死，那次工具调用就该被判拒绝。脱开它会让被取消的会话永远挂着等待。
+//  3. **跳过 WebSocket 升级请求**（防御性）。升级之后这条连接被 hijack，它的生命周期
+//     就是整条 socket，脱开等于让处理器在 socket 关掉后继续跑。
+//
+// ── 脱开的是连接，不是服务端生命周期 ──────────────────────────────────────
+//
+// ctx 仍然挂在 `s.runtimeCtx` 上（用 AfterFunc 把它的取消接过来），所以进程退出时
+// 这些操作照样被取消 —— 与 CLI 装/升级那几条路径现在用的语义一致。
+func (s *Server) detachWriteContext(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions ||
+			websocket.IsWebSocketUpgrade(r) || strings.HasPrefix(r.URL.Path, "/api/internal/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// runtimeCtx 为 nil 只可能出现在手工构造的测试 Server 上（New 一定会设），
+		// 而 `context.AfterFunc(nil, …)` 是**空指针崩溃** —— 崩在中间件里，报错完全
+		// 指不到原因。与其炸掉一个请求，不如如实退回"不脱开"。
+		if s.runtimeCtx == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+		stop := context.AfterFunc(s.runtimeCtx, cancel)
+		// 处理器返回时就收回 ctx：与原先"ServeHTTP 返回即取消"的语义一致
+		// （否则 handler 里起的 goroutine 会用着一个永远不会被取消的 ctx 活下去）。
+		defer func() {
+			stop()
+			cancel()
+		}()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func (s *Server) routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.cors)
 	r.Use(s.slowRequestLogger)
+	r.Use(s.detachWriteContext)
 	r.Use(s.requireSession)
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -1202,6 +1281,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
 	r.Post("/api/projects/{projectID}/tasks/review-all", s.reviewAllTasks)
+	r.Get("/api/conversations/recent", s.recentConversations)
 	r.Get("/api/projects/{projectID}/scheduled-tasks", s.listScheduledTasks)
 	r.Post("/api/projects/{projectID}/scheduled-tasks", s.createScheduledTask)
 	r.Post("/api/projects/{projectID}/insights/scan", s.triggerInsightScan)
@@ -1230,6 +1310,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/orchestration/batches", s.listOrchestrationBatches)
 	r.Post("/api/projects/{projectID}/orchestration/batches", s.createOrchestrationBatch)
 	r.Post("/api/projects/{projectID}/orchestration/batches/{batchID}/tasks", s.addTasksToOrchestrationBatch)
+	r.Post("/api/projects/{projectID}/orchestration/batches/{batchID}/start", s.startOrchestrationBatch)
 	r.Delete("/api/projects/{projectID}/orchestration/batches/{batchID}", s.deleteOrchestrationBatch)
 	r.Post("/api/projects/{projectID}/orchestration/enqueue-batch", s.enqueueBatchForOrchestration)
 	r.Patch("/api/projects/{projectID}/orchestration/order", s.reorderOrchestrationJobs)
@@ -1471,6 +1552,36 @@ func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition str
 	return err
 }
 
+// addColumnIfMissing 与 ensureColumn 同源，但额外报告"这次是否真的加了列"。一次性回填
+// （例如给已有计划补一个"视为已开始"的标记）必须只在列新建那一次跑：无条件回填会在每次
+// 启动时把后来才产生的数据也一并改掉。
+func addColumnIfMissing(ctx context.Context, db *sql.DB, table, column, definition string) (bool, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("pragma table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return false, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("alter table %s add column %s %s", table, column, definition)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Server) migrateProjectsRunnerPathUnique(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `pragma index_list(projects)`)
 	if err != nil {
@@ -1606,7 +1717,7 @@ create table if not exists shortcut_projects (shortcut_id text not null referenc
 create table if not exists shortcut_runs (id text primary key, shortcut_id text references shortcuts(id) on delete set null, conversation_id text not null references conversations(id) on delete cascade, run_id text unique references runs(id) on delete set null, rendered_content text not null, action text not null, status text not null, created_at datetime not null, completed_at datetime);
 create table if not exists shortcut_audit_events (id text primary key, shortcut_id text references shortcuts(id) on delete set null, action text not null, payload text not null default '{}', created_at datetime not null);
 create table if not exists app_metadata (key text primary key, value text not null);
-	create table if not exists project_run_configs (project_id text primary key references projects(id) on delete cascade, work_dir text not null default '', command text not null default '', env_vars text not null default '{}', execution_target text not null default 'auto', updated_at datetime not null);
+	create table if not exists project_run_configs (project_id text primary key references projects(id) on delete cascade, work_dir text not null default '', command text not null default '', env_vars text not null default '{}', execution_target text not null default 'auto', commands text not null default '[]', selected_command_id text not null default '', updated_at datetime not null);
 	create table if not exists project_insight_scans (id text primary key, project_id text not null references projects(id) on delete cascade, status text not null default 'running', error text not null default '', agent text not null default 'claude-code', repo_sha text not null default '', findings_count integer not null default 0, suppressed_count integer not null default 0, created_at datetime not null, started_at datetime, completed_at datetime);
 	create table if not exists project_insights (id text primary key, project_id text not null references projects(id) on delete cascade, scan_id text not null references project_insight_scans(id) on delete cascade, type text not null, severity text not null default 'normal', title text not null, summary text not null, file_hint text not null default '', fingerprint text not null default '', status text not null default 'open', created_at datetime not null, updated_at datetime not null);
 	create table if not exists project_insight_events (id text primary key, scan_id text not null references project_insight_scans(id) on delete cascade, seq integer not null, ts datetime not null, level text not null default 'info', message text not null);
@@ -1663,6 +1774,14 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	}
 	if err := ensureColumn(ctx, s.db, "project_run_configs", "execution_target", "text not null default 'auto'"); err != nil {
 		return fmt.Errorf("add project run execution target: %w", err)
+	}
+	// 多启动命令：老库只有单条 command，读取时会迁移成 commands 里的一条（见
+	// project_run_commands.go），无需数据回填。
+	if err := ensureColumn(ctx, s.db, "project_run_configs", "commands", "text not null default '[]'"); err != nil {
+		return fmt.Errorf("add project run commands: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "project_run_configs", "selected_command_id", "text not null default ''"); err != nil {
+		return fmt.Errorf("add project run selected command: %w", err)
 	}
 	// 优化建议扫描的方向（主题 + 查找类型）：只读展示本次扫描聚焦，参与 prompt 组装，不参与去重。
 	// 用 ensureColumn（幂等）而非改 create table heredoc——该表已存在，if not exists 不会补列。
@@ -3098,10 +3217,22 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		input.AgentID = preferences.DefaultAgentID
 	}
 	if input.PermissionMode == "" {
-		if input.AgentID == "codex" {
+		switch input.AgentID {
+		case "codex":
 			input.PermissionMode = preferences.CodexPermissionMode
-		} else {
+		case "claude-code":
 			input.PermissionMode = preferences.ClaudePermissionMode
+		default:
+			// 目录里 2026-09-24 起不止两个工具：新工具的默认权限来自目录的
+			// DefaultPermissionMode，**不**回落 Claude 的偏好 —— 那个回落是按
+			// claude/codex 二元式写的，而 codebuddy 的权限面不含 approval_required，
+			// 落进去会被下面的 validAgentPolicy 拒成 400（手机端接入 codebuddy 时实测撞上）。
+			// 目录里没有的工具维持旧行为。
+			if entry, ok := agentByID(input.AgentID); ok {
+				input.PermissionMode = entry.DefaultPermissionMode
+			} else {
+				input.PermissionMode = preferences.ClaudePermissionMode
+			}
 		}
 	}
 	if !validAgentPolicy(input.AgentID, input.PermissionMode) {
@@ -3292,6 +3423,43 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 		nextCursor = encodeConversationListCursor(conversationListCursor{IsCurrent: last.IsCurrent, LastActivityAt: last.LastActivityAt, ID: last.ID})
 	}
 	writeJSON(w, http.StatusOK, conversationListPage{Items: items, NextCursor: nextCursor})
+}
+
+// recentConversations 返回跨所有项目、按最近活跃时间倒序的最近会话摘要（最多 limit 条）。
+// 供托盘面板展示"最近会话"：每条附带项目名称，点击可跳回该项目的对应会话。
+func (s *Server) recentConversations(w http.ResponseWriter, r *http.Request) {
+	limit := 8
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 50 {
+			writeError(w, http.StatusBadRequest, errors.New("limit must be between 1 and 50"))
+			return
+		}
+		limit = parsed
+	}
+	// 列顺序与 listConversations 一致，末尾追加项目名；按最后活跃时间倒序取全项目最新会话。
+	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),''),exists(select 1 from git_task_records r where r.conversation_id=c.id),coalesce(p.name,'') from conversations c left join projects p on p.id=c.project_id where exists(select 1 from messages mf where mf.conversation_id=c.id and mf.parent_tool_use_id='') order by c.last_activity_at desc,c.id desc limit ?`
+	rows, err := s.db.QueryContext(r.Context(), statement, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+	items := []RecentConversation{}
+	for rows.Next() {
+		var rc RecentConversation
+		if err := rows.Scan(&rc.ID, &rc.ProjectID, &rc.ClaudeSessionID, &rc.AgentID, &rc.AgentSessionID, &rc.AgentRuntimeID, &rc.AgentProfileRevisionID, &rc.ExecutionPolicy, &rc.Status, &rc.PermissionMode, &rc.ModelOverride, &rc.Title, &rc.LastActivityAt, &rc.ClaudeInitialized, &rc.AgentInitialized, &rc.IsCurrent, &rc.CreatedAt, &rc.Preview, &rc.IsOrchestration, &rc.ProjectName); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		rc.Preview = compactConversationText(rc.Preview, 120)
+		items = append(items, rc)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
@@ -4049,7 +4217,7 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if !validAgentPolicy(conversation.AgentID, input.PermissionMode) {
-		writeError(w, http.StatusBadRequest, errors.New("unsupported execution policy for this agent"))
+		writeError(w, http.StatusBadRequest, errors.New("该 Agent 不支持这种执行策略"))
 		return
 	}
 	if conversation.Status != "idle" {
@@ -4466,7 +4634,7 @@ func (s *Server) saveShortcut(w http.ResponseWriter, r *http.Request, id string,
 	if input.Scope == "project" {
 		for _, projectID := range input.ProjectIDs {
 			if _, err = tx.ExecContext(r.Context(), `insert into shortcut_projects (shortcut_id,project_id) values (?,?)`, id, projectID); err != nil {
-				writeError(w, http.StatusBadRequest, errors.New("project is unavailable"))
+				writeError(w, http.StatusBadRequest, errors.New("项目不可用"))
 				return
 			}
 		}
@@ -6061,13 +6229,20 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 	return "stopping", http.StatusAccepted, nil
 }
 
+// errActiveRunsPresent 是"这个会话还有排队/运行中的任务，不能单独停这一个"的哨兵。
+//
+// httpErrorCode 靠它给出稳定错误码 active_runs_present，客户端据此分支。判据必须是错误
+// 类型而不是英文原文：原先那里比的是 err.Error() 的整串，把文案翻成中文的那一刻，
+// 码会**静默**变空串，而调用方只是少了分支、不会报错。errNotSQLiteDatabase 是同型的先例。
+var errActiveRunsPresent = errors.New("当前会话还有排队或运行中的任务，暂时无法单独停止此任务。")
+
 func (s *Server) ensureStreamingStopIsIsolated(ctx context.Context, conversationID, runID string) error {
 	var otherActive bool
 	if err := s.db.QueryRowContext(ctx, `select exists(select 1 from runs where conversation_id=? and id<>? and status in ('queued','running'))`, conversationID, runID).Scan(&otherActive); err != nil {
 		return err
 	}
 	if otherActive {
-		return errors.New("cannot stop a run while this conversation has other queued or running runs")
+		return errActiveRunsPresent
 	}
 	return nil
 }
@@ -6550,8 +6725,27 @@ func httpErrorCode(err error) string {
 	if errors.As(err, &occupied) {
 		return "workspace_occupied"
 	}
-	if err != nil && strings.TrimSpace(err.Error()) == "cannot stop a run while this conversation has other queued or running runs" {
+	if errors.Is(err, errActiveRunsPresent) {
 		return "active_runs_present"
+	}
+	// runner 离线：这里原来没这一支，于是 git 那条路径回的是**没有 code** 的 409，
+	// 而手机端的码表里列着 `runner_offline`（mobile-git-request.ts）并注释"两边都能命中"
+	// —— fs_handler 与 app.go 的另一处早就在给这个码了，git 这条漏了（2026-09-29 复查）。
+	// 当前没有消费方分支，但"清单里列着、实际永不命中"是那类静默失效的坑。
+	var offline *runnerOfflineError
+	if errors.As(err, &offline) {
+		return "runner_offline"
+	}
+	// Git 三态：手机端按种类分支（自动重取 / 清空选择 / 提示无改动），而它隔着四跳只能
+	// 拿到文案。文案会被翻译、会被改措辞，拿它当判据是静默失效（见 errGitStateChanged
+	// 上方的注释）。码是加法，客户端可以码优先、文案兜底。
+	switch {
+	case errors.Is(err, errGitStateChanged):
+		return "git_state_changed"
+	case errors.Is(err, errGitPathsGone):
+		return "git_paths_gone"
+	case errors.Is(err, errGitNoChanges):
+		return "git_no_changes"
 	}
 	return ""
 }
@@ -6581,11 +6775,26 @@ func projectWorkspaceOwnerSummary(owner string) (kind, summary string) {
 		return "unknown", "另一项项目操作正在使用工作区"
 	}
 }
+
+// taskFailureFallback 是 errorText 的兜底句：一条错误没被翻译时要给用户的那句话。
+//
+// 它不只是文案，还是**契约**：localizedErrorText 在翻不出来时会拼成
+// `taskFailureFallbackPrefix + 英文原文`，而有两处要把这层前缀剥掉——
+// orchestration.go 把 task_runs.failure_reason 提升成作业 last_error 时剥一次，
+// insights.go 让优化建议扫描的原因直接可见时又剥一次。
+//
+// 那两处原先各自硬编码了一份字面量。这里改一个字、那边不会报错，只会静默失配，
+// 用户看到的就是一句多余的"请查看任务日志后重试。"前缀——所以三处必须引用同一份。
+const taskFailureFallback = "任务执行失败，请查看任务日志后重试。"
+
+// taskFailureFallbackPrefix 是上面那句在 `fallback + "：" + message` 形态里的前缀。
+const taskFailureFallbackPrefix = taskFailureFallback + "："
+
 func errorText(err error) string {
 	if err == nil {
 		return ""
 	}
-	return localizedErrorText(err, "任务执行失败，请查看任务日志后重试。")
+	return localizedErrorText(err, taskFailureFallback)
 }
 
 // localizedHTTPErrorText keeps internal implementation errors out of the UI
@@ -6648,35 +6857,68 @@ func localizedErrorText(err error, fallback string) string {
 	if strings.Contains(message, "'ls' is not recognized as an internal or external command") || strings.Contains(message, "'ls' 不是内部或外部命令") {
 		return "自动编排验证命令 ls 在当前 Windows 命令解释器中不可用。请重启应用以加载 PowerShell 验证支持后，再恢复队列重试。"
 	}
+	if strings.Contains(message, "orchestration batch still has unfinished tasks") {
+		return "该编排任务还有未结束的子任务，暂时不能删除。请先在下方子任务列表里处理它们：可移出队列的先移出，执行中的先停止；若状态显示「待合并」，则需先合并至目标分支。"
+	}
+	// 直接模式（直接在已有分支上跑）的错误都带这段稳定哨兵。分支名（main/master/…）
+	// 会被 containsUntranslatedEnglish 判成英文，所以必须在翻译表之前单独拦住，
+	// 否则用户看到的是一句被套上通用前缀的、指不到分支名的提示。
+	if strings.Contains(message, "direct mode ") {
+		switch {
+		case strings.Contains(message, "requires the project worktree to be on"):
+			return "直接模式要求项目工作区正检出计划选定的分支。请先在项目目录里切到该分支（Milevia 不会替你切换），再重试。"
+		case strings.Contains(message, "requires an existing local branch"):
+			return "直接模式要求目标分支已存在于本地。请先在项目目录里创建该分支，再新建编排任务。"
+		case strings.Contains(message, "target branch check"):
+			return "直接模式的目标分支在项目仓库中不存在。请检查分支名后重建编排任务。"
+		case strings.Contains(message, "target branch is missing"):
+			return "直接模式没有指定目标分支。请重新新建编排任务并选定一个已存在的分支。"
+		case strings.Contains(message, "target branch is invalid"):
+			return "直接模式的目标分支名不合法。请重新新建编排任务并选定一个已存在的分支。"
+		case strings.Contains(message, "task ended on"):
+			return "直接模式的任务结束时工作区不在计划选定的分支上（Agent 可能自行切换了分支）。请确认改动落在哪个分支上，再决定如何处理这次任务。"
+		}
+		return "直接模式执行失败：请确认项目工作区正检出计划选定的分支后重试。"
+	}
+
+	// 隔离工作树模式的实现守卫：Agent 一轮跑完，工作树里却没有任何改动，就没有可提交、
+	// 可合并的东西。原文是英文的，任它落到通用 fallback 上会变成「请查看任务日志后重试」
+	// ——没有日志可看，而且同一条任务重试必然同样失败。这里如实说明，并把用户真正该看的
+	// 地方（编排对话里 Agent 的回复）指出来。用 Contains 而不是精确匹配：这条错误的调用
+	// 链只有一处，但包装一次就会让精确匹配静默失效，退回原来那句误导文案。
+	if strings.Contains(message, "implementation produced no changes to commit") {
+		return "Agent 在实现阶段没有产生任何文件改动，本次编排没有可提交的内容。请检查任务说明是否是一条可实施的改动要求，并到编排对话中查看 Agent 的回复。"
+	}
 
 	translations := map[string]string{
 		"project not found":             "项目不存在或已被删除。",
 		"project worktree is not clean": "项目工作区存在未提交或未跟踪的更改。请提交、暂存或清理这些更改后重试任务编排。",
-		"automatic orchestration branch already exists for this task":                "该任务当天的自动编排分支已存在。请确认是否为上次任务遗留的分支，处理后再重试。",
-		"task branch is not ready to confirm":                                        "该任务分支尚未完成验证，暂时不能确认合并。",
-		"main does not contain this task branch commit":                              "main 尚未包含该任务分支的提交。请先合并分支，再确认完成。",
-		"task branch status changed before confirmation":                             "任务分支状态已变化，请刷新后重试确认。",
-		"conversation not found":                                                     "会话不存在或已被删除。",
-		"run not found":                                                              "任务运行记录不存在。",
-		"invalid JSON request":                                                       "请求内容不是有效的 JSON。",
-		"conversation was cleared; start a new conversation from its history":        "该会话已清空，请先从历史记录恢复后再发送消息。",
-		"activate this conversation before sending a message":                        "请先激活该会话，再发送消息。",
-		"Codex is currently available only on the local WSL runner":                  "Codex 目前仅支持本地 WSL 运行器。",
-		"远程服务器上 Codex CLI 不可用或未登录":                                                   "远程服务器上 Codex CLI 不可用或未登录。",
-		"远程服务器上未安装 Codex CLI":                                                        "远程服务器上未安装 Codex CLI。",
-		"此 Runner 不支持 Codex":                                                         "此运行器不支持 Codex。",
-		"Codex CLI is unavailable or not logged in":                                  "Codex CLI 不可用或尚未登录。",
-		"Claude Code is unavailable or not logged in":                                "Claude Code 不可用或尚未登录。",
-		"conversation is stopping":                                                   "会话正在停止，请稍后再试。",
-		"conversation already has a running agent turn":                              "该会话已有正在运行的 AI 任务。",
-		"cannot stop a run while this conversation has other queued or running runs": "当前会话还有排队或运行中的任务，暂时无法单独停止此任务。",
-		"cannot stop a task while this conversation has other queued task runs":      "当前会话还有排队的任务，暂时无法单独停止此任务。",
-		"queued task cannot be stopped independently":                                "排队中的任务无法单独停止。",
-		"Git request timed out":                                                      "Git 操作超时，请稍后重试。",
-		"project is not currently a readable Git repository":                         "当前项目不是可读取的 Git 仓库。",
-		"runner not found":                                                           "运行器不存在。",
-		"runner is not an SSH runner":                                                "当前运行器不是 SSH 运行器。",
-		"another AI CLI is already being updated on this runner":                     "该运行器上已有 AI CLI 正在更新。",
+		"automatic orchestration branch already exists for this task":           "该任务当天的自动编排分支已存在。请确认是否为上次任务遗留的分支，处理后再重试。",
+		"orchestration batch not found":                                         "编排任务不存在或已被删除。",
+		"executionMode must be worktree or branch":                              "执行方式只能是「隔离工作树」或「直接写入已有分支」。",
+		"task branch is not ready to confirm":                                   "该任务分支尚未完成验证，暂时不能确认合并。",
+		"main does not contain this task branch commit":                         "main 尚未包含该任务分支的提交。请先合并分支，再确认完成。",
+		"task branch status changed before confirmation":                        "任务分支状态已变化，请刷新后重试确认。",
+		"conversation not found":                                                "会话不存在或已被删除。",
+		"run not found":                                                         "任务运行记录不存在。",
+		"invalid JSON request":                                                  "请求内容不是有效的 JSON。",
+		"conversation was cleared; start a new conversation from its history":   "该会话已清空，请先从历史记录恢复后再发送消息。",
+		"activate this conversation before sending a message":                   "请先激活该会话，再发送消息。",
+		"Codex is currently available only on the local WSL runner":             "Codex 目前仅支持本地 WSL 运行器。",
+		"远程服务器上 Codex CLI 不可用或未登录":                                              "远程服务器上 Codex CLI 不可用或未登录。",
+		"远程服务器上未安装 Codex CLI":                                                   "远程服务器上未安装 Codex CLI。",
+		"此 Runner 不支持 Codex":                                                    "此运行器不支持 Codex。",
+		"Codex CLI is unavailable or not logged in":                             "Codex CLI 不可用或尚未登录。",
+		"Claude Code is unavailable or not logged in":                           "Claude Code 不可用或尚未登录。",
+		"conversation is stopping":                                              "会话正在停止，请稍后再试。",
+		"conversation already has a running agent turn":                         "该会话已有正在运行的 AI 任务。",
+		"cannot stop a task while this conversation has other queued task runs": "当前会话还有排队的任务，暂时无法单独停止此任务。",
+		"queued task cannot be stopped independently":                           "排队中的任务无法单独停止。",
+		"Git request timed out":                                                 "Git 操作超时，请稍后重试。",
+		"project is not currently a readable Git repository":                    "当前项目不是可读取的 Git 仓库。",
+		"runner not found":                                                      "运行器不存在。",
+		"runner is not an SSH runner":                                           "当前运行器不是 SSH 运行器。",
+		"another AI CLI is already being updated on this runner":                "该运行器上已有 AI CLI 正在更新。",
 	}
 	if translated, ok := translations[message]; ok {
 		return translated
@@ -6935,27 +7177,51 @@ func (s *Server) runnerStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry)
 }
 
-func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner AgentRunner) {
+func (s *Server) checkAgentUpdate(w http.ResponseWriter, r *http.Request, runner AgentRunner, runnerID, agentID string) {
+	// 「最新版本是多少」是一次真实网络查询（实测 1.9~3.1s），而 registry 上的最新版
+	// 几分钟内不会变 —— 按 (runner, agent) 缓存，见 agent_readings.go。
+	key := agentUpdateCheckKey{runnerID: runnerID, agentID: agentID}
+	if !forceRefresh(r) {
+		if cached, ok := s.cachedAgentUpdateCheck(key); ok {
+			writeAgentUpdateCheck(w, cached)
+			return
+		}
+	}
 	// autoUpdatable 区分"可应用内自动更新"与"有新版本但仅能到目标环境手动更新"。
 	// 判据只有一处（agentAutoUpdatable）—— 管理页读的是同一个，两处各判一次
 	// 就会对同一件事给出相反结论（一处给按钮、一处说"需手动更新"）。
-	autoUpdatable := agentAutoUpdatable(runner)
+	result := agentUpdateCheck{
+		at:            time.Now().UTC(),
+		autoUpdatable: agentAutoUpdatable(runner),
+		current:       runner.Version(r.Context()),
+	}
 	available, latestVersion, err := runner.CheckUpdate(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"updateAvailable": false,
-			"autoUpdatable":   autoUpdatable,
-			"currentVersion":  runner.Version(r.Context()),
-			"error":           errorText(err),
-		})
+		// 缓存的是"这次没查到"这件事**本身**，回放时也必须原样回放 ——
+		// 回落成"没有新版本"会把一次网络失败说成"已是最新"。
+		result.errText = errorText(err)
+	} else {
+		result.available, result.latest = available, latestVersion
+	}
+	s.storeAgentUpdateCheck(key, result)
+	writeAgentUpdateCheck(w, result)
+}
+
+// writeAgentUpdateCheck 是 check-update 响应**唯一**的写出点：缓存命中与首次查询
+// 走同一条路 —— 两处各拼一份形状，迟早会出现"今天少一个键、明天多一个"。
+func writeAgentUpdateCheck(w http.ResponseWriter, c agentUpdateCheck) {
+	body := map[string]any{
+		"updateAvailable": c.available,
+		"autoUpdatable":   c.autoUpdatable,
+		"currentVersion":  c.current,
+	}
+	if c.errText != "" {
+		body["error"] = c.errText
+		writeJSON(w, http.StatusInternalServerError, body)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"updateAvailable": available,
-		"autoUpdatable":   autoUpdatable,
-		"currentVersion":  runner.Version(r.Context()),
-		"latestVersion":   latestVersion,
-	})
+	body["latestVersion"] = c.latest
+	writeJSON(w, http.StatusOK, body)
 }
 
 // codexRunnerAdapter exposes a CodexCapableRunner (e.g. an SSH runner) through
@@ -7082,6 +7348,13 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, a
 	updateCtx, cancel := context.WithTimeout(s.runtimeCtx, s.config.agentUpdateTimeout())
 	defer cancel()
 	previousVersion, currentVersion, err := s.performAgentUpdate(updateCtx, runnerID, agentID, runner)
+	// 升级**无论成败**都作废读数：失败往往正是"留下了半成品"那一档（诊断要查的就是它），
+	// 拿缓存里的"就绪"盖住，用户会以为升级压根没发生过。
+	//
+	// 走 npm 重装那条已经在 recordAgentInstallation 里失效过了，但**用户自己用官方
+	// 安装器装的**走 runner.Update（performAgentUpdate 的兜底分支），不经过登记表
+	// —— 少这一次，刚升完级的工具会带着旧版本号在界面上停一个 TTL。
+	s.invalidateAgentReadings(runnerID)
 	if err != nil {
 		// 升级同样要留痕：跨端升级会在目标环境里重跑 npm（或执行 CLI 自带的 update），
 		// 与安装是同一量级的写操作。
@@ -7118,8 +7391,8 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, runnerID, a
 
 func (s *Server) loadRunConfig(ctx context.Context, projectID string) (RunConfig, error) {
 	var c RunConfig
-	var envJSON string
-	err := s.db.QueryRowContext(ctx, `select work_dir, command, env_vars, execution_target from project_run_configs where project_id=$1`, projectID).Scan(&c.WorkDir, &c.Command, &envJSON, &c.ExecutionTarget)
+	var envJSON, commandsJSON string
+	err := s.db.QueryRowContext(ctx, `select work_dir, command, env_vars, execution_target, commands, selected_command_id from project_run_configs where project_id=$1`, projectID).Scan(&c.WorkDir, &c.Command, &envJSON, &c.ExecutionTarget, &commandsJSON, &c.SelectedCommandID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return RunConfig{}, nil
@@ -7129,16 +7402,23 @@ func (s *Server) loadRunConfig(ctx context.Context, projectID string) (RunConfig
 	if envJSON != "" {
 		json.Unmarshal([]byte(envJSON), &c.EnvVars)
 	}
+	if commandsJSON != "" {
+		json.Unmarshal([]byte(commandsJSON), &c.Commands)
+	}
 	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
+	// 补 ID、丢空行、修正选中项，并让旧库的单条 command 迁移成列表里的一条。
+	normalizeRunCommands(&c)
 	return c, nil
 }
 
 func (s *Server) saveRunConfig(ctx context.Context, projectID string, c RunConfig) error {
 	envJSON, _ := json.Marshal(c.EnvVars)
 	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
+	normalizeRunCommands(&c)
+	commandsJSON, _ := json.Marshal(c.Commands)
 	_, err := s.db.ExecContext(ctx,
-		`insert into project_run_configs (project_id, work_dir, command, env_vars, execution_target, updated_at) values ($1,$2,$3,$4,$5,$6) on conflict(project_id) do update set work_dir=excluded.work_dir, command=excluded.command, env_vars=excluded.env_vars, execution_target=excluded.execution_target, updated_at=excluded.updated_at`,
-		projectID, c.WorkDir, c.Command, string(envJSON), c.ExecutionTarget, time.Now().UTC())
+		`insert into project_run_configs (project_id, work_dir, command, env_vars, execution_target, commands, selected_command_id, updated_at) values ($1,$2,$3,$4,$5,$6,$7,$8) on conflict(project_id) do update set work_dir=excluded.work_dir, command=excluded.command, env_vars=excluded.env_vars, execution_target=excluded.execution_target, commands=excluded.commands, selected_command_id=excluded.selected_command_id, updated_at=excluded.updated_at`,
+		projectID, c.WorkDir, c.Command, string(envJSON), c.ExecutionTarget, string(commandsJSON), c.SelectedCommandID, time.Now().UTC())
 	return err
 }
 
@@ -7231,8 +7511,14 @@ func (s *Server) projectRunManagerForWorkspace(ctx context.Context, project Proj
 }
 
 func validateProjectRunConfig(project Project, cfg RunConfig) error {
-	if cfg.Command == "" {
+	// 先规范化（cfg 是值拷贝，改不到调用方）：调用方可能只填了旧式单命令字段，
+	// 也可能带着前端"添加一条"留下的空行。
+	normalizeRunCommands(&cfg)
+	if len(cfg.Commands) == 0 {
 		return errors.New("请先配置启动命令")
+	}
+	if err := validateRunCommands(cfg.Commands); err != nil {
+		return err
 	}
 	if err := validateRunEnvironmentVariables(cfg.EnvVars); err != nil {
 		return err
@@ -7256,8 +7542,12 @@ func validateProjectRunWorkDir(project Project, cfg RunConfig) error {
 }
 
 func (s *Server) validateProjectRunConfigWithWorktree(ctx context.Context, project Project, cfg RunConfig) error {
-	if cfg.Command == "" {
+	normalizeRunCommands(&cfg)
+	if len(cfg.Commands) == 0 {
 		return errors.New("请先配置启动命令")
+	}
+	if err := validateRunCommands(cfg.Commands); err != nil {
+		return err
 	}
 	if err := validateRunEnvironmentVariables(cfg.EnvVars); err != nil {
 		return err
@@ -7351,6 +7641,9 @@ func (s *Server) getRunConfig(w http.ResponseWriter, r *http.Request) {
 	if c.EnvVars == nil {
 		c.EnvVars = map[string]string{}
 	}
+	if c.Commands == nil {
+		c.Commands = []RunCommand{}
+	}
 	c.ExecutionTarget = normalizeRunExecutionTarget(c.ExecutionTarget)
 	writeJSON(w, 200, c)
 }
@@ -7410,6 +7703,13 @@ func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &c) {
 		return
 	}
+	// 丢弃空行、补齐 ID、修正选中项后再校验，这样前端点出来的空行不会让保存失败，
+	// 而"只填了名称没填命令"的行会得到明确报错。
+	normalizeRunCommands(&c)
+	if err := validateRunCommands(c.Commands); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if err := validateRunEnvironmentVariables(c.EnvVars); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -7461,22 +7761,32 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 用请求体覆盖
+	// 用请求体覆盖：前端只传 selectedCommandId（本次要跑哪一条）。也兼容旧写法 ——
+	// 请求体直接给一条 command，临时跑一次（不落库），用于"改一条命令试一下"。
+	// 注意旧写法里 envVars 的语义变了：过去是整包替换全局变量，现在是作为这条临时命令的
+	// 专属变量**叠加**在全局之上（同名覆盖），与保存下来的多条命令完全一致。
 	var req RunConfig
 	if r.Body != http.NoBody {
 		if !decode(w, r, &req) {
 			return
 		}
-		if req.Command != "" {
-			cfg.Command = req.Command
-			cfg.WorkDir = req.WorkDir
-			cfg.ExecutionTarget = req.ExecutionTarget
-			if req.EnvVars != nil {
-				cfg.EnvVars = req.EnvVars
+		if command := strings.TrimSpace(req.Command); command != "" && strings.TrimSpace(req.SelectedCommandID) == "" {
+			cfg.Commands = append(cfg.Commands, RunCommand{ID: adHocRunCommandID, Command: command, EnvVars: req.EnvVars})
+			req.SelectedCommandID = adHocRunCommandID
+			if req.WorkDir != "" {
+				cfg.WorkDir = req.WorkDir
+			}
+			if req.ExecutionTarget != "" {
+				cfg.ExecutionTarget = req.ExecutionTarget
 			}
 		}
 	}
 
+	selected, err := cfg.resolveRunCommand(strings.TrimSpace(req.SelectedCommandID))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if cfg.EnvVars == nil {
 		cfg.EnvVars = map[string]string{}
 	}
@@ -7494,13 +7804,13 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if offline, ok := err.(*runnerOfflineError); ok {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "runner_offline", "runnerId": offline.RunnerID})
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "runner_offline", "code": "runner_offline", "runnerId": offline.RunnerID})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := runner.StartWithConfig(s.runtimeCtx, resolved.Workspace.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars, cfg.ExecutionTarget); err != nil {
+	if err := runner.StartWithConfig(s.runtimeCtx, resolved.Workspace.Path, cfg.WorkDir, selected.Command, mergedRunEnvVars(cfg.EnvVars, selected), cfg.ExecutionTarget); err != nil {
 		writeError(w, 409, err)
 		return
 	}
@@ -7514,7 +7824,7 @@ func (s *Server) stopProjectRun(w http.ResponseWriter, r *http.Request) {
 	}
 	resolved, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	s.runManagersMu.RLock()
@@ -7556,6 +7866,17 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 与启动一致：请求体只带 selectedCommandId，指明重启后跑哪一条；不带则用配置里
+	// 持久化的选中项。
+	var req RunConfig
+	if !decodeOptional(w, r, &req) {
+		return
+	}
+	selected, err := cfg.resolveRunCommand(strings.TrimSpace(req.SelectedCommandID))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if cfg.EnvVars == nil {
 		cfg.EnvVars = map[string]string{}
 	}
@@ -7572,13 +7893,13 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if offline, ok := err.(*runnerOfflineError); ok {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "runner_offline", "runnerId": offline.RunnerID})
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "runner_offline", "code": "runner_offline", "runnerId": offline.RunnerID})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := runner.RestartWithConfig(s.runtimeCtx, resolved.Workspace.Path, cfg.WorkDir, cfg.Command, cfg.EnvVars, cfg.ExecutionTarget); err != nil {
+	if err := runner.RestartWithConfig(s.runtimeCtx, resolved.Workspace.Path, cfg.WorkDir, selected.Command, mergedRunEnvVars(cfg.EnvVars, selected), cfg.ExecutionTarget); err != nil {
 		writeError(w, 409, err)
 		return
 	}
@@ -7592,7 +7913,7 @@ func (s *Server) getProjectRunStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resolved, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	s.runManagersMu.RLock()
@@ -7612,7 +7933,7 @@ func (s *Server) clearProjectRunLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	resolved, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	s.runManagersMu.RLock()
@@ -7631,7 +7952,7 @@ func (s *Server) subscribeRunLogs(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 	resolved, resolveErr := s.resolveRequestWorkspaceFromRequest(r)
 	if resolveErr != nil {
-		writeError(w, http.StatusConflict, resolveErr)
+		writeProjectResolveError(w, resolveErr)
 		return
 	}
 	managerKey := runManagerKeyForWorkspace(projectID, resolved.Workspace)
@@ -7807,11 +8128,15 @@ func (s *Server) closeAllRunLogSubscribers() {
 // 只有**用户自己用官方安装器装的**才交给 CLI 自带的 update —— 那种布局我们不知道，
 // 硬去猜会猜错，而猜错的表现是"升级之后跑不起来"。
 //
+// 最后一档还有一次兜底：CLI 自带的 update 失败之后，若实测确认这份工具是 npm 全局
+// 装的，改用平台自己的 npm 原地重装（见 agent_update_fallback.go）。它不是"多试一次"
+// —— 在 Windows + Node ≥ 22 上，npm 全局装的 CLI 走 update 是**必然**失败的。
+//
 // 注意这里**不**做闸门：调用方（updateAgent / installAgentFor）已经持有了。
 func (s *Server) performAgentUpdate(ctx context.Context, runnerID, agentID string, runner AgentRunner) (string, string, error) {
 	// 平台装的（登记为 npm 类）一律走"重装最新版"：布局是我们定的，直接指定包与
 	// 版本确定性最高，而且 install 与 update 变成同一条代码路径（docs/42 §6.3）。
-	// 用户自己装的走 CLI 自带的 update —— 那是既有行为，不在这里动。
+	// 用户自己装的先走 CLI 自带的 update（既有行为），失败了再由下面的兜底接手。
 	recorded, hasRecord, err := s.recordedInstallation(ctx, runnerID, agentID)
 	if err != nil {
 		// 读不到登记就不知道"这份工具是怎么装上的"，也就不知道能不能接管升级 ——
@@ -7826,7 +8151,28 @@ func (s *Server) performAgentUpdate(ctx context.Context, runnerID, agentID strin
 		}
 		return recorded.Version, installation.Version, nil
 	}
-	return runner.Update(ctx)
+	previous, current, err := runner.Update(ctx)
+	if err == nil {
+		return previous, current, nil
+	}
+	// 只有**本机**才尝试接手：跨端的 npm 在哪、装到哪个 prefix 由目标环境自己报
+	// （installAgentCLICross），本机这套在那边不成立。这一档原样报出 CLI 的错，
+	// 不追加任何本机才有的措辞。
+	if !isLocalRunnerID(runnerID) {
+		return previous, "", err
+	}
+	// CLI 自带的 update 失败了。若这份工具**实测**确实是 npm 全局装的，就用平台
+	// 自己的 npm 原地重装一次 —— 理由见 agent_update_fallback.go（Windows 上
+	// `claude update` 会把一次必然失败的进程启动报成"npm registry 不可达"）。
+	//
+	// 确认不了来源（pnpm / bun / 官方安装器）时 repairAgentViaNpm 会拒绝，于是
+	// 报出去的是"CLI 的原文 + 为什么没有接手"—— 绝不为了"能升级"而另装第二份。
+	installation, repairErr := s.repairAgentViaNpm(ctx, runnerID, agentID)
+	if repairErr != nil {
+		return previous, "", fmt.Errorf("%w；已改用平台 npm 原地重装，同样失败：%v", err, repairErr)
+	}
+	// 修复成功也登记了安装，于是下一次升级直接走上面那段确定性路径。
+	return previous, installation.Version, nil
 }
 
 // installAgentFor 是 POST /api/runners/{runnerID}/agents/{agentID}/install。

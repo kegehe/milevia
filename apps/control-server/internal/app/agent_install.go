@@ -116,6 +116,46 @@ func (s *Server) resolveAgentInstallPlan(ctx context.Context, runnerID, agentID 
 	return agentInstallPlan{}, fmt.Errorf("目标环境没有可用的 npm：请先安装 Node.js 运行时（%s）", entry.Name)
 }
 
+// existingNpmInstallPlan 给出"原地升级这份**已经存在**的 npm 全局安装"的计划。
+//
+// 与 resolveAgentInstallPlan 的差别只有一条，但正是它存在的理由：prefix 由调用方
+// **实测**给出，不走"还没装过就优先托管工具链"那条默认。原地修复要升的是用户机器上
+// 那一份，另装一份是 agent_install.go 顶部明令禁止的事（两份 CLI，而没人知道哪份在生效）。
+//
+// 命令形状与 installAgentCLI 一致（`npm install -g --prefix <prefix> <pkg>@latest`）：
+// 这里显式钉住 prefix，比依赖 npm 自己的全局 prefix 更确定 —— prefix 是调用方刚从
+// `npm prefix -g` 问出来并核对过命令来源的。
+//
+// ⚠️ 系统 npm 那一档会**带上一个非空的 Prefix**，而 resolveAgentInstallPlan 的同名分支
+// 给的是空串。这不是笔误：空串的语义是"用 npm 自己的全局 prefix"，两者指向同一个地方，
+// 差别只在于这里钉住的是**实测核对过**的那一个。登记表也就因此多了一条带 prefix 的
+// 系统安装记录 —— 而 diagnoseInstallPrefix 的优先级本来就是"登记表记的（我们自己写的，
+// 权威）> 现问 npm"，记下来正是它要的。
+func (s *Server) existingNpmInstallPlan(ctx context.Context, prefix string) (agentInstallPlan, error) {
+	if root, err := managedToolchainRoot(); err == nil && sameCleanPath(managedNpmGlobalPrefix(root), prefix) {
+		npm := managedNpmCommand(root)
+		if !fileExists(npm) {
+			return agentInstallPlan{}, errors.New("该工具装在托管工具链里，但托管 npm 已经不见了；请先重新安装 Node.js 运行时")
+		}
+		return agentInstallPlan{
+			NpmPath:        npm,
+			Prefix:         prefix,
+			Kind:           installKindNpmManaged,
+			RuntimeVersion: runVersionCommand(ctx, managedNodeBinary(root), "--version"),
+		}, nil
+	}
+	npm, err := exec.LookPath("npm")
+	if err != nil {
+		return agentInstallPlan{}, errors.New("找不到 npm，无法用 npm 原地重装；请先安装 Node.js 运行时")
+	}
+	return agentInstallPlan{
+		NpmPath:        npm,
+		Prefix:         prefix,
+		Kind:           installKindNpmSystem,
+		RuntimeVersion: nodeVersionNearNpm(ctx, npm),
+	}, nil
+}
+
 // nodeVersionNearNpm 找出与这个 npm 同处一地的 node 的版本。
 //
 // 不直接查 PATH 上的 `node`：用户可能改过 PATH，让 node 与 npm 来自不同的安装。
@@ -168,13 +208,22 @@ func (s *Server) recordedInstallation(ctx context.Context, runnerID, agentID str
 //
 // install 与 update 共用它，所以两条路上的最低版本闸门、自检与登记完全一致。
 func (s *Server) installAgentCLI(ctx context.Context, runnerID, agentID, versionSelector string) (agentInstallation, error) {
-	entry, ok := agentByID(agentID)
-	if !ok {
-		return agentInstallation{}, fmt.Errorf("不支持的工具 %s", agentID)
-	}
 	plan, err := s.resolveAgentInstallPlan(ctx, runnerID, agentID)
 	if err != nil {
 		return agentInstallation{}, err
+	}
+	return s.installAgentCLIWithPlan(ctx, runnerID, agentID, plan, versionSelector, "managed-install")
+}
+
+// installAgentCLIWithPlan 是"装到哪已经定好"之后的执行段。
+//
+// 拆出来只有一个理由：原地修复（repairAgentViaNpm）必须走**完全相同**的一段。
+// 版本号白名单、运行时闸门、装后自检、登记这四道里少任何一道，都会留下一种
+// 说不清的结局：装上了却跑不起来、或者跑得起来却没登记（于是下次升级又走回老路）。
+func (s *Server) installAgentCLIWithPlan(ctx context.Context, runnerID, agentID string, plan agentInstallPlan, versionSelector, source string) (agentInstallation, error) {
+	entry, ok := agentByID(agentID)
+	if !ok {
+		return agentInstallation{}, fmt.Errorf("不支持的工具 %s", agentID)
 	}
 	if err := checkRuntimeGate(plan.RuntimeVersion, entry); err != nil {
 		return agentInstallation{}, err
@@ -231,7 +280,7 @@ func (s *Server) installAgentCLI(ctx context.Context, runnerID, agentID, version
 		InstallKind: plan.Kind,
 		Prefix:      plan.Prefix,
 		Version:     agentVersionFromOutput(runVersionCommand(ctx, binary, entry.VersionArgs...)),
-		Source:      "managed-install",
+		Source:      source,
 	}
 	if err := s.recordAgentInstallation(ctx, installation); err != nil {
 		return installation, err

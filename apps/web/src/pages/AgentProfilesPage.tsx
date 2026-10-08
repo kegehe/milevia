@@ -231,7 +231,7 @@ export default function AgentProfilesPage() {
   return <main className="app-shell agent-profiles-page">
     <header className="agent-profiles-head">
       <button className="secondary" type="button" onClick={() => navigate(-1)}>返回</button>
-      <div><h1>AI 配置管理</h1><p>高级管理视图：项目级配置请用「会话页 → AI 配置」。此处可停用 / 撤销版本。</p></div>
+      <div><h1>AI 配置管理</h1><p>高级管理视图：项目级配置请用「会话页 → AI 配置」。</p></div>
       <label>Runner<select value={runnerID} onChange={(event) => { setRunnerID(event.target.value); setDraft(null); setNotice(""); }} disabled={runners.length === 0}>{runners.map((runner) => <option key={runner.id} value={runner.id}>{runner.name}</option>)}</select></label>
     </header>
     {error && <div className="agent-profiles-error" role="alert">{error}</div>}

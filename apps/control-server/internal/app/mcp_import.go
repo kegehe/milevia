@@ -479,6 +479,15 @@ func (s *Server) persistImportedCandidate(ctx context.Context, candidate mcpImpo
 			input.Headers[key] = value
 		}
 	}
+	// ⚠️ 必须在**这里**再查一次 env 键名：上面那次 validate() 跑在填 Env 之前（那次 Env 还是空的），
+	// 而下面 buildStoredMaps 的同类错误会被统一压成"凭据无法保存"——点名不了是哪个键，
+	// 用户拿着一条第三方配置无从下手。键名为什么要挡见 mcpEnvKeyPattern。
+	if err := mcpEnvKeyError(input.Env); err != nil {
+		return err
+	}
+	if err := mcpEnvKeyError(input.EnvSecrets); err != nil {
+		return err
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

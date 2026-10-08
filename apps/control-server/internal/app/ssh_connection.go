@@ -948,7 +948,13 @@ func (s *Server) markSSHStatus(ctx context.Context, c *SSHConnection, status, er
 // recoverSSHConnections is called during startup to re-register SSH connections
 // that were previously connected.
 func (s *Server) recoverSSHConnections(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `select id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where status='connected'`)
+	// order by created_at **升序**：恢复顺序就是执行环境列表里各台 SSH 的先后
+	// （见 runnerRegistry.list），必须是"添加的先后"而不是数据库的扫描顺序。
+	// ⚠️ 用升序而不是 SSH 管理页那样的 desc：新加的连接是在**运行期**注册的，
+	// 落在列表末尾；重启后要还是末尾，标签的顺序才不会变（管理页是另一个列表视图，
+	// 那边"最新的在上"是它自己的选择，与此无关）。
+	// 尾上再挂 id 只为消掉同一时刻创建时的并列（UUID 本身无意义，但它是确定的）。
+	rows, err := s.db.QueryContext(ctx, `select id,name,host,port,user,private_key_path,private_key_paths,known_hosts,root_path,status,last_seen,error_msg,created_at,updated_at, password from ssh_connections where status='connected' order by created_at, id`)
 	if err != nil {
 		return fmt.Errorf("query ssh connections for recovery: %w", err)
 	}

@@ -28,6 +28,21 @@ const (
 	gitOperationNeedsAttention = "needs_attention"
 )
 
+// 这几个哨兵存在的唯一理由是给客户端一个**稳定错误码**（见 httpErrorCode）。
+//
+// 手机端的 Git 面板按失败种类分支（滚动刷新 / 提示"已为你刷新" / 清空选择 / 提示无改动），
+// 而它只能从四跳之外拿到一句文案。按文案匹配是错的判据：文案会被翻译、会被改措辞，
+// 改了那边不会报错，只会静默失效（docs/41 §15.1 记录过一次真实事故——"工作区被占用"
+// 那一档在真实链路上永远不命中，而单测喂原文照样绿）。
+//
+// 文案本身保持英文不动：它同时是**历史契约**（旧客户端与旧云端仍在按它匹配），
+// 换文案要连客户端一起发版；给码是加法，不会让任何已有匹配失效。
+var (
+	errGitStateChanged = errors.New("Git state changed; refresh the repository")
+	errGitNoChanges    = errors.New("there are no eligible Git changes")
+	errGitPathsGone    = errors.New("selected Git paths are no longer available")
+)
+
 type GitOperation struct {
 	ID             string     `json:"id"`
 	ProjectID      string     `json:"projectId"`
@@ -202,7 +217,7 @@ func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
 	observedAt := time.Now().UTC()
 	workspace, resolveErr := s.resolveRequestWorkspaceFromRequest(r)
 	if resolveErr != nil {
-		writeError(w, http.StatusConflict, resolveErr)
+		writeProjectResolveError(w, resolveErr)
 		return
 	}
 	token := s.issueGitStateToken(chi.URLParam(r, "projectID"), workspace.Workspace.ID, workspace.Workspace.Path, snapshot, changes, fingerprints, observedAt)
@@ -223,7 +238,7 @@ func (s *Server) gitInit(w http.ResponseWriter, r *http.Request) {
 	defer s.projectLifecycleMu.Unlock()
 	runner, repo, err := s.gitRunnerForProject(r.Context(), projectID)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	if _, err := runner.runGit(r.Context(), repo, "init", "-b", "main"); err != nil {
@@ -356,7 +371,7 @@ func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ
 		}
 	}
 	if len(paths) == 0 {
-		writeError(w, http.StatusConflict, errors.New("there are no eligible Git changes"))
+		writeError(w, http.StatusConflict, errGitNoChanges)
 		return
 	}
 	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, typ, fmt.Sprintf("%s（%d 个文件）", label, len(paths)), state.snapshot, func(runner GitRunner) error {
@@ -399,7 +414,7 @@ func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ st
 	for _, path := range input.Paths {
 		change, found := available[path]
 		if !found || (typ == "stage" && !(change.Modified || change.Untracked || change.Deleted || change.Renamed || change.Conflicted)) || (typ == "unstage" && !change.Staged) {
-			writeError(w, http.StatusConflict, errors.New("selected Git paths are no longer available"))
+			writeError(w, http.StatusConflict, errGitPathsGone)
 			return
 		}
 	}
@@ -816,7 +831,7 @@ func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	workspaceKey := workspaceLeaseKey(workspace.Project, workspace.Workspace)
@@ -1043,7 +1058,7 @@ func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateT
 	projectID := chi.URLParam(r, "projectID")
 	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return nil, "", "", gitStateToken{}, nil, false
 	}
 	workspaceKey := workspaceLeaseKey(workspace.Project, workspace.Workspace)
@@ -1214,14 +1229,14 @@ func (s *Server) validateGitStateToken(ctx context.Context, runner GitRunner, pr
 	record, found := s.gitStateTokens[token]
 	s.mu.Unlock()
 	if token == "" || !found || record.projectID != projectID || record.workspaceID != workspaceID || !sameCleanPath(record.workspacePath, repo) || !record.expiresAt.After(time.Now().UTC()) {
-		return gitStateToken{}, errors.New("Git state changed; refresh the repository")
+		return gitStateToken{}, errGitStateChanged
 	}
 	snapshot, changes, fingerprints, err := readGitState(ctx, runner, repo)
 	if err != nil {
 		return gitStateToken{}, errors.New("Git repository state is unavailable")
 	}
 	if !reflect.DeepEqual(record.snapshot, snapshot) || !reflect.DeepEqual(record.changes, changes) || !reflect.DeepEqual(record.fingerprints, fingerprints) {
-		return gitStateToken{}, errors.New("Git state changed; refresh the repository")
+		return gitStateToken{}, errGitStateChanged
 	}
 	return record, nil
 }
@@ -1382,7 +1397,7 @@ func (s *Server) gitOperations(w http.ResponseWriter, r *http.Request) {
 	}
 	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeProjectResolveError(w, err)
 		return
 	}
 	filter := gitOperationFilter{

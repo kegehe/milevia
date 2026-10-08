@@ -350,7 +350,7 @@ func TestClaudeSessionFinishClearsBackgroundWait(t *testing.T) {
 
 	session.readOutput(strings.NewReader(claudeBackgroundMainTurn))
 
-	session.finish(errors.New("Claude exited"))
+	session.finish(errors.New(claudeExitPrefix + "exit status 1"))
 
 	session.mu.Lock()
 	defer session.mu.Unlock()

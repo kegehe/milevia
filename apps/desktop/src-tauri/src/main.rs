@@ -21,7 +21,7 @@ use tauri::{
     Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, RunEvent, WebviewUrl,
     WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
-use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 use url::Url;
 use uuid::Uuid;
 
@@ -68,6 +68,96 @@ const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(45);
 // GitHub release assets can be slow on some networks. Keep a generous total
 // limit, while still guaranteeing that a stalled download eventually fails.
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+// 单次读取的停滞上限：这么久没读到新数据就判定这条连接已经死了。
+//
+// reqwest 的 `read_timeout` 是"每次读操作"的超时（读到数据就重置），正是用来
+// 对付"连接没断但也不再吐数据"的假死。只有总超时的话，假死要等满
+// UPDATE_DOWNLOAD_TIMEOUT（45 分钟）才失败，而这段时间里用户点安装只会被告知
+// "更新正在后台下载" —— 等于被锁在门外。挂死后快速失败 → 重试 → 实在不行退回
+// 手动路径，最多几分钟就能重新掌握主动权。
+const UPDATE_READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+// 后台静默预下载的总尝试次数与重试间隔。静默下载失败用户是看不见的，
+// 所以先自己重试几轮；全部失败才把 download 相位落成 failed，界面退回
+// "发现新版本 → 点击后再下载安装"的老路径。
+const BACKGROUND_DOWNLOAD_ATTEMPTS: u32 = 3;
+const BACKGROUND_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(30);
+// "点击安装时预下载还在跑"的等待上限。取得比 UPDATE_READ_STALL_TIMEOUT 略长：
+// 这样"连接假死"一定会在等待期内被判失败（phase → failed），用户拿到的是"现场
+// 重下"而不是"再等等"。这种点击在现有界面上几乎点不出来（下载中三处入口都不可点），
+// 这里只是兜住竞态，绝不因此触发第二次下载。
+const PENDING_DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// 后台预下载的相位快照。前端据此决定"能不能直接安装"。
+/// - idle：没有可装的包（尚未开始 / 更新源撤回了版本）
+/// - downloading：正在后台静默下载
+/// - ready：已下载并校验签名，点击即可安装
+/// - failed：静默下载失败，界面退回"点击后再下载安装"
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateDownloadRepr {
+    phase: String,
+    received: u64,
+    total: Option<u64>,
+    error: Option<String>,
+}
+
+impl UpdateDownloadRepr {
+    fn idle() -> Self {
+        Self {
+            phase: "idle".to_string(),
+            received: 0,
+            total: None,
+            error: None,
+        }
+    }
+}
+
+/// 由三份真实下载状态推导出给前端看的相位。
+///
+/// 做成纯函数是为了可单测：`tauri_plugin_updater::Update` 的字段私有，测试里
+/// 造不出实例，所以这里只收版本号与包大小。
+///
+/// 三份状态都按**当前公告的版本号**守卫：更新源换了版本、或撤回了版本时，
+/// 之前下好的包已经没用了，相位一律回到 idle —— 否则界面会提示"已就绪"，
+/// 装上去的却是别的版本。
+fn download_repr(
+    advertised: Option<&str>,
+    pending: Option<(&str, u64)>,
+    downloading: Option<(&str, u64, Option<u64>)>,
+    failed: Option<(&str, &str)>,
+) -> UpdateDownloadRepr {
+    if let Some((version, size)) = pending {
+        if advertised == Some(version) {
+            return UpdateDownloadRepr {
+                phase: "ready".to_string(),
+                received: size,
+                total: Some(size),
+                error: None,
+            };
+        }
+    }
+    if let Some((version, received, total)) = downloading {
+        if advertised == Some(version) {
+            return UpdateDownloadRepr {
+                phase: "downloading".to_string(),
+                received,
+                total,
+                error: None,
+            };
+        }
+    }
+    if let Some((version, error)) = failed {
+        if advertised == Some(version) {
+            return UpdateDownloadRepr {
+                phase: "failed".to_string(),
+                received: 0,
+                total: None,
+                error: Some(error.to_string()),
+            };
+        }
+    }
+    UpdateDownloadRepr::idle()
+}
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +166,36 @@ struct UpdateInfoRepr {
     status: String,
     update: Option<UpdateInfo>,
     error: Option<String>,
+    /// 后台静默预下载的进度（见 `UpdateDownloadRepr`）
+    download: UpdateDownloadRepr,
+}
+
+/// 正在后台静默下载的进度。
+struct DownloadProgress {
+    version: String,
+    received: u64,
+    total: Option<u64>,
+}
+
+/// 已下载完成、等待安装的整包。
+///
+/// `update` 是安装所必需的句柄（`install()` 是它的方法），里面还挂着
+/// `on_before_exit`（安装前先停 sidecar/agent）—— 见 `build_updater`。
+/// `bytes` 约 24MB，只在"有待安装更新"期间常驻内存，安装或换版本即释放。
+struct PendingUpdate {
+    version: String,
+    update: Update,
+    bytes: Vec<u8>,
+}
+
+/// 取"等待安装的整包"的结果。
+enum PendingSlot {
+    /// 包已备好，可以直接安装
+    Ready(PendingUpdate),
+    /// 预下载还在跑，等到超时也没落定
+    StillDownloading,
+    /// 没有可用的包（还没开始或已失败），交给"现场检查 + 下载"的老路径
+    Unavailable,
 }
 
 struct UpdateCheck {
@@ -86,6 +206,184 @@ struct UpdateCheckState {
     info: UpdateInfoRepr,
     generation: u64,
     installing: bool,
+    /// 已下载并验签通过、等待安装的整包
+    pending: Option<PendingUpdate>,
+    /// 正在后台下载的版本与进度
+    downloading: Option<DownloadProgress>,
+    /// 后台下载失败的 (版本, 原因)
+    download_error: Option<(String, String)>,
+}
+
+impl UpdateCheckState {
+    /// 丢弃与当前公告版本不符的下载成果 / 任务 / 错误。
+    fn prune_download(&mut self) {
+        let advertised = self.info.update.as_ref().map(|update| update.version.clone());
+        let matches = |version: &str| advertised.as_deref() == Some(version);
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !matches(&pending.version))
+        {
+            self.pending = None;
+        }
+        if self
+            .downloading
+            .as_ref()
+            .is_some_and(|progress| !matches(&progress.version))
+        {
+            self.downloading = None;
+        }
+        if self
+            .download_error
+            .as_ref()
+            .is_some_and(|(version, _)| !matches(version))
+        {
+            self.download_error = None;
+        }
+    }
+
+    /// 把 `info.download` 与真实的下载状态对齐。所有会改动下载状态的路径都要
+    /// 经过这里，前端的相位才不会和事实脱节。
+    fn sync_download(&mut self) {
+        self.prune_download();
+        let repr = {
+            let advertised = self.info.update.as_ref().map(|update| update.version.as_str());
+            download_repr(
+                advertised,
+                self.pending
+                    .as_ref()
+                    .map(|pending| (pending.version.as_str(), pending.bytes.len() as u64)),
+                self.downloading.as_ref().map(|progress| {
+                    (
+                        progress.version.as_str(),
+                        progress.received,
+                        progress.total,
+                    )
+                }),
+                self.download_error
+                    .as_ref()
+                    .map(|(version, error)| (version.as_str(), error.as_str())),
+            )
+        };
+        self.info.download = repr;
+    }
+
+    /// 同步下载相位之后的对外快照。
+    fn snapshot(&mut self) -> UpdateInfoRepr {
+        self.sync_download();
+        self.info.clone()
+    }
+
+    /// 落地一次「检查成功」：写入公告版本、清掉上次的错误，并判断该不该起预下载。
+    ///
+    /// `announced` 是 (版本号, 对外信息)，None 表示这次没查到新版本。
+    /// 返回 true 表示调用方应当在**锁外**为这个版本起一次静默预下载 —— spawn
+    /// 不能在持锁时做，但"该不该起"必须和状态落地在同一个锁里，否则并发检查
+    /// 会各起一个下载任务。调用方在这之后还要 `snapshot()` 一次。
+    fn apply_check_success(
+        &mut self,
+        app_version: String,
+        announced: Option<(String, UpdateInfo)>,
+    ) -> bool {
+        self.info.app_version = app_version;
+        self.info.status = "complete".to_string();
+        self.info.error = None;
+        let Some((version, info)) = announced else {
+            // 服务器说没有新版本：公告清空，之前下好的包也随之作废（prune）。
+            self.info.update = None;
+            return false;
+        };
+        self.info.update = Some(info);
+        // 同一版本已有成果或任务、或正在安装时不再起第二个。
+        if self.installing
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.version == version)
+            || self
+                .downloading
+                .as_ref()
+                .is_some_and(|progress| progress.version == version)
+        {
+            return false;
+        }
+        self.download_error = None;
+        self.downloading = Some(DownloadProgress {
+            version,
+            received: 0,
+            total: None,
+        });
+        true
+    }
+
+    /// 落地一次「检查失败」。
+    ///
+    /// **刻意只改状态与错误，不动 `info.update` 与下载状态**：一次检查失败
+    /// （网络抖动、自建源暂时不可达）跟"更新源撤回了版本"是两回事。清掉
+    /// `info.update` 会连带 prune 掉已经下好的整包、并掐掉正在跑的预下载 ——
+    /// 用户白等一遍 24MB，明明包已经到手了。下次检查成功时 `info.update` 会被
+    /// 重新写一遍，真正该丢的（换版本 / 撤回）自然会被 prune 掉。
+    fn apply_check_failure(&mut self, app_version: String, error: String) {
+        self.info.app_version = app_version;
+        self.info.status = "failed".to_string();
+        self.info.error = Some(error);
+    }
+}
+
+/// 构造 updater：检查与下载共用一份配置。
+///
+/// 下载超时放宽到 45 分钟（GitHub 资源在部分网络下很慢）；检查本身另外用
+/// `tokio::time::timeout` 单独限时，所以这个宽超时不会拖慢检查。
+///
+/// `on_before_exit` 会随 `check()` 产出的 `Update` 一起传下去（插件把它存进
+/// `Update`），因此**后台静默预下载拿到的 `Update` 在稍后安装时同样会先停子进程**。
+/// 这条不能省：Windows 上 updater 启动安装包后直接 `std::process::exit(0)`，
+/// `RunEvent::ExitRequested` 不会触发，`run()` 回调里的 stop_agent/stop_sidecar
+/// 也就没机会执行；而 milevia-control.exe 只能靠 parent-watch 发现自己成了孤儿，
+/// 安装程序覆写它时它往往还在运行 —— 于是必弹"无法打开要写入的文件"。
+/// 顺带也让 SQLite 正常收尾（否则升级后首次启动可能卡在"库被锁定"）。
+fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    app.updater_builder()
+        .timeout(UPDATE_DOWNLOAD_TIMEOUT)
+        // 连接假死（没断、也不再吐数据）只靠总超时要等满 45 分钟。加一条读停滞
+        // 超时，让它在两分钟内失败，交给重试 / 手动路径 —— 详见常量注释。
+        .configure_client(|builder| builder.read_timeout(UPDATE_READ_STALL_TIMEOUT))
+        .on_before_exit({
+            let app = app.clone();
+            move || {
+                stop_agent(&app);
+                stop_sidecar(&app);
+            }
+        })
+        .build()
+        .map_err(localize_update_error)
+}
+
+
+/// 把 tauri-plugin-updater 的英文错误转成中文。
+///
+/// 这个插件是本应用里**唯一一处"纯英文直出界面"**：它的错误经
+/// `UpdateInfoRepr.error` / `UpdateDownloadRepr.error` 原样渲染在更新横幅上
+/// （`UpdateBanner.tsx` 直接把它塞进 <span>），没有任何兜底。
+///
+/// 未命中任何一类时也必须套一层中文外壳——「更新失败：<原文>」——不能原样返回英文。
+/// 原文一律附在括号里：排障与搜索都要靠它。
+fn localize_update_error(raw: impl std::fmt::Display) -> String {
+    let text = raw.to_string();
+    let lower = text.to_lowercase();
+    // 三类判据都取插件文案里稳定出现的词，不做语义猜测；认不出就走最后那条兜底。
+    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("dns")
+        || lower.contains("connect") || lower.contains("network")
+    {
+        return format!("检查更新失败：网络不可用（{text}）");
+    }
+    if lower.contains("404") || lower.contains("not found") {
+        return format!("检查更新失败：更新源上没有这个版本的文件（{text}）");
+    }
+    if lower.contains("signature") || lower.contains("verify") || lower.contains("minisign") {
+        return format!("更新包校验失败：签名与当前应用不匹配（{text}）");
+    }
+    format!("更新失败：{text}")
 }
 
 async fn perform_update_check(app: &tauri::AppHandle) -> UpdateInfoRepr {
@@ -95,47 +393,66 @@ async fn perform_update_check(app: &tauri::AppHandle) -> UpdateInfoRepr {
         state.generation = state.generation.wrapping_add(1);
         state.info.status = "checking".to_string();
         state.info.error = None;
-        state.info.update = None;
+        // 这里**刻意不动** info.update 与下载状态：正在跑的静默预下载靠
+        // info.update.version 做版本守卫，中途清掉它会让每次重新检查（比如打开
+        // 托盘面板）都把下到一半的包判成过期、从零重下。status 不是 complete 时
+        // 前端本来就不渲染 update，留着不会露旧版本。
         state.generation
     } else {
         0
     };
     let result = async {
-        let updater = app
-            .updater_builder()
-            .timeout(UPDATE_CHECK_TIMEOUT)
-            .build()
-            .map_err(|error| error.to_string())?;
-        let update = updater.check().await.map_err(|error| error.to_string())?;
-        Ok::<Option<UpdateInfo>, String>(update.map(|update| UpdateInfo {
-            current_version: update.current_version,
-            version: update.version,
-            notes: update.body.clone(),
-        }))
+        let updater = build_updater(app)?;
+        let update = tokio::time::timeout(UPDATE_CHECK_TIMEOUT, updater.check())
+            .await
+            .map_err(|_| "检查更新超过 45 秒仍未完成，请检查网络后重试".to_string())?
+            .map_err(localize_update_error)?;
+        Ok::<Option<Update>, String>(update)
     }
     .await;
-    let next = match result {
-        Ok(update) => UpdateInfoRepr {
-            app_version,
-            status: "complete".to_string(),
-            update,
-            error: None,
-        },
-        Err(error) => UpdateInfoRepr {
-            app_version,
-            status: "failed".to_string(),
-            update: None,
-            error: Some(error),
-        },
-    };
-    if let Ok(mut state) = update_check.state.lock() {
-        if state.generation == generation {
-            state.info = next.clone();
-            return next;
+    // 只有"最新一代"的检查有权写状态：并发检查里落后的那次沿用先到的结果。
+    let mut start_download = None;
+    let snapshot = {
+        let Ok(mut state) = update_check.state.lock() else {
+            return UpdateInfoRepr {
+                app_version,
+                status: "failed".to_string(),
+                update: None,
+                error: Some("更新状态锁不可用".to_string()),
+                download: UpdateDownloadRepr::idle(),
+            };
+        };
+        if state.generation != generation {
+            state.snapshot()
+        } else {
+            match result {
+                Ok(update) => {
+                    let announced = update.as_ref().map(|update| {
+                        (
+                            update.version.clone(),
+                            UpdateInfo {
+                                current_version: update.current_version.clone(),
+                                version: update.version.clone(),
+                                notes: update.body.clone(),
+                            },
+                        )
+                    });
+                    // 发现新版本就立刻后台静默预下载：等用户点"安装"时包已经在手上了。
+                    if state.apply_check_success(app_version, announced) {
+                        start_download = update;
+                    }
+                }
+                Err(error) => {
+                    state.apply_check_failure(app_version, error);
+                }
+            }
+            state.snapshot()
         }
-        return state.info.clone();
+    };
+    if let Some(update) = start_download {
+        spawn_background_download(app, update);
     }
-    next
+    snapshot
 }
 
 fn prime_update_check(app: &tauri::AppHandle) {
@@ -160,7 +477,186 @@ async fn check_for_update_now(app: tauri::AppHandle) -> UpdateInfoRepr {
     perform_update_check(&app).await
 }
 
-/// 下载并安装新版本，结束后重启应用。期间通过 `updater://progress` 事件回报进度。
+/// 起一个后台静默预下载任务。
+///
+/// 去重与"标记为下载中"由 `UpdateCheckState::apply_check_success` 在锁内一并做完，
+/// 这里只负责把任务挂到运行时上。
+fn spawn_background_download(app: &tauri::AppHandle, update: Update) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        background_download(app, update).await;
+    });
+}
+
+/// 后台静默预下载整包到内存（约 24MB），成功后放进 `pending` 等待安装。
+///
+/// **全程不发 `updater://progress` 事件**：那个事件是给"用户点出来的安装"驱动
+/// 进度条的，静默下载往上面发就会把右上角横幅点亮，静默也就无从谈起。进度只走
+/// `get_updater_status` 的 `download` 字段，由设置页/托盘按需读。
+async fn background_download(app: tauri::AppHandle, update: Update) {
+    let version = update.version.clone();
+    let mut last_error = String::new();
+    for attempt in 1..=BACKGROUND_DOWNLOAD_ATTEMPTS {
+        if !background_download_wanted(&app, &version) {
+            return; // 已被新检查取代：静默放弃，别把过期结果写回去
+        }
+        // 重试是从 0 重新下的：先把残留进度清掉，别让上一次的数字挂在界面上。
+        record_download_progress(&app, &version, 0, None);
+        // 插件的进度回调给的是**本次块大小**（`on_chunk(chunk.len(), content_length)`），
+        // 不是累计字节，所以自己累加。计数放在循环体内：重试时天然归零，
+        // 否则跨次累加会算出超过 100% 的假进度。
+        let mut received: u64 = 0;
+        let outcome = tokio::time::timeout(
+            UPDATE_DOWNLOAD_TIMEOUT,
+            update.download(
+                |chunk, total| {
+                    received += chunk as u64;
+                    record_download_progress(&app, &version, received, total);
+                },
+                || {},
+            ),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(bytes)) => {
+                store_downloaded(&app, &version, update.clone(), bytes);
+                return;
+            }
+            Ok(Err(error)) => last_error = localize_update_error(error),
+            Err(_) => {
+                last_error = format!(
+                    "更新下载超过 {} 分钟仍未完成",
+                    UPDATE_DOWNLOAD_TIMEOUT.as_secs() / 60
+                )
+            }
+        }
+        if attempt < BACKGROUND_DOWNLOAD_ATTEMPTS {
+            tokio::time::sleep(BACKGROUND_DOWNLOAD_RETRY_DELAY).await;
+        }
+    }
+    // 重试也全败：把相位落成 failed，界面退回"发现新版本 → 点击后再下载"。
+    let update_check = app.state::<UpdateCheck>();
+    let Ok(mut state) = update_check.state.lock() else {
+        return;
+    };
+    if !is_downloading(&state, &version) {
+        return;
+    }
+    state.downloading = None;
+    state.download_error = Some((version, last_error));
+    state.sync_download();
+}
+
+/// 这次后台下载是否仍然值得继续：版本没被换掉（换了会被 `prune_download` 清空）。
+fn background_download_wanted(app: &tauri::AppHandle, version: &str) -> bool {
+    let update_check = app.state::<UpdateCheck>();
+    let Ok(state) = update_check.state.lock() else {
+        return false;
+    };
+    is_downloading(&state, version)
+}
+
+fn is_downloading(state: &UpdateCheckState, version: &str) -> bool {
+    state
+        .downloading
+        .as_ref()
+        .is_some_and(|progress| progress.version == version)
+}
+
+/// 记录后台预下载进度。`received` 是**累计**字节数 —— 插件的回调给的是单块大小，
+/// 调用方负责累加（见 `background_download` / `install_update_inner`）。
+fn record_download_progress(
+    app: &tauri::AppHandle,
+    version: &str,
+    received: u64,
+    total: Option<u64>,
+) {
+    let update_check = app.state::<UpdateCheck>();
+    let Ok(mut state) = update_check.state.lock() else {
+        return;
+    };
+    let matched = state.downloading.as_mut().is_some_and(|progress| {
+        if progress.version != version {
+            return false;
+        }
+        progress.received = received;
+        progress.total = total;
+        true
+    });
+    if matched {
+        state.sync_download();
+    }
+}
+
+/// 下载 + 验签成功后落库。版本在这期间被换掉就丢弃，绝不把旧包当新包用。
+fn store_downloaded(app: &tauri::AppHandle, version: &str, update: Update, bytes: Vec<u8>) {
+    let update_check = app.state::<UpdateCheck>();
+    let Ok(mut state) = update_check.state.lock() else {
+        return;
+    };
+    if !is_downloading(&state, version) {
+        return;
+    }
+    state.downloading = None;
+    state.download_error = None;
+    state.pending = Some(PendingUpdate {
+        version: version.to_string(),
+        update,
+        bytes,
+    });
+    state.sync_download();
+}
+
+/// 取"等待安装的整包"。若预下载还在跑就先等它落定（有界）—— 一次"点击安装"
+/// 不该触发第二次下载。
+async fn take_pending_update(app: &tauri::AppHandle) -> PendingSlot {
+    let deadline = tokio::time::Instant::now() + PENDING_DOWNLOAD_WAIT_TIMEOUT;
+    loop {
+        let waiting = {
+            let update_check = app.state::<UpdateCheck>();
+            let Ok(mut state) = update_check.state.lock() else {
+                return PendingSlot::Unavailable;
+            };
+            if let Some(pending) = state.pending.take() {
+                state.sync_download();
+                return PendingSlot::Ready(pending);
+            }
+            // 预下载还在跑就再等等；没有在跑的（还没开始 / 已失败）交给老路径现场下载。
+            state.downloading.is_some()
+        };
+        if !waiting {
+            return PendingSlot::Unavailable;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return PendingSlot::StillDownloading;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// 用内存里备好的整包安装（不再联网）。失败时把包放回状态，用户还能再点一次。
+fn install_pending(app: &tauri::AppHandle, pending: PendingUpdate) -> Result<(), String> {
+    // 安装前先停 sidecar/agent 的钩子挂在这个 `Update` 上（随 check() 一起传下来的）。
+    let installed = pending.update.install(&pending.bytes);
+    if let Err(error) = installed {
+        let update_check = app.state::<UpdateCheck>();
+        if let Ok(mut state) = update_check.state.lock() {
+            state.pending = Some(pending);
+            state.sync_download();
+        }
+        return Err(localize_update_error(error));
+    }
+    // Windows 上 install_inner 内部已 `std::process::exit(0)`，走不到这里；
+    // 其它平台兜底重启一次。
+    app.restart();
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+/// 安装新版本，结束后重启应用。期间通过 `updater://progress` 事件回报进度。
+///
+/// 两条路径：后台静默预下载已备好包时直接装（快，且不再联网）；否则现场
+/// 检查 + 下载 + 安装（老路径，也是静默下载失败时的兜底）。
 #[derive(serde::Serialize)]
 struct InstallUpdateResult {
     installed: bool,
@@ -180,7 +676,15 @@ async fn install_update(app: tauri::AppHandle) -> Result<InstallUpdateResult, St
         state.installing = true;
     }
 
-    let result = install_update_inner(&app).await;
+    let result = match take_pending_update(&app).await {
+        PendingSlot::Ready(pending) => {
+            install_pending(&app, pending).map(|()| InstallUpdateResult { installed: true })
+        }
+        PendingSlot::StillDownloading => {
+            Err("更新正在后台下载，下载完成后再点安装即可".to_string())
+        }
+        PendingSlot::Unavailable => install_update_inner(&app).await,
+    };
     if let Ok(mut state) = app.state::<UpdateCheck>().state.lock() {
         state.installing = false;
     }
@@ -201,29 +705,9 @@ async fn install_update(app: tauri::AppHandle) -> Result<InstallUpdateResult, St
     }
 }
 
+/// 老路径：现场检查一次，有新版就下载并安装。
 async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateResult, String> {
-    let updater = app
-        .updater_builder()
-        // The updater client's timeout also applies to the asset download.
-        // Keep it generous for large packages on slow networks; the check
-        // itself is bounded separately below.
-        .timeout(UPDATE_DOWNLOAD_TIMEOUT)
-        // 交给安装程序之前先自己停掉子进程。Windows 上 updater 启动安装包后直接
-        // `std::process::exit(0)`（tauri-plugin-updater 的 `install_inner`），
-        // `RunEvent::ExitRequested` 不会触发，`run()` 回调里的 stop_agent/stop_sidecar
-        // 也就没机会执行；而 milevia-control.exe 只能靠 parent-watch 发现自己成了孤儿，
-        // 安装程序覆写它时它往往还在运行 —— 于是必弹"无法打开要写入的文件"。
-        // 这里优雅停掉：既让安装程序能立刻覆写文件，也让 SQLite 正常收尾
-        // （否则升级后首次启动可能卡在"库被锁定"）。
-        .on_before_exit({
-            let app = app.clone();
-            move || {
-                stop_agent(&app);
-                stop_sidecar(&app);
-            }
-        })
-        .build()
-        .map_err(|error| error.to_string())?;
+    let updater = build_updater(app)?;
     let _ = app.emit(
         "updater://progress",
         serde_json::json!({ "phase": "checking", "received": 0, "total": null }),
@@ -231,7 +715,7 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
     let update = tokio::time::timeout(UPDATE_CHECK_TIMEOUT, updater.check())
         .await
         .map_err(|_| "检查更新超过 45 秒仍未完成，请检查网络后重试".to_string())?
-        .map_err(|error| error.to_string())?;
+        .map_err(localize_update_error)?;
     let Some(update) = update else {
         let update_check = app.state::<UpdateCheck>();
         if let Ok(mut state) = update_check.state.lock() {
@@ -239,6 +723,8 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
             state.info.status = "complete".to_string();
             state.info.update = None;
             state.info.error = None;
+            // 更新源撤回了版本：之前下好的包（若有）也要一起作废。
+            state.sync_download();
         }
         return Ok(InstallUpdateResult { installed: false });
     };
@@ -246,10 +732,14 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
         "updater://progress",
         serde_json::json!({ "phase": "starting", "received": 0, "total": null }),
     );
+    // 插件的进度回调给的是**单块大小**而不是累计字节（见 `background_download` 里的
+    // 说明），这里同样要自己累加 —— 否则横幅上的进度条会一直停在 0% 附近。
+    let mut received: u64 = 0;
     let download = tokio::time::timeout(
         UPDATE_DOWNLOAD_TIMEOUT,
         update.download_and_install(
-            |received, total| {
+            |chunk, total| {
+                received += chunk as u64;
                 let _ = app.emit(
                     "updater://progress",
                     serde_json::json!({ "phase": "downloading", "received": received, "total": total }),
@@ -266,7 +756,7 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
     .await;
     match download {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(error.to_string()),
+        Ok(Err(error)) => return Err(localize_update_error(error)),
         Err(_) => {
             return Err(format!(
                 "更新下载超过 {} 分钟仍未完成，请检查网络后重试",
@@ -393,7 +883,7 @@ fn load_agent_env(
             .map(|value| value.trim().is_empty())
             .unwrap_or(true)
     {
-        return Err("agent configuration is missing MILEVIA_CLOUD_URL".into());
+        return Err("Agent 配置缺少 MILEVIA_CLOUD_URL，无法注册到云端".into());
     }
     let credential_path = endpoint_path
         .parent()
@@ -444,11 +934,11 @@ fn start_agent(
 ) -> Result<Option<Child>, Box<dyn Error>> {
     let binary = agent_binary(app)?;
     if !binary.exists() {
-        return Err(format!("Agent binary not found: {}", binary.display()).into());
+        return Err(format!("找不到 Agent 可执行文件：{}", binary.display()).into());
     }
     let config = agent_config_path(app)?;
     if !config.exists() {
-        return Err(format!("Agent configuration not found: {}", config.display()).into());
+        return Err(format!("找不到 Agent 配置文件：{}", config.display()).into());
     }
     let data_dir = app.path().app_local_data_dir()?;
     let endpoint = data_dir.join("milevia.endpoint");
@@ -473,7 +963,7 @@ fn start_agent(
     command.creation_flags(CREATE_NO_WINDOW);
     match command.spawn() {
         Ok(child) => Ok(Some(child)),
-        Err(error) => Err(format!("failed to start Agent: {error}").into()),
+        Err(error) => Err(format!("启动 Agent 失败：{error}").into()),
     }
 }
 
@@ -495,7 +985,7 @@ fn enroll_remote_agent(app: tauri::AppHandle, enrollment_token: String) -> Resul
         .map(|sidecar| sidecar.local_agent_token.clone())
         .ok_or("本地控制服务尚未启动")?;
     let agent =
-        start_agent(&app, &local_agent_token, Some(token)).map_err(|error| error.to_string())?;
+        start_agent(&app, &local_agent_token, Some(token)).map_err(localize_update_error)?;
     *app.state::<ManagedAgent>()
         .0
         .lock()
@@ -523,6 +1013,52 @@ fn open_app_data_directory(app: tauri::AppHandle) -> Result<(), String> {
     // 会弹一句"找不到路径"——那时候用户只会以为按钮坏了。
     std::fs::create_dir_all(&dir).map_err(|error| format!("创建应用数据目录失败：{error}"))?;
     open_directory(&dir)
+}
+
+/// 把 URL 交给系统协议处理器打开（http/https → 默认浏览器，mailto: → 邮件客户端）。
+///
+/// ⚠️ 这个命令**前端一直在调、宿主却从没注册过**（2026-09-29 复查发现）：`@milevia/sdk`
+/// 的 `openExternal()` 会 `invoke("open_external")`，失败后自己退回 `window.open`；
+/// 而本应用两个窗口都 `.on_new_window(|_, _| NewWindowResponse::Deny)`、`on_navigation`
+/// 只放行本地源 —— 于是**桌面端所有外链都打不开**：MCP 的 OAuth 授权页（还会先弹一句
+/// "已打开授权页面"然后死等 flow）、CLI 工具登录的授权链接、运行日志与消息里的链接。
+/// 与 open_app_data_directory 是同一个教训：`invoke("…")` 必须与 `invoke_handler` 那张表
+/// 一起改，两侧没有共享类型，编译期抓不到。
+///
+/// 只放行 http/https/mailto：这个参数会交给系统的协议处理器，放行 `file:`/`javascript:` 等于把
+/// 前端能拿到的任意字符串变成一次"用系统默认程序打开它"。`mailto:` 是同一天补的（此前桌面端
+/// 点 AI 回复里的邮箱毫无反应）：它没有代码执行能力、去处就是系统邮件客户端，与 Web/手机端
+/// 浏览器的原生行为一致，所以放进来；`tel:` 桌面端没有去处、`ftp:` 在所有现代浏览器里都已失效
+/// （Chrome 88 起移除 FTP），都不放。SDK 侧（`openExternal`）有一道同样的判据，这里必须自己
+/// 再判一次 —— 命令是可以被直接 invoke 的，不能把安全性寄托在调用方身上。
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let parsed = Url::parse(url.trim()).map_err(|_| "链接格式不正确。".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" | "mailto" => open_url_in_browser(parsed.as_str()),
+        _ => Err("只支持打开 http/https/mailto 链接。".to_string()),
+    }
+}
+
+/// 把 URL 交给系统协议处理器（http/https 落到默认浏览器，mailto: 落到邮件客户端）。
+///
+/// Windows 走 `rundll32 url.dll,FileProtocolHandler`（ShellExecute 的官方 shim）：不进
+/// shell、URL 走独立 argv，所以 `&`/`|` 这类元字符不会被重解释（与 `explorer` 那条同一
+/// 个理由）；它也不像 `cmd /C start` 那样会弹出控制台窗口。同 `open_directory`，
+/// **不等退出状态**：这类进程的退出码不代表成功与否。
+#[cfg(windows)]
+fn open_url_in_browser(url: &str) -> Result<(), String> {
+    Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开链接失败：{error}"))
+}
+
+/// 其它平台目前没有发布产物，明确回一句而不是假装成功（同 `open_directory`）。
+#[cfg(not(windows))]
+fn open_url_in_browser(_url: &str) -> Result<(), String> {
+    Err("当前平台暂不支持打开外部链接。".to_string())
 }
 
 /// 用系统文件管理器打开一个目录。
@@ -951,7 +1487,11 @@ fn runtime_init_script(api_base: &str, session_token: &str, mode: &str) -> Strin
   showMain: () => window.__TAURI_INTERNALS__.invoke('show_main_window'),
   close: () => window.__TAURI_INTERNALS__.invoke('close_panel'),
   quit: () => window.__TAURI_INTERNALS__.invoke('quit_app'),
+  restart: () => window.__TAURI_INTERNALS__.invoke('restart_app'),
   resize: (w, h) => window.__TAURI_INTERNALS__.invoke('set_panel_size', { width: w, height: h }),
+  resizeKeep: (w, h) => window.__TAURI_INTERNALS__.invoke('set_panel_size', { width: w, height: h, relocate: false }),
+  resizeExpand: (w, h, shift) => window.__TAURI_INTERNALS__.invoke('set_panel_size', { width: w, height: h, relocate: false, shiftLeft: shift }),
+  resizeUp: (w, h, up) => window.__TAURI_INTERNALS__.invoke('set_panel_size', { width: w, height: h, relocate: false, shiftUp: up }),
   navigateMain: (path) => window.__TAURI_INTERNALS__.invoke('navigate_main', { path }),
   getUpdaterStatus: () => window.__TAURI_INTERNALS__.invoke('get_updater_status'),
   checkForUpdate: () => window.__TAURI_INTERNALS__.invoke('check_for_update_now'),
@@ -1102,7 +1642,7 @@ fn position_panel_at_cursor(
     *panel.app_handle().state::<TrayAnchor>().0.lock().unwrap() = Some(*click_physical);
 }
 
-/// 点击托盘图标（左/右键）时弹出品牌面板。
+/// 右键点击托盘图标时弹出品牌面板。
 fn open_tray_panel(app: &tauri::AppHandle, click_position: &PhysicalPosition<f64>) {
     let Some((api_base, session_token)) = sidecar_snapshot(app) else {
         return;
@@ -1141,6 +1681,26 @@ fn show_main_window(app: tauri::AppHandle) {
 fn close_panel(app: tauri::AppHandle) {
     if let Some(panel) = app.get_webview_window(TRAY_PANEL_LABEL) {
         let _ = panel.hide();
+    }
+}
+
+/// 左键点击托盘图标：切换主窗口显示/隐藏。
+/// 主窗口可见且未最小化 → 隐藏；隐藏或最小化 → 显示并聚焦。
+fn toggle_main_window(app: &tauri::AppHandle) {
+    // 先隐藏托盘面板，避免焦点竞争导致面板误关
+    if let Some(panel) = app.get_webview_window(TRAY_PANEL_LABEL) {
+        let _ = panel.hide();
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let visible = window.is_visible().unwrap_or(false);
+        let minimized = window.is_minimized().unwrap_or(false);
+        if visible && !minimized {
+            let _ = window.hide();
+        } else {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
     }
 }
 
@@ -1204,20 +1764,77 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-/// 让面板窗口按内容自适应尺寸（前端测量后调用，消除右侧留白）。
-/// 尺寸变化后重新按最近一次点击点把面板左下角贴回鼠标位置。
+/// 重启应用：先触发 ExitRequested（优雅停掉 sidecar）再拉起新实例。
+/// 与 `quit_app` 同一条退出路径（`AppHandle::exit` 也是走 `request_exit`），配合
+/// single-instance 插件避免双开。对照：更新安装那条路是**另一套**——安装器在 Windows 上
+/// 直接 `std::process::exit(0)`，ExitRequested 根本没机会跑，所以它靠 `build_updater`
+/// 的 `on_before_exit` 停子进程。
+///
+/// ⚠️ 这里**必须**用 `request_restart()` 而不是 `restart()`。`AppHandle::restart()` 分区
+/// 判断调用线程（tauri 的 app.rs）：主线程上只做 `cleanup_before_exit()` + 立即
+/// `process::restart()`——**根本不发 `RunEvent::ExitRequested`**，于是 `run()` 回调里的
+/// `stop_agent` / `stop_sidecar` 一次都不会执行。而本命令是**同步** command：wry 的
+/// WebMessageReceived 回调是内联调用 ipc handler 的（WebView2 事件全在 UI 线程上抛），
+/// 所以它恰好落在主线程那条分支上 —— 注释写着"优雅停掉 sidecar"，实际却是硬重启：
+/// 旧 control-server 还开着同一个 data-dir 的 SQLite，新实例的 sidecar 就上去开库了
+/// （正是 build_updater 注释里担心的"库被锁定"）。
+///
+/// `request_restart()` 走请求退出那条路：事件循环先派发 ExitRequested（我们的回调在这里
+/// 停子进程），随后 Exit 事件里发现 restart_on_exit 已置位再拉起新实例。注意**不要**在
+/// ExitRequested 分支里调 `api.prevent_exit()`，那会把这个流程永久挂住。
 #[tauri::command]
-fn set_panel_size(app: tauri::AppHandle, width: f64, height: f64) {
+fn restart_app(app: tauri::AppHandle) {
+    app.request_restart();
+}
+
+/// 让面板窗口按内容自适应尺寸（前端测量后调用，消除右侧留白）。
+/// - `relocate`（默认 true）为 true 时，尺寸变化后重新按最近一次点击点把面板左下角
+///   贴回鼠标位置（内容自适应时保持贴齐）。
+/// - `relocate` 为 false 且 `shift_left` 为 Some>0 时：只改尺寸并整体向左平移窗口
+///   `shift_left`（逻辑像素），用于"二级子菜单自动判定：右侧放不下就放左侧"——
+///   向左让出一段空间给子菜单。一级随整体一次到位、不抖动。
+/// - `relocate` 为 false 且 `shift_left` 为 None/0 时：只改尺寸、不重新定位
+///   （右侧子菜单弹出场景，一级保持原位）。
+#[tauri::command]
+fn set_panel_size(
+    app: tauri::AppHandle,
+    width: f64,
+    height: f64,
+    relocate: Option<bool>,
+    shift_left: Option<f64>,
+    shift_up: Option<f64>,
+) {
     if let Some(panel) = app.get_webview_window(TRAY_PANEL_LABEL) {
         // 逻辑像素尺寸；加一点安全余量避免贴边裁切
         let new_w = width + 2.0;
         let new_h = height + 2.0;
         let _ = panel.set_size(LogicalSize::new(new_w, new_h));
-        // 内容自适应后高度变化会破坏“左下角贴鼠标”，这里用刚请求的尺寸重贴一次
-        // （避免读 inner_size() 时 set_size 尚未生效拿到旧值）
-        let anchor = app.state::<TrayAnchor>().0.lock().unwrap().clone();
-        if let Some(anchor) = anchor {
-            position_panel_at_cursor(&panel, &anchor, Some((new_w, new_h)));
+        if relocate.unwrap_or(true) {
+            // 内容自适应后高度变化会破坏“左下角贴鼠标”，这里用刚请求的尺寸重贴一次
+            // （避免读 inner_size() 时 set_size 尚未生效拿到旧值）
+            let anchor = app.state::<TrayAnchor>().0.lock().unwrap().clone();
+            if let Some(anchor) = anchor {
+                position_panel_at_cursor(&panel, &anchor, Some((new_w, new_h)));
+            }
+        } else {
+            let Ok(pos) = panel.outer_position() else { return };
+            let Ok(scale) = panel.scale_factor() else { return };
+            let mut lx = pos.x as f64 / scale;
+            let mut ly = pos.y as f64 / scale;
+            if let Some(shift) = shift_left {
+                if shift > 0.0 {
+                    // 向左平移整窗：右侧放不下、改为左侧时，把窗口整体左移让出空间
+                    lx -= shift;
+                }
+            }
+            if let Some(up) = shift_up {
+                if up > 0.0 {
+                    // 向上平移整窗（底部保持锚点）：hover 子菜单需要更高时，让额外高度
+                    // 向上生长，避免多出的高度向下越出屏幕而被裁断。
+                    ly -= up;
+                }
+            }
+            let _ = panel.set_position(LogicalPosition::new(lx, ly));
         }
     }
 }
@@ -1226,7 +1843,7 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
     // Windows 托盘必须在创建时显式提供图标，否则 Shell_NotifyIconW(NIM_ADD) 只注册一个
     // “无图标”的托盘项，任务栏通知区不会渲染出任何可见图标。
     let tray = TrayIconBuilder::with_id("main-tray")
-        // 去掉原生菜单，改由品牌覆盖层面板承载；左/右键都弹面板。
+        // 去掉原生左键菜单；右键仍由品牌覆盖层面板承载，左键切换主窗口显隐。
         .icon(
             app.default_window_icon()
                 .map(Clone::clone)
@@ -1245,9 +1862,13 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
             ..
         } = event
         {
-            if matches!(button, MouseButton::Left | MouseButton::Right) {
-                let app = tray.app_handle();
-                open_tray_panel(&app, &position);
+            let app = tray.app_handle();
+            match button {
+                // 左键：切换主窗口显示/隐藏
+                MouseButton::Left => toggle_main_window(app),
+                // 右键：弹出品牌托盘面板
+                MouseButton::Right => open_tray_panel(app, &position),
+                _ => {}
             }
         }
     })
@@ -1371,11 +1992,13 @@ fn main() {
             show_main_window,
             close_panel,
             quit_app,
+            restart_app,
             set_panel_size,
             navigate_main,
             show_system_notification,
             enroll_remote_agent,
             open_app_data_directory,
+            open_external,
             get_updater_status,
             check_for_update_now,
             install_update
@@ -1394,14 +2017,18 @@ fn main() {
                         status: "checking".to_string(),
                         update: None,
                         error: None,
+                        download: UpdateDownloadRepr::idle(),
                     },
                     generation: 0,
                     installing: false,
+                    pending: None,
+                    downloading: None,
+                    download_error: None,
                 }),
             });
             let local_agent_token = Uuid::new_v4().simple().to_string();
             let sidecar = start_sidecar(&app.handle(), &local_agent_token)
-                .map_err(|error| error.to_string())?;
+                .map_err(localize_update_error)?;
             if let Err(error) = create_main_window(&app.handle(), &sidecar) {
                 let mut sidecar = sidecar;
                 stop_running_sidecar(&mut sidecar);
@@ -1552,5 +2179,236 @@ mod tests {
             "0.1.8"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 造一份「检查已完成、公告了 advertised 版本」的下载状态。
+    /// `pending` 留空：`PendingUpdate` 里的 `Update` 字段私有，测试里造不出实例，
+    /// 所以"已就绪"那一相由 `download_repr` 直接覆盖。
+    fn update_state(advertised: Option<&str>) -> UpdateCheckState {
+        UpdateCheckState {
+            info: UpdateInfoRepr {
+                app_version: "0.1.7".to_string(),
+                status: "complete".to_string(),
+                update: advertised.map(update_info),
+                error: None,
+                download: UpdateDownloadRepr::idle(),
+            },
+            generation: 1,
+            installing: false,
+            pending: None,
+            downloading: None,
+            download_error: None,
+        }
+    }
+
+    fn update_info(version: &str) -> UpdateInfo {
+        UpdateInfo {
+            current_version: "0.1.7".to_string(),
+            version: version.to_string(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn download_repr_reports_each_phase() {
+        let ready = download_repr(Some("0.1.8"), Some(("0.1.8", 1024)), None, None);
+        assert_eq!(ready.phase, "ready");
+        assert_eq!(ready.received, 1024);
+        assert_eq!(ready.total, Some(1024));
+
+        let downloading = download_repr(Some("0.1.8"), None, Some(("0.1.8", 512, Some(2048))), None);
+        assert_eq!(downloading.phase, "downloading");
+        assert_eq!(downloading.received, 512);
+        assert_eq!(downloading.total, Some(2048));
+
+        let failed = download_repr(Some("0.1.8"), None, None, Some(("0.1.8", "网络中断")));
+        assert_eq!(failed.phase, "failed");
+        assert_eq!(failed.error.as_deref(), Some("网络中断"));
+
+        assert_eq!(download_repr(Some("0.1.8"), None, None, None).phase, "idle");
+    }
+
+    #[test]
+    fn download_repr_ignores_state_from_another_version() {
+        // 更新源换了版本、或整个撤回了版本时，旧包的成果/任务/错误一律不算数：
+        // 否则界面会提示"已就绪"，装上去的却是别的版本。
+        assert_eq!(
+            download_repr(Some("0.1.9"), Some(("0.1.8", 1024)), None, None).phase,
+            "idle"
+        );
+        assert_eq!(
+            download_repr(Some("0.1.9"), None, Some(("0.1.8", 512, None)), None).phase,
+            "idle"
+        );
+        assert_eq!(
+            download_repr(Some("0.1.9"), None, None, Some(("0.1.8", "网络中断"))).phase,
+            "idle"
+        );
+        assert_eq!(
+            download_repr(None, None, Some(("0.1.8", 512, None)), None).phase,
+            "idle"
+        );
+    }
+
+    #[test]
+    fn sync_download_drops_progress_of_a_replaced_version() {
+        let mut state = update_state(Some("0.1.8"));
+        state.downloading = Some(DownloadProgress {
+            version: "0.1.8".to_string(),
+            received: 900,
+            total: Some(1000),
+        });
+        state.sync_download();
+        assert_eq!(state.info.download.phase, "downloading");
+        assert_eq!(state.info.download.received, 900);
+
+        // 重新检查发现服务器已经换到 0.1.9：旧任务的进度必须真的丢掉，
+        // 而不只是不显示 —— 否则它下次回写会把 0.1.8 的包当成 0.1.9 的。
+        state.info.update = Some(UpdateInfo {
+            current_version: "0.1.7".to_string(),
+            version: "0.1.9".to_string(),
+            notes: None,
+        });
+        state.sync_download();
+        assert_eq!(state.info.download.phase, "idle");
+        assert!(state.downloading.is_none(), "换版本要真的把旧任务丢掉");
+    }
+
+    #[test]
+    fn sync_download_keeps_failure_only_for_the_announced_version() {
+        let mut state = update_state(Some("0.1.8"));
+        state.download_error = Some(("0.1.8".to_string(), "网络中断".to_string()));
+        state.sync_download();
+        assert_eq!(state.info.download.phase, "failed");
+        assert_eq!(state.info.download.error.as_deref(), Some("网络中断"));
+
+        // 版本被撤回：失败态也要一起清掉，界面回到"无更新"。
+        state.info.update = None;
+        state.sync_download();
+        assert_eq!(state.info.download.phase, "idle");
+        assert!(state.download_error.is_none());
+    }
+
+    #[test]
+    fn check_failure_keeps_the_download_it_knows_nothing_about() {
+        // 一次检查失败（网络抖动、自建源暂时不可达）跟"更新源撤回了版本"是两回事：
+        // 不能因此掐掉正在跑的预下载 —— 那会让用户白等一遍 24MB。
+        // 公告版本也必须留着，它正是下载任务的版本守卫。
+        let mut state = update_state(Some("0.1.8"));
+        state.downloading = Some(DownloadProgress {
+            version: "0.1.8".to_string(),
+            received: 300,
+            total: Some(1000),
+        });
+
+        state.apply_check_failure("0.1.7".to_string(), "网络不可达".to_string());
+        let snapshot = state.snapshot();
+
+        assert_eq!(snapshot.status, "failed");
+        assert_eq!(snapshot.error.as_deref(), Some("网络不可达"));
+        assert_eq!(
+            snapshot.update.as_ref().map(|update| update.version.as_str()),
+            Some("0.1.8"),
+        );
+        assert!(state.downloading.is_some(), "正在跑的预下载不该被掐掉");
+        assert_eq!(snapshot.download.phase, "downloading");
+        assert_eq!(snapshot.download.received, 300, "进度不该被清零");
+    }
+
+    #[test]
+    fn check_success_announces_and_starts_exactly_one_download() {
+        let mut state = update_state(None);
+
+        let start = state.apply_check_success(
+            "0.1.7".to_string(),
+            Some(("0.1.8".to_string(), update_info("0.1.8"))),
+        );
+        state.snapshot();
+
+        assert!(start, "查到新版本就该起一次静默预下载");
+        assert_eq!(state.info.status, "complete");
+        assert_eq!(state.info.download.phase, "downloading");
+        assert_eq!(
+            state.downloading.as_ref().map(|progress| progress.version.as_str()),
+            Some("0.1.8"),
+        );
+    }
+
+    #[test]
+    fn check_success_does_not_restart_a_running_download() {
+        // 打开托盘面板会重新检查一次：已经在下的包不能被从零重下。
+        let mut state = update_state(Some("0.1.8"));
+        state.downloading = Some(DownloadProgress {
+            version: "0.1.8".to_string(),
+            received: 300,
+            total: Some(1000),
+        });
+
+        let start = state.apply_check_success(
+            "0.1.7".to_string(),
+            Some(("0.1.8".to_string(), update_info("0.1.8"))),
+        );
+        state.snapshot();
+
+        assert!(!start);
+        assert_eq!(
+            state.downloading.as_ref().map(|progress| progress.received),
+            Some(300),
+            "进度不该被清零",
+        );
+    }
+
+    #[test]
+    fn check_success_switches_download_when_the_version_changed() {
+        let mut state = update_state(Some("0.1.8"));
+        state.downloading = Some(DownloadProgress {
+            version: "0.1.8".to_string(),
+            received: 300,
+            total: Some(1000),
+        });
+
+        let start = state.apply_check_success(
+            "0.1.7".to_string(),
+            Some(("0.1.9".to_string(), update_info("0.1.9"))),
+        );
+        state.snapshot();
+
+        assert!(start, "换版本要重下");
+        assert_eq!(
+            state.downloading.as_ref().map(|progress| progress.version.as_str()),
+            Some("0.1.9"),
+        );
+    }
+
+    #[test]
+    fn check_success_without_update_clears_the_announcement() {
+        let mut state = update_state(Some("0.1.8"));
+        state.download_error = Some(("0.1.8".to_string(), "网络中断".to_string()));
+
+        let start = state.apply_check_success("0.1.7".to_string(), None);
+        state.snapshot();
+
+        assert!(!start);
+        assert!(state.info.update.is_none());
+        assert_eq!(state.info.download.phase, "idle");
+        assert!(
+            state.download_error.is_none(),
+            "版本撤回了，旧包的失败态也该作废",
+        );
+    }
+
+    #[test]
+    fn check_success_does_not_start_a_download_while_installing() {
+        let mut state = update_state(None);
+        state.installing = true;
+
+        let start = state.apply_check_success(
+            "0.1.7".to_string(),
+            Some(("0.1.8".to_string(), update_info("0.1.8"))),
+        );
+        state.snapshot();
+
+        assert!(!start, "正在安装时不该再起下载");
+        assert!(state.downloading.is_none());
     }
 }

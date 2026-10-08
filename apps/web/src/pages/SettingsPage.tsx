@@ -10,14 +10,17 @@ import { PROJECT_ORDER_STORAGE_KEY, resetProjectOrder } from "../lib/project-ord
 import { isDesktop } from "../lib/runtime";
 import { api, apiWithTimeout } from "../lib/api";
 import { agentDisplayName, useAgentCatalog } from "../lib/agent-registry";
+import {
+  checkResultToast,
+  downloadPhase,
+  installableUpdate,
+  settingsInstallDisabled,
+  settingsInstallLabel,
+  settingsUpdateDescription,
+  IDLE_POLL_MS,
+  type UpdaterStatus,
+} from "../features/updater/update-view";
 import "./settings.css";
-
-type UpdaterStatus = {
-  appVersion: string;
-  status: "checking" | "complete" | "failed";
-  update: { currentVersion: string; version: string; notes?: string | null } | null;
-  error?: string | null;
-};
 
 type InstallUpdateResult = { installed: boolean };
 type StorageUsage = {
@@ -63,10 +66,6 @@ function BackIcon() {
 
 function ShieldIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></svg>;
-}
-
-function SettingsIcon() {
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2.9" /><path d="M20.17 10.56A8.3 8.3 0 0 1 20.17 13.44L17.51 12.97A5.6 5.6 0 0 1 16.59 15.21L18.80 16.76A8.3 8.3 0 0 1 16.76 18.80L15.21 16.59A5.6 5.6 0 0 1 12.97 17.51L13.44 20.17A8.3 8.3 0 0 1 10.56 20.17L11.03 17.51A5.6 5.6 0 0 1 8.79 16.59L7.24 18.80A8.3 8.3 0 0 1 5.20 16.76L7.41 15.21A5.6 5.6 0 0 1 6.49 12.97L3.83 13.44A8.3 8.3 0 0 1 3.83 10.56L6.49 11.03A5.6 5.6 0 0 1 7.41 8.79L5.20 7.24A8.3 8.3 0 0 1 7.24 5.20L8.79 7.41A5.6 5.6 0 0 1 11.03 6.49L10.56 3.83A8.3 8.3 0 0 1 13.44 3.83L12.97 6.49A5.6 5.6 0 0 1 15.21 7.41L16.76 5.20A8.3 8.3 0 0 1 18.80 7.24L16.59 8.79A5.6 5.6 0 0 1 17.51 11.03L20.17 10.56Z" /></svg>;
 }
 
 function Toggle({ checked, disabled, onChange, label }: { checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void; label: string }) {
@@ -234,9 +233,18 @@ export default function SettingsPage() {
       invoke<UpdaterStatus>("get_updater_status").then((status) => {
         if (cancelled) return;
         setUpdaterStatus(status);
-        if (status.status === "checking") timer = window.setTimeout(load, 1_000);
+        // 共享状态已经翻篇（这次检查成功）时，本地那份"手动检查失败"就过期了 ——
+        // 不清掉的话卡片会一直挂着一条已经被推翻的失败说明，跟横幅说的打架。
+        if (status.status === "complete") setUpdaterError(null);
+        // 检查中/下载中按秒续约（用户打开这一页就是想看它下到哪了）；其余按慢节奏
+        // 兜底而不是彻底停：状态也会被托盘面板、主界面横幅触发的重查改写，
+        // 停在过期状态上会让这一页和它们互相矛盾。
+        const busy = status.status === "checking" || downloadPhase(status) === "downloading";
+        timer = window.setTimeout(load, busy ? 1_000 : IDLE_POLL_MS);
       }).catch(() => {
-        if (!cancelled) setUpdaterStatus(null);
+        if (cancelled) return;
+        setUpdaterStatus(null);
+        timer = window.setTimeout(load, IDLE_POLL_MS);
       });
     };
     load();
@@ -303,13 +311,15 @@ export default function SettingsPage() {
       const status = await invoke<UpdaterStatus>("check_for_update_now");
       setUpdaterStatus(status);
       if (status.status === "failed") {
-        const message = status.error || "无法检查更新，请稍后重试。";
-        setUpdaterError(message);
-        toast.error(message);
+        // 失败原因就在 status 里，卡片统一从 status 读 —— 本地不再存第二份副本，
+        // 免得它过期之后跟 status 打架。
+        toast.error(status.error || "无法检查更新，请稍后重试。");
       } else {
-        toast.success(status.update ? `发现新版本 v${status.update.version}` : "当前已是最新版本");
+        toast.success(checkResultToast(status));
       }
     } catch (cause) {
+      // 命令本身抛了（IPC 异常）：共享状态没被改写，只能本地记一下，
+      // 否则这一页会装作什么都没发生。
       const message = cause instanceof Error ? cause.message : "无法检查更新，请稍后重试。";
       setUpdaterError(message);
       toast.error(message);
@@ -333,8 +343,7 @@ export default function SettingsPage() {
   return <main className="settings-page">
     {storageConfirmOpen && <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-clean-storage-title"><section className="modal settings-confirm-dialog"><header><div><h2 id="settings-clean-storage-title">清理数据库</h2></div><button type="button" title="关闭" onClick={() => setStorageConfirmOpen(false)}>x</button></header><p>将删除数据库中遗留的 thinking_tokens 遥测，并回收文件里已释放的页（必要时会重写整个数据库文件，期间其它操作会明显变慢）。会话消息、任务、任务结果和用量统计不会被删除；清理期间请不要运行任务。</p><footer><button type="button" className="secondary" onClick={() => setStorageConfirmOpen(false)}>取消</button><button type="button" className="primary danger" onClick={() => void cleanupStorage()}>确认清理</button></footer></section></div>}
     <header className="settings-header">
-      <div className="settings-header-main"><button type="button" className="settings-back" title="返回首页" aria-label="返回首页" onClick={() => navigate("/")}><BackIcon /></button><div><span className="settings-kicker"><SettingsIcon />应用</span><h1>Milevia 设置</h1></div></div>
-      <span className="settings-device-label">仅作用于当前设备</span>
+      <div className="settings-header-main"><button type="button" className="settings-back" title="返回首页" aria-label="返回首页" onClick={() => navigate("/")}><BackIcon /></button><div><h1>Milevia 设置</h1></div></div>
     </header>
     <div className="settings-tabs" role="tablist" aria-label="设置分组" ref={tabsRef} onKeyDown={onTabKeyDown}>{TAB_ORDER.map((id) => <button key={id} type="button" role="tab" id={`settings-tab-${id}`} aria-selected={activeTab === id} aria-controls={`settings-panel-${id}`} tabIndex={activeTab === id ? 0 : -1} className={activeTab === id ? "active" : ""} onClick={() => selectTab(id)}>{TAB_LABELS[id].tab}</button>)}</div>
     <div className="settings-board">
@@ -431,13 +440,10 @@ export default function SettingsPage() {
         </div>}
 
         {activeTab === "about" && <div className="settings-grid">
-          <SettingCard title="运行环境" description={isDesktop() ? "桌面端，本地偏好仅保存在当前设备。" : "Web 环境，本地偏好仅保存在当前浏览器。"}>
-            <span className="settings-value">{isDesktop() ? "桌面端" : "Web"}</span>
-          </SettingCard>
-          {isDesktop() && <SettingCard wide title="当前版本" description={updaterError || updaterStatus?.status === "failed" ? (updaterError || updaterStatus?.error || "更新检查失败，请稍后重试。") : updaterStatus?.status === "checking" ? "正在检查更新…" : updaterStatus?.update ? `发现新版本 v${updaterStatus.update.version}${updaterStatus.update.notes ? `：${updaterStatus.update.notes.trim().slice(0, 80)}` : ""}` : updaterStatus ? "当前已是最新版本。" : "正在读取更新状态。"}>
+          {isDesktop() && <SettingCard wide title="当前版本" description={settingsUpdateDescription(updaterStatus, updaterError)}>
             <button type="button" className="secondary" disabled={checkingUpdate || installingUpdate} onClick={() => void checkForUpdate()}>{checkingUpdate ? "检查中" : "检查更新"}</button>
-            {updaterStatus?.status === "complete" && updaterStatus.update
-              ? <button type="button" className="primary" disabled={checkingUpdate || installingUpdate} onClick={() => void installUpdate()}>{installingUpdate ? "升级中" : "立即升级"}</button>
+            {installableUpdate(updaterStatus)
+              ? <button type="button" className="primary" disabled={settingsInstallDisabled(updaterStatus, checkingUpdate, installingUpdate)} onClick={() => void installUpdate()}>{settingsInstallLabel(updaterStatus, installingUpdate)}</button>
               : <span className="settings-value">v{updaterStatus?.appVersion ?? "-"}</span>}
           </SettingCard>}
         </div>}

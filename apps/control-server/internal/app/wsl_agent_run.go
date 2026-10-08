@@ -284,10 +284,12 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 	// PromptViaStdin：后台 goroutine 写 prompt 再关 stdin，避免阻塞主流程（与本地 Run 一致，
 	// 也不会因大 prompt 撑满管道而与后续 reader 互相阻塞——reader 已在此前启动）。
 	var stderrTail = &stderrCapture{}
+	// 与本地 Run 一致：包一层 sink 记录 CLI 自报的失败原因（见 claudeResultErrorDetail）。
+	recorded := &claudeResultErrorSink{AgentRunSink: sink}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); r.claude.readOutput(stdout, sink) }()
-	go func() { defer wg.Done(); r.claude.readStderrCapture(stderr, sink, stderrTail) }()
+	go func() { defer wg.Done(); r.claude.readOutput(stdout, recorded) }()
+	go func() { defer wg.Done(); r.claude.readStderrCapture(stderr, recorded, stderrTail) }()
 	if stdin != nil {
 		go func() {
 			_, _ = io.WriteString(stdin, request.Prompt)
@@ -296,11 +298,11 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 	}
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
-		// 与 claudeCLIRunner.Run 一致：附上 claude stderr 尾部，暴露真实失败原因。
-		if detail := claudeStderrDetail(stderrTail.tail()); detail != "" {
-			return fmt.Errorf("Claude exited: %w %s", err, detail)
+		// 与 claudeCLIRunner.Run 一致（规则见 claudeRunFailureDetail）。
+		if detail := claudeRunFailureDetail(recorded.failureResult(), stderrTail.tail()); detail != "" {
+			return fmt.Errorf(claudeExitPrefix+"%w %s", err, detail)
 		}
-		return fmt.Errorf("Claude exited: %w", err)
+		return fmt.Errorf(claudeExitPrefix+"%w", err)
 	}
 	return nil
 }
@@ -381,7 +383,7 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	go func() { defer wg.Done(); readCodexStderr(stderr, sink) }()
 	wg.Wait()
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("Codex exited: %w", err)
+		return fmt.Errorf(codexExitPrefix+"%w", err)
 	}
 	return nil
 }
@@ -453,10 +455,10 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 		case <-time.After(30 * time.Second):
 		}
 		if err == nil && session.hasTurns() {
-			err = fmt.Errorf("Claude session exited before completing active turns")
+			err = fmt.Errorf("Claude 会话在完成未结束的对话轮次之前就结束了")
 		}
 		if err != nil {
-			err = fmt.Errorf("Claude exited: %w", err)
+			err = fmt.Errorf(claudeExitPrefix+"%w", err)
 		}
 		session.finish(err)
 		close(session.processDone)

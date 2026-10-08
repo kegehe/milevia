@@ -262,6 +262,25 @@ export function getBaseName(path: string): string {
   return idx >= 0 ? path.substring(idx + 1) : path;
 }
 
+/**
+ * 校验用户输入的文件名 / 目录名（新建与重命名共用）。返回错误文案，null 表示通过。
+ *
+ * 只拦「把名字接在父目录后面会逃出父目录」的两种写法：
+ *   - 含路径分隔符 —— 一段名字变成了多段路径；
+ *   - 整个名字就是 `.` / `..` —— `dir/..` 直接指到上级。
+ *
+ * 注意这里**不能**用 `name.includes("..")`：子串在单个路径段里没有任何越界能力，
+ * `v1..2.md`、`config..bak` 都是正常文件名（2026-09-29 修的子串误拦）。
+ * 真正的越界由服务端 resolvePath 按解析后的父目录判定，前端不必定更严的规则。
+ */
+export function validateFileName(name: string): string | null {
+  const trimmed = name.trim();
+  if (!trimmed) return "文件名不能为空";
+  if (trimmed.includes("/") || trimmed.includes("\\")) return "文件名不能包含路径分隔符";
+  if (trimmed === "." || trimmed === "..") return "文件名不能是 . 或 ..";
+  return null;
+}
+
 // ─── 跨页面深链用的会话内传参 key ────────────────────────────────────────────
 // 其它页面跳到文件页时，通过 sessionStorage 传"要打开哪个文件"（与"添加到对话"的
 // milevia_add_file_to_chat 同一套路）。放在 feature 模块里而不是某个页面里，避免

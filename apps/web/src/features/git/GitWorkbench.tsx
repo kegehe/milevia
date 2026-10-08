@@ -488,7 +488,7 @@ function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview,
       {mobile && (selectedDiff || conflictPath) && <button type="button" className="git-mobile-back" onClick={() => { closeConflict(); closeDiff(); }}>← 变更列表</button>}
       {conflictPath
         ? <ConflictSolveView key={conflictPath} projectID={projectID} conversationId={conversationId} path={conflictPath} conflictPaths={(conflictOverview?.files.map((file) => file.path) ?? [conflictPath])} request={request} fail={fail} oursLabel={context?.oursLabel || "当前"} theirsLabel={context?.theirsLabel || "传入"} busy={mutating !== ""} mobile={mobile} onResolve={resolveConflict} onOpenFile={openConflict} onClose={closeConflict} />
-        : selectedDiff ? <DiffViewer diff={selectedDiff} close={closeDiff} /> : <div className="git-diff-placeholder"><div className="git-diff-placeholder-icon" aria-hidden="true"><PendingIcon /></div><h3>选择一个文件查看变更</h3><p>从变更列表里点击文件，差异内容会显示在这里。</p></div>}
+        : selectedDiff ? <DiffViewer diff={selectedDiff} close={closeDiff} /> : <div className="git-diff-placeholder"><div className="git-diff-placeholder-icon" aria-hidden="true"><PendingIcon /></div><h3>选择一个文件查看变更</h3></div>}
     </section>
   </div>;
 }
@@ -537,8 +537,31 @@ function ChangeList({ changes, stage, openDiff, mutatePath, requestDiscard, muta
   })}</div>;
 }
 
-function CommitPanel({ stagedCount, value, setValue, open, openAmend, disabled }: { stagedCount: number; value: string; setValue: (value: string) => void; open: () => void; openAmend: () => void; disabled: boolean }) {
-  return <section className="git-commit-panel"><label htmlFor="git-commit-message">提交信息</label><textarea id="git-commit-message" value={value} maxLength={4000} disabled={disabled || stagedCount === 0} onChange={(event) => setValue(event.target.value)} placeholder={stagedCount === 0 ? "暂存文件后即可提交" : "简要说明本次变更"} /><footer><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span><div className="git-commit-actions"><button type="button" className="secondary git-amend-btn" title="修改最近一次提交" disabled={disabled || !value.trim()} onClick={openAmend}>修改最近一次提交</button><button type="button" className="primary" disabled={disabled || stagedCount === 0 || !value.trim() || value.split("\n")[0].length > 72} onClick={open}>提交</button></div></footer></section>;
+// 提交信息首行的长度上限，与后端 git_operations.go 的校验保持一致。
+export const MAX_COMMIT_SUBJECT_LENGTH = 72;
+
+// 首行长度必须与后端 gitCommit / gitAmendCommit 的算法对齐，那里是
+// strings.TrimSpace(message) 之后再取第一行做 utf8.RuneCountInString：
+//   - 先 trim：否则 "\n\n<73 字>" 这种以空行开头的信息，前端取到的首行是空串、
+//     判定合法放行，后端 trim 后数出 73 字直接 400。
+//   - 再按码点算：JS 的 .length 数的是 UTF-16 码元，一个 emoji 在前端算 2、后端算 1，
+//     按钮会比后端更早变灰，把明明能提交的信息拦下来。
+// （JS 的 trim 与 Go 的 TrimSpace 只在 U+0085 这类冷门空白符上不同，提交信息里碰不到。）
+export function commitSubjectLength(message: string): number {
+  return Array.from(message.trim().split("\n")[0]).length;
+}
+
+export function CommitPanel({ stagedCount, value, setValue, open, openAmend, disabled }: { stagedCount: number; value: string; setValue: (value: string) => void; open: () => void; openAmend: () => void; disabled: boolean }) {
+  const subjectLength = commitSubjectLength(value);
+  const subjectOverLimit = subjectLength > MAX_COMMIT_SUBJECT_LENGTH;
+  return <section className="git-commit-panel"><label htmlFor="git-commit-message">提交信息</label><textarea id="git-commit-message" value={value} maxLength={4000} disabled={disabled || stagedCount === 0} aria-invalid={subjectOverLimit || undefined} aria-describedby={subjectOverLimit ? "git-commit-subject-warning" : undefined} onChange={(event) => setValue(event.target.value)} placeholder={stagedCount === 0 ? "暂存文件后即可提交" : "简要说明本次变更"} />
+    {/* 首行超长会让「提交」变灰，必须当场说明原因，否则用户只会以为按钮坏了。
+        文案直接点明「提交」和「修改最近一次提交」都会受影响 —— 只说限制，
+        用户仍会去点那个同样变灰的修改按钮。
+        提示不给按钮加 title：禁用的按钮不派发鼠标事件，title 根本不会弹出。 */}
+    {subjectOverLimit ? <p className="git-commit-subject-warning" id="git-commit-subject-warning" role="alert">提交信息首行最多 {MAX_COMMIT_SUBJECT_LENGTH} 个字符，超出后无法提交，也无法修改最近一次提交。请缩短首行，多行说明写在第二行起。</p> : null}
+    {/* 计数器从能输入的那一刻就常驻，而不是等超限才出现：这条 72 字的规矩要在用户写之前就看得见。 */}
+    <footer><div className="git-commit-meta"><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span>{stagedCount === 0 ? null : <span className={`git-commit-subject-count${subjectOverLimit ? " over" : ""}`} title={`提交信息首行的字符数，上限 ${MAX_COMMIT_SUBJECT_LENGTH}`}>首行 {subjectLength}/{MAX_COMMIT_SUBJECT_LENGTH}</span>}</div><div className="git-commit-actions"><button type="button" className="secondary git-amend-btn" title="修改最近一次提交" disabled={disabled || !value.trim() || subjectOverLimit} onClick={openAmend}>修改最近一次提交</button><button type="button" className="primary" disabled={disabled || stagedCount === 0 || !value.trim() || subjectOverLimit} onClick={open}>提交</button></div></footer></section>;
 }
 
 function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, commitAmend, discardWorktree, discardAll, fetchRemote, pullRemote, pushBranch, switchBranch, abortConflict, finishConflict }: {

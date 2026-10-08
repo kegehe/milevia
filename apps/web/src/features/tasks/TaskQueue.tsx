@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { useDocumentVisible } from "../../lib/useDocumentVisible";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
 type DispatchResult = { message: DispatchedMessage; runId: string };
@@ -86,6 +87,9 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const mountedRef = useRef(true);
   const conversationIDRef = useRef(conversationID);
   conversationIDRef.current = conversationID;
+  // 页面可见性：任务队列挂在对话页侧栏上，窗口最小化/切到后台时不该继续空跑轮询。
+  const documentVisible = useDocumentVisible();
+  const prevVisibleRef = useRef(documentVisible);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -118,10 +122,16 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   }, [projectID, request]);
 
   useEffect(() => { void loadTasks().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务队列"); }); }, [fail, loadTasks]);
+  // 兜底轮询：仅页面可见时每 10s 拉一次；不可见时停掉，只在「不可见 → 可见」那一跳补拉
+  // 一次（否则窗口在后台放久了，切回来看到的还是旧队列，要再等一个周期）。
   useEffect(() => {
+    const becameVisible = documentVisible && !prevVisibleRef.current;
+    prevVisibleRef.current = documentVisible;
+    if (!documentVisible) return;
+    if (becameVisible) void loadTasks().catch(() => undefined);
     const interval = window.setInterval(() => { void loadTasks().catch(() => undefined); }, 10_000);
     return () => window.clearInterval(interval);
-  }, [loadTasks]);
+  }, [documentVisible, loadTasks]);
 
   const queueTasks = useMemo(() => {
     const term = query.trim().toLowerCase();

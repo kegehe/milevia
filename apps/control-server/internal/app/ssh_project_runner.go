@@ -113,6 +113,12 @@ func remoteProcessGroupKillCommand(pidfile string) string {
 // 最后执行命令。每个 export 都必须是独立命令并以 "&& " 结尾：否则 shell 会把后续命令
 // 当作 export 的参数（合法标识符被静默吞掉，含特殊字符时报 not a valid identifier），
 // 真实命令永远不执行。与 git_ssh.buildGitShell 的修正保持一致。
+//
+// ⚠️ 键名同样是**原样拼进远端 shell** 的（只有值走 shellQuote）。这里的 envVars 来自
+// 项目运行配置，而它上游已经过 validateRunEnvironmentVariables（app.go 的
+// validateProjectRunConfig*，按 isPosixEnvName 只放行 POSIX 标识符）——
+// 这是本函数安全的前提。新增调用方时若换了数据来源，必须先过同一道校验：
+// 键名带 `;`/`|` 就能在目标主机上执行任意命令（对照 mcpEnvKeyPattern 那次实测）。
 func buildSSHRunShell(cdTarget string, envVars map[string]string, command string) string {
 	shellCmd := "cd " + shellQuote(cdTarget) + " && "
 	for k, v := range envVars {
@@ -484,6 +490,7 @@ func (pr *sshProjectRunner) StatusSnapshot() RunStatusResponse {
 	defer pr.mu.RUnlock()
 	snapshot := RunStatusResponse{
 		Status:     pr.status,
+		Command:    pr.command,
 		RecentLogs: pr.logBuf.Recent(projectRunLogHistory),
 	}
 	if !pr.startedAt.IsZero() {

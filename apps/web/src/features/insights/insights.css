@@ -1,38 +1,237 @@
-/* 优化建议页样式 —— 与 tasks / conversation 共用同一套绿色 studio token */
+/* 优化建议页样式 —— 方案F：深绿头版横幅 + 浮层白面板。
+   与 tasks / conversation 共用同一套绿色 studio token；中性色一律取 style.css
+   已有的带绿灰（#31594f / #4c6b60 / #748b81 / #809188；#e3ece7 / #f7fbf8 / #f2f5f3），
+   不引暖灰。深底横幅只承载「判断 + 主行动」，排障素材留在下方面板。 */
 
-/* 工作区铺底：与 .task-workspace 同源，保证切到本页时背景连续 */
+/* ── 页面外壳：横幅通栏铺满工作区，白面板居中上浮 ── */
 .insights {
   display: flex;
   flex-direction: column;
-  gap: 16px;
   width: 100%;
-  max-width: 1180px;
-  margin: 0 auto;
-  /* 与 .task-workspace 同款 min-height，空态/少内容时绿底也能铺满视口 */
   min-height: calc(100vh - 86px);
-  padding: 28px clamp(18px, 4vw, 54px) 44px;
+  padding-bottom: 48px;
   color: #19332c;
   background: #f3f8f4;
 }
 
-.insights-head {
+/* ── 深绿头版横幅 ── */
+.insights-banner {
+  position: relative;
+  overflow: hidden;
+  padding: 38px 50px 84px;
+  background: linear-gradient(120deg, #132e26 0%, #1d4a3e 55%, #2c7567 130%);
+}
+/* 两团柔和辉光：只做质感，不承载信息 */
+.insights-banner::before {
+  content: "";
+  position: absolute;
+  right: -140px;
+  top: -180px;
+  width: 480px;
+  height: 480px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #ffffff14 0%, transparent 62%);
+}
+.insights-banner::after {
+  content: "";
+  position: absolute;
+  right: 120px;
+  bottom: -220px;
+  width: 420px;
+  height: 420px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #9fd8c433 0%, transparent 60%);
+}
+.insights-banner-in {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
-  border-bottom: 1px solid #cfe0d6;
-  padding-bottom: 14px;
+  gap: 24px;
+  max-width: 1180px;
+  margin: 0 auto;
 }
-.insights-heading { min-width: 0; }
-.insights-heading h2 { margin: 0 0 6px; color: #19332c; font-size: 19px; font-weight: 820; }
-.insights-heading p { margin: 0; color: #73887e; font-size: 12px; line-height: 1.6; }
-/* 主按钮直接复用全局 .primary（黄绿新拟态），与 tasks 页「创建任务」一致 */
-.insights-head > button.primary,
-.insights-head > button.insight-stop { flex: none; min-width: 120px; }
+.insights-banner-copy { min-width: 0; }
+.insights-banner-copy h2 { margin: 0; color: #f3f8f4; font-size: 22px; font-weight: 700; letter-spacing: 0.3px; }
+.insights-banner-copy > p { max-width: 640px; margin-top: 7px; color: #ffffffa8; font-size: 12.5px; line-height: 1.7; }
+/* 统计 chip：毛玻璃质感，只放「判断」级读数（有效 / 新增 / 高严重度 / 聚焦） */
+.insights-banner-stats { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.insights-stat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #ffffff2b;
+  border-radius: 99px;
+  padding: 4px 13px;
+  color: #eaf4ee;
+  background: #ffffff14;
+  font-size: 12px;
+  font-weight: 700;
+  backdrop-filter: blur(4px);
+}
+.insights-stat-chip b { color: #f3f8f4; font-variant-numeric: tabular-nums; }
+.insights-stat-chip b.up { color: #9fd8c4; }
+.insights-banner-acts {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 9px;
+  align-items: flex-end;
+  padding-top: 4px;
+}
+/* 主按钮：浅底深字，在深绿横幅上做最高对比的行动点 */
+.insight-banner-primary {
+  border: 1px solid #f3f8f4;
+  border-radius: 99px;
+  padding: 10px 26px;
+  color: #1d4a3e;
+  background: #f3f8f4;
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 6px 18px #0c1f1980;
+  transition: background .16s ease, opacity .16s ease;
+}
+.insight-banner-primary:hover:not(:disabled) { background: #fff; }
+.insight-banner-primary:disabled { cursor: default; opacity: 0.7; }
+.insight-banner-ghost {
+  border: 1px solid #ffffff40;
+  border-radius: 99px;
+  padding: 7px 18px;
+  color: #eaf4ee;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .16s ease, opacity .16s ease;
+}
+.insight-banner-ghost:hover:not(:disabled) { background: #ffffff1a; }
+.insight-banner-ghost:disabled { cursor: default; opacity: 0.55; }
+/* 停止分析（描边警示按钮）在深底横幅上换浅色描边，警示语义靠暖色字保留 */
+.insights-banner .insight-stop { border-color: #ffffff40; color: #ffe1d6; background: transparent; min-width: 120px; }
+.insights-banner .insight-stop:hover:not(:disabled) { border-color: #ffffff80; background: #ffffff1a; }
 
+/* ── 浮层白面板：上缘压住横幅，所有内容都住在这张卡里 ── */
+.insights-panel {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  gap: 14px;
+  width: 100%;
+  max-width: 1180px;
+  margin: -52px auto 0;
+  padding: 18px 22px 22px;
+  border: 1px solid #e3ece7;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 2px 4px #17362c0a, 0 24px 48px #17362c1f;
+}
+
+/* ── 分析设置（可折叠）── */
+.insights-pickers {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #edf3ef;
+  border-radius: 12px;
+  padding: 12px 16px 15px;
+  background: #f9fcfa;
+}
+.insights-pickers-head { display: flex; align-items: center; justify-content: space-between; }
+.insights-pickers-title { color: #748b81; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
+.insights-pickers-toggle {
+  border: 0;
+  padding: 2px 6px;
+  color: #2c7567;
+  background: transparent;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.insights-pickers-toggle:hover { color: #1f5b4c; }
+.insights-pickers-body { display: flex; flex-wrap: wrap; gap: 12px 30px; }
+.insights-picker { display: flex; flex: 1 1 auto; align-items: center; gap: 10px; }
+.insights-picker-label {
+  flex: none;
+  color: #809188;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+.insights-agent-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.insights-agent-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 4px 11px;
+  color: #41665b;
+  background: #fff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insights-agent-options label:hover { border-color: #a6cbbb; background: #f0f8f3; }
+.insights-agent-options label.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-agent-options input { accent-color: #2c7567; cursor: pointer; }
+.insights-theme-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.insights-theme-chips button {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 4px 11px;
+  color: #41665b;
+  background: #fff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insights-theme-chips button:hover { border-color: #a6cbbb; background: #f0f8f3; }
+.insights-theme-chips button.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-type-options { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.insights-type-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 4px 11px;
+  color: #41665b;
+  background: #fff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insights-type-option:hover { border-color: #a6cbbb; background: #f0f8f3; }
+.insights-type-option input { accent-color: #2c7567; cursor: pointer; }
+
+.insights-select-all {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 4px 11px;
+  color: #41665b;
+  background: #fff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insights-select-all:hover:not(:disabled) { border-color: #a6cbbb; background: #f0f8f3; }
+.insights-select-all.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insights-select-all:disabled { cursor: default; opacity: 0.7; }
+
+/* ── 空态 / 进度 / 失败 ── */
 .insights-empty {
   border: 1px dashed #bfd8cb;
-  border-radius: 8px;
+  border-radius: 12px;
   padding: 26px 20px;
   color: #6d8479;
   background: #f9fdf9;
@@ -44,16 +243,12 @@
 .insights-progress {
   display: grid;
   gap: 12px;
-  border: 1px solid #cfe0d6;
-  border-radius: 8px;
+  border: 1px solid #dbe9e1;
+  border-radius: 12px;
   padding: 18px 20px;
   background: #f4faf6;
 }
-.insights-progress-head {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
+.insights-progress-head { display: flex; align-items: center; gap: 14px; }
 .insights-progress-copy { min-width: 0; }
 .insights-spinner {
   width: 22px;
@@ -67,9 +262,8 @@
 @keyframes insight-spin { to { transform: rotate(360deg); } }
 .insights-progress-copy b { color: #264a40; font-size: 14px; }
 .insights-progress-copy small { display: block; margin-top: 3px; color: #6f887e; font-size: 11px; }
-/* 停止分析 / 停止复核：描边警示按钮，与「开始分析」的实底主按钮区分 */
+/* 停止分析 / 停止复核：描边警示按钮（白面板内用原配色） */
 .insight-stop {
-  flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -91,7 +285,7 @@
   align-items: center;
   gap: 12px;
   border: 1px solid #d8d9c5;
-  border-radius: 8px;
+  border-radius: 12px;
   padding: 12px 16px;
   background: #fbfbf2;
 }
@@ -124,14 +318,14 @@
   background: #8a8c57;
   transition: width .5s ease;
 }
-/* 分析信息滚动日志：里程碑 + agent 实时工具动作，随轮询滚动追加 */
+/* 分析信息滚动日志 */
 .insights-progress-log {
   display: grid;
   gap: 3px;
   max-height: 220px;
   overflow-y: auto;
   border: 1px solid #dbe9e1;
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 10px 12px;
   background: #fbfdfb;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -167,7 +361,7 @@
   display: grid;
   gap: 4px;
   border: 1px solid #f2cfc5;
-  border-radius: 8px;
+  border-radius: 12px;
   padding: 16px 18px;
   color: #a73c2a;
   background: #fff4f1;
@@ -182,285 +376,17 @@
 }
 .insights-failed.cancelled b { color: #7a5f14; }
 
+/* ── 汇总行：真实读数 + 批量/折叠区开关（「验证全部」在横幅上，不在这里重复） ── */
 .insights-summary {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
-  color: #73887e;
+  color: #748b81;
   font-size: 12px;
 }
 .insights-suppressed { color: #a66127; }
 
-.insights-filters {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.insights-filters button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid #d4e4da;
-  border-radius: 99px;
-  padding: 6px 12px;
-  color: #41665b;
-  background: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
-}
-.insights-filters button:hover { border-color: #a6cbbb; background: #f0f8f3; }
-.insights-filters button.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
-.insights-filters button small { font-size: 10px; opacity: 0.7; }
-
-.insights-pickers {
-  display: grid;
-  gap: 12px;
-  border: 1px solid #cfe0d6;
-  border-radius: 8px;
-  padding: 16px 18px;
-  background: #f8fcf9;
-}
-.insights-picker { display: flex; align-items: flex-start; gap: 12px; }
-.insights-picker-label {
-  flex: none;
-  width: 64px;
-  padding-top: 6px;
-  color: #5d766c;
-  font-size: 12px;
-  font-weight: 700;
-}
-.insights-agent-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.insights-agent-options label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid #d4e4da;
-  border-radius: 99px;
-  padding: 6px 12px;
-  color: #41665b;
-  background: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
-}
-.insights-agent-options label:hover { border-color: #a6cbbb; background: #f0f8f3; }
-.insights-agent-options label.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
-.insights-agent-options input { accent-color: #2c7567; cursor: pointer; }
-.insights-theme-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.insights-theme-chips button {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid #d4e4da;
-  border-radius: 99px;
-  padding: 6px 12px;
-  color: #41665b;
-  background: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
-}
-.insights-theme-chips button:hover { border-color: #a6cbbb; background: #f0f8f3; }
-.insights-theme-chips button.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
-.insights-type-options {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-.insights-type-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: #41665b;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  user-select: none;
-}
-.insights-type-option input { accent-color: #2c7567; cursor: pointer; }
-
-.insights-select-all {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid #d4e4da;
-  border-radius: 99px;
-  padding: 6px 12px;
-  color: #41665b;
-  background: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
-}
-.insights-select-all:hover:not(:disabled) { border-color: #a6cbbb; background: #f0f8f3; }
-.insights-select-all.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
-.insights-select-all:disabled { cursor: default; opacity: 0.7; }
-
-.insights-focus { color: #35608a; }
-
-.insights-list {
-  display: grid;
-  gap: 12px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.insight-card {
-  display: grid;
-  gap: 8px;
-  border: 1px solid #d1e1d8;
-  border-radius: 7px;
-  padding: 13px 15px;
-  background: #fcfefc;
-  box-shadow: 0 1px 2px #17362c0d;
-  transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
-}
-.insight-card:hover { border-color: #91baaa; background: #fff; box-shadow: 0 7px 16px #17362c14; transform: translateY(-2px); }
-.insight-card > b { color: #264a40; font-size: 14px; font-weight: 780; line-height: 1.4; }
-.insight-card > p { margin: 0; color: #668077; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
-
-.insight-card-type {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  width: fit-content;
-  border: 1px solid #d2e3da;
-  border-radius: 99px;
-  padding: 3px 9px 3px 6px;
-  color: #507066;
-  background: #f4f8f5;
-  font-size: 11px;
-  font-weight: 700;
-}
-.insight-type-icon { width: 14px; height: 14px; }
-.insight-card-type.insight-type-bug { color: #a73c2a; border-color: #f2cfc5; background: #fff4f1; }
-.insight-card-type.insight-type-style { color: #7b4b6d; border-color: #e5cfe0; background: #faf3f8; }
-.insight-card-type.insight-type-optimization { color: #41665b; border-color: #cfe0d6; background: #f4faf6; }
-.insight-card-type.insight-type-feature { color: #35608a; border-color: #c3d5e8; background: #f2f6fb; }
-
-.insight-card-foot {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  border-top: 1px solid #e5eee8;
-  padding-top: 8px;
-}
-.insight-severity {
-  display: inline-flex;
-  border: 1px solid #d2e3da;
-  border-radius: 99px;
-  padding: 2px 8px;
-  color: #507066;
-  background: #f4f8f5;
-  font-size: 10px;
-  font-weight: 700;
-}
-.insight-severity.insight-severity-high { color: #ad4838; border-color: #f0d3cb; background: #fff3ef; }
-.insight-severity.insight-severity-low { color: #4f907f; border-color: #cdddd2; background: #eef6f1; }
-.insight-file {
-  max-width: 100%;
-  overflow: hidden;
-  color: #789087;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.insights-none {
-  border: 1px dashed #c7dbd0;
-  border-radius: 8px;
-  padding: 22px;
-  color: #718a7f;
-  background: #f8fcf9;
-  font-size: 12px;
-  text-align: center;
-}
-
-.insights-new { color: #1f5b4c; }
-
-/* 卡片动作行：默认低调，hover 卡片时显眼 */
-.insight-card-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: auto;
-  opacity: 0.65;
-  transition: opacity 0.18s ease;
-}
-.insight-card:hover .insight-card-actions,
-.insight-card.editing .insight-card-actions { opacity: 1; }
-.insight-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 3px 8px;
-  color: #5d766c;
-  background: transparent;
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
-}
-.insight-action:hover { background: #eef7f1; border-color: #d4e4da; color: #1f5b4c; }
-.insight-action.danger:hover { background: #fff0ee; border-color: #f2cfc5; color: #a73c2a; }
-.insight-action:disabled { cursor: default; opacity: 0.6; }
-.insight-action:disabled:hover { background: transparent; border-color: transparent; color: #5d766c; }
-.insight-action-icon { width: 13px; height: 13px; }
-
-/* 内联编辑表单 */
-.insight-card.editing { border-color: #a7cdbb; box-shadow: 0 0 0 3px #2c75671a; }
-.insight-edit-field { display: grid; gap: 4px; }
-.insight-edit-field > span { color: #5d766c; font-size: 11px; font-weight: 700; }
-.insight-edit-field input,
-.insight-edit-field textarea,
-.insight-edit-field select {
-  width: 100%;
-  border: 1px solid #c5dad0;
-  border-radius: 6px;
-  padding: 7px 9px;
-  color: #19332c;
-  background: #fff;
-  font-size: 13px;
-  font-family: inherit;
-  resize: vertical;
-}
-.insight-edit-field input:focus,
-.insight-edit-field textarea:focus,
-.insight-edit-field select:focus { outline: none; border-color: #55a697; box-shadow: 0 0 0 3px #d9eee2; }
-.insight-edit-severity select { max-width: 220px; }
-.insight-card.editing .insight-card-actions { justify-content: flex-end; border-top: 1px solid #e5eee8; padding-top: 10px; }
-.insight-card.editing .insight-card-actions button.secondary,
-.insight-card.editing .insight-card-actions button.primary { margin: 0; }
-
-@media (max-width: 820px) {
-  .insights { padding: 20px 16px 32px; }
-  /* 长副标题 + 主按钮挤一行时会压窄按钮：窄屏下让按钮换到下一行右对齐 */
-  .insights-head { flex-direction: column; }
-  .insights-head > button.primary,
-  .insights-head > button.insight-stop { align-self: flex-end; }
-  .insights-summary { flex-wrap: wrap; }
-}
-
-/* ─── 建议再验证（re-verify）──────────────────────────────────────────── */
-
-/* 汇总行动作：验证全部 + 已失效折叠开关 */
 .insights-summary-actions {
   display: inline-flex;
   align-items: center;
@@ -468,8 +394,8 @@
   gap: 8px;
   margin-left: auto;
 }
-.insight-verify-all,
-.insight-invalidated-toggle {
+.insight-invalidated-toggle,
+.insight-dismissed-toggle {
   display: inline-flex;
   align-items: center;
   border: 1px solid #d4e4da;
@@ -478,18 +404,16 @@
   color: #41665b;
   background: #fff;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   transition: border-color .16s ease, color .16s ease, background .16s ease;
 }
-.insight-verify-all:hover:not(:disabled),
-.insight-invalidated-toggle:hover { border-color: #a6cbbb; background: #f0f8f3; }
-.insight-verify-all:disabled { cursor: default; opacity: 0.6; }
+.insight-invalidated-toggle:hover,
+.insight-dismissed-toggle:hover { border-color: #a6cbbb; background: #f0f8f3; }
 .insight-invalidated-toggle.active { border-color: #c9d3c4; color: #5d766c; background: #eef2ec; }
+.insight-dismissed-toggle.active { border-color: #c9c9c5; color: #4a524e; background: #f0f0ee; }
 
-/* 一键把全部有效建议添加为任务：实底主按钮。配色对齐应用既有绿实底按钮
-   （tasks.css `.task-inline-detail-actions .primary`：#2c7567/#f8fdf9/hover #1b5548），
-   与 outline 的"验证全部"区分。 */
+/* 一键把全部有效建议添加为任务：实底主按钮，配色对齐 tasks 页的绿实底 */
 .insight-add-all {
   display: inline-flex;
   align-items: center;
@@ -499,118 +423,42 @@
   color: #f8fdf9;
   background: #2c7567;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   transition: border-color .16s ease, background .16s ease, opacity .16s ease;
 }
 .insight-add-all:hover:not(:disabled) { border-color: #1b5548; background: #1b5548; }
 .insight-add-all:disabled { cursor: default; opacity: 0.6; }
 
-/* 验证状态徽章：仍存在 / 已失效 / 验证失败 / 验证中 */
-.insight-verify-badge {
+/* 汇总行上的模式开关（选中态 = 正在多选） */
+.insight-bulk-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  border: 1px solid #d2e3da;
-  border-radius: 99px;
-  padding: 2px 8px;
-  color: #507066;
-  background: #f4f8f5;
-  font-size: 10px;
-  font-weight: 700;
-}
-.insight-verify-badge.valid { color: #1f7a5e; border-color: #bfe2cf; background: #eef8f1; }
-.insight-verify-badge.invalid { color: #8a6d1c; border-color: #e7d9a8; background: #faf6e8; }
-.insight-verify-badge.failed { color: #a73c2a; border-color: #f0d3cb; background: #fff3ef; }
-.insight-verify-badge.pending { color: #35608a; border-color: #c3d5e8; background: #f2f6fb; }
-.insight-verify-spin {
-  width: 10px;
-  height: 10px;
-  flex: none;
-  border: 2px solid #cfe0d6;
-  border-top-color: #2c7567;
-  border-radius: 50%;
-  animation: insight-spin 0.9s linear infinite;
-}
-
-/* AI 验证的判断依据（仍存在 / 失效 / 失败的原因说明） */
-.insight-verify-reason {
-  margin: 0;
-  padding: 7px 9px;
-  border: 1px dashed #cfe3d8;
-  border-radius: 6px;
-  color: #5d766c;
-  background: #f7fbf8;
-  font-size: 11px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-}
-.insight-verify-reason.failed { color: #a73c2a; border-color: #f0d3cb; background: #fff6f3; }
-.insight-verify-reason.invalidated { color: #8a6d1c; border-color: #e7d9a8; background: #fbf8ec; }
-
-/* 已失效折叠区 */
-.insights-invalidated {
-  display: grid;
-  gap: 10px;
-  border: 1px dashed #cdc8b4;
-  border-radius: 8px;
-  padding: 14px 16px;
-  background: #fbfaf5;
-}
-.insights-invalidated-head { display: grid; gap: 3px; }
-.insights-invalidated-head b { color: #6d5f2e; font-size: 13px; }
-.insights-invalidated-head small { color: #9a8f62; font-size: 11px; line-height: 1.5; }
-
-/* 已失效卡片：低调置灰 */
-.insight-card.invalidated {
-  border-color: #ddd6bf;
-  background: #faf8f1;
-  box-shadow: none;
-}
-.insight-card.invalidated:hover { border-color: #c9c2a6; background: #fbfaf4; transform: none; box-shadow: 0 3px 8px #2d241010; }
-.insight-card.invalidated > b { color: #7a7358; }
-.insight-card.invalidated > p { color: #8a8266; }
-
-/* ── 「不再提示」折叠区（与已失效区同构，配色取中性灰，区别于"已失效"的黄）── */
-.insights-dismissed {
-  display: grid;
-  gap: 10px;
-  border: 1px dashed #d3d3cf;
-  border-radius: 8px;
-  padding: 14px 16px;
-  background: #fafafa;
-}
-.insights-dismissed-head { display: grid; gap: 3px; }
-.insights-dismissed-head b { color: #4d5a55; font-size: 13px; }
-.insights-dismissed-head small { color: #8b938f; font-size: 11px; line-height: 1.5; }
-
-/* 已忽略卡片：降到最低视觉权重，但保留可读性（用户可能还要恢复它） */
-.insight-card.dismissed {
-  border-color: #e2e2df;
-  background: #fbfbfa;
-  box-shadow: none;
-}
-.insight-card.dismissed:hover { border-color: #d0d0cc; background: #fcfcfb; transform: none; box-shadow: 0 3px 8px #2d241008; }
-.insight-card.dismissed > b { color: #6f7773; }
-.insight-card.dismissed > p { color: #838a86; }
-
-.insight-dismissed-toggle {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid #ddd;
+  border: 1px solid #d4e4da;
   border-radius: 99px;
   padding: 4px 12px;
-  color: #5f6864;
+  color: #41665b;
   background: #fff;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   transition: border-color .16s ease, color .16s ease, background .16s ease;
 }
-.insight-dismissed-toggle:hover { border-color: #c4c4c0; background: #f5f5f4; }
-.insight-dismissed-toggle.active { border-color: #c9c9c5; color: #4a524e; background: #f0f0ee; }
+.insight-bulk-toggle:hover:not(:disabled) { border-color: #a6cbbb; background: #f0f8f3; }
+.insight-bulk-toggle.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
+.insight-bulk-toggle:disabled { cursor: default; opacity: 0.6; }
 
-/* ── 被第 2 轮核实剔除的候选（含 AI 依据）：汇总行开关 + 展开列表 ── */
+/* ── 列表截断提示 ── */
+.insights-notice {
+  border: 1px solid #e3ece7;
+  border-radius: 10px;
+  padding: 9px 14px;
+  color: #6b7370;
+  background: #f9fcfa;
+  font-size: 12px;
+}
+
+/* ── 被第 2 轮核实剔除的候选 ── */
 .insights-rejected-toggle {
   display: inline-flex;
   align-items: center;
@@ -620,7 +468,7 @@
   color: #7a6a35;
   background: #fffdf6;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   transition: border-color .16s ease, color .16s ease, background .16s ease;
 }
@@ -631,7 +479,7 @@
   display: grid;
   gap: 8px;
   border: 1px dashed #e3d9bd;
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 14px 16px;
   background: #fdfbf4;
 }
@@ -644,72 +492,16 @@
   gap: 2px;
   padding: 8px 10px;
   border: 1px solid #ece4cd;
-  border-radius: 6px;
+  border-radius: 8px;
   background: #fff;
 }
-.insights-rejected li b { color: #5d5330; font-size: 12px; font-weight: 600; }
+.insights-rejected li b { color: #5d5330; font-size: 12px; font-weight: 700; }
 .insights-rejected li span { color: #8c8259; font-size: 11px; line-height: 1.5; }
 .insights-rejected li span.muted { color: #b0a98b; font-style: italic; }
 
-/* ── 列表截断提示 ── */
-.insights-notice {
-  border: 1px solid #e3e3df;
-  border-radius: 8px;
-  padding: 9px 14px;
-  color: #6b7370;
-  background: #fafaf9;
-  font-size: 12px;
-}
-
-/* ── 卡片上的「已转为任务」标注 ── */
-.insight-linked-task {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid #d4e4da;
-  border-radius: 99px;
-  padding: 1px 8px;
-  color: #41665b;
-  background: #f2f9f5;
-  font-size: 10px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-.insight-linked-task.terminal { border-color: #e0e0dc; color: #7b837f; background: #f7f7f6; }
-
-/* 可点击的文件路径（跳转到文件页打开） */
-.insight-file.link {
-  border: 0;
-  padding: 0;
-  background: none;
-  cursor: pointer;
-  text-align: left;
-  text-decoration: underline dotted;
-  text-underline-offset: 2px;
-}
-.insight-file.link:hover { color: #2c7567; }
-/* ─── 批量删除（多选 / 全部删除）────────────────────────────────────────────
+/* ── 批量删除（多选 / 全部删除）────────────────────────────────────────────
    视觉语言与任务看板的「批量管理」对齐：选择条紧贴列表上方，危险动作用实底红、
-   范围说明用文字而不是靠按钮禁用（禁用只说明"现在不行"，不说明"删的是哪些"）。
-   复选框与 tasks.css 的 .task-check 同尺寸同勾法：同一个应用里同一件事的小方框
-   长得不一样，本身就是一种误导。 */
-
-/* 汇总行上的模式开关（选中态 = 正在多选） */
-.insight-bulk-toggle {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid #d4e4da;
-  border-radius: 99px;
-  padding: 4px 12px;
-  color: #41665b;
-  background: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
-}
-.insight-bulk-toggle:hover:not(:disabled) { border-color: #a6cbbb; background: #f0f8f3; }
-.insight-bulk-toggle.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
-.insight-bulk-toggle:disabled { cursor: default; opacity: 0.6; }
+   范围说明用文字而不是靠按钮禁用。复选框与 tasks.css 的 .task-check 同尺寸同勾法。 */
 
 /* 选择条：全选 + 范围说明 + 已选计数 + 两个删除动作 */
 .insights-bulk {
@@ -718,7 +510,7 @@
   flex-wrap: wrap;
   gap: 9px;
   border: 1px solid #cfe0d6;
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 9px 12px;
   background: #f7fbf9;
 }
@@ -733,7 +525,7 @@
   color: #315e50;
   background: #fff;
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 700;
   cursor: pointer;
   transition: border-color .16s ease, background .16s ease;
 }
@@ -743,7 +535,7 @@
   overflow: hidden;
   color: #6f8b80;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -755,7 +547,7 @@
   margin-left: auto;
   color: #547066;
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 700;
   white-space: nowrap;
 }
 .insights-bulk-count b { color: #1f5b4c; }
@@ -767,7 +559,7 @@
   color: #fff;
   background: #c0463a;
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 700;
   cursor: pointer;
   transition: background .16s ease, border-color .16s ease;
 }
@@ -813,21 +605,335 @@
 .insight-check:indeterminate { border-color: #2c7567; background: #2c7567; box-shadow: 0 0 0 3px #d3ede0; }
 .insight-check:checked::after { opacity: 1; transform: rotate(-45deg) scale(1); }
 .insight-check:indeterminate::after { width: 9px; height: 0; margin-top: 0; border-bottom-width: 2px; border-left-width: 0; opacity: 1; transform: none; }
-.insight-check:focus-visible { border-color: #2c7567; outline: 2px solid #78aa98; outline-offset: 2px; }
+.insight-check:focus-visible {  border-color: #2c7567; outline: 2px solid #2b7b68; outline-offset: 2px;  }
 .insight-check:disabled { border-color: #d5e2da; background: #f2f6f3; cursor: not-allowed; }
 
-/* 卡片首行：复选框 + 类型徽标共用一行（单独占一个网格行会让每张卡凭空长高一行）。
-   `min-width: 0` 让长徽标在窄屏也能收缩，不至于把复选框挤出去。 */
+/* ── 类型筛选：分段控件 ── */
+.insights-filters {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  width: fit-content;
+  border: 1px solid #e3ece7;
+  border-radius: 10px;
+  padding: 3px;
+  background: #f7fbf8;
+}
+.insights-filters button {
+  border: 0;
+  border-radius: 8px;
+  padding: 5px 13px;
+  color: #4c6b60;
+  background: transparent;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .16s ease, color .16s ease;
+}
+.insights-filters button:hover { color: #1f5b4c; background: #e9f4ed; }
+.insights-filters button.active { color: #f8fdf9; background: #2c7567; }
+.insights-filters button small { margin-left: 3px; font-size: 10px; opacity: 0.7; }
+.insights-filters button.active small { opacity: 0.85; }
+
+/* ── 建议卡片（方案F：类型色图标章在左，正文在右）── */
+.insights-list {
+  display: grid;
+  gap: 11px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.insight-card {
+  display: flex;
+  gap: 12px;
+  border: 1px solid #edf3ef;
+  border-radius: 13px;
+  padding: 13px 16px;
+  background: #fdfefd;
+  box-shadow: 0 1px 2px #17362c0a;
+  transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+}
+.insight-card:hover { border-color: #bcd6c9; background: #fff; box-shadow: 0 2px 4px #17362c0a, 0 12px 26px #17362c12; }
+
+/* 类型色图标章 */
+.insight-stamp {
+  display: grid;
+  flex: none;
+  width: 38px;
+  height: 38px;
+  margin-top: 2px;
+  place-items: center;
+  border: 1px solid #d8e8de;
+  border-radius: 11px;
+  color: #2c6558;
+  background: #f4faf6;
+}
+.insight-stamp .insight-type-icon { width: 18px; height: 18px; }
+.insight-stamp.insight-type-bug { color: #a73c2a; border-color: #f0d3cb; background: #fff4f1; }
+.insight-stamp.insight-type-style { color: #7b4b6d; border-color: #e5cfe0; background: #faf3f8; }
+.insight-stamp.insight-type-optimization { color: #2c6558; border-color: #d8e8de; background: #f4faf6; }
+.insight-stamp.insight-type-feature { color: #35608a; border-color: #cddcea; background: #f2f6fb; }
+
+/* 正文：首行 = 复选框+类型徽标（左）与动作（右）同行；其余行跨两列 */
+.insight-card-body {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 12px;
+  align-items: start;
+}
+.insight-card-body > .insight-card-top { grid-column: 1; grid-row: 1; }
+.insight-card-body > .insight-card-actions { grid-column: 2; grid-row: 1; justify-self: end; }
+.insight-card-body > b,
+.insight-card-body > p,
+.insight-card-body > .insight-card-foot { grid-column: 1 / -1; }
+
+/* 卡片首行：复选框 + 类型徽标共用一行（徽标只留文字，图标由左侧的章承担） */
 .insight-card-top {
   display: flex;
   min-width: 0;
   align-items: center;
   gap: 9px;
 }
-/* 选择模式：整卡可点（控件优先，见 InsightsPanel 的 isCardControl） */
+.insight-card-type {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  color: #507066;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.insight-type-icon { width: 14px; height: 14px; }
+.insight-card-type.insight-type-bug { color: #a73c2a; }
+.insight-card-type.insight-type-style { color: #7b4b6d; }
+.insight-card-type.insight-type-optimization { color: #2c6558; }
+.insight-card-type.insight-type-feature { color: #35608a; }
+
+.insight-card-body > b { color: #264a40; font-size: 14px; font-weight: 700; line-height: 1.45; }
+.insight-card-body > p { margin: 0; color: #4c6b60; font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; }
+
+.insight-card-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 3px;
+}
+.insight-severity {
+  display: inline-flex;
+  border: 1px solid #d2e3da;
+  border-radius: 99px;
+  padding: 1px 8px;
+  color: #507066;
+  background: #f4f8f5;
+  font-size: 10px;
+  font-weight: 700;
+}
+.insight-severity.insight-severity-high { color: #ad4838; border-color: #f0d3cb; background: #fff3ef; }
+.insight-severity.insight-severity-low { color: #4f907f; border-color: #cdddd2; background: #eef6f1; }
+.insight-file {
+  max-width: 100%;
+  overflow: hidden;
+  color: #748b81;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  background: #f2f5f3;
+  border-radius: 5px;
+  padding: 2px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.insights-none {
+  border: 1px dashed #c7dbd0;
+  border-radius: 10px;
+  padding: 22px;
+  color: #718a7f;
+  background: #f9fcfa;
+  font-size: 12px;
+  text-align: center;
+}
+
+/* 卡片动作行：与首行同行右对齐；默认略收，hover 卡片时全亮 */
+.insight-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0.75;
+  transition: opacity 0.18s ease;
+}
+.insight-card:hover .insight-card-actions,
+.insight-card.editing .insight-card-actions { opacity: 1; }
+.insight-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 3px 8px;
+  color: #5d766c;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.insight-action:hover { background: #eef7f1; border-color: #d4e4da; color: #1f5b4c; }
+.insight-action.danger:hover { background: #fff0ee; border-color: #f2cfc5; color: #a73c2a; }
+.insight-action:disabled { cursor: default; opacity: 0.6; }
+.insight-action:disabled:hover { background: transparent; border-color: transparent; color: #5d766c; }
+.insight-action-icon { width: 13px; height: 13px; }
+
+/* 内联编辑表单：编辑态退回单列网格（无章、无正文分栏） */
+.insight-card.editing { display: grid; gap: 8px; border-color: #a7cdbb; box-shadow: 0 0 0 3px #2c75671a; }
+.insight-edit-field { display: grid; gap: 4px; }
+.insight-edit-field > span { color: #5d766c; font-size: 11px; font-weight: 700; }
+.insight-edit-field input,
+.insight-edit-field textarea,
+.insight-edit-field select {
+  width: 100%;
+  border: 1px solid #c5dad0;
+  border-radius: 6px;
+  padding: 7px 9px;
+  color: #19332c;
+  background: #fff;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+.insight-edit-field input:focus,
+.insight-edit-field textarea:focus,
+.insight-edit-field select:focus { outline: none; border-color: #55a697; box-shadow: 0 0 0 3px #d9eee2; }
+.insight-edit-severity select { max-width: 220px; }
+.insight-card.editing .insight-card-actions { justify-content: flex-end; border-top: 1px solid #e5eee8; padding-top: 10px; }
+.insight-card.editing .insight-card-actions button.secondary,
+.insight-card.editing .insight-card-actions button.primary { margin: 0; }
+
+/* ── 已失效折叠区 ── */
+.insights-invalidated {
+  display: grid;
+  gap: 10px;
+  border: 1px dashed #cdc8b4;
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: #fbfaf5;
+}
+.insights-invalidated-head { display: grid; gap: 3px; }
+.insights-invalidated-head b { color: #6d5f2e; font-size: 13px; }
+.insights-invalidated-head small { color: #9a8f62; font-size: 11px; line-height: 1.5; }
+
+/* 已失效卡片：低调置灰（规则必须在 .selected 之前——选中态靠顺序盖住它） */
+.insight-card.invalidated {
+  border-color: #ddd6bf;
+  background: #faf8f1;
+  box-shadow: none;
+}
+.insight-card.invalidated:hover { border-color: #c9c2a6; background: #fbfaf4; box-shadow: 0 3px 8px #2d241010; }
+.insight-card.invalidated b { color: #7a7358; }
+.insight-card.invalidated p { color: #8a8266; }
+
+/* ── 「不再提示」折叠区（中性灰，区别于"已失效"的黄）── */
+.insights-dismissed {
+  display: grid;
+  gap: 10px;
+  border: 1px dashed #d3d3cf;
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: #fafafa;
+}
+.insights-dismissed-head { display: grid; gap: 3px; }
+.insights-dismissed-head b { color: #4d5a55; font-size: 13px; }
+.insights-dismissed-head small { color: #8b938f; font-size: 11px; line-height: 1.5; }
+
+/* 已忽略卡片：降到最低视觉权重，但保留可读性 */
+.insight-card.dismissed {
+  border-color: #e2e2df;
+  background: #fbfbfa;
+  box-shadow: none;
+}
+.insight-card.dismissed:hover { border-color: #d0d0cc; background: #fcfcfb; box-shadow: 0 3px 8px #2d241008; }
+.insight-card.dismissed b { color: #6f7773; }
+.insight-card.dismissed p { color: #838a86; }
+
+/* ── 验证状态徽章与依据 ── */
+.insight-verify-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #d2e3da;
+  border-radius: 99px;
+  padding: 1px 8px;
+  color: #507066;
+  background: #f4f8f5;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.insight-verify-badge.valid { color: #1f7a5e; border-color: #bfe2cf; background: #eef8f1; }
+.insight-verify-badge.invalid { color: #8a6d1c; border-color: #e7d9a8; background: #faf6e8; }
+.insight-verify-badge.failed { color: #a73c2a; border-color: #f0d3cb; background: #fff3ef; }
+.insight-verify-badge.pending { color: #35608a; border-color: #c3d5e8; background: #f2f6fb; }
+.insight-verify-spin {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border: 2px solid #cfe0d6;
+  border-top-color: #2c7567;
+  border-radius: 50%;
+  animation: insight-spin 0.9s linear infinite;
+}
+
+/* AI 验证的判断依据（仍存在 / 失效 / 失败的原因说明）。
+   选择器带 .insight-card 前缀：`.insight-card-body > p` 是 (0,1,1)，单类名 (0,1,0)
+   压不过它，依据的颜色会被说明文字的颜色吃掉（特异性坑，复核过两轮）。 */
+.insight-card .insight-verify-reason {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px dashed #cfe3d8;
+  border-radius: 8px;
+  color: #5d766c;
+  background: #f7fbf8;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.insight-verify-reason.failed { color: #a73c2a; border-color: #f0d3cb; background: #fff6f3; }
+.insight-verify-reason.invalidated { color: #8a6d1c; border-color: #e7d9a8; background: #fbf8ec; }
+
+/* 卡片上的「已转为任务」标注 */
+.insight-linked-task {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d4e4da;
+  border-radius: 99px;
+  padding: 1px 8px;
+  color: #41665b;
+  background: #f2f9f5;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.insight-linked-task.terminal { border-color: #e0e0dc; color: #7b837f; background: #f7f7f6; }
+
+/* 可点击的文件路径（跳转到文件页打开） */
+.insight-file.link {
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.insight-file.link:hover { color: #2c7567; }
+
+/* ── 选择模式：整卡可点 + 选中态 ──
+   选择模式的样式与任务看板同一套（18×18 / 1.5px 描边 / 圆角 5px / 勾用伪元素）。 */
 .insight-card.selectable { cursor: pointer; }
-/* 选中态用 inset 描边而不是 box-shadow 外扩：外层 hover 的阴影与位移是另一条规则，
-   两者叠在一起时不该互相覆盖。规则排在被它盖住的 `.insight-card:hover`（更早）之后。 */
+/* 选中态规则必须排在 .insight-card:hover / .invalidated / .dismissed 之后：
+   同特异性下靠源码顺序生效（有测试钉住这条顺序，勿挪）。 */
 .insight-card.selected {
   border-color: #86b8a6;
   background: #f2faf5;
@@ -836,16 +942,26 @@
 .insight-card.selected:hover {
   border-color: #6ea895;
   background: #eef8f2;
-  box-shadow: inset 0 0 0 1px #a7d3c1, 0 7px 16px #17362c14;
-  transform: translateY(-2px);
+  box-shadow: inset 0 0 0 1px #a7d3c1, 0 12px 26px #17362c12;
 }
 
 @media (max-width: 820px) {
+  /* 窄屏只收起"发现性提示"，**说明范围的那条不能藏**（与任务看板批量栏同一条约定）：
+     "筛选生效：只作用于「有 bug」下的 N 条"说的是「选择范围被改小了」，藏起来就会出现
+     "全选只选了一半"的困惑。这条规则必须排在本媒体块最前（有测试钉住距离）。 */
+  .insights-bulk-hint[data-scope="all"] { display: none; }
+  .insights-banner { padding: 26px 18px 72px; }
+  .insights-banner-in { flex-direction: column; gap: 16px; }
+  .insights-banner-acts { flex-direction: row; align-items: center; padding-top: 0; }
+  .insights-panel { margin-top: -44px; padding: 14px 14px 18px; }
+  .insights-pickers-body { flex-direction: column; align-items: stretch; gap: 10px; }
+  .insights-summary { flex-wrap: wrap; }
+  .insights-summary-actions { margin-left: 0; }
   .insights-bulk-count { margin-left: 0; }
   .insights-bulk-hint { white-space: normal; }
-  /* 窄屏只收起"发现性提示"，**说明范围的那条不能藏**（与任务看板批量栏同一条约定）：
-     480px 实测发现性提示会被压成半句（"…也能一起勾"的尾巴被裁），留着不如收起来 ——
-     卡片上的复选框本身就是可发现的；而"筛选生效：只作用于「有 bug」下的 N 条"说的是
-     「选择范围被改小了」，藏起来就会出现"全选只选了一半"的困惑。 */
-  .insights-bulk-hint[data-scope="all"] { display: none; }
+  .insight-card { flex-direction: column; gap: 8px; }
+  .insight-stamp { margin-top: 0; }
+  .insight-card-body { grid-template-columns: 1fr; }
+  .insight-card-body > .insight-card-top { grid-column: 1; grid-row: auto; }
+  .insight-card-body > .insight-card-actions { grid-column: 1; grid-row: auto; justify-self: end; }
 }

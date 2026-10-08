@@ -49,18 +49,9 @@
   background: #f7fbf8;
 }
 .desktop-remote-back:hover:not(:disabled) { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
-.desktop-remote-back:focus-visible { outline: 2px solid #f6be4e; outline-offset: 2px; }
+.desktop-remote-back:focus-visible {  outline: 2px solid #2b7b68; outline-offset: 2px;  }
 .desktop-remote-head-text { min-width: 0; }
-.desktop-remote-kicker {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: #5c8174;
-  font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
-  letter-spacing: .6px;
-}
-.desktop-remote-kicker svg { width: 13px; height: 13px; flex: none; }
-.desktop-remote-head-text h1 { margin: 6px 0 0; color: #19332c; font-size: 24px; line-height: 1.15; }
+.desktop-remote-head-text h1 { margin: 0; color: #19332c; font-size: 24px; line-height: 1.15; }
 .desktop-remote-head-actions { display: flex; flex: none; align-items: center; gap: 10px; }
 
 /* 服务状态胶囊。五档各有一个色，**"未注册"和"读不到"必须长得不一样** ——
@@ -75,7 +66,7 @@
   color: #216b58;
   background: #e6f5ec;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
   white-space: nowrap;
 }
 .desktop-remote-led { width: 8px; height: 8px; flex: none; border-radius: 999px; background: #3fa87a; }
@@ -105,7 +96,7 @@
   color: #fff;
   background: #1f6055;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
   white-space: nowrap;
 }
 .desktop-remote-phone-chip .desktop-remote-led { background: #8ce0b4; }
@@ -138,7 +129,6 @@
 .desktop-remote-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
 .desktop-remote-card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .desktop-remote-note { margin: 6px 0 14px; color: #6f887c; font-size: 12px; line-height: 1.7; }
-.desktop-remote-note b { color: #294e43; }
 
 /* 按钮：三档尺寸 / 四套配色。全部 ≥32px（窄屏下也不缩到 28px 那种点不准的尺寸）。 */
 .desktop-remote-btn {
@@ -157,7 +147,10 @@
   white-space: nowrap;
 }
 .desktop-remote-btn:disabled { cursor: not-allowed; }
-.desktop-remote-btn:focus-visible { outline: 2px solid #f6be4e; outline-offset: 2px; }
+/* 深色实底按钮照样用深绿环：offset 为正时环落在**按钮之外**的浅色页面底上，
+   对比对象是页面背景而非按钮自身（实测见 .tmp/probe-outline-layer.mjs 的 A 组）。
+   只有 offset 为负（环被压进元素内部）或四周本身就是深色时，才需要换亮色。 */
+.desktop-remote-btn:focus-visible { outline: 2px solid #2b7b68; outline-offset: 2px; }
 .desktop-remote-btn.ghost { border-color: #c8dcd1; color: #2c7567; background: #fff; }
 .desktop-remote-btn.ghost:hover:not(:disabled) { border-color: #7fae9d; background: #eaf5ee; }
 .desktop-remote-btn.ghost:disabled { color: #9bb3a9; background: #f4f8f6; }
@@ -214,13 +207,13 @@
   border-radius: 999px;
   color: #1f6055;
   background: #eaf5ee;
-  font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .desktop-remote-steps li[data-done="true"]::before { color: #fff; background: #2c7567; }
 
 .desktop-remote-code { display: flex; align-items: center; gap: 10px; }
 .desktop-remote-code-label { color: #6f887c; font-size: 12px; }
-.desktop-remote-code strong { color: #19332c; font: 800 26px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .14em; font-variant-numeric: tabular-nums; }
+.desktop-remote-code strong { color: #19332c; font: 700 26px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .14em; font-variant-numeric: tabular-nums; }
 .desktop-remote-countdown { margin: 0; color: #6f887c; font-size: 12px; font-weight: 700; }
 .desktop-remote-countdown[data-expired="true"] { color: #9b3e33; }
 .desktop-remote-empty { margin: 0; border: 1px dashed #cfded6; border-radius: 8px; padding: 22px 14px; color: #6f887c; background: #fbfefb; font-size: 12.5px; text-align: center; }
@@ -248,7 +241,7 @@
   color: #216b58;
   background: #e6f5ec;
   font-size: 11px;
-  font-weight: 800;
+  font-weight: 700;
   white-space: nowrap;
 }
 .desktop-remote-chip[data-state="loading"] { border-color: #cfded6; color: #567468; background: #f4f8f6; }
@@ -258,8 +251,8 @@
 /* 键值对用 dt/dd 而不是"标签 + 冒号 + 值"：实例 ID 很长，两列网格能保证所有值左缘对齐。 */
 .desktop-remote-kv { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 7px 12px; margin: 12px 0 0; font-size: 12px; }
 .desktop-remote-kv dt { color: #82968d; }
-.desktop-remote-kv dd { min-width: 0; margin: 0; color: #294e43; font-weight: 600; overflow-wrap: anywhere; }
-.desktop-remote-kv dd code { color: #31594c; font: 600 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.desktop-remote-kv dd { min-width: 0; margin: 0; color: #294e43; font-weight: 700; overflow-wrap: anywhere; }
+.desktop-remote-kv dd code { color: #31594c; font: 700 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .desktop-remote-hint { margin: 10px 0 0; color: #6f887c; font-size: 11.5px; line-height: 1.65; }
 .desktop-remote-hint[data-tone="warn"] { color: #8c3a2c; }
 
@@ -285,7 +278,7 @@
 .desktop-remote-phone-who small { display: block; margin-top: 2px; color: #6f887c; font-size: 11.5px; }
 /* 名字右侧那颗状态胶囊，和页头那颗说的是同一件事（页头给完整句，这里给一个词）。
    `flex: none` + 名字容器的 `min-width: 0` 一起保证长手机名挤不走它。 */
-.desktop-remote-phone-state { flex: none; border-radius: 999px; padding: 2px 8px; color: #286452; background: #e4f6e9; font-size: 11px; font-weight: 800; }
+.desktop-remote-phone-state { flex: none; border-radius: 999px; padding: 2px 8px; color: #286452; background: #e4f6e9; font-size: 11px; font-weight: 700; }
 .desktop-remote-phone-state[data-state="idle"],
 .desktop-remote-phone-state[data-state="never"] { color: #8a5a1c; background: #fff1ce; }
 /* 读数过期：同页头那颗 stale 胶囊的配色。这里写「读不到」而不是「未同步」——

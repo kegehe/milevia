@@ -1103,26 +1103,28 @@ func (s *Server) launchScheduledTaskRun(ctx context.Context, scheduledRunID stri
 	}
 	task, err := s.scheduledTaskByID(ctx, run.ScheduledTaskID)
 	if err != nil {
-		s.failScheduledTaskRun(scheduledRunID, "scheduled task no longer exists")
+		s.failScheduledTaskRun(scheduledRunID, "定时任务已不存在")
 		return
 	}
 	project, err := s.getProjectByID(ctx, task.ProjectID)
 	if err != nil {
-		s.failScheduledTaskRun(scheduledRunID, "project is unavailable")
+		s.failScheduledTaskRun(scheduledRunID, "项目不可用")
 		return
 	}
 	_, agentID, permissionMode := scheduledRunExecutionConfig(task, run)
 	if !validAgentPolicy(agentID, permissionMode) {
-		s.failScheduledTaskRun(scheduledRunID, "scheduled run has an unsupported execution policy")
+		s.failScheduledTaskRun(scheduledRunID, "这次定时运行的执行策略不受支持")
 		return
 	}
+	// failScheduledTaskRun 的 reason 直接写进 scheduled_task_runs.failure_reason 并被
+	// 定时任务页渲染，所以一律走 errorText，不留裸的英文 err.Error()。
 	if err := s.validateScheduledTaskSkills(ctx, project, agentID, run.SkillsSnapshot); err != nil {
-		s.failScheduledTaskRun(scheduledRunID, err.Error())
+		s.failScheduledTaskRun(scheduledRunID, errorText(err))
 		return
 	}
 	conversation, err := s.createScheduledTaskConversation(ctx, project, task, run)
 	if err != nil {
-		s.failScheduledTaskRun(scheduledRunID, err.Error())
+		s.failScheduledTaskRun(scheduledRunID, errorText(err))
 		return
 	}
 	record := &runStartRecord{Scheduled: &run}
@@ -1130,15 +1132,32 @@ func (s *Server) launchScheduledTaskRun(ctx context.Context, scheduledRunID stri
 	if err == nil {
 		return
 	}
-	if (status == http.StatusConflict && strings.Contains(err.Error(), "project workspace is occupied")) || status == http.StatusTooManyRequests {
-		reason := "waiting for the project workspace to become idle"
-		if status == http.StatusTooManyRequests {
-			reason = "waiting for credential quota availability"
-		}
+	// 判据取错误类型，不比英文原文：这条以前用 strings.Contains 匹配
+	// "project workspace is occupied"，那条文案由 *projectWorkspaceOccupiedError 产出，
+	// 一旦它被中文化（或换了措辞），限流分支会**静默**失效、退化成 failScheduledTaskRun
+	// ——用户看到的是"执行失败"，而不是"正在等待工作区空闲"。
+	if reason := scheduledRunRetryReason(status, err); reason != "" {
 		_, _ = s.db.ExecContext(context.Background(), `update scheduled_task_runs set failure_reason=? where id=? and status=? and run_id=''`, reason, run.ID, scheduledRunQueued)
 		return
 	}
 	s.failScheduledTaskRun(scheduledRunID, err.Error())
+}
+
+// scheduledRunRetryReason 判断一次派发失败属于"稍后再试"还是"真失败"。
+// 返回非空字符串表示应把这次运行留在 queued 状态，并把该字符串写进 failure_reason
+// 当作等待原因（它会被定时任务页直接渲染，所以必须是中文）。
+//
+// 判据是 HTTP 状态码加上错误**类型**，不是错误文案。文案是会被改的东西——把它当判据，
+// 改文案的那一刻分支会静默失效，而没有任何测试会红（docs/41 §15.1 记录过一次同类事故）。
+func scheduledRunRetryReason(status int, err error) string {
+	if status == http.StatusTooManyRequests {
+		return "凭据额度暂时不可用，正在等待"
+	}
+	var occupied *projectWorkspaceOccupiedError
+	if status == http.StatusConflict && errors.As(err, &occupied) {
+		return "项目工作区正被占用，正在等待其空闲"
+	}
+	return ""
 }
 
 // scheduledRunExecutionConfig preserves the configuration that was selected
@@ -1162,7 +1181,7 @@ func (s *Server) scheduledRunProfileRevisionTx(ctx context.Context, tx *sql.Tx, 
 	var runnerID string
 	if err := tx.QueryRowContext(ctx, `select coalesce(nullif(runner_id,''),runner) from projects where id=?`, task.ProjectID).Scan(&runnerID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return profileRouteSelection{}, errors.New("project is unavailable")
+			return profileRouteSelection{}, errors.New("项目不可用")
 		}
 		return profileRouteSelection{}, err
 	}

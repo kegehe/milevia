@@ -175,6 +175,11 @@ func (s *Server) openSQLitePreview(r *http.Request) (*sql.DB, func(), error) {
 }
 
 func (s *Server) writeSQLitePreviewError(w http.ResponseWriter, err error) {
+	// 与 writeFSError 同理：解析请求上下文失败（"项目不存在"）不是"请求参数无效"。
+	if errors.Is(err, sql.ErrNoRows) {
+		writeMissingProject(w)
+		return
+	}
 	if offline, ok := err.(*runnerOfflineError); ok {
 		s.writeFSError(w, offline)
 		return

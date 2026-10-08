@@ -848,6 +848,36 @@ func TestRelayErrorCarriesBothLocalizedTextAndMachineCode(t *testing.T) {
 	}
 }
 
+// TestGitFailureCodesSurviveTheRelay 是"码真的穿到底"的那一半：从 writeError 一路到
+// 中继答复，逐个新码走一遍。
+//
+// 为什么不能只测 httpErrorCode：那只能证明码生成得出来，证明不了它被写进响应体、
+// 又原样被中继取出来交给客户端。中间任何一处漏了，客户端就退回文案匹配 —— 静默失效。
+// 手机端的 classifyGitFailure 现在码优先，它拿到这些码才不去看文案。
+func TestGitFailureCodesSurviveTheRelay(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"Git 状态已变化", errGitStateChanged, "git_state_changed"},
+		{"选中的路径已不可用", errGitPathsGone, "git_paths_gone"},
+		{"没有可操作的文件", errGitNoChanges, "git_no_changes"},
+		{"会话还有在跑的任务", errActiveRunsPresent, "active_runs_present"},
+	}
+	for _, testCase := range cases {
+		recorder := httptest.NewRecorder()
+		writeError(recorder, http.StatusConflict, testCase.err)
+		reply := relayErrorResponse(http.StatusConflict, recorder.Body.Bytes())
+		if reply.Code != testCase.code {
+			t.Fatalf("%s：中继答复里的码 = %q，期望 %q（正文：%s）", testCase.name, reply.Code, testCase.code, recorder.Body.String())
+		}
+		if reply.OK {
+			t.Fatalf("%s：冲突不该回 ok=true", testCase.name)
+		}
+	}
+}
+
 func TestOrEmptyJSONObjectNeverEmitsInvalidJSON(t *testing.T) {
 	if got := string(orEmptyJSONObject(nil)); got != "{}" {
 		t.Fatalf("nil body = %q", got)

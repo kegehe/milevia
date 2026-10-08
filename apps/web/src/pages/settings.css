@@ -36,11 +36,7 @@
 
 .settings-back:hover:not(:disabled) { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
 .settings-back svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.9; }
-.settings-kicker { display: inline-flex; align-items: center; gap: 5px; color: #5c8174; font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.settings-kicker svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
-.settings-header h1 { margin: 6px 0 0; color: #19332c; font-size: 24px; line-height: 1.15; }
-.settings-device-label { display: inline-flex; flex: none; align-items: center; gap: 6px; border: 1px solid #d3e4da; border-radius: 99px; padding: 5px 11px; color: #5f7d72; background: #f8fcf9; font-size: 11.5px; font-weight: 600; }
-.settings-device-label::before { width: 6px; height: 6px; border-radius: 50%; background: #7fae9d; content: ""; }
+.settings-header h1 { margin: 0; color: #19332c; font-size: 24px; line-height: 1.15; }
 
 /* 分页栏：与下方白板咬合，选中页与白板连成一体 */
 .settings-tabs {
@@ -60,7 +56,7 @@
   color: #658075;
   background: transparent;
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 700;
   white-space: nowrap;
   transition: color .16s ease, background .16s ease;
 }
@@ -69,7 +65,7 @@
 .settings-tabs button.active {
   color: #1f6055;
   background: #fbfefb;
-  font-weight: 750;
+  font-weight: 700;
   box-shadow: inset 0 1px 0 #dce9e1, inset 1px 0 0 #dce9e1, inset -1px 0 0 #dce9e1;
 }
 
@@ -85,7 +81,7 @@
 }
 
 .settings-board-hero { margin-bottom: 24px; padding-bottom: 22px; border-bottom: 1px dashed #d7e6dd; }
-.settings-board-hero p { margin: 0 0 6px; color: #5c8174; font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.settings-board-hero p { margin: 0 0 6px; color: #5c8174; font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .settings-board-hero h2 { margin: 0 0 6px; color: #19332c; font-size: 22px; line-height: 1.2; }
 .settings-board-hero span { display: block; max-width: 780px; color: #71887e; font-size: 12.5px; line-height: 1.55; }
 
@@ -107,7 +103,7 @@
 .settings-card.wide { grid-column: 1 / -1; }
 .settings-card.danger { border-color: #f0ded8; background: #fdfaf9; }
 .settings-card-text { display: grid; min-width: 0; gap: 4px; }
-.settings-card-text b { color: #294e43; font-size: 13.5px; font-weight: 690; }
+.settings-card-text b { color: #294e43; font-size: 13.5px; font-weight: 700; }
 .settings-card-text span { color: #748b81; font-size: 12.5px; line-height: 1.5; }
 .settings-card.danger .settings-card-text b { color: #8f4130; }
 .settings-card.danger .settings-card-text span { color: #8d7972; }
@@ -123,7 +119,7 @@
   background: #fefaf8;
 }
 
-.settings-danger-title { margin: 0; color: #a97362; font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.settings-danger-title { margin: 0; color: #a97362; font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 
 .settings-note { display: flex; align-items: flex-start; gap: 12px; border: 1px solid #e6d6cf; border-radius: 11px; padding: 15px 17px; background: #fdf8f6; }
 .settings-note-icon { display: grid; width: 30px; height: 30px; flex: none; place-items: center; border-radius: 8px; color: #a04a37; background: #f7e4de; }
@@ -142,7 +138,7 @@
 .settings-toggle > span::after { display: block; width: 17px; height: 17px; margin: 2px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px #17362c2a; content: ""; transition: transform .16s ease; }
 .settings-toggle input:checked + span { border-color: #2c7567; background: #2c7567; }
 .settings-toggle input:checked + span::after { transform: translateX(17px); }
-.settings-toggle input:focus-visible + span { outline: 3px solid #f6be4e; outline-offset: 3px; }
+.settings-toggle input:focus-visible + span {  outline: 2px solid #2b7b68; outline-offset: 3px;  }
 .settings-toggle input:disabled + span { opacity: .5; cursor: not-allowed; }
 
 .settings-card select, .settings-time-control input {
@@ -179,7 +175,7 @@
 .settings-card-side > .secondary, .settings-card-side > .primary { min-height: 36px; padding: 7px 13px; font-size: 12.5px; }
 
 .font-size-control, .settings-time-control { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 7px; }
-.font-size-control > button:not(.secondary) { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid #c8dcd1; border-radius: 8px; padding: 0; color: #31594f; background: #f7fbf8; }
+.font-size-control > button:not(.secondary) { display: grid; width: 30px; height: 30px; min-height: 30px; place-items: center; border: 1px solid #c8dcd1; border-radius: 8px; padding: 0; color: #31594f; background: #f7fbf8; }
 .font-size-control > button:not(.secondary):hover:not(:disabled) { border-color: #7fae9d; background: #eaf5ee; }
 .font-size-control input { width: 118px; accent-color: #2c7567; }
 .font-size-control output { width: 38px; color: #315f54; font: 700 11.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
@@ -205,7 +201,6 @@
   .settings-header, .settings-tabs, .settings-board { width: min(100% - 28px, 460px); }
   .settings-header { align-items: flex-start; padding: 16px 0; }
   .settings-header h1 { font-size: 21px; }
-  .settings-device-label { display: none; }
   .settings-card { flex-direction: column; align-items: stretch; gap: 12px; padding: 15px 16px; }
   .settings-card-side { justify-content: flex-start; }
   .settings-card-side > .font-size-control, .settings-card-side > .settings-time-control { justify-content: flex-start; }

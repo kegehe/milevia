@@ -142,6 +142,16 @@ type mcpProbeRequest struct {
 
 // probeMCPServer 在目标环境执行一次 initialize + tools/list。
 func (s *Server) probeMCPServer(ctx context.Context, req mcpProbeRequest) (mcpProbeOutcome, error) {
+	// 环境变量**键名**先归一化（去首尾空白，与写入路径同一口径），再验：远端探针把它
+	// 内联进交给远端 sh 的脚本，值有 shellQuote、键没有（见 mcpEnvKeyPattern）。
+	// 写入路径的三道闸门也会挡，但这里必须再挡一次，因为两条路都不经过写入路径就能走到这儿：
+	//   · 库里可能存着本次修复之前写进去的键（老数据）；
+	//   · 草稿试连压根不落库。
+	// 放在唯一的漏斗上，两个测试入口与将来新增的入口一次性全覆盖。
+	req.Env = normalizeMCPEnvKeys(req.Env)
+	if err := mcpEnvKeyError(req.Env); err != nil {
+		return mcpProbeOutcome{}, err
+	}
 	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = mcpDefaultProbeTimeout
@@ -234,6 +244,10 @@ func (s *Server) sshClientForConnection(connID string) (*sshClient, error) {
 // 避免引号/空格/非 ASCII 在远端 shell 被重解释。远端没有安全 env 通道（见 docs/34 §0.4），
 // 因此 env 以 `env KEY=VAL` 前缀形式内联——这一点与「密钥不进 argv」原则冲突，故仅在
 // 用户主动点击「测试连接」时发生，且不落盘、不写日志。
+//
+// ⚠️ 这里的 env 只对**值**做 shellQuote，键是原样拼进脚本的（`env NAME=v` 要求 NAME 是
+// 合法标识符，加引号反而非法）。所以**键名必须先由调用方校验**，唯一入口是
+// probeMCPServer 那道 mcpEnvKeyError 闸门 —— 绕过它就等于允许在目标主机上执行任意命令。
 func buildRemoteStdioProbeCommand(req mcpProbeRequest) string {
 	parts := []string{}
 	for _, key := range sortedKeys(req.Env) {
@@ -1439,7 +1453,9 @@ func (s *Server) checkMCPRuntimes(w http.ResponseWriter, r *http.Request) {
 		}
 		client, err := s.sshClientForConnection(connID)
 		if err != nil {
-			respond(err.Error(), nil)
+			// 这条以前是 respond(err.Error())——整条纯英文、连中文壳都没有，而
+			// "runner not found"/"runner is not an SSH runner" 在翻译表里本来就有中文。
+			respond(errorText(err), nil)
 			return
 		}
 		found := make([]mcpRuntimeCheckItem, 0, len(commands))

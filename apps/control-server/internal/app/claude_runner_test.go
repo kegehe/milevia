@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -176,14 +177,104 @@ func TestClaudeStderrCaptureBoundsAndDetail(t *testing.T) {
 	if claudeStderrDetail("   ") != "" {
 		t.Fatalf("empty/whitespace stderr should produce empty detail")
 	}
-	// 构造贴近上限的 detail（180 字节内容），验证加上固定前缀后仍落在
-	// insightRunErrorMessage 的 240 字符截断（保留开头）之内，不砍关键末尾。
+	// 构造贴近上限的 detail（maxAgentDetailBytes=180 字节**内容**，括号另计），验证加上固定前缀后
+	// 仍落在 insightRunErrorMessage 的 insightRunMessageBytes=240 **字节**截断（保留开头）之内，
+	// 不砍关键末尾。（单位别写成"字符"：中文一字三字节，这条预算按字节算。）
 	maxDetail := claudeStderrDetail(strings.Repeat("x", 500))
-	if len("Claude exited: exit status 1 "+maxDetail) > 240 {
-		t.Fatalf("max-length error message exceeds 240-char insight truncation: %d", len("Claude exited: exit status 1 "+maxDetail))
-	}
+	assertClaudeExitMessageFitsInsightTruncation(t, maxDetail)
 	if !strings.HasSuffix(maxDetail, "xxx）") {
 		t.Fatalf("max-length detail should keep the tail end: %q", maxDetail)
+	}
+}
+
+// assertClaudeExitMessageFitsInsightTruncation 钉住"进程退出错误 + 详情段"的字节预算。
+//
+// insightRunErrorMessage 会把这串东西按 insightRunMessageBytes 截断（且保留开头、切掉
+// 末尾），一旦超了，被切掉的恰好是最有用的末尾原因。所以整个形态要一起算：固定前缀
+// （claudeExitPrefix）+ Go 的退出描述 + 详情段。
+//
+// 这里用真实的前缀与真实的上限来算，不抄一份字面量——抄字面量的话，前缀改成中文以后
+// 这条断言会**照旧通过**，但它量的已经不是真正发出去的那个串了。
+//
+// ⚠️ 退出描述取 **Windows 的十位崩溃码**（`exit status 3221225477`，23 字节含尾空格），
+// 不是 POSIX 的 "exit status 137 "（16 字节）。原来按后者算，得出"还留了余量"的结论，
+// 而真实的长尾（Windows 上进程崩溃）是 22 + 23 + 195 = 恰好 240 —— 余量为 0。
+// 按最坏形态钉，这条断言才有意义。
+const longestGoExitDescription = "exit status 3221225477 " // Windows STATUS_ACCESS_VIOLATION 一类
+
+func assertClaudeExitMessageFitsInsightTruncation(t *testing.T, detail string) {
+	t.Helper()
+	if total := len(claudeExitPrefix) + len(longestGoExitDescription) + len(detail); total > insightRunMessageBytes {
+		t.Fatalf("进程退出错误最长形态 %d 字节，超出 %d 字节截断上限（详情段 %d 字节，其内层 tail 另有 maxAgentDetailBytes=%d 的帽子）",
+			total, insightRunMessageBytes, len(detail), maxAgentDetailBytes)
+	}
+}
+
+// 详情段的额度是**内容**字节数，括号另计 —— 这条钉的就是这个口径。
+//
+// 2026-09-29 那轮修复里，我一度把 `claudeRunFailureDetailWithin` 的入参当成"整段（含括号）"，
+// 于是本地路径的 CLI 分支从 192 悄悄缩到 180：没有任何断言会红，因为差的只是"少给 12 字节
+// 报错原文"。括号是"（CLI：…）"9+3 还是"（stderr：…）"12+3 由运行结果决定，调用方事先不知道，
+// 所以反推额度时扣的是**大的那个**（claudeDetailWrapperBytes）。
+func TestClaudeFailureDetailContentCapExcludesWrapper(t *testing.T) {
+	long := strings.Repeat("远端报错原文", 100) // 远超上限，逼出截断
+
+	// stderr 分支：内容上限 maxAgentDetailBytes，括号 15 字节。
+	stderrDetail := claudeRunFailureDetail(nil, long)
+	stderrContent := strings.TrimSuffix(strings.TrimPrefix(stderrDetail, "（stderr："), "）")
+	if len(stderrContent) > maxAgentDetailBytes {
+		t.Fatalf("stderr 详情段内容 %d 字节，超出 maxAgentDetailBytes=%d：括号被算进内容额度了",
+			len(stderrContent), maxAgentDetailBytes)
+	}
+	// 允许一个多字节字符的余量（截断点会回退到 UTF-8 边界），但不能少太多 ——
+	// 少一整段就说明额度算小了，那正是这次要防的退化。
+	if len(stderrContent) < maxAgentDetailBytes-3 {
+		t.Fatalf("stderr 详情段只给了 %d 字节（上限 %d）—— 额度被谁又扣了一道",
+			len(stderrContent), maxAgentDetailBytes)
+	}
+
+	// CLI 分支：同一份内容额度，括号 12 字节。
+	cliDetail := claudeRunFailureDetail(json.RawMessage(`{"type":"result","is_error":true,"result":`+strconv.Quote(long)+`}`), "")
+	cliContent := strings.TrimSuffix(strings.TrimPrefix(cliDetail, "（CLI："), "）")
+	if !strings.HasPrefix(cliDetail, "（CLI：") {
+		t.Fatalf("CLI 自报的可读原因没被用上：%q", cliDetail[:min(len(cliDetail), 40)])
+	}
+	if len(cliContent) > maxAgentDetailBytes || len(cliContent) < maxAgentDetailBytes-3 {
+		t.Fatalf("CLI 详情段内容 %d 字节（上限 %d）—— 与 stderr 分支的口径不一致",
+			len(cliContent), maxAgentDetailBytes)
+	}
+
+	// 反推额度时必须扣**较大**的括号：同一段内容走哪个分支由运行结果决定。
+	if claudeDetailWrapperBytes < len("（CLI：）") || claudeDetailWrapperBytes < len("（stderr：）") {
+		t.Fatalf("claudeDetailWrapperBytes=%d 不是较大的那个括号长度，反推额度会算少",
+			claudeDetailWrapperBytes)
+	}
+}
+
+// claudeCLIErrorCodes 的**不变量**：每个译文都必须含"失败"二字。
+//
+// 理由见 claudeCLIErrorCodeText 的注释：括号里保留着英文原值，所以直通判据要求
+// "含中文 且（含失败 或 无残留英文）"，少这两个字就会被套上"任务执行失败，请查看任务
+// 日志后重试。"——一句既指不到原因、又建议重试一件重试必然同样失败的事。
+//
+// 2026-09-29：`error_max_turns` 正是漏网的第三个值（独立复查实测 errorText 的输出）。
+// 这条断言的作用是让**下一个**新增的枚举值也逃不掉。
+func TestClaudeCLIErrorCodeTextsAllCarryFailureWord(t *testing.T) {
+	if len(claudeCLIErrorCodes) < 3 {
+		t.Fatalf("枚举表只剩 %d 条，锚点可能已失配（这条断言会退化成空转）", len(claudeCLIErrorCodes))
+	}
+	for code, text := range claudeCLIErrorCodes {
+		if !strings.Contains(text, "失败") {
+			t.Errorf("枚举 %s 的译文 %q 里没有「失败」：它会被套上误导前缀", code, text)
+		}
+		// 端到端再钉一次：真正上屏的那条串不许带兜底前缀。
+		got := errorText(errors.New(mapClaudeAPIError(code)))
+		if strings.Contains(got, taskFailureFallbackPrefix) {
+			t.Errorf("枚举 %s 的错误被套上了兜底前缀：%q", code, got)
+		}
+		if !containsChinese(got) {
+			t.Errorf("枚举 %s 的错误没有中文：%q", code, got)
+		}
 	}
 }
 
@@ -204,7 +295,7 @@ func TestClaudeReadStderrCaptureAccumulatesTail(t *testing.T) {
 
 // TestClaudeCLIRunErrorIncludesStderrDetail 端到端验证真实失败场景：fake claude 脚本
 // 写一行 stderr 后以退出码 1 结束，Run 返回的错误应包含 claude 自己写的 stderr 尾部，
-// 而非只有裸的 "Claude exited: exit status 1"。
+// 而非只有裸的退出描述（claudeExitPrefix + "exit status 1"）。
 func TestClaudeCLIRunErrorIncludesStderrDetail(t *testing.T) {
 	requirePOSIXShell(t)
 	scriptPath := filepath.Join(t.TempDir(), "fake-claude-fail")
@@ -222,11 +313,237 @@ func TestClaudeCLIRunErrorIncludesStderrDetail(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from failing fake Claude CLI")
 	}
-	if !strings.Contains(err.Error(), "Claude exited") {
-		t.Fatalf("error missing Claude exited marker: %v", err)
+	if !strings.Contains(err.Error(), claudeExitPrefix) {
+		t.Fatalf("error missing exit-wrapper prefix: %v", err)
 	}
 	if !strings.Contains(err.Error(), "rate limit exceeded") {
 		t.Fatalf("error missing stderr detail: %v", err)
+	}
+}
+
+// TestClaudeRunFailureDetailPicksTheMostUsefulReason 单测失败原因的选择规则：API 级失败
+// 只在 stream-json 的 result 事件里报出，必须能从 is_error/api_error_status/result 里
+// 还原成人能看懂的一句话；CLI 只给枚举时，stderr 比裸枚举更有信息量，而 success /
+// completed 这类无害枚举绝不能当失败原因展示。
+func TestClaudeRunFailureDetailPicksTheMostUsefulReason(t *testing.T) {
+	apiError := json.RawMessage(
+		`{"type":"result","subtype":"success","is_error":true,"api_error_status":400,"terminal_reason":"api_error",` +
+			`"result":"API Error: 400 Upstream service returned HTTP 400: {\"model\":\"x\"}"}`)
+	detail := claudeRunFailureDetail(apiError, "")
+	if !strings.HasPrefix(detail, "（CLI：") {
+		t.Fatalf("detail missing prefix: %q", detail)
+	}
+	if !strings.Contains(detail, "API Error: 400") {
+		t.Fatalf("detail missing API error text: %q", detail)
+	}
+
+	// 非失败（is_error 缺失或为假）不得产出附加段，否则正常收尾也会被拼进错误。
+	if got := claudeRunFailureDetail(json.RawMessage(`{"type":"result","is_error":false,"result":"正常回复"}`), ""); got != "" {
+		t.Fatalf("non-error result should produce empty detail, got %q", got)
+	}
+	if got := claudeRunFailureDetail(json.RawMessage(`{"type":"result","result":"缺少 is_error"}`), ""); got != "" {
+		t.Fatalf("result without is_error should produce empty detail, got %q", got)
+	}
+	if got := claudeRunFailureDetail(nil, ""); got != "" {
+		t.Fatalf("no result event should produce empty detail, got %q", got)
+	}
+
+	// CLI 没给可读原因（result 为空）时，退回 stderr——它比裸枚举更有信息量。
+	enumOnly := json.RawMessage(`{"type":"result","is_error":true,"terminal_reason":"error_max_turns"}`)
+	if got := claudeRunFailureDetail(enumOnly, "real crash: context length exceeded"); !strings.Contains(got, "（stderr：") {
+		t.Fatalf("stderr should outrank a bare enum, got %q", got)
+	}
+	// stderr 也没有时才用裸枚举，并补上 HTTP 状态码。
+	fallback := claudeRunFailureDetail(json.RawMessage(
+		`{"type":"result","is_error":true,"api_error_status":429,"terminal_reason":"api_error"}`), "")
+	if !strings.Contains(fallback, "HTTP 429") || !strings.Contains(fallback, "api_error") {
+		t.Fatalf("fallback detail missing status/reason: %q", fallback)
+	}
+
+	// 无害枚举（实测 API 400 那次的 subtype 正是 "success"；completed 是常态）必须跳过，
+	// 不能给用户一句"（CLI：completed）"当作失败原因。
+	for _, noise := range []string{
+		`{"type":"result","is_error":true,"subtype":"success","terminal_reason":"completed","result":""}`,
+		`{"type":"result","is_error":true,"subtype":"completed"}`,
+	} {
+		if got := claudeRunFailureDetail(json.RawMessage(noise), ""); got != "" {
+			t.Fatalf("noise-only enums should yield no detail, got %q for %s", got, noise)
+		}
+	}
+	// 没有可读原因、stderr 也无内容时，非噪声枚举仍要透出（否则用户什么都看不到）。
+	if got := claudeRunFailureDetail(json.RawMessage(`{"type":"result","is_error":true,"subtype":"error_during_execution"}`), "  "); !strings.Contains(got, "error_during_execution") {
+		t.Fatalf("meaningful enum should still surface, got %q", got)
+	}
+
+	// 脱敏 + ANSI 剥离 + 有界：即使塞入超长带密钥的正文也不能撑爆 240 **字节**上限。
+	long := claudeRunFailureDetail(json.RawMessage(
+		`{"type":"result","is_error":true,"result":"\u001b[31mkey sk-abcdef1234567890 `+strings.Repeat("x", 900)+`"}`), "")
+	if strings.Contains(long, "sk-abcdef1234567890") {
+		t.Fatalf("detail leaked secret: %q", long)
+	}
+	if strings.Contains(long, "\x1b") {
+		t.Fatalf("detail leaked ANSI escapes: %q", long)
+	}
+	assertClaudeExitMessageFitsInsightTruncation(t, long)
+}
+
+// TestClaudeCLIRunErrorIncludesResultEventDetail 端到端验证真实失败场景：fake claude
+// 在 stdout 的 result 事件里报 API 错误、stderr 一个字都没有、退出码 1——Run 返回的
+// 错误必须带上 CLI 自报的原因，而不是裸的退出描述（claudeExitPrefix + "exit status 1"）。
+func TestClaudeCLIRunErrorIncludesResultEventDetail(t *testing.T) {
+	requirePOSIXShell(t)
+	scriptPath := filepath.Join(t.TempDir(), "fake-claude-api-error")
+	result := `{"type":"result","subtype":"success","is_error":true,"api_error_status":400,` +
+		`"terminal_reason":"api_error","result":"API Error: 400 Upstream service returned HTTP 400"}`
+	script := "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n" +
+		"printf '%s\\n' '" + result + "'\n" +
+		"printf '%s\\n' 'unrelated stderr warning' >&2\nexit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake Claude CLI: %v", err)
+	}
+	runner := claudeCLIRunner{config: Config{ClaudePath: scriptPath}}
+	err := runner.Run(context.Background(), AgentRunRequest{
+		SessionID:      "00000000-0000-4000-8000-000000000000",
+		ProjectPath:    t.TempDir(),
+		Prompt:         "test",
+		PermissionMode: "full_control",
+	}, &recordingSink{})
+	if err == nil {
+		t.Fatal("expected error from failing fake Claude CLI")
+	}
+	if !strings.Contains(err.Error(), claudeExitPrefix) {
+		t.Fatalf("error missing exit-wrapper prefix: %v", err)
+	}
+	// CLI 自报的原因优先于 stderr（API 失败时 stderr 通常只是无关噪声）。
+	if !strings.Contains(err.Error(), "API Error: 400") {
+		t.Fatalf("error missing CLI-reported API error: %v", err)
+	}
+	if strings.Contains(err.Error(), "unrelated stderr warning") {
+		t.Fatalf("stderr should not shadow the CLI-reported reason: %v", err)
+	}
+}
+
+// 包装层必须对调用方 sink 的**可选能力**透明：readOutput 会对 sink 做
+// assistantMessageIDSetter / assistantDeltaSink 断言，断言失败即静默跳过——包装层若不
+// 转发，"增量输出 / 采纳 assistant message id"这类能力就被无声吞掉。今天只有长驻会话用
+// 得上它们，但一次性路径不该埋这种雷，所以把不变量钉在测试里。
+func TestClaudeResultErrorSinkForwardsOptionalSinkCapabilities(t *testing.T) {
+	runner := &claudeCLIRunner{}
+	stream := `{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"增量"}}}` + "\n"
+
+	opted := &partialSink{}
+	runner.readOutput(strings.NewReader(stream), &claudeResultErrorSink{AgentRunSink: opted})
+	if opted.messageID != "msg_1" {
+		t.Fatalf("wrapped sink dropped assistant message id: %q", opted.messageID)
+	}
+	if len(opted.deltas) != 1 || opted.deltas[0] != "增量" {
+		t.Fatalf("wrapped sink dropped assistant deltas: %q", opted.deltas)
+	}
+
+	// 没实现这两个能力的内层 sink（编排审查、SSH 回合等）不得因此报错或凭空产生事件。
+	plain := &plainSink{}
+	runner.readOutput(strings.NewReader(stream), &claudeResultErrorSink{AgentRunSink: plain})
+	if len(plain.events) != 0 {
+		t.Fatalf("stream_event envelopes must not become events: %q", plain.events)
+	}
+}
+
+// writeFakeClaudeExecutable 写一个假 claude 可执行文件：POSIX 下是带 shebang 的脚本，
+// Windows 下是 .cmd（由 Go 经 cmd.exe 执行）。既有夹具用 requirePOSIXShell 在 Windows 上
+// 跳过，但"失败时把 CLI 自报原因拼进错误"这件事恰恰只在 Windows 上复现过——跳过就等于
+// 在本机没有任何端到端证据，所以这里给两个平台各写一份。
+func writeFakeClaudeExecutable(t *testing.T, posixBody, windowsBody string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "fake-claude.cmd")
+		if err := os.WriteFile(path, []byte(windowsBody), 0o700); err != nil {
+			t.Fatalf("write fake Claude CLI: %v", err)
+		}
+		return path
+	}
+	path := filepath.Join(dir, "fake-claude")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+posixBody), 0o700); err != nil {
+		t.Fatalf("write fake Claude CLI: %v", err)
+	}
+	return path
+}
+
+// TestClaudeCLIRunSurfacesSelfReportedFailure 端到端（Windows 也真跑）：fake claude 在
+// stdout 的 result 事件里自报 API 失败、stderr 一个字节都没有、退出码 1——Run 返回的错误
+// 必须带上 CLI 自报的原因，而不是裸的退出描述（claudeExitPrefix + "exit status 1"）。
+func TestClaudeCLIRunSurfacesSelfReportedFailure(t *testing.T) {
+	const initLine = `{"type":"system","subtype":"init"}`
+	const resultLine = `{"type":"result","subtype":"success","is_error":true,"api_error_status":400,` +
+		`"terminal_reason":"api_error","result":"API Error: 400 Upstream service returned HTTP 400"}`
+	scriptPath := writeFakeClaudeExecutable(t,
+		"printf '%s\\n' '"+initLine+"'\nprintf '%s\\n' '"+resultLine+"'\nexit 1\n",
+		"@echo off\r\necho "+initLine+"\r\necho "+resultLine+"\r\nexit /b 1\r\n")
+
+	runner := claudeCLIRunner{config: Config{ClaudePath: scriptPath}}
+	err := runner.Run(context.Background(), AgentRunRequest{
+		SessionID:      "00000000-0000-4000-8000-000000000000",
+		ProjectPath:    t.TempDir(),
+		Prompt:         "test",
+		PermissionMode: "full_control",
+	}, &recordingSink{})
+	if err == nil {
+		t.Fatal("expected error from failing fake Claude CLI")
+	}
+	if !strings.Contains(err.Error(), claudeExitPrefix) {
+		t.Fatalf("error missing exit-wrapper prefix: %v", err)
+	}
+	if !strings.Contains(err.Error(), "API Error: 400") {
+		t.Fatalf("error missing CLI-reported reason: %v", err)
+	}
+	// stderr 本来就是空的：绝不能凭空多出一段"（stderr：…）"。
+	if strings.Contains(err.Error(), "（stderr：") {
+		t.Fatalf("empty stderr must not be reported: %v", err)
+	}
+}
+
+// TestClaudeResultErrorSinkRecordsReadOutputFailure 不依赖子进程夹具（Windows 也能跑）：
+// readOutput 解析 stdout 事件流时，result 事件里的失败原因应被包装的 sink 记下（供
+// Run 拼进错误信息），且事件仍照常转发给调用方的 sink——包装对调用方透明。
+func TestClaudeResultErrorSinkRecordsReadOutputFailure(t *testing.T) {
+	runner := &claudeCLIRunner{}
+	sink := &claudeOutputTestSink{}
+	recorded := &claudeResultErrorSink{AgentRunSink: sink}
+	stream := `{"type":"system","subtype":"init"}` + "\n" +
+		`{"type":"result","subtype":"success","is_error":true,"api_error_status":400,` +
+		`"terminal_reason":"api_error","result":"API Error: 400 upstream rejected the request"}` + "\n"
+	runner.readOutput(strings.NewReader(stream), recorded)
+
+	if detail := claudeRunFailureDetail(recorded.failureResult(), ""); !strings.Contains(detail, "API Error: 400 upstream rejected") {
+		t.Fatalf("recorded detail missing CLI reason: %q", detail)
+	}
+	// 事件转发不因包装而丢失：init + result 两条都应到达调用方的 sink。
+	if len(sink.events) != 2 {
+		t.Fatalf("wrapped sink dropped events: got %d want 2", len(sink.events))
+	}
+	// 结构化输出文本必须照常透传：Pass A 的 textA 正是靠 AssistantText 累积的，
+	// 被包装层吞掉就会退化成"分析代理未返回有效结果"。
+	structured := &claudeResultErrorSink{AgentRunSink: &claudeOutputTestSink{}}
+	delegate := structured.AgentRunSink.(*claudeOutputTestSink)
+	runner.readOutput(strings.NewReader(
+		`{"type":"result","is_error":false,"structured_output":{"findings":[{"title":"t"}]}}`+"\n"), structured)
+	if len(delegate.texts) != 1 || !strings.Contains(delegate.texts[0], `"findings"`) {
+		t.Fatalf("wrapped sink dropped structured output text: %q", delegate.texts)
+	}
+	// 正常收尾（非失败）不得记下 failure，否则成功运行也会被拼出错误附加段。
+	healthy := &claudeResultErrorSink{AgentRunSink: &claudeOutputTestSink{}}
+	runner.readOutput(strings.NewReader(`{"type":"result","is_error":false,"result":"一切正常"}`+"\n"), healthy)
+	if got := claudeRunFailureDetail(healthy.failureResult(), ""); got != "" {
+		t.Fatalf("healthy run should record no failure detail, got %q", got)
+	}
+	// 出现多条失败 result 时应以最后一条为准（更接近终止状态）。
+	multi := &claudeResultErrorSink{AgentRunSink: &claudeOutputTestSink{}}
+	runner.readOutput(strings.NewReader(
+		`{"type":"result","is_error":true,"result":"第一条失败"}`+"\n"+
+			`{"type":"result","is_error":true,"result":"最后一条失败"}`+"\n"), multi)
+	if got := claudeRunFailureDetail(multi.failureResult(), ""); !strings.Contains(got, "最后一条失败") {
+		t.Fatalf("latest failure result should win, got %q", got)
 	}
 }
 

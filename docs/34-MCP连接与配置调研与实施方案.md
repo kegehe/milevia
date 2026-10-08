@@ -1816,3 +1816,153 @@ git show ab7d601:apps/control-server/internal/app/claude_runner.go | grep -n -A 
 （不猜版本号），但「探测到即常驻提示」这个 UI 决定错了 —— 前瞻风险的合适归宿是文档与
 发布检查项，不是每个用户的进度条。
 
+
+## 26. 弹窗改独立页（2026-09-24，方案 A · 单栏分节长页）
+
+`/mcp-manager` 此前虽然是一条路由，页面本体却是「`<DashboardPage />` 为底 + 全屏弹窗背板」
+（`backdrop ssh-manager-backdrop` + `aria-modal`，关闭即 `navigate("/")`）。本轮改为**真正的独立页面**，
+与 Cli 管理页同一套骨架：
+
+- **页面壳**（`McpManagerPage.tsx` + 新文件 `pages/mcp-manager.css`）：顶栏（返回 / `h1` /
+  副标题 / 「高级设置」切换）＋ 1224px 内容栏里从上到下「已连接 → 可以连接的服务 → 高级设置（默认收起）」。
+  分节头平铺在底色上，内容才是卡片；已连接卡两列、目录卡三列（1000px 回两列、560px 回单列）。
+- **命名统一**：页面名与首页入口写同一个字符串「MCP连接」（弹窗时代叫「外部能力」，与入口
+  「MCP连接」不一致）。改名三处一起动的纪律同 Cli 管理页（结构断言钉住 h1 == 入口 title/span）。
+- **官方品牌图标**：判据 `serviceLogoKey`（`features/mcp/mcp-model.ts`，按**预设名**白名单，
+  与 `AgentLogo` 同一约定；`github-local`→GitHub、`atlassian`→Jira；`filesystem`/`fetch`/`memory`
+  及未来条目回落原示意图标）。渲染走新组件 `components/ServiceLogo.tsx`（`<img>` 原样引用，
+  理由同 `AgentLogo`：官方 SVG 的渐变/clipPath 固定 ID 内联会串）。三个渲染点都经它走：
+  已连接卡、目录卡、向导弹窗头。资产 `assets/mcp-*.svg` 九份（抓取于 2026-09-24：simple-icons
+  官方色六份；slack/playwright 为 simple-icons 单色原件按官方色 #4A154B/#2EAD33 上色；
+  context7 取自 context7.com 官方站点 logo 原件、裁出 28×28 徽标位）。
+- **样式收口**：原先后作用域限定在 `.ssh-manager-dialog` 的按钮规则在 style.css 里**并列补上
+  `.mcp-shell` 选择器**（不复制第二份口径）；连接卡的动作按钮在页面上放开宽度
+  （弹窗时代的 30px 图标方块会让「授权/停用」竖排折行）。子流程（向导 / 手动配置 / 导入 /
+  审计 / 测试 / 删除确认）仍以模态弹层呈现，样式不动。
+- **空态升级**：已连接为空时从一行灰字改为卡片式空态（标题 + 下一步指引）。
+- **验证**：tsc clean；web 全量单测 758/758（`mcp-manager.test.mjs` 重写页面壳断言：
+  旧形态三件套不许回来、页面名一致性、官方图标接线与资产在位、页面样式等价版本；
+  `mcp-model.test.ts` 新增 `serviceLogoKey` 行为断言）；真机探针（vite + Playwright 拦截 API）
+  11 条全过并出截图 `outputs/mcp连接独立页-方案-20260924/实施-*.png`。
+
+## 27. 目录卡片布局调整 + 「本机运行」暂时下线（2026-09-24，下午第二轮）
+
+- **卡片布局**：目录卡片改为左右分布 —— 左侧 `.mcp-preset-main`（官方图标 + 服务名 + 一句说明
+  + 「要准备什么」徽标），右侧 `.mcp-preset-action` 垂直居中放主按钮；按钮不再单独占一行
+  （原先的 `.ssh-preflight-checks` 通栏行是弹窗时代的形状）。
+- **按钮文案统一**：目录卡片按钮一律「连接」。`cardActionLabel`（按授权形态区分
+  「用浏览器登录 / 检查并连接 / 连接」）已删除 —— 文案口径只剩页面里的字面量一处。
+  向导弹窗内的「用浏览器登录 {服务名}」是流程按钮，不是卡片按钮，不在此列。
+- **「本机运行」分组暂时下线**：`mcp_servers.go` 删除 `mcpLocalPreset` 与全部本地条目
+  （filesystem / playwright / fetch / memory / context7 / github-local），目录只返回 7 条
+  远程托管条目；`mcpPresetCategoryLocal` 常量一并移除。运行时依赖检查端点（`/api/mcp/runtime-check`）
+  **保留** —— 手动配置的 stdio server 仍要在目标环境实测依赖。恢复本地形态时按 §26 的形状重建
+  （stdio + requires 诚实声明 + 凭据落点检查），`TestMCPPresetCatalogIsWellFormed` 现在守着
+  「目录里不许出现 stdio 条目 / github-local 不许回来」—— 恢复必须是一个显式决定。
+- **官方图标资产**（`assets/mcp-*.svg`）与 `serviceLogoKey` 白名单**保留**：按预设名键控，
+  本地条目回归时映射仍然在位（playwright / context7 / github-local→github）。
+- **验证**：go build + vet clean；MCP 预设相关 Go 用例过；tsc clean；web 全量 757/757
+  （删 cardActionLabel 用例后 758→757）；卡片左右分布与「连接」文案由结构断言钉住；
+  视觉复验 `outputs/mcp连接独立页-方案-20260924/实施-04-卡片左右分布.png`。
+  真机探针（`.tmp/probe-mcp-page.mjs`）样例数据同步为 7 条目录 + 左右结构断言，
+  并把 vite 收尾改为整棵进程树 taskkill（防 2026-09-24 的 OOM 事故复发）。
+
+## 28. 状态口径修正 + 取消向导清理半成品 + 徽标行删除（2026-09-24，晚）
+
+用户实例踩中了三件叠加的口径问题：点了「连接」→ OAuth 路径**先落库** → 中途放弃 →
+列表里躺着一条 `enabled=true` 的记录，而卡片把 `enabled` 直译成「**已连接**」。
+
+- **状态口径**：列表分节「已连接」→「**我的服务**」；卡片状态 pill「已连接 / 已停用」→
+  「**已启用 / 已停用**」。`enabled` 只是配置开关，连接与否以最近一次测试为准
+  （描述行已注明）。CSS 类名 `is-connected/is-unknown` 是与 SSH 管理页共享的表现层钩子，未动。
+- **取消向导清半成品**（`closeWizard`）：凡是 `wizardResult.ok !== true`（试连/验证没通过）
+  的已落库记录，取消时一律 `DELETE` 并如实提示「没有保存任何东西」；只有验证通过的才保留。
+  这条行为由切片断言钉住（DELETE 路径 + 提示文案），防止将来退化回「只 toast 一下」。
+- **徽标行删除**：目录卡片不再展示「点一次授权即可 / 可授权，也可填密钥 / 先装 X」——
+  `presetBadges` 随 UI 一并删除（含 `.mcp-preset-meta` CSS 与相关断言）。准备事项改由
+  向导的凭据屏 / 检查屏逐步告知。
+- **验证**：tsc clean；web 全量 763/763；视觉复验
+  `outputs/mcp连接独立页-方案-20260924/实施-05-状态口径与去徽标.png`。
+  探针（`.tmp/probe-mcp-page.mjs`）同步「已启用/已停用」与无徽标断言。
+
+## 29. 换视角复查（2026-09-24，晚 · 第二轮）
+
+派「不知原意」的审查代理复查今日全部 MCP 改动，抓到 4 个真问题（都已修复）：
+
+- **P0 · .connect 变体迁移错位**（style.css:473）：给 `.ssh-manager-dialog .ssh-action-button`
+  系并列补 `.mcp-shell` 时，base 形状的 sed 把 `.connect` 规则替换成了
+  `.mcp-shell .ssh-action-button, … .connect` —— mcp-shell 侧丢了 `.connect`，页面上**所有**
+  动作按钮常态被套上绿色 connect 样式。修复为首选择器 `.mcp-shell .ssh-action-button.connect`。
+  **核查教训**：逐变体 grep `-qF ".mcp-shell .ssh-action-button.connect"` 会被
+  `.connect:hover` 当子串骗过 —— 断言必须匹配**完整选择器组**（含 `, … {`），测试已改为
+  五条完整组断言 + 一条「base 不许混进 connect」的反向断言。
+- **P1 · 删 server 不吊销 OAuth 令牌**（mcp_servers.go deleteMCPServer）：只删 mcp_servers 行，
+  mcp_oauth_tokens 里的 access/refresh 令牌永久残留 —— 取消向导半成品使 DELETE 成了常规路径后，
+  每次放弃授权都泄漏一对令牌；轮询超时后浏览器里完成授权还会按 serverID upsert 出孤儿令牌。
+  修复：抽出 `revokeMCPOAuthToken`（ErrNoRows 不算错），deleteMCPServer 与 deleteMCPServerOAuth
+  共用；新增 `TestMCPDeleteServerRevokesOAuthTokens` 钉住（insert 令牌 → 删 server → 断言令牌行消失）。
+- **P1 · MCPConnectPlan.needsInstall 无人读**：唯一读者是已删除的 presetBadges / cardActionLabel。
+  字段随类型一并删除（tests 的 deepEqual 同步）；「要不要先装运行时」只由向导检查屏按
+  preset.requires 现场实答。
+- **P2 · closeWizard 同 tick 双击**：wizardBusy 是异步 state，双击 × 会发出第二个 DELETE
+  （404 后误报「清理失败」）。加 `wizardClosingRef` 同步闸 + 清理期间置忙。
+- **P2 · 空断言**：`/用浏览器登录 \{wizard\.displayName\}[\s\S]{0,80}mcp-preset-action/`
+  在页面里永远匹配不到（向导 JSX 在目录之后），已删除 —— presetCard 切片的整串断言已覆盖。
+- **审查确认无问题的项**：删除符号全仓零残留（含 mobile/托盘/对话页）；closeWizard 状态机
+  各路径正确（凭据路径不误删、OAuth 成功保留、成功但测试失败删）；mcp-manager.css 与
+  style.css 无覆盖冲突；sliceBetween 起止标记仍唯一；ServiceLogo 9 键与资产一一对应；
+  Go 侧无未用标识符。
+- 另登记一个**未修的旧交互**（本次未加重）：OAuth 轮询期间（最长 5 分钟）×/取消均 disabled，
+  用户想中途放弃只能等超时。值得作为独立交互改进立项。
+- 验证：tsc clean；web 763/763；go build/vet clean；MCP 预设 + 新增 OAuth 吊销用例全过
+  （WSL 就绪门那条仍是沙箱环境性失败）。
+
+## 30. 第三轮复查：修复的修复（2026-09-24，晚 · 第三轮）
+
+第二个「不知原意」审查代理对 §29 的修复本身做增量复查，又抓到 3 个问题（已修复）：
+
+- **P1 · 迟到 OAuth 回调复活孤儿令牌**（mcp_oauth.go storeMCPOAuthToken）：按 flow.ServerID
+  upsert 时不校验 server 行是否还在 —— 轮询超时 → 用户取消（DELETE 连令牌吊销）→ 浏览器里
+  随后完成登录 → 回调把令牌行重新落库，且全仓只有删除 server 两条路径清令牌，孤儿永久化。
+  修复：事务内先 `select 1 from mcp_servers`，行不存在则回滚整笔事务并报
+  「MCP server 已被删除，丢弃本次授权结果」（回调方照常向浏览器返回失败）。
+- **P1 · 先删行后清令牌的误导性 500**（mcp_servers.go deleteMCPServer）：§29 的实现是
+  「删行 → 吊销令牌（失败→500）」，前端会拿着「请在列表里手动删除」的提示去找一条
+  已经不存在的记录。调整为**先吊销令牌（失败→500 中止，可重试）→ 再删行 → best-effort
+  清 env/header 密钥引用**：任何失败点都保持状态一致。
+- **P2 · 两处收尾**：① style.css:490 `.mcp-test-button` 的 mcp-shell 半边是死值
+  （宽度被 mcp-manager.css 同特异性后到规则覆盖，只剩 font-size 生效）——mcp-shell 半边
+  删除、font-size 并入 mcp-manager.css，测试改为断言「弹窗半边存在 + mcp-shell 半边不许
+  回来」；② TestMCPDeleteServerRevokesOAuthTokens 原先只断言令牌行消失，现在用
+  profileSecrets.Store 存真实密钥引用、删除后断言三枚引用 Load 不出明文（循环被删会红）。
+- **复查确认无问题**：五条选择器组逐字节匹配且 MCP 页实际类名（mcp-test-button/裸/danger）
+  无误命中（.connect 只在 SSH 页使用）；deleteMCPServerOAuth 对外语义不变（ErrNoRows 仍
+  204）；closeWizard ref 复位完整、openWizard 重置无残留；轮询期间 disabled 不存在
+  「迟到轮询写进已关闭向导」；needsInstall 零引用。
+- 验证：tsc clean；web 763/763；go vet + TestMCPDeleteServerRevokesOAuthTokens 过。
+
+## 31. 第四轮复查：覆盖盲区（2026-09-24，晚 · 第四轮）
+
+本轮换视角查「独立页不再渲染 DashboardPage 之后的数据依赖」与三态纪律，抓到 3 个问题（已修复）：
+
+- **P1 · 项目列表失去加载方**：refreshProjects 的全仓唯一调用方是 DashboardPage —— 独立页
+  不再渲染 DashboardPage 后，直接刷新 `/mcp-manager` 进来时项目列表为空，手动配置 /
+  导入 / 项目视图的项目下拉全空（静默降级）。修复：页面挂载时自调 `refreshProjects()`
+  （合并刷新，重复调用无副作用），结构断言钉住。SSH 管理页仍是「垫 DashboardPage」旧模式，
+  属同族隐患，另行登记。
+- **P1 · 保存失败不可见**：performSave 失败只 setLocalError，而错误横幅在表单弹层背板后面
+  —— 保存失败时弹层内零反馈。修复：改 toast.error（与 runRuntimeCheck 同一通道）。
+- **P1 · 读失败被表单开关伪装成「没有」**：startCreate/startEdit/closeForm 会清 localError
+  —— 加载失败后打开再关掉「手动配置」，列表区落到「还没有配置任何服务」空态卡。修复：
+  这三个入口不再清 localError（它同时承担读失败记忆；弹层内失败已改走 toast，无依赖）。
+- **同轮新增：服务列表/目录的三态渲染**——加载失败时列表区出「读不到服务列表 + 重试」
+  （红调失败块）、目录出「读不到服务目录 + 重试」，计数显示「—」；只有读成功且为空才出
+  「还没有配置」空态卡。此前目录读失败是静默消失（把「读不到」写成「平台只有这几个服务」）。
+- **确认无问题**：useCoalescedRefresh 挂在根部 Provider，页面快速挂/卸无竞态；页面消费的
+  store 字段就 api/projects/refreshProjects 三个，无其它「失去预热」面；ConversationPage /
+  tray / __mileviaNavigate 无 MCP 残留引用；mcp-manager.css 无死结构规则。
+- **P2 已知可接受（登记不改）**：删行失败（500）时令牌已吊销、server 仍存活 → 注入会静默
+  无 Authorization 头（远端 401，重新授权即恢复）；窗口毫秒级。Go 全量套件在沙箱内撞
+  `go test` 默认 10 分钟包超时（wsl.exe 被安全中心拦截等环境因素），MCP 相关用例均为
+  定向跑过 —— 全量需在真机环境执行。
+- 验证：tsc clean；web 764/764（新增三态用例）。

@@ -59,7 +59,7 @@ func (s *Server) checkAgentStatusFor(w http.ResponseWriter, r *http.Request, run
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	s.checkAgentUpdate(w, r, backend)
+	s.checkAgentUpdate(w, r, backend, runnerID, agentID)
 }
 
 // updateAgentStatus 是 POST 泛化路由的处理器：安装或升级某个工具。

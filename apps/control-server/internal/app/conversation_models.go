@@ -187,7 +187,14 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 		view.Source = "cli_default"
 	}
 
-	if conversation.AgentID == "codex" {
+	if conversation.AgentID == "codebuddy" {
+		// CodeBuddy 支持 --model（官方 CLI 参考），但没有与 Codex `debug models` 等价的
+		// 目录列举命令，也没有可靠的静态型号表（其型号体系与 Claude 不同）。这里不给它
+		// 冒充 Claude 的模型目录（opus/sonnet 等对 CodeBuddy 是无效模型名），如实返回空
+		// 目录，交还自定义输入。
+		view.Models = nil
+		view.Note = "CodeBuddy 没有内置模型目录，可直接在下方输入模型名（如 gpt-5）；切换后下一条消息生效。"
+	} else if conversation.AgentID == "codex" {
 		options, note := s.codexModelCatalogFor(r.Context(), projectRunner, projectPath)
 		if len(options) > 0 {
 			view.Models = options

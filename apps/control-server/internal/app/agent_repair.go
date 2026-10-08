@@ -282,7 +282,7 @@ func removableInterruptedDir(packageRoot, name string, install npmCLIInstall) bo
 // 服务端允许的动作必然一致。
 //
 // 例外只有一个，而且必须带 `!local` 这个条件：**跨端**诊断目前是受限的
-//（分不出"没装"与"坏了"，因此给不出症状），那种状态下允许两个"把它弄回来"的动作，
+// （分不出"没装"与"坏了"，因此给不出症状），那种状态下允许两个"把它弄回来"的动作，
 // 否则跨端用户彻底没有出路。
 //
 // ⚠️ 为什么 `!local` 不能省：`diagnosisUnknown` 不止"跨端受限"这一档 ——
@@ -500,6 +500,10 @@ func (s *Server) repairAgentHandler(w http.ResponseWriter, r *http.Request) {
 	// "维护中"。那一档由两层兜住：报告本身如实说"没查成"，前端也只在报告**有结论**时
 	// 才拿它算差集（见 `resolvedIssues`）。
 	releaseGate()
+	// 读数作废必须在**重跑诊断之前**：下面这份报告是拿来跟修复前那份算差集的
+	// （见 CliToolsPage.tsx 的 resolvedIssues），失效放在它之后，报告就会照着
+	// **修复前**的读数写出来，"哪些症状真的没了"这个结论整条失真。
+	s.invalidateAgentReadings(runnerID)
 	after := s.buildAgentDiagnosis(repairCtx, meta, entry)
 	// success 只看**真的执行过**的动作：被跳过（不适用 / 跨端不支持 / 不在白名单 /
 	// 前一步失败）的动作不算"修复失败"—— 否则用户会收到一句"修复失败"，而实际症状
@@ -537,7 +541,7 @@ func (s *Server) repairAgentHandler(w http.ResponseWriter, r *http.Request) {
 //
 // **三态分开记**：真的做了且成功 = `ok`、做了但失败 = `failed`、
 // 压根没做 = `skipped`。把最后一档也记成 failed 会让审计说假话
-//（"这台机器上发生过什么"是审计唯一的职责）。
+// （"这台机器上发生过什么"是审计唯一的职责）。
 // 失败那一步要把**现场**带上：那是排查的唯一线索，而响应里的 detail 不会进审计。
 // 经 tailUpdateOutput（脱敏 + 去 ANSI + 截断）再落库 —— 与安装失败同一条纪律。
 func repairAuditDetail(steps []repairStep) string {

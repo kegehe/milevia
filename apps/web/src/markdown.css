@@ -6,7 +6,7 @@
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
 .markdown p { margin: 0 0 12px; }
-.markdown h1,.markdown h2,.markdown h3,.markdown h4,.markdown h5,.markdown h6 { color: #1d4438; line-height: 1.32; margin: 22px 0 9px; font-weight: 780; }
+.markdown h1,.markdown h2,.markdown h3,.markdown h4,.markdown h5,.markdown h6 { color: #1d4438; line-height: 1.32; margin: 22px 0 9px; font-weight: 700; }
 .markdown h1 { font-size: 20px; }
 .markdown h2 { font-size: 18px; }
 .markdown h3 { font-size: 16px; }
@@ -59,7 +59,7 @@
 .markdown th,.markdown td { min-width: 96px; border-right: 1px solid #dce9e1; border-bottom: 1px solid #dce9e1; padding: 10px 12px; vertical-align: top; }
 .markdown th:last-child,.markdown td:last-child { border-right: 0; }
 .markdown tr:last-child td { border-bottom: 0; }
-.markdown th { color: #1f4d42; background: #eaf5ee; font-weight: 750; white-space: nowrap; }
+.markdown th { color: #1f4d42; background: #eaf5ee; font-weight: 700; white-space: nowrap; }
 .markdown td { color: #334f45; overflow-wrap: anywhere; word-break: break-word; }
 @media (max-width: 520px) { .markdown th,.markdown td { min-width: 84px; padding: 8px 10px; font-size: 13px; } }
 

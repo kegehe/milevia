@@ -22,6 +22,21 @@ import (
 	"github.com/google/uuid"
 )
 
+// cloudRequestTimeout 是打云端控制接口时**必须**自带的上限。
+//
+// 为什么不能只靠 `r.Context()`：`detachWriteContext` 让写操作不再随客户端断开而取消
+// （那是为了让 git push / npm 安装跑完），副作用是这些调用在客户端走掉之后**再没有人取消
+// 它们** —— 而 `http.DefaultClient` 没有 Timeout，云端不回应就会永久挂住一个 goroutine，
+// 连带把这次请求占着的资源一起留在那儿。所以给一条自己的上限：足够云端把一次配对/撤销
+// 做完，又不至于把请求挂死。
+//
+// 20 秒与云端 rpc 层的默认等待同一个量级（cloud-control 的 rpcDefaultTimeout）：
+// 这里都是控制面的小请求，不存在需要等几分钟的情况。
+const cloudRequestTimeout = 20 * time.Second
+
+// cloudHTTPClient 专供上面的控制接口调用，不用 http.DefaultClient（它没有上限）。
+var cloudHTTPClient = &http.Client{Timeout: cloudRequestTimeout}
+
 // RemoteInstance is the stable identity and health view sent to the cloud.
 type RemoteInstance struct {
 	InstanceID        string    `json:"instanceId"`
@@ -465,7 +480,7 @@ func (s *Server) createRemotePairing(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
 	request.Header.Set("X-Milevia-Instance-ID", instanceID)
-	response, err := http.DefaultClient.Do(request)
+	response, err := cloudHTTPClient.Do(request)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -508,7 +523,7 @@ func (s *Server) confirmRemotePairing(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
 	request.Header.Set("X-Milevia-Instance-ID", instanceID)
-	response, err := http.DefaultClient.Do(request)
+	response, err := cloudHTTPClient.Do(request)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -549,7 +564,7 @@ func (s *Server) remotePairingStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	response, err := http.DefaultClient.Do(request)
+	response, err := cloudHTTPClient.Do(request)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -583,7 +598,7 @@ func (s *Server) remoteRevokeBindings(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
 	request.Header.Set("X-Milevia-Instance-ID", instanceID)
-	response, err := http.DefaultClient.Do(request)
+	response, err := cloudHTTPClient.Do(request)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -646,7 +661,7 @@ func (s *Server) remoteBindings(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Header.Set("X-Milevia-Agent-Token", cloudToken)
 	request.Header.Set("X-Milevia-Instance-ID", instanceID)
-	response, err := http.DefaultClient.Do(request)
+	response, err := cloudHTTPClient.Do(request)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -1729,7 +1744,14 @@ func (s *Server) processOneRemoteCommand(ctx context.Context) {
 	finalStatus := "completed"
 	if execErr != nil {
 		finalStatus = "failed"
-		result = map[string]string{"error": execErr.Error()}
+		// 走本地化而不是裸 execErr.Error()：这条 result 会经云端回到手机，
+		// 手机端的 commandFailureDetail 把它当文案直接显示（再拼在"快捷方式执行失败："后面）。
+		// 兜底句也必须是**远程命令自己的**：errorText 的兜底是"任务执行失败，请查看任务日志
+		// 后重试。"，而手机端那条链上没有"任务日志"可看，拼出来会是
+		// "快捷方式执行失败：任务执行失败，请查看任务日志后重试。：taskId is required"
+		// —— 两层前缀 + 一个指不到的地方。这里多为英文校验错误（taskId is required 之类），
+		// 所以兜底句要能自然接住它们。
+		result = map[string]string{"error": localizedErrorText(execErr, "这条远程命令没能完成，请稍后重试。")}
 	}
 	encoded := mustJSON(result)
 	s.finalizeRemoteCommand(command.CommandID, finalStatus, encoded)
@@ -1913,7 +1935,12 @@ func (s *Server) executeRemoteHTTPCommand(ctx context.Context, method, path, pro
 		if err := json.Unmarshal(body, &failure); err == nil && failure.Error != "" {
 			detail = failure.Error
 		}
-		return nil, fmt.Errorf("remote command failed (%d): %s", status, detail)
+		// 这句是我们自己的包装，必须是中文且带"失败"：它后面跟的 detail 往往本身已含中文
+		// （handler 的 localize 结果）或英文（DB/外部），按 localizedErrorText 的直通判据，
+		// 句子里有"失败"才不会被再套一层"任务执行失败，请查看任务日志后重试。"。
+		// 不再把 HTTP 码写进文案：上面那句注释已经定过规矩（用户要看的是失败原因，
+		// 不是状态码），状态码对排障有用，但它在该出现的地方（服务端日志）已经出现。
+		return nil, fmt.Errorf("远程命令执行失败：%s", detail)
 	}
 	var value any
 	if len(body) > 0 {

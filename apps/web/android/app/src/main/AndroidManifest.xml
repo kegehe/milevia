@@ -45,4 +45,16 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- 本地通知（任务完成/失败提醒）。Android 13（API 33）起是运行时权限，需在代码里
+         用 @capacitor/local-notifications 的 requestPermissions() 申请；API 32 及以下
+         （含目标机华为 HarmonyOS 4.x 的 Android 12 兼容层）不弹框、直接视为已授予。
+         本应用只发**即时**通知、不做定时排程，所以调用处显式写了
+         `isExactNotification: false`（不写就是插件默认的 true，见下面那条）。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- SCHEDULE_EXACT_ALARM 不是我们声明的：它由 @capacitor/local-notifications 自己的
+         AndroidManifest 合并进来（插件 8.3.1 的 android/src/main/AndroidManifest.xml）。
+         插件默认按"精确闹钟"排程（isExactNotification 默认 true），而在未授予
+         「闹钟和提醒」的机型上（Android 14+ 默认不授予）它会跳去系统设置页、
+         即时通知也会被这一跳拦住 —— 所以 MobileRemotePage 的 schedule() 显式传了 false，
+         把这条权限彻底绕开。要改回精确闹钟，必须连着申请该权限一起改。 -->
 </manifest>

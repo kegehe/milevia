@@ -97,20 +97,28 @@ const insightFindingsCap = 30
 const insightVerifyBatchSize = 20
 
 // insightScanPassTimeout 是单趟只读 agent（Pass A 发现 / Pass B 核实）的执行上限。
-// 超时后进程会被终止，扫描置 failed 并明确提示"分析超时"（见 runReadOnlyAgent 的
-// scanCtx.Err() 分支），避免用户面对无解释的"项目分析失败"。
-const insightScanPassTimeout = 20 * time.Minute
+// **0 = 不限时**（2026-09-26 按用户要求关闭：实测生产 prompt 跑一个中等项目单趟已用
+// 17.7 分钟，而原上限 20 分钟——余量不足 12%，稍大的项目或稍慢的上游就会撞墙，报
+// "分析超时"而把整趟分析成果丢掉）。
+//
+// 不限时之后：
+//   - 挂死/跑偏不再由定时器兜底，改由用户随时取消（cancelInsightRun → insightCancels
+//     登记表，见 triggerInsightScan 一带的运行登记）；
+//   - 单趟仍受父上下文约束（运行被取消时立即返回）。
+//
+// 需要恢复限制时把它设回正数即可——下面所有分支都按 >0 判断，超时文案也随之复活。
+const insightScanPassTimeout time.Duration = 0 // 无类型常量不能调 .Minutes()（超时文案要用）
 
 // insightScanRunTimeout 是一次完整扫描（Pass A → 可能的修正重试 → Pass B 分批 ×
-// 可能的修正重试 → 落库）的总预算。单趟上限是"每趟"的：最坏情况（Pass A 重试 +
-// Pass B 两批各重试）会累计到 6 趟，没有总预算就会拖到 2 小时。
+// 可能的修正重试 → 落库）的总预算。**0 = 不限时**（同上，2026-09-26 关闭）。
 //
-// 取值口径：**必须宽于"成功扫描的合理最坏情况"**——预算若落在合法慢扫描的耗时区间里，
-// 它自己就成了失败来源（跑满 30 分钟然后把结果全丢掉，是最差的组合）。两趟各十几分钟的
-// 扫描是正常的，故取 45 分钟（与 insightVerifyRunTimeout 一致），仍远低于理论最坏 120 分钟。
-// 注意：扫描期间**不持有**项目工作区租约，因此放宽这个值不会让任何项目的占用时间变长，
-// 只是让慢扫描有机会跑完（代价是更长时间窗口内工作区可能被改动、结果被判作废）。
-const insightScanRunTimeout = 45 * time.Minute
+// 原本取值口径是"必须宽于成功扫描的合理最坏情况"——预算若落在合法慢扫描的耗时区间里，
+// 它自己就成了失败来源。既然实际观测已经贴到单趟上限，索性不再设总预算：
+//   - 扫描期间**不持有**项目工作区租约，放宽不会让任何项目的占用时间变长；
+//   - 两个"等一小会儿"的局部上限仍各自生效且**不依赖本预算**（insightPublishLeaseWait、
+//     insightQuotaWaitMax 只在 ctx 有 deadline 时才被夹取，见各自的 clamp）；
+//   - 运行登记的互斥（同一项目同一 kind 只允许一个）会持有更久，由用户取消兜底。
+const insightScanRunTimeout time.Duration = 0 // 无类型常量不能调 .Minutes()（超时文案要用）
 
 // insightPublishLeaseWait 是发布结果（落库）前等待项目工作区空闲的上限；实际等待还会被
 // 本次运行的剩余总预算夹住（取二者较小值）。结果已经算好、只差写不进去——等一小会儿
@@ -406,8 +414,15 @@ type pendingInsight struct {
 	Confirmed bool   `json:"confirmed"`
 }
 
+// 三个 schema 的顶层**必须都是 object**。`--json-schema` 会把它们包成 CLI 的
+// StructuredOutput 工具的 input_schema，而 OpenAI 兼容上游（经中转转发时，
+// 例如把 Anthropic 形状的 input_schema 直接塞进 function.parameters）要求
+// parameters 顶层是 object——顶层为 array 会被上游以 HTTP 400 拒绝，claude 随即
+// exit 1 且 stderr 为空，界面只剩一句裸的退出描述（claudeExitPrefix + "exit status 1"）。
+// 因此候选发现的结果集要写成 {findings:[...]} 包一层（parseInsightCandidates
+// 本就同时接受裸数组与该包裹形态，故对模型侧无兼容负担）。
 var (
-	insightCandidatesOutputSchema = json.RawMessage(`{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["bug","style","optimization","feature"]},"severity":{"type":"string","enum":["low","normal","high"]},"title":{"type":"string"},"summary":{"type":"string"},"fileHint":{"type":"string"}},"required":["type","severity","title","summary","fileHint"],"additionalProperties":false}}`)
+	insightCandidatesOutputSchema = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["bug","style","optimization","feature"]},"severity":{"type":"string","enum":["low","normal","high"]},"title":{"type":"string"},"summary":{"type":"string"},"fileHint":{"type":"string"}},"required":["type","severity","title","summary","fileHint"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 	insightVerifyOutputSchema     = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer","minimum":1},"confirmed":{"type":"boolean"},"reason":{"type":"string"}},"required":["index","confirmed","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 	insightReverifyOutputSchema   = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["valid","invalid","uncertain"]},"reason":{"type":"string"}},"required":["id","status","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 )
@@ -630,7 +645,13 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 	defer cleanupQuota()
 
 	sink := &insightLiveSink{onProgress: progress}
-	scanCtx, cancel := context.WithTimeout(ctx, insightScanPassTimeout)
+	// 单趟上限：0 = 不限时（见 insightScanPassTimeout 的说明），此时直接沿用父上下文——
+	// 用户取消运行仍会立刻生效，只是不再有"跑满 N 分钟被杀"这条路径。
+	scanCtx := ctx
+	cancel := func() {}
+	if insightScanPassTimeout > 0 {
+		scanCtx, cancel = context.WithTimeout(ctx, insightScanPassTimeout)
+	}
 	defer cancel()
 	if err := runner.Run(scanCtx, AgentRunRequest{
 		SessionID:      uuid.NewString(),
@@ -649,15 +670,26 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 		PromptViaStdin: len(insightReadOnlyTools(agentID)) > 0, // 用了 --allowedTools 就需 stdin 传 prompt
 		OutputSchema:   outputSchema,
 	}, sink); err != nil {
-		// 区分"跑满单趟上限被杀"（agent 进程被终止，cmd.Wait 的报错不含 deadline
+		// 区分"跑满上限被杀"（agent 进程被终止，cmd.Wait 的报错不含 deadline
 		// 语义，这里显式看 scanCtx.Err()）与真正的运行失败，让用户拿到准确原因。
+		// 注意：单趟/总预算都是 0（不限时）时这里不可能命中——scanCtx 无 deadline；
+		// 文案沿用常量里的分钟数，恢复限制后自动生效。
 		if scanCtx.Err() == context.DeadlineExceeded {
 			// scanCtx 是从本次运行的 ctx 派生出来的，两者的 deadline 都可能触发。父 ctx
-			// 也已结束时说明是**整趟运行的总预算**用尽（不是这一趟跑满 20 分钟）——
+			// scanCtx 是从本次运行的 ctx 派生出来的，两者的 deadline 都可能触发。父 ctx
+			// 也已结束时说明是**整趟运行的总预算**用尽（不是这一趟跑满单趟上限）——
 			// 报错必须区分，否则用户会按"单趟超时"去重试，而其实该缩小范围。
+			//
+			// ⚠️ 分钟数**只有预算真的启用时才能写**：insightScanRunTimeout / PassTimeout
+			// 现在是 0（不限时，见常量注释），照 `.Minutes()` 拼出来是"（0 分钟）"——
+			// 一句凭空的读数。而且两者都为 0 时 scanCtx 就是 ctx（见上面 scanCtx 的赋值），
+			// 于是"单趟上限"那一支**恒不可达**；留着它是给将来恢复单趟预算用的。
 			if ctx.Err() != nil {
-				return "", fmt.Errorf("分析超时：已超出本次运行的总时长上限（%d 分钟），已中止。可缩小分析范围（选择聚焦主题或更少的查找类型）后重试",
-					int(insightScanRunTimeout.Minutes()))
+				if insightScanRunTimeout > 0 {
+					return "", fmt.Errorf("分析超时：已超出本次运行的总时长上限（%d 分钟），已中止。可缩小分析范围（选择聚焦主题或更少的查找类型）后重试",
+						int(insightScanRunTimeout.Minutes()))
+				}
+				return "", errors.New("分析超时：已超出本次运行的时间预算，已中止。可缩小分析范围（选择聚焦主题或更少的查找类型）后重试")
 			}
 			return "", fmt.Errorf("分析超时：超过 %d 分钟未完成。项目可能较大或模型处理较慢，请稍后重试或更换更快的模型档案",
 				int(insightScanPassTimeout.Minutes()))
@@ -1064,7 +1096,7 @@ func buildInsightScanPrompt(projectPath, repoSHA string, alreadySurfaced []strin
 任务：通读整个项目，主动找出值得用户知道的发现，覆盖以下类别：
 - %s
 
-硬性输出要求：你的整个回复只能包含一个 JSON 数组，不允许有任何前言、注释、Markdown 围栏、或数组之后的任何文字。数组里每条为：
+硬性输出要求：你的整个回复只能包含一个 JSON 对象，不允许有任何前言、注释、Markdown 围栏、或对象之后的任何文字。对象形如 {"findings":[ ... ]}，findings 数组里每条为：
 {"type":"bug|style|optimization|feature","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
 
 约束：
@@ -1078,8 +1110,9 @@ func buildInsightScanPrompt(projectPath, repoSHA string, alreadySurfaced []strin
 
 // buildInsightRepairPrompt 组装 Pass A 解析失败后的修正重试 prompt。与首轮同方向
 // （theme + types），但对输出契约做最强约束：不得叙述、不得展示过程、不得贴示例、
-// 不得中途改口，整段回复就是且仅是那个 JSON 数组。首轮失败的真因是模型把 JSON 数组
-// 留到最后却在输出前 end_turn，因此这里明确"宁可少报也必须在回复里给出数组"。
+// 不得中途改口，整段回复就是且仅是那个 JSON 对象（{"findings":[...]}，见
+// insightCandidatesOutputSchema 为何不是裸数组）。首轮失败的真因是模型把 JSON
+// 留到最后却在输出前 end_turn，因此这里明确"宁可少报也必须在回复里给出 findings"。
 func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string {
 	var types []string
 	if len(opts.Types) == 0 {
@@ -1104,12 +1137,12 @@ func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string
 覆盖类别：%s
 
 这一次的硬性要求（必须严格遵守）：
-1. 你的整段回复必须是且仅是一个 JSON 数组，前面、后面、中间都不允许有任何说明文字、思考、标题、示例或 Markdown 围栏。
-2. 数组元素格式：{"type":"bug|style|optimization|feature","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
-3. 宁缺毋滥：只报你直接核实过的发现；拿不稳的不报，最少可以只报 1 条，但必须给出数组。
+1. 你的整段回复必须是且仅是一个 JSON 对象 {"findings":[ ... ]}，前面、后面、中间都不允许有任何说明文字、思考、标题、示例或 Markdown 围栏。
+2. findings 是 JSON 数组，元素格式：{"type":"bug|style|optimization|feature","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
+3. 宁缺毋滥：只报你直接核实过的发现；拿不稳的不报，最少可以只报 1 条，但必须给出 findings 数组。
 4. title 用用户能看懂的表述；禁止代码标识符、行号、堆栈。
 
-现在只输出那个 JSON 数组：`, projectPath, repoSHA, themeLine, strings.Join(types, "\n- "))
+现在只输出那个 JSON 对象：`, projectPath, repoSHA, themeLine, strings.Join(types, "\n- "))
 }
 
 func buildInsightRepairPromptWithHistory(projectPath, repoSHA string, alreadySurfaced []string, opts scanOpts) string {
@@ -1313,39 +1346,47 @@ func buildVerifyExistingRepairPrompt(projectPath string, targets []InsightFindin
 	return buildInsightReverifyPrompt(projectPath, "", targets, true)
 }
 
-// insightVerifyExistingVerdict 是再验证 agent 输出的解码目标。
-// Exists 用 *bool：若 agent 违约输出缺少 exists 字段的条目，缺省应判"无法确定"
-// （标 failed 可重试）而非误判 invalid 把仍有效的建议隐藏。
-// buildInsightReverifyPrompt 使用三态结论。只有能指出直接依据的 invalid 才会隐藏建议；
-// 无法确认必须返回 uncertain，由服务端保留建议并标记可重试。
+// buildInsightReverifyPrompt 把每条既有建议（含 id）连同全部详情交给只读 agent 逐条核验。
+// 用三态结论：只有能指出直接依据的 invalid 才会隐藏建议；无法确认必须返回 uncertain，
+// 由服务端保留建议并标记可重试。repair 为真时额外说明上一次输出的违约点（修正重试）。
 func buildInsightReverifyPrompt(projectPath, repoSHA string, targets []InsightFinding, repair bool) string {
 	items := make([]string, 0, len(targets))
 	for i, f := range targets {
 		items = append(items, fmt.Sprintf("%d. {\"id\":%q,\"title\":%q,\"type\":%q,\"severity\":%q,\"summary\":%q,\"fileHint\":%q}",
 			i+1, f.ID, f.Title, f.Type, f.Severity, f.Summary, f.FileHint))
 	}
+	// 修正重试的说明覆盖"输出契约"的每一种违约（不止 JSON 非法）：服务端会重试的
+	// 失败就是这几类，逐条点名比笼统的"不是合法 JSON"更能让模型一次改对。id 抄写
+	// 单独强调——它是 36 位随机 UUID，逐字符照抄对模型并非无成本动作，而服务端要
+	// 靠它归位（见 matchReverifyTargetID 的说明）。
 	repairLine := ""
 	if repair {
-		repairLine = "The previous response was not valid JSON. Repeat the verification and return only the required JSON object."
+		repairLine = "The previous response did not satisfy the contract: it was not valid JSON, or it listed an unknown or duplicate candidate id, or it missed a candidate. Repeat the verification and return only the required JSON object. Copy every candidate id character for character from the list below."
 	}
+	// 示例里的 id 用尖括号占位而不是 candidate-id：后者看着像可以直接照抄的字面量，
+	// 模型有把占位符原样回传的风险（那会先触发一次修正重试，重试仍照抄才判"未知建议"）。
 	return fmt.Sprintf(`Run a read-only verification now. Do not ask questions and do not change files.
 Project directory: %s
 Git revision: %s
 %s
 
 For every candidate, inspect the relevant code and return exactly one JSON object:
-{"findings":[{"id":"candidate-id","status":"valid","reason":"direct evidence"},{"id":"candidate-id","status":"invalid","reason":"direct evidence that it is fixed or implemented"},{"id":"candidate-id","status":"uncertain","reason":"evidence is insufficient"}]}
+{"findings":[{"id":"<candidate id>","status":"valid","reason":"direct evidence"},{"id":"<candidate id>","status":"invalid","reason":"direct evidence that it is fixed or implemented"},{"id":"<candidate id>","status":"uncertain","reason":"evidence is insufficient"}]}
 
 status meanings:
 - valid: the issue or missing feature still exists.
 - invalid: it is fixed, implemented, or inapplicable. Use this only with direct evidence from the project.
 - uncertain: relevant evidence is insufficient. Never use invalid merely because you cannot confirm it.
 
+Copy each "id" character for character from the candidate list below: it is an opaque UUID, so never rewrite, shorten, or complete it.
 Return one entry for every candidate and no text outside the JSON object.
 Candidates:
 %s`, projectPath, repoSHA, repairLine, strings.Join(items, "\n"))
 }
 
+// insightVerifyExistingVerdict 是再验证 agent 输出的解码目标。
+// Exists 用 *bool：若 agent 违约输出缺少 exists 字段的条目，缺省应判"无法确定"
+// （标 failed 可重试）而非误判 invalid 把仍有效的建议隐藏。
 type insightVerifyExistingVerdict struct {
 	Findings []struct {
 		ID     string `json:"id"`
@@ -1357,14 +1398,16 @@ type insightVerifyExistingVerdict struct {
 }
 
 // decodeInsightVerifyExisting 从 agent 输出抽最外层 JSON 并解码为再验证对象。
+// 错误文案用中文：它会经 insightRunErrorMessage 进入建议卡片的验证说明——英文错误会先被
+// 套上"任务执行失败…"前缀、再被剥掉，用户最终看到的是原样的半句开发者术语。
 func decodeInsightVerifyExisting(text string) (insightVerifyExistingVerdict, error) {
 	vJSON := extractInsightJSON(text)
 	if vJSON == "" {
-		return insightVerifyExistingVerdict{}, errors.New("empty/non-json")
+		return insightVerifyExistingVerdict{}, errors.New("AI 未返回 JSON 结果")
 	}
 	var verdict insightVerifyExistingVerdict
 	if err := json.Unmarshal([]byte(vJSON), &verdict); err != nil {
-		return insightVerifyExistingVerdict{}, err
+		return insightVerifyExistingVerdict{}, fmt.Errorf("AI 返回的 JSON 无法解析：%w", err)
 	}
 	return verdict, nil
 }
@@ -1413,10 +1456,14 @@ type insightReverifyResult struct {
 	reason string
 }
 
+// normalizeInsightReverifyStatus 归一化三态结论。大小写与首尾空白一并容忍：schema 里
+// 虽然给了 enum，但经中转的上游并不保证按 enum 约束模型，而 "Valid" / "valid " 这种
+// 写法没有任何歧义，不值得为它浪费一次修正重试。
 func normalizeInsightReverifyStatus(status string, legacyExists *bool) (string, bool) {
-	switch status {
+	normalized := strings.ToLower(strings.TrimSpace(status))
+	switch normalized {
 	case "valid", "invalid", "uncertain":
-		return status, true
+		return normalized, true
 	case "":
 		if legacyExists == nil {
 			return "", false
@@ -1428,6 +1475,154 @@ func normalizeInsightReverifyStatus(status string, legacyExists *bool) (string, 
 	default:
 		return "", false
 	}
+}
+
+// ─── 再验证输出的 id 归位 ────────────────────────────────────────────────
+//
+// 再验证要求模型把候选的 id（36 位随机 UUID）原样回传，服务端靠它把判定挂回建议。
+// 让模型逐字符抄一串高熵随机字符串本身就是个易错动作，而此前一处字符之差会让整批
+// 结论全废：2026-09-28 生产事故里，6 条一批的输出中有 1 条把
+// a4e9d6ab-eef2-43fc-b0f8-… 抄成 …-b0b8-…，该批 6 条建议全部被标成"验证失败"，
+// 而同批其余 5 条、以及另外两批同模型的输出都是逐字符正确的——纯随机手滑。
+//
+// 归位只认**唯一命中**：命中不唯一时宁可判"未知建议"交给修正重试，也不猜。猜错会把
+// 判定挂到别的建议上，那比整批失败更糟——整批失败用户看得见、可重试，静默错配则
+// 直接污染建议的有效性结论。
+//
+// 放宽之后仍不会张冠李戴，靠的是同一批的两道兜底：一批要求 N 条判定覆盖 N 条建议且
+// 各自唯一。若模型把某条判定挂到了别的主张上，要么那条建议缺判定（→"未给出全部建议"），
+// 要么已有判定被覆盖两次（→"重复返回同一条建议"）——两种情况都触发修正重试，而不是
+// 把错误结论写进库里。
+
+// reverifyIDKey 是 id 比对用的归一化形式：去首尾空白与包裹引号、转小写。模型常把 id
+// 包在引号/反引号里回传，大小写也可能整体翻转（UUID 本身大小写不敏感）。
+func reverifyIDKey(raw string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(raw), "\"'`"))
+}
+
+// reverifyIDMinPrefix 是前缀匹配允许的最短长度。更短的前缀（如 "a"）在随机 UUID 里
+// 也往往唯一，但那只是巧合，不该被当成"模型抄了个截断的 id"。
+const reverifyIDMinPrefix = 8
+
+// reverifyIDDistanceAtMostOne 判断两个归一化 id 是否只差一次编辑（替换 / 插入 / 删除）。
+// 手写而非上通用编辑距离：这里只关心"差一次"，线性扫描即可，也不需要为一次比对分配矩阵。
+func reverifyIDDistanceAtMostOne(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if len(a) == len(b) {
+		diff := 0
+		for i := 0; i < len(a); i++ {
+			if a[i] != b[i] {
+				diff++
+				if diff > 1 {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	short, long := a, b
+	if len(short) > len(long) {
+		short, long = long, short
+	}
+	if len(long)-len(short) != 1 {
+		return false
+	}
+	// 长度差 1：短串必须是长串删掉一个字符的结果，即遇到第一处分歧后长串多跳一格。
+	for i, j, skipped := 0, 0, false; i < len(short); {
+		if short[i] == long[j] {
+			i++
+			j++
+			continue
+		}
+		if skipped {
+			return false
+		}
+		skipped = true
+		j++
+	}
+	return true
+}
+
+// uniqueReverifyMatch 在 targets 里挑出唯一满足 match 的 id；0 个或 ≥2 个都算未命中。
+func uniqueReverifyMatch(targets []InsightFinding, match func(key string) bool) (string, bool) {
+	found := ""
+	for _, target := range targets {
+		if !match(reverifyIDKey(target.ID)) {
+			continue
+		}
+		if found != "" {
+			return "", false
+		}
+		found = target.ID
+	}
+	return found, found != ""
+}
+
+// matchReverifyTargetID 把模型回传的 id 归位到本批目标的真实 id。三级匹配，依次放宽：
+// 归一化后精确 → 唯一前缀（模型抄了截断的 id）→ 唯一编辑距离 1（模型抄错一个字符）。
+// 未命中返回 ("", false)，由调用方按契约违约处理（修正重试，见 matchReverifyVerdict）。
+func matchReverifyTargetID(targets []InsightFinding, raw string) (string, bool) {
+	key := reverifyIDKey(raw)
+	if key == "" {
+		return "", false
+	}
+	for _, target := range targets {
+		if reverifyIDKey(target.ID) == key {
+			return target.ID, true
+		}
+	}
+	// 前缀这一级自带长度下限；"差一个字符"这一级不需要——reverifyIDDistanceAtMostOne
+	// 自身就要求两者长度差 ≤1，短输入自然落空。
+	if len(key) >= reverifyIDMinPrefix {
+		if id, unique := uniqueReverifyMatch(targets, func(candidate string) bool {
+			return strings.HasPrefix(candidate, key)
+		}); unique {
+			return id, true
+		}
+	}
+	return uniqueReverifyMatch(targets, func(candidate string) bool {
+		return reverifyIDDistanceAtMostOne(candidate, key)
+	})
+}
+
+// matchReverifyVerdict 把再验证输出归位并校验契约：每条判定的 id 必须唯一地落回本批的
+// 某条建议、状态合法、且一条不漏。任何一条不满足都返回错误——调用方据此决定是否用
+// 强约束 prompt 修正重试。与 Pass B 的 validateInsightVerdict 同责，两者都必须在
+// "可重试"这一侧（见 runInsightReverifyBatch 的 decode 闭包）。
+//
+// 错误文案保持中文原样：它会直接出现在建议卡片的验证说明里（见 insightRunErrorMessage）。
+func matchReverifyVerdict(targets []InsightFinding, verdict insightVerifyExistingVerdict) (map[string]insightReverifyResult, error) {
+	results := make(map[string]insightReverifyResult, len(targets))
+	for _, item := range verdict.Findings {
+		id, ok := matchReverifyTargetID(targets, item.ID)
+		if !ok {
+			return nil, errors.New("AI 返回了未知建议")
+		}
+		if _, duplicate := results[id]; duplicate {
+			return nil, errors.New("AI 重复返回了同一条建议")
+		}
+		status, ok := normalizeInsightReverifyStatus(item.Status, item.Exists)
+		if !ok {
+			return nil, errors.New("AI 未给出有效的验证判定")
+		}
+		results[id] = insightReverifyResult{status: status, reason: item.Reason}
+	}
+	if len(results) != len(targets) {
+		return nil, errors.New("AI 未给出全部建议的验证判定")
+	}
+	return results, nil
+}
+
+// reverifyVerdictIDs 提取输出里的 id 列表，仅供失败日志留证：模型这趟到底回了什么，
+// 只有落进日志事后才查得动（Pass A 的 parse failed 分支同做法）。
+func reverifyVerdictIDs(verdict insightVerifyExistingVerdict) []string {
+	ids := make([]string, 0, len(verdict.Findings))
+	for _, item := range verdict.Findings {
+		ids = append(ids, item.ID)
+	}
+	return ids
 }
 
 // runInsightFindingsVerify 见 runInsightFindingsVerifyRun。
@@ -1677,45 +1872,63 @@ func persistInsightWrite(write func(context.Context)) {
 	write(persistCtx)
 }
 
+// runInsightReverifyBatch 跑一趟再验证（一批 ≤ insightVerifyBatchSize 条建议），返回
+// 按建议 id 归位后的判定。失败分两类，调用方据以决定是否继续后续批次：
+//   - agent 进程本身失败（启动/超时/退出）：原样返回，属环境问题，重试无用；
+//   - 输出不可用（非法 JSON / 契约违约）：内部已用强约束 prompt 修正重试一次，
+//     仍不可用才返回"重试后仍未返回可用结果：…"。
 func (s *Server) runInsightReverifyBatch(ctx context.Context, project Project, agentID, repoSHA string, targets []InsightFinding, progress func(level, message string)) (map[string]insightReverifyResult, error) {
 	cc := func(prompt string) (string, error) {
 		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightReverifyOutputSchema, insightQuotaWaitMax, progress)
+	}
+	targetIDs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		targetIDs = append(targetIDs, target.ID)
+	}
+	// decode 把"JSON 可解析"与"输出契约成立"合并成一次判定：两者都属于"这趟输出不可
+	// 用"，都该触发一次强约束修正重试——与 Pass B 的 decode 闭包同一语义（见
+	// runInsightVerify：validateInsightVerdict 也在 decode 里）。此前契约校验留在这
+	// 之后，于是"id 抄错一个字符"这类本可改对的失误没有第二次机会，整批结论直接作废。
+	//
+	// 两种失败都打日志：模型到底回了什么，只有落进日志事后才查得动（Pass A 同做法，
+	// 见 runProjectInsightScan 的 parse failed 分支）。缺了这行日志时，界面上只有一句
+	// "AI 返回了未知建议"，根因只能靠翻 CLI 的 session transcript 才挖得出来。
+	decode := func(text, stage string) (map[string]insightReverifyResult, error) {
+		verdict, err := decodeInsightVerifyExisting(text)
+		if err != nil {
+			log.Printf("[insights] project=%s re-verify %s: output is not JSON (len=%d): %q",
+				project.ID, stage, len(text), truncateInsightLog(text, 300))
+			return nil, err
+		}
+		results, err := matchReverifyVerdict(targets, verdict)
+		if err != nil {
+			log.Printf("[insights] project=%s re-verify %s: %v; returned ids=%v want=%v",
+				project.ID, stage, err, reverifyVerdictIDs(verdict), targetIDs)
+			return nil, err
+		}
+		return results, nil
 	}
 	text, err := cc(buildInsightReverifyPrompt(project.Path, repoSHA, targets, false))
 	if err != nil {
 		return nil, err
 	}
-	verdict, err := decodeInsightVerifyExisting(text)
+	results, vErr := decode(text, "first attempt")
+	if vErr == nil {
+		return results, nil
+	}
+	// 修正重试是一趟完整的 agent 调用（可能数分钟），必须明说，否则用户看到的是
+	// "这一批卡住了"（与 Pass A 的"首轮输出不规范…"同一处理）。重试跑在全新 agent
+	// 会话里，prompt 会完整重贴候选详情（见 buildInsightReverifyPrompt）。
+	if progress != nil {
+		progress("warn", "首轮输出不规范，正在要求 AI 补交结果…")
+	}
+	text, err = cc(buildInsightReverifyPrompt(project.Path, repoSHA, targets, true))
 	if err != nil {
-		text, err = cc(buildInsightReverifyPrompt(project.Path, repoSHA, targets, true))
-		if err != nil {
-			return nil, err
-		}
-		verdict, err = decodeInsightVerifyExisting(text)
-		if err != nil {
-			return nil, fmt.Errorf("verification agent returned invalid JSON: %w", err)
-		}
+		return nil, err
 	}
-	targetIDs := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		targetIDs[target.ID] = struct{}{}
-	}
-	results := make(map[string]insightReverifyResult, len(targets))
-	for _, item := range verdict.Findings {
-		if _, ok := targetIDs[item.ID]; !ok {
-			return nil, errors.New("AI 返回了未知建议")
-		}
-		if _, duplicate := results[item.ID]; duplicate {
-			return nil, errors.New("AI 重复返回了同一条建议")
-		}
-		status, ok := normalizeInsightReverifyStatus(item.Status, item.Exists)
-		if !ok {
-			return nil, errors.New("AI 未给出有效的验证判定")
-		}
-		results[item.ID] = insightReverifyResult{status: status, reason: item.Reason}
-	}
-	if len(results) != len(targets) {
-		return nil, errors.New("AI 未给出全部建议的验证判定")
+	results, vErr = decode(text, "repair retry")
+	if vErr != nil {
+		return nil, fmt.Errorf("重试后仍未返回可用结果：%w", vErr)
 	}
 	return results, nil
 }
@@ -1818,6 +2031,31 @@ func (s *Server) acquireWorkspaceWait(ctx context.Context, key, owner string, wa
 //
 // 返回 ok=false 表示没能发布，reason 为用户可读原因（已取消 / 预算用尽 / 工作区被占用 /
 // 工作区已变化 / 版本状态读不出 / 写库失败）。reason 一定非空，调用方可直接展示。
+// insightRevisionAbortText 把"版本探测没做成"翻成一句**真原因**，返回空串表示探测成功
+// （调用方接着按"真的变了"处理）。
+//
+// 两条规则：
+//   - 读不出快照与"工作区变了"是两回事，**别混成同一句话**：前者是"这一次没跑成/超时"，
+//     后者才是"代码在你眼皮底下变了"。混起来用户会去查一个不存在的变化。
+//   - 上下文已结束时优先报真实原因（取消 / 超预算），而不是"无法读取"这种技术措辞。
+//
+// 提成函数是因为这套判断原先在两处各写了一份，其中一处漏了（Pass A/B 之间那道守卫把
+// `revisionErr != nil || !unchanged` 合并成"项目代码在分析中发生变化"）——2026-09-29
+// 由一次满载全量的偶发失败日志反查出来。两份各写一次，就还会再漏一次。
+func insightRevisionAbortText(ctx context.Context, projectID, stage string, revisionErr error) string {
+	if revisionErr == nil {
+		return ""
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "已取消"
+	}
+	if ctx.Err() != nil {
+		return "已超出本次运行的时间预算，结果未写入，请重新发起"
+	}
+	log.Printf("[insights] project=%s %s: read workspace revision failed: %v", projectID, stage, revisionErr)
+	return "无法读取项目版本状态，本次结果未写入，请重新发起"
+}
+
 func (s *Server) publishInsightResult(ctx context.Context, project Project, revision insightWorkspaceRevision, owner string, onWait func(), publish func(context.Context) error) (bool, string) {
 	// 先判上下文：已取消/已超预算就没必要再去碰工作区（否则会落到下面那些"看起来
 	// 像是工作区问题"的分支，把真实原因盖掉）。
@@ -1854,16 +2092,8 @@ func (s *Server) publishInsightResult(ctx context.Context, project Project, revi
 	}
 	defer release()
 	unchanged, revisionErr := s.insightWorkspaceUnchanged(ctx, project, revision)
-	if revisionErr != nil {
-		// 读不出快照与"工作区变了"是两回事，别混成同一句话。上下文已结束时优先报真实原因。
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return false, "已取消"
-		}
-		if ctx.Err() != nil {
-			return false, "已超出本次运行的时间预算，结果未写入，请重新发起"
-		}
-		log.Printf("[insights] project=%s publish: read workspace revision failed: %v", project.ID, revisionErr)
-		return false, "无法读取项目版本状态，本次结果未写入，请重新发起"
+	if text := insightRevisionAbortText(ctx, project.ID, "publish", revisionErr); text != "" {
+		return false, text
 	}
 	if !unchanged {
 		return false, "项目代码在处理过程中发生变化，已丢弃本轮结果，请重新发起"
@@ -2120,12 +2350,14 @@ func insightRunErrorMessage(prefix string, err error) string {
 		return prefix + "，请重试"
 	}
 	msg := redactAgentText(errorText(err))
-	// errorText 对未翻译的英文错误会包一层"任务执行失败，请查看任务日志后重试。"——
-	// 该提示面向对话/任务页，对优化建议扫描无意义，剥掉让原因直接可见。
-	const fallbackPrefix = "任务执行失败，请查看任务日志后重试。："
-	msg = strings.TrimPrefix(msg, fallbackPrefix)
-	msg = truncateInsightLog(strings.TrimSpace(msg), 240)
-	if msg == "" || msg == "任务执行失败，请查看任务日志后重试。" {
+	// errorText 对未翻译的错误会包一层 taskFailureFallback——该提示面向对话/任务页，
+	// 对优化建议扫描无意义，剥掉让原因直接可见。两个常量都取自 app.go 的同名定义，
+	// 不在这里另写一份字面量：那样 app.go 改一个字，这里会静默失配。
+	msg = strings.TrimPrefix(msg, taskFailureFallbackPrefix)
+	// 上限取自 claude_runner.go 的 insightRunMessageBytes：那条"前缀 + 退出描述 + 详情段"
+	// 的预算就是按它算的，这里抄字面量会让两处静默失配。
+	msg = truncateInsightLog(strings.TrimSpace(msg), insightRunMessageBytes)
+	if msg == "" || msg == taskFailureFallback {
 		return prefix + "，请重试"
 	}
 	// 超时信息已自带完整原因（"分析超时：…"），无需再叠"项目分析失败："前缀。
@@ -2436,7 +2668,7 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	if err != nil {
 		log.Printf("[insights] project=%s Pass A parse failed on first attempt; raw(len=%d): %q",
 			projectID, len(textA), truncateInsightLog(textA, 300))
-		// 修正 prompt 重试一次（同项目同方向，但明确"只输出数组"。）
+		// 修正 prompt 重试一次（同项目同方向，但明确"只输出那个 JSON 对象"。）
 		emit("warn", "首轮输出不规范，正在要求 AI 补交结果…")
 		textA, err = s.runReadOnlyAgentWithSchema(ctx, project, agentID, buildInsightRepairPromptWithHistory(project.Path, repoSHA, alreadySurfaced, opts), insightCandidatesOutputSchema, insightQuotaWaitMax, emit)
 		if err != nil {
@@ -2459,8 +2691,16 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 	emit("success", fmt.Sprintf("第 1 轮完成，收集到 %d 条候选发现", len(candidates)))
 
 	// Pass B：独立核实。先确认工作区未在 Pass A 中变化，避免两个阶段分析不同版本。
+	//
+	// ⚠️ "读不出快照"与"工作区变了"是两回事：判断统一走 insightRevisionAbortText
+	// （与发布那条路径同一份），别在这里另写一遍 —— 这里原先把两者合并成
+	// "项目代码在分析中发生变化"，预算耗尽时会说出一句用户查不出的假原因。
 	unchanged, revisionErr := s.insightWorkspaceUnchanged(ctx, project, workspaceRevision)
-	if revisionErr != nil || !unchanged {
+	if text := insightRevisionAbortText(ctx, projectID, "pass B", revisionErr); text != "" {
+		markFailed(text)
+		return
+	}
+	if !unchanged {
 		markFailed("项目代码在分析中发生变化，已丢弃本轮结果，请重新发起")
 		return
 	}
@@ -2660,8 +2900,8 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	}
 	scanID := uuid.NewString()
 
-	// 总预算 insightScanRunTimeout 从登记这一刻开始计，保证扫描不会无限期跑下去
-	// （单趟上限是"每趟"的，没有总预算时多趟 + 重试会累计成小时级）。
+	// 总预算 insightScanRunTimeout 从登记这一刻开始计（0 = 不限时，见其说明）。
+	// 这里仍然登记：它同时承担"同一项目同一 kind 只允许一个运行"的互斥与可取消性。
 	runCtx, release, ok, closing := s.beginInsightRun(projectID, insightRunScan, insightScanRunTimeout)
 	if !ok {
 		if closing {

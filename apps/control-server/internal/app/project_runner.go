@@ -816,6 +816,7 @@ func (pr *projectRunner) StatusSnapshot() RunStatusResponse {
 	snapshot := RunStatusResponse{
 		Status:          pr.status,
 		ExecutionTarget: pr.executionTarget,
+		Command:         pr.command,
 		RecentLogs:      pr.logBuf.Recent(projectRunLogHistory),
 	}
 	if !pr.startedAt.IsZero() {

@@ -6,10 +6,17 @@ import { api } from "./lib/api.ts";
 const apiModule = await readFile(new URL("./lib/api.ts", import.meta.url), "utf8");
 
 test("only safe API methods receive automatic retries", () => {
-  assert.match(apiModule, /function retryCountFor\(init\?: RequestInit\): number/);
-  assert.match(apiModule, /const method = \(init\?\.method \?\? "GET"\)\.toUpperCase\(\);/);
+  assert.match(apiModule, /function retryCountFor\(init\?: RequestInit, path = ""\): number/);
+  assert.match(apiModule, /const requestMethod = \(init\?: RequestInit\) => \(init\?\.method \?\? "GET"\)\.toUpperCase\(\);/);
   assert.match(apiModule, /return method === "GET" \|\| method === "HEAD" \|\| method === "OPTIONS" \? 2 : 0;/);
-  assert.match(apiModule, /export async function api<T>\(path: string, init\?: RequestInit, retries = retryCountFor\(init\)\)/);
+  assert.match(apiModule, /export async function api<T>\(path: string, init\?: RequestInit, retries = retryCountFor\(init, path\)\)/);
+  // 长任务一律不重试：那张"放宽到 2x 再来一次"是给服务端瞬时忙用的，套在分钟级的
+  // 重活上等于把 npm 安装 / git push 整件事再跑一遍。
+  assert.match(apiModule, /if \(requestBudgetMs\(path, method\) > requestTimeoutMs\) return 0;/);
+  assert.match(apiModule, /return apiWithTimeout<T>\(path, init, retries, requestBudgetMs\(path, requestMethod\(init\)\)\);/);
+  // 预算**必须带方法**：同一条路径上常同时挂着读与写（GET/POST /api/projects 与
+  // /git/branches、GET/POST /api/ssh-connections），只按路径匹配会把快的读也拖成分钟级。
+  assert.match(apiModule, /entry\.methods\.includes\(method\) && entry\.pattern\.test\(bare\)/);
 });
 
 test("successful responses with invalid JSON use a Chinese fallback", () => {
