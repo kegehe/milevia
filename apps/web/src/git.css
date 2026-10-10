@@ -140,6 +140,24 @@
 .git-empty { display: grid; min-height: 280px; place-items: center; }
 .git-list-empty { padding: 24px 16px; }
 
+/* 首屏骨架（见 GitWorkbench.tsx 的 GitSkeleton）：进 Git 视图时先给结构、再填内容。
+   它顶掉的是原来那句**会反复出现**的「正在读取仓库状态」—— 现在只有真的没有内容可显示
+   （`!snapshot`）时才现身，后台对账一概不碰，所以那句文案不会再每秒闪一次。
+   动效只用一层很轻的呼吸（与这一页其它状态指示同一条纪律：动画只表示状态），
+   并且尊重 prefers-reduced-motion。 */
+.git-skeleton { display: grid; min-width: 0; flex: 1; align-content: start; gap: 14px; }
+.git-skeleton-sr { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.git-skeleton-group { display: grid; overflow: hidden; border: 1px solid #d5e4dc; border-radius: 7px; background: #fff; }
+.git-skeleton-group > header { height: 36px; border-bottom: 1px solid #e0ebe5; background: #f8fcf9; }
+.git-skeleton-row { display: grid; grid-template-columns: minmax(0, 1fr) 42px; align-items: center; gap: 10px; height: 34px; padding: 0 14px; }
+.git-skeleton-row + .git-skeleton-row { border-top: 1px solid #e4ede7; }
+.git-skeleton-row i, .git-skeleton-row em { display: block; height: 9px; border-radius: 4px; background: #e6efe9; animation: git-skeleton-pulse 1.4s ease-in-out infinite; }
+.git-skeleton-row em { width: 38px; }
+
+@keyframes git-skeleton-pulse { 50% { opacity: .45; } }
+
+@media (prefers-reduced-motion: reduce) { .git-skeleton-row i, .git-skeleton-row em { animation: none; } }
+
 /* 非 git 项目的「初始化 Git 仓库」空态。 */
 .git-init-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 320px; padding: 24px; text-align: center; color: #5f7a6e; }
 .git-init-empty-mark { display: grid; place-items: center; width: 46px; height: 46px; border-radius: 50%; color: #2c7567; background: #e8f4ee; }

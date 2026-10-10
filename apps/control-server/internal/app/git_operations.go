@@ -3,7 +3,9 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +76,32 @@ type gitSummaryResponse struct {
 	GitSnapshot
 	ObservedAt time.Time `json:"observedAt"`
 	StateToken string    `json:"stateToken"`
+	// ChangesRevision 是"变更清单 + 每个文件指纹"的摘要，给手机端那个**只取 summary**
+	// 的后台探针当变化判据用（见 apps/web 的 sameGitSnapshot）。
+	//
+	// 为什么不能只比 worktree 计数：一个文件恢复干净、另一个文件同时被改，计数一模一样，
+	// 清单却换了人。用户看到的是已经恢复干净的那一行（点下去必然撞 409「仓库状态已变化」），
+	// 而真正改动的那个文件不在列表里 —— 且因为每次都判"没变"，它会一直错到用户手动刷新。
+	// 指纹本来就在本函数里算给 stateToken 用（readGitState），所以这里几乎不额外花钱。
+	ChangesRevision string `json:"changesRevision,omitempty"`
+}
+
+// gitChangesRevision 把变更清单与每个文件的指纹压成一个短摘要。
+//
+// 走查一遍"清单可能变了但计数没变"的几种：改名（renamed 计数变了）、
+// 暂存 ↔ 未暂存之间搬动（staged/flags 变）、一个文件恢复干净而另一个被改（计数相同）。
+// 后一种只有把路径与指纹一起算进来才看得见，所以这里两者都进摘要。
+func gitChangesRevision(changes []GitChange, fingerprints map[string]string) string {
+	hash := sha256.New()
+	for _, change := range changes {
+		// 每段**带长度前缀**再进摘要：路径里可能有空格、冒号、甚至分隔符本身，
+		// 靠一个分隔符拼接会造出"两份不同清单算出同一个摘要"的歧义，长度前缀不会。
+		fingerprint := fingerprints[change.Path]
+		fmt.Fprintf(hash, "%d:%s:%t%t%t%t%t%t:%d:%s;", len(change.Path), change.Path,
+			change.Staged, change.Modified, change.Untracked, change.Deleted, change.Renamed, change.Conflicted,
+			len(fingerprint), fingerprint)
+	}
+	return hex.EncodeToString(hash.Sum(nil))[:16]
 }
 
 func (s *Server) migrateGit(ctx context.Context) error {
@@ -221,7 +249,7 @@ func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := s.issueGitStateToken(chi.URLParam(r, "projectID"), workspace.Workspace.ID, workspace.Workspace.Path, snapshot, changes, fingerprints, observedAt)
-	writeJSON(w, http.StatusOK, gitSummaryResponse{GitSnapshot: snapshot, ObservedAt: observedAt, StateToken: token})
+	writeJSON(w, http.StatusOK, gitSummaryResponse{GitSnapshot: snapshot, ObservedAt: observedAt, StateToken: token, ChangesRevision: gitChangesRevision(changes, fingerprints)})
 }
 
 // gitInit 在项目目录初始化一个 Git 仓库（git init -b main）。

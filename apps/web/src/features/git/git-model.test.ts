@@ -82,7 +82,9 @@ test("reports an unavailable Git state instead of silently ignoring a mutation",
   const source = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
 
   assert.match(source, /if \(!snapshot\?\.stateToken\) \{\s+fail\("Git 状态尚未准备完成，请刷新后重试"\);\s+return;\s+\}/);
-  assert.match(source, /void reload\(true\)\.catch\(\(\) => undefined\);/);
+  // 这里原本还断言了失败分支那句重读调用（`void reload(true).catch(...)`）。现在写操作的收尾
+  // 分了两段（成功 await / 失败 void），断言整体搬到下面那条测试里 —— 那条会剥注释、按分支判，
+  // 光"字符串在文件里出现过"是拦不住"把代码注释掉"的。
 });
 
 test("keeps the workbench a compact 2-tab layout with a persistent status bar", () => {
@@ -137,6 +139,49 @@ test("ssr smoke: commit history renders a root commit whose parents are null", (
   assert.match(html, /首个提交/);
   assert.match(html, /桌面端/);
   assert.doesNotMatch(html, /git-commit-merge-badge/);
+});
+
+test("重读期间不复用上一份读数：loading 档一律显示占位", () => {
+  const source = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
+
+  // 为什么不能写成 `loading && !snapshot`：重读的触发之一就是**工作区身份变了**
+  // （projectID / conversationId / request 换人 —— 手机端还会因为电脑那边切了会话而被动换），
+  // 那时手上的 snapshot 是**上一个工作区**的。拿它顶上，用户看到的是 A 的变更列表、
+  // 点下去可能写进 B。`loading` 只由首屏那一档置位（后台对账一概不置），
+  // 所以它本身就等于"屏幕上这份数据不属于当前工作区"，不必再加 snapshot 非空的限定。
+  assert.match(source, /\{loading \? <GitSkeleton \/>/);
+  assert.match(source, /\{loading \? <><span className="git-bar-label">/);
+  // 先剥注释再查这条：上面的 ⚠️ 注释为了说明"为什么不能那么写"，把那句原样写了一遍
+  // （同一个形状在 mobile-remote-agent.test.mjs 里也用过一次）。
+  const code = source.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.doesNotMatch(code, /loading && !snapshot/);
+});
+
+test("写操作：反馈不等对账、成功才等令牌、失败不许把 busy 扣到对账结束", () => {
+  const raw = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
+  // ⚠️ **先剥注释再断言**：这几串在注释里也原样出现过（说明"为什么要这么写"），不剥的话
+  // 把对应代码整段注释掉照样能过 —— 审查者用变异测试正是这么骗过去的（改完 153 条全绿）。
+  const source = raw.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  const mutate = source.slice(source.indexOf("const mutate = async"), source.indexOf("const mutatePath ="));
+
+  const feedback = mutate.indexOf("success?.();");
+  const successFrom = mutate.indexOf("if (wrote) {");
+  const failureFrom = mutate.indexOf("} else {");
+  const clearBusy = mutate.indexOf('setMutating("")');
+  assert.ok(feedback > 0 && successFrom > feedback, "反馈（关确认框 / 清提交信息 / 退差异面板）必须在两段对账之前落地");
+  assert.ok(failureFrom > successFrom && clearBusy > failureFrom, "两段对账之后才是清 busy");
+
+  const successBranch = mutate.slice(successFrom, failureFrom);
+  const failureBranch = mutate.slice(failureFrom, clearBusy);
+
+  // 成功：await 对账（写操作作废了手上的 stateToken，新令牌要等 summary 回来）；
+  // 而且要带 `.catch`：万一 reload 抛出，"清 busy 那句不执行 ⇒ 按钮永远禁着"不该是后果。
+  assert.match(successBranch, /await reload\("reconcile", options\)\.catch\(\(\) => undefined\);/);
+  assert.doesNotMatch(successBranch, /void reload\("reconcile", options\);/);
+  // 失败：反过来 —— 发对账但**不等**它（写请求超时后确认框还开着、三颗按钮全是 disabled={busy}，
+  // 等对账就是让用户没有任何能按的东西）。两段对调会让这两条同时红。
+  assert.match(failureBranch, /void reload\("reconcile", options\);/);
+  assert.doesNotMatch(failureBranch, /await reload\(/);
 });
 
 test("ssr smoke: GitBar loaded state renders branch, sync badge and actions", () => {

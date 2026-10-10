@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -66,11 +67,15 @@ func (s *Server) runAgentLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := loginR.Login(r.Context())
 	if err != nil {
-		info = agentLoginInfo{Message: "无法发起 CodeBuddy 登录：" + err.Error() + "。请打开官方登录页完成授权。"}
+		info = agentLoginInfo{Message: fmt.Sprintf("无法发起 %s 登录：%v。请打开官方登录页完成授权。", entry.Name, err)}
 	} else if info.AuthURL == "" && info.UserCode == "" {
 		// 管理 runner 的 Login 不真正拉起交互式 TUI（无头环境无法驱动），如实给可直接
 		// 操作的指引，不说"已经启动流程"这类对其运行状态无法保证的话。
-		info.Message = "CodeBuddy 需要登录后才能使用。请在目标环境的终端运行 codebuddy，按提示选择站点并在浏览器完成授权，授权完成后在本页点「检查登录状态」。"
+		//
+		// ⚠️ 工具名与命令名都从**目录**取，不写死：写死的那一版在新增第二个需要登录的
+		// 工具时，会把用户指向另一个 CLI（而这句话是"点进去之后唯一的指引"）。
+		info.Message = fmt.Sprintf("%s 需要登录后才能使用。请在目标环境的终端里运行 %s 完成登录授权，然后回到本页点「检查登录状态」。",
+			entry.Name, entry.CommandName)
 	}
 	writeJSON(w, http.StatusOK, info)
 }

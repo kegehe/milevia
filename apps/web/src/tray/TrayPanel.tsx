@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react
 import type { ReactNode } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
-import { downloadPhase, type UpdaterStatus } from "../features/updater/update-view";
+import { downloadFailureReason, downloadPhase, type UpdaterStatus } from "../features/updater/update-view";
 import type { RecentConversation } from "../lib/types";
 import "./tray-panel.css";
 
@@ -142,7 +142,9 @@ export function TrayPanel() {
     }
     if (r.update) {
       setAvailable(r.update.version);
-      setMessage(r.update.notes ?? "");
+      // 静默下载失败时把原因顶到副标题上（Rust 侧已按下载语境本地化）：这一行
+      // 平时显示"更新内容"，但失败时用户更需要知道**为什么**没下成。
+      setMessage(downloadFailureReason(r) ?? r.update.notes ?? "");
       // 后台静默预下载的相位决定这一行能干什么：下载中不可点，备好了才是"点击安装"。
       setPhase(phase === "downloading" ? "downloading" : "available");
       // ⚠️ 下载是**异步推进**的，而且后台下载刻意不发任何事件（静默）——面板若正好在这一相位

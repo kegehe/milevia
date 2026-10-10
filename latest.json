@@ -1,21 +1,21 @@
 {
-  "version": "0.1.7",
-  "notes": "修复后台任务期间状态误判与历史消息乱序；远程控制页新增「已绑定手机」卡片，可查看手机名与最近同步并直接解绑；扫码配对重新带上校验码、扫码即提交，无需手输；修复升级安装后首次启动白屏、会话「加载更早记录」点不掉；项目优化建议支持多选批量删除。",
-  "pub_date": "2026-09-19T10:57:24.438Z",
+  "version": "0.1.8",
+  "notes": "CLI 工具管理页支持在 WSL 与远程服务器上查看、安装与升级工具（CodeBuddy 不再显示「跨端管理尚未接通」）；登录入口移到工具卡片上；运行依赖与更新按钮在未授权或环境装不了时说明原因；通知改为带倒计时进度条的轨迹卡；后台更新下载失败时显示具体原因；修复新建会话被弹回旧会话、连点攒出空会话；修复 CodeBuddy 会话的模型下拉与用量面板打不开；修复「直接写入」在 Windows 服务端上的 WSL 项目误判。",
+  "pub_date": "2026-10-09T13:35:17.411Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNncy9MS2tURXpzb25ka1dPS2dPakFic2k1WUZsZWlQRzcvMFgrMmxkMW9zU3Z1dEV0TnNxRUpySHhqMlBoNFJyYTRDTVNGTFkrMkhWQW1LNG56N3NESWdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5ODE1NDQ0CWZpbGU6TWlsZXZpYV8wLjEuN194NjQtc2V0dXAuZXhlCnlEbDcwN1c2R1VnZE1pN0lmVkVNNDlNclFPRGhQNnI1ZFo1N21XaTM1NGNHajVoZUlES1JiK2pDeW9Wd3FSUnZnTmlnM281ZFMrWDV5OUhsTlFScUR3PT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.7/Milevia_0.1.7_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczRzWTZpZUsvWW1keGJlQXh2ZEFEZjl2OWtDTWRvOTZxelY3UVNzOXFheGJJOEdNU1dleUZiZVkwT1ZSM1pMQVNiME1xdTIyMTdoOVJWWXBneW9uOWc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNTUyOTE3CWZpbGU6TWlsZXZpYV8wLjEuOF94NjQtc2V0dXAuZXhlCjIrNVk0L2JzUCtBeWtKQ0ttQWo5aDZtMVB1SGNiMDY3K1AxS1N1bTZVWUc2MGs0bXgyOVh3Nmpsb3A0MFBTTWlsRXJJVlNhRjAyZ04xZFZrcVVZZkFBPT0K",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.8/Milevia_0.1.8_x64-setup.exe"
     },
     "android": {
-      "version": "0.1.8",
-      "versionCode": 6,
-      "notes": "一台手机可绑定多台电脑，项目页顶部可随时切换或解绑；任务增删改在手机上立即生效并标注同步中，新增搜索、状态计数与悬浮新建；新建会话与发送消息不再等待电脑端往返；项目卡片支持长按拖动排序；修复键盘弹起后会话不自动贴底。",
-      "pub_date": "2026-09-19T10:59:20.345Z",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.8/Milevia_0.1.8_android.apk",
-      "size": 28387179,
-      "sha256": "dda8636145f6d7c148ca7b19cca8e285e28f4945b43d5bc81d07987ac0657201",
-      "signature": "dda8636145f6d7c148ca7b19cca8e285e28f4945b43d5bc81d07987ac0657201"
+      "version": "0.1.9",
+      "versionCode": 7,
+      "notes": "修复新建会话被弹回旧会话、连点攒出空会话；修复 CodeBuddy 会话的模型下拉与用量面板打不开；通知改为带倒计时进度条的轨迹卡；后台更新下载失败时显示具体原因；CLI 工具管理页在 WSL 与远程服务器上的工具可正常查看与升级；修复环境变量改名覆盖同名变量。",
+      "pub_date": "2026-10-09T13:38:08.450Z",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.9/Milevia_0.1.9_android.apk",
+      "size": 28512290,
+      "sha256": "5bc2452b7357640835c8455203bd4c2bdcc0e669ab539569ea4341efd22018e1",
+      "signature": "5bc2452b7357640835c8455203bd4c2bdcc0e669ab539569ea4341efd22018e1"
     }
   }
 }

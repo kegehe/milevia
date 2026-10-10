@@ -12,7 +12,7 @@ import {
   installBlockNote,
   latestVersionLine,
   runnerLabel,
-  runtimeLatestLine,
+  runtimeDepLine,
 } from "./cli-tools-view";
 import type { LatestRead, RuntimeStatus, RunnerAgentItem, ToolCardInput } from "./cli-tools-view";
 import type { AgentCatalogEntry } from "./agent-registry";
@@ -197,7 +197,7 @@ test("有可修的症状时，主操作是修复而不是升级", () => {
   assert.equal(card.statusTone, "warn");
 });
 
-test("症状存在但没有可自动修的动作时，不给按钮、并说清只能手动处理", () => {
+test("症状存在但没有可自动修的动作时，不给可修按钮、改成给详情入口", () => {
   const card = buildToolCard(input({
     diagnosis: diagnosis({
       status: "broken",
@@ -207,6 +207,8 @@ test("症状存在但没有可自动修的动作时，不给按钮、并说清�
   assert.equal(card.primary, undefined);
   assert.match(card.note ?? "", /不能自动修/);
   assert.equal(card.statusTone, "bad");
+  // 文案让用户"按详情里的证据手动处理"，就得给得起点开：横幅只会指向第一张问题卡。
+  assert.equal(card.canOpenDetails, true);
 });
 
 test("info 级症状不算「要留意」，不该顶掉「已是最新」", () => {
@@ -218,6 +220,8 @@ test("info 级症状不算「要留意」，不该顶掉「已是最新」", () 
   }));
   assert.equal(card.statusText, "已是最新，不用管它。");
   assert.equal(card.statusTone, "ok");
+  // 健康卡不给详情入口 —— 它没有抽屉内容，给了只会在卡底留下一条空动作条。
+  assert.equal(card.canOpenDetails, false);
 });
 
 test("跨端工具不做应用内升级：给手动命令，不给按钮", () => {
@@ -245,6 +249,47 @@ test("有任务在跑时不给任何操作入口", () => {
     assert.equal(card.primary, undefined);
     assert.match(card.note ?? "", /已有任务在进行/);
   }
+});
+
+// ── 「登录」这颗按钮给不给 ──────────────────────────────────────────────────
+
+test("支持登录的工具，装好了就在卡片上给「登录」", () => {
+  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }) }));
+  assert.equal(card.canLogin, true);
+  // 它与主操作位是**两件事**：登录是"能做的事"，不该顶掉"要做的事"。
+  // 已是最新时主操作位空着，登录照样给。
+  assert.equal(card.primary, undefined);
+  assert.equal(card.statusTone, "ok");
+});
+
+test("不给「登录」的三档：不支持登录、没装、正有任务在跑", () => {
+  // ① 工具本身不支持平台内登录。
+  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: false }) })).canLogin, false);
+  assert.equal(buildToolCard(input({ entry: entry({}) })).canLogin, false, "目录没给这个字段时不许当成支持");
+  // ② 没装：点进去服务端会 404，点亮一个必失败的按钮比不亮更坏。
+  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: true }), item: item({ installed: false, version: "" }) })).canLogin, false);
+  // ③ 正有任务在跑：界面此时什么都不给。
+  //    ⚠️ 2026-10-09 复查修正：这条原来写的理由是"服务端会拒"——**不成立**。
+  //    `runAgentLogin`（agent_login.go:44-77）没有维护闸门，只查 supportsLogin 与 backend
+  //    是否实现 loginAgentRunner；`beginAgentMaintenance` 只管 install/update/repair。
+  //    所以这一档是**界面自己收得更紧**，理由只能是"那个工具正在被替换，此刻发起的登录
+  //    会跑到半成品上"（顺带：卡片上的登录入口是唯一的入口，抽屉那颗 2026-10-08 已删，
+  //    于是这段时间全页没有登录入口）。要放开这一档，先确认登录流程能在替换期间安全跑完。
+  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: true }), item: item({ operation: "running" }) })).canLogin, false);
+});
+
+test("读数还在路上时不给「登录」", () => {
+  // 这一档要盖掉上一个执行环境留下的 item（loadView 重读时不清旧 view）——
+  // 照旧读数亮出「登录」，会是在一台还没读到的机器上按上一台的信息给动作。
+  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }), reading: true, item: item({ installed: true }) }));
+  assert.equal(card.canLogin, false);
+});
+
+test("「登录」不进 primary，因此也不参与横幅的任何一条分支", () => {
+  // 一个"已是最新、支持登录"的健康工具不该上横幅 —— 横幅只说"有事"。
+  const healthy = buildToolCard(input({ entry: entry({ supportsLogin: true }), latest: UP_TO_DATE }));
+  assert.equal(healthy.canLogin, true);
+  assert.equal(bannerFor([healthy]), undefined);
 });
 
 // ── 「能不能装」的三件事 ───────────────────────────────────────────────────
@@ -317,26 +362,70 @@ test("「最新版本」四态：读取中 / 读不到 / 读到 / 空版本号",
   assert.equal(latestVersionLine({ state: "ready", latest: "2.0.31", updateAvailable: true }, false).tone, "plain");
 });
 
-// 「运行依赖」那一行：**读不到最新版本不许说"已是最新"**。
+// 「运行依赖」那一行：文案与升级按钮**必须同源**。
 //
-// latestVersion 是服务端的 omitempty 字段，只在真取到 Node 版本索引时才有值；离线 /
-// registry 不可达时它为空，updateAvailable 也随之 false —— 只按 updateAvailable 二分，
-// 就会对着一个"根本没查成"的环境亮绿灯。这条用例把那一档单独钉住。
-test("运行依赖读数：读不到最新版本时不许写「已是最新」", () => {
+// 两条纪律合在一个用例里，因为它们曾经由两处各判各的（2026-10-09 修），而错位是可复现的：
+//
+//   ① 读不到最新版本的纪律（老的那一条）：latestVersion 是服务端的 omitempty 字段，
+//      只在真取到 Node 版本索引时才有值；离线 / registry 不可达时它为空，updateAvailable
+//      也随之恒为 false —— 只按 updateAvailable 二分，就会对着一个"根本没查成"的环境亮绿灯。
+//   ② 说了"可升级到 X"就得给出按钮，或者**在同一行说清为什么没有**。按钮原先由页面自己数
+//      `installSupported && updateAvailable && remoteInstallAllowed`，而那句话只看
+//      updateAvailable。两道判据一错位，未授权的 WSL 上就是真机实测的那个样子：
+//      读数说能升、按钮没了、那一行一个字都不解释（原因写在下面另一块讲「安装」的提示里）。
+test("运行依赖那一行：读不到不许说已是最新，说了可升级就得给出按钮或说出原因", () => {
   const base: RuntimeStatus = {
     id: "node", installed: true, version: "v20.11.0", npmVersion: "10.2.4", origin: "system",
     meetsMinimumFor: ["claude-code"], installSupported: true, updateAvailable: false,
   };
-  const unknown = runtimeLatestLine({ ...base, latestVersion: "" });
-  assert.equal(unknown.tone, "unknown");
-  assert.doesNotMatch(unknown.text, /已是最新/);
 
-  const ok = runtimeLatestLine({ ...base, latestVersion: "v22.14.0" });
+  // ① 读不到最新版本：灰档 + 不许写"已是最新"，也不给动作。
+  const unknown = runtimeDepLine({ ...base, latestVersion: "" }, true);
+  assert.deepEqual(unknown, { text: "读不到最新版本", tone: "unknown" });
+
+  // ① 已是最新：绿档、无动作（没有新版时不该有升级按钮）。
+  const ok = runtimeDepLine({ ...base, latestVersion: "v22.14.0" }, true);
   assert.deepEqual(ok, { text: "已是最新", tone: "ok" });
 
-  const update = runtimeLatestLine({ ...base, latestVersion: "v22.14.0", updateAvailable: true });
-  assert.equal(update.tone, "update");
-  assert.match(update.text, /v22\.14\.0/);
+  // ② 三道闸门全开：读数说得出升到哪，按钮**同一句话**给到（版本号不许两处各写一遍），
+  //    且按钮自己带着要发出去的那个动作（页面照它发请求，不自己写死一个 kind）。
+  const can = runtimeDepLine({ ...base, latestVersion: "v22.14.0", updateAvailable: true }, true);
+  assert.equal(can.text, "可升级到 v22.14.0");
+  assert.deepEqual(can.action, { kind: "install-runtime", label: "升级到 v22.14.0" });
+
+  // ② 未授权：按钮收回，缘由写在**同一行**的读数里。用户报的就是这一档。
+  const ungranted = runtimeDepLine({ ...base, latestVersion: "v22.14.0", updateAvailable: true }, false);
+  assert.equal(ungranted.action, undefined);
+  assert.match(ungranted.text, /可升级到 v22\.14\.0/); // "有新版本"这件事不许说丢
+  assert.match(ungranted.text, /需先授权在这台主机上安装/);
+  assert.equal(ungranted.tone, "update"); // 仍然是"有新版"那一档，不是"未知"
+
+  // ② 这个环境装不了运行时（跨端缺 tar/gzip、平台没有官方包）：服务端的理由原样念出来。
+  //    注意这一档传的是 remoteInstallAllowed=true —— 授权了也装不了，判据不是授权，
+  //    所以它必须先判（先判授权的话，这一档会说成"去授权就好了"，而授权解决不了它）。
+  const unsupported = runtimeDepLine({
+    ...base, latestVersion: "v22.14.0", updateAvailable: true,
+    installSupported: false, installBlockedReason: "缺少 tar 或 gzip，无法解压官方分发包",
+  }, true);
+  assert.equal(unsupported.action, undefined);
+  assert.match(unsupported.text, /缺少 tar 或 gzip/);
+  // ② 两道闸门**同时**关着（既没授权、这个环境又装不了）：必须报**先判的那一道**。
+  //    报成"需先授权"就是把人支去做错事 —— 用户点完「允许在此主机安装」，升级照样跑不起来，
+  //    而真正的原因（缺 tar/gzip）一个字都没露过面。
+  //    ⚠️ 这一条是 2026-10-09 独立复查补的：上面两个用例一个传 remoteInstallAllowed=true、
+  //    一个传 installSupported=true，**把两个 if 对调过来全都还是绿的** —— 也就是说
+  //    "次序有意"当时只是注释里的一句自称，没有任何断言在钉它。同时关着这一档才钉得住。
+  const bothBlocked = runtimeDepLine({
+    ...base, latestVersion: "v22.14.0", updateAvailable: true,
+    installSupported: false, installBlockedReason: "缺少 tar 或 gzip，无法解压官方分发包",
+  }, false);
+  assert.equal(bothBlocked.action, undefined);
+  assert.match(bothBlocked.text, /缺少 tar 或 gzip/);
+  assert.doesNotMatch(bothBlocked.text, /需先授权/);
+  // 服务端没给理由时给一句兜底 —— 不许退回成光秃秃的"可升级到 X"（那就又是没有原因）。
+  const unsupportedNoReason = runtimeDepLine({ ...base, latestVersion: "v22.14.0", updateAvailable: true, installSupported: false }, true);
+  assert.match(unsupportedNoReason.text, /装不了/);
+  assert.equal(unsupportedNoReason.action, undefined);
 });
 
 // ── 页面级汇总 ─────────────────────────────────────────────────────────────
@@ -371,6 +460,34 @@ test("横幅点名的那个工具，和真正能点「修好它」的那个是�
   }));
   const banner = bannerFor([healthy, sick]);
   assert.equal(banner?.agentID, "codex", "横幅点名的工具必须带着那个能修的动作");
+});
+
+// 「要留意」但平台修不了的那一档（服务端不下发 remedy：实测超时、包目录扫不动）
+// **也要上横幅**：卡片上那句「按详情里的证据手动处理」需要一条能打开抽屉的路，
+// 而卡片上的「详情」按钮已随这轮改动删除 —— 横幅是问题卡剩下的唯一入口。
+// （2026-10-08 修：删掉卡片按钮时漏了这一档，那些卡片的话变成了点不到的指引。）
+test("横幅：要留意但平台修不了的那一档也要上，只是不给「修好它」", () => {
+  const manualOnly = buildToolCard(input({
+    latest: UP_TO_DATE,
+    diagnosis: diagnosis({ issues: [{ code: "probe-timeout", severity: "warning", summary: "实测超时", evidence: ["…"], remedies: [] }] }),
+  }));
+  assert.equal(manualOnly.statusTone, "warn");
+  assert.equal(manualOnly.primary, undefined, "前提：服务端没给可修动作");
+  assert.match(manualOnly.note ?? "", /不能自动修/);
+  const banner = bannerFor([manualOnly]);
+  assert.match(banner?.text ?? "", /需要处理一下/, "这一档必须上横幅，否则它的卡片没有入口");
+  assert.equal(banner?.agentID, manualOnly.id);
+  assert.equal(banner?.actionLabel, undefined, "没有可修动作就不该给「修好它」");
+});
+
+// 反面：「可以更新到 v2」是另一件事，不该被当成"需要处理一下"。
+test("横幅：带更新动作的卡片不算「需要处理一下」", () => {
+  const updatable = buildToolCard(input({ latest: LATEST }));
+  assert.equal(updatable.statusTone, "warn", "前提：这一档的状态档与「要留意」同为 warn");
+  assert.equal(updatable.primary?.kind, "update");
+  // 它自己带着升级按钮，不是"有个问题要处理" —— 卡片上写着、按钮就在那儿，
+  // 没有"需要打开抽屉才能知道怎么办"这一档，因此整条横幅不出现。
+  assert.equal(bannerFor([updatable]), undefined);
 });
 
 // 「有新版本但升不了」这一档有四种成因，**四种都没有可修的动作**。
@@ -446,6 +563,9 @@ test("报告没有结论时，绝不说「已是最新，不用管它」", () =>
   assert.notEqual(card.statusText, "已是最新，不用管它。");
   // 面板里那句也要跟着结论走，而不是说"没有发现任何症状"。
   assert.ok(card.detailNotes.some((line) => /没有得出结论/.test(line)), card.detailNotes.join(" / "));
+  // 这一档 statusTone 是 unknown，不进 bannerFor 的任何分支 → 连横幅都不会为它出现。
+  // 没查成的原因只在抽屉里，所以卡片必须自带入口，否则永远点不开。
+  assert.equal(card.canOpenDetails, true);
 });
 
 test("没查成时，更新这一件事照样说（它是另一个读数）", () => {

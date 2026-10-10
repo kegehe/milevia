@@ -732,6 +732,11 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 已取消不再是分类（那颗胶囊去掉了），但任务不能因此静默消失：真存在的话在这行报出条数。
    非交互的一行说明，不放进可滚动区，免得被列表顶走之后没人再看见。 */
 .mobile-task-hidden { margin: 0; padding: 9px 2px 0; color: #587568; font-size: 12px; }
+/* 任务队列面板里那份失败原因（内容就是页面级那条 `.mobile-error` 的同一份 error）。
+   它是这一列 flex 的**固定项**（flex: none、并且在滚动区之外），列表滚到哪儿都看得见 ——
+   出错的常常是某一张卡，而卡片一滚出屏幕，这句原因就跟着找不着了。
+   配色与 `.mobile-task-modal-error` 逐字一致：同一类文案在两个层里不该长得不一样。 */
+.mobile-task-panel-error { flex: none; margin: 0 0 8px; border: 1px solid #f0cfc7; border-radius: 8px; padding: 9px 11px; color: #9b3e33; background: #fff4f1; font-size: 12.5px; line-height: 1.6; overflow-wrap: anywhere; }
 /* 任务列表的列宽必须夹住 —— 与 `.mobile-message-list` 是同一个坑（见 MOBILE-UI.md「列宽三闸」）。
    `.mobile-task-list` 是 display: grid，隐式列是 `auto`，其 growth limit 取**内容的 max-content**：
    一条 30 字的长标题就能把列顶到 510px（实测 390 屏：列表 362 / 卡片 510 / 删除按钮右缘 509），
@@ -976,6 +981,19 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 禁用态「浅底 + 深灰绿箭头」实测 3.5:1（更浅的 #93ab9f 只有 2.18:1，按钮会像丢了）。
    沿用刷新胶囊的定案：禁用/忙碌不走 opacity，半透明在浅色页面上会糊成一片。 */
 .mobile-composer .mobile-composer-send:disabled { color: #64857a; background: #e9f0ec; }
+/* 停止键：运行中出现在发送键**左边**（不是取代它 —— 跑着的时候还要能再发一条，
+   理由见 MobileRemotePage 里那段）。与发送键**不同**的是它带字，所以宽高都要放开：
+   上面那条 `width: 38px` 是给图标圆钮的，这里 width:auto + 内边距横向撑开，
+   纵向仍与两侧 38px 齐平（高度 38 由基类给）。
+   内边距收到 11px 是有代价意识的：这一颗要从输入框那里借走约 48px（"停止中"时 61px），
+   手机上输入框本来就窄，所以只留够"字不贴边"的余量，不再放方形图标（字已经说清了）。
+   配色沿用桌面端停止那一套（浅红底 / 深红字）。 */
+.mobile-composer .mobile-composer-stop { display: inline-flex; width: auto; align-items: center; padding: 0 11px; color: #963d2b; background: #fff3ef; box-shadow: inset 0 0 0 1px #e2a695; font-size: 13px; font-weight: 700; }
+/* 停止中：按钮自己禁掉（停止要等进程真的退出，期间再点会落在已经停掉的那一轮上），
+   但**不把颜色压到看不清** —— 它是这几秒里唯一在告诉用户"已经点到了"的东西。
+   #a86450 on #f9eeea 实测 4.0:1，比发送键禁用态的 3.5:1 还清楚一点：可用态 6.4:1，
+   这一档的落差要让人看出"点了但还没完"，不是"这颗按钮没了"。 */
+.mobile-composer .mobile-composer-stop:disabled { color: #a86450; background: #f9eeea; box-shadow: inset 0 0 0 1px #e8d3cc; }
 /* textarea 在 Chromium 里"只要聚焦就命中 :focus-visible"，画出来的是盒子内部的一圈描边，
    会和盒子自己的边框叠成双层；焦点指示改由 .mobile-composer-box:focus-within 承担
    （整盒变绿 + 3px 外发光，键盘用户同样看得见）。 */

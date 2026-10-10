@@ -5,10 +5,55 @@ import { asRecord } from "./api";
 import { contentToText, agentSummary, toolSummary, formatTokens, formatDuration } from "./utils";
 
 const ignoredCodexStderr = new Set(["Reading additional input from stdin..."]);
-// WSL 等字词是常见技术术语而非"未翻译的英文"，在纯中文错误里出现不应触发
-// "fallback：detail" 的前缀拼接（例如 wsl.exe 的 "wsl: 检测到 localhost 代理配置..."
-// 主机侧警告，本身是可读中文，无需再包一层"工具输出异常"）。
-const allowedTechnicalTerms = /\b(?:AI|API|CLI|Codex|Claude|Git|HTTP|ID|JSON|NAT|SSH|URL|WSL|wsl|localhost)\b/g;
+
+// allowedTechnicalTerms 是 app.go 的 containsUntranslatedEnglish 那份白名单的**逐词拷贝**
+// （13 个词，顺序也照抄）。localizedErrorDetail 是服务端那套本地化的镜像，判定必须与它
+// 完全一致 —— **包括这份表**，因为差异就出在表上。
+//
+// 2026-10-08 对齐：这里原先写的是"先 replace 掉一份术语表、再看还剩没有 [A-Za-z]{3,}"，
+// 与服务端有**两处**实测偏差：
+//  1. **表不同**：那份多了 NAT/localhost/wsl（服务端表里没有）、少了 NUL。于是
+//     `含 NUL 说明` 在服务端直通、在前端被套兜底；含 wsl 的则反过来。
+//  2. **断词规则不同**：Go 只按 ASCII 字母断词，`NUL2`/`NUL_x`/`JSON2`/`2NUL` 都含白名单词
+//     `NUL`/`JSON` 因而直通；而旧写法用的 `\b` 把数字与下划线也当作词字符，`NUL2` 既不被
+//     replace 掉、又整体是一个 ≥3 的字母段，被判成残留英文。上面四个形态实测在服务端
+//     全是直通（`ID_1` 也直通，但那是另一个原因：`ID` 只有 2 个字母，两侧都走不到这个分支）。
+//
+// 别凭记忆补词，也别改断词规则：timeline.test.ts 里有用例直接从 app.go 读出这份表逐词
+// 比对，另有一条钉住数字/下划线紧邻的形态。
+const allowedTechnicalTerms = new Set([
+  "AI", "API", "CLI", "Codex", "Claude", "Git", "HTTP", "ID", "JSON", "NUL", "SSH", "URL", "WSL",
+]);
+
+// rawOutputTerms 在 app.go 那份之外多了三个词（NAT / localhost / wsl 小写），**只**用于
+// 本地化根本不经手的那几条路径 —— 工具结果、Codex 的命令/文件输出、聚合后的原始 stderr。
+//
+// 它们与服务端无从对齐，因为服务端在这几条链上只做搬运、不做本地化：tool_result 与
+// item.* 是 CLI 事件原样转发，stderr 更是逐行发事件（remote_control.go 的
+// remoteNoticeTypesSQL 刻意不含 stderr）。所以"这条原始输出要不要包一层兜底"的口径由
+// 前端自己定，取宽一点：wsl.exe 的 UTF-16LE 主机侧警告
+// 「wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost
+// 代理。」本身已经是可读中文 —— 而这三个词**不在**服务端白名单里（实测：服务端会把它判成
+// 残留英文并套兜底前缀），多包一层"工具输出异常：…"只会把这条可读的中文弄坏。
+//
+// 反过来，**服务端本地化过**的文案（run.failed / error / turn.failed / stream.error 的
+// detail）一律走 allowedTechnicalTerms，与 app.go 严格同表 —— 那些文案在服务端已经被
+// containsUntranslatedEnglish 判过一道，前端再判时换表就会让两端形态分叉。
+const rawOutputTerms = new Set([...allowedTechnicalTerms, "NAT", "localhost", "wsl"]);
+
+// hasUntranslatedEnglish 与 app.go 的 containsUntranslatedEnglish **逐字同构**：按 ASCII
+// 字母切出连续字母段，「长度 ≥ 3 且不在白名单里」才算残留英文。
+//
+// 两个不许动的细节：
+//  - **不用 \b 断词**。JS 的 \b 把数字与下划线也算 \w，于是 `NUL2`、`NUL_x` 会被切出
+//    一个不在表里的 `NUL2`，与服务端的 `NUL` 判决相反（Go 只认字母）。见文件顶部第 2 条。
+//  - **门槛是 ≥ 3**。1~2 个字母的拉丁片段（no / px / os …）两侧都放过，不要"顺手收紧"。
+function hasUntranslatedEnglish(value: string, allowed: Set<string> = allowedTechnicalTerms): boolean {
+  for (const word of value.match(/[A-Za-z]+/g) || []) {
+    if (word.length >= 3 && !allowed.has(word)) return true;
+  }
+  return false;
+}
 
 function isIgnoredCLIStderr(message: string): boolean {
   return ignoredCodexStderr.has(message.trim());
@@ -43,7 +88,11 @@ function isInternalError(message: string): boolean {
   return message.includes(".go:") || message.includes("panic:") || message.includes("goroutine");
 }
 
-function localizedErrorDetail(value: unknown, fallback: string): string {
+// allowed 只在"本地化不经手"的原始输出那几条链上传 rawOutputTerms；凡是服务端已经判过的
+// 文案（run.failed / error / turn.failed / stream.error 的 detail）都用默认表，与 app.go
+// 严格同表。传错表不会报错，只会让同一条错误在两端形态不同 —— 动这个参数前先看上面
+// rawOutputTerms 的说明。
+function localizedErrorDetail(value: unknown, fallback: string, allowed: Set<string> = allowedTechnicalTerms): string {
   const detail = typeof value === "string" ? value.trim() : "";
   if (!detail) return fallback;
   // Internal Go errors (stack traces, panics) — keep the fallback only.
@@ -55,17 +104,17 @@ function localizedErrorDetail(value: unknown, fallback: string): string {
   // —— 同一个错误在两端的形态不一致，正是这个文件反复强调要避免的那件事
   // （2026-09-29 对齐：原来这一条排在中文分支之后）。
   if (isInternalError(detail)) return fallback;
-  // 含中文时按 server 侧 localizedErrorText 的**同一条判据**决定要不要套兜底前缀：
-  // 有“失败”就直通，否则要求剔除技术术语后没有残留英文。
+  // 含中文时按 app.go 的 localizedErrorText 的**同一条**判据决定要不要套兜底前缀：
+  // 含“失败”就直通，否则跑 hasUntranslatedEnglish（与 containsUntranslatedEnglish 同一套
+  // 算法、同一份词表），没有残留英文才直通。
   //
   // 那个“失败”分支不是可有可无的：进程退出这类错误的真实形态是「中文包装 + Go 的
   // 英文退出描述」（如 “Codex 运行失败：exit status 1”），只有它能让这句直通；
   // 少了它，桌面端与手机端会在同一条错误上给出不同形态（这里多套一层“请查看任务日志
-  // 后重试。”，服务端那边不套）——镜像必须与 app.go 逐条对齐。
+  // 后重试。”，服务端那边不套）——判据必须与 app.go 逐条对齐。
   if (/[\u4e00-\u9fff]/.test(detail)) {
     if (detail.includes("失败")) return detail;
-    const withoutTechnicalTerms = detail.replace(allowedTechnicalTerms, "");
-    if (!/[A-Za-z]{3,}/.test(withoutTechnicalTerms)) return detail;
+    if (!hasUntranslatedEnglish(detail, allowed)) return detail;
   }
   // English or mixed-language errors \u2014 keep the fallback as a prefix, then
   // append the original error so users can see the real cause.
@@ -74,6 +123,9 @@ function localizedErrorDetail(value: unknown, fallback: string): string {
 
 // Codex emits top-level failures as JSONL events. Depending on the failure
 // phase, its diagnostic is a string or a nested error object.
+//
+// 目前没有调用点（实际走的是导出的 eventDiagnostic）。真要启用它，先决定该配哪张词表：
+// 原始 CLI 事件传 rawOutputTerms，服务端已判过的 detail 用默认表。
 function eventErrorDetail(payload: Record<string, any>): string {
   const nestedError = asRecord(payload.error);
   return localizedErrorDetail(firstText(
@@ -273,7 +325,7 @@ export function eventDiagnostic(event: Event): EventDiagnostic | null {
 export function cliOutputDiagnostic(messages: string[]): { title: string; detail: string } | null {
   const kept = messages.map((message) => message.trim()).filter((message) => message && !isIgnoredCLIStderr(message));
   if (kept.length === 0) return null;
-  return { title: "CLI 输出", detail: localizedErrorDetail(kept.join("\n"), "工具输出异常，请查看任务日志后重试。") };
+  return { title: "CLI 输出", detail: localizedErrorDetail(kept.join("\n"), "工具输出异常，请查看任务日志后重试。", rawOutputTerms) };
 }
 
 export function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
@@ -287,7 +339,7 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
         if (part?.type === "tool_result" && part.tool_use_id) {
           const isError = Boolean(part.is_error);
           const content = contentToText(part.content);
-          results.set(String(part.tool_use_id), { content: isError ? localizedErrorDetail(content, "工具执行失败，请查看任务日志后重试。") : content, isError });
+          results.set(String(part.tool_use_id), { content: isError ? localizedErrorDetail(content, "工具执行失败，请查看任务日志后重试。", rawOutputTerms) : content, isError });
         }
       }
     }
@@ -367,7 +419,7 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
       name: itemType === "command_execution" ? "终端命令" : "文件修改",
       input,
       createdAt: existing?.createdAt || event.createdAt,
-      output: event.type === "item.completed" ? { content: failed ? localizedErrorDetail(outputText, "命令执行失败，请查看任务日志后重试。") : outputText || "已完成", isError: failed } : existing?.output,
+      output: event.type === "item.completed" ? { content: failed ? localizedErrorDetail(outputText, "命令执行失败，请查看任务日志后重试。", rawOutputTerms) : outputText || "已完成", isError: failed } : existing?.output,
       runStatus: runStatuses.get(event.runId),
     });
   }
@@ -481,7 +533,7 @@ export function buildAgentExecutions(events: Event[]): AgentExecution[] {
         const ownerID = toolOwners.get(part.tool_use_id);
         const isError = Boolean(part.is_error);
         const output = contentToText(part.content);
-        appendLog(ownerID, { id: event.id + part.tool_use_id, createdAt: event.createdAt, kind: "result", title: isError ? "工具失败" : "工具结果", detail: isError ? localizedErrorDetail(output, "工具执行失败，请查看任务日志后重试。") : output, isError });
+        appendLog(ownerID, { id: event.id + part.tool_use_id, createdAt: event.createdAt, kind: "result", title: isError ? "工具失败" : "工具结果", detail: isError ? localizedErrorDetail(output, "工具执行失败，请查看任务日志后重试。", rawOutputTerms) : output, isError });
         const agent = nodes.get(part.tool_use_id);
         if (agent) agent.status = part.is_error ? "failed" : "completed";
       }

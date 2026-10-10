@@ -113,35 +113,55 @@ func (s *Server) probeAgent(ctx context.Context, meta RunnerMeta, entry AgentCat
 // 返回 nil 表示探测不了，第二项是给用户的原因（空串 = 运行器自身未注册，
 // 属于防御分支：register 会同时写入 metas 与 runners，因此正常不会出现）。
 //
-// ⚠️ 这里的 codex 特判就是 docs/42 §2.3 记的耦合点（本机走 codexRunner、
-// 远端走 CodexCapableRunner），会在引入 Runtime 适配层时收敛。本期只把原先
-// 重复两遍的这段收成一份 —— 从两份变一份，而不是把它继续扩散。
+// 分派的顺序与理由（这一处是"某工具在某条路径上莫名不可用"的高发地，所以写清楚）：
+//
+//	① 本机的 Codex / CodeBuddy 由各自独立的管理 runner 提供 —— 它们与注册表里那个
+//	   Claude runner **不是同一个进程面**（Codex 走一次性 exec、CodeBuddy 走
+//	   stream-json 会话）。这是结构差异，不是"哪个工具特殊"。
+//	② Codex / Claude 这两个**真有额外语义**的走特化：
+//	   - Codex 的"就绪"要看登录态（`codex login status`），仅测能不能报版本会把
+//	     "装了但没登录"报成就绪；
+//	   - Claude 的跨端探测键（claude-version / `claude auth status`）与读数缓存已被
+//	     WSL 的保活唤醒（refreshFailedProbes）依赖着，改走目录驱动会另起一套探测键
+//	     （同一件事探两遍），并把就绪判据从"登录态"放宽成"能报版本"。
+//	③ **其余一律走目录驱动**（catalogAgentBackend）。这是本函数原先那句"从两份变一份，
+//	   而不是把它继续扩散"的落点：目录里新增一个工具，只要目标端的 runner 能跑 shell，
+//	   就自动可用 —— 不必再在 wsl/ssh 两个 runner 上各加一组方法。
+//
+// ③ 生效前后最直接的一个差别：CodeBuddy 在跨端不再是"跨端管理尚未接通"（那一档
+// 判成 unsupported，于是管理页连「安装」按钮都不给），而是如实报"未安装"并给出安装入口。
 func (s *Server) agentBackend(meta RunnerMeta, entry AgentCatalogEntry) (AgentRunner, string) {
-	if entry.ID == "codex" && isLocalRunnerID(meta.ID) {
-		// 本机 Codex 不经过 runnerRegistry：它由独立的 codexRunner 提供。
-		return s.codexRunner, ""
-	}
-	if entry.ID == "codebuddy" {
-		// 本机 CodeBuddy 由独立的管理面 runner 提供探测/版本/升级；跨端（WSL/SSH）
-		// 的 CodeBuddy 运行与探测待阶段 2/3 接通，先如实报"未接通"，绝不用通用
-		// runner 的（claude/codex）版本冒充 codebuddy 的版本。
-		if isLocalRunnerID(meta.ID) {
+	if isLocalRunnerID(meta.ID) {
+		switch entry.ID {
+		case "codex":
+			// 本机 Codex 不经过 runnerRegistry：它由独立的 codexRunner 提供。
+			return s.codexRunner, ""
+		case "codebuddy":
+			// 本机 CodeBuddy 由独立的管理面 runner 提供。
 			return s.codebuddyRunner, ""
 		}
-		return nil, fmt.Sprintf("%s 跨端管理尚未接通", entry.Name)
 	}
 	runner, registered := s.runnerRegistry.get(meta.ID)
 	if !registered {
 		return nil, ""
 	}
-	if entry.ID == "codex" {
+	switch entry.ID {
+	case "codex":
 		codexR, ok := runner.(CodexCapableRunner)
 		if !ok {
 			return nil, fmt.Sprintf("此 Runner 不支持 %s", entry.Name)
 		}
 		return codexRunnerAdapter{codexR}, ""
+	case "claude-code":
+		// 注册表里这个 runner 本身就是 Claude 的执行面（跨端亦然）。
+		return runner, ""
 	}
-	return runner, ""
+	if shell, ok := runner.(crossShellRunner); ok {
+		return &catalogAgentBackend{entry: entry, shell: shell}, ""
+	}
+	// 这个 runner 连"在目标环境里跑一条命令"都提供不了（如 WSL→Windows 那条方向，
+	// 见 docs/42 §17.7）。如实说"尚未接通"，不用另一个工具的读数冒充它。
+	return nil, fmt.Sprintf("%s 在 %s 上的管理尚未接通", entry.Name, meta.Name)
 }
 
 // agentUnavailableReason 给出"装了但用不了 / 没装"的确切说法。

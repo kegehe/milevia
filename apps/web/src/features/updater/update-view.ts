@@ -63,6 +63,20 @@ export function downloadPercent(status: UpdaterStatus | null): number | null {
   return Math.min(100, Math.max(0, Math.round((received / total) * 100)));
 }
 
+/**
+ * 后台静默下载失败的原因（Rust 侧已本地化，见 `localize_update_error` 的
+ * `UpdateStage::Download`）；没失败、或老版本 Rust 不带这个字段时为 null。
+ *
+ * 这个字段存在的唯一理由就是被显示出来：静默下载失败时界面只剩"后台下载未完成，
+ * 点击后重新下载"这句话，用户拿不到任何原因，只能瞎点。所以它必须出现在
+ * **每一个**说"下载未完成"的地方（设置页描述、横幅、托盘）。
+ */
+export function downloadFailureReason(status: UpdaterStatus | null): string | null {
+  if (downloadPhase(status) !== "failed") return null;
+  const error = status?.download?.error;
+  return typeof error === "string" && error.trim() ? error.trim() : null;
+}
+
 export type BannerUpdate =
   | { kind: "none" }
   | { kind: "ready"; update: UpdateInfo }
@@ -143,8 +157,14 @@ export function settingsUpdateDescription(
         percent == null ? "" : `（${percent}%）`
       }，完成后即可一键安装。`;
     }
-    case "failed":
-      return `发现新版本 v${update.version}：后台下载未完成，点击「立即升级」重新下载。`;
+    case "failed": {
+      // 失败原因如实带出来：只说"后台下载未完成"，用户没法判断是网络问题还是
+      // 更新源出了问题，也就没法决定是重试还是等一会儿。
+      const reason = downloadFailureReason(status);
+      return `发现新版本 v${update.version}：后台下载未完成${
+        reason ? `（${reason}）` : ""
+      }，点击「立即升级」重新下载。`;
+    }
     default:
       return `发现新版本 v${update.version}${notes}`;
   }

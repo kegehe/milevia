@@ -3,14 +3,13 @@
 
 import { FormEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useParams, useNavigate, useSearchParams, useOutletContext } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams, useOutletContext, useLocation } from "react-router-dom";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "../markdown.css";
 import "../permission.css";
 import "../conversation.css";
-import "../stop.css";
 import "../tasks.css";
 import "../git.css";
 import "../run.css";
@@ -51,6 +50,8 @@ import {
   readClosedConversationIds, clearConversationTabClosed, markConversationTabClosed, readConversationTabs, writeConversationTabs, type ConversationTabsState,
 } from "../lib/conversation-tabs";
 import { readConversationPanels, writeConversationPanels, type ConversationPanelKey, type ConversationPanelsState } from "../lib/conversation-panels";
+import { modelList } from "../lib/model-options";
+import { dialogParamURL } from "../lib/dialog-params";
 import { copyToClipboard } from "../lib/clipboard";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
@@ -436,9 +437,15 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
   };
 
   const selectedLabel = selected || view?.effective || "";
+  // 候选项可能整个缺席：服务端把"该工具没有模型目录"（CodeBuddy）表示成空目录，而
+  // Go 的 nil 切片会序列化成 null —— 只把可选链挂在外层对象上、随后直接读字段的
+  // length（改动前的写法），遇到 null 就会抛 "reading 'length'"，把整个工作区面板
+  // 打成兜底 UI。空目录照旧走下面的"没有可用的候选项"分支，自定义输入始终可用。
   // 打开弹层前还不知道来源（要等 /models 回来），所以只说确定的事，不猜"跟随 CLI 默认"。
   const sourceHint = selected ? "本会话指定" : "跟随配置";
   const customValid = /^[A-Za-z0-9][A-Za-z0-9._:@/+-]*$/.test(custom.trim());
+  // 目录缺席（null）与空目录（[]）在界面上是同一件事：没有候选项可选，走自定义输入。
+  const modelOptions = modelList(view);
 
   return <>
     <button ref={triggerRef} type="button" className={`composer-usage-model composer-model-trigger${open ? " open" : ""}${busy ? " busy" : ""}`} title={selected ? `${agentName} 模型：${displayed}（本会话指定，点击切换）` : `${agentName} 模型：${displayed}（${sourceHint}，点击切换）`} aria-haspopup="dialog" aria-expanded={open} disabled={disabled} onClick={() => void toggle()}>
@@ -450,7 +457,7 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
         <span><b>跟随配置</b><small>{view?.source === "profile" && view.effective ? `当前：${view.effective}` : "使用项目配置 / CLI 默认模型"}</small></span>
       </button>
       {loading && !view ? <p className="model-menu-loading">正在读取可用模型…</p> : <>
-        {view?.models.length ? <ul className="model-menu-list">{view.models.map((option: AgentModelOption) => <li key={option.id}>
+        {modelOptions.length ? <ul className="model-menu-list">{modelOptions.map((option: AgentModelOption) => <li key={option.id}>
           <button type="button" className={`model-menu-item${selected === option.id ? " selected" : ""}`} disabled={busy} title={option.description || option.id} onClick={() => void choose(option.id)}>
             <span><b>{option.label || option.id}{option.alias && <em className="model-menu-alias">别名</em>}</b>{option.label && option.label !== option.id && <small>{option.id}</small>}</span>
           </button>
@@ -619,6 +626,9 @@ function UsageDialog({ agentID, usage, currentRun, close }: { agentID: AgentID; 
   }, []);
   if (usage && !usage.available) return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><UsageDialogHeader agentName={agentName} close={close} /><div className="usage-body usage-unavailable"><p className="usage-note">{usage.reason || "当前工具未提供可验证的使用统计。"}</p></div><footer><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
   const task = usage?.currentRun ?? usage?.latestRun;
+  // 与模型选择器同一条规矩：按模型聚合的用量可能是 null（Go 的 nil 切片），
+  // 只对 usage 做可选链时这里同样会在 null 上读 .length 抛错。
+  const modelUsage = modelList(usage);
   const active = Boolean(usage?.currentRun && usage.currentRun.status === "running");
   const hasTaskUsage = Boolean(task?.hasResult);
   const metrics = task ? [
@@ -643,7 +653,7 @@ function UsageDialog({ agentID, usage, currentRun, close }: { agentID: AgentID; 
     <section className="usage-context-overview"><div><span>当前会话上下文</span><b>{contextDetail}</b></div><span className={`context-state ${contextLevel(context)}`}>{contextLabel(context)}</span>{contextWindow > 0 && <div className={`usage-context-meter ${contextLevel(context)}`} aria-label={`上下文使用 ${contextPercent}%`}><i style={{ width: `${contextPercent}%` }} /></div>}</section>
     <section className="usage-section"><div className="usage-section-head"><h3>当前任务</h3>{task?.model && <span className="usage-model-label" title={task.model}>{task.model}</span>}</div>{task ? <><dl className="usage-grid task-usage-grid">{metrics.map(([label, value]) => <div key={String(label)} className={label === "状态" ? `usage-metric-status ${active ? "running" : task.status}` : ""}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>{!hasTaskUsage && !active && <p className="usage-note">{task.reason || `该任务未获得 ${agentName} 的最终统计数据。`}</p>}</> : <p className="usage-note">当前会话还没有可用的任务统计。</p>}</section>
     {session && <section className="usage-section"><div className="usage-section-head"><h3>当前会话</h3><span>{session.taskCount} 次任务</span></div><dl className="usage-grid session-grid"><div><dt>Agent 轮次</dt><dd>{session.agentTurns}</dd></div><div><dt>模型步骤</dt><dd>{session.modelSteps}</dd></div><div><dt>工具调用</dt><dd>{session.toolCalls}</dd></div><div><dt>输入 / 输出</dt><dd>{formatTokens(session.inputTokens)} / {formatTokens(session.outputTokens)}</dd></div><div><dt>缓存读取 / 创建</dt><dd>{formatTokens(session.cacheReadTokens)} / {formatTokens(session.cacheCreationTokens)}</dd></div><div><dt>费用估算</dt><dd>{formatCost(session.estimatedCostUsd)}</dd></div></dl></section>}
-    {usage?.models.length ? <section className="usage-section"><div className="usage-section-head"><h3>模型用量</h3><span>包含子代理</span></div><div className="model-usage-list">{usage.models.map((model) => <div key={model.model}><b>{model.model}</b><span>{formatTokens(model.inputTokens)} 输入 · {formatTokens(model.outputTokens)} 输出</span><em>{formatCost(model.estimatedCostUsd)}</em></div>)}</div></section> : null}
+    {modelUsage.length ? <section className="usage-section"><div className="usage-section-head"><h3>模型用量</h3><span>包含子代理</span></div><div className="model-usage-list">{modelUsage.map((model) => <div key={model.model}><b>{model.model}</b><span>{formatTokens(model.inputTokens)} 输入 · {formatTokens(model.outputTokens)} 输出</span><em>{formatCost(model.estimatedCostUsd)}</em></div>)}</div></section> : null}
     <p className="usage-disclaimer">费用为客户端事件估算值，不代表账单金额。</p>
   </div><footer><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
 }
@@ -1207,24 +1217,45 @@ const MessageList = memo(function MessageList({ timeline, agentID, fail, resolvi
 export default function ConversationPage() {
   const { projectId, conversationId: urlConversationId } = useParams<{ projectId: string; conversationId: string }>();
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
+  const location = useLocation();
   const { api: projectApi, setError, getConversationDraft, saveConversationDraft, flushConversationDraft } = useProjectContext();
   const { appPreferences, appPreferencesLoading, appPreferencesError } = useUIPreferences();
   const { project } = useOutletContext<ProjectLayoutOutletContext>();
   const fail = setError;
-  // 弹窗控制辅助函数 — 使用不可变模式创建新的 URLSearchParams
-  const closeHistory = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("history"); return next; });
-  const closeNewConversation = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("new"); return next; });
-  const closeUsage = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("usage"); return next; });
-  const closeAgentExecution = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("execution"); return next; });
-  const openUsage = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("usage", "true"); return next; });
-  const openNewConversationParam = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("new", "true"); return next; });
+  // 弹窗参数的开关 —— 全部经下面两个函数，不再直接调 setSearchParams。
+  //
+  // setSearchParams 按**相对路径**解析，基准是闭包里的 location；而关闭弹窗的调用常常
+  // 发生在 await 之后（resetConversationView 由 loadConversation / newConversation 收尾
+  // 时调用），闭包还停在旧会话上，算出来的地址会把用户推回上一个会话、并复活它 search 里
+  // 的弹窗参数。实测：点「创建会话」后 URL 又跳回旧会话 + ?new=true，新会话弹窗重新打开，
+  // 用户以为没建成，反复点 → 攒出一堆空会话（诊断见 lib/dialog-params.ts 的文件头）。
+  //
+  // 因此这里：用 locationRef（**最新** location）算绝对地址；没有要改的参数就不发导航。
+  // 开＝push（Back 能关弹窗，维持原有语义），关＝replace（关弹窗不该往历史里塞条目）。
+  const locationRef = useRef({ pathname: location.pathname, search: location.search });
+  locationRef.current = { pathname: location.pathname, search: location.search };
+  const openDialogParam = useCallback((name: string, value = "true") => {
+    const target = dialogParamURL(locationRef.current, name, value);
+    if (target) navigate(target);
+  }, [navigate]);
+  const closeDialogParam = useCallback((name: string) => {
+    const target = dialogParamURL(locationRef.current, name, null);
+    if (target) navigate(target, { replace: true });
+  }, [navigate]);
+  // 弹窗控制辅助函数 — 名字保持原样，调用处不必改。
+  const closeHistory = () => closeDialogParam("history");
+  const closeNewConversation = () => closeDialogParam("new");
+  const closeUsage = () => closeDialogParam("usage");
+  const closeAgentExecution = () => closeDialogParam("execution");
+  const closeAiConfig = () => closeDialogParam("config");
+  const openUsage = () => openDialogParam("usage");
+  const openNewConversationParam = () => openDialogParam("new");
   const openAiConfig = () => {
     if (readOnlyConversation) return;
-    setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("config", "true"); return next; });
+    openDialogParam("config");
   };
-  const closeAiConfig = () => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("config"); return next; });
-  const openExecutionParam = useCallback((runId: string) => setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("execution", runId); return next; }), [setSearchParams]);
+  const openExecutionParam = useCallback((runId: string) => openDialogParam("execution", runId), [openDialogParam]);
 
   // 对话核心状态
   const [conversation, setConversation] = useState<Conversation | null>(null);
@@ -1642,12 +1673,13 @@ export default function ConversationPage() {
     if (addFileHandledRef.current === dedupKey) return;
     addFileHandledRef.current = dedupKey;
     sessionStorage.removeItem("milevia_add_file_to_chat");
-    // 清除 URL 中的 addFile 参数
-    setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete("addFile"); return next; });
+    // 清除 URL 中的 addFile 参数（同样走 dialogParamURL：这个 effect 会在 URL 变化后重跑，
+    // 直接 setSearchParams 会照闭包里的旧 location 算地址）
+    closeDialogParam("addFile");
     // 将文件路径追加到输入框
     const prefix = textRef.current.trim() ? `${textRef.current}\n` : "";
     setComposerText(`${prefix}@${filePath} `, conversation.id);
-  }, [projectId, conversation?.id, searchParams, setSearchParams, setComposerText]);
+  }, [projectId, conversation?.id, searchParams, closeDialogParam, setComposerText]);
 
   useEffect(() => () => {
     const conversationID = conversationRef.current?.id;
@@ -1835,7 +1867,7 @@ export default function ConversationPage() {
   }, [projectId, projectApi]);
 
   const openConversationHistory = () => {
-    setSearchParams((prev) => { const next = new URLSearchParams(prev); next.set("history", "true"); return next; });
+    openDialogParam("history");
     void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
   };
 
@@ -3092,10 +3124,11 @@ export default function ConversationPage() {
 	      if (item.status === "archived") {
 	        await reopenArchivedConversation(item.id);
 	      }
-	      // 顺序不能反：closeHistory 走 setSearchParams，而它是**相对当前 location** 解析的，
-	      // 闭包里的 pathname 还是旧会话。先切 Tab 再关弹窗的话，这次 setSearchParams 会把刚 push
-	      // 出去的新会话 URL 覆盖回旧会话 —— 现象就是"在历史弹窗里点另一个会话，怎么点都切不过去"
-	      // （探针抓到的两次 pushState：c2 之后立刻又推 c1）。先关弹窗只动 search，再切会话定路径。
+	      // 顺序不能反：closeHistory 按 locationRef 里的**最新 location** 拼绝对地址，而
+	      // locationRef 要等路由变化引发下一次渲染才更新 —— 同一次点击里先切 Tab 再关弹窗，
+	      // 它拿到的仍是旧会话的 pathname，会把刚 push 出去的新会话 URL replace 回旧会话。
+	      // 现象就是"在历史弹窗里点另一个会话，怎么点都切不过去"（探针抓到的两次 pushState：
+	      // c2 之后立刻又推 c1）。先关弹窗只动 search，再切会话定路径。
 	      closeHistory();
 	      selectConversationTab(item.id);
 	    } catch (cause) {

@@ -374,16 +374,20 @@ export default function OrchestrationPage() {
 	const mainBranchValid = validOrchestrationBranch(batchPolicy.mainBranch.trim());
 	const devBranchValid = validOrchestrationBranch(batchPolicy.devBranch.trim());
 	const maxFixRoundsValid = validMaxFixRounds(batchPolicy.maxFixRounds);
-	// 「直接写入」的前置条件。服务端只接受本地 runner 跑自动编排
-	// （isLocalRunnerID：windows-local / wsl-local 或空），这里做同一判断，
-	// 免得用户在远端项目上选完才吃 400/409。
+	// 「直接写入」的前置条件。服务端只接受**服务端本机 runner** 的项目跑自动编排
+	// （app.go isLocalRunnerID：Windows 服务端是 ""/windows-local，其余平台是 ""/wsl-local），
+	// 判据按平台而定，所以这里读服务端下发的 project.localRunner，不自己按 runner id 拼。
+	// 自己拼的代价不是 400 而是派发期 needs_human：Windows 服务端上的 wsl-local 项目会先
+	// 过这道闸门、建出计划，然后在 orchestration.go 的派发前置检查上失败并冻结整个项目队列。
+	// 旧服务端不下发这一位时取不到值 → 判为"不是本机"（禁用这个模式）：宁可少给一个模式，
+	// 也不要在"不知道"的时候给出一个可能必失败的模式。
 	const batchProject = projects.find((item) => item.id === projectId) || null;
-	const localRunner = !batchProject || batchProject.runner === "" || batchProject.runner === "windows-local" || batchProject.runner === "wsl-local";
+	const localRunner = !batchProject || batchProject.localRunner;
 	const currentBranchName = branchOptions.find((branch) => branch.current)?.name || "";
 	const targetBranchDraft = batchPolicy.targetBranch.trim();
 	const directModeSelected = batchPolicy.executionMode === "branch";
 	const directModeBlockedReason = !localRunner
-		? "「直接写入」目前只支持本地运行器的项目。"
+		? "「直接写入」只支持运行在服务端本机运行器上的项目；当前项目在远端或其他运行器上（例如 Windows 服务端上的 WSL 项目）。"
 		: branchOptionsError
 			? `无法读取项目分支列表：${branchOptionsError}`
 			: branchOptions.length === 0

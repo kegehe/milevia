@@ -1102,6 +1102,12 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusInternalServerError, projectErr)
 			return
 		}
+		// 派发前置检查（prepareAndDispatchOrchestrationJob）只认服务端本机 runner，
+		// 非本机项目在这里就拒掉，理由同上：等到派发才说，代价是整个项目队列被冻结。
+		if !isLocalRunnerID(project.Runner) {
+			writeError(w, http.StatusBadRequest, errors.New("direct mode requires a project on the server's own runner"))
+			return
+		}
 		if err := s.gitCommand(r.Context(), project.Path, "show-ref", "--verify", "--quiet", "refs/heads/"+input.TargetBranch); err != nil {
 			writeError(w, http.StatusConflict, fmt.Errorf("direct mode requires an existing local branch: %s", input.TargetBranch))
 			return

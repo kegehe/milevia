@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { createRunCommand, isRunnableCommand, runCommandLabel, runLogPresentation, runLogText, selectedRunCommand, withRunCommands, type RunConfig } from "./run-model.ts";
+import { createRunCommand, isRunnableCommand, renameEnvironmentVariable, runCommandLabel, runLogPresentation, runLogText, selectedRunCommand, withRunCommands, type RunConfig } from "./run-model.ts";
 
 function baseConfig(overrides: Partial<RunConfig> = {}): RunConfig {
 	return { workDir: "", command: "", envVars: {}, executionTarget: "auto", commands: [], selectedCommandId: "", ...overrides };
@@ -67,6 +67,40 @@ test("keeps the selected command valid and the command mirror in sync on every e
 	const original = baseConfig({ commands, selectedCommandId: "a" });
 	withRunCommands(original, [], "");
 	assert.equal(original.selectedCommandId, "a");
+});
+
+test("renames an environment variable without clobbering its namesake", () => {
+	const envVars = { PATH: "/usr/bin", PWD: "/home/app" };
+
+	// 改名成已存在的键：拒绝，而不是把 PWD 的值悄悄覆盖掉。
+	assert.deepEqual(renameEnvironmentVariable(envVars, "PATH", "PWD"), { ok: false, reason: "duplicate" });
+	assert.equal(envVars.PWD, "/home/app");
+
+	// 正常改名成功，且这一行留在原来的位置（不因"删旧键再追加"跳到末尾）。
+	const renamed = renameEnvironmentVariable(envVars, "PATH", "NODE_PATH");
+	assert.deepEqual(renamed, { ok: true, envVars: { NODE_PATH: "/usr/bin", PWD: "/home/app" } });
+	assert.ok(renamed.ok);
+	// deepEqual 不看键序，行序要单独钉：键序就是界面上的行序。
+	assert.deepEqual(Object.keys(renamed.envVars), ["NODE_PATH", "PWD"]);
+	// 原表不被就地修改。
+	assert.deepEqual(envVars, { PATH: "/usr/bin", PWD: "/home/app" });
+
+	// 首尾空白由改名收敛掉，据此判重。
+	assert.deepEqual(renameEnvironmentVariable(envVars, "PATH", "  PWD  "), { ok: false, reason: "duplicate" });
+	assert.deepEqual(renameEnvironmentVariable(envVars, "PATH", "  HOME  "), { ok: true, envVars: { HOME: "/usr/bin", PWD: "/home/app" } });
+
+	// 键名被清空时不落库（空键名后端会判成非法），框里可以清空但不能就此产生一条无名变量。
+	assert.deepEqual(renameEnvironmentVariable(envVars, "PATH", "   "), { ok: false, reason: "empty" });
+	// 没改、或那一行已经不在了：同样不改动变量表。
+	assert.deepEqual(renameEnvironmentVariable(envVars, "PATH", "PATH"), { ok: false, reason: "unchanged" });
+	assert.deepEqual(renameEnvironmentVariable(envVars, "GONE", "OTHER"), { ok: false, reason: "missing" });
+
+	// `__proto__` 是合法的 POSIX 变量名（后端 isPosixEnvName 放行）。重建映射时若写成
+	// `next[新键] = 值`，这一项会被原型 setter 吃掉、变量凭空消失，所以走 Object.fromEntries。
+	const proto = renameEnvironmentVariable({ PATH: "/usr/bin" }, "PATH", "__proto__");
+	assert.deepEqual(proto, { ok: true, envVars: Object.fromEntries([["__proto__", "/usr/bin"]]) });
+	assert.ok(proto.ok);
+	assert.equal(Object.prototype.hasOwnProperty.call(proto.envVars, "__proto__"), true);
 });
 
 test("labels a command by name, then by its text, then by position", () => {

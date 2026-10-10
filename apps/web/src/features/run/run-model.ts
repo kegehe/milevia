@@ -72,6 +72,31 @@ export function withRunCommands(config: RunConfig, commands: RunCommand[], selec
 	return { ...config, commands, selectedCommandId: selected?.id || '', command: selected?.command || '' };
 }
 
+/** 改名的结果。成功时才带出新的变量表（判别式联合，调用方 `if (result.ok)` 之后拿到的就是
+ *  非空的新表），失败时只给原因。 */
+export type EnvironmentVariableRename =
+	| { ok: true; envVars: Record<string, string> }
+	/** empty：新键名为空；duplicate：新键名已被别的变量占用；unchanged/missing：无需改名。 */
+	| { ok: false; reason: "empty" | "duplicate" | "unchanged" | "missing" };
+
+/** 改一条环境变量的键名。成功时带出新的变量表，失败时给出原因供界面提示。
+ *
+ *  键名冲突必须在这里挡住：`next[新键] = 值` 这种写法遇到已存在的同名键会**悄悄盖掉**那条
+ *  变量的取值（用户把 PATH 改成 PWD，PWD 那一行连同它的值一起消失）。占用即拒绝，变量表
+ *  原样不动，由界面回滚输入框并提示，用户的另一个变量不会被动。
+ *  空键名同样拒绝 —— 键名框允许被清空，但清空不该往表里塞一条无名变量（后端会判成非法）。 */
+export function renameEnvironmentVariable(envVars: Record<string, string>, oldKey: string, nextKey: string): EnvironmentVariableRename {
+	const trimmed = nextKey.trim();
+	if (!trimmed) return { ok: false, reason: "empty" };
+	if (!Object.prototype.hasOwnProperty.call(envVars, oldKey)) return { ok: false, reason: "missing" };
+	if (trimmed === oldKey) return { ok: false, reason: "unchanged" };
+	if (Object.prototype.hasOwnProperty.call(envVars, trimmed)) return { ok: false, reason: "duplicate" };
+	// 按键序重建而不是"删旧键再追加"：改名后这一行留在原处，不会跳到列表末尾。
+	// 用 fromEntries（内部是 CreateDataProperty）而不是 `next[新键] = 值`：后者遇到 `__proto__`
+	// 会被原型 setter 吃掉，变量会凭空消失 —— 而它是个合法的 POSIX 变量名，后端照收。
+	return { ok: true, envVars: Object.fromEntries(Object.entries(envVars).map(([key, value]) => [key === oldKey ? trimmed : key, value])) };
+}
+
 export interface LogEntry {
 	id: number;
 	timestamp: string;

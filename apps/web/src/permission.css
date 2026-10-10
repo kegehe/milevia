@@ -1,11 +1,3 @@
-.permission-options { display: grid; gap: 10px; padding: 18px; }
-.permission-options button { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; padding: 14px; text-align: left; background: #fff; }
-.permission-options button.active { border-color: #55a697; box-shadow: inset 0 0 0 1px #55a697; background: #eaf7ef; }
-.permission-options button.active.danger { border-color: #ef7058; box-shadow: inset 0 0 0 1px #ef7058; background: #fff0ec; }
-.permission-options b { color: #19332c; font-size: 14px; }
-.permission-options span { color: #6b8178; font-size: 12px; line-height: 1.45; }
-.conversation-profile-select { display: grid; gap: 6px; padding: 0 18px 4px; color: #49665c; font-size: 12px; }
-.conversation-profile-select select { width: 100%; min-height: 36px; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 10px; color: #19332c; background: #fff; }
 .permission-confirmation { margin: 0; padding: 4px 18px 20px; color: #5f7169; line-height: 1.55; }
 .permission-dialog .primary.danger { border-color: #dc5c46; color: #fff; background: #e6624b; }
 .permission-dialog .primary.danger:hover { background: #d5513c; }
@@ -14,4 +6,4 @@
 .permission-trigger.full { border-color: #efb59d; color: #a94634; background: #fff0eb; }
 .permission-popover { border-color: #c9ddd3; border-radius: 8px; background: #fbfefb; box-shadow: 7px 7px 0 #d8e8de; }
 .permission-popover button { color: #597268; border-radius: 6px; }.permission-popover button:hover,.permission-popover button.selected { background: #eaf7ef; }.permission-popover button.selected.full { background: #fff0eb; }.permission-popover b { color: #19332c; }
-.permission-options button.active { border-color: #55a697; box-shadow: inset 0 0 0 1px #55a697; background: #eaf7ef; }.permission-options button.active.danger { border-color: #ef8068; box-shadow: inset 0 0 0 1px #ef8068; background: #fff0eb; }.permission-options b { color: #19332c; }.permission-options span { color: #6b8178; }.permission-confirmation { color: #5f7169; }
+.permission-confirmation { color: #5f7169; }

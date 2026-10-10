@@ -9,6 +9,7 @@ import { DEVICE_ALIAS_MAX_LENGTH, addOrReplaceDevice, activeDevice, deviceDispla
 import { MOBILE_PROJECT_ORDER_STORAGE_KEY, dismissMobileDragHint, persistOrder, readMobileDragHint, sortProjectIds } from "../lib/project-order";
 import { useCardDragReorder } from "../lib/use-card-drag";
 import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval } from "../lib/timeline";
+import { NON_GIT_BRANCH } from "../lib/types";
 import type { SystemVariant, PermissionMode } from "../lib/types";
 import { AgentLogo } from "../components/AgentLogo";
 import { ExternalLink } from "../components/ExternalLink";
@@ -29,6 +30,10 @@ import { applyPendingTaskMutations, mutationReflectsInSnapshot, newPendingTaskID
 // 会话末尾那条「正在处理」状态条的判据（徽标 / 阶段词 / 已耗时）。三份读数来自三个不同来源，
 // 收口在纯函数里，页面只调用 + 渲染 —— 理由见 lib/processing-indicator.ts 的文件头。
 import { formatElapsed, latestNotice, processingBadge, processingStageText } from "../lib/processing-indicator";
+// 「停止当前对话」的答复怎么读（真的在停 / 本来就没在跑 / 要用户确认强制停止 / 失败）。
+// 四种答复在线上都长成一个 JSON，判错的症状是"点了停止，界面什么也没说"——所以判据抽成
+// 纯函数，在 lib/mobile-conversation-stop.test.ts 里逐条钉死。
+import { conversationStopConfirmCopy, conversationStopIdleMessage, conversationStopOutcome, conversationStopParams, conversationStopTimeoutMs } from "../lib/mobile-conversation-stop";
 // 「新建会话」的乐观更新规则。会话先在**本机**建好（立刻能进去、能打字），命令只在后台
 // 发给电脑端 —— 手机端的操作不该等电脑端点头。规则的每一条分支在
 // src/lib/conversation-mutations.ts 里有独立的行为用例。
@@ -126,6 +131,13 @@ const terminalCommandStatuses = ["completed", "failed", "expired", "cancelled", 
 // 会话视图里刷新状态条的存活时间。顶栏折成一行才省下 ~40px，这条回执不该把它吃回去；
 // 6 秒足够看清"已刷新/失败"，又不至于让人以为它要一直挂着。仅会话视图生效（见该 effect）。
 const REMOTE_REFRESH_STATUS_TTL_MS = 6000;
+
+// Git 视图后台对账的节流窗口（见那个 SSE effect 里的 scheduleGitRefresh）。
+//
+// 为什么是 3 秒而不是跟着快照走的那 500ms：结构事件里 AI 每调一次工具就有一条，
+// 而"手机上的 Git 列表跟电脑差 3 秒"和"差 0.5 秒"对人是没有区别的 —— 但每一次对账
+// 都实打实走一趟云中继（本机实测到云端 RTT ~150ms）。取值标准是**人眼**，不是事件密度。
+const GIT_REFRESH_THROTTLE_MS = 3000;
 
 function commandStatusRank(status: string): number {
   if (status === "queued" || status === "pending") return 0;
@@ -293,6 +305,13 @@ const approvalLabels: Record<string, { title: string; state: string }> = {
 // 一次会话只保留最近这一段运行记录：时间久了状态卡会越积越多，而用户翻历史时
 // 关心的是刚刚发生了什么，不是三天前的每一次重试。
 const maxConversationNotices = 24;
+
+// 「停止中」的兜底放开时限。停止正常是秒级（电脑端把进程收干净），但界面**不能**把
+// 「停止中」当成一个只能靠别人来解的状态：processingConversations 里那条乐观记录一旦
+// 因为"还有待确认的消息"而清不掉（见下面的对账 effect），按钮就会永远禁着。
+// 到点无条件放开 —— 那时它多半已经停了，而再点一次是幂等的（服务端没有活跃的一轮就回 idle），
+// 卡死可比多一次无害的请求糟得多。
+const conversationStopFallbackMs = 60_000;
 
 // 「＋」面板里的技能分组。来源键与桌面端 ConversationPage 的 skillSourceMeta 完全一致，
 // 顺序也照抄（项目 > 用户 > 系统/官方），两端看到的技能分组不会长得不一样。
@@ -592,6 +611,21 @@ function taskFromCommandResult(result: unknown): Task | null {
     status: typeof item.status === "string" ? item.status : "todo",
     updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : new Date().toISOString(),
   };
+}
+
+// taskDispatchConversationID 从下发回执里取出电脑端**实际**用的那条会话。
+//
+// 下发的回执是 taskDispatchResult（message / runId / taskRun），会话在以 taskRun 为准：
+// 它记的就是这条 run 挂在哪儿。message.conversationId 只是同一件事的第二来源（旧版回执
+// 没有 taskRun 时还能兜住），认不出来就返回空串，调用方就停在当前这条会话上。
+function taskDispatchConversationID(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const value = result as { taskRun?: { conversationId?: unknown }; message?: { conversationId?: unknown } };
+  const candidates = [value.taskRun?.conversationId, value.message?.conversationId];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim() !== "") return candidate.trim();
+  }
+  return "";
 }
 
 function conversationIDFromCommandResult(result: unknown): string {
@@ -1141,6 +1175,16 @@ export default function MobileRemotePage() {
   const [refreshStatus, setRefreshStatus] = useState<RefreshStatus | null>(null);
   const refreshingRef = useRef(false);
   const [processingConversations, setProcessingConversations] = useState<ProcessingConversations>({});
+  // 停止请求已发出、电脑端在停，但那条会话的实时事件还没到。它与"这条会话在跑"是两件事：
+  // 前者是**我们这次动作**的状态（决定了按钮显示"停止中"还是"停止"），后者是电脑端的读数。
+  // 分开是因为停止要等进程真的退出（秒级），期间按钮必须保持不可再点。
+  const [stoppingConversation, setStoppingConversation] = useState(false);
+  // 「强制停止」确认框要停的是**哪条会话**。空串 = 没开。
+  //
+  // 存 id 而不是一个布尔：这个请求要跨一次几秒钟的往返，期间用户完全可能已经切到别的会话
+  // （点通知、侧滑返回再进另一个项目）。只存"开没开"，确认那一刻按下去的就会是**屏幕上那条**
+  // ——而「强制停止」会把那条会话正在跑的连同排队中的一起取消掉，停错一条是会造成实际损失的。
+  const [stopConfirmTarget, setStopConfirmTarget] = useState("");
   const [error, setError] = useState("");
   // 通知权限的初值。两条通道，判定与理由见 lib/mobile-notify.ts 顶部：
   //   · 原生包（Capacitor）：@capacitor/local-notifications 的**本地通知** —— App 自己把
@@ -2163,6 +2207,20 @@ export default function MobileRemotePage() {
         void loadSnapshot();
       }, delay);
     };
+    // Git 视图的后台对账（见 MobileGitPanelHandle.refreshInBackground）。
+    //
+    // **不轮询**：只在结构事件到达时问一次。Git 视图没开着时 `gitPanelRef.current` 是 null，
+    // 天然什么都不做 —— 所以这里不必把 `gitOpen` 拖进本 effect 的依赖里（那会重连整条流）。
+    // 窗口比快照那条宽得多，理由见 GIT_REFRESH_THROTTLE_MS 的说明。
+    let gitRefreshTimer: number | null = null;
+    const scheduleGitRefresh = () => {
+      if (gitRefreshTimer !== null) return;
+      gitRefreshTimer = window.setTimeout(() => {
+        gitRefreshTimer = null;
+        if (!documentVisibleRef.current) return;
+        gitPanelRef.current?.refreshInBackground();
+      }, GIT_REFRESH_THROTTLE_MS);
+    };
     const wait = (delay: number) => new Promise<void>((resolve) => {
       const timer = window.setTimeout(resolve, delay);
       controller.signal.addEventListener("abort", () => { window.clearTimeout(timer); resolve(); }, { once: true });
@@ -2179,7 +2237,7 @@ export default function MobileRemotePage() {
             // 消息内容已经随事件到达，不需要为它再拉整份快照：那会让手机在每条
             // 助手消息后重新下载全部项目与会话，是移动端延迟最大的单一来源。结构性
             // 事件（任务、会话生命周期）仍需对账，漏掉的事件由慢速兜底轮询收敛。
-            if (!isMessage) scheduleSnapshotRefresh(500);
+            if (!isMessage) { scheduleSnapshotRefresh(500); scheduleGitRefresh(); }
           }, controller.signal);
           if (stopped || controller.signal.aborted) break;
           await wait(retryDelay);
@@ -2198,6 +2256,7 @@ export default function MobileRemotePage() {
       controller.abort();
       if (fallbackTimer !== null) window.clearInterval(fallbackTimer);
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      if (gitRefreshTimer !== null) window.clearTimeout(gitRefreshTimer);
     };
   }, [instanceID, loadSnapshot, applyRealtimeEvent, notifyHiddenMobileEvent]);
   // 回到前台补刷一次快照，避免用户先看到后台期间的旧状态。
@@ -2209,6 +2268,10 @@ export default function MobileRemotePage() {
     if (!documentVisible || wasVisible) return;
     if (!instanceID) return;
     void loadSnapshot();
+    // Git 那条后台对账的定时器在隐藏期间会**丢弃**（见 scheduleGitRefresh：它是"首事件开窗"
+    // 的节流，窗口内的事件不会再排第二次），所以后台期间"AI 跑完了"这件事不会自己补上 ——
+    // 回到前台补一次，与快照这条对齐。视图没开着时 ref 是 null，天然 no-op。
+    gitPanelRef.current?.refreshInBackground();
   }, [documentVisible, instanceID, loadSnapshot]);
   useEffect(() => {
     let cancelled = false;
@@ -2507,6 +2570,8 @@ export default function MobileRemotePage() {
     // 截出来的前 80 字，挂在顶栏那行大字上是句半截的话，顶栏改用项目名（见下面的 showConversationTitle）。
   })), [project?.conversations]);
   const conversation = conversations.find((item) => item.id === selectedConversation) || conversations.find((item) => item.isCurrent) || conversations[0];
+  // 「这个项目现在是 git 仓库吗」——手机端判据的唯一来源（见上面 isGitRepo 的说明）。
+  const isSelectedProjectGitRepo = Boolean(project?.gitBranch) && project?.gitBranch !== NON_GIT_BRANCH;
   // 当前这条会话是不是"本地已经建好、电脑端还没分配真 id"。它只影响两件事：
   // 快捷方式暂时不能下发（那条命令必须带真 id），以及消息要走延迟队列（见 sendConversationMessage）。
   const conversationPending = Boolean(conversation && isPendingConversationID(conversation.id));
@@ -2671,6 +2736,31 @@ export default function MobileRemotePage() {
     const timer = window.setInterval(() => setProcessingClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [conversationProcessing]);
+  // 停止收尾：这条会话不再"在跑"了，就把「停止中」摘掉。
+  //
+  // 摘的时机**不是**停止请求的响应 —— 那个响应说的是"电脑端开始停"，而进程真正退出还要几秒；
+  // 早摘会让按钮在这几秒里变回「停止」，用户以为没生效、再点一次（第二次点会落在已经停掉的
+  // 那一轮上，回一句"没有在运行的任务"，看起来就像失败）。挂点在 conversationProcessing 上：
+  // 它由实时事件与快照两路收敛（见下面那个对账 effect），是"确实不跑了"的**唯一**读数。
+  //
+  // 反过来的风险是它一直不转 false、按钮永远停在「停止中」。这条由同一个对账 effect 兜住：
+  // 快照一到，只要会话状态不再是 running、且没有待确认的消息，processingConversations 就会被清掉。
+  useEffect(() => {
+    if (!conversationProcessing) setStoppingConversation(false);
+  }, [conversationProcessing]);
+  // 换会话时无条件复位。这两个状态说的都是"我刚对**屏幕上这条会话**做了一次停止"，
+  // 不是"某条会话正在停"的全局读数（那个读数在 conversationProcessing 里）。
+  // 少了这一句：在 A 上点了停止、再切到也在跑的 B，B 的停止键会显示「停止中」并被禁掉
+  // 好几秒 —— 用户看着一条自己没停过的会话停在"停止中"，只能等。确认框同理，
+  // 它是挂在 A 上的（见 stopConfirmTarget 的说明），换到 B 就该消失而不是留在屏上。
+  useEffect(() => { setStoppingConversation(false); setStopConfirmTarget(""); }, [conversation?.id]);
+  // 兜底放开（见 conversationStopFallbackMs）：正常路径是上面那个 effect 摘掉它，
+  // 这一条只是保证"没有任何人摘"时按钮也会自己活过来。
+  useEffect(() => {
+    if (!stoppingConversation) return;
+    const timer = window.setTimeout(() => setStoppingConversation(false), conversationStopFallbackMs);
+    return () => window.clearTimeout(timer);
+  }, [stoppingConversation]);
   // `formatElapsed` 自带 10 秒门槛（且返回空串）。空串 ⇒ 这一格不渲染，
   // 于是"没到 10 秒"与"读不到时间"两种情况在界面上是同一种占位，不需要第二个判据。
   const processingElapsed = processingSince === null ? "" : formatElapsed(processingClock - processingSince);
@@ -2780,6 +2870,10 @@ export default function MobileRemotePage() {
       // 「解除绑定」确认框：它和任务弹层一样是 position: fixed 的一层，漏掉这一句
       // 返回键会直接去收下面的配对面板，确认框留在屏上（而且「确认解除」仍然可点）。
       if (confirmUnbind) { setConfirmUnbind(""); return true; }
+      // 「强制停止」确认框：与上面几个 backdrop 同理，它也是 position: fixed 的一层。
+      // 漏掉这一句，返回键会一路退掉会话层，而确认框还浮在项目列表上、「强制停止」仍可点 ——
+      // 那一下会真的把电脑端正在跑的任务连同排队请求一起取消掉。
+      if (stopConfirmTarget) { setStopConfirmTarget(""); return true; }
       // 「备注」弹层是设备面板**之上**的一层（z-index 30 > 面板的 20）。必须排在
       // `devicesOpen` **之前** —— 排在后面时返回键会先把整个面板收掉，而弹层还浮在
       // 项目列表上（与 confirmUnbind 同一条成因，实测过同一个形状）。
@@ -4101,7 +4195,7 @@ export default function MobileRemotePage() {
     });
   }
 
-  async function sendTaskCommand(taskID: string, type: string, payload: Record<string, unknown> = {}): Promise<boolean> {
+  async function sendTaskCommand(taskID: string, type: string, payload: Record<string, unknown> = {}): Promise<{ ok: boolean; result: unknown }> {
     // 下发 / 验收 / 停止没有乐观改动可叠加，但同样要给即时反馈：命中了就先把这张
     // 卡片标成「同步中」并按住它自己的按钮，别让用户以为没点上而连点。
     setTaskBusy(taskID, true);
@@ -4109,7 +4203,43 @@ export default function MobileRemotePage() {
     const outcome = await runTaskCommand({ type, taskId: taskID, payload: commandPayload });
     notePendingCommand(taskID, outcome.commandId);
     await settleTaskMutation(taskID, outcome);
-    return !outcome.error;
+    // 回执原样交回调用方：下发那条链要靠它知道任务落到了哪条会话（见 dispatchTask）。
+    return { ok: !outcome.error, result: outcome.result };
+  }
+
+  // 下发任务。它**不是**普通的任务命令，所以不复用上面那条链的收尾：验收 / 停止做完就完了，
+  // 而下发做完之后用户该看的是**执行**，不是任务队列面板。
+  // 电脑端本来就是这么定的（TaskBoardPage 的 onDispatched 就是 navigate 回会话页），
+  // 这里只是把手机端补齐。
+  //
+  // 目标会话由手机端显式指给电脑端，与桌面端那颗下发键完全一致（TaskQueue 也是带上
+  // 它正在看的那条会话）。不带的话电脑端会自己挑"项目里最近活跃的空闲会话"，可能挑中
+  // 编排用的后台会话（is_current=0，见 orchestration.go 的 createOrchestrationConversation）
+  // —— 手机端快照每个项目只带一条会话，那种会话它根本渲染不出来：症状就是
+  // "点了下发，屏幕上什么都没发生，人还钉在任务队列上"。
+  //
+  // 会话还在本地态（还没有真 id）时没有目标可指定，只能交给电脑端自己挑，
+  // 落点以回执为准（见 taskDispatchConversationID）。
+  async function dispatchTask(taskID: string) {
+    const target = conversation && !conversationPending ? conversation.id : "";
+    const outcome = await sendTaskCommand(taskID, "task.dispatch", target ? { conversationId: target } : {});
+    // 失败**不收面板**：任务还是那张待处理的卡，那句原因也还画在面板自己那行上
+    // （面板开着时它直接渲染页面级那份 error，见 `.mobile-task-panel-error`），
+    // 用户看完可以直接再点一次 —— 收掉面板等于把这张卡和那句原因一起藏起来。
+    // （error 为空但命令没进终态（"还没回执"）时走下面这条成功分支：命令多半已经送达，
+    //   而卡片会一直挂着「同步中」直到快照对账收敛 —— 那也是用户该看的执行现场。）
+    if (!outcome.ok) return;
+    // 成功：任务已经在电脑端跑起来了 —— 面板收掉，人交回会话页，看执行过程。
+    setTasksOpen(false);
+    const landed = taskDispatchConversationID(outcome.result);
+    // 落点与手机端指定的目标不一致时才需要切（只有"会话还没有真 id"那一小段窗口、或电脑端
+    // 版本比手机端旧、不认这个目标时才会发生）。三个条件缺一不可：
+    //   ① 会话还在本地态时选择权归交棒那条链（它认得 pending→真 id 的那次替换，能让用户
+    //      在输入框里写的草稿活下来），这里抢一次会把草稿清掉；
+    //   ② 快照里没有的会话切过去屏幕上不会有任何变化，反而把选择钉在一个查不到的 id 上；
+    //   ③ 落点本来就是当前这条（绝大多数情况）时什么都不用做。
+    const known = landed !== "" && conversations.some((item) => item.id === landed);
+    if (known && !conversationPending && landed !== conversation?.id) setSelectedConversation(landed);
   }
 
   function openTaskEditor(task: Task) {
@@ -4436,6 +4566,63 @@ export default function MobileRemotePage() {
       if (failed?.size === 0) pendingMessageRef.current.delete(conversationID);
       dropOptimistic();
       if (selectedConversationRef.current === conversationID) onRejected(cause instanceof Error ? cause.message : "消息发送失败");
+    }
+  }
+
+  // stopConversationRun 让电脑端停掉这条对话当前在跑的那一轮。
+  //
+  // 走中继（conversation.stop）而不是命令通道。判据是项目自己定的那条（docs/40 §0 决策 3，
+  // 展开写在 control-server 的 remote_relay.go）：除非真的需要命令通道那三样 —— 幂等键、
+  // 持久化审计、终态机 —— 否则新操作一律走请求-响应。停止一样都不需要（入参不含内容、
+  // 重复停无害、run 自己的状态与事件就是审计），却要多维护两份命令类型白名单，
+  // 还多一个"新桌面 + 旧云端 = 400"的偏斜窗口。
+  //
+  // 界面侧只有两件事要接对：
+  //   ① 发出去那一刻就置 stopping —— 电脑端把进程收干净要几秒，没有这个即时反馈，
+  //      用户会以为没生效而反复点（第二次点会落在已经停掉的那一轮上）。
+  //   ② 收尾**不靠**这个请求的响应，而等 conversationProcessing 转 false（见上面那个 effect）：
+  //      响应说的是"电脑端开始停了"，不是"已经停了"。
+  async function stopConversationRun(force: boolean, target: string) {
+    // 目标会话由**调用方**钉死（而不是函数里读屏幕上那条）：确认框可能是几秒前挂在 A 上开的，
+    // 而「强制停止」会把目标那条会话正在跑的连同排队中的一起取消 —— 停错一条是真的会丢工作。
+    //
+    // 判据用**当前渲染的那条**（`conversation`，与按钮/确认框渲染出来的同源），
+    // 不用 `selectedConversationRef`：后者可能指向一条已经从快照里消失的会话，那时
+    // `conversation` 会回落到 isCurrent 那条，两者不一致 —— 拿它当判据会让这颗按钮**点了没反应**
+    // （而它看起来是可用的）。这一句是"绝不误停"的唯一硬判据，下面的 stillOnConversation
+    // 只决定要不要上屏一句提示。
+    if (!target || conversation?.id !== target) return;
+    // 会话还是"本地已建好、电脑端没分配真 id"时不能发：中继的 conversationId 只取自信封，
+    // 而这种情况下面那个 sender 刻意传的是空串（它要按这个 id 查会话，查不到会报错）。
+    // 这个窗口里电脑端也确实还没接到任何东西可停。见 rpcTransport 的说明。
+    if (conversationPending || stoppingConversation) return;
+    setStopConfirmTarget("");
+    setStoppingConversation(true);
+    try {
+      const reply = await rpcTransport("conversation.stop", conversationStopParams(force), conversationStopTimeoutMs);
+      const outcome = conversationStopOutcome(reply);
+      // 往返期间用户可能已经切走了。⚠️ 少了这个判据，A 的答复会落在 B 的界面上：
+      // 失败文案显示在 B 上、或者一个"关于 A"的强制停止确认框浮在 B 上（点下去会被上面那句
+      // 硬判据挡掉，所以不会真停错 —— 但用户对着 B 看到一个说 A 的弹窗，只会以为这功能坏了）。
+      const stillOnConversation = selectedConversationRef.current === target;
+      if (outcome.kind === "stopping") {
+        // 顺手拉一次快照：实时事件在手机上并不总是活着（SSE 可能断），而"这条会话已停止"
+        // 这条读数要尽快到位。它不负责摘「停止中」—— 那个挂点在 conversationProcessing 上。
+        void loadSnapshot({ force: true });
+        return;
+      }
+      setStoppingConversation(false);
+      if (outcome.kind === "needs-force") { if (stillOnConversation) setStopConfirmTarget(target); return; }
+      if (outcome.kind === "failed") { if (stillOnConversation) setError(outcome.message); return; }
+      // 这一趟什么都没停。顺序在这里是**必须的**：loadSnapshot 的第一句就是 setError("")
+      // （它在第一个 await 之前，所以是同步跑完的），把它写在 setError 之后等于同一拍里
+      // 又清一次 —— React 批处理后只剩后者，用户一个字都看不到（这是最容易写错的一处，
+      // 界面上表现为"点了停止，什么也没说"）。
+      void loadSnapshot({ force: true });
+      if (stillOnConversation) setError(conversationStopIdleMessage(outcome));
+    } catch (cause) {
+      setStoppingConversation(false);
+      if (selectedConversationRef.current === target) setError(cause instanceof Error ? cause.message : "无法停止任务");
     }
   }
 
@@ -4801,6 +4988,11 @@ export default function MobileRemotePage() {
   // **不能**复用页面上那颗「刷新」（它做的是重新同步云端快照）：那两件事语义不同，
   // 而且快照里根本没有仓库状态。刷新按钮就在 GitBar 上，这里只是顶栏菜单的同一件事。
   function reloadGit() {
+    // 项目还不是仓库时，面板里没有任何仓库状态可读（空态里连 GitBar 都没有），
+    // 走面板那条只会撞服务端一句"project is not currently a readable Git repository"。
+    // 这时用户真正想知道的其实是"电脑上现在是不是仓库了" —— 那是**项目信息**，
+    // 要重新同步云端快照（面板会按新的 gitBranch 自己切过去，见 GitWorkbench 那条 setIsGitRepo）。
+    if (!isSelectedProjectGitRepo) { void refreshNow(); return; }
     gitPanelRef.current?.reload();
   }
 
@@ -4854,6 +5046,9 @@ export default function MobileRemotePage() {
     closeMessageActions();
     // 「解除绑定」确认框同理：它也是 fixed backdrop，而且里面的「确认解除」会真的吊销令牌。
     setConfirmUnbind("");
+    // 「强制停止」确认框同理，而且它的「强制停止」会真的取消电脑端正在跑的请求（含排队中的）。
+    // 这条链**不走 backHandlerRef**，所以两处都要收（与上面那几个弹层同一条纪律）。
+    setStopConfirmTarget("");
     // 「备注」弹层同样：fixed backdrop（z-index 30，比面板更高），侧滑返回时必须在这里收，
     // 否则回到项目列表后它还浮在屏上。这条链**不走 backHandlerRef**，两处必须一致。
     closeAliasEditor();
@@ -5404,6 +5599,12 @@ export default function MobileRemotePage() {
     {mobileApp && mobileView === "projects" && !showPairingStart && <><section className="mobile-project-picker" ref={projectPickerRef} onPointerDown={onProjectPointerDown}><div className="mobile-section-heading"><h2>选择项目</h2><span>{snapshot ? `${projects.length} 个项目` : "加载中"}</span></div>{dragHint && orderedProjects.length > 1 && <p className="mobile-project-drag-hint">按住项目卡片可拖动排序</p>}{projects.length === 0 ? <p className="mobile-empty">暂无项目或电脑尚未同步。</p> : orderedProjects.map((item) => <MobileProjectChoice key={item.id} item={item} busy={busy} isDragSlot={draggingProjectId === item.id} open={openMobileProject} />)}</section>{draggingProject && <div className={`card-drag-ghost${projectLifted ? " is-lifted" : ""}`} ref={projectDragGhostRef} aria-hidden="true"><div className="card-drag-ghost-inner"><MobileProjectChoice item={draggingProject} busy={false} open={openMobileProject} ghost /></div></div>}</>}
     {/* 解绑是不可逆动作（云端吊销这台手机的令牌），复用任务弹层那一套视觉，不另造一套。 */}
     {confirmUnbind && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-unbind-title"><section className="mobile-task-modal mobile-task-delete-modal"><header><h2 id="mobile-unbind-title">解除绑定</h2><button type="button" onClick={() => setConfirmUnbind("")} disabled={busy} aria-label="关闭">×</button></header><p>这台手机将失去对「{deviceDisplayName({ alias: confirmUnbindRecord?.alias || "", name: confirmUnbindRecord?.name || instance?.name || "当前电脑" })}」的访问权限，需要重新扫码配对才能恢复。</p><footer><button type="button" onClick={() => setConfirmUnbind("")} disabled={busy}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmUnbindDevice()} disabled={busy}>确认解除</button></footer></section></div>}
+    {/* 强制停止确认。出现的条件是电脑端回了一句"这条对话还有排队中或执行中的请求"
+        （码 active_runs_present），与桌面端 stopRun 里那个 pendingConfirm 是同一分支、
+        同一句话 —— 文案本身在 lib/mobile-conversation-stop.ts 里钉死，两端逐字一致。
+        与上面几个弹层同一套处理：backdrop 是 position: fixed 的一层，返回键优先收它
+        （见 backHandlerRef —— 漏掉那句会让返回键一路退掉会话层，而「强制停止」仍可点）。 */}
+    {stopConfirmTarget && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-stop-confirm-title"><section className="mobile-task-modal"><header><h2 id="mobile-stop-confirm-title">{conversationStopConfirmCopy.title}</h2><button type="button" onClick={() => setStopConfirmTarget("")} aria-label="关闭">×</button></header><p>{conversationStopConfirmCopy.message}</p><footer><button type="button" onClick={() => setStopConfirmTarget("")}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => { const target = stopConfirmTarget; setStopConfirmTarget(""); void stopConversationRun(true, target); }}>{conversationStopConfirmCopy.confirm}</button></footer></section></div>}
     {/* 「备注」弹层：给某一台电脑起/改/清一个**只在这台手机上生效**的名字。
         三个设计点：
         ① 它是设备面板**之上**的一层（z-index 30 > 面板的 20），返回键与侧滑返回两处都要收
@@ -5464,6 +5665,10 @@ export default function MobileRemotePage() {
       ref={gitPanelRef}
       projectId={project.id}
       conversationId={conversation && !conversationPending ? conversation.id : undefined}
+      // 非 git 项目交给工作台自己说（空态），而不是让它去读一个非 git 目录再报错。
+      // `Boolean(...)` 是保险：这个字段在本仓并不被假定非空（卡片那边写的是
+      // `gitBranch || "默认分支"`），空串若判成"是仓库"就会去读一个非 git 目录。
+      isGitRepo={isSelectedProjectGitRepo}
       transport={rpcTransport}
     /></section>}
     {mobileApp && mobileView === "conversation" && project && filesOpen && <section className="mobile-files" aria-label="项目文件"><FilesPanel
@@ -5498,6 +5703,12 @@ export default function MobileRemotePage() {
         <h3 id="mobile-task-panel-title">任务队列</h3>
         <button type="button" className="mobile-task-panel-close" onClick={() => setTasksOpen(false)} aria-label="关闭任务队列" title="关闭">×</button>
       </header>
+      {/* 面板里也要看得见失败原因。页面级那条 `.mobile-error` 在面板**之下**，而且渲染在
+          文档最上面（MOBILE-UI 记的块序是「顶栏 / 刷新状态条 / 错误条 / 更新条 / 会话块」）
+          —— 长会话里滚在底部的用户两处都够不着，症状就是"点了下发，面板停在原地、一个字都不说"。
+          所以这一行不另存状态，直接把**同一份** error 画在面板里：在滚动区之外，滚到哪条都看得见。
+          它跟着 error 一起消失，不存在"上一轮的原因留在面板里"这种事。 */}
+      {error && <p className="mobile-task-panel-error" role="alert">{error}</p>}
       {/* 搜索框在分类栏**上面**（2026-09-18 按用户要求）：先选分类、再在这一档里搜。
           两个装饰（放大镜、清除键）都自己画 —— 原生 `type="search"` 的这两颗由系统绘制、
           本页 CSS 一行都管不到，与当初那颗原生 select 是同一类问题（所以 `::-webkit-search-*`
@@ -5538,7 +5749,7 @@ export default function MobileRemotePage() {
             <strong className="mobile-task-title">{taskSummary(task)}</strong>
             {taskDescription && <p className="mobile-task-desc">{taskDescription}</p>}
             <footer className="mobile-task-foot">
-              {task.status === "todo" || task.status === "action_required" ? <button type="button" className="mobile-task-primary" disabled={taskSyncing} onClick={() => void sendTaskCommand(task.id, "task.dispatch")}>下发</button> : null}
+              {task.status === "todo" || task.status === "action_required" ? <button type="button" className="mobile-task-primary" disabled={taskSyncing} onClick={() => void dispatchTask(task.id)}>下发</button> : null}
               {task.status === "awaiting_review" ? <button type="button" className="mobile-task-primary" disabled={taskSyncing} onClick={() => void sendTaskCommand(task.id, "task.review")}>验收</button> : null}
               {task.status === "running" ? <button type="button" className="mobile-task-primary" disabled={taskSyncing} onClick={() => void sendTaskCommand(task.id, "task.stop")}>停止</button> : null}
               <span className="mobile-task-foot-gap" />
@@ -5569,7 +5780,21 @@ export default function MobileRemotePage() {
     正文必须夹列宽 + 单行省略：这里回显的是别人写的内容，长度不可控
     （本文件记过四次的「回显用户输入」坑，第四例就是它）。 */}
 {quoteRef && <div className="mobile-quote-refs" role="group" aria-label="已引用的消息"><span className="mobile-quote-ref"><MessageActionIcon kind="quote" /><span className="mobile-quote-ref-text" title={quoteRef.content}>{quoteRef.content}</span><button type="button" className="mobile-quote-ref-remove" title="取消引用" aria-label={`取消引用${quoteRef.role === "user" ? "我" : "Agent"}的这条消息`} disabled={busy} onClick={() => setQuoteRef(null)}>×</button></span><span className="mobile-quote-ref-hint">发送时展开为引用块</span></div>}
-<div className="mobile-composer-box"><button type="button" className="mobile-composer-tool" aria-label="工具" title="工具" aria-expanded={composerToolsOpen} aria-controls="mobile-composer-tools" onClick={() => setComposerToolsOpen((open) => !open)} disabled={busy}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg></button><textarea ref={messageInputRef} value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversation ? "输入消息..." : "请先新建会话"} aria-label="输入消息" rows={1} disabled={busy || !conversation} /><button type="submit" className="mobile-composer-send" disabled={busy || !conversation || (!messageDraft.trim() && skillRefs.length === 0 && !quoteRef)} aria-label="发送消息" title="发送消息"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg></button></div></form></div></section>}
+<div className="mobile-composer-box"><button type="button" className="mobile-composer-tool" aria-label="工具" title="工具" aria-expanded={composerToolsOpen} aria-controls="mobile-composer-tools" onClick={() => setComposerToolsOpen((open) => !open)} disabled={busy}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg></button><textarea ref={messageInputRef} value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversation ? "输入消息..." : "请先新建会话"} aria-label="输入消息" rows={1} disabled={busy || !conversation} />{/* 运行中：在发送键**左边**多一颗停止键，发送键留着。
+    刻意不是"把发送键换成停止键"（第一版就是那样，复查时改掉了）：跑着的时候再发一条是
+    **既有能力** —— 桌面端在运行中同样能发（还有「立即发送 / 预约发送」两种），而把发送键换掉
+    等于在最需要它的时刻把入口藏起来，手机上就只剩"按回车"这一条看不见的路。
+    放在发送键左边而不是右边：停止是破坏性动作，不该占住发送键那个位置（那是肌肉记忆），
+    而且这样右手拇指够得到的两颗按钮顺序是「停止 → 发送」，主操作在最外。
+    它是**文字**胶囊而不是图标圆钮：停止没有一个一看就懂的通用图标（桌面端也没敢用，
+    同样是写着"停止"两个字）。也刻意**不加 aria-label** —— 可见文字本身就是它的名字，
+    而它会在"停止/停止中"之间变，写死的 aria-label 反而会让"可见文字不在可访问名里"
+    （WCAG 2.5.3）。给"正在停"这层意思的是 title。
+    disabled 里也刻意**不带 busy**：那一票是命令通道的在途请求（发消息 / 任务操作），
+    而停止走的是另一条通道、且是幂等的，没理由被它们挡住。
+    会话还是本地态（conversationPending）时不显示：那个窗口里电脑端还没接到任何东西，
+    而中继的 conversationId 只取自信封、这种情况传的是空串，发出去只会得到一句参数错误。 */}
+{conversationProcessing && !conversationPending && <button type="button" className="mobile-composer-stop" disabled={stoppingConversation} title={stoppingConversation ? "正在停止当前对话" : "停止当前对话"} onClick={() => void stopConversationRun(false, conversation?.id ?? "")}>{stoppingConversation ? "停止中" : "停止"}</button>}<button type="submit" className="mobile-composer-send" disabled={busy || !conversation || (!messageDraft.trim() && skillRefs.length === 0 && !quoteRef)} aria-label="发送消息" title="发送消息"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg></button></div></form></div></section>}
     {newConversationProject && <div className="mobile-new-conversation-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-new-conversation-title"><section className="mobile-new-conversation-dialog">
       <div className="mobile-sheet-grabber" aria-hidden="true"></div>
       <header><div><h2 id="mobile-new-conversation-title">新会话</h2><p>选择执行工具</p></div><button type="button" onClick={cancelNewConversation} disabled={busy} aria-label="关闭">×</button></header>

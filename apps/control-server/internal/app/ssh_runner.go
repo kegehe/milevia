@@ -979,6 +979,41 @@ func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
 	return runCrossCLIUpdate(ctx, "远程服务器上", "codex", "Codex CLI", codexNpmCLIInstall, r.execRemote, r.CodexVersion)
 }
 
+// ── crossShellRunner：目录驱动的工具（catalogAgentBackend 用）────────────────
+//
+// 与 CodexCapableRunner 那类逐工具方法的分工：那些只为**真有额外语义**的工具保留
+// （Codex 的就绪要看登录态）。目录里其余工具一律走这三个方法，因此远端新增一个工具
+// 时这里不需要任何改动。
+
+// crossProbe 在远端执行 `name args...` 并拿回 stdout。
+//
+// 逐段 shellQuote：命令名与参数都来自目录（常量），此刻本不存在注入面，但拼 shell
+// 命令这一类代码的纪律是"不因为此刻的值可信就省掉转义"。
+//
+// SSH 侧不做缓存：与既有的 Version / CodexVersion 同一取舍（那两条本来也是每次会话
+// 各跑一次远端命令）。超时由调用方的 ctx 兜住（探针走的是请求上下文）。
+func (r *sshRunner) crossProbe(ctx context.Context, name string, args ...string) (string, bool) {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, shellQuote(name))
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	out, err := r.client.execCommand(ctx, strings.Join(parts, " "))
+	return strings.TrimSpace(string(out)), err == nil
+}
+
+// crossRun 在远端跑一段脚本（升级这类短命令）。
+func (r *sshRunner) crossRun(ctx context.Context, script string) (string, error) {
+	return r.execRemote(ctx, script)
+}
+
+// crossWhere 是"在哪台机器上"的说法，只用于报错文案。
+func (r *sshRunner) crossWhere() string { return "远程服务器上" }
+
+// 编译期钉住能力面：签名写歪了只会表现为"这个 runner 突然不支持目录驱动"（断言失败
+// 落到 agentBackend 的"尚未接通"分支），而那是一条**看起来像数据问题**的静默降级。
+var _ crossShellRunner = (*sshRunner)(nil)
+
 // remoteNpmCLIRecovery 是一条"升级失败时可以回滚到哪"的信息。
 // SSH 与 WSL 共用（编排见 cross_npm_update.go）。
 type remoteNpmCLIRecovery struct {

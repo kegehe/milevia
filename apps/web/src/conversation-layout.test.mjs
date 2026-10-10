@@ -276,8 +276,9 @@ test("a failed send restores its draft only while the original conversation rema
 });
 
 test("switching conversations from the history dialog closes it before moving the tab", () => {
-  // 顺序不能反。closeHistory 走的是 setSearchParams —— React Router 的相对导航按**闭包里的旧 location**
-  // 解析 pathname，所以它会把 selectConversationTab 刚 push 出去的新会话 URL 覆盖回旧会话；
+  // 顺序不能反。closeHistory 现在按 locationRef 里的**最新 location** 拼绝对地址，而
+  // locationRef 要到下次渲染才更新 —— 同一次点击里先切 Tab 再关弹窗，它拿到的还是旧会话
+  // 的 pathname，会把 selectConversationTab 刚 push 出去的新会话 URL replace 回旧会话；
   // 症状是"在历史弹窗里点另一个会话，怎么点都切不过去"。真浏览器证据（两次 pushState c2 → c1）见
   // .tmp/probe-skill-refs-desktop.mjs 的"切会话"段，变异见 .tmp/mutation-skill-refs.py 的 m16。
   assert.match(conversationPage, /closeHistory\(\);\s*\n\s*selectConversationTab\(item\.id\);/);
@@ -407,7 +408,12 @@ test("Git workbench, project runner, and terminal are first-class workspace tabs
   assert.doesNotMatch(projectLayout, /const \[showRun, setShowRun\]/);
   assert.match(workspaceStyles, /\.workspace-tabs\s*\{[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;/s);
   assert.match(workspaceStyles, /\.workspace-content\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*flex:\s*1;[^}]*overflow:\s*hidden;/s);
-  assert.match(gitWorkbench, /useEffect\(\(\) => \{ if \(active && isGitRepo\) void reload\(\)\.catch\(\(\) => undefined\); \}, \[active, isGitRepo, reload\]\);/);
+  // 装载 effect：`active && isGitRepo` 时发首屏读取，依赖 [active, isGitRepo, reload]。
+  // 写成多行是因为它开头还有一句"身份变了就作废在飞的冲突总览"（见 GitWorkbench 里的说明）。
+  assert.match(
+    gitWorkbench,
+    /useEffect\(\(\) => \{[\s\S]*?if \(active && isGitRepo\) void reload\("initial"\)\.catch\(\(\) => undefined\);\s*\}, \[active, isGitRepo, reload\]\);/,
+  );
   assert.match(runPanel, /if \(!active\) return;/);
   // 左右分栏：.run-body 水平排列，左侧日志 flex:1，右侧侧栏保持受控宽度并可独立滚动。
   assert.match(runStyles, /\.run-body\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
@@ -599,9 +605,9 @@ test("wide and narrow screens sort prompts and commands in separate vertical lis
   assert.match(stylesheet, /\.quick-tag-list\.sortable \.quick-tag-item\s*\{[^}]*cursor:\s*grab;/s);
   assert.match(stylesheet, /\.quick-tag-item\.dragging\s*\{[^}]*opacity:\s*\.55;/);
   assert.match(stylesheet, /\.quick-tag-item\.drop-over\s*>[^}]*\.quick-tag\s*\{[^}]*border-color:\s*#2b6c5e;/);
-  assert.match(stylesheet, /\.quick-actions-mobile\s*\{[^}]*display:\s*none;/s);
+  // quick-actions-mobile 响应式变体已随「窄屏快捷方式收进 composer 菜单」下线，
+  // 死样式连同这里的旧断言一起移除（见下一个测试）。
   assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-row\s*\{[^}]*display:\s*none;/);
-  assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-mobile\s*\{[^}]*display:\s*grid;/);
   assert.match(stylesheet, /\.quick-actions-row \.quick-tag > button:first-child,\s*\.quick-actions-row \.quick-tag-empty\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
   assert.match(conversationPage, /function ShortcutSortableList\(/);
   assert.match(conversationPage, /const reorderKind = useCallback\(async \(kind/s);

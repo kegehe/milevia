@@ -1857,7 +1857,22 @@ func (s *Server) executeRemoteCommand(ctx context.Context, command remoteCommand
 		return nil, errors.New("taskId is required")
 	}
 	if command.Type == "task.dispatch" {
-		result, _, err := s.dispatchTaskByID(ctx, command.TaskID)
+		// 目标会话可以由手机端指定，与桌面端完全一致（桌面端 TaskQueue 下发时同样显式带上
+		// 它正在看的那条会话：POST /api/tasks/{id}/dispatch {"conversationId": ...}）。
+		//
+		// 不带的话回落到"项目里最近活跃的空闲会话"——那条可能是编排用的后台会话
+		// （is_current=0，见 orchestration.go 的 insert），而手机端的快照每个项目只带一条会话
+		// （remoteSnapshotConversationsPerProject），它渲染不出别的会话：症状就是
+		// "点了下发、屏幕上什么都没发生，人还停在任务队列面板上"。
+		var input struct {
+			ConversationID string `json:"conversationId"`
+		}
+		if len(command.Payload) > 0 {
+			if err := json.Unmarshal(command.Payload, &input); err != nil {
+				return nil, errors.New("task dispatch payload is invalid")
+			}
+		}
+		result, _, err := s.dispatchTaskByIDForConversation(ctx, command.TaskID, strings.TrimSpace(input.ConversationID))
 		if err != nil {
 			return nil, err
 		}

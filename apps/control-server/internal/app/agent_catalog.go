@@ -52,10 +52,16 @@ type AgentCatalogEntry struct {
 	InstallKind string `json:"installKind"`
 	NpmPackage  string `json:"npmPackage"`
 	CommandName string `json:"commandName"`
-	// BinFile 是 npm 包内 bin/ 目录下的文件名（与 npmCLIInstall.binFile 同义）。
-	// 注意：这是既有实现的沿用值，Unix 侧的确切文件名未经验证 —— 它只被
-	// npmCLIInstall.binaryPath 用于符号链接比对（npm_cli_install.go:75），
-	// 属于既有行为，本次不改动它。
+	// BinFile 是 npm 包内 bin/ 目录下的**文件名**（与 npmCLIInstall.binFile 同义）：
+	// npmCLIInstall.binaryPath 会把它拼到 `<包根>/bin/` 之后，所以这里写的是
+	// `bin/<X>` 里那个 `<X>`，不是包内的完整相对路径。
+	//
+	// ⚠️ 取值来自各包自己的 npm bin 目标（`npm view <pkg> bin`）去掉 `bin/` 前缀：
+	// claude-code → `bin/claude.exe`、codex → `bin/codex.js`、codebuddy-code →
+	// `bin/codebuddy`。codebuddy 最初抄的是完整目标（"bin/codebuddy"），于是拼接后
+	// 指向 `<包根>/bin/bin/codebuddy` —— 那是**不存在的路径**，而它只被跨端升级的
+	// "确认来源"与回滚用到（cross_npm_update.go / ssh_runner.go），所以症状是
+	// "升级失败时回滚不了"，不会在安装路径上暴露。升级 CLI 后需复核。
 	BinFile string `json:"-"`
 
 	// MinRuntimeVersion 是该 CLI 要求的 Node 最低版本。
@@ -163,7 +169,7 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		InstallKind:       InstallKindNpmGlobal,
 		NpmPackage:        "@tencent-ai/codebuddy-code",
 		CommandName:       "codebuddy",
-		BinFile:           "bin/codebuddy", // npm bin 目标（实测，见 npm view @tencent-ai/codebuddy-code bin）
+		BinFile:           "codebuddy", // npm bin 目标 bin/codebuddy 去掉 bin/（见 BinFile 的注释）
 		MinRuntimeVersion: "18.20.0",
 		Readiness:         readinessVersion,
 		VersionArgs:       []string{"--version"},

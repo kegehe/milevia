@@ -116,8 +116,14 @@ test("orchestration workspace loads complete history and keeps a single-column m
 
 test("Git, project dashboard, and SSH lists discard stale responses", () => {
   assert.match(gitWorkbench, /const reloadRequest = useRef\(0\);/);
-  assert.match(gitWorkbench, /const requestID = \+\+reloadRequest\.current;/);
+  // 领号那行是 `requestID = ++reloadRequest.current`（没有 const）：号**在确认要动手取数时**
+  // 才领 —— probe 的两条早退不该动它（见 GitWorkbench 里"号在这一步才领"的说明）。
+  assert.match(gitWorkbench, /^\s+requestID = \+\+reloadRequest\.current;$/m);
   assert.match(gitWorkbench, /requestID !== reloadRequest\.current/);
+  // 收尾那一份（finally 里）也要在：它负责把"有重读在飞"的标记放掉、并补做被让路的 probe。
+  // 只钉 try 里那一份的话，把 finally 里的整段删掉照样绿（审查者实测过）。
+  assert.match(gitWorkbench, /reloadInFlightRef\.current = false;/);
+  assert.match(gitWorkbench, /if \(probePendingRef\.current\) \{ probePendingRef\.current = false; void reload\("probe"\); \}/);
   assert.match(projectStore, /const projectRequestVersion = useRef\(0\);/);
   assert.match(projectStore, /const statusRequestVersion = useRef\(0\);/);
   assert.match(projectStore, /requestVersion !== projectRequestVersion\.current\) return;/);

@@ -15,7 +15,9 @@
 //  3. **诊断自身也是三档**（docs/43）—— 检测没查成 / 发现了问题 / 没有问题。
 //     把"没查成"并进"没问题"是最坏的一种：用户会以为这台机器一切正常。
 //
-// 首屏**只留判断 + 唯一的下一步**：卡片上是名字、当前版本、最新版本、一句状态、一个动作；
+// 首屏**只留判断 + 唯一的下一步**：卡片上是名字、当前版本、最新版本、一句状态、一个动作
+// （需要登录的工具在它旁边多一颗「登录」—— 那是"能做的事"，不是"要做的事"，但它同样
+// 是卡片上的下一步，不该藏进抽屉）；
 // 路径 / 证据 / 日志 / 「这台机器上的所有位置」这些排查素材收进「详情」抽屉 ——
 // 它们不是没用，是没必要站在首屏（删除的判据：不看它，会不会做错下一步）。
 // 唯一必须留在一线的是「这次没检查成功」，它不能并进"没有问题"。
@@ -45,7 +47,7 @@ import {
 } from "../lib/cli-diagnosis";
 import { normalizeDiagnosis, normalizeDiagnostics } from "../lib/cli-diagnosis";
 import type { AgentDiagnosis, AgentDiagnosisWire, DiagnoseRemedy, RepairResult, RunnerDiagnosticsViewWire } from "../lib/cli-diagnosis";
-import { bannerFor, buildManualInstallRows, buildToolCard, latestLoading, runnerLabel, runtimeLatestLine } from "../lib/cli-tools-view";
+import { bannerFor, buildManualInstallRows, buildToolCard, grantNeededReason, latestLoading, runnerLabel, runtimeDepLine } from "../lib/cli-tools-view";
 import type { LatestRead, RuntimeStatus, RunnerAgentItem, ToolCard } from "../lib/cli-tools-view";
 import type { RunnerInfo } from "../lib/types";
 import "./cli-tools.css";
@@ -580,14 +582,35 @@ export default function CliToolsPage() {
   }), [catalog.entries, selectedRunner, items, runtime, latest, diagnoses, diagnoseErrors, skippedDiagnoses, diagnoseChannel, view?.remoteInstallAllowed, reading]);
 
   const banner = useMemo(() => bannerFor(cards), [cards]);
-  // 「运行依赖」那一行的读数（文案 + 状态档都由模型给，页面不自己判）。没有运行时是另一条分支。
-  const depLatest = useMemo(() => (runtime && runtime.installed ? runtimeLatestLine(runtime) : null), [runtime]);
+  // 「运行依赖」那一行：读数（文案 + 状态档）与**升级按钮亮不亮**由同一个函数一起给
+  // （`runtimeDepLine`）—— 两者分家过一次，代价是"可升级到 X"与"没有按钮"同屏且无人解释
+  // （2026-10-09 修）。页面因此**不数那三个条件**，也不自己拼按钮文案。
+  // 授权那一道进门时必须带上：它是按钮的判据之一，漏传就等于把"未授权"当成"可以升"。
+  const depLine = useMemo(
+    () => (runtime && runtime.installed ? runtimeDepLine(runtime, Boolean(view?.remoteInstallAllowed)) : null),
+    [runtime, view?.remoteInstallAllowed],
+  );
+  // 单独取出来给 onClick 用：`depLine?.action &&` 那个窄化进不了闭包（TS 会在
+  // `depLine.action.kind` 上报 possibly undefined）。动作的种类也由它带来，
+  // 页面不自己写死（见 `RuntimeDepLine.action` 的注释）。
+  const depAction = depLine?.action;
   const openCard = cards.find((card) => card.id === openAgent);
   const openItem = items.find((candidate) => candidate.id === openAgent);
   const openEntry = catalog.entries.find((entry) => entry.id === openAgent);
   const openKey = openAgent ? updateKey(openAgent) : "";
   const openDiagnosis = openKey ? diagnoses[openKey] : undefined;
   const openDiagnosisError = openKey ? diagnoseErrors[openKey] : "";
+  /**
+   * 抽屉里那条「预检」说明 —— **算在模型里，页面不判**。
+   *
+   * 页面此前自己写了一遍 `openDiagnosis.preflight && !openDiagnosis.preflight.installOk`，
+   * 而那正是 `preflightNote` 自己那句 `if (!preflight || preflight.installOk) return ""`
+   * 的取反：同一件事两处判，将来 `preflightNote` 改了守卫（比如 installOk 为真但仍有话
+   * 要说），页面这块会**静默地把话藏掉**。同族的 `preflight.upgradeOk` 早有禁令
+   * （见 cli-tools-page.test.mjs 那条「页面里一次都不该出现」），`installOk` 是漏网的
+   * 那一个（2026-10-09 补）。现在只有这一处判：有话说就整块出来，没话说整块不出现。
+   */
+  const openPreflightNote = openDiagnosis ? preflightNote(openDiagnosis.preflight) : "";
 
   /** 卡片上那个主动作点了之后做什么。 */
   const runPrimary = useCallback((card: ToolCard) => {
@@ -680,9 +703,11 @@ export default function CliToolsPage() {
                 「看看是什么问题」是同一个效果（两个入口做同一件事）。 */}
             {banner.actionLabel && <button className="primary" disabled={busy} onClick={() => {
               const card = cards.find((candidate) => candidate.id === banner.agentID);
-              if (!card) return;
-              if (card.primary?.kind === "repair") setPending({ kind: "repair", agentID: card.id, remedies: card.primary.remedies });
-              else setOpenAgent(card.id);
+              // `actionLabel` 只在卡片真有 repair 动作时才由模型给出（见 bannerFor），
+              // 所以这里只有那一档可走 —— 原来那句"否则打开抽屉"的兜底是**到不了的**
+              // 死分支（2026-10-08：卡片上的「详情」已删，兜底跟着一起清掉）。
+              if (card?.primary?.kind !== "repair") return;
+              setPending({ kind: "repair", agentID: card.id, remedies: card.primary.remedies });
             }}>{banner.actionLabel}</button>}
             <button type="button" className="cli-tools-link" onClick={() => setOpenAgent(banner.agentID)}>看看是什么问题</button>
           </div>}
@@ -751,14 +776,31 @@ export default function CliToolsPage() {
                           （skipped，于是 diagnosis 被移除），放在抽屉里就永远看不见了 ——
                           而那一刻正是最该看见它的时候。 */}
                       {resolvedNotes[key] && <p className="cli-tools-resolved" role="status">{resolvedNotes[key]}</p>}
-                      <div className="cli-tools-card-actions">
+                      {/* ⚠️ 一个动作都没有时**整条不渲染**。这条动作区带 border-top 与浅底
+                          （`cli-tools-card-actions`），空着渲染会在卡底留下一条 23px 的空条 ——
+                          「已是最新、不需要登录」那一档（最健康、最常见的一档）张张如此。
+                          所以这三颗（主操作 / 登录 / 详情）都可能是 undefined，守卫要把它们
+                          全算进来。 */}
+                      {(card.primary || card.canLogin || card.canOpenDetails) && <div className="cli-tools-card-actions">
                         {card.primary && <button className="primary" disabled={busy} onClick={() => runPrimary(card)}>
                           {running && running.runnerID === selectedRunner && "agentID" in running.action && running.action.agentID === card.id
                             ? pendingActionText(running.action).button
                             : card.primary.label}
                         </button>}
-                        <button type="button" className="secondary" onClick={() => setOpenAgent(card.id)}>详情</button>
-                      </div>
+                        {/* 需要登录的工具（`canLogin` 由模型按目录的 supportsLogin + 真的装没装判）
+                            把入口摆在卡片上：点开就是登录面板，不用先进详情抽屉。
+                            它是**次要**按钮 —— 登录是"能做的事"，不是"这一屏要做的事"。 */}
+                        {card.canLogin && <button type="button" className="secondary" disabled={busy} onClick={() => {
+                          setLoggedIn(false);
+                          setLoginInfo(null);
+                          setLoginAgent({ agentID: card.id, name: card.name });
+                        }}>登录</button>}
+                        {/* 「详情」只在模型判定"这张卡的下一步就在抽屉里"时出现（canOpenDetails）。
+                            横幅只指向**第一张**问题卡，别的卡（第 2 张要处理的、"没检查成功"那一档）
+                            否则没有任何入口，而卡片文案却让用户"按详情里的证据处理"。
+                            它不占主操作位、不参与 bannerFor；已是最新的健康卡不给它。 */}
+                        {card.canOpenDetails && <button type="button" className="secondary" disabled={busy} onClick={() => setOpenAgent(card.id)}>详情</button>}
+                      </div>}
                     </article>;
                   })}
                 </div>}
@@ -785,16 +827,16 @@ export default function CliToolsPage() {
                 <span>工具满足</span>
               </span>
               <span className="cli-tools-dep-right">
-                {/* 右边是**读数**（状态点 + 一句话），有新版时才跟一颗动作按钮。
-                    文案与状态档都取自模型（runtimeLatestLine）：读不到最新版本时**不能**
-                    写"已是最新"—— 那是把读不到写成没有，与卡片那一行同一族纪律。 */}
-                <span className="cli-tools-dep-state" data-tone={depLatest?.tone}>
-                  {depLatest?.text}
+                {/* 右边是**读数**（状态点 + 一句话），有新版**且真的点得动**时才跟一颗动作按钮。
+                    两件事都由模型一起给（`runtimeDepLine`）：读不到最新版本时**不能**写"已是最新"，
+                    升不了时**也不能**只写"可升级到 X" 而不说为什么 —— 这正是 2026-10-09 修的
+                    那个症状（未授权的 WSL 上：读数说能升、按钮没了、那一行一个字都不解释）。 */}
+                <span className="cli-tools-dep-state" data-tone={depLine?.tone}>
+                  {depLine?.text}
                 </span>
-                {runtime.installSupported && runtime.updateAvailable && view?.remoteInstallAllowed &&
-                  <button className="secondary" disabled={busy} onClick={() => setPending({ kind: "install-runtime" })}>
-                    升级到 {runtime.latestVersion}
-                  </button>}
+                {depAction && <button className="secondary" disabled={busy} onClick={() => setPending({ kind: depAction.kind })}>
+                  {depAction.label}
+                </button>}
               </span></>
             : <><span className="cli-tools-dep-mark" data-tone="missing" aria-hidden="true">⬢</span>
               <span className="cli-tools-dep-who">
@@ -826,10 +868,16 @@ export default function CliToolsPage() {
           <button className="primary" disabled={busy} onClick={() => void grantRunnerInstall()}>允许在此主机安装</button>
         </p>}
         {/* 运行时装好了但随包的 npm 不可用：这一档是**预期会发生**的（分发异常），
-            而它下面每个工具都装不了 —— 必须给一个重装入口，否则用户只能看着"请重装"却无处可点。 */}
-        {runtime?.installed && runtime.installSupported && !runtime.npmVersion && view?.remoteInstallAllowed &&
+            而它下面每个工具都装不了 —— 必须给一个重装入口，否则用户只能看着"请重装"却无处可点。
+            ⚠️ 授权门只挡**按钮**，不挡这一整段（2026-10-09 修）：未授权时整段消失等于把
+            "随包的 npm 不可用"这条读数也一起藏掉 —— 而它是这台机器的事实，与授没授权无关
+            （与"运行依赖"那一行同一个病：读数被动作的判据连坐）。收回按钮时照上面那条
+            缘由说清为什么，不写第二份措辞。 */}
+        {runtime?.installed && runtime.installSupported && !runtime.npmVersion &&
           <p className="cli-tools-note">运行时装好了，但随包的 npm 不可用 —— 装不了 CLI，请重装 Node.js 运行时。
-            <button className="secondary" disabled={busy} onClick={() => setPending({ kind: "install-runtime" })}>重装</button>
+            {view?.remoteInstallAllowed
+              ? <button className="secondary" disabled={busy} onClick={() => setPending({ kind: "install-runtime" })}>重装</button>
+              : <span>{grantNeededReason}（见上）。</span>}
           </p>}
       </section>
 
@@ -914,9 +962,9 @@ export default function CliToolsPage() {
                   // 按钮比不给更坏。
                   : <p className="cli-tools-issue-manual">这个症状平台不能自动修 —— 按上面的证据在目标环境手动处理。</p>}
               </div>)}
-              {openDiagnosis.preflight && !openDiagnosis.preflight.installOk && <div className="cli-tools-diagnosis-block">
+              {openPreflightNote && <div className="cli-tools-diagnosis-block">
                 <h3>预检</h3>
-                <p className="cli-tools-note">{preflightNote(openDiagnosis.preflight)}</p>
+                <p className="cli-tools-note">{openPreflightNote}</p>
               </div>}
               {/* ② 这台机器上的所有位置 —— "装了新版却不生效"的唯一解释视图 */}
               {openDiagnosis.paths.length > 0 && <div className="cli-tools-diagnosis-block">
@@ -970,12 +1018,6 @@ export default function CliToolsPage() {
             disabled={Boolean(diagnoseBusy[openKey])}
             onClick={() => void diagnoseOne(openAgent)}
           >{diagnoseBusy[openKey] ? "检测中…" : "重新检测这个工具"}</button>
-          {openCard.installed && openEntry?.supportsLogin &&
-            <button className="secondary" disabled={busy} onClick={() => {
-              setLoggedIn(false);
-              setLoginInfo(null);
-              setLoginAgent({ agentID: openAgent, name: openCard.name });
-            }}>登录</button>}
         </footer>
       </section>
     </div>}

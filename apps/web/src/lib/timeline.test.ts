@@ -114,6 +114,10 @@ test("coalesces multiple CLI stderr events from one run into one diagnostic", ()
 test("renders decoded WSL launcher warning as readable detail, no fallback prefix", () => {
   // wsl.exe 的 UTF-16LE 主机侧警告经服务端解码后是含技术术语（wsl/localhost/NAT）的
   // 纯中文；不应被当作"未翻译英文"而包上"工具输出异常：..." 前缀。
+  //
+  // 这三个词是前端**多出来**的（app.go 的白名单里没有它们），只挂在"本地化不经手"的
+  // 原始输出链上（rawOutputTerms）。别把它们挪进默认表：那样 run.failed / error 的判定
+  // 就与服务端不同表了 —— 见下面那条同表用例。
   const timeline = buildTimeline([], [
     event("stderr-wsl", "stderr", { message: "wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost 代理。" }),
   ]);
@@ -121,6 +125,162 @@ test("renders decoded WSL launcher warning as readable detail, no fallback prefi
   assert.equal(errors.length, 1);
   assert.equal(errors[0].title, "CLI 输出");
   assert.equal(errors[0].detail, "wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost 代理。");
+});
+
+// 原始输出的宽表不许外溢到**服务端已经判过**的诊断上。
+//
+// 两边是两条不同的链：
+//  - rawOutputTerms（宽表）：工具结果、Codex 输出、聚合 stderr。服务端在这些链上只做搬运
+//    （tool_result / item.* 原样转发，stderr 逐行发事件且刻意不进快照），本地化根本没经手，
+//    所以口径由前端自己定，取宽一点 —— 一条含 wsl/NAT 的可读中文不该被套前缀。
+//  - allowedTechnicalTerms（窄表 = app.go 那份）：run.failed / error / turn.failed /
+//    stream.error 的 detail 在服务端已经被 localizedErrorText 判过一道，前端再判时必须
+//    同表，否则同一条错误在两端形态不同。
+test("原始输出的宽表不外溢到服务端已判过的诊断上", () => {
+  const wslNotice = "wsl: 检测到 localhost 代理配置，但未镜像到 WSL。";
+
+  // 宽表这一侧：工具结果（原始输出）原样保留。
+  const timeline = buildTimeline([], [
+    event("a1", "assistant", { message: { content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } }] } }),
+    event("u1", "user", { message: { content: [{ type: "tool_result", tool_use_id: "tu1", is_error: true, content: wslNotice }] } }),
+  ]);
+  const toolItem = timeline.find((item): item is Extract<TimelineItem, { kind: "tool" }> => item.kind === "tool");
+  assert.ok(toolItem, "expected a tool item");
+  assert.equal(
+    toolItem.action.output?.content,
+    wslNotice,
+    "工具结果这条原始输出链被换成了窄表 —— 可读的中文又被套上了兜底前缀",
+  );
+
+  // 窄表那一侧：同一条文案若走**服务端已判过**的诊断链，前端必须用窄表 —— 也就是把 wsl
+  // 也当成残留英文（服务端实测就是这么判的）。
+  //
+  // ⚠️ 这一句里不能出现"失败"二字：那个分支在查白名单**之前**就 return 了，写进去会把
+  // 这张表的作用整个遮掉，断言再怎么写都恒真（这条用例的第一版就是这个毛病）。
+  const diagnostic = eventDiagnostic(event("e1", "run.failed", {
+    error: "说明：wsl 已完成，请稍后重试。",
+  }));
+  assert.equal(
+    diagnostic?.detail,
+    "任务执行失败，请查看任务日志后重试。：说明：wsl 已完成，请稍后重试。",
+    "诊断链上 wsl 被放过了 —— 前端在这里用了宽表，而服务端用的是窄表",
+  );
+});
+
+// 残留英文的判据必须与 app.go 的 containsUntranslatedEnglish **同表同算法**。
+//
+// 2026-10-08 之前这里用的是一份**不同的表**：多了 NAT/localhost/wsl（服务端表里没有，
+// 实测服务端会把它们判成残留英文），少了 NUL。于是 `含 NUL 说明` 这类纯中文文案在服务端
+// 原样直通、在前端却被套上"任务执行失败，请查看任务日志后重试。"，`wsl/NAT/localhost`
+// 则反过来 —— 同一个错误在任务卡、通知与桌面/手机时间线上形态不一致。
+//
+// 注意判据的**长度门槛两端一致**：1~2 个字母的拉丁片段（no / ls / px）两边都放过，
+// 不要试图"顺手收紧"成 {1,} —— 那会和服务端分叉，而且是更难查的一种分叉。
+test("英文残留判据与服务端同表：NUL 放过，NAT/localhost/wsl 也算残留", () => {
+  const passes = (text: string) => eventDiagnostic(event("e", "run.failed", { error: text }))?.detail;
+
+  // NUL 在 app.go 的白名单里 → 两端都必须原样直通。
+  assert.equal(
+    passes("环境变量名称不能为空，且不能包含 = 或 NUL 字符"),
+    "环境变量名称不能为空，且不能包含 = 或 NUL 字符",
+    "NUL 没被放过 —— 词表比 app.go 少了一个词（原先就是少了它）",
+  );
+
+  // NAT / localhost / wsl 不在 app.go 的白名单里 → 两端都必须套兜底前缀。
+  // 这三个词只允许出现在 rawOutputTerms（原始输出那几条链），不许回到本地化这条链上。
+  for (const term of ["NAT", "localhost", "wsl"]) {
+    assert.equal(
+      passes(`说明：${term} 已完成`),
+      `任务执行失败，请查看任务日志后重试。：说明：${term} 已完成`,
+      `${term} 被当成技术术语放过了 —— 它只属于 rawOutputTerms，不属于本地化这条链`,
+    );
+  }
+
+  // 门槛长度也别动：3 个字母的残留要判为残留，1~2 个的两端一样放过。
+  assert.equal(passes("说明：var 已完成"), "任务执行失败，请查看任务日志后重试。：说明：var 已完成");
+  assert.equal(passes("操作完成：见 no 目录"), "操作完成：见 no 目录");
+});
+
+// 断词规则也必须与服务端一致：Go 只按 ASCII 字母切词，数字与下划线不是词字符。
+//
+// 所以 `NUL2` 会被切成白名单里的 `NUL` + 残留的 `2`，**直通**。旧写法用的是 `\b`，而 JS
+// 的 \b 把数字/下划线也算 \w —— `NUL2` 既 replace 不掉、又整体成一个 ≥3 字母段，被判成
+// 残留英文。实测这四个形态在服务端全是直通，前端也必须一样。
+test("断词规则与服务端一致：数字/下划线紧邻白名单词仍算直通", () => {
+  const passes = (text: string) => eventDiagnostic(event("e", "run.failed", { error: text }))?.detail;
+  for (const text of ["说明：NUL2 已完成", "说明：NUL_x 已完成", "说明：JSON2 已完成", "说明：2NUL 已完成"]) {
+    assert.equal(
+      passes(text),
+      text,
+      `${text} 被判成了残留英文 —— 断词又用回 \\b 了（前端的 \\b 把数字/下划线也算词字符，服务端不算）`,
+    );
+  }
+  // 反面：紧邻数字只是**不断词**，不等于放过真正的英文残留。
+  assert.equal(passes("说明：var2 已完成"), "任务执行失败，请查看任务日志后重试。：说明：var2 已完成");
+});
+
+// 白名单是一份**拷贝**：app.go 那边加/删一个词，这里必须同步，否则两端形态又分叉。
+// 与其等它静默漂移，不如直接从 app.go 把词表读出来比。读不到文件（例如只拷了 web 目录
+// 的环境）就跳过，别把一个文件系统依赖变成红灯。
+//
+// ⚠️ 必须双向比（`deepEqual` 集合相等），不能只做"服务端每个词前端都放过"：
+// **多出来的词才是最初那起 bug 的成因**（NAT/localhost/wsl 就是这么跑偏的），
+// 单向检查对它完全无感。这条用例的第一版就是单向的。
+test("allowedTechnicalTerms 与 app.go 的词表集合相等（双向，多的词也算漂移）", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(
+    new URL("../../../control-server/internal/app/app.go", import.meta.url),
+    "utf8",
+  ).catch(() => "");
+  if (!source) return;
+
+  const body = source.slice(source.indexOf("func containsUntranslatedEnglish"));
+  assert.ok(body.length > 0, "app.go 里找不到 containsUntranslatedEnglish");
+  const block = body.slice(0, body.indexOf("}"));
+  const serverTerms = [...block.matchAll(/"([A-Za-z]+)":\s*true/g)].map((match) => match[1]);
+  // 锚点自证：抠不到就说明解析退化了，别让它悄悄对一个空集通过（同 mobile-remote-agent.test.mjs 的写法）。
+  assert.ok(serverTerms.length >= 10, `从 app.go 解析出的词表太短：${JSON.stringify(serverTerms)}`);
+
+  // 前端那张表没有导出（它是实现细节），同样从源码里抠；两个 set 字面量各自一行。
+  const frontend = await readFile(new URL("./timeline.ts", import.meta.url), "utf8");
+  const narrow = frontend.match(/const allowedTechnicalTerms = new Set\(\[([^\]]*)\]\)/)?.[1] ?? "";
+  assert.ok(narrow.includes("NUL"), "抠不到 allowedTechnicalTerms 的字面量（改成多行/换写法了？）");
+  const webTerms = [...narrow.matchAll(/"([A-Za-z]+)"/g)].map((match) => match[1]);
+
+  const sort = (terms: string[]) => [...terms].sort();
+  assert.deepEqual(
+    sort(webTerms),
+    sort(serverTerms),
+    "前端 allowedTechnicalTerms 与 app.go 的词表不是同一个集合（少一个词或多一个词都算漂移；"
+      + "多出来的词正是 NAT/localhost/wsl 那起 bug 的成因）",
+  );
+
+  // 行为抽查：证明上面抠出来的字面量**真的**被判定逻辑用着，而不是一个已失效的常量。
+  for (const term of serverTerms) {
+    const diagnostic = eventDiagnostic(event("t", "run.failed", { error: `说明：${term} 已完成` }));
+    assert.equal(
+      diagnostic?.detail,
+      `说明：${term} 已完成`,
+      `${term} 在 app.go 的白名单里，前端却没放过它 —— 表抠对了但没接进判定`,
+    );
+  }
+  assert.equal(
+    eventDiagnostic(event("t2", "run.failed", { error: "说明：wsl 已完成" }))?.detail,
+    "任务执行失败，请查看任务日志后重试。：说明：wsl 已完成",
+    "本地化这条链上 wsl 被放过了 —— 宽表（rawOutputTerms）外溢了",
+  );
+});
+
+// 宽表只能等于"窄表 + 那三个原始输出专用词"。写死比较，避免以后有人往宽表里再塞词
+// 而没人发现（宽表一旦长出新词，本地化链与原始输出链的分界就没人守了）。
+test("rawOutputTerms 只比窄表多 NAT / localhost / wsl 三个词", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const frontend = await readFile(new URL("./timeline.ts", import.meta.url), "utf8").catch(() => "");
+  if (!frontend) return;
+  const raw = frontend.match(/const rawOutputTerms = new Set\(\[\.\.\.allowedTechnicalTerms,([^\]]*)\]\)/)?.[1] ?? "";
+  assert.ok(raw.trim(), "抠不到 rawOutputTerms 的定义（改成别的写法了？锚点要跟着更新）");
+  const extra = [...raw.matchAll(/"([A-Za-z]+)"/g)].map((match) => match[1]);
+  assert.deepEqual([...extra].sort(), ["NAT", "localhost", "wsl"]);
 });
 
 test("unwraps Codex shell wrapper and labels command execution as terminal command", () => {

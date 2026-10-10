@@ -86,7 +86,10 @@ test("能不能安装的判据只有一个来源：模型，而且页面不许�
   assert.doesNotMatch(code, /meetsMinimumFor\?\.includes/, "页面里又判了一遍「够不够用」");
   assert.doesNotMatch(code, /Boolean\(runtime\?\.npmVersion\)/, "页面里又判了一遍「有没有 npm」");
   // 升级那两档更是判断，页面里一次都不该出现。
-  for (const forbidden of ["autoUpdatable", "upgradeNeedsGrant", "preflight.upgradeOk"]) {
+  // `preflight.installOk` 是 2026-10-09 补进这一列的：页面此前自己写了一遍
+  // `preflight && !preflight.installOk`，而那正好是 `preflightNote` 自带守卫的取反 ——
+  // 同一件事两处判，且守的那一处（模型）改了，页面这块会把话静默藏掉。
+  for (const forbidden of ["autoUpdatable", "upgradeNeedsGrant", "preflight.upgradeOk", "preflight.installOk"]) {
     assert.ok(!code.includes(forbidden), `页面里又出现了判据字段 ${forbidden}（它只该在 lib/cli-tools-view.ts 里）`);
   }
   // ③ 页面确实通过模型算卡片。
@@ -202,14 +205,12 @@ test("运行依赖仪表行：徽标 + 大数字满足度 + 状态点，竖线�
   // 不许出现判断形态（meetsMinimumFor.includes 已有别的断言禁着）。
   assert.match(code, /cli-tools-dep-meter">\s*<b>\{runtime\.meetsMinimumFor\?\.length \?\? 0\} \/ \{cards\.length\}<\/b>/);
   // 更新状态是读数不是动作：状态点走 data-tone 三档（ok 绿 / update 琥珀 / unknown 灰，
-  // 后者 = 服务端没取到版本索引，latestVersion 为空）。**判据在模型里**（runtimeLatestLine），
-  // 页面只把它的两个返回值放上去 —— 2026-09-29 之前页面自己写着
+  // 后者 = 服务端没取到版本索引，latestVersion 为空）。**判据与文案在模型里**
+  // （`runtimeDepLine`），页面只把它的两个返回值放上去 —— 2026-09-29 之前页面自己写着
   // `updateAvailable ? "update" : "ok"`，于是"读不到最新版本"被写成"已是最新"。
-  // 升级按钮仍只在那三个条件同时成立时出现。
-  assert.match(code, /cli-tools-dep-state" data-tone=\{depLatest\?\.tone\}/);
-  assert.match(code, /\{depLatest\?\.text\}/);
+  assert.match(code, /cli-tools-dep-state" data-tone=\{depLine\?\.tone\}/);
+  assert.match(code, /\{depLine\?\.text\}/);
   assert.doesNotMatch(code, /data-tone=\{runtime\.updateAvailable \? "update" : "ok"\}/);
-  assert.match(code, /runtimeLatestLine\(runtime\)/);
   assert.match(css, /\.cli-tools-dep-state\[data-tone="update"\]/);
   assert.match(css, /\.cli-tools-dep-state\[data-tone="unknown"\]/);
   assert.match(css, /\.cli-tools-dep-mark\[data-tone="missing"\]/);
@@ -222,12 +223,52 @@ test("运行依赖仪表行：徽标 + 大数字满足度 + 状态点，竖线�
   assert.match(code, /\{!view\?\.remoteInstallAllowed && <p className="cli-tools-dep-grant">/);
   // 没装分支的原因文案与兜底不许丢（2026-09-25 复查补钉）。
   assert.match(code, /installBlockedReason \|\| "CLI 工具要通过 npm 安装，需要先装好它。"/);
-  // 升级按钮的三个条件必须同时成立，少一个就是点了必失败的按钮。
-  assert.match(code, /runtime\.installSupported && runtime\.updateAvailable && view\?\.remoteInstallAllowed/);
   // 确认弹窗里写具体的下载源与托管位置（2026-09-25 复查修正：这两个事实此前全页零渲染，
   // view.ts 却一直带着字段 —— 「算了但没人读」）。只显示，不判。
   assert.match(code, /runtimeCatalog\?\.source \? <><code>\{runtimeCatalog\.source\}<\/code>/);
   assert.match(code, /runtime\?\.managedPath \? <>（<code>\{runtime\.managedPath\}<\/code>）<\/>/);
+});
+
+test("运行依赖那一行：读数与升级按钮同源，且授权门只挡按钮不挡读数（2026-10-09）", () => {
+  // 修的是一个用户报得出的症状（未授权的 WSL 上）：那一行写着「可升级到 24.21.0」，
+  // 按钮不渲染，而且**那一行一个字都不解释**。根因是判据分裂 —— 页面自己数三个条件
+  // （installSupported && updateAvailable && remoteInstallAllowed），而那句读数只看
+  // updateAvailable。所以这条用例钉的是**同源**：判据、文案、按钮三件事一起由模型给。
+  //
+  // ⚠️ 两段式（本文件的老规矩）：① 页面里不许再出现那份判据；② 它必须在模型里、
+  // 且有真的调用去验它（lib/cli-tools-view.test.ts 五个状态逐条钉）。
+  assert.match(code, /runtimeDepLine\(runtime, Boolean\(view\?\.remoteInstallAllowed\)\)/);
+  assert.match(code, /const depAction = depLine\?\.action;/);
+  assert.match(code, /\{depAction && <button/);
+  assert.match(code, /\{depAction\.label\}/);
+  // 动作种类**照模型给的发**，页面不自己写死一个 kind（否则将来依赖条长出第二种动作时，
+  // TS 一声不响，页面照样发 install-runtime）。
+  assert.match(code, /setPending\(\{ kind: depAction\.kind \}\)/);
+  // 反面：页面里不许再有第二份口径。**判据按"页面不许读那个读数"来钉，不认写法的顺序与
+  // 空格** —— 2026-10-09 独立复查指出：原先那条 `!code.includes("runtime.installSupported
+  // && runtime.updateAvailable")` 只认那一种字面量与那一种先后，把条件换个顺序重写
+  // （`runtime.updateAvailable && runtime.installSupported && …`）就整体漏过。
+  // 现在 `updateAvailable` / `latestVersion` 都只该在模型里被读，页面一个都不许碰 ——
+  // 无论它将来怎么排列组合那三个条件，只要再判一次就会在这里红。
+  assert.ok(!code.includes("runtime.updateAvailable"), "页面又自己读 updateAvailable 了（那一行说什么、给不给按钮只能由模型判）");
+  assert.ok(!code.includes("runtime.latestVersion"), "页面又自己读 latestVersion 了（按钮文案由模型给）");
+  // ⚠️ 授权那一位**必须按 `view` 传**：漏传（或写成恒真的字面量）等于把"未授权"当成
+  // "可以升"，于是按钮亮起来而服务端会 403（runtime_install.go:291 那道闸门，
+  // 接口层自己拒）。上面那条正则把 `Boolean(view?.remoteInstallAllowed)` 钉死，
+  // 写成 `true` 就失配 —— 不必再补一条同义的反面断言。
+  //
+  // 「没授权所以这颗按钮现在不给」只有一条措辞，两处（升级 / 重装）共用 —— 各写一句
+  // 必然漂移成"同一件事两种说法"，而这一页的存在意义正是"别再让用户从噪音里挑信息"。
+  assert.match(viewCode, /export const grantNeededReason = "需先授权在这台主机上安装";/);
+  // 第二条同族缺陷（同一处修的）：授权门原先挡在**整段** npm 读数上
+  // （`… && !runtime.npmVersion && view?.remoteInstallAllowed &&`），未授权时
+  // "随包的 npm 不可用"这条机器事实跟着消失 —— 而它与授没授权无关。现在门只挡按钮。
+  assert.match(code, /\{runtime\?\.installed && runtime\.installSupported && !runtime\.npmVersion &&\s*<p className="cli-tools-note">/);
+  assert.ok(!code.includes("!runtime.npmVersion && view?.remoteInstallAllowed"), "那条 npm 读数又被授权门整段挡掉了");
+  assert.match(code, /\{view\?\.remoteInstallAllowed\s*\?\s*<button className="secondary"/);
+  assert.match(code, />重装<\/button>/);
+  // 收回按钮时照那条缘由说清为什么，不写第二份措辞。
+  assert.match(code, /\{grantNeededReason\}（见上）。/);
 });
 
 test("页脚那一整块已删，且没有事实因此失联", () => {
@@ -457,12 +498,25 @@ test("服务端算好的每个字段都有渲染路径上的消费点", () => {
   assert.match(code, /preflightNote\(openDiagnosis\.preflight\)/);
   assert.match(model, /export function preflightNote/);
   assert.match(model, /if \(!preflight \|\| preflight\.installOk\) return ""/);
+  // 抽屉那块「预检」由**算好的那句话**决定出不出现（有话说才出现），页面不再对着
+  // installOk 重判一次（2026-10-09）。等价性由模型那两条用例钉着：
+  // `preflightNote(undefined) === ""`、`preflightNote({installOk: true, …}) === ""`。
+  assert.match(code, /const openPreflightNote = openDiagnosis \? preflightNote\(openDiagnosis\.preflight\) : "";/);
+  assert.match(code, /\{openPreflightNote && <div className="cli-tools-diagnosis-block">/);
+  assert.match(code, /\{openPreflightNote\}<\/p>/);
   assert.match(viewCode, /!preflight\.upgradeOk/);
   // 通道状态与 runnerId 也要消费（前者决定 skipped 的说法，后者校验响应归属）。
   assert.match(code, /result\.runnerId !== runnerID/);
-  // `meetsMinimumFor` 与 `updateAvailable` 在页面上也确实被读了（依赖条那两处）。
+  // `meetsMinimumFor` 与 `updateAvailable` 也都要有渲染路径上的消费点（依赖条那一处）。
+  // 前者由页面直接读；后者 2026-10-09 起改由模型读（`runtimeDepLine` 拿它与另外两道闸门
+  // 一起决定那一行说什么、按钮给不给），页面只渲染结论 —— 所以断言落在模型里。
   assert.match(code, /runtime\.meetsMinimumFor\?\.length/);
-  assert.match(code, /runtime\.updateAvailable/);
+  assert.match(viewCode, /runtime\.updateAvailable/);
+  assert.match(viewCode, /!runtime\.latestVersion/);
+  // 运行时的 `installBlockedReason` 现在有两处出口：没装那一分支，以及"装了但这个环境
+  // 装不了运行时"时那句缘由（后者是 2026-10-09 补的 —— 此前装了之后它全页零渲染）。
+  assert.match(code, /runtime\?\.installBlockedReason/);
+  assert.match(viewCode, /runtime\.installBlockedReason/);
 });
 
 test("样式：诊断面板四档观感各不相同，且变体一律走 data-*", () => {
@@ -555,6 +609,61 @@ test("详情抽屉不开场白；CodeBuddy 那句登录提示只给 CodeBuddy", 
   // 但它不能整个删 —— CodeBuddy 走官方交互式授权，后端那条等价指引要等点过
   // 「发起登录」才经 loginInfo.message 出现（agent_login.go），这是事前唯一出口。
   assert.match(code, /loginAgent\.agentID === "codebuddy" && <p className="cli-tools-hintline">提示：CodeBuddy/);
+});
+
+// ── 卡片上的动作：主操作 + 需要登录时的「登录」+ 需要时的「详情」─────────────
+//
+// 背景（2026-10-08 用户报）：卡片上每张都挂一颗「详情」按钮，而抽屉里绝大多数素材
+// （路径、证据、日志）在卡片上其实已经有了 —— 对健康卡那颗按钮没有信息量，还会在卡底
+// 留下一条空动作条。处置：**健康卡不给「详情」**；需要登录的工具把「登录」摆到卡片上。
+//
+// 2026-10-09 补：删「详情」后又发现它删过头了 —— 抽屉的主入口只有顶部横幅，而横幅只
+// 指向**第一张**命中的问题卡。于是"第 2 张要处理的卡"和 statusTone=unknown 的"没查成"
+// 那一档再也没有入口，卡片文案却让用户"按详情里的证据手动处理"。现在：模型用
+// `canOpenDetails` 单独说"这张卡的下一步就在抽屉里"（④ 修不了 / ⑤ 没查成），页面据此
+// 补一颗「详情」；健康卡照旧不给。抽屉不再是登录的入口。
+
+test("抽屉入口：横幅给唯一那张问题卡，卡片在需要时自己补一颗「详情」", () => {
+  // 横幅仍是"当前这张问题卡"的主入口。
+  assert.match(code, /setOpenAgent\(banner\.agentID\)/);
+  assert.match(code, /看看是什么问题/);
+  // 但横幅只指向**第一张**命中的问题卡（bannerFor 用 find）。对"第 2 张要处理的卡"与
+  // statusTone=unknown 的"这次没检查成功"档，卡片必须自己留一颗入口 —— 否则卡片文案让
+  // 用户"按「详情」里的证据手动处理"，抽屉却没有任何入口。判据由模型给（canOpenDetails）。
+  assert.match(code, /\{card\.canOpenDetails && <button type="button" className="secondary"/);
+  const detailsAt = code.indexOf("{card.canOpenDetails && <button");
+  assert.ok(detailsAt > 0, "找不到卡片上的「详情」入口");
+  assert.match(code.slice(detailsAt, detailsAt + 260), /setOpenAgent\(card\.id\)/);
+  assert.match(viewCode, /canOpenDetails: false/);
+  assert.match(viewCode, /card\.canOpenDetails = true/);
+  // ⚠️ 动作区带 border-top 与浅底：三颗按钮（主操作 / 登录 / 详情）**都 absent** 时整条不能
+  //    渲染，否则"已是最新、不需要登录、无需详情"那张最常见的健康卡会留下一条空条。
+  assert.match(code, /\{\(card\.primary \|\| card\.canLogin \|\| card\.canOpenDetails\) && <div className="cli-tools-card-actions">/,
+    "动作区没有做空档守卫，没有动作的卡片会留下一条空条");
+});
+
+test("需要登录的工具把「登录」摆在卡片上，判据来自模型", () => {
+  // 页面只渲染模型给的 `canLogin`，不自己拼判据（supportsLogin / installed 都不许再出现）。
+  assert.match(code, /\{card\.canLogin && <button type="button" className="secondary"/);
+  assert.match(viewCode, /canLogin: Boolean\(entry\.supportsLogin\)/);
+  assert.doesNotMatch(code, /supportsLogin/, "页面里出现了第二份「能不能登录」的判据");
+  // 点开的是登录面板，且开面板前要把上一轮的登录态清掉（否则会带着上一台/上一个工具的结果）。
+  const loginAt = code.indexOf("{card.canLogin && <button");
+  assert.ok(loginAt > 0, "找不到卡片上的「登录」按钮");
+  const block = code.slice(loginAt, loginAt + 500);
+  assert.match(block, /setLoginAgent\(\{ agentID: card\.id, name: card\.name \}\)/);
+  assert.match(block, /setLoggedIn\(false\)/);
+  assert.match(block, /setLoginInfo\(null\)/);
+});
+
+test("抽屉里不再重复给「登录」（两个入口做同一件事）", () => {
+  const drawerAt = code.indexOf("cli-tools-detail");
+  const pendingAt = code.indexOf("cli-tools-confirm-title");
+  assert.ok(drawerAt > 0 && pendingAt > drawerAt, "找不到详情抽屉或它后面的确认框");
+  // 只取**抽屉那一块**（到确认框为止）—— 后面的登录面板里当然有「发起登录」这些字。
+  const drawer = code.slice(drawerAt, pendingAt);
+  assert.doesNotMatch(drawer, />登录</, "抽屉里又出现了「登录」—— 它现在只在卡片上");
+  assert.doesNotMatch(drawer, /supportsLogin/);
 });
 
 

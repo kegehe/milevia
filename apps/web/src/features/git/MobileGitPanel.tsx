@@ -26,11 +26,31 @@ export interface MobileGitPanelHandle {
   showTopLevel: () => boolean;
   /** 重新读一遍仓库状态（顶栏 ⋯ 菜单里的「刷新仓库状态」走它）。 */
   reload: () => void;
+  /**
+   * 后台对账：不置任何 loading、不动在位的内容。
+   *
+   * 宿主在收到结构事件（AI 的工具调用、运行起止）时节流调用它 —— 手机停在这一页时
+   * "电脑那边的改动自己会出现"靠这条。宿主**不需要**知道仓库到底变没变：
+   * 工作台会先只问一句 summary，一样就到此为止（见 GitWorkbenchHandle.refreshInBackground）。
+   */
+  refreshInBackground: () => void;
 }
 
 interface MobileGitPanelProps {
   projectId: string;
   conversationId?: string;
+  /**
+   * 项目当前是不是 git 仓库（页面按 `project.gitBranch === NON_GIT_BRANCH` 判）。
+   *
+   * 手机端**必须**把这个真相传下来，不能靠工作台 `initialIsGitRepo` 的默认 true 兜：
+   *  · 假认成仓库，工作台会去读一个非 git 目录（服务端必失败），用户面对一个完全正常的
+   *    项目，看到的却是"读不到仓库状态"；
+   *  · 更要紧的是**后台对账**：它由结构事件自动触发，假认成仓库就等于在 AI 每跑一步时
+   *    反复去撞一堵必失败的墙。
+   * 中继的 op 表里没有 `git.init`（见 control-server 的 remote_git.go），所以手机端也
+   * 初始化不了 —— 空态那颗按钮在手机端换成一行动作说明（见 GitWorkbench 的空态）。
+   */
+  isGitRepo: boolean;
   /**
    * 中继发信器。它的**身份**同时编码了"哪台电脑 / 哪个项目 / 哪个工作区" ——
    * 页面在换其中任何一个时都会换一个新的，所以下面只拿它当依赖
@@ -39,7 +59,7 @@ interface MobileGitPanelProps {
   transport: MobileRpcTransport;
 }
 
-export const MobileGitPanel = forwardRef<MobileGitPanelHandle, MobileGitPanelProps>(function MobileGitPanel({ projectId, conversationId, transport }, ref) {
+export const MobileGitPanel = forwardRef<MobileGitPanelHandle, MobileGitPanelProps>(function MobileGitPanel({ projectId, conversationId, isGitRepo, transport }, ref) {
   const workbenchRef = useRef<GitWorkbenchHandle | null>(null);
   const [error, setError] = useState("");
   // 可恢复的提示（目前只有一种：服务端说"仓库状态已变化，已为你刷新"）。
@@ -62,6 +82,7 @@ export const MobileGitPanel = forwardRef<MobileGitPanelHandle, MobileGitPanelPro
   useImperativeHandle(ref, () => ({
     showTopLevel: () => workbenchRef.current?.showTopLevel() ?? false,
     reload: () => workbenchRef.current?.reload(),
+    refreshInBackground: () => workbenchRef.current?.refreshInBackground(),
   }), []);
 
   return <section className="mobile-git" aria-label="Git 工作台">
@@ -78,6 +99,7 @@ export const MobileGitPanel = forwardRef<MobileGitPanelHandle, MobileGitPanelPro
       fail={(message) => { if (message !== STALE_STATE_NOTICE) setError(message); }}
       active
       mobile
+      initialIsGitRepo={isGitRepo}
     />
   </section>;
 });

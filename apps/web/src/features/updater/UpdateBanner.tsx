@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isDesktop } from "../../lib/runtime";
-import { bannerUpdate, downloadPhase, nextStatusPollMs, readyUpdate, CHECK_POLL_MS, IDLE_POLL_MS, type UpdaterStatus } from "./update-view";
+import { bannerUpdate, downloadFailureReason, downloadPhase, nextStatusPollMs, readyUpdate, CHECK_POLL_MS, IDLE_POLL_MS, type UpdaterStatus } from "./update-view";
 import "./updater.css";
 
 type ProgressEvent = {
@@ -167,19 +167,23 @@ export function UpdateBanner() {
   if (!update) return null;
   const ready = view.kind === "ready";
   const failed = downloadPhase(status) === "failed";
+  // 静默下载失败的原因（Rust 侧已按下载语境本地化）。横幅这一行是 nowrap + 省略号，
+  // 长了会被截断，所以同时挂 title —— 截断也不至于把原因整个吞掉。
+  const downloadError = downloadFailureReason(status);
+  // 这里从 JSX 的多个文本节点改成了一个模板串，所以要自己处理"值为 undefined"：
+  // JSX 的 {undefined} 什么都不渲染，而模板串会写出 "undefined"。`update` 非空
+  // 就意味着 status 非空（bannerUpdate 的守卫），`?? ""` 只是把老行为钉住。
+  const statusLine = `当前 v${status?.appVersion ?? ""}` + (ready
+    ? " · 更新包已下载完成，点击安装后应用会自动重启"
+    : failed
+      ? ` · 后台下载未完成${downloadError ? `：${downloadError}` : ""}，点击后重新下载并安装`
+      : update.notes ? ` · ${update.notes.trim().slice(0, 60)}` : "");
 
   return (
     <div className="update-banner" role="status">
       <div className="update-banner-text">
         <strong>{ready ? `新版本 v${update.version} 已就绪` : `发现新版本 v${update.version}`}</strong>
-        <span>
-          当前 v{status?.appVersion}
-          {ready
-            ? " · 更新包已下载完成，点击安装后应用会自动重启"
-            : failed
-              ? " · 后台下载未完成，点击后重新下载并安装"
-              : update.notes ? ` · ${update.notes.trim().slice(0, 60)}` : ""}
-        </span>
+        <span title={failed && downloadError ? statusLine : undefined}>{statusLine}</span>
       </div>
       <button className="update-banner-action" onClick={() => void install(ready)}>
         {ready ? "立即安装" : "立即升级"}

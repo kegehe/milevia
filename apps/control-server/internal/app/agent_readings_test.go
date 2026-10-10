@@ -102,8 +102,10 @@ func (r *countingCheckRunner) checkCount() int {
 // newReadingsFixture 造一台"只有远端 runner"的轻量 Server。
 //
 // 刻意用**远端** meta：本机的 codex / codebuddy 由独立的 runner 提供（会真的去探），
-// 而远端环境下它们走 agentBackend 的"该环境不支持 / 尚未接通"分支 —— 于是这一组
-// 用例只依赖我们自己的替身，不去碰机器上真实装了什么。
+// 而远端环境下 codex / codebuddy 走 agentBackend 的兜底分支 —— 这里的替身**没有**
+// crossShellRunner（见 agent_catalog_backend.go），所以它们落进"尚未接通"那一档
+// （实现了跨端执行面的 runner 会在那里被目录驱动后端接管，当时这一组用例的意图是
+// 只依赖我们自己的替身、不去碰机器上真实装了什么）。
 func newReadingsFixture(t *testing.T, runner AgentRunner) (*Server, RunnerMeta) {
 	t.Helper()
 	server := &Server{

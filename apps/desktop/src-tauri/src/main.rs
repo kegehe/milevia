@@ -342,7 +342,10 @@ impl UpdateCheckState {
 /// 也就没机会执行；而 milevia-control.exe 只能靠 parent-watch 发现自己成了孤儿，
 /// 安装程序覆写它时它往往还在运行 —— 于是必弹"无法打开要写入的文件"。
 /// 顺带也让 SQLite 正常收尾（否则升级后首次启动可能卡在"库被锁定"）。
-fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+fn build_updater(
+    app: &tauri::AppHandle,
+    stage: UpdateStage,
+) -> Result<tauri_plugin_updater::Updater, String> {
     app.updater_builder()
         .timeout(UPDATE_DOWNLOAD_TIMEOUT)
         // 连接假死（没断、也不再吐数据）只靠总超时要等满 45 分钟。加一条读停滞
@@ -356,9 +359,34 @@ fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater
             }
         })
         .build()
-        .map_err(localize_update_error)
+        .map_err(|error| localize_update_error(stage, error))
 }
 
+/// 更新链路上出错的是哪一步 —— 决定「<前缀>失败：<原因>」里的前缀。
+///
+/// 同一句英文原文（`connection reset`）在两步里要说成不同的话：一次**下载**失败
+/// 若被写成"检查更新失败"，用户会去查"为什么连不上更新源"，而其实检查早就成功了，
+/// 断的是下载那一跳。这个区分不是修辞——`UpdateDownloadRepr.error` 里放的就是
+/// 下载语境的错误，它曾经由一份写死"检查更新失败"的文案产出。
+#[derive(Clone, Copy)]
+enum UpdateStage {
+    /// 问更新源有没有新版本。
+    Check,
+    /// 把新版本整包下下来并验签。
+    Download,
+    /// 安装（含现场重新下载的老路径）。
+    Install,
+}
+
+impl UpdateStage {
+    fn prefix(self) -> &'static str {
+        match self {
+            UpdateStage::Check => "检查更新",
+            UpdateStage::Download => "下载更新",
+            UpdateStage::Install => "安装更新",
+        }
+    }
+}
 
 /// 把 tauri-plugin-updater 的英文错误转成中文。
 ///
@@ -368,22 +396,33 @@ fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater
 ///
 /// 未命中任何一类时也必须套一层中文外壳——「更新失败：<原文>」——不能原样返回英文。
 /// 原文一律附在括号里：排障与搜索都要靠它。
-fn localize_update_error(raw: impl std::fmt::Display) -> String {
+fn localize_update_error(stage: UpdateStage, raw: impl std::fmt::Display) -> String {
     let text = raw.to_string();
     let lower = text.to_lowercase();
+    let action = stage.prefix();
     // 三类判据都取插件文案里稳定出现的词，不做语义猜测；认不出就走最后那条兜底。
     if lower.contains("timed out") || lower.contains("timeout") || lower.contains("dns")
         || lower.contains("connect") || lower.contains("network")
     {
-        return format!("检查更新失败：网络不可用（{text}）");
+        return format!("{action}失败：网络不可用（{text}）");
     }
     if lower.contains("404") || lower.contains("not found") {
-        return format!("检查更新失败：更新源上没有这个版本的文件（{text}）");
+        return format!("{action}失败：更新源上没有这个版本的文件（{text}）");
     }
     if lower.contains("signature") || lower.contains("verify") || lower.contains("minisign") {
         return format!("更新包校验失败：签名与当前应用不匹配（{text}）");
     }
     format!("更新失败：{text}")
+}
+
+/// 与更新无关的本地进程（Agent / 控制服务）启动错误的中文外壳。
+///
+/// 它们同样是纯英文直出（`std::io::Error`、Tauri 的 Command 错误），需要中文外壳；
+/// 但**不能借用更新那套前缀**——"找不到 sidecar 可执行文件"被说成"检查更新失败"
+/// 是张冠李戴，而"更新源上没有这个版本的文件"这类判据套到本地进程上更是胡话。
+/// 所以这里只套壳、不做语义分类。
+fn localize_startup_error(what: &str, raw: impl std::fmt::Display) -> String {
+    format!("{what}失败：{raw}")
 }
 
 async fn perform_update_check(app: &tauri::AppHandle) -> UpdateInfoRepr {
@@ -402,11 +441,11 @@ async fn perform_update_check(app: &tauri::AppHandle) -> UpdateInfoRepr {
         0
     };
     let result = async {
-        let updater = build_updater(app)?;
+        let updater = build_updater(app, UpdateStage::Check)?;
         let update = tokio::time::timeout(UPDATE_CHECK_TIMEOUT, updater.check())
             .await
             .map_err(|_| "检查更新超过 45 秒仍未完成，请检查网络后重试".to_string())?
-            .map_err(localize_update_error)?;
+            .map_err(|error| localize_update_error(UpdateStage::Check, error))?;
         Ok::<Option<Update>, String>(update)
     }
     .await;
@@ -522,7 +561,7 @@ async fn background_download(app: tauri::AppHandle, update: Update) {
                 store_downloaded(&app, &version, update.clone(), bytes);
                 return;
             }
-            Ok(Err(error)) => last_error = localize_update_error(error),
+            Ok(Err(error)) => last_error = localize_update_error(UpdateStage::Download, error),
             Err(_) => {
                 last_error = format!(
                     "更新下载超过 {} 分钟仍未完成",
@@ -644,7 +683,7 @@ fn install_pending(app: &tauri::AppHandle, pending: PendingUpdate) -> Result<(),
             state.pending = Some(pending);
             state.sync_download();
         }
-        return Err(localize_update_error(error));
+        return Err(localize_update_error(UpdateStage::Install, error));
     }
     // Windows 上 install_inner 内部已 `std::process::exit(0)`，走不到这里；
     // 其它平台兜底重启一次。
@@ -707,7 +746,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<InstallUpdateResult, St
 
 /// 老路径：现场检查一次，有新版就下载并安装。
 async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateResult, String> {
-    let updater = build_updater(app)?;
+    let updater = build_updater(app, UpdateStage::Install)?;
     let _ = app.emit(
         "updater://progress",
         serde_json::json!({ "phase": "checking", "received": 0, "total": null }),
@@ -715,7 +754,7 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
     let update = tokio::time::timeout(UPDATE_CHECK_TIMEOUT, updater.check())
         .await
         .map_err(|_| "检查更新超过 45 秒仍未完成，请检查网络后重试".to_string())?
-        .map_err(localize_update_error)?;
+        .map_err(|error| localize_update_error(UpdateStage::Check, error))?;
     let Some(update) = update else {
         let update_check = app.state::<UpdateCheck>();
         if let Ok(mut state) = update_check.state.lock() {
@@ -756,7 +795,7 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
     .await;
     match download {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(localize_update_error(error)),
+        Ok(Err(error)) => return Err(localize_update_error(UpdateStage::Download, error)),
         Err(_) => {
             return Err(format!(
                 "更新下载超过 {} 分钟仍未完成，请检查网络后重试",
@@ -984,8 +1023,8 @@ fn enroll_remote_agent(app: tauri::AppHandle, enrollment_token: String) -> Resul
         .as_ref()
         .map(|sidecar| sidecar.local_agent_token.clone())
         .ok_or("本地控制服务尚未启动")?;
-    let agent =
-        start_agent(&app, &local_agent_token, Some(token)).map_err(localize_update_error)?;
+    let agent = start_agent(&app, &local_agent_token, Some(token))
+        .map_err(|error| localize_startup_error("启动 Agent", error))?;
     *app.state::<ManagedAgent>()
         .0
         .lock()
@@ -2028,7 +2067,7 @@ fn main() {
             });
             let local_agent_token = Uuid::new_v4().simple().to_string();
             let sidecar = start_sidecar(&app.handle(), &local_agent_token)
-                .map_err(localize_update_error)?;
+                .map_err(|error| localize_startup_error("启动本地控制服务", error))?;
             if let Err(error) = create_main_window(&app.handle(), &sidecar) {
                 let mut sidecar = sidecar;
                 stop_running_sidecar(&mut sidecar);
@@ -2207,6 +2246,55 @@ mod tests {
             version: version.to_string(),
             notes: None,
         }
+    }
+
+    /// 同一条英文原文，说法必须跟着**出错的那一步**走。
+    ///
+    /// 回归的是：`background_download` 重试全败时把错误写进 `download.error`，
+    /// 而它当时借的是检查语境的文案 —— 一次下载失败被说成"检查更新失败"，
+    /// 用户会去查"为什么连不上更新源"，可检查其实早就成功了。
+    #[test]
+    fn update_error_wording_follows_the_stage() {
+        let network = "error sending request: connection reset by peer";
+        // 每一步都要说自己的话：一次下载失败绝不能被说成"检查更新失败"。
+        let check = localize_update_error(UpdateStage::Check, network);
+        let download = localize_update_error(UpdateStage::Download, network);
+        let install = localize_update_error(UpdateStage::Install, network);
+        assert!(check.starts_with("检查更新失败：网络不可用"), "{check}");
+        assert!(download.starts_with("下载更新失败：网络不可用"), "{download}");
+        assert!(install.starts_with("安装更新失败：网络不可用"), "{install}");
+        assert!(
+            !download.contains("检查"),
+            "下载失败不能说成检查失败：{download}"
+        );
+        // 原文一律留在括号里：排障与搜索都靠它。
+        assert!(download.contains(network));
+
+        // 404 跟着步骤走；签名不匹配与步骤无关（只有下载会验签），说法唯一。
+        let missing = localize_update_error(UpdateStage::Download, "404 Not Found");
+        assert!(missing.starts_with("下载更新失败：更新源上没有这个版本的文件"));
+        for stage in [UpdateStage::Check, UpdateStage::Download] {
+            let text = localize_update_error(stage, "signature verification failed");
+            assert!(text.starts_with("更新包校验失败：签名与当前应用不匹配"), "{text}");
+        }
+
+        // 认不出的原文也必须套中文外壳，绝不能原样英文直出。
+        assert_eq!(
+            localize_update_error(UpdateStage::Download, "unexpected end of file"),
+            "更新失败：unexpected end of file"
+        );
+    }
+
+    /// 本地进程启动错误不能借用更新那套前缀（"找不到 sidecar 可执行文件"说成
+    /// "检查更新失败"是张冠李戴，套上"更新源上没有这个版本的文件"更是胡话）。
+    #[test]
+    fn startup_errors_do_not_borrow_the_update_wording() {
+        let text = localize_startup_error("启动本地控制服务", "failed to spawn sidecar: not found");
+        assert_eq!(
+            text,
+            "启动本地控制服务失败：failed to spawn sidecar: not found"
+        );
+        assert!(!text.contains("更新"));
     }
 
     #[test]

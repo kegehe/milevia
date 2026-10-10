@@ -368,6 +368,11 @@
   background: #e5f4ea !important;
   display: grid !important;
   place-items: center !important;
+  /* sonner 自身的 justify-content:flex-start（flex 语义）在 grid 下会把 16px
+     单列轨道压到容器最左 —— svg 实测偏左 6px，透明圆环底下一眼可见。
+     显式把轨道居中（place-items 只能居中轨道内的 item，管不到轨道本身）。 */
+  justify-content: center !important;
+  align-content: center !important;
 }
 [data-sonner-toast] [data-icon] svg {
   width: 16px !important;
@@ -428,4 +433,131 @@
   [data-sonner-toast] [data-button] {
     transition: none !important;
   }
+}
+
+/* ===== 方案E轨迹卡 —— 通知中心 toast（.notif-toast 限定） =====
+ * 只有 NotificationProvider 弹的通知套这层形态（圆环图标 / 文字链接操作 /
+ * 右下角倒计时提示 / 底部进度条）；其他页面的操作反馈 toast 保持上面的通用主题。
+ *
+ * 进度条由 NotificationToastBody 用 JS 驱动（内联 scaleX），刻意不用 CSS 动画：
+ * sonner 的计时在「容器悬停」「页面隐藏」时暂停（见其源码 Timer），CSS 动画
+ * 跟不住这两个暂停，条会和 toast 的真实消失时机脱节。
+ *
+ * 特异性纪律：下面的覆盖统一用 [data-sonner-toast].notif-toast[data-type] =
+ * (0,3,0) 起步，压过上方 (0,1,0)/(0,2,0) 的通用主题；两边都带 !important 时
+ * 特异性高者胜，不依赖源码顺序。 */
+
+/* 底部留出提示行 + 进度条的空间；白底软投影替代左色条 + 硬投影 */
+[data-sonner-toast].notif-toast {
+  padding: 13px 14px 26px !important;
+  border-radius: 10px !important;
+  border-color: #e0ebe4 !important;
+  background: #fff !important;
+}
+[data-sonner-toast].notif-toast[data-type] {
+  box-shadow: 0 8px 24px rgba(23, 54, 44, 0.09) !important;
+}
+
+/* 圆环状态图标（替代通用圆角方块） */
+[data-sonner-toast].notif-toast[data-type] [data-icon] {
+  width: 34px !important;
+  height: 34px !important;
+  box-sizing: border-box !important; /* 34px 含 2px 描边，与方案E稿一致 */
+  border-radius: 50% !important;
+  border: 2px solid #d8e8de !important;
+  background: transparent !important;
+  /* 去掉 sonner 的 -3px 左偏，圆环左缘与文字列对齐；间距靠 margin-right 补足 */
+  margin-left: 0 !important;
+  margin-right: 6px !important;
+}
+
+/* 关闭按钮收进卡片右上角 —— sonner 默认骑在左上角外沿（实测悬出 6px），
+   与卡片形态不搭。旧式 toast 保持 sonner 原样，只改方案E这一层。 */
+[data-sonner-toast].notif-toast [data-close-button] {
+  left: auto !important;
+  right: 8px !important;
+  top: 8px !important;
+  transform: none !important;
+}
+/* 关闭钮挪进卡片后，给标题行让位，防止长标题顶到按钮底下 */
+[data-sonner-toast].notif-toast [data-title] {
+  padding-right: 22px !important;
+}
+[data-sonner-toast].notif-toast[data-type="success"] [data-icon],
+[data-sonner-toast].notif-toast[data-type="info"] [data-icon] {
+  color: #2c7567 !important;
+  border-color: #d8e8de !important;
+}
+[data-sonner-toast].notif-toast[data-type="error"] [data-icon] {
+  color: #b44b38 !important;
+  border-color: #f0d5cb !important;
+}
+[data-sonner-toast].notif-toast[data-type="warning"] [data-icon] {
+  color: #a06f16 !important;
+  border-color: #f0d49a !important;
+}
+
+/* 操作降级为文字链接（高优先级常驻通知同样适用） */
+[data-sonner-toast].notif-toast[data-type] [data-button] {
+  border: none !important;
+  background: transparent !important;
+  color: #2c7567 !important;
+  font-size: 12.5px !important;
+  font-weight: 800 !important;
+  padding: 2px 2px !important;
+  height: auto !important;
+  min-height: 0 !important;
+}
+[data-sonner-toast].notif-toast [data-button]:hover {
+  color: #1f6055 !important;
+  background: transparent !important;
+}
+
+/* 标题行内的项目名小标 */
+.notif-project {
+  margin-left: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #809188; /* style.css 注脚色 */
+}
+
+/* 右下角倒计时 / 保留提示（NotificationToastBody 每秒更新文字） */
+.notif-remaining {
+  position: absolute;
+  right: 14px;
+  bottom: 9px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: #809188;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+}
+
+/* 底部进度条：轨道贴满 toast 内宽，剩余时间由 .notif-progress-bar 的内联
+   transform: scaleX() 表达（left 对齐 = 绿条从右往左退） */
+.notif-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  border-radius: 0 0 7px 7px;
+  overflow: hidden;
+  background: #e3ece7; /* style.css 分隔色 */
+}
+.notif-progress-bar {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform-origin: left center;
+  background: linear-gradient(90deg, #2c7567, #63a890);
+}
+[data-sonner-toast].notif-toast[data-type="error"] .notif-progress-bar {
+  background: linear-gradient(90deg, #b44b38, #d98a72);
+}
+[data-sonner-toast].notif-toast[data-type="warning"] .notif-progress-bar {
+  background: linear-gradient(90deg, #e08a1a, #edaa55);
+}
+[data-sonner-toast].notif-toast[data-type="info"] .notif-progress-bar {
+  background: linear-gradient(90deg, #2c7567, #63a890);
 }

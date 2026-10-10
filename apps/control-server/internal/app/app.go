@@ -478,14 +478,19 @@ func (err *projectWorkspaceOccupiedError) Error() string {
 }
 
 type Project struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Path        string    `json:"-"`
-	PathDisplay string    `json:"pathDisplay"`
-	FullPath    string    `json:"fullPath"`
-	Runner      string    `json:"runner"`
-	RunnerID    string    `json:"runnerId"`
-	Environment string    `json:"environment"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Path        string `json:"-"`
+	PathDisplay string `json:"pathDisplay"`
+	FullPath    string `json:"fullPath"`
+	Runner      string `json:"runner"`
+	RunnerID    string `json:"runnerId"`
+	Environment string `json:"environment"`
+	// LocalRunner 表示项目跑在**服务端本机**的 runner 上（isLocalRunnerID：Windows
+	// 服务端为 ""/windows-local，其余平台为 ""/wsl-local）。前端不能自己按 runner id
+	// 拼这个判据——那是按平台的，Windows 服务端上的 wsl-local 项目会被误判成"本机"，
+	// 而自动编排在派发时只认本机 runner（orchestration.go 的派发前置检查）。
+	LocalRunner bool      `json:"localRunner"`
 	GitBranch   string    `json:"gitBranch"`
 	ClaudeReady bool      `json:"claudeReady"`
 	CodexReady  bool      `json:"codexReady"`
@@ -1150,16 +1155,19 @@ func (s *Server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	// Local Agent relay endpoints. 除 /api/remote/rpc 之外都只暴露控制类元数据；
-	// 那个端点提供**项目沙箱内**的文件读写、以及该仓库的 Git 操作（28 个领域动作，
-	// 全部复用既有 handler）。路径一律经 Filesystem 的 resolvePath / resolveMutationPath /
+	// 那个端点提供**项目沙箱内**的文件读写、该仓库的 Git 操作，以及**会话控制**
+	// （停掉某条会话当前在跑的那一轮），全部复用既有 handler。
+	// 前两类的路径一律经 Filesystem 的 resolvePath / resolveMutationPath /
 	// remotePathWithinRoot 与 Git 侧的 validateGitPath 校验，出不了项目根；
 	// 引用（ref / branch / startPoint）只能来自服务端列出的引用或严格校验的 SHA，
-	// 不接受任意 revision 表达式。**不提供任何 Shell、命令执行、任意 `git` 子命令
+	// 不接受任意 revision 表达式。第三类不吃路径参数：落点是 `/api/conversations/{id}/stop`，
+	// 而那个 id 只取自信封（见 remote_relay.go 的 relayScope 与 remote_conversation.go），
+	// 调用方无法把它指向别的路由。**不提供任何 Shell、命令执行、任意 `git` 子命令
 	// 或任意 URL 转发能力。**
 	//
-	// 它存在的理由是手机端要能查看/编辑项目文件、并完成受控的 Git 操作，
-	// 而这条通道是唯一一条不把文件内容与 diff 落进云端库的路径 —— 详见 docs/40、docs/41
-	// 与 remote_relay.go 顶部。改动这个命名空间的边界时，必须同时更新这段说明：
+	// 它存在的理由是手机端要能查看/编辑项目文件、完成受控的 Git 操作、并把跑飞的一轮停下来，
+	// 而这条通道是唯一一条不把文件内容与 diff 落进云端库的路径 —— 详见 docs/40、docs/41、
+	// docs/46 与 remote_relay.go 顶部。改动这个命名空间的边界时，必须同时更新这段说明：
 	// 一句已经失实的"这里只有控制类元数据"比没有注释更危险。
 	r.Route("/api/remote", func(remote chi.Router) {
 		remote.Use(s.remoteAgentOnly)
@@ -1360,6 +1368,8 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/conversations/{conversationID}/input-history", s.listInputHistory)
 	r.Get("/api/conversations/{conversationID}/usage", s.getConversationUsage)
 	r.Post("/api/conversations/{conversationID}/clear", s.clearConversation)
+	// 手机端的停止入口（中继 conversation.stop 的落点）。桌面端按 run 停，见 /api/runs/{runID}/stop。
+	r.Post("/api/conversations/{conversationID}/stop", s.stopConversationRuns)
 	r.Delete("/api/conversations/{conversationID}", s.deleteConversation)
 	r.Post("/api/conversations/{conversationID}/activate", s.activateConversation)
 	r.Post("/api/conversations/{conversationID}/permission-mode", s.setConversationPermissionMode)
@@ -3022,6 +3032,10 @@ func (s *Server) decorateProjectPresentation(project *Project) {
 	// Environment 由项目 Runner 与路径解析出的 Agent 目标环境如实推导（docs/20 §3.5），
 	// 不再用 /mnt/ 前缀单独猜测。
 	project.Environment = string(s.resolveAgentTargetEnv(project.Runner, project.Path))
+	// LocalRunner 与编排派发用的是同一个函数：前端只做展示与前置禁用，判据必须与
+	// 服务端**逐字同源**，否则用户在界面上选完、建出计划，直到派发才 needs_human
+	// 并冻结整个项目队列（orchestration.go 的 prepareAndDispatchOrchestrationJob）。
+	project.LocalRunner = isLocalRunnerID(project.Runner)
 	if !strings.HasPrefix(project.Runner, "ssh-") {
 		return
 	}
@@ -3928,11 +3942,12 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	var activeRunID *string
 	if c.Status == "running" {
-		var runID string
-		if err := s.db.QueryRowContext(r.Context(), `select id from runs where conversation_id=$1 and status in ('queued','running') order by created_at desc limit 1`, id).Scan(&runID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		runID, found, err := s.activeRunIDForConversation(r.Context(), id)
+		if err != nil {
 			writeError(w, 500, err)
 			return
-		} else if err == nil {
+		}
+		if found {
 			activeRunID = &runID
 		}
 	}
@@ -6055,11 +6070,64 @@ func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "runID")
 	var conversationID string
 	if err := s.db.QueryRowContext(r.Context(), `select conversation_id from runs where id=?`, id).Scan(&conversationID); err == nil && s.isOrchestrationConversation(r.Context(), conversationID) {
-		writeError(w, http.StatusConflict, errors.New("stop automatic orchestration from the orchestration controls"))
+		writeError(w, http.StatusConflict, errOrchestrationStopRestricted)
 		return
 	}
 	force := r.URL.Query().Get("force") == "true"
 	status, code, err := s.stopRunByID(r.Context(), id, force)
+	if err != nil {
+		writeError(w, code, err)
+		return
+	}
+	writeJSON(w, code, map[string]string{"status": status})
+}
+
+// stopConversationRuns 是**手机端**的停止入口（`POST /api/conversations/{conversationID}/stop`，
+// 经中继的 conversation.stop op 抵达）：停掉这条会话当前在跑的那一轮。
+//
+// 它按会话停，与桌面端按 run 停（stopRun）是两件事，不是同一个端点的两份：
+// 桌面端手里有 run id，手机端没有 —— 它只有"这条会话在跑"这一个判据（会话状态 + 实时事件）。
+// 让手机端自己维护 run 生命周期，等于把链路里最容易做错的一段搬到最不容易测的一侧。
+//
+// 除此之外全部复用 stopRunByID 的语义：编排会话拒绝、`active_runs_present` 那条
+// "还有排队中的请求，不能单独停这一个"、force 走 forceStopConversationRuns ——
+// 手机端因此拿到与桌面端逐字相同的分支码，而不是一份自己猜出来的行为。
+//
+// 没有活跃的一轮时返回 `{"status":"idle"}`（200）而不是 404/409：这是一次幂等的空操作，
+// 而"按下停止"与"那一轮恰好自己跑完"是常态竞态，报错等于把"其实已经停了"说成失败。
+//
+// 但**会话本身不存在**仍然是 404（与 getConversation / clearConversation 那一族一致）。
+// 少了这道判据，一个已经被删掉的会话 id 会拿到 `200 {"status":"idle"}` —— 那是把
+// "这条会话没了"说成"它现在没在跑"，用户会一直等一个不存在的会话。
+func (s *Server) stopConversationRuns(w http.ResponseWriter, r *http.Request) {
+	conversationID := strings.TrimSpace(chi.URLParam(r, "conversationID"))
+	if conversationID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("conversationID is required"))
+		return
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from conversations where id=?)`, conversationID).Scan(&exists); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
+		return
+	}
+	if s.isOrchestrationConversation(r.Context(), conversationID) {
+		writeError(w, http.StatusConflict, errOrchestrationStopRestricted)
+		return
+	}
+	runID, found, err := s.activeRunIDForConversation(r.Context(), conversationID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "idle"})
+		return
+	}
+	status, code, err := s.stopRunByID(r.Context(), runID, r.URL.Query().Get("force") == "true")
 	if err != nil {
 		writeError(w, code, err)
 		return
@@ -6235,6 +6303,31 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 // 类型而不是英文原文：原先那里比的是 err.Error() 的整串，把文案翻成中文的那一刻，
 // 码会**静默**变空串，而调用方只是少了分支、不会报错。errNotSQLiteDatabase 是同型的先例。
 var errActiveRunsPresent = errors.New("当前会话还有排队或运行中的任务，暂时无法单独停止此任务。")
+
+// errOrchestrationStopRestricted 是"这条对话由自动编排接管，不能在这里停"的哨兵。
+//
+// 抽成哨兵而不是两处各写一句英文：按 run 停（stopRun）与按会话停（stopConversationRuns）
+// 撞的是同一件事，文案与状态码必须只留一份解释。原文留在英文是因为它同时是
+// localizedErrorText 翻译表的键（表按原文精确匹配），改一个字就会退回"未翻译"那条路。
+var errOrchestrationStopRestricted = errors.New("stop automatic orchestration from the orchestration controls")
+
+// activeRunIDForConversation 取这条会话当前**活跃的那一轮**。
+//
+// 「活跃」在这里只有一个定义：runs 里 status 为 queued/running 的那一批，按创建时间取最新。
+// 取最新而不是最旧，是因为一个会话的 AI 进程会把后来的消息接成排队回合（见
+// forceStopConversationRuns 的说明），于是"用户刚发的那条"才是他按下停止时想停的东西；
+// 而只有一个活跃 run 时，最新与最旧是同一行，两种取法没有差别。
+func (s *Server) activeRunIDForConversation(ctx context.Context, conversationID string) (string, bool, error) {
+	var runID string
+	err := s.db.QueryRowContext(ctx, `select id from runs where conversation_id=? and status in ('queued','running') order by created_at desc limit 1`, conversationID).Scan(&runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return runID, true, nil
+}
 
 func (s *Server) ensureStreamingStopIsIsolated(ctx context.Context, conversationID, runID string) error {
 	var otherActive bool
@@ -6869,6 +6962,12 @@ func localizedErrorText(err error, fallback string) string {
 			return "直接模式要求项目工作区正检出计划选定的分支。请先在项目目录里切到该分支（Milevia 不会替你切换），再重试。"
 		case strings.Contains(message, "requires an existing local branch"):
 			return "直接模式要求目标分支已存在于本地。请先在项目目录里创建该分支，再新建编排任务。"
+		case strings.Contains(message, "requires a project on the server's own runner"):
+			// 派发前置检查只认服务端本机 runner（isLocalRunnerID），所以这里能提前拦住
+			// 的正是"项目跑在别的运行器上"这一种（Windows 服务端上的 WSL 项目是最常见的一例）。
+			// 措辞与派发期那条（下面 translations 里的 automatic orchestration …）保持一致：
+			// 同一件事在建计划与派发两个时点被看到，说法不该变。
+			return "直接模式只支持运行在服务端本机运行器上的项目。当前项目不在本机运行器上（例如 Windows 服务端上的 WSL 项目），请更换项目运行器后再新建编排任务。"
 		case strings.Contains(message, "target branch check"):
 			return "直接模式的目标分支在项目仓库中不存在。请检查分支名后重建编排任务。"
 		case strings.Contains(message, "target branch is missing"):
@@ -6893,8 +6992,13 @@ func localizedErrorText(err error, fallback string) string {
 	translations := map[string]string{
 		"project not found":             "项目不存在或已被删除。",
 		"project worktree is not clean": "项目工作区存在未提交或未跟踪的更改。请提交、暂存或清理这些更改后重试任务编排。",
-		"automatic orchestration branch already exists for this task":           "该任务当天的自动编排分支已存在。请确认是否为上次任务遗留的分支，处理后再重试。",
-		"orchestration batch not found":                                         "编排任务不存在或已被删除。",
+		"automatic orchestration branch already exists for this task": "该任务当天的自动编排分支已存在。请确认是否为上次任务遗留的分支，处理后再重试。",
+		"orchestration batch not found":                               "编排任务不存在或已被删除。",
+		// 停止被拒（stopRun / stopConversationRuns）。手机端的"停止"按钮是它唯一能碰到的停止入口，
+		// 原文是英文，不翻译的话用户看到的是"当前操作与进行中的操作冲突，请稍后重试。：stop automatic
+		// orchestration from the orchestration controls" —— 既没说清发生了什么，也没说该去哪停。
+		// 这句同时点明"为什么"与"该去哪"：编排对话的队列由编排面板接管（暂停/停止队列）。
+		"stop automatic orchestration from the orchestration controls":          "这条对话由自动编排任务接管，请在编排面板里暂停或停止它的队列。",
 		"executionMode must be worktree or branch":                              "执行方式只能是「隔离工作树」或「直接写入已有分支」。",
 		"task branch is not ready to confirm":                                   "该任务分支尚未完成验证，暂时不能确认合并。",
 		"main does not contain this task branch commit":                         "main 尚未包含该任务分支的提交。请先合并分支，再确认完成。",
@@ -6919,6 +7023,13 @@ func localizedErrorText(err error, fallback string) string {
 		"runner not found":                                                      "运行器不存在。",
 		"runner is not an SSH runner":                                           "当前运行器不是 SSH 运行器。",
 		"another AI CLI is already being updated on this runner":                "该运行器上已有 AI CLI 正在更新。",
+		// 派发前置检查（orchestration.go prepareAndDispatchOrchestrationJob）的原文。建计划时
+		// 只拦掉了直接模式的这一类项目；隔离工作树模式的计划、任务页的单条「加入自动队列」，
+		// 以及升级前就躺在队列里的作业都还会走到这里，而这条路径的代价是 needs_human 加整个
+		// 项目队列冻结——所以文案必须说清是哪一侧的"本机"，否则 Windows 用户看着自己的
+		// WSL 项目只会一头雾水。注意 projects.runner 建后不可改（全库没有 update 它的语句），
+		// 所以这里不是"计划建完又被改坏"的场景。
+		"automatic orchestration currently requires a local runner": "自动编排只支持运行在服务端本机运行器上的项目。当前项目不在本机运行器上（例如 Windows 服务端上的 WSL 项目），请更换项目运行器后再恢复队列。",
 	}
 	if translated, ok := translations[message]; ok {
 		return translated

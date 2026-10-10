@@ -72,10 +72,10 @@ export const latestLoading: LatestRead = { state: "loading" };
 /** 卡片右上角的状态图标。观感只有这六档，变体一律走 data-*。 */
 export type CardIcon = "loading" | "ok" | "update" | "alert" | "off" | "unknown";
 
-/** 卡片上唯一那个主动作。没有就是"此刻不该给按钮"。
+/** 卡片上那个主动作。没有就是"此刻不该给按钮"。它永远回答"我现在需要做什么"。
  *
- *  ⚠️ 「登录」**不在这里**：它是"能做的事"，不是"要做的事"，所以它不住在卡片的主操作位上
- *  ——它住在详情抽屉的底部。卡片上的主动作永远回答"我现在需要做什么"。 */
+ *  ⚠️ 「登录」**不是** `CardAction`：它是"能做的事"，不是"要做的事"，占不住主操作位
+ *  ——它由 `ToolCard.canLogin` 单独说，页面渲染成主按钮旁边那颗次要按钮。 */
 export type CardAction =
   | { kind: "install"; label: string }
   | { kind: "update"; label: string }
@@ -128,7 +128,30 @@ export type ToolCard = {
   noteTone: "warn" | "muted";
 
   primary?: CardAction;
-  /** 「详情」抽屉里要说清的两句：这次没查 / 没详查的原因。 */
+  /**
+   * 该不该在这张卡上给「登录」入口。
+   *
+   * 判据两条都由**服务端**给：工具目录说它支持平台内登录（`entry.supportsLogin`），
+   * 这台机器上它真的装着（没装时点进去只会在服务端 404，点亮一个必失败的按钮比不亮更坏）。
+   *
+   * ⚠️ 它**不进 `primary`**：登录是"能做的事"不是"要做的事"，与主操作位那颗（安装 /
+   * 更新 / 修好它）并列显示，且不参与 `bannerFor` 的任何一条分支。
+   */
+  canLogin: boolean;
+  /**
+   * 该不该在这张卡上给「详情」入口。
+   *
+   * 顶部横幅是打开抽屉的主入口，但它只会指向**一张**卡（`bannerFor` 用 `find` 取第一张
+   * 命中的）。于是有两类卡的下一步根本点不开，而卡片自己的文案正是让用户去抽屉里看证据：
+   *   - ④ 修不了那一档（`note` 写着"按「详情」里的证据手动处理"），当它不是横幅指的那张时；
+   *   - ⑤ 这次没检查成功那一档：`statusTone` 是 `unknown`，不进 `bannerFor` 的任何分支，
+   *     连"唯一"的那张横幅都不会为它出现 —— 它的原因（`diagnosisEmptyText`）只在抽屉里。
+   *
+   * 判据就是"这张卡的下一步在抽屉里"。**不是**"每张卡都给一颗详情"：已是最新的健康卡
+   * 不给，那正是删掉旧按钮、避免卡底留下空动作条的原因。
+   */
+  canOpenDetails: boolean;
+  /** 抽屉里要说清的两句：这次没查 / 没详查的原因。 */
   detailNotes: string[];
 
   // 供上层做汇总用的读数（卡片自己不渲染它们）。
@@ -233,22 +256,76 @@ export function latestVersionLine(
   return { text: latest.latest, tone: "plain" };
 }
 
+/** 「运行依赖」那一行的结论：读数（`text`/`tone`）+ 那颗按钮（`action`），见 `runtimeDepLine`。 */
+export type RuntimeDepLine = {
+  text: string;
+  tone: "update" | "ok" | "unknown";
+  /**
+   * 现在该点的那颗按钮。undefined = 此刻不给（原因已经写在 `text` 里）。
+   *
+   * `kind` 与页面的 `PendingAction` 同名同值，且页面是**照着它发请求**的
+   * （`setPending({ kind: action.kind })`）—— 不是页面自己写死一个 kind。这样"按钮上写着
+   * 一件事、点下去做的是另一件"就成了一条类型上的约束：将来依赖条长出第二种动作时，
+   * 忘了在页面接上会编译不过，而不是静默发成 install-runtime（见文件头那条纪律）。
+   */
+  action?: { kind: "install-runtime"; label: string };
+};
+
 /**
- * 「运行依赖」那一行的读数怎么念 —— 与 latestVersionLine 同一族纪律：
- * **读不到最新版本时绝不能写"已是最新"**。
+ * 「没授权，所以这颗按钮现在不给」那一句缘由 —— **依赖区里只有这一处措辞**。
  *
- * latestVersion 是服务端的 omitempty 字段，只有真取到 Node 版本索引时才有值
- * （runtime_install.go：`if s.runtimes != nil { if entries, err := fetchNodeVersionIndex…}`），
- * 拿不到时 updateAvailable 也随之恒为 false。只按 updateAvailable 二分，就会给一个
- * **根本没查成**的环境亮绿灯写"已是最新" —— 那正是这一族反复复发的那件事。
+ * 依赖区里有两处会因为这个原因收回一颗按钮（升到新版本 / 重装运行时）。两处各写一句话，
+ * 必然漂移成"同一件事两种说法"，而这一页的存在意义正是"别再让用户从噪音里挑信息"。
+ *
+ * ⚠️ 管不到卡片那一边：卡片上那句「尚未授权在 … 上安装」是**服务端**算好下发的
+ * （`runner_agents.go` 的 `installBlockedReason`），与本句同义不同源 —— 那是有意的
+ * （服务端的理由带着具体的 runner 名），别拿同义词去统一它们。
+ */
+export const grantNeededReason = "需先授权在这台主机上安装";
+
+/**
+ * 「运行依赖」那一行怎么念、给不给升级按钮 —— **只有这一处判断**。
+ *
+ * 与卡片那边 `updateDecision` 同构（同一种判断只能有一份）。这一层同时是两处既有缺陷的
+ * 修复，两处的病根是同一个：**文案与动作各判各的**，于是同屏说出"可以升级"却给不出下一步。
+ *
+ * 一、读不到最新版本的纪律（与 latestVersionLine 同族）：latestVersion 是服务端的
+ *     omitempty 字段，只有真取到 Node 版本索引时才有值（runtime_install.go：
+ *     `if s.runtimes != nil { if entries, err := fetchNodeVersionIndex…}`），
+ *     拿不到时 updateAvailable 也随之恒为 false。只按 updateAvailable 二分，就会给一个
+ *     **根本没查成**的环境亮绿灯写"已是最新" —— 那正是这一族反复复发的那件事。
+ *
+ * 二、升级按钮的**三道闸门**（2026-10-09 修）。按钮此前只由页面自己数条件：
+ *     `installSupported && updateAvailable && remoteInstallAllowed`，而那句读数
+ *     只看 `updateAvailable`。两道判据一错位，"可升级到 24.21.0"与"没有按钮"必然同屏，
+ *     且那一行一个字都不解释 —— 真机实测（WSL 未授权）就是用户报的那个样子：
+ *     读数说能升，按钮没了，唯一的原因写在下面另一块讲「安装」的提示里。
+ *      ① `installSupported`：这个环境装不了运行时（跨端缺 tar/gzip、平台无官方包）。
+ *         服务端给了 `installBlockedReason`，**照原样念出来**，不编新话。
+ *      ② `remoteInstallAllowed`：这台主机还没授权平台安装。原因是"先授权"，
+ *         入口在那一行下面**单独一处**（`cli-tools-dep-grant`）—— 这里只说破，
+ *         不再摆第二个同义按钮（页面在别处批评过"两个入口做同一件事"）。
+ *      ③ 都过了才给按钮。
+ *
+ * ⚠️ 升不了时**不给按钮**是既有规矩（给一个点了必失败的按钮比不给更坏：未授权时
+ * 服务端会以 403 拒掉），改的是"不给就得说清为什么"这一半。
  *
  * 前提：**运行时已装**（`runtime.installed`）。没装是另一条分支（那条分支说的是"还没装"），
  * 调用方要先判它，别把这个函数的"已是最新"当成对未装状态的回答。
  */
-export function runtimeLatestLine(runtime: RuntimeStatus): { text: string; tone: "update" | "ok" | "unknown" } {
-  if (runtime.updateAvailable) return { text: `可升级到 ${runtime.latestVersion}`, tone: "update" };
-  if (!runtime.latestVersion) return { text: "读不到最新版本", tone: "unknown" };
-  return { text: "已是最新", tone: "ok" };
+export function runtimeDepLine(runtime: RuntimeStatus, remoteInstallAllowed: boolean): RuntimeDepLine {
+  if (!runtime.updateAvailable) {
+    if (!runtime.latestVersion) return { text: "读不到最新版本", tone: "unknown" };
+    return { text: "已是最新", tone: "ok" };
+  }
+  const available = `可升级到 ${runtime.latestVersion}`;
+  if (!runtime.installSupported) {
+    return { text: `${available}（${runtime.installBlockedReason || "这个环境装不了 Node.js 运行时"}）`, tone: "update" };
+  }
+  if (!remoteInstallAllowed) {
+    return { text: `${available}（${grantNeededReason}）`, tone: "update" };
+  }
+  return { text: available, tone: "update", action: { kind: "install-runtime", label: `升级到 ${runtime.latestVersion}` } };
 }
 
 /**
@@ -383,6 +460,11 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     statusTone: "muted",
     statusText: "",
     noteTone: "muted",
+    // `reading` 也要挡：那时 `item` 可能还是上一个执行环境留下的（loadView 不清旧 view），
+    // 照它亮出「登录」会是在一台还没读到的机器上按上一台的读数给动作。
+    canLogin: Boolean(entry.supportsLogin) && installed && !running && !input.reading,
+    // 默认不给：只有"下一步就在抽屉里"的那两档会把它打开（见 canOpenDetails 的注释）。
+    canOpenDetails: false,
     detailNotes: [],
     updateAvailable: update.available,
     canUpdate: update.primary?.kind === "update",
@@ -445,8 +527,11 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     if (remedies.length > 0) {
       card.primary = { kind: "repair", label: "修好它", remedies };
     } else {
-      // 修不了的就**不给按钮**，并说清只能手动处理 —— 给一个点了没反应的按钮比不给更坏。
+      // 修不了的就**不给可修动作**（给一个点了没反应的按钮比不给更坏），改成让用户去看证据。
       card.note = "这个问题平台不能自动修 —— 按「详情」里的证据在目标环境手动处理。";
+      // 这句话必须点得开：横幅只指向第一张命中的问题卡，这张若不是它（或多张问题卡里的
+      // 后几张），没有这颗入口就永远够不着抽屉 —— 而证据只在抽屉里。
+      card.canOpenDetails = true;
     }
     return card;
   }
@@ -460,6 +545,9 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     card.statusText = "这次没检查成功。";
     card.note = "这不代表它没问题 —— 只是这一次没查成。";
     card.detailNotes.push(diagnosisEmptyText(diagnosis));
+    // 这一档 statusTone 是 unknown，不进 bannerFor 的任何分支 → 连横幅都不会为它出现。
+    // "为什么没查成"只在抽屉里，所以必须给它一颗自己的入口。
+    card.canOpenDetails = true;
     // 更新是另一件事、另一个读数，该给还得给。
     if (update.primary) card.primary = update.primary;
     return card;
@@ -498,8 +586,8 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     return card;
   }
 
-  // ⑧ 已是最新：卡片上一个动作都不给。登录入口在「详情」里 —— 那是"能做的事"，
-  //    不是"要做的事"，它占着主操作位只会让"这一列按钮"失去含义。
+  // ⑧ 已是最新：主操作位上一个动作都不给。需要登录的工具另有「登录」那颗次要按钮
+  //    （`canLogin`）—— 那是"能做的事"，它占着主操作位只会让"这一列按钮"失去含义。
   card.icon = "ok";
   card.statusTone = "ok";
   card.statusText = "已是最新，不用管它。";
@@ -520,6 +608,12 @@ export type Banner = { tone: "warn" | "bad"; text: string; agentID: string; acti
  *
  * 三条分支是有序的：① 有新版本但升不了；② 有工具用不了；③ 有工具要留意。
  * 一条都不满足就返回 undefined（整条不渲染）。
+ *
+ * ⚠️ ③ 覆盖**两种**要留意：能修的（给「修好它」）与平台修不了的（如实测超时、包目录
+ * 扫不动 —— 服务端不下发 remedy）。后者也**必须**上横幅：这类卡的下一步是去抽屉里看
+ * 证据。但横幅只指向**第一张**命中的问题卡，所以这种不可修的卡还会自带一颗「详情」
+ * （`ToolCard.canOpenDetails`）兜底 —— 否则多张问题卡里的后几张、以及不产横幅的
+ * "没查成"档，都会点不开抽屉。
  *
  * ⚠️ `actionLabel` **只在卡片真有 repair 动作时才给**（2026-09-29 修正）。此前这三条
  * 分支一律写死"修好它"，而"有新版本但升不了"这一档有四种成因（跨端只能手动升 /
@@ -559,15 +653,22 @@ export function bannerFor(cards: ToolCard[]): Banner | undefined {
       ...(unusable.primary?.kind === "repair" ? { actionLabel: "修好它" } : {}),
     };
   }
+  // ③ 有工具要留意。两种都要上横幅，因为**横幅是问题卡打开抽屉的唯一入口**：
+  //    能修的给「修好它」；不能修的（服务端没下发 remedy，如实测超时、包目录扫不动）
+  //    卡片上那句"按详情里的证据手动处理"要靠它或卡片自带的「详情」才点得开。
+  //    带别的动作（更新 / 安装）的**不算**："可以更新到 v2"不是"需要处理一下"。
   const needsAttention = cards.find(
-    (card) => card.statusTone === "warn" && card.primary?.kind === "repair",
+    (card) => card.statusTone === "warn" && (card.primary?.kind === "repair" || !card.primary),
   );
   if (needsAttention) {
+    const repairable = needsAttention.primary?.kind === "repair";
     return {
       tone: "warn",
       text: `${needsAttention.name} 需要处理一下。`,
       agentID: needsAttention.id,
-      actionLabel: "修好它",
+      // 与 ①② 同一条规矩：没有可修动作就不给按钮（给一个点了没反应的按钮比不给更坏），
+      // 只留「看看是什么问题」那颗链接去开抽屉。
+      ...(repairable ? { actionLabel: "修好它" } : {}),
     };
   }
   return undefined;

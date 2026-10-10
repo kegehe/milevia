@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -546,6 +547,81 @@ func TestCreateOrchestrationBatchValidatesDirectMode(t *testing.T) {
 	}
 	if !strings.Contains(invalid.Body.String(), "执行方式只能是") {
 		t.Fatalf("expected the localized execution mode reason, body=%s", invalid.Body.String())
+	}
+}
+
+// nonLocalRunnerIDForTest 返回一个**必然不是**服务端本机 runner 的 id：Windows 服务端上
+// wsl-local 是跨端（文件走 UNC、AI 经 wsl.exe），其余平台上跨端的才是 windows-local。
+func nonLocalRunnerIDForTest() string {
+	if runtime.GOOS == "windows" {
+		return "wsl-local"
+	}
+	return "windows-local"
+}
+
+// 非本机 runner 的项目：直接模式必须在**建计划**时就拒掉。留到派发是 needs_human 加整个
+// 项目队列冻结（prepareAndDispatchOrchestrationJob 的前置检查），而那时用户只看到一句
+// 指向不明的失败——他并不知道是自己选错了项目。前端那道闸门只能拦界面上的操作：API 直连
+// 或任何不走这个弹窗的客户端都绕得过去，所以这道校验必须落在服务端。
+func TestCreateOrchestrationBatchRejectsDirectModeOffTheServerRunner(t *testing.T) {
+	server := newTestServer(t)
+	projectID := "direct-off-runner"
+	initDirectModeProject(t, server, projectID)
+	if _, err := server.db.Exec(`update projects set runner=? where id=?`, nonLocalRunnerIDForTest(), projectID); err != nil {
+		t.Fatalf("switch project runner: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	server.routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"off runner","executionMode":"branch","targetBranch":"main"}`)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("create direct batch off the server runner: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "只支持运行在服务端本机运行器上的项目") {
+		t.Fatalf("expected the localized runner reason, body=%s", recorder.Body.String())
+	}
+	// 拒掉就要真的什么都没建：留下一条计划行等于队列里躺着一个必然失败的作业。
+	var batches int
+	if err := server.db.QueryRow(`select count(*) from orchestration_batches where project_id=?`, projectID).Scan(&batches); err != nil {
+		t.Fatalf("count batches: %v", err)
+	}
+	if batches != 0 {
+		t.Fatalf("rejected direct batch left %d rows behind", batches)
+	}
+	// 顺序也是判据的一部分：本机 runner 检查必须排在分支存在性检查**之前**。否则非本机项目
+	// 会先被拿去在本机跑一次 git show-ref（远端路径在本机根本不存在），用户拿到一句指错
+	// 方向的"目标分支不存在"409，而真正的原因（项目不在本机 runner 上）一个字都没提。
+	masked := httptest.NewRecorder()
+	server.routes().ServeHTTP(masked, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/orchestration/batches", bytes.NewBufferString(`{"name":"off runner 2","executionMode":"branch","targetBranch":"no-such-branch"}`)))
+	if masked.Code != http.StatusBadRequest || !strings.Contains(masked.Body.String(), "只支持运行在服务端本机运行器上的项目") {
+		t.Fatalf("a missing branch masked the runner check: %d body=%s", masked.Code, masked.Body.String())
+	}
+}
+
+// 前端那道闸门读的是项目载荷里的 localRunner，而它由 decorateProjectPresentation 用
+// isLocalRunnerID 填。这里把**线上字段名**也钉住：json tag 写错时前端的判据会静默变成
+// undefined（=不是本机），直接模式对所有项目都不再出现，而没有任何测试会红。
+func TestProjectPayloadCarriesLocalRunner(t *testing.T) {
+	server := newTestServer(t)
+	local := Project{Runner: server.localRunnerID(), Path: t.TempDir()}
+	server.decorateProjectPresentation(&local)
+	other := Project{Runner: nonLocalRunnerIDForTest(), Path: t.TempDir()}
+	server.decorateProjectPresentation(&other)
+	payload, err := json.Marshal([]Project{local, other})
+	if err != nil {
+		t.Fatalf("marshal projects: %v", err)
+	}
+	if !strings.Contains(string(payload), `"localRunner":true`) || !strings.Contains(string(payload), `"localRunner":false`) {
+		t.Fatalf("project payload is missing the localRunner flag the orchestration page reads: %s", payload)
+	}
+}
+
+// 建计划时拦不住的那两条路（隔离工作树模式、建完计划再改项目 runner）仍会在派发时撞上
+// 同一个前置检查，并被 failOrchestrationJob 记成 needs_human 加整个项目队列冻结。用户
+// 只能从 last_error 看原因，所以那句原文必须有中文映射，且要指明是"服务端本机运行器"——
+// 落到通用兜底（"请查看任务日志后重试"）时用户没有任何日志可看。
+func TestOrchestrationOffRunnerFailureIsLocalized(t *testing.T) {
+	text := errorText(errors.New("automatic orchestration currently requires a local runner"))
+	if !strings.Contains(text, "服务端本机运行器") || strings.Contains(text, taskFailureFallback) {
+		t.Fatalf("off-runner dispatch failure text = %q", text)
 	}
 }
 

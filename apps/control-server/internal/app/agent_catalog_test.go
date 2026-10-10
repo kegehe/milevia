@@ -177,3 +177,40 @@ func withExtraCatalogEntry(t *testing.T, entry AgentCatalogEntry) {
 	agentCatalogEntries = append(append([]AgentCatalogEntry{}, original...), entry)
 	t.Cleanup(func() { agentCatalogEntries = original })
 }
+
+// TestCatalogBinFileIsAFileNameNotAPath 钉住一条**只在最末端才暴露**的约定。
+//
+// BinFile 的消费方式是被拼到包根之后：npmCLIInstall.binaryPath =
+// `<prefix>/lib/node_modules/<scope>/<pkg>/bin/<BinFile>`。而各包在 npm 上的 bin 目标
+// 写的是 `bin/<X>`（完整相对路径）—— 照抄过来就得到 `<包根>/bin/bin/<X>`，一个不存在的
+// 路径。2026-10-09 实测 codebuddy 就是这样抄错的。
+//
+// 它不在安装路径上暴露（那条自检用的是 `$prefix/bin/<命令名>`），只在跨端升级的
+// 「确认来源」与「回滚」上用（cross_npm_update.go / ssh_runner.go）——症状是"升级失败
+// 时回滚不了"，所以特别需要一条断言把它钉住。
+func TestCatalogBinFileIsAFileNameNotAPath(t *testing.T) {
+	// npm 上**实测**的 bin 目标（`npm view <pkg> bin`）。新增工具时必须先查一次并记进
+	// 这张表 —— 缺一条就红，是为了让"照抄 `bin/X`"这个错在下一次也犯不出来。
+	npmBinTargets := map[string]string{
+		"claude-code": "bin/claude.exe",
+		"codex":       "bin/codex.js",
+		"codebuddy":   "bin/codebuddy",
+	}
+	for _, entry := range agentCatalog() {
+		if entry.InstallKind != InstallKindNpmGlobal {
+			continue
+		}
+		target, known := npmBinTargets[entry.ID]
+		if !known {
+			t.Fatalf("%s: 先跑 `npm view %s bin` 并把结果记进这张表", entry.ID, entry.NpmPackage)
+		}
+		if strings.ContainsAny(entry.BinFile, `/\`) {
+			t.Fatalf("%s: BinFile = %q 是路径而不是文件名；binaryPath 会拼成 <包根>/bin/%s",
+				entry.ID, entry.BinFile, entry.BinFile)
+		}
+		if want := strings.TrimPrefix(target, "bin/"); entry.BinFile != want {
+			t.Fatalf("%s: BinFile = %q，want %q（npm bin 目标 %q 去掉 bin/ 前缀）",
+				entry.ID, entry.BinFile, want, target)
+		}
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -334,6 +335,48 @@ func TestConversationModelsWithoutProfile(t *testing.T) {
 	}
 	if stored != "gpt-5.5" {
 		t.Fatalf("stored model_override=%q", stored)
+	}
+}
+
+// CodeBuddy 没有内置模型目录，接口要如实返回**空数组**而不是 null。
+//
+// 这条不是吹毛求疵：Go 的 encoding/json 把 nil 切片写成 `null`，而模型选择器是前端
+// 渲染路径（`view?.models.length`）——可选链只到 view，null 上读 .length 会抛
+// "Cannot read properties of null (reading 'length')"，把整个工作区面板替换成兜底 UI。
+// 曾实测：CodeBuddy 会话里点开底部模型下拉就白掉面板。JSON 里必须逐字出现 `[]`。
+func TestConversationModelsCodeBuddyReturnsEmptyArray(t *testing.T) {
+	server := newTestServer(t)
+	seedModelConversation(t, server, "codebuddy", "idle")
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/model-conversation/models", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("models status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	// 用正则而不是逐字匹配：将来若把 JSON 编码器换成带缩进的（`"models": null`），
+	// 逐字匹配的否定断言会**静默失效**，而这条断言正是要拦住那个 null 的。
+	if regexp.MustCompile(`"models"\s*:\s*null`).MatchString(body) {
+		t.Fatalf("models must serialize as [] rather than null: %s", body)
+	}
+	if !regexp.MustCompile(`"models"\s*:\s*\[\s*\]`).MatchString(body) {
+		t.Fatalf("codebuddy has no built-in catalog, expected an empty array: %s", body)
+	}
+	// 不冒充别的工具的目录，同时也不关闭自定义输入。
+	var view ConversationModelsView
+	if err := json.Unmarshal(response.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode models view: %v", err)
+	}
+	if len(view.Models) != 0 {
+		t.Fatalf("codebuddy must not borrow another tool's catalog: %#v", view.Models)
+	}
+	if !view.CustomAllowed {
+		t.Fatalf("custom models must stay allowed: %#v", view)
+	}
+	// 解出来的视图非 nil 也算一道保险：nil 切片解回 Go 仍是 nil，而 `[]` 会解成空切片
+	// —— 前端拿到的 JSON 差异就在这里。
+	if view.Models == nil {
+		t.Fatalf("decoded models must be an empty slice, not nil: %s", body)
 	}
 }
 

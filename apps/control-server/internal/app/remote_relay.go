@@ -14,10 +14,11 @@ import (
 // 手机端与本机之间的远程调用（RPC）通道：Agent 把云端的请求帧原样转给
 // /api/remote/rpc，本进程按 op 调用**既有的** handler。
 //
-// 这条通道承载**多个领域**的操作：文件（fs.*，见 remote_fs.go）与
-// Git（git.*，见 remote_git.go）。形态是「一条通道、一个端点、一张由各领域合成的 op 表」，
-// 不是「每个领域一条通道」—— 后者要求 Agent 按 op 前缀选择端点，那就等于把 op 映射
-// 搬进 Agent，正是本设计刻意避开的结构性风险。见 docs/41 §3.1。
+// 这条通道承载**多个领域**的操作：文件（fs.*，见 remote_fs.go）、Git（git.*，见
+// remote_git.go）与会话控制（conversation.*，见 remote_conversation.go）。形态是
+// 「一条通道、一个端点、一张由各领域合成的 op 表」，不是「每个领域一条通道」——
+// 后者要求 Agent 按 op 前缀选择端点，那就等于把 op 映射搬进 Agent，
+// 正是本设计刻意避开的结构性风险。见 docs/41 §3.1。
 //
 // 为什么走本机 HTTP 而不复用 /api/remote/commands 那条命令通道：
 //
@@ -26,11 +27,22 @@ import (
 //     直接冲突。这条通道全程只在内存里过，落盘为零。
 //   - 命令通道的 payload / result 各限 256 KiB，且是 500ms 轮询取结果；这些操作是
 //     幂等无副作用的请求-响应，用轮询去做既慢又在语义上绕远。
+//   - 命令通道的**失败会被压成一句话**：executeRemoteHTTPCommand 只留
+//     `{"error": "<本地化文案>"}`，稳定机器码（如 active_runs_present）到不了手机。
+//     而这条通道的 rpcResponse 逐字保留 status 与 code（见下面的说明）。
 //   - Git 写操作确实需要"重放安全"，但那由服务端自己的 stateToken 乐观锁提供
 //     （同版本写第二次会拿到明确的冲突，而不是静默重复写入），不需要命令通道的幂等键。
 //
-// 这是 relay 命名空间里唯一提供**文件读写与 Git 操作**的地方，因此它是这个命名空间
-// 安全边界的核心，不是普通的一批新端点 —— 见 app.go 里 remote 路由组的那段说明。
+// 判断一条新操作该走哪条通道的判据（docs/40 §0 决策 3 定的）：**除非真的需要**命令通道
+// 那三样 —— 幂等键、持久化审计、终态机 —— 否则一律走这条。那三样的代价不小：命令类型在
+// enqueueRemoteCommand 与云端 createCommand 各有一份白名单（"两份名单要同步"），
+// 而云端那条要先部署，于是多出一个"新桌面 + 旧云端 = 400"的偏斜窗口；
+// 这条通道的 op 名单只有执行点这一份，云端与 Agent 都不认识 op。
+// conversation.stop 恰好一样都不需要：入参不含内容、天然幂等（重复停无害）、
+// run 自己的状态与事件就是审计。
+//
+// 这是 relay 命名空间里唯一提供**文件读写、Git 操作与会话控制**的地方，因此它是这个
+// 命名空间安全边界的核心，不是普通的一批新端点 —— 见 app.go 里 remote 路由组的那段说明。
 // 它不提供 shell、任意命令执行、任意 `git` 子命令或任意 URL 转发。
 //
 // op 名单只有一份，且在**执行点**（本进程，由 remoteOperations 合成）：
@@ -46,10 +58,30 @@ import (
 // 并在测试里把数值本身钉住。改动任何一端都要同时看另外两端。
 const relayFrameBudget = 384 << 10
 
+// relayScope 说明一条 op 挂在哪个路径前缀下。见 remoteOperation.Scope。
+type relayScope int
+
+const (
+	// relayScopeProject 是默认（零值）：请求打到 `/api/projects/{projectID}` + Path。
+	// 文件与 Git 的全部 op 都在这个作用域里 —— 它们都要先解析出工作区。
+	relayScopeProject relayScope = iota
+	// relayScopeConversation 打到 `/api/conversations/{conversationID}` + Path：
+	// 落点是**会话**而不是项目，与 app.go 里 /api/conversations/{conversationID}/* 那一族
+	// （clear / activate / messages / …）平级。conversationID 只取自信封，见 relayTarget。
+	relayScopeConversation
+)
+
 // remoteOperation 是 op 表里的一条。
 type remoteOperation struct {
 	Method string
-	// Path 是 /api/projects/{projectID} 之后的片段，可含 {name} 占位。
+	// Scope 说明这条 op 挂在哪个路径前缀下（零值 = relayScopeProject）。
+	//
+	// 会话域的 op 用 relayScopeConversation，且**Path 里没有 {conversationID} 占位符、
+	// PathParams 里也不声明它**：那个 id 决定请求落到哪条会话，与 projectId 决定落到哪个
+	// 项目同理，只能来自信封。声明成路径参数就等于让 params 顺手改掉落点（见 relayTarget
+	// 里 conversationId 那段说明），而这里要挡的正是"调用方多填一个键就指到别处"。
+	Scope relayScope
+	// Path 是**作用域前缀之后**的片段，可含 {name} 占位（见 Scope）。
 	Path string
 	// Query 为 true 表示 params 是查询参数（取值必须都是字符串）；
 	// 为 false 表示 params 整个作为 JSON 请求体。
@@ -76,11 +108,11 @@ type remoteOperation struct {
 
 // remoteOperations 是 relay 唯一的一张 op 表：把各领域的名单合成一份。
 //
-// 领域各自导出自己的 map（remoteFSOperations / remoteGitOperations），而不是写成
-// 一个巨型 switch：每份名单都能被独立测试钉死（条数、方法、路径、上限），
-// 而"改名单必须同时改测试"这条纪律也就落到了具体的一份上。
+// 领域各自导出自己的 map（remoteFSOperations / remoteGitOperations /
+// remoteConversationOperations），而不是写成一个巨型 switch：每份名单都能被独立测试
+// 钉死（条数、方法、路径、上限），而"改名单必须同时改测试"这条纪律也就落到了具体的一份上。
 //
-// 两份名单的 op 名**不允许有交集**：有交集意味着后注册的那份静默覆盖前一份，
+// 三份名单的 op 名**不允许有交集**：有交集意味着后注册的那份静默覆盖前一份，
 // 症状是"某个操作跑到另一个 handler 上去了"，而两边各自看代码都是对的。
 // TestRelayCompositeOperationTableHasNoOverlap 守着这条。
 func (s *Server) remoteOperations() map[string]remoteOperation {
@@ -89,6 +121,9 @@ func (s *Server) remoteOperations() map[string]remoteOperation {
 		operations[name] = operation
 	}
 	for name, operation := range s.remoteGitOperations() {
+		operations[name] = operation
+	}
+	for name, operation := range s.remoteConversationOperations() {
 		operations[name] = operation
 	}
 	return operations
@@ -135,8 +170,11 @@ func (s *Server) relayRPCRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("不支持的远程操作"))
 		return
 	}
-	// projectId 一律必填：所有 handler 都要用它解析工作区（resolveRequestWorkspace），
-	// 缺了它会走到"项目不存在"，报错比这里直接拦下更含糊。
+	// projectId 一律必填，包括会话域那些自己不用它的 op（见 remoteOperation.Scope）：
+	// 项目域的 handler 都要用它解析工作区（resolveRequestWorkspace），缺了它会走到
+	// "项目不存在"，报错比这里直接拦下更含糊；而会话域那几条虽然不解析工作区，
+	// 但为它们单独开一条判据，就等于让信封的形状随 op 变 —— 云端、Agent、手机端
+	// 三处都要跟着"哪些 op 要带 projectId"分叉，而调用方本来无一例外都拿得到它。
 	if input.ProjectID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("projectId 必填"))
 		return
@@ -191,14 +229,40 @@ func (s *Server) relayRPCRequest(w http.ResponseWriter, r *http.Request) {
 // 沙箱里构造 Server 会拉起 wsl.exe 而被拦，所以"能测"这件事在这里是有实际价值的。
 // 返回值里的 pathParams 要原样交给 invokeLocalHandler 的 extraParams（见调用点说明）。
 func relayTarget(operation remoteOperation, projectID, conversationID string, params json.RawMessage) (string, json.RawMessage, map[string]string, error) {
-	target := "/api/projects/" + projectID + operation.Path
-	var body json.RawMessage
-
 	pathValues, err := relayPathValues(params, operation.PathParams)
 	if err != nil {
 		return "", nil, nil, err
 	}
 
+	// 落点前缀由**信封**决定：项目域的 op 挂在项目下，会话域的挂在会话下。
+	// 信封里那个 conversationId 在两处含义不同 —— 项目域是"用哪个工作区"（进查询串），
+	// 会话域是"落到哪条会话"（进 URL 路径）—— 但两种都只认信封那一份。
+	target := "/api/projects/" + projectID
+	conversationInQuery := true
+	if operation.Scope == relayScopeConversation {
+		conversationID = strings.TrimSpace(conversationID)
+		if conversationID == "" {
+			return "", nil, nil, errors.New("conversationId 必填")
+		}
+		// 它会被拼进 URL 路径。与 projectId 同样的理由，先把路径分隔符与编码字符挡在外面，
+		// 否则一个 `../` 就能让合成的请求指到别的路由上去。
+		if strings.ContainsAny(conversationID, "/\\?#%") {
+			return "", nil, nil, errors.New("conversationId 非法")
+		}
+		if pathValues == nil {
+			pathValues = map[string]string{}
+		}
+		// 交给 invokeLocalHandler 的 extraParams：合成请求没有真的走路由匹配，
+		// handler 里 chi.URLParam 读的就是这一份。
+		pathValues["conversationID"] = conversationID
+		target = "/api/conversations/" + url.PathEscape(conversationID)
+		// 落点已经在路径里了，不再往查询串里塞第二份：同一个值出现两次，
+		// 将来一旦分叉就没人说得清哪份作数。
+		conversationInQuery = false
+	}
+	target += operation.Path
+
+	var body json.RawMessage
 	if operation.Query {
 		values := map[string]string{}
 		if len(params) > 0 {
@@ -222,7 +286,7 @@ func relayTarget(operation remoteOperation, projectID, conversationID string, pa
 			}
 			query.Set(key, value)
 		}
-		if conversationID != "" {
+		if conversationInQuery && conversationID != "" {
 			query.Set("conversationId", conversationID)
 		}
 		if encoded := query.Encode(); encoded != "" {
@@ -237,7 +301,7 @@ func relayTarget(operation remoteOperation, projectID, conversationID string, pa
 		body = stripped
 		// 请求体类操作的 conversationId 同样是**查询参数**（决定工作区，与信封同源），
 		// 不塞进请求体 —— 体里那份是给 handler 的业务字段用的。
-		if conversationID != "" {
+		if conversationInQuery && conversationID != "" {
 			target += "?conversationId=" + url.QueryEscape(conversationID)
 		}
 	}

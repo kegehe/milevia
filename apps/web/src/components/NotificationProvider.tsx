@@ -15,6 +15,11 @@ import {
   toastVariantForType,
 } from "../lib/notifications";
 import { useUIPreferences, type LocalPreferences } from "../stores/useUIPreferences";
+import { NotificationToastBody } from "./NotificationToastBody";
+
+/** 通知 toast 的自动收起时长。唯一的时长来源：
+ * sonner 的 duration、倒计时文字与进度条都从它推导（见 NotificationToastBody）。 */
+const NOTIFICATION_TOAST_DURATION_MS = 8000;
 
 const UnreadNotificationContext = createContext(0);
 
@@ -175,12 +180,23 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         markUnread(event);
         return;
       }
-      const duration = isHighPriority ? Infinity : 8000;
+      const duration = isHighPriority ? Infinity : NOTIFICATION_TOAST_DURATION_MS;
       const variant = toastVariantForType(event.type);
 
-      toast[variant](event.title, {
+      // 标题行内附项目名小标（方案E轨迹卡）；后端字段按可能为空处理
+      const titleNode = event.projectName ? (
+        <>
+          {event.title}
+          <span className="notif-project">{event.projectName}</span>
+        </>
+      ) : (
+        event.title
+      );
+
+      toast[variant](titleNode, {
         id: `notif-${event.id}`, // 去重：同一通知只显示一个
-        description: event.body,
+        className: "notif-toast", // 方案E轨迹卡样式钩子（notification.css 末段）
+        description: <NotificationToastBody body={event.body} durationMs={duration} />,
         duration,
         action: {
           label: "查看详情",

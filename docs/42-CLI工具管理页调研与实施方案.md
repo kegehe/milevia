@@ -1392,8 +1392,9 @@ python .tmp/mutate-cli-tools.py           # 定点变异，跑完自动还原（
   左半边那句「平台托管，不动系统里已有的 Node」是**解释**，压成灰的（让版本号站前面）。
   **2026-09-29 补第三档**：`latestVersion` 是服务端的 `omitempty` 字段，离线/registry 不可达时
   它为空、`updateAvailable` 恒为 false —— 只按 `updateAvailable` 二分就会给一个**根本没查成**的
-  环境亮绿灯写「已是最新」。现在文案与状态档都取自 `runtimeLatestLine`（绿=已是最新 / 琥珀=可升级 /
-  灰=「读不到最新版本」），与卡片那一行同一族纪律。
+  环境亮绿灯写「已是最新」。现在文案与状态档都取自模型（绿=已是最新 / 琥珀=可升级 /
+  灰=「读不到最新版本」），与卡片那一行同一族纪律。**函数名 2026-10-09 起是 `runtimeDepLine`**
+  （`runtimeLatestLine` 那个名字只覆盖读数，而它现在连按钮亮不亮一起判 —— 见 §29）。
 
 ### 22.5 顺手修掉的两处
 
@@ -1859,3 +1860,346 @@ Claude 裸图形仍 18px 居中；结构断言钉住两条 CSS 规则；全量�
 包括 TSX 渲染、`readingMomentsText` 助手（模型层）、CSS 规则与对应测试；§27 的
 顶栏测试改题为「只有「重新检查」一颗动作」，并加了**反向断言**（代码与样式里都不许
 再出现）。本节记录这个决定，§27/§27.4 里关于读数时刻的描述以本节为准。
+
+## 29. 运行依赖那一行：读数与升级按钮**同源**（2026-10-09）
+
+> 用户："帮我仔细看看当前 cli 管理中的运行依赖，显示的是可以升级，但是没有升级按钮呢"。
+
+### 29.1 症状与根因
+
+真机实测（dev 版控制服务 + 真页面，环境 = WSL）：那一行写着「可升级到 24.21.0」，
+按钮不渲染，而**那一行一个字都不解释为什么** —— 唯一说得上缘由的文字在下面另一块讲
+「**安装**」的授权提示里，用户看着像两件事。
+
+根因是**判据分裂**：改前按钮由页面自己数三个条件
+（`installSupported && updateAvailable && remoteInstallAllowed`，当时在
+`CliToolsPage.tsx` 依赖条那段 JSX 里；现在的形状见 §29.2），而那句读数只看
+`updateAvailable`（`runtimeLatestLine`，2026-10-09 起叫 `runtimeDepLine`）。
+两处一错位，"说能升"与"没有按钮"就必然同屏。三个条件的实测分布：
+
+| 环境 | installSupported | updateAvailable | remoteInstallAllowed | 那一行渲染出 |
+| --- | --- | --- | --- | --- |
+| windows-local（本机） | true | true | true（本机永远为真，`runner_install_grants.go:55`） | 读数 + **按钮** |
+| wsl-local（跨端未授权） | true | true | **false** | 读数 + **没有按钮** |
+
+第二道闸门 `installSupported` 同样可达（跨端缺 tar/gzip、平台没有官方包）：那一档此前
+一模一样 —— 没有按钮、没有原因，`installBlockedReason` 只在"没装"那一分支渲染。
+
+### 29.2 改法
+
+判据与文案**收进一处**（`runtimeDepLine`，`lib/cli-tools-view.ts`），页面只渲染结论 ——
+与卡片那边的 `updateDecision` 同构：
+
+- 三道闸门依次判：`installSupported` → `remoteInstallAllowed` → 给按钮。次序有意：
+  环境根本装不了时，说成"去授权就好了"是错的（授权解决不了它）；
+- 闸门关着时**原因写在同一行的读数里**（「可升级到 24.21.0（需先授权在这台主机上安装）」）；
+  服务端给了 `installBlockedReason` 的**原样念**，不编新话；
+- 按钮仍**不给**（既有规矩：未授权时服务端会 403，给一个点了必失败的按钮比不给更坏），
+  授权入口仍只有下面那一处（不许长成 N+1 个同义按钮）；
+- 给按钮时**连动作一起给**（`action: { kind, label }`），页面照着它发请求
+  （`setPending({ kind: depAction.kind })`）—— 不是页面写死一个 kind。这一条是 2026-10-09
+  独立复查补的（见 §29.4）：依赖条将来说不定会有第二种动作，"按钮上写着一件事、点下去
+  做的是另一件"必须成一条类型上的约束，而不是靠人记得；
+- 「没授权所以这颗按钮现在不给」这句措辞只有一处（`grantNeededReason`），两处共用 ——
+  各写一句必然漂移成"同一件事两种说法"。
+
+顺带修掉**同一类病的第二处**：「随包的 npm 不可用」那条读数被授权门**整段**藏掉
+（`… && view?.remoteInstallAllowed` 挡在 `<p>` 上）。那条读数是这台机器的事实，与授没
+授权无关（用户看不到它就会去装 CLI，而 CLI 装不上的原因正是它）。现在门只挡「重装」
+那颗按钮，读数照常显示；收回按钮时照上面那条缘由说清为什么。
+
+**没装那一支没动**（有意）：它说的是**事实**（「Node.js 运行时还没装」+ 服务端给的原因
+或那句兜底），没有一个"看起来现在就能点"的读数要它兑现；而未授权时那颗「安装 Node.js
+运行时」按钮的缺失，由紧挨在下面的授权入口当场解释（那是 2026-09-24 定的形状，见 §23/§28）。
+与本次修的那一档的区别正在这里：那一档的读数**断言了当下可用的一件事**（「可升级到 X」），
+却没有给出口也不说原因 —— 断言与出口必须同源，只说事实的那一支不受这条约束。
+
+### 29.3 验证
+
+- **单测**（`lib/cli-tools-view.test.ts`，一条用例六个状态）：三闸门全开（读数与按钮文案
+  同源，版本号不许两处各写一遍；按钮自带要发出去的那个 `kind`）、未授权（无按钮 + 缘由在
+  读数里 + 档位仍是 `update`）、环境装不了（念服务端理由）、**两道闸门同时关着**（必须报
+  环境那道，不许把人支去授权 —— 见下）、已是最新、读不到最新版本；
+- **页面源码断言改成两段式**：页面里不许再出现那三个条件与按钮文案；判据必须在模型里、
+  且授权那一位**必须传进去**（漏传 = 把"未授权"当成"可以升"）。同时钉住授权门只挡按钮、
+  不挡那条 npm 读数，以及按钮的动作种类是**照模型发的**（`setPending({ kind: depAction.kind })`）；
+- **真机载荷跑真页面**（dist + 假后端；载荷按 2026-10-08 实测读数重建），八个状态逐个量过：
+
+  | 载荷 | 那一行读数 | 按钮 |
+  | --- | --- | --- |
+  | windows（已授权） | 可升级到 24.21.0 | 升级到 24.21.0 |
+  | wsl（未授权） | 可升级到 24.21.0（需先授权在这台主机上安装） | 无（下面是授权入口） |
+  | wsl + 已授权 | 可升级到 24.21.0 | 升级到 24.21.0 |
+  | 已是最新 | 已是最新 | 无 |
+  | 读不到最新版本 | 读不到最新版本（灰点） | 无 |
+  | 环境装不了（缺 tar/gzip） | 可升级到 24.21.0（缺少 tar 或 gzip，无法解压官方分发包） | 无 |
+  | npm 不可用 + 未授权 | 可升级到 24.21.0（需先授权…）+ npm 那条读数**仍在** | 无（有一条缘由，不是空白） |
+  | npm 不可用 + 已授权 | 可升级到 24.21.0 + npm 那条读数 | 升级到 24.21.0 与 重装 两颗 |
+
+- **窄屏 780 / 620px**：加了原因之后那句话长一截，两种载荷都无横向溢出、读数换行干净
+  （点跟着文字走）；
+- **点一遍**：点「升级到 24.21.0」→ 确认框出现（标题「安装 Node.js 运行时」、正文写明
+  下载源与托管位置、目标环境），**确认前不发任何安装请求**；
+- `npm test` 908 过、`tsc -b` 干净。
+
+### 29.4 独立复查（2026-10-09）：抓到一个"自称钉住了、其实没钉"的洞
+
+换视角（另起一个 agent 只看 diff）抓到一条真漏洞，已修：
+
+**模型里那两道闸门的先后，注释自称"有意且先判环境"，但没有任何断言在钉它** ——
+`unsupported` 两个用例传的是 `remoteInstallAllowed=true`、`ungranted` 传的是
+`installSupported=true`，**把两个 `if` 对调过来，六个断言全都还是绿的**。
+失败场景正是我文档里点名要防的那一个：一台既没授权、又结构上装不了（缺 tar/gzip /
+该架构没有官方包）的机器 —— 那一行会说「需先授权在这台主机上安装」，用户照着点完
+「允许在此主机安装」，升级照样跑不起来，而真正的原因一个字都没露过面。
+补法：加一条**两道闸门同时关着**的用例，断言报的是环境那道理由、且文本里不许出现
+「需先授权」。
+
+同一次复查还指出两处"护栏比它自称的窄"，一并修：
+
+1. 「页面不许有第二份口径」那条反面断言原来只认一种字面量与一种先后
+   （`runtime.installSupported && runtime.updateAvailable`）—— 换个顺序重写就整体漏过。
+   改成**按"页面不许读那个读数"钉**：`runtime.updateAvailable` / `runtime.latestVersion`
+   在页面里必须一个都不出现（它们只该在模型里被读），将来无论怎么排列组合都会红；
+2. 按钮的动作种类原先由页面写死（`setPending({ kind: "install-runtime" })`），模型给什么
+   都发同一个 —— 与文件头那条"按钮说一件事、点下去做另一件"的纪律正相反。改成
+   `action: { kind, label }` 由模型给、页面照发（`setPending({ kind: depAction.kind })`）。
+
+**变异验证**（这才是"钉住了"的证据，不是"测试是绿的"）：把这次修复的每一道判据逐个
+弄坏跑一遍，12 个变异全部被现有用例抓到，含"两道闸门真对调"与"第二份口径换个顺序写"
+这两个此前会漏过去的写法（清单与脚本在 `.tmp/dep-btn/mutate.py`）。
+
+复查指出但**有意不改**的两处，记在这里免得下次再被提：
+- **没装那一支**仍由页面自己数条件、行内不说"为什么没按钮"（理由见 §29.2 末段）；
+- 按钮报的版本号取自一次可能走缓存的读数，而点下去的请求体是 `{ version: "lts" }`
+  （服务端在点击那一刻重新解析 LTS）—— 若期间 LTS 前进，装到的版本会比按钮上写的新一档。
+  旧代码同形。不改成固定版本号，是因为那会让"镜像上恰好撤掉该版本"变成一次必失败的操作；
+  真正的版本差由升级完成后的 toast（服务端回的 旧 → 新）报出。
+
+### 29.5 附带发现：本机同时跑着两个 Milevia
+
+排查时发现本机 `D:\softwares\milevia\`（**2026-09-19** 的安装版）与仓库里的 dev 版
+**共用** `%LOCALAPPDATA%\com.milevia.desktop`（同一个 DB、同一个 `milevia.endpoint`）。
+两件事都值得记：
+
+1. 9/19 那份控制服务**没有** `/api/runners/{id}/agents` 这条路由（404），
+   而「运行依赖」是 2026-10-08（`7c48148`）才有的 —— 所以**看症状前先确认跑的是哪一个**，
+   否则会对着一个根本没有这一块的旧版本找按钮；
+2. 认进程的办法：`Get-CimInstance Win32_Process` 看 `--allowed-origin`
+   （dev 版是 `http://127.0.0.1:1420`，安装版是 `https://tauri.localhost`）+ 二进制路径。
+
+顺带：dev 版的 vite 绑在 `[::1]:1420`（`--host 127.0.0.1` 在这台机器上只监听 IPv6 环回），
+`curl http://127.0.0.1:1420` 会 000 —— 得用 `http://[::1]:1420`。
+
+## 30. 第二轮独立复查（2026-10-09）：抽屉入口只剩一条、运行时的"正在装"没人报
+
+第二轮换了个视角（不再只看 §29 那个 diff，改成"把当前工作区当成待提交的改动"，
+并专门盯并发与入口可达性），抓到两条已核实的缺陷。**两条都不是 §29 那次修复引入的**，
+是同一批未提交改动里既有的，记在这里免得丢。
+
+### 30.1 已修（本轮顺带）
+
+1. **抽屉那块「预检」是第二份口径**：页面自己写 `openDiagnosis.preflight && !preflight.installOk`，
+   而那正好是 `preflightNote` 自带守卫（`if (!preflight || preflight.installOk) return ""`）
+   的取反 —— 同一件事两处判，守的那一处改了，页面这块会把话**静默藏掉**。同族的
+   `preflight.upgradeOk` 早有禁令（cli-tools-page.test.mjs「页面里一次都不该出现」），
+   `installOk` 是漏网的那一个。改成算 `openPreflightNote`、有话说就整块出来，并把
+   `preflight.installOk` 加进那张禁令表。真机探针两档都量过（有理由 → 块在；installOk
+   → 块不在）。
+2. **两处注释说的理由不成立**（改了注释，没改行为）：
+   - `canLogin` 的 `!running` 那档自称"服务端会拒"—— **不成立**：`runAgentLogin`
+     （`agent_login.go:44-77`）没有维护闸门，只查 supportsLogin 与 backend 是否实现；
+     `beginAgentMaintenance` 只管 install/update/repair。真正成立的理由只能是"那个工具
+     正在被替换，此刻发起的登录会跑到半成品上"。
+   - `grantNeededReason` 的注释自称"只有这一处措辞"—— 实际只在依赖区内成立；卡片上那句
+     「尚未授权在 … 上安装」是**服务端**下的（`runner_agents.go` 的 `installBlockedReason`），
+     同义不同源且有意如此（它带着具体的 runner 名）。
+
+### 30.2 已核实、**尚未修**（要方案）
+
+**① 删掉卡片上的「详情」之后，抽屉只剩横幅那一条入口，而横幅只点名一张卡。**
+实测（真机载荷 + 真页面，证据见下）：
+
+- 两张"要留意但平台修不了"的卡 → 横幅只点名 Claude Code，**全页能打开抽屉的元素数 = 1**；
+  Codex 那张卡自己写着「这个问题平台不能自动修 —— 按**「详情」**里的证据在目标环境手动处理。」
+  而它卡上一个能点开的入口都没有（那颗按钮这批已删）—— 这句指引指着不存在的东西，
+  它的证据、安装位置表、抽屉里的「重新检测这个工具」全部够不到。
+- 「检测没查成」那一档更彻底：实测 **横幅整条不出现、全页抽屉入口数 = 0**。
+  那张卡写着「这次没检查成功。这不代表它没问题」，而 `diagnosisEmptyText` 塞进
+  `detailNotes` 的那句「原因见下面的「这次没查的部分」。」只在抽屉里渲染 ——
+  **"我们不知道"这件事的出口被关死了**（这张卡 `statusTone="unknown"`，按构造永远不会被
+  `bannerFor` 的三条分支点名）。
+
+成因：`setOpenAgent` 全页只有两个产出点（横幅链接与关闭），而 `bannerFor` 三条分支各用
+一次 `cards.find` → 永远只点名一张卡。修法要定方案（三选一或另有想法）：
+  - (a) 模型给一个 `canOpenDetail`（分支 ④ 修不了、⑤ 没查成这两档为真），页面在这两档
+    的卡上渲染一颗低键的「看证据」链接 —— 只给"卡上那句话指着抽屉"的卡，健康卡不添噪音；
+  - (b) 让整张卡可点开抽屉（primary/登录 按钮 stopPropagation）—— 零新增控件，但改了交互模型；
+  - (c) 横幅改成能覆盖多张卡（点名 + 「还有一个」循环）—— 改动最大，且仍解决不了 ⑤ 那一档。
+
+**② 运行时没有"正在装"这一档，卡片那边有。** `RuntimeStatus`（`runtime_install.go:30-55`）
+没有任何"正在装"字段；服务端其实**持有**这个信号（`app.go:7328` 置
+`runnerUpdating[{runner,"node"}]`），但 `runner_agents.go:170-173` 只把它翻成**目录内工具**
+的 `item.Operation="running"`。后果（读码确认，未真跑安装）：
+
+- 另一个窗口/客户端（或本页刷新后）发起运行时安装期间，依赖条照样写"可升级到 X"并给一颗
+  **可点**的按钮，点下去 409 立刻回（`app.go:7288-7291` 的 `runnerUpdateExecuting` 是
+  **runner 级**的：任何安装进行中，这台机器上所有安装类动作都拒）；
+- 同一时刻工具卡也**不会**显示「正在处理…」—— `agentMaintenanceActive` 是按
+  `(runner, 该工具)` 查的（`agent_probe.go:206-209`），"node" 槽位与工具卡无关。
+  也就是说：一台机器上有任何安装在跑时，**整页看起来都是空闲的**，而点什么都 409。
+- 要补只能在服务端加字段（给 `runtimeStatus` 一个 `operation`，并考虑 runner 级的
+  "有安装在进行"），不是在页面加条件 —— 这也正是把判据收进 `runtimeDepLine` 的代价：
+  签名 `(runtime, remoteInstallAllowed)` **结构上**表达不了这一档。
+
+**③ 顺带（同一个 409 家族，都是既存）**：409 的文案漏英 ——
+`another AI CLI is already being updated on this runner` 不在 `app.go` 的翻译表里
+（那张表是**精确匹配**，而 `cannot update %s while … active session` 这类带参数的句子
+根本没法进表），用户会看到"操作失败，请稍后重试。：cannot update …"。要修得先让那层
+能处理带参数的句子。
+
+**④ 可选合并**：`installed && installSupported && !npmVersion && updateAvailable` 时，
+依赖条会长出**两颗做同一件事的按钮** —— 「升级到 X」与 npm 那条 note 里的「重装」，
+两者的 `setPending({kind:"install-runtime"})`、请求体、确认框完全一样（实测
+`nonpm-granted`：`allDepButtons = ['升级到 24.21.0','重装']`）。同一份改动里刚为"未授权"
+那一档明令禁止过"两个入口做同一件事"，兄弟档漏了。没动它，因为此时"升级到最新"确实
+就是修复 npm 的办法（新运行时自带 npm），藏掉哪一颗都不显然更好。
+
+## 31. 跨端"这个环境没有这个工具"：让安装入口真的出现（2026-10-09）
+
+> 用户："帮我仔细看看当前 cli 管理中的，如果 cli 工具在对应的环境没有，并没有提供安装
+> 按钮，可以将该 cli 安装到环境中呢"
+
+### 31.1 症状与根因
+
+真机实测（用当前源码起的控制服务，直接查接口）：
+
+| 环境 | 工具 | installed | installSupported | 卡片给了什么 |
+| --- | --- | --- | --- | --- |
+| windows-local | codebuddy | true | true | 正常读数 |
+| wsl-local | claude-code / codex | true | false（未授权） | 读数 + 「允许在此主机安装」 |
+| wsl-local | **codebuddy** | **false** | **false** | **一个字：跨端管理尚未接通** |
+
+根因在 `agentBackend`（`agent_probe.go`）：CodeBuddy 在**非本机** runner 上被硬编码成
+`nil + "跨端管理尚未接通"` → `probeAgent` 判 `unsupported` → `runner_agents.go:184-188`
+把 `installSupported` 与 `updateSupported` **一起**置 false → 前端 `canInstallTool` 为假，
+卡片只剩一句理由。
+
+关键事实是：**安装通道本身早就是通用的**。`installAgentFor`（`app.go`）不查 backend，
+只看目录的 `SupportsInstall` + 逐主机授权；`installAgentCLICross` 完全按
+`entry.NpmPackage` 拼 `npm install -g` 并自检 `$prefix/bin/<commandName>`。缺的只是
+"探测"那一条通道 —— 而探测所需的一切（命令名、版本参数、包名）**都写在目录里**。
+
+### 31.2 方案：目录驱动是默认，逐工具特化只留给真有额外语义的
+
+第一版做法是在 `wslAgentRunner` / `sshRunner` 上各加一组 `CodeBuddy*` 方法（照
+`CodexCapableRunner` 的样子）。**否掉了**：`agentBackend` 的注释自己写着这处耦合
+"会在引入 Runtime 适配层时收敛……从两份变一份，而不是把它继续扩散"，而那一版正是
+把它扩散成三份。更要紧的是那些方法**不携带任何工具信息** —— claude / codex / codebuddy
+的差别只有目录里的三个字段，是数据不是结构。
+
+改后（`agent_catalog_backend.go`，新文件）：
+
+- `crossShellRunner`：runner 只要提供"在目标环境跑一条命令 / 跑一段脚本 / 我在哪台机器上"
+  三件事（`crossProbe` / `crossRun` / `crossWhere`），`wslAgentRunner` 与 `sshRunner`
+  各实现一次；
+- `catalogAgentBackend`：把 `AgentCatalogEntry` 接成 `AgentRunner` —— 版本探测、查新版、
+  升级（复用 `runCrossCLIUpdate` 那套编排）全部由目录数据驱动；
+- `agentBackend` 的分派：本机 Codex/CodeBuddy →各自的管理 runner；Codex、Claude 两个
+  **真有额外语义**的走特化（Codex 的就绪要看登录态；Claude 的跨端探测键已被 WSL 的读数
+  缓存与保活唤醒依赖，改走目录驱动会另起一套键、并把就绪判据放宽）；**其余一律走目录驱动**。
+
+于是目录里新增一个 npm 分发工具时，跨端这一侧**零代码**可用 —— `agent_routes_test.go`
+原有的那条"新增工具别忘了加路由"之外，现在有了对应的"新增工具别忘了（其实不用）接后端"。
+
+### 31.3 顺带抓到、也一并修掉的四个真问题
+
+**① WSL 里的"已安装"曾经是个假读数（接上目录驱动后才暴露）。**
+第一版接上后，WSL 上 CodeBuddy 立刻报 `installed=true, version=2.162.0` —— 而
+`wsl.exe -d Ubuntu -e sh -c 'command -v codebuddy'` 给出的是
+`/mnt/c/Users/<u>/AppData/Roaming/npm/codebuddy`：**Windows 的那一份，经 WSL 互操作跑
+起来的**。它不是这台机器上的安装，后果有两层：卡片把"没装"说成"已安装 2.162.0"，
+并且因此走"可更新"那一档，给出一个会把升级落到 **Windows 那份**上的按钮 ——
+一台机器上的操作改另一台机器的文件。
+
+修法：探测命令里钉一条判据（`wslNativeProbeCommand`）——
+**经 `/mnt/` 命中的不算这台机器上的安装**，与"解析不到"走同一个出口（exit 127）。
+判据取解析结果而不是从 PATH 里删掉 `/mnt/*`：删 PATH 会连带影响用户合法需要的其它
+Windows 工具，而且那份 PATH 是给整条执行链（含会话）用的。
+真机复核：加上之后 WSL 如实报 `installed=false` + `WSL 内 CodeBuddy Code 未安装或不可执行`。
+
+⚠️ **Claude / Codex 的既有探测键没有这条判据**（它们的 `claude --version` / `codex --version`
+同样会命中 /mnt 那份）。本机 WSL 里两者都装了原生版（`~/.npm-global/bin` 被
+`wslPathPrefix` 前置）才没暴露。要收口就得改那两条热路径上的探测，**未在本轮做**。
+
+**② `BinFile` 抄错了一位，只影响回滚。** `npmCLIInstall.binaryPath` 把 `BinFile` 拼在
+`<包根>/bin/` 之后，而 npm 上各家 bin 目标写的是 `bin/<X>`。claude / codex 当初抄的是
+去掉前缀的值，codebuddy 抄成了完整目标 `bin/codebuddy` → 拼出
+`<包根>/bin/bin/codebuddy`（不存在）。它**不在安装路径上暴露**（那条自检用的是
+`$prefix/bin/<commandName>`），只在跨端升级的「确认来源」与「回滚」上用 —— 症状是
+"升级失败时回滚不了"。已改成 `codebuddy`，并加了 `TestCatalogBinFileIsAFileNameNotAPath`：
+那张表里存的是 `npm view <pkg> bin` 的实测值，新增工具不改表就红。
+
+**③ 登录指引里写死了工具名。** 那条指引是这一层给出的**唯一**东西（无头环境驱动不了
+交互式 TUI），写死就意味着第二个需要登录的工具出现时，用户会被指去运行另一个 CLI。
+改成按目录的 `Name` / `CommandName` 拼；`catalogAgentBackend` 也实现了
+`loginAgentRunner` / `authStateRunner`（未安装就报错，登录态判别不了就如实回 false）。
+**这条不修的话，跨端 codebuddy 装好后卡片上那颗「登录」会以 501 收场** —— 正是这一页
+反复禁止的"点了没反应的按钮"。
+
+**④ 升级后的"健康检查"读的是升级前的版本（接上目录驱动后才发现）。**
+`runCrossCLIUpdate` 的编排是"升级前取一次版本 → 跑 update → 再取一次当健康检查"，
+而 WSL 侧的读数是 **stale-while-revalidate**：只要探过一次，之后**永远先回旧值**、后台
+再刷新（`wslAgentRunner.probe` 的三条分支）。于是那条健康检查永远读到升级前那个版本号，
+三处判据一起失真：
+
+| 那一处 | 本意 | 变质的后果 |
+| --- | --- | --- |
+| 升级后的健康检查 | 还能读出版本 ⇒ 没升坏 | **永远判健康** ⇒ 回滚永不触发 |
+| 返回的 (previous, current) | 报出"旧 → 新" | 两个值相同 ⇒ 界面报"升到同一个版本" |
+| 回滚后的核对 | `current != previous` ⇒ 回滚失败 | 拿旧值比对 ⇒ **一次没生效的回滚判成成功** |
+
+演示（真缓存 + 会变的探测值，改前 `previous=2.162.0 / health-check=2.162.0`）。
+改法：升级那条路上取版本走 `freshVersion`（新增可选接口 `freshProbeRunner`，WSL 侧
+`crossProbeFresh` 真探一次、不看缓存也不复用在飞的探测，自带 20s 上限）；真探失败时
+**退回常规读数**而不是报空 —— 报空会被 `runCrossCLIUpdate` 当成"未安装"，那是另一句
+指错方向的结论。
+
+⚠️ **Claude / Codex 的跨端升级仍在用缓存读数**（`wsl_agent_update.go` 传的是
+`r.Version` / `r.CodexVersion`），同一处三连失真对它们同样成立，**本轮没动**：那要改两条
+已在跑的工具路径，得单独验证。修法就是把那两处也换成 fresh 一档（`crossProbeFresh` 已经
+在那个 runner 上，可直接复用）。
+
+### 31.4 验证
+
+- **真机**（当前源码起的控制服务，`/api/runners/{id}/agents`）：windows-local 三个工具
+  读数不变；wsl-local 的 codebuddy 从 unsupported 变成 `installed=false,
+  installSupported=true`，且 `runtime.meetsMinimumFor` 含 codebuddy、`npmVersion` 非空
+  ⇒ 页面三条判据齐备，**「安装」按钮会出现**（真装未做：会改动 WSL 环境，且临时 data-dir
+  会把登记落到错的地方）。`check-update` 与 `login` 两个端点也不再 404。
+- **Go 测试**：全包通过（`-skip TestProjectRunnerStartStop`，那条按既有记录会挂）。
+  新增 11 条，其中"往目录里塞一个从没实现过的工具、不加任何代码、跨端必须能用"是该方案
+  的自证用例。
+- **变异检验**（逐条改生产代码、确认对应用例变红，再按 sha1 还原）：去掉 `/mnt` 判据 →
+  `TestWSLNativeProbeCommandRefusesWindowsMounts` 红；把 codebuddy 写回硬编码的
+  "尚未接通" → 跨端两条红；`BinFile` 写回 `bin/codebuddy` → 目录不变量红；指引写回
+  "CodeBuddy …" → 登录那条红；探测命令写死 `claude` 或去掉版本归一化 → 目录驱动那条红。
+- **既有测试的一处前提变了**：`TestDiagnoseReportsUnsupportedEnvironment` 原先靠"codebuddy
+  在跨端一律硬编码成 unsupported"拿到那一档，而它用的 runner 是**没注册**的。改成注册一个
+  "跑不了 shell"的 runner —— "该环境不提供这个工具"这一档仍然存在，只是实例从硬编码变成了
+  「runner 没有跨端执行面」。
+
+- **`/mnt` 判据的真机两分支**（单元测试在 Windows 上造不出 `/mnt`，只能钉形状，所以这一条
+  在真机上单跑）：把生成的那段脚本原样丢给 WSL —— `claude`（原生装在 `~/.npm-global/bin`）
+  → `2.1.293 (Claude Code)`、exit 0；`codebuddy` 带判据 → 空输出、**exit 127**；
+  同一个 `codebuddy` **去掉判据** → `2.162.0`、exit 0（那就是假读数本身）。
+
+### 31.5 仍未做
+
+- **跨端 CodeBuddy 的会话**：`app.go` 的会话选择只给本机 `codebuddyRunner`。装好之后能在
+  WSL 里执行 CLI，但项目对话仍选不到它 —— 卡片不该被读成"装完就能用"。
+- **Claude / Codex 探测的 /mnt 漏洞**（见 31.3 ①）。
+- **Claude / Codex 跨端升级的健康检查仍走缓存读数**（见 31.3 ④）。
+- **那句 500 的文案**：`WSL 内未安装 CodeBuddy Code` 含中文却没有「失败」二字、且带残留
+  英文，`localizedErrorText` 会再套一层"任务执行失败，请查看任务日志后重试。："。
+  这是**既存形状**（Codex / Claude 的同类报错一模一样），改它要动那层判据，未在本轮做。

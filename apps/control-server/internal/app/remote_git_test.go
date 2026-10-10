@@ -91,18 +91,27 @@ func TestGitRemoteOperationWhitelistIsExplicit(t *testing.T) {
 // 合成表的两条性质：不覆盖、不漏条。
 func TestRelayCompositeOperationTableHasNoOverlap(t *testing.T) {
 	server := &Server{}
-	fileOperations := server.remoteFSOperations()
-	gitOperations := server.remoteGitOperations()
-	for name := range gitOperations {
-		if _, clash := fileOperations[name]; clash {
-			// 有交集意味着后注册的那份静默覆盖前一份：某个操作会跑到另一个 handler 上，
-			// 而两边单独看代码都是对的。
-			t.Fatalf("operation %q appears in both the file and the Git table", name)
+	tables := map[string]map[string]remoteOperation{
+		"file":         server.remoteFSOperations(),
+		"Git":          server.remoteGitOperations(),
+		"conversation": server.remoteConversationOperations(),
+	}
+	total := 0
+	seen := map[string]string{}
+	for name, table := range tables {
+		total += len(table)
+		for op := range table {
+			if first, clash := seen[op]; clash {
+				// 有交集意味着后注册的那份静默覆盖前一份：某个操作会跑到另一个 handler 上，
+				// 而两边单独看代码都是对的。
+				t.Fatalf("operation %q appears in both the %s and the %s table", op, first, name)
+			}
+			seen[op] = name
 		}
 	}
 	merged := server.remoteOperations()
-	if len(merged) != len(fileOperations)+len(gitOperations) {
-		t.Fatalf("merged table has %d operations, want %d", len(merged), len(fileOperations)+len(gitOperations))
+	if len(merged) != total {
+		t.Fatalf("merged table has %d operations, want %d", len(merged), total)
 	}
 }
 

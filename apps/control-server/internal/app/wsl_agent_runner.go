@@ -371,6 +371,90 @@ func (r *wslAgentRunner) codexVersion(ctx context.Context) string {
 	return agentVersionFromOutput(r.probe(ctx, wslProbeKeyCodexCLI, wslProbeCommandCodexVer).value)
 }
 
+// ── crossShellRunner：目录驱动的工具（catalogAgentBackend 用）────────────────
+//
+// 这三个方法让 WSL runner 能按**目录条目**服务任意工具，而不是每个工具各加一组方法。
+// Claude / Codex 的专属方法留在各自的位置：它们有额外语义（就绪要看登录态、探测键被
+// 保活唤醒依赖），不属于这一层。
+
+// crossProbe 在 WSL 内执行 `name args...` 并拿回 stdout，**走既有读数缓存**。
+//
+// 探测键按**命令**取，用同一个字符串：同一条命令在同一个 runner 上永远指同一件事，
+// 因此天然与那些语义键（claude-version / codex-cli）不冲突，也不会两个工具用同一条
+// 命令时重复探测。这里绕开缓存是**不行**的：这个方法会被 /api/runners 的每个工具
+// 各调一次，而一次冷启动的 wsl.exe 实测 7s 起（见本文件顶部那段背景）。
+func (r *wslAgentRunner) crossProbe(ctx context.Context, name string, args ...string) (string, bool) {
+	command := wslNativeProbeCommand(name, args...)
+	entry := r.probe(ctx, "agent-cmd:"+command, command)
+	return entry.value, entry.ready
+}
+
+// wslNativeProbeCommand 拼出探测命令，并在其中钉住一条判据：
+// **经 /mnt/ 命中的不算这台机器上的安装**。
+//
+// 为什么必须钉：WSL 的 PATH 里有 /mnt/c/...，而 Windows 的 npm 全局目录
+// （/mnt/c/Users/<u>/AppData/Roaming/npm）也在其中。挂在那个目录下的命令**解析得到、
+// 也跑得起来**（经 WSL 互操作拉起 Windows 的 node），可它是**另一台机器上的安装**：
+// 2026-10-09 真机实测 `codebuddy --version` 在 WSL 里打印 2.162.0，而那个文件是
+// /mnt/c/Users/.../AppData/Roaming/npm/codebuddy。
+//
+// 不加这条判据的后果有两层，都在管理页上：① 卡片把"WSL 里没装"说成"已安装 2.162.0"
+// （那是假读数）；② 于是它走"可更新"那一档，给出一个会把升级落到 **Windows 那份**上的
+// 按钮 —— 一台机器上的操作改了另一台机器的文件。与 wslPathPrefix 的注释同一条纪律：
+// **WSL 项目就用 WSL 原生那一份**。
+//
+// 判据取解析结果而不是"PATH 里有没有 /mnt"：只从 PATH 里删掉 /mnt/* 会连带删掉
+// 用户可能合法需要的其它 Windows 工具，而且改 PATH 是给整条执行链用的（同一份
+// wslPathPrefix 也供会话使用）；这里只回答"这个命令在这台机器上是谁"。
+//
+// 用 `command -v` 而不是 `which`：前者是 sh 内建，任何发行版都有。
+//
+// 两条出口**都不打印任何东西**：探针只认 (值, 是否成功)，而 wslBridgeProbe 把 stderr
+// 丢在 ExitError 里没人读（runProbe 只存 value/ready）—— 写一条没人读的输出，按本仓的
+// 规矩就是缺陷。调用方那一档要说的"未安装或不可执行"由 agentUnavailableReasonText 出。
+func wslNativeProbeCommand(name string, args ...string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, shellQuote(name))
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	return "cmd=$(command -v " + shellQuote(name) + " 2>/dev/null || true)\n" +
+		`case "$cmd" in ""|/mnt/*) exit 127;; esac` + "\n" +
+		"exec " + strings.Join(parts, " ")
+}
+
+// crossRun 在 WSL 内跑一段脚本（升级这类短命令）。
+func (r *wslAgentRunner) crossRun(ctx context.Context, script string) (string, error) {
+	return r.wslRunScript(ctx, script)
+}
+
+// crossProbeFresh 与 crossProbe 同义，但**同步真探一次**：不看缓存，也不复用在飞的
+// 探测（freshProbeRunner 的 WSL 实现）。
+//
+// 只有升级那条路用它，而且是那条路上的**每一次**取版本（升级前、升级后的健康检查、
+// 回滚后的核对）—— 缓存读数永远不会阻塞等待新值（见 probe 的三条分支），拿它当
+// "升完级还健康吗"的判据等于永远判健康。
+//
+// 自己带 20s 上限：调用方给的 ctx 可能是整段升级的预算（分钟级），而这里要的只是一条
+// 探测命令的答复；没有上限的话，一次 WSL 卡死会把升级流程连同回滚一起拖住。
+func (r *wslAgentRunner) crossProbeFresh(ctx context.Context, name string, args ...string) (string, bool) {
+	probeCtx, cancel := context.WithTimeout(ctx, wslProbeFirstTimeout)
+	defer cancel()
+	value, err := r.probeFn(probeCtx, wslNativeProbeCommand(name, args...))
+	return strings.TrimSpace(value), err == nil
+}
+
+// crossWhere 是"在哪台机器上"的说法，只用于报错文案。
+func (r *wslAgentRunner) crossWhere() string { return "WSL 内" }
+
+// 编译期钉住能力面：签名写歪了只会表现为"这个 runner 突然不支持目录驱动"（断言失败
+// 落到 agentBackend 的"尚未接通"分支），而那是一条**看起来像数据问题**的静默降级。
+var _ crossShellRunner = (*wslAgentRunner)(nil)
+
+// 同上，freshProbeRunner 是**可选**接口，写歪了不会报错、只会静默退回缓存的旧读数
+// （也就是升级后健康检查读到升级前的版本）。这条断言是它唯一的守卫。
+var _ freshProbeRunner = (*wslAgentRunner)(nil)
+
 // Ready implements AgentRunner（Claude 就绪，用于 claude 分发与 createProject 校验）。
 func (r *wslAgentRunner) Ready(parent context.Context) bool { return r.claudeReady(parent) }
 

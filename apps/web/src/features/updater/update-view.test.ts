@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   bannerUpdate,
   checkResultToast,
+  downloadFailureReason,
   downloadPercent,
   downloadPhase,
   installableUpdate,
@@ -165,6 +166,43 @@ test("设置页描述跟着相位走：下载中报进度、就绪说可以直�
     /后台下载未完成/,
   );
   assert.match(settingsUpdateDescription(status(), null), /发现新版本 v0\.1\.8/);
+});
+
+// 静默下载失败时，用户看到的只有"后台下载未完成，点击后重新下载"—— 拿不到任何
+// 原因，只能瞎点。Rust 侧一直在写 download.error（已本地化），前端却从没人读它。
+test("后台下载失败的原因要显示出来，不能只说「未完成」", () => {
+  const failed = status({
+    download: {
+      phase: "failed",
+      received: 0,
+      total: null,
+      error: "下载更新失败：网络不可用（error sending request）",
+    },
+  });
+  const text = settingsUpdateDescription(failed, null);
+  assert.match(text, /后台下载未完成/);
+  assert.match(text, /下载更新失败：网络不可用/);
+  // 原因在括号里，与"发现新版本"那句连成一句，不是另起一行
+  assert.match(text, /后台下载未完成（下载更新失败/);
+
+  assert.equal(downloadFailureReason(failed), "下载更新失败：网络不可用（error sending request）");
+  // 只有 failed 相位才谈得上"失败原因"：其它相位即便残留着旧字段也不能当失败用。
+  for (const phase of ["idle", "downloading", "ready"] as const) {
+    const other = status({ download: { phase, received: 0, total: null, error: "上一轮的原因" } });
+    assert.equal(downloadFailureReason(other), null, `${phase} 不该报失败原因`);
+    assert.doesNotMatch(settingsUpdateDescription(other, null), /上一轮的原因/);
+  }
+  // 老版本 Rust 不带 error 字段，或字段是空白：照旧只说"未完成"，不能崩也不能编。
+  assert.equal(downloadFailureReason(status({ download: { phase: "failed", received: 0, total: null } })), null);
+  assert.equal(
+    downloadFailureReason(status({ download: { phase: "failed", received: 0, total: null, error: "   " } })),
+    null,
+  );
+  assert.match(
+    settingsUpdateDescription(status({ download: { phase: "failed", received: 0, total: null } }), null),
+    /后台下载未完成，点击「立即升级」重新下载。/,
+  );
+  assert.equal(downloadFailureReason(null), null);
 });
 
 test("设置页描述里，本地错误与检查失败优先于相位文案", () => {

@@ -204,16 +204,45 @@ test("mobile composer is one rounded box with both buttons mounted inside it", (
   // 或只引用了某条消息、一个字没写，都能发出去）。漏掉 quoteRef 这一项的症状是：
   // 输入框上方明明挂着一颗引用胶囊，发送键却是灰的 —— 用户以为引用没生效。
   assert.match(page, /<button type="submit" className="mobile-composer-send" disabled=\{busy \|\| !conversation \|\| \(!messageDraft\.trim\(\) && skillRefs\.length === 0 && !quoteRef\)\}/);
-  // 整盒 + 单行内嵌（DeepSeek / ChatGPT 那种）：盒子里**一行**依次是 [＋] [文字] [发送]。
-  assert.match(page, /<div className="mobile-composer-box"><button type="button" className="mobile-composer-tool"[\s\S]*?<\/button><textarea[\s\S]*?\/><button type="submit" className="mobile-composer-send"/);
+  // 整盒 + 单行内嵌（DeepSeek / ChatGPT 那种）：盒子里**一行**依次是 [＋] [文字] [发送]；
+  // 这条会话跑起来时，在发送键**左边**多一颗停止键（见下面那条用例）。
+  //
+  // ⚠️ 判据是"这几个元素**都在这只盒子里**，且顺序如此"，不是"这几个串在全文里按序出现"：
+  // 早先这行用两个 `[\s\S]*?` 跨过去，那时候它连"整段 JSX 挪到 </form> 之后"都照样绿
+  // （复查时用变异实测过）。所以先把盒子那一段切出来，再在切片里断言。
+  // 切片必须从**剥掉注释的那份**上取索引：注释一剥，字符数就变了，拿原文的索引去切剥过的那份
+  // 会切到一段毫不相干的内容（实测过：断言报的是"切片不以盒子开头"）。
+  const composerPageCode = page.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const boxStart = composerPageCode.indexOf('<div className="mobile-composer-box">');
+  const composerBox = composerPageCode.slice(boxStart, composerPageCode.indexOf("</form>", boxStart));
+  assert.match(composerBox, /^<div className="mobile-composer-box"><button type="button" className="mobile-composer-tool"/);
+  for (const [name, pattern] of [
+    ["工具键", /<button type="button" className="mobile-composer-tool"/],
+    ["输入框", /<textarea/],
+    ["停止键", /\{conversationProcessing && !conversationPending && <button type="button" className="mobile-composer-stop"/],
+    ["发送键", /<button type="submit" className="mobile-composer-send"/],
+  ]) {
+    assert.ok(pattern.test(composerBox), `输入盒里找不到${name}`);
+  }
+  const positions = ["mobile-composer-tool", "<textarea", "mobile-composer-stop", 'className="mobile-composer-send"']
+    .map((marker) => composerBox.indexOf(marker));
+  assert.ok(
+    positions.every((at, index) => at > 0 && (index === 0 || at > positions[index - 1])),
+    `输入盒里的顺序必须是 [工具][输入][停止][发送]，实际位置 ${positions}`,
+  );
+  // 发送键**任何时候都在**（停止键是加在它左边，不是取代它）：跑着的时候还要能再发一条，
+  // 那是既有能力（桌面端运行中同样能发，还有「立即发送 / 预约发送」两种）。
+  assert.equal((composerBox.match(/mobile-composer-send/g) ?? []).length, 1, "发送键应当只有一个，且常驻");
   assert.doesNotMatch(page, /mobile-composer-bar/);
   assert.doesNotMatch(styles, /mobile-composer-bar/);
   assert.match(styles, /\.mobile-composer-box\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*flex-end;/s);
   assert.match(styles, /\.mobile-composer-box\s*\{[^}]*border-radius:\s*22px;/s);
   assert.match(styles, /\.mobile-composer textarea\s*\{[^}]*flex:\s*1;[^}]*min-height:\s*38px;/s);
   assert.match(styles, /\.mobile-composer\s*\{[^}]*display:\s*flex;/s);
-  // 两颗按钮常驻。旧实现里发送键在草稿为空时 display: none，一打字就凭空出现，
+  // 按钮常驻。旧实现里发送键在草稿为空时 display: none，一打字就凭空出现，
   // 把输入框宽度挤掉一颗按钮、光标跟着跳；禁用态改由专门的一条配色规则表达。
+  // 后来加的停止键是**渲染条件**（跑起来才有），不是第二条 display 规则 —— 这仍是上面那句话的
+  // 反面：按草稿内容决定显隐是不行的，按"这条会话在不在跑"决定有没有停止键是另一回事。
   assert.match(styles, /\.mobile-composer button\s*\{[^}]*display:\s*grid;/s);
   assert.doesNotMatch(styles, /\.mobile-composer button:not\(:disabled\)/);
   assert.match(styles, /\.mobile-composer \.mobile-composer-send:disabled\s*\{[^}]*background:\s*#e9f0ec;/s);
@@ -969,6 +998,53 @@ test("mobile task cards show a per-card syncing state and roll back on failure",
   // 本地那张卡只能靠快照自己收敛 —— 少了这个 effect，「同步中」会一直挂着。
   assert.match(page, /if \(!mutationReflectsInSnapshot\(mutation, snapshot\.projects, current\.values\(\)\)\) continue;/);
   assert.match(page, /current\.delete\(mutation\.taskId\);/);
+});
+
+// 下发**不是**一条"做完就完了"的命令（用户 2026-10-10 报的）：任务已经跑起来了，
+// 用户该看的是执行，而不是还钉在任务队列那张 inset:0 的整页浮层上。
+test("mobile dispatch hands the task over to the conversation it runs in", () => {
+  const dispatch = page.slice(page.indexOf("async function dispatchTask("), page.indexOf("function openTaskEditor("));
+  assert.ok(dispatch.length > 0, "找不到 dispatchTask（下发那条链的落点）");
+
+  // ① 目标会话由手机端显式指给电脑端，与桌面端那颗下发键完全一致（TaskQueue 也带 conversationId）。
+  //    不带的话电脑端会自己挑"项目里最近活跃的空闲会话"，那条可能是编排用的后台会话
+  //    （is_current=0），而手机端快照每个项目只带一条会话 —— 它渲染不出来，
+  //    症状就是"点了下发，屏幕上什么都没发生"（电脑端那半边的判据见
+  //    control-server 的 TestRemoteTaskDispatchHonorsRequestedConversation）。
+  assert.match(dispatch, /const target = conversation && !conversationPending \? conversation\.id : "";/);
+  assert.match(dispatch, /sendTaskCommand\(taskID, "task\.dispatch", target \? \{ conversationId: target \} : \{\}\)/);
+
+  // ② 面板只在**成功**时收：失败时任务还是那张待处理的卡，原因写在面板自己那行上，
+  //    用户看完能直接再点一次 —— 收掉面板等于把这张卡和那句原因一起藏起来。
+  assert.match(dispatch, /if \(!outcome\.ok\) return;[\s\S]{0,400}?setTasksOpen\(false\);/);
+
+  // ③ 成功之后落在**任务真正跑起来的那条会话**上。落点以回执为准：会话还在本地态
+  //    （还没有真 id）时没有目标可指定，只有回执知道任务落到了哪儿。
+  //    切之前三条都要过：会话还在本地态时不抢交棒那条链的选择权（抢了会清掉草稿）、
+  //    快照里没有的会话切了也白切（屏幕不会有任何变化）、落点本来就是当前这条就什么都不做。
+  assert.match(dispatch, /const landed = taskDispatchConversationID\(outcome\.result\);/);
+  assert.match(dispatch, /const known = landed !== "" && conversations\.some\(\(item\) => item\.id === landed\);/);
+  assert.match(dispatch, /if \(known && !conversationPending && landed !== conversation\?\.id\) setSelectedConversation\(landed\);/);
+
+  // ④ 失败原因必须**同时**画在面板自己那行上：页面级那条 `.mobile-error` 在面板之下、
+  //    又在文档最上面（MOBILE-UI 的块序：顶栏 / 刷新状态条 / 错误条 / … / 会话块），
+  //    长会话里滚在底部的用户两处都看不到。
+  //    它不另存一份状态、直接画同一份 error —— 于是"上一轮的原因留在面板里"这种事
+  //    在结构上不可能发生（这也正是创建弹层当年那个坑的成因，见 MOBILE-UI 2026-09-17 那条）。
+  assert.match(page, /\{error && <p className="mobile-task-panel-error" role="alert">\{error\}<\/p>\}/);
+  //    行在滚动区之外、且不参与收缩（面板是一列 flex，收起来就等于把那句话说没了）。
+  assert.match(styles, /\.mobile-task-panel-error \{ flex: none;/);
+
+  // ⑤ 面板上那颗「下发」必须走这条链：直接调 sendTaskCommand 就等于回到"发完还站在原地"。
+  //    负向断言先剥注释（本文件上面那几段解释里原样写着旧写法）。
+  const panelCode = page.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.match(panelCode, /onClick=\{\(\) => void dispatchTask\(task\.id\)\}>下发<\/button>/);
+  assert.doesNotMatch(panelCode, /sendTaskCommand\(task\.id, "task\.dispatch"\)/);
+
+  // ⑥ 回执的读法：会话以 taskRun.conversationId 为准（它记的就是这条 run 挂在哪儿），
+  //    message.conversationId 只是同一件事的第二来源；两者都认不出来时停在当前会话，不做假装。
+  assert.match(page, /const candidates = \[value\.taskRun\?\.conversationId, value\.message\?\.conversationId\];/);
+  assert.match(page, /function taskDispatchConversationID\(result: unknown\): string \{/);
 });
 
 test("mobile pairing QR carries the pairing handle plus the one-time code", () => {
@@ -3462,7 +3538,10 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   assert.match(page, /\{mobileApp && mobileView === "conversation" && project && !subHeaderActive && <section className="mobile-conversation">/);
   // 顶栏 ⋯ 菜单里的「刷新仓库状态」走工作台自己的 reload，而不是重新同步云端快照
   // （快照里根本没有仓库状态，那两件事语义不同）。
-  assert.match(page, /function reloadGit\(\) \{\n\s*gitPanelRef\.current\?\.reload\(\);\n\s*\}/);
+  // 唯一的例外是"项目还不是仓库"：那时面板里没有任何仓库状态可读（空态连 GitBar 都不渲染），
+  // 用户真正想知道的是"电脑上现在是不是仓库了" —— 那属于项目信息，所以只有这一档转去同步快照。
+  assert.match(page, /if \(!isSelectedProjectGitRepo\) \{ void refreshNow\(\); return; \}\n\s*gitPanelRef\.current\?\.reload\(\);/);
+  assert.match(page, /isGitRepo=\{isSelectedProjectGitRepo\}/);
   assert.match(page, /onClick=\{\(\) => \{ setHeaderMenuOpen\(false\); reloadGit\(\); \}\}><span>刷新仓库状态<\/span>/);
 
   // ⑥ 适配器必须记忆化：它持有"上一条可恢复提示还挂着吗"这份状态（以及两个回调）。
@@ -3495,7 +3574,15 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   const workbenchCode = workbench.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
   assert.doesNotMatch(workbenchCode, /\.catch\(\(\) => null\)/);
   assert.match(workbench, /const \[conflictsState, setConflictsState\] = useState<"loading" \| "ready" \| "unavailable">\("loading"\);/);
-  assert.match(workbench, /setConflictsState\(conflictsResult\.ok \? "ready" : "unavailable"\);/);
+  // 冲突总览改成**单独一路、不挡首屏**之后（它是这一组里最慢的一条：干净仓库上要跑
+  // 四次 rev-parse 探测），三档的判据从 `conflictsResult.ok` 挪进了 loadConflicts 的
+  // try/catch —— 但纪律一条没松：读到才 ready，**读不到必须显式落到 unavailable**。
+  assert.match(workbench, /setConflictsState\("ready"\);/);
+  assert.match(workbench, /setConflictsState\("unavailable"\);/);
+  // 它自己一个作废号（不共用 reloadRequest）：共用的话，一次什么都没改的 probe 会把
+  // 在飞的这一份判成过期，而 probe 早退时并不补发新的 —— 这份读数就永久停在「读取中」。
+  assert.match(workbench, /void loadConflicts\(\);/, "冲突总览必须仍然被取（只是不挡首屏）");
+  assert.match(workbench, /const id = \+\+conflictRequest\.current;/);
   // 「读不到」必须显式渲染，且文案与"真的有冲突"那条横幅**不同**（两件事）。
   assert.match(workbench, /conflictsState === "unavailable" && <div className="git-conflict-unavailable" role="status">/);
   assert.match(gitStyles, /\.git-conflict-unavailable \{[^}]*background: #fdf8ec;/s);
@@ -3631,4 +3718,95 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   assert.match(adapter, /\{ pattern: "\/commits\/amend",[\s\S]*?\n\s*\{ pattern: "\/commits",/);
   // 令牌换取失败必须原样失败，不能"换不到就拿旧的硬发"（那会拿到一个指不到原因的 409）。
   assert.match(adapter, /readonly code: "operation_failed" \| "wiring" \| MobileGitFailureKind;/);
+});
+
+test("mobile conversation can actually be stopped from the composer", () => {
+  // 这一条守的是**接线**：这一屏在 2026-10-10 之前根本没有停止入口 —— 任务队列里的任务能停
+  // （task.stop），对话却只能等它自己跑完。判据层（四种答复怎么读）在
+  // lib/mobile-conversation-stop.test.ts 里逐条跑函数，这里只查接线接对了没有。
+  //
+  // 剥掉注释再断言：本文件里解释"为什么这么接"的注释会原样写出那些选择器与文案，
+  // 直接对 page 做 negative 断言会被自己的注释满足（TOOLING「断言前先剥注释」）。
+  const pageCode = page.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+  // ① 走中继的 conversation.stop，不是命令通道。项目为此定过规矩（docs/40 §0 决策 3）：
+  //    除非真的需要命令通道的幂等键 / 持久化审计 / 终态机，新操作一律走请求-响应。
+  //    停止一样都不需要，而命令类型要同时改 control-server 与**云端**两份白名单。
+  assert.match(pageCode, /import \{[^}]*conversationStopOutcome[^}]*\} from "\.\.\/lib\/mobile-conversation-stop"/);
+  // 超时必须自己提议：默认 20s 会被服务端那把全局流式锁真实地跑爆（假失败），
+  // 理由写在 lib 那个常量上。这一条防的是"顺手把第三个参数删掉"。
+  assert.match(page, /rpcTransport\("conversation\.stop", conversationStopParams\(force\), conversationStopTimeoutMs\)/);
+  // force 必须是字符串：中继把 params 整个当查询串，且要求取值都是字符串 ——
+  // 塞布尔 true 进去，电脑端回的是"params 必须是字符串键值对"。所以只认那个 helper，
+  // 而且只允许一个调用点（params 就地写成对象字面量就是这条约束失守的第一种写法）。
+  assert.doesNotMatch(pageCode, /conversationStopParams\(true\)/);
+  assert.equal((page.match(/rpcTransport\("conversation\.stop"/g) ?? []).length, 1, "conversation.stop 只能有一个调用点（走那个收敛 params 形状的 helper）");
+
+  // ② 跑起来时在发送键**左边**多一颗停止键（发送键留着 —— 跑着的时候还要能再发一条，
+  //    那是既有能力；换掉它等于在最需要的时候把发送入口藏起来）。
+  assert.match(page, /\{conversationProcessing && !conversationPending && <button type="button" className="mobile-composer-stop" disabled=\{stoppingConversation\}/);
+  assert.match(page, /\{stoppingConversation \? "停止中" : "停止"\}/);
+  // 可见文字就是它的可访问名 —— 不加 aria-label（那会让可见文字不在可访问名里，WCAG 2.5.3）。
+  assert.doesNotMatch(pageCode, /className="mobile-composer-stop"[^>]*aria-label/);
+  // 会话还是本地态（pending，电脑端还没分配真 id）时**不显示**停止键：那时中继的
+  // conversationId 传的是空串（见 rpcTransport 的说明），发出去只会得到一句参数错误。
+  assert.match(page, /conversationProcessing && !conversationPending &&/);
+
+  // ③ 点了就置 stopping：电脑端把进程收干净要几秒，没有即时反馈用户会以为没生效而反复点。
+  assert.match(page, /setStopConfirmTarget\(""\);\n    setStoppingConversation\(true\);/);
+  // 而收尾**不靠**这个请求的响应（那个响应说的是"开始停了"），挂点是 conversationProcessing
+  // 转 false —— 它由实时事件与快照两路收敛，是"确实不跑了"的唯一读数。
+  assert.match(page, /useEffect\(\(\) => \{\n    if \(!conversationProcessing\) setStoppingConversation\(false\);\n  \}, \[conversationProcessing\]\);/);
+  // 换会话无条件复位这两个状态：它们说的是"我刚对**屏幕上这条会话**做了一次停止"。
+  // 少了它，在 A 上点了停止再切到也在跑的 B，B 的停止键会显示「停止中」并被禁掉好几秒。
+  assert.match(page, /useEffect\(\(\) => \{ setStoppingConversation\(false\); setStopConfirmTarget\(""\); \}, \[conversation\?\.id\]\);/);
+  // 兜底放开：上面那两条都是"别人来摘"，而 processingConversations 里那条乐观记录是有可能
+  // 清不掉的（还有待确认的消息时对账会跳过它）—— 没有这一条，按钮就可能永远禁着。
+  assert.match(page, /const conversationStopFallbackMs = 60_000;/);
+  assert.match(page, /window\.setTimeout\(\(\) => setStoppingConversation\(false\), conversationStopFallbackMs\)/);
+
+  // ④ 还有排队中的请求时**不自动强制**：服务端回 active_runs_present，界面弹确认框，
+  //    用户点了才带 force 重发。少这一步，一次点击会连用户排队等着跑的请求一起取消掉。
+  assert.match(page, /if \(outcome\.kind === "needs-force"\) \{ if \(stillOnConversation\) setStopConfirmTarget\(target\); return; \}/);
+  assert.equal((page.match(/stopConversationRun\(true, /g) ?? []).length, 1, "强制停止只能有一个调用点（确认框里那颗）");
+  assert.match(page, /\{stopConfirmTarget && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-stop-confirm-title">/);
+  assert.match(page, /className="mobile-task-delete-confirm" onClick=\{\(\) => \{ const target = stopConfirmTarget; setStopConfirmTarget\(""\); void stopConversationRun\(true, target\); \}\}/);
+  // 确认框认的是**它自己那条会话**（stopConfirmTarget），不是"当时屏幕上那条"：
+  // 这个请求要跨一次几秒的往返，期间用户完全可能切走 —— 而「强制停止」会连排队中的一起取消，
+  // 停错一条是真的会丢工作。所以调用点必须把 id 传下去，且函数里要求它仍是被选中的那条。
+  assert.match(page, /if \(!target \|\| conversation\?\.id !== target\) return;/);
+  assert.match(page, /const stillOnConversation = selectedConversationRef\.current === target;/);
+
+  // ⑤ 确认框的文案只允许有一份：它必须来自 lib 里那个常量（与桌面端逐字一致），
+  //    而不是在这里再抄一遍 —— 抄一遍就会有一天两边说得不一样，用户以为是两件事。
+  assert.match(pageCode, /\{conversationStopConfirmCopy\.title\}/);
+  assert.match(pageCode, /\{conversationStopConfirmCopy\.message\}/);
+  assert.match(pageCode, /\{conversationStopConfirmCopy\.confirm\}/);
+  assert.doesNotMatch(pageCode, /强制停止将一并取消它们/);
+
+  // ⑥ 这一趟什么都没停时的那句话来自 lib 的判据（服务端回的两种状态要说不同的话），
+  //    而且**必须**排在 loadSnapshot 之后 —— loadSnapshot 的第一句就是 setError("")，
+  //    写在它前面等于同一拍里又被清一次，用户一个字都看不到（复查抓出来的那个 bug）。
+  assert.match(pageCode, /void loadSnapshot\(\{ force: true \}\);\n      if \(stillOnConversation\) setError\(conversationStopIdleMessage\(outcome\)\);/);
+
+  // ⑦ 返回键必须先收这一层。漏掉的症状与上面那几个 backdrop 一样：返回键一路退掉会话层，
+  //    确认框还浮在项目列表上、「强制停止」仍可点 —— 那一下会真的取消电脑端正在跑的请求。
+  //
+  //    比较位置用的是**剥掉注释的那份**：这个 handler 里解释其它弹层的注释本身就写着
+  //    "返回键一路走到 exitConversationView()"，拿原文比较会被那句注释满足。
+  const backHandler = pageCode.slice(pageCode.indexOf("backHandlerRef.current = () => {"));
+  const stopGuardAt = backHandler.indexOf('if (stopConfirmTarget) { setStopConfirmTarget(""); return true; }');
+  const exitAt = backHandler.indexOf("exitConversationView()");
+  assert.ok(stopGuardAt > 0, "返回键没有处理「强制停止」确认框");
+  assert.ok(exitAt > 0 && stopGuardAt < exitAt, "确认框的处理必须排在 exitConversationView() 之前");
+  // 侧滑返回（popstate → leaveConversationView）**不走** backHandlerRef，所以那条链上也要收一次。
+  // 这个文件里为同一件事记过两次（编辑/删除任务那两张弹层就是这么漏的）：两处必须一致。
+  // 用剥掉注释的 pageCode 比对 —— 中间只该剩空白，注释不算证据。
+  assert.match(pageCode, /setConfirmUnbind\(""\);\s*setStopConfirmTarget\(""\);/);
+
+  // ⑧ 样式：停止键是**文字**胶囊，不是 38px 的图标圆钮 —— 所以宽高都要放开，
+  //    否则"停止中"三个字会挤在一个 38px 的圆里（这正是一条只想改配色的人会踩的坑）。
+  //    配色沿用桌面端停止那一套（浅红底 / 深红字）。
+  assert.match(styleRules, /\.mobile-composer \.mobile-composer-stop \{[^}]*display: inline-flex;[^}]*width: auto;/);
+  assert.match(styleRules, /\.mobile-composer \.mobile-composer-stop:disabled \{[^}]*background: #f9eeea;/);
 });

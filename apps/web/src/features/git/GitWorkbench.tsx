@@ -8,6 +8,27 @@ import { ConflictSolveView } from "./ConflictSolveView";
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Tab = "changes" | "branches";
 type ResolveAction = "ours" | "theirs" | "delete" | "working";
+
+/**
+ * 为什么要重读仓库状态 —— **它决定界面做什么、以及取哪几样**，不只是个标签。
+ *
+ *  - `initial`   首屏：占位（骨架），取全套。
+ *  - `manual`    用户点了刷新：转圈，取全套（用户要的就是"全部给我最新的"）。
+ *  - `reconcile` 刚做完一次写操作**或知道仓库可能变了**：不置任何 loading，
+ *                在位的内容一步都不动。
+ *  - `probe`     事件驱动的后台对账：**先只问一句 summary**（353 字节），
+ *                和手上这份一模一样就到此为止。
+ *
+ * 手机端每次中继往返的固定成本约 300ms（实测：本机到云端 RTT ~150ms，
+ * 一个来回就是两次），而 Git 页在 AI 跑动时会反复对账 —— 所以"少发一次"与
+ * "不发"是两件事，`probe` 存在的理由就是后者。
+ */
+type ReloadReason = "initial" | "manual" | "reconcile" | "probe";
+interface ReloadOptions {
+  /** 刚做过分支操作（切分支 / 新建）：分支列表必须一起对账。 */
+  branches?: boolean;
+}
+
 type GitOperationResult = { operationId: string; status: "succeeded" | "failed" | "needs_attention"; errorMessage?: string };
 type DiffLine = { content: string; kind: "added" | "removed" | "context" | "hunk" | "meta"; oldLine?: number; newLine?: number };
 type Confirmation =
@@ -43,6 +64,38 @@ function gitPullTarget(snapshot: GitSnapshot | null): { remote: string; branch: 
   return { remote: "origin", branch: snapshot?.head.branch || "" };
 }
 
+/**
+ * 两份 summary 说的是不是同一份仓库状态。
+ *
+ * 判据有两层，**优先用服务端给的清单摘要**（`changesRevision`，它把改动清单与每个文件的
+ * 指纹一起算进去了），没有它才退回比 `head` 与 `worktree` 计数。
+ *
+ * 为什么不能只看计数（第一版就是这么写的，注释里还振振有词地说"计数一样就不会有多值得看的
+ * 差别"，那句是错的）：**一个文件恢复干净、另一个文件同时被改**，计数一模一样，清单却换了人。
+ * 症状是探针每次判"没变"、永远早退 —— 手机端一直显示那份过期清单，用户对着一条已经恢复干净的
+ * 行点暂存，服务端按 stateToken 判"仓库状态已变化"，而真正被改的文件根本不在列表里。
+ *
+ * 比对**不认** `observedAt`（每次都是新时间戳）与 `stateToken`（服务端每次现签的随机 UUID，
+ * 跟内容无关）—— 带上它们任何一个，这个比较就永远为假，probe 等于没写。
+ */
+function sameGitSnapshot(a: GitSnapshot | null, b: GitSnapshot | null): boolean {
+  if (!a || !b) return false;
+  // 旧版服务端没有 `changesRevision`：两边都有才用它，缺了退回计数比对（= 旧行为，不更差）。
+  if (a.changesRevision !== undefined && b.changesRevision !== undefined && a.changesRevision !== b.changesRevision) return false;
+  return a.head.oid === b.head.oid
+    && a.head.branch === b.head.branch
+    && a.head.upstream === b.head.upstream
+    && a.head.ahead === b.head.ahead
+    && a.head.behind === b.head.behind
+    && a.worktree.staged === b.worktree.staged
+    && a.worktree.modified === b.worktree.modified
+    && a.worktree.untracked === b.worktree.untracked
+    && a.worktree.deleted === b.worktree.deleted
+    && a.worktree.renamed === b.worktree.renamed
+    && a.worktree.conflicted === b.worktree.conflicted;
+}
+
+
 /** 手机端的返回键要问"里面还有没有上一层"，而那一层只有这里知道。 */
 export interface GitWorkbenchHandle {
   /**
@@ -57,6 +110,15 @@ export interface GitWorkbenchHandle {
    * 那两件事语义完全不同（一个是"再读一眼仓库"，另一个是"重新同步整个页面"）。
    */
   reload: () => void;
+  /**
+   * 后台对账：**不置任何 loading、不动在位的内容**，先只问一句 summary，
+   * 没变化就到此为止。
+   *
+   * 手机端在收到结构事件（AI 的工具调用、运行起止）时节流调用它 ——
+   * "停在 Git 页上自动看到电脑那边的变化"靠这条，而不是靠定时轮询：
+   * 没有事件就没有一次请求，有事件也只在**真的变了**时才取第二趟。
+   */
+  refreshInBackground: () => void;
 }
 
 interface GitWorkbenchProps {
@@ -108,9 +170,41 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const reloadRequest = useRef(0);
   // 刷新出口。`reload` 在下面才定义（它依赖若干个 state 回调），而 ref 句柄要能调它，
   // 所以中间隔一层 ref —— 直接引用会撞上"用到未初始化的 const"。
-  const reloadRef = useRef<(manual?: boolean) => Promise<void>>(async () => undefined);
+  const reloadRef = useRef<(reason?: ReloadReason, options?: ReloadOptions) => Promise<void>>(async () => undefined);
   const conflictPathRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
+  // 下面这几个 ref 都是"`reload` 里的判断要读的当前值"，一律**不进 `reload` 的依赖**：
+  // 它们一变（切个 tab、项目变回非 git…）就会重建 `reload`，而 `reload` 是装载 effect 的
+  // 依赖项 —— 那等于又给"用户随手切一下整个仓库就重读一遍"开了条口子，与上面 fail 那条同理。
+  const snapshotRef = useRef<GitSnapshot | null>(null);           // 手上那份已落地的 summary
+  const tabRef = useRef<Tab>("changes");
+  const isGitRepoRef = useRef(initialIsGitRepo);
+  const reloadInFlightRef = useRef(false);                        // 有没有一趟重读在飞
+  // 被让路的 probe（见 reload 开头）：宿主那边是"首事件开窗"的节流，窗口内的事件不会再排
+  // 第二次 —— 丢掉一次就等于"这次变化永远不出现"，直到用户手动刷新。所以是**推迟**不是丢弃。
+  const probePendingRef = useRef(false);
+  const conflictRequest = useRef(0);                              // 冲突总览自己的作废号
+  useEffect(() => { tabRef.current = tab; }, [tab]);
+  useEffect(() => { isGitRepoRef.current = isGitRepo; }, [isGitRepo]);
+  // ⚠️ `isGitRepo` 是 `useState(initialIsGitRepo)` 锁存的，而**没有**这条同步的话，
+  // prop 后来变成"是仓库了"也进不来：手机端会永远停在「未初始化 Git 仓库」空态上，
+  // 连 ⋯ 里的「刷新仓库状态」都救不了（它读回来的是仓库内容，但渲染在 `if (!isGitRepo)`
+  // 那一步就被空态挡掉了）—— 唯一出路是退出视图再进来。而空态那句文案恰恰是让用户
+  // "去电脑上初始化再回来"，于是它把人送进一个回不来的地方。
+  // 单向即可：prop 只会告诉我们"它现在是仓库了"（非 git 的判定由页面按 gitBranch 给出，
+  // 这里不需要反向把 true 改回 false —— 那会让 git init 刚成功的工作台瞬间塌回空态）。
+  useEffect(() => { if (initialIsGitRepo) setIsGitRepo(true); }, [initialIsGitRepo]);
+  // 错误落点只走 ref，**不进 `reload` 的依赖**。
+  //
+  // `reload` 是下面那个"装载 / 刷新" effect 的依赖项，而 `fail` 是宿主传进来的回调
+  // （签名 `(message: string) => void`，宿主完全可以正当地写成行内闭包 —— 手机端的
+  // `MobileGitPanel` 当初就是那么写的）。把它的身份放进依赖，等于规定"宿主每重渲染一次，
+  // 整个仓库就重读一遍"，而重读会 `setLoading(true)` ⇒ 界面闪回「正在读取仓库状态」。
+  // 手机端宿主每秒重渲染若干次（`assistant.delta` 每个流式片段一次 `setSnapshot`、
+  // `loadInstances` 每 5 秒一次），于是这个工作台常亮地闪。
+  // 复现与量化见 `.tmp/mobile-git-refresh`（修复前：每次重渲染 5 个中继请求 + 1 次闪烁）。
+  const failRef = useRef(fail);
+  useEffect(() => { failRef.current = fail; }, [fail]);
   const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   useEffect(() => {
     mountedRef.current = true;
@@ -120,7 +214,16 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const closeDiff = () => { diffRequest.current++; setSelectedDiff(null); };
   const closeConflict = () => { conflictPathRef.current = null; setConflictPath(null); };
   const openConflict = (path: string) => { diffRequest.current++; setSelectedDiff(null); conflictPathRef.current = path; setConflictPath(path); };
-  const selectTab = (next: Tab) => { setTab(next); closeDiff(); closeConflict(); };
+  const selectTab = (next: Tab) => {
+    setTab(next);
+    closeDiff();
+    closeConflict();
+    // 切到「分支」时才补一次分支列表：AI 在电脑上换过分支的话，用户在「变更」tab 上
+    // 停留期间那些后台对账都按"没在看分支"跳过了它，不补就会拿着一份很旧的列表
+    // （而且没有任何东西会去纠正它）。带上 branches 明确要它，不靠 tabRef
+    // —— 那一刻 tabRef 还没同步到新值。
+    if (next === "branches") void reloadRef.current("reconcile", { branches: true });
+  };
   const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, current: Tab) => {
     const currentIndex = tabs.findIndex((item) => item.id === current);
     const targetIndex = event.key === "ArrowRight" ? (currentIndex + 1) % tabs.length
@@ -143,53 +246,147 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       if (selectedDiff) { closeDiff(); return true; }
       return false;
     },
-    reload: () => { void reloadRef.current(true); },
+    reload: () => { void reloadRef.current("manual"); },
+    refreshInBackground: () => { void reloadRef.current("probe"); },
   }), [selectedDiff]);
 
-  const reload = useCallback(async (manual = false) => {
-    const requestID = ++reloadRequest.current;
-    if (manual) { if (!mountedRef.current) return; setRefreshing(true); }
-    else { if (!mountedRef.current) return; setLoading(true); }
+  const reload = useCallback(async (reason: ReloadReason = "initial", options?: ReloadOptions) => {
+    if (!mountedRef.current) return;
+    // probe 是**唯一一个"用户没要求"的档位**（宿主收到结构事件就调它），所以它要多两道闸：
+    //
+    //  · 非 git 项目：工作台在空态里从不读仓库（后端对非 git 目录会失败）。放它过去，
+    //    用户停在「未初始化 Git 仓库」上会莫名收到一条红色错误条 —— 而那件事他没做、
+    //    也不知道该做什么。手动刷新不走这道闸：那是用户按的，出错就该当场说。
+    //  · 已经有一趟重读在飞：让给它。这不是省一次请求，是**防作废** —— `++reloadRequest`
+    //    就是在飞那一趟的作废开关，而 probe 领号前还要先问一句话（几百毫秒），这段时间里
+    //    完全可能有人开始整份读。probe 抢到号，那一趟的结果（尤其 branches / operations）
+    //    就再也写不进去，症状是「分支」tab 显示成空列表 —— 正是"把读不到写成没有"。
+    if (reason === "probe" && !isGitRepoRef.current) return;
+    if (reason === "probe" && reloadInFlightRef.current) { probePendingRef.current = true; return; }
+    // 「手上还没有一份完整读数」时，**任何档位都按整份读**：首屏失败之后靠一次事件驱动的
+    // probe 恢复时最要紧 —— 那一档本来只取 summary + changes，分支与操作记录就永远补不上。
+    // 判据是"有没有落地过一份完整读数"，不是"这是第几次调用"。
+    const full = reason === "initial" || reason === "manual" || snapshotRef.current === null;
+    const base = `/api/projects/${projectID}/git`;
+    let requestID = 0;
     try {
-      const base = `/api/projects/${projectID}/git`;
-      // conflicts 只读总览：它单独失败不该拖垮整个工作台。
-      //
-      // ⚠️ 但它**不能**降级成"空"（第一版是 `.catch(() => null)`）。那个写法把"这次没读到"
-      // 渲染成了"没有冲突"，而仓库真的处在冲突中时，用户看到的会是一个完全正常的仓库，
-      // 一个字都不说 —— 正撞在本项目"把读不到写成没有"的红线上。
-      // 更糟的是触发是**竞态的**（并发被拒时哪一条被拒不确定），所以症状是
-      // "这次看得见、下次看不见"。这里改成三档：读到 / 读取中 / **读不到**。
-      const conflictsPromise = request<GitConflictOverview>(withWorkspace(`${base}/conflicts`))
-        .then((value) => ({ ok: true as const, value }))
-        .catch(() => ({ ok: false as const, value: null }));
-      const [nextSnapshot, nextChanges, nextBranches, nextOperations, conflictsResult] = await Promise.all([
-        request<GitSnapshot>(withWorkspace(`${base}/summary`)),
+      // ① `probe` 先只问一句 summary（353 字节）：它跟手上这份一模一样就到此为止，
+      //    没有理由去取 10KB 的变更列表和另外两样。**只有 probe 走这条串行路** ——
+      //    它是后台对账，多一趟往返没人等；其余档位把 summary 与另外三样并发发出去
+      //    （见下面的 Promise.all），否则"先等 summary 再取列表"会白白多出一整趟中继往返。
+      //    比对用什么（`changesRevision` 优先、退回 head 与 worktree 计数）见 sameGitSnapshot 的说明。
+      let probeSnapshot: GitSnapshot | null = null;
+      if (reason === "probe") {
+        probeSnapshot = await request<GitSnapshot>(withWorkspace(`${base}/summary`));
+        if (!mountedRef.current) return;
+        if (sameGitSnapshot(probeSnapshot, snapshotRef.current)) return;
+        // 问这一句话的工夫里又有人开始重读了：它的数据比这句 summary 新，让给它 —— 但要记账，
+        // 等那一趟落地后补做（见 probePendingRef）。
+        if (reloadInFlightRef.current) { probePendingRef.current = true; return; }
+      }
+
+      // ⚠️ 号**在这一步才领**。上面两条早退都不动 `reloadRequest` —— 一个只问了一句话、
+      // 什么都没改的 probe，不该有权把别人在飞的结果作废。
+      requestID = ++reloadRequest.current;
+      reloadInFlightRef.current = true;
+      if (reason === "initial") setLoading(true);
+      if (reason === "manual") setRefreshing(true);
+      // reconcile / probe **什么都不置**。在位的内容一步都不动 —— 这正是"停在页面上自动
+      // 保持最新"与"一直闪"之间唯一的区别（首屏那句「正在读取仓库状态」就是那一闪，
+      // 见下面 render 里的 loading 分支）。任何"后台刷新也要转个圈"的想法都会把它带回来。
+      const [nextSnapshot, nextChanges, nextBranches, nextOperations] = await Promise.all([
+        probeSnapshot ? Promise.resolve(probeSnapshot) : request<GitSnapshot>(withWorkspace(`${base}/summary`)),
         request<GitChange[]>(withWorkspace(`${base}/changes`)),
-        request<GitBranch[]>(withWorkspace(`${base}/branches`)),
-        request<GitOperation[]>(withWorkspace(`${base}/operations`)),
-        conflictsPromise,
+        // 分支列表只在四种情况下要：首屏/手动刷新、用户正看着「分支」tab、刚做过分支操作、
+        // 或刚切到那个 tab（`selectTab` 会把 `branches: true` 明确传进来 —— 切 tab 那一刻
+        // `tabRef` 还没同步到新值，靠它自己判会漏）。
+        // 其余档位不取 —— 它不会因为 AI 改了几个文件而变，而 probe 的间隔只有几秒。
+        full || options?.branches === true || tabRef.current === "branches"
+          ? request<GitBranch[]>(withWorkspace(`${base}/branches`))
+          : null,
+        // 操作记录（7KB，是后台那一组里最大的一份）只服务 GitBar 上那个红点：
+        // 用户自己那次操作的失败由 fail() 直接说给用户听，不靠红点兜底；
+        // 操作记录弹层打开时本来就会自己查一页。
+        // **写后对账照取**：那正是刚刚多出一条审计记录的时刻（红点该亮的也是那一刻），
+        // 而且它由用户动作触发、频率低。**probe 不取** —— 它一次可能只有几百毫秒的间隔。
+        full || reason === "reconcile" ? request<GitOperation[]>(withWorkspace(`${base}/operations`)) : null,
       ]);
       if (!mountedRef.current || requestID !== reloadRequest.current) return;
+      snapshotRef.current = nextSnapshot;
       setSnapshot(nextSnapshot);
       setChanges(nextChanges);
-      setBranches(nextBranches);
-      setOperations(nextOperations);
-      setConflictOverview(conflictsResult.value);
-      setConflictsState(conflictsResult.ok ? "ready" : "unavailable");
-      // 正在解决的路径已不在冲突清单中（已解决/中止）时，退出该文件的解决视图。
-      if (conflictPathRef.current && conflictsResult.value && !conflictsResult.value.files.some((file) => file.path === conflictPathRef.current)) closeConflict();
+      if (nextBranches) setBranches(nextBranches);
+      if (nextOperations) setOperations(nextOperations);
+      // 主体已经落地：左栏可以显示了。**手动刷新的转圈也到此为止** ——
+      // 下面那份冲突总览是这一组里最慢的一条，不该让"刷新"按钮跟着它多转半秒。
+      setLoading(false);
+      setRefreshing(false);
+      void loadConflicts();
     } catch (cause) {
-      if (mountedRef.current && requestID === reloadRequest.current) fail(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
+      // **整条 probe 链静默**（不只是它第一句话）：那是后台对账，用户没要求过它，
+      // 网络抖一下就在他眼皮底下弹一条红条子是噪音 —— 判据用 reason，不用"领没领号"
+      // （后者只覆盖第一跳，第二跳 /changes 超时照样会弹，正是这里修掉的漏网）。
+      // 代价说清楚：仓库**持续**读不到时，停在这一页的人会看着上一份数据而没人告诉他。
+      // 兜住它的是下一次手动刷新（那时会报），以及任何一次写操作的对账。
+      if (reason !== "probe" && requestID !== 0 && mountedRef.current && requestID === reloadRequest.current) failRef.current(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
     } finally {
-      if (mountedRef.current && requestID === reloadRequest.current) {
+      // `requestID === 0` = 这次调用压根没领号（probe 的两条早退）⇒ 什么都不该由它收尾。
+      // 少了这一条，一个恰好赶上"还没有任何一趟重读"的早退 probe 会把 loading 抹成 false，
+      // 界面就从骨架跳成「无法读取仓库状态」—— 一次纯读取的后台动作把首屏判死。
+      if (requestID !== 0 && mountedRef.current && requestID === reloadRequest.current) {
+        reloadInFlightRef.current = false;
         setLoading(false);
         setRefreshing(false);
+        // 补做被让路的那次后台对账（推迟 ≠ 丢弃）。
+        if (probePendingRef.current) { probePendingRef.current = false; void reload("probe"); }
       }
     }
-  }, [projectID, request, fail, conversationId]);
+
+    /**
+     * 冲突总览：**单独一路，不挡首屏**。
+     *
+     * 两条理由，一条是速度、一条是纪律：
+     *
+     *  1. 它是这一组里最慢的一条。干净仓库上它要跑 `ls-files -u` 加**四次
+     *     `rev-parse -q --verify <X>_HEAD`**，而 Windows 上每一次都是一次进程创建
+     *     （实测 37ms 起），合起来 165ms —— 比 summary 的 86ms 慢一倍。把它摊在
+     *     首屏的 `Promise.all` 里，等于让"看一眼变更列表"这件事等冲突探测。
+     *  2. 它**不能**降级成"空"（第一版是 `.catch(() => null)`）。那个写法把"这次没读到"
+     *     渲染成了"没有冲突"，而仓库真的处在冲突中时，用户看到的会是一个完全正常的仓库，
+     *     一个字都不说 —— 正撞在本项目"把读不到写成没有"的红线上。所以它有自己的三档：
+     *     读到 `ready` / 读取中 `loading` / **读不到 `unavailable`**；延后取不等于放弃取，
+     *     这三档在延后期间照旧成立（横幅本来也由变更列表里的 `conflicted` 标记驱动）。
+     */
+    async function loadConflicts() {
+      // ⚠️ 它**自己**一个作废号，不共用 `reloadRequest`。共用的话，一次"只问了一句话、
+      // 什么都没改"的 probe 也会把在飞的那份冲突总览判成过期，而 probe 早退时并不会补发
+      // 一份新的 —— 这份读数就永久停在「读取中」，`conflictsState` 既不落到 ready 也不落到
+      // unavailable，界面上一个字都不说。冲突那三档（读到 / 读取中 / **读不到**）正是
+      // 为了"必然有结论"才立的，不能让一个后台对账把它拖住。
+      const id = ++conflictRequest.current;
+      try {
+        const value = await request<GitConflictOverview>(withWorkspace(`${base}/conflicts`));
+        if (!mountedRef.current || id !== conflictRequest.current) return;
+        setConflictOverview(value);
+        setConflictsState("ready");
+        // 正在解决的路径已不在冲突清单中（已解决/中止）时，退出该文件的解决视图。
+        if (conflictPathRef.current && !value.files.some((file) => file.path === conflictPathRef.current)) closeConflict();
+      } catch {
+        if (!mountedRef.current || id !== conflictRequest.current) return;
+        setConflictsState("unavailable");
+      }
+    }
+  }, [projectID, request, conversationId]);
 
   useEffect(() => { reloadRef.current = reload; }, [reload]);
-  useEffect(() => { if (active && isGitRepo) void reload().catch(() => undefined); }, [active, isGitRepo, reload]);
+  useEffect(() => {
+    // 身份（项目 / 会话 / 取数通道）变了 ⇒ 在飞的那份冲突总览属于**上一个工作区**，必须作废：
+    // 它现在只认自己那个号，若不在这里点名作废，它会带着旧工作区的冲突清单落地
+    // （界面上就是"B 的页面弹出 A 的冲突横幅"，点进去路径都不对）。这条正是它从前
+    // 共用 `reloadRequest` 时白拿到的保护，拆号之后要自己补回来。
+    conflictRequest.current += 1;
+    if (active && isGitRepo) void reload("initial").catch(() => undefined);
+  }, [active, isGitRepo, reload]);
 
   const grouped = useMemo(() => groupChanges(changes), [changes]);
   const changeCount = changes.length;
@@ -203,30 +400,54 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法读取差异"); }
   };
 
-  const mutate = async (key: string, endpoint: string, payload: Record<string, unknown>, success?: () => void) => {
+  const mutate = async (key: string, endpoint: string, payload: Record<string, unknown>, success?: () => void, options?: ReloadOptions) => {
     if (!mountedRef.current) return;
     if (!snapshot?.stateToken) {
       fail("Git 状态尚未准备完成，请刷新后重试");
       return;
     }
     setMutating(key);
+    // 这次写到底成没成 —— 决定 busy 要不要等对账（见 finally）。
+    let wrote = false;
     try {
       const result = await request<GitOperationResult>(withWorkspace(`/api/projects/${projectID}/git/${endpoint}`), { method: "POST", body: JSON.stringify({ ...payload, stateToken: snapshot.stateToken }) });
-      await reload(true);
+      if (!mountedRef.current) return;
       if (result.status === "needs_attention") {
         closeDiff();
         setConfirmation(null);
       }
       if (result.status !== "succeeded") throw new Error(result.errorMessage || "Git 操作未完成，请查看操作记录");
-      if (!mountedRef.current) return;
+      wrote = true;
+      // **反馈先行**：确认框该关、提交信息该清、差异面板该退 —— 这些不再等重读。
+      // 旧写法把它们放在 `await` 的那次重读之后，用户点完「确认提交」要等近一秒
+      // （手机上：写一趟中继 + 读一趟中继）才看到对话框关上，那就是"点一下没反应"。
       closeDiff();
       success?.();
     } catch (cause) {
-      if (mountedRef.current) {
-        fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
-        void reload(true).catch(() => undefined);
-      }
+      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
     } finally {
+      // ⚠️ 但 **busy 要留到对账落地**，而不是写回来就撤。
+      //
+      // 写操作会**作废手上那个 stateToken**：它是乐观锁，绑的是写入前那份仓库状态
+      // （`gitStateToken` 存着当时的 snapshot / changes / 每个文件的指纹）。新令牌要等
+      // 对账把 summary 取回来才到手。这段窗口（本机 ~90ms，手机 ~350ms）里再发一次写，
+      // 服务端判定的就是"仓库状态已变化"—— 电脑上对着同一行连点两下就能撞上，
+      // 而手机端不会（那边的适配器每次写之前都无条件换一个新令牌）。
+      //
+      // 于是分工是：**反馈不等它，"能再点"等它。**
+      // 失败与 needs_attention 同样要对这一次账：半途失败也会在电脑上留下痕迹。
+      if (wrote) {
+        // 成功：busy 扣到对账落地。末尾那个 `.catch` 是保险 —— `reload` 自己吞业务错误，
+        // 但万一它抛出（那是个 bug），"清 busy 那一句不执行 ⇒ 按钮永远禁着"不该是后果。
+        await reload("reconcile", options).catch(() => undefined);
+      } else {
+        // 失败：对账照发，但**不等它**。
+        // 等它的代价是实打实的卡死：写请求超时（推送的预算是 120s）之后确认框还开着，
+        // 而框里三颗按钮全是 `disabled={busy}` —— 用户没有任何能按的东西，只能杀进程。
+        // 那几十秒的"防连点"不值这个价。代价是这次失败后若立刻再写，可能撞一次
+        // "仓库状态已变化"：那是一句可读、可重试的错，与卡死的弹窗不是一个量级。
+        void reload("reconcile", options);
+      }
       if (mountedRef.current) setMutating("");
     }
   };
@@ -241,7 +462,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const fetchRemote = (remote: string) => mutate("fetch", "fetch", { remote }, () => setConfirmation(null));
   const pullRemote = (remote: string, branch: string) => mutate("pull", "pull", { remote, branch }, () => setConfirmation(null));
   const pushBranch = (remote: string, branch: string, setUpstream: boolean) => mutate("push", "push", { remote, branch, setUpstream }, () => setConfirmation(null));
-  const switchBranch = (branch: string) => mutate("switch-branch", "switch", { branch }, () => setConfirmation(null));
+  const switchBranch = (branch: string) => mutate("switch-branch", "switch", { branch }, () => setConfirmation(null), { branches: true });
   const pullTarget = gitPullTarget(snapshot);
 
   // 非 git 项目在空态里发起 git init：成功后置 isGitRepo、通知宿主刷新项目、再加载仓库状态。
@@ -251,9 +472,11 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
     try {
       const result = await request<{ gitBranch: string; gitReady: boolean }>(`/api/projects/${projectID}/git/init`, { method: "POST" });
       if (result.gitReady) {
+        // 装载 effect 依赖 `isGitRepo`，这一置就会自己触发一次首屏读取 ——
+        // 这里不再显式 `reload()`（旧版两处都写，等于每次初始化发两轮请求，
+        // 只是靠 reloadRequest 的序号把前一轮的结果丢掉而已）。
         setIsGitRepo(true);
         void onGitInitialized?.();
-        void reload(true);
       }
     } catch (cause) {
       if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法初始化 Git 仓库");
@@ -278,18 +501,21 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const createBranch = async (name: string, startPoint: string) => {
     if (!mountedRef.current) return;
     setMutating("create-branch");
+    let wrote = false;
     try {
       const result = await request<GitOperationResult>(withWorkspace(`/api/projects/${projectID}/git/branches`), { method: "POST", body: JSON.stringify({ name, startPoint }) });
-      await reload(true);
+      if (!mountedRef.current) return;
+      // 与 mutate 同一条：反馈先行，busy 留到对账落地（新建分支会改分支列表，所以带上 branches）。
       if (result.status !== "succeeded" && result.status !== "needs_attention") throw new Error(result.errorMessage || "创建分支失败");
+      wrote = true;
       closeDiff();
       setConfirmation(null);
     } catch (cause) {
-      if (mountedRef.current) {
-        fail(cause instanceof Error ? cause.message : "无法创建分支");
-        void reload(true).catch(() => undefined);
-      }
+      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法创建分支");
     } finally {
+      // 同 mutate：成功才等对账（令牌要换新），失败不等（别把用户扣在卡死的弹窗里）。
+      if (wrote) await reload("reconcile", { branches: true }).catch(() => undefined);
+      else void reload("reconcile", { branches: true });
       if (mountedRef.current) setMutating("");
     }
   };
@@ -300,18 +526,34 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
         <span className="git-init-empty-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.5V15M8.7 9.3v5.4M15.3 9.3v5.4M12 8a.9.9 0 1 0 .01 0" /></svg></span>
         <h3>未初始化 Git 仓库</h3>
         <p>当前项目目录还不是 Git 仓库。初始化后将在此查看文件变更、分支与提交历史。</p>
-        <button className="primary" type="button" disabled={initializingRepo} onClick={() => void initializeRepo()}>{initializingRepo ? "正在初始化..." : "初始化 Git 仓库"}</button>
-        <p className="git-init-empty-note">初始化后建议先提交一个初始 commit，方能使用隔离工作区 / 自动编排。</p>
+        {/* 手机端不摆这颗按钮：中继的 op 表里**没有** `git.init`（见 remote_git.go），
+            点了只会得到一句"手机端没有映射这个 Git 端点：POST /init" ——
+            一颗按了必然报技术错误的按钮，比没有按钮更糟。改成把该做的事说清楚。 */}
+        {/* 文案要说**怎么做**，不能只说一句"请在电脑上初始化"就完事：
+            手机端看到的项目信息来自云端快照，电脑端刚初始化完这里未必立刻知道 ——
+            所以给出那个能主动同步一次的动作（页面把它接成"重取项目信息"，见 MobileRemotePage 的
+            reloadGit）。另外工作台自己也盯住了 prop 变化：一旦同步回来的是"已经是仓库了"，
+            它会当场读仓库，不需要用户退出重进。 */}
+        {mobile
+          ? <p className="git-init-empty-note">手机端不提供初始化操作。请在电脑上初始化这个项目，然后在右上角 ⋯ 里点「刷新仓库状态」。</p>
+          : <button className="primary" type="button" disabled={initializingRepo} onClick={() => void initializeRepo()}>{initializingRepo ? "正在初始化..." : "初始化 Git 仓库"}</button>}
+        {mobile ? null : <p className="git-init-empty-note">初始化后建议先提交一个初始 commit，方能使用隔离工作区 / 自动编排。</p>}
       </div>
     </section>;
   }
   return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active} data-mobile={mobile ? "true" : undefined} data-detail={mobileDetailOpen ? "open" : undefined}>
-    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} requestRefresh={() => void reload(true)} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} />
+    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} requestRefresh={() => void reload("manual")} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} />
     <nav className="git-tabs" aria-label="Git工作台视图">
       <div className="git-tab-list" role="tablist" aria-label="Git工作台视图">{tabs.map((item) => <button type="button" key={item.id} id={`git-tab-${item.id}`} role="tab" aria-controls={`git-view-${item.id}`} className={tab === item.id ? "active" : ""} aria-selected={tab === item.id} tabIndex={tab === item.id ? 0 : -1} onClick={() => selectTab(item.id)} onKeyDown={(event) => handleTabKeyDown(event, item.id)}>{item.label}{item.id === "changes" && changeCount > 0 ? <b>{changeCount}</b> : null}</button>)}</div>
     </nav>
     <main className={`git-workbench-body${tab === "changes" ? " changes-active" : ""}`}>
-      {loading ? <div className="git-empty">正在读取仓库状态</div> : !snapshot ? <div className="git-empty">无法读取仓库状态</div> : <>
+      {/* ⚠️ 判据是 `loading` 本身，**不是** `loading && !snapshot`。
+          这个工作台重读的触发之一就是"工作区身份变了"（projectID / conversationId / request
+          换了人，手机端还会因为电脑那边切了会话而被动换），而那时手上的 snapshot 是**上一个
+          工作区**的 —— 拿它顶上，用户看到的是 A 的变更列表，点下去可能写进 B。
+          `loading` 只由首屏那一档置位（后台对账一概不置），所以它本身就等于
+          "屏幕上这份数据不属于当前工作区"，不需要再加一个 snapshot 非空的限定。 */}
+      {loading ? <GitSkeleton /> : !snapshot ? <div className="git-empty">无法读取仓库状态</div> : <>
         {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
         {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch) => setConfirmation({ type: "switch-branch", branch })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
       </>}
@@ -384,7 +626,8 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
   }, [opsOpen]);
   return <div className="git-bar" ref={barRef} data-mobile={mobile ? "true" : undefined}>
     <div className="git-bar-ref">
-      {loading && !snapshot ? <><span className="git-bar-label">当前引用</span><span className="git-bar-loading">正在读取仓库状态…</span></> : <>
+      {/* 与 body 那条同源：只要在读，就不显示手上那份（它可能属于上一个工作区）。 */}
+      {loading ? <><span className="git-bar-label">当前引用</span><span className="git-bar-loading">正在读取仓库状态…</span></> : <>
         <span className="git-bar-label">当前引用</span>
         <div className="git-bar-name">
           <b title={`当前 HEAD ${head?.oid ?? ""}`}>{head?.detached ? "HEAD (游离指针)" : head?.branch || "未初始化"}</b>
@@ -426,6 +669,26 @@ function HistoryIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" 
 function FilterChips({ label, value, options, onChange }: { label: string; value: string; options: Array<{ value: string; label: string }>; onChange: (value: string) => void }) {
   return <div className="git-ops-chips" role="group" aria-label={label}>
     {options.map((item) => <button type="button" key={item.value || "all"} className={value === item.value ? "active" : ""} aria-pressed={value === item.value} onClick={() => onChange(item.value)}>{item.label}</button>)}
+  </div>;
+}
+
+/**
+ * 首屏骨架：进 Git 视图时先给出**结构**，而不是一句「正在读取仓库状态」占着整屏。
+ *
+ * 手机端首屏那一次是走云中继的（实测本机到云端 RTT ~150ms，一个来回 ~300ms，
+ * 加上最慢那条读接口 165ms，约 465ms），这段时间里屏幕本来是空的。骨架让
+ * "页面已经在、正在填内容"立刻成立，比一句话等着更接近真实进度。
+ *
+ * 它同时收窄了那句 loading 文案的出场机会：只有**真的没有内容可显示**（`!snapshot`）
+ * 时才顶上，后台对账一概不碰 —— 于是它再也不会像以前那样每隔几秒闪一次。
+ */
+function GitSkeleton() {
+  return <div className="git-skeleton" role="status">
+    <span className="git-skeleton-sr">正在读取仓库状态</span>
+    {[0, 1].map((group) => <div className="git-skeleton-group" key={group} aria-hidden="true">
+      <header />
+      {[0, 1, 2].map((row) => <div className="git-skeleton-row" key={row}><i /><em /></div>)}
+    </div>)}
   </div>;
 }
 

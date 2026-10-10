@@ -541,7 +541,7 @@ func TestDiagnoseReportsMissingRuntime(t *testing.T) {
 	entry := mustAgent(t, "claude-code")
 	if err := server.recordAgentInstallation(context.Background(), agentInstallation{
 		RunnerID: server.localRunnerID(), AgentID: entry.ID,
-		BinaryPath: filepath.Join(t.TempDir(), "claude"+executableSuffix()),
+		BinaryPath:  filepath.Join(t.TempDir(), "claude"+executableSuffix()),
 		InstallKind: installKindNpmManaged, Prefix: t.TempDir(), Version: "2.1.216",
 	}); err != nil {
 		t.Fatal(err)
@@ -585,9 +585,16 @@ func TestDiagnoseReportsNotInstalledWithoutComplaint(t *testing.T) {
 //
 // 结论是"换环境"，不是"修工具" —— 所以详查都要跳过（needsDeepDiagnosis），
 // 单工具诊断也要给出这一档而不是一串误导性的 blocker。
+//
+// ⚠️ 机器必须是**注册过的**：没注册的 runner 连"这个环境提供不提供它"都无从谈起
+// （那一档是防御分支，如实报 unavailable）。2026-10-09 之前这条用例靠"codebuddy 在
+// 跨端一律硬编码成尚未接通"才拿到 unsupported —— 那条硬编码删掉后，这一档的实例变成
+// 「runner 跑不了 shell」（WSL→Windows 那条方向就是这样），所以这里注册一个跑不了
+// shell 的普通 runner。
 func TestDiagnoseReportsUnsupportedEnvironment(t *testing.T) {
 	server := newDiagnoseTestServer(t)
 	meta := RunnerMeta{ID: "ssh-prod", Name: "prod", Environment: "ssh"}
+	server.runnerRegistry.register(meta.ID, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil }), meta)
 
 	report := server.buildAgentDiagnosis(context.Background(), meta, mustAgent(t, "codebuddy"))
 	if report.Status != diagnosisUnsupported {
@@ -954,7 +961,7 @@ func TestDiagnoseDoesNotCallUnreadablePathMissing(t *testing.T) {
 // 假 blocker 的构造：托管运行时"文件在、跑不起来"（一次失败的运行时安装留下的典型
 // 残留），而系统那份 node/npm 好着。用 `probeRuntime`（托管优先）的读数去判这个工具，
 // 会得到"找不到可用的 Node.js 运行时"—— 可它其实跑得好好的；而且给出的修复动作
-//（装托管运行时）根本换不掉它实际用的那个 node。
+// （装托管运行时）根本换不掉它实际用的那个 node。
 func TestDiagnoseJudgesSystemNpmRuntimeFromSystemNode(t *testing.T) {
 	entry := mustAgent(t, "claude-code")
 	record := func(t *testing.T, server *Server) {

@@ -4,7 +4,10 @@
 // Git 工作台入口并拦截直接访问 /git 的重定向；若后端更换标记，只需改这一处。
 export const NON_GIT_BRANCH = "非 Git 目录";
 
-export type Project = { id: string; name: string; pathDisplay: string; fullPath: string; runner: string; environment: string; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
+// localRunner 由服务端下发（app.go isLocalRunnerID）：项目跑在**服务端本机**的 runner 上。
+// 判据按服务端平台而定（Windows 服务端为 ""/windows-local，其余为 ""/wsl-local），前端不许
+// 自己按 runner id 拼一份——同名不同义的写法会让 Windows 服务端上的 wsl-local 项目误过闸门。
+export type Project = { id: string; name: string; pathDisplay: string; fullPath: string; runner: string; environment: string; localRunner: boolean; gitBranch: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
 // /api/projects/availability 的单项：项目连通性探测结果（远端 / 跨端 codex 就绪）。
 // 列表接口不再同步探活，这份结果由前端单独拉取后按项目 id 合并。
 export type ProjectAvailability = { id: string; claudeReady: boolean; codexReady: boolean; agentReady: boolean };
@@ -24,7 +27,11 @@ export type Conversation = { id: string; status: string; agentId: AgentID; agent
 export type RecentConversation = Conversation & { projectId: string; projectName: string };
 // 底部模型选择器的候选项与当前生效信息（GET /api/conversations/{id}/models）。
 export type AgentModelOption = { id: string; label?: string; description?: string; alias?: boolean };
-export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[]; customAllowed: boolean; note?: string };
+// models 可空：服务端用"空目录"表达"这个工具没有内置模型表"（CodeBuddy），而这份
+// 前端也可能连到更早的 sidecar 二进制（Go 的 nil 切片会序列化成 null）。写死成非空
+// 数组曾经让渲染路径上的 .length 直接抛错——取值一律经 lib/model-options.ts 的
+// modelList()，类型上就不要再假装它一定在。
+export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[] | null; customAllowed: boolean; note?: string };
 export type ConversationWorkspace = { id: string; conversationId: string; generation: number; mode: "project_shared" | "isolated_worktree" | string; path: string; branch?: string; baseRevision?: string; state: "provisioning" | "ready" | "active" | "failed" | "archived" | string; active?: boolean; createdAt: string; archivedAt?: string | null };
 export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 export type ShortcutKind = "prompt" | "snippet" | "command_request";
@@ -296,7 +303,7 @@ export type AgentExecution = { runId: string; status: string; incomplete: boolea
 export type ModelUsage = { model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; contextWindow: number };
 export type RunUsage = { runId: string; conversationId: string; available: boolean; reason?: string; status: string; model: string; contextWindow: number; contextInputTokens: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; durationMs: number; ttftMs: number; terminalReason: string; hasResult: boolean; startedAt?: string; completedAt?: string; models: ModelUsage[] };
 export type ConversationUsage = { taskCount: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number };
-export type ConversationUsageResponse = { conversationId: string; available: boolean; reason?: string; context: RunUsage; currentRun?: RunUsage; latestRun?: RunUsage; session: ConversationUsage; models: ModelUsage[] };
+export type ConversationUsageResponse = { conversationId: string; available: boolean; reason?: string; context: RunUsage; currentRun?: RunUsage; latestRun?: RunUsage; session: ConversationUsage; models: ModelUsage[] | null };
 export type SystemVariant = "compact" | "compact_result" | "compact_boundary" | "api_retry" | "task";
 export type SystemItem = { id: string; createdAt: string; runId: string; variant: SystemVariant; title: string; detail?: string; metadata?: Record<string, unknown> };
 export type TimelineItem =

@@ -1284,18 +1284,16 @@ type taskDispatchResult struct {
 	TaskRun TaskRun `json:"taskRun"`
 }
 
-// dispatchTaskByID keeps task dispatch on the same path as direct messages so
-// it creates the Message, Run, TaskRun, workspace lease, and agent process.
-func (s *Server) dispatchTaskByID(ctx context.Context, taskID string) (taskDispatchResult, int, error) {
-	return s.dispatchTaskByIDInWorkspace(ctx, taskID, "")
-}
-
+// dispatchTaskByIDForConversation 让任务下发落在**指定的**那条会话上。conversationID 为空时
+// 仍由电脑端挑一条（见 dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation 里那段
+// 回落）—— 但下发方只有拿不到真 id（会话还在本地态）时才该交白卷：手机端快照每个项目只带一条
+// 会话，电脑端自己挑中的那条可能是编排用的后台会话（is_current=0），手机上根本渲染不出来，
+// 症状就是"点了下发，屏幕上什么都没发生"。
+//
+// 它取代了原来那个"不给目标"的包装（dispatchTaskByID）：后者唯一的调用者是手机端的
+// task.dispatch 命令，留着只会把下一个人引回上面那个坑。
 func (s *Server) dispatchTaskByIDForConversation(ctx context.Context, taskID, conversationID string) (taskDispatchResult, int, error) {
 	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, "", "", "", conversationID, "")
-}
-
-func (s *Server) dispatchTaskByIDInWorkspace(ctx context.Context, taskID, worktreePath string) (taskDispatchResult, int, error) {
-	return s.dispatchTaskByIDInWorkspaceWithContext(ctx, taskID, worktreePath, "")
 }
 
 func (s *Server) dispatchTaskByIDInWorkspaceWithContext(ctx context.Context, taskID, worktreePath, repairContext string) (taskDispatchResult, int, error) {

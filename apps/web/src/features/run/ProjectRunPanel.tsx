@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type LogEntry, type RunCommand, type RunConfig, type RunStatusResponse, createRunCommand, isRunnableCommand, runCommandLabel, runLogPresentation, runLogText, selectedRunCommand, statusLabels, withRunCommands } from "./run-model";
+import { type LogEntry, type RunCommand, type RunConfig, type RunStatusResponse, createRunCommand, isRunnableCommand, renameEnvironmentVariable, runCommandLabel, runLogPresentation, runLogText, selectedRunCommand, statusLabels, withRunCommands } from "./run-model";
 import { type AnsiSegment, toAnsiSegments } from "./ansi";
 import { toast } from "sonner";
 import { linkifyText } from "./linkify";
@@ -72,20 +72,53 @@ function nextEnvironmentVariableKey(envVars: Record<string, string>): string {
 }
 
 /** 环境变量编辑器。全局一份、每条命令各一份，两处共用同一实现，
- *  免得"全局那份能增删改、命令那份悄悄少一个按钮"。 */
+ *  免得"全局那份能增删改、命令那份悄悄少一个按钮"。
+ *
+ *  键名框走"草稿 + 离开这一行时提交"而不是逐键 onChange：逐键改写变量表的写法里，删到最后一个
+ *  字符会回落成旧键（框里永远清不空），改成已存在的键名则会静默覆盖那一条的取值。 */
 function EnvironmentVarsEditor({ envVars, onChange, addLabel = "添加环境变量" }: { envVars: Record<string, string>; onChange: (next: Record<string, string>) => void; addLabel?: string }) {
+	// 键名框里正在编辑、尚未提交的键名（按被改的那一行记）。值框不需要草稿：它改的是同一个
+	// 键名，逐键更新不会改变表结构。
+	const [renameDraft, setRenameDraft] = useState<{ key: string; value: string } | null>(null);
+	const [renameError, setRenameError] = useState<string | null>(null);
+	// 草稿所属的那一行已经不在了（被删掉、或整个配置被换掉）时草稿一律作废：否则这一行后来
+	// 若以同名重新出现（比如别的行改名成了它），框里会冒出上一行的残留文字。
+	const draft = renameDraft && Object.prototype.hasOwnProperty.call(envVars, renameDraft.key) ? renameDraft : null;
+
+	const commitRename = (oldKey: string) => {
+		if (!draft || draft.key !== oldKey) return;
+		// 草稿先收掉：提交后这个输入框要立刻回到"显示变量的真实键名"，而不是停在没有生效的草稿上。
+		setRenameDraft(null);
+		const result = renameEnvironmentVariable(envVars, oldKey, draft.value);
+		if (result.ok) { setRenameError(null); onChange(result.envVars); return; }
+		if (result.reason === "duplicate") {
+			// 不想用 toast：命令专属环境变量在 <details> 里，面板切走时浮层会留在原地。
+			setRenameError(`环境变量 ${draft.value.trim()} 已存在，未改名`);
+			return;
+		}
+		setRenameError(null);
+	};
+
 	return <div className="run-env-vars">
 		{Object.entries(envVars).map(([k, v]) => (
-			<div key={k} className="run-env-var">
-				<input type="text" value={k} placeholder="KEY" onChange={(e) => {
-					const next = { ...envVars };
-					delete next[k];
-					next[e.target.value || k] = v;
-					onChange(next);
-				}} />
+			<div key={k} className="run-env-var" onBlur={(e) => {
+				// 焦点只在这一行内换框（键名 → 值、→ 移除按钮）时先不提交：提交会重建这一行，把刚点
+				// 进去的那个框连焦点一起换掉，用户得再点一次。离开整行（含点「保存」）才提交，此时
+				// 键名与值一起落库；回车走 blur，relatedTarget 为空，同样提交。
+				const target = e.relatedTarget;
+				if (target instanceof Node && e.currentTarget.contains(target)) return;
+				commitRename(k);
+			}}>
+				<input type="text" className="run-env-key" value={draft?.key === k ? draft.value : k} placeholder="KEY" onChange={(e) => {
+					setRenameDraft({ key: k, value: e.target.value });
+					setRenameError(null);
+				}} onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
 				<span>=</span>
 				<input type="text" value={v} placeholder="VALUE" onChange={(e) => onChange({ ...envVars, [k]: e.target.value })} />
 				<button type="button" className="run-env-remove" title={`移除环境变量 ${k}`} aria-label={`移除环境变量 ${k}`} onClick={() => {
+					// 删掉的那一行可能正带着没提交的草稿，也可能正是"键名被占用"提示里的占位者。
+					setRenameDraft(null);
+					setRenameError(null);
 					const next = { ...envVars };
 					delete next[k];
 					onChange(next);
@@ -93,6 +126,7 @@ function EnvironmentVarsEditor({ envVars, onChange, addLabel = "添加环境变�
 			</div>
 		))}
 		<button type="button" className="secondary" onClick={() => onChange({ ...envVars, [nextEnvironmentVariableKey(envVars)]: "" })}><PlusIcon />{addLabel}</button>
+		{renameError ? <p className="run-env-error" role="status">{renameError}</p> : null}
 	</div>;
 }
 

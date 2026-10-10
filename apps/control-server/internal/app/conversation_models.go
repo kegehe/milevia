@@ -192,7 +192,7 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 		// 目录列举命令，也没有可靠的静态型号表（其型号体系与 Claude 不同）。这里不给它
 		// 冒充 Claude 的模型目录（opus/sonnet 等对 CodeBuddy 是无效模型名），如实返回空
 		// 目录，交还自定义输入。
-		view.Models = nil
+		view.Models = []AgentModelOption{}
 		view.Note = "CodeBuddy 没有内置模型目录，可直接在下方输入模型名（如 gpt-5）；切换后下一条消息生效。"
 	} else if conversation.AgentID == "codex" {
 		options, note := s.codexModelCatalogFor(r.Context(), projectRunner, projectPath)
@@ -216,6 +216,14 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 出口归一：**任何**分支都不许把 nil 切片交给 JSON。Go 的 encoding/json 把 nil 切片
+	// 写成 `null`，而模型选择器是前端渲染路径（读 `models.length`）——历史上 CodeBuddy
+	// 的空目录就是这么把整个工作区面板打成兜底 UI 的（"Cannot read properties of null
+	// (reading 'length')"）。"这个工具没有目录"用空数组表达，与"读不到"（该接口整体
+	// 失败）区分开。
+	if view.Models == nil {
+		view.Models = []AgentModelOption{}
+	}
 	writeJSON(w, http.StatusOK, view)
 }
 

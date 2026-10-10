@@ -7,6 +7,7 @@ const cssSource = await readFile(new URL("./orchestration.css", import.meta.url)
 // 后端常量：直接模式的终态名一旦改了，前端的 statusLabel 会静默退回显示英文原文，
 // 所以两个仓库里的这一份必须对齐（前端无法 import Go，只能这样钉）。
 const orchestrationSource = await readFile(new URL("../../control-server/internal/app/orchestration.go", import.meta.url), "utf8");
+const appSource = await readFile(new URL("../../control-server/internal/app/app.go", import.meta.url), "utf8");
 
 // 计划级执行方式：worktree（现状）/ branch（直接在已有分支上跑）。用户要的核心是
 // 「指定一个已存在的分支、不建 worktree、不合并、工作区有未提交改动也能跑」。
@@ -23,10 +24,23 @@ test("新建计划时可以选「直接写入已有分支」并指定目标分�
 });
 
 // 远端项目跑不了自动编排（服务端 isLocalRunnerID 会拒），必须在选之前就禁用并说明原因。
-test("非本地项目禁用「直接写入」并给出原因", () => {
-  assert.match(pageSource, /const localRunner = !batchProject \|\| batchProject\.runner === "" \|\| batchProject\.runner === "windows-local" \|\| batchProject\.runner === "wsl-local";/);
-  assert.match(pageSource, /"「直接写入」目前只支持本地运行器的项目。"|「直接写入」目前只支持本地运行器的项目。/);
+//
+// 判据**只能**来自服务端：isLocalRunnerID 是按平台的（Windows 服务端是 ""/windows-local，
+// 其余平台是 ""/wsl-local），前端自己按 runner id 拼一份必然漂移——Windows 服务端上的
+// wsl-local 项目会被误判成本机，用户建出计划后在派发期撞上 needs_human 并冻结整个项目队列。
+test("非本机项目禁用「直接写入」并给出原因", () => {
+  assert.match(pageSource, /const localRunner = !batchProject \|\| batchProject\.localRunner;/);
+  // 判据不许再碰 runner id：那正是原 bug 的写法（Windows 服务端上的 wsl-local 会被放过）。
+  assert.doesNotMatch(pageSource, /batchProject\.runner/);
+  // 服务端下发的那一位必须与派发前置检查同源，否则前端只是换了个地方写错。
+  assert.match(appSource, /project\.LocalRunner = isLocalRunnerID\(project\.Runner\)/);
+  // 文案必须说清是哪一侧的"本机"：只写"本地运行器"正是这处 bug 的认知来源——
+  // Windows 用户看着自己的 WSL 项目会以为它就是本机。
+  assert.match(pageSource, /「直接写入」只支持运行在服务端本机运行器上的项目/);
   assert.match(pageSource, /: directModeSelected && directModeBlockedReason/);
+  // 前端拦不住的那条路（API 直连、或任何不走这个弹窗的客户端）也要在服务端建计划时拒掉，
+  // 而不是留到派发：那时是 needs_human + 队列冻结，用户完全不知道是自己选错了项目。
+  assert.match(orchestrationSource, /if !isLocalRunnerID\(project\.Runner\) \{\s*writeError\(w, http\.StatusBadRequest, errors\.New\("direct mode requires a project on the server's own runner"\)\)/);
 });
 
 // 目标分支不是当前检出的分支时不硬拦（用户可能刚切过），但必须一直提示；

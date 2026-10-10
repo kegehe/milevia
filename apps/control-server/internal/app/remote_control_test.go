@@ -830,3 +830,91 @@ func TestRemoteRevokeBindingsHitsCloudAgentEndpoint(t *testing.T) {
 		t.Fatal("revoke never reached the cloud")
 	}
 }
+
+// seedRemoteConversation 往项目里再塞一条空闲会话（is_current=0）。时间戳由调用方给：
+// 「不带目标时电脑端挑哪一条」正是按 last_activity_at 排的，用例要靠它控制这个排序。
+func seedRemoteConversation(t *testing.T, server *Server, projectID, conversationID string, activity time.Time) {
+	t.Helper()
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,last_activity_at,created_at) values (?,?,?,?,?,?,?,?)`,
+		conversationID, projectID, "session-"+conversationID, "idle", false, false, activity, activity); err != nil {
+		t.Fatalf("insert conversation %s: %v", conversationID, err)
+	}
+}
+
+// 手机端下发任务时指定了目标会话 —— 电脑端必须听它的，哪怕项目里还有一条**更近活跃**的
+// 空闲会话（不带目标时电脑端挑的正是后者）。
+//
+// 这就是「点了下发，屏幕上什么都没发生」的那个根因：手机端的快照每个项目只带一条会话
+// （remoteSnapshotConversationsPerProject），电脑端自己挑中的那条可能是编排用的后台会话
+// （is_current=0），手机端根本渲染不出来 —— 它既看不到执行，也不会因为下发而切走。
+func TestRemoteTaskDispatchHonorsRequestedConversation(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	// 另一条会话刻意更近活跃：没有 payload 目标时，任务会落到它身上（见下一条用例）。
+	seedRemoteConversation(t, server, projectID, "conversation-bg", time.Now().UTC().Add(time.Minute))
+	taskID := createTaskForTest(t, server.routes(), projectID, "dispatch target")
+
+	value, err := server.executeRemoteCommand(context.Background(), remoteCommand{
+		Type:    "task.dispatch",
+		TaskID:  taskID,
+		Payload: json.RawMessage(`{"conversationId":"` + conversationID + `"}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	result, ok := value.(taskDispatchResult)
+	if !ok {
+		t.Fatalf("dispatch result type=%T want taskDispatchResult", value)
+	}
+	// 回执里的两条会话字段都要是手机端指定的那条：手机端拿 taskRun 判「任务落到了哪条会话」
+	// （见 taskDispatchConversationID），message 那条是同一件事的第二来源。
+	if result.TaskRun.ConversationID != conversationID {
+		t.Fatalf("taskRun.conversationId=%q want %q", result.TaskRun.ConversationID, conversationID)
+	}
+	if result.Message.ConversationID != conversationID {
+		t.Fatalf("message.conversationId=%q want %q", result.Message.ConversationID, conversationID)
+	}
+	// 手机端是按**序列化之后**的 JSON 读这两个字段的（`taskRun.conversationId` 为准、
+	// `message.conversationId` 兜底，见 MobileRemotePage 的 taskDispatchConversationID）。
+	// 结构体字段对了不等于线上那串键名对了：这两条钉的就是键名本身。
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal dispatch result: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatalf("decode dispatch result: %v", err)
+	}
+	for _, container := range []string{"taskRun", "message"} {
+		section, _ := wire[container].(map[string]any)
+		landed, _ := section["conversationId"].(string)
+		if landed != conversationID {
+			t.Fatalf("%s.conversationId=%q want %q（回执的键名就是手机端的接口）", container, landed, conversationID)
+		}
+	}
+}
+
+// 不带目标的老行为一个字节都不能变：回落到「项目里最近活跃的空闲会话」。
+// 这条同时守着「payload 里是别的东西也不会被打回来」——手机端历史上发的就是这种 payload。
+func TestRemoteTaskDispatchWithoutTargetKeepsServerChoice(t *testing.T) {
+	server, projectID, _ := seedTaskConversation(t)
+	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	seedRemoteConversation(t, server, projectID, "conversation-bg", time.Now().UTC().Add(time.Minute))
+	taskID := createTaskForTest(t, server.routes(), projectID, "dispatch fallback")
+
+	value, err := server.executeRemoteCommand(context.Background(), remoteCommand{
+		Type:    "task.dispatch",
+		TaskID:  taskID,
+		Payload: json.RawMessage(`{"x":1}`),
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	result, ok := value.(taskDispatchResult)
+	if !ok {
+		t.Fatalf("dispatch result type=%T want taskDispatchResult", value)
+	}
+	if result.TaskRun.ConversationID != "conversation-bg" {
+		t.Fatalf("taskRun.conversationId=%q want conversation-bg（不带目标时回落的是最近活跃的空闲会话）", result.TaskRun.ConversationID)
+	}
+}

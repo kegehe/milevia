@@ -165,14 +165,35 @@ export function publishGithubRelease({ repoRoot, tag, title, notes, files }) {
     console.warn("〔警告〕gh 未安装或未登录，跳过 GitHub Release；备用源清单将不提供下载地址。");
     return false;
   }
+  // 「查看是否存在 → 创建 → 上传」整段是一个失败点：外部依赖（GitHub）任何一步出错，
+  // 都只降级备用源（清单里不写这一段的下载地址）并返回 false —— **绝不抛出**。
+  //
+  // ⚠️ 调用方把主用路径（自建源 scp）排在调用本函数**之后**。以前只有「查看 Release」
+  // 那段包了 try，`gh release create / upload` 裸奔：GitHub 一次瞬时故障（实测
+  // `unexpected EOF`、`TLS handshake timeout`）就会让异常穿透到调用方，令整次发版在
+  // scp 之前中断 —— 安装包只打到本地 release/ 目录、没传上服务器，线上仍是旧版。
+  // 2026-10-09 桌面端与手机端各撞了一次。这与文件头"失败只警告不中断"的承诺必须一致。
   try {
-    execFileSync("gh", ["release", "view", tag], { cwd: repoRoot, stdio: "ignore" });
-    console.log(`GitHub Release ${tag} 已存在，覆盖上传资产…`);
-  } catch {
-    console.log(`GitHub Release ${tag} 不存在，创建…`);
-    gh("release", "create", tag, "--title", title, "--notes", notes);
+    let exists = true;
+    try {
+      execFileSync("gh", ["release", "view", tag], { cwd: repoRoot, stdio: "ignore" });
+    } catch {
+      exists = false;
+    }
+    if (exists) {
+      console.log(`GitHub Release ${tag} 已存在，覆盖上传资产…`);
+    } else {
+      console.log(`GitHub Release ${tag} 不存在，创建…`);
+      gh("release", "create", tag, "--title", title, "--notes", notes);
+    }
+    gh("release", "upload", tag, ...existing, "--clobber");
+  } catch (error) {
+    const detail = String(error?.message ?? error).split("\n")[0];
+    console.warn(
+      `〔警告〕GitHub Release ${tag} 创建/上传失败，跳过；备用源清单将不提供下载地址。（${detail}）`,
+    );
+    return false;
   }
-  gh("release", "upload", tag, ...existing, "--clobber");
   console.log(`已上传到 GitHub Release ${tag}：${existing.map((file) => file.split(/[\\/]/).pop()).join("、")}`);
   return true;
 }
