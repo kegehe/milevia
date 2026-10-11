@@ -822,3 +822,110 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
    「提交」保持通栏主按钮；「修改最近一次提交」降成一条低调的文字按钮。 */
 .git-workbench[data-mobile="true"] .git-commit-panel { padding: 14px; }
 .git-workbench[data-mobile="true"] .git-commit-actions .git-amend-btn { min-height: 36px; border-color: transparent; color: #4a7a6a; background: transparent; font-size: 13px; font-weight: 700; }
+
+/* ── 方案 C · 柔和卡片风（2026-10-11，画布稿《Git工作台样式优化方案》）─────────
+   桌面端把工作台改成「无边框 + 阴影卡片」的浅色底，共四件事：
+     · 页面底 #f2f6f3；卡片纯白、圆角 14、一层很轻的投影（不再画 1px 边框）；
+     · 顶栏融进页面底色：分支/同步徽标与「拉取/获取/推送」变成浮起的白胶囊，
+       「推送」在有东西可推时用品牌绿强调；「变更/分支」页签变成胶囊分段控件，
+       且挪进工具栏同一行（见 GitWorkbench.tsx 里 GitBar 的 tabs 插槽，手机端 DOM 不变）；
+     · 新增三张概览统计卡（同步状态 / 已暂存 / 工作区），`.git-stats`，桌面端专用；
+     · 提交面板：textarea 去边框换浅底，「修改最近一次提交」降为文字按钮，
+       「提交」是通栏胶囊并把对象写进文案（「提交 N 个已暂存文件」）。
+
+   ⚠️ 每一条都用 `:not([data-mobile="true"])` 限定。上方手机端段落的规矩是
+   「两段选择器、特异性定胜负、与书写位置无关」—— 本段根本不命中手机端，
+   所以手机端一个像素都不变；改这页之前先读 docs/41 §6.2。 */
+.git-workbench:not([data-mobile="true"]) { background: #f2f6f3; }
+
+/* 顶栏：透明融进底色，徽标与按钮都是浮起的白胶囊。 */
+.git-workbench:not([data-mobile="true"]) .git-bar { justify-content: flex-start; gap: 12px; border-bottom: 0; background: transparent; padding: 12px 20px 10px; }
+.git-workbench:not([data-mobile="true"]) .git-bar-ref { margin-right: auto; }
+.git-workbench:not([data-mobile="true"]) .git-bar-label { color: #7d948a; }
+.git-workbench:not([data-mobile="true"]) .git-bar-name { gap: 8px; border-radius: 999px; padding: 6px 14px; background: #fff; box-shadow: 0 2px 8px rgb(19 46 37 / 8%); }
+.git-workbench:not([data-mobile="true"]) .git-bar-name b { font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.git-workbench:not([data-mobile="true"]) .git-sync-badge { border: 0; background: #e7f4ec; }
+.git-workbench:not([data-mobile="true"]) .git-sync-badge.muted { border: 0; background: #eef2ef; }
+
+.git-workbench:not([data-mobile="true"]) .git-bar-actions { gap: 8px; }
+.git-workbench:not([data-mobile="true"]) .git-bar-actions button.secondary { min-height: 34px; border: 0; border-radius: 999px; padding: 0 16px; background: #fff; box-shadow: 0 2px 8px rgb(19 46 37 / 8%); }
+.git-workbench:not([data-mobile="true"]) .git-bar-actions button.secondary:hover:not(:disabled) { border: 0; background: #f6faf7; }
+/* 「推送」是这一排里的主动作：有东西可推时用品牌绿说出来，没有时与其它胶囊一样安静地禁用。 */
+.git-workbench:not([data-mobile="true"]) .git-bar-actions button.git-push:not(:disabled) { color: #fff; background: #2f8f68; box-shadow: 0 2px 8px rgb(19 46 37 / 18%); }
+.git-workbench:not([data-mobile="true"]) .git-bar-actions button.git-push:hover:not(:disabled) { background: #27795a; }
+.git-workbench:not([data-mobile="true"]) .git-refresh,
+.git-workbench:not([data-mobile="true"]) .git-ops-trigger { width: 34px; height: 34px; border: 0; border-radius: 999px; background: #fff; box-shadow: 0 2px 8px rgb(19 46 37 / 8%); }
+.git-workbench:not([data-mobile="true"]) .git-refresh:hover:not(:disabled),
+.git-workbench:not([data-mobile="true"]) .git-ops-trigger:hover:not(:disabled) { background: #f0f7f3; }
+.git-workbench:not([data-mobile="true"]) .git-refresh:disabled,
+.git-workbench:not([data-mobile="true"]) .git-ops-trigger:disabled { background: #edf1ee; box-shadow: none; }
+/* 弹层开着时的激活态要显式重申：上面那条基础规则（0,3,0、书写在后）会压掉
+   基线里 (0,2,0) 的 .git-ops-trigger.active，不补的话"打开了"在按钮上看不出来。 */
+.git-workbench:not([data-mobile="true"]) .git-ops-trigger.active { border: 0; color: #21483d; background: #e7f4ec; box-shadow: 0 2px 8px rgb(19 46 37 / 8%); }
+
+/* 页签 → 胶囊分段控件（桌面端在工具栏行内；手机端那颗 680px 断点的样式不受影响）。 */
+.git-workbench:not([data-mobile="true"]) .git-tabs { flex: none; border-bottom: 0; border-radius: 999px; padding: 3px; background: #e4ece7; }
+.git-workbench:not([data-mobile="true"]) .git-tab-list { flex: none; gap: 2px; overflow: visible; padding: 0; }
+.git-workbench:not([data-mobile="true"]) .git-tabs button { min-height: 28px; border: 0; border-radius: 999px; padding: 0 14px; }
+.git-workbench:not([data-mobile="true"]) .git-tabs button:hover:not(:disabled) { background: rgb(255 255 255 / 55%); }
+.git-workbench:not([data-mobile="true"]) .git-tabs button.active { border: 0; background: #fff; box-shadow: 0 1px 3px rgb(19 46 37 / 14%); }
+.git-workbench:not([data-mobile="true"]) .git-tabs b { color: #2f8f68; background: #e7f4ec; }
+
+/* 概览统计卡（.git-stats 只在桌面端渲染，见 GitWorkbench.tsx）。 */
+.git-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; padding: 2px 20px 0; }
+.git-stats-card { display: grid; gap: 5px; min-width: 0; align-content: start; border-radius: 14px; padding: 14px 16px; background: #fff; box-shadow: 0 4px 14px -2px rgb(19 46 37 / 7%); }
+.git-stats-card span { color: #7d948a; font-size: 11px; font-weight: 700; }
+.git-stats-card b { overflow: hidden; color: #1f3a32; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.git-stats-card b.accent { color: #2f8f68; }
+.git-stats-card b.danger { color: #a54a39; }
+.git-stats-card small { overflow: hidden; color: #8aa096; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+
+/* 内容卡片：去边框、圆角 14、轻投影。 */
+.git-workbench:not([data-mobile="true"]) .git-workbench-body { padding: 14px 20px 22px; }
+.git-workbench:not([data-mobile="true"]) .git-changes-content,
+.git-workbench:not([data-mobile="true"]) .git-change-group,
+.git-workbench:not([data-mobile="true"]) .git-commit-panel,
+.git-workbench:not([data-mobile="true"]) .git-diff,
+.git-workbench:not([data-mobile="true"]) .git-branch-list-pane,
+.git-workbench:not([data-mobile="true"]) .git-branch-history-pane,
+.git-workbench:not([data-mobile="true"]) .git-commit-files { border: 0; border-radius: 14px; background: #fff; box-shadow: 0 4px 14px -2px rgb(19 46 37 / 7%); }
+/* 双层结构里内层不吃卡片样式：外层已经提供了圆角与投影，内层再来一层就是双影。 */
+.git-workbench:not([data-mobile="true"]) .git-changes-content > .git-diff { border: 0; border-radius: 0; box-shadow: none; }
+.git-workbench:not([data-mobile="true"]) .git-change-group > header,
+.git-workbench:not([data-mobile="true"]) .git-diff > header,
+.git-workbench:not([data-mobile="true"]) .git-commit-detail-header,
+.git-workbench:not([data-mobile="true"]) .git-branch-history-header,
+.git-workbench:not([data-mobile="true"]) .git-conflict-solve-head { border-bottom: 1px solid #eef3ef; background: transparent; }
+.git-workbench:not([data-mobile="true"]) .git-commit-message { border: 0; border-radius: 12px; box-shadow: 0 4px 14px -2px rgb(19 46 37 / 7%); }
+
+/* 变更行：状态词换成浅绿章，行内动作按钮从「贴边的格子」变成圆形浮钮。 */
+.git-workbench:not([data-mobile="true"]) .git-change-kind { width: fit-content; border-radius: 6px; padding: 3px 8px; background: #e7f4ec; }
+.git-workbench:not([data-mobile="true"]) .git-change-kind.conflicted { background: #f9e7e2; }
+.git-workbench:not([data-mobile="true"]) .git-inline-actions { align-items: center; gap: 4px; border-left: 0; padding: 0 10px 0 2px; }
+.git-workbench:not([data-mobile="true"]) .git-change-list .git-inline-actions .git-inline-icon { width: 28px; min-width: 28px; height: 28px; border: 0; border-radius: 999px; background: #f2f6f3; }
+.git-workbench:not([data-mobile="true"]) .git-change-list .git-inline-actions .git-inline-icon:hover:not(:disabled) { background: #ddf1e5; }
+.git-workbench:not([data-mobile="true"]) .git-change-list .git-inline-actions .git-inline-icon.danger { background: #fdf0ec; }
+.git-workbench:not([data-mobile="true"]) .git-change-list .git-inline-actions .git-inline-icon.danger:hover:not(:disabled) { background: #ffe4dc; }
+.git-workbench:not([data-mobile="true"]) .git-change-list .git-inline-actions .git-inline-icon:disabled { background: #eef2ef; }
+
+/* 提交面板：textarea 浅底无边框；底行改两行网格 —— 第一行「计数 + 修改」，
+   第二行通栏胶囊「提交 N 个已暂存文件」（DOM 见 CommitPanel，手机端仍是原来的列布局）。 */
+.git-workbench:not([data-mobile="true"]) .git-commit-panel { gap: 12px; padding: 16px; }
+.git-workbench:not([data-mobile="true"]) .git-commit-panel textarea { border: 0; border-radius: 12px; padding: 12px; background: #f4f8f5; }
+.git-workbench:not([data-mobile="true"]) .git-commit-panel textarea:disabled { background: #f0f4f1; }
+.git-workbench:not([data-mobile="true"]) .git-commit-panel footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; }
+.git-workbench:not([data-mobile="true"]) .git-commit-panel footer .git-commit-submit { grid-column: 1 / -1; width: 100%; min-height: 38px; border: 0; border-radius: 999px; }
+.git-workbench:not([data-mobile="true"]) .git-commit-actions { gap: 10px; }
+.git-workbench:not([data-mobile="true"]) .git-commit-actions .git-amend-btn { border: 0; background: transparent; }
+.git-workbench:not([data-mobile="true"]) .git-commit-actions .git-amend-btn:hover:not(:disabled) { background: transparent; color: #1e6858; }
+
+/* 分支视图与弹层里的输入件：同样换浅底无边框。 */
+.git-workbench:not([data-mobile="true"]) .git-branch-create { border: 0; border-radius: 12px; background: #fff; box-shadow: 0 4px 14px -2px rgb(19 46 37 / 7%); }
+.git-workbench:not([data-mobile="true"]) .git-branch-input,
+.git-workbench:not([data-mobile="true"]) .git-history-search input,
+.git-workbench:not([data-mobile="true"]) .git-ops-search input { border: 0; border-radius: 8px; background: #f4f8f5; }
+.git-workbench:not([data-mobile="true"]) .git-ops-filters select { border: 0; border-radius: 8px; background: #f4f8f5; }
+.git-workbench:not([data-mobile="true"]) .git-ops-popover { border: 0; border-radius: 14px; }
+/* 骨架屏与内容卡片是同一种东西的两态（在读 / 已读到），跟着方案 C 一起去边框， */
+/* 否则首屏是一圈带边框的灰卡、落定后变成无边的白卡，形状会跳一下。 */
+.git-workbench:not([data-mobile="true"]) .git-skeleton-group { border: 0; border-radius: 14px; box-shadow: 0 4px 14px -2px rgb(19 46 37 / 7%); }

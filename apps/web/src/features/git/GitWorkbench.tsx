@@ -73,6 +73,31 @@ function gitPullTarget(snapshot: GitSnapshot | null): { remote: string; branch: 
   return { remote: "origin", branch: snapshot?.head.branch || "" };
 }
 
+/** 同步状态的**唯一判据**（detached / 未跟踪上游 / 已同步 / 领先 / 落后 / 双向分叉）。
+ *  有两处消费 —— GitBar 的同步徽标与概览统计卡（方案 C）—— 分支逻辑只许出现在这里，
+ *  两处只做文案拼装（徽标要紧凑「领先 2」，统计卡要完整「领先 2 个提交」），
+ *  改判据时 grep 这个函数名即可，不会漏第二处。 */
+function gitSync(head: GitSnapshot["head"]): { kind: "detached" | "no-upstream" | "synced" | "ahead" | "behind" | "diverged"; ahead: number; behind: number } {
+  // 上游比对先行：detached 但仍带 upstream（后端理论上的矛盾态）时，徽标继续按计数说话，
+  // 与旧版逐字一致；「游离指针」只在没有上游可比时作为统计卡的读数出现。
+  if (!head.upstream) return { kind: head.detached ? "detached" : "no-upstream", ahead: 0, behind: 0 };
+  if (head.ahead === 0 && head.behind === 0) return { kind: "synced", ahead: 0, behind: 0 };
+  if (head.behind === 0) return { kind: "ahead", ahead: head.ahead, behind: 0 };
+  if (head.ahead === 0) return { kind: "behind", ahead: 0, behind: head.behind };
+  return { kind: "diverged", ahead: head.ahead, behind: head.behind };
+}
+
+/** 概览统计卡「同步状态」那张的完整读数。 */
+function gitSyncStatus(head: GitSnapshot["head"]): string {
+  const sync = gitSync(head);
+  return sync.kind === "detached" ? "游离指针"
+    : sync.kind === "no-upstream" ? "未跟踪上游"
+      : sync.kind === "synced" ? "与上游同步"
+        : sync.kind === "ahead" ? `领先 ${sync.ahead} 个提交`
+          : sync.kind === "behind" ? `落后 ${sync.behind} 个提交`
+            : `领先 ${sync.ahead} · 落后 ${sync.behind}`;
+}
+
 /**
  * 两份 summary 说的是不是同一份仓库状态。
  *
@@ -569,11 +594,28 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       </div>
     </section>;
   }
-  return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active} data-mobile={mobile ? "true" : undefined} data-detail={mobileDetailOpen ? "open" : undefined}>
-    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} requestRefresh={() => void reload("manual")} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} />
-    <nav className="git-tabs" aria-label="Git工作台视图">
+  // 页签在桌面端挪进 GitBar 的同一条工具栏（方案 C：分段控件 + 概览统计卡）；
+  // 手机端保持原来的「工具栏一行 + 页签一行」DOM 不动 —— 手机端那段 CSS（docs/41 §6.2）
+  // 全是按这个结构写的，动它就等于动手机端发版。
+  const tabsNav = <nav className="git-tabs" aria-label="Git工作台视图">
       <div className="git-tab-list" role="tablist" aria-label="Git工作台视图">{tabs.map((item) => <button type="button" key={item.id} id={`git-tab-${item.id}`} role="tab" aria-controls={`git-view-${item.id}`} className={tab === item.id ? "active" : ""} aria-selected={tab === item.id} tabIndex={tab === item.id ? 0 : -1} onClick={() => selectTab(item.id)} onKeyDown={(event) => handleTabKeyDown(event, item.id)}>{item.label}{item.id === "changes" && changeCount > 0 ? <b>{changeCount}</b> : null}</button>)}</div>
-    </nav>
+    </nav>;
+  // 概览统计卡（仅桌面端、仅「变更」页、且已有完整读数）：loading 档交给骨架屏，
+  // 后台对账不置 loading，统计卡跟着 snapshot 原地更新，不闪。
+  // 工作区卡上的冲突备注沿用三态：真的没有 / 读不到 / 正在检测，不把「读不到」写成「没有」。
+  const conflictedCount = conflictedWorktreeCount(grouped);
+  const conflictNote = conflictedCount > 0 ? ` · ${conflictedCount} 个冲突` : conflictsState === "ready" ? " · 无冲突" : conflictsState === "unavailable" ? " · 冲突状态读不到" : " · 正在检测冲突";
+  // 统计卡的强调色也走 gitSync 的判据（ahead/behind/diverged 才值得强调），不再内联重写一遍。
+  const headSync = snapshot ? gitSync(snapshot.head) : null;
+  const syncAccent = headSync !== null && (headSync.kind === "ahead" || headSync.kind === "behind" || headSync.kind === "diverged");
+  return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active} data-mobile={mobile ? "true" : undefined} data-detail={mobileDetailOpen ? "open" : undefined}>
+    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} tabs={mobile ? undefined : tabsNav} requestRefresh={() => void reload("manual")} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} />
+    {mobile ? tabsNav : null}
+    {!mobile && tab === "changes" && snapshot && !loading ? <div className="git-stats" role="group" aria-label="仓库概览">
+      <div className="git-stats-card"><span>同步状态</span><b className={syncAccent ? "accent" : ""}>{gitSyncStatus(snapshot.head)}</b><small>{snapshot.head.upstream || (snapshot.head.detached ? "HEAD (游离指针)" : snapshot.head.branch)}</small></div>
+      <div className="git-stats-card"><span>已暂存</span><b>{grouped.staged.length} 个文件</b></div>
+      <div className="git-stats-card"><span>工作区</span><b className={conflictedCount > 0 ? "danger" : ""}>{grouped.worktree.length} 个文件{conflictNote}</b></div>
+    </div> : null}
     <main className={`git-workbench-body${tab === "changes" ? " changes-active" : ""}`}>
       {/* ⚠️ 判据是 `loading` 本身，**不是** `loading && !snapshot`。
           这个工作台重读的触发之一就是"工作区身份变了"（projectID / conversationId / request
@@ -590,7 +632,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   </section>;
 });
 
-export function GitBar({ snapshot, loading, mutating, refreshing, operations, projectID, conversationId, request, fail, mobile = false, requestRefresh, requestFetch, requestPull, requestPush }: { snapshot: GitSnapshot | null; loading: boolean; mutating: string; refreshing: boolean; operations: GitOperation[]; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; mobile?: boolean; requestRefresh: () => void; requestFetch: () => void; requestPull: () => void; requestPush: () => void }) {
+export function GitBar({ snapshot, loading, mutating, refreshing, operations, projectID, conversationId, request, fail, mobile = false, tabs, requestRefresh, requestFetch, requestPull, requestPush }: { snapshot: GitSnapshot | null; loading: boolean; mutating: string; refreshing: boolean; operations: GitOperation[]; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; mobile?: boolean; /** 桌面端把「变更/分支」分段控件插到工具栏同一行（方案 C）；手机端不传。 */ tabs?: ReactNode; requestRefresh: () => void; requestFetch: () => void; requestPull: () => void; requestPush: () => void }) {
   const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   const [opsOpen, setOpsOpen] = useState(false);
   const [opsItems, setOpsItems] = useState<GitOperation[]>([]);
@@ -627,19 +669,29 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
     return () => window.clearTimeout(timer);
   }, [opsQuery]);
   const loadMoreOps = () => fetchOps(opsItems.length, true);
-  const barRef = useRef<HTMLDivElement>(null);
   const head = snapshot?.head;
-  const syncLabel = head?.upstream
-    ? head.ahead === 0 && head.behind === 0 ? "与上游同步" : head.ahead > 0 && head.behind === 0 ? `领先 ${head.ahead}` : head.ahead === 0 && head.behind > 0 ? `落后 ${head.behind}` : `领先 ${head.ahead} · 落后 ${head.behind}`
-    : "未跟踪上游";
+  // 判断收口在 gitSync（见它的说明）：徽标这里只做紧凑文案。
+  const sync = head ? gitSync(head) : null;
+  const syncLabel = !head || !head.upstream ? "未跟踪上游"
+    : sync!.kind === "synced" ? "与上游同步"
+      : sync!.kind === "ahead" ? `领先 ${head.ahead}`
+        : sync!.kind === "behind" ? `落后 ${head.behind}`
+          : `领先 ${head.ahead} · 落后 ${head.behind}`;
   const needsAttention = operations.some((operation) => operation.status === "failed" || operation.status === "needs_attention");
   // 点击外部或 Escape 键关闭操作记录。沿用 NotificationCenter 的 ref.contains 模式：
   // 只监听不拦截，外部点击（如切换工作区 tab）会正常穿透。
+  // ⚠️ 判定域是「触发按钮 + 弹层本体」，**不是**整条 `.git-bar`：2026-10-11 方案 C 把
+  // 「变更/分支」页签挪进了这条工具栏（桌面端），再按整条 bar 判的话，弹层开着时点页签
+  // 会切走视图而弹层还浮着 —— 它已经不在"刚才那个上下文"里了。点工具栏其余部分
+  // （分支名、同步徽标等）现在也会收起弹层：浮层语义下这是更标准的"点哪都关"。
+  const opsTriggerRef = useRef<HTMLButtonElement>(null);
+  const opsPopoverRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!opsOpen) return;
     const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as Node;
-      if (barRef.current?.contains(target)) return;
+      if (opsPopoverRef.current?.contains(target)) return;
+      if (opsTriggerRef.current?.contains(target)) return;
       setOpsOpen(false);
     };
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -652,7 +704,7 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, [opsOpen]);
-  return <div className="git-bar" ref={barRef} data-mobile={mobile ? "true" : undefined}>
+  return <div className="git-bar" data-mobile={mobile ? "true" : undefined}>
     <div className="git-bar-ref">
       {/* 与 body 那条同源：只要在读，就不显示手上那份（它可能属于上一个工作区）。 */}
       {loading ? <><span className="git-bar-label">当前引用</span><span className="git-bar-loading">正在读取仓库状态…</span></> : <>
@@ -664,14 +716,15 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
         <span className={`git-sync-badge${head?.upstream ? "" : " muted"}`}>{syncLabel}</span>
       </>}
     </div>
+    {tabs}
     <div className="git-bar-actions">
       <button type="button" className="secondary" disabled={loading || Boolean(mutating) || head?.detached || !head?.branch || !head?.upstream} onClick={() => { setOpsOpen(false); requestPull(); }} title={loading ? "正在读取仓库状态" : head?.detached || !head?.branch ? "游离指针状态无法拉取" : !head?.upstream ? "未设置上游分支" : undefined}>拉取</button>
       <button type="button" className="secondary" disabled={loading || Boolean(mutating)} onClick={() => { setOpsOpen(false); requestFetch(); }}>获取</button>
-      <button type="button" className="secondary" disabled={loading || Boolean(mutating) || head?.detached || !head?.branch || head?.ahead === 0} onClick={() => { setOpsOpen(false); requestPush(); }} title={loading ? "正在读取仓库状态" : head?.detached || !head?.branch ? "游离指针状态无法推送" : head?.ahead === 0 ? "没有需要推送的提交" : undefined}>推送</button>
+      <button type="button" className="secondary git-push" disabled={loading || Boolean(mutating) || head?.detached || !head?.branch || head?.ahead === 0} onClick={() => { setOpsOpen(false); requestPush(); }} title={loading ? "正在读取仓库状态" : head?.detached || !head?.branch ? "游离指针状态无法推送" : head?.ahead === 0 ? "没有需要推送的提交" : undefined}>推送</button>
       <button type="button" className={`git-refresh${refreshing ? " spinning" : ""}`} title={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} aria-label={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} disabled={refreshing || Boolean(mutating)} onClick={requestRefresh}><RefreshIcon /></button>
-      <button type="button" className={`git-ops-trigger${opsOpen ? " active" : ""}${needsAttention ? " attention" : ""}`} title="操作记录" aria-label="操作记录" aria-expanded={opsOpen} aria-controls="git-ops-popover" disabled={operations.length === 0} onClick={() => setOpsOpen(!opsOpen)}><HistoryIcon />{needsAttention ? <i className="git-ops-dot" aria-hidden="true" /> : null}</button>
+      <button type="button" ref={opsTriggerRef} className={`git-ops-trigger${opsOpen ? " active" : ""}${needsAttention ? " attention" : ""}`} title="操作记录" aria-label="操作记录" aria-expanded={opsOpen} aria-controls="git-ops-popover" disabled={operations.length === 0} onClick={() => setOpsOpen(!opsOpen)}><HistoryIcon />{needsAttention ? <i className="git-ops-dot" aria-hidden="true" /> : null}</button>
     </div>
-    {opsOpen && <div id="git-ops-popover" className="git-ops-popover" role="dialog" aria-label="操作记录"><header><div><span>审计记录</span><h3>操作记录</h3></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" onClick={() => setOpsOpen(false)}><CloseIcon /></button></header><div className="git-ops-popover-body"><div className="git-ops-filters">{mobile ? <><FilterChips label="按操作类型筛选" value={opsType} options={[{ value: "", label: "全部类型" }, ...OPERATION_TYPE_VALUES.map((value) => ({ value, label: operationTypeLabel(value) }))]} onChange={setOpsType} /><FilterChips label="按操作状态筛选" value={opsStatus} options={[{ value: "", label: "全部状态" }, ...OPERATION_STATUS_VALUES.map((value) => ({ value, label: operationStatusLabel(value) }))]} onChange={setOpsStatus} /></> : <><select value={opsType} aria-label="按操作类型筛选" onChange={(event) => setOpsType(event.target.value)}><option value="">全部类型</option>{OPERATION_TYPE_VALUES.map((value) => <option key={value} value={value}>{operationTypeLabel(value)}</option>)}</select><select value={opsStatus} aria-label="按操作状态筛选" onChange={(event) => setOpsStatus(event.target.value)}><option value="">全部状态</option>{OPERATION_STATUS_VALUES.map((value) => <option key={value} value={value}>{operationStatusLabel(value)}</option>)}</select></>}<div className="git-ops-search"><input type="text" value={opsQuery} placeholder="搜索操作…" aria-label="搜索操作记录" onChange={(event) => setOpsQuery(event.target.value)} />{opsQuery ? <button type="button" className="git-history-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setOpsQuery("")}>×</button> : null}</div></div><Operations operations={opsItems} loading={opsLoading} />{opsHasMore && !opsLoading ? <button type="button" className="git-ops-load-more" onClick={loadMoreOps}>加载更多操作</button> : null}</div></div>}
+    {opsOpen && <div id="git-ops-popover" ref={opsPopoverRef} className="git-ops-popover" role="dialog" aria-label="操作记录"><header><div><span>审计记录</span><h3>操作记录</h3></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" onClick={() => setOpsOpen(false)}><CloseIcon /></button></header><div className="git-ops-popover-body"><div className="git-ops-filters">{mobile ? <><FilterChips label="按操作类型筛选" value={opsType} options={[{ value: "", label: "全部类型" }, ...OPERATION_TYPE_VALUES.map((value) => ({ value, label: operationTypeLabel(value) }))]} onChange={setOpsType} /><FilterChips label="按操作状态筛选" value={opsStatus} options={[{ value: "", label: "全部状态" }, ...OPERATION_STATUS_VALUES.map((value) => ({ value, label: operationStatusLabel(value) }))]} onChange={setOpsStatus} /></> : <><select value={opsType} aria-label="按操作类型筛选" onChange={(event) => setOpsType(event.target.value)}><option value="">全部类型</option>{OPERATION_TYPE_VALUES.map((value) => <option key={value} value={value}>{operationTypeLabel(value)}</option>)}</select><select value={opsStatus} aria-label="按操作状态筛选" onChange={(event) => setOpsStatus(event.target.value)}><option value="">全部状态</option>{OPERATION_STATUS_VALUES.map((value) => <option key={value} value={value}>{operationStatusLabel(value)}</option>)}</select></>}<div className="git-ops-search"><input type="text" value={opsQuery} placeholder="搜索操作…" aria-label="搜索操作记录" onChange={(event) => setOpsQuery(event.target.value)} />{opsQuery ? <button type="button" className="git-history-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setOpsQuery("")}>×</button> : null}</div></div><Operations operations={opsItems} loading={opsLoading} />{opsHasMore && !opsLoading ? <button type="button" className="git-ops-load-more" onClick={loadMoreOps}>加载更多操作</button> : null}</div></div>}
   </div>;
 }
 
@@ -751,7 +804,7 @@ function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview,
   mutating: string;
   changeCount: number;
 }) {
-  const conflictedCount = grouped.worktree.filter((change) => change.conflicted).length;
+  const conflictedCount = conflictedWorktreeCount(grouped);
   const context = conflictOverview?.context;
   const operationVerb = conflictOperationVerb(context?.operationType);
   const openFile = (change: GitChange, stage: "worktree" | "index") => {
@@ -786,6 +839,11 @@ function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview,
 
 function conflictOperationVerb(operationType: GitConflictOverview["context"]["operationType"] | undefined): string {
   return ({ merge: "合并", rebase: "变基", "cherry-pick": "挑选", revert: "还原", none: "" })[operationType ?? "none"] || "";
+}
+
+/** 工作区里的冲突文件数。概览统计卡与冲突横幅共用这一个判据，别处不许再 filter 一遍。 */
+function conflictedWorktreeCount(grouped: { worktree: GitChange[] }): number {
+  return grouped.worktree.filter((change) => change.conflicted).length;
 }
 
 export function parseDiffContent(content: string): DiffLine[] {
@@ -852,7 +910,9 @@ export function CommitPanel({ stagedCount, value, setValue, open, openAmend, dis
         提示不给按钮加 title：禁用的按钮不派发鼠标事件，title 根本不会弹出。 */}
     {subjectOverLimit ? <p className="git-commit-subject-warning" id="git-commit-subject-warning" role="alert">提交信息首行最多 {MAX_COMMIT_SUBJECT_LENGTH} 个字符，超出后无法提交，也无法修改最近一次提交。请缩短首行，多行说明写在第二行起。</p> : null}
     {/* 计数器从能输入的那一刻就常驻，而不是等超限才出现：这条 72 字的规矩要在用户写之前就看得见。 */}
-    <footer><div className="git-commit-meta"><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span>{stagedCount === 0 ? null : <span className={`git-commit-subject-count${subjectOverLimit ? " over" : ""}`} title={`提交信息首行的字符数，上限 ${MAX_COMMIT_SUBJECT_LENGTH}`}>首行 {subjectLength}/{MAX_COMMIT_SUBJECT_LENGTH}</span>}</div><div className="git-commit-actions"><button type="button" className="secondary git-amend-btn" title="修改最近一次提交" disabled={disabled || !value.trim() || subjectOverLimit} onClick={openAmend}>修改最近一次提交</button><button type="button" className="primary" disabled={disabled || stagedCount === 0 || !value.trim() || subjectOverLimit} onClick={open}>提交</button></div></footer></section>;
+    {/* 方案 C 的提交区主次：「修改最近一次提交」降成与计数同行的一条文字按钮，
+        「提交」独占一行的通栏胶囊，并把自己的对象写进按钮文案（提交几个文件，不用猜）。 */}
+    <footer><div className="git-commit-meta"><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span>{stagedCount === 0 ? null : <span className={`git-commit-subject-count${subjectOverLimit ? " over" : ""}`} title={`提交信息首行的字符数，上限 ${MAX_COMMIT_SUBJECT_LENGTH}`}>首行 {subjectLength}/{MAX_COMMIT_SUBJECT_LENGTH}</span>}</div><div className="git-commit-actions"><button type="button" className="secondary git-amend-btn" title="修改最近一次提交" disabled={disabled || !value.trim() || subjectOverLimit} onClick={openAmend}>修改最近一次提交</button></div><button type="button" className="primary git-commit-submit" disabled={disabled || stagedCount === 0 || !value.trim() || subjectOverLimit} onClick={open}>{stagedCount === 0 ? "提交" : `提交 ${stagedCount} 个已暂存文件`}</button></footer></section>;
 }
 
 function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, commitAmend, discardWorktree, discardAll, fetchRemote, pullRemote, pushBranch, switchBranch, abortConflict, finishConflict }: {

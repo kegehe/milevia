@@ -91,7 +91,7 @@ export function reorderIds(ids: string[], fromId: string, targetIndex: number, a
 const MOBILE_DRAG_HINT_STORAGE_KEY = "milevia:mobile-project-drag-hint";
 
 /**
- * 手机端「按住项目卡片可拖动排序」的提示**是否还该显示**：
+ * 手机端「长按磁贴可拖动换位」的提示**是否还该显示**：
  * true = 还没拖成过（要显示），false = 已经拖成过一次（永久收起）。
  * 注意判据是反的 —— 读名字容易读成"是否已收起"，改条件时先看这里。
  */

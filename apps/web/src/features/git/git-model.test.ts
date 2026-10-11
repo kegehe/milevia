@@ -99,7 +99,13 @@ test("keeps the workbench a compact 2-tab layout with a persistent status bar", 
 test("closes the operations popover via ref.contains outside-click instead of a blocking backdrop", () => {
   const source = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
 
-  assert.match(source, /barRef\.current\?\.contains\(target\)/);
+  // 判定域是「触发按钮 + 弹层本体」，不是整条 `.git-bar` —— 2026-10-11 方案 C 把
+  // 变更/分支页签挪进了同一条工具栏，按整条 bar 判会让"弹层开着点页签"把视图切走
+  // 而弹层还浮着。两个 ref 必须都挂在判定上，缺一个就是"点触发按钮先被外点关掉再
+  // 被 onClick 打开"或"点弹层内部自己关自己"。
+  assert.match(source, /opsPopoverRef\.current\?\.contains\(target\)/);
+  assert.match(source, /opsTriggerRef\.current\?\.contains\(target\)/);
+  assert.doesNotMatch(source, /barRef/);
   assert.match(source, /if \(event\.key === "Escape"\) setOpsOpen\(false\);/);
   assert.doesNotMatch(source, /git-ops-backdrop/);
 });

@@ -174,20 +174,28 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-project-picker, .mobile-conversation { max-width: 860px; margin: 0 auto 14px; }
 /* 「重新配对此设备 / 解除绑定」不再挂在页面底部 —— 它们是设备层面的动作，
    已经并进底部「我的电脑」面板（见 `.mobile-device-sheet`），页面上不再有游离的按钮组。 */
-/* ── 项目卡片 ────────────────────────────────────────────────────────────────
-   整张卡就是一个按钮。三列 grid：[环境图标块] [内容 1fr] [›]。
-   内容列必须写 minmax(0, 1fr)：auto 轨道会按"最长那条内容"的 min-content 撑开，
-   把右侧箭头挤出卡片，而 .mobile-remote 是 overflow-x: hidden —— 挤出去的部分
-   会被静默裁掉（320px + 长项目名必然触发）。
+/* ── 项目磁贴（两列网格，2026-10-11 C2「状态染色」方案）──────────────────────
+   整张磁贴就是一个按钮，排进 .mobile-project-grid 两列网格。原来的三列横排卡
+   （图标 | 内容 | ›）改成竖排：[环境图标块] [名称] [分支] [状态 · 计数]。
 
-   信息分层：左侧图标块承载"这是哪台机器上的项目"（环境色底 + 环境图标），所以第二行
-   的元信息即使被省略号截断也不会丢关键信息 —— 元信息按"越靠前越重要"排序
-   （环境 · 分支 · 任务数 · 会话数），窄屏上先被牺牲的只会是尾巴上的计数。
-   运行状态保留文字而不只给一个圆点：它是"现在能不能连上去"的唯一先验。 */
-/* 圆角 12px 是本页"卡片列表"这一档（7px 留给信息面板）。任务队列的卡片 2026-09-16 改成了 16px
-   （浮起卡片、层级更重），但两者不同屏，不必强行对齐 —— 这里只保留项目卡自己的口径。 */
-.mobile-project-choice { width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; border: 1px solid #dfeae4; border-radius: 12px; padding: 14px; margin: 0 0 10px; color: #19332c; background: #fff; text-align: left; cursor: pointer; box-shadow: 0 1px 2px rgba(25, 51, 44, .05); transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+   信息分层：图标块承载“这是哪台机器上的项目”（环境色底 + 环境图标，环境全称在
+   磁贴的 title 里兜底）；分支单独一行用等宽字体 —— 它是机器可读的标识，不是普通
+   文案；状态与计数并成一行，放不下时先牺牲尾巴上的计数。运行状态保留文字而不只
+   给一个圆点：它是“现在能不能连上去”的唯一先验。
+
+   运行中的磁贴整块泛绿（底色 + 边框 + 右上角环点）：两列网格里要靠余光找
+   “哪个活着”，一行小字不够看。角点是静态的，刻意不做动画 —— 整块底色已经把状态
+   说了，再动就是两处信号抢注意力，reduced-motion 也少一条要显式降级的规则。
+
+   截断契约：磁贴里每一行文本都要自己 overflow hidden + 省略号，.mobile-remote
+   是 overflow-x: hidden，被挤出磁贴的文字会被静默裁掉（320px + 长项目名必然触发）；
+   网格轨道必须 minmax(0, 1fr)，否则轨道按最长内容的 min-content 收缩下限被撑开，
+   长分支名会把另一列挤窄（同一个坑，三列卡时代的注释里也记过一次）。 */
+.mobile-project-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.mobile-project-choice { position: relative; display: flex; flex-direction: column; gap: 5px; border: 1px solid #dfeae4; border-radius: 14px; padding: 12px; color: #19332c; background: #fff; text-align: left; cursor: pointer; box-shadow: 0 1px 2px rgba(25, 51, 44, .05); transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
 .mobile-project-choice:disabled { opacity: .6; cursor: default; }
+/* 运行中的磁贴整块染色；未运行保持白底。 */
+.mobile-project-choice[data-running="true"] { border-color: #bfe3d3; background: #f2faf6; }
 /* 聚焦环交给 .mobile-remote button:focus-visible 那条全局深绿 outline（页面统一约定），
    这里不再叠一层 border/shadow —— 两套焦点样式同时出现只会互相打架。 */
 /* 悬停只给精确指针：触屏上 hover 会粘在刚点过的那张卡上，看起来像还按着没松手。 */
@@ -195,6 +203,10 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
   .mobile-project-choice:not(:disabled):hover { border-color: #a9cfbc; box-shadow: 0 8px 20px -12px rgba(25, 51, 44, .5); transform: translateY(-1px); }
 }
 .mobile-project-choice:not(:disabled):active { transform: translateY(0); box-shadow: 0 1px 2px rgba(25, 51, 44, .08); }
+/* 图标块在磁贴里固定 40px：基类 .mobile-project-mark 保持 44px 是「我的电脑」面板的
+   设备卡在用（复用同一套环境配色，两处各写一遍迟早走偏），别把设备卡一起缩小。 */
+.mobile-project-choice .mobile-project-mark { width: 40px; height: 40px; border-radius: 12px; }
+.mobile-project-choice .mobile-project-mark svg { width: 20px; height: 20px; }
 .mobile-project-mark { display: grid; width: 44px; height: 44px; place-items: center; border: 1px solid #d5e7dd; border-radius: 13px; color: #3d6a5c; background: #f1f8f4; }
 .mobile-project-mark svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
 .mobile-project-mark.windows { color: #2f6cba; border-color: #ccdcf4; background: linear-gradient(160deg, #f3f8ff, #dfeafb); }
@@ -202,29 +214,20 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-project-mark.wsl { color: #6a569b; border-color: #ded5ef; background: linear-gradient(160deg, #f9f5fd, #ece5f8); }
 .mobile-project-mark.wsl svg { stroke: none; }
 .mobile-project-mark.remote-linux { color: #1f7a68; border-color: #c3e5d6; background: linear-gradient(160deg, #f1faf6, #d9f0e5); }
-.mobile-project-choice-content { display: grid; min-width: 0; gap: 5px; }
-/* flex-start 而不是 center：项目名可以是两行（实测 17 字），居中会让胶囊飘在两行中间，
-   和名字的第一行对不上。 */
-.mobile-project-choice-head { display: flex; min-width: 0; align-items: flex-start; gap: 8px; }
-/* 项目名最多两行：只给一行会把长名字（实测 17 字）截得太狠，不封顶又会让卡片高矮参差。 */
-.mobile-project-choice strong { display: -webkit-box; overflow: hidden; flex: 1; min-width: 0; color: #1c3a31; font-size: 16px; font-weight: 700; line-height: 1.35; word-break: break-word; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-/* line-height 必须显式给：这个 <small> 继承的是全局行高，卡片高度会跟着全局值漂
-   （实测同一张卡在 1 行名字下忽高忽低，量到 72 / 77.3 两个数）。 */
-.mobile-project-choice-meta { overflow: hidden; color: #7b9187; font-size: 12px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
-.mobile-project-choice-chevron { color: #a3bcaf; font-size: 22px; line-height: 1; }
-/* 运行状态做成不加边框的实底色胶囊：整卡已经有一圈边框，胶囊再描一道边就是"卡里套卡"，
-   视觉噪音全落在描边上了。
-
-   变体用 data-state 而不是第二个类名：style.css 里有一条全局的 `.ready, .running { padding: 6px 9px }`
-   （裸类名，见那边的 .head-actions 状态药丸），本组件的 `running` 类名会被它一起命中、
-   与 `.mobile-project-running` 同权重、又排在后面 —— 于是"运行中"那颗胶囊凭空多出
-   4px/3px padding（实测 26.3px vs 未运行的 20.3px），卡片高度也跟着飘。
-   属性选择器不参与这套类名碰撞，且这条同源性不会随样式表顺序改变。 */
-.mobile-project-running { display: inline-flex; flex: none; align-items: center; gap: 4px; border-radius: 999px; padding: 3px 7px; color: #74867f; background: #f1f5f3; font-size: 11px; font-weight: 700; line-height: 1.3; white-space: nowrap; }
-.mobile-project-running i { display: block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.mobile-project-running[data-state="running"] { color: #1f6d58; background: #e4f5eb; }
-.mobile-project-running[data-state="running"] i { box-shadow: 0 0 0 3px #cfeadc; animation: mobile-project-running-pulse 1.4s ease-in-out infinite; }
-@keyframes mobile-project-running-pulse { 50% { opacity: .5; } }
+/* 名称单行截断：两列磁贴容不下两行名字 —— 网格同一行的磁贴是等高的，
+   一张高了整行跟着高，参差感比单列列表明显得多。 */
+.mobile-project-choice strong { overflow: hidden; max-width: 100%; color: #1c3a31; font-size: 14px; font-weight: 700; line-height: 1.35; white-space: nowrap; text-overflow: ellipsis; }
+/* 分支单独一行、等宽字体：它是机器可读的标识，和普通文案混排会被误读。 */
+.mobile-project-branch { overflow: hidden; max-width: 100%; color: #4c6b60; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; }
+/* line-height 必须显式给：这个 <small> 继承的是全局行高，磁贴高度会跟着全局值漂
+   （单列卡时代实测同一张卡量到 72 / 77.3 两个数，就是它）。 */
+.mobile-project-choice-meta { overflow: hidden; max-width: 100%; color: #7b9187; font-size: 10px; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; }
+/* 运行状态在磁贴上是纯文字：原来的实底胶囊是“白卡里给状态一个家”，现在家就是
+   整块底色（磁贴自身已按 data-running 染色），胶囊再描一道就是“卡里套卡”。 */
+.mobile-project-running { color: #74867f; font-weight: 700; }
+.mobile-project-running[data-state="running"] { color: #1f6d58; }
+/* 运行中的右上角环点（静态，理由见区块头的说明）。 */
+.mobile-project-live { position: absolute; top: 10px; right: 10px; width: 8px; height: 8px; border-radius: 50%; background: #1f8a6d; box-shadow: 0 0 0 3px #cfeadc; }
 /* ── 会话视图顶栏：一行标题 + ⋯ 菜单 ──────────────────────────────────────
    原来会话页顶部是两段：一段是「会话标题 + 状态」的标题条，一段是「历史 / 新会话 / 任务」
    三个常驻按钮。390×800 实测这两段加起来吃掉 199px（屏幕顶到第一条消息），接近四分之一屏 ——
@@ -1089,9 +1092,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
    见页面顶部 .mobile-back 那段说明）——加回这一组会让它们又长回 44px。
    原来这里还有一条 `.mobile-pairing button { min-height: 44px }`：那个类已随内联配对面板
    一起删掉（现在叫 `.mobile-pairing-page`），新的配对页把 44px 写在各自的按钮规则里。 */
-/* 卡片高度交给内容算（图标块 44 + 上下 padding 28 = 72px）：原来钉死 88px，多出来的
-   那 16px 是一条没有内容的空白带。 */
-.mobile-project-choice { min-height: 72px; }
+/* 卡片高度交给内容算（磁贴：图标块 40 + 三行文字 + 上下 padding，行距见各行的 line-height）。 */
 /* 任务条目的行内按钮（下发/验收/停止/详情/编辑/删除）走 `.mobile-task-foot button` 那一组
    （视觉 36px + ::after 外扩到 44px），所以刻意不出现在下面这条 44px 最小高度规则里 ——
    加回去它们会又长回 44px，每张卡片白白高 8px。 */
@@ -1118,12 +1119,13 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
   .mobile-composer, .mobile-composer-tools { padding-left: 10px; padding-right: 10px; }
   .mobile-remote-header { gap: 10px; }
   .mobile-remote h1 { font-size: 24px; }
-  .mobile-project-choice { gap: 10px; padding: 12px; }
+  /* 磁贴在窄屏再收一档：320px 减去页面 padding 后内容宽约 296px，两列各 ~142px，
+     padding/字号不降的话名称截得太狠。图标块那条窄屏降级同时管着「我的电脑」面板的设备卡。 */
+  .mobile-project-choice { gap: 4px; padding: 10px; }
+  .mobile-project-grid { gap: 8px; }
   .mobile-project-mark { width: 40px; height: 40px; border-radius: 12px; }
   .mobile-project-mark svg { width: 20px; height: 20px; }
-  .mobile-project-choice strong { font-size: 15px; }
-  .mobile-project-choice-meta { font-size: 11px; }
-  .mobile-project-running { padding: 2px 6px; font-size: 11px; }
+  .mobile-project-choice strong { font-size: 13px; }
 }
 
 /* ── 新建会话：底部弹层（方案 A，2026-09-24）─────────────────────────────
@@ -1277,7 +1279,6 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-refresh-spinner { width: 13px; height: 13px; flex: none; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: mobile-refresh-spin .9s linear infinite; }
 @media (prefers-reduced-motion: reduce) {
   .mobile-refresh[aria-busy="true"] .mobile-refresh-icon, .mobile-refresh-spinner { animation: none; }
-  .mobile-project-running[data-state="running"] i { animation: none; }
 }
 
 /* ── 项目卡片拖拽排序（按住浮起 → 跟着手指走 → 邻居让位）────────────────────────
@@ -1312,7 +1313,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 桌面浏览器打开 /mobile 时也给个像样的光标（触摸端无感）。 */
 body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 
-/* 「按住项目卡片可拖动排序」：只在没成功拖过一次时出现，拖成一次就永久收起。 */
+/* 「长按磁贴可拖动换位」：只在没成功拖过一次时出现，拖成一次就永久收起。 */
 .mobile-project-drag-hint { margin: -2px 0 10px; color: #7b9187; font-size: 12px; line-height: 1.45; }
 
 /* 配对状态行：沿用"刷新结果条"的视觉语言（同一页里"流程结果"长得一样）。
@@ -1452,7 +1453,10 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
    ② 顶栏保持"一行标题 + ⋯"，当前电脑只在 ⋯ 菜单里点名；③ "离线"和"绑定已失效"
    （被另一台手机顶替）必须分开说 —— 后者点一下是连不上的（见 `deviceStatusText`）。
 
-   这张卡与项目卡同族：圆角 12px / 内边距 14px / 图标块直接复用 `.mobile-project-mark`。
+   这张卡沿用单列项目卡时代的视觉口径（圆角 12px / 内边距 14px）；项目卡 2026-10-11 改成
+   两列磁贴后升到 14px 圆角 / 12px 内边距，两边**有意不再对齐** —— 设备卡是横排单行、
+   磁贴是竖排小块，各自的圆角/内距跟着自己的形态走。图标块仍直接复用 `.mobile-project-mark`
+   （44px / 13px 圆角 / 窄屏自动降 40px），环境配色只此一份。
    卡片高度由 44px 图标块决定（真实页面实测 74px）；**长电脑名两行时会涨到 92px，且「在线」
    胶囊会跟着文字流落到第二行末** —— 那是文本流的必然结果，不是错位，别去"修"它。 */
 

@@ -183,3 +183,29 @@ test("减弱动效偏好下不播浮起过渡", () => {
   assert.match(sharedStyles, /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.card-drag-ghost-inner\s*\{\s*transition:\s*none;\s*\}\s*\}/);
   assert.match(hook, /prefers-reduced-motion: reduce/);
 });
+
+test("「选择项目」是两列磁贴网格（C2 状态染色，2026-10-11）", () => {
+  // 卡片包在网格容器里：lib 用 grid.querySelectorAll 找卡片，多一层容器照样是后代，落点几何不受影响。
+  assert.match(mobile, /<div className="mobile-project-grid">\{orderedProjects\.map\(\(item\) => </);
+  assert.match(mobileStyles, /\.mobile-project-grid\s*\{\s*display:\s*grid;\s*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
+  // 运行中的磁贴整块染色 + 右上角环点：两列网格里靠余光找“哪个活着”。
+  assert.match(mobileStyles, /\.mobile-project-choice\[data-running="true"\]\s*\{[^}]*border-color:\s*#bfe3d3;/);
+  assert.match(mobileStyles, /\.mobile-project-live\s*\{[^}]*position:\s*absolute;/);
+  assert.match(mobileCode, /data-running=\{running \? "true" : "false"\}/);
+  // 状态必须是文字（运行中/未运行），不许退化成只有圆点 —— 三态纪律。
+  assert.match(mobileCode, /\{running \? "运行中" : "未运行"\}/);
+  // 分支单独一行、等宽字体。
+  assert.match(mobileCode, /className="mobile-project-branch"/);
+  assert.match(mobileStyles, /\.mobile-project-branch\s*\{[^}]*font-family:\s*ui-monospace/);
+  // 环境名从可见文字退成了图标块，读屏用户的信息不能跟着丢：aria-label 必须拼上环境。
+  // title 不进可访问名称、触屏也不可达，不能当兜底算数。
+  assert.match(mobileCode, /aria-label=\{\`\$\{item\.name\}，\$\{environmentLabel\}/);
+});
+
+test("磁贴化之后单列卡的旧结构不许残留（残留 = 第二份口径）", () => {
+  assert.doesNotMatch(mobileStyles, /\.mobile-project-choice-content|\.mobile-project-choice-head|\.mobile-project-choice-chevron/);
+  assert.doesNotMatch(mobileCode, /mobile-project-choice-content|mobile-project-choice-head|mobile-project-choice-chevron/);
+  // 旧的胶囊点（<i>）随纯文字状态一起退役；角点是 .mobile-project-live，不再依赖动画。
+  assert.doesNotMatch(mobileStyles, /mobile-project-running-pulse/);
+  assert.match(mobileStyles, /\.mobile-project-running\s*\{[^}]*color:\s*#74867f;/);
+});

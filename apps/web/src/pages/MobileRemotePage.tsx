@@ -1063,7 +1063,7 @@ async function consumeMobileEventStream(url: string, token: string, lastEventID:
   }
 }
 
-/** 「选择项目」里的一张卡片。浮起的那张复用同一份标记 —— 两处各写一遍迟早会长歪。 */
+/** 「选择项目」里的一张磁贴（两列网格）。浮起的那张复用同一份标记 —— 两处各写一遍迟早会长歪。 */
 function MobileProjectChoice({ item, busy, open, isDragSlot = false, ghost = false }: {
   item: Project;
   busy: boolean;
@@ -1077,7 +1077,20 @@ function MobileProjectChoice({ item, busy, open, isDragSlot = false, ghost = fal
   const running = item.running === true;
   const environmentLabel = projectEnvironmentLabel(environment);
   const branch = item.gitBranch || "默认分支";
-  return <button type="button" className={`mobile-project-choice${isDragSlot ? " is-drag-slot" : ""}`} data-card-id={ghost ? undefined : item.id} aria-hidden={ghost || undefined} tabIndex={ghost ? -1 : undefined} onClick={ghost ? undefined : () => void open(item)} disabled={ghost ? undefined : busy}><span className={`mobile-project-mark ${environment}`} aria-hidden="true"><ProjectEnvironmentIcon environment={environment} /></span><span className="mobile-project-choice-content"><span className="mobile-project-choice-head"><strong title={item.name}>{item.name}</strong><span className="mobile-project-running" data-state={running ? "running" : "idle"}><i></i>{running ? "运行中" : "未运行"}</span></span><small className="mobile-project-choice-meta" title={`${environmentLabel} · ${branch}`}>{`${environmentLabel} · ${branch} · ${item.tasks.length} 个任务 · ${item.conversations?.length || 0} 个会话`}</small></span><span className="mobile-project-choice-chevron" aria-hidden="true">›</span></button>;
+  // 环境名不再单独占一行（磁贴太窄），由图标块的颜色/图形承载。但 title 不进可访问名称、
+  // 触屏上也不可达 —— 环境信息必须拼进 aria-label，否则读屏用户丢掉“这是哪台机器”这一要素。
+  return <button type="button" className={`mobile-project-choice${isDragSlot ? " is-drag-slot" : ""}`} data-card-id={ghost ? undefined : item.id} data-running={running ? "true" : "false"} aria-hidden={ghost || undefined} tabIndex={ghost ? -1 : undefined} onClick={ghost ? undefined : () => void open(item)} disabled={ghost ? undefined : busy} aria-label={`${item.name}，${environmentLabel}，${branch}，${running ? "运行中" : "未运行"}，${item.tasks.length} 个任务，${item.conversations?.length || 0} 个会话`} title={`${item.name} · ${environmentLabel}`}>
+    <span className={`mobile-project-mark ${environment}`} aria-hidden="true"><ProjectEnvironmentIcon environment={environment} /></span>
+    <strong title={item.name}>{item.name}</strong>
+    <code className="mobile-project-branch" title={branch}>{branch}</code>
+    {/* 运行状态保留文字而不只给一个圆点：它是“现在能不能连上去”的唯一先验；
+        染色交给整块磁贴（见 .mobile-project-choice[data-running]），状态行只管把话说清楚。 */}
+    <small className="mobile-project-choice-meta"><span className="mobile-project-running" data-state={running ? "running" : "idle"}>{running ? "运行中" : "未运行"}</span><span> · {item.tasks.length} 任务 · {item.conversations?.length || 0} 会话</span></small>
+    {/* 运行中的磁贴给右上角一颗静态环点：两列网格里要靠余光找“哪个活着”。
+        刻意不做动画 —— 整块底色差异已经把状态说了，再动就是两处信号抢注意力，
+        prefers-reduced-motion 也少一条要显式降级的规则。 */}
+    {running && <span className="mobile-project-live" aria-hidden="true"></span>}
+  </button>;
 }
 
 export default function MobileRemotePage() {
@@ -5799,7 +5812,7 @@ export default function MobileRemotePage() {
     {/* `!showPairingStart`：首启（还没有任何电脑）时这一段整块不渲染 —— 那时 projects 必然为空，
         留在屏上就是"「选择项目」+ 一行『暂无项目或电脑尚未同步』"的空标题，而上面那张空态卡
         已经把"接下来该干什么"说清楚了。拖拽排序也要它（没有卡片就没有顺序可排）。 */}
-    {mobileApp && mobileView === "projects" && !showPairingStart && <><section className="mobile-project-picker" ref={projectPickerRef} onPointerDown={onProjectPointerDown}><div className="mobile-section-heading"><h2>选择项目</h2><span>{snapshot ? `${projects.length} 个项目` : "加载中"}</span></div>{dragHint && orderedProjects.length > 1 && <p className="mobile-project-drag-hint">按住项目卡片可拖动排序</p>}{projects.length === 0 ? <p className="mobile-empty">暂无项目或电脑尚未同步。</p> : orderedProjects.map((item) => <MobileProjectChoice key={item.id} item={item} busy={busy} isDragSlot={draggingProjectId === item.id} open={openMobileProject} />)}</section>{draggingProject && <div className={`card-drag-ghost${projectLifted ? " is-lifted" : ""}`} ref={projectDragGhostRef} aria-hidden="true"><div className="card-drag-ghost-inner"><MobileProjectChoice item={draggingProject} busy={false} open={openMobileProject} ghost /></div></div>}</>}
+    {mobileApp && mobileView === "projects" && !showPairingStart && <><section className="mobile-project-picker" ref={projectPickerRef} onPointerDown={onProjectPointerDown}><div className="mobile-section-heading"><h2>选择项目</h2><span>{snapshot ? `${projects.length} 个项目` : "加载中"}</span></div>{dragHint && orderedProjects.length > 1 && <p className="mobile-project-drag-hint">长按磁贴可拖动换位</p>}{projects.length === 0 ? <p className="mobile-empty">暂无项目或电脑尚未同步。</p> : <div className="mobile-project-grid">{orderedProjects.map((item) => <MobileProjectChoice key={item.id} item={item} busy={busy} isDragSlot={draggingProjectId === item.id} open={openMobileProject} />)}</div>}</section>{draggingProject && <div className={`card-drag-ghost${projectLifted ? " is-lifted" : ""}`} ref={projectDragGhostRef} aria-hidden="true"><div className="card-drag-ghost-inner"><MobileProjectChoice item={draggingProject} busy={false} open={openMobileProject} ghost /></div></div>}</>}
     {/* 解绑是不可逆动作（云端吊销这台手机的令牌），复用任务弹层那一套视觉，不另造一套。 */}
     {confirmUnbind && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-unbind-title"><section className="mobile-task-modal mobile-task-delete-modal"><header><h2 id="mobile-unbind-title">解除绑定</h2><button type="button" onClick={() => setConfirmUnbind("")} disabled={busy} aria-label="关闭">×</button></header><p>这台手机将失去对「{deviceDisplayName({ alias: confirmUnbindRecord?.alias || "", name: confirmUnbindRecord?.name || instance?.name || "当前电脑" })}」的访问权限，需要重新扫码配对才能恢复。</p><footer><button type="button" onClick={() => setConfirmUnbind("")} disabled={busy}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmUnbindDevice()} disabled={busy}>确认解除</button></footer></section></div>}
     {/* 强制停止确认。出现的条件是电脑端回了一句"这条对话还有排队中或执行中的请求"
@@ -5844,8 +5857,9 @@ export default function MobileRemotePage() {
               <small>{deviceStatusText(item)}</small></span>
             {/* 失效的那台不给"在线/离线"标签：它的状态是"要重新配对"，两者混淆会让人以为点一下就能连上。 */}
             <span className={`mobile-device-tag${!item.revoked && item.status === "online" ? " is-online" : ""}`}>{item.revoked ? "需重新配对" : item.status === "online" ? "在线" : "离线"}</span>
-            {/* 当前那台给 ✓；其余**未失效**的给一个 ›（和项目卡同一套"可进入"语言）——
-                否则除了当前那行，用户看不出别的行能点。失效那行不给，它点不动。 */}
+            {/* 当前那台给 ✓；其余**未失效**的给一个 ›，给一行「可进入」的暗示（项目磁贴窄，
+                容不下这颗箭头，所以只有设备行有）—— 否则除了当前那行，用户看不出别的行能点。
+                失效那行不给，它点不动。 */}
             {item.token === token
               ? <span className="mobile-device-tick" aria-hidden="true">✓</span>
               : !item.revoked && <span className="mobile-device-chevron" aria-hidden="true">›</span>}
