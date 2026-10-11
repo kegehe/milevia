@@ -146,3 +146,16 @@ export const statusColors: Record<RunStatus, string> = {
 	stopping: '#f59e0b',
 	failed: '#ef4444',
 };
+
+// 开发进程运行时长的展示口径（项目卡状态色带用，数据源是 runStartedAt）。
+// 只认合法且不早于未来的时间；向上取整到分钟，满 1 小时换算成「X 小时 Y 分钟」。
+// 时间非法或在未来时返回空串——「算不出」不许伪装成「刚运行 1 分钟」。
+export function runDurationLabel(startedAt: string, now: number = Date.now()): string {
+	const started = Date.parse(startedAt);
+	if (Number.isNaN(started) || started > now) return '';
+	const minutes = Math.max(1, Math.round((now - started) / 60_000));
+	if (minutes < 60) return `已运行 ${minutes} 分钟`;
+	const hours = Math.floor(minutes / 60);
+	const rest = minutes % 60;
+	return rest === 0 ? `已运行 ${hours} 小时` : `已运行 ${hours} 小时 ${rest} 分钟`;
+}

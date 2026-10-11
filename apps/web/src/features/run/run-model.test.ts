@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { createRunCommand, isRunnableCommand, renameEnvironmentVariable, runCommandLabel, runLogPresentation, runLogText, selectedRunCommand, withRunCommands, type RunConfig } from "./run-model.ts";
+import { createRunCommand, isRunnableCommand, renameEnvironmentVariable, runCommandLabel, runDurationLabel, runLogPresentation, runLogText, selectedRunCommand, withRunCommands, type RunConfig } from "./run-model.ts";
 
 function baseConfig(overrides: Partial<RunConfig> = {}): RunConfig {
 	return { workDir: "", command: "", envVars: {}, executionTarget: "auto", commands: [], selectedCommandId: "", ...overrides };
@@ -150,4 +150,18 @@ test("reserves room for semantic labels and lets their colors override stderr", 
 	assert.ok(styles.indexOf(".run-log-line.stderr .run-log-stream") < styles.indexOf(".run-log-line.is-warning .run-log-stream"));
 	assert.ok(styles.indexOf(".run-log-line.stderr .run-log-stream") < styles.indexOf(".run-log-line.is-info .run-log-stream"));
 	assert.match(styles, /\.run-log-line\.is-error \.run-log-stream\s*\{/);
+});
+
+test("runDurationLabel 按分钟向上取整，满一小时换算成小时", () => {
+	const now = Date.parse("2026-10-10T12:00:00Z");
+	assert.equal(runDurationLabel("2026-10-10T11:59:30Z", now), "已运行 1 分钟");
+	assert.equal(runDurationLabel("2026-10-10T11:57:00Z", now), "已运行 3 分钟");
+	assert.equal(runDurationLabel("2026-10-10T10:00:00Z", now), "已运行 2 小时");
+	assert.equal(runDurationLabel("2026-10-10T10:02:00Z", now), "已运行 1 小时 58 分钟");
+});
+
+test("runDurationLabel 对非法或未来的时间返回空串（算不出不许伪装成刚运行）", () => {
+	const now = Date.parse("2026-10-10T12:00:00Z");
+	assert.equal(runDurationLabel("not-a-time", now), "");
+	assert.equal(runDurationLabel("2026-10-10T12:00:01Z", now), "");
 });

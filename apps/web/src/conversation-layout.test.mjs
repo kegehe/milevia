@@ -307,6 +307,28 @@ test("conversation entries keep card styles separate from their layout and align
   assert.match(conversationContentStyles, /@media \(max-width: 820px\)[\s\S]*?\.chat-center > \.timeline\s*\{[^}]*padding:\s*20px\s+16px\s+max\(32px,\s*var\(--composer-height,\s*0px\)\)\s+16px;/s);
 });
 
+test("用户消息圆点轨：悬浮预览、点击跳转、当前态随视口高亮", () => {
+  // 结构：圆点轨是 chat-center 里的独立组件，渲染在滚动按钮之前；没有用户消息时不渲染。
+  assert.match(conversationPage, /const UserMessageDotsRail = memo\(function UserMessageDotsRail\(/);
+  assert.match(conversationPage, /<UserMessageDotsRail messages=\{userMessages\} activeIndex=\{userMessageNavigationIndex\} onJump=\{scrollToUserMessage\} \/>/);
+  assert.match(conversationPage, /if \(messages\.length === 0\) return null;/);
+  // 当前态判据唯一：圆点高亮直接吃 userMessageNavigationIndex，不在圆点轨里重算视口位置。
+  assert.match(conversationPage, /className=\{`message-dot-btn\$\{index === activeIndex \? " active" : ""\}`\}/);
+  // 交互：点击圆点复用 scrollToUserMessage；预览卡 = 序号 · 时间（formatTime）+ 消息本体摘要。
+  assert.match(conversationPage, /onClick=\{\(\) => onJump\(index\)\}/);
+  assert.match(conversationPage, /第 \{previewIndex \+ 1\} 条 · \{formatTime\(previewMessage\.createdAt\)\}/);
+  assert.match(conversationPage, /<span className="message-dots-preview-body">\{previewMessage\.content\}<\/span>/);
+  // 布局：圆点轨叠加在 timeline 行右缘，本体不接收指针（不挡时间线）；轨道消息多时内部自滚动。
+  assert.match(stylesheet, /\.message-dots-wrap\s*\{[^}]*grid-row:\s*2;[^}]*position:\s*absolute;[^}]*inset:\s*0;[^}]*pointer-events:\s*none;/s);
+  assert.match(stylesheet, /\.message-dots\s*\{[^}]*overflow-y:\s*auto;[^}]*scrollbar-width:\s*none;/s);
+  // 底部必须避开滚动按钮组（占 row2 底部约 164px），消息多时圆点不许落到按钮面板背后。
+  assert.match(stylesheet, /\.message-dots\s*\{[^}]*bottom:\s*176px;/s);
+  // 预览卡必须自己恢复 pointer-events（wrap 是 none 且该属性继承），否则移上去就关闭、点击跳转失效。
+  assert.match(stylesheet, /\.message-dots-preview\s*\{[^}]*position:\s*absolute;[^}]*right:\s*36px;[^}]*pointer-events:\s*auto;/s);
+  // 窄屏触屏没有悬浮场景，且已有上一条/下一条按钮：整列收起。
+  assert.match(stylesheet, /@media \(max-width: 820px\)\s*\{\s*\.message-dots-wrap\s*\{\s*display:\s*none;\s*\}\s*\}/);
+});
+
 test("desktop canvas uses three working columns without a page inset", () => {
   assert.match(workspaceStyles, /\.conversation-canvas\s*\{[^}]*width:\s*100%;[^}]*grid-template-columns:\s*minmax\(260px,\s*300px\)\s+minmax\(440px,\s*1fr\)\s+minmax\(280px,\s*340px\);[^}]*margin:\s*0;/s);
   assert.match(conversationPage, /<aside className="quick-tag-rail"[\s\S]*?<section className="chat-center"[^>]*>\s*<ConversationTabStrip[\s\S]*?<section className="timeline"[\s\S]*?<aside className="task-queue-rail"/);
