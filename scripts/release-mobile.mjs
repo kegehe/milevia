@@ -9,15 +9,16 @@
 //   node scripts/release-mobile.mjs --bump-only 0.1.6      # 只同步 Android 版本号
 //   node scripts/release-mobile.mjs 0.1.6 "…" --no-build   # 复用已有 APK，只更新清单
 //   node scripts/release-mobile.mjs 0.1.6 "…" --deploy     # 上传：自建更新源 + GitHub Release 资产
+//   node scripts/release-mobile.mjs 0.1.6 "…" --allow-debug # 仅本机内测，允许 debug 签名
 //
 // 环境变量：
 //   MILEVIA_DOWNLOAD_BASE  自建源清单里 APK 的下载基地址（默认自建服务器
 //                          https://keyanjia.info:8443/updates）
 //   MILEVIA_DEPLOY_TARGET  --deploy 的 scp 目标（如 root@host:/var/www/milevia/dist/updates/）
 //   MILEVIA_ANDROID_KEYSTORE / _PASSWORD / _KEY_ALIAS / _KEY_PASSWORD
-//                           Android 正式签名（可选）。也可放 apps/web/android/keystore.properties。
-//                           两者都没有时回退 debug 签名 —— 注意 debug 签名只在同一台机器上
-//                           有效，换机器后新包无法覆盖安装，需要先卸载（手机上会丢配对令牌）。
+//                           Android 正式签名。也可放 apps/web/android/keystore.properties。
+//                           缺失时仅可显式加 --allow-debug 生成本机内测包；--deploy 一律拒绝
+//                           debug 签名，避免用户无法覆盖安装正式版本。
 //
 // 清单会写两份，下载地址分别指向两个能真正下到包的地方（见 scripts/lib/update-manifest.mjs）：
 //   release/updates/latest.json → 自建源（传到服务器的 /updates/），国内快，主用路径
@@ -54,6 +55,7 @@ const args = process.argv.slice(2);
 const bumpOnly = args.includes("--bump-only");
 const noBuild = args.includes("--no-build");
 const deploy = args.includes("--deploy");
+const allowDebug = args.includes("--allow-debug");
 const positional = args.filter((a) => !a.startsWith("--"));
 
 if (positional.length < 1) {
@@ -70,6 +72,60 @@ if (!/^\d+\.\d+\.\d+$/.test(nextVersion)) {
 /* ── 1. 升 Android 版本号 ────────────────────────────────── */
 const gradleFile = join(androidDir, "app/build.gradle");
 const gradleSource = readFileSync(gradleFile, "utf8");
+
+function readKeystoreProperties(file) {
+  const values = new Map();
+  for (const rawLine of readFileSync(file, "utf8").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith("!")) continue;
+    const separator = line.search(/[=:]/);
+    if (separator <= 0) continue;
+    values.set(line.slice(0, separator).trim(), line.slice(separator + 1).trim());
+  }
+  return values;
+}
+
+function resolveReleaseSigning() {
+  const propertiesFile = join(androidDir, "keystore.properties");
+  const requiredKeys = ["storeFile", "storePassword", "keyAlias", "keyPassword"];
+  if (existsSync(propertiesFile)) {
+    const values = readKeystoreProperties(propertiesFile);
+    const missing = requiredKeys.filter((key) => !values.get(key));
+    if (missing.length > 0) {
+      throw new Error(`Android 正式签名配置不完整，${propertiesFile} 缺少：${missing.join(", ")}`);
+    }
+    const storeFile = resolve(androidDir, "app", values.get("storeFile"));
+    if (!existsSync(storeFile)) {
+      throw new Error(`Android 正式签名文件不存在：${storeFile}`);
+    }
+    return true;
+  }
+
+  const envKeys = {
+    storeFile: "MILEVIA_ANDROID_KEYSTORE",
+    storePassword: "MILEVIA_ANDROID_KEYSTORE_PASSWORD",
+    keyAlias: "MILEVIA_ANDROID_KEY_ALIAS",
+    keyPassword: "MILEVIA_ANDROID_KEY_PASSWORD",
+  };
+  const configured = Boolean(process.env[envKeys.storeFile]?.trim());
+  if (!configured) return false;
+  const missing = Object.values(envKeys).filter((key) => !process.env[key]?.trim());
+  if (missing.length > 0) {
+    throw new Error(`Android 正式签名环境变量不完整，缺少：${missing.join(", ")}`);
+  }
+  if (!existsSync(process.env[envKeys.storeFile])) {
+    throw new Error(`Android 正式签名文件不存在：${process.env[envKeys.storeFile]}`);
+  }
+  return true;
+}
+
+const hasKeystore = bumpOnly ? false : resolveReleaseSigning();
+if (!bumpOnly && !hasKeystore && deploy) {
+  throw new Error("--deploy 必须使用 Android 正式签名。请配置 keystore.properties 或 MILEVIA_ANDROID_KEYSTORE 等四个环境变量。");
+}
+if (!bumpOnly && !hasKeystore && !allowDebug) {
+  throw new Error("未配置 Android 正式签名。正式发包请配置 keystore.properties 或环境变量；仅本机内测请显式加 --allow-debug。");
+}
 // 锚定行首，避免把注释里出现的 versionCode 之类文本当成真值（桌面脚本已踩过这个坑）。
 const codeMatch = gradleSource.match(/^[ \t]*versionCode\s+(\d+)/m);
 const nameMatch = gradleSource.match(/^[ \t]*versionName\s+"([^"]+)"/m);
@@ -96,8 +152,6 @@ if (bumpOnly) {
 }
 
 /* ── 2. 构建 APK ─────────────────────────────────────────── */
-const hasKeystore =
-  existsSync(join(androidDir, "keystore.properties")) || Boolean(process.env.MILEVIA_ANDROID_KEYSTORE);
 const buildType = hasKeystore ? "release" : "debug";
 const gradleTask = hasKeystore ? "assembleRelease" : "assembleDebug";
 if (!hasKeystore) {

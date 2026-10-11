@@ -2211,7 +2211,7 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   const readAppInfoFn = mobileUpdateLib.match(/export async function readMobileAppInfo\(\)[\s\S]*?\n\}/)?.[0] ?? "";
   assert.match(readAppInfoFn, /^export async function readMobileAppInfo\(\): Promise<MobileAppInfo \| null> \{[\s\S]*?if \(!Capacitor\.isNativePlatform\(\)\) return null;/);
   assert.match(readAppInfoFn, /catch \{[\s\S]*?return null;/);
-  assert.match(androidReleaseLib, /export function formatAppVersion\(version: string, build\?: string\): string \{/);
+  assert.match(androidReleaseLib, /export function formatAppVersion\(version: string\): string \{/);
   // 样式：它是**信息行**，不是菜单项 —— 不能进 `.mobile-header-menu-sheet button` 那条
   // min-height: 44 的规则（点不动的东西给 44 会让人以为可以点）。
   assert.doesNotMatch(page, /appVersionLabel|mobile-header-menu-version/);

@@ -152,7 +152,7 @@ export default function SettingsPage() {
       setMobileNotificationPermission(status.display === "granted" ? "granted" : status.display === "denied" ? "denied" : "default");
     }).catch(() => setMobileNotificationPermission("unsupported"));
     void readMobileAppInfo().then((info) => {
-      if (info) setMobileVersion(formatAppVersion(info.version, info.build));
+      if (info) setMobileVersion(formatAppVersion(info.version));
     });
   }, [nativeNotificationsAvailable]);
   const tabsRef = useRef<HTMLDivElement | null>(null);

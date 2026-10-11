@@ -82,6 +82,57 @@ function readCargoVersion(file) {
   return match ? match[1] : null;
 }
 
+function hasAgentCloudUrl() {
+  if (process.env.MILEVIA_CLOUD_URL?.trim()) return true;
+  const agentEnv = join(repoRoot, "apps/agent/.env.windows");
+  if (!existsSync(agentEnv)) return false;
+  return readFileSync(agentEnv, "utf8").split(/\r?\n/).some((rawLine) => {
+    const line = rawLine.trim();
+    return /^MILEVIA_CLOUD_URL\s*=\s*\S+/.test(line);
+  });
+}
+
+function assertDesktopBuildPrerequisites() {
+  if (!hasAgentCloudUrl()) {
+    throw new Error("桌面端发布需要 MILEVIA_CLOUD_URL。请设置环境变量，或在 apps/agent/.env.windows 中配置该公开地址。");
+  }
+  const env = buildEnv();
+  if ((env.CGO_ENABLED ?? "").trim() === "0") {
+    throw new Error("桌面端 sidecar 需要 CGO_ENABLED=1，当前为 0。");
+  }
+  let compiler = "";
+  try {
+    compiler = execFileSync("go", ["env", "CC"], { encoding: "utf8", env }).trim();
+    if (!compiler) throw new Error("empty compiler");
+    execFileSync(compiler, ["--version"], { env, stdio: "ignore" });
+  } catch {
+    throw new Error("桌面端 sidecar 需要可运行的 C 编译器。请安装 gcc/mingw-w64，并确保它能被 go env CC 找到。");
+  }
+  return env;
+}
+
+function assertDesktopReleasePrerequisites() {
+  if (deploy && !process.env.MILEVIA_DEPLOY_TARGET) {
+    throw new Error("--deploy 需要设置 MILEVIA_DEPLOY_TARGET（scp 目标目录，例如 root@host:/var/www/milevia/dist/updates/）");
+  }
+  const privkey = process.env.MILEVIA_PRIVKEY || join(HOME, ".tauri", "milevia-updater.key");
+  const passfile = process.env.MILEVIA_PASSFILE || join(HOME, ".tauri", "milevia-updater-password.txt");
+  if (!existsSync(privkey)) throw new Error(`找不到私钥：${privkey}`);
+  if (!existsSync(passfile)) throw new Error(`找不到口令文件：${passfile}`);
+  const tauriCli = join(repoRoot, "apps/desktop/node_modules/@tauri-apps/cli/tauri.js");
+  if (!existsSync(tauriCli)) throw new Error(`找不到 tauri CLI 入口：${tauriCli}`);
+
+  if (!noBuild) return assertDesktopBuildPrerequisites();
+  const productName = readJson(tauriConf).productName ?? "Milevia";
+  const installer = join(repoRoot, "apps/desktop/src-tauri/target/release/bundle/nsis", `${productName}_${nextVersion}_x64-setup.exe`);
+  if (!existsSync(installer)) {
+    throw new Error(`未找到安装包：${installer}\n请确认已执行 build（或去掉 --no-build）。`);
+  }
+  return null;
+}
+
+const releaseBuildEnv = bumpOnly ? null : assertDesktopReleasePrerequisites();
+
 /* ── 1. 校验当前三处版本一致，然后一起升到新版本 ─────────── */
 const current = {
   tauriConf: readJson(tauriConf).version,
@@ -124,7 +175,7 @@ if (!noBuild) {
     stdio: "inherit",
     // Windows 下 pnpm 是 .cmd shim，需经 shell 才能被 Node 解析到。
     shell: process.platform === "win32",
-    env: buildEnv(),
+    env: releaseBuildEnv,
   });
 }
 
@@ -309,7 +360,7 @@ function buildEnv() {
       env[pathKey] = found + (currentPath ? sep + currentPath : "");
     }
   }
-  const gcc = execFileSync("go", ["env", "CC"], { encoding: "utf8" }).trim();
+  const gcc = execFileSync("go", ["env", "CC"], { encoding: "utf8", env }).trim();
   if (!gcc) {
     console.warn("〔警告〕未解析到 C 编译器（go env CC 为空），go-sqlite3 将无法编译，见 build-sidecar.mjs 的报错。");
   }
