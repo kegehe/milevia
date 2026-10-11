@@ -9,7 +9,7 @@ import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import NotificationCenter from "../components/NotificationCenter";
 import type { Project, ProjectFilter, ProjectStatus } from "../lib/types";
 import type { RunStatus } from "../features/run/run-model";
-import { statusColors, statusLabels } from "../features/run/run-model";
+import { statusColors, statusLabels, runDurationLabel } from "../features/run/run-model";
 import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order";
 import { literalNameClass } from "../lib/utils";
 import { AppVersionTag } from "../features/updater/AppVersionTag";
@@ -178,12 +178,11 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
     </header>
     <section className="project-dashboard command-dashboard">
       <header className="dashboard-intro">
-        <div><h1>项目<em>总览</em></h1></div>
+        <div className="dashboard-intro-heading"><h1>项目<em>总览</em></h1><p className="dashboard-subline">{`共 ${projects.length} 个项目 · 状态实时同步`}</p></div>
         <div className="dashboard-summary" aria-label="按项目状态筛选">
-          {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><small>{item.label}</small><b>{item.count}</b></button>)}
+          {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><b>{item.count}</b><small>{item.label}</small></button>)}
         </div>
       </header>
-      <div className="dashboard-divider"><span>项目列表</span><i></i>{filter !== "all" && <small>{`显示${filters.find((item) => item.id === filter)?.label}项目`}</small>}</div>
       {projects.length === 0 ? <div className="empty"><h2>还没有项目</h2><p>加载一个本地目录后，即可在这里开始 AI 工具对话。</p><button className="primary" onClick={() => navigate("/projects/import")}>加载项目</button></div>
         : filteredProjects.length === 0 ? (() => {
           const current = filters.find((item) => item.id === filter);
@@ -196,17 +195,19 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
             <button className="primary" type="button" onClick={() => setFilter("all")}>查看全部项目</button>
           </div>;
         })()
-          : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
+          : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} runStartedAt={processStatuses[item.id]?.runStartedAt ?? null} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
+      {filteredProjects.length > 0 && <footer className="dashboard-footnote">拖拽卡片可调整顺序 · 状态每 30 秒自动刷新，事件到达时即时更新</footer>}
     </section>
     {isDesktop() && <div className="dashboard-version"><AppVersionTag /></div>}
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} status={projectStatuses[deleteTarget.id]} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
   </main>;
 }
 
-function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isDropTarget }: {
+function ProjectCard({ project, status, runStatus, runStartedAt, open, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isDropTarget }: {
   project: Project;
   status?: ProjectStatus;
   runStatus: RunStatus;
+  runStartedAt?: string | null;
   open: () => void;
   onDelete: () => void;
   onDragStart: (event: DragEvent, id: string) => void;
@@ -229,29 +230,37 @@ function ProjectCard({ project, status, runStatus, open, onDelete, onDragStart, 
   const dragClass = isDragging ? " dragging" : isDropTarget ? " drop-target" : "";
   // 目录名含下划线：标题改等宽渲染，避免 `_` 被正文无衬线字体弱化成“看起来像空格”。
   const nameLiteral = literalNameClass(project.name);
-  // 开发进程状态点徽标：已停止（进程未启动是常态）不显示，仅可视化进行中的状态。
-  const runStatusLabel = runStatus !== "stopped" ? statusLabels[runStatus] : null;
+  // 开发进程状态的可视化分工：running 且能算出时长 → 色带右侧展示「进程已运行 X 分钟」；
+  // 其余情况（启动中/停止中/失败/时长算不出）回退终端小徽标——运行中的事实不许双双消失。
+  const runDuration = runStatus === "running" && runStartedAt ? runDurationLabel(runStartedAt) : "";
+  const runBadgeVisible = runStatus !== "stopped" && !runDuration;
   return <article className={`project-card task-card state-${stateClass}${dragClass}`} draggable onClick={open}
     onDragStart={(event) => onDragStart(event, project.id)}
     onDragOver={(event) => onDragOver(event, project.id)}
     onDrop={(event) => onDrop(event, project.id)}
     onDragEnd={onDragEnd}>
     <button className="project-card-open" type="button" draggable={false} onClick={(event) => { event.stopPropagation(); open(); }} aria-label={`进入 ${project.name} 的对话`} />
-    <div className="project-card-top">
-      <span className="project-mark">{project.name.slice(0, 1).toUpperCase()}</span>
-      <span className="project-card-top-actions">
-        <span className={`project-state ${stateClass}`}><i></i>{state}</span>
-        {analyzing && <span className="project-analysis-badge" title={analysisTitle}><i></i>优化建议分析中</span>}
-        {runStatusLabel && <span className={`project-run-state run-state-${runStatus}`} title={`开发进程: ${statusLabels[runStatus]}`}><svg className="project-run-state-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 3.5 6 8l-4.5 4.5M7.5 12.5h7" /></svg><i style={{ background: statusColors[runStatus] }}></i>{runStatusLabel}</span>}
-        {project.environment === "windows" && <span className="env-tag windows" title="Windows 项目" role="img" aria-label="Windows 项目"><WindowsEnvironmentIcon /></span>}
-        {project.environment === "remote-linux" && <span className="env-tag remote" title="远程服务器" role="img" aria-label="远程服务器"><RemoteServerIcon /></span>}
-        {project.environment === "wsl" && <span className="env-tag wsl" title="WSL 项目" role="img" aria-label="WSL 项目"><WslEnvironmentIcon /></span>}
-        <button className="project-card-delete" type="button" draggable={false} title="删除项目" onClick={(event) => { event.stopPropagation(); onDelete(); }} aria-label={`删除项目 ${project.name}`}>×</button>
-      </span>
+    <span className="project-mark" aria-hidden="true">{project.name.slice(0, 1).toUpperCase()}</span>
+    <div className="project-band">
+      <span className="project-band-status"><i></i>{state}</span>
+      {runDuration && <span className="project-band-duration" title="开发进程运行时长">{`进程${runDuration}`}</span>}
+      {project.environment === "windows" && <span className="project-band-env" title="Windows 项目" role="img" aria-label="Windows 项目"><WindowsEnvironmentIcon /></span>}
+      {project.environment === "remote-linux" && <span className="project-band-env" title="远程服务器项目" role="img" aria-label="远程服务器项目"><RemoteServerIcon /></span>}
+      {project.environment === "wsl" && <span className="project-band-env" title="WSL 项目" role="img" aria-label="WSL 项目"><WslEnvironmentIcon /></span>}
+      <button className="project-card-delete" type="button" draggable={false} title="删除项目" onClick={(event) => { event.stopPropagation(); onDelete(); }} aria-label={`删除项目 ${project.name}`}>×</button>
     </div>
-    <div className="project-card-title"><span>项目</span><h2 title={nameLiteral ? project.name : undefined} className={nameLiteral}>{project.name}</h2><p>{taskTitle}</p></div>
-    <div className="project-card-meta"><span><small>会话</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b className={literalNameClass(project.pathDisplay)}>{project.pathDisplay}</b></span></div>
-    <footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话<i>→</i></b></footer>
+    <div className="project-card-body">
+      <div className="project-card-title">
+        <div className="project-card-heading">
+          <h2 title={nameLiteral ? project.name : undefined} className={nameLiteral}>{project.name}</h2>
+          {analyzing && <span className="project-analysis-badge" title={analysisTitle}><i></i>优化建议分析中</span>}
+          {runBadgeVisible && <span className={`project-run-state run-state-${runStatus}`} title={`开发进程: ${statusLabels[runStatus]}`}><svg className="project-run-state-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 3.5 6 8l-4.5 4.5M7.5 12.5h7" /></svg><i style={{ background: statusColors[runStatus] }}></i>{statusLabels[runStatus]}</span>}
+        </div>
+        <p>{taskTitle}</p>
+      </div>
+      <div className="project-card-meta"><span><small>会话数</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b className={literalNameClass(project.pathDisplay)}>{project.pathDisplay}</b></span></div>
+      <footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话<i>→</i></b></footer>
+    </div>
   </article>;
 }
 

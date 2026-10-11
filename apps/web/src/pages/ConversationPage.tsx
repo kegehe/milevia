@@ -102,14 +102,81 @@ function ProjectConfigIcon() {
   return <svg className="conversation-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3.5 8 3v5.6c0 4.3-3 7.8-8 9.4-5-1.6-8-5.1-8-9.4V6.5l8-3Z" /><path d="M9 11.2 11 13.2 15.2 9" /></svg>;
 }
 
+// 滚动导航图标：统一 V 形笔画（stroke 走 .scroll-btn-icon 的 1.9 圆角描边）。
+// 顶部/底部用上下 V 形；上一条/下一条用左右 V 形表达「序列里前一条 / 后一条」。
 function ScrollNavigationIcon({ direction }: { direction: "top" | "previous" | "next" | "bottom" }) {
-  const edge = direction === "top" || direction === "bottom";
-  const up = direction === "top" || direction === "previous";
-  return <svg className="scroll-btn-icon" viewBox="0 0 24 24" aria-hidden="true">
-    {edge && <path d={up ? "M6 5.5h12" : "M6 18.5h12"} />}
-    <path d={up ? "M12 18V7M8.5 10.5 12 7l3.5 3.5" : "M12 6v11m-3.5-3.5L12 17l3.5-3.5"} />
-  </svg>;
+  const paths: Record<typeof direction, string> = {
+    top: "m7 14.2 5-4.7 5 4.7",
+    bottom: "m7 9.8 5 4.7 5-4.7",
+    previous: "M14.2 7 9.5 12l4.7 5",
+    next: "M9.8 7l4.7 5-4.7 5",
+  };
+  return <svg className="scroll-btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d={paths[direction]} /></svg>;
 }
+
+// 用户消息圆点轨：一条用户消息对应一个圆点，常驻时间线右缘。
+// 当前视口所在消息的圆点放大加深（判据直接用 userMessageNavigationIndex，不在此重算视口位置）；
+// 悬浮/聚焦弹出预览卡（序号 · 时间 · 内容摘要），点击复用 scrollToUserMessage 跳转。
+// 消息很多时轨道内部自滚动（隐藏滚动条），当前圆点变化时自动滚进可视范围，不影响时间线滚动。
+const UserMessageDotsRail = memo(function UserMessageDotsRail({ messages, activeIndex, onJump }: {
+  messages: Message[];
+  activeIndex: number;
+  onJump: (index: number) => void;
+}) {
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const dotRefs = useRef(new Map<string, HTMLButtonElement>());
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [previewTop, setPreviewTop] = useState(0);
+
+  const previewIndex = hoveredIndex !== null && hoveredIndex < messages.length ? hoveredIndex : null;
+  const previewMessage = previewIndex !== null ? messages[previewIndex] : null;
+
+  const showPreview = useCallback((index: number) => {
+    const dot = dotRefs.current.get(messages[index]?.id);
+    const wrap = wrapRef.current;
+    if (!dot || !wrap) return;
+    const dotRect = dot.getBoundingClientRect();
+    const wrapRect = wrap.getBoundingClientRect();
+    // 预览卡垂直对齐悬浮的圆点；贴近轨道两端时收进来，避免越出时间线。
+    const center = dotRect.top - wrapRect.top + dotRect.height / 2;
+    setPreviewTop(Math.min(Math.max(center, 34), Math.max(wrapRect.height - 34, 34)));
+    setHoveredIndex(index);
+  }, [messages]);
+
+  // 当前消息变化时，把对应圆点滚进轨道可视范围（只滚轨道自己，不碰时间线）。
+  useEffect(() => {
+    const rail = railRef.current;
+    const active = activeIndex >= 0 ? dotRefs.current.get(messages[activeIndex]?.id) : null;
+    if (!rail || !active) return;
+    if (active.offsetTop < rail.scrollTop + 8) rail.scrollTop = active.offsetTop - 16;
+    else if (active.offsetTop + active.offsetHeight > rail.scrollTop + rail.clientHeight - 8) rail.scrollTop = active.offsetTop + active.offsetHeight - rail.clientHeight + 16;
+  }, [activeIndex, messages]);
+
+  if (messages.length === 0) return null;
+  return (
+    <div className="message-dots-wrap" ref={wrapRef} onMouseLeave={() => setHoveredIndex(null)}>
+      <div className="message-dots" ref={railRef} role="navigation" aria-label="我的消息导航">
+        {messages.map((message, index) => (
+          <button key={message.id} type="button" ref={(el) => { if (el) dotRefs.current.set(message.id, el); else dotRefs.current.delete(message.id); }}
+            className={`message-dot-btn${index === activeIndex ? " active" : ""}`}
+            aria-label={`跳到第 ${index + 1} 条我的消息`}
+            aria-current={index === activeIndex ? "true" : undefined}
+            onMouseEnter={() => showPreview(index)}
+            onFocus={() => showPreview(index)}
+            onBlur={() => setHoveredIndex((current) => current === index ? null : current)}
+            onClick={() => onJump(index)}>
+            <span className="message-dot" />
+          </button>
+        ))}
+      </div>
+      {previewMessage && previewIndex !== null && <div className="message-dots-preview" style={{ top: `${previewTop}px` }} onClick={() => onJump(previewIndex)}>
+        <span className="message-dots-preview-meta">第 {previewIndex + 1} 条 · {formatTime(previewMessage.createdAt)}</span>
+        <span className="message-dots-preview-body">{previewMessage.content}</span>
+      </div>}
+    </div>
+  );
+});
 
 function ComposerActionIcon({ action }: { action: "clear" | "continue" | "send" | "schedule" }) {
   if (action === "clear") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 7 1 12h10l1-12M9 7V4.5h6V7M4.5 7h15M10 11v4.5M14 11v4.5" /></svg>;
@@ -3604,6 +3671,7 @@ export default function ConversationPage() {
         {run && <div className="run-indicator"><span></span>{runLabel}</div>}
         <div ref={bottom} />
       </section>
+      <UserMessageDotsRail messages={userMessages} activeIndex={userMessageNavigationIndex} onJump={scrollToUserMessage} />
       <div className={`scroll-buttons${hasNewContent ? " has-new" : ""}`}>
         <button type="button" className="scroll-btn scroll-to-top" title="回到顶部" aria-label="回到顶部" onClick={scrollToTop}><ScrollNavigationIcon direction="top" /></button>
         <button type="button" className="scroll-btn scroll-to-previous-message" title="上一条我的消息" aria-label="上一条我的消息" disabled={loadingOlderHistory || (userMessageNavigationIndex <= 0 && !hasMoreMessageHistory)} onClick={goToPreviousUserMessage}><ScrollNavigationIcon direction="previous" /></button>
