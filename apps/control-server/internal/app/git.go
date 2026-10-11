@@ -157,6 +157,7 @@ type GitRunner interface {
 	CommitDiff(context.Context, string, string, string, string) (string, error)
 	Branches(context.Context, string) ([]GitBranch, error)
 	Stage(context.Context, string, []string) error
+	StageAll(context.Context, string) error
 	Unstage(context.Context, string, []string) error
 	RestoreWorktree(context.Context, string, []string) error
 	RestoreAll(context.Context, string, []string) error
@@ -199,6 +200,13 @@ func (runner *gitCLIRunner) Stage(ctx context.Context, repo string, paths []stri
 		}
 	}
 	_, err := runner.backend.runGitPaths(ctx, repo, []string{"--literal-pathspecs", "add"}, paths)
+	return err
+}
+
+// StageAll uses Git's native all-path operation after the state token has
+// validated the current worktree, avoiding a large pathspec argument/file.
+func (runner *gitCLIRunner) StageAll(ctx context.Context, repo string) error {
+	_, err := runner.backend.runGit(ctx, repo, "--literal-pathspecs", "add", "-A", "--", ".")
 	return err
 }
 

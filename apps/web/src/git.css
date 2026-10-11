@@ -182,7 +182,7 @@
 .git-diff-placeholder-icon svg { width: 20px; height: 20px; }
 .git-diff-placeholder h3 { margin: 0; color: #355e51; font-size: 14px; }
 .git-diff-placeholder p { max-width: 280px; margin: 0; color: #84998f; font-size: 12px; line-height: 1.6; }
-.git-change-group { overflow: hidden; border: 1px solid #d5e4dc; border-radius: 7px; background: #fff; }
+.git-change-group { display: flex; min-height: 0; flex-direction: column; overflow: hidden; border: 1px solid #d5e4dc; border-radius: 7px; background: #fff; }
 .git-change-group > header { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px 9px 14px; border-bottom: 1px solid #e0ebe5; background: #f8fcf9; }
 .git-change-group h3 { margin: 0; color: #355e51; font-size: 13px; }
 .git-group-actions { display: flex; align-items: center; gap: 7px; }
@@ -192,7 +192,7 @@
 .git-icon-btn.danger:hover:not(:disabled) { border-color: #c98a7d; background: #ffe9e3; }
 .git-icon-btn.danger:disabled { color: #afbab4; border-color: #d5e0da; background: #f4f6f4; }
 
-.git-change-list { display: grid; }
+.git-change-list { display: grid; min-height: 0; max-height: min(42dvh, 480px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
 .git-change-list > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
 .git-change-list > div + div { border-top: 1px solid #e4ede7; }
 .git-change-list > div > button:first-child {
@@ -434,6 +434,7 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
   .git-change-list > div { grid-template-columns: minmax(0, 1fr); }
   .git-changes-view { grid-template-columns: minmax(0, 1fr); gap: 14px; }
   .git-changes-sidebar { overflow: visible; padding-right: 0; }
+  .git-change-list { max-height: min(55dvh, 520px); overscroll-behavior: auto; }
   .git-changes-content { min-height: 300px; }
   .git-changes-content > .git-diff .git-diff-code { max-height: 52dvh; flex: none; }
   .git-inline-actions { min-height: 36px; justify-content: flex-end; border-top: 1px solid #e4ede7; border-left: 0; }

@@ -42,6 +42,8 @@ export interface MobileFsRequestOptions {
    * 等一次。一次多拿几层之后，展开子目录由下面的**子树缓存**直接命中，零往返。
    */
   treeDepth?: number;
+  /** 目录显示后，空闲时预读最多三个小文本文件。 */
+  prefetch?: boolean;
 }
 
 export interface MobileFsRequest {
@@ -83,6 +85,21 @@ type FsRoute = keyof typeof ROUTES;
  * 翻来翻去是常态，但没人会同时需要十几份内容常驻。
  */
 const openCacheLimit = 12;
+const openCacheMaxAge = 30_000;
+const prefetchableTextExtensions = new Set([
+  ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
+  ".css", ".scss", ".sass", ".less", ".html", ".htm", ".vue", ".svelte",
+  ".json", ".jsonc", ".json5", ".map", ".lock", ".md", ".markdown", ".mdx",
+  ".py", ".go", ".sql", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh",
+  ".hpp", ".hxx", ".rs", ".yaml", ".yml", ".xml", ".svg", ".txt", ".log",
+  ".diff", ".patch", ".toml", ".ini", ".cfg", ".conf", ".env", ".sh", ".bash",
+  ".zsh", ".fish", ".rb", ".kt", ".scala", ".cs", ".graphql", ".gql", ".proto",
+  ".dart", ".swift", ".lua", ".r",
+]);
+const prefetchableTextNames = new Set([
+  "readme", "changelog", "makefile", "dockerfile", "rakefile", "gemfile", "procfile",
+  "vagrantfile", "license",
+]);
 
 // 路由表是**唯一**一份 REST → op 的映射。方法一并写死在这里：`init.method` 只用来
 // 校验调用方没有写错，不作为取值来源（两处各说一遍必然有一天不同步）。
@@ -145,6 +162,12 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
   // 内容缓存按**路径**索引：`/fs/stat` 与 `/fs/read` 都映射到 fs.open，
   // 没有这一层，打开一个文件就是两次往返（几百毫秒到一秒 ×2），白等一半。
   const openCache = new Map<string, MobileOpenPayload>();
+  const openTimes = new Map<string, number>();
+  const pendingOpen = new Map<string, Promise<MobileOpenPayload>>();
+  let generation = 0;
+  let prefetchTimer: ReturnType<typeof setTimeout> | undefined;
+  let prefetchQueue: string[] = [];
+  let prefetchRunning = false;
   // 子树缓存：一次 fs.tree（带 depth）会拿到好几层，这里把它们**摊平**成
   // 「目录 → 该目录的直接子项」，于是后续 fetchDir("src/lib") 直接命中，零往返。
   // 摊平之后失效范围也能说清楚：某个目录的列表变了，只丢它自己那一条。
@@ -159,13 +182,28 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
     }
   }
 
+  function forgetOpen(path: string): void {
+    openCache.delete(path);
+    openTimes.delete(path);
+  }
+
+  function forgetOpensAtOrBelow(path: string): void {
+    for (const key of [...openTimes.keys()]) {
+      if (key === path || (path !== "" && key.startsWith(`${path}/`))) forgetOpen(key);
+    }
+  }
+
   function invalidateAfterMutation(call: ParsedCall): void {
+    // 已发出的读取仍可能返回旧内容，不能让它在写入之后重新填回缓存。
+    generation += 1;
+    pendingOpen.clear();
+    prefetchQueue = [];
     // 判据按"这次改动会让**哪个目录的列表**变化"来定，而不是一律清空：
     // 一律清空会让上一次展开的子树全丢，用户每删一个文件都要重新点回去。
     switch (call.route) {
       case "/write": {
         const path = stringValue(call.body.path);
-        openCache.delete(path);
+        forgetOpen(path);
         // 新建文件会改变父目录的列表；覆盖写不会，但分不清楚更安全 ——
         // 丢一条缓存只是多一次往返，留着过期数据是错的。
         dropTree(parentDir(path));
@@ -182,21 +220,15 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
         dropTree(parentDir(newPath));
         dropTree(oldPath);
         // 重命名会改路径，两个路径上的内容缓存都要丢。
-        openCache.delete(oldPath);
-        openCache.delete(newPath);
-        for (const key of [...openCache.keys()]) {
-          if (oldPath !== "" && key.startsWith(`${oldPath}/`)) openCache.delete(key);
-        }
+        forgetOpensAtOrBelow(oldPath);
+        forgetOpen(newPath);
         break;
       }
       case "/remove": {
         const path = stringValue(call.query.get("path"));
         dropTree(parentDir(path));
         dropTree(path);
-        openCache.delete(path);
-        for (const key of [...openCache.keys()]) {
-          if (path !== "" && key.startsWith(`${path}/`)) openCache.delete(key);
-        }
+        forgetOpensAtOrBelow(path);
         break;
       }
       default:
@@ -215,13 +247,29 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
 
   async function openFile(path: string): Promise<MobileOpenPayload> {
     const cached = openCache.get(path);
-    if (cached) return cached;
-    const payload = (await call("/read", { path })) as MobileOpenPayload | null;
-    if (!payload || typeof payload !== "object" || !payload.stat) {
-      throw new MobileFsError("operation_failed", "电脑端返回的文件信息无法解析", 200);
+    if (cached && Date.now() - (openTimes.get(path) ?? 0) < openCacheMaxAge) {
+      // 命中也更新 LRU 顺序，但不延长内容有效期。
+      openCache.delete(path);
+      openCache.set(path, cached);
+      return cached;
     }
-    rememberOpen(path, payload);
-    return payload;
+    const pending = pendingOpen.get(path);
+    if (pending) return pending;
+    const startedGeneration = generation;
+    const loading = (async () => {
+      const payload = (await call("/read", { path })) as MobileOpenPayload | null;
+      if (!payload || typeof payload !== "object" || !payload.stat) {
+        throw new MobileFsError("operation_failed", "电脑端返回的文件信息无法解析", 200);
+      }
+      if (startedGeneration === generation) rememberOpen(path, payload);
+      return payload;
+    })();
+    pendingOpen.set(path, loading);
+    try {
+      return await loading;
+    } finally {
+      if (pendingOpen.get(path) === loading) pendingOpen.delete(path);
+    }
   }
 
   /**
@@ -236,10 +284,12 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
     // 队首，成为第一个被淘汰的对象 —— 恰好淘汰掉最常用的那个。
     openCache.delete(path);
     openCache.set(path, payload);
+    openTimes.set(path, Date.now());
     while (openCache.size > openCacheLimit) {
       const oldest = openCache.keys().next().value;
       if (oldest === undefined) break;
       openCache.delete(oldest);
+      openTimes.delete(oldest);
     }
   }
 
@@ -258,17 +308,58 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
 
   async function fetchTree(path: string): Promise<TreeResponse> {
     const cached = treeCache.get(path);
-    if (cached) return cached;
+    if (cached) {
+      schedulePrefetch(cached.entries);
+      return cached;
+    }
+    const startedGeneration = generation;
     const params: Record<string, string> = { depth: String(treeDepth) };
     if (path) params.path = path;
     const response = (await call("/tree", params)) as TreeResponse;
+    if (startedGeneration !== generation) return response ?? { entries: [] };
     primeTree(path, response ?? { entries: [] });
-    return treeCache.get(path) ?? { entries: [] };
+    const result = treeCache.get(path) ?? { entries: [] };
+    schedulePrefetch(result.entries);
+    return result;
+  }
+
+  function schedulePrefetch(entries: FileEntry[]): void {
+    if (!options.prefetch) return;
+    // 只预读当前目录的小文本；不递归扫项目，也不搬运图片/大文件。
+    prefetchQueue = entries.filter((entry) => !entry.isDir && Number.isFinite(entry.size) && entry.size! <= 32 * 1024 &&
+      isPrefetchableTextEntry(entry))
+      .slice(0, 3).map((entry) => entry.path);
+    if (prefetchTimer !== undefined) clearTimeout(prefetchTimer);
+    prefetchTimer = setTimeout(() => {
+      prefetchTimer = undefined;
+      void drainPrefetch();
+    }, 200);
+  }
+
+  async function drainPrefetch(): Promise<void> {
+    if (prefetchRunning) return;
+    prefetchRunning = true;
+    const startedGeneration = generation;
+    try {
+      while (prefetchQueue.length && startedGeneration === generation) {
+        const path = prefetchQueue.shift()!;
+        try { await openFile(path); } catch { /* 预读失败由用户实际打开时重试。 */ }
+      }
+    } finally {
+      prefetchRunning = false;
+      if (prefetchQueue.length) void drainPrefetch();
+    }
   }
 
   return {
     invalidateAll(): void {
+      generation += 1;
+      pendingOpen.clear();
+      prefetchQueue = [];
+      if (prefetchTimer !== undefined) clearTimeout(prefetchTimer);
+      prefetchTimer = undefined;
       openCache.clear();
+      openTimes.clear();
       treeCache.clear();
     },
 
@@ -364,6 +455,13 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
       throw new MobileFsError("wiring", `没有实现这个文件端点：${parsed.route}`, 0);
     },
   };
+}
+
+function isPrefetchableTextEntry(entry: FileEntry): boolean {
+  const name = entry.name.toLowerCase();
+  if (prefetchableTextNames.has(name)) return true;
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 && prefetchableTextExtensions.has(name.slice(dot));
 }
 
 /** 摊平之后 children 没用了，留着会让每次读缓存都重新遍历一遍深树。 */

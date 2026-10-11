@@ -43,3 +43,13 @@ test("the load-earlier button still keys off the server's hasMore", () => {
   assert.match(conversationPage, /\{hasMoreHistory && <button className="secondary load-earlier-history"/);
   assert.match(conversationPage, /onClick=\{\(\) => void loadOlderHistory\(\)\}/);
 });
+
+test("running conversations reconcile persisted messages even when realtime events are missed", () => {
+  // A mobile dispatch may keep the run active while the desktop WebSocket is
+  // reconnecting. The fallback poll must fetch the full page during that
+  // window, rather than waiting for activeRunId to become empty.
+  assert.match(conversationPage, /if \(!conversation\?\.id\) return undefined;/);
+  assert.doesNotMatch(conversationPage, /conversation\?\.status !== "running"/);
+  assert.doesNotMatch(conversationPage, /if \(!data\.activeRunId\) \{/);
+  assert.match(conversationPage, /const full = await projectApi<\{ messages: Message\[\]; events: Event\[\]; activeRunId: string \| null/);
+});

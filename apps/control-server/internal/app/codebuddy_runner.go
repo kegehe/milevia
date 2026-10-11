@@ -253,8 +253,17 @@ type codebuddyCLISession struct {
 	stdin  io.WriteCloser
 	mu     sync.Mutex
 	sink   AgentRunSink
+	queued []codebuddyQueuedTurn
+	// turnFinishing closes the small gap after a result has detached the
+	// current sink but before the next queued turn becomes active.
+	turnFinishing bool
 	done   chan error
 	closed bool
+}
+
+type codebuddyQueuedTurn struct {
+	frame []byte
+	sink  AgentRunSink
 }
 
 func (s *codebuddyCLISession) Send(request AgentRunRequest, sink AgentRunSink) error {
@@ -267,6 +276,15 @@ func (s *codebuddyCLISession) Send(request AgentRunRequest, sink AgentRunSink) e
 		return err
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("CodeBuddy 会话已结束")
+	}
+	if s.sink != nil || s.turnFinishing {
+		s.queued = append(s.queued, codebuddyQueuedTurn{frame: append([]byte(nil), append(frame, '\n')...), sink: sink})
+		s.mu.Unlock()
+		return nil
+	}
 	s.sink = sink
 	s.mu.Unlock()
 	// 工具调用由 CLI 内部自执行并自己产出 tool_result（实测事件序列：
@@ -295,11 +313,37 @@ func (s *codebuddyCLISession) Done() <-chan error { return s.done }
 
 func (s *codebuddyCLISession) finish(err error) {
 	s.mu.Lock()
-	if !s.closed {
-		s.closed = true
-		s.done <- err
+	if s.closed {
+		s.mu.Unlock()
+		return
 	}
+	s.closed = true
+	current := s.sink
+	queued := s.queued
+	s.sink = nil
+	s.queued = nil
+	s.done <- err
 	s.mu.Unlock()
+
+	// A CLI exit can happen before it emits a result frame. Every accepted
+	// turn must still receive a terminal callback, otherwise its durable Run
+	// remains queued or running forever. Queued turns have not started yet,
+	// but their sinks use the same terminal callback to release their Run.
+	turnErr := err
+	if turnErr == nil {
+		turnErr = errors.New("CodeBuddy 会话在回合完成前结束")
+	}
+	finishTurn := func(sink AgentRunSink) {
+		if sink, ok := sink.(AgentTurnSink); ok {
+			sink.TurnFinished(turnErr)
+		}
+	}
+	if current != nil {
+		finishTurn(current)
+	}
+	for _, turn := range queued {
+		finishTurn(turn.sink)
+	}
 }
 
 // readOutput 逐行解析 NDJSON，映射 init/assistant/result 到当前 sink。
@@ -348,12 +392,46 @@ func (s *codebuddyCLISession) readOutput(out io.Reader) {
 		case "result":
 			// result 收尾回合。error 型 result（subtype 带 error 或 is_error）把原因回给
 			// 回合；成功则 nil。
+			var turnErr error
+			if ev.IsError || strings.HasPrefix(ev.Subtype, "error") {
+				turnErr = errors.New(substr(ev.Result))
+			}
+			s.mu.Lock()
+			if s.sink != sink || s.closed {
+				s.mu.Unlock()
+				continue
+			}
+			// Detach the completed sink before its callback. finish() therefore
+			// cannot report the same turn again if the CLI exits concurrently.
+			s.sink = nil
+			s.turnFinishing = true
+			s.mu.Unlock()
 			if ts, ok := sink.(AgentTurnSink); ok {
-				var turnErr error
-				if ev.IsError || strings.HasPrefix(ev.Subtype, "error") {
-					turnErr = errors.New(substr(ev.Result))
-				}
 				ts.TurnFinished(turnErr)
+			}
+			s.mu.Lock()
+			if s.closed {
+				s.turnFinishing = false
+				s.mu.Unlock()
+				continue
+			}
+			if len(s.queued) > 0 {
+				nextTurn := s.queued[0]
+				s.sink = nextTurn.sink
+				s.queued = s.queued[1:]
+				s.turnFinishing = false
+				next := s.sink
+				s.mu.Unlock()
+				if ts, ok := next.(AgentTurnSink); ok {
+					ts.TurnStarted()
+				}
+				if _, writeErr := s.stdin.Write(nextTurn.frame); writeErr != nil {
+					s.Stop()
+					s.finish(writeErr)
+				}
+			} else {
+				s.turnFinishing = false
+				s.mu.Unlock()
 			}
 		}
 	}

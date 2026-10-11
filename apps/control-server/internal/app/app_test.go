@@ -3196,6 +3196,32 @@ func TestConversationPageReturnsLatestWindowAndCursor(t *testing.T) {
 	if second.HasMore || second.HasMoreMessages || len(second.Messages) != 1 || second.Messages[0].ID != "message-0" || len(second.Events) != 1 || second.Events[0].ID != "event-0" {
 		t.Fatalf("unexpected second page: %#v", second)
 	}
+	// 手机端的历史恢复只渲染消息。messagesOnly 必须移除运行事件，并且仍按消息游标
+	// 分页，避免事件负载挤占远程中继帧预算。
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?limit=2&messagesOnly=true", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("messages-only first page status: %d body=%s", response.Code, response.Body.String())
+	}
+	var messagesOnlyFirst conversationPage
+	if err := json.NewDecoder(response.Body).Decode(&messagesOnlyFirst); err != nil {
+		t.Fatalf("decode messages-only first page: %v", err)
+	}
+	if !messagesOnlyFirst.HasMore || !messagesOnlyFirst.HasMoreMessages || messagesOnlyFirst.NextCursor == "" || len(messagesOnlyFirst.Messages) != 2 || len(messagesOnlyFirst.Events) != 0 {
+		t.Fatalf("unexpected messages-only first page: %#v", messagesOnlyFirst)
+	}
+	response = httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?limit=2&messagesOnly=true&cursor="+url.QueryEscape(messagesOnlyFirst.NextCursor), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("messages-only second page status: %d body=%s", response.Code, response.Body.String())
+	}
+	var messagesOnlySecond conversationPage
+	if err := json.NewDecoder(response.Body).Decode(&messagesOnlySecond); err != nil {
+		t.Fatalf("decode messages-only second page: %v", err)
+	}
+	if messagesOnlySecond.HasMore || messagesOnlySecond.HasMoreMessages || messagesOnlySecond.NextCursor != "" || len(messagesOnlySecond.Messages) != 1 || len(messagesOnlySecond.Events) != 0 {
+		t.Fatalf("unexpected messages-only second page: %#v", messagesOnlySecond)
+	}
 	response = httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/conversation?cursor=not-a-valid-cursor", nil))
 	if response.Code != http.StatusBadRequest {
@@ -5784,6 +5810,36 @@ func TestListOrchestrationBatchesUsesSingleSQLiteConnection(t *testing.T) {
 	}
 	if len(batches) != 1 || batches[0].TaskCount != 1 || batches[0].Status != "active" {
 		t.Fatalf("batches=%#v", batches)
+	}
+}
+
+func TestCompletedOrchestrationBatchNotificationIsClaimedOnce(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	server.config.RemoteCloudURL = "https://cloud.example.com"
+	server.config.RemoteCloudToken = "test-token"
+	taskID := createTaskForTest(t, server.routes(), projectID, "Batch notification")
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into orchestration_batches (id,project_id,name,conversation_strategy,started_at,created_at,updated_at) values ('batch-notification',?,'Batch notification','new',?,?,?)`, projectID, now, now, now); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into task_orchestration_jobs (id,project_id,task_id,batch_id,queue_position,status,policy_snapshot,created_at,updated_at) values ('job-notification',?,?,'batch-notification',1,'done','{}',?,?)`, projectID, taskID, now, now); err != nil {
+		t.Fatalf("insert batch job: %v", err)
+	}
+	server.notifyCompletedOrchestrationBatchByID("batch-notification", projectID, conversationID)
+	server.notifyCompletedOrchestrationBatchByID("batch-notification", projectID, conversationID)
+	var notified bool
+	if err := server.db.QueryRow(`select completion_notified_at is not null from orchestration_batches where id='batch-notification'`).Scan(&notified); err != nil {
+		t.Fatalf("load notification claim: %v", err)
+	}
+	if !notified {
+		t.Fatal("completed batch notification was not claimed")
+	}
+	var events int
+	if err := server.db.QueryRow(`select count(*) from remote_outbox where type='project.batch_completed'`).Scan(&events); err != nil {
+		t.Fatalf("count batch completion events: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("batch completion events=%d, want 1", events)
 	}
 }
 

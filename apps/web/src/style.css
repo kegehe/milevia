@@ -217,6 +217,7 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
 .app-shell { background: linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), #dce9e1 100%), repeating-linear-gradient(0deg, transparent 0, transparent 31px, #e6efe9 32px), #f3f8f4; }
 .app-shell.project-open { background: #f3f8f4; }
 .dashboard-bar { min-height: 76px; border-bottom-color: #cfe0d6; padding: 14px clamp(20px, 4vw, 68px); background: #f3f8f4e8; backdrop-filter: blur(14px); }
+.dashboard-bar-fixed { position: sticky; z-index: 10; top: 0; }
 .brand { gap: 10px; color: #19332c; text-decoration: none; }
 .brand-mark { width: 42px; height: 42px; filter: drop-shadow(0 2px 2px #19332c24); }
 .brand-word { position: relative; display: inline-flex; align-items: baseline; padding: 2px 1px 5px; color: #19332c; font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif; font-size: 20px; font-weight: 700; line-height: 1; letter-spacing: 0; white-space: nowrap; }

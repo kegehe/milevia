@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +42,11 @@ func (s *recordingTurnSink) AssistantText(content, _ string) {
 	s.text = append(s.text, content)
 	s.mu.Unlock()
 }
-func (s *recordingTurnSink) SessionIdentified(id string) { s.mu.Lock(); s.sessionID = id; s.mu.Unlock() }
+func (s *recordingTurnSink) SessionIdentified(id string) {
+	s.mu.Lock()
+	s.sessionID = id
+	s.mu.Unlock()
+}
 func (s *recordingTurnSink) SessionInitialized() {
 	s.mu.Lock()
 	s.initialized = true
@@ -103,5 +108,39 @@ func TestCodebuddyLiveSessionTurn(t *testing.T) {
 		}
 	case <-time.After(90 * time.Second):
 		t.Fatal("第 2 回合超时：未收到 TurnFinished（可能 -p 一次性退出，无法持久会话）")
+	}
+}
+
+func TestCodebuddySessionExitFinishesCurrentAndQueuedTurns(t *testing.T) {
+	current := &turnRecordingSink{}
+	queued := &turnRecordingSink{}
+	session := &codebuddyCLISession{
+		sink:   current,
+		queued: []codebuddyQueuedTurn{{sink: queued}},
+		done:   make(chan error, 1),
+	}
+	exitErr := errors.New("process exited")
+
+	session.finish(exitErr)
+
+	current.mu.Lock()
+	currentFinished := append([]error(nil), current.finished...)
+	current.mu.Unlock()
+	queued.mu.Lock()
+	queuedFinished := append([]error(nil), queued.finished...)
+	queued.mu.Unlock()
+	if len(currentFinished) != 1 || !errors.Is(currentFinished[0], exitErr) {
+		t.Fatalf("current turn finishes=%v, want exactly process exit error", currentFinished)
+	}
+	if len(queuedFinished) != 1 || !errors.Is(queuedFinished[0], exitErr) {
+		t.Fatalf("queued turn finishes=%v, want exactly process exit error", queuedFinished)
+	}
+	select {
+	case got := <-session.Done():
+		if !errors.Is(got, exitErr) {
+			t.Fatalf("Done error=%v, want %v", got, exitErr)
+		}
+	default:
+		t.Fatal("session Done was not closed")
 	}
 }

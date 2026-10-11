@@ -179,6 +179,17 @@ test("mobile snapshots normalize missing revisions for offline recovery", () => 
   assert.match(page, /Number\.isFinite\(snapshot\.snapshotRevision\)/);
 });
 
+test("mobile snapshots retain realtime messages until the snapshot contains them", () => {
+  // 快捷命令完成后，快照版本可能先前进、消息稍后才落库。实时消息不能因为版本更大而被丢掉，
+  // 否则界面会出现“先显示、再消失、下一轮快照又出现”的闪烁。
+  const realtimeMerge = page.match(/const extras = \[\.\.\.realtimeMessages\.values\(\)\][\s\S]*?return changed \|\| extras\.length > 0 \? \{ \.\.\.entry, messages: \[\.\.\.messages, \.\.\.extras\] \} : entry;/)?.[0] ?? "";
+  assert.ok(realtimeMerge, "找不到实时消息与快照的合并逻辑");
+  assert.match(realtimeMerge, /item\.conversationId === entry\.id/);
+  assert.match(realtimeMerge, /!entry\.messages\.some\(\(message\) => message\.id === item\.message\.id\)/);
+  assert.match(realtimeMerge, /item\.revision >= baseline/);
+  assert.doesNotMatch(realtimeMerge, /item\.revision >= value\.snapshotRevision/);
+});
+
 test("mobile projects without a conversation open agent selection before creating", () => {
   // 进入会话视图要压一层浏览器历史（见"entering a project pushes a real history entry"），
   // 所以这里的断言跟着改成 enterConversationView：有会话才切视图，没会话先弹 Agent 选择。
@@ -189,7 +200,7 @@ test("mobile projects without a conversation open agent selection before creatin
   const openProjectBody = page.match(/async function openMobileProject\(projectValue: Project\) \{[\s\S]*?\n  \}/)?.[0] ?? "";
   assert.ok(openProjectBody, "找不到 openMobileProject");
   assert.match(openProjectBody, /if \(existingConversation\) \{\s*setSelectedConversation\(existingConversation\.id\);\s*enterConversationView\(\);\s*return;\s*\}/);
-  assert.match(openProjectBody, /setNewConversationProject\(projectValue\);/);
+  assert.match(openProjectBody, /openNewConversation\(projectValue\);/);
   assert.match(page, /if \(!agentId\) \{[\s\S]*?openNewConversation\(projectValue\);[\s\S]*?return;/);
 });
 
@@ -289,7 +300,10 @@ test("mobile + panel mirrors the desktop shortcut library instead of hardcoded p
   assert.doesNotMatch(page, /insertComposerPhrase/);
   // 类型：快捷方式在快照顶层（一份可被多个项目共用），技能挂在项目上（它是"项目 + CLI"两个维度的产物）。
   assert.match(page, /type RemoteShortcut = \{ id: string; name: string;/);
-  assert.match(page, /type Project = \{[^}]*skills\?: RemoteSkill\[\] \};/);
+  assert.match(page, /type Project = \{[^}]*skills\?: RemoteSkill\[\][^}]*agentStatuses\?: RemoteAgentStatus\[\][^}]*agentProbeOk\?: boolean/);
+  assert.match(page, /function mobileAgentAvailable\(project: Project \| null \| undefined, agentID: MobileAgentID\): boolean/);
+  assert.match(page, /disabled=\{!available \|\| busy\}/);
+  assert.match(page, /disabled=\{busy \|\| !mobileAgentAvailable\(newConversationProject, newConversationAgent\)\}/);
   assert.match(page, /type Snapshot = \{ snapshotRevision: number; observedAt: string; projects: Project\[\]; shortcuts\?: RemoteShortcut\[\] \}/);
   // 可见性判据必须与电脑端 listShortcuts 的 SQL 逐字对应（`scope='local' or 绑定到本项目`）；
   // **顺序**也必须是同一份 —— 由 control-server remoteSnapshotShortcuts 的 `order by sort_order,name`
@@ -1634,6 +1648,8 @@ test("mobile task panel is a full-page dialog whose status filters fit on one li
   // 见下面那组"分类栏本身"的断言；原来还有"卡片折叠状态下大片空白"、"删除"孤零零
   // 挂在"查看详情"旁边两个问题，下面各自的断言继续守着）。
   assert.match(page, /<h3 id="mobile-task-panel-title">任务队列<\/h3>/);
+  assert.match(page, /<span>任务队列<\/span><small>\{activeTaskCount\}<\/small>/);
+  assert.match(page, /<h3 id="mobile-task-panel-title">任务队列<\/h3><b className="mobile-task-panel-count"[^>]*>\{activeTaskCount\}<\/b>/);
   assert.doesNotMatch(page, /任务与操作/);
   // 抽屉那一套必须彻底消失（类名、右侧定位、点击遮罩），别留半套。
   assert.doesNotMatch(page, /mobile-task-drawer/);
@@ -1831,8 +1847,8 @@ test("mobile task panel is a full-page dialog whose status filters fit on one li
         : styles.includes(`.mobile-task-status.status-${status} { color: ${color}; background: ${background}; }`);
     assert.ok(hit, `状态徽标缺了 ${status} 的配色（那是协议上的状态空间，不许当死样式删）`);
   }
-  // 面板头栏也不再挂副标题（"共 9 个任务" / "待验收 0 / 6"）—— 那是分类胶囊上同一份数字的
-  // 第二遍展示，而胶囊就在下一行。头栏只剩「任务队列」+ 关闭键。
+  // 面板头栏不再挂旧的副标题（"共 9 个任务" / "待验收 0 / 6"）；现在只显示与顶栏角标同口径的
+  // 未完成总数徽标，分类胶囊继续展示各状态数量。
   assert.doesNotMatch(page, /taskFilterSummary/);
   assert.doesNotMatch(styles, /\.mobile-task-panel-header small/);
   // 光断言"那个 memo 和那条 CSS 没了"不够：**硬编码一行文案能照样溜过去**（变异检验抓出来的口子）。
@@ -2100,6 +2116,27 @@ test("mobile conversation history is a button that opens a dialog with one row p
   assert.match(leaveBody[0], /setComposerToolsOpen\(false\);/);
 });
 
+test("mobile history paging continues only while message pages remain", () => {
+  // getConversation 的 hasMore 还包括可回放运行事件；手机历史只渲染消息。
+  // 用总标记续页会在消息耗尽后为事件反复请求历史，甚至带回重复消息。
+  assert.match(page, /const hasMore = page\?\.hasMoreMessages === true && Boolean\(nextCursor\);/);
+  assert.doesNotMatch(page, /const hasMore = page\?\.hasMore === true && Boolean\(nextCursor\);/);
+  assert.match(page, /const params: Record<string, string> = \{ limit: String\(pageSize\), messagesOnly: "true" \};\s*if \(cursor\) params\.cursor = cursor;/);
+});
+
+test("mobile history never requests the same cursor concurrently", () => {
+  assert.match(page, /const historyPageLoadsRef = useRef\(new Set<string>\(\)\);/);
+  assert.match(page, /const loadKey = `\$\{instanceID\}\\u0000\$\{projectID\}\\u0000\$\{conversationID\}\\u0000\$\{cursor\}\\u0000\$\{pageSize\}`;/);
+  assert.match(page, /if \(historyPageLoadsRef\.current\.has\(loadKey\)\) return;\s*historyPageLoadsRef\.current\.add\(loadKey\);/);
+  assert.match(page, /finally \{\s*historyPageLoadsRef\.current\.delete\(loadKey\);\s*\}/);
+});
+
+test("mobile history retries an oversized relay page with fewer messages", () => {
+  assert.match(page, /!reply\.ok && reply\.status === 413 && pageSize > 1/);
+  assert.match(page, /loadConversationHistory\(projectID, conversationID, cursor, Math\.max\(1, Math\.floor\(pageSize \/ 2\)\)\)/);
+  assert.match(page, /loadConversationHistory\(projectID, conversationID, nextCursor, pageSize\)/);
+});
+
 test("mobile conversation header collapses to one line with an overflow menu", () => {
   // 【本轮定案】顶部从"两段三行"归并成"一行标题 + ⋯"。
   // 旧结构（会话标题条 + 状态行 + 「历史/新会话/任务」按钮行）实测在 390×800 上吃掉 199px，
@@ -2141,7 +2178,7 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   // （正好压在 ::after 边界上，半开区间判为界外），左侧却因亚像素取整侥幸命中——
   // 同一份 CSS 两侧表现不一致，就是"热区偏小 2px"的典型症状。刷新胶囊 / 开启通知同理。
   assert.match(styles, /\.mobile-back::after \{ position: absolute; inset: -3px; content: ""; \}/);
-  assert.match(styles, /\.mobile-refresh::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
+  assert.match(styles, /\.mobile-refresh::after, \.mobile-new-task::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
   // 展开态**不**整颗填实心深绿：⋯ 字形与右上角标同为浅色，填实会糊成一团深绿块，看不出是按钮。
   // 与刷新胶囊忙碌态同一套做法——状态靠底色变化表达。
   assert.match(styles, /\.mobile-header-menu-button\[aria-expanded="true"\] \{ border-color: #2c7567; color: #1d5b4e; background: #dcefe4; \}/);
@@ -2162,9 +2199,8 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   // AppVersionTag 带 isDesktop() 守卫、且只挂在 DashboardPage 上，而 Capacitor 原生包里
   // isDesktop() 恒为 false、整页只挂 MobileRemotePage —— 于是"我装的是哪一版"没有来源。
   // 守三件事：菜单里真的渲染它、值来自原生 App.getInfo、读不到时整行不出现（不摆空占位）。
-  assert.match(page, /className="mobile-header-menu-version"><span>Milevia<\/span><small>\{appVersionLabel\}<\/small>/);
-  assert.match(page, /\{appVersionLabel && <div className="mobile-header-menu-version">/);
-  assert.match(page, /readMobileAppInfo\(\)[\s\S]*?setAppVersionLabel\(formatAppVersion\(info\.version, info\.build\)\)/);
+  assert.match(page, /className="mobile-home-settings"/);
+  assert.match(page, /onClick=\{\(\) => navigate\("\/settings"\)\}/);
   // 读值那条链的两条硬性质（拿**函数体**来断，别把注释原文写进锚点 —— 改一句措辞就误报）：
   //   ① 非原生端**先**返回 null（Web 端 App.getInfo() 会抛 unimplemented，不能走到它）；
   //   ② 异常必须被吞成 null：读不到版本不该在启动路径上冒红字。
@@ -2178,9 +2214,7 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   assert.match(androidReleaseLib, /export function formatAppVersion\(version: string, build\?: string\): string \{/);
   // 样式：它是**信息行**，不是菜单项 —— 不能进 `.mobile-header-menu-sheet button` 那条
   // min-height: 44 的规则（点不动的东西给 44 会让人以为可以点）。
-  assert.match(styleRules, /\.mobile-header-menu-version \{[^}]*font-size: 11px;/s);
-  assert.match(styleRules, /\.mobile-header-menu-version small \{[^}]*font-family: ui-monospace/s);
-  assert.doesNotMatch(styleRules, /\.mobile-header-menu-version[^{]*\{[^}]*min-height: 44px/s);
+  assert.doesNotMatch(page, /appVersionLabel|mobile-header-menu-version/);
 
   // 关闭路径：点面板外 + Esc。Esc 必须把焦点还给 ⋯，否则键盘用户掉在 document.body 上、
   // 只能从头 Tab 一遍（本页其它浮层早就有这个约定）。
@@ -2561,7 +2595,7 @@ test("mobile refresh actually re-fetches and reports the outcome", () => {
   // 外扩量**按有没有 1px 边框**分两条写，不能合成一条：inset 的参照系是 padding box
   // （带边框时比 border box 小 1px），-3px 只能扩到 42。详见顶栏那条用例里的实测记录。
   assert.match(styles, /\.mobile-back::after \{ position: absolute; inset: -3px; content: ""; \}/);
-  assert.match(styles, /\.mobile-refresh::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
+  assert.match(styles, /\.mobile-refresh::after, \.mobile-new-task::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
   assert.doesNotMatch(styles, /\.mobile-refresh \{ min-width: 76px; \}/);
   assert.doesNotMatch(styles, /\.mobile-refresh, \.mobile-pairing button/);
   assert.doesNotMatch(styles, /\.mobile-back \{ width: 44px; height: 44px; \}/);
@@ -3389,7 +3423,7 @@ test("mobile file view is a sub-state of the conversation, wired to the relay ad
 
   // ④ 取数走中继适配器，不是本机 REST。适配器**持有缓存**，所以必须记忆化 ——
   //    每次渲染换一个 = 缓存清零，用户在目录里点两下就会不停重新拉取。
-  assert.match(page, /const filesAdapter = useMemo\(\(\) => createMobileFsRequest\(\{ transport: rpcTransport \}\), \[rpcTransport\]\);/);
+  assert.match(page, /const filesAdapter = useMemo\(\(\) => createMobileFsRequest\(\{ transport: rpcTransport, prefetch: true \}\), \[rpcTransport\]\);/);
   assert.match(page, /return \(op: string, params: unknown, timeoutMs\?: number\) =>\n\s*cloud<MobileRpcReply>\(`\/v1\/instances\/\$\{encodeURIComponent\(instanceID\)\}\/rpc`, \{/);
   assert.match(page, /request=\{filesAdapter\.request\}/);
   // 图片字节的入口同样是记忆化对象：面板里的 useMobileMedia 把它写进依赖，
@@ -3809,4 +3843,20 @@ test("mobile conversation can actually be stopped from the composer", () => {
   //    配色沿用桌面端停止那一套（浅红底 / 深红字）。
   assert.match(styleRules, /\.mobile-composer \.mobile-composer-stop \{[^}]*display: inline-flex;[^}]*width: auto;/);
   assert.match(styleRules, /\.mobile-composer \.mobile-composer-stop:disabled \{[^}]*background: #f9eeea;/);
+});
+
+test("enabling notifications also enables the product preference", () => {
+  assert.match(page, /const \{ localPreferences, updateLocalPreferences \} = useUIPreferences\(\);/);
+  const notificationFunction = page.slice(page.indexOf("async function enableMobileNotifications()"));
+  assert.match(notificationFunction, /notificationGrantedRef\.current = permission === "granted";\s*if \(permission === "granted"\) updateLocalPreferences\(\{ systemNotificationsEnabled: true \}\);/);
+  assert.match(notificationFunction, /const permission = await Notification\.requestPermission\(\);\s*setNotificationPermission\(permission\);\s*if \(permission === "granted"\) updateLocalPreferences\(\{ systemNotificationsEnabled: true \}\);/);
+});
+
+test("mobile conversation follows streaming content without covering the final entry", () => {
+  assert.match(page, /useLayoutEffect\(\(\) => \{\s*if \(!mobileApp \|\| mobileView !== "conversation"\) return;\s*const list = messageListRef\.current;/s);
+  assert.match(page, /const observer = new ResizeObserver\(scheduleFollow\);\s*observer\.observe\(list\);/s);
+  assert.match(page, /if \(stickToBottomRef\.current\) window\.scrollTo\(\{ top: document\.documentElement\.scrollHeight \}\);/);
+  assert.match(page, /className="mobile-message-list" ref=\{messageListRef\}/);
+  assert.match(page, /document\.documentElement\.style\.setProperty\("--mobile-composer-height", `\$\{height\}px`\)/);
+  assert.match(styles, /\.mobile-remote\.mobile-conversation-mode \{[^}]*padding-bottom: calc\(var\(--mobile-composer-height, 68px\) \+ 16px\);/s);
 });

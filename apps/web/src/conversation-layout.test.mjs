@@ -43,6 +43,8 @@ test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
   assert.match(conversationPage, /title=\{copied \? "已复制" : "复制消息"\}/);
   assert.match(stylesheet, /\.message-copy\s*\{[^}]*width:\s*26px;[^}]*height:\s*26px;[^}]*background:\s*transparent;/s);
   assert.match(stylesheet, /\.message-copy::before,[\s\S]*?\.message-copy::after/);
+  assert.match(stylesheet, /\.message-copy\.copied::before\s*\{[^}]*border-width:\s*0\s+0\s+2px\s+2px;/s);
+  assert.match(stylesheet, /\.message-copy\.copied::after\s*\{\s*display:\s*none;/);
 });
 
 test("stopping an unanswered direct prompt restores it to the composer", () => {
@@ -104,9 +106,12 @@ test("the HTTP fallback poll also pauses while the window is hidden", () => {
   // 补一次；「由隐藏转为可见」那一跳靠这个 ref 认出来。ref 必须在 !run 守卫之前无条件
   // 同步，否则 run 为空的那些可见性变化不更新它，下次启动运行会被误判成"刚从后台回来"。
   assert.match(conversationPage, /const prevRunPollVisible = useRef\(documentVisible\);/);
-  assert.match(conversationPage, /const becameVisible = documentVisible && !prevRunPollVisible\.current;\s*prevRunPollVisible\.current = documentVisible;\s*if \(!run \|\| !conversation\?\.id\) return undefined;[\s\S]*?if \(!documentVisible\) return undefined;/);
+  assert.match(conversationPage, /const becameVisible = documentVisible && !prevRunPollVisible\.current;/);
+  assert.match(conversationPage, /prevRunPollVisible\.current = documentVisible;/);
+  assert.match(conversationPage, /if \(!conversation\?\.id\) return undefined;/);
+  assert.match(conversationPage, /if \(!documentVisible\) return undefined;/);
   assert.match(conversationPage, /if \(becameVisible\) void poll\(\);\s*const interval = window\.setInterval\(\(\) => \{ void poll\(\); \}, 15_000\);/);
-  assert.match(conversationPage, /\}, \[documentVisible, run, conversation\?\.id, projectApi, recordAssistantOutput\]\);/);
+  assert.match(conversationPage, /\}, \[documentVisible, run, conversation\?\.id, conversation\?\.status, projectApi, recordAssistantOutput\]\);/);
 });
 
 test("task queue polling pauses while the window is hidden", () => {

@@ -94,6 +94,11 @@ type remoteSnapshotProject struct {
 	// 挂在项目上而不是顶层：技能是"项目 + CLI"两个维度的产物（项目级 SKILL.md 目录会覆盖
 	// 用户级同名技能），脱离项目就没有意义。详见 skills.go 的 discoverSkillsForProject。
 	Skills []Skill `json:"skills"`
+	// 手机端无法直接访问 Runner 状态接口，因此把统一探测结果随项目快照下发。
+	// 状态缺失时客户端应按不可用处理，避免把未知状态误报成可用。
+	AgentStatuses   []AgentStatus `json:"agentStatuses,omitempty"`
+	AgentProbeOK    bool          `json:"agentProbeOk"`
+	AgentProbeError string        `json:"agentProbeError,omitempty"`
 }
 
 // remoteSnapshotShortcut 是 Shortcut 的裁剪版：只带手机端渲染与执行需要的字段。
@@ -788,7 +793,7 @@ func (s *Server) enqueueRemoteEventTxWithConversation(ctx context.Context, tx *s
 	if err := tx.QueryRowContext(ctx, `select last_agent_sequence from remote_instance limit 1`).Scan(&sequence); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `insert into remote_outbox(event_id,agent_sequence,type,task_id,task_run_id,payload,created_at) values(?,?,?,?,?,?,?)`, eventID, sequence, typ, taskID, taskRunID, string(payload), now); err != nil {
+	if _, err := tx.ExecContext(ctx, `insert or ignore into remote_outbox(event_id,agent_sequence,type,task_id,task_run_id,payload,created_at) values(?,?,?,?,?,?,?)`, eventID, sequence, typ, taskID, taskRunID, string(payload), now); err != nil {
 		return err
 	}
 	// Wake any held long-poll request so the Agent forwards this event now
@@ -1194,6 +1199,24 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		project.Environment = string(s.resolveAgentTargetEnv(project.Runner, path))
+		// 复用 probeAgentsFor 的缓存和目录驱动探测逻辑，避免移动端另造一套
+		// command -v / 登录状态判断。探测通道失败时保留原因，但不伪造状态。
+		if meta, probeOK, probeError, probeErr := s.resolveProbeTarget(project.Runner); probeErr != nil {
+			project.AgentProbeError = probeErr.Error()
+		} else if !probeOK {
+			project.AgentProbeError = probeError
+		} else {
+			project.AgentProbeOK = true
+			if statuses, hasCache, fresh := s.cachedAgentStatusesForRemote(meta.ID); hasCache {
+				project.AgentStatuses = statuses
+				if !fresh {
+					s.triggerAgentProbeForRemote(meta)
+				}
+			} else {
+				// 冷启动探测放到后台，不能让手机项目列表同步等待 WSL/SSH 超时。
+				s.triggerAgentProbeForRemote(meta)
+			}
+		}
 		projects = append(projects, project)
 	}
 	if err := rows.Err(); err != nil {

@@ -108,11 +108,15 @@ export function FilesPanel({
   const [isSaving, setIsSaving] = useState(false);
   const [pendingDiscard, setPendingDiscard] = useState<{ files: OpenFile[]; proceed: () => void } | null>(null);
   const [mobileView, setMobileView] = useState<"tree" | "editor">("tree");
+  const [openingFile, setOpeningFile] = useState<{ path: string; name: string } | null>(null);
+  const openSelectionRef = useRef(0);
   // 返回键要能"退一层"，但"现在到底有没有上一层"只有这里知道 ——
   // 外层拿不到 mobileView，也不该去猜一个布尔量再回传进来。
   useImperativeHandle(ref, () => ({
     showTree: () => {
       if (mobileView === "tree") return false;
+      openSelectionRef.current += 1;
+      setOpeningFile(null);
       setMobileView("tree");
       return true;
     },
@@ -122,6 +126,8 @@ export function FilesPanel({
   const dialogRef = useRef<HTMLElement | null>(null);
   const dialogOpenerRef = useRef<HTMLElement | null>(null);
   const pendingOpens = useRef<Set<string>>(new Set());
+  // 同一请求可以被重复点选；这里记录它现在代表的最后一次选择。
+  const pendingOpenSelections = useRef<Map<string, number>>(new Map());
   const savingRef = useRef(false);
   // 删除确认的「删除」按钮是默认焦点（回车即确认），且弹窗在请求返回前不会关闭；
   // 双击、连按回车都会再触发一次 submitDelete，这里用 ref 做同步的防重复提交
@@ -226,14 +232,27 @@ export function FilesPanel({
       const current = openFilesRef.current;
       const existing = current.find((f) => f.path === path);
       if (existing) {
+        openSelectionRef.current += 1;
+        setOpeningFile(null);
         setActiveFilePath(path);
         setMobileView("editor");
         return;
       }
 
       // 防止同一文件的并发请求
-      if (pendingOpens.current.has(path)) return;
+      if (pendingOpens.current.has(path)) {
+        const selection = ++openSelectionRef.current;
+        pendingOpenSelections.current.set(path, selection);
+        setOpeningFile({ path, name });
+        setMobileView("editor");
+        return;
+      }
+      const selection = ++openSelectionRef.current;
+      setOpeningFile(null);
       pendingOpens.current.add(path);
+      pendingOpenSelections.current.set(path, selection);
+      setOpeningFile({ path, name });
+      setMobileView("editor");
 
       try {
 		const stat = await request<FileInfo>(withWorkspace(`/api/projects/${projectId}/fs/stat?path=${encodeURIComponent(path)}`));
@@ -272,6 +291,9 @@ export function FilesPanel({
           readOnlyReason: res?.readOnlyReason,
         };
 
+        // 用户已经选择了另一个文件：这次结果不能悄悄占一个标签，也不该覆盖新选择。
+        if (openSelectionRef.current !== pendingOpenSelections.current.get(path)) return;
+
         // 超出上限且无可关闭的干净标签时拒绝打开
         if (openFilesRef.current.length >= MAX_OPEN_TABS) {
           const hasCleanClosable = openFilesRef.current.some(
@@ -297,12 +319,16 @@ export function FilesPanel({
         setActiveFilePath(path);
         setMobileView("editor");
       } catch (err) {
-        setError(err instanceof Error ? err.message : "无法打开文件");
+        if (openSelectionRef.current === pendingOpenSelections.current.get(path)) {
+          setError(err instanceof Error ? err.message : "无法打开文件");
+        }
       } finally {
         pendingOpens.current.delete(path);
+        pendingOpenSelections.current.delete(path);
+        setOpeningFile((current) => current?.path === path ? null : current);
       }
     },
-    [projectId, request] // openFilesRef / pendingOpens 是 ref 不需要作为依赖
+    [projectId, request, withWorkspace] // openFilesRef / pendingOpens 是 ref 不需要作为依赖
   );
 
   // 深链打开指定文件（如优化建议卡片的「查看文件」）。只消费一次：打开后通知持有方清掉，
@@ -635,7 +661,11 @@ export function FilesPanel({
       {mobileView === "editor" && (
         <button
           className="files-mobile-back"
-          onClick={() => setMobileView("tree")}
+          onClick={() => {
+            openSelectionRef.current += 1;
+            setOpeningFile(null);
+            setMobileView("tree");
+          }}
         >
           ← 文件列表
         </button>
@@ -667,6 +697,8 @@ export function FilesPanel({
             openFiles={openFiles}
             activeFilePath={activeFilePath}
             onTabSelect={(path) => {
+              openSelectionRef.current += 1;
+              setOpeningFile(null);
               setActiveFilePath(path);
               setMobileView("editor");
             }}
@@ -678,7 +710,11 @@ export function FilesPanel({
           />
 
           {/* 文件内容区 */}
-          {activeFile ? (
+          {openingFile ? (
+            <div className="files-empty" role="status" aria-live="polite" aria-busy="true">
+              <span className="files-empty-text">正在打开 {openingFile.name}…</span>
+            </div>
+          ) : activeFile ? (
             editingFile === activeFile.path && activeFile.contentLoaded ? (
               <FileEditor
                 content={activeFile.content}

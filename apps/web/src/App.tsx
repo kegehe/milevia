@@ -72,10 +72,14 @@ export function App() {
   }, []);
   return (
     <BrowserRouter>
-      {nativeMobile || mobileRoute ? <MobileRemotePage /> : <>
       <TooltipProvider>
         <UIPreferencesProvider>
-          <NotificationProvider>
+          {nativeMobile || mobileRoute ? <ProjectProvider>
+            <Routes>
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="*" element={<MobileRemotePage />} />
+            </Routes>
+          </ProjectProvider> : <NotificationProvider>
             <LiveEventsProvider>
             <ProcessStatusProvider>
               <ProjectProvider>
@@ -112,10 +116,9 @@ export function App() {
               </ProjectProvider>
             </ProcessStatusProvider>
             </LiveEventsProvider>
-          </NotificationProvider>
+          </NotificationProvider>}
         </UIPreferencesProvider>
       </TooltipProvider>
-      </>}
     </BrowserRouter>
   );
 }

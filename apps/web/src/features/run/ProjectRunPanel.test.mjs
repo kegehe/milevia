@@ -28,3 +28,10 @@ test("commits an environment variable rename when focus leaves the row, not on e
   assert.match(source, /已存在，未改名/);
   assert.match(source, /renameError \? <p className="run-env-error" role="status">\{renameError\}<\/p> : null/);
 });
+
+test("configures each startup entry with only its command", () => {
+  assert.doesNotMatch(source, /placeholder="名称，如：开发环境"/);
+  assert.doesNotMatch(source, /updateCommand\(item\.id, \{ name:/);
+  assert.match(source, /aria-label=\{`第 \$\{index \+ 1\} 条启动命令`\}/);
+  assert.match(source, /const commands = \(config\.commands \|\| \[\]\)\.map\(\(\{ id, command, envVars \}\)/);
+});

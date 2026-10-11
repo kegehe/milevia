@@ -1,10 +1,9 @@
-/** 一条具名启动命令。一个项目可以保存多条（开发/预发/生产参数不同，或不同的启动方式），
- *  启动时选中其中一条执行。 */
+/** 一条启动命令。一个项目可以保存多条，启动时选中其中一条执行。 */
 export interface RunCommand {
 	/** 标识这一条；选中、去重、列表 key 都以它为准。 */
 	id: string;
-	/** 展示名，如「开发环境」；留空时界面回落到命令文本。 */
-	name: string;
+	/** 旧版配置里的展示名。仅为读取已有数据保留，界面和新配置均不再使用。 */
+	name?: string;
 	/** 实际执行的命令行。 */
 	command: string;
 	/** 这条命令专属的环境变量，启动时叠加在全局环境变量之上（同名覆盖）。 */
@@ -41,14 +40,14 @@ export function newRunCommandID(): string {
 	return globalThis.crypto?.randomUUID?.() || `run-cmd-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-/** 新建一条空白启动命令（名称与命令都留给用户填）。 */
+/** 新建一条空白启动命令。 */
 export function createRunCommand(): RunCommand {
-	return { id: newRunCommandID(), name: '', command: '' };
+	return { id: newRunCommandID(), command: '' };
 }
 
-/** 命令在界面上的称呼：优先名称，其次命令文本，都没有时用序号占位。 */
+/** 命令在界面上的称呼：直接使用命令文本，空行用序号占位。 */
 export function runCommandLabel(command: RunCommand, index = 0): string {
-	return command.name.trim() || command.command.trim() || `命令 ${index + 1}`;
+	return command.command.trim() || `命令 ${index + 1}`;
 }
 
 /** 这条命令是否"真实存在"。空命令的行只是「添加一条」留下的壳：后端保存时会丢弃，

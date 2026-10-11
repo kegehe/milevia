@@ -57,7 +57,7 @@ func (s *Server) remoteGitOperations() map[string]remoteOperation {
 		// ── 变更 / 提交 / 丢弃 ──────────────────────────────────────────────────
 		"git.stage":      {Method: http.MethodPost, Path: "/git/stage", Handle: s.gitStage},
 		"git.unstage":    {Method: http.MethodPost, Path: "/git/unstage", Handle: s.gitUnstage},
-		"git.stageAll":   {Method: http.MethodPost, Path: "/git/stage-all", Handle: s.gitStageAll},
+		"git.stageAll":   {Method: http.MethodPost, Path: "/git/stage-all", Handle: s.gitStageAllFast},
 		"git.unstageAll": {Method: http.MethodPost, Path: "/git/unstage-all", Handle: s.gitUnstageAll},
 		// 写入那条与只读的 git.commit 同名会让人读错，所以显式叫 Create。
 		"git.commitCreate": {Method: http.MethodPost, Path: "/git/commits", Handle: s.gitCommit},

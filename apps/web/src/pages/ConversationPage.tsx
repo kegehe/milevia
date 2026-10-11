@@ -2232,32 +2232,37 @@ export default function ConversationPage() {
     // 启动运行的瞬间就会误判成"刚从后台回来"，白打一次请求。
     const becameVisible = documentVisible && !prevRunPollVisible.current;
     prevRunPollVisible.current = documentVisible;
-    if (!run || !conversation?.id) return undefined;
+    // A remote/mobile dispatch can produce assistant events while the local
+    // WebSocket is reconnecting. Keep reconciliation alive even when both the
+    // local run and the cached conversation status have gone stale; otherwise
+    // a missed event leaves only the initial dispatch message visible.
+    if (!conversation?.id) return undefined;
     // 窗口不可见时停掉回退轮询。实时性由 WebSocket 保证（它不受后台定时器限流影响），
     // 这条只是连接不可靠时的兜底，隐藏期间没有兜底的价值。
     if (!documentVisible) return undefined;
     let cancelled = false;
+    let pollInFlight = false;
     const poll = async () => {
+      if (pollInFlight) return;
+      pollInFlight = true;
       try {
-        const data = await projectApi<{ activeRunId: string | null }>(`/api/conversations/${conversation.id}?limit=1`);
+        const full = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
         if (cancelled) return;
-        if (!data.activeRunId) {
-          const full = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
-          if (cancelled) return;
-          full.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
-          // 过滤掉被撤回的用户消息
-          const pollMessages = full.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
-          setMessages((current) => mergeReloadMessages(pollMessages, current));
-          setEvents((current) => mergeConversationItems(full.events, current));
-          setRun(full.activeRunId || "");
-          // 同 reload：轮询拿到的也是最新一页，不能覆盖已经往回翻过的分页游标。
-          if (!pagedBackRef.current) {
-            setHasMoreHistory(full.hasMore); setHasMoreMessageHistory(full.hasMoreMessages); setHistoryCursor(full.nextCursor || "");
-          }
-          setStopping(false);
+        full.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
+        // 过滤掉被撤回的用户消息
+        const pollMessages = full.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
+        setMessages((current) => mergeReloadMessages(pollMessages, current));
+        setEvents((current) => mergeConversationItems(full.events, current));
+        setRun(full.activeRunId || "");
+        // 同 reload：轮询拿到的也是最新一页，不能覆盖已经往回翻过的分页游标。
+        if (!pagedBackRef.current) {
+          setHasMoreHistory(full.hasMore); setHasMoreMessageHistory(full.hasMoreMessages); setHistoryCursor(full.nextCursor || "");
         }
+        setStopping(false);
       } catch {
         // silently ignore
+      } finally {
+        pollInFlight = false;
       }
     };
     if (becameVisible) void poll();
@@ -2266,7 +2271,7 @@ export default function ConversationPage() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [documentVisible, run, conversation?.id, projectApi, recordAssistantOutput]);
+  }, [documentVisible, run, conversation?.id, conversation?.status, projectApi, recordAssistantOutput]);
 
   // 对话切换时重置输入历史浏览状态（历史本身按项目保留，不清空）
   useEffect(() => {
@@ -3416,6 +3421,7 @@ export default function ConversationPage() {
   const promptShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "prompt" || shortcut.kind === "snippet");
   const commandShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "command_request");
   const userMessageNavigationIndex = userMessages.length === 0 ? -1 : Math.max(0, Math.min(currentUserMessageIndex, userMessages.length - 1));
+  const inputHistoryPosition = historyIndex.current === null ? null : inputHistory.length - historyIndex.current;
   const starterSuggestions = [
     { label: "审查改动", prompt: "请审查当前工作区的改动，重点检查潜在问题、风险和缺少的测试。" },
     { label: "定位问题", prompt: "请帮我定位并分析以下问题的原因：" },
@@ -3623,6 +3629,7 @@ export default function ConversationPage() {
           {composerSlashHint.suggestion && <button type="button" onClick={() => setComposerText(`/${composerSlashHint.suggestion} `, conversation?.id)}>你是想用 <code>/{composerSlashHint.suggestion}</code> 吗？</button>}
         </div>}
         <div className="composer-input-area">
+          {inputHistoryPosition !== null && inputHistory.length > 0 && <span className="composer-history-position" role="status" aria-label={`输入历史第 ${inputHistoryPosition} 条，共 ${inputHistory.length} 条`}>{inputHistoryPosition}/{inputHistory.length}</span>}
           <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} />
           <button className={`composer-mobile-shortcut-toggle${showMobileShortcuts ? " open" : ""}`} type="button" title="快捷操作" aria-label="快捷操作" aria-controls="mobile-shortcut-menu" aria-expanded={showMobileShortcuts} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowMobileShortcuts((open) => !open)}><ComposerShortcutIcon /></button>
         </div>

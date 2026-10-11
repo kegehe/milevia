@@ -76,6 +76,8 @@ type gitSummaryResponse struct {
 	GitSnapshot
 	ObservedAt time.Time `json:"observedAt"`
 	StateToken string    `json:"stateToken"`
+	// Changes 与 summary 随同一个响应返回，避免前端并发请求时把两个时刻拼在一起。
+	Changes []GitChange `json:"changes"`
 	// ChangesRevision 是"变更清单 + 每个文件指纹"的摘要，给手机端那个**只取 summary**
 	// 的后台探针当变化判据用（见 apps/web 的 sameGitSnapshot）。
 	//
@@ -249,7 +251,7 @@ func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := s.issueGitStateToken(chi.URLParam(r, "projectID"), workspace.Workspace.ID, workspace.Workspace.Path, snapshot, changes, fingerprints, observedAt)
-	writeJSON(w, http.StatusOK, gitSummaryResponse{GitSnapshot: snapshot, ObservedAt: observedAt, StateToken: token, ChangesRevision: gitChangesRevision(changes, fingerprints)})
+	writeJSON(w, http.StatusOK, gitSummaryResponse{GitSnapshot: snapshot, ObservedAt: observedAt, StateToken: token, ChangesRevision: gitChangesRevision(changes, fingerprints), Changes: changes})
 }
 
 // gitInit 在项目目录初始化一个 Git 仓库（git init -b main）。
@@ -356,6 +358,41 @@ func (s *Server) gitStage(w http.ResponseWriter, r *http.Request) {
 	s.gitPathsMutation(w, r, "stage", func(ctx context.Context, runner GitRunner, repo string, paths []string) error {
 		return runner.Stage(ctx, repo, paths)
 	})
+}
+
+// gitStageAllFast keeps the state-token guard but uses Git's native all-path
+// operation instead of serializing every changed path into a pathspec.
+func (s *Server) gitStageAllFast(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		StateToken string `json:"stateToken"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	if !ok {
+		return
+	}
+	defer release()
+	hasChanges := false
+	for _, change := range state.changes {
+		if change.Modified || change.Untracked || change.Deleted || change.Renamed || change.Conflicted {
+			hasChanges = true
+			break
+		}
+	}
+	if !hasChanges {
+		writeError(w, http.StatusConflict, errGitNoChanges)
+		return
+	}
+	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "stage_all", "鍏ㄩ儴鏆傚瓨", state.snapshot, func(runner GitRunner) error {
+		return runner.StageAll(r.Context(), repo)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
 }
 
 func (s *Server) gitUnstage(w http.ResponseWriter, r *http.Request) {

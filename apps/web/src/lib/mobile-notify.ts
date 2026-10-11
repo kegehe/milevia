@@ -45,7 +45,7 @@ export function toNotificationPermission(display: unknown): NotificationPermissi
  * 这个判据与改版前 notifyHiddenMobileEvent 里那条正则完全一致，没有放宽也没有收紧。
  */
 export function isInterruptingMobileEvent(type: unknown): boolean {
-  return typeof type === "string" && /^(task\.|run\.|approval\.)/.test(type);
+  return typeof type === "string" && (/^(task\.|run\.|approval\.)/.test(type) || type === "project.batch_completed");
 }
 
 export interface MobileNotificationContent {
@@ -73,17 +73,29 @@ export interface MobileNotificationContent {
 /**
  * 从 SSE 事件里取出通知文案与跳转目标。
  *
- * 文案的取法与改版前一致：优先 `payload.summary`，其次 `状态：<status>`，最后退回事件类型。
- * 不值得打扰的事件返回 null。
+ * 项目批次完成事件优先使用服务端生成的 `payload.summary`；普通运行事件使用中文状态。
+ * 批次中的单个成功运行返回 null，避免把中间状态误报成项目完成。
  */
 export function mobileNotificationContent(event: { type?: unknown; taskId?: unknown; payload?: unknown }): MobileNotificationContent | null {
   if (!isInterruptingMobileEvent(event.type)) return null;
   const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
   const summary = typeof payload.summary === "string" ? payload.summary : "";
   const status = typeof payload.status === "string" ? payload.status : "";
+  const projectName = typeof payload.projectName === "string" ? payload.projectName.trim() : "";
+  const type = typeof event.type === "string" ? event.type : "";
+  // 批次中的单个运行结束不代表项目批次完成，等服务端发出的唯一项目事件。
+  if (type === "run.completed" && typeof payload.batchId === "string" && payload.batchId !== "") return null;
+  const statusLabel: Record<string, string> = {
+    completed: "任务已完成",
+    failed: "任务执行失败",
+    stopped: "任务已停止",
+    interrupted: "任务已中断",
+  };
   return {
-    title: "Milevia",
-    body: summary || (status ? `状态：${status}` : String(event.type)),
+    title: type === "project.batch_completed" ? "项目任务完成" : "任务状态提醒",
+    body: summary || (type === "run.completed" && projectName
+      ? `项目「${projectName}」的任务已完成`
+      : status ? (statusLabel[status] || `任务状态：${status}`) : "任务状态已更新"),
     projectId: typeof payload.projectId === "string" ? payload.projectId : "",
     conversationId: typeof payload.conversationId === "string" ? payload.conversationId : "",
     // 信封优先，payload 兜底（两者的来源见 taskId 字段的说明）。

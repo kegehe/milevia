@@ -243,6 +243,57 @@ test("同一文件的 stat 与 read 只发一次请求", async () => {
   assert.deepEqual(Object.keys(content).sort(), ["content", "editable", "stat", "version"]);
 });
 
+test("同一文件并发读取合并为一次中继请求", async () => {
+  const { transport, calls } = makeTransport(() => ok(openPayload()));
+  const adapter = createMobileFsRequest({ transport });
+  const path = `${PROJECT}/fs/read?path=src%2Fmain.ts`;
+  const [first, second] = await Promise.all([
+    adapter.request<{ content: string }>(path),
+    adapter.request<{ content: string }>(path),
+  ]);
+  assert.equal(first.content, "export {}\n");
+  assert.equal(second.content, "export {}\n");
+  assert.equal(calls.length, 1, "并发打开同一文件不该重复穿过中继");
+});
+
+test("目录加载后预读小文本文件，随后打开直接命中缓存", async () => {
+  const { transport, calls } = makeTransport((op) => {
+    if (op === "fs.tree") return ok({ entries: [{ name: "main.ts", path: "src/main.ts", isDir: false, size: 128 }] });
+    return ok(openPayload());
+  });
+  const adapter = createMobileFsRequest({ transport, prefetch: true });
+  await adapter.request(`${PROJECT}/fs/tree?path=src`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(calls.length, 2, "预读应只额外读取一个候选文件");
+  await adapter.request(`${PROJECT}/fs/read?path=src%2Fmain.ts`);
+  assert.equal(calls.length, 2, "点击预读过的文件不该再发请求");
+  adapter.invalidateAll();
+});
+
+test("目录预读不读取小型二进制文件", async () => {
+  const { transport, calls } = makeTransport((op) => {
+    if (op === "fs.tree") return ok({ entries: [{ name: "logo.png", path: "logo.png", isDir: false, size: 128 }] });
+    return ok(openPayload());
+  });
+  const adapter = createMobileFsRequest({ transport, prefetch: true });
+  await adapter.request(`${PROJECT}/fs/tree`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(calls.length, 1, "不能把二进制文件误当文本预读");
+  adapter.invalidateAll();
+});
+
+test("目录项缺少大小时不预读，避免意外读取大文件", async () => {
+  const { transport, calls } = makeTransport((op) => {
+    if (op === "fs.tree") return ok({ entries: [{ name: "unknown-size.ts", path: "unknown-size.ts", isDir: false }] });
+    return ok(openPayload());
+  });
+  const adapter = createMobileFsRequest({ transport, prefetch: true });
+  await adapter.request(`${PROJECT}/fs/tree`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(calls.length, 1, "未知大小不能按小文件预读");
+  adapter.invalidateAll();
+});
+
 // 只读原因只在服务端真的判了 false 时才出现：可以编辑的文件不该带一个空的
 // `readOnlyReason`，否则界面得再判一次"这个空串算不算有原因"。
 test("可编辑的文件不带 readOnlyReason", async () => {

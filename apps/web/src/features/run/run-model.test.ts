@@ -103,12 +103,13 @@ test("renames an environment variable without clobbering its namesake", () => {
 	assert.equal(Object.prototype.hasOwnProperty.call(proto.envVars, "__proto__"), true);
 });
 
-test("labels a command by name, then by its text, then by position", () => {
-	assert.equal(runCommandLabel({ id: "a", name: " 开发环境 ", command: "npm run dev" }, 0), "开发环境");
+test("labels a command by its text, then by position", () => {
+	assert.equal(runCommandLabel({ id: "a", name: " 开发环境 ", command: "npm run dev" }, 0), "npm run dev");
 	assert.equal(runCommandLabel({ id: "a", name: "", command: " npm run dev " }, 0), "npm run dev");
 	assert.equal(runCommandLabel({ id: "a", name: "", command: "" }, 2), "命令 3");
 	// 每条新建的命令 ID 都不同：列表 key 与选中判定都靠它。
 	assert.notEqual(createRunCommand().id, createRunCommand().id);
+	assert.equal("name" in createRunCommand(), false);
 });
 
 test("uses semantic labels for standard-error logs", () => {

@@ -133,6 +133,10 @@ export function UIPreferencesProvider({ children }: { children: ReactNode }) {
   useEffect(() => { persistLocalPreferences(localPreferences); }, [localPreferences]);
 
   useEffect(() => {
+    if (Capacitor.isNativePlatform()) {
+      setAppPreferencesLoading(false);
+      return;
+    }
     let cancelled = false;
     api<AppPreferences>("/api/preferences")
       .then((preferences) => { if (!cancelled) setAppPreferences(preferences); })

@@ -28,8 +28,19 @@ import (
 func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	server := &Server{}
 	operations := server.remoteConversationOperations()
-	if len(operations) != 1 {
-		t.Fatalf("conversation operation count = %d, want 1", len(operations))
+	if len(operations) != 3 {
+		t.Fatalf("conversation operation count = %d, want 3", len(operations))
+	}
+	list, ok := operations["conversation.list"]
+	if !ok || list.Method != http.MethodGet || list.Scope != relayScopeProject || list.Path != "/conversations" || !list.Query || list.Handle == nil {
+		t.Fatalf("conversation.list = %#v, want read-only project conversation directory operation", list)
+	}
+	history, ok := operations["conversation.history"]
+	if !ok || history.Method != http.MethodGet || history.Scope != relayScopeConversation || history.Path != "" || !history.Query || history.Handle == nil {
+		t.Fatalf("conversation.history = %#v, want read-only conversation history operation", history)
+	}
+	if history.MaxBytes <= 0 || history.MaxBytes >= relayFrameBudget {
+		t.Fatalf("conversation.history MaxBytes = %d, want a positive value below relay frame budget %d", history.MaxBytes, relayFrameBudget)
 	}
 	operation, ok := operations["conversation.stop"]
 	if !ok {
@@ -102,6 +113,46 @@ func conversationStopOperation(t *testing.T) remoteOperation {
 		t.Fatal("conversation.stop is missing")
 	}
 	return operation
+}
+
+func conversationOperation(t *testing.T, name string) remoteOperation {
+	t.Helper()
+	operation, ok := (&Server{}).remoteConversationOperations()[name]
+	if !ok {
+		t.Fatalf("%s is missing", name)
+	}
+	return operation
+}
+
+func TestRelayTargetScopesConversationHistoryToEnvelopeConversation(t *testing.T) {
+	target, body, pathParams, err := relayTarget(
+		conversationOperation(t, "conversation.history"), "project-1", "conversation-real",
+		json.RawMessage(`{"conversationId":"conversation-forged","limit":"50"}`),
+	)
+	if err != nil {
+		t.Fatalf("relayTarget: %v", err)
+	}
+	if !strings.HasPrefix(target, "/api/conversations/conversation-real?") || strings.Contains(target, "conversation-forged") {
+		t.Fatalf("target = %q, want the envelope conversation path only", target)
+	}
+	if pathParams["conversationID"] != "conversation-real" || len(body) != 0 {
+		t.Fatalf("pathParams=%v body=%s, want envelope route parameter and no body", pathParams, body)
+	}
+}
+
+func TestRelayTargetScopesConversationListToProject(t *testing.T) {
+	target, body, pathParams, err := relayTarget(
+		conversationOperation(t, "conversation.list"), "project-1", "", json.RawMessage(`{"limit":"100"}`),
+	)
+	if err != nil {
+		t.Fatalf("relayTarget: %v", err)
+	}
+	if !strings.HasPrefix(target, "/api/projects/project-1/conversations?") || strings.Contains(target, "conversationId=") {
+		t.Fatalf("target = %q, want the project conversation directory", target)
+	}
+	if len(pathParams) != 0 || len(body) != 0 {
+		t.Fatalf("pathParams=%v body=%s, want no path parameters or body", pathParams, body)
+	}
 }
 
 func TestRelayTargetScopesConversationCallsToTheConversationPath(t *testing.T) {

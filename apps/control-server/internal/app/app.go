@@ -272,10 +272,14 @@ type Server struct {
 	// 两份都只活在内存里：它们是**读数**不是事实，重启后重新探一遍即可。
 	// 两个 map 一律懒初始化（见 agent_readings.go）—— 测试夹具大量使用
 	// `&Server{...}` 字面量，不能要求它们先建 map。
-	agentReadingsMu     sync.Mutex
-	agentReadings       map[string]agentReading
-	agentUpdateChecksMu sync.Mutex
-	agentUpdateChecks   map[agentUpdateCheckKey]agentUpdateCheck
+	agentReadingsMu sync.Mutex
+	agentReadings   map[string]agentReading
+	// remoteAgentProbeActive keeps remote snapshots from piling up goroutines
+	// that only wait on the same WSL/SSH probe round.
+	remoteAgentProbeMu     sync.Mutex
+	remoteAgentProbeActive map[string]bool
+	agentUpdateChecksMu    sync.Mutex
+	agentUpdateChecks      map[agentUpdateCheckKey]agentUpdateCheck
 	// commandCatalogMu 保护 Claude 命令目录的单条缓存（见 project_commands.go）：
 	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
 	// 串行地拉起一次探针进程。
@@ -304,6 +308,7 @@ type Server struct {
 	streamingSetups        map[string]*streamingSetup
 	projectWorkspaceLeases map[string]*projectWorkspaceLease
 	runWorkspaceReleases   map[string]func()
+	nonStreamingLaunches   map[string]*nonStreamingRunLaunch
 	gitStateTokens         map[string]gitStateToken
 	sessions               map[string]*activeAgentSession
 	sessionManager         *conversationSessionManager
@@ -460,6 +465,18 @@ type streamingSetup struct {
 	cancelled   bool
 	session     *activeAgentSession
 	ownsSession bool
+}
+
+// nonStreamingRunLaunch keeps the process-only data needed to start a Run
+// after an earlier turn in the same conversation has finished. The Run and
+// user message themselves are already durable before this is recorded.
+type nonStreamingRunLaunch struct {
+	runner       AgentRunner
+	conversation Conversation
+	profile      *AgentRuntimeProfile
+	runnerID     string
+	projectPath  string
+	prompt       string
 }
 
 type projectWorkspaceLease struct {
@@ -796,7 +813,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	codexRunner := newCodexCLIRunner(config, paths)
 	codebuddyRunner := newCodebuddyManageRunner(config, paths)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -1268,7 +1285,7 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/stage", s.gitStage)
 	r.Post("/api/projects/{projectID}/git/init", s.gitInit)
 	r.Post("/api/projects/{projectID}/git/unstage", s.gitUnstage)
-	r.Post("/api/projects/{projectID}/git/stage-all", s.gitStageAll)
+	r.Post("/api/projects/{projectID}/git/stage-all", s.gitStageAllFast)
 	r.Post("/api/projects/{projectID}/git/unstage-all", s.gitUnstageAll)
 	r.Post("/api/projects/{projectID}/git/commits", s.gitCommit)
 	r.Post("/api/projects/{projectID}/git/commits/amend", s.gitAmendCommit)
@@ -3838,6 +3855,7 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "conversationID")
+	messagesOnly := r.URL.Query().Get("messagesOnly") == "true"
 	limit := 400
 	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
 		parsed, err := strconv.Atoi(rawLimit)
@@ -3891,6 +3909,30 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
 		messages[left], messages[right] = messages[right], messages[left]
+	}
+	// Remote history recovery needs the complete message transcript, but does not
+	// render event replay cards. Avoid sending those often much larger payloads
+	// through the bounded relay frame; the regular desktop endpoint keeps its
+	// existing messages-and-events response.
+	if messagesOnly {
+		var activeRunID *string
+		if c.Status == "running" {
+			runID, found, err := s.activeRunIDForConversation(r.Context(), id)
+			if err != nil {
+				writeError(w, 500, err)
+				return
+			}
+			if found {
+				activeRunID = &runID
+			}
+		}
+		nextCursor := conversationPageCursor{}
+		if hasMoreMessages && len(messages) > 0 {
+			oldest := messages[0]
+			nextCursor.Message = &conversationPagePosition{CreatedAt: oldest.CreatedAt, ID: oldest.ID}
+		}
+		writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": []Event{}, "hasMore": hasMoreMessages, "hasMoreMessages": hasMoreMessages, "nextCursor": encodeConversationPageCursor(nextCursor)})
+		return
 	}
 	// 分页只走可回放事件：过程遥测（stream_event、thinking_tokens 等）一条都渲染不出来，
 	// 却能让 hasMore 永远为真 —— 界面上"加载更早记录"按钮就再也点不掉。详见
@@ -5166,6 +5208,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		streaming = false
 		streamingRunner = nil
 	}
+	queuedNonStreaming := !streaming && conversation.Status != "idle"
 	if streaming {
 		s.streamMu.Lock()
 		defer s.streamMu.Unlock()
@@ -5177,13 +5220,9 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			return Message{}, "", nil, http.StatusConflict, err
 		}
 	}
-	if conversation.Status != "idle" && !streaming {
-		return Message{}, "", nil, http.StatusConflict, errors.New("conversation already has a running agent turn")
-	}
-	workspaceOwner := "run:" + runID
-	if streaming {
-		workspaceOwner = "conversation:" + conversation.ID
-	}
+	// A non-streaming conversation is also serialized by this conversation's
+	// persistent Run queue, so its queued turns must share the same lease.
+	workspaceOwner := "conversation:" + conversation.ID
 	workspaceKey := workspaceLeaseKey(Project{ID: conversation.ProjectID, Path: projectRoot}, ConversationWorkspace{ID: workspace.ID, Path: workspace.Path})
 	releaseWorkspace, acquired := s.acquireWorkspace(workspaceKey, workspaceOwner)
 	if !acquired {
@@ -5203,7 +5242,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	if conversation.Title == "" || conversation.Title == "新会话" {
 		conversation.Title = conversationTitle(content)
 	}
-	result, updateErr := tx.ExecContext(ctx, `update conversations set status='running',title=?,last_activity_at=? where id=? and (status='idle' or ?=1)`, conversation.Title, m.CreatedAt, conversationID, boolToInt(streaming))
+	result, updateErr := tx.ExecContext(ctx, `update conversations set status='running',title=?,last_activity_at=? where id=? and (status='idle' or ?=1)`, conversation.Title, m.CreatedAt, conversationID, boolToInt(streaming || queuedNonStreaming))
 	err = updateErr
 	if err == nil {
 		var changed int64
@@ -5234,12 +5273,12 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 	if err == nil {
 		status := "running"
-		if streaming {
+		if streaming || queuedNonStreaming {
 			status = "queued"
 		}
 		_, err = tx.ExecContext(ctx, `insert into runs (id,conversation_id,agent_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,workspace_id,workspace_path,workspace_branch,workspace_base_revision,agent_run_id,status,created_at) values ($1,$2,$3,$4,$5,(select project_agent_route_revision_id from conversations where id=$2),$6,$7,$8,$9,$10,$11,$12,$13)`, runID, conversationID, conversation.AgentID, projectRunner, conversation.AgentProfileRevisionID, conversation.executionPolicy(), workspace.ID, workspace.Path, workspace.Branch, workspace.BaseRevision, "", status, m.CreatedAt)
 	}
-	if err == nil {
+	if err == nil && !queuedNonStreaming {
 		err = s.reserveProfileQuotaTx(ctx, tx, runID, conversation.AgentProfileRevisionID)
 	}
 	if err == nil && record != nil && record.Shortcut != nil {
@@ -5247,7 +5286,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		_, err = tx.ExecContext(ctx, `insert into shortcut_runs (id,shortcut_id,conversation_id,run_id,rendered_content,action,status,created_at) values (?,?,?,?,?,?,?,?)`, record.Shortcut.ID, record.Shortcut.ShortcutID, record.Shortcut.ConversationID, record.Shortcut.RunID, record.Shortcut.RenderedContent, record.Shortcut.Action, record.Shortcut.Status, record.Shortcut.CreatedAt)
 	}
 	if err == nil && record != nil && record.Task != nil {
-		if streaming {
+		if streaming || queuedNonStreaming {
 			record.Task.Status = "queued"
 		} else {
 			record.Task.Status = "running"
@@ -5280,7 +5319,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 	if err == nil && record != nil && record.Scheduled != nil {
 		status := scheduledRunRunning
-		if streaming {
+		if streaming || queuedNonStreaming {
 			status = scheduledRunQueued
 		} else {
 			record.Scheduled.StartedAt = &m.CreatedAt
@@ -5320,7 +5359,9 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	})
 	s.registerRunWorkspace(runID, releaseWorkspace)
 	workspaceAdmitted = true
-	s.startQuotaLeaseHeartbeat(runID)
+	if !queuedNonStreaming {
+		s.startQuotaLeaseHeartbeat(runID)
+	}
 	if streaming {
 		// A streaming runner can still be establishing its persistent process
 		// after the Run row has been committed. Register a per-run cancellation
@@ -5333,6 +5374,16 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		s.streamingSetups[runID] = &streamingSetup{}
 		s.mu.Unlock()
 		s.submitStreamingRunWithProfile(runCtx, streamingRunner, runID, conversation, profile, projectRunner, projectPath, content)
+		return m, runID, record, http.StatusAccepted, nil
+	}
+	if queuedNonStreaming {
+		s.mu.Lock()
+		if s.nonStreamingLaunches == nil {
+			s.nonStreamingLaunches = map[string]*nonStreamingRunLaunch{}
+		}
+		s.nonStreamingLaunches[runID] = &nonStreamingRunLaunch{runner: runnerObj, conversation: conversation, profile: profile, runnerID: projectRunner, projectPath: projectPath, prompt: content}
+		s.mu.Unlock()
+		s.startNextNonStreamingRun(conversation.ID)
 		return m, runID, record, http.StatusAccepted, nil
 	}
 	runCtx, cancel := context.WithCancel(s.runtimeCtx)
@@ -5802,6 +5853,86 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 	s.finishRun(runID, c.ID, status, err)
 }
 
+// startNextNonStreamingRun claims the oldest durable queued Run for one
+// conversation. Its launch data is intentionally process-local: after a
+// service restart recoverInterruptedRuns finalizes queued Runs rather than
+// attempting to recreate a CLI invocation with stale credentials.
+func (s *Server) startNextNonStreamingRun(conversationID string) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	var running int
+	if err := s.db.QueryRowContext(s.runtimeCtx, `select count(*) from runs where conversation_id=? and status='running'`, conversationID).Scan(&running); err != nil || running != 0 {
+		s.mu.Unlock()
+		return
+	}
+	var runID string
+	if err := s.db.QueryRowContext(s.runtimeCtx, `select id from runs where conversation_id=? and status='queued' order by created_at,id limit 1`, conversationID).Scan(&runID); err != nil {
+		s.mu.Unlock()
+		return
+	}
+	launch := s.nonStreamingLaunches[runID]
+	if launch == nil {
+		s.mu.Unlock()
+		return
+	}
+	tx, err := s.db.BeginTx(s.runtimeCtx, nil)
+	if err != nil {
+		s.mu.Unlock()
+		return
+	}
+	result, err := tx.ExecContext(s.runtimeCtx, `update runs set status='running' where id=? and status='queued'`, runID)
+	if err == nil {
+		var changed int64
+		changed, err = result.RowsAffected()
+		if changed != 1 {
+			err = errors.New("queued run changed before it could start")
+		}
+	}
+	if err == nil {
+		_, err = tx.ExecContext(s.runtimeCtx, `update task_runs set status='running',started_at=? where run_id=? and status='queued'`, time.Now().UTC(), runID)
+	}
+	if err == nil {
+		err = s.reserveProfileQuotaTx(s.runtimeCtx, tx, runID, launch.conversation.AgentProfileRevisionID)
+	}
+	if err == nil {
+		_, err = tx.ExecContext(s.runtimeCtx, `update scheduled_task_runs set status='running',started_at=?,failure_reason='' where run_id=? and status='queued'`, time.Now().UTC(), runID)
+	}
+	if err == nil {
+		err = tx.Commit()
+	} else {
+		tx.Rollback()
+	}
+	if err != nil {
+		s.mu.Unlock()
+		// Quota cooldowns are transient. Keep the durable Run queued and retry
+		// after the admission window instead of leaving it stranded forever.
+		time.AfterFunc(5*time.Second, func() { s.startNextNonStreamingRun(conversationID) })
+		return
+	}
+	delete(s.nonStreamingLaunches, runID)
+	runCtx, cancel := context.WithCancel(s.runtimeCtx)
+	runToken := uuid.NewString()
+	s.runWG.Add(1)
+	s.cancels[runID] = cancel
+	s.runTokens[runID] = runToken
+	s.runContexts[runID] = conversationID
+	s.registerProfileRunCancelLocked(launch.conversation.AgentProfileRevisionID, runID, cancel)
+	s.mu.Unlock()
+
+	// This registers its own lifecycle lock and must run after the admission
+	// critical section above is released.
+	s.startQuotaLeaseHeartbeat(runID)
+	s.beginRunUsage(runID, conversationID)
+	go func() {
+		defer s.runWG.Done()
+		s.seedRunUsageModel(runID, launch.conversation.AgentID, runModel(launch.conversation.ModelOverride, launch.profile), launch.runner)
+		s.runAgent(runCtx, launch.runner, runID, runToken, launch.conversation, launch.profile, launch.runnerID, launch.projectPath, launch.prompt)
+	}()
+}
+
 type agentRunSink struct {
 	server         *Server
 	runID          string
@@ -6033,9 +6164,18 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 	payload := map[string]any{"status": status, "error": errorText(runErr)}
 	// Attach taskId so the frontend can link error cards to the task detail page.
 	{
-		var payloadTaskID string
-		if err := s.db.QueryRowContext(s.runtimeCtx, `select task_id from task_runs where run_id=?`, runID).Scan(&payloadTaskID); err == nil && payloadTaskID != "" {
+		var payloadTaskID, payloadBatchID, payloadProjectID, payloadProjectName string
+		if err := s.db.QueryRowContext(s.runtimeCtx, `select tr.task_id,coalesce(job.batch_id,''),coalesce(job.project_id,''),coalesce(project.name,'') from task_runs tr left join task_orchestration_jobs job on job.task_id=tr.task_id left join projects project on project.id=job.project_id where tr.run_id=?`, runID).Scan(&payloadTaskID, &payloadBatchID, &payloadProjectID, &payloadProjectName); err == nil && payloadTaskID != "" {
 			payload["taskId"] = payloadTaskID
+			if payloadBatchID != "" {
+				payload["batchId"] = payloadBatchID
+			}
+			if payloadProjectID != "" {
+				payload["projectId"] = payloadProjectID
+			}
+			if payloadProjectName != "" {
+				payload["projectName"] = payloadProjectName
+			}
 		}
 	}
 	if details, ok := runErr.(interface{ ErrorDetails() map[string]string }); ok {
@@ -6047,7 +6187,9 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 	s.appendEvent(runID, conversationID, "run."+status, payloadJSON)
 	s.releaseRunWorkspace(runID)
 	if committed {
+		s.startNextNonStreamingRun(conversationID)
 		s.kickOrchestratorForRun(runID)
+		s.notifyCompletedOrchestrationBatch(runID, conversationID)
 		// 通知：任务运行结束后的状态变更（awaiting_review 或 action_required）
 		var taskID string
 		if err := s.db.QueryRowContext(s.runtimeCtx, `select task_id from task_runs where run_id=?`, runID).Scan(&taskID); err == nil && taskID != "" {
@@ -6065,6 +6207,71 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 			}
 		}
 	}
+}
+
+// notifyCompletedOrchestrationBatch emits one project-level event after every
+// task in the same started batch has reached a terminal run state. The check
+// is deliberately based on task runs rather than orchestration job status:
+// the orchestrator may still be cleaning up a worktree after the actual task
+// run has finished, and that cleanup must not make the phone report late.
+func (s *Server) notifyCompletedOrchestrationBatch(runID, conversationID string) {
+	ctx := s.runtimeCtx
+	var taskID, batchID, projectID string
+	if err := s.db.QueryRowContext(ctx, `select tr.task_id,coalesce(job.batch_id,''),coalesce(job.project_id,'') from task_runs tr left join task_orchestration_jobs job on job.task_id=tr.task_id where tr.run_id=?`, runID).Scan(&taskID, &batchID, &projectID); err != nil || taskID == "" || batchID == "" || projectID == "" {
+		return
+	}
+	s.notifyCompletedOrchestrationBatchByID(batchID, projectID, conversationID)
+}
+
+func (s *Server) notifyCompletedOrchestrationBatchByID(batchID, projectID, conversationID string) {
+	ctx := s.runtimeCtx
+	if batchID == "" || projectID == "" {
+		return
+	}
+	now := time.Now().UTC()
+	var projectName, batchName string
+	if err := s.db.QueryRowContext(ctx, `select project.name,batch.name from orchestration_batches batch join projects project on project.id=batch.project_id where batch.id=?`, batchID).Scan(&projectName, &batchName); err != nil {
+		return
+	}
+	var needsAction int
+	if err := s.db.QueryRowContext(ctx, `select count(*) from task_orchestration_jobs job where job.batch_id=? and job.status in ('needs_human','stopped','removing')`, batchID).Scan(&needsAction); err != nil {
+		return
+	}
+	// 多个任务可以几乎同时结束。把「是否全部结束」和「标记已通知」合成一次条件更新，
+	// 只有抢到这一行的调用才能广播，避免同一批次被重复通知。
+	claim, err := s.db.ExecContext(ctx, `update orchestration_batches set completion_notified_at=? where id=? and completion_notified_at is null and exists(select 1 from task_orchestration_jobs where batch_id=?) and not exists(select 1 from task_orchestration_jobs job where job.batch_id=? and (exists(select 1 from task_runs active where active.task_id=job.task_id and active.status in ('queued','running')) or (job.status in ('queued','paused','preparing','implementing','checking') and not exists(select 1 from task_runs succeeded where succeeded.task_id=job.task_id and succeeded.status='succeeded'))))`, now, batchID, batchID, batchID)
+	if err != nil {
+		return
+	}
+	claimed, err := claim.RowsAffected()
+	if err != nil || claimed != 1 {
+		return
+	}
+	body := "项目「" + projectName + "」的本次任务已全部完成"
+	if needsAction > 0 {
+		body = "项目「" + projectName + "」的本次任务已结束，有任务需要处理"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"projectId": projectID, "projectName": projectName, "batchId": batchID,
+		"batchName": batchName, "summary": body, "conversationId": conversationID,
+	})
+	// Keep the event identity stable across a retry. A transient relay failure
+	// must not permanently suppress the notification.
+	if err := s.broadcastConversationEventWithError(Event{ID: "orchestration-batch-completed:" + batchID, ConversationID: conversationID, Type: "project.batch_completed", Payload: payload, CreatedAt: now}); err != nil {
+		// Keep the batch retryable when the durable mobile relay could not be
+		// written. A later terminal-state check can retry it; the stable event ID
+		// makes that retry idempotent.
+		_, _ = s.db.ExecContext(ctx, `update orchestration_batches set completion_notified_at=null where id=? and completion_notified_at is not null`, batchID)
+		return
+	}
+}
+
+func (s *Server) notifyCompletedOrchestrationBatchForTask(taskID string) {
+	var batchID, projectID, conversationID string
+	if err := s.db.QueryRowContext(s.runtimeCtx, `select coalesce(job.batch_id,''),coalesce(job.project_id,''),coalesce((select tr.conversation_id from task_runs tr where tr.task_id=job.task_id order by tr.created_at desc,tr.id desc limit 1),'') from task_orchestration_jobs job where job.task_id=?`, taskID).Scan(&batchID, &projectID, &conversationID); err != nil {
+		return
+	}
+	s.notifyCompletedOrchestrationBatchByID(batchID, projectID, conversationID)
 }
 func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "runID")
@@ -6250,15 +6457,18 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 	s.streamMu.Lock()
 	defer s.streamMu.Unlock()
 
-	type activeRun struct{ id string }
-	rows, err := s.db.QueryContext(ctx, `select id from runs where conversation_id=? and status in ('queued','running')`, conversationID)
+	type activeRun struct {
+		id     string
+		status string
+	}
+	rows, err := s.db.QueryContext(ctx, `select id,status from runs where conversation_id=? and status in ('queued','running')`, conversationID)
 	if err != nil {
 		return "", http.StatusInternalServerError, err
 	}
 	activeRuns := []activeRun{}
 	for rows.Next() {
 		var run activeRun
-		if err := rows.Scan(&run.id); err != nil {
+		if err := rows.Scan(&run.id, &run.status); err != nil {
 			rows.Close()
 			return "", http.StatusInternalServerError, err
 		}
@@ -6290,6 +6500,26 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 	}
 	if session != nil {
 		session.Stop()
+	}
+	// Queued turns have no process to cancel. Remove *all* process-local launch
+	// records before finalizing any one of them: finishRun advances the FIFO
+	// queue, and doing this one at a time would otherwise start the next queued
+	// turn during a force-stop.
+	nonStreamingQueued := make(map[string]bool, len(activeRuns))
+	s.mu.Lock()
+	for _, run := range activeRuns {
+		if run.status == "queued" {
+			if _, ok := s.nonStreamingLaunches[run.id]; ok {
+				nonStreamingQueued[run.id] = true
+				delete(s.nonStreamingLaunches, run.id)
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, run := range activeRuns {
+		if nonStreamingQueued[run.id] {
+			s.finishRun(run.id, conversationID, "stopped", context.Canceled)
+		}
 	}
 	for _, run := range activeRuns {
 		s.resolveRunApprovals(run.id, "deny")
@@ -6543,11 +6773,18 @@ func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) 
 // persisting it. Most events belong to a Run and use appendEvent; orchestration
 // status messages deliberately have no Run, while events.run_id is required.
 func (s *Server) broadcastConversationEvent(event Event) {
+	_ = s.broadcastConversationEventWithError(event)
+}
+
+func (s *Server) broadcastConversationEventWithError(event Event) error {
+	var relayErr error
 	if err := s.enqueueRemoteEventWithConversation(context.Background(), event.ID, "", event.RunID, event.ConversationID, event.Type, event.Payload, event.CreatedAt); err != nil {
 		log.Printf("queue remote %s event: %v", event.Type, err)
+		relayErr = err
 	}
 	data, _ := json.Marshal(event)
 	s.enqueueConversationEvent(event.ConversationID, data)
+	return relayErr
 }
 
 // enqueueConversationEvent keeps agent output independent from WebSocket I/O.

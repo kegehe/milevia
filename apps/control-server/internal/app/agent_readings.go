@@ -261,6 +261,62 @@ func (s *Server) cachedAgentDiagnostics(runnerID string) (runnerDiagnosticsView,
 	return *entry.diagnostics, true
 }
 
+// cachedAgentStatusesForRemote 返回远程快照可立即使用的工具状态。
+// 快照不能同步等待 WSL/SSH 冷启动探测；过期读数仍可回放给手机端，同时由调用方
+// 在后台触发一次统一探测。没有任何读数时返回 false，客户端应按不可用处理。
+func (s *Server) cachedAgentStatusesForRemote(runnerID string) ([]AgentStatus, bool, bool) {
+	s.agentReadingsMu.Lock()
+	entry, ok := s.agentReadings[runnerID]
+	if !ok || len(entry.statuses) == 0 {
+		s.agentReadingsMu.Unlock()
+		return nil, false, false
+	}
+	statuses := append([]AgentStatus(nil), entry.statuses...)
+	fresh := entry.fresh(time.Now())
+	s.agentReadingsMu.Unlock()
+
+	// Maintenance is intentionally not cached: replaying a ready result while an
+	// installation is replacing the binary can let a new session start against a
+	// half-written tool. Overlay the live maintenance flag on the copied result.
+	s.runnerMaintenanceMu.Lock()
+	for index := range statuses {
+		if s.runnerUpdating[runnerAgentKey{runnerID: runnerID, agentID: statuses[index].ID}] {
+			statuses[index].Status = agentStatusUpdating
+			statuses[index].Version = ""
+			statuses[index].Reason = ""
+		}
+	}
+	s.runnerMaintenanceMu.Unlock()
+	return statuses, true, fresh
+}
+
+// triggerAgentProbeForRemote starts at most one background refresh for a
+// runner. A remote snapshot can contain many projects on the same runner and
+// is requested repeatedly while a cold WSL/SSH probe is still in flight.
+func (s *Server) triggerAgentProbeForRemote(meta RunnerMeta) {
+	s.remoteAgentProbeMu.Lock()
+	if s.remoteAgentProbeActive == nil {
+		s.remoteAgentProbeActive = map[string]bool{}
+	}
+	if s.remoteAgentProbeActive[meta.ID] {
+		s.remoteAgentProbeMu.Unlock()
+		return
+	}
+	s.remoteAgentProbeActive[meta.ID] = true
+	s.remoteAgentProbeMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.remoteAgentProbeMu.Lock()
+			delete(s.remoteAgentProbeActive, meta.ID)
+			s.remoteAgentProbeMu.Unlock()
+		}()
+		probeCtx, cancel := s.agentProbeContext()
+		defer cancel()
+		_, _ = s.probeAgentsFor(probeCtx, meta, false)
+	}()
+}
+
 // storeAgentDiagnostics 把这一轮结果挂到读数上。
 //
 // **读数变了就不存** —— 报告是照着那份读数算出来的，读数一变它就不作数了。

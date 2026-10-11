@@ -21,6 +21,8 @@ const TREE_ID = "file-tree";
 // 与 TREE_ID 同一个前提：页面上同时只会有一棵树。
 const SEARCH_LIST_ID = "file-tree-search-results";
 const SEARCH_OPTION_ID_PREFIX = "file-tree-search-option-";
+// 搜索会遍历整个项目；短暂等待用户停下输入，避免每个字符都触发一次遍历。
+const LIVE_SEARCH_DEBOUNCE_MS = 250;
 
 async function copyToClipboard(text: string): Promise<boolean> {
   if (navigator.clipboard?.writeText) {
@@ -441,6 +443,7 @@ export function ProjectFileTree({
   // 结果列表容器。键盘上下选中的那条要跟着滚进可视区，否则用 ↑↓ 选到列表外的项时看不见。
   const searchListRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchDebounceRef = useRef<number | null>(null);
   /**
    * 搜索请求的序号，用来丢弃过期响应。输入一变、或又发了一次搜索，先前那次的结果就不作数。
    *
@@ -461,6 +464,12 @@ export function ProjectFileTree({
     setSearchPending(false);
   }, []);
 
+  const cancelScheduledSearch = useCallback(() => {
+    if (searchDebounceRef.current === null) return;
+    window.clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = null;
+  }, []);
+
   /**
    * 换了项目 / 会话就等于换了工作区，上一个工作区的搜索结果（路径、"已打开"标记）在这里没有意义。
    *
@@ -469,10 +478,11 @@ export function ProjectFileTree({
    * 所以搜索状态得自己清。还在飞的那次搜索也要一并作废，否则它会把旧工作区的结果挂上来。
    */
   useEffect(() => {
+    cancelScheduledSearch();
     invalidateSearch();
     setSearchResults(null);
     setSearchQuery("");
-  }, [projectId, conversationId, invalidateSearch]);
+  }, [projectId, conversationId, invalidateSearch, cancelScheduledSearch]);
 
   const showError = useCallback((message: string) => {
     setError(message);
@@ -570,6 +580,7 @@ export function ProjectFileTree({
     (dirPath?: string, preferPath?: string) => {
       // 结果列表是**某一刻**树快照上的命中：新建/改名/删除之后它列的路径可能已经不存在，
       // 点下去只会得到一个"文件不存在"。刷了树就把它撤掉，让用户重搜一次。
+      cancelScheduledSearch();
       setSearchResults(null);
       invalidateSearch(); // 顺手作废还在飞的那次搜索，免得它把旧结果又挂回来
       if (dirPath === undefined) {
@@ -582,7 +593,7 @@ export function ProjectFileTree({
         .refreshDir(dirPath, dirPath || "root")
         .then(() => settleEnvironmentSelection(dirPath, preferPath));
     },
-    [provider, settleEnvironmentSelection, invalidateSearch]
+    [provider, settleEnvironmentSelection, invalidateSearch, cancelScheduledSearch]
   );
 
   // 暴露刷新方法给父组件
@@ -644,7 +655,7 @@ export function ProjectFileTree({
   }, []);
 
   // 搜索
-  const handleSearch = useCallback(async () => {
+  const handleSearch = useCallback(async (openSingleResult = true) => {
     const query = searchQuery.trim();
     if (!query) {
       setSearchResults(null);
@@ -663,13 +674,14 @@ export function ProjectFileTree({
       const entries = res.entries || [];
       if (entries.length === 0) {
         setSearchResults(null);
-        showError("未找到匹配的文件");
+        if (openSingleResult) showError("未找到匹配的文件");
+        else setError(null);
         return;
       }
       // 只命中一条就直接打开：没有"挑哪一个"的问题，多一次点击纯属仪式感。
       // 命中多条则列出来让用户自己挑 —— 直接打开第一条正是以前那个毛病的来源。
       const only = entries[0];
-      if (entries.length === 1 && only) {
+      if (openSingleResult && entries.length === 1 && only) {
         setSearchResults(null);
         onFileSelect(only.path, only.name);
         setError(null); // 上一次"未找到"的红条不能留在屏幕上，这次明明找到了
@@ -688,6 +700,19 @@ export function ProjectFileTree({
     }
   }, [searchQuery, projectId, request, onFileSelect, showError, conversationId]);
 
+  // 输入停止后立即更新匹配列表。实时搜索只展示结果，不能因为输入时恰好唯一命中就擅自跳转文件。
+  useEffect(() => {
+    cancelScheduledSearch();
+    invalidateSearch();
+    setSearchResults(null);
+    if (!searchQuery.trim()) return;
+    searchDebounceRef.current = window.setTimeout(() => {
+      searchDebounceRef.current = null;
+      void handleSearch(false);
+    }, LIVE_SEARCH_DEBOUNCE_MS);
+    return cancelScheduledSearch;
+  }, [searchQuery, handleSearch, invalidateSearch, cancelScheduledSearch]);
+
   // 键盘操作都挂在输入框上（焦点一直在那儿）：↑↓ 换选中项，回车打开，Esc 收起。
   const handleSearchKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -697,7 +722,10 @@ export function ProjectFileTree({
         // 搜索不受取树的 loading 影响（两条链路互不依赖），所以这里不再等它 ——
         // 否则展开一个目录的那几秒里，回车会静悄悄什么都不做。
         if (searchResults) openSearchResult(searchResults.activeIndex);
-        else void handleSearch();
+        else {
+          cancelScheduledSearch();
+          void handleSearch();
+        }
         return;
       }
       // Esc 排在最前：它要管的是"列表开着"和"搜索还在飞"两种状态，而下面那行
@@ -705,10 +733,11 @@ export function ProjectFileTree({
       // 几百毫秒后列表照样冒出来。
       if (e.key === "Escape") {
         // 没东西可取消时别吞掉 Esc（树那边可能还有别的用途）。
-        if (!searchResults && !searchPending) return;
+        if (!searchResults && !searchPending && searchDebounceRef.current === null) return;
         e.preventDefault();
         // "我不要这个列表了"：光把已摆出来的收起来不够，在飞的那次也得作废。
         invalidateSearch();
+        cancelScheduledSearch();
         setSearchResults(null);
         return;
       }
@@ -721,7 +750,7 @@ export function ProjectFileTree({
         moveSearchActive(-1);
       }
     },
-    [searchResults, searchPending, handleSearch, openSearchResult, moveSearchActive, invalidateSearch]
+    [searchResults, searchPending, handleSearch, openSearchResult, moveSearchActive, invalidateSearch, cancelScheduledSearch]
   );
 
   // 键盘换行后把选中项滚进可视区。`block: "nearest"` 保证已经在视野里时不动。
@@ -756,10 +785,6 @@ export function ProjectFileTree({
             value={searchQuery}
             onChange={(e) => {
               setSearchQuery(e.target.value);
-              // 结果列表必须和输入框里的词对得上。改了词还挂着旧结果，
-              // 用户点下去打开的是"上一个词"命中的文件，而屏幕上写着新词。
-              invalidateSearch();
-              setSearchResults(null);
             }}
             onKeyDown={handleSearchKeyDown}
           />

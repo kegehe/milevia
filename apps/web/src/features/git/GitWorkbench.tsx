@@ -27,10 +27,19 @@ type ReloadReason = "initial" | "manual" | "reconcile" | "probe";
 interface ReloadOptions {
   /** 刚做过分支操作（切分支 / 新建）：分支列表必须一起对账。 */
   branches?: boolean;
+  /** 操作是否改变了某个 ref，需要让提交历史重新从第一页读取。 */
+  history?: boolean;
 }
 
 type GitOperationResult = { operationId: string; status: "succeeded" | "failed" | "needs_attention"; errorMessage?: string };
 type DiffLine = { content: string; kind: "added" | "removed" | "context" | "hunk" | "meta"; oldLine?: number; newLine?: number };
+
+function isGitStateChangedError(cause: unknown): boolean {
+  if (!cause || typeof cause !== "object") return false;
+  const error = cause as { status?: number; code?: string; message?: string };
+  return error.status === 409
+    && (error.code === "git_state_changed" || error.message?.includes("Git state changed") === true || error.message?.includes("仓库状态") === true);
+}
 type Confirmation =
   | { type: "commit" }
   | { type: "amend" }
@@ -149,6 +158,7 @@ interface GitWorkbenchProps {
 export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(function GitWorkbench({ projectID, conversationId, request, fail, active, mobile = false, initialIsGitRepo = true, onGitInitialized }, ref) {
   const [tab, setTab] = useState<Tab>("changes");
   const [snapshot, setSnapshot] = useState<GitSnapshot | null>(null);
+  const [historyRevision, setHistoryRevision] = useState(0);
   // 非 git 项目一开始就是 false；git init 成功后置 true 并正常加载仓库。
   const [isGitRepo, setIsGitRepo] = useState(initialIsGitRepo);
   const [initializingRepo, setInitializingRepo] = useState(false);
@@ -294,9 +304,12 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       // reconcile / probe **什么都不置**。在位的内容一步都不动 —— 这正是"停在页面上自动
       // 保持最新"与"一直闪"之间唯一的区别（首屏那句「正在读取仓库状态」就是那一闪，
       // 见下面 render 里的 loading 分支）。任何"后台刷新也要转个圈"的想法都会把它带回来。
-      const [nextSnapshot, nextChanges, nextBranches, nextOperations] = await Promise.all([
+      const [nextSnapshot, changesResult, nextBranches, nextOperations] = await Promise.all([
         probeSnapshot ? Promise.resolve(probeSnapshot) : request<GitSnapshot>(withWorkspace(`${base}/summary`)),
-        request<GitChange[]>(withWorkspace(`${base}/changes`)),
+        request<GitChange[]>(withWorkspace(`${base}/changes`)).then(
+          (value) => ({ value } as const),
+          (error) => ({ error } as const),
+        ),
         // 分支列表只在四种情况下要：首屏/手动刷新、用户正看着「分支」tab、刚做过分支操作、
         // 或刚切到那个 tab（`selectTab` 会把 `branches: true` 明确传进来 —— 切 tab 那一刻
         // `tabRef` 还没同步到新值，靠它自己判会漏）。
@@ -312,9 +325,14 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
         full || reason === "reconcile" ? request<GitOperation[]>(withWorkspace(`${base}/operations`)) : null,
       ]);
       if (!mountedRef.current || requestID !== reloadRequest.current) return;
+      if ("error" in changesResult && nextSnapshot.changes === undefined) {
+        throw changesResult.error;
+      }
       snapshotRef.current = nextSnapshot;
       setSnapshot(nextSnapshot);
-      setChanges(nextChanges);
+      // 新版服务端把 changes 和 summary 在同一次 Git 读取中返回，避免两个并发请求跨过一次提交；
+      // 旧版服务端没有该字段时继续使用独立的 changes 接口。
+      setChanges(nextSnapshot.changes ?? ("value" in changesResult ? changesResult.value : []));
       if (nextBranches) setBranches(nextBranches);
       if (nextOperations) setOperations(nextOperations);
       // 主体已经落地：左栏可以显示了。**手动刷新的转圈也到此为止** ——
@@ -424,7 +442,13 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       closeDiff();
       success?.();
     } catch (cause) {
-      if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
+      if (isGitStateChangedError(cause)) {
+        // 写入前的令牌已经过期时，先把清单和新令牌一起换回来，避免用户继续对着旧行重试。
+        await reload("reconcile").catch(() => undefined);
+        if (mountedRef.current) fail("仓库状态已经变化，已刷新变更列表，请确认后再操作");
+      } else if (mountedRef.current) {
+        fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
+      }
     } finally {
       // ⚠️ 但 **busy 要留到对账落地**，而不是写回来就撤。
       //
@@ -439,6 +463,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       if (wrote) {
         // 成功：busy 扣到对账落地。末尾那个 `.catch` 是保险 —— `reload` 自己吞业务错误，
         // 但万一它抛出（那是个 bug），"清 busy 那一句不执行 ⇒ 按钮永远禁着"不该是后果。
+        if (options?.history) setHistoryRevision((value) => value + 1);
         await reload("reconcile", options).catch(() => undefined);
       } else {
         // 失败：对账照发，但**不等它**。
@@ -455,14 +480,14 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const mutatePath = (action: "stage" | "unstage", path: string) => mutate(`${action}:${path}`, action, { paths: [path] });
   const stageAll = () => mutate("stage-all", "stage-all", {});
   const unstageAll = () => mutate("unstage-all", "unstage-all", {});
-  const commit = () => mutate("commit", "commits", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); });
-  const commitAmend = () => mutate("commit_amend", "commits/amend", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); });
+  const commit = () => mutate("commit", "commits", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); }, { history: true });
+  const commitAmend = () => mutate("commit_amend", "commits/amend", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); }, { history: true });
   const discardWorktree = (path: string, untracked: boolean) => mutate(`discard:${path}`, "discard", { mode: "worktree", paths: [path], includeUntracked: untracked }, () => setConfirmation(null));
   const discardAll = (includeUntracked: boolean) => mutate("discard-all", "discard", { mode: "all", includeUntracked }, () => setConfirmation(null));
-  const fetchRemote = (remote: string) => mutate("fetch", "fetch", { remote }, () => setConfirmation(null));
-  const pullRemote = (remote: string, branch: string) => mutate("pull", "pull", { remote, branch }, () => setConfirmation(null));
-  const pushBranch = (remote: string, branch: string, setUpstream: boolean) => mutate("push", "push", { remote, branch, setUpstream }, () => setConfirmation(null));
-  const switchBranch = (branch: string) => mutate("switch-branch", "switch", { branch }, () => setConfirmation(null), { branches: true });
+  const fetchRemote = (remote: string) => mutate("fetch", "fetch", { remote }, () => setConfirmation(null), { history: true });
+  const pullRemote = (remote: string, branch: string) => mutate("pull", "pull", { remote, branch }, () => setConfirmation(null), { history: true });
+  const pushBranch = (remote: string, branch: string, setUpstream: boolean) => mutate("push", "push", { remote, branch, setUpstream }, () => setConfirmation(null), { history: true });
+  const switchBranch = (branch: string) => mutate("switch-branch", "switch", { branch }, () => setConfirmation(null), { branches: true, history: true });
   const pullTarget = gitPullTarget(snapshot);
 
   // 非 git 项目在空态里发起 git init：成功后置 isGitRepo、通知宿主刷新项目、再加载仓库状态。
@@ -496,7 +521,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const requestAbortConflict = () => setConfirmation({ type: "conflict-abort" });
   const requestFinishConflict = () => setConfirmation({ type: "conflict-finish" });
   const abortConflict = () => mutate("conflict-abort", "conflicts/abort", {}, () => { closeConflict(); setConfirmation(null); });
-  const finishConflict = () => mutate("conflict-finish", "conflicts/continue", {}, () => { closeConflict(); setConfirmation(null); });
+  const finishConflict = () => mutate("conflict-finish", "conflicts/continue", {}, () => { closeConflict(); setConfirmation(null); }, { history: true });
 
   const createBranch = async (name: string, startPoint: string) => {
     if (!mountedRef.current) return;
@@ -514,7 +539,10 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法创建分支");
     } finally {
       // 同 mutate：成功才等对账（令牌要换新），失败不等（别把用户扣在卡死的弹窗里）。
-      if (wrote) await reload("reconcile", { branches: true }).catch(() => undefined);
+      if (wrote) {
+        setHistoryRevision((value) => value + 1);
+        await reload("reconcile", { branches: true }).catch(() => undefined);
+      }
       else void reload("reconcile", { branches: true });
       if (mountedRef.current) setMutating("");
     }
@@ -555,7 +583,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
           "屏幕上这份数据不属于当前工作区"，不需要再加一个 snapshot 非空的限定。 */}
       {loading ? <GitSkeleton /> : !snapshot ? <div className="git-empty">无法读取仓库状态</div> : <>
         {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
-        {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch) => setConfirmation({ type: "switch-branch", branch })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
+        {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} historyRevision={historyRevision} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch) => setConfirmation({ type: "switch-branch", branch })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
       </>}
     </main>
     {confirmation && <GitConfirmation confirmation={confirmation} snapshot={snapshot} conflictOverview={conflictOverview} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} commitAmend={commitAmend} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pullRemote={pullRemote} pushBranch={pushBranch} switchBranch={switchBranch} abortConflict={abortConflict} finishConflict={finishConflict} />}
@@ -967,7 +995,7 @@ function CommitDetailView({ commit, detail, loading, error, selectedFile, fileDi
   </div>;
 }
 
-function Branches({ branches, mutating, projectID, conversationId, request, fail, requestSwitchBranch, requestCreateBranch }: { branches: GitBranch[]; mutating: string; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; requestSwitchBranch: (branch: string) => void; requestCreateBranch: (name: string, startPoint: string) => void }) {
+function Branches({ branches, historyRevision, mutating, projectID, conversationId, request, fail, requestSwitchBranch, requestCreateBranch }: { branches: GitBranch[]; historyRevision: number; mutating: string; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; requestSwitchBranch: (branch: string) => void; requestCreateBranch: (name: string, startPoint: string) => void }) {
   const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   const [showForm, setShowForm] = useState(false);
   const [newName, setNewName] = useState("");
@@ -985,6 +1013,7 @@ function Branches({ branches, mutating, projectID, conversationId, request, fail
   const [historyQuery, setHistoryQuery] = useState("");
   const [pendingQuery, setPendingQuery] = useState("");
   const historyRequest = useRef(0);
+  const historyRevisionRef = useRef(historyRevision);
   const prevSelectionRef = useRef("");
   const [selectedCommit, setSelectedCommit] = useState<GitCommit | null>(null);
   const [commitDetail, setCommitDetail] = useState<GitCommitDetail | null>(null);
@@ -1001,6 +1030,21 @@ function Branches({ branches, mutating, projectID, conversationId, request, fail
   const currentName = branches.find((b) => b.current)?.name || "";
   // 选中分支不存在时回退到当前分支，保证始终有一个分支处于选中态。
   const effectiveSelection = selected && branches.some((b) => b.name === selected) ? selected : currentName;
+  useEffect(() => {
+    if (historyRevisionRef.current === historyRevision) return;
+    historyRevisionRef.current = historyRevision;
+    historyRequest.current++;
+    detailRequest.current++;
+    fileDiffRequest.current++;
+    setBranchCommits([]);
+    setHistoryHasMore(false);
+    setHistoryError("");
+    setSelectedCommit(null);
+    setCommitDetail(null);
+    setDetailError("");
+    setSelectedFile(null);
+    setFileDiff(null);
+  }, [historyRevision]);
   const handleCreate = () => {
     if (!newName.trim()) return;
     requestCreateBranch(newName.trim(), startPoint.trim());
@@ -1040,7 +1084,7 @@ function Branches({ branches, mutating, projectID, conversationId, request, fail
     return () => { historyRequest.current++; };
     // withWorkspace 仅追加 conversationId，纳入依赖会导致每次渲染重复拉取。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectID, effectiveSelection, pendingQuery, request, fail]);
+  }, [projectID, effectiveSelection, pendingQuery, historyRevision, request, fail]);
 
   // 加载更多：在当前已显示的提交之后继续取一页，相同检索词下追加。
   const loadMoreHistory = () => {

@@ -32,11 +32,12 @@ test("插件的 prompt 两态映射成 default，才能让既有的开启通知�
   assert.equal(toNotificationPermission("something-else"), "unsupported");
 });
 
-test("只有任务/运行/审批类事件打断用户，会话消息不打扰", () => {
+test("只有任务/运行/审批/项目批次完成事件打断用户，会话消息不打扰", () => {
   assert.equal(isInterruptingMobileEvent("task.done"), true);
   assert.equal(isInterruptingMobileEvent("task.awaiting_review"), true);
   assert.equal(isInterruptingMobileEvent("run.completed"), true);
   assert.equal(isInterruptingMobileEvent("approval.pending"), true);
+  assert.equal(isInterruptingMobileEvent("project.batch_completed"), true);
   // 会话消息回到 App 就能看到
   assert.equal(isInterruptingMobileEvent("assistant.delta"), false);
   assert.equal(isInterruptingMobileEvent("assistant.message"), false);
@@ -46,27 +47,35 @@ test("只有任务/运行/审批类事件打断用户，会话消息不打扰", 
   assert.equal(isInterruptingMobileEvent(42), false);
 });
 
-test("通知文案沿用 summary → 状态 → 事件类型的三级回退", () => {
+test("通知文案使用中文，并等待项目批次完成事件", () => {
   assert.deepEqual(
     mobileNotificationContent({ type: "task.done", taskId: "t1", payload: { summary: "任务已完成", projectId: "p1", conversationId: "c1" } }),
-    { title: "Milevia", body: "任务已完成", projectId: "p1", conversationId: "c1", taskId: "t1" },
+    { title: "任务状态提醒", body: "任务已完成", projectId: "p1", conversationId: "c1", taskId: "t1" },
   );
   assert.equal(
     mobileNotificationContent({ type: "run.failed", payload: { status: "failed" } })?.body,
-    "状态：failed",
+    "任务执行失败",
   );
-  // 两个字段都没有时退回事件类型，不能是空字符串（空 body 的通知在通知栏里是一行空标题）
-  assert.equal(mobileNotificationContent({ type: "task.action_required", payload: {} })?.body, "task.action_required");
-  assert.equal(mobileNotificationContent({ type: "task.done" })?.body, "task.done");
+  assert.equal(
+    mobileNotificationContent({ type: "run.completed", payload: { status: "completed", projectName: "Alpha" } })?.body,
+    "项目「Alpha」的任务已完成",
+  );
+  assert.equal(mobileNotificationContent({ type: "task.action_required", payload: {} })?.body, "任务状态已更新");
+  assert.equal(mobileNotificationContent({ type: "task.done" })?.body, "任务状态已更新");
+  assert.equal(mobileNotificationContent({ type: "run.completed", payload: { status: "completed", batchId: "batch-1" } }), null);
+  assert.deepEqual(
+    mobileNotificationContent({ type: "project.batch_completed", payload: { projectId: "p1", conversationId: "c1", summary: "项目「Alpha」的本次任务已全部完成" } }),
+    { title: "项目任务完成", body: "项目「Alpha」的本次任务已全部完成", projectId: "p1", conversationId: "c1", taskId: "" },
+  );
   // 不值得打扰的事件直接不给内容
   assert.equal(mobileNotificationContent({ type: "assistant.delta", payload: { delta: "x" } }), null);
   // 跳转目标缺失时给空串、不给 undefined，调用方判空即可
   assert.deepEqual(
     mobileNotificationContent({ type: "task.done", payload: { summary: "s" } }),
-    { title: "Milevia", body: "s", projectId: "", conversationId: "", taskId: "" },
+    { title: "任务状态提醒", body: "s", projectId: "", conversationId: "", taskId: "" },
   );
   // payload 不是对象时不能抛
-  assert.equal(mobileNotificationContent({ type: "task.done", payload: "not-an-object" })?.body, "task.done");
+  assert.equal(mobileNotificationContent({ type: "task.done", payload: "not-an-object" })?.body, "任务状态已更新");
   // taskId 有两个来源，缺一不可：task.* 事件只在**信封**上有（payload 里没有项目/会话字段），
   // run.* 事件反过来 —— 信封为空，是控制端主动塞进 payload 的。
   assert.equal(mobileNotificationContent({ type: "task.created", taskId: "t9", payload: { status: "todo" } })?.taskId, "t9");

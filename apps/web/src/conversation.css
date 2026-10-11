@@ -233,7 +233,17 @@
 .message-copy::after { transform: translate(2px, 2px); background: #fbfefb; }
 .message-copy:hover { color: #1f5e50; background: #e3f2e9; }
 .message-copy:focus-visible {  outline: 2px solid #2b7b68; outline-offset: 2px;  }
-.message-copy.copied { color: #287a48; }
+/* 成功后直接替换为勾选图标，不能只换颜色，否则用户难以确认复制是否完成。 */
+.message-copy.copied { color: #287a48; background: #e2f4e8; }
+.message-copy.copied::before {
+  width: 12px;
+  height: 7px;
+  transform: translate(0, -1px) rotate(-45deg);
+  border-width: 0 0 2px 2px;
+  border-radius: 0;
+  opacity: 1;
+}
+.message-copy.copied::after { display: none; }
 
 /* ---- 工具卡片 ------------------------------------------------------------ */
 .tool-meta { display: flex; align-items: center; gap: 8px; }
@@ -3486,6 +3496,17 @@
 .composer-skill-ref-remove:hover:not(:disabled) { color: #fff; background: #2c7567; }
 .composer-skill-ref-remove:disabled { color: #9db3a9; }
 .composer-input-area { position: relative; }
+.composer-input-area textarea { padding-right: 54px; }
+.composer-history-position {
+  position: absolute;
+  z-index: 1;
+  top: 8px;
+  right: 11px;
+  color: #78958a;
+  font: 600 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  pointer-events: none;
+  user-select: none;
+}
 .composer-mobile-shortcut-toggle,
 .mobile-shortcut-menu { display: none; }
 

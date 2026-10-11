@@ -25,10 +25,8 @@ test("项目列表刷新不等远端连通性探测", () => {
 test("加载项目不再被环境就绪度阻塞（空目录/无环境也能加载）", () => {
   // 「确认加载」按钮不再因为 agentReady=false 禁用，只由正常加载状态控制。
   assert.doesNotMatch(importProjectPage, /disabled=\{!result\?\.agentReady/);
-  assert.match(importProjectPage, /disabled=\{busy \|\| loadingDirectory \|\| !directoryReady \|\| !result\}/);
-  // 环境不可用时不阻断，改为提示「仍可加载」。
-  assert.match(importProjectPage, /环境不可用，仍可加载；新建会话时可安装或升级 CLI 工具/);
-  assert.match(importProjectPage, /仍可加载/);
+  assert.match(importProjectPage, /disabled=\{busy \|\| loadingDirectory \|\| !directoryReady\}/);
+  // 目录浏览完成后直接提示可加载。
 });
 
 test("项目总览页保持事件驱动刷新 + 30 秒兜底轮询", () => {

@@ -25,6 +25,25 @@ import "net/http"
 // getConversation / clearConversation 那一族对齐，不是可选项。
 func (s *Server) remoteConversationOperations() map[string]remoteOperation {
 	return map[string]remoteOperation{
+		// 历史会话目录按项目读取。它只返回会话元数据与预览，不经云端持久化；
+		// 完整消息在用户选中某条会话后由 conversation.history 按页读取。
+		"conversation.list": {
+			Method: http.MethodGet,
+			Path:   "/conversations",
+			Query:  true,
+			Handle: s.listConversations,
+		},
+		// 复用桌面端已有的游标分页接口。上限低于中继帧限制，避免一页历史
+		// 因为超长助手回复而断开整条 Agent 连接。
+		"conversation.history": {
+			Method:   http.MethodGet,
+			Scope:    relayScopeConversation,
+			Path:     "",
+			Query:    true,
+			MaxBytes: 320 << 10,
+			Label:    "会话历史",
+			Handle:   s.getConversation,
+		},
 		// 停止这条会话当前在跑的那一轮。
 		//
 		// 它按**会话**停而不是按 run 停，与桌面端的 `POST /api/runs/{runID}/stop` 是两件事：

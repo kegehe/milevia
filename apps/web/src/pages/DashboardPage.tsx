@@ -57,6 +57,7 @@ function CliToolsIcon() {
 }
 
 export default function DashboardPage() {  const { projects, projectStatuses, error, setError, refreshProjects, removeProject, api } = useProjectContext();
+  const desktop = isDesktop();
   const processStatuses = useProcessStatusMap();
   const navigate = useNavigate();
   const [filter, setFilter] = useState<ProjectFilter>("all");
@@ -164,7 +165,7 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
 
   return <main className="app-shell">
     {error && <div className="error"><span>{error}</span><button title="关闭错误提示" onClick={() => setError("")}>x</button></div>}
-    <header className="dashboard-bar">
+    <header className={`dashboard-bar${desktop ? " dashboard-bar-fixed" : ""}`}>
       <a className="brand" href="/"><img className="brand-mark" src="/milevia-mark.svg" width="42" height="42" alt="" /><span className="brand-word"><strong>Mile</strong><em>via</em></span></a>
       <div className="dashboard-actions">
         <NotificationCenter />
@@ -198,7 +199,7 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
         })()
           : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
     </section>
-    {isDesktop() && <div className="dashboard-version"><AppVersionTag /></div>}
+    {desktop && <div className="dashboard-version"><AppVersionTag /></div>}
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} status={projectStatuses[deleteTarget.id]} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
   </main>;
 }

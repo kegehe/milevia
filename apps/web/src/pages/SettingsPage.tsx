@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { Capacitor } from "@capacitor/core";
+import { LocalNotifications } from "@capacitor/local-notifications";
 import { toast } from "sonner";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useUIPreferences, type AppPreferences } from "../stores/useUIPreferences";
@@ -20,6 +22,8 @@ import {
   IDLE_POLL_MS,
   type UpdaterStatus,
 } from "../features/updater/update-view";
+import { readMobileAppInfo } from "../features/updater/mobile-update";
+import { formatAppVersion } from "../features/updater/android-release";
 import "./settings.css";
 
 type InstallUpdateResult = { installed: boolean };
@@ -130,6 +134,8 @@ export default function SettingsPage() {
   const [resetLocalOpen, setResetLocalOpen] = useState(false);
   const [draftVersion, setDraftVersion] = useState(0);
   const [updaterStatus, setUpdaterStatus] = useState<UpdaterStatus | null>(null);
+  const [mobileVersion, setMobileVersion] = useState<string | null>(null);
+  const [mobileNotificationPermission, setMobileNotificationPermission] = useState<"granted" | "denied" | "default" | "unsupported">("unsupported");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [openingDataDirectory, setOpeningDataDirectory] = useState(false);
@@ -139,6 +145,16 @@ export default function SettingsPage() {
   const [storageCleaning, setStorageCleaning] = useState(false);
   const [storageConfirmOpen, setStorageConfirmOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>(readTabFromHash);
+  const nativeNotificationsAvailable = Capacitor.isNativePlatform();
+  useEffect(() => {
+    if (!nativeNotificationsAvailable) return;
+    void LocalNotifications.checkPermissions().then((status) => {
+      setMobileNotificationPermission(status.display === "granted" ? "granted" : status.display === "denied" ? "denied" : "default");
+    }).catch(() => setMobileNotificationPermission("unsupported"));
+    void readMobileAppInfo().then((info) => {
+      if (info) setMobileVersion(formatAppVersion(info.version, info.build));
+    });
+  }, [nativeNotificationsAvailable]);
   const tabsRef = useRef<HTMLDivElement | null>(null);
   const draftCount = useMemo(() => countStoredConversationDrafts(localPreferences.draftRetentionDays), [draftVersion, localPreferences.draftRetentionDays]);
 
@@ -278,6 +294,22 @@ export default function SettingsPage() {
     toast.error(permission === "denied" ? "系统通知已被拒绝，请在浏览器或系统的通知设置里允许。" : "当前环境不支持系统通知。");
   };
 
+  const toggleMobileSystemNotifications = async (enabled: boolean) => {
+    if (!enabled) {
+      updateLocalPreferences({ systemNotificationsEnabled: false });
+      return;
+    }
+    try {
+      const status = await LocalNotifications.requestPermissions();
+      const permission = status.display === "granted" ? "granted" : status.display === "denied" ? "denied" : "default";
+      setMobileNotificationPermission(permission);
+      if (permission === "granted") updateLocalPreferences({ systemNotificationsEnabled: true });
+      else toast.error(permission === "denied" ? "系统通知已被拒绝，请在系统设置中允许。" : "当前环境不支持系统通知。");
+    } catch {
+      toast.error("无法请求系统通知权限。");
+    }
+  };
+
   const resetLocal = () => {
     try { window.localStorage.removeItem(CODE_FONT_SIZE_STORAGE_KEY); } catch { /* reset current view below */ }
     resetProjectOrder();
@@ -359,6 +391,9 @@ export default function SettingsPage() {
         </div>}
 
         {activeTab === "notifications" && <div className="settings-grid">
+          {nativeNotificationsAvailable && <SettingCard title="移动端系统通知" description={mobileNotificationPermission === "granted" ? "系统通知已获授权。" : mobileNotificationPermission === "denied" ? "系统通知已被拒绝。" : "开启后会请求系统通知授权。"}>
+            <Toggle label="移动端系统通知" checked={localPreferences.systemNotificationsEnabled} disabled={mobileNotificationPermission === "unsupported"} onChange={(checked) => void toggleMobileSystemNotifications(checked)} />
+          </SettingCard>}
           {/* 两条 Web Notification 开关只在浏览器里有意义（桌面端/原生包的支持判定见
               stores/useUIPreferences.tsx → webNotificationsSupported）：在桌面端留着它们，
               用户点了只会得到"已被拒绝"，而那个 denied 存在应用自己的 WebView2 profile 里，
@@ -440,6 +475,9 @@ export default function SettingsPage() {
         </div>}
 
         {activeTab === "about" && <div className="settings-grid">
+          {nativeNotificationsAvailable && <SettingCard wide title="当前版本" description="当前安装的移动端版本。">
+            <span className="settings-value">{mobileVersion ?? "读取中…"}</span>
+          </SettingCard>}
           {isDesktop() && <SettingCard wide title="当前版本" description={settingsUpdateDescription(updaterStatus, updaterError)}>
             <button type="button" className="secondary" disabled={checkingUpdate || installingUpdate} onClick={() => void checkForUpdate()}>{checkingUpdate ? "检查中" : "检查更新"}</button>
             {installableUpdate(updaterStatus)

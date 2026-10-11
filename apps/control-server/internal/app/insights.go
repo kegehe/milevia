@@ -1324,6 +1324,23 @@ func validateInsightVerdict(verdict insightVerifyVerdict, candidateCount int) er
 	return nil
 }
 
+// insightVerifyResultErrorMessage keeps the scan failure actionable without
+// exposing a model response. The verification contract is intentionally
+// strict: every Pass A candidate needs exactly one Pass B verdict, otherwise
+// an unverified suggestion could be shown as confirmed.
+func insightVerifyResultErrorMessage(err error) string {
+	detail := "返回内容不是有效 JSON"
+	if err != nil {
+		switch {
+		case strings.HasPrefix(err.Error(), "incomplete verdict:"):
+			detail = "核实结论数量不完整"
+		case strings.HasPrefix(err.Error(), "invalid candidate index:"), strings.HasPrefix(err.Error(), "duplicate candidate index:"):
+			detail = "核实结论的候选编号无效"
+		}
+	}
+	return "核实代理未返回有效结果（" + detail + "），已自动重试一次，请重试"
+}
+
 // ─── 建议再验证（re-verify）───────────────────────────────────────────────
 //
 // 扫描时的 Pass B 只保证「报告当下」候选真实存在；此后项目可能被其它任务迭代
@@ -2716,7 +2733,7 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 			if errors.Is(bErr, errInsightVerifyRunner) {
 				markFailed(insightRunErrorMessage("建议核实失败", bErr))
 			} else {
-				markFailed("核实代理未返回有效结果，请重试")
+				markFailed(insightVerifyResultErrorMessage(bErr))
 			}
 			return
 		}

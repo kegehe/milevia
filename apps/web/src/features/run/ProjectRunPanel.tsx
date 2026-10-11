@@ -18,9 +18,10 @@ function emptyRunConfig(): RunConfig {
 	return { workDir: "", command: "", envVars: {}, executionTarget: "auto", commands: [], selectedCommandId: "" };
 }
 
-/** 补齐后端可能返回 null 的字段（老配置没有 commands），界面各处就不必再各自兜底。 */
+/** 补齐后端可能返回 null 的字段（老配置没有 commands），并清理旧版名称字段。 */
 function normalizeRunConfig(config: RunConfig): RunConfig {
-	return { ...emptyRunConfig(), ...config, envVars: config.envVars || {}, commands: config.commands || [] };
+	const commands = (config.commands || []).map(({ id, command, envVars }) => ({ id, command, ...(envVars ? { envVars } : {}) }));
+	return { ...emptyRunConfig(), ...config, envVars: config.envVars || {}, commands };
 }
 
 function mergeLogs(previous: LogEntry[], entries: LogEntry[]): LogEntry[] {
@@ -49,12 +50,12 @@ function environmentValidationError(envVars: Record<string, string>): string | n
 	return null;
 }
 
-/** 逐条校验启动命令：只填了名称或变量的空命令会被后端拒绝，这里先给出可读提示。
- *  名称、命令、变量全都空的行是"添加一条"留下的空壳，保存时后端会忽略它，故不报错。 */
+/** 逐条校验启动命令：带专属变量的空命令会被后端拒绝，这里先给出可读提示。
+ *  命令与变量全都空的行是"添加一条"留下的空壳，保存时后端会忽略它，故不报错。 */
 function commandsValidationError(commands: RunCommand[]): string | null {
 	for (const [index, command] of commands.entries()) {
 		const envVars = command.envVars || {};
-		if (!isRunnableCommand(command) && (command.name.trim() || Object.keys(envVars).length)) return `第 ${index + 1} 条启动命令不能为空`;
+		if (!isRunnableCommand(command) && Object.keys(envVars).length) return `第 ${index + 1} 条启动命令不能为空`;
 		const envError = environmentValidationError(envVars);
 		if (envError) return `启动命令「${runCommandLabel(command, index)}」：${envError}`;
 	}
@@ -520,8 +521,7 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 											<span>{runCommandLabel(item, index)}</span>
 										</label>
 										<div className="run-command-fields">
-											<input type="text" value={item.name} placeholder="名称，如：开发环境" onChange={(e) => updateCommand(item.id, { name: e.target.value })} />
-											<input type="text" value={item.command} placeholder="例如: npm run dev" onChange={(e) => updateCommand(item.id, { command: e.target.value })} />
+											<input type="text" value={item.command} aria-label={`第 ${index + 1} 条启动命令`} placeholder="例如: npm run dev" onChange={(e) => updateCommand(item.id, { command: e.target.value })} />
 											<button type="button" className="run-env-remove" title="删除这条启动命令" aria-label={`删除启动命令 ${runCommandLabel(item, index)}`} onClick={() => removeCommand(item.id)}><CloseIcon /></button>
 										</div>
 										<details className="run-command-env">

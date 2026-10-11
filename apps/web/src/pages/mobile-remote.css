@@ -28,7 +28,7 @@
    实测过：⋯ 按钮右侧 border-box 外 2px 处 elementFromPoint 已落到 <main> 上（正好压在
    ::after 的右边界上，半开区间判为界外），左侧则因为亚像素取整侥幸命中——同一份 CSS
    两侧表现不一致，正是"热区偏小 2px"的典型症状。 */
-.mobile-refresh::after, .mobile-notification-button::after, .mobile-header-menu-button::after { position: absolute; inset: -4px; content: ""; }
+.mobile-refresh::after, .mobile-new-task::after, .mobile-notification-button::after, .mobile-header-menu-button::after { position: absolute; inset: -4px; content: ""; }
 .mobile-remote-header { max-width: 860px; margin: 0 auto 16px; }
 .mobile-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .mobile-brand-mark { width: 36px; height: 36px; flex: none; border-radius: 9px; box-shadow: 0 2px 5px rgba(25, 51, 44, .16); }
@@ -274,6 +274,8 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 展开态用"浅底加深描边"，**不**整颗填成实心深绿：填实之后 ⋯ 字形和右上角标（同为浅色）
    会糊成一团深绿块，看不出是个按钮。定案与刷新胶囊的忙碌态一致 —— 状态靠底色变化表达。 */
 .mobile-header-menu-button[aria-expanded="true"] { border-color: #2c7567; color: #1d5b4e; background: #dcefe4; }
+.mobile-home-settings { position: relative; display: grid; width: 38px; height: 38px; flex: none; place-items: center; border: 1px solid #cfe4da; border-radius: 999px; color: #256a5b; background: #eaf4ef; }
+.mobile-home-settings:active { background: #d2e9dc; }
 /* 「还有几个任务没跑完」是唯一一眼可见的状态信号，收进菜单就等于看不见了 ——
    做成 ⋯ 上的角标；角标为 0 时整个元素不渲染。位置贴右上，别压住 ⋯ 字形本身。 */
 .mobile-header-menu-badge { position: absolute; top: -4px; right: -3px; display: grid; min-width: 17px; height: 17px; place-items: center; border: 2px solid #f3f8f4; border-radius: 999px; padding: 0 4px; color: #fff; background: #2c7567; font-size: 10px; font-weight: 700; line-height: 1; }
@@ -297,8 +299,6 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
    · 等宽字体 + 更小一号字，与桌面端 Dashboard 角落的 .app-version-tag 同一套语言，
      一眼就能认出是版本号而不是一条功能。
    颜色沿用菜单里辅助文字那一档 #587568（白底 5.05:1，过正文 4.5 闸）。 */
-.mobile-header-menu-version { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 4px; border-top: 1px solid #eef4f0; padding: 9px 12px 4px; color: #587568; font-size: 11px; font-weight: 700; line-height: 1.5; }
-.mobile-header-menu-version small { flex: none; color: #587568; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
 /* 处理状态条是消息列表的最后一个网格项（跟在最后一条消息后面），它与上一条消息的间距
    由 .mobile-message-list 的 gap 提供，所以自身不再留 margin。 */
 /* ── 会话末尾「正在处理」状态条（2026-09-22 重做：形态 F + 流光 M2 + 光晕 M1）─────
@@ -682,6 +682,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 头栏只有标题与关闭键（2026-09-16 按用户要求去掉副标题）：原来 h3 下面还挂一行
    "共 9 个任务 / 待验收 0 / 6"，那是分类胶囊上同一份数字的第二遍展示，胶囊就在下一行。 */
 .mobile-task-panel-header h3 { margin: 0; font-size: 19px; }
+.mobile-task-panel-count { flex: none; margin-right: auto; border: 1px solid #c5dad0; border-radius: 999px; padding: 4px 8px; color: #2c7567; background: #e5f4ea; font-size: 12px; font-variant-numeric: tabular-nums; line-height: 1; }
 .mobile-task-panel-close { display: grid; width: 44px; height: 44px; flex: none; place-items: center; border: 1px solid #c5dad0; border-radius: 5px; color: #52766a; background: #fff; font-size: 22px; line-height: 1; }
 /* 面板正文自己滚动：flex 列里必须配 min-height: 0，否则溢出高度按内容算，滚动条会落到面板外层。 */
 .mobile-task-panel-body { display: flex; flex: 1; min-height: 0; flex-direction: column; overflow-y: auto; overscroll-behavior: contain; padding-top: 4px; }
@@ -1161,6 +1162,9 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-agent-app.selected { border-color: #2c7567; background: #f2faf5; box-shadow: 0 0 0 2px #cfe7db; }
 .mobile-agent-app b { font-size: 12px; line-height: 1.25; text-align: center; }
 .mobile-agent-app small { font-size: 10.5px; color: #748b81; }
+.mobile-agent-app.unavailable { opacity: .48; filter: grayscale(.72); cursor: not-allowed; }
+.mobile-agent-app.unavailable small { color: #9a7568; }
+.mobile-new-conversation-unavailable { margin: 10px 0 0; padding: 9px 11px; border: 1px solid #ead9cf; border-radius: 8px; background: #fff8f3; color: #8b5f50; font-size: 12px; line-height: 1.45; }
 .mobile-agent-app-check { position: absolute; top: 7px; right: 7px; width: 18px; height: 18px; border-radius: 50%;
   background: #2c7567; color: #fff; font-size: 11px; font-style: normal; display: grid; place-items: center; }
 .mobile-agent-app-icon { width: 48px; height: 48px; border-radius: 12px; display: grid; place-items: center; background: #f0f4f2; }
@@ -1243,6 +1247,8 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
    高度 38px，底色与描边都退到"次级操作"那一档。图标顺手从 12px 提到 13px ——
    原先 12px 是为了让加图标不加宽（配 min-width: 76px 用），那条约束随实心块一起作废了。 */
 .mobile-refresh { position: relative; display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 5px; border: 1px solid #cfe4da; border-radius: 999px; padding: 0 11px; color: #256a5b; background: #eaf4ef; font: inherit; font-size: 12px; font-weight: 700; }
+.mobile-new-task { position: relative; display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 5px; border: 1px solid #a9cfbc; border-radius: 999px; padding: 0 11px; color: #1f6d58; background: #e4f5eb; font: inherit; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.mobile-new-task svg { flex: none; }
 .mobile-refresh-icon { flex: none; }
 /* 文字必须 nowrap：按钮是 inline-flex，span 默认可收缩，而头部这一行在会话视图里是"标题挤按钮"的
    （标题 overflow: hidden 只保住自己不被撑破，剩下的宽度按 base 大小分摊）。
@@ -1256,9 +1262,9 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 @keyframes mobile-refresh-spin { to { transform: rotate(360deg); } }
 /* 悬停只给精确指针：触屏上 hover 会粘在刚点过的按钮上（同 .mobile-project-choice）。 */
 @media (hover: hover) and (pointer: fine) {
-  .mobile-back:hover, .mobile-refresh:hover, .mobile-notification-button:hover { background: #dcefe4; }
+  .mobile-back:hover, .mobile-refresh:hover, .mobile-new-task:hover, .mobile-notification-button:hover { background: #dcefe4; }
 }
-.mobile-back:active, .mobile-refresh:active, .mobile-notification-button:active { background: #d2e9dc; }
+.mobile-back:active, .mobile-refresh:active, .mobile-new-task:active, .mobile-notification-button:active { background: #d2e9dc; }
 
 /* 刷新结果条：紧跟头部，是"点了刷新到底发生了什么"的唯一权威回答。
    时间戳用 margin-left: auto 贴右，内容再长也不会把它挤出去（文字自己换行）。 */

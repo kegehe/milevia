@@ -332,6 +332,9 @@ create index if not exists verification_runs_job on verification_runs(job_id,cre
 	if err := ensureColumn(ctx, s.db, "orchestration_batches", "target_branch", "text not null default ''"); err != nil {
 		return fmt.Errorf("add orchestration batch target branch: %w", err)
 	}
+	if err := ensureColumn(ctx, s.db, "orchestration_batches", "completion_notified_at", "datetime"); err != nil {
+		return fmt.Errorf("add orchestration batch completion notification timestamp: %w", err)
+	}
 	if err := ensureColumn(ctx, s.db, "git_task_records", "execution_mode", "text not null default 'worktree'"); err != nil {
 		return fmt.Errorf("add git_task_records execution mode: %w", err)
 	}
@@ -1547,6 +1550,7 @@ func (s *Server) dequeueTaskFromOrchestration(w http.ResponseWriter, r *http.Req
 	defer cancelCleanup()
 	if err = s.waitForOrchestrationJobShutdown(cleanupCtx, jobID); err != nil {
 		_, _ = s.db.ExecContext(context.Background(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, orchestrationStopped, time.Now().UTC(), jobID, orchestrationRemoving)
+		s.notifyCompletedOrchestrationBatchForTask(taskID)
 		writeError(w, http.StatusConflict, fmt.Errorf("wait for task execution to stop before cleanup: %w", err))
 		return
 	}
@@ -1555,6 +1559,7 @@ func (s *Server) dequeueTaskFromOrchestration(w http.ResponseWriter, r *http.Req
 	release, acquired := s.acquireProjectWorkspace(projectID, "orchestration-dequeue:"+jobID)
 	if !acquired {
 		_, _ = s.db.ExecContext(context.Background(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, orchestrationStopped, time.Now().UTC(), jobID, orchestrationRemoving)
+		s.notifyCompletedOrchestrationBatchForTask(taskID)
 		writeError(w, http.StatusConflict, errors.New("project workspace is occupied"))
 		return
 	}
@@ -1564,6 +1569,7 @@ func (s *Server) dequeueTaskFromOrchestration(w http.ResponseWriter, r *http.Req
 	// actionable rather than becoming an invisible orphan.
 	if err = s.removeOrchestrationGitResources(r.Context(), projectPath, projectID, jobID, worktree, branch); err != nil {
 		_, _ = s.db.ExecContext(r.Context(), `update task_orchestration_jobs set status=?,updated_at=? where id=? and status=?`, orchestrationStopped, time.Now().UTC(), jobID, orchestrationRemoving)
+		s.notifyCompletedOrchestrationBatchForTask(taskID)
 		writeError(w, http.StatusConflict, err)
 		return
 	}
@@ -1988,6 +1994,7 @@ func (s *Server) stopOrchestrationJob(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cancelOrchestrationJob(jobID)
 	s.stopOrchestrationRun(r.Context(), taskID)
+	s.notifyCompletedOrchestrationBatchForTask(taskID)
 	s.kickProjectOrchestrator(projectID)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -3414,6 +3421,7 @@ func (s *Server) failOrchestrationJob(ctx context.Context, job OrchestrationJob,
 	}
 	// 通知：编排任务失败，需要人工介入
 	s.notifyOrchestrationNeedsHuman(ctx, job, cause)
+	s.notifyCompletedOrchestrationBatchForTask(job.TaskID)
 }
 
 func (s *Server) ensureCleanRepository(ctx context.Context, repo string) error {

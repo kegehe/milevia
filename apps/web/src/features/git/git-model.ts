@@ -6,7 +6,7 @@ export type GitSnapshot = { repositoryState: "ready"; head: GitHead; worktree: G
    * 手机端那个只取 summary 的后台探针靠它判断清单有没有变 —— 只比计数会漏掉
    * "一个文件恢复干净、另一个同时被改"。旧版服务端没有这个字段，缺了就退回计数比对。
    */
-  changesRevision?: string };
+  changesRevision?: string; changes?: GitChange[] };
 export type GitChange = { path: string; originalPath?: string; staged: boolean; modified: boolean; untracked: boolean; deleted: boolean; renamed: boolean; conflicted: boolean };
 export type GitDiff = { path: string; stage: "worktree" | "index" | "commit"; content: string };
 export type GitCommit = { oid: string; parents: string[]; subject: string; author: string; authoredAt: string };

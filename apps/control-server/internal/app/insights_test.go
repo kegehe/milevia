@@ -585,9 +585,9 @@ func TestRunInsightScanBadJSONFailsAfterVerifyRetry(t *testing.T) {
 
 	scanID := insertSyncInsightScan(t, server, projectID)
 
-	var status string
+	var status, errMsg string
 	var n int
-	if err := server.db.QueryRow(`select status from project_insight_scans where id=?`, scanID).Scan(&status); err != nil {
+	if err := server.db.QueryRow(`select status,error from project_insight_scans where id=?`, scanID).Scan(&status, &errMsg); err != nil {
 		t.Fatalf("scan row: %v", err)
 	}
 	if err := server.db.QueryRow(`select count(*) from project_insights where scan_id=?`, scanID).Scan(&n); err != nil {
@@ -595,6 +595,9 @@ func TestRunInsightScanBadJSONFailsAfterVerifyRetry(t *testing.T) {
 	}
 	if status != insightScanFailed || n != 0 {
 		t.Errorf("after failed verify retry: status=%q findings=%d want %q/0", status, n, insightScanFailed)
+	}
+	if !strings.Contains(errMsg, "返回内容不是有效 JSON") || !strings.Contains(errMsg, "已自动重试一次") {
+		t.Errorf("parse failure should explain the JSON contract and retry, got %q", errMsg)
 	}
 	if got := stubCalls(server.runner); got != 3 {
 		t.Errorf("agent runs: got %d want 3 (A, B, B-retry)", got)
@@ -1009,8 +1012,8 @@ func TestPassBMissingFindingFailsScan(t *testing.T) {
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	scanID := insertSyncInsightScan(t, server, projectID)
 
-	var status string
-	if err := server.db.QueryRow(`select status from project_insight_scans where id=?`, scanID).Scan(&status); err != nil {
+	var status, errMsg string
+	if err := server.db.QueryRow(`select status,error from project_insight_scans where id=?`, scanID).Scan(&status, &errMsg); err != nil {
 		t.Fatalf("scan status: %v", err)
 	}
 	var n int
@@ -1019,6 +1022,9 @@ func TestPassBMissingFindingFailsScan(t *testing.T) {
 	}
 	if status != insightScanFailed || n != 0 {
 		t.Errorf("incomplete Pass B: status/count = %q/%d want failed/0", status, n)
+	}
+	if !strings.Contains(errMsg, "核实结论数量不完整") {
+		t.Errorf("incomplete verdict should be diagnosed, got %q", errMsg)
 	}
 }
 
@@ -1041,6 +1047,26 @@ func TestValidateInsightVerdictRejectsInvalidIndexes(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if err := validateInsightVerdict(result, 2); err == nil {
 				t.Fatal("expected invalid verdict error")
+			}
+		})
+	}
+}
+
+func TestInsightVerifyResultErrorMessageClassifiesContractFailures(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"json", errors.New("invalid character 'n' looking for beginning of value"), "返回内容不是有效 JSON"},
+		{"count", errors.New("incomplete verdict: got 1 findings, want 2"), "核实结论数量不完整"},
+		{"index", errors.New("duplicate candidate index: 1"), "核实结论的候选编号无效"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := insightVerifyResultErrorMessage(tc.err)
+			if !strings.Contains(got, tc.want) || !strings.Contains(got, "已自动重试一次") {
+				t.Fatalf("message=%q, want %q and retry hint", got, tc.want)
 			}
 		})
 	}

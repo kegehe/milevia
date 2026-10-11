@@ -32,22 +32,21 @@ test("only the newest directory request can update the import view", () => {
   assert.match(page, /const requestID = \+\+browseRequestRef\.current;/);
   assert.match(page, /requestID !== browseRequestRef\.current/);
   assert.match(page, /browseRequestRef\.current\+\+;/);
-  assert.match(page, /setPath\(target\);\s*setParent\(""\);\s*setDirs\(\[\]\);\s*setResult\(null\);/);
+  assert.match(page, /setPath\(target\);\s*setParent\(""\);\s*setDirs\(\[\]\);/);
 });
 
 test("directory-dependent actions wait for directory loading", () => {
   assert.match(page, /const \[loadingDirectory, setLoadingDirectory\] = useState\(false\);/);
   assert.match(page, /const \[directoryReady, setDirectoryReady\] = useState\(false\);/);
-  assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| creatingDirectory \|\| !directoryReady\}/);
+  assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| !directoryReady\}/);
   // 确认加载不再要求 agentReady：环境不可用（空目录/无工具）也能加载。
-  assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| !directoryReady \|\| !result\}/);
+  assert.match(page, /disabled=\{busy \|\| loadingDirectory \|\| !directoryReady\}/);
   assert.doesNotMatch(page, /!result\?\.agentReady \|\| busy \|\| loadingDirectory/);
 });
 
-test("validation and project creation cannot update a stale import view", () => {
-  assert.match(page, /const validationRequestRef = useRef\(0\);/);
-  assert.match(page, /const requestID = \+\+validationRequestRef\.current;/);
-  assert.match(page, /requestID === validationRequestRef\.current\) setResult\(validationResult\)/);
+test("project creation does not require a validation request", () => {
+  assert.doesNotMatch(page, /api\("\/api\/projects\/validate"/);
+  assert.doesNotMatch(page, /validationRequestRef/);
   assert.match(page, /const createRequestRef = useRef\(0\);/);
   assert.match(page, /requestID === createRequestRef\.current\) navigate\(`/);
   assert.match(page, /disabled=\{busy\} onClick=\{returnToRootSelection\}/);
