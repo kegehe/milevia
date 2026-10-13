@@ -15,6 +15,7 @@ import { ServiceLogo } from "../components/ServiceLogo";
 import type { MCPAuditEntry, MCPAuditResponse, MCPImportCandidate, MCPImportResult, MCPInjectionStatus, MCPOAuthStatus, MCPPreset, MCPPreviewResult, MCPProjectView, MCPRuntimeCheckResult, MCPScope, MCPServer, MCPTestResult, MCPTransport } from "../lib/types";
 import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseKeyValueLines, parseLines, presetGuidanceLines, runtimeCommandsFor, wizardStartsAt, type MCPSecretInput } from "../features/mcp/mcp-model";
 import "./mcp-manager.css";
+import { waitForOAuthFlowResult } from "../features/mcp/oauth-flow";
 
 const ENVIRONMENT_OPTIONS: { id: string; label: string }[] = [
   { id: "windows", label: "Windows" },
@@ -98,6 +99,10 @@ function statusSeverity(status?: string) {
   if (status === "error") return "danger";
   if (status === "pending") return "warn";
   return "info";
+}
+
+function isNotFoundError(cause: unknown): boolean {
+  return typeof cause === "object" && cause !== null && "status" in cause && (cause as { status?: unknown }).status === 404;
 }
 
 // mcpPreviewRows 把预览结果摊平成 [标签, 值] 行，避免在 JSX 里嵌套 Fragment 又要补 key。
@@ -250,6 +255,7 @@ export default function McpManagerPage() {
   const [oauthStarting, setOauthStarting] = useState(false);
   const [oauthRevoking, setOauthRevoking] = useState(false);
   const [oauthFlowId, setOauthFlowId] = useState("");
+  const oauthCancelRef = useRef<AbortController | null>(null);
   // P2：调用审计。
   const [auditOpen, setAuditOpen] = useState(false);
   const [auditEntries, setAuditEntries] = useState<MCPAuditEntry[]>([]);
@@ -288,6 +294,24 @@ export default function McpManagerPage() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   // 关闭向导的同步闸（防同 tick 双击发出两个 DELETE）。
   const wizardClosingRef = useRef(false);
+  const wizardOAuthFlowRef = useRef("");
+  const wizardOAuthCancelRef = useRef<AbortController | null>(null);
+  const wizardServerRef = useRef<MCPServer | null>(null);
+  const oauthFlowRef = useRef("");
+  const oauthViewVersion = useRef(0);
+
+  useEffect(() => () => {
+    wizardOAuthCancelRef.current?.abort();
+    oauthCancelRef.current?.abort();
+    oauthViewVersion.current += 1;
+    const server = wizardServerRef.current;
+    if (server && !server.enabled) {
+      void api(`/api/mcp/servers/${server.id}`, { method: "DELETE" }).catch(() => undefined);
+    }
+    if (oauthFlowRef.current) {
+      void api(`/api/mcp/oauth/flows/${oauthFlowRef.current}`, { method: "DELETE" }).catch(() => undefined);
+    }
+  }, [api]);
 
   const loadServers = useCallback(async () => {
     setLoading(true);
@@ -456,6 +480,7 @@ export default function McpManagerPage() {
   // —— 「一键连接」向导 ——
 
   const openWizard = (preset: MCPPreset) => {
+    if (wizardClosingRef.current) return;
     setWizard(preset);
     setWizardSecrets({});
     setWizardTrust(false);
@@ -464,23 +489,40 @@ export default function McpManagerPage() {
     setWizardInstall(null);
     setWizardResult(null);
     setWizardServer(null);
+    wizardServerRef.current = null;
+    wizardOAuthFlowRef.current = "";
+    wizardOAuthCancelRef.current = null;
     setWizardStep(wizardStartsAt(preset));
   };
 
   const closeWizard = async () => {
     // wizardClosingRef 是同步闸：wizardBusy 是异步 state，同一 tick 里的第二次点击
     // 读到的还是旧值，会发出第二个 DELETE（404 后反而报「清理失败」）。
-    if (wizardBusy || wizardClosingRef.current) return;
+    if (wizardClosingRef.current) return;
+    const activeFlowId = wizardOAuthFlowRef.current;
+    if (wizardBusy && !wizardOAuthCancelRef.current) return;
+    wizardOAuthCancelRef.current?.abort();
+    wizardOAuthCancelRef.current = null;
     // OAuth 路径会先落库（回调要按 serverID 存令牌），所以「取消」时列表里可能躺着一条
     // 从没连上的记录。凡是**试连没有通过**的半成品，取消时一律删掉 —— 不然用户只是点了
     // 一下连接、什么都没连上，列表里却多出一条「已启用」的服务。只有 wizardResult.ok
     // （真实连接验证通过）的才留下。
-    const leftover = wizardServer;
+    const leftover = wizardServerRef.current || wizardServer;
+    setWizard(null);
+    setWizardServer(null);
+    wizardServerRef.current = null;
+    setWizardBusy(false);
     if (leftover && wizardResult?.ok !== true) {
       wizardClosingRef.current = true;
       setWizardBusy(true);
       try {
-        await api(`/api/mcp/servers/${leftover.id}`, { method: "DELETE" });
+        if (activeFlowId) {
+          await api(`/api/mcp/oauth/flows/${activeFlowId}`, { method: "DELETE" }).catch(() => undefined);
+          wizardOAuthFlowRef.current = "";
+        }
+        await api(`/api/mcp/servers/${leftover.id}`, { method: "DELETE" }).catch((cause) => {
+          if (!isNotFoundError(cause)) throw cause;
+        });
         toast.message(`已取消连接「${leftover.displayName || leftover.name}」，没有保存任何东西`);
         await loadServers();
       } catch (cause) {
@@ -492,8 +534,6 @@ export default function McpManagerPage() {
     } else if (leftover) {
       toast.message(`「${leftover.displayName || leftover.name}」已保存，可在列表里管理`);
     }
-    setWizard(null);
-    setWizardServer(null);
   };
 
   // wizardDraftPayload 是所有路径共用的创建体：默认值全给上（全局 / 全部环境 / 保存即启用）。
@@ -551,22 +591,34 @@ export default function McpManagerPage() {
   // startWizardOAuth 走「先创建、再授权」：OAuth 回调要按 serverID 存令牌，没有 id 就发不起授权。
   // 授权完成后用**已落库**的测试接口验证 —— 草稿态试连拿不到服务端的令牌。
   const startWizardOAuth = async () => {
-    if (!wizard) return;
+    if (!wizard || wizardOAuthCancelRef.current || wizardClosingRef.current) return;
+    const cancel = new AbortController();
+    wizardOAuthCancelRef.current = cancel;
+    let created: MCPServer | null = null;
+    let flowId = "";
+    let connected = false;
     setWizardBusy(true);
     setWizardError("");
     setWizardInstall(null);
     setWizardResult(null);
     setWizardStep("check");
     try {
-      const created = wizardServer || await api<MCPServer>("/api/mcp/servers", { method: "POST", body: JSON.stringify(wizardDraftPayload()) });
+      created = wizardServer || await api<MCPServer>("/api/mcp/servers", { method: "POST", body: JSON.stringify({ ...wizardDraftPayload(), enabled: false, oauthPending: true }) });
+      if (cancel.signal.aborted) return;
+      wizardServerRef.current = created;
       setWizardServer(created);
       const started = await api<{ flowId: string; authorizationUrl: string }>(
         `/api/mcp/servers/${created.id}/oauth/start`,
         { method: "POST", body: JSON.stringify({}) },
       );
+      flowId = started.flowId;
+      if (cancel.signal.aborted) return;
+      wizardOAuthFlowRef.current = started.flowId;
       await openExternal(started.authorizationUrl);
+      if (cancel.signal.aborted) return;
       toast.message("已打开授权页面，请在浏览器中完成登录");
-      const flow = await waitForOAuthFlow(started.flowId);
+      const flow = await waitForOAuthFlow(started.flowId, cancel.signal);
+      if (cancel.signal.aborted) return;
       if (!flow.ok) {
         setWizardError(flow.error || "授权没有完成，可以重试。");
         return;
@@ -575,24 +627,45 @@ export default function McpManagerPage() {
         method: "POST",
         body: JSON.stringify({ environment: "" }),
       });
+      if (cancel.signal.aborted) return;
       setWizardResult(tested);
       if (!tested.ok) {
         setWizardError(tested.error || "授权已完成，但还是连不上。");
         return;
       }
+      // 服务端在 OAuth 令牌与真实试连都通过后才启用临时记录。
+      connected = true;
+      wizardServerRef.current = { ...created, enabled: true };
+      setWizardServer(wizardServerRef.current);
       setWizardStep("done");
       await loadServers();
     } catch (cause) {
-      setWizardError(cause instanceof Error ? cause.message : "授权失败");
+      if (!cancel.signal.aborted) setWizardError(cause instanceof Error ? cause.message : "授权失败");
     } finally {
-      setWizardBusy(false);
+      if (!connected && created) {
+        try {
+          if (flowId) await api(`/api/mcp/oauth/flows/${flowId}`, { method: "DELETE" });
+          await api(`/api/mcp/servers/${created.id}`, { method: "DELETE" }).catch((cause) => {
+            if (!isNotFoundError(cause)) throw cause;
+          });
+          if (wizardServerRef.current?.id === created.id) wizardServerRef.current = null;
+          if (!cancel.signal.aborted) setWizardServer(null);
+        } catch (cause) {
+          if (!cancel.signal.aborted) setWizardError(cause instanceof Error ? cause.message : "清理未完成的连接失败，请取消后重试");
+        }
+      }
+      if (wizardOAuthCancelRef.current === cancel) {
+        wizardOAuthFlowRef.current = "";
+        wizardOAuthCancelRef.current = null;
+        setWizardBusy(false);
+      }
     }
   };
 
   // finishWizard 才真正结束：OAuth 路径已经落库（只剩「以后不用再问」要落），
   // 其它路径在这里一次性保存。
   const finishWizard = async () => {
-    if (!wizard) return;
+    if (!wizard || wizardResult?.ok !== true) return;
     setWizardBusy(true);
     setWizardError("");
     try {
@@ -610,6 +683,7 @@ export default function McpManagerPage() {
       toast.success(`${wizard.displayName} 已连接`);
       setWizard(null);
       setWizardServer(null);
+      wizardServerRef.current = null;
     } catch (cause) {
       setWizardError(cause instanceof Error ? cause.message : "保存失败");
     } finally {
@@ -785,83 +859,116 @@ export default function McpManagerPage() {
   // —— P2：远程授权（OAuth 2.1 + PKCE） ——
 
   const openOAuth = async (server: MCPServer) => {
+    oauthCancelRef.current?.abort();
+    oauthCancelRef.current = null;
+    const version = ++oauthViewVersion.current;
     setOauthTarget(server);
     setOauthStatus(null);
     setOauthFlowId("");
     setOauthStatusLoading(true);
     try {
       const status = await api<MCPOAuthStatus>(`/api/mcp/servers/${server.id}/oauth`);
-      setOauthStatus(status);
+      if (version === oauthViewVersion.current) setOauthStatus(status);
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "无法读取授权状态");
+      if (version === oauthViewVersion.current) toast.error(cause instanceof Error ? cause.message : "无法读取授权状态");
     } finally {
-      setOauthStatusLoading(false);
+      if (version === oauthViewVersion.current) setOauthStatusLoading(false);
     }
   };
 
   // 授权需要用户在浏览器里登录服务商。发起后轮询流程状态，完成后自动刷新授权状态。
   const startOAuth = async () => {
-    if (!oauthTarget) return;
+    if (!oauthTarget || oauthCancelRef.current) return;
+    const cancel = new AbortController();
+    oauthCancelRef.current = cancel;
+    const version = oauthViewVersion.current;
+    let flowId = "";
     setOauthStarting(true);
     try {
       const started = await api<{ flowId: string; authorizationUrl: string; redirectUri: string }>(
         `/api/mcp/servers/${oauthTarget.id}/oauth/start`,
         { method: "POST", body: JSON.stringify({}) },
       );
+      flowId = started.flowId;
+      if (cancel.signal.aborted) {
+        await api(`/api/mcp/oauth/flows/${started.flowId}`, { method: "DELETE" });
+        return;
+      }
       setOauthFlowId(started.flowId);
+      oauthFlowRef.current = started.flowId;
       await openExternal(started.authorizationUrl);
+      if (cancel.signal.aborted) return;
       toast.message("已打开授权页面，请在浏览器中完成登录");
-      void pollOAuthFlow(oauthTarget.id, started.flowId);
+      void pollOAuthFlow(oauthTarget.id, started.flowId, cancel.signal);
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "发起授权失败");
+      if (flowId) await api(`/api/mcp/oauth/flows/${flowId}`, { method: "DELETE" }).catch(() => undefined);
+      if (oauthCancelRef.current === cancel) oauthCancelRef.current = null;
+      if (!cancel.signal.aborted) toast.error(cause instanceof Error ? cause.message : "发起授权失败");
     } finally {
-      setOauthStarting(false);
+      if (version === oauthViewVersion.current) setOauthStarting(false);
     }
   };
 
   // waitForOAuthFlow 等一次授权流程结束，返回结果而不是抛错 ——
   // 两个调用方对失败的处理不同：卡片入口只提示一次，一键连接向导要停在检查屏让用户重试。
-  const waitForOAuthFlow = async (flowId: string): Promise<{ ok: boolean; error?: string }> => {
-    // 最多轮询 ~5 分钟（60 次 × 5s），与后端 flow TTL 对齐。
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      let status: { status?: string; error?: string } | null = null;
-      try {
-        status = await api<{ status?: string; error?: string }>(`/api/mcp/oauth/flows/${flowId}`);
-      } catch {
-        // flow 过期或服务重启：停止轮询，让用户重新发起。
-        return { ok: false, error: "授权会话已过期，请重新发起。" };
-      }
-      if (status?.status === "done") return { ok: true };
-      if (status?.status === "error") return { ok: false, error: status.error || "授权失败" };
-    }
-    return { ok: false, error: "等待授权超时。" };
+  const waitForOAuthFlow = async (flowId: string, signal?: AbortSignal): Promise<{ ok: boolean; error?: string }> => {
+    return waitForOAuthFlowResult(
+      () => api<{ status?: string; error?: string }>(`/api/mcp/oauth/flows/${flowId}`),
+      signal,
+    );
   };
 
-  const pollOAuthFlow = async (serverId: string, flowId: string) => {
-    const result = await waitForOAuthFlow(flowId);
+  const pollOAuthFlow = async (serverId: string, flowId: string, signal?: AbortSignal) => {
+    const result = await waitForOAuthFlow(flowId, signal);
+    if (signal?.aborted) return;
+    oauthFlowRef.current = "";
+    setOauthFlowId("");
     if (!result.ok) {
+      await api(`/api/mcp/oauth/flows/${flowId}`, { method: "DELETE" }).catch(() => undefined);
       toast.error(result.error || "授权失败");
+      oauthCancelRef.current = null;
       return;
     }
     toast.success("授权完成");
     try {
-      setOauthStatus(await api<MCPOAuthStatus>(`/api/mcp/servers/${serverId}/oauth`));
+      const status = await api<MCPOAuthStatus>(`/api/mcp/servers/${serverId}/oauth`);
+      if (!signal?.aborted) setOauthStatus(status);
     } catch { /* 忽略：状态未刷新也不影响已完成的授权 */ }
+    if (!signal?.aborted) oauthCancelRef.current = null;
   };
 
   const revokeOAuth = async () => {
     if (!oauthTarget) return;
+    oauthCancelRef.current?.abort();
+    oauthCancelRef.current = null;
+    const version = oauthViewVersion.current;
     setOauthRevoking(true);
     try {
       await api(`/api/mcp/servers/${oauthTarget.id}/oauth`, { method: "DELETE" });
+      if (version !== oauthViewVersion.current) return;
       toast.success("已清除授权");
       setOauthStatus({ serverId: oauthTarget.id, authorized: false, expired: false, hasRefreshToken: false, hasClientSecret: false });
       setOauthFlowId("");
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "清除授权失败");
+      if (version === oauthViewVersion.current) toast.error(cause instanceof Error ? cause.message : "清除授权失败");
     } finally {
-      setOauthRevoking(false);
+      if (version === oauthViewVersion.current) setOauthRevoking(false);
+    }
+  };
+
+  const closeOAuth = async () => {
+    oauthViewVersion.current += 1;
+    setOauthStarting(false);
+    setOauthRevoking(false);
+    const flowId = oauthFlowRef.current;
+    oauthCancelRef.current?.abort();
+    oauthCancelRef.current = null;
+    oauthFlowRef.current = "";
+    setOauthTarget(null);
+    setOauthStatus(null);
+    setOauthFlowId("");
+    if (flowId) {
+      await api(`/api/mcp/oauth/flows/${flowId}`, { method: "DELETE" }).catch(() => undefined);
     }
   };
 
@@ -1002,7 +1109,7 @@ export default function McpManagerPage() {
             : servers.length === 0 ? <div className="mcp-empty"><b>还没有配置任何服务</b><span>从下面的目录里挑一个，点「连接」按提示走完就行。</span></div>
             : <div className="ssh-connection-list mcp-conn-list">{servers.map((server) => <article className={`ssh-connection-card is-${server.enabled ? "connected" : "unknown"}`} key={server.id}>
               <div className="ssh-connection-main">
-                <span className="ssh-status"><i></i>{server.enabled ? "已启用" : "已停用"}</span>
+                <span className="ssh-status"><i></i>{server.source === "oauth-pending" ? "待完成授权与验证" : (server.enabled ? "已启用" : "已停用")}</span>
                 <h3><span className="mcp-service-mark"><ServiceLogo service={server.name} fallback={<PresetIcon name={presetIconKey(server.name, presets)} />} /></span>{server.displayName || server.name}</h3>
                 <p>{server.envSecretKeys?.length || server.headerSecretKeys?.length ? "已保存凭据" : server.transport === "stdio" ? "在本机运行" : "远程服务"}{server.scope === "project" ? ` · 仅用于「${projectName.get(server.projectId || "") || server.projectId}」` : ""}</p>
               </div>
@@ -1071,7 +1178,7 @@ export default function McpManagerPage() {
     </div>
     {wizard && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-wizard-title">
       <section className="modal ssh-connection-dialog">
-        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><ServiceLogo service={wizard.name} fallback={<PresetIcon name={wizard.icon} />} /></span><div><h2 id="mcp-wizard-title">连接 {wizard.displayName}</h2><p>{wizard.summary || wizard.description}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={wizardBusy} onClick={() => void closeWizard()}><CloseIcon /></button></header>
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><ServiceLogo service={wizard.name} fallback={<PresetIcon name={wizard.icon} />} /></span><div><h2 id="mcp-wizard-title">连接 {wizard.displayName}</h2><p>{wizard.summary || wizard.description}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={wizardClosingRef.current} onClick={() => void closeWizard()}><CloseIcon /></button></header>
         <div className="ssh-form-body">
           <ol className="mcp-wizard-steps">
             <li className={wizardStep === "credential" ? "is-active" : "is-done"}>1 准备</li>
@@ -1115,7 +1222,7 @@ export default function McpManagerPage() {
           </div>}
         </div>
         <footer>
-          <button className="secondary" type="button" disabled={wizardBusy} onClick={() => void closeWizard()}>取消</button>
+          <button className="secondary" type="button" disabled={wizardClosingRef.current} onClick={() => void closeWizard()}>{wizardOAuthFlowRef.current ? "取消授权" : "取消"}</button>
           {wizardStep === "credential" && (wizardHasSecret || !wizardPlan.canOAuth) && <button className="primary" type="button" disabled={wizardBusy || !credentialsSatisfied(wizard, wizardSecrets)} onClick={() => { setWizardStep("check"); void runWizardCheck(); }}>下一步</button>}
           {wizardStep === "done" && <button className="primary" type="button" disabled={wizardBusy} onClick={() => void finishWizard()}>{wizardBusy ? "保存中…" : "完成"}</button>}
         </footer>
@@ -1293,7 +1400,7 @@ export default function McpManagerPage() {
     </div>}
     {oauthTarget && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-oauth-title">
       <section className="modal ssh-connection-dialog">
-        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-oauth-title">远程授权</h2><p>{oauthTarget.displayName || oauthTarget.name} · {oauthTarget.transport}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={oauthStarting} onClick={() => { setOauthTarget(null); setOauthStatus(null); setOauthFlowId(""); }}><CloseIcon /></button></header>
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-oauth-title">远程授权</h2><p>{oauthTarget.displayName || oauthTarget.name} · {oauthTarget.transport}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" onClick={() => void closeOAuth()}><CloseIcon /></button></header>
         <div className="ssh-form-body">
           <section className="ssh-form-section"><header><h3>授权状态</h3><p>Milevia 使用 OAuth 2.1 + PKCE：在浏览器完成登录后，令牌加密存放在本机，注入时自动附加 Authorization 头。</p></header>
             {oauthStatusLoading && <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在读取授权状态…</p>}
@@ -1311,7 +1418,7 @@ export default function McpManagerPage() {
             <p className="ssh-form-notice">在 server 上已手动配置请求头（如 Authorization）时，Milevia 不会覆盖它，也不会走此处的 OAuth。</p>
           </section>
         </div>
-        <footer><button className="secondary" type="button" disabled={oauthStarting} onClick={() => { setOauthTarget(null); setOauthStatus(null); setOauthFlowId(""); }}>关闭</button></footer>
+        <footer><button className="secondary" type="button" onClick={() => void closeOAuth()}>关闭</button></footer>
       </section>
     </div>}
     {auditOpen && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-audit-title">

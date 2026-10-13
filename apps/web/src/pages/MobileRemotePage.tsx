@@ -111,7 +111,7 @@ type RemoteShortcut = { id: string; name: string; description: string; kind: str
 // 电脑端（或 SSH 远端）文件系统上扫出来的技能。source 决定分组标题（用户 / 项目 / 系统插件）。
 type RemoteSkill = { name: string; description: string; agent: string; env: string; source: string };
 type ProjectEnvironment = "windows" | "wsl" | "remote-linux";
-type Project = { id: string; name: string; runner: string; environment?: ProjectEnvironment; running?: boolean; gitBranch: string; tasks: Task[]; conversations: RemoteConversation[]; skills?: RemoteSkill[]; agentStatuses?: RemoteAgentStatus[]; agentProbeOk?: boolean; agentProbeError?: string };
+type Project = { id: string; name: string; runner: string; environment?: ProjectEnvironment; running?: boolean; gitBranch: string; tasks: Task[]; conversations: RemoteConversation[]; skills?: RemoteSkill[]; agentStatuses?: RemoteAgentStatus[]; agentProbeOk?: boolean; agentProbePending?: boolean; agentProbeError?: string };
 type Snapshot = { snapshotRevision: number; observedAt: string; projects: Project[]; shortcuts?: RemoteShortcut[] };
 type CommandState = { commandId: string; status: string; result?: unknown };
 type AcceptedCommand = { commandId: string; status: string };
@@ -312,10 +312,15 @@ function mobileAgentAvailable(project: Project | null | undefined, agentID: Mobi
   return mobileAgentStatus(project, agentID)?.status === "ready";
 }
 
+function mobileAgentProbePending(project: Project | null | undefined): boolean {
+  return project?.agentProbePending === true;
+}
+
 function mobileAgentUnavailableReason(project: Project | null | undefined, agentID: MobileAgentID): string {
   const status = mobileAgentStatus(project, agentID);
   if (status?.reason) return status.reason;
   if (project?.agentProbeError) return project.agentProbeError;
+  if (mobileAgentProbePending(project)) return "正在检测电脑端工具状态";
   if (project?.agentProbeOk === false || !project?.agentStatuses) return "暂时无法确认该工具是否可用";
   if (status?.status === "updating") return "该工具正在更新";
   if (status?.status === "unsupported") return "当前环境不支持该工具";
@@ -1112,6 +1117,9 @@ export default function MobileRemotePage() {
   // latest snapshot available without recreating the SSE subscription.
   const snapshotRef = useRef<Snapshot | null>(null);
   snapshotRef.current = snapshot;
+  // RPC 成功到 Agent 上传新快照之间，云端仍可能返回激活前的旧版本。记录这次
+  // 已提交的共享选择，避免旧快照在这段窗口把页面切回去。
+  const pendingSharedConversationRef = useRef<{ projectID: string; conversationID: string; snapshotRevision: number } | null>(null);
   const [selectedProject, setSelectedProject] = useState("");
   const [selectedConversation, setSelectedConversation] = useState("");
   // 会话历史改成按钮 + 弹窗（原来是下拉框：长标题会把选项撑得非常高）。
@@ -1157,8 +1165,8 @@ export default function MobileRemotePage() {
   // 必须先问一声 —— 复用面板与桌面端同一条确认流程，不另造一个提示。
   const filesGuardRef = useRef<NavigationGuard | null>(null);
   const [tasksOpen, setTasksOpen] = useState(false);
-  // 会话视图的顶栏：返回 + 会话名 + 刷新 + ⋯。刷新直接露在顶栏上（一键同步，不再藏进菜单），
-  // 历史会话、新会话、任务队列收进 ⋯ 菜单。原来各占一行吃掉 199px——接近 390×800 屏幕的四分之一。
+  // 会话视图的顶栏：返回 + 会话名 + 刷新 + 新会话 + ⋯。刷新和新会话是高频入口，
+  // 历史会话与任务操作收进 ⋯ 菜单。
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   // 任务队列是个整页模态层：打开时焦点要搬进面板、关闭时还给触发它的那颗按钮（见下面的焦点 effect）。
   const taskPanelRef = useRef<HTMLElement | null>(null);
@@ -1195,7 +1203,7 @@ export default function MobileRemotePage() {
   // 卡片上「详情」展开的是哪一条（同时只开一条，避免一屏里多段长描述把列表撑散）。
   // 描述在卡片上只给一行预览，完整描述与完整更新时间仍然找得到，不是被删掉了。
   const [expandedTask, setExpandedTask] = useState("");
-  // 「新建任务」弹层。创建入口来自会话顶栏与任务面板右下角：以前表单常驻列表底部，
+  // 「新建任务」弹层。创建入口来自 ⋯ 菜单与任务面板右下角：以前表单常驻列表底部，
   // 每个分类页底部都挂着一张两百多像素的表单，滚到底才看得见，还顺手吃掉了列表的可见高度。
   const [creatingTask, setCreatingTask] = useState(false);
   // 只属于创建弹层的失败原因。页面级那条 `.mobile-error` 是**在弹层遮罩之下**的，
@@ -1241,10 +1249,8 @@ export default function MobileRemotePage() {
   // 会话视图顶栏是 sticky 的（见 mobile-remote.css「会话视图顶栏冻结」）。刷新状态条要钉在它
   // 正下方，因此需要它的实测高度 —— 拿 ref 而不是 querySelector，免得和取景层那些同名节点抢。
   const headerRef = useRef<HTMLElement | null>(null);
-  const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [editingTask, setEditingTask] = useState<Task | null>(null);
-  const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [editPriority, setEditPriority] = useState("normal");
   // 编辑弹层自己的失败原因，与 `createError` 同构、同样由弹层渲染（`.mobile-task-modal-error`）。
@@ -1422,6 +1428,9 @@ export default function MobileRemotePage() {
   const notifiedEventIDs = useRef(new Set<string>());
   const [commandState, setCommandState] = useState<CommandState | null>(null);
   const [pendingAccessToken, setPendingAccessToken] = useState("");
+  // 配对声明返回的实例才是待确认的目标。此时 `instanceID` 仍可能指向手机当前
+  // 操作的另一台电脑；确认后若误用它，设备表会把新增电脑当成同机重新配对而覆盖。
+  const [pendingPairingInstanceID, setPendingPairingInstanceID] = useState("");
 
   // 页面可见性：切到后台时暂停轮询与快照兜底，回到前台立即补一次，省电又省流量。
   const documentVisible = useDocumentVisible();
@@ -1823,7 +1832,7 @@ export default function MobileRemotePage() {
     setPendingTaskBusy(new Set());
     setProcessingConversations({});
   }, [instanceID]);
-  const loadSnapshot = useCallback(async (options?: { force?: boolean; instanceId?: string }): Promise<SnapshotFetchResult> => {
+  const loadSnapshot = useCallback(async (options?: { force?: boolean; instanceId?: string; silent?: boolean }): Promise<SnapshotFetchResult> => {
     // 允许显式指定实例：手动刷新刚刚才拉过实例列表，选中的电脑可能已经失效并被换掉，
     // 这时要请求"列表里实际选中的那台"，而不是这一轮闭包里那台已经不存在的。
     const target = options?.instanceId || instanceID;
@@ -1834,7 +1843,7 @@ export default function MobileRemotePage() {
     // 里消失）没有可比基线，必须按全新实例处理：拿 B 的版本号去比 A 的，既可能让守卫不通过、
     // 把 B 的快照整个丢掉，又会把"什么都没应用"报成"已是最新"。
     const baseline = options?.instanceId && options.instanceId !== instanceID ? -1 : snapshotRevisionRef.current;
-    setError("");
+    if (!options?.silent) setError("");
     try {
       // 带上已知版本号：云端在内容未变化时只回一个小标记，省掉一次全量传输。
       // 手动刷新（force）必须跳过这个短路——被短路掉的长轮询看不出来，但用户点了刷新
@@ -1975,14 +1984,14 @@ export default function MobileRemotePage() {
         try {
           const cachedValue = JSON.parse(cached) as Snapshot;
           setSnapshot(cachedValue);
-          setError("当前显示的是最近一次同步快照");
+          if (!options?.silent) setError("当前显示的是最近一次同步快照");
           // 有缓存也要如实报失败：界面确实停在旧数据上，不能让刷新按钮显示"已刷新"。
           // 原因写短一点——"当前显示的是最近一次同步快照"那句由页面上的错误条负责说明，
           // 两边各说一句，避免同一条红框提示连说两遍。
           return { outcome: "failed", snapshot: cachedValue, reason: "无法连接云端" };
         } catch { /* ignore invalid cache */ }
       }
-      setError(reason);
+      if (!options?.silent) setError(reason);
       return { outcome: "failed", snapshot: null, reason };
     }
   }, [instanceID]);
@@ -2272,6 +2281,13 @@ export default function MobileRemotePage() {
     return () => window.clearInterval(timer);
   }, [token, loadInstances, documentVisible]);
   useEffect(() => { void loadSnapshot(); }, [loadSnapshot]);
+  // CLI 探测在电脑端后台进行，不会产生业务事件，因此快照版本号不一定变化。
+  // 检测期间显式绕过版本短路，等状态到齐就立刻停下，避免把“尚未检测”长期显示成不可用。
+  useEffect(() => {
+    if (!snapshot?.projects.some((item) => mobileAgentProbePending(item))) return;
+    const timer = window.setTimeout(() => { void loadSnapshot({ force: true, silent: true }); }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [loadSnapshot, snapshot]);
   useEffect(() => {
     if (!instanceID) return;
     const tokenValue = readActiveToken();
@@ -2418,22 +2434,24 @@ export default function MobileRemotePage() {
         .then((state) => {
           if (state.status === "confirmed") {
             // 一台新电脑绑上了：进设备表、并成为当前设备（同时镜像旧键，见 mobile-devices）。
-            addOrReplaceDevice({ token: pendingAccessToken, instanceId: instanceID, name: instance?.name || "" });
+            addOrReplaceDevice({ token: pendingAccessToken, instanceId: pendingPairingInstanceID, name: "" });
             setDevices(readDevices());
             setToken(pendingAccessToken);
             setPendingAccessToken("");
+            setPendingPairingInstanceID("");
             setPairingExpanded(false);
             setPairingNotice({ text: "电脑已确认，绑定完成", state: "success" });
             void loadInstances();
           } else if (["expired", "cancelled"].includes(state.status)) {
             setPendingAccessToken("");
+            setPendingPairingInstanceID("");
             setPairingNotice({ text: "配对已失效，请让电脑重新生成二维码", state: "error" });
           }
         })
         .catch(() => undefined);
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [pendingAccessToken, pairingID, loadInstances]);
+  }, [pendingAccessToken, pendingPairingInstanceID, pairingID, loadInstances]);
   // 桌面端跟踪配对会话：云端只允许在手机提交校验码之后确认，提前点击必然被
   // 拒绝。让"确认绑定"跟着会话状态启用，用户就不必盲点并对着报错猜原因。
   useEffect(() => {
@@ -2685,6 +2703,17 @@ export default function MobileRemotePage() {
     return merged;
   }, [historyDirectory, historyDirectoryProjectID, historyPages, project?.id, snapshotConversations]);
   const conversation = conversations.find((item) => item.id === selectedConversation) || conversations.find((item) => item.isCurrent) || conversations[0];
+  // selectedConversation 仅保留页面过渡状态。服务端 isCurrent 是跨端权威值：
+  // 桌面端或另一台手机切换后，下一份快照必须覆盖本机旧选择。
+  useEffect(() => {
+    const sharedCurrent = project?.conversations.find((item) => item.isCurrent);
+    const pending = pendingSharedConversationRef.current;
+    if (pending && pending.projectID === project?.id && pending.conversationID === selectedConversation) {
+      if ((snapshot?.snapshotRevision ?? -1) <= pending.snapshotRevision) return;
+      pendingSharedConversationRef.current = null;
+    }
+    if (sharedCurrent && sharedCurrent.id !== selectedConversation) setSelectedConversation(sharedCurrent.id);
+  }, [project?.conversations, project?.id, selectedConversation, snapshot?.snapshotRevision]);
   // 「这个项目现在是 git 仓库吗」——手机端判据的唯一来源（见上面 isGitRepo 的说明）。
   const isSelectedProjectGitRepo = Boolean(project?.gitBranch) && project?.gitBranch !== NON_GIT_BRANCH;
   // 当前这条会话是不是"本地已经建好、电脑端还没分配真 id"。它只影响两件事：
@@ -2712,6 +2741,18 @@ export default function MobileRemotePage() {
       method: "POST",
       body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
     }, undefined, timeoutMs), [instanceID]);
+
+  const activateSharedConversation = useCallback(async (projectID: string, conversationID: string) => {
+    if (!projectID || !conversationID || isPendingConversationID(conversationID)) return false;
+    const reply = await remoteConversationRPC(projectID, conversationID, "conversation.activate", {}, 20_000);
+    if (!reply.ok) throw new Error(reply.error || "无法切换当前会话");
+    pendingSharedConversationRef.current = { projectID, conversationID, snapshotRevision: snapshotRevisionRef.current };
+    setSelectedProject(projectID);
+    setSelectedConversation(conversationID);
+    // 激活已在电脑端提交；立即读取权威快照，不等后台轮询。
+    void loadSnapshot({ force: true, silent: true });
+    return true;
+  }, [loadSnapshot, remoteConversationRPC]);
 
   const loadConversationDirectory = useCallback(async (projectID: string) => {
     if (!projectID || !instanceID) return;
@@ -3826,9 +3867,11 @@ export default function MobileRemotePage() {
     }
     setBusy(true); setError("");
     try {
-      const result = await cloud<{ instanceId: string; status: string }>(`/v1/pairings/${encodeURIComponent(pairingIDValue.trim())}/claim`, { method: "POST", body: JSON.stringify({ code: pairingCodeValue.trim(), deviceName: deviceLabel(), platform: devicePlatform(Capacitor.getPlatform()) }) });
-      const accessToken = (result as { accessToken?: string }).accessToken;
-      if (accessToken) setPendingAccessToken(accessToken);
+      const result = await cloud<{ instanceId: string; status: string; accessToken?: string }>(`/v1/pairings/${encodeURIComponent(pairingIDValue.trim())}/claim`, { method: "POST", body: JSON.stringify({ code: pairingCodeValue.trim(), deviceName: deviceLabel(), platform: devicePlatform(Capacitor.getPlatform()) }) });
+      if (result.accessToken) {
+        setPendingAccessToken(result.accessToken);
+        setPendingPairingInstanceID(result.instanceId || "");
+      }
       // 把配对页一起打开：**深链**进来的人（用系统相机扫电脑上的二维码 → 打开这个 URL）
       // 此刻已经在流程中间了，他要看的是"第 2 步 · 等待电脑确认"，而不是项目列表上一条孤零零的回执。
       // 在应用内扫码那条路上这一句是 no-op（页面本来就开着），所以放在这里而不是调用点 ——
@@ -3921,7 +3964,10 @@ export default function MobileRemotePage() {
       const result = await cloud<{ pairingId: string; instanceId: string; status: string; accessToken?: string }>("/v1/pairings/claim", { method: "POST", body: JSON.stringify({ code, deviceName: deviceLabel(), platform: devicePlatform(Capacitor.getPlatform()) }) });
       setPairingID(result.pairingId || "");
       setPairingCode(code);
-      if (result.accessToken) setPendingAccessToken(result.accessToken);
+      if (result.accessToken) {
+        setPendingAccessToken(result.accessToken);
+        setPendingPairingInstanceID(result.instanceId || "");
+      }
       setPairingNotice({ text: "校验码已提交，等待电脑确认", state: "waiting" });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "校验码配对失败");
@@ -4345,12 +4391,8 @@ export default function MobileRemotePage() {
   async function createTask(event: FormEvent) {
     event.preventDefault();
     if (!project) return;
-    const trimmedTitle = title.trim();
     const trimmedDescription = description.trim();
-    // 标题是**可选**字段，任务说明才是必填 —— 与电脑端（TaskBoard 把「任务名称」标成"可选"、
-    // 给「任务说明」挂 `required`）以及 control-server `validateTaskInput`（`task description is required`）
-    // 一致。这里原来判的却是标题那一格，正好两边都判反：按电脑端习惯只填说明的用户
-    // 会撞上一颗**静默禁用**的按钮（点了完全没反应），只填标题的用户则会被服务端打回来。
+    // 任务说明是唯一可编辑的内容；服务端会立即生成标题并在可用时异步优化。
     // `required` 只看"值是不是空串"，一片空格的说明能绕过它，所以这里再兜一次；
     // 提示必须落在弹层自己的 `createError` 上（页面级那条 `.mobile-error` 在遮罩之下）。
     if (!trimmedDescription) {
@@ -4369,7 +4411,7 @@ export default function MobileRemotePage() {
       kind: "create",
       projectId: projectID,
       taskId: optimisticID,
-      task: { id: optimisticID, title: trimmedTitle, description: trimmedDescription, priority: chosenPriority, status: "todo", updatedAt: stamp },
+      task: { id: optimisticID, title: trimmedDescription, description: trimmedDescription, priority: chosenPriority, status: "todo", updatedAt: stamp },
     });
     setTaskBusy(optimisticID, true);
     // 新任务的状态是待处理，一定落在「待处理」那一档。用户可能正停在别的分类上，
@@ -4378,11 +4420,11 @@ export default function MobileRemotePage() {
     setTaskFilter("todo");
     // 弹层立刻收起、输入框立刻清空：用户已经看到任务出现在队列里了，没有理由再等。
     // 优先级一并回到默认「普通」，否则下一条会在用户没看这一格的情况下沿用上一条的档位。
-    setTitle(""); setDescription(""); setCreatePriority("normal"); setCreatingTask(false); setCreateError("");
+    setDescription(""); setCreatePriority("normal"); setCreatingTask(false); setCreateError("");
     const outcome = await runTaskCommand({
       type: "task.create",
       projectId: projectID,
-      payload: { title: trimmedTitle, description: trimmedDescription, priority: chosenPriority },
+      payload: { description: trimmedDescription, priority: chosenPriority },
     });
     // 电脑端把新建任务的**真 id** 放在回执里。就地换成它之后，"这张卡片落地了吗"
     // 就不用再靠标题+描述去猜（见 withResolvedCreateID）。
@@ -4393,7 +4435,6 @@ export default function MobileRemotePage() {
       // 回滚时把用户刚打的字放回输入框并重新打开弹层：任务已经被撤掉了，
       // 至少不让他把这些内容再打一遍。优先级也要一起放回去 —— 少了它，
       // 弹层重新打开时那一格显示的是默认「普通」，而用户明明选过「紧急」。
-      setTitle(trimmedTitle);
       setDescription(trimmedDescription);
       setCreatePriority(chosenPriority);
       setCreateError(reason);
@@ -4450,7 +4491,6 @@ export default function MobileRemotePage() {
 
   function openTaskEditor(task: Task) {
     setEditingTask(task);
-    setEditTitle(task.title || "");
     setEditDescription(task.description || "");
     setEditPriority(task.priority || "normal");
     // 与创建弹层同理：上一次的失败原因不能带到这一次（那个理由是给上一条任务的）。
@@ -4468,7 +4508,7 @@ export default function MobileRemotePage() {
       setEditError("任务描述不能为空");
       return;
     }
-    const patch = { title: editTitle.trim(), description: trimmedDescription, priority: editPriority };
+    const patch = { description: trimmedDescription, priority: editPriority };
     const taskID = editingTask.id;
     // 卡片上的改动立刻可见，弹层立刻收起。
     trackPendingTask({ commandId: "", kind: "update", projectId: selectedProject, taskId: taskID, patch: { ...patch, updatedAt: new Date().toISOString() } });
@@ -5314,14 +5354,11 @@ export default function MobileRemotePage() {
   // 切到系统通知指定的项目 / 会话。复用与 openMobileProject 相同的三个原语。
   // 只在会话视图里换目标时 enterConversationView 不会重复压历史（它自带 conversationHistoryRef 守卫）；
   // 换会话要清的浮层由 `[selectedProject, selectedConversation]` 那条 effect 统一处理，这里不重写。
-  function applyNotificationTarget(projectValue: Project, conversationId: string) {
+  function applyNotificationTarget(projectValue: Project, _conversationId: string) {
     setSelectedProject(projectValue.id);
-    // 通知没带会话 id 时挑当前会话。**不能只 setSelectedProject 就完事**：mobileView 仍停在
-    // "projects"，用户点了通知还钉在项目列表上，看起来像通知点了没反应。
-    // 挑法与 openMobileProject 一致（isCurrent 优先，其次第一条）；一条会话都没有时只切项目，
-    // 不替用户弹"新建会话"——那是用户主动进项目才该发生的事。
-    const target = projectValue.conversations?.find((entry) => entry.id === conversationId)
-      || projectValue.conversations?.find((entry) => entry.isCurrent)
+    // 通知仅定位项目。当前会话是跨端共享状态，不能让一条旧通知把所有设备
+    // 拉回它所属的历史会话；进入项目后一律读取服务端当前会话。
+    const target = projectValue.conversations?.find((entry) => entry.isCurrent)
       || projectValue.conversations?.[0];
     if (!target) return;
     setSelectedConversation(target.id);
@@ -5508,12 +5545,12 @@ export default function MobileRemotePage() {
   const boundPhonePlatform = platformLabel(boundPhone?.platform);
 
   return <main className={`mobile-remote${mobileApp ? "" : " desktop-remote"} ${mobileApp && mobileView === "conversation" ? "mobile-conversation-mode" : ""}${showConversationEmpty ? " mobile-empty-mode" : ""}`}>
-    {editingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-edit-title"><form className="mobile-task-modal" onSubmit={(event) => void saveTaskEdit(event)}><header><h2 id="mobile-task-edit-title">编辑任务</h2><button type="button" onClick={() => setEditingTask(null)} disabled={busy} aria-label="关闭">×</button></header><label>标题（可选）<input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} placeholder="留空时用描述代替" /></label><label>描述<textarea value={editDescription} onChange={(event) => setEditDescription(event.target.value)} required rows={4} /></label><MobilePriorityPicker name="mobile-task-edit-priority" value={editPriority} onChange={setEditPriority} />{editError && <p className="mobile-task-modal-error" role="alert">{editError}</p>}<footer><button type="button" onClick={() => setEditingTask(null)} disabled={busy}>取消</button><button type="submit" disabled={busy}>保存</button></footer></form></div>}
+    {editingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-edit-title"><form className="mobile-task-modal" onSubmit={(event) => void saveTaskEdit(event)}><header><h2 id="mobile-task-edit-title">编辑任务</h2><button type="button" onClick={() => setEditingTask(null)} disabled={busy} aria-label="关闭">×</button></header><label>描述<textarea value={editDescription} onChange={(event) => setEditDescription(event.target.value)} required rows={4} /></label><MobilePriorityPicker name="mobile-task-edit-priority" value={editPriority} onChange={setEditPriority} />{editError && <p className="mobile-task-modal-error" role="alert">{editError}</p>}<footer><button type="button" onClick={() => setEditingTask(null)} disabled={busy}>取消</button><button type="submit" disabled={busy}>保存</button></footer></form></div>}
     {deletingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-delete-title"><section className="mobile-task-modal mobile-task-delete-modal"><header><h2 id="mobile-task-delete-title">删除任务</h2><button type="button" onClick={() => setDeletingTask(null)} disabled={busy} aria-label="关闭">×</button></header><p>确定要删除任务吗？删除后无法恢复。</p><footer><button type="button" onClick={() => setDeletingTask(null)} disabled={busy}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmTaskDelete()} disabled={busy}>确认删除</button></footer></section></div>}
     {/* 新建任务：顶栏与面板右下角都能打开，表单收进这个弹层。复用编辑/删除那两张弹层的
         `.mobile-task-modal*` 样式与结构（居中小卡 + 头部 × + 底部主次按钮），不另造一套视觉；
-        字段与提交仍走原来的 title/description 状态与 createTask。 */}
-    {creatingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-create-title"><form className="mobile-task-modal" onSubmit={(event) => void createTask(event)}><header><h2 id="mobile-task-create-title">新建任务</h2><button type="button" onClick={() => setCreatingTask(false)} disabled={busy} aria-label="关闭">×</button></header><label>标题（可选）<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="留空时用描述代替" /></label><label>描述<textarea value={description} onChange={(event) => setDescription(event.target.value)} required placeholder="说明背景、范围和要完成的事" rows={3} /></label><MobilePriorityPicker name="mobile-task-create-priority" value={createPriority} onChange={setCreatePriority} />{createError && <p className="mobile-task-modal-error" role="alert">{createError}</p>}<footer><button type="button" onClick={() => setCreatingTask(false)} disabled={busy}>取消</button><button type="submit" disabled={busy}>创建</button></footer></form></div>}
+        字段与提交只走任务说明、优先级和服务端生成的标题。 */}
+    {creatingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-create-title"><form className="mobile-task-modal" onSubmit={(event) => void createTask(event)}><header><h2 id="mobile-task-create-title">新建任务</h2><button type="button" onClick={() => setCreatingTask(false)} disabled={busy} aria-label="关闭">×</button></header><label>描述<textarea autoFocus value={description} onChange={(event) => setDescription(event.target.value)} required placeholder="说明背景、范围和要完成的事" rows={3} /></label><MobilePriorityPicker name="mobile-task-create-priority" value={createPriority} onChange={setCreatePriority} />{createError && <p className="mobile-task-modal-error" role="alert">{createError}</p>}<footer><button type="button" onClick={() => setCreatingTask(false)} disabled={busy}>取消</button><button type="submit" disabled={busy}>创建</button></footer></form></div>}
     {confirmShortcut && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-shortcut-confirm-title"><section className="mobile-task-modal mobile-task-delete-modal"><header><h2 id="mobile-shortcut-confirm-title">执行「{confirmShortcut.name}」</h2><button type="button" onClick={() => setConfirmShortcut(null)} disabled={busy || Boolean(shortcutBusy)} aria-label="关闭">×</button></header><p>这条命令会在电脑端执行。模板内容：</p><pre className="mobile-shortcut-confirm-template">{confirmShortcut.template}</pre><footer><button type="button" onClick={() => setConfirmShortcut(null)} disabled={busy || Boolean(shortcutBusy)}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmShortcutRun()} disabled={busy || Boolean(shortcutBusy)}>执行</button></footer></section></div>}
     {/* 扫码取景层。必须是 <main> 的**直接子元素**：清底时 `html.barcode-scanner-active
         .mobile-remote > *:not(.mobile-scan)` 会把其余同级块整体不绘制，而取景窗要靠
@@ -5559,7 +5596,7 @@ export default function MobileRemotePage() {
         </div>
       </div>
     </div>}
-    {mobileApp ? <header className="mobile-remote-header" ref={headerRef}><div className="mobile-remote-title">{(!mobileApp || mobileView === "conversation") && <button className="mobile-back" type="button" onClick={goBack} title={mobileBackLabel} aria-label={mobileBackLabel}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5" /><path d="M11 18l-6-6 6-6" /></svg></button>}<div className="mobile-brand"><img className="mobile-brand-mark" src="/milevia-mark.svg" width="36" height="36" alt="" /><h1>{filesHeaderActive ? "项目文件" : gitHeaderActive ? "Git 工作台" : showConversationTitle ? (project?.name || "项目对话") : "Milevia"}</h1></div>{filesHeaderActive && project?.gitBranch && <span className="mobile-files-workspace" title="当前项目分支；手机端快照里还没有每个会话的工作区信息">{project.gitBranch}</span>}{conversationHeaderActive && conversationState && <span className={`mobile-conversation-state mobile-conversation-state-${conversation?.status}`}>{conversationState}</span>}</div><div className="mobile-header-actions">{mobileApp && mobileView === "projects" && <button className="mobile-home-settings" type="button" onClick={() => navigate("/settings")} aria-label="设置" title="设置"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2h-2.6v-.2a1.7 1.7 0 0 0-1-1.5l-.1.1-1.8-1.8.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0 1.5-1H4.3v-2.6h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1-1.8-1.8.1.1a1.7 1.7 0 0 0 1.9-.3 1.7 1.7 0 0 0 1-1.5v-.2H13v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1-1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0 1.5 1h.2V14h-.2a1.7 1.7 0 0 0-1.5 1Z" /></svg></button>}{!conversationHeaderActive && notificationPermission === "default" && <button className="mobile-notification-button" type="button" onClick={() => void enableMobileNotifications()} title="开启后台通知">开启通知</button>}{!conversationHeaderActive && <button className="mobile-refresh" type="button" onClick={() => void refreshNow()} disabled={refreshing} aria-busy={refreshing} title="从电脑端重新同步"><svg className="mobile-refresh-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg><span>刷新</span></button>}{filesHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-files-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="文件操作" title="文件操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-files-menu-sheet" role="menu" aria-label="文件操作"><div className="mobile-header-menu-info"><span>项目文件</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadFiles(); }}><span>刷新文件</span><small>重新读取目录与内容</small></button></div>}</div>}{gitHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-git-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="Git 操作" title="Git 操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-git-menu-sheet" role="menu" aria-label="Git 操作"><div className="mobile-header-menu-info"><span>Git 工作台</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadGit(); }}><span>刷新仓库状态</span><small>重新读取变更、分支与提交</small></button></div>}</div>}{conversationHeaderActive && project && !subHeaderActive && <><button className="mobile-refresh" type="button" onClick={() => void refreshNow()} disabled={refreshing} aria-busy={refreshing} title="从电脑端重新同步"><svg className="mobile-refresh-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg><span>刷新</span></button><button className="mobile-new-task" type="button" onClick={() => { setCreateError(""); setCreatingTask(true); }} disabled={busy} title="新建任务"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>新建任务</span></button><div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-header-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="更多操作" title="更多操作">{activeTaskCount > 0 && <span className="mobile-header-menu-badge" aria-hidden="true">{activeTaskCount}</span>}<span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-header-menu-sheet" role="menu" aria-label="更多操作">{activeDeviceRecord && <div className="mobile-header-menu-info mobile-header-menu-device"><span>当前电脑</span><small>{deviceDisplayName(activeDeviceRecord)} · {activeDeviceRecord.revoked ? "绑定已失效" : activeDeviceRecord.status === "online" ? "在线" : "离线"}</small></div>}{conversation && <div className="mobile-header-menu-info"><span>执行 Agent</span><small>{conversationAgentLabel(conversation.agentId)}</small></div>}{notificationPermission === "default" && <button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void enableMobileNotifications(); }}><span>开启通知</span><small>后台提醒</small></button>}<div className="mobile-header-menu-separator" role="none" /><button type="button" role="menuitem" onClick={() => openFiles()}><span>项目文件</span><small>查看与编辑</small></button><button type="button" role="menuitem" onClick={() => openGit()}><span>Git 工作台</span><small>变更 · 差异 · 提交</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setConversationHistoryOpen(true); }} disabled={conversations.length === 0}><span>历史会话</span><small>{conversations.length}</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void createConversationForProject(project); }} disabled={busy}><span>新会话</span><small>新建</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setTasksOpen(true); }}><span>任务队列</span><small>{activeTaskCount}</small></button></div>}</div></>}</div></header> : <header className="desktop-remote-header">
+    {mobileApp ? <header className="mobile-remote-header" ref={headerRef}><div className="mobile-remote-title">{(!mobileApp || mobileView === "conversation") && <button className="mobile-back" type="button" onClick={goBack} title={mobileBackLabel} aria-label={mobileBackLabel}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5" /><path d="M11 18l-6-6 6-6" /></svg></button>}<div className="mobile-brand"><img className="mobile-brand-mark" src="/milevia-mark.svg" width="36" height="36" alt="" /><h1>{filesHeaderActive ? "项目文件" : gitHeaderActive ? "Git 工作台" : showConversationTitle ? (project?.name || "项目对话") : "Milevia"}</h1></div>{filesHeaderActive && project?.gitBranch && <span className="mobile-files-workspace" title="当前项目分支；手机端快照里还没有每个会话的工作区信息">{project.gitBranch}</span>}{conversationHeaderActive && conversationState && <span className={`mobile-conversation-state mobile-conversation-state-${conversation?.status}`}>{conversationState}</span>}</div><div className="mobile-header-actions">{mobileApp && mobileView === "projects" && <button className="mobile-home-settings" type="button" onClick={() => navigate("/settings")} aria-label="设置" title="设置"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2h-2.6v-.2a1.7 1.7 0 0 0-1-1.5l-.1.1-1.8-1.8.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0 1.5-1H4.3v-2.6h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1-1.8-1.8.1.1a1.7 1.7 0 0 0 1.9-.3 1.7 1.7 0 0 0 1-1.5v-.2H13v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1-1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0 1.5 1h.2V14h-.2a1.7 1.7 0 0 0-1.5 1Z" /></svg></button>}{!conversationHeaderActive && notificationPermission === "default" && <button className="mobile-notification-button" type="button" onClick={() => void enableMobileNotifications()} title="开启后台通知">开启通知</button>}{!conversationHeaderActive && <button className="mobile-refresh" type="button" onClick={() => void refreshNow()} disabled={refreshing} aria-busy={refreshing} title="从电脑端重新同步"><svg className="mobile-refresh-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg><span>刷新</span></button>}{filesHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-files-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="文件操作" title="文件操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-files-menu-sheet" role="menu" aria-label="文件操作"><div className="mobile-header-menu-info"><span>项目文件</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadFiles(); }}><span>刷新文件</span><small>重新读取目录与内容</small></button></div>}</div>}{gitHeaderActive && <div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-git-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="Git 操作" title="Git 操作"><span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-git-menu-sheet" role="menu" aria-label="Git 操作"><div className="mobile-header-menu-info"><span>Git 工作台</span><small>{project?.gitBranch || "项目工作区"}</small></div><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); reloadGit(); }}><span>刷新仓库状态</span><small>重新读取变更、分支与提交</small></button></div>}</div>}{conversationHeaderActive && project && !subHeaderActive && <><button className="mobile-refresh" type="button" onClick={() => void refreshNow()} disabled={refreshing} aria-busy={refreshing} title="从电脑端重新同步"><svg className="mobile-refresh-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg><span>刷新</span></button><button className="mobile-new-conversation" type="button" onClick={() => openNewConversation(project)} disabled={busy} title="新会话"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>新会话</span></button><div className="mobile-header-menu"><button className="mobile-header-menu-button" ref={headerMenuButtonRef} type="button" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="mobile-header-menu-sheet" onClick={() => setHeaderMenuOpen((open) => !open)} aria-label="更多操作" title="更多操作">{activeTaskCount > 0 && <span className="mobile-header-menu-badge" aria-hidden="true">{activeTaskCount}</span>}<span aria-hidden="true">⋯</span></button>{headerMenuOpen && <div className="mobile-header-menu-sheet" id="mobile-header-menu-sheet" role="menu" aria-label="更多操作">{activeDeviceRecord && <div className="mobile-header-menu-info mobile-header-menu-device"><span>当前电脑</span><small>{deviceDisplayName(activeDeviceRecord)} · {activeDeviceRecord.revoked ? "绑定已失效" : activeDeviceRecord.status === "online" ? "在线" : "离线"}</small></div>}{conversation && <div className="mobile-header-menu-info"><span>执行 Agent</span><small>{conversationAgentLabel(conversation.agentId)}</small></div>}{notificationPermission === "default" && <button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); void enableMobileNotifications(); }}><span>开启通知</span><small>后台提醒</small></button>}<div className="mobile-header-menu-separator" role="none" /><button type="button" role="menuitem" onClick={() => openFiles()}><span>项目文件</span><small>查看与编辑</small></button><button type="button" role="menuitem" onClick={() => openGit()}><span>Git 工作台</span><small>变更 · 差异 · 提交</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setConversationHistoryOpen(true); }} disabled={conversations.length === 0}><span>历史会话</span><small>{conversations.length}</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setCreateError(""); setCreatingTask(true); }} disabled={busy}><span>新建任务</span><small>添加到队列</small></button><button type="button" role="menuitem" onClick={() => { setHeaderMenuOpen(false); setTasksOpen(true); }}><span>任务队列</span><small>{activeTaskCount}</small></button></div>}</div></>}</div></header> : <header className="desktop-remote-header">
       <div className="desktop-remote-head-main">
         <button className="desktop-remote-back" type="button" onClick={goBack} aria-label="返回项目总览" title="返回项目总览"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5" /><path d="M11 18l-6-6 6-6" /></svg></button>
         <div className="desktop-remote-head-text">
@@ -6025,7 +6062,7 @@ export default function MobileRemotePage() {
           const selected = newConversationAgent === agent.id;
           const available = mobileAgentAvailable(newConversationProject, agent.id);
           const status = mobileAgentStatus(newConversationProject, agent.id);
-          const statusLabel = available ? "已就绪" : status?.status === "updating" ? "更新中" : "不可用";
+          const statusLabel = available ? "已就绪" : mobileAgentProbePending(newConversationProject) ? "检测中" : status?.status === "updating" ? "更新中" : "不可用";
           const reason = available ? agent.name : mobileAgentUnavailableReason(newConversationProject, agent.id);
           return <button key={agent.id} type="button" role="radio" aria-checked={selected}
             className={`mobile-agent-app${selected ? " selected" : ""}${available ? "" : " unavailable"}`}
@@ -6043,7 +6080,7 @@ export default function MobileRemotePage() {
       </div>
       {!MOBILE_AGENTS.some((agent) => mobileAgentAvailable(newConversationProject, agent.id)) &&
         <p className="mobile-new-conversation-unavailable" role="status">
-          当前环境没有可用的 CLI 工具。{newConversationProject?.agentProbeError || "请先在电脑端安装、登录或修复工具后再试。"}
+          {mobileAgentProbePending(newConversationProject) ? "正在检测电脑端的 CLI 工具，请稍候…" : `当前环境没有可用的 CLI 工具。${newConversationProject?.agentProbeError || "请先在电脑端安装、登录或修复工具后再试。"}`}
         </p>}
       {/* 执行权限：桌面端新会话弹窗的「02 执行权限」对齐到这里 —— 手机端建的会话
           之前只能吃电脑端设置页的默认权限（桌面端配了「完全控制」时手机会静默拿到）。
@@ -6065,6 +6102,6 @@ export default function MobileRemotePage() {
       </div>
       <footer><button type="button" className="mobile-new-conversation-cancel" onClick={cancelNewConversation} disabled={busy}>取消</button><button type="button" className="mobile-new-conversation-confirm" onClick={() => void createConversationForProject(newConversationProject, newConversationAgent, newConversationPermission)} disabled={busy || !mobileAgentAvailable(newConversationProject, newConversationAgent)}>创建会话</button></footer>
     </section></div>}
-    {conversationHistoryOpen && <div className="mobile-conversation-history-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-conversation-history-title" onClick={(event) => { if (event.target === event.currentTarget) setConversationHistoryOpen(false); }}><section className="mobile-conversation-history-dialog"><header><div><h2 id="mobile-conversation-history-title">历史会话</h2><small>{historyDirectoryProjectID === project?.id && historyDirectory ? `${historyDirectory.length} 个会话` : "正在同步目录"}</small></div><button type="button" onClick={() => setConversationHistoryOpen(false)} aria-label="关闭历史会话">×</button></header>{historyDirectoryLoading && <p className="mobile-empty">正在从电脑端读取全部会话...</p>}{historyDirectoryError && <p className="mobile-empty" role="status">{historyDirectoryError}</p>}{!historyDirectoryLoading && conversations.length === 0 ? <p className="mobile-empty">该项目还没有会话。</p> : <ul className="mobile-conversation-history-list">{conversations.map((item) => <li key={item.id}><button type="button" className={`mobile-conversation-history-item${item.id === conversation?.id ? " active" : ""}`} aria-current={item.id === conversation?.id ? "true" : undefined} onClick={() => { setSelectedConversation(item.id); setConversationHistoryOpen(false); if (project?.id) void loadConversationHistory(project.id, item.id); }}><strong>{item.title || "未命名会话"}</strong><small>{conversationStatusLabel(item.status)}{item.isOrchestration ? " · 编排任务（只读）" : ""}{item.lastActivityAt ? ` · ${new Date(item.lastActivityAt).toLocaleString()}` : ""}</small></button></li>)}</ul>}</section></div>}
+    {conversationHistoryOpen && <div className="mobile-conversation-history-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-conversation-history-title" onClick={(event) => { if (event.target === event.currentTarget) setConversationHistoryOpen(false); }}><section className="mobile-conversation-history-dialog"><header><div><h2 id="mobile-conversation-history-title">历史会话</h2><small>{historyDirectoryProjectID === project?.id && historyDirectory ? `${historyDirectory.length} 个会话` : "正在同步目录"}</small></div><button type="button" onClick={() => setConversationHistoryOpen(false)} aria-label="关闭历史会话">×</button></header>{historyDirectoryLoading && <p className="mobile-empty">正在从电脑端读取全部会话...</p>}{historyDirectoryError && <p className="mobile-empty" role="status">{historyDirectoryError}</p>}{!historyDirectoryLoading && conversations.length === 0 ? <p className="mobile-empty">该项目还没有会话。</p> : <ul className="mobile-conversation-history-list">{conversations.map((item) => <li key={item.id}><button type="button" className={`mobile-conversation-history-item${item.id === conversation?.id ? " active" : ""}`} aria-current={item.id === conversation?.id ? "true" : undefined} onClick={() => { if (!project?.id || item.isOrchestration) return; void activateSharedConversation(project.id, item.id).then((activated) => { if (activated) { setConversationHistoryOpen(false); void loadConversationHistory(project.id, item.id); } }).catch((cause) => setError(cause instanceof Error ? cause.message : "无法切换当前会话")); }}><strong>{item.title || "未命名会话"}</strong><small>{conversationStatusLabel(item.status)}{item.isOrchestration ? " · 编排任务（只读）" : ""}{item.lastActivityAt ? ` · ${new Date(item.lastActivityAt).toLocaleString()}` : ""}</small></button></li>)}</ul>}</section></div>}
   </main>;
 }

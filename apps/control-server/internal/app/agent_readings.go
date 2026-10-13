@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"time"
 )
@@ -298,23 +299,68 @@ func (s *Server) triggerAgentProbeForRemote(meta RunnerMeta) {
 	if s.remoteAgentProbeActive == nil {
 		s.remoteAgentProbeActive = map[string]bool{}
 	}
+	if s.remoteAgentProbeRetryAfter == nil {
+		s.remoteAgentProbeRetryAfter = map[string]time.Time{}
+	}
 	if s.remoteAgentProbeActive[meta.ID] {
 		s.remoteAgentProbeMu.Unlock()
 		return
 	}
+	if retryAfter := s.remoteAgentProbeRetryAfter[meta.ID]; time.Now().Before(retryAfter) {
+		s.remoteAgentProbeMu.Unlock()
+		return
+	}
 	s.remoteAgentProbeActive[meta.ID] = true
+	delete(s.remoteAgentProbeRetryAfter, meta.ID)
 	s.remoteAgentProbeMu.Unlock()
 
 	go func() {
 		defer func() {
-			s.remoteAgentProbeMu.Lock()
-			delete(s.remoteAgentProbeActive, meta.ID)
-			s.remoteAgentProbeMu.Unlock()
+			s.clearRemoteAgentProbe(meta.ID)
 		}()
+		before, hadBefore, _ := s.cachedAgentStatusesForRemote(meta.ID)
 		probeCtx, cancel := s.agentProbeContext()
 		defer cancel()
 		_, _ = s.probeAgentsFor(probeCtx, meta, false)
+		after, hadAfter, _ := s.cachedAgentStatusesForRemote(meta.ID)
+		// Clear the in-flight marker before advancing the snapshot revision. The
+		// Agent may read the next snapshot immediately, and that snapshot must
+		// describe the completed probe rather than the old pending state.
+		s.finishRemoteAgentProbe(meta.ID, !hadAfter)
+		// 首次探测即使因超时而没有留下读数，也要推进版本：快照里的
+		// agentProbePending 会从 true 变为 false，手机端需要收到这次结束状态。
+		if !hadBefore || hadBefore != hadAfter || !agentStatusesEqual(before, after) {
+			if err := s.advanceRemoteSnapshotRevision(context.Background()); err != nil {
+				log.Printf("advance remote snapshot revision after agent probe: %v", err)
+			}
+		}
 	}()
+}
+
+func (s *Server) clearRemoteAgentProbe(runnerID string) {
+	s.remoteAgentProbeMu.Lock()
+	delete(s.remoteAgentProbeActive, runnerID)
+	s.remoteAgentProbeMu.Unlock()
+}
+
+func (s *Server) finishRemoteAgentProbe(runnerID string, retryLater bool) {
+	s.remoteAgentProbeMu.Lock()
+	delete(s.remoteAgentProbeActive, runnerID)
+	if retryLater {
+		if s.remoteAgentProbeRetryAfter == nil {
+			s.remoteAgentProbeRetryAfter = map[string]time.Time{}
+		}
+		s.remoteAgentProbeRetryAfter[runnerID] = time.Now().Add(agentReadingsStaleTTL)
+	}
+	s.remoteAgentProbeMu.Unlock()
+}
+
+// remoteAgentProbePending reports whether the background refresh is still
+// running. A timed-out probe has no cache entry too, but is not pending.
+func (s *Server) remoteAgentProbePending(runnerID string) bool {
+	s.remoteAgentProbeMu.Lock()
+	defer s.remoteAgentProbeMu.Unlock()
+	return s.remoteAgentProbeActive[runnerID]
 }
 
 // storeAgentDiagnostics 把这一轮结果挂到读数上。

@@ -42,6 +42,7 @@ type RemoteInstance struct {
 	InstanceID        string    `json:"instanceId"`
 	Status            string    `json:"status"`
 	LastAgentSequence int64     `json:"lastAgentSequence"`
+	SnapshotRevision  int64     `json:"snapshotRevision"`
 	ObservedAt        time.Time `json:"observedAt"`
 }
 
@@ -96,9 +97,12 @@ type remoteSnapshotProject struct {
 	Skills []Skill `json:"skills"`
 	// 手机端无法直接访问 Runner 状态接口，因此把统一探测结果随项目快照下发。
 	// 状态缺失时客户端应按不可用处理，避免把未知状态误报成可用。
-	AgentStatuses   []AgentStatus `json:"agentStatuses,omitempty"`
-	AgentProbeOK    bool          `json:"agentProbeOk"`
-	AgentProbeError string        `json:"agentProbeError,omitempty"`
+	AgentStatuses []AgentStatus `json:"agentStatuses,omitempty"`
+	AgentProbeOK  bool          `json:"agentProbeOk"`
+	// AgentProbePending 区分"正在检测"与"探测结束但没有可回放读数"。
+	// 后者不能让客户端无限重试。
+	AgentProbePending bool   `json:"agentProbePending,omitempty"`
+	AgentProbeError   string `json:"agentProbeError,omitempty"`
 }
 
 // remoteSnapshotShortcut 是 Shortcut 的裁剪版：只带手机端渲染与执行需要的字段。
@@ -259,6 +263,7 @@ create table if not exists remote_instance (
 		instance_id text primary key,
 		status text not null default 'agent_unavailable',
 		last_agent_sequence integer not null default 0,
+		snapshot_revision integer not null default 0,
 		last_seen_at datetime,
 		updated_at datetime not null
 );
@@ -297,6 +302,14 @@ create unique index if not exists processed_remote_commands_idempotency
 		return err
 	}
 	if err := ensureColumn(ctx, s.db, "processed_remote_commands", "request_payload", "text not null default '{}' "); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, s.db, "remote_instance", "snapshot_revision", "integer not null default 0"); err != nil {
+		return err
+	}
+	// 已安装版本以前只用事件序列作为快照版本。把既有值接过来，后续 CLI 探测
+	// 完成时才能在不伪造业务事件的前提下单独推进快照版本。
+	if _, err := s.db.ExecContext(ctx, `update remote_instance set snapshot_revision=last_agent_sequence where snapshot_revision=0`); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `update processed_remote_commands set status='indeterminate',updated_at=? where status='executing'`, time.Now().UTC()); err != nil {
@@ -786,7 +799,7 @@ func (s *Server) enqueueRemoteEventTx(ctx context.Context, tx *sql.Tx, eventID, 
 // the phone with nothing to attribute it to.
 func (s *Server) enqueueRemoteEventTxWithConversation(ctx context.Context, tx *sql.Tx, eventID, taskID, taskRunID, conversationID, typ string, payload []byte, now time.Time) error {
 	payload = compactRemoteEventPayload(typ, remoteEventPayloadWithConversation(payload, conversationID))
-	if _, err := tx.ExecContext(ctx, `update remote_instance set last_agent_sequence=last_agent_sequence+1,updated_at=?`, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `update remote_instance set last_agent_sequence=last_agent_sequence+1,snapshot_revision=snapshot_revision+1,updated_at=?`, now); err != nil {
 		return err
 	}
 	var sequence int64
@@ -908,7 +921,7 @@ func (s *Server) remoteOverview(w http.ResponseWriter, r *http.Request) {
 	// source columns contain timestamps. Scan the raw value and normalize it so
 	// the relay health endpoint works with both SQLite and PostgreSQL drivers.
 	var observedAt any
-	if err := s.db.QueryRowContext(r.Context(), `select instance_id,status,last_agent_sequence,coalesce(last_seen_at,updated_at) from remote_instance limit 1`).Scan(&item.InstanceID, &item.Status, &item.LastAgentSequence, &observedAt); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), `select instance_id,status,last_agent_sequence,snapshot_revision,coalesce(last_seen_at,updated_at) from remote_instance limit 1`).Scan(&item.InstanceID, &item.Status, &item.LastAgentSequence, &item.SnapshotRevision, &observedAt); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -919,6 +932,13 @@ func (s *Server) remoteOverview(w http.ResponseWriter, r *http.Request) {
 	}
 	item.ObservedAt = parsed
 	writeJSON(w, http.StatusOK, item)
+}
+
+// advanceRemoteSnapshotRevision records a change that belongs in the mobile
+// snapshot but is not a relay event, such as a completed background CLI probe.
+func (s *Server) advanceRemoteSnapshotRevision(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `update remote_instance set snapshot_revision=snapshot_revision+1,updated_at=?`, time.Now().UTC())
+	return err
 }
 
 func parseRemoteTimestamp(value any) (time.Time, error) {
@@ -1163,7 +1183,7 @@ func (s *Server) remoteSnapshotSkills(ctx context.Context, project Project, agen
 
 func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	var revision int64
-	if err := s.db.QueryRowContext(r.Context(), `select last_agent_sequence from remote_instance limit 1`).Scan(&revision); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), `select snapshot_revision from remote_instance limit 1`).Scan(&revision); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1215,6 +1235,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			} else {
 				// 冷启动探测放到后台，不能让手机项目列表同步等待 WSL/SSH 超时。
 				s.triggerAgentProbeForRemote(meta)
+				project.AgentProbePending = s.remoteAgentProbePending(meta.ID)
 			}
 		}
 		projects = append(projects, project)

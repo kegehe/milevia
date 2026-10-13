@@ -43,7 +43,7 @@ test("the reference is expanded only at send time, and both ends agree on the te
   assert.match(conversationPage, /const content = composeSkillMessage\(draft, refs\);/);
   assert.match(conversationPage, /if \(!draft && refs\.length === 0\) return false;/);
   // 点发送这条路径必须真的把引用带上（漏了它就是"输入框里有胶囊、发出去却没有引用"）。
-  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*setShowSendMenu\(false\);\s*void sendContent\(text, true, \{ skillRefs \}\);\s*\};/s);
+  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*if \(changingModel\) return;\s*setShowSendMenu\(false\);\s*void sendContent\(text, true, \{ skillRefs \}\);\s*\};/s);
   // 两端必须逐字一致：同一个技能不能因为"在手机上点的"就让 Agent 收到另一句指令。
   // headless 通道（-p --output-type stream-json）不解析交互式斜杠命令，所以发出去的
   // 只能是这句自然语言引用 —— 能改的只有显示层，这条断言就是那道闸门。

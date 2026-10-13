@@ -28,7 +28,7 @@
    实测过：⋯ 按钮右侧 border-box 外 2px 处 elementFromPoint 已落到 <main> 上（正好压在
    ::after 的右边界上，半开区间判为界外），左侧则因为亚像素取整侥幸命中——同一份 CSS
    两侧表现不一致，正是"热区偏小 2px"的典型症状。 */
-.mobile-refresh::after, .mobile-new-task::after, .mobile-notification-button::after, .mobile-header-menu-button::after { position: absolute; inset: -4px; content: ""; }
+.mobile-refresh::after, .mobile-new-task::after, .mobile-new-conversation::after, .mobile-notification-button::after, .mobile-header-menu-button::after { position: absolute; inset: -4px; content: ""; }
 .mobile-remote-header { max-width: 860px; margin: 0 auto 16px; }
 .mobile-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .mobile-brand-mark { width: 36px; height: 36px; flex: none; border-radius: 9px; box-shadow: 0 2px 5px rgba(25, 51, 44, .16); }
@@ -1249,8 +1249,8 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
    高度 38px，底色与描边都退到"次级操作"那一档。图标顺手从 12px 提到 13px ——
    原先 12px 是为了让加图标不加宽（配 min-width: 76px 用），那条约束随实心块一起作废了。 */
 .mobile-refresh { position: relative; display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 5px; border: 1px solid #cfe4da; border-radius: 999px; padding: 0 11px; color: #256a5b; background: #eaf4ef; font: inherit; font-size: 12px; font-weight: 700; }
-.mobile-new-task { position: relative; display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 5px; border: 1px solid #a9cfbc; border-radius: 999px; padding: 0 11px; color: #1f6d58; background: #e4f5eb; font: inherit; font-size: 12px; font-weight: 700; white-space: nowrap; }
-.mobile-new-task svg { flex: none; }
+.mobile-new-task, .mobile-new-conversation { position: relative; display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 5px; border: 1px solid #a9cfbc; border-radius: 999px; padding: 0 11px; color: #1f6d58; background: #e4f5eb; font: inherit; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.mobile-new-task svg, .mobile-new-conversation svg { flex: none; }
 .mobile-refresh-icon { flex: none; }
 /* 文字必须 nowrap：按钮是 inline-flex，span 默认可收缩，而头部这一行在会话视图里是"标题挤按钮"的
    （标题 overflow: hidden 只保住自己不被撑破，剩下的宽度按 base 大小分摊）。
@@ -1264,9 +1264,9 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 @keyframes mobile-refresh-spin { to { transform: rotate(360deg); } }
 /* 悬停只给精确指针：触屏上 hover 会粘在刚点过的按钮上（同 .mobile-project-choice）。 */
 @media (hover: hover) and (pointer: fine) {
-  .mobile-back:hover, .mobile-refresh:hover, .mobile-new-task:hover, .mobile-notification-button:hover { background: #dcefe4; }
+  .mobile-back:hover, .mobile-refresh:hover, .mobile-new-task:hover, .mobile-new-conversation:hover, .mobile-notification-button:hover { background: #dcefe4; }
 }
-.mobile-back:active, .mobile-refresh:active, .mobile-new-task:active, .mobile-notification-button:active { background: #d2e9dc; }
+.mobile-back:active, .mobile-refresh:active, .mobile-new-task:active, .mobile-new-conversation:active, .mobile-notification-button:active { background: #d2e9dc; }
 
 /* 刷新结果条：紧跟头部，是"点了刷新到底发生了什么"的唯一权威回答。
    时间戳用 margin-left: auto 贴右，内容再长也不会把它挤出去（文字自己换行）。 */

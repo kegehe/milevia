@@ -36,6 +36,14 @@ func TestReadCodexJSONLStoresThreadAndAssistantText(t *testing.T) {
 	}
 }
 
+func TestReadCodexJSONLSignalsTurnCompletion(t *testing.T) {
+	completion := newCodexTurnCompletion()
+	readCodexJSONL(strings.NewReader(`{"type":"turn.completed"}`+"\n"), &recordingSink{}, "", completion)
+	if !completion.finished() {
+		t.Fatal("turn.completed did not signal completion")
+	}
+}
+
 func TestCodexOutputSchemaWrapsArrayRoot(t *testing.T) {
 	schema, err := codexOutputSchema(json.RawMessage(`{"type":"array","items":{"type":"string"}}`))
 	if err != nil {
@@ -384,6 +392,31 @@ func TestCodexRunForceTerminatesCancelledProcess(t *testing.T) {
 		}
 	case <-time.After(7 * time.Second):
 		t.Fatal("cancelled Codex process was not force terminated")
+	}
+}
+
+func TestCodexRunFinishesAfterTurnCompletedWhenProcessStaysAlive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "terminal-event-codex")
+	script := "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"turn.completed\"}'\ntrap '' TERM\nwhile :; do sleep 1; done\n"
+	if runtime.GOOS == "windows" {
+		path += ".cmd"
+		script = "@echo {\"type\":\"turn.completed\"}\r\n:loop\r\ntimeout /t 1 /nobreak >nul\r\ngoto loop\r\n"
+	}
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	runner := newCodexCLIRunner(Config{CodexPath: path}, nil)
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.Run(context.Background(), AgentRunRequest{ProjectPath: t.TempDir(), PermissionMode: "read_only"}, &recordingSink{})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("completed Codex turn returned error: %v", err)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("Codex process was not reclaimed after turn.completed")
 	}
 }
 

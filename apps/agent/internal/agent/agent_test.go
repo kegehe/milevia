@@ -33,6 +33,73 @@ func TestSnapshotRevisionFallsBackToSnapshotPayload(t *testing.T) {
 	}
 }
 
+func TestSnapshotOverviewVersionAvoidsIdleRebuilds(t *testing.T) {
+	var snapshotReads, uploads int
+	revision := int64(4)
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/remote/overview":
+			_ = json.NewEncoder(w).Encode(map[string]int64{"lastAgentSequence": 2, "snapshotRevision": revision})
+		case "/api/remote/snapshot":
+			snapshotReads++
+			_ = json.NewEncoder(w).Encode(map[string]any{"snapshotRevision": revision, "projects": []any{}})
+		default:
+			t.Fatalf("unexpected local path %q", r.URL.Path)
+		}
+	}))
+	defer local.Close()
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/agent/snapshot" {
+			t.Fatalf("unexpected cloud path %q", r.URL.Path)
+		}
+		uploads++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cloud.Close()
+	agent := New(Config{CloudURL: cloud.URL, InstanceID: "instance", CloudToken: "token", LocalURL: local.URL})
+	if err := agent.syncSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.syncSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotReads != 1 || uploads != 1 {
+		t.Fatalf("idle sync reads=%d uploads=%d, want 1 each", snapshotReads, uploads)
+	}
+}
+
+func TestSnapshotLegacyOverviewFallsBackToEventSequence(t *testing.T) {
+	var snapshotReads, uploads int
+	sequence := int64(4)
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/remote/overview":
+			_ = json.NewEncoder(w).Encode(map[string]int64{"lastAgentSequence": sequence})
+		case "/api/remote/snapshot":
+			snapshotReads++
+			_ = json.NewEncoder(w).Encode(map[string]any{"snapshotRevision": sequence, "projects": []any{}})
+		default:
+			t.Fatalf("unexpected local path %q", r.URL.Path)
+		}
+	}))
+	defer local.Close()
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cloud.Close()
+	agent := New(Config{CloudURL: cloud.URL, InstanceID: "instance", CloudToken: "token", LocalURL: local.URL})
+	if err := agent.syncSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.syncSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotReads != 1 || uploads != 1 {
+		t.Fatalf("legacy idle sync reads=%d uploads=%d, want 1 each", snapshotReads, uploads)
+	}
+}
+
 func TestCloudWebSocketEndpointConvertsHTTPS(t *testing.T) {
 	got, err := cloudWebSocketEndpoint("https://cloud.example.com/base", "instance 1")
 	if err != nil {

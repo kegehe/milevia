@@ -144,9 +144,10 @@ export function mutationReflectsInSnapshot(
   // 第二条会被第一条误判成"已反映"，卡片当着用户的面消失一次。
   // 两个字段都兜 null：`created` 是本地刚建的（一定有值），但 `task` 来自**快照**（线协议）。
   // 少了兜底，快照里任意一条 title 为 null 的任务都会让这次比对抛错。
-  const title = (created.title || "").trim();
   const description = created.description?.trim() || "";
-  const matches = (task: PendingTaskTask) => (task.title || "").trim() === title && (task.description?.trim() || "") === description;
+  // 服务端会从说明生成并可能异步优化标题，因此确认新建任务时只能用
+  // 稳定的说明匹配，不能要求手机端的乐观标题与服务端最终标题相同。
+  const matches = (task: PendingTaskTask) => (task.description?.trim() || "") === description;
   const inSnapshot = project.tasks.filter(matches).length;
   const stillPending = Array.from(pending).filter((item) => item.kind === "create" && item.projectId === mutation.projectId && item.task && isPendingTaskID(item.task.id) && matches(item.task)).length;
   return inSnapshot >= stillPending;

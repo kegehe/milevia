@@ -38,6 +38,11 @@ type wslAgentRunner struct {
 
 	mu     sync.Mutex
 	probes map[string]wslProbeEntry
+
+	nodeBinMu       sync.Mutex
+	nodeBin         string
+	nodeBinResolved bool
+	nodeBinLookup   chan struct{}
 }
 
 // wslProbeEntry 是一次 WSL 探测的缓存条目。
@@ -151,8 +156,64 @@ func (r *wslAgentRunner) backgroundContext() context.Context {
 // 目录（$HOME/.npm-global/bin、$HOME/.local/bin，见 WSL .bashrc/.zshrc）里的同名单文件
 // 才是可在 Linux 执行的版本。探测与运行都前置这两个目录，保证"WSL 项目用 WSL 原生
 // codex/claude"，不让 Windows shim 劫持。
-func wslPathPrefix() string {
-	return `export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"`
+func (r *wslAgentRunner) wslPathPrefix() string {
+	nodeBin := r.zshNodeBin()
+	prefix := `export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"`
+	if nodeBin == "" {
+		return prefix
+	}
+	return "export PATH=" + shellQuote(nodeBin) + `:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH`
+}
+
+func (r *wslAgentRunner) zshNodeBin() string {
+	r.nodeBinMu.Lock()
+	if r.nodeBinResolved {
+		nodeBin := r.nodeBin
+		r.nodeBinMu.Unlock()
+		return nodeBin
+	}
+	if done := r.nodeBinLookup; done != nil {
+		r.nodeBinMu.Unlock()
+		<-done
+		r.nodeBinMu.Lock()
+		nodeBin := r.nodeBin
+		r.nodeBinMu.Unlock()
+		return nodeBin
+	}
+	done := make(chan struct{})
+	r.nodeBinLookup = done
+	r.nodeBinMu.Unlock()
+
+	nodeBin := r.resolveZshNodeBin()
+	r.nodeBinMu.Lock()
+	r.nodeBin = nodeBin
+	r.nodeBinResolved = true
+	r.nodeBinLookup = nil
+	close(done)
+	nodeBin = r.nodeBin
+	r.nodeBinMu.Unlock()
+	return nodeBin
+}
+
+func (r *wslAgentRunner) resolveZshNodeBin() string {
+	ctx, cancel := context.WithTimeout(r.backgroundContext(), 10*time.Second)
+	defer cancel()
+	wslPath, err := wslExePath()
+	if err != nil {
+		return ""
+	}
+	cmd := exec.CommandContext(ctx, wslPath, "-d", r.distro, "-e", "zsh", "-ic", "command -v node")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	for lines := strings.Split(strings.TrimSpace(string(out)), "\n"); len(lines) > 0; lines = lines[:len(lines)-1] {
+		node := strings.TrimSpace(lines[len(lines)-1])
+		if strings.HasPrefix(node, "/") && strings.HasSuffix(node, "/bin/node") {
+			return strings.TrimSuffix(node, "/node")
+		}
+	}
+	return ""
 }
 
 // wslBridgeProbe 在 WSL 内执行一条 sh 命令，返回 stdout 文本（UTF-8）。找不到 wsl.exe
@@ -173,7 +234,7 @@ func (r *wslAgentRunner) wslBridgeProbe(ctx context.Context, command string) (st
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	full := wslPathPrefix() + ";" + command
+	full := r.wslPathPrefix() + ";" + command
 	cmd := exec.CommandContext(probeCtx, wslPath, "-d", r.distro, "-e", "sh", "-c", full)
 	configureProcessGroup(cmd)
 	out, err := cmd.Output()

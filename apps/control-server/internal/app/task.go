@@ -356,12 +356,11 @@ func canUpdateTaskStatus(from, to string) bool {
 }
 
 func validateTaskInput(input *taskInput) error {
-	input.Title = strings.TrimSpace(input.Title)
 	input.Description = strings.TrimSpace(input.Description)
 	if input.Description == "" {
 		return errors.New("task description is required")
 	}
-	if len([]rune(input.Title)) > 120 || len([]rune(input.Description)) > 12000 {
+	if len([]rune(input.Description)) > 12000 {
 		return errors.New("task content exceeds the allowed length")
 	}
 	if input.Priority == "" {
@@ -370,6 +369,9 @@ func validateTaskInput(input *taskInput) error {
 	if !validTaskPriority(input.Priority) {
 		return errors.New("unsupported task priority")
 	}
+	// The client title is intentionally ignored. Descriptions are the single
+	// source of truth for task content and the displayed title is derived from it.
+	input.Title = generatedTaskTitle(input.Description)
 	return nil
 }
 
@@ -492,6 +494,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, task)
+	s.refineTaskTitleAsync(task.ProjectID, task.ID, task.Description)
 }
 
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
@@ -545,6 +548,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	descriptionChanged := task.Description != input.Description
 	originalStatus := task.Status
 	if input.Status != "" {
 		if !validTaskStatus(input.Status) {
@@ -657,6 +661,9 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		s.notifyTaskStatusChange(r.Context(), task.ID, task.Status)
 	}
 	writeJSON(w, http.StatusOK, task)
+	if descriptionChanged {
+		s.refineTaskTitleAsync(task.ProjectID, task.ID, task.Description)
+	}
 }
 
 func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {

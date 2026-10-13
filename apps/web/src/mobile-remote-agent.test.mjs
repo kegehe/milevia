@@ -300,8 +300,12 @@ test("mobile + panel mirrors the desktop shortcut library instead of hardcoded p
   assert.doesNotMatch(page, /insertComposerPhrase/);
   // 类型：快捷方式在快照顶层（一份可被多个项目共用），技能挂在项目上（它是"项目 + CLI"两个维度的产物）。
   assert.match(page, /type RemoteShortcut = \{ id: string; name: string;/);
-  assert.match(page, /type Project = \{[^}]*skills\?: RemoteSkill\[\][^}]*agentStatuses\?: RemoteAgentStatus\[\][^}]*agentProbeOk\?: boolean/);
+  assert.match(page, /type Project = \{[^}]*skills\?: RemoteSkill\[\][^}]*agentStatuses\?: RemoteAgentStatus\[\][^}]*agentProbeOk\?: boolean; agentProbePending\?: boolean/);
   assert.match(page, /function mobileAgentAvailable\(project: Project \| null \| undefined, agentID: MobileAgentID\): boolean/);
+  assert.match(page, /function mobileAgentProbePending\(project: Project \| null \| undefined\): boolean/);
+  assert.match(page, /return project\?\.agentProbePending === true;/);
+  assert.match(page, /mobileAgentProbePending\(newConversationProject\) \? "检测中"/);
+  assert.match(page, /正在检测电脑端的 CLI 工具，请稍候/);
   assert.match(page, /disabled=\{!available \|\| busy\}/);
   assert.match(page, /disabled=\{busy \|\| !mobileAgentAvailable\(newConversationProject, newConversationAgent\)\}/);
   assert.match(page, /type Snapshot = \{ snapshotRevision: number; observedAt: string; projects: Project\[\]; shortcuts\?: RemoteShortcut\[\] \}/);
@@ -373,6 +377,17 @@ test("mobile + panel mirrors the desktop shortcut library instead of hardcoded p
   // 独立空态文案：数据来自电脑端，没有条目时要说明来源，而不是让用户以为面板坏了。
   assert.match(page, /电脑端还没有添加常用提示词。/);
   assert.match(page, /电脑端未发现可用技能。/);
+});
+
+test("mobile retries a pending CLI probe without waiting for a business event", () => {
+  const pendingRefresh = page.match(/useEffect\(\(\) => \{\s*if \(!snapshot\?\.projects\.some\(\(item\) => mobileAgentProbePending\(item\)\)\) return;[\s\S]*?\}, \[loadSnapshot, snapshot\]\);/)?.[0] ?? "";
+  assert.ok(pendingRefresh, "找不到 CLI 探测中的快照刷新");
+  assert.match(pendingRefresh, /loadSnapshot\(\{ force: true, silent: true \}\)/);
+  assert.match(pendingRefresh, /3000/);
+  const loadSnapshot = page.match(/const loadSnapshot = useCallback\([\s\S]*?\n  \}, \[instanceID\]\);/)?.[0] ?? "";
+  assert.match(loadSnapshot, /silent\?: boolean/);
+  assert.match(loadSnapshot, /if \(!options\?\.silent\) setError\(""\)/);
+  assert.match(loadSnapshot, /if \(!options\?\.silent\) setError\(reason\)/);
 });
 
 test("mobile message bubbles size to their content and point at the sender", () => {
@@ -919,11 +934,8 @@ test("mobile task controls reconcile busy and status changes without duplicates"
 // **静默禁用**的按钮（禁用态当时没有配色，外观与可点状态逐项相同，触屏上连 cursor 都看不到），
 // 只填标题的用户则会被服务端打回来。2026-09-20 实测复现并修掉；这里把"哪一端必填"同时钉在
 // DOM 与提交守卫两处，防止再次写反。
-test("mobile task forms treat the title as optional and the description as required", () => {
-  // ① 两处表单的字段声明：标题不再 required，描述 required。
-  assert.match(page, /<label>标题（可选）<input value=\{title\} onChange=\{\(event\) => setTitle\(event\.target\.value\)\} placeholder="留空时用描述代替" \/>/);
-  assert.match(page, /<label>描述<textarea value=\{description\} onChange=\{\(event\) => setDescription\(event\.target\.value\)\} required placeholder=/);
-  assert.match(page, /<label>标题（可选）<input value=\{editTitle\} onChange=\{\(event\) => setEditTitle\(event\.target\.value\)\} placeholder="留空时用描述代替" \/>/);
+test("mobile task forms only expose a required description", () => {
+  assert.match(page, /<label>描述<textarea autoFocus value=\{description\} onChange=\{\(event\) => setDescription\(event\.target\.value\)\} required placeholder=/);
   assert.match(page, /<label>描述<textarea value=\{editDescription\} onChange=\{\(event\) => setEditDescription\(event\.target\.value\)\} required rows=\{4\} \/>/);
 
   // ② 提交按钮只跟全局 busy 走：交给 `required` 出原生提示，不再拿"标题为空"把按钮按住。
@@ -1005,7 +1017,7 @@ test("mobile task cards show a per-card syncing state and roll back on failure",
   assert.match(page, /if \(result\.outcome === "failed"\) \{\s*setTaskBusy\(taskID, false\);\s*setError\("已同步到电脑端，但云端快照还没更新，稍后刷新即可"\);\s*return;\s*\}/);
   // 创建失败要把用户刚打的字放回输入框：任务已经被撤掉了，至少不让他重打一遍。
   // （2026-09-17 起中间多了一句 setCreatePriority：优先级也要一起放回去，见下面的优先级用例。）
-  assert.match(page, /setTitle\(trimmedTitle\);\s*setDescription\(trimmedDescription\);\s*setCreatePriority\(chosenPriority\);\s*setCreateError\(reason\);\s*setCreatingTask\(true\);/);
+  assert.match(page, /setDescription\(trimmedDescription\);\s*setCreatePriority\(chosenPriority\);\s*setCreateError\(reason\);\s*setCreatingTask\(true\);/);
   // 待确认改动按实例隔离，换电脑后不能叠到新电脑的快照上。
   assert.match(page, /if \(pendingTaskRef\.current\.size > 0\) \{\s*pendingTaskRef\.current\.clear\(\);/);
   // 每一次快照落地都要对一次账：命令没在 30 秒窗口内拿到回执时我们故意不回滚，
@@ -1412,8 +1424,9 @@ test("mobile never loses its device entry points when the instance read fails", 
   // 跳到项目时**必须同时进会话视图**：只 setSelectedProject 的话 mobileView 仍停在 "projects"，
   // 用户点了通知还钉在项目列表上，看起来像点了没反应。没带会话 id 时挑当前会话（与
   // openMobileProject 同口径）。
-  assert.match(page, /function applyNotificationTarget\(projectValue: Project, conversationId: string\) \{/);
+  assert.match(page, /function applyNotificationTarget\(projectValue: Project, _conversationId: string\) \{/);
   assert.match(page, /projectValue\.conversations\?\.find\(\(entry\) => entry\.isCurrent\)/);
+  assert.doesNotMatch(page.match(/function applyNotificationTarget\([\s\S]*?\n  \}/)?.[0] ?? "", /entry\.id === conversationId/);
   // 前后台不能只看 document.hidden：Android WebView 里 visibilitychange 是否可靠触发
   // 没有验证记录，若它不触发，通知就永远发不出去。原生侧补 appStateChange，两条取或。
   assert.match(page, /CapacitorApp\.addListener\("appStateChange"/);
@@ -1594,7 +1607,12 @@ test("mobile device storage keeps the legacy key alive for older builds", () => 
   // 旧包只认 milevia.cloud.token：新包必须继续镜像它，否则用户回退版本就会发现"配对没了"。
   assert.match(page, /const \[devices, setDevices\] = useState<MobileDevice\[\]>\(\(\) => reconcileDevices\(\)\);/);
   assert.match(page, /const \[token, setToken\] = useState\(\(\) => readActiveToken\(\)\);/);
-  assert.match(page, /addOrReplaceDevice\(\{ token: pendingAccessToken, instanceId: instanceID, name: instance\?\.name \|\| "" \}\);/);
+  // 确认配对时，页面的 instanceID 仍可能是当前正在操作的 A；必须使用声明
+  // 响应中的 B，否则设备表会把 B 当成 A 的重新配对并删除 A。
+  assert.match(page, /const \[pendingPairingInstanceID, setPendingPairingInstanceID\] = useState\(""\);/);
+  assert.match(page, /setPendingPairingInstanceID\(result\.instanceId \|\| ""\);/);
+  assert.match(page, /addOrReplaceDevice\(\{ token: pendingAccessToken, instanceId: pendingPairingInstanceID, name: "" \}\);/);
+  assert.doesNotMatch(page, /addOrReplaceDevice\(\{ token: pendingAccessToken, instanceId: instanceID,/);
   // 手动粘贴令牌的入口（`saveToken`）在 2026-09-20 的可用性排查里确认是死代码（全仓无调用点），
   // 已删除 —— 所以这里不再断言它的函数体，改为断言"确实删了 + 留下了恢复线索"。
   assert.doesNotMatch(page, /function saveToken\(/);
@@ -2019,9 +2037,9 @@ test("mobile task forms pick a priority in place instead of opening a native pic
   //    旧实现两处都写死 "normal"：用户在手机上建不出「紧急」的任务。
   assert.match(code, /const \[createPriority, setCreatePriority\] = useState\("normal"\);/);
   assert.match(code, /const chosenPriority = createPriority \|\| "normal";/);
-  assert.match(code, /task: \{ id: optimisticID, title: trimmedTitle, description: trimmedDescription, priority: chosenPriority,/);
-  assert.match(code, /payload: \{ title: trimmedTitle, description: trimmedDescription, priority: chosenPriority \}/);
-  assert.match(code, /setTitle\(""\); setDescription\(""\); setCreatePriority\("normal"\); setCreatingTask\(false\);/);
+  assert.match(code, /task: \{ id: optimisticID, title: trimmedDescription, description: trimmedDescription, priority: chosenPriority,/);
+  assert.match(code, /payload: \{ description: trimmedDescription, priority: chosenPriority \}/);
+  assert.match(code, /setDescription\(""\); setCreatePriority\("normal"\); setCreatingTask\(false\);/);
   // 失败回滚要把优先级一起放回去，否则弹层重开时那一格显示的是「普通」，而用户明明选过「紧急」。
   assert.match(code, /setDescription\(trimmedDescription\);\s*setCreatePriority\(chosenPriority\);/);
   // ⑦ 编辑弹层打开时用这条任务自己的档位（不是默认普通，也不是上一轮改过的值）。
@@ -2116,6 +2134,17 @@ test("mobile conversation history is a button that opens a dialog with one row p
   assert.match(leaveBody[0], /setComposerToolsOpen\(false\);/);
 });
 
+test("mobile conversation selection follows the shared desktop current conversation", () => {
+  assert.match(page, /const activateSharedConversation = useCallback/);
+  assert.match(page, /"conversation\.activate"/);
+  assert.match(page, /const sharedCurrent = project\?\.conversations\.find\(\(item\) => item\.isCurrent\)/);
+  assert.match(page, /const pendingSharedConversationRef = useRef/);
+  assert.match(page, /if \(pending && pending\.projectID === project\?\.id && pending\.conversationID === selectedConversation\) \{\s*if \(\(snapshot\?\.snapshotRevision \?\? -1\) <= pending\.snapshotRevision\) return;/s);
+  assert.match(page, /if \(sharedCurrent && sharedCurrent\.id !== selectedConversation\) setSelectedConversation\(sharedCurrent\.id\)/);
+  assert.match(page, /void activateSharedConversation\(project\.id, item\.id\)\.then\(\(activated\) =>/);
+  assert.doesNotMatch(page, /setSelectedConversation\(item\.id\); setConversationHistoryOpen/);
+});
+
 test("mobile history paging continues only while message pages remain", () => {
   // getConversation 的 hasMore 还包括可回放运行事件；手机历史只渲染消息。
   // 用总标记续页会在消息耗尽后为事件反复请求历史，甚至带回重复消息。
@@ -2178,14 +2207,17 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   // （正好压在 ::after 边界上，半开区间判为界外），左侧却因亚像素取整侥幸命中——
   // 同一份 CSS 两侧表现不一致，就是"热区偏小 2px"的典型症状。刷新胶囊 / 开启通知同理。
   assert.match(styles, /\.mobile-back::after \{ position: absolute; inset: -3px; content: ""; \}/);
-  assert.match(styles, /\.mobile-refresh::after, \.mobile-new-task::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
+  assert.match(styles, /\.mobile-refresh::after, \.mobile-new-task::after, \.mobile-new-conversation::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
   // 展开态**不**整颗填实心深绿：⋯ 字形与右上角标同为浅色，填实会糊成一团深绿块，看不出是按钮。
   // 与刷新胶囊忙碌态同一套做法——状态靠底色变化表达。
   assert.match(styles, /\.mobile-header-menu-button\[aria-expanded="true"\] \{ border-color: #2c7567; color: #1d5b4e; background: #dcefe4; \}/);
 
-  // 菜单本体：role=menu、Agent 信息行 + 四项操作、每项 ≥44、禁用态用配色不用 opacity。
+  // 菜单本体：role=menu、Agent 信息行与次级操作；高频的新会话直接留在顶栏。
   assert.match(page, /<div className="mobile-header-menu-sheet" id="mobile-header-menu-sheet" role="menu" aria-label="更多操作">/);
   assert.match(page, /className="mobile-header-menu-info"><span>执行 Agent<\/span>/);
+  assert.match(page, /<button className="mobile-new-conversation" type="button" onClick=\{\(\) => openNewConversation\(project\)\}[^>]*><svg[\s\S]*?<span>新会话<\/span><\/button><div className="mobile-header-menu">/);
+  assert.match(page, /role="menuitem" onClick=\{\(\) => \{ setHeaderMenuOpen\(false\); setCreateError\(""\); setCreatingTask\(true\); \}\}[^>]*><span>新建任务<\/span><small>添加到队列<\/small>/);
+  assert.doesNotMatch(page, /void createConversationForProject\(project\); \}\} disabled=\{busy\}><span>新会话<\/span>/);
   assert.match(styles, /\.mobile-header-menu-sheet button \{[^}]*min-height: 44px;/s);
   assert.match(styles, /\.mobile-header-menu-sheet button:disabled \{ color: #64857a; \}/);
   // 面板要能塞进最窄的屏：min-width 用 min() 夹住，否则 320px 上会顶破视口。
@@ -2503,7 +2535,7 @@ test("mobile refresh actually re-fetches and reports the outcome", () => {
   //      2026-09-17 已随方案 B 撤掉；这条历史依据保留，因为它解释的是状态条为什么必须带时刻。）
   // 修法：手动刷新强制取全量并回传结构化结果（updated / unchanged / failed / skipped），
   //      按钮忙碌时禁用 + 转圈，结果写成一条带时刻的状态条。
-  const snapBody = page.match(/const loadSnapshot = useCallback\(async \(options\?: \{ force\?: boolean; instanceId\?: string \}\)[\s\S]*?\n  \}, \[instanceID\]\);/)?.[0] ?? "";
+  const snapBody = page.match(/const loadSnapshot = useCallback\(async \(options\?: \{ force\?: boolean; instanceId\?: string; silent\?: boolean \}\)[\s\S]*?\n  \}, \[instanceID\]\);/)?.[0] ?? "";
   // 锚点先自证存在：抠不到函数体时下面的断言会退化成对空串匹配，全部恒假/恒真。
   assert.ok(snapBody, "找不到 loadSnapshot（签名变了就更新本用例的锚点）");
   // ① force 必须真的绕过 revision：照旧拼 ?revision= 的话，用户点刷新还是会拿到
@@ -2521,7 +2553,7 @@ test("mobile refresh actually re-fetches and reports the outcome", () => {
   //    原因只写"无法连接云端"，"当前显示的是最近一次同步快照"交给页面错误条说一次，
   //    免得同一条提示连着出现两遍。
   assert.match(snapBody, /return \{ outcome: "failed", snapshot: cachedValue, reason: "无法连接云端" \};/);
-  assert.match(snapBody, /setError\(reason\);/);
+  assert.match(snapBody, /if \(!options\?\.silent\) setError\(reason\);/);
   // ⑤ 刷新可以指定实例：实例列表刚被重拉过，选中的电脑可能已经失效并被换掉。
   assert.match(snapBody, /const target = options\?\.instanceId \|\| instanceID;/);
   assert.match(snapBody, /encodeURIComponent\(target\)/);
@@ -2595,7 +2627,7 @@ test("mobile refresh actually re-fetches and reports the outcome", () => {
   // 外扩量**按有没有 1px 边框**分两条写，不能合成一条：inset 的参照系是 padding box
   // （带边框时比 border box 小 1px），-3px 只能扩到 42。详见顶栏那条用例里的实测记录。
   assert.match(styles, /\.mobile-back::after \{ position: absolute; inset: -3px; content: ""; \}/);
-  assert.match(styles, /\.mobile-refresh::after, \.mobile-new-task::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
+  assert.match(styles, /\.mobile-refresh::after, \.mobile-new-task::after, \.mobile-new-conversation::after, \.mobile-notification-button::after, \.mobile-header-menu-button::after \{ position: absolute; inset: -4px; content: ""; \}/);
   assert.doesNotMatch(styles, /\.mobile-refresh \{ min-width: 76px; \}/);
   assert.doesNotMatch(styles, /\.mobile-refresh, \.mobile-pairing button/);
   assert.doesNotMatch(styles, /\.mobile-back \{ width: 44px; height: 44px; \}/);

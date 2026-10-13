@@ -194,7 +194,7 @@ test("keeps pinned and stale-snapshot writes honest", () => {
   // 置顶只切 pinned：不能回传可能过期 10s 的 position 快照
   assert.doesNotMatch(queue, /pinned: p, position: t\.position/);
   // 编辑既有任务时不带 position（旧快照会覆盖这期间的重排）；新建才用 0 号追加哨兵
-  assert.match(board, /task \? \{ title, description, priority \} : \{ title, description, priority, position: 0 \}/);
+  assert.match(board, /task \? \{ description, priority \} : \{ description, priority, position: 0 \}/);
 });
 
 test("derives the board drop slot from the pointer, never from drag state", () => {

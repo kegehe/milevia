@@ -1127,6 +1127,20 @@ func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fillMCPTestResponse(&response, outcome)
+	if stored.Source == mcpSourceOAuthPending {
+		s.mcpOAuthLifecycleMu.Lock()
+		defer s.mcpOAuthLifecycleMu.Unlock()
+		if _, authorized := s.mcpOAuthAuthorizationHeader(ctx, stored.ID); !authorized {
+			response.OK = false
+			response.Error = "授权尚未完成，请重新授权"
+		} else if result, err := s.db.ExecContext(ctx, `update mcp_servers set enabled=1,source=?,updated_at=? where id=? and source=?`, mcpSourceManual, time.Now().UTC(), stored.ID, mcpSourceOAuthPending); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		} else if count, err := result.RowsAffected(); err != nil || count != 1 {
+			response.OK = false
+			response.Error = "临时配置已取消或失效，请重新连接"
+		}
+	}
 	writeJSON(w, http.StatusOK, response)
 }
 

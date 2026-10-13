@@ -88,6 +88,12 @@ test("工具状态只读 agents[]，不再回落读 claude / codex 两个旧字�
   assert.doesNotMatch(source, /runner\?\.codex/);
 });
 
+test("优化建议只列出已接通只读分析协议且当前环境就绪的工具", () => {
+  const code = stripComments(SOURCES["features/insights/InsightsPanel.tsx"]);
+  assert.match(code, /entry\.supportsProjectInsights === true && runnerAgentReady\(agentRunner, entry\.id\)/);
+  assert.match(code, /agentRunnerLoading \|\| agentRunnerError \|\| availableAgentOptions\.length === 0/);
+});
+
 test("目录 id 到 AgentID 的收窄只有一个转换点", () => {
   const source = stripComments(registry);
   assert.match(source, /export function catalogAgentID\(entry: AgentCatalogEntry\): AgentID \{/);

@@ -58,6 +58,7 @@ type Agent struct {
 	conn                    *websocket.Conn
 	lastSnapshotFingerprint string
 	lastSnapshotSequence    int64
+	lastSnapshotRevision    int64
 	lastSnapshotUploadAt    time.Time
 	snapshotReady           bool
 	// credMu guards InstanceID/CloudToken: re-enrollment rewrites them while
@@ -498,21 +499,27 @@ func cloudWebSocketEndpoint(rawURL, instanceID string) (string, error) {
 }
 
 func (a *Agent) syncSnapshot(ctx context.Context) error {
-	// The overview endpoint is a single-row, cheap query. Avoid rebuilding the
-	// full project snapshot on every heartbeat when no local event advanced the
-	// sequence. This matters on large SQLite databases where snapshot assembly
-	// is substantially more expensive than the relay heartbeat itself.
+	// The overview endpoint exposes both event and snapshot versions. CLI probes
+	// advance only the latter, so the Agent can publish their result without
+	// rebuilding the complete snapshot on every heartbeat.
 	var overview struct {
 		LastAgentSequence int64 `json:"lastAgentSequence"`
+		// nil means an older local control service that has not yet added this
+		// field. Its event sequence remains a compatible snapshot version.
+		SnapshotRevision *int64 `json:"snapshotRevision"`
 	}
 	overviewOK := a.localGet(ctx, "/api/remote/overview", &overview) == nil
 	if overviewOK {
-		if a.snapshotReady && overview.LastAgentSequence == a.lastSnapshotSequence {
+		overviewRevision := overview.LastAgentSequence
+		if overview.SnapshotRevision != nil {
+			overviewRevision = *overview.SnapshotRevision
+		}
+		if a.snapshotReady && overviewRevision == a.lastSnapshotRevision {
 			return nil
 		}
 		// Throttle the steady drip of full snapshots during a long reply; a
 		// larger backlog uploads right away.
-		if a.snapshotReady &&
+		if a.snapshotReady && overview.LastAgentSequence > a.lastSnapshotSequence &&
 			overview.LastAgentSequence-a.lastSnapshotSequence < snapshotMinOutstandingEvents &&
 			time.Since(a.lastSnapshotUploadAt) < snapshotMinUploadInterval {
 			return nil
@@ -523,12 +530,23 @@ func (a *Agent) syncSnapshot(ctx context.Context) error {
 		return err
 	}
 	sequence := overview.LastAgentSequence
+	revision := overview.LastAgentSequence
+	if overview.SnapshotRevision != nil {
+		revision = *overview.SnapshotRevision
+	}
 	if !overviewOK {
-		sequence = snapshotRevision(snapshot)
+		revision = snapshotRevision(snapshot)
+	}
+	// Overview and snapshot are read separately. If a local change lands in
+	// between them, retain the payload's newer version so the next heartbeat
+	// does not accidentally skip it.
+	if payloadRevision := snapshotRevision(snapshot); payloadRevision > revision {
+		revision = payloadRevision
 	}
 	fingerprint := snapshotFingerprint(snapshot)
 	if fingerprint != "" && fingerprint == a.lastSnapshotFingerprint {
 		a.lastSnapshotSequence = sequence
+		a.lastSnapshotRevision = revision
 		a.snapshotReady = true
 		return nil
 	}
@@ -565,6 +583,7 @@ func (a *Agent) syncSnapshot(ctx context.Context) error {
 	}
 	a.lastSnapshotFingerprint = fingerprint
 	a.lastSnapshotSequence = sequence
+	a.lastSnapshotRevision = revision
 	a.lastSnapshotUploadAt = time.Now()
 	a.snapshotReady = true
 	return nil

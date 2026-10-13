@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,9 +81,69 @@ type mcpOAuthFlow struct {
 	ClientID         string
 	ClientSecret     string
 	Scope            string
-	Status           string // pending | done | error
+	Status           string // preparing | pending | processing | done | error | canceled
 	Error            string
 	ExpiresAt        time.Time
+}
+
+func (s *Server) cancelMCPServerFlows(serverID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for state, flow := range s.mcpOAuthFlows {
+		if flow != nil && flow.ServerID == serverID {
+			delete(s.mcpOAuthFlows, state)
+		}
+	}
+}
+
+// 临时配置可跨重启识别；没有前端在线时也能回收凭据和记录。
+func (s *Server) cleanupPendingMCPOAuthLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		_ = s.cleanupPendingMCPOAuth(ctx, time.Now())
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) cleanupPendingMCPOAuth(ctx context.Context, now time.Time) error {
+	rows, err := s.db.QueryContext(ctx, `select id from mcp_servers where source=? and created_at<?`, mcpSourceOAuthPending, now.Add(-mcpOAuthFlowTTL))
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		s.mcpOAuthLifecycleMu.Lock()
+		// 查询后可能刚完成试连；锁内重读，避免误删已转为正式配置的服务。
+		current, fetchErr := s.fetchStoredMCPServer(ctx, id)
+		if errors.Is(fetchErr, sql.ErrNoRows) {
+			fetchErr = nil
+		} else if fetchErr == nil && current.Source == mcpSourceOAuthPending && current.CreatedAt.Before(now.Add(-mcpOAuthFlowTTL)) {
+			fetchErr = s.removeMCPServerLocked(ctx, id)
+		}
+		s.mcpOAuthLifecycleMu.Unlock()
+		if fetchErr != nil {
+			return fetchErr
+		}
+	}
+	return nil
 }
 
 type mcpOAuthTokenRow struct {
@@ -600,100 +661,86 @@ func (s *Server) startMCPServerOAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := mcpOAuthHTTPClient()
-	endpoints, err := discoverMCPOAuthEndpoints(ctx, mcpURL, client)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
-		return
-	}
-
-	// 复用已注册的客户端，避免每次授权都在服务商侧留下一个新应用。
-	existing, existingErr := s.loadMCPOAuthToken(ctx, serverID)
-	clientID, clientSecret := "", ""
-	if existingErr == nil && existing.ClientID != "" && existing.RegistrationEndpoint == endpoints.RegistrationEndpoint {
-		clientID = existing.ClientID
-		if existing.ClientSecretRef != "" {
-			if plain, err := s.profileSecrets.Load(s.db, ctx, existing.ClientSecretRef); err == nil {
-				clientSecret = plain
-			}
-		}
-	}
-	if clientID == "" {
-		if endpoints.RegistrationEndpoint == "" {
-			writeError(w, http.StatusBadGateway, errors.New("该授权服务器不支持动态客户端注册，需要先在服务商处注册客户端并配置 client_id"))
+	// Return a preparation URL immediately. Network discovery and dynamic client
+	// registration continue in the background so the system browser opens at once.
+	{
+		state, stateErr := randomURLToken(32)
+		verifier, verifierErr := randomURLToken(32)
+		if stateErr != nil || verifierErr != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("无法生成 OAuth 授权状态"))
 			return
 		}
-		clientID, clientSecret, err = registerMCPOAuthClient(ctx, client, endpoints.RegistrationEndpoint, s.mcpOAuthRedirectURI(), "Milevia")
-		if err != nil {
-			writeError(w, http.StatusBadGateway, err)
-			return
-		}
-	}
-
-	state, err := randomURLToken(32)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, errors.New("无法生成授权状态"))
+		scope := strings.TrimSpace(input.Scope)
+		flow := &mcpOAuthFlow{ID: uuid.NewString(), ServerID: stored.ID, ServerName: stored.Name, State: state, Verifier: verifier, RedirectURI: s.mcpOAuthRedirectURI(), Scope: scope, Status: "preparing", ExpiresAt: time.Now().Add(mcpOAuthFlowTTL)}
+		s.mu.Lock()
+		s.pruneMCPOAuthFlowsLocked()
+		s.mcpOAuthFlows[state] = flow
+		s.mu.Unlock()
+		prepareURL := strings.TrimSuffix(flow.RedirectURI, mcpOAuthCallbackPath) + "/api/mcp/oauth/prepare/" + flow.ID
+		writeJSON(w, http.StatusOK, mcpOAuthStartResponse{FlowID: flow.ID, AuthorizationURL: prepareURL, RedirectURI: flow.RedirectURI, Scope: scope})
+		go s.prepareMCPOAuthFlow(flow, mcpURL)
 		return
 	}
-	verifier, err := randomURLToken(32)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, errors.New("无法生成 PKCE 校验值"))
-		return
-	}
-	redirectURI := s.mcpOAuthRedirectURI()
-	// 默认不请求任何 scope：多数服务商的 scopes_supported 只是「支持清单」，全量请求会
-	// 造成过度授权。需要特定 scope 时由调用方显式给出。
-	scope := strings.TrimSpace(input.Scope)
 
-	authURL, err := url.Parse(endpoints.AuthorizationEndpoint)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, errors.New("授权端点地址无效"))
-		return
-	}
-	query := authURL.Query()
-	query.Set("response_type", "code")
-	query.Set("client_id", clientID)
-	query.Set("redirect_uri", redirectURI)
-	query.Set("state", state)
-	query.Set("code_challenge", mcpPKCEChallenge(verifier))
-	query.Set("code_challenge_method", "S256")
-	query.Set("resource", mcpURL)
-	if scope != "" {
-		query.Set("scope", scope)
-	}
-	authURL.RawQuery = query.Encode()
-
-	flow := &mcpOAuthFlow{
-		ID:               uuid.NewString(),
-		ServerID:         stored.ID,
-		ServerName:       stored.Name,
-		State:            state,
-		Verifier:         verifier,
-		RedirectURI:      redirectURI,
-		AuthorizationURL: authURL.String(),
-		Endpoints:        endpoints,
-		ClientID:         clientID,
-		ClientSecret:     clientSecret,
-		Scope:            scope,
-		Status:           "pending",
-		ExpiresAt:        time.Now().Add(mcpOAuthFlowTTL),
-	}
-	s.mu.Lock()
-	s.pruneMCPOAuthFlowsLocked()
-	s.mcpOAuthFlows[state] = flow
-	s.mu.Unlock()
-
-	writeJSON(w, http.StatusOK, mcpOAuthStartResponse{
-		FlowID:           flow.ID,
-		AuthorizationURL: flow.AuthorizationURL,
-		RedirectURI:      redirectURI,
-		Scope:            scope,
-		ClientID:         clientID,
-	})
 }
 
 // handleMCPOAuthCallback 接收浏览器回调，换取并保存令牌。该路径不要求桌面会话，
 // 安全性依托随机 state（见文件头说明）。
+func (s *Server) prepareMCPOAuthFlow(flow *mcpOAuthFlow, mcpURL string) {
+	ctx, cancel := context.WithTimeout(context.Background(), mcpOAuthHTTPTimeout*2)
+	defer cancel()
+	endpoints, err := discoverMCPOAuthEndpoints(ctx, mcpURL, mcpOAuthHTTPClient())
+	clientID, clientSecret := "", ""
+	if err == nil {
+		if existing, loadErr := s.loadMCPOAuthToken(ctx, flow.ServerID); loadErr == nil && existing.ClientID != "" && existing.RegistrationEndpoint == endpoints.RegistrationEndpoint {
+			clientID = existing.ClientID
+			if existing.ClientSecretRef != "" {
+				if plain, secretErr := s.profileSecrets.Load(s.db, ctx, existing.ClientSecretRef); secretErr == nil {
+					clientSecret = plain
+				}
+			}
+		}
+		if clientID == "" {
+			if endpoints.RegistrationEndpoint == "" {
+				err = errors.New("OAuth 服务未提供动态客户端注册端点，请先配置 client_id")
+			} else {
+				clientID, clientSecret, err = registerMCPOAuthClient(ctx, mcpOAuthHTTPClient(), endpoints.RegistrationEndpoint, flow.RedirectURI, "Milevia")
+			}
+		}
+	}
+	if err == nil {
+		authURL, parseErr := url.Parse(endpoints.AuthorizationEndpoint)
+		if parseErr != nil {
+			err = errors.New("授权端点地址无效")
+		} else {
+			query := authURL.Query()
+			query.Set("response_type", "code")
+			query.Set("client_id", clientID)
+			query.Set("redirect_uri", flow.RedirectURI)
+			query.Set("state", flow.State)
+			query.Set("code_challenge", mcpPKCEChallenge(flow.Verifier))
+			query.Set("code_challenge_method", "S256")
+			query.Set("resource", mcpURL)
+			if flow.Scope != "" {
+				query.Set("scope", flow.Scope)
+			}
+			authURL.RawQuery = query.Encode()
+			s.mu.Lock()
+			if s.mcpOAuthFlows[flow.State] == flow && flow.Status == "preparing" {
+				flow.AuthorizationURL, flow.Endpoints, flow.ClientID, flow.ClientSecret = authURL.String(), endpoints, clientID, clientSecret
+				flow.Status = "pending"
+			}
+			s.mu.Unlock()
+			return
+		}
+	}
+	s.mu.Lock()
+	if s.mcpOAuthFlows[flow.State] == flow && flow.Status == "preparing" {
+		flow.Status, flow.Error, flow.ExpiresAt = "error", err.Error(), time.Now().Add(mcpOAuthFinishedTTL)
+	}
+	s.mu.Unlock()
+}
+
 func (s *Server) handleMCPOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	state := query.Get("state")
@@ -703,23 +750,36 @@ func (s *Server) handleMCPOAuthCallback(w http.ResponseWriter, r *http.Request) 
 
 	s.mu.Lock()
 	flow, ok := s.mcpOAuthFlows[state]
+	if ok && (flow.Status != "pending" || time.Now().After(flow.ExpiresAt)) {
+		ok = false
+	}
 	if ok {
-		delete(s.mcpOAuthFlows, state)
+		flow.Status = "processing"
 	}
 	s.mu.Unlock()
 	if !ok || flow == nil {
 		writeMCPOAuthResultPage(w, http.StatusBadRequest, false, "授权失败：state 无效或已过期，请回到 Milevia 重新发起授权。")
 		return
 	}
+	s.mu.Lock()
+	canceled := flow.Status == "canceled"
+	s.mu.Unlock()
+	if canceled {
+		writeMCPOAuthResultPage(w, http.StatusBadRequest, false, "授权已取消。")
+		return
+	}
 
 	// 流程结束后保留短暂记录，供前端轮询到最终结果。
 	finish := func(status, message string) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if flow.Status == "canceled" || s.mcpOAuthFlows[state] != flow {
+			return
+		}
 		flow.Status = status
 		flow.Error = message
 		flow.ExpiresAt = time.Now().Add(mcpOAuthFinishedTTL)
-		s.mu.Lock()
 		s.mcpOAuthFlows[state] = flow
-		s.mu.Unlock()
 	}
 	fail := func(message string) {
 		finish("error", message)
@@ -745,11 +805,34 @@ func (s *Server) handleMCPOAuthCallback(w http.ResponseWriter, r *http.Request) 
 		fail("换取访问令牌失败：" + err.Error())
 		return
 	}
-	if err := s.storeMCPOAuthToken(ctx, flow, token); err != nil {
+	s.mcpOAuthLifecycleMu.Lock()
+	defer s.mcpOAuthLifecycleMu.Unlock()
+	s.mu.Lock()
+	canceled = flow.Status == "canceled" || s.mcpOAuthFlows[state] != flow
+	s.mu.Unlock()
+	if canceled {
+		writeMCPOAuthResultPage(w, http.StatusBadRequest, false, "授权已取消。")
+		return
+	}
+	err = s.storeMCPOAuthToken(ctx, flow, token)
+	if err != nil {
 		fail("保存访问令牌失败：" + err.Error())
 		return
 	}
-	finish("done", "")
+	s.mu.Lock()
+	canceled = flow.Status == "canceled" || s.mcpOAuthFlows[state] != flow
+	if canceled {
+		delete(s.mcpOAuthFlows, state)
+		s.mu.Unlock()
+		_ = s.revokeMCPOAuthToken(context.Background(), flow.ServerID)
+		writeMCPOAuthResultPage(w, http.StatusBadRequest, false, "授权已取消。")
+		return
+	}
+	flow.Status = "done"
+	flow.Error = ""
+	flow.ExpiresAt = time.Now().Add(mcpOAuthFinishedTTL)
+	s.mcpOAuthFlows[state] = flow
+	s.mu.Unlock()
 	writeMCPOAuthResultPage(w, http.StatusOK, true, "授权完成，现在可以关闭此页面并回到 Milevia。")
 }
 
@@ -826,6 +909,9 @@ func (s *Server) revokeMCPOAuthToken(ctx context.Context, serverID string) error
 }
 
 func (s *Server) deleteMCPServerOAuth(w http.ResponseWriter, r *http.Request) {
+	s.mcpOAuthLifecycleMu.Lock()
+	defer s.mcpOAuthLifecycleMu.Unlock()
+	s.cancelMCPServerFlows(chi.URLParam(r, "serverID"))
 	if err := s.revokeMCPOAuthToken(r.Context(), chi.URLParam(r, "serverID")); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -836,6 +922,7 @@ func (s *Server) deleteMCPServerOAuth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getMCPOAuthFlow(w http.ResponseWriter, r *http.Request) {
 	flowID := chi.URLParam(r, "flowID")
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	var found *mcpOAuthFlow
 	for _, flow := range s.mcpOAuthFlows {
 		if flow != nil && flow.ID == flowID {
@@ -843,17 +930,62 @@ func (s *Server) getMCPOAuthFlow(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	s.mu.Unlock()
 	if found == nil {
 		writeError(w, http.StatusNotFound, errors.New("授权流程不存在或已过期"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"flowId":   found.ID,
-		"serverId": found.ServerID,
-		"status":   found.Status,
-		"error":    found.Error,
+		"flowId":           found.ID,
+		"serverId":         found.ServerID,
+		"status":           found.Status,
+		"error":            found.Error,
+		"authorizationUrl": found.AuthorizationURL,
 	})
+}
+
+// mcpOAuthPreparePage is intentionally unauthenticated: the flow ID is a
+// random capability and the page is opened by the system browser without the
+// desktop webview session cookie.
+func (s *Server) mcpOAuthPreparePage(w http.ResponseWriter, r *http.Request) {
+	flowID := chi.URLParam(r, "flowID")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><title>正在准备登录</title><p id="message">正在准备登录页面，请稍候…</p><script>(async()=>{const id=`+strconv.Quote(flowID)+`;const m=document.getElementById("message");for(let i=0;i<120;i++){try{const r=await fetch("/api/mcp/oauth/prepare/"+id+"/status",{cache:"no-store"});const x=await r.json();if(x.status==="pending"&&x.authorizationUrl){location.replace(x.authorizationUrl);return}if(x.status==="error"){m.textContent=x.error||"授权准备失败";return}}catch{}await new Promise(r=>setTimeout(r,500))}m.textContent="授权准备超时，请回到 Milevia 重试。"})()</script>`)
+}
+
+func (s *Server) mcpOAuthPrepareStatus(w http.ResponseWriter, r *http.Request) {
+	flowID := chi.URLParam(r, "flowID")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, flow := range s.mcpOAuthFlows {
+		if flow != nil && flow.ID == flowID {
+			writeJSON(w, http.StatusOK, map[string]any{"status": flow.Status, "error": flow.Error, "authorizationUrl": flow.AuthorizationURL})
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "error": "授权流程不存在或已过期"})
+}
+
+// cancelMCPOAuthFlow 使用户取消后的迟到浏览器回调失效。
+func (s *Server) cancelMCPOAuthFlow(w http.ResponseWriter, r *http.Request) {
+	flowID := chi.URLParam(r, "flowID")
+	s.mcpOAuthLifecycleMu.Lock()
+	defer s.mcpOAuthLifecycleMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for state, flow := range s.mcpOAuthFlows {
+		if flow != nil && flow.ID == flowID {
+			if flow.Status == "preparing" || flow.Status == "pending" || flow.Status == "processing" {
+				flow.Status = "canceled"
+				flow.Error = "授权已取消"
+				flow.ExpiresAt = time.Now().Add(mcpOAuthFinishedTTL)
+			}
+			s.mcpOAuthFlows[state] = flow
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // writeMCPOAuthResultPage 返回一个极简结果页。不含任何令牌内容。

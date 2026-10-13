@@ -111,6 +111,9 @@ func TestCatalogEntriesAreSelfConsistent(t *testing.T) {
 		if !validAgentPolicy(entry.ID, entry.DefaultPermissionMode) {
 			t.Fatalf("%s: defaultPermissionMode %q is not among permissionModes %v", entry.ID, entry.DefaultPermissionMode, entry.PermissionModes)
 		}
+		if entry.SupportsProjectInsights && !entry.RunnableInProject {
+			t.Fatalf("%s: insights-capable agent must be runnable in a project", entry.ID)
+		}
 		if entry.SupportsInstall && entry.MinRuntimeVersion == "" {
 			t.Fatalf("%s: supportsInstall without minRuntimeVersion leaves no way to gate an unusable install", entry.ID)
 		}
@@ -121,6 +124,19 @@ func TestCatalogEntriesAreSelfConsistent(t *testing.T) {
 	}
 	if len(ids) == 0 {
 		t.Fatal("agent catalog is empty")
+	}
+}
+
+func TestInsightAgentSupportIsExplicit(t *testing.T) {
+	for _, agentID := range []string{"claude-code", "codex"} {
+		entry, ok := agentByID(agentID)
+		if !ok || !entry.SupportsProjectInsights {
+			t.Fatalf("%s must be explicitly enabled for optimization insights", agentID)
+		}
+	}
+	entry, ok := agentByID("codebuddy")
+	if !ok || entry.SupportsProjectInsights {
+		t.Fatal("CodeBuddy must stay out of optimization insights until its read-only analysis protocol is implemented")
 	}
 }
 

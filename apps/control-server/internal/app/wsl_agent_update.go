@@ -26,7 +26,7 @@ import (
 // Windows 挂载进来的 npm shim，落到那上面会一跑即崩（它缺平台可选二进制）。
 func (r *wslAgentRunner) wslRunScript(ctx context.Context, script string) (string, error) {
 	env := &wslCrossEnvironment{runner: r}
-	stdout, stderr, err := env.run(ctx, wslPathPrefix()+"\n"+script)
+	stdout, stderr, err := env.run(ctx, r.wslPathPrefix()+"\n"+script)
 	if err != nil {
 		return stdout, fmt.Errorf("%w%s", err, crossOutputDetail(stderr))
 	}

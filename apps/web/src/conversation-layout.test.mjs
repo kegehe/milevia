@@ -99,6 +99,23 @@ test("background conversation polling preserves search results and advances acti
   assert.match(conversationPage, /refreshBackgroundTabs\(\);\s*const timer = window\.setInterval\(refreshBackgroundTabs, 8_000\);/);
 });
 
+test("shared current conversation refreshes immediately and only frees a tab after activation", () => {
+  assert.match(conversationPage, /useLiveStateEventsFor\("projects", projectId, useCallback/);
+  assert.match(conversationPage, /if \(!historyQuery\.trim\(\)\) void requestConversationHistory\("", "", false, true\)/);
+  assert.match(conversationPage, /sharedCurrent\.id !== urlConversationId && !readClosedConversationIds\(projectId \|\| ""\)\.includes\(sharedCurrent\.id\)[\s\S]*?selectConversationTab\(sharedCurrent\.id, true\)/);
+  const selectBody = conversationPage.match(/const selectConversationTab = useCallback\([\s\S]*?\n  \}, \[fail, navigate, projectApi, projectId, rememberConversationTab, urlConversationId\]\);/)?.[0] ?? "";
+  assert.ok(selectBody, "找不到共享会话切换函数");
+  assert.match(selectBody, /await projectApi<Conversation>\(`\/api\/conversations\/\$\{conversationID\}\/activate`/);
+  assert.match(selectBody, /if \(makeRoomForSharedConversation\) \{/);
+  assert.ok(selectBody.indexOf("await projectApi<Conversation>") < selectBody.indexOf("if (makeRoomForSharedConversation)"), "激活失败前不应释放本地标签");
+});
+
+test("closing the last tab leaves an empty workspace instead of recreating it", () => {
+  assert.match(conversationPage, /const next = restored \|\| list\.find\(\(item\) => !closed\.has\(item\.id\)\) \|\| \(list\.length === 0/);
+  assert.match(conversationPage, /setConversation\(next\);[\s\S]*?if \(!next\) \{/);
+  assert.match(conversationPage, /setConversation\(null\);\s*setMessages\(\[\]\);\s*setEvents\(\[\]\);\s*setRun\(""\);\s*setUsage\(null\);/);
+});
+
 test("the HTTP fallback poll also pauses while the window is hidden", () => {
   assert.match(conversationPage, /import \{ useDocumentVisible \} from "\.\.\/lib\/useDocumentVisible";/);
   assert.match(conversationPage, /const documentVisible = useDocumentVisible\(\);/);
@@ -272,7 +289,7 @@ test("user-triggered stop or clear cancels a pending scheduled send", () => {
   // 只有用户主动点"撤回预约"按钮才把内容写回输入框
   assert.match(conversationPage, /const cancelScheduledSend = \(\) => \{[\s\S]*?clearScheduledSend\(\);[\s\S]*?setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);/s);
   // 普通发送（含键盘 Enter 提交）会收起发送方式下拉
-  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*setShowSendMenu\(false\);/s);
+  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*if \(changingModel\) return;\s*setShowSendMenu\(false\);/s);
 });
 
 test("a failed send restores its draft only while the original conversation remains active", () => {
@@ -533,14 +550,13 @@ test("clearing context closes the current tab and starts a fresh conversation wi
   assert.match(conversationPage, /`\/api\/conversations\/\$\{conversationID\}\/clear`/);
   assert.match(conversationPage, /const replaceConversationTab = useCallback\(\(closedConversationID: string, nextConversationID: string\) => \{[\s\S]*?closeConversationTab\(conversationTabsRef\.current, closedConversationID\);[\s\S]*?openConversationTab\(closed, nextConversationID\);/);
   assert.match(conversationPage, /if \(!clearStillOwnsView\(\)\) return;\s*replaceConversationTab\(conversationID, next\.id\);\s*resetConversationView\(next\);/s);
-  assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
-  assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| shortcutBusy\) return;/);
+  assert.match(conversationPage, /if \(conversationTransitionRef\.current \|\| !conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff \|\| shortcutBusy\) return;/);
   assert.match(conversationPage, /const isCurrentConversation = \(\) => !cancelled && conversationRef\.current\?\.id === conversation\.id;/);
   assert.match(conversationPage, /socket\.onmessage = \(raw\) => \{\s*if \(!isCurrentConversation\(\)\) return;/s);
   assert.match(conversationPage, /if \(sending \|\| clearing \|\| stopping \|\| shortcutBusy\) \{ closeHistory\(\); return; \}/);
-  assert.match(conversationPage, /disabled=\{readOnlyConversation \|\| !!run \|\| clearing \|\| stopping \|\| changingPermission\}/);
-  assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| conversation\.permissionMode === permissionMode \|\| run \|\| clearing \|\| stopping\) return;/);
-  assert.match(conversationPage, /if \(!conversation \|\| run \|\| clearing \|\| stopping\) return;/);
+  assert.match(conversationPage, /disabled=\{readOnlyConversation \|\| !!run \|\| clearing \|\| stopping \|\| handingOff \|\| changingPermission\}/);
+  assert.match(conversationPage, /if \(!conversation \|\| readOnlyConversation \|\| conversation\.permissionMode === permissionMode \|\| run \|\| clearing \|\| stopping \|\| handingOff\) return;/);
+  assert.match(conversationPage, /if \(!conversation \|\| run \|\| clearing \|\| stopping \|\| handingOff\) return;/);
   assert.match(conversationPage, /const current = result\.items\.find\(\(item\) => item\.isCurrent\);/);
   assert.match(conversationPage, /if \(conversationRef\.current\?\.id !== conversationID\) return;\s*setConversation\(updated\);/s);
   assert.match(conversationPage, /const conversationTransitionRef = useRef\(false\);/);
@@ -558,14 +574,14 @@ test("clearing context closes the current tab and starts a fresh conversation wi
   assert.match(conversationPage, /const clearStillOwnsView = \(\) =>/);
   assert.match(conversationPage, /conversationRouteVersion\.current === routeVersion/);
   assert.match(conversationPage, /setHasNewContent\(false\); userNearBottom\.current = true;/);
-  assert.match(conversationPage, /<TaskQueue projectID=\{project\.id\} conversationID=\{conversation\?\.id \|\| ""\}[\s\S]*?dispatchDisabled=\{clearing \|\| stopping \|\| !conversation\}/);
+  assert.match(conversationPage, /<TaskQueue projectID=\{project\.id\} conversationID=\{conversation\?\.id \|\| ""\}[\s\S]*?dispatchDisabled=\{clearing \|\| stopping \|\| handingOff \|\| !conversation\}/);
   assert.match(taskQueue, /conversationId: dispatchConversationID/);
   assert.match(taskQueue, /conversationIDRef\.current !== dispatchConversationID/);
   assert.match(taskQueue, /setDispatching\(false\);\s*setRedispatchingTaskID\(null\);/);
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
-  assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
-  assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
-  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| \(!text\.trim\(\) && skillRefs\.length === 0\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\)\}><ComposerActionIcon action="send" \/>/);
+  assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
+  assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
+  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| \(!text\.trim\(\) && skillRefs\.length === 0\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\}><ComposerActionIcon action="send" \/>/);
 });
 
 test("/clear in the composer and the 清屏 shortcut route through the app clear flow", () => {

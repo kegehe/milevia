@@ -118,6 +118,30 @@ func newReadingsFixture(t *testing.T, runner AgentRunner) (*Server, RunnerMeta) 
 	return server, meta
 }
 
+func TestRemoteAgentProbeCompletionClearsPendingBeforeSnapshotRefresh(t *testing.T) {
+	server := &Server{
+		remoteAgentProbeActive: map[string]bool{"runner": true},
+	}
+	server.finishRemoteAgentProbe("runner", true)
+	if server.remoteAgentProbePending("runner") {
+		t.Fatal("已完成的探测仍被标成进行中")
+	}
+	server.remoteAgentProbeMu.Lock()
+	retryAfter := server.remoteAgentProbeRetryAfter["runner"]
+	server.remoteAgentProbeMu.Unlock()
+	if !retryAfter.After(time.Now()) {
+		t.Fatal("没有读数的探测结束后必须短暂冷却，避免快照立刻重启它")
+	}
+	// goroutine 的 defer 也会再清一次；它不能误删已经安排好的冷却。
+	server.clearRemoteAgentProbe("runner")
+	server.remoteAgentProbeMu.Lock()
+	_, hasRetry := server.remoteAgentProbeRetryAfter["runner"]
+	server.remoteAgentProbeMu.Unlock()
+	if !hasRetry {
+		t.Fatal("收尾清理误删了失败探测的重试冷却")
+	}
+}
+
 // TestProbeAgentsReadsOnceWithinTTL 是"反复进出页面不再反复检测"的服务端证明。
 func TestProbeAgentsReadsOnceWithinTTL(t *testing.T) {
 	runner := &countingProbeRunner{version: "1.0.0"}

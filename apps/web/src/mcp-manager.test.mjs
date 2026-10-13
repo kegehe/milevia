@@ -99,7 +99,7 @@ test("创建体走模型层：默认值全给上，页面自己拼不出第二�
   assert.match(wizardDraftPayload, /ENVIRONMENT_OPTIONS\.map\(\(option\) => option\.id\)/);
   assert.match(wizardDraftPayload, /\["claude-code"\]/);
   // OAuth 路径与最终保存必须共用同一个创建体，否则两条路的默认值会漂移。
-  assert.match(startWizardOAuth, /JSON\.stringify\(wizardDraftPayload\(\)\)/);
+  assert.match(startWizardOAuth, /JSON\.stringify\(\{ \.\.\.wizardDraftPayload\(\), enabled: false, oauthPending: true \}\)/);
   assert.match(finishWizard, /JSON\.stringify\(wizardDraftPayload\(\)\)/);
 });
 
@@ -152,7 +152,8 @@ test("已连接的卡片按「服务」呈现，不再暴露传输类型与环�
 test("状态口径：enabled 只能说「已启用」，不许说成「已连接」", () => {
   // 「已连接」是一个**连接事实**，而列表里的每一条只是配置存在且启用 ——
   // 点了连接又中途放弃的人也会在这里看到一条记录（OAuth 路径会先落库）。
-  assert.match(connectedBlock, /\{server\.enabled \? "已启用" : "已停用"\}/);
+  assert.match(connectedBlock, /server\.source === "oauth-pending" \? "待完成授权与验证"/);
+  assert.match(connectedBlock, /server\.enabled \? "已启用" : "已停用"/);
   assert.doesNotMatch(connectedBlock, /已连接/);
   assert.match(connectedBlock, /<h2>我的服务/);
 });

@@ -21,6 +21,23 @@ func findMCPPreset(id string) (mcpPreset, bool) {
 	return mcpPreset{}, false
 }
 
+func TestMCPPresetCatalogKeepsOnlyRequestedServices(t *testing.T) {
+	want := map[string]bool{"notion": true, "github": true, "stripe": true}
+	presets := mcpPresetCatalog()
+	if len(presets) != len(want) {
+		t.Fatalf("模板目录包含 %d 个服务，期望 %d 个：%v", len(presets), len(want), presets)
+	}
+	for _, preset := range presets {
+		if !want[preset.ID] {
+			t.Errorf("模板目录包含未保留的服务：%s", preset.ID)
+		}
+		delete(want, preset.ID)
+	}
+	for id := range want {
+		t.Errorf("模板目录缺少保留的服务：%s", id)
+	}
+}
+
 // TestMCPPresetCatalogIsWellFormed 守住模板的基本形状：字段与传输类型自洽、Name 是合法
 // server key、ID 与 name 都不重复。模板写错在这里就失败，而不是等用户点了才发现。
 func TestMCPPresetCatalogIsWellFormed(t *testing.T) {
@@ -247,8 +264,8 @@ func TestMCPCommonPresetsAreOneClick(t *testing.T) {
 			t.Errorf("「常用服务」条目 %s 未给出官方文档地址", preset.ID)
 		}
 	}
-	if count < 5 {
-		t.Errorf("「常用服务」只有 %d 条，目录太薄 —— 用户找不到自己在用的服务就会放弃", count)
+	if count != 3 {
+		t.Errorf("「常用服务」只有 %d 条，期望保留 Notion、GitHub、Stripe 共 3 条", count)
 	}
 }
 

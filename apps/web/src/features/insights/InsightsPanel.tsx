@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
-import type { AgentID } from "../../lib/types";
-import { catalogAgentID, knownAgentID, useAgentCatalog } from "../../lib/agent-registry";
+import type { AgentID, RunnerInfo } from "../../lib/types";
+import { catalogAgentID, knownAgentID, runnerAgentReady, useAgentCatalog } from "../../lib/agent-registry";
 import {
   filterFindingsByType,
   insightFindingCounts,
@@ -66,15 +66,19 @@ function formatLogTime(ts: string): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
+export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }: {
   projectID: string;
+  runnerID: string;
   request: Request;
   fail: (message: string) => void;
   // 点击卡片的"查看文件"时跳转到文件页并打开该文件（未提供则只展示路径）。
   onOpenFile?: (path: string) => void;
 }) {
-  // 分析引擎清单来自服务端工具目录：新增工具时这里自动多一个单选项。
+  // 工具目录给出平台支持项；当前项目 Runner 的状态决定哪些项实际可用于分析。
   const agentOptions = useAgentCatalog();
+  const [agentRunner, setAgentRunner] = useState<RunnerInfo | null>(null);
+  const [agentRunnerLoading, setAgentRunnerLoading] = useState(true);
+  const [agentRunnerError, setAgentRunnerError] = useState("");
   const [scan, setScan] = useState<InsightScan | null>(null);
   const [findings, setFindings] = useState<InsightFinding[]>([]);
   const [events, setEvents] = useState<InsightEvent[]>([]);
@@ -120,6 +124,36 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   const logRef = useRef<HTMLDivElement | null>(null);
   // 已拉取到的最大事件 seq：轮询时只取增量，避免每次把整份日志重传。
   const eventSeqRef = useRef(0);
+
+  const availableAgentOptions = useMemo(
+    () => agentOptions.filter((entry) => entry.supportsProjectInsights === true && runnerAgentReady(agentRunner, entry.id)),
+    [agentOptions, agentRunner],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setAgentRunner(null);
+    setAgentRunnerLoading(true);
+    setAgentRunnerError("");
+    void request<RunnerInfo>(`/api/runners/${encodeURIComponent(runnerID)}/status`)
+      .then((runner) => {
+        if (!cancelled) setAgentRunner(runner);
+      })
+      .catch((cause) => {
+        if (!cancelled) setAgentRunnerError(cause instanceof Error ? cause.message : "无法读取当前环境的分析引擎状态");
+      })
+      .finally(() => {
+        if (!cancelled) setAgentRunnerLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [request, runnerID]);
+
+  useEffect(() => {
+    if (agentRunnerLoading || availableAgentOptions.length === 0) return;
+    if (!availableAgentOptions.some((entry) => catalogAgentID(entry) === agent)) {
+      setAgent(catalogAgentID(availableAgentOptions[0]));
+    }
+  }, [agent, agentRunnerLoading, availableAgentOptions]);
 
   const loadInsights = useCallback(async () => {
     const version = ++requestVersion.current;
@@ -243,7 +277,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   }, [events.length, scan?.status]);
 
   const startScan = async () => {
-    if (busy) return;
+    if (busy || agentRunnerLoading || agentRunnerError || availableAgentOptions.length === 0) return;
     setBusy(true);
     try {
       await request(`/api/projects/${projectID}/insights/scan`, {
@@ -299,7 +333,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   // 复核与扫描互不阻塞（后端按"项目 × 种类"分别占用）：一次漫长的初扫进行中也能发起，
   // 两者共用凭据时后端会先排队等待额度，面板上仍显示"正在复核"而不是直接报错。
   const verifyAll = async () => {
-    if (verifyAllBusy || busy) return;
+    if (verifyAllBusy || busy || agentRunnerLoading || agentRunnerError || availableAgentOptions.length === 0) return;
     setVerifyAllBusy(true);
     const targets = findings.map((f) => f.id);
     // 先把全部有效建议标记为 in-flight，保证轮询启动（即使随后刷新失败）。
@@ -446,7 +480,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
 
   // 单个建议验证：加入 in-flight 集合保证轮询启动，POST 成功后立即刷新拿到 pending。
   const verifyFinding = async (id: string) => {
-    if (verifyInFlight.has(id)) return;
+    if (verifyInFlight.has(id) || agentRunnerLoading || agentRunnerError || availableAgentOptions.length === 0) return;
     setVerifyInFlight((prev) => new Set(prev).add(id));
     try {
       await request(`/api/projects/${projectID}/insights/verify`, {
@@ -509,6 +543,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
   const focusLabel = lastTheme !== "" || lastFocus.length > 0
     ? `本次聚焦：${lastTheme !== "" ? insightThemeLabels[lastTheme] : "全面"}${lastFocus.length > 0 ? ` · ${lastFocus.map((t) => insightTypeLabels[t]).join("、")}` : ""}`
     : null;
+  const canStartScan = !busy && !agentRunnerLoading && !agentRunnerError && availableAgentOptions.length > 0;
 
   return (
     <div className="insights">
@@ -518,7 +553,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
         <div className="insights-banner-in">
           <div className="insights-banner-copy">
             <h2>优化建议</h2>
-            <p>AI 主动通读项目，找出可优化点、可新增功能、已有 bug 与样式问题；每条在报告时已独立核实，并可随时对既有建议再验证，确认其在当前代码里是否仍然成立。</p>
+            <p>使用 AI 分析项目并给出改进建议。</p>
             {hasScan && (
               <div className="insights-banner-stats">
                 <span className="insights-stat-chip"><b>{openCount}</b> 条有效</span>
@@ -540,7 +575,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                 {busy ? "正在停止…" : "停止分析"}
               </button>
             ) : (
-              <button type="button" className="insight-banner-primary" disabled={busy} onClick={() => void startScan()}>
+              <button type="button" className="insight-banner-primary" disabled={!canStartScan} onClick={() => void startScan()}>
                 开始分析
               </button>
             )}
@@ -548,7 +583,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
               type="button"
               className="insight-banner-ghost"
               onClick={() => void verifyAll()}
-              disabled={busy || verifyAllBusy || anyVerifying || openCount === 0}
+              disabled={!canStartScan || verifyAllBusy || anyVerifying || openCount === 0}
               title="调用 AI 复核当前全部有效建议是否仍然成立（项目可能已被其它任务迭代修改；分析进行中也可以发起，两者共用凭据时后端会先排队等额度）"
             >
               {verifyAllBusy || anyVerifying ? "正在验证…" : "验证全部建议"}
@@ -578,7 +613,13 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
           <div className="insights-picker">
             <span className="insights-picker-label">分析引擎</span>
             <div className="insights-agent-options" role="radiogroup" aria-label="选择分析引擎">
-              {agentOptions.map((entry) => {
+              {agentRunnerLoading ? (
+                <span className="insights-agent-state">正在检测当前环境的分析引擎…</span>
+              ) : agentRunnerError ? (
+                <span className="insights-agent-state insights-agent-state-error" role="alert">{agentRunnerError}</span>
+              ) : availableAgentOptions.length === 0 ? (
+                <span className="insights-agent-state">当前环境没有可用的分析引擎</span>
+              ) : availableAgentOptions.map((entry) => {
                 const id = catalogAgentID(entry);
                 return <label key={id} className={agent === id ? "active" : ""}>
                   <input type="radio" name="insight-agent" value={id} checked={agent === id} disabled={anyVerifying} onChange={() => selectAgent(id)} />
@@ -865,6 +906,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                 selected={selected.has(finding.id)}
                 onToggleSelect={() => toggleSelect(finding.id)}
                 verifying={verifyInFlight.has(finding.id)}
+                canVerify={canStartScan}
                 onVerify={() => void verifyFinding(finding.id)}
                 onOpenFile={onOpenFile}
               />
@@ -893,6 +935,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                     selected={selected.has(finding.id)}
                     onToggleSelect={() => toggleSelect(finding.id)}
                     verifying={verifyInFlight.has(finding.id)}
+                    canVerify={canStartScan}
                     onVerify={() => void verifyFinding(finding.id)}
                     onOpenFile={onOpenFile}
                   />
@@ -922,6 +965,7 @@ export function InsightsPanel({ projectID, request, fail, onOpenFile }: {
                     selected={selected.has(finding.id)}
                     onToggleSelect={() => toggleSelect(finding.id)}
                     verifying={verifyInFlight.has(finding.id)}
+                    canVerify={canStartScan}
                     onVerify={() => void verifyFinding(finding.id)}
                     onOpenFile={onOpenFile}
                   />
@@ -1037,7 +1081,7 @@ function InsightVerifyBadge({ result, note, verifiedAt }: {
   return null;
 }
 
-function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismissed, fail, invalidated = false, dismissed = false, selectable = false, selected = false, onToggleSelect, verifying = false, onVerify, onOpenFile }: {
+function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismissed, fail, invalidated = false, dismissed = false, selectable = false, selected = false, onToggleSelect, verifying = false, canVerify = true, onVerify, onOpenFile }: {
   finding: InsightFinding;
   projectID: string;
   request: Request;
@@ -1054,6 +1098,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
   // 面板级 in-flight 标记：POST 后立即为 true，轮询拿到 pending 后仍为 true，
   // 结果落库（loadInsights 同步 verifyInFlight）后变回 false。
   verifying?: boolean;
+  canVerify?: boolean;
   onVerify?: () => void;
   onOpenFile?: (path: string) => void;
 }) {
@@ -1219,7 +1264,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
             type="button"
             className="insight-action"
             onClick={onVerify}
-            disabled={isVerifying || saving}
+            disabled={isVerifying || saving || !canVerify}
             title="调用 AI 复核此建议在当前代码里是否仍然成立（项目可能已被其它任务迭代修改）"
           >
             {isVerifying ? <InsightVerifySpinner /> : <VerifyIcon />}

@@ -40,6 +40,8 @@ export type AgentCatalogEntry = {
   supportsLogin?: boolean;
   /** 平台是否已实现该工具的 AgentRunner，可在项目对话中真正运行。 */
   runnableInProject?: boolean;
+  /** 平台是否已接通该工具的只读分析协议，可用于项目优化建议。 */
+  supportsProjectInsights?: boolean;
 };
 
 /**

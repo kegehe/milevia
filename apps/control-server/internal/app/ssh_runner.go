@@ -1366,8 +1366,9 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 		return fmt.Errorf("启动远程 Codex 失败：%w", err)
 	}
 
+	completion := newCodexTurnCompletion()
 	done := make(chan struct{})
-	go func() { readCodexJSONL(stdout, sink, ""); close(done) }()
+	go func() { readCodexJSONL(stdout, sink, "", completion); close(done) }()
 	go func() { readCodexStderr(stderr, sink) }()
 
 	select {
@@ -1379,7 +1380,23 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 		case <-time.After(5 * time.Second):
 		}
 		return ctx.Err()
+	case <-completion.done:
+		// The remote Codex has emitted its terminal event. Its wrapper may still
+		// retain stdout/stderr, so close the remote process instead of waiting
+		// indefinitely for the stream to reach EOF.
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		return nil
 	case <-done:
+		if completion.finished() {
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+			return nil
+		}
 		waitErr := session.Wait()
 		if waitErr != nil {
 			return fmt.Errorf("远程 Codex 退出：%w", waitErr)

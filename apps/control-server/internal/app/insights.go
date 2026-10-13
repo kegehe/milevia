@@ -241,6 +241,38 @@ func normalizeScanAgent(agent string) string {
 	return ""
 }
 
+// requireInsightAgentReady verifies the selected engine against the current
+// project Runner before a scan or verification is recorded. The UI reads the
+// same Runner status, but this check keeps direct and stale client requests
+// from creating work that cannot run.
+func (s *Server) requireInsightAgentReady(ctx context.Context, projectID, agentID string) error {
+	project, err := s.getProjectByID(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	meta, ok := s.runnerRegistry.getMeta(project.Runner)
+	if !ok {
+		return errors.New("当前项目的运行环境不可用")
+	}
+	entry, ok := agentByID(agentID)
+	if !ok || !entry.SupportsProjectInsights {
+		return errors.New("该分析引擎不支持项目分析")
+	}
+	for _, status := range s.probeAgents(ctx, meta) {
+		if status.ID != agentID {
+			continue
+		}
+		if status.Status == agentStatusReady {
+			return nil
+		}
+		if status.Reason != "" {
+			return fmt.Errorf("%s当前不可用：%s", entry.Name, status.Reason)
+		}
+		return fmt.Errorf("%s当前不可用", entry.Name)
+	}
+	return fmt.Errorf("无法检测%s的可用状态", entry.Name)
+}
+
 // normalizeScanTheme 把请求里的主题归一到白名单；非法/空 → ""（全面分析）。
 func normalizeScanTheme(t string) string {
 	if _, ok := insightThemeLabels[t]; ok {
@@ -272,6 +304,27 @@ func normalizeScanTypes(types []string) []string {
 		return nil
 	}
 	return out
+}
+
+// filterInsightCandidatesByTypes is the server-side enforcement for the
+// user's scan scope. The prompt narrows the model's work, but model output is
+// still untrusted; a returned finding outside the selected types must never
+// reach verification or the database.
+func filterInsightCandidatesByTypes(candidates []pendingInsight, types []string) []pendingInsight {
+	if len(types) == 0 {
+		return candidates
+	}
+	allowed := make(map[string]struct{}, len(types))
+	for _, typ := range types {
+		allowed[typ] = struct{}{}
+	}
+	filtered := make([]pendingInsight, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := allowed[candidate.Type]; ok {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
 }
 
 // buildScanOpts 把 scanRequest 解析为规范化 scanOpts（供入库与 prompt 消费）。
@@ -424,7 +477,7 @@ type pendingInsight struct {
 var (
 	insightCandidatesOutputSchema = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["bug","style","optimization","feature"]},"severity":{"type":"string","enum":["low","normal","high"]},"title":{"type":"string"},"summary":{"type":"string"},"fileHint":{"type":"string"}},"required":["type","severity","title","summary","fileHint"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 	insightVerifyOutputSchema     = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer","minimum":1},"confirmed":{"type":"boolean"},"reason":{"type":"string"}},"required":["index","confirmed","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
-	insightReverifyOutputSchema   = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["valid","invalid","uncertain"]},"reason":{"type":"string"}},"required":["id","status","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
+	insightReverifyOutputSchema   = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer","minimum":1},"status":{"type":"string","enum":["valid","invalid","uncertain"]},"reason":{"type":"string"}},"required":["index","status","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 )
 
 // rawInsightParse 兼容多种 agent 输出形态：裸数组、{findings:[...]} 包裹、
@@ -1093,7 +1146,7 @@ func buildInsightScanPrompt(projectPath, repoSHA string, alreadySurfaced []strin
 
 %s
 
-任务：通读整个项目，主动找出值得用户知道的发现，覆盖以下类别：
+任务：通读整个项目，主动找出值得用户知道的发现，只允许输出以下类别（不得输出其它类别）：
 - %s
 
 硬性输出要求：你的整个回复只能包含一个 JSON 对象，不允许有任何前言、注释、Markdown 围栏、或对象之后的任何文字。对象形如 {"findings":[ ... ]}，findings 数组里每条为：
@@ -1134,7 +1187,7 @@ func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string
 上一轮你只做了大量分析却未在回复里给出结果，这不可接受。你现在已经掌握项目结构，只需快速核对后用 JSON 数组把发现交出来，尽量少做重复探索。
 
 对象：%s（git %s）。%s
-覆盖类别：%s
+覆盖类别（只能输出这些类型）：%s
 
 这一次的硬性要求（必须严格遵守）：
 1. 你的整段回复必须是且仅是一个 JSON 对象 {"findings":[ ... ]}，前面、后面、中间都不允许有任何说明文字、思考、标题、示例或 Markdown 围栏。
@@ -1268,6 +1321,19 @@ func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID 
 	}
 	outcomes, vErr = decode(textB)
 	if vErr != nil {
+		// 模型有时会按 schema 返回可解析的 JSON，却漏掉部分候选。完整契约已重试
+		// 一次仍不成立时，不能让一个漏项抹掉本轮已核实的结果，也不能把漏项当作
+		// 已确认落库。只采纳编号唯一且合法的结论，其他候选一律保守排除。
+		if verdict, decodeErr := decodeInsightVerdict(textB); decodeErr == nil {
+			outcomes, accepted := conservativeInsightVerifyOutcomes(verdict, len(candidates))
+			if accepted > 0 {
+				log.Printf("[insights] project=%s Pass B repair returned incomplete verdict: %v; keeping %d/%d verified outcomes", project.ID, vErr, accepted, len(candidates))
+				if progress != nil {
+					progress("warn", fmt.Sprintf("核实结果不完整，已保守排除 %d 条未确认候选", len(candidates)-accepted))
+				}
+				return outcomes, nil
+			}
+		}
 		return nil, fmt.Errorf("核实代理未返回有效结果: %v (raw len=%d)", vErr, len(textB))
 	}
 	return outcomes, nil
@@ -1324,6 +1390,48 @@ func validateInsightVerdict(verdict insightVerifyVerdict, candidateCount int) er
 	return nil
 }
 
+// conservativeInsightVerifyOutcomes converts a malformed but parseable Pass B
+// response into a complete, safe result set. Only one valid verdict for an
+// in-range candidate is trusted; every unresolved candidate is excluded.
+func conservativeInsightVerifyOutcomes(verdict insightVerifyVerdict, candidateCount int) ([]insightVerifyOutcome, int) {
+	byIndex := make(map[int]insightVerifyOutcome, candidateCount)
+	invalid := make(map[int]struct{})
+	for _, finding := range verdict.Findings {
+		if finding.Index < 1 || finding.Index > candidateCount {
+			continue
+		}
+		if _, duplicate := byIndex[finding.Index]; duplicate {
+			delete(byIndex, finding.Index)
+			invalid[finding.Index] = struct{}{}
+			continue
+		}
+		if _, duplicate := invalid[finding.Index]; duplicate {
+			continue
+		}
+		byIndex[finding.Index] = insightVerifyOutcome{
+			Index:     finding.Index,
+			Confirmed: finding.Confirmed,
+			Reason:    truncateInsightLog(strings.TrimSpace(finding.Reason), insightRejectionReasonLimit),
+		}
+	}
+
+	outcomes := make([]insightVerifyOutcome, 0, candidateCount)
+	accepted := 0
+	for index := 1; index <= candidateCount; index++ {
+		if outcome, ok := byIndex[index]; ok {
+			outcomes = append(outcomes, outcome)
+			accepted++
+			continue
+		}
+		reason := "AI 未返回该候选的核实结论，已保守排除"
+		if _, duplicate := invalid[index]; duplicate {
+			reason = "AI 返回了重复的核实结论，已保守排除"
+		}
+		outcomes = append(outcomes, insightVerifyOutcome{Index: index, Confirmed: false, Reason: reason})
+	}
+	return outcomes, accepted
+}
+
 // insightVerifyResultErrorMessage keeps the scan failure actionable without
 // exposing a model response. The verification contract is intentionally
 // strict: every Pass A candidate needs exactly one Pass B verdict, otherwise
@@ -1363,39 +1471,35 @@ func buildVerifyExistingRepairPrompt(projectPath string, targets []InsightFindin
 	return buildInsightReverifyPrompt(projectPath, "", targets, true)
 }
 
-// buildInsightReverifyPrompt 把每条既有建议（含 id）连同全部详情交给只读 agent 逐条核验。
+// buildInsightReverifyPrompt 把每条既有建议连同稳定的批内序号交给只读 agent 逐条核验。
 // 用三态结论：只有能指出直接依据的 invalid 才会隐藏建议；无法确认必须返回 uncertain，
 // 由服务端保留建议并标记可重试。repair 为真时额外说明上一次输出的违约点（修正重试）。
 func buildInsightReverifyPrompt(projectPath, repoSHA string, targets []InsightFinding, repair bool) string {
 	items := make([]string, 0, len(targets))
 	for i, f := range targets {
-		items = append(items, fmt.Sprintf("%d. {\"id\":%q,\"title\":%q,\"type\":%q,\"severity\":%q,\"summary\":%q,\"fileHint\":%q}",
-			i+1, f.ID, f.Title, f.Type, f.Severity, f.Summary, f.FileHint))
+		items = append(items, fmt.Sprintf("%d. {\"index\":%d,\"title\":%q,\"type\":%q,\"severity\":%q,\"summary\":%q,\"fileHint\":%q}",
+			i+1, i+1, f.Title, f.Type, f.Severity, f.Summary, f.FileHint))
 	}
-	// 修正重试的说明覆盖"输出契约"的每一种违约（不止 JSON 非法）：服务端会重试的
-	// 失败就是这几类，逐条点名比笼统的"不是合法 JSON"更能让模型一次改对。id 抄写
-	// 单独强调——它是 36 位随机 UUID，逐字符照抄对模型并非无成本动作，而服务端要
-	// 靠它归位（见 matchReverifyTargetID 的说明）。
+	// 修正重试要明确要求一一对应：模型只需返回 1..N 的小整数，无需复述高熵 UUID。
 	repairLine := ""
 	if repair {
-		repairLine = "The previous response did not satisfy the contract: it was not valid JSON, or it listed an unknown or duplicate candidate id, or it missed a candidate. Repeat the verification and return only the required JSON object. Copy every candidate id character for character from the list below."
+		repairLine = "The previous response did not satisfy the contract: it was not valid JSON, or it used an invalid or duplicate candidate index, or it missed a candidate. Repeat the verification and return only the required JSON object."
 	}
-	// 示例里的 id 用尖括号占位而不是 candidate-id：后者看着像可以直接照抄的字面量，
-	// 模型有把占位符原样回传的风险（那会先触发一次修正重试，重试仍照抄才判"未知建议"）。
+	// 示例只放一条，避免小批次时示例中的额外编号被模型机械回传，进而被判为未知建议。
 	return fmt.Sprintf(`Run a read-only verification now. Do not ask questions and do not change files.
 Project directory: %s
 Git revision: %s
 %s
 
 For every candidate, inspect the relevant code and return exactly one JSON object:
-{"findings":[{"id":"<candidate id>","status":"valid","reason":"direct evidence"},{"id":"<candidate id>","status":"invalid","reason":"direct evidence that it is fixed or implemented"},{"id":"<candidate id>","status":"uncertain","reason":"evidence is insufficient"}]}
+{"findings":[{"index":1,"status":"valid","reason":"direct evidence"}]}
 
 status meanings:
 - valid: the issue or missing feature still exists.
 - invalid: it is fixed, implemented, or inapplicable. Use this only with direct evidence from the project.
 - uncertain: relevant evidence is insufficient. Never use invalid merely because you cannot confirm it.
 
-Copy each "id" character for character from the candidate list below: it is an opaque UUID, so never rewrite, shorten, or complete it.
+The JSON above only illustrates one entry's shape. Copy the integer index shown for each candidate. Return every index exactly once.
 Return one entry for every candidate and no text outside the JSON object.
 Candidates:
 %s`, projectPath, repoSHA, repairLine, strings.Join(items, "\n"))
@@ -1406,6 +1510,9 @@ Candidates:
 // （标 failed 可重试）而非误判 invalid 把仍有效的建议隐藏。
 type insightVerifyExistingVerdict struct {
 	Findings []struct {
+		// Index 是当前协议的稳定批内序号，避免模型复述随机 UUID。
+		Index int `json:"index"`
+		// ID 兼容旧版输出；新 schema 与 prompt 都不会要求它。
 		ID     string `json:"id"`
 		Status string `json:"status"`
 		// Exists 兼容旧版 agent 输出；新协议使用 status 三态。
@@ -1613,7 +1720,12 @@ func matchReverifyTargetID(targets []InsightFinding, raw string) (string, bool) 
 func matchReverifyVerdict(targets []InsightFinding, verdict insightVerifyExistingVerdict) (map[string]insightReverifyResult, error) {
 	results := make(map[string]insightReverifyResult, len(targets))
 	for _, item := range verdict.Findings {
-		id, ok := matchReverifyTargetID(targets, item.ID)
+		id, ok := "", false
+		if item.Index >= 1 && item.Index <= len(targets) {
+			id, ok = targets[item.Index-1].ID, true
+		} else if item.ID != "" {
+			id, ok = matchReverifyTargetID(targets, item.ID)
+		}
 		if !ok {
 			return nil, errors.New("AI 返回了未知建议")
 		}
@@ -1632,14 +1744,17 @@ func matchReverifyVerdict(targets []InsightFinding, verdict insightVerifyExistin
 	return results, nil
 }
 
-// reverifyVerdictIDs 提取输出里的 id 列表，仅供失败日志留证：模型这趟到底回了什么，
-// 只有落进日志事后才查得动（Pass A 的 parse failed 分支同做法）。
-func reverifyVerdictIDs(verdict insightVerifyExistingVerdict) []string {
-	ids := make([]string, 0, len(verdict.Findings))
+// reverifyVerdictReferences 提取输出里的归位字段，仅供失败日志留证。
+func reverifyVerdictReferences(verdict insightVerifyExistingVerdict) []string {
+	references := make([]string, 0, len(verdict.Findings))
 	for _, item := range verdict.Findings {
-		ids = append(ids, item.ID)
+		if item.Index != 0 {
+			references = append(references, fmt.Sprintf("index=%d", item.Index))
+			continue
+		}
+		references = append(references, "id="+item.ID)
 	}
-	return ids
+	return references
 }
 
 // runInsightFindingsVerify 见 runInsightFindingsVerifyRun。
@@ -1919,8 +2034,8 @@ func (s *Server) runInsightReverifyBatch(ctx context.Context, project Project, a
 		}
 		results, err := matchReverifyVerdict(targets, verdict)
 		if err != nil {
-			log.Printf("[insights] project=%s re-verify %s: %v; returned ids=%v want=%v",
-				project.ID, stage, err, reverifyVerdictIDs(verdict), targetIDs)
+			log.Printf("[insights] project=%s re-verify %s: %v; returned references=%v want ids=%v",
+				project.ID, stage, err, reverifyVerdictReferences(verdict), targetIDs)
 			return nil, err
 		}
 		return results, nil
@@ -2183,6 +2298,10 @@ func (s *Server) verifyInsightFindings(w http.ResponseWriter, r *http.Request) {
 	agentID := normalizeScanAgent(req.Agent)
 	if agentID == "" {
 		agentID = s.currentInsightAgent(r.Context(), projectID)
+	}
+	if err := s.requireInsightAgentReady(r.Context(), projectID, agentID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
 	}
 	targets, err := s.resolveVerifyTargets(r.Context(), projectID, req.FindingIDs)
 	if err != nil {
@@ -2701,6 +2820,9 @@ func (s *Server) runProjectInsightScan(ctx context.Context, projectID, scanID st
 			return
 		}
 	}
+	// Enforce the requested type scope after parsing as well as in the prompt.
+	// This protects the result set when the model ignores or misreads the scope.
+	candidates = filterInsightCandidatesByTypes(candidates, opts.Types)
 	if len(candidates) > insightFindingsCap {
 		candidates = candidates[:insightFindingsCap]
 	}
@@ -2914,6 +3036,10 @@ func (s *Server) triggerInsightScan(w http.ResponseWriter, r *http.Request) {
 	if opts.Agent == "" {
 		// 兼容未传 agent 的旧客户端，同时让扫描记录保存实际使用的 Agent。
 		opts.Agent = s.currentInsightAgent(r.Context(), projectID)
+	}
+	if err := s.requireInsightAgentReady(r.Context(), projectID, opts.Agent); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
 	}
 	scanID := uuid.NewString()
 

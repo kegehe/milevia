@@ -43,8 +43,8 @@ func (r *nthBatchRunner) Run(_ context.Context, req AgentRunRequest, sink AgentR
 	r.answered = append(r.answered, ids)
 	r.mu.Unlock()
 	verdicts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		verdicts = append(verdicts, fmt.Sprintf(`{"id":%q,"status":"valid","reason":"仍在"}`, id))
+	for i := range ids {
+		verdicts = append(verdicts, fmt.Sprintf(`{"index":%d,"status":"valid","reason":"仍在"}`, i+1))
 	}
 	sink.AssistantText(`{"findings":[`+strings.Join(verdicts, ",")+`]}`, "")
 	return nil
@@ -60,20 +60,16 @@ func insightPromptCandidateIDs(prompt string) []string {
 	}
 	var ids []string
 	for {
-		i := strings.Index(rest, `{"id":`)
+		i := strings.Index(rest, `{"index":`)
 		if i < 0 {
 			return ids
 		}
-		rest = rest[i+len(`{"id":`):]
-		if !strings.HasPrefix(rest, `"`) {
-			continue
-		}
-		rest = rest[1:]
-		end := strings.Index(rest, `"`)
+		rest = rest[i+len(`{"index":`):]
+		end := strings.IndexByte(rest, ',')
 		if end < 0 {
 			return ids
 		}
-		ids = append(ids, rest[:end])
+		ids = append(ids, strings.TrimSpace(rest[:end]))
 		rest = rest[end:]
 	}
 }
@@ -327,6 +323,21 @@ func TestMatchReverifyVerdictRejectsInvalidStatus(t *testing.T) {
 	}
 	if _, ok := normalizeInsightReverifyStatus("maybe", nil); ok {
 		t.Fatal("normalizeInsightReverifyStatus accepted an unknown status")
+	}
+}
+
+func TestMatchReverifyVerdictUsesStableBatchIndex(t *testing.T) {
+	targets := []InsightFinding{{ID: reverifyRealID}, {ID: "0f0050f7-8040-439b-849f-4f4125b21aa7"}}
+	verdict, err := decodeInsightVerifyExisting(`{"findings":[{"index":2,"status":"valid","reason":"仍在"},{"index":1,"status":"invalid","reason":"已修复"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := matchReverifyVerdict(targets, verdict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results[targets[0].ID].status != insightVerifyInvalid || results[targets[1].ID].status != insightVerifyValid {
+		t.Fatalf("results=%#v", results)
 	}
 }
 

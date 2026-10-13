@@ -33,9 +33,10 @@ const (
 	mcpScopeGlobal  = "global"
 	mcpScopeProject = "project"
 
-	mcpSourceManual = "manual"
-	mcpSourceImport = "import"
-	mcpSourcePreset = "preset"
+	mcpSourceManual       = "manual"
+	mcpSourceImport       = "import"
+	mcpSourcePreset       = "preset"
+	mcpSourceOAuthPending = "oauth-pending"
 
 	// mcpSecretRefPrefix 是环境变量/请求头中加密密钥引用的前缀（复用 profile_secrets）。
 	mcpSecretRefPrefix = "sec_"
@@ -230,7 +231,10 @@ func (s *Server) registerMCPRoutes(r chi.Router) {
 	r.Get("/api/mcp/servers/{serverID}/oauth", s.getMCPServerOAuth)
 	r.Delete("/api/mcp/servers/{serverID}/oauth", s.deleteMCPServerOAuth)
 	r.Get("/api/mcp/oauth/flows/{flowID}", s.getMCPOAuthFlow)
+	r.Delete("/api/mcp/oauth/flows/{flowID}", s.cancelMCPOAuthFlow)
 	r.Get(mcpOAuthCallbackPath, s.handleMCPOAuthCallback)
+	r.Get("/api/mcp/oauth/prepare/{flowID}", s.mcpOAuthPreparePage)
+	r.Get("/api/mcp/oauth/prepare/{flowID}/status", s.mcpOAuthPrepareStatus)
 	// 调用审计（P2）。
 	r.Get("/api/mcp/audit", s.listMCPCallAudit)
 	r.Delete("/api/mcp/audit", s.clearMCPCallAudit)
@@ -242,10 +246,11 @@ func (s *Server) registerMCPRoutes(r chi.Router) {
 // mcpServerInput 是写入接口的请求体。密钥通过 envSecrets/headerSecrets 明文传入，
 // 服务端加密为 sec_ 引用后并入 env/headers；env/headers 中已存在的 sec_ 引用原样保留。
 type mcpServerInput struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"displayName"`
-	Description string `json:"description"`
-	Transport   string `json:"transport"`
+	OAuthPending bool   `json:"oauthPending"`
+	Name         string `json:"name"`
+	DisplayName  string `json:"displayName"`
+	Description  string `json:"description"`
+	Transport    string `json:"transport"`
 
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
@@ -550,6 +555,10 @@ func scanMCPServer(row interface {
 const mcpServerColumns = `id,name,display_name,description,transport,command,args_json,env_json,cwd,url,headers_json,scope,project_id,environments,agents,enabled,auto_approve_tools,startup_timeout_sec,tool_timeout_sec,source,created_at,updated_at`
 
 func (s *Server) listMCPServers(w http.ResponseWriter, r *http.Request) {
+	if err := s.cleanupPendingMCPOAuth(r.Context(), time.Now()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	query := `select ` + mcpServerColumns + ` from mcp_servers`
 	clauses := []string{}
 	args := []any{}
@@ -656,6 +665,15 @@ func (s *Server) createMCPServer(w http.ResponseWriter, r *http.Request) {
 		Source:            mcpSourceManual,
 		CreatedAt:         now,
 		UpdatedAt:         now,
+	}
+	if input.OAuthPending {
+		if server.Transport == "stdio" {
+			writeError(w, http.StatusBadRequest, errors.New("只有远程 MCP 可以创建临时授权配置"))
+			return
+		}
+		server.Enabled = false
+		server.Source = mcpSourceOAuthPending
+		server.AutoApproveTools = []string{}
 	}
 	if input.StartupTimeoutSec != nil && *input.StartupTimeoutSec > 0 {
 		server.StartupTimeoutSec = *input.StartupTimeoutSec
@@ -770,6 +788,10 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 		merged.Agents = input.Agents
 	}
 	if input.Enabled != nil {
+		if *input.Enabled && current.Source == mcpSourceOAuthPending {
+			writeError(w, http.StatusConflict, errors.New("请先完成授权并通过连接测试"))
+			return
+		}
 		merged.Enabled = input.Enabled
 	}
 	if input.AutoApproveTools != nil {
@@ -853,30 +875,48 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteMCPServer(w http.ResponseWriter, r *http.Request) {
 	serverID := chi.URLParam(r, "serverID")
 	ctx := r.Context()
-	current, err := s.fetchStoredMCPServer(ctx, serverID)
-	if errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.fetchStoredMCPServer(ctx, serverID); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("MCP server not found"))
 		return
-	}
-	if err != nil {
+	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if err := s.removeMCPServer(ctx, serverID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) removeMCPServer(ctx context.Context, serverID string) error {
+	s.mcpOAuthLifecycleMu.Lock()
+	defer s.mcpOAuthLifecycleMu.Unlock()
+	return s.removeMCPServerLocked(ctx, serverID)
+}
+
+func (s *Server) removeMCPServerLocked(ctx context.Context, serverID string) error {
+	s.cancelMCPServerFlows(serverID)
+	current, err := s.fetchStoredMCPServer(ctx, serverID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 	// 先吊销 OAuth 令牌、再删行：吊销失败时 500 中止，什么都没发生、可重试；
 	// 反过来（先删行）失败会让前端拿着「删除失败」的报错去找一条已经不存在的记录。
 	// ErrNoRows（本来就没有令牌）不算错。
 	if err := s.revokeMCPOAuthToken(ctx, serverID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `delete from mcp_servers where id=?`, serverID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return err
 	}
 	for _, ref := range collectSecretRefs(current.envRaw, current.headersRaw) {
 		_ = s.profileSecrets.Revoke(s.db, ctx, ref)
 	}
-	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 // storedMCPServer 是内部使用的完整行（env/headers 保留原始 sec_ 引用）。
@@ -1073,14 +1113,6 @@ func mcpPresetCatalog() []mcpPreset {
 	common := []mcpPreset{
 		mcpRemotePreset("notion", "notion", "Notion", "读写你的 Notion 页面与数据库", "docs",
 			"https://mcp.notion.com/mcp", true, nil, "https://developers.notion.com/docs/mcp"),
-		mcpRemotePreset("linear", "linear", "Linear", "查找、创建、更新 Linear 工单", "tasks",
-			"https://mcp.linear.app/mcp", true, nil, "https://linear.app/docs/mcp"),
-		mcpRemotePreset("sentry", "sentry", "Sentry", "查看线上报错与告警，定位问题", "alert",
-			"https://mcp.sentry.dev/mcp", true, nil, "https://docs.sentry.io/product/sentry-mcp/"),
-		mcpRemotePreset("slack", "slack", "Slack", "读取频道与线程，发送消息", "chat",
-			"https://mcp.slack.com/mcp", true, nil, "https://docs.slack.dev/mcp/"),
-		mcpRemotePreset("atlassian", "atlassian", "Jira / Confluence", "读写 Jira 工单与 Confluence 文档", "docs",
-			"https://mcp.atlassian.com/v1/sse", true, nil, "https://www.atlassian.com/platform/remote-mcp-server"),
 		mcpRemotePreset("github", "github", "GitHub", "查看与修改代码仓库、Issue、PR", "code",
 			mcpGitHubRemoteURL, true, githubToken, mcpGitHubDocsURL),
 		mcpRemotePreset("stripe", "stripe", "Stripe", "查询支付、订阅与客户", "pay",

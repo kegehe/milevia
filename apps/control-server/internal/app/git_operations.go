@@ -360,8 +360,8 @@ func (s *Server) gitStage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// gitStageAllFast keeps the state-token guard but uses Git's native all-path
-// operation instead of serializing every changed path into a pathspec.
+// gitStageAllFast stages only paths observed by the validated state token.
+// Files created by the AI after validation remain in the worktree.
 func (s *Server) gitStageAllFast(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		StateToken string `json:"stateToken"`
@@ -369,7 +369,7 @@ func (s *Server) gitStageAllFast(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitIndexMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -385,8 +385,14 @@ func (s *Server) gitStageAllFast(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errGitNoChanges)
 		return
 	}
+	paths := make([]string, 0, len(state.changes))
+	for _, change := range state.changes {
+		if change.Modified || change.Untracked || change.Deleted || change.Renamed || change.Conflicted {
+			paths = append(paths, change.Path)
+		}
+	}
 	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "stage_all", "鍏ㄩ儴鏆傚瓨", state.snapshot, func(runner GitRunner) error {
-		return runner.StageAll(r.Context(), repo)
+		return runner.Stage(r.Context(), repo, paths)
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -424,7 +430,7 @@ func (s *Server) gitAllPathsMutation(w http.ResponseWriter, r *http.Request, typ
 	if !decode(w, r, &input) {
 		return
 	}
-	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitIndexMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -467,7 +473,7 @@ func (s *Server) gitPathsMutation(w http.ResponseWriter, r *http.Request, typ st
 			return
 		}
 	}
-	runner, projectID, repo, state, release, ok := s.gitMutationState(w, r, input.StateToken)
+	runner, projectID, repo, state, release, ok := s.gitIndexMutationState(w, r, input.StateToken)
 	if !ok {
 		return
 	}
@@ -1115,6 +1121,57 @@ func (s *Server) gitConflictContinue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, result)
 }
 
+func (s *Server) gitIndexMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (GitRunner, string, string, gitStateToken, func(), bool) {
+	runner, repo, ok := s.getGitRunner(w, r)
+	if !ok {
+		return nil, "", "", gitStateToken{}, nil, false
+	}
+	projectID := chi.URLParam(r, "projectID")
+	workspace, err := s.resolveRequestWorkspaceFromRequest(r)
+	if err != nil {
+		writeProjectResolveError(w, err)
+		return nil, "", "", gitStateToken{}, nil, false
+	}
+	workspaceKey := workspaceLeaseKey(workspace.Project, workspace.Workspace)
+	releaseIndex, indexAcquired := s.acquireGitIndexLock(workspaceKey)
+	if !indexAcquired {
+		writeError(w, http.StatusConflict, &projectWorkspaceOccupiedError{owner: "git:index"})
+		return nil, "", "", gitStateToken{}, nil, false
+	}
+	s.mu.Lock()
+	lease := s.projectWorkspaceLeases[workspaceKey]
+	blocked := lease != nil && !isAIWorkspaceOwner(lease.owner)
+	if !blocked {
+		if s.gitIndexActive == nil {
+			s.gitIndexActive = map[string]bool{}
+		}
+		s.gitIndexActive[workspaceKey] = true
+	}
+	s.mu.Unlock()
+	if blocked {
+		releaseIndex()
+		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceKey))
+		return nil, "", "", gitStateToken{}, nil, false
+	}
+	release := func() {
+		s.mu.Lock()
+		delete(s.gitIndexActive, workspaceKey)
+		s.mu.Unlock()
+		releaseIndex()
+	}
+	state, err := s.validateGitStateToken(r.Context(), runner, projectID, workspace.Workspace.ID, repo, stateToken)
+	if err != nil {
+		release()
+		writeError(w, http.StatusConflict, err)
+		return nil, "", "", gitStateToken{}, nil, false
+	}
+	return runner, projectID, repo, state, release, true
+}
+
+func isAIWorkspaceOwner(owner string) bool {
+	return strings.HasPrefix(owner, "conversation:") || strings.HasPrefix(owner, "run:")
+}
+
 func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (GitRunner, string, string, gitStateToken, func(), bool) {
 	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
@@ -1132,13 +1189,20 @@ func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateT
 		writeError(w, http.StatusConflict, s.workspaceOccupiedError(workspaceKey))
 		return nil, "", "", gitStateToken{}, nil, false
 	}
+	releaseIndex, indexAcquired := s.acquireGitIndexLock(workspaceKey)
+	if !indexAcquired {
+		release()
+		writeError(w, http.StatusConflict, &projectWorkspaceOccupiedError{owner: "git:index"})
+		return nil, "", "", gitStateToken{}, nil, false
+	}
 	state, err := s.validateGitStateToken(r.Context(), runner, projectID, workspace.Workspace.ID, repo, stateToken)
 	if err != nil {
+		releaseIndex()
 		release()
 		writeError(w, http.StatusConflict, err)
 		return nil, "", "", gitStateToken{}, nil, false
 	}
-	return runner, projectID, repo, state, release, true
+	return runner, projectID, repo, state, func() { releaseIndex(); release() }, true
 }
 
 type gitOperationResult struct {

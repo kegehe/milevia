@@ -101,6 +101,9 @@ type AgentCatalogEntry struct {
 	// RunnableInProject 表示平台已实现该工具的 AgentRunner，可在项目对话中真正运行。
 	// 未接通前为 false：管理页照常展示与安装，但新建会话不会把它列为可用 agent。
 	RunnableInProject bool `json:"runnableInProject"`
+	// SupportsProjectInsights 表示平台已接通该工具的只读分析协议，可用于优化建议。
+	// 这比能否参与普通项目对话更严格：分析需要可靠的只读权限、结构化输出与复核流程。
+	SupportsProjectInsights bool `json:"supportsProjectInsights"`
 }
 
 // agentCatalogEntries 是唯一清单。顺序即界面顺序。
@@ -129,7 +132,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		SlashCommands: true,
 		MCPInjection:  "config-file",
 		// Claude 长驻会话（StartSession）已实现并经活 harness 验证，可参与项目对话。
-		RunnableInProject: true,
+		RunnableInProject:       true,
+		SupportsProjectInsights: true,
 	},
 	{
 		ID:                "codex",
@@ -158,7 +162,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		SlashCommands: false,
 		MCPInjection:  "cli-args",
 		// Codex 走一次性回合（非流式 Run），已在项目对话中接通，可参与对话。
-		RunnableInProject: true,
+		RunnableInProject:       true,
+		SupportsProjectInsights: true,
 	},
 	{
 		ID:                "codebuddy",

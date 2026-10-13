@@ -11,7 +11,7 @@ import "../features/insights/insights.css";
 export default function InsightsPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const { api, setError } = useProjectContext();
-  const { navigateWithGuard } = useOutletContext<ProjectLayoutOutletContext>();
+  const { navigateWithGuard, project } = useOutletContext<ProjectLayoutOutletContext>();
 
   // 建议卡片里的「查看文件」：把目标路径交给文件页（与"添加到对话"同样的会话内传递方式），
   // 再跳过去由 FilesPanel 自动打开。路径来自 AI 输出（相对项目根），文件页会做越权校验。
@@ -25,7 +25,7 @@ export default function InsightsPage() {
 
   return (
     <div className="workspace-tab-panel">
-      <InsightsPanel projectID={projectId} request={api} fail={setError} onOpenFile={openFile} />
+      <InsightsPanel projectID={projectId} runnerID={project.runner} request={api} fail={setError} onOpenFile={openFile} />
     </div>
   );
 }

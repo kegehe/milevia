@@ -36,7 +36,7 @@ func TestWslInnerToken(t *testing.T) {
 //   - cd <workdir>（工作目录在脚本内显式设置）
 //   - exec <cli> <args>（每个参数都经 wslInnerToken 编码，可被 sh 还原为单 argv）
 func TestWslNativeCommandScript(t *testing.T) {
-	r := &wslAgentRunner{distro: "Ubuntu", codex: &codexCLIRunner{config: Config{CodexPath: "codex"}}}
+	r := &wslAgentRunner{distro: "Ubuntu", codex: &codexCLIRunner{config: Config{CodexPath: "codex"}}, nodeBin: "/home/tangmaoke/.nvm/versions/node/v22.22.2/bin", nodeBinResolved: true}
 	args := []string{"exec", "-c", `model="gpt-5-codex"`, "--json", "hello world from milevia"}
 	cmd := r.wslNativeCommand(context.Background(), r.codex.config.CodexPath, args, nil, "/home/tangmaoke/proj")
 
@@ -55,6 +55,7 @@ func TestWslNativeCommandScript(t *testing.T) {
 	for _, want := range []string{
 		"export PATH=",
 		".npm-global/bin",
+		"/home/tangmaoke/.nvm/versions/node/v22.22.2/bin",
 		`cd "$(echo L2hvbWUvdGFuZ21hb2tlL3Byb2o= | base64 -d)"`, // /home/tangmaoke/proj
 		"exec codex",
 		`"$(echo`, // 每个参数均为双引号包裹的 base64 命令替换

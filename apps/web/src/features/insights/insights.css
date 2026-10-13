@@ -159,6 +159,8 @@
   letter-spacing: 1px;
 }
 .insights-agent-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.insights-agent-state { color: #527067; font-size: 13px; line-height: 30px; }
+.insights-agent-state-error { color: #a64235; }
 .insights-agent-options label {
   display: inline-flex;
   align-items: center;

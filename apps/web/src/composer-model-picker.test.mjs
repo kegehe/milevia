@@ -40,7 +40,22 @@ test("switching is blocked while a run is active", () => {
   // 与权限菜单同一条规则：运行中/清空中/停止中都不放行。
   assert.match(conversationPage, /disabled=\{readOnly \|\| Boolean\(run\) \|\| stopping \|\| changingModel\}/);
   const selectBody = conversationPage.match(/const selectConversationModel = async \(model: string\)[\s\S]*?\n  \};/)?.[0] ?? "";
-  assert.match(selectBody, /if \(!conversation \|\| readOnlyConversation \|\| \(conversation\.modelOverride \|\| ""\) === model \|\| run \|\| clearing \|\| stopping\) return false;/);
+  assert.match(selectBody, /if \(!conversation \|\| readOnlyConversation \|\| \(conversation\.modelOverride \|\| ""\) === model \|\| run \|\| clearing \|\| stopping \|\| handingOff\) return false;/);
+});
+
+test("model switching blocks every message dispatch path until the override is saved", () => {
+  const sendBody = conversationPage.match(/const sendContent = async \(rawContent: string[\s\S]*?\n  \};/)?.[0] ?? "";
+  assert.match(sendBody, /shortcutBusy \|\| changingModel/);
+
+  const scheduleBody = conversationPage.match(/const scheduleSend = \(\) => \{[\s\S]*?\n  \};/)?.[0] ?? "";
+  assert.match(scheduleBody, /shortcutBusy \|\| changingModel/);
+
+  const shortcutBody = conversationPage.match(/const runShortcut = async \(shortcut: Shortcut[\s\S]*?\n  \};/)?.[0] ?? "";
+  assert.match(shortcutBody, /shortcutBusy \|\| changingModel/);
+
+  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*if \(changingModel\) return;/);
+  assert.match(conversationPage, /if \(changingModel\) return false;/);
+  assert.match(conversationPage, /<fieldset className="composer-model-switch-lock" disabled=\{changingModel\}>/);
 });
 
 test("the footer shows the model that will be used next", () => {

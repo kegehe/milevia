@@ -275,11 +275,14 @@ type Server struct {
 	agentReadingsMu sync.Mutex
 	agentReadings   map[string]agentReading
 	// remoteAgentProbeActive keeps remote snapshots from piling up goroutines
-	// that only wait on the same WSL/SSH probe round.
-	remoteAgentProbeMu     sync.Mutex
-	remoteAgentProbeActive map[string]bool
-	agentUpdateChecksMu    sync.Mutex
-	agentUpdateChecks      map[agentUpdateCheckKey]agentUpdateCheck
+	// that only wait on the same WSL/SSH probe round. A failed cold probe gets
+	// a short retry delay so rendering its terminal state does not immediately
+	// start the same expensive WSL/SSH probe again.
+	remoteAgentProbeMu         sync.Mutex
+	remoteAgentProbeActive     map[string]bool
+	remoteAgentProbeRetryAfter map[string]time.Time
+	agentUpdateChecksMu        sync.Mutex
+	agentUpdateChecks          map[agentUpdateCheckKey]agentUpdateCheck
 	// commandCatalogMu 保护 Claude 命令目录的单条缓存（见 project_commands.go）：
 	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
 	// 串行地拉起一次探针进程。
@@ -307,6 +310,8 @@ type Server struct {
 	quotaLeaseStops        map[string]context.CancelFunc
 	streamingSetups        map[string]*streamingSetup
 	projectWorkspaceLeases map[string]*projectWorkspaceLease
+	gitIndexLocks          map[string]*sync.Mutex
+	gitIndexActive         map[string]bool
 	runWorkspaceReleases   map[string]func()
 	nonStreamingLaunches   map[string]*nonStreamingRunLaunch
 	gitStateTokens         map[string]gitStateToken
@@ -321,6 +326,8 @@ type Server struct {
 	// mcpOAuthFlows 保存进行中的远程 MCP OAuth 授权流程（按随机 state 索引）。
 	// 流程本身不落盘：发起后由用户在浏览器完成授权，回调命中即写入 token 并清理。
 	mcpOAuthFlows map[string]*mcpOAuthFlow
+	// 串行化 OAuth 回调提交、取消与临时配置回收，网络请求在锁外执行。
+	mcpOAuthLifecycleMu sync.Mutex
 	// mcpLastInject 记录每个项目最近一次 MCP 注入快照，供 GET /api/projects/{id}/mcp/status。
 	// 仅内存态：它是「当前运行了什么」的观测，不是用户配置。
 	mcpLastInject          map[string]projectMCPStatus
@@ -544,6 +551,9 @@ type Conversation struct {
 	IsCurrent         bool      `json:"isCurrent"`
 	IsOrchestration   bool      `json:"isOrchestration,omitempty"`
 	CreatedAt         time.Time `json:"createdAt"`
+	// Handoff only marks an internal context-transfer run. It is never stored
+	// or sent to clients, and lets the runner exclude project MCP tools.
+	Handoff bool `json:"-"`
 }
 
 // recentConversations 返回结构：内嵌 Conversation 全部摘要字段并追加所属项目名。
@@ -619,9 +629,12 @@ type runStartRecord struct {
 	Shortcut     *ShortcutRun
 	Task         *TaskRun
 	Scheduled    *ScheduledTaskRun
+	Handoff      *conversationHandoffRun
 	WorktreePath string
 	Orchestrated bool
 }
+
+type conversationHandoffRun struct{ ID string }
 
 type Event struct {
 	ID             string          `json:"id"`
@@ -813,7 +826,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	codexRunner := newCodexCLIRunner(config, paths)
 	codebuddyRunner := newCodebuddyManageRunner(config, paths)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, gitIndexLocks: map[string]*sync.Mutex{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -853,9 +866,16 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		_ = dataLock.close()
 		return nil, err
 	}
+	if err := s.recoverInterruptedConversationHandoffs(ctx); err != nil {
+		runtimeStop()
+		pool.Close()
+		_ = dataLock.close()
+		return nil, err
+	}
 	s.startRemoteCommandWorker()
 	// 清理上次异常退出遗留的 MCP 运行时临时配置（正常路径由 defer 删除）。
 	s.cleanupStaleMCPRuntimeFiles()
+	go s.cleanupPendingMCPOAuthLoop(s.runtimeCtx)
 	if err := s.recoverInterruptedScheduledTasks(ctx); err != nil {
 		runtimeStop()
 		pool.Close()
@@ -1385,6 +1405,8 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/conversations/{conversationID}/input-history", s.listInputHistory)
 	r.Get("/api/conversations/{conversationID}/usage", s.getConversationUsage)
 	r.Post("/api/conversations/{conversationID}/clear", s.clearConversation)
+	r.Post("/api/conversations/{conversationID}/handoff", s.startConversationHandoff)
+	r.Get("/api/conversation-handoffs/{handoffID}", s.getConversationHandoff)
 	// 手机端的停止入口（中继 conversation.stop 的落点）。桌面端按 run 停，见 /api/runs/{runID}/stop。
 	r.Post("/api/conversations/{conversationID}/stop", s.stopConversationRuns)
 	r.Delete("/api/conversations/{conversationID}", s.deleteConversation)
@@ -1503,6 +1525,10 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		// state instead: redeeming the authorization code requires a state value
 		// that only the flow initiator and this server know.
 		if r.URL.Path == mcpOAuthCallbackPath {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/mcp/oauth/prepare/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1736,6 +1762,7 @@ create table if not exists conversations (id text primary key, project_id text n
 	create table if not exists messages (id text primary key, conversation_id text not null references conversations(id) on delete cascade, run_id text not null default '', role text not null, content text not null, client_request_id text not null default '', parent_tool_use_id text not null default '', created_at datetime not null);
 create table if not exists conversation_workspaces (id text primary key, conversation_id text not null references conversations(id) on delete cascade, generation integer not null, mode text not null, path text not null, branch text not null default '', base_revision text not null default '', state text not null default 'ready', created_at datetime not null, archived_at datetime, unique(conversation_id,generation));
 create table if not exists runs (id text primary key, conversation_id text not null references conversations(id) on delete cascade, agent_id text not null default 'claude-code', agent_runtime_id text not null default '', execution_policy text not null default 'approval_required', workspace_id text not null default '', workspace_path text not null default '', workspace_branch text not null default '', workspace_base_revision text not null default '', agent_run_id text not null default '', status text not null, created_at datetime not null, completed_at datetime);
+create table if not exists conversation_handoffs (id text primary key, source_conversation_id text not null references conversations(id) on delete cascade, target_conversation_id text references conversations(id) on delete set null, source_run_id text not null default '', target_run_id text not null default '', status text not null check(status in ('summarizing','initializing','completed','failed')), summary text not null default '', error_message text not null default '', created_at datetime not null, completed_at datetime);
 create table if not exists events (id text primary key, conversation_id text not null references conversations(id) on delete cascade, run_id text not null references runs(id) on delete cascade, type text not null, payload text not null, created_at datetime not null);
 create table if not exists run_usage (run_id text primary key references runs(id) on delete cascade, conversation_id text not null references conversations(id) on delete cascade, model text not null default '', context_window integer not null default 0, context_input_tokens integer not null default 0, input_tokens integer not null default 0, output_tokens integer not null default 0, cache_read_tokens integer not null default 0, cache_creation_tokens integer not null default 0, estimated_cost_usd real not null default 0, agent_turns integer not null default 0, model_steps integer not null default 0, tool_calls integer not null default 0, subagent_count integer not null default 0, duration_ms integer not null default 0, ttft_ms integer not null default 0, terminal_reason text not null default '', has_result integer not null default 0, completed_at datetime not null);
 create table if not exists run_model_usage (run_id text not null references runs(id) on delete cascade, model text not null, input_tokens integer not null default 0, output_tokens integer not null default 0, cache_read_tokens integer not null default 0, cache_creation_tokens integer not null default 0, estimated_cost_usd real not null default 0, context_window integer not null default 0, primary key (run_id,model));
@@ -1756,6 +1783,7 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	create index if not exists events_conversation_created on events(conversation_id,created_at desc);
 	create index if not exists events_conversation_created_id on events(conversation_id,created_at,id);
 	create index if not exists run_usage_conversation_completed on run_usage(conversation_id,completed_at desc);
+create index if not exists conversation_handoffs_source_status on conversation_handoffs(source_conversation_id,status);
 	create index if not exists project_insight_scans_project on project_insight_scans(project_id,created_at desc);
 	create index if not exists project_insights_project on project_insights(project_id,status);
 	create index if not exists project_insights_scan on project_insights(scan_id);
@@ -1764,6 +1792,9 @@ create table if not exists app_metadata (key text primary key, value text not nu
 	create unique index if not exists project_insights_project_fingerprint on project_insights(project_id,fingerprint);`)
 	if err != nil {
 		return fmt.Errorf("migrate database: %w", err)
+	}
+	if err := s.migrateConversationHandoffs(ctx); err != nil {
+		return fmt.Errorf("migrate conversation handoffs: %w", err)
 	}
 	if err := s.migrateProjectsRunnerPathUnique(ctx); err != nil {
 		return fmt.Errorf("migrate project path uniqueness: %w", err)
@@ -3279,9 +3310,10 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// is_current remains a compatibility-only "last selected" marker. Keep its
-	// transition ordered so its partial unique index is never briefly violated,
-	// but never use it to decide whether another conversation may run.
+	// is_current is the project-level current conversation shared by every
+	// connected client. Keep its transition ordered so its partial unique index
+	// is never briefly violated, but never use it to decide whether another
+	// conversation may run.
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
 	now := time.Now().UTC()
@@ -3529,12 +3561,19 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("stop the active agent run before clearing the conversation"))
 		return
 	}
+	if handingOff, err := s.conversationHandoffInProgress(r.Context(), conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if handingOff {
+		writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
+		return
+	}
 
 	now := time.Now().UTC()
 	sessionID := uuid.NewString()
 	// A cleared conversation remains readable history, but must never accept a
 	// later turn: its native session is being stopped below. Preserve another
-	// tab's last-selected marker when clearing a background conversation.
+	// tab's shared selection when clearing a background conversation.
 	fresh := Conversation{ID: uuid.NewString(), ProjectID: previous.ProjectID, ClaudeSessionID: sessionID, AgentID: previous.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, AgentProfileRevisionID: previous.AgentProfileRevisionID, ProjectAgentRouteRevisionID: previous.ProjectAgentRouteRevisionID, ExecutionPolicy: previous.executionPolicy(), Status: "idle", PermissionMode: previous.PermissionMode, ModelOverride: previous.ModelOverride, Title: "新会话", LastActivityAt: now, IsCurrent: previous.IsCurrent, CreatedAt: now}
 	result, err := tx.ExecContext(r.Context(), `update conversations set is_current=0,status='archived' where id=? and status='idle'`, previous.ID)
 	if err != nil {
@@ -3573,7 +3612,10 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 	s.projectLifecycleMu.Unlock()
 	locked = false
 	if previousSession != nil {
-		previousSession.Stop()
+		// Stopping a native CLI may wait for a wedged child process. The old
+		// conversation is already archived and marked stopping, so do not hold
+		// the clear request open while the process is being reaped.
+		go previousSession.Stop()
 	}
 	writeJSON(w, http.StatusCreated, fresh)
 }
@@ -3660,6 +3702,13 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if handingOff, err := s.conversationHandoffInProgress(s.runtimeCtx, conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if handingOff {
+		writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
+		return
+	}
 	if status != "idle" && status != "archived" {
 		writeError(w, http.StatusConflict, errors.New("stop the active agent run before deleting the conversation"))
 		return
@@ -3714,7 +3763,7 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	s.projectLifecycleMu.Unlock()
 	locked = false
 	if previousSession != nil {
-		previousSession.Stop()
+		go previousSession.Stop()
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -3787,6 +3836,13 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 		}
 		if item.status != "idle" && item.status != "archived" {
 			writeError(w, http.StatusConflict, errors.New("stop the active agent run before deleting all conversations"))
+			return
+		}
+		if handingOff, err := s.conversationHandoffInProgress(s.runtimeCtx, item.id); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		} else if handingOff {
+			writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
 			return
 		}
 		ids = append(ids, item.id)
@@ -4198,7 +4254,8 @@ func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations cannot be activated"))
 		return
 	}
-	// Activation only updates the compatibility-only last-selected marker.
+	// Activation updates the project-level current conversation shared by every
+	// connected client.
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
 	tx, err := s.db.BeginTx(r.Context(), nil)
@@ -4215,6 +4272,10 @@ func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if conversation.IsCurrent && conversation.Status != "archived" {
+		writeJSON(w, http.StatusOK, conversation)
 		return
 	}
 	// A cleared conversation keeps its native session ID and persisted messages
@@ -4245,6 +4306,16 @@ func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conversation.IsCurrent = true
+	// is_current 是跨端共享的选择。状态事件唤醒桌面端列表，远程事件
+	// 推进手机快照版本并触发其刷新。
+	s.broadcastStateEvent(stEvProjects, conversation.ProjectID)
+	s.broadcastConversationEvent(Event{
+		ID:             uuid.NewString(),
+		ConversationID: conversation.ID,
+		Type:           "conversation.activated",
+		Payload:        mustJSON(map[string]string{"conversationId": conversation.ID, "projectId": conversation.ProjectID}),
+		CreatedAt:      time.Now().UTC(),
+	})
 	writeJSON(w, http.StatusOK, conversation)
 }
 
@@ -4279,6 +4350,13 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 	}
 	if conversation.Status != "idle" {
 		writeError(w, http.StatusConflict, errors.New("stop the active agent run before changing permission mode"))
+		return
+	}
+	if handingOff, err := s.conversationHandoffInProgress(r.Context(), conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if handingOff {
+		writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
 		return
 	}
 	if !s.sessionManager.retireForConfiguration(conversationID) {
@@ -5110,6 +5188,30 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	if conversation.Status == "archived" {
 		return Message{}, "", nil, http.StatusConflict, errors.New("conversation was cleared; start a new conversation from its history")
 	}
+	// Context handoffs deliberately run under a read-only sandbox. They still
+	// use the durable conversation run pipeline, but never inherit a user's
+	// workspace-write or full-control policy merely to summarize prior work.
+	if record != nil && record.Handoff != nil {
+		if conversation.AgentID != "codex" {
+			return Message{}, "", nil, http.StatusConflict, errors.New("context handoff is only supported for Codex conversations")
+		}
+		conversation.ExecutionPolicy = "read_only"
+		conversation.Handoff = true
+	}
+	// Once a handoff has captured its source, accepting another ordinary turn
+	// would let that turn finish between summary generation and archival, where
+	// it would be absent from the new session's working context. The two
+	// internal handoff runs are the only allowed turns until it reaches a
+	// terminal state.
+	if record == nil || record.Handoff == nil {
+		var handingOff bool
+		if err := tx.QueryRowContext(ctx, `select exists(select 1 from conversation_handoffs where source_conversation_id=? and status in ('summarizing','initializing'))`, conversationID).Scan(&handingOff); err != nil {
+			return Message{}, "", nil, http.StatusInternalServerError, err
+		}
+		if handingOff {
+			return Message{}, "", nil, http.StatusConflict, errors.New("context handoff is in progress")
+		}
+	}
 	if conversation.AgentProfileRevisionID == "" && conversation.ProjectAgentRouteRevisionID != "" {
 		var routeMode string
 		if err := tx.QueryRowContext(ctx, `select mode from project_agent_route_revisions where id=?`, conversation.ProjectAgentRouteRevisionID).Scan(&routeMode); err != nil {
@@ -5239,7 +5341,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			return Message{}, "", nil, http.StatusConflict, err
 		}
 	}
-	if conversation.Title == "" || conversation.Title == "新会话" {
+	if (conversation.Title == "" || conversation.Title == "新会话") && (record == nil || record.Handoff == nil) {
 		conversation.Title = conversationTitle(content)
 	}
 	result, updateErr := tx.ExecContext(ctx, `update conversations set status='running',title=?,last_activity_at=? where id=? and (status='idle' or ?=1)`, conversation.Title, m.CreatedAt, conversationID, boolToInt(streaming || queuedNonStreaming))
@@ -5447,13 +5549,40 @@ func (s *Server) acquireProjectWorkspace(projectID, owner string) (func(), bool)
 	return s.acquireWorkspace(projectID, owner)
 }
 
+// acquireGitIndexLock serializes only Git index mutations. It deliberately
+// does not inspect or acquire the project workspace lease, so staging can run
+// while an AI process continues editing the worktree.
+func (s *Server) acquireGitIndexLock(workspaceKey string) (func(), bool) {
+	s.mu.Lock()
+	if s.gitIndexLocks == nil {
+		s.gitIndexLocks = map[string]*sync.Mutex{}
+	}
+	lock := s.gitIndexLocks[workspaceKey]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.gitIndexLocks[workspaceKey] = lock
+	}
+	s.mu.Unlock()
+	if !lock.TryLock() {
+		return nil, false
+	}
+	return lock.Unlock, true
+}
+
 // acquireWorkspace serializes operations against the actual directory they
 // affect. project_shared keeps its historical project ID key; isolated
 // worktrees use their cleaned absolute path and can therefore run in parallel.
 func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
 	s.mu.Lock()
+	if s.gitIndexActive[workspaceKey] && !isAIWorkspaceOwner(owner) {
+		s.mu.Unlock()
+		return nil, false
+	}
 	lease := s.projectWorkspaceLeases[workspaceKey]
-	if lease != nil && lease.owner != owner {
+	// AI runs edit the same directory concurrently, just like independent CLI
+	// sessions. Keep the lease as a shared admission record so Git and other
+	// workspace-mutating operations can still see that AI work is active.
+	if lease != nil && lease.owner != owner && !(isAIWorkspaceOwner(lease.owner) && isAIWorkspaceOwner(owner)) {
 		s.mu.Unlock()
 		return nil, false
 	}
@@ -5470,7 +5599,7 @@ func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			current := s.projectWorkspaceLeases[workspaceKey]
-			if current == nil || current.owner != owner {
+			if current == nil || (current.owner != owner && !(isAIWorkspaceOwner(current.owner) && isAIWorkspaceOwner(owner))) {
 				return
 			}
 			current.holders--
@@ -5810,7 +5939,10 @@ func (s *Server) waitForStreamingSessionExit(managed *activeAgentSession) bool {
 }
 
 func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, profile *AgentRuntimeProfile, runnerID, projectPath, prompt string) {
-	injection := s.prepareMCPInjection(ctx, c.ProjectID, projectPath, c.AgentID, runnerID, runID)
+	injection := mcpInjection{}
+	if !c.Handoff {
+		injection = s.prepareMCPInjection(ctx, c.ProjectID, projectPath, c.AgentID, runnerID, runID)
+	}
 	defer injection.done()
 	s.setMCPAutoApprove(c.ID, injection.AutoApproveTools)
 	defer func() {
@@ -7253,6 +7385,7 @@ func localizedErrorText(err error, fallback string) string {
 		"Claude Code is unavailable or not logged in":                           "Claude Code 不可用或尚未登录。",
 		"conversation is stopping":                                              "会话正在停止，请稍后再试。",
 		"conversation already has a running agent turn":                         "该会话已有正在运行的 AI 任务。",
+		"context handoff is in progress":                                        "上下文交接正在进行中，请等待完成或失败后再发送消息。",
 		"cannot stop a task while this conversation has other queued task runs": "当前会话还有排队的任务，暂时无法单独停止此任务。",
 		"queued task cannot be stopped independently":                           "排队中的任务无法单独停止。",
 		"Git request timed out":                                                 "Git 操作超时，请稍后重试。",

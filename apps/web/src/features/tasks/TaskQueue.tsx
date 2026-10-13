@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
+import { persistTaskQuickDraft, readTaskQuickDraft } from "../../lib/task-quick-draft";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
 type DispatchResult = { message: DispatchedMessage; runId: string };
@@ -63,8 +64,8 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [dispatching, setDispatching] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [quickCreateOpen, setQuickCreateOpen] = useState(false);
-  const [quickDescription, setQuickDescription] = useState("");
+  const [quickCreateOpen, setQuickCreateOpen] = useState(() => Boolean(readTaskQuickDraft(projectID)));
+  const [quickDescription, setQuickDescription] = useState(() => readTaskQuickDraft(projectID));
   const [quickCreating, setQuickCreating] = useState(false);
   const [reviewNote, setReviewNote] = useState("");
   const [reviewingTaskID, setReviewingTaskID] = useState<string | null>(null);
@@ -113,6 +114,19 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     setInlineDetailLoading(false);
     setInlineBusy("");
   }, [conversationID]);
+
+  // 快速创建框是侧栏组件的一部分，切换到项目其它页面时组件会卸载；
+  // 用项目级草稿保存输入，回来时恢复未提交内容。
+  useEffect(() => {
+    const draft = readTaskQuickDraft(projectID);
+    setQuickDescription(draft);
+    setQuickCreateOpen(Boolean(draft));
+  }, [projectID]);
+
+  const updateQuickDescription = (text: string) => {
+    setQuickDescription(text);
+    persistTaskQuickDraft(projectID, text);
+  };
 
   const loadTasks = useCallback(async () => {
     const requestVersion = ++tasksRequestVersion.current;
@@ -299,7 +313,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     });
   };
 
-  const inlineEdit = async (patch: { title: string; description: string; priority: Priority }): Promise<{ ok: boolean; message?: string }> => {
+  const inlineEdit = async (patch: { description: string; priority: Priority }): Promise<{ ok: boolean; message?: string }> => {
     if (!inlineDetail) return { ok: false };
     if (!mountedRef.current) return { ok: false };
     const taskID = inlineDetail.id;
@@ -449,7 +463,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
       // title/description/priority 用刚拉到的最新值回填：PATCH 会无条件重写这三项，
       // 用本地旧快照会把别的端（手机远程页等）刚改的文案覆盖回去。
       const refreshed = latest.find((item) => item.id === taskID) ?? task;
-      const body: Record<string, unknown> = { title: refreshed.title, description: refreshed.description, priority: refreshed.priority };
+      const body: Record<string, unknown> = { description: refreshed.description, priority: refreshed.priority };
       if (position !== null) body.position = position;
       if (unpin) body.pinned = false;
       await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify(body) });
@@ -499,7 +513,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     // 【勿改】这里**不能**回传 t.position：tasks 快照最多可能过期 10s（轮询周期），
     // 期间别的端（手机远程页）拖拽改过的位置会被这个旧值覆盖回去。后端 Position 是指针，
     // 不带该字段就会保留原值，所以"不改 position"必须靠不带，而不是靠回传旧值。
-    const patch = (t: Task, p: boolean) => JSON.stringify({ title: t.title, description: t.description, priority: t.priority, pinned: p });
+    const patch = (t: Task, p: boolean) => JSON.stringify({ description: t.description, priority: t.priority, pinned: p });
     try {
       if (pinned) {
         // 单置顶：点谁谁到第一个，同时取消其它任务原来的置顶。
@@ -525,7 +539,9 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     try {
       // position: 0 是服务端约定的"追加到队列末尾"哨兵值：服务端会把它改写成
       // max(position)+1（见 control-server task.go createTask），所以新建任务恒在队列最后。
-      await request<Task>(`/api/projects/${projectID}/tasks`, { method: "POST", body: JSON.stringify({ title: "", description: quickDescription.trim(), priority: "normal", position: 0 }) });
+      await request<Task>(`/api/projects/${projectID}/tasks`, { method: "POST", body: JSON.stringify({ description: quickDescription.trim(), priority: "normal", position: 0 }) });
+      // 请求成功即代表任务已经创建；即使用户在请求期间切换页面，也不能把旧草稿恢复成重复任务。
+      persistTaskQuickDraft(projectID, "");
       if (!mountedRef.current) return;
       setQuickDescription("");
       setQuickCreateOpen(false);
@@ -541,13 +557,14 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     if (quickCreating) return;
     setQuickCreateOpen(false);
     setQuickDescription("");
+    persistTaskQuickDraft(projectID, "");
   };
 
   return <div className={`task-queue ${mobileOpen ? "mobile-open" : ""}`}>
     <button type="button" className="task-queue-mobile-toggle" aria-expanded={collapsed ? false : mobileOpen} onClick={() => { if (collapsed) onToggleCollapsed?.(); setMobileOpen((open) => !open); }}>任务 <b>{taskCounts.active}</b></button>
     <div className="task-queue-panel">
-      <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions">{taskCounts.awaiting_review > 0 && <button type="button" className="task-queue-review-all" disabled={approvingAll} title="一键验收全部待验收任务" aria-label="一键验收全部待验收任务" onClick={confirmReviewAll}>{approvingAll ? "验收中" : "一键验收"}{!approvingAll && <b>{taskCounts.awaiting_review}</b>}</button>}<button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => { setQuickCreateOpen(true); setQuickDescription(""); }}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button><button type="button" className="task-queue-fold" title={collapsed ? "展开任务队列" : "收起任务队列"} aria-label={collapsed ? "展开任务队列" : "收起任务队列"} aria-expanded={!collapsed} onClick={() => onToggleCollapsed?.()}><TaskQueueFoldIcon /></button></div></header>
-      {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => setQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
+      <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions">{taskCounts.awaiting_review > 0 && <button type="button" className="task-queue-review-all" disabled={approvingAll} title="一键验收全部待验收任务" aria-label="一键验收全部待验收任务" onClick={confirmReviewAll}>{approvingAll ? "验收中" : "一键验收"}{!approvingAll && <b>{taskCounts.awaiting_review}</b>}</button>}<button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => setQuickCreateOpen(true)}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button><button type="button" className="task-queue-fold" title={collapsed ? "展开任务队列" : "收起任务队列"} aria-label={collapsed ? "展开任务队列" : "收起任务队列"} aria-expanded={!collapsed} onClick={() => onToggleCollapsed?.()}><TaskQueueFoldIcon /></button></div></header>
+      {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => updateQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
       <div className="task-queue-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg><input type="search" value={query} placeholder="搜索任务…" aria-label="搜索任务" onChange={(event) => setQuery(event.target.value)} /></div>
       <nav className="task-queue-filters" aria-label="任务筛选">{filters.map((item) => <button type="button" key={item.id} className={filter === item.id ? "active" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<span>{taskCounts[item.id]}</span></button>)}</nav>
       <div className="task-queue-list">{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={(edit = false) => void openInlineDetail(task.id, edit)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} dispatchDisabled={dispatchDisabled} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop} setInlineEditingID={setInlineEditingID}
@@ -573,7 +590,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   </div>;
 }
 
-function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, setInlineEditingID, inlineDetailID, inlineDetail, inlineEditRequestedID, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, deleteTask, inlineEdit, inlineReview, openBoard, confirmTransition, setPinned }: { task: Task; index: number; open: (edit?: boolean) => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; setInlineEditingID: (taskID: string | null) => void; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineEditRequestedID: string | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; deleteTask: (task: Task) => void; inlineEdit: (patch: { title: string; description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void; setPinned: (taskID: string, pinned: boolean) => Promise<void> }) {
+function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, dispatchDisabled, openReview, closeReview, reviewingTaskID, reviewNote, setReviewNote, reviewSubmitting, submitReview, onDrop, setInlineEditingID, inlineDetailID, inlineDetail, inlineEditRequestedID, inlineDetailLoading, inlineBusy, closeInlineDetail, inlineDispatch, inlineTransition, inlineDelete, deleteTask, inlineEdit, inlineReview, openBoard, confirmTransition, setPinned }: { task: Task; index: number; open: (edit?: boolean) => void; confirm: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatch: (event: MouseEvent<HTMLButtonElement>, taskID: string) => Promise<void>; redispatching: boolean; dispatchDisabled: boolean; openReview: (taskID: string) => void; closeReview: () => void; reviewingTaskID: string | null; reviewNote: string; setReviewNote: (value: string) => void; reviewSubmitting: boolean; submitReview: (taskID: string, action: "accept" | "request_changes") => Promise<void>; onDrop: (taskID: string, targetIndex: number) => Promise<void>; setInlineEditingID: (taskID: string | null) => void; inlineDetailID: string | null; inlineDetail: TaskDetail | null; inlineEditRequestedID: string | null; inlineDetailLoading: boolean; inlineBusy: string; closeInlineDetail: () => void; inlineDispatch: () => Promise<void>; inlineTransition: (action: "reopen" | "stop") => Promise<void>; inlineDelete: () => void; deleteTask: (task: Task) => void; inlineEdit: (patch: { description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; inlineReview: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: (taskID?: string) => void; confirmTransition: () => void; setPinned: (taskID: string, pinned: boolean) => Promise<void> }) {
   const [isDragging, setIsDragging] = useState(false);
   const [dragOverPosition, setDragOverPosition] = useState<"before" | "after" | null>(null);
   const [hoverOpen, setHoverOpen] = useState(false);
@@ -802,14 +819,13 @@ function DispatchConfirmation({ task, detail, loading, dispatching, dispatchDisa
   </div>;
 }
 
-function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEditingChange, dispatchDisabled, close, dispatch, transition, deleteTask, edit, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; initialEditing?: boolean; onEditingChange: (editing: boolean) => void; dispatchDisabled: boolean; close: () => void; dispatch: () => Promise<void>; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; edit: (patch: { title: string; description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: () => void }) {
+function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEditingChange, dispatchDisabled, close, dispatch, transition, deleteTask, edit, review, openBoard, confirmTransition }: { detail: TaskDetail | null; loading: boolean; busy: string; initialEditing?: boolean; onEditingChange: (editing: boolean) => void; dispatchDisabled: boolean; close: () => void; dispatch: () => Promise<void>; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; edit: (patch: { description: string; priority: Priority }) => Promise<{ ok: boolean; message?: string }>; review: (action: "accept" | "request_changes", note: string) => Promise<void>; openBoard: () => void; confirmTransition: () => void }) {
   const detailRef = useRef<HTMLDivElement>(null);
   const editActionsRef = useRef<HTMLDivElement>(null);
   const [localReviewNote, setLocalReviewNote] = useState("");
   const [localReviewSubmitting, setLocalReviewSubmitting] = useState(false);
   // 内联编辑态：进入时用当前 detail 快照初始化，保存成功后由父组件刷新 detail 并退出编辑。
   const [editing, setEditing] = useState(initialEditing);
-  const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [editPriority, setEditPriority] = useState<Priority>("normal");
   // 保存失败的错误消息：紧贴保存按钮展示，避免只出现在页面右上角的全局错误横幅
@@ -833,7 +849,6 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
       setEditing(false);
       return;
     }
-    setEditTitle(detail.title);
     setEditDescription(detail.description);
     setEditPriority(detail.priority);
     setSaveError("");
@@ -880,7 +895,6 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
   const canEdit = detail.status === "todo" || detail.status === "action_required";
 
   const startEdit = () => {
-    setEditTitle(detail.title);
     setEditDescription(detail.description);
     setEditPriority(detail.priority);
     setSaveError("");
@@ -890,7 +904,7 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
   const saveEdit = async () => {
     if (editBusy || !mountedRef.current) return;
     if (!editDescription.trim()) return;
-    const result = await edit({ title: editTitle.trim(), description: editDescription.trim(), priority: editPriority });
+    const result = await edit({ description: editDescription.trim(), priority: editPriority });
     // 保存失败时在表单内保留错误信息并保留用户输入，便于查看原因后重试。
     if (!result.ok) {
       if (result.message && mountedRef.current) setSaveError(result.message);
@@ -919,7 +933,6 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
       <button type="button" className="task-inline-close" title="关闭详情" disabled={reviewBusy || editBusy} onClick={close}>x</button>
     </div>
     {editing ? <form className="task-inline-edit-form" onSubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
-      <label className="task-inline-edit-field"><span>任务名称 <small>可选</small></span><input maxLength={120} value={editTitle} disabled={editBusy} onChange={(event) => setEditTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label>
       <label className="task-inline-edit-field"><span>任务说明</span><textarea required maxLength={12000} value={editDescription} disabled={editBusy} onChange={(event) => setEditDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label>
       <label className="task-inline-edit-field task-inline-edit-priority"><span>优先级</span><select value={editPriority} disabled={editBusy} onChange={(event) => setEditPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
       {saveError && <p className="task-inline-edit-error" role="alert">{saveError}</p>}

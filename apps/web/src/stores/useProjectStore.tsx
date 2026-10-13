@@ -14,6 +14,7 @@ import {
 } from "../lib/conversation-draft";
 import { coalesceRefresh } from "../lib/refresh-coalesce";
 import { useUIPreferences } from "./useUIPreferences";
+import { useTransientError } from "../lib/use-transient-error";
 
 interface ProjectContextValue {
   projects: Project[];
@@ -90,7 +91,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const { localPreferences } = useUIPreferences();
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectStatuses, setProjectStatuses] = useState<Record<string, ProjectStatus>>({});
-  const [error, setError] = useState("");
+  const [error, setError] = useTransientError();
   const transientConversationDrafts = useRef<Record<string, string>>({});
   const pendingConversationDrafts = useRef(new Map<string, PendingConversationDraft>());
   const pendingDraftTimers = useRef(new Map<string, number>());

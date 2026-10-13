@@ -22,6 +22,36 @@ import (
 
 const maxCodexDiagnosticBytes = 4 * 1024
 
+// codexTurnCompletion keeps the JSONL reader and process owner coordinated.
+// `codex exec` is one turn per process, so a terminal turn event is authoritative
+// even if a CLI child keeps the inherited output pipes open afterwards.
+type codexTurnCompletion struct {
+	once sync.Once
+	done chan struct{}
+}
+
+func newCodexTurnCompletion() *codexTurnCompletion {
+	return &codexTurnCompletion{done: make(chan struct{})}
+}
+
+func (completion *codexTurnCompletion) finish() {
+	if completion != nil {
+		completion.once.Do(func() { close(completion.done) })
+	}
+}
+
+func (completion *codexTurnCompletion) finished() bool {
+	if completion == nil {
+		return false
+	}
+	select {
+	case <-completion.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // codexExitPrefix 是"Codex CLI 进程异常结束"这类错误的固定前缀。
 // 与 claudeExitPrefix 同理：必须含"失败"才过得了 localizedErrorText 的直通判据
 // （后面必然跟着 Go 的英文退出描述），长度也受同一份 240 字节预算约束。
@@ -254,11 +284,15 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Codex: %w", err)
 	}
+	completion := newCodexTurnCompletion()
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
+		case <-completion.done:
+			// Codex has supplied its terminal event. Do not wait indefinitely for
+			// the CLI wrapper or one of its descendants to close inherited pipes.
 			terminateProcessGroup(cmd)
 			select {
 			case <-done:
@@ -270,10 +304,16 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	}()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, request.ProjectPath) }()
+	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, request.ProjectPath, completion) }()
 	go func() { defer wg.Done(); readCodexStderr(stderr, sink) }()
 	wg.Wait()
-	if err := cmd.Wait(); err != nil {
+	err = cmd.Wait()
+	if completion.finished() {
+		// The expected termination after turn.completed may produce a non-zero
+		// process exit. The completed turn is the user-visible outcome.
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf(codexExitPrefix+"%w", err)
 	}
 	return nil
@@ -667,7 +707,11 @@ func codexSandbox(policy string) (string, error) {
 	}
 }
 
-func readCodexJSONL(reader io.Reader, sink AgentRunSink, projectPath string) {
+func readCodexJSONL(reader io.Reader, sink AgentRunSink, projectPath string, completions ...*codexTurnCompletion) {
+	var completion *codexTurnCompletion
+	if len(completions) > 0 {
+		completion = completions[0]
+	}
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
@@ -708,6 +752,9 @@ func readCodexJSONL(reader io.Reader, sink AgentRunSink, projectPath string) {
 		}
 		if event.Type == "item.completed" && event.Item.Type == "agent_message" && strings.TrimSpace(event.Item.Text) != "" {
 			sink.AssistantText(event.Item.Text, "")
+		}
+		if event.Type == "turn.completed" {
+			completion.finish()
 		}
 	}
 	if err := scanner.Err(); err != nil {

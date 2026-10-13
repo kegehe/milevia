@@ -54,6 +54,7 @@ import { modelList } from "../lib/model-options";
 import { dialogParamURL } from "../lib/dialog-params";
 import { copyToClipboard } from "../lib/clipboard";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
+import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
 import { ExternalLink } from "../components/ExternalLink";
 
@@ -178,8 +179,9 @@ const UserMessageDotsRail = memo(function UserMessageDotsRail({ messages, active
   );
 });
 
-function ComposerActionIcon({ action }: { action: "clear" | "continue" | "send" | "schedule" }) {
+function ComposerActionIcon({ action }: { action: "clear" | "handoff" | "continue" | "send" | "schedule" }) {
   if (action === "clear") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 7 1 12h10l1-12M9 7V4.5h6V7M4.5 7h15M10 11v4.5M14 11v4.5" /></svg>;
+  if (action === "handoff") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7.5h9M11 4.5l3 3-3 3M19 16.5h-9M13 13.5l-3 3 3 3" /></svg>;
   if (action === "continue") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h12M13 7.5l4.5 4.5-4.5 4.5" /></svg>;
   if (action === "schedule") return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2M9.5 4.5v-2M14.5 4.5v-2M4.8 8.5l-1.5-1.5M12 2.5l1.6 1.6" /></svg>;
   return <svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 15 7.2-6.6 2.1-2.1 6.7-6.3-16Z" /><path d="m12.9 13.8 3-3" /></svg>;
@@ -1317,7 +1319,10 @@ export default function ConversationPage() {
   const closeAgentExecution = () => closeDialogParam("execution");
   const closeAiConfig = () => closeDialogParam("config");
   const openUsage = () => openDialogParam("usage");
-  const openNewConversationParam = () => openDialogParam("new");
+  const openNewConversationParam = () => {
+    suppressConversationRestoreRef.current = false;
+    openDialogParam("new");
+  };
   const openAiConfig = () => {
     if (readOnlyConversation) return;
     openDialogParam("config");
@@ -1326,6 +1331,7 @@ export default function ConversationPage() {
 
   // 对话核心状态
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const suppressConversationRestoreRef = useRef(false);
   const [conversationWorkspaces, setConversationWorkspaces] = useState<ConversationWorkspace[]>([]);
   const [conversationWorkspaceLabels, setConversationWorkspaceLabels] = useState<Record<string, string>>({});
   const [archiveWorkspaceID, setArchiveWorkspaceID] = useState("");
@@ -1392,7 +1398,7 @@ export default function ConversationPage() {
   }, [archiveWorkspaceID, conversationWorkspaces]);
 
   const createIsolatedWorkspace = async () => {
-    if (!conversation || workspaceBusy || run || clearing || stopping || readOnlyConversation) return;
+    if (!conversation || workspaceBusy || run || clearing || stopping || handingOff || readOnlyConversation) return;
     setWorkspaceBusy(true);
     try {
       const workspace = await projectApi<ConversationWorkspace>(`/api/conversations/${conversation.id}/workspaces`, { method: "POST" });
@@ -1411,7 +1417,7 @@ export default function ConversationPage() {
   };
 
   const activateWorkspace = async (workspace: ConversationWorkspace) => {
-    if (!conversation || workspaceBusy || workspace.active || run || clearing || stopping || readOnlyConversation) return;
+    if (!conversation || workspaceBusy || workspace.active || run || clearing || stopping || handingOff || readOnlyConversation) return;
     setWorkspaceBusy(true);
     try {
       await projectApi(`/api/conversations/${conversation.id}/workspaces/${workspace.id}/activate`, { method: "POST" });
@@ -1425,7 +1431,7 @@ export default function ConversationPage() {
   };
 
   const archiveWorkspace = async (workspace: ConversationWorkspace) => {
-    if (!conversation || workspaceBusy || workspace.active || workspace.mode !== "isolated_worktree" || run || clearing || stopping || readOnlyConversation) return;
+    if (!conversation || workspaceBusy || workspace.active || workspace.mode !== "isolated_worktree" || run || clearing || stopping || handingOff || readOnlyConversation) return;
     if (!window.confirm(`移除工作区 #${workspace.generation}？仅当没有未提交变更且专用分支已合并时才能移除。该目录和专用分支将被移除，历史运行记录会保留。`)) return;
     setWorkspaceBusy(true);
     try {
@@ -1444,6 +1450,7 @@ export default function ConversationPage() {
   const [run, setRun] = useState("");
   const [sending, setSending] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [handingOff, setHandingOff] = useState(false);
   const [resolving, setResolving] = useState("");
   const [stopping, setStopping] = useState(false);
   const [changingPermission, setChangingPermission] = useState(false);
@@ -1584,6 +1591,7 @@ export default function ConversationPage() {
   const finishedRunIds = useRef(new Set<string>());
   const usageRequestVersion = useRef(0);
   const usageConversationID = useRef<string | null>(null);
+  const usageRefreshInFlight = useRef(false);
   const conversationRef = useRef<Conversation | null>(null);
   conversationRef.current = conversation;
   textRef.current = text;
@@ -1653,13 +1661,53 @@ export default function ConversationPage() {
     return true;
   }, [projectId]);
 
-  const selectConversationTab = useCallback((conversationID: string) => {
+  const selectConversationTab = useCallback(async (conversationID: string, followShared = false) => {
+    if (!projectId || !conversationID) return;
+    suppressConversationRestoreRef.current = false;
+    let makeRoomForSharedConversation = false;
+    const tabs = conversationTabsRef.current;
+    if (!tabs.openConversationIds.includes(conversationID) && tabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS) {
+      if (!followShared) {
+        fail(`每个项目最多同时打开 ${MAX_OPEN_CONVERSATION_TABS} 个会话，请先关闭一个 Tab。`);
+        return;
+      }
+      makeRoomForSharedConversation = true;
+    }
+    try {
+      await projectApi<Conversation>(`/api/conversations/${conversationID}/activate`, { method: "POST" });
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : "无法切换当前会话");
+      return;
+    }
+    if (makeRoomForSharedConversation) {
+      const currentTabs = conversationTabsRef.current;
+      if (!currentTabs.openConversationIds.includes(conversationID) && currentTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS) {
+        // 远端已将它设为共享选择。请求成功后再替换当前标签，避免网络失败
+        // 时本地无故丢失一个标签。
+        const displacedID = currentTabs.activeConversationId || currentTabs.openConversationIds[0];
+        const next = closeConversationTab(currentTabs, displacedID);
+        conversationTabsRef.current = next;
+        writeConversationTabs(projectId, next);
+        setConversationTabs(next);
+      }
+    }
     if (!rememberConversationTab(conversationID)) {
       fail(`每个项目最多同时打开 ${MAX_OPEN_CONVERSATION_TABS} 个会话，请先关闭一个 Tab。`);
       return;
     }
     if (projectId && conversationID !== urlConversationId) navigate(`/projects/${projectId}/conversations/${conversationID}`);
-  }, [fail, navigate, projectId, rememberConversationTab, urlConversationId]);
+  }, [fail, navigate, projectApi, projectId, rememberConversationTab, urlConversationId]);
+
+  // 会话目录每 8 秒与服务端对账一次。isCurrent 代表跨端共享选择，
+  // 因此手机切换后桌面应跟随它，而不能继续停在自己的旧标签页。
+  useEffect(() => {
+    if (!projectId) return;
+    const sharedCurrent = conversationHistory.find((item) => item.isCurrent);
+    // Closing a tab is a local UI decision. The server keeps `isCurrent` for
+    // cross-device selection, so it must not resurrect a tab dismissed here.
+    if (!sharedCurrent || sharedCurrent.id === urlConversationId || readClosedConversationIds(projectId).includes(sharedCurrent.id)) return;
+    void selectConversationTab(sharedCurrent.id, true);
+  }, [conversationHistory, projectId, selectConversationTab, urlConversationId]);
 
   const closeConversationTabFromUI = useCallback((conversationID: string) => {
     if (!projectId) return;
@@ -1668,6 +1716,16 @@ export default function ConversationPage() {
     conversationTabsRef.current = next;
     writeConversationTabs(projectId, next);
     setConversationTabs(next);
+    if (next.openConversationIds.length === 0) {
+      suppressConversationRestoreRef.current = true;
+      setConversation(null);
+      setMessages([]);
+      setEvents([]);
+      setRun("");
+      setUsage(null);
+      setText("");
+      textRef.current = "";
+    }
     if (conversationID !== urlConversationId) return;
     const nextID = next.activeConversationId;
     navigate(nextID ? `/projects/${projectId}/conversations/${nextID}` : `/projects/${projectId}/conversations`);
@@ -1858,6 +1916,24 @@ export default function ConversationPage() {
     return pending;
   }, [projectId, projectApi]);
 
+  // 手机通过中继激活会话后，服务端会广播 projects 失效事件。立即重读目录，
+  // 让桌面跟随共享选择，不必等 8 秒兜底轮询。
+  useLiveStateEventsFor("projects", projectId, useCallback(() => {
+    // 搜索结果不能被后台目录刷新覆盖，但它也不能阻断共享会话跟随；当前会话
+    // 按 isCurrent 排在目录首位，单独读取后直接切换即可。
+    if (projectId) {
+      void projectApi<ConversationHistoryPage>(`/api/projects/${projectId}/conversations?limit=1`)
+        .then((page) => {
+          const sharedCurrent = page.items.find((item) => item.isCurrent);
+          if (sharedCurrent && sharedCurrent.id !== urlConversationId && !readClosedConversationIds(projectId || "").includes(sharedCurrent.id)) {
+            void selectConversationTab(sharedCurrent.id, true);
+          }
+        })
+        .catch(() => undefined);
+    }
+    if (!historyQuery.trim()) void requestConversationHistory("", "", false, true).catch(() => undefined);
+  }, [historyQuery, projectApi, projectId, requestConversationHistory, selectConversationTab, urlConversationId]));
+
   const refreshConversationHistory = useCallback(async () => {
     setHistoryQuery("");
     return requestConversationHistory("");
@@ -1958,6 +2034,30 @@ export default function ConversationPage() {
     setUsage(null);
   }, [conversation?.id]);
 
+  // WebSocket 事件是主要刷新路径；运行中再保留一个低频兜底，避免事件
+  // 丢失或 CLI 长时间不发事件时，底部上下文状态停在旧快照。
+  useEffect(() => {
+    if (!documentVisible || !run || !conversation?.id) return undefined;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled || usageRefreshInFlight.current) return;
+      usageRefreshInFlight.current = true;
+      try {
+        await refreshUsage();
+      } catch {
+        // WebSocket 刷新路径负责报告错误；兜底轮询失败时静默等待下一次。
+      } finally {
+        usageRefreshInFlight.current = false;
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => { void tick(); }, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [conversation?.id, documentVisible, refreshUsage, run]);
+
   // 加载或创建对话
   useEffect(() => {
     if (!projectId || conversationTransitionRef.current) return;
@@ -1966,6 +2066,16 @@ export default function ConversationPage() {
     const isCurrentRoute = () => !cancelled && !conversationTransitionRef.current;
     async function loadConversation() {
       try {
+        if (!urlConversationId && suppressConversationRestoreRef.current) {
+          setConversation(null);
+          setMessages([]);
+          setEvents([]);
+          setRun("");
+          setUsage(null);
+          setText("");
+          textRef.current = "";
+          return;
+        }
         // 直接链接必须按 ID 查询，不能依赖历史列表的当前分页结果。
 		if (urlConversationId) {
 			let detail = await projectApi<{ conversation: Conversation & { projectId: string } }>(`/api/conversations/${urlConversationId}?limit=1`, { signal: abort.signal });
@@ -2015,9 +2125,25 @@ export default function ConversationPage() {
         const restoredID = conversationTabsRef.current.activeConversationId;
         const restored = restoredID ? list.find((item) => item.id === restoredID) : undefined;
         const closed = new Set(readClosedConversationIds(projectId || ""));
-        const next = restored || list.find((item) => !closed.has(item.id)) || await projectApi<Conversation>(`/api/projects/${projectId}/conversations`, { method: "POST" });
+        // If every historical conversation was deliberately closed, keep the
+        // workspace empty. Creating one here would immediately resurrect the
+        // last tab the user just closed. A brand-new conversation is created
+        // only when the project has no history at all or when the user clicks
+        // the explicit new-conversation action.
+        const next = restored || list.find((item) => !closed.has(item.id)) || (list.length === 0
+          ? await projectApi<Conversation>(`/api/projects/${projectId}/conversations`, { method: "POST" })
+          : null);
         if (!cancelled && !conversationTransitionRef.current) {
           setConversation(next);
+          if (!next) {
+            setMessages([]);
+            setEvents([]);
+            setRun("");
+            setUsage(null);
+            setText("");
+            textRef.current = "";
+            return;
+          }
           if (list.length === 0) setConversationHistory([next]);
           // 更新 URL 到当前对话。恢复会话只是"把 URL 补全成当前会话"，不是"重置页面状态"：
           // 走 conversationURL 把弹窗参数原样带过去，否则刚打开的历史弹窗会被这次 replace
@@ -2732,7 +2858,7 @@ export default function ConversationPage() {
   const sendContent = async (rawContent: string, clearDraft = true, options: { restoreOnFailure?: boolean; notifyFailure?: boolean; clientRequestId?: string; skillRefs?: Skill[] } = {}): Promise<boolean> => {
     const { restoreOnFailure = true, notifyFailure = true } = options;
     const refs = options.skillRefs ?? [];
-    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return false;
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || handingOff || shortcutBusy || changingModel) return false;
     // draft = 用户在输入框里写的正文；content = 加上技能引用后真正上线的文本。
     // 所有"写回输入框"的路径只能用 draft：否则一次发送失败就会把整段技能描述重新灌回输入框，
     // 又回到"输入框被技能描述铺满"的老问题。
@@ -2806,6 +2932,7 @@ export default function ConversationPage() {
 
   const send = (event: FormEvent) => {
     event.preventDefault();
+    if (changingModel) return;
     setShowSendMenu(false);
     void sendContent(text, true, { skillRefs });
   };
@@ -2816,7 +2943,7 @@ export default function ConversationPage() {
     const content = text.trim();
     // 只有技能引用、没有正文时同样可以预约（与"点技能后直接发送"一致）。
     if ((!content && skillRefs.length === 0) || !conversation) return;
-    if (sending || clearing || stopping || shortcutBusy) return;
+    if (sending || clearing || stopping || handingOff || shortcutBusy || changingModel) return;
     setShowSendMenu(false);
     pendingSendRef.current = content;
     pendingSendSkillRefsRef.current = skillRefs;
@@ -2869,6 +2996,7 @@ export default function ConversationPage() {
 
   // 真正发出预约内容。仅在“空闲刚成立”的延迟触发中被调用，随后清理预约状态。
   const fireScheduledSend = useCallback(async (): Promise<boolean> => {
+    if (changingModel) return false;
     const conversationID = pendingSendConversationRef.current;
     // `?? ""`：预约里可能只有技能引用、正文是空串，甚至 pendingSendRef 已被取消清成 null。
     // 归一成字符串之后，下面"预约是否还是同一条"的比较仍然成立（null !== "" 就是"已被取消"）。
@@ -2878,7 +3006,7 @@ export default function ConversationPage() {
     // draft 为空但带着技能引用，同样是一条可发的消息（点技能就能发）。
     if (!conversationID || (!draft && refs.length === 0) || !clientRequestId) return false;
     if (readOnlyConversation) return false; // 会话变为只读（编排/readonly）时不能发送，保留预约不丢失
-    if (sending || clearing || stopping || shortcutBusy) return false;
+    if (sending || clearing || stopping || handingOff || shortcutBusy) return false;
     if (conversationRef.current?.id !== conversationID) return false; // 切换会话后不越界发送
     if (!isConversationIdle()) return false; // 延迟期间又有了新的运行，继续等待
     // 自动发送可能撞上瞬时的后端拒绝（工作区被并发的 insight 扫描 / Git 操作占用、
@@ -2913,7 +3041,7 @@ export default function ConversationPage() {
       await new Promise((resolve) => setTimeout(resolve, backoff[attempt]));
     }
     return true;
-  }, [clearing, isConversationIdle, readOnlyConversation, sending, shortcutBusy, stopping]);
+  }, [changingModel, clearing, handingOff, isConversationIdle, readOnlyConversation, sending, shortcutBusy, stopping]);
 
   const fireScheduledSendRef = useRef(fireScheduledSend);
   fireScheduledSendRef.current = fireScheduledSend;
@@ -2925,6 +3053,14 @@ export default function ConversationPage() {
   // 立即 POST 可能撞上瞬时 4xx，被 sendContent 的失败回退写回输入框。
   // 延迟后再重查空闲仍成立才发送，显著降低这类竞态。
   useEffect(() => {
+    if (changingModel) {
+      if (scheduledSendTimerRef.current != null) {
+        window.clearTimeout(scheduledSendTimerRef.current);
+        scheduledSendTimerRef.current = null;
+      }
+      wasScheduledIdleRef.current = false;
+      return;
+    }
     if (!pendingSendRef.current) {
       if (scheduledSendTimerRef.current != null) {
         window.clearTimeout(scheduledSendTimerRef.current);
@@ -2958,14 +3094,14 @@ export default function ConversationPage() {
     // 注意：不要把 sendContent 加进依赖。它每次渲染都重建（非 useCallback），
     // 且本 effect 只通过 fireScheduledSendRef 间接调用它，加了会让此 effect 每
     // 次渲染都跑一遍，白白重复 idle 判定。
-  }, [isConversationIdle, pendingSendContent, clearing, readOnlyConversation, sending, shortcutBusy, stopping]);
+  }, [changingModel, isConversationIdle, pendingSendContent, clearing, readOnlyConversation, sending, shortcutBusy, stopping]);
 
   useEffect(() => () => {
     if (scheduledSendTimerRef.current != null) window.clearTimeout(scheduledSendTimerRef.current);
   }, []);
 
   const runShortcut = async (shortcut: Shortcut, variables: Record<string, string> = {}, variablesReady = false) => {
-    if (!conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || handingOff || shortcutBusy || changingModel) return;
     const required = requiredShortcutVariables(shortcut.template);
     if (!variablesReady && required.length) { setShortcutVariables({ shortcut, variables }); return; }
     if (shortcut.defaultAction === "fill") {
@@ -3004,7 +3140,7 @@ export default function ConversationPage() {
   };
 
   const newConversation = async (agentId: AgentID, permissionMode: PermissionMode, profileID?: string) => {
-    if (conversationTransitionRef.current || sending || clearing || stopping || shortcutBusy || workspaceBusy || !projectId) { closeNewConversation(); return; }
+    if (conversationTransitionRef.current || sending || clearing || stopping || handingOff || shortcutBusy || workspaceBusy || !projectId) { closeNewConversation(); return; }
     if (conversationTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS) {
       closeNewConversation();
       fail(`每个项目最多同时打开 ${MAX_OPEN_CONVERSATION_TABS} 个会话，请先关闭一个 Tab。`);
@@ -3025,7 +3161,7 @@ export default function ConversationPage() {
   };
 
   const clearConversationContext = () => {
-    if (conversationTransitionRef.current || !conversation || readOnlyConversation || sending || clearing || stopping || shortcutBusy) return;
+    if (conversationTransitionRef.current || !conversation || readOnlyConversation || sending || clearing || stopping || handingOff || shortcutBusy) return;
     if (run) {
       // 运行中时先停止，再关闭当前会话并新建一个会话。
       pendingConfirmBusyRef.current = false;
@@ -3071,6 +3207,38 @@ export default function ConversationPage() {
       },
       onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
     });
+  };
+
+  const handoffConversationContext = async () => {
+    if (!conversation || conversation.agentId !== "codex" || readOnlyConversation || sending || clearing || stopping || shortcutBusy || handingOff) return;
+    const conversationID = conversation.id;
+    const routeVersion = conversationRouteVersion.current;
+    const routeConversationID = urlConversationId;
+    const handoffStillOwnsView = () =>
+      conversationRef.current?.id === conversationID &&
+      conversationRouteVersion.current === routeVersion &&
+      (!routeConversationID || routeConversationID === conversationID);
+    setHandingOff(true);
+    try {
+      const handoff = await projectApi<{ id: string; status: string; targetConversationId?: string }>(`/api/conversations/${conversation.id}/handoff`, { method: "POST" });
+      for (let attempt = 0; attempt < 180; attempt++) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        if (!handoffStillOwnsView()) return;
+        const current = await projectApi<{ status: string; targetConversationId?: string; errorMessage?: string }>(`/api/conversation-handoffs/${handoff.id}`);
+        if (current.status === "failed") throw new Error(current.errorMessage || "上下文交接失败");
+        if (current.status !== "completed" || !current.targetConversationId) continue;
+        const detail = await projectApi<{ conversation: Conversation }>(`/api/conversations/${current.targetConversationId}?limit=1`);
+        if (!handoffStillOwnsView()) return;
+        replaceConversationTab(conversationID, detail.conversation.id);
+        resetConversationView(detail.conversation);
+        if (projectId) navigate(`/projects/${projectId}/conversations/${detail.conversation.id}`, { replace: true });
+        void refreshConversationHistory();
+        return;
+      }
+      throw new Error("上下文交接超时，请稍后从历史会话重试");
+    } catch (cause) {
+      if (handoffStillOwnsView()) fail(cause instanceof Error ? cause.message : "上下文交接失败");
+    } finally { setHandingOff(false); }
   };
 
   const stopAndClear = async () => {
@@ -3120,7 +3288,7 @@ export default function ConversationPage() {
   };
   stopAndClearRef.current = stopAndClear;
 
-  const clearCurrentConversation = async (skipRunGuard = false) => {
+    const clearCurrentConversation = async (skipRunGuard = false) => {
     if (conversationTransitionRef.current || !conversation || sending || clearing || shortcutBusy || (!skipRunGuard && run)) return;
     // 用户主动关闭会话并新建：清空预约状态，让预约内容随之作废。
     // 这里不清写回输入框——resetConversationView 会用新会话草稿重置输入框，写回会被覆盖。
@@ -3184,7 +3352,9 @@ export default function ConversationPage() {
   };
 
   const activateConversation = async (item: Conversation) => {
-    if (!conversation || item.id === conversation.id || item.isOrchestration) { closeHistory(); return; }
+    // The workspace may be intentionally empty after its last tab was closed;
+    // opening a history item must still be allowed in that state.
+    if (item.id === conversation?.id || item.isOrchestration) { closeHistory(); return; }
     if (sending || clearing || stopping || shortcutBusy) { closeHistory(); return; }
 	    if (!conversationTabs.openConversationIds.includes(item.id) && conversationTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS) {
 	      closeHistory();
@@ -3300,7 +3470,7 @@ export default function ConversationPage() {
   // 切换会话级模型：写 conversations.model_override。服务端会退役按旧模型启动的长驻会话，
   // 下一条消息带新 --model --resume 重启，因此这里与权限切换同样只在空闲时放行。
   const selectConversationModel = async (model: string): Promise<boolean> => {
-    if (!conversation || readOnlyConversation || (conversation.modelOverride || "") === model || run || clearing || stopping) return false;
+    if (!conversation || readOnlyConversation || (conversation.modelOverride || "") === model || run || clearing || stopping || handingOff) return false;
     const conversationID = conversation.id;
     setChangingModel(true);
     try {
@@ -3317,7 +3487,7 @@ export default function ConversationPage() {
   };
 
   const changePermissionMode = async (permissionMode: PermissionMode) => {
-    if (!conversation || readOnlyConversation || conversation.permissionMode === permissionMode || run || clearing || stopping) return;
+    if (!conversation || readOnlyConversation || conversation.permissionMode === permissionMode || run || clearing || stopping || handingOff) return;
     if (permissionMode === "full_control") { setShowPermissionMenu(false); setShowFullControlConfirmation(true); return; }
     const conversationID = conversation.id;
     setChangingPermission(true);
@@ -3332,7 +3502,7 @@ export default function ConversationPage() {
   };
 
   const confirmFullControl = async () => {
-    if (!conversation || run || clearing || stopping) return;
+    if (!conversation || run || clearing || stopping || handingOff) return;
     const conversationID = conversation.id;
     setChangingPermission(true);
     try {
@@ -3368,7 +3538,7 @@ export default function ConversationPage() {
   };
 
   const stopRun = async () => {
-    if (!conversation || readOnlyConversation || !run || stopping) return;
+    if (!conversation || readOnlyConversation || !run || stopping || handingOff) return;
     const conversationID = conversation.id;
     const routeVersion = conversationRouteVersion.current;
     const runID = run;
@@ -3543,7 +3713,7 @@ export default function ConversationPage() {
       : warn
         ? `${shortcut.template}\n\n当前 CLI 的命令目录里没有这条命令，执行后可能只会得到一句 Unknown command`
         : shortcut.enabled ? shortcut.template : `${shortcut.template}\n\n${shortcut.name}已停用`;
-    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}${blocked ? " blocked" : ""}${warn ? " stale" : ""}`} key={shortcut.id}><button type="button" disabled={readOnlyConversation || !shortcut.enabled || !conversation || blocked || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => { beforeRun?.(); void runShortcut(shortcut); }} title={title}><span className="quick-tag-text">{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</span>{(blocked || warn) && <span className="quick-tag-warn" aria-hidden="true">!</span>}</button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} aria-label={`编辑 ${shortcut.name}`} disabled={readOnlyConversation || clearing || Boolean(shortcutBusy)} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: shortcut.kind, shortcut }); }}><ShortcutMoreIcon /></button></div>;
+    return <div className={`quick-tag ${shortcut.enabled ? "" : "disabled"}${kind === "command_request" ? " command-tag" : ""}${blocked ? " blocked" : ""}${warn ? " stale" : ""}`} key={shortcut.id}><button type="button" disabled={readOnlyConversation || !shortcut.enabled || !conversation || blocked || sending || clearing || stopping || handingOff || Boolean(shortcutBusy)} onClick={() => { beforeRun?.(); void runShortcut(shortcut); }} title={title}><span className="quick-tag-text">{shortcutBusy === shortcut.id ? "发送中" : shortcut.name}</span>{(blocked || warn) && <span className="quick-tag-warn" aria-hidden="true">!</span>}</button><button type="button" className="quick-tag-edit" title={`编辑 ${shortcut.name}`} aria-label={`编辑 ${shortcut.name}`} disabled={readOnlyConversation || clearing || handingOff || Boolean(shortcutBusy)} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: shortcut.kind, shortcut }); }}><ShortcutMoreIcon /></button></div>;
   };
 
   const reorderKind = useCallback(async (kind: SortableShortcutKind, orderedIDs: string[]) => {
@@ -3617,7 +3787,7 @@ export default function ConversationPage() {
               </button>
               {!groupCollapsed && <ul className="quick-tag-list">{group.map((skill) => (
                 <li key={skill.name} className="quick-tag-item skill-item">
-                  <button type="button" className="skill-tag" disabled={readOnlyConversation || !conversation || sending || clearing || stopping || Boolean(shortcutBusy)} data-tooltip-title={skill.name} data-tooltip-desc={truncateSkillDescription(skill.description, skill.name)} onClick={() => useSkill(skill)}>
+                  <button type="button" className="skill-tag" disabled={readOnlyConversation || !conversation || sending || clearing || stopping || handingOff || Boolean(shortcutBusy)} data-tooltip-title={skill.name} data-tooltip-desc={truncateSkillDescription(skill.description, skill.name)} onClick={() => useSkill(skill)}>
                     <span className="skill-tag-text">{skill.name}</span>
                   </button>
                 </li>
@@ -3638,15 +3808,15 @@ export default function ConversationPage() {
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
         <div className="head-actions">
           <button className="conversation-head-action secondary" type="button" disabled={sending} onClick={openConversationHistory}><HistoryIcon /><span>历史</span></button>
-          {conversationWorkspaces.length > 0 && <label className="conversation-workspace-picker"><span>工作区</span><select aria-label="会话工作区" value={conversationWorkspaces.find((item) => item.active)?.id || ""} disabled={workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onChange={(event) => { const selected = conversationWorkspaces.find((item) => item.id === event.target.value); if (selected) void activateWorkspace(selected); }}><option value="" disabled>选择工作区</option>{conversationWorkspaces.filter((item) => item.state === "ready").map((item) => <option key={item.id} value={item.id}>{item.mode === "isolated_worktree" ? `工作区 #${item.generation}` : "项目工作区"}</option>)}</select></label>}
-          <button className="conversation-head-action secondary workspace-create-action" type="button" disabled={workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onClick={() => void createIsolatedWorkspace()} title="创建会话级 Git 工作区"><span>{workspaceBusy ? "处理中" : "新建工作区"}</span></button>
-          {conversationWorkspaces.some((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active) && <><label className="conversation-workspace-picker workspace-remove-picker"><span>移除目标</span><select aria-label="移除工作区" value={archiveWorkspaceID} disabled={workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onChange={(event) => setArchiveWorkspaceID(event.target.value)}>{conversationWorkspaces.filter((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active).map((item) => <option key={item.id} value={item.id}>工作区 #{item.generation}</option>)}</select></label><button className="conversation-head-action secondary workspace-remove-action" type="button" disabled={!archiveWorkspaceID || workspaceBusy || Boolean(run) || clearing || stopping || readOnlyConversation} onClick={() => { const workspace = conversationWorkspaces.find((item) => item.id === archiveWorkspaceID); if (workspace) void archiveWorkspace(workspace); }} title="移除选中的闲置工作区"><span>移除工作区</span></button></>}
+          {conversationWorkspaces.length > 0 && <label className="conversation-workspace-picker"><span>工作区</span><select aria-label="会话工作区" value={conversationWorkspaces.find((item) => item.active)?.id || ""} disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => { const selected = conversationWorkspaces.find((item) => item.id === event.target.value); if (selected) void activateWorkspace(selected); }}><option value="" disabled>选择工作区</option>{conversationWorkspaces.filter((item) => item.state === "ready").map((item) => <option key={item.id} value={item.id}>{item.mode === "isolated_worktree" ? `工作区 #${item.generation}` : "项目工作区"}</option>)}</select></label>}
+          <button className="conversation-head-action secondary workspace-create-action" type="button" disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => void createIsolatedWorkspace()} title="创建会话级 Git 工作区"><span>{workspaceBusy ? "处理中" : "新建工作区"}</span></button>
+          {conversationWorkspaces.some((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active) && <><label className="conversation-workspace-picker workspace-remove-picker"><span>移除目标</span><select aria-label="移除工作区" value={archiveWorkspaceID} disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => setArchiveWorkspaceID(event.target.value)}>{conversationWorkspaces.filter((item) => item.mode === "isolated_worktree" && item.state === "ready").map((item) => <option key={item.id} value={item.id}>工作区 #{item.generation}</option>)}</select></label><button className="conversation-head-action secondary workspace-remove-action" type="button" disabled={!archiveWorkspaceID || workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => { const workspace = conversationWorkspaces.find((item) => item.id === archiveWorkspaceID); if (workspace) void archiveWorkspace(workspace); }} title="移除选中的闲置工作区"><span>移除工作区</span></button></>}
           <button className="conversation-head-action secondary" type="button" disabled={readOnlyConversation} onClick={openAiConfig}><ProjectConfigIcon /><span>AI 配置</span></button>
           <div className="permission-menu">
-          <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} type="button" aria-haspopup="menu" aria-expanded={showPermissionMenu} disabled={readOnlyConversation || !!run || clearing || stopping || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}><PermissionModeIcon /><span>{permissionLabel}</span></button>
+          <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} type="button" aria-haspopup="menu" aria-expanded={showPermissionMenu} disabled={readOnlyConversation || !!run || clearing || stopping || handingOff || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}><PermissionModeIcon /><span>{permissionLabel}</span></button>
             {showPermissionMenu && <div className="permission-popover" role="menu">{agentPermissionModes(conversation?.agentId || "").map((mode) => <button key={mode} className={conversation?.permissionMode === mode ? (mode === "full_control" ? "selected full" : "selected") : ""} onClick={() => void changePermissionMode(mode)}><b>{permissionCopy[mode].title}</b><span>{permissionCopy[mode].detail}</span></button>)}</div>}
           </div>
-          <button className="conversation-head-action new-conversation-action primary" type="button" disabled={readOnlyConversation || sending || stopping || conversationTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS} onClick={openNewConversationParam}><NewConversationIcon /><span>新会话</span></button>
+          <button className="conversation-head-action new-conversation-action primary" type="button" disabled={readOnlyConversation || sending || stopping || handingOff || conversationTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS} onClick={openNewConversationParam}><NewConversationIcon /><span>新会话</span></button>
         </div>
       </div>, document.querySelector('.head-actions-slot') || document.body)}
     {/* 对话面板：快捷方式、对话内容和任务队列 */}
@@ -3685,11 +3855,12 @@ export default function ConversationPage() {
         <button type="button" className={`scroll-btn scroll-to-bottom${hasNewContent ? " pulse" : ""}`} title="回到底部" aria-label="回到底部" onClick={() => scrollToBottomNextFrame("auto")}><ScrollNavigationIcon direction="bottom" /></button>
       </div>
       <form ref={composerRef} className={`composer${pendingApproval ? " has-approval" : ""}${isEmptyConversation ? " empty-session" : ""}`} onSubmit={(event) => void send(event)}>
+        <fieldset className="composer-model-switch-lock" disabled={changingModel}>
         {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
         {skillRefs.length > 0 && <div className="composer-skill-refs" role="group" aria-label="已引用的技能">
           {skillRefs.map((skill) => <span className="composer-skill-ref" key={`${skill.source}-${skill.name}`}>
             <span className="composer-skill-ref-name" title={truncateSkillDescription(skill.description, skill.name) || skill.name}><SkillTagIcon /><span>{skill.name}</span></span>
-            <button type="button" className="composer-skill-ref-remove" title={`移除技能 ${skill.name}`} aria-label={`移除技能 ${skill.name}`} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => removeSkillRef(skill)}>×</button>
+            <button type="button" className="composer-skill-ref-remove" title={`移除技能 ${skill.name}`} aria-label={`移除技能 ${skill.name}`} disabled={readOnlyConversation || sending || clearing || stopping || handingOff || Boolean(shortcutBusy)} onClick={() => removeSkillRef(skill)}>×</button>
           </span>)}
         </div>}
         {composerSlashHint && <div className="composer-slash-hint" role="status">
@@ -3698,20 +3869,21 @@ export default function ConversationPage() {
         </div>}
         <div className="composer-input-area">
           {inputHistoryPosition !== null && inputHistory.length > 0 && <span className="composer-history-position" role="status" aria-label={`输入历史第 ${inputHistoryPosition} 条，共 ${inputHistory.length} 条`}>{inputHistoryPosition}/{inputHistory.length}</span>}
-          <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} />
-          <button className={`composer-mobile-shortcut-toggle${showMobileShortcuts ? " open" : ""}`} type="button" title="快捷操作" aria-label="快捷操作" aria-controls="mobile-shortcut-menu" aria-expanded={showMobileShortcuts} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowMobileShortcuts((open) => !open)}><ComposerShortcutIcon /></button>
+      <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || handingOff || changingModel || Boolean(shortcutBusy)} />
+          <button className={`composer-mobile-shortcut-toggle${showMobileShortcuts ? " open" : ""}`} type="button" title="快捷操作" aria-label="快捷操作" aria-controls="mobile-shortcut-menu" aria-expanded={showMobileShortcuts} disabled={readOnlyConversation || sending || clearing || stopping || handingOff || Boolean(shortcutBusy)} onClick={() => setShowMobileShortcuts((open) => !open)}><ComposerShortcutIcon /></button>
         </div>
         {showMobileShortcuts && <section className="mobile-shortcut-menu" id="mobile-shortcut-menu" aria-label="快捷操作">
           <div className="quick-tag-group"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span><b className="quick-tag-count">{promptShortcuts.length}</b></span><button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "prompt" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderMobilePromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "command_request" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderMobileCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           {renderSkillGroup()}
         </section>}
-        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} conversationID={conversation?.id || ""} modelOverride={conversation?.modelOverride || ""} onSelectModel={selectConversationModel} changingModel={changingModel} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} onModelFail={fail} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button><button className="secondary composer-action composer-continue" type="button" disabled={readOnlyConversation || sending || clearing || stopping} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy)}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {activeAgentName}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy)} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
+        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} conversationID={conversation?.id || ""} modelOverride={conversation?.modelOverride || ""} onSelectModel={selectConversationModel} changingModel={changingModel} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} onModelFail={fail} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button>{conversation?.agentId === "codex" && <button className="secondary composer-action composer-handoff" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => { pendingConfirmBusyRef.current = false; setPendingConfirmBusy(false); setPendingConfirm({ title: "压缩并新建会话", message: "将生成只读上下文摘要，并用它初始化新的 Codex 会话。当前会话会保留在历史中。", confirmLabel: "开始交接", className: "conversation-clear-dialog", onConfirm: () => { setPendingConfirm(null); void handoffConversationContext(); }, onCancel: () => setPendingConfirm(null) }); }}><ComposerActionIcon action="handoff" /><span>{handingOff ? "交接中" : "压缩"}</span></button>}<button className="secondary composer-action composer-continue" type="button" disabled={readOnlyConversation || sending || clearing || stopping || handingOff} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {activeAgentName}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
         {pendingSendContent !== null && <div className="composer-pending"><span className="composer-pending-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2" /></svg></span><span className="composer-pending-text"><b>已预约发送</b><small>{run ? "等待当前任务完成..." : "等待子代理完成..."}<span className="composer-pending-preview">{pendingSendContent ? (pendingSendContent.length > 40 ? `${pendingSendContent.slice(0, 40)}…` : pendingSendContent) : "已引用的技能"}</span></small></span><button className="composer-pending-cancel" type="button" title="撤回预约并带回输入框" onClick={cancelScheduledSend}>取消</button></div>}
+        </fieldset>
       </form>
       </section>
       {!readOnlyConversation && <aside className="task-queue-rail" aria-label="任务队列" data-collapsed={conversationPanels.taskQueue ? "true" : undefined}>
-        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} collapsed={conversationPanels.taskQueue} onToggleCollapsed={() => toggleConversationPanel("taskQueue")} />
+        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || handingOff || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} collapsed={conversationPanels.taskQueue} onToggleCollapsed={() => toggleConversationPanel("taskQueue")} />
       </aside>}
     </section>
     {showNewConversation && <NewConversationDialog runnerID={project.runner} defaults={appPreferences} defaultsLoading={appPreferencesLoading} defaultsError={appPreferencesError} close={closeNewConversation} create={newConversation} />}

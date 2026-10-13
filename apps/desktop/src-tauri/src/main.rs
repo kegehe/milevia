@@ -356,6 +356,9 @@ fn build_updater(
             move || {
                 stop_agent(&app);
                 stop_sidecar(&app);
+                // `on_before_exit` 会替换 updater 插件默认注册的清理回调。
+                // 安装器接着会启动新版本，因此必须先释放旧进程的托盘与窗口资源。
+                app.cleanup_before_exit();
             }
         })
         .build()

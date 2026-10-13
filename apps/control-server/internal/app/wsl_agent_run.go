@@ -191,7 +191,7 @@ func (r *wslAgentRunner) wslNativeCommand(ctx context.Context, cli string, args 
 	for _, a := range args {
 		tokens = append(tokens, wslInnerToken(a))
 	}
-	script := wslPathPrefix()
+	script := r.wslPathPrefix()
 	if linuxWorkDir != "" {
 		script += "; cd " + wslInnerToken(linuxWorkDir)
 	}
@@ -360,11 +360,13 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 		return fmt.Errorf("start Codex (wsl): %w", err)
 	}
 
+	completion := newCodexTurnCompletion()
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
+		case <-completion.done:
 			terminateProcessGroup(cmd)
 			select {
 			case <-done:
@@ -379,10 +381,14 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	wg.Add(2)
 	// projectPath 传空：codex 的 file_change 富化（git diff/读文件）只在本地 OS 侧做，
 	// wsl-local 项目文件位于 WSL 内，Windows 进程读 Linux 路径会失败，故跳过（同 SSH）。
-	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, "") }()
+	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, "", completion) }()
 	go func() { defer wg.Done(); readCodexStderr(stderr, sink) }()
 	wg.Wait()
-	if err := cmd.Wait(); err != nil {
+	err = cmd.Wait()
+	if completion.finished() {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf(codexExitPrefix+"%w", err)
 	}
 	return nil

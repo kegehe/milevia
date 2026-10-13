@@ -373,6 +373,13 @@ func (s *Server) setConversationModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("请先停止当前任务，再切换模型"))
 		return
 	}
+	if handingOff, err := s.conversationHandoffInProgress(r.Context(), conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if handingOff {
+		writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
+		return
+	}
 	// 模型是长驻进程的启动参数，改配置前必须让旧进程退役。retireForConfiguration 在
 	// 「刚发起退役」与「退不掉」（例如有审批挂起）两种情况下都返回 false（其注释写明调用方
 	// 应在 watcher 清理后重试），所以这里等它真正从 s.sessions 消失再落库——否则用户点一次

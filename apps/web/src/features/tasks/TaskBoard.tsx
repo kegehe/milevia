@@ -325,7 +325,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
         fail("任务顺序数据异常，已重新同步，请再试一次");
         return;
       }
-      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: refreshed.title, description: refreshed.description, priority: refreshed.priority, position }) });
+      await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ description: refreshed.description, priority: refreshed.priority, position }) });
       if (!mountedRef.current) return;
       await refresh(task.id);
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
@@ -364,10 +364,9 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
           fail("任务顺序数据异常，已重新同步，请再试一次");
           return;
         }
-        // title/description/priority 用最新的值回填：PATCH 会无条件重写这三项，
-        // 用本地旧快照会把别的端刚改的文案覆盖回去。
+        // 用服务端最新说明和优先级提交，避免把别的端刚修改的内容覆盖回去。
         const refreshed = latest.find((item) => item.id === taskID) ?? task;
-        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: refreshed.title, description: refreshed.description, priority: refreshed.priority, position: newPosition }) });
+        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ description: refreshed.description, priority: refreshed.priority, position: newPosition }) });
         if (!mountedRef.current) return;
         await refresh();
       } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法调整任务顺序"); }
@@ -398,7 +397,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
           }
           newPosition = computed;
         }
-        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ title: refreshed.title, description: refreshed.description, priority: refreshed.priority, position: newPosition, status: targetStatus }) });
+        await request(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ description: refreshed.description, priority: refreshed.priority, position: newPosition, status: targetStatus }) });
         if (!mountedRef.current) return;
         await refresh();
       } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法移动任务"); }
@@ -701,7 +700,6 @@ function StatusBadge({ task }: { task: Task }) {
 }
 
 function TaskEditor({ projectID, task, request, close, saved, fail }: { projectID: string; task?: Task; tasks?: Task[]; request: Request; close: () => void; saved: (taskID: string) => Promise<void>; fail: (message: string) => void }) {
-  const [title, setTitle] = useState(task?.title || "");
   const [description, setDescription] = useState(task?.description || "");
   const [priority, setPriority] = useState<Priority>(task?.priority || "normal");
   const [busy, setBusy] = useState(false);
@@ -719,14 +717,14 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
       // 编辑：**不带** position —— 后端 Position 为指针，缺省即保留原值。不要回传编辑器打开时的
       // 快照值：面板开着期间（最长可能一个轮询周期）任务可能被拖拽重排，回传旧值会把它顶回去。
       // 这与队列内联编辑的约定一致（见 TaskQueue.inlineEdit）。
-      const payload = task ? { title, description, priority } : { title, description, priority, position: 0 };
+      const payload = task ? { description, priority } : { description, priority, position: 0 };
       const result = await request<Task>(task ? `/api/tasks/${task.id}` : `/api/projects/${projectID}/tasks`, { method: task ? "PATCH" : "POST", body: JSON.stringify(payload) });
       if (!mountedRef.current) return;
       await saved(result.id);
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法保存任务"); }
     finally { if (mountedRef.current) setBusy(false); }
   };
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog task-editor-dialog"><header className="task-editor-header"><div><span>任务</span><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button type="button" className="task-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><form className="task-editor-form" onSubmit={(event) => void save(event)}><div className="task-form"><section className="task-form-section"><div className="task-form-section-head"><h3>基本信息</h3></div><div className="task-form-basic-grid"><label className="task-form-title">任务名称 <small>可选</small><input autoFocus maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：实现项目任务看板" /></label><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div></section><section className="task-form-section"><div className="task-form-section-head"><h3>任务内容</h3></div><label>任务说明<textarea required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label></section></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog task-editor-dialog"><header className="task-editor-header"><div><span>任务</span><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button type="button" className="task-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><form className="task-editor-form" onSubmit={(event) => void save(event)}><div className="task-form"><section className="task-form-section"><div className="task-form-section-head"><h3>基本信息</h3></div><div className="task-form-basic-grid"><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div></section><section className="task-form-section"><div className="task-form-section-head"><h3>任务内容</h3></div><label>任务说明<textarea autoFocus required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label></section></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
 }
 
 function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, beginDispatch, enqueue, orchestrationEnabled, transition, deleteTask, confirmTransition, edit, move, canMoveUp, canMoveDown, request, fail }: { detail: TaskDetail; permissionMode?: ExecutionPolicy; busy: string; close: () => void; refresh: () => Promise<void>; beginDispatch: () => void; enqueue: () => Promise<void>; orchestrationEnabled: boolean; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; confirmTransition: () => void; edit: () => void; move: (taskID: string, direction: "up" | "down") => Promise<void>; canMoveUp: boolean; canMoveDown: boolean; request: Request; fail: (message: string) => void }) {

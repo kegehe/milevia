@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 
 type TooltipState = { anchor: HTMLElement; text: string; title?: string; desc?: string };
 type TooltipPosition = { left: number; top: number; side: "top" | "bottom" };
+type InputModality = "mouse" | "touch" | "pen" | "keyboard" | "unknown";
 
 const TOOLTIP_ID = "milevia-global-tooltip";
 const MAX_TOOLTIP_LENGTH = 360;
@@ -23,6 +24,10 @@ function tooltipTarget(node: EventTarget | null) {
   return node instanceof Element ? node.closest<HTMLElement>("[data-tooltip-title], [data-tooltip], [title]") : null;
 }
 
+export function isHoverPointerType(pointerType: string) {
+  return pointerType === "mouse";
+}
+
 function tooltipPreview(text: string) {
   if (text.length <= MAX_TOOLTIP_LENGTH) return text;
   return `内容较长，仅显示前 ${MAX_TOOLTIP_LENGTH} 个字符：\n${text.slice(0, MAX_TOOLTIP_LENGTH).trimEnd()}`;
@@ -40,6 +45,7 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
   const [position, setPosition] = useState<TooltipPosition | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
   const activeAnchorRef = useRef<HTMLElement | null>(null);
+  const inputModalityRef = useRef<InputModality>("unknown");
 
   const hideTooltip = useCallback((anchor?: HTMLElement) => {
     const activeAnchor = activeAnchorRef.current;
@@ -105,7 +111,19 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
 
     const pointerOver = (event: PointerEvent) => {
       const target = tooltipTarget(event.target);
+      const pointerType = event.pointerType || "unknown";
+      inputModalityRef.current = pointerType === "mouse" || pointerType === "touch" || pointerType === "pen" ? pointerType : "unknown";
+      if (!isHoverPointerType(pointerType)) {
+        hideTooltip();
+        return;
+      }
       if (target) showTooltip(target);
+    };
+    const pointerDown = (event: PointerEvent) => {
+      const pointerType = event.pointerType || "unknown";
+      inputModalityRef.current = pointerType === "mouse" || pointerType === "touch" || pointerType === "pen" ? pointerType : "unknown";
+      // 触摸/手写笔点击可能随后触发 focusin；先清理旧提示，避免点按后残留。
+      if (!isHoverPointerType(pointerType)) hideTooltip();
     };
     const pointerOut = (event: PointerEvent) => {
       const target = tooltipTarget(event.target);
@@ -114,7 +132,8 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
     };
     const focusIn = (event: FocusEvent) => {
       const target = tooltipTarget(event.target);
-      if (target) showTooltip(target);
+      // 触摸按钮获得焦点不是用户在请求帮助；键盘焦点仍需要提示。
+      if (target && inputModalityRef.current !== "touch" && inputModalityRef.current !== "pen") showTooltip(target);
     };
     const focusOut = (event: FocusEvent) => {
       const target = tooltipTarget(event.target);
@@ -123,16 +142,23 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
         if (!(document.activeElement instanceof Node && target.contains(document.activeElement))) hideTooltip(target);
       });
     };
+    const keyDown = () => {
+      inputModalityRef.current = "keyboard";
+    };
+    document.addEventListener("pointerdown", pointerDown, true);
     document.addEventListener("pointerover", pointerOver, true);
     document.addEventListener("pointerout", pointerOut, true);
     document.addEventListener("focusin", focusIn, true);
     document.addEventListener("focusout", focusOut, true);
+    document.addEventListener("keydown", keyDown, true);
     return () => {
       observer.disconnect();
+      document.removeEventListener("pointerdown", pointerDown, true);
       document.removeEventListener("pointerover", pointerOver, true);
       document.removeEventListener("pointerout", pointerOut, true);
       document.removeEventListener("focusin", focusIn, true);
       document.removeEventListener("focusout", focusOut, true);
+      document.removeEventListener("keydown", keyDown, true);
     };
   }, [hideTooltip, showTooltip]);
 

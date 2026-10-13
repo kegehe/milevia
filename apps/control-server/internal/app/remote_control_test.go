@@ -245,6 +245,34 @@ func TestRemoteOverviewScansSQLiteExpressionTimestamp(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotRevisionTracksNonEventChanges(t *testing.T) {
+	db := newRemoteTestDB(t)
+	defer db.Close()
+	s := &Server{db: db}
+	if err := s.migrateRemoteControl(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.advanceRemoteSnapshotRevision(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var eventSequence, snapshotRevision int64
+	if err := db.QueryRow(`select last_agent_sequence,snapshot_revision from remote_instance`).Scan(&eventSequence, &snapshotRevision); err != nil {
+		t.Fatal(err)
+	}
+	if eventSequence != 0 || snapshotRevision != 1 {
+		t.Fatalf("event=%d snapshot=%d, want 0 and 1", eventSequence, snapshotRevision)
+	}
+	overview := httptest.NewRecorder()
+	s.remoteOverview(overview, httptest.NewRequest(http.MethodGet, "/api/remote/overview", nil))
+	var item RemoteInstance
+	if err := json.Unmarshal(overview.Body.Bytes(), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.SnapshotRevision != 1 {
+		t.Fatalf("overview snapshot revision=%d, want 1", item.SnapshotRevision)
+	}
+}
+
 // 页面能用桌面会话令牌打的端点是一张**显式小表**（desktopPairingPaths），其余
 // `/api/remote/**` 只认 Agent 令牌。心跳端点绝不能被放进去：control-server 在
 // `remoteOverview` 里记"最近听到 Agent 说话"的时刻，页面自己去打就等于自己给自己

@@ -7110,9 +7110,14 @@ func TestRunForceStopKeepsWorkspaceUntilStreamingSessionExits(t *testing.T) {
 	if runStatus != "running" || conversationStatus != "running" {
 		t.Fatalf("session exited too early: run=%q conversation=%q", runStatus, conversationStatus)
 	}
-	if _, acquired := server.acquireProjectWorkspace(projectID, "run:replacement"); acquired {
-		t.Fatal("workspace was released before the stopped session exited")
+	releaseReplacement, acquired := server.acquireProjectWorkspace(projectID, "run:replacement")
+	if !acquired {
+		t.Fatal("a second AI run should share the active project workspace")
 	}
+	if _, acquired := server.acquireProjectWorkspace(projectID, "git:commit"); acquired {
+		t.Fatal("Git operation unexpectedly bypassed the active AI workspace lease")
+	}
+	releaseReplacement()
 
 	close(session.release)
 	waitForConversationIdle(t, server, conversationID)
@@ -7122,7 +7127,7 @@ func TestRunForceStopKeepsWorkspaceUntilStreamingSessionExits(t *testing.T) {
 	if runStatus != "stopped" {
 		t.Fatalf("run status=%q, want stopped", runStatus)
 	}
-	releaseReplacement, acquired := server.acquireProjectWorkspace(projectID, "run:replacement")
+	releaseReplacement, acquired = server.acquireProjectWorkspace(projectID, "run:replacement")
 	if !acquired {
 		t.Fatal("workspace remained held after the stopped session exited")
 	}
@@ -8829,6 +8834,23 @@ func TestLocalizedErrorSuppressesInternalUpdateWraps(t *testing.T) {
 	// 纯中文错误仍原样展示。
 	if direct := localizedErrorText(errors.New("更新服务超时，请稍后再试。"), "fallback"); direct != "更新服务超时，请稍后再试。" {
 		t.Fatalf("pure Chinese error not shown directly: %q", direct)
+	}
+}
+
+func TestGitIndexLockDoesNotConflictWithWorkspaceLease(t *testing.T) {
+	server := &Server{projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, gitIndexLocks: map[string]*sync.Mutex{}}
+	releaseWorkspace, acquired := server.acquireProjectWorkspace("project", "conversation:active")
+	if !acquired {
+		t.Fatal("acquire workspace lease")
+	}
+	defer releaseWorkspace()
+	releaseIndex, ok := server.acquireGitIndexLock("project")
+	if !ok {
+		t.Fatal("acquire index lock")
+	}
+	releaseIndex()
+	if _, acquired := server.acquireWorkspace("project", "git:commit"); acquired {
+		t.Fatal("high-risk Git operation unexpectedly bypassed workspace lease")
 	}
 }
 

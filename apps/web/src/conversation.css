@@ -2132,6 +2132,7 @@
   box-shadow: 0 0 0 3px #dff1e7, inset 0 1px 1px #17362c08;
 }
 .composer textarea:disabled { color: #80958b; background: #f2f7f3; }
+.composer-model-switch-lock { min-width: 0; margin: 0; padding: 0; border: 0; }
 .composer-footer {
   display: flex;
   min-width: 0;
@@ -2387,6 +2388,8 @@
 .composer-action.composer-clear:hover:not(:disabled) { border-color: #a9cabc; color: #365f51; background: #f0f8f3; }
 .composer-action.composer-continue { border-color: #c6ded2; color: #2f6859; background: #eef8f2; }
 .composer-action.composer-continue:hover:not(:disabled) { border-color: #8fbdab; color: #1f5b4c; background: #e0f2e7; }
+.composer-action.composer-handoff { border-color: #c7d4e5; color: #3f607b; background: #f3f7fb; }
+.composer-action.composer-handoff:hover:not(:disabled) { border-color: #91aecb; color: #294d6b; background: #e6f0f8; }
 .composer-action.composer-stop { border-color: #efc3b7; color: #a44531; background: #fff3ef; }
 .composer-action.composer-stop:hover:not(:disabled) { border-color: #db927d; color: #8b3627; background: #ffe6df; }
 .composer-action.composer-send {

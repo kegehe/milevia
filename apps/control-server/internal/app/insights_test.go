@@ -132,7 +132,7 @@ func insightTestProjectID(t *testing.T, server *Server, projectID string) string
 			t.Fatalf("initialize insight test repository (%s): %v", strings.Join(args, " "), err)
 		}
 	}
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,'windows','main',1,?)`, projectID, projectID, projectPath, time.Now().UTC().Format("2006-01-02 15:04:05")); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,1,?)`, projectID, projectID, projectPath, server.localRunnerID(), "main", time.Now().UTC().Format("2006-01-02 15:04:05")); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
 	return projectID
@@ -427,6 +427,38 @@ func TestInsightOutputSchemasAreObjectTyped(t *testing.T) {
 	}
 	if !slices.Contains(candidates.Required, "findings") {
 		t.Errorf("candidates schema must require findings, got %v", candidates.Required)
+	}
+}
+
+func TestInsightReverifySchemaUsesBatchIndex(t *testing.T) {
+	var schema struct {
+		Properties map[string]struct {
+			Items struct {
+				Properties map[string]json.RawMessage `json:"properties"`
+				Required   []string                   `json:"required"`
+			} `json:"items"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(insightReverifyOutputSchema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	findings := schema.Properties["findings"].Items
+	if findings.Properties["index"] == nil || !slices.Contains(findings.Required, "index") {
+		t.Fatalf("reverify schema must require a batch index: %s", insightReverifyOutputSchema)
+	}
+	if findings.Properties["id"] != nil || slices.Contains(findings.Required, "id") {
+		t.Fatalf("reverify schema must not require a model-returned UUID: %s", insightReverifyOutputSchema)
+	}
+}
+
+func TestInsightReverifyPromptDoesNotSuggestOutOfRangeIndexes(t *testing.T) {
+	targets := []InsightFinding{{ID: "one", Title: "first"}}
+	prompt := buildInsightReverifyPrompt("/project", "", targets, false)
+	if strings.Contains(prompt, `{"index":2,"status":`) || strings.Contains(prompt, `{"index":3,"status":`) {
+		t.Fatalf("single-target prompt must not include out-of-range output examples: %s", prompt)
+	}
+	if !strings.Contains(prompt, `The JSON above only illustrates one entry's shape.`) {
+		t.Fatalf("prompt must explain that the example is not a complete result: %s", prompt)
 	}
 }
 
@@ -904,6 +936,37 @@ func TestTriggerInsightScanPersistsThemeAndFocusTypes(t *testing.T) {
 	}
 }
 
+func TestInsightRequestsRejectUnavailableOrUnsupportedAgent(t *testing.T) {
+	t.Run("unsupported engine", func(t *testing.T) {
+		server := newTestServer(t)
+		projectID := insightTestProject(t, server)
+		for _, endpoint := range []string{"scan", "verify"} {
+			body := strings.NewReader(`{"agent":"codebuddy"}`)
+			rec := httptest.NewRecorder()
+			server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/"+endpoint, body))
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("%s: got %d want %d (body %s)", endpoint, rec.Code, http.StatusConflict, rec.Body.String())
+			}
+		}
+	})
+
+	t.Run("engine unavailable on project runner", func(t *testing.T) {
+		server := newTestServer(t)
+		projectID := insightTestProject(t, server)
+		// Version 为空时探测结果为 unavailable；请求不得进入任务创建流程。
+		server.runner = &blockingInsightRunner{}
+		server.runnerRegistry.register(server.localRunnerID(), server.runner, server.localRunnerMeta())
+		for _, endpoint := range []string{"scan", "verify"} {
+			body := strings.NewReader(`{"agent":"claude-code"}`)
+			rec := httptest.NewRecorder()
+			server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/"+endpoint, body))
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("%s: got %d want %d (body %s)", endpoint, rec.Code, http.StatusConflict, rec.Body.String())
+			}
+		}
+	})
+}
+
 func TestTriggerInsightScanBodyOptionalDefaultsToAll(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
@@ -1003,13 +1066,14 @@ func firstInsightFindingID(t *testing.T, server *Server, projectID string) strin
 	return id
 }
 
-func TestPassBMissingFindingFailsScan(t *testing.T) {
-	// Pass B 漏掉候选时，不得把未核实建议当作已确认落库。
+func TestPassBIncompleteRepairKeepsOnlyVerifiedFindings(t *testing.T) {
+	// Pass B 漏掉候选时，不得把未核实建议当作已确认落库；但已经明确核实
+	// 的候选仍应保留，不能因为一个漏项让整次分析失败。
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
 	passA := `[{"type":"bug","severity":"high","title":"已核实","summary":"s1"},{"type":"feature","severity":"normal","title":"未覆盖","summary":"s2"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`
-	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
+	server.runner = &insightScriptRunner{outputs: []string{passA, passB, passB}}
 	scanID := insertSyncInsightScan(t, server, projectID)
 
 	var status, errMsg string
@@ -1020,11 +1084,45 @@ func TestPassBMissingFindingFailsScan(t *testing.T) {
 	if err := server.db.QueryRow(`select count(*) from project_insights where scan_id=?`, scanID).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if status != insightScanFailed || n != 0 {
-		t.Errorf("incomplete Pass B: status/count = %q/%d want failed/0", status, n)
+	if status != insightScanCompleted || n != 1 || errMsg != "" {
+		t.Errorf("incomplete Pass B: status/count/error = %q/%d/%q want completed/1/empty", status, n, errMsg)
 	}
-	if !strings.Contains(errMsg, "核实结论数量不完整") {
-		t.Errorf("incomplete verdict should be diagnosed, got %q", errMsg)
+	var title string
+	if err := server.db.QueryRow(`select title from project_insights where scan_id=?`, scanID).Scan(&title); err != nil {
+		t.Fatalf("load verified finding: %v", err)
+	}
+	if title != "已核实" {
+		t.Errorf("persisted title=%q want 已核实", title)
+	}
+}
+
+func TestConservativeInsightVerifyOutcomesRejectsDuplicateAndInvalidIndexes(t *testing.T) {
+	verdict := insightVerifyVerdict{}
+	verdict.Findings = append(verdict.Findings,
+		struct {
+			Index     int    `json:"index"`
+			Confirmed bool   `json:"confirmed"`
+			Reason    string `json:"reason"`
+		}{Index: 1, Confirmed: true},
+		struct {
+			Index     int    `json:"index"`
+			Confirmed bool   `json:"confirmed"`
+			Reason    string `json:"reason"`
+		}{Index: 1, Confirmed: true},
+		struct {
+			Index     int    `json:"index"`
+			Confirmed bool   `json:"confirmed"`
+			Reason    string `json:"reason"`
+		}{Index: 4, Confirmed: true},
+	)
+	outcomes, accepted := conservativeInsightVerifyOutcomes(verdict, 2)
+	if accepted != 0 || len(outcomes) != 2 {
+		t.Fatalf("accepted/outcomes=%d/%d want 0/2", accepted, len(outcomes))
+	}
+	for _, outcome := range outcomes {
+		if outcome.Confirmed {
+			t.Fatalf("untrusted outcome %#v must be excluded", outcome)
+		}
 	}
 }
 

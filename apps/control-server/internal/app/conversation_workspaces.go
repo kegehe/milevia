@@ -286,6 +286,13 @@ func (s *Server) createConversationWorktree(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusConflict, errors.New("stop the active agent run before creating an isolated workspace"))
 		return
 	}
+	if handingOff, err := s.conversationHandoffInProgress(r.Context(), conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if handingOff {
+		writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
+		return
+	}
 	if !isLocalRunnerID(project.Runner) && project.Runner != "wsl-local" {
 		writeError(w, http.StatusConflict, errors.New("isolated conversation workspaces currently require a local runner"))
 		return
@@ -401,6 +408,13 @@ func (s *Server) activateConversationWorkspace(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusConflict, errors.New("stop the active agent run before changing the workspace"))
 		return
 	}
+	if handingOff, err := s.conversationHandoffInProgress(r.Context(), conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if handingOff {
+		writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
+		return
+	}
 	if !s.sessionManager.retireForConfiguration(conversationID) {
 		writeError(w, http.StatusConflict, errors.New("native agent session is stopping for a workspace change; retry shortly"))
 		return
@@ -450,6 +464,13 @@ func (s *Server) archiveConversationWorkspace(w http.ResponseWriter, r *http.Req
 	}
 	if conversationStatus != "idle" || !expectedPath {
 		writeError(w, http.StatusConflict, errors.New("conversation workspace is not safe to archive"))
+		return
+	}
+	if handingOff, err := s.conversationHandoffInProgress(r.Context(), conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if handingOff {
+		writeError(w, http.StatusConflict, errors.New("context handoff is in progress"))
 		return
 	}
 	var activeRuns int

@@ -23,13 +23,13 @@ import (
 
 // ─── 会话域 op 名单 ────────────────────────────────────────────────────────
 
-// 这份名单是手机端能对**会话**做的全部事情。现在只有一条，但同样写死：
+// 这份名单是手机端能对**会话**做的全部事情。每一条都写死：
 // 多一条就是"手机能停/改别的东西了"，必须同时改这里，逼出一次有意识的决定。
 func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	server := &Server{}
 	operations := server.remoteConversationOperations()
-	if len(operations) != 3 {
-		t.Fatalf("conversation operation count = %d, want 3", len(operations))
+	if len(operations) != 4 {
+		t.Fatalf("conversation operation count = %d, want 4", len(operations))
 	}
 	list, ok := operations["conversation.list"]
 	if !ok || list.Method != http.MethodGet || list.Scope != relayScopeProject || list.Path != "/conversations" || !list.Query || list.Handle == nil {
@@ -41,6 +41,10 @@ func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	}
 	if history.MaxBytes <= 0 || history.MaxBytes >= relayFrameBudget {
 		t.Fatalf("conversation.history MaxBytes = %d, want a positive value below relay frame budget %d", history.MaxBytes, relayFrameBudget)
+	}
+	activate, ok := operations["conversation.activate"]
+	if !ok || activate.Method != http.MethodPost || activate.Scope != relayScopeConversation || activate.Path != "/activate" || activate.Query || activate.Handle == nil {
+		t.Fatalf("conversation.activate = %#v, want shared conversation activation operation", activate)
 	}
 	operation, ok := operations["conversation.stop"]
 	if !ok {
@@ -263,6 +267,38 @@ func TestConversationStopRouteIsRegistered(t *testing.T) {
 	}
 	if payload.Status != "idle" {
 		t.Fatalf("status = %q, want idle", payload.Status)
+	}
+}
+
+func TestRelayConversationActivateChangesTheSharedCurrentConversation(t *testing.T) {
+	server, projectID, currentID := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,claude_initialized,is_current,created_at) values (?,?,?,?,?,?,?)`, "target", projectID, "00000000-0000-4000-8000-000000000001", "idle", false, false, now); err != nil {
+		t.Fatalf("insert target conversation: %v", err)
+	}
+
+	code, payload := relayConversation(t, server, map[string]any{
+		"op":             "conversation.activate",
+		"projectId":      projectID,
+		"conversationId": "target",
+		"params":         map[string]any{},
+	})
+	if code != http.StatusOK || payload["ok"] != true {
+		t.Fatalf("relay activation code=%d payload=%v", code, payload)
+	}
+	var current string
+	if err := server.db.QueryRow(`select id from conversations where project_id=? and is_current=1`, projectID).Scan(&current); err != nil {
+		t.Fatalf("read shared current conversation: %v", err)
+	}
+	if current != "target" {
+		t.Fatalf("shared current conversation=%q, want target", current)
+	}
+	var previousCurrent bool
+	if err := server.db.QueryRow(`select is_current from conversations where id=?`, currentID).Scan(&previousCurrent); err != nil {
+		t.Fatalf("read previous current conversation: %v", err)
+	}
+	if previousCurrent {
+		t.Fatalf("previous conversation %q is still current", currentID)
 	}
 }
 

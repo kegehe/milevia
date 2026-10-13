@@ -44,6 +44,14 @@ func (s *Server) remoteConversationOperations() map[string]remoteOperation {
 			Label:    "会话历史",
 			Handle:   s.getConversation,
 		},
+		// 当前会话是桌面端与手机端共享的项目级选择。复用桌面端的激活
+		// handler，避免手机另写一套 is_current 的更新规则。
+		"conversation.activate": {
+			Method: http.MethodPost,
+			Scope:  relayScopeConversation,
+			Path:   "/activate",
+			Handle: s.activateConversation,
+		},
 		// 停止这条会话当前在跑的那一轮。
 		//
 		// 它按**会话**停而不是按 run 停，与桌面端的 `POST /api/runs/{runID}/stop` 是两件事：
