@@ -22,6 +22,7 @@ import {
   toggleInsightSelection,
   toggleInsightSelectionAll,
   toggleInsightType,
+  verificationSegments,
   type InsightFinding,
   type InsightType,
 } from "./insights-model.ts";
@@ -224,4 +225,34 @@ test("isInsightDismissed only matches the dismissed status", () => {
   assert.equal(isInsightDismissed(makeFinding("a")), false);
   assert.equal(isInsightDismissed(makeFinding("a", { status: "open" })), false);
   assert.equal(isInsightDismissed(makeFinding("a", { status: "dismissed" })), true);
+});
+
+test("verificationSegments maps progress onto capped segments, one segment per suggestion below cap", () => {
+  // 复核 8/13：13 条 ≤ 36 段上限，一段一条；done=8 段完成，当前处理的是下标 8 那段。
+  assert.deepEqual(verificationSegments(8, 13), { done: 8, segments: 13 });
+  assert.deepEqual(verificationSegments(0, 13), { done: 0, segments: 13 });
+  // 超上限按比例压缩：200 条压到 36 段，99/200 ≈ 17.8 段完成。
+  assert.deepEqual(verificationSegments(99, 200), { done: 17, segments: 36 });
+  // 全部处理完：满段，没有"进行中"段。
+  assert.deepEqual(verificationSegments(13, 13), { done: 13, segments: 13 });
+  assert.deepEqual(verificationSegments(50, 13), { done: 13, segments: 13 });
+  // 读不到总数（0/负数/非数）：0 段，调用方不渲染刻度行，不假装有进度。
+  assert.deepEqual(verificationSegments(0, 0), { done: 0, segments: 0 });
+  assert.deepEqual(verificationSegments(3, -1), { done: 0, segments: 0 });
+  assert.deepEqual(verificationSegments(3, Number.NaN), { done: 0, segments: 0 });
+  // 进度计数异常越界（processed > total 或负数）夹到 [0, segments]，不出负段/超段。
+  assert.deepEqual(verificationSegments(-4, 13), { done: 0, segments: 13 });
+  assert.deepEqual(verificationSegments(Number.NaN, 13), { done: 0, segments: 13 });
+  // 浮点雷区回归（曾用 p/t*t 写法，这三组 done 会被舍入算少 1）：
+  assert.deepEqual(verificationSegments(15, 22), { done: 15, segments: 22 });
+  assert.deepEqual(verificationSegments(13, 23), { done: 13, segments: 23 });
+  assert.deepEqual(verificationSegments(15, 26), { done: 15, segments: 26 });
+  // 结构化断言：未压缩路径（total ≤ 上限）必须逐条相等——一段一条是这条刻度的承诺。
+  for (let total = 1; total <= 36; total++) {
+    for (let processed = 0; processed <= total; processed++) {
+      const { done, segments } = verificationSegments(processed, total);
+      assert.equal(done, processed, `processed=${processed}/${total}`);
+      assert.equal(segments, total, `processed=${processed}/${total}`);
+    }
+  }
 });

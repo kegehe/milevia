@@ -1760,20 +1760,28 @@ fn navigate_main(app: tauri::AppHandle, path: String) {
 /// 在 Windows 系统右下角弹一条系统通知。前端只在用户开启“Windows 弹窗通知”
 /// 且收到任务完成类通知时调用。
 ///
-/// - 内容刻意不包含具体项目/任务名，统一显示“有任务完成”，避免在通知中心泄露细节。
+/// - 内容为「方案A分层完整版」三行：`title`（“任务已完成/任务等待审查”，与事件类型
+///   语义匹配，由前端 isWindowsNotifyType 保证）、`line1`（“项目「X」· 任务Y”）、
+///   `line2`（“耗时 …”）。字段全部由服务端算好、前端组好行传入；空串的行跳过不渲染，
+///   因此旧数据缺耗时/任务名时自动退化为更短的弹窗，不会显示占位符。
 /// - `Duration::Short` 让系统按短时展示（会在一段时间后自动消失）。
 /// - 用户点击弹窗时（前台激活）调用回调：`on_activated` 闭包直接捕获本次 `path`，
 ///   因此**每条弹窗点击都只跳到它对应的那条任务的项目**（无需中心的共享状态，
 ///   也不存在多条弹窗互相覆盖导航目标的问题）。跳转复用托盘“跳转主窗口”同款实现。
 #[tauri::command]
-fn show_system_notification(app: tauri::AppHandle, path: String) {
+fn show_system_notification(app: tauri::AppHandle, path: String, title: String, line1: String, line2: String) {
     let app_id = app.config().identifier.clone();
     let callback_app = app.clone();
     // 把本条弹窗自己的导航目标放进闭包，随 Toast 一起保存（每条调用独享一份）。
     let target = path.clone();
-    let result = tauri_winrt_notification::Toast::new(app_id.as_str())
-        .title("Milevia")
-        .text1("有任务完成")
+    let mut toast = tauri_winrt_notification::Toast::new(app_id.as_str()).title(title.as_str());
+    if !line1.is_empty() {
+        toast = toast.text1(line1.as_str());
+    }
+    if !line2.is_empty() {
+        toast = toast.text2(line2.as_str());
+    }
+    let result = toast
         .duration(tauri_winrt_notification::Duration::Short)
         .on_activated(move |_args| {
             // WebView 必须在主线程操作，跳到该条弹窗对应的项目。

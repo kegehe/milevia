@@ -18,16 +18,23 @@ import (
 
 // NotificationEvent 是推送给前端的通知事件。
 type NotificationEvent struct {
-	ID             string    `json:"id"`
-	Type           string    `json:"type"`
-	ProjectID      string    `json:"projectId"`
-	ProjectName    string    `json:"projectName"`
-	ConversationID string    `json:"conversationId,omitempty"`
-	TaskID         string    `json:"taskId,omitempty"`
-	Title          string    `json:"title"`
-	Body           string    `json:"body"`
-	Priority       string    `json:"priority"` // "high" | "normal" | "low"
-	ActionURL      string    `json:"actionUrl"`
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	ProjectID   string `json:"projectId"`
+	ProjectName string `json:"projectName"`
+	// TaskTitle 是任务的通知用标题（title 为空时回落到描述前 80 字）。
+	// Windows 弹窗（方案A分层完整版）第二行「项目「X」· 任务Y」直接消费它，
+	// 不允许前端从 body 里反解析 —— 那会变成同一事实的第二份判据。
+	TaskTitle string `json:"taskTitle,omitempty"`
+	// DurationMs 是最近一次任务执行的耗时（startedAt→finishedAt，服务端算好）。
+	// 无执行记录或时间戳不完整时为 0，前端据此省略耗时行。
+	DurationMs     int64  `json:"durationMs,omitempty"`
+	ConversationID string `json:"conversationId,omitempty"`
+	TaskID         string `json:"taskId,omitempty"`
+	Title          string `json:"title"`
+	Body           string `json:"body"`
+	Priority       string `json:"priority"` // "high" | "normal" | "low"
+	ActionURL      string `json:"actionUrl"`
 	CreatedAt      time.Time `json:"createdAt"`
 	DedupeKey      string    `json:"-"`
 }
@@ -60,6 +67,8 @@ func (s *Server) migrateNotifications(ctx context.Context) error {
 	type text not null,
 	project_id text not null,
 	project_name text not null default '',
+	task_title text not null default '',
+	duration_ms integer not null default 0,
 	conversation_id text not null default '',
 	task_id text not null default '',
 	title text not null,
@@ -77,6 +86,8 @@ create index if not exists idx_notifications_dismissed on notifications(dismisse
 	}
 	// 兼容旧表：添加新列（列已存在时 SQLite 返回错误但无副作用，忽略即可）
 	s.db.ExecContext(ctx, `alter table notifications add column project_name text not null default ''`)
+	s.db.ExecContext(ctx, `alter table notifications add column task_title text not null default ''`)
+	s.db.ExecContext(ctx, `alter table notifications add column duration_ms integer not null default 0`)
 	s.db.ExecContext(ctx, `alter table notifications add column conversation_id text not null default ''`)
 	s.db.ExecContext(ctx, `alter table notifications add column task_id text not null default ''`)
 	s.db.ExecContext(ctx, `alter table notifications add column dedupe_key text not null default ''`)
@@ -184,8 +195,8 @@ func (s *Server) broadcastNotification(event NotificationEvent) {
 	s.notificationMu.Lock()
 	event.CreatedAt = time.Now().UTC()
 	result, err := s.db.ExecContext(s.runtimeCtx,
-		`insert or ignore into notifications (id, type, project_id, project_name, conversation_id, task_id, title, body, priority, action_url, dismissed, created_at, dedupe_key) values (?,?,?,?,?,?,?,?,?,?,0,?,?)`,
-		event.ID, event.Type, event.ProjectID, event.ProjectName, event.ConversationID, event.TaskID, event.Title, event.Body, event.Priority, event.ActionURL, event.CreatedAt, event.DedupeKey)
+		`insert or ignore into notifications (id, type, project_id, project_name, task_title, duration_ms, conversation_id, task_id, title, body, priority, action_url, dismissed, created_at, dedupe_key) values (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`,
+		event.ID, event.Type, event.ProjectID, event.ProjectName, event.TaskTitle, event.DurationMs, event.ConversationID, event.TaskID, event.Title, event.Body, event.Priority, event.ActionURL, event.CreatedAt, event.DedupeKey)
 	s.notificationMu.Unlock()
 	if err != nil {
 		log.Printf("persist notification %s: %v", event.ID, err)
@@ -264,7 +275,7 @@ var errNotificationNotFound = errors.New("notification not found")
 // --- 内部辅助 ---
 
 func (s *Server) getUnreadNotifications(ctx context.Context) ([]NotificationEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `select n.id, n.type, n.project_id, coalesce(nullif(n.project_name,''), p.name,''), n.conversation_id, n.task_id, n.title, n.body, n.priority, n.action_url, n.created_at from notifications n left join projects p on p.id=n.project_id where n.dismissed=0 order by n.created_at desc`)
+	rows, err := s.db.QueryContext(ctx, `select n.id, n.type, n.project_id, coalesce(nullif(n.project_name,''), p.name,''), n.task_title, n.duration_ms, n.conversation_id, n.task_id, n.title, n.body, n.priority, n.action_url, n.created_at from notifications n left join projects p on p.id=n.project_id where n.dismissed=0 order by n.created_at desc`)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +283,7 @@ func (s *Server) getUnreadNotifications(ctx context.Context) ([]NotificationEven
 	var items []NotificationEvent
 	for rows.Next() {
 		var n NotificationEvent
-		if err := rows.Scan(&n.ID, &n.Type, &n.ProjectID, &n.ProjectName, &n.ConversationID, &n.TaskID, &n.Title, &n.Body, &n.Priority, &n.ActionURL, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Type, &n.ProjectID, &n.ProjectName, &n.TaskTitle, &n.DurationMs, &n.ConversationID, &n.TaskID, &n.Title, &n.Body, &n.Priority, &n.ActionURL, &n.CreatedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, n)
@@ -338,11 +349,22 @@ func (s *Server) notifyTaskStatusChange(_ context.Context, taskID, newStatus str
 	}
 	conversationID, actionURL := s.taskNotificationTarget(ctx, task.ProjectID, task.ID)
 
+	// 方案A分层完整版：耗时由服务端从最近一次执行算好（startedAt→finishedAt），
+	// 前端只消费、不自己算。没有 started_at（任务没真正跑起来，比如排队中被打断）
+	// 时不拿 created_at 兜底 —— 那会把排队等待当执行时间；时间戳不完整就保持 0，
+	// 前端据此省略耗时行（三态不并档）。
+	var durationMs int64
+	if run, err := s.latestTaskRun(ctx, taskID); err == nil && run.StartedAt != nil && run.FinishedAt != nil && run.FinishedAt.After(*run.StartedAt) {
+		durationMs = run.FinishedAt.Sub(*run.StartedAt).Milliseconds()
+	}
+
 	s.broadcastNotification(NotificationEvent{
 		ID:             uuid.NewString(),
 		Type:           notifType,
 		ProjectID:      task.ProjectID,
 		ProjectName:    project.Name,
+		TaskTitle:      taskNotificationTitle(task),
+		DurationMs:     durationMs,
 		ConversationID: conversationID,
 		TaskID:         task.ID,
 		Title:          title,

@@ -280,43 +280,68 @@
 .insight-stop:hover:not(:disabled) { border-color: #c9604a; background: #fff0ec; }
 .insight-stop:disabled { cursor: default; opacity: 0.6; }
 .insights-verification-progress .insight-stop { margin-left: auto; }
+/* 复核进度条（分段点阵）：与扫描进度块同族的项目绿（#f4faf6 底 + #2c7567 强调），
+   一段刻度对应一条建议。扫描与复核并存时靠文案区分，颜色上成兄弟。 */
 .insights-verification-progress {
   display: flex;
   align-items: center;
   gap: 12px;
-  border: 1px solid #d8d9c5;
+  border: 1px solid #dbe9e1;
   border-radius: 12px;
   padding: 12px 16px;
-  background: #fbfbf2;
+  background: #f4faf6;
 }
-.insights-verification-progress b { display: block; color: #55583a; font-size: 13px; }
+.insights-verification-progress .insights-spinner {
+  width: 17px;
+  height: 17px;
+  border-width: 2.5px;
+}
+.insights-verification-progress b {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  color: #264a40;
+  font-size: 13px;
+}
 .insights-verification-progress b em {
   font-style: normal;
-  color: #8a8c57;
+  color: #2c7567;
+  font-weight: 700;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-variant-numeric: tabular-nums;
 }
 .insights-verification-progress small {
   display: block;
   margin-top: 2px;
-  color: #777a59;
+  color: #6f887e;
   font-size: 11px;
   line-height: 1.5;
 }
 .insights-verification-copy { min-width: 0; flex: 1; }
-.insights-verification-track {
-  display: block;
-  height: 4px;
-  margin-top: 6px;
-  border-radius: 99px;
-  background: #ece6c4;
-  overflow: hidden;
+/* 分段刻度：已完成 #7fa89b（主绿降饱和），正在处理实色 #2c7567 + 呼吸光圈，未处理 #e3ece7。 */
+.insights-verification-dots {
+  display: flex;
+  gap: 4px;
+  margin-top: 9px;
 }
-.insights-verification-track i {
-  display: block;
-  height: 100%;
-  border-radius: 99px;
-  background: #8a8c57;
-  transition: width .5s ease;
+.insights-verification-dots i {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: #e3ece7;
+}
+.insights-verification-dots i.done { background: #7fa89b; }
+.insights-verification-dots i.cur {
+  background: #2c7567;
+  animation: insight-verify-dot-pulse 1.4s ease-in-out infinite;
+}
+@keyframes insight-verify-dot-pulse {
+  50% { box-shadow: 0 0 0 3px rgba(44, 117, 103, 0.2); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 降级必须显式点名同一选择器——靠通用 * 规则会被上面的特异性压过（项目复发坑）。 */
+  .insights-verification-dots i.cur { animation: none; }
 }
 /* 分析信息滚动日志 */
 .insights-progress-log {

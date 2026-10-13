@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import {
   condenseStageDetail,
   formatElapsed,
+  latestActiveStageNotice,
   latestNotice,
   processingBadge,
   processingClockVisibleAfterMs,
@@ -197,4 +198,38 @@ test("最新通知：时间戳并列时取靠后那条（>= 而不是 >）", () 
     { createdAt: same, variant: "api_retry" },
   ]);
   assert.equal(picked?.variant, "api_retry", "并列时应取靠后（更晚到达）的那条");
+});
+
+// ── 阶段判定：最新信号获胜（与桌面 latestActiveStage 同语义）────────────────
+test("阶段判定：进行中通知（压缩/重试/等待确认）是当前阶段", () => {
+  const stage = latestActiveStageNotice([
+    { variant: "compact", createdAt: "2026-10-13T10:00:00Z" },
+    { variant: "api_retry", createdAt: "2026-10-13T10:00:05Z" },
+  ]);
+  assert.equal(stage?.variant, "api_retry");
+  // task + pending（等待确认）是真实的当前状态，不算终态
+  const approval = latestActiveStageNotice([
+    { variant: "task", state: "pending", createdAt: "2026-10-13T10:00:00Z" },
+  ]);
+  assert.equal(approval?.variant, "task");
+});
+
+test("阶段判定：最新信号是结果类 ⇒ null（不许捞更早的进行中事件说假话）", () => {
+  // 压缩已被自己的结果事件关闭：把更早的 compact 捞出来就是假话
+  assert.equal(latestActiveStageNotice([
+    { variant: "compact", createdAt: "2026-10-13T10:00:00Z" },
+    { variant: "compact_result", state: "success", createdAt: "2026-10-13T10:00:30Z" },
+  ]), null);
+  // 任务终态同理；错误通知也不算进行中阶段
+  assert.equal(latestActiveStageNotice([
+    { variant: "task", state: "success", createdAt: "2026-10-13T10:00:40Z" },
+  ]), null);
+  assert.equal(latestActiveStageNotice([
+    { variant: "error", createdAt: "2026-10-13T10:00:50Z" },
+  ]), null);
+});
+
+test("阶段判定：空/无通知如实返回 null", () => {
+  assert.equal(latestActiveStageNotice(undefined), null);
+  assert.equal(latestActiveStageNotice([]), null);
 });

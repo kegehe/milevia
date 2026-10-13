@@ -5,6 +5,10 @@ export interface NotificationEvent {
   type: string; // "task.done", "task.action_required", "approval.pending", "run.completed", "orchestration.needs_human"
   projectId: string;
   projectName: string;
+  /** 任务的通知用标题；服务端算好下发（title 为空时回落描述前 80 字），前端不许从 body 反解析。 */
+  taskTitle?: string;
+  /** 最近一次任务执行耗时（毫秒，服务端从 startedAt→finishedAt 算好）；缺失或为 0 表示没有可靠耗时。 */
+  durationMs?: number;
   conversationId?: string;
   taskId?: string;
   title: string;
@@ -48,10 +52,37 @@ export function isWithinQuietHours(now: Date, start: string, end: string): boole
 }
 
 /** 需要弹 Windows 系统通知的类型：仅“任务完成 / 等待审查”这类已完成语义。
- * 弹窗文字固定为“有任务完成”，因此只匹配完成类事件；需要处理的（action_required、
- * needs_human 等）仍走应用内提醒，避免文字与事件含义不符。 */
+ * 弹窗标题直接取事件 title（“任务已完成 / 任务等待审查”），因此只匹配完成类事件；
+ * 需要处理的（action_required、needs_human 等）仍走应用内提醒，避免文字与事件含义不符。 */
 export function isWindowsNotifyType(type: string): boolean {
   return type === "task.done" || type === "task.awaiting_review";
+}
+
+/** 毫秒 → 人类可读耗时（Windows 弹窗第三行）。
+ * 秒级「42 秒」；分钟级「3 分 42 秒 / 5 分钟」；小时级「1 小时 23 分钟」。
+ * 入参必须 > 0；调用方（windowsToastLines）负责在缺失时省略整行。 */
+export function formatDurationMs(durationMs: number): string {
+  const totalSeconds = Math.floor(durationMs / 1000);
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return seconds > 0 ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes > 0 ? `${hours} 小时 ${restMinutes} 分钟` : `${hours} 小时`;
+}
+
+/** Windows 系统弹窗的三行内容（方案A分层完整版）。
+ * 判据只此一份：标题=事件 title（语义与类型匹配由 isWindowsNotifyType 保证）；
+ * 第二行「项目「X」· 任务Y」直接消费服务端的 projectName/taskTitle 字段；
+ * 第三行耗时消费服务端 durationMs，缺失或为 0 时省略整行（不猜、不编）。
+ * 各行都可能为空串，Rust 侧按空串跳过对应行。 */
+export function windowsToastLines(event: Pick<NotificationEvent, "title" | "projectName" | "taskTitle" | "durationMs">): { title: string; line1: string; line2: string } {
+  const taskTitle = (event.taskTitle ?? "").trim();
+  const projectName = (event.projectName ?? "").trim();
+  const line1 = projectName && taskTitle ? `项目「${projectName}」· ${taskTitle}` : taskTitle || (projectName ? `项目「${projectName}」` : "");
+  const line2 = event.durationMs && event.durationMs > 0 ? formatDurationMs(event.durationMs) : "";
+  return { title: event.title, line1, line2 };
 }
 
 /** 需要发通知的任务/编排状态 */

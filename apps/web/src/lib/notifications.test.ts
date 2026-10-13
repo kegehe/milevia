@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isWithinQuietHours, isWindowsNotifyType, notificationConversationURL, notificationTargetURL, priorityForType, webNotificationsSupported, type NotificationEvent } from "./notifications";
+import { formatDurationMs, isWithinQuietHours, isWindowsNotifyType, notificationConversationURL, notificationTargetURL, priorityForType, webNotificationsSupported, windowsToastLines, type NotificationEvent } from "./notifications";
 
 test("failed and error notifications use normal priority", () => {
   assert.equal(priorityForType("task.done"), "normal");
@@ -50,11 +50,36 @@ test("Windows 弹窗通知仅限任务完成类状态", () => {
   // 完成语义 → 应触发
   assert.equal(isWindowsNotifyType("task.done"), true);
   assert.equal(isWindowsNotifyType("task.awaiting_review"), true);
-  // 需要处理/审批等 → 不应触发（文字为“有任务完成”，避免含义不符）
+  // 需要处理/审批等 → 不应触发（弹窗标题取事件 title，是完成语义；含义不符的不弹）
   assert.equal(isWindowsNotifyType("task.action_required"), false);
   assert.equal(isWindowsNotifyType("orchestration.needs_human"), false);
   assert.equal(isWindowsNotifyType("approval.pending"), false);
   assert.equal(isWindowsNotifyType("run.completed"), false);
+});
+
+test("formatDurationMs 按秒/分/小时分层", () => {
+  assert.equal(formatDurationMs(42_000), "42 秒");
+  assert.equal(formatDurationMs(59_000), "59 秒");
+  assert.equal(formatDurationMs(61_000), "1 分 1 秒");
+  assert.equal(formatDurationMs(222_000), "3 分 42 秒");
+  assert.equal(formatDurationMs(300_000), "5 分钟");
+  assert.equal(formatDurationMs(4_980_000), "1 小时 23 分钟");
+  assert.equal(formatDurationMs(7_200_000), "2 小时");
+});
+
+test("windowsToastLines 组装方案A三行：结果 / 项目+任务 / 耗时", () => {
+  const lines = windowsToastLines(makeEvent({ title: "任务已完成", taskTitle: "修复移动端导航错位", durationMs: 222_000 }));
+  assert.deepEqual(lines, { title: "任务已完成", line1: "项目「项目一」· 修复移动端导航错位", line2: "3 分 42 秒" });
+});
+
+test("windowsToastLines 字段缺失时省略对应行，不编造", () => {
+  // 无耗时（durationMs 缺失或 0）→ 不显示耗时行
+  assert.equal(windowsToastLines(makeEvent({ taskTitle: "X", durationMs: 0 })).line2, "");
+  assert.equal(windowsToastLines(makeEvent({ taskTitle: "X" })).line2, "");
+  // 无项目名 → 主体退化为任务名
+  assert.deepEqual(windowsToastLines(makeEvent({ projectName: "", taskTitle: "修复移动端导航错位", durationMs: 1_000 })), { title: "t", line1: "修复移动端导航错位", line2: "1 秒" });
+  // 旧通知两字段都没有 → 只剩标题（等价旧行为的最短弹窗）
+  assert.deepEqual(windowsToastLines(makeEvent({ projectName: "" })), { title: "t", line1: "", line2: "" });
 });
 
 test("无效或相同的免打扰时段不会静默所有通知", () => {

@@ -189,6 +189,30 @@ export function normalizeInsightVerification(value?: string): InsightVerificatio
   return "";
 }
 
+/** 复核分段点阵的最大刻度数：超过后按比例压缩，避免刻度细到不可辨。 */
+export const INSIGHT_VERIFY_DOTS_MAX = 36;
+
+/**
+ * 复核分段点阵映射：把 (processedCount, totalCount) 摊到最多 maxSegments 段刻度上。
+ * 返回 done = 已完成段数（刻度下标 < done）；当前正在处理的段 = 下标 done 本身
+ * （processedCount < total 时存在，全部处理完则没有"进行中"段）。
+ * total ≤ 0（读不到总数）返回 0 段——调用方据此不渲染刻度行，不假装有进度。
+ */
+export function verificationSegments(
+  processedCount: number,
+  totalCount: number,
+  maxSegments: number = INSIGHT_VERIFY_DOTS_MAX,
+): { done: number; segments: number } {
+  if (!Number.isFinite(totalCount) || totalCount <= 0) return { done: 0, segments: 0 };
+  const segments = Math.max(1, Math.min(maxSegments, Math.floor(totalCount)));
+  const processed = Number.isFinite(processedCount) ? Math.max(0, processedCount) : 0;
+  if (processed === 0) return { done: 0, segments };
+  if (processed >= totalCount) return { done: segments, segments };
+  // 先整数乘后除：total ≤ 上限（segments === totalCount）时 (p*segments)/totalCount 恒等于 p，
+  // 不会像 p/totalCount*totalCount 那样因浮点舍入把 done 算少 1（15/22、13/23、15/26 实测踩雷）。
+  return { done: Math.floor((processed * segments) / totalCount), segments };
+}
+
 export type InsightFilter = InsightType | "all";
 
 // 排序：动态类型在前，同类型内 high → normal → low → created_at 升序（稳定）。

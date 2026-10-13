@@ -7183,6 +7183,47 @@ func TestTaskStatusNotificationLinksToTaskConversation(t *testing.T) {
 	}
 }
 
+// 方案A分层完整版：任务类通知必须携带服务端算好的 task_title 与 duration_ms，
+// 前端 Windows 弹窗直接消费这两个字段，不许从 body 反解析或自己算耗时。
+func TestTaskStatusNotificationCarriesTaskTitleAndDuration(t *testing.T) {
+	server, projectID, conversationID := seedTaskConversation(t)
+	taskID := createTaskForTest(t, server.routes(), projectID, "带耗时的通知任务")
+	start := time.Now().UTC().Add(-10 * time.Minute)
+	finished := start.Add(3*time.Minute + 42*time.Second)
+	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at) values ('duration-task-run',?,?,1,'completed','prompt','criteria','',?,?,?)`, taskID, conversationID, start, start, finished); err != nil {
+		t.Fatalf("insert task run: %v", err)
+	}
+
+	server.notifyTaskStatusChange(context.Background(), taskID, taskDone)
+
+	var taskTitle string
+	var durationMs int64
+	if err := server.db.QueryRow(`select task_title, duration_ms from notifications where task_id=? and type='task.done'`, taskID).Scan(&taskTitle, &durationMs); err != nil {
+		t.Fatalf("load notification: %v", err)
+	}
+	if taskTitle != "带耗时的通知任务" {
+		t.Fatalf("notification task_title = %q", taskTitle)
+	}
+	if durationMs != (3*time.Minute + 42*time.Second).Milliseconds() {
+		t.Fatalf("notification duration_ms = %d, want %d", durationMs, (3*time.Minute + 42*time.Second).Milliseconds())
+	}
+
+	// 无执行记录的任务：耗时保持 0（前端据此省略耗时行），任务名仍要带上
+	otherTaskID := createTaskForTest(t, server.routes(), projectID, "没有执行记录的任务")
+	server.notifyTaskStatusChange(context.Background(), otherTaskID, taskDone)
+	var otherTitle string
+	var otherDurationMs int64
+	if err := server.db.QueryRow(`select task_title, duration_ms from notifications where task_id=? and type='task.done'`, otherTaskID).Scan(&otherTitle, &otherDurationMs); err != nil {
+		t.Fatalf("load notification without run: %v", err)
+	}
+	if otherDurationMs != 0 {
+		t.Fatalf("notification duration_ms = %d, want 0 (no run)", otherDurationMs)
+	}
+	if otherTitle != "没有执行记录的任务" {
+		t.Fatalf("notification task_title = %q", otherTitle)
+	}
+}
+
 func TestTaskStatusNotificationUsesDescriptionForUntitledTaskAndDeduplicates(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	response := httptest.NewRecorder()

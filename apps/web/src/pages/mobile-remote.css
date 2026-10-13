@@ -304,64 +304,34 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
    颜色沿用菜单里辅助文字那一档 #587568（白底 5.05:1，过正文 4.5 闸）。 */
 /* 处理状态条是消息列表的最后一个网格项（跟在最后一条消息后面），它与上一条消息的间距
    由 .mobile-message-list 的 gap 提供，所以自身不再留 margin。 */
-/* ── 会话末尾「正在处理」状态条（2026-09-22 重做：形态 F + 流光 M2 + 光晕 M1）─────
-  旧版是「三颗跳动的点 + 一句『Claude Code 正在处理...』」，五个问题：
-    ① 形态与消息气泡不是一族（细边框 + 直角 6px，气泡是圆角 14px 的块）；
-    ② Agent 名与状态同一字号同一颜色 —— 身份和状态挤在一句话里，扫过去分不出哪个是哪个；
-    ③ 不说"在干什么"：压缩上下文、网络重试、跑后台任务三件事长得完全一样；
-    ④ 不说"多久了"：卡住 5 秒和卡住 5 分钟长得一样，用户没有判据决定要不要等；
-    ⑤ 三颗点的关键帧与气泡里的「正在写」共用（`mobile-agent-processing-dot`）——
-       两处运动方向也相同（一起向上跳），同一个屏幕上出现两处跳动，读者会以为它们是一件事。
-  现在拆成三格，每格一个来源（判据在 lib/processing-indicator.ts）：
-    ① 徽标（.mobile-agent-processing-badge）—— 品牌色圆角块，身份
-    ② 阶段词（-stage）—— 这一刻在干什么
-    ③ 已耗时（-elapsed）—— 多久了（10 秒以下不渲染）
+/* ── 会话末尾「正在处理」状态条（2026-10-13 改版：撤框 + 桌面同源动画）─────────
+  上一版（2026-09-22）是「绿底卡片框（光晕 + 流光两层装饰）+ 徽标 + 阶段词 + 已耗时」。
+  2026-10-13 定稿：撤掉整个框 —— 边框/底色/圆角/光晕/流光/品牌徽标全部移除，
+  就是一条裸行「动画 正在压缩上下文 · 8s」，与桌面会话页的运行指示器同一种形态。
 
-  动效两条，**各自独立降级**：
-    M2 流光 —— 一条斜向高光横扫条体（"它活着"），靠 ::after 做，需要 overflow: hidden
-    M1 光晕 —— 条体外的一圈呼吸辉光（"它热着"），靠 ::before 做，需要 overflow **visible**
-  两者对 overflow 的要求正好相反，所以一条挂 ::before、一条挂 ::after，互不抢位。
-  ⚠️ `overflow: hidden` 一旦落在 .mobile-agent-processing 本身上，::before 那圈外扩的辉光
-  就会被整块裁掉、M1 直接消失（不报错、只是不动）。所以裁切**只放在 ::after 自己身上**。
+  现在三格，每格一个来源：
+    ① 动画图形位 —— 7 变体随机（波点/轨道/思绪波纹/星芒/追点/三点走三角/CLI 盲文），
+       按 runId 哈希抽取，判据与桌面共用 lib/run-indicator.ts 的 pickRunIndicatorVariant；
+       变体图形 CSS 在 run-indicator.css（两端共享，含 reduced-motion 降级）。
+    ② 阶段词（-stage）—— 最新一条「进行中」通知的标题（结果类通知不算阶段，
+       判据 latestActiveStageNotice 在 lib/processing-indicator.ts）。
+    ③ 阶段计时（-elapsed）—— 从该通知的 createdAt 起算，阶段一变归零（与桌面同口径），
+       立即显示（无 10 秒门槛）、CLI 风格「8s / 1m05s」。
 
-  三条硬约束（与文件末尾"消息动效"那段同源，别重复发明）：
-    · 只动 `transform` / `opacity` —— 这一页是整页滚动 + 「贴底跟随」判据
-      （scrollHeight - scrollY - innerHeight < 100），任何改尺寸的动画都会与它打架；
-    · 流光靠 `translateX` 位移，**不用 `left`**（left 是布局属性，会每帧改 scrollWidth）；
-    · 辉光靠 `::before` 的 scale/opacity，`z-index: -1` 把它压到条体底色之下 ——
-      没有这一句，呼吸的是**盖在文字上的一层绿雾**，读数会被压得发糊。
-
-  主题色不动：底 #eef9f2 / 边 #b8dcca / 字 #216b58 与改动前逐字一致，
-  唯一的品牌色出现在①徽标那一格。 */
-.mobile-agent-processing { position: relative; display: flex; min-height: 38px; box-sizing: border-box; align-items: center; gap: 9px; margin-top: 0; border: 1px solid #b8dcca; border-radius: 10px; padding: 8px 11px; color: #216b58; background: #eef9f2; font-size: 12px; font-weight: 700; }
-/* ① 徽标。`aria-hidden` 在 JSX 上 —— 名字这件事由 role="status" 那一层整体播报，
-   徽标再读一遍就是同一句话说两遍。文字仍**可见**（aria-hidden 不隐藏视觉）。 */
-.mobile-agent-processing-badge { flex: none; border-radius: 4px; padding: 1px 5px; color: #fff; background: #d97757; font-size: 10px; font-weight: 700; letter-spacing: .2px; }
-/* Codex 用近黑墨色，与 Claude Code 的橙形成区分（两处品牌色都只在这一格）。 */
-.mobile-agent-processing[data-agent="codex"] .mobile-agent-processing-badge { background: #1f2933; }
+  布局约束不变：状态条是消息列表的最后一个网格项，与上一条消息的间距由
+  .mobile-message-list 的 gap 提供，自身不另留 margin；只动 transform/opacity 的
+  动画纪律也照旧（变体动画全部符合）。 */
+.mobile-agent-processing { display: flex; align-items: center; gap: 8px; padding: 2px 2px 2px 12px; color: #4c6b60; font-size: 12px; font-weight: 700; }
 /* ② 阶段词。min-width: 0 是**必要**条件：flex 子项默认 min-width: auto（= min-content），
    少了它，下面那三件套在 flex 里一律不生效，长阶段词会硬切而不是省略。
-   （实测：`正在编辑 mobile-remote.css` 在 320px 上会顶成两行。） */
-.mobile-agent-processing-stage { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* ③ 已耗时。tabular-nums 让数字等宽 —— 否则每秒重排时「1 分 9 秒 → 1 分 10 秒」
+   （实测：`正在编辑 mobile-remote.css` 在 320px 上会顶成两行。）
+   flex 用 `0 1 auto` 而不是 `1`：阶段词按内容收缩、**计时紧跟在文字后面**；
+   `flex: 1` 会把阶段词撑满整行、计时被推到最右端（2026-10-13 用户指正）。
+   长阶段词时它仍可被压缩出省略号（min-width: 0 + overflow hidden），计时不会被挤没。 */
+.mobile-agent-processing-stage { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ③ 阶段计时。tabular-nums 让数字等宽 —— 否则每秒重排时「1m09s → 1m10s」
    整格宽度会抖（等宽数字是这种常驻读数该有的基本处理）。 */
 .mobile-agent-processing-elapsed { flex: none; color: #3c7f6d; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
-/* ── M1 光晕：条体外的一圈呼吸辉光。`inset: -1px` 与边框对齐，避免在圆角处露一道缝。 */
-.mobile-agent-processing::before { content: ""; position: absolute; inset: -1px; z-index: -1; border-radius: inherit; background: radial-gradient(120% 140% at 12% 50%, rgba(44, 117, 103, .22), rgba(44, 117, 103, 0) 70%); animation: mobile-agent-processing-glow 2.6s ease-in-out infinite; }
-@keyframes mobile-agent-processing-glow { 0%, 100% { opacity: .35; transform: scale(1); } 50% { opacity: .85; transform: scale(1.035); } }
-/* ── M2 流光：一条斜向高光从左扫到右。频率 2.6s 与光晕**刻意错开**（1.3s / 2.6s 是倍数关系 =>
-   两条会锁相，看起来像一条卡顿的动画）；这里是 2.6s vs 1.9s。
-   裁切挂在自己身上（`overflow: hidden` + `border-radius: inherit`），不动父层。 */
-.mobile-agent-processing::after { content: ""; position: absolute; inset: 0; overflow: hidden; border-radius: inherit; background: linear-gradient(105deg, rgba(255, 255, 255, 0) 38%, rgba(255, 255, 255, .62) 50%, rgba(255, 255, 255, 0) 62%); animation: mobile-agent-processing-shimmer 1.9s ease-in-out infinite; pointer-events: none; }
-@keyframes mobile-agent-processing-shimmer { 0% { transform: translateX(-100%); } 55%, 100% { transform: translateX(100%); } }
-/* 降级判据是"降级后信息不丢"，**不是"什么都不动"**：
-   · 流光与光晕是装饰 → 直接撤掉（撤掉后条体仍是完整的一条绿底状态条，信息一格不少）；
-   · 已耗时是读数 → 保留，且仍然每秒更新（它由 JS 驱动，本来就不受这里影响）。 */
-@media (prefers-reduced-motion: reduce) {
-  .mobile-agent-processing::before, .mobile-agent-processing::after { animation: none; }
-  .mobile-agent-processing::before { opacity: .5; }
-  .mobile-agent-processing::after { background: none; }
-}
 @media (prefers-reduced-motion: reduce) { .mobile-task-syncing::before { animation: none; opacity: .75; } }
 /* ⚠️ 这条关键帧原先定义在上面状态条那一段里。状态条 2026-09-22 改成"徽标 + 阶段词 + 读数"
    三格之后，三颗跳点的 DOM 没了，但**这条关键帧不能跟着删** —— 下面「正在写」还在用它

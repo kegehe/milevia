@@ -10,6 +10,7 @@ import remarkGfm from "remark-gfm";
 import "../markdown.css";
 import "../permission.css";
 import "../conversation.css";
+import "../run-indicator.css";
 import "../tasks.css";
 import "../git.css";
 import "../run.css";
@@ -24,7 +25,7 @@ import type {
   Conversation, Message, Event, Shortcut, ShortcutEditorState,
   ConversationWorkspace,
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
-  AgentExecution, RunUsage, ConversationUsageResponse, ConversationModels, AgentModelOption,
+  AgentExecution, ConversationUsageResponse, ConversationModels, AgentModelOption,
   RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
   Skill, AgentCommandOption, ProjectCommands,
 } from "../lib/types";
@@ -37,7 +38,7 @@ import {
 import { createWebSocket } from "../lib/runtime";
 import {
   formatTime, formatHistoryTime, formatTokens, formatDuration,
-  formatCost, runDuration, contextLabel, contextLevel, requiredShortcutVariables,
+  formatCost, runDuration, contextLabel, contextLevel, contextStateText, requiredShortcutVariables,
   isNarrowConversationLayout, websocketAssistantMessageID, isTemporaryMessage,
   mergeConversationItems, mergeReloadMessages, agentStatusLabel,
 } from "../lib/utils";
@@ -45,6 +46,7 @@ import {
   buildTimeline, buildAgentExecutions, subagentTextIndex,
   isSubagentMessage, flattenAgents, timelineContentVersion,
 } from "../lib/timeline";
+import { formatStageClock, latestActiveStage, pickRunIndicatorVariant, type RunIndicatorVariant } from "../lib/run-indicator";
 import {
   MAX_OPEN_CONVERSATION_TABS, closeConversationTab, markConversationTabRead, openConversationTab, recordConversationActivity,
   readClosedConversationIds, clearConversationTabClosed, markConversationTabClosed, readConversationTabs, writeConversationTabs, type ConversationTabsState,
@@ -403,6 +405,43 @@ function CommandCatalogList({ commands, selected, onSelect }: { commands: AgentC
   </>;
 }
 
+// 运行指示器：7 个动画变体（波点/轨道/思绪波纹/星芒/追点/三点走三角/CLI 盲文）
+// 按 runId 哈希随机抽一个，同一 run 内不换（判据在 lib/run-indicator.ts）。
+// cli 变体的字符与阶段计时都由本组件内部的 interval 驱动 —— 计时状态必须收在
+// 这里而不是页面根上：页面根每秒 setState 会强迫整个会话页树重渲染，
+// 收在这里每秒只重渲染这一行。clockStartMs 传 null 表示无阶段事件，不显示计时。
+const runIndicatorCliFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+function RunIndicatorView({ variant, label, clockStartMs }: { variant: RunIndicatorVariant; label: string; clockStartMs: number | null }) {
+  const [cliFrame, setCliFrame] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (variant !== "cli") return;
+    setCliFrame(0);
+    const timer = window.setInterval(() => setCliFrame((value) => value + 1), 80);
+    return () => window.clearInterval(timer);
+  }, [variant]);
+  useEffect(() => {
+    if (clockStartMs === null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [clockStartMs]);
+  const clock = clockStartMs !== null ? formatStageClock(now - clockStartMs) : "";
+  return (
+    <div className={`run-indicator ri-${variant}`}>
+      {variant === "dots" && <span className="ri-anim ri-dots" aria-hidden="true"><i></i><i></i><i></i></span>}
+      {variant === "orbit" && <span className="ri-anim ri-orbit" aria-hidden="true"><span className="ri-orbit-spin"><i></i><i></i></span></span>}
+      {variant === "ripple" && <span className="ri-anim ri-ripple" aria-hidden="true"><i></i></span>}
+      {variant === "spark" && <span className="ri-anim ri-spark" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2 C13 8 16 11 22 12 C16 13 13 16 12 22 C11 16 8 13 2 12 C8 11 11 8 12 2 Z" /></svg></span>}
+      {variant === "chase" && <span className="ri-anim ri-chase" aria-hidden="true">{Array.from({ length: 6 }, (_, index) => <i className="ri-chase-dot" key={index} />)}</span>}
+      {variant === "tri" && <span className="ri-anim ri-tri" aria-hidden="true"><i></i><i></i><i></i></span>}
+      {variant === "cli" && <span className="ri-anim ri-cli" aria-hidden="true">{runIndicatorCliFrames[cliFrame % runIndicatorCliFrames.length]}</span>}
+      <span className="ri-stage">{label}</span>
+      {clock && <span className="ri-clock">· {clock}</span>}
+    </div>
+  );
+}
+
 function ConversationClearIcon({ running = false }: { running?: boolean }) {
   return running
     ? <svg className="conversation-clear-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5.5h10M9.5 5.5v-2h5v2M6.5 8l.8 10.5h9.4L17.5 8M10 11.5v4M14 11.5v4" /><path d="M4.5 12.5 2.8 10.8 4.5 9.1" /></svg>
@@ -679,11 +718,46 @@ function UsageDialogIcon() {
   return <svg className="usage-dialog-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V10M10 19V5M15 19v-7M20 19V8" /><path d="M3.5 19.5h17" /></svg>;
 }
 
-function UsageDialogHeader({ agentName, close }: { agentName: string; close: () => void }) {
-  return <header><div className="usage-dialog-heading"><span className="usage-dialog-mark"><UsageDialogIcon /></span><div><label>{agentName.toUpperCase()} USAGE</label><h2 id="usage-title">使用状态</h2></div></div><button type="button" className="usage-dialog-close" title="关闭" aria-label="关闭" onClick={close}><DialogCloseIcon /></button></header>;
+// 方案 D（图表主角）的半圆仪表：上下文要有「窗口 + 读数」两个可信值才画弧，
+// 缺一边就是「计算中」，只留轨道和占位符，不把读不到画成 0%。
+const USAGE_ARC_RADIUS = 88;
+const USAGE_ARC_LENGTH = Math.PI * USAGE_ARC_RADIUS;
+function UsageArcGauge({ percent, level, pendingText }: { percent: number | null; level: string; pendingText: string }) {
+  const clamped = percent === null ? null : Math.min(100, Math.max(0, percent));
+  return <div className={`usage-arc ${level}`} role="img" aria-label={clamped === null ? pendingText : `上下文已使用 ${clamped}%`}>
+    <svg width="196" height="104" viewBox="0 0 208 116" aria-hidden="true">
+      <path className="usage-arc-track" d="M 16 108 A 88 88 0 0 1 192 108" />
+      {clamped !== null && <path className="usage-arc-fill" d="M 16 108 A 88 88 0 0 1 192 108" strokeDasharray={`${clamped / 100 * USAGE_ARC_LENGTH} ${USAGE_ARC_LENGTH}`} />}
+    </svg>
+    <div className="usage-arc-center"><b>{clamped === null ? "--" : `${clamped}%`}</b><span>上下文已用</span></div>
+  </div>;
 }
 
-function UsageDialog({ agentID, usage, currentRun, close }: { agentID: AgentID; usage: ConversationUsageResponse | null; currentRun: RunUsage | undefined; close: () => void }) {
+// 指标条的小图标。kind 与文案一一对应，改文案时同步改这里的路径。
+type UsageMetricKind = "duration" | "ttft" | "turns" | "steps" | "tools" | "subagents";
+const USAGE_METRIC_PATHS: Record<UsageMetricKind, React.ReactNode> = {
+  duration: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+  ttft: <path d="M13 2v7h6L11 22v-7H5z" />,
+  turns: <><path d="M8 6h13M8 12h13M8 18h13" /><circle cx="4" cy="6" r="1" /><circle cx="4" cy="12" r="1" /><circle cx="4" cy="18" r="1" /></>,
+  steps: <><rect x="4" y="4" width="16" height="16" rx="2" /><path d="M9 4v16M4 9h16" /></>,
+  tools: <path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18v3h3l5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3z" />,
+  subagents: <><rect x="5" y="7" width="14" height="12" rx="2" /><circle cx="9.5" cy="12.5" r="1" /><circle cx="14.5" cy="12.5" r="1" /><path d="M12 7V4M9 4h6" /></>,
+};
+function UsageMetricIcon({ kind }: { kind: UsageMetricKind }) {
+  return <svg className="usage-metric-icon" viewBox="0 0 24 24" aria-hidden="true">{USAGE_METRIC_PATHS[kind]}</svg>;
+}
+
+function UsageChartCardIcon({ kind }: { kind: "tokens" | "cost" }) {
+  return <svg className="usage-card-icon" viewBox="0 0 24 24" aria-hidden="true">{kind === "tokens"
+    ? <><path d="m12 3 9 5-9 5-9-5z" /><path d="m3 14.5 9 5 9-5" /></>
+    : <><path d="M12 3v18M5 8l7-5 7 5" /><path d="M3 21h18" /></>}</svg>;
+}
+
+function UsageDialogHeader({ close }: { close: () => void }) {
+  return <header><div className="usage-dialog-heading"><span className="usage-dialog-mark"><UsageDialogIcon /></span><h2 id="usage-title">使用状态</h2></div><button type="button" className="usage-dialog-close" title="关闭" aria-label="关闭" onClick={close}><DialogCloseIcon /></button></header>;
+}
+
+function UsageDialog({ agentID, usage, close }: { agentID: AgentID; usage: ConversationUsageResponse | null; close: () => void }) {
   const agentName = agentDisplayName(agentID);
   // 计时器仅在本组件挂载时（即弹窗打开时）运行，避免在对话页顶层每秒触发整页重渲染。
   const [now, setNow] = useState(Date.now());
@@ -691,36 +765,82 @@ function UsageDialog({ agentID, usage, currentRun, close }: { agentID: AgentID; 
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  if (usage && !usage.available) return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><UsageDialogHeader agentName={agentName} close={close} /><div className="usage-body usage-unavailable"><p className="usage-note">{usage.reason || "当前工具未提供可验证的使用统计。"}</p></div><footer><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
+  if (usage && !usage.available) return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><UsageDialogHeader close={close} /><div className="usage-body usage-unavailable"><p className="usage-note">{usage.reason || "当前工具未提供可验证的使用统计。"}</p></div><footer><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
   const task = usage?.currentRun ?? usage?.latestRun;
   // 与模型选择器同一条规矩：按模型聚合的用量可能是 null（Go 的 nil 切片），
   // 只对 usage 做可选链时这里同样会在 null 上读 .length 抛错。
   const modelUsage = modelList(usage);
   const active = Boolean(usage?.currentRun && usage.currentRun.status === "running");
   const hasTaskUsage = Boolean(task?.hasResult);
-  const metrics = task ? [
-    ["状态", active ? "运行中" : task.status === "completed" ? "已完成" : task.status === "stopped" ? "已停止" : task.status === "failed" ? "失败" : task.status],
-    ["耗时", formatDuration(runDuration(task, now))],
-    ["首个响应", task.ttftMs > 0 ? formatDuration(task.ttftMs) : "等待响应"],
-    ["Agent 轮次", task.agentTurns || "--"],
-    ["模型步骤", task.modelSteps || "--"],
-    ["工具调用", task.toolCalls || "--"],
-    ["子代理", task.subagentCount || "0"],
-    ["输入 / 输出", hasTaskUsage ? `${formatTokens(task.inputTokens)} / ${formatTokens(task.outputTokens)}` : "等待最终统计"],
-    ["缓存读取 / 创建", hasTaskUsage ? `${formatTokens(task.cacheReadTokens)} / ${formatTokens(task.cacheCreationTokens)}` : "等待最终统计"],
-    ["费用估算", hasTaskUsage ? formatCost(task.estimatedCostUsd) : "等待最终统计"],
-  ] : [];
   const session = usage?.session;
   const context = usage?.context;
   const contextWindow = context?.contextWindow ?? 0;
   const contextTokens = context?.contextInputTokens ?? 0;
-  const contextPercent = contextWindow > 0 ? Math.min(100, Math.round(contextTokens / contextWindow * 100)) : 0;
-  const contextDetail = contextTokens && contextWindow ? `${formatTokens(contextTokens)} / ${formatTokens(contextWindow)}` : contextTokens ? `已用 ${formatTokens(contextTokens)}` : context?.available === false ? context.reason || "当前工具未提供上下文快照" : context?.hasResult ? "当前工具未提供上下文快照" : "等待上下文快照";
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><UsageDialogHeader agentName={agentName} close={close} /><div className="usage-body">
-    <section className="usage-context-overview"><div><span>当前会话上下文</span><b>{contextDetail}</b></div><span className={`context-state ${contextLevel(context)}`}>{contextLabel(context)}</span>{contextWindow > 0 && <div className={`usage-context-meter ${contextLevel(context)}`} aria-label={`上下文使用 ${contextPercent}%`}><i style={{ width: `${contextPercent}%` }} /></div>}</section>
-    <section className="usage-section"><div className="usage-section-head"><h3>当前任务</h3>{task?.model && <span className="usage-model-label" title={task.model}>{task.model}</span>}</div>{task ? <><dl className="usage-grid task-usage-grid">{metrics.map(([label, value]) => <div key={String(label)} className={label === "状态" ? `usage-metric-status ${active ? "running" : task.status}` : ""}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>{!hasTaskUsage && !active && <p className="usage-note">{task.reason || `该任务未获得 ${agentName} 的最终统计数据。`}</p>}</> : <p className="usage-note">当前会话还没有可用的任务统计。</p>}</section>
-    {session && <section className="usage-section"><div className="usage-section-head"><h3>当前会话</h3><span>{session.taskCount} 次任务</span></div><dl className="usage-grid session-grid"><div><dt>Agent 轮次</dt><dd>{session.agentTurns}</dd></div><div><dt>模型步骤</dt><dd>{session.modelSteps}</dd></div><div><dt>工具调用</dt><dd>{session.toolCalls}</dd></div><div><dt>输入 / 输出</dt><dd>{formatTokens(session.inputTokens)} / {formatTokens(session.outputTokens)}</dd></div><div><dt>缓存读取 / 创建</dt><dd>{formatTokens(session.cacheReadTokens)} / {formatTokens(session.cacheCreationTokens)}</dd></div><div><dt>费用估算</dt><dd>{formatCost(session.estimatedCostUsd)}</dd></div></dl></section>}
-    {modelUsage.length ? <section className="usage-section"><div className="usage-section-head"><h3>模型用量</h3><span>包含子代理</span></div><div className="model-usage-list">{modelUsage.map((model) => <div key={model.model}><b>{model.model}</b><span>{formatTokens(model.inputTokens)} 输入 · {formatTokens(model.outputTokens)} 输出</span><em>{formatCost(model.estimatedCostUsd)}</em></div>)}</div></section> : null}
+  // 窗口与读数都齐了才承认这个百分比；缺一边是「计算中」，不能画成 0%。
+  const contextPercent = contextWindow > 0 && contextTokens > 0 ? Math.min(100, Math.round(contextTokens / contextWindow * 100)) : null;
+  const contextUsed = contextTokens && contextWindow ? `${formatTokens(contextTokens)} / ${formatTokens(contextWindow)}` : contextTokens ? `已用 ${formatTokens(contextTokens)}` : context?.available === false ? context.reason || "当前工具未提供上下文快照" : context?.hasResult ? "当前工具未提供上下文快照" : "等待上下文快照";
+  const contextRemain = contextWindow > 0 && contextTokens > 0 ? formatTokens(Math.max(0, contextWindow - contextTokens)) : null;
+  const sessionTokens = session ? session.inputTokens + session.outputTokens + session.cacheReadTokens + session.cacheCreationTokens : 0;
+  const taskTokenTotal = hasTaskUsage && task ? task.inputTokens + task.outputTokens + task.cacheReadTokens + task.cacheCreationTokens : 0;
+  const taskSegments = hasTaskUsage && task ? [
+    { kind: "seg-cache-read", label: "缓存读取", value: task.cacheReadTokens },
+    { kind: "seg-input", label: "输入", value: task.inputTokens },
+    { kind: "seg-cache-create", label: "缓存创建", value: task.cacheCreationTokens },
+    { kind: "seg-output", label: "输出", value: task.outputTokens },
+  ] : [];
+  const maxModelCost = modelUsage.length ? Math.max(...modelUsage.map((model) => model.estimatedCostUsd)) : 0;
+  // 徽章文案不直接吐后端 status（内部叫法不许上屏）；latestRun 残留 running 而判活为假时，
+  // 也按运行中渲染而不是露出英文原文。
+  const badgeRunning = active || task?.status === "running";
+  const taskStatusText = !task
+    ? ""
+    : active || task.status === "running"
+      ? "运行中"
+      : task.status === "completed" ? "已完成" : task.status === "stopped" ? "已停止" : task.status === "failed" ? "失败" : task.status;
+  // 三态分开：「真的 0」≠「没查成」≠「还在算」。
+  const taskNote = !task
+    ? "当前会话还没有可用的任务统计。"
+    : active
+      ? "任务结束后给出最终统计。"
+      : task.reason || `该任务未获得 ${agentName} 的最终统计数据。`;
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="usage-title"><section className="modal usage-dialog"><UsageDialogHeader close={close} /><div className="usage-body">
+    <section className="usage-arc-banner">
+      <UsageArcGauge percent={contextPercent} level={contextLevel(context)} pendingText={contextStateText(context)} />
+      <div className="usage-arc-meta">
+        <div className="usage-arc-row"><span>已用 / 窗口</span><b title={contextUsed}>{contextUsed}</b></div>
+        {contextRemain && <div className="usage-arc-row"><span>剩余可用</span><b>{contextRemain}</b></div>}
+        {session && <div className="usage-arc-row"><span>会话累计 tokens</span><b>{formatTokens(sessionTokens)}</b></div>}
+        {session && <div className="usage-arc-row"><span>会话费用估算</span><b>{formatCost(session.estimatedCostUsd)}</b></div>}
+        {session && <div className="usage-arc-row"><span>任务次数</span><b>{session.taskCount}</b></div>}
+      </div>
+      <span className={`context-state ${contextLevel(context)}`}>{contextStateText(context)}</span>
+    </section>
+    {task && <section className="usage-task-head"><h3>当前任务</h3><span className={`usage-run-badge ${badgeRunning ? "running" : task.status}`}>{badgeRunning && <i aria-hidden="true" />}{taskStatusText}</span>{task.model && <span className="usage-task-model" title={task.model}>{task.model}</span>}</section>}
+    <div className="usage-chart-cols">
+      <section className="usage-chart-card">
+        <h4><UsageChartCardIcon kind="tokens" />本次 Token 构成{task && hasTaskUsage && taskTokenTotal > 0 && <span>共 {formatTokens(taskTokenTotal)} tokens · 费用 {formatCost(task.estimatedCostUsd)}</span>}</h4>
+        {task && hasTaskUsage && taskTokenTotal > 0 ? <>
+          <div className="usage-token-bar">{taskSegments.filter((segment) => segment.value > 0).map((segment) => <i key={segment.kind} className={segment.kind} style={{ flex: `${segment.value} 1 0%` }} title={`${segment.label} ${formatTokens(segment.value)}`} />)}</div>
+          <div className="usage-token-legend">{taskSegments.map((segment) => <div key={segment.kind}><i className={segment.kind} />{segment.label}<b>{formatTokens(segment.value)}</b></div>)}</div>
+        </> : <p className="usage-note">{hasTaskUsage && taskTokenTotal === 0 ? "本任务没有产生 token 记录。" : taskNote}</p>}
+      </section>
+      {modelUsage.length > 0 && <section className="usage-chart-card">
+        <h4><UsageChartCardIcon kind="cost" />模型费用<span>包含子代理{session ? ` · 会话累计 ${formatCost(session.estimatedCostUsd)}` : ""}</span></h4>
+        <div className="usage-model-bars">{modelUsage.map((model) => <div key={model.model} className="usage-model-bar">
+          <div className="usage-model-line"><b title={model.model}>{model.model}</b><em>{formatCost(model.estimatedCostUsd)}</em></div>
+          <div className="usage-model-lane"><i style={{ width: `${maxModelCost > 0 ? Math.max(2, Math.round(model.estimatedCostUsd / maxModelCost * 100)) : 0}%` }} /></div>
+          <span className="usage-model-detail">{formatTokens(model.inputTokens)} 输入 · {formatTokens(model.outputTokens)} 输出</span>
+        </div>)}</div>
+      </section>}
+    </div>
+    {task && <div className="usage-metric-strip">
+      <div className={`usage-metric${active ? " live" : ""}`}><UsageMetricIcon kind="duration" /><b>{formatDuration(runDuration(task, now))}</b><span>耗时</span></div>
+      <div className="usage-metric"><UsageMetricIcon kind="ttft" /><b>{task.ttftMs > 0 ? formatDuration(task.ttftMs) : "等待响应"}</b><span>首个响应</span></div>
+      <div className="usage-metric"><UsageMetricIcon kind="turns" /><b>{task.agentTurns || "--"}</b><span>Agent 轮次</span></div>
+      <div className="usage-metric"><UsageMetricIcon kind="steps" /><b>{task.modelSteps || "--"}</b><span>模型步骤</span></div>
+      <div className="usage-metric"><UsageMetricIcon kind="tools" /><b>{task.toolCalls || "--"}</b><span>工具调用</span></div>
+      <div className="usage-metric"><UsageMetricIcon kind="subagents" /><b>{task.subagentCount || "0"}</b><span>子代理</span></div>
+    </div>}
     <p className="usage-disclaimer">费用为客户端事件估算值，不代表账单金额。</p>
   </div><footer><button className="secondary" onClick={close}>关闭</button></footer></section></div>;
 }
@@ -3478,9 +3598,20 @@ export default function ConversationPage() {
     void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
   };
 
+  // 阶段计时：本阶段从最新一条「进行中」阶段事件（压缩/重试/后台任务）起算，
+  // 阶段一变自然归零，run 结束即停表 —— 口径对齐 CLI 的"当前动作计时"。
+  // 判据收口在 lib/run-indicator.ts；没有阶段事件时退回 runLabel 且不显示计时
+  //（时间戳读不到就是读不到，不许拿 0 起点编出一个大数）。
+  // 计时的每秒 tick 在 RunIndicatorView 内部，不放在页面根上。
+  const stageItem = useMemo(() => (run ? latestActiveStage(events, run) : null), [events, run]);
+  const runIndicatorVariant = run ? pickRunIndicatorVariant(run) : null;
+  const stageCreatedAtMs = stageItem ? Date.parse(stageItem.createdAt) : Number.NaN;
+  const stageStartMs = Number.isFinite(stageCreatedAtMs) ? stageCreatedAtMs : null;
   const activeAgentName = conversation ? agentDisplayName(conversation.agentId) : "";
   const permissionLabel = conversation ? permissionCopy[conversation.permissionMode]?.title ?? conversation.permissionMode : "";
   const runLabel = activeAgentName ? `${activeAgentName} 正在处理任务` : "正在处理任务";
+  // 阶段词：有进行中的阶段事件用它的标题（桌面时间线同一份文案），否则退回「XX 正在处理任务」。
+  const stageLabel = stageItem ? stageItem.title : runLabel;
   const currentUsage = usage?.currentRun ?? usage?.latestRun;
   // 会话指定的模型优先展示：它是"接下来会用的模型"，而用量里的 model 是"上一次实际用的
   // 模型"（第三方网关还可能改写模型名，见 docs/36 §2.7）。实际值仍可在使用状态弹窗查看。
@@ -3591,12 +3722,16 @@ export default function ConversationPage() {
     const collapsible = Boolean(options?.collapsible);
     const collapsed = collapsible && Boolean(options?.collapsed);
     const toggle = options?.onToggle ?? (() => {});
+    // 桌面端（collapsible）渲染为「技能」色块的块头（.quick-block-head），与提示词/命令块同构；
+    // 移动端输入框菜单（非折叠）沿用原有 .quick-tag-group 标题行，样式随 .skill-tag 全局改版同步。
     const heading = collapsible
-      ? <button type="button" className="quick-tag-heading quick-tag-heading-toggle skill-heading-toggle" aria-expanded={!collapsed} title={collapsed ? "展开技能模块" : "折叠技能模块"} onClick={toggle}>
-          <span className="quick-tag-heading-label"><SkillTagIcon /><span className="quick-tag-heading-title">技能 (Skill)</span></span>
-          <span className="skill-source-hint" title="全部来源">{skillsLoading ? "加载中" : `${skills.length} 个`}</span>
-          <QuickTagChevron />
-        </button>
+      ? <div className="quick-block-head">
+          <button type="button" className="quick-block-title" aria-expanded={!collapsed} title={collapsed ? "展开技能模块" : "折叠技能模块"} onClick={toggle}>
+            <span className="quick-block-title-text">技能 Skill</span>
+            <QuickTagChevron />
+          </button>
+          <b className="quick-block-count">{skillsLoading ? "…" : skills.length}</b>
+        </div>
       : <div className="quick-tag-heading">
           <span className="quick-tag-heading-label"><SkillTagIcon /><span className="quick-tag-heading-title">技能 (Skill)</span></span>
           <span className="skill-source-hint" title="全部来源"> {skillsLoading ? "加载中" : `${skills.length} 个`}</span>
@@ -3625,12 +3760,12 @@ export default function ConversationPage() {
             </div>
           );
         })}</div>;
-    return (
-      <div className={`quick-tag-group skill-tags${collapsible && collapsed ? " collapsed" : ""}`}>
-        {heading}
-        {!(collapsible && collapsed) && body}
-      </div>
-    );
+    return collapsible
+      ? <div className={`quick-block skill-block${collapsed ? " collapsed" : ""}`}>
+          {heading}
+          {!collapsed && body}
+        </div>
+      : <div className="quick-tag-group skill-tags">{heading}{body}</div>;
   };
 
   return <>
@@ -3653,16 +3788,29 @@ export default function ConversationPage() {
     <section className="conversation-canvas" data-queue-collapsed={!readOnlyConversation && conversationPanels.taskQueue ? "true" : undefined}>
       <aside className="quick-tag-rail" aria-label="常用操作">
         <div className="quick-actions-row">
-          <div className={`quick-tag-group quick-shortcuts${conversationPanels.shortcuts ? " collapsed" : ""}`}>
-            <div className="quick-tag-heading">
-              <button type="button" className="quick-tag-heading-toggle" aria-expanded={!conversationPanels.shortcuts} title={conversationPanels.shortcuts ? "展开常用提示词 / 常用命令" : "折叠常用提示词 / 常用命令"} onClick={() => toggleConversationPanel("shortcuts")}><ShortcutCategoryIcon kind="prompt" /><span className="quick-tag-heading-title">常用提示词 / 常用命令</span><b className="quick-tag-count">{promptShortcuts.length + commandShortcuts.length}</b><QuickTagChevron /></button>
-              <button type="button" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button>
-              <button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button>
+          {/* 方案 F 色块分区：提示词 / 命令 / 技能各一块浅色底板，白色胶囊浮在上面。
+              三块独立折叠（shortcuts / commands / skills），新增入口收进各自块头右端。 */}
+          <div className={`quick-block prompt-block${conversationPanels.shortcuts ? " collapsed" : ""}`}>
+            <div className="quick-block-head">
+              <button type="button" className="quick-block-title" aria-expanded={!conversationPanels.shortcuts} title={conversationPanels.shortcuts ? "展开常用提示词" : "折叠常用提示词"} onClick={() => toggleConversationPanel("shortcuts")}>
+                <span className="quick-block-title-text">常用提示词</span>
+                <QuickTagChevron />
+              </button>
+              <b className="quick-block-count">{promptShortcuts.length}</b>
+              <button type="button" className="quick-block-add" title="新增常用提示词" aria-label="新增常用提示词" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "prompt" })}><ShortcutAddIcon /></button>
             </div>
-            {!conversationPanels.shortcuts && <>
-              <div className="quick-shortcuts-sub"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="prompt" /><span>常用提示词</span><b className="quick-tag-count">{promptShortcuts.length}</b></span></div><ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-              <div className="quick-shortcuts-sub command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b></span></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
-            </>}
+            {!conversationPanels.shortcuts && <ShortcutSortableList items={promptShortcuts} kind="prompt" renderItem={renderPromptCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} />}
+          </div>
+          <div className={`quick-block command-block${conversationPanels.commands ? " collapsed" : ""}`}>
+            <div className="quick-block-head">
+              <button type="button" className="quick-block-title" aria-expanded={!conversationPanels.commands} title={conversationPanels.commands ? "展开常用命令" : "折叠常用命令"} onClick={() => toggleConversationPanel("commands")}>
+                <span className="quick-block-title-text">常用命令</span>
+                <QuickTagChevron />
+              </button>
+              <b className="quick-block-count">{commandShortcuts.length}</b>
+              <button type="button" className="quick-block-add" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => setShortcutEditor({ kind: "command_request" })}><ShortcutAddIcon /></button>
+            </div>
+            {!conversationPanels.commands && <ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} />}
           </div>
           {renderSkillGroup({ collapsible: true, collapsed: conversationPanels.skills, onToggle: () => toggleConversationPanel("skills") })}
         </div>
@@ -3674,7 +3822,7 @@ export default function ConversationPage() {
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
         {isEmptyConversation && <section className="conversation-starter" aria-label="新会话建议"><span>新会话</span><h2>从一个任务开始</h2><div className="conversation-starter-options">{starterSuggestions.map((suggestion) => <button key={suggestion.label} type="button" onClick={() => startFromSuggestion(suggestion.prompt)}>{suggestion.label}</button>)}</div></section>}
         <MessageList timeline={timeline} agentID={conversation?.agentId || "claude-code"} fail={fail} resolving={resolving} decide={decide} projectId={project.id} onViewTask={onViewTask} executionByRun={executionByRun} onOpenExecution={openExecutionParam} registerUserMessageElement={registerUserMessageElement} />
-        {run && <div className="run-indicator"><span></span>{runLabel}</div>}
+        {run && runIndicatorVariant && <RunIndicatorView variant={runIndicatorVariant} label={stageLabel} clockStartMs={stageStartMs} />}
         <div ref={bottom} />
       </section>
       <UserMessageDotsRail messages={userMessages} activeIndex={userMessageNavigationIndex} onJump={scrollToUserMessage} />
@@ -3718,7 +3866,7 @@ export default function ConversationPage() {
     {showHistory && <ConversationHistoryDialog conversations={conversationHistory} historyQuery={historyQuery} loading={historyLoading} error={historyError} activeID={conversation?.id || ""} busyID={activatingConversation} deletingID={deletingConversation} deleteAllBusy={deleteAllConversationsBusy} close={closeHistory} activate={activateConversation} view={viewConversation} search={searchConversationHistory} deleteOne={deleteHistoryConversation} deleteAll={deleteAllHistoryConversations} hasMore={Boolean(conversationHistoryCursor)} loadingMore={loadingMoreConversationHistory} loadMore={loadMoreConversationHistory} />}
     {showFullControlConfirmation && <FullControlConfirmationDialog close={() => setShowFullControlConfirmation(false)} confirm={confirmFullControl} changing={changingPermission} agentID={conversation?.agentId || ""} />}
     {showAgentExecution && agentExecutions.find((execution) => execution.runId === showAgentExecution) && <AgentExecutionDialog execution={agentExecutions.find((execution) => execution.runId === showAgentExecution)!} close={closeAgentExecution} />}
-    {showUsage && <UsageDialog agentID={conversation?.agentId || "claude-code"} usage={usage} currentRun={currentUsage} close={closeUsage} />}
+    {showUsage && <UsageDialog agentID={conversation?.agentId || "claude-code"} usage={usage} close={closeUsage} />}
     {showAiConfig && <ProjectAiConfigDialog projectId={project.id} runnerID={project.runner} close={closeAiConfig} />}
     {shortcutEditor && <ShortcutEditor projectID={project.id} state={shortcutEditor} close={() => setShortcutEditor(null)} refresh={refreshShortcuts} fail={fail} agentID={conversation?.agentId || "claude-code"} catalog={commandCatalog} catalogLoading={commandCatalogLoading} refreshCatalog={refreshCommandCatalog} />}
     {shortcutVariables && <ShortcutVariablesDialog state={shortcutVariables} close={() => setShortcutVariables(null)} run={(variables) => { setShortcutVariables(null); void runShortcut(shortcutVariables.shortcut, variables, true); }} />}

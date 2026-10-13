@@ -386,9 +386,11 @@ test("task queue has one named landmark", () => {
 });
 
 test("shortcut and task cards keep their intrinsic row heights", () => {
-  // align-content: start 让列表行不被拉高；align-items: start 让两列各自按内容高度顶部对齐，
-  // 否则提示词/命令数量不等时，较短一列的卡片间距会被拉伸（见 quick-tag-rail 两列布局）。
-  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*align-content:\s*start;[^}]*align-items:\s*start;/s);
+  // 方案 F 色块分区：左栏是纵向色块流（.quick-actions-row 为 flex column），
+  // 块内条目是 hug 胶囊（.quick-block .quick-tag 为 inline-flex + align-items: center），
+  // 不再有“两列行高被拉伸”的旧问题；这里钉住纵向流与胶囊的居中排布。
+  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*flex-direction:\s*column;[^}]*align-items:\s*stretch;/s);
+  assert.match(stylesheet, /\.quick-block \.quick-tag\s*\{[^}]*align-items:\s*center;/s);
   assert.match(taskStyles, /\.task-queue-list\s*\{[^}]*align-content:\s*start;[^}]*gap:\s*6px;/s);
 });
 
@@ -627,7 +629,11 @@ test("new conversations start from the configured default permission", () => {
 });
 
 test("wide and narrow screens sort prompts and commands in separate vertical lists", () => {
-  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
+  // 方案 F：左栏是纵向色块流，提示词/命令各自一块浅色底板（.quick-block），块内胶囊换行铺开。
+  assert.match(stylesheet, /\.quick-actions-row\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s);
+  assert.match(stylesheet, /\.quick-block\.prompt-block\s*\{[^}]*background:\s*#e9f4ec;/s);
+  assert.match(stylesheet, /\.quick-block\.command-block\s*\{[^}]*background:\s*#eff4dd;/s);
+  assert.match(stylesheet, /\.quick-block \.quick-tag-list\s*\{[^}]*flex-wrap:\s*wrap;/s);
   assert.match(stylesheet, /\.quick-tag-list\.sortable\s*\{[^}]*list-style:\s*none;[^}]*margin:\s*0;[^}]*padding:\s*0;/s);
   assert.match(stylesheet, /\.quick-tag-list\.sortable \.quick-tag-item\s*\{[^}]*cursor:\s*grab;/s);
   assert.match(stylesheet, /\.quick-tag-item\.dragging\s*\{[^}]*opacity:\s*\.55;/);
@@ -635,7 +641,6 @@ test("wide and narrow screens sort prompts and commands in separate vertical lis
   // quick-actions-mobile 响应式变体已随「窄屏快捷方式收进 composer 菜单」下线，
   // 死样式连同这里的旧断言一起移除（见下一个测试）。
   assert.match(stylesheet, /@media \(max-width: 820px\)[\s\S]*?\.quick-actions-row\s*\{[^}]*display:\s*none;/);
-  assert.match(stylesheet, /\.quick-actions-row \.quick-tag > button:first-child,\s*\.quick-actions-row \.quick-tag-empty\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
   assert.match(conversationPage, /function ShortcutSortableList\(/);
   assert.match(conversationPage, /const reorderKind = useCallback\(async \(kind/s);
   assert.match(conversationPage, /`\/api\/projects\/\$\{projectId\}\/shortcuts\/reorder`/);
@@ -689,14 +694,15 @@ test("conversation side modules collapse through header toggles and persist per 
   assert.match(conversationPage, /const \[conversationPanelsState, setConversationPanelsState\] = useState<\{ projectId: string; collapsed: ConversationPanelsState \}>/);
   assert.match(conversationPage, /const conversationPanels = conversationPanelsState\.collapsed;/);
   assert.match(conversationPage, /writeConversationPanels\(projectId, conversationPanelsState\.collapsed\)/);
-  // 常用提示词 + 常用命令合并为一个整体折叠（.quick-shortcuts），技能为独立折叠。
-  assert.match(conversationPage, /className="quick-tag-heading-toggle"[\s\S]*?aria-expanded=\{!conversationPanels\.shortcuts\}[\s\S]*?toggleConversationPanel\("shortcuts"\)/);
+  // 方案 F：提示词 / 命令 / 技能是三个独立色块，各自折叠（shortcuts / commands / skills）。
+  assert.match(conversationPage, /className="quick-block-title" aria-expanded=\{!conversationPanels\.shortcuts\}[\s\S]*?toggleConversationPanel\("shortcuts"\)/);
+  assert.match(conversationPage, /className="quick-block-title" aria-expanded=\{!conversationPanels\.commands\}[\s\S]*?toggleConversationPanel\("commands"\)/);
   assert.match(conversationPage, /renderSkillGroup\(\{ collapsible: true, collapsed: conversationPanels\.skills, onToggle: \(\) => toggleConversationPanel\("skills"\) \}\)/);
-  // 折叠状态里不再有独立的 prompt / command 键。
   assert.match(conversationPage, /toggleConversationPanel\("shortcuts"\)/);
-  assert.doesNotMatch(conversationPage, /conversationPanels\.(prompt|command)/);
+  // 旧版「提示词+命令合并折叠」的键不许回来；commands 是独立键。
+  assert.doesNotMatch(conversationPage, /conversationPanels\.prompt/);
   // 折叠箭头会随折叠状态翻转（展开朝上、折叠朝下）。
-  assert.match(stylesheet, /\.quick-tag-group\.collapsed \.quick-tag-heading-chevron \{[^}]*transform: rotate\(180deg\);/s);
+  assert.match(stylesheet, /\.quick-block\.collapsed \.quick-block-title \.quick-tag-heading-chevron \{[^}]*transform: rotate\(180deg\);/s);
   // 任务队列标题提供折叠箭头；折叠后在宽屏收敛为右侧窄条。
   assert.match(taskQueue, /task-queue-fold[\s\S]*?aria-expanded=\{!collapsed\}[\s\S]*?onClick=\{\(\) => onToggleCollapsed\?\.\(\)\}/);
   assert.match(conversationPage, /data-collapsed=\{conversationPanels\.taskQueue \? "true" : undefined\}/);

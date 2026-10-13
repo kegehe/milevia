@@ -103,8 +103,9 @@ export type ToolCard = {
   latestText: string;
   latestTone: "plain" | "new" | "none" | "loading";
 
-  /** 一句话状态（判断），不是素材。 */
-  statusTone: "ok" | "warn" | "bad" | "unknown" | "muted";
+  /** 一句话状态（判断），不是素材。`loading` = 读数还在路上（分支⓪专属），
+   *  页面据此把这一行渲染成占位条 —— 它与通用灰 `muted`（"还没装"等）是两种意思。 */
+  statusTone: "ok" | "warn" | "bad" | "unknown" | "muted" | "loading";
   statusText: string;
 
   /** 做不了的时候要说清的那一句（"为什么点不了"）。 */
@@ -479,7 +480,9 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
   //    不给任何动作：能不能装、能不能升、要不要留意，此刻一条都还没读到。
   if (input.reading) {
     card.icon = "loading";
-    card.statusTone = "muted";
+    // 独立的 `loading` 档，不复用 `muted`：页面把这一档的状态行渲染成占位条，
+    // 而「还没装」等通用灰档仍是文字 —— 两档共用一个值就会一起被条形化。
+    card.statusTone = "loading";
     card.statusText = "正在读取…";
     card.currentTone = "loading";
     card.currentText = "读取中…";

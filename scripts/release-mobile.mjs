@@ -9,7 +9,7 @@
 //   node scripts/release-mobile.mjs --bump-only 0.1.6      # 只同步 Android 版本号
 //   node scripts/release-mobile.mjs 0.1.6 "…" --no-build   # 复用已有 APK，只更新清单
 //   node scripts/release-mobile.mjs 0.1.6 "…" --deploy     # 上传：自建更新源 + GitHub Release 资产
-//   node scripts/release-mobile.mjs 0.1.6 "…" --allow-debug # 仅本机内测，允许 debug 签名
+//   node scripts/release-mobile.mjs 0.1.6 "…" --allow-debug # 无正式签名时用 debug 签名（可配合 --deploy）
 //
 // 环境变量：
 //   MILEVIA_DOWNLOAD_BASE  自建源清单里 APK 的下载基地址（默认自建服务器
@@ -17,8 +17,8 @@
 //   MILEVIA_DEPLOY_TARGET  --deploy 的 scp 目标（如 root@host:/var/www/milevia/dist/updates/）
 //   MILEVIA_ANDROID_KEYSTORE / _PASSWORD / _KEY_ALIAS / _KEY_PASSWORD
 //                           Android 正式签名。也可放 apps/web/android/keystore.properties。
-//                           缺失时仅可显式加 --allow-debug 生成本机内测包；--deploy 一律拒绝
-//                           debug 签名，避免用户无法覆盖安装正式版本。
+//                           缺失时回退 debug 签名（历史一直如此，见 docs/33），--deploy 照发，
+//                           但必须显式加 --allow-debug 确认，避免误把 debug 包当真签名发布。
 //
 // 清单会写两份，下载地址分别指向两个能真正下到包的地方（见 scripts/lib/update-manifest.mjs）：
 //   release/updates/latest.json → 自建源（传到服务器的 /updates/），国内快，主用路径
@@ -120,11 +120,10 @@ function resolveReleaseSigning() {
 }
 
 const hasKeystore = bumpOnly ? false : resolveReleaseSigning();
-if (!bumpOnly && !hasKeystore && deploy) {
-  throw new Error("--deploy 必须使用 Android 正式签名。请配置 keystore.properties 或 MILEVIA_ANDROID_KEYSTORE 等四个环境变量。");
-}
+// 手机端历史上一直用 debug 签名发布（见 docs/33：切正式 keystore 是需卸载重装的独立决定），
+// 所以 --deploy 也允许走 debug 签名，但要求显式加 --allow-debug —— 避免误把 debug 包当真签名发出去。
 if (!bumpOnly && !hasKeystore && !allowDebug) {
-  throw new Error("未配置 Android 正式签名。正式发包请配置 keystore.properties 或环境变量；仅本机内测请显式加 --allow-debug。");
+  throw new Error("未配置 Android 正式签名。正式发包请配置 keystore.properties 或环境变量；确认用 debug 签名（历史默认）请显式加 --allow-debug。");
 }
 // 锚定行首，避免把注释里出现的 versionCode 之类文本当成真值（桌面脚本已踩过这个坑）。
 const codeMatch = gradleSource.match(/^[ \t]*versionCode\s+(\d+)/m);
