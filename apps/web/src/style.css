@@ -234,7 +234,7 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
 .project-dashboard h1 { margin-top: 0; color: #19332c; font-size: clamp(35px, 4.4vw, 59px); font-weight: 700; line-height: 1.15; }
 .project-dashboard h1 em { color: var(--accent); font-style: normal; }
 .project-grid { grid-template-columns: repeat(3, minmax(250px, 1fr)); gap: 18px; }
-.project-card { --card-accent: #55b4a6; min-height: 292px; border: 1px solid #c7dcd0; border-radius: 8px; padding: 18px; color: #19332c; background: #fbfefb; box-shadow: 0 1px 3px #17362c14, 0 10px 24px #17362c0d; transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease; }
+.project-card { --card-accent: #55b4a6; min-height: 268px; border: 1px solid #c7dcd0; border-radius: 8px; padding: 18px; color: #19332c; background: #fbfefb; box-shadow: 0 1px 3px #17362c14, 0 10px 24px #17362c0d; transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease; }
 .project-card::before { position: absolute; z-index: 0; top: 0; right: 0; width: 36%; height: 7px; border-radius: 0 7px 0 8px; background: var(--card-accent); content: ""; }
 .project-card::after { right: 17px; bottom: 17px; width: 54px; height: 54px; border: 1px solid #d9e8dd; border-radius: 8px; background: repeating-linear-gradient(90deg, transparent 0, transparent 7px, #e1eee6 8px), repeating-linear-gradient(0deg, transparent 0, transparent 7px, #e1eee6 8px); }
 .project-card:hover { border-color: #5a998c; box-shadow: 0 3px 8px #17362c1c, 0 16px 32px #17362c14; transform: translateY(-3px); }
@@ -340,11 +340,6 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
 .command-dashboard .dashboard-summary > button.selected { border-color: var(--accent); background: var(--accent); box-shadow: 0 2px 6px #17362c2e; }
 .command-dashboard .dashboard-summary > button.selected b { color: #fff; }
 .command-dashboard .dashboard-summary > button.selected small { color: #cfe7de; }
-/* 标题下的状态副标题 */
-.command-dashboard .dashboard-intro-heading { display: grid; gap: 8px; }
-.command-dashboard .dashboard-intro .dashboard-subline { margin: 0; color: #71867b; font-size: 13px; line-height: 1.5; }
-/* 列表脚注：拖拽排序与刷新口径的一句话说明 */
-.dashboard-footnote { margin-top: 28px; color: #809188; font-size: 12px; text-align: center; }
 .command-dashboard .project-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
 .task-card { --card-accent: #55a697; display: flex; flex-direction: column; border-color: #d2e1d8; border-radius: 8px; padding: 0; background: #fcfffd; box-shadow: 0 1px 2px #17362c0c, 0 8px 22px #17362c0b; cursor: pointer; }.task-card.state-offline { border-color: #e3d9c2; background: #fdfcf6; }
 .task-card::before, .task-card::after { display: none; }
@@ -352,22 +347,24 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
 .task-card:hover { border-color: color-mix(in srgb, var(--card-accent) 48%, #b8d4c5); box-shadow: 0 4px 10px #17362c14, 0 17px 30px #17362c14; transform: translateY(-2px); }
 .project-card-open { position: absolute; z-index: 3; inset: 0; width: 100%; height: 100%; border: 0; border-radius: inherit; padding: 0; pointer-events: none; background: transparent; }.project-card-open:focus-visible {  outline: 2px solid #2b7b68; outline-offset: 3px;  }
 /* 悬浮铭牌：骑缝在色带下缘正中（上 26px 压色带、下 26px 落卡体）。 */
-.task-card .project-mark { position: absolute; z-index: 2; top: 14px; left: 20px; width: 52px; height: 52px; border-radius: 8px; font-size: 17px; box-shadow: inset 0 -3px color-mix(in srgb, var(--card-accent) 35%, #ffffff), 0 4px 10px #17362c24; }
+.task-card .project-mark { position: absolute; z-index: 2; top: 12px; left: 20px; width: 52px; height: 52px; border-radius: 8px; font-size: 17px; box-shadow: inset 0 -3px color-mix(in srgb, var(--card-accent) 35%, #ffffff), 0 4px 10px #17362c24; }
 /* 状态色带：把状态徽标拉成整条色带。运行中=青绿实底+柠檬脉冲点；
    就绪/不可用沿用各自徽标的浅底原色；内容从悬浮铭牌右侧起步。 */
-.project-band { position: relative; z-index: 1; display: flex; align-items: center; gap: 8px; height: 40px; flex: none; padding: 0 10px 0 78px; background: #217b68; }
-.project-band-status { display: inline-flex; align-items: center; gap: 6px; flex: 1; min-width: 0; overflow: hidden; color: #fff; font-size: 11.5px; font-weight: 700; white-space: nowrap; }
-.project-band-status i { width: 7px; height: 7px; flex: none; border-radius: 50%; background: #c8e85a; box-shadow: 0 0 0 4px #ffffff24; }
-.project-band-duration { flex: none; color: #b8e0d4; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; white-space: nowrap; }
+.project-band { position: relative; z-index: 1; display: flex; align-items: center; gap: 8px; height: 38px; flex: none; padding: 0 10px 0 86px; background: #217b68; }
+.project-band-status { display: inline-flex; align-items: center; gap: 6px; flex: 1 0 auto; overflow: hidden; margin-left: -4px; padding: 4px 0 4px 4px; color: #fff; font-size: 11.5px; font-weight: 700; white-space: nowrap; }
+.project-band-status i { width: 7px; height: 7px; flex: none; border-radius: 50%; background: #c8e85a; box-shadow: 0 0 0 4px #ffffff24; animation: project-band-pulse 1.25s ease-in-out infinite; }
+@keyframes project-band-pulse { 50% { opacity: .45; transform: scale(.72); } }
+@media (prefers-reduced-motion: reduce) { .project-band-status i { animation: none; } }
+.project-band-duration { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #b8e0d4; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; white-space: nowrap; }
 .project-band-env { display: grid; place-items: center; flex: none; width: 26px; height: 20px; border-radius: 5px; background: #eaf7ef; border: 1px solid #b8d8ca; color: #277566; }
 .project-band-env .env-tag-icon { width: 13px; height: 13px; color: #277566; }
 .task-card.state-ready .project-band { background: #f1f7d9; }
 .task-card.state-ready .project-band-status { color: #54762e; }
-.task-card.state-ready .project-band-status i { background: #8aac45; box-shadow: none; }
+.task-card.state-ready .project-band-status i { background: #8aac45; box-shadow: none; animation: none; }
 .task-card.state-ready .project-band-duration { color: #97a86a; }
 .task-card.state-offline .project-band { background: #fff8df; }
 .task-card.state-offline .project-band-status { color: #826718; }
-.task-card.state-offline .project-band-status i { background: #c6a34c; box-shadow: none; }
+.task-card.state-offline .project-band-status i { background: #c6a34c; box-shadow: none; animation: none; }
 .project-band .project-card-delete { display: grid; place-items: center; width: 24px; height: 24px; flex: none; border: 0; border-radius: 6px; padding: 0; background: transparent; color: #b8e0d4; font-size: 15px; line-height: 1; transition: color .16s ease, background .16s ease; cursor: pointer; }
 .project-band .project-card-delete:hover { color: #fff; background: #ffffff26; }
 .task-card.state-ready .project-band .project-card-delete { color: #a9bc6e; }
@@ -376,7 +373,7 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
 .task-card.state-offline .project-band .project-card-delete:hover { color: #826718; background: #ffffff8c; }
 .project-band .project-card-delete:focus-visible { outline: 2px solid #2b7b68; outline-offset: 2px; }
 /* 卡体：从悬浮铭牌下方起步。 */
-.task-card .project-card-body { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 12px; padding: 34px 18px 16px; }
+.task-card .project-card-body { position: relative; z-index: 1; display: flex; flex: 1 1 auto; flex-direction: column; justify-content: space-between; gap: 10px; padding: 32px 18px 13px; }
 .task-card .project-card-title { display: flex; flex-direction: column; gap: 8px; min-width: 0; align-self: stretch; padding: 0; }.task-card .project-card-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }.task-card .project-card-heading h2 { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; font-size: 21px; line-height: 1.15; }.task-card .project-card-heading .project-analysis-badge, .task-card .project-card-heading .project-run-state { flex: none; }.task-card .project-card-title p { display: -webkit-box; min-height: 0; margin: 0; overflow: hidden; color: #49665c; font-family: "Avenir Next", "PingFang SC", sans-serif; font-size: 13px; line-height: 1.45; text-overflow: ellipsis; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }.task-card.state-offline .project-card-title p { color: #8a6c1b; }
 
 /* 目录/仓库名含下划线时用等宽渲染（配合 .literal-name），避免正文无衬线字体里
@@ -386,8 +383,8 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
    18px ≈ 无衬线 24px 的同类宽度（等宽字形约 0.6em），窄到手机单列也基本放得下常见目录名。 */
 .task-card .project-card-title h2.literal-name { font-size: clamp(17px, 1.6vw, 21px); }
 
-.task-card .project-card-meta { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 0; border: 0; border-radius: 6px; padding: 9px 12px; background: #f8fcf9; }.task-card .project-card-meta > span { display: grid; min-width: 0; gap: 3px; }.task-card .project-card-meta > span + span { border-left: 1px solid #dce9e1; padding-left: 13px; }.task-card .project-card-meta small { color: #7a9086; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }.task-card .project-card-meta b { overflow: hidden; color: #284d43; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 400; }.task-card .project-card-meta > span:first-child b { font-size: 13px; font-weight: 600; }.task-card.state-offline .project-card-meta { background: #faf7ee; }.task-card.state-offline .project-card-meta small { color: #a5946b; }.task-card.state-offline .project-card-meta b { color: #5c4a1e; }
-.task-card footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; padding-top: 12px; color: #5e786d; font-size: 12px; }.task-card footer b { display: inline-flex; align-items: center; gap: 6px; color: #245d52; }.task-card footer i { display: inline-grid; width: 18px; height: 18px; place-items: center; border-radius: 50%; line-height: 1; font-size: 12px; font-style: normal; color: #f7fcf8; background: #2c7567; }
+.task-card .project-card-meta { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 0; border: 0; border-radius: 6px; padding: 8px 11px; background: #f8fcf9; }.task-card .project-card-meta > span { display: grid; min-width: 0; gap: 3px; }.task-card .project-card-meta > span + span { border-left: 1px solid #dce9e1; padding-left: 13px; }.task-card .project-card-meta small { color: #7a9086; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }.task-card .project-card-meta b { overflow: hidden; color: #284d43; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 400; }.task-card .project-card-meta > span:first-child b { font-size: 13px; font-weight: 600; }/* 工作目录完整显示：路径是判据不是装饰，省略截断会让人认错目录——整行放不下时按需断行（overflow-wrap: anywhere），不做截断。 */.task-card .project-card-meta > span + span b { overflow-wrap: anywhere; white-space: normal; word-break: normal; line-height: 1.4; }.task-card.state-offline .project-card-meta { background: #faf7ee; }.task-card.state-offline .project-card-meta small { color: #a5946b; }.task-card.state-offline .project-card-meta b { color: #5c4a1e; }
+.task-card footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 0; color: #5e786d; font-size: 12px; }.task-card footer b { display: inline-flex; align-items: center; gap: 6px; color: #245d52; }.task-card footer i { display: inline-grid; width: 18px; height: 18px; place-items: center; border-radius: 50%; line-height: 1; font-size: 12px; font-style: normal; color: #f7fcf8; background: #2c7567; }
 
 /* 卡片「按住浮起 → 拖动排序」的浮起层——桌面端与手机端共用这一份原语。
    判定与阈值在 lib/card-drag.ts，指针与动画在 lib/use-card-drag.ts；

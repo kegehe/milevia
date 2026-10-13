@@ -75,6 +75,16 @@ export function contextLevel(context: import("./types").RunUsage | undefined): s
   return percent >= 85 ? "danger" : percent >= 70 ? "warning" : "normal";
 }
 
+// 使用状态弹窗的状态徽章短文案。与 contextLabel/contextLevel 读同一个 context 判据，
+// 只是换成更短的措辞；「读不到」仍然不并进「没有」—— 不可用与计算中各说各的。
+export function contextStateText(context: import("./types").RunUsage | undefined): string {
+  if (context?.available === false) return "上下文暂不可用";
+  const tokens = context?.contextInputTokens;
+  if (!tokens || !context?.contextWindow) return context?.hasResult ? "上下文暂不可用" : "上下文计算中";
+  const percent = tokens / context.contextWindow * 100;
+  return percent >= 85 ? "上下文即将用尽" : percent >= 70 ? "上下文接近上限" : "余量充足";
+}
+
 export function requiredShortcutVariables(template: string): ("selection" | "error")[] {
   return (["selection", "error"] as const).filter((key) => template.includes(`\${${key}}`));
 }

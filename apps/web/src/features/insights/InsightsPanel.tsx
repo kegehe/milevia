@@ -26,6 +26,7 @@ import {
   toggleInsightSelection,
   toggleInsightSelectionAll,
   toggleInsightType,
+  verificationSegments,
   type InsightEvent,
   type InsightFilter,
   type InsightFinding,
@@ -708,16 +709,22 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }
       {/* 复核可与扫描同时进行：两者各有进度块，扫描进行中也要显示复核进度，
           否则用户会以为复核没在跑（正是"边扫边核"场景的关键反馈）。 */}
       {verification?.status === "running" && (() => {
-        const verifyPct = verification.totalCount > 0
-          ? Math.min(100, Math.round((verification.processedCount / verification.totalCount) * 100))
-          : 0;
+        // 分段点阵：一段刻度对应一条建议（超过上限按比例压缩），done=完成段，
+        // 下标 done 那段是"正在处理"。totalCount 读不到时不渲染刻度行。
+        const { done: segDone, segments: segTotal } = verificationSegments(verification.processedCount, verification.totalCount);
         return (
           <section className="insights-verification-progress" role="status">
             <span className="insights-spinner" aria-hidden="true" />
             <div className="insights-verification-copy">
               <b>正在复核建议 <em>{verification.processedCount}/{verification.totalCount}</em></b>
               <small>{verification.message || "正在读取当前项目代码"}</small>
-              <span className="insights-verification-track" aria-hidden="true"><i style={{ width: `${verifyPct}%` }} /></span>
+              {segTotal > 0 && (
+                <span className="insights-verification-dots" aria-hidden="true">
+                  {Array.from({ length: segTotal }, (_, i) => (
+                    <i key={i} className={i < segDone ? "done" : i === segDone && segDone < segTotal ? "cur" : undefined} />
+                  ))}
+                </span>
+              )}
             </div>
             <button
               type="button"

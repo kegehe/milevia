@@ -1,29 +1,70 @@
-/* 项目 AI 配置弹窗 — 复刻会话页的绿色 studio 色板 */
-.project-config-dialog { width: min(560px, 100%); color: #19332c; background: #fcfefc; }
-.project-config-dialog > header { border-bottom-color: #dcebe1; padding: 16px 18px; }
+/* 项目 AI 配置弹窗（方案 B · 标签页）— 复用会话页的绿色 studio 色板。
+   特异性约定：本文件里所有与全局 `.modal` 系规则同台竞技的规则（容器/头部/footer/按钮）
+   都带 `.modal.project-config-dialog` 或 `.project-config-dialog` 前缀 ——
+   全局 `.modal header`(0,1,1) 的 border-top 简写、`.modal footer`(0,1,1)、
+   `.modal button`(0,1,1) 与 `.modal button:hover:not(:disabled)`(0,3,1)
+   都会压过单类名规则，前缀是为了不管 CSS 打包顺序如何都稳赢。 */
+.modal.project-config-dialog { width: min(520px, 100%); color: #19332c; background: #fcfefc; }
+.modal.project-config-dialog > header { display: flex; flex: none; align-items: center; justify-content: space-between; border-bottom: 1px solid #dcebe1; padding: 16px 18px; }
 .project-config-heading { display: flex; min-width: 0; align-items: center; gap: 12px; }
 .project-config-mark { display: grid; width: 34px; height: 34px; flex: none; place-items: center; border-radius: 8px; color: #19332c; background: #d9f0b8; }
 .project-config-mark svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
-.project-config-heading label { color: #6d8494; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-.project-config-heading h2 { margin: 2px 0 0; color: #19332c; font-size: 18px; }
-.project-config-dialog > header .project-config-close { display: grid; width: 30px; height: 30px; min-width: 0; box-sizing: border-box; flex: none; place-items: center; border: 1px solid #d0e1d8; border-radius: 6px; padding: 0; color: #668176; background: #fcfefc; font: 19px/1 ui-sans-serif, system-ui, sans-serif; transition: border-color .16s ease, color .16s ease, background .16s ease; }.project-config-dialog > header .project-config-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }
-.project-config-intro { padding: 14px 18px 0; color: #5f7169; font-size: 12.5px; line-height: 1.55; }
+.project-config-heading h2 { margin: 0; color: #19332c; font-size: 17px; }
+.project-config-dialog > header .project-config-close { display: grid; width: 30px; height: 30px; min-width: 0; box-sizing: border-box; flex: none; place-items: center; border: 1px solid #d0e1d8; border-radius: 6px; padding: 0; color: #668176; background: #fcfefc; font: 19px/1 ui-sans-serif, system-ui, sans-serif; transition: border-color .16s ease, color .16s ease, background .16s ease; }
+.project-config-dialog > header .project-config-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }
+
 .project-config-error { margin: 12px 18px 0; border: 1px solid #f3aa9a; padding: 9px 11px; color: #8c2d21; background: #fff0ed; font-size: 12.5px; }
 .project-config-notice { margin: 12px 18px 0; border: 1px solid #bfe6cd; padding: 9px 11px; color: #1d6a4e; background: #eaf9ef; font-size: 12.5px; }
 .project-config-loading { padding: 32px 18px; color: #637a70; text-align: center; font-size: 13px; }
-.project-config-agents { display: grid; gap: 14px; padding: 16px 18px; }
-.project-config-agent { border: 1px solid #dcebe1; border-radius: 9px; padding: 14px; background: #fff; box-shadow: 0 1px 2px #17362c0a; }
-.project-config-agent.is-default { border-color: #9bc4af; background: #f2faf4; }
-.project-config-agent > header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; border: 0; padding: 0 0 10px; }.project-config-agent > header b { color: #19332c; font-size: 13.5px; }.project-config-agent > header small { color: #6d8494; font-size: 11.5px; }
-.project-config-fields { display: grid; gap: 11px; }
+
+/* 标签：一次只看一个工具；默认工具带绿点。允许换行 —— 目录多出第三个工具时
+   不能被 overflow:hidden 的 modal 静默裁掉（激活下划线属于看不见的标签最糟）。 */
+.project-config-tabs { display: flex; flex: none; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid #dcebe1; padding: 0 18px; }
+.project-config-dialog .project-config-tab { position: relative; border: 0; border-radius: 0; min-height: 0; padding: 13px 14px 12px; color: #748b81; background: none; font-size: 13px; font-weight: 700; cursor: pointer; }
+.project-config-dialog .project-config-tab:hover:not(:disabled) { color: #19332c; background: none; }
+.project-config-dialog .project-config-tab.is-active { color: #19332c; }
+.project-config-tab.is-active::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 2px; border-radius: 2px; background: #2c7567; }
+.project-config-tab-dot { display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 50%; background: #2c7567; vertical-align: 2px; }
+
+/* 表单体：标签在上、控件在下，行距比卡片版更松。
+   modal 是 max-height 80vh + overflow hidden 的 flex 列 —— body 必须
+   min-height:0 + overflow:auto 才允许自己收缩滚动，否则 footer 会被无声裁掉。 */
+.project-config-body { display: grid; gap: 14px; min-height: 0; overflow: auto; padding: 16px 18px 18px; }
+.project-config-status { display: flex; align-items: center; gap: 10px; min-height: 24px; }
+.project-config-badge { display: inline-flex; align-items: center; gap: 5px; border-radius: 99px; padding: 4px 10px; color: #1e6a52; background: #eaf6ef; font-size: 11px; font-weight: 700; }
+.project-config-badge i { width: 6px; height: 6px; border-radius: 50%; background: #2c7567; }
+.project-config-hint { margin-left: auto; color: #809188; font-size: 11.5px; }
+.project-config-field { display: grid; gap: 6px; }
+.project-config-field > span { color: #49665c; font-size: 12px; font-weight: 700; }
+.project-config-field input { width: 100%; min-height: 38px; box-sizing: border-box; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 11px; color: #19332c; background: #fff; font: 13px ui-sans-serif, system-ui, sans-serif; }
+.project-config-field input:focus { border-color: #7fae9d; outline: 2px solid #d5ebe0; outline-offset: -1px; }
+.project-config-field input::placeholder { color: #a3b8ac; }
+
+/* 认证方式：分段控件（两端贴合、无外间隙）。
+   hover 规则必须同时压过全局 `.modal button:hover:not(:disabled)`(0,3,1) 的
+   border-color/background —— 否则分段间 1px 分隔线 hover 变绿、选中段 hover 闪浅底。 */
+.project-config-authmode { display: flex; overflow: hidden; border: 1px solid #c8dcd1; border-radius: 6px; background: #fff; }
+.project-config-dialog .project-config-authmode button { min-height: 34px; flex: 1; border: 0; border-right: 1px solid #c8dcd1; border-radius: 0; padding: 6px 10px; color: #49665c; background: #f7fbf8; font-size: 12px; cursor: pointer; transition: color .16s ease, background .16s ease; }
+.project-config-dialog .project-config-authmode button:last-child { border-right: 0; }
+.project-config-dialog .project-config-authmode button:hover:not(:disabled):not(.active) { border-color: #c8dcd1; color: #1f6055; background: #eaf5ee; }
+.project-config-dialog .project-config-authmode button.active, .project-config-dialog .project-config-authmode button.active:hover:not(:disabled) { border-color: #c8dcd1; color: #fff; background: #2c7567; font-weight: 700; }
+.project-config-dialog .project-config-authmode button:disabled { opacity: .6; cursor: default; }
+
+/* 低频动作：安静链接 + 可展开的凭据池一行。 */
+.project-config-links { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline; }
+.project-config-links-failed { color: #8a6c5a; font-size: 12px; }
+.project-config-dialog .project-config-link { border: 0; border-radius: 0; min-height: 0; padding: 0; color: #4c6b60; background: none; font-size: 12px; cursor: pointer; }
+.project-config-dialog .project-config-link:hover:not(:disabled) { color: #1f6055; background: none; text-decoration: underline; }
+.project-config-pool-row { display: flex; align-items: center; gap: 8px; }
+.project-config-dialog .project-config-pool-row select { flex: 1; min-height: 34px; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 8px; color: #31594f; background: #f7fbf8; font-size: 12px; }
+
 .project-config-pool-route { border: 1px solid #b9d7d1; padding: 10px; color: #31594f; background: #eff8f5; font-size: 12px; line-height: 1.5; }
-.project-config-field { display: grid; gap: 5px; color: #49665c; font-size: 12px; }
-.project-config-field > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }.project-config-field > span small { color: #8aa093; font-size: 11px; }
-.project-config-field input { min-height: 36px; box-sizing: border-box; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 10px; color: #19332c; background: #fff; font: 13px ui-sans-serif, system-ui, sans-serif; }.project-config-field input:focus { border-color: #7fae9d; outline: 2px solid #d5ebe0; }
-.project-config-authmode { display: flex; gap: 6px; }.project-config-authmode button { min-height: 32px; flex: 1; border: 1px solid #c8dcd1; border-radius: 6px; padding: 6px 10px; color: #49665c; background: #f7fbf8; font-size: 12px; cursor: pointer; }.project-config-authmode button.active { border-color: #2c7567; color: #fff; background: #2c7567; }.project-config-authmode button:disabled { opacity: .6; cursor: default; }
-.project-config-agent > footer { border: 0; padding: 12px 0 0; justify-content: flex-end; }.project-config-agent > footer .primary { border-color: #9fbd46; color: #19332c; background: #c8e85a; font-weight: 700; }.project-config-agent > footer .primary:hover:not(:disabled) { background: #d8f47b; }
-.project-config-pool-select { min-height: 34px; max-width: 150px; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0 7px; color: #31594f; background: #f7fbf8; font-size: 12px; }
-.project-config-clear { padding: 0 18px 14px; }.project-config-clear .secondary { color: #9b4632; border-color: #ecc7bc; background: #fff6f2; }
-.project-config-dialog-footer { border-top-color: #dcebe1; padding: 14px 18px; }.project-config-dialog-footer .secondary { border-color: #c8dcd1; color: #31594f; background: #f7fbf8; }
-.project-config-remote { padding: 22px 20px; color: #5f7169; font-size: 13px; line-height: 1.6; }.project-config-remote p { margin: 0 0 18px; }.project-config-remote p strong { color: #19332c; }
-@media (max-width: 520px) { .project-config-agents { padding: 14px; }.project-config-agent { padding: 12px; } }
+
+.modal.project-config-dialog > footer { flex: none; border-top: 1px solid #dcebe1; padding: 13px 18px; }
+.project-config-dialog .project-config-dialog-footer .secondary { border-color: #c8dcd1; color: #31594f; background: #f7fbf8; }
+
+.project-config-remote { padding: 22px 20px; color: #5f7169; font-size: 13px; line-height: 1.6; }
+.project-config-remote p { margin: 0 0 18px; }
+.project-config-remote p strong { color: #19332c; }
+
+@media (max-width: 520px) { .project-config-body { padding: 14px 14px 16px; }.project-config-tabs { padding: 0 14px; } }

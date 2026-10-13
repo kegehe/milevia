@@ -22,6 +22,9 @@ const rootStyles = normalize(await readFile(new URL("./style.css", import.meta.u
 // 电脑端那一屏（`!mobileApp`）自己的样式表。它与手机页共用组件，所以必须单独读进来断言 ——
 // 混在 mobile-remote.css 里的话，"这一页到底有没有桌面页头"就又变成靠肉眼看了。
 const desktopStyles = normalize(await readFile(new URL("./pages/desktop-remote.css", import.meta.url), "utf8"));
+// 运行指示器的变体图形（桌面会话页与移动端状态条共用一份文件）。手机状态条三格中
+// 那一格动画的图形与降级判据都落在这里，页面级断言要跟它对齐。
+const runIndicatorStyles = normalize(await readFile(new URL("./run-indicator.css", import.meta.url), "utf8"));
 // 手机端"当前安装的包版本"那条链（读原生 App.getInfo → 拼版本文案）。它跨两个模块：
 // 读值带 Capacitor（不能直接跑），拼文案是纯函数（在 android-release.test.ts 里跑）。
 const mobileUpdateLib = normalize(await readFile(new URL("./features/updater/mobile-update.ts", import.meta.url), "utf8"));
@@ -93,30 +96,34 @@ test("mobile processing indicator sits at the end of the message list", () => {
   assert.ok(indicator > listOpen, "处理状态条必须渲染在消息列表内部，不能挂在列表上方");
   assert.ok(indicator < listClose, "处理状态条必须在消息列表结束之前（必须是列表的最后一项）");
   assert.ok(indicator > messages, "处理状态条必须排在消息内容之后");
-  // 间距交给列表的 gap：状态条自身不能再留 margin-top。真实浏览器实测——留 0 时它与上一条
-  // 消息的间距是列表 gap 的 10px；把它注入回 10px 后变成 20px（间距翻倍）。
-  assert.match(styles, /\.mobile-agent-processing \{[^}]*margin-top: 0;/s);
+  // 间距交给列表的 gap：状态条自身不留 margin（2026-10-13 改版后是裸行，连 margin-top: 0
+  // 都不再写 —— 裸行上任何 margin 都会与列表 gap 叠成双倍间距，不许回来）。
+  assert.match(styles, /\.mobile-agent-processing \{ display: flex; align-items: center; gap: 8px;/);
+  assert.doesNotMatch(styleRules, /\.mobile-agent-processing \{[^}]*margin/);
 });
 
 test("mobile processing bar is three sourced cells, not one sentence", () => {
-  // 旧版是「三颗跳点 + 一句『Claude Code 正在处理...』」：Agent 名与状态同一字号同一颜色，
-  // 身份和状态挤在一句话里；不说在干什么、不说多久了。现在拆成三格，每格一个来源。
-  assert.match(page, /className="mobile-agent-processing-badge"/);
+  // 2026-10-13 改版：撤掉绿底卡片框与品牌徽标，裸行三格 —— 动画图形位 / 阶段词 / 阶段计时。
+  // 动画图形位与桌面共用 7 变体（判据 pickRunIndicatorVariant 在 lib/run-indicator.ts）。
+  assert.match(page, /<MobileRunIndicatorAnim variant=\{runIndicatorVariant\} \/>/);
+  assert.match(page, /<div className="mobile-agent-processing">/);
   assert.match(page, /className="mobile-agent-processing-stage"/);
   assert.match(page, /className="mobile-agent-processing-elapsed"/);
-  // 三格读的三个值必须来自 lib/processing-indicator.ts —— 页面上**不许再出现第二套判断**。
-  // 这是本项目"同一件事在多处各写一遍就是缺陷"那条的直接落地：钉住页面上只有调用、没有内联枚举。
-  assert.match(page, /import \{ formatElapsed, latestNotice, processingBadge, processingStageText \} from "\.\.\/lib\/processing-indicator";/);
-  assert.match(page, /const processingAgent = processingBadge\(conversation\?\.agentId \?\? ""\);/);
-  assert.match(page, /const processingStage = processingStageText\(\{ notice: latestNotice\(conversation\?\.notices\) \}\);/);
-  assert.match(page, /const processingElapsed = processingSince === null \? "" : formatElapsed\(processingClock - processingSince\);/);
+  // 计时每秒在变，容器上不加 role="status"（读屏逐秒播报反成骚扰）。
+  const pageRules = page.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  // 旧版徽标必须真的不在了（比对剥过注释的源码：解释性注释里还写着 badge）。
+  assert.doesNotMatch(pageRules, /mobile-agent-processing-badge/);
+  assert.doesNotMatch(pageRules, /className="mobile-agent-processing" role=/);
+  // 三格读的值全部来自 lib（run-indicator.ts / processing-indicator.ts）——
+  // 页面上**不许再出现第二套判断**，这是"同一件事在多处各写一遍就是缺陷"的直接落地。
+  assert.match(page, /import \{ formatStageClock, pickRunIndicatorVariant, type RunIndicatorVariant \} from "\.\.\/lib\/run-indicator";/);
+  assert.match(page, /import \{ latestActiveStageNotice, processingStageText \} from "\.\.\/lib\/processing-indicator";/);
+  assert.match(page, /const activeStageNotice = latestActiveStageNotice\(conversation\?\.notices\);/);
+  assert.match(page, /const processingStage = processingStageText\(\{ notice: activeStageNotice \}\);/);
+  assert.match(page, /const stageClock = Number\.isFinite\(stageStartMs\) \? formatStageClock\(processingClock - stageStartMs, 0\) : "";/);
   // 旧的那句文案（连同 ASCII 三点）必须真的不再渲染。**比对剥过注释的源码**：
-  // 那句旧文案作为"为什么要改"写在状态条那段 JSX 注释里，直接对 `page` 做 doesNotMatch
-  // 会被自己的注释满足（同一个坑在样式那边叫 styleRules，见文件头「断言前先剥注释」）。
-  assert.doesNotMatch(page.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""), /正在处理\.\.\./);
-  // 徽标配色只由 data-agent 一处分档（不在 JSX 里写颜色）。
-  assert.match(page, /data-agent=\{processingAgent\.tone\}/);
-  assert.match(styles, /\.mobile-agent-processing\[data-agent="codex"\] \.mobile-agent-processing-badge \{ background: #1f2933; \}/);
+  // 兜底词「正在处理」（无省略号）是合法读数，别误伤 —— 这里只挡带点的旧文案。
+  assert.doesNotMatch(pageRules, /正在处理\.\.\./);
 });
 
 test("mobile processing elapsed clock ticks on the running flag, not on message count", () => {
@@ -130,47 +137,65 @@ test("mobile processing elapsed clock ticks on the running flag, not on message 
   assert.doesNotMatch(effect, /conversationMessageCount|lastMessageLength/, "计时不该挂在消息条数上");
 });
 
-test("mobile processing elapsed time consumes startedAt instead of ignoring it", () => {
-  // `processingConversations[id].startedAt` 原先**只写不读**（典型的"算了但没人读"，
-  // 一条假装存在的边界）。本次改动把它真正消费掉，这条用例就是那条边界的守门人：
-  // 删掉 startedAt 这个读点、或改成从 0 开始计时，这里必红。
-  assert.match(page, /processingConversations\[conversation\.id\]\?\.startedAt/);
-  // 退路必须存在且**不能**是 0：中途被杀掉再重开时没有 startedAt（内存态不落盘），
-  // 从 0 开始会显示「3 秒」而它其实已经跑了一小时 —— 那是一句编出来的读数。
-  assert.match(page, /Date\.parse\(conversation\.lastActivityAt \|\| ""\) \|\| null/);
-  assert.match(page, /: null;\n  \/\/ 每秒走一格/);
+test("mobile processing stage clock starts from the active stage notice, not a fabricated zero", () => {
+  // `startedAt` 的消费点（2026-10-13 改版后）：动画变体种子 —— 新一轮 run 换一种动画，
+  // 快照恢复（无 startedAt，内存态不落盘）时退化为按会话稳定。读点不能丢
+  //（"算了但没人读"守门）：删掉这个读点、或改回写而不读，这里必红。
+  assert.match(page, /pickRunIndicatorVariant\(`\$\{conversation\.id\}:\$\{processingConversations\[conversation\.id\]\?\.startedAt \?\? ""\}`\)/);
+  // 阶段计时从该阶段通知的 createdAt 起算（阶段一变归零，与桌面同口径）；
+  // 读不到时间戳就不显示（空串）——绝不能从 0 起点编出「3 秒」那种读数。
+  assert.match(page, /const stageStartMs = activeStageNotice \? Date\.parse\(activeStageNotice\.createdAt\) : Number\.NaN;/);
+  assert.match(page, /const stageClock = Number\.isFinite\(stageStartMs\) \? formatStageClock\(processingClock - stageStartMs, 0\) : "";/);
+  // 旧的 lastActivityAt 退路随改版移除（"多久了"的职责由阶段计时接管）：复活即红。
+  assert.doesNotMatch(page.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""), /Date\.parse\(conversation\.lastActivityAt/);
 });
 
-test("mobile processing motion is shimmer plus glow, each degrading on its own", () => {
-  // M2 流光 / M1 光晕。两条对 overflow 的要求**正好相反**（一个要裁切、一个要溢出），
-  // 所以一条挂 ::after、一条挂 ::before，互不抢位。
-  assert.match(styles, /@keyframes mobile-agent-processing-shimmer \{ 0% \{ transform: translateX\(-100%\); \} 55%, 100% \{ transform: translateX\(100%\); \} \}/);
-  assert.match(styles, /@keyframes mobile-agent-processing-glow \{ 0%, 100% \{ opacity: \.35; transform: scale\(1\); \} 50% \{ opacity: \.85; transform: scale\(1\.035\); \} \}/);
-  // ⚠️ 流光必须走 transform，**不能**用 left —— left 是布局属性，每帧会改 scrollWidth，
-  // 与这一页的「贴底跟随」判据（scrollHeight - scrollY - innerHeight < 100）直接打架。
-  // 这条用 styleRules（剥过注释）比：解释"为什么不用 left"的注释里就写着 left。
-  assert.doesNotMatch(styleRules, /\.mobile-agent-processing::after[^}]*\bleft:/);
-  // ⚠️ 辉光必须被压到条体底色**之下**：少了 z-index: -1，呼吸的是盖在文字上的一层绿雾，
-  // 读数会被压得发糊（这条是"看着还行、读不清"的那种坏，静态截图里最容易放过）。
-  assert.match(styles, /\.mobile-agent-processing::before \{ content: ""; position: absolute; inset: -1px; z-index: -1;/);
-  // ⚠️ **裁切只能挂在 ::after 自己身上**。一旦 overflow: hidden 落在 .mobile-agent-processing
-  // 本身上，::before 那圈外扩的辉光会被整块裁掉 —— M1 直接消失，而且不报错、只是不动。
-  assert.match(styles, /\.mobile-agent-processing::after \{[^}]*overflow: hidden;/s);
-  assert.doesNotMatch(styleRules, /\.mobile-agent-processing \{[^}]*overflow: hidden;/s);
-  // 主题色一个像素都不动：底 / 边 / 字与改动前逐字一致，品牌色只出现在徽标那一格。
-  assert.match(styles, /\.mobile-agent-processing \{[^}]*border: 1px solid #b8dcca;[^}]*color: #216b58;[^}]*background: #eef9f2;/s);
-  assert.match(styles, /\.mobile-agent-processing-badge \{[^}]*background: #d97757;/s);
+test("mobile processing motion shares the desktop run-indicator variants", () => {
+  // 2026-10-13 改版：流光/光晕撤掉，动画图形位换成与桌面会话页共用的 7 变体
+  // （判据在 lib/run-indicator.ts，图形在 run-indicator.css —— 两端同一份文件）。
+  assert.match(page, /import "\.\.\/run-indicator\.css";/);
+  // 变体图形的作用域必须钉在 .ri-anim 上：变体类同时会出现在容器行上，
+  // 不钉住的话 ripple 的伪元素会画到整行、chase 的旋转会转整行、tri 的宽高会压扁整行。
+  assert.match(runIndicatorStyles, /^\.ri-anim \{ position: relative; display: inline-block; flex: none; \}$/m);
+  // 7 个变体一个不能少：少一个 = 哈希抽到它的 run 没有图形。
+  const riRules = runIndicatorStyles.replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const variant of ["dots", "orbit", "ripple", "spark", "chase", "tri", "cli"]) {
+    assert.match(riRules, new RegExp(`\\.ri-anim\\.ri-${variant} \\{`), `缺少变体 .ri-${variant}`);
+  }
+  // cli 变体的字符由本组件每 80ms 轮换（其余变体是纯 CSS），轮换定时器不许丢。
+  assert.match(page, /window\.setInterval\(\(\) => setCliFrame\(\(value\) => value \+ 1\), 80\)/);
+  // 动画纪律照旧：关键帧只动 transform / opacity —— 这一页是整页滚动 + 贴底跟随判据，
+  // 任何动布局属性的动画都会与它打架（比对剥过注释的 CSS，且 10 条关键帧一条不少）。
+  const keyframes = [...riRules.matchAll(/@keyframes (ri-[\w-]+)/g)].map((m) => m[1]);
+  assert.deepEqual(
+    new Set(keyframes),
+    new Set(["ri-dot-wave", "ri-spin", "ri-ripple-ring", "ri-spark-twinkle", "ri-chase-rotate", "ri-chase-dot", "ri-chase-dot-before", "ri-tri-1", "ri-tri-2", "ri-tri-3"]),
+  );
+  for (const name of keyframes) {
+    // 用括号计数抠出整块关键帧体：嵌套的百分比块让"一层正则"写不准，
+    // 数括号对单行/多行格式都成立。
+    const at = riRules.indexOf(`@keyframes ${name} `);
+    let depth = 0;
+    let block = "";
+    for (let i = at; i < riRules.length; i += 1) {
+      const ch = riRules[i];
+      block += ch;
+      if (ch === "{") depth += 1;
+      if (ch === "}") { depth -= 1; if (depth === 0) break; }
+    }
+    assert.ok(depth === 0 && block.startsWith(`@keyframes ${name} `), `找不到 @keyframes ${name}`);
+    assert.doesNotMatch(block, /\b(left|top|right|bottom|margin|padding|width|height)\s*:/, `${name} 的关键帧动了布局属性`);
+  }
 });
 
 test("mobile processing degradation keeps the reading and drops only the decoration", () => {
-  // 判据是"降级后信息不丢"，**不是"什么都不动"**：流光与光晕是装饰 → 撤掉；
-  // 已耗时是读数 → 保留（它由 JS 每秒写进去，本来就不受 CSS 影响）。
-  assert.match(styles, /@media \(prefers-reduced-motion: reduce\) \{\s*\.mobile-agent-processing::before, \.mobile-agent-processing::after \{ animation: none; \}/);
-  assert.match(styles, /\.mobile-agent-processing::after \{ background: none; \}/);
-  // ⚠️ 反向断言：**不能**顺手把 -elapsed 一起藏掉（那是把"多久了"这条信息弄丢，
-  // 属于降级过度）。hide 的写法有一堆（display:none / visibility:hidden / opacity:0），三种都要挡。
+  // 判据不变："降级后信息不丢"。动画图形位是装饰 → run-indicator.css 的降级块把全部变体
+  // 退化为静点；降级块必须**显式列出同选择器**（具体度压过降级块是这个项目的复发坑）。
+  assert.match(runIndicatorStyles, /@media \(prefers-reduced-motion: reduce\) \{\s*\.ri-anim\.ri-dots i,[\s\S]*?\{ animation: none; \}\s*\}/);
+  // 阶段词与计时是读数 → 降级时**不能**一起藏掉（hide 的写法一堆，三种都要挡）。
   assert.doesNotMatch(styleRules, /\.mobile-agent-processing-elapsed[^{]*\{[^}]*(display: none|visibility: hidden|opacity: 0)/s);
-  // 那条共用的关键帧**不能**随三颗点的 DOM 一起删掉：气泡里的「正在写」还在用它。
+  assert.doesNotMatch(styleRules, /\.mobile-agent-processing-stage[^{]*\{[^}]*(display: none|visibility: hidden|opacity: 0)/s);
+  // 那条共用的关键帧**不能**随旧状态条一起删掉：气泡里的「正在写」还在用它。
   assert.match(styles, /@keyframes mobile-agent-processing-dot \{ 0%, 60%, 100% \{ opacity: \.3; transform: translateY\(0\); \} 30% \{ opacity: 1; transform: translateY\(-3px\); \} \}/);
 });
 

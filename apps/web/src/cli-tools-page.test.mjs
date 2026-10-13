@@ -347,6 +347,22 @@ test("样式：卡片右上角六档图标各不相同，且「没查成」与�
   assert.match(css, /@media \(max-width: 680px\)[\s\S]*?\.cli-tools-card-actions \{ flex-direction: column;/);
 });
 
+test("「读取中」的卡片：读数与状态是流光占位条，不是三行灰字", () => {
+  // 判据在模型：分支⓪给出独立的 loading 档（不复用 muted），页面才有东西可渲染。
+  assert.match(viewCode, /card\.statusTone = "loading"/);
+  assert.match(css, /\.cli-tools-readings dd\[data-tone="loading"\]/);
+  assert.match(css, /\.cli-tools-status\[data-tone="loading"\]/);
+  // 占位条是**实线**块：虚线只属于「没查成」一族 —— loading 档绝不能带 dashed。
+  assert.doesNotMatch(css, /\.cli-tools-(readings dd|status)\[data-tone="loading"\][^}]*dashed/);
+  // 流光动画 + 显式同选择器的降级块（本页约定第 4 条）。
+  // ⚠️ 正则锚死「media 头直接跟 dd 选择器」：用 [\s\S]*? 懒匹配会从文件里第一个
+  // media 块（icon 的）跨块凑出匹配 —— 降级块的头丢了它也照样绿，等于没断言。
+  assert.match(css, /@keyframes cli-tools-shimmer/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{\s*\.cli-tools-readings dd\[data-tone="loading"\]::before,\s*\.cli-tools-status\[data-tone="loading"\]::before \{ animation: none; \}/);
+  // 没有动作条的那几档，最后一段不能贴着卡底。
+  assert.match(css, /\.cli-tools-card > \.cli-tools-status:last-child[^}]*margin-bottom: 14px;/);
+});
+
 // ── 故障诊断（docs/43） ────────────────────────────────────────────────────
 
 test("诊断结论的判据只有一份，页面不自己判定", () => {

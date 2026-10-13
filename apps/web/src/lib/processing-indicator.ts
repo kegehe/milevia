@@ -141,3 +141,25 @@ export function latestNotice<T extends { createdAt?: string }>(notices: T[] | un
   }
   return best;
 }
+
+// 当前 run 有没有「正在进行的阶段」？有就返回那条通知，没有返回 null。
+// 与桌面 lib/run-indicator.ts 的 latestActiveStage 同一套语义（最新信号获胜），
+// 但作用于移动端的通知列表而不是桌面的事件列表：
+//   · 最新一条是进行中类（compact / api_retry / 非终态 task）→ 就是当前阶段；
+//   · 最新一条是结果类（compact_result 压缩完成/失败、compact_boundary、带终态
+//     state 的 task、error 执行错误）→ 说明最新的那件事**已经结束** → null，
+//     页面回退到兜底词。不能因为"更早还有一条 compact"就把它捞出来 —— 那个阶段
+//     已被它自己的结果事件关闭，捞出来就是「压缩完成后还挂着正在压缩上下文」的假话。
+// ⚠️ 已知边界（如实记录）：移动端没有当前 runId 锚点（processingConversations 只记
+// startedAt），所以不做跨 run 过滤 —— 上一轮 run 以进行中通知收尾、新一轮还没产生
+// 通知时，会短暂沿用上一轮的阶段词。这与改版前"永远取最新通知标题"的口径一致，
+// 没有变坏；桌面端有 runId，无此边界。
+// state 取值与桌面 system-card 同源（pending 算进行中 —— 「等待确认」是真实的当前状态）。
+export function latestActiveStageNotice<T extends { variant: string; createdAt?: string; state?: string }>(notices: T[] | undefined): T | null {
+  let best = latestNotice(notices);
+  if (!best) return null;
+  if (best.variant === "compact_result" || best.variant === "compact_boundary" || best.variant === "error") return null;
+  const state = best.state;
+  if (state === "success" || state === "failed" || state === "info") return null;
+  return best;
+}

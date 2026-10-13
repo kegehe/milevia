@@ -13,6 +13,7 @@ import {
   notificationTargetURL,
   priorityForType,
   toastVariantForType,
+  windowsToastLines,
 } from "../lib/notifications";
 import { useUIPreferences, type LocalPreferences } from "../stores/useUIPreferences";
 import { NotificationToastBody } from "./NotificationToastBody";
@@ -211,11 +212,18 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       markUnread(event);
 
       // Windows 系统右下角弹窗通知：用户开启 + 任务完成类 + 主窗口不在前台时发起。
-      // Rust 侧只显示“有任务完成”，不含项目/任务名；点击后跳到对应项目。
-      // 用 document.hasFocus() 判断主窗口是否在前台：聚焦时已有应用内 toast，不叠加
-      // 系统弹窗造成双重提醒；切到别处（窗口失焦/最小化）才弹系统弹窗进行提醒。
+      // 内容为方案A分层完整版：标题=事件 title，第二行「项目「X」· 任务Y」，第三行耗时
+      // （均为服务端算好的字段，经 windowsToastLines 组装，缺失时省略对应行）；
+      // 点击后跳到对应项目。用 document.hasFocus() 判断主窗口是否在前台：聚焦时已有
+      // 应用内 toast，不叠加系统弹窗造成双重提醒；切到别处（窗口失焦/最小化）才弹。
       if (isDesktop() && preferences.windowsToastsEnabled && isWindowsNotifyType(event.type) && !document.hasFocus()) {
-        invoke("show_system_notification", { path: notificationTargetURL(event) }).catch(() => {
+        const toastLines = windowsToastLines(event);
+        invoke("show_system_notification", {
+          path: notificationTargetURL(event),
+          title: toastLines.title,
+          line1: toastLines.line1,
+          line2: toastLines.line2,
+        }).catch(() => {
           /* 系统通知失败不影响应用内提醒 */
         });
       }

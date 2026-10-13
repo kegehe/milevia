@@ -115,6 +115,8 @@ test("「读取中」与「已是最新」是两句话、两种观感", () => {
   const loading = buildToolCard(input({ latest: { state: "loading" } }));
   assert.equal(loading.latestTone, "loading");
   assert.equal(loading.latestText, "读取中…");
+  // 只是「最新版本」还在读：状态行仍是通用灰文字（不是整卡条形化那档）。
+  assert.equal(loading.statusTone, "muted");
   assert.notEqual(loading.statusText, "已是最新，不用管它。");
   assert.equal(loading.icon, "loading");
   assert.equal(buildToolCard(input({ latest: UP_TO_DATE })).icon, "ok");
@@ -124,6 +126,8 @@ test("「未安装」与「拿不到状态」是两件事", () => {
   const missing = buildToolCard(input({ item: item({ installed: false, version: "" }) }));
   assert.equal(missing.currentText, "未安装");
   assert.equal(missing.statusText, "还没装。");
+  // 通用灰档保持 muted：只有「读取中」那一档才条形化 —— 误改成 loading 会把没装也画成占位条。
+  assert.equal(missing.statusTone, "muted");
 
   const unknown = buildToolCard(input({ item: undefined }));
   assert.equal(unknown.currentText, "状态未知");
@@ -141,6 +145,9 @@ test("「还在读」既不是「未安装」也不是「拿不到」—— 它�
   assert.notEqual(reading.statusText, "拿不到它的状态。");
   assert.equal(reading.icon, "loading");
   assert.equal(reading.currentTone, "loading");
+  // 独立的 loading 档（不是 muted）：页面据此把状态行渲染成流光占位条；
+  // 改回 muted 那条渲染就静默失效，「还没装」等通用灰档也会被一起条形化。
+  assert.equal(reading.statusTone, "loading");
   assert.equal(reading.primary, undefined, "读数还没到，不许亮按钮（能不能装/升都还没读到）");
   assert.equal(reading.note, undefined, "也不许编一句说明出来");
 
@@ -512,6 +519,7 @@ test("横幅：升不了但没有可修动作时不给按钮，照卡片的原�
   // 而卡片自己已经在说「正在处理…」。
   const running = buildToolCard(input({ latest: LATEST, item: item({ operation: "running" }) }));
   assert.equal(running.running, true);
+  assert.equal(running.statusTone, "muted", "「正在处理」是通用灰文字档，不是读取占位条档");
   assert.equal(bannerFor([running]), undefined, "正在跑的工具不该上横幅");
 
   // 有 repair 动作的那一档不受影响：按钮与文案照旧。

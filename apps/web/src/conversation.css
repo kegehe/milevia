@@ -56,65 +56,6 @@
   text-underline-offset: 2px;
 }
 .usage-trigger:hover { color: #245d52; }
-.usage-dialog { width: min(760px, 100%); }
-.usage-body { overflow-y: auto; padding: 0 20px 18px; }
-.usage-section { padding: 18px 0; border-bottom: 1px solid #dce9e1; }
-.usage-section:last-of-type { border-bottom: 0; }
-.usage-section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.usage-section h3 { margin: 0; color: #19332c; font-size: 14px; }
-.usage-section-head > span { color: #6b8178; font-size: 12px; }
-.usage-section-head .context-state { color: #277566; font-weight: 700; }
-.usage-section-head .context-state.warning { color: #a16f11; }
-.usage-section-head .context-state.danger { color: #b44431; }
-.usage-section-head .context-state.pending { color: #6b8178; font-weight: 400; }
-.usage-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1px;
-  margin: 14px 0 0;
-  border: 1px solid #dce9e1;
-  background: #dce9e1;
-}
-.usage-grid > div { min-height: 62px; padding: 10px 11px; background: #fbfefb; }
-.usage-grid dt { color: #6b8178; font-size: 11px; }
-.usage-grid dd {
-  margin: 5px 0 0;
-  overflow: hidden;
-  color: #19332c;
-  font-size: 13px;
-  font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.session-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.usage-note,
-.usage-disclaimer { margin: 9px 0 0; color: #6b8178; font-size: 12px; line-height: 1.5; }
-.usage-note { padding: 10px; background: #f1f7f3; }
-.usage-disclaimer { padding-top: 14px; }
-.model-usage-list { margin-top: 12px; border-top: 1px solid #dce9e1; }
-.model-usage-list > div {
-  display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(160px, 1fr) max-content;
-  gap: 12px;
-  align-items: center;
-  border-bottom: 1px solid #e3eee7;
-  padding: 10px 4px;
-  color: #6b8178;
-  font-size: 12px;
-}
-.model-usage-list b {
-  overflow: hidden;
-  color: #19332c;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-}
-.model-usage-list em { color: #277566; font-style: normal; }
 
 /* ---- 时间线基础 ---------------------------------------------------------- */
 .timeline { position: relative; }
@@ -330,15 +271,36 @@
   font-family: inherit;
 }
 
-/* ---- 运行指示器 ---------------------------------------------------------- */
+/* ---- 运行指示器 ----------------------------------------------------------
+   行容器样式。7 个动画变体的图形 CSS 收口在 run-indicator.css（桌面/移动共用），
+   变体抽取判据在 lib/run-indicator.ts（runId 哈希随机抽一个）。 */
 .run-indicator { display: flex; align-items: center; gap: 9px; margin: 4px 0 20px 34px; color: #5f766c; font-size: 12px; }
-.run-indicator span {
+.run-indicator .ri-stage { color: #4c6b60; }
+.run-indicator .ri-clock {
+  color: #809188;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #f2f5f3;
+}
+
+/* 编排页（OrchestrationPage）沿用旧的单点形态：裸空 span = 一个脉冲绿点，
+   没有阶段词/计时。用 :empty 精确命中它，绝不会碰到 7 个变体的 span
+  （它们都有子元素或文字，:empty 不成立）。 */
+.run-indicator > span:empty {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #2c7567;
   box-shadow: 0 0 0 4px #cbeadd;
   animation: run-pulse 1.4s ease-in-out infinite;
+}
+
+/* reduced-motion：编排页旧形态的脉冲退化为静点（7 变体的降级在 run-indicator.css）。
+   降级块必须显式列出同选择器，否则会被具体度压过（本项目踩过三次的坑）。 */
+@media (prefers-reduced-motion: reduce) {
+  .run-indicator > span:empty { animation: none; }
 }
 .load-earlier-history { display: block; margin: 0 auto 16px; border-color: #c8dcd1; color: #41665b; background: #fbfefb; font-size: 11px; }
 @keyframes run-pulse { 50% { opacity: .35; transform: scale(.7); } }
@@ -1178,7 +1140,8 @@
 .command-tags .quick-tag-empty:hover,
 .quick-tag-empty.command-tag:hover { border-color: #cf906d; color: #713d27; background: #fff0e8; }
 
-.quick-actions-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; align-items: start; gap: 12px; }
+/* 方案 F 色块分区：左栏从双列网格改为纵向色块流（提示词/命令/技能各一块浅色底板）。 */
+.quick-actions-row { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
 .quick-actions-row .quick-tag-heading { padding-bottom: 6px; }
 .quick-actions-row .quick-tag,
 .quick-actions-row .quick-tag-empty,
@@ -1514,8 +1477,6 @@
   .permission-popover { right: auto; left: 0; }
   .head-actions { position: relative; }
   .project-head { align-items: flex-start; }
-  .usage-grid,
-  .session-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
   .chat {
     height: auto;
@@ -1638,12 +1599,7 @@
   .history-item { gap: 8px; }
   .history-item em { max-width: 72px; text-align: right; }
   .conversation-history footer small { display: none; }
-  .usage-body { padding: 0 14px 14px; }
-  .usage-grid,
-  .session-grid { grid-template-columns: 1fr 1fr; }
-  .model-usage-list > div { grid-template-columns: minmax(0, 1fr) max-content; }
-  .model-usage-list > div span { grid-column: 1 / -1; }
-  .model-usage-list > div em { grid-column: 2; grid-row: 1; }
+  .usage-body { padding: 12px 14px 14px; }
   .usage-dialog { max-height: 90vh; }
 }
 
@@ -1701,25 +1657,8 @@
   .head-actions-menu .workspace-create-action { text-align: left; }
 }
 
-.usage-trigger,
-.usage-section-head .context-state,
-.model-usage-list em { color: #277566; }
+.usage-trigger { color: #277566; }
 .usage-trigger:hover { color: #245d52; }
-.usage-section { border-bottom-color: #dce9e1; }
-.usage-section h3,
-.usage-grid dd,
-.model-usage-list b { color: #19332c; }
-.usage-section-head > span,
-.usage-section-head .context-state.pending,
-.usage-grid dt,
-.usage-note,
-.usage-disclaimer,
-.model-usage-list { color: #6b8178; }
-.usage-grid { border-color: #dce9e1; background: #dce9e1; }
-.usage-grid > div { background: #fbfefb; }
-.usage-note { background: #f1f7f3; }
-.model-usage-list { border-top-color: #dce9e1; }
-.model-usage-list > div { border-bottom-color: #e3eee7; }
 
 .message > header { color: #597268; }
 .message > header time,
@@ -1729,7 +1668,6 @@
 .tool-card .output.inline { border-top-color: #dce9e1; color: #31594f; background: #f1f7f3; }
 
 .run-indicator { color: #5f766c; }
-.run-indicator span { background: #2c7567; box-shadow: 0 0 0 4px #cbeadd; }
 .load-earlier-history { border-color: #c8dcd1; color: #41665b; background: #fbfefb; }
 
 .conversation-history > input { border-color: #c5dad0; color: #19332c; background: #fff; }
@@ -2688,22 +2626,140 @@
   color: #425b1e;
   background: #f2f7e5;
 }
-.quick-actions-row .quick-tag-heading { padding-bottom: 7px; }
-/* 常用提示词 + 常用命令合并在同一个整体折叠（.quick-shortcuts）里：
-   标题行占满整行作为唯一折叠开关，下方两栏保留“常用提示词 / 常用命令”两个子分组。 */
-.quick-shortcuts { grid-column: 1 / -1; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 12px; }
-.quick-shortcuts > .quick-tag-heading { grid-column: 1 / -1; }
-.quick-shortcuts .quick-shortcuts-sub { min-width: 0; }
-.quick-actions-row .quick-tag,
-.quick-actions-row .quick-tag-empty,
-.quick-tag-slot { min-height: 36px; }
-.quick-actions-row .quick-tag > button:first-child,
-.quick-actions-row .quick-tag-empty { padding: 7px 9px; }
-.quick-actions-row .quick-tag-edit { width: 30px; }
-.quick-tag-slot { border-radius: 7px; }
+/* ---- 方案 F 色块分区：提示词 / 命令 / 技能各一块浅色底板，白色胶囊浮在上面。
+   三块独立折叠（shortcuts / commands / skills），新增入口收进各自块头右端。 ---- */
+.quick-block {
+  display: grid;
+  gap: 8px;
+  border-radius: 12px;
+  padding: 10px;
+}
+.quick-block.prompt-block { background: #e9f4ec; }
+.quick-block.command-block { background: #eff4dd; }
+.quick-block.skill-block { background: #e3f1ec; }
+.quick-block.collapsed { gap: 0; }
+.quick-block-head { display: flex; min-height: 22px; align-items: center; gap: 4px; }
+.quick-block-title {
+  display: inline-flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+  border: 0;
+  border-radius: 6px;
+  padding: 2px 4px;
+  color: inherit;
+  background: transparent;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition: background .16s ease;
+}
+.quick-block-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prompt-block .quick-block-title { color: #2a6a5a; }
+.command-block .quick-block-title { color: #556b29; }
+.skill-block .quick-block-title { color: #1f7a6b; }
+.quick-block-title:hover:not(:disabled) { background: rgba(23, 61, 50, .07); }
+.command-block .quick-block-title:hover:not(:disabled) { background: rgba(85, 107, 41, .1); }
+.quick-block-title:focus-visible { outline: 2px solid #2b7b68; outline-offset: 1px; }
+.quick-block-title .quick-tag-heading-chevron { flex: none; width: 9px; height: 9px; margin-left: 2px; opacity: .7; }
+.quick-block.collapsed .quick-block-title .quick-tag-heading-chevron { transform: rotate(180deg); }
+.quick-block-count {
+  flex: none;
+  color: inherit;
+  opacity: .7;
+  font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.quick-block-add {
+  display: grid;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  opacity: .75;
+  cursor: pointer;
+  transition: background .16s ease, opacity .16s ease;
+}
+.quick-block-add:hover:not(:disabled) { background: rgba(255, 255, 255, .8); opacity: 1; }
+.quick-block-add:disabled { opacity: .35; cursor: default; }
+.quick-block-add .quick-tag-control-icon { width: 12px; height: 12px; }
 
-/* Skill 技能区 — 与常用提示词/常用命令并列，第三组（青绿系区分）。
-   技能标签以紧凑的圆形胶囊排布，左右换行铺开，不竖向堆满。 */
+/* 色块内的条目：白色胶囊（去边框、轻投影），横向换行铺开；
+   编辑钮收进胶囊右端；拖拽排序沿用 HTML5 拖拽，落点用整颗描边高亮。 */
+.quick-block .quick-tag,
+.quick-block .quick-tag-empty { min-height: 0; }
+.quick-block .quick-tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.quick-block .quick-tag-item { display: block; width: auto; max-width: 100%; padding: 0; }
+.quick-block .quick-tag {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 0;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(23, 55, 44, .06);
+}
+.quick-block .quick-tag > button:first-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 26px;
+  border: 0;
+  border-radius: 8px;
+  padding: 5px 4px 5px 10px;
+  color: #31594f;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-align: left;
+}
+.quick-block .quick-tag > button:first-child:hover:not(:disabled),
+.quick-block .quick-tag-empty:hover { color: #173d32; background: rgba(23, 61, 50, .05); transform: none; }
+/* 基础样式的 :active 位移（translateX(1px)）在胶囊里不成立，显式压掉。 */
+.quick-block .quick-tag > button:first-child:active:not(:disabled) { transform: none; }
+.quick-block .quick-tag > button:first-child:disabled { color: #94a99f; background: transparent; }
+.quick-block .quick-tag.disabled > button:first-child { color: #91a39b; background: transparent; }
+.quick-block .quick-tag-edit { width: 18px; min-height: 26px; border-radius: 8px; color: #809188; }
+.quick-block .quick-tag-edit:hover:not(:disabled) { border-color: transparent; color: #245f50; background: rgba(23, 61, 50, .08); }
+.quick-block .quick-tag-empty {
+  flex: 0 1 auto;
+  min-height: 26px;
+  border: 1px dashed rgba(23, 61, 50, .28);
+  border-radius: 8px;
+  padding: 5px 10px;
+  color: #4c6b60;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-align: center;
+}
+.quick-block .quick-tag-empty:hover { border-style: solid; }
+/* 空态/加载态（添加提示词 / 添加命令 / 加载中 / 未发现 Skill）保持旧版的整行占满：
+   它们是 .quick-tag-list 的直接子节点，不与胶囊挤同一行。 */
+.quick-block > .quick-tag-list .quick-tag-empty { flex: 1 1 100%; }
+/* 命令块：等宽字体 + 黄绿墨色。 */
+.command-block .quick-tag > button:first-child,
+.command-block .quick-tag-empty {
+  color: #556b29;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.command-block .quick-tag > button:first-child:hover:not(:disabled),
+.command-block .quick-tag-empty:hover { color: #3f521d; }
+/* 色块内的拖拽落点：整颗胶囊描边高亮（替代旧竖排列表的顶部色条指示）。 */
+.quick-block .quick-tag-item.drop-over > .quick-tag { box-shadow: 0 0 0 1.5px #2b6c5e; }
+
+/* Skill 技能区 — 青绿色块。技能胶囊为白色圆角小块（无描边、轻投影）横向换行铺开；
+   来源分组头改为「色点 + 来源名 + 计数」，色点区分 系统/官方 · 用户 · 项目 三种来源。 */
 .skill-tags .quick-tag-heading { border-bottom-color: #bfe3d4; color: #1f7a6b; }
 .skill-tags .quick-tag-heading-icon { stroke: #2c8f7d; }
 .skill-source-hint {
@@ -2718,50 +2774,45 @@
   font-weight: 700;
   line-height: 1;
 }
-.skill-item { list-style: none; padding: 0; }
-/* 只在来源分组(el 由 skill-source-group 包裹)内的胶囊列表用两列网格；
-   加载中/空态的 .quick-tag-list 直接挂在 skill-tags 下不使用网格，保持整行占满。 */
-.skill-tags .skill-source-group .quick-tag-list {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+.skill-item { list-style: none; padding: 0; min-width: 0; }
+/* 来源分组内的技能胶囊横向换行铺开；
+   加载中/空态的 .quick-tag-list 直接挂在 skill-tags 下不换行，保持整行占满。 */
+.skill-source-group .quick-tag-list {
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin: 0;
   /* <ul> 默认自带 list-style 缩进（padding-left: 40px），会整体右移列表、占掉胶囊宽度。 */
   padding: 0;
 }
-.skill-tags .quick-tag-item.skill-item {
-  display: flex;
-  min-width: 0;
-}
 .skill-tag {
-  display: flex;
+  display: inline-flex;
+  flex: 0 1 auto;
   min-width: 0;
-  flex: 1;
   align-items: center;
   justify-content: center;
-  gap: 5px;
   box-sizing: border-box;
-  min-height: 28px;
-  border: 1px solid #bfe0d2;
-  border-radius: 99px;
-  padding: 4px 9px;
+  min-height: 26px;
+  border: 0;
+  border-radius: 8px;
+  padding: 5px 10px;
   color: #1f604f;
-  background: #f2faf6;
-  box-shadow: none;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(23, 55, 44, .06);
   font-family: inherit;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease, box-shadow .16s ease;
+  transition: color .16s ease, background .16s ease, box-shadow .16s ease;
 }
-.skill-tag:hover:not(:disabled) { border-color: #6fb39a; color: #174e41; background: #e4f4ea; box-shadow: none; }
+.skill-tag:hover:not(:disabled) { color: #123c31; background: rgba(23, 61, 50, .06); box-shadow: 0 1px 2px rgba(23, 55, 44, .06); }
 .skill-tag:active:not(:disabled) { transform: translateY(0); }
-.skill-tag:disabled { color: #9db1a8; background: #f5f8f6; cursor: default; }
+.skill-tag:disabled { color: #9db1a8; background: #ffffff; opacity: .75; cursor: default; }
 .skill-tag-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
-/* 技能按来源分组：每组一行来源标签(可点击展开/折叠) + 两列胶囊。 */
-.skill-source-groups { display: grid; gap: 12px; }
+/* 技能按来源分组：每组一行「色点 + 来源名(可点击展开/折叠) + 计数 + 延展线」。 */
+.skill-source-groups { display: grid; gap: 10px; }
 .skill-source-group { display: grid; gap: 6px; }
 .skill-source-heading {
   display: flex;
@@ -2777,25 +2828,37 @@
   text-align: left;
   cursor: pointer;
 }
-.skill-source-heading:hover { background: #eef7f2; }
+.skill-source-heading:hover { background: rgba(23, 61, 50, .05); }
 .skill-source-heading:focus-visible {  outline: 2px solid #2b7b68; outline-offset: 1px;  }
+/* 来源徽章 → 来源色点：小圆点区分来源，名称保持普通文字，弱化到接近图例。 */
 .skill-source-chip {
   flex: none;
-  border: 1px solid #cfe3d8;
-  border-radius: 99px;
-  padding: 1px 8px;
-  color: #4d7568;
-  background: #eef7f2;
-  font-size: 9px;
-  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  color: #4c6b60;
+  background: transparent;
+  font-size: 10px;
+  font-weight: 600;
   font-style: normal;
-  letter-spacing: .03em;
+  letter-spacing: .02em;
   line-height: 1.6;
   white-space: nowrap;
 }
-.skill-source-chip.user { border-color: #bfe0d2; color: #1f6b5b; background: #e6f5ec; }
-.skill-source-chip.plugin { border-color: #ead6ae; color: #8a6717; background: #fbf4e2; }
-.skill-source-chip.project { border-color: #cfe0b2; color: #5f7426; background: #f2f8e4; }
+.skill-source-chip::before {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  background: #748b81;
+  content: "";
+}
+.skill-source-chip.plugin::before { background: #d9a92c; }
+.skill-source-chip.user::before { background: #2c8f7d; }
+.skill-source-chip.project::before { background: #8faf3c; }
 .skill-source-count {
   flex: none;
   color: #7b9489;
@@ -2806,7 +2869,7 @@
   height: 1px;
   min-width: 0;
   flex: 1;
-  background: #dcebe2;
+  background: rgba(23, 61, 50, .12);
   content: "";
 }
 .skill-source-chevron {
@@ -2822,12 +2885,10 @@
 .skill-source-chevron.open { transform: rotate(45deg) translateY(2px); }
 
 .skill-empty, .skill-loading {
-  border: 1px dashed #bfe0d2;
-  color: #6f8f83;
-  background: #f4faf7;
+  border: 1px dashed rgba(23, 61, 50, .25);
+  color: #4c6b60;
+  background: transparent;
 }
-/* 桌面 rail 两列布局下，Skill 组整行横跨两列，位于两组快捷方式下方。 */
-.quick-actions-row .skill-tags { grid-column: 1 / -1; }
 
 
 @media (max-width: 820px) {
@@ -3152,7 +3213,8 @@
   .conversation-clear-dialog footer .primary { padding: 0 12px; }
 }
 
-/* 使用状态：优先展示上下文余量，再呈现任务和会话指标。 */
+/* 使用状态弹窗（图表主角版）：半圆仪表给上下文余量，图表卡给 Token 构成与模型费用，
+   图标指标条给本次任务明细。所有判据仍只来自后端 usage 字段。 */
 .usage-dialog {
   width: min(700px, calc(100% - 32px));
   max-height: min(760px, calc(100dvh - 32px));
@@ -3186,14 +3248,6 @@
   background: #e8f5ed;
 }
 .usage-dialog-icon { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
-.usage-dialog-heading label {
-  display: block;
-  margin-bottom: 3px;
-  color: #638074;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .04em;
-}
 .usage-dialog-heading h2 { margin: 0; color: #193d32; font-size: 18px; font-weight: 700; line-height: 1.25; }
 .usage-dialog > header .usage-dialog-close {
   display: grid;
@@ -3214,29 +3268,48 @@
 .usage-dialog > header .usage-dialog-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }
 .usage-body {
   display: grid;
-  gap: 0;
-  padding: 0 20px 18px;
+  gap: 12px;
+  /* 弹窗是 flex column + overflow:hidden，body 必须自己接住滚动，
+     否则内容超过 max-height 会被静默剪掉（旧版这条在文件头部的基础块里，重写时丢过一次）。 */
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 20px 16px;
   scrollbar-color: #a7c3b5 transparent;
 }
 .usage-unavailable { min-height: 132px; align-content: center; }
-.usage-context-overview {
+
+/* 半圆仪表横幅：上下文余量是首屏判断。 */
+.usage-arc-banner {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 9px 14px;
-  margin-top: 18px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 18px;
   border: 1px solid #cde1d6;
-  border-radius: 7px;
-  padding: 13px 14px;
+  border-radius: 8px;
+  padding: 12px 18px 10px;
   background: #f7fbf8;
 }
-.usage-context-overview > div:first-child { display: grid; min-width: 0; gap: 4px; }
-.usage-context-overview > div:first-child span { color: #6c887d; font-size: 11px; font-weight: 700; }
-.usage-context-overview > div:first-child b { overflow: hidden; color: #1e5548; text-overflow: ellipsis; white-space: nowrap; font: 700 16px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.usage-context-overview .context-state {
+.usage-arc { position: relative; width: 196px; height: 104px; }
+.usage-arc svg { overflow: visible; }
+.usage-arc-track { fill: none; stroke: #e0ede5; stroke-width: 13; stroke-linecap: round; }
+.usage-arc-fill { fill: none; stroke: #55a697; stroke-linecap: round; transition: stroke-dasharray .25s ease; }
+.usage-arc.warning .usage-arc-fill { stroke: #d3a148; }
+.usage-arc.danger .usage-arc-fill { stroke: #d66d58; }
+.usage-arc.pending .usage-arc-fill { stroke: #a8bdb3; }
+.usage-arc-center { position: absolute; left: 0; right: 0; bottom: 0; text-align: center; }
+.usage-arc-center b { color: #1e5548; font: 700 25px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.usage-arc-center span { display: block; margin-top: 3px; color: #6c887d; font-size: 10px; font-weight: 700; }
+.usage-arc-meta { display: grid; min-width: 0; gap: 6px; }
+.usage-arc-row { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; border-bottom: 1px dashed #dbe9e0; padding-bottom: 5px; }
+.usage-arc-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.usage-arc-row span { flex: none; color: #748b81; font-size: 11px; }
+.usage-arc-row b { overflow: hidden; color: #1e5548; text-overflow: ellipsis; white-space: nowrap; font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.usage-arc-banner .context-state {
   align-self: start;
+  margin-top: 6px;
   border: 1px solid #b9d9ca;
   border-radius: 99px;
-  padding: 4px 7px;
+  padding: 4px 9px;
   color: #277566;
   background: #e8f5ed;
   font-size: 10px;
@@ -3244,62 +3317,63 @@
   line-height: 1.2;
   white-space: nowrap;
 }
-.usage-context-overview .context-state.warning { border-color: #ead3a2; color: #926125; background: #fff8e4; }
-.usage-context-overview .context-state.danger { border-color: #ebc2b7; color: #aa4936; background: #fff3ef; }
-.usage-context-overview .context-state.pending { border-color: #d5e2db; color: #728a80; background: #f4f8f5; }
-.usage-context-meter {
-  grid-column: 1 / -1;
-  height: 5px;
-  overflow: hidden;
-  border-radius: 99px;
-  background: #dbe9e1;
-}
-.usage-context-meter i { display: block; height: 100%; border-radius: inherit; background: #55a697; transition: width .25s ease; }
-.usage-context-meter.warning i { background: #d3a148; }
-.usage-context-meter.danger i { background: #d66d58; }
-.usage-context-meter.pending i { background: #a8bdb3; }
-.usage-section { padding: 18px 0; border-bottom-color: #dce9e1; }
-.usage-section-head { min-height: 24px; gap: 10px; }
-.usage-section h3 { color: #244f43; font-size: 13px; font-weight: 700; }
-.usage-section-head > span { max-width: 54%; overflow: hidden; color: #6e887d; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 700; }
-.usage-model-label { border: 1px solid #d2e4da; border-radius: 5px; padding: 4px 6px; background: #f7fbf8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.usage-grid {
-  gap: 7px;
-  margin-top: 11px;
-  border: 0;
-  background: transparent;
-}
-.task-usage-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.session-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.usage-grid > div {
-  min-height: 62px;
-  border: 1px solid #d5e5dc;
-  border-radius: 6px;
-  padding: 9px 10px;
-  background: #fbfefb;
-  box-shadow: inset 0 1px #fff;
-}
-.usage-grid dt { color: #718a80; font-size: 10px; font-weight: 700; }
-.usage-grid dd { margin-top: 6px; color: #234f42; font-size: 12px; font-weight: 700; }
-.usage-grid .usage-metric-status { border-color: #b8d8ca; background: #eef8f2; }
-.usage-grid .usage-metric-status.running dd { color: #1e715d; }
-.usage-grid .usage-metric-status.failed dd { color: #a44735; }
-.usage-grid .usage-metric-status.stopped dd { color: #6c8077; }
-.usage-note { margin-top: 11px; border-left: 2px solid #a8cdbc; padding: 9px 10px; color: #658077; background: #f5faf7; }
-.model-usage-list { display: grid; gap: 7px; margin-top: 11px; border: 0; }
-.model-usage-list > div {
-  grid-template-columns: minmax(0, 1fr) minmax(132px, 1fr) max-content;
-  gap: 12px;
-  border: 1px solid #d7e6de;
-  border-radius: 6px;
-  padding: 10px 11px;
-  background: #fbfefb;
-}
-.model-usage-list > div:hover { border-color: #b9d8ca; background: #f7fbf8; }
-.model-usage-list b { color: #245244; font-size: 12px; font-weight: 700; }
-.model-usage-list span { color: #6f887e; font-size: 11px; }
-.model-usage-list em { color: #277566; font-size: 11px; font-weight: 700; }
-.usage-disclaimer { margin: 0; padding-top: 15px; color: #7d9289; font-size: 10px; }
+.usage-arc-banner .context-state.warning { border-color: #ead3a2; color: #926125; background: #fff8e4; }
+.usage-arc-banner .context-state.danger { border-color: #ebc2b7; color: #aa4936; background: #fff3ef; }
+.usage-arc-banner .context-state.pending { border-color: #d5e2db; color: #728a80; background: #f4f8f5; }
+/* 当前任务标题行：状态徽章与模型名留在这层，指标条只放读数。 */
+.usage-task-head { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.usage-task-head h3 { margin: 0; color: #193d32; font-size: 13.5px; font-weight: 700; }
+.usage-run-badge { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #d5e2db; border-radius: 99px; padding: 3px 9px; color: #728a80; background: #f4f8f5; font-size: 10px; font-weight: 700; line-height: 1.2; white-space: nowrap; }
+.usage-run-badge i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.usage-run-badge.running { border-color: #b9d9ca; color: #1e715d; background: #e8f5ed; }
+.usage-run-badge.running i { background: #3ea585; animation: usage-live-blink 1.4s infinite; }
+.usage-run-badge.failed { border-color: #ebc2b7; color: #aa4936; background: #fff3ef; }
+@keyframes usage-live-blink { 50% { opacity: .35; } }
+.usage-task-model { overflow: hidden; margin-left: auto; color: #4c6b60; font: 600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 图表卡双栏：Token 构成 + 模型费用。模型卡缺失时单卡自动占满整行。 */
+.usage-chart-cols { display: grid; grid-template-columns: 1.2fr 1fr; gap: 10px; }
+.usage-chart-cols:has(> .usage-chart-card:only-child) { grid-template-columns: 1fr; }
+.usage-chart-card { min-width: 0; border: 1px solid #d6e5dc; border-radius: 8px; padding: 12px 14px 13px; background: #fff; }
+.usage-chart-card h4 { display: flex; align-items: center; gap: 6px; margin: 0 0 11px; color: #193d32; font-size: 12.5px; font-weight: 700; }
+.usage-card-icon { width: 14px; height: 14px; flex: none; fill: none; stroke: #3e7c6c; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.usage-chart-card h4 span { overflow: hidden; margin-left: auto; color: #748b81; font-size: 10.5px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Token 构成：堆叠条 + 图例。分段色沿用仪表的绿 / 琥珀家族。
+   段宽走 flex-grow 比例（basis 0），多段取整不会加出超过 100% 的总宽把末段裁掉；
+   min-width 只保证极小段（如 0.4% 的输出）还有可点/可悬停的像素。 */
+.usage-token-bar { display: flex; height: 14px; border-radius: 99px; background: #eef4f0; overflow: hidden; }
+.usage-token-bar i { height: 100%; min-width: 2px; }
+.seg-cache-read { background: #8fc0b2; }
+.seg-input { background: #55a697; }
+.seg-cache-create { background: #c9b27e; }
+.seg-output { background: #d3a148; }
+.usage-token-legend { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; margin-top: 10px; }
+.usage-token-legend div { display: flex; align-items: center; gap: 6px; color: #4c6b60; font-size: 10.5px; }
+.usage-token-legend i { width: 8px; height: 8px; flex: none; border-radius: 2px; }
+.usage-token-legend b { margin-left: auto; color: #1e5548; font: 600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* 模型费用：按费用占比的琥珀条，越贵越长。 */
+.usage-model-bars { display: grid; gap: 10px; }
+.usage-model-bar { display: grid; gap: 4px; }
+.usage-model-line { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; }
+.usage-model-line b { overflow: hidden; color: #193d32; font: 700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.usage-model-line em { color: #926125; font: 700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; font-style: normal; }
+.usage-model-lane { height: 7px; border-radius: 99px; background: #f4efe2; overflow: hidden; }
+.usage-model-lane i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #d3a148, #b9862f); }
+.usage-model-detail { color: #748b81; font-size: 10px; }
+
+/* 图标指标条：本次任务的计数读数。 */
+.usage-metric-strip { display: flex; align-items: stretch; border: 1px solid #d6e5dc; border-radius: 8px; background: #fff; overflow: hidden; }
+.usage-metric { display: grid; flex: 1; min-width: 0; justify-items: center; gap: 3px; padding: 10px 4px 9px; border-right: 1px solid #eef4f0; }
+.usage-metric:last-child { border-right: 0; }
+.usage-metric.live { background: #f2faf5; }
+.usage-metric-icon { width: 15px; height: 15px; fill: none; stroke: #3e7c6c; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+.usage-metric b { max-width: 100%; overflow: hidden; color: #1e5548; font: 700 13.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.usage-metric span { color: #748b81; font-size: 9.5px; white-space: nowrap; }
+
+.usage-note { margin: 0; border-left: 2px solid #a8cdbc; padding: 9px 10px; color: #658077; background: #f5faf7; font-size: 12px; line-height: 1.5; }
+.usage-disclaimer { margin: 0; padding-top: 2px; color: #7d9289; font-size: 10px; }
 .usage-dialog > footer {
   min-height: 58px;
   border-top-color: #d6e5dc;
@@ -3311,14 +3385,20 @@
 @media (max-width: 620px) {
   .usage-dialog { width: min(100% - 20px, 700px); max-height: calc(100dvh - 20px); }
   .usage-dialog > header { min-height: 68px; padding: 13px 14px; }
-  .usage-body { padding: 0 14px 14px; }
-  .usage-context-overview { margin-top: 14px; padding: 12px; }
-  .task-usage-grid,
-  .session-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .model-usage-list > div { grid-template-columns: minmax(0, 1fr) max-content; }
-  .model-usage-list > div span { grid-column: 1 / -1; }
-  .model-usage-list > div em { grid-column: 2; grid-row: 1; }
+  .usage-body { padding: 12px 14px 14px; }
+  .usage-arc-banner { grid-template-columns: 1fr; justify-items: center; padding: 12px 14px 12px; }
+  .usage-arc-meta { width: 100%; }
+  .usage-arc-banner .context-state { margin-top: 2px; }
+  .usage-chart-cols { grid-template-columns: 1fr; }
+  .usage-metric-strip { flex-wrap: wrap; }
+  .usage-metric-strip .usage-metric { flex: 1 1 30%; }
   .usage-dialog > footer { padding: 11px 14px; }
+}
+
+/* 动画降级：逐个点名，不靠通配（会被更高特异性压过，见 cli-tools.css 顶部第 4 条）。 */
+@media (prefers-reduced-motion: reduce) {
+  .usage-run-badge.running i { animation: none; }
+  .usage-arc-fill { transition: none; }
 }
 
 /* 会话历史：名称、来源和更新时间分层，当前与运行状态保持一眼可辨。 */
@@ -3665,55 +3745,8 @@
 }
 
 /* ---- 侧栏模块折叠（常用提示词/常用命令/技能） ----------------------------- */
-/* 标题整行变成可点击的折叠按钮：保留文字/角标/图标，右端加小箭头。
-   需要压过 .command-tags .quick-tag-heading button 的边框/底色按钮样式。 */
-.quick-tag-heading .quick-tag-heading-toggle,
-.command-tags .quick-tag-heading .quick-tag-heading-toggle,
-.skill-tags .quick-tag-heading.skill-heading-toggle {
-  width: auto;
-  height: auto;
-  min-width: 0;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 4px;
-  box-sizing: border-box;
-  border: 0;
-  border-radius: 5px;
-  color: inherit;
-  background: transparent;
-  font: inherit;
-  font-weight: inherit;
-  letter-spacing: inherit;
-  line-height: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition: color .16s ease, background .16s ease;
-}
-/* 提示词/命令是“标题行内右侧的小切换钮”：占用标题剩余宽度，把新增 + 号推到右端。 */
-.quick-tag-heading .quick-tag-heading-toggle,
-.command-tags .quick-tag-heading .quick-tag-heading-toggle {
-  display: inline-flex;
-  flex: 1;
-  padding: 1px 2px;
-}
-/* 技能标题整行本身就是可点按钮：块级 flex 占满整行，复用 .quick-tag-heading 的 flex 布局。
-   padding 由 .quick-tag-heading 的常规标题样式提供，这里只重置按钮默认样式。 */
-.skill-tags .quick-tag-heading.skill-heading-toggle {
-  display: flex;
-  width: 100%;
-  padding-top: 0;
-  padding-left: 0;
-  padding-right: 0;
-}
-.quick-tag-heading .quick-tag-heading-toggle:hover:not(:disabled),
-.command-tags .quick-tag-heading .quick-tag-heading-toggle:hover:not(:disabled),
-.skill-tags .quick-tag-heading.skill-heading-toggle:hover:not(:disabled) {
-  border-color: transparent;
-  background: rgba(47, 104, 87, .08);
-}
-.command-tags .quick-tag-heading .quick-tag-heading-toggle:hover:not(:disabled) { background: rgba(116, 96, 40, .08); }
-.quick-tag-heading-toggle:focus-visible { outline: 2px solid #2b7b68; outline-offset: 1px; }
-.quick-tag-heading-toggle .quick-tag-heading-icon { flex: none; }
+/* 方案 F 色块分区后，桌面端折叠开关是各色块头部的 .quick-block-title；
+   这里只保留标题文字截断与折叠箭头的公共样式（移动端菜单标题仍在用）。 */
 .quick-tag-heading-title {
   min-width: 0;
   overflow: hidden;
@@ -3734,11 +3767,6 @@
   transform: rotate(0deg);
   transition: transform .16s ease, opacity .16s ease;
 }
-/* 展开态箭头朝上（点击收起）；折叠后翻转为朝下，暗示点击可展开下方内容。 */
-.quick-tag-group.collapsed .quick-tag-heading-chevron { transform: rotate(180deg); }
-/* 技能组标题里已有 skill-source-hint（margin-left:auto）负责右对齐，
-   折叠箭头不再用 auto 抢占剩余空间，贴着数量右侧即可。 */
-.skill-tags .quick-tag-heading-toggle .quick-tag-heading-chevron { margin-left: 2px; }
 
 /* ---- 任务队列栏折叠（宽屏桌面） ------------------------------------------ */
 @media (min-width: 1200px) {

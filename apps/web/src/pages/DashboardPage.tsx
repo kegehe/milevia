@@ -179,7 +179,7 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
     </header>
     <section className="project-dashboard command-dashboard">
       <header className="dashboard-intro">
-        <div className="dashboard-intro-heading"><h1>项目<em>总览</em></h1><p className="dashboard-subline">{`共 ${projects.length} 个项目 · 状态实时同步`}</p></div>
+        <div><h1>项目<em>总览</em></h1></div>
         <div className="dashboard-summary" aria-label="按项目状态筛选">
           {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><b>{item.count}</b><small>{item.label}</small></button>)}
         </div>
@@ -197,7 +197,6 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
           </div>;
         })()
           : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} runStartedAt={processStatuses[item.id]?.runStartedAt ?? null} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
-      {filteredProjects.length > 0 && <footer className="dashboard-footnote">拖拽卡片可调整顺序 · 状态每 30 秒自动刷新，事件到达时即时更新</footer>}
     </section>
     {desktop && <div className="dashboard-version"><AppVersionTag /></div>}
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} status={projectStatuses[deleteTarget.id]} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}

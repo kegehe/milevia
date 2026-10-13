@@ -154,7 +154,31 @@
 .cli-tools-readings dd { margin: 0 0 0 auto; font-family: ui-monospace, monospace; font-size: 12.5px; color: #31594f; }
 .cli-tools-readings dd[data-tone="new"] { color: #225c50; font-weight: 700; }
 .cli-tools-readings dd[data-tone="none"] { color: #809188; }
-.cli-tools-readings dd[data-tone="loading"] { color: #809188; font-family: inherit; }
+/* 「读取中」：文字仍留在 DOM（读屏与文本断言都吃它），视觉换成流光占位条 ——
+   三行灰字各念一遍「读取中」是这一档最吵的地方，条形占位一眼就是
+   「这里马上会被填上」。占位条是**实线**块：虚线仍只属于「没查成」那一族
+   （本页约定第 2 条），两种意思绝不共用一种观感。 */
+.cli-tools-readings dd[data-tone="loading"] { position: relative; min-width: 64px; color: transparent; font-family: inherit; }
+.cli-tools-readings dd[data-tone="loading"]::before { content: ""; position: absolute; left: 0; right: 0; top: 50%;
+  height: 9px; transform: translateY(-50%); border-radius: 5px;
+  background: linear-gradient(100deg, #e9efec 30%, #f8fbf9 48%, #e9efec 66%); background-size: 220% 100%;
+  animation: cli-tools-shimmer 1.5s linear infinite; }
+.cli-tools-status[data-tone="loading"] { position: relative; min-width: 96px; color: transparent; }
+.cli-tools-status[data-tone="loading"]::before { content: ""; position: absolute; left: 0; top: 50%; width: 96px; height: 9px;
+  transform: translateY(-50%); border-radius: 5px;
+  background: linear-gradient(100deg, #e9efec 30%, #f8fbf9 48%, #e9efec 66%); background-size: 220% 100%;
+  animation: cli-tools-shimmer 1.5s linear infinite; }
+/* 三张卡错开相位：整排一起闪像故障，波浪式推进才像「在读」。 */
+.cli-tools-card:nth-child(2) .cli-tools-readings dd[data-tone="loading"]::before,
+.cli-tools-card:nth-child(2) .cli-tools-status[data-tone="loading"]::before { animation-delay: -.5s; }
+.cli-tools-card:nth-child(3) .cli-tools-readings dd[data-tone="loading"]::before,
+.cli-tools-card:nth-child(3) .cli-tools-status[data-tone="loading"]::before { animation-delay: -1s; }
+@keyframes cli-tools-shimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+/* ⚠️ 降级块必须**显式写出同一个选择器**（本页约定第 4 条）。 */
+@media (prefers-reduced-motion: reduce) {
+  .cli-tools-readings dd[data-tone="loading"]::before,
+  .cli-tools-status[data-tone="loading"]::before { animation: none; }
+}
 
 /* 一句话状态。**"没查成"那一档是虚线灰**（与"没问题"一眼可分）。 */
 .cli-tools-status { display: flex; gap: 8px; margin: 12px 0 0; font-size: 12px; line-height: 1.7; color: #748b81; }
@@ -180,6 +204,12 @@
 .cli-tools-card-actions { display: flex; gap: 8px; align-items: center; margin: auto -16px 0; padding: 11px 16px;
   border-top: 1px solid #eef3f0; background: #fcfdfc; border-radius: 0 0 13px 13px; }
 .cli-tools-card-actions .primary, .cli-tools-card-actions .secondary { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+/* 没有动作条的那几档（读取中 / 没装…）最后一段贴着卡底太挤：给「最后一段」
+   留出与卡顶对称的呼吸位。有动作条时动作条自己是最后一段（自带负 margin
+   与圆角底），不受这条影响。 */
+.cli-tools-card > .cli-tools-status:last-child,
+.cli-tools-card > .cli-tools-note:last-child,
+.cli-tools-card > .cli-tools-resolved:last-child { margin-bottom: 14px; }
 
 /* ── 运行依赖（2026-09-25 仪表行改版，docs/42 §28）───────────────────────
    徽标立身份 → 大数字读数「N / M」做主角 → 右侧状态点 + 动作。
