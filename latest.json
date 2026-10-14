@@ -1,21 +1,21 @@
 {
-  "version": "0.1.9",
-  "notes": "项目总览页重做：卡片显示运行环境（Windows / WSL / 远程服务器）与进程已运行时长，支持按状态筛选与拖拽排序；导入项目改为「选择环境 → 浏览目录 → 加载项目」分步引导，支持选择 Windows 盘符与新建目录；对话新增右侧消息圆点轨，可点击快速跳转到某条用户消息；CLI 工具卡片上直接提供「登录」入口，运行依赖可升级时标明原因；后台更新下载失败时显示具体原因。",
-  "pub_date": "2026-10-11T14:39:02.541Z",
+  "version": "0.1.11",
+  "notes": "对话输入区重做：输入框下方新增工具坞，集中放置 MCP 服务器托盘（只显示本次会话实际注入的连接，超出的在「⋯」里逐条列全）、上下文占用进度环、模型选择器，以及压缩、清空、继续、使用状态等操作；轮数与分支胶囊移到工具坞两侧，分支胶囊显示当前分支、领先/落后提交数与未提交改动数，点击进入 Git 工作台。修复窗口宽度在 1200 像素附近时工具坞内容把发送键挤出卡片的问题；非 Git 目录项目不再显示一条永远读取失败的分支状态；修正若干「点不动却显示手型/悬停」的样式。",
+  "pub_date": "2026-10-14T12:41:07.473Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnc3oxL2piZjZRVHJacVFIRkVuMUpmeFJ2cVFoWG5nRXpRWmFFSldWSnZYbjduWDhleFh1Q2V4RmE0TzlkREJ3Z245MUxkTDR3a2x5NFhuTUNVckZzREF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNzI5NTQyCWZpbGU6TWlsZXZpYV8wLjEuOV94NjQtc2V0dXAuZXhlCjB4RXNPWlYxN1duRU5PZUtiYzlGeTJGekpCOVRjU1h6alhIVStaK2ZSdit5L0ZUWkNpdmRVUHk1VDZvQmlaQWhzU0tobnp1ME9PSGVlZ3ZiZHBVQURnPT0K",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.9/Milevia_0.1.9_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNncy85UWtjTFJBR0E2b3ZJQjV3YWRkdmhzNXB1aEg2N21hUm13VTZGUjZWQVFpZHU1bVNRMXhIa1V5aUxtVngza0ZoQnJhVVd1RDJKU29paTN2enRLYWc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTgxNjY3CWZpbGU6TWlsZXZpYV8wLjEuMTFfeDY0LXNldHVwLmV4ZQpqMGtOOGxOMTdVNnJ4OW5KK01JQTRva0JpcUhtRjJnSjNFaEVkVkNyaC9JYmVxZzRpM3B0YUdNWGVXelllcE1YbTkvRnNCbktYN0wyUk1aSk1NNGpBdz09Cg==",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.11/Milevia_0.1.11_x64-setup.exe"
     },
     "android": {
-      "version": "0.1.10",
-      "versionCode": 8,
-      "notes": "新增对话停止：会话运行中，输入框发送键旁出现「停止」键，可在手机上停止本轮对话（排队中的请求会先确认再强制停止）；项目总览与导入项目改用新的分步界面；CLI 工具卡片上可直接登录；设置页可开关系统通知并查看当前版本。",
-      "pub_date": "2026-10-11T14:41:36.855Z",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.10/Milevia_0.1.10_android.apk",
-      "size": 28522490,
-      "sha256": "99a79d4bc56a87f19d076d53f00dae63111d0b34038030361d13963e6b16d22e",
-      "signature": "99a79d4bc56a87f19d076d53f00dae63111d0b34038030361d13963e6b16d22e"
+      "version": "0.1.12",
+      "versionCode": 9,
+      "notes": "⋯ 菜单改版：每个操作配上行内图标，按「工作台 / 会话与任务」分组，历史会话与任务队列直接显示数量，能进入下一层的项带箭头指示；并修正禁用项仍显示可点悬停底色、以及计数文字被通用样式覆盖的问题。",
+      "pub_date": "2026-10-14T12:45:27.556Z",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.12/Milevia_0.1.12_android.apk",
+      "size": 28534066,
+      "sha256": "517b290c1ab37f34b193230cd07bb39765eabb88e441cd75bc9a400427e89d58",
+      "signature": "517b290c1ab37f34b193230cd07bb39765eabb88e441cd75bc9a400427e89d58"
     }
   }
 }
