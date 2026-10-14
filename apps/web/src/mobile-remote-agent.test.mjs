@@ -1429,10 +1429,12 @@ test("mobile never loses its device entry points when the instance read fails", 
   assert.doesNotMatch(page, /Capacitor\.isNativePlatform\(\) \|\| typeof Notification === "undefined" \? "unsupported"/);
   // 原生平台的权限初值给 "default"（真值由 checkPermissions 异步收敛），两处入口才会渲染。
   assert.match(page, /if \(backend === "native"\) return "default"/);
-  // 两个入口（顶栏那颗 + ⋯ 菜单里那项）都只认 "default"；插件权限经 toNotificationPermission
-  // 映射回同一口径，所以这两处一个字都不用改。
-  assert.ok((page.match(/notificationPermission === "default"/g) || []).length >= 2,
-    "顶栏与 ⋯ 菜单里的通知入口都只认 default");
+  // 入口只剩顶栏那颗（2026-10-13 起菜单里不再有通知项），它只认 "default"；
+  // 插件权限经 toNotificationPermission 映射回同一口径，所以这一处一个字都不用改。
+  // 数**恰好一处**而不是「至少有一处」：原来那条 >=2 是守着"顶栏与菜单各一颗"的，
+  // 菜单那颗删掉后改成了 assert.match，等于连"别在文件页/Git 页再冒一颗出来"也放过了。
+  assert.ok((page.match(/notificationPermission === "default"/g) || []).length === 1,
+    `「开启通知」入口只应剩顶栏那一处，实际 ${(page.match(/notificationPermission === "default"/g) || []).length} 处`);
   // 渠道必须先建好再发：channelId 指向不存在的渠道时通知会**静默不发**（不是退回默认渠道），
   // 所以发之前要等 createChannel 那条 promise —— 启动瞬间到达的事件正好落在这个窗口里。
   assert.match(page, /notificationChannelRef\.current = LocalNotifications\.createChannel\(\{ \.\.\.MOBILE_NOTIFICATION_CHANNEL \}\)/);
@@ -1504,8 +1506,9 @@ test("mobile one-phone-many-desktops: device bar, switcher sheet and per-device 
   // /api/remote/agent-status（见本文件末尾"desktop remote"那组用例）。
   assert.doesNotMatch(page, /className="mobile-instance-status"/);
   assert.match(page, /<h2 id="desktop-remote-service-title">远程服务<\/h2>/);
-  // ② 顶栏不动：当前电脑只是⋯菜单里的一行非交互信息（和"执行 Agent"同一套样式）。
-  assert.match(page, /className="mobile-header-menu-info mobile-header-menu-device"><span>当前电脑<\/span>/);
+  // ② 顶栏不动；设备身份也不进 ⋯ 菜单 —— 2026-10-13 方案C改版把「当前电脑」信息行删了
+  //   （排障素材，设备管理在设备列表面板），别让它以任何类名/形态回到顶栏或菜单里。
+  assert.doesNotMatch(page, /mobile-header-menu-device/);
   assert.doesNotMatch(page, /<h1>\{[^}]*activeDeviceRecord/);
   // ③ 切换必须复位上一台的现场：instanceID 置空是有意的（拉失败也不能挂旧数据）。
   assert.match(page, /function switchDevice\(nextToken: string\) \{/);
@@ -1549,11 +1552,12 @@ test("mobile device alias: 每台电脑一个只在这台手机上生效的备�
   //    "面板里改了、卡片上还是老名字"。这四条断言就是数它有没有被绕过。
   assert.match(page, /import \{[^}]*deviceDisplayName[^}]*\} from "\.\.\/lib\/mobile-devices";/);
   assert.ok((page.match(/deviceDisplayName\(/g) || []).length >= 4,
-    `四处显示点（卡片 / 面板行 / 面板行的 aria-label / 解绑确认框 / ⋯ 菜单）都要走它，实际 ${(page.match(/deviceDisplayName\(/g) || []).length} 处`);
+    `四处显示点（卡片 / 面板行 / 面板行的 aria-label / 解绑确认框）都要走它，实际 ${(page.match(/deviceDisplayName\(/g) || []).length} 处`);
   assert.match(page, /const activeDeviceName = instance \? deviceDisplayName\(\{ alias: activeAlias, name: instance\.name \|\| instance\.instanceId \}\) : activeAlias;/);
   assert.match(page, /<b>\{deviceDisplayName\(item\)\}<\/b>/);
-  // ⋯ 菜单里那行「当前电脑」也要跟着走 —— 它是会话视图里唯一能确认"现在连的是哪台"的地方。
-  assert.match(page, /<small>\{deviceDisplayName\(activeDeviceRecord\)\} · \{activeDeviceRecord\.revoked \? "绑定已失效"/);
+  // ⋯ 菜单里那行「当前电脑」已随 2026-10-13 方案C改版删除（排障素材，设备管理在设备
+  // 列表面板）—— 它曾是会话视图里唯一显示设备名的地方，删掉后这里必须继续守着"别回流"。
+  assert.doesNotMatch(page, /deviceDisplayName\(activeDeviceRecord\)/);
 
   // ② 卡片上**必须显示备注名**，并且在云端读数没回来时也显示：备注是本地读数，
   //    不依赖 `/v1/instances`。但副标题仍要说"没读回来"—— 名字有了不等于这台电脑是好的。
@@ -1691,7 +1695,8 @@ test("mobile task panel is a full-page dialog whose status filters fit on one li
   // 见下面那组"分类栏本身"的断言；原来还有"卡片折叠状态下大片空白"、"删除"孤零零
   // 挂在"查看详情"旁边两个问题，下面各自的断言继续守着）。
   assert.match(page, /<h3 id="mobile-task-panel-title">任务队列<\/h3>/);
-  assert.match(page, /<span>任务队列<\/span><small>\{activeTaskCount\}<\/small>/);
+  // 顶栏 ⋯ 菜单里的「任务队列」入口（2026-10-13 方案C：带行内图标 + 计数胶囊）。
+  assert.match(page, /<HeaderMenuItemIcon kind="queue" \/><span>任务队列<\/span>/);
   assert.match(page, /<h3 id="mobile-task-panel-title">任务队列<\/h3><b className="mobile-task-panel-count"[^>]*>\{activeTaskCount\}<\/b>/);
   assert.doesNotMatch(page, /任务与操作/);
   // 抽屉那一套必须彻底消失（类名、右侧定位、点击遮罩），别留半套。
@@ -2117,7 +2122,7 @@ test("mobile create failures keep their reason on screen", () => {
 test("mobile conversation history is a button that opens a dialog with one row per conversation", () => {
   // 原先是下拉框：选项里直接渲染整条标题，标题一长选项就撑到十几行、把面板拉得很高。
   // 现在是 ⋯ 菜单里的一项，点开是弹窗，弹窗里一行一个会话。
-  assert.match(page, /<button type="button" role="menuitem" onClick=\{\(\) => \{ setHeaderMenuOpen\(false\); setConversationHistoryOpen\(true\); \}\} disabled=\{conversations\.length === 0\}><span>历史会话<\/span>/);
+  assert.match(page, /<button type="button" role="menuitem" onClick=\{\(\) => \{ setHeaderMenuOpen\(false\); setConversationHistoryOpen\(true\); \}\} disabled=\{conversations\.length === 0\}><HeaderMenuItemIcon kind="history" \/><span>历史会话<\/span>/);
   // 下拉框那一整套必须彻底消失（触发器里的标题 span、选项列表、listbox 角色、对应 CSS），别留半套。
   assert.doesNotMatch(page, /mobile-conversation-picker/);
   assert.doesNotMatch(page, /mobile-conversation-options/);
@@ -2237,16 +2242,43 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   // 与刷新胶囊忙碌态同一套做法——状态靠底色变化表达。
   assert.match(styles, /\.mobile-header-menu-button\[aria-expanded="true"\] \{ border-color: #2c7567; color: #1d5b4e; background: #dcefe4; \}/);
 
-  // 菜单本体：role=menu、Agent 信息行与次级操作；高频的新会话直接留在顶栏。
+  // 菜单本体（2026-10-13 方案C改版）：role=menu，「工作台 / 会话与任务」两段小节标题
+  // 组织入口；「当前电脑 / 执行 Agent」两行信息已删（设备那段在上面钉另一半）。
   assert.match(page, /<div className="mobile-header-menu-sheet" id="mobile-header-menu-sheet" role="menu" aria-label="更多操作">/);
-  assert.match(page, /className="mobile-header-menu-info"><span>执行 Agent<\/span>/);
+  assert.match(page, /<span className="mobile-header-menu-label" role="none">工作台<\/span>/);
+  assert.match(page, /<span className="mobile-header-menu-label" role="none">会话与任务<\/span>/);
+  assert.doesNotMatch(page, /mobile-header-menu-info/);
+  assert.doesNotMatch(page, /<span>执行 Agent<\/span>/);
+  // 项目文件 / Git 工作台行带行内图标（HeaderMenuItemIcon）；openFiles/openGit 自己收菜单。
+  assert.match(page, /onClick=\{\(\) => openFiles\(\)\}><HeaderMenuItemIcon kind="files" \/><span>项目文件<\/span>/);
+  assert.match(page, /onClick=\{\(\) => openGit\(\)\}><HeaderMenuItemIcon kind="git" \/><span>Git 工作台<\/span>/);
+  // 高频的新会话直接留在顶栏。
   assert.match(page, /<button className="mobile-new-conversation" type="button" onClick=\{\(\) => openNewConversation\(project\)\}[^>]*><svg[\s\S]*?<span>新会话<\/span><\/button><div className="mobile-header-menu">/);
-  assert.match(page, /role="menuitem" onClick=\{\(\) => \{ setHeaderMenuOpen\(false\); setCreateError\(""\); setCreatingTask\(true\); \}\}[^>]*><span>新建任务<\/span><small>添加到队列<\/small>/);
+  // 「新建任务」只有任务队列面板里那一个入口（右下角 FAB）：菜单里不再出现。
+  // 切菜单本体的切片来断言"删干净"——全文 doesNotMatch 会误伤 FAB 的 aria-label。
+  assert.match(page, /className="mobile-task-fab" onClick=\{\(\) => \{ setCreateError\(""\); setCreatingTask\(true\); \}\} disabled=\{busy\} aria-label="新建任务"/);
+  const convMenuAt = page.indexOf('id="mobile-header-menu-sheet"');
+  const convMenuSlice = convMenuAt > 0 ? page.slice(convMenuAt, page.indexOf("</>}</div></header>", convMenuAt)) : "";
+  assert.ok(convMenuSlice.includes("项目文件") && convMenuSlice.includes("任务队列"), "没切到「更多操作」菜单本体");
+  // 菜单只留 4 项（项目文件 / Git 工作台 / 历史会话 / 任务队列）：新建任务只在队列 FAB，
+  // 「开启通知」不进菜单 —— 那是顶栏胶囊的事（非会话视图的 mobile-notification-button）。
+  assert.doesNotMatch(convMenuSlice, /新建任务|setCreatingTask|setCreateError|执行 Agent|当前电脑|开启通知|enableMobileNotifications/);
+  // 任务队列计数：>0 实心绿（data-hot）、0 静默灰 —— 与 ⋯ 角标同口径（activeTaskCount）。
+  assert.match(page, /className="mobile-header-menu-count" data-hot=\{activeTaskCount > 0 \? "true" : undefined\}/);
+  assert.match(styles, /\.mobile-header-menu-count\[data-hot="true"\] \{ color: #fff; background: #2c7567; \}/);
+  // 描述文字那档必须把胶囊排除掉：`.mobile-header-menu-aside small` 是 (0,1,1)，
+  // 比 `.mobile-header-menu-count` 的 (0,1,0) 多一个元素级，源码顺序救不回来 ——
+  // 不加 :not() 胶囊的 color / font-size / font-weight / line-height 会被静默盖成
+  // 11px/600/#748b81（实测浏览器），作者写的 10.5px/800/#4c6b60 全是死代码。
+  assert.match(styles, /\.mobile-header-menu-aside small:not\(\.mobile-header-menu-count\) \{/);
+  // 禁用行不得有悬停底色：它点不动，给底色等于说"可以点"（实测启用/禁用两行的
+  // hover 底色一模一样）。与同批新增的 .composer-icon-btn:hover:not(:disabled) 同规矩。
+  assert.match(styles, /\.mobile-header-menu-sheet button:hover:not\(:disabled\) \{ background: #eef7f2; \}/);
   assert.doesNotMatch(page, /void createConversationForProject\(project\); \}\} disabled=\{busy\}><span>新会话<\/span>/);
-  assert.match(styles, /\.mobile-header-menu-sheet button \{[^}]*min-height: 44px;/s);
+  assert.match(styles, /\.mobile-header-menu-sheet button \{[^}]*min-height: 42px;/s);
   assert.match(styles, /\.mobile-header-menu-sheet button:disabled \{ color: #64857a; \}/);
   // 面板要能塞进最窄的屏：min-width 用 min() 夹住，否则 320px 上会顶破视口。
-  assert.match(styles, /\.mobile-header-menu-sheet \{[^}]*min-width: min\(216px, calc\(100vw - 32px\)\);/s);
+  assert.match(styles, /\.mobile-header-menu-sheet \{[^}]*min-width: min\(252px, calc\(100vw - 32px\)\);/s);
   // 角标：只在"还有任务没跑完"时渲染。它是唯一一眼可见的状态信号，收进菜单就等于看不见了；
   // 口径 = done / cancelled 之外（与共享层 filterQueueTasks(…, "active") 一致）。
   assert.match(page, /activeTaskCount > 0 && <span className="mobile-header-menu-badge" aria-hidden="true">\{activeTaskCount\}<\/span>/);
@@ -2270,7 +2302,7 @@ test("mobile conversation header collapses to one line with an overflow menu", (
   assert.match(readAppInfoFn, /catch \{[\s\S]*?return null;/);
   assert.match(androidReleaseLib, /export function formatAppVersion\(version: string\): string \{/);
   // 样式：它是**信息行**，不是菜单项 —— 不能进 `.mobile-header-menu-sheet button` 那条
-  // min-height: 44 的规则（点不动的东西给 44 会让人以为可以点）。
+  // min-height: 42 的规则（点不动的东西给 42 会让人以为可以点）。
   assert.doesNotMatch(page, /appVersionLabel|mobile-header-menu-version/);
 
   // 关闭路径：点面板外 + Esc。Esc 必须把焦点还给 ⋯，否则键盘用户掉在 document.body 上、
@@ -2320,7 +2352,7 @@ test("native local notifications opt out of exact alarms", () => {
 // 通知权限必须在**回到前台时**重读，不能只在挂载时读一次。
 //
 // 只读一次的话状态不会收敛：用户去系统设置里把通知打开再回到 App，ref 仍是 false
-// （本会话再也发不出通知），而两颗「开启通知」入口只判 `=== "default"` 也不会重新出现
+// （本会话再也发不出通知），而「开启通知」入口只判 `=== "default"` 也不会重新出现
 // —— 只能杀进程重来（2026-09-29 复查）。
 test("通知权限在回到前台时重读", () => {
   assert.match(page, /const syncNotificationPermission = \(\) => \{/);
@@ -3459,7 +3491,7 @@ test("mobile file view is a sub-state of the conversation, wired to the relay ad
 
   // ① 入口：会话 ⋯ 菜单里那一项，走 openFiles。写成 `() => openFiles()` 而不是
   //    直接传函数 —— 直接传会把 click 事件当成"要打开的文件路径"传进去。
-  assert.match(page, /<button type="button" role="menuitem" onClick=\{\(\) => openFiles\(\)\}><span>项目文件<\/span><small>查看与编辑<\/small><\/button>/);
+  assert.match(page, /<button type="button" role="menuitem" onClick=\{\(\) => openFiles\(\)\}><HeaderMenuItemIcon kind="files" \/><span>项目文件<\/span>/);
   // 而 openFiles 自己也挡一道：拿到的不是字符串就当成"没指定文件"。
   assert.match(page, /setFilesInitialPath\(typeof initialPath === "string" && initialPath\.trim\(\) \? initialPath\.trim\(\) : null\);/);
 
@@ -3598,7 +3630,7 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   const gitStyles = normalize(await readFile(new URL("./git.css", import.meta.url), "utf8"));
 
   // ① 入口：会话 ⋯ 菜单里「项目文件」之后那一项，走 openGit。
-  assert.match(page, /<button type="button" role="menuitem" onClick=\{\(\) => openGit\(\)\}><span>Git 工作台<\/span>/);
+  assert.match(page, /<button type="button" role="menuitem" onClick=\{\(\) => openGit\(\)\}><HeaderMenuItemIcon kind="git" \/><span>Git 工作台<\/span>/);
 
   // ② 子态是**一个槽位**，不是第二个布尔。两个布尔意味着返回键链与 leaveConversationView
   //    要各记两条，而那也是"两处必须一致"的结构 —— 漏一处就会出现"点错也能执行"。
@@ -3633,7 +3665,7 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   // 用户真正想知道的是"电脑上现在是不是仓库了" —— 那属于项目信息，所以只有这一档转去同步快照。
   assert.match(page, /if \(!isSelectedProjectGitRepo\) \{ void refreshNow\(\); return; \}\n\s*gitPanelRef\.current\?\.reload\(\);/);
   assert.match(page, /isGitRepo=\{isSelectedProjectGitRepo\}/);
-  assert.match(page, /onClick=\{\(\) => \{ setHeaderMenuOpen\(false\); reloadGit\(\); \}\}><span>刷新仓库状态<\/span>/);
+  assert.match(page, /onClick=\{\(\) => \{ setHeaderMenuOpen\(false\); reloadGit\(\); \}\}><HeaderMenuItemIcon kind="refresh" \/><span>刷新仓库状态<\/span>/);
 
   // ⑥ 适配器必须记忆化：它持有"上一条可恢复提示还挂着吗"这份状态（以及两个回调）。
   //    每次渲染重建会把它清零，于是那条提示的重置时机变得不可预测。

@@ -27,8 +27,9 @@ import type {
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
   AgentExecution, ConversationUsageResponse, ConversationModels, AgentModelOption,
   RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
-  Skill, AgentCommandOption, ProjectCommands,
+  Skill, AgentCommandOption, ProjectCommands, MCPInjectionStatus, MCPTransport,
 } from "../lib/types";
+import { NON_GIT_BRANCH } from "../lib/types";
 import { api, apiWithTimeout, asRecord } from "../lib/api";
 import {
   agentDisplayName, agentEntry, agentPermissionModes, agentSupportsSlashCommands, catalogAgentID,
@@ -38,7 +39,7 @@ import {
 import { createWebSocket } from "../lib/runtime";
 import {
   formatTime, formatHistoryTime, formatTokens, formatDuration,
-  formatCost, runDuration, contextLabel, contextLevel, contextStateText, requiredShortcutVariables,
+  formatCost, runDuration, contextLevel, contextStateText, requiredShortcutVariables,
   isNarrowConversationLayout, websocketAssistantMessageID, isTemporaryMessage,
   mergeConversationItems, mergeReloadMessages, agentStatusLabel,
 } from "../lib/utils";
@@ -58,6 +59,9 @@ import { copyToClipboard } from "../lib/clipboard";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
+import { ServiceLogo } from "../components/ServiceLogo";
+import { transportLabel } from "../features/mcp/mcp-model";
+import type { GitSnapshot } from "../features/git/git-model";
 import { ExternalLink } from "../components/ExternalLink";
 
 function requiresForceStop(cause: unknown): boolean {
@@ -582,7 +586,243 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
   </>;
 }
 
-function ComposerRunnerInfo({ runnerID, agentID, conversationID, modelOverride, onSelectModel, changingModel, run, runLabel, permissionMode, usage, displayedModel, contextLabel, contextLevel, onShowUsage, onModelFail, readOnly, stopping, onStop }: { runnerID: string; agentID: AgentID; conversationID: string; modelOverride: string; onSelectModel: (model: string) => Promise<boolean>; changingModel: boolean; run: string; runLabel: string; permissionMode?: string; usage: ConversationUsageResponse | null; displayedModel: string; contextLabel: string; contextLevel: string; onShowUsage: () => void; onModelFail: (message: string) => void; readOnly: boolean; stopping: boolean; onStop: () => void }) {
+// MCP 托盘的插头图标：无品牌图标的回落、空态与错误态都用它。
+function ComposerMcpIcon() {
+  return <svg className="composer-mcp-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3" /><path d="M9 9.5v5M9 9.5a2 2 0 1 0-2 2M15 14.5a2 2 0 1 0 2-2M15 9.5v5" /></svg>;
+}
+
+// 托盘上最多摆几个 server 图标（其余只在 ⋯ 菜单里）。见 ComposerMcpTray 里的布局说明。
+const mcpTrayVisibleLimit = 4;
+
+// ── MCP 图标托盘：数据源是「最近一次注入快照」（GET /api/projects/{id}/mcp/status）──
+// 只展示 CLI 实际注入过的服务器，不展示"配置了但没注入"的——对话里能用什么以注入为准；
+// 超过 mcpTrayVisibleLimit 个时托盘只摆前 N 个，剩下的在 ⋯ 里逐条列全。
+// 三态分开渲染：读取中 / 读取失败（可重试）/ 快照（含"本次未注入"的明示），绝不把读不到说成没有。
+// 弹层沿用 ComposerModelPicker 的 portal + fixed 定位模式，避免被卡片的滚动容器裁掉。
+function ComposerMcpTray({ projectID, runKey }: { projectID: string; runKey: string }) {
+  const [status, setStatus] = useState<MCPInjectionStatus | null>(null);
+  const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [position, setPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
+  const navigate = useNavigate();
+  // requestSeq 与 ComposerBranchPill 同款防竞态：切项目后旧响应晚到不得覆盖新状态。
+  const requestSeq = useRef(0);
+
+  const load = useCallback(async () => {
+    const seq = requestSeq.current += 1;
+    // 已有快照先留着显示，新响应到了再换，避免每次刷新都闪一下空态。
+    setPhase((prev) => (prev === "ready" ? prev : "loading"));
+    try {
+      const data = await api<MCPInjectionStatus>(`/api/projects/${projectID}/mcp/status`);
+      if (seq !== requestSeq.current) return;
+      setStatus(data);
+      setPhase("ready");
+    } catch {
+      if (seq !== requestSeq.current) return;
+      setPhase((prev) => (prev === "ready" ? prev : "error"));
+    }
+  }, [projectID]);
+
+  useEffect(() => { void load(); }, [load, runKey]);
+
+  const placeMenu = useCallback(() => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const width = Math.min(340, Math.max(260, window.innerWidth - 24));
+    const left = Math.min(Math.max(12, rect.left), Math.max(12, window.innerWidth - width - 12));
+    setPosition({ left, bottom: Math.max(12, window.innerHeight - rect.top + 8), width });
+  }, []);
+
+  const close = useCallback(() => setOpen(false), []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (target && (menuRef.current?.contains(target) || triggerRef.current?.contains(target))) return;
+      close();
+    };
+    const onScroll = (event: globalThis.Event) => {
+      const target = event.target as Node | null;
+      if (target && menuRef.current?.contains(target)) return;
+      close();
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [open, close]);
+
+  const toggle = () => {
+    if (open) { close(); return; }
+    void load(); // 打开面板时顺带刷新一次，注入快照在 run 开始后才落库，打开即取最新。
+    placeMenu();
+    setOpen(true);
+  };
+
+  const tileTitle = (name: string, displayName: string, origin: string, transport: string) =>
+    `${displayName || name} · 已注入（${origin === "project" ? "项目" : "全局"}） · ${transportLabel(transport as MCPTransport)}`;
+
+  // 托盘最多摆 4 个 tile，其余只在 ⋯ 的菜单里出现（菜单本来就逐条列全）。
+  // 上限是**布局**要求、不是审美：工具坞是一行 flex、托盘 flex:none 不缩，而 1200–1300px
+  // 视口下右侧任务栏占据栅格第三列、对话区只剩 510px —— 实测第 5 个 tile 起发送键就被挤出
+  // 卡片压到任务栏上（5 个溢 18px、8 个溢 114px）。工具坞基类的 flex-wrap 是第二道兜底，
+  // 两者一起保证这一档不再溢出。
+  const trayServers = status?.servers.slice(0, mcpTrayVisibleLimit) ?? [];
+
+  return (
+    <span className="mcp-tray" role="group" aria-label="MCP 服务器">
+      {phase === "error" ? (
+        <button type="button" className="mcp-tile" title="MCP 状态读取失败 · 点击重试" aria-label="MCP 状态读取失败，点击重试" onClick={() => void load()}>
+          <ComposerMcpIcon />
+          <i className="mcp-tile-dot warn" aria-hidden="true" />
+        </button>
+      ) : trayServers.length > 0 ? trayServers.map((srv) => (
+        <span key={srv.name} className="mcp-tile" title={tileTitle(srv.name, srv.displayName, srv.origin, srv.transport)}>
+          <ServiceLogo service={srv.name} fallback={<span aria-hidden="true">{(srv.displayName || srv.name).slice(0, 1).toUpperCase()}</span>} size={14} />
+          <i className="mcp-tile-dot" aria-hidden="true" />
+        </span>
+      )) : (
+        <span className="mcp-tile" title={phase === "loading" ? "正在读取 MCP 状态…" : status?.note || "本次会话未注入任何 MCP 服务器"}>
+          <ComposerMcpIcon />
+        </span>
+      )}
+      <button ref={triggerRef} type="button" className={`mcp-tile mcp-tile-more${open ? " open" : ""}`} title={status && status.serverCount > 0 ? `全部 MCP 服务器（共 ${status.serverCount} 个）` : "全部 MCP 服务器"} aria-label="全部 MCP 服务器" aria-haspopup="dialog" aria-expanded={open} onClick={toggle}>⋯</button>
+      {open && createPortal(
+        <div ref={menuRef} className="mcp-menu" role="dialog" aria-label="MCP 服务器" style={position ? { left: position.left, bottom: position.bottom, width: position.width } : undefined}>
+          <header>
+            <div><label>MCP SERVERS</label><b>最近一次注入</b></div>
+            <button type="button" className="mcp-menu-manage" onClick={() => { close(); navigate("/mcp-manager"); }}>管理连接</button>
+          </header>
+          {phase === "loading" && <p className="mcp-menu-note">正在读取注入状态…</p>}
+          {phase === "error" && <p className="mcp-menu-note mcp-menu-error">MCP 状态读取失败。<button type="button" onClick={() => void load()}>重试</button></p>}
+          {phase === "ready" && status && (status.serverCount > 0 ? (
+            <ul className="mcp-menu-list">
+              {status.servers.map((srv) => (
+                <li key={srv.name} className="mcp-menu-item">
+                  <span className="mcp-tile" aria-hidden="true">
+                    <ServiceLogo service={srv.name} fallback={<span>{(srv.displayName || srv.name).slice(0, 1).toUpperCase()}</span>} size={14} />
+                    <i className="mcp-tile-dot" aria-hidden="true" />
+                  </span>
+                  <span className="mcp-menu-copy"><b>{srv.displayName || srv.name}</b><small>{transportLabel(srv.transport as MCPTransport)}</small></span>
+                  <span className="mcp-menu-origin">{srv.origin === "project" ? "项目" : "全局"}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mcp-menu-note">{status.note || "本次会话未注入任何 MCP 服务器。"}</p>
+          ))}
+          {phase === "ready" && status?.updatedAt && !status.updatedAt.startsWith("0001-") && <p className="mcp-menu-foot">注入快照 · {new Date(status.updatedAt).toLocaleString("zh-CN")}</p>}
+        </div>,
+        document.body,
+      )}
+    </span>
+  );
+}
+
+// ── 上下文进度环：要有「窗口 + token 读数」两个可信值才画弧；读不到显示 "--" 并解释原因 ──
+// （不把"计算中/不可用"画成 0%。环色即档位：normal 绿 / warning 琥珀 / danger 红。）
+function ContextRing({ usage }: { usage: ConversationUsageResponse | null }) {
+  const context = usage?.context;
+  const tokens = context?.contextInputTokens;
+  const window_ = context?.contextWindow;
+  const percent = tokens && window_ ? Math.min(100, Math.round(tokens / window_ * 100)) : null;
+  const level = contextLevel(context);
+  const circumference = 2 * Math.PI * 9;
+  const dash = percent === null ? 0 : Math.max(percent <= 0 ? 0 : 0.5, percent) / 100 * circumference;
+  return (
+    <span className={`ctx-ring ctx-${level}`} role="img" aria-label={contextStateText(context)} title={contextStateText(context)}>
+      <svg viewBox="0 0 22 22" aria-hidden="true">
+        <circle className="ctx-ring-track" cx="11" cy="11" r="9" />
+        {percent !== null && <circle className="ctx-ring-fill" cx="11" cy="11" r="9" strokeDasharray={`${dash} ${circumference}`} />}
+      </svg>
+      <b aria-hidden="true">{percent === null ? "--" : `${percent}%`}</b>
+    </span>
+  );
+}
+
+// ── 分支胶囊：读当前工作区（会话级）的 git 摘要，分支/同步/未提交改动都是服务端算好的读数 ──
+// 三态分开渲染：读取失败（灰，可重试）/ detached HEAD（琥珀）/ 正常（绿，含 ↑↓ 同步与 N 处改动）。
+// 点击跳转 Git 工作台。刷新时机：挂载、会话切换、run 开始与结束（runKey 变化）——
+// 分支切换发生在 Git 工作台页面，回到会话页时组件重挂载即取新值。
+function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: string; conversationID: string; runKey: string }) {
+  const [snapshot, setSnapshot] = useState<GitSnapshot | null>(null);
+  const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
+  const [errorText, setErrorText] = useState("");
+  const navigate = useNavigate();
+  // requestSeq 标识"最新一次请求"：切换会话/工作区时 props 变化会重发请求，
+  // 旧会话的响应若晚到，据此丢弃——分支胶囊绝不能显示上一个工作区的分支。
+  const requestSeq = useRef(0);
+
+  const load = useCallback(async () => {
+    const seq = requestSeq.current += 1;
+    // 已有快照先留着显示，新响应到了再换，避免每次刷新都闪一下空态。
+    setPhase((prev) => (prev === "ready" ? prev : "loading"));
+    try {
+      const query = conversationID ? `?conversationId=${encodeURIComponent(conversationID)}` : "";
+      const data = await api<GitSnapshot>(`/api/projects/${projectID}/git/summary${query}`);
+      if (seq !== requestSeq.current) return;
+      setSnapshot(data);
+      setPhase("ready");
+    } catch (cause) {
+      if (seq !== requestSeq.current) return;
+      setPhase((prev) => (prev === "ready" ? prev : "error"));
+      setErrorText(cause instanceof Error ? cause.message : "分支读取失败");
+    }
+  }, [projectID, conversationID]);
+
+  useEffect(() => { void load(); }, [load, runKey]);
+
+  // 未提交改动数优先用服务端给的 changes 清单（一个文件同时 staged+modified 只算一处），
+  // 旧版响应没带清单时才退回分项计数相加（含 conflicted）。
+  const dirtyCount = snapshot
+    ? snapshot.changes ? snapshot.changes.length
+      : snapshot.worktree.staged + snapshot.worktree.modified + snapshot.worktree.untracked + snapshot.worktree.deleted + snapshot.worktree.renamed + snapshot.worktree.conflicted
+    : 0;
+
+  if (phase === "error") {
+    return (
+      <button type="button" className="branch-pill error" title={`分支读取失败：${errorText} · 点击重试`} onClick={() => void load()}>
+        <BranchPillIcon />
+        读取失败
+      </button>
+    );
+  }
+  if (phase !== "ready" || !snapshot || !snapshot.head) {
+    return <span className="branch-pill" title="正在读取分支状态…"><BranchPillIcon />…</span>;
+  }
+  const head = snapshot.head;
+  if (head.detached) {
+    return (
+      <button type="button" className="branch-pill detached" title={`工作区处于 detached HEAD（${head.oid.slice(0, 7)}），不在任何分支上 · 点击打开Git工作台`} onClick={() => navigate(`/projects/${projectID}/git`)}>
+        <BranchPillIcon />
+        detached HEAD
+        {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
+      </button>
+    );
+  }
+  const syncBits = [head.ahead > 0 ? `↑${head.ahead}` : "", head.behind > 0 ? `↓${head.behind}` : ""].filter(Boolean).join("");
+  return (
+    <button type="button" className="branch-pill" title={`当前分支 ${head.branch}${head.upstream ? `（跟踪 ${head.upstream}）` : ""}${syncBits ? ` · 同步状态 ${syncBits}` : ""}${dirtyCount > 0 ? ` · ${dirtyCount}处未提交改动` : ""} · 点击打开Git工作台`} onClick={() => navigate(`/projects/${projectID}/git`)}>
+      <BranchPillIcon />
+      <span className="branch-name">{head.branch || "（空仓库）"}</span>
+      {syncBits && <span className="sync">{syncBits}</span>}
+      {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
+    </button>
+  );
+}
+
+function BranchPillIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.2" /><circle cx="6" cy="18" r="2.2" /><circle cx="18" cy="8" r="2.2" /><path d="M6 8.2v7.6M18 10.2c0 3.6-4.4 3.4-7.6 4" /></svg>;
+}
+
+function ComposerRunnerInfo({ runnerID, agentID, projectID, conversationID, isGitRepo, run, runLabel, usage, readOnly, stopping, onStop }: { runnerID: string; agentID: AgentID; projectID: string; conversationID: string; isGitRepo: boolean; run: string; runLabel: string; usage: ConversationUsageResponse | null; readOnly: boolean; stopping: boolean; onStop: () => void }) {
   const [runner, setRunner] = useState<RunnerInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<CheckUpdateResult | null>(null);
@@ -699,20 +939,26 @@ function ComposerRunnerInfo({ runnerID, agentID, conversationID, modelOverride, 
   const manualUpdateEnv = runner?.environment === "wsl" ? "WSL 内" : runner?.environment === "windows" ? "Windows 侧" : runner?.environment === "remote-linux" ? "远程服务器上" : "目标环境";
   const manualUpdateCommand = `${agentEntry(agentID)?.commandName ?? agentID} update`;
 
-  const canShowUsage = Boolean(run) || tool?.status === "ready";
   return (<>
-    <span className="composer-status-group">
+    <div className="composer-meta">
+      <span className="composer-meta-group">
       <span className={`runner-inline ${runnerStatusClass}${run ? " run-active" : ""}`} title={tool?.reason} role={run ? "status" : undefined} aria-live={run ? "polite" : undefined}><i aria-hidden="true"></i><span>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span></span>
+      {/* 非 Git 目录项目没有分支可读：/api/projects/{id}/git/summary 对它一律 409，
+          画出来就是一条常驻的「读取失败」胶囊（点了也永远失败）。判据与 GitWorkbenchPage、
+          手机端共用 NON_GIT_BRANCH 这一个哨兵，由宿主演算后传进来。 */}
+      {isGitRepo && <ComposerBranchPill projectID={projectID} conversationID={conversationID} runKey={run} />}
       {run && <button className="runner-stop" type="button" disabled={readOnly || stopping} onClick={onStop} title={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"} aria-label={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"}><span aria-hidden="true"></span>{stopping ? "停止中" : "停止"}</button>}
-      {!run && tool?.status === "ready" && <button className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
-      {!run && !updating && hasUpdate && autoUpdatable && <button className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo?.latestVersion}</button>}
+      {!run && tool?.status === "ready" && <button type="button" className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
+      {!run && !updating && hasUpdate && autoUpdatable && <button type="button" className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo?.latestVersion}</button>}
       {!run && !updating && hasUpdate && !autoUpdatable && <span className="runner-inline-manual" title={`${toolName} 检测到新版本 ${updateInfo?.latestVersion ?? ""}，当前运行器暂不支持应用内自动更新，请在${manualUpdateEnv}手动执行 ${manualUpdateCommand}`}>发现新版本 {updateInfo?.latestVersion} · 需手动更新</span>}
       {!run && !updating && updateInfo && !hasUpdate && !updateInfo.error && <span className="runner-inline-uptodate" title={`${toolName} 已是最新版本`}>已是最新版本</span>}
       {!run && !updating && updateInfo?.error && <span className="runner-inline-error" title={updateInfo.error}>{updateInfo.error}</span>}
-      {canShowUsage ? <span className="composer-usage">{conversationID ? <ComposerModelPicker conversationID={conversationID} agentID={agentID} selected={modelOverride} displayed={displayedModel} disabled={readOnly || Boolean(run) || stopping || changingModel} runActive={Boolean(run)} busy={changingModel} onSelect={onSelectModel} onFail={onModelFail} /> : <span className="composer-usage-model" title={displayedModel}>{displayedModel}</span>}<span className={`composer-usage-context ${contextLevel}`}>{contextLabel}</span><span className="composer-usage-count">{usage ? `${usage.session.taskCount} 次对话` : "加载中"}</span><button className="usage-trigger" type="button" onClick={onShowUsage}>使用状态</button></span> : <span className="composer-usage pending">用量将在工具就绪后显示</span>}
-    </span>
-    {showConfirm && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新 {toolName}</label><h2>确认更新 {toolName}</h2></div><button title="关闭" onClick={() => setShowConfirm(false)}>x</button></header><p className="permission-confirmation">当前版本：<b>{tool?.version}</b> → 最新版本：<b>{updateInfo?.latestVersion}</b>。更新期间将无法使用 AI 对话功能，更新预计需要数十秒。</p><footer><button className="secondary" onClick={() => setShowConfirm(false)}>取消</button><button className="primary" onClick={() => void handleUpdate()}>确认更新</button></footer></section></div>}
-    {updateError && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal update-error-dialog"><header><div><label>更新错误</label><h2>更新失败</h2></div><button title="关闭" onClick={() => setUpdateError(null)}>x</button></header><div className="update-error-reason" role="alert">{updateError}</div><footer><button className="secondary" onClick={() => setUpdateError(null)}>关闭</button></footer></section></div>}
+      </span>
+      <span className="composer-meta-push" aria-hidden="true"></span>
+      {usage && <span className="turns" title="本次会话已完成的对话轮数"><svg className="turns-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.6c0 3.9-3.6 7-8 7-.9 0-1.8-.1-2.6-.4L4.5 19.5l1.1-3.2C4.6 15.2 4 13.5 4 11.6c0-3.9 3.6-7 8-7s8 3.1 8 7Z" /></svg><b>{usage.session.taskCount}</b>次对话</span>}
+    </div>
+    {showConfirm && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新 {toolName}</label><h2>确认更新 {toolName}</h2></div><button type="button" title="关闭" onClick={() => setShowConfirm(false)}>x</button></header><p className="permission-confirmation">当前版本：<b>{tool?.version}</b> → 最新版本：<b>{updateInfo?.latestVersion}</b>。更新期间将无法使用 AI 对话功能，更新预计需要数十秒。</p><footer><button type="button" className="secondary" onClick={() => setShowConfirm(false)}>取消</button><button type="button" className="primary" onClick={() => void handleUpdate()}>确认更新</button></footer></section></div>}
+    {updateError && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal update-error-dialog"><header><div><label>更新错误</label><h2>更新失败</h2></div><button type="button" title="关闭" onClick={() => setUpdateError(null)}>x</button></header><div className="update-error-reason" role="alert">{updateError}</div><footer><button type="button" className="secondary" onClick={() => setUpdateError(null)}>关闭</button></footer></section></div>}
   </>);
 }
 
@@ -1247,9 +1493,9 @@ function ApprovalBanner({ action, resolving, decide, scrollToCard }: { action: T
       </div>
       {detail && <code className="approval-banner-command">{detail}</code>}
       <div className="approval-banner-actions">
-        <button className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button>
-        <button className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button>
-        <button className="approval-banner-scroll" onClick={scrollToCard} title="滚动到命令卡片">↓</button>
+        <button type="button" className="secondary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "deny")}>拒绝</button>
+        <button type="button" className="primary" disabled={resolving === approval.approvalId} onClick={() => void decide(approval.approvalId, "allow")}>{resolving === approval.approvalId ? "处理中" : "允许执行"}</button>
+        <button type="button" className="approval-banner-scroll" onClick={scrollToCard} title="滚动到命令卡片">↓</button>
       </div>
     </div>
   </div>;
@@ -4015,6 +4261,7 @@ export default function ConversationPage() {
           <span>当前 CLI 的命令目录里没有 <code>/{composerSlashHint.commandName}</code>{composerSlashHint.suggestion ? "，" : "，发送后只会得到一句 Unknown command。"}</span>
           {composerSlashHint.suggestion && <button type="button" onClick={() => setComposerText(`/${composerSlashHint.suggestion} `, conversation?.id)}>你是想用 <code>/{composerSlashHint.suggestion}</code> 吗？</button>}
         </div>}
+        <div className="composer-card">
         <div className="composer-input-area">
           {inputHistoryPosition !== null && inputHistory.length > 0 && <span className="composer-history-position" role="status" aria-label={`输入历史第 ${inputHistoryPosition} 条，共 ${inputHistory.length} 条`}>{inputHistoryPosition}/{inputHistory.length}</span>}
       <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || handingOff || changingModel || Boolean(shortcutBusy)} />
@@ -4025,7 +4272,20 @@ export default function ConversationPage() {
           <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "command_request" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderMobileCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           {renderSkillGroup()}
         </section>}
-        <div className="composer-footer"><ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} conversationID={conversation?.id || ""} modelOverride={conversation?.modelOverride || ""} onSelectModel={selectConversationModel} changingModel={changingModel} run={run} runLabel={runLabel} permissionMode={conversation?.permissionMode} usage={usage} displayedModel={displayedModel} contextLabel={contextLabel(usage?.context).replace(/^上下文 /, "")} contextLevel={contextLevel(usage?.context)} onShowUsage={openUsage} onModelFail={fail} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} /><span className="composer-actions"><button className="secondary composer-action composer-clear" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={clearConversationContext}><ComposerActionIcon action="clear" /><span>清空</span></button>{conversation?.agentId === "codex" && <button className="secondary composer-action composer-handoff" type="button" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => { pendingConfirmBusyRef.current = false; setPendingConfirmBusy(false); setPendingConfirm({ title: "压缩并新建会话", message: "将生成只读上下文摘要，并用它初始化新的 Codex 会话。当前会话会保留在历史中。", confirmLabel: "开始交接", className: "conversation-clear-dialog", onConfirm: () => { setPendingConfirm(null); void handoffConversationContext(); }, onCancel: () => setPendingConfirm(null) }); }}><ComposerActionIcon action="handoff" /><span>{handingOff ? "交接中" : "压缩"}</span></button>}<button className="secondary composer-action composer-continue" type="button" disabled={readOnlyConversation || sending || clearing || stopping || handingOff} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /><span>继续</span></button>{run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}<span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {activeAgentName}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span></span></div>
+          <div className="composer-dock">
+            <ComposerMcpTray projectID={project.id} runKey={run} />
+            <ContextRing usage={usage} />
+            <span className="composer-dock-push" aria-hidden="true"></span>
+            {conversation?.id ? <ComposerModelPicker conversationID={conversation.id} agentID={conversation?.agentId || "claude-code"} selected={conversation?.modelOverride || ""} displayed={displayedModel} disabled={readOnlyConversation || Boolean(run) || stopping || changingModel} runActive={Boolean(run)} busy={changingModel} onSelect={selectConversationModel} onFail={fail} /> : <span className="composer-usage-model" title={displayedModel}>{displayedModel}</span>}
+            {conversation?.agentId === "codex" && <button className="composer-icon-btn composer-handoff" type="button" title={handingOff ? "交接中" : "压缩并新建会话"} aria-label="压缩并新建会话" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => { pendingConfirmBusyRef.current = false; setPendingConfirmBusy(false); setPendingConfirm({ title: "压缩并新建会话", message: "将生成只读上下文摘要，并用它初始化新的 Codex 会话。当前会话会保留在历史中。", confirmLabel: "开始交接", className: "conversation-clear-dialog", onConfirm: () => { setPendingConfirm(null); void handoffConversationContext(); }, onCancel: () => setPendingConfirm(null) }); }}><ComposerActionIcon action="handoff" /></button>}
+            <button className="composer-icon-btn danger composer-clear" type="button" title="清空并新建对话" aria-label="清空并新建对话" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={clearConversationContext}><ComposerActionIcon action="clear" /></button>
+            <button className="composer-icon-btn composer-continue" type="button" title="继续上一轮" aria-label="继续上一轮" disabled={readOnlyConversation || sending || clearing || stopping || handingOff} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /></button>
+            {run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}
+            <button className="composer-icon-btn composer-usage-open" type="button" title={!run && !usage ? "用量将在工具就绪后显示" : "使用状态"} aria-label="使用状态" disabled={!run && !usage} onClick={openUsage}><svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V10M10 19V5M15 19v-7M20 19V8" /><path d="M3.5 19.5h17" /></svg></button>
+            <span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {activeAgentName}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span>
+          </div>
+        </div>
+        <ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} projectID={project.id} conversationID={conversation?.id || ""} isGitRepo={project.gitBranch !== NON_GIT_BRANCH} run={run} runLabel={runLabel} usage={usage} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} />
         {pendingSendContent !== null && <div className="composer-pending"><span className="composer-pending-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13.2" r="6.2" /><path d="M12 10.5V13l1.8 1.2" /></svg></span><span className="composer-pending-text"><b>已预约发送</b><small>{run ? "等待当前任务完成..." : "等待子代理完成..."}<span className="composer-pending-preview">{pendingSendContent ? (pendingSendContent.length > 40 ? `${pendingSendContent.slice(0, 40)}…` : pendingSendContent) : "已引用的技能"}</span></small></span><button className="composer-pending-cancel" type="button" title="撤回预约并带回输入框" onClick={cancelScheduledSend}>取消</button></div>}
         </fieldset>
       </form>

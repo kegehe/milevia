@@ -37,8 +37,8 @@ test("the picker reads the catalog and writes a session-scoped override", () => 
 });
 
 test("switching is blocked while a run is active", () => {
-  // 与权限菜单同一条规则：运行中/清空中/停止中都不放行。
-  assert.match(conversationPage, /disabled=\{readOnly \|\| Boolean\(run\) \|\| stopping \|\| changingModel\}/);
+  // 与权限菜单同一条规则：运行中/清空中/停止中都不放行。（选择器已移入工具坞，宿主 prop 是 readOnlyConversation。）
+  assert.match(conversationPage, /disabled=\{readOnlyConversation \|\| Boolean\(run\) \|\| stopping \|\| changingModel\}/);
   const selectBody = conversationPage.match(/const selectConversationModel = async \(model: string\)[\s\S]*?\n  \};/)?.[0] ?? "";
   assert.match(selectBody, /if \(!conversation \|\| readOnlyConversation \|\| \(conversation\.modelOverride \|\| ""\) === model \|\| run \|\| clearing \|\| stopping \|\| handingOff\) return false;/);
 });

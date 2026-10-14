@@ -46,16 +46,6 @@
 .permission-popover span { font-size: 11px; }
 
 /* ---- 使用状态弹窗 ------------------------------------------------------- */
-.usage-trigger {
-  border: 0;
-  padding: 4px 2px;
-  color: #277566;
-  background: transparent;
-  font-size: 11px;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-.usage-trigger:hover { color: #245d52; }
 
 /* ---- 时间线基础 ---------------------------------------------------------- */
 .timeline { position: relative; }
@@ -1657,8 +1647,6 @@
   .head-actions-menu .workspace-create-action { text-align: left; }
 }
 
-.usage-trigger { color: #277566; }
-.usage-trigger:hover { color: #245d52; }
 
 .message > header { color: #597268; }
 .message > header time,
@@ -2070,23 +2058,220 @@
   box-shadow: 0 0 0 3px #dff1e7, inset 0 1px 1px #17362c08;
 }
 .composer textarea:disabled { color: #80958b; background: #f2f7f3; }
+
+/* ── 浮岛卡：文本区与工具坞合在一张白卡里，卡是唯一的边框；焦点态由卡片接管 ── */
+.composer-card {
+  border: 1px solid #bdd8ca;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: inset 0 1px 1px #17362c08, 0 1px 2px #17362c0a, 0 12px 30px #17362c0f;
+  transition: border-color .16s ease, box-shadow .16s ease;
+}
+.composer-card:focus-within {
+  border-color: #55a697;
+  box-shadow: 0 0 0 3px #dff1e7, inset 0 1px 1px #17362c08, 0 12px 30px #17362c0f;
+}
+/* 卡内 textarea 不再自带边框：`.composer textarea:focus` (0,2,1) 被 (0,3,1) 压过，勿合并选择器。
+   禁用态灰底 (0,2,1) 与卡内规则同特异性、但在源码更早处——需在此显式列出，否则被透明底盖掉。 */
+.composer-card .composer-input-area textarea { border: 0; background: transparent; box-shadow: none; }
+.composer-card .composer-input-area textarea:hover:not(:disabled),
+.composer-card .composer-input-area textarea:focus {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  outline: 0;
+}
+.composer-card .composer-input-area textarea:disabled { border-color: transparent; background: #f2f7f3; }
+
+/* flex-wrap 必须在基类、不能只放 ≤820px 那条 media query：视口宽度不是工具坞宽度的可靠代理 ——
+   右侧任务栏在 1200px 变成栅格第三列（对话区骤降到 510px）、821–905px 这一段又是一个窄档，
+   两处都在 media query 覆盖不到的范围里，装不下就只能把发送键挤出卡片压到任务栏上
+   （实测 821px + 2 个 server 就溢 20px）。换行是作者已经为窄屏选定的降级方式，这里只是把
+   触发条件从「视口窄」换成「真的装不下」；装得下时一行不变。 */
+.composer-dock {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 10px 10px 12px;
+}
+.composer-dock-push { flex: 1 1 auto; min-width: 0; }
+/* 折行后发送键往往独占第二行，靠这条贴到右边缘（与 ≤820px 里原本那条同一个作用，
+   提到基类是因为折行现在不只发生在窄屏）。 */
+.composer-dock .composer-send-wrap { margin-left: auto; }
+
+.composer-icon-btn {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 7px;
+  padding: 0;
+  color: #6f8a7e;
+  background: transparent;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease;
+}
+.composer-icon-btn:hover:not(:disabled) { color: #2c7567; background: #eef6f1; }
+.composer-icon-btn.danger:hover:not(:disabled) { color: #ad4835; background: #fdf1ee; }
+.composer-icon-btn:disabled { cursor: not-allowed; opacity: .45; }
+.composer-icon-btn .composer-action-icon { width: 16px; height: 16px; }
+
+/* ── MCP 图标托盘：数据来自最近一次注入快照，绿点=已注入（不含"运行时就绪"语义） ── */
+.mcp-tray {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 9px;
+  background: #f2f7f4;
+}
+.mcp-tile {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border: 1px solid #dfeae3;
+  border-radius: 7px;
+  padding: 0;
+  color: #6f8a7e;
+  background: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: default;
+  transition: transform .12s ease, box-shadow .12s ease;
+}
+button.mcp-tile { cursor: pointer; }
+/* 悬停抬起只给**可点的**那颗（错误态/⋯ 是 button）：已注入的 server 是纯展示 span
+   （cursor: default、无 onClick），给它同样的抬升等于许诺一个点不动的按钮。 */
+button.mcp-tile:hover { transform: translateY(-1px); box-shadow: 0 0 0 3px #2c75671f, 0 3px 8px #17362c1f; }
+.composer-mcp-icon { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.mcp-tile-dot {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2c8a73;
+  box-shadow: 0 0 0 2px #f2f7f4;
+}
+.mcp-tile-dot.warn { background: #c19e40; }
+.mcp-tile-more { color: #5c8477; font: 700 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mcp-tile-more.open { color: #1f6055; background: #e2f4ea; }
+.mcp-menu {
+  position: fixed;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid #c9ddd3;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fbfefb;
+  box-shadow: 7px 7px 0 #d8e8de, 0 18px 40px #17362c14;
+}
+.mcp-menu header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px 8px; }
+.mcp-menu header label { display: block; color: #7a9187; font-size: 9px; font-weight: 700; letter-spacing: .08em; }
+.mcp-menu header b { color: #19332c; font-size: 12px; }
+.mcp-menu-manage { border: 0; padding: 0; color: #2c7567; background: transparent; font-size: 11px; font-weight: 700; cursor: pointer; }
+.mcp-menu-manage:hover { text-decoration: underline; }
+.mcp-menu-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.mcp-menu-item { display: flex; align-items: center; gap: 9px; border: 1px solid transparent; border-radius: 7px; padding: 7px 8px; }
+.mcp-menu-item:hover { background: #eef7f1; border-color: #dff0e7; }
+.mcp-menu-item .mcp-tile { background: #fff; }
+.mcp-menu-copy { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.mcp-menu-copy b { color: #19332c; font-size: 12px; }
+.mcp-menu-copy small { overflow: hidden; color: #809188; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-menu-origin { flex: none; margin-left: auto; border-radius: 4px; padding: 1px 5px; color: #416b5e; background: #e2f0e8; font-size: 9px; font-weight: 700; }
+.mcp-menu-note { margin: 0; padding: 6px 4px; color: #7a9187; font-size: 11px; line-height: 1.6; }
+.mcp-menu-note button { border: 0; padding: 0; color: #2c7567; background: transparent; font-size: 11px; font-weight: 700; cursor: pointer; text-decoration: underline; }
+.mcp-menu-foot { margin: 0; padding: 7px 4px 0; border-top: 1px solid #e2efe7; color: #7a9187; font-size: 10px; }
+
+/* ── 上下文进度环：有「窗口+读数」两个可信值才画弧，读不到显示 "--" ── */
+.ctx-ring { position: relative; display: inline-grid; place-items: center; width: 22px; height: 22px; flex: none; }
+.ctx-ring svg { width: 22px; height: 22px; transform: rotate(-90deg); }
+.ctx-ring-track { fill: none; stroke: #dcebe2; stroke-width: 3; }
+.ctx-ring-fill { fill: none; stroke: #2c8a73; stroke-width: 3; stroke-linecap: round; transition: stroke-dasharray .3s ease; }
+.ctx-ring b {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #31594f;
+  font-size: 7.5px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+}
+.ctx-ring.ctx-warning .ctx-ring-fill { stroke: #c19e40; }
+.ctx-ring.ctx-warning b { color: #85671c; }
+.ctx-ring.ctx-danger .ctx-ring-fill { stroke: #ad4835; }
+.ctx-ring.ctx-danger b { color: #ad4835; }
+/* pending（计算中/暂不可用）：不画弧，数字与轨道都用灰，与"余量充足"的绿色区分 */
+.ctx-ring.ctx-pending b { color: #809188; }
+.ctx-ring.ctx-pending .ctx-ring-track { stroke: #e3ece7; }
 .composer-model-switch-lock { min-width: 0; margin: 0; padding: 0; border: 0; }
-.composer-footer {
+.composer-meta {
   display: flex;
   min-width: 0;
   align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-top: 10px;
+  gap: 8px;
+  margin-top: 8px;
+  color: #809188;
+  font-size: 11px;
 }
-.composer-status-group {
+.composer-meta-group {
   display: flex;
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
 }
+.composer-meta-push { flex: 1 1 auto; min-width: 0; }
+.turns { display: inline-flex; flex: none; align-items: center; color: #809188; font-size: 11px; white-space: nowrap; }
+/* 图标与文字的间距用 margin 而不是容器 gap：flex 的 gap 会把 <b>12</b> 和后面的中文文本节点
+   也拆开，数字与中文之间会多出一条空隙（文字节点在 flex 里是独立 item）。 */
+.turns-icon { width: 13px; height: 13px; margin-right: 5px; fill: none; stroke: #94a89d; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.turns b { color: #31594f; font-weight: 800; }
+/* ── 分支胶囊：当前分支+同步状态+未提交改动数，点击跳转 Git 工作台 ── */
+.branch-pill {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 320px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #cbe1d5;
+  border-radius: 5px;
+  padding: 5px 8px;
+  color: #315e50;
+  background: #edf8f1;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+/* 指针与悬停只给**可点的**那颗：读取中那一档是 <span>（没有 onClick），
+   给它 pointer + 悬停换色等于许诺一个点不动的按钮。 */
+button.branch-pill { cursor: pointer; }
+.branch-pill .branch-name { overflow: hidden; text-overflow: ellipsis; }
+.branch-pill svg { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.branch-pill .sync { flex: none; color: #748b81; font-size: 10px; font-weight: 700; }
+.branch-pill .dirty { flex: none; color: #b4703a; font-size: 10px; font-weight: 700; }
+button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e2f4ea; }
+.branch-pill.detached { border-color: #ead4a8; color: #85671c; background: #fff8e8; }
+/* 每个**状态**的悬停都得显式写：状态类 (0,2,0) 与上面的通用 hover 平级、又排在后面，
+   不写就会被整个盖掉 —— 曾经 detached 悬停一像素都不变（点了能跳，只是没有反馈）。 */
+.branch-pill.detached:hover { border-color: #d3b87e; color: #6f550f; background: #fdf0d4; }
+.branch-pill.error { border-color: #e2e0d9; color: #8a8a84; background: #faf9f6; }
+.branch-pill.error:hover { border-color: #c9c7c0; color: #6d6b64; background: #f4f2ee; }
 .runner-inline {
   min-width: 0;
   border: 1px solid #cbe1d5;
@@ -2186,37 +2371,9 @@
 }
 .runner-inline-btn:hover:not(:disabled) { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
 .runner-stop { display: none; }
-.composer-usage {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 0;
-  color: #6d867b;
-  font-size: 10px;
-}
-.composer-usage > span { max-width: 132px; padding: 0 7px; }
-.composer-usage > span + span::before { content: none; }
-.composer-usage-context,
-.composer-usage-count { border-left: 1px solid #d4e5db; }
-.composer-usage .warning { color: #956b16; }
-.composer-usage .danger { color: #ad4835; }
-.composer-usage.pending { padding: 5px 0; color: #7a9187; }
-.composer-usage .usage-trigger {
-  min-height: 27px;
-  border: 1px solid #c5dcd0;
-  border-radius: 5px;
-  padding: 4px 8px;
-  color: #416b5e;
-  background: #fbfefb;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  text-decoration: none;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
-}
-.composer-usage .usage-trigger:hover { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
-/* 底部模型选择器：触发按钮沿用原"模型文本"的位置与观感，只是变成可点。 */
-.composer-usage .composer-model-trigger {
+.composer-usage-model { padding: 5px 7px; color: #6d867b; font-size: 11px; }
+/* 工具坞里的模型选择器：触发按钮沿用原"模型文本"的观感，只是变成可点。 */
+.composer-model-trigger {
   display: inline-flex;
   max-width: 168px;
   min-height: 27px;
@@ -2233,10 +2390,10 @@
   cursor: pointer;
   transition: border-color .16s ease, color .16s ease, background .16s ease;
 }
-.composer-usage .composer-model-trigger:hover:not(:disabled),
-.composer-usage .composer-model-trigger.open { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
-.composer-usage .composer-model-trigger:disabled { cursor: default; opacity: .68; }
-.composer-usage .composer-model-trigger.busy { opacity: .55; }
+.composer-model-trigger:hover:not(:disabled),
+.composer-model-trigger.open { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
+.composer-model-trigger:disabled { cursor: default; opacity: .68; }
+.composer-model-trigger.busy { opacity: .55; }
 .composer-model-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-model-caret {
   flex: none;
@@ -2302,12 +2459,6 @@
 .model-menu-current b { color: #19332c; }
 .model-menu-note { margin: 0; color: #7a9187; font-size: 10px; line-height: 1.5; }
 .model-menu-hint { margin: 0; border-top: 1px solid #e2efe7; padding-top: 6px; color: #8ba398; font-size: 10px; line-height: 1.5; }
-.composer-actions {
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  gap: 7px;
-}
 .composer-action {
   display: inline-flex;
   min-height: 34px;
@@ -2322,12 +2473,6 @@
   white-space: nowrap;
 }
 .composer-action-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
-.composer-action.composer-clear { border-color: #d5e4da; color: #607d71; background: #fbfefb; }
-.composer-action.composer-clear:hover:not(:disabled) { border-color: #a9cabc; color: #365f51; background: #f0f8f3; }
-.composer-action.composer-continue { border-color: #c6ded2; color: #2f6859; background: #eef8f2; }
-.composer-action.composer-continue:hover:not(:disabled) { border-color: #8fbdab; color: #1f5b4c; background: #e0f2e7; }
-.composer-action.composer-handoff { border-color: #c7d4e5; color: #3f607b; background: #f3f7fb; }
-.composer-action.composer-handoff:hover:not(:disabled) { border-color: #91aecb; color: #294d6b; background: #e6f0f8; }
 .composer-action.composer-stop { border-color: #efc3b7; color: #a44531; background: #fff3ef; }
 .composer-action.composer-stop:hover:not(:disabled) { border-color: #db927d; color: #8b3627; background: #ffe6df; }
 .composer-action.composer-send {
@@ -2451,8 +2596,8 @@
 
 @media (max-width: 820px) {
   .chat-center > .composer { padding: 12px 16px 16px; }
-  .composer-footer { align-items: flex-start; flex-direction: column; gap: 10px; }
-  .composer-status-group { width: 100%; }
+  .composer-meta { flex-wrap: wrap; }
+  /* 这里的 flex-wrap 与发送键的 margin-left: auto 已提到基类（折行不再只发生在窄屏）。 */
   .runner-stop {
     display: inline-flex;
     min-height: 30px;
@@ -2470,14 +2615,12 @@
   .runner-stop > span { width: 9px; height: 9px; border-radius: 1px; background: currentColor; }
   .runner-stop:disabled { cursor: default; opacity: .6; }
   .composer-action.composer-stop { display: none; }
-  .composer-actions { align-self: flex-end; }
 }
 
 @media (max-width: 480px) {
   .composer textarea { min-height: 78px; }
-  .composer-usage { width: 100%; overflow-x: auto; padding-bottom: 1px; }
-  .composer-actions { width: 100%; justify-content: flex-end; }
-  .composer-action { flex: 1; }
+  .composer-dock { row-gap: 6px; }
+  .composer-icon-btn { width: 30px; height: 30px; }
 }
 
 /* 快捷操作区：提示词与命令使用同一工作台语言，仅以绿色明度区分。 */

@@ -282,26 +282,48 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 「还有几个任务没跑完」是唯一一眼可见的状态信号，收进菜单就等于看不见了 ——
    做成 ⋯ 上的角标；角标为 0 时整个元素不渲染。位置贴右上，别压住 ⋯ 字形本身。 */
 .mobile-header-menu-badge { position: absolute; top: -4px; right: -3px; display: grid; min-width: 17px; height: 17px; place-items: center; border: 2px solid #f3f8f4; border-radius: 999px; padding: 0 4px; color: #fff; background: #2c7567; font-size: 10px; font-weight: 700; line-height: 1; }
-/* 下拉面板从 ⋯ 下方展开、右对齐。不能超出屏幕：min-width 用 min() 夹住窄屏。 */
-.mobile-header-menu-sheet { position: absolute; z-index: 40; top: calc(100% + 8px); right: 0; display: grid; min-width: min(216px, calc(100vw - 32px)); gap: 2px; border: 1px solid #dfeae4; border-radius: 14px; padding: 6px; background: #fff; box-shadow: 0 12px 30px rgba(25, 51, 44, .16); }
-.mobile-header-menu-sheet button { display: flex; min-height: 44px; align-items: center; justify-content: space-between; gap: 12px; border: 0; border-radius: 9px; padding: 8px 12px; color: #1d4b40; background: transparent; font: inherit; font-size: 14px; font-weight: 700; text-align: left; }
-/* 「执行 Agent」是信息行、不是操作行：不做 hover、不进 tab 序列、与下面的菜单项用一条线隔开。
-   Agent 名从标题栏挪到这里 —— 会话名要独占那一行最大的字，Agent 是次级信息。 */
-.mobile-header-menu-info { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px 9px; color: #587568; font-size: 12px; font-weight: 700; line-height: 1.5; }
-.mobile-header-menu-info small { flex: none; color: #1d4b40; font-size: 12.5px; font-weight: 700; }
-.mobile-header-menu-sheet button:hover { background: #eef7f2; }
+/* 下拉面板从 ⋯ 下方展开、右对齐。不能超出屏幕：min-width 用 min() 夹住窄屏。
+   2026-10-13 方案C改版：「当前电脑 / 执行 Agent」两行排障信息删除（设备身份在设备
+   列表面板、Agent 名在会话与历史里各有归属）；改为「工作台 / 会话与任务」两段小节
+   标题组织入口，行内图标细描边、无色块（HeaderMenuItemIcon）。 */
+.mobile-header-menu-sheet { position: absolute; z-index: 40; top: calc(100% + 8px); right: 0; display: grid; min-width: min(252px, calc(100vw - 32px)); gap: 1px; border: 1px solid #dfeae4; border-radius: 16px; padding: 6px 6px 8px; background: #fff; box-shadow: 0 12px 30px rgba(25, 51, 44, .16); }
+/* 小节标题：它是分组导航、不是内容，字号压到 10.5px 灰色加宽字距，不与菜单项争。
+   text-align 必须显式钉左：span 在 grid 里 blockify 后占满整行，会继承外部容器
+   的对齐（快照复核时被布景的 center 带偏），不能靠"碰巧没人设 center"活着。 */
+.mobile-header-menu-label { padding: 8px 10px 4px; color: #809188; font-size: 10.5px; font-weight: 800; letter-spacing: .08em; text-align: left; }
+.mobile-header-menu-sheet button { display: flex; min-height: 42px; align-items: center; gap: 9px; border: 0; border-radius: 10px; padding: 0 10px; color: #1d4b40; background: transparent; font: inherit; font-size: 13.5px; font-weight: 700; text-align: left; white-space: nowrap; }
+/* white-space: nowrap 是**必要**条件：面板是 absolute + right:0 的 shrink-to-fit，
+   可用宽度按 ⋯ 按钮的 38px 算，min-width 只兜底、不按内容撑开 —— 「刷新仓库状态」
+   这类长标题会被压成两行。nowrap 让面板按最宽一行撑开（最长的 Git 动作行约 272px，
+   320px 窄屏的可用余量 ≈ 288px，装得下）。 */
+/* 行内图标 20px 细描边（#31594f 次文字档）；chevron 只挂在导航行上（点进去有下一层），
+   动作行（刷新文件 / 刷新仓库状态）不给 —— chevron 是「还有下一层」的承诺。 */
+.mobile-header-menu-item-icon { width: 20px; height: 20px; flex: none; color: #31594f; }
+.mobile-header-menu-chevron { width: 13px; height: 13px; flex: none; color: #a9bcb3; }
+.mobile-header-menu-aside { display: flex; flex: none; align-items: center; gap: 5px; margin-left: auto; }
+/* :not(.mobile-header-menu-count) 是**必要**的：本选择器 (0,1,1) 的 class 数虽与
+   .mobile-header-menu-count (0,1,0) 相同，但多一个元素级，源码顺序救不回来 —— 不加这一条，
+   胶囊的 color / font-size / font-weight / line-height 会被这行静默盖掉（实测浏览器里
+   胶囊显示成 11px/600/#748b81，作者写的 10.5px/800/#4c6b60 全是死代码）。 */
+.mobile-header-menu-aside small:not(.mobile-header-menu-count) { color: #748b81; font-size: 11px; font-weight: 600; line-height: 1.4; }
+/* 计数胶囊：默认浅灰（0 是静默状态，不喊）；任务队列 data-hot（>0）实心绿 ——
+   「有活要干」是页面级信号（⋯ 角标同口径 activeTaskCount），两个读数一眼可分。 */
+.mobile-header-menu-count { display: grid; min-width: 20px; height: 19px; place-items: center; border-radius: 999px; padding: 0 6px; color: #4c6b60; background: #f2f5f3; font-size: 10.5px; font-weight: 800; line-height: 1; }
+.mobile-header-menu-count[data-hot="true"] { color: #fff; background: #2c7567; }
+/* :not(:disabled) 是必要条件：禁用行（「历史会话 0」）本来只靠配色退档，
+   底色却和可用行一样随悬停变 —— 点不动的东西给悬停底色等于说"可以点"。
+   与同批新增的 .composer-icon-btn:hover:not(:disabled) 同一条规矩。 */
+.mobile-header-menu-sheet button:hover:not(:disabled) { background: #eef7f2; }
 /* 禁用态用配色、不用 opacity：菜单面板是纯白底，半透明文字在浅色页面上会糊成一片
    （与刷新胶囊 / 发送键同一条定案）。#64857a on #fff = 4.86:1。 */
 .mobile-header-menu-sheet button:disabled { color: #64857a; }
-.mobile-header-menu-sheet button small { flex: none; color: #587568; font-size: 12px; font-weight: 700; line-height: 1.5; }
-.mobile-header-menu-sheet button:disabled small { color: #7b948a; }
-.mobile-header-menu-separator { height: 1px; margin: 4px 6px; background: #eef4f0; }
-/* ⋯ 菜单最底部那行「应用版本」。它是**信息**、不是操作行，所以：
-   · 与上面那条分隔线隔开，视觉上归到"关于本机"那一档，而不是又一颗菜单项；
-   · 不走按钮的 hover / min-height: 44（它点不动，给 44 会让人以为可以点）；
-   · 等宽字体 + 更小一号字，与桌面端 Dashboard 角落的 .app-version-tag 同一套语言，
-     一眼就能认出是版本号而不是一条功能。
-   颜色沿用菜单里辅助文字那一档 #587568（白底 5.05:1，过正文 4.5 闸）。 */
+.mobile-header-menu-sheet button:disabled .mobile-header-menu-item-icon { color: #7b948a; }
+/* 禁用行的计数必须退回静默灰：本条 (0,3,1) 特异性高于上面 data-hot 的 (0,2,0)，
+   「历史会话 0」禁用时不会挂着一颗实心绿 0。 */
+.mobile-header-menu-sheet button:disabled .mobile-header-menu-count { color: #7b948a; background: #f2f5f3; }
+/* 组内行与行之间的细线：左端缩进到图标之后（10 padding + 20 图标 + 9 gap = 39），
+   与文字对齐、不顶到面板边；分组之间靠小节标题自己的留白隔开，不再画通栏线。 */
+.mobile-header-menu-sep { height: 1px; margin: 2px 0 2px 39px; background: #eef4f0; }
 /* 处理状态条是消息列表的最后一个网格项（跟在最后一条消息后面），它与上一条消息的间距
    由 .mobile-message-list 的 gap 提供，所以自身不再留 margin。 */
 /* ── 会话末尾「正在处理」状态条（2026-10-13 改版：撤框 + 桌面同源动画）─────────

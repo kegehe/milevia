@@ -49,8 +49,60 @@ test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
 
 test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /\{run && <button className="runner-stop" type="button" disabled=\{readOnly \|\| stopping\} onClick=\{onStop\}/);
-  // 允许中间插入新的底部栏 prop（例如模型选择器的 onModelFail），但三者必须都接着。
-  assert.match(conversationPage, /onShowUsage=\{openUsage\}[\s\S]{0,200}?readOnly=\{readOnlyConversation\} stopping=\{stopping\}/);
+  // 卡外细语行的调用点：usage 读数与 runner 状态同行呈现，三者的顺序必须固定。
+  assert.match(conversationPage, /usage=\{usage\} readOnly=\{readOnlyConversation\} stopping=\{stopping\} onStop=\{\(\) => void stopRun\(\)\}/);
+  // 分支胶囊挂在 meta 行 runner 之后，数据来自会话级 git summary（conversationId 决定读哪个工作区）。
+  // 但它必须**只对 Git 项目**渲染：`/api/projects/{id}/git/summary` 对非 Git 目录一律 409
+  // （后端 writeGitReadError），画出来就是一条永远「读取失败」、点了也永远失败的胶囊。
+  // 判据与 GitWorkbenchPage / 手机端共用 NON_GIT_BRANCH 哨兵，不许就地另写一份。
+  assert.match(conversationPage, /import \{ NON_GIT_BRANCH \} from "\.\.\/lib\/types";/);
+  assert.match(conversationPage, /\{isGitRepo && <ComposerBranchPill projectID=\{projectID\} conversationID=\{conversationID\} runKey=\{run\} \/>\}/);
+  assert.match(conversationPage, /isGitRepo=\{project\.gitBranch !== NON_GIT_BRANCH\}/);
+  // 哨兵的字面值同时钉住：它是前后端约定（Go 侧 app.go / git_operations.go 三处写同一个串），
+  // 改这里就必须同步改后端，否则判据会静默失真。
+  assert.match(types, /export const NON_GIT_BRANCH = "非 Git 目录";/);
+  assert.match(conversationPage, /`\/api\/projects\/\$\{projectID\}\/git\/summary\$\{query\}`/);
+  // 工具坞必须有 MCP 托盘与上下文进度环，且都在卡片（composer-card）之内。
+  const dockBlock = conversationPage.match(/<div className="composer-dock">[\s\S]*?<\/div>\s*<\/div>/)?.[0] ?? "";
+  assert.ok(dockBlock, "找不到工具坞区块");
+  assert.match(dockBlock, /<ComposerMcpTray projectID=\{project\.id\} runKey=\{run\} \/>/);
+  assert.match(dockBlock, /<ContextRing usage=\{usage\} \/>/);
+  assert.match(dockBlock, /composer-send-wrap/);
+  // MCP 托盘只摆前 4 个，其余在 ⋯ 里（菜单本来就逐条列全）。
+  // 上限来自实测，不是拍脑袋：托盘 flex:none 不缩，1200–1300px 视口下右栏占掉栅格第三列、
+  // 对话区只剩 510px，第 5 个 tile 起就把发送键挤出卡片（5 个溢 18px、8 个溢 114px）。
+  assert.match(conversationPage, /const mcpTrayVisibleLimit = 4;/);
+  const traySlice = conversationPage.match(/const trayServers = [^\n]*/)?.[0] ?? "";
+  assert.match(traySlice, /status\?\.servers\.slice\(0, mcpTrayVisibleLimit\)/);
+  assert.match(conversationPage, /trayServers\.length > 0 \? trayServers\.map\(/);
+  // 托盘摆不下的那些**必须**还在 ⋯ 的菜单里（菜单仍走全量 status.servers）。
+  assert.match(conversationPage, /\{status\.servers\.map\(\(srv\) => \(/);
+  // 工具坞的换行必须在**基类**：视口宽度不是工具坞宽度的可靠代理 —— 1200px 起右侧任务栏
+  // 变成栅格第三列（对话区骤降到 510px），821–905px 又是一个窄档，两处都在 ≤820px 那条
+  // media query 够不到的地方，只在那里写 flex-wrap 就会把发送键挤出卡片压到任务栏上
+  // （实测 821px + 2 个 server 溢 20px、4 个溢 84px；换行后全档 0 溢出）。
+  const dockBase = stylesheet.match(/(^|\n)\.composer-dock \{[^}]*\}/)?.[0] ?? "";
+  assert.ok(dockBase.includes("flex-wrap: wrap"), "工具坞基类必须自带 flex-wrap: wrap");
+  assert.match(stylesheet, /\.composer-dock \.composer-send-wrap \{ margin-left: auto; \}/);
+  // 发送按钮必须保持「form 内默认 submit」语义：不得显式声明 type 属性。
+  const sendBtn = conversationPage.match(/<button className="primary composer-action composer-send"[^>]*>/)?.[0] ?? "";
+  assert.ok(sendBtn && !sendBtn.includes("type="), "发送按钮不得写 type 属性（submit 语义）");
+  // 悬停抬升只给可点的 tile（错误态 / ⋯ 才是 button）：已注入的 server 是纯展示 span
+  // （cursor: default、无 onClick），给它同样的抬升等于许诺一个点不动的按钮。
+  assert.match(stylesheet, /button\.mcp-tile:hover \{/);
+  assert.doesNotMatch(stylesheet, /(^|\n)\.mcp-tile:hover \{/);
+  // 分支胶囊同一类问题（上面两条同样用浏览器实测过）：
+  // ① 读取中那一档是 <span>（没有 onClick），指针与悬停只能给 button，否则「…」也会假装可点；
+  // ② 每个**状态类**的悬停必须显式写 —— 状态类 (0,2,0) 与通用 button.branch-pill:hover 平级
+  //    又排在后面，不写就会被整个盖掉（detached 曾经悬停一像素都不变）。
+  const branchBase = stylesheet.match(/(^|\n)\.branch-pill \{[^}]*\}/)?.[0] ?? "";
+  assert.ok(branchBase, "找不到 .branch-pill 基类");
+  assert.ok(!branchBase.includes("cursor"), ".branch-pill 基类不得自带 cursor（它会命中不可点的 span）");
+  assert.match(stylesheet, /button\.branch-pill \{ cursor: pointer; \}/);
+  assert.match(stylesheet, /button\.branch-pill:hover \{/);
+  assert.match(stylesheet, /\.branch-pill\.detached:hover \{/);
+  assert.match(stylesheet, /\.branch-pill\.error:hover \{/);
+  assert.doesNotMatch(stylesheet, /(^|\n)\.branch-pill:hover \{/);
   assert.match(stylesheet, /\.runner-stop \{ display: none; \}/);
   assert.match(stylesheet, /@media \(max-width: 820px\) \{[\s\S]*?\.runner-stop \{[\s\S]*?display:\s*inline-flex;[\s\S]*?\.composer-action\.composer-stop \{ display: none; \}/);
   assert.match(conversationPage, /const pendingUserDrafts = useRef\(new Map<string, string>\(\)\);/);
@@ -427,7 +479,7 @@ test("Codex and Claude use the same version check and update controls", () => {
   assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/agents\/\$\{encodeURIComponent\(agentID\)\}\/check-update/);
   assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/agents\/\$\{encodeURIComponent\(agentID\)\}\/update/);
   assert.doesNotMatch(conversationPage, /agentPath/);
-  assert.match(conversationPage, /!run && tool\?\.status === "ready" && <button className="runner-inline-btn"/);
+  assert.match(conversationPage, /!run && tool\?\.status === "ready" && <button type="button" className="runner-inline-btn"/);
   assert.match(conversationPage, /确认更新 \{toolName\}/);
   assert.doesNotMatch(conversationPage, /status: "ready" as const/);
 });
@@ -581,8 +633,8 @@ test("clearing context closes the current tab and starts a fresh conversation wi
   assert.match(taskQueue, /conversationIDRef\.current !== dispatchConversationID/);
   assert.match(taskQueue, /setDispatching\(false\);\s*setRedispatchingTaskID\(null\);/);
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
-  assert.match(conversationPage, /<button className="secondary composer-action composer-clear" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><span>清空<\/span><\/button>/);
-  assert.match(conversationPage, /<button className="secondary composer-action composer-continue" type="button" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><span>继续<\/span><\/button>/);
+  assert.match(conversationPage, /<button className="composer-icon-btn danger composer-clear" type="button" title="清空并新建对话" aria-label="清空并新建对话" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><\/button>/);
+  assert.match(conversationPage, /<button className="composer-icon-btn composer-continue" type="button" title="继续上一轮" aria-label="继续上一轮" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><\/button>/);
   assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| \(!text\.trim\(\) && skillRefs\.length === 0\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\}><ComposerActionIcon action="send" \/>/);
 });
 
