@@ -1059,6 +1059,9 @@ type mcpPreset struct {
 	DocsURL string `json:"docsUrl,omitempty"`
 	// Note 用于说明该条目与上游版本/废弃情况相关的事项，在表单里原样展示。
 	Note string `json:"note,omitempty"`
+	// Mode 决定目录卡片是否可以直接进入连接向导。manual 只展示官方接入文档，
+	// 避免把尚未确认的第三方 MCP 地址伪装成可用的一键连接。
+	Mode string `json:"mode"`
 }
 
 // 目录分组。
@@ -1068,6 +1071,7 @@ type mcpPreset struct {
 // 移除；恢复时按 docs/34 §26 记录的形状重建（stdio + requires 诚实声明 + 凭据落点）。
 const (
 	mcpPresetCategoryCommon = "常用服务"
+	mcpPresetModeConnect    = "connect"
 )
 
 // mcpGitHubRemoteURL 是 GitHub 官方托管的远程 MCP server。
@@ -1096,7 +1100,7 @@ func mcpRemotePreset(id, name, display, summary, icon, rawURL string, oauth bool
 		Category: mcpPresetCategoryCommon, Icon: icon,
 		Transport: mcpTransportHTTP, URL: rawURL,
 		Environments: mcpPresetEnvironmentsAll(),
-		OAuth:        oauth, Credentials: credentials, DocsURL: docsURL,
+		OAuth:        oauth, Credentials: credentials, DocsURL: docsURL, Mode: mcpPresetModeConnect,
 	}
 }
 
@@ -1124,6 +1128,7 @@ func mcpPresetCatalog() []mcpPreset {
 			}}, "https://docs.stripe.com/mcp"),
 	}
 
+	common = append(common, mcpRemotePreset("aliyun", "aliyun", "阿里云", "查询阿里云资源、配额、监控和审计信息", "cloud", "https://api.aliyun.com/mcp", true, nil, "https://help.aliyun.com/zh/openapi/user-guide/openapi-mcp-server-guide"))
 	return common
 }
 

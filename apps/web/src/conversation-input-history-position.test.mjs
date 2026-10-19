@@ -6,7 +6,7 @@ const page = await readFile(new URL("./pages/ConversationPage.tsx", import.meta.
 const styles = await readFile(new URL("./conversation.css", import.meta.url), "utf8");
 
 test("input history position uses the current history index and hides at the newest draft", () => {
-  assert.match(page, /const inputHistoryPosition = historyIndex\.current === null \? null : inputHistory\.length - historyIndex\.current;/);
+  assert.match(page, /const inputHistoryPosition = historyIndex\.current === null \? null : historyIndex\.current \+ 1;/);
   assert.match(page, /inputHistoryPosition !== null && inputHistory\.length > 0/);
   assert.match(page, /\{inputHistoryPosition\}\/\{inputHistory\.length\}/);
   assert.match(page, /aria-label=\{`输入历史第 \$\{inputHistoryPosition\} 条，共 \$\{inputHistory\.length\} 条`\}/);

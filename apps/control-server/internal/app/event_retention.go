@@ -74,12 +74,45 @@ func (s *Server) startEventRetentionLoop() {
 		case <-timer.C:
 		}
 		for {
-			removed, err := s.pruneConversationEvents(s.runtimeCtx)
+			var removed int64
+			passStarted := time.Now()
+			// Retention is a best-effort maintenance task. Never compete with an
+			// active run for the single SQLite connection, and bound each pass so
+			// a large events table cannot occupy it indefinitely.
+			active, err := s.hasActiveRuns(s.runtimeCtx)
+			activeCheckFailed := err != nil
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("[maintenance] check active runs before event prune: %v", err)
+				}
+				// A failed admission check must not be treated as "no active
+				// runs". Skipping this best-effort pass preserves the invariant
+				// that retention never competes with an unknown run state.
+				active = true
+			}
+			if active {
+				removed = 0
+				err = nil
+				reason := "active_runs"
+				if activeCheckFailed {
+					reason = "active_run_check_failed"
+				}
+				log.Printf("[maintenance] event retention skipped reason=%s", reason)
+			} else {
+				pruneCtx, cancel := context.WithTimeout(s.runtimeCtx, 2*time.Minute)
+				removed, err = s.pruneConversationEvents(pruneCtx)
+				cancel()
+			}
 			if err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("[maintenance] prune conversation events: %v", err)
 			}
 			if removed > 0 {
-				s.reclaimAfterPrune(s.runtimeCtx, removed)
+				reclaimCtx, reclaimCancel := context.WithTimeout(s.runtimeCtx, 2*time.Minute)
+				s.reclaimAfterPrune(reclaimCtx, removed)
+				reclaimCancel()
+			}
+			if !active {
+				log.Printf("[maintenance] event retention finished removed=%d elapsed_ms=%d", removed, time.Since(passStarted).Milliseconds())
 			}
 			ticker := time.NewTicker(eventsRetentionInterval)
 			select {
@@ -91,6 +124,12 @@ func (s *Server) startEventRetentionLoop() {
 			}
 		}
 	}()
+}
+
+func (s *Server) hasActiveRuns(ctx context.Context) (bool, error) {
+	var active bool
+	err := s.db.QueryRowContext(ctx, `select exists(select 1 from runs where status in ('queued','running'))`).Scan(&active)
+	return active, err
 }
 
 // reclaimAfterPrune 在裁剪之后做一次**有界**的增量回收。
@@ -133,22 +172,21 @@ func (s *Server) pruneConversationEvents(ctx context.Context) (int64, error) {
 // （同 cleanOrphanedConversationEvents 的约定）。
 func (s *Server) pruneConversationEventsWithLimits(ctx context.Context, processLimit, totalLimit int64) (int64, error) {
 	processTypes := eventsProcessEventTypesSQL()
-	query := `select conversation_id, count(*) as total,
-			sum(case when type in (` + processTypes + `) then 1 else 0 end) as process
-		from events group by conversation_id
-		having process > ? or total > ?`
-	rows, err := s.db.QueryContext(ctx, query, processLimit, totalLimit)
+	// Enumerate conversation ids first. The old GROUP BY scanned and aggregated
+	// the entire events table on every retention pass; the per-conversation
+	// index makes these bounded counts proportional to each conversation's data.
+	rows, err := s.db.QueryContext(ctx, `select id from conversations order by id`)
 	if err != nil {
 		return 0, err
 	}
-	overLimit := []conversationEventUsage{}
+	conversationIDs := []string{}
 	for rows.Next() {
-		var usage conversationEventUsage
-		if err := rows.Scan(&usage.conversationID, &usage.total, &usage.process); err != nil {
+		var conversationID string
+		if err := rows.Scan(&conversationID); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		overLimit = append(overLimit, usage)
+		conversationIDs = append(conversationIDs, conversationID)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -159,7 +197,15 @@ func (s *Server) pruneConversationEventsWithLimits(ctx context.Context, processL
 	}
 
 	var removed int64
-	for _, usage := range overLimit {
+	for _, conversationID := range conversationIDs {
+		var usage conversationEventUsage
+		usage.conversationID = conversationID
+		if err := s.db.QueryRowContext(ctx, `select count(*), coalesce(sum(case when type in (`+processTypes+`) then 1 else 0 end),0) from events where conversation_id=?`, conversationID).Scan(&usage.total, &usage.process); err != nil {
+			return removed, err
+		}
+		if usage.process <= processLimit && usage.total <= totalLimit {
+			continue
+		}
 		count, err := s.pruneConversationEventUsage(ctx, usage, processLimit, totalLimit)
 		removed += count
 		if err != nil {

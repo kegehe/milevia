@@ -893,7 +893,16 @@ func (s *Server) prepareSSHRunner(ctx context.Context, c SSHConnection) (_ *sshR
 
 // tryConnectAndRegister validates a candidate before replacing an existing
 // runner. A failed reconnect leaves an already-running connection untouched.
-func (s *Server) tryConnectAndRegister(ctx context.Context, c *SSHConnection) error {
+func (s *Server) tryConnectAndRegister(ctx context.Context, c *SSHConnection) (err error) {
+	started := time.Now()
+	log.Printf("[ssh] connect begin connection=%s host=%s", c.ID, c.Host)
+	defer func() {
+		if err != nil {
+			log.Printf("[ssh] connect failed connection=%s host=%s elapsed_ms=%d error=%v", c.ID, c.Host, time.Since(started).Milliseconds(), err)
+		} else {
+			log.Printf("[ssh] connect succeeded connection=%s host=%s elapsed_ms=%d", c.ID, c.Host, time.Since(started).Milliseconds())
+		}
+	}()
 	s.sshMu.Lock()
 	defer s.sshMu.Unlock()
 	runnerID := "ssh-" + c.ID

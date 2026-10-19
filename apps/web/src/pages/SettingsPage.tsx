@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Capacitor } from "@capacitor/core";
 import { LocalNotifications } from "@capacitor/local-notifications";
+import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useUIPreferences, type AppPreferences } from "../stores/useUIPreferences";
@@ -12,6 +13,7 @@ import { PROJECT_ORDER_STORAGE_KEY, resetProjectOrder } from "../lib/project-ord
 import { isDesktop } from "../lib/runtime";
 import { api, apiWithTimeout } from "../lib/api";
 import { agentDisplayName, useAgentCatalog } from "../lib/agent-registry";
+import { MOBILE_AGENTS } from "../lib/mobile-agent-catalog";
 import {
   checkResultToast,
   downloadPhase,
@@ -79,7 +81,8 @@ function Toggle({ checked, disabled, onChange, label }: { checked: boolean; disa
 // 分组表是唯一事实来源：Tab 顺序、标题、副标题、面板内容都从这里取。
 // 加一个分组只改这里，别再去别处补第二份清单。
 type TabId = "general" | "notifications" | "security" | "tasks" | "data" | "about";
-const TAB_ORDER: TabId[] = ["general", "notifications", "security", "tasks", "data", "about"];
+const DESKTOP_TAB_ORDER: TabId[] = ["general", "notifications", "security", "tasks", "data", "about"];
+const MOBILE_TAB_ORDER: TabId[] = ["general", "notifications", "data", "about"];
 const TAB_LABELS: Record<TabId, { tab: string; eyebrow: string; title: string; lede: string }> = {
   general: { tab: "通用", eyebrow: "通用", title: "界面体验", lede: "字号会同时作用于文件查看器、编辑器与差异视图；这些偏好只保存在当前设备，不会同步到其它电脑。" },
   notifications: { tab: "通知", eyebrow: "通知", title: "提醒方式", lede: "系统通知、应用内 Toast 与免打扰时段集中在这一页。审批和人工介入不受这里的开关影响。" },
@@ -90,14 +93,14 @@ const TAB_LABELS: Record<TabId, { tab: string; eyebrow: string; title: string; l
 };
 
 function isTabId(value: string): value is TabId {
-  return (TAB_ORDER as string[]).includes(value);
+  return (DESKTOP_TAB_ORDER as string[]).includes(value);
 }
 
 /** 把 hash 当唯一真相：刷新、前进后退、深链都靠它，组件内不再另存一份。 */
-function readTabFromHash(): TabId {
+function readTabFromHash(order: readonly TabId[] = DESKTOP_TAB_ORDER): TabId {
   if (typeof window === "undefined") return "general";
   const raw = window.location.hash.replace(/^#/, "");
-  return isTabId(raw) ? raw : "general";
+  return isTabId(raw) && order.includes(raw) ? raw : "general";
 }
 
 /** 卡片式设置项：左文右控件。危险项加 danger 变体（红底 + 红按钮）。 */
@@ -110,6 +113,8 @@ function SettingCard({ title, description, children, wide, danger }: { title: st
 
 export default function SettingsPage() {
   const navigate = useNavigate();
+  const mobileSettings = !isDesktop();
+  const tabOrder = mobileSettings ? MOBILE_TAB_ORDER : DESKTOP_TAB_ORDER;
   // 默认 Agent 的候选来自服务端目录：写死两项的话，目录里新增的工具根本选不到。
   const agentOptions = useAgentCatalog();
   const { clearConversationDrafts } = useProjectContext();
@@ -144,8 +149,20 @@ export default function SettingsPage() {
   const [storageLoading, setStorageLoading] = useState(false);
   const [storageCleaning, setStorageCleaning] = useState(false);
   const [storageConfirmOpen, setStorageConfirmOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<TabId>(readTabFromHash);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [autostartLoading, setAutostartLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState<TabId>(() => readTabFromHash(tabOrder));
   const nativeNotificationsAvailable = Capacitor.isNativePlatform();
+  useEffect(() => {
+    if (!isDesktop()) return;
+    let cancelled = false;
+    void isAutostartEnabled().then((enabled) => {
+      if (!cancelled) setAutostartEnabled(enabled);
+    }).catch(() => {
+      if (!cancelled) setAutostartEnabled(false);
+    });
+    return () => { cancelled = true; };
+  }, []);
   useEffect(() => {
     if (!nativeNotificationsAvailable) return;
     void LocalNotifications.checkPermissions().then((status) => {
@@ -160,10 +177,15 @@ export default function SettingsPage() {
 
   // hash 是外部状态：浏览器前进/后退、外链跳进来都要能同步回组件。
   useEffect(() => {
-    const sync = () => setActiveTab(readTabFromHash());
+    const sync = () => {
+      const raw = window.location.hash.replace(/^#/, "");
+      if (raw && isTabId(raw) && !tabOrder.includes(raw)) window.history.replaceState(null, "", "#general");
+      setActiveTab(readTabFromHash(tabOrder));
+    };
+    sync();
     window.addEventListener("hashchange", sync);
     return () => window.removeEventListener("hashchange", sync);
-  }, []);
+  }, [tabOrder]);
 
   // 窄屏下分页栏会横向溢出：选中项必须自己滚进可视区，否则用户按方向键切到「关于」
   // 时屏幕上毫无变化，看起来像"点了没反应"。inline:"nearest" 保证只在必要时滚、不抖。
@@ -186,12 +208,12 @@ export default function SettingsPage() {
 
   // Tab 键盘导航：左右箭头在分页间移动，Home/End 跳首尾。
   const onTabKeyDown = (event: { key: string; preventDefault: () => void }) => {
-    const index = TAB_ORDER.indexOf(activeTab);
+    const index = tabOrder.indexOf(activeTab);
     let next: TabId | null = null;
-    if (event.key === "ArrowRight") next = TAB_ORDER[(index + 1) % TAB_ORDER.length];
-    else if (event.key === "ArrowLeft") next = TAB_ORDER[(index - 1 + TAB_ORDER.length) % TAB_ORDER.length];
-    else if (event.key === "Home") next = TAB_ORDER[0];
-    else if (event.key === "End") next = TAB_ORDER[TAB_ORDER.length - 1];
+    if (event.key === "ArrowRight") next = tabOrder[(index + 1) % tabOrder.length];
+    else if (event.key === "ArrowLeft") next = tabOrder[(index - 1 + tabOrder.length) % tabOrder.length];
+    else if (event.key === "Home") next = tabOrder[0];
+    else if (event.key === "End") next = tabOrder[tabOrder.length - 1];
     if (!next) return;
     event.preventDefault();
     selectTab(next);
@@ -310,6 +332,21 @@ export default function SettingsPage() {
     }
   };
 
+  const toggleAutostart = async (enabled: boolean) => {
+    setAutostartLoading(true);
+    try {
+      if (enabled) await enableAutostart();
+      else await disableAutostart();
+      setAutostartEnabled(await isAutostartEnabled());
+      toast.success(enabled ? "已开启开机启动" : "已关闭开机启动");
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "无法修改开机启动设置");
+      try { setAutostartEnabled(await isAutostartEnabled()); } catch { /* keep current state */ }
+    } finally {
+      setAutostartLoading(false);
+    }
+  };
+
   const resetLocal = () => {
     try { window.localStorage.removeItem(CODE_FONT_SIZE_STORAGE_KEY); } catch { /* reset current view below */ }
     resetProjectOrder();
@@ -377,17 +414,26 @@ export default function SettingsPage() {
     <header className="settings-header">
       <div className="settings-header-main"><button type="button" className="settings-back" title="返回首页" aria-label="返回首页" onClick={() => navigate("/")}><BackIcon /></button><div><h1>Milevia 设置</h1></div></div>
     </header>
-    <div className="settings-tabs" role="tablist" aria-label="设置分组" ref={tabsRef} onKeyDown={onTabKeyDown}>{TAB_ORDER.map((id) => <button key={id} type="button" role="tab" id={`settings-tab-${id}`} aria-selected={activeTab === id} aria-controls={`settings-panel-${id}`} tabIndex={activeTab === id ? 0 : -1} className={activeTab === id ? "active" : ""} onClick={() => selectTab(id)}>{TAB_LABELS[id].tab}</button>)}</div>
+    <div className="settings-tabs" role="tablist" aria-label="设置分组" ref={tabsRef} onKeyDown={onTabKeyDown}>{tabOrder.map((id) => <button key={id} type="button" role="tab" id={`settings-tab-${id}`} aria-selected={activeTab === id} aria-controls={`settings-panel-${id}`} tabIndex={activeTab === id ? 0 : -1} className={activeTab === id ? "active" : ""} onClick={() => selectTab(id)}>{TAB_LABELS[id].tab}</button>)}</div>
     <div className="settings-board">
       <header className="settings-board-hero"><p>{TAB_LABELS[activeTab].eyebrow}</p><h2>{TAB_LABELS[activeTab].title}</h2><span>{TAB_LABELS[activeTab].lede}</span></header>
       <div className="settings-panel" role="tabpanel" id={`settings-panel-${activeTab}`} aria-labelledby={`settings-tab-${activeTab}`}>
+        {mobileSettings && activeTab === "general" && <div className="settings-note settings-grid-full"><span className="settings-note-icon"><ShieldIcon /></span><div><b>任务由当前连接的电脑执行</b><span>任务执行、自动验收和 Agent 默认设置由连接的电脑决定；手机端这里只管理本机体验。</span></div></div>}
         {activeTab === "general" && <div className="settings-grid">
+          {mobileSettings && <SettingCard wide title="默认 Agent" description="移动端新建会话优先使用此工具；如果连接的电脑没有该工具，会自动回退到可用工具。">
+            <select aria-label="默认 Agent" value={localPreferences.defaultAgentId} onChange={(event) => updateLocalPreferences({ defaultAgentId: event.target.value as AppPreferences["defaultAgentId"] })}>
+              {MOBILE_AGENTS.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+            </select>
+          </SettingCard>}
           <SettingCard wide title="代码字号" description="文件查看器和编辑器共用此字号。">
             <div className="font-size-control"><button type="button" aria-label="减小代码字号" title="减小代码字号" disabled={fontSize <= CODE_FONT_SIZE_BOUNDS.min} onClick={() => { const next = setCodeFontSize(fontSize - 1); setFontSize(next); }}>-</button><input aria-label="代码字号" type="range" min={CODE_FONT_SIZE_BOUNDS.min} max={CODE_FONT_SIZE_BOUNDS.max} value={fontSize} style={{ "--range-progress": fontSizeProgress } as CSSProperties} onChange={(event) => { const next = setCodeFontSize(Number(event.target.value)); setFontSize(next); }} /><output>{fontSize}px</output><button type="button" aria-label="增大代码字号" title="增大代码字号" disabled={fontSize >= CODE_FONT_SIZE_BOUNDS.max} onClick={() => { const next = setCodeFontSize(fontSize + 1); setFontSize(next); }}>+</button></div>
           </SettingCard>
           <SettingCard title="项目卡片排序" description="清除首页拖拽产生的自定义排列，恢复服务端顺序。">
             <button type="button" className="secondary" onClick={() => { resetProjectOrder(); toast.success("项目卡片排序已恢复默认"); }}>恢复默认</button>
           </SettingCard>
+          {isDesktop() && <SettingCard wide title="开机启动" description="登录 Windows 后自动启动 Milevia 并显示主窗口；默认关闭。">
+            <Toggle label="开机启动" checked={autostartEnabled} disabled={autostartLoading} onChange={(checked) => void toggleAutostart(checked)} />
+          </SettingCard>}
         </div>}
 
         {activeTab === "notifications" && <div className="settings-grid">
@@ -424,7 +470,7 @@ export default function SettingsPage() {
           <div className="settings-note settings-grid-full"><span className="settings-note-icon"><ShieldIcon /></span><div><b>审批与人工介入始终保留应用内提醒</b><span>上面这些开关与免打扰时段都不会静默这类中断，它们会一直出现在通知中心。</span></div></div>
         </div>}
 
-        {activeTab === "security" && <div className="settings-grid">
+        {!mobileSettings && activeTab === "security" && <div className="settings-grid">
           {appPreferencesError && <p className="settings-error">{appPreferencesError}</p>}
           <SettingCard wide title="默认 Agent" description="只影响之后打开的新会话，已创建会话不会改变。">
             <select aria-label="默认 Agent" disabled={appPreferencesLoading} value={appPreferences.defaultAgentId} onChange={(event) => void saveAppPreferences({ defaultAgentId: event.target.value as AppPreferences["defaultAgentId"] })}>{agentOptions.length === 0
@@ -440,7 +486,7 @@ export default function SettingsPage() {
           {appPreferencesLoading && <p className="settings-loading">正在读取默认设置…</p>}
         </div>}
 
-        {activeTab === "tasks" && <div className="settings-grid">
+        {!mobileSettings && activeTab === "tasks" && <div className="settings-grid">
           {appPreferencesError && <p className="settings-error">{appPreferencesError}</p>}
           <SettingCard wide title="自动验收任务" description="开启后，执行成功的任务会自动验收并从队列消失，无需手动确认；默认关闭。失败或被中断的任务仍会进入「需处理」等待处理。">
             <Toggle label="自动验收任务" checked={appPreferences.autoReview} disabled={appPreferencesLoading} onChange={(checked) => void saveAppPreferences({ autoReview: checked })} />

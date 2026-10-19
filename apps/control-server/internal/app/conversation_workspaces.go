@@ -267,9 +267,6 @@ func (s *Server) removeConversationWorktrees(ctx context.Context, projectID, con
 
 func (s *Server) createConversationWorktree(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
-	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
-
 	var project Project
 	var conversationProjectID, status string
 	err := s.db.QueryRowContext(r.Context(), `select p.id,p.name,p.path,coalesce(nullif(p.runner_id,''),p.runner),p.git_branch,p.claude_ready,p.created_at,coalesce(p.default_profile_id,''),c.project_id,c.status
@@ -362,6 +359,21 @@ func (s *Server) createConversationWorktree(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	workspace.State = "ready"
+	// The project lease prevents project deletion and another worktree mutation
+	// from racing this external Git operation. Recheck ownership before making
+	// the provisioning row visible as ready.
+	var exists bool
+	if err := s.db.QueryRowContext(r.Context(), `select exists(select 1 from conversations c join projects p on p.id=c.project_id where c.id=? and p.id=?)`, conversationID, project.ID).Scan(&exists); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !exists {
+		_, _ = runner.runGit(r.Context(), repo, "worktree", "remove", "--force", path)
+		_, _ = runner.runGit(r.Context(), repo, "branch", "-D", branch)
+		_, _ = s.db.ExecContext(r.Context(), `delete from conversation_workspaces where id=? and state='provisioning'`, workspace.ID)
+		writeError(w, http.StatusConflict, errors.New("conversation was deleted while creating its workspace"))
+		return
+	}
 	if _, err := s.db.ExecContext(r.Context(), `update conversation_workspaces set state='ready' where id=? and state='provisioning'`, workspace.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -433,7 +445,12 @@ func (s *Server) archiveConversationWorkspace(w http.ResponseWriter, r *http.Req
 	conversationID := chi.URLParam(r, "conversationID")
 	workspaceID := chi.URLParam(r, "workspaceID")
 	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			s.projectLifecycleMu.Unlock()
+		}
+	}()
 
 	var project Project
 	var workspace ConversationWorkspace
@@ -498,13 +515,17 @@ func (s *Server) archiveConversationWorkspace(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusConflict, errors.New("close terminal and project run before archiving this workspace"))
 		return
 	}
-	key := workspaceLeaseKey(project, workspace)
-	release, acquired := s.acquireWorkspace(key, "workspace-archive:"+workspace.ID)
+	// Hold the project lease across the external Git cleanup. Conversation and
+	// project deletion use the same lease, so releasing projectLifecycleMu below
+	// cannot leave a deleted row or project behind an in-flight worktree removal.
+	release, acquired := s.acquireProjectWorkspace(project.ID, "workspace-archive:"+workspace.ID)
 	if !acquired {
-		writeError(w, http.StatusConflict, s.workspaceOccupiedError(key))
+		writeError(w, http.StatusConflict, s.projectWorkspaceOccupiedError(project.ID))
 		return
 	}
 	defer release()
+	s.projectLifecycleMu.Unlock()
+	locked = false
 	runner, repo, err := s.gitRunnerForProject(r.Context(), project.ID)
 	if err != nil {
 		writeProjectResolveError(w, err)
@@ -590,6 +611,8 @@ func (s *Server) archiveConversationWorkspace(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
+	s.projectLifecycleMu.Lock()
+	locked = true
 	removeEmptyConversationWorktreeParents(project.Path, project.ID, conversationID)
 	now := time.Now().UTC()
 	if _, err := s.db.ExecContext(r.Context(), `update conversation_workspaces set state='archived',archived_at=? where id=? and state='ready'`, now, workspace.ID); err != nil {

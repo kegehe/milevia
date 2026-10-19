@@ -24,6 +24,9 @@ import stripeLogo from "../assets/mcp-stripe.svg";
 import { serviceLogoKey, type ServiceLogoKey } from "../features/mcp/mcp-model";
 import type { ReactNode } from "react";
 
+// 国内服务使用可核验的品牌资源：百度/Gitee 来自 Simple Icons CDN，其他服务使用官方站点图标。
+// 这些 URL 只用于品牌展示，连接配置本身不依赖它们。
+
 const LOGOS: Readonly<Record<ServiceLogoKey, string>> = {
   github: githubLogo,
   notion: notionLogo,
@@ -34,6 +37,7 @@ const LOGOS: Readonly<Record<ServiceLogoKey, string>> = {
   stripe: stripeLogo,
   playwright: playwrightLogo,
   context7: context7Logo,
+  aliyun: "https://www.aliyun.com/favicon.ico",
 };
 
 /** 白名单内渲染官方图标；白名单外渲染调用方给的回落（页面原有的示意图标）。 */

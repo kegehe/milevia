@@ -40,6 +40,7 @@
 .mcp-preset-main > header { display: flex; align-items: center; gap: 8px; }
 .mcp-preset-main > header b { overflow: hidden; color: #254b40; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
 .mcp-preset-main > p { margin: 0; color: #4c6b60; font-size: 12px; line-height: 1.5; }
+.mcp-preset-main > .mcp-preset-note { color: #748b81; font-size: 11px; }
 .mcp-preset-action { display: flex; flex: none; align-items: center; }
 .mcp-preset-action .primary { min-height: 32px; }
 
@@ -75,3 +76,15 @@
 @media (max-width: 560px) {
   .mcp-shell .mcp-preset-grid { grid-template-columns: 1fr; }
 }
+.mcp-custom-dialog { width: min(760px, calc(100% - 32px)); }
+.mcp-custom-file { display: none; }
+.mcp-custom-dropzone { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 64px; margin-bottom: 10px; border: 1px dashed #b9d7c8; border-radius: 7px; color: #648276; background: #f7fbf8; font-size: 11px; }
+.mcp-custom-dropzone.is-dragging { border-color: #2c7567; color: #245f50; background: #eaf6ee; }
+.mcp-custom-dropzone b { color: #315f51; }
+.mcp-custom-input { width: 100%; min-height: 230px; resize: vertical; border: 1px solid #c7dcd1; border-radius: 6px; padding: 11px; color: #254b40; background: #fbfefb; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mcp-custom-input:focus { outline: 2px solid #b9d7c8; outline-offset: 1px; border-color: #72a994; }
+.mcp-custom-error { color: #a34d37; }
+.mcp-import-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mcp-import-item > div { min-width: 0; }
+.mcp-import-item small { display: block; overflow: hidden; margin-top: 3px; color: #70897f; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+@media (max-width: 620px) { .mcp-custom-dialog { width: min(100% - 20px, 760px); } .mcp-import-item { align-items: stretch; flex-direction: column; } .mcp-import-item button { width: 100%; } }

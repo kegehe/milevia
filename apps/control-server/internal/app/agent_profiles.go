@@ -567,6 +567,9 @@ type ProjectAgentConfigView struct {
 	// Agents 按工具 ID 索引（也就是工具目录里的全部工具）。前端遍历它，
 	// 不再分别读下面两个具名字段。
 	Agents map[string]*ProjectAgentEntryView `json:"agents"`
+	// CLI is the redacted configuration used when the project has no explicit
+	// Milevia profile. It is keyed by agent ID and never contains secrets.
+	CLI map[string]*CLIConfigSnapshot `json:"cli,omitempty"`
 	// Claude / Codex 是过渡兼容字段，值由 Agents 派生，前端改用 Agents 后可删。
 	Claude *ProjectAgentEntryView `json:"claude,omitempty"`
 	Codex  *ProjectAgentEntryView `json:"codex,omitempty"`
@@ -640,13 +643,10 @@ func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// Keep the aggregate view useful for projects created before independent
-	// routes existed: an agent without an explicit project route still exposes
-	// the enabled runner profile that would be selected for a new conversation.
+	// 保留旧数据库的 runner 默认 Profile 兼容视图，但标记为 runner_default。
+	// 它不是项目显式配置，前端会继续显示 CLI 实际配置并按 CLI 草稿初始化。
 	for _, agentID := range supportedAgentIDs() {
-		if byAgent[agentID] != nil {
-			continue
-		}
+		if byAgent[agentID] != nil { continue }
 		var entry ProjectAgentEntryView
 		var optionsJSON string
 		err := s.db.QueryRowContext(r.Context(), `select p.id,r.model,r.base_url,r.auth_mode,p.enabled,r.state,r.options_json
@@ -654,24 +654,54 @@ func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
 			where p.runner_id=? and p.agent_id=? and p.enabled=1 and r.state='active'
 			order by case when p.id=? then 0 when p.is_default=1 then 1 else 2 end,p.name limit 1`, runnerID, agentID, project.DefaultProfileID).
 			Scan(&entry.ProfileID, &entry.Model, &entry.BaseURL, &entry.AuthMode, &entry.Enabled, &entry.State, &optionsJSON)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		entry.Mode = "pinned"
+		if errors.Is(err, sql.ErrNoRows) { continue }
+		if err != nil { writeError(w, http.StatusInternalServerError, err); return }
+		entry.Mode = "runner_default"
 		entry.IsDefault = entry.ProfileID == project.DefaultProfileID
 		entry.Env, _ = unmarshalProfileOptions(optionsJSON)
 		byAgent[agentID] = &entry
 	}
 	view.Agents = byAgent
+	view.CLI = map[string]*CLIConfigSnapshot{}
+	if claudeView := s.projectCLIConfig(r.Context(), &project, "claude-code"); claudeView != nil {
+		view.CLI["claude-code"] = claudeView
+	}
+	if codexView := s.projectCLIConfig(r.Context(), &project, "codex"); codexView != nil {
+		view.CLI["codex"] = codexView
+	}
 	// Claude / Codex 两个具名字段是过渡兼容：它们的值全部来自上面按目录构建的
 	// byAgent（同一份来源），因此不会与 Agents 分叉。前端改用 Agents 遍历后即可删除。
 	view.Claude = byAgent["claude-code"]
 	view.Codex = byAgent["codex"]
 	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) projectCLIConfig(ctx context.Context, project *Project, agentID string) *CLIConfigSnapshot {
+	var runner AgentRunner
+	if strings.HasPrefix(project.Runner, "ssh-") {
+		runner, _ = s.runnerRegistry.get(project.Runner)
+	} else if agentID == "claude-code" {
+		runner = s.agentClaudeRunnerFor(s.resolveAgentTargetEnv(project.Runner, project.Path))
+	} else {
+		runner = s.codexRunnerFor(s.resolveAgentTargetEnv(project.Runner, project.Path))
+	}
+	if runner == nil {
+		return &CLIConfigSnapshot{Source: "cli", SourceLabel: agentID + " CLI 配置", CredentialState: "unavailable", Error: "当前 Runner 不可用"}
+	}
+	if agentID == "claude-code" {
+		probe, ok := runner.(claudeCLIConfigRunner)
+		if !ok {
+			return &CLIConfigSnapshot{Source: "cli", SourceLabel: "Claude Code CLI 配置", CredentialState: "unavailable", Error: "当前 Runner 不支持读取 Claude CLI 配置"}
+		}
+		view := probe.claudeCLIConfig(ctx)
+		return &view
+	}
+	probe, ok := runner.(codexCLIConfigRunner)
+	if !ok {
+		return &CLIConfigSnapshot{Source: "cli", SourceLabel: "Codex CLI 配置", CredentialState: "unavailable", Error: "当前 Runner 不支持读取 Codex CLI 配置"}
+	}
+	view := probe.codexCLIConfig(ctx)
+	return &view
 }
 
 func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {

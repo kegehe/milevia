@@ -942,6 +942,33 @@ func (r *sshRunner) codexDefaultModel(ctx context.Context) string {
 	return codexModelFromConfig(out)
 }
 
+func (r *sshRunner) codexCLIConfig(ctx context.Context) CLIConfigSnapshot {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := r.client.execCommand(probeCtx, `codex_home="${CODEX_HOME:-$HOME/.codex}"; cat "$codex_home/config.toml" 2>/dev/null`)
+	if err != nil {
+		return CLIConfigSnapshot{Source: "cli", SourceLabel: "远端 Codex CLI 配置", CredentialState: "unavailable", Error: "无法读取远端 Codex config.toml"}
+	}
+	view := parseCodexCLIConfig(out)
+	view.SourceLabel = "远端 Codex CLI 配置"
+	view.Readable = true
+	view.CredentialState = "unknown"
+	return view
+}
+
+func (r *sshRunner) claudeCLIConfig(ctx context.Context) CLIConfigSnapshot {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := r.client.execCommand(probeCtx, `claude_config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; cat "$claude_config_dir/settings.json" 2>/dev/null`)
+	if err != nil {
+		return CLIConfigSnapshot{Source: "cli", SourceLabel: "远端 Claude Code CLI 配置", CredentialState: "unavailable", Error: "无法读取远端 Claude settings.json"}
+	}
+	view := parseClaudeCLIConfig(out)
+	view.SourceLabel = "远端 Claude Code CLI 配置"
+	view.Readable = true
+	return view
+}
+
 // codexModelCatalog 列出远端 Codex 的模型目录（modelCatalogRunner 实现）。
 func (r *sshRunner) codexModelCatalog(ctx context.Context) ([]AgentModelOption, error) {
 	out, err := r.client.execCommand(ctx, "codex debug models 2>/dev/null")
@@ -1168,6 +1195,9 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	if request.Model != "" {
 		modelArg = " --model " + shellQuote(request.Model)
 	}
+	if request.ReasoningEffort != "" {
+		modelArg += " --effort " + shellQuote(request.ReasoningEffort)
+	}
 	// --allowedTools（只读执行）要求 prompt 经 stdin 提供（`claude ... -` 读 stdin）；
 	// 否则按 argv 传 prompt。
 	// MCP：远端无本地落盘通道，改为在同一 shell 命令内 base64 写入 /tmp 并 trap 清理。
@@ -1294,6 +1324,9 @@ func buildSSHCodexExecCommand(request AgentRunRequest, transportArgs, configArg,
 	modelArg := ""
 	if request.Model != "" {
 		modelArg = fmt.Sprintf(" -c %s", shellQuote(fmt.Sprintf("model=%q", request.Model)))
+	}
+	if request.ReasoningEffort != "" {
+		modelArg += fmt.Sprintf(" -c %s", shellQuote(fmt.Sprintf("model_reasoning_effort=%q", request.ReasoningEffort)))
 	}
 	if request.Resume {
 		return fmt.Sprintf("codex exec%s resume -c %s --json%s %s %s",

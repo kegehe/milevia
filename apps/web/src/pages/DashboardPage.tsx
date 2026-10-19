@@ -258,7 +258,7 @@ function ProjectCard({ project, status, runStatus, runStartedAt, open, onDelete,
         </div>
         <p>{taskTitle}</p>
       </div>
-      <div className="project-card-meta"><span><small>会话数</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b className={literalNameClass(project.pathDisplay)}>{project.pathDisplay}</b></span></div>
+      <div className="project-card-meta"><span><small>会话数</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b className={literalNameClass(project.fullPath)}>{project.fullPath}</b></span></div>
       <footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话<i>→</i></b></footer>
     </div>
   </article>;

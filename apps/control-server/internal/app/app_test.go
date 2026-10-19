@@ -6518,9 +6518,9 @@ func TestTaskDispatchCreatesSnapshotAndWaitsForReviewAfterRunCompletion(t *testi
 	if dispatched.RunID == "" || dispatched.TaskRun.RunID != dispatched.RunID || dispatched.TaskRun.TaskID != taskID {
 		t.Fatalf("unexpected dispatch response: %+v", dispatched)
 	}
-	// 验收条件已从产品移除（taskPrompt 只含标题+描述），快照不应再包含验收文本。
-	if !strings.Contains(dispatched.TaskRun.PromptSnapshot, "Implement task board") || !strings.Contains(dispatched.TaskRun.PromptSnapshot, "Implement Implement task board safely.") {
-		t.Fatalf("task run snapshot does not preserve task content: %q", dispatched.TaskRun.PromptSnapshot)
+	// 验收条件已从产品移除，且下发快照只保留任务详情。
+	if dispatched.TaskRun.PromptSnapshot != "Implement Implement task board safely." {
+		t.Fatalf("task run snapshot should contain only task description: %q", dispatched.TaskRun.PromptSnapshot)
 	}
 	select {
 	case <-started:
@@ -11920,7 +11920,7 @@ func TestProjectGitCreateAndSwitchBranch(t *testing.T) {
 	}
 }
 
-func TestProjectGitSwitchBranchRejectsDirtyWorktree(t *testing.T) {
+func TestProjectGitSwitchBranchAllowsNonConflictingDirtyWorktree(t *testing.T) {
 	server := newTestServer(t)
 	repo := newTempGitRepository(t)
 	writeGitTestFile(t, repo, "readme.txt", "one\n")
@@ -11938,11 +11938,15 @@ func TestProjectGitSwitchBranchRejectsDirtyWorktree(t *testing.T) {
 
 	switchResp := httptest.NewRecorder()
 	server.routes().ServeHTTP(switchResp, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/switch", bytes.NewBufferString(`{"branch":"other-branch","stateToken":"`+summary.StateToken+`"}`)))
-	if switchResp.Code != http.StatusConflict {
-		t.Fatalf("expected conflict for dirty worktree, got status=%d body=%s", switchResp.Code, switchResp.Body.String())
+	if switchResp.Code != http.StatusAccepted {
+		t.Fatalf("expected Git to allow non-conflicting dirty worktree, got status=%d body=%s", switchResp.Code, switchResp.Body.String())
 	}
-	if !strings.Contains(switchResp.Body.String(), "commit or discard") && !strings.Contains(switchResp.Body.String(), "冲突") {
-		t.Fatalf("expected dirty worktree rejection, got %s", switchResp.Body.String())
+	afterSummary := gitSummaryForTest(t, server, "git-project")
+	if afterSummary.Head.Branch != "other-branch" {
+		t.Fatalf("expected other-branch after switch, got %s", afterSummary.Head.Branch)
+	}
+	if afterSummary.Worktree.Modified == 0 {
+		t.Fatal("expected local modification to remain after non-conflicting switch")
 	}
 }
 

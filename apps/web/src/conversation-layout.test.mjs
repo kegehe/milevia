@@ -48,7 +48,8 @@ test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
 });
 
 test("stopping an unanswered direct prompt restores it to the composer", () => {
-  assert.match(conversationPage, /\{run && <button className="runner-stop" type="button" disabled=\{readOnly \|\| stopping\} onClick=\{onStop\}/);
+  assert.match(conversationPage, /\{run && <button className="runner-stop" type="button" disabled=\{readOnly\} onClick=\{onStop\}/);
+  assert.match(conversationPage, /<textarea[\s\S]*?disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| handingOff \|\| changingModel \|\| Boolean\(shortcutBusy\)\}/);
   // 卡外细语行的调用点：usage 读数与 runner 状态同行呈现，三者的顺序必须固定。
   assert.match(conversationPage, /usage=\{usage\} readOnly=\{readOnlyConversation\} stopping=\{stopping\} onStop=\{\(\) => void stopRun\(\)\}/);
   // 分支胶囊挂在 meta 行 runner 之后，数据来自会话级 git summary（conversationId 决定读哪个工作区）。
@@ -57,6 +58,9 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   // 判据与 GitWorkbenchPage / 手机端共用 NON_GIT_BRANCH 哨兵，不许就地另写一份。
   assert.match(conversationPage, /import \{ NON_GIT_BRANCH \} from "\.\.\/lib\/types";/);
   assert.match(conversationPage, /\{isGitRepo && <ComposerBranchPill projectID=\{projectID\} conversationID=\{conversationID\} runKey=\{run\} \/>\}/);
+  assert.match(conversationPage, /api<GitBranch\[]>\(`\/api\/projects\/\$\{projectID\}\/git\/branches/);
+  assert.match(conversationPage, /api<\{ status: string; errorMessage\?: string \}>\(`\/api\/projects\/\$\{projectID\}\/git\/switch/);
+  assert.doesNotMatch(conversationPage, /onClick=\{\(\) => navigate\(`\/projects\/\$\{projectID\}\/git`\)\}/);
   assert.match(conversationPage, /isGitRepo=\{project\.gitBranch !== NON_GIT_BRANCH\}/);
   // 哨兵的字面值同时钉住：它是前后端约定（Go 侧 app.go / git_operations.go 三处写同一个串），
   // 改这里就必须同步改后端，否则判据会静默失真。
@@ -199,7 +203,7 @@ test("opening the history dialog issues one refresh and never renders a pending 
   assert.match(page, /type ConversationHistoryResult = \{ items: Conversation\[\]; stale: boolean \};/);
   assert.match(page, /const requestVersion = background \? conversationHistoryRequestVersion\.current : \+\+conversationHistoryRequestVersion\.current;/);
   assert.match(page, /if \(requestVersion !== conversationHistoryRequestVersion\.current\) return \{ items: \[\], stale: true \};/);
-  assert.match(page, /return \{ items: page\.items, stale: false \};/);
+  assert.match(page, /return \{ items, stale: false \};/);
   // ② 无 id 分支只重试、绝不拿 stale 的空白去判空 —— 那会 POST 出一个凭空多出来的会话，
   //    并把历史列表覆盖成那一条。
   assert.match(page, /if \(result\.stale\) return;\n\s*const list = result\.items;/);
@@ -247,7 +251,7 @@ test("opening the history dialog issues one refresh and never renders a pending 
 test("invalid conversation routes always navigate away from an unavailable URL", () => {
   assert.match(conversationPage, /const previous = conversationTabsRef\.current;\s*let next = previous;/s);
   assert.match(conversationPage, /if \(next !== previous\) \{[\s\S]*?setConversationTabs\(next\);\s*\}/s);
-  assert.match(conversationPage, /if \(urlConversationId && unavailable\.has\(urlConversationId\)\) \{[\s\S]*?navigate\(conversationURL\(next\.activeConversationId \|\| undefined\), \{ replace: true \}\);/s);
+  assert.match(conversationPage, /if \(currentRouteID && unavailable\.has\(currentRouteID\)\) \{[\s\S]*?navigate\(conversationURL\(next\.activeConversationId \|\| undefined\), \{ replace: true \}\);/s);
 });
 
 test("conversation tabs use roving keyboard navigation and name their panel", () => {
@@ -633,8 +637,8 @@ test("clearing context closes the current tab and starts a fresh conversation wi
   assert.match(taskQueue, /conversationIDRef\.current !== dispatchConversationID/);
   assert.match(taskQueue, /setDispatching\(false\);\s*setRedispatchingTaskID\(null\);/);
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
-  assert.match(conversationPage, /<button className="composer-icon-btn danger composer-clear" type="button" title="清空并新建对话" aria-label="清空并新建对话" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><\/button>/);
-  assert.match(conversationPage, /<button className="composer-icon-btn composer-continue" type="button" title="继续上一轮" aria-label="继续上一轮" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><\/button>/);
+  assert.match(conversationPage, /<button className="composer-icon-btn danger composer-clear" type="button" title="清空内容并新建对话" aria-label="清空内容并新建对话" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><\/button>/);
+  assert.match(conversationPage, /<button className="composer-icon-btn composer-continue" type="button" title="继续任务" aria-label="继续任务" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><\/button>/);
   assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| \(!text\.trim\(\) && skillRefs\.length === 0\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\}><ComposerActionIcon action="send" \/>/);
 });
 

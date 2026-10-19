@@ -32,8 +32,8 @@ test("the picker reads the catalog and writes a session-scoped override", () => 
   // 后端返回更新后的会话，前端据此立刻刷新底部显示，不必等下一次用量刷新。
   assert.match(selectBody, /setConversation\(updated\)/);
 
-  // "跟随配置"发的是空串（= 清除覆盖），与后端语义一致。
-  assert.match(picker, /onClick=\{\(\) => void choose\(""\)\}/);
+  // 模型选择器不再把“跟随配置”作为一个模型选项展示。
+  assert.doesNotMatch(picker, /<b>跟随配置<\/b>/);
 });
 
 test("switching is blocked while a run is active", () => {

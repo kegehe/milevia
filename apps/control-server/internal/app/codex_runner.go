@@ -238,6 +238,9 @@ func codexExecArgs(request AgentRunRequest, profileArgs []string, schemaPath, po
 	if request.Model != "" {
 		args = append(args, "-c", fmt.Sprintf("model=%q", request.Model))
 	}
+	if request.ReasoningEffort != "" {
+		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", request.ReasoningEffort))
+	}
 	if request.Resume {
 		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
 	} else {
@@ -673,6 +676,10 @@ func (r *codexCLIRunner) codexDefaultModel(ctx context.Context) string {
 		return ""
 	}
 	return codexModelFromConfig(data)
+}
+
+func (r *codexCLIRunner) codexCLIConfig(context.Context) CLIConfigSnapshot {
+	return localCodexCLIConfig()
 }
 
 // codexModelCatalog 列出本机 Codex 的可用模型目录（modelCatalogRunner 实现）。

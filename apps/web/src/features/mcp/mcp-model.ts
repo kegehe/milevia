@@ -5,7 +5,112 @@
 // （把 `fromPreset` 过滤成空数组，页面照样过测试）。凡是"结果取决于几行代码的顺序/优先级"的逻辑，
 // 都要能被真的调用一次，而不是被 grep 一次。
 
-import type { MCPPreset, MCPPresetCredential, MCPTransport } from "../../lib/types";
+import type { MCPPreset, MCPPresetCredential, MCPServer, MCPTransport } from "../../lib/types";
+
+export type CustomMCPConfig = {
+  name: string;
+  displayName: string;
+  description: string;
+  transport: MCPTransport;
+  command: string;
+  args: string[];
+  url: string;
+  env: Record<string, string>;
+  envSecrets: Record<string, string>;
+  headers: Record<string, string>;
+  headerSecrets: Record<string, string>;
+};
+
+function splitConfigSecrets(values: unknown): { visible: Record<string, string>; secrets: Record<string, string> } {
+  const visible: Record<string, string> = {};
+  const secrets: Record<string, string> = {};
+  if (!values || typeof values !== "object" || Array.isArray(values)) return { visible, secrets };
+  for (const [key, raw] of Object.entries(values as Record<string, unknown>)) {
+    if (typeof raw !== "string") continue;
+    // 只要值包含变量占位符，就保留为可复制的普通配置；其余真实值进入加密字段。
+    if (raw.trim() && !/\$\{[^}]+\}/.test(raw.trim())) secrets[key] = raw;
+    else visible[key] = raw;
+  }
+  return { visible, secrets };
+}
+
+function customEntryFromUnknown(name: string, raw: unknown): CustomMCPConfig {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`MCP「${name}」配置不是对象`);
+  const input = raw as Record<string, unknown>;
+  const command = typeof input.command === "string" ? input.command.trim() : "";
+  const url = typeof input.url === "string" ? input.url.trim() : "";
+  const declaredTransport = typeof input.transport === "string" ? input.transport : typeof input.type === "string" ? input.type : "";
+  const normalizedTransport = declaredTransport === "streamable-http" ? "http" : declaredTransport;
+  const transport = normalizedTransport === "sse" || normalizedTransport === "http" ? normalizedTransport : command ? "stdio" : url ? "http" : "stdio";
+  if (transport === "stdio" && !command) throw new Error(`MCP「${name}」缺少 command`);
+  if (transport !== "stdio" && !url) throw new Error(`MCP「${name}」缺少 url`);
+  const env = splitConfigSecrets(input.env);
+  const headers = splitConfigSecrets(input.headers);
+  const bearerEnv = typeof input.bearer_token_env_var === "string" ? input.bearer_token_env_var.trim() : "";
+  if (bearerEnv && !headers.visible.Authorization && !headers.secrets.Authorization) {
+    headers.visible.Authorization = `Bearer \${${bearerEnv}}`;
+  }
+  return {
+    name,
+    displayName: typeof input.displayName === "string" ? input.displayName : name,
+    description: typeof input.description === "string" ? input.description : "",
+    transport,
+    command,
+    args: Array.isArray(input.args) ? input.args.filter((item): item is string => typeof item === "string") : [],
+    url,
+    env: env.visible,
+    envSecrets: env.secrets,
+    headers: headers.visible,
+    headerSecrets: headers.secrets,
+  };
+}
+
+export function parseCustomMCPConfig(text: string): CustomMCPConfig[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("配置不是有效的 JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("MCP 配置必须是 JSON 对象");
+  const root = parsed as Record<string, unknown>;
+  if (typeof root.command === "string" || typeof root.url === "string") {
+    const name = typeof root.name === "string" && root.name.trim() ? root.name.trim() : typeof root.displayName === "string" && root.displayName.trim() ? root.displayName.trim() : "custom-mcp";
+    return [customEntryFromUnknown(name, root)];
+  }
+  const container = root.mcpServers || root.mcp_servers || root.servers;
+  const entries = container && typeof container === "object" && !Array.isArray(container)
+    ? container as Record<string, unknown>
+    : root;
+  const names = Object.keys(entries).filter((name) => !["mcpServers", "mcp_servers", "servers", "version"].includes(name));
+  if (names.length === 0) throw new Error("没有找到 mcpServers 配置");
+  return names.map((name) => customEntryFromUnknown(name, entries[name]));
+}
+
+export function uniqueMCPName(name: string, existingNames: string[]): string {
+  const base = name.trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "custom-mcp";
+  const taken = new Set(existingNames.map((item) => item.trim().toLowerCase()));
+  if (!taken.has(base.toLowerCase())) return base;
+  let suffix = 2;
+  while (taken.has(`${base}-${suffix}`.toLowerCase())) suffix += 1;
+  return `${base}-${suffix}`;
+}
+
+export function redactedMCPConfig(server: MCPServer, format: "claude" | "single" = "claude"): string {
+  const env: Record<string, string> = { ...(server.env || {}) };
+  for (const key of server.envSecretKeys || []) env[key] = `\${${key}}`;
+  const headers: Record<string, string> = { ...(server.headers || {}) };
+  for (const key of server.headerSecretKeys || []) headers[key] = `\${${key}}`;
+  const entry: Record<string, unknown> = {
+    command: server.transport === "stdio" ? server.command || "" : undefined,
+    args: server.transport === "stdio" ? server.args || [] : undefined,
+    url: server.transport === "stdio" ? undefined : server.url || "",
+    env: Object.keys(env).length ? env : undefined,
+    headers: Object.keys(headers).length ? headers : undefined,
+  };
+  Object.keys(entry).forEach((key) => entry[key] === undefined && delete entry[key]);
+  return JSON.stringify(format === "single" ? { name: server.name, displayName: server.displayName, ...entry } : { mcpServers: { [server.name]: entry } }, null, 2);
+}
 
 // parseKeyValueLines 解析「每行 KEY=VALUE」文本框。
 //
@@ -228,6 +333,7 @@ export const SERVICE_LOGO_KEYS = [
   "stripe",
   "playwright",
   "context7",
+  "aliyun",
 ] as const;
 export type ServiceLogoKey = (typeof SERVICE_LOGO_KEYS)[number];
 
@@ -252,6 +358,8 @@ export function serviceLogoKey(presetName: string): ServiceLogoKey | null {
       return "playwright";
     case "context7":
       return "context7";
+    case "aliyun":
+      return "aliyun";
     default:
       return null;
   }

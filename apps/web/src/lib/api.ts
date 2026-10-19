@@ -47,6 +47,7 @@ const installTimeoutMs = 16 * 60_000;
  * 会跟着拿到分钟级预算 —— 那既丢掉了 15 秒的早发现，又让它们失去"重试一次"的资格。
  */
 const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutMs: number }> = [
+	{ methods: ["POST"], pattern: /^\/api\/conversations\/[^/]+\/rewind$/, timeoutMs: externalTaskTimeoutMs },
 	// ── 装 / 升级 / 修复 / 运行时 ── 服务端一律取 agentUpdateTimeout（默认 15 分钟）
 	{ methods: ["POST"], pattern: /^\/api\/runners\/[^/]+\/(agents\/[^/]+\/(install|update|repair)|runtime\/install)$/, timeoutMs: installTimeoutMs },
 	// 旧路径，与上面的 agents/{id}/update 是同一段（agent_routes.go 的薄委托）
@@ -74,6 +75,12 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	{ methods: ["POST", "DELETE"], pattern: /^\/api\/projects\/[^/]+\/terminal\/sessions(\/[^/]+)?$/, timeoutMs: externalTaskTimeoutMs },
 	// 建 worktree（跑 git worktree add）
 	{ methods: ["POST"], pattern: /^\/api\/conversations\/[^/]+\/workspaces$/, timeoutMs: externalTaskTimeoutMs },
+	// 新建会话需要做 profile/runner 就绪检查；SSH/跨环境项目可能包含网络探测。
+	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/conversations$/, timeoutMs: externalTaskTimeoutMs },
+	// 发消息会在入库前执行 runner 就绪、workspace 和额度准入检查。
+	{ methods: ["POST"], pattern: /^\/api\/conversations\/[^/]+\/messages$/, timeoutMs: externalTaskTimeoutMs },
+	// 任务下发复用会话启动流水线，可能等待 runner/额度/工作区。
+	{ methods: ["POST"], pattern: /^\/api\/tasks\/[^/]+\/dispatch$/, timeoutMs: externalTaskTimeoutMs },
 	// 编排的两条重活（合并分支 / 清理工作区资源）：
 	//   · merge-main 是**一串** git 命令（status → rev-parse → merge-base --is-ancestor →
 	//     merge --no-ff），单条上限就是 gitCommandTimeout = 30 秒，慢盘/大仓库上叠起来超 15 秒很正常；

@@ -22,6 +22,14 @@ import { priorityLabels, statusLabels, type Priority } from "../features/tasks/t
 // （2026-09-17 变异检验实测漏网），必须用行为断言守。
 import { desktopServiceView, heartbeatAgoText, refreshDesktopStatusMessage, shortInstanceID } from "../features/remote/desktop-service";
 import { cloudClientWaitMs } from "../features/remote/cloud-budget";
+import { snapshotRequestPath } from "../features/remote/snapshot-request";
+import { mergeSnapshotPendingMessages } from "../features/remote/snapshot-pending-message-merge";
+import { mergeSnapshotRealtimeMessages } from "../features/remote/snapshot-realtime-merge";
+import { mergeSnapshotStreamingMessages } from "../features/remote/snapshot-streaming-merge";
+import { mergeSnapshotNotices } from "../features/remote/snapshot-notice-merge";
+import { useRemoteSnapshotLoader } from "../features/remote/use-remote-snapshot-loader";
+import { useRemoteInstances } from "../features/remote/use-remote-instances";
+import { useMobileRemoteEventStream } from "../features/remote/use-mobile-remote-event-stream";
 // 「已绑定手机」那一段的纯逻辑（绑定项归一化 / 最近同步的四档 / 平台文案）。
 // 和上面同一个理由：`lastUsedAt` 的 undefined 与 null 必须走不同分支，合并成一个
 // 就跟「还没回来」写成「没有数据」是同一个错，而那种错源码级断言看不出来。
@@ -119,12 +127,6 @@ type Project = { id: string; name: string; runner: string; environment?: Project
 type Snapshot = { snapshotRevision: number; observedAt: string; projects: Project[]; shortcuts?: RemoteShortcut[] };
 type CommandState = { commandId: string; status: string; result?: unknown };
 type AcceptedCommand = { commandId: string; status: string };
-// 一次快照拉取的真实结果。"updated/unchanged" 都算成功，区别只在版本号有没有前进；
-// "skipped" 表示这次请求没有真正发出去（没有选中的实例 / 已被更新的请求取代）。
-// 手动刷新必须拿到这个结果才能给出"已刷新 / 已是最新 / 刷新失败"的可信反馈——只靠
-// setSnapshot 是看不出有没有生效的。
-type SnapshotFetchOutcome = "updated" | "unchanged" | "failed" | "skipped";
-type SnapshotFetchResult = { outcome: SnapshotFetchOutcome; snapshot: Snapshot | null; reason?: string };
 // 实例列表请求的结果。superseded 必须与 failed 分开：列表每 5 秒被轮询拉一次，
 // 手动刷新那一次被轮询抢答是常态而不是故障（见 loadInstances 注释）。
 type InstanceFetchResult = { instances: Instance[]; outcome: "ok" | "failed" | "superseded"; reason?: string };
@@ -1146,8 +1148,7 @@ export default function MobileRemotePage() {
   const [token, setToken] = useState(() => readActiveToken());
   const [mobileUpdate, setMobileUpdate] = useState<MobileUpdateState | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
-  const [instances, setInstances] = useState<Instance[]>([]);
-  const [instanceID, setInstanceID] = useState("");
+  const [deviceEpoch, setDeviceEpoch] = useState(0);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   // Realtime callbacks stay registered across snapshot refreshes. Keep the
   // latest snapshot available without recreating the SSE subscription.
@@ -1452,9 +1453,6 @@ export default function MobileRemotePage() {
   // 但它有上传节流：不在这里留一份，刚冒出来的"API 重试中"会被下一次快照抹掉。
   // 每条记录一旦出现在快照里就从这里移除，所以它不会无限增长。
   const pendingNoticesRef = useRef(new Map<string, RemoteNotice[]>());
-  const instancesRequestGenerationRef = useRef(0);
-  const snapshotRevisionRef = useRef(-1);
-  const snapshotLoadGenerationRef = useRef(0);
   const scanAccepted = useRef(false);
   const initialPairing = useRef({
     pairingID: new URLSearchParams(location.search).get("pairingId") || new URLSearchParams(location.search).get("pairing_id") || "",
@@ -1471,6 +1469,12 @@ export default function MobileRemotePage() {
   // 页面可见性：切到后台时暂停轮询与快照兜底，回到前台立即补一次，省电又省流量。
   const documentVisible = useDocumentVisible();
   const documentVisibleRef = useRef(documentVisible);
+  const previousTokenRef = useRef(token);
+  useEffect(() => {
+    if (previousTokenRef.current === token) return;
+    previousTokenRef.current = token;
+    setDeviceEpoch((value) => value + 1);
+  }, [token]);
   // 上一次的可见性，用来识别「由隐藏转为可见」这个瞬间。
   const wasDocumentVisibleRef = useRef(documentVisible);
   // 消息列表是否「贴着底部」。用户主动向上翻阅时不能夺走滚动位置。
@@ -1795,56 +1799,58 @@ export default function MobileRemotePage() {
     };
   }, [scanning, scanVideo, acceptScannedPairing]);
 
-  // 返回本次请求的真实结果，供"手动刷新"判断该给什么反馈。
-  // 三个结果必须分开：列表请求每 5 秒被轮询触发一次，手动刷新那一次**很容易被轮询抢答**
-  // （手机上一次列表请求要几秒，而轮询周期就是 5 秒）。把"被更新的请求取代"当成失败，
-  // 就会在一切正常时弹出一句"刷新失败：没有连上云端"——这正是用户看不懂的那种假失败。
-  //   ok         = 拿到了列表（可能是空数组：云端确实一台电脑都没有）
-  //   failed     = 请求真的失败了
-  //   superseded = 这次请求被更新的请求取代，结果由那一次落地
-  const loadInstances = useCallback(async (): Promise<InstanceFetchResult> => {
-    const requestGeneration = ++instancesRequestGenerationRef.current;
-    const superseded: InstanceFetchResult = { instances: [], outcome: "superseded" };
-    if (!readActiveToken()) {
-      if (requestGeneration !== instancesRequestGenerationRef.current) return superseded;
-      setInstances([]);
-      setInstanceID("");
-      // 没有令牌是"还没配对"，属于拿到了真实状态（空的），不是失败。
-      return { instances: [], outcome: "ok" };
-    }
-    setError("");
-    // 这次请求代表哪台设备：下面回填信息时必须用同一个令牌，否则切换设备的空档里
-    // 会把 A 的状态写到 B 的记录上。
-    const requestToken = readActiveToken();
-    try {
-      const result = await cloud<Instance[]>("/v1/instances");
-      if (requestGeneration !== instancesRequestGenerationRef.current) return superseded;
-      const nextInstances = Array.isArray(result) ? result : [];
-      setInstances(nextInstances);
-      setInstanceID((current) => nextInstances.some((item) => item.instanceId === current)
-        ? current
-        : nextInstances[0]?.instanceId || "");
-      // 回填"这台电脑叫什么、在不在线"。切换面板上那一行就是它 —— 一个令牌只知道
-      // 自己那台电脑，所以这里的回填同时也是"跨设备列表"唯一的信息来源（逐台探测）。
-      if (requestToken && nextInstances.length > 0) {
-        const info = nextInstances[0];
-        updateDevice(requestToken, { instanceId: info.instanceId || "", name: info.name || "", status: info.status || "", lastSeenAt: info.lastSeenAt || "" });
-        setDevices(readDevices());
-      }
-      if (!Array.isArray(result)) {
-        setError("云端返回了无效的电脑实例列表");
-      }
-      return { instances: nextInstances, outcome: "ok" };
-    } catch (cause) {
-      if (requestGeneration !== instancesRequestGenerationRef.current) return superseded;
-      const reason = cause instanceof TypeError ? "无法连接云端，请确认 keyanjia.info:8443 已放行并可访问" : cause instanceof Error ? cause.message : "无法加载电脑实例";
-      setError(reason);
-      return { instances: [], outcome: "failed", reason };
-    }
+  const { instances, setInstances, instanceID, setInstanceID, loadInstances } = useRemoteInstances<Instance>({
+    readToken: readActiveToken,
+    request: () => cloud<Instance[]>("/v1/instances"),
+    patchDevice: (deviceToken, value) => {
+      updateDevice(deviceToken, value);
+      setDevices(readDevices());
+    },
+    reportError: setError,
+  });
+
+  const mergeLoadedSnapshot = useCallback((value: Snapshot, baseline: number): Snapshot => {
+    let merged = mergeSnapshotPendingMessages(value, pendingMessageRef.current, (message) => ({
+      id: `pending-${message.requestId}`,
+      role: "user",
+      content: message.content,
+      createdAt: message.createdAt,
+    }));
+    merged = mergeSnapshotRealtimeMessages(merged, realtimeMessagesRef.current, baseline);
+    merged = mergeSnapshotStreamingMessages(merged, streamingMessagesRef.current, (messageID, chunk) => ({
+      id: `stream-${messageID}`,
+      role: "assistant",
+      content: chunk.content,
+      createdAt: chunk.createdAt,
+    }));
+    return mergeSnapshotNotices(merged, pendingNoticesRef.current, noticesFromSnapshot, mergeNotices);
   }, []);
 
+  const { loadSnapshot, snapshotRevisionRef, resetSnapshotRevision } = useRemoteSnapshotLoader({
+    instanceID: () => instanceID,
+    readToken: readActiveToken,
+    request: (path) => cloud<Snapshot & { unchanged?: boolean }>(path),
+    requestPath: snapshotRequestPath,
+    normalize: (value) => {
+      if (!value || !Array.isArray(value.projects)) throw new Error("云端返回了无效的项目快照");
+      return {
+        ...value,
+        snapshotRevision: typeof value.snapshotRevision === "number" && Number.isFinite(value.snapshotRevision)
+          ? value.snapshotRevision
+          : 0,
+      };
+    },
+    mergeSnapshot: mergeLoadedSnapshot,
+    setSnapshot,
+    reportError: setError,
+    readCache: (target) => localStorage.getItem(`milevia.snapshot.${target}`),
+    writeCache: (target, value) => localStorage.setItem(`milevia.snapshot.${target}`, JSON.stringify(value)),
+    unavailableMessage: "无法加载项目快照",
+    cacheFailureMessage: "无法连接云端",
+  });
+
   useEffect(() => {
-    snapshotRevisionRef.current = -1;
+    resetSnapshotRevision();
     // These maps are scoped to the selected desktop instance. Retaining them
     // across a logout or instance switch can make a coincidentally reused
     // conversation ID appear to be processing in the new instance.
@@ -1867,171 +1873,7 @@ export default function MobileRemotePage() {
     }
     setPendingTaskBusy(new Set());
     setProcessingConversations({});
-  }, [instanceID]);
-  const loadSnapshot = useCallback(async (options?: { force?: boolean; instanceId?: string; silent?: boolean }): Promise<SnapshotFetchResult> => {
-    // 允许显式指定实例：手动刷新刚刚才拉过实例列表，选中的电脑可能已经失效并被换掉，
-    // 这时要请求"列表里实际选中的那台"，而不是这一轮闭包里那台已经不存在的。
-    const target = options?.instanceId || instanceID;
-    if (!target) return { outcome: "skipped", snapshot: null };
-    const requestGeneration = ++snapshotLoadGenerationRef.current;
-    const force = options?.force === true;
-    // 版本基线。请求的实例与"当前选中的实例"不是同一台时（刚配对完、或选中的电脑已从列表
-    // 里消失）没有可比基线，必须按全新实例处理：拿 B 的版本号去比 A 的，既可能让守卫不通过、
-    // 把 B 的快照整个丢掉，又会把"什么都没应用"报成"已是最新"。
-    const baseline = options?.instanceId && options.instanceId !== instanceID ? -1 : snapshotRevisionRef.current;
-    if (!options?.silent) setError("");
-    try {
-      // 带上已知版本号：云端在内容未变化时只回一个小标记，省掉一次全量传输。
-      // 手动刷新（force）必须跳过这个短路——被短路掉的长轮询看不出来，但用户点了刷新
-      // 却什么都没发生，就等于"刷新按钮坏了"（本轮修复的原始投诉）。而且本地快照可能
-      // 落后于 snapshotRevisionRef（例如上一次失败后回落到 localStorage 缓存），
-      // 这种情况下短路会把"显示着旧数据"判成"已是最新"。
-      const query = force ? "" : `?revision=${baseline}`;
-      const value = await cloud<Snapshot & { unchanged?: boolean }>(`/v1/instances/${encodeURIComponent(target)}/snapshot${query}`);
-      if (value?.unchanged) return { outcome: "unchanged", snapshot: null };
-      if (!value || !Array.isArray(value.projects)) {
-        throw new Error("云端返回了无效的项目快照");
-      }
-      // Snapshots from older mobile builds may not carry a revision. Treat
-      // those as the initial revision instead of dropping a valid project
-      // list because `undefined >= -1` is false.
-      value.snapshotRevision = typeof value.snapshotRevision === "number" && Number.isFinite(value.snapshotRevision)
-        ? value.snapshotRevision
-        : 0;
-      if (requestGeneration === snapshotLoadGenerationRef.current && value.snapshotRevision >= baseline) {
-        snapshotRevisionRef.current = value.snapshotRevision;
-        const pending = pendingMessageRef.current;
-        if (pending.size > 0) {
-          value.projects = value.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => {
-            const messages = pending.get(entry.id);
-            if (!messages || messages.size === 0) return entry;
-            // Consume persisted messages as a multiset so two identical
-            // prompts do not accidentally clear both optimistic entries.
-            const persistedCounts = new Map<string, number>();
-            for (const message of entry.messages) {
-              if (message.role === "user") persistedCounts.set(message.content, (persistedCounts.get(message.content) || 0) + 1);
-            }
-            const additions: Message[] = [];
-            const matchedRequestIDs = new Set<string>();
-            for (const pendingMessage of messages.values()) {
-              const count = persistedCounts.get(pendingMessage.content) || 0;
-              if (count > 0) {
-                persistedCounts.set(pendingMessage.content, count - 1);
-                matchedRequestIDs.add(pendingMessage.requestId);
-              }
-              else additions.push({ id: `pending-${pendingMessage.requestId}`, role: "user", content: pendingMessage.content, createdAt: pendingMessage.createdAt });
-            }
-            for (const requestID of matchedRequestIDs) messages.delete(requestID);
-            if (messages.size === 0) pending.delete(entry.id);
-            return additions.length > 0 ? { ...entry, messages: [...entry.messages, ...additions] } : entry;
-          }) }));
-        }
-        // A message event can arrive before the Agent has uploaded its next
-        // snapshot. Preserve those messages while accepting the older snapshot
-        // so streamed output cannot briefly disappear from the mobile view.
-        const realtimeMessages = realtimeMessagesRef.current;
-        if (realtimeMessages.size > 0) {
-          value.projects = value.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => {
-            let changed = false;
-            const messages = entry.messages.map((message) => {
-              const live = realtimeMessages.get(message.id);
-              if (!live || live.conversationId !== entry.id) return message;
-              realtimeMessages.delete(message.id);
-              // The recovery snapshot intentionally bounds older content. If
-              // the realtime event has the full message, prefer it so a fast
-              // snapshot cannot overwrite a complete assistant response with
-              // its 2000-character prefix.
-              if (live.message.content.length > message.content.length) {
-                changed = true;
-                return live.message;
-              }
-              return message;
-            });
-            // A newer snapshot revision can still arrive before the message is
-            // durably included. Keep messages observed at or after this
-            // request's baseline until their ids appear in a snapshot. Older
-            // live entries are allowed to expire so deleted messages cannot be
-            // resurrected by a later snapshot.
-            const extras = [...realtimeMessages.values()]
-              .filter((item) => item.conversationId === entry.id
-                && item.revision >= baseline
-                && !entry.messages.some((message) => message.id === item.message.id))
-              .map((item) => {
-                realtimeMessages.delete(item.message.id);
-                return item.message;
-              });
-            return changed || extras.length > 0 ? { ...entry, messages: [...messages, ...extras] } : entry;
-          }) }));
-        }
-        // 增量不落库，因此不在快照里：整体覆盖会把正在输出的回复抹掉。这里按
-        // 累积内容把它补回，正式消息到达时替换、之后随快照自然消失。
-        const streaming = streamingMessagesRef.current;
-        if (streaming.size > 0) {
-          value.projects = value.projects.map((item) => {
-            const conversations = item.conversations.map((entry) => {
-              let touched = false;
-              const messages = entry.messages.map((message) => {
-                if (!message.id.startsWith("stream-")) return message;
-                const chunk = streaming.get(message.id.slice("stream-".length));
-                if (!chunk || chunk.conversationId !== entry.id) return message;
-                touched = true;
-                return { ...message, content: chunk.content };
-              });
-              const pending: Message[] = [];
-              for (const [messageID, chunk] of streaming) {
-                if (chunk.conversationId !== entry.id) continue;
-                const placeholderID = `stream-${messageID}`;
-                if (messages.some((message) => message.id === placeholderID)) continue;
-                pending.push({ id: placeholderID, role: "assistant", content: chunk.content, createdAt: chunk.createdAt });
-                touched = true;
-              }
-              return touched ? { ...entry, messages: [...messages, ...pending] } : entry;
-            });
-            const changed = conversations.some((entry, index) => entry !== item.conversations[index]);
-            return changed ? { ...item, conversations } : item;
-          });
-        }
-        // 快照里的 notices 是事件原文，先按与实时通道同一套规则解析；再把本次刚收到、
-        // 还没进快照的那几条并回来——少了后者，刚冒出来的"API 重试中"会被下一次快照覆盖掉。
-        const pendingNotices = pendingNoticesRef.current;
-        value.projects = value.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => {
-          const serverNotices = noticesFromSnapshot(entry.notices);
-          const local = pendingNotices.get(entry.id);
-          if (!local || local.length === 0) return { ...entry, notices: serverNotices };
-          const serverIDs = new Set(serverNotices.map((notice) => notice.id));
-          // "服务端已有同名记录"不等于"本地这条可以扔"。工具确认（replace 型）必须
-          // 一直留着：快照有上传节流，下一次可能只带回更旧的 pending，此时若本地那条
-          // 已被清掉，合并结果就会是 pending —— 界面从"已确认"倒退回"等待确认"。
-          const remaining = local.filter((notice) => notice.merge === "replace" || !serverIDs.has(notice.id));
-          if (remaining.length > 0) pendingNotices.set(entry.id, remaining);
-          else pendingNotices.delete(entry.id);
-          return { ...entry, notices: mergeNotices(serverNotices, remaining) };
-        }) }));
-        setSnapshot(value);
-        localStorage.setItem(`milevia.snapshot.${target}`, JSON.stringify(value));
-      }
-      // 版本号有没有前进，就是"这次刷新到底有没有带回来新东西"的判据。
-      return { outcome: value.snapshotRevision > baseline ? "updated" : "unchanged", snapshot: value };
-    } catch (cause) {
-      if (requestGeneration !== snapshotLoadGenerationRef.current) return { outcome: "skipped", snapshot: null };
-      const reason = cause instanceof Error ? cause.message : "无法加载项目快照";
-      const cached = localStorage.getItem(`milevia.snapshot.${target}`);
-      if (cached) {
-        try {
-          const cachedValue = JSON.parse(cached) as Snapshot;
-          setSnapshot(cachedValue);
-          if (!options?.silent) setError("当前显示的是最近一次同步快照");
-          // 有缓存也要如实报失败：界面确实停在旧数据上，不能让刷新按钮显示"已刷新"。
-          // 原因写短一点——"当前显示的是最近一次同步快照"那句由页面上的错误条负责说明，
-          // 两边各说一句，避免同一条红框提示连说两遍。
-          return { outcome: "failed", snapshot: cachedValue, reason: "无法连接云端" };
-        } catch { /* ignore invalid cache */ }
-      }
-      if (!options?.silent) setError(reason);
-      return { outcome: "failed", snapshot: null, reason };
-    }
-  }, [instanceID]);
-
+  }, [instanceID, resetSnapshotRevision]);
   const applyRealtimeEvent = useCallback((raw: MessageEvent): boolean => {
     try {
       const event = JSON.parse(String(raw.data)) as { eventId?: string; type?: string; taskId?: string; taskRunId?: string; payload?: unknown; createdAt?: string };
@@ -2237,6 +2079,21 @@ export default function MobileRemotePage() {
     }
   }, [localPreferences.systemNotificationsEnabled]);
 
+  useMobileRemoteEventStream({
+    instanceID,
+    activeToken: token,
+    deviceEpoch,
+    visible: documentVisible,
+    streamURL: instanceID ? `${cloudURL}/v1/stream?${new URLSearchParams({ instanceId: instanceID }).toString()}` : "",
+    isCurrentToken: (streamToken) => streamToken === readActiveToken(),
+    onEvent: (event) => {
+      notifyHiddenMobileEvent(event);
+      return applyRealtimeEvent(event);
+    },
+    refreshSnapshot: loadSnapshot,
+    refreshGit: () => gitPanelRef.current?.refreshInBackground(),
+  });
+
   // 云端判定令牌不可用时（过期、被电脑端撤销、被另一台手机顶替、或配对尚未确认）
   // 云请求层会标记那台设备并广播该事件，这里把页面状态一起复位，回到配对流程，
   // 避免用户卡在一串注定失败的请求里。
@@ -2316,7 +2173,7 @@ export default function MobileRemotePage() {
     const timer = window.setInterval(() => { void loadInstances(); }, 5000);
     return () => window.clearInterval(timer);
   }, [token, loadInstances, documentVisible]);
-  useEffect(() => { void loadSnapshot(); }, [loadSnapshot]);
+  useEffect(() => { void loadSnapshot(); }, [instanceID, loadSnapshot]);
   // CLI 探测在电脑端后台进行，不会产生业务事件，因此快照版本号不一定变化。
   // 检测期间显式绕过版本短路，等状态到齐就立刻停下，避免把“尚未检测”长期显示成不可用。
   useEffect(() => {
@@ -2324,107 +2181,6 @@ export default function MobileRemotePage() {
     const timer = window.setTimeout(() => { void loadSnapshot({ force: true, silent: true }); }, 3000);
     return () => window.clearTimeout(timer);
   }, [loadSnapshot, snapshot]);
-  useEffect(() => {
-    if (!instanceID) return;
-    const tokenValue = readActiveToken();
-    const controller = new AbortController();
-    let stopped = false;
-    let lastEventID = "";
-    // SSE is the fast path; periodic snapshots remain active because
-    // conversation output is produced independently of task events.
-    // SSE is the normal fast path. Keep a slower safety poll for proxies or
-    // networks that silently drop events, without competing with every event
-    // refresh and increasing full-snapshot traffic threefold.
-    // SSE 是快速通道，仍保留一个较慢的快照兜底，兼容会静默丢事件的代理与网络。
-    // 后台不跑兜底轮询（SSE 连接本身保留），回到前台由可见性效果补刷一次快照。
-    let fallbackTimer: number | null = null;
-    const startFallbackTimer = () => {
-      if (fallbackTimer !== null) return;
-      fallbackTimer = window.setInterval(() => {
-        if (!documentVisibleRef.current) return;
-        void loadSnapshot();
-      }, 15_000);
-    };
-    startFallbackTimer();
-    let refreshTimer: number | null = null;
-    const scheduleSnapshotRefresh = (delay: number) => {
-      // Trailing throttle: a busy assistant stream cannot keep postponing
-      // durable task metadata and history reconciliation indefinitely.
-      if (refreshTimer !== null) return;
-      refreshTimer = window.setTimeout(() => {
-        refreshTimer = null;
-        // 后台不拉快照：SSE 事件在后台仍会到达，若不拦住，前面「隐藏时暂停
-        // 轮询」就会被这条路径完全抵消。回到前台时可见性效果会整体补刷一次。
-        if (!documentVisibleRef.current) return;
-        void loadSnapshot();
-      }, delay);
-    };
-    // Git 视图的后台对账（见 MobileGitPanelHandle.refreshInBackground）。
-    //
-    // **不轮询**：只在结构事件到达时问一次。Git 视图没开着时 `gitPanelRef.current` 是 null，
-    // 天然什么都不做 —— 所以这里不必把 `gitOpen` 拖进本 effect 的依赖里（那会重连整条流）。
-    // 窗口比快照那条宽得多，理由见 GIT_REFRESH_THROTTLE_MS 的说明。
-    let gitRefreshTimer: number | null = null;
-    const scheduleGitRefresh = () => {
-      if (gitRefreshTimer !== null) return;
-      gitRefreshTimer = window.setTimeout(() => {
-        gitRefreshTimer = null;
-        if (!documentVisibleRef.current) return;
-        gitPanelRef.current?.refreshInBackground();
-      }, GIT_REFRESH_THROTTLE_MS);
-    };
-    const wait = (delay: number) => new Promise<void>((resolve) => {
-      const timer = window.setTimeout(resolve, delay);
-      controller.signal.addEventListener("abort", () => { window.clearTimeout(timer); resolve(); }, { once: true });
-    });
-    const runStream = async () => {
-      let retryDelay = 1000;
-      while (!stopped && !controller.signal.aborted) {
-        try {
-          const query = new URLSearchParams({ instanceId: instanceID });
-          await consumeMobileEventStream(`${cloudURL}/v1/stream?${query.toString()}`, tokenValue, lastEventID, (event) => {
-            if (event.lastEventId) lastEventID = event.lastEventId;
-            notifyHiddenMobileEvent(event);
-            const isMessage = applyRealtimeEvent(event);
-            // 消息内容已经随事件到达，不需要为它再拉整份快照：那会让手机在每条
-            // 助手消息后重新下载全部项目与会话，是移动端延迟最大的单一来源。结构性
-            // 事件（任务、会话生命周期）仍需对账，漏掉的事件由慢速兜底轮询收敛。
-            if (!isMessage) { scheduleSnapshotRefresh(500); scheduleGitRefresh(); }
-          }, controller.signal);
-          if (stopped || controller.signal.aborted) break;
-          await wait(retryDelay);
-          retryDelay = 1000;
-        } catch {
-          if (stopped || controller.signal.aborted) break;
-          startFallbackTimer();
-          await wait(retryDelay);
-          retryDelay = Math.min(retryDelay * 2, 30_000);
-        }
-      }
-    };
-    void runStream();
-    return () => {
-      stopped = true;
-      controller.abort();
-      if (fallbackTimer !== null) window.clearInterval(fallbackTimer);
-      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
-      if (gitRefreshTimer !== null) window.clearTimeout(gitRefreshTimer);
-    };
-  }, [instanceID, loadSnapshot, applyRealtimeEvent, notifyHiddenMobileEvent]);
-  // 回到前台补刷一次快照，避免用户先看到后台期间的旧状态。
-  // 只在「隐藏 → 可见」的瞬间触发：实例切换等其它原因引起的重跑不需要额外拉快照。
-  // （实例列表由上面的轮询效果在可见性变化时自动补拉，这里不重复。）
-  useEffect(() => {
-    const wasVisible = wasDocumentVisibleRef.current;
-    wasDocumentVisibleRef.current = documentVisible;
-    if (!documentVisible || wasVisible) return;
-    if (!instanceID) return;
-    void loadSnapshot();
-    // Git 那条后台对账的定时器在隐藏期间会**丢弃**（见 scheduleGitRefresh：它是"首事件开窗"
-    // 的节流，窗口内的事件不会再排第二次），所以后台期间"AI 跑完了"这件事不会自己补上 ——
-    // 回到前台补一次，与快照这条对齐。视图没开着时 ref 是 null，天然 no-op。
-    gitPanelRef.current?.refreshInBackground();
-  }, [documentVisible, instanceID, loadSnapshot]);
   useEffect(() => {
     let cancelled = false;
     if (!pairingURL) {

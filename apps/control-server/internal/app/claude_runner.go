@@ -79,7 +79,8 @@ type AgentSessionRequest struct {
 	// Model 是本次会话实际要使用的模型（会话覆盖 > 档案模型 > 空串=CLI 默认），
 	// 由控制服务在构造请求时解析完毕（runModel）。runner 只做"非空就拼参数"，
 	// 一律不读 Profile.Model（见 AgentRunRequest.Model）。
-	Model string
+	Model           string
+	ReasoningEffort string
 	// MCP 注入（本地/WSL 用 MCPConfigPath；SSH 用 MCPConfigJSON 在远端落盘）。
 	MCPConfigPath string
 	MCPConfigJSON string
@@ -126,7 +127,8 @@ type AgentRunRequest struct {
 	// 一律不读 Profile.Model——模型只有一个来源，避免两处取值分叉。
 	// 构造处必须显式传：忘了传不会报错，只会静默退化成 CLI 默认模型，
 	// 所以 TestEveryRunRequestSetsModel 会扫描源码把这种遗漏变成测试失败。
-	Model string
+	Model           string
+	ReasoningEffort string
 	// SkipSessionID 让一次性 Run 不带 --session-id/--resume。会话无关的只读分析
 	//（投递式扫描）需要它：规划模式的 Claude 在带 --session-id 的一次性 -p 调用下
 	// 会进入"待命"而非执行，导致扫描收到 "I'll wait for your request"。
@@ -177,6 +179,10 @@ type claudeCLIRunner struct {
 	// approvalHookOverride 允许跨端 runner（如 wslAgentRunner）注入自定义审批 hook
 	// 命令字符串。nil 时走默认（本机 NativeApprovalHook / sh 逻辑）。
 	approvalHookOverride func() string
+}
+
+func (r *claudeCLIRunner) claudeCLIConfig(context.Context) CLIConfigSnapshot {
+	return localClaudeCLIConfig()
 }
 
 type claudeCLISession struct {
@@ -729,6 +735,9 @@ func (r *claudeCLIRunner) args(request AgentRunRequest) ([]string, error) {
 	if request.Model != "" {
 		args = append(args, "--model", request.Model)
 	}
+	if request.ReasoningEffort != "" {
+		args = append(args, "--effort", request.ReasoningEffort)
+	}
 	if len(request.OutputSchema) > 0 {
 		if !json.Valid(request.OutputSchema) {
 			return nil, errors.New("invalid Claude output schema")
@@ -760,6 +769,9 @@ func (r *claudeCLIRunner) sessionArgs(request AgentSessionRequest) ([]string, er
 	}
 	if request.Model != "" {
 		args = append(args, "--model", request.Model)
+	}
+	if request.ReasoningEffort != "" {
+		args = append(args, "--effort", request.ReasoningEffort)
 	}
 	return args, nil
 }

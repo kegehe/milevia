@@ -63,7 +63,9 @@ type ConversationModelsView struct {
 	ConversationID string `json:"conversationId"`
 	AgentID        string `json:"agentId"`
 	// Selected 是会话级覆盖（空 = 未设置）。
-	Selected string `json:"selected"`
+	Selected         string   `json:"selected"`
+	ReasoningEffort  string   `json:"reasoningEffort"`
+	ReasoningOptions []string `json:"reasoningOptions"`
 	// Effective 是"跟随配置时会实际使用的模型"，未知时为空串。
 	Effective string `json:"effective"`
 	// Source 说明 effective 的来源：override | profile | cli_default。
@@ -167,13 +169,15 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := ConversationModelsView{
-		ConversationID: conversation.ID,
-		AgentID:        conversation.AgentID,
-		Selected:       conversation.ModelOverride,
-		CustomAllowed:  true,
-		Models:         claudeModelCatalog(),
-		Note:           "候选项为内置建议；Claude Code 的 --model 接受任意模型名，可直接输入。",
+		ConversationID:   conversation.ID,
+		AgentID:          conversation.AgentID,
+		Selected:         conversation.ModelOverride,
+		CustomAllowed:    true,
+		ReasoningOptions: reasoningEffortOptions(conversation.AgentID),
+		Models:           claudeModelCatalog(),
+		Note:             "候选项为内置建议；Claude Code 的 --model 接受任意模型名，可直接输入。",
 	}
+	_ = s.db.QueryRowContext(r.Context(), `select reasoning_effort from conversation_model_settings where conversation_id=?`, conversationID).Scan(&view.ReasoningEffort)
 
 	// 跟随配置时实际会用的模型：优先读档案 revision 的 model（只读，不触发凭据解密，
 	// 也不做凭据池轮转选择——那是 run 路径的事）。读不到就留给运行后的用量数据展示。
@@ -225,6 +229,78 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 		view.Models = []AgentModelOption{}
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+func reasoningEffortOptions(agentID string) []string {
+	if agentID == "codex" {
+		return []string{"low", "medium", "high", "xhigh"}
+	}
+	if agentID == "claude-code" {
+		return []string{"low", "medium", "high"}
+	}
+	return nil
+}
+
+func (s *Server) conversationReasoningEffort(ctx context.Context, conversationID string) string {
+	var effort string
+	if err := s.db.QueryRowContext(ctx, `select reasoning_effort from conversation_model_settings where conversation_id=?`, conversationID).Scan(&effort); err != nil {
+		return ""
+	}
+	return effort
+}
+
+func (s *Server) setConversationReasoningEffort(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		ReasoningEffort string `json:"reasoningEffort"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	effort := strings.ToLower(strings.TrimSpace(input.ReasoningEffort))
+	allowed := map[string]bool{"": true, "low": true, "medium": true, "high": true, "xhigh": true}
+	if !allowed[effort] {
+		writeError(w, http.StatusBadRequest, errors.New("invalid reasoning effort"))
+		return
+	}
+	id := chi.URLParam(r, "conversationID")
+	if s.isOrchestrationConversation(r.Context(), id) {
+		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations are read-only"))
+		return
+	}
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
+	var status, agentID string
+	if err := s.db.QueryRowContext(r.Context(), `select status,agent_id from conversations where id=?`, id).Scan(&status, &agentID); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if status != "idle" {
+		writeError(w, http.StatusConflict, errors.New("请先停止当前任务，再切换推理强度"))
+		return
+	}
+	valid := false
+	for _, option := range reasoningEffortOptions(agentID) {
+		if option == effort {
+			valid = true
+			break
+		}
+	}
+	if effort != "" && !valid {
+		writeError(w, http.StatusBadRequest, errors.New("该工具不支持此推理强度"))
+		return
+	}
+	if !s.sessionManager.retireForConfiguration(id) && !s.awaitSessionRetired(id, modelSwitchRetireTimeout) {
+		writeError(w, http.StatusConflict, errors.New("会话正在重启，请稍后重试"))
+		return
+	}
+	if _, err := s.db.ExecContext(r.Context(), `insert into conversation_model_settings(conversation_id,reasoning_effort) values(?,?) on conflict(conversation_id) do update set reasoning_effort=excluded.reasoning_effort`, id, effort); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"reasoningEffort": effort})
 }
 
 // profileModel 只读地取出档案 revision 上的模型名。取不到（无档案、档案已不可用、

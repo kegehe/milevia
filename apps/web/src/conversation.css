@@ -2022,8 +2022,16 @@
   .timeline-entry.tool,
   .timeline-entry.system,
   .timeline-entry.error { width: 100%; padding: 0; }
+  .timeline-entry.message-entry { margin-bottom: 32px; }
+  .timeline-entry.tool { margin-bottom: 24px; }
   .message.user { width: min(100%, 680px); }
   .message > .markdown { padding: 13px 14px; }
+  .message:not(.user) > .markdown {
+    border-color: #c8ddd1;
+    box-shadow: 0 2px 5px #17362c12;
+  }
+  .message.user > .markdown { border-color: #afd3c1; }
+  .tool-card { border-color: #c5dbce; box-shadow: 0 2px 5px #17362c10; }
   .tool-card > header { align-items: flex-start; }
   .tool-card header small { max-width: none; }
   .tool-meta { align-items: flex-end; flex-direction: column; gap: 3px; }
@@ -2240,7 +2248,8 @@ button.mcp-tile:hover { transform: translateY(-1px); box-shadow: 0 0 0 3px #2c75
    也拆开，数字与中文之间会多出一条空隙（文字节点在 flex 里是独立 item）。 */
 .turns-icon { width: 13px; height: 13px; margin-right: 5px; fill: none; stroke: #94a89d; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .turns b { color: #31594f; font-weight: 800; }
-/* ── 分支胶囊：当前分支+同步状态+未提交改动数，点击跳转 Git 工作台 ── */
+/* ── 分支胶囊：当前分支+同步状态+未提交改动数，点击展开切换菜单 ── */
+.branch-switcher { position: relative; display: inline-flex; }
 .branch-pill {
   display: inline-flex;
   min-width: 0;
@@ -2258,6 +2267,16 @@ button.mcp-tile:hover { transform: translateY(-1px); box-shadow: 0 0 0 3px #2c75
   line-height: 1;
   white-space: nowrap;
 }
+.branch-pill:disabled { cursor: wait; opacity: .7; }
+.branch-chevron { margin-left: 2px; font-size: 12px; line-height: 1; }
+.branch-menu { position: absolute; z-index: 20; top: calc(100% + 5px); right: 0; min-width: 190px; padding: 5px; border: 1px solid #cbe1d5; border-radius: 6px; background: #fff; box-shadow: 0 8px 22px #24483a22; }
+.branch-menu-title { padding: 5px 8px 6px; color: #748b81; font-size: 10px; font-weight: 700; }
+.branch-menu button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; border: 0; border-radius: 4px; padding: 7px 8px; color: #315e50; background: transparent; font: inherit; font-size: 11px; text-align: left; cursor: pointer; }
+.branch-menu button:hover:not(:disabled) { background: #e2f4ea; }
+.branch-menu button.current { color: #17634f; background: #edf8f1; }
+.branch-menu button:disabled { cursor: default; opacity: .65; }
+.branch-menu small { color: #748b81; font-size: 10px; }
+.branch-menu-empty { padding: 8px; color: #8a8a84; font-size: 11px; }
 /* 指针与悬停只给**可点的**那颗：读取中那一档是 <span>（没有 onClick），
    给它 pointer + 悬停换色等于许诺一个点不动的按钮。 */
 button.branch-pill { cursor: pointer; }
@@ -2456,6 +2475,9 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 .model-menu-custom button { min-height: 28px; border: 1px solid #1f6055; border-radius: 5px; padding: 4px 10px; color: #fff; background: #1f6055; font-size: 11px; font-weight: 700; cursor: pointer; }
 .model-menu-custom button:disabled { cursor: default; opacity: .45; }
 .model-menu-current { margin: 0; color: #597268; font-size: 10px; }
+.model-menu-current { display: none; }
+.model-menu-effort { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0; color: #597268; font-size: 11px; }
+.model-menu-effort select { min-width: 130px; padding: 5px 8px; border: 1px solid #cbd8d2; border-radius: 5px; background: #fff; color: #19332c; }
 .model-menu-current b { color: #19332c; }
 .model-menu-note { margin: 0; color: #7a9187; font-size: 10px; line-height: 1.5; }
 .model-menu-hint { margin: 0; border-top: 1px solid #e2efe7; padding-top: 6px; color: #8ba398; font-size: 10px; line-height: 1.5; }
@@ -3942,3 +3964,10 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 /* 桌面左栏两列较窄：常用提示词/常用命令标题兼作折叠按钮后不再重复画类别图标，
    把空间让给数量角标与折叠箭头，避免标题折行。技能组整行较宽，仍保留图标。 */
 .quick-actions-row .quick-tag-group:not(.skill-tags) .quick-tag-heading-toggle .quick-tag-heading-icon { display: none; }
+.checkpoint-popover { min-width: 300px; max-width: min(420px, calc(100vw - 32px)); }
+.checkpoint-entry { padding: 8px 10px; border-bottom: 1px solid var(--border-subtle, #e5e7eb); }
+.checkpoint-entry:last-child { border-bottom: 0; }
+.checkpoint-entry b, .checkpoint-entry small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.checkpoint-entry small { margin-top: 2px; opacity: .68; }
+.checkpoint-entry > div { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.checkpoint-entry button { border: 1px solid var(--border-subtle, #d1d5db); background: transparent; border-radius: 4px; padding: 3px 6px; font-size: 12px; cursor: pointer; }

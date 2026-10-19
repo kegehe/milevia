@@ -13,7 +13,7 @@ import { openExternal } from "../lib/runtime";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ServiceLogo } from "../components/ServiceLogo";
 import type { MCPAuditEntry, MCPAuditResponse, MCPImportCandidate, MCPImportResult, MCPInjectionStatus, MCPOAuthStatus, MCPPreset, MCPPreviewResult, MCPProjectView, MCPRuntimeCheckResult, MCPScope, MCPServer, MCPTestResult, MCPTransport } from "../lib/types";
-import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseKeyValueLines, parseLines, presetGuidanceLines, runtimeCommandsFor, wizardStartsAt, type MCPSecretInput } from "../features/mcp/mcp-model";
+import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseCustomMCPConfig, parseKeyValueLines, parseLines, presetGuidanceLines, redactedMCPConfig, runtimeCommandsFor, uniqueMCPName, wizardStartsAt, type CustomMCPConfig, type MCPSecretInput } from "../features/mcp/mcp-model";
 import "./mcp-manager.css";
 import { waitForOAuthFlowResult } from "../features/mcp/oauth-flow";
 
@@ -247,6 +247,16 @@ export default function McpManagerPage() {
   const [importLoading, setImportLoading] = useState(false);
   const [importSelection, setImportSelection] = useState<Record<string, boolean>>({});
   const [importRunning, setImportRunning] = useState(false);
+  const [customOpen, setCustomOpen] = useState(false);
+  const [customText, setCustomText] = useState("");
+  const [customConfigs, setCustomConfigs] = useState<CustomMCPConfig[]>([]);
+  const [customSelected, setCustomSelected] = useState<Record<string, boolean>>({});
+  const [customQueue, setCustomQueue] = useState<CustomMCPConfig[]>([]);
+  const [customNameNotice, setCustomNameNotice] = useState("");
+  const [customError, setCustomError] = useState("");
+  const [customParsing, setCustomParsing] = useState(false);
+  const [customDragging, setCustomDragging] = useState(false);
+  const customFileInputRef = useRef<HTMLInputElement | null>(null);
   const [bindingBusy, setBindingBusy] = useState("");
   // P2：远程授权（OAuth 2.1 + PKCE，仅 http / sse）。
   const [oauthTarget, setOauthTarget] = useState<MCPServer | null>(null);
@@ -275,6 +285,8 @@ export default function McpManagerPage() {
   const [previewEnvironment, setPreviewEnvironment] = useState("windows");
   const [previewResult, setPreviewResult] = useState<MCPPreviewResult | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [draftTestResult, setDraftTestResult] = useState<MCPTestResult | null>(null);
+  const [draftTestRunning, setDraftTestRunning] = useState(false);
   // —— 「一键连接」向导 ——
   // 用户不懂 MCP，所以向导只有两屏：① 只问缺的那一项（凭据 / 授权）② 自动检查后完成。
   // 「选服务」那一屏就是下面的服务目录本身（点卡片即进入），不必再套一层模态。
@@ -372,6 +384,7 @@ export default function McpManagerPage() {
   }, [api]);
 
   const startCreate = (preset?: MCPPreset) => {
+    setCustomNameNotice("");
     setEditingId(null);
     if (preset) {
       const next = emptyForm();
@@ -395,18 +408,127 @@ export default function McpManagerPage() {
     // 不在这里清 localError：它还承担「服务列表读失败」的记忆 —— 打开又关掉表单后，
     // 列表区该回到读失败块，而不是把「读不到」伪装成「还没有配置任何服务」。
     setPreviewResult(null);
+    setDraftTestResult(null);
     setRuntimeResult(null);
     setShowForm(true);
   };
 
   const startEdit = (server: MCPServer) => {
+    setCustomNameNotice("");
     setEditingId(server.id);
     setForm(formFromServer(server));
     // 编辑既有 server 时不再展示模板要求：它反映的是当初的模板，不是当前配置的事实。
     setPresetMeta(null);
     setPreviewResult(null);
+    setDraftTestResult(null);
     setRuntimeResult(null);
     setShowForm(true);
+  };
+
+  const copyServerConfig = async (server: MCPServer, format: "claude" | "single" = "claude") => {
+    try {
+      const text = redactedMCPConfig(server, format);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const input = document.createElement("textarea");
+        input.value = text;
+        input.setAttribute("readonly", "true");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        try {
+          input.select();
+          if (!document.execCommand("copy")) throw new Error("clipboard unavailable");
+        } finally {
+          input.remove();
+        }
+      }
+      toast.success("已复制脱敏后的 MCP 设置");
+    } catch {
+      toast.error("无法写入剪贴板，请检查浏览器权限");
+    }
+  };
+
+  const openCustomMCP = () => {
+    setCustomOpen(true);
+    setCustomText("");
+    setCustomConfigs([]);
+    setCustomSelected({});
+    setCustomQueue([]);
+    setCustomNameNotice("");
+    setCustomError("");
+  };
+
+  const parseCustomText = () => {
+    setCustomParsing(true);
+    setCustomError("");
+    try {
+      const parsed = parseCustomMCPConfig(customText);
+      setCustomConfigs(parsed);
+      setCustomSelected(Object.fromEntries(parsed.map((config) => [config.name, true])));
+    } catch (cause) {
+      setCustomConfigs([]);
+      setCustomError(cause instanceof Error ? cause.message : "无法解析 MCP 配置");
+    } finally {
+      setCustomParsing(false);
+    }
+  };
+
+  const readCustomFile = async (file?: File) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".json") && file.type !== "application/json") {
+      setCustomError("请选择 JSON 配置文件");
+      return;
+    }
+    try {
+      const text = await file.text();
+      setCustomText(text);
+      setCustomError("");
+      const parsed = parseCustomMCPConfig(text);
+      setCustomConfigs(parsed);
+      setCustomSelected(Object.fromEntries(parsed.map((config) => [config.name, true])));
+    } catch (cause) {
+      setCustomConfigs([]);
+      setCustomError(cause instanceof Error ? cause.message : "无法读取 MCP 配置文件");
+    }
+  };
+
+  const useCustomConfig = (config: CustomMCPConfig, queued = false) => {
+    const next = emptyForm();
+    const existingNames = [...servers.map((server) => server.name), ...(queued && form.name.trim() ? [form.name.trim()] : [])];
+    const nextName = uniqueMCPName(config.name, existingNames);
+    next.name = nextName;
+    next.displayName = config.displayName;
+    next.description = config.description;
+    next.transport = config.transport;
+    next.command = config.command;
+    next.argsText = config.args.join("\n");
+    next.url = config.url;
+    next.envText = keyValueLines(config.env);
+    next.headersText = keyValueLines(config.headers);
+    next.envSecretKeys = Object.keys(config.envSecrets);
+    next.headerSecretKeys = Object.keys(config.headerSecrets);
+    next.envSecrets = config.envSecrets;
+    next.headerSecrets = config.headerSecrets;
+    setEditingId(null);
+    setPresetMeta(null);
+    setForm(next);
+    setCustomOpen(false);
+    setShowForm(true);
+    setCustomNameNotice(nextName !== config.name ? `名称已存在，已改为 ${nextName}` : "");
+    if (!queued) setCustomQueue([]);
+  };
+
+  const beginCustomQueue = () => {
+    const selected = customConfigs.filter((config) => customSelected[config.name]);
+    if (selected.length === 0) {
+      setCustomError("请至少选择一个 MCP 配置");
+      return;
+    }
+    const [first, ...rest] = selected;
+    setCustomQueue(rest);
+    useCustomConfig(first, true);
   };
 
   const closeForm = () => {
@@ -415,6 +537,7 @@ export default function McpManagerPage() {
     setEditingId(null);
     setPresetMeta(null);
     setPreviewResult(null);
+    setDraftTestResult(null);
     setRuntimeResult(null);
   };
 
@@ -691,6 +814,37 @@ export default function McpManagerPage() {
     }
   };
 
+  const runDraftTest = async () => {
+    setDraftTestRunning(true);
+    setDraftTestResult(null);
+    try {
+      const env = parseKeyValueLines(form.envText);
+      const headers = parseKeyValueLines(form.headersText);
+      for (const key of form.envSecretKeys) {
+        if (form.envSecrets[key]) env[key] = form.envSecrets[key];
+      }
+      for (const key of form.headerSecretKeys) {
+        if (form.headerSecrets[key]) headers[key] = form.headerSecrets[key];
+      }
+      const result = await api<MCPTestResult>("/api/mcp/test-draft", {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.name.trim(), displayName: form.displayName.trim(), description: form.description.trim(),
+          transport: form.transport, command: form.transport === "stdio" ? form.command.trim() : "",
+          args: form.transport === "stdio" ? parseLines(form.argsText) : [], env,
+          url: form.transport === "stdio" ? "" : form.url.trim(), headers,
+          environment: previewEnvironment, projectId: form.scope === "project" ? form.projectId : "",
+        }),
+      });
+      setDraftTestResult(result);
+      if (!result.ok) toast.error(result.error || "连接测试失败，草稿已保留");
+    } catch (cause) {
+      toast.error(cause instanceof Error ? `${cause.message}，草稿已保留` : "连接测试失败，草稿已保留");
+    } finally {
+      setDraftTestRunning(false);
+    }
+  };
+
   const performSave = async () => {
     setSaving(true);
     setLocalError("");
@@ -733,8 +887,16 @@ export default function McpManagerPage() {
         await api("/api/mcp/servers", { method: "POST", body: JSON.stringify(payload) });
         toast.success("MCP 配置已创建");
       }
-      setShowForm(false);
-      setEditingId(null);
+      const [nextConfig, ...remaining] = customQueue;
+      if (!editingId && nextConfig) {
+        setCustomQueue(remaining);
+        useCustomConfig(nextConfig, true);
+        toast.success(`已保存，继续配置 ${nextConfig.displayName || nextConfig.name}`);
+      } else {
+        setShowForm(false);
+        setEditingId(null);
+        setCustomQueue([]);
+      }
       await loadServers();
     } catch (cause) {
       // 表单弹层盖着页面，localError 横幅在背板后面看不见 —— 保存失败必须用 toast。
@@ -1115,6 +1277,7 @@ export default function McpManagerPage() {
               </div>
               <div className="ssh-connection-actions">
                 <button className="ssh-action-button mcp-test-button" type="button" title="测试连接" aria-label={`测试 ${server.name}`} onClick={() => openTest(server)}>测试</button>
+                <div className="mcp-copy-actions"><button className="ssh-action-button" type="button" title="复制 Claude 脱敏设置" aria-label={`复制 ${server.name} 的 Claude 设置`} onClick={() => void copyServerConfig(server, "claude")}>复制 Claude</button><button className="ssh-action-button" type="button" title="复制单个 MCP 脱敏设置" aria-label={`复制 ${server.name} 的单个设置`} onClick={() => void copyServerConfig(server, "single")}>复制单个</button></div>
                 {server.transport !== "stdio" && <button className="ssh-action-button" type="button" title="OAuth 授权" aria-label={`授权 ${server.name}`} onClick={() => void openOAuth(server)}>授权</button>}
                 <button className="ssh-action-button" type="button" title={server.enabled ? "停用" : "启用"} aria-label={`切换 ${server.name}`} onClick={() => void toggleEnabled(server)}>{server.enabled ? "停用" : "启用"}</button>
                 <button className="ssh-action-button" type="button" title="管理" aria-label={`管理 ${server.name}`} onClick={() => startEdit(server)}><EditIcon /></button>
@@ -1136,8 +1299,9 @@ export default function McpManagerPage() {
               <div className="mcp-preset-main">
                 <header><span className="mcp-service-mark"><ServiceLogo service={preset.name} fallback={<PresetIcon name={preset.icon} />} /></span><b>{preset.displayName || preset.name}</b></header>
                 <p>{preset.summary || preset.description}</p>
+                {preset.note && <p className="mcp-preset-note">{preset.note}</p>}
               </div>
-              <div className="mcp-preset-action"><button className="primary" type="button" onClick={() => openWizard(preset)}>连接</button></div>
+              <div className="mcp-preset-action">{preset.mode === "manual" ? <button className="secondary" type="button" onClick={() => void openExternal(preset.docsUrl || "")}>查看接入说明</button> : <button className="primary" type="button" onClick={() => openWizard(preset)}>连接</button>}</div>
             </article>)}</div>
           </div>)}
         </section>}
@@ -1146,6 +1310,7 @@ export default function McpManagerPage() {
         {showAdvanced && <section className="mcp-section mcp-advanced">
           <div className="ssh-form-section"><header><h3>高级设置</h3></header>
             <div className="ssh-preflight-checks">
+              <button className="primary" type="button" onClick={openCustomMCP}><McpIcon />添加自定义 MCP</button>
               <button className="secondary" type="button" onClick={() => startCreate()}><McpIcon />手动配置</button>
               <button className="secondary" type="button" onClick={() => { setImportOpen(true); setImportPreview(null); void loadImportPreview(""); }}>从现有配置导入</button>
               <button className="secondary" type="button" onClick={() => { setAuditOpen(true); setAuditFilter(""); void loadAudit(""); }}>调用审计</button>
@@ -1228,11 +1393,37 @@ export default function McpManagerPage() {
         </footer>
       </section>
     </div>}
+    {customOpen && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-custom-title">
+      <section className="modal ssh-connection-dialog mcp-custom-dialog">
+        <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-custom-title">添加自定义 MCP</h2><p>粘贴官方文档中的 JSON 配置，解析后再测试和保存</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" onClick={() => setCustomOpen(false)}><CloseIcon /></button></header>
+        <div className="ssh-form-body">
+          <section className="ssh-form-section"><header><h3>粘贴或导入配置</h3><p>支持带 mcpServers 的配置，也支持单个 MCP server。敏感字段会在保存时进入加密凭据。</p></header>
+            <input ref={customFileInputRef} className="mcp-custom-file" type="file" accept="application/json,.json" onChange={(event) => { void readCustomFile(event.target.files?.[0]); event.currentTarget.value = ""; }} />
+            <div className={`mcp-custom-dropzone${customDragging ? " is-dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setCustomDragging(true); }} onDragLeave={() => setCustomDragging(false)} onDrop={(event) => { event.preventDefault(); setCustomDragging(false); void readCustomFile(event.dataTransfer.files?.[0]); }}>
+              <b>把 JSON 文件拖到这里</b><span>或</span><button className="secondary" type="button" onClick={() => customFileInputRef.current?.click()}>选择文件</button>
+            </div>
+            <textarea className="mcp-custom-input" rows={10} value={customText} onChange={(event) => { setCustomText(event.target.value); setCustomError(""); setCustomConfigs([]); }} placeholder={'{\n  "mcpServers": {\n    "example": {\n      "command": "your-mcp-command",\n      "args": ["--config", "value"]\n    }\n  }\n}'} />
+            {customError && <p className="ssh-form-notice mcp-custom-error">{customError}</p>}
+            <div className="ssh-preflight-checks"><button className="secondary" type="button" disabled={customParsing || !customText.trim()} onClick={parseCustomText}>{customParsing ? "解析中…" : "解析配置"}</button></div>
+          </section>
+          {customConfigs.length > 0 && <section className="ssh-form-section"><header><h3>发现 {customConfigs.length} 个 MCP</h3><p>选择一个进入统一的预览、测试和保存流程。</p></header>
+            <div className="mcp-import-list">{customConfigs.map((config) => { const secretCount = Object.keys(config.envSecrets).length + Object.keys(config.headerSecrets).length; return <article className="mcp-import-item" key={config.name}>
+              <label><input type="checkbox" checked={!!customSelected[config.name]} onChange={() => setCustomSelected((old) => ({ ...old, [config.name]: !old[config.name] }))} /> 导入此项</label>
+              <small>敏感字段：{secretCount} 个；真实凭据不会明文展示</small>
+              <div><b>{config.displayName || config.name}</b><small>{config.name} · {config.transport}{config.command ? ` · ${config.command} ${(config.args || []).join(" ")}` : ` · ${config.url}`}</small></div>
+              <button className="primary" type="button" onClick={() => useCustomConfig(config)}>使用此配置</button>
+            </article>})}</div><div className="ssh-preflight-checks"><button className="primary" type="button" onClick={beginCustomQueue}>依次配置全部</button></div>
+          </section>}
+        </div>
+        <footer><button className="secondary" type="button" onClick={() => setCustomOpen(false)}>取消</button></footer>
+      </section>
+    </div>}
     {showForm && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-form-title">
       <section className="modal ssh-connection-dialog">
         <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-form-title">{editingId ? "编辑 MCP server" : "添加 MCP server"}</h2><p>配置将按项目环境在运行时注入到 AI 会话</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={saving} onClick={closeForm}><CloseIcon /></button></header>
         <div className="ssh-form-body">
           <section className="ssh-form-section"><header><h3>基本信息</h3><p>名称会作为注入后的 server key，仅支持字母、数字、下划线与连字符。</p></header>
+            {customNameNotice && <p className="ssh-form-notice">{customNameNotice}</p>}
             <div className="ssh-fields">
               <label className="ssh-field">名称<input autoFocus type="text" value={form.name} onChange={(event) => setField("name", event.target.value)} placeholder="github" /></label>
               <label className="ssh-field">显示名称<input type="text" value={form.displayName} onChange={(event) => setField("displayName", event.target.value)} placeholder="GitHub" /></label>
@@ -1289,7 +1480,7 @@ export default function McpManagerPage() {
               <label className="ssh-field">预览环境<select value={previewEnvironment} onChange={(event) => { setPreviewEnvironment(event.target.value); setPreviewResult(null); setRuntimeResult(null); }}>{ENVIRONMENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
             </div>
             <div className="ssh-preflight-checks">
-              <button className="secondary" type="button" disabled={previewLoading} onClick={() => void runPreview()}>{previewLoading ? "解析中…" : "解析占位符"}</button>
+              <button className="secondary" type="button" disabled={previewLoading} onClick={() => void runPreview()}>{previewLoading ? "解析中…" : "解析占位符"}</button><button className="secondary" type="button" disabled={draftTestRunning || !canSubmit} onClick={() => void runDraftTest()}>{draftTestRunning ? "测试中…" : "测试草稿"}</button>
               {runtimeCommands().length > 0 && <button className="secondary" type="button" disabled={runtimeChecking} onClick={() => void runRuntimeCheck()}>{runtimeChecking ? "检查中…" : "检查运行时依赖"}</button>}
             </div>
             {runtimeCommands().length > 0 && <p className="ssh-form-notice">依赖检查会在该环境真实执行 <code>command -v</code>，确认 {runtimeCommands().join("、")} 是否可用（不落库、不启动 server）。</p>}
@@ -1303,6 +1494,7 @@ export default function McpManagerPage() {
                 : <dl>{runtimeResult.items.map((item) => <div key={item.command}><dt>{item.command}</dt><dd>{item.error ? item.error : item.found ? `已安装：${item.path || "（路径未知）"}` : "未找到，请在该环境安装后重试"}</dd></div>)}</dl>}
               {!runtimeResult.error && runtimeResult.items.some((item) => !item.found) && <p className="ssh-form-notice">stdio 型 server 在目标环境各自拉起进程，本机装了不代表 WSL / 远端也装了，需要分别安装。</p>}
             </div>}
+            {draftTestResult && <div className="mcp-preview"><p className="ssh-form-notice">{draftTestResult.ok ? `测试通过：发现 ${draftTestResult.toolCount} 个工具` : `测试失败：${draftTestResult.error || "无法连接"}。当前草稿仍保留，可修改后重试。`}</p></div>}
           </section>
           <section className="ssh-form-section"><header><h3>策略</h3><p>默认所有 MCP 工具调用都需要确认；填入自动放行模式后，命中的工具不再弹审批（保存时会再次确认）。</p></header>
             <label className="ssh-field ssh-field-wide">自动放行模式（每行一个，如 mcp__github__*；Bash(git status*) 按命令前缀放行）<textarea rows={2} value={form.autoApproveText} onChange={(event) => setField("autoApproveText", event.target.value)} /></label>

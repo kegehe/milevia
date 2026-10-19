@@ -81,6 +81,37 @@ const (
 	defaultSlowRequestLogThreshold = 10 * time.Second
 )
 
+type requestLogResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *requestLogResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *requestLogResponseWriter) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *requestLogResponseWriter) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func ConfigFromEnv() Config {
 	home, _ := os.UserHomeDir()
 	root := os.Getenv("AUTO_ALLOWED_ROOT")
@@ -231,6 +262,8 @@ type Server struct {
 	remoteOutboxWakeMu sync.Mutex
 	remoteOutboxWake   *remoteOutboxWaker
 	storageMu          sync.Mutex
+	storageDBMu        sync.Mutex
+	storageDB          *sql.DB
 	// storageReclaiming 为真表示后台正在做一次性空间回收（VACUUM，会长时间独占唯一那条
 	// SQLite 连接）。对外暴露在存储用量接口里，让设置页能说明"这段时间为什么卡"。
 	storageReclaiming atomic.Bool
@@ -996,6 +1029,12 @@ func (s *Server) Close() {
 			}
 		}
 		s.runWG.Wait()
+		s.storageDBMu.Lock()
+		if s.storageDB != nil {
+			_ = s.storageDB.Close()
+			s.storageDB = nil
+		}
+		s.storageDBMu.Unlock()
 		_ = s.db.Close()
 		_ = s.dataLock.close()
 	})
@@ -1106,6 +1145,12 @@ func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+		if requestID == "" || len(requestID) > 128 || strings.ContainsAny(requestID, "\r\n") {
+			requestID = uuid.NewString()
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		response := &requestLogResponseWriter{ResponseWriter: w}
 		started := time.Now()
 		finished := make(chan struct{})
 		defer close(finished)
@@ -1115,14 +1160,24 @@ func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
 			select {
 			case <-finished:
 			case <-timer.C:
-				log.Printf("[slow-request] %s %s still running after %s",
-					r.Method, r.URL.EscapedPath(), time.Since(started).Round(time.Millisecond))
+				stats := s.db.Stats()
+				log.Printf("[request] id=%s phase=slow method=%s path=%s project=%s conversation=%s elapsed_ms=%d db_wait_count=%d db_wait_ms=%d",
+					requestID, r.Method, r.URL.EscapedPath(), chi.URLParam(r, "projectID"), chi.URLParam(r, "conversationID"), time.Since(started).Milliseconds(), stats.WaitCount, stats.WaitDuration.Milliseconds())
 			}
 		}()
-		next.ServeHTTP(w, r)
-		if elapsed := time.Since(started); elapsed >= threshold {
-			log.Printf("[slow-request] %s %s completed in %s",
-				r.Method, r.URL.EscapedPath(), elapsed.Round(time.Millisecond))
+		next.ServeHTTP(response, r)
+		if elapsed := time.Since(started); elapsed >= threshold || response.status >= http.StatusBadRequest {
+			status := response.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			stats := s.db.Stats()
+			phase := "complete"
+			if status >= http.StatusBadRequest {
+				phase = "error"
+			}
+			log.Printf("[request] id=%s phase=%s method=%s path=%s status=%d project=%s conversation=%s elapsed_ms=%d db_wait_count=%d db_wait_ms=%d",
+				requestID, phase, r.Method, r.URL.EscapedPath(), status, chi.URLParam(r, "projectID"), chi.URLParam(r, "conversationID"), elapsed.Milliseconds(), stats.WaitCount, stats.WaitDuration.Milliseconds())
 		}
 	})
 }
@@ -1404,6 +1459,8 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/conversations/{conversationID}", s.getConversation)
 	r.Get("/api/conversations/{conversationID}/input-history", s.listInputHistory)
 	r.Get("/api/conversations/{conversationID}/usage", s.getConversationUsage)
+	r.Get("/api/conversations/{conversationID}/checkpoints", s.listConversationCheckpoints)
+	r.Post("/api/conversations/{conversationID}/rewind", s.rewindConversation)
 	r.Post("/api/conversations/{conversationID}/clear", s.clearConversation)
 	r.Post("/api/conversations/{conversationID}/handoff", s.startConversationHandoff)
 	r.Get("/api/conversation-handoffs/{handoffID}", s.getConversationHandoff)
@@ -1414,6 +1471,7 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/conversations/{conversationID}/permission-mode", s.setConversationPermissionMode)
 	r.Post("/api/conversations/{conversationID}/model", s.setConversationModel)
 	r.Get("/api/conversations/{conversationID}/models", s.conversationModels)
+	r.Post("/api/conversations/{conversationID}/reasoning-effort", s.setConversationReasoningEffort)
 	r.Get("/api/conversations/{conversationID}/workspaces", s.listConversationWorkspaces)
 	r.Post("/api/conversations/{conversationID}/workspaces", s.createConversationWorktree)
 	r.Post("/api/conversations/{conversationID}/workspaces/{workspaceID}/activate", s.activateConversationWorkspace)
@@ -1796,6 +1854,9 @@ create index if not exists conversation_handoffs_source_status on conversation_h
 	if err := s.migrateConversationHandoffs(ctx); err != nil {
 		return fmt.Errorf("migrate conversation handoffs: %w", err)
 	}
+	if err := s.migrateCheckpoints(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateProjectsRunnerPathUnique(ctx); err != nil {
 		return fmt.Errorf("migrate project path uniqueness: %w", err)
 	}
@@ -2071,6 +2132,9 @@ create index if not exists messages_conversation_primary_created on messages(con
 	}
 	if err := s.migrateRunnerInstallGrants(ctx); err != nil {
 		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `create table if not exists conversation_model_settings (conversation_id text primary key references conversations(id) on delete cascade, reasoning_effort text not null default '')`); err != nil {
+		return fmt.Errorf("create conversation model settings: %w", err)
 	}
 	return s.migrateGit(ctx)
 }
@@ -2704,6 +2768,11 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteProjectLocked(ctx context.Context, projectID string) (runners []projectRunnerInterface, conversationIDs map[string]struct{}, status int, resultErr error) {
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, "project-delete")
+	if !acquired {
+		return nil, nil, http.StatusConflict, s.projectWorkspaceOccupiedError(projectID)
+	}
+	defer releaseWorkspace()
 	terminalDeletionStarted := false
 	if s.terminals != nil {
 		s.terminals.blockProject(projectID)
@@ -2778,10 +2847,6 @@ func (s *Server) deleteProjectLocked(ctx context.Context, projectID string) (run
 	if s.terminals != nil {
 		s.terminals.closeProject(projectID)
 	}
-	// Release the workspace lease only after a successful commit.
-	s.mu.Lock()
-	delete(s.projectWorkspaceLeases, projectID)
-	s.mu.Unlock()
 	s.runManagersMu.Lock()
 	for key, managedRunner := range s.runManagers {
 		if key == projectID || strings.HasPrefix(key, projectID+"|") {
@@ -3200,23 +3265,38 @@ func (s *Server) StartBackgroundMaintenance() {
 	// 出队表也要有上界：投递不出去的事件若无限堆积，会拖住整个中继（见该文件的说明）。
 	s.startRemoteOutboxRetentionLoop()
 	go func() {
-		if err := s.pruneConversationHistories(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("[maintenance] prune conversation history: %v", err)
-		}
-		if err := s.ensureConversationDeleteIntegrity(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("[maintenance] conversation delete integrity: %v", err)
-		}
-		// 空间回收排在最后，并且先让开启动后的交互窗口：这是一次性的大动作（VACUUM），
-		// 期间会独占唯一那条 SQLite 连接。
+		maintenanceStarted := time.Now()
+		log.Printf("[maintenance] startup begin delay=%s", storageReclaimStartDelay)
+		// All of the following jobs use the service's only SQLite connection. In
+		// particular, the orphan-event scan and index creation can read the whole
+		// events table. Do not start them immediately after the listener comes up:
+		// the desktop must have a quiet interaction window before maintenance is
+		// allowed to occupy the connection.
 		if err := s.waitForIdleWindow(s.runtimeCtx, storageReclaimStartDelay); err != nil {
 			if !errors.Is(err, context.Canceled) {
-				log.Printf("[maintenance] storage reclaim skipped: %v", err)
+				log.Printf("[maintenance] startup maintenance skipped: %v", err)
 			}
 			return
 		}
-		if err := s.ensureStorageReclaimed(s.runtimeCtx); err != nil && !errors.Is(err, context.Canceled) {
+		maintenanceCtx, cancel := context.WithTimeout(s.runtimeCtx, storageCleanupTimeout)
+		defer cancel()
+		stageStarted := time.Now()
+		if err := s.pruneConversationHistories(maintenanceCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[maintenance] prune conversation history: %v", err)
+		}
+		log.Printf("[maintenance] prune conversation history finished elapsed_ms=%d", time.Since(stageStarted).Milliseconds())
+		stageStarted = time.Now()
+		if err := s.ensureConversationDeleteIntegrity(maintenanceCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[maintenance] conversation delete integrity: %v", err)
+		}
+		log.Printf("[maintenance] conversation delete integrity finished elapsed_ms=%d", time.Since(stageStarted).Milliseconds())
+		// 空间回收仍在同一批维护中执行，且共享有界上下文；客户端请求
+		// 断开不会让删除/VACUUM 半途取消，也不会让维护无限期运行。
+		stageStarted = time.Now()
+		if err := s.ensureStorageReclaimed(maintenanceCtx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[maintenance] storage reclaim: %v", err)
 		}
+		log.Printf("[maintenance] storage reclaim finished elapsed_ms=%d total_elapsed_ms=%d", time.Since(stageStarted).Milliseconds(), time.Since(maintenanceStarted).Milliseconds())
 	}()
 }
 
@@ -3310,12 +3390,9 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// is_current is the project-level current conversation shared by every
-	// connected client. Keep its transition ordered so its partial unique index
-	// is never briefly violated, but never use it to decide whether another
-	// conversation may run.
-	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
+	// Resolve profile metadata before the short write transaction below. Runner
+	// readiness checks may probe SSH/WSL and must not hold SQLite or the global
+	// lifecycle lock while they wait on the network.
 	now := time.Now().UTC()
 	sessionID := uuid.NewString()
 	c := Conversation{ID: uuid.NewString(), ProjectID: projectID, ClaudeSessionID: sessionID, AgentID: input.AgentID, AgentSessionID: sessionID, AgentRuntimeID: projectRunner, ExecutionPolicy: input.PermissionMode, Status: "idle", PermissionMode: input.PermissionMode, Title: "新会话", LastActivityAt: now, IsCurrent: true, CreatedAt: now}
@@ -3332,6 +3409,18 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	c.AgentProfileRevisionID = selection.ProfileRevisionID
 	c.ProjectAgentRouteRevisionID = selection.RouteRevisionID
+	var profile *AgentRuntimeProfile
+	if input.AgentID == "codex" && !strings.HasPrefix(projectRunner, "ssh-") {
+		profile, err = s.runtimeProfileTx(r.Context(), tx, selection.ProfileRevisionID, projectRunner, input.AgentID)
+		if err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if input.AgentID == "codex" {
 		if strings.HasPrefix(projectRunner, "ssh-") {
 			runner, ok := s.runnerRegistry.get(projectRunner)
@@ -3345,11 +3434,6 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			profile, profileErr := s.runtimeProfileTx(r.Context(), tx, selection.ProfileRevisionID, projectRunner, input.AgentID)
-			if profileErr != nil {
-				writeError(w, http.StatusConflict, profileErr)
-				return
-			}
 			target := s.resolveAgentTargetEnv(projectRunner, projectPathForTarget)
 			if target == agentTargetEnvWindows && runtime.GOOS != "windows" {
 				// 跨端 Codex（WSL 服务端→Windows 侧）：按 Windows 目标环境探测。
@@ -3374,6 +3458,18 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// is_current is the project-level current conversation shared by every
+	// connected client. Keep its transition ordered so its partial unique index
+	// is never briefly violated, but do not hold this lock during readiness
+	// probes above.
+	s.projectLifecycleMu.Lock()
+	defer s.projectLifecycleMu.Unlock()
+	tx, err = s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
 	if newSession {
 		if _, err = tx.ExecContext(r.Context(), `update conversations set is_current=0 where project_id=$1 and is_current=1`, projectID); err != nil {
 			writeError(w, 500, err)
@@ -3539,16 +3635,10 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	tx, err := s.db.BeginTx(r.Context(), nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
 	var previous Conversation
 	var projectRunner string
 	var previousWorkspaceID string
-	err = tx.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,c.active_workspace_id,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.AgentProfileRevisionID, &previous.ProjectAgentRouteRevisionID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.ModelOverride, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &previousWorkspaceID, &projectRunner)
+	err := s.db.QueryRowContext(r.Context(), `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,c.active_workspace_id,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&previous.ID, &previous.ProjectID, &previous.ClaudeSessionID, &previous.AgentID, &previous.AgentSessionID, &previous.AgentRuntimeID, &previous.AgentProfileRevisionID, &previous.ProjectAgentRouteRevisionID, &previous.ExecutionPolicy, &previous.Status, &previous.PermissionMode, &previous.ModelOverride, &previous.Title, &previous.LastActivityAt, &previous.ClaudeInitialized, &previous.AgentInitialized, &previous.IsCurrent, &previous.CreatedAt, &previousWorkspaceID, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
@@ -3571,6 +3661,12 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	sessionID := uuid.NewString()
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
 	// A cleared conversation remains readable history, but must never accept a
 	// later turn: its native session is being stopped below. Preserve another
 	// tab's shared selection when clearing a background conversation.
@@ -3713,15 +3809,26 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("stop the active agent run before deleting the conversation"))
 		return
 	}
+	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, "conversation-delete:"+conversationID)
+	if !acquired {
+		writeError(w, http.StatusConflict, s.projectWorkspaceOccupiedError(projectID))
+		return
+	}
+	defer releaseWorkspace()
 	// Remove the conversation's isolated Git worktrees before the row is
 	// dropped; after deletion the cascade makes them unreachable for project
-	// cleanup. Cleanup is best-effort so a Git failure never blocks history
-	// deletion.
+	// cleanup. Git cleanup can take seconds, so release the global lifecycle
+	// lock while it runs and reacquire it before the database delete. The final
+	// delete remains serialized with project/conversation lifecycle changes.
+	s.projectLifecycleMu.Unlock()
+	locked = false
 	cleanupCtx, cleanupCancel := context.WithTimeout(s.runtimeCtx, conversationWorktreeCleanupTimeout)
 	if err := s.removeConversationWorktrees(cleanupCtx, projectID, conversationID); err != nil {
 		log.Printf("delete conversation %s: remove isolated worktrees: %v", conversationID, err)
 	}
 	cleanupCancel()
+	s.projectLifecycleMu.Lock()
+	locked = true
 
 	tx, err := s.db.BeginTx(s.runtimeCtx, nil)
 	if err != nil {
@@ -3854,6 +3961,12 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusOK, deleteConversationsResult{Deleted: 0, Skipped: skipped})
 		return
 	}
+	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, "conversations-delete")
+	if !acquired {
+		writeError(w, http.StatusConflict, s.projectWorkspaceOccupiedError(projectID))
+		return
+	}
+	defer releaseWorkspace()
 
 	// Remove isolated worktrees owned by the conversations being deleted before
 	// their workspace rows cascade away.
@@ -3932,8 +4045,17 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, errors.New("conversation not found"))
 		return
 	}
+	cutoff, err := s.conversationCheckpointCutoff(r.Context(), id)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
 	messageQuery := `select id,conversation_id,run_id,role,content,parent_tool_use_id,created_at from messages where conversation_id=?`
 	messageArgs := []any{id}
+	if cutoff != nil {
+		messageQuery += ` and created_at <= ?`
+		messageArgs = append(messageArgs, *cutoff)
+	}
 	if cursor.Message != nil {
 		messageQuery += ` and (created_at < ? or (created_at = ? and id < ?))`
 		messageArgs = append(messageArgs, cursor.Message.CreatedAt, cursor.Message.CreatedAt, cursor.Message.ID)
@@ -3995,6 +4117,10 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	// replayableEventsPredicate。
 	eventQuery := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=? and ` + replayableEventsPredicate("events")
 	eventArgs := []any{id}
+	if cutoff != nil {
+		eventQuery += ` and created_at <= ?`
+		eventArgs = append(eventArgs, *cutoff)
+	}
 	if cursor.Event != nil {
 		eventQuery += ` and (created_at < ? or (created_at = ? and id < ?))`
 		eventArgs = append(eventArgs, cursor.Event.CreatedAt, cursor.Event.CreatedAt, cursor.Event.ID)
@@ -4104,7 +4230,17 @@ func (s *Server) listConversationActivity(w http.ResponseWriter, r *http.Request
 
 		item := conversationActivityItem{ConversationID: cursor.ConversationID, Events: []Event{}}
 		var latest conversationPagePosition
-		err = s.db.QueryRowContext(r.Context(), `select created_at,id from events where conversation_id=? order by created_at desc,id desc limit 1`, cursor.ConversationID).Scan(&latest.CreatedAt, &latest.ID)
+		latestQuery := `select created_at,id from events where conversation_id=?`
+		latestArgs := []any{cursor.ConversationID}
+		if cutoff, cutoffErr := s.conversationCheckpointCutoff(r.Context(), cursor.ConversationID); cutoffErr != nil {
+			writeError(w, http.StatusInternalServerError, cutoffErr)
+			return
+		} else if cutoff != nil {
+			latestQuery += ` and created_at <= ?`
+			latestArgs = append(latestArgs, *cutoff)
+		}
+		latestQuery += ` order by created_at desc,id desc limit 1`
+		err = s.db.QueryRowContext(r.Context(), latestQuery, latestArgs...).Scan(&latest.CreatedAt, &latest.ID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -4113,8 +4249,17 @@ func (s *Server) listConversationActivity(w http.ResponseWriter, r *http.Request
 			item.LatestPosition = &latest
 		}
 
-		query := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=?`
+	query := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=?`
 		args := []any{cursor.ConversationID}
+	cutoff, cutoffErr := s.conversationCheckpointCutoff(r.Context(), cursor.ConversationID)
+	if cutoffErr != nil {
+		writeError(w, http.StatusInternalServerError, cutoffErr)
+		return
+	}
+	if cutoff != nil {
+		query += ` and created_at <= ?`
+		args = append(args, *cutoff)
+	}
 		if cursor.After != nil {
 			query += ` and (created_at > ? or (created_at = ? and id > ?))`
 			args = append(args, cursor.After.CreatedAt, cursor.After.CreatedAt, cursor.After.ID)
@@ -4174,7 +4319,18 @@ func (s *Server) listInputHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select content from messages where conversation_id=? and role='user' order by created_at desc limit ?`, conversationID, limit)
+	query := `select content from messages where conversation_id=? and role='user'`
+	args := []any{conversationID}
+	if cutoff, cutoffErr := s.conversationCheckpointCutoff(r.Context(), conversationID); cutoffErr != nil {
+		writeError(w, http.StatusInternalServerError, cutoffErr)
+		return
+	} else if cutoff != nil {
+		query += ` and created_at <= ?`
+		args = append(args, *cutoff)
+	}
+	query += ` order by created_at desc limit ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -5129,7 +5285,12 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	// Do not hold a database transaction while waiting for either of these
 	// locks. updateClaude takes the maintenance lock before querying SQLite.
 	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
+	lifecycleLocked := true
+	defer func() {
+		if lifecycleLocked {
+			s.projectLifecycleMu.Unlock()
+		}
+	}()
 	if clientRequestID != "" {
 		existing, found, err := messageForClientRequest(ctx, s.db, conversationID, clientRequestID)
 		if err != nil {
@@ -5244,6 +5405,28 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 	projectRoot := projectPath
 	projectPath = workspace.Path
+	// Admit the conversation workspace before releasing the lifecycle lock. It
+	// serializes concurrent turns for the same workspace while readiness probes
+	// run without holding SQLite or the global lock.
+	workspaceOwner := "conversation:" + conversation.ID
+	workspaceKey := workspaceLeaseKey(Project{ID: conversation.ProjectID, Path: projectRoot}, ConversationWorkspace{ID: workspace.ID, Path: workspace.Path})
+	releaseWorkspace, acquired := s.acquireWorkspace(workspaceKey, workspaceOwner)
+	if !acquired {
+		return Message{}, "", nil, http.StatusConflict, s.workspaceOccupiedError(workspaceKey)
+	}
+	workspaceAdmitted := false
+	defer func() {
+		if !workspaceAdmitted {
+			releaseWorkspace()
+		}
+	}()
+	// All profile data needed by readiness checks is now in memory. Commit the
+	// read/selection phase before probing SSH/WSL/CLI readiness.
+	if err = tx.Commit(); err != nil {
+		return Message{}, "", nil, http.StatusInternalServerError, err
+	}
+	s.projectLifecycleMu.Unlock()
+	lifecycleLocked = false
 	// Select the runner for this specific project by its target environment
 	// (docs/20 §3.3). SSH projects resolve through the registry; local Windows/WSL
 	// projects route to the runner for their resolved target environment so a
@@ -5322,20 +5505,15 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			return Message{}, "", nil, http.StatusConflict, err
 		}
 	}
-	// A non-streaming conversation is also serialized by this conversation's
-	// persistent Run queue, so its queued turns must share the same lease.
-	workspaceOwner := "conversation:" + conversation.ID
-	workspaceKey := workspaceLeaseKey(Project{ID: conversation.ProjectID, Path: projectRoot}, ConversationWorkspace{ID: workspace.ID, Path: workspace.Path})
-	releaseWorkspace, acquired := s.acquireWorkspace(workspaceKey, workspaceOwner)
-	if !acquired {
-		return Message{}, "", nil, http.StatusConflict, s.workspaceOccupiedError(workspaceKey)
+	// Reacquire the lifecycle lock and a short transaction for the durable run
+	// admission. The external readiness checks above must stay outside both.
+	s.projectLifecycleMu.Lock()
+	lifecycleLocked = true
+	tx, err = s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Message{}, "", nil, http.StatusInternalServerError, err
 	}
-	workspaceAdmitted := false
-	defer func() {
-		if !workspaceAdmitted {
-			releaseWorkspace()
-		}
-	}()
+	defer tx.Rollback()
 	if record != nil && record.Task != nil {
 		if err := s.validateTaskDispatchTx(ctx, tx, *record.Task, conversation, record.Orchestrated); err != nil {
 			return Message{}, "", nil, http.StatusConflict, err
@@ -5574,6 +5752,9 @@ func (s *Server) acquireGitIndexLock(workspaceKey string) (func(), bool) {
 // worktrees use their cleaned absolute path and can therefore run in parallel.
 func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
 	s.mu.Lock()
+	if s.projectWorkspaceLeases == nil {
+		s.projectWorkspaceLeases = make(map[string]*projectWorkspaceLease)
+	}
 	if s.gitIndexActive[workspaceKey] && !isAIWorkspaceOwner(owner) {
 		s.mu.Unlock()
 		return nil, false
@@ -5721,7 +5902,7 @@ func (s *Server) submitStreamingRunWithProfile(ctx context.Context, runner Strea
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
 	}
-	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID, Profile: profile, Model: runModel(conversation.ModelOverride, profile)}
+	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID)}
 	if err := s.beginStreamingRun(ctx, runID); err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
@@ -5785,7 +5966,7 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	mcpKey := "sess-" + conversation.ID
 	injection := s.prepareMCPInjection(ctx, conversation.ProjectID, projectPath, conversation.AgentID, runnerID, mcpKey)
 	s.setMCPAutoApprove(conversation.ID, injection.AutoApproveTools)
-	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, Model: runModel(conversation.ModelOverride, profile), MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools})
+	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID), MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools})
 	if err != nil {
 		injection.done()
 		s.clearMCPAutoApprove(conversation.ID)
@@ -5967,6 +6148,7 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		AgentID:             c.AgentID,
 		Profile:             profile,
 		Model:               runModel(c.ModelOverride, profile),
+		ReasoningEffort:     s.conversationReasoningEffort(ctx, c.ID),
 		MCPConfigPath:       injection.localConfigPath(),
 		MCPConfigJSON:       injection.remoteJSON(),
 		MCPKey:              runID,
@@ -6292,6 +6474,14 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 		if err != nil {
 			tx.Rollback()
 		}
+	if committed && status == "completed" && runErr == nil {
+		var prompt string
+		if err := s.db.QueryRowContext(context.Background(), `select content from messages where run_id=? and role='user' order by created_at asc,id asc limit 1`, runID).Scan(&prompt); err == nil {
+			if err := s.createConversationCheckpoint(context.Background(), conversationID, runID, prompt); err != nil {
+				log.Printf("create conversation checkpoint for run %s: %v", runID, err)
+			}
+		}
+	}
 	}
 	payload := map[string]any{"status": status, "error": errorText(runErr)}
 	// Attach taskId so the frontend can link error cards to the task detail page.
@@ -8215,7 +8405,12 @@ func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			s.projectLifecycleMu.Unlock()
+		}
+	}()
 	projectID := chi.URLParam(r, "projectID")
 	resolved, err := s.resolveRequestWorkspaceFromRequest(r)
 	project := resolved.Project
@@ -8291,6 +8486,11 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// Starting a local/WSL/SSH process may perform external I/O. The runner's
+	// own operation mutex and retired state protect this operation; do not keep
+	// the global lifecycle lock while waiting for it.
+	s.projectLifecycleMu.Unlock()
+	locked = false
 	if err := runner.StartWithConfig(s.runtimeCtx, resolved.Workspace.Path, cfg.WorkDir, selected.Command, mergedRunEnvVars(cfg.EnvVars, selected), cfg.ExecutionTarget); err != nil {
 		writeError(w, 409, err)
 		return
@@ -8324,7 +8524,12 @@ func (s *Server) stopProjectRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			s.projectLifecycleMu.Unlock()
+		}
+	}()
 	projectID := chi.URLParam(r, "projectID")
 	resolved, err := s.resolveRequestWorkspaceFromRequest(r)
 	project := resolved.Project
@@ -8380,6 +8585,8 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.projectLifecycleMu.Unlock()
+	locked = false
 	if err := runner.RestartWithConfig(s.runtimeCtx, resolved.Workspace.Path, cfg.WorkDir, selected.Command, mergedRunEnvVars(cfg.EnvVars, selected), cfg.ExecutionTarget); err != nil {
 		writeError(w, 409, err)
 		return

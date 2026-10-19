@@ -965,9 +965,13 @@ func parseRemoteTimestamp(value any) (time.Time, error) {
 //
 // 取的是"真能渲染成卡片"的那些：窗口定长，被心跳占掉的位置就是用户看不到的卡片
 // （见 unrenderedSystemSubtypePredicate）。
-func (s *Server) remoteConversationNotices(ctx context.Context, conversationID string) ([]remoteSnapshotNotice, error) {
+type remoteSnapshotQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func readRemoteConversationNotices(ctx context.Context, queryer remoteSnapshotQueryer, conversationID string) ([]remoteSnapshotNotice, error) {
 	query := fmt.Sprintf(`select id,run_id,type,payload,created_at from events where conversation_id=? and %s order by created_at desc,id desc limit ?`, remoteNoticeReplayPredicate("events"))
-	rows, err := s.db.QueryContext(ctx, query, conversationID, remoteSnapshotNoticesPerConversation)
+	rows, err := queryer.QueryContext(ctx, query, conversationID, remoteSnapshotNoticesPerConversation)
 	if err != nil {
 		return nil, err
 	}
@@ -991,6 +995,14 @@ func (s *Server) remoteConversationNotices(ctx context.Context, conversationID s
 		items[left], items[right] = items[right], items[left]
 	}
 	return items, nil
+}
+
+func (s *Server) remoteConversationNotices(ctx context.Context, conversationID string) ([]remoteSnapshotNotice, error) {
+	return readRemoteConversationNotices(ctx, s.db, conversationID)
+}
+
+func remoteConversationNoticesTx(ctx context.Context, tx *sql.Tx, conversationID string) ([]remoteSnapshotNotice, error) {
+	return readRemoteConversationNotices(ctx, tx, conversationID)
 }
 
 // shrinkNoticePayload 把超出中继预算的 payload 裁到预算之内，**保留 JSON 结构**。
@@ -1182,20 +1194,27 @@ func (s *Server) remoteSnapshotSkills(ctx context.Context, project Project, agen
 }
 
 func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
+	shortcuts, shortcutsErr := s.remoteSnapshotShortcuts(r.Context())
+	tx, err := s.db.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer tx.Rollback()
 	var revision int64
-	if err := s.db.QueryRowContext(r.Context(), `select snapshot_revision from remote_instance limit 1`).Scan(&revision); err != nil {
+	if err := tx.QueryRowContext(r.Context(), `select snapshot_revision from remote_instance limit 1`).Scan(&revision); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	snapshot := remoteSnapshot{SnapshotRevision: revision, ObservedAt: time.Now().UTC(), Projects: make([]remoteSnapshotProject, 0), Shortcuts: make([]remoteSnapshotShortcut, 0)}
 	// 快捷方式库与项目/任务无关，先取一次填到顶层。取失败不让整个快照失败：
 	// 手机端拿到一份"没有快捷方式"的快照，仍能看会话、发消息，比整页空白好得多。
-	if shortcuts, err := s.remoteSnapshotShortcuts(r.Context()); err == nil {
+	if shortcutsErr == nil {
 		snapshot.Shortcuts = shortcuts
 	} else {
-		log.Printf("remote snapshot: load shortcuts: %v", err)
+		log.Printf("remote snapshot: load shortcuts: %v", shortcutsErr)
 	}
-	rows, err := s.db.QueryContext(r.Context(), `
+	rows, err := tx.QueryContext(r.Context(), `
 		select
 			p.id,
 			p.name,
@@ -1252,7 +1271,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	for index := range projects {
 		project := &projects[index]
 		project.Tasks = make([]remoteSnapshotTask, 0)
-		taskRows, err := s.db.QueryContext(r.Context(), `select id,title,description,priority,status,updated_at from tasks where project_id=? order by position,id`, project.ID)
+		taskRows, err := tx.QueryContext(r.Context(), `select id,title,description,priority,status,updated_at from tasks where project_id=? order by position,id`, project.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -1274,7 +1293,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 		taskRows.Close()
 		project.Conversations = make([]remoteSnapshotConversation, 0) // The active conversation is enough to make a project immediately usable
 		// on mobile. Do not turn a recovery snapshot into a full history export.
-		conversationRows, err := s.db.QueryContext(r.Context(), `select id,title,status,agent_id,last_activity_at,is_current from conversations where project_id=? order by is_current desc,last_activity_at desc,id desc limit ?`, project.ID, remoteSnapshotConversationsPerProject)
+		conversationRows, err := tx.QueryContext(r.Context(), `select id,title,status,agent_id,last_activity_at,is_current from conversations where project_id=? order by is_current desc,last_activity_at desc,id desc limit ?`, project.ID, remoteSnapshotConversationsPerProject)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -1299,7 +1318,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			conversation := &project.Conversations[0]
 			// 消息从最新往回装，装到预算用尽为止（详见 remoteSnapshotMessageBudget）。
 			// 每条最多吃掉「预算 - reserve」，超出的部分截断并留下标记。
-			messageRows, err := s.db.QueryContext(r.Context(), `select id,run_id,role,content,created_at from messages where conversation_id=? and parent_tool_use_id='' order by created_at desc,id desc limit ?`, conversation.ID, remoteSnapshotMessagesPerConversation)
+			messageRows, err := tx.QueryContext(r.Context(), `select id,run_id,role,content,created_at from messages where conversation_id=? and parent_tool_use_id='' order by created_at desc,id desc limit ?`, conversation.ID, remoteSnapshotMessagesPerConversation)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -1346,7 +1365,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			for left, right := 0, len(conversation.Messages)-1; left < right; left, right = left+1, right-1 {
 				conversation.Messages[left], conversation.Messages[right] = conversation.Messages[right], conversation.Messages[left]
 			}
-			notices, err := s.remoteConversationNotices(r.Context(), conversation.ID)
+			notices, err := remoteConversationNoticesTx(r.Context(), tx, conversation.ID)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -1359,15 +1378,23 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 		// 没有会话的项目直接跳过扫描：手机端打不开这种项目（点进去是"选 Agent 建会话"），
 		// 而扫描本地技能目录会顺带触发 WSL 探测、远端 runner 更是要走一次 SSH find+cat ——
 		// 每个项目每 60 秒白跑一次不值得。
-		project.Skills = []Skill{}
-		if len(project.Conversations) > 0 {
-			if stored, err := s.getProjectByID(r.Context(), project.ID); err == nil {
-				project.Skills = s.remoteSnapshotSkills(r.Context(), stored, project.Conversations[0].AgentID)
-			} else {
-				log.Printf("remote snapshot: load project %s for skills: %v", project.ID, err)
-			}
-		}
 		snapshot.Projects = append(snapshot.Projects, *project)
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	for index := range snapshot.Projects {
+		project := &snapshot.Projects[index]
+		project.Skills = []Skill{}
+		if len(project.Conversations) == 0 {
+			continue
+		}
+		if stored, err := s.getProjectByID(r.Context(), project.ID); err == nil {
+			project.Skills = s.remoteSnapshotSkills(r.Context(), stored, project.Conversations[0].AgentID)
+		} else {
+			log.Printf("remote snapshot: load project %s for skills: %v", project.ID, err)
+		}
 	}
 	writeJSON(w, http.StatusOK, snapshot)
 }

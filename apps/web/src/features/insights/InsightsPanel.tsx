@@ -47,6 +47,7 @@ function TypeIcon({ type }: { type: InsightType }) {
     style: <><path d="M12 3.5a8.5 8.5 0 1 0 0 17h1.2a2.3 2.3 0 0 0 0-4.6H12a2.3 2.3 0 0 1 0-4.6h5.5a2.3 2.3 0 0 0 2.3-2.3A8.5 8.5 0 0 0 12 3.5Z" /><circle cx="8.5" cy="9.5" r="1" /><circle cx="12" cy="7.5" r="1" /></>,
     optimization: <path d="M12 3.5v2M3.5 12h2M18.5 12h2M12 18.5v2M5.6 5.6 7 7M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4" />,
     feature: <path d="M12 5v14M5 12h14" />,
+    cleanup: <><path d="m5 16 9-9 4 4-9 9H5v-4Z" /><path d="m13 8 2-2 4 4-2 2M4 20h16" /></>,
   };
   return <svg className="insight-type-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{icons[type]}</svg>;
 }
@@ -67,11 +68,13 @@ function formatLogTime(ts: string): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }: {
+export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, defaultAgentID, onAgentChange }: {
   projectID: string;
   runnerID: string;
   request: Request;
   fail: (message: string) => void;
+  defaultAgentID?: InsightAgent;
+  onAgentChange?: (agentID: InsightAgent) => void;
   // 点击卡片的"查看文件"时跳转到文件页并打开该文件（未提供则只展示路径）。
   onOpenFile?: (path: string) => void;
 }) {
@@ -90,8 +93,8 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }
   const [findingsLimit, setFindingsLimit] = useState(0);
   const [filter, setFilter] = useState<InsightFilter>("all");
   const [theme, setTheme] = useState<InsightTheme>("");
-  const [agent, setAgent] = useState<InsightAgent>("claude-code");
-  // 默认全部分类选中：后端对"四类全勾选"会归一为空（全查），故 UI 初始即全部勾选，
+  const [agent, setAgent] = useState<InsightAgent>(defaultAgentID ?? "claude-code");
+  // 默认全部分类选中：后端对"全部类型全勾选"会归一为空（全查），故 UI 初始即全部勾选，
   // 既符合后端语义也让"全部分类"按钮保持激活态；用户仍可逐个取消来收窄（最后一项
   // 由 toggleInsightType 拦住，见那里的说明）。
   const [focusTypes, setFocusTypes] = useState<InsightType[]>([...insightTypeOrder]);
@@ -173,7 +176,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }
     setScan(res.scan);
     if (!agentSelectionInitializedRef.current) {
       agentSelectionInitializedRef.current = true;
-      const initialAgent = knownAgentID(res.scan?.agent ?? res.defaultAgent);
+      const initialAgent = defaultAgentID ?? knownAgentID(res.scan?.agent ?? res.defaultAgent);
       // 服务端可能报出一个前端还不认识的工具；那种情况保持当前选择，
       // 而不是回落成某一个已知工具（那会把"不知道"说成"就是它"）。
       if (initialAgent) {
@@ -222,7 +225,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }
     setHasScan(res.hasScan);
     setSuppressed(res.suppressedCount);
     setOpenCount(res.openCount ?? res.findings.length);
-  }, [projectID, request]);
+  }, [defaultAgentID, projectID, request]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -231,7 +234,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }
 
   useEffect(() => {
     agentSelectionInitializedRef.current = false;
-    setAgent("claude-code");
+    setAgent(defaultAgentID ?? "claude-code");
     setFocusTypes([...insightTypeOrder]);
     // 切换项目：清掉上一个项目的事件游标与日志，避免把两个项目的进度混排。
     scanIdRef.current = null;
@@ -240,7 +243,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }
     // 选择集是"上一个项目的 id"，留着必然全部失配（删除按钮还会带着它们发出去）。
     setSelectMode(false);
     setSelected(new Set());
-  }, [projectID]);
+  }, [defaultAgentID, projectID]);
 
   useEffect(() => {
     void loadInsights().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载优化建议"); });
@@ -327,6 +330,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile }
   const selectAgent = (nextAgent: InsightAgent) => {
     agentSelectionInitializedRef.current = true;
     setAgent(nextAgent);
+    onAgentChange?.(nextAgent);
   };
 
   // 验证全部有效建议：调 AI 复核每条在当前代码里是否仍然成立（项目可能已被

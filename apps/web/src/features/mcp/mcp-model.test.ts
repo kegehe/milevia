@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseKeyValueLines, parseLines, presetGuidanceLines, runtimeCommandsFor, serviceLogoKey, transportLabel, wizardStartsAt } from "./mcp-model.ts";
-import type { MCPPreset } from "../../lib/types.ts";
+import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseCustomMCPConfig, parseKeyValueLines, parseLines, presetGuidanceLines, redactedMCPConfig, runtimeCommandsFor, serviceLogoKey, transportLabel, uniqueMCPName, wizardStartsAt } from "./mcp-model.ts";
+import type { MCPPreset, MCPServer } from "../../lib/types.ts";
 
 // 2026-09-15 修的模板缺陷里，凡是「靠几行代码的顺序 / 优先级成立」的规则都放在这里做**行为**断言。
 // 起因：变异检验发现「运行时检查不再采用模板声明的依赖」这种变异**扫源码的断言挡不住**
@@ -276,9 +276,54 @@ test("serviceLogoKey：官方图标按预设名白名单映射，认不出回落
   for (const name of ["notion", "linear", "sentry", "slack", "stripe", "playwright", "context7"]) {
     assert.equal(serviceLogoKey(name), name);
   }
+  assert.equal(serviceLogoKey("aliyun"), "aliyun");
   // 白名单外（filesystem / fetch / memory / 未知的未来条目）回落 null → 页面退回示意图标。
   assert.equal(serviceLogoKey("filesystem"), null);
   assert.equal(serviceLogoKey("fetch"), null);
   assert.equal(serviceLogoKey("memory"), null);
   assert.equal(serviceLogoKey("some-future-service"), null);
+});
+
+test("自定义 MCP 配置支持 mcpServers、多条目和传输类型识别", () => {
+  const configs = parseCustomMCPConfig(JSON.stringify({ mcpServers: {
+    local: { command: "npx", args: ["-y", "demo"], env: { API_KEY: "secret-value" } },
+    remote: { url: "https://example.test/mcp", headers: { Authorization: "Bearer ${TOKEN}" } },
+  } }));
+  assert.equal(configs.length, 2);
+  assert.equal(configs[0].transport, "stdio");
+  assert.deepEqual(configs[0].envSecrets, { API_KEY: "secret-value" });
+  assert.deepEqual(configs[0].env, {});
+  assert.equal(configs[1].transport, "http");
+  assert.deepEqual(configs[1].headers, { Authorization: "Bearer ${TOKEN}" });
+  const single = parseCustomMCPConfig(JSON.stringify({ name: "single", url: "https://example.test/mcp" }));
+  assert.equal(single.length, 1);
+  assert.equal(single[0].name, "single");
+  const sse = parseCustomMCPConfig(JSON.stringify({ mcpServers: { legacy: { type: "sse", url: "https://example.test/sse" } } }));
+  assert.equal(sse[0].transport, "sse");
+  const cursor = parseCustomMCPConfig(JSON.stringify({ servers: { cursor: { command: "cursor-mcp", env: { REGION: "cn" } } } }));
+  assert.deepEqual(cursor[0].envSecrets, { REGION: "cn" });
+  const codex = parseCustomMCPConfig(JSON.stringify({ mcp_servers: { codex: { url: "https://example.test/mcp", bearer_token_env_var: "CODEX_TOKEN" } } }));
+  assert.equal(codex[0].headers.Authorization, "Bearer ${CODEX_TOKEN}");
+});
+
+test("复制 MCP 设置默认脱敏环境变量和请求头", () => {
+  const server = {
+    id: "1", name: "demo", displayName: "Demo", description: "", transport: "http",
+    command: "", args: [], env: { REGION: "cn" }, envSecretKeys: ["API_KEY"],
+    headers: { "X-Mode": "safe" }, headerSecretKeys: ["Authorization"],
+    url: "https://example.test/mcp", scope: "global", projectId: "", environments: ["windows"],
+    agents: ["claude-code"], enabled: true, autoApproveTools: [], source: "manual",
+  } as MCPServer;
+  const output = redactedMCPConfig(server);
+  assert.match(output, /"API_KEY": "\$\{API_KEY\}"/);
+  assert.match(output, /"Authorization": "\$\{Authorization\}"/);
+  assert.doesNotMatch(output, /secret-value/);
+  assert.match(redactedMCPConfig(server, "single"), /"name": "demo"/);
+});
+
+test("重名导入会生成稳定的递增名称", () => {
+  assert.equal(uniqueMCPName("demo", []), "demo");
+  assert.equal(uniqueMCPName("demo", ["demo"]), "demo-2");
+  assert.equal(uniqueMCPName("demo", ["demo", "demo-2"]), "demo-3");
+  assert.equal(uniqueMCPName("demo.service", []), "demo-service");
 });

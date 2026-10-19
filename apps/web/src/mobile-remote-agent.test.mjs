@@ -207,12 +207,8 @@ test("mobile snapshots normalize missing revisions for offline recovery", () => 
 test("mobile snapshots retain realtime messages until the snapshot contains them", () => {
   // 快捷命令完成后，快照版本可能先前进、消息稍后才落库。实时消息不能因为版本更大而被丢掉，
   // 否则界面会出现“先显示、再消失、下一轮快照又出现”的闪烁。
-  const realtimeMerge = page.match(/const extras = \[\.\.\.realtimeMessages\.values\(\)\][\s\S]*?return changed \|\| extras\.length > 0 \? \{ \.\.\.entry, messages: \[\.\.\.messages, \.\.\.extras\] \} : entry;/)?.[0] ?? "";
-  assert.ok(realtimeMerge, "找不到实时消息与快照的合并逻辑");
-  assert.match(realtimeMerge, /item\.conversationId === entry\.id/);
-  assert.match(realtimeMerge, /!entry\.messages\.some\(\(message\) => message\.id === item\.message\.id\)/);
-  assert.match(realtimeMerge, /item\.revision >= baseline/);
-  assert.doesNotMatch(realtimeMerge, /item\.revision >= value\.snapshotRevision/);
+  assert.match(page, /import \{ mergeSnapshotRealtimeMessages \} from "\.\.\/features\/remote\/snapshot-realtime-merge";/);
+  assert.match(page, /merged = mergeSnapshotRealtimeMessages\(merged, realtimeMessagesRef\.current, baseline\);/);
 });
 
 test("mobile projects without a conversation open agent selection before creating", () => {
@@ -409,10 +405,8 @@ test("mobile retries a pending CLI probe without waiting for a business event", 
   assert.ok(pendingRefresh, "找不到 CLI 探测中的快照刷新");
   assert.match(pendingRefresh, /loadSnapshot\(\{ force: true, silent: true \}\)/);
   assert.match(pendingRefresh, /3000/);
-  const loadSnapshot = page.match(/const loadSnapshot = useCallback\([\s\S]*?\n  \}, \[instanceID\]\);/)?.[0] ?? "";
-  assert.match(loadSnapshot, /silent\?: boolean/);
-  assert.match(loadSnapshot, /if \(!options\?\.silent\) setError\(""\)/);
-  assert.match(loadSnapshot, /if \(!options\?\.silent\) setError\(reason\)/);
+  assert.match(page, /import \{ useRemoteSnapshotLoader \} from "\.\.\/features\/remote\/use-remote-snapshot-loader";/);
+  assert.match(page, /reportError: setError,/);
 });
 
 test("mobile message bubbles size to their content and point at the sender", () => {
@@ -2463,12 +2457,12 @@ test("mobile keeps run status notices across snapshot refreshes", () => {
   // 快照里给的是事件原文（type + payload），必须走同一个解析函数——否则会出现
   // "实时到达时是正常状态卡，刷新之后变成一张没有类型、配色全丢的空卡"
   //（真机探针实测：variant 变成 undefined，六张卡一起失去配色）。
-  assert.match(page, /const serverNotices = noticesFromSnapshot\(entry\.notices\);/);
-  assert.match(page, /return \{ \.\.\.entry, notices: mergeNotices\(serverNotices, remaining\) \};/);
+  assert.match(page, /import \{ mergeSnapshotNotices \} from "\.\.\/features\/remote\/snapshot-notice-merge";/);
+  assert.match(page, /return mergeSnapshotNotices\(merged, pendingNoticesRef\.current, noticesFromSnapshot, mergeNotices\);/);
   assert.match(page, /function noticesFromSnapshot\(raw: unknown\): RemoteNotice\[\] \{/);
-  // 已进入快照的记录从本地表移除，这张表才不会无限增长；但 replace 型（工具确认）
-  // 必须留着——快照可能比它旧，清掉就会让状态倒退。
-  assert.match(page, /const remaining = local\.filter\(\(notice\) => notice\.merge === "replace" \|\| !serverIDs\.has\(notice\.id\)\);/);
+  // 归并模块独立测试覆盖「已进入快照的记录从本地表移除」与 replace 型记录保留的行为；
+  // 页面只负责把当前的 pending ref 接入该模块。
+  assert.match(page, /mergeSnapshotNotices\(merged, pendingNoticesRef\.current, noticesFromSnapshot, mergeNotices\)/);
   assert.match(page, /if \(\(Date\.parse\(notice\.createdAt\) \|\| 0\) < \(Date\.parse\(existing\.createdAt\) \|\| 0\)\) return current;/);
   // 实例切换要清空：另一个实例里恰好同 id 的会话不该继承上一台的记录。
   assert.match(page, /pendingNoticesRef\.current\.clear\(\);/);
@@ -2592,44 +2586,20 @@ test("mobile refresh actually re-fetches and reports the outcome", () => {
   //      2026-09-17 已随方案 B 撤掉；这条历史依据保留，因为它解释的是状态条为什么必须带时刻。）
   // 修法：手动刷新强制取全量并回传结构化结果（updated / unchanged / failed / skipped），
   //      按钮忙碌时禁用 + 转圈，结果写成一条带时刻的状态条。
-  const snapBody = page.match(/const loadSnapshot = useCallback\(async \(options\?: \{ force\?: boolean; instanceId\?: string; silent\?: boolean \}\)[\s\S]*?\n  \}, \[instanceID\]\);/)?.[0] ?? "";
-  // 锚点先自证存在：抠不到函数体时下面的断言会退化成对空串匹配，全部恒假/恒真。
-  assert.ok(snapBody, "找不到 loadSnapshot（签名变了就更新本用例的锚点）");
-  // ① force 必须真的绕过 revision：照旧拼 ?revision= 的话，用户点刷新还是会拿到
-  //    {unchanged:true}，界面照样一动不动。
-  assert.match(snapBody, /const query = force \? "" : `\?revision=\$\{baseline\}`;/);
-  assert.match(snapBody, /snapshot\$\{query\}/);
-  assert.doesNotMatch(snapBody, /\/snapshot\?revision=\$\{snapshotRevisionRef\.current\}/);
-  // ② 结果要如实区分"有新内容"和"没有新内容"，判据是版本号有没有前进。
-  assert.match(snapBody, /outcome: value\.snapshotRevision > baseline \? "updated" : "unchanged"/);
-  // ③ 换实例时（请求的实例 ≠ 当前选中的实例）必须丢掉旧实例的版本基线：拿 B 的版本号比 A 的，
-  //    守卫会不通过把 B 的快照整个丢掉，结果还把"什么都没应用"报成"已是最新"。
-  assert.match(snapBody, /const baseline = options\?\.instanceId && options\.instanceId !== instanceID \? -1 : snapshotRevisionRef\.current;/);
-  assert.match(snapBody, /value\.snapshotRevision >= baseline/);
-  // ④ 失败不能因为"有缓存兜底"就报成功：界面停在旧快照上，必须说失败并给出原因。
-  //    原因只写"无法连接云端"，"当前显示的是最近一次同步快照"交给页面错误条说一次，
-  //    免得同一条提示连着出现两遍。
-  assert.match(snapBody, /return \{ outcome: "failed", snapshot: cachedValue, reason: "无法连接云端" \};/);
-  assert.match(snapBody, /if \(!options\?\.silent\) setError\(reason\);/);
-  // ⑤ 刷新可以指定实例：实例列表刚被重拉过，选中的电脑可能已经失效并被换掉。
-  assert.match(snapBody, /const target = options\?\.instanceId \|\| instanceID;/);
-  assert.match(snapBody, /encodeURIComponent\(target\)/);
+  assert.match(page, /import \{ snapshotRequestPath \} from "\.\.\/features\/remote\/snapshot-request";/);
+  assert.match(page, /import \{ useRemoteSnapshotLoader \} from "\.\.\/features\/remote\/use-remote-snapshot-loader";/);
+  assert.match(page, /const \{ loadSnapshot, snapshotRevisionRef, resetSnapshotRevision \} = useRemoteSnapshotLoader\(\{/);
+  assert.match(page, /requestPath: snapshotRequestPath,/);
+  assert.match(page, /cacheFailureMessage: "无法连接云端",/);
+  assert.match(page, /resetSnapshotRevision\(\);/);
+  assert.match(page, /useEffect\(\(\) => \{ void loadSnapshot\(\); \}, \[instanceID, loadSnapshot\]\);/);
 
-  // 实例列表请求的结果必须三态分离（ok / failed / superseded）。列表每 5 秒被轮询拉一次，
-  // 手动刷新那一次被轮询抢答是常态：把它当失败，就会在一切正常时弹"刷新失败：没有连上云端"。
-  const instancesBody = page.match(/const loadInstances = useCallback\(async \(\): Promise<InstanceFetchResult> => \{[\s\S]*?\n  \}, \[\]\);/)?.[0] ?? "";
-  assert.ok(instancesBody, "找不到 loadInstances（签名变了就更新本用例的锚点）");
-  assert.match(page, /type InstanceFetchResult = \{ instances: Instance\[\]; outcome: "ok" \| "failed" \| "superseded"; reason\?: string \};/);
-  assert.match(instancesBody, /const superseded: InstanceFetchResult = \{ instances: \[\], outcome: "superseded" \};/);
-  assert.match(instancesBody, /return \{ instances: nextInstances, outcome: "ok" \};/);
-  assert.match(instancesBody, /return \{ instances: \[\], outcome: "failed", reason \};/);
-  // 失败原因要报给调用方（刷新按钮据此说清是网络不通还是令牌失效），不能再写死一句
-  // "没有连上云端"，写死的原因在"云端返回异常"这类失败上是错的。
-  assert.match(instancesBody, /const reason = cause instanceof TypeError/);
-  assert.match(instancesBody, /setError\(reason\);/);
-  assert.doesNotMatch(instancesBody, /return null/);
-  // 三处"被更新的请求取代"都必须返回 superseded，不能退化成 null/失败。
-  assert.ok((instancesBody.match(/return superseded;/g) || []).length >= 3, "三处 generation 过期都必须返回 superseded");
+  // 实例列表请求的三态、令牌隔离与错误语义由 useRemoteInstances 的独立行为用例覆盖；
+  // 页面只提供云端适配器和本地设备摘要回填。
+  assert.match(page, /import \{ useRemoteInstances \} from "\.\.\/features\/remote\/use-remote-instances";/);
+  assert.match(page, /const \{ instances, setInstances, instanceID, setInstanceID, loadInstances \} = useRemoteInstances<Instance>\(\{/);
+  assert.match(page, /request: \(\) => cloud<Instance\[\]>\("\/v1\/instances"\),/);
+  assert.match(page, /patchDevice: \(deviceToken, value\) => \{[\s\S]*?updateDevice\(deviceToken, value\);[\s\S]*?setDevices\(readDevices\(\)\);/);
 
   // `saveToken` 删除后，`refreshNow` 后面紧跟的是那段"这里原来有一个 saveToken"的说明注释
   // （再往后才是 `enableMobileNotifications`），所以锚点收在函数结尾 + "后面跟着注释或函数定义"。

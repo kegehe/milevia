@@ -1,0 +1,3 @@
+[http]
+# Cargo otherwise auto-detects a stale Windows localhost proxy on this machine.
+proxy = ""

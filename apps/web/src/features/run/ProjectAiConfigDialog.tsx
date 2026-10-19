@@ -28,8 +28,20 @@ type AgentConfigView = {
   // 按工具目录索引的视图（服务端派生）。claude / codex 两个键是过渡兼容，
   // 值由 agents 派生，前端不再分别读它们。
   agents?: Record<string, AgentEntry | null>;
+  cli?: Record<string, CLIConfigEntry | null>;
   claude?: AgentEntry | null;
   codex?: AgentEntry | null;
+};
+type CLIConfigEntry = {
+  source: string;
+  sourceLabel: string;
+  model?: string;
+  provider?: string;
+  baseUrl?: string;
+  wireApi?: string;
+  credentialState: string;
+  readable: boolean;
+  error?: string;
 };
 type CredentialPool = {
   currentRevisionId: string;
@@ -98,13 +110,18 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
   useEffect(() => { void refresh(); }, [refresh]);
 
   const manageable = config?.runnerManaged ?? true;
-  const entryFor = (agentId: AgentID): AgentEntry | null | undefined => config?.agents?.[agentId] ?? null;
+  const entryFor = (agentId: AgentID): AgentEntry | null | undefined => {
+    const entry = config?.agents?.[agentId] ?? null;
+    return entry?.mode === "runner_default" ? null : entry;
+  };
+  const cliEntryFor = (agentId: AgentID): CLIConfigEntry | null | undefined => config?.cli?.[agentId] ?? null;
   const draftFor = (agentId: AgentID): AgentDraft => {
     const draft = drafts[agentId];
     const entry = entryFor(agentId);
+    const cliEntry = cliEntryFor(agentId);
     return {
-      model: draft?.model ?? entry?.model ?? "",
-      baseUrl: draft?.baseUrl ?? entry?.baseUrl ?? "",
+      model: draft?.model ?? entry?.model ?? cliEntry?.model ?? "",
+      baseUrl: draft?.baseUrl ?? entry?.baseUrl ?? cliEntry?.baseUrl ?? "",
       authMode: draft?.authMode ?? (entry?.authMode === "api_key" ? "api_key" : "cli_managed"),
       apiKey: draft?.apiKey ?? "",
     };
@@ -116,6 +133,7 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
   const activeEntry = catalog.entries.find((item) => catalogAgentID(item) === activeId) ?? catalog.entries[0] ?? null;
   const id = activeEntry ? catalogAgentID(activeEntry) : null;
   const entry = id ? entryFor(id) ?? null : null;
+  const cliEntry = id ? cliEntryFor(id) ?? null : null;
   const draft = id ? draftFor(id) : null;
   const busy = saving && savingAgent === id;
   const poolRoute = entry?.mode === "pool";
@@ -287,8 +305,15 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
               {poolRoute ? <div className="project-config-pool-route">该项目正在使用凭据池。项目级设置不会覆盖池成员。</div> : <>
                 <div className="project-config-status">
                   {entry?.isDefault && <span className="project-config-badge"><i />项目默认 · 新会话生效</span>}
-                  <span className="project-config-hint">留空的项使用 CLI 默认</span>
+                  {!entry && cliEntry?.readable && <span className="project-config-badge project-config-cli-source"><i />{cliEntry.sourceLabel}</span>}
+                  <span className="project-config-hint">{entry ? "项目配置优先于 CLI 配置" : cliEntry?.error || "当前使用 CLI 配置；保存后将创建项目级配置"}</span>
                 </div>
+                {!entry && cliEntry?.readable && <div className="project-config-cli-summary">
+                  {cliEntry.provider && <span>Provider：{cliEntry.provider}</span>}
+                  {cliEntry.baseUrl && <span>Base URL：{cliEntry.baseUrl}</span>}
+                  {cliEntry.wireApi && <span>协议：{cliEntry.wireApi}</span>}
+                  <span>凭据：{cliEntry.credentialState === "configured" ? "已配置" : cliEntry.credentialState === "unknown" ? "由 CLI 管理" : "未读取到"}</span>
+                </div>}
                 <label className="project-config-field"><span>模型</span>
                   <input maxLength={128} disabled={busy} value={draft.model} onChange={(event) => setAgentDraft(id, { model: event.target.value })} placeholder="例如 opus、gpt-5" />
                 </label>

@@ -1,0 +1,18 @@
+.mobile-optimization { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; overflow: hidden; background: #f7fbf8; color: #183a30; }
+.mobile-optimization-header { display: flex; align-items: center; justify-content: space-between; flex: none; padding: max(14px, env(safe-area-inset-top)) 16px 13px; border-bottom: 1px solid #dceae2; background: #fbfefc; }
+.mobile-optimization-header small { color: #4a927c; font-size: 11px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.mobile-optimization-header h2 { margin: 3px 0 0; font-size: 18px; }
+.mobile-optimization-header > button { width: 32px; height: 32px; border: 0; border-radius: 50%; color: #5b756b; background: #edf5f0; font-size: 22px; line-height: 1; }
+.mobile-optimization-content { width: min(100%, 760px); margin: 0 auto; min-height: 0; flex: 1; overflow: auto; padding-bottom: env(safe-area-inset-bottom); }
+.mobile-optimization-content .insights { min-height: 100%; padding: 12px; background: transparent; }
+.mobile-optimization-content .insights-banner { border-radius: 10px; }
+.mobile-optimization-content .insights-banner-copy h2 { font-size: 18px; }
+.mobile-optimization-content .insights-banner-copy > p { line-height: 1.5; }
+.mobile-optimization-content .insights-banner-in { padding: 16px; }
+.mobile-optimization-content .insights-panel { margin-top: 10px; border-radius: 10px; }
+.mobile-optimization-content .insights-pickers-body { grid-template-columns: 1fr; }
+.mobile-optimization-content .insights-list { grid-template-columns: 1fr; }
+.mobile-optimization-content .insight-card { border-radius: 9px; }
+.mobile-optimization-content .insights-banner-acts { gap: 7px; }
+.mobile-optimization-content .insights-banner-acts button { min-height: 36px; }
+@media (min-width: 700px) { .mobile-optimization { inset: 12px auto 12px 50%; width: min(760px, calc(100vw - 24px)); border: 1px solid #cfe1d7; border-radius: 14px; box-shadow: 0 20px 60px #17352c30; transform: translateX(-50%); } }

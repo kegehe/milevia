@@ -24,6 +24,7 @@ import { useUIPreferences, type AppPreferences } from "../stores/useUIPreference
 import type {
   Conversation, Message, Event, Shortcut, ShortcutEditorState,
   ConversationWorkspace,
+  ConversationCheckpoint,
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
   AgentExecution, ConversationUsageResponse, ConversationModels, AgentModelOption,
   RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
@@ -61,7 +62,7 @@ import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
 import { ServiceLogo } from "../components/ServiceLogo";
 import { transportLabel } from "../features/mcp/mcp-model";
-import type { GitSnapshot } from "../features/git/git-model";
+import type { GitBranch, GitSnapshot } from "../features/git/git-model";
 import { ExternalLink } from "../components/ExternalLink";
 
 function requiresForceStop(cause: unknown): boolean {
@@ -470,6 +471,17 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
   // requestSeq 用来标识"最新一次目录请求"：切换会话或重新打开都会 +1，旧响应据此丢弃。
   const requestSeq = useRef(0);
   const agentName = agentDisplayName(agentID);
+  const buttonModel = selected || view?.effective || displayed;
+
+  useEffect(() => {
+    let cancelled = false;
+    void api<ConversationModels>(`/api/conversations/${conversationID}/models`).then((data) => {
+      if (!cancelled) setView(data);
+    }).catch(() => {
+      // 打开菜单时会再次请求并显示错误；预取失败不打扰当前对话。
+    });
+    return () => { cancelled = true; };
+  }, [conversationID]);
 
   // 打开时定位：弹层贴在触发按钮上方，宽度按视口收敛，避免贴边溢出。
   const placeMenu = useCallback(() => {
@@ -554,20 +566,16 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
   // length（改动前的写法），遇到 null 就会抛 "reading 'length'"，把整个工作区面板
   // 打成兜底 UI。空目录照旧走下面的"没有可用的候选项"分支，自定义输入始终可用。
   // 打开弹层前还不知道来源（要等 /models 回来），所以只说确定的事，不猜"跟随 CLI 默认"。
-  const sourceHint = selected ? "本会话指定" : "跟随配置";
   const customValid = /^[A-Za-z0-9][A-Za-z0-9._:@/+-]*$/.test(custom.trim());
   // 目录缺席（null）与空目录（[]）在界面上是同一件事：没有候选项可选，走自定义输入。
   const modelOptions = modelList(view);
 
   return <>
-    <button ref={triggerRef} type="button" className={`composer-usage-model composer-model-trigger${open ? " open" : ""}${busy ? " busy" : ""}`} title={selected ? `${agentName} 模型：${displayed}（本会话指定，点击切换）` : `${agentName} 模型：${displayed}（${sourceHint}，点击切换）`} aria-haspopup="dialog" aria-expanded={open} disabled={disabled} onClick={() => void toggle()}>
-      <span className="composer-model-name">{displayed}</span><span className="composer-model-caret" aria-hidden="true" />
+    <button ref={triggerRef} type="button" className={`composer-usage-model composer-model-trigger${open ? " open" : ""}${busy ? " busy" : ""}`} title={`${agentName} 模型：${buttonModel}，点击切换`} aria-haspopup="dialog" aria-expanded={open} disabled={disabled} onClick={() => void toggle()}>
+      <span className="composer-model-name">{buttonModel}</span><span className="composer-model-caret" aria-hidden="true" />
     </button>
     {open && createPortal(<div ref={menuRef} className="model-menu" role="dialog" aria-label={`选择 ${agentName} 模型`} style={position ? { left: position.left, bottom: position.bottom, width: position.width } : undefined}>
-      <header><div><label>MODEL</label><b>选择 {agentName} 模型</b></div><button type="button" className="model-menu-close" title="关闭" aria-label="关闭" onClick={close}>×</button></header>
-      <button type="button" className={`model-menu-item${selected ? "" : " selected"}`} disabled={busy} onClick={() => void choose("")}>
-        <span><b>跟随配置</b><small>{view?.source === "profile" && view.effective ? `当前：${view.effective}` : "使用项目配置 / CLI 默认模型"}</small></span>
-      </button>
+      <header><div><b>选择 {agentName} 模型</b></div><button type="button" className="model-menu-close" title="关闭" aria-label="关闭" onClick={close}>×</button></header>
       {loading && !view ? <p className="model-menu-loading">正在读取可用模型…</p> : <>
         {modelOptions.length ? <ul className="model-menu-list">{modelOptions.map((option: AgentModelOption) => <li key={option.id}>
           <button type="button" className={`model-menu-item${selected === option.id ? " selected" : ""}`} disabled={busy} title={option.description || option.id} onClick={() => void choose(option.id)}>
@@ -578,7 +586,8 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
           <label htmlFor="composer-model-custom">自定义模型名</label>
           <div><input id="composer-model-custom" value={custom} maxLength={128} placeholder="例如 opus、claude-opus-5、gpt-5.6-sol" disabled={busy} onChange={(event) => setCustom(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && customValid && !busy) { event.preventDefault(); void choose(custom.trim()); } }} /><button type="button" className="primary" disabled={busy || !customValid} onClick={() => void choose(custom.trim())}>{busy ? "切换中" : "使用"}</button></div>
         </div>
-        {selectedLabel && <p className="model-menu-current">当前生效：<b>{selectedLabel}</b>{selected ? "（本会话指定）" : "（跟随配置）"}</p>}
+        {selectedLabel && <p className="model-menu-current">当前模型：<b>{selectedLabel}</b></p>}
+        {(view?.reasoningOptions?.length ?? 0) > 0 && <label className="model-menu-effort">推理强度<select value={view?.reasoningEffort || ""} disabled={busy} onChange={async (event) => { const effort = event.target.value; try { await api(`/api/conversations/${conversationID}/reasoning-effort`, { method: "POST", body: JSON.stringify({ reasoningEffort: effort }) }); setView((current) => current ? { ...current, reasoningEffort: effort } : current); } catch (cause) { onFail(cause instanceof Error ? cause.message : "推理强度切换失败"); } }}><option value="">默认强度</option>{view?.reasoningOptions?.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>}
         {view?.note && <p className="model-menu-note">{view.note}</p>}
         <p className="model-menu-hint">切换后下一条消息生效，本会话内持续有效；仅影响模型，不影响凭据与权限。</p>
       </>}
@@ -749,13 +758,16 @@ function ContextRing({ usage }: { usage: ConversationUsageResponse | null }) {
 
 // ── 分支胶囊：读当前工作区（会话级）的 git 摘要，分支/同步/未提交改动都是服务端算好的读数 ──
 // 三态分开渲染：读取失败（灰，可重试）/ detached HEAD（琥珀）/ 正常（绿，含 ↑↓ 同步与 N 处改动）。
-// 点击跳转 Git 工作台。刷新时机：挂载、会话切换、run 开始与结束（runKey 变化）——
+// 分支切换菜单。刷新时机：挂载、会话切换、run 开始与结束（runKey 变化）——
 // 分支切换发生在 Git 工作台页面，回到会话页时组件重挂载即取新值。
 function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: string; conversationID: string; runKey: string }) {
   const [snapshot, setSnapshot] = useState<GitSnapshot | null>(null);
+  const [branches, setBranches] = useState<GitBranch[]>([]);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [errorText, setErrorText] = useState("");
-  const navigate = useNavigate();
+  const branchRequestSeq = useRef(0);
   // requestSeq 标识"最新一次请求"：切换会话/工作区时 props 变化会重发请求，
   // 旧会话的响应若晚到，据此丢弃——分支胶囊绝不能显示上一个工作区的分支。
   const requestSeq = useRef(0);
@@ -777,7 +789,55 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
     }
   }, [projectID, conversationID]);
 
-  useEffect(() => { void load(); }, [load, runKey]);
+  const loadBranches = useCallback(async () => {
+    const seq = ++branchRequestSeq.current;
+    try {
+      const query = conversationID ? `?conversationId=${encodeURIComponent(conversationID)}` : "";
+      const data = await api<GitBranch[]>(`/api/projects/${projectID}/git/branches${query}`);
+      if (seq !== branchRequestSeq.current) return;
+      setBranches(data.filter((branch) => !branch.remote));
+      setMenuOpen(true);
+    } catch (cause) {
+      if (seq !== branchRequestSeq.current) return;
+      setErrorText(cause instanceof Error ? cause.message : "分支读取失败");
+      setPhase("error");
+    }
+  }, [projectID, conversationID]);
+
+  const switchBranch = useCallback(async (branch: GitBranch) => {
+    if (!snapshot?.stateToken || branch.current || switching) return;
+    if (!window.confirm(`将切换到分支“${branch.name}”。工作区必须干净且没有正在运行的 AI 任务，是否继续？`)) return;
+    setSwitching(true);
+    try {
+      const query = conversationID ? `?conversationId=${encodeURIComponent(conversationID)}` : "";
+      const result = await api<{ status: string; errorMessage?: string }>(`/api/projects/${projectID}/git/switch${query}`, { method: "POST", body: JSON.stringify({ branch: branch.name, remote: false, stateToken: snapshot.stateToken }) });
+      if (result.status !== "succeeded") throw new Error(result.errorMessage || "分支切换失败");
+      setMenuOpen(false);
+      await load();
+    } catch (cause) {
+      setErrorText(cause instanceof Error ? cause.message : "分支切换失败");
+      setPhase("error");
+    } finally {
+      setSwitching(false);
+    }
+  }, [conversationID, load, projectID, snapshot, switching]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (event: MouseEvent) => {
+      if (!(event.target as Element).closest(".branch-switcher")) setMenuOpen(false);
+    };
+    const key = (event: KeyboardEvent) => { if (event.key === "Escape") setMenuOpen(false); };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", key);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", key); };
+  }, [menuOpen]);
+
+  useEffect(() => {
+    branchRequestSeq.current += 1;
+    setMenuOpen(false);
+    void load();
+  }, [load, runKey]);
 
   // 未提交改动数优先用服务端给的 changes 清单（一个文件同时 staged+modified 只算一处），
   // 旧版响应没带清单时才退回分项计数相加（含 conflicted）。
@@ -800,21 +860,35 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
   const head = snapshot.head;
   if (head.detached) {
     return (
-      <button type="button" className="branch-pill detached" title={`工作区处于 detached HEAD（${head.oid.slice(0, 7)}），不在任何分支上 · 点击打开Git工作台`} onClick={() => navigate(`/projects/${projectID}/git`)}>
-        <BranchPillIcon />
-        detached HEAD
-        {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
-      </button>
+      <span className="branch-switcher">
+          <button type="button" className="branch-pill detached" title={`工作区处于 detached HEAD（${head.oid.slice(0, 7)}），点击选择分支`} onClick={() => menuOpen ? setMenuOpen(false) : void loadBranches()}>
+          <BranchPillIcon />
+          detached HEAD
+          {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
+          <span className="branch-chevron" aria-hidden="true">⌄</span>
+        </button>
+        {menuOpen && <div className="branch-menu" role="menu" aria-label="切换分支">
+          <div className="branch-menu-title">切换分支</div>
+          {branches.length === 0 ? <div className="branch-menu-empty">没有可切换的本地分支</div> : branches.map((branch) => <button key={branch.name} type="button" role="menuitem" className={branch.current ? "current" : ""} disabled={branch.current || switching} onClick={() => void switchBranch(branch)}><span>{branch.name}</span>{branch.current && <small>当前</small>}</button>)}
+        </div>}
+      </span>
     );
   }
   const syncBits = [head.ahead > 0 ? `↑${head.ahead}` : "", head.behind > 0 ? `↓${head.behind}` : ""].filter(Boolean).join("");
   return (
-    <button type="button" className="branch-pill" title={`当前分支 ${head.branch}${head.upstream ? `（跟踪 ${head.upstream}）` : ""}${syncBits ? ` · 同步状态 ${syncBits}` : ""}${dirtyCount > 0 ? ` · ${dirtyCount}处未提交改动` : ""} · 点击打开Git工作台`} onClick={() => navigate(`/projects/${projectID}/git`)}>
-      <BranchPillIcon />
-      <span className="branch-name">{head.branch || "（空仓库）"}</span>
-      {syncBits && <span className="sync">{syncBits}</span>}
-      {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
-    </button>
+    <span className="branch-switcher">
+      <button type="button" className="branch-pill" disabled={switching} title={`当前分支 ${head.branch} · 点击选择要切换的分支`} onClick={() => menuOpen ? setMenuOpen(false) : void loadBranches()}>
+        <BranchPillIcon />
+        <span className="branch-name">{head.branch || "（空仓库）"}</span>
+        {syncBits && <span className="sync">{syncBits}</span>}
+        {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
+        <span className="branch-chevron" aria-hidden="true">⌄</span>
+      </button>
+      {menuOpen && <div className="branch-menu" role="menu" aria-label="切换分支">
+        <div className="branch-menu-title">切换分支</div>
+        {branches.length === 0 ? <div className="branch-menu-empty">没有可切换的本地分支</div> : branches.map((branch) => <button key={branch.name} type="button" role="menuitem" className={branch.current ? "current" : ""} disabled={branch.current || switching} onClick={() => void switchBranch(branch)}><span>{branch.name}</span>{branch.current && <small>当前</small>}</button>)}
+      </div>}
+    </span>
   );
 }
 
@@ -938,26 +1012,28 @@ function ComposerRunnerInfo({ runnerID, agentID, projectID, conversationID, isGi
   const autoUpdatable = updateInfo?.autoUpdatable !== false;
   const manualUpdateEnv = runner?.environment === "wsl" ? "WSL 内" : runner?.environment === "windows" ? "Windows 侧" : runner?.environment === "remote-linux" ? "远程服务器上" : "目标环境";
   const manualUpdateCommand = `${agentEntry(agentID)?.commandName ?? agentID} update`;
+  const currentVersion = formatToolVersion(tool?.version);
+  const latestVersion = formatToolVersion(updateInfo?.latestVersion);
 
   return (<>
     <div className="composer-meta">
       <span className="composer-meta-group">
-      <span className={`runner-inline ${runnerStatusClass}${run ? " run-active" : ""}`} title={tool?.reason} role={run ? "status" : undefined} aria-live={run ? "polite" : undefined}><i aria-hidden="true"></i><span>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span></span>
+      <span className={`runner-inline ${runnerStatusClass}${run ? " run-active" : ""}`} title={tool?.reason} role={run ? "status" : undefined} aria-live={run ? "polite" : undefined}><i aria-hidden="true"></i><span>{run ? runLabel : tool?.status === "ready" ? `${toolName} ${currentVersion || tool.version}` : tool?.status === "updating" ? "更新中..." : tool?.reason || `${toolName} 不可用`}</span></span>
       {/* 非 Git 目录项目没有分支可读：/api/projects/{id}/git/summary 对它一律 409，
           画出来就是一条常驻的「读取失败」胶囊（点了也永远失败）。判据与 GitWorkbenchPage、
           手机端共用 NON_GIT_BRANCH 这一个哨兵，由宿主演算后传进来。 */}
       {isGitRepo && <ComposerBranchPill projectID={projectID} conversationID={conversationID} runKey={run} />}
-      {run && <button className="runner-stop" type="button" disabled={readOnly || stopping} onClick={onStop} title={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"} aria-label={readOnly ? "只读会话无法停止" : stopping ? "正在停止当前对话" : "停止当前对话"}><span aria-hidden="true"></span>{stopping ? "停止中" : "停止"}</button>}
+      {run && <button className="runner-stop" type="button" disabled={readOnly} onClick={onStop} title={readOnly ? "只读会话无法停止" : stopping ? "再次请求停止当前对话" : "停止当前对话"} aria-label={readOnly ? "只读会话无法停止" : stopping ? "再次请求停止当前对话" : "停止当前对话"}><span aria-hidden="true"></span>{stopping ? "再次停止" : "停止"}</button>}
       {!run && tool?.status === "ready" && <button type="button" className="runner-inline-btn" disabled={checking || updating} onClick={() => void handleCheckUpdate()}>{checking ? "检查中..." : "检查更新"}</button>}
-      {!run && !updating && hasUpdate && autoUpdatable && <button type="button" className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {updateInfo?.latestVersion}</button>}
-      {!run && !updating && hasUpdate && !autoUpdatable && <span className="runner-inline-manual" title={`${toolName} 检测到新版本 ${updateInfo?.latestVersion ?? ""}，当前运行器暂不支持应用内自动更新，请在${manualUpdateEnv}手动执行 ${manualUpdateCommand}`}>发现新版本 {updateInfo?.latestVersion} · 需手动更新</span>}
+      {!run && !updating && hasUpdate && autoUpdatable && <button type="button" className="runner-inline-btn update-available" onClick={() => setShowConfirm(true)}>更新至 {latestVersion || updateInfo?.latestVersion}</button>}
+      {!run && !updating && hasUpdate && !autoUpdatable && <span className="runner-inline-manual" title={`${toolName} 检测到新版本 ${latestVersion || updateInfo?.latestVersion || ""}，当前运行器暂不支持应用内自动更新，请在${manualUpdateEnv}手动执行 ${manualUpdateCommand}`}>发现新版本 {latestVersion || updateInfo?.latestVersion} · 需手动更新</span>}
       {!run && !updating && updateInfo && !hasUpdate && !updateInfo.error && <span className="runner-inline-uptodate" title={`${toolName} 已是最新版本`}>已是最新版本</span>}
       {!run && !updating && updateInfo?.error && <span className="runner-inline-error" title={updateInfo.error}>{updateInfo.error}</span>}
       </span>
       <span className="composer-meta-push" aria-hidden="true"></span>
       {usage && <span className="turns" title="本次会话已完成的对话轮数"><svg className="turns-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.6c0 3.9-3.6 7-8 7-.9 0-1.8-.1-2.6-.4L4.5 19.5l1.1-3.2C4.6 15.2 4 13.5 4 11.6c0-3.9 3.6-7 8-7s8 3.1 8 7Z" /></svg><b>{usage.session.taskCount}</b>次对话</span>}
     </div>
-    {showConfirm && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新 {toolName}</label><h2>确认更新 {toolName}</h2></div><button type="button" title="关闭" onClick={() => setShowConfirm(false)}>x</button></header><p className="permission-confirmation">当前版本：<b>{tool?.version}</b> → 最新版本：<b>{updateInfo?.latestVersion}</b>。更新期间将无法使用 AI 对话功能，更新预计需要数十秒。</p><footer><button type="button" className="secondary" onClick={() => setShowConfirm(false)}>取消</button><button type="button" className="primary" onClick={() => void handleUpdate()}>确认更新</button></footer></section></div>}
+    {showConfirm && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal"><header><div><label>更新 {toolName}</label><h2>确认更新 {toolName}</h2></div><button type="button" title="关闭" onClick={() => setShowConfirm(false)}>x</button></header><p className="permission-confirmation">当前版本：<b>{currentVersion || tool?.version}</b> → 最新版本：<b>{latestVersion || updateInfo?.latestVersion}</b>。更新期间将无法使用 AI 对话功能，更新预计需要数十秒。</p><footer><button type="button" className="secondary" onClick={() => setShowConfirm(false)}>取消</button><button type="button" className="primary" onClick={() => void handleUpdate()}>确认更新</button></footer></section></div>}
     {updateError && <div className="backdrop" role="dialog" aria-modal="true"><section className="modal update-error-dialog"><header><div><label>更新错误</label><h2>更新失败</h2></div><button type="button" title="关闭" onClick={() => setUpdateError(null)}>x</button></header><div className="update-error-reason" role="alert">{updateError}</div><footer><button type="button" className="secondary" onClick={() => setUpdateError(null)}>关闭</button></footer></section></div>}
   </>);
 }
@@ -1699,6 +1775,9 @@ export default function ConversationPage() {
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const suppressConversationRestoreRef = useRef(false);
   const [conversationWorkspaces, setConversationWorkspaces] = useState<ConversationWorkspace[]>([]);
+  const [conversationCheckpoints, setConversationCheckpoints] = useState<ConversationCheckpoint[]>([]);
+  const [showCheckpointMenu, setShowCheckpointMenu] = useState(false);
+  const [checkpointBusy, setCheckpointBusy] = useState(false);
   const [conversationWorkspaceLabels, setConversationWorkspaceLabels] = useState<Record<string, string>>({});
   const [archiveWorkspaceID, setArchiveWorkspaceID] = useState("");
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
@@ -1734,6 +1813,18 @@ export default function ConversationPage() {
         if (active) setConversationWorkspaceLabels((current) => ({ ...current, [conversation.id]: active.mode === "isolated_worktree" ? `工作区 #${active.generation}` : "项目工作区" }));
       })
       .catch((cause) => { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法读取会话工作区"); });
+    return () => { cancelled = true; };
+  }, [conversation?.id, fail, projectApi]);
+
+  useEffect(() => {
+    if (!conversation?.id) {
+      setConversationCheckpoints([]);
+      return;
+    }
+    let cancelled = false;
+    void projectApi<{ checkpoints: ConversationCheckpoint[] }>(`/api/conversations/${conversation.id}/checkpoints`)
+      .then((result) => { if (!cancelled) setConversationCheckpoints(result.checkpoints || []); })
+      .catch((cause) => { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法加载回退节点"); });
     return () => { cancelled = true; };
   }, [conversation?.id, fail, projectApi]);
 
@@ -1810,6 +1901,31 @@ export default function ConversationPage() {
       setWorkspaceBusy(false);
     }
   };
+
+  const rewindToCheckpoint = async (checkpoint: ConversationCheckpoint, mode: "conversation" | "code" | "conversation_and_code", fork = false) => {
+    if (!conversation || checkpointBusy || run || clearing || stopping || handingOff || readOnlyConversation) return;
+    const action = fork ? "从该节点创建分支" : mode === "code" ? "恢复代码" : mode === "conversation" ? "恢复对话" : "恢复代码和对话";
+    if (!window.confirm(`${action}？这会停止当前会话上下文。`)) return;
+    setCheckpointBusy(true);
+    try {
+      const result = await projectApi<{ conversation?: Conversation; checkpoint: ConversationCheckpoint; forked: boolean }>(`/api/conversations/${conversation.id}/rewind`, { method: "POST", body: JSON.stringify({ checkpointId: checkpoint.id, mode, fork }) });
+      setShowCheckpointMenu(false);
+      if (result.forked && result.conversation) {
+        navigate(conversationURL(result.conversation.id));
+        return;
+      }
+      setConversationCheckpoints((items) => items.map((item) => (item.createdAt > checkpoint.createdAt || (item.createdAt === checkpoint.createdAt && item.id > checkpoint.id)) ? { ...item, status: "rewound" } : item.id === checkpoint.id ? { ...item, status: "active" } : item));
+      const detail = await projectApi<{ conversation: Conversation; messages: Message[]; events: Event[]; activeRunId: string | null }>(`/api/conversations/${conversation.id}?limit=400`);
+      resetConversationView(detail.conversation);
+      setMessages(detail.messages || []);
+      setEvents(detail.events || []);
+      setRun(detail.activeRunId || "");
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : "回退失败");
+    } finally {
+      setCheckpointBusy(false);
+    }
+  };
   const [text, setText] = useState("");
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyRefresh, setHistoryRefresh] = useState(0);
@@ -1857,6 +1973,15 @@ export default function ConversationPage() {
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [showPermissionMenu]);
+
+  useEffect(() => {
+    if (!showCheckpointMenu) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!(event.target as HTMLElement).closest(".checkpoint-menu")) setShowCheckpointMenu(false);
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showCheckpointMenu]);
 
   // 点击外部关闭发送方式菜单
   useEffect(() => {
@@ -1966,6 +2091,14 @@ export default function ConversationPage() {
   const conversationTransitionRef = useRef(false);
   const conversationRouteVersion = useRef(0);
   const conversationHistoryRequestVersion = useRef(0);
+  const unavailableConversationIdsRef = useRef(new Set<string>());
+  const conversationPageActiveRef = useRef(true);
+  const conversationDeletionPendingRef = useRef(false);
+  conversationDeletionPendingRef.current = Boolean(deletingConversation) || deleteAllConversationsBusy;
+  useEffect(() => {
+    conversationPageActiveRef.current = true;
+    return () => { conversationPageActiveRef.current = false; };
+  }, []);
   // 正在飞行的列表刷新，按"同一种刷新"去重（见 requestConversationHistory）。
   const conversationHistoryInflight = useRef(new Map<string, Promise<ConversationHistoryResult>>());
   // 每次渲染都取最新的 search 参数：恢复会话时要用"此刻"的弹窗参数，而不是挂载那一刻的。
@@ -1975,9 +2108,15 @@ export default function ConversationPage() {
   // 上一个项目那份列表结果飞回来时必须能被认出来，不能落到新项目的页面上。
   const projectIDRef = useRef(projectId);
   projectIDRef.current = projectId;
+  const urlConversationIdRef = useRef(urlConversationId);
+  urlConversationIdRef.current = urlConversationId;
   const conversationTabsRef = useRef<ConversationTabsState>(conversationTabs);
   conversationTabsRef.current = conversationTabs;
   const stopRunRef = useRef<() => Promise<void>>(async () => {});
+  // The stop endpoint is asynchronous. Keep a short request lock so a double
+  // click does not create concurrent stop requests, while still allowing a
+  // retry after the first request has returned `stopping`.
+  const stopRequestInFlightRef = useRef(false);
   const stopAndClearRef = useRef<() => Promise<void>>(async () => {});
   const pendingUserDrafts = useRef(new Map<string, string>());
   const assistantOutputRuns = useRef(new Set<string>());
@@ -1995,10 +2134,8 @@ export default function ConversationPage() {
     if (persist && projectId && conversationID) saveConversationDraft(projectId, conversationID, value);
   }, [projectId, saveConversationDraft]);
 
-  // 技能引用的兜底清理：**会话一换就不许留着**（引用属于上一个会话，跟草稿不一样 —— 草稿是按会话
-  // 持久化后各自取回，引用没有跨会话的意义）。主路径是 resetConversationView 里那一次显式清理，
-  // 但本组件还有"URL 没带 id → 恢复/新建会话"那条路（直接 setConversation(next)，不走 reset），
-  // 以及未来新增的切换入口 —— 用 conversation.id 兜底，比逐个入口补一次更不容易漏。
+  // 技能引用属于当前会话。resetConversationView 负责主路径，这里也覆盖关闭最后一个
+  // Tab 等直接清空会话的入口，避免引用在会话之间残留。
   useEffect(() => { setSkillRefs([]); }, [conversation?.id]);
 
   // Route changes must invalidate a pending clear before promise callbacks can
@@ -2008,6 +2145,7 @@ export default function ConversationPage() {
   }, [projectId, urlConversationId]);
 
   useEffect(() => {
+    unavailableConversationIdsRef.current.clear();
     const restored = readConversationTabs(projectId || "");
     conversationTabsRef.current = restored;
     setConversationTabs(restored);
@@ -2028,7 +2166,11 @@ export default function ConversationPage() {
   }, [projectId]);
 
   const selectConversationTab = useCallback(async (conversationID: string, followShared = false) => {
-    if (!projectId || !conversationID) return;
+    const selectionIsAvailable = () => conversationPageActiveRef.current && projectIDRef.current === projectId &&
+      !unavailableConversationIdsRef.current.has(conversationID) && (!followShared || !conversationDeletionPendingRef.current);
+    if (!projectId || !conversationID || !selectionIsAvailable()) return;
+    const routeVersion = conversationRouteVersion.current;
+    const routePath = window.location.pathname;
     suppressConversationRestoreRef.current = false;
     let makeRoomForSharedConversation = false;
     const tabs = conversationTabsRef.current;
@@ -2042,9 +2184,11 @@ export default function ConversationPage() {
     try {
       await projectApi<Conversation>(`/api/conversations/${conversationID}/activate`, { method: "POST" });
     } catch (cause) {
+      if (!selectionIsAvailable() || conversationRouteVersion.current !== routeVersion || window.location.pathname !== routePath) return;
       fail(cause instanceof Error ? cause.message : "无法切换当前会话");
       return;
     }
+    if (!selectionIsAvailable() || conversationRouteVersion.current !== routeVersion || window.location.pathname !== routePath) return;
     if (makeRoomForSharedConversation) {
       const currentTabs = conversationTabsRef.current;
       if (!currentTabs.openConversationIds.includes(conversationID) && currentTabs.openConversationIds.length >= MAX_OPEN_CONVERSATION_TABS) {
@@ -2120,8 +2264,11 @@ export default function ConversationPage() {
   }, [projectId]);
 
   const removeUnavailableConversationTabs = useCallback((conversationIDs: string[]) => {
-    if (!projectId || conversationIDs.length === 0) return;
+    if (!conversationPageActiveRef.current || !projectId || projectId !== projectIDRef.current || conversationIDs.length === 0) return;
     const unavailable = new Set(conversationIDs);
+    // Also reject late list/activation responses that still refer to these IDs.
+    conversationIDs.forEach((id) => unavailableConversationIdsRef.current.add(id));
+    setConversationHistory((current) => current.filter((item) => !unavailable.has(item.id)));
     const previous = conversationTabsRef.current;
     let next = previous;
     conversationIDs.forEach((conversationID) => { next = closeConversationTab(next, conversationID); });
@@ -2130,10 +2277,26 @@ export default function ConversationPage() {
       writeConversationTabs(projectId, next);
       setConversationTabs(next);
     }
-    if (urlConversationId && unavailable.has(urlConversationId)) {
-      navigate(conversationURL(next.activeConversationId || undefined), { replace: true });
+    if (conversationRef.current && unavailable.has(conversationRef.current.id)) {
+      conversationRef.current = null;
+      setConversation(null);
+      setMessages([]);
+      setEvents([]);
+      setRun("");
+      setUsage(null);
+      setText("");
+      textRef.current = "";
+      setSkillRefs([]);
     }
-  }, [conversationURL, navigate, projectId, urlConversationId]);
+    // Deletion/activity requests may finish after the user has navigated away.
+    const currentRouteID = urlConversationIdRef.current;
+    if (currentRouteID && unavailable.has(currentRouteID)) {
+      // BrowserRouter updates the address before React commits the new route.
+      if (window.location.pathname === `/projects/${projectId}/conversations/${currentRouteID}`) {
+        navigate(conversationURL(next.activeConversationId || undefined), { replace: true });
+      }
+    }
+  }, [conversationURL, navigate, projectId]);
 
   const markActiveConversationTabRead = useCallback(() => {
     const conversationID = conversationRef.current?.id;
@@ -2257,14 +2420,15 @@ export default function ConversationPage() {
         // 曾经这里返回空数组，调用方据此认定"项目里没有会话"，于是 POST 新建一个会话、
         // 再把历史列表覆盖成那一条 —— 项目里凭空多出来的会话就是这么来的。
         if (requestVersion !== conversationHistoryRequestVersion.current) return { items: [], stale: true };
+        const items = page.items.filter((item) => !unavailableConversationIdsRef.current.has(item.id));
         setHistoryError("");
         setConversationHistory((current) => {
-          if (!append) return page.items;
+          if (!append) return items;
           const known = new Set(current.map((item) => item.id));
-          return [...current, ...page.items.filter((item) => !known.has(item.id))];
+          return [...current, ...items.filter((item) => !known.has(item.id))];
         });
         setConversationHistoryCursor(page.nextCursor);
-        return { items: page.items, stale: false };
+        return { items, stale: false };
       } catch (cause) {
         // 这次刷新失败了：同样**没有结论**，把原因如实交给弹窗，别让它显示成"没有记录"。
         if (!background && requestVersion === conversationHistoryRequestVersion.current) {
@@ -2429,7 +2593,8 @@ export default function ConversationPage() {
     if (!projectId || conversationTransitionRef.current) return;
     let cancelled = false;
     const abort = new AbortController();
-    const isCurrentRoute = () => !cancelled && !conversationTransitionRef.current;
+    const isCurrentRoute = () => !cancelled && !conversationTransitionRef.current &&
+      (!urlConversationId || !unavailableConversationIdsRef.current.has(urlConversationId));
     async function loadConversation() {
       try {
         if (!urlConversationId && suppressConversationRestoreRef.current) {
@@ -2500,8 +2665,8 @@ export default function ConversationPage() {
           ? await projectApi<Conversation>(`/api/projects/${projectId}/conversations`, { method: "POST" })
           : null);
         if (!cancelled && !conversationTransitionRef.current) {
-          setConversation(next);
           if (!next) {
+            setConversation(null);
             setMessages([]);
             setEvents([]);
             setRun("");
@@ -2510,6 +2675,8 @@ export default function ConversationPage() {
             textRef.current = "";
             return;
           }
+          if (conversationRef.current?.id === next.id) setConversation(next);
+          else resetConversationView(next);
           if (list.length === 0) setConversationHistory([next]);
           // 更新 URL 到当前对话。恢复会话只是"把 URL 补全成当前会话"，不是"重置页面状态"：
           // 走 conversationURL 把弹窗参数原样带过去，否则刚打开的历史弹窗会被这次 replace
@@ -3781,12 +3948,13 @@ export default function ConversationPage() {
 			// 的会话在慢速磁盘上可能超过默认 15s 请求超时。
 			await apiWithTimeout(`/api/conversations/${conversationID}`, { method: "DELETE" }, 0, 120_000);
 		} catch (cause) {
-			fail(cause instanceof Error ? cause.message : "无法删除会话");
+			if (conversationPageActiveRef.current && projectIDRef.current === projectId) fail(cause instanceof Error ? cause.message : "无法删除会话");
 			return;
 		} finally {
 			setDeletingConversation("");
 		}
 		// 关闭该会话对应的 Tab；若它正是当前 URL 会话，会切到相邻 Tab 或新建会话。
+		if (!conversationPageActiveRef.current || projectIDRef.current !== projectId) return;
 		removeUnavailableConversationTabs([conversationID]);
 		void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
 	};
@@ -3822,11 +3990,12 @@ export default function ConversationPage() {
 			const result = await apiWithTimeout<{ deleted: number; skipped: number; deletedIds?: string[] }>(`/api/projects/${projectId}/conversations`, { method: "DELETE" }, 0, 120_000);
 			deletedIDs = result.deletedIds || [];
 		} catch (cause) {
-			fail(cause instanceof Error ? cause.message : "无法清除全部历史对话");
+			if (conversationPageActiveRef.current && projectIDRef.current === projectId) fail(cause instanceof Error ? cause.message : "无法清除全部历史对话");
 			return;
 		} finally {
 			setDeleteAllConversationsBusy(false);
 		}
+		if (!conversationPageActiveRef.current || projectIDRef.current !== projectId) return;
 		if (deletedIDs.length > 0) {
 			removeUnavailableConversationTabs(deletedIDs);
 		}
@@ -3904,7 +4073,8 @@ export default function ConversationPage() {
   };
 
   const stopRun = async () => {
-    if (!conversation || readOnlyConversation || !run || stopping || handingOff) return;
+    if (!conversation || readOnlyConversation || !run || handingOff || stopRequestInFlightRef.current) return;
+    stopRequestInFlightRef.current = true;
     const conversationID = conversation.id;
     const routeVersion = conversationRouteVersion.current;
     const runID = run;
@@ -3954,6 +4124,9 @@ export default function ConversationPage() {
       fail(cause instanceof Error ? cause.message : "无法停止任务");
       setStopping(false);
       return;
+    }
+    finally {
+      stopRequestInFlightRef.current = false;
     }
   };
   stopRunRef.current = stopRun;
@@ -4035,7 +4208,7 @@ export default function ConversationPage() {
   const promptShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "prompt" || shortcut.kind === "snippet");
   const commandShortcuts = shortcuts.filter((shortcut) => shortcut.kind === "command_request");
   const userMessageNavigationIndex = userMessages.length === 0 ? -1 : Math.max(0, Math.min(currentUserMessageIndex, userMessages.length - 1));
-  const inputHistoryPosition = historyIndex.current === null ? null : inputHistory.length - historyIndex.current;
+  const inputHistoryPosition = historyIndex.current === null ? null : historyIndex.current + 1;
   const starterSuggestions = [
     { label: "审查改动", prompt: "请审查当前工作区的改动，重点检查潜在问题、风险和缺少的测试。" },
     { label: "定位问题", prompt: "请帮我定位并分析以下问题的原因：" },
@@ -4189,6 +4362,16 @@ export default function ConversationPage() {
         <button className="head-actions-mobile-toggle" type="button" aria-expanded={showMobileActions} onClick={() => setShowMobileActions((open) => !open)}>操作</button>
         <div className="head-actions">
           <button className="conversation-head-action secondary" type="button" disabled={sending} onClick={openConversationHistory}><HistoryIcon /><span>历史</span></button>
+          <div className="permission-menu checkpoint-menu">
+            <button className="conversation-head-action secondary" type="button" aria-haspopup="menu" aria-expanded={showCheckpointMenu} disabled={readOnlyConversation || checkpointBusy || Boolean(run) || clearing || stopping || handingOff || conversationCheckpoints.length === 0} onClick={() => setShowCheckpointMenu((open) => !open)} title="回退到会话节点"><HistoryIcon /><span>{checkpointBusy ? "处理中" : "回退"}</span></button>
+            {showCheckpointMenu && <div className="permission-popover checkpoint-popover" role="menu">
+              {conversationCheckpoints.slice().reverse().map((checkpoint) => <div className="checkpoint-entry" key={checkpoint.id}>
+                <b>{checkpoint.prompt.trim().replace(/\s+/g, " ").slice(0, 72) || "未命名回合"}</b>
+                <small>{formatHistoryTime(checkpoint.createdAt)}{checkpoint.status === "active" ? " · 当前" : ""}</small>
+                <div><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation")}>恢复对话</button><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "code")}>恢复代码</button><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation_and_code")}>恢复全部</button><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation_and_code", true)}>分支</button></div>
+              </div>)}
+            </div>}
+          </div>
           {conversationWorkspaces.length > 0 && <label className="conversation-workspace-picker"><span>工作区</span><select aria-label="会话工作区" value={conversationWorkspaces.find((item) => item.active)?.id || ""} disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => { const selected = conversationWorkspaces.find((item) => item.id === event.target.value); if (selected) void activateWorkspace(selected); }}><option value="" disabled>选择工作区</option>{conversationWorkspaces.filter((item) => item.state === "ready").map((item) => <option key={item.id} value={item.id}>{item.mode === "isolated_worktree" ? `工作区 #${item.generation}` : "项目工作区"}</option>)}</select></label>}
           <button className="conversation-head-action secondary workspace-create-action" type="button" disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => void createIsolatedWorkspace()} title="创建会话级 Git 工作区"><span>{workspaceBusy ? "处理中" : "新建工作区"}</span></button>
           {conversationWorkspaces.some((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active) && <><label className="conversation-workspace-picker workspace-remove-picker"><span>移除目标</span><select aria-label="移除工作区" value={archiveWorkspaceID} disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => setArchiveWorkspaceID(event.target.value)}>{conversationWorkspaces.filter((item) => item.mode === "isolated_worktree" && item.state === "ready").map((item) => <option key={item.id} value={item.id}>工作区 #{item.generation}</option>)}</select></label><button className="conversation-head-action secondary workspace-remove-action" type="button" disabled={!archiveWorkspaceID || workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => { const workspace = conversationWorkspaces.find((item) => item.id === archiveWorkspaceID); if (workspace) void archiveWorkspace(workspace); }} title="移除选中的闲置工作区"><span>移除工作区</span></button></>}
@@ -4264,7 +4447,7 @@ export default function ConversationPage() {
         <div className="composer-card">
         <div className="composer-input-area">
           {inputHistoryPosition !== null && inputHistory.length > 0 && <span className="composer-history-position" role="status" aria-label={`输入历史第 ${inputHistoryPosition} 条，共 ${inputHistory.length} 条`}>{inputHistoryPosition}/{inputHistory.length}</span>}
-      <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || stopping || handingOff || changingModel || Boolean(shortcutBusy)} />
+      <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || handingOff || changingModel || Boolean(shortcutBusy)} />
           <button className={`composer-mobile-shortcut-toggle${showMobileShortcuts ? " open" : ""}`} type="button" title="快捷操作" aria-label="快捷操作" aria-controls="mobile-shortcut-menu" aria-expanded={showMobileShortcuts} disabled={readOnlyConversation || sending || clearing || stopping || handingOff || Boolean(shortcutBusy)} onClick={() => setShowMobileShortcuts((open) => !open)}><ComposerShortcutIcon /></button>
         </div>
         {showMobileShortcuts && <section className="mobile-shortcut-menu" id="mobile-shortcut-menu" aria-label="快捷操作">
@@ -4277,10 +4460,9 @@ export default function ConversationPage() {
             <ContextRing usage={usage} />
             <span className="composer-dock-push" aria-hidden="true"></span>
             {conversation?.id ? <ComposerModelPicker conversationID={conversation.id} agentID={conversation?.agentId || "claude-code"} selected={conversation?.modelOverride || ""} displayed={displayedModel} disabled={readOnlyConversation || Boolean(run) || stopping || changingModel} runActive={Boolean(run)} busy={changingModel} onSelect={selectConversationModel} onFail={fail} /> : <span className="composer-usage-model" title={displayedModel}>{displayedModel}</span>}
-            {conversation?.agentId === "codex" && <button className="composer-icon-btn composer-handoff" type="button" title={handingOff ? "交接中" : "压缩并新建会话"} aria-label="压缩并新建会话" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => { pendingConfirmBusyRef.current = false; setPendingConfirmBusy(false); setPendingConfirm({ title: "压缩并新建会话", message: "将生成只读上下文摘要，并用它初始化新的 Codex 会话。当前会话会保留在历史中。", confirmLabel: "开始交接", className: "conversation-clear-dialog", onConfirm: () => { setPendingConfirm(null); void handoffConversationContext(); }, onCancel: () => setPendingConfirm(null) }); }}><ComposerActionIcon action="handoff" /></button>}
-            <button className="composer-icon-btn danger composer-clear" type="button" title="清空并新建对话" aria-label="清空并新建对话" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={clearConversationContext}><ComposerActionIcon action="clear" /></button>
-            <button className="composer-icon-btn composer-continue" type="button" title="继续上一轮" aria-label="继续上一轮" disabled={readOnlyConversation || sending || clearing || stopping || handingOff} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /></button>
-            {run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation || stopping} onClick={() => void stopRun()}>{stopping ? "停止中" : "停止"}</button>}
+            <button className="composer-icon-btn danger composer-clear" type="button" title="清空内容并新建对话" aria-label="清空内容并新建对话" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={clearConversationContext}><ComposerActionIcon action="clear" /></button>
+            <button className="composer-icon-btn composer-continue" type="button" title="继续任务" aria-label="继续任务" disabled={readOnlyConversation || sending || clearing || stopping || handingOff} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /></button>
+            {run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation} onClick={() => void stopRun()}>{stopping ? "再次停止" : "停止"}</button>}
             <button className="composer-icon-btn composer-usage-open" type="button" title={!run && !usage ? "用量将在工具就绪后显示" : "使用状态"} aria-label="使用状态" disabled={!run && !usage} onClick={openUsage}><svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V10M10 19V5M15 19v-7M20 19V8" /><path d="M3.5 19.5h17" /></svg></button>
             <span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {activeAgentName}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span>
           </div>

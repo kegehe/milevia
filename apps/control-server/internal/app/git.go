@@ -171,6 +171,7 @@ type GitRunner interface {
 	Push(context.Context, string, string, string, bool) error
 	CreateBranch(context.Context, string, string, string) error
 	SwitchBranch(context.Context, string, string) error
+	CheckoutRemoteBranch(context.Context, string, string, string) error
 	// ConflictOverview 返回冲突操作上下文（merge/rebase/cherry-pick…）与冲突文件清单。
 	ConflictOverview(context.Context, string) (GitConflictOverview, error)
 	// ConflictContent 返回单个冲突文件的三方（base/ours/theirs）与工作区内容。
@@ -395,6 +396,20 @@ func (runner *gitCLIRunner) SwitchBranch(ctx context.Context, repo, name string)
 	return err
 }
 
+func (runner *gitCLIRunner) CheckoutRemoteBranch(ctx context.Context, repo, local, remote string) error {
+	if local == "" || remote == "" {
+		return errors.New("local and remote branch names are required")
+	}
+	if err := validateGitRef(local); err != nil {
+		return err
+	}
+	if err := validateGitRef(remote); err != nil {
+		return err
+	}
+	_, err := runner.backend.runGit(ctx, repo, "switch", "--track", "-c", local, remote)
+	return err
+}
+
 func (runner *gitCLIRunner) Snapshot(ctx context.Context, repo string) (GitSnapshot, error) {
 	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
 	if err != nil {
@@ -402,6 +417,18 @@ func (runner *gitCLIRunner) Snapshot(ctx context.Context, repo string) (GitSnaps
 	}
 	snapshot, _, err := parsePorcelainV2(raw)
 	return snapshot, err
+}
+
+// SnapshotAndChanges parses one status invocation into both views. WSL
+// repositories are especially sensitive to duplicate status scans because
+// each filesystem lookup otherwise crosses the Windows/WSL boundary.
+func (runner *gitCLIRunner) SnapshotAndChanges(ctx context.Context, repo string) (GitSnapshot, []GitChange, error) {
+	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
+	if err != nil {
+		return GitSnapshot{}, nil, err
+	}
+	snapshot, changes, err := parsePorcelainV2(raw)
+	return snapshot, changes, err
 }
 
 func (runner *gitCLIRunner) Changes(ctx context.Context, repo string) ([]GitChange, error) {

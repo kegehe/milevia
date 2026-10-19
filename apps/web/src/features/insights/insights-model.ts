@@ -1,7 +1,7 @@
 // 项目主动优化建议（Insights）前端模型 —— 见 docs/25-项目主动优化建议实现方案.md
 // 纯函数与类型集中在 model 里便于单测，组件只负责渲染与交互。
 
-export type InsightType = "bug" | "style" | "optimization" | "feature";
+export type InsightType = "bug" | "style" | "optimization" | "feature" | "cleanup";
 export type InsightSeverity = "low" | "normal" | "high";
 export type InsightScanStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -126,6 +126,7 @@ export const insightTypeLabels: Record<InsightType, string> = {
   style: "样式问题",
   optimization: "可优化项",
   feature: "可新增功能",
+  cleanup: "可清理项",
 };
 
 export const insightSeverityLabels: Record<InsightSeverity, string> = {
@@ -134,7 +135,7 @@ export const insightSeverityLabels: Record<InsightSeverity, string> = {
   high: "高",
 };
 
-export const insightTypeOrder: InsightType[] = ["bug", "style", "optimization", "feature"];
+export const insightTypeOrder: InsightType[] = ["bug", "style", "optimization", "feature", "cleanup"];
 
 // 扫描可选择聚焦的主题方向（暂不含"全面分析"空串值，以便 UI 单独当作"全部"渲染）。
 export const insightThemes: InsightTheme[] = ["security", "performance", "ux", "architecture", "stability"];
@@ -318,7 +319,7 @@ export function insightSelectionSummary(selected: ReadonlySet<string>, ids: read
 }
 
 export function insightFindingCounts(findings: InsightFinding[]): Record<InsightFilter, number> {
-  const counts: Record<InsightFilter, number> = { all: findings.length, bug: 0, style: 0, optimization: 0, feature: 0 };
+  const counts: Record<InsightFilter, number> = { all: findings.length, bug: 0, style: 0, optimization: 0, feature: 0, cleanup: 0 };
   for (const f of findings) counts[normalizeInsightType(f.type)] += 1;
   return counts;
 }

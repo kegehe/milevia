@@ -701,6 +701,7 @@
 .insight-stamp.insight-type-style { color: #7b4b6d; border-color: #e5cfe0; background: #faf3f8; }
 .insight-stamp.insight-type-optimization { color: #2c6558; border-color: #d8e8de; background: #f4faf6; }
 .insight-stamp.insight-type-feature { color: #35608a; border-color: #cddcea; background: #f2f6fb; }
+.insight-stamp.insight-type-cleanup { color: #8a5a22; border-color: #ead8bd; background: #fff8ec; }
 
 /* 正文：首行 = 复选框+类型徽标（左）与动作（右）同行；其余行跨两列 */
 .insight-card-body {
@@ -739,6 +740,7 @@
 .insight-card-type.insight-type-style { color: #7b4b6d; }
 .insight-card-type.insight-type-optimization { color: #2c6558; }
 .insight-card-type.insight-type-feature { color: #35608a; }
+.insight-card-type.insight-type-cleanup { color: #8a5a22; }
 
 .insight-card-body > b { color: #264a40; font-size: 14px; font-weight: 700; line-height: 1.45; }
 .insight-card-body > p { margin: 0; color: #4c6b60; font-size: 12.5px; line-height: 1.65; white-space: pre-wrap; }

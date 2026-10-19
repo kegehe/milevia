@@ -108,6 +108,34 @@ func (s *Server) getStorageUsage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, usage)
 }
 
+// storageReadDB keeps expensive read-only measurements off the single
+// business connection. A separate connection does not make VACUUM concurrent,
+// but it prevents a measurement that is waiting on SQLite from queueing every
+// conversation and task request behind it.
+func (s *Server) storageReadDB(ctx context.Context) (*sql.DB, error) {
+	if s.config.DatabasePath == "" || strings.HasPrefix(s.config.DatabasePath, ":memory:") {
+		return s.db, nil
+	}
+	s.storageDBMu.Lock()
+	defer s.storageDBMu.Unlock()
+	if s.storageDB != nil {
+		return s.storageDB, nil
+	}
+	dsn := sqliteDSNWithConnectionPragmas(s.config.DatabasePath) + "&mode=ro"
+	readDB, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open SQLite storage reader: %w", err)
+	}
+	readDB.SetMaxOpenConns(1)
+	readDB.SetMaxIdleConns(1)
+	if err := readDB.PingContext(ctx); err != nil {
+		_ = readDB.Close()
+		return nil, fmt.Errorf("connect SQLite storage reader: %w", err)
+	}
+	s.storageDB = readDB
+	return readDB, nil
+}
+
 // measureStorage 统计数据库占用。整体套 storageMeasureTimeout：超时不自作主张报错，
 // 而是把已经测到的部分标上 measurementComplete=false 返回 —— 设置页能显示大半数字，
 // 总好过让那条唯一连接一直被占着。
@@ -129,20 +157,24 @@ func (s *Server) measureStorage(ctx context.Context) (storageUsageResponse, erro
 	// 会把连接占住几十秒，设置页不能跟着一起挂死。超时按"数字不全"返回已测到的部分。
 	measureCtx, cancel := context.WithTimeout(ctx, storageMeasureTimeout)
 	defer cancel()
+	readDB, err := s.storageReadDB(measureCtx)
+	if err != nil {
+		return partialStorageUsage(usage, err)
+	}
 	usage.MeasurementDone = true
 
-	if err := s.db.QueryRowContext(measureCtx, `pragma page_size`).Scan(&usage.PageSize); err != nil {
+	if err := readDB.QueryRowContext(measureCtx, `pragma page_size`).Scan(&usage.PageSize); err != nil {
 		return partialStorageUsage(usage, err)
 	}
-	if err := s.db.QueryRowContext(measureCtx, `pragma page_count`).Scan(&usage.PageCount); err != nil {
+	if err := readDB.QueryRowContext(measureCtx, `pragma page_count`).Scan(&usage.PageCount); err != nil {
 		return partialStorageUsage(usage, err)
 	}
-	if err := s.db.QueryRowContext(measureCtx, `pragma freelist_count`).Scan(&usage.FreelistPages); err != nil {
+	if err := readDB.QueryRowContext(measureCtx, `pragma freelist_count`).Scan(&usage.FreelistPages); err != nil {
 		return partialStorageUsage(usage, err)
 	}
 	usage.FreelistBytes = usage.FreelistPages * usage.PageSize
 
-	rows, err := s.db.QueryContext(measureCtx, `select name from sqlite_master where type='table' and name in ('messages','events','tasks','task_runs','task_events','remote_outbox') order by name`)
+	rows, err := readDB.QueryContext(measureCtx, `select name from sqlite_master where type='table' and name in ('messages','events','tasks','task_runs','task_events','remote_outbox') order by name`)
 	if err != nil {
 		return partialStorageUsage(usage, err)
 	}
@@ -165,11 +197,11 @@ func (s *Server) measureStorage(ctx context.Context) (storageUsageResponse, erro
 
 	for _, name := range names {
 		item := storageTableUsage{Name: name}
-		if err := s.db.QueryRowContext(measureCtx, `select count(*) from `+name).Scan(&item.Rows); err != nil {
+		if err := readDB.QueryRowContext(measureCtx, `select count(*) from `+name).Scan(&item.Rows); err != nil {
 			return partialStorageUsage(usage, err)
 		}
 		if column := storagePayloadColumn(name); column != "" {
-			estimated, err := s.estimatePayloadBytes(measureCtx, name, column, item.Rows)
+			estimated, err := estimatePayloadBytes(readDB, measureCtx, name, column, item.Rows)
 			if err != nil {
 				return partialStorageUsage(usage, err)
 			}
@@ -207,13 +239,13 @@ func storagePayloadColumn(table string) string {
 // 旧实现是 `select sum(length(payload)) from events` —— 在 64 万行 / 320 MB 的真实库上
 // 要数秒，而它只是给设置页显示一个量级。这里改成只读最新的 N 行求平均行长，再乘总行数；
 // 走 rowid 倒序，成本与表大小无关。返回值标记为估算值（PayloadEstimated）。
-func (s *Server) estimatePayloadBytes(ctx context.Context, table, column string, totalRows int64) (int64, error) {
+func estimatePayloadBytes(db *sql.DB, ctx context.Context, table, column string, totalRows int64) (int64, error) {
 	if totalRows <= 0 {
 		return 0, nil
 	}
 	query := fmt.Sprintf(`select avg(length(%s)) from (select %s from %s order by rowid desc limit ?)`, column, column, table)
 	var average sql.NullFloat64
-	if err := s.db.QueryRowContext(ctx, query, storagePayloadSampleSize).Scan(&average); err != nil {
+	if err := db.QueryRowContext(ctx, query, storagePayloadSampleSize).Scan(&average); err != nil {
 		return 0, err
 	}
 	if !average.Valid {
@@ -245,7 +277,8 @@ func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
 	}
 	result := storageCleanupResult{Before: before}
 	// 精确统计遗留的 thinking_tokens（只有用户主动清理时才值得这一次全表扫）。
-	if err := s.db.QueryRowContext(ctx, `select count(*),coalesce(sum(length(payload)),0) from events e where `+thinkingTokensPredicate("e")).Scan(&result.ThinkingTokenEvents, &result.ThinkingTokenBytes); err != nil {
+	result.ThinkingTokenEvents, result.ThinkingTokenBytes, err = s.thinkingTokenStatsBatched(ctx, thinkingTokenDeleteBatchSize)
+	if err != nil {
 		if ctx.Err() != nil {
 			writeError(w, http.StatusGatewayTimeout, errors.New("清理超时，请稍后重试"))
 			return
@@ -284,6 +317,44 @@ func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteThinkingTokenEvents 分批删除 events 里遗留的 thinking_tokens 遥测，返回删除行数。
+// thinkingTokenStatsBatched walks rowid ranges so each read has a bounded
+// result set. Rowid progression avoids repeatedly rescanning earlier rows.
+func (s *Server) thinkingTokenStatsBatched(ctx context.Context, batchSize int64) (int64, int64, error) {
+	if batchSize <= 0 {
+		return 0, 0, errors.New("thinking token stats batch size must be positive")
+	}
+	predicate := thinkingTokensPredicate("events")
+	var lastRowID, count, bytes int64
+	for {
+		rows, err := s.db.QueryContext(ctx, `select rowid,length(payload) from events where rowid>? and `+predicate+` order by rowid limit ?`, lastRowID, batchSize)
+		if err != nil {
+			return count, bytes, err
+		}
+		batch := 0
+		for rows.Next() {
+			var rowID, payloadLength int64
+			if err := rows.Scan(&rowID, &payloadLength); err != nil {
+				rows.Close()
+				return count, bytes, err
+			}
+			lastRowID = rowID
+			count++
+			bytes += payloadLength
+			batch++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return count, bytes, err
+		}
+		if err := rows.Close(); err != nil {
+			return count, bytes, err
+		}
+		if batch < int(batchSize) {
+			return count, bytes, nil
+		}
+	}
+}
+
 func (s *Server) deleteThinkingTokenEvents(ctx context.Context) (int64, error) {
 	return s.deleteThinkingTokenEventsBatched(ctx, thinkingTokenDeleteBatchSize)
 }

@@ -11,12 +11,13 @@ import test from "node:test";
 // 这个分工是被变异检验逼出来的：最初把「模板依赖优先于表单命令」也写成源码正则，
 // 结果把优先级改反照样绿 —— 文本里 `requires` 与 `return fromPreset` 都还在。
 
-const [page, types, styles, pageStyles, dashboard] = await Promise.all([
+const [page, types, styles, pageStyles, dashboard, model] = await Promise.all([
   readFile(new URL("./pages/McpManagerPage.tsx", import.meta.url), "utf8"),
   readFile(new URL("./lib/types.ts", import.meta.url), "utf8"),
   readFile(new URL("./style.css", import.meta.url), "utf8"),
   readFile(new URL("./pages/mcp-manager.css", import.meta.url), "utf8"),
   readFile(new URL("./pages/DashboardPage.tsx", import.meta.url), "utf8"),
+  readFile(new URL("./features/mcp/mcp-model.ts", import.meta.url), "utf8"),
 ]);
 
 // sliceBetween 取出一段函数体 / 一段 JSX。
@@ -76,12 +77,16 @@ test("主路径只有一条：点目录卡片进向导，其余能力收进「�
   assert.match(advancedBlock, /调用审计/);
   // 「要准备什么」徽标行已随 UI 删除（presetBadges 一并移除），不许悄悄长回来。
   assert.doesNotMatch(page, /presetBadges|mcp-preset-meta|点一次授权即可|可授权，也可填密钥/);
-  // 目录卡片的按钮：统一只叫「连接」（cardActionLabel 已删，不许再出现第二份文案口径），
-  // 且按钮与左侧标题/描述左右分布（mcp-preset-main 左、mcp-preset-action 右），不单独占一行。
+  // 目录卡片按模板 mode 分流：可验证服务进入连接向导，国内候选项打开官方接入说明。
   assert.doesNotMatch(page, /cardActionLabel/);
   const presetCard = sliceBetween(page, 'className="mcp-preset-card"', "</article>");
   assert.match(presetCard, /<div className="mcp-preset-main">/);
-  assert.match(presetCard, /<div className="mcp-preset-action"><button className="primary" type="button" onClick=\{\(\) => openWizard\(preset\)\}>连接<\/button><\/div>/);
+  assert.match(presetCard, /<div className="mcp-preset-action">\{preset\.mode === "manual" \? /);
+  assert.match(page, /parseCustomMCPConfig/);
+  assert.match(page, /redactedMCPConfig/);
+  assert.match(page, /mcp-custom-dropzone/);
+  assert.match(page, /accept="application\/json,.json"/);
+  assert.match(page, /查看接入说明/);
 });
 
 test("向导三屏：起点由模型层决定，界面上不留协议名词", () => {
@@ -200,6 +205,7 @@ test("服务牌位走官方图标：白名单内用 ServiceLogo，白名单外�
     const asset = await readFile(new URL(`./assets/mcp-${key}.svg`, import.meta.url), "utf8");
     assert.match(asset, /<svg[\s\S]+<\/svg>/, `assets/mcp-${key}.svg 不是一份 SVG`);
   }
+  assert.match(model, /case "aliyun":\s*return "aliyun"/);
 });
 
 test("解析与凭据提示共用模型层，页面里不留第二份实现", () => {
@@ -228,7 +234,7 @@ test("过期文案已修正：Codex 不再标「P1 起支持」", () => {
 test("类型声明了目录字段、依赖与凭据落点", () => {
   assert.match(types, /export type MCPPresetCredential = \{[\s\S]*?target: "env" \| "header";[\s\S]*?valuePrefix\?: string;[\s\S]*?docsUrl\?: string;[\s\S]*?\};/);
   assert.match(types, /export type MCPPresetRequirement = \{ command: string; label: string; hint\?: string \};/);
-  assert.match(types, /export type MCPPreset = \{[\s\S]*?summary: string;[\s\S]*?category: string;[\s\S]*?icon: string;[\s\S]*?oauth\?: boolean;[\s\S]*?\};/);
+  assert.match(types, /export type MCPPreset = \{[\s\S]*?summary: string;[\s\S]*?category: string;[\s\S]*?icon: string;[\s\S]*?oauth\?: boolean;[\s\S]*?mode\?: "connect" \| "manual";[\s\S]*?\};/);
   assert.match(types, /export type MCPRuntimeCheckResult = \{[\s\S]*?error\?: string;[\s\S]*?\};/);
 });
 

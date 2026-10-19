@@ -19,6 +19,7 @@ export type AppPreferences = {
 };
 
 export type LocalPreferences = {
+  defaultAgentId: AgentID;
   systemNotificationsEnabled: boolean;
   notifyWhenHidden: boolean;
   windowsToastsEnabled: boolean;
@@ -51,6 +52,7 @@ const safeAppDefaults: AppPreferences = {
 };
 
 const defaultLocalPreferences: LocalPreferences = {
+  defaultAgentId: "claude-code",
   systemNotificationsEnabled: false,
   notifyWhenHidden: true,
   windowsToastsEnabled: false,
@@ -99,6 +101,9 @@ function readLocalPreferences(): LocalPreferences {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return defaultLocalPreferences;
     const value = parsed as Partial<LocalPreferences>;
     return {
+      defaultAgentId: value.defaultAgentId === "codex" || value.defaultAgentId === "codebuddy" || value.defaultAgentId === "claude-code"
+        ? value.defaultAgentId
+        : defaultLocalPreferences.defaultAgentId,
       systemNotificationsEnabled: typeof value.systemNotificationsEnabled === "boolean" ? value.systemNotificationsEnabled : defaultLocalPreferences.systemNotificationsEnabled,
       notifyWhenHidden: typeof value.notifyWhenHidden === "boolean" ? value.notifyWhenHidden : defaultLocalPreferences.notifyWhenHidden,
       windowsToastsEnabled: typeof value.windowsToastsEnabled === "boolean" ? value.windowsToastsEnabled : defaultLocalPreferences.windowsToastsEnabled,

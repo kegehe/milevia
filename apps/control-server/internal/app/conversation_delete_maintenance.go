@@ -77,42 +77,47 @@ func (s *Server) ensureConversationDeleteIntegrity(ctx context.Context) error {
 // SQLite pool holds a single connection, so iterating a live row set while
 // writing would deadlock.
 func (s *Server) cleanOrphanedConversationEvents(ctx context.Context) (int64, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		select e.conversation_id
-		from events e
-		where not exists (select 1 from conversations c where c.id = e.conversation_id)
-		group by e.conversation_id`)
-	if err != nil {
-		return 0, fmt.Errorf("find orphaned conversation events: %w", err)
-	}
-	orphanIDs := []string{}
-	for rows.Next() {
-		var conversationID string
-		if err := rows.Scan(&conversationID); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("read orphaned conversation id: %w", err)
-		}
-		orphanIDs = append(orphanIDs, conversationID)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, err
-	}
-	if err := rows.Close(); err != nil {
-		return 0, err
-	}
-
 	var removed int64
-	for _, conversationID := range orphanIDs {
-		result, err := s.db.ExecContext(ctx, `delete from events where conversation_id=?`, conversationID)
+	const batchSize = 128
+	for {
+		rows, err := s.db.QueryContext(ctx, `
+			select e.conversation_id
+			from events e
+			where not exists (select 1 from conversations c where c.id = e.conversation_id)
+			group by e.conversation_id
+			limit ?`, batchSize)
 		if err != nil {
-			return removed, fmt.Errorf("delete orphaned events for conversation %s: %w", conversationID, err)
+			return removed, fmt.Errorf("find orphaned conversation events: %w", err)
 		}
-		if affected, err := result.RowsAffected(); err == nil {
-			removed += affected
+		orphanIDs := []string{}
+		for rows.Next() {
+			var conversationID string
+			if err := rows.Scan(&conversationID); err != nil {
+				rows.Close()
+				return removed, fmt.Errorf("read orphaned conversation id: %w", err)
+			}
+			orphanIDs = append(orphanIDs, conversationID)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return removed, err
+		}
+		if err := rows.Close(); err != nil {
+			return removed, err
+		}
+		if len(orphanIDs) == 0 {
+			return removed, nil
+		}
+		for _, conversationID := range orphanIDs {
+			result, err := s.db.ExecContext(ctx, `delete from events where conversation_id=?`, conversationID)
+			if err != nil {
+				return removed, fmt.Errorf("delete orphaned events for conversation %s: %w", conversationID, err)
+			}
+			if affected, err := result.RowsAffected(); err == nil {
+				removed += affected
+			}
 		}
 	}
-	return removed, nil
 }
 
 func timeNowForMetadata() string {

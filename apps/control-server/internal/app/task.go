@@ -1215,14 +1215,7 @@ func nullTaskRunID(value string) any {
 }
 
 func taskPrompt(task Task) string {
-	var parts []string
-	if task.Title != "" {
-		parts = append(parts, task.Title)
-	}
-	if task.Description != "" {
-		parts = append(parts, task.Description)
-	}
-	return strings.Join(parts, "\n\n")
+	return task.Description
 }
 
 func (s *Server) taskDispatchEligibility(ctx context.Context, task Task, orchestrated bool) (bool, string, error) {

@@ -22,7 +22,7 @@ func findMCPPreset(id string) (mcpPreset, bool) {
 }
 
 func TestMCPPresetCatalogKeepsOnlyRequestedServices(t *testing.T) {
-	want := map[string]bool{"notion": true, "github": true, "stripe": true}
+	want := map[string]bool{"notion": true, "github": true, "stripe": true, "aliyun": true}
 	presets := mcpPresetCatalog()
 	if len(presets) != len(want) {
 		t.Fatalf("模板目录包含 %d 个服务，期望 %d 个：%v", len(presets), len(want), presets)
@@ -125,11 +125,8 @@ func TestMCPPresetCatalogIsWellFormed(t *testing.T) {
 			}
 			switch credential.Target {
 			case mcpPresetCredentialEnv:
-				// 声明成环境变量的凭据必须真的出现在启动参数里（如 docker 的 `-e KEY`），
-				// 否则用户照着提示填了，却没有任何东西去消费它。
-				if !strings.Contains(strings.Join(preset.Args, " "), credential.Key) {
-					t.Errorf("模板 %s 声明了环境变量凭据 %s，但启动参数里没有引用它", preset.ID, credential.Key)
-				}
+				// stdio server 通过进程环境读取凭据是标准 MCP 配置方式；
+				// 不要求把密钥名重复写进 args，避免把 `${VAR}` 当成字面参数传给 server。
 			case mcpPresetCredentialHeader:
 				// 请求头由用户在表单里填，模板只需要是 http/sse 形态。
 				if preset.Transport == mcpTransportStdio {
@@ -206,15 +203,10 @@ func TestMCPGitHubPresetsPointAtOfficialServer(t *testing.T) {
 		t.Errorf("http 形态的 github 模板应适用于全部环境，实际 %v", remote.Environments)
 	}
 
-	// 「本机运行」分组（含 github-local）已暂时下线（2026-09-24）——这里守着它不许悄悄回来：
-	// 本地形态要用户先装运行时，目录恢复它必须是一个显式决定。
+	// github-local 本地容器形态仍保持下线；其他官方维护的 stdio server（如语雀）
+	// 可以在声明运行时依赖后进入目录。
 	if _, ok := findMCPPreset("github-local"); ok {
 		t.Error("github-local 已随「本机运行」分组下线，不应出现在目录里")
-	}
-	for _, preset := range mcpPresetCatalog() {
-		if preset.Transport == mcpTransportStdio {
-			t.Errorf("模板 %s 是 stdio 形态：本地形态已暂时下线，目录里只应有远程托管条目", preset.ID)
-		}
 	}
 }
 
@@ -249,23 +241,47 @@ func TestMCPCommonPresetsAreOneClick(t *testing.T) {
 		if preset.Category != mcpPresetCategoryCommon {
 			continue
 		}
+		if preset.Mode != mcpPresetModeConnect {
+			continue
+		}
 		count++
-		if !preset.OAuth {
-			t.Errorf("「常用服务」条目 %s 不支持浏览器授权，用户还得自己去申请凭据", preset.ID)
-		}
-		if len(preset.Requires) > 0 {
-			t.Errorf("「常用服务」条目 %s 需要先在目标环境装东西（%+v），不属于一键路径", preset.ID, preset.Requires)
-		}
 		if preset.Transport != mcpTransportHTTP && preset.Transport != mcpTransportSSE {
-			t.Errorf("「常用服务」条目 %s 应为远程形态，实际 %s", preset.ID, preset.Transport)
+			// 本地 stdio 模板（例如语雀）可以连接，但必须显式声明运行时依赖。
+			if preset.Transport != mcpTransportStdio || len(preset.Requires) == 0 {
+				t.Errorf("「常用服务」条目 %s 的传输或运行时依赖声明不完整", preset.ID)
+			}
 		}
 		// 远程地址必须附官方文档，用户才有地方核对「这个地址是不是官方的」。
 		if preset.DocsURL == "" {
 			t.Errorf("「常用服务」条目 %s 未给出官方文档地址", preset.ID)
 		}
 	}
-	if count != 3 {
-		t.Errorf("「常用服务」只有 %d 条，期望保留 Notion、GitHub、Stripe 共 3 条", count)
+	if count != 4 {
+		t.Errorf("「常用服务」只有 %d 条可连接服务，期望 8 条", count)
+	}
+}
+
+func TestMCPOnlyOAuthDomesticPresetIsRetained(t *testing.T) {
+	if _, ok := findMCPPreset("aliyun"); !ok {
+		t.Fatal("缺少阿里云 OAuth 模板")
+	}
+}
+
+func TestMCPDomesticConnectPresetsHaveRealConfiguration(t *testing.T) {
+	for _, id := range []string{"aliyun"} {
+		preset, ok := findMCPPreset(id)
+		if !ok {
+			t.Fatalf("缺少国内可连接模板：%s", id)
+		}
+		if preset.Category != mcpPresetCategoryCommon || preset.Mode != mcpPresetModeConnect {
+			t.Errorf("国内服务 %s 必须是 connect 模式，实际 category=%q mode=%q", id, preset.Category, preset.Mode)
+		}
+		if preset.URL == "" && preset.Command == "" {
+			t.Errorf("国内服务 %s 缺少 URL 或启动命令", id)
+		}
+		if preset.DocsURL == "" {
+			t.Errorf("国内服务 %s 缺少官方实现或文档地址", id)
+		}
 	}
 }
 

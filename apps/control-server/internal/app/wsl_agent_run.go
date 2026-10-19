@@ -334,6 +334,9 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	if request.Model != "" {
 		args = append(args, "-c", fmt.Sprintf("model=%q", request.Model))
 	}
+	if request.ReasoningEffort != "" {
+		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", request.ReasoningEffort))
+	}
 	// MCP 注入：与本地 Codex 一致走 -c；密钥只写变量名，真值需随 wsl.exe 进程环境并经
 	// WSLENV 透传（变量名是任意的，故显式列入转发名单，见 wslBuildEnv）。
 	args = append(args, request.CodexMCPArgs...)

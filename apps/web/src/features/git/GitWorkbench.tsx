@@ -48,7 +48,7 @@ type Confirmation =
   | { type: "fetch"; remote: string }
   | { type: "pull"; remote: string; branch: string }
   | { type: "push"; remote: string; branch: string; setUpstream: boolean }
-  | { type: "switch-branch"; branch: string }
+  | { type: "switch-branch"; branch: string; remote?: boolean }
   | { type: "conflict-abort" }
   | { type: "conflict-finish" };
 
@@ -299,7 +299,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
     if (reason === "probe" && !isGitRepoRef.current) return;
     if (reason === "probe" && reloadInFlightRef.current) { probePendingRef.current = true; return; }
     // 「手上还没有一份完整读数」时，**任何档位都按整份读**：首屏失败之后靠一次事件驱动的
-    // probe 恢复时最要紧 —— 那一档本来只取 summary + changes，分支与操作记录就永远补不上。
+    // probe 恢复时最要紧 —— 那一档只取 summary（其中已经包含 changes），分支与操作记录就永远补不上。
     // 判据是"有没有落地过一份完整读数"，不是"这是第几次调用"。
     const full = reason === "initial" || reason === "manual" || snapshotRef.current === null;
     const base = `/api/projects/${projectID}/git`;
@@ -329,12 +329,8 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       // reconcile / probe **什么都不置**。在位的内容一步都不动 —— 这正是"停在页面上自动
       // 保持最新"与"一直闪"之间唯一的区别（首屏那句「正在读取仓库状态」就是那一闪，
       // 见下面 render 里的 loading 分支）。任何"后台刷新也要转个圈"的想法都会把它带回来。
-      const [nextSnapshot, changesResult, nextBranches, nextOperations] = await Promise.all([
+      const [nextSnapshot, nextBranches, nextOperations] = await Promise.all([
         probeSnapshot ? Promise.resolve(probeSnapshot) : request<GitSnapshot>(withWorkspace(`${base}/summary`)),
-        request<GitChange[]>(withWorkspace(`${base}/changes`)).then(
-          (value) => ({ value } as const),
-          (error) => ({ error } as const),
-        ),
         // 分支列表只在四种情况下要：首屏/手动刷新、用户正看着「分支」tab、刚做过分支操作、
         // 或刚切到那个 tab（`selectTab` 会把 `branches: true` 明确传进来 —— 切 tab 那一刻
         // `tabRef` 还没同步到新值，靠它自己判会漏）。
@@ -350,25 +346,25 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
         full || reason === "reconcile" ? request<GitOperation[]>(withWorkspace(`${base}/operations`)) : null,
       ]);
       if (!mountedRef.current || requestID !== reloadRequest.current) return;
-      if ("error" in changesResult && nextSnapshot.changes === undefined) {
-        throw changesResult.error;
-      }
       snapshotRef.current = nextSnapshot;
       setSnapshot(nextSnapshot);
-      // 新版服务端把 changes 和 summary 在同一次 Git 读取中返回，避免两个并发请求跨过一次提交；
-      // 旧版服务端没有该字段时继续使用独立的 changes 接口。
-      setChanges(nextSnapshot.changes ?? ("value" in changesResult ? changesResult.value : []));
+      setChanges(nextSnapshot.changes ?? []);
       if (nextBranches) setBranches(nextBranches);
       if (nextOperations) setOperations(nextOperations);
       // 主体已经落地：左栏可以显示了。**手动刷新的转圈也到此为止** ——
       // 下面那份冲突总览是这一组里最慢的一条，不该让"刷新"按钮跟着它多转半秒。
       setLoading(false);
       setRefreshing(false);
-      void loadConflicts();
+      if (nextSnapshot.worktree.conflicted > 0) {
+        void loadConflicts();
+      } else {
+        setConflictOverview(null);
+        setConflictsState("ready");
+      }
     } catch (cause) {
       // **整条 probe 链静默**（不只是它第一句话）：那是后台对账，用户没要求过它，
       // 网络抖一下就在他眼皮底下弹一条红条子是噪音 —— 判据用 reason，不用"领没领号"
-      // （后者只覆盖第一跳，第二跳 /changes 超时照样会弹，正是这里修掉的漏网）。
+      // 这样整条后台对账链都不会把网络抖动变成用户可见的错误提示。
       // 代价说清楚：仓库**持续**读不到时，停在这一页的人会看着上一份数据而没人告诉他。
       // 兜住它的是下一次手动刷新（那时会报），以及任何一次写操作的对账。
       if (reason !== "probe" && requestID !== 0 && mountedRef.current && requestID === reloadRequest.current) failRef.current(cause instanceof Error ? cause.message : "无法读取 Git 仓库");
@@ -512,7 +508,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const fetchRemote = (remote: string) => mutate("fetch", "fetch", { remote }, () => setConfirmation(null), { history: true });
   const pullRemote = (remote: string, branch: string) => mutate("pull", "pull", { remote, branch }, () => setConfirmation(null), { history: true });
   const pushBranch = (remote: string, branch: string, setUpstream: boolean) => mutate("push", "push", { remote, branch, setUpstream }, () => setConfirmation(null), { history: true });
-  const switchBranch = (branch: string) => mutate("switch-branch", "switch", { branch }, () => setConfirmation(null), { branches: true, history: true });
+  const switchBranch = (branch: string, remote = false) => mutate("switch-branch", "switch", { branch, remote }, () => setConfirmation(null), { branches: true, history: true });
   const pullTarget = gitPullTarget(snapshot);
 
   // 非 git 项目在空态里发起 git init：成功后置 isGitRepo、通知宿主刷新项目、再加载仓库状态。
@@ -625,7 +621,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
           "屏幕上这份数据不属于当前工作区"，不需要再加一个 snapshot 非空的限定。 */}
       {loading ? <GitSkeleton /> : !snapshot ? <div className="git-empty">无法读取仓库状态</div> : <>
         {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
-        {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} historyRevision={historyRevision} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch) => setConfirmation({ type: "switch-branch", branch })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
+        {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} historyRevision={historyRevision} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch, remote) => setConfirmation({ type: "switch-branch", branch, remote })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
       </>}
     </main>
     {confirmation && <GitConfirmation confirmation={confirmation} snapshot={snapshot} conflictOverview={conflictOverview} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} commitAmend={commitAmend} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pullRemote={pullRemote} pushBranch={pushBranch} switchBranch={switchBranch} abortConflict={abortConflict} finishConflict={finishConflict} />}
@@ -932,7 +928,7 @@ function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount
   fetchRemote: (remote: string) => void;
   pullRemote: (remote: string, branch: string) => void;
   pushBranch: (remote: string, branch: string, setUpstream: boolean) => void;
-  switchBranch: (branch: string) => void;
+  switchBranch: (branch: string, remote?: boolean) => void;
   abortConflict: () => void;
   finishConflict: () => void;
 }) {
@@ -961,7 +957,7 @@ function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount
     else if (confirmation.type === "fetch") fetchRemote(confirmation.remote);
     else if (confirmation.type === "pull") pullRemote(confirmation.remote, confirmation.branch);
     else if (confirmation.type === "push") pushBranch(confirmation.remote, confirmation.branch, confirmation.setUpstream);
-    else if (confirmation.type === "switch-branch") switchBranch(confirmation.branch);
+    else if (confirmation.type === "switch-branch") switchBranch(confirmation.branch, confirmation.remote);
     else if (confirmation.type === "conflict-abort") abortConflict();
     else if (confirmation.type === "conflict-finish") finishConflict();
   };
@@ -972,7 +968,7 @@ function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount
       : confirmation.type === "fetch" ? <><p className="git-confirmation-lead">从 <b>{confirmation.remote}</b> 获取最新更新。</p><div className="git-confirmation-scope"><span>操作说明</span><b>更新远端引用并清理已删除的分支引用</b><small>工作树不会改变</small></div></>
       : confirmation.type === "pull" ? <><p className="git-confirmation-lead">从 <b>{confirmation.remote}</b> 拉取 <b>{confirmation.branch}</b> 并合并最新更新。</p><div className="git-confirmation-scope"><span>操作说明</span><b>仅允许快进合并，历史分叉时会失败以保护提交</b><small>有未提交改动时，冲突文件可能导致拉取失败</small></div></>
       : confirmation.type === "push" ? <><p className="git-confirmation-lead">将 <b>{confirmation.branch}</b> 推送到 <b>{confirmation.remote}</b>。</p><div className="git-confirmation-scope"><span>操作说明</span><b>仅允许普通推送，non-fast-forward 将被拒绝</b>{confirmation.setUpstream ? <small>将同时设置上游跟踪</small> : null}</div></>
-      : confirmation.type === "switch-branch" ? <><div className="git-confirmation-risk"><span>注意</span><p>切换分支前需确保工作区干净且无进行中的 AI 任务。</p></div><p className="git-confirmation-lead">将切换到分支 <b>{confirmation.branch}</b>。</p><div className="git-confirmation-scope"><span>当前分支</span><b>{snapshot?.head.branch || "HEAD"}</b></div></>
+      : confirmation.type === "switch-branch" ? <><div className="git-confirmation-risk"><span>注意</span><p>切换分支前需确保工作区干净且无进行中的 AI 任务。</p></div><p className="git-confirmation-lead">{confirmation.remote ? <>将从远端分支 <b>{confirmation.branch}</b> 检出并切换到本地跟踪分支。</> : <>将切换到分支 <b>{confirmation.branch}</b>。</>}</p><div className="git-confirmation-scope"><span>当前分支</span><b>{snapshot?.head.branch || "HEAD"}</b></div></>
       : confirmation.type === "conflict-abort" ? <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{context && context.operationType !== "none" ? <p className="git-confirmation-lead">正在{operationVerb} <b>{context.theirsLabel || ""} → {context.oursLabel}</b>，中止后将回到操作前状态。</p> : <p className="git-confirmation-lead">将中止当前冲突操作并丢弃所有已做解决的改动。</p>}</>
       : confirmation.type === "conflict-finish" ? <><p className="git-confirmation-lead">所有冲突文件都已解决，将{operationVerb} <b>{context?.theirsLabel || ""} → {context?.oursLabel || ""}</b> 并结束本次操作。</p><div className="git-confirmation-scope"><span>操作说明</span><b>解决结果会以{operationVerb}提交的形式保留</b></div></>
       : <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{confirmation.type === "discard-all" ? <><p className="git-confirmation-lead">已暂存和工作区中的受跟踪改动都会恢复到 <code>HEAD</code>。</p><div className="git-confirmation-scope"><span>受影响内容</span><b>{trackedChangeCount} 个受跟踪文件</b>{untrackedChangeCount > 0 ? <small>另有 {untrackedChangeCount} 个未跟踪文件可选删除</small> : null}</div><label className="git-confirmation-check"><input type="checkbox" checked={includeUntracked} onChange={(event) => setIncludeUntracked(event.target.checked)} />同时删除未跟踪文件</label></> : <><p className="git-confirmation-lead">{isUntracked ? "将永久删除以下未跟踪文件。" : "将以下文件恢复到暂存版本，已暂存内容不会改变。"}</p><code className="git-confirmation-path">{discardPath}</code></>}</>}
@@ -1055,7 +1051,7 @@ function CommitDetailView({ commit, detail, loading, error, selectedFile, fileDi
   </div>;
 }
 
-function Branches({ branches, historyRevision, mutating, projectID, conversationId, request, fail, requestSwitchBranch, requestCreateBranch }: { branches: GitBranch[]; historyRevision: number; mutating: string; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; requestSwitchBranch: (branch: string) => void; requestCreateBranch: (name: string, startPoint: string) => void }) {
+function Branches({ branches, historyRevision, mutating, projectID, conversationId, request, fail, requestSwitchBranch, requestCreateBranch }: { branches: GitBranch[]; historyRevision: number; mutating: string; projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; requestSwitchBranch: (branch: string, remote?: boolean) => void; requestCreateBranch: (name: string, startPoint: string) => void }) {
   const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
   const [showForm, setShowForm] = useState(false);
   const [newName, setNewName] = useState("");
@@ -1088,6 +1084,7 @@ function Branches({ branches, historyRevision, mutating, projectID, conversation
   const remote = branches.filter((b) => b.remote);
   const busy = Boolean(mutating);
   const currentName = branches.find((b) => b.current)?.name || "";
+  const currentUpstream = local.find((branch) => branch.current)?.upstream || "";
   // 选中分支不存在时回退到当前分支，保证始终有一个分支处于选中态。
   const effectiveSelection = selected && branches.some((b) => b.name === selected) ? selected : currentName;
   useEffect(() => {
@@ -1218,7 +1215,8 @@ function Branches({ branches, historyRevision, mutating, projectID, conversation
   };
   const branchRow = (branch: GitBranch, tag: ReactNode) => {
     const isSelected = branch.name === effectiveSelection;
-    return <article key={branch.name} className={isSelected ? "selected" : ""} title={isSelected ? "已选中，右侧显示该分支历史" : "点击查看该分支历史"} tabIndex={0} onClick={() => setSelected(branch.name)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(branch.name); } }}>{tag}<b>{branch.name}</b><small className="git-branch-upstream">{branch.upstream || (branch.remote ? "" : "无上游")}</small>{!branch.remote && !branch.current && <button type="button" className="git-branch-switch-btn" disabled={busy} onClick={(event) => { event.stopPropagation(); requestSwitchBranch(branch.name); }}>切换</button>}</article>;
+    const canSwitch = !branch.current && !(branch.remote && branch.name === currentUpstream);
+    return <article key={branch.name} className={isSelected ? "selected" : ""} title={isSelected ? "已选中，右侧显示该分支历史" : "点击查看该分支历史"} tabIndex={0} onClick={() => setSelected(branch.name)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(branch.name); } }}>{tag}<b>{branch.name}</b><small className="git-branch-upstream">{branch.upstream || (branch.remote ? "" : "无上游")}</small>{canSwitch && <button type="button" className="git-branch-switch-btn" disabled={busy} onClick={(event) => { event.stopPropagation(); requestSwitchBranch(branch.name, branch.remote); }}>{branch.remote ? "检出并切换" : "切换"}</button>}</article>;
   };
   if (branches.length === 0) return <div className="git-branches-view"><div className="git-empty">没有可显示的分支</div></div>;
   return <div className="git-branches-view">

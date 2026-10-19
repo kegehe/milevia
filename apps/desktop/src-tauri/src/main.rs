@@ -11,7 +11,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tauri::{
@@ -37,6 +37,7 @@ const DEV_ORIGIN: &str = "http://127.0.0.1:1420";
 const SIDECAR_READY_PREFIX: &str = "MILEVIA_READY=";
 // 首次打开大型 SQLite 数据库时，控制服务可能需要较长时间完成迁移/恢复。
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 60;
+const SIDECAR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct RunningSidecar {
     child: Child,
@@ -354,15 +355,30 @@ fn build_updater(
         .on_before_exit({
             let app = app.clone();
             move || {
-                stop_agent(&app);
-                stop_sidecar(&app);
+                cleanup_before_process_exit(&app);
                 // `on_before_exit` 会替换 updater 插件默认注册的清理回调。
                 // 安装器接着会启动新版本，因此必须先释放旧进程的托盘与窗口资源。
-                app.cleanup_before_exit();
             }
         })
         .build()
         .map_err(|error| localize_update_error(stage, error))
+}
+
+/// 处理更新器直接退出进程前的清理。
+///
+/// Windows 更新器在 `on_before_exit` 返回后会直接退出进程，不会再发送
+/// `RunEvent::ExitRequested`。先显式移除托盘图标，避免 Shell 中的旧句柄
+/// 与新进程注册的图标短暂重叠。
+fn cleanup_before_process_exit(app: &tauri::AppHandle) {
+    // 更新器回调可能运行在异步命令线程；set_visible 会同步派发到托盘的 UI 线程，
+    // 确保 Windows Shell 先收到隐藏通知，再释放托盘资源。
+    if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
+        let _ = tray.set_visible(false);
+    }
+    drop(app.remove_tray_by_id(TRAY_ICON_ID));
+    stop_agent(app);
+    stop_sidecar(app);
+    app.cleanup_before_exit();
 }
 
 /// 更新链路上出错的是哪一步 —— 决定「<前缀>失败：<原因>」里的前缀。
@@ -812,6 +828,7 @@ async fn install_update_inner(app: &tauri::AppHandle) -> Result<InstallUpdateRes
 }
 
 const TRAY_PANEL_LABEL: &str = "tray-panel";
+const TRAY_ICON_ID: &str = "main-tray";
 /// 面板初始宽度/高度（仅作建窗时的初始值，前端随后按内容自适应覆盖）。
 const TRAY_PANEL_WIDTH: f64 = 220.0;
 const TRAY_PANEL_HEIGHT: f64 = 224.0;
@@ -1448,29 +1465,41 @@ fn start_sidecar(
     }
 }
 
-fn request_graceful_shutdown(sidecar: &RunningSidecar) {
+fn request_graceful_shutdown(sidecar: &RunningSidecar) -> bool {
     let Ok(url) = Url::parse(&sidecar.api_base) else {
-        return;
+        eprintln!("[control-server] graceful shutdown skipped: invalid endpoint {}", sidecar.api_base);
+        return false;
     };
-    let Some(host) = url.host_str() else { return };
+    let Some(host) = url.host_str() else {
+        eprintln!("[control-server] graceful shutdown skipped: endpoint has no host");
+        return false;
+    };
     let Some(port) = url.port_or_known_default() else {
-        return;
+        eprintln!("[control-server] graceful shutdown skipped: endpoint has no port");
+        return false;
     };
-    let Ok(address) = format!("{host}:{port}").to_socket_addrs() else {
-        return;
+    let Ok(addresses) = format!("{host}:{port}").to_socket_addrs() else {
+        eprintln!("[control-server] graceful shutdown skipped: cannot resolve {host}:{port}");
+        return false;
     };
-    let Some(address) = address.into_iter().next() else {
-        return;
+    let Some(address) = addresses.into_iter().next() else {
+        eprintln!("[control-server] graceful shutdown skipped: no address for {host}:{port}");
+        return false;
     };
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(1)) else {
-        return;
+        eprintln!("[control-server] graceful shutdown connection failed at {sidecar_api}", sidecar_api = sidecar.api_base);
+        return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let request = format!(
         "POST /api/internal/shutdown HTTP/1.1\r\nHost: {host}\r\nX-Milevia-Session: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         sidecar.session_token
     );
-    let _ = stream.write_all(request.as_bytes());
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        eprintln!("[control-server] graceful shutdown request failed: {error}");
+        return false;
+    }
+    true
 }
 
 fn stop_sidecar(app: &tauri::AppHandle) {
@@ -1485,13 +1514,22 @@ fn stop_sidecar(app: &tauri::AppHandle) {
 }
 
 fn stop_running_sidecar(sidecar: &mut RunningSidecar) {
-    request_graceful_shutdown(sidecar);
-    for _ in 0..50 {
+    if matches!(sidecar.child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let requested = request_graceful_shutdown(sidecar);
+    let deadline = Instant::now() + SIDECAR_SHUTDOWN_TIMEOUT;
+    while Instant::now() < deadline {
         if matches!(sidecar.child.try_wait(), Ok(Some(_))) {
             return;
         }
         thread::sleep(Duration::from_millis(100));
     }
+    eprintln!(
+        "[control-server] graceful shutdown timed out after {}s{}; forcing process termination",
+        SIDECAR_SHUTDOWN_TIMEOUT.as_secs(),
+        if requested { "" } else { " (request was not delivered)" }
+    );
     let _ = sidecar.child.kill();
     let _ = sidecar.child.wait();
 }
@@ -1892,7 +1930,7 @@ fn set_panel_size(
 fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
     // Windows 托盘必须在创建时显式提供图标，否则 Shell_NotifyIconW(NIM_ADD) 只注册一个
     // “无图标”的托盘项，任务栏通知区不会渲染出任何可见图标。
-    let tray = TrayIconBuilder::with_id("main-tray")
+    let tray = TrayIconBuilder::with_id(TRAY_ICON_ID)
         // 去掉原生左键菜单；右键仍由品牌覆盖层面板承载，左键切换主窗口显隐。
         .icon(
             app.default_window_icon()
@@ -2037,6 +2075,9 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_autostart::Builder::new()
+            .args(["--autostart"])
+            .build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             show_main_window,

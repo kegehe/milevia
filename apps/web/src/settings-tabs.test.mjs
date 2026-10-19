@@ -21,8 +21,8 @@ test("设置页用分页（tablist）而不是常驻锚点导航", () => {
 });
 
 test("分页表是唯一的分组来源，且六个分组齐全", () => {
-  // 顺序、标题、面板内容都从 TAB_ORDER / TAB_LABELS 取；这里钉住条目本身。
-  assert.match(page, /const TAB_ORDER: TabId\[\] = \["general", "notifications", "security", "tasks", "data", "about"\]/);
+  // 顺序、标题、面板内容都从 DESKTOP_TAB_ORDER / TAB_LABELS 取；这里钉住条目本身。
+  assert.match(page, /const DESKTOP_TAB_ORDER: TabId\[\] = \["general", "notifications", "security", "tasks", "data", "about"\]/);
   for (const id of ["general", "notifications", "security", "tasks", "data", "about"]) {
     assert.match(page, new RegExp(`activeTab === "${id}" &&`), `缺少 ${id} 面板的渲染分支`);
   }
@@ -32,7 +32,22 @@ test("分页状态以 hash 为唯一真相（刷新与前进后退都靠它）",
   assert.match(page, /window\.history\.replaceState\(null, "", `#\$\{next\}`\)/);
   assert.match(page, /addEventListener\("hashchange", sync\)/);
   // 组件内不得另外维护一份与 hash 并行的分组 state 来源
-  assert.match(page, /useState<TabId>\(readTabFromHash\)/);
+  assert.match(page, /useState<TabId>\(\(\) => readTabFromHash\(tabOrder\)\)/);
+});
+
+test("手机端只展示本机设置，不展示桌面执行配置", () => {
+  assert.match(page, /const MOBILE_TAB_ORDER: TabId\[\] = \["general", "notifications", "data", "about"\]/);
+  assert.match(page, /const mobileSettings = !isDesktop\(\)/);
+  assert.match(page, /!mobileSettings && activeTab === "security"/);
+  assert.match(page, /!mobileSettings && activeTab === "tasks"/);
+  assert.match(page, /任务由当前连接的电脑执行/);
+  assert.match(page, /if \(raw && isTabId\(raw\) && !tabOrder\.includes\(raw\)\) window\.history\.replaceState\(null, "", "#general"\)/);
+});
+
+test("手机端默认 Agent 使用本地偏好并展示完整工具目录", () => {
+  assert.match(page, /import \{ MOBILE_AGENTS \} from "\.\.\/lib\/mobile-agent-catalog"/);
+  assert.match(page, /value=\{localPreferences\.defaultAgentId\}/);
+  assert.match(page, /MOBILE_AGENTS\.map\(\(agent\) =>/);
 });
 
 test("分页键盘导航按 roving tabindex 接线", () => {

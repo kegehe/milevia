@@ -77,6 +77,17 @@ func (r *windowsAgentRunner) codexVersion(ctx context.Context) string {
 	return agentVersionFromOutput(out)
 }
 
+func (r *windowsAgentRunner) claudeCLIConfig(ctx context.Context) CLIConfigSnapshot {
+	out, err := windowsBridgeProbe(ctx, "$dir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }; Get-Content -Raw (Join-Path $dir 'settings.json')")
+	if err != nil {
+		return CLIConfigSnapshot{Source: "cli", SourceLabel: "Windows Claude Code CLI 配置", CredentialState: "unavailable", Error: "无法读取 Windows Claude settings.json"}
+	}
+	view := parseClaudeCLIConfig([]byte(out))
+	view.SourceLabel = "Windows Claude Code CLI 配置"
+	view.Readable = true
+	return view
+}
+
 // Ready implements AgentRunner（Claude 就绪，用于 claude 分发与 createProject 校验）。
 func (r *windowsAgentRunner) Ready(parent context.Context) bool { return r.claudeReady(parent) }
 

@@ -47,6 +47,7 @@ const (
 	insightStyle        = "style"
 	insightOptimization = "optimization"
 	insightFeature      = "feature"
+	insightCleanup      = "cleanup"
 )
 
 // 严重度枚举。
@@ -299,7 +300,7 @@ func normalizeScanTypes(types []string) []string {
 		seen[t] = true
 		out = append(out, t)
 	}
-	// 全四个都被勾选等价于全查 → 归 nil，让 prompt 走"覆盖四类"原文。
+	// 全部类型都被勾选等价于全查 → 归 nil，让 prompt 走全量语义。
 	if len(out) == len(insightTypeOrder) {
 		return nil
 	}
@@ -475,7 +476,7 @@ type pendingInsight struct {
 // 因此候选发现的结果集要写成 {findings:[...]} 包一层（parseInsightCandidates
 // 本就同时接受裸数组与该包裹形态，故对模型侧无兼容负担）。
 var (
-	insightCandidatesOutputSchema = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["bug","style","optimization","feature"]},"severity":{"type":"string","enum":["low","normal","high"]},"title":{"type":"string"},"summary":{"type":"string"},"fileHint":{"type":"string"}},"required":["type","severity","title","summary","fileHint"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
+	insightCandidatesOutputSchema = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["bug","style","optimization","feature","cleanup"]},"severity":{"type":"string","enum":["low","normal","high"]},"title":{"type":"string"},"summary":{"type":"string"},"fileHint":{"type":"string"}},"required":["type","severity","title","summary","fileHint"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 	insightVerifyOutputSchema     = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer","minimum":1},"confirmed":{"type":"boolean"},"reason":{"type":"string"}},"required":["index","confirmed","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 	insightReverifyOutputSchema   = json.RawMessage(`{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer","minimum":1},"status":{"type":"string","enum":["valid","invalid","uncertain"]},"reason":{"type":"string"}},"required":["index","status","reason"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`)
 )
@@ -1111,14 +1112,15 @@ var insightTypeLabels = map[string]string{
 	insightStyle:        "样式问题",
 	insightOptimization: "可优化项",
 	insightFeature:      "可新增功能",
+	insightCleanup:      "可清理项",
 }
 
-var insightTypeOrder = []string{insightBug, insightStyle, insightOptimization, insightFeature}
+var insightTypeOrder = []string{insightBug, insightStyle, insightOptimization, insightFeature, insightCleanup}
 
 // buildInsightScanPrompt 组装 Pass A 的发现 prompt（docs/25 §5.2）。
 // opts 携带本次方向：theme（”=全面）+ types（空=全查）。
 func buildInsightScanPrompt(projectPath, repoSHA string, alreadySurfaced []string, opts scanOpts) string {
-	// 类型段：按 opts.Types 过滤；空 = 覆盖全部四类（原全量语义）。
+	// 类型段：按 opts.Types 过滤；空 = 覆盖全部类型（原全量语义）。
 	var types []string
 	if len(opts.Types) == 0 {
 		for _, t := range insightTypeOrder {
@@ -1150,14 +1152,15 @@ func buildInsightScanPrompt(projectPath, repoSHA string, alreadySurfaced []strin
 - %s
 
 硬性输出要求：你的整个回复只能包含一个 JSON 对象，不允许有任何前言、注释、Markdown 围栏、或对象之后的任何文字。对象形如 {"findings":[ ... ]}，findings 数组里每条为：
-{"type":"bug|style|optimization|feature","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
+{"type":"bug|style|optimization|feature|cleanup","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
 
 约束：
 1. title 和 summary 用用户能看懂的表述（界面能看到/用到），禁止代码标识符、行号、堆栈。
 2. 【不重复】以下为本项目前几批已报告过的建议。凡已在清单里、或经核对项目当前已实现/具备的，一律不得再报（宁缺毋滥，最多 30 条）：
 %s
 3. 每条都先到项目里核实确有其事再报；拿不准的不要报。
-4. 你看不到运行中的浏览器，样式问题依据代码结构与组件树推断即可。`,
+4. 你看不到运行中的浏览器，样式问题依据代码结构与组件树推断即可。
+5. cleanup 只报告有直接证据的无用文件、目录、构建产物、重复资源、不可达代码或死逻辑；不要建议直接批量删除，summary 中说明需要人工确认。`,
 		projectPath, repoSHA, themeLine, strings.Join(types, "\n- "), prev)
 }
 
@@ -1191,9 +1194,10 @@ func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string
 
 这一次的硬性要求（必须严格遵守）：
 1. 你的整段回复必须是且仅是一个 JSON 对象 {"findings":[ ... ]}，前面、后面、中间都不允许有任何说明文字、思考、标题、示例或 Markdown 围栏。
-2. findings 是 JSON 数组，元素格式：{"type":"bug|style|optimization|feature","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
+2. findings 是 JSON 数组，元素格式：{"type":"bug|style|optimization|feature|cleanup","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
 3. 宁缺毋滥：只报你直接核实过的发现；拿不稳的不报，最少可以只报 1 条，但必须给出 findings 数组。
 4. title 用用户能看懂的表述；禁止代码标识符、行号、堆栈。
+5. cleanup 只报告有直接证据的无用文件、目录、构建产物、重复资源、不可达代码或死逻辑；不要建议直接批量删除，summary 中说明需要人工确认。
 
 现在只输出那个 JSON 对象：`, projectPath, repoSHA, themeLine, strings.Join(types, "\n- "))
 }
@@ -3683,7 +3687,7 @@ func (s *Server) updateInsightFinding(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
-// normalizeInsightTypeOrDefault 把任意字符串归一到四类枚举之一（非法值回退 optimization）。
+// normalizeInsightTypeOrDefault 把任意字符串归一到已知枚举之一（非法值回退 optimization）。
 func normalizeInsightTypeOrDefault(value string) string {
 	for _, known := range insightTypeOrder {
 		if value == known {
@@ -3791,7 +3795,11 @@ func buildInsightTaskDescription(f InsightFinding) string {
 	if hint := strings.TrimSpace(f.FileHint); hint != "" {
 		lines = append(lines, "相关位置："+hint)
 	}
-	lines = append(lines, "", "请据此排查并修复上述问题/实现上述功能。")
+	if f.Type == insightCleanup {
+		lines = append(lines, "", "请先确认该文件、目录或代码确实无用，再执行删除或重构；不要直接批量删除。")
+	} else {
+		lines = append(lines, "", "请据此排查并修复上述问题/实现上述功能。")
+	}
 	return strings.Join(lines, "\n")
 }
 

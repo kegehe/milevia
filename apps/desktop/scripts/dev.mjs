@@ -165,6 +165,10 @@ try {
   // The command-line guard prevents terminating an unrelated project that may
   // happen to use the same development port.
   releaseDevPort();
+  // A cloud URL is mandatory for release builds, but local desktop development
+  // must also work without remote Agent enrollment configured. This value is
+  // scoped to the dev process and is never set by the release build command.
+  process.env.MILEVIA_ALLOW_UNCONFIGURED_AGENT ||= "1";
   // Reuse the local Agent configuration for the desktop sidecar during
   // development. The control server needs the cloud relay variables too;
   // previously only start-agent.ps1 loaded them, leaving pairing disabled in

@@ -1617,6 +1617,17 @@ func TestBuildInsightTaskDescriptionTruncatesLongSummary(t *testing.T) {
 	}
 }
 
+func TestBuildInsightTaskDescriptionForCleanupRequiresConfirmation(t *testing.T) {
+	desc := buildInsightTaskDescription(InsightFinding{
+		Type:    insightCleanup,
+		Title:   "未使用的构建目录",
+		Summary: "目录没有被项目配置引用。",
+	})
+	if !strings.Contains(desc, "先确认") || !strings.Contains(desc, "不要直接批量删除") {
+		t.Fatalf("cleanup task should require confirmation before deletion: %s", desc)
+	}
+}
+
 // 同一建议连续转两次任务：第一次成功并删掉建议，第二次应 404（避免一条建议建出多个任务）。
 func TestAddInsightToTaskSecondAttemptNotFound(t *testing.T) {
 	server := newTestServer(t)

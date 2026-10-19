@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -263,9 +264,14 @@ func (s *Server) gitSummary(w http.ResponseWriter, r *http.Request) {
 // 成功后把探测到的分支名写回项目行，供列表/标签页/工作台一致显示。
 func (s *Server) gitInit(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
-	// 与删除/建工作区串行，避免初始化过程中项目被删除留下孤立 .git。
-	s.projectLifecycleMu.Lock()
-	defer s.projectLifecycleMu.Unlock()
+	// Git 初始化可能是本地、WSL 或 SSH 操作，不能持有全局生命周期锁跨越
+	// 外部命令；项目工作区租约已经足够串行同一项目的工作区写入。
+	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, "git-init")
+	if !acquired {
+		writeError(w, http.StatusConflict, errors.New("项目工作区正在被其他任务占用，请稍候再试"))
+		return
+	}
+	defer releaseWorkspace()
 	runner, repo, err := s.gitRunnerForProject(r.Context(), projectID)
 	if err != nil {
 		writeProjectResolveError(w, err)
@@ -935,6 +941,7 @@ func (s *Server) gitCreateBranch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Branch     string `json:"branch"`
+		Remote     bool   `json:"remote"`
 		StateToken string `json:"stateToken"`
 	}
 	if !decode(w, r, &input) {
@@ -953,22 +960,29 @@ func (s *Server) gitSwitchBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	for _, change := range state.changes {
-		if change.Conflicted {
-			writeError(w, http.StatusConflict, errors.New("resolve Git conflicts before switching branches"))
-			return
-		}
-		if change.Staged || change.Modified || change.Deleted || change.Renamed || change.Untracked {
-			writeError(w, http.StatusConflict, errors.New("commit or discard changes before switching branches"))
-			return
-		}
-	}
 	if state.snapshot.Head.Branch == input.Branch && !state.snapshot.Head.Detached {
 		writeError(w, http.StatusConflict, errors.New("already on the target branch"))
 		return
 	}
 	result, err := s.executeGitOperationForWorkspace(r.Context(), runner, projectID, state.workspaceID, state.workspacePath, repo, "switch_branch",
 		fmt.Sprintf("切换到 %s", input.Branch), state.snapshot, func(runner GitRunner) error {
+			if input.Remote {
+				separator := strings.IndexByte(input.Branch, '/')
+				if separator <= 0 || separator == len(input.Branch)-1 {
+					return errors.New("remote branch must include a remote name")
+				}
+				local := input.Branch[separator+1:]
+				branches, err := runner.Branches(r.Context(), repo)
+				if err != nil {
+					return err
+				}
+				for _, branch := range branches {
+					if !branch.Remote && branch.Name == local {
+						return runner.SwitchBranch(r.Context(), repo, local)
+					}
+				}
+				return runner.CheckoutRemoteBranch(r.Context(), repo, local, input.Branch)
+			}
 			return runner.SwitchBranch(r.Context(), repo, input.Branch)
 		})
 	if err != nil {
@@ -1315,6 +1329,19 @@ func gitOperationFailure(err error) (status, code, message string) {
 }
 
 func readGitState(ctx context.Context, runner GitRunner, repo string) (GitSnapshot, []GitChange, map[string]string, error) {
+	if combined, ok := runner.(interface {
+		SnapshotAndChanges(context.Context, string) (GitSnapshot, []GitChange, error)
+	}); ok {
+		snapshot, changes, err := combined.SnapshotAndChanges(ctx, repo)
+		if err != nil {
+			return GitSnapshot{}, nil, nil, err
+		}
+		fingerprints, err := gitChangeFingerprintsWithContext(ctx, runner, repo, changes)
+		if err != nil {
+			return GitSnapshot{}, nil, nil, err
+		}
+		return snapshot, changes, fingerprints, nil
+	}
 	snapshot, err := runner.Snapshot(ctx, repo)
 	if err != nil {
 		return GitSnapshot{}, nil, nil, err
@@ -1323,7 +1350,20 @@ func readGitState(ctx context.Context, runner GitRunner, repo string) (GitSnapsh
 	if err != nil {
 		return GitSnapshot{}, nil, nil, err
 	}
-	return snapshot, changes, gitChangeFingerprints(runner, repo, changes), nil
+	fingerprints, err := gitChangeFingerprintsWithContext(ctx, runner, repo, changes)
+	if err != nil {
+		return GitSnapshot{}, nil, nil, err
+	}
+	return snapshot, changes, fingerprints, nil
+}
+
+func gitChangeFingerprintsWithContext(ctx context.Context, runner GitRunner, repo string, changes []GitChange) (map[string]string, error) {
+	if batch, ok := runner.(interface {
+		GitChangeFingerprints(context.Context, string, []GitChange) (map[string]string, error)
+	}); ok {
+		return batch.GitChangeFingerprints(ctx, repo, changes)
+	}
+	return gitChangeFingerprints(runner, repo, changes), nil
 }
 
 func gitChangeFingerprints(runner GitRunner, repo string, changes []GitChange) map[string]string {
@@ -1588,8 +1628,20 @@ func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner
 		return nil, "", false
 	}
 	project := workspace.Project
+	if project.Runner == "wsl-local" && runtime.GOOS == "windows" {
+		wslRunner, ok := s.wslAgentRunner().(*wslAgentRunner)
+		if !ok || wslRunner == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("WSL runner is unavailable"))
+			return nil, "", false
+		}
+		if _, ok := uncToWslPath(workspace.Workspace.Path, wslRunner.distro); !ok {
+			// Keep synthetic/local paths usable for tests and legacy data. Real WSL
+			// projects are always stored as matching UNC paths.
+			return newGitRunner(), workspace.Workspace.Path, true
+		}
+		return newWSLGitRunner(wslRunner.distro), workspace.Workspace.Path, true
+	}
 	if isLocalRunnerID(project.Runner) || project.Runner == "wsl-local" {
-		// wsl-local 也走本地 GitRunner 直读 UNC（与 fs_handler 复用 LocalFilesystem 一致）。
 		return newGitRunner(), workspace.Workspace.Path, true
 	}
 	runner, ok := s.runnerRegistry.get(project.Runner)
@@ -1616,8 +1668,17 @@ func (s *Server) gitRunnerForProject(ctx context.Context, projectID string) (Git
 	if err != nil {
 		return nil, "", err
 	}
+	if project.Runner == "wsl-local" && runtime.GOOS == "windows" {
+		wslRunner, ok := s.wslAgentRunner().(*wslAgentRunner)
+		if !ok || wslRunner == nil {
+			return nil, "", errors.New("WSL runner is unavailable")
+		}
+		if _, ok := uncToWslPath(project.Path, wslRunner.distro); !ok {
+			return newGitRunner(), project.Path, nil
+		}
+		return newWSLGitRunner(wslRunner.distro), project.Path, nil
+	}
 	if isLocalRunnerID(project.Runner) || project.Runner == "wsl-local" {
-		// wsl-local 也走本地 GitRunner 直读 UNC。
 		return newGitRunner(), project.Path, nil
 	}
 	runner, ok := s.runnerRegistry.get(project.Runner)

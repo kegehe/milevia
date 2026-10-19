@@ -81,13 +81,15 @@ test("counts findings by type", () => {
     makeFinding("1", { type: "bug" }),
     makeFinding("2", { type: "bug" }),
     makeFinding("3", { type: "feature" }),
+    makeFinding("4", { type: "cleanup" }),
   ];
-  assert.deepEqual(insightFindingCounts(findings), { all: 3, bug: 2, style: 0, optimization: 0, feature: 1 });
+  assert.deepEqual(insightFindingCounts(findings), { all: 4, bug: 2, style: 0, optimization: 0, feature: 1, cleanup: 1 });
 });
 
 test("normalizes invalid type and severity", () => {
   assert.equal(normalizeInsightType("weird"), "optimization");
   assert.equal(normalizeInsightType("bug"), "bug");
+  assert.equal(normalizeInsightType("cleanup"), "cleanup");
   assert.equal(normalizeInsightSeverity("extreme"), "normal");
   assert.equal(normalizeInsightSeverity("high"), "high");
 });
@@ -95,6 +97,7 @@ test("normalizes invalid type and severity", () => {
 test("labels map to Chinese user-facing text", () => {
   assert.equal(insightTypeLabels.bug, "有 bug");
   assert.equal(insightTypeLabels.feature, "可新增功能");
+  assert.equal(insightTypeLabels.cleanup, "可清理项");
   assert.equal(insightSeverityLabels.high, "高");
 });
 

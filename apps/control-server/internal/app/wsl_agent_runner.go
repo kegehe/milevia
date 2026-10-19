@@ -107,11 +107,12 @@ const (
 	wslProbeKeyCodexModel    = "codex-default-model"
 	wslProbeKeyCodexCatalog  = "codex-model-catalog"
 
-	wslProbeCommandClaudeAuth = "claude auth status"
-	wslProbeCommandClaudeVer  = "claude --version"
-	wslProbeCommandCodexVer   = "codex --version"
-	wslProbeCommandCodexModel = `cat "$HOME/.codex/config.toml" 2>/dev/null`
-	wslProbeCommandCodexCat   = "codex debug models 2>/dev/null"
+	wslProbeCommandClaudeAuth   = "claude auth status"
+	wslProbeCommandClaudeVer    = "claude --version"
+	wslProbeCommandCodexVer     = "codex --version"
+	wslProbeCommandCodexModel   = `codex_home="${CODEX_HOME:-$HOME/.codex}"; cat "$codex_home/config.toml" 2>/dev/null`
+	wslProbeCommandClaudeConfig = `claude_config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; cat "$claude_config_dir/settings.json" 2>/dev/null`
+	wslProbeCommandCodexCat     = "codex debug models 2>/dev/null"
 )
 
 // newWSLAgentRunner 构造 WSL runner。background 是后台刷新用的生命周期上下文，
@@ -390,6 +391,28 @@ func (r *wslAgentRunner) codexDefaultModel(ctx context.Context) string {
 		return ""
 	}
 	return codexModelFromConfig([]byte(entry.value))
+}
+
+func (r *wslAgentRunner) codexCLIConfig(ctx context.Context) CLIConfigSnapshot {
+	entry := r.probe(ctx, wslProbeKeyCodexModel, wslProbeCommandCodexModel)
+	if !entry.ready {
+		return CLIConfigSnapshot{Source: "cli", SourceLabel: "WSL Codex CLI 配置", CredentialState: "unavailable", Error: "无法读取 WSL 内 Codex config.toml"}
+	}
+	view := parseCodexCLIConfig([]byte(entry.value))
+	view.SourceLabel = "WSL Codex CLI 配置"
+	view.Readable = true
+	return view
+}
+
+func (r *wslAgentRunner) claudeCLIConfig(ctx context.Context) CLIConfigSnapshot {
+	entry := r.probe(ctx, "claude-cli-config", wslProbeCommandClaudeConfig)
+	if !entry.ready {
+		return CLIConfigSnapshot{Source: "cli", SourceLabel: "WSL Claude Code CLI 配置", CredentialState: "unavailable", Error: "无法读取 WSL 内 Claude settings.json"}
+	}
+	view := parseClaudeCLIConfig([]byte(entry.value))
+	view.SourceLabel = "WSL Claude Code CLI 配置"
+	view.Readable = true
+	return view
 }
 
 // codexModelCatalog 列出 WSL 内 Codex 的模型目录（modelCatalogRunner 实现）。

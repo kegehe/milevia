@@ -21,7 +21,7 @@ export type ProjectProcessStatusMap = Record<string, ProjectProcessStatus>;
 export type RunStatusEvent = { projectId: string; status: RunStatus; sequence?: number; startedAt?: string | null; pid?: number | null };
 export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
-export type AgentID = "claude-code" | "codex";
+export type AgentID = "claude-code" | "codex" | "codebuddy";
 export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; modelOverride?: string; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean; isOrchestration?: boolean };
 // 托盘面板"最近会话"（GET /api/conversations/recent）：会话摘要 + 所属项目名。
 export type RecentConversation = Conversation & { projectId: string; projectName: string };
@@ -31,8 +31,9 @@ export type AgentModelOption = { id: string; label?: string; description?: strin
 // 前端也可能连到更早的 sidecar 二进制（Go 的 nil 切片会序列化成 null）。写死成非空
 // 数组曾经让渲染路径上的 .length 直接抛错——取值一律经 lib/model-options.ts 的
 // modelList()，类型上就不要再假装它一定在。
-export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[] | null; customAllowed: boolean; note?: string };
+export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[] | null; customAllowed: boolean; reasoningEffort?: string; reasoningOptions?: string[]; note?: string };
 export type ConversationWorkspace = { id: string; conversationId: string; generation: number; mode: "project_shared" | "isolated_worktree" | string; path: string; branch?: string; baseRevision?: string; state: "provisioning" | "ready" | "active" | "failed" | "archived" | string; active?: boolean; createdAt: string; archivedAt?: string | null };
+export type ConversationCheckpoint = { id: string; conversationId: string; parentId?: string; agentId: AgentID | string; nativeSessionId?: string; nativeTurnId?: string; prompt: string; status: "active" | "rewound" | string; createdAt: string; rewoundAt?: string | null; metadata?: string };
 export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 export type ShortcutKind = "prompt" | "snippet" | "command_request";
 export type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };
@@ -226,6 +227,8 @@ export type MCPPreset = {
   oauth?: boolean;
   docsUrl?: string;
   note?: string;
+  // connect 可进入一键连接；manual 仅展示官方接入说明，避免使用未经确认的 endpoint。
+  mode?: "connect" | "manual";
 };
 
 // —— 运行时依赖检查（POST /api/mcp/runtime-check，保存前调用） ——
