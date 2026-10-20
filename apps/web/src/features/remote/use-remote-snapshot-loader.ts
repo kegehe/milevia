@@ -11,6 +11,7 @@ type MutableNumber = { current: number };
 export type RemoteSnapshotLoaderOptions<S extends SnapshotWithRevision> = {
   instanceID: () => string;
   readToken: () => string;
+  scopeKey?: unknown;
   request: (path: string) => Promise<S & { unchanged?: boolean }>;
   requestPath: (instanceID: string, baseline: number, force: boolean) => string;
   normalize: (value: S & { unchanged?: boolean }) => S;
@@ -38,11 +39,12 @@ export function createRemoteSnapshotLoader<S extends SnapshotWithRevision>(
     if (!target) return { outcome: "skipped", snapshot: null };
     const requestGeneration = ++generationRef.current;
     const requestToken = current.readToken();
+    const requestScope = current.scopeKey;
     const baseline = loadOptions?.instanceId && loadOptions.instanceId !== selectedInstanceID ? -1 : revisionRef.current;
     if (!loadOptions?.silent) current.reportError("");
     try {
       const response = await current.request(current.requestPath(target, baseline, loadOptions?.force === true));
-      if (!isCurrentRemoteRequest(requestGeneration, generationRef.current, requestToken, current.readToken())) {
+      if (!isCurrentRemoteRequest(requestGeneration, generationRef.current, requestToken, options().readToken()) || requestScope !== options().scopeKey) {
         return { outcome: "skipped", snapshot: null };
       }
       if (response?.unchanged) return { outcome: "unchanged", snapshot: null };
@@ -56,7 +58,7 @@ export function createRemoteSnapshotLoader<S extends SnapshotWithRevision>(
       }
       return { outcome: "unchanged", snapshot };
     } catch (cause) {
-      if (!isCurrentRemoteRequest(requestGeneration, generationRef.current, requestToken, current.readToken())) {
+      if (!isCurrentRemoteRequest(requestGeneration, generationRef.current, requestToken, options().readToken()) || requestScope !== options().scopeKey) {
         return { outcome: "skipped", snapshot: null };
       }
       const reason = cause instanceof Error ? cause.message : current.unavailableMessage;

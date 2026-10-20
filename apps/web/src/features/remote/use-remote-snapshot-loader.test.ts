@@ -49,6 +49,33 @@ test("remote snapshot loader ignores a superseded request", async () => {
   assert.deepEqual(state.applied, [{ snapshotRevision: 2, projects: ["new", "merged"] }]);
 });
 
+test("remote snapshot loader ignores an old device epoch even when its token is reused", async () => {
+  const pending = deferred<Snapshot>();
+  let scope = 1;
+  const revision = { current: -1 };
+  const generation = { current: 0 };
+  const applied: Snapshot[] = [];
+  const loader = createRemoteSnapshotLoader(() => ({
+    instanceID: () => "instance-a",
+    readToken: () => "token-a",
+    scopeKey: scope,
+    request: () => pending.promise,
+    requestPath: () => "/snapshots/instance-a",
+    normalize: (value) => value,
+    mergeSnapshot: (value) => value,
+    setSnapshot: (value) => applied.push(value),
+    reportError: () => undefined,
+    readCache: () => null,
+    writeCache: () => undefined,
+    unavailableMessage: "unavailable",
+  }), revision, generation);
+  const request = loader();
+  scope = 2;
+  pending.resolve({ snapshotRevision: 1, projects: ["old"] });
+  assert.deepEqual(await request, { outcome: "skipped", snapshot: null });
+  assert.deepEqual(applied, []);
+});
+
 test("remote snapshot loader sends force refresh through the request path", async () => {
   const state = setup(async () => ({ snapshotRevision: 1, projects: [] }));
   await state.loader({ force: true });

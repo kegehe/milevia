@@ -12,6 +12,9 @@ const styles = normalize(await readFile(new URL("./pages/mobile-remote.css", imp
 // 设备表（多设备 + 备注名）那一层。这里只做**结构/接线**断言：`alias` 是不是走同一处归一化、
 // 重新配对有没有继承。真正的行为判据在 `lib/mobile-devices.test.ts`（那份能直接跑函数）。
 const lib = normalize(await readFile(new URL("./lib/mobile-devices.ts", import.meta.url), "utf8"));
+const remoteDevicesHook = normalize(await readFile(new URL("./features/remote/use-remote-devices.ts", import.meta.url), "utf8"));
+const nativeScannerHook = normalize(await readFile(new URL("./features/remote/use-native-barcode-scanner.ts", import.meta.url), "utf8"));
+const pendingTasksHook = normalize(await readFile(new URL("./features/remote/use-mobile-pending-tasks.ts", import.meta.url), "utf8"));
 // 剥掉 CSS 注释后的样式正文。**negative 断言必须拿它来比**：解释"为什么把这一组规则删掉"的
 // 注释里会原样写出那些选择器，直接对 `styles` 做 `doesNotMatch` 会被自己的注释满足
 // （同一个坑在 JSX 那边叫 `page.replace(/^\s*\/\/.*$/gm, "")`，见 TOOLING「断言前先剥注释」）。
@@ -983,7 +986,8 @@ test("mobile task forms only expose a required description", () => {
 test("mobile task mutations apply locally before the command round trip", () => {
   // 项目列表必须是"快照 + 待确认改动"叠出来的，否则本地改完立刻被下一次快照顶掉。
   assert.match(page, /applyPendingTaskMutations\(snapshot\?\.projects \|\| \[\], pendingTaskRef\.current\.values\(\)\)/);
-  assert.match(page, /import \{ applyPendingTaskMutations, mutationReflectsInSnapshot, newPendingTaskID, withResolvedCreateID, type PendingTaskMutation \} from "\.\.\/lib\/task-mutations";/);
+  assert.match(page, /import \{ useMobilePendingTasks \} from "\.\.\/features\/remote\/use-mobile-pending-tasks";/);
+  assert.match(page, /const \{ pendingTaskRef, pendingTaskRevision, pendingTaskBusy,[\s\S]*?\} = useMobilePendingTasks\(\);/);
 
   // 三个入口都必须在发命令**之前**先落本地状态；顺序反了就等于没做乐观更新。
   const createTask = page.slice(page.indexOf("async function createTask(event: FormEvent)"), page.indexOf("async function sendTaskCommand("));
@@ -1030,15 +1034,16 @@ test("mobile task cards show a per-card syncing state and roll back on failure",
   // 漏掉任何一个，卡片都会在同步途中丢掉「同步中」，成功对账也找不回它。
   assert.match(page, /const settleID = created \? resolvePendingCreate\(optimisticID, created\.id, outcome\.commandId\) : optimisticID;/);
   assert.match(page, /await settleTaskMutation\(settleID, outcome, \(reason\) => \{/);
-  assert.match(page, /setTaskBusy\(pendingID, false\);\s*setTaskBusy\(resolved\.taskId, true\);/);
-  assert.match(page, /const resolved = \{ \.\.\.withResolvedCreateID\(mutation, realID\), commandId \};\s*if \(resolved\.taskId === pendingID\) return pendingID;/);
+  assert.match(pendingTasksHook, /setTaskBusy\(pendingID, false\);\s*setTaskBusy\(resolved\.taskId, true\);/);
+  assert.match(pendingTasksHook, /const resolved = \{ \.\.\.withResolvedCreateID\(mutation, realID\), commandId \};\s*if \(resolved\.taskId === pendingID\) return pendingID;/);
   // 快照没拉回来时保留本地改动，别让用户刚建的任务凭空消失一次。
   assert.match(page, /if \(result\.outcome === "failed"\) \{\s*setTaskBusy\(taskID, false\);\s*setError\("已同步到电脑端，但云端快照还没更新，稍后刷新即可"\);\s*return;\s*\}/);
   // 创建失败要把用户刚打的字放回输入框：任务已经被撤掉了，至少不让他重打一遍。
   // （2026-09-17 起中间多了一句 setCreatePriority：优先级也要一起放回去，见下面的优先级用例。）
   assert.match(page, /setDescription\(trimmedDescription\);\s*setCreatePriority\(chosenPriority\);\s*setCreateError\(reason\);\s*setCreatingTask\(true\);/);
   // 待确认改动按实例隔离，换电脑后不能叠到新电脑的快照上。
-  assert.match(page, /if \(pendingTaskRef\.current\.size > 0\) \{\s*pendingTaskRef\.current\.clear\(\);/);
+  assert.match(page, /clearPendingTasks\(\);/);
+  assert.match(pendingTasksHook, /const changed = pendingTaskRef\.current\.size > 0;\s*pendingTaskRef\.current\.clear\(\);\s*setPendingTaskBusy\(new Set\(\)\);/);
   // 每一次快照落地都要对一次账：命令没在 30 秒窗口内拿到回执时我们故意不回滚，
   // 本地那张卡只能靠快照自己收敛 —— 少了这个 effect，「同步中」会一直挂着。
   assert.match(page, /if \(!mutationReflectsInSnapshot\(mutation, snapshot\.projects, current\.values\(\)\)\) continue;/);
@@ -1115,7 +1120,10 @@ test("mobile QR scans without an embedded code fall back to manual verification"
   assert.match(page, /setPairingNotice\(\{ text: "[^"]*6 位数字", state: "idle" \}\);/);
   // 兜底那条路（手输 6 位校验码）现在长在配对页里，与扫码同为这一页的入口之一。
   assert.match(page, /className="mobile-pairing-code"/);
-  assert.match(page, /\/v1\/pairings\/claim/);
+  // 请求细节归配对 Hook；页面只负责把两条入口接到同一条提交与确认链路。
+  assert.match(page, /import \{ useMobilePairingClaim \} from "\.\.\/features\/remote\/use-mobile-pairing-claim";/);
+  assert.match(page, /const result = await submitMobilePairingClaim\(\{/);
+  assert.match(page, /beginMobilePairingConfirmation\(result\);/);
 });
 
 test("mobile pairing states are graded and the notice outlives the pairing panel", () => {
@@ -1352,8 +1360,7 @@ test("mobile unbind keeps the component in step with the device store", () => {
     const unbindAt = page.indexOf("async function unbindDevice() {");
     const unbindSlice = page.slice(unbindAt, page.indexOf("\n  }", unbindAt));
     assert.ok(unbindAt > 0 && unbindSlice.length > 0, "没切到 unbindDevice");
-    assert.match(unbindSlice, /const nextToken = readActiveToken\(\);/);
-    assert.match(unbindSlice, /setToken\(nextToken\);/);
+    assert.match(unbindSlice, /const nextToken = removeRemoteDevice\(readActiveToken\(\)\);/);
     // 还有别的电脑可用时不该弹配对页（那不是"必须重新配对"，只是这台没了）；
     // 一台都不剩时才弹 —— 否则用户面对的是"没有电脑、也没有入口"。
     assert.match(unbindSlice, /nextToken \? "已解除绑定，已切到另一台电脑" : "已解除绑定，请重新配对"/);
@@ -1380,8 +1387,7 @@ test("mobile unbind keeps the component in step with the device store", () => {
     assert.ok(at > 0 && slice.length > 0, "没切到 onTokenCleared");
     assert.match(slice, /setDevicesOpen\(false\);/);
     assert.match(slice, /remaining\.find\(\(item\) => !item\.revoked\)\?\.token \|\| ""/);
-    assert.match(slice, /setActiveToken\(keep\);/);
-    assert.match(slice, /setToken\(keep\);/);
+    assert.match(slice, /activateDevice\(keep\);/);
     assert.match(slice, /setPairingExpanded\(!keep\);/);
     assert.match(slice, /if \(keep\) void loadInstances\(\);/);
     // 反例：写死 `setPairingExpanded(true)` 就是"不管还有没有别的电脑，一律把人按在配对页上"。
@@ -1414,7 +1420,8 @@ test("mobile never loses its device entry points when the instance read fails", 
   // 入口按钮与读数解耦：instance 缺失时写「管理」，而不是让整颗按钮跟着读数一起消失。
   assert.match(page, /\{instance \? devicePanelLabel : "管理"\}/);
   // 设备面板本身只吃本地设备表（`readDevices()`），不需要云端读数 —— 这是"入口能兜底"的前提。
-  assert.match(page, /function openDevicesSheet\(\) \{\s*setDevices\(readDevices\(\)\);/);
+  assert.match(page, /function openDevicesSheet\(\) \{\s*refreshDevices\(\);/);
+  assert.match(page, /\} = useRemoteDevices\(\);/);
 
   // 通知：原生包接的是 @capacitor/local-notifications 的**本地通知** —— App 自己把已经从 SSE
   // 拿到的事件丢进系统通知栏，不经过任何服务器。这里曾经在原生平台判 `unsupported` 把入口收起，
@@ -1506,7 +1513,7 @@ test("mobile one-phone-many-desktops: device bar, switcher sheet and per-device 
   assert.doesNotMatch(page, /<h1>\{[^}]*activeDeviceRecord/);
   // ③ 切换必须复位上一台的现场：instanceID 置空是有意的（拉失败也不能挂旧数据）。
   assert.match(page, /function switchDevice\(nextToken: string\) \{/);
-  assert.match(page, /setActiveToken\(nextToken\);\s*setDevices\(readDevices\(\)\);\s*setToken\(nextToken\);\s*setInstances\(\[\]\);\s*setInstanceID\(""\);\s*setSnapshot\(null\);/);
+  assert.match(page, /activateDevice\(nextToken\);\s*setInstances\(\[\]\);\s*setInstanceID\(""\);\s*setSnapshot\(null\);/);
   // 切换面板：当前那台带勾、失效那台不可点且标签写"需重新配对"。
   // 行是**容器**（里面要嵌「解绑」这第二颗按钮，嵌套按钮非法）：
   // 行主体＝切到这台，右侧＝解绑。
@@ -1575,8 +1582,7 @@ test("mobile device alias: 每台电脑一个只在这台手机上生效的备�
     const saveAt = page.indexOf("function saveAlias(event: FormEvent) {");
     const saveSlice = page.slice(saveAt, page.indexOf("\n  }", saveAt));
     assert.ok(saveAt > 0 && saveSlice.length > 0, "没切到 saveAlias");
-    assert.match(saveSlice, /setDeviceAlias\(aliasTarget, aliasDraft\);/);
-    assert.match(saveSlice, /setDevices\(readDevices\(\)\);/);
+    assert.match(saveSlice, /renameRemoteDevice\(aliasTarget, aliasDraft\);/);
     assert.match(page, /const \[aliasDraft, setAliasDraft\] = useState\(""\);/);
   }
   assert.match(page, /maxLength=\{DEVICE_ALIAS_MAX_LENGTH\}/);
@@ -1628,14 +1634,13 @@ test("mobile device alias: 每台电脑一个只在这台手机上生效的备�
 
 test("mobile device storage keeps the legacy key alive for older builds", () => {
   // 旧包只认 milevia.cloud.token：新包必须继续镜像它，否则用户回退版本就会发现"配对没了"。
-  assert.match(page, /const \[devices, setDevices\] = useState<MobileDevice\[\]>\(\(\) => reconcileDevices\(\)\);/);
-  assert.match(page, /const \[token, setToken\] = useState\(\(\) => readActiveToken\(\)\);/);
+  assert.match(page, /import \{ useRemoteDevices \} from "\.\.\/features\/remote\/use-remote-devices";/);
+  assert.match(page, /activeToken: token,/);
+  assert.match(remoteDevicesHook, /setActiveToken\(token\);\s*const next = readDevices\(\);\s*setDevices\(next\);\s*setActiveTokenState\(token\);/);
   // 确认配对时，页面的 instanceID 仍可能是当前正在操作的 A；必须使用声明
   // 响应中的 B，否则设备表会把 B 当成 A 的重新配对并删除 A。
-  assert.match(page, /const \[pendingPairingInstanceID, setPendingPairingInstanceID\] = useState\(""\);/);
-  assert.match(page, /setPendingPairingInstanceID\(result\.instanceId \|\| ""\);/);
-  assert.match(page, /addOrReplaceDevice\(\{ token: pendingAccessToken, instanceId: pendingPairingInstanceID, name: "" \}\);/);
-  assert.doesNotMatch(page, /addOrReplaceDevice\(\{ token: pendingAccessToken, instanceId: instanceID,/);
+  assert.match(page, /addDevice\(\{ token: claim\.token, instanceId: claim\.instanceID, name: "" \}\);/);
+  assert.match(remoteDevicesHook, /const add = useCallback\(\(input: \{ token: string; instanceId: string; name\?: string \}\) => \{/);
   // 手动粘贴令牌的入口（`saveToken`）在 2026-09-20 的可用性排查里确认是死代码（全仓无调用点），
   // 已删除 —— 所以这里不再断言它的函数体，改为断言"确实删了 + 留下了恢复线索"。
   assert.doesNotMatch(page, /function saveToken\(/);
@@ -1644,7 +1649,7 @@ test("mobile device storage keeps the legacy key alive for older builds", () => 
   assert.match(page, /markDeviceRevoked\(token\);/);
   assert.match(page, /if \(token === readActiveToken\(\)\) globalThis\.dispatchEvent\(new Event\("milevia:token-cleared"\)\);/);
   // 上报设备名：电脑端"当前绑定的手机"那一行就是它。
-  assert.match(page, /deviceName: deviceLabel\(\)/);
+  assert.match(page, /device: \(\) => \(\{ deviceName: deviceLabel\(\), platform: devicePlatform\(Capacitor\.getPlatform\(\)\) \}\),/);
 });
 
 test("instance status renders Chinese text through one shared label map", () => {
@@ -2599,7 +2604,8 @@ test("mobile refresh actually re-fetches and reports the outcome", () => {
   assert.match(page, /import \{ useRemoteInstances \} from "\.\.\/features\/remote\/use-remote-instances";/);
   assert.match(page, /const \{ instances, setInstances, instanceID, setInstanceID, loadInstances \} = useRemoteInstances<Instance>\(\{/);
   assert.match(page, /request: \(\) => cloud<Instance\[\]>\("\/v1\/instances"\),/);
-  assert.match(page, /patchDevice: \(deviceToken, value\) => \{[\s\S]*?updateDevice\(deviceToken, value\);[\s\S]*?setDevices\(readDevices\(\)\);/);
+  assert.match(page, /patchDevice: \(deviceToken, value\) => \{\s*patchRemoteDevice\(deviceToken, value\);\s*\},/);
+  assert.match(remoteDevicesHook, /const patch = useCallback\(\(token: string, value: Partial<Omit<MobileDevice, "token">>\) => \{/);
 
   // `saveToken` 删除后，`refreshNow` 后面紧跟的是那段"这里原来有一个 saveToken"的说明注释
   // （再往后才是 `enableMobileNotifications`），所以锚点收在函数结尾 + "后面跟着注释或函数定义"。
@@ -2857,11 +2863,12 @@ test("mobile scan failures surface inside the overlay instead of behind it", () 
   // openSettings() 在 Web 上是"未实现"异常，所以要 catch 出可读的中文指引。
   assert.match(page, /scanNeedsSettings && <button className="mobile-scan-settings"/);
   assert.match(page, /await BarcodeScanner\.openSettings\(\);/);
-  assert.match(page, /if \(!cancelled\) setScanNeedsSettings\(true\);/);
+  assert.match(page, /useNativeBarcodeScanner\(\{[\s\S]*?onError: \(message, needsSettings\) => \{\s*setScanNeedsSettings\(needsSettings\);\s*setScanError\(message\);\s*setScanning\(false\);/);
+  assert.match(nativeScannerHook, /callbacksRef\.current\.onError\("未获得摄像头权限，请在系统设置中允许 Milevia 使用摄像头", true\);/);
   // 手电筒是可选能力：拿不到可用性就永远不渲染那颗按钮，让它不出现在"点了没反应"的状态里。
   assert.match(page, /\{scanning && scanTorchAvailable && <button className="mobile-scan-torch"/);
   assert.match(page, /aria-pressed=\{scanTorchOn\}/);
-  assert.match(page, /void BarcodeScanner\.isTorchAvailable\(\)/);
+  assert.match(nativeScannerHook, /void BarcodeScanner\.isTorchAvailable\(\)/);
   assert.match(styles, /\.mobile-scan-torch\[aria-pressed="true"\]/);
   // 失败态的取景窗里没有画面，空着会被读成「卡住了」——补一句说明，扫描中则只有扫描线。
   assert.match(page, /\{scanning \? <i className="mobile-scan-laser" \/> : <span className="mobile-scan-window-note">相机未开启<\/span>\}/);
@@ -2922,12 +2929,13 @@ test("mobile scan keeps one teardown path and tags which phase the overlay is in
   // `if (started) stopScan()` 整支跳过，相机没被停；随后 `startScan` 才 resolve。
   // 若不在那里补一次，listener 已被摘掉、超时也没设，用户看到的是"浮层关了但摄像头一直开着"。
   // 这条兜底必须走同一个 `stop()`（摘 listener / 关灯 / 复位状态只在一个地方）。
-  assert.match(page, /if \(cancelled\) \{\s*await stop\(\);\s*return;\s*\}/);
-  assert.doesNotMatch(page, /if \(cancelled\) \{\s*await BarcodeScanner\.stopScan\(\)/);
+  assert.match(page, /import \{ useNativeBarcodeScanner \} from "\.\.\/features\/remote\/use-native-barcode-scanner";/);
+  assert.match(nativeScannerHook, /if \(cancelled\) \{ await stop\(\); return; \}/);
+  assert.doesNotMatch(nativeScannerHook, /if \(cancelled\) \{\s*await BarcodeScanner\.stopScan\(\)/);
   // stop 里连手电筒可用性一起复位，否则下次进来会拿着上一次的可用性渲染按钮。
-  assert.match(page, /if \(started\) await BarcodeScanner\.stopScan\(\)\.catch\(\(\) => undefined\);\s*setScanTorchAvailable\(false\);\s*setScanTorchOn\(false\);\s*\};/);
+  assert.match(nativeScannerHook, /if \(started\) await BarcodeScanner\.stopScan\(\)\.catch\(\(\) => undefined\);\s*callbacksRef\.current\.onStopped\(\);/);
   // 插件的 stopScan() 内部第一件事就是 disableTorch()，所以这里不需要（也不该）手写关灯 —— 钉住这个前提。
-  assert.doesNotMatch(page, /stopScan[\s\S]{0,200}disableTorch/);
+  assert.doesNotMatch(nativeScannerHook, /stopScan[\s\S]{0,200}disableTorch/);
 
   // data-phase 是给"矮视口 + 失败态"用的钩子：失败态多一张报错卡，会把取景窗挤小
   // （实测 844×390 → 222px、720×200 → 76px），而那时窗口里本来就没有画面。
@@ -3303,7 +3311,9 @@ test("desktop remote control page only shows what this machine can actually know
   assert.match(page, /<dt>最近同步<\/dt><dd>\{phoneSync\.agoText \|\| "—"\}<\/dd>/);
   // ⑧ 平台由手机上报，两条 claim 路径都要带上；闭集收口在 lib/mobile-devices.ts
   //    （`devicePlatform`），别直接塞 `Capacitor.getPlatform()` 的原始值。
-  assert.equal(page.split("platform: devicePlatform(Capacitor.getPlatform())").length - 1, 2, "两条 claim 路径（扫码 / 6 位校验码）都要上报平台");
+  assert.match(page, /device: \(\) => \(\{ deviceName: deviceLabel\(\), platform: devicePlatform\(Capacitor\.getPlatform\(\)\) \}\),/);
+  assert.match(page, /claimPairing\([\s\S]*?submitMobilePairingClaim\(/);
+  assert.match(page, /async function claimPairingByCode[\s\S]*?submitMobilePairingClaim\(/);
 });
 test("mobile conversation creation and message send never wait for the desktop", () => {
   // 症状（用户报的）：手机上点「创建会话」，要等电脑端把命令跑完界面才切过去；SSE 一断就是

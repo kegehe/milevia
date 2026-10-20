@@ -4,9 +4,10 @@ import test from "node:test";
 
 const source = await readFile(new URL("./use-remote-instances.ts", import.meta.url), "utf8");
 
-test("实例读取以请求代次和当前令牌隔离响应", () => {
+test("实例读取以请求代次、当前令牌和设备代次隔离响应", () => {
   assert.match(source, /const requestGeneration = \+\+requestGenerationRef\.current;/);
-  assert.match(source, /requestGeneration !== requestGenerationRef\.current \|\| requestToken !== optionsRef\.current\.readToken\(\)/);
+  assert.match(source, /const requestScope = current\.scopeKey;/);
+  assert.match(source, /requestGeneration !== requestGenerationRef\.current \|\| requestToken !== optionsRef\.current\.readToken\(\) \|\| requestScope !== optionsRef\.current\.scopeKey/);
   assert.match(source, /const optionsRef = useRef\(options\);/);
   assert.match(source, /\}, \[\]\);/);
   assert.match(source, /const superseded: InstanceLoadResult<T> = \{ instances: \[\], outcome: "superseded" \}/);

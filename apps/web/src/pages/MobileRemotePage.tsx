@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import { api, asRecord } from "../lib/api";
 import { isDesktop } from "../lib/runtime";
 import { copyToClipboard } from "../lib/clipboard";
-import { DEVICE_ALIAS_MAX_LENGTH, addOrReplaceDevice, activeDevice, deviceDisplayName, deviceLabel, devicePlatform, markDeviceRevoked, normalizeAlias, reconcileDevices, readActiveToken, readDevices, removeDevice, setActiveToken, setDeviceAlias, updateDevice, type MobileDevice } from "../lib/mobile-devices";
+import { DEVICE_ALIAS_MAX_LENGTH, activeDevice, deviceDisplayName, deviceLabel, devicePlatform, markDeviceRevoked, normalizeAlias, readActiveToken, readDevices, type MobileDevice } from "../lib/mobile-devices";
 import { MOBILE_PROJECT_ORDER_STORAGE_KEY, dismissMobileDragHint, persistOrder, readMobileDragHint, sortProjectIds } from "../lib/project-order";
 import { useCardDragReorder } from "../lib/use-card-drag";
 import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval } from "../lib/timeline";
@@ -29,12 +29,19 @@ import { mergeSnapshotStreamingMessages } from "../features/remote/snapshot-stre
 import { mergeSnapshotNotices } from "../features/remote/snapshot-notice-merge";
 import { useRemoteSnapshotLoader } from "../features/remote/use-remote-snapshot-loader";
 import { useRemoteInstances } from "../features/remote/use-remote-instances";
+import { useRemoteInstancePolling } from "../features/remote/use-remote-instance-polling";
 import { useMobileRemoteEventStream } from "../features/remote/use-mobile-remote-event-stream";
+import { useRemoteDevices } from "../features/remote/use-remote-devices";
+import { useMobilePairingClaim } from "../features/remote/use-mobile-pairing-claim";
+import { useMobilePairingConfirmation } from "../features/remote/use-mobile-pairing-confirmation";
+import { useNativeBarcodeScanner } from "../features/remote/use-native-barcode-scanner";
+import { useMobilePendingTasks } from "../features/remote/use-mobile-pending-tasks";
+import { useMobileConversationHistory } from "../features/remote/use-mobile-conversation-history";
 // 「已绑定手机」那一段的纯逻辑（绑定项归一化 / 最近同步的四档 / 平台文案）。
 // 和上面同一个理由：`lastUsedAt` 的 undefined 与 null 必须走不同分支，合并成一个
 // 就跟「还没回来」写成「没有数据」是同一个错，而那种错源码级断言看不出来。
 import { normalizeBindings, phoneSyncView, platformLabel, syncAgeFrom, type DesktopBinding } from "../features/remote/desktop-phone";
-import { applyPendingTaskMutations, mutationReflectsInSnapshot, newPendingTaskID, withResolvedCreateID, type PendingTaskMutation } from "../lib/task-mutations";
+import { applyPendingTaskMutations, mutationReflectsInSnapshot, newPendingTaskID } from "../lib/task-mutations";
 import { applyMobileTerminalEvent, type MobileRealtimeEvent } from "../lib/mobile-realtime";
 // 会话末尾那条「正在处理」裸行的判据（动画变体 / 阶段词 / 阶段计时）。读数来自不同来源，
 // 收口在纯函数里，页面只调用 + 渲染 —— 理由见 lib/processing-indicator.ts 的文件头。
@@ -62,7 +69,7 @@ import { useUIPreferences } from "../stores/useUIPreferences";
 import { Capacitor } from "@capacitor/core";
 import { App as CapacitorApp } from "@capacitor/app";
 import type { PluginListenerHandle } from "@capacitor/core";
-import { BarcodeFormat, BarcodeScanner, LensFacing } from "@capacitor-mlkit/barcode-scanning";
+import { BarcodeScanner } from "@capacitor-mlkit/barcode-scanning";
 import { LocalNotifications } from "@capacitor/local-notifications";
 import { invoke } from "@tauri-apps/api/core";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
@@ -115,7 +122,6 @@ type RemoteNotice = {
 };
 type RemoteConversation = { id: string; title: string; status: string; agentId: string; lastActivityAt: string; isCurrent: boolean; messages: Message[]; notices?: RemoteNotice[]; isOrchestration?: boolean };
 type RemoteConversationIndex = Omit<RemoteConversation, "messages" | "notices"> & { preview?: string };
-type ConversationHistoryPage = { messages: Message[]; nextCursor: string; hasMore: boolean; loading: boolean; error: string };
 type RemoteAgentStatus = { id: string; status: "ready" | "unavailable" | "updating" | "unsupported"; version?: string; reason?: string };
 // 电脑端数据库里的「常用提示词 / 常用命令」条目。字段与 control-server 的 Shortcut 一一对应
 // （只少了手机端用不到的 createdAt/updatedAt）。
@@ -1142,13 +1148,21 @@ export default function MobileRemotePage() {
   // Capacitor 原生 WebView 可能同时注入桌面运行时对象；原生包始终
   // 使用移动端项目选择/对话布局，避免被桌面分支误判。
   const mobileApp = Capacitor.isNativePlatform() || !isDesktop();
-  // 手机连过哪些电脑。列表与"当前"都归 mobile-devices 管（含旧单令牌的迁移），
-  // 组件这里只是它的一份镜像，用于渲染切换面板。
-  const [devices, setDevices] = useState<MobileDevice[]>(() => reconcileDevices());
-  const [token, setToken] = useState(() => readActiveToken());
+  // 设备记录、当前令牌与设备代次统一由设备域持有。cloud() 仍从本地存储读取令牌，
+  // Hook 的动作先写存储再发布 React 状态，避免界面与请求使用不同设备。
+  const {
+    devices,
+    activeToken: token,
+    deviceEpoch,
+    refresh: refreshDevices,
+    activate: activateDevice,
+    add: addDevice,
+    remove: removeRemoteDevice,
+    patch: patchRemoteDevice,
+    rename: renameRemoteDevice,
+  } = useRemoteDevices();
   const [mobileUpdate, setMobileUpdate] = useState<MobileUpdateState | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
-  const [deviceEpoch, setDeviceEpoch] = useState(0);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   // Realtime callbacks stay registered across snapshot refreshes. Keep the
   // latest snapshot available without recreating the SSE subscription.
@@ -1163,14 +1177,6 @@ export default function MobileRemotePage() {
   const [conversationHistoryOpen, setConversationHistoryOpen] = useState(false);
   // 快照只保留当前会话的有限窗口；目录与正文都在用户需要时直连电脑端读取。
   // 这两份缓存只属于当前页面会话，绝不把完整正文持久化到云端或本机存储。
-  const [historyDirectory, setHistoryDirectory] = useState<RemoteConversationIndex[] | null>(null);
-  const [historyDirectoryProjectID, setHistoryDirectoryProjectID] = useState("");
-  const [historyDirectoryLoading, setHistoryDirectoryLoading] = useState(false);
-  const [historyDirectoryError, setHistoryDirectoryError] = useState("");
-  const [historyPages, setHistoryPages] = useState<Record<string, ConversationHistoryPage>>({});
-  // 历史弹窗可以在自动翻页期间再次打开。同一游标只允许有一条在途请求，避免
-  // 两个响应以不同顺序落地后互相覆盖分页游标。
-  const historyPageLoadsRef = useRef(new Set<string>());
   const [newConversationProject, setNewConversationProject] = useState<Project | null>(null);
   const [newConversationAgent, setNewConversationAgent] = useState<MobileAgentID>("claude-code");
   // 执行权限随所选工具重置（切工具的副作用写在 selectMobileAgent 里，不用 effect 猜意图）。
@@ -1412,7 +1418,6 @@ export default function MobileRemotePage() {
   const [scanTorchAvailable, setScanTorchAvailable] = useState(false);
   const [scanTorchOn, setScanTorchOn] = useState(false);
   const [scanVideo, setScanVideo] = useState<HTMLVideoElement | null>(null);
-  const nativeScanListener = useRef<PluginListenerHandle | null>(null);
   const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
   const manualCodeRef = useRef<HTMLInputElement | null>(null);
   // 配对页（整页浮层）的焦点管理用：容器自己（tabIndex=-1 的程序化聚焦目标）+ 打开它的那颗按钮。
@@ -1426,9 +1431,7 @@ export default function MobileRemotePage() {
   const pendingMessageRef = useRef(new Map<string, Map<string, PendingMessage>>());
   // 还没被电脑端确认的任务增删改（见 PendingTaskMutation）。放在 ref 里是因为它会被
   // 「命令回调」和「快照落地」两条异步链路读写；配套的 revision 只用来触发重渲染。
-  const pendingTaskRef = useRef(new Map<string, PendingTaskMutation>());
-  const [pendingTaskRevision, setPendingTaskRevision] = useState(0);
-  const markPendingTasksChanged = useCallback(() => setPendingTaskRevision((current) => current + 1), []);
+  const { pendingTaskRef, pendingTaskRevision, pendingTaskBusy, setPendingTaskBusy, markPendingTasksChanged, setTaskBusy, trackPendingTask, notePendingCommand, resolvePendingCreate, dropPendingTask, clearPendingTasks } = useMobilePendingTasks();
   // 还没被电脑端分配真 id 的新建会话（见 lib/conversation-mutations.ts）。和待确认任务同
   // 一套写法：真实数据在 ref 里（两条异步链路都读写它），revision 只负责触发重渲染。
   const pendingConversationsRef = useRef(new Map<string, PendingConversation>());
@@ -1440,7 +1443,6 @@ export default function MobileRemotePage() {
   const deferredMessagesRef = useRef(new Map<string, Array<PendingMessage & { draft: string; quote: MessageQuote | null }>>());
   // 每一张卡片自己的"处理中"状态：老实现是一个全局 busy 把整屏按钮一起按住，
   // 用户在等一条命令时连别的任务都动不了。
-  const [pendingTaskBusy, setPendingTaskBusy] = useState<Set<string>>(() => new Set());
   // revision 记录这条实时消息到达时的快照版本。快照一旦前进到更新的版本，
   // 就说明云端已经反映了那个时刻的状态（消息仍在，或者已被删除），此时不能再
   // 把实时消息当作"快照还没包含"补回去，否则电脑端删掉的消息会在手机上复活。
@@ -1461,20 +1463,10 @@ export default function MobileRemotePage() {
   });
   const notifiedEventIDs = useRef(new Set<string>());
   const [commandState, setCommandState] = useState<CommandState | null>(null);
-  const [pendingAccessToken, setPendingAccessToken] = useState("");
-  // 配对声明返回的实例才是待确认的目标。此时 `instanceID` 仍可能指向手机当前
-  // 操作的另一台电脑；确认后若误用它，设备表会把新增电脑当成同机重新配对而覆盖。
-  const [pendingPairingInstanceID, setPendingPairingInstanceID] = useState("");
 
   // 页面可见性：切到后台时暂停轮询与快照兜底，回到前台立即补一次，省电又省流量。
   const documentVisible = useDocumentVisible();
   const documentVisibleRef = useRef(documentVisible);
-  const previousTokenRef = useRef(token);
-  useEffect(() => {
-    if (previousTokenRef.current === token) return;
-    previousTokenRef.current = token;
-    setDeviceEpoch((value) => value + 1);
-  }, [token]);
   // 上一次的可见性，用来识别「由隐藏转为可见」这个瞬间。
   const wasDocumentVisibleRef = useRef(documentVisible);
   // 消息列表是否「贴着底部」。用户主动向上翻阅时不能夺走滚动位置。
@@ -1662,81 +1654,24 @@ export default function MobileRemotePage() {
     return () => setScannerActive(false);
   }, [scanOverlayVisible]);
 
-  useEffect(() => {
-    if (!scanning || !Capacitor.isNativePlatform()) return;
-    let cancelled = false;
-    let started = false;
-    let timeout: number | undefined;
-    scanAccepted.current = false;
-
-    const stop = async () => {
-      if (timeout !== undefined) window.clearTimeout(timeout);
-      const listener = nativeScanListener.current;
-      nativeScanListener.current = null;
-      await listener?.remove().catch(() => undefined);
-      if (started) await BarcodeScanner.stopScan().catch(() => undefined);
+  useNativeBarcodeScanner({
+    scanning,
+    onScan: acceptScannedPairing,
+    onError: (message, needsSettings) => {
+      setScanNeedsSettings(needsSettings);
+      setScanError(message);
+      setScanning(false);
+    },
+    onTimeout: () => {
+      setScanError("30 秒内未识别到二维码，请靠近电脑屏幕、调亮亮度或打开手电筒后重试");
+      setScanning(false);
+    },
+    onTorchAvailability: setScanTorchAvailable,
+    onStopped: () => {
       setScanTorchAvailable(false);
       setScanTorchOn(false);
-    };
-
-    void (async () => {
-      try {
-        const { supported } = await BarcodeScanner.isSupported();
-        if (!supported) throw new Error("此设备没有可用摄像头");
-        let permission = await BarcodeScanner.checkPermissions();
-        if (permission.camera === "prompt" || permission.camera === "prompt-with-rationale") {
-          permission = await BarcodeScanner.requestPermissions();
-        }
-        if (permission.camera !== "granted" && permission.camera !== "limited") {
-          // 走到这里可能是"用户刚拒绝"，也可能是"早就拒绝了、系统不再弹窗"。无论哪种，
-          // 都只有系统设置这一条路能修好，所以直接把设置入口放出来。
-          if (!cancelled) setScanNeedsSettings(true);
-          throw new Error("未获得摄像头权限，请在系统设置中允许 Milevia 使用摄像头");
-        }
-        if (cancelled) return;
-
-        nativeScanListener.current = await BarcodeScanner.addListener("barcodesScanned", ({ barcodes }) => {
-          for (const barcode of barcodes) {
-            if (acceptScannedPairing(barcode.rawValue || barcode.displayValue)) return;
-          }
-        });
-        if (cancelled) return;
-        await BarcodeScanner.startScan({ formats: [BarcodeFormat.QrCode], lensFacing: LensFacing.Back });
-        started = true;
-        // 这一段**不是**冗余的，删掉会让相机永久开着：清理函数（见下方 return）会在
-        // `cancelled = true` 之后立刻调 `stop()`，而那时 `started` 还是 false（`startScan`
-        // 尚未 resolve）→ `stop()` 里 `if (started) stopScan()` 整支跳过，相机没被停。
-        // 随后 `startScan` 才 resolve、`started` 才变 true —— 若不在这里补一次，就再也没人
-        // 会去停它了：listener 已被摘掉、超时也没设，用户看到的是"浮层关了但摄像头一直开着"。
-        // 走 `stop()` 而不是就地写 stopScan()，是为了让"摘 listener / 关灯 / 复位状态"只在一个地方。
-        if (cancelled) {
-          await stop();
-          return;
-        }
-        // 手电筒可用性单独问一次：问不到就当"没有"，不把异常冒泡成扫码失败。
-        void BarcodeScanner.isTorchAvailable()
-          .then((value) => { if (!cancelled) setScanTorchAvailable(Boolean((value as { available?: boolean })?.available)); })
-          .catch(() => undefined);
-        timeout = window.setTimeout(() => {
-          if (!cancelled) {
-            setScanError("30 秒内未识别到二维码，请靠近电脑屏幕、调亮亮度或打开手电筒后重试");
-            setScanning(false);
-          }
-        }, 30_000);
-      } catch (cause) {
-        if (!cancelled) {
-          setScanError(cause instanceof Error ? cause.message : "无法启动二维码扫描，请稍后重试");
-          setScanning(false);
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      void stop();
-    };
-  }, [scanning, acceptScannedPairing]);
-
+    },
+  });
   // Web 分支（手机浏览器 / 桌面预览）：画面是自己画的，用 getUserMedia + BarcodeDetector。
   // 清底类名由上面那个 effect 统一管，这里不再碰（`.mobile-scan[data-backdrop="solid"]`
   // 会自己铺底，所以两条分支共用同一套取景层样式）。
@@ -1801,10 +1736,10 @@ export default function MobileRemotePage() {
 
   const { instances, setInstances, instanceID, setInstanceID, loadInstances } = useRemoteInstances<Instance>({
     readToken: readActiveToken,
+    scopeKey: deviceEpoch,
     request: () => cloud<Instance[]>("/v1/instances"),
     patchDevice: (deviceToken, value) => {
-      updateDevice(deviceToken, value);
-      setDevices(readDevices());
+      patchRemoteDevice(deviceToken, value);
     },
     reportError: setError,
   });
@@ -1829,6 +1764,7 @@ export default function MobileRemotePage() {
   const { loadSnapshot, snapshotRevisionRef, resetSnapshotRevision } = useRemoteSnapshotLoader({
     instanceID: () => instanceID,
     readToken: readActiveToken,
+    scopeKey: deviceEpoch,
     request: (path) => cloud<Snapshot & { unchanged?: boolean }>(path),
     requestPath: snapshotRequestPath,
     normalize: (value) => {
@@ -1849,6 +1785,28 @@ export default function MobileRemotePage() {
     cacheFailureMessage: "无法连接云端",
   });
 
+  const submitMobilePairingClaim = useMobilePairingClaim({
+    request: cloud,
+    device: () => ({ deviceName: deviceLabel(), platform: devicePlatform(Capacitor.getPlatform()) }),
+    setBusy,
+    clearError: () => setError(""),
+    reportError: setError,
+  });
+  const { beginConfirmation: beginMobilePairingConfirmation } = useMobilePairingConfirmation({
+    pairingID,
+    request: cloud,
+    onConfirmed: (claim) => {
+      // 配对声明返回的实例才是待确认目标，不能使用当前页面可能仍指向的旧实例。
+      addDevice({ token: claim.token, instanceId: claim.instanceID, name: "" });
+      setPairingExpanded(false);
+      setPairingNotice({ text: "电脑已确认，绑定完成", state: "success" });
+      void loadInstances();
+    },
+    onExpired: () => {
+      setPairingNotice({ text: "配对已失效，请让电脑重新生成二维码", state: "error" });
+    },
+  });
+
   useEffect(() => {
     resetSnapshotRevision();
     // These maps are scoped to the selected desktop instance. Retaining them
@@ -1860,10 +1818,7 @@ export default function MobileRemotePage() {
     pendingNoticesRef.current.clear();
     // 待确认的任务改动同样按实例隔离：换一台电脑之后，上一台那份"本地已生效、
     // 还没被确认"的改动不能再叠到新电脑的快照上。
-    if (pendingTaskRef.current.size > 0) {
-      pendingTaskRef.current.clear();
-      setPendingTaskRevision((current) => current + 1);
-    }
+    clearPendingTasks();
     // 待确认的会话与排队的消息同理：本地那条临时会话只在**发起它的那台电脑**上才有意义，
     // 换机器之后它永远等不到真身，留着就是一条点不动、发不出的幽灵会话。
     if (pendingConversationsRef.current.size > 0 || deferredMessagesRef.current.size > 0) {
@@ -1871,9 +1826,8 @@ export default function MobileRemotePage() {
       deferredMessagesRef.current.clear();
       setPendingConversationRevision((current) => current + 1);
     }
-    setPendingTaskBusy(new Set());
     setProcessingConversations({});
-  }, [instanceID, resetSnapshotRevision]);
+  }, [instanceID, deviceEpoch, resetSnapshotRevision, clearPendingTasks]);
   const applyRealtimeEvent = useCallback((raw: MessageEvent): boolean => {
     try {
       const event = JSON.parse(String(raw.data)) as { eventId?: string; type?: string; taskId?: string; taskRunId?: string; payload?: unknown; createdAt?: string };
@@ -2112,7 +2066,6 @@ export default function MobileRemotePage() {
       const keep = stillActive && remaining.some((item) => item.token === stillActive && !item.revoked)
         ? stillActive
         : remaining.find((item) => !item.revoked)?.token || "";
-      setDevices(remaining);
       // ⚠️ 必须**同时**写 storage：`setToken` 只改组件 state，而 `cloud()` 是从 storage 取令牌的
       // （`deviceToken ?? readActiveToken()`）—— 只写 state 会让界面显示"已切到另一台电脑"、
       // 实际每个请求仍然带着被吊销的那台令牌，全部 401（`switchDevice` 里 `setActiveToken` 与
@@ -2120,8 +2073,7 @@ export default function MobileRemotePage() {
       // `keep` 为空（一台可用的都不剩）时把 active 清掉也是对的：留着被吊销的那个，
       // 下次冷启动会再去撞一次 401，又提示一遍，永远好不了。设备记录不受影响（仍在列表里标着
       // "需重新配对"），清掉的只是"当前选中是谁"。
-      setActiveToken(keep);
-      setToken(keep);
+      activateDevice(keep);
       setInstances([]);
       setInstanceID("");
       setSnapshot(null);
@@ -2165,14 +2117,12 @@ export default function MobileRemotePage() {
       .catch(() => undefined);
     return () => controller.abort();
   }, []);
-  useEffect(() => {
-    if (!token.trim()) return;
-    void loadInstances();
-    // 后台不轮询。visibilitychange 会重跑本效果，因此回到前台时上面这句会立刻补一次。
-    if (!documentVisible) return;
-    const timer = window.setInterval(() => { void loadInstances(); }, 5000);
-    return () => window.clearInterval(timer);
-  }, [token, loadInstances, documentVisible]);
+  useRemoteInstancePolling({
+    activeToken: token,
+    deviceEpoch,
+    visible: documentVisible,
+    load: loadInstances,
+  });
   useEffect(() => { void loadSnapshot(); }, [instanceID, loadSnapshot]);
   // CLI 探测在电脑端后台进行，不会产生业务事件，因此快照版本号不一定变化。
   // 检测期间显式绕过版本短路，等状态到齐就立刻停下，避免把“尚未检测”长期显示成不可用。
@@ -2219,31 +2169,6 @@ export default function MobileRemotePage() {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [commandState?.commandId, commandState?.status]);
-  useEffect(() => {
-    if (!pendingAccessToken || !pairingID) return;
-    const timer = window.setInterval(() => {
-      void cloud<{ status: string }>(`/v1/pairings/${encodeURIComponent(pairingID)}/status`)
-        .then((state) => {
-          if (state.status === "confirmed") {
-            // 一台新电脑绑上了：进设备表、并成为当前设备（同时镜像旧键，见 mobile-devices）。
-            addOrReplaceDevice({ token: pendingAccessToken, instanceId: pendingPairingInstanceID, name: "" });
-            setDevices(readDevices());
-            setToken(pendingAccessToken);
-            setPendingAccessToken("");
-            setPendingPairingInstanceID("");
-            setPairingExpanded(false);
-            setPairingNotice({ text: "电脑已确认，绑定完成", state: "success" });
-            void loadInstances();
-          } else if (["expired", "cancelled"].includes(state.status)) {
-            setPendingAccessToken("");
-            setPendingPairingInstanceID("");
-            setPairingNotice({ text: "配对已失效，请让电脑重新生成二维码", state: "error" });
-          }
-        })
-        .catch(() => undefined);
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, [pendingAccessToken, pendingPairingInstanceID, pairingID, loadInstances]);
   // 桌面端跟踪配对会话：云端只允许在手机提交校验码之后确认，提前点击必然被
   // 拒绝。让"确认绑定"跟着会话状态启用，用户就不必盲点并对着报错猜原因。
   useEffect(() => {
@@ -2379,6 +2304,30 @@ export default function MobileRemotePage() {
   }, [agentEnrollWaiting, loadAgentStatus]);
 
   const instance = instances.find((item) => item.instanceId === instanceID);
+  const remoteConversationRPC = useCallback((projectID: string, conversationID: string, op: string, params: Record<string, string>, timeoutMs: number) =>
+    cloud<MobileRpcReply>(`/v1/instances/${encodeURIComponent(instanceID)}/rpc`, {
+      method: "POST",
+      body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
+    }, undefined, timeoutMs), [instanceID]);
+  const {
+    pages: historyPages,
+    directory: historyDirectory,
+    directoryProjectID: historyDirectoryProjectID,
+    directoryLoading: historyDirectoryLoading,
+    directoryError: historyDirectoryError,
+    load: loadConversationHistory,
+    loadDirectory: loadConversationDirectory,
+  } = useMobileConversationHistory({
+    instanceID,
+    activeToken: token,
+    deviceEpoch,
+    projectID: selectedProject,
+    readToken: readActiveToken,
+    request: remoteConversationRPC,
+    messages: remoteHistoryMessages,
+    index: remoteConversationIndex,
+    merge: mergeRemoteMessages,
+  });
   // 界面上看到的项目列表 = 服务端快照 + 还没被电脑端确认的本地改动。
   //
   // 两个 revision 都只是触发器：待确认改动存在 ref 里，改了 ref 不会重渲染。
@@ -2528,12 +2477,6 @@ export default function MobileRemotePage() {
         body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
       }, undefined, timeoutMs);
   }, [instanceID, project?.id, conversation?.id, conversationPending]);
-  const remoteConversationRPC = useCallback((projectID: string, conversationID: string, op: string, params: Record<string, string>, timeoutMs: number) =>
-    cloud<MobileRpcReply>(`/v1/instances/${encodeURIComponent(instanceID)}/rpc`, {
-      method: "POST",
-      body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
-    }, undefined, timeoutMs), [instanceID]);
-
   const activateSharedConversation = useCallback(async (projectID: string, conversationID: string) => {
     if (!projectID || !conversationID || isPendingConversationID(conversationID)) return false;
     const reply = await remoteConversationRPC(projectID, conversationID, "conversation.activate", {}, 20_000);
@@ -2546,71 +2489,6 @@ export default function MobileRemotePage() {
     return true;
   }, [loadSnapshot, remoteConversationRPC]);
 
-  const loadConversationDirectory = useCallback(async (projectID: string) => {
-    if (!projectID || !instanceID) return;
-    setHistoryDirectoryLoading(true);
-    setHistoryDirectoryError("");
-    try {
-      const collected: RemoteConversationIndex[] = [];
-      let cursor = "";
-      do {
-        const reply = await remoteConversationRPC(projectID, "", "conversation.list", cursor ? { limit: "100", cursor } : { limit: "100" }, 20_000);
-        if (!reply.ok) throw new Error(reply.error || "无法读取电脑端会话目录");
-        const page = asRecord(reply.data);
-        const items = Array.isArray(page?.items) ? page.items.flatMap((entry) => {
-          const item = remoteConversationIndex(entry);
-          return item ? [item] : [];
-        }) : [];
-        collected.push(...items);
-        cursor = typeof page?.nextCursor === "string" ? page.nextCursor : "";
-      } while (cursor);
-      setHistoryDirectoryProjectID(projectID);
-      setHistoryDirectory(collected);
-    } catch (cause) {
-      setHistoryDirectoryError(cause instanceof Error ? cause.message : "无法读取电脑端会话目录");
-    } finally {
-      setHistoryDirectoryLoading(false);
-    }
-  }, [instanceID, remoteConversationRPC]);
-
-  const loadConversationHistory = useCallback(async (projectID: string, conversationID: string, cursor = "", pageSize = 50): Promise<void> => {
-    if (!projectID || !conversationID || isPendingConversationID(conversationID)) return;
-    const loadKey = `${instanceID}\u0000${projectID}\u0000${conversationID}\u0000${cursor}\u0000${pageSize}`;
-    if (historyPageLoadsRef.current.has(loadKey)) return;
-    historyPageLoadsRef.current.add(loadKey);
-    setHistoryPages((current) => ({ ...current, [conversationID]: { ...(current[conversationID] || { messages: [], nextCursor: "", hasMore: false, error: "" }), loading: true, error: "" } }));
-    try {
-      const params: Record<string, string> = { limit: String(pageSize), messagesOnly: "true" };
-      if (cursor) params.cursor = cursor;
-      const reply = await remoteConversationRPC(projectID, conversationID, "conversation.history", params, 30_000);
-      // 中继对单帧有硬上限。一次取太多条时从同一游标缩小页大小重试；
-      // 缩小后的尺寸会沿用到后续页，避免每一页都先触发一次超限。
-      if (!reply.ok && reply.status === 413 && pageSize > 1) {
-        historyPageLoadsRef.current.delete(loadKey);
-        return loadConversationHistory(projectID, conversationID, cursor, Math.max(1, Math.floor(pageSize / 2)));
-      }
-      if (!reply.ok) throw new Error(reply.error || "无法读取会话历史");
-      const page = asRecord(reply.data);
-      const messages = remoteHistoryMessages(page?.messages);
-      const nextCursor = typeof page?.nextCursor === "string" ? page.nextCursor : "";
-      // 此接口也会携带可回放的运行事件，`hasMore` 是两者合计的分页信号。
-      // 手机只把 messages 放进会话正文；若仅剩事件仍按总 hasMore 续取，会重复
-      // 请求消息页。专用标记只表示消息是否还有下一页。
-      const hasMore = page?.hasMoreMessages === true && Boolean(nextCursor);
-      setHistoryPages((current) => {
-        const previous = current[conversationID];
-        return { ...current, [conversationID]: { messages: mergeRemoteMessages(cursor ? previous?.messages || [] : [], messages), nextCursor, hasMore, loading: false, error: "" } };
-      });
-      // 首屏先落地，后续页再按游标续取。这样历史不会挤进快照或云端持久化，
-      // 同时打开旧会话后最终能读到完整正文，而不是停在最近 50 条。
-      if (hasMore) window.setTimeout(() => void loadConversationHistory(projectID, conversationID, nextCursor, pageSize), 0);
-    } catch (cause) {
-      const reason = cause instanceof Error ? cause.message : "无法读取会话历史";
-      setHistoryPages((current) => ({ ...current, [conversationID]: { ...(current[conversationID] || { messages: [], nextCursor: "", hasMore: false }), loading: false, error: reason } }));
-    } finally {
-      historyPageLoadsRef.current.delete(loadKey);
-    }
-  }, [instanceID, remoteConversationRPC]);
   useEffect(() => {
     if (conversationHistoryOpen && project?.id) void loadConversationDirectory(project.id);
   }, [conversationHistoryOpen, loadConversationDirectory, project?.id]);
@@ -3655,27 +3533,20 @@ export default function MobileRemotePage() {
   }
 
   async function claimPairing(pairingIDValue = pairingID, pairingCodeValue = pairingCode) {
-    if (!pairingIDValue.trim() || !/^\d{6}$/.test(pairingCodeValue.trim())) {
-      setError("二维码缺少有效的配对信息，请让电脑重新生成二维码");
-      return;
-    }
-    setBusy(true); setError("");
-    try {
-      const result = await cloud<{ instanceId: string; status: string; accessToken?: string }>(`/v1/pairings/${encodeURIComponent(pairingIDValue.trim())}/claim`, { method: "POST", body: JSON.stringify({ code: pairingCodeValue.trim(), deviceName: deviceLabel(), platform: devicePlatform(Capacitor.getPlatform()) }) });
-      if (result.accessToken) {
-        setPendingAccessToken(result.accessToken);
-        setPendingPairingInstanceID(result.instanceId || "");
-      }
-      // 把配对页一起打开：**深链**进来的人（用系统相机扫电脑上的二维码 → 打开这个 URL）
-      // 此刻已经在流程中间了，他要看的是"第 2 步 · 等待电脑确认"，而不是项目列表上一条孤零零的回执。
-      // 在应用内扫码那条路上这一句是 no-op（页面本来就开着），所以放在这里而不是调用点 ——
-      // 两个入口共用同一条链，也就不会再出现"某一条忘了开页"。
-      // 放在**提交成功之后**（而不是进函数就开）：提交在路上时露出第 1 步那颗可点的「扫描二维码」
-      // 会让人以为还能重来一次。
-      setPairingExpanded(true);
-      setPairingNotice({ text: "已扫码并提交，请在电脑上点击「确认绑定」", state: "waiting" });
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "配对失败"); }
-    finally { setBusy(false); }
+    const result = await submitMobilePairingClaim({
+      pairingID: pairingIDValue,
+      code: pairingCodeValue,
+      validationError: "二维码缺少有效的配对信息，请让电脑重新生成二维码",
+      failureError: "配对失败",
+    });
+    if (!result) return;
+    beginMobilePairingConfirmation(result);
+    // 把配对页一起打开：**深链**进来的人（用系统相机扫电脑上的二维码 → 打开这个 URL）
+    // 此刻已经在流程中间了，他要看的是"第 2 步 · 等待电脑确认"，而不是项目列表上一条孤零零的回执。
+    // 在应用内扫码那条路上这一句是 no-op（页面本来就开着），所以放在这里而不是调用点 ——
+    // 两个入口共用同一条链，也就不会再出现"某一条忘了开页"。
+    setPairingExpanded(true);
+    setPairingNotice({ text: "已扫码并提交，请在电脑上点击「确认绑定」", state: "waiting" });
   }
 
   // 「扫描二维码」的唯一入口。五次复位必须写在同一个地方：少复位一项，复用上一次的
@@ -3749,25 +3620,16 @@ export default function MobileRemotePage() {
   async function claimPairingByCode(event: FormEvent) {
     event.preventDefault();
     const code = manualPairingCode.trim();
-    if (!/^\d{6}$/.test(code)) {
-      setError("请输入 6 位校验码");
-      return;
-    }
-    setBusy(true); setError("");
-    try {
-      const result = await cloud<{ pairingId: string; instanceId: string; status: string; accessToken?: string }>("/v1/pairings/claim", { method: "POST", body: JSON.stringify({ code, deviceName: deviceLabel(), platform: devicePlatform(Capacitor.getPlatform()) }) });
-      setPairingID(result.pairingId || "");
-      setPairingCode(code);
-      if (result.accessToken) {
-        setPendingAccessToken(result.accessToken);
-        setPendingPairingInstanceID(result.instanceId || "");
-      }
-      setPairingNotice({ text: "校验码已提交，等待电脑确认", state: "waiting" });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "校验码配对失败");
-    } finally {
-      setBusy(false);
-    }
+    const result = await submitMobilePairingClaim({
+      code,
+      validationError: "请输入 6 位校验码",
+      failureError: "校验码配对失败",
+    });
+    if (!result) return;
+    setPairingID(result.pairingId || "");
+    setPairingCode(code);
+    beginMobilePairingConfirmation(result);
+    setPairingNotice({ text: "校验码已提交，等待电脑确认", state: "waiting" });
   }
 
   async function confirmDesktopPairing() {
@@ -3873,16 +3735,13 @@ export default function MobileRemotePage() {
     } finally {
       // 只摘掉**当前这台**：手机上的其它电脑不受影响（旧实现把唯一的键删掉，
       // 多设备之后那等于把全部配对一起清空）。
-      removeDevice(readActiveToken());
-      setDevices(readDevices());
+      const nextToken = removeRemoteDevice(readActiveToken());
       // ⚠️ 当前设备必须**回读**，不能写死 `setToken("")`：`removeDevice` 已经顺手把"当前设备"
       // 顺移到下一台**可用**的电脑（见 mobile-devices.ts 那句 `setActiveToken(next.find(...))`）。
       // 写死会让组件状态与 storage 打架 —— store 里当前设备是 B，而 `token` 是空串，
       // 页面于是按"还没配对"渲染出首启空态卡（"还没有连接电脑 / ＋ 添加电脑"），
       // 用户会以为所有配对一起没了。（2026-09-20 修：这条以前只是让内联配对块多显示一次，
       // 首启空态卡上线之后它变成了一块**说假话的屏**。）
-      const nextToken = readActiveToken();
-      setToken(nextToken);
       setInstances([]); setInstanceID(""); setSnapshot(null);
       setSelectedProject(""); setSelectedConversation("");
       setPairingURL(""); setPairingCode(""); setPairingID(""); setPairingQR("");
@@ -3926,8 +3785,7 @@ export default function MobileRemotePage() {
   function saveAlias(event: FormEvent) {
     event.preventDefault();
     if (!aliasTarget) return;
-    setDeviceAlias(aliasTarget, aliasDraft);
-    setDevices(readDevices());
+    renameRemoteDevice(aliasTarget, aliasDraft);
     closeAliasEditor();
   }
 
@@ -3955,8 +3813,7 @@ export default function MobileRemotePage() {
     } catch {
       // 忽略云端错误：本地摘掉即可，用户随时可以重新扫码。
     } finally {
-      removeDevice(deviceToken);
-      setDevices(readDevices());
+      removeRemoteDevice(deviceToken);
       setBusy(false);
     }
   }
@@ -4004,14 +3861,13 @@ export default function MobileRemotePage() {
         const result = await cloud<Instance[]>("/v1/instances", undefined, item.token);
         const info = (Array.isArray(result) ? result : [])[0];
         if (info) {
-          updateDevice(item.token, { instanceId: info.instanceId || item.instanceId, name: info.name || item.name, status: info.status || "", lastSeenAt: info.lastSeenAt || "" });
+          patchRemoteDevice(item.token, { instanceId: info.instanceId || item.instanceId, name: info.name || item.name, status: info.status || "", lastSeenAt: info.lastSeenAt || "" });
         }
       } catch {
         // 单台探测失败只影响它自己那一行（标成离线），不让整个面板转圈。
-        updateDevice(item.token, { status: "offline" });
+        patchRemoteDevice(item.token, { status: "offline" });
       }
     }));
-    setDevices(readDevices());
   }, []);
 
   // 切换当前电脑。等价于"换一个令牌 + 把上一台的现场全部收掉"：
@@ -4022,9 +3878,7 @@ export default function MobileRemotePage() {
     if (!nextToken) return;
     setDevicesOpen(false);
     if (nextToken === readActiveToken()) return;
-    setActiveToken(nextToken);
-    setDevices(readDevices());
-    setToken(nextToken);
+    activateDevice(nextToken);
     setInstances([]);
     setInstanceID("");
     setSnapshot(null);
@@ -4040,7 +3894,7 @@ export default function MobileRemotePage() {
 
   // 打开切换面板：立刻用本地缓存渲染（零等待），同时后台把其它几台的状态探一遍。
   function openDevicesSheet() {
-    setDevices(readDevices());
+    refreshDevices();
     setDevicesOpen(true);
     void probeOtherDevices();
   }
@@ -4072,48 +3926,6 @@ export default function MobileRemotePage() {
   // 真机上命令往返劣化到 19~75 秒后，用户看到的就是"点了没反应、最后还报失败"，
   // 而桌面端其实晚几十秒才执行完。现在本地立刻改、立刻标「同步中」，命令在后台
   // 跑，成功/失败再回来收尾。见 PendingTaskMutation 那段注释。
-
-  function setTaskBusy(taskID: string, busy: boolean) {
-    setPendingTaskBusy((current) => {
-      const next = new Set(current);
-      if (busy) next.add(taskID);
-      else next.delete(taskID);
-      return next;
-    });
-  }
-
-  function trackPendingTask(mutation: PendingTaskMutation) {
-    pendingTaskRef.current.set(mutation.taskId, mutation);
-    markPendingTasksChanged();
-  }
-
-  // notePendingCommand 只把命令 id 记回待确认项（用于诊断与后续对账）。
-  function notePendingCommand(taskID: string, commandId: string) {
-    const mutation = pendingTaskRef.current.get(taskID);
-    if (mutation && commandId) pendingTaskRef.current.set(taskID, { ...mutation, commandId });
-  }
-
-  // resolvePendingCreate 把新建的临时 id 换成电脑端回执里的真 id，返回换完之后用来
-  // 收尾的那个 id（没换成就是原 id）。
-  //
-  // 键、值、以及卡片上的「同步中」必须一起换：待确认表和 pendingTaskBusy 都是按 id
-  // 索引的，漏掉任何一个，那张卡都会在同步途中丢掉「同步中」，后续的成功对账也找不回它。
-  function resolvePendingCreate(pendingID: string, realID: string, commandId: string): string {
-    const mutation = pendingTaskRef.current.get(pendingID);
-    if (!mutation || realID === pendingID) return pendingID;
-    const resolved = { ...withResolvedCreateID(mutation, realID), commandId };
-    if (resolved.taskId === pendingID) return pendingID;
-    pendingTaskRef.current.delete(pendingID);
-    pendingTaskRef.current.set(resolved.taskId, resolved);
-    setTaskBusy(pendingID, false);
-    setTaskBusy(resolved.taskId, true);
-    markPendingTasksChanged();
-    return resolved.taskId;
-  }
-
-  function dropPendingTask(taskID: string) {
-    if (pendingTaskRef.current.delete(taskID)) markPendingTasksChanged();
-  }
 
   // runTaskCommand 把命令发出去并等它进入终态，**不**碰界面状态。
   // 所有收尾（撤销本地改动 / 重拉快照 / 提示）都在调用方。
@@ -5667,7 +5479,7 @@ export default function MobileRemotePage() {
            `leaveConversationView` 与返回键链都各自收过它），但"靠今天恰好没有那条路"
            不值得赌 —— 少一个条件，将来任何一处新增的 `setDevicesOpen(false)` 都会让
            这层浮在项目列表上。写在条件里，就不需要每个关面板的地方都记得它。 */}
-    {devicesOpen && aliasTarget && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-device-alias-title"><form className="mobile-task-modal" onSubmit={saveAlias}><header><h2 id="mobile-device-alias-title">给这台电脑起个名字</h2><button type="button" onClick={closeAliasEditor} aria-label="关闭">×</button></header><label>备注名<input value={aliasDraft} maxLength={DEVICE_ALIAS_MAX_LENGTH} autoFocus enterKeyHint="done" autoComplete="off" placeholder={aliasTargetRecord?.name || "例如：公司那台"} onChange={(event) => setAliasDraft(event.target.value)} /></label><p className="mobile-device-alias-hint">只在这台手机上生效，电脑本身的名字不会变。留空即恢复原名{aliasTargetRecord?.name ? `「${aliasTargetRecord.name}」` : ""}。</p><footer>{aliasTargetRecord?.alias ? <button type="button" className="mobile-device-alias-clear" onClick={() => { setDeviceAlias(aliasTarget, ""); setDevices(readDevices()); closeAliasEditor(); }}>清除备注</button> : null}<button type="button" onClick={closeAliasEditor}>取消</button><button type="submit">保存</button></footer></form></div>}
+    {devicesOpen && aliasTarget && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-device-alias-title"><form className="mobile-task-modal" onSubmit={saveAlias}><header><h2 id="mobile-device-alias-title">给这台电脑起个名字</h2><button type="button" onClick={closeAliasEditor} aria-label="关闭">×</button></header><label>备注名<input value={aliasDraft} maxLength={DEVICE_ALIAS_MAX_LENGTH} autoFocus enterKeyHint="done" autoComplete="off" placeholder={aliasTargetRecord?.name || "例如：公司那台"} onChange={(event) => setAliasDraft(event.target.value)} /></label><p className="mobile-device-alias-hint">只在这台手机上生效，电脑本身的名字不会变。留空即恢复原名{aliasTargetRecord?.name ? `「${aliasTargetRecord.name}」` : ""}。</p><footer>{aliasTargetRecord?.alias ? <button type="button" className="mobile-device-alias-clear" onClick={() => { renameRemoteDevice(aliasTarget, ""); closeAliasEditor(); }}>清除备注</button> : null}<button type="button" onClick={closeAliasEditor}>取消</button><button type="submit">保存</button></footer></form></div>}
     {/* 「我的电脑」面板（底部弹层）：切换电脑、添加/重新配对、逐台解绑**都在这一层**。
         以前这些散在三处（页面底部的两个游离按钮 + 配对面板里的"我的电脑"总账 + 这个弹层），
         现在合成一处 —— 点设备卡片上的「切换 / 管理」就进来。
