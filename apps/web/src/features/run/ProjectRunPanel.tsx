@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type LogEntry, type RunCommand, type RunConfig, type RunStatusResponse, createRunCommand, isRunnableCommand, renameEnvironmentVariable, runCommandLabel, runLogPresentation, runLogText, selectedRunCommand, statusLabels, withRunCommands } from "./run-model";
 import { type AnsiSegment, toAnsiSegments } from "./ansi";
 import { toast } from "sonner";
@@ -13,6 +13,13 @@ const MAX_LOG_ENTRIES = 2_000;
 const LOG_BOTTOM_THRESHOLD = 64;
 const RECONNECT_MAX_DELAY = 10_000;
 
+/** 日志流过滤：全部 / 普通输出 / 错误行（按 runLogPresentation 的错误判定，而不是裸 stream ——
+ *  构建工具把大量无害进度信息写进 stderr，按 stream 过滤会把它们误标成错误）。 */
+type LogFilter = "all" | "output" | "error";
+
+function isEntryError(entry: LogEntry): boolean {
+	return runLogPresentation(entry).tone === "is-error";
+}
 /** 空白启动配置。用函数而不是共享常量，避免多个面板实例共用同一个可变对象。 */
 function emptyRunConfig(): RunConfig {
 	return { workDir: "", command: "", envVars: {}, executionTarget: "auto", commands: [], selectedCommandId: "" };
@@ -158,6 +165,9 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	const [logs, setLogs] = useState<LogEntry[]>([]);
 	const [hasNewLogs, setHasNewLogs] = useState(false);
 	const [busy, setBusy] = useState("");
+	// 日志流过滤与配置展开态：都是本面板的浏览偏好，切换项目/会话时一并复位。
+	const [logFilter, setLogFilter] = useState<LogFilter>("all");
+	const [configExpanded, setConfigExpanded] = useState(false);
 	// 是否有未保存的改动。与 configDirtyRef 同源，但需要触发重渲染来标注「保存」按钮。
 	const [configDirty, setConfigDirty] = useState(false);
 	const [now, setNow] = useState(() => Date.now());
@@ -235,11 +245,18 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 		logNearBottomRef.current = true;
 		setConfig(emptyRunConfig());
 		setConfigDirty(false);
+		// worktrees 必须清空：普通项目的 /worktrees 请求会失败且静默吞错，
+		// 不清空的话上一个（自动编排）项目的 worktree 选项会残留，选中就把它的
+		// 路径写进当前项目的 workDir。退避计数同理，别把上一次的断连情绪带过来。
+		setWorktrees([]);
+		reconnectAttemptRef.current = 0;
 		setWorktreeSelection("");
 		setStatus(null);
 		setLogs([]);
 		setHasNewLogs(false);
 		setBusy("");
+		setLogFilter("all");
+		setConfigExpanded(false);
 	}, [projectID, conversationId]);
 
 	useEffect(() => {
@@ -292,6 +309,22 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 		};
 	}, [projectID, active, loadConfig, loadStatus, loadWorktrees, mergeIncomingLogs]);
 
+	// 过滤是纯展示层的裁剪：mergeLogs / clearedThroughLogIDRef 仍以全量 logs 为准，
+	// 切换过滤不会漏掉或误清任何一条服务端日志。
+	const errorCount = useMemo(() => logs.reduce((count, entry) => count + (isEntryError(entry) ? 1 : 0), 0), [logs]);
+	const visibleLogs = useMemo(() => (logFilter === "all" ? logs : logs.filter((entry) => isEntryError(entry) === (logFilter === "error"))), [logs, logFilter]);
+	// 自动滚动 effect 的依赖用「可见内容的签名」而不是 visibleLogs 数组引用：过滤状态下
+	// 任何一条被滤掉的日志到达都会生成新数组，若按引用比较，「跳到最新」会为一条根本
+	// 不在当前视图里的日志亮起。
+	const visibleSignature = `${visibleLogs.length}:${visibleLogs.length ? visibleLogs[visibleLogs.length - 1].id : ""}`;
+	// 切换过滤是一次「换一个视图」：贴底游标复位，自动滚到新视图底部，而不是把上一个
+	// 视图的「向上滚过」状态带过来凭空点亮「跳到最新」。
+	const applyLogFilter = useCallback((filter: LogFilter) => {
+		logNearBottomRef.current = true;
+		setHasNewLogs(false);
+		setLogFilter(filter);
+	}, []);
+
 	useEffect(() => {
 		const terminal = logTerminalRef.current;
 		if (!terminal) return;
@@ -301,7 +334,7 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 		} else {
 			setHasNewLogs(true);
 		}
-	}, [logs]);
+	}, [visibleSignature]);
 
 	useEffect(() => {
 		if (status?.status !== "running" || !status.startedAt) return;
@@ -337,6 +370,8 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	const addCommand = () => {
 		// 只追加、不抢选中：新行还没有命令文本，既不能被选中（选中项必须是一条真命令），
 		// 也不该把当前选中项顶掉。填好命令后再点它的圆点即可。
+		// chips 只能「选」不能「编辑」，所以添加新命令时自动展开配置表单，让输入框就在眼前。
+		setConfigExpanded(true);
 		updateConfig(withRunCommands(config, [...commands, createRunCommand()]));
 	};
 	const removeCommand = (id: string) => {
@@ -425,16 +460,22 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	const handleClearLogs = async () => {
 		setBusy("clear-logs");
 		const workspaceGeneration = workspaceGenerationRef.current;
+		// 水位线推进到「发起清除那一刻」的最大服务端日志 id 快照，而不是确认返回后 updater
+		// 里的 prev 最大 id：updater 是延迟执行的，响应返回与 updater 执行之间若恰好有 WS
+		// 推来清空之后的新日志，按 prev 推进会把这条新日志误标成「已清除」——它从此被
+		// recentLogs 回放的过滤器拦住，服务端还留着、界面上却永远消失。
+		const maxClearedId = logs.reduce((max, entry) => (entry.id > max ? entry.id : max), 0);
 		try {
 			const next = await request<RunStatusResponse>(withWorkspace(`${basePath}/logs/clear`), { method: "POST" });
 			if (activeProjectIDRef.current !== projectID || workspaceGeneration !== workspaceGenerationRef.current) return;
 			// Only after the server confirms the clear should the local log state
 			// advance, otherwise a failed request would leave the UI empty while
 			// the server still retains the logs (and loadStatus would filter them).
-			setLogs((prev) => {
-				for (const entry of prev) clearedThroughLogIDRef.current = Math.max(clearedThroughLogIDRef.current, entry.id);
-				return [];
-			});
+			// id <= 0 的条目没有服务端 id（服务端清除动作管不到它们），保留。
+			setLogs((prev) => prev.filter((entry) => entry.id <= 0 || entry.id > maxClearedId));
+			clearedThroughLogIDRef.current = Math.max(clearedThroughLogIDRef.current, maxClearedId);
+			// 视图即将清空：贴底游标复位，别让「跳到最新」浮钮停在一个空终端上。
+			logNearBottomRef.current = true;
 			setHasNewLogs(false);
 			setStatus(next);
 		} catch (cause) {
@@ -455,17 +496,35 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	const statusLabel = status ? statusLabels[status.status] : statusLabels.stopped;
 	const statusKey = status?.status || "stopped";
 	const uptime = status?.startedAt ? formatUptime(new Date(status.startedAt), now) : "";
+	// 启动台摘要行：执行环境 / 工作目录 / 变量数量，全部只读展示，编辑入口在「展开配置」里。
+	const runnableCommands = commands.filter(isRunnableCommand);
+	const targetLabel = resolvedTarget === "windows" ? "Windows" : resolvedTarget === "wsl" ? "WSL" : resolvedTarget === "auto" ? "自动" : "远程";
+	const trimmedWorkDir = config.workDir.trim();
+	const workDirLabel = trimmedWorkDir || "项目根目录";
+	const globalEnvCount = Object.keys(config.envVars || {}).length;
+	const commandEnvCount = commands.reduce((count, item) => count + Object.keys(item.envVars || {}).length, 0);
+	const runningCommandText = status?.command ? (runningCommand ? runCommandLabel(runningCommand, commands.indexOf(runningCommand)) : status.command) : "";
+	const configSummary = `运行环境 ${targetLabel} · 工作目录 ${workDirLabel} · 环境变量 ${globalEnvCount} 个${commandEnvCount ? ` · 命令变量 ${commandEnvCount} 个` : ""}`;
 
 	return <section id="workspace-panel-run" className="run-panel workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-run" hidden={!active}>
 			<div className="run-body">
 				<section className="run-log-section">
 					<header>
-						<div className="run-section-heading"><span className="run-section-mark"><TerminalIcon /></span><div><h3>运行日志</h3><small>{logs.length ? `${logs.length} 条输出` : "等待服务输出"}</small></div></div>
-						<button type="button" className="run-log-clear" title="清除当前日志" aria-label="清除当前日志" disabled={logs.length === 0 || busy !== ""} onClick={() => void handleClearLogs()}><ClearIcon /></button>
+						<div className="run-section-heading"><span className="run-section-mark"><TerminalIcon /></span><div><h3>运行日志</h3><small>{logs.length ? `${logs.length} 条输出${errorCount ? ` · ${errorCount} 条错误` : ""}` : "等待服务输出"}</small></div></div>
+						<div className="run-log-tools">
+							<div className="run-log-filters" role="group" aria-label="按严重程度过滤日志">
+								<button type="button" className={logFilter === "all" ? "selected" : ""} aria-pressed={logFilter === "all"} onClick={() => applyLogFilter("all")}>全部</button>
+								<button type="button" className={logFilter === "output" ? "selected" : ""} aria-pressed={logFilter === "output"} onClick={() => applyLogFilter("output")}>输出</button>
+								<button type="button" className={logFilter === "error" ? "selected" : ""} aria-pressed={logFilter === "error"} onClick={() => applyLogFilter("error")}>{`错误${errorCount ? ` ${errorCount}` : ""}`}</button>
+							</div>
+							<button type="button" className="run-log-clear" title="清除当前日志" aria-label="清除当前日志" disabled={logs.length === 0 || busy !== ""} onClick={() => void handleClearLogs()}><ClearIcon /><span>清除日志</span></button>
+						</div>
 					</header>
 					<div className="run-log-terminal-wrap">
 						<div ref={logTerminalRef} className="run-log-terminal" onScroll={handleLogScroll}>
-						{logs.length === 0 ? <div className="run-log-empty">尚未有日志输出。配置并启动命令后，日志将显示在此处。</div> : logs.map((entry, i) => {
+						{logs.length === 0 ? <div className="run-log-empty">尚未有日志输出。配置并启动命令后，日志将显示在此处。</div>
+							: visibleLogs.length === 0 ? <div className="run-log-empty">当前过滤下没有日志行，切回「全部」可查看完整输出。</div>
+							: visibleLogs.map((entry, i) => {
 							const presentation = runLogPresentation(entry);
 							return <div key={entry.id || `${entry.timestamp}-${i}`} className={`run-log-line ${entry.stream} ${presentation.tone}`}>
 								<time>{new Date(entry.timestamp).toLocaleTimeString()}</time>
@@ -478,23 +537,40 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 					</div>
 				</section>
 
-				<aside className="run-sidebar">
-					<section className="run-controls">
-						<header className="run-sidebar-heading"><div><span>服务状态</span><h3>项目进程</h3></div><div className={`run-status-badge ${statusKey}`} aria-live="polite"><i></i>{statusLabel}</div></header>
-						<div className="run-status-details">
-							<span><small>进程</small><b>{status?.pid ? `PID ${status.pid}` : "尚未启动"}</b></span>
-							<span><small>运行时长</small><b>{uptime || "-"}</b></span>
-							{status?.command ? <span className="run-running-command"><small>启动命令</small><b title={status.command}>{runningCommand ? runCommandLabel(runningCommand, commands.indexOf(runningCommand)) : status.command}</b></span> : null}
-							{status?.exitCode !== null && status?.exitCode !== undefined && status.status !== "running" ? <span className="run-exit-code"><small>退出码</small><b>{status.exitCode}</b></span> : null}
-						</div>
-						<div className="run-actions">
-							<button type="button" className="primary" disabled={running || transitioning || busy !== ""} title={selectedCommand ? `启动：${runCommandLabel(selectedCommand, commands.indexOf(selectedCommand))}` : "请先配置启动命令"} onClick={handleStart}><PlayIcon />{busy === "start" ? "启动中" : "启动"}</button>
-							<button type="button" className="danger" disabled={!running || busy !== ""} onClick={handleStop}><StopIcon />{busy === "stop" ? "停止中" : "停止"}</button>
-							<button type="button" className="secondary" disabled={busy !== ""} onClick={handleRestart}><RestartIcon />{busy === "restart" ? "重启中" : "重启"}</button>
+				<aside className="run-sidebar run-launchpad">
+					<section className="run-launch-status">
+						<header className="run-launch-head">
+							<h3>启动台</h3>
+							<div className={`run-status-badge ${statusKey}`} aria-live="polite"><i></i>{statusLabel}</div>
+						</header>
+						<div className={`run-launch-hero is-${statusKey}`}>
+							<div className="run-launch-hero-main">
+								<i className="run-launch-dot" aria-hidden="true"></i>
+								<b>{statusLabel}</b>
+								{running && uptime ? <span className="run-launch-uptime">已运行<b>{uptime}</b></span> : null}
+							</div>
+							<p className="run-launch-meta">{status?.pid ? `PID ${status.pid}` : "PID —"}{runningCommandText ? ` · ${runningCommandText}` : ""}{status?.exitCode !== null && status?.exitCode !== undefined && status.status !== "running" ? ` · 退出码 ${status.exitCode}` : ""}</p>
 						</div>
 					</section>
 
-					<section className="run-config">
+					<section className="run-launch-commands">
+						<p className="run-launch-label">启动命令 · 点谁启动谁</p>
+						{runnableCommands.length === 0 ? <p className="run-config-hint">还没有启动命令，点「添加」创建一条，例如 <code>npm run dev</code>。</p>
+							: <div className="run-command-chips" role="group" aria-label="选择启动命令">
+								{runnableCommands.map((item) => {
+									const selected = item.id === selectedCommand?.id;
+									return <button key={item.id} type="button" aria-pressed={selected} className={`run-command-chip${selected ? " is-selected" : ""}`} title={selected ? "启动/重启将执行这一条" : `点击选中：${item.command.trim()}`} onClick={() => selectCommand(item.id)}><i aria-hidden="true"></i><span>{item.command.trim()}</span></button>;
+								})}
+							</div>}
+						<button type="button" className="run-command-chip is-add" onClick={addCommand}><PlusIcon />添加</button>
+					</section>
+
+					<section className="run-launch-summary">
+						<p className="run-launch-summary-text" title={configSummary}>{configSummary}</p>
+						<button type="button" className={`run-launch-toggle${configDirty && !configExpanded ? " is-dirty" : ""}`} aria-expanded={configExpanded} title={configDirty && !configExpanded ? "有未保存的改动；启动、重启时会自动保存，也可展开配置后手动保存" : undefined} onClick={() => setConfigExpanded((value) => !value)}>{configExpanded ? "收起配置" : "展开配置"}</button>
+					</section>
+
+					{configExpanded && <section className="run-config">
 						<header className="run-sidebar-heading"><div><h3>命令与环境</h3></div><button type="button" className={`run-save-config${configDirty ? " is-dirty" : ""}`} title={configDirty ? "有未保存的改动；启动、重启时会自动保存" : "保存启动配置"} disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : configDirty ? "保存 •" : "保存"}</button></header>
 						<div className="run-config-row">
 							<label htmlFor="run-execution-target">运行环境</label>
@@ -539,7 +615,15 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 							<label>环境变量</label>
 							<EnvironmentVarsEditor envVars={config.envVars || {}} onChange={(next) => updateConfig({ ...config, envVars: next })} />
 						</div>
-					</section>
+					</section>}
+
+					<div className="run-launch-spacer" aria-hidden="true"></div>
+					<div className="run-launch-actions">
+						{running ? <button type="button" className="run-launch-primary is-danger" disabled={transitioning || busy !== ""} onClick={handleStop}><StopIcon />{busy === "stop" ? "停止中" : "停止"}</button>
+							: <button type="button" className="run-launch-primary" disabled={transitioning || busy !== ""} title={selectedCommand ? `启动：${runCommandLabel(selectedCommand, commands.indexOf(selectedCommand))}` : "请先配置启动命令"} onClick={handleStart}><PlayIcon />{busy === "start" ? "启动中" : "启动"}</button>}
+						<button type="button" className="run-launch-secondary" disabled={busy !== ""} onClick={handleRestart}><RestartIcon />{busy === "restart" ? "重启中" : "重启"}</button>
+					</div>
+					<p className="run-launch-hint">启动、重启前会自动保存未保存的配置改动</p>
 				</aside>
 			</div>
 	</section>;

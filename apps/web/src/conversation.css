@@ -125,6 +125,10 @@
 }
 .message > header time,
 .tool-meta time { color: #8a95a7; font-size: 11px; font-weight: 400; }
+/* 方案 D 悬浮卡片：仅 AI 消息头部撑满整行（名称居左、时间居右，与复制按钮同一侧）；
+   用户消息头部保持右侧聚拢不动 */
+.message:not(.user) > header { width: 100%; }
+.message:not(.user) > header time { margin-left: auto; }
 .message-avatar {
   display: grid;
   width: 22px;
@@ -1603,11 +1607,16 @@
 .permission-popover button.selected.full { background: #fff0eb; }
 .permission-popover b { color: #19332c; }
 
-/* 对话页顶部工具栏：权限、历史和新会话保持明确但克制的操作层级。 */
+/* 对话页顶部工具栏（方案 A「图标化降噪」）：次要操作在桌面端收成 34px 图标方钮
+   （.icon-action），文字留在 .action-label 里、CSS 收起 —— ≤820px 的「操作」菜单
+   会把它重新显示出来，所以 DOM 一份不能少。权限（状态语义）与新会话（主操作）
+   保留文字；高度档从 38 降到 34，与通知铃铛（notification.css）同档。 */
 .head-actions-menu { gap: 10px; }
 .head-actions { gap: 8px; }
 .permission-trigger,
-.conversation-head-action { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 7px; border-radius: 7px; padding: 8px 11px; font-size: 12px; font-weight: 700; line-height: 1; white-space: nowrap; }
+.conversation-head-action { display: inline-flex; min-height: 34px; align-items: center; justify-content: center; gap: 7px; border-radius: 7px; padding: 0 12px; font-size: 12px; font-weight: 700; line-height: 1; white-space: nowrap; }
+.conversation-head-action.icon-action { width: 34px; min-width: 34px; padding: 0; }
+.conversation-head-action .action-label { display: none; }
 .conversation-workspace-picker { display: inline-flex; align-items: center; gap: 6px; color: #637267; font-size: 12px; }
 .conversation-workspace-picker select { min-width: 150px; max-width: 210px; height: 32px; padding: 0 8px; border: 1px solid #c9d7cc; border-radius: 6px; background: #fff; color: #24352b; font-size: 12px; }
 .conversation-head-icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
@@ -1615,13 +1624,13 @@
 .conversation-head-action.secondary { border-color: #c8dcd1; color: #31594f; background: #f7fbf8; box-shadow: none; transition: border-color .16s ease, color .16s ease, background .16s ease; }.conversation-head-action.secondary:hover:not(:disabled) { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
 .conversation-head-action.new-conversation-action { border-color: #9fbd46; color: #19332c; background: #c8e85a; box-shadow: none; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }.conversation-head-action.new-conversation-action:hover:not(:disabled) { border-color: #7d9e2f; background: #d8f47b; box-shadow: none; }.conversation-head-action.new-conversation-action:disabled, .permission-trigger:disabled { cursor: not-allowed; opacity: .58; }
 
-/* 工作区控件：将选择、创建和移除从普通操作中区分出来，保持紧凑但有明确层级。 */
-.project-head .conversation-workspace-picker { position: relative; min-height: 38px; box-sizing: border-box; gap: 8px; border: 1px solid #c9ddd3; border-radius: 8px; padding: 4px 6px 4px 10px; color: #557267; background: #f3faf5; font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: 0; line-height: 1; text-transform: none; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
+/* 工作区控件（方案 A 紧凑芯片）：文件夹图标 + 标签 + 值下拉，整枚芯片 34px 档。 */
+.project-head .conversation-workspace-picker { position: relative; min-height: 34px; box-sizing: border-box; gap: 6px; border: 1px solid #c9ddd3; border-radius: 7px; padding: 3px 6px 3px 9px; color: #557267; background: #f3faf5; font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: 0; line-height: 1; text-transform: none; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
 .conversation-workspace-picker:hover { border-color: #9bbfac; background: #edf7f0; }
 .conversation-workspace-picker:focus-within { border-color: #5f9d88; background: #eef8f2; box-shadow: 0 0 0 3px #75b59a2b; }
 .project-head .conversation-workspace-picker > span { flex: none; color: #557267; font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: 0; line-height: 1; text-transform: none; }
-.project-head .conversation-workspace-picker select { min-width: 142px; max-width: 190px; height: 30px; appearance: none; border: 1px solid #d4e3d9; border-radius: 6px; padding: 0 30px 0 10px; outline: 0; color: #214338; background: #fff; box-shadow: 0 1px 2px #2143380b; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: 0; line-height: 28px; text-overflow: ellipsis; }
-.conversation-workspace-picker::after { position: absolute; right: 13px; bottom: 14px; width: 6px; height: 6px; border-right: 1.5px solid #5c8878; border-bottom: 1.5px solid #5c8878; content: ""; pointer-events: none; transform: rotate(45deg) translateY(-2px); }
+.project-head .conversation-workspace-picker select { min-width: 118px; max-width: 170px; height: 26px; appearance: none; border: 1px solid #d4e3d9; border-radius: 5px; padding: 0 26px 0 9px; outline: 0; color: #214338; background: #fff; box-shadow: 0 1px 2px #2143380b; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: 0; line-height: 24px; text-overflow: ellipsis; }
+.conversation-workspace-picker::after { position: absolute; right: 11px; bottom: 12px; width: 6px; height: 6px; border-right: 1.5px solid #5c8878; border-bottom: 1.5px solid #5c8878; content: ""; pointer-events: none; transform: rotate(45deg) translateY(-2px); }
 .conversation-workspace-picker select:hover { border-color: #a9c8b5; background: #fcfffd; box-shadow: 0 2px 5px #21433812; }
 .conversation-workspace-picker select:focus-visible { border-color: #5f9d88; box-shadow: 0 0 0 3px #75b59a2b; }
 .conversation-workspace-picker select:disabled { color: #8b9b91; border-color: #dce5df; background: #f1f4f1; cursor: not-allowed; }
@@ -1645,6 +1654,10 @@
   .head-actions-menu .conversation-workspace-picker select { min-width: 0; max-width: none; flex: 1; }
   .head-actions-menu .workspace-remove-action,
   .head-actions-menu .workspace-create-action { text-align: left; }
+  /* 「操作」菜单里恢复文字：图标方钮退回整行文字钮（min-width 必须显式归零，
+     否则桌面档的 34px 方钮约束会漏进来把菜单项压扁）。 */
+  .head-actions-menu .head-actions .action-label { display: inline; }
+  .head-actions-menu .conversation-head-action.icon-action { width: auto; min-width: 0; justify-content: flex-start; }
 }
 
 
@@ -1774,7 +1787,7 @@
   width: 24px;
   height: 24px;
   border: 1px solid #315d50;
-  border-radius: 7px;
+  border-radius: 50%;
   color: #f7fcf8;
   background: #315d50;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1782,30 +1795,42 @@
   letter-spacing: 0;
 }
 .message.user .message-avatar {
-  border-color: #badccd;
-  color: #1f6556;
-  background: #e5f4ea;
+  border-color: var(--accent);
+  color: #ffffff;
+  background: var(--accent);
   font-family: inherit;
   font-size: 11px;
 }
 .message > .markdown {
   width: fit-content;
   max-width: 100%;
-  border: 1px solid #d9e7de;
-  border-radius: 8px;
+  border: 1px solid #e3ede7;
+  border-radius: 12px;
   padding: 15px 17px;
   color: #29443a;
-  background: #fcfefd;
-  box-shadow: 0 1px 2px #17362c08;
+  background: #ffffff;
+  box-shadow: 0 1px 2px #17362c0d, 0 3px 12px #17362c0f;
   font-size: 14px;
   line-height: 1.72;
 }
+/* 方案 D 悬浮卡片：用户消息用主题绿实底反白，内部 Markdown 元素换深底可读配色。
+   只动静态样式，不涉及任何运行态动画（run-pulse / runner-active-* 均未触碰）。 */
 .message.user > .markdown {
-  border-color: #b9dccd;
-  color: #214d40;
-  background: #e9f6ee;
-  box-shadow: none;
+  border-color: var(--accent);
+  color: #f4faf6;
+  background: var(--accent);
+  box-shadow: 0 1px 2px #1c4a3a1f, 0 4px 14px #1c4a3a2e;
 }
+.message.user .markdown h1, .message.user .markdown h2, .message.user .markdown h3, .message.user .markdown h4, .message.user .markdown h5, .message.user .markdown h6 { color: #ffffff; }
+.message.user .markdown a { color: #d8f2e4; }
+.message.user .markdown code { border-color: #ffffff33; color: #eaf7ef; background: #ffffff1f; }
+.message.user .markdown blockquote { color: #dcefe5; background: #ffffff14; border-left-color: #9fd3bf; }
+.message.user .markdown hr { background: #ffffff2e; }
+.message.user .markdown ul ul { border-left-color: #ffffff38; }
+.message.user .markdown table { border-color: #ffffff2e; background: transparent; }
+.message.user .markdown th, .message.user .markdown td { border-color: #ffffff2e; }
+.message.user .markdown th { color: #ffffff; background: #ffffff17; }
+.message.user .markdown-image-reference { border-color: #ffffff33; color: #dcefe5; background: #ffffff14; }
 .message-copy {
   width: 28px;
   height: 28px;
@@ -1837,8 +1862,8 @@
     box-shadow: 0 7px 18px #17362c12;
   }
   .message.user:hover > .markdown {
-    border-color: #a9d2c0;
-    box-shadow: 0 3px 10px #17362c0b;
+    border-color: #245d52;
+    box-shadow: 0 4px 14px #1c4a3a2e;
   }
   .tool-card:hover,
   .agent-execution-card:hover {
@@ -1856,8 +1881,8 @@
   box-shadow: 0 0 0 3px #e4f4ea, 0 7px 18px #17362c12;
 }
 .message.user:focus-within > .markdown {
-  border-color: #99cbb5;
-  box-shadow: 0 0 0 3px #dff1e6, 0 3px 10px #17362c0b;
+  border-color: #245d52;
+  box-shadow: 0 0 0 3px #dff1e6, 0 4px 14px #1c4a3a2e;
 }
 .tool-card:focus-within,
 .agent-execution-card:focus-within {
@@ -2357,6 +2382,62 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 }
 .update-error-dialog .update-error-reason::-webkit-scrollbar { width: 8px; }
 .update-error-dialog .update-error-reason::-webkit-scrollbar-thumb { border-radius: 4px; background: #d7cec3; }
+/* 更新失败弹窗：失败原因可能带 CLI 输出，壳由共享类 .modal.dialog-studio 提供，宽度放宽一档。
+   三段类名 (0,3,0) 压过全局 .modal 的 width，不依赖加载顺序。 */
+.modal.dialog-studio.update-error-dialog { width: min(520px, 100%); }
+
+/* 更新 CLI 确认弹窗（方案A 绿色小弹窗）。全局 .modal 被全站共用，这里的皮肤全部走
+   .modal.update-confirm-dialog / .update-confirm-* 专属前缀 —— 与全局 .modal header(0,1,1)、
+   .modal h2(0,1,1)、.modal label(0,1,1)、.modal button(0,1,1) 同台时靠更高特异性生效，
+   顺序不参与胜负（conversation.css 与 style.css 的加载顺序不能当依赖）。 */
+.modal.update-confirm-dialog {
+  width: min(440px, 100%);
+  color: #19332c;
+  border-color: #c8dcd1;
+  border-radius: 12px;
+  background: #fbfefb;
+  box-shadow: 0 24px 60px #102d2347;
+}
+.modal.update-confirm-dialog > header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border-bottom: 1px solid #dcebe1;
+  padding: 13px 16px;
+  background: #f4faf6;
+}
+.update-confirm-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid #cfe3d8;
+  border-radius: 8px;
+  color: #2c7567;
+  background: #e3f1ea;
+}
+.update-confirm-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+.update-confirm-heading { display: grid; min-width: 0; flex: 1; gap: 1px; }
+.update-confirm-dialog .update-confirm-heading label { overflow: hidden; color: #789188; font: 700 10px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.06em; text-overflow: ellipsis; white-space: nowrap; }
+.update-confirm-dialog .update-confirm-heading h2 { margin: 0; color: #19332c; font-size: 15px; }
+.modal.update-confirm-dialog header .update-confirm-close { display: grid; width: 28px; height: 28px; min-width: 28px; flex: none; place-items: center; border: 1px solid #d0e1d8; border-radius: 6px; padding: 0; color: #668176; background: #fcfefc; font-size: 14px; line-height: 1; transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease; }
+.modal.update-confirm-dialog header .update-confirm-close:hover { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }
+.update-confirm-body { display: grid; gap: 12px; padding: 16px; }
+.update-confirm-versions { display: flex; align-items: stretch; gap: 10px; border: 1px solid #dbe8e0; border-radius: 9px; padding: 12px; background: #f4faf6; }
+.update-confirm-version { display: grid; min-width: 0; flex: 1; align-content: center; gap: 2px; border-radius: 7px; padding: 9px 12px; }
+.update-confirm-version small { color: #8aa39a; font-size: 9.5px; font-weight: 700; letter-spacing: 0.05em; }
+.update-confirm-version code { overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
+.update-confirm-version.is-current { border: 1px solid #d7e6dd; color: #547369; background: #ffffff; }
+.update-confirm-version.is-latest { border: 1px solid #7ab5a6; background: #e3f1ea; }
+.update-confirm-version.is-latest small { color: #3d7a67; }
+.update-confirm-version.is-latest code { color: #1e5145; font-weight: 700; }
+.update-confirm-arrow { width: 20px; height: 20px; flex: none; align-self: center; fill: none; stroke: #2c7567; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
+.update-confirm-note { display: flex; align-items: center; gap: 9px; margin: 0; border: 1px solid #ead5a8; border-radius: 8px; padding: 10px 12px; color: #85671c; background: #fff8e8; font-size: 12px; line-height: 1.5; }
+.update-confirm-note svg { width: 15px; height: 15px; flex: none; fill: none; stroke: #a47720; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.modal.update-confirm-dialog > footer { border-top: 1px solid #dcebe1; background: #f8fcf9; }
+
 .runner-inline-btn {
   min-height: 27px;
   border-color: #c5dcd0;
@@ -2837,7 +2918,8 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 .quick-block-add .quick-tag-control-icon { width: 12px; height: 12px; }
 
 /* 色块内的条目：白色胶囊（去边框、轻投影），横向换行铺开；
-   编辑钮收进胶囊右端；拖拽排序沿用 HTML5 拖拽，落点用整颗描边高亮。 */
+   编辑钮不常驻——悬停/聚焦胶囊时在右端现形（见下方 .quick-tag-edit 规则）；
+   拖拽排序沿用 HTML5 拖拽，落点用整颗描边高亮。 */
 .quick-block .quick-tag,
 .quick-block .quick-tag-empty { min-height: 0; }
 .quick-block .quick-tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -2851,13 +2933,16 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
   background: #ffffff;
   box-shadow: 0 1px 2px rgba(23, 55, 44, .06);
 }
+/* 编辑钮悬停现形：胶囊静默时是纯文字（左右对称内边距），
+   悬停整颗胶囊时「⋯」在右端展开淡入；键盘 Tab 聚焦（focus-within）同样现形。
+   只作用于桌面左栏 .quick-block；移动端快捷菜单（.quick-tag-group）保持常驻按钮。 */
 .quick-block .quick-tag > button:first-child {
   flex: 0 1 auto;
   min-width: 0;
   min-height: 26px;
   border: 0;
   border-radius: 8px;
-  padding: 5px 4px 5px 10px;
+  padding: 5px 10px;
   color: #31594f;
   background: transparent;
   font-size: 11px;
@@ -2871,8 +2956,35 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 .quick-block .quick-tag > button:first-child:active:not(:disabled) { transform: none; }
 .quick-block .quick-tag > button:first-child:disabled { color: #94a99f; background: transparent; }
 .quick-block .quick-tag.disabled > button:first-child { color: #91a39b; background: transparent; }
-.quick-block .quick-tag-edit { width: 18px; min-height: 26px; border-radius: 8px; color: #809188; }
+.quick-block .quick-tag-edit {
+  width: 0;
+  min-height: 26px;
+  border: 0;
+  padding: 0;
+  overflow: hidden;
+  opacity: 0;
+  border-radius: 8px;
+  color: #809188;
+  pointer-events: none;
+  transition: width .16s ease, opacity .16s ease, color .16s ease, background .16s ease;
+}
+.quick-block .quick-tag:hover .quick-tag-edit,
+.quick-block .quick-tag:focus-within .quick-tag-edit {
+  width: 18px;
+  opacity: 1;
+  pointer-events: auto;
+}
 .quick-block .quick-tag-edit:hover:not(:disabled) { border-color: transparent; color: #245f50; background: rgba(23, 61, 50, .08); }
+/* 禁用态（只读会话等）现形时必须看得见地禁用：上面 (0,3,0) 的 opacity:1
+   会压过基础规则 .quick-tag-edit:disabled 的 .45，这里用 (0,4,0) 夺回来。 */
+.quick-block .quick-tag:hover .quick-tag-edit:disabled,
+.quick-block .quick-tag:focus-within .quick-tag-edit:disabled { opacity: .45; }
+/* 动效降级：上面的 width/opacity 过渡在 reduced-motion 下直接取消（显式列出同一组选择器）。 */
+@media (prefers-reduced-motion: reduce) {
+  .quick-block .quick-tag-edit,
+  .quick-block .quick-tag:hover .quick-tag-edit,
+  .quick-block .quick-tag:focus-within .quick-tag-edit { transition: none; }
+}
 .quick-block .quick-tag-empty {
   flex: 0 1 auto;
   min-height: 26px;

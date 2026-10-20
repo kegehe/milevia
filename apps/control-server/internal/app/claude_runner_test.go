@@ -1146,3 +1146,108 @@ func TestCodexReadOutputSilencesPipeClosed(t *testing.T) {
 		}
 	}
 }
+
+// 「读不到最新版本」必须说得出原因，而且不许把用户支去一个不存在的地方。
+//
+// 背景（2026-10-16 用户报，管理页三张卡同时读不到）：卡片上写的是
+// 「读不到最新版本（任务执行失败，请查看任务日志后重试。：query latest
+// @anthropic-ai/claude-code version: exit status 1）。」—— 两处都不对：
+//
+//   - "请查看任务日志"指不到任何东西：这条链路没有任务、也没有任务日志。它来自
+//     localizedErrorText 对**纯英文**错误套的通用兜底（原文是 `query latest …`）；
+//   - `exit status 1` 有两种完全不同的成因：npm 自己报错，或者**我们的时间上限把它
+//     杀了** —— Windows 上被 TerminateProcess 杀掉的进程退出码就是 1，Go 侧报的一模
+//     一样（实测：ctx 到点时 Run() 返回的正是 `exit status 1`，ctx.Err() 才是
+//     DeadlineExceeded）。而 npm 真正的失败原因（registry 不可达 / 404 / 代理）
+//     只在 stderr 上，`cmd.Output()` 会把它整个丢掉。
+func TestNpmVersionQueryFailureExplainsItself(t *testing.T) {
+	// ① 超时：与"npm 报错"分开说，且原样直通（不套"任务执行失败…"那层前缀）。
+	timeout := npmVersionQueryError(context.DeadlineExceeded, errors.New("exit status 1"), "")
+	if !strings.Contains(timeout.Error(), "超时") {
+		t.Fatalf("超时没被说成超时：%v", timeout)
+	}
+	if got := errorText(timeout); !strings.Contains(got, "超时") || strings.Contains(got, taskFailureFallbackPrefix) {
+		t.Fatalf("超时被套上了通用兜底或丢了原因：%q", got)
+	}
+
+	// ② npm 自己报错：stderr 上那句原因必须带上（原先它被 Output() 丢掉，只剩 exit status 1），
+	//    而**退出码不许再出现** —— 它是原先那句文案里唯一的内容，对用户没有信息量。
+	npmErr := npmVersionQueryError(nil, errors.New("exit status 1"),
+		"npm error code EAI_AGAIN\nnpm error syscall getaddrinfo\nnpm error network request to https://registry.npmjs.org failed\n")
+	for _, want := range []string{"EAI_AGAIN", "getaddrinfo"} {
+		if !strings.Contains(npmErr.Error(), want) {
+			t.Fatalf("npm 的 stderr 没被带出来（缺 %q）：%v", want, npmErr)
+		}
+	}
+	if strings.Contains(npmErr.Error(), "exit status") {
+		t.Fatalf("有原因却还把退出码摆上来了：%v", npmErr)
+	}
+	if got := errorText(npmErr); strings.Contains(got, taskFailureFallbackPrefix) {
+		t.Fatalf("npm 的失败原因被通用兜底盖住了：%q", got)
+	}
+
+	// ③ npm 的 stderr 里同一件事会抄好几遍（这段是**真机原文**，一次 404 有 400 多字）。
+	//    只留前两条：错误码 + 正文；"还能从 tarball 装"那两行与末尾的日志路径都是噪音。
+	real404 := strings.Join([]string{
+		"npm error code E404",
+		"npm error 404 Not Found - GET https://registry.npmjs.org/@anthropic-ai%2fdefinitely-not-here - Not found",
+		"npm error 404",
+		"npm error 404  The requested resource '@anthropic-ai/definitely-not-here@*' could not be found.",
+		"npm error 404 Note that you can also install from a",
+		"npm error 404 tarball, folder, http url, or git url.",
+		`npm error A complete log of this run can be found in: C:\Users\x\AppData\Local\npm-cache\_logs\x-debug-0.log`,
+	}, "\n")
+	detail := npmFailureDetail(real404)
+	if !strings.Contains(detail, "E404") || !strings.Contains(detail, "Not Found") {
+		t.Fatalf("把原因本身滤掉了：%q", detail)
+	}
+	for _, noise := range []string{"tarball", "complete log", "_logs"} {
+		if strings.Contains(detail, noise) {
+			t.Fatalf("噪音没被滤掉（%q）：%q", noise, detail)
+		}
+	}
+	if runes := len([]rune(detail)); runes > maxNpmFailureRunes {
+		t.Fatalf("压完还有 %d 字符：%q", runes, detail)
+	}
+	// 反例：认不出 npm 的格式时**不许**把 stderr 丢掉（node 崩了这类只会走这一支）。
+	//    也钉住"不是 npm 标出来的行不算原因"：`npm notice` 那句旁白不许顶替真正的失败原因。
+	unknown := npmVersionQueryError(nil, errors.New("exit status 1"), "FATAL ERROR: Reached heap limit Allocation failed")
+	if !strings.Contains(unknown.Error(), "heap limit") {
+		t.Fatalf("非 npm 格式的 stderr 被丢了：%v", unknown)
+	}
+	notice := npmFailureDetail("npm notice New major version of npm available! 10.9.2 -> 12.2.0\n")
+	if notice != "" {
+		t.Fatalf("把 npm 的旁白当成了失败原因：%q", notice)
+	}
+
+	// ④ npm 压根没跑起来（GUI 进程的 PATH 里没有它）—— 这一条同样要留得下来：
+	//    "exit status 1" 与"找不到 npm"是两件事，后者只能靠这句原文分辨。
+	missing := npmVersionQueryError(nil, &exec.Error{Name: "npm", Err: exec.ErrNotFound}, "")
+	if !strings.Contains(missing.Error(), "npm") || strings.Contains(missing.Error(), taskFailureFallbackPrefix) {
+		t.Fatalf("找不到 npm 这条没留下痕迹：%q", missing.Error())
+	}
+}
+
+// 用**真的 npm** 走一遍超时那条路 —— 它是这次缺陷的正身：时间上限到点时进程被杀，
+// Windows 上被杀的退出码是 1，Go 报的与"npm 自己报错"一模一样（实测 ctx.Err() 才是
+// DeadlineExceeded）。上面那条用例只喂了构造出来的错误，这一条证明真机上确实分得开。
+//
+// 期限压到 200 毫秒：node 冷启动本身就要 0.4 秒（见 CliToolsPage.tsx 的实测记录），
+// 所以 npm 必然跑不完 —— "被杀"这件事是真发生过的，不是假设的。
+func TestNpmVersionQueryTimeoutIsReportedAsTimeout(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("这台机器上没有 npm，跳过")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := latestNpmPackageVersion(ctx, "@anthropic-ai/claude-code")
+	if err == nil {
+		t.Fatal("200 毫秒内就查回来了？这条用例的前提没了，请调小期限")
+	}
+	if !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("被杀掉的那次没被说成超时：%v", err)
+	}
+	if got := errorText(err); strings.Contains(got, taskFailureFallbackPrefix) {
+		t.Fatalf("超时被套上了通用兜底，用户又被支去看不存在的任务日志：%q", got)
+	}
+}

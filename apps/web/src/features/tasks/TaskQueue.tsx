@@ -2,7 +2,7 @@ import { FormEvent, MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 
-import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
+import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, taskRunStatusTone, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import { persistTaskQuickDraft, readTaskQuickDraft } from "../../lib/task-quick-draft";
@@ -53,6 +53,24 @@ function DispatchIcon() {
 
 function DispatchCloseIcon() {
   return <svg className="task-dispatch-close-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
+}
+
+// 详情面板工具按钮图标：编辑（铅笔）、完整详情（跳转任务页）、删除（垃圾桶）。
+// 三个都是"通用工具"，统一 28×28 图标按钮形态，文字含义交给 title / aria-label。
+function EditTaskIcon() {
+  return <svg className="task-inline-tool-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h3.6L19 8.6 15.4 5 4 16.4V20Z" /><path d="m14.4 6 3.6 3.6" /></svg>;
+}
+
+function OpenTaskBoardIcon() {
+  return <svg className="task-inline-tool-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18 18 6" /><path d="M9 6h9v9" /></svg>;
+}
+
+function DeleteTaskIcon() {
+  return <svg className="task-inline-tool-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9.5 7V4.5h5V7" /><path d="m6.5 7 1 13h9l1-13" /></svg>;
+}
+
+function CloseIcon() {
+  return <svg className="task-inline-close-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
 }
 
 export function TaskQueue({ projectID, conversationID, permissionMode, request, fail, dispatchDisabled = false, onDispatched, openBoard, collapsed = false, onToggleCollapsed }: { projectID: string; conversationID: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; dispatchDisabled?: boolean; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void; collapsed?: boolean; onToggleCollapsed?: () => void }) {
@@ -601,7 +619,6 @@ function TaskQueueRow({ task, index, open, confirm, redispatch, redispatching, d
   const didDragRef = useRef(false);
   const mouseDownPosRef = useRef<{ x: number; y: number } | null>(null);
   const queued = task.status === "running" && task.lastRun?.status === "queued";
-  const status = queued ? "队列中" : statusLabels[task.status];
   const note = taskQueueNote(task);
   const isReviewing = reviewingTaskID === task.id;
   const reviewRef = useRef<HTMLDivElement>(null);
@@ -893,6 +910,25 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
   // 仅待处理/需处理状态可编辑：后端禁止在 running/awaiting_review 下改执行内容
   // （会与进行中或待验收的 run 冲突，返回 409），与任务页详情弹窗的编辑入口一致。
   const canEdit = detail.status === "todo" || detail.status === "action_required";
+  // 「能不能就地验收」只有这一处判据（输入框与两个按钮共用）：必须和队列行里的验收入口
+  // （上面 QueueRow 的 `!isTaskOrchestrating && !isTaskAwaitingMainMerge`）取同一口径，
+  // 否则会出现"行里不给验收、点进详情却能确认完成"——与编排收尾互相覆盖。
+  const canReviewInline = detail.status === "awaiting_review" && !isTaskAwaitingMainMerge(detail) && !isTaskOrchestrating(detail);
+  // 待验收但暂不可验时，必须把原因说出来：只把按钮拿掉等于静默告诉用户"没有这个功能"。
+  let reviewUnavailable = "";
+  if (detail.status === "awaiting_review" && !canReviewInline) {
+    reviewUnavailable = isTaskAwaitingMainMerge(detail)
+      ? `分支已验证，可合并至 ${detail.orchestrationTargetBranch || "目标分支"} 后验收。`
+      : "自动编排正在收尾，稍后即可验收。";
+  }
+  // 三个通用工具共用同一个忙碌口径：验收提交中／删除中都算忙，别让在途请求和危险操作抢跑。
+  const toolBusy = reviewBusy || Boolean(busy);
+  const deleteLabel = busy === "delete" ? "删除中" : "删除任务";
+  // 说明 / 执行记录 / 阻塞原因三者全空时，内容块整块不渲染——否则会留下一条没有内容的分隔线。
+  // 判据放在这里而不是交给 CSS `:empty`：React 渲染出的空文本节点会让 `:empty` 失效，
+  // 而"要不要渲染"只能有一处判据（`:empty` 与这里的判断会各自为政）。
+  const hasDescription = detail.description.trim().length > 0;
+  const hasBody = hasDescription || detail.runs.length > 0 || Boolean(detail.blockReason);
 
   const startEdit = () => {
     setEditDescription(detail.description);
@@ -923,14 +959,16 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
     finally { if (mountedRef.current) setLocalReviewSubmitting(false); }
   };
 
-  return <div className="task-inline-detail" data-task-inline-detail-id={detail.id} ref={detailRef} onDragStart={(e) => e.stopPropagation()}>
+  return <div className="task-inline-detail" data-status={detail.status} data-task-inline-detail-id={detail.id} ref={detailRef} onDragStart={(e) => e.stopPropagation()}>
     <div className="task-inline-detail-head">
       <div className="task-inline-detail-title">
-        <span className={`task-status ${detail.status}`}>{queued ? "队列中" : statusLabels[detail.status]}</span>
+        <span className="task-inline-meta">
+          <span className={`task-status ${taskDisplayStatusClass(detail)}`}>{taskDisplayStatus(detail)}</span>
+          <span className={`task-inline-priority priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span>
+        </span>
         <b>{taskDisplayTitle(detail)}</b>
-        <span className={`task-inline-priority priority-${detail.priority}`}>{priorityLabels[detail.priority]}优先级</span>
       </div>
-      <button type="button" className="task-inline-close" title="关闭详情" disabled={reviewBusy || editBusy} onClick={close}>x</button>
+      <button type="button" className="task-inline-close" title="关闭详情" aria-label="关闭详情" disabled={reviewBusy || editBusy} onClick={close}><CloseIcon /></button>
     </div>
     {editing ? <form className="task-inline-edit-form" onSubmit={(event) => { event.preventDefault(); void saveEdit(); }}>
       <label className="task-inline-edit-field"><span>任务说明</span><textarea required maxLength={12000} value={editDescription} disabled={editBusy} onChange={(event) => setEditDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label>
@@ -941,27 +979,33 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
         <button type="submit" className="primary" disabled={editBusy || !editDescription.trim()}>{editBusy ? "保存中" : "保存"}</button>
       </div>
     </form> : <>
-    <div className="task-inline-detail-body">
-      {detail.description && <p className="task-inline-description">{detail.description}</p>}
-      {detail.runs.length > 0 && <div className="task-inline-section"><b>执行记录</b><div className="task-inline-runs">{detail.runs.map((run) => <span key={run.id} className="task-inline-run"><em>{run.status}</em><small>第 {run.sequence} 次 · {formatDate(run.createdAt)}</small></span>)}</div></div>}
+    {hasBody && <div className="task-inline-detail-body">
+      {hasDescription && <p className="task-inline-description">{detail.description}</p>}
+      {detail.runs.length > 0 && <div className="task-inline-section"><b>执行记录</b><div className="task-inline-runs">{detail.runs.map((run) => <span key={run.id} className="task-inline-run"><i className={`task-inline-run-dot ${taskRunStatusTone(run.status)}`} aria-hidden="true" /><em>第 {run.sequence} 次 · {taskRunStatusLabel(run.status)}</em><small>{formatDate(run.createdAt)}</small></span>)}</div></div>}
       {detail.blockReason && <p className="task-dispatch-reason">{detail.blockReason}</p>}
-    </div>
-    <div className={`task-inline-detail-actions${detail.status === "todo" || detail.status === "action_required" ? " task-inline-detail-actions-compact" : ""}`}>
-      {(detail.status === "todo" || detail.status === "action_required") && <>
-        {detail.canDispatch && <button className="primary" disabled={dispatchDisabled || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发"}</button>}
-      </>}
-      {detail.status === "running" && <button className="danger-text" disabled={Boolean(busy) || queued} onClick={() => void transition("stop")}>{queued ? "队列中" : busy === "stop" ? "停止中" : "停止任务"}</button>}
-      {detail.status === "awaiting_review" && !isTaskAwaitingMainMerge(detail) && <>
-        <button className="secondary" disabled={reviewBusy} onClick={() => void doReview("accept")}>{localReviewSubmitting ? "提交中" : "确认完成"}</button>
-        <div className="task-inline-review-reject">
-          <textarea autoFocus required disabled={localReviewSubmitting} value={localReviewNote} onChange={(event) => setLocalReviewNote(event.target.value)} placeholder="说明需要修改的内容…" />
-          <button className="primary" disabled={!localReviewNote.trim() || localReviewSubmitting} onClick={() => void doReview("request_changes")}>{localReviewSubmitting ? "提交中" : "要求修改"}</button>
-        </div>
-      </>}
-      {detail.status === "done" && <button className="secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}
-      {canEdit && <button className="secondary" disabled={Boolean(busy)} onClick={() => startEdit()}>编辑</button>}
-      <button className="danger-text" disabled={Boolean(busy)} onClick={() => void deleteTask()}>{busy === "delete" ? "删除中" : "删除"}</button>
-      <button className="secondary" disabled={reviewBusy} onClick={openBoard}>详情</button>
+    </div>}
+    {/* 操作条：一排优先——左侧主操作（该状态最多一个实底）、右侧通用工具，中间自动撑开。
+        实测操作行内宽 ≥214px（栏宽 ≥320px）就是单行，更窄才按组换行（不溢出、不横滚）。
+        读数（创建时间、执行次数）不进操作条——它不属于操作，混进来会让人以为不可点。 */}
+    <div className="task-inline-detail-actions">
+      {canReviewInline && <div className="task-inline-review-note">
+        <textarea autoFocus required aria-label="要求修改的说明" disabled={localReviewSubmitting} value={localReviewNote} onChange={(event) => setLocalReviewNote(event.target.value)} placeholder="说明需要修改的内容…" />
+      </div>}
+      {reviewUnavailable && <p className="task-inline-review-blocked">{reviewUnavailable}</p>}
+      <div className="task-inline-action-row">
+        {(detail.status === "todo" || detail.status === "action_required") && detail.canDispatch && <button type="button" className="task-inline-action primary" disabled={dispatchDisabled || Boolean(busy)} onClick={() => void dispatch()}>{busy === "dispatch" ? "下发中" : "下发"}</button>}
+        {detail.status === "running" && <button type="button" className="task-inline-action warn" disabled={Boolean(busy) || queued} onClick={() => void transition("stop")}>{queued ? "队列中" : busy === "stop" ? "停止中" : "停止任务"}</button>}
+        {canReviewInline && <>
+          <button type="button" className="task-inline-action primary" disabled={reviewBusy} onClick={() => void doReview("accept")}>{localReviewSubmitting ? "提交中" : "确认完成"}</button>
+          <button type="button" className="task-inline-action secondary" disabled={!localReviewNote.trim() || reviewBusy} onClick={() => void doReview("request_changes")}>{localReviewSubmitting ? "提交中" : "要求修改"}</button>
+        </>}
+        {detail.status === "done" && <button type="button" className="task-inline-action secondary" disabled={Boolean(busy)} onClick={confirmTransition}>重新打开</button>}
+        <span className="task-inline-action-tools">
+          {canEdit && <button type="button" className="task-inline-tool" title="编辑" aria-label="编辑" disabled={toolBusy} onClick={() => startEdit()}><EditTaskIcon /></button>}
+          <button type="button" className="task-inline-tool" title="完整详情" aria-label="完整详情" disabled={toolBusy} onClick={openBoard}><OpenTaskBoardIcon /></button>
+          <button type="button" className="task-inline-tool danger" title={deleteLabel} aria-label={deleteLabel} disabled={toolBusy} onClick={() => void deleteTask()}><DeleteTaskIcon /></button>
+        </span>
+      </div>
     </div>
     </>}
   </div>;

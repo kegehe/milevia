@@ -111,6 +111,29 @@ test("最新版本读失败时，绝不说「已是最新」", () => {
   assert.equal(buildToolCard(input({ latest: UP_TO_DATE })).statusText, "已是最新，不用管它。");
 });
 
+test("读不到最新版本：卡片上只有结论，服务端原文进抽屉", () => {
+  // 2026-10-16 用户报的就是这一档：卡片上贴着一整句服务端原文，两行都是噪音 ——
+  // 「任务执行失败，请查看任务日志后重试。：query latest @anthropic-ai/claude-code
+  // version: exit status 1」（夹具逐字照抄真机读到的形态）。
+  const raw = "任务执行失败，请查看任务日志后重试。：query latest @anthropic-ai/claude-code version: exit status 1";
+  const card = buildToolCard(input({ latest: { state: "error", error: raw } }));
+
+  // 结论只有一句，且**不含原文**（原文里那层"任务执行失败…"前缀与本页无关：
+  // 这里没有任务、也没有任务日志可看）。
+  assert.equal(card.statusText, "读不到最新版本。");
+  assert.ok(!card.statusText.includes("exit status"), "卡片状态行里出现了服务端原文");
+  assert.ok(!card.statusText.includes("任务执行失败"), "卡片状态行里出现了与本页无关的前缀");
+  // 那句纪律话照旧留着：读不到**不等于**是最新的。
+  assert.equal(card.note, "这不代表它是最新的 —— 只是这次没查到。");
+
+  // 原文不丢，搬到抽屉里；并且要给出一颗「详情」入口 —— 否则那段原文无处可看
+  // （④ 修不了 / ⑤ 没查成 两档同一条规矩）。
+  assert.deepEqual(card.detailNotes, [`读不到的原因：${raw}`]);
+  assert.equal(card.canOpenDetails, true);
+  // 反面：这一档不该给任何动作（点下去都是必失败的）。
+  assert.equal(card.primary, undefined);
+});
+
 test("「读取中」与「已是最新」是两句话、两种观感", () => {
   const loading = buildToolCard(input({ latest: { state: "loading" } }));
   assert.equal(loading.latestTone, "loading");

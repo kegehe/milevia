@@ -1001,3 +1001,88 @@
 .file-tree-search-result-open { flex: none; border-radius: 999px; padding: 0 6px; color: #1f6055; background: #e2f2e8; font-size: 10px; font-weight: 700; line-height: 1.7; white-space: nowrap; }
 /* 手机端不摆键盘提示：那儿没有 ↑↓ / 回车可按，摆着只占位置。 */
 @media (max-width: 520px) { .file-tree-search-results-hint { display: none; } }
+
+/* ─── 方案B：卡片化面板 ─────────────────────────────────────────────────────
+   桌面端：树与查看器变成两块白色圆角卡片，浮在浅绿灰底（#eef4f0）上；
+   树头合并「标题 + 操作钮」一行，搜索单独成行，标签做成胶囊，查看器头变成
+   「路径 + 大小·修改时间」的信息条。
+   窄屏（≤820px 堆叠）与手机端（.mobile-files）在文件末尾各自的段里退回扁平形态 ——
+   卡片化写在无断点规则里，同特异性下靠顺序覆盖，所以那两段不能省。 */
+
+.files-panel {
+  gap: 14px;
+  padding: 14px;
+  background: #eef4f0;
+}
+
+.files-content { gap: 14px; }
+
+.files-tree {
+  width: 300px;
+  border: 1px solid #dbe8e0;
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(23, 54, 44, 0.05);
+}
+
+.files-editor {
+  border: 1px solid #dbe8e0;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+/* 错误横幅跟着变一张卡片（面板现在自带内边距）。 */
+.files-error { border: 1px solid var(--file-error-border); border-radius: 8px; }
+
+/* 树头：标题与操作钮一行。手机端只藏标题文字（手机页自带「项目文件」标题，
+   会出现两次），新建/刷新三个钮必须保留。 */
+.file-tree-head { display: flex; min-height: 42px; align-items: center; gap: 8px; padding: 10px 12px 2px; }
+.file-tree-title { color: #254d41; font-size: 13px; font-weight: 700; }
+.file-tree-head-actions { display: flex; margin-left: auto; align-items: center; gap: 2px; }
+.file-tree-head-actions .file-tree-action,
+.file-tree-head-actions .file-tree-refresh { border: 0; background: transparent; }
+.file-tree-head-actions .file-tree-refresh:disabled { background: transparent; }
+
+/* 搜索行：白卡内不再压底色，单独成行。 */
+.file-tree-toolbar { background: transparent; border-bottom: 0; padding: 4px 12px 8px; }
+.file-tree-search input { min-height: 32px; border-color: #d7e6dd; border-radius: 7px; background: #f6faf7; }
+
+/* 树列表：行距放宽（松弛密度），选中态从「左竖条」改成「整行描边」。 */
+.file-tree-body { padding: 4px 10px 12px; }
+.file-tree-body [data-rct-item-container] { min-height: 32px; margin: 2px 0; border-radius: 6px; }
+.file-tree-body .rct-tree-item-li-selected > [data-rct-item-container] { background: #e8f5ee; box-shadow: inset 0 0 0 1px #bfe0d0; }
+
+/* 标签：胶囊形。标签栏不再是分段的底色条，透明地贴在白卡顶部。 */
+.file-tabs { align-items: center; min-height: 48px; gap: 6px; border-bottom: 0; padding: 8px 12px; background: transparent; }
+.file-tab { height: 28px; align-self: center; border: 1px solid transparent; border-radius: 999px; background: #f2f7f4; }
+.file-tab:hover { background: #eaf3ee; }
+.file-tab.active { border-color: #bfe0d0; background: #e3f1ea; }
+.file-tab-select { padding: 0 4px 0 11px; border-radius: 999px; }
+.file-tab-close { width: 20px; border-radius: 999px; }
+
+/* 查看器头 = 文件信息条：路径撑满折行省略，大小与修改时间贴在操作钮左侧。 */
+.file-viewer-file-path { flex: 1; }
+.file-viewer-file-meta { flex: none; color: #8aa39a; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+
+/* 窄屏（≤820px）：树与编辑器上下堆叠，退回扁平无卡片。
+   width 必须在这里重申 100%：上面的 `.files-tree { width: 300px }` 是无断点规则、
+   排在本文件已有的 ≤820px 恢复块之后，同特异性靠顺序生效，不重申就会把窄屏的树钉死在 300px。
+   树列表两侧同理重申 12px：上面 `.file-tree-body` 的无断点规则会把既有的窄屏 12px 两侧留白压回 10px。 */
+@media (max-width: 820px) {
+  .files-panel { gap: 0; padding: 0; background: var(--file-bg); }
+  .files-content { gap: 0; }
+  .files-tree { width: 100%; border: 0; border-bottom: 1px solid var(--file-border); border-radius: 0; box-shadow: none; }
+  .files-editor { border: 0; border-radius: 0; }
+  .file-tree-body { padding-left: 12px; padding-right: 12px; }
+  .file-viewer-file-meta { display: none; }
+}
+
+/* 手机端：整页有自己的 chrome，文件区必须保持通铺扁平。 */
+.mobile-files .files-panel { gap: 0; padding: 0; background: var(--file-bg); }
+.mobile-files .files-content { gap: 0; }
+.mobile-files .files-tree,
+.mobile-files .files-editor { border: 0; border-radius: 0; box-shadow: none; }
+.mobile-files .file-tree-title { display: none; }
+.mobile-files .file-tree-head { min-height: 40px; padding: 6px 10px 0; }
+.mobile-files .file-tree-toolbar { padding: 8px 10px; }
+.mobile-files .file-viewer-file-meta { display: none; }

@@ -4,7 +4,6 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { api, type APIError } from "../lib/api";
-import { literalNameClass } from "../lib/utils";
 import { createWebSocket } from "../lib/runtime";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
 import type { TerminalSessionInfo, TerminalSessionList } from "../lib/types";
@@ -334,75 +333,77 @@ export default function TerminalPage() {
   const statusLabel = status === "running" ? "运行中" : status === "connecting" ? "连接中" : status === "disconnected" ? "已断开" : status === "exited" ? "已退出" : status === "failed" ? "不可用" : "未启动";
   const reachedLimit = sessions.length >= maxSessions;
   const limitTitle = reachedLimit ? `已达会话上限（${maxSessions} 个）：先关闭不再使用的会话后即可新建` : undefined;
+  // 方案B（卡片化控制台）：整页一张白卡片 —— 卡片头 = 会话标签 + 新建/重连/清屏，
+  // 卡片体 = 终端画布，卡片底 = 状态条（环境 · 管理员 · 路径 | 会话数 | 连接状态）。
+  // 旧版独立的工具栏（项目名大标题）与信息条两个层并掉了：项目名页面顶部本来就有，
+  // 环境信息标签里也有，各自重复一遍只会把终端画布往下压。
   return <section className="terminal-page">
-    <header className="terminal-toolbar">
-      <div className="terminal-title">
-        <div className="terminal-title-heading"><span className="terminal-title-icon" aria-hidden="true"><TerminalIcon /></span><span className="terminal-kicker">项目终端</span></div>
-        <h3 title={project.name} className={literalNameClass(project.name)}>{project.name}</h3>
-      </div>
-      <div className="terminal-actions">
-        <div className="terminal-button-group">
-          {isWindowsProject ? (
-            <div className="terminal-split-wrap" ref={newMenuRef}>
-              <div className="terminal-split-group">
-                <button type="button" aria-label="新建终端" onClick={quickNewSession} disabled={reachedLimit} title={limitTitle ?? "新建终端"}><PlusIcon /><span>新建</span></button>
-                <button type="button" className="terminal-split-caret" aria-label="新建终端选项" aria-haspopup="menu" aria-expanded={showNewMenu} disabled={reachedLimit} title={limitTitle ?? "选择 Shell"} onClick={() => setShowNewMenu((open) => !open)}><ChevronDownIcon /></button>
+    <div className="terminal-card">
+      <header className="terminal-card-head">
+        <div className="terminal-tabs" role="tablist" aria-label="终端会话">
+          {sessions.map((item, index) => {
+            const isActive = item.id === activeID;
+            return (
+              <div key={item.id} className={`terminal-tab ${isActive ? "active" : ""}`}
+                onMouseDown={(event) => { if (event.button === 1) { event.preventDefault(); void closeSession(item.id); } }}>
+                <button type="button" className="terminal-tab-select" role="tab" aria-selected={isActive} tabIndex={isActive ? 0 : -1}
+                  data-terminal-tab={item.id} title={`终端 ${index + 1} · ${sessionTitle(item)}`}
+                  onClick={() => activateSession(item.id)} onKeyDown={(event) => handleTabKeyDown(event, item.id)}>
+                  <span className={`terminal-tab-dot ${dotForStatus(item.id === activeID ? status : item.status)}`} aria-hidden="true"><i /></span>
+                  <span className="terminal-tab-label">终端 {index + 1}</span>
+                  {item.elevated && <span className="terminal-tab-shield" title="以管理员身份运行"><ShieldIcon /></span>}
+                  <span className="terminal-tab-env">{sessionEnvText(item)}</span>
+                </button>
+                <button type="button" className="terminal-tab-close" aria-label={`关闭终端 ${index + 1}`} title="关闭终端"
+                  onClick={() => void closeSession(item.id)}><CloseIcon /></button>
               </div>
-              {showNewMenu && (
-                <div className="terminal-new-menu" role="menu" aria-label="新建终端 Shell">
-                  <button type="button" role="menuitem" onClick={() => requestNewSession("cmd", false)}><CmdIcon /><span><em>命令提示符</em><i>cmd.exe</i></span></button>
-                  <button type="button" role="menuitem" onClick={() => requestNewSession("powershell", false)}><PowershellIcon /><span><em>Windows PowerShell</em><i>powershell.exe</i></span></button>
-                  <div className="terminal-new-menu-separator" role="separator" />
-                  <button type="button" role="menuitem" className="terminal-new-menu-admin" onClick={() => requestNewSession("cmd", true)}><ShieldIcon /><span><em>命令提示符（管理员）</em><i>UAC 授权后运行</i></span></button>
-                  <button type="button" role="menuitem" className="terminal-new-menu-admin" onClick={() => requestNewSession("powershell", true)}><ShieldIcon /><span><em>Windows PowerShell（管理员）</em><i>UAC 授权后运行</i></span></button>
-                </div>
-              )}
-            </div>
-          ) : (
-            <button type="button" aria-label="新建终端" onClick={quickNewSession} disabled={reachedLimit} title={limitTitle ?? "新建终端"}><PlusIcon /><span>新建</span></button>
-          )}
-          <button type="button" aria-label="重新连接" onClick={() => setConnectionVersion((version) => version + 1)} disabled={!canReconnect} title="重新连接"><ReconnectIcon /><span>重连</span></button>
-          <button type="button" aria-label="清空终端输出" onClick={() => termRef.current?.clear()} disabled={!activeID} title="清空终端输出"><ClearIcon /><span>清屏</span></button>
+            );
+          })}
+          <button type="button" className="terminal-tab-add" aria-label="新建终端" onClick={quickNewSession} disabled={reachedLimit} title={limitTitle ?? "新建终端"}><PlusIcon /></button>
         </div>
-      </div>
-      <strong className={`terminal-status ${status}`}><i aria-hidden="true" />{statusLabel}</strong>
-    </header>
-    <div className="terminal-tabs" role="tablist" aria-label="终端会话">
-      {sessions.map((item, index) => {
-        const isActive = item.id === activeID;
-        return (
-          <div key={item.id} className={`terminal-tab ${isActive ? "active" : ""}`}
-            onMouseDown={(event) => { if (event.button === 1) { event.preventDefault(); void closeSession(item.id); } }}>
-            <button type="button" className="terminal-tab-select" role="tab" aria-selected={isActive} tabIndex={isActive ? 0 : -1}
-              data-terminal-tab={item.id} title={`终端 ${index + 1} · ${sessionTitle(item)}`}
-              onClick={() => activateSession(item.id)} onKeyDown={(event) => handleTabKeyDown(event, item.id)}>
-              <span className={`terminal-tab-dot ${dotForStatus(item.id === activeID ? status : item.status)}`} aria-hidden="true"><i /></span>
-              <span className="terminal-tab-label">终端 {index + 1}</span>
-              {item.elevated && <span className="terminal-tab-shield" title="以管理员身份运行"><ShieldIcon /></span>}
-              <span className="terminal-tab-env">{sessionEnvText(item)}</span>
-            </button>
-            <button type="button" className="terminal-tab-close" aria-label={`关闭终端 ${index + 1}`} title="关闭终端"
-              onClick={() => void closeSession(item.id)}><CloseIcon /></button>
+        <div className="terminal-actions">
+          <div className="terminal-button-group">
+            {isWindowsProject ? (
+              <div className="terminal-split-wrap" ref={newMenuRef}>
+                <div className="terminal-split-group">
+                  <button type="button" aria-label="新建终端" onClick={quickNewSession} disabled={reachedLimit} title={limitTitle ?? "新建终端"}><PlusIcon /><span>新建</span></button>
+                  <button type="button" className="terminal-split-caret" aria-label="新建终端选项" aria-haspopup="menu" aria-expanded={showNewMenu} disabled={reachedLimit} title={limitTitle ?? "选择 Shell"} onClick={() => setShowNewMenu((open) => !open)}><ChevronDownIcon /></button>
+                </div>
+                {showNewMenu && (
+                  <div className="terminal-new-menu" role="menu" aria-label="新建终端 Shell">
+                    <button type="button" role="menuitem" onClick={() => requestNewSession("cmd", false)}><CmdIcon /><span><em>命令提示符</em><i>cmd.exe</i></span></button>
+                    <button type="button" role="menuitem" onClick={() => requestNewSession("powershell", false)}><PowershellIcon /><span><em>Windows PowerShell</em><i>powershell.exe</i></span></button>
+                    <div className="terminal-new-menu-separator" role="separator" />
+                    <button type="button" role="menuitem" className="terminal-new-menu-admin" onClick={() => requestNewSession("cmd", true)}><ShieldIcon /><span><em>命令提示符（管理员）</em><i>UAC 授权后运行</i></span></button>
+                    <button type="button" role="menuitem" className="terminal-new-menu-admin" onClick={() => requestNewSession("powershell", true)}><ShieldIcon /><span><em>Windows PowerShell（管理员）</em><i>UAC 授权后运行</i></span></button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <button type="button" aria-label="新建终端" onClick={quickNewSession} disabled={reachedLimit} title={limitTitle ?? "新建终端"}><PlusIcon /><span>新建</span></button>
+            )}
+            <button type="button" aria-label="重新连接" onClick={() => setConnectionVersion((version) => version + 1)} disabled={!canReconnect} title="重新连接"><ReconnectIcon /><span>重连</span></button>
+            <button type="button" aria-label="清空终端输出" onClick={() => termRef.current?.clear()} disabled={!activeID} title="清空终端输出"><ClearIcon /><span>清屏</span></button>
           </div>
-        );
-      })}
-      <button type="button" className="terminal-tab-add" aria-label="新建终端" onClick={quickNewSession} disabled={reachedLimit} title={limitTitle ?? "新建终端"}><PlusIcon /></button>
+        </div>
+      </header>
+      <div ref={hostRef} className="terminal-host">
+        {(!activeID || selected?.projectId !== projectId) && <div className="terminal-empty"><span className="terminal-empty-icon" aria-hidden="true"><TerminalIcon /></span><strong>尚未选择终端</strong><span>创建一个新会话开始工作</span></div>}
+      </div>
+      {status === "exited" && exitCode !== null && <p className="terminal-exit-code">exit code {exitCode}</p>}
+      {replayTruncated && <p className="terminal-notice">{"\u90e8\u5206\u7ec8\u7aef\u8f93\u51fa\u5df2\u8fc7\u671f\uff0c\u65e0\u6cd5\u6062\u590d"}</p>}
+      {error && <p className="terminal-error" role="alert">{error}</p>}
+      <footer className="terminal-meta">
+        {selected ? <>
+          <span className="terminal-meta-environment">{sessionEnvText(selected)}</span>
+          {selected.elevated && <span className="terminal-meta-admin" title="以管理员身份运行"><ShieldIcon /><span>管理员</span></span>}
+          <span className="terminal-meta-separator" aria-hidden="true">/</span>
+          <code title={project.pathDisplay}>{project.pathDisplay}</code>
+        </> : <span>没有活动终端</span>}
+        <span className={`terminal-meta-count${reachedLimit ? " is-full" : ""}`} title={limitTitle ?? `${sessions.length}/${maxSessions} 会话`}>{sessions.length}/{maxSessions} 会话{reachedLimit ? "，已达上限" : ""}</span>
+        <strong className={`terminal-status ${status}`}><i aria-hidden="true" />{statusLabel}</strong>
+      </footer>
     </div>
-    <div className="terminal-meta">
-      {selected ? <>
-        <span className="terminal-meta-environment">{sessionEnvText(selected)}</span>
-        {selected.elevated && <span className="terminal-meta-admin" title="以管理员身份运行"><ShieldIcon /><span>管理员</span></span>}
-        <span className="terminal-meta-separator" aria-hidden="true">/</span>
-        <code title={project.pathDisplay}>{project.pathDisplay}</code>
-      </> : <span>没有活动终端</span>}
-      <span className={`terminal-meta-count${reachedLimit ? " is-full" : ""}`} title={limitTitle ?? `${sessions.length}/${maxSessions} 会话`}>{sessions.length}/{maxSessions} 会话{reachedLimit ? "，已达上限" : ""}</span>
-    </div>
-    <div ref={hostRef} className="terminal-host">
-      {(!activeID || selected?.projectId !== projectId) && <div className="terminal-empty"><span className="terminal-empty-icon" aria-hidden="true"><TerminalIcon /></span><strong>尚未选择终端</strong><span>创建一个新会话开始工作</span></div>}
-    </div>
-    {status === "exited" && exitCode !== null && <p className="terminal-exit-code">exit code {exitCode}</p>}
-    {replayTruncated && <p className="terminal-notice">{"\u90e8\u5206\u7ec8\u7aef\u8f93\u51fa\u5df2\u8fc7\u671f\uff0c\u65e0\u6cd5\u6062\u590d"}</p>}
-    {error && <p className="terminal-error" role="alert">{error}</p>}
   </section>;
 }
 

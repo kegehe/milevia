@@ -143,16 +143,18 @@ export type ToolCard = {
    * 该不该在这张卡上给「详情」入口。
    *
    * 顶部横幅是打开抽屉的主入口，但它只会指向**一张**卡（`bannerFor` 用 `find` 取第一张
-   * 命中的）。于是有两类卡的下一步根本点不开，而卡片自己的文案正是让用户去抽屉里看证据：
+   * 命中的）。于是有几类卡的下一步根本点不开，而卡片自己的文案正是让用户去抽屉里看证据：
    *   - ④ 修不了那一档（`note` 写着"按「详情」里的证据手动处理"），当它不是横幅指的那张时；
    *   - ⑤ 这次没检查成功那一档：`statusTone` 是 `unknown`，不进 `bannerFor` 的任何分支，
    *     连"唯一"的那张横幅都不会为它出现 —— 它的原因（`diagnosisEmptyText`）只在抽屉里。
+   *   - ⑦ 读不到最新版本那一档（2026-10-16 起）：卡片上只剩结论，服务端原文整段搬进
+   *     `detailNotes` —— 抽屉因此成了它唯一的去处，不给入口就等于把那段原文删了。
    *
    * 判据就是"这张卡的下一步在抽屉里"。**不是**"每张卡都给一颗详情"：已是最新的健康卡
    * 不给，那正是删掉旧按钮、避免卡底留下空动作条的原因。
    */
   canOpenDetails: boolean;
-  /** 抽屉里要说清的两句：这次没查 / 没详查的原因。 */
+  /** 抽屉里要说清的两句：这次没查 / 没详查 / 读不到最新版本的原因。 */
   detailNotes: string[];
 
   // 供上层做汇总用的读数（卡片自己不渲染它们）。
@@ -464,7 +466,7 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     // `reading` 也要挡：那时 `item` 可能还是上一个执行环境留下的（loadView 不清旧 view），
     // 照它亮出「登录」会是在一台还没读到的机器上按上一台的读数给动作。
     canLogin: Boolean(entry.supportsLogin) && installed && !running && !input.reading,
-    // 默认不给：只有"下一步就在抽屉里"的那两档会把它打开（见 canOpenDetails 的注释）。
+    // 默认不给：只有"下一步就在抽屉里"的那几档会把它打开（见 canOpenDetails 的注释）。
     canOpenDetails: false,
     detailNotes: [],
     updateAvailable: update.available,
@@ -575,11 +577,23 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
   }
 
   // ⑦ 读不到最新版本：**不能说"已是最新"**。
+  //
+  //    卡片上只留**结论**，不贴服务端原文（2026-10-16 用户报）。原文长这样：
+  //    「任务执行失败，请查看任务日志后重试。：query latest @anthropic-ai/claude-code
+  //    version: exit status 1」—— 一层与本页无关的前缀（这里没有任务日志可看）加一句
+  //    退出码，贴在卡片上要占两行，把"读不到最新版本"这个结论淹掉；而这一页存在的意义
+  //    正是"别再让用户从噪音里挑信息"。
+  //
+  //    原文照旧**不丢**，挪进详情抽屉（那一页本来就是"给排障用的素材"）：④ 修不了、
+  //    ⑤ 没查成都已经把下一步放在抽屉里，这一档同理 —— 因此要连带给出 `canOpenDetails`，
+  //    否则那段原文没有任何入口，等于删掉而不是搬家。
   if (latest.state === "error") {
     card.icon = "unknown";
     card.statusTone = "unknown";
-    card.statusText = `读不到最新版本（${latest.error}）。`;
+    card.statusText = "读不到最新版本。";
     card.note = "这不代表它是最新的 —— 只是这次没查到。";
+    card.detailNotes.push(`读不到的原因：${latest.error}`);
+    card.canOpenDetails = true;
     return card;
   }
   if (latest.state === "loading") {

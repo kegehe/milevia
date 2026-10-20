@@ -60,7 +60,8 @@ test("独立页面壳：不再是「Dashboard + 弹窗背板」，页面名与�
   const h1 = page.match(/<h1 className="mcp-title">([^<]+)<\/h1>/)?.[1];
   assert.ok(h1, "页面顶栏应有 h1 标题");
   assert.match(dashboard, new RegExp(`title="${h1}"[\\s\\S]{0,120}navigate\\("/mcp-manager"\\)`));
-  assert.match(dashboard, new RegExp(`<span>${h1}</span>`));
+  // span 允许带 className（方案 A 图标化后入口文字挂 .action-label，桌面端由 CSS 收起）。
+  assert.match(dashboard, new RegExp(`<span( className="[^"]*")?>${h1}</span>`));
 });
 
 test("主路径只有一条：点目录卡片进向导，其余能力收进「高级设置」", () => {

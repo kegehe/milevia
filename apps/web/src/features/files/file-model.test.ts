@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateFileName } from "./file-model";
+import { formatModTime, validateFileName } from "./file-model";
 
 // validateFileName 是新建文件 / 新建目录 / 重命名三个入口共用的名字校验。
 // 它守的是"名字接在父目录后面会不会逃出父目录"，不是"名字长得像不像禁忌字符"：
@@ -49,4 +49,25 @@ test("错误文案是给用户看的，必须非空且指出原因", () => {
   assert.equal(validateFileName(""), "文件名不能为空");
   assert.match(String(validateFileName("a/b")), /分隔符/);
   assert.match(String(validateFileName("..")), /\.\./);
+});
+
+// formatModTime 是文件信息条上「大小 · 修改时间」的时间那一半。
+// 解析不了必须返回空串（调用方据此整段省略），绝不能让 "Invalid Date" 上屏。
+
+test("formatModTime：解析不了的时间返回空串，由调用方省略", () => {
+  assert.equal(formatModTime("not-a-date"), "");
+  assert.equal(formatModTime(""), "");
+});
+
+test("formatModTime：当前时刻按「今天 HH:mm」读出", () => {
+  // 用当前时刻本身构造，不受时区与跨午夜影响；经 ISO 字符串走一圈，
+  // 正是调用链的真实路径（服务端给 ISO，formatModTime 再解析回来）。
+  const label = formatModTime(new Date().toISOString());
+  assert.match(label, /^今天 \d{2}:\d{2}$/);
+});
+
+test("formatModTime：往年时间带年份，且绝不落进「今天」", () => {
+  // 本地构造固定时刻再转 ISO：往返解析后各分量不变，与运行环境的时区无关。
+  const label = formatModTime(new Date(2019, 0, 15, 8, 5).toISOString());
+  assert.equal(label, "2019年1月15日 08:05");
 });

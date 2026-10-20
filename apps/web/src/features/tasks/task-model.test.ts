@@ -1,8 +1,23 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
-import { anchorForSlot, canOfferDispatch, canRedispatch, compareTaskOrder, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, sortByPosition, sortQueueTasks, taskDisplayStatus, taskDisplayStatusClass, taskQueueNote, type Task } from "./task-model.ts";
+import { anchorForSlot, canOfferDispatch, canRedispatch, compareTaskOrder, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, sortByPosition, sortQueueTasks, taskDisplayStatus, taskDisplayStatusClass, taskQueueNote, taskRunStatusLabel, taskRunStatusTone, type Task } from "./task-model.ts";
+
+// 全仓 CSS 扫描：用来钉住"同一件事只能写一处"这类跨文件约定（同一份样式写两遍时，
+// 后写的那份会静默压掉前面的）。
+function collectCssFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...collectCssFiles(full));
+    else if (entry.name.endsWith(".css")) out.push(full);
+  }
+  return out;
+}
 
 const makeTask = (id: string, overrides: Partial<Task> = {}): Task => ({
   id,
@@ -501,6 +516,119 @@ test("prevents duplicate task review submissions", () => {
 	assert.doesNotMatch(source, /task-detail-close" title="关闭" aria-label="关闭" disabled=\{reviewBusy\}/);
 	assert.match(source, /<h3>验证记录<\/h3>/);
 	assert.match(source, /verificationPhaseLabel\(run\.phase\)/);
+});
+
+test("执行记录圆点的色调由纯函数判定，未建模状态不许画成空白", () => {
+  assert.equal(taskRunStatusTone("succeeded"), "ok");
+  assert.equal(taskRunStatusTone("failed"), "warn");
+  assert.equal(taskRunStatusTone("stopped"), "warn");
+  assert.equal(taskRunStatusTone("interrupted"), "warn");
+  assert.equal(taskRunStatusTone("running"), "live");
+  // queued 是"还没结果"，不是"出错了"，也不是"没问题"：给它中性档，而不是套绿点。
+  assert.equal(taskRunStatusTone("queued"), "idle");
+  // 未建模状态（后端 run.status 无 CHECK 约束）必须落在一个有底色的档上：
+  // 圆点没颜色＝把"不知道"画成"没问题"，文案也必须回落到原值而不是空串。
+  assert.equal(taskRunStatusTone("paused"), "idle");
+  assert.equal(taskRunStatusLabel("paused"), "paused");
+});
+
+test("详情面板：一排操作条 + 图标工具按钮 + 状态单一来源", () => {
+  const source = readFileSync(new URL("./TaskQueue.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../../tasks.css", import.meta.url), "utf8");
+  // 锚点必须是组件本身（`function InlineTaskDetail`）：早先按 `<div className="task-inline-detail">`
+  // 切片会命中 loading 分支那一行（904 行），切片起点比预想的早、断言语义悄悄跑偏。
+  const start = source.indexOf("function InlineTaskDetail");
+  const detail = source.slice(start, source.indexOf("function formatDate", start));
+  assert.match(detail, /className="task-inline-detail" data-status=\{detail\.status\}/, "切片必须落在 InlineTaskDetail 组件内");
+  const actions = detail.slice(detail.indexOf("task-inline-detail-actions"));
+
+  // 一排优先：`.task-inline-action-row` 是横向 flex，间距走 gap（不用 margin 拼），
+  // 实测 340 栏宽 → 操作行内宽 234px，而「确认完成 + 要求修改 + 详情 + 删除」需要 209px。
+  assert.match(styles, /\.task-inline-action-row \{ display: flex;[^}]*flex-wrap: wrap;[^}]*row-gap: 8px; \}/);
+  // 放不下时必须**按组换行**：宁可换行也不许溢出（overflow 会把工具按钮画到卡片边框外）
+  // 或横滚（把操作藏起来）。换行靠 .task-inline-action-tools 的 margin-left:auto 落成第二行右对齐，
+  // 所以不再需要单独的撑开元素——两套机制会互相抢空间。
+  assert.match(styles, /\.task-inline-action-tools \{ display: inline-flex; flex: none; gap: 5px; margin-left: auto; \}/);
+  assert.doesNotMatch(detail, /task-inline-action-gap/);
+  // 读数不进操作条：创建/执行时间只属于详情信息，混进操作行会让人以为"这行都在做操作"。
+  assert.doesNotMatch(actions, /formatDate\(|创建|上次执行/);
+  // 工具组恒有两个动作（完整详情 + 删除，不带条件渲染）：任何状态都不许出现空操作条。
+  const toolsBlock = detail.slice(detail.indexOf('<span className="task-inline-action-tools">'), detail.indexOf("</div>", detail.indexOf('<span className="task-inline-action-tools">')));
+  assert.match(toolsBlock, /title="完整详情" aria-label="完整详情"/);
+  assert.match(toolsBlock, /title=\{deleteLabel\} aria-label=\{deleteLabel\}/);
+  // 三个通用工具是图标按钮，但必须各自带可访问名（只有图标、没有名字＝读屏与悬浮都拿不到含义）。
+  assert.match(detail, /className="task-inline-tool" title="编辑" aria-label="编辑"/);
+  // 可访问名与视觉提示必须同一口径：删除中时 title/aria 一起改口，不许一个静态一个动态。
+  assert.match(detail, /const deleteLabel = busy === "delete" \? "删除中" : "删除任务";/);
+  // 三个工具共用同一个忙碌口径，避免"验收提交中还能点删除"这种在途请求与危险操作抢跑。
+  assert.equal((detail.match(/disabled=\{toolBusy\}/g) || []).length, 3);
+  // 按钮规格唯一：图标按钮与文字按钮同高同圆角，否则一行里会一大一小。
+  // ⚠️ 必须同时钉住 min-height：`style.css:293` 给 `.primary / .secondary` 定了 min-height: 38px，
+  // 而 min-height 永远压过 height —— 只写 height: 28px 时实测仍是 38px（第一版就是这么漏的，
+  // 截图里只是"按钮略高"，肉眼看不出来；靠探针量出 38 才发现）。
+  assert.match(styles, /\.task-inline-action \{ display: inline-flex; height: 28px; min-height: 28px;/);
+  assert.match(styles, /\.task-inline-edit-actions \.primary, \.task-inline-edit-actions \.secondary \{ display: inline-flex; height: 28px; min-height: 28px;/);
+  assert.match(styles, /\.task-inline-tool \{ display: grid; width: 28px; height: 28px;[^}]*border-radius: 6px;/);
+  assert.match(styles, /\.task-inline-tool-icon \{ width: 14px; height: 14px;/);
+  // 禁用态必须逐形态重申底色（同一份样式里 `.task-inline-action.primary` 排在全局
+  // `.primary:disabled` 之后，只写 opacity 会让禁用的实底按钮仍然"看着能点"）。
+  assert.match(styles, /\.task-inline-action\.primary:disabled \{ border-color: #c9d6ce; color: #809188; background: #dce7df; \}/);
+  assert.match(styles, /\.task-inline-action\.secondary:disabled \{/);
+  assert.match(styles, /\.task-inline-action\.warn:disabled \{/);
+  assert.match(styles, /\.task-inline-tool:disabled \{ border-color: #dce7df;/);
+  // 同一个面板里不许出现两种实底色（查看态 #2c7567 vs 全站柠檬绿）。
+  assert.match(styles, /\.task-inline-edit-actions \.primary \{ border: 1px solid #2c7567; color: #f8fdf9; background: #2c7567; \}/);
+  assert.match(styles, /\.task-inline-edit-actions \.primary:disabled \{ border-color: #c9d6ce;/);
+  // 状态只有一个来源：根节点 data-status 直接取 detail.status，降灰态选择器再按它命中。
+  assert.match(detail, /className="task-inline-detail" data-status=\{detail\.status\}/);
+  assert.match(styles, /\.task-inline-detail\[data-status="cancelled"\] \{/);
+  assert.match(styles, /\.task-inline-detail\[data-status="cancelled"\] \.task-inline-detail-title b \{/);
+  // 状态胶囊与优先级同一行（原来是各占一行的上下堆叠，窄栏里白吃一行高度）。
+  assert.match(detail, /className="task-inline-meta">/);
+  assert.match(styles, /\.task-inline-meta \{ display: flex;[^}]*gap: 8px;/);
+  // 面板里的状态文案/配色必须和队列行同源（taskDisplayStatus / taskDisplayStatusClass）：
+  // 直接用 statusLabels[detail.status] 会让同一个任务在行里显示「自动执行中」、在详情里显示「执行中」；
+  // `queued ? "队列中" : …` 也是多余的——taskDisplayStatus 自己就返回「队列中」（task-model.ts:48）。
+  assert.match(detail, /taskDisplayStatusClass\(detail\)/);
+  assert.match(detail, /taskDisplayStatus\(detail\)/);
+  assert.doesNotMatch(detail, /statusLabels\[detail\.status\]/);
+  assert.doesNotMatch(detail, /\{queued \? "队列中" : taskDisplayStatus\(detail\)\}/);
+  // 「能不能就地验收」只有一处判据，且必须和队列行的验收入口同口径（含 isTaskOrchestrating）：
+  // 否则会出现"行里不给验收、点进详情却能确认完成"，与编排收尾互相覆盖。
+  assert.match(detail, /const canReviewInline = detail\.status === "awaiting_review" && !isTaskAwaitingMainMerge\(detail\) && !isTaskOrchestrating\(detail\);/);
+  assert.equal((detail.match(/canReviewInline &&/g) || []).length, 2, "输入框与两个验收按钮共用同一个判据");
+  assert.equal((detail.match(/detail\.status === "awaiting_review"/g) || []).length, 2, "只有「验收判据」与「暂不可验收的原因」两处按这个状态分支");
+  // 暂不可验收时要说出原因，不能静默把按钮拿掉。
+  assert.match(detail, /reviewUnavailable/);
+  assert.match(styles, /\.task-inline-review-blocked \{/);
+  // 「内容块要不要渲染」的判据只有一处，且在 JSX 里（交给 CSS :empty 会被 React 的空文本节点废掉）。
+  assert.match(detail, /const hasBody = hasDescription \|\| detail\.runs\.length > 0 \|\| Boolean\(detail\.blockReason\);/);
+  assert.match(detail, /\{hasBody && <div className="task-inline-detail-body">/);
+  assert.doesNotMatch(styles, /\.task-inline-detail-body:empty/);
+  // 头部分隔线必须是「头部之后」才出现：加载态/失败态复用同一个 .task-inline-detail-body 容器，
+  // 写成无条件上边框会让那两态凭空多一条线（实测 2026-10-15 复查时抓到的）。
+  assert.match(styles, /\.task-inline-detail-head \+ \.task-inline-detail-body \{ border-top: 1px solid #edf4ef; padding-top: 11px; \}/);
+  assert.doesNotMatch(styles, /\.task-inline-detail-body \{ display: grid; gap: 10px; border-top/, "内容块的边距不许无条件写在基础规则里");
+  // 面板内的竖直间距只有一个来源（根节点 grid gap）：表单再叠 margin-top 会变成双倍间距。
+  assert.match(styles, /\.task-inline-edit-form \{ display: grid; gap: 9px; \}/);
+  assert.doesNotMatch(styles, /\.task-inline-edit-form \{[^}]*margin-top/);
+  // 禁用态一律降到项目已有的禁用灰：不许为"危险描边"另造暖褐色（越出项目色板）。
+  assert.match(styles, /\.task-inline-action\.warn:disabled \{ border-color: #dce7df; color: #809188; background: #f2f5f3; \}/);
+  // 执行记录的状态文案与色调都走纯函数：服务端枚举（succeeded / interrupted）不许直接上屏。
+  assert.match(detail, /taskRunStatusLabel\(run\.status\)/);
+  assert.match(detail, /taskRunStatusTone\(run\.status\)/);
+  assert.doesNotMatch(detail, /<em>\{run\.status\}<\/em>/);
+  // 同一份样式只允许写一遍：改动前有一段 `.task-inline-detail` 的后置覆盖，
+  // 会让新卡片的底色/圆角/阴影被静默压回去（后写的赢）。这里扫**全部** css，
+  // 并额外排除"和别的选择器写在同一份规则里"（旧覆盖正是 `.task-queue-inline-review, .task-inline-detail {`）。
+  const cssFiles = collectCssFiles(fileURLToPath(new URL("../../", import.meta.url)));
+  let cardRules = 0;
+  for (const file of cssFiles) {
+    const text = readFileSync(file, "utf8");
+    cardRules += (text.match(/^\.task-inline-detail\s*\{/gm) || []).length;
+    assert.doesNotMatch(text, /,\s*\.task-inline-detail\s*[,{]/, `${file} 里 .task-inline-detail 不许和别的选择器合并成一条规则`);
+  }
+  assert.equal(cardRules, 1, "详情面板的卡片样式只能有一处定义（全仓 css 范围内）");
 });
 
 test("defines a responsive task work rail", () => {

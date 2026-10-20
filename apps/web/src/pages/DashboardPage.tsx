@@ -168,12 +168,14 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
     <header className={`dashboard-bar${desktop ? " dashboard-bar-fixed" : ""}`}>
       <a className="brand" href="/"><img className="brand-mark" src="/milevia-mark.svg" width="42" height="42" alt="" /><span className="brand-word"><strong>Mile</strong><em>via</em></span></a>
       <div className="dashboard-actions">
+        {/* 方案 A 图标化降噪：桌面端（>820px）次要入口只露图标（.action-label 由 CSS 收起，
+            title 承担悬停提示）；≤820px 标签重新显示，触屏上不依赖悬停。 */}
         <NotificationCenter />
         <button type="button" className="dashboard-action dashboard-action-settings secondary" title="设置" aria-label="设置" onClick={() => navigate("/settings")}><SettingsIcon /></button>
-        <button type="button" className="dashboard-action dashboard-action-remote secondary" title="远程控制" aria-label="远程控制" onClick={() => navigate("/mobile")}><RemotePairingIcon /><span>远程控制</span></button>
-        <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span>SSH连接</span></button>
-        <button className="dashboard-action dashboard-action-mcp secondary" title="MCP连接" onClick={() => navigate("/mcp-manager")}><McpIcon /><span>MCP连接</span></button>
-        <button className="dashboard-action dashboard-action-cli-tools secondary" title="Cli管理" onClick={() => navigate("/cli-tools")}><CliToolsIcon /><span>Cli管理</span></button>
+        <button type="button" className="dashboard-action dashboard-action-remote secondary" title="远程控制" aria-label="远程控制" onClick={() => navigate("/mobile")}><RemotePairingIcon /><span className="action-label">远程控制</span></button>
+        <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" aria-label="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span className="action-label">SSH连接</span></button>
+        <button className="dashboard-action dashboard-action-mcp secondary" title="MCP连接" aria-label="MCP连接" onClick={() => navigate("/mcp-manager")}><McpIcon /><span className="action-label">MCP连接</span></button>
+        <button className="dashboard-action dashboard-action-cli-tools secondary" title="Cli管理" aria-label="Cli管理" onClick={() => navigate("/cli-tools")}><CliToolsIcon /><span className="action-label">Cli管理</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
       </div>
     </header>
@@ -284,7 +286,7 @@ function DeleteProjectDialog({ project, status, busy, close, confirm }: { projec
   const conversationCount = status?.conversationCount ?? 0;
   return (
     <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-project-title" onClick={(event) => { if (event.target === event.currentTarget && !busy) close(); }}>
-      <section className="modal delete-project-dialog">
+      <section className="modal dialog-studio delete-project-dialog">
         <header>
           <div className="delete-project-heading">
             <span className="delete-project-mark"><DeleteTrashIcon /></span>
