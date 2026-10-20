@@ -1,6 +1,9 @@
 .permission-confirmation { margin: 0; padding: 4px 18px 20px; color: #5f7169; line-height: 1.55; }
 .permission-dialog .primary.danger { border-color: #dc5c46; color: #fff; background: #e6624b; }
 .permission-dialog .primary.danger:hover { background: #d5513c; }
+/* 「完全控制」确认弹窗：壳由共享类 .modal.dialog-studio 提供（见 style.css），这里只定宽度。
+   特异性要压过全局 .modal 的 width —— 三段类名 (0,3,0)，不依赖加载顺序。 */
+.modal.dialog-studio.permission-dialog { width: min(460px, 100%); }
 
 .permission-trigger { border-color: #c8dcd1; color: #277566; background: #eaf7ef; }
 .permission-trigger.full { border-color: #efb59d; color: #a94634; background: #fff0eb; }

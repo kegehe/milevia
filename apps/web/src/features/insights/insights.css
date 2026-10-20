@@ -158,26 +158,64 @@
   font-weight: 700;
   letter-spacing: 1px;
 }
-.insights-agent-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.insights-agent-options { display: flex; flex-wrap: wrap; gap: 8px; }
 .insights-agent-state { color: #527067; font-size: 13px; line-height: 30px; }
 .insights-agent-state-error { color: #a64235; }
-.insights-agent-options label {
+/* ── 引擎选择卡（方案 A2，2026-10-18）：横排矮卡 ─────────────────────────
+   图标底块在左、名称 + 就绪点在右。原生 radio 留在 DOM（视觉隐藏），键盘/读屏
+   语义不变；选中态样式全落在 .active 上。图标判据只有一份：
+   `lib/cli-tools-view.ts` 的 agentLogoKey → components/AgentLogo。
+   底色档位与 new-conversation-agent-mark（conversation.css）同一套：
+   Claude 暖米 #fdf1ec / OpenAI 薄荷 #eaf6f2 / 无官方图标一律中性 ——
+   中性是诚实默认，新工具没图标时不会"看起来就是 Claude"。 */
+.insights-agent-option {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  border: 1px solid #d4e4da;
-  border-radius: 99px;
-  padding: 4px 11px;
-  color: #41665b;
+  gap: 10px;
+  border: 1.5px solid #d4e4da;
+  border-radius: 10px;
+  padding: 7px 14px 7px 8px;
   background: #fff;
-  font-size: 11.5px;
-  font-weight: 700;
+  box-shadow: 0 1px 2px rgba(31, 91, 76, .05);
   cursor: pointer;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
+  transition: border-color .16s ease, background .16s ease, box-shadow .16s ease;
 }
-.insights-agent-options label:hover { border-color: #a6cbbb; background: #f0f8f3; }
-.insights-agent-options label.active { border-color: #a7cdbb; color: #1f5b4c; background: #e4f3ea; }
-.insights-agent-options input { accent-color: #2c7567; cursor: pointer; }
+.insights-agent-option:hover { border-color: #a6cbbb; background: #f3faf6; }
+.insights-agent-option.active { border-color: #2c7567; background: #eef7f2; box-shadow: 0 1px 4px rgba(44, 117, 103, .14); }
+.insights-agent-option:has(.insights-agent-radio:focus-visible) { outline: 2px solid #2b7b68; outline-offset: 2px; }
+.insights-agent-radio { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.insights-agent-tile {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 1px solid #dcdcd6;
+  border-radius: 8px;
+  color: #6b6b66;
+  background: #f4f3f0;
+}
+.insights-agent-tile.logo-claude { border-color: #f0dccd; color: #c2603f; background: #fdf1ec; }
+.insights-agent-tile.logo-openai { border-color: #cfe0da; color: #1f7a68; background: #eaf6f2; }
+/* 徽标类图标（CodeBuddy，自带紫色底）：铺满牌位，牌位的底色与边框让位。 */
+.insights-agent-tile:has(img[data-logo-badge]) { border-color: transparent; background: transparent; overflow: hidden; }
+.insights-agent-tile img[data-logo-badge] { width: 100%; height: 100%; border-radius: inherit; }
+.insights-agent-glyph { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.75; }
+.insights-agent-text { display: flex; flex-direction: column; gap: 3px; }
+.insights-agent-name { color: #3d5f54; font-size: 12px; font-weight: 700; line-height: 1; }
+.insights-agent-option.active .insights-agent-name { color: #1f5b4c; }
+.insights-agent-ready { display: inline-flex; align-items: center; gap: 4px; color: #748b81; font-size: 9.5px; font-weight: 600; line-height: 1; }
+.insights-agent-ready i { width: 4.5px; height: 4.5px; border-radius: 50%; background: #3d9a6a; }
+/* 验证中整组禁用（input disabled + .locked）：文案与圆点降灰；官方图标是 <img>
+   不吃 color，置灰要靠 filter 自己做（与 new-conversation-agent-card 同一招）。 */
+.insights-agent-option.locked { cursor: not-allowed; }
+.insights-agent-option.locked:hover { border-color: #d4e4da; background: #fff; }
+.insights-agent-option.locked.active { border-color: #b9d2c5; background: #f4f9f6; box-shadow: none; }
+.insights-agent-option.locked .insights-agent-tile img { filter: grayscale(1); opacity: .55; }
+.insights-agent-option.locked .insights-agent-name { color: #8b9a92; }
+.insights-agent-option.locked .insights-agent-ready { color: #a5b3ab; }
+.insights-agent-option.locked .insights-agent-ready i { background: #a5b3ab; }
 .insights-theme-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .insights-theme-chips button {
   display: inline-flex;

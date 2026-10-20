@@ -5,7 +5,7 @@ import { apiURL, isDesktop, sessionHeaders } from "../../lib/runtime";
 import { markdownCodeComponents } from "../../components/MarkdownCodeBlock";
 import { ExternalLink } from "../../components/ExternalLink";
 import type { FileInfo } from "./file-model";
-import { formatSize, getDirPath, isEditableFile } from "./file-model";
+import { formatModTime, formatSize, getDirPath, isEditableFile } from "./file-model";
 import type { FilePreviewKind } from "./source-language";
 import { CodeFileView } from "./CodeFileView";
 import { JsonViewer } from "./JsonViewer";
@@ -87,6 +87,8 @@ export function FileViewer({ content, stat, previewKind, projectId, conversation
   // 而它一保存就把整个文件覆盖成空的。
   const canEdit = !omittedMessage && !serverReadOnly && isEditableFile(stat) && activePreviewKind !== "large" && activePreviewKind !== "sqlite";
   const readOnlyHint = readOnlyReason === "binary_file" ? "只读 · 非文本文件" : "只读 · 文件较大";
+  // 信息条（方案B）：大小 + 修改时间。时间解析不了就只给大小，不摆一个空占位。
+  const modTimeLabel = formatModTime(stat.modTime);
 
 
   return (
@@ -95,6 +97,9 @@ export function FileViewer({ content, stat, previewKind, projectId, conversation
         <span className="file-viewer-file-path" title={stat.path}>
           <FileIcon iconKey="file" size={15} />
           <span>{stat.path}</span>
+        </span>
+        <span className="file-viewer-file-meta" title="文件大小与修改时间">
+          {formatSize(stat.size)}{modTimeLabel ? ` · ${modTimeLabel}` : ""}
         </span>
         <div className="file-viewer-actions">
           <div className="file-viewer-font-controls">

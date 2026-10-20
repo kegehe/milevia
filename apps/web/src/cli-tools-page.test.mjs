@@ -159,7 +159,8 @@ test("入口名只有一个来源：首页那两颗字与页面标题一模一�
   // 断言钉的是**两处相等**这件事本身，不钉具体名字 —— 下次改名只要两处一起动就仍然绿。
   assert.match(code, /<h1 className="cli-tools-title">([^<]+)<\/h1>/);
   const pageName = code.match(/<h1 className="cli-tools-title">([^<]+)<\/h1>/)[1];
-  assert.match(dashboard, new RegExp(`<CliToolsIcon \\/><span>${pageName}</span>`),
+  // span 允许带 className（方案 A 图标化后入口文字挂 .action-label，桌面端由 CSS 收起）。
+  assert.match(dashboard, new RegExp(`<CliToolsIcon \\/><span( className="[^"]*")?>${pageName}</span>`),
     `首页入口写的名字与页面标题不一致（页面是「${pageName}」）`);
   assert.match(dashboard, new RegExp(`title="${pageName}"`), "入口的 title 没跟着改");
   // 反面：旧名字不许在入口上残留（`title` 或那两颗字任意一处）。
@@ -636,8 +637,8 @@ test("详情抽屉不开场白；CodeBuddy 那句登录提示只给 CodeBuddy", 
 // 2026-10-09 补：删「详情」后又发现它删过头了 —— 抽屉的主入口只有顶部横幅，而横幅只
 // 指向**第一张**命中的问题卡。于是"第 2 张要处理的卡"和 statusTone=unknown 的"没查成"
 // 那一档再也没有入口，卡片文案却让用户"按详情里的证据手动处理"。现在：模型用
-// `canOpenDetails` 单独说"这张卡的下一步就在抽屉里"（④ 修不了 / ⑤ 没查成），页面据此
-// 补一颗「详情」；健康卡照旧不给。抽屉不再是登录的入口。
+// `canOpenDetails` 单独说"这张卡的下一步就在抽屉里"（④ 修不了 / ⑤ 没查成 / ⑦ 读不到
+// 最新版本），页面据此补一颗「详情」；健康卡照旧不给。抽屉不再是登录的入口。
 
 test("抽屉入口：横幅给唯一那张问题卡，卡片在需要时自己补一颗「详情」", () => {
   // 横幅仍是"当前这张问题卡"的主入口。
@@ -656,6 +657,20 @@ test("抽屉入口：横幅给唯一那张问题卡，卡片在需要时自己�
   //    渲染，否则"已是最新、不需要登录、无需详情"那张最常见的健康卡会留下一条空条。
   assert.match(code, /\{\(card\.primary \|\| card\.canLogin \|\| card\.canOpenDetails\) && <div className="cli-tools-card-actions">/,
     "动作区没有做空档守卫，没有动作的卡片会留下一条空条");
+});
+
+test("「读不到最新版本」只写结论：服务端原文进抽屉，不许拼回状态行", () => {
+  // 2026-10-16 用户报：卡片上写着一整句
+  // 「读不到最新版本（任务执行失败，请查看任务日志后重试。：query latest …: exit status 1）」。
+  // 那一层"任务执行失败…"前缀与本页无关（这条链路没有任务日志可看），而原文贴在卡片上
+  // 要占两行、把结论淹掉。现在：状态行只放结论，原文走 `detailNotes` —— 卡片上的
+  // 「详情」是它的唯一入口，所以 `canOpenDetails` 必须跟着给（见上面那条测试）。
+  assert.match(viewCode, /card\.statusText = "读不到最新版本。"/);
+  assert.doesNotMatch(viewCode, /读不到最新版本（/, "状态行又把服务端原文拼回来了");
+  // 判据写成"状态行里不许出现读数原文"，而不是"状态行不许用模板串" —— 那句话本身
+  // 允许插值（⑥「可以更新到 ${card.latestText}。」就是），错的只是把**错误原文**插进去。
+  assert.doesNotMatch(viewCode, /statusText = [^;]*latest\.error/, "服务端原文被插进了状态行");
+  assert.match(viewCode, /card\.detailNotes\.push\(`读不到的原因：\$\{latest\.error\}`\)/);
 });
 
 test("需要登录的工具把「登录」摆在卡片上，判据来自模型", () => {

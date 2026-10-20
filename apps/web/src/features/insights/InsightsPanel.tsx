@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { AgentLogo } from "../../components/AgentLogo";
+import { agentLogoKey } from "../../lib/cli-tools-view";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import type { AgentID, RunnerInfo } from "../../lib/types";
 import { catalogAgentID, knownAgentID, runnerAgentReady, useAgentCatalog } from "../../lib/agent-registry";
@@ -626,9 +628,21 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
                 <span className="insights-agent-state">当前环境没有可用的分析引擎</span>
               ) : availableAgentOptions.map((entry) => {
                 const id = catalogAgentID(entry);
-                return <label key={id} className={agent === id ? "active" : ""}>
-                  <input type="radio" name="insight-agent" value={id} checked={agent === id} disabled={anyVerifying} onChange={() => selectAgent(id)} />
-                  {entry.name}
+                const logo = agentLogoKey(id);
+                return <label key={id} className={`insights-agent-option${agent === id ? " active" : ""}${anyVerifying ? " locked" : ""}`}>
+                  {/* 原生 radio 视觉隐藏但留在 DOM 里：键盘切换与读屏语义不变，选中态样式由 .active 承担 */}
+                  <input type="radio" className="insights-agent-radio" name="insight-agent" value={id} checked={agent === id} disabled={anyVerifying} onChange={() => selectAgent(id)} />
+                  <span className={`insights-agent-tile${logo ? ` logo-${logo}` : ""}`} aria-hidden="true">
+                    {logo ? <AgentLogo logo={logo} size={17} /> : (
+                      /* 白名单外的工具回落中性图形：绝不能借某个已知工具的图标冒充身份 */
+                      <svg className="insights-agent-glyph" viewBox="0 0 24 24"><path d="M12 3.5 20 8v8l-8 4.5L4 16V8l8-4.5Z" /><path d="M12 3.5V12m0 0 8-4m-8 4-8-4" /></svg>
+                    )}
+                  </span>
+                  <span className="insights-agent-text">
+                    <span className="insights-agent-name">{entry.name}</span>
+                    {/* 列表本身只含就绪的引擎（见 availableAgentOptions 的过滤条件），「就绪」是如实读数 */}
+                    <span className="insights-agent-ready"><i />就绪</span>
+                  </span>
                 </label>;
               })}
             </div>

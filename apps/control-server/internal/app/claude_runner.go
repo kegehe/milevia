@@ -369,25 +369,138 @@ func (r *claudeCLIRunner) CheckUpdate(parent context.Context) (bool, string, err
 	return available, latest, nil
 }
 
+// npmVersionQueryTimeout 是一次「问 npm registry 最新版本是多少」的时间上限。
+//
+// ⚠️ 它曾经是 10 秒，而**同一台机器上量到过的尾巴比它长**：docs/42 §25 的本机实测里，
+// `npm view` 常态 2.4~3.1s，而那一批三条里有一条花了 **14.6s 并且失败了**
+// （node 冷启动本身只 0.4s，瓶颈在到 registry 的网络）。10 秒落在分布的尾巴里，
+// 于是"平时都对、网络一慢就读不到"；又因为下面注释里那条"被杀与报错长得一模一样"，
+// 现场只会留下一句 `exit status 1`，谁也看不出是上限的问题（2026-10-16 用户报"都读不到"）。
+//
+// 25 秒的来历：高过已知最慢那一条，又明显低于客户端给这个端点的预算
+// （`api.ts` 的 probeTimeoutMs = 60 秒；每个工具各跑一条、并发发出去，等的是最慢那条，
+// 不是它们之和）。再往上加没有意义 —— 真要 25 秒还回不来，用户在管理页该看到的是
+// "读不到"，而不是一个继续转圈的页面。
+const npmVersionQueryTimeout = 25 * time.Second
+
 // latestNpmPackageVersion 查询 npm registry 上指定包的最新版本号。
 // 跨端 runner（wsl/windows 对侧）的更新检查复用本查询：npm registry 的版本号跨平台
 // 唯一，与"目标环境用哪一端 npm"无关，因此在本机（control-server 所在侧）执行即可，
 // 无需再跨界拉起一次 npm。查询失败或返回空串时如实返回错误。
+//
+// ⚠️ 失败时**必须**说得出原因。这里原先用的是 `cmd.Output()` 加一句
+// `query latest %s version: %w`，两件事一起把原因埋掉了：
+//
+//   - `Output()` 只收 stdout，**npm 的失败原因全在 stderr 上**（`npm error code
+//     EAI_AGAIN`、`npm error 404 Not Found - GET https://…`）。于是不管 registry
+//     不可达、包名 404 还是代理挡了，界面上都是同一句 `exit status 1`；
+//   - 更要命的是**超时也长成这个样**：Windows 上被 TerminateProcess 杀掉的进程退出码
+//     就是 1，Go 报的同样是 `exit status 1`（实测：ctx 到点时 Run() 返回的正是它，
+//     `ctx.Err()` 才是 DeadlineExceeded）。"网络慢，一会儿再试"与"这台机器根本问不到
+//     registry"的下一步完全不同，混成一句话就永远查不出所以然。
 func latestNpmPackageVersion(parent context.Context, packageName string) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, npmVersionQueryTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "npm", "view", packageName, "version")
 	configureProcessGroup(cmd)
+	// ⚠️ 上限要能真的框住这次调用，就得连**孙进程**一起杀。
+	//
+	// Windows 上 `npm` 是 npm.cmd：Go 手里那个进程是 cmd.exe，真正干活的 node.exe 是它
+	// 的子进程。CommandContext 的默认取消只 TerminateProcess 直接子进程 —— node 照旧活着，
+	// 而且**握着 stdout/stderr 管道不放**，于是 cmd.Output() 要等它自己退出才返回：
+	// 上限到点了、调用却还挂着。实测过的形态正是这个：上限 10 秒，而 docs/42 §25 记录的那
+	// 一次花了 **14.6s 才失败**（> 上限），退出码按 Windows 的规矩是 1，看起来与"npm 报错"
+	// 一模一样。
+	//
+	// 这里改用项目现成的按平台终止助手（Windows：TerminateProcess + 后台回收后代；
+	// Unix：给整个进程组 SIGKILL，见 configureProcessGroup 设的 Setpgid）——
+	// 第一次调用就是既有的 terminateProcessGroup，不新造一套。
+	cmd.Cancel = func() error {
+		forceTerminateProcessGroup(cmd)
+		return nil
+	}
+	var errOut bytes.Buffer
+	cmd.Stderr = &errOut
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("query latest %s version: %w", packageName, err)
+		return "", npmVersionQueryError(ctx.Err(), err, errOut.String())
 	}
 	latest := strings.TrimSpace(string(out))
 	if latest == "" {
-		return "", fmt.Errorf("latest %s version is empty", packageName)
+		return "", errors.New("查询最新版本失败：npm 没有返回版本号")
 	}
 	return latest, nil
 }
+
+// npmVersionQueryError 把「这次查询没成」归一成一句用户看得懂的原因。
+//
+// 单独一个纯函数是为了能被测：三种情形里最难碰到的那条（超时）要等一次真超时才复现，
+// 而它恰恰是最容易被误报成"npm 报错了"的那条（见 latestNpmPackageVersion 的注释）。
+//
+// 措辞里带"失败"两字是**有意的**：`localizedErrorText` 会给纯英文的错误套上一层
+// "任务执行失败，请查看任务日志后重试。" —— 这个动作没有任务、也没有任务日志可看，
+// 那句话指不到任何东西（2026-10-16 用户报的正是它）。带上中文失败标签，它就会原样直通。
+func npmVersionQueryError(ctxErr, runErr error, stderr string) error {
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return fmt.Errorf("查询最新版本失败：npm 超时未返回（超过 %s）", npmVersionQueryTimeout)
+	}
+	if detail := npmFailureDetail(stderr); detail != "" {
+		// 有 npm 自己那句原因时**不再带退出码**：`exit status 1` 对用户没有信息量，
+		// 而它正是这段文案原先唯一的内容（见 docs/42 §33）。
+		return fmt.Errorf("查询最新版本失败：%s", detail)
+	}
+	// 认不出 npm 的格式（node 崩了、stderr 是别的东西写的）就退回通用尾部摘录：
+	// 宁可给一段脱敏过的尾巴，也不要因为"看着不像 npm 写的"把原因弄丢。
+	return fmt.Errorf("查询最新版本失败：%w%s", runErr, updateOutputDetail(stderr))
+}
+
+// npmFailureDetail 把 npm 的 stderr 压成**一句**原因。
+//
+// npm 在 stderr 上会把同一件事抄好几遍 —— 实测一次 404 有 400 多字：`code E404`、
+// `404 Not Found - GET https://…`、一行裸 `404`、正文、"还能从 tarball 装"两行，
+// 最后再附一段日志路径。真正有用的只有最前面两条（错误码 + 正文）。而这段文字的两个
+// 去处都不适合长文：管理页详情抽屉里的一行、会话页那处 200px 就截断的 inline 提示。
+//
+// 只取前两条 `npm error …` / `npm ERR! …` 行；"本次运行的完整日志在…"那句也带上这个
+// 前缀，但它是路径不是原因，按前缀内容滤掉。
+func npmFailureDetail(stderr string) string {
+	var lines []string
+	for _, raw := range strings.Split(redactAgentText(stripAnsi(stderr)), "\n") {
+		line := strings.TrimSpace(raw)
+		// 只要 npm **自己标出来**的错误行。其余一概不算"原因"：`npm notice`（"有新版本
+		// 可装"那类旁白）、进度行、以及别的程序写进 stderr 的东西 —— 把它们当成原因，
+		// 用户就会去查一个并不存在的问题。
+		switch {
+		case strings.HasPrefix(line, "npm error "):
+			line = strings.TrimSpace(strings.TrimPrefix(line, "npm error "))
+		case strings.HasPrefix(line, "npm ERR! "):
+			line = strings.TrimSpace(strings.TrimPrefix(line, "npm ERR! "))
+		default:
+			continue
+		}
+		// "本次运行的完整日志在…"也带 `npm error` 前缀，但它是路径不是原因。
+		if line == "" || strings.HasPrefix(line, "A complete log of this run") {
+			continue
+		}
+		lines = append(lines, line)
+		if len(lines) == maxNpmFailureLines {
+			break
+		}
+	}
+	joined := strings.Join(lines, "；")
+	// 截断要看得出来（truncateRunes 自己不加省略号，它只负责不切坏多字节字符）。
+	if capped := truncateRunes(joined, maxNpmFailureRunes); capped != joined {
+		return capped + "…"
+	}
+	return joined
+}
+
+const (
+	// 只留前两条 npm 的错误行（错误码 + 正文）。
+	maxNpmFailureLines = 2
+	// 再给一个字符数上限：正文里常常嵌着一整条 registry URL，不能由它决定这段文字多长。
+	maxNpmFailureRunes = 160
+)
 
 func (r *claudeCLIRunner) Update(parent context.Context) (string, string, error) {
 	previous := r.Version(parent)

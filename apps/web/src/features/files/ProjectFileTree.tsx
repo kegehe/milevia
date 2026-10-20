@@ -767,6 +767,26 @@ export function ProjectFileTree({
 
   return (
     <div className="file-tree-container">
+      {/* 树头：标题与操作钮一行（方案B 卡片化改版）。手机页自带「项目文件」标题胶囊，
+          所以 .mobile-files 下只藏标题文字、保留操作钮 —— 藏整行会让手机端失去新建与刷新。 */}
+      <div className="file-tree-head">
+        <span className="file-tree-title">项目文件</span>
+        <div className="file-tree-head-actions">
+          {!readOnly && <>
+            <button type="button" className="file-tree-action" onClick={() => onCreateFile("")} title="新建文件" aria-label="新建文件"><TreeActionIcon name="new-file" /></button>
+            <button type="button" className="file-tree-action" onClick={() => onCreateDir("")} title="新建目录" aria-label="新建目录"><TreeActionIcon name="new-folder" /></button>
+          </>}
+          <button
+            type="button"
+            className="file-tree-refresh"
+            onClick={handleRefresh}
+            title="刷新"
+            disabled={loading}
+          >
+            <TreeActionIcon name="refresh" />
+          </button>
+        </div>
+      </div>
       <div className="file-tree-toolbar">        <div className="file-tree-search">
           <input
             type="text"
@@ -789,19 +809,6 @@ export function ProjectFileTree({
             onKeyDown={handleSearchKeyDown}
           />
         </div>
-        {!readOnly && <>
-          <button type="button" className="file-tree-action" onClick={() => onCreateFile("")} title="新建文件" aria-label="新建文件"><TreeActionIcon name="new-file" /></button>
-          <button type="button" className="file-tree-action" onClick={() => onCreateDir("")} title="新建目录" aria-label="新建目录"><TreeActionIcon name="new-folder" /></button>
-        </>}
-        <button
-          type="button"
-          className="file-tree-refresh"
-          onClick={handleRefresh}
-          title="刷新"
-          disabled={loading}
-        >
-          <TreeActionIcon name="refresh" />
-        </button>
       </div>
 
       {/* 搜索在飞时的一行说明。`/fs/search` 是全树遍历、服务端没给它预算，慢是正常的；

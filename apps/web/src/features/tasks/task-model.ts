@@ -155,6 +155,22 @@ export function taskRunStatusLabel(status: string): string {
   }
 }
 
+// 执行记录圆点的色调档：与 taskRunStatusLabel 同源，组件里不再各写一遍三元。
+// `idle` 这一档是给"还没结果"和"未建模状态"的兜底——圆点必须仍然可见（不许画成空白，
+// 那等于把"不知道"画成"没问题"）。
+export type TaskRunStatusTone = "ok" | "warn" | "live" | "idle";
+
+export function taskRunStatusTone(status: string): TaskRunStatusTone {
+  switch (status) {
+    case "succeeded": return "ok";
+    case "failed":
+    case "stopped":
+    case "interrupted": return "warn";
+    case "running": return "live";
+    default: return "idle";
+  }
+}
+
 // 队列顺序 = 用户的手工顺序：置顶任务恒在最前，其余一律按 position 升序。
 //
 // 【规则 · 勿改】position 必须排在状态分组与优先级之前。服务端新建任务（createTask

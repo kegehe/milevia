@@ -9,10 +9,12 @@
   position: relative;
 }
 
+/* 方案 A：铃铛与头部按钮排统一降到 34px 档（对话页 .conversation-head-action 与
+   总览页 .dashboard-action 同档），角标 -4px 悬出位置不变。 */
 .notification-bell {
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   place-items: center;
   border: 1px solid #c8dcd1;
   border-radius: 7px;
@@ -33,8 +35,8 @@
 }
 
 .notification-bell-icon {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;

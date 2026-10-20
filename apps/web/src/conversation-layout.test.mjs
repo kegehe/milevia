@@ -484,7 +484,11 @@ test("Codex and Claude use the same version check and update controls", () => {
   assert.match(conversationPage, /\/api\/runners\/\$\{runnerID\}\/agents\/\$\{encodeURIComponent\(agentID\)\}\/update/);
   assert.doesNotMatch(conversationPage, /agentPath/);
   assert.match(conversationPage, /!run && tool\?\.status === "ready" && <button type="button" className="runner-inline-btn"/);
-  assert.match(conversationPage, /确认更新 \{toolName\}/);
+  // 确认弹窗走专属皮肤类（.modal.update-confirm-dialog），标题的 kicker 仍带工具名 ——
+  // 旧断言钉的是 h2「确认更新 {toolName}」，方案A 改版后工具名移进 label、h2 只说事。
+  assert.match(conversationPage, /modal update-confirm-dialog/);
+  assert.match(conversationPage, /<label>更新 \{toolName\}<\/label>/);
+  assert.match(conversationPage, /update-confirm-version is-latest/);
   assert.doesNotMatch(conversationPage, /status: "ready" as const/);
 });
 
@@ -517,9 +521,41 @@ test("Git workbench, project runner, and terminal are first-class workspace tabs
     /useEffect\(\(\) => \{[\s\S]*?if \(active && isGitRepo\) void reload\("initial"\)\.catch\(\(\) => undefined\);\s*\}, \[active, isGitRepo, reload\]\);/,
   );
   assert.match(runPanel, /if \(!active\) return;/);
-  // 左右分栏：.run-body 水平排列，左侧日志 flex:1，右侧侧栏保持受控宽度并可独立滚动。
+  // 左右分栏：.run-body 水平排列，左侧日志 flex:1，右侧启动台侧栏保持受控宽度并可独立滚动。
   assert.match(runStyles, /\.run-body\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
-  assert.match(runStyles, /\.run-sidebar\s*\{[^}]*width:\s*348px;[^}]*min-width:\s*300px;[^}]*max-width:\s*420px;[^}]*overflow-y:\s*auto;/s);
+  assert.match(runStyles, /\.run-sidebar\s*\{[^}]*width:\s*360px;[^}]*min-width:\s*320px;[^}]*max-width:\s*420px;[^}]*overflow-y:\s*auto;/s);
+  // F2 启动台改版：状态英雄条 + 命令 chips（点谁启动谁）+ 配置默认折叠 + 底部操作按钮。
+  assert.match(runStyles, /\.run-launchpad\s*\{/);
+  assert.match(runStyles, /\.run-launch-hero\.is-running \.run-launch-dot\s*\{[^}]*background:\s*#25705f;/s);
+  assert.match(runPanel, /启动命令 · 点谁启动谁/);
+  assert.match(runPanel, /className=\{`run-command-chip\$\{selected \? " is-selected" : ""\}`\}/);
+  assert.match(runPanel, /run-launch-primary is-danger/);
+  assert.match(runPanel, /启动、重启前会自动保存未保存的配置改动/);
+  // 配置默认收起，添加命令时自动展开（chips 只能选不能编辑）。
+  assert.match(runPanel, /\{configExpanded && <section className="run-config">/);
+  assert.match(runPanel, /setConfigExpanded\(true\);\s*updateConfig/);
+  // 折叠时未保存改动不能失去可见性：toggle 转琥珀色（原来「保存 •」常驻的信号）。
+  assert.match(runPanel, /run-launch-toggle\$\{configDirty && !configExpanded \? " is-dirty" : ""\}/);
+  assert.match(runStyles, /\.run-launch-toggle\.is-dirty\s*\{[^}]*background:\s*#fff6e4;/s);
+  // 清除日志改为「图标 + 文字」按钮，不再是孤立图标。
+  assert.match(runPanel, /<ClearIcon \/><span>清除日志<\/span>/);
+  // 日志流过滤 chips：过滤失败时必须与「真的没有日志」分开说（三态纪律）。
+  assert.match(runPanel, /run-log-filters/);
+  assert.match(runPanel, /当前过滤下没有日志行/);
+  assert.doesNotMatch(runPanel, /run-status-details/);
+  // 过滤切换走 applyLogFilter（贴底游标复位），自动滚动 effect 依赖可见内容签名而非数组引用。
+  assert.match(runPanel, /const applyLogFilter = useCallback\(\(filter: LogFilter\)/);
+  assert.match(runPanel, /const visibleSignature = /);
+  assert.doesNotMatch(runPanel, /\}, \[visibleLogs\]\);/);
+  // 切项目/会话必须清空 worktrees（普通项目请求失败静默吞错，上一项目的选项不得残留）。
+  assert.match(runPanel, /setWorktrees\(\[\]\);/);
+  // 清除日志的水位线推进用发起时的 maxClearedId 快照，updater 里不得再按 prev 推进。
+  assert.match(runPanel, /const maxClearedId = logs\.reduce/);
+  assert.match(runPanel, /entry\.id <= 0 \|\| entry\.id > maxClearedId/);
+  assert.doesNotMatch(runPanel, /for \(const entry of prev\) clearedThroughLogIDRef/);
+  // 命令 chips 与过滤 chips 统一 group+aria-pressed（radio 语义需要 roving tabindex，此处不适用）。
+  assert.match(runPanel, /aria-pressed=\{selected\}/);
+  assert.doesNotMatch(runPanel, /role="radio"/);
   // 日志终端使用浅薄荷底色与足够的文字对比度，并保留 ANSI 语义颜色。
   assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*background:\s*#f4faf6;/s);
   assert.match(runStyles, /\.run-log-terminal\s*\{[^}]*color:\s*#29473d;/s);

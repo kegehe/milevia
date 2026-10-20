@@ -233,6 +233,27 @@ export function formatSize(bytes: number): string {
 }
 
 /**
+ * 把文件的修改时间转成给界面的一句话。同一事实只有这一个格式化出口：
+ * 今天 → 「今天 HH:mm」；今年 → 「M月D日 HH:mm」；更早带上年份。
+ * 解析不了就返回空串，由调用方决定要不要把这段省掉（不许显示成 "Invalid Date"）。
+ */
+export function formatModTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  if (sameDay) return `今天 ${time}`;
+  const monthDay = `${date.getMonth() + 1}月${date.getDate()}日`;
+  if (date.getFullYear() === now.getFullYear()) return `${monthDay} ${time}`;
+  return `${date.getFullYear()}年${monthDay} ${time}`;
+}
+
+/**
  * 判断文件是否为图片（SVG 除外，SVG 是文本文件可编辑）
  */
 export function isImageFile(mimeType: string): boolean {

@@ -1023,8 +1023,8 @@ export default function CliToolsPage() {
     </div>}
 
     {pending && <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="cli-tools-confirm-title">
-      <section className="modal cli-tools-confirm">
-        <header><div><label>确认操作</label><h2 id="cli-tools-confirm-title">{pendingActionText(pending).title}</h2></div></header>
+      <section className="modal dialog-studio cli-tools-confirm">
+        <header><div><label>确认操作</label><h2 id="cli-tools-confirm-title">{pendingActionText(pending).title}</h2></div><button type="button" className="dialog-close" title="关闭" aria-label="关闭" onClick={() => setPending(null)}>×</button></header>
         {pending.kind === "repair"
           ? <div className="cli-tools-confirm-body">
             {/* **不宣称执行顺序**：界面拿到的次序是"症状里出现动作的次序"，而真正执行的

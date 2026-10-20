@@ -349,6 +349,9 @@
 }
 
 /* ── 确认框 ─────────────────────────────────────────────────────────────── */
+/* 壳由共享类 .modal.dialog-studio 提供（style.css）；这里只收宽度 ——
+   不写的话会吃全局 .modal 的 720px，一个「确认动作」的小弹窗又宽又空。 */
+.modal.dialog-studio.cli-tools-confirm { width: min(520px, 100%); }
 .cli-tools-confirm .cli-tools-confirm-body { margin: 0; padding: 0 20px 12px; font-size: 13px; line-height: 1.8; color: #31594f; }
 .cli-tools-confirm .cli-tools-confirm-body code { padding: 1px 6px; border-radius: 4px; background: #f2f5f3; font-size: 12px; }
 .cli-tools-confirm-env { margin: 0; padding: 0 20px 16px; font-size: 12px; color: #4c6b60; }

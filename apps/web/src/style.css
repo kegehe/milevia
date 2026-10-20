@@ -209,9 +209,12 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
 .brand-word strong { font: inherit; }
 .brand-word em { color: #75982e; font: inherit; font-style: normal; }
 .brand-word::after { position: absolute; bottom: 0; left: 1px; width: 21px; height: 2px; border-radius: 2px; background: #c8e85a; content: ""; }
-.dashboard-actions { gap: 10px !important; }
-.dashboard-actions .dashboard-action { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 8px; border-radius: 7px; padding: 8px 12px; font-size: 12px; font-weight: 700; line-height: 1; white-space: nowrap; }
-.dashboard-actions .dashboard-action-settings { width: 38px; min-width: 38px; padding: 0; }
+.dashboard-actions { gap: 8px !important; }
+.dashboard-actions .dashboard-action { display: inline-flex; min-height: 34px; align-items: center; justify-content: center; gap: 8px; border-radius: 7px; padding: 0 12px; font-size: 12px; font-weight: 700; line-height: 1; white-space: nowrap; }
+.dashboard-actions .dashboard-action-settings { width: 34px; min-width: 34px; padding: 0; }
+/* 方案 A 图标化降噪：桌面端（>820px）次要入口只露图标；≤820px 标签显示（触屏无悬停）。
+   ≤520px 的既有规则（SSH 藏标签等）在窄屏继续生效，不受影响。 */
+@media (min-width: 821px) { .dashboard-actions .dashboard-action .action-label { display: none; } }
 .dashboard-action-icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .dashboard-actions .secondary { border-color: #c8dcd1; color: #31594f; background: #f7fbf8; box-shadow: none; transition: border-color .16s ease, color .16s ease, background .16s ease, box-shadow .16s ease; }.dashboard-actions .secondary:hover:not(:disabled) { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
 .dashboard-actions .primary { border-color: #9fbd46; padding-right: 14px; color: #19332c; background: #c8e85a; box-shadow: none; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }.dashboard-actions .primary:hover:not(:disabled) { border-color: #7d9e2f; background: #d8f47b; box-shadow: none; }
@@ -305,6 +308,17 @@ button:focus-visible, a:focus-visible, textarea:focus-visible {  outline: 2px so
 .modal button.primary:not(.danger):hover:not(:disabled) { border-color: #7d9e2f; background: #d8f47b; }
 .modal button.primary:not(.danger):disabled { border-color: #c9d6ce; color: #809188; background: #dce7df; }
 .project-head h2, .modal h2 { color: #19332c; }.project-head label, .modal label { color: var(--accent); }.project-head code { color: #73887e; }
+/* ── 弹窗绿色皮肤（dialog-studio）────────────────────────────────────────
+   全局 .modal 仍是旧蓝灰壳（#fbfcff/#d6dbe7），但大部分弹窗已有各自的绿色专属类；
+   还在裸穿蓝灰壳的弹窗逐个挂上 dialog-studio（如 modal dialog-studio update-error-dialog）。
+   这里只管壳：底色/边框/圆角/阴影/头尾条与共享关闭钮 —— 宽度与内部布局归各弹窗专属类管。
+   (0,2,0)/(0,3,1) 的特异性压过 .modal 系 (0,1,x)，不依赖文件加载顺序。 */
+.modal.dialog-studio { color: #19332c; border-color: #c8dcd1; border-radius: 12px; background: #fbfefb; box-shadow: 0 24px 60px #102d2347; }
+.modal.dialog-studio > header { border-bottom: 1px solid #dcebe1; background: #f4faf6; }
+.modal.dialog-studio > footer { border-top: 1px solid #dcebe1; background: #f8fcf9; }
+.modal.dialog-studio header .dialog-close { display: grid; width: 28px; height: 28px; min-width: 28px; box-sizing: border-box; flex: none; place-items: center; border: 1px solid #d0e1d8; border-radius: 6px; padding: 0; color: #668176; background: #fcfefc; font-size: 14px; line-height: 1; transition: border-color .16s ease, color .16s ease, background .16s ease; }
+.modal.dialog-studio header .dialog-close:hover:not(:disabled) { border-color: #a3c9b7; color: #225f50; background: #eaf6ee; }
+.modal.dialog-studio header .dialog-close:disabled { cursor: not-allowed; opacity: .5; }
 .head-actions > .ready, .head-actions > .running { border-radius: 99px; padding: 6px 9px; color: #277566; background: #e6f4ed; }.head-actions > .running { color: #a94634; background: #fff0eb; }
 .timeline::before { background: #d5e5db; }.timeline-entry::before { border-color: #f3f8f4; background: #97afa3; }.timeline-entry.tool::before { background: #55a697; }
 .timeline-entry.message-entry { margin-bottom: 20px; }.message > div, .tool-card { border-color: #d4e3da; border-radius: 8px; background: #fbfefb; box-shadow: none; }.message > .markdown { padding: 12px 14px; line-height: 1.6; }.message.user > div { border-color: #b8d9c7; background: var(--accent-soft); }

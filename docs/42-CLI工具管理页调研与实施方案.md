@@ -2241,3 +2241,104 @@ Windows 工具，而且那份 PATH 是给整条执行链（含会话）用的。
 - 变异验证：statusTone 改回 `muted` 红 2 条；删降级块选择器红 1 条。
 - 全量 web 套件 951 条全绿；`tsc -b` 干净；压缩产物逐条核对（含 CRLF 归一化回 LF）。
 
+
+## 33. 「读不到最新版本」：分清超时与 npm 报错，卡片上只留结论（2026-10-16）
+
+> 用户："读不到最新版本（任务执行失败，请查看任务日志后重试。：query latest
+> @anthropic-ai/claude-code version: exit status 1）。……当前在 cli 管理中为什么会出现
+> 这个问题，都读取不到呢"
+
+### 33.1 症状
+
+管理页三张卡**同时**读不到（同一台机器上的全部工具），原文如上；再次进页面可能又读得到。
+
+### 33.2 根因：上限压住了尾巴，而"被杀"与"报错"长得一模一样
+
+先量后断。本机现网复现（真 control-server、逐工具 `check-update?force=true` ×8 轮共 24 次）
+**24/24 成功、每次 0.9~1.4s**（另有 wsl-local 那三条 0.7~0.9s）—— 所以它不是稳定故障，
+而那正说明现场那句原文不承载任何可判断的信息。逐条查下去是两条根因叠在一起：
+
+1. **时间上限 10 秒低于本机量到过的尾巴**。§25 的表里，`npm view` 常态 2.4~3.1s，而那一批
+   三条里有**一条花 14.6s 并且失败了**。上限落在分布的尾巴里，"平时都对、网络一慢就读不到"
+   就是这个样子的。现在是 25 秒（高过已知最慢那条，仍低于客户端给这个端点的 60 秒预算）。
+2. **上限本身还框不住这次调用**（这一条是复查时才挖到的真机制）。Windows 上 `npm` 是
+   `npm.cmd`：Go 手里那个进程是 **cmd.exe，真正干活的 node.exe 是它的子进程**，而且握着
+   stdout/stderr 管道。`exec.CommandContext` 的默认取消只 TerminateProcess **直接子进程**
+   —— node 照旧活着，`cmd.Output()` 要等它自己退出才返回。于是"上限 10 秒"的那次调用
+   可以挂到 14.6 秒才报错：**§25 那笔 14.6s 的失败正是这个形状**（下限被超，而报出来的是
+   `exit status 1`）。
+   实测复现（假 npm.cmd 派生一个睡 30 秒的孙进程、上限 300 毫秒）：
+   **摘掉修复 30.15s，装上修复 0.32s**（`TestNpmVersionQueryTimeoutKillsTheWholeTree`）。
+3. **原因被埋掉了两层**：
+   - `cmd.Output()` 只收 stdout，而 **npm 的失败原因全在 stderr 上**（实测：包名不存在时
+     stdout 空、退出码 1，原因 `npm error code E404` / `404 Not Found - GET https://…`
+     全在 stderr）。于是 registry 不可达、404、代理挡了，界面上都是同一句 `exit status 1`；
+   - **超时也长成这个样**：Windows 上被 TerminateProcess 杀掉的进程退出码就是 1，Go 报的
+     同样是 `exit status 1`（本次实测：ctx 到点时 `Run()` 返回的正是它，`ctx.Err()` 才是
+     `DeadlineExceeded`）。"网络慢，一会儿再试"与"这台机器根本问不到 registry"的下一步
+     完全不同，混成一句就永远查不出所以然。
+   - 外面还套了一层：`localizedErrorText` 给**纯英文**错误加通用兜底
+     「任务执行失败，请查看任务日志后重试。」—— 这条链路没有任务、也没有任务日志可看，
+     那句话把用户支去一个不存在的地方。
+
+### 33.3 改了什么
+
+**服务端**（`claude_runner.go`）：
+
+- 上限 10s → 25s（`npmVersionQueryTimeout`，来历写在常量注释里）；
+- **`cmd.Cancel` 改成杀整棵进程树**（复用既有的 `forceTerminateProcessGroup`：Windows 是
+  TerminateProcess + 后台回收后代，Unix 是给整个进程组 SIGKILL）—— 上限这才真的框住这次
+  调用，而不是"到点了还得陪孙进程耗着"；
+- 收 `stderr`，失败时带上 npm 自己那句原因；**有原因就不带退出码**（`exit status 1` 对用户
+  没有信息量，而且它正是原先那句文案里唯一的内容）；
+- stderr 只取前两条 `npm error …` 行（错误码 + 正文）、按字符截到 160 —— 真机一次 404 的
+  stderr 有 400 多字（正文 + 三行裸 404 + "还能从 tarball 装"两行 + 日志路径），那是噪音；
+  认不出 npm 格式时退回 `updateOutputDetail`（脱敏、剥 ANSI、留尾部），**不因为"看着不像"
+  就把原因丢掉**；
+- 超时**单独一句**「查询最新版本失败：npm 超时未返回（超过 25s）」，与"npm 报错"分开；
+- 各情形的措辞都带中文「失败」标签 —— 这样 `localizedErrorText` 会**原样直通**，
+  不再被套上"任务执行失败，请查看任务日志后重试。"（判定规则见 docs/45）。
+
+**前端**（`lib/cli-tools-view.ts` 分支 ⑦）：
+
+- 状态行只留**结论**「读不到最新版本。」，不再把服务端原文括进卡片（它要占两行，
+  把结论淹掉 —— 而这一页存在的意义正是"别让用户从噪音里挑信息"）；那句纪律话
+  「这不代表它是最新的 —— 只是这次没查到。」照旧保留；
+- 原文**不丢**，搬进详情抽屉（`detailNotes` 一行「读不到的原因：…」），并连带给出
+  `canOpenDetails` —— 否则那段原文没有任何入口，等于删掉而不是搬家（与 ④ 修不了 /
+  ⑤ 没查成 两档同一条规矩：抽屉是排障素材的归宿）。
+
+### 33.4 验证
+
+- **真超时**（`TestNpmVersionQueryTimeoutIsReportedAsTimeout`）：拿真的 npm，把期限压到
+  200 毫秒（node 冷启动本身就要 0.4s，必然跑不完），断言报出来的是"超时"而不是
+  `exit status 1`，且 `errorText` 没套通用兜底。**"被杀"这件事是真发生过的，不是构造的。**
+- **整棵树被杀**（`TestNpmVersionQueryTimeoutKillsTheWholeTree`，windows-only）：假
+  npm.cmd 派生一个睡 30 秒的孙进程，上限给 300 毫秒 —— 断言这次调用**秒回**。
+  **变异验证**：摘掉 `cmd.Cancel` 那三行，同一条用例挂 30.15s 后红（`上限到点后调用还挂了
+  30.15s`）；装上 0.32s 绿。这就是 §33.2 第 2 条的实证。
+- **三种情形**（`TestNpmVersionQueryFailureExplainsItself`）：超时 / npm 报错（带 stderr 上的
+  `code EAI_AGAIN`，且**不许**再出现退出码）/ 认不出格式（不许把 stderr 丢掉）/
+  npm 压根没跑起来，四种都要说得出原因且直通本地化；另有一份**真机 404 原文**（400 多字）
+  断言压完只留"错误码 + 正文"、过滤掉 tarball 与日志路径、长度 ≤160 字符。
+- **真机端到端**（跑完即删的临时用例）：正常路径 `latest=2.1.301`（0.81s）；不存在的包
+  实际下发 128 字符 ——「查询最新版本失败：code E404；404 Not Found - GET
+  https://registry.npmjs.org/@anthropic-ai%2fdefinitely-not-here - Not found」。
+- **前端**：`cli-tools-view.test.ts` 钉住"状态行不含原文、抽屉里有原文、必须给详情入口、
+  这一档不给任何动作"；`cli-tools-page.test.mjs` 断言模型里状态行是字面量
+  `"读不到最新版本。"`、且 `statusText` 里不许插 `latest.error`（写成"不许用模板串"是错的 ——
+  ⑥「可以更新到 ${card.latestText}。」本来就该插版本号）。
+- **真页面**：`.tmp/cli-tools-readfail/`（dist + 假后端，三张卡同时读不到）——读数行"读不到"
+  、状态行 20px 单行、抽屉里一行原因，截图 `cards.png` / `drawer.png`。
+
+### 33.5 同族但未动
+
+- `ConversationPage` 那处 inline 错误（`.runner-inline-error` 200px 截断、全文在 `title`）：
+  服务端文案变短变准之后它跟着受益，本身没改；
+- `sshRunner.CheckUpdate`（`ssh_runner.go`）查 npm 时仍带 `2>/dev/null`，同一条"丢掉 stderr"
+  的盲区，远端 SSH 环境上还在；
+- 顺带发现**与本页无关**的一条既有卡死（不在本次范围，未改）：`clearConversation`
+  （`app.go`）在 `BeginTx` 之后调 `conversationHandoffInProgress`，而它走的是 `s.db` 不是
+  `tx` —— 单连接（`SetMaxOpenConns(1)`）下这就是自我死锁：`POST /api/conversations/{id}/clear`
+  永不返回，`TestClearConversationStopsIdleClaudeSessionAndRejectsOldMessages` 因此挂到
+  测试超时（把本次改动整体移开、用原始代码跑，一样挂）。
