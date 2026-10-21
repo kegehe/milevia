@@ -1,21 +1,21 @@
 {
-  "version": "0.1.11",
-  "notes": "对话输入区重做：输入框下方新增工具坞，集中放置 MCP 服务器托盘（只显示本次会话实际注入的连接，超出的在「⋯」里逐条列全）、上下文占用进度环、模型选择器，以及压缩、清空、继续、使用状态等操作；轮数与分支胶囊移到工具坞两侧，分支胶囊显示当前分支、领先/落后提交数与未提交改动数，点击进入 Git 工作台。修复窗口宽度在 1200 像素附近时工具坞内容把发送键挤出卡片的问题；非 Git 目录项目不再显示一条永远读取失败的分支状态；修正若干「点不动却显示手型/悬停」的样式。",
-  "pub_date": "2026-10-14T12:41:07.473Z",
+  "version": "0.1.12",
+  "notes": "会话回退重做：每条用户消息下新增「回退到此处」，确认框写明此后多少轮不再显示、代码是否回到那一刻、模型上下文是否重建。节点快照改用影子 git 仓库，只存每轮增量并遵守 .gitignore（此前一个 7 轮会话要占 1.15 GB），每个会话保留最近 50 个节点。回退真的丢掉回合时，电脑端会把保留的对话历史重新喂给模型，被回退掉的回合不再记得；Codex 走原生回退。修复回退之后新发出的消息在刷新时消失的问题。另新增：运行指示阶段文字的 5 种随机动效；分支胶囊改为状态卡（分支、短 SHA、领先/落后、未提交改动与「查看改动」）；CLI 工具页的升级与运行依赖进度落在卡片内；MCP 卡片新增复制下拉与开关防连点；编排页候选任务收进「＋ 从任务加入」弹窗；交互式流式分片不再逐条落库与推送（单次运行约 5 万条事件归零）。",
+  "pub_date": "2026-10-21T07:11:13.667Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNncy85UWtjTFJBR0E2b3ZJQjV3YWRkdmhzNXB1aEg2N21hUm13VTZGUjZWQVFpZHU1bVNRMXhIa1V5aUxtVngza0ZoQnJhVVd1RDJKU29paTN2enRLYWc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTgxNjY3CWZpbGU6TWlsZXZpYV8wLjEuMTFfeDY0LXNldHVwLmV4ZQpqMGtOOGxOMTdVNnJ4OW5KK01JQTRva0JpcUhtRjJnSjNFaEVkVkNyaC9JYmVxZzRpM3B0YUdNWGVXelllcE1YbTkvRnNCbktYN0wyUk1aSk1NNGpBdz09Cg==",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.11/Milevia_0.1.11_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnc3dJdElYQlEwM2EyN0VPeWk4R2xLdE5rd1JCd3ZvcEFOY0UwNlkzUUJnN0ZHamMxQkU0Tk1IVmtKdFBmMDllSXBVWTNFMmtnTjdJL2VuWVppUmtVandrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNTY2NjczCWZpbGU6TWlsZXZpYV8wLjEuMTJfeDY0LXNldHVwLmV4ZQprUVF5T1dXRlgzbFlpM1M1K3EwcFFkWkorbkRPY1B1U2FMRmF5NTN3bHc2NzQ5MjhUWlQzKzdMRnU4QnRWczFzUlJ1L3R4SEs3TkJneGRWTTgzZzRDUT09Cg==",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.12/Milevia_0.1.12_x64-setup.exe"
     },
     "android": {
-      "version": "0.1.12",
-      "versionCode": 9,
-      "notes": "⋯ 菜单改版：每个操作配上行内图标，按「工作台 / 会话与任务」分组，历史会话与任务队列直接显示数量，能进入下一层的项带箭头指示；并修正禁用项仍显示可点悬停底色、以及计数文字被通用样式覆盖的问题。",
-      "pub_date": "2026-10-14T12:45:27.556Z",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.12/Milevia_0.1.12_android.apk",
-      "size": 28534066,
-      "sha256": "517b290c1ab37f34b193230cd07bb39765eabb88e441cd75bc9a400427e89d58",
-      "signature": "517b290c1ab37f34b193230cd07bb39765eabb88e441cd75bc9a400427e89d58"
+      "version": "0.1.13",
+      "versionCode": 10,
+      "notes": "消息「⋯」菜单新增「回退到此处」：回到某一轮结束时的代码与对话，确认层会写明此后多少轮不再显示、代码是否回写，文案与电脑端共用一份。电脑端（或另一台手机）回退之后，这台手机缓存里被丢掉的回合会同时消失，回退之后新发的消息照常保留。另修正若干远程页交互与样式细节。",
+      "pub_date": "2026-10-21T07:13:29.746Z",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.13/Milevia_0.1.13_android.apk",
+      "size": 28558039,
+      "sha256": "3e22fa219c3afa922e20bd394c9afef7b6495800e694e2a164744cede35239dd",
+      "signature": "3e22fa219c3afa922e20bd394c9afef7b6495800e694e2a164744cede35239dd"
     }
   }
 }
