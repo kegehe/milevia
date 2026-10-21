@@ -61,6 +61,67 @@
 /* CLI 盲文：JS 每 80ms 轮换字符（cli-spinners dots 帧序列） */
 .ri-anim.ri-cli { font-family: Consolas, "Courier New", monospace; font-size: 13px; line-height: 1; color: #2c7567; width: 13px; text-align: center; }
 
+/* ── 文字位变体（rt-*）：阶段词自己的动效，判据 pickRunTextVariant（runId + ":text" 哈希）。 ──
+   与图形位（ri-*）相互独立：每个 run 各抽各的。样式类直接挂在阶段词 span 上（.ri-stage / .mobile-agent-processing-stage）。
+   选择器都带上下文（.run-indicator .ri-stage.rt-x = 0,3,0），压过 .run-indicator .ri-stage 的基础色（0,2,0）——
+   特异性是这个项目的复发坑，clip:text 变体的 color:transparent 输给基础色就会整段不可读。
+   关键帧只动 background-position / transform / color，不碰布局属性。 */
+.run-indicator .ri-stage.rt-shimmerPro, .mobile-agent-processing-stage .rt-shimmerPro {
+  background: linear-gradient(100deg, #294f43 32%, #8fd4c0 46%, #294f43 60%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+  animation: rt-shimmer 1.2s linear infinite;
+}
+@keyframes rt-shimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+
+.run-indicator .ri-stage.rt-wipe, .mobile-agent-processing-stage .rt-wipe {
+  background: linear-gradient(90deg, #2c9a80 50%, #b9cfc4 50%);
+  background-size: 200% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+  animation: rt-wipe 2s linear infinite;
+}
+/* 填满后停留到周期尾再归零：推进感 + 喘息 */
+@keyframes rt-wipe { 0% { background-position: 100% 0; } 75% { background-position: 0% 0; } 100% { background-position: 0% 0; } }
+
+.run-indicator .ri-stage.rt-bounce span, .mobile-agent-processing-stage .rt-bounce span {
+  display: inline-block;
+  animation: rt-bounce 1.2s ease-in-out infinite;
+}
+/* 弹跳逐字错峰（delay 由组件按字符序内联），幅度 5px + 提亮 */
+@keyframes rt-bounce { 0%, 55%, 100% { transform: translateY(0); color: #4c6b60; } 25% { transform: translateY(-5px); color: #2c9a80; } }
+
+.run-indicator .ri-stage.rt-pulse, .mobile-agent-processing-stage .rt-pulse {
+  animation: rt-pulse 1.1s ease-in-out infinite;
+}
+@keyframes rt-pulse { 0%, 100% { color: #294f43; } 50% { color: #2c9a80; } }
+
+.run-indicator .ri-stage.rt-liquid, .mobile-agent-processing-stage .rt-liquid {
+  background: linear-gradient(3deg, #2c9a80 44%, #2c9a80 48%, #b9cfc4 56%);
+  background-size: 100% 260%; background-repeat: repeat;
+  background-position: 0 100%;
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+  animation: rt-fill 2.4s ease-in-out infinite alternate;
+}
+@keyframes rt-fill { from { background-position: 0 100%; } to { background-position: 0 0%; } }
+
+/* reduced-motion：文字位全部退化为静态阶段词。降级块必须显式列出同选择器
+   （具体度压过降级块是这个项目的复发坑）；clip:text 变体还要把填充色捞回来，
+   否则动画停了、文字仍是透明的 —— 「看得见的降级」才算降级。 */
+@media (prefers-reduced-motion: reduce) {
+  .run-indicator .ri-stage.rt-shimmerPro, .mobile-agent-processing-stage .rt-shimmerPro,
+  .run-indicator .ri-stage.rt-wipe, .mobile-agent-processing-stage .rt-wipe,
+  .run-indicator .ri-stage.rt-pulse, .mobile-agent-processing-stage .rt-pulse,
+  .run-indicator .ri-stage.rt-liquid, .mobile-agent-processing-stage .rt-liquid {
+    animation: none;
+    color: #4c6b60; -webkit-text-fill-color: #4c6b60;
+  }
+  .run-indicator .ri-stage.rt-bounce span, .mobile-agent-processing-stage .rt-bounce span { animation: none; }
+}
+
 /* reduced-motion：全部变体退化为静点。降级块必须显式列出同选择器，
    否则会被上面的具体度压过（本项目踩过三次的坑）。 */
 @media (prefers-reduced-motion: reduce) {

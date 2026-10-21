@@ -6,9 +6,13 @@ import {
   formatStageClock,
   latestActiveStage,
   pickRunIndicatorVariant,
+  pickRunTextVariant,
   runIndicatorVariants,
+  runTextVariants,
+  splitLabelChars,
   stageClockVisibleAfterMs,
   type RunIndicatorVariant,
+  type RunTextVariant,
 } from "./run-indicator";
 import type { Event } from "./types";
 
@@ -50,6 +54,64 @@ test("变体抽取：哈希吃到完整 runId（改一位就换变体的概率�
     if (pickRunIndicatorVariant(`run-shared-prefix-${i}`) !== base) changed += 1;
   }
   assert.ok(changed >= 10, `50 个不同 runId 里只有 ${changed} 个换了变体，哈希可能只读了前缀`);
+});
+
+// ── 分类：文字位变体抽取（与图形位同一套机制的第二条随机轴） ──────────────
+test("文字变体抽取：同一 runId 永远抽到同一个（重渲染/重连不换花样）", () => {
+  const first = pickRunTextVariant("run-abc-123");
+  for (let i = 0; i < 20; i += 1) {
+    assert.equal(pickRunTextVariant("run-abc-123"), first);
+  }
+});
+
+test("文字变体抽取：结果必在 5 个定稿变体之内", () => {
+  const valid = new Set<string>(runTextVariants);
+  for (let i = 0; i < 200; i += 1) {
+    assert.ok(valid.has(pickRunTextVariant(`run-${i}`)), `run-${i} 抽到了集合外的文字变体`);
+  }
+});
+
+test("文字变体抽取：5 个变体都能被抽到（不是名义随机、实际只剩两三个）", () => {
+  const seen = new Set<RunTextVariant>();
+  for (let i = 0; i < 2000; i += 1) {
+    seen.add(pickRunTextVariant(`run-${i}-${i * 7}`));
+  }
+  assert.deepEqual(
+    runTextVariants.filter((variant) => !seen.has(variant)).sort(),
+    [],
+    "有文字变体从未被抽到：随机分布有洞",
+  );
+});
+
+test("文字变体抽取：种子确实带 ':text' 后缀（与图形位同哈希但独立投影）", () => {
+  // 第一版这里写的是"两个枚举值字符串相等计数"——两个枚举没有交集字符串，
+  // same 恒为 0，就算实现退化成与图形位共用种子它也永远绿（无效断言）。
+  // 改为钉种子推导：测试内独立重算 FNV-1a，去掉 ':text' 后缀或改哈希必红。
+  const fnv = (input: string) => {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < input.length; index += 1) {
+      hash ^= input.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return Math.abs(hash);
+  };
+  for (const runId of ["run-1", "run-abc-123", "run-axis-check", "会话:锚点"]) {
+    const expected = runTextVariants[fnv(`${runId}:text`) % runTextVariants.length];
+    assert.equal(pickRunTextVariant(runId), expected, `runId=${runId} 的文字变体偏离种子推导`);
+  }
+  // 顺带钉住"后缀真的参与了投影"：无后缀推导与有后缀推导对同一批 runId
+  // 不能给出完全相同的序列（否则后缀形同虚设，两条轴实际同源）。
+  const withSuffix = ["run-1", "run-abc-123", "run-axis-check"].map(pickRunTextVariant);
+  const withoutSuffix = ["run-1", "run-abc-123", "run-axis-check"].map(
+    (runId) => runTextVariants[fnv(runId) % runTextVariants.length],
+  );
+  assert.notDeepEqual(withSuffix, withoutSuffix, "':text' 后缀没有参与投影，两条轴实际同源");
+});
+
+test("拆字：空格换成不换行空格（inline-block span 里普通空格会塌掉），其余原样", () => {
+  assert.deepEqual(splitLabelChars("ab c"), ["a", "b", "\u00A0", "c"]);
+  assert.equal(splitLabelChars("正在处理").length, 4);
+  assert.deepEqual(splitLabelChars(""), []);
 });
 
 // ── 分类：阶段词取哪条 ────────────────────────────────────────────────────

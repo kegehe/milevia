@@ -48,10 +48,55 @@
 .mcp-service-mark img { display: block; }
 .ssh-dialog-mark img { display: block; }
 
-/* 连接卡的动作按钮：弹窗时代是 30px 图标方块（「授权/停用/启用」两个字会竖排折行）。
-   页面上按钮带文字，宽度放开、文字不折行；纯图标按钮（管理/删除）靠 padding 保持可点。
-   font-size 在这里声明 —— style.css 的 .mcp-test-button 规则只剩弹窗半边。 */
-.mcp-shell .ssh-connection-actions .ssh-action-button { width: auto; min-width: 30px; height: 30px; padding: 0 10px; white-space: nowrap; font-size: 11px; font-weight: 700; }
+/* 连接卡（方案 C，2026-10-20 定稿）：纵向三段 —— 头部（牌位 + 名称 + 运行位置 + 状态胶囊）/
+   说明行（凭据与项目范围，两者都缺席时整行隐藏）/ 底部操作栏（细线分隔）。
+   横向卡的基础样式仍来自 style.css 的 .ssh-connection-card（SSH 管理弹窗共用），这里的
+   覆写全部收在 .mcp-shell 之下，被覆写的形状（display/padding/min-height）逐条重申，
+   不靠层叠顺序生效。 */
+.mcp-shell .mcp-conn-card { display: block; min-height: 0; padding: 0; }
+/* 头部自带下间距：没有说明行的卡（无凭据且全局范围）文字也不贴底栏分隔线。 */
+.mcp-conn-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px 11px; }
+.mcp-conn-mark { display: grid; width: 32px; height: 32px; flex: none; place-items: center; border: 1px solid #b8d8ca; border-radius: 7px; color: #277566; background: #e8f5ed; }
+.mcp-conn-mark img { display: block; }
+.mcp-conn-title { min-width: 0; flex: 1; }
+.mcp-conn-title h3 { overflow: hidden; margin: 0; color: #254b40; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.mcp-conn-title p { overflow: hidden; margin: 1px 0 0; color: #70897f; text-overflow: ellipsis; white-space: nowrap; font: 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mcp-conn-pill { flex: none; border: 1px solid #bcd8c8; border-radius: 99px; padding: 3px 9px; color: #28715f; background: #eff8f2; font-size: 10px; font-weight: 700; }
+.mcp-conn-pill.is-off { border-color: #d8e3dc; color: #809188; background: #f2f5f3; }
+.mcp-conn-pill.is-pending { border-color: #ead1a0; color: #90611d; background: #fff4d9; }
+.mcp-conn-meta { margin: 0 14px; padding-bottom: 11px; color: #4c6b60; font-size: 11.5px; }
+.mcp-conn-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; border-top: 1px solid #e3ece7; border-radius: 0 0 7px 7px; padding: 9px 12px; background: #f9fcfa; }
+.mcp-foot-push { flex: 1 1 0; }
+/* 底栏按钮：文字钮放开宽度（30px 高保留）；display 重申为 inline-flex ——
+   style.css 的基底是 display:grid，文字＋下拉箭头两个子元素会被拆成两格竖排。
+   图标钮回到方块。每种形态的禁用态都重申底色（实底主钮禁用降 #c9d6ce，否则禁用仍像能点）。 */
+.mcp-shell .mcp-conn-foot .ssh-action-button { display: inline-flex; width: auto; min-width: 30px; height: 30px; align-items: center; justify-content: center; padding: 0 10px; white-space: nowrap; font-size: 11px; font-weight: 700; }
+.mcp-shell .mcp-conn-foot .ssh-action-button.is-icon { width: 30px; min-width: 30px; padding: 0; }
+.mcp-shell .mcp-conn-foot .ssh-action-button.is-primary { border-color: #2c7567; color: #fff; background: #2c7567; }
+.mcp-shell .mcp-conn-foot .ssh-action-button.is-primary:hover:not(:disabled) { border-color: #256558; color: #fff; background: #256558; }
+.mcp-shell .mcp-conn-foot .ssh-action-button:disabled { border-color: #dce7df; color: #809188; background: #fbfefb; }
+.mcp-shell .mcp-conn-foot .ssh-action-button.is-primary:disabled { border-color: #c9d6ce; color: #fff; background: #c9d6ce; }
+/* 复制下拉：copyMenuId 单态驱动；背板 20 收点击、菜单 21（页面 z 阶梯：面板与弹层 20）。 */
+.mcp-copy-wrap { position: relative; display: inline-flex; }
+.mcp-copy-caret { width: 12px; height: 12px; margin-left: 3px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
+.mcp-menu-backdrop { position: fixed; z-index: 20; inset: 0; }
+.mcp-copy-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 21; display: grid; gap: 1px; width: 190px; border: 1px solid #d1e2d8; border-radius: 8px; padding: 5px; background: #fff; box-shadow: 0 10px 28px #102d2322; }
+.mcp-copy-menu button { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 30px; border: 0; border-radius: 5px; padding: 0 10px; color: #3f5a51; background: transparent; font-size: 12px; text-align: left; cursor: pointer; }
+.mcp-copy-menu button:hover { color: #245f50; background: #eaf6ee; }
+.mcp-copy-menu small { flex: none; color: #809188; font-size: 10px; }
+/* 启用开关：状态本身可操作，不再占文字按钮槽位（启停判据仍只有 toggleEnabled 一个来源）。 */
+.mcp-conn-switch { position: relative; width: 34px; height: 20px; flex: none; border: 1px solid transparent; border-radius: 99px; padding: 0; background: #c9d6ce; cursor: pointer; transition: background .16s ease; }
+.mcp-conn-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px #102d2340; transition: transform .16s ease; }
+.mcp-conn-switch[aria-checked="true"] { background: #2c7567; }
+.mcp-conn-switch[aria-checked="true"]::after { transform: translateX(14px); }
+.mcp-conn-switch:hover:not(:disabled) { border-color: #b0c6ba; }
+.mcp-conn-switch[aria-checked="true"]:hover:not(:disabled) { background: #256558; }
+.mcp-conn-switch:disabled { opacity: .55; cursor: default; }
+.mcp-conn-switch-label { color: #748b81; font-size: 10.5px; font-weight: 700; }
+@media (prefers-reduced-motion: reduce) {
+  .mcp-conn-switch { transition: none; }
+  .mcp-conn-switch::after { transition: none; }
+}
 
 /* 空态：卡片式、带下一步（本项目约定：有下一步动作的空态禁止「一行灰字」）。 */
 .mcp-empty { display: grid; gap: 6px; justify-items: start; border: 1px dashed #c8ddd2; border-radius: 12px; padding: 18px 20px; background: #fff; }

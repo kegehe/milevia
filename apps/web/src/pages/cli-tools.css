@@ -81,13 +81,9 @@
 .cli-tools-banner { display: flex; align-items: center; gap: 12px; margin: 12px 0; padding: 11px 16px; border-radius: 11px;
   border: 1px solid #f0d9a8; background: #fff8e8; color: #85671c; font-size: 12.5px; }
 .cli-tools-banner[data-tone="bad"] { border-color: #f2c8c0; background: #fdf3f1; color: #a4462f; }
-/* 进行中：中性偏冷色，**不能**用 bad 那一档的红色 —— 那是"出事了"，而这条说的是
-   "正在做，请等"，把两者画成一样会让用户在一条正常的升级里以为坏了。 */
-.cli-tools-banner[data-tone="busy"] { border-color: #c8dbd4; background: #f2f7f5; color: #2c7567; }
 .cli-tools-banner-mark { display: grid; place-items: center; flex: none; width: 18px; height: 18px; border-radius: 50%;
   background: #85671c; color: #fff; font-size: 11px; font-weight: 700; }
 .cli-tools-banner[data-tone="bad"] .cli-tools-banner-mark { background: #a4462f; }
-.cli-tools-banner[data-tone="busy"] .cli-tools-banner-mark { background: #2c7567; }
 .cli-tools-banner > span:nth-child(2) { flex: 1; }
 .cli-tools-banner .primary { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
 
@@ -111,6 +107,9 @@
    （整张卡画成虚线会被读成"这个工具坏了"，而它可能只是这次没查到）。 */
 .cli-tools-card[data-tone="warn"] { border-color: #f0d9a8; }
 .cli-tools-card[data-tone="bad"] { border-color: #f2c8c0; }
+/* 正在进行中的那张卡：边框与光晕抬高一点，和按钮上的转圈一起说"就是这一张"。
+   只加静态色，不加整卡动画 —— 分钟级的操作里让整张卡闪会非常吵。 */
+.cli-tools-card[data-busy="true"] { border-color: #9fc9b8; box-shadow: 0 0 0 3px rgba(44, 117, 103, .08); }
 
 .cli-tools-card-head { display: flex; align-items: center; gap: 10px; }
 .cli-tools-card-head b { font-size: 14px; font-weight: 700; letter-spacing: .01em; }
@@ -145,6 +144,7 @@
    被同等选择器按特异性压过）。 */
 @media (prefers-reduced-motion: reduce) {
   .cli-tools-icon[data-icon="loading"] { animation: none; }
+  .cli-tools-btn-spinner { animation: none; }
 }
 
 /* 两行读数：标签左、值右。这是整张卡里唯一"密"的地方。 */
@@ -204,6 +204,14 @@
 .cli-tools-card-actions { display: flex; gap: 8px; align-items: center; margin: auto -16px 0; padding: 11px 16px;
   border-top: 1px solid #eef3f0; background: #fcfdfc; border-radius: 0 0 13px 13px; }
 .cli-tools-card-actions .primary, .cli-tools-card-actions .secondary { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+/* 进行中：按钮里那一圈转动的缺口环。它只出现在**发起操作的那颗按钮**上（页面按
+   runner + agent 判，见 activeAction），所以"在跑"这件事有了落点，不需要页面级
+   横幅再说一遍。disabled 的按钮是灰底，环用青色保持可读。
+   ⚠️ 作用域名带 `.cli-tools-shell`：这条 CSS 与别页共用一份产物，裸 `button[aria-busy]`
+   会把别处的按钮也改成 flex。 */
+.cli-tools-shell button[aria-busy="true"] { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.cli-tools-btn-spinner { flex: none; width: 12px; height: 12px; border: 2px solid #2c7567;
+  border-top-color: transparent; border-radius: 50%; animation: cli-tools-spin .9s linear infinite; }
 /* 没有动作条的那几档（读取中 / 没装…）最后一段贴着卡底太挤：给「最后一段」
    留出与卡顶对称的呼吸位。有动作条时动作条自己是最后一段（自带负 margin
    与圆角底），不受这条影响。 */

@@ -111,14 +111,14 @@ export default function CliToolsPage() {
    *
    * 为什么需要它：装/升级/修复是**数十秒到数分钟级**的操作（docs/42 §4.4），而在这之前
    * 点完「确认」的界面是"弹窗关掉、按钮置灰、页面上什么都不说" —— 用户只能盯着一个
-   * 没反应的按钮，等到的往往是超时。docs/42 §1.1 把「长任务进度：要有进行中与结果」
-   * 列为待补项，这一档就是它。
+   * 没反应的按钮，等到的往往是超时。所以那一张卡的按钮换成「升级中…」并带转动的指示器：
+   * 状态落在**发起它的那张卡**上，不额外占一行横幅。
    *
    * ⚠️ 必须连**跑在哪台机器上**一起记下来，不能只记 action：顶栏可以切执行环境，而
    * 操作还在原来那台上跑。只记 action 的话，切过去之后新环境的同名卡片会亮起
    * "升级中…"，说的是一台根本没在升级的机器。
    */
-  const [running, setRunning] = useState<{ action: PendingAction; runnerID: string; runnerText: string } | null>(null);
+  const [running, setRunning] = useState<{ action: PendingAction; runnerID: string } | null>(null);
   const [pending, setPending] = useState<PendingAction | null>(null);
   // 登录面板状态：loginAgent 非空时打开；loginInfo 承载后端返回的授权链接/指引。
   const [loginAgent, setLoginAgent] = useState<{ agentID: string; name: string } | null>(null);
@@ -389,7 +389,7 @@ export default function CliToolsPage() {
     const action = pending;
     setPending(null);
     setBusy(true);
-    setRunning({ action, runnerID: selectedRunner, runnerText: environmentLabel });
+    setRunning({ action, runnerID: selectedRunner });
     // 「上次修复已解决 N 项」只对**那一次**修复有效：一发起新动作就先清掉，
     // 否则它会一直挂在那儿，说一件早已被后续变更推翻的事。
     const actionAgentID = "agentID" in action ? action.agentID : "";
@@ -453,7 +453,7 @@ export default function CliToolsPage() {
       setBusy(false);
       setRunning(null);
     }
-  }, [diagnoses, environmentLabel, pending, refresh, selectedRunner, updateKey]);
+  }, [diagnoses, pending, refresh, selectedRunner, updateKey]);
 
   // 发起登录：把后端返回的授权链接/指引放进登录面板。设备码/浏览器的端到端回调依赖
   // 已安装 codebuddy 的真机输出校准 —— 后端当前会回一个可操作指引（见 agent_login.go）。
@@ -594,6 +594,13 @@ export default function CliToolsPage() {
   // `depLine.action.kind` 上报 possibly undefined）。动作的种类也由它带来，
   // 页面不自己写死（见 `RuntimeDepLine.action` 的注释）。
   const depAction = depLine?.action;
+  /**
+   * 运行依赖那一栏正在装吗。
+   *
+   * 页面级横幅去掉之后，这里不转圈就只剩一颗灰按钮 —— 而装 Node.js 运行时恰恰是
+   * 这一页最慢的一档。判据与卡片上那条一致：动作 + 发起时的环境。
+   */
+  const runtimeInstalling = Boolean(running && running.runnerID === selectedRunner && running.action.kind === "install-runtime");
   const openCard = cards.find((card) => card.id === openAgent);
   const openItem = items.find((candidate) => candidate.id === openAgent);
   const openEntry = catalog.entries.find((entry) => entry.id === openAgent);
@@ -653,14 +660,10 @@ export default function CliToolsPage() {
       </div>
     </header>
 
-    {/* 进行中横幅。装/升级是数十秒到数分钟级的操作（docs/42 §4.4），而在这之前
-        点完「确认」的界面是"弹窗关掉、按钮置灰、什么都不说" —— 用户唯一能做的就是
-        盯着一个没反应的按钮，或者以为点漏了**再点一次**。这一条要说清三件事：
-        在做什么、要多久、别再点。 */}
-    {running && <div className="cli-tools-banner" data-tone="busy" role="status">
-      <span className="cli-tools-banner-mark" aria-hidden="true">…</span>
-      <span>{pendingRunningText(running.action, running.runnerText)}</span>
-    </div>}
+    {/* 装/升级是数十秒到数分钟级的操作（docs/42 §4.4），期间的状态只说在**那张卡自己**上：
+        按钮换成「升级中…」并带一圈转动的指示器。这里原先还有一条页面级横幅（"Windows：正在
+        升级 X…"），它和卡片说的是同一件事、却占了一行、还把环境名念了两遍 —— 去掉之后
+        「在做什么」由卡片承担，「跑在哪台机器上」看顶栏就够。 */}
 
     <section className="cli-tools-body">
       {/* ⚠️ 这里原先是「正在读取执行环境…」一整块 —— 它把页面按到 `/api/runners` 回来为止
@@ -753,7 +756,13 @@ export default function CliToolsPage() {
                 : <div className="cli-tools-grid">
                   {cards.map((card) => {
                     const key = updateKey(card.id);
-                    return <article className="cli-tools-card" key={card.id} data-tone={card.statusTone}>
+                    // 这张卡上正在跑的，就是它自己的动作吗？**环境也要对上**：顶栏可以切执行
+                    // 环境，而操作还在原来那台上跑 —— 只比 agentID 的话，切过去之后新环境的
+                    // 同名卡片会转起圈来，说的是一台根本没在升级的机器。
+                    const activeAction = running && running.runnerID === selectedRunner && "agentID" in running.action && running.action.agentID === card.id
+                      ? running.action
+                      : null;
+                    return <article className="cli-tools-card" key={card.id} data-tone={card.statusTone} data-busy={activeAction ? "true" : undefined}>
                       <header className="cli-tools-card-head">
                         {/* 官方图标优先（判据在模型的 `agentLogoKey`）；没有官方图标
                             的工具回落两字母牌 —— 绝不拿别的产品的图标冒充。 */}
@@ -782,10 +791,9 @@ export default function CliToolsPage() {
                           所以这三颗（主操作 / 登录 / 详情）都可能是 undefined，守卫要把它们
                           全算进来。 */}
                       {(card.primary || card.canLogin || card.canOpenDetails) && <div className="cli-tools-card-actions">
-                        {card.primary && <button className="primary" disabled={busy} onClick={() => runPrimary(card)}>
-                          {running && running.runnerID === selectedRunner && "agentID" in running.action && running.action.agentID === card.id
-                            ? pendingActionText(running.action).button
-                            : card.primary.label}
+                        {card.primary && <button className="primary" disabled={busy} aria-busy={activeAction ? true : undefined} onClick={() => runPrimary(card)}>
+                          {activeAction && <span className="cli-tools-btn-spinner" aria-hidden="true"/>}
+                          {activeAction ? pendingActionText(activeAction).button : card.primary.label}
                         </button>}
                         {/* 需要登录的工具（`canLogin` 由模型按目录的 supportsLogin + 真的装没装判）
                             把入口摆在卡片上：点开就是登录面板，不用先进详情抽屉。
@@ -834,8 +842,9 @@ export default function CliToolsPage() {
                 <span className="cli-tools-dep-state" data-tone={depLine?.tone}>
                   {depLine?.text}
                 </span>
-                {depAction && <button className="secondary" disabled={busy} onClick={() => setPending({ kind: depAction.kind })}>
-                  {depAction.label}
+                {depAction && <button className="secondary" disabled={busy} aria-busy={runtimeInstalling ? true : undefined} onClick={() => setPending({ kind: depAction.kind })}>
+                  {runtimeInstalling && <span className="cli-tools-btn-spinner" aria-hidden="true"/>}
+                  {runtimeInstalling ? pendingActionText(depAction).button : depAction.label}
                 </button>}
               </span></>
             : <><span className="cli-tools-dep-mark" data-tone="missing" aria-hidden="true">⬢</span>
@@ -847,8 +856,9 @@ export default function CliToolsPage() {
                 {/* 未授权时这里**不给动作**：安装会以 403 失败，亮一个点了必失败的按钮
                     比不亮更坏。授权入口在这一栏下面单独一处（见 `cli-tools-dep-grant`）。 */}
                 {view?.remoteInstallAllowed && runtime?.installSupported &&
-                  <button className="primary" disabled={busy} onClick={() => setPending({ kind: "install-runtime" })}>
-                    安装 Node.js 运行时
+                  <button className="primary" disabled={busy} aria-busy={runtimeInstalling ? true : undefined} onClick={() => setPending({ kind: "install-runtime" })}>
+                    {runtimeInstalling && <span className="cli-tools-btn-spinner" aria-hidden="true"/>}
+                    {runtimeInstalling ? pendingActionText({ kind: "install-runtime" }).button : "安装 Node.js 运行时"}
                   </button>}
                 {/* LTS 提示是**陈述**不是动作，不进授权门 —— 恰恰是要做「允许安装」
                     决策的机器上，"会装哪个版本"这个决策输入最该可见（2026-09-25 复查修正）。 */}
@@ -876,7 +886,10 @@ export default function CliToolsPage() {
         {runtime?.installed && runtime.installSupported && !runtime.npmVersion &&
           <p className="cli-tools-note">运行时装好了，但随包的 npm 不可用 —— 装不了 CLI，请重装 Node.js 运行时。
             {view?.remoteInstallAllowed
-              ? <button className="secondary" disabled={busy} onClick={() => setPending({ kind: "install-runtime" })}>重装</button>
+              ? <button className="secondary" disabled={busy} aria-busy={runtimeInstalling ? true : undefined} onClick={() => setPending({ kind: "install-runtime" })}>
+                {runtimeInstalling && <span className="cli-tools-btn-spinner" aria-hidden="true"/>}
+                {runtimeInstalling ? pendingActionText({ kind: "install-runtime" }).button : "重装"}
+              </button>
               : <span>{grantNeededReason}（见上）。</span>}
           </p>}
       </section>
@@ -1085,33 +1098,20 @@ export default function CliToolsPage() {
 /**
  * 这次操作在做什么。
  *
- * 三处必须用**同一份**说法：确认弹窗的标题、进行中横幅、卡片按钮的文案。各写一遍
- * 必然有一天只剩两处改了 —— 那时用户会看到"确认安装"点下去变成"正在升级"。
+ * 两处必须用**同一份**说法：确认弹窗的标题、卡片按钮在进行中时的文案。各写一遍
+ * 必然有一天只剩一处改了 —— 那时用户会看到"确认安装"点下去变成"正在升级"。
  */
-function pendingActionText(action: PendingAction): { title: string; running: string; button: string } {
+function pendingActionText(action: PendingAction): { title: string; button: string } {
   switch (action.kind) {
     case "install-runtime":
-      return { title: "安装 Node.js 运行时", running: "正在安装 Node.js 运行时…", button: "安装中…" };
+      return { title: "安装 Node.js 运行时", button: "安装中…" };
     case "install-agent":
-      return { title: `安装 ${agentDisplayName(action.agentID)}`, running: `正在安装 ${agentDisplayName(action.agentID)}…`, button: "安装中…" };
+      return { title: `安装 ${agentDisplayName(action.agentID)}`, button: "安装中…" };
     case "update-agent":
-      return { title: `升级 ${agentDisplayName(action.agentID)}`, running: `正在升级 ${agentDisplayName(action.agentID)}…`, button: "升级中…" };
+      return { title: `升级 ${agentDisplayName(action.agentID)}`, button: "升级中…" };
     default:
-      return { title: `修复 ${agentDisplayName(action.agentID)}`, running: `正在修复 ${agentDisplayName(action.agentID)}…`, button: "修复中…" };
+      return { title: `修复 ${agentDisplayName(action.agentID)}`, button: "修复中…" };
   }
-}
-
-/**
- * 进行中横幅那句话。
- *
- * 带上**执行环境**（`runnerText` 由发起时捕获，不是现读的选择框）：顶栏可以切环境，
- * 而这条横幅要说的是"哪台机器上正在跑什么"，切过去之后不能变成新环境的名字。
- *
- * 「不要重复点击」不是客套：这几种操作在服务端是**串行闸门**（`beginAgentMaintenance`），
- * 第二次点击要么被拒（看起来像失败），要么在第一次的几分钟里一直转圈。
- */
-function pendingRunningText(action: PendingAction, runnerText: string): string {
-  return `${runnerText}：${pendingActionText(action).running}这是分钟级操作，期间请不要重复点击。`;
 }
 
 /** 状态图标里那个字形。形状与观感一起构成"一眼看出该管哪张"。 */

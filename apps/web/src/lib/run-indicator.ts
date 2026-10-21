@@ -19,16 +19,41 @@ export const runIndicatorVariants: RunIndicatorVariant[] = [
   "dots", "orbit", "ripple", "spark", "chase", "tri", "cli",
 ];
 
-// FNV-1a 哈希：把 runId 稳定映射到 7 个变体之一。
+// 文字位变体：阶段词（.ri-stage）自己的动效，与图形位变体相互独立。
+// K 高亮扫过 / L 填色擦除 / M 弹跳字符（需拆字）/ N 双色脉冲 / O 液态填充。
+export type RunTextVariant = "shimmerPro" | "wipe" | "bounce" | "pulse" | "liquid";
+
+export const runTextVariants: RunTextVariant[] = [
+  "shimmerPro", "wipe", "bounce", "pulse", "liquid",
+];
+
+// FNV-1a 哈希：把种子串稳定映射到一个数。
 // 不用 Math.random()：那会随每次重渲染重抽，动画在 run 中途换花样；
 // 也不用 state 存抽取结果：那样 WebSocket 重连、页面重开都会丢。
-export function pickRunIndicatorVariant(runId: string): RunIndicatorVariant {
+function fnv1a(input: string): number {
   let hash = 0x811c9dc5;
-  for (let index = 0; index < runId.length; index += 1) {
-    hash ^= runId.charCodeAt(index);
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
     hash = Math.imul(hash, 0x01000193);
   }
-  return runIndicatorVariants[Math.abs(hash) % runIndicatorVariants.length];
+  return Math.abs(hash);
+}
+
+// 图形位：runId 直接做种子。
+export function pickRunIndicatorVariant(runId: string): RunIndicatorVariant {
+  return runIndicatorVariants[fnv1a(runId) % runIndicatorVariants.length];
+}
+
+// 文字位：种子加 ":text" 后缀 —— 与图形位抽取独立（同一 run 的图形/文字不绑死），
+// 但同一 run 内仍然稳定：重渲染、重连都不换花样。
+export function pickRunTextVariant(runId: string): RunTextVariant {
+  return runTextVariants[fnv1a(`${runId}:text`) % runTextVariants.length];
+}
+
+// 弹跳变体（rt-bounce）需要把阶段词拆成单字 span 逐字起舞。
+// 空格换成不换行空格：inline-block 的 span 里普通空格会塌掉，词间距就丢了。
+export function splitLabelChars(label: string): string[] {
+  return Array.from(label).map((ch) => (ch === " " ? "\u00A0" : ch));
 }
 
 // 当前 run 有没有「正在进行的阶段」？有就返回那个阶段事件，没有返回 null。

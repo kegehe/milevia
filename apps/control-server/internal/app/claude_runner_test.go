@@ -449,6 +449,49 @@ func TestClaudeResultErrorSinkForwardsOptionalSinkCapabilities(t *testing.T) {
 	}
 }
 
+// 交互式流式会话（claudeCLISession）这条路径曾经漏掉 stream_event 的 guard：逐 token 的
+// 分片被当成普通事件落库并广播。真机库实测单次运行能写进 49,737 条、峰值 964 条/秒，而这些
+// 分片**全仓没有任何读取方** —— 代价是 84% 的 events 表（约 1 GB）和前端每条约 2ms 的重算。
+//
+// 同一条纪律在一次性路径（上面那个用例）与 SSH 的两条路径上早已生效，所以这里钉的是
+// "四条路径行为一致"，而不只是"这条路径没坏"。
+func TestClaudeSessionKeepsStreamEventsOutOfTheEventLog(t *testing.T) {
+	stream := `{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"增量"}}}` + "\n" +
+		`{"type":"system","subtype":"status"}` + "\n"
+
+	// 分片仍要走合并增量路径：guard 不能顺手把"实时增量"和"采纳 assistant message id"
+	// 一起吞掉，那正是 handleClaudePartialMessage 存在的理由。
+	opted := &partialSink{}
+	newStreamingTestSession(opted).readOutput(strings.NewReader(stream))
+	if opted.messageID != "msg_1" {
+		t.Fatalf("streaming session dropped assistant message id: %q", opted.messageID)
+	}
+	if len(opted.deltas) != 1 || opted.deltas[0] != "增量" {
+		t.Fatalf("streaming session dropped assistant deltas: %q", opted.deltas)
+	}
+
+	// 而它自己**不能**变成一条事件：只剩那条 system。
+	plain := &plainSink{}
+	newStreamingTestSession(plain).readOutput(strings.NewReader(stream))
+	if len(plain.events) != 1 || plain.events[0] != "system" {
+		t.Fatalf("events = %q, want exactly [system]", plain.events)
+	}
+}
+
+// newStreamingTestSession 造一个只有单个进行中回合的交互式会话，够 readOutput 走完一遍。
+//
+// 只喂 stream_event / system 是有意的：noteStreamEvent 只为 assistant / user 起回合空闲
+// 计时器，用这两种之外的类型就不必在用例里处理计时器收尾（本用例要验的是事件去向，
+// 不是看门狗）。
+func newStreamingTestSession(sink AgentRunSink) *claudeCLISession {
+	return &claudeCLISession{
+		cmd:         &exec.Cmd{},
+		processDone: make(chan struct{}),
+		current:     &claudeSessionTurn{sink: sink},
+	}
+}
+
 // writeFakeClaudeExecutable 写一个假 claude 可执行文件：POSIX 下是带 shebang 的脚本，
 // Windows 下是 .cmd（由 Go 经 cmd.exe 执行）。既有夹具用 requirePOSIXShell 在 Windows 上
 // 跳过，但"失败时把 CLI 自报原因拼进错误"这件事恰恰只在 Windows 上复现过——跳过就等于

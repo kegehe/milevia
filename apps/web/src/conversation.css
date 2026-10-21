@@ -180,6 +180,38 @@
 }
 .message-copy.copied::after { display: none; }
 
+/* ---- 回合回退入口（时间线上的节点）---------------------------------------- */
+/* 节点属于"这一轮"，所以入口跟着产生它的那条用户消息走：右对齐、与用户消息同一列。
+   头部那份列表退成"浏览所有节点"的次要入口，主入口在用户眼前这一轮上。 */
+.message-checkpoint {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  /* 右边留出 18px：消息圆点轨道钉在 right:3px（z-index 10），贴着边缘放会被它压住点不中。 */
+  margin: 6px 18px 18px 42px;
+}
+.message-checkpoint small { color: #7b8f88; font-size: 11px; }
+.message-checkpoint.pending { justify-content: flex-end; margin-top: 4px; color: #93a49d; font-size: 11px; }
+.message-checkpoint-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #cfe0d6;
+  border-radius: 999px;
+  padding: 3px 10px 3px 8px;
+  color: #2c7567;
+  background: #f6fbf8;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+.message-checkpoint-button:hover:not(:disabled) { border-color: #8eb9aa; color: #1f6055; background: #eaf5ee; }
+.message-checkpoint-button:focus-visible { outline: 2px solid #2b7b68; outline-offset: 2px; }
+.message-checkpoint-button:disabled { color: #9aa9a3; border-color: #e4ece8; background: #f8fbf9; }
+.message-checkpoint-icon { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
 /* ---- 工具卡片 ------------------------------------------------------------ */
 .tool-meta { display: flex; align-items: center; gap: 8px; }
 .tool-status.failed { color: #a84130; background: #ffe7e2; }
@@ -2293,15 +2325,35 @@ button.mcp-tile:hover { transform: translateY(-1px); box-shadow: 0 0 0 3px #2c75
   white-space: nowrap;
 }
 .branch-pill:disabled { cursor: wait; opacity: .7; }
-.branch-chevron { margin-left: 2px; font-size: 12px; line-height: 1; }
-.branch-menu { position: absolute; z-index: 20; top: calc(100% + 5px); right: 0; min-width: 190px; padding: 5px; border: 1px solid #cbe1d5; border-radius: 6px; background: #fff; box-shadow: 0 8px 22px #24483a22; }
-.branch-menu-title { padding: 5px 8px 6px; color: #748b81; font-size: 10px; font-weight: 700; }
-.branch-menu button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; border: 0; border-radius: 4px; padding: 7px 8px; color: #315e50; background: transparent; font: inherit; font-size: 11px; text-align: left; cursor: pointer; }
-.branch-menu button:hover:not(:disabled) { background: #e2f4ea; }
-.branch-menu button.current { color: #17634f; background: #edf8f1; }
-.branch-menu button:disabled { cursor: default; opacity: .65; }
-.branch-menu small { color: #748b81; font-size: 10px; }
-.branch-menu-empty { padding: 8px; color: #8a8a84; font-size: 11px; }
+/* 箭头不设 color：随胶囊文字色走（正常绿 / detached 琥珀 / hover 加深），钉死会在 detached 里混进绿。 */
+.branch-chevron { display: inline-flex; margin-left: 2px; }
+.branch-chevron svg { width: 10px; height: 10px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; transition: transform 140ms ease; }
+.branch-chevron.open svg { transform: rotate(180deg); }
+/* ── 分支状态卡（方案 C）：胶囊在页面最底行，向下弹会整卡跑出视口——必须 bottom 锚定向上弹。
+   上半是当前分支详情（短 SHA / ↑↓ / 未提交改动，全是服务端算好的读数）+「查看改动」直达
+   Git 工作台；分隔线以下才是切换列表。状态类的悬停/禁用逐条显式写，别靠继承。 ── */
+.branch-card { position: absolute; z-index: 20; bottom: calc(100% + 8px); left: 0; width: 300px; max-width: calc(100vw - 40px); padding: 12px; border: 1px solid #cbe1d5; border-radius: 10px; background: #fff; box-shadow: 0 -10px 28px #24483a17, 0 12px 30px #24483a24; }
+.bc-label { margin-bottom: 7px; color: #748b81; font-size: 10px; font-weight: 700; letter-spacing: .05em; }
+.bc-head { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.bc-head svg { width: 14px; height: 14px; flex: none; fill: none; stroke: #2c7567; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.bc-branch { overflow: hidden; color: #23463b; font-size: 14px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.bc-sha { flex: none; padding: 2px 5px; border-radius: 4px; background: #f2f5f3; color: #809188; font-family: Consolas, monospace; font-size: 10.5px; }
+.bc-stats { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0 10px; }
+.bc-stats .stat { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 10px; background: #f2f5f3; color: #4c6b60; font-size: 10.5px; font-weight: 700; white-space: nowrap; }
+.bc-stats .stat.amber { background: #fdf0d4; color: #8a5a22; }
+.bc-actions { display: flex; margin-bottom: 10px; }
+.bc-btn { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #bcd9cb; border-radius: 6px; padding: 5px 10px; color: #286756; background: #edf7f1; font: inherit; font-size: 10.5px; font-weight: 700; cursor: pointer; transition: background 160ms ease; }
+.bc-btn:hover { background: #ddf1e5; }
+.bc-btn svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.bc-div { margin: 0 -12px 8px; border: 0; border-top: 1px solid #e3ece7; }
+.bc-row { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; overflow: hidden; border: 0; border-radius: 5px; padding: 7px 9px; color: #315e50; background: transparent; font: inherit; font-size: 11px; font-weight: 600; text-align: left; cursor: pointer; white-space: nowrap; }
+.bc-row:hover:not(:disabled) { background: #e2f4ea; }
+.bc-row.current { color: #17634f; background: #edf8f1; }
+.bc-row:disabled { cursor: default; opacity: .65; }
+.bc-row .name { display: inline-flex; min-width: 0; overflow: hidden; align-items: center; gap: 7px; }
+.bc-check { flex: none; color: #2c7567; font-weight: 800; }
+.bc-row small { flex: none; color: #748b81; font-size: 10px; }
+.bc-empty { padding: 8px; color: #8a8a84; font-size: 11px; }
 /* 指针与悬停只给**可点的**那颗：读取中那一档是 <span>（没有 onClick），
    给它 pointer + 悬停换色等于许诺一个点不动的按钮。 */
 button.branch-pill { cursor: pointer; }

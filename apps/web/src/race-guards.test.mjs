@@ -68,7 +68,7 @@ test("orchestration workspace exposes plan, queue and decision controls without 
   assert.match(orchestrationPage, /function candidateSummary\(task: Task\)/);
   assert.match(orchestrationPage, /const summary = candidateSummary\(task\); return <li key=\{task\.id\}><label title=\{summary\}>/);
   assert.doesNotMatch(orchestrationPage, /候选任务[\s\S]*?未命名任务/);
-  assert.match(orchestrationPage, /if \(await queueAction\([\s\S]*?setSelectedEnqueue\(new Set\(\)\);/);
+  assert.match(orchestrationPage, /const ok = await queueAction\("add-tasks"[\s\S]*?if \(ok\) setSelectedEnqueue\(new Set\(\)\);/);
   assert.match(orchestrationPage, /id="workspace-panel-orchestration"[\s\S]*?role="tabpanel"[\s\S]*?aria-labelledby="workspace-tab-orchestration"/);
   assert.match(orchestrationStyles, /\.orchestration-queue \.orchestration-queue-actions button\s*\{[^}]*width:\s*21px;[^}]*min-height:\s*21px;/s);
 	assert.match(orchestrationStyles, /\.orchestration-head-actions \{ flex-wrap: wrap; \}/);
@@ -88,7 +88,7 @@ test("orchestration workspace loads complete history and keeps a single-column m
   // 但「选中项在刷新时也要拉一次最新历史」这层意图不变。
   assert.match(orchestrationPage, /if \(selected && needsRefresh\(selected\)\) void loadSelected\("latest"\)/);
   const conversationPanel = orchestrationPage.match(/<main className="orchestration-conversation">[\s\S]*?<\/main>/)?.[0] || "";
-  assert.match(conversationPanel, /<h2>完整对话<\/h2>/);
+  assert.match(conversationPanel, /<h2>执行对话<\/h2>/);
   assert.doesNotMatch(conversationPanel, /<section className="orchestration-timeline">/);
   assert.match(orchestrationPage, /import "\.\.\/conversation\.css";/);
   assert.match(orchestrationPage, /<section className="timeline orchestration-conversation-timeline">/);
@@ -100,10 +100,9 @@ test("orchestration workspace loads complete history and keeps a single-column m
   assert.match(conversationPanel, /className="run-indicator orchestration-run-indicator" role="status"/);
   assert.match(orchestrationPage, /function ScrollNavigationIcon\(\{ direction \}: \{ direction: "top" \| "previous" \| "next" \| "bottom" \}\)/);
   assert.match(conversationPanel, /className="scroll-buttons orchestration-scroll-buttons"/);
-  assert.match(conversationPanel, /title="回到顶部"/);
-  assert.match(conversationPanel, /title="上一条我的消息"/);
-  assert.match(conversationPanel, /title="下一条我的消息"/);
+  // 滚动按钮精简成「回到底部」一颗：对话默认跟随最新，跳到某条自己消息的需求交给对话页。
   assert.match(conversationPanel, /title="回到底部"/);
+  assert.doesNotMatch(conversationPanel, /title="回到顶部"|title="上一条我的消息"|title="下一条我的消息"/);
   assert.match(orchestrationPage, /<aside className="orchestration-detail"[\s\S]*?<section className="orchestration-timeline">/);
   assert.match(orchestrationStyles, /\.orchestration-page \{ display: flex; height: 100%; min-height: 0; flex-direction: column; overflow: hidden; \}/);
   assert.match(orchestrationStyles, /\.orchestration-console \{ min-height: 0; flex: 1 1 0; grid-template-rows: minmax\(0, 1fr\); overflow: hidden; \}/);

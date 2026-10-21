@@ -231,6 +231,17 @@ export default function McpManagerPage() {
   const [saving, setSaving] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<MCPServer | null>(null);
   const [deleting, setDeleting] = useState(false);
+  // 连接卡「复制 ▾」下拉：存 server.id（null = 全部收起）。单态驱动，打开另一张卡自然收起前一张。
+  const [copyMenuId, setCopyMenuId] = useState<string | null>(null);
+  // 菜单开着时 Escape 也能收（背板只接鼠标点击）。
+  useEffect(() => {
+    if (!copyMenuId) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setCopyMenuId(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [copyMenuId]);
+  // 开关防连点：切换请求在途时只禁用那一张卡的开关（状态真值在服务端，重试走下一次点击）。
+  const [togglingId, setTogglingId] = useState<string | null>(null);
   const [autoApproveConfirm, setAutoApproveConfirm] = useState(false);
   const [projectView, setProjectView] = useState<MCPProjectView | null>(null);
   const [viewProjectId, setViewProjectId] = useState("");
@@ -414,6 +425,7 @@ export default function McpManagerPage() {
   };
 
   const startEdit = (server: MCPServer) => {
+    setCopyMenuId(null);
     setCustomNameNotice("");
     setEditingId(server.id);
     setForm(formFromServer(server));
@@ -922,17 +934,21 @@ export default function McpManagerPage() {
   };
 
   const toggleEnabled = async (server: MCPServer) => {
+    setTogglingId(server.id);
     try {
       await api(`/api/mcp/servers/${server.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !server.enabled }) });
       await loadServers();
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "更新失败");
+    } finally {
+      setTogglingId(null);
     }
   };
 
   // 连接测试：在目标环境真实拉起 server 并列出工具。授权前先看清 server 声称能做什么，
   // 是抵御工具投毒最有效的一环。
   const openTest = (server: MCPServer) => {
+    setCopyMenuId(null);
     setTestTarget(server);
     setTestEnvironment(server.environments[0] || "windows");
     setTestResult(null);
@@ -1021,6 +1037,7 @@ export default function McpManagerPage() {
   // —— P2：远程授权（OAuth 2.1 + PKCE） ——
 
   const openOAuth = async (server: MCPServer) => {
+    setCopyMenuId(null);
     oauthCancelRef.current?.abort();
     oauthCancelRef.current = null;
     const version = ++oauthViewVersion.current;
@@ -1269,19 +1286,36 @@ export default function McpManagerPage() {
           {loading ? <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在读取…</p>
             : servers.length === 0 && serversError ? <div className="mcp-empty mcp-read-fail" role="alert"><b>读不到服务列表</b><button className="secondary" type="button" onClick={() => void loadServers()}>重试</button></div>
             : servers.length === 0 ? <div className="mcp-empty"><b>还没有配置任何服务</b><span>从下面的目录里挑一个，点「连接」按提示走完就行。</span></div>
-            : <div className="ssh-connection-list mcp-conn-list">{servers.map((server) => <article className={`ssh-connection-card is-${server.enabled ? "connected" : "unknown"}`} key={server.id}>
-              <div className="ssh-connection-main">
-                <span className="ssh-status"><i></i>{server.source === "oauth-pending" ? "待完成授权与验证" : (server.enabled ? "已启用" : "已停用")}</span>
-                <h3><span className="mcp-service-mark"><ServiceLogo service={server.name} fallback={<PresetIcon name={presetIconKey(server.name, presets)} />} /></span>{server.displayName || server.name}</h3>
-                <p>{server.envSecretKeys?.length || server.headerSecretKeys?.length ? "已保存凭据" : server.transport === "stdio" ? "在本机运行" : "远程服务"}{server.scope === "project" ? ` · 仅用于「${projectName.get(server.projectId || "") || server.projectId}」` : ""}</p>
+            : <div className="ssh-connection-list mcp-conn-list">{servers.map((server) => <article className="ssh-connection-card mcp-conn-card" key={server.id}>
+              <div className="mcp-conn-head">
+                <span className="mcp-conn-mark"><ServiceLogo service={server.name} fallback={<PresetIcon name={presetIconKey(server.name, presets)} />} /></span>
+                <div className="mcp-conn-title">
+                  <h3>{server.displayName || server.name}</h3>
+                  <p>{server.transport === "stdio" ? "在本机运行" : "远程服务"}</p>
+                </div>
+                <span className={`mcp-conn-pill${server.source === "oauth-pending" ? " is-pending" : server.enabled ? "" : " is-off"}`}>{server.source === "oauth-pending" ? "待完成授权与验证" : (server.enabled ? "已启用" : "已停用")}</span>
               </div>
-              <div className="ssh-connection-actions">
-                <button className="ssh-action-button mcp-test-button" type="button" title="测试连接" aria-label={`测试 ${server.name}`} onClick={() => openTest(server)}>测试</button>
-                <div className="mcp-copy-actions"><button className="ssh-action-button" type="button" title="复制 Claude 脱敏设置" aria-label={`复制 ${server.name} 的 Claude 设置`} onClick={() => void copyServerConfig(server, "claude")}>复制 Claude</button><button className="ssh-action-button" type="button" title="复制单个 MCP 脱敏设置" aria-label={`复制 ${server.name} 的单个设置`} onClick={() => void copyServerConfig(server, "single")}>复制单个</button></div>
+              {(server.envSecretKeys?.length || server.headerSecretKeys?.length || server.scope === "project") ? <p className="mcp-conn-meta">
+                {(server.envSecretKeys?.length || server.headerSecretKeys?.length) ? "已保存凭据" : ""}{server.scope === "project" ? `${(server.envSecretKeys?.length || server.headerSecretKeys?.length) ? " · " : ""}仅用于「${projectName.get(server.projectId || "") || server.projectId}」` : ""}
+              </p> : null}
+              <div className="mcp-conn-foot">
+                <button className="ssh-action-button is-primary" type="button" title="测试连接" aria-label={`测试 ${server.name}`} onClick={() => openTest(server)}>测试</button>
+                <div className="mcp-copy-wrap">
+                  <button className="ssh-action-button" type="button" title="复制脱敏设置" aria-haspopup="menu" aria-expanded={copyMenuId === server.id} onClick={() => setCopyMenuId(copyMenuId === server.id ? null : server.id)}>复制<svg className="mcp-copy-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></button>
+                  {copyMenuId === server.id && <>
+                    <div className="mcp-menu-backdrop" onClick={() => setCopyMenuId(null)} />
+                    <div className="mcp-copy-menu" role="menu">
+                      <button type="button" role="menuitem" onClick={() => { setCopyMenuId(null); void copyServerConfig(server, "claude"); }}>复制 Claude 设置<small>脱敏</small></button>
+                      <button type="button" role="menuitem" onClick={() => { setCopyMenuId(null); void copyServerConfig(server, "single"); }}>复制单个设置<small>脱敏</small></button>
+                    </div>
+                  </>}
+                </div>
                 {server.transport !== "stdio" && <button className="ssh-action-button" type="button" title="OAuth 授权" aria-label={`授权 ${server.name}`} onClick={() => void openOAuth(server)}>授权</button>}
-                <button className="ssh-action-button" type="button" title={server.enabled ? "停用" : "启用"} aria-label={`切换 ${server.name}`} onClick={() => void toggleEnabled(server)}>{server.enabled ? "停用" : "启用"}</button>
-                <button className="ssh-action-button" type="button" title="管理" aria-label={`管理 ${server.name}`} onClick={() => startEdit(server)}><EditIcon /></button>
-                <button className="ssh-action-button danger" type="button" title="删除" aria-label={`删除 ${server.name}`} onClick={() => setDeleteTarget(server)}><TrashIcon /></button>
+                <span className="mcp-foot-push" />
+                <span className="mcp-conn-switch-label">{server.enabled ? "启用" : "停用"}</span>
+                <button className="mcp-conn-switch" type="button" role="switch" aria-checked={server.enabled} aria-label={server.enabled ? `停用 ${server.name}` : `启用 ${server.name}`} title={server.enabled ? "停用" : "启用"} disabled={togglingId === server.id} onClick={() => void toggleEnabled(server)} />
+                <button className="ssh-action-button is-icon" type="button" title="管理" aria-label={`管理 ${server.name}`} onClick={() => startEdit(server)}><EditIcon /></button>
+                <button className="ssh-action-button is-icon danger" type="button" title="删除" aria-label={`删除 ${server.name}`} onClick={() => { setCopyMenuId(null); setDeleteTarget(server); }}><TrashIcon /></button>
               </div>
             </article>)}</div>}
         </section>

@@ -5,12 +5,15 @@ import remarkGfm from "remark-gfm";
 import { api, asRecord } from "../lib/api";
 import { isDesktop } from "../lib/runtime";
 import { copyToClipboard } from "../lib/clipboard";
+// 回退的文案与"默认发哪个 mode"与桌面端共用一份：回退不可撤销，两端不能各说一套。
+import { rewindConfirmMessage, rewindConfirmTitle, rewindHint, rewindPrimaryMode } from "../lib/conversation-rewind";
+import { dropAfterCutoff } from "../lib/conversation-cutoff";
 import { DEVICE_ALIAS_MAX_LENGTH, activeDevice, deviceDisplayName, deviceLabel, devicePlatform, markDeviceRevoked, normalizeAlias, readActiveToken, readDevices, type MobileDevice } from "../lib/mobile-devices";
 import { MOBILE_PROJECT_ORDER_STORAGE_KEY, dismissMobileDragHint, persistOrder, readMobileDragHint, sortProjectIds } from "../lib/project-order";
 import { useCardDragReorder } from "../lib/use-card-drag";
 import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval } from "../lib/timeline";
 import { NON_GIT_BRANCH } from "../lib/types";
-import type { SystemVariant, PermissionMode } from "../lib/types";
+import type { ConversationCheckpoint, SystemVariant, PermissionMode } from "../lib/types";
 import { AgentLogo } from "../components/AgentLogo";
 import { ExternalLink } from "../components/ExternalLink";
 import type { AgentLogoKey } from "../lib/cli-tools-view";
@@ -120,7 +123,7 @@ type RemoteNotice = {
   // 缺省 = 同 id 视为重复，保留先到的那条。
   merge?: "append" | "replace";
 };
-type RemoteConversation = { id: string; title: string; status: string; agentId: string; lastActivityAt: string; isCurrent: boolean; messages: Message[]; notices?: RemoteNotice[]; isOrchestration?: boolean };
+type RemoteConversation = { id: string; title: string; status: string; agentId: string; lastActivityAt: string; isCurrent: boolean; messages: Message[]; notices?: RemoteNotice[]; isOrchestration?: boolean; messagesCutoff?: string; messagesVisibleAfter?: string };
 type RemoteConversationIndex = Omit<RemoteConversation, "messages" | "notices"> & { preview?: string };
 type RemoteAgentStatus = { id: string; status: "ready" | "unavailable" | "updating" | "unsupported"; version?: string; reason?: string };
 // 电脑端数据库里的「常用提示词 / 常用命令」条目。字段与 control-server 的 Shortcut 一一对应
@@ -421,6 +424,16 @@ function HeaderMenuItemIcon({ kind }: { kind: "files" | "git" | "history" | "que
 // 卡死可比多一次无害的请求糟得多。
 const conversationStopFallbackMs = 60_000;
 
+// 会话回退（节点）的两条中继调用时限。
+//   · 读列表：与其它读操作同档，几百毫秒级；超时当作"没有节点"，不打断用户。
+//   · 回退：电脑端要退休长驻进程、把代码快照回写（真回退还会删掉快照之后新建的文件），
+//     大工作区是秒级 —— 给足预算，别让手机端在半路放弃而用户以为没生效。
+const checkpointRPCTimeoutMs = 20_000;
+// ⚠️ 上限不是我们说了算：手机请求经 relays 到电脑端，agent 自己的 http.Client 是 60 秒硬超时
+// （apps/agent/internal/agent/agent.go），比 60 秒更长只会换来一句"读不到本机服务"——
+// 而电脑端其实正在恢复。留 5 秒余量，超时后提示"回退可能仍在电脑端继续"。
+const checkpointRewindRPCTimeoutMs = 55_000;
+
 // 「＋」面板里的技能分组。来源键与桌面端 ConversationPage 的 skillSourceMeta 完全一致，
 // 顺序也照抄（项目 > 用户 > 系统/官方），两端看到的技能分组不会长得不一样。
 const skillSourceOrder = ["project", "user", "plugin"];
@@ -511,13 +524,15 @@ function transientReason(message: Message, action: "row" | "quote" | "resend"): 
 //   ③ 图标本身取通用形状（复制=重叠方块、引用=左侧竖条＋正文线、重发=回卷箭头）。
 // 画 30px、靠 ::after 外扩 7px 补到 44×44 热区 —— 与「⋯」同一档；**相邻两颗的间距因此
 // 必须是 14px**（外扩 7+7），小于它两颗热区就互相压住，点左边实际命中右边。
-function MessageActionIcon({ kind }: { kind: "copy" | "quote" | "resend" | "copied" | "failed" }) {
+function MessageActionIcon({ kind }: { kind: "copy" | "quote" | "resend" | "rewind" | "copied" | "failed" }) {
   if (kind === "copy") return <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.2" /><path d="M15 5.5H6.5A2.5 2.5 0 0 0 4 8v8.5" /></svg>;
   // 复制成功的就地反馈：图标从"两个方块"变成勾。文字版（旧面板那行「已复制」）没有了，
   // 这里就必须让图标自己变 —— 只有颜色变化对色觉障碍用户等于没反馈。
   if (kind === "copied") return <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path className="mobile-action-check" d="M4.5 12.5 9.5 17.5 19.5 7" /></svg>;
   if (kind === "failed") return <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 6.5v7.5" /><path d="M12 17.6v.1" /></svg>;
   if (kind === "quote") return <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><rect x="3.4" y="5" width="2.6" height="14" rx="1.3" fill="currentColor" stroke="none" /><path d="M9.6 8h11" /><path d="M9.6 12h11" /><path d="M9.6 16h6.4" /></svg>;
+  // 回退：撤销箭头，与桌面端头部/时间线上那一支同形（两端同一个动作就该是同一个符号）。
+  if (kind === "rewind") return <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M4.6 9.4h9.6a4.7 4.7 0 0 1 0 9.4H9.4" /><path d="M8.2 5.8 4.6 9.4l3.6 3.6" /></svg>;
   return <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5A5.5 5.5 0 0 1 20 14.5V20" /></svg>;
 }
 
@@ -1318,6 +1333,12 @@ export default function MobileRemotePage() {
   // （点通知、侧滑返回再进另一个项目）。只存"开没开"，确认那一刻按下去的就会是**屏幕上那条**
   // ——而「强制停止」会把那条会话正在跑的连同排队中的一起取消掉，停错一条是会造成实际损失的。
   const [stopConfirmTarget, setStopConfirmTarget] = useState("");
+  // 会话回退节点：手机端只读列表 + 按 id 回退（都是电脑端那条服务端路径，不另写判据）。
+  // 节点是"某一轮跑完之后"，所以入口挂在产生它的那条用户消息的 ⋯ 菜单里，与桌面端同构。
+  const [conversationCheckpoints, setConversationCheckpoints] = useState<ConversationCheckpoint[]>([]);
+  // 存节点对象而不是 id：确认框要拿它的提示词、有没有代码快照、以及这一轮之后还剩几轮。
+  const [rewindTarget, setRewindTarget] = useState<ConversationCheckpoint | null>(null);
+  const [rewinding, setRewinding] = useState(false);
   const [error, setError] = useState("");
   // 通知权限的初值。两条通道，判定与理由见 lib/mobile-notify.ts 顶部：
   //   · 原生包（Capacitor）：@capacitor/local-notifications 的**本地通知** —— App 自己把
@@ -2327,6 +2348,9 @@ export default function MobileRemotePage() {
     messages: remoteHistoryMessages,
     index: remoteConversationIndex,
     merge: mergeRemoteMessages,
+    // 历史分页的本地缓存同样要按节点可见性滤：电脑端回退之后，这台手机缓存里被丢掉的那几轮
+    // 不会自己消失（这条会话也可能不在快照的 top-N 里，那时快照给不了 cutoff）。
+    filterRewound: (messages, cutoff, visibleAfter) => dropAfterCutoff(messages, cutoff, visibleAfter),
   });
   // 界面上看到的项目列表 = 服务端快照 + 还没被电脑端确认的本地改动。
   //
@@ -2432,7 +2456,10 @@ export default function MobileRemotePage() {
       return {
         ...item,
         ...snapshotItem,
-        messages: mergeRemoteMessages(page?.messages || [], snapshotItem?.messages || []),
+        // 本地历史页 ∪ 快照，再按节点可见性滤一遍：历史页读过一次就留在本地缓存里，
+        // 光靠服务端过滤快照挡不住它 —— 电脑端（或另一台手机）回退之后，这台手机的缓存里
+        // 仍然是被丢掉的那几轮，屏幕上就会继续显示它们。
+        messages: dropAfterCutoff(mergeRemoteMessages(page?.messages || [], snapshotItem?.messages || []), snapshotItem?.messagesCutoff, snapshotItem?.messagesVisibleAfter),
         notices: snapshotItem?.notices,
         title: `${(snapshotItem?.title || item.title || "未命名会话")} · ${conversationAgentLabel(snapshotItem?.agentId || item.agentId)}`,
       };
@@ -2477,6 +2504,28 @@ export default function MobileRemotePage() {
         body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
       }, undefined, timeoutMs);
   }, [instanceID, project?.id, conversation?.id, conversationPending]);
+
+  // ── 会话回退（节点）───────────────────────────────────────────────────────
+  // 节点列表由电脑端算，手机端只读；回退也走电脑端那条服务端路径（中继上的
+  // conversation.rewind），两端共用同一份判据与文案。
+  const checkpointByRun = useMemo(() => {
+    const map = new Map<string, ConversationCheckpoint>();
+    conversationCheckpoints.forEach((checkpoint) => { if (checkpoint.runId) map.set(checkpoint.runId, checkpoint); });
+    return map;
+  }, [conversationCheckpoints]);
+  const loadCheckpoints = useCallback(async () => {
+    const target = conversation?.id || "";
+    if (!target || conversationPending) { setConversationCheckpoints([]); return; }
+    try {
+      const reply = await rpcTransport("conversation.checkpoints", {}, checkpointRPCTimeoutMs);
+      // 读不到就当作"这条会话还没有节点"：入口不出现，而不是弹一句错打断用户 ——
+      // 回退是可选动作，它的列表读失败不该影响读消息。
+      if (!reply.ok) return;
+      if (selectedConversationRef.current !== target) return; // 回包跨了会话就丢掉
+      const data = reply.data as { checkpoints?: ConversationCheckpoint[] } | undefined;
+      setConversationCheckpoints(data?.checkpoints || []);
+    } catch { /* 同上：读不到当作没有节点 */ }
+  }, [conversation?.id, conversationPending, rpcTransport]);
   const activateSharedConversation = useCallback(async (projectID: string, conversationID: string) => {
     if (!projectID || !conversationID || isPendingConversationID(conversationID)) return false;
     const reply = await remoteConversationRPC(projectID, conversationID, "conversation.activate", {}, 20_000);
@@ -2616,6 +2665,12 @@ export default function MobileRemotePage() {
 
   const messageActionOpen = conversationTimeline.some((entry) => entry.kind === "message" && entry.message.id === messageActionId);
   const conversationProcessing = Boolean(conversation && (conversation.status === "running" || processingConversations[conversation.id]));
+  // 节点是电脑端在"run 成功结束"之后才生成的，所以除了换会话，还要在**这条会话不再在跑**
+  // 的那一刻重读一次；否则刚跑完的那一轮永远不会出现在菜单里。
+  useEffect(() => {
+    if (!conversation?.id || conversationPending) { setConversationCheckpoints([]); return; }
+    void loadCheckpoints();
+  }, [conversation?.id, conversationPending, conversationProcessing, loadCheckpoints]);
   // ── 状态条的三份读数（徽标 / 阶段词 / 已耗时）────────────────────────────────
   //
   // ⚠️ 时间基准取 `processingConversations[id].startedAt` —— 这个字段原先**只写不读**
@@ -2651,7 +2706,7 @@ export default function MobileRemotePage() {
   // 少了这一句：在 A 上点了停止、再切到也在跑的 B，B 的停止键会显示「停止中」并被禁掉
   // 好几秒 —— 用户看着一条自己没停过的会话停在"停止中"，只能等。确认框同理，
   // 它是挂在 A 上的（见 stopConfirmTarget 的说明），换到 B 就该消失而不是留在屏上。
-  useEffect(() => { setStoppingConversation(false); setStopConfirmTarget(""); }, [conversation?.id]);
+  useEffect(() => { setStoppingConversation(false); setStopConfirmTarget(""); setRewindTarget(null); }, [conversation?.id]);
   // 兜底放开（见 conversationStopFallbackMs）：正常路径是上面那个 effect 摘掉它，
   // 这一条只是保证"没有任何人摘"时按钮也会自己活过来。
   useEffect(() => {
@@ -2791,6 +2846,9 @@ export default function MobileRemotePage() {
       // 漏掉这一句，返回键会一路退掉会话层，而确认框还浮在项目列表上、「强制停止」仍可点 ——
       // 那一下会真的把电脑端正在跑的任务连同排队请求一起取消掉。
       if (stopConfirmTarget) { setStopConfirmTarget(""); return true; }
+      // 「回退到此处」确认框同理（它也是 position: fixed 的一层）：漏掉这一句，返回键会一路
+      // 退掉会话层，而「确认回退」仍可点 —— 那一下会真的改掉电脑端的工作区文件。
+      if (rewindTarget) { setRewindTarget(null); return true; }
       // 「备注」弹层是设备面板**之上**的一层（z-index 30 > 面板的 20）。必须排在
       // `devicesOpen` **之前** —— 排在后面时返回键会先把整个面板收掉，而弹层还浮在
       // 项目列表上（与 confirmUnbind 同一条成因，实测过同一个形状）。
@@ -4438,6 +4496,42 @@ export default function MobileRemotePage() {
   //      用户会以为没生效而反复点（第二次点会落在已经停掉的那一轮上）。
   //   ② 收尾**不靠**这个请求的响应，而等 conversationProcessing 转 false（见上面那个 effect）：
   //      响应说的是"电脑端开始停了"，不是"已经停了"。
+  // 回退到这个节点会丢几轮：数这条会话里比它晚的顶层用户消息。入口的小字、确认框、
+  // 以及"回退中"的进度都用同一个判据，不各算一遍。
+  function rewindDiscardedTurns(checkpoint: ConversationCheckpoint): number {
+    const at = Date.parse(checkpoint.createdAt) || 0;
+    return conversationTimeline.filter((entry) => entry.kind === "message" && entry.message.role === "user" && (Date.parse(entry.message.createdAt) || 0) > at).length;
+  }
+
+  // 回退到某个节点。目标由**调用方钉死**（确认框里的那个节点），与停止同一条理由：
+  // 往返期间用户完全可能已经切到别的会话，而回退会真的改掉电脑端的工作区文件。
+  async function confirmRewind() {
+    const target = rewindTarget;
+    if (!target || rewinding) return;
+    const projectID = project?.id || "";
+    if (!projectID || conversation?.id !== target.conversationId) { setRewindTarget(null); return; }
+    // 回退按节点落在**哪条会话**上由服务端按 checkpointId 自己认（它校验节点属于该会话），
+    // 这里只保证发出去时还站在同一条会话上。
+    // 不再弹第二道 window.confirm：确认框本身就是"回退到此处"的确认层（标题 + 代价 + 确认键），
+    // 再套一层原生弹窗等于让用户对同一个动作确认两次，而且手机端别处从不使用原生 confirm。
+    const request = { mode: rewindPrimaryMode(target), discarded: rewindDiscardedTurns(target) };
+    setRewindTarget(null);
+    setRewinding(true);
+    try {
+      const reply = await rpcTransport("conversation.rewind", { checkpointId: target.id, mode: request.mode }, checkpointRewindRPCTimeoutMs);
+      if (!reply.ok) { setError(reply.error || "回退失败"); return; }
+      // 回退改了电脑端的工作区与对话（消息按节点时间被隐藏）：必须重读权威快照与这条会话的
+      // 历史，否则手机端还停在旧内容上 —— 用户会以为回退没生效。
+      void loadSnapshot({ force: true });
+      void loadConversationHistory(projectID, target.conversationId);
+      void loadCheckpoints();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "回退失败");
+    } finally {
+      setRewinding(false);
+    }
+  }
+
   async function stopConversationRun(force: boolean, target: string) {
     // 目标会话由**调用方**钉死（而不是函数里读屏幕上那条）：确认框可能是几秒前挂在 A 上开的，
     // 而「强制停止」会把目标那条会话正在跑的连同排队中的一起取消 —— 停错一条是真的会丢工作。
@@ -4911,6 +5005,9 @@ export default function MobileRemotePage() {
     // 「强制停止」确认框同理，而且它的「强制停止」会真的取消电脑端正在跑的请求（含排队中的）。
     // 这条链**不走 backHandlerRef**，所以两处都要收（与上面那几个弹层同一条纪律）。
     setStopConfirmTarget("");
+    // 「回退到此处」确认框同理：它的「确认回退」会真的改掉电脑端的工作区文件（还会删掉
+    // 快照之后新建的文件）—— 漏掉这一行，侧滑退回项目列表后那颗按钮仍然可点。
+    setRewindTarget(null);
     // 「备注」弹层同样：fixed backdrop（z-index 30，比面板更高），侧滑返回时必须在这里收，
     // 否则回到项目列表后它还浮在屏上。这条链**不走 backHandlerRef**，两处必须一致。
     closeAliasEditor();
@@ -5149,6 +5246,10 @@ export default function MobileRemotePage() {
   // 的判据在纯模块里，页面只负责把年龄递给它。
   const phoneSync = phoneSyncView(boundPhone, phoneSyncAgeMs);
   const boundPhonePlatform = platformLabel(boundPhone?.platform);
+
+  // 确认框要用的两样：默认动作（有代码快照就一起恢复）与"会丢几轮"。渲染期算一次，
+  // 别在标题、正文、按钮三处各算一遍。
+  const rewindRequest = rewindTarget ? { mode: rewindPrimaryMode(rewindTarget), discarded: rewindDiscardedTurns(rewindTarget) } : null;
 
   return <main className={`mobile-remote${mobileApp ? "" : " desktop-remote"} ${mobileApp && mobileView === "conversation" ? "mobile-conversation-mode" : ""}${showConversationEmpty ? " mobile-empty-mode" : ""}`}>
     {editingTask && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-task-edit-title"><form className="mobile-task-modal" onSubmit={(event) => void saveTaskEdit(event)}><header><h2 id="mobile-task-edit-title">编辑任务</h2><button type="button" onClick={() => setEditingTask(null)} disabled={busy} aria-label="关闭">×</button></header><label>描述<textarea value={editDescription} onChange={(event) => setEditDescription(event.target.value)} required rows={4} /></label><MobilePriorityPicker name="mobile-task-edit-priority" value={editPriority} onChange={setEditPriority} />{editError && <p className="mobile-task-modal-error" role="alert">{editError}</p>}<footer><button type="button" onClick={() => setEditingTask(null)} disabled={busy}>取消</button><button type="submit" disabled={busy}>保存</button></footer></form></div>}
@@ -5463,6 +5564,11 @@ export default function MobileRemotePage() {
         同一句话 —— 文案本身在 lib/mobile-conversation-stop.ts 里钉死，两端逐字一致。
         与上面几个弹层同一套处理：backdrop 是 position: fixed 的一层，返回键优先收它
         （见 backHandlerRef —— 漏掉那句会让返回键一路退掉会话层，而「强制停止」仍可点）。 */}
+    {/* 回退确认。回退是**不可撤销**的破坏性动作（改工作区文件、可能删掉快照之后新建的文件），
+        所以不能像「停止」那样点了就走：文案在 lib/conversation-rewind 里与桌面端共用一份。
+        与上面几个弹层同一套处理：backdrop 是 position: fixed 的一层，返回键优先收它
+        （见 backHandlerRef —— 漏掉那句会让返回键一路退掉会话层，而「确认回退」仍可点）。 */}
+    {rewindTarget && rewindRequest && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-rewind-title"><section className="mobile-task-modal"><header><h2 id="mobile-rewind-title">{rewindConfirmTitle(rewindRequest)}</h2><button type="button" onClick={() => setRewindTarget(null)} disabled={rewinding} aria-label="关闭">×</button></header><p className="mobile-rewind-node">{rewindTarget.prompt.trim().replace(/\s+/g, " ").slice(0, 72) || "未命名回合"}</p><p>{rewindConfirmMessage(rewindTarget, rewindRequest)}</p><footer><button type="button" onClick={() => setRewindTarget(null)} disabled={rewinding}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmRewind()} disabled={rewinding}>{rewinding ? "回退中" : "确认回退"}</button></footer></section></div>}
     {stopConfirmTarget && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-stop-confirm-title"><section className="mobile-task-modal"><header><h2 id="mobile-stop-confirm-title">{conversationStopConfirmCopy.title}</h2><button type="button" onClick={() => setStopConfirmTarget("")} aria-label="关闭">×</button></header><p>{conversationStopConfirmCopy.message}</p><footer><button type="button" onClick={() => setStopConfirmTarget("")}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => { const target = stopConfirmTarget; setStopConfirmTarget(""); void stopConversationRun(true, target); }}>{conversationStopConfirmCopy.confirm}</button></footer></section></div>}
     {/* 「备注」弹层：给某一台电脑起/改/清一个**只在这台手机上生效**的名字。
         三个设计点：
@@ -5549,7 +5655,7 @@ export default function MobileRemotePage() {
       initialPath={filesInitialPath}
       onInitialPathConsumed={() => setFilesInitialPath(null)}
     /></section>}
-    {mobileApp && mobileView === "conversation" && project && !subHeaderActive && <section className="mobile-conversation"><div className="mobile-message-list" ref={messageListRef} data-empty={showConversationEmpty ? "true" : undefined}>{conversationTimeline.length ? conversationTimeline.map((entry, index) => entry.kind === "message" ? <article className={`mobile-message ${entry.message.role}`} key={entry.key} data-group={messageGroups.get(entry.key)} data-transient={isTransientMessage(entry.message) ? "true" : undefined} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} data-actions={messageActionId === entry.message.id ? "open" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><div className="mobile-message-head"><small>{entry.message.role === "user" ? "我" : "Agent"} · {messageTime(entry.message.createdAt)}{isStreamingMessage(entry.message) && <span className="mobile-message-writing" role="img" aria-label="正在写入"><i aria-hidden="true" /><i aria-hidden="true" /><i aria-hidden="true" /></span>}</small><div className="mobile-message-head-actions">{messageActionId === entry.message.id && <div className="mobile-message-actions" id={`mobile-message-actions-${index}`} ref={messageActionsRef} role="group" aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作${isTransientMessage(entry.message) ? `（${transientReason(entry.message, "row")}）` : ""}`}><button type="button" className="mobile-message-action-icon" data-copy-state={messageCopyState} aria-label={messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请重试" : "复制这条消息"} title="复制 Markdown 原文" onClick={() => void copyMessageBody(entry.message.content)}><MessageActionIcon kind={messageCopyState === "idle" ? "copy" : messageCopyState} /></button><span className="mobile-message-action-status" role="status" aria-live="polite">{messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请检查剪贴板权限" : ""}</span><button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label={`引用${entry.message.role === "user" ? "我" : "Agent"}这条消息到输入框`} title={isTransientMessage(entry.message) ? transientReason(entry.message, "quote") : "引用到输入框"} onClick={() => quoteMessage({ id: entry.message.id, role: entry.message.role, content: entry.message.content })}><MessageActionIcon kind="quote" /></button>{entry.message.role === "user" && <button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label="把这条消息的原文填回输入框" title={isTransientMessage(entry.message) ? transientReason(entry.message, "resend") : "填回输入框，改完再发"} onClick={() => resendMessage(entry.message.content)}><MessageActionIcon kind="resend" /></button>}</div>}<button type="button" className="mobile-message-more" aria-expanded={messageActionId === entry.message.id} aria-controls={messageActionId === entry.message.id ? `mobile-message-actions-${index}` : undefined} aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作`} title="更多操作" onClick={(event) => { if (messageActionId === entry.message.id) { closeMessageActions(); return; } openMessageActions(event.currentTarget, entry.message.id); }}>⋯</button></div></div><div className="mobile-message-markdown markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <MobileMarkdownLink href={href}>{children}</MobileMarkdownLink>, code: ({ className, children }) => <MobileInlineCode className={className} onOpenFile={openFiles}>{children}</MobileInlineCode> }}>{entry.message.content}</ReactMarkdown></div></article> : <article className={`mobile-notice mobile-notice-${entry.notice.variant}${entry.notice.state ? ` mobile-notice-${entry.notice.state}` : ""}`} key={entry.key} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><span className="mobile-notice-icon" aria-hidden="true">{noticeIcons[entry.notice.variant]}</span><div className="mobile-notice-text"><strong>{entry.notice.title}</strong>{entry.notice.detail && <small>{entry.notice.detail}</small>}</div>{noticeTime(entry.notice.createdAt) && <time className="mobile-notice-time">{noticeTime(entry.notice.createdAt)}</time>}</article>) : conversationEmpty}{conversationProcessing && runIndicatorVariant && <div className="mobile-agent-processing">{/* 裸行三格（2026-10-13 定稿）：动画图形位 / 阶段词 / 阶段计时，判据分别在
+    {mobileApp && mobileView === "conversation" && project && !subHeaderActive && <section className="mobile-conversation"><div className="mobile-message-list" ref={messageListRef} data-empty={showConversationEmpty ? "true" : undefined}>{conversationTimeline.length ? conversationTimeline.map((entry, index) => entry.kind === "message" ? <article className={`mobile-message ${entry.message.role}`} key={entry.key} data-group={messageGroups.get(entry.key)} data-transient={isTransientMessage(entry.message) ? "true" : undefined} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} data-actions={messageActionId === entry.message.id ? "open" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><div className="mobile-message-head"><small>{entry.message.role === "user" ? "我" : "Agent"} · {messageTime(entry.message.createdAt)}{isStreamingMessage(entry.message) && <span className="mobile-message-writing" role="img" aria-label="正在写入"><i aria-hidden="true" /><i aria-hidden="true" /><i aria-hidden="true" /></span>}</small><div className="mobile-message-head-actions">{messageActionId === entry.message.id && <div className="mobile-message-actions" id={`mobile-message-actions-${index}`} ref={messageActionsRef} role="group" aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作${isTransientMessage(entry.message) ? `（${transientReason(entry.message, "row")}）` : ""}`}><button type="button" className="mobile-message-action-icon" data-copy-state={messageCopyState} aria-label={messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请重试" : "复制这条消息"} title="复制 Markdown 原文" onClick={() => void copyMessageBody(entry.message.content)}><MessageActionIcon kind={messageCopyState === "idle" ? "copy" : messageCopyState} /></button><span className="mobile-message-action-status" role="status" aria-live="polite">{messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请检查剪贴板权限" : ""}</span><button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label={`引用${entry.message.role === "user" ? "我" : "Agent"}这条消息到输入框`} title={isTransientMessage(entry.message) ? transientReason(entry.message, "quote") : "引用到输入框"} onClick={() => quoteMessage({ id: entry.message.id, role: entry.message.role, content: entry.message.content })}><MessageActionIcon kind="quote" /></button>{entry.message.role === "user" && <button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label="把这条消息的原文填回输入框" title={isTransientMessage(entry.message) ? transientReason(entry.message, "resend") : "填回输入框，改完再发"} onClick={() => resendMessage(entry.message.content)}><MessageActionIcon kind="resend" /></button>}{entry.message.role === "user" && checkpointByRun.has(entry.message.runId || "") && <button type="button" className="mobile-message-action-icon" disabled={conversationProcessing || rewinding} aria-label="回退到这一轮结束时" title={conversationProcessing ? "这条会话正在跑，等这一轮结束后再回退" : rewindHint(checkpointByRun.get(entry.message.runId || "")!, rewindDiscardedTurns(checkpointByRun.get(entry.message.runId || "")!)) || "回退到这一轮结束时（代码与对话都回到这一刻）"} onClick={() => { const target = checkpointByRun.get(entry.message.runId || ""); closeMessageActions(); if (target) setRewindTarget(target); }}><MessageActionIcon kind="rewind" /></button>}</div>}<button type="button" className="mobile-message-more" aria-expanded={messageActionId === entry.message.id} aria-controls={messageActionId === entry.message.id ? `mobile-message-actions-${index}` : undefined} aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作`} title="更多操作" onClick={(event) => { if (messageActionId === entry.message.id) { closeMessageActions(); return; } openMessageActions(event.currentTarget, entry.message.id); }}>⋯</button></div></div><div className="mobile-message-markdown markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <MobileMarkdownLink href={href}>{children}</MobileMarkdownLink>, code: ({ className, children }) => <MobileInlineCode className={className} onOpenFile={openFiles}>{children}</MobileInlineCode> }}>{entry.message.content}</ReactMarkdown></div></article> : <article className={`mobile-notice mobile-notice-${entry.notice.variant}${entry.notice.state ? ` mobile-notice-${entry.notice.state}` : ""}`} key={entry.key} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><span className="mobile-notice-icon" aria-hidden="true">{noticeIcons[entry.notice.variant]}</span><div className="mobile-notice-text"><strong>{entry.notice.title}</strong>{entry.notice.detail && <small>{entry.notice.detail}</small>}</div>{noticeTime(entry.notice.createdAt) && <time className="mobile-notice-time">{noticeTime(entry.notice.createdAt)}</time>}</article>) : conversationEmpty}{conversationProcessing && runIndicatorVariant && <div className="mobile-agent-processing">{/* 裸行三格（2026-10-13 定稿）：动画图形位 / 阶段词 / 阶段计时，判据分别在
       lib/run-indicator.ts 与 lib/processing-indicator.ts —— 这一格里**不许再出现任何
       条件判断**，否则就是"服务端算了一套、界面又另判一套"。不加 role="status"：
       计时每秒在变，播报读屏反而成骚扰（图形本就 aria-hidden）。 */}

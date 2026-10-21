@@ -241,7 +241,8 @@ test("运行依赖那一行：读数与升级按钮同源，且授权门只挡�
   assert.match(code, /runtimeDepLine\(runtime, Boolean\(view\?\.remoteInstallAllowed\)\)/);
   assert.match(code, /const depAction = depLine\?\.action;/);
   assert.match(code, /\{depAction && <button/);
-  assert.match(code, /\{depAction\.label\}/);
+  // 按钮文案仍由模型给的 label 承担；只在**这一栏真的在装**时换成「安装中…」+ 转圈。
+  assert.match(code, /\{runtimeInstalling \? pendingActionText\(depAction\)\.button : depAction\.label\}/);
   // 动作种类**照模型给的发**，页面不自己写死一个 kind（否则将来依赖条长出第二种动作时，
   // TS 一声不响，页面照样发 install-runtime）。
   assert.match(code, /setPending\(\{ kind: depAction\.kind \}\)/);
@@ -267,7 +268,8 @@ test("运行依赖那一行：读数与升级按钮同源，且授权门只挡�
   assert.match(code, /\{runtime\?\.installed && runtime\.installSupported && !runtime\.npmVersion &&\s*<p className="cli-tools-note">/);
   assert.ok(!code.includes("!runtime.npmVersion && view?.remoteInstallAllowed"), "那条 npm 读数又被授权门整段挡掉了");
   assert.match(code, /\{view\?\.remoteInstallAllowed\s*\?\s*<button className="secondary"/);
-  assert.match(code, />重装<\/button>/);
+  // 重装入口还在，且它在**真的在装**时和上面那颗一样换成「安装中…」+ 转圈。
+  assert.match(code, /\{runtimeInstalling \? pendingActionText\(\{ kind: "install-runtime" \}\)\.button : "重装"\}/);
   // 收回按钮时照那条缘由说清为什么，不写第二份措辞。
   assert.match(code, /\{grantNeededReason\}（见上）。/);
 });
@@ -698,7 +700,7 @@ test("抽屉里不再重复给「登录」（两个入口做同一件事）", ()
 });
 
 
-// ── 长任务进行中：说清"在做什么、要多久、别再点" ────────────────────────────
+// ── 长任务进行中：说清"在做什么"，而且状态落在**发起它的那张卡**上 ─────────────
 //
 // 背景（2026-09-26 用户报）：点「升级 Claude Code」后界面报的是超时失败，而服务端其实
 // 升级成功了（审计里那条是 succeeded 2.1.266 → 2.1.282）。根因有两层，这里钉的是前端
@@ -706,39 +708,37 @@ test("抽屉里不再重复给「登录」（两个入口做同一件事）", ()
 // 界面是"弹窗关掉、按钮置灰、页面上什么都不说" —— docs/42 §1.1 把「长任务进度：要有
 // 进行中与结果」列为待补项，这一组断言就是补上的那一条。
 //
+// 2026-10-21 改口径：页面级那条「Windows：正在升级 X…」横幅去掉了 —— 它与卡片说的是
+// 同一件事，却额外占一行、还把环境名念两遍。现在进行中只由卡片自己表达：按钮换成
+// 「升级中…」+ 转圈，卡片边框轻抬一档。
+//
 // 超时预算那一层在 `api-timeout-retry.test.mjs`（长任务表）。
 
 test("进行中要说清在做什么，而不是只把按钮置灰", () => {
   // ① 有一档"正在跑"的状态，且它带得出**是哪一次操作**（光一个 busy 布尔说不出在忙什么），
   //    以及**跑在哪台机器上** —— 顶栏可以切执行环境，而操作还在原来那台上跑。
-  assert.match(code, /const \[running, setRunning\] = useState<\{ action: PendingAction; runnerID: string; runnerText: string \} \| null>\(null\)/);
-  assert.match(code, /setRunning\(\{ action, runnerID: selectedRunner, runnerText: environmentLabel \}\)/);
+  assert.match(code, /const \[running, setRunning\] = useState<\{ action: PendingAction; runnerID: string \} \| null>\(null\)/);
+  assert.match(code, /setRunning\(\{ action, runnerID: selectedRunner \}\)/);
   assert.match(code, /setRunning\(null\)/);
-  // 横幅用的环境名是**发起时捕获**的，不是现读选择框（后者在切环境后会说成新环境）。
-  assert.match(code, /pendingRunningText\(running\.action, running\.runnerText\)/);
-  // 卡片按钮只在"操作发生的那个环境 + 那张卡"上变文案。
+  // 卡片按钮只在"操作发生的那个环境 + 那张卡"上变文案、转圈。
   assert.match(code, /running\.runnerID === selectedRunner && "agentID" in running\.action && running\.action\.agentID === card\.id/);
-  // ② 横幅消费它，并走 busy 那一档样式 —— **不能**用 bad：那是"出事了"，
-  //    而这条说的是"正在做，请等"，画成一样会让用户在正常的升级里以为坏了。
-  assert.match(code, /running && <div className="cli-tools-banner" data-tone="busy" role="status">/);
-  assert.match(css, /\.cli-tools-banner\[data-tone="busy"\] \{/);
-  assert.match(css, /\.cli-tools-banner\[data-tone="busy"\] \.cli-tools-banner-mark \{/);
-  // ③ 三处说法来自同一份（各写一遍就会有一天只剩两处改了）。两个动作词都必须在。
+  // ② 进行中只落在卡片上：按钮带 aria-busy、里面有一圈转动指示器，卡片自身也标 data-busy。
+  assert.match(code, /aria-busy=\{activeAction \? true : undefined\}/);
+  assert.match(code, /activeAction && <span className="cli-tools-btn-spinner" aria-hidden="true"\/>/);
+  assert.match(code, /data-busy=\{activeAction \? "true" : undefined\}/);
+  assert.match(css, /\.cli-tools-btn-spinner \{/);
+  assert.match(css, /\.cli-tools-card\[data-busy="true"\] \{/);
+  assert.match(css, /\.cli-tools-shell button\[aria-busy="true"\] \{[^}]*display: inline-flex/);
+  // ③ 页面级那条横幅不许回来：显示的是"哪台机器 + 正在做什么"，与卡片重复且多占一行。
+  assert.doesNotMatch(code, /pendingRunningText/, "进行中横幅又回来了");
+  assert.doesNotMatch(code, /data-tone="busy"/, "进行中横幅又回来了");
+  assert.doesNotMatch(css, /\.cli-tools-banner\[data-tone="busy"\]/, "横幅的 busy 档样式还留着");
+  // ④ 说法来自同一份（各写一遍就会有一天只剩一处改了）。两个动作词都必须在。
   assert.match(code, /function pendingActionText\(action: PendingAction\)/);
-  assert.match(code, /正在升级 \$\{agentDisplayName\(action\.agentID\)\}…/);
-  assert.match(code, /正在安装 Node\.js 运行时…/);
+  assert.match(code, /button: "升级中…"/);
+  assert.match(code, /button: "安装中…"/);
   assert.match(code, /pendingActionText\(pending\)\.title/);
-  // ④ "别再点"要说出来：这几种操作在服务端是串行闸门（beginAgentMaintenance），
-  //    重复点击要么被拒（看起来像失败），要么一直转圈。
-  assert.match(code, /期间请不要重复点击/);
-
-  // ⑤ ⚠️ 横幅**不能**被 `view?.probeOk` 挡住：正在装的时候通道探测本来就可能没回来，
-  //    那恰恰是最需要看见"在跑"的时候（同「手动安装命令」那块）。它挂在页头之后、
-  //    cli-tools-body 之前，不在任何 probeOk 分支里。
-  const bannerAt = code.indexOf('data-tone="busy" role="status"');
-  assert.ok(bannerAt > 0, "找不到进行中横幅");
-  const guard = code.slice(Math.max(0, bannerAt - 200), bannerAt);
-  assert.ok(!/probeOk/.test(guard), `进行中横幅被 probeOk 挡住了：${guard}`);
+  assert.match(code, /pendingActionText\(activeAction\)\.button/);
 });
 
 test("升级成功后报的是**版本变化**，不是一句「已升级」", () => {

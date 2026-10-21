@@ -170,41 +170,80 @@ func TestStorageUsageEndpointReturnsSampledEstimates(t *testing.T) {
 	}
 }
 
-// 清理遗留 thinking_tokens 必须分批：真机库里有 42 万行，一条无界 DELETE 会变成独占唯一
-// SQLite 连接几十秒的巨型事务。
-func TestDeleteThinkingTokenEventsBatchesAndSparesContent(t *testing.T) {
+// 清理遗留遥测必须分批：真机库里有 42 万行 thinking_tokens 和 215 万行 stream_event，
+// 一条无界 DELETE 会变成独占唯一 SQLite 连接几十分钟的巨型事务。
+//
+// 两类一起覆盖是有意的：stream_event 是"交互式流式会话漏了 guard"留下的整类分片，与
+// thinking_tokens 同属"写入端已不再持久化、全仓没有读取方"的历史数据。清理范围必须把
+// 两者都算上 —— 保留循环够不到它们（分片常年压在每会话 5 万条过程事件的上限之内），
+// 漏掉任何一类，它就永远占着文件。
+func TestDeleteLegacyTelemetryEventsBatchesAndSparesContent(t *testing.T) {
 	server := newTestServer(t)
 	const conversationID = "conversation-thinking"
 	runID := seedConversation(t, server, "project-thinking", conversationID)
 	base := time.Now().UTC().Add(-time.Hour)
 
-	// 留在库里的都是历史遗留数据：appendEvent 早已不再持久化这类事件，所以这里直接写库。
+	// 留在库里的都是历史遗留数据：写入端早已不再持久化它们，所以这里直接写库。
 	seedEvents(t, server, conversationID, runID, "system", "think-", 25, base)
 	if _, err := server.db.Exec(`update events set payload='{"type":"system","subtype":"thinking_tokens"}' where id like 'think-%'`); err != nil {
 		t.Fatalf("mark thinking_tokens payloads: %v", err)
 	}
+	seedEvents(t, server, conversationID, runID, "stream_event", "stream-", 25, base.Add(30*time.Second))
 	seedEvents(t, server, conversationID, runID, "assistant", "assistant-", 7, base.Add(time.Minute))
 
-	// 批大小 10 < 25 行，必须跨多批删完。
-	removed, err := server.deleteThinkingTokenEventsBatched(context.Background(), 10)
+	// 批大小 10 < 50 行，必须跨多批删完。
+	removed, err := server.deleteLegacyTelemetryEventsBatched(context.Background(), 10)
 	if err != nil {
-		t.Fatalf("deleteThinkingTokenEventsBatched: %v", err)
+		t.Fatalf("deleteLegacyTelemetryEventsBatched: %v", err)
 	}
-	if removed != 25 {
-		t.Fatalf("removed = %d, want 25", removed)
+	if removed != 50 {
+		t.Fatalf("removed = %d, want 50", removed)
 	}
 	if got := countEventsOfType(t, server, conversationID, "system"); got != 0 {
 		t.Fatalf("system events left = %d, want 0", got)
+	}
+	if got := countEventsOfType(t, server, conversationID, "stream_event"); got != 0 {
+		t.Fatalf("stream_event left = %d, want 0", got)
 	}
 	if got := countEventsOfType(t, server, conversationID, "assistant"); got != 7 {
 		t.Fatalf("assistant events = %d, want 7 (content must survive)", got)
 	}
 	// 没有可删的时候不该空转。
-	removed, err = server.deleteThinkingTokenEventsBatched(context.Background(), 10)
+	removed, err = server.deleteLegacyTelemetryEventsBatched(context.Background(), 10)
 	if err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
 	if removed != 0 {
 		t.Fatalf("second pass removed = %d, want 0", removed)
+	}
+}
+
+// 清理前的精确统计要与删除范围同源：统计口径比删除范围窄的话，界面会报"删了 0 条"而
+// 文件却变小了；反过来则会报出一批根本没删掉的条数。
+func TestLegacyTelemetryStatsMatchTheDeleteScope(t *testing.T) {
+	server := newTestServer(t)
+	const conversationID = "conversation-telemetry-stats"
+	runID := seedConversation(t, server, "project-telemetry-stats", conversationID)
+	base := time.Now().UTC().Add(-time.Hour)
+
+	seedEvents(t, server, conversationID, runID, "system", "think-", 3, base)
+	const thinkingPayload = `{"type":"system","subtype":"thinking_tokens"}`
+	if _, err := server.db.Exec(`update events set payload=? where id like 'think-%'`, thinkingPayload); err != nil {
+		t.Fatalf("mark thinking_tokens payloads: %v", err)
+	}
+	seedEvents(t, server, conversationID, runID, "stream_event", "stream-", 4, base.Add(time.Minute))
+	seedEvents(t, server, conversationID, runID, "assistant", "assistant-", 5, base.Add(2*time.Minute))
+
+	count, bytes, err := server.legacyTelemetryStatsBatched(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("legacyTelemetryStatsBatched: %v", err)
+	}
+	if count != 7 {
+		t.Fatalf("counted events = %d, want 7", count)
+	}
+	// seedEvents 写的 payload 是 "{}"（2 字节）；3 条被改成了 thinking_tokens 的长 payload。
+	wantBytes := int64(3*len(thinkingPayload) + 4*len("{}"))
+	if bytes != wantBytes {
+		t.Fatalf("counted payload bytes = %d, want %d", bytes, wantBytes)
 	}
 }

@@ -17,6 +17,7 @@ const gitWorkbench = await readFile(new URL("./features/git/GitWorkbench.tsx", i
 const runPanel = await readFile(new URL("./features/run/ProjectRunPanel.tsx", import.meta.url), "utf8");
 const runStyles = await readFile(new URL("./run.css", import.meta.url), "utf8");
 const orchestrationPage = await readFile(new URL("./pages/OrchestrationPage.tsx", import.meta.url), "utf8");
+const runIndicatorStyles = await readFile(new URL("./run-indicator.css", import.meta.url), "utf8");
 
 const workspaceStyles = stylesheet.slice(stylesheet.indexOf("/* Desktop conversation workspace:"));
 const conversationContentStyles = stylesheet.slice(stylesheet.indexOf("/* 对话内容："));
@@ -109,8 +110,7 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.doesNotMatch(stylesheet, /(^|\n)\.branch-pill:hover \{/);
   assert.match(stylesheet, /\.runner-stop \{ display: none; \}/);
   assert.match(stylesheet, /@media \(max-width: 820px\) \{[\s\S]*?\.runner-stop \{[\s\S]*?display:\s*inline-flex;[\s\S]*?\.composer-action\.composer-stop \{ display: none; \}/);
-  assert.match(conversationPage, /const pendingUserDrafts = useRef\(new Map<string, string>\(\)\);/);
-  assert.match(conversationPage, /const assistantOutputRuns = useRef\(new Set<string>\(\)\);/);
+  assert.match(conversationPage, /const pendingUserDrafts = useRef\(new Map<string, string>\(\)\);/);  assert.match(conversationPage, /const assistantOutputRuns = useRef\(new Set<string>\(\)\);/);
   assert.match(conversationPage, /const recordAssistantOutput = useCallback[\s\S]*?if \(outputs\.size > 128\)[\s\S]*?pendingUserDrafts\.current\.delete\(runID\);/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.set\(data\.runId, data\.message\.content\)/);
   assert.match(conversationPage, /const shouldRetractMessage = !assistantOutputRuns\.current\.has\(runID\);\s*const draftToRestore = shouldRetractMessage \? pendingUserDrafts\.current\.get\(runID\) : undefined;/s);
@@ -123,8 +123,26 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
 });
 
+test("branch status card opens upward and keeps a single source for its readings", () => {
+  // 分支胶囊在 composer 最底行：向下弹（top 锚定）会整卡跑出视口——
+  // 2026-10-20 的原始 bug。卡片必须 bottom 锚定向上弹，且旧 .branch-menu 不得复活。
+  const branchCard = stylesheet.match(/(^|\n)\.branch-card \{[^}]*\}/)?.[0] ?? "";
+  assert.ok(branchCard, "找不到 .branch-card 基类");
+  assert.ok(branchCard.includes("bottom: calc(100% + 8px)"), "分支状态卡必须 bottom 锚定向上弹出");
+  assert.ok(!branchCard.includes("top:"), "分支状态卡不得用 top 锚定向下弹（页面最底行会跑出视口）");
+  assert.ok(branchCard.includes("z-index: 20"), "分支状态卡要有 z-index 才能盖过输入卡");
+  assert.doesNotMatch(stylesheet, /(^|\n)\.branch-menu[\s{]/);
+  // detached 与正常分支共用同一份卡片 JSX（原先两份菜单各写一遍）。
+  assert.equal((conversationPage.match(/branch-card" role="group"/g) ?? []).length, 1, "状态卡 JSX 必须只有一份（收口在 branchCard 变量）");
+  // 卡内读数与胶囊同源：都消费 dirtyCount / head.ahead/behind，不许出现第二套判据。
+  assert.match(conversationPage, /className="stat amber">\{\`\$\{dirtyCount\}处未提交改动\`\}/);
+  // 胶囊箭头不设 color：随胶囊文字色走（detached 琥珀 / hover 加深），钉死会在 detached 里混进绿。
+  const chevron = stylesheet.match(/(^|\n)\.branch-chevron \{[^}]*\}/)?.[0] ?? "";
+  assert.ok(chevron && !chevron.includes("color:"), ".branch-chevron 不得钉死 color（要继承胶囊文字色）");
+});
+
 test("persisted conversation history loads without waiting for the realtime socket", () => {
-  assert.match(conversationPage, /const reload = async \(runID\?: string\): Promise<boolean> => \{[\s\S]*?setMessages\(\(current\) => mergeReloadMessages\(filteredMessages, current\)\);/);
+  assert.match(conversationPage, /const reload = async \(runID\?: string\): Promise<boolean> => \{[\s\S]*?setMessages\(\(current\) => dropAfterCutoff\(mergeReloadMessages\(filteredMessages, current\), data\.messagesCutoff, data\.messagesVisibleAfter\)\);/);
   assert.match(conversationPage, /const initialHistoryLoad = reload\(\);\s*connect\(\);/);
   assert.match(conversationPage, /void initialHistoryLoad\.then\(\(loaded\) => \{\s*if \(!loaded && isCurrentConversation\(\)\) void reload\(\);\s*}\);/s);
   assert.match(conversationPage, /let hasOpenedSocket = false;/);
@@ -784,8 +802,9 @@ test("agent work is progressive: primary chat stays clean and trace details rema
   assert.match(conversationPage, /<AgentExecutionCard key=\{execution\.runId\}/);
   assert.match(conversationPage, /<AgentExecutionDialog execution=/);
   assert.match(timelineLib, /node\.status = "unresolved"/);
-  assert.match(conversationPage, /setMessages\(\(current\) => mergeReloadMessages\(filteredMessages, current\)\)/);
-  assert.match(conversationPage, /setEvents\(\(current\) => mergeConversationItems\(data\.events, current\)\)/);
+  // reload 合完本地消息之后还要按会话回退节点的可见性再滤一遍（本地缓存里可能有被丢掉的回合）。
+  assert.match(conversationPage, /setMessages\(\(current\) => dropAfterCutoff\(mergeReloadMessages\(filteredMessages, current\), data\.messagesCutoff, data\.messagesVisibleAfter\)\)/);
+  assert.match(conversationPage, /setEvents\(\(current\) => dropAfterCutoff\(mergeConversationItems\(data\.events, current\), data\.messagesCutoff, data\.messagesVisibleAfter\)\)/);
   assert.match(stylesheet, /\.agent-execution-card\s*\{/);
   assert.match(stylesheet, /\.agent-execution-dialog\s*\{/);
 });
@@ -817,4 +836,33 @@ test("conversation side modules collapse through header toggles and persist per 
   assert.match(conversationPage, /collapsed=\{conversationPanels\.taskQueue\} onToggleCollapsed=\{\(\) => toggleConversationPanel\("taskQueue"\)\}/);
   assert.match(stylesheet, /@media \(min-width: 1200px\)[\s\S]*?\.conversation-canvas\[data-queue-collapsed="true"\]/);
   assert.match(stylesheet, /\.task-queue-rail\[data-collapsed="true"\] \.task-queue-panel \{\s*display:\s*none;\s*\}/);
+});
+
+test("run indicator stage word joins the per-run text-variant lottery", () => {
+  // 文字位变体（K 高亮扫过 / L 填色擦除 / M 弹跳字符 / N 双色脉冲 / O 液态填充）：
+  // 与图形位同一套 runId 哈希机制的第二条随机轴 —— 判据在 lib/run-indicator.ts
+  //（pickRunTextVariant，种子加 ":text" 后缀与图形位抽取独立），页面只消费不另判。
+  assert.match(conversationPage, /import \{ formatStageClock, latestActiveStage, pickRunIndicatorVariant, pickRunTextVariant, splitLabelChars, type RunIndicatorVariant, type RunTextVariant \} from "\.\.\/lib\/run-indicator";/);
+  assert.match(conversationPage, /const runTextVariant = run \? pickRunTextVariant\(run\) : null;/);
+  assert.match(conversationPage, /<RunIndicatorView variant=\{runIndicatorVariant\} textVariant=\{runTextVariant\} label=\{stageLabel\} clockStartMs=\{stageStartMs\} \/>/);
+  // 阶段词 span 必须带上 rt- 变体类：丢了它 = 五种文字动效一个都不会出现。
+  assert.match(conversationPage, /className=\{`ri-stage rt-\$\{textVariant\}`\}/);
+  // 弹跳变体逐字起舞（拆字 + 按字符序内联 delay）；其余变体必须整段渲染 —— 渐变
+  // clip:text 的背景要铺满整段，拆开高光就扫不过去了。
+  assert.match(conversationPage, /if \(textVariant !== "bounce"\) return label;/);
+  assert.match(conversationPage, /splitLabelChars\(label\)\.map\(\(ch, index\) => \(/);
+  assert.match(conversationPage, /animationDelay: `\$\{index \* 70\}ms`/);
+  // CSS：5 个变体一个不能少（少一个 = 抽到它的 run 的文字没有任何动效）。
+  // bounce 作用于拆字后的子 span，选择器带 " span" 后缀，其余整段。
+  for (const variant of ["shimmerPro", "wipe", "bounce", "pulse", "liquid"]) {
+    assert.match(runIndicatorStyles, new RegExp(`\\.run-indicator \\.ri-stage\\.rt-${variant}( span)?, \\.mobile-agent-processing-stage \\.rt-${variant}( span)? \\{`));
+  }
+  // 降级块必须显式列出同选择器（具体度压过降级块是复发坑），且 clip:text 变体的
+  // 填充色要捞回来 —— 否则动画停了文字仍是透明的，「看得见的降级」才算降级。
+  const degraded = runIndicatorStyles.match(/@media \(prefers-reduced-motion: reduce\) \{[\s\S]*?\.ri-stage\.rt-shimmerPro[\s\S]*?\}\s*\}/)?.[0] ?? "";
+  assert.ok(degraded, "找不到文字位变体的降级块");
+  for (const variant of ["shimmerPro", "wipe", "bounce", "pulse", "liquid"]) {
+    assert.match(degraded, new RegExp(`rt-${variant}`));
+  }
+  assert.match(degraded, /-webkit-text-fill-color: #4c6b60/);
 });

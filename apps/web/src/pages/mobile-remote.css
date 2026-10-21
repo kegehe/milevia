@@ -1710,6 +1710,8 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 .mobile-message-actions .mobile-message-action-icon:nth-of-type(1) { animation-delay: 0ms; }
 .mobile-message-actions .mobile-message-action-icon:nth-of-type(2) { animation-delay: 60ms; }
 .mobile-message-actions .mobile-message-action-icon:nth-of-type(3) { animation-delay: 120ms; }
+/* 第四颗是「回退到此处」（只在那一轮有节点时出现）：补齐错峰，别和复制同时弹进来。 */
+.mobile-message-actions .mobile-message-action-icon:nth-of-type(4) { animation-delay: 180ms; }
 /* 「⋯」的弹出只挂在**展开态**上：它是每条气泡常驻的一颗，无条件加动画会让整页的「⋯」
    在挂载时一起弹一次（列表加载看起来像在抖）。`data-actions` 从无到有会让它**新匹配**
    这条规则，动画因此正好在"点开"那一刻触发。 */

@@ -12,7 +12,7 @@ test("发布快照列表随编排总览一起加载", () => {
 });
 
 test("编排页提供创建发布快照与确认合入稳定分支的入口", () => {
-  assert.match(pageSource, /④ 发布快照/);
+  assert.match(pageSource, /<h3 id="orchestration-release-title">发布快照<\/h3>/);
   assert.match(pageSource, /`\/api\/projects\/\$\{projectId\}\/orchestration\/releases`, \{ method: "POST" \}/);
   assert.match(pageSource, /`\/api\/projects\/\$\{projectId\}\/orchestration\/releases\/\$\{confirmRelease\.id\}\/confirm`, \{ method: "POST" \}/);
 });

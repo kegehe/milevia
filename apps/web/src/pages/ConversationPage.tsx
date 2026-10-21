@@ -48,7 +48,7 @@ import {
   buildTimeline, buildAgentExecutions, subagentTextIndex,
   isSubagentMessage, flattenAgents, timelineContentVersion,
 } from "../lib/timeline";
-import { formatStageClock, latestActiveStage, pickRunIndicatorVariant, type RunIndicatorVariant } from "../lib/run-indicator";
+import { formatStageClock, latestActiveStage, pickRunIndicatorVariant, pickRunTextVariant, splitLabelChars, type RunIndicatorVariant, type RunTextVariant } from "../lib/run-indicator";
 import {
   MAX_OPEN_CONVERSATION_TABS, closeConversationTab, markConversationTabRead, openConversationTab, recordConversationActivity,
   readClosedConversationIds, clearConversationTabClosed, markConversationTabClosed, readConversationTabs, writeConversationTabs, type ConversationTabsState,
@@ -57,6 +57,8 @@ import { readConversationPanels, writeConversationPanels, type ConversationPanel
 import { modelList } from "../lib/model-options";
 import { dialogParamURL } from "../lib/dialog-params";
 import { copyToClipboard } from "../lib/clipboard";
+import { checkpointHasCode, rewindButtonLabel, rewindConfirmMessage, rewindHint, rewindPrimaryMode } from "../lib/conversation-rewind";
+import { dropAfterCutoff } from "../lib/conversation-cutoff";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
@@ -93,6 +95,11 @@ function ConversationDeleteIcon() {
 // 两个同样的时钟图标并排就分不出「历史」和「回退」了。
 function RewindIcon() {
   return <svg className="conversation-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 9.4h9.6a4.7 4.7 0 0 1 0 9.4H9.4" /><path d="M8.2 5.8 4.6 9.4l3.6 3.6" /></svg>;
+}
+
+// 时间线行内的回退入口：同一支撤销箭头，尺寸跟着那条消息下的小按钮走。
+function RewindInlineIcon() {
+  return <svg className="message-checkpoint-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 9.4h9.6a4.7 4.7 0 0 1 0 9.4H9.4" /><path d="M8.2 5.8 4.6 9.4l3.6 3.6" /></svg>;
 }
 
 // 方案 A「图标化降噪」：头部次要操作在桌面端只露图标（文字保留在 DOM 里，供
@@ -439,7 +446,15 @@ function CommandCatalogList({ commands, selected, onSelect }: { commands: AgentC
 // 这里而不是页面根上：页面根每秒 setState 会强迫整个会话页树重渲染，
 // 收在这里每秒只重渲染这一行。clockStartMs 传 null 表示无阶段事件，不显示计时。
 const runIndicatorCliFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-function RunIndicatorView({ variant, label, clockStartMs }: { variant: RunIndicatorVariant; label: string; clockStartMs: number | null }) {
+// 文字位变体的拆字由这里渲染：rt-bounce 把阶段词拆成单字 span 逐字起舞，
+// 其余变体整段一个节点（渐变 clip:text 的背景要铺满整段，拆开就扫不过去了）。
+function RunStageText({ textVariant, label }: { textVariant: RunTextVariant; label: string }) {
+  if (textVariant !== "bounce") return label;
+  return splitLabelChars(label).map((ch, index) => (
+    <span key={index} style={{ animationDelay: `${index * 70}ms` }}>{ch}</span>
+  ));
+}
+function RunIndicatorView({ variant, textVariant, label, clockStartMs }: { variant: RunIndicatorVariant; textVariant: RunTextVariant; label: string; clockStartMs: number | null }) {
   const [cliFrame, setCliFrame] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -464,7 +479,7 @@ function RunIndicatorView({ variant, label, clockStartMs }: { variant: RunIndica
       {variant === "chase" && <span className="ri-anim ri-chase" aria-hidden="true">{Array.from({ length: 6 }, (_, index) => <i className="ri-chase-dot" key={index} />)}</span>}
       {variant === "tri" && <span className="ri-anim ri-tri" aria-hidden="true"><i></i><i></i><i></i></span>}
       {variant === "cli" && <span className="ri-anim ri-cli" aria-hidden="true">{runIndicatorCliFrames[cliFrame % runIndicatorCliFrames.length]}</span>}
-      <span className="ri-stage">{label}</span>
+      <span className={`ri-stage rt-${textVariant}`}><RunStageText textVariant={textVariant} label={label} /></span>
       {clock && <span className="ri-clock">· {clock}</span>}
     </div>
   );
@@ -779,9 +794,12 @@ function ContextRing({ usage }: { usage: ConversationUsageResponse | null }) {
 
 // ── 分支胶囊：读当前工作区（会话级）的 git 摘要，分支/同步/未提交改动都是服务端算好的读数 ──
 // 三态分开渲染：读取失败（灰，可重试）/ detached HEAD（琥珀）/ 正常（绿，含 ↑↓ 同步与 N 处改动）。
-// 分支切换菜单。刷新时机：挂载、会话切换、run 开始与结束（runKey 变化）——
-// 分支切换发生在 Git 工作台页面，回到会话页时组件重挂载即取新值。
+// 分支状态卡（方案 C）：点击向上弹出一张卡（胶囊在页面最底行，向下弹会跑出视口）——
+// 上半是当前分支详情（短 SHA / ↑↓ 待推送落后 / N处未提交改动，「工作区干净」只在服务端计数为 0 时画）
+// 和「查看改动」直达 Git 工作台；分隔线下半才是切换列表。刷新时机：挂载、会话切换、run 开始与结束
+// （runKey 变化）——分支切换发生在 Git 工作台页面，回到会话页时组件重挂载即取新值。
 function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: string; conversationID: string; runKey: string }) {
+  const navigate = useNavigate();
   const [snapshot, setSnapshot] = useState<GitSnapshot | null>(null);
   const [branches, setBranches] = useState<GitBranch[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -879,36 +897,55 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
     return <span className="branch-pill" title="正在读取分支状态…"><BranchPillIcon />…</span>;
   }
   const head = snapshot.head;
+  // 状态卡对 detached / 正常分支是同一份 JSX，只差胶囊本身（原先两份菜单各写一遍，收口到这里）。
+  const branchCard = menuOpen && (
+    <div className="branch-card" role="group" aria-label="分支">
+      <div className="bc-label">当前分支</div>
+      <div className="bc-head">
+        <BranchPillIcon />
+        <span className="bc-branch">{head.detached ? "detached HEAD" : head.branch || "（空仓库）"}</span>
+        <span className="bc-sha">{head.oid.slice(0, 7)}</span>
+      </div>
+      <div className="bc-stats">
+        {head.ahead > 0 && <span className="stat">{`↑${head.ahead} 待推送`}</span>}
+        {head.behind > 0 && <span className="stat">{`↓${head.behind} 落后`}</span>}
+        {dirtyCount > 0 ? <span className="stat amber">{`${dirtyCount}处未提交改动`}</span> : <span className="stat">工作区干净</span>}
+      </div>
+      <div className="bc-actions">
+        <button type="button" className="bc-btn" onClick={() => { setMenuOpen(false); navigate(`/projects/${projectID}/git`); }}>
+          查看改动
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6" /></svg>
+        </button>
+      </div>
+      <hr className="bc-div" />
+      <div className="bc-label">切换到</div>
+      {branches.length === 0 ? <div className="bc-empty">没有可切换的本地分支</div> : branches.map((branch) => <button key={branch.name} type="button" title={branch.name} className={branch.current ? "bc-row current" : "bc-row"} disabled={branch.current || switching} onClick={() => void switchBranch(branch)}><span className="name">{branch.current && <span className="bc-check" aria-hidden="true">✓</span>}{branch.name}</span>{branch.current && <small>当前</small>}</button>)}
+    </div>
+  );
   if (head.detached) {
     return (
       <span className="branch-switcher">
-          <button type="button" className="branch-pill detached" title={`工作区处于 detached HEAD（${head.oid.slice(0, 7)}），点击选择分支`} onClick={() => menuOpen ? setMenuOpen(false) : void loadBranches()}>
+        <button type="button" className="branch-pill detached" title={`工作区处于 detached HEAD（${head.oid.slice(0, 7)}），点击打开分支状态卡`} onClick={() => menuOpen ? setMenuOpen(false) : void loadBranches()}>
           <BranchPillIcon />
           detached HEAD
           {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
-          <span className="branch-chevron" aria-hidden="true">⌄</span>
+          <span className={`branch-chevron${menuOpen ? " open" : ""}`} aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg></span>
         </button>
-        {menuOpen && <div className="branch-menu" role="menu" aria-label="切换分支">
-          <div className="branch-menu-title">切换分支</div>
-          {branches.length === 0 ? <div className="branch-menu-empty">没有可切换的本地分支</div> : branches.map((branch) => <button key={branch.name} type="button" role="menuitem" className={branch.current ? "current" : ""} disabled={branch.current || switching} onClick={() => void switchBranch(branch)}><span>{branch.name}</span>{branch.current && <small>当前</small>}</button>)}
-        </div>}
+        {branchCard}
       </span>
     );
   }
   const syncBits = [head.ahead > 0 ? `↑${head.ahead}` : "", head.behind > 0 ? `↓${head.behind}` : ""].filter(Boolean).join("");
   return (
     <span className="branch-switcher">
-      <button type="button" className="branch-pill" disabled={switching} title={`当前分支 ${head.branch} · 点击选择要切换的分支`} onClick={() => menuOpen ? setMenuOpen(false) : void loadBranches()}>
+      <button type="button" className="branch-pill" disabled={switching} title={`当前分支 ${head.branch} · 点击打开分支状态卡`} onClick={() => menuOpen ? setMenuOpen(false) : void loadBranches()}>
         <BranchPillIcon />
         <span className="branch-name">{head.branch || "（空仓库）"}</span>
         {syncBits && <span className="sync">{syncBits}</span>}
         {dirtyCount > 0 && <span className="dirty">·{dirtyCount}处改动</span>}
-        <span className="branch-chevron" aria-hidden="true">⌄</span>
+        <span className={`branch-chevron${menuOpen ? " open" : ""}`} aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg></span>
       </button>
-      {menuOpen && <div className="branch-menu" role="menu" aria-label="切换分支">
-        <div className="branch-menu-title">切换分支</div>
-        {branches.length === 0 ? <div className="branch-menu-empty">没有可切换的本地分支</div> : branches.map((branch) => <button key={branch.name} type="button" role="menuitem" className={branch.current ? "current" : ""} disabled={branch.current || switching} onClick={() => void switchBranch(branch)}><span>{branch.name}</span>{branch.current && <small>当前</small>}</button>)}
-      </div>}
+      {branchCard}
     </span>
   );
 }
@@ -1729,7 +1766,35 @@ function ShortcutEditor({ projectID, state, close, refresh, fail, agentID, catal
 
 // ---- 消息列表（独立 memo 组件，阻断对话页其他状态变化导致的列表重渲染） ----
 
-const MessageList = memo(function MessageList({ timeline, agentID, fail, resolving, decide, projectId, onViewTask, executionByRun, onOpenExecution, registerUserMessageElement }: {
+// 时间线上的回退入口。节点就是"这一轮跑完之后"，所以入口挂在产生它的那条用户消息下面，
+// 而不是挂在项目头部 —— 用户想回到的是"这一轮"，不是"一个会话设置"。
+//
+// 两种"没有按钮"的情形必须如实说清，否则用户会以为功能坏了：
+//   - 这一轮还在跑：节点要等 run 成功结束才生成 → 显示"本轮结束后可回退"；
+//   - 这一轮失败/被停止：服务端不会留节点 → 什么都不显示（不是坏了，是没有这个时间点）。
+function CheckpointAnchor({ checkpoint, running, discarded, busy, disabled, rewind }: {
+  checkpoint: ConversationCheckpoint | undefined;
+  running: boolean;
+  discarded: number;
+  busy: boolean;
+  disabled: boolean;
+  rewind: (checkpoint: ConversationCheckpoint) => void;
+}) {
+  if (!checkpoint) {
+    return running ? <p className="message-checkpoint pending">本轮结束后可回退到此处</p> : null;
+  }
+  // 行内只在小字里说"这一轮的节点和常规节点不一样"的地方（没有代码快照、会丢几轮）；
+  // 常规节点的完整代价在确认框里讲，铺在每一轮下面只会变成噪音。文案与手机端同源。
+  const hasCode = checkpointHasCode(checkpoint);
+  const notes = rewindHint(checkpoint, discarded);
+  const title = `回退到本轮结束时：${hasCode ? "代码与对话都回到这一刻" : "只回退对话（该节点没有代码快照）"}${discarded > 0 ? `，之后 ${discarded} 轮不再显示` : ""}`;
+  return <p className="message-checkpoint">
+    <button type="button" className="message-checkpoint-button" disabled={disabled || busy} title={title} onClick={() => rewind(checkpoint)}><RewindInlineIcon />{busy ? "处理中" : rewindButtonLabel(checkpoint)}</button>
+    {notes && <small>{notes}</small>}
+  </p>;
+}
+
+const MessageList = memo(function MessageList({ timeline, agentID, fail, resolving, decide, projectId, onViewTask, executionByRun, onOpenExecution, registerUserMessageElement, checkpointByRun, activeRunId, checkpointBusy, rewindDisabled, discardedTurnsAfter, rewindToCheckpoint }: {
   timeline: TimelineItem[];
   agentID: AgentID;
   fail: (message: string) => void;
@@ -1740,10 +1805,19 @@ const MessageList = memo(function MessageList({ timeline, agentID, fail, resolvi
   executionByRun: Map<string, AgentExecution>;
   onOpenExecution: (runId: string) => void;
   registerUserMessageElement: (messageId: string, element: HTMLDivElement | null) => void;
+  checkpointByRun: Map<string, ConversationCheckpoint>;
+  activeRunId: string;
+  checkpointBusy: boolean;
+  rewindDisabled: boolean;
+  discardedTurnsAfter: (checkpoint: ConversationCheckpoint) => number;
+  rewindToCheckpoint: (checkpoint: ConversationCheckpoint, mode: "conversation" | "code" | "conversation_and_code", fork?: boolean) => void;
 }) {
   const anchoredExecutionRunIDs = useMemo(() => new Set(timeline.flatMap((item) => item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.has(item.message.runId) ? [item.message.runId] : [])), [executionByRun, timeline]);
   return <>
-    {timeline.map((item) => <div key={item.id} className="timeline-item" data-timeline-kind={item.kind} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { registerUserMessageElement(item.message.id, element); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={agentID} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : item.kind === "system" ? <SystemCard system={item.system} /> : <ErrorCard item={item} projectId={projectId} onViewTask={onViewTask} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => onOpenExecution(item.message.runId!)} />}</div>)}
+    {timeline.map((item) => {
+      const checkpoint = item.kind === "message" && item.message.role === "user" && item.message.runId ? checkpointByRun.get(item.message.runId) : undefined;
+      return <div key={item.id} className="timeline-item" data-timeline-kind={item.kind} data-user-message-id={item.kind === "message" && item.message.role === "user" ? item.message.id : undefined} ref={item.kind === "message" && item.message.role === "user" ? (element) => { registerUserMessageElement(item.message.id, element); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={agentID} fail={fail} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : item.kind === "system" ? <SystemCard system={item.system} /> : <ErrorCard item={item} projectId={projectId} onViewTask={onViewTask} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => onOpenExecution(item.message.runId!)} />}{item.kind === "message" && item.message.role === "user" && item.message.runId && (checkpoint || item.message.runId === activeRunId) && <CheckpointAnchor checkpoint={checkpoint} running={item.message.runId === activeRunId} discarded={checkpoint ? discardedTurnsAfter(checkpoint) : 0} busy={checkpointBusy} disabled={rewindDisabled} rewind={(target) => rewindToCheckpoint(target, rewindPrimaryMode(target))} />}</div>;
+    })}
     {executionByRun && Array.from(executionByRun.values()).filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => onOpenExecution(execution.runId)} />)}
   </>;
 });
@@ -1803,6 +1877,27 @@ export default function ConversationPage() {
   const [conversationCheckpoints, setConversationCheckpoints] = useState<ConversationCheckpoint[]>([]);
   const [showCheckpointMenu, setShowCheckpointMenu] = useState(false);
   const [checkpointBusy, setCheckpointBusy] = useState(false);
+  // 节点按 runId 索引：节点与消息的稳定关联是 run（不是内容），界面据此把回退入口挂到
+  // 产生它的那条用户消息下面。Codex 的 nativeTurnId 是原生 turn id，不能拿来对消息，
+  // 所以服务端额外存了 run_id（老节点靠迁移回填）。
+  const checkpointByRun = useMemo(() => {
+    const map = new Map<string, ConversationCheckpoint>();
+    conversationCheckpoints.forEach((checkpoint) => { if (checkpoint.runId) map.set(checkpoint.runId, checkpoint); });
+    return map;
+  }, [conversationCheckpoints]);
+  // 节点是 run 成功结束后才在服务端生成的，所以每轮结束时必须重新拉一次：
+  // 只在切会话时拉的话，"刚跑完的这一轮"永远不会出现在列表里（新会话甚至一直是灰按钮）。
+  const refreshConversationCheckpoints = useCallback(async (conversationID?: string) => {
+    const target = conversationID || conversationRef.current?.id || "";
+    if (!target) { setConversationCheckpoints([]); return; }
+    try {
+      const result = await projectApi<{ checkpoints: ConversationCheckpoint[] }>(`/api/conversations/${target}/checkpoints`);
+      if (conversationRef.current?.id !== target) return; // 回包跨了会话就丢掉
+      setConversationCheckpoints(result.checkpoints || []);
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : "无法加载回退节点");
+    }
+  }, [fail, projectApi]);
   const [conversationWorkspaceLabels, setConversationWorkspaceLabels] = useState<Record<string, string>>({});
   const [archiveWorkspaceID, setArchiveWorkspaceID] = useState("");
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
@@ -1818,6 +1913,10 @@ export default function ConversationPage() {
   const [loadingMoreConversationHistory, setLoadingMoreConversationHistory] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
+
+  // 回退到这个节点会丢几轮：数"节点之后还有几条顶层用户消息"。列表本身已经被服务端的
+  // cutoff 过滤过，所以这里数出来的就是用户眼前还看得到、马上要消失的那几轮。
+  const discardedTurnsAfter = useCallback((checkpoint: ConversationCheckpoint) => messages.filter((message) => message.role === "user" && !message.parentToolUseId && message.createdAt > checkpoint.createdAt).length, [messages]);
 
   // 页面可见性：窗口最小化或切到后台时返回 false，用来给本页的两处轮询加闸。
   // 后台标签页会把 setInterval 限流到 ≥1 分钟，隐藏期间的轮询既不准也白费请求与电量。
@@ -1846,12 +1945,8 @@ export default function ConversationPage() {
       setConversationCheckpoints([]);
       return;
     }
-    let cancelled = false;
-    void projectApi<{ checkpoints: ConversationCheckpoint[] }>(`/api/conversations/${conversation.id}/checkpoints`)
-      .then((result) => { if (!cancelled) setConversationCheckpoints(result.checkpoints || []); })
-      .catch((cause) => { if (!cancelled) fail(cause instanceof Error ? cause.message : "无法加载回退节点"); });
-    return () => { cancelled = true; };
-  }, [conversation?.id, fail, projectApi]);
+    void refreshConversationCheckpoints(conversation.id);
+  }, [conversation?.id, refreshConversationCheckpoints]);
 
   useEffect(() => {
     const openIDs = conversationTabs.openConversationIds;
@@ -1929,30 +2024,46 @@ export default function ConversationPage() {
 
   const rewindToCheckpoint = async (checkpoint: ConversationCheckpoint, mode: "conversation" | "code" | "conversation_and_code", fork = false) => {
     if (!conversation || checkpointBusy || run || clearing || stopping || handingOff || readOnlyConversation) return;
-    const action = fork ? "从该节点创建分支" : mode === "code" ? "恢复代码" : mode === "conversation" ? "恢复对话" : "恢复代码和对话";
-    if (!window.confirm(`${action}？这会停止当前会话上下文。`)) return;
+    // 确认框的文案与"默认发哪个 mode"都在 lib/conversation-rewind 里，与手机端共用一份：
+    // 回退不可撤销，两端必须说清同一件事（丢几轮、代码会不会被改回去）。
+    const request = { mode, fork, discarded: discardedTurnsAfter(checkpoint) };
+    if (!window.confirm(rewindConfirmMessage(checkpoint, request))) return;
+    const conversationID = conversation.id;
     setCheckpointBusy(true);
     try {
-      const result = await projectApi<{ conversation?: Conversation; checkpoint: ConversationCheckpoint; forked: boolean }>(`/api/conversations/${conversation.id}/rewind`, { method: "POST", body: JSON.stringify({ checkpointId: checkpoint.id, mode, fork }) });
+      // 回退可能要把整棵工作区写回去（秒级到分钟级）。用默认的 15 秒超时会让桌面对
+      // 一次**其实成功**的回退报"失败"；服务端那侧已经不跟请求上下文走（见 checkpoint.go），
+      // 所以这里只要给足预算。
+      const result = await apiWithTimeout<{ conversation?: Conversation; checkpoint: ConversationCheckpoint; forked: boolean }>(`/api/conversations/${conversationID}/rewind`, { method: "POST", body: JSON.stringify({ checkpointId: checkpoint.id, mode, fork }) }, 180_000);
+      if (conversationRef.current?.id !== conversationID) return; // 往返期间用户可能已经切走
       setShowCheckpointMenu(false);
       if (result.forked && result.conversation) {
         navigate(conversationURL(result.conversation.id));
         return;
       }
       setConversationCheckpoints((items) => items.map((item) => (item.createdAt > checkpoint.createdAt || (item.createdAt === checkpoint.createdAt && item.id > checkpoint.id)) ? { ...item, status: "rewound" } : item.id === checkpoint.id ? { ...item, status: "active" } : item));
-      const detail = await projectApi<{ conversation: Conversation; messages: Message[]; events: Event[]; activeRunId: string | null }>(`/api/conversations/${conversation.id}?limit=400`);
+      const detail = await apiWithTimeout<{ conversation: Conversation; messages: Message[]; events: Event[]; activeRunId: string | null }>(`/api/conversations/${conversationID}?limit=400`, {}, undefined, 30_000);
+      if (conversationRef.current?.id !== conversationID) return;
       resetConversationView(detail.conversation);
       setMessages(detail.messages || []);
       setEvents(detail.events || []);
       setRun(detail.activeRunId || "");
+      // 这两样也是"回退之后该变了"的派生视图：↑ 的输入历史（服务端已按节点过滤）与
+      // 上下文用量（否则环上还挂着被回退掉那一轮的 token）。
+      setHistoryRefresh((version) => version + 1);
+      void refreshUsage().catch(() => undefined);
     } catch (cause) {
       fail(cause instanceof Error ? cause.message : "回退失败");
     } finally {
       setCheckpointBusy(false);
     }
   };
-  const [text, setText] = useState("");
-  const [inputHistory, setInputHistory] = useState<string[]>([]);
+  // 时间线的回退回调走 ref 转发：MessageList 是 memo 的，回调身份一变整条时间线就跟着
+  // 重渲染，而这个回调依赖了会话/运行状态等一大堆每帧都可能变的值。
+  const rewindRef = useRef(rewindToCheckpoint);
+  rewindRef.current = rewindToCheckpoint;
+  const rewindFromTimeline = useCallback((target: ConversationCheckpoint, mode: "conversation" | "code" | "conversation_and_code") => { void rewindRef.current(target, mode); }, []);
+  const [text, setText] = useState("");  const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyRefresh, setHistoryRefresh] = useState(0);
   const [run, setRun] = useState("");
   const [sending, setSending] = useState(false);
@@ -1965,6 +2076,9 @@ export default function ConversationPage() {
   // 弹窗状态 — 通过 URL search params 驱动
   const showHistory = searchParams.get("history") === "true";
 	const readOnlyConversation = searchParams.get("readonly") === "true" || conversation?.isOrchestration === true;
+  // 回退的禁用条件：跑着、清空中、正在停止、正在交接、只读会话时都不能回退。头部入口与
+  // 时间线上的入口共用这一份判据（服务端也会拒，但界面不该让用户点了才知道）。
+  const rewindDisabled = readOnlyConversation || checkpointBusy || Boolean(run) || clearing || stopping || handingOff;
   const showNewConversation = searchParams.get("new") === "true";
   const showUsage = searchParams.get("usage") === "true";
   const showAgentExecution = searchParams.get("execution");
@@ -2806,13 +2920,16 @@ export default function ConversationPage() {
       lastReloadRequestedAt.current = Date.now();
       const runAtRequest = runRef.current;
       try {
-        const data = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string }>(`/api/conversations/${conversation.id}?limit=400`);
+        const data = await projectApi<{ messages: Message[]; events: Event[]; activeRunId: string | null; hasMore: boolean; hasMoreMessages: boolean; nextCursor: string; messagesCutoff?: string; messagesVisibleAfter?: string }>(`/api/conversations/${conversation.id}?limit=400`);
         if (!isCurrentConversation()) return false;
         data.messages.forEach((message) => { if (message.role === "assistant") recordAssistantOutput(message.runId || "", message.content); });
         // 过滤掉被撤回的用户消息 — 停止时如果助手还没有输出，后端可能仍会返回用户消息
         const filteredMessages = data.messages.filter((message) => !(message.role === "user" && message.runId && retractedMessageRuns.current.has(message.runId)));
-        setMessages((current) => mergeReloadMessages(filteredMessages, current));
-        setEvents((current) => mergeConversationItems(data.events, current));
+        // mergeReloadMessages 会**保留**本地已有的消息（流式输出还没落库时不能丢），所以服务端
+        // 按节点时间过滤过的那份挡不住本地缓存里的回合 —— 合并完还要按同一个 cutoff 再滤一遍，
+        // 否则在别的设备上发起的回退，本机屏幕上看不出来（内容还在）。
+        setMessages((current) => dropAfterCutoff(mergeReloadMessages(filteredMessages, current), data.messagesCutoff, data.messagesVisibleAfter));
+        setEvents((current) => dropAfterCutoff(mergeConversationItems(data.events, current), data.messagesCutoff, data.messagesVisibleAfter));
         // 这份回包是请求发出时的快照：若请求期间 run 已推进到更晚的值（例如预约发送
         // 自动发出的新回合，或另一处已启动的新 run），不能拿旧快照把它覆盖/清空，
         // 否则 isConversationIdle 会误判为空闲、运行指示也会丢失。
@@ -2927,6 +3044,9 @@ export default function ConversationPage() {
           rememberFinishedRun(event.runId);
           setRun((active) => active === event.runId ? "" : active);
           setStopping(false);
+          // 节点就是这一轮跑完后生成的，终态一到就重新拉列表：否则"刚跑完的这一轮"永远不会
+          // 出现在回退入口里（新会话甚至因为列表为空而一直是灰按钮）。run.started 不必拉。
+          if (event.type !== "run.started") void refreshConversationCheckpoints(conversation.id);
           const sameRun = lastReloadRunID.current === event.runId;
           const recentReload = Date.now() - lastReloadRequestedAt.current < 500;
           if (!sameRun || !recentReload) {
@@ -4219,6 +4339,9 @@ export default function ConversationPage() {
   // 计时的每秒 tick 在 RunIndicatorView 内部，不放在页面根上。
   const stageItem = useMemo(() => (run ? latestActiveStage(events, run) : null), [events, run]);
   const runIndicatorVariant = run ? pickRunIndicatorVariant(run) : null;
+  // 文字位变体：与图形位同一套 runId 哈希机制（种子加 ":text" 后缀，互不绑死），
+  // 同一 run 内图形与文字的花样都稳定（判据在 lib/run-indicator.ts）。
+  const runTextVariant = run ? pickRunTextVariant(run) : null;
   const stageCreatedAtMs = stageItem ? Date.parse(stageItem.createdAt) : Number.NaN;
   const stageStartMs = Number.isFinite(stageCreatedAtMs) ? stageCreatedAtMs : null;
   const activeAgentName = conversation ? agentDisplayName(conversation.agentId) : "";
@@ -4389,15 +4512,16 @@ export default function ConversationPage() {
           {/* 方案 A 图标化降噪：次要操作桌面端只露图标（.icon-action 34px 方钮 + title 提示），
               文字留在 .action-label 里，≤820px 的「操作」菜单再显示。 */}
           <button className="conversation-head-action secondary icon-action" type="button" disabled={sending} onClick={openConversationHistory} title="历史" aria-label="会话历史"><HistoryIcon /><span className="action-label">历史</span></button>
-          {/* 会话回退（checkpoint）：同为头部次要操作，一并收成图标方钮；图标用撤销箭头，
-              不与「历史」的时钟撞脸（图标档下没有文字，只靠图标和 title 分辨）。 */}
+          {/* 会话回退（checkpoint）：主入口在时间线上（每条用户消息下面的「回退到此处」），
+              这里保留的是**节点列表** —— 节点滚出屏幕、或要看某个节点有没有代码快照、
+              或要用「分支」这种非回退动作时，列表比逐条翻消息快。 */}
           <div className="permission-menu checkpoint-menu">
-            <button className="conversation-head-action secondary icon-action" type="button" aria-haspopup="menu" aria-expanded={showCheckpointMenu} disabled={readOnlyConversation || checkpointBusy || Boolean(run) || clearing || stopping || handingOff || conversationCheckpoints.length === 0} onClick={() => setShowCheckpointMenu((open) => !open)} title="回退到会话节点" aria-label="回退到会话节点"><RewindIcon /><span className="action-label">{checkpointBusy ? "处理中" : "回退"}</span></button>
+            <button className="conversation-head-action secondary icon-action" type="button" aria-haspopup="menu" aria-expanded={showCheckpointMenu} disabled={readOnlyConversation || checkpointBusy || Boolean(run) || clearing || stopping || handingOff || conversationCheckpoints.length === 0} onClick={() => setShowCheckpointMenu((open) => !open)} title="回退节点（按回合）" aria-label="回退节点"><RewindIcon /><span className="action-label">{checkpointBusy ? "处理中" : "节点"}</span></button>
             {showCheckpointMenu && <div className="permission-popover checkpoint-popover" role="menu">
               {conversationCheckpoints.slice().reverse().map((checkpoint) => <div className="checkpoint-entry" key={checkpoint.id}>
                 <b>{checkpoint.prompt.trim().replace(/\s+/g, " ").slice(0, 72) || "未命名回合"}</b>
-                <small>{formatHistoryTime(checkpoint.createdAt)}{checkpoint.status === "active" ? " · 当前" : ""}</small>
-                <div><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation")}>恢复对话</button><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "code")}>恢复代码</button><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation_and_code")}>恢复全部</button><button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation_and_code", true)}>分支</button></div>
+                <small>{formatHistoryTime(checkpoint.createdAt)}{checkpoint.status === "active" ? " · 当前" : ""}{checkpointHasCode(checkpoint) ? "" : " · 无代码快照"}</small>
+                <div>{checkpointHasCode(checkpoint) && <button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "code")}>恢复代码</button>}<button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation")}>恢复对话</button>{checkpointHasCode(checkpoint) && <button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation_and_code")}>恢复全部</button>}<button type="button" onClick={() => void rewindToCheckpoint(checkpoint, "conversation_and_code", true)}>分支</button></div>
               </div>)}
             </div>}
           </div>
@@ -4449,8 +4573,8 @@ export default function ConversationPage() {
         <div ref={top} />
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
         {isEmptyConversation && <section className="conversation-starter" aria-label="新会话建议"><span>新会话</span><h2>从一个任务开始</h2><div className="conversation-starter-options">{starterSuggestions.map((suggestion) => <button key={suggestion.label} type="button" onClick={() => startFromSuggestion(suggestion.prompt)}>{suggestion.label}</button>)}</div></section>}
-        <MessageList timeline={timeline} agentID={conversation?.agentId || "claude-code"} fail={fail} resolving={resolving} decide={decide} projectId={project.id} onViewTask={onViewTask} executionByRun={executionByRun} onOpenExecution={openExecutionParam} registerUserMessageElement={registerUserMessageElement} />
-        {run && runIndicatorVariant && <RunIndicatorView variant={runIndicatorVariant} label={stageLabel} clockStartMs={stageStartMs} />}
+        <MessageList timeline={timeline} agentID={conversation?.agentId || "claude-code"} fail={fail} resolving={resolving} decide={decide} projectId={project.id} onViewTask={onViewTask} executionByRun={executionByRun} onOpenExecution={openExecutionParam} registerUserMessageElement={registerUserMessageElement} checkpointByRun={checkpointByRun} activeRunId={run} checkpointBusy={checkpointBusy} rewindDisabled={rewindDisabled} discardedTurnsAfter={discardedTurnsAfter} rewindToCheckpoint={rewindFromTimeline} />
+        {run && runIndicatorVariant && runTextVariant && <RunIndicatorView variant={runIndicatorVariant} textVariant={runTextVariant} label={stageLabel} clockStartMs={stageStartMs} />}
         <div ref={bottom} />
       </section>
       <UserMessageDotsRail messages={userMessages} activeIndex={userMessageNavigationIndex} onJump={scrollToUserMessage} />

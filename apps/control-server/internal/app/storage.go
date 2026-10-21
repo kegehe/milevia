@@ -32,12 +32,21 @@ const (
 	storagePayloadSampleSize = 2000
 
 	// storageCleanupTimeout 是清理动作（删除 + 空间回收）的上限。它用 runtimeCtx 派生，
-	// **不绑请求 ctx**：客户端在 15s/120s 超时后 abort 不能把 VACUUM 掐断 —— 半途取消的
-	// VACUUM 白跑一趟，用户还以为清了。同 deleteConversation 的处理方式（app.go）。
+	// **不绑请求 ctx**：客户端 abort 不能把 VACUUM 掐断 —— 半途取消的 VACUUM 白跑一趟，
+	// 用户还以为清了。同 deleteConversation 的处理方式（app.go）。
+	//
+	// 设置页给这条请求的预算必须**不小于**它（当前 31 分钟），否则会由客户端的通用超时
+	// 文案抢先报告，把下面那条更准确的「清理超时，请稍后重试」盖掉。留一分钟余量是给
+	// 网络与排队，不是给服务端加时间。
+	//
+	// 真机库实测这个动作要删约 250 万行遗留遥测（见 legacyTelemetryPredicate），外加一次
+	// 全表统计和 incremental_vacuum，分钟级是常态。分批提交保证即使超时也留得住进度，
+	// 重跑接着删。
 	storageCleanupTimeout = 30 * time.Minute
 
-	// thinkingTokenDeleteBatchSize 是清理遗留 thinking_tokens 时单批删除的行数。
-	thinkingTokenDeleteBatchSize = 20000
+	// legacyTelemetryDeleteBatchSize 是清理遗留遥测时单批删除的行数。
+	// 真机库实测 stream_event 有 215 万行，按这个批量约 108 个短事务删完。
+	legacyTelemetryDeleteBatchSize = 20000
 )
 
 type storageTableUsage struct {
@@ -62,14 +71,15 @@ type storageUsageResponse struct {
 	MeasurementDone bool                `json:"measurementComplete"`
 }
 
-// storageCleanupResult 是清理接口的返回值。thinking_tokens 的精确条数只有在这里才统计
-// —— 它是历史遗留数据（appendEvent 早就不再持久化这类事件了），日常面板没必要为它扫全表。
+// storageCleanupResult 是清理接口的返回值。遗留遥测的精确条数只有在这里才统计 ——
+// 它们是历史遗留数据（写入端早已不再持久化，见 legacyTelemetryPredicate），
+// 日常面板没必要为它们扫全表。
 type storageCleanupResult struct {
-	Before              storageUsageResponse `json:"before"`
-	After               storageUsageResponse `json:"after"`
-	FreedBytes          int64                `json:"freedBytes"`
-	ThinkingTokenEvents int64                `json:"thinkingTokenEvents"`
-	ThinkingTokenBytes  int64                `json:"thinkingTokenBytes"`
+	Before                storageUsageResponse `json:"before"`
+	After                 storageUsageResponse `json:"after"`
+	FreedBytes            int64                `json:"freedBytes"`
+	LegacyTelemetryEvents int64                `json:"legacyTelemetryEvents"`
+	LegacyTelemetryBytes  int64                `json:"legacyTelemetryBytes"`
 }
 
 func isThinkingTokensEvent(eventType string, payload []byte) bool {
@@ -97,6 +107,24 @@ func thinkingTokensPredicate(alias string) string {
 		alias = "events"
 	}
 	return "(lower(" + alias + ".type) like '%thinking_tokens%' or lower(" + alias + ".type) like '%thinking.tokens%' or (lower(" + alias + ".type)='system' and lower(" + alias + ".payload) like '%thinking_tokens%'))"
+}
+
+// legacyTelemetryPredicate 是设置页「清理数据库」的删除范围：**历史遗留、写入端已经
+// 不再持久化、且全仓没有任何读取方**的整类遥测。
+//
+//   - thinking_tokens：更早的一次修复之后 appendEvent 就不再落库（见 isThinkingTokensEvent）。
+//   - stream_event：Claude CLI 逐 token 的流式分片。一次性路径与 SSH 的两条路径一直只把它
+//     合并成增量下发（见 handleClaudePartialMessage），交互式流式会话那条漏了同一道 guard，
+//     于是旧库里同样积着整类没人读的分片。guard 已补齐，存量只能在这里回收。
+//
+// **这两类都不会被保留循环回收**，这是它必须单独存在的理由：保留策略的触发条件是"单会话
+// 过程事件超过 5 万条"，而分片常年就压在 5 万上下（真机库实测：单会话 5.2 万条事件里 99%
+// 是 stream_event），永远够不到阈值。不显式删，它们就会一直占着文件。
+func legacyTelemetryPredicate(alias string) string {
+	if alias == "" {
+		alias = "events"
+	}
+	return "(" + thinkingTokensPredicate(alias) + " or lower(" + alias + ".type)='stream_event')"
 }
 
 func (s *Server) getStorageUsage(w http.ResponseWriter, r *http.Request) {
@@ -276,8 +304,8 @@ func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := storageCleanupResult{Before: before}
-	// 精确统计遗留的 thinking_tokens（只有用户主动清理时才值得这一次全表扫）。
-	result.ThinkingTokenEvents, result.ThinkingTokenBytes, err = s.thinkingTokenStatsBatched(ctx, thinkingTokenDeleteBatchSize)
+	// 精确统计遗留遥测（只有用户主动清理时才值得这一次全表扫）。
+	result.LegacyTelemetryEvents, result.LegacyTelemetryBytes, err = s.legacyTelemetryStatsBatched(ctx, legacyTelemetryDeleteBatchSize)
 	if err != nil {
 		if ctx.Err() != nil {
 			writeError(w, http.StatusGatewayTimeout, errors.New("清理超时，请稍后重试"))
@@ -286,10 +314,10 @@ func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 分批删除：真机库里遗留的 thinking_tokens 有 42 万行，一条无界 DELETE 会是
-	// 一个把唯一 SQLite 连接独占几十秒、WAL 暴涨的巨型事务 —— 与 deleteConversation
-	// 记录过的教训同源。分批让每批都是一个短事务，其它请求能穿插进来。
-	if _, err := s.deleteThinkingTokenEvents(ctx); err != nil {
+	// 分批删除：真机库里遗留的 thinking_tokens 有 42 万行、stream_event 有 215 万行，一条
+	// 无界 DELETE 会是一个把唯一 SQLite 连接独占几十分钟、WAL 暴涨的巨型事务 —— 与
+	// deleteConversation 记录过的教训同源。分批让每批都是一个短事务，其它请求能穿插进来。
+	if _, err := s.deleteLegacyTelemetryEvents(ctx); err != nil {
 		if ctx.Err() != nil {
 			writeError(w, http.StatusGatewayTimeout, errors.New("清理超时，请稍后重试"))
 			return
@@ -316,14 +344,14 @@ func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// deleteThinkingTokenEvents 分批删除 events 里遗留的 thinking_tokens 遥测，返回删除行数。
-// thinkingTokenStatsBatched walks rowid ranges so each read has a bounded
-// result set. Rowid progression avoids repeatedly rescanning earlier rows.
-func (s *Server) thinkingTokenStatsBatched(ctx context.Context, batchSize int64) (int64, int64, error) {
+// legacyTelemetryStatsBatched 统计遗留遥测的条数与 payload 字节数。
+//
+// 按 rowid 区间推进，每次读的结果集都有界；区间递进还避免了反复重扫已经数过的行。
+func (s *Server) legacyTelemetryStatsBatched(ctx context.Context, batchSize int64) (int64, int64, error) {
 	if batchSize <= 0 {
-		return 0, 0, errors.New("thinking token stats batch size must be positive")
+		return 0, 0, errors.New("legacy telemetry stats batch size must be positive")
 	}
-	predicate := thinkingTokensPredicate("events")
+	predicate := legacyTelemetryPredicate("events")
 	var lastRowID, count, bytes int64
 	for {
 		rows, err := s.db.QueryContext(ctx, `select rowid,length(payload) from events where rowid>? and `+predicate+` order by rowid limit ?`, lastRowID, batchSize)
@@ -355,16 +383,18 @@ func (s *Server) thinkingTokenStatsBatched(ctx context.Context, batchSize int64)
 	}
 }
 
-func (s *Server) deleteThinkingTokenEvents(ctx context.Context) (int64, error) {
-	return s.deleteThinkingTokenEventsBatched(ctx, thinkingTokenDeleteBatchSize)
+func (s *Server) deleteLegacyTelemetryEvents(ctx context.Context) (int64, error) {
+	return s.deleteLegacyTelemetryEventsBatched(ctx, legacyTelemetryDeleteBatchSize)
 }
 
-// deleteThinkingTokenEventsBatched 是批大小可注入的版本（测试用小数走同一条路径）。
+// deleteLegacyTelemetryEventsBatched 是批大小可注入的版本（测试用小数走同一条路径）。
 //
 // 每批一条独立的 delete（子查询里带 limit，不需要 SQLITE_ENABLE_UPDATE_DELETE_LIMIT），
-// 批与批之间事务提交、连接归还，避免一次几万行的大事务把唯一连接和 WAL 一起撑爆。
-func (s *Server) deleteThinkingTokenEventsBatched(ctx context.Context, batchSize int64) (int64, error) {
-	predicate := thinkingTokensPredicate("events")
+// 批与批之间事务提交、连接归还，避免一次几百万行的大事务把唯一连接和 WAL 一起撑爆。
+// 每批都从表头重新找匹配行，但上一批已经把它们删掉了，所以整体扫描量仍是 O(表行数)，
+// 不会因为分批而变成 O(n²)。
+func (s *Server) deleteLegacyTelemetryEventsBatched(ctx context.Context, batchSize int64) (int64, error) {
+	predicate := legacyTelemetryPredicate("events")
 	var removed int64
 	for {
 		if err := ctx.Err(); err != nil {

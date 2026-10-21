@@ -14,6 +14,11 @@ export type HistoryAdapters<M, I> = {
   messages: (value: unknown) => M[];
   index: (value: unknown) => I | null;
   merge: (previous: M[], next: M[]) => M[];
+  // filterRewound 把"会话回退节点"的可见性套用在这份历史页上：分页缓存是**本地**的，
+  // 电脑端（或另一台手机）回退之后，这里存着的被丢掉的那几轮不会自己消失。服务端每份
+  // history 回包都带 messagesCutoff / messagesVisibleAfter，用它把缓存里被回退掉的条目滤掉。
+  // 不传就不滤（老调用方）。
+  filterRewound?: (messages: M[], cutoff: string | undefined, visibleAfter: string | undefined) => M[];
 };
 
 // 一个控制器只服务一台设备上的一个项目。请求不能在 await 后换用新设备的适配器。
@@ -61,7 +66,10 @@ export function createMobileConversationHistory<M, I>(options: HistoryAdapters<M
           }
           if (!reply.ok) throw new Error(reply.error || "无法读取会话历史");
           const page = asRecord(reply.data);
-          const messages = options.messages(page?.messages);
+          const rawMessages = options.messages(page?.messages);
+          const messages = options.filterRewound
+            ? options.filterRewound(rawMessages, typeof page?.messagesCutoff === "string" ? page.messagesCutoff : undefined, typeof page?.messagesVisibleAfter === "string" ? page.messagesVisibleAfter : undefined)
+            : rawMessages;
           const nextCursor = typeof page?.nextCursor === "string" ? page.nextCursor : "";
           const hasMore = page?.hasMoreMessages === true && Boolean(nextCursor);
           visited.add(next);

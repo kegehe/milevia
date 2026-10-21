@@ -139,6 +139,14 @@ type remoteSnapshotConversation struct {
 	LastActivityAt time.Time               `json:"lastActivityAt"`
 	IsCurrent      bool                    `json:"isCurrent"`
 	Messages       []remoteSnapshotMessage `json:"messages"`
+	// MessagesCutoff 是这条会话"当前回退节点"的时间（RFC3339，空串表示没有节点）。
+	// 手机端的消息是**本地缓存 ∪ 快照**（历史分页 + 实时事件都在本地留过一份），
+	// 只靠快照过滤挡不住已经被缓存的、被回退掉的那些消息 —— 客户端要拿它把本地缓存里
+	// 比节点更新的消息也丢掉（见 apps/web/src/lib/conversation-cutoff.ts）。
+	MessagesCutoff string `json:"messagesCutoff,omitempty"`
+	// MessagesVisibleAfter 是最近一次回退的时刻：客户端过滤时，比它更新的消息**要留着**
+	// （那是回退之后新发生的回合，哪怕是失败的）。判据与服务端的 checkpointVisibilityClause 一致。
+	MessagesVisibleAfter string `json:"messagesVisibleAfter,omitempty"`
 	// Notices 是最近的状态/诊断事件原文（API 重试、上下文压缩、执行失败等）。
 	// 实时的 outbox 事件只在运行中送达，手机重进页面或中途刷新时看不到它们，
 	// 所以快照要一并回放，否则"执行失败"这类关键信息一刷新就消失了。
@@ -969,9 +977,18 @@ type remoteSnapshotQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func readRemoteConversationNotices(ctx context.Context, queryer remoteSnapshotQueryer, conversationID string) ([]remoteSnapshotNotice, error) {
-	query := fmt.Sprintf(`select id,run_id,type,payload,created_at from events where conversation_id=? and %s order by created_at desc,id desc limit ?`, remoteNoticeReplayPredicate("events"))
-	rows, err := queryer.QueryContext(ctx, query, conversationID, remoteSnapshotNoticesPerConversation)
+func readRemoteConversationNotices(ctx context.Context, queryer remoteSnapshotQueryer, conversationID string, cutoff, rewoundAt *time.Time) ([]remoteSnapshotNotice, error) {
+	query := fmt.Sprintf(`select id,run_id,type,payload,created_at from events where conversation_id=? and %s`, remoteNoticeReplayPredicate("events"))
+	args := []any{conversationID}
+	// 回退过的会话：被回退掉的那些回合的状态事件同样不能再上屏（否则手机端会拿回
+	// 一堆用户刚在电脑端丢掉的卡片，而这些卡片背后的事件在会话详情里已经被挡住）。
+	if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+		query += " and " + clause
+		args = append(args, clauseArgs...)
+	}
+	query += ` order by created_at desc,id desc limit ?`
+	args = append(args, remoteSnapshotNoticesPerConversation)
+	rows, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -998,11 +1015,20 @@ func readRemoteConversationNotices(ctx context.Context, queryer remoteSnapshotQu
 }
 
 func (s *Server) remoteConversationNotices(ctx context.Context, conversationID string) ([]remoteSnapshotNotice, error) {
-	return readRemoteConversationNotices(ctx, s.db, conversationID)
+	cutoff, rewoundAt, err := checkpointVisibilityFor(ctx, s.db, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	return readRemoteConversationNotices(ctx, s.db, conversationID, cutoff, rewoundAt)
 }
 
 func remoteConversationNoticesTx(ctx context.Context, tx *sql.Tx, conversationID string) ([]remoteSnapshotNotice, error) {
-	return readRemoteConversationNotices(ctx, tx, conversationID)
+	// 判据跑在调用方的事务上：只有一条 SQLite 连接，事务里再去 s.db 查会死锁。
+	cutoff, rewoundAt, err := checkpointVisibilityFor(ctx, tx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	return readRemoteConversationNotices(ctx, tx, conversationID, cutoff, rewoundAt)
 }
 
 // shrinkNoticePayload 把超出中继预算的 payload 裁到预算之内，**保留 JSON 结构**。
@@ -1306,6 +1332,16 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			conversation.Messages = make([]remoteSnapshotMessage, 0)
+			// 每条会话都带上可见性边界：手机端可以切到其中任意一条，而它的消息是
+			// "本地历史缓存 ∪ 快照"，客户端要拿这个值把缓存里被回退掉的条目也丢掉。
+			if cutoff, rewoundAt, visibilityErr := checkpointVisibilityFor(r.Context(), tx, conversation.ID); visibilityErr != nil {
+				conversationRows.Close()
+				writeError(w, http.StatusInternalServerError, visibilityErr)
+				return
+			} else {
+				conversation.MessagesCutoff = checkpointCutoffValue(cutoff)
+				conversation.MessagesVisibleAfter = checkpointCutoffValue(rewoundAt)
+			}
 			project.Conversations = append(project.Conversations, conversation)
 		}
 		if err := conversationRows.Err(); err != nil {
@@ -1316,9 +1352,28 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 		conversationRows.Close()
 		if len(project.Conversations) > 0 {
 			conversation := &project.Conversations[0]
+			// 回退过的会话：快照要按节点时间过滤，否则手机端会把用户刚在电脑端丢掉的
+			// 那些回合原样拿回来（会话详情已经过滤了，快照漏掉就是两端显示不一致）。
+			// 同一个 cutoff 还要带给客户端：手机端的消息是本地缓存 ∪ 快照，光过滤快照挡不住
+			// 已经在本地缓存里的那几轮。
+			cutoff, rewoundAt, cutoffErr := checkpointVisibilityFor(r.Context(), tx, conversation.ID)
+			if cutoffErr != nil {
+				writeError(w, http.StatusInternalServerError, cutoffErr)
+				return
+			}
+			conversation.MessagesCutoff = checkpointCutoffValue(cutoff)
+			conversation.MessagesVisibleAfter = checkpointCutoffValue(rewoundAt)
 			// 消息从最新往回装，装到预算用尽为止（详见 remoteSnapshotMessageBudget）。
 			// 每条最多吃掉「预算 - reserve」，超出的部分截断并留下标记。
-			messageRows, err := tx.QueryContext(r.Context(), `select id,run_id,role,content,created_at from messages where conversation_id=? and parent_tool_use_id='' order by created_at desc,id desc limit ?`, conversation.ID, remoteSnapshotMessagesPerConversation)
+			messageQuery := `select id,run_id,role,content,created_at from messages where conversation_id=? and parent_tool_use_id=''`
+			messageArgs := []any{conversation.ID}
+			if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+				messageQuery += " and " + clause
+				messageArgs = append(messageArgs, clauseArgs...)
+			}
+			messageQuery += ` order by created_at desc,id desc limit ?`
+			messageArgs = append(messageArgs, remoteSnapshotMessagesPerConversation)
+			messageRows, err := tx.QueryContext(r.Context(), messageQuery, messageArgs...)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return

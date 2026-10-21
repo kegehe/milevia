@@ -274,7 +274,7 @@ test("独立页壳的样式在 mcp-manager.css：弹窗里限定的按钮规则�
   //（留在 style.css 会形成半截迁移：宽度是死值，只有 font-size 生效）。
   assert.ok(styles.includes(".ssh-manager-dialog .ssh-action-button.mcp-test-button {"), "style.css 缺少弹窗侧 .mcp-test-button 规则");
   assert.doesNotMatch(styles, /\.mcp-shell \.ssh-action-button\.mcp-test-button/);
-  assert.match(pageStyles, /\.mcp-shell \.ssh-connection-actions \.ssh-action-button \{[^}]*font-size: 11px/);
+  assert.match(pageStyles, /\.mcp-shell \.mcp-conn-foot \.ssh-action-button \{[^}]*font-size: 11px/);
   // 变体迁移错位的兜底：mcp-shell 侧的 base 规则里不许混进 connect 的绿色
   //（错位的形状是「.mcp-shell .ssh-action-button, … .connect」——所有按钮常态变绿）。
   assert.doesNotMatch(styles, /\.mcp-shell \.ssh-action-button, \.ssh-manager-dialog \.ssh-action-button\.connect \{/);
@@ -283,8 +283,53 @@ test("独立页壳的样式在 mcp-manager.css：弹窗里限定的按钮规则�
   assert.match(pageStyles, /\.mcp-shell \.mcp-preset-grid \{ grid-template-columns: repeat\(3, minmax\(0, 1fr\)\); gap: 13px; \}/);
   // 官方图标用 <img> 渲染，牌位里要块状排布（inline 基线空隙会把卡片撑歪）。
   assert.match(pageStyles, /\.mcp-service-mark img \{ display: block; \}/);
-  // 动作按钮：弹窗时代是 30px 图标方块，页面上带文字的按钮必须放开宽度，否则「授权/停用」竖排折行。
-  assert.match(pageStyles, /\.mcp-shell \.ssh-connection-actions \.ssh-action-button \{ width: auto; min-width: 30px; height: 30px; padding: 0 10px; white-space: nowrap; font-size: 11px; font-weight: 700; \}/);
+  // 动作按钮：底栏文字钮必须放开宽度，否则文字竖排折行；display 必须重申为 inline-flex ——
+  // style.css 基底是 display:grid，「复制」的文字＋下拉箭头会被拆成两格竖排。
+  assert.match(pageStyles, /\.mcp-shell \.mcp-conn-foot \.ssh-action-button \{ display: inline-flex; width: auto; min-width: 30px; height: 30px; align-items: center; justify-content: center; padding: 0 10px; white-space: nowrap; font-size: 11px; font-weight: 700; \}/);
+  assert.match(pageStyles, /\.mcp-shell \.mcp-conn-foot \.ssh-action-button \{[^}]*font-size: 11px/);
+});
+
+test("连接卡是纵向三段（方案 C）：头部 / 说明 / 底部操作栏，旧横向结构不得复活", () => {
+  // 覆写横向卡时形状必须逐条重申（display/padding/min-height），不靠层叠顺序生效。
+  assert.match(pageStyles, /\.mcp-shell \.mcp-conn-card \{ display: block; min-height: 0; padding: 0; \}/);
+  // 头部自带下间距（无说明行的卡文字不贴底栏分隔线），说明行不再另起 margin-top。
+  assert.match(pageStyles, /\.mcp-conn-head \{ display: flex; align-items: center; gap: 10px; padding: 12px 14px 11px; \}/);
+  assert.match(pageStyles, /\.mcp-conn-meta \{ margin: 0 14px; padding-bottom: 11px; color: #4c6b60; font-size: 11\.5px; \}/);
+  for (const className of ["mcp-conn-head", "mcp-conn-mark", "mcp-conn-title", "mcp-conn-pill", "mcp-conn-meta", "mcp-conn-foot", "mcp-foot-push"]) {
+    assert.ok(pageStyles.includes(`.${className}`), `mcp-manager.css 缺少 .${className}`);
+  }
+  // 状态胶囊三态齐全：启用（默认绿）/ 停用（降灰）/ 待授权（琥珀）——「待完成」不许并进「已启用」。
+  for (const selector of [".mcp-conn-pill.is-off", ".mcp-conn-pill.is-pending"]) {
+    assert.ok(pageStyles.includes(selector), `mcp-manager.css 缺少 ${selector}`);
+  }
+  // 主操作唯一且实底；禁用态重申底色（否则禁用的实底绿仍像能点）。
+  for (const rule of [
+    ".mcp-shell .mcp-conn-foot .ssh-action-button.is-primary { border-color: #2c7567; color: #fff; background: #2c7567; }",
+    ".mcp-shell .mcp-conn-foot .ssh-action-button:disabled { border-color: #dce7df; color: #809188; background: #fbfefb; }",
+    ".mcp-shell .mcp-conn-foot .ssh-action-button.is-primary:disabled { border-color: #c9d6ce; color: #fff; background: #c9d6ce; }",
+  ]) {
+    assert.ok(pageStyles.includes(rule), `mcp-manager.css 缺少规则：${rule}`);
+  }
+  // 启用开关：role=switch + aria-checked 是开关状态的唯一渲染来源；reduced-motion 降级要显式列出同一选择器。
+  assert.match(page, /role="switch" aria-checked=\{server\.enabled\}/);
+  // 防连点：请求在途时只禁用那一张卡的开关（togglingId 单态判据）。
+  assert.match(page, /const \[togglingId, setTogglingId\] = useState<string \| null>\(null\);/);
+  assert.match(page, /disabled=\{togglingId === server\.id\}/);
+  assert.match(page, /setTogglingId\(server\.id\)/);
+  assert.match(pageStyles, /\.mcp-conn-switch:disabled \{ opacity: \.55; cursor: default; \}/);
+  // 复制菜单：Escape 可收（背板只接鼠标）。
+  assert.match(page, /if \(event\.key === "Escape"\) setCopyMenuId\(null\)/);
+  assert.match(pageStyles, /\.mcp-conn-switch\[aria-checked="true"\] \{ background: #2c7567; \}/);
+  assert.match(pageStyles, /@media \(prefers-reduced-motion: reduce\) \{\s*\.mcp-conn-switch \{ transition: none; \}\s*\.mcp-conn-switch::after \{ transition: none; \}\s*\}/);
+  // 复制下拉：copyMenuId 单态驱动 + 背板收点击；两个菜单项的判据都在 copyServerConfig。
+  assert.match(page, /const \[copyMenuId, setCopyMenuId\] = useState<string \| null>\(null\);/);
+  assert.match(page, /role="menu"/);
+  assert.match(page, /aria-haspopup="menu" aria-expanded=\{copyMenuId === server\.id\}/);
+  assert.match(pageStyles, /\.mcp-menu-backdrop \{ position: fixed; z-index: 20; inset: 0; \}/);
+  // 旧结构不得复活：动作行 / 双复制按钮 / 图标钮混排都已迁入底栏。
+  assert.doesNotMatch(page, /ssh-connection-actions/);
+  assert.doesNotMatch(page, /mcp-copy-actions/);
+  assert.doesNotMatch(pageStyles, /\.ssh-connection-actions/);
 });
 
 test("审计保留上限这条事实在界面上有出口，且不靠弹窗副标题", () => {

@@ -1243,6 +1243,16 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 		}
 		parts, content := parseClaudeMessage(envelope.Message)
 		session.noteStreamEvent(envelope.Type, content)
+		// 逐 token 的流式分片交给合并增量路径：**不落库、不广播**。
+		//
+		// 一次性路径（claudeCLIRunner.readOutput）与 SSH 的两条路径早就是这样（见各自
+		// 同一条注释），交互式流式会话这条是漏网的。少了它，一次运行会往 events 表写进
+		// 几万条**没有任何读取方**的分片，并逐条推给前端重算整条时间线 —— 真机库实测单次
+		// 运行 49,737 条、峰值 964 条/秒，而前端每条要付约 2ms 的 buildTimeline。
+		if envelope.Type == "stream_event" {
+			session.emitPartial(line)
+			continue
+		}
 		initialized := envelope.Type == "system" && envelope.Subtype == "init"
 		session.emit(envelope.Type, line, initialized)
 		if envelope.Type == "assistant" {
@@ -1279,6 +1289,28 @@ func (session *claudeCLISession) readStderr(reader io.Reader) {
 			session.emit("stream.error", mustJSON(map[string]string{"error": text}), false)
 		}
 	}
+}
+
+// emitPartial 把一条逐 token 的流式分片交给合并增量路径（handleClaudePartialMessage）。
+//
+// 归属只看**当前回合**，与 sshAgentSession.turnSink 同一条规则。刻意**不**回落到
+// lastTurnSink：那里存在的理由是"后台任务在主回合 result 之后仍要落库并广播"，而分片
+// 不是后台任务的产物 —— 回落到它只会给一条已经收尾的消息追加增量。
+//
+// sink 缺席时直接丢弃，**不**攒进 pending：pending 的语义是"等下一次发言再成批补发"，
+// 拿它装分片等于把几万条无内容的事件延迟到用户下次说话时才集中落库，既不是延迟也不是
+// 补发，只是把洪峰挪个位置。
+func (session *claudeCLISession) emitPartial(line json.RawMessage) {
+	session.mu.Lock()
+	var sink AgentRunSink
+	if session.current != nil {
+		sink = session.current.sink
+	}
+	session.mu.Unlock()
+	if sink == nil {
+		return
+	}
+	handleClaudePartialMessage(line, sink)
 }
 
 func (session *claudeCLISession) emit(eventType string, payload json.RawMessage, initialized bool) {

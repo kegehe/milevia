@@ -154,3 +154,26 @@ test("目录设备失效后不写入旧结果，也不发下一页请求", async
   await loading;
   assert.equal(state.controller.getSnapshot(), before);
 });
+
+// 分页缓存在本地。电脑端（或另一台手机）回退之后，缓存里被丢掉的那几轮不会自己消失 ——
+// 回包带的 messagesCutoff / messagesVisibleAfter 要能把它滤掉，否则手机端会继续显示
+// 用户刚刚在电脑上扔掉的内容。
+test("历史页按会话回退节点的可见性过滤本地缓存", async () => {
+  const seen: Array<{ cutoff?: string; visibleAfter?: string }> = [];
+  let current = true;
+  const controller = createMobileConversationHistory<string, string>({
+    request: async () => ({ ok: true, data: { messages: ["kept", "discarded"], hasMoreMessages: false, nextCursor: "", messagesCutoff: "cut", messagesVisibleAfter: "after" } }),
+    messages: (value) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [],
+    index: (value) => typeof value === "string" ? value : null,
+    merge: (previous, next) => [...new Set([...previous, ...next])],
+    filterRewound: (messages, cutoff, visibleAfter) => {
+      seen.push({ cutoff, visibleAfter });
+      return messages.filter((message) => message !== "discarded");
+    },
+    isCurrent: () => current,
+    schedule: () => () => undefined,
+  });
+  await controller.load("p", "c");
+  assert.deepEqual(seen, [{ cutoff: "cut", visibleAfter: "after" }]);
+  assert.deepEqual(controller.getSnapshot().pages.c.messages, ["kept"]);
+});

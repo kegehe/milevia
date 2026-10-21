@@ -44,13 +44,14 @@ type StorageUsage = {
   measurementComplete: boolean;
   tables: Array<{ name: string; rows: number; payloadBytes?: number; payloadEstimated?: boolean }>;
 };
-// 清理接口单独返回精确的 thinking_tokens 条数：它只在这个动作里扫一次全表，
-// 日常的占用面板不再为它付代价。
+// 清理接口单独返回精确的遗留遥测条数：它只在这个动作里扫一次全表，
+// 日常的占用面板不再为它付代价。范围见服务端 legacyTelemetryPredicate
+// （thinking_tokens + stream_event，两者写入端都已不再持久化、也没有任何读取方）。
 type StorageCleanupResult = {
   after: StorageUsage;
   freedBytes: number;
-  thinkingTokenEvents: number;
-  thinkingTokenBytes: number;
+  legacyTelemetryEvents: number;
+  legacyTelemetryBytes: number;
 };
 
 function formatBytes(value: number): string {
@@ -232,11 +233,13 @@ export default function SettingsPage() {
     setStorageConfirmOpen(false);
     setStorageCleaning(true);
     try {
-      // 这次调用可能触发整库重写（VACUUM），服务端给出的上限是 15 分钟且刻意不受客户端
-      // abort 影响，所以这里不重试、给足时间。
-      const result = await apiWithTimeout<StorageCleanupResult>("/api/system/storage/cleanup", { method: "POST", body: "{}" }, 0, 900_000);
+      // 这次调用可能触发整库重写（VACUUM），服务端上限 30 分钟且刻意不受客户端 abort 影响，
+      // 所以这里不重试、给足时间。给 31 分钟而不是 30：多出的一分钟让服务端那条更准确的
+      // 「清理超时，请稍后重试」先返回，而不是被这里的通用超时文案抢走。删到一半重发没有
+      // 意义 —— 进度是分批提交的，重跑会接着删。
+      const result = await apiWithTimeout<StorageCleanupResult>("/api/system/storage/cleanup", { method: "POST", body: "{}" }, 0, 31 * 60_000);
       setStorage(result.after);
-      const removed = result.thinkingTokenEvents > 0 ? `已删除 ${result.thinkingTokenEvents.toLocaleString()} 条思考事件，` : "";
+      const removed = result.legacyTelemetryEvents > 0 ? `已删除 ${result.legacyTelemetryEvents.toLocaleString()} 条遗留遥测，` : "";
       toast.success(`${removed}释放 ${formatBytes(result.freedBytes)}`);
     } catch (cause) { toast.error(cause instanceof Error ? cause.message : "清理失败"); }
     finally { setStorageCleaning(false); }
@@ -410,7 +413,7 @@ export default function SettingsPage() {
 
 
   return <main className="settings-page">
-    {storageConfirmOpen && <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-clean-storage-title"><section className="modal dialog-studio settings-confirm-dialog"><header><div><h2 id="settings-clean-storage-title">清理数据库</h2></div><button type="button" className="dialog-close" title="关闭" aria-label="关闭" onClick={() => setStorageConfirmOpen(false)}>×</button></header><p>将删除数据库中遗留的 thinking_tokens 遥测，并回收文件里已释放的页（必要时会重写整个数据库文件，期间其它操作会明显变慢）。会话消息、任务、任务结果和用量统计不会被删除；清理期间请不要运行任务。</p><footer><button type="button" className="secondary" onClick={() => setStorageConfirmOpen(false)}>取消</button><button type="button" className="primary danger" onClick={() => void cleanupStorage()}>确认清理</button></footer></section></div>}
+    {storageConfirmOpen && <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-clean-storage-title"><section className="modal dialog-studio settings-confirm-dialog"><header><div><h2 id="settings-clean-storage-title">清理数据库</h2></div><button type="button" className="dialog-close" title="关闭" aria-label="关闭" onClick={() => setStorageConfirmOpen(false)}>×</button></header><p>将删除数据库中遗留的流式分片（stream_event）与 thinking_tokens 遥测 —— 这些数据界面从不读取，只是历史遗留，并回收文件里已释放的页（必要时会重写整个数据库文件，期间其它操作会明显变慢）。会话消息、任务、任务结果和用量统计不会被删除；清理期间请不要运行任务。</p><footer><button type="button" className="secondary" onClick={() => setStorageConfirmOpen(false)}>取消</button><button type="button" className="primary danger" onClick={() => void cleanupStorage()}>确认清理</button></footer></section></div>}
     <header className="settings-header">
       <div className="settings-header-main"><button type="button" className="settings-back" title="返回首页" aria-label="返回首页" onClick={() => navigate("/")}><BackIcon /></button><div><h1>Milevia 设置</h1></div></div>
     </header>
@@ -514,7 +517,7 @@ export default function SettingsPage() {
             <SettingCard danger title="恢复本地界面偏好" description="仅恢复通知、代码字号和项目卡片排序，不会删除项目或任何凭据。">
               <button type="button" className="secondary" onClick={() => setResetLocalOpen(true)}>恢复默认</button>
             </SettingCard>
-            {isDesktop() && <SettingCard danger wide title="清理数据库" description="删除遗留的 thinking_tokens 遥测，并回收数据库文件里已释放的页；不会删除会话消息、任务或结果。运行中的任务需要先完成，整库整理期间操作会变慢。">
+            {isDesktop() && <SettingCard danger wide title="清理数据库" description="删除遗留的流式分片（stream_event）与 thinking_tokens 遥测，并回收数据库文件里已释放的页；不会删除会话消息、任务或结果。运行中的任务需要先完成，整库整理期间操作会变慢。">
               <button type="button" className="secondary" disabled={storageCleaning} onClick={() => setStorageConfirmOpen(true)}>{storageCleaning ? "清理中" : "清理数据"}</button>
             </SettingCard>}
           </div>

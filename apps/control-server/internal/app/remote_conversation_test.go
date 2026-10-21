@@ -28,8 +28,8 @@ import (
 func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	server := &Server{}
 	operations := server.remoteConversationOperations()
-	if len(operations) != 4 {
-		t.Fatalf("conversation operation count = %d, want 4", len(operations))
+	if len(operations) != 6 {
+		t.Fatalf("conversation operation count = %d, want 6", len(operations))
 	}
 	list, ok := operations["conversation.list"]
 	if !ok || list.Method != http.MethodGet || list.Scope != relayScopeProject || list.Path != "/conversations" || !list.Query || list.Handle == nil {
@@ -72,6 +72,22 @@ func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	}
 	if operation.MaxBytes != 0 {
 		t.Errorf("conversation.stop maxBytes = %d, want 0（响应只有一个状态词，不可能超限）", operation.MaxBytes)
+	}
+	// 会话回退：手机端要能读节点列表、并按节点 id 回退（同一条服务端路径，不另写判据）。
+	// 回退是破坏性动作，所以手机端**必须先读列表拿到 id**，不能自己编一个。
+	checkpoints, ok := operations["conversation.checkpoints"]
+	if !ok || checkpoints.Method != http.MethodGet || checkpoints.Scope != relayScopeConversation || checkpoints.Path != "/checkpoints" || checkpoints.Query || checkpoints.Handle == nil {
+		t.Fatalf("conversation.checkpoints = %#v, want a read-only node list operation", checkpoints)
+	}
+	if checkpoints.MaxBytes <= 0 || checkpoints.MaxBytes >= relayFrameBudget {
+		t.Fatalf("conversation.checkpoints MaxBytes = %d, want a positive value below relay frame budget %d（一条会话最多 50 个节点，提示词可能很长）", checkpoints.MaxBytes, relayFrameBudget)
+	}
+	rewind, ok := operations["conversation.rewind"]
+	if !ok || rewind.Method != http.MethodPost || rewind.Scope != relayScopeConversation || rewind.Path != "/rewind" || rewind.Query || rewind.Handle == nil {
+		t.Fatalf("conversation.rewind = %#v, want the desktop rewind endpoint behind the relay", rewind)
+	}
+	if len(rewind.PathParams) != 0 {
+		t.Errorf("conversation.rewind pathParams = %v, want none（节点 id 走请求体）", rewind.PathParams)
 	}
 }
 
@@ -336,6 +352,104 @@ func relayConversationStop(t *testing.T, server *Server, params map[string]any) 
 		t.Fatalf("relay transport status = %d body %v", code, payload)
 	}
 	return code, payload
+}
+
+// 手机端的会话回退：读节点列表 → 按 id 回退，走的是与桌面端**同一条**服务端路径。
+//
+// 两条都必须走真链路（relayRPCRequest → invokeLocalHandler → handler）：它们要证明的正是
+// "信封里的 conversationId 有没有真的变成落点" —— 而回退会改工作区文件，落错会话是实打实的破坏。
+func TestRelayConversationRewindReachesTheDesktopEndpoint(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into conversation_checkpoints (id,conversation_id,agent_id,prompt,status,metadata,created_at) values ('node-1',?,'claude-code','first','active','{}',?)`, conversationID, now); err != nil {
+		t.Fatalf("insert checkpoint: %v", err)
+	}
+
+	code, payload := relayConversation(t, server, map[string]any{
+		"op":             "conversation.checkpoints",
+		"projectId":      "project",
+		"conversationId": conversationID,
+		"params":         map[string]any{},
+	})
+	if code != http.StatusOK || payload["ok"] != true {
+		t.Fatalf("checkpoint list code=%d payload=%v", code, payload)
+	}
+	data, _ := payload["data"].(map[string]any)
+	nodes, _ := data["checkpoints"].([]any)
+	if len(nodes) != 1 {
+		t.Fatalf("checkpoints = %v, want the seeded node", data["checkpoints"])
+	}
+	first, _ := nodes[0].(map[string]any)
+	if first["id"] != "node-1" {
+		t.Fatalf("node id = %v", first["id"])
+	}
+
+	// mode=conversation：只回退对话，不碰代码 —— 手机端在没有代码快照时发的就是它。
+	code, payload = relayConversation(t, server, map[string]any{
+		"op":             "conversation.rewind",
+		"projectId":      "project",
+		"conversationId": conversationID,
+		"params":         map[string]any{"checkpointId": "node-1", "mode": "conversation"},
+	})
+	if code != http.StatusOK || payload["ok"] != true {
+		t.Fatalf("rewind code=%d payload=%v", code, payload)
+	}
+	data, _ = payload["data"].(map[string]any)
+	checkpoint, _ := data["checkpoint"].(map[string]any)
+	if checkpoint["status"] != "active" {
+		t.Fatalf("rewound node status = %v, want active", checkpoint["status"])
+	}
+	// 真落到库里了（不是只回了一句成功）。
+	var status string
+	if err := server.db.QueryRow(`select status from conversation_checkpoints where id='node-1'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" {
+		t.Fatalf("stored status = %q", status)
+	}
+}
+
+// 回退的落点只能来自信封：params 里塞一个同名字段不算数（与 conversation.stop 同一条）。
+func TestRelayConversationRewindKeepsTheEnvelopeConversation(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into conversation_checkpoints (id,conversation_id,agent_id,prompt,status,metadata,created_at) values ('node-1',?,'claude-code','first','active','{}',?)`, conversationID, now); err != nil {
+		t.Fatal(err)
+	}
+	target, _, pathParams, err := relayTarget(conversationOperation(t, "conversation.rewind"), "project", "conv-real", json.RawMessage(`{"checkpointId":"node-1","conversationId":"conv-forged"}`))
+	if err != nil {
+		t.Fatalf("relayTarget: %v", err)
+	}
+	if strings.Contains(target, "conv-forged") || pathParams["conversationID"] != "conv-real" {
+		t.Fatalf("target = %q pathParams = %v：落点被 params 改掉了", target, pathParams)
+	}
+	if !strings.HasPrefix(target, "/api/conversations/conv-real/rewind") {
+		t.Fatalf("target = %q, want the rewind endpoint under the envelope conversation", target)
+	}
+}
+
+// 真实路由必须注册上（中继的合成请求不查路由表，见文件头那段说明）。
+func TestConversationCheckpointRoutesAreRegistered(t *testing.T) {
+	server, _, conversationID := seedTaskConversation(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/"+conversationID+"/checkpoints", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("checkpoint list route status = %d body = %s（404 就是没注册）", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversationID+"/rewind", strings.NewReader(`{"checkpointId":"missing","mode":"conversation"}`))
+	server.routes().ServeHTTP(response, request)
+	// 节点不存在 → 404（不是 405/404 路由缺失：路由缺失时 chi 给的也是 404，
+	// 所以这条同时断言**文案**来自 handler，而不是路由兜底的那句）。
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode rewind response %q: %v", response.Body.String(), err)
+	}
+	if response.Code != http.StatusNotFound || !containsChinese(payload.Error) {
+		t.Fatalf("rewind route status = %d error = %q, want a localized 404 from the handler", response.Code, payload.Error)
+	}
 }
 
 // 没有活跃的那一轮时，停止是一次**幂等的空操作**：返回 idle 而不是报错。

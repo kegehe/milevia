@@ -319,10 +319,12 @@ type Server struct {
 	// commandCatalogMu 保护 Claude 命令目录的单条缓存（见 project_commands.go）：
 	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
 	// 串行地拉起一次探针进程。
-	commandCatalogMu       sync.Mutex
-	commandCatalogEntry    *commandCatalogEntry
-	commandProbeMu         sync.Mutex
-	projectLifecycleMu     sync.Mutex
+	commandCatalogMu    sync.Mutex
+	commandCatalogEntry *commandCatalogEntry
+	commandProbeMu      sync.Mutex
+	projectLifecycleMu  sync.Mutex
+	// checkpointLocks 串行化同一会话上的快照类 git 操作（见 checkpoint.go 的 checkpointLockSet）。
+	checkpointLocks        checkpointLockSet
 	sshMu                  sync.Mutex
 	sshPrepare             func(context.Context, SSHConnection) (*sshRunner, RunnerMeta, error)
 	runtimeCtx             context.Context
@@ -587,6 +589,9 @@ type Conversation struct {
 	// Handoff only marks an internal context-transfer run. It is never stored
 	// or sent to clients, and lets the runner exclude project MCP tools.
 	Handoff bool `json:"-"`
+	// PendingContextRebuild 为真表示"原生 CLI 会话已被重置，下一轮要把保留的对话历史
+	// 重新喂回去"（会话回退到某个节点后由 rewindConversation 置位，喂完即清）。
+	PendingContextRebuild bool `json:"-"`
 }
 
 // recentConversations 返回结构：内嵌 Conversation 全部摘要字段并追加所属项目名。
@@ -2017,6 +2022,13 @@ create index if not exists conversation_handoffs_source_status on conversation_h
 		// 会话级模型覆盖：空串表示跟随项目配置 / CLI 默认（与 permission_mode 一样
 		// 是"用户随时可切的执行参数"，不是凭据，故不进 agent_profile_revisions）。
 		{"model_override", "text not null default ''"},
+		// 会话回退把原生会话重置之后，用它标记"下一轮必须把保留的对话历史喂回去"。
+		{"pending_context_rebuild", "integer not null default 0"},
+		// 最近一次回退的落点与时刻：比"落点"晚、但发生在"回退时刻"之前的内容属于被丢掉的历史
+		// （见 checkpointVisibility）。落点必须存下来，不能由节点状态推导 —— 回退后再成功跑
+		// 一轮会生成新节点，那时"最新节点"会越过被丢掉的区间，让它重新出现。
+		{"checkpoint_hidden_after", "datetime"},
+		{"checkpoint_rewound_at", "datetime"},
 	} {
 		if err := ensureColumn(ctx, s.db, "conversations", column.name, column.definition); err != nil {
 			return fmt.Errorf("add conversation %s: %w", column.name, err)
@@ -2024,6 +2036,12 @@ create index if not exists conversation_handoffs_source_status on conversation_h
 	}
 	if err := s.migrateRunWorkspaceColumns(ctx); err != nil {
 		return err
+	}
+	// 回填会话回退的可见性落点：升级前用"最新 active 节点"推导边界，现在把它固化到会话行上
+	// （否则已回退过的会话会突然变成"什么都看得见"）。放在这里而不是 migrateCheckpoints：
+	// 那一步在这批列加上之前就跑完了，会话行上的列还不存在。
+	if _, err := s.db.ExecContext(ctx, `update conversations set checkpoint_hidden_after=coalesce((select cc.created_at from conversation_checkpoints cc where cc.conversation_id=conversations.id and cc.status='active' order by cc.created_at desc,cc.id desc limit 1), checkpoint_rewound_at) where checkpoint_hidden_after is null and checkpoint_rewound_at is not null`); err != nil {
+		return fmt.Errorf("backfill checkpoint visibility: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `update conversations set agent_session_id=case when agent_session_id='' then claude_session_id else agent_session_id end, agent_initialized=case when agent_initialized=0 then claude_initialized else agent_initialized end, agent_runtime_id=case when agent_runtime_id='' then coalesce((select nullif(runner_id,'') from projects where projects.id=conversations.project_id),(select runner from projects where projects.id=conversations.project_id),'') else agent_runtime_id end, execution_policy=case when execution_policy='' or execution_policy='approval_required' then permission_mode else execution_policy end`); err != nil {
 		return fmt.Errorf("backfill agent conversation fields: %w", err)
@@ -3298,6 +3316,15 @@ func (s *Server) StartBackgroundMaintenance() {
 		}
 		log.Printf("[maintenance] storage reclaim finished elapsed_ms=%d total_elapsed_ms=%d", time.Since(stageStarted).Milliseconds(), time.Since(maintenanceStarted).Milliseconds())
 	}()
+	// 会话快照的清理与转换单独一个 goroutine + 自己的预算：它主要是磁盘活（转换一份遗留
+	// 拷贝快照要整目录读一遍再压缩），不该和空间回收抢同一份 30 分钟预算，也不该让回收等它。
+	// 清理（删孤儿目录）便宜，立刻做；真正的转换在每份之前各自等一个空闲窗口
+	// （见 sweepCheckpointSnapshots），不与正在跑的 agent 抢磁盘。
+	go func() {
+		sweepCtx, cancel := context.WithTimeout(s.runtimeCtx, checkpointMaintenanceTimeout)
+		defer cancel()
+		s.sweepCheckpointSnapshots(sweepCtx)
+	}()
 }
 
 func (s *Server) listProjectStatuses(w http.ResponseWriter, r *http.Request) {
@@ -3547,7 +3574,10 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),''),exists(select 1 from git_task_records r where r.conversation_id=c.id) from conversations c where c.project_id=? and (?='' or lower(c.title) like '%' || lower(?) || '%' or exists(select 1 from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' and lower(m.content) like '%' || lower(?) || '%'))`
+	// 预览与搜索也按"回退之后看得见什么"过滤（同 checkpointVisibilityClause 的口径，
+	// 只是这里要在一条 SQL 里对每行算）：否则会话列表/提示浮层会拿被回退掉的那句话当预览，
+	// 搜一个只存在于被丢弃回合里的词也还能搜到。
+	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' and (m.created_at <= coalesce(c.checkpoint_hidden_after, m.created_at) or m.created_at > coalesce(c.checkpoint_rewound_at, m.created_at)) order by m.created_at desc limit 1),''),exists(select 1 from git_task_records r where r.conversation_id=c.id) from conversations c where c.project_id=? and (?='' or lower(c.title) like '%' || lower(?) || '%' or exists(select 1 from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' and (m.created_at <= coalesce(c.checkpoint_hidden_after, m.created_at) or m.created_at > coalesce(c.checkpoint_rewound_at, m.created_at)) and lower(m.content) like '%' || lower(?) || '%'))`
 	args := []any{chi.URLParam(r, "projectID"), query, query, query}
 	if cursor.ID != "" {
 		statement += ` and (c.last_activity_at < ? or (c.last_activity_at = ? and c.id < ?))`
@@ -3597,7 +3627,7 @@ func (s *Server) recentConversations(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 	// 列顺序与 listConversations 一致，末尾追加项目名；按最后活跃时间倒序取全项目最新会话。
-	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' order by m.created_at desc limit 1),''),exists(select 1 from git_task_records r where r.conversation_id=c.id),coalesce(p.name,'') from conversations c left join projects p on p.id=c.project_id where exists(select 1 from messages mf where mf.conversation_id=c.id and mf.parent_tool_use_id='') order by c.last_activity_at desc,c.id desc limit ?`
+	statement := `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,coalesce((select content from messages m where m.conversation_id=c.id and m.parent_tool_use_id='' and (m.created_at <= coalesce(c.checkpoint_hidden_after, m.created_at) or m.created_at > coalesce(c.checkpoint_rewound_at, m.created_at)) order by m.created_at desc limit 1),''),exists(select 1 from git_task_records r where r.conversation_id=c.id),coalesce(p.name,'') from conversations c left join projects p on p.id=c.project_id where exists(select 1 from messages mf where mf.conversation_id=c.id and mf.parent_tool_use_id='') order by c.last_activity_at desc,c.id desc limit ?`
 	rows, err := s.db.QueryContext(r.Context(), statement, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -4045,16 +4075,16 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, errors.New("conversation not found"))
 		return
 	}
-	cutoff, err := s.conversationCheckpointCutoff(r.Context(), id)
+	cutoff, rewoundAt, err := checkpointVisibilityFor(r.Context(), s.db, id)
 	if err != nil {
 		writeError(w, 500, err)
 		return
 	}
 	messageQuery := `select id,conversation_id,run_id,role,content,parent_tool_use_id,created_at from messages where conversation_id=?`
 	messageArgs := []any{id}
-	if cutoff != nil {
-		messageQuery += ` and created_at <= ?`
-		messageArgs = append(messageArgs, *cutoff)
+	if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+		messageQuery += " and " + clause
+		messageArgs = append(messageArgs, clauseArgs...)
 	}
 	if cursor.Message != nil {
 		messageQuery += ` and (created_at < ? or (created_at = ? and id < ?))`
@@ -4109,7 +4139,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 			oldest := messages[0]
 			nextCursor.Message = &conversationPagePosition{CreatedAt: oldest.CreatedAt, ID: oldest.ID}
 		}
-		writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": []Event{}, "hasMore": hasMoreMessages, "hasMoreMessages": hasMoreMessages, "nextCursor": encodeConversationPageCursor(nextCursor)})
+		writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": []Event{}, "hasMore": hasMoreMessages, "hasMoreMessages": hasMoreMessages, "nextCursor": encodeConversationPageCursor(nextCursor), "messagesCutoff": checkpointCutoffValue(cutoff), "messagesVisibleAfter": checkpointCutoffValue(rewoundAt)})
 		return
 	}
 	// 分页只走可回放事件：过程遥测（stream_event、thinking_tokens 等）一条都渲染不出来，
@@ -4117,9 +4147,9 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	// replayableEventsPredicate。
 	eventQuery := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=? and ` + replayableEventsPredicate("events")
 	eventArgs := []any{id}
-	if cutoff != nil {
-		eventQuery += ` and created_at <= ?`
-		eventArgs = append(eventArgs, *cutoff)
+	if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+		eventQuery += " and " + clause
+		eventArgs = append(eventArgs, clauseArgs...)
 	}
 	if cursor.Event != nil {
 		eventQuery += ` and (created_at < ? or (created_at = ? and id < ?))`
@@ -4181,7 +4211,9 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	if !hasMore {
 		nextCursor = conversationPageCursor{}
 	}
-	writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": events, "hasMore": hasMore, "hasMoreMessages": hasMoreMessages, "nextCursor": encodeConversationPageCursor(nextCursor)})
+	// messagesCutoff：见 checkpointCutoffValue —— 客户端要拿它把**本地**那一份里比节点更新的
+	// 消息也丢掉（它的列表是"本地内容 ∪ 这份回包"，只过滤服务端这份挡不住已被缓存的回合）。
+	writeJSON(w, 200, map[string]any{"conversation": c, "activeRunId": activeRunID, "messages": messages, "events": events, "hasMore": hasMore, "hasMoreMessages": hasMoreMessages, "nextCursor": encodeConversationPageCursor(nextCursor), "messagesCutoff": checkpointCutoffValue(cutoff), "messagesVisibleAfter": checkpointCutoffValue(rewoundAt)})
 }
 
 func (s *Server) listConversationActivity(w http.ResponseWriter, r *http.Request) {
@@ -4232,12 +4264,12 @@ func (s *Server) listConversationActivity(w http.ResponseWriter, r *http.Request
 		var latest conversationPagePosition
 		latestQuery := `select created_at,id from events where conversation_id=?`
 		latestArgs := []any{cursor.ConversationID}
-		if cutoff, cutoffErr := s.conversationCheckpointCutoff(r.Context(), cursor.ConversationID); cutoffErr != nil {
+		if cutoff, rewoundAt, cutoffErr := checkpointVisibilityFor(r.Context(), s.db, cursor.ConversationID); cutoffErr != nil {
 			writeError(w, http.StatusInternalServerError, cutoffErr)
 			return
-		} else if cutoff != nil {
-			latestQuery += ` and created_at <= ?`
-			latestArgs = append(latestArgs, *cutoff)
+		} else if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+			latestQuery += " and " + clause
+			latestArgs = append(latestArgs, clauseArgs...)
 		}
 		latestQuery += ` order by created_at desc,id desc limit 1`
 		err = s.db.QueryRowContext(r.Context(), latestQuery, latestArgs...).Scan(&latest.CreatedAt, &latest.ID)
@@ -4249,17 +4281,17 @@ func (s *Server) listConversationActivity(w http.ResponseWriter, r *http.Request
 			item.LatestPosition = &latest
 		}
 
-	query := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=?`
+		query := `select id,conversation_id,run_id,type,payload,created_at from events where conversation_id=?`
 		args := []any{cursor.ConversationID}
-	cutoff, cutoffErr := s.conversationCheckpointCutoff(r.Context(), cursor.ConversationID)
-	if cutoffErr != nil {
-		writeError(w, http.StatusInternalServerError, cutoffErr)
-		return
-	}
-	if cutoff != nil {
-		query += ` and created_at <= ?`
-		args = append(args, *cutoff)
-	}
+		cutoff, rewoundAt, cutoffErr := checkpointVisibilityFor(r.Context(), s.db, cursor.ConversationID)
+		if cutoffErr != nil {
+			writeError(w, http.StatusInternalServerError, cutoffErr)
+			return
+		}
+		if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+			query += " and " + clause
+			args = append(args, clauseArgs...)
+		}
 		if cursor.After != nil {
 			query += ` and (created_at > ? or (created_at = ? and id > ?))`
 			args = append(args, cursor.After.CreatedAt, cursor.After.CreatedAt, cursor.After.ID)
@@ -4321,12 +4353,12 @@ func (s *Server) listInputHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	query := `select content from messages where conversation_id=? and role='user'`
 	args := []any{conversationID}
-	if cutoff, cutoffErr := s.conversationCheckpointCutoff(r.Context(), conversationID); cutoffErr != nil {
+	if cutoff, rewoundAt, cutoffErr := checkpointVisibilityFor(r.Context(), s.db, conversationID); cutoffErr != nil {
 		writeError(w, http.StatusInternalServerError, cutoffErr)
 		return
-	} else if cutoff != nil {
-		query += ` and created_at <= ?`
-		args = append(args, *cutoff)
+	} else if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+		query += " and " + clause
+		args = append(args, clauseArgs...)
 	}
 	query += ` order by created_at desc limit ?`
 	args = append(args, limit)
@@ -4370,7 +4402,9 @@ func (s *Server) listProjectInputHistory(w http.ResponseWriter, r *http.Request)
 			limit = parsed
 		}
 	}
-	rows, err := s.db.QueryContext(r.Context(), `select messages.content from messages join conversations on conversations.id = messages.conversation_id where conversations.project_id = ? and messages.role = 'user' order by messages.created_at desc limit ?`, projectID, limit)
+	// ↑ 的输入历史是**项目级**的（跨会话），所以逐会话的可见性边界要在这里按行判断：
+	// 被回退掉的那些提示词不该出现在候选里（它们描述的工作已经作废了）。
+	rows, err := s.db.QueryContext(r.Context(), `select messages.content from messages join conversations on conversations.id = messages.conversation_id where conversations.project_id = ? and messages.role = 'user' and (conversations.checkpoint_hidden_after is null or messages.created_at <= conversations.checkpoint_hidden_after or messages.created_at > conversations.checkpoint_rewound_at) order by messages.created_at desc limit ?`, projectID, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -5339,12 +5373,27 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	var conversation Conversation
 	var projectPath string
 	var projectRunner string
-	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,p.path,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ProjectAgentRouteRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &projectPath, &projectRunner)
+	err = tx.QueryRowContext(ctx, `select c.id,c.project_id,c.claude_session_id,c.agent_id,c.agent_session_id,c.agent_runtime_id,c.agent_profile_revision_id,c.project_agent_route_revision_id,c.execution_policy,c.status,c.permission_mode,c.model_override,c.title,c.last_activity_at,c.claude_initialized,c.agent_initialized,c.is_current,c.created_at,c.pending_context_rebuild,p.path,coalesce(nullif(p.runner_id,''),p.runner) from conversations c join projects p on p.id=c.project_id where c.id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ProjectAgentRouteRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt, &conversation.PendingContextRebuild, &projectPath, &projectRunner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, "", nil, http.StatusNotFound, errors.New("conversation not found")
 	}
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
+	}
+	// 会话回退之后原生会话是全新的：第一轮要把保留下来的对话历史重新喂回去。否则模型
+	// 不但不记得被回退掉的回合（这是对的），连保留的那部分也不记得（这就错了）—— 而工作区
+	// 已经按那一刻恢复，模型只能靠这段历史理解自己从哪来。
+	//
+	// 只加在**发出去的提示词**上，不写进用户那条消息：界面里看到的仍然只是用户打的那句话。
+	prompt := content
+	if conversation.PendingContextRebuild {
+		preamble, preambleErr := s.contextRebuildPreamble(ctx, tx, conversationID)
+		if preambleErr != nil {
+			return Message{}, "", nil, http.StatusInternalServerError, preambleErr
+		}
+		if preamble != "" {
+			prompt = preamble + "\n\n" + content
+		}
 	}
 	if conversation.Status == "archived" {
 		return Message{}, "", nil, http.StatusConflict, errors.New("conversation was cleared; start a new conversation from its history")
@@ -5653,7 +5702,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		s.registerProfileRunCancelLocked(conversation.AgentProfileRevisionID, runID, cancel)
 		s.streamingSetups[runID] = &streamingSetup{}
 		s.mu.Unlock()
-		s.submitStreamingRunWithProfile(runCtx, streamingRunner, runID, conversation, profile, projectRunner, projectPath, content)
+		s.submitStreamingRunWithProfile(runCtx, streamingRunner, runID, conversation, profile, projectRunner, projectPath, prompt)
 		return m, runID, record, http.StatusAccepted, nil
 	}
 	if queuedNonStreaming {
@@ -5661,7 +5710,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		if s.nonStreamingLaunches == nil {
 			s.nonStreamingLaunches = map[string]*nonStreamingRunLaunch{}
 		}
-		s.nonStreamingLaunches[runID] = &nonStreamingRunLaunch{runner: runnerObj, conversation: conversation, profile: profile, runnerID: projectRunner, projectPath: projectPath, prompt: content}
+		s.nonStreamingLaunches[runID] = &nonStreamingRunLaunch{runner: runnerObj, conversation: conversation, profile: profile, runnerID: projectRunner, projectPath: projectPath, prompt: prompt}
 		s.mu.Unlock()
 		s.startNextNonStreamingRun(conversation.ID)
 		return m, runID, record, http.StatusAccepted, nil
@@ -5689,7 +5738,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		// 放在后台 goroutine 内执行：WSL/SSH 探测默认模型可能需拉起远程进程，
 		// 不阻塞发送请求的 Accepted 响应。
 		s.seedRunUsageModel(runID, conversation.AgentID, runModel(conversation.ModelOverride, profile), runnerObj)
-		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectRunner, projectPath, content)
+		s.runAgent(runCtx, runnerObj, runID, runToken, conversation, profile, projectRunner, projectPath, prompt)
 	}()
 	return m, runID, record, http.StatusAccepted, nil
 }
@@ -6474,14 +6523,20 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 		if err != nil {
 			tx.Rollback()
 		}
-	if committed && status == "completed" && runErr == nil {
-		var prompt string
-		if err := s.db.QueryRowContext(context.Background(), `select content from messages where run_id=? and role='user' order by created_at asc,id asc limit 1`, runID).Scan(&prompt); err == nil {
-			if err := s.createConversationCheckpoint(context.Background(), conversationID, runID, prompt); err != nil {
-				log.Printf("create conversation checkpoint for run %s: %v", runID, err)
+		if committed && status == "completed" {
+			// 这一轮真的跑完了：回退时喂回去的历史已被原生会话吸收，标记可以清了。
+			// 失败/被停止的回合**不清** —— 那时 CLI 可能压根没起来，下一轮重试必须重新喂一遍，
+			// 否则模型会在一段全新的会话里继续（比多喂一次糟得多）。
+			s.clearContextRebuildFlag(conversationID)
+		}
+		if committed && status == "completed" && runErr == nil {
+			var prompt string
+			if err := s.db.QueryRowContext(context.Background(), `select content from messages where run_id=? and role='user' order by created_at asc,id asc limit 1`, runID).Scan(&prompt); err == nil {
+				if err := s.createConversationCheckpoint(context.Background(), conversationID, runID, prompt); err != nil {
+					log.Printf("create conversation checkpoint for run %s: %v", runID, err)
+				}
 			}
 		}
-	}
 	}
 	payload := map[string]any{"status": status, "error": errorText(runErr)}
 	// Attach taskId so the frontend can link error cards to the task detail page.
@@ -7548,6 +7603,23 @@ func localizedErrorText(err error, fallback string) string {
 		return "Agent 在实现阶段没有产生任何文件改动，本次编排没有可提交的内容。请检查任务说明是否是一条可实施的改动要求，并到编排对话中查看 Agent 的回复。"
 	}
 
+	// 会话回退（rewindConversation）的拒绝原因。原文都是英文，不翻译的话用户看到的是
+	// "当前操作与进行中的操作冲突，请稍后重试。：checkpoint has no file snapshot; …" ——
+	// 既没说是哪一步不行，也没说还能做什么。这条链路里"没有代码快照"完全正常（远程 runner
+	// 项目、快照创建失败的节点），必须点明"只能恢复对话"，用户才知道换个按钮试。
+	if strings.Contains(message, "checkpoint snapshot unavailable") {
+		return "该节点的代码快照已不可用（可能已被清理或所在项目已删除），只能恢复对话。"
+	}
+	if strings.Contains(message, "checkpoint has no file snapshot") {
+		return "该节点没有代码快照（远程 runner 项目或快照创建失败），只能恢复对话。"
+	}
+	if strings.Contains(message, "remote runner does not support local checkpoint code restore") {
+		return "远程 runner 项目不支持恢复代码，只能恢复对话。"
+	}
+	if strings.Contains(message, "conversation has an active run") {
+		return "会话正在运行中，请先停止当前任务再回退。"
+	}
+
 	translations := map[string]string{
 		"project not found":             "项目不存在或已被删除。",
 		"project worktree is not clean": "项目工作区存在未提交或未跟踪的更改。请提交、暂存或清理这些更改后重试任务编排。",
@@ -7563,6 +7635,11 @@ func localizedErrorText(err error, fallback string) string {
 		"main does not contain this task branch commit":                         "main 尚未包含该任务分支的提交。请先合并分支，再确认完成。",
 		"task branch status changed before confirmation":                        "任务分支状态已变化，请刷新后重试确认。",
 		"conversation not found":                                                "会话不存在或已被删除。",
+		"checkpoint not found":                                                  "该节点已不存在（可能已被清理），请刷新后重试。",
+		"checkpointId is required":                                              "缺少要回退的节点，请刷新页面后重试。",
+		"invalid rewind request":                                                "回退请求无效，请刷新页面后重试。",
+		"mode must be conversation, code, or conversation_and_code":             "回退方式只能是「恢复对话」「恢复代码」或「恢复全部」。",
+		"native agent session is still stopping":                                "会话正在重启，请稍后重试。",
 		"run not found":                                                         "任务运行记录不存在。",
 		"invalid JSON request":                                                  "请求内容不是有效的 JSON。",
 		"conversation was cleared; start a new conversation from its history":   "该会话已清空，请先从历史记录恢复后再发送消息。",

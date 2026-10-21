@@ -71,5 +71,27 @@ func (s *Server) remoteConversationOperations() map[string]remoteOperation {
 			Query:  true,
 			Handle: s.stopConversationRuns,
 		},
+		// 会话回退节点：列表是只读的，回退是**破坏性**的（改工作区文件、可能删掉快照之后
+		// 新建的文件），所以手机端必须先读列表、拿到节点 id，再按 id 回退 —— 与桌面端
+		// 「回退到此处」同一条服务端路径，不另写一套判据。
+		//
+		// 列表带上限：节点本身只有 id/提示词/时间/状态，但一条会话最多保留 50 个节点，
+		// 提示词可能很长（每条约 200 字），整帧要留在中继预算之内。
+		"conversation.checkpoints": {
+			Method:   http.MethodGet,
+			Scope:    relayScopeConversation,
+			Path:     "/checkpoints",
+			MaxBytes: 64 << 10,
+			Label:    "回退节点",
+			Handle:   s.listConversationCheckpoints,
+		},
+		// 回退请求体与桌面端逐字同形（checkpointId / mode / fork），复用同一个 handler：
+		// 手机端只发 mode，不发 fork（"从节点分支"是电脑端才有的动作）。
+		"conversation.rewind": {
+			Method: http.MethodPost,
+			Scope:  relayScopeConversation,
+			Path:   "/rewind",
+			Handle: s.rewindConversation,
+		},
 	}
 }

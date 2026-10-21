@@ -584,7 +584,18 @@ func (s *Server) batchContext(ctx context.Context, job OrchestrationJob) (string
 	if err != nil {
 		return "", err
 	}
-	rows, err := s.db.QueryContext(ctx, `select role,content from messages where conversation_id=? and parent_tool_use_id='' order by created_at desc limit 8`, conversationID)
+	// 续跑的上下文同样按"回退之后看得见什么"取：被回退掉的回合不能喂给下一条任务
+	// （它们描述的代码状态已经不存在了）。
+	contextQuery := `select role,content from messages where conversation_id=? and parent_tool_use_id=''`
+	contextArgs := []any{conversationID}
+	if cutoff, rewoundAt, cutoffErr := checkpointVisibilityFor(ctx, s.db, conversationID); cutoffErr != nil {
+		return "", cutoffErr
+	} else if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
+		contextQuery += " and " + clause
+		contextArgs = append(contextArgs, clauseArgs...)
+	}
+	contextQuery += ` order by created_at desc limit 8`
+	rows, err := s.db.QueryContext(ctx, contextQuery, contextArgs...)
 	if err != nil {
 		return "", err
 	}

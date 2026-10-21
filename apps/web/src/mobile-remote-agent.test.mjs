@@ -12,6 +12,9 @@ const styles = normalize(await readFile(new URL("./pages/mobile-remote.css", imp
 // 设备表（多设备 + 备注名）那一层。这里只做**结构/接线**断言：`alias` 是不是走同一处归一化、
 // 重新配对有没有继承。真正的行为判据在 `lib/mobile-devices.test.ts`（那份能直接跑函数）。
 const lib = normalize(await readFile(new URL("./lib/mobile-devices.ts", import.meta.url), "utf8"));
+// 手机端会话历史的分页链（2026-10-20 从页面里搬出来）：缩页重试、续页、去重都在这里，
+// 页面只负责接线。分页判据的断言因此读这个模块，而不是在页面源码里找实现。
+const mobileHistory = normalize(await readFile(new URL("./features/remote/mobile-conversation-history.ts", import.meta.url), "utf8"));
 const remoteDevicesHook = normalize(await readFile(new URL("./features/remote/use-remote-devices.ts", import.meta.url), "utf8"));
 const nativeScannerHook = normalize(await readFile(new URL("./features/remote/use-native-barcode-scanner.ts", import.meta.url), "utf8"));
 const pendingTasksHook = normalize(await readFile(new URL("./features/remote/use-mobile-pending-tasks.ts", import.meta.url), "utf8"));
@@ -598,7 +601,9 @@ test("mobile message bubbles reveal an icon action row instead of opening a shee
   // 分组名字里带不带那句"此刻只能复制"，取决于这条消息落没落定 —— 禁用图标**不可聚焦**，
   // 它的 title/aria-label 在焦点模式下根本读不到，所以原因必须挂到分组这个能读到的容器上。
   assert.match(page, /\{messageActionId === entry\.message\.id && <div className="mobile-message-actions" id=\{`mobile-message-actions-\$\{index\}`\} ref=\{messageActionsRef\} role="group" aria-label=\{`\$\{entry\.message\.role === "user" \? "我" : "Agent"\}这条消息的操作\$\{isTransientMessage\(entry\.message\) \? `（\$\{transientReason\(entry\.message, "row"\)\}）` : ""\}`\}>/);
-  assert.equal((page.match(/className="mobile-message-action-icon"/g) || []).length, 3, "复制 / 引用 / 重发三颗");
+  // 复制 / 引用 / 重发 / 回退四颗。回退（2026-10-20 加）只在"这一轮在服务端留了节点"时出现，
+  // 点它只**打开确认框**、不在菜单里直接执行 —— 回退会改电脑端的工作区文件，是不可撤销的。
+  assert.equal((page.match(/className="mobile-message-action-icon"/g) || []).length, 4, "复制 / 引用 / 重发 / 回退四颗");
   {
     // ⚠️ 反例断言必须**切到图标行这一块**再扫，不能扫全文件：`重新生成` 在电脑端那张配对卡片上
     // 是另一件事（「重新生成二维码」），扫全文件会让这条断言永远红。剥注释同理 ——
@@ -2177,22 +2182,27 @@ test("mobile conversation selection follows the shared desktop current conversat
 test("mobile history paging continues only while message pages remain", () => {
   // getConversation 的 hasMore 还包括可回放运行事件；手机历史只渲染消息。
   // 用总标记续页会在消息耗尽后为事件反复请求历史，甚至带回重复消息。
-  assert.match(page, /const hasMore = page\?\.hasMoreMessages === true && Boolean\(nextCursor\);/);
-  assert.doesNotMatch(page, /const hasMore = page\?\.hasMore === true && Boolean\(nextCursor\);/);
-  assert.match(page, /const params: Record<string, string> = \{ limit: String\(pageSize\), messagesOnly: "true" \};\s*if \(cursor\) params\.cursor = cursor;/);
+  // 分页循环 2026-10-20 搬到 features/remote/mobile-conversation-history.ts（页面只接线），
+  // 断言跟着实现走，否则这里守的是一份已经不存在的代码。
+  assert.match(mobileHistory, /const hasMore = page\?\.hasMoreMessages === true && Boolean\(nextCursor\);/);
+  assert.doesNotMatch(mobileHistory, /const hasMore = page\?\.hasMore === true && Boolean\(nextCursor\);/);
+  assert.match(mobileHistory, /const params: Record<string, string> = \{ limit: String\(pageSize\), messagesOnly: "true" \};\s*if \(next\) params\.cursor = next;/);
 });
 
 test("mobile history never requests the same cursor concurrently", () => {
-  assert.match(page, /const historyPageLoadsRef = useRef\(new Set<string>\(\)\);/);
-  assert.match(page, /const loadKey = `\$\{instanceID\}\\u0000\$\{projectID\}\\u0000\$\{conversationID\}\\u0000\$\{cursor\}\\u0000\$\{pageSize\}`;/);
-  assert.match(page, /if \(historyPageLoadsRef\.current\.has\(loadKey\)\) return;\s*historyPageLoadsRef\.current\.add\(loadKey\);/);
-  assert.match(page, /finally \{\s*historyPageLoadsRef\.current\.delete\(loadKey\);\s*\}/);
+  // 同一会话的分页链只允许一条：缩页重试与自动续页都在链内顺序执行，后来者复用同一个 promise。
+  // 这比"按游标登记 Set"更强 —— 它把不同页之间的并发也一起挡住了。
+  assert.match(mobileHistory, /const loads = new Map<string, Promise<void>>\(\);/);
+  assert.match(mobileHistory, /const key = JSON\.stringify\(\[projectID, conversationID\]\);/);
+  assert.match(mobileHistory, /const pending = loads\.get\(key\);\s*if \(pending\) return pending;/);
+  assert.match(mobileHistory, /finally\(\(\) => \{ if \(loads\.get\(key\) === promise\) loads\.delete\(key\); \}\)/);
 });
 
 test("mobile history retries an oversized relay page with fewer messages", () => {
-  assert.match(page, /!reply\.ok && reply\.status === 413 && pageSize > 1/);
-  assert.match(page, /loadConversationHistory\(projectID, conversationID, cursor, Math\.max\(1, Math\.floor\(pageSize \/ 2\)\)\)/);
-  assert.match(page, /loadConversationHistory\(projectID, conversationID, nextCursor, pageSize\)/);
+  assert.match(mobileHistory, /!reply\.ok && reply\.status === 413 && pageSize > 1/);
+  assert.match(mobileHistory, /pageSize = Math\.max\(1, Math\.floor\(pageSize \/ 2\)\);/);
+  // 缩页之后仍从同一个游标重试，不能往下一页跳（跳了等于永久丢掉中间那段）。
+  assert.match(mobileHistory, /let next = cursor;/);
 });
 
 test("mobile conversation header collapses to one line with an overflow menu", () => {
@@ -2563,7 +2573,14 @@ test("the snapshot replays tool confirmations so a stuck run is visible after re
   // 取数条件从"只有类型表"变成了类型表 + 排除空转子类型：快照的窗口是定长的，而 CLI 每几秒
   // 一条 {"status":"requesting","subtype":"status"} 会把 24 格占满（实测只剩 4~10 格是真卡片），
   // 一张"后台任务启动"卡片几分钟就被挤出去。所以这里必须锁到**新**的谓词上。
-  assert.match(remote, /where conversation_id=\? and %s order by created_at desc,id desc limit \?`, remoteNoticeReplayPredicate\("events"\)\)/);
+  // 取数条件再加一条**会话回退节点的可见性过滤**：快照是手机端历史的主要来源，
+  // 漏掉它等于"用户在电脑端回退了，手机端把丢掉的回合原样拿回来"。判据收口在
+  // checkpointVisibilityClause（节点时间 + 最近一次回退时刻，见 docs/48 §4），
+  // 所以这里锁"用了它"，而不是锁某一段具体 SQL。
+  assert.match(remote, /query := fmt\.Sprintf\(`select id,run_id,type,payload,created_at from events where conversation_id=\? and %s`, remoteNoticeReplayPredicate\("events"\)\)/);
+  assert.match(remote, /if clause, clauseArgs := checkpointVisibilityClause\("created_at", cutoff, rewoundAt\); clause != "" \{/);
+  assert.match(remote, /query \+= ` order by created_at desc,id desc limit \?`/);
+  assert.match(remote, /args = append\(args, remoteSnapshotNoticesPerConversation\)/);
   const replayPredicate = remote.match(/func remoteNoticeReplayPredicate\(alias string\) string \{[\s\S]*?\n\}/)?.[0] ?? "";
   // 锚点先自证存在：抠不到函数体时下面的断言会退化成对空串匹配。
   assert.ok(replayPredicate, "找不到 remoteNoticeReplayPredicate（签名变了就更新本用例的锚点）");
@@ -3862,7 +3879,9 @@ test("mobile conversation can actually be stopped from the composer", () => {
   assert.match(page, /useEffect\(\(\) => \{\n    if \(!conversationProcessing\) setStoppingConversation\(false\);\n  \}, \[conversationProcessing\]\);/);
   // 换会话无条件复位这两个状态：它们说的是"我刚对**屏幕上这条会话**做了一次停止"。
   // 少了它，在 A 上点了停止再切到也在跑的 B，B 的停止键会显示「停止中」并被禁掉好几秒。
-  assert.match(page, /useEffect\(\(\) => \{ setStoppingConversation\(false\); setStopConfirmTarget\(""\); \}, \[conversation\?\.id\]\);/);
+  // 换会话时无条件复位这组"我刚才对屏幕上这条会话做的动作"：少一个，"关于 A"的确认框就会
+  // 浮在 B 上（回退那颗也一样 —— 它同样会把电脑端的工作区按 A 的节点改回去）。
+  assert.match(page, /useEffect\(\(\) => \{ setStoppingConversation\(false\); setStopConfirmTarget\(""\); setRewindTarget\(null\); \}, \[conversation\?\.id\]\);/);
   // 兜底放开：上面那两条都是"别人来摘"，而 processingConversations 里那条乐观记录是有可能
   // 清不掉的（还有待确认的消息时对账会跳过它）—— 没有这一条，按钮就可能永远禁着。
   assert.match(page, /const conversationStopFallbackMs = 60_000;/);
@@ -3905,7 +3924,13 @@ test("mobile conversation can actually be stopped from the composer", () => {
   // 侧滑返回（popstate → leaveConversationView）**不走** backHandlerRef，所以那条链上也要收一次。
   // 这个文件里为同一件事记过两次（编辑/删除任务那两张弹层就是这么漏的）：两处必须一致。
   // 用剥掉注释的 pageCode 比对 —— 中间只该剩空白，注释不算证据。
-  assert.match(pageCode, /setConfirmUnbind\(""\);\s*setStopConfirmTarget\(""\);/);
+  // 「回退到此处」确认框（2026-10-20 加）同样两处都要收：它的「确认回退」会真的改掉电脑端的
+  // 工作区文件（还会删掉快照之后新建的文件）。这一条同时钉住"新加的弹层也要进这条纪律"，
+  // 而不只是那两张老弹层。
+  const leaveView = pageCode.slice(pageCode.indexOf("function leaveConversationView()"));
+  const stopAt = leaveView.indexOf('setStopConfirmTarget("");');
+  const rewindAt = leaveView.indexOf("setRewindTarget(null);");
+  assert.ok(stopAt > 0 && rewindAt > stopAt, "侧滑返回那条链也要收掉「回退到此处」确认框");
 
   // ⑧ 样式：停止键是**文字**胶囊，不是 38px 的图标圆钮 —— 所以宽高都要放开，
   //    否则"停止中"三个字会挤在一个 38px 的圆里（这正是一条只想改配色的人会踩的坑）。
