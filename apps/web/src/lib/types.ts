@@ -21,7 +21,7 @@ export type ProjectProcessStatusMap = Record<string, ProjectProcessStatus>;
 export type RunStatusEvent = { projectId: string; status: RunStatus; sequence?: number; startedAt?: string | null; pid?: number | null };
 export type ProjectFilter = "all" | "running" | "ready" | "offline";
 export type PermissionMode = "approval_required" | "full_control" | "read_only" | "workspace_write";
-export type AgentID = "claude-code" | "codex" | "codebuddy";
+export type AgentID = "claude-code" | "codex" | "codebuddy" | "qoder" | "opencode" | "cursor";
 export type Conversation = { id: string; status: string; agentId: AgentID; agentSessionId: string; agentRuntimeId: string; agentProfileRevisionId?: string; executionPolicy: PermissionMode; permissionMode: PermissionMode; modelOverride?: string; title: string; preview?: string; lastActivityAt: string; isCurrent: boolean; isOrchestration?: boolean };
 // 托盘面板"最近会话"（GET /api/conversations/recent）：会话摘要 + 所属项目名。
 export type RecentConversation = Conversation & { projectId: string; projectName: string };

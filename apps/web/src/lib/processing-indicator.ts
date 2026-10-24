@@ -108,18 +108,6 @@ export function formatElapsed(ms: number): string {
   return `${hours} 小时 ${totalMinutes % 60} 分`;
 }
 
-// 徽标上的 Agent 名与配色档位。
-//   claude —— Claude Code，用它的品牌橙
-//   codex  —— Codex，用近黑墨色
-// fallback 落在 claude 上是为了**不改现有观感**：未知 agent 原先就显示"Claude Code"，
-// 这里保持同一个默认，只是把颜色一起带上。
-export type ProcessingBadgeTone = "claude" | "codex";
-
-export function processingBadge(agentId: string): { label: string; tone: ProcessingBadgeTone } {
-  if (agentId === "codex") return { label: "Codex", tone: "codex" };
-  return { label: "Claude Code", tone: "claude" };
-}
-
 // 从会话的通知列表里取"最新的一条"。
 //
 // 不直接取数组最后一项：服务端合并通知时（merge: "append"）是往同一条上并内容，

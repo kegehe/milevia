@@ -281,23 +281,40 @@ test("有任务在跑时不给任何操作入口", () => {
   }
 });
 
-// ── 「登录」这颗按钮给不给 ──────────────────────────────────────────────────
+// ── 登录那一格给不给、给哪一种 ─────────────────────────────────────────────
 
-test("支持登录的工具，装好了就在卡片上给「登录」", () => {
-  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }) }));
-  assert.equal(card.canLogin, true);
+test("已登录：不给「登录」，给「已登录」", () => {
+  // 2026-10-23 的实测反馈：在终端里登录成功之后，卡片上还亮着一颗「登录」——
+  // 用户会以为登录没生效。判据必须是**登录态**，而不只是 supportsLogin + 装没装。
+  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }), authStatus: "logged_in" }));
+  assert.equal(card.login, "logged-in");
   // 它与主操作位是**两件事**：登录是"能做的事"，不该顶掉"要做的事"。
-  // 已是最新时主操作位空着，登录照样给。
   assert.equal(card.primary, undefined);
   assert.equal(card.statusTone, "ok");
 });
 
-test("不给「登录」的三档：不支持登录、没装、正有任务在跑", () => {
+test("未登录 / 判断不了：都给「登录」入口", () => {
+  // 未登录：这是此刻该做的事。
+  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: true }), authStatus: "logged_out" })).login, "not-logged-in");
+  // 判断不了：codebuddy 永远自报不了登录态。不给入口等于让它无法从这一页登录，
+  // 但也**不许**把这一档记成未登录（面板里说法不同，见 authStatus）。
+  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: true }), authStatus: "unreadable" })).login, "not-logged-in");
+});
+
+test("还没读到登录态：不给入口，也不冒充未登录", () => {
+  // undefined = 页面刚进来、后台那次探测还没回来。这一档亮出「登录」，就会让一个已登录
+  // 的工具在首屏闪一颗按钮 —— 而登录态是**另一个读数**，不该由"没读到"来填。
+  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }) }));
+  assert.equal(card.login, undefined);
+});
+
+test("不给登录那一档的三种情况：不支持登录、没装、正有任务在跑", () => {
   // ① 工具本身不支持平台内登录。
-  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: false }) })).canLogin, false);
-  assert.equal(buildToolCard(input({ entry: entry({}) })).canLogin, false, "目录没给这个字段时不许当成支持");
+  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: false }), authStatus: "logged_out" })).login, undefined);
+  assert.equal(buildToolCard(input({ entry: entry({}), authStatus: "logged_out" })).login, undefined, "目录没给这个字段时不许当成支持");
   // ② 没装：点进去服务端会 404，点亮一个必失败的按钮比不亮更坏。
-  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: true }), item: item({ installed: false, version: "" }) })).canLogin, false);
+  const notInstalled = buildToolCard(input({ entry: entry({ supportsLogin: true }), item: item({ installed: false, version: "" }), authStatus: "logged_out" }));
+  assert.equal(notInstalled.login, undefined);
   // ③ 正有任务在跑：界面此时什么都不给。
   //    ⚠️ 2026-10-09 复查修正：这条原来写的理由是"服务端会拒"——**不成立**。
   //    `runAgentLogin`（agent_login.go:44-77）没有维护闸门，只查 supportsLogin 与 backend
@@ -305,20 +322,38 @@ test("不给「登录」的三档：不支持登录、没装、正有任务在�
   //    所以这一档是**界面自己收得更紧**，理由只能是"那个工具正在被替换，此刻发起的登录
   //    会跑到半成品上"（顺带：卡片上的登录入口是唯一的入口，抽屉那颗 2026-10-08 已删，
   //    于是这段时间全页没有登录入口）。要放开这一档，先确认登录流程能在替换期间安全跑完。
-  assert.equal(buildToolCard(input({ entry: entry({ supportsLogin: true }), item: item({ operation: "running" }) })).canLogin, false);
+  const running = buildToolCard(input({ entry: entry({ supportsLogin: true }), item: item({ operation: "running" }), authStatus: "logged_out" }));
+  assert.equal(running.login, undefined);
 });
 
-test("读数还在路上时不给「登录」", () => {
+test("读数还在路上时不给登录入口", () => {
   // 这一档要盖掉上一个执行环境留下的 item（loadView 重读时不清旧 view）——
   // 照旧读数亮出「登录」，会是在一台还没读到的机器上按上一台的信息给动作。
-  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }), reading: true, item: item({ installed: true }) }));
-  assert.equal(card.canLogin, false);
+  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }), reading: true, item: item({ installed: true }), authStatus: "logged_out" }));
+  assert.equal(card.login, undefined);
 });
 
-test("「登录」不进 primary，因此也不参与横幅的任何一条分支", () => {
-  // 一个"已是最新、支持登录"的健康工具不该上横幅 —— 横幅只说"有事"。
-  const healthy = buildToolCard(input({ entry: entry({ supportsLogin: true }), latest: UP_TO_DATE }));
-  assert.equal(healthy.canLogin, true);
+test("未登录时状态行不再说「不用管它」，但它也不上横幅", () => {
+  // 装好了、版本也最新，唯独没有凭据：这张卡现在**用不了**，下一步就是登录。
+  const card = buildToolCard(input({ entry: entry({ supportsLogin: true }), latest: UP_TO_DATE, authStatus: "logged_out" }));
+  assert.equal(card.statusText, "还没登录，登录之后才能用。");
+  assert.equal(card.statusTone, "warn");
+  assert.equal(card.icon, "alert");
+  assert.equal(card.loginBlocked, true);
+  // 但横幅不点名它：横幅点开的是抽屉，而抽屉里没有登录入口 —— 那会变成
+  // "说有事情要处理，点进去却没有可做的事"。
+  assert.equal(bannerFor([card]), undefined);
+  // 判断不了（unreadable）**不动**状态行：不能替一台机器说"没登录"。
+  const unknown = buildToolCard(input({ entry: entry({ supportsLogin: true }), latest: UP_TO_DATE, authStatus: "unreadable" }));
+  assert.equal(unknown.statusText, "已是最新，不用管它。");
+  assert.equal(unknown.statusTone, "ok");
+  assert.equal(unknown.loginBlocked, false);
+});
+
+test("登录那一格不进 primary，因此也不参与横幅的任何一条分支", () => {
+  // 一个"已是最新、登录着"的健康工具不该上横幅 —— 横幅只说"有事"。
+  const healthy = buildToolCard(input({ entry: entry({ supportsLogin: true }), latest: UP_TO_DATE, authStatus: "logged_in" }));
+  assert.notEqual(healthy.login, undefined);
   assert.equal(bannerFor([healthy]), undefined);
 });
 
@@ -687,26 +722,36 @@ test("执行环境只念机器名：本机两档是 Windows / WSL，远端仍用
   assert.equal(runnerLabel(undefined), "");
 });
 
-// ── 手动安装命令 ───────────────────────────────────────────────────────────
+// ── 手动安装 ───────────────────────────────────────────────────────────────
 
-test("手动安装命令：npm 全局分发的工具给命令，别的分发方式**不回落**", () => {
+test("手动安装：npm 全局分发的工具给命令，别的分发方式**不回落成 npm**", () => {
   const rows = buildManualInstallRows([
     entry({ id: "claude-code", name: "Claude Code", npmPackage: "@anthropic-ai/claude-code" }),
     entry({ id: "codex", name: "Codex", npmPackage: "@openai/codex" }),
-    // 将来若有非 npm 分发的工具：**不进这一列**。回落成 `npm install -g` 等于
-    // 教用户做错事 —— 与 installBlockNote 里"四档不回落"是同一条纪律。
-    entry({ id: "native-thing", name: "Native Thing", installKind: "native", npmPackage: "@x/native" }),
+    // 原生分发的工具：**绝不**回落成 `npm install -g`（Cursor 的 npm 包是第三方包），
+    // 只给目录里登记过的官方说明地址。
+    entry({ id: "native-thing", name: "Native Thing", installKind: "native", npmPackage: "@x/native", docsUrl: "https://example.com/native" }),
     // 声明是 npm 全局但没给包名：也拼不出命令，同样不进列（而不是拼出半条）。
     entry({ id: "broken", name: "Broken", npmPackage: "" }),
   ]);
 
   assert.deepEqual(rows, [
-    { id: "claude-code", name: "Claude Code", command: "npm install -g @anthropic-ai/claude-code@latest" },
-    { id: "codex", name: "Codex", command: "npm install -g @openai/codex@latest" },
+    { id: "claude-code", name: "Claude Code", kind: "command", command: "npm install -g @anthropic-ai/claude-code@latest" },
+    { id: "codex", name: "Codex", kind: "command", command: "npm install -g @openai/codex@latest" },
+    { id: "native-thing", name: "Native Thing", kind: "docs", docsUrl: "https://example.com/native" },
   ]);
 });
 
-test("手动安装命令：清单不随「装没装」变（它是手册，不是状态面板）", () => {
+test("手动安装：原生工具没有官方说明地址时不进列（不猜地址、不拿官网顶替）", () => {
+  // 猜一条地址会把用户送到错误的安装说明 —— 宁可这一行不出现。
+  assert.deepEqual(buildManualInstallRows([
+    entry({ id: "native-no-docs", name: "Native No Docs", installKind: "native", npmPackage: "@x/native" }),
+    // homepage 不是安装说明，不能顶替 docsUrl。
+    entry({ id: "native-homepage", name: "Native Homepage", installKind: "native", homepage: "https://example.com" }),
+  ]), []);
+});
+
+test("手动安装：清单不随「装没装」变（它是手册，不是状态面板）", () => {
   // 这条钉住的是"别把已装的工具过滤掉"：已装的工具拿同一条命令就是升级，
   // 而这一块存在的意义正是"平台装不了时自己上手"。
   const catalog = [entry({ id: "claude-code" }), entry({ id: "codex", npmPackage: "@openai/codex" })];

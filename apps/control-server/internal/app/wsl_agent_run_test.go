@@ -57,6 +57,7 @@ func TestWslNativeCommandScript(t *testing.T) {
 		".npm-global/bin",
 		"/home/tangmaoke/.nvm/versions/node/v22.22.2/bin",
 		`cd "$(echo L2hvbWUvdGFuZ21hb2tlL3Byb2o= | base64 -d)"`, // /home/tangmaoke/proj
+		"|| exit 1", // workdir 不存在时不能继续在家目录里运行 CLI
 		"exec codex",
 		`"$(echo`, // 每个参数均为双引号包裹的 base64 命令替换
 	} {

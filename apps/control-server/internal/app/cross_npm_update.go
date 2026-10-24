@@ -25,12 +25,17 @@ import (
 // crossCommandRunner 是"在目标环境跑一条命令拿输出"。
 type crossCommandRunner func(ctx context.Context, script string) (string, error)
 
-// runCrossCLIUpdate 是在目标环境里跑 `<cli> update` 的完整编排。
+// runCrossCLIUpdate 是在目标环境里跑 `<cli> <updateArgs>` 的完整编排。
+//
+// updateArgs 来自目录：Claude/Codex 是 `update`，OpenCode 是 `upgrade`。写死
+// `update` 会让目录里声明了别的子命令的工具在跨端升级时必然失败。
 //
 // where 只用于报错文案（"远程服务器"、"WSL 内"）。
 func runCrossCLIUpdate(
 	ctx context.Context,
-	where, commandName, displayName string,
+	where, commandName string,
+	updateArgs []string,
+	displayName string,
 	install npmCLIInstall,
 	run crossCommandRunner,
 	version func(context.Context) string,
@@ -41,10 +46,14 @@ func runCrossCLIUpdate(
 	}
 	// 先确认这个命令确实来自那个 npm 包，再动它 —— 顺序不能反。
 	recovery, recoveryErr := npmCLIRecoveryFor(ctx, run, install)
-	out, err := run(ctx, commandName+" update")
+	updateCommand := shellQuote(commandName)
+	for _, arg := range updateArgs {
+		updateCommand += " " + shellQuote(arg)
+	}
+	out, err := run(ctx, updateCommand)
 	if err != nil {
 		return finishCrossNpmUpdate(previous, displayName, version, run,
-			fmt.Errorf("%s执行 %s update 失败：%w%s", where, commandName, err, updateOutputDetail(out)), recovery, recoveryErr)
+			fmt.Errorf("%s执行 %s %s 失败：%w%s", where, commandName, strings.Join(updateArgs, " "), err, updateOutputDetail(out)), recovery, recoveryErr)
 	}
 	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -61,7 +70,7 @@ func runCrossCLIUpdate(
 // 只接受提供该命令的包：一次失败的升级不该去动无关的全局包（这与 doctor 式的
 // "找到什么修什么"是相反的取舍 —— 宁可回滚不可用，也不要改错东西）。
 func npmCLIRecoveryFor(ctx context.Context, run crossCommandRunner, install npmCLIInstall) (remoteNpmCLIRecovery, error) {
-	expected := pathpkg.Join("$prefix", "lib", "node_modules", install.scope, install.packageName, "bin", install.binFile)
+	expected := pathpkg.Join("$prefix", "lib", "node_modules", install.scope, install.packageName, install.binPath)
 	command := fmt.Sprintf(`set -eu
 prefix=$(npm prefix -g)
 command_path=$(command -v %s)

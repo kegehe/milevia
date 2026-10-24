@@ -156,7 +156,9 @@ func (s *Server) gitConflictSuggest(w http.ResponseWriter, r *http.Request) {
 	if input.Agent == "" {
 		input.Agent = "claude-code"
 	}
-	if !validProfileAgent(input.Agent) {
+	// 只接受已接通只读分析协议的工具：runReadOnlyAgent 对其余 ID 会回落到
+	// Claude runner，直接放行等于用错工具生成建议。
+	if entry, ok := agentByID(input.Agent); !ok || !entry.SupportsProjectInsights {
 		writeError(w, http.StatusBadRequest, errors.New("unsupported agent"))
 		return
 	}

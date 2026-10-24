@@ -52,6 +52,10 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	{ methods: ["POST"], pattern: /^\/api\/runners\/[^/]+\/(agents\/[^/]+\/(install|update|repair)|runtime\/install)$/, timeoutMs: installTimeoutMs },
 	// 旧路径，与上面的 agents/{id}/update 是同一段（agent_routes.go 的薄委托）
 	{ methods: ["POST"], pattern: /^\/api\/runners\/[^/]+\/(claude|codex)\/update$/, timeoutMs: installTimeoutMs },
+// 登录态是**探测**：Qoder 的 `status` 冷启动实测 7.5 秒（node + 70MB bundle），
+// 服务端给它 20 秒预算。不放进这一档的话，前端 15 秒先放弃，用户看到"请求超时"，
+// 而真实结论可能只是"还没读完"——那会诱导他去重复登录一次。
+{ methods: ["GET"], pattern: /^\/api\/runners\/[^/]+\/agents\/[^/]+\/login-status$/, timeoutMs: probeTimeoutMs },
 
 	// ── git 写操作 ── **全部**写操作。判据是"它们统统走同一个 backend"：单条 git 命令
 	// 的上限是 gitCommandTimeout = 30 秒（git.go 的 localGitBackend.runGit），SSH 项目还要

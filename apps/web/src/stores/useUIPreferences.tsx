@@ -101,7 +101,7 @@ function readLocalPreferences(): LocalPreferences {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return defaultLocalPreferences;
     const value = parsed as Partial<LocalPreferences>;
     return {
-      defaultAgentId: value.defaultAgentId === "codex" || value.defaultAgentId === "codebuddy" || value.defaultAgentId === "claude-code"
+      defaultAgentId: value.defaultAgentId === "codex" || value.defaultAgentId === "codebuddy" || value.defaultAgentId === "qoder" || value.defaultAgentId === "opencode" || value.defaultAgentId === "cursor" || value.defaultAgentId === "claude-code"
         ? value.defaultAgentId
         : defaultLocalPreferences.defaultAgentId,
       systemNotificationsEnabled: typeof value.systemNotificationsEnabled === "boolean" ? value.systemNotificationsEnabled : defaultLocalPreferences.systemNotificationsEnabled,

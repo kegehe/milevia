@@ -48,7 +48,7 @@ import {
 import { normalizeDiagnosis, normalizeDiagnostics } from "../lib/cli-diagnosis";
 import type { AgentDiagnosis, AgentDiagnosisWire, DiagnoseRemedy, RepairResult, RunnerDiagnosticsViewWire } from "../lib/cli-diagnosis";
 import { bannerFor, buildManualInstallRows, buildToolCard, grantNeededReason, latestLoading, runnerLabel, runtimeDepLine } from "../lib/cli-tools-view";
-import type { LatestRead, RuntimeStatus, RunnerAgentItem, ToolCard } from "../lib/cli-tools-view";
+import type { AgentAuthStatus, LatestRead, RuntimeStatus, RunnerAgentItem, ToolCard } from "../lib/cli-tools-view";
 import type { RunnerInfo } from "../lib/types";
 import "./cli-tools.css";
 
@@ -76,6 +76,18 @@ type CheckUpdateResult = {
   updateAvailable: boolean;
   latestVersion?: string;
   error?: string;
+};
+
+/**
+ * `GET …/login-status` 的响应。
+ *
+ * **只读 authStatus 与 note**：服务端还回一个 loggedIn，那是给旧客户端留的兼容位
+ * （bool 表达不了"判断不了"，而"判断不了"被念成"未登录"正是这一轮要修的事）。
+ */
+type LoginStatusResult = {
+  /** 空串 = 服务端没给出结论（"调用方没等到"那一档），按判断不了处理。 */
+  authStatus?: AgentAuthStatus | "";
+  note?: string;
 };
 
 /** 待确认的动作。安装、升级与修复都要先确认：它们会改动目标环境上的东西。 */
@@ -124,7 +136,30 @@ export default function CliToolsPage() {
   const [loginAgent, setLoginAgent] = useState<{ agentID: string; name: string } | null>(null);
   const [loginInfo, setLoginInfo] = useState<{ authUrl?: string; userCode?: string; message?: string } | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
-  const [loggedIn, setLoggedIn] = useState(false);
+  /**
+   * 面板里显示的那一份登录态。
+   *
+   * 与卡片共用同一个来源（authStates）：打开面板时先把已知结论填进来，所以一个已登录的
+   * 工具点进去**直接看到「已登录」**，不用再点一次「检查登录状态」。空串 = 还不知道。
+   */
+  const [loginAuth, setLoginAuth] = useState<AgentAuthStatus | "">("");
+  /** 判断不了时的原因（"这次为什么没读成"），由服务端给。 */
+  const [loginNote, setLoginNote] = useState("");
+  /**
+   * 逐工具的登录态读数，按 「runner:agent」 索引。
+   *
+   * 它**不在** /agents 那条响应里：那条接口是首屏瓶颈，而登录态要起一个 node 进程
+   * （qoder 的 status 冷启动实测 7.5s）。页面进入后并发探一次，谁先回来谁先上屏；
+   * 服务端有 5 分钟缓存 + singleflight，反复进出不会反复拉起 CLI。
+   */
+  const [authStates, setAuthStates] = useState<Record<string, AgentAuthStatus>>({});
+  /**
+   * 面板当前展示的是哪个工具（空串 = 面板关着）。
+   *
+   * 挡的是"回来晚的那份读数"：面板里的状态是**单槽**的，而读登录态是异步的 —— 用户关掉
+   * 面板、换一个工具再打开，前一个工具的结果回来时不许写进后一个工具的面板。
+   */
+  const loginPanelAgent = useRef("");
   const [runtimeCatalog, setRuntimeCatalog] = useState<RuntimeCatalog | null>(null);
   /** 打开了哪个工具的「详情」抽屉（存 agentID）。 */
   const [openAgent, setOpenAgent] = useState("");
@@ -474,21 +509,92 @@ export default function CliToolsPage() {
     }
   }, [loginAgent, loginBusy, selectedRunner]);
 
-  // 核对登录态：向服务端问该工具当前是否已登录。
+  /**
+   * 读一个工具的登录态（三态，见后端 agent_auth.go）。
+   *
+   * 结果按 「runner:agent」 写进 authStates —— 卡片上那一格就是照它画的，所以在面板里
+   * 点过「检查登录状态」之后，卡片会**当场**从「登录」变成「已登录」，不必刷新页面。
+   *
+   * force=true 绕过服务端缓存（手动检查要走它）：用户刚在浏览器里授权完，点一下却
+   * 被 5 分钟缓存挡回"未登录"，是最难受的一种。页面进入时那次自动读不带 force。
+   */
+  const readAuthStatus = useCallback(async (runnerID: string, agentID: string, force = false) => {
+    const key = `${runnerID}:${agentID}`;
+    try {
+      const result = await api<LoginStatusResult>(
+        withForce(`/api/runners/${encodeURIComponent(runnerID)}/agents/${encodeURIComponent(agentID)}/login-status`, force),
+      );
+      // 空串也要当成"判断不了"：服务端在"调用方没等到"那一档会回空值。
+      const state = result.authStatus ? result.authStatus : "unreadable";
+      setAuthStates((current) => ({ ...current, [key]: state }));
+      return { state, note: result.note ?? "" };
+    } catch (cause) {
+      // 读不到**不是**未登录：这一档照样给登录入口，但面板里要说清"没读成"。
+      setAuthStates((current) => ({ ...current, [key]: "unreadable" }));
+      return { state: "unreadable" as const, note: cause instanceof Error ? cause.message : "读取登录状态失败" };
+    }
+  }, []);
+
+  // 核对登录态：面板里那颗按钮（手动动作 ⇒ force）。
   const checkLoginStatus = useCallback(async () => {
     if (!loginAgent || loginBusy) return;
+    const agentID = loginAgent.agentID;
     setLoginBusy(true);
     try {
-      const result = await api<{ loggedIn: boolean }>(
-        `/api/runners/${encodeURIComponent(selectedRunner)}/agents/${encodeURIComponent(loginAgent.agentID)}/login-status`,
-      );
-      setLoggedIn(result.loggedIn);
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "读取登录状态失败");
+      const result = await readAuthStatus(selectedRunner, agentID, true);
+      // 与 openLogin 里那条同理：面板是**单槽**的，回来晚的那份不许写进别的工具的面板。
+      if (loginPanelAgent.current !== agentID) return;
+      setLoginAuth(result.state);
+      setLoginNote(result.note);
     } finally {
       setLoginBusy(false);
     }
-  }, [loginAgent, loginBusy, selectedRunner]);
+  }, [loginAgent, loginBusy, readAuthStatus, selectedRunner]);
+
+  /**
+   * 页面进入（或换了执行环境）后，给需要登录的工具各探一次登录态。
+   *
+   * 触发点只有一个，且**不在** /agents 那条读数里：那条接口已经是首屏瓶颈（实测
+   * 2.3~6.7s），再叠一个 qoder status 的 7.5s 冷启动，整页会为了"一颗按钮的文案"
+   * 多等一个 node 进程。这里并发探、谁先回来谁先上屏。
+   *
+   * 探件的失败也照实落进 authStates（unreadable）：卡片仍然给登录入口，
+   * 而**不会**变成"未登录"，更不会因此把一颗「登录」按钮亮在一个已登录的工具上。
+   */
+  useEffect(() => {
+    if (viewState !== "ready" || !view?.probeOk) return;
+    const loginIDs = new Set(catalog.entries.filter((entry) => entry.supportsLogin).map((entry) => entry.id));
+    for (const item of view.items) {
+      if (!item.installed || !loginIDs.has(item.id)) continue;
+      void readAuthStatus(selectedRunner, item.id);
+    }
+  }, [catalog.entries, readAuthStatus, selectedRunner, view, viewState]);
+
+  /**
+   * 打开登录面板。
+   *
+   * 把卡片上**已经读到**的登录态一起带进去：一个已登录的工具点进去直接看到「已登录」，
+   * 不必再点一次「检查登录状态」（那一次会真起一个 node 进程）。
+   */
+  const openLogin = useCallback((agentID: string, name: string) => {
+    const known = authStates[`${selectedRunner}:${agentID}`];
+    loginPanelAgent.current = agentID;
+    setLoginAuth(known ?? "");
+    setLoginNote("");
+    setLoginInfo(null);
+    setLoginAgent({ agentID, name });
+    if (!known) {
+      // 还不知道就当场问一次（不带 force：服务端可能正在探同一轮，singleflight 会让它等着）。
+      // 面板因此不会停在"正在读取"，也不会拿一句"需要登录"去猜一个已登录的工具。
+      void readAuthStatus(selectedRunner, agentID).then((result) => {
+        // 这期间用户可能已经关掉面板、或换了一个工具打开 —— 回来晚的那份**不许**盖上去
+        // （那一刻 panel 上写的是另一个工具的名字，说它的登录态就是张冠李戴）。
+        if (loginPanelAgent.current !== agentID) return;
+        setLoginAuth(result.state);
+        setLoginNote(result.note);
+      });
+    }
+  }, [authStates, readAuthStatus, selectedRunner]);
 
   // 逐主机授权：只对这一台机器生效，且可随时撤销（撤销入口在远程控制页/后续版本）。
   const grantRunnerInstall = useCallback(async () => {
@@ -552,7 +658,7 @@ export default function CliToolsPage() {
   const runtime = view?.runtime ?? null;
   const items = view?.items ?? [];
 
-  // 手动安装命令：命令本身在模型里拼（页面不拼命令），这里只取结果。
+  // 手动安装：命令由模型拼（页面不拼命令），原生工具那一行只给官方说明地址。
   // 不依赖所选环境 —— 这一块是手册，不是状态面板。
   const manualRows = useMemo(() => buildManualInstallRows(catalog.entries), [catalog.entries]);
 
@@ -570,6 +676,9 @@ export default function CliToolsPage() {
     return buildToolCard({
       entry,
       item: items.find((candidate) => candidate.id === entry.id),
+      // 登录态是**另一个读数**（见上面那条 effect）：还没读到就是 undefined，
+      // 卡片据此不给登录入口——不能把"还没读到"画成"登录"。
+      authStatus: authStates[`${selectedRunner}:${entry.id}`],
       runtime,
       latest: latest[key] ?? latestLoading,
       diagnosis: diagnoses[key],
@@ -579,7 +688,7 @@ export default function CliToolsPage() {
       remoteInstallAllowed: Boolean(view?.remoteInstallAllowed),
       reading,
     });
-  }), [catalog.entries, selectedRunner, items, runtime, latest, diagnoses, diagnoseErrors, skippedDiagnoses, diagnoseChannel, view?.remoteInstallAllowed, reading]);
+  }), [authStates, catalog.entries, selectedRunner, items, runtime, latest, diagnoses, diagnoseErrors, skippedDiagnoses, diagnoseChannel, view?.remoteInstallAllowed, reading]);
 
   const banner = useMemo(() => bannerFor(cards), [cards]);
   // 「运行依赖」那一行：读数（文案 + 状态档）与**升级按钮亮不亮**由同一个函数一起给
@@ -790,19 +899,22 @@ export default function CliToolsPage() {
                           「已是最新、不需要登录」那一档（最健康、最常见的一档）张张如此。
                           所以这三颗（主操作 / 登录 / 详情）都可能是 undefined，守卫要把它们
                           全算进来。 */}
-                      {(card.primary || card.canLogin || card.canOpenDetails) && <div className="cli-tools-card-actions">
+                      {(card.primary || card.login || card.canOpenDetails) && <div className="cli-tools-card-actions">
                         {card.primary && <button className="primary" disabled={busy} aria-busy={activeAction ? true : undefined} onClick={() => runPrimary(card)}>
                           {activeAction && <span className="cli-tools-btn-spinner" aria-hidden="true"/>}
                           {activeAction ? pendingActionText(activeAction).button : card.primary.label}
                         </button>}
-                        {/* 需要登录的工具（`canLogin` 由模型按目录的 supportsLogin + 真的装没装判）
-                            把入口摆在卡片上：点开就是登录面板，不用先进详情抽屉。
-                            它是**次要**按钮 —— 登录是"能做的事"，不是"这一屏要做的事"。 */}
-                        {card.canLogin && <button type="button" className="secondary" disabled={busy} onClick={() => {
-                          setLoggedIn(false);
-                          setLoginInfo(null);
-                          setLoginAgent({ agentID: card.id, name: card.name });
-                        }}>登录</button>}
+                        {/* 登录那一格（判据全在模型里，见 loginSlotFor）：
+                            已登录 → 一枚可点开的「已登录」牌子，**不再**出现「登录」——已登录还
+                            亮着登录，会让人以为登录没生效；点开它就是面板（换账号/重新登录）。
+                            未登录或判断不了 → 「登录」按钮。
+                            还没读到 → 什么都不给（页面正在后台探，探回来自己会变）。 */}
+                        {card.login && <button type="button" className={`secondary${card.login === "logged-in" ? " cli-tools-auth-chip" : ""}`}
+                          data-state={card.login} disabled={busy}
+                          title={card.login === "logged-in" ? "已登录；点开可查看状态或换账号" : undefined}
+                          onClick={() => openLogin(card.id, card.name)}>
+                          {card.login === "logged-in" ? "已登录" : "登录"}
+                        </button>}
                         {/* 「详情」只在模型判定"这张卡的下一步就在抽屉里"时出现（canOpenDetails）。
                             横幅只指向**第一张**问题卡，别的卡（第 2 张要处理的、"没检查成功"那一档）
                             否则没有任何入口，而卡片文案却让用户"按详情里的证据处理"。
@@ -903,29 +1015,35 @@ export default function CliToolsPage() {
           ⚠️ 唯一不能跟着一起删的是上面那块「**这次没检查成功**」—— 它是全页的"我们不知道"。 */}
     </>}
 
-    {/* ── 手动安装命令：平台装不了时的出路 ─────────────────────────────────
+    {/* ── 手动安装：平台装不了时的出路 ─────────────────────────────────────
         默认折叠（原生 `<details>` 不带 `open`）：它是**手册**，不是这一屏的下一步，
         站着不动才是对的；用户要它的时候自己展开。
 
         ⚠️ 它**有意放在 `probeOk` 那道门之外**：通道探测不到（WSL 没起来 / SSH 连不上）
-        恰恰是最需要自己上手装的时候。命令由 `buildManualInstallRows` 从目录里拼
-        （页面不拼命令），清单内容与所选环境无关。 */}
+        恰恰是最需要自己上手装的时候。清单由 `buildManualInstallRows` 从目录里拼
+        （页面不拼命令、也不拼地址），内容与所选环境无关。
+
+        两种行**不能混**：npm 全局分发的工具给可复制的命令；原生分发的工具（Cursor CLI）
+        平台装不了、也没有可代跑的命令，只给官方安装说明的入口 —— 绝不拿
+        `npm install -g` 冒充（Cursor 的 npm 包是第三方包）。 */}
     {viewState === "ready" && manualRows.length > 0 &&
       <section className="cli-tools-body cli-tools-manual">
         <details>
           <summary>
-            <h2>手动安装命令</h2>
+            <h2>手动安装</h2>
           </summary>
           <ul className="cli-tools-manual-list">
             {manualRows.map((row) => <li key={row.id}>
               <span className="cli-tools-manual-name">{row.name}</span>
-              <code>{row.command}</code>
-              <button
-                type="button"
-                className="secondary cli-tools-manual-copy"
-                data-state={manualCopy[row.id] ?? "idle"}
-                onClick={() => void copyManualCommand(row.id, row.command)}
-              >{manualCopy[row.id] === "copied" ? "已复制" : "复制"}</button>
+              {row.kind === "command" ? <>
+                <code>{row.command}</code>
+                <button
+                  type="button"
+                  className="secondary cli-tools-manual-copy"
+                  data-state={manualCopy[row.id] ?? "idle"}
+                  onClick={() => void copyManualCommand(row.id, row.command)}
+                >{manualCopy[row.id] === "copied" ? "已复制" : "复制"}</button>
+              </> : <ExternalLink className="cli-tools-link cli-tools-manual-docs" href={row.docsUrl} rel="noreferrer">官方安装说明</ExternalLink>}
             </li>)}
           </ul>
         </details>
@@ -1070,11 +1188,18 @@ export default function CliToolsPage() {
       <section className="modal cli-tools-login">
         <header>
           <div><label>登录</label><h2 id="cli-tools-login-title">{loginAgent.name}</h2></div>
-          {loggedIn && <span className="cli-tools-login-ok">已登录</span>}
+          {loginAuth === "logged_in" && <span className="cli-tools-login-ok">已登录</span>}
         </header>
         <div className="cli-tools-login-body">
           {loginInfo === null ? (<>
-            <p>该工具需要登录后才能使用。点击「发起登录」在本机启动登录流程；若页面拿到授权链接，请在浏览器打开并完成授权。</p>
+            {/* 面板一打开就把**已知的**结论说出来，而不是让用户再点一次「检查登录状态」
+                去换一句他已经知道的话。四档各有各的说法：已登录 / 正在读 / 判断不了 / 未登录。 */}
+            {loginAuth === "logged_in" && <p>该工具已登录，可以直接使用。要换账号请点「发起登录」重新授权。</p>}
+            {loginAuth === "" && <p>正在读取登录状态…</p>}
+            {loginAuth === "unreadable" && <p>这个工具的登录状态无法自动判断。若它确实还没登录，点「发起登录」按指引完成授权。</p>}
+            {/* 判断不了 ≠ 未登录：原因要说出来，别让用户以为登录没生效。 */}
+            {loginAuth === "unreadable" && loginNote && <p className="cli-tools-hintline">{loginNote}</p>}
+            {loginAuth === "logged_out" && <p>该工具需要登录后才能使用。点击「发起登录」在本机启动登录流程；若页面拿到授权链接，请在浏览器打开并完成授权。</p>}
             {/* 这条只对 CodeBuddy 说：它的登录是官方交互式 TUI，拿不到无头设备码 URL
                 （后端 agent_login.go 那两条等价指引要等点过「发起登录」才经 message 出现）。
                 以前对所有工具无条件显示，其它工具那边它是废话。 */}
@@ -1086,8 +1211,11 @@ export default function CliToolsPage() {
           </>)}
         </div>
         <footer>
-          <button className="secondary" disabled={loginBusy} onClick={() => setLoginAgent(null)}>关闭</button>
-          <button className="secondary" disabled={loginBusy} onClick={() => void checkLoginStatus()}>{loginBusy ? "读取中…" : (loggedIn ? "刷新登录状态" : "检查登录状态")}</button>
+          <button className="secondary" disabled={loginBusy} onClick={() => {
+            loginPanelAgent.current = "";
+            setLoginAgent(null);
+          }}>关闭</button>
+          <button className="secondary" disabled={loginBusy} onClick={() => void checkLoginStatus()}>{loginBusy ? "读取中…" : (loginAuth === "logged_in" ? "刷新登录状态" : "检查登录状态")}</button>
           <button className="primary" disabled={loginBusy} onClick={() => void runLogin()}>{loginBusy ? "处理中…" : "发起登录"}</button>
         </footer>
       </section>

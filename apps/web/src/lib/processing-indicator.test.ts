@@ -10,7 +10,6 @@ import {
   formatElapsed,
   latestActiveStageNotice,
   latestNotice,
-  processingBadge,
   processingClockVisibleAfterMs,
   processingStageFallback,
   processingStageText,
@@ -157,15 +156,6 @@ test("耗时：负值与非法值当 0（不显示「-3 秒」这种坏读数）
   // 这半句在当前阈值下与门槛不可能同时为真，它是纯防御分支；
   // 若哪天门槛被改成非正数，它就会立刻变成唯一去路（那正是 -3 秒 会出现的时候）。
   assert.ok(processingClockVisibleAfterMs > 0, "门槛若不再为正，`ms < 0` 就不再是死分支 —— 这条断言逼着改门槛的人同时回来看这里");
-});
-
-// ── 分类：徽标 ────────────────────────────────────────────────────────────
-test("徽标：codex 与 Claude Code 分开，未知回落 Claude Code", () => {
-  assert.deepEqual(processingBadge("codex"), { label: "Codex", tone: "codex" });
-  assert.deepEqual(processingBadge("claude-code"), { label: "Claude Code", tone: "claude" });
-  // 未知 agent 的默认必须与**改版前的观感一致**（原先就显示 Claude Code）。
-  assert.deepEqual(processingBadge(""), { label: "Claude Code", tone: "claude" });
-  assert.deepEqual(processingBadge("something-else"), { label: "Claude Code", tone: "claude" });
 });
 
 // ── 读数：最新通知的挑选 ──────────────────────────────────────────────────

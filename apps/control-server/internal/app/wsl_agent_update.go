@@ -35,10 +35,10 @@ func (r *wslAgentRunner) wslRunScript(ctx context.Context, script string) (strin
 
 // Update implements AgentRunner。
 func (r *wslAgentRunner) Update(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "WSL 内", "claude", "Claude Code", claudeNpmCLIInstall, r.wslRunScript, r.Version)
+	return runCrossCLIUpdate(ctx, "WSL 内", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, r.wslRunScript, r.Version)
 }
 
 // CodexUpdate implements CodexCapableRunner。
 func (r *wslAgentRunner) CodexUpdate(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "WSL 内", "codex", "Codex CLI", codexNpmCLIInstall, r.wslRunScript, r.CodexVersion)
+	return runCrossCLIUpdate(ctx, "WSL 内", "codex", []string{"update"}, "Codex CLI", codexNpmCLIInstall, r.wslRunScript, r.CodexVersion)
 }

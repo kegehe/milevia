@@ -73,11 +73,11 @@ func plantAgentFixture(t *testing.T, prefix string, entry AgentCatalogEntry, ver
 		writePackageJSON(t, packageDir, version)
 		// 包内的可执行文件在 `bin/` 下 —— 那个子目录要自己建
 		// （writePackageJSON 只保证包目录本身存在）。
-		binDir := filepath.Join(packageDir, "bin")
-		if err := os.MkdirAll(binDir, 0o755); err != nil {
+		binary := filepath.Join(packageDir, filepath.FromSlash(install.binPath))
+		if err := os.MkdirAll(filepath.Dir(binary), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		writeExecutable(t, filepath.Join(binDir, install.binFile), version)
+		writeExecutable(t, binary, version)
 	}
 	if !opts.SkipShim {
 		shim := install.commandPath(prefix)
@@ -96,7 +96,7 @@ func plantAgentFixture(t *testing.T, prefix string, entry AgentCatalogEntry, ver
 		if err := os.MkdirAll(filepath.Join(backup, "bin"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		writeExecutable(t, filepath.Join(backup, "bin", install.binFile), opts.BackupVersion)
+		writeExecutable(t, filepath.Join(backup, filepath.FromSlash(install.binPath)), opts.BackupVersion)
 	}
 	for index := 0; index < opts.Interrupted; index++ {
 		dir := filepath.Join(install.packageRoot(prefix),
@@ -436,7 +436,7 @@ func TestDiagnoseFindsBackupOnlyWhenVersionMatches(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(different, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(different, "bin", install.binFile), "9.9.9")
+	writeExecutable(t, filepath.Join(different, filepath.FromSlash(install.binPath)), "9.9.9")
 
 	if err := server.recordAgentInstallation(context.Background(), agentInstallation{
 		RunnerID: server.localRunnerID(), AgentID: entry.ID,

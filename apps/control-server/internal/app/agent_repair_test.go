@@ -117,7 +117,7 @@ func requireConclusiveDiagnosis(t *testing.T, report agentDiagnosis, what string
 //
 // 这条判据挡住的是"删错目录"—— 修复动作里唯一不可逆的一步。
 func TestRemovableInterruptedDirGuards(t *testing.T) {
-	install := npmCLIInstall{scope: "@anthropic-ai", packageName: "claude-code", commandName: "claude", binFile: "claude.exe"}
+	install := npmCLIInstall{scope: "@anthropic-ai", packageName: "claude-code", commandName: "claude", binPath: "bin/claude.exe"}
 	packageRoot := filepath.Join(t.TempDir(), "node_modules", "@anthropic-ai")
 
 	cases := []struct {
@@ -568,7 +568,7 @@ func TestRepairRestoreBackupMakesTheToolUsable(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(backup, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(backup, "bin", install.binFile), "0.146.1")
+	writeExecutable(t, filepath.Join(backup, filepath.FromSlash(install.binPath)), "0.146.1")
 
 	if err := server.recordAgentInstallation(context.Background(), agentInstallation{
 		RunnerID: server.localRunnerID(), AgentID: entry.ID,
@@ -717,7 +717,7 @@ func TestRepairSkipsReinstallAfterSuccessfulRollback(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(backup, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(backup, "bin", install.binFile), "0.146.1")
+	writeExecutable(t, filepath.Join(backup, filepath.FromSlash(install.binPath)), "0.146.1")
 	if err := server.recordAgentInstallation(context.Background(), agentInstallation{
 		RunnerID: server.localRunnerID(), AgentID: entry.ID,
 		BinaryPath: install.commandPath(prefix), InstallKind: installKindNpmManaged,

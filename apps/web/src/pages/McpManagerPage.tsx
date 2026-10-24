@@ -26,6 +26,7 @@ const ENVIRONMENT_OPTIONS: { id: string; label: string }[] = [
 const AGENT_OPTIONS: { id: string; label: string }[] = [
   { id: "claude-code", label: "Claude Code" },
   { id: "codex", label: "Codex" },
+  { id: "opencode", label: "OpenCode" },
 ];
 
 function McpIcon({ className = "ssh-icon" }: { className?: string }) {

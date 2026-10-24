@@ -2058,6 +2058,14 @@ func invokeLocalHandler(ctx context.Context, method, path, projectID, taskID, co
 		rctx.URLParams.Add(extraParams[index], extraParams[index+1])
 	}
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	// 真实路由（chi v5.2+）在匹配成功后会把 URLParams 桥接进 Request.SetPathValue
+	// （chi 的 path_value.go），所以 handler 里 r.PathValue 与 chi.URLParam 都读得到。
+	// 合成请求绕过了 Mux.routeHTTP，这个桥没人走 —— 必须在这里手工补上，否则用
+	// r.PathValue 取参的 handler（insights 全族）经中继读到的全是空串，症状是
+	// "电脑上一切正常、手机端整域 404"，而喂 chi.URLParam 的单测照样绿。
+	for index := 0; index < len(rctx.URLParams.Keys); index++ {
+		req.SetPathValue(rctx.URLParams.Keys[index], rctx.URLParams.Values[index])
+	}
 	response := httptest.NewRecorder()
 	handler(response, req)
 	return response.Code, response.Body.Bytes()

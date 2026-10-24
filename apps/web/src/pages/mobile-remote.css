@@ -1149,7 +1149,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 
 /* 工具徽标大卡：图形主导。裸图形（Claude/OpenAI）坐在品牌浅底上居中（30px）；
    徽标类（CodeBuddy，自带紫底）铺满整个图位 —— 与桌面端同一套 data-logo-badge 语义。
-   ⚠️ 三列与 MOBILE_AGENTS 的当前长度（3）对应：目录加新工具时这里要跟着调。 */
+   固定三列，清单长度变化时按行换行（不必跟着改列数）。 */
 .mobile-agent-app-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .mobile-agent-app { position: relative; display: flex; flex-direction: column; align-items: center; gap: 7px;
   border: 1.5px solid #dfe9e3; border-radius: 16px; padding: 15px 8px 12px; color: #19332c; background: #fbfdfc; cursor: pointer; }
@@ -1168,6 +1168,8 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-agent-app-icon[data-logo="claude"] { background: #fdf1ec; }
 .mobile-agent-app-icon[data-logo="openai"] { background: #eaf6f2; }
 .mobile-agent-app-icon img { display: block; width: 30px; height: 30px; }
+/* 没有官方图标资产的工具（如 Qoder）用两字母牌，禁用斜体只借 <em> 的无语义行内盒。 */
+.mobile-agent-app-icon .mobile-agent-app-mark { font-style: normal; font-size: 13px; font-weight: 700; color: #6b6b66; letter-spacing: .5px; }
 .mobile-agent-app-icon img[data-logo-badge] { width: 100%; height: 100%; border-radius: inherit; }
 
 /* 执行权限：分段控件 + 一句说明。档位随所选工具变化（目录的权限面），文案与桌面端同源。 */
@@ -1758,7 +1760,7 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 .mobile-message-file-link span { font-size: .85em; opacity: .75; }
 /* 触屏上没有 hover，用 :active 给一次按压反馈（`:hover` 在手机上会粘住上一次的状态）。 */
 .mobile-message-file-link:active { border-color: #2c7567; background: #dcefe4; }
-.mobile-optimization-trigger { position: fixed; right: 14px; bottom: calc(var(--mobile-composer-height, 72px) + 16px); z-index: 12; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; padding: 0 12px; border: 1px solid #b9d9ca; border-radius: 999px; color: #20614e; background: #f1faf5; box-shadow: 0 5px 18px #1b4d3b22; font-size: 12px; font-weight: 750; }
+.mobile-optimization-trigger { position: fixed; right: 14px; bottom: calc(var(--mobile-composer-height, 68px) + 16px); z-index: 12; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; padding: 0 12px; border: 1px solid #b9d9ca; border-radius: 999px; color: #20614e; background: #f1faf5; box-shadow: 0 5px 18px #1b4d3b22; font-size: 12px; font-weight: 750; }
 .mobile-optimization-trigger span:first-child { font-size: 15px; line-height: 1; }
 .mobile-optimization { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: #f7fbf8; color: #183a30; }
 .mobile-optimization-header { display: flex; align-items: center; justify-content: space-between; padding: max(14px, env(safe-area-inset-top)) 16px 13px; border-bottom: 1px solid #dceae2; background: #fbfefc; }

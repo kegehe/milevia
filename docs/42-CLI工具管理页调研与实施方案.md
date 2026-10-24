@@ -2342,3 +2342,239 @@ Windows 工具，而且那份 PATH 是给整条执行链（含会话）用的。
   `tx` —— 单连接（`SetMaxOpenConns(1)`）下这就是自我死锁：`POST /api/conversations/{id}/clear`
   永不返回，`TestClearConversationStopsIdleClaudeSessionAndRejectsOldMessages` 因此挂到
   测试超时（把本次改动整体移开、用原始代码跑，一样挂）。
+
+## 34. OpenCode CLI 接入（2026-10-22）
+
+### 34.1 形态
+
+OpenCode 与 Codex 同构：每轮一个 `opencode run --format json` 进程，平台保存事件里的
+`sessionID`，下一轮用 `--session <id>` 续聊；它**不是** Claude/CodeBuddy/Qoder 那种长驻
+stdin stream-json 会话，所以 `app.go` 里必须把它归到非流式分支。
+
+目录条目（`agent_catalog.go`）：
+
+- `ID=opencode`，npm 包 `opencode-ai`，命令 `opencode`，`BinPath=bin/opencode.exe`
+  （postinstall 在所有平台都复制到这个路径）。
+- 权限三档：`read_only` / `workspace_write` / `full_control`，默认 `workspace_write`；
+  不提供 `approval_required`。
+- `SupportsLogin=true`，但只提供入口与 `opencode auth list` 读数，不在后台驱动交互式 TUI。
+- `SupportsProjectInsights=true`。
+
+### 34.2 权限与配置注入
+
+- `read_only`：`--agent plan`，不加 `--auto`，并设置 `OPENCODE_PERMISSION` 显式 deny
+  edit/shell/webfetch/task/external_directory。
+- `workspace_write` / `full_control`：默认 build agent + `--auto`；前者 deny
+  `external_directory` 与若干危险 shell 前缀，后者全部 allow。
+- MCP：平台的 `mcpServers` 转成 OpenCode 的 `mcp`（stdio → local，http/sse → remote），
+  通过 `OPENCODE_CONFIG_CONTENT` 注入；SSH 走远端 0600 临时文件，命令里只出现路径。
+- prompt 走 stdin（真机确认 `run --format json` 无位置参数时会读 stdin）：避免 Windows
+  `cmd.exe` 把 `&`/`|` 当成命令分隔符，也绕开命令行长度上限。
+- `OPENCODE_DISABLE_AUTOUPDATE=true` 固定注入，避免运行中自我升级。
+
+### 34.3 已知边界（必须如实告知，不能宣传成沙箱）
+
+- OpenCode 没有 OS 级沙箱。`external_directory` 只约束文件类工具，shell 仍可 `cd ..`、
+  `bash -c`、读写项目外路径；`workspace_write` 只能承诺“文件类工具尽量限制在项目内”。
+- 没有 Claude 的逐命令审批回调，因此不提供 `approval_required`。
+- 没有 `--strict-mcp-config` 等价物，用户全局/项目配置里的 MCP 仍会加载。
+- 没有 `--output-schema`；Insights 只能依赖 prompt 的 JSON 约束 + `extractInsightJSON`
+  + 修复轮。若首轮输出不合法，走既有修复流程，不把“没有 schema”说成“结构化输出”。
+- 以 `step_finish(reason=stop)` 作为权威结束信号：没有结束事件、完全无输出、扫描器错误、
+  提示词写入超时都会记失败，不拿退出码 0 冒充成功；无头模式下 `question` 权限显式 deny，
+  避免模型问问题时挂住回合。
+- Windows 原生可用但官方推荐 WSL；shell 工具依赖 Git Bash，可用
+  `AUTO_OPENCODE_GIT_BASH_PATH` 指定。
+- `opencode upgrade` 与 npm 全局安装可能产生第二份 CLI；平台托管安装优先走 npm 重装，
+  用户自装的那份才走 CLI 自带 upgrade。
+- 不支持平台托管 API Key 档案：档案表仍只接受 Claude/Codex，目录用
+  `SupportsProfiles=false` 明确标出这一点，避免档案页给出一个保存时必然失败的选项。
+
+### 34.4 跨端
+
+WSL 与 SSH 都支持一次性会话，复用同一套 JSONL 解析。SSH 的 MCP 配置走 SFTP 0600
+临时文件 + `trap` 清理；SFTP 不可用时回退 base64 并在 stderr 留下可见说明。WSL→Windows
+反向通道与 Codex 现状一致，如实报“尚未接通”。
+
+跨端 probe/运行路径会前置托管工具链与用户原生目录（`crossManagedPathValue`），否则平台
+装到 `~/.local/share/milevia/toolchain/npm-global/bin` 的 CLI 会被 `command -v` 当成没装。
+
+### 34.5 真机校准记录（2026-10-22，opencode-ai@1.19.3）
+
+- `opencode --version` → `1.19.3`；`run --format json` 的 `step_start` / `text` / `tool_use` /
+  `step_finish` 字段与 `opencode_runner.go` 的解析一致；`tool_use.part.callID` 与
+  `part.state.output` 已确认。
+- 第一轮抓到 `sessionID`，第二轮 `--session <id>` 能回忆起第一轮内容（ pineapple 实测）。
+- `--agent plan` + 只读 `OPENCODE_PERMISSION` 下要求覆盖文件，文件内容未变；
+  默认 build agent + `--auto` + workspace 权限下同一操作成功写入。
+- `opencode auth list` 在未配置 provider 时输出 `0 credentials`，与
+  `AuthStatusEmptyMarkers` 匹配；`~/.local/share/opencode/auth.json` 路径已确认。
+
+## 35. Cursor CLI 接入（2026-10-22）
+
+### 35.1 形态
+
+Cursor CLI 与 Codex / OpenCode 同构：每轮一个 `cursor-agent -p` 进程，输出
+`--output-format stream-json`，平台从 `system/init` 事件保存 `session_id`（部分版本字段为
+`chat_id`），下一轮用 `--resume <chatId>` 续聊。它没有 `--input-format`，**不能**复用
+Claude / CodeBuddy / Qoder 的长驻 stdin 会话，因此 `app.go` 里归到非流式分支。
+
+目录条目（`agent_catalog.go`）：
+
+- `ID=cursor`，命令 `cursor-agent`，别名 `agent`；官方安装器在 Windows 上可能只把其中
+  一个放进 PATH，探测、升级、登录态查询都要两个名字都认。
+- `InstallKind=native`、`SupportsInstall=false`：官方只提供 curl / PowerShell 安装器，
+  npm 上的 `cursor-agent` 是第三方包，平台绝不代装。官方命令：
+  Linux/macOS `curl https://cursor.com/install -fsS | bash`，
+  Windows `irm 'https://cursor.com/install?win32=true' | iex`。
+- 管理页的「手动安装」块因此分两种行：npm 工具给可复制的 `npm install -g` 命令；
+  原生工具给目录里登记的官方安装说明（`docsUrl`）。没有 `docsUrl` 的原生工具不进列 ——
+  不猜地址、也不拿官网顶替，更不回落成 npm 命令（Cursor 的 npm 包是第三方包）。
+- 已从官方安装脚本确认落点：Windows `%LOCALAPPDATA%\cursor-agent`（同时生成
+  `cursor-agent.exe|.cmd|.ps1` 与 `agent.*` 别名），Linux/macOS 为
+  `~/.local/share/cursor-agent/versions/<version>/cursor-agent`，并在 `~/.local/bin`
+  下建 `agent` 与 `cursor-agent` 两个软链。`agent_paths.go` 的兜底候选按这两个落点枚举。
+- 版本来源没有公开 JSON API，从 `https://cursor.com/install` 里提取
+  `lab/<YYYY.M.D>-<build>`（月/日可能不带前导零，构建号可能有多段）；日期版本用
+  `cursorUpdateAvailableFrom` 比较，读不到就如实报错，不冒充“已是最新”。
+- `SupportsProfiles=false`（档案表 CHECK 仍只允许 Claude/Codex）、
+  `SupportsProjectInsights=false`（只读分析协议尚未接通）、`SlashCommands=false`。
+
+### 35.2 权限映射（待真机校准）
+
+| 平台权限 | Cursor 参数 |
+|---|---|
+| `read_only` | `--mode ask` |
+| `workspace_write` | 默认 Agent 模式 + `--force` |
+| `full_control` | 默认 Agent 模式 + `--force` + `--sandbox disabled` |
+
+官方参数文档写明 `--mode` 只接受 `plan` / `ask`，Agent 是**默认模式**，因此
+`workspace_write` / `full_control` 不能显式传 `--mode agent`（会因非法取值启动失败）。
+
+headless 的 `-p` 没有可回复的审批通道，所以不提供 `approval_required`；`--force` 是让
+回合能自动继续的必需项，不代表 OS 级沙箱。`--trust` 固定传入，否则 headless 下工作区
+不被信任、CLI 会拒绝执行。
+
+### 35.3 运行与输出
+
+- prompt 走 stdin：`-p` **不带提示词位置参数**。Cursor 只在没有位置参数、且 stdin 非
+  TTY 时才读 stdin；传 `-` 会被当成字面量减号。这样也绕开 Windows `.cmd` shim 的元字符
+  解析与命令行长度上限。
+- 工作区用 `cmd.Dir`，不传 `--workspace`，理由同上。
+- `assistant` 事件的 `message.content` 用与 Claude 同一套 `parseClaudeMessage` 提取正文；
+  若 CLI 只在 `result.result` 给最终文本，则在**没收到任何 assistant 正文**时补发一次，
+  避免重复。
+- 以 `result` 为权威结束信号：`is_error` / `subtype != success` 判失败；EOF 没有 `result`
+  时按“未返回结束事件 / 未返回任何输出 / 最后一条诊断”如实失败，不拿退出码 0 冒充成功。
+- MCP：Cursor 没有会话级注入参数，只读 `~/.cursor/mcp.json` 与项目 `.cursor/mcp.json`。
+  `mcp_config.go` 显式记录“未注入任何 server”，不把界面上的选择说成已生效。
+- 模型：没有非交互的模型目录命令，界面给空目录 + 自定义输入；模型名经安全字符白名单
+  校验后传给 `--model`。
+
+### 35.4 已知边界
+
+- 会话面只在本机：可执行文件由控制服务的 PATH 解析，WSL / SSH 项目在建会话时直接拒绝
+  （`cursorLocalOnlyMessage`），旧会话或直连请求在启动回合时再守一次。
+- 登录入口为 `cursor-agent login`（交互式浏览器授权），平台只给入口，不后台驱动 TUI；
+  登录态用 `cursor-agent status` + 目录里的空标记判断，只能证明“CLI 认为自己有登录态”。
+- 升级：本机走 runner 自带的 `cursor-agent update` + 健康检查；跨端走目录驱动的
+  `updateNative`，用实际命中的命令名（主名或别名），不走 npm 重装编排。
+- MCP 管理页的会话级注入清单仍不含 Cursor —— 它没有可注入的通道，列出来只会误导。
+
+### 35.5 尚未真机校准（当前开发机未安装 Cursor CLI）
+
+- `--version` / `status` 的真实输出形状与本地版本号格式。
+- `stream-json` 的事件字段（尤其 `session_id` 与 `chat_id` 哪一个出现、`result` 是否总有
+  `subtype`）。
+- `--mode ask` 是否真的不执行命令；`--force` 在 `workspace_write` 下的实际边界
+  （`--mode` 的合法取值已由官方参数文档确认：仅 `plan` / `ask`）。
+- `-p` 从 stdin 读取、`--resume <chatId>` 跨轮记忆。
+- Windows 安装目录与 `.cmd` / `.exe` 形态已从官方安装脚本确认（见 §35.1），但本机未实际
+  安装，`.cmd` 经 `cmd /d /c` 启动这条路径尚未跑过。
+- `cursor-agent update` 的退出码与升级后版本变化。
+- 以上任一项与实现不符时，先改目录/runner 的对应一处，再跑
+  `TestCursorExecArgs` / `TestReadCursorJSONL` / `TestCatalogExposesCursor`。
+
+## 36. 登录态：已登录就不该再亮「登录」（2026-10-23）
+
+### 36.1 现场
+
+用户在终端里登录了 qoder（`qoder status` 能读出 Username / Email），但 Cli 管理页的
+qoder 卡片上**照样亮着一颗「登录」按钮**；点进面板再点「检查登录状态」，才看到「已登录」。
+同一个毛病在 codebuddy 上更糟：面板检查完永远说**未登录**，因为它的登录态判别写死成
+`false`。opencode / cursor 有真正的判别，但卡片同样不看它。
+
+### 36.2 三处根因（缺一不可）
+
+1. **卡片上的判据里没有登录态**。收口前是
+   `canLogin = supportsLogin && installed && !running && !reading`
+   —— 只回答"这个工具能不能登录"，不回答"它现在登录了吗"。
+2. **登录态读数是 bool**。CLI 判别不了（codebuddy）、命令失败、输出形状变了，全都压成
+   `false`，而 `false` 在界面上的意思是"未登录"。这就是本项目反复禁止的"把读不到写成没有"，
+   后果是**把一个已登录的用户指去再登录一次**。
+3. **登录态只活在面板那一次按需探测里**。页面加载时不读，卡片没有数据可用，于是永远
+   按"能登录"渲染。
+
+### 36.3 改法
+
+**后端（`agent_auth.go`，新文件）**
+
+- `agentAuthState` 三态：`logged_in` / `logged_out` / `unreadable`。
+  `unreadable` 的两种成因分开：工具不支持自报（`note` 说明），或这次没读成（带 error，
+  按 30 秒短 TTL 重试；稳定结论按 5 分钟）。
+- `authStateRunner` 从 `LoginStatus(ctx) bool` 改成 `LoginStatus(ctx) (agentAuthState, error)`。
+  五个实现跟着改：qoder（`status` 解析：`not logged in` ⇒ 未登录 / 有身份字段 ⇒ 已登录 /
+  形状陌生 ⇒ unreadable）、opencode（`auth list` + 凭据文件兜底）、cursor（`status` + 目录
+  空标记）、codebuddy（**永远 unreadable**，它没有非交互查询）、目录驱动的跨端后端
+  （`AuthStatusArgs` 有就执行，没有就 unreadable）。
+- 读数按 **(runner, agent)** 缓存 + singleflight：TTL 5 分钟，`?force=true` 绕过。缓存
+  必须按机器分 —— 只按 agentID 会把 A 机器的"已登录"带到 B 机器。
+- `GET …/agents/{id}/login-status` 回 `{authStatus, note, loggedIn, probedAt}`
+  （`probedAt` 在没读到时省略，免得被念成"1月1日读到的"）。
+  `loggedIn` 是给旧客户端留的兼容位；新界面只读 `authStatus`。
+  不支持平台内登录的工具回 **501**（不再回一个假的 `loggedIn:false`）。
+
+**前端（`cli-tools-view.ts` / `CliToolsPage.tsx`）**
+
+- `ToolCard.canLogin: boolean` 改成 `login?: "not-logged-in" | "logged-in"`，判据收进
+  `loginSlotFor`：
+  - `logged_in` ⇒ 卡片上是**「已登录」牌子**（可点开面板换账号），不再有「登录」；
+  - `logged_out` / `unreadable` ⇒ 「登录」按钮；
+  - 还没读到（`undefined`）/ 没装 / 有任务在跑 / 页面还在读环境读数 ⇒ 不给。
+- 页面进入（或换执行环境）后，对"已安装且支持登录"的工具**并发探一次**（不带 force），
+  结果按 `runner:agent` 落在 `authStates` 里，卡片与面板共用同一份。面板打开时直接带入
+  已知结论（已登录就不再让用户点一次「检查」），只有手动那颗按钮走 `force=true`。
+- 面板文案按四档分开：已登录 / 正在读 / **判断不了**（附服务端给的 note）/ 未登录。
+
+### 36.4 为什么不把登录态塞进 `/agents`
+
+那条接口是首屏瓶颈（实测 2.3~6.7s，要真的去机器上探），而 `qoder status` 冷启动 7.5s
+（node + 70MB bundle）。塞进去会让整页为了"一颗按钮的文案"多等一个 node 进程。
+现在：首屏先用 `/agents` 出卡片，登录态由并发的 `login-status` 各自填，谁先回来谁先上屏；
+服务端 5 分钟缓存 + singleflight 保证反复进出不会反复拉起 CLI。
+
+### 36.5 判据一览
+
+| 场景 | 卡片 | 面板 |
+|---|---|---|
+| 已登录 | 「已登录」牌子（无「登录」） | 打开即显示「已登录」 |
+| 未登录 | 「登录」 + 状态行「还没登录，登录之后才能用。」 | 打开即显示「需要登录」+ 指引 |
+| 判断不了（codebuddy / 这次没读成） | 「登录」（入口不能少） | 说清判断不了 + 原因 |
+| 还没读到 / 没装 / 有任务在跑 | 不给入口 | — |
+
+补一条（2026-10-23 同日）：**未登录时状态行也不再说「已是最新，不用管它」**。
+那一档其实用不了，一句话和旁边那颗「登录」互相打脸；现在写「还没登录，登录之后才能用。」
+（icon=alert，statusTone=warn）。但它**不进横幅**（ToolCard.loginBlocked）：横幅点开的是
+抽屉，抽屉里没有登录入口，点名它等于「说有事情要处理、点进去却没事可做」。
+判断不了（unreadable）不动状态行 —— 不许替一台机器说「没登录」。
+
+### 36.6 测试
+
+- `TestQoderAuthState`：真机原文三态（含"形状陌生 ⇒ unreadable"）。
+- `TestAgentAuthStateFromStatusOutputIsThreeWay`：空标记 ⇒ 未登录、有输出 ⇒ 已登录、
+  空输出 ⇒ unreadable。
+- `TestAgentAuthReadingIsCachedAndForceReprobes` / `TestAgentAuthSingleFlightProbesOnce`：
+  TTL 内只探一次、force 必重探、并发只探一次、逐机器独立。
+- `TestLoginStatusWireKeepsUnreadableOutOfLoggedOut`：线上格式里 unreadable 与未登录是两个值。
+- `cli-tools-view.test.ts` 的「登录那一格」五条；`cli-tools-page.test.mjs` 钉住页面不重判、
+  进入后自动探、手动检查带 force。

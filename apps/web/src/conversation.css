@@ -142,75 +142,64 @@
 }
 .message.user .message-avatar { color: #245d52; background: var(--accent-soft); }
 .message.user > header { justify-content: flex-end; }
-.message-copy {
-  position: relative;
+/* ---- 消息动作行（复制 + 回退，2026-10-23 改版）----------------------------
+   两颗按钮同住气泡下方的 .message-actions 行，共用同一套 28px ghost 观感与同一支
+   SVG 描边图标语言（.message-action-icon）。变体一律走 data-* / 静态类，不拼动态类名。 */
+.message-copy,
+.message-rewind {
   display: grid;
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   place-items: center;
-  margin-top: 3px;
-  border: 0;
-  border-radius: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
   padding: 0;
   color: #56776d;
   background: transparent;
+  cursor: pointer;
+  font-family: inherit;
 }
-.message-copy::before,
-.message-copy::after {
-  position: absolute;
-  width: 9px;
-  height: 11px;
-  border: 1.5px solid currentColor;
-  border-radius: 2px;
-  content: "";
-}
-.message-copy::before { transform: translate(-2px, -2px); opacity: .72; }
-.message-copy::after { transform: translate(2px, 2px); background: #fbfefb; }
-.message-copy:hover { color: #1f5e50; background: #e3f2e9; }
-.message-copy:focus-visible {  outline: 2px solid #2b7b68; outline-offset: 2px;  }
-/* 成功后直接替换为勾选图标，不能只换颜色，否则用户难以确认复制是否完成。 */
+.message-copy:hover:not(:disabled),
+.message-rewind:hover:not(:disabled) { border-color: #cae1d5; color: #1e6657; background: #eff8f2; }
+.message-copy:focus-visible,
+.message-rewind:focus-visible {  outline: 2px solid #2b7b68; outline-offset: 2px;  }
+/* 复制成功后直接替换为勾选图标并常显（显形策略压不过它，见下方 reveal 规则），
+   不能只换颜色，否则用户难以确认复制是否完成。 */
 .message-copy.copied { color: #287a48; background: #e2f4e8; }
-.message-copy.copied::before {
-  width: 12px;
-  height: 7px;
-  transform: translate(0, -1px) rotate(-45deg);
-  border-width: 0 0 2px 2px;
-  border-radius: 0;
-  opacity: 1;
-}
-.message-copy.copied::after { display: none; }
+/* 回退不可用（跑着 / 清空中 / 正在停止 / 交接 / 只读）时如实降灰，不留"看着能点"的按钮。 */
+.message-rewind:disabled { color: #9aa9a3; background: transparent; }
+.message-action-icon { width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+/* 「已复制」小字反馈：按钮换勾之外再给一行文字，1.5s 后随 copied 态一起消失。 */
+.copy-feedback { color: #287a48; font-size: 11px; font-weight: 600; }
 
-/* ---- 回合回退入口（时间线上的节点）---------------------------------------- */
-/* 节点属于"这一轮"，所以入口跟着产生它的那条用户消息走：右对齐、与用户消息同一列。
-   头部那份列表退成"浏览所有节点"的次要入口，主入口在用户眼前这一轮上。 */
-.message-checkpoint {
+/* ---- 回合回退入口（动作行，2026-10-23 上卡片）------------------------------
+   回退与复制同住 .message-actions 行，挂在产生它的那条用户消息下面（用户消息右对齐、
+   AI 消息左对齐，跟随 .message 的 align-items）。头部「节点」列表已撤除。 */
+.message-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  /* 右边留出 18px：消息圆点轨道钉在 right:3px（z-index 10），贴着边缘放会被它压住点不中。 */
-  margin: 6px 18px 18px 42px;
-}
-.message-checkpoint small { color: #7b8f88; font-size: 11px; }
-.message-checkpoint.pending { justify-content: flex-end; margin-top: 4px; color: #93a49d; font-size: 11px; }
-.message-checkpoint-button {
-  display: inline-flex;
-  align-items: center;
   gap: 5px;
-  border: 1px solid #cfe0d6;
-  border-radius: 999px;
-  padding: 3px 10px 3px 8px;
-  color: #2c7567;
-  background: #f6fbf8;
-  font-family: inherit;
-  font-size: 11px;
-  line-height: 1.5;
-  transition: border-color .16s ease, color .16s ease, background .16s ease;
+  margin-top: 6px;
 }
-.message-checkpoint-button:hover:not(:disabled) { border-color: #8eb9aa; color: #1f6055; background: #eaf5ee; }
-.message-checkpoint-button:focus-visible { outline: 2px solid #2b7b68; outline-offset: 2px; }
-.message-checkpoint-button:disabled { color: #9aa9a3; border-color: #e4ece8; background: #f8fbf9; }
-.message-checkpoint-icon { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.message:not(.user) .message-actions { justify-content: flex-start; }
+/* 用户消息的动作行右侧留出 18px：消息圆点轨道钉在 right:3px（z-index 10），按钮贴边
+   会被它压住点不中 —— 旧胶囊行的同一让位，2026-10-23 上卡片时继承（窄屏轨道隐藏，让位仍在，与旧版一致）。 */
+.message.user .message-actions { justify-content: flex-end; margin-right: 18px; }
+.message-actions small { color: #7b8f88; font-size: 11px; }
+/* 这一轮还在跑：节点要等 run 成功结束才生成，先如实说一句，而不是让按钮凭空消失。 */
+.checkpoint-pending { color: #93a49d; font-size: 11px; }
+/* 显形策略：精确指针设备上默认隐藏，hover / focus 该消息时显形；
+   时间线上最后一条用户消息（data-keep）与「已复制」态常显 —— 回退与复制反馈
+   都不能依赖 hover 才看得见。触屏没有 hover，保持常显。 */
+.message-actions .reveal { opacity: 1; }
+@media (hover: hover) and (pointer: fine) {
+  .message-actions .reveal { opacity: 0; }
+  .message:hover .message-actions .reveal,
+  .message:focus-within .message-actions .reveal,
+  .message-actions[data-keep] .reveal { opacity: 1; }
+  /* 「已复制」反馈必须压过显形策略：三条 (0,3,0) 都不够稳，显式写满类名。 */
+  .message-actions .message-copy.copied { opacity: 1; }
+}
 
 /* ---- 工具卡片 ------------------------------------------------------------ */
 .tool-meta { display: flex; align-items: center; gap: 8px; }
@@ -1863,16 +1852,9 @@
 .message.user .markdown th, .message.user .markdown td { border-color: #ffffff2e; }
 .message.user .markdown th { color: #ffffff; background: #ffffff17; }
 .message.user .markdown-image-reference { border-color: #ffffff33; color: #dcefe5; background: #ffffff14; }
-.message-copy {
-  width: 28px;
-  height: 28px;
-  margin-top: 5px;
-  border: 1px solid transparent;
-  border-radius: 6px;
+.message-copy, .message-rewind {
   color: #66857a;
 }
-.message-copy::after { background: #fcfefd; }
-.message-copy:hover { border-color: #cae1d5; color: #1e6657; background: #eff8f2; }
 
 /* 交互反馈只在可悬浮的精确指针设备上启用，避免触屏滚动时闪动。 */
 .message,
@@ -4128,10 +4110,4 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 /* 桌面左栏两列较窄：常用提示词/常用命令标题兼作折叠按钮后不再重复画类别图标，
    把空间让给数量角标与折叠箭头，避免标题折行。技能组整行较宽，仍保留图标。 */
 .quick-actions-row .quick-tag-group:not(.skill-tags) .quick-tag-heading-toggle .quick-tag-heading-icon { display: none; }
-.checkpoint-popover { min-width: 300px; max-width: min(420px, calc(100vw - 32px)); }
-.checkpoint-entry { padding: 8px 10px; border-bottom: 1px solid var(--border-subtle, #e5e7eb); }
-.checkpoint-entry:last-child { border-bottom: 0; }
-.checkpoint-entry b, .checkpoint-entry small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.checkpoint-entry small { margin-top: 2px; opacity: .68; }
-.checkpoint-entry > div { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
-.checkpoint-entry button { border: 1px solid var(--border-subtle, #d1d5db); background: transparent; border-radius: 4px; padding: 3px 6px; font-size: 12px; cursor: pointer; }
+/* 头部「节点」列表 2026-10-23 撤除（回退入口上卡片），checkpoint-popover / checkpoint-entry 规则随之删除。 */

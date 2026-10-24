@@ -15,7 +15,8 @@ import (
 // /api/remote/rpc，本进程按 op 调用**既有的** handler。
 //
 // 这条通道承载**多个领域**的操作：文件（fs.*，见 remote_fs.go）、Git（git.*，见
-// remote_git.go）与会话控制（conversation.*，见 remote_conversation.go）。形态是
+// remote_git.go）、会话控制（conversation.*，见 remote_conversation.go）与优化建议
+// （insights.*，见 remote_insights.go）。形态是
 // 「一条通道、一个端点、一张由各领域合成的 op 表」，不是「每个领域一条通道」——
 // 后者要求 Agent 按 op 前缀选择端点，那就等于把 op 映射搬进 Agent，
 // 正是本设计刻意避开的结构性风险。见 docs/41 §3.1。
@@ -109,10 +110,11 @@ type remoteOperation struct {
 // remoteOperations 是 relay 唯一的一张 op 表：把各领域的名单合成一份。
 //
 // 领域各自导出自己的 map（remoteFSOperations / remoteGitOperations /
-// remoteConversationOperations），而不是写成一个巨型 switch：每份名单都能被独立测试
-// 钉死（条数、方法、路径、上限），而"改名单必须同时改测试"这条纪律也就落到了具体的一份上。
+// remoteConversationOperations / remoteInsightOperations），而不是写成一个巨型 switch：
+// 每份名单都能被独立测试钉死（条数、方法、路径、上限），而"改名单必须同时改测试"
+// 这条纪律也就落到了具体的一份上。
 //
-// 三份名单的 op 名**不允许有交集**：有交集意味着后注册的那份静默覆盖前一份，
+// 各份名单的 op 名**不允许有交集**：有交集意味着后注册的那份静默覆盖前一份，
 // 症状是"某个操作跑到另一个 handler 上去了"，而两边各自看代码都是对的。
 // TestRelayCompositeOperationTableHasNoOverlap 守着这条。
 func (s *Server) remoteOperations() map[string]remoteOperation {
@@ -124,6 +126,9 @@ func (s *Server) remoteOperations() map[string]remoteOperation {
 		operations[name] = operation
 	}
 	for name, operation := range s.remoteConversationOperations() {
+		operations[name] = operation
+	}
+	for name, operation := range s.remoteInsightOperations() {
 		operations[name] = operation
 	}
 	return operations
@@ -171,10 +176,11 @@ func (s *Server) relayRPCRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// projectId 一律必填，包括会话域那些自己不用它的 op（见 remoteOperation.Scope）：
-	// 项目域的 handler 都要用它解析工作区（resolveRequestWorkspace），缺了它会走到
-	// "项目不存在"，报错比这里直接拦下更含糊；而会话域那几条虽然不解析工作区，
-	// 但为它们单独开一条判据，就等于让信封的形状随 op 变 —— 云端、Agent、手机端
-	// 三处都要跟着"哪些 op 要带 projectId"分叉，而调用方本来无一例外都拿得到它。
+	// 项目域的 handler 都要靠它定位 —— fs / git 经 resolveRequestWorkspace 解析工作区，
+	// insights 用它查项目库；缺了它会走到"项目不存在"，报错比这里直接拦下更含糊；
+	// 而会话域那几条虽然不解析工作区，但为它们单独开一条判据，就等于让信封的形状随 op 变
+	// —— 云端、Agent、手机端三处都要跟着"哪些 op 要带 projectId"分叉，
+	// 而调用方本来无一例外都拿得到它。
 	if input.ProjectID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("projectId 必填"))
 		return
@@ -409,6 +415,13 @@ var relayPathParamValidators = map[string]func(string) error{
 	"suggestionID": func(value string) error {
 		if !relayUUID.MatchString(value) {
 			return errors.New("suggestionID 格式不正确")
+		}
+		return nil
+	},
+	"findingID": func(value string) error {
+		// 优化建议的 id 由服务端 uuid.NewString() 生成，形状校验与 suggestionID 同源。
+		if !relayUUID.MatchString(value) {
+			return errors.New("findingID 格式不正确")
 		}
 		return nil
 	},

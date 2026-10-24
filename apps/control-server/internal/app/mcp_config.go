@@ -78,6 +78,9 @@ type mcpInjection struct {
 	// CodexArgs 是 Codex 的 -c 注入参数（仅 agent=codex 时非空）。
 	// Codex 无 --mcp-config，改由点号路径逐键注入；此时 JSON/LocalPath/Strict 均为空。
 	CodexArgs []string
+	// OpenCodeConfig 是 OpenCode 的 {"mcp":{...}} 内联配置（仅 agent=opencode 时非空）。
+	// 由 runner 写入 OPENCODE_CONFIG_CONTENT；不落盘（SSH 由 ssh runner 自行落盘）。
+	OpenCodeConfig string
 
 	cleanup func()
 }
@@ -116,6 +119,23 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 	if agentID == "" {
 		agentID = "claude-code"
 	}
+	if agentID == "cursor" {
+		// Cursor CLI 没有会话级 MCP 注入参数：它只读 ~/.cursor/mcp.json 与项目
+		// .cursor/mcp.json。这里**必须**显式记录"未注入"，否则界面上会显示本项目
+		// 选了哪些 server，而这一轮一个都没生效 —— 那是把没做写成做了。
+		target := s.resolveAgentTargetEnv(runnerID, projectPath)
+		note := "Cursor CLI 没有会话级 MCP 注入参数；本次未注入任何 server（它只读取 ~/.cursor/mcp.json 与项目 .cursor/mcp.json）。"
+		s.recordProjectMCPInjection(projectID, projectMCPStatus{
+			ProjectID:   projectID,
+			Environment: string(target),
+			AgentID:     agentID,
+			StrictMode:  !s.projectMCPAllowMcpJson(ctx, projectID),
+			Servers:     []projectMCPStatusServer{},
+			Note:        note,
+			RunKey:      runKey,
+		})
+		return mcpInjection{Environment: target, Note: note}
+	}
 	if !validProfileAgent(agentID) {
 		return mcpInjection{}
 	}
@@ -131,6 +151,9 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 			RunKey:      runKey,
 		})
 		return mcpInjection{Environment: target}
+	}
+	if agentID == "opencode" {
+		return s.prepareOpenCodeMCPInjection(ctx, projectID, projectPath, servers, target, runKey)
 	}
 	if agentID == "codex" {
 		// 远端（SSH）Codex 暂无 MCP 注入通道：ssh runner 的 runCodex 不消费 CodexArgs
@@ -243,6 +266,132 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 		RunKey:      runKey,
 	})
 	return inj
+}
+
+// prepareOpenCodeMCPInjection 把平台 MCP 定义转成 OpenCode 的 `mcp` 配置。
+//
+// 与 Claude/Codex 不同，OpenCode 没有 --mcp-config / -c 注入通道，只能走
+// OPENCODE_CONFIG_CONTENT（本地/WSL）或远端临时配置（SSH）。这里统一生成 JSON，
+// 由各条运行路径决定放在进程环境还是临时文件。
+func (s *Server) prepareOpenCodeMCPInjection(ctx context.Context, projectID, projectPath string, servers []storedMCPServer, target agentTargetEnv, runKey string) mcpInjection {
+	entries := map[string]any{}
+	injected := []projectMCPStatusServer{}
+	notes := []string{}
+	seenNote := map[string]bool{}
+	skipped := 0
+	addNote := func(key, text string) {
+		if seenNote[key] {
+			return
+		}
+		seenNote[key] = true
+		notes = append(notes, text)
+	}
+	for _, server := range servers {
+		raw, _, ok := s.mcpServerEntry(ctx, server, target, projectPath, false)
+		if !ok {
+			skipped++
+			continue
+		}
+		entry, ok := openCodeMCPServerEntry(raw)
+		if !ok {
+			skipped++
+			continue
+		}
+		entries[server.Name] = entry
+		injected = append(injected, describeMCPStatusServer(server))
+		if strings.TrimSpace(server.Cwd) != "" {
+			addNote("cwd", "OpenCode 不支持 MCP 的 cwd 字段，已忽略")
+		}
+		if server.StartupTimeoutSec > 0 || server.ToolTimeoutSec > 0 {
+			addNote("timeout", "OpenCode 不支持 MCP 的启动/工具超时字段，已忽略")
+		}
+	}
+	if skipped > 0 {
+		addNote("skipped", fmt.Sprintf("%d 个 MCP server 因配置不完整、传输方式不支持或密钥不可用未注入", skipped))
+	}
+	if len(entries) == 0 {
+		s.recordProjectMCPInjection(projectID, projectMCPStatus{
+			ProjectID:   projectID,
+			Environment: string(target),
+			AgentID:     "opencode",
+			Servers:     []projectMCPStatusServer{},
+			Note:        strings.Join(notes, "；"),
+			RunKey:      runKey,
+		})
+		return mcpInjection{Environment: target, Note: strings.Join(notes, "；")}
+	}
+	payload, err := json.Marshal(map[string]any{"mcp": entries})
+	if err != nil {
+		return mcpInjection{Environment: target}
+	}
+	// SSH 走远端临时文件，不受 Windows 环境块大小限制；本地/WSL 才需要上限。
+	if target != agentTargetEnvRemote && len(payload) > opencodeInlineConfigLimit() {
+		note := "MCP 配置超过 OpenCode 内联配置上限，本次未注入任何 server。请减少 server 或改用更短的环境变量"
+		s.recordProjectMCPInjection(projectID, projectMCPStatus{
+			ProjectID:   projectID,
+			Environment: string(target),
+			AgentID:     "opencode",
+			Servers:     []projectMCPStatusServer{},
+			Note:        note,
+			RunKey:      runKey,
+		})
+		return mcpInjection{Environment: target, Note: note}
+	}
+	// OpenCode 没有 strict 等价物：用户全局/项目配置里的 MCP 仍会加载。
+	addNote("strict", "OpenCode 没有 strict MCP 等价物，用户/项目配置里的 MCP 仍会加载")
+	note := strings.Join(notes, "；")
+	s.recordProjectMCPInjection(projectID, projectMCPStatus{
+		ProjectID:   projectID,
+		Environment: string(target),
+		AgentID:     "opencode",
+		StrictMode:  false,
+		Servers:     injected,
+		Note:        note,
+		RunKey:      runKey,
+	})
+	return mcpInjection{Environment: target, OpenCodeConfig: string(payload), Note: note}
+}
+
+// openCodeMCPServerEntry 把 mcpServerEntry 的 Claude/Codex 形态转成 OpenCode 的
+// local/remote 形态。调用方传入 useEnvRefs=false 的明文值，因此这里不再处理
+// ${MCP_SEC_*} 占位符。
+func openCodeMCPServerEntry(raw map[string]any) (map[string]any, bool) {
+	transport, _ := raw["type"].(string)
+	switch transport {
+	case "stdio":
+		command, _ := raw["command"].(string)
+		if strings.TrimSpace(command) == "" {
+			return nil, false
+		}
+		commandLine := []string{command}
+		switch args := raw["args"].(type) {
+		case []string:
+			commandLine = append(commandLine, args...)
+		case []any:
+			for _, arg := range args {
+				if text, ok := arg.(string); ok {
+					commandLine = append(commandLine, text)
+				}
+			}
+		}
+		entry := map[string]any{"type": "local", "command": commandLine, "enabled": true}
+		if env, ok := raw["env"].(map[string]string); ok && len(env) > 0 {
+			entry["environment"] = env
+		}
+		return entry, true
+	case "http", "sse":
+		// OpenCode 只有 remote 一种远端类型；SSE 也映射到 remote，兼容性以目标版本为准。
+		url, _ := raw["url"].(string)
+		if strings.TrimSpace(url) == "" {
+			return nil, false
+		}
+		entry := map[string]any{"type": "remote", "url": url, "enabled": true}
+		if headers, ok := raw["headers"].(map[string]string); ok && len(headers) > 0 {
+			entry["headers"] = headers
+		}
+		return entry, true
+	}
+	return nil, false
 }
 
 // describeMCPStatusServer 把一条生效定义转成注入状态里的摘要。

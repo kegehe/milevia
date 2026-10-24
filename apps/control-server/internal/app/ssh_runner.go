@@ -904,7 +904,7 @@ func (r *sshRunner) CheckUpdate(ctx context.Context) (bool, string, error) {
 // 编排（确认来源 → 执行 → 健康检查 → 必要时回滚）与 WSL 侧共用一套实现，
 // 差别只在"怎么在那边跑命令"（见 cross_npm_update.go）。
 func (r *sshRunner) Update(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "远程服务器上", "claude", "Claude Code", claudeNpmCLIInstall, r.execRemote, r.Version)
+	return runCrossCLIUpdate(ctx, "远程服务器上", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, r.execRemote, r.Version)
 }
 
 // execRemote 在远端跑一条脚本（crossCommandRunner 的 SSH 实现）。
@@ -921,6 +921,21 @@ const codexLoginStatusCommand = "codex login status"
 func (r *sshRunner) CodexReady(ctx context.Context) bool {
 	out, err := r.client.execCommand(ctx, "which codex && "+codexLoginStatusCommand)
 	return err == nil && len(out) > 0
+}
+
+// OpenCodeReady / OpenCodeVersion implement OpenCodeCapableRunner.
+// 远端只测“能报版本”，不查 provider 凭据：凭据是否存在由登录状态接口回答，
+// 运行失败时再由 CLI 自己给出认证错误。
+func (r *sshRunner) OpenCodeReady(ctx context.Context) bool {
+	return r.OpenCodeVersion(ctx) != ""
+}
+
+func (r *sshRunner) OpenCodeVersion(ctx context.Context) string {
+	out, err := r.client.execCommand(ctx, crossManagedPathPrefix()+"; opencode --version")
+	if err != nil {
+		return ""
+	}
+	return agentVersionFromOutput(string(out))
 }
 
 func (r *sshRunner) CodexVersion(ctx context.Context) string {
@@ -1003,7 +1018,7 @@ func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) 
 }
 
 func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "远程服务器上", "codex", "Codex CLI", codexNpmCLIInstall, r.execRemote, r.CodexVersion)
+	return runCrossCLIUpdate(ctx, "远程服务器上", "codex", []string{"update"}, "Codex CLI", codexNpmCLIInstall, r.execRemote, r.CodexVersion)
 }
 
 // ── crossShellRunner：目录驱动的工具（catalogAgentBackend 用）────────────────
@@ -1025,13 +1040,13 @@ func (r *sshRunner) crossProbe(ctx context.Context, name string, args ...string)
 	for _, arg := range args {
 		parts = append(parts, shellQuote(arg))
 	}
-	out, err := r.client.execCommand(ctx, strings.Join(parts, " "))
+	out, err := r.client.execCommand(ctx, crossManagedPathPrefix()+"; "+strings.Join(parts, " "))
 	return strings.TrimSpace(string(out)), err == nil
 }
 
 // crossRun 在远端跑一段脚本（升级这类短命令）。
 func (r *sshRunner) crossRun(ctx context.Context, script string) (string, error) {
-	return r.execRemote(ctx, script)
+	return r.execRemote(ctx, crossManagedPathPrefix()+"\n"+script)
 }
 
 // crossWhere 是"在哪台机器上"的说法，只用于报错文案。
@@ -1040,6 +1055,7 @@ func (r *sshRunner) crossWhere() string { return "远程服务器上" }
 // 编译期钉住能力面：签名写歪了只会表现为"这个 runner 突然不支持目录驱动"（断言失败
 // 落到 agentBackend 的"尚未接通"分支），而那是一条**看起来像数据问题**的静默降级。
 var _ crossShellRunner = (*sshRunner)(nil)
+var _ OpenCodeCapableRunner = (*sshRunner)(nil)
 
 // remoteNpmCLIRecovery 是一条"升级失败时可以回滚到哪"的信息。
 // SSH 与 WSL 共用（编排见 cross_npm_update.go）。
@@ -1052,7 +1068,7 @@ type remoteNpmCLIRecovery struct {
 func remoteNpmRollbackCommand(prefix, previous string, install npmCLIInstall) string {
 	packageRoot := pathpkg.Join(prefix, "lib", "node_modules", install.scope)
 	active := pathpkg.Join(packageRoot, install.packageName)
-	binary := pathpkg.Join("bin", install.binFile)
+	binary := pathpkg.Join(install.binPath)
 	command := pathpkg.Join(prefix, "bin", install.commandName)
 	target := pathpkg.Join(active, binary)
 	return fmt.Sprintf(`set -eu
@@ -1129,6 +1145,9 @@ func truncateBytesHead(s string, max int) string {
 func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
 	if request.AgentID == "codex" {
 		return r.runCodex(ctx, request, sink)
+	}
+	if request.AgentID == "opencode" {
+		return r.runOpenCode(ctx, request, sink)
 	}
 	approvalURL := ""
 	if needsClaudeApprovalHook(request.PermissionMode) {
@@ -1436,6 +1455,173 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 		}
 		return nil
 	}
+}
+
+// runOpenCode executes one OpenCode turn on the remote host over SSH.
+// 配置（MCP）先落到 0600 临时文件，命令里只出现路径；权限与自动更新开关直接走环境。
+func (r *sshRunner) runOpenCode(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
+	configPath := ""
+	if strings.TrimSpace(request.OpenCodeConfig) != "" {
+		path, warning, err := r.uploadOpenCodeConfig(ctx, request.OpenCodeConfig)
+		if err != nil {
+			return err
+		}
+		configPath = path
+		if warning != "" {
+			sink.Event("stderr", mustJSON(map[string]string{"message": warning}))
+		}
+	}
+	if configPath != "" {
+		// EXIT trap 是主清理路径；这里再兜一次，防止 SIGKILL / 连接中断跳过 trap。
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = r.client.execCommand(cleanupCtx, "rm -f "+shellQuote(configPath))
+		}()
+	}
+	command, err := buildSSHOpenCodeCommand(request, configPath)
+	if err != nil {
+		return err
+	}
+	session, err := r.client.newSession(ctx)
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("SSH OpenCode stdin pipe: %w", err)
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("SSH OpenCode stdout pipe: %w", err)
+	}
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("SSH OpenCode stderr pipe: %w", err)
+	}
+	if err := session.Start(command); err != nil {
+		return fmt.Errorf("启动远程 OpenCode 失败：%w", err)
+	}
+
+	completion := newOpenCodeCompletion()
+	promptErr := writeOpenCodePrompt(stdin, request.Prompt)
+	done := make(chan struct{})
+	go func() {
+		readOpenCodeJSONL(stdout, sink, completion)
+		close(done)
+	}()
+	go readOpenCodeStderr(stderr, sink, completion)
+
+	select {
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		return ctx.Err()
+	case <-completion.done:
+		// 先等远端 shell 自己退出：它还要执行 EXIT trap 删除 0600 配置。
+		// 只有在 CLI 退出后仍有子进程握着管道时才杀。
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = session.Signal(ssh.SIGKILL)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
+		_ = session.Close()
+		return completion.failure()
+	case <-done:
+		if completion.finished() {
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+			return completion.failure()
+		}
+		waitCh := make(chan error, 1)
+		go func() { waitCh <- session.Wait() }()
+		var waitErr error
+		select {
+		case waitErr = <-waitCh:
+		case <-ctx.Done():
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+			return fmt.Errorf(opencodeExitPrefix + "远程会话退出超时")
+		}
+		if waitErr != nil {
+			return fmt.Errorf(opencodeExitPrefix+"%w", waitErr)
+		}
+		if writeErr := waitOpenCodePrompt(promptErr); writeErr != nil {
+			return fmt.Errorf("写入 OpenCode 提示词失败：%w", writeErr)
+		}
+		return nil
+	}
+}
+
+// uploadOpenCodeConfig 把内联配置写到远端 /tmp 下的 0600 文件。
+// SFTP 不可用时回退 base64；回退路径会在 stderr 留一条可见说明。
+func (r *sshRunner) uploadOpenCodeConfig(ctx context.Context, content string) (string, string, error) {
+	remote := pathpkg.Join("/tmp", "milevia-opencode-"+uuid.NewString()+".json")
+	client, err := r.client.getSFTPClient(ctx)
+	if err == nil {
+		file, openErr := client.OpenFile(remote, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+		if openErr == nil {
+			chmodErr := file.Chmod(0o600)
+			written, writeErr := io.WriteString(file, content)
+			closeErr := file.Close()
+			if chmodErr == nil && writeErr == nil && closeErr == nil && written == len(content) {
+				return remote, "", nil
+			}
+		}
+		_ = client.Remove(remote)
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte(content))
+	script := fmt.Sprintf("printf '%%s' %s | base64 -d > %s && chmod 600 %s",
+		shellQuote(encoded), shellQuote(remote), shellQuote(remote))
+	if _, err := r.client.execCommand(ctx, script); err != nil {
+		return "", "", fmt.Errorf("在远端写入 OpenCode 配置失败：%w", err)
+	}
+	return remote, "SFTP 不可用，OpenCode MCP 配置已通过 base64 命令行写入远端临时文件；同机用户可能在此刻看到配置内容", nil
+}
+
+// buildSSHOpenCodeCommand 是纯函数，便于断言引号与参数顺序。
+// 注意不能用 `exec opencode`：exec 会跳过 EXIT trap，临时配置文件就删不掉。
+func buildSSHOpenCodeCommand(request AgentRunRequest, configPath string) (string, error) {
+	args, err := opencodeExecArgs(request)
+	if err != nil {
+		return "", err
+	}
+	permission, err := opencodePermissionJSON(request.PermissionMode)
+	if err != nil {
+		return "", err
+	}
+	var script strings.Builder
+	script.WriteString(crossManagedPathPrefix())
+	script.WriteString("\n")
+	if configPath != "" {
+		script.WriteString("trap 'rm -f " + configPath + "' EXIT\n")
+		script.WriteString("export OPENCODE_CONFIG_CONTENT=\"$(cat " + shellQuote(configPath) + ")\"\n")
+	}
+	script.WriteString("export OPENCODE_PERMISSION=" + shellQuote(permission) + "\n")
+	script.WriteString("export OPENCODE_DISABLE_AUTOUPDATE=true\n")
+	// cd 失败必须中止：否则 OpenCode 会带着 workspace_write/full_control 在远端
+	// 家目录里跑起来，把"项目目录已不存在"变成"在错误目录里改文件"。
+	script.WriteString("cd " + shellQuote(request.ProjectPath) + " || exit 1\n")
+	script.WriteString("opencode")
+	for _, arg := range args {
+		script.WriteString(" " + shellQuote(arg))
+	}
+	script.WriteString("\nstatus=$?\nexit $status\n")
+	return script.String(), nil
 }
 
 func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (AgentSession, error) {

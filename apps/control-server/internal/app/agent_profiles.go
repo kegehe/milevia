@@ -105,6 +105,8 @@ type AgentRuntimeProfile struct {
 var profileCredentialKeys = []string{
 	"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
 	"OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY",
+	// Qoder 的 headless 认证通道（官方文档：CI/CD 与无头环境用个人访问令牌）。
+	"QODER_PERSONAL_ACCESS_TOKEN",
 }
 
 // managedCLIEnvironment builds the effective CLI environment for an admitted
@@ -140,6 +142,15 @@ func managedCLIEnvironment(profile *AgentRuntimeProfile, inherited []string, add
 				if profile.BaseURL != "" {
 					effective = append(effective, "OPENAI_BASE_URL="+profile.BaseURL)
 				}
+			case "qoder":
+				// Qoder 只认自己的令牌通道；BaseURL 走它的 BYOK 配置、没有环境变量入口，
+				// 所以这一档在 validateManagedProfileInput 里直接拒绝自定义端点 —— 不在
+				// 这里"假装注入成功"。
+				//
+				// ⚠️ 目前**不可达**：档案表的 agent_id CHECK 还没放开，Qoder 档案在保存
+				// 时就被拒了。保留这一分支是为了约束放开后不会静默落到 default 的
+				// ANTHROPIC_API_KEY（那是错的凭据变量）。
+				effective = append(effective, "QODER_PERSONAL_ACCESS_TOKEN="+profile.Secret)
 			default:
 				effective = append(effective, "ANTHROPIC_API_KEY="+profile.Secret)
 				if profile.BaseURL != "" {
@@ -407,9 +418,26 @@ func (s *Server) replaceProjectAgentRouteTx(ctx context.Context, tx *sql.Tx, pro
 	return s.replaceProjectAgentRouteWithPoolTx(ctx, tx, projectID, agentID, profileID, profileRevisionID, "", mode)
 }
 
+// profileStoreAcceptsAgent 报告档案 / 路由**表**能不能存这个 agent。
+//
+// 判据来自目录的 SupportsProfiles，但它的真身仍是 migrateAgentProfiles 里那几条
+// CHECK(agent_id in ('claude-code','codex'))：表已经建在用户库里，改约束要重建表。
+// 所以新增工具必须先把目录的 SupportsProfiles 留为 false —— 放行只会在 insert 时
+// 撞 SQLite 约束，把一条英文的 CHECK constraint failed 丢给用户，指不到下一步。
+//
+// ⚠️ 约束放开时，目录的 SupportsProfiles、这里和 validateManagedProfileInput 的拒绝
+// 要一起改。
+func profileStoreAcceptsAgent(agentID string) bool {
+	entry, ok := agentByID(agentID)
+	return ok && entry.SupportsProfiles
+}
+
 func (s *Server) replaceProjectAgentRouteWithPoolTx(ctx context.Context, tx *sql.Tx, projectID, agentID, profileID, profileRevisionID, poolRevisionID, mode string) error {
 	if !validProfileAgent(agentID) || (mode != "pinned" && mode != "cli_managed" && mode != "pool") || (mode == "pinned" && (profileID == "" || profileRevisionID == "" || poolRevisionID != "")) || (mode == "pool" && (poolRevisionID == "" || profileID != "" || profileRevisionID != "")) || (mode == "cli_managed" && (profileID != "" || profileRevisionID != "" || poolRevisionID != "")) {
 		return errors.New("invalid project agent route")
+	}
+	if !profileStoreAcceptsAgent(agentID) {
+		return fmt.Errorf("%s 暂不支持项目级档案路由；请直接使用该工具自己的登录", agentDisplayName(agentID))
 	}
 	now := time.Now().UTC()
 	routeRevisionID := uuid.NewString()
@@ -435,6 +463,9 @@ func validateManagedProfileInput(agentID, name, model, baseURL, authMode string)
 	if !validProfileAgent(agentID) {
 		return errors.New("unsupported agent profile")
 	}
+	if !profileStoreAcceptsAgent(agentID) {
+		return fmt.Errorf("%s 暂不支持托管档案；请在目标环境执行该工具自己的登录，或设置它自己的令牌环境变量", agentDisplayName(agentID))
+	}
 	if !profileNamePattern.MatchString(strings.TrimSpace(name)) {
 		return errors.New("profile name is invalid")
 	}
@@ -447,6 +478,11 @@ func validateManagedProfileInput(agentID, name, model, baseURL, authMode string)
 			return errors.New("cli_managed profiles cannot set a custom endpoint")
 		}
 	case "api_key":
+		if agentID == "qoder" && baseURL != "" {
+			// Qoder 没有文档化的端点环境变量：注入了也到不了 CLI。与其让它看起来
+			// "已配置"，不如在保存时就说不行。
+			return errors.New("Qoder 档案不支持自定义端点")
+		}
 		if baseURL != "" {
 			httpEndpointPattern := regexp.MustCompile(`^https?://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/.*)?$`)
 			if !httpEndpointPattern.MatchString(baseURL) {
@@ -488,6 +524,9 @@ func isLoopbackHost(host string) bool {
 func profileProtocol(agentID, authMode string) string {
 	if agentID == "codex" {
 		return "codex_cli"
+	}
+	if agentID == "qoder" {
+		return "qoder_cli"
 	}
 	return "claude_cli"
 }
@@ -646,7 +685,9 @@ func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
 	// 保留旧数据库的 runner 默认 Profile 兼容视图，但标记为 runner_default。
 	// 它不是项目显式配置，前端会继续显示 CLI 实际配置并按 CLI 草稿初始化。
 	for _, agentID := range supportedAgentIDs() {
-		if byAgent[agentID] != nil { continue }
+		if byAgent[agentID] != nil {
+			continue
+		}
 		var entry ProjectAgentEntryView
 		var optionsJSON string
 		err := s.db.QueryRowContext(r.Context(), `select p.id,r.model,r.base_url,r.auth_mode,p.enabled,r.state,r.options_json
@@ -654,8 +695,13 @@ func (s *Server) getProjectAgentConfig(w http.ResponseWriter, r *http.Request) {
 			where p.runner_id=? and p.agent_id=? and p.enabled=1 and r.state='active'
 			order by case when p.id=? then 0 when p.is_default=1 then 1 else 2 end,p.name limit 1`, runnerID, agentID, project.DefaultProfileID).
 			Scan(&entry.ProfileID, &entry.Model, &entry.BaseURL, &entry.AuthMode, &entry.Enabled, &entry.State, &optionsJSON)
-		if errors.Is(err, sql.ErrNoRows) { continue }
-		if err != nil { writeError(w, http.StatusInternalServerError, err); return }
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 		entry.Mode = "runner_default"
 		entry.IsDefault = entry.ProfileID == project.DefaultProfileID
 		entry.Env, _ = unmarshalProfileOptions(optionsJSON)

@@ -56,11 +56,11 @@ func (v *versionSequence) next(context.Context) string {
 func TestRunCrossCLIUpdateChecksSourceBeforeUpdating(t *testing.T) {
 	run := &scriptedRun{replies: []fakeCrossReply{
 		{match: "npm prefix -g", out: "/usr/local\n"},
-		{match: "claude update", out: "updated\n"},
+		{match: "'claude' 'update'", out: "updated\n"},
 	}}
 	versions := &versionSequence{values: []string{"2.1.216", "2.1.217"}}
 
-	previous, current, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
+	previous, current, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
 	if err != nil {
 		t.Fatalf("升级失败：%v", err)
 	}
@@ -74,7 +74,7 @@ func TestRunCrossCLIUpdateChecksSourceBeforeUpdating(t *testing.T) {
 	if !strings.Contains(run.scripts[0], "npm prefix -g") {
 		t.Fatalf("第一条脚本不是来源确认：%s", run.scripts[0])
 	}
-	if !strings.Contains(run.scripts[1], "claude update") {
+	if !strings.Contains(run.scripts[1], "'claude' 'update'") {
 		t.Fatalf("第二条脚本不是 update：%s", run.scripts[1])
 	}
 	// 升级后必须真的读一次版本号 —— 只看退出码的话"更新成功"只是一句话。
@@ -83,16 +83,42 @@ func TestRunCrossCLIUpdateChecksSourceBeforeUpdating(t *testing.T) {
 	}
 }
 
+// TestRunCrossCLIUpdateUsesCatalogUpdateArgs 钉住 OpenCode 的 `upgrade` 子命令。
+//
+// 跨端编排曾经写死 `<cli> update`，目录里的 UpdateArgs 根本没有消费者。OpenCode
+// 只有 `upgrade`，写死会让 WSL/SSH 上的升级必然失败（且工具仍可用，不会触发回滚）。
+func TestRunCrossCLIUpdateUsesCatalogUpdateArgs(t *testing.T) {
+	entry, ok := agentByID("opencode")
+	if !ok {
+		t.Fatal("opencode missing from catalog")
+	}
+	run := &scriptedRun{replies: []fakeCrossReply{
+		{match: "npm prefix -g", out: "/usr/local\n"},
+		{match: "'opencode' 'upgrade'", out: "upgraded\n"},
+	}}
+	versions := &versionSequence{values: []string{"1.19.3", "1.20.0"}}
+	previous, current, err := runCrossCLIUpdate(context.Background(), "远程服务器上", entry.CommandName, entry.UpdateArgs, entry.Name, agentNpmCLIInstall(entry), run.run, versions.next)
+	if err != nil {
+		t.Fatalf("升级失败：%v", err)
+	}
+	if previous != "1.19.3" || current != "1.20.0" {
+		t.Fatalf("previous/current = %q/%q", previous, current)
+	}
+	if !strings.Contains(run.scripts[1], "'opencode' 'upgrade'") {
+		t.Fatalf("第二条脚本不是 upgrade：%s", run.scripts[1])
+	}
+}
+
 func TestRunCrossCLIUpdateRollsBackOnlyAfterHealthCheckFails(t *testing.T) {
 	run := &scriptedRun{replies: []fakeCrossReply{
 		{match: "npm prefix -g", out: "/usr/local\n"},
-		{match: "claude update", err: fmt.Errorf("exit status 1")},
+		{match: "'claude' 'update'", err: fmt.Errorf("exit status 1")},
 		{match: "mv ", out: ""},
 	}}
 	// 升级后读不到版本 → 判定不可用 → 回滚 → 回滚后的健康检查通过（回到旧版本）。
 	versions := &versionSequence{values: []string{"2.1.216", "", "2.1.216"}}
 
-	previous, current, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
+	previous, current, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
 	if err == nil {
 		t.Fatal("升级失败且工具不可用时应当报错")
 	}
@@ -120,11 +146,11 @@ func TestRunCrossCLIUpdateRollsBackOnlyAfterHealthCheckFails(t *testing.T) {
 func TestRunCrossCLIUpdateDoesNotRollbackWhileToolStillWorks(t *testing.T) {
 	run := &scriptedRun{replies: []fakeCrossReply{
 		{match: "npm prefix -g", out: "/usr/local\n"},
-		{match: "claude update", err: fmt.Errorf("exit status 1")},
+		{match: "'claude' 'update'", err: fmt.Errorf("exit status 1")},
 	}}
 	versions := &versionSequence{values: []string{"2.1.216", "2.1.216"}}
 
-	_, _, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
+	_, _, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
 	if err == nil {
 		t.Fatal("update 报错时应当如实返回失败")
 	}
@@ -145,11 +171,11 @@ func TestRunCrossCLIUpdateDoesNotRollbackWhileToolStillWorks(t *testing.T) {
 func TestRunCrossCLIUpdateRefusesToGuessWhichPackageToRollBack(t *testing.T) {
 	run := &scriptedRun{replies: []fakeCrossReply{
 		{match: "npm prefix -g", err: fmt.Errorf("exit status 1")},
-		{match: "claude update", err: fmt.Errorf("exit status 1")},
+		{match: "'claude' 'update'", err: fmt.Errorf("exit status 1")},
 	}}
 	versions := &versionSequence{values: []string{"2.1.216", ""}}
 
-	_, _, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
+	_, _, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
 	if err == nil {
 		t.Fatal("应当报错")
 	}
@@ -167,7 +193,7 @@ func TestRunCrossCLIUpdateRefusesToGuessWhichPackageToRollBack(t *testing.T) {
 func TestCrossEndRunnersReportMissingInstall(t *testing.T) {
 	run := &scriptedRun{}
 	versions := &versionSequence{values: []string{""}}
-	_, _, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
+	_, _, err := runCrossCLIUpdate(context.Background(), "WSL 内", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, run.run, versions.next)
 	if err == nil {
 		t.Fatal("那边没装时应当如实报错")
 	}

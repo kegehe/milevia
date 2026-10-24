@@ -148,22 +148,23 @@ func (r *wslAgentRunner) backgroundContext() context.Context {
 	return context.Background()
 }
 
-// wslPathPrefix 返回在 WSL 内把原生 npm bin 目录前置到 PATH 的 shell 语句前缀。
+// wslPathPrefix 返回在 WSL 内把平台托管/原生 npm bin 目录前置到 PATH 的 shell 语句前缀。
 //
 // 背景：wsl.exe 不会继承 Windows 侧 PATH，而是为默认 shell 重建一份，且会把 Windows
 // npm 全局目录（/mnt/c/Users/.../AppData/Roaming/npm）混进 PATH 并置于用户原生目录之前。
 // 于是 WSL 内裸 `codex` 会命中 Windows 那个 npm shim——它在 Linux 平台缺
 // @openai/codex-linux-x64 可选二进制，一跑即抛 "Missing optional dependency"。用户原生
-// 目录（$HOME/.npm-global/bin、$HOME/.local/bin，见 WSL .bashrc/.zshrc）里的同名单文件
-// 才是可在 Linux 执行的版本。探测与运行都前置这两个目录，保证"WSL 项目用 WSL 原生
-// codex/claude"，不让 Windows shim 劫持。
+// 目录（$HOME/.npm-global/bin、$HOME/.local/bin、$HOME/.opencode/bin）里的同名单文件
+// 才是可在 Linux 执行的版本；平台装的则落在托管 npm-global/bin。探测与运行都前置这些
+// 目录，保证"WSL 项目用 WSL 原生那一份"，不被 Windows shim 劫持。
 func (r *wslAgentRunner) wslPathPrefix() string {
 	nodeBin := r.zshNodeBin()
-	prefix := `export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"`
+	// $HOME 必须在双引号里展开；nodeBin 由 zsh 解析出来，单独用 shellQuote 保护。
+	prefix := `export PATH="` + crossManagedPathValue + `:$PATH"`
 	if nodeBin == "" {
 		return prefix
 	}
-	return "export PATH=" + shellQuote(nodeBin) + `:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH`
+	return "export PATH=" + shellQuote(nodeBin) + `:` + crossManagedPathValue + `:$PATH`
 }
 
 func (r *wslAgentRunner) zshNodeBin() string {
@@ -538,6 +539,7 @@ var _ crossShellRunner = (*wslAgentRunner)(nil)
 // 同上，freshProbeRunner 是**可选**接口，写歪了不会报错、只会静默退回缓存的旧读数
 // （也就是升级后健康检查读到升级前的版本）。这条断言是它唯一的守卫。
 var _ freshProbeRunner = (*wslAgentRunner)(nil)
+var _ OpenCodeCapableRunner = (*wslAgentRunner)(nil)
 
 // Ready implements AgentRunner（Claude 就绪，用于 claude 分发与 createProject 校验）。
 func (r *wslAgentRunner) Ready(parent context.Context) bool { return r.claudeReady(parent) }
@@ -550,6 +552,21 @@ func (r *wslAgentRunner) Version(parent context.Context) string { return r.claud
 
 // CodexVersion implements CodexCapableRunner。
 func (r *wslAgentRunner) CodexVersion(parent context.Context) string { return r.codexVersion(parent) }
+
+// OpenCodeReady / OpenCodeVersion implement OpenCodeCapableRunner。
+// 走目录驱动的 crossProbe（带缓存），能报出版本才算就绪；不把 /mnt/ 命中的
+// Windows 安装算成 WSL 侧安装（判据在 wslNativeProbeCommand）。
+func (r *wslAgentRunner) OpenCodeReady(parent context.Context) bool {
+	return r.OpenCodeVersion(parent) != ""
+}
+
+func (r *wslAgentRunner) OpenCodeVersion(parent context.Context) string {
+	out, ok := r.crossProbe(parent, "opencode", "--version")
+	if !ok {
+		return ""
+	}
+	return agentVersionFromOutput(out)
+}
 
 // CheckUpdate implements AgentRunner。与 claudeCLIRunner / sshRunner 语义一致：先取 WSL
 // 内探测到的本机版本，再查 npm registry 最新版并比较。npm registry 版本号跨平台唯一，

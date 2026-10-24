@@ -2,6 +2,9 @@ package app
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path"
 	"strings"
 	"testing"
 )
@@ -15,7 +18,7 @@ func TestValidProfileAgentReadsCatalogNotHardcodedPair(t *testing.T) {
 	withExtraCatalogEntry(t, AgentCatalogEntry{
 		ID: "gemini-cli", Name: "Gemini CLI", Vendor: "Google",
 		InstallKind: InstallKindNpmGlobal, NpmPackage: "@google/gemini-cli",
-		CommandName: "gemini", BinFile: "index.js",
+		CommandName: "gemini", BinPath: "bin/index.js",
 		VersionArgs:           []string{"--version"},
 		SupportsInstall:       true,
 		PermissionModes:       []string{"read_only"},
@@ -42,7 +45,7 @@ func TestSupportedAgentIDsTracksCatalog(t *testing.T) {
 	withExtraCatalogEntry(t, AgentCatalogEntry{
 		ID: "aider", Name: "Aider", Vendor: "Aider",
 		InstallKind: InstallKindNpmGlobal, NpmPackage: "aider-chat",
-		CommandName: "aider", BinFile: "aider.js",
+		CommandName: "aider", BinPath: "bin/aider.js",
 		PermissionModes:       []string{"read_only"},
 		DefaultPermissionMode: "read_only",
 	})
@@ -93,8 +96,8 @@ func TestCatalogEntriesAreSelfConsistent(t *testing.T) {
 			t.Fatalf("%s: installKind is empty", entry.ID)
 		}
 		if entry.InstallKind == InstallKindNpmGlobal {
-			if entry.NpmPackage == "" || entry.CommandName == "" || entry.BinFile == "" {
-				t.Fatalf("%s: npm-global entry needs npmPackage/commandName/binFile", entry.ID)
+			if entry.NpmPackage == "" || entry.CommandName == "" || entry.BinPath == "" {
+				t.Fatalf("%s: npm-global entry needs npmPackage/commandName/binPath", entry.ID)
 			}
 			if len(entry.VersionArgs) == 0 {
 				t.Fatalf("%s: npm-global entry needs versionArgs to probe its version", entry.ID)
@@ -117,6 +120,11 @@ func TestCatalogEntriesAreSelfConsistent(t *testing.T) {
 		if entry.SupportsInstall && entry.MinRuntimeVersion == "" {
 			t.Fatalf("%s: supportsInstall without minRuntimeVersion leaves no way to gate an unusable install", entry.ID)
 		}
+		if entry.SupportsInstall && len(entry.UpdateArgs) == 0 {
+			// 跨端升级用目录里的子命令（Claude/Codex 是 update、OpenCode 是 upgrade）。
+			// 漏填会让跨端升级去跑裸命令，而裸命令通常只打印帮助并成功退出。
+			t.Fatalf("%s: supportsInstall without updateArgs makes cross-end updates run the bare command", entry.ID)
+		}
 		// 不可安装的工具不能声明运行时依赖，否则界面会提示"先装 Node"却给不出动作。
 		if !entry.SupportsInstall && len(entry.Requires) > 0 {
 			t.Fatalf("%s: declares requires but does not support install", entry.ID)
@@ -128,15 +136,17 @@ func TestCatalogEntriesAreSelfConsistent(t *testing.T) {
 }
 
 func TestInsightAgentSupportIsExplicit(t *testing.T) {
-	for _, agentID := range []string{"claude-code", "codex"} {
+	for _, agentID := range []string{"claude-code", "codex", "opencode"} {
 		entry, ok := agentByID(agentID)
 		if !ok || !entry.SupportsProjectInsights {
 			t.Fatalf("%s must be explicitly enabled for optimization insights", agentID)
 		}
 	}
-	entry, ok := agentByID("codebuddy")
-	if !ok || entry.SupportsProjectInsights {
-		t.Fatal("CodeBuddy must stay out of optimization insights until its read-only analysis protocol is implemented")
+	for _, agentID := range []string{"codebuddy", "qoder", "cursor"} {
+		entry, ok := agentByID(agentID)
+		if !ok || entry.SupportsProjectInsights {
+			t.Fatalf("%s must stay out of optimization insights until its read-only analysis protocol is implemented", agentID)
+		}
 	}
 }
 
@@ -168,7 +178,7 @@ func TestPermissionModesCoversEveryCatalogAgent(t *testing.T) {
 		InstallKind:           InstallKindNpmGlobal,
 		NpmPackage:            "brand-new",
 		CommandName:           "brand-new",
-		BinFile:               "index.js",
+		BinPath:               "bin/index.js",
 		VersionArgs:           []string{"--version"},
 		PermissionModes:       []string{"read_only"},
 		DefaultPermissionMode: "read_only",
@@ -194,23 +204,28 @@ func withExtraCatalogEntry(t *testing.T, entry AgentCatalogEntry) {
 	t.Cleanup(func() { agentCatalogEntries = original })
 }
 
-// TestCatalogBinFileIsAFileNameNotAPath 钉住一条**只在最末端才暴露**的约定。
+// TestCatalogBinPathIsTheNpmBinTarget 钉住一条**只在最末端才暴露**的约定。
 //
-// BinFile 的消费方式是被拼到包根之后：npmCLIInstall.binaryPath =
-// `<prefix>/lib/node_modules/<scope>/<pkg>/bin/<BinFile>`。而各包在 npm 上的 bin 目标
-// 写的是 `bin/<X>`（完整相对路径）—— 照抄过来就得到 `<包根>/bin/bin/<X>`，一个不存在的
-// 路径。2026-10-09 实测 codebuddy 就是这样抄错的。
+// BinPath 的消费方式是被拼到包根之后：npmCLIInstall.binaryPath =
+// `<prefix>/lib/node_modules/<scope>/<pkg>/<BinPath>`。所以它必须**逐字等于**
+// `npm view <pkg> bin` 里那一条目标 —— 少一层、多一层都是不存在的路径。
+//
+// 历史教训有两条：2026-10-09 codebuddy 照抄完整目标 `bin/codebuddy`，而当时字段语义是
+// "bin/ 下的文件名"，于是拼成 `<包根>/bin/bin/codebuddy`；2026-10-21 接 qoder 时它的 bin
+// 目标在 `bundle/`，旧语义根本表达不出来。
 //
 // 它不在安装路径上暴露（那条自检用的是 `$prefix/bin/<命令名>`），只在跨端升级的
 // 「确认来源」与「回滚」上用（cross_npm_update.go / ssh_runner.go）——症状是"升级失败
 // 时回滚不了"，所以特别需要一条断言把它钉住。
-func TestCatalogBinFileIsAFileNameNotAPath(t *testing.T) {
+func TestCatalogBinPathIsTheNpmBinTarget(t *testing.T) {
 	// npm 上**实测**的 bin 目标（`npm view <pkg> bin`）。新增工具时必须先查一次并记进
 	// 这张表 —— 缺一条就红，是为了让"照抄 `bin/X`"这个错在下一次也犯不出来。
 	npmBinTargets := map[string]string{
 		"claude-code": "bin/claude.exe",
 		"codex":       "bin/codex.js",
-		"codebuddy":   "bin/codebuddy",
+		"codebuddy":   "./bin/codebuddy",
+		"qoder":       "bundle/qoder-npm-dispatcher.cjs",
+		"opencode":    "bin/opencode.exe",
 	}
 	for _, entry := range agentCatalog() {
 		if entry.InstallKind != InstallKindNpmGlobal {
@@ -220,13 +235,51 @@ func TestCatalogBinFileIsAFileNameNotAPath(t *testing.T) {
 		if !known {
 			t.Fatalf("%s: 先跑 `npm view %s bin` 并把结果记进这张表", entry.ID, entry.NpmPackage)
 		}
-		if strings.ContainsAny(entry.BinFile, `/\`) {
-			t.Fatalf("%s: BinFile = %q 是路径而不是文件名；binaryPath 会拼成 <包根>/bin/%s",
-				entry.ID, entry.BinFile, entry.BinFile)
+		// 比之前先 Clean：npm 对 codebuddy 报的是 `./bin/codebuddy`，落点本身等价。
+		if path.Clean(entry.BinPath) != path.Clean(target) {
+			t.Fatalf("%s: BinPath = %q，want %q（npm bin 目标原样）", entry.ID, entry.BinPath, target)
 		}
-		if want := strings.TrimPrefix(target, "bin/"); entry.BinFile != want {
-			t.Fatalf("%s: BinFile = %q，want %q（npm bin 目标 %q 去掉 bin/ 前缀）",
-				entry.ID, entry.BinFile, want, target)
+	}
+}
+
+// TestListAgentsEndpointExposesQoder 是"接口层真的把它交出去"的断言。
+//
+// 目录里登记了、handler 却没发出去，是这类接入最典型的静默失败：编译通过、目录测试
+// 也通过，前端却永远看不到这个工具。这里走真实路由，只断言对外可观察的东西。
+func TestListAgentsEndpointExposesQoder(t *testing.T) {
+	server := newTestServer(t)
+	recorder := httptest.NewRecorder()
+	server.routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/agents", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /api/agents 返回 %d：%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	// 落点与内部路径是**不许**出现在这份响应里的（它是给前端的目录，不是诊断读数）。
+	for _, forbidden := range []string{"binPath", "qoder-npm-dispatcher", "binFile"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("目录响应泄漏了内部字段 %q：%s", forbidden, body)
 		}
+	}
+	var entries []AgentCatalogEntry
+	if err := json.Unmarshal([]byte(body), &entries); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	var qoder *AgentCatalogEntry
+	for index := range entries {
+		if entries[index].ID == "qoder" {
+			qoder = &entries[index]
+		}
+	}
+	if qoder == nil {
+		t.Fatalf("GET /api/agents 没有 qoder：%s", body)
+	}
+	if qoder.Name != "Qoder CLI" || qoder.CommandName != "qoder" || qoder.NpmPackage != "@qoder-ai/qodercli" {
+		t.Fatalf("qoder 条目的名字/命令/包名不对：%+v", *qoder)
+	}
+	if !qoder.SupportsInstall || !qoder.SupportsLogin || !qoder.RunnableInProject {
+		t.Fatalf("qoder 能力开关不完整（安装/登录/可运行都要为 true）：%+v", *qoder)
+	}
+	if qoder.SupportsProjectInsights {
+		t.Fatal("洞察协议还没接，目录不能声称支持")
 	}
 }

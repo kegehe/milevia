@@ -41,12 +41,15 @@ type agentPathResolver struct {
 // 平台兜底只解决"GUI 进程继承了 npm 安装之前的陈旧 PATH"这一种已知情况。
 func newAgentPathResolver(config Config) *agentPathResolver {
 	override := map[string]string{}
-	// 两个环境变量沿用既有名字，不加新开关。
+	// 环境变量沿用既有命名（AUTO_CLAUDE_PATH / AUTO_CODEX_PATH / AUTO_OPENCODE_PATH），不加新开关。
 	if path := strings.TrimSpace(config.ClaudePath); path != "" && path != agentCommandName("claude-code") {
 		override["claude-code"] = path
 	}
 	if path := strings.TrimSpace(config.CodexPath); path != "" && path != agentCommandName("codex") {
 		override["codex"] = path
+	}
+	if path := strings.TrimSpace(config.OpenCodePath); path != "" && path != agentCommandName("opencode") {
+		override["opencode"] = path
 	}
 	return &agentPathResolver{override: override, recorded: map[string]string{}}
 }
@@ -71,12 +74,22 @@ func (r *agentPathResolver) Path(agentID string) string {
 	if path := r.recorded[agentID]; path != "" && fileExists(path) {
 		return path
 	}
-	if path, err := exec.LookPath(entry.CommandName); err == nil {
-		return path
+	names := agentCommandNames(entry)
+	if len(names) > 0 {
+		if path, err := exec.LookPath(names[0]); err == nil {
+			return path
+		}
 	}
 	for _, candidate := range platformFallbackCandidates(entry) {
 		if fileExists(candidate) {
 			return candidate
+		}
+	}
+	// 别名放在平台兜底之后：主名与已知安装位置都没有命中时，再认 PATH 上的别名。
+	// （Cursor 的官方安装器可能只把 agent 放进 PATH。）
+	for _, name := range names[1:] {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
 		}
 	}
 	return entry.CommandName
@@ -115,7 +128,14 @@ func (r *agentPathResolver) load(recorded map[string]string) {
 //
 // 沿用 codex 原先那段硬编码的意图，但**不再只对 codex 生效**：npm 全局包的落点
 // 对两个工具是一样的，没有理由只给其中一个兜底。
+//
+// 原生分发的工具（官方安装器）另有一套已知落点：Windows 的安装器把入口放在
+// %LOCALAPPDATA%\<命令名>，POSIX 安装器放在 ~/.local/bin。用户在安装器里选择
+// "加入 PATH"之前，GUI 进程继承的 PATH 里没有它 —— 这一档正是为那种情况兜底。
 func platformFallbackCandidates(entry AgentCatalogEntry) []string {
+	if entry.InstallKind != InstallKindNpmGlobal {
+		return nativeFallbackCandidates(entry)
+	}
 	if runtime.GOOS != "windows" {
 		return nil
 	}
@@ -123,10 +143,69 @@ func platformFallbackCandidates(entry AgentCatalogEntry) []string {
 	if appData == "" {
 		return nil
 	}
-	return []string{
-		filepath.Join(appData, "npm", entry.CommandName+".cmd"),
-		filepath.Join(appData, "npm", entry.CommandName+".exe"),
+	names := agentCommandNames(entry)
+	candidates := make([]string, 0, len(names)*2)
+	for _, name := range names {
+		candidates = append(candidates,
+			filepath.Join(appData, "npm", name+".cmd"),
+			filepath.Join(appData, "npm", name+".exe"),
+		)
 	}
+	return candidates
+}
+
+// nativeFallbackCandidates 是原生分发工具的已知安装位置。
+//
+// 主名与别名都要试：它们是同一个可执行文件的两个入口，安装器不一定两个都放。
+func nativeFallbackCandidates(entry AgentCatalogEntry) []string {
+	names := agentCommandNames(entry)
+	dirs := []string{}
+	if runtime.GOOS == "windows" {
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			base := filepath.Join(localAppData, entry.CommandName)
+			dirs = append(dirs, base, filepath.Join(base, "bin"))
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			dirs = append(dirs, filepath.Join(home, ".local", "bin"), filepath.Join(home, "."+entry.CommandName))
+		}
+		candidates := make([]string, 0, len(dirs)*len(names)*3)
+		for _, dir := range dirs {
+			for _, name := range names {
+				candidates = append(candidates,
+					filepath.Join(dir, name+".exe"),
+					filepath.Join(dir, name+".cmd"),
+					filepath.Join(dir, name),
+				)
+			}
+		}
+		return candidates
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		dirs = append(dirs, filepath.Join(home, ".local", "bin"), filepath.Join(home, "."+entry.CommandName, "bin"))
+	}
+	candidates := make([]string, 0, len(dirs)*len(names))
+	for _, dir := range dirs {
+		for _, name := range names {
+			candidates = append(candidates, filepath.Join(dir, name))
+		}
+	}
+	return candidates
+}
+
+// agentCommandNames 返回该工具在 PATH 上的全部命令名：目录声明的主名在前，别名随后，
+// 去重且保持顺序。
+func agentCommandNames(entry AgentCatalogEntry) []string {
+	names := make([]string, 0, 1+len(entry.CommandAliases))
+	seen := map[string]bool{}
+	for _, name := range append([]string{entry.CommandName}, entry.CommandAliases...) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names
 }
 
 // agentCommandName 返回目录里声明的命令名；未知工具返回空串。

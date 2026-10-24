@@ -28,8 +28,9 @@ const emptyPoolDraft = (): PoolDraft => ({ name: "", strategy: "fair_queue", pro
 type PendingConfirm = { kind: "disable" | "revoke"; profile: AgentProfile };
 
 export default function AgentProfilesPage() {
-  // 工具清单来自服务端目录：新增工具时这个下拉会自动多出一项。
-  const agentOptions = useAgentCatalog();
+  // 工具清单来自服务端目录；档案表目前只支持 Claude/Codex，目录用 supportsProfiles
+  // 明确标出这一能力，避免把 Qoder/CodeBuddy/OpenCode 放进一个保存时必失败的选项。
+  const agentOptions = useAgentCatalog().filter((entry) => entry.supportsProfiles !== false);
   const navigate = useNavigate();
   const [runners, setRunners] = useState<RunnerInfo[]>([]);
   const [runnerID, setRunnerID] = useState("");

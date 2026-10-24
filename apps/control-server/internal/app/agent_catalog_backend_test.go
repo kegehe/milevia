@@ -151,7 +151,7 @@ func TestAgentBackendServesANewCatalogToolWithNoPerToolCode(t *testing.T) {
 	entry := AgentCatalogEntry{
 		ID: "gemini-cli", Name: "Gemini CLI", Vendor: "Google",
 		InstallKind: InstallKindNpmGlobal, NpmPackage: "@google/gemini-cli",
-		CommandName: "gemini", BinFile: "index.js",
+		CommandName: "gemini", BinPath: "bin/index.js",
 		MinRuntimeVersion:     "18.0.0",
 		VersionArgs:           []string{"--version"},
 		Readiness:             readinessVersion,
@@ -195,6 +195,11 @@ func TestAgentBackendServesEveryCatalogToolOnACrossRunner(t *testing.T) {
 			// CodexCapableRunner（见下一条用例）。这里不是漏网。
 			continue
 		}
+		if entry.ID == "cursor" {
+			// Cursor 也是**有意的例外**：会话面只在本机，跨端必须报 unsupported
+			// 而不是"装了就能跑"（见 TestAgentBackendRejectsCursorOnCrossRunner）。
+			continue
+		}
 		backend, reason := server.agentBackend(meta, entry)
 		if backend == nil {
 			unserved = append(unserved, fmt.Sprintf("%s（%s）", entry.ID, reason))
@@ -202,6 +207,28 @@ func TestAgentBackendServesEveryCatalogToolOnACrossRunner(t *testing.T) {
 	}
 	if len(unserved) > 0 {
 		t.Fatalf("这些工具在跨端拿不到后端：%v", unserved)
+	}
+}
+
+func TestAgentBackendRejectsCursorOnCrossRunner(t *testing.T) {
+	server := &Server{runnerRegistry: newRunnerRegistry()}
+	shell := newFakeCrossShell()
+	meta := RunnerMeta{ID: "remote-1", Name: "远程主机", Environment: "remote-linux"}
+	server.runnerRegistry.register(meta.ID, &crossShellOnlyRunner{shell}, meta)
+	entry, _ := agentByID("cursor")
+
+	backend, reason := server.agentBackend(meta, entry)
+	if backend != nil {
+		t.Fatal("跨端 Cursor 不应拿到可执行后端")
+	}
+	if !strings.Contains(reason, "仅支持本机") {
+		t.Fatalf("跨端 Cursor 的理由没有说明本机边界：%q", reason)
+	}
+	// probeAgent 必须在提交会话之前就报 unsupported：新建会话卡片读的就是这一档，
+	// 否则远端会显示"已就绪"，用户点了才收到 400。
+	status := server.probeAgent(context.Background(), meta, entry)
+	if status.Status != agentStatusUnsupported || status.Reason != cursorLocalOnlyMessage {
+		t.Fatalf("probe status = %+v", status)
 	}
 }
 
@@ -213,28 +240,46 @@ func TestAgentBackendServesEveryCatalogToolOnACrossRunner(t *testing.T) {
 //   - Codex：就绪要看登录态（`codex login status`），仅测能不能报版本会把"装了但没登录"
 //     报成就绪。
 //
-// 顺带钉住本机的两个：Codex / CodeBuddy 由各自独立的管理 runner 提供，不许被目录驱动
-// 那条路截胡（那会拿 CodeBuddy 的目录去读 Claude runner 的版本）。
+// 顺带钉住本机的四个：Codex / CodeBuddy / Qoder / OpenCode 由各自独立的管理 runner 提供，
+// 不许被目录驱动那条路截胡（那会拿别人的目录去读 Claude runner 的版本）。
 func TestAgentBackendKeepsTheToolsThatHaveExtraSemantics(t *testing.T) {
 	codexRunner := &updateTestRunner{}
 	codebuddyRunner := &updateTestRunner{}
+	qoderRunner := &updateTestRunner{}
+	opencodeRunner := &updateTestRunner{}
+	cursorRunner := &updateTestRunner{}
 	server := &Server{
 		runnerRegistry:  newRunnerRegistry(),
 		codexRunner:     codexRunner,
 		codebuddyRunner: codebuddyRunner,
+		qoderRunner:     qoderRunner,
+		opencodeRunner:  opencodeRunner,
+		cursorRunner:    cursorRunner,
 	}
 
 	claude, _ := agentByID("claude-code")
 	codex, _ := agentByID("codex")
 	codebuddy, _ := agentByID("codebuddy")
+	qoder, _ := agentByID("qoder")
+	opencode, _ := agentByID("opencode")
+	cursor, _ := agentByID("cursor")
 
-	// ① 本机：Codex / CodeBuddy 必须是各自那个管理 runner（同一个对象）。
+	// ① 本机：Codex / CodeBuddy / Qoder / OpenCode / Cursor 必须是各自那个管理 runner（同一个对象）。
 	local := RunnerMeta{ID: server.localRunnerID(), Name: "本机", Environment: "windows"}
 	if backend, reason := server.agentBackend(local, codex); backend != AgentRunner(codexRunner) || reason != "" {
 		t.Fatalf("本机 Codex 没有走 codexRunner：%v / %q", backend, reason)
 	}
 	if backend, reason := server.agentBackend(local, codebuddy); backend != AgentRunner(codebuddyRunner) || reason != "" {
 		t.Fatalf("本机 CodeBuddy 没有走 codebuddyRunner：%v / %q", backend, reason)
+	}
+	if backend, reason := server.agentBackend(local, qoder); backend != AgentRunner(qoderRunner) || reason != "" {
+		t.Fatalf("本机 Qoder 没有走 qoderRunner：%v / %q", backend, reason)
+	}
+	if backend, reason := server.agentBackend(local, opencode); backend != AgentRunner(opencodeRunner) || reason != "" {
+		t.Fatalf("本机 OpenCode 没有走 opencodeRunner：%v / %q", backend, reason)
+	}
+	if backend, reason := server.agentBackend(local, cursor); backend != AgentRunner(cursorRunner) || reason != "" {
+		t.Fatalf("本机 Cursor 没有走 cursorRunner：%v / %q", backend, reason)
 	}
 
 	// ② 跨端：Claude 仍然是注册表里那个 runner 本身（不包目录驱动那一层）。
@@ -265,6 +310,17 @@ func TestAgentBackendKeepsTheToolsThatHaveExtraSemantics(t *testing.T) {
 	}
 	if !strings.Contains(reason, codebuddy.Name) {
 		t.Fatalf("理由没有点名是哪个工具：%q", reason)
+	}
+
+	// ⑤ 跨端的 Qoder 与"本机会话"不同：它没有跨端会话面，但管理面（安装/版本/升级）
+	//    仍然走目录驱动那条通用通道。这一条把"能装不能用"这个边界钉成预期行为，
+	//    免得以后有人照着第 ① 组把它也塞进本机 runner。
+	remoteQoderBackend, reason := server.agentBackend(remote, qoder)
+	if reason != "" {
+		t.Fatalf("跨端 Qoder 的管理面应当可用，实际理由=%q", reason)
+	}
+	if _, ok := remoteQoderBackend.(*catalogAgentBackend); !ok {
+		t.Fatalf("跨端 Qoder 应走目录驱动后端，实际 %T", remoteQoderBackend)
 	}
 }
 
@@ -331,36 +387,44 @@ func TestCatalogBackendProbeFailureIsNotInstalled(t *testing.T) {
 // Claude / Codex 与目录驱动的工具必须走**同一段**。这里用一个会"升级后改版本号"的假
 // 环境走通成功路径：previous → current 必须真的变。
 func TestCatalogBackendUpdateUsesTheSharedCrossOrchestration(t *testing.T) {
-	entry, _ := agentByID("codebuddy")
-	shell := newFakeCrossShell()
-	shell.outputs[entry.CommandName] = entry.CommandName + " 2.162.0"
-	shell.runFunc = func(script string) (string, error) {
-		switch {
-		case strings.Contains(script, "npm prefix -g"):
-			// 确认来源那一步问的是"这个命令由哪个 npm 全局包提供"。
-			return "/home/u/.npm-global\n", nil
-		case strings.Contains(script, entry.CommandName+" update"):
-			shell.mu.Lock()
-			shell.outputs[entry.CommandName] = entry.CommandName + " 2.163.0"
-			shell.mu.Unlock()
-			return "", nil
-		}
-		return "", nil
-	}
+	for _, agentID := range []string{"codebuddy", "opencode"} {
+		t.Run(agentID, func(t *testing.T) {
+			entry, _ := agentByID(agentID)
+			updateCommand := shellQuote(entry.CommandName)
+			for _, arg := range entry.UpdateArgs {
+				updateCommand += " " + shellQuote(arg)
+			}
+			shell := newFakeCrossShell()
+			shell.outputs[entry.CommandName] = entry.CommandName + " 2.162.0"
+			shell.runFunc = func(script string) (string, error) {
+				switch {
+				case strings.Contains(script, "npm prefix -g"):
+					// 确认来源那一步问的是"这个命令由哪个 npm 全局包提供"。
+					return "/home/u/.npm-global\n", nil
+				case strings.Contains(script, updateCommand):
+					shell.mu.Lock()
+					shell.outputs[entry.CommandName] = entry.CommandName + " 2.163.0"
+					shell.mu.Unlock()
+					return "", nil
+				}
+				return "", nil
+			}
 
-	previous, current, err := (&catalogAgentBackend{entry: entry, shell: shell}).Update(context.Background())
-	if err != nil {
-		t.Fatalf("升级失败：%v", err)
-	}
-	if previous != "2.162.0" || current != "2.163.0" {
-		t.Fatalf("升级前后版本 = %q → %q，want 2.162.0 → 2.163.0", previous, current)
-	}
-	scripts := shell.ranScripts()
-	if len(scripts) != 2 {
-		t.Fatalf("跑了 %d 段脚本，want 2（确认来源 + 执行 update）：%v", len(scripts), scripts)
-	}
-	if !strings.Contains(scripts[1], entry.CommandName+" update") {
-		t.Fatalf("第二段不是该工具自己的 update：%q", scripts[1])
+			previous, current, err := (&catalogAgentBackend{entry: entry, shell: shell}).Update(context.Background())
+			if err != nil {
+				t.Fatalf("升级失败：%v", err)
+			}
+			if previous != "2.162.0" || current != "2.163.0" {
+				t.Fatalf("升级前后版本 = %q → %q，want 2.162.0 → 2.163.0", previous, current)
+			}
+			scripts := shell.ranScripts()
+			if len(scripts) != 2 {
+				t.Fatalf("跑了 %d 段脚本，want 2（确认来源 + 执行 update）：%v", len(scripts), scripts)
+			}
+			if !strings.Contains(scripts[1], updateCommand) {
+				t.Fatalf("第二段不是该工具自己的 update（%s）：%q", updateCommand, scripts[1])
+			}
+		})
 	}
 }
 
@@ -387,8 +451,10 @@ func TestCatalogBackendLoginGuidesToTheCatalogsOwnCommand(t *testing.T) {
 	if info.AuthURL != "" || info.UserCode != "" || info.Message != "" {
 		t.Fatalf("无头环境不该声称拿到了设备码/授权链接：%+v", info)
 	}
-	if backend.LoginStatus(context.Background()) {
-		t.Fatal("命令行判别不了登录态时不许冒充已登录")
+	// 目录没登记登录态命令 ⇒ 只能报 unreadable（判断不了），既不许冒充已登录，
+	// 也不许冒充未登录 —— 后者会让一个明明登录着的用户被指去再登录一次。
+	if state, err := backend.LoginStatus(context.Background()); state != agentAuthUnreadable || err != nil {
+		t.Fatalf("没有登录态命令时应报 unreadable，得到 (%q, %v)", state, err)
 	}
 }
 
@@ -401,7 +467,7 @@ func TestLoginGuidanceComesFromTheCatalogNotAHardcodedTool(t *testing.T) {
 	entry := AgentCatalogEntry{
 		ID: "gemini-cli", Name: "Gemini CLI", Vendor: "Google",
 		InstallKind: InstallKindNpmGlobal, NpmPackage: "@google/gemini-cli",
-		CommandName: "gemini", BinFile: "index.js",
+		CommandName: "gemini", BinPath: "bin/index.js",
 		MinRuntimeVersion: "18.0.0",
 		VersionArgs:       []string{"--version"},
 		Readiness:         readinessVersion,
@@ -487,12 +553,14 @@ func TestCatalogBackendUpdateHealthCheckReadsFreshVersion(t *testing.T) {
 		defer mu.Unlock()
 		return value, nil
 	}
+	entry := mustAgent(t, "codebuddy")
+	updateCommand := shellQuote(entry.CommandName) + " " + shellQuote(entry.UpdateArgs[0])
 	shell := &cachedProbeShell{wslAgentRunner: runner}
 	shell.run = func(_ context.Context, script string) (string, error) {
 		switch {
 		case strings.Contains(script, "npm prefix -g"):
 			return "/home/u/.npm-global\n", nil
-		case strings.Contains(script, "codebuddy update"):
+		case strings.Contains(script, updateCommand):
 			mu.Lock()
 			value = "codebuddy 2.163.0"
 			mu.Unlock()
@@ -500,7 +568,7 @@ func TestCatalogBackendUpdateHealthCheckReadsFreshVersion(t *testing.T) {
 		}
 		return "", nil
 	}
-	backend := &catalogAgentBackend{entry: mustAgent(t, "codebuddy"), shell: shell}
+	backend := &catalogAgentBackend{entry: entry, shell: shell}
 
 	previous, current, err := backend.Update(context.Background())
 	if err != nil {

@@ -439,6 +439,9 @@ func (s *Server) invalidateAgentReadings(runnerID string) {
 		}
 	}
 	s.agentUpdateChecksMu.Unlock()
+
+	// 登录态同理：它是这台机器上另一份会被写操作影响的读数（见 agent_auth.go）。
+	s.invalidateAgentAuth(runnerID)
 }
 
 // agentStatusesEqual 比较两份读数是否**逐项相同**。AgentStatus 全是 string 字段，

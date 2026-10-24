@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find ~/.trae/cli -type f 2>/dev/null | head -20; echo \"===toml===\"; find ~/.trae -name \"*.toml\" -exec cat {} \\\\; 2>/dev/null | head -40; echo \"===minver===\"; cat ~/.trae/minimum_supported_version.json 2>/dev/null)",
+      "Bash(tail:*)"
+    ]
+  }
+}

@@ -95,6 +95,7 @@ func TestRelayCompositeOperationTableHasNoOverlap(t *testing.T) {
 		"file":         server.remoteFSOperations(),
 		"Git":          server.remoteGitOperations(),
 		"conversation": server.remoteConversationOperations(),
+		"insights":     server.remoteInsightOperations(),
 	}
 	total := 0
 	seen := map[string]string{}

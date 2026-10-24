@@ -180,6 +180,49 @@ func (s *Server) codexRunnerFor(target agentTargetEnv) AgentRunner {
 	}
 }
 
+// opencodeRunnerFor 依据目标环境返回可运行 OpenCode 的 AgentRunner。
+// WSL→Windows 反向通道尚未接通，返回 nil；远端由 registry 按 runner_id 取。
+func (s *Server) opencodeRunnerFor(target agentTargetEnv) AgentRunner {
+	switch target {
+	case agentTargetEnvWindows:
+		if runtime.GOOS == "windows" {
+			return s.opencodeRunner
+		}
+		return nil
+	case agentTargetEnvRemote:
+		return nil
+	default:
+		if runtime.GOOS == "windows" {
+			return s.wslAgentRunner()
+		}
+		return s.opencodeRunner
+	}
+}
+
+func (s *Server) opencodeReadyForTarget(ctx context.Context, target agentTargetEnv) bool {
+	runner := s.opencodeRunnerFor(target)
+	if runner == nil {
+		return false
+	}
+	if capable, ok := runner.(OpenCodeCapableRunner); ok {
+		return capable.OpenCodeReady(ctx)
+	}
+	// 决不能回落到 runner.Ready：那是 Claude 的就绪度，会把“OpenCode 没接通”
+	// 显示成“OpenCode 可用”。WSL / SSH runner 已实现 OpenCodeCapableRunner。
+	return false
+}
+
+func (s *Server) opencodeVersionForTarget(ctx context.Context, target agentTargetEnv) string {
+	runner := s.opencodeRunnerFor(target)
+	if runner == nil {
+		return ""
+	}
+	if capable, ok := runner.(OpenCodeCapableRunner); ok {
+		return agentVersionFromOutput(capable.OpenCodeVersion(ctx))
+	}
+	return ""
+}
+
 // windowsAgentRunner 返回为 WSL 部署下跨到 Windows 侧准备的 AgentRunner。
 // 服务端在 Windows 时 windows 目标直接走本机 s.runner，本函数不会被调用。
 // 长驻会话能力按 docs/20 §3.4 分级，未就绪时如实降级报错而非静默回退 WSL。

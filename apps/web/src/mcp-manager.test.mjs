@@ -229,7 +229,7 @@ test("模板要求只在来自模板时展示，编辑既有 server 时清掉", 
 
 test("过期文案已修正：Codex 不再标「P1 起支持」", () => {
   assert.doesNotMatch(page, /P1 起支持/);
-  assert.match(page, /const AGENT_OPTIONS: \{ id: string; label: string \}\[\] = \[\s*\{ id: "claude-code", label: "Claude Code" \},\s*\{ id: "codex", label: "Codex" \},\s*\];/);
+  assert.match(page, /const AGENT_OPTIONS: \{ id: string; label: string \}\[\] = \[\s*\{ id: "claude-code", label: "Claude Code" \},\s*\{ id: "codex", label: "Codex" \},\s*\{ id: "opencode", label: "OpenCode" \},\s*\];/);
 });
 
 test("类型声明了目录字段、依赖与凭据落点", () => {

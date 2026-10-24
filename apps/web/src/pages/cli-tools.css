@@ -204,6 +204,12 @@
 .cli-tools-card-actions { display: flex; gap: 8px; align-items: center; margin: auto -16px 0; padding: 11px 16px;
   border-top: 1px solid #eef3f0; background: #fcfdfc; border-radius: 0 0 13px 13px; }
 .cli-tools-card-actions .primary, .cli-tools-card-actions .secondary { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+/* 「已登录」那一格：它首先是一个**状态**，其次才是入口（点开面板换账号）。
+   所以它不长成一颗行动按钮 —— 无边框、淡底、绿字，与旁边的「登录」一眼可分。
+   判据在模型里（loginSlotFor），这里只管它长什么样。 */
+.cli-tools-card-actions .cli-tools-auth-chip[data-state="logged-in"] {
+  border-color: transparent; background: #eef7f2; color: #2c7567; }
+.cli-tools-card-actions .cli-tools-auth-chip[data-state="logged-in"]:hover { background: #e3f1ea; }
 /* 进行中：按钮里那一圈转动的缺口环。它只出现在**发起操作的那颗按钮**上（页面按
    runner + agent 判，见 activeAction），所以"在跑"这件事有了落点，不需要页面级
    横幅再说一遍。disabled 的按钮是灰底，环用青色保持可读。
@@ -268,7 +274,7 @@
    以及**唯一不能删的那块仍在**：`.cli-tools-warn` 的「这次没检查成功」。
    要加回"元信息"之前先读一遍那段注释 —— 别又把噪音长回来。 */
 
-/* ── 手动安装命令（默认折叠）─────────────────────────────────────────────
+/* ── 手动安装（默认折叠）─────────────────────────────────────────────────
    这一块是**手册**，不是这一屏的下一步：默认收起来，用户要的时候自己展开。
    ⚠️ 它有意留在 `probeOk` 那道门之外（通道探测不到时最需要它），
    所以样式上也要能独立站着，不依赖卡片区的任何东西。 */
@@ -291,6 +297,8 @@
 .cli-tools-manual-list code { flex: 1; min-width: 0; overflow-wrap: anywhere;
   font-family: ui-monospace, monospace; font-size: 12px; color: #31594f; }
 .cli-tools-manual-copy { flex: none; min-height: 28px; padding: 0 12px; font-size: 12px; }
+/* 原生分发工具没有可复制的命令，只给官方安装说明 —— 入口推到行尾，与「复制」对齐。 */
+.cli-tools-manual-docs { flex: none; margin-left: auto; }
 /* 复制反馈走 `data-state`（本页第 1 条约定：变体不拼类名）。
    只有 "copied" 一档：失败走 toast，不给按钮留一个没人设的状态。 */
 .cli-tools-manual-copy[data-state="copied"] { border-color: #2c7567; color: #225c50; }
@@ -404,4 +412,5 @@
   .cli-tools-manual-list > li { align-items: stretch; flex-direction: column; }
   .cli-tools-manual-name { min-width: 0; }
   .cli-tools-manual-copy { width: 100%; }
+  .cli-tools-manual-docs { margin-left: 0; }
 }

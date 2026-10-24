@@ -171,6 +171,11 @@ func (s *Server) listRunnerAgents(w http.ResponseWriter, r *http.Request) {
 		}
 		if known {
 			item.InstallSupported = entry.SupportsInstall
+			if !entry.SupportsInstall {
+				// 原生分发的工具由官方安装器提供，平台不代装。这里必须给准确理由：
+				// 空理由会被前端念成"这个执行环境不提供该工具"，那是另一件事。
+				item.InstallBlockedReason = fmt.Sprintf("%s 由官方安装器分发，平台不代装；请在那台机器上按官方说明安装", entry.Name)
+			}
 		}
 		if status.Status == agentStatusUpdating {
 			item.Operation = "running"
@@ -186,9 +191,11 @@ func (s *Server) listRunnerAgents(w http.ResponseWriter, r *http.Request) {
 			item.InstallSupported = false
 			item.InstallBlockedReason = status.Reason
 			item.UpdateSupported = false
-		} else if !isLocalRunnerID(meta.ID) && !view.RemoteInstallAllowed {
+		} else if !isLocalRunnerID(meta.ID) && !view.RemoteInstallAllowed && item.InstallSupported {
 			// 未授权：这一档由 installSupported=false + 可操作的理由表达，
 			// 授权入口在运行时卡片里给**一处**（每个工具再各来一个同义按钮是噪音）。
+			// 只对**平台本来能装**的工具生效：原生工具有自己的官方安装器，
+			// 拿"尚未授权安装"覆盖它会让用户以为授权后平台就能代装。
 			item.InstallSupported = false
 			item.InstallBlockedReason = fmt.Sprintf("尚未授权在 %s 上安装；需先在该主机上显式确认一次", meta.Name)
 		}

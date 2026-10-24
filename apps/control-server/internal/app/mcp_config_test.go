@@ -326,6 +326,37 @@ func TestPrepareMCPInjectionFiltersEnvironmentAndAgent(t *testing.T) {
 	}
 }
 
+func TestPrepareMCPInjectionRecordsCursorAsNotInjected(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	projectID := "proj-cursor-mcp"
+	projectPath := t.TempDir()
+	if _, err := s.db.ExecContext(ctx, `insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,?,?)`,
+		projectID, "P", projectPath, s.localRunnerID(), "main", true, time.Now().UTC()); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	// 即使项目给 Cursor 选了 server，Cursor 也没有会话级注入参数，必须如实记录未注入。
+	insertTestMCPServer(t, s, "cursor-web", mcpScopeGlobal, "", mcpTransportStdio, "npx", nil,
+		[]string{"windows", "wsl"}, []string{"cursor"})
+
+	injection := s.prepareMCPInjection(ctx, projectID, projectPath, "cursor", s.localRunnerID(), "run-cursor")
+	if injection.JSON != "" || injection.LocalPath != "" || len(injection.Env) != 0 {
+		t.Fatalf("Cursor must not receive an injected config: %+v", injection)
+	}
+	if !strings.Contains(injection.Note, "Cursor CLI") || !strings.Contains(injection.Note, "未注入") {
+		t.Fatalf("expected an explicit not-injected note, got %q", injection.Note)
+	}
+	s.mu.Lock()
+	status, ok := s.mcpLastInject[projectID]
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("expected a recorded injection status for Cursor")
+	}
+	if status.AgentID != "cursor" || status.ServerCount != 0 || len(status.Servers) != 0 || status.Note == "" || status.RunKey != "run-cursor" {
+		t.Fatalf("unexpected Cursor injection status: %+v", status)
+	}
+}
+
 func TestMCPProjectScopeOverridesGlobal(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()

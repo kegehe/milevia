@@ -110,6 +110,9 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
   useEffect(() => { void refresh(); }, [refresh]);
 
   const manageable = config?.runnerManaged ?? true;
+  // 项目 AI 配置写入的是档案/路由表，只有 supportsProfiles 的工具能保存；
+  // 不要在这里展示 Qoder/CodeBuddy/OpenCode，否则保存时必然撞后端约束。
+  const profileEntries = catalog.entries.filter((item) => item.supportsProfiles !== false);
   const entryFor = (agentId: AgentID): AgentEntry | null | undefined => {
     const entry = config?.agents?.[agentId] ?? null;
     return entry?.mode === "runner_default" ? null : entry;
@@ -130,7 +133,7 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
     setDrafts((current) => ({ ...current, [agentId]: { ...draftFor(agentId), ...patch } }));
   };
 
-  const activeEntry = catalog.entries.find((item) => catalogAgentID(item) === activeId) ?? catalog.entries[0] ?? null;
+  const activeEntry = profileEntries.find((item) => catalogAgentID(item) === activeId) ?? profileEntries[0] ?? null;
   const id = activeEntry ? catalogAgentID(activeEntry) : null;
   const entry = id ? entryFor(id) ?? null : null;
   const cliEntry = id ? cliEntryFor(id) ?? null : null;
@@ -281,14 +284,14 @@ export function ProjectAiConfigDialog({ projectId, runnerID, close }: { projectI
                 // ARIA tabs 约定：←/→ 在标签间移动选择与焦点（roving tabindex）。
                 if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
                 event.preventDefault();
-                const ids = catalog.entries.map(catalogAgentID);
+                const ids = profileEntries.map(catalogAgentID);
                 const index = ids.indexOf(id);
                 if (index < 0 || ids.length < 2) return;
                 const nextId = ids[(index + (event.key === "ArrowRight" ? 1 : ids.length - 1)) % ids.length];
                 selectTab(nextId);
                 requestAnimationFrame(() => document.getElementById(`project-config-tab-${nextId}`)?.focus());
               }}>
-              {catalog.entries.map((catalogEntry) => {
+              {profileEntries.map((catalogEntry) => {
                 const tabId = catalogAgentID(catalogEntry);
                 const tabEntry = entryFor(tabId);
                 return <button key={tabId} type="button" role="tab" id={`project-config-tab-${tabId}`}

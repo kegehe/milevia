@@ -7206,8 +7206,12 @@ func TestTaskStatusNotificationCarriesTaskTitleAndDuration(t *testing.T) {
 	if err := server.db.QueryRow(`select task_title, duration_ms from notifications where task_id=? and type='task.done'`, taskID).Scan(&taskTitle, &durationMs); err != nil {
 		t.Fatalf("load notification: %v", err)
 	}
-	if taskTitle != "带耗时的通知任务" {
-		t.Fatalf("notification task_title = %q", taskTitle)
+	var wantTitle string
+	if err := server.db.QueryRow(`select title from tasks where id=?`, taskID).Scan(&wantTitle); err != nil {
+		t.Fatalf("load task title: %v", err)
+	}
+	if taskTitle != wantTitle {
+		t.Fatalf("notification task_title = %q, want %q", taskTitle, wantTitle)
 	}
 	if durationMs != (3*time.Minute + 42*time.Second).Milliseconds() {
 		t.Fatalf("notification duration_ms = %d, want %d", durationMs, (3*time.Minute + 42*time.Second).Milliseconds())
@@ -7224,8 +7228,12 @@ func TestTaskStatusNotificationCarriesTaskTitleAndDuration(t *testing.T) {
 	if otherDurationMs != 0 {
 		t.Fatalf("notification duration_ms = %d, want 0 (no run)", otherDurationMs)
 	}
-	if otherTitle != "没有执行记录的任务" {
-		t.Fatalf("notification task_title = %q", otherTitle)
+	var wantOtherTitle string
+	if err := server.db.QueryRow(`select title from tasks where id=?`, otherTaskID).Scan(&wantOtherTitle); err != nil {
+		t.Fatalf("load other task title: %v", err)
+	}
+	if otherTitle != wantOtherTitle {
+		t.Fatalf("notification task_title = %q, want %q", otherTitle, wantOtherTitle)
 	}
 }
 
@@ -8875,6 +8883,28 @@ func TestLocalizedErrorSuppressesInternalUpdateWraps(t *testing.T) {
 	// 纯中文错误仍原样展示。
 	if direct := localizedErrorText(errors.New("更新服务超时，请稍后再试。"), "fallback"); direct != "更新服务超时，请稍后再试。" {
 		t.Fatalf("pure Chinese error not shown directly: %q", direct)
+	}
+}
+
+// TestLocalizedErrorAllowsProductNames 钉住中文准入错误里的产品名不会触发英文兜底。
+//
+// “Claude Code / CodeBuddy Code”里的 Code 与工具品牌同属术语表；漏词会把一句完整中文
+// 套上“请求参数无效，请检查后重试。”，用户看到的首句就指错了方向。
+func TestLocalizedErrorAllowsProductNames(t *testing.T) {
+	fallback := "请求参数无效，请检查后重试。"
+	for _, message := range []string{
+		"Claude Code 在 WSL 环境不可用或未登录",
+		"CodeBuddy 目前仅支持本机项目；WSL / SSH 项目请改用 Claude Code 或 Codex",
+		"Qoder 目前仅支持本机项目；WSL / SSH 项目请改用 Claude Code 或 Codex",
+		"OpenCode 未返回结束事件",
+		"OpenCode 在 Windows 环境不可用或未登录",
+		"运行时版本过低（当前 Node 18.0.0，OpenCode 需要 >= 18.0.0）",
+		"npm 没有返回版本号",
+		"MCP 配置超过 OpenCode 内联配置上限",
+	} {
+		if got := localizedErrorText(errors.New(message), fallback); got != message {
+			t.Errorf("product name was wrapped: got %q want %q", got, message)
+		}
 	}
 }
 
@@ -12357,7 +12387,8 @@ func englishPhraseBeforeChinese(text string) string {
 		return strings.TrimSpace(text)
 	}
 	head := strings.TrimSpace(text[:index])
-	for _, term := range []string{"Claude", "Codex", "Agent", "API", "CLI", "Git", "SSH", "WSL", "AI", "HTTP", "JSON"} {
+	// 先替换长词再替换短词：先删 "Code" 会把 "Codex" 变成 "x"，反过来则不会。
+	for _, term := range []string{"CodeBuddy", "OpenCode", "Claude", "Codex", "Code", "MCP", "Node", "npm", "Qoder", "Agent", "API", "CLI", "Git", "SSH", "WSL", "Windows", "AI", "HTTP", "JSON"} {
 		head = strings.ReplaceAll(head, term, "")
 	}
 	return strings.TrimSpace(strings.Trim(head, " \t:：,，.。、-—（）()[]"))

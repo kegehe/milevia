@@ -3588,7 +3588,7 @@ test("mobile file view is a sub-state of the conversation, wired to the relay ad
   //    建、缓存跟着那条会话）。留着会让用户看到另一条会话的文件树；而它一旦因为
   //    `project` 暂时为空而不渲染（令牌失效那条链会清空 selectedProject），状态仍在，
   //    下次进任何一个项目它又会自己冒出来 —— 与设置页那条「清理 effect 不重跑」同因。
-  assert.match(page, /setSessionSub\(null\);\n\s*setFilesInitialPath\(null\);\n\s*filesGuardRef\.current = null;\n\s*\}, \[selectedProject, selectedConversation\]\);/);
+  assert.match(page, /setSessionSub\(null\);\n\s*setOptimizationOpen\(false\);\n\s*setFilesInitialPath\(null\);\n\s*filesGuardRef\.current = null;\n\s*\/\/ 扫描工具的选择跟着项目\/会话走[\s\S]{0,120}?setOptimizationAgent\(null\);\n\s*\}, \[selectedProject, selectedConversation\]\);/);
   // ⑩ 退出会话视图那条链走的是 `setFilesOpen` 而不是 `closeFiles`，所以守卫要在这里
   //    再清一次（closeFiles 里那句管不到它）：留着会指向一个已卸载的面板，
   //    「放弃未保存的更改」那条链会拿着它去问一个不存在的编辑态。
@@ -3838,6 +3838,50 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   assert.match(adapter, /\{ pattern: "\/commits\/amend",[\s\S]*?\n\s*\{ pattern: "\/commits",/);
   // 令牌换取失败必须原样失败，不能"换不到就拿旧的硬发"（那会拿到一个指不到原因的 409）。
   assert.match(adapter, /readonly code: "operation_failed" \| "wiring" \| MobileGitFailureKind;/);
+});
+
+test("mobile optimization panel is wired into the conversation view", async () => {
+  // 这条守的也是**接线**：面板与样式在 050dfc4 就已交付，但页面从没引用过它 ——
+  // 组件存在 ≠ 用户能看到。判据层（模型/过滤）在 insights-model 的用例里，这里查七条线：
+  //
+  // ① 入口：悬浮胶囊只在会话视图、且整页层（子态 / 任务队列 / ⋯菜单 / 工具面板 / 它自己）都关着时出现。
+  //    ⋯菜单必须排它之前关：返回键链里 headerMenuOpen 优先级更高，两者同开时第一次返回
+  //    会收掉被面板盖住、看不见的菜单，像"按了没反应"。
+  assert.match(page, /mobileApp && mobileView === "conversation" && project && !optimizationOpen && !subHeaderActive && !tasksOpen && !headerMenuOpen && !composerToolsOpen && <button type="button" className="mobile-optimization-trigger"/);
+  // ② 面板是整页浮层，渲染条件与入口互斥，关闭走同一个状态。
+  //    project prop 用 memo 好的 optimizationProject（带非空守卫），面板本身也是
+  //    memo 组件 —— 2 秒快照轮询下，内联对象会让 memo 形同虚设。
+  assert.match(page, /mobileApp && mobileView === "conversation" && project && optimizationOpen && optimizationProject && <MobileOptimizationPanel/);
+  assert.match(page, /onClose=\{closeOptimization\}/);
+  assert.match(page, /const optimizationProject = useMemo\(/);
+  // ③ 取数走中继适配器（手机上没有同源 /api/* 通道：原生 WebView 打到资源源只会拿到
+  //    SPA index.html，直接喂 api() 面板会整块空转）。适配器与文件 / Git 共用
+  //    rpcTransport，身份跟着换实例 / 换项目 / 换会话走。fail 必须是模块级稳定引用：
+  //    InsightsPanel 把它放进了加载 effect 的依赖，内联箭头每次渲染换身份，
+  //    快照轮询 / 阶段计时每跳一次面板就整拉一遍建议列表。
+  assert.match(page, /request=\{insightsAdapter\.request\}/);
+  assert.match(page, /const insightsAdapter = useMemo\(\(\) => createMobileInsightsRequest\(\{ transport: rpcTransport \}\), \[rpcTransport\]\)/);
+  assert.match(page, /fail=\{reportInsightFailure\}/);
+  assert.match(page, /function reportInsightFailure\(message: string\) \{/);
+  // ④ 默认工具不能过 knownAgentID（手机端读不到工具目录，docs/42 §15，它恒为 undefined）。
+  assert.match(page, /defaultAgentID=\{optimizationAgent \?\? \(conversation\?\.agentId as AgentID \| undefined\) \?\? "claude-code"\}/);
+  // ⑤ 「查看文件」要先收面板：文件视图开在 z-60 全屏遮罩下面，不收就是点了没反应。
+  //    回调经 ref 钉成稳定身份（openFiles 每次渲染都重建，内联箭头会打穿面板的 memo）。
+  assert.match(page, /onOpenFile=\{openFileFromOptimization\}/);
+  assert.match(page, /const openFileFromOptimization = useCallback\(\(path: string\) => \{\n\s*setOptimizationOpen\(false\);\n\s*openFilesRef\.current\(path\);\n\s*\}, \[\]\)/);
+  // ⑥ 返回键收整层，排在任务队列之后（同为 fixed 整页层）。
+  assert.match(page, /if \(tasksOpen\) \{ setTasksOpen\(false\); return true; \}\n\s*\/\/ 优化建议同样是整页 fixed 浮层[\s\S]{0,80}?if \(optimizationOpen\) \{ setOptimizationOpen\(false\); return true; \}/);
+  // ⑦ 换会话 / 侧滑回列表两条链都要收它（与文件面板同一条纪律，见各自断言处的成因）。
+  assert.match(page, /setSessionSub\(null\);\n\s*setOptimizationOpen\(false\);/);
+  {
+    const leaveAt = page.indexOf("function leaveConversationView() {");
+    const leaveBlock = leaveAt > 0 ? page.slice(leaveAt, page.indexOf("\n  }", leaveAt)) : "";
+    assert.ok(leaveBlock.includes("setOptimizationOpen(false);"), "侧滑返回那条链也要收掉优化建议浮层");
+  }
+  // ⑧ 面板本身是 memo 组件（减 2 秒轮询的重渲染负担）。前提是宿主的 props 全部稳定 ——
+  //    上面 ②③⑤ 断的就是这件事；这层 memo 与那些断言是一套约定，拆一边要同时改另一边。
+  const optimizationPanel = normalize(await readFile(new URL("./features/optimization/MobileOptimizationPanel.tsx", import.meta.url), "utf8"));
+  assert.match(optimizationPanel, /export const MobileOptimizationPanel = memo\(/);
 });
 
 test("mobile conversation can actually be stopped from the composer", () => {

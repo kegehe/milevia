@@ -13,7 +13,7 @@ import { MOBILE_PROJECT_ORDER_STORAGE_KEY, dismissMobileDragHint, persistOrder, 
 import { useCardDragReorder } from "../lib/use-card-drag";
 import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval } from "../lib/timeline";
 import { NON_GIT_BRANCH } from "../lib/types";
-import type { ConversationCheckpoint, SystemVariant, PermissionMode } from "../lib/types";
+import type { ConversationCheckpoint, SystemVariant, PermissionMode, AgentID } from "../lib/types";
 import { AgentLogo } from "../components/AgentLogo";
 import { ExternalLink } from "../components/ExternalLink";
 import type { AgentLogoKey } from "../lib/cli-tools-view";
@@ -63,8 +63,13 @@ import { applyPendingConversations, isPendingConversationID, matchPendingConvers
 // 云端的中继请求（见 mobile-fs-request.ts），树/查看器/编辑器/JSON/SQLite 全部是同一份实现。
 import { FilesPanel, type FilesPanelHandle } from "../features/files/FilesPanel";
 import { createMobileFsRequest, type MobileRpcReply } from "../features/files/mobile-fs-request";
+import { createMobileInsightsRequest } from "../features/insights/mobile-insights-request";
 // Git 工作台同属一个子态槽位，同样是**整块复用**桌面端那套（见 mobile-git-request.ts）。
 import { MobileGitPanel, type MobileGitPanelHandle } from "../features/git/MobileGitPanel";
+// 优化建议：面板整块复用桌面端 InsightsPanel，错误经 toast 落地（`.mobile-error` 在
+// 这张 inset:0 的面板遮罩之下，用户看不到 —— 与 MobileGitPanel 头注同一个成因）。
+import { MobileOptimizationPanel } from "../features/optimization/MobileOptimizationPanel";
+import { toast } from "sonner";
 import { projectFileReference } from "../lib/project-path";
 import type { NavigationGuard } from "../components/ProjectLayout";
 import { useNavigate } from "react-router-dom";
@@ -293,6 +298,13 @@ function mergeRemoteMessages(...sets: ReadonlyArray<Message[]>): Message[] {
   });
 }
 
+// 优化建议面板的错误落点。必须是**模块级稳定引用**：InsightsPanel 把 `fail` 放进了
+// 加载 effect 的依赖（`[loadInsights, fail]`），页面上内联箭头每次渲染都换身份 ——
+// 快照轮询 / 阶段计时每跳一次，面板就会整拉一遍建议列表。
+function reportInsightFailure(message: string) {
+  toast.error(message);
+}
+
 function remoteConversationIndex(value: unknown): RemoteConversationIndex | null {
   const item = asRecord(value);
   if (!item || typeof item.id !== "string") return null;
@@ -347,12 +359,13 @@ function mobileAgentUnavailableReason(project: Project | null | undefined, agent
 // 名称、厂商、权限面取自目录；目录加了新工具而这里没跟，手机端就少一个可选项。
 // 权限面与默认权限同样来自目录（PermissionModes / DefaultPermissionMode）；
 // 手机端没有设置页偏好的通道，默认权限一律用目录声明值。
-type MobileAgentID = "claude-code" | "codex" | "codebuddy";
+type MobileAgentID = "claude-code" | "codex" | "codebuddy" | "qoder" | "opencode" | "cursor";
 type MobileAgent = {
   id: MobileAgentID;
   name: string;
   vendor: string;
-  logo: AgentLogoKey;
+  /** 没有官方图标资产时留空，界面回落两字母牌。 */
+  logo?: AgentLogoKey;
   /** 目录声明的权限面（PermissionModes）。 */
   permissionModes: PermissionMode[];
   /** 目录声明的默认权限（DefaultPermissionMode）。 */
@@ -365,6 +378,14 @@ const MOBILE_AGENTS: MobileAgent[] = [
     permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
   { id: "codebuddy", name: "CodeBuddy Code", vendor: "腾讯云", logo: "codebuddy",
     // vendor 有意译成中文（目录原文是 "Tencent Cloud"）—— 界面语言是中文。
+    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+  { id: "qoder", name: "Qoder CLI", vendor: "阿里云",
+    // 没有官方图标资产：不拿别的工具图标顶替（与 agentLogoKey 白名单同一约定）。
+    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+  { id: "opencode", name: "OpenCode", vendor: "Anomaly",
+    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+  { id: "cursor", name: "Cursor CLI", vendor: "Anysphere",
+    // 没有官方图标资产：不拿别的工具图标顶替（与 agentLogoKey 白名单同一约定）。
     permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
 ];
 
@@ -1223,6 +1244,12 @@ export default function MobileRemotePage() {
   // 必须先问一声 —— 复用面板与桌面端同一条确认流程，不另造一个提示。
   const filesGuardRef = useRef<NavigationGuard | null>(null);
   const [tasksOpen, setTasksOpen] = useState(false);
+  // 优化建议是 inset:0 的整页浮层（z-index 60），与任务队列同一形态：不是会话视图的
+  // 子态槽位（sessionSub），不参与顶栏子标题，返回键直接收掉整层。
+  const [optimizationOpen, setOptimizationOpen] = useState(false);
+  // 扫描工具的用户选择。null = 还没选过，回落到当前会话的工具（两套类型一致：
+  // MobileAgentID 与 AgentID 是同一个联合，详见各自定义处的维护规则）。
+  const [optimizationAgent, setOptimizationAgent] = useState<AgentID | null>(null);
   // 会话视图的顶栏：返回 + 会话名 + 刷新 + 新会话 + ⋯。刷新和新会话是高频入口，
   // 历史会话与任务操作收进 ⋯ 菜单。
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
@@ -2549,6 +2576,27 @@ export default function MobileRemotePage() {
   // 重建就是缓存清零，用户在目录里点两下会不停重新拉取。
   const filesAdapter = useMemo(() => createMobileFsRequest({ transport: rpcTransport, prefetch: true }), [rpcTransport]);
   useEffect(() => () => filesAdapter.invalidateAll(), [filesAdapter]);
+  // 优化建议适配器：与文件 / Git 同一条中继发信器（fs / git / conversation / insights
+  // 共用 `POST /v1/instances/{id}/rpc`，电脑端按 op 分发表）。**不能**直接喂桌面同源的
+  // `api()`：手机上没有同源 /api 通道（原生 WebView 打到资源源只会拿到 SPA index.html），
+  // 面板会整块空转。适配器身份跟着 rpcTransport 走 —— 换实例 / 换项目 / 换会话才重建，
+  // 面板的加载 effect 不会因为快照轮询换引用而整拉一遍。
+  const insightsAdapter = useMemo(() => createMobileInsightsRequest({ transport: rpcTransport }), [rpcTransport]);
+  // 面板的 project prop 要**稳定身份**：MobileOptimizationPanel 是 memo 组件，
+  // 每次渲染都换对象会让 memo 形同虚设，2 秒轮询下整个建议列表白重渲染。
+  const optimizationProject = useMemo(
+    () => project ? { id: project.id, name: project.name, runner: project.runner } : null,
+    [project?.id, project?.name, project?.runner],
+  );
+  const closeOptimization = useCallback(() => setOptimizationOpen(false), []);
+  // 「查看文件」要先收面板（文件视图开在面板 z-60 全屏遮罩**下面**）。openFiles 是
+  // 每次渲染都重建的普通函数，经 ref 转一手才能把这个回调钉成稳定身份。
+  const openFilesRef = useRef(openFiles);
+  openFilesRef.current = openFiles;
+  const openFileFromOptimization = useCallback((path: string) => {
+    setOptimizationOpen(false);
+    openFilesRef.current(path);
+  }, []);
   // 消息与运行记录按时间混排：用户要看的是"什么时候发生了什么"，而不是
   // "对话"和"状态"两个割裂的列表。sort 是稳定的，同一时刻消息在前、状态卡在后。
   const conversationTimeline = useMemo(() => {
@@ -2858,6 +2906,8 @@ export default function MobileRemotePage() {
       // 取景层有两个渲染条件（scanning / scanError），按扫描态判断会在失败态漏掉它。
       if (scanning || scanError) { closeScanOverlay(); return true; }
       if (tasksOpen) { setTasksOpen(false); return true; }
+      // 优化建议同样是整页 fixed 浮层，排在 tasksOpen 之后（两者同层，先收先开的语义不受影响）。
+      if (optimizationOpen) { setOptimizationOpen(false); return true; }
       // 展开着的消息图标行虽然不是浮层（它就在气泡里、不遮任何东西），返回键也先收它：
       // 返回的语义是"收掉当前这一层动作"，直接退出会话视图等于把用户刚展开的状态丢掉。
       // ⚠️ 判据用 `messageActionOpen`（**界面上真的有这一排**），不能用 `messageActionId`：
@@ -3379,8 +3429,12 @@ export default function MobileRemotePage() {
     // Git 视图同理：它绑的更是"哪个工作区"（切错工作区就是切错分支），而且适配器
     // 手里还攥着那条会话的 stateToken。一个槽位一起收。
     setSessionSub(null);
+    setOptimizationOpen(false);
     setFilesInitialPath(null);
     filesGuardRef.current = null;
+    // 扫描工具的选择跟着项目/会话走：换项目不沿用上一个项目里选的工具，
+    // 下次打开面板回落到那个项目当前会话的工具。
+    setOptimizationAgent(null);
   }, [selectedProject, selectedConversation]);
   useEffect(() => {
     selectedConversationRef.current = selectedConversation;
@@ -4982,6 +5036,9 @@ export default function MobileRemotePage() {
   function leaveConversationView() {
     setMobileView("projects");
     setTasksOpen(false);
+    // 优化建议浮层的渲染条件含 mobileView === "conversation"，但状态要在这里一起收：
+    // 换项目 / 侧滑回列表后留着它，下次进任何一个项目它又会自己冒出来（与文件面板同一条纪律）。
+    setOptimizationOpen(false);
     // 侧滑返回会走 popstate → 这里：视图退到项目列表时，压在上面的弹窗必须一起关掉，
     // 否则回到项目列表后还挂着一个"选会话"弹窗（任务抽屉 / 顶栏 ⋯ 菜单 / 快捷方式确认框同理）。
     setConversationHistoryOpen(false);
@@ -5734,7 +5791,30 @@ export default function MobileRemotePage() {
       <button type="button" className="mobile-task-fab" onClick={() => { setCreateError(""); setCreatingTask(true); }} disabled={busy} aria-label="新建任务" title="新建任务">
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
       </button>
-    </section>}<div className="mobile-composer-shell" ref={composerShellRef}>{composerToolsOpen && <section className="mobile-composer-tools" id="mobile-composer-tools" aria-label="工具">
+    </section>}
+    {/* 优化建议入口：悬浮在输入条右上方的胶囊（样式见 mobile-remote.css）。它属于会话视图，
+        子态视图 / 任务队列 / ⋯菜单 / 工具面板 / 浮层打开时都不渲染 —— 那些层要么盖住它、
+        要么语义上已经离开会话本体。⋯菜单必须排它之前关：返回键链里 headerMenuOpen 优先级
+        更高，两者同开时第一次返回会收掉被面板盖住、看不见的菜单，像"按了没反应"。 */}
+    {mobileApp && mobileView === "conversation" && project && !optimizationOpen && !subHeaderActive && !tasksOpen && !headerMenuOpen && !composerToolsOpen && <button type="button" className="mobile-optimization-trigger" onClick={() => setOptimizationOpen(true)} aria-label="打开优化建议" title="优化建议">
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"><path d="M12 3.5v2M3.5 12h2M18.5 12h2M12 18.5v2M5.6 5.6 7 7M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4" /></svg>
+      <span>优化建议</span>
+    </button>}
+    {mobileApp && mobileView === "conversation" && project && optimizationOpen && optimizationProject && <MobileOptimizationPanel
+      project={optimizationProject}
+      // 默认工具 = 用户上次在面板里选的 > 当前会话的 > claude-code。**不能**过
+      // knownAgentID：手机端读不到工具目录（docs/42 §15，/api/agents 不在云端通道上），
+      // 它在这里恒为 undefined，会把这个默认悄悄变成恒 claude-code。快照里的 agentId
+      // 直接送下去，扫描前服务端还会再校验一次（requireInsightAgentReady）。
+      defaultAgentID={optimizationAgent ?? (conversation?.agentId as AgentID | undefined) ?? "claude-code"}
+      request={insightsAdapter.request}
+      fail={reportInsightFailure}
+      onClose={closeOptimization}
+      onAgentChange={setOptimizationAgent}
+      // 「查看文件」要先收面板：文件视图开在面板（z-60 全屏遮罩）**下面**，不收的话
+      // 用户点了像没反应，返回键也得按两次才见得到文件列表。
+      onOpenFile={openFileFromOptimization}
+    />}<div className="mobile-composer-shell" ref={composerShellRef}>{composerToolsOpen && <section className="mobile-composer-tools" id="mobile-composer-tools" aria-label="工具">
 <div className="mobile-tool-group"><h3>常用提示词<span>{promptShortcuts.length}</span></h3>{promptShortcuts.length === 0 ? <p className="mobile-tool-empty">电脑端还没有添加常用提示词。</p> : <div className="mobile-tool-chips">{promptShortcuts.map((item) => <button type="button" key={item.id} disabled={busy || !conversation || Boolean(shortcutBusy)} onClick={() => void applyShortcut(item)} title={item.template}>{shortcutBusy === item.id ? "处理中" : item.name}</button>)}</div>}</div>
 <div className="mobile-tool-group"><h3>常用命令<span>{commandShortcuts.length}</span></h3>{commandShortcuts.length === 0 ? <p className="mobile-tool-empty">电脑端还没有添加常用命令。</p> : <div className="mobile-tool-chips">{commandShortcuts.map((item) => <button type="button" key={item.id} disabled={busy || !conversation || Boolean(shortcutBusy)} onClick={() => void applyShortcut(item)} title={item.template}>{shortcutBusy === item.id ? "处理中" : item.name}</button>)}</div>}</div>
 <div className="mobile-tool-group"><h3>技能<span>{projectSkills.length}</span></h3>{projectSkills.length === 0 ? <p className="mobile-tool-empty">电脑端未发现可用技能。</p> : <div className="mobile-tool-subgroups">{skillGroups.map((group) => <div className="mobile-tool-subgroup" key={group.source}><h4>{group.label}<span>{group.items.length}</span></h4><div className="mobile-tool-chips">{group.items.map((skill) => <button type="button" key={`${group.source}-${skill.name}`} disabled={busy || !conversation} onClick={() => fillSkill(skill)} title={skill.description}>{skill.name}</button>)}</div></div>)}</div>}</div>
@@ -5780,8 +5860,10 @@ export default function MobileRemotePage() {
             disabled={!available || busy}
             title={reason}
             onClick={() => selectMobileAgent(agent.id)}>
-            <span className="mobile-agent-app-icon" data-logo={agent.logo}>
-              <AgentLogo logo={agent.logo} size={30}/>
+            <span className="mobile-agent-app-icon" data-logo={agent.logo ?? "none"}>
+              {agent.logo
+                ? <AgentLogo logo={agent.logo} size={30}/>
+                : <em className="mobile-agent-app-mark" aria-hidden="true">{agent.name.replace(/\s+/g, "").slice(0, 2).toUpperCase()}</em>}
             </span>
             <b>{agent.name}</b>
             <small>{available ? agent.vendor : statusLabel}</small>

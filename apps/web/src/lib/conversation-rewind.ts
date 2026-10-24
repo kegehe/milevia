@@ -30,11 +30,6 @@ export function rewindPrimaryMode(checkpoint: ConversationCheckpoint): RewindMod
   return checkpointHasCode(checkpoint) ? "conversation_and_code" : "conversation";
 }
 
-/** 按钮上的字。有代码快照的节点与只有对话的节点，用户点下去的后果不同，标签也要不同。 */
-export function rewindButtonLabel(checkpoint: ConversationCheckpoint): string {
-  return checkpointHasCode(checkpoint) ? "回退到此处" : "回退到此处（无代码快照）";
-}
-
 /** 行内/菜单里那行小字：只说"这个节点和常规节点不一样"的地方。 */
 export function rewindHint(checkpoint: ConversationCheckpoint, discarded: number): string {
   const notes: string[] = [];

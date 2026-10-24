@@ -577,17 +577,17 @@ test("授权入口**不藏在「运行时装没装」的分支里**", () => {
   assert.match(css, /\.cli-tools-dep-grant \{/);
 });
 
-// ── 手动安装命令（默认折叠 + 一键复制）────────────────────────────────────
+// ── 手动安装（默认折叠 + 一键复制 / 官方说明入口）─────────────────────────
 
-test("手动安装命令：默认折叠，命令来自模型，复制走统一入口", () => {
+test("手动安装：默认折叠，命令来自模型，复制走统一入口", () => {
   // ① 默认折叠：原生 <details> **不带 open**（它就是"默认收起"的实现，
   //    加个 open 就变成默认展开了，而这一块是手册、不是这一屏的下一步）。
   assert.match(code, /<section className="cli-tools-body cli-tools-manual">/);
   assert.match(code, /<details>/);
-  assert.doesNotMatch(code, /<details[^>]*\sopen/, "「手动安装命令」被改成默认展开了");
+  assert.doesNotMatch(code, /<details[^>]*\sopen/, "「手动安装」被改成默认展开了");
   assert.match(css, /\.cli-tools-manual > details > summary \{/);
 
-  // 反面：那两句说明文字已按用户要求删掉（2026-09-25）—— 这一块只留标题与命令清单。
+  // 反面：那两句说明文字已按用户要求删掉（2026-09-25）—— 这一块只留标题与清单。
   assert.ok(!code.includes("cli-tools-manual-hint"), "折叠头里那句「平台装不了…」还在");
   assert.ok(!code.includes("装好之后点上面的"), "展开后那句「在 X 里执行…」还在");
   assert.ok(!css.includes(".cli-tools-manual-hint"), "说明文字的样式还留着（类名已成死类）");
@@ -609,13 +609,21 @@ test("手动安装命令：默认折叠，命令来自模型，复制走统一�
   // 反馈走 data-state（本页第 1 条约定：变体不拼类名）。
   assert.match(code, /className="secondary cli-tools-manual-copy"[\s\S]{0,80}data-state=\{manualCopy\[row\.id\]/);
   assert.match(css, /\.cli-tools-manual-copy\[data-state="copied"\]/);
+
+  // ④ 原生分发的工具（Cursor CLI）平台不代装，也没有可复制的命令：只给目录里的
+  //    官方安装说明。地址同样只从模型来，页面不拼。
+  assert.match(viewCode, /INSTALL_KIND_NATIVE/);
+  assert.match(viewCode, /kind: "docs", docsUrl: entry\.docsUrl/);
+  assert.match(code, /row\.kind === "command" \?/);
+  assert.match(code, /<ExternalLink[^>]*href=\{row\.docsUrl\}[^>]*>官方安装说明<\/ExternalLink>/);
+  assert.doesNotMatch(code, /cursor\.com/, "页面里自己拼了官方安装地址");
 });
 
-test("手动安装命令：有意留在「探测不到」那道门之外", () => {
+test("手动安装：有意留在「探测不到」那道门之外", () => {
   // 通道探测不到（WSL 没起来 / SSH 连不上）恰恰是最需要自己上手装的时候，
   // 所以这一块**不能**跟着卡片区一起被 `view?.probeOk` 挡住。
   const sectionAt = code.indexOf('className="cli-tools-body cli-tools-manual"');
-  assert.ok(sectionAt > 0, "找不到「手动安装命令」那一块");
+  assert.ok(sectionAt > 0, "找不到「手动安装」那一块");
   const guard = code.slice(Math.max(0, sectionAt - 120), sectionAt);
   assert.match(guard, /viewState === "ready" && manualRows\.length > 0/);
   assert.ok(!/probeOk/.test(guard), `它被 probeOk 挡住了：${guard}`);
@@ -657,7 +665,7 @@ test("抽屉入口：横幅给唯一那张问题卡，卡片在需要时自己�
   assert.match(viewCode, /card\.canOpenDetails = true/);
   // ⚠️ 动作区带 border-top 与浅底：三颗按钮（主操作 / 登录 / 详情）**都 absent** 时整条不能
   //    渲染，否则"已是最新、不需要登录、无需详情"那张最常见的健康卡会留下一条空条。
-  assert.match(code, /\{\(card\.primary \|\| card\.canLogin \|\| card\.canOpenDetails\) && <div className="cli-tools-card-actions">/,
+  assert.match(code, /\{\(card\.primary \|\| card\.login \|\| card\.canOpenDetails\) && <div className="cli-tools-card-actions">/,
     "动作区没有做空档守卫，没有动作的卡片会留下一条空条");
 });
 
@@ -675,18 +683,36 @@ test("「读不到最新版本」只写结论：服务端原文进抽屉，不�
   assert.match(viewCode, /card\.detailNotes\.push\(`读不到的原因：\$\{latest\.error\}`\)/);
 });
 
-test("需要登录的工具把「登录」摆在卡片上，判据来自模型", () => {
-  // 页面只渲染模型给的 `canLogin`，不自己拼判据（supportsLogin / installed 都不许再出现）。
-  assert.match(code, /\{card\.canLogin && <button type="button" className="secondary"/);
-  assert.match(viewCode, /canLogin: Boolean\(entry\.supportsLogin\)/);
-  assert.doesNotMatch(code, /supportsLogin/, "页面里出现了第二份「能不能登录」的判据");
-  // 点开的是登录面板，且开面板前要把上一轮的登录态清掉（否则会带着上一台/上一个工具的结果）。
-  const loginAt = code.indexOf("{card.canLogin && <button");
-  assert.ok(loginAt > 0, "找不到卡片上的「登录」按钮");
-  const block = code.slice(loginAt, loginAt + 500);
-  assert.match(block, /setLoginAgent\(\{ agentID: card\.id, name: card\.name \}\)/);
-  assert.match(block, /setLoggedIn\(false\)/);
-  assert.match(block, /setLoginInfo\(null\)/);
+test("需要登录的工具把登录入口摆在卡片上，判据来自模型", () => {
+  // 页面只渲染模型给的 `login`，不自己拼判据。页面里与"能不能登录"有关的唯一一处是
+  // **该给哪些工具探登录态**（发起探测，不是渲染判据），而且只出现在那条 effect 里。
+  assert.match(code, /\{card\.login && <button/);
+  assert.match(viewCode, /authStatus === "logged_in"\) return "logged-in"/);
+  const supportsLoginUses = code.match(/supportsLogin/g) ?? [];
+  assert.equal(supportsLoginUses.length, 1, "页面里出现了第二份「能不能登录」的判据");
+  assert.match(code, /entries\.filter\(\(entry\) => entry\.supportsLogin\)/);
+  // 点开的是登录面板：带进去的是**这个工具已有的结论**（已登录就别再让它点一次"检查"）。
+  const loginAt = code.indexOf("{card.login && <button");
+  assert.ok(loginAt > 0, "找不到卡片上的登录入口");
+  const block = code.slice(loginAt, loginAt + 700);
+  assert.match(block, /openLogin\(card\.id, card\.name\)/);
+  assert.match(code, /const known = authStates\[`\$\{selectedRunner\}:\$\{agentID\}`\]/);
+  assert.match(code, /setLoginAuth\(known \?\? ""\)/);
+});
+
+test("已登录就不给「登录」：卡片上是「已登录」牌子，且页面进入后自己探一次", () => {
+  // 2026-10-23 用户反馈：终端里登录成功，卡片上还亮着一颗「登录」。
+  assert.match(code, /card\.login === "logged-in" \? "已登录" : "登录"/);
+  assert.match(code, /cli-tools-auth-chip/);
+  assert.match(css, /\.cli-tools-card-actions \.cli-tools-auth-chip\[data-state="logged-in"\]/);
+  // 登录态是**另一个读数**（不进 /agents：那条接口是首屏瓶颈，而 qoder status 冷启动 7.5s），
+  // 页面进入后并发探一次，谁先回来谁先上屏。
+  assert.match(code, /login-status/);
+  assert.match(code, /void readAuthStatus\(selectedRunner, item\.id\)/);
+  // 手动「检查登录状态」必须 force，否则刚在浏览器里授权完、点一下还是旧的"未登录"。
+  assert.match(code, /const agentID = loginAgent\.agentID;[\s\S]{0,200}readAuthStatus\(selectedRunner, agentID, true\)/);
+  // 读不到 ≠ 未登录：探测失败那一档落到 unreadable（仍然给登录入口，但面板说判断不了）。
+  assert.match(code, /catch[\s\S]{0,200}setAuthStates\(\(current\) => \(\{ \.\.\.current, \[key\]: "unreadable" \}\)\)/);
 });
 
 test("抽屉里不再重复给「登录」（两个入口做同一件事）", () => {

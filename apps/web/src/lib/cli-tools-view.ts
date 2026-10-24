@@ -67,6 +67,15 @@ export type LatestRead =
 
 export const latestLoading: LatestRead = { state: "loading" };
 
+/**
+ * 登录态三态（与后端 `agent_auth.go` 的取值一一对应）。
+ *
+ * `unreadable` 不是"未登录"：它是"判断不了"（工具没有非交互查询，或这次没读成）。
+ * 把它们合并的后果在 2026-10-23 之前一直存在 —— 一个明明登录着的 codebuddy 用户，
+ * 面板上永远写着未登录，而他会被指去再登录一次。
+ */
+export type AgentAuthStatus = "logged_in" | "logged_out" | "unreadable";
+
 // ── 卡片 ───────────────────────────────────────────────────────────────────
 
 /** 卡片右上角的状态图标。观感只有这六档，变体一律走 data-*。 */
@@ -75,7 +84,8 @@ export type CardIcon = "loading" | "ok" | "update" | "alert" | "off" | "unknown"
 /** 卡片上那个主动作。没有就是"此刻不该给按钮"。它永远回答"我现在需要做什么"。
  *
  *  ⚠️ 「登录」**不是** `CardAction`：它是"能做的事"，不是"要做的事"，占不住主操作位
- *  ——它由 `ToolCard.canLogin` 单独说，页面渲染成主按钮旁边那颗次要按钮。 */
+ *  ——它由 `ToolCard.login` 单独说，页面渲染成主按钮旁边那颗次要按钮（已登录时是
+ *  「已登录」牌子，见 loginSlotFor）。 */
 export type CardAction =
   | { kind: "install"; label: string }
   | { kind: "update"; label: string }
@@ -130,15 +140,30 @@ export type ToolCard = {
 
   primary?: CardAction;
   /**
-   * 该不该在这张卡上给「登录」入口。
+   * 卡片上登录那一格该怎么画。**三档，缺一不可**：
    *
-   * 判据两条都由**服务端**给：工具目录说它支持平台内登录（`entry.supportsLogin`），
-   * 这台机器上它真的装着（没装时点进去只会在服务端 404，点亮一个必失败的按钮比不亮更坏）。
+   *   - `"not-logged-in"` → 给「登录」按钮。这一档既包含"CLI 说自己没登录"，也包含
+   *     "判断不了"（工具不能自报 / 这次没读成）—— 两件事在卡片上都只需要同一个入口，
+   *     区别留给面板去说（那里有 `authStatus` 与它带的原因）。
+   *   - `"logged-in"` → **不再给「登录」按钮**，只给一枚「已登录」牌子（点开面板可以
+   *     换账号）。已登录还亮着「登录」，用户会以为登录没生效 —— 2026-10-23 的实测反馈。
+   *   - `undefined` → 不给入口：没装 / 正有任务在跑 / 这一页还没读到该工具的登录态
+   *     （那时页面正在后台探，探回来这一格自己会变）。
+   *
+   * 判据两半各有出处：装没装、支不支持登录来自服务端目录与读数；登没登录来自
+   * `authStatus`（`GET …/login-status` 的三态读数，见后端 agent_auth.go）。
    *
    * ⚠️ 它**不进 `primary`**：登录是"能做的事"不是"要做的事"，与主操作位那颗（安装 /
    * 更新 / 修好它）并列显示，且不参与 `bannerFor` 的任何一条分支。
    */
-  canLogin: boolean;
+  login?: "not-logged-in" | "logged-in";
+  /**
+   * 这张卡的「用不了」来自**还没登录**（装好了、版本也正常，就是没有凭据）。
+   *
+   * 只为 bannerFor 存在：登录入口就在卡片上，而顶部横幅点开的是**抽屉**（那里没有
+   * 登录入口）。不排除它，横幅会说出"有事要处理，点进来"却给不出对应的下一步。
+   */
+  loginBlocked: boolean;
   /**
    * 该不该在这张卡上给「详情」入口。
    *
@@ -184,6 +209,13 @@ export type ToolCardInput = {
   /** 批量诊断那条通道当时通不通（决定上一条怎么念）。 */
   channelOk: boolean;
   remoteInstallAllowed: boolean;
+  /**
+   * 这个工具在这台机器上的登录态读数（`GET …/login-status` 的三态）。
+   *
+   * `undefined` = 还没读到（页面进入后才去探），**不是**"没登录" —— 两者混起来，
+   * 一个已登录的工具会在首屏闪一颗「登录」按钮，而那正是这一轮要修的现象。
+   */
+  authStatus?: AgentAuthStatus;
   /**
    * 这台机器上的读数**还在路上**。
    *
@@ -429,6 +461,25 @@ function updateDecision(input: {
 }
 
 /**
+ * 登录那一格给不给、给哪一种。
+ *
+ * 判据只有这一份（页面与测试都用它），三段各有坑：
+ *   - 没装 / 正有任务在跑 / 这一页还没读到环境读数 ⇒ **不给**。没装时点进去只会在服务端
+ *     404，点亮一个必失败的入口比不亮更坏；`reading` 那一档则会把**上一个执行环境**的
+ *     登录态挂到这台机器的卡上。
+ *   - 已登录 ⇒ 不给「登录」，给"已登录"牌子。这就是 2026-10-23 那条反馈的落点：
+ *     在终端里登录成功之后，卡片上那颗按钮必须自己消失，而不是等用户再点一次"检查"。
+ *   - 未登录 / **判断不了** ⇒ 都给「登录」入口。判断不了时不能不给：codebuddy 永远自报不了
+ *     登录态，不给入口等于让它无法从这一页登录。
+ */
+function loginSlotFor(input: ToolCardInput, installed: boolean, running: boolean): ToolCard["login"] {
+  if (!input.entry.supportsLogin || !installed || running || input.reading) return undefined;
+  if (input.authStatus === "logged_in") return "logged-in";
+  // logged_out / unreadable 都要入口；**undefined 是"还没读到"**，不是"没登录"。
+  return input.authStatus ? "not-logged-in" : undefined;
+}
+
+/**
  * 把一张工具卡的全部判据算出来。页面只渲染它的结果。
  *
  * 分支的顺序是**有意的**，每一步的注释写了为什么：
@@ -463,9 +514,8 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     statusTone: "muted",
     statusText: "",
     noteTone: "muted",
-    // `reading` 也要挡：那时 `item` 可能还是上一个执行环境留下的（loadView 不清旧 view），
-    // 照它亮出「登录」会是在一台还没读到的机器上按上一台的读数给动作。
-    canLogin: Boolean(entry.supportsLogin) && installed && !running && !input.reading,
+    login: loginSlotFor(input, installed, running),
+    loginBlocked: false,
     // 默认不给：只有"下一步就在抽屉里"的那几档会把它打开（见 canOpenDetails 的注释）。
     canOpenDetails: false,
     detailNotes: [],
@@ -603,11 +653,20 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     return card;
   }
 
-  // ⑧ 已是最新：主操作位上一个动作都不给。需要登录的工具另有「登录」那颗次要按钮
-  //    （`canLogin`）—— 那是"能做的事"，它占着主操作位只会让"这一列按钮"失去含义。
+  // ⑧ 已是最新：主操作位上一个动作都不给。需要登录的工具另有登录那一格
+  //    （`login`）—— 那是"能做的事"，它占着主操作位只会让"这一列按钮"失去含义。
   card.icon = "ok";
   card.statusTone = "ok";
   card.statusText = "已是最新，不用管它。";
+  // ⑨ 版本是最新的，但 CLI 自己说**没有凭据**：这一档其实用不了，下一步就是登录（卡片上
+  //    那颗按钮）。停在「不用管它」上，一句判断会和旁边那颗「登录」互相打脸。
+  //    unreadable **不动它**：判断不了的时候不许替它说"没登录"。
+  if (input.authStatus === "logged_out") {
+    card.icon = "alert";
+    card.statusTone = "warn";
+    card.statusText = "还没登录，登录之后才能用。";
+    card.loginBlocked = true;
+  }
   return card;
 }
 
@@ -675,7 +734,7 @@ export function bannerFor(cards: ToolCard[]): Banner | undefined {
   //    卡片上那句"按详情里的证据手动处理"要靠它或卡片自带的「详情」才点得开。
   //    带别的动作（更新 / 安装）的**不算**："可以更新到 v2"不是"需要处理一下"。
   const needsAttention = cards.find(
-    (card) => card.statusTone === "warn" && (card.primary?.kind === "repair" || !card.primary),
+    (card) => card.statusTone === "warn" && !card.loginBlocked && (card.primary?.kind === "repair" || !card.primary),
   );
   if (needsAttention) {
     const repairable = needsAttention.primary?.kind === "repair";
@@ -710,31 +769,46 @@ export function runnerLabel(runner: { name?: string; environment?: string } | un
   return runner.name || runner.environment || "未知环境";
 }
 
-// ── 手动安装命令（页面最下面那块，默认折叠）────────────────────────────────
+// ── 手动安装（页面最下面那块，默认折叠）────────────────────────────────────
 
-/** 分发方式：与后端 `InstallKindNpmGlobal` 同名同值（agent_catalog.go:20）。 */
+/** 分发方式：与后端常量同名同值（agent_catalog.go 的 `InstallKindNpmGlobal`；native 在 agent_install.go）。 */
 const INSTALL_KIND_NPM_GLOBAL = "npm-global";
-
-export type ManualInstallRow = { id: string; name: string; command: string };
+const INSTALL_KIND_NATIVE = "native";
 
 /**
- * 手动安装命令清单 —— 平台装不了的时候，用户自己在那台机器上跑的那条命令。
+ * 一行"平台不代装，用户自己装"的出路。
  *
- * 三条判据，都是**有意**的：
- *  1. **只对 npm 全局分发的工具给命令**。将来若有别的分发方式，它**不进这一列**，
- *     也绝不回落成 `npm install -g` —— 那等于教用户做错事（与 `installBlockNote`
- *     里"四档不回落"是同一条纪律）。
+ * 两种形状**必须分开**，不能合并成一个 `command?: string`：
+ *  - npm 全局分发的工具能给出可直接复制的命令；
+ *  - 原生分发的工具（如 Cursor CLI）由官方安装器分发，平台既没有可代跑的命令，
+ *    也不许拿 `npm install -g` 冒充 —— 那一行只给官方说明的地址。
+ */
+export type ManualInstallRow =
+  | { id: string; name: string; kind: "command"; command: string }
+  | { id: string; name: string; kind: "docs"; docsUrl: string };
+
+/**
+ * 手动安装清单 —— 平台装不了的时候，用户自己在那台机器上的出路。
+ *
+ * 四条判据，都是**有意**的：
+ *  1. **npm 全局分发的工具给命令**；原生分发的工具给 `docsUrl`（官方安装说明）。
+ *     两种都**绝不互相回落**：给原生工具拼 `npm install -g` 等于教用户装第三方包
+ *     （Cursor 的 `cursor-agent` npm 包正是第三方），给 npm 工具猜一个官方地址同理。
  *  2. **命令在这里拼，不在页面里拼**。与 `updateDecision` 里那句
  *     `${entry.commandName} update` 同源：命令只有一处来源，页面只渲染。
- *  3. **列全部目录工具，不按装没装过滤**。这一块是手册，不是状态面板 ——
+ *  3. **没有 `docsUrl` 的原生工具不进列**。宁可这一行不出现，也不拿 `homepage`
+ *     顶替或猜一条地址 —— 猜错会把用户送到错误的安装说明。
+ *  4. **列全部目录工具，不按装没装过滤**。这一块是手册，不是状态面板 ——
  *     已装的工具拿同一条命令也能升到最新。它因此不随所选环境变化。
  */
 export function buildManualInstallRows(entries: AgentCatalogEntry[]): ManualInstallRow[] {
-  return entries
-    .filter((entry) => entry.installKind === INSTALL_KIND_NPM_GLOBAL && Boolean(entry.npmPackage))
-    .map((entry) => ({
-      id: entry.id,
-      name: entry.name,
-      command: `npm install -g ${entry.npmPackage}@latest`,
-    }));
+  return entries.flatMap((entry): ManualInstallRow[] => {
+    if (entry.installKind === INSTALL_KIND_NPM_GLOBAL && entry.npmPackage) {
+      return [{ id: entry.id, name: entry.name, kind: "command", command: `npm install -g ${entry.npmPackage}@latest` }];
+    }
+    if (entry.installKind === INSTALL_KIND_NATIVE && entry.docsUrl) {
+      return [{ id: entry.id, name: entry.name, kind: "docs", docsUrl: entry.docsUrl }];
+    }
+    return [];
+  });
 }

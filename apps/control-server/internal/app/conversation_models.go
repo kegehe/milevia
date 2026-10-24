@@ -191,13 +191,28 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 		view.Source = "cli_default"
 	}
 
-	if conversation.AgentID == "codebuddy" {
+	if conversation.AgentID == "qoder" {
+		// Qoder 有 `--list-models`，但它们需要登录态且输出形状未校准（本机实测未登录时
+		// 只回一句英文报错）。先如实返回空目录 + 可输入提示，不拿猜出来的型号表冒充目录。
+		view.Models = []AgentModelOption{}
+		view.Note = "Qoder 没有内置模型目录，可直接在下方输入模型名（如 auto、performance，或自有模型 ID）；切换后下一条消息生效。"
+	} else if conversation.AgentID == "codebuddy" {
 		// CodeBuddy 支持 --model（官方 CLI 参考），但没有与 Codex `debug models` 等价的
 		// 目录列举命令，也没有可靠的静态型号表（其型号体系与 Claude 不同）。这里不给它
 		// 冒充 Claude 的模型目录（opus/sonnet 等对 CodeBuddy 是无效模型名），如实返回空
 		// 目录，交还自定义输入。
 		view.Models = []AgentModelOption{}
 		view.Note = "CodeBuddy 没有内置模型目录，可直接在下方输入模型名（如 gpt-5）；切换后下一条消息生效。"
+	} else if conversation.AgentID == "opencode" {
+		// OpenCode 的模型 ID 由 provider/model 组成，且可用模型取决于用户在本机
+		// 配置了哪些 provider。给空目录 + 自定义输入，不拿 Claude 的型号表冒充。
+		view.Models = []AgentModelOption{}
+		view.Note = "OpenCode 使用 provider/model 形式的模型 ID（如 opencode/gpt-5.1-codex）；可直接输入，切换后下一条消息生效。"
+	} else if conversation.AgentID == "cursor" {
+		// Cursor 有 `--model`，但没有非交互的模型目录命令；可用型号还取决于账号。
+		// 给空目录 + 自定义输入，不拿 Claude 的 opus/sonnet 冒充 Cursor 的型号。
+		view.Models = []AgentModelOption{}
+		view.Note = "Cursor CLI 没有内置模型目录，可直接输入模型名（如 auto、gpt-5、sonnet-4）；切换后下一条消息生效。"
 	} else if conversation.AgentID == "codex" {
 		options, note := s.codexModelCatalogFor(r.Context(), projectRunner, projectPath)
 		if len(options) > 0 {

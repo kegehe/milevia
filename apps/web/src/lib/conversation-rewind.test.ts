@@ -3,7 +3,6 @@ import test from "node:test";
 
 import {
   checkpointHasCode,
-  rewindButtonLabel,
   rewindConfirmAction,
   rewindConfirmMessage,
   rewindConfirmTitle,
@@ -38,9 +37,8 @@ test("默认动作按节点能力选", () => {
   assert.equal(rewindPrimaryMode(node({ hasSnapshot: false })), "conversation");
 });
 
-test("按钮与标题跟着模式走", () => {
-  assert.equal(rewindButtonLabel(node()), "回退到此处");
-  assert.equal(rewindButtonLabel(node({ hasSnapshot: false })), "回退到此处（无代码快照）");
+// 确认框的标题与动作键跟着模式走（按钮本体已改为图标钮，标签文案只活在确认框里）。
+test("确认框标题与动作键跟着模式走", () => {
   assert.equal(rewindConfirmTitle({ mode: "conversation_and_code", discarded: 0 }), "恢复代码和对话");
   assert.equal(rewindConfirmTitle({ mode: "code", discarded: 0 }), "只恢复代码");
   assert.equal(rewindConfirmTitle({ mode: "conversation", discarded: 0 }), "只恢复对话");

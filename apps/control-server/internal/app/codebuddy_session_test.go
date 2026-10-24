@@ -114,11 +114,9 @@ func TestCodebuddyLiveSessionTurn(t *testing.T) {
 func TestCodebuddySessionExitFinishesCurrentAndQueuedTurns(t *testing.T) {
 	current := &turnRecordingSink{}
 	queued := &turnRecordingSink{}
-	session := &codebuddyCLISession{
-		sink:   current,
-		queued: []codebuddyQueuedTurn{{sink: queued}},
-		done:   make(chan error, 1),
-	}
+	session := newStreamJSONSession(streamJSONSessionConfig{agentID: "codebuddy", label: "CodeBuddy", exitPrefix: codebuddyExitPrefix}, nil, &captureWriteCloser{}, nil, nil)
+	session.sink = current
+	session.queued = []streamJSONTurn{{sink: queued}}
 	exitErr := errors.New("process exited")
 
 	session.finish(exitErr)

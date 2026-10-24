@@ -39,13 +39,20 @@ test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
   assert.match(conversationPage, /import \{ copyToClipboard \} from "\.\.\/lib\/clipboard";/);
   assert.match(conversationPage, /if \(!\(await copyToClipboard\(message\.content\)\)\) \{/);
   // 复制按钮不区分角色：用户消息与 AI 回复都带一个（AI 回复此前只能靠框选整段复制）。
+  // 2026-10-23 改版：按钮从伪元素画法换成与回退箭头同一支 SVG 描边图标，
+  // 并住进气泡下方的 .message-actions 动作行（显形策略在 css 的 hover 媒体查询里）。
   assert.doesNotMatch(conversationPage, /isUser && <button className=\{`message-copy/);
-  assert.match(conversationPage, /<\/div><button className=\{`message-copy\$\{copied \? " copied" : ""\}`\}/);
+  assert.match(conversationPage, /<div className="message-actions" data-keep=\{persistent \? "" : undefined\}><button type="button" className=\{`message-copy reveal\$\{copied \? " copied" : ""\}`\}/);
   assert.match(conversationPage, /title=\{copied \? "已复制" : "复制消息"\}/);
-  assert.match(stylesheet, /\.message-copy\s*\{[^}]*width:\s*26px;[^}]*height:\s*26px;[^}]*background:\s*transparent;/s);
-  assert.match(stylesheet, /\.message-copy::before,[\s\S]*?\.message-copy::after/);
-  assert.match(stylesheet, /\.message-copy\.copied::before\s*\{[^}]*border-width:\s*0\s+0\s+2px\s+2px;/s);
-  assert.match(stylesheet, /\.message-copy\.copied::after\s*\{\s*display:\s*none;/);
+  assert.match(conversationPage, /\{copied \? <CopyDoneIcon \/> : <CopyIcon \/>\}/);
+  // 「已复制」除了换勾再给一行文字反馈（1.5s 后随 copied 态一起消失）。
+  assert.match(conversationPage, /\{copied && <span className="copy-feedback" role="status">已复制<\/span>\}/);
+  // 伪元素画法已死：css 里不再有 ::before/::after 画的双矩形。
+  assert.doesNotMatch(stylesheet, /\.message-copy::before/);
+  assert.doesNotMatch(stylesheet, /\.message-copy::after/);
+  assert.match(stylesheet, /\.message-copy,\s*\n\.message-rewind \{[\s\S]*?width: 28px;[\s\S]*?height: 28px;/);
+  assert.match(stylesheet, /\.message-copy\.copied \{ color: #287a48; background: #e2f4e8; \}/);
+  assert.match(stylesheet, /\.message-action-icon \{ width: 15px; height: 15px;/);
 });
 
 test("stopping an unanswered direct prompt restores it to the composer", () => {
@@ -637,7 +644,7 @@ test("conversation follows streaming updates and explicitly follows dispatched m
 test("conversation controls navigate direct user messages and continue through older pages", () => {
   assert.match(conversationPage, /const userMessages = useMemo\(\(\) => primaryMessages\.filter\(\(message\) => message\.role === "user"\)/);
   assert.match(conversationPage, /const userMessageElements = useRef\(new Map<string, HTMLDivElement>\(\)\)/);
-  assert.match(conversationPage, /data-user-message-id=\{item\.kind === "message" && item\.message\.role === "user"/);
+  assert.match(conversationPage, /data-user-message-id=\{isUserMessage \? item\.message\.id : undefined\}/);
   assert.match(conversationPage, /const goToPreviousUserMessage = \(\) => \{/);
   assert.match(conversationPage, /if \(loadingOlderHistory\) return;/);
   assert.match(conversationPage, /if \(index === -1 && hasMoreMessageHistory\)/);

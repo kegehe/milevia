@@ -214,7 +214,7 @@ func TestInstallAgentCLIEndToEnd(t *testing.T) {
 	// 于是把机器上真实存在的那份 claude 认成了我们的安装。
 	npmPath := managedNpmCommand(root)
 	prefix := managedNpmGlobalPrefix(root)
-	install := npmCLIInstall{scope: "@anthropic-ai", packageName: "claude-code", commandName: "claude", binFile: "claude.exe"}
+	install := npmCLIInstall{scope: "@anthropic-ai", packageName: "claude-code", commandName: "claude", binPath: "bin/claude.exe"}
 	target := install.commandPath(prefix)
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		t.Fatal(err)

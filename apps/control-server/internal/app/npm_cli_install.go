@@ -17,7 +17,9 @@ type npmCLIInstall struct {
 	scope       string
 	packageName string
 	commandName string
-	binFile     string
+	// binPath 是包内相对路径（`bin/claude.exe`、`bundle/qoder-npm-dispatcher.cjs`），
+	// 逐字来自 `npm view <pkg> bin`，由 binaryPath 拼到包根之后。
+	binPath string
 }
 
 func (install npmCLIInstall) packageRoot(prefix string) string {
@@ -28,7 +30,7 @@ func (install npmCLIInstall) packageRoot(prefix string) string {
 }
 
 func (install npmCLIInstall) binaryPath(prefix string) string {
-	return filepath.Join(install.packageRoot(prefix), install.packageName, "bin", install.binFile)
+	return filepath.Join(install.packageRoot(prefix), install.packageName, filepath.FromSlash(install.binPath))
 }
 
 func (install npmCLIInstall) commandPath(prefix string) string {
@@ -36,6 +38,18 @@ func (install npmCLIInstall) commandPath(prefix string) string {
 		return filepath.Join(prefix, install.commandName+".cmd")
 	}
 	return filepath.Join(prefix, "bin", install.commandName)
+}
+
+// npmCLIScriptSuffix 判断包内入口是不是"要用 node 跑"的脚本。
+//
+// 早先只认 `.js`：qoder 的入口是 .cjs，漏掉这类后缀会直接写出一个
+// `"<target>" %*` 的 shim —— 双击/调用即报"不是有效的 Win32 应用"。
+func npmCLIScriptSuffix(binPath string) bool {
+	switch strings.ToLower(filepath.Ext(binPath)) {
+	case ".js", ".cjs", ".mjs":
+		return true
+	}
+	return false
 }
 
 type npmCLIRecovery struct {
@@ -142,7 +156,7 @@ func rollbackInterruptedNpmInstall(prefix, previous string, install npmCLIInstal
 		if versionErr != nil || version != previous {
 			continue
 		}
-		binary, statErr := os.Stat(filepath.Join(candidate, "bin", install.binFile))
+		binary, statErr := os.Stat(filepath.Join(candidate, filepath.FromSlash(install.binPath)))
 		if statErr == nil && !binary.IsDir() && (runtime.GOOS == "windows" || binary.Mode()&0o111 != 0) {
 			backup = candidate
 			break
@@ -188,23 +202,23 @@ func ensureNpmCLICommand(prefix string, install npmCLIInstall) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect npm global %s command: %w", install.commandName, err)
 	}
-	target := filepath.Join("..", "lib", "node_modules", install.scope, install.packageName, "bin", install.binFile)
+	target := filepath.Join("..", "lib", "node_modules", install.scope, install.packageName, filepath.FromSlash(install.binPath))
 	return os.Symlink(target, command)
 }
 
 func ensureWindowsNpmCLICommand(prefix string, install npmCLIInstall) error {
-	target := filepath.Join("%~dp0", "node_modules", install.scope, install.packageName, "bin", install.binFile)
+	target := filepath.Join("%~dp0", "node_modules", install.scope, install.packageName, filepath.FromSlash(install.binPath))
 	command := filepath.Join(prefix, install.commandName+".cmd")
 	invoke := fmt.Sprintf("\"%s\" %%*", target)
-	if strings.HasSuffix(strings.ToLower(install.binFile), ".js") {
+	if npmCLIScriptSuffix(install.binPath) {
 		invoke = fmt.Sprintf("node \"%s\" %%*", target)
 	}
 	if err := os.WriteFile(command, []byte("@echo off\r\n"+invoke+"\r\n"), 0o755); err != nil {
 		return fmt.Errorf("write npm global %s command shim: %w", install.commandName, err)
 	}
-	psTarget := "$PSScriptRoot\\" + filepath.Join("node_modules", install.scope, install.packageName, "bin", install.binFile)
+	psTarget := "$PSScriptRoot\\" + filepath.Join("node_modules", install.scope, install.packageName, filepath.FromSlash(install.binPath))
 	psInvoke := fmt.Sprintf("& \"%s\" @args", psTarget)
-	if strings.HasSuffix(strings.ToLower(install.binFile), ".js") {
+	if npmCLIScriptSuffix(install.binPath) {
 		psInvoke = fmt.Sprintf("& node \"%s\" @args", psTarget)
 	}
 	if err := os.WriteFile(filepath.Join(prefix, install.commandName+".ps1"), []byte(psInvoke+"\r\nexit $LASTEXITCODE\r\n"), 0o755); err != nil {

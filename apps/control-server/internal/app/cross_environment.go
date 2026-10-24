@@ -195,6 +195,16 @@ func firstNonEmpty(values ...string) string {
 
 // ── 目标环境里的落点 ─────────────────────────────────────────────────────────
 
+// crossManagedPathValue 是目标环境里平台托管/用户原生 CLI 的目录列表。
+//
+// 平台的托管 npm prefix 不在用户 shell 的 PATH 上；安装自检虽然能按绝对路径找到产物，
+// 但后续的 `command -v` 探测会把它当成“没装”。探测与运行都必须先前置这些目录。
+const crossManagedPathValue = "$HOME/.local/share/milevia/toolchain/node/bin:$HOME/.local/share/milevia/toolchain/npm-global/bin:$HOME/.opencode/bin:$HOME/.npm-global/bin:$HOME/.local/bin"
+
+func crossManagedPathPrefix() string {
+	return `export PATH="` + crossManagedPathValue + `:$PATH"`
+}
+
 // crossToolchainRoot 给出目标环境里的托管工具链根目录（`~/.local/share/milevia/toolchain`）。
 //
 // 与本机同构，于是"哪份文件该在哪"这套知识只有一份。**一律落在 $HOME 下**：

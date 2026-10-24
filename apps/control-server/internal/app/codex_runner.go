@@ -213,7 +213,7 @@ func (r *codexCLIRunner) finishFailedUpdate(previous string, updateErr error, re
 }
 
 var codexNpmCLIInstall = npmCLIInstall{
-	scope: "@openai", packageName: "codex", commandName: "codex", binFile: "codex.js",
+	scope: "@openai", packageName: "codex", commandName: "codex", binPath: "bin/codex.js",
 }
 
 func rollbackInterruptedNpmCodexInstall(prefix, previous string) (string, error) {

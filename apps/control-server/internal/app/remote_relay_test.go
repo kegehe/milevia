@@ -34,7 +34,7 @@ func newFSRelayTestServer(t *testing.T) (*Server, string) {
 	return server, projectRoot
 }
 
-func relayFS(t *testing.T, server *Server, body map[string]any) (int, map[string]any) {
+func relayRPC(t *testing.T, server *Server, body map[string]any) (int, map[string]any) {
 	t.Helper()
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -51,9 +51,9 @@ func relayFS(t *testing.T, server *Server, body map[string]any) (int, map[string
 	return response.Code, decoded
 }
 
-func relayFSData(t *testing.T, server *Server, body map[string]any) map[string]any {
+func relayRPCData(t *testing.T, server *Server, body map[string]any) map[string]any {
 	t.Helper()
-	status, payload := relayFS(t, server, body)
+	status, payload := relayRPC(t, server, body)
 	if status != http.StatusOK {
 		t.Fatalf("relay transport status = %d body %v", status, payload)
 	}
@@ -108,7 +108,7 @@ func TestFSRemoteOperationWhitelistIsExplicit(t *testing.T) {
 
 func TestRelayFSRequestRejectsUnsupportedOperation(t *testing.T) {
 	server := newTestServer(t)
-	status, payload := relayFS(t, server, map[string]any{"op": "fs.chmod", "projectId": "file-project"})
+	status, payload := relayRPC(t, server, map[string]any{"op": "fs.chmod", "projectId": "file-project"})
 	if status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", status)
 	}
@@ -119,7 +119,7 @@ func TestRelayFSRequestRejectsUnsupportedOperation(t *testing.T) {
 
 func TestRelayFSRequestRejectsMissingProject(t *testing.T) {
 	server := newTestServer(t)
-	status, _ := relayFS(t, server, map[string]any{"op": "fs.tree"})
+	status, _ := relayRPC(t, server, map[string]any{"op": "fs.tree"})
 	if status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", status)
 	}
@@ -132,7 +132,7 @@ func TestRelayFSRequestRejectsProjectIDWithPathSyntax(t *testing.T) {
 	server := newTestServer(t)
 	for _, projectID := range []string{"../admin", "a/b", "a\\b", "a?b", "a#b", "a%2fb"} {
 		t.Run(projectID, func(t *testing.T) {
-			status, _ := relayFS(t, server, map[string]any{"op": "fs.tree", "projectId": projectID})
+			status, _ := relayRPC(t, server, map[string]any{"op": "fs.tree", "projectId": projectID})
 			if status != http.StatusBadRequest {
 				t.Fatalf("projectId %q: status = %d, want 400", projectID, status)
 			}
@@ -144,7 +144,7 @@ func TestRelayFSRequestRejectsProjectIDWithPathSyntax(t *testing.T) {
 // 悄悄改成别的写法，客户端传错类型时应当明确报错。
 func TestRelayFSRequestRejectsNonStringQueryParams(t *testing.T) {
 	server := newTestServer(t)
-	status, payload := relayFS(t, server, map[string]any{
+	status, payload := relayRPC(t, server, map[string]any{
 		"op":        "fs.tree",
 		"projectId": "file-project",
 		"params":    map[string]any{"depth": 3},
@@ -162,7 +162,7 @@ func TestRelayFSRequestReadsAndWritesProjectFile(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 
-	opened := relayFSData(t, server, map[string]any{
+	opened := relayRPCData(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "notes.md"},
@@ -179,7 +179,7 @@ func TestRelayFSRequestReadsAndWritesProjectFile(t *testing.T) {
 	}
 
 	// 保存必须带对版本：这是手机端唯一能挡住"覆盖掉电脑上别人的改动"的手段。
-	written := relayFSData(t, server, map[string]any{
+	written := relayRPCData(t, server, map[string]any{
 		"op":        "fs.write",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "notes.md", "content": "# 标题\n改过的正文\n", "expectedVersion": version},
@@ -203,7 +203,7 @@ func TestRelayFSRequestWriteReportsVersionConflict(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 
-	status, payload := relayFS(t, server, map[string]any{
+	status, payload := relayRPC(t, server, map[string]any{
 		"op":        "fs.write",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "notes.md", "content": "stale write", "expectedVersion": "sha256-of-something-else"},
@@ -257,7 +257,7 @@ func TestRelayFSRequestKeepsPathInsideProjectSandbox(t *testing.T) {
 			for key, value := range testCase.body {
 				body[key] = value
 			}
-			_, payload := relayFS(t, server, body)
+			_, payload := relayRPC(t, server, body)
 			if payload["ok"] != false {
 				t.Fatalf("%s was allowed: %v", testCase.op, payload)
 			}
@@ -302,7 +302,7 @@ func TestFSOpenImageIsBase64AndMeasuredAfterEncoding(t *testing.T) {
 		t.Fatalf("seed image: %v", err)
 	}
 
-	opened := relayFSData(t, server, map[string]any{
+	opened := relayRPCData(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "shot.png"},
@@ -372,7 +372,7 @@ func TestFSOpenLargeTextIsReadableButNotEditable(t *testing.T) {
 		t.Fatalf("seed large text: %v", err)
 	}
 
-	opened := relayFSData(t, server, map[string]any{
+	opened := relayRPCData(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "large.txt"},
@@ -422,7 +422,7 @@ func TestFSOpenOmitsTextWhoseEscapedFormExceedsTheTransmitBudget(t *testing.T) {
 		t.Fatalf("seed plain: %v", err)
 	}
 
-	denseOpened := relayFSData(t, server, map[string]any{
+	denseOpened := relayRPCData(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "quotes.txt"},
@@ -438,7 +438,7 @@ func TestFSOpenOmitsTextWhoseEscapedFormExceedsTheTransmitBudget(t *testing.T) {
 		t.Fatalf("editable = %v, want false（发都发不出去的东西不能标成可编辑）", denseOpened["editable"])
 	}
 
-	plainOpened := relayFSData(t, server, map[string]any{
+	plainOpened := relayRPCData(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "plain.txt"},
@@ -453,7 +453,7 @@ func TestFSOpenOmitsVersionWhenContentIsOmitted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectRoot, "huge.txt"), bytes.Repeat([]byte("c"), fsRemoteOpenViewLimit+1), 0o644); err != nil {
 		t.Fatalf("seed huge file: %v", err)
 	}
-	opened := relayFSData(t, server, map[string]any{
+	opened := relayRPCData(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "huge.txt"},
@@ -474,7 +474,7 @@ func TestFSOpenRejectsDirectory(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(projectRoot, "src"), 0o755); err != nil {
 		t.Fatalf("seed dir: %v", err)
 	}
-	_, payload := relayFS(t, server, map[string]any{
+	_, payload := relayRPC(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "src"},
@@ -692,7 +692,7 @@ func TestTreeWithoutDepthKeepsFlatBehaviour(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	data := relayFSData(t, server, map[string]any{
+	data := relayRPCData(t, server, map[string]any{
 		"op":        "fs.tree",
 		"projectId": "file-project",
 		"params":    map[string]string{},
@@ -728,7 +728,7 @@ func TestTreeWithDepthHidesDependenciesAndReportsSkips(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	data := relayFSData(t, server, map[string]any{
+	data := relayRPCData(t, server, map[string]any{
 		"op":        "fs.tree",
 		"projectId": "file-project",
 		"params":    map[string]string{"depth": "3"},
@@ -758,7 +758,7 @@ func TestTreeWithDepthHidesMixedCaseDependencyDirs(t *testing.T) {
 		}
 	}
 
-	data := relayFSData(t, server, map[string]any{
+	data := relayRPCData(t, server, map[string]any{
 		"op":        "fs.tree",
 		"projectId": "file-project",
 		"params":    map[string]string{"depth": "3"},
@@ -787,7 +787,7 @@ func TestRelayFSRequestIgnoresConversationIDInParams(t *testing.T) {
 
 	// 信封里没有 conversationId（= 项目共享工作区），params 里塞一个不存在的会话。
 	// 覆盖生效的话这一步会失败在"会话工作区不存在"，所以断言的就是"读得到文件"。
-	data := relayFSData(t, server, map[string]any{
+	data := relayRPCData(t, server, map[string]any{
 		"op":        "fs.open",
 		"projectId": "file-project",
 		"params":    map[string]string{"path": "notes.md", "conversationId": "does-not-exist"},

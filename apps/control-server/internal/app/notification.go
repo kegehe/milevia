@@ -28,13 +28,13 @@ type NotificationEvent struct {
 	TaskTitle string `json:"taskTitle,omitempty"`
 	// DurationMs 是最近一次任务执行的耗时（startedAt→finishedAt，服务端算好）。
 	// 无执行记录或时间戳不完整时为 0，前端据此省略耗时行。
-	DurationMs     int64  `json:"durationMs,omitempty"`
-	ConversationID string `json:"conversationId,omitempty"`
-	TaskID         string `json:"taskId,omitempty"`
-	Title          string `json:"title"`
-	Body           string `json:"body"`
-	Priority       string `json:"priority"` // "high" | "normal" | "low"
-	ActionURL      string `json:"actionUrl"`
+	DurationMs     int64     `json:"durationMs,omitempty"`
+	ConversationID string    `json:"conversationId,omitempty"`
+	TaskID         string    `json:"taskId,omitempty"`
+	Title          string    `json:"title"`
+	Body           string    `json:"body"`
+	Priority       string    `json:"priority"` // "high" | "normal" | "low"
+	ActionURL      string    `json:"actionUrl"`
 	CreatedAt      time.Time `json:"createdAt"`
 	DedupeKey      string    `json:"-"`
 }

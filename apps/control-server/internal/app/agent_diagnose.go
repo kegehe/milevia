@@ -342,7 +342,12 @@ func (s *Server) buildLocalAgentDiagnosisWith(ctx context.Context, meta RunnerMe
 	s.assessRecord(&report, entry, recorded, hasRecord, paths)
 
 	// ── 5. 预检：把"点了会失败"提前说出来 ───────────────────────────────────
-	report.Preflight = s.diagnosePreflightLocal(ctx, meta, entry)
+	// 只对**平台自己装**的工具做预检：它回答的是"安装计划能不能落地"。原生分发的
+	// 工具没有安装计划（升级走 CLI 自己的 update），这里给出 installOk=false 会让
+	// 界面把"平台不代装"误读成"升不了"，把唯一的更新按钮挡掉。
+	if entry.SupportsInstall {
+		report.Preflight = s.diagnosePreflightLocal(ctx, meta, entry)
+	}
 
 	// ── 6. 上次失败的现场 ───────────────────────────────────────────────────
 	report.LastFailure = s.lastAgentInstallFailure(ctx, meta.ID, entry.ID)
@@ -778,7 +783,7 @@ func (s *Server) assessRuntime(ctx context.Context, shared diagnoseShared, repor
 // assessSystemNpmRuntime 判"装在系统 npm 全局里的工具，它的运行时够不够用"。
 //
 // ⚠️ 判据必须来自**系统那一套**，不能拿 `probeRuntime` 的读数 —— 后者是"托管优先"的
-//（`runtime_install.go`：托管命中就不看系统）。拿它去判一个系统 npm 安装的工具，
+// （`runtime_install.go`：托管命中就不看系统）。拿它去判一个系统 npm 安装的工具，
 // 会在"托管运行时坏掉/太老、系统 node 正常"的机器上给出**假的 blocker**：
 // 分明能跑的工具被判成"找不到可用的 Node"或"版本过低"。
 //
@@ -901,7 +906,7 @@ func agentNpmCLIInstall(entry AgentCatalogEntry) npmCLIInstall {
 		scope:       packageScope(entry.NpmPackage),
 		packageName: packageBase(entry.NpmPackage),
 		commandName: entry.CommandName,
-		binFile:     entry.BinFile,
+		binPath:     entry.BinPath,
 	}
 }
 

@@ -256,6 +256,45 @@ func TestProjectCommandsForCodexHasNoSlashCommands(t *testing.T) {
 	}
 }
 
+func TestProjectCommandsForOpenCodeHasNoSlashCommands(t *testing.T) {
+	server := newTestServer(t)
+	projectID := createCommandTestProject(t, server, t.TempDir())
+	runner := &stubCommandCatalogRunner{catalog: mustCommandCatalog(t)}
+	server.runner = runner
+
+	view := projectCommandsView(t, server, projectID, "agentId=opencode")
+	if len(view.Commands) != 0 {
+		t.Fatalf("OpenCode 不应回落到 Claude 的命令目录：%+v", view.Commands)
+	}
+	if view.AgentID != "opencode" {
+		t.Fatalf("目录归属被改写成了 %q", view.AgentID)
+	}
+	if !view.CustomAllowed || view.Note == "" {
+		t.Fatalf("必须保留自定义命令并说明没有目录：%+v", view)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("OpenCode 没有可探测的目录，不应拉起 Claude 探针：calls = %d", runner.calls)
+	}
+}
+
+func TestProjectCommandsForCodeBuddyDoesNotUseClaudeCatalog(t *testing.T) {
+	server := newTestServer(t)
+	projectID := createCommandTestProject(t, server, t.TempDir())
+	runner := &stubCommandCatalogRunner{catalog: mustCommandCatalog(t)}
+	server.runner = runner
+
+	view := projectCommandsView(t, server, projectID, "agentId=codebuddy")
+	if len(view.Commands) != 0 {
+		t.Fatalf("CodeBuddy 不应展示 Claude 的命令目录：%+v", view.Commands)
+	}
+	if view.AgentID != "codebuddy" || !view.CustomAllowed || view.Note == "" {
+		t.Fatalf("CodeBuddy 目录应如实为空并保留自定义入口：%+v", view)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("CodeBuddy 没有可探测的目录，不应拉起 Claude 探针：calls = %d", runner.calls)
+	}
+}
+
 func TestObserveCommandCatalogFromRunWinsOverProbe(t *testing.T) {
 	server := newTestServer(t)
 	projectID := createCommandTestProject(t, server, t.TempDir())
@@ -263,7 +302,7 @@ func TestObserveCommandCatalogFromRunWinsOverProbe(t *testing.T) {
 	projectCommandsView(t, server, projectID, "")
 
 	// 真实运行的观测比探针更新，必须覆盖缓存（否则新装的插件命令要等 TTL 才可见）。
-	server.observeCommandCatalog(projectID, []byte(`{"type":"system","subtype":"init","slash_commands":["compact","brand-new"],"skills":[],"claude_code_version":"2.1.267"}`))
+	server.observeCommandCatalog(projectID, "claude-code", []byte(`{"type":"system","subtype":"init","slash_commands":["compact","brand-new"],"skills":[],"claude_code_version":"2.1.267"}`))
 
 	view := projectCommandsView(t, server, projectID, "")
 	if view.Source != "run" || view.ClaudeVersion != "2.1.267" {
@@ -283,8 +322,11 @@ func TestObserveCommandCatalogFromRunWinsOverProbe(t *testing.T) {
 func TestObserveCommandCatalogIgnoresUnrelatedEvents(t *testing.T) {
 	server := newTestServer(t)
 	// 事件热路径上的采样必须廉价且精确：非 init 事件、或空 projectID 都不该写入缓存。
-	server.observeCommandCatalog("project", []byte(`{"type":"assistant","message":{"content":[]}}`))
-	server.observeCommandCatalog("", []byte(`{"type":"system","subtype":"init","slash_commands":["compact"]}`))
+	server.observeCommandCatalog("project", "claude-code", []byte(`{"type":"assistant","message":{"content":[]}}`))
+	server.observeCommandCatalog("", "claude-code", []byte(`{"type":"system","subtype":"init","slash_commands":["compact"]}`))
+	// Qoder / CodeBuddy 的 init 也带 slash_commands；它们不能写进 Claude 的唯一缓存槽。
+	server.observeCommandCatalog("project", "qoder", []byte(`{"type":"system","subtype":"init","slash_commands":["qoder-only"]}`))
+	server.observeCommandCatalog("project", "codebuddy", []byte(`{"type":"system","subtype":"init","slash_commands":["codebuddy-only"]}`))
 	if _, ok := server.cachedCommandCatalog(commandCatalogCacheKey("project", "claude-code"), 0); ok {
 		t.Fatal("不该写入缓存")
 	}

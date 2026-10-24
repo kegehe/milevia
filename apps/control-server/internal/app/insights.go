@@ -636,6 +636,20 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 	isSSH := strings.HasPrefix(project.Runner, "ssh-")
 	target := s.resolveAgentTargetEnv(project.Runner, project.Path)
 	switch {
+	case agentID == "opencode":
+		policy = "read_only"
+		if isSSH {
+			r, ok := s.runnerRegistry.get(project.Runner)
+			if !ok {
+				return "", fmt.Errorf("SSH 连接不可用")
+			}
+			runner = r
+		} else {
+			runner = s.opencodeRunnerFor(target)
+			if runner == nil {
+				return "", errors.New("没有可用的 OpenCode 分析运行器")
+			}
+		}
 	case isSSH:
 		r, ok := s.runnerRegistry.get(project.Runner)
 		if !ok {
@@ -684,6 +698,15 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 		}
 		if !ready {
 			return "", errors.New("Codex CLI is unavailable or not logged in")
+		}
+	}
+	if agentID == "opencode" {
+		ready := false
+		if capable, ok := runner.(OpenCodeCapableRunner); ok {
+			ready = capable.OpenCodeReady(ctx)
+		}
+		if !ready {
+			return "", errors.New("OpenCode CLI is unavailable")
 		}
 	}
 	cleanupQuota, err := s.reserveInsightQuotaWithWait(ctx, project, agentID, profile, quotaWait, progress)
@@ -2547,10 +2570,10 @@ func insightRevisionFailureReason(err error) string {
 func (s *Server) currentInsightAgent(ctx context.Context, projectID string) string {
 	agentID := "claude-code"
 	_ = s.db.QueryRowContext(ctx, `select agent_id from conversations where project_id=? and is_current=true`, projectID).Scan(&agentID)
-	if agentID != "codex" {
-		agentID = "claude-code"
+	if entry, ok := agentByID(agentID); ok && entry.SupportsProjectInsights {
+		return agentID
 	}
-	return agentID
+	return "claude-code"
 }
 
 type insightWorkspaceRevision struct {

@@ -12,9 +12,9 @@ import (
 )
 
 // 本文件实现 wslAgentRunner 的 Run / StartSession：经 wsl.exe 在 WSL 内执行
-// claude / codex CLI。复用 claudeCLIRunner / codexCLIRunner 的参数组装与输出解析
-// （args / sessionArgs / profileLaunch / readOutput / readStderr / readCodexJSONL），
-// 仅进程拉起由本文件实现为 wsl.exe 版本。
+// claude / codex / opencode CLI。复用 claudeCLIRunner / codexCLIRunner / OpenCode
+// 的参数组装与输出解析（args / sessionArgs / profileLaunch / readOutput / readStderr /
+// readCodexJSONL / readOpenCodeJSONL），仅进程拉起由本文件实现为 wsl.exe 版本。
 //
 // 命令形态：wsl.exe -d <distro> --cd <linuxWorkDir> -- <cli> <args>
 //   - --cd 设置 WSL 内工作目录（request.ProjectPath 为 UNC，经 uncToWslPath 转换）。
@@ -33,6 +33,7 @@ var wslForwardEnvKeys = []string{
 	"CODEX_HOME",
 	"CODEX_",
 	"CLAUDE_",
+	"OPENCODE_",
 	"MCP_",
 	// WSL 内同样是 Windows 项目路径（/mnt/<盘符>/）在跑 python 脚本，同样会按 GBK
 	// 输出中文；这两个变量必须透传，否则 UTF-8 注入到 wsl.exe 就断了（见
@@ -174,7 +175,7 @@ func wslInnerToken(arg string) string {
 	return `"$(echo ` + encoded + ` | base64 -d)"`
 }
 
-// wslNativeCommand 在 WSL 内经一条自包含 shell 脚本启动原生 CLI（codex / claude）。
+// wslNativeCommand 在 WSL 内经一条自包含 shell 脚本启动原生 CLI（codex / claude / opencode）。
 //
 // 形态为 `wsl.exe -d <distro> -- sh -c <base64脚本>`：`--` 让默认 shell（zsh）重展开
 // 那一个 base64 token（命令替换还原出脚本；不能用 `-e`——它会按空格把 -c 的实参在进 sh
@@ -193,7 +194,9 @@ func (r *wslAgentRunner) wslNativeCommand(ctx context.Context, cli string, args 
 	}
 	script := r.wslPathPrefix()
 	if linuxWorkDir != "" {
-		script += "; cd " + wslInnerToken(linuxWorkDir)
+		// cd 失败必须中止：否则 CLI 会带着会话权限在 WSL 家目录里跑起来，
+		// 把“项目目录不存在”变成“在错误目录里读/写文件”（与 SSH 路径同一条）。
+		script += "; cd " + wslInnerToken(linuxWorkDir) + " || exit 1"
 	}
 	asm := strings.Join(tokens, " ")
 	script += "; exec " + cli
@@ -214,14 +217,102 @@ func (r *wslAgentRunner) wslNativeCommand(ctx context.Context, cli string, args 
 	return cmd
 }
 
-// wslAgentRun 执行 Claude 或 Codex 的一次性会话（非流式 CLI Run）。
+// wslAgentRun 执行 Claude、Codex 或 OpenCode 的一次性会话（非流式 CLI Run）。
 func wslAgentRun(ctx context.Context, r *wslAgentRunner, request AgentRunRequest, sink AgentRunSink) error {
 	linuxWorkDir := r.wslLinuxWorkDir(request.ProjectPath)
 
 	if request.AgentID == "codex" {
 		return r.runCodexOnce(ctx, request, sink, linuxWorkDir)
 	}
+	if request.AgentID == "opencode" {
+		return r.runOpenCodeOnce(ctx, request, sink, linuxWorkDir)
+	}
 	return r.runClaudeOnce(ctx, request, sink, linuxWorkDir)
+}
+
+// runOpenCodeOnce 在 WSL 内执行一轮 OpenCode。事件解析复用本机 runner 的实现；
+// 这里只负责把进程放进 WSL、把 OPENCODE_* 环境经 WSLENV 透传进去。
+func (r *wslAgentRunner) runOpenCodeOnce(ctx context.Context, request AgentRunRequest, sink AgentRunSink, linuxWorkDir string) error {
+	args, err := opencodeExecArgs(request)
+	if err != nil {
+		return err
+	}
+	// 必须带 os.Environ()：wsl.exe 的 cmd.Env 一旦非 nil 就会整体替换进程环境，
+	// 只给 OPENCODE_* 会连同 SystemRoot/PATH 一起丢掉。
+	environment, err := opencodeProcessEnvironment(request, "")
+	if err != nil {
+		return err
+	}
+	cmd := r.wslNativeCommand(ctx, "opencode", args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("open OpenCode stdin (wsl): %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("open OpenCode stdout (wsl): %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("open OpenCode stderr (wsl): %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start OpenCode (wsl): %w", err)
+	}
+	promptErr := writeOpenCodePrompt(stdin, request.Prompt)
+
+	completion := newOpenCodeCompletion()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		closePipes := func() {
+			_ = stdout.Close()
+			_ = stderr.Close()
+		}
+		select {
+		case <-ctx.Done():
+			terminateProcessGroup(cmd)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				forceTerminateProcessGroup(cmd)
+				closePipes()
+			}
+		case <-completion.done:
+			terminateProcessGroup(cmd)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				forceTerminateProcessGroup(cmd)
+				closePipes()
+			}
+		case <-done:
+		}
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); readOpenCodeJSONL(stdout, sink, completion) }()
+	go func() { defer wg.Done(); readOpenCodeStderr(stderr, sink, completion) }()
+	wg.Wait()
+	err = cmd.Wait()
+	if completion.finished() {
+		if failure := completion.failure(); failure != nil {
+			return failure
+		}
+		if writeErr := waitOpenCodePrompt(promptErr); writeErr != nil {
+			return fmt.Errorf("写入 OpenCode 提示词失败：%w", writeErr)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf(opencodeExitPrefix+"%w", err)
+	}
+	if writeErr := waitOpenCodePrompt(promptErr); writeErr != nil {
+		return fmt.Errorf("写入 OpenCode 提示词失败：%w", writeErr)
+	}
+	return nil
 }
 
 // runClaudeOnce 在 WSL 内执行一次性 claude Run。

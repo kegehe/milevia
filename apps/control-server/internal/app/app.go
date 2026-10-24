@@ -39,6 +39,8 @@ type Config struct {
 	AllowedRoot                   string
 	ClaudePath                    string
 	CodexPath                     string
+	OpenCodePath                  string
+	OpenCodeGitBashPath           string
 	PermissionMode                string
 	ControlURL                    string
 	RemoteAgentToken              string
@@ -154,6 +156,10 @@ func ConfigFromEnv() Config {
 	if claudePath == "" {
 		claudePath = "claude"
 	}
+	openCodePath := strings.TrimSpace(os.Getenv("AUTO_OPENCODE_PATH"))
+	if openCodePath == "" {
+		openCodePath = "opencode"
+	}
 	return Config{
 		DatabasePath:                  db,
 		DataDir:                       dataDir,
@@ -161,6 +167,8 @@ func ConfigFromEnv() Config {
 		AllowedRoot:                   root,
 		ClaudePath:                    claudePath,
 		CodexPath:                     codexPath,
+		OpenCodePath:                  openCodePath,
+		OpenCodeGitBashPath:           strings.TrimSpace(os.Getenv("AUTO_OPENCODE_GIT_BASH_PATH")),
 		PermissionMode:                mode,
 		ControlURL:                    controlURL,
 		RemoteAgentToken:              os.Getenv("AUTO_REMOTE_AGENT_TOKEN"),
@@ -279,6 +287,9 @@ type Server struct {
 	runner          AgentRunner
 	codexRunner     AgentRunner
 	codebuddyRunner AgentRunner
+	qoderRunner     AgentRunner
+	opencodeRunner  AgentRunner
+	cursorRunner    AgentRunner
 	windowsRunner   AgentRunner
 	wslRunner       AgentRunner // Windows 服务端下跨到 WSL 侧的 runner；无 WSL 时为 nil
 	wslDistro       string      // 探测到的默认 WSL 发行版名；空表示无 WSL
@@ -307,6 +318,12 @@ type Server struct {
 	// `&Server{...}` 字面量，不能要求它们先建 map。
 	agentReadingsMu sync.Mutex
 	agentReadings   map[string]agentReading
+
+	// 登录态读数缓存（按 runner+agent 一条，见 agent_auth.go）。与上面两份同一条
+	// 纪律：只活在内存里、懒初始化（测试夹具大量使用 &Server{...} 字面量）。
+	agentAuthMu      sync.Mutex
+	agentAuths       map[agentAuthKey]agentAuthReading
+	agentAuthFlights map[agentAuthKey]*agentAuthFlight
 	// remoteAgentProbeActive keeps remote snapshots from piling up goroutines
 	// that only wait on the same WSL/SSH probe round. A failed cold probe gets
 	// a short retry delay so rendering its terminal state does not immediately
@@ -863,8 +880,11 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	}
 	codexRunner := newCodexCLIRunner(config, paths)
 	codebuddyRunner := newCodebuddyManageRunner(config, paths)
+	qoderRunner := newQoderManageRunner(config, paths)
+	opencodeRunner := newOpenCodeManageRunner(config, paths)
+	cursorRunner := newCursorCLIRunner(config, paths)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, gitIndexLocks: map[string]*sync.Mutex{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, qoderRunner: qoderRunner, opencodeRunner: opencodeRunner, cursorRunner: cursorRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, gitIndexLocks: map[string]*sync.Mutex{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -1004,6 +1024,12 @@ func (s *Server) Close() {
 		}
 		for _, session := range sessions {
 			session.Stop()
+		}
+		// 长驻登录进程（Qoder）也要收掉：Windows 上父进程退出不会带走子进程，
+		// 留下一个还在等浏览器授权的 node 进程，既占资源又会让下一次登录撞上
+		// "已经有一次在进行中"的假象。
+		if stopper, ok := s.qoderRunner.(loginProcessStopper); ok {
+			stopper.stopLogin()
 		}
 		// No new orchestration worker may start once closing is set. Wait for
 		// existing workers before releasing their fenced leases to another server.
@@ -1252,20 +1278,24 @@ func (s *Server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	// Local Agent relay endpoints. 除 /api/remote/rpc 之外都只暴露控制类元数据；
-	// 那个端点提供**项目沙箱内**的文件读写、该仓库的 Git 操作，以及**会话控制**
-	// （停掉某条会话当前在跑的那一轮），全部复用既有 handler。
+	// 那个端点提供**项目沙箱内**的文件读写、该仓库的 Git 操作、**会话控制**
+	// （停掉某条会话当前在跑的那一轮）与**优化建议操作**（列表 / 扫描 / 复核 / 转任务 /
+	// 编辑 / 删除 / 不再提示 —— 烧的是电脑端的 AI 配额，名单见 remote_insights.go），
+	// 全部复用既有 handler。
 	// 前两类的路径一律经 Filesystem 的 resolvePath / resolveMutationPath /
 	// remotePathWithinRoot 与 Git 侧的 validateGitPath 校验，出不了项目根；
 	// 引用（ref / branch / startPoint）只能来自服务端列出的引用或严格校验的 SHA，
 	// 不接受任意 revision 表达式。第三类不吃路径参数：落点是 `/api/conversations/{id}/stop`，
 	// 而那个 id 只取自信封（见 remote_relay.go 的 relayScope 与 remote_conversation.go），
-	// 调用方无法把它指向别的路由。**不提供任何 Shell、命令执行、任意 `git` 子命令
-	// 或任意 URL 转发能力。**
+	// 调用方无法把它指向别的路由。第四类（优化建议）落点固定在 `/insights*` 之下，
+	// 唯一的路径参数 findingID 经 UUID 形状校验后才进 URL（见 relayPathParamValidators），
+	// 扫描 / 复核复用既有 handler 的互斥登记与配额预留。**不提供任何 Shell、命令执行、
+	// 任意 `git` 子命令或任意 URL 转发能力。**
 	//
-	// 它存在的理由是手机端要能查看/编辑项目文件、完成受控的 Git 操作、并把跑飞的一轮停下来，
-	// 而这条通道是唯一一条不把文件内容与 diff 落进云端库的路径 —— 详见 docs/40、docs/41、
-	// docs/46 与 remote_relay.go 顶部。改动这个命名空间的边界时，必须同时更新这段说明：
-	// 一句已经失实的"这里只有控制类元数据"比没有注释更危险。
+	// 它存在的理由是手机端要能查看/编辑项目文件、完成受控的 Git 操作、把跑飞的一轮停下来、
+	// 并处理优化建议，而这条通道是唯一一条不把文件内容与 diff 落进云端库的路径 ——
+	// 详见 docs/40、docs/41、docs/46 与 remote_relay.go 顶部。改动这个命名空间的边界时，
+	// 必须同时更新这段说明：一句已经失实的"这里只有控制类元数据"比没有注释更危险。
 	r.Route("/api/remote", func(remote chi.Router) {
 		remote.Use(s.remoteAgentOnly)
 		remote.Post("/credentials", s.updateRemoteCredentials)
@@ -3408,6 +3438,11 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("unsupported agent or execution policy"))
 		return
 	}
+	if entry, ok := agentByID(input.AgentID); !ok || !entry.RunnableInProject {
+		// 目录里已登记但平台还没实现会话的运行器，不能让它落进默认 Claude 分支。
+		writeError(w, http.StatusBadRequest, errors.New("该工具尚未接通项目会话"))
+		return
+	}
 	var projectRunner string
 	var projectPathForTarget string
 	if err := s.db.QueryRowContext(r.Context(), `select coalesce(nullif(runner_id,''),runner),path from projects where id=?`, projectID).Scan(&projectRunner, &projectPathForTarget); errors.Is(err, sql.ErrNoRows) {
@@ -3415,6 +3450,25 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Qoder 的会话面只在本机：它的可执行文件由控制服务这台机器的 PATH 解析。
+	// 远端 / WSL 项目在这里就拒绝 —— 否则用户会先建好一个会话、发第一条消息才拿到
+	// 503，而这在手机端尤其难看出原因。管理面（安装、版本、升级）仍走目录驱动的
+	// 跨端通道，所以工具页在那些机器上照样能装、能升级。
+	if input.AgentID == "qoder" && !isLocalRunnerID(projectRunner) {
+		writeError(w, http.StatusBadRequest, errors.New(qoderLocalOnlyMessage))
+		return
+	}
+	// CodeBuddy 同样只有本机会话面（见 codebuddyLocalOnlyMessage）。不在这里拦，
+	// 用户会先建好会话，发第一条消息时才拿到 503。
+	if input.AgentID == "codebuddy" && !isLocalRunnerID(projectRunner) {
+		writeError(w, http.StatusBadRequest, errors.New(codebuddyLocalOnlyMessage))
+		return
+	}
+	// Cursor 的会话面同样只在本机（可执行文件由控制服务的 PATH 解析）。
+	if input.AgentID == "cursor" && !isLocalRunnerID(projectRunner) {
+		writeError(w, http.StatusBadRequest, errors.New(cursorLocalOnlyMessage))
 		return
 	}
 	// Resolve profile metadata before the short write transaction below. Runner
@@ -5337,7 +5391,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			return existing, existing.RunID, record, http.StatusAccepted, nil
 		}
 	}
-	if admission.agentID == "claude-code" || admission.agentID == "codex" {
+	if admission.agentID == "claude-code" || admission.agentID == "codex" || admission.agentID == "opencode" || admission.agentID == "cursor" {
 		s.runnerMaintenanceMu.Lock()
 		defer s.runnerMaintenanceMu.Unlock()
 		if s.runnerUpdating[runnerAgentKey{runnerID: admission.runnerID, agentID: admission.agentID}] {
@@ -5487,7 +5541,45 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	switch {
 	case conversation.AgentID == "codebuddy":
 		// CodeBuddy 走本机独立 runner（StreamingAgentRunner，多回合流式会话）。
+		// 它的会话面只在本机：与 Qoder 同一条边界，不能拿本机 codebuddy 去跑
+		// 远端路径（否则会在错误的环境里读/写文件）。
+		if !isLocalRunnerID(projectRunner) {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New(codebuddyLocalOnlyMessage)
+		}
 		runnerObj = s.codebuddyRunner
+	case conversation.AgentID == "qoder":
+		// Qoder 同样走本机独立 runner。它的会话面就在控制服务这台机器上（路径解析器
+		// 查的是本机 PATH），因此 WSL / SSH 项目必须先如实拒绝 —— 不能拿本机的 qoder
+		// 去跑一个远端路径，那会把"跑错机器"显示成"任务失败"。
+		if !isLocalRunnerID(projectRunner) {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New(qoderLocalOnlyMessage)
+		}
+		runnerObj = s.qoderRunner
+	case conversation.AgentID == "cursor":
+		// Cursor 的会话面只在本机（路径解析器查的是控制服务的 PATH）。远端项目在
+		// 建会话时就被拦了；这里再守一次，防止旧会话或直接调用绕过那道检查。
+		if !isLocalRunnerID(projectRunner) {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New(cursorLocalOnlyMessage)
+		}
+		runnerObj = s.cursorRunner
+	case conversation.AgentID == "opencode" && isSSH:
+		r, ok := s.runnerRegistry.get(projectRunner)
+		if !ok {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("SSH 连接不可用，请重新连接后再试")
+		}
+		openCodeR, ok := r.(OpenCodeCapableRunner)
+		if !ok || !openCodeR.OpenCodeReady(ctx) {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New("远程服务器上 OpenCode 不可用或未登录")
+		}
+		runnerObj = r
+	case conversation.AgentID == "opencode":
+		if target == agentTargetEnvWindows && runtime.GOOS != "windows" {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New(opencodeWindowsBridgeMessage)
+		}
+		if !s.opencodeReadyForTarget(ctx, target) {
+			return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "OpenCode")
+		}
+		runnerObj = s.opencodeRunnerFor(target)
 	case conversation.AgentID == "codex" && isSSH:
 		r, ok := s.runnerRegistry.get(projectRunner)
 		if !ok {
@@ -5533,12 +5625,18 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Claude Code")
 	}
 	if conversation.AgentID == "codebuddy" && !runnerObj.Ready(ctx) {
-		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "CodeBuddy Code")
+		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "CodeBuddy")
+	}
+	if conversation.AgentID == "qoder" && !runnerObj.Ready(ctx) {
+		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Qoder CLI")
+	}
+	if conversation.AgentID == "cursor" && !runnerObj.Ready(ctx) {
+		return Message{}, "", nil, http.StatusServiceUnavailable, agentTargetEnvUnavailable(target, "Cursor CLI")
 	}
 	streamingRunner, streaming := runnerObj.(StreamingAgentRunner)
-	// Codex runs one-shot turns (non-streaming) even on SSH runners, which
-	// otherwise implement StreamingAgentRunner for Claude Code.
-	if conversation.AgentID == "codex" {
+	// Codex/OpenCode/Cursor run one-shot turns (non-streaming) even on SSH runners,
+	// which otherwise implement StreamingAgentRunner for Claude Code.
+	if conversation.AgentID == "codex" || conversation.AgentID == "opencode" || conversation.AgentID == "cursor" {
 		streaming = false
 		streamingRunner = nil
 	}
@@ -6168,7 +6266,43 @@ func (s *Server) waitForStreamingSessionExit(managed *activeAgentSession) bool {
 	}
 }
 
+// refreshConversationForRun reloads the fields that decide native-session resume.
+// It intentionally leaves process-local markers (Handoff/PendingContextRebuild)
+// untouched. A read failure keeps the snapshot: the run can still proceed, and the
+// missing refresh is logged rather than turning a transient DB error into a failed run.
+//
+// Handoff runs force read_only in memory before admission (startMessage) without
+// persisting it. Reloading the persisted policy would hand a summary run the user's
+// workspace_write/full_control, so that override stays on the admission snapshot.
+func (s *Server) refreshConversationForRun(ctx context.Context, c Conversation) Conversation {
+	var projectID, agentID, agentSessionID, claudeSessionID, executionPolicy, permissionMode, modelOverride string
+	var agentInitialized, claudeInitialized bool
+	err := s.db.QueryRowContext(ctx, `select project_id,agent_id,coalesce(agent_session_id,''),coalesce(claude_session_id,''),coalesce(execution_policy,''),coalesce(permission_mode,''),coalesce(model_override,''),coalesce(agent_initialized,0),coalesce(claude_initialized,0) from conversations where id=?`, c.ID).Scan(
+		&projectID, &agentID, &agentSessionID, &claudeSessionID, &executionPolicy, &permissionMode, &modelOverride, &agentInitialized, &claudeInitialized,
+	)
+	if err != nil {
+		log.Printf("[run] refresh conversation %s before agent run: %v", c.ID, err)
+		return c
+	}
+	c.ProjectID = projectID
+	c.AgentID = agentID
+	c.AgentSessionID = agentSessionID
+	c.ClaudeSessionID = claudeSessionID
+	if !c.Handoff {
+		c.ExecutionPolicy = executionPolicy
+		c.PermissionMode = permissionMode
+	}
+	c.ModelOverride = modelOverride
+	c.AgentInitialized = agentInitialized
+	c.ClaudeInitialized = claudeInitialized
+	return c
+}
+
 func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runToken string, c Conversation, profile *AgentRuntimeProfile, runnerID, projectPath, prompt string) {
+	// Queued non-streaming runs snapshot the Conversation at admission. A previous
+	// turn may have initialized the native session in the meantime; use the current
+	// row so the next turn resumes that session instead of silently starting a new one.
+	c = s.refreshConversationForRun(ctx, c)
 	injection := mcpInjection{}
 	if !c.Handoff {
 		injection = s.prepareMCPInjection(ctx, c.ProjectID, projectPath, c.AgentID, runnerID, runID)
@@ -6204,6 +6338,7 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		StrictMCP:           injection.Strict,
 		MCPEnv:              injection.Env,
 		CodexMCPArgs:        injection.CodexArgs,
+		OpenCodeConfig:      injection.OpenCodeConfig,
 		MCPAutoApproveTools: injection.AutoApproveTools,
 	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, projectID: c.ProjectID, agentID: c.AgentID})
 	status := "completed"
@@ -6370,7 +6505,7 @@ func (sink *agentRunSink) Event(eventType string, payload json.RawMessage) {
 	// 的唯一完整来源，而每次真实运行本来就会产生一条。只认 system 事件，避免在每条
 	// 事件上白付一次反序列化。
 	if eventType == "system" {
-		sink.server.observeCommandCatalog(sink.projectID, payload)
+		sink.server.observeCommandCatalog(sink.projectID, sink.agentID, payload)
 	}
 }
 
@@ -6402,12 +6537,29 @@ func (sink *agentRunSink) SessionIdentified(sessionID string) {
 	if sessionID == "" {
 		return
 	}
-	_, _ = sink.server.db.ExecContext(context.Background(), `update conversations set agent_session_id=?,claude_session_id=case when agent_id='claude-code' then ? else claude_session_id end where id=?`, sessionID, sessionID, sink.conversationID)
-	_, _ = sink.server.db.ExecContext(context.Background(), `update runs set agent_run_id=? where id=?`, sessionID, sink.runID)
+	tx, err := sink.server.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		log.Printf("[run] start agent session transaction for run %s: %v", sink.runID, err)
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck // harmless after commit; cleans up error paths
+	if _, err := tx.ExecContext(context.Background(), `update conversations set agent_session_id=?,claude_session_id=case when agent_id='claude-code' then ? else claude_session_id end where id=?`, sessionID, sessionID, sink.conversationID); err != nil {
+		log.Printf("[run] persist agent session for run %s: %v", sink.runID, err)
+		return
+	}
+	if _, err := tx.ExecContext(context.Background(), `update runs set agent_run_id=? where id=?`, sessionID, sink.runID); err != nil {
+		log.Printf("[run] persist agent run id for run %s: %v", sink.runID, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[run] commit agent session for run %s: %v", sink.runID, err)
+	}
 }
 
 func (sink *agentRunSink) SessionInitialized() {
-	_, _ = sink.server.db.ExecContext(context.Background(), `update conversations set agent_initialized=true,claude_initialized=case when agent_id='claude-code' then true else claude_initialized end where id=?`, sink.conversationID)
+	if _, err := sink.server.db.ExecContext(context.Background(), `update conversations set agent_initialized=true,claude_initialized=case when agent_id='claude-code' then true else claude_initialized end where id=?`, sink.conversationID); err != nil {
+		log.Printf("[run] persist agent initialized for run %s: %v", sink.runID, err)
+	}
 }
 
 func (sink *agentRunSink) TurnStarted() {
@@ -7722,7 +7874,8 @@ func containsChinese(value string) bool {
 
 func containsUntranslatedEnglish(value string) bool {
 	allowed := map[string]bool{
-		"AI": true, "API": true, "CLI": true, "Codex": true, "Claude": true,
+		"AI": true, "API": true, "CLI": true, "Code": true, "CodeBuddy": true, "Codex": true, "Claude": true, "Cursor": true,
+		"MCP": true, "Node": true, "OpenCode": true, "Qoder": true, "Windows": true, "npm": true,
 		"Git": true, "HTTP": true, "ID": true, "JSON": true, "NUL": true,
 		"SSH": true, "URL": true, "WSL": true,
 	}
@@ -8919,6 +9072,11 @@ func (s *Server) performAgentUpdate(ctx context.Context, runnerID, agentID strin
 	previous, current, err := runner.Update(ctx)
 	if err == nil {
 		return previous, current, nil
+	}
+	// 原生分发的工具（官方安装器）不经过 npm 编排：repairAgentViaNpm 会去确认一个
+	// 不存在的 npm 包，报出的"已改用平台 npm 原地重装"也是假的。原样报出 CLI 的错误。
+	if entry, ok := agentByID(agentID); ok && entry.InstallKind != InstallKindNpmGlobal {
+		return previous, "", err
 	}
 	// 只有**本机**才尝试接手：跨端的 npm 在哪、装到哪个 prefix 由目标环境自己报
 	// （installAgentCLICross），本机这套在那边不成立。这一档原样报出 CLI 的错，

@@ -1,168 +1,173 @@
-# 生成 Milevia 品牌安装向导横幅(NSIS/WiX), 延续品牌配色(深绿底 #19332C + 亮绿 #C8E85A)。
-# 4x 超采样保证质量; 中文强制微软雅黑避免乱码。
-from PIL import Image, ImageDraw, ImageFont
-import os, re
+# -*- coding: utf-8 -*-
+# 生成 Milevia 品牌安装向导图 (C2 终端开发者风, 2026-10-21 定稿)。
+# 设计: 深色网格底 + 真实应用图标(亮绿描边) + 终端卡片 $ milevia init。
+# 管线: HTML @4x -> Playwright 截图 -> LANCZOS 缩回逻辑尺寸 -> 24 位 BMP。
+# 依赖: PIL + playwright (本机 chromium-1169, 缺失时回落到 playwright 默认浏览器)。
+# 产物: src-tauri/icons/{nsis-sidebar,nsis-header,wix-banner}.bmp
+import base64
+import os
+import tempfile
 
-S = 4  # 超采样倍率 (侧边/背景图用较高)
+try:
+    from PIL import Image
+    from playwright.sync_api import sync_playwright
+except ImportError as exc:
+    raise SystemExit(f"缺少依赖: {exc} —— 请在装有 Pillow + playwright 的 Python 环境运行本脚本")
 
-# ── 渐变背景 (垂直: 顶部深 → 中部品牌深绿 → 底部略亮) ──
-def _gradient(w4, h4, top, mid, bot):
-    img = Image.new("RGB", (w4, h4))
-    d = ImageDraw.Draw(img)
-    for y in range(h4):
-        t = y / max(1, h4 - 1)
-        if t < 0.5:
-            f = t / max(0.001, 0.5)
-            c = tuple(int(top[i] + (mid[i] - top[i]) * f) for i in range(3))
-        else:
-            f = (t - 0.5) / 0.5
-            c = tuple(int(mid[i] + (bot[i] - mid[i]) * f) for i in range(3))
-        d.line([0, y, w4, y], fill=c)
-    return img
+HERE = os.path.dirname(os.path.abspath(__file__))
+ICONS = os.path.join(HERE, "..", "src-tauri", "icons")
 
-# 圆角矩形 (NSIS 展示为直角, 圆角在整幅图里不显形, 故徽标用直角圆即可)
-def _rounded(d, box, r, fill, outline=None, width=1):
-    x0, y0, x1, y1 = box
-    d.rectangle(box, fill=fill, outline=outline, width=width)
+# ── 品牌色 (采样自 icons/icon.png) ──
+DEEP_BG = "#0c1512"        # 侧边栏底色
+DEEP_BAR = "#0e1a15"       # 顶栏/横幅底色
+LIME = "#c8e85a"           # 亮绿 (品牌 M 色)
+GREY = "#5c766a"           # 注脚灰绿
+RING = "box-shadow:0 0 0 1px rgba(200,232,90,.28),0 2px 8px rgba(0,0,0,.5)"
 
-# 精致的 logo 徽标: 圆角浅色底 + 居中亮绿 M
-def draw_badge(d, cx, cy, wx, hx, px_scale):
-    x0, y0 = int(cx - wx/2), int(cy - hx/2)
-    x1, y1 = int(cx + wx/2), int(cy + hx/2)
-    # 白色/极浅描边徽标底
-    _rounded(d, (x0, y0, x1, y1), r=int(16*px_scale), fill=(245, 250, 245), outline=(205, 225, 205), width=int(1*px_scale))
-    # 内部 M logo (深绿, 非亮绿, 徽标白底配深绿字更像正式品牌)
-    mw, mh = int(wx*0.5), int(hx*0.55)
-    mw2 = mw * px_scale
-    lw = max(4, int(mw*0.18))
-    mx0 = cx - mw/2; my0 = cy - mh/2
-    pts = [(mx0, my0+mh), (mx0, my0), (mx0+mw*0.52, my0+mh), (mx0+mw, my0), (mx0+mw, my0+mh)]
-    d.line(pts, fill=DEEP_X, width=lw, joint="curve")
+FONT_UI = "'Segoe UI','Microsoft YaHei',sans-serif"
+FONT_MONO = "Consolas,'Microsoft YaHei',monospace"
+INFO_LINES = ["Claude Code / Codex", "本地 / WSL / SSH", "一步接入 AI 开发"]
+GRID = (
+    "background-image:"
+    "radial-gradient(140% 60% at 50% 0%,rgba(200,232,90,.07),transparent 60%),"
+    "linear-gradient(rgba(200,232,90,.045) 1px,transparent 1px),"
+    "linear-gradient(90deg,rgba(200,232,90,.045) 1px,transparent 1px);"
+    "background-size:100% 100%,22px 22px,22px 22px"
+)
 
-# 文字带轻微投影提升层次
-def shadow_cx(d, cx, y, s, px, fill, dx=0, dy=2):
-    text_cx(d, cx+dx, y+dy, s, px, (0, 0, 0, 40) if fill==WHITE else (0,0,0,30))
-    text_cx(d, cx, y, s, px, fill)
+_icon_path = os.path.join(ICONS, "icon.png")
+if not os.path.exists(_icon_path):
+    raise SystemExit(f"找不到 {_icon_path} —— 请先准备应用图标 icon.png 再生成本安装图")
+with open(_icon_path, "rb") as f:
+    ICON_B64 = "data:image/png;base64," + base64.b64encode(f.read()).decode()
 
-DEEP   = (25, 51, 44)     # 主背景
-DEEP_X = (20, 42, 37)     # 深色(徽标里的 M / 强调)
-DEEP2  = (31, 60, 53)     # 视觉分区
-LIGHT  = (200, 232, 90)   # 亮绿(logo / 强调)
-WHITE  = (255, 255, 255)
-GREY   = (190, 208, 201)  # 次级文字
 
-OUT = os.path.join(os.path.dirname(__file__), "..", "src-tauri", "icons")
-os.makedirs(OUT, exist_ok=True)
+def _stage(inner, w, h, z):
+    return (
+        f'<div class="stagewrap" style="width:{w * z}px;height:{h * z}px">'
+        f'<div style="width:{w}px;height:{h}px;transform:scale({z});transform-origin:0 0">{inner}</div></div>'
+    )
 
-_CJK = re.compile(r'[\u3000-\u303f\u4e00-\u9fff\uac00-\ud7af\u3040-\u30ff]')
 
-def font(px, text):
-    has_cjk = bool(_CJK.search(text))
-    for p in (r"C:/Windows/Fonts/msyhbd.ttc" if has_cjk else r"C:/Windows/Fonts/seguib.ttf",
-              r"C:/Windows/Fonts/msyh.ttc" if has_cjk else r"C:/Windows/Fonts/segoeui.ttf",
-              r"C:/Windows/Fonts/arialbd.ttf", r"C:/Windows/Fonts/arial.ttf"):
-        if os.path.exists(p):
-            try: return ImageFont.truetype(p, px)
-            except Exception: pass
-    return ImageFont.load_default()
+def _icon(size, radius):
+    return f'<img src="{ICON_B64}" style="width:{size}px;height:{size}px;border-radius:{radius}px;{RING}">'
 
-# 画 Milevia 的 M 形折线 logo(亮绿)。
-def draw_logo(d, cx, cy, px_scale):
-    w, h = 34 * px_scale, 48 * px_scale
-    lw = max(4, int(6 * px_scale))
-    x0, y0 = cx - w / 2, cy - h / 2
-    pts = [(x0, y0 + h), (x0, y0), (x0 + w * 0.52, y0 + h), (x0 + w, y0), (x0 + w, y0 + h)]
-    d.line(pts, fill=LIGHT, width=lw, joint="curve")
 
-def text_at(d, x, y, s, px, fill):
-    f = font(px, s)
-    b = d.textbbox((0, 0), s, font=f)
-    d.text((x - b[0], y - b[1]), s, font=f, fill=fill)
+# ── NSIS 侧边栏 164x314 ──
+def _sidebar():
+    def ln(inner):
+        return f'<div style="line-height:2.05">{inner}</div>'
 
-def text_cx(d, cx, y, s, px, fill):
-    f = font(px, s)
-    b = d.textbbox((0, 0), s, font=f)
-    d.text((cx - (b[2] - b[0]) / 2 - b[0], y - b[1]), s, font=f, fill=fill)
+    body = (
+        ln(f'<span style="color:{LIME}">$ milevia init</span>')
+        + "".join(
+            ln(f'<span style="color:#8fb3a4">&#10003;</span> <span style="color:#bccfc5">{t}</span>')
+            for t in INFO_LINES
+        )
+        + ln(f'<span style="display:inline-block;width:6px;height:11px;background:{LIME};vertical-align:-1px"></span>')
+    )
+    dots = "".join(
+        f'<span style="width:7px;height:7px;border-radius:50%;background:{c};display:inline-block"></span>'
+        for c in ("#e2695c", "#e2b45c", "#9cc260")
+    )
+    return f"""
+<div style="width:164px;height:314px;position:relative;overflow:hidden;font-family:{FONT_MONO};
+  background:{DEEP_BG};{GRID}">
+  <div style="position:absolute;right:-18px;bottom:-38px;font-family:{FONT_UI};font-weight:800;
+    font-size:104px;line-height:1;color:rgba(200,232,90,.055);letter-spacing:-4px">Mi</div>
+  <div style="position:relative;display:flex;align-items:center;gap:9px;padding:19px 15px 0">
+    {_icon(34, 9)}
+    <span style="font-size:15px;font-weight:700;color:#fff;letter-spacing:.5px">milevia</span>
+  </div>
+  <div style="position:relative;margin:16px 14px 0;background:#15221d;border:1px solid #2a423a;
+    border-radius:9px;overflow:hidden;box-shadow:0 6px 18px rgba(0,0,0,.35)">
+    <div style="height:21px;background:#1b2b25;display:flex;align-items:center;gap:5px;padding:0 9px;box-sizing:border-box">
+      {dots}
+      <span style="margin-left:auto;font-size:7px;color:{GREY};letter-spacing:1px">安装向导</span>
+    </div>
+    <div style="padding:10px 11px 12px;font-size:9px;color:#bccfc5">{body}</div>
+  </div>
+  <div style="position:absolute;bottom:14px;left:0;right:0;text-align:center;font-size:8.5px;letter-spacing:2px;color:{GREY}">milevia</div>
+</div>"""
 
-def canvas(w, h):
-    return Image.new("RGB", (w * S, h * S), DEEP)
 
-def finish(cv, w, h):
-    return cv.resize((w, h), Image.LANCZOS)
+# ── NSIS 顶栏 150x57 ──
+def _header():
+    return f"""
+<div style="width:150px;height:57px;display:flex;align-items:center;padding:0 10px;box-sizing:border-box;
+  font-family:{FONT_MONO};background:{DEEP_BAR};{GRID}">
+  {_icon(33, 8)}
+  <div style="display:flex;flex-direction:column;margin-left:9px">
+    <div style="font-size:15px;font-weight:700;color:#fff;letter-spacing:.5px">milevia<span style="display:inline-block;width:5px;height:11px;background:{LIME};margin-left:4px;vertical-align:-1px"></span></div>
+  </div>
+</div>"""
 
-def build(w, h, paint, gradient=False):
-    cv = _gradient(w * S, h * S, (16, 33, 29), DEEP, DEEP2) if gradient else canvas(w, h)
-    paint(ImageDraw.Draw(cv), cv.size, w, h)
-    return finish(cv, w, h)
 
-def save(img, name):
-    img.save(os.path.join(OUT, name))
+# ── WiX 横幅 493x58 ──
+def _wix_banner():
+    return f"""
+<div style="width:493px;height:58px;display:flex;align-items:center;padding:0 16px;box-sizing:border-box;
+  font-family:{FONT_MONO};background:{DEEP_BAR};{GRID}">
+  {_icon(40, 10)}
+  <div style="display:flex;align-items:baseline;margin-left:12px">
+    <span style="font-size:19px;font-weight:700;color:#fff;letter-spacing:.5px">milevia</span>
+  </div>
+  <div style="margin-left:auto;font-size:9px;color:{LIME};white-space:nowrap">$ milevia init</div>
+</div>"""
 
-# ── 1. NSIS sidebar 164x314: 渐变底, 居中徽标, 大标题, 信息区, 底部 ──
-def side(d, cv, W, H):
-    W4, H4 = cv
-    # 上部 logo 徽标(圆角底 + M)
-    draw_badge(d, W4/2, H4*0.13, int(W4*0.30), int(W4*0.30), S)
-    # 大标题
-    shadow_cx(d, W4/2, H4*0.24, "Milevia", 40*S, WHITE)
-    text_cx(d, W4/2, H4*0.325, "多项目 AI 开发平台", 13*S, LIGHT)
-    # 信息区: 简洁三行, 亮绿小圆点装饰
-    lines = ["支持 Claude Code / Codex", "本地 / WSL / SSH 项目", "一步接入 AI 开发"]
-    y0 = H4*0.47
-    for i, ln in enumerate(lines):
-        y = y0 + i*H4*0.07
-        # 小圆点
-        d.ellipse([W4*0.24, y-H4*0.012, W4*0.24+H4*0.014, y+H4*0.002], fill=LIGHT)
-        text_cx(d, W4/2 + W4*0.01, y - H4*0.03, ln, 10*S, GREY)
-    # 底部日志感分隔 + 小字
-    d.rectangle([int(W4*0.18), int(H4*0.87), int(W4*0.82), int(H4*0.87)+2*S], fill=LIGHT)
-    text_cx(d, W4/2, int(H4*0.905), "milevia", 11*S, GREY)
-save(build(164, 314, side, gradient=True), "nsis-sidebar.bmp")
-print("nsis-sidebar.bmp")
 
-# ── 2. NSIS header 150x57: 渐变底, 左徽标 + 大字 ──
-def hdr(d, cv, W, H):
-    W4, H4 = cv
-    draw_badge(d, W4*0.085, H4/2, int(H4*0.72), int(H4*0.72), S*0.55)
-    d.rectangle([int(W4*0.16), int(H4*0.2), int(W4*0.16)+2*S, int(H4*0.8)], fill=LIGHT)
-    text_at(d, W4*0.20, H4*0.28, "Milevia", 17*S, WHITE)
-    text_at(d, W4*0.20, H4*0.62, "多项目 AI 开发", 6*S, GREY)
-save(build(150, 57, hdr, gradient=True), "nsis-header.bmp")
-print("nsis-header.bmp")
+def _render(shots):
+    """shots: [(name, html, logical_w, logical_h, zoom), ...] -> {name: PIL.Image}"""
+    out = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        html_path = os.path.join(tmp, "banners.html")
+        raw_path = os.path.join(tmp, "raw.png")
+        y = 0
+        marks = []
+        for name, html, w, h, z in shots:
+            marks.append((name, y, w * z, h * z, w, h))
+            y += h * z
+        body = "".join(_stage(s[1], s[2], s[3], s[4]) for s in shots)
+        page = (
+            '<!DOCTYPE html><html><head><meta charset="utf-8"><style>'
+            "body{margin:0;background:#fff}img{display:block}"
+            ".stagewrap{position:relative;overflow:hidden}"
+            "</style></head><body>" + body + "</body></html>"
+        )
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(page)
+        with sync_playwright() as p:
+            exe = os.path.expandvars(
+                r"%LOCALAPPDATA%\ms-playwright\chromium-1169\chrome-win\chrome.exe")
+            kwargs = {"executable_path": exe} if os.path.exists(exe) else {}
+            browser = p.chromium.launch(**kwargs)
+            pg = browser.new_page(
+                viewport={"width": max(s[2] * s[4] for s in shots), "height": 1400},
+                device_scale_factor=1,
+            )
+            pg.goto("file:///" + html_path.replace("\\", "/"))
+            pg.wait_for_timeout(400)
+            pg.screenshot(path=raw_path, full_page=True)
+            browser.close()
+        raw = Image.open(raw_path)
+        for name, oy, w, h, lw, lh in marks:
+            out[name] = raw.crop((0, oy, w, oy + h)).resize((lw, lh), Image.LANCZOS)
+    return out
 
-# ── 3. WiX banner 493x58: 渐变底, 左徽标 + 居中大字 ──
-def wb(d, cv, W, H):
-    W4, H4 = cv
-    draw_badge(d, W4*0.034, H4/2, int(H4*0.78), int(H4*0.78), S*0.6)
-    d.rectangle([int(W4*0.058), int(H4*0.18), int(W4*0.058)+3*S, int(H4*0.82)], fill=LIGHT)
-    text_cx(d, W4*0.54, H4*0.30, "Milevia", 24*S, WHITE)
-    text_cx(d, W4*0.54, H4*0.66, "多项目 AI 开发平台", 8*S, LIGHT)
-save(build(493, 58, wb, gradient=True), "wix-banner.bmp")
-print("wix-banner.bmp")
 
-# ── 4. WiX background 493x312: 左 logo+大字, 右信息区 ──
-def wbg(d, cv, W, H):
-    W4, H4 = cv
-    draw_logo(d, W4 * 0.08, H4 * 0.22, 1.3 * S)
-    text_at(d, W4 * 0.14, H4 * 0.13, "Milevia", 34 * S, WHITE)
-    text_at(d, W4 * 0.14, H4 * 0.30, "多项目 AI 自动开发平台", 11 * S, LIGHT)
-    text_at(d, W4 * 0.14, H4 * 0.39, "Claude Code / Codex 驱动的", 8 * S, GREY)
-    text_at(d, W4 * 0.14, H4 * 0.46, "持续 AI 开发", 8 * S, GREY)
-    x0 = int(W4 * 0.63)
-    x1 = int(W4 * 0.97)
-    d.rectangle([x0, int(H4*0.06), x1, int(H4*0.94)], outline=LIGHT, width=2*S)
-    # 内部渐变(垂直深→更深)
-    top, bot = int(H4*0.06), int(H4*0.94)
-    n = 50
-    for i in range(n):
-        t = i / max(1, n-1)
-        c = (int(25 + 3*t), int(51 + 8*t), int(44 + 5*t))
-        y = top + int((bot-top)*i/n)
-        d.line([x0+2*S, y, x1-2*S, y], fill=c)
-    draw_logo(d, x0 + (x1-x0)//2, int(H4*0.5), 0.8*S)
-    text_cx(d, x0+(x1-x0)//2, int(H4*0.68), "MILEVIA", 10*S, WHITE)
-    text_cx(d, x0+(x1-x0)//2, int(H4*0.78), "欢迎使用", 9*S, LIGHT)
-save(build(493, 312, wbg), "wix-background.bmp")
-print("wix-background.bmp")
+def main():
+    shots = [
+        ("nsis-sidebar", _sidebar(), 164, 314, 4),
+        ("nsis-header", _header(), 150, 57, 4),
+        ("wix-banner", _wix_banner(), 493, 58, 2),
+    ]
+    images = _render(shots)
+    for name, img in images.items():
+        dst = os.path.join(ICONS, name + ".bmp")
+        img.convert("RGB").save(dst)
+        check = Image.open(dst)
+        print(f"{name}.bmp  {check.size}  mode={check.mode}  -> {dst}")
 
-print("done ->", os.path.abspath(OUT))
+
+if __name__ == "__main__":
+    main()

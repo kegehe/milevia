@@ -671,8 +671,11 @@ var slashCommandsMarker = []byte(`"slash_commands"`)
 // 这是目录的常态来源：项目跑过一次之后就再也不用起探针。所有 runner（本机 / WSL /
 // SSH 长驻会话）的事件都汇聚到 agentRunSink.Event，因此这里能覆盖全部环境。
 // 调用点在事件热路径上，故先做一次零成本的字节子串判断再反序列化。
-func (s *Server) observeCommandCatalog(projectID string, payload json.RawMessage) {
-	if projectID == "" || !bytes.Contains(payload, slashCommandsMarker) {
+func (s *Server) observeCommandCatalog(projectID, agentID string, payload json.RawMessage) {
+	// 缓存只有**一个槽位**，且 /commands 的探针与服务对象都是 Claude Code。
+	// Qoder / CodeBuddy 的 init 帧同样带 slash_commands；照收会把它们的命令名
+	// 写进 Claude 的目录（还会互相覆盖）。在它们各自的目录接入前，只采 Claude 的观测。
+	if projectID == "" || agentID != "claude-code" || !bytes.Contains(payload, slashCommandsMarker) {
 		return
 	}
 	catalog, ok := parseClaudeCommandCatalog(payload)
@@ -701,7 +704,8 @@ func commandCatalogCacheKey(projectID, agentID string) string {
 // projectCommands 返回命令选择器需要的目录与来源说明。
 //
 // 查询参数：
-//   - agentId  默认 claude-code；codex 返回空目录（其 exec 路径不支持斜杠命令）
+//   - agentId  默认 claude-code；codex / qoder / opencode / codebuddy / cursor
+//     返回空目录（各自尚未接通独立的斜杠命令探测，不能拿 Claude 的目录冒充）。
 //   - refresh=1 忽略 TTL 重新探测（用户点"刷新"）
 //   - probe=0  不允许起探针：只用缓存/扫描/静态表。会话页加载时的徽标判定走这条，
 //     避免仅仅打开一个项目就拉起 CLI 进程。
@@ -716,10 +720,13 @@ func (s *Server) projectCommands(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// agentId 只区分 Codex 与"其余（= Claude）"。收敛成这两个取值再入缓存键，避免任意
-	// 查询串（?agentId=xxx）各占一条缓存、各拉起一次探针。
+	// agentId 只保留有独立语义的取值；其余（包括未识别的查询串）归一成 claude-code。
+	// CodeBuddy 不在这里回落到 Claude：它的探针/目录还没有接，回落会把 Claude 的命令名
+	// 当成 CodeBuddy 的能力展示出去（与 Qoder/OpenCode 同一取舍）。
 	agentID := strings.TrimSpace(r.URL.Query().Get("agentId"))
-	if agentID != "codex" {
+	switch agentID {
+	case "codex", "qoder", "opencode", "codebuddy", "cursor":
+	default:
 		agentID = "claude-code"
 	}
 	target := s.resolveAgentTargetEnv(project.Runner, project.Path)
@@ -736,6 +743,39 @@ func (s *Server) projectCommands(w http.ResponseWriter, r *http.Request) {
 		// 传给模型（实测）。因此不提供目录，只保留"自定义 shell 命令"这条路。
 		view.Source = "static"
 		view.Note = "Codex 在非交互模式下不支持斜杠命令，请使用自定义 shell 命令。"
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	if agentID == "qoder" {
+		// Qoder 的 init 帧确实自带 slash_commands，但这里没有等价于 Claude 的那条探测通道。
+		// **不**回落到 Claude 的目录：那会把 Claude 的命令名当成 Qoder 的展示出去
+		// （前者在 Qoder 里未必存在）。如实给空目录 + 说明。
+		view.Source = "static"
+		view.Note = "Qoder 的斜杠命令目录尚未接入；可直接输入内容，或使用自定义命令。"
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	if agentID == "opencode" {
+		// 同上：非交互 `run` 没有已校准的斜杠命令目录；回落到 Claude 会把另一套命令名
+		// 当成 OpenCode 的能力展示出去。目录里 SlashCommands=false，界面据此不显示选择器。
+		view.Source = "static"
+		view.Note = "OpenCode 的斜杠命令目录尚未接入；可直接输入内容，或使用自定义命令。"
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	if agentID == "codebuddy" {
+		// CodeBuddy 的 init 帧虽带 slash_commands，但这条通道还只服务 Claude；
+		// **不**回落到 Claude 的探针/静态表，避免把 Claude 的命令名当成 CodeBuddy 的。
+		view.Source = "static"
+		view.Note = "CodeBuddy 的斜杠命令目录尚未接入；可直接输入内容，或使用自定义命令。"
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	if agentID == "cursor" {
+		// 非交互的 print 模式没有已校准的斜杠命令目录；回落到 Claude 会把另一套命令名
+		// 当成 Cursor 的能力展示出去。目录里 SlashCommands=false，界面据此不显示选择器。
+		view.Source = "static"
+		view.Note = "Cursor CLI 的斜杠命令目录尚未接入；可直接输入内容，或使用自定义命令。"
 		writeJSON(w, http.StatusOK, view)
 		return
 	}

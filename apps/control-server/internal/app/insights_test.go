@@ -993,7 +993,7 @@ func TestTriggerInsightScanNormalizesInvalidDirection(t *testing.T) {
 	projectID := insightTestProject(t, server)
 	server.runner = &insightScriptRunner{outputs: []string{`[]`, `{"findings":[]}`}}
 	// 非法 theme 回退 ''；非法 type 丢弃；全选归全查（focus_types=''）。
-	body := strings.NewReader(`{"theme":"bogus","types":["bug","notAType","style","optimization","feature"]}`)
+	body := strings.NewReader(`{"theme":"bogus","types":["bug","notAType","style","optimization","feature","cleanup"]}`)
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/scan", body))
 	if rec.Code != http.StatusAccepted {
@@ -1036,7 +1036,7 @@ func TestNormalizeScanTypes(t *testing.T) {
 		t.Errorf("dedupe/filter: %v", got)
 	}
 	// 全选 → nil（全查）。
-	if got := normalizeScanTypes([]string{"bug", "style", "optimization", "feature"}); got != nil {
+	if got := normalizeScanTypes([]string{"bug", "style", "optimization", "feature", "cleanup"}); got != nil {
 		t.Errorf("full selection should be nil: %v", got)
 	}
 	if got := normalizeScanTypes(nil); got != nil {
@@ -2765,11 +2765,13 @@ func TestVerifyInsightFindingsSplitsLargeBatch(t *testing.T) {
 	if len(requests) != 2 {
 		t.Fatalf("agent runs: got %d want 2", len(requests))
 	}
-	firstNext := fmt.Sprintf("finding-%d", insightVerifyBatchSize)
-	if !strings.Contains(requests[0].Prompt, "finding-0") || strings.Contains(requests[0].Prompt, firstNext) {
+	// prompt 现在按批内序号 + title 呈现候选，不再回传随机 UUID；用 title 钉住批次边界。
+	firstTitle := `"title":"Finding 0"`
+	nextTitle := fmt.Sprintf(`"title":"Finding %d"`, insightVerifyBatchSize)
+	if !strings.Contains(requests[0].Prompt, firstTitle) || strings.Contains(requests[0].Prompt, nextTitle) {
 		t.Errorf("first prompt has wrong batch: %q", requests[0].Prompt)
 	}
-	if !strings.Contains(requests[1].Prompt, firstNext) || strings.Contains(requests[1].Prompt, "finding-0") {
+	if !strings.Contains(requests[1].Prompt, nextTitle) || strings.Contains(requests[1].Prompt, firstTitle) {
 		t.Errorf("second prompt has wrong batch: %q", requests[1].Prompt)
 	}
 }
@@ -3229,15 +3231,16 @@ func TestUpdateInsightFindingResetsVerification(t *testing.T) {
 func TestVerifyExistingPromptBuild(t *testing.T) {
 	f := InsightFinding{ID: "abc", Title: "列表加载很慢", Summary: "列表页打开要等好几秒", Type: insightBug, Severity: insightSeverityHigh, FileHint: "src/List.tsx"}
 	p := buildVerifyExistingPrompt("/x", "sha123", []InsightFinding{f})
-	if !strings.Contains(p, "列表加载很慢") || !strings.Contains(p, "abc") || !strings.Contains(p, "sha123") {
-		t.Errorf("prompt should carry finding id/title/repo sha, got:\n%s", p)
+	// 复核协议用批内序号，不再把随机 UUID 写进主 prompt；候选详情仍必须完整。
+	if !strings.Contains(p, "列表加载很慢") || !strings.Contains(p, `"index":1`) || !strings.Contains(p, "sha123") {
+		t.Errorf("prompt should carry finding index/title/repo sha, got:\n%s", p)
 	}
-	if !strings.Contains(p, `"status":"valid"`) || !strings.Contains(p, `"status":"uncertain"`) {
+	if !strings.Contains(p, `"status":"valid"`) || !strings.Contains(p, "uncertain:") {
 		t.Errorf("prompt should explain both verdicts, got:\n%s", p)
 	}
 	// 修正重试跑在全新 agent 会话里，必须自包含候选详情（不能只给 id）。
 	rp := buildVerifyExistingRepairPrompt("/x", []InsightFinding{f})
-	if !strings.Contains(rp, "列表加载很慢") || !strings.Contains(rp, "abc") || !strings.Contains(rp, "src/List.tsx") {
+	if !strings.Contains(rp, "列表加载很慢") || !strings.Contains(rp, `"index":1`) || !strings.Contains(rp, "src/List.tsx") {
 		t.Errorf("repair prompt must repeat full candidate details (new session has no context), got:\n%s", rp)
 	}
 }

@@ -52,6 +52,13 @@ type CodexCapableRunner interface {
 	CodexUpdate(context.Context) (previousVersion, currentVersion string, err error)
 }
 
+// OpenCodeCapableRunner 由能运行 OpenCode 的跨端 runner 实现（WSL / SSH）。
+// 本机 opencodeCLIRunner 直接实现 OpenCodeReady/OpenCodeVersion，因此也满足该接口。
+type OpenCodeCapableRunner interface {
+	OpenCodeReady(context.Context) bool
+	OpenCodeVersion(context.Context) string
+}
+
 // autoUpdateSupportedRunner 是可选接口：报告该 runner 是否支持"应用内自动升级"。
 // 未实现此接口的 runner 视为支持（默认 true）。跨端 runner（Windows→WSL 的
 // wslAgentRunner、WSL→Windows 的 windowsAgentRunner）暂不支持应用内自动升级，
@@ -116,8 +123,9 @@ type AgentRunRequest struct {
 	Resume         bool
 	RunID          string
 	RunToken       string
-	// AgentID identifies which CLI ("claude-code" or "codex") this run targets.
-	// SSH runners consult it to dispatch to the correct remote command.
+	// AgentID identifies which CLI this run targets. SSH/WSL runners consult it
+	// to dispatch to the correct remote command; unknown IDs must not silently
+	// fall back to Claude Code.
 	AgentID string
 	// Profile resolves baseUrl/managed-key injection for this run (and is the
 	// fallback source of the model, already folded into Model below).
@@ -163,6 +171,9 @@ type AgentRunRequest struct {
 	// MCPAutoApproveTools 是本次运行生效的自动放行模式，随 --settings 写进
 	// permissions.allow 作为兜底（真正的放行判定在 hook handler 内，见 docs/34 §8.4）。
 	MCPAutoApproveTools []string
+	// OpenCodeConfig 是 OpenCode 的 {"mcp":{...}} 内联配置，由 runner 写入
+	// OPENCODE_CONFIG_CONTENT。其他工具为空。
+	OpenCodeConfig string
 }
 
 type AgentRunSink interface {
@@ -550,7 +561,7 @@ func claudePackageVersion(packageDir string) (string, error) {
 }
 
 var claudeNpmCLIInstall = npmCLIInstall{
-	scope: "@anthropic-ai", packageName: "claude-code", commandName: "claude", binFile: "claude.exe",
+	scope: "@anthropic-ai", packageName: "claude-code", commandName: "claude", binPath: "bin/claude.exe",
 }
 
 func rollbackInterruptedNpmClaudeInstall(prefix, previous string) (string, error) {

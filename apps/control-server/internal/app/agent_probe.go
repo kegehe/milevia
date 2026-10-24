@@ -115,9 +115,10 @@ func (s *Server) probeAgent(ctx context.Context, meta RunnerMeta, entry AgentCat
 //
 // 分派的顺序与理由（这一处是"某工具在某条路径上莫名不可用"的高发地，所以写清楚）：
 //
-//	① 本机的 Codex / CodeBuddy 由各自独立的管理 runner 提供 —— 它们与注册表里那个
-//	   Claude runner **不是同一个进程面**（Codex 走一次性 exec、CodeBuddy 走
-//	   stream-json 会话）。这是结构差异，不是"哪个工具特殊"。
+//	① 本机的 Codex / CodeBuddy / Qoder / OpenCode / Cursor 由各自独立的管理 runner
+//	   提供 —— 它们与注册表里那个 Claude runner **不是同一个进程面**（Codex / OpenCode /
+//	   Cursor 走一次性 JSONL，CodeBuddy 与 Qoder 走 stream-json 会话）。这是结构差异，
+//	   不是"哪个工具特殊"。
 //	② Codex / Claude 这两个**真有额外语义**的走特化：
 //	   - Codex 的"就绪"要看登录态（`codex login status`），仅测能不能报版本会把
 //	     "装了但没登录"报成就绪；
@@ -139,6 +140,15 @@ func (s *Server) agentBackend(meta RunnerMeta, entry AgentCatalogEntry) (AgentRu
 		case "codebuddy":
 			// 本机 CodeBuddy 由独立的管理面 runner 提供。
 			return s.codebuddyRunner, ""
+		case "qoder":
+			// 本机 Qoder 由独立的管理面 runner 提供（同样是 stream-json 会话面）。
+			return s.qoderRunner, ""
+		case "opencode":
+			// OpenCode 是一次性 JSONL 回合（不是 stream-json 长驻会话）。
+			return s.opencodeRunner, ""
+		case "cursor":
+			// Cursor 同样是一次性 JSONL 回合（print 模式 + --resume）。
+			return s.cursorRunner, ""
 		}
 	}
 	runner, registered := s.runnerRegistry.get(meta.ID)
@@ -155,6 +165,12 @@ func (s *Server) agentBackend(meta RunnerMeta, entry AgentCatalogEntry) (AgentRu
 	case "claude-code":
 		// 注册表里这个 runner 本身就是 Claude 的执行面（跨端亦然）。
 		return runner, ""
+	}
+	if entry.ID == "cursor" {
+		// Cursor 的会话面只在本机（app.go 创建会话时同样拒绝非本机项目）。
+		// 探测必须与这条边界同源：否则远端会报 ready，新建会话给出一个
+		// 点了必失败的卡片，错误要等到提交后才由服务端说出。
+		return nil, cursorLocalOnlyMessage
 	}
 	if shell, ok := runner.(crossShellRunner); ok {
 		return &catalogAgentBackend{entry: entry, shell: shell}, ""

@@ -22,7 +22,7 @@ const ignoredCodexStderr = new Set(["Reading additional input from stdin..."]);
 // 别凭记忆补词，也别改断词规则：timeline.test.ts 里有用例直接从 app.go 读出这份表逐词
 // 比对，另有一条钉住数字/下划线紧邻的形态。
 const allowedTechnicalTerms = new Set([
-  "AI", "API", "CLI", "Codex", "Claude", "Git", "HTTP", "ID", "JSON", "NUL", "SSH", "URL", "WSL",
+  "AI", "API", "CLI", "Code", "CodeBuddy", "Codex", "Claude", "Cursor", "Git", "HTTP", "ID", "JSON", "MCP", "NUL", "Node", "OpenCode", "Qoder", "SSH", "URL", "WSL", "Windows", "npm",
 ]);
 
 // rawOutputTerms 在 app.go 那份之外多了三个词（NAT / localhost / wsl 小写），**只**用于

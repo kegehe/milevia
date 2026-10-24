@@ -1,15 +1,11 @@
 package app
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -57,6 +53,13 @@ func (r *codebuddyCLIRunner) codebuddyBinary() string {
 // 与 claudeExitPrefix / sshClaudeExitPrefix 同一条规矩，有测试守着
 // （TestSurfacesWithoutTaskLogsDoNotUseTheTaskFallback）。
 const codebuddyExitPrefix = "CodeBuddy 会话运行失败："
+
+// codebuddyLocalOnlyMessage 是"CodeBuddy 只在本机可用"的唯一说法。
+//
+// CodeBuddy 的会话面（可执行文件解析、cmd.Dir、MCP 配置落盘）都在控制服务这台机器上，
+// 没有 WSL / SSH 的跨端运行分支。若不拦，startMessage 会选本机 runner 去跑一个远端
+// 路径；创建会话与发送消息两处必须用同一句话拒绝，避免用户先建好一个用不了的会话。
+const codebuddyLocalOnlyMessage = "CodeBuddy 目前仅支持本机项目；WSL / SSH 项目请改用 Claude Code 或 Codex"
 
 // codebuddyCommand 把可执行文件与参数构造成 *exec.Cmd，兼容 Windows npm 的 .cmd shim
 // （与 codexCommandContext 同款：.cmd/.bat 需经 cmd.exe /d /c 启动）。
@@ -143,10 +146,16 @@ func (r *codebuddyCLIRunner) Login(parent context.Context) (agentLoginInfo, erro
 	return agentLoginInfo{}, nil
 }
 
-// LoginStatus 报告 CodeBuddy 是否已登录（阶段 2 的待校准接缝）。目前无法从命令行可靠
-// 区分，如实返回未登录，避免冒充。
-func (r *codebuddyCLIRunner) LoginStatus(parent context.Context) bool {
-	return false
+// LoginStatus 报告 CodeBuddy 是否已登录。
+//
+// 它**没有**可用的非交互登录态查询（官方没给 status 类命令），所以这一档永远是
+// unreadable 且不带 error —— 语义是"这个工具不能自报"，而不是"这次没读成"。
+//
+// ⚠️ 曾经这里返回 false，注释写的是"避免冒充已登录"。方向对，结论错：那个 false 会被
+// 界面念成"未登录"，于是一个明明登录着的用户每次打开面板都被说成未登录、再被指去登录。
+// 判断不了就该说判断不了（agent_auth.go 的三态）。
+func (r *codebuddyCLIRunner) LoginStatus(context.Context) (agentAuthState, error) {
+	return agentAuthUnreadable, nil
 }
 
 // codebuddySessionArgs 拼装会话命令行参数。
@@ -206,250 +215,14 @@ func (r *codebuddyCLIRunner) StartSession(ctx context.Context, request AgentSess
 	if err := cmd.Start(); err != nil {
 		return nil, errors.New("启动 CodeBuddy 失败")
 	}
-	session := &codebuddyCLISession{
-		cmd:   cmd,
-		stdin: stdin,
-		done:  make(chan error, 1),
-	}
-	var readers sync.WaitGroup
-	readers.Add(2)
-	go func() { defer readers.Done(); session.readOutput(stdout) }()
-	go func() { defer readers.Done(); drainLines(stderr) }()
-	go func() {
-		select {
-		case <-ctx.Done():
-			session.Stop()
-		case <-session.done:
-		}
-	}()
-	go func() {
-		err := cmd.Wait()
-		readersDone := make(chan struct{})
-		go func() { readers.Wait(); close(readersDone) }()
-		select {
-		case <-readersDone:
-		case <-time.After(30 * time.Second):
-		}
-		if err != nil {
-			// 前缀必须含"失败"：后面跟的是 Go 的进程状态描述（英文），少了这两个字
-			// 就过不了 localizedErrorText 的直通判据，用户看到的会是
-			// "任务执行失败，请查看任务日志后重试。：CodeBuddy 会话退出: exit status 1"
-			// —— 一句指不到原因、还建议重试的误导文案
-			// （与 claudeExitPrefix / sshClaudeExitPrefix 同一条规矩，有测试钉着）。
-			err = errors.New(codebuddyExitPrefix + err.Error())
-		}
-		session.finish(err)
-	}()
+	session := newStreamJSONSession(streamJSONSessionConfig{
+		agentID:    "codebuddy",
+		label:      "CodeBuddy",
+		exitPrefix: codebuddyExitPrefix,
+	}, cmd, stdin, stdout, stderr)
+	session.watch(ctx)
 	return session, nil
 }
 
 var _ loginAgentRunner = (*codebuddyCLIRunner)(nil)
 var _ authStateRunner = (*codebuddyCLIRunner)(nil)
-
-// codebuddyCLISession 实现 AgentSession：Send 把用户帧写进 stdin，readOutput 把
-// stream-json 输出映射成 AgentRunSink 事件。
-type codebuddyCLISession struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	mu     sync.Mutex
-	sink   AgentRunSink
-	queued []codebuddyQueuedTurn
-	// turnFinishing closes the small gap after a result has detached the
-	// current sink but before the next queued turn becomes active.
-	turnFinishing bool
-	done   chan error
-	closed bool
-}
-
-type codebuddyQueuedTurn struct {
-	frame []byte
-	sink  AgentRunSink
-}
-
-func (s *codebuddyCLISession) Send(request AgentRunRequest, sink AgentRunSink) error {
-	if request.AgentID != "" && request.AgentID != "codebuddy" {
-		return errors.New("codebuddy 会话只接受 codebuddy 运行")
-	}
-	payload := map[string]any{"role": "user", "content": request.Prompt}
-	frame, err := json.Marshal(map[string]any{"type": "user", "message": payload})
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return errors.New("CodeBuddy 会话已结束")
-	}
-	if s.sink != nil || s.turnFinishing {
-		s.queued = append(s.queued, codebuddyQueuedTurn{frame: append([]byte(nil), append(frame, '\n')...), sink: sink})
-		s.mu.Unlock()
-		return nil
-	}
-	s.sink = sink
-	s.mu.Unlock()
-	// 工具调用由 CLI 内部自执行并自己产出 tool_result（实测事件序列：
-	// assistant(tool_use) → user(tool_result) → assistant(text) → result），
-	// 所以服务器只负责：回合开始 → 收集 assistant 文本 → result 收尾。
-	// 这就是 AgentTurnSink 在 codebuddy 上所需的全部握手。
-	// TurnStarted 放在锁外调用，避免持锁回调 sink（sink 可能反向进入本 session）造成再入死锁。
-	if ts, ok := sink.(AgentTurnSink); ok {
-		ts.TurnStarted()
-	}
-	if _, err := s.stdin.Write(append(frame, '\n')); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Stop 结束会话进程。
-func (s *codebuddyCLISession) Stop() {
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-}
-
-// Done 返回会话结束信号。
-func (s *codebuddyCLISession) Done() <-chan error { return s.done }
-
-func (s *codebuddyCLISession) finish(err error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.closed = true
-	current := s.sink
-	queued := s.queued
-	s.sink = nil
-	s.queued = nil
-	s.done <- err
-	s.mu.Unlock()
-
-	// A CLI exit can happen before it emits a result frame. Every accepted
-	// turn must still receive a terminal callback, otherwise its durable Run
-	// remains queued or running forever. Queued turns have not started yet,
-	// but their sinks use the same terminal callback to release their Run.
-	turnErr := err
-	if turnErr == nil {
-		turnErr = errors.New("CodeBuddy 会话在回合完成前结束")
-	}
-	finishTurn := func(sink AgentRunSink) {
-		if sink, ok := sink.(AgentTurnSink); ok {
-			sink.TurnFinished(turnErr)
-		}
-	}
-	if current != nil {
-		finishTurn(current)
-	}
-	for _, turn := range queued {
-		finishTurn(turn.sink)
-	}
-}
-
-// readOutput 逐行解析 NDJSON，映射 init/assistant/result 到当前 sink。
-func (s *codebuddyCLISession) readOutput(out io.Reader) {
-	sc := bufio.NewScanner(out)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var ev struct {
-			Type      string `json:"type"`
-			Subtype   string `json:"subtype"`
-			IsError   bool   `json:"is_error"`
-			SessionID string `json:"session_id"`
-			Message   struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-			} `json:"message"`
-			Result string `json:"result"`
-		}
-		if err := json.Unmarshal(line, &ev); err != nil {
-			continue
-		}
-		s.mu.Lock()
-		sink := s.sink
-		s.mu.Unlock()
-		if sink == nil {
-			continue
-		}
-		switch ev.Type {
-		case "system":
-			if ev.Subtype == "init" {
-				sink.SessionIdentified(ev.SessionID)
-				sink.SessionInitialized()
-			}
-		case "assistant":
-			for _, part := range ev.Message.Content {
-				if part.Type == "text" && part.Text != "" {
-					sink.AssistantText(part.Text, "")
-				}
-			}
-		case "result":
-			// result 收尾回合。error 型 result（subtype 带 error 或 is_error）把原因回给
-			// 回合；成功则 nil。
-			var turnErr error
-			if ev.IsError || strings.HasPrefix(ev.Subtype, "error") {
-				turnErr = errors.New(substr(ev.Result))
-			}
-			s.mu.Lock()
-			if s.sink != sink || s.closed {
-				s.mu.Unlock()
-				continue
-			}
-			// Detach the completed sink before its callback. finish() therefore
-			// cannot report the same turn again if the CLI exits concurrently.
-			s.sink = nil
-			s.turnFinishing = true
-			s.mu.Unlock()
-			if ts, ok := sink.(AgentTurnSink); ok {
-				ts.TurnFinished(turnErr)
-			}
-			s.mu.Lock()
-			if s.closed {
-				s.turnFinishing = false
-				s.mu.Unlock()
-				continue
-			}
-			if len(s.queued) > 0 {
-				nextTurn := s.queued[0]
-				s.sink = nextTurn.sink
-				s.queued = s.queued[1:]
-				s.turnFinishing = false
-				next := s.sink
-				s.mu.Unlock()
-				if ts, ok := next.(AgentTurnSink); ok {
-					ts.TurnStarted()
-				}
-				if _, writeErr := s.stdin.Write(nextTurn.frame); writeErr != nil {
-					s.Stop()
-					s.finish(writeErr)
-				}
-			} else {
-				s.turnFinishing = false
-				s.mu.Unlock()
-			}
-		}
-	}
-}
-
-func substr(s string) string {
-	if s == "" {
-		return "CodeBuddy 回合失败"
-	}
-	if len(s) > 200 {
-		return s[:200] + "…"
-	}
-	return s
-}
-
-func drainLines(r io.Reader) {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		// 丢弃 stderr 输出；仅在调试时有用。
-	}
-}

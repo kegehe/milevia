@@ -84,8 +84,10 @@ func runCodebuddyStreamJSON(t *testing.T, bin string, frames []string) []map[str
 }
 
 // 活得跑一次已安装的 codebuddy，断言 stream-json 会话契约：
-//   输入 frame 同 Claude（type=user.message.content），输出依次有 system/init →
-//   assistant(text) → result(success)。
+//
+//	输入 frame 同 Claude（type=user.message.content），输出依次有 system/init →
+//	assistant(text) → result(success)。
+//
 // codebuddy 未安装时跳过（不在常规回归里动不动拉起目录探测）。
 func TestCodebuddyLiveStreamJSONContract(t *testing.T) {
 	bin := codebuddyTestBinary()
