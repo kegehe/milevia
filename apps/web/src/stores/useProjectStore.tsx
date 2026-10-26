@@ -19,6 +19,12 @@ import { useTransientError } from "../lib/use-transient-error";
 interface ProjectContextValue {
   projects: Project[];
   projectStatuses: Record<string, ProjectStatus>;
+  // 列表首屏三态：loading（还没成功拉到过、当前有请求在飞）/ loaded（至少成功过一次）/
+  // failed（从未成功且最近一次失败）。区分它们是为了让总览页不再把"还没加载完/加载失败"
+  // 误画成"还没有项目"。
+  projectsLoading: boolean;
+  projectsLoaded: boolean;
+  projectsLoadError: string;
   error: string;
   setError: (msg: string) => void;
   refreshProjects: () => Promise<void>;
@@ -91,6 +97,11 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const { localPreferences } = useUIPreferences();
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectStatuses, setProjectStatuses] = useState<Record<string, ProjectStatus>>({});
+  // 初始为 true：Provider 挂载后，总览页的首个 effect 就会发起列表请求；
+  // 若等到请求真正开始才置位，首帧会先闪一下"还没有项目"。
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const [projectsLoadError, setProjectsLoadError] = useState("");
   const [error, setError] = useTransientError();
   const transientConversationDrafts = useRef<Record<string, string>>({});
   const pendingConversationDrafts = useRef(new Map<string, PendingConversationDraft>());
@@ -105,6 +116,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const statusesRef = useRef<Record<string, ProjectStatus>>({});
   // 镜像当前 projects，供 Dashboard 轮询去重。
   const projectsRef = useRef<Project[]>([]);
+  // 镜像 projectsLoaded：刷新闭包只在"首屏阶段"跟踪 loading，
+  // 用 ref 判断而不读 state，避免把过期的渲染闭包值带进异步续体。
+  const projectsLoadedRef = useRef(false);
   const localPreferencesRef = useRef(localPreferences);
   localPreferencesRef.current = localPreferences;
 
@@ -238,6 +252,12 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
   const refreshProjects = useCoalescedRefresh(async () => {
     const requestVersion = ++projectRequestVersion.current;
+    // 只在"还没成功拉到过列表"时跟踪 loading：首屏骨架靠它；成功之后如果每次
+    // 轮询仍把 loading 来回切换，context value 会不断换新引用，把整页（含全部
+    // 项目卡）带着无意义重渲染 —— 这与下面 projectsEqual / statusesEqual 的去重
+    // 目的直接冲突。
+    const firstLoad = !projectsLoadedRef.current;
+    if (firstLoad) setProjectsLoading(true);
     try {
       const list = await apiFn<Project[]>("/api/projects");
       if (requestVersion !== projectRequestVersion.current) return;
@@ -255,11 +275,26 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         projectsRef.current = merged;
         setProjects(merged);
       }
+      // 拿到列表即视为"已经知道项目有哪些"：即便结果是空数组，也是确定的空，而非加载中。
+      if (!projectsLoadedRef.current) {
+        projectsLoadedRef.current = true;
+        setProjectsLoaded(true);
+      }
+      setProjectsLoadError("");
       // 连通性探测不阻塞列表：拿到列表即返回，探测结果异步合并。
       void refreshAvailability();
       await refreshStatuses();
     } catch (cause) {
-      if (requestVersion === projectRequestVersion.current) setError(cause instanceof Error ? cause.message : "无法加载项目列表");
+      if (requestVersion === projectRequestVersion.current) {
+        // 消息可能为空串（Error("")），那样错误态会退化成空态，所以兜底。
+        const message = cause instanceof Error && cause.message ? cause.message : "无法加载项目列表";
+        setError(message);
+        // 持久错误只服务于"从未成功加载"的首屏；已加载后的轮询失败保留全局短暂提示即可，
+        // 否则总览页会凭空出现一块与当前列表矛盾的错误面板。
+        if (!projectsLoadedRef.current) setProjectsLoadError(message);
+      }
+    } finally {
+      if (firstLoad && requestVersion === projectRequestVersion.current) setProjectsLoading(false);
     }
   });
 
@@ -276,6 +311,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const value = useMemo<ProjectContextValue>(() => ({
     projects,
     projectStatuses,
+    projectsLoading,
+    projectsLoaded,
+    projectsLoadError,
     error,
     setError,
     refreshProjects,
@@ -287,7 +325,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     flushConversationDraft,
     clearConversationDrafts,
     api: apiFn,
-  }), [projects, projectStatuses, error, refreshProjects, refreshAvailability, refreshStatuses, removeProject, getConversationDraft, saveConversationDraft, flushConversationDraft, clearConversationDrafts]);
+  }), [projects, projectStatuses, projectsLoading, projectsLoaded, projectsLoadError, error, refreshProjects, refreshAvailability, refreshStatuses, removeProject, getConversationDraft, saveConversationDraft, flushConversationDraft, clearConversationDrafts]);
 
   return (
     <ProjectContext.Provider value={value}>

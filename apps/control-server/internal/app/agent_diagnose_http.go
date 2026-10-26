@@ -98,6 +98,17 @@ func (s *Server) listRunnerDiagnostics(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, view)
 		return
 	}
+	// 通道级健康检查：与 listRunnerAgents 同源 —— 同一台机器，两处必须给出**同一个**
+	// 结论。连不上时报"无法检测"（而不是"没查成"），理由是通道断开的原因。
+	if healthy, reason := s.probeChannelHealth(r.Context(), meta); !healthy {
+		view.ProbeOK = false
+		view.ProbeError = reason
+		for _, entry := range agentCatalog() {
+			view.Skipped = append(view.Skipped, entry.ID)
+		}
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
 
 	force := forceRefresh(r)
 	// 缓存命中就直接回放：这份报告里的 `diagnosedAt` 保持**原来**那个时刻，界面已有的

@@ -20,8 +20,14 @@ import (
 //
 //	首次（auto_vacuum 仍为 0 且 freelist 占比超阈值）→ 切到 INCREMENTAL 并 VACUUM，
 //	一次性把积压的空洞还回去；
-//	之后（auto_vacuum 已是 INCREMENTAL）→ 每次启动只做小额 incremental_vacuum，
-//	让新产生的空洞逐步归还，不会再攒成几个 GB。
+//	之后（auto_vacuum 已是 INCREMENTAL）→ 每次启动先做 incremental_vacuum，
+//	让新产生的空洞逐步归还；**收不动就退回整库 VACUUM**。
+//
+// 最后那句是修出来的，不是设计出来的：incremental_vacuum 只在文件尾部是空闲页时才截断
+// 文件，遇到"占着 2 GB freelist 但一页都放不掉"的库（真机见过：631,934 页里 518,071 页
+// 空闲、调用 0.0 秒只少 1 页）时，旧实现照样报成功，库就永远卡在 2.59 GB，每次启动都
+// 白跑一遍"回收"。所以这里改成收完复查 freelist，残留占比仍超阈值就整库 VACUUM ——
+// 那也是唯一能重建 pointer map、让后续 incremental_vacuum 恢复有效的动作。
 //
 // 用 `pragma auto_vacuum` 自身作为"一次性动作是否做过"的状态，不再额外写 app_metadata：
 // 数据本身就是标记，不会出现"标记写了但动作没成"的不一致。
@@ -40,6 +46,11 @@ const (
 	// storageReclaimMinFreelistRatio 是触发一次性 VACUUM 的 freelist 占比下限。
 	// 低于它就认为没有值得回收的空间（VACUUM 本身也要重写整个库）。
 	storageReclaimMinFreelistRatio = 0.25
+
+	// storageReclaimMinForcedVacuumBytes 是用户点「清理」时仍要求的最小可回收空间：
+	// 至少 32 MiB，且随库大小放大到库的 1%。force 不看占比阈值，但不能为一个大库里的
+	// 零星空洞重写整个库（真机 2.6 GB 库只残留 ~3 MB 的情况）。
+	storageReclaimMinForcedVacuumBytes = 32 << 20
 )
 
 // waitForIdleWindow 先等 delay，再等到没有排队/运行中的 run 为止；预算耗尽返回错误。
@@ -64,7 +75,7 @@ func (s *Server) waitForIdleWindow(ctx context.Context, delay time.Duration) err
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return errors.New("storage reclaim skipped: runs stayed active")
+			return errors.New("idle window timed out: runs stayed active")
 		}
 		ticker := time.NewTicker(storageReclaimIdlePoll)
 		select {
@@ -86,6 +97,40 @@ func (s *Server) activeRunCount(ctx context.Context) (int64, error) {
 	return active, nil
 }
 
+// needsFullVacuum 判断 freelist 里积压的空洞还值不值得用一次整库 VACUUM 去换。
+//
+// 判据只看占比：VACUUM 要重写整库、还要一份同等量级的空闲磁盘（真机 2.5 GB 实测 5.5 秒，
+// 机械盘或杀软实时扫描下会慢一个数量级），为几百页的空洞动它不划算。
+// force 为真（用户点的「清理」）时不看占比阈值，但仍要求可回收空间值得重写：
+// 至少 32 MiB，且不低于库大小的 1%（大库里的零星空洞不该触发整库重写）。
+func needsFullVacuum(force bool, pageSize, pageCount, freelist int64) bool {
+	if freelist <= 0 {
+		return false
+	}
+	if force {
+		// force 是"比自动回收更积极"，不是"更保守"：可回收空间够大就做；
+		// 小库的高占比空洞仍然值得（重写成本也小），大库的零星残留则跳过。
+		// 绝对下限随库大小放大到 1%，避免"20 GB 库为 40 MB 空洞整库重写"。
+		minBytes := int64(storageReclaimMinForcedVacuumBytes)
+		if pageCount > 0 {
+			if scaled := pageCount * pageSize / 100; scaled > minBytes {
+				minBytes = scaled
+			}
+		}
+		if freelist*pageSize >= minBytes {
+			return true
+		}
+		if pageCount <= 0 {
+			return false
+		}
+		return float64(freelist)/float64(pageCount) >= storageReclaimMinFreelistRatio
+	}
+	if pageCount <= 0 {
+		return false
+	}
+	return float64(freelist)/float64(pageCount) >= storageReclaimMinFreelistRatio
+}
+
 // ensureStorageReclaimed 回收 SQLite freelist 占用的文件空间。见文件头注释。
 //
 // 持 storageMu：与设置页的「清理数据」（cleanupStorage）互斥，避免两个 VACUUM 撞车。
@@ -97,7 +142,8 @@ func (s *Server) ensureStorageReclaimed(ctx context.Context) error {
 
 // reclaimFreePagesLocked 执行空间回收。**调用方必须已持 storageMu。**
 //
-// force 为真表示调用方（用户点的清理）已经明确要求释放空间，不再看 freelist 阈值；
+// force 为真表示调用方（用户点的清理）已经明确要求释放空间，不再看 freelist 占比
+// 阈值；但残留小于绝对下限时仍跳过 —— 为几 MB 空洞重写整个库不划算。
 // 为假表示这是启动期的机会性回收，占比不到阈值就直接跳过，免得白重写一遍库。
 func (s *Server) reclaimFreePagesLocked(ctx context.Context, force bool) error {
 	var pageSize, pageCount, freelist, autoVacuum int64
@@ -117,15 +163,28 @@ func (s *Server) reclaimFreePagesLocked(ctx context.Context, force bool) error {
 		return nil
 	}
 
-	// 已经切到 INCREMENTAL：把 free pages 一次还回去即可，快且不重写整库。
+	// 已经切到 INCREMENTAL：先走便宜路径，把 free pages 一次还回去。
 	if autoVacuum == 2 {
 		if _, err := s.db.ExecContext(ctx, `pragma incremental_vacuum`); err != nil {
 			return fmt.Errorf("incremental_vacuum: %w", err)
 		}
-		return nil
-	}
-
-	if !force && (pageCount == 0 || float64(freelist)/float64(pageCount) < storageReclaimMinFreelistRatio) {
+		// 但不能就此认定"收完了"：incremental_vacuum 只在**文件尾部**恰好是空闲页时才
+		// 截断文件。真机实测出现过 auto_vacuum 已是 INCREMENTAL、freelist 仍压着 2 GB
+		// （518,071 页）的一次 —— 这一句 0.0 秒返回、只放掉 1 页，文件照旧 2.59 GB，
+		// 于是每次启动都"回收成功"，而库永远不缩小。所以复查一次（页数也要重读：真
+		// 收缩过的话 page_count 已经变了）：残留占比仍然超标就退回下面的整库 VACUUM。
+		if err := s.db.QueryRowContext(ctx, `pragma page_count`).Scan(&pageCount); err != nil {
+			return fmt.Errorf("read page_count after incremental_vacuum: %w", err)
+		}
+		if err := s.db.QueryRowContext(ctx, `pragma freelist_count`).Scan(&freelist); err != nil {
+			return fmt.Errorf("read freelist after incremental_vacuum: %w", err)
+		}
+		if !needsFullVacuum(force, pageSize, pageCount, freelist) {
+			return nil
+		}
+		log.Printf("[maintenance] incremental_vacuum left %d free pages (~%d MB); falling back to a full VACUUM",
+			freelist, freelist*pageSize/(1<<20))
+	} else if !needsFullVacuum(force, pageSize, pageCount, freelist) {
 		return nil
 	}
 

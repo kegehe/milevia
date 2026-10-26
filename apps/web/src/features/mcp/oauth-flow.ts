@@ -5,7 +5,9 @@ export async function waitForOAuthFlowResult(
   readStatus: () => Promise<OAuthFlowStatus>,
   signal?: AbortSignal,
   intervalMs = 5000,
-  attempts = 60,
+  // 后端 mcpOAuthFlowTTL = 10 分钟。前端等待必须覆盖整个有效期，否则用户在第 6 分钟
+  // 完成浏览器授权时前端已经放弃、向导还会把刚建的 server 删掉。
+  attempts = 120,
 ): Promise<OAuthFlowResult> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     await new Promise<void>((resolve) => {

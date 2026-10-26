@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -612,6 +613,72 @@ func TestSweepCheckpointSnapshotsCleansAndConverts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "extra.txt")); err != nil {
 		t.Fatalf("overlay restore must not delete unrelated files: %v", err)
+	}
+}
+
+// 转换遗留快照时只要有运行开始就必须立刻撒手：不然它和首条消息的 CLI 冷启动抢同一块
+// 磁盘（见 checkpointSweepStartDelay 的注释：真机上见过两者撞在一起、发送卡 61 秒）。
+func TestCancelWhenRunsStartStopsConversionWhenWorkBegins(t *testing.T) {
+	server := newTestServer(t)
+	seedCheckpointConversation(t, server)
+
+	runCtx, stop := server.cancelWhenRunsStart(t.Context(), 10*time.Millisecond)
+	defer stop()
+
+	select {
+	case <-runCtx.Done():
+		t.Fatal("no run is active yet, the conversion context must stay alive")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := server.db.Exec("insert into runs (id,conversation_id,status,created_at) values (?,?,?,?)",
+		"active-run", "checkpoint-conversation", "running", time.Now().UTC()); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	select {
+	case <-runCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("conversion context still alive after a run started")
+	}
+	// stop 自己也会取消 ctx，所以它必须明确回报这次取消是不是 watcher 触发的；
+	// 否则调用方事后看 ctx.Err() 会把任何真实失败都误判成"被运行打断"。
+	if !stop() {
+		t.Fatal("stop did not report that a run interrupted the conversion")
+	}
+}
+
+// stop 无条件取消 ctx，但"没有运行开始"时必须回报 false —— 调用方靠它区分
+// "被打断、下次再来"和"转换真的失败了"，误报会把真实错误吞掉。
+func TestCancelWhenRunsStartReportsNoInterruptionWithoutRuns(t *testing.T) {
+	server := newTestServer(t)
+	_, stop := server.cancelWhenRunsStart(t.Context(), 10*time.Millisecond)
+	if stop() {
+		t.Fatal("stop reported an interruption although no run started")
+	}
+}
+
+// 机器持续有运行也不能让清理永远饿死：等不到空闲（这里把等待调到 50ms）就得照做，
+// 否则已删会话的快照目录会一直留在磁盘上，每次启动都被跳过。
+func TestSweepCheckpointSnapshotsCleansEvenWhenRunsNeverIdle(t *testing.T) {
+	server := newTestServer(t)
+	server.checkpointCleanupWait = 50 * time.Millisecond
+	seedCheckpointConversation(t, server)
+	server.config.DataDir = t.TempDir()
+	orphanDir := filepath.Join(server.checkpointStorageRoot(), "checkpoints", "deleted-conversation", "whatever")
+	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.db.Exec(`insert into runs (id,conversation_id,status,created_at) values ('busy-run','checkpoint-conversation','running',?)`, time.Now().UTC()); err != nil {
+		t.Fatalf("insert running run: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	server.sweepCheckpointSnapshots(ctx)
+
+	if _, err := os.Stat(orphanDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("orphan snapshot was not cleaned up while runs kept the machine busy")
 	}
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseCustomMCPConfig, parseKeyValueLines, parseLines, presetGuidanceLines, redactedMCPConfig, runtimeCommandsFor, serviceLogoKey, transportLabel, uniqueMCPName, wizardStartsAt } from "./mcp-model.ts";
+import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, defaultTestEnvironment, draftProbeValues, groupPresetsByCategory, keyValueLines, parseCustomMCPConfig, parseKeyValueLines, parseLines, presetGuidanceLines, redactedMCPConfig, runtimeCommandsFor, serviceLogoKey, transportLabel, uniqueMCPName, wizardStartsAt } from "./mcp-model.ts";
 import type { MCPPreset, MCPServer } from "../../lib/types.ts";
 
 // 2026-09-15 修的模板缺陷里，凡是「靠几行代码的顺序 / 优先级成立」的规则都放在这里做**行为**断言。
@@ -326,4 +326,13 @@ test("重名导入会生成稳定的递增名称", () => {
   assert.equal(uniqueMCPName("demo", ["demo"]), "demo-2");
   assert.equal(uniqueMCPName("demo", ["demo", "demo-2"]), "demo-3");
   assert.equal(uniqueMCPName("demo.service", []), "demo-service");
+});
+
+test("测试连接的默认环境不能取排序后的首项", () => {
+  // 后端会把 environments 排序；全选时数组是 ["remote-linux","windows","wsl"]，
+  // 直接取 [0] 会让本地 stdio server 默认走 SSH 远端并报缺少连接。
+  assert.equal(defaultTestEnvironment(["remote-linux", "windows", "wsl"]), "windows");
+  assert.equal(defaultTestEnvironment(["remote-linux", "wsl"]), "wsl");
+  assert.equal(defaultTestEnvironment(["remote-linux"]), "remote-linux");
+  assert.equal(defaultTestEnvironment([]), "windows");
 });

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GitConflictContent } from "./git-model";
 import { countConflictMarkers, parseConflictBlocks, resolveConflictBlock, type ConflictChoice } from "./conflict-blocks";
 import { CodeFileView } from "../files/CodeFileView";
+import { useCodeFontSize } from "../files/useCodeFontSize";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type ResolveAction = "ours" | "theirs" | "delete" | "working";
@@ -62,6 +63,8 @@ function snippet(text: string, maxLines = 5): string {
 }
 
 export function ConflictSolveView({ projectID, conversationId, path, conflictPaths, request, fail, oursLabel, theirsLabel, busy, mobile = false, onResolve, onOpenFile, onClose }: ConflictSolveViewProps) {
+  // 结果编辑器就是文件编辑器，字号跟设置页的“代码字号”走（与文件页、差异视图一致）。
+  const { fontSize } = useCodeFontSize();
   const [content, setContent] = useState<GitConflictContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -237,7 +240,7 @@ export function ConflictSolveView({ projectID, conversationId, path, conflictPat
         <div className="git-conflict-editor">
           <header><span>结果文件（可直接编辑，无冲突标记后即可“标记为已解决”）</span></header>
           {workingText === null ? <div className="git-empty">该文件暂无可编辑内容</div>
-            : <CodeFileView content={workingText} filename={fileName} fontSize={13} editable onChange={setWorkingText} />}
+            : <CodeFileView content={workingText} filename={fileName} fontSize={fontSize} editable onChange={setWorkingText} />}
         </div>
       </>}
   </section>;

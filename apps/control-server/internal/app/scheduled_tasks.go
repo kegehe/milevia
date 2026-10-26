@@ -276,6 +276,8 @@ func (s *Server) updateScheduledTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.broadcastStateEvent(stEvScheduledTasks, task.ProjectID)
+	// 更新可能停掉未开始的运行并清掉它们的通知。
+	s.broadcastStateEvent(stEvNotifications, task.ProjectID)
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -319,11 +321,17 @@ func (s *Server) deleteScheduledTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("scheduled task changed before deletion"))
 		return
 	}
+	// 任务没了，“查看”指向它的通知就是死链。
+	if err := deleteScheduledTaskNotificationsTx(r.Context(), tx, projectID, id); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	s.broadcastStateEvent(stEvScheduledTasks, projectID)
+	s.broadcastStateEvent(stEvNotifications, projectID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -388,6 +396,8 @@ func (s *Server) setScheduledTaskEnabled(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	s.broadcastStateEvent(stEvScheduledTasks, task.ProjectID)
+	// 暂停可能删掉未开始运行的占位会话及其通知。
+	s.broadcastStateEvent(stEvNotifications, task.ProjectID)
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -749,6 +759,15 @@ func (s *Server) replaceScheduledTaskTx(ctx context.Context, tx *sql.Tx, task Sc
 // waiting for the project workspace; remove that empty conversation in the
 // same transaction so disabling a schedule cannot leave orphaned entries.
 func (s *Server) stopUnstartedScheduledTaskRunsTx(ctx context.Context, tx *sql.Tx, taskID string, now time.Time) (bool, error) {
+	// 占位会话可能被一条任务通知当成回退目标；删会话前先清掉这类通知。
+	if _, err := tx.ExecContext(ctx, `delete from notifications
+where scheduled_task_id='' and action_url not like '%/tasks/schedules/%'
+  and conversation_id<>'' and conversation_id in (
+	select conversation_id from scheduled_task_runs
+	where scheduled_task_id=? and status=? and run_id='' and conversation_id!=''
+)`, taskID, scheduledRunQueued); err != nil {
+		return false, err
+	}
 	if _, err := tx.ExecContext(ctx, `delete from conversations where origin='scheduled' and id in (
 		select conversation_id from scheduled_task_runs
 		where scheduled_task_id=? and status=? and run_id='' and conversation_id!=''
@@ -832,15 +851,58 @@ func (s *Server) scheduledTasksForProject(ctx context.Context, projectID string)
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	taskIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		taskIDs = append(taskIDs, item.ID)
+	}
+	// 一次批量取「每条定时任务最近一次执行」：逐条查是 N+1，而控制服务只有一条 SQLite
+	// 连接，列表页刷新时这些往返会一条条排队。
+	lastRuns, err := s.scheduledTaskLastRuns(ctx, taskIDs)
+	if err != nil {
+		return nil, err
+	}
 	for index := range items {
-		last, err := s.latestScheduledTaskRun(ctx, items[index].ID)
-		if err == nil {
+		if last, ok := lastRuns[items[index].ID]; ok {
 			items[index].LastRun = &last
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
 		}
 	}
 	return items, nil
+}
+
+// scheduledTaskLastRuns 批量返回每条定时任务最近一次执行，语义等同于逐条执行
+// `order by created_at desc limit 1`（rowid 只作为同一时刻创建时的稳定兜底）。
+func (s *Server) scheduledTaskLastRuns(ctx context.Context, taskIDs []string) (map[string]ScheduledTaskRun, error) {
+	lastRuns := make(map[string]ScheduledTaskRun, len(taskIDs))
+	// 列清单只维护一份（scheduledTaskRunSelect），这里统一加 run. 前缀，
+	// 否则 join 时 scheduled_task_id / created_at 会和子查询的列名撞车。
+	columns := "run." + strings.ReplaceAll(scheduledTaskRunSelect, ",", ",run.")
+	err := forEachIDBatch(taskIDs, func(placeholders string, args []any) error {
+		rows, err := s.db.QueryContext(ctx, `select `+columns+` from scheduled_task_runs run join (select scheduled_task_id,max(created_at) as latest_created_at from scheduled_task_runs where scheduled_task_id in (`+placeholders+`) group by scheduled_task_id) latest on latest.scheduled_task_id=run.scheduled_task_id and latest.latest_created_at=run.created_at order by run.scheduled_task_id,run.scheduled_for desc`, args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			item, err := scanScheduledTaskRun(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			// created_at 相同时上面两条 order by 保证先扫到 scheduled_for 更晚的那条；
+			// 取到一条就不再覆盖，结果与"最新一条"一致且稳定。
+			if _, exists := lastRuns[item.ScheduledTaskID]; !exists {
+				lastRuns[item.ScheduledTaskID] = item
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		return rows.Close()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return lastRuns, nil
 }
 
 const scheduledTaskRunSelect = `id,scheduled_task_id,scheduled_for,status,title_snapshot,agent_id_snapshot,permission_mode_snapshot,profile_revision_snapshot,route_revision_snapshot,prompt_snapshot,skills_snapshot,conversation_id,run_id,failure_reason,created_at,started_at,finished_at`
@@ -875,10 +937,6 @@ func (s *Server) scheduledTaskRunByID(ctx context.Context, id string) (Scheduled
 
 func (s *Server) scheduledTaskRunByRunID(ctx context.Context, runID string) (ScheduledTaskRun, error) {
 	return scanScheduledTaskRun(s.db.QueryRowContext(ctx, `select `+scheduledTaskRunSelect+` from scheduled_task_runs where run_id=?`, runID))
-}
-
-func (s *Server) latestScheduledTaskRun(ctx context.Context, taskID string) (ScheduledTaskRun, error) {
-	return scanScheduledTaskRun(s.db.QueryRowContext(ctx, `select `+scheduledTaskRunSelect+` from scheduled_task_runs where scheduled_task_id=? order by created_at desc limit 1`, taskID))
 }
 
 func (s *Server) scheduledTaskRuns(ctx context.Context, taskID string, limit int) ([]ScheduledTaskRun, error) {
@@ -1232,7 +1290,8 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 	if err := ensureSharedConversationWorkspaceTx(ctx, tx, conversation.ID, conversation.ProjectID, conversation.CreatedAt); err != nil {
 		return Conversation{}, err
 	}
-	if err := pruneConversationHistoryTx(ctx, tx, conversation.ProjectID); err != nil {
+	prunedHistory, err := pruneConversationHistoryTx(ctx, tx, conversation.ProjectID)
+	if err != nil {
 		return Conversation{}, err
 	}
 	result, err := tx.ExecContext(ctx, `update scheduled_task_runs set conversation_id=? where id=? and status=? and conversation_id=''`, conversation.ID, run.ID, scheduledRunQueued)
@@ -1251,6 +1310,10 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 	}
 	// 为定时运行新建会话后，列表页的会话数/活跃标题会变化。
 	s.broadcastStateEvent(stEvProjects, conversation.ProjectID)
+	// 同一事务里的历史裁剪可能删掉了仍带未读通知的旧会话。
+	if prunedHistory {
+		s.broadcastStateEvent(stEvNotifications, conversation.ProjectID)
+	}
 	return conversation, nil
 }
 
@@ -1400,5 +1463,5 @@ func (s *Server) notifyScheduledTaskRun(scheduledRunID string) {
 	default:
 		return
 	}
-	s.broadcastNotification(NotificationEvent{ID: uuid.NewString(), Type: typ, ProjectID: task.ProjectID, ProjectName: project.Name, ConversationID: run.ConversationID, Title: title, Body: body, Priority: priority, ActionURL: "/projects/" + task.ProjectID + "/tasks/schedules/" + task.ID, DedupeKey: "scheduled-task-run:" + run.ID})
+	s.broadcastNotification(NotificationEvent{ID: uuid.NewString(), Type: typ, ProjectID: task.ProjectID, ProjectName: project.Name, ConversationID: run.ConversationID, ScheduledTaskID: task.ID, Title: title, Body: body, Priority: priority, ActionURL: "/projects/" + task.ProjectID + "/tasks/schedules/" + task.ID, DedupeKey: "scheduled-task-run:" + run.ID})
 }

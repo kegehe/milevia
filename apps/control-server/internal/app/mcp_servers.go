@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -248,9 +249,11 @@ func (s *Server) registerMCPRoutes(r chi.Router) {
 type mcpServerInput struct {
 	OAuthPending bool   `json:"oauthPending"`
 	Name         string `json:"name"`
-	DisplayName  string `json:"displayName"`
-	Description  string `json:"description"`
-	Transport    string `json:"transport"`
+	// DisplayName / Description 用指针区分「未提供」与「显式清空」：整表 PATCH 是部分
+	// 更新语义，卡片开关只发 {enabled}，绝不能把没传的说明当成空串覆盖掉。
+	DisplayName *string `json:"displayName"`
+	Description *string `json:"description"`
+	Transport   string  `json:"transport"`
 
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
@@ -262,6 +265,10 @@ type mcpServerInput struct {
 
 	EnvSecrets    map[string]string `json:"envSecrets"`
 	HeaderSecrets map[string]string `json:"headerSecrets"`
+	// RemovedEnvSecrets / RemovedHeaderSecrets 是表单上显式「移除」的已保存凭据键。
+	// 密钥值永不回显，前端无法用「值是否为空」表达删除，必须单独给键名。
+	RemovedEnvSecrets    []string `json:"removedEnvSecrets"`
+	RemovedHeaderSecrets []string `json:"removedHeaderSecrets"`
 
 	Scope        string   `json:"scope"`
 	ProjectID    string   `json:"projectId"`
@@ -325,8 +332,14 @@ func normalizeMCPAgents(values []string) []string {
 
 func (input *mcpServerInput) normalize() {
 	input.Name = strings.TrimSpace(input.Name)
-	input.DisplayName = strings.TrimSpace(input.DisplayName)
-	input.Description = strings.TrimSpace(input.Description)
+	if input.DisplayName != nil {
+		trimmed := strings.TrimSpace(*input.DisplayName)
+		input.DisplayName = &trimmed
+	}
+	if input.Description != nil {
+		trimmed := strings.TrimSpace(*input.Description)
+		input.Description = &trimmed
+	}
 	input.Transport = strings.TrimSpace(strings.ToLower(input.Transport))
 	input.Command = strings.TrimSpace(input.Command)
 	input.Cwd = strings.TrimSpace(input.Cwd)
@@ -392,6 +405,10 @@ func (input mcpServerInput) validate() error {
 
 // buildStoredMaps 把明文密钥加密为 sec_ 引用后并入 env/headers。
 // 已有 sec_ 引用原样保留；明文覆盖同名引用。
+//
+// 除显式传入的 envSecrets/headerSecrets 外，普通值里**键名像凭据**的也会自动加密：
+// 手动配置表单允许用户把 token 直接粘进环境变量/请求头（UI 明确承诺“保存时自动加密”），
+// 若只在 *Secrets 字段里加密，明文会落库并经 GET 与「复制脱敏设置」原样回显。
 func (s *Server) buildStoredMaps(ctx context.Context, q secretQueryer, env, headers, envSecrets, headerSecrets map[string]string) (map[string]string, map[string]string, []string, error) {
 	// 三个写入路径（建 / 改 / 导入）的唯一咽喉：键名不合法在这里就挡住，将来新增写入方
 	// 也自动被兜住。必须挡的原因见 mcpEnvKeyPattern —— 键名会被内联进远端探针的 shell 脚本。
@@ -401,49 +418,83 @@ func (s *Server) buildStoredMaps(ctx context.Context, q secretQueryer, env, head
 	if err := mcpEnvKeyError(envSecrets); err != nil {
 		return nil, nil, nil, err
 	}
-	stored := map[string]string{}
-	for key, value := range env {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		stored[key] = value
-	}
 	created := []string{}
-	for key, value := range envSecrets {
-		key = strings.TrimSpace(key)
-		if key == "" || value == "" {
-			continue
+	fail := func(err error) (map[string]string, map[string]string, []string, error) {
+		for _, id := range created {
+			_ = s.profileSecrets.Revoke(q, ctx, id)
 		}
+		return nil, nil, nil, err
+	}
+	store := func(value string) (string, error) {
 		ref, err := s.profileSecrets.Store(q, ctx, value)
 		if err != nil {
-			return nil, nil, nil, err
+			return "", err
 		}
 		created = append(created, ref)
-		stored[key] = ref
+		return ref, nil
 	}
-	storedHeaders := map[string]string{}
-	for key, value := range headers {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		storedHeaders[key] = value
-	}
-	for key, value := range headerSecrets {
-		key = strings.TrimSpace(key)
-		if key == "" || value == "" {
-			continue
-		}
-		ref, err := s.profileSecrets.Store(q, ctx, value)
-		if err != nil {
-			for _, id := range created {
-				_ = s.profileSecrets.Revoke(q, ctx, id)
+	// 同一组键里，明文密钥优先于普通值；键名先归一（去首尾空白）并按排序处理，
+	// 避免同名键（如 "TOKEN" 与 " TOKEN "）的胜出者取决于 map 迭代顺序。
+	merge := func(public, secrets map[string]string) (map[string]string, error) {
+		plain := map[string]string{}
+		for _, original := range sortedKeys(public) {
+			if key := strings.TrimSpace(original); key != "" {
+				plain[key] = public[original]
 			}
-			return nil, nil, nil, err
 		}
-		created = append(created, ref)
-		storedHeaders[key] = ref
+		secret := map[string]string{}
+		for _, original := range sortedKeys(secrets) {
+			if key := strings.TrimSpace(original); key != "" {
+				secret[key] = secrets[original]
+			}
+		}
+		keys := map[string]bool{}
+		for key := range plain {
+			keys[key] = true
+		}
+		for key := range secret {
+			keys[key] = true
+		}
+		ordered := make([]string, 0, len(keys))
+		for key := range keys {
+			ordered = append(ordered, key)
+		}
+		sort.Strings(ordered)
+		out := map[string]string{}
+		for _, key := range ordered {
+			if value, ok := secret[key]; ok && value != "" {
+				ref, err := store(value)
+				if err != nil {
+					return nil, err
+				}
+				out[key] = ref
+				continue
+			}
+			value, ok := plain[key]
+			if !ok {
+				continue
+			}
+			// 已加密引用原样保留；含 ${VAR} 的值交给 CLI 展开，不替用户决定它是不是密钥。
+			if value != "" && !strings.HasPrefix(value, mcpSecretRefPrefix) &&
+				!strings.Contains(value, "${") && looksLikeSecretKey(key) {
+				ref, err := store(value)
+				if err != nil {
+					return nil, err
+				}
+				out[key] = ref
+				continue
+			}
+			out[key] = value
+		}
+		return out, nil
+	}
+	stored, err := merge(env, envSecrets)
+	if err != nil {
+		return fail(err)
+	}
+	storedHeaders, err := merge(headers, headerSecrets)
+	if err != nil {
+		return fail(err)
 	}
 	return stored, storedHeaders, created, nil
 }
@@ -567,8 +618,14 @@ func (s *Server) listMCPServers(w http.ResponseWriter, r *http.Request) {
 		args = append(args, projectID)
 	}
 	if agentID := strings.TrimSpace(r.URL.Query().Get("agentId")); agentID != "" {
+		// agents 存的是 JSON 数组文本；按带引号的完整元素匹配，避免 `code` 命中
+		// `codex`、`%`/`_` 当成通配符。非法 Agent ID 直接拒绝，不参与拼条件。
+		if !validProfileAgent(agentID) {
+			writeError(w, http.StatusBadRequest, errors.New("未知的 Agent"))
+			return
+		}
 		clauses = append(clauses, `agents like ?`)
-		args = append(args, `%`+agentID+`%`)
+		args = append(args, `%"`+agentID+`"%`)
 	}
 	if scope := strings.TrimSpace(r.URL.Query().Get("scope")); scope != "" {
 		clauses = append(clauses, `scope=?`)
@@ -619,11 +676,19 @@ func (s *Server) createMCPServer(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
 	input.normalize()
 	if err := input.validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	patterns, err := normalizeAutoApproveForServer(input.AutoApproveTools, input.Name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	input.AutoApproveTools = patterns
 	ctx := r.Context()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -643,12 +708,19 @@ func (s *Server) createMCPServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("MCP 凭据无法保存"))
 		return
 	}
+	displayName, description := "", ""
+	if input.DisplayName != nil {
+		displayName = *input.DisplayName
+	}
+	if input.Description != nil {
+		description = *input.Description
+	}
 	now := time.Now().UTC()
 	server := mcpServer{
 		ID:                "mcp_" + uuid.NewString(),
 		Name:              input.Name,
-		DisplayName:       input.DisplayName,
-		Description:       input.Description,
+		DisplayName:       displayName,
+		Description:       description,
 		Transport:         input.Transport,
 		Command:           input.Command,
 		Args:              input.Args,
@@ -724,6 +796,8 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
 	ctx := r.Context()
 	current, err := s.fetchStoredMCPServer(ctx, serverID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -736,8 +810,8 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 	}
 	merged := mcpServerInput{
 		Name:              current.Name,
-		DisplayName:       current.DisplayName,
-		Description:       current.Description,
+		DisplayName:       stringPtr(current.DisplayName),
+		Description:       stringPtr(current.Description),
 		Transport:         current.Transport,
 		Command:           current.Command,
 		Args:              current.Args,
@@ -752,14 +826,17 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 		StartupTimeoutSec: &current.StartupTimeoutSec,
 		ToolTimeoutSec:    &current.ToolTimeoutSec,
 	}
-	// 用请求中出现的字段覆盖（PATCH 语义：零值也视为显式更新，与前端“保存整表”一致）。
+	// 用请求中出现的字段覆盖。字符串字段的「未提供」与「显式清空」必须分开：
+	// description 已改成指针；displayName 同样；projectId 的显式清空由 scope 归一兜住。
 	if input.Name != "" {
 		merged.Name = input.Name
 	}
-	if input.DisplayName != "" {
+	if input.DisplayName != nil {
 		merged.DisplayName = input.DisplayName
 	}
-	merged.Description = input.Description
+	if input.Description != nil {
+		merged.Description = input.Description
+	}
 	if input.Transport != "" {
 		merged.Transport = input.Transport
 	}
@@ -794,9 +871,6 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 		}
 		merged.Enabled = input.Enabled
 	}
-	if input.AutoApproveTools != nil {
-		merged.AutoApproveTools = input.AutoApproveTools
-	}
 	if input.StartupTimeoutSec != nil && *input.StartupTimeoutSec > 0 {
 		merged.StartupTimeoutSec = input.StartupTimeoutSec
 	}
@@ -807,10 +881,86 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 	// 密钥明文通过 envSecrets/headerSecrets 新增或覆盖。
 	merged.Env = mergePublicEnv(current.envRaw, input.Env)
 	merged.Headers = mergePublicEnv(current.headersRaw, input.Headers)
+	// 显式移除的已保存凭据：只有该键本次没有重新填写时才删（用户可能在移除后又用
+	// 明文/新值加回来）。旧 sec_ 引用由提交后的回收循环吊销。
+	// 键名先按 TrimSpace 归一：buildStoredMaps 会把 `" TOKEN "` 写成 `TOKEN`，
+	// 用原始 map 键比较会误判为「没重新填写」。
+	envProvided := map[string]bool{}
+	for key := range input.Env {
+		envProvided[strings.TrimSpace(key)] = true
+	}
+	envSecretProvided := map[string]bool{}
+	for key, value := range input.EnvSecrets {
+		if value != "" {
+			envSecretProvided[strings.TrimSpace(key)] = true
+		}
+	}
+	for _, key := range input.RemovedEnvSecrets {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if envProvided[key] || envSecretProvided[key] {
+			continue
+		}
+		delete(merged.Env, key)
+	}
+	headerProvided := map[string]bool{}
+	for key := range input.Headers {
+		headerProvided[strings.TrimSpace(key)] = true
+	}
+	headerSecretProvided := map[string]bool{}
+	for key, value := range input.HeaderSecrets {
+		if value != "" {
+			headerSecretProvided[strings.TrimSpace(key)] = true
+		}
+	}
+	for _, key := range input.RemovedHeaderSecrets {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if headerProvided[key] || headerSecretProvided[key] {
+			continue
+		}
+		delete(merged.Headers, key)
+	}
 	merged.normalize()
+	// 作用域从 project 改成 global 时，前端用 projectId:"" 表达清空；空串和「未提供」
+	// 在 JSON 里不可区分，但 scope=global 本身就明确要求不带项目。必须在 normalize
+	// 之后判断（" Global " 这类字面量只有 normalize 后才等于 global），再去校验。
+	if merged.Scope == mcpScopeGlobal {
+		merged.ProjectID = ""
+	}
 	if err := merged.validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	// 自动放行白名单与专用 PUT 接口共用同一套形态 + 归属校验。主 PATCH 是前端「保存
+	// 整表」的实际入口，不在这里挡就等于专用接口的白名单形同虚设。
+	// 只校验**本次新增/修改**的条目：老记录里可能存着修复前写入的 mcp__*，改名时
+	// 旧名前缀会被重写；整表保存原样回传（包括重排）不应因此被拦住。
+	if merged.Name != current.Name {
+		// 改名时白名单必须跟着换前缀：否则旧名模式永久失效，而 UI 整表保存又会带回来。
+		merged.AutoApproveTools = rewriteAutoApproveServerPrefix(current.AutoApproveTools, current.Name, merged.Name)
+	}
+	if input.AutoApproveTools != nil {
+		patterns, err := applyAutoApproveEdits(input.AutoApproveTools, current.AutoApproveTools, current.Name, merged.Name)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		merged.AutoApproveTools = patterns
+	}
+	// 地址/传输/作用域/项目变化都会让旧 OAuth 令牌不再适用（URL 可能含 ${PROJECT_DIR}，
+	// 解析结果随项目/环境变）。必须在开事务**之前**拿生命周期锁：否则事务已占住
+	// SQLite 单连接、再等这把锁，会与持锁写令牌的回调形成死锁。
+	endpointChanged := merged.Transport != current.Transport || merged.URL != current.URL ||
+		merged.Scope != current.Scope || merged.ProjectID != current.ProjectID
+	if endpointChanged {
+		s.mcpOAuthLifecycleMu.Lock()
+		defer s.mcpOAuthLifecycleMu.Unlock()
+		s.cancelMCPServerFlows(serverID)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -825,9 +975,6 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if merged.Scope == mcpScopeGlobal {
-		merged.ProjectID = ""
-	}
 	env, headers, createdSecrets, err := s.buildStoredMaps(ctx, tx, merged.Env, merged.Headers, input.EnvSecrets, input.HeaderSecrets)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("MCP 凭据无法保存"))
@@ -839,33 +986,94 @@ func (s *Server) updateMCPServer(w http.ResponseWriter, r *http.Request) {
 	environmentsJSON, _ := marshalStringSlice(merged.Environments)
 	agentsJSON, _ := marshalStringSlice(merged.Agents)
 	autoApproveJSON, _ := marshalStringSlice(merged.AutoApproveTools)
-	displayName := merged.DisplayName
+	displayName, description := "", ""
+	if merged.DisplayName != nil {
+		displayName = *merged.DisplayName
+	}
+	if merged.Description != nil {
+		description = *merged.Description
+	}
 	if displayName == "" {
 		displayName = merged.Name
 	}
 	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `update mcp_servers set name=?,display_name=?,description=?,transport=?,command=?,args_json=?,env_json=?,cwd=?,url=?,headers_json=?,scope=?,project_id=?,environments=?,agents=?,enabled=?,auto_approve_tools=?,startup_timeout_sec=?,tool_timeout_sec=?,updated_at=? where id=?`,
-		merged.Name, displayName, merged.Description, merged.Transport, merged.Command, argsJSON, envJSON, merged.Cwd, merged.URL, headersJSON,
+	result, execErr := tx.ExecContext(ctx, `update mcp_servers set name=?,display_name=?,description=?,transport=?,command=?,args_json=?,env_json=?,cwd=?,url=?,headers_json=?,scope=?,project_id=?,environments=?,agents=?,enabled=?,auto_approve_tools=?,startup_timeout_sec=?,tool_timeout_sec=?,updated_at=? where id=?`,
+		merged.Name, displayName, description, merged.Transport, merged.Command, argsJSON, envJSON, merged.Cwd, merged.URL, headersJSON,
 		merged.Scope, merged.ProjectID, environmentsJSON, agentsJSON, merged.Enabled, autoApproveJSON,
-		merged.StartupTimeoutSec, merged.ToolTimeoutSec, now, serverID); err != nil {
+		merged.StartupTimeoutSec, merged.ToolTimeoutSec, now, serverID)
+	if execErr != nil {
 		for _, id := range createdSecrets {
 			_ = s.profileSecrets.Revoke(tx, ctx, id)
 		}
-		if isUniqueConstraint(err) {
+		if isUniqueConstraint(execErr) {
 			writeError(w, http.StatusConflict, errors.New("同名 MCP server 已存在（作用域内名称需唯一）"))
 			return
 		}
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, execErr)
 		return
 	}
+	if affected, affectedErr := result.RowsAffected(); affectedErr == nil && affected == 0 {
+		// 后台 TTL 清理可能刚删掉这条 oauth-pending 记录；不要把零值对象当成功返回。
+		writeError(w, http.StatusNotFound, errors.New("MCP server not found"))
+		return
+	}
+	// 作用域/归属变了，旧的项目覆盖行不再有明确语义（改全局后它会让该 server 在旧项目
+	// 继续关闭；移到别的项目后它对任何视图都不可见）。一并清掉。
+	if merged.Scope != current.Scope || merged.ProjectID != current.ProjectID {
+		if _, err := tx.ExecContext(ctx, `delete from mcp_project_bindings where server_id=?`, serverID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	// 令牌行与地址变更在同一事务里删除：提交后旧 host 的 Bearer 不可能再被注入新 URL。
+	var oauthTokenRefs []string
+	if endpointChanged {
+		row, loadErr := scanMCPOAuthToken(tx.QueryRowContext(ctx,
+			`select `+mcpOAuthTokenColumns+` from mcp_oauth_tokens where server_id=?`, serverID))
+		if loadErr == nil {
+			if _, err := tx.ExecContext(ctx, `delete from mcp_oauth_tokens where server_id=?`, serverID); err != nil {
+				for _, id := range createdSecrets {
+					_ = s.profileSecrets.Revoke(tx, ctx, id)
+				}
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			oauthTokenRefs = []string{row.AccessTokenRef, row.RefreshTokenRef, row.ClientSecretRef}
+		} else if !errors.Is(loadErr, sql.ErrNoRows) {
+			for _, id := range createdSecrets {
+				_ = s.profileSecrets.Revoke(tx, ctx, id)
+			}
+			writeError(w, http.StatusInternalServerError, loadErr)
+			return
+		}
+	}
 	if err := tx.Commit(); err != nil {
+		// 事务没提交成功：本次刚创建的密文引用必须回收，否则永远没人引用它们。
+		for _, id := range createdSecrets {
+			_ = s.profileSecrets.Revoke(s.db, ctx, id)
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 被覆盖或被移除的旧密钥引用及时吊销，避免残留密文。
+	// 被覆盖或被移除的旧密钥引用及时吊销，避免残留密文。失败不改变已提交的更新，
+	// 但必须可见：静默失败会留下永远没人引用的可用密文。用后台超时，避免请求 ctx
+	// 已取消时一条都回收不了。
+	revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer revokeCancel()
 	for _, ref := range collectSecretRefs(current.envRaw, current.headersRaw) {
 		if !containsString(collectSecretRefs(env, headers), ref) {
-			_ = s.profileSecrets.Revoke(s.db, ctx, ref)
+			if err := s.profileSecrets.Revoke(s.db, revokeCtx, ref); err != nil {
+				log.Printf("[mcp] revoke replaced secret %s: %v", ref, err)
+			}
+		}
+	}
+	// 地址/传输/作用域变了：令牌行已在事务里删除，现在回收它引用的密文。
+	for _, ref := range oauthTokenRefs {
+		if strings.TrimSpace(ref) == "" {
+			continue
+		}
+		if err := s.profileSecrets.Revoke(s.db, revokeCtx, ref); err != nil {
+			log.Printf("[mcp] revoke oauth credential after endpoint change: %v", err)
 		}
 	}
 	stored, _ := s.fetchMCPServer(ctx, serverID)
@@ -890,6 +1098,8 @@ func (s *Server) deleteMCPServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeMCPServer(ctx context.Context, serverID string) error {
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
 	s.mcpOAuthLifecycleMu.Lock()
 	defer s.mcpOAuthLifecycleMu.Unlock()
 	return s.removeMCPServerLocked(ctx, serverID)
@@ -914,7 +1124,9 @@ func (s *Server) removeMCPServerLocked(ctx context.Context, serverID string) err
 		return err
 	}
 	for _, ref := range collectSecretRefs(current.envRaw, current.headersRaw) {
-		_ = s.profileSecrets.Revoke(s.db, ctx, ref)
+		if err := s.profileSecrets.Revoke(s.db, ctx, ref); err != nil {
+			log.Printf("[mcp] revoke secret %s on delete: %v", ref, err)
+		}
 	}
 	return nil
 }
@@ -970,6 +1182,76 @@ func collectSecretRefs(maps ...map[string]string) []string {
 		}
 	}
 	return refs
+}
+
+// projectMCPTokenRefs 是删除项目时需要回收的 OAuth 密文引用（删行之前必须先取出来）。
+type projectMCPTokenRefs struct {
+	ServerID        string
+	AccessTokenRef  string
+	RefreshTokenRef string
+	ClientSecretRef string
+}
+
+// projectMCPRowsForDeletion 取出项目级 MCP 定义及其 OAuth 令牌引用。
+//
+// MCP 各表都没有指向 projects 的外键（见各 migrate 函数），删除项目时必须显式清理：
+// 否则项目级 server、项目开关、`.mcp.json` 放行记录与 OAuth 令牌会变成孤儿，凭据密文
+// 再没有任何引用、永远不会被回收。
+func (s *Server) projectMCPRowsForDeletion(ctx context.Context, projectID string) ([]storedMCPServer, []projectMCPTokenRefs, error) {
+	servers := []storedMCPServer{}
+	rows, err := s.db.QueryContext(ctx, `select `+mcpServerColumns+` from mcp_servers where scope=? and project_id=?`, mcpScopeProject, projectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		stored, scanErr := scanStoredMCPServer(rows)
+		if scanErr != nil {
+			rows.Close()
+			return nil, nil, scanErr
+		}
+		servers = append(servers, stored)
+	}
+	err = rows.Err()
+	// SQLite 单连接：必须在下一个查询前关闭 rows。
+	if closeErr := rows.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	tokens := []projectMCPTokenRefs{}
+	tokenRows, err := s.db.QueryContext(ctx, `select server_id, access_token_ref, refresh_token_ref, client_secret_ref
+		from mcp_oauth_tokens where server_id in (select id from mcp_servers where scope=? and project_id=?)`,
+		mcpScopeProject, projectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	for tokenRows.Next() {
+		var row projectMCPTokenRefs
+		if scanErr := tokenRows.Scan(&row.ServerID, &row.AccessTokenRef, &row.RefreshTokenRef, &row.ClientSecretRef); scanErr != nil {
+			tokenRows.Close()
+			return nil, nil, scanErr
+		}
+		tokens = append(tokens, row)
+	}
+	err = tokenRows.Err()
+	if closeErr := tokenRows.Close(); err == nil {
+		err = closeErr
+	}
+	return servers, tokens, err
+}
+
+// revokeProjectMCPCredential 在项目删除后回收密文。best-effort：项目行已经去掉，
+// 失败只能记日志（已无任何界面入口能重试到这些引用）。调用方统一传一个后台超时
+// 上下文，避免每条引用各自等 5 秒。
+func (s *Server) revokeProjectMCPCredential(ctx context.Context, ref string) {
+	if strings.TrimSpace(ref) == "" {
+		return
+	}
+	if err := s.profileSecrets.Revoke(s.db, ctx, ref); err != nil {
+		log.Printf("[mcp] revoke secret %s after project delete: %v", ref, err)
+	}
 }
 
 func containsString(list []string, want string) bool {
@@ -1151,6 +1433,7 @@ type projectMCPEntry struct {
 type projectMCPView struct {
 	ProjectID    string                  `json:"projectId"`
 	Environment  string                  `json:"environment"`
+	AgentID      string                  `json:"agentId"`
 	StrictMode   bool                    `json:"strictMode"`
 	AllowMcpJson bool                    `json:"allowMcpJson"`
 	Effective    []projectMCPEntry       `json:"effective"`
@@ -1172,10 +1455,21 @@ func (s *Server) getProjectMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target := s.resolveAgentTargetEnv(project.RunnerID, project.Path)
+	// 生效列表与注入一样是「按 Agent」的：以前固定按 claude-code 算，会话用 Codex/
+	// OpenCode 时界面展示的与实际注入的可以完全不同。允许显式指定，默认 claude-code。
+	agentID := strings.TrimSpace(r.URL.Query().Get("agentId"))
+	if agentID == "" {
+		agentID = "claude-code"
+	}
+	if !validProfileAgent(agentID) {
+		writeError(w, http.StatusBadRequest, errors.New("未知的 Agent"))
+		return
+	}
 	allowMcpJson := s.projectMCPAllowMcpJson(r.Context(), projectID)
 	view := projectMCPView{
 		ProjectID:      projectID,
 		Environment:    string(target),
+		AgentID:        agentID,
 		StrictMode:     !allowMcpJson,
 		AllowMcpJson:   allowMcpJson,
 		Effective:      []projectMCPEntry{},
@@ -1183,7 +1477,7 @@ func (s *Server) getProjectMCP(w http.ResponseWriter, r *http.Request) {
 		McpJSONServers: []string{},
 		Warnings:       []string{},
 	}
-	selected, err := s.selectMCPServers(r.Context(), projectID, "claude-code", target)
+	selected, err := s.selectMCPServers(r.Context(), projectID, agentID, target)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1206,6 +1500,11 @@ func (s *Server) getProjectMCP(w http.ResponseWriter, r *http.Request) {
 	}
 	view.Bindings = bindings
 	view.McpJSONServers = projectMcpJSONServerNames(project.Path)
+	// nil 切片会序列化成 null，前端按 string[] 取 .length 时直接抛错（项目根没有
+	// .mcp.json 是常态）。这里统一回落到空数组。
+	if view.McpJSONServers == nil {
+		view.McpJSONServers = []string{}
+	}
 	if allowMcpJson {
 		if len(view.McpJSONServers) == 0 {
 			view.Warnings = append(view.Warnings,
@@ -1252,7 +1551,7 @@ func (s *Server) selectMCPServers(ctx context.Context, projectID, agentID string
 		if !containsString(stored.Environments, string(target)) || !containsString(stored.Agents, agentID) {
 			continue
 		}
-		if stored.Scope == mcpScopeGlobal && disabled[stored.ID] {
+		if disabled[stored.ID] {
 			continue
 		}
 		if _, exists := byName[stored.Name]; !exists {
@@ -1396,6 +1695,75 @@ func normalizeMCPAutoApprovePatterns(values []string) ([]string, error) {
 	return out, nil
 }
 
+// normalizeAutoApproveForServer 在通用形态校验之外，再限定 MCP 模式必须属于本 server。
+// 三个写入入口（create / 整表 PATCH / 专用 PUT）共用这一份判据：白名单按 server 存放，
+// 允许一条 server 写 `mcp__other__*` 等于让它替别的 server 放行工具。
+func normalizeAutoApproveForServer(values []string, serverName string) ([]string, error) {
+	patterns, err := normalizeMCPAutoApprovePatterns(values)
+	if err != nil {
+		return nil, err
+	}
+	prefix := "mcp__" + serverName + "__"
+	for _, pattern := range patterns {
+		if strings.HasPrefix(pattern, "mcp__") && !strings.HasPrefix(pattern, prefix) {
+			return nil, fmt.Errorf("模式 %q 不属于本 server（应以 %s 开头）", pattern, prefix)
+		}
+	}
+	return patterns, nil
+}
+
+// applyAutoApproveEdits 计算整表 PATCH 后的白名单：改名时先重写前缀，只对**不在旧集合
+// 里**的条目做形态/归属校验。这样历史非法值（如 mcp__*）只要用户没动就继续保留，
+// 重排、改名也不会把整条保存卡死；新增或改写的模式仍会被严格校验。
+func applyAutoApproveEdits(patterns, current []string, oldName, newName string) ([]string, error) {
+	carried := map[string]bool{}
+	for _, pattern := range rewriteAutoApproveServerPrefix(current, oldName, newName) {
+		if trimmed := strings.TrimSpace(pattern); trimmed != "" {
+			carried[trimmed] = true
+		}
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, pattern := range rewriteAutoApproveServerPrefix(patterns, oldName, newName) {
+		trimmed := strings.TrimSpace(pattern)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		if !carried[trimmed] {
+			if _, err := normalizeAutoApproveForServer([]string{trimmed}, newName); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, trimmed)
+	}
+	return out, nil
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+// rewriteAutoApproveServerPrefix 在 server 改名时把白名单里的旧名前缀换成新名，
+// 避免「改个名字就再也保存不了」或改名后免审批静默失效。
+func rewriteAutoApproveServerPrefix(patterns []string, oldName, newName string) []string {
+	if oldName == "" || oldName == newName {
+		return patterns
+	}
+	oldPrefix := "mcp__" + oldName + "__"
+	newPrefix := "mcp__" + newName + "__"
+	out := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		trimmed := strings.TrimSpace(pattern)
+		if strings.HasPrefix(trimmed, oldPrefix) {
+			out = append(out, newPrefix+strings.TrimPrefix(trimmed, oldPrefix))
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
 // updateMCPServerAutoApprove 单独更新一条 server 的自动放行白名单。
 // 与整表 PATCH 分开，是因为前端在「工具列表」里逐个勾选时只改这一个字段，
 // 走整表 PATCH 会把其它字段的零值语义卷进来。
@@ -1405,6 +1773,8 @@ func (s *Server) updateMCPServerAutoApprove(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &input) {
 		return
 	}
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
 	ctx := r.Context()
 	stored, err := s.fetchStoredMCPServer(ctx, serverID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1415,18 +1785,10 @@ func (s *Server) updateMCPServerAutoApprove(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	patterns, err := normalizeMCPAutoApprovePatterns(input.Patterns)
+	patterns, err := normalizeAutoApproveForServer(input.Patterns, stored.Name)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
-	}
-	// 白名单按 server 存放，故只接受属于本 server 的 MCP 模式（或 Bash 模式）。
-	prefix := "mcp__" + stored.Name + "__"
-	for _, pattern := range patterns {
-		if strings.HasPrefix(pattern, "mcp__") && !strings.HasPrefix(pattern, prefix) {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("模式 %q 不属于本 server（应以 %s 开头）", pattern, prefix))
-			return
-		}
 	}
 	autoApproveJSON, _ := marshalStringSlice(patterns)
 	if _, err := s.db.ExecContext(ctx, `update mcp_servers set auto_approve_tools=?,updated_at=? where id=?`,

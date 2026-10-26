@@ -1,3 +1,10 @@
+/* 手机端样式表。
+   【约定 · 辅助文字】次级说明文字（分支名 / 元信息 / 时间戳 / 提示）字号下限 11px、
+   对比度门槛 4.5:1（WCAG AA 正文档，11px 不算大字号）。默认用本页统一次级色
+   #587568：白底 5.0:1、浅绿底（磁贴运行态 / 引用条）约 4.6–4.8:1；要换色相时按实测
+   对比度选，别凭"看着够深"。落在有色底上（成功刷新条 / 选中的历史项 / 青柠色更新条）
+   时再用深一档的 #557065，那一档在 #e6f5ec / #e5f4eb / #f6fceb 上都还有 4.7:1 以上。
+   10px 在这个尺寸下已经只剩纹理，户外光下基本读不出来 —— 别为了省一行高把字号降回去。 */
 .mobile-remote { min-height: 100dvh; padding: 24px max(16px, 4vw) 48px; padding-top: calc(24px + env(safe-area-inset-top)); color: #19332c; background: #f3f8f4; }
 .mobile-remote-header, .mobile-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .mobile-header-actions { display: flex; align-items: center; gap: 8px; }
@@ -51,8 +58,8 @@
    留着它们不只是死样式：将来谁再写一个 `className="mobile-pairing"`，会凭空继承一整套
    绿底卡片 + 实心按钮，而那套视觉已经没有任何界面在用。 */
 .mobile-remote input, .mobile-remote textarea, .mobile-remote select { width: 100%; border: 1px solid #c5dad0; border-radius: 5px; padding: 9px 10px; color: #19332c; background: #fff; font: inherit; }
-.mobile-task small { color: #70897f; font-size: 12px; }
-.mobile-section-heading { margin-bottom: 10px; }.mobile-section-heading span { color: #82968d; font-size: 12px; }.mobile-task-list { display: grid; gap: 7px; margin-top: 12px; border-top: 1px solid #e3eee7; padding-top: 9px; }.mobile-task { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.mobile-task strong { overflow: hidden; color: #315448; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }.mobile-empty { color: #7a9186; font-size: 12px; }.mobile-error { max-width: 860px; margin: 0 auto 14px; border: 1px solid #e5b8aa; border-radius: 6px; padding: 10px 12px; color: #933d2e; background: #fff1ed; font-size: 12px; }
+.mobile-task small { color: #587568; font-size: 12px; }
+.mobile-section-heading { margin-bottom: 10px; }.mobile-section-heading span { color: #587568; font-size: 12px; }.mobile-task-list { display: grid; gap: 7px; margin-top: 12px; border-top: 1px solid #e3eee7; padding-top: 9px; }.mobile-task { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.mobile-task strong { overflow: hidden; color: #315448; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }.mobile-empty { color: #587568; font-size: 12px; }.mobile-error { max-width: 860px; margin: 0 auto 14px; border: 1px solid #e5b8aa; border-radius: 6px; padding: 10px 12px; color: #933d2e; background: #fff1ed; font-size: 12px; }
 @media (max-width: 620px) { .mobile-remote { padding: 18px 12px 36px; padding-top: calc(18px + env(safe-area-inset-top)); padding-bottom: calc(36px + env(safe-area-inset-bottom)); }.mobile-remote h1 { font-size: 26px; }.mobile-task { align-items: flex-start; flex-direction: column; } }
 
 /* ── 扫码取景层 ──────────────────────────────────────────────────────────────
@@ -217,14 +224,22 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 名称单行截断：两列磁贴容不下两行名字 —— 网格同一行的磁贴是等高的，
    一张高了整行跟着高，参差感比单列列表明显得多。 */
 .mobile-project-choice strong { overflow: hidden; max-width: 100%; color: #1c3a31; font-size: 14px; font-weight: 700; line-height: 1.35; white-space: nowrap; text-overflow: ellipsis; }
-/* 分支单独一行、等宽字体：它是机器可读的标识，和普通文案混排会被误读。 */
-.mobile-project-branch { overflow: hidden; max-width: 100%; color: #4c6b60; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; }
+/* 分支单独一行、等宽字体：它是机器可读的标识，和普通文案混排会被误读。
+   字号下限 11px：磁贴里这行是「这台机器在哪个分支」的唯一说明，10px 在手机上（尤其户外）
+   基本只是纹理。320 屏磁贴内宽实测 124px，11px 等宽下放得下约 20 个字符，更长的走省略号。
+   颜色同步压深一档（#4c6b60 → #3f6053）：小字号 + 等宽细笔画需要更高的对比度兜底。 */
+.mobile-project-branch { overflow: hidden; max-width: 100%; color: #3f6053; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; }
 /* line-height 必须显式给：这个 <small> 继承的是全局行高，磁贴高度会跟着全局值漂
-   （单列卡时代实测同一张卡量到 72 / 77.3 两个数，就是它）。 */
-.mobile-project-choice-meta { overflow: hidden; max-width: 100%; color: #7b9187; font-size: 10px; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; }
+   （单列卡时代实测同一张卡量到 72 / 77.3 两个数，就是它）。
+   字号封顶 11px：320 屏两列磁贴内宽实测 124px，「未运行 · 12 任务 · 8 会话」在 11px 下
+   恰好放得下（124px），再大一档就截掉后半句 —— 想加大得先改布局（比如元信息换行）。
+   三位数计数或换一套更宽的字体时会按设计省略；全量信息在磁贴的 aria-label 里。
+   颜色取本页统一的次级文字色 #587568：原来的 #7b9187 在 11px 上只有 ~3.4:1，
+   户外光下几乎看不见。 */
+.mobile-project-choice-meta { overflow: hidden; max-width: 100%; color: #587568; font-size: 11px; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; }
 /* 运行状态在磁贴上是纯文字：原来的实底胶囊是“白卡里给状态一个家”，现在家就是
    整块底色（磁贴自身已按 data-running 染色），胶囊再描一道就是“卡里套卡”。 */
-.mobile-project-running { color: #74867f; font-weight: 700; }
+.mobile-project-running { color: #5b736a; font-weight: 700; }
 .mobile-project-running[data-state="running"] { color: #1f6d58; }
 /* 运行中的右上角环点（静态，理由见区块头的说明）。 */
 .mobile-project-live { position: absolute; top: 10px; right: 10px; width: 8px; height: 8px; border-radius: 50%; background: #1f8a6d; box-shadow: 0 0 0 3px #cfeadc; }
@@ -281,16 +296,17 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-home-settings:active { background: #d2e9dc; }
 /* 「还有几个任务没跑完」是唯一一眼可见的状态信号，收进菜单就等于看不见了 ——
    做成 ⋯ 上的角标；角标为 0 时整个元素不渲染。位置贴右上，别压住 ⋯ 字形本身。 */
-.mobile-header-menu-badge { position: absolute; top: -4px; right: -3px; display: grid; min-width: 17px; height: 17px; place-items: center; border: 2px solid #f3f8f4; border-radius: 999px; padding: 0 4px; color: #fff; background: #2c7567; font-size: 10px; font-weight: 700; line-height: 1; }
+.mobile-header-menu-badge { position: absolute; top: -4px; right: -3px; display: grid; min-width: 17px; height: 17px; place-items: center; border: 2px solid #f3f8f4; border-radius: 999px; padding: 0 4px; color: #fff; background: #2c7567; font-size: 11px; font-weight: 700; line-height: 1; }
 /* 下拉面板从 ⋯ 下方展开、右对齐。不能超出屏幕：min-width 用 min() 夹住窄屏。
    2026-10-13 方案C改版：「当前电脑 / 执行 Agent」两行排障信息删除（设备身份在设备
    列表面板、Agent 名在会话与历史里各有归属）；改为「工作台 / 会话与任务」两段小节
    标题组织入口，行内图标细描边、无色块（HeaderMenuItemIcon）。 */
 .mobile-header-menu-sheet { position: absolute; z-index: 40; top: calc(100% + 8px); right: 0; display: grid; min-width: min(252px, calc(100vw - 32px)); gap: 1px; border: 1px solid #dfeae4; border-radius: 16px; padding: 6px 6px 8px; background: #fff; box-shadow: 0 12px 30px rgba(25, 51, 44, .16); }
-/* 小节标题：它是分组导航、不是内容，字号压到 10.5px 灰色加宽字距，不与菜单项争。
+/* 小节标题：它是分组导航、不是内容，字号压到 11px 深灰加宽字距，不与菜单项争。
+   （下限就是 11px，别再往 10.5 降 —— 见文件顶部约定。）
    text-align 必须显式钉左：span 在 grid 里 blockify 后占满整行，会继承外部容器
    的对齐（快照复核时被布景的 center 带偏），不能靠"碰巧没人设 center"活着。 */
-.mobile-header-menu-label { padding: 8px 10px 4px; color: #809188; font-size: 10.5px; font-weight: 800; letter-spacing: .08em; text-align: left; }
+.mobile-header-menu-label { padding: 8px 10px 4px; color: #63776e; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-align: left; }
 .mobile-header-menu-sheet button { display: flex; min-height: 42px; align-items: center; gap: 9px; border: 0; border-radius: 10px; padding: 0 10px; color: #1d4b40; background: transparent; font: inherit; font-size: 13.5px; font-weight: 700; text-align: left; white-space: nowrap; }
 /* white-space: nowrap 是**必要**条件：面板是 absolute + right:0 的 shrink-to-fit，
    可用宽度按 ⋯ 按钮的 38px 算，min-width 只兜底、不按内容撑开 —— 「刷新仓库状态」
@@ -305,10 +321,10 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
    .mobile-header-menu-count (0,1,0) 相同，但多一个元素级，源码顺序救不回来 —— 不加这一条，
    胶囊的 color / font-size / font-weight / line-height 会被这行静默盖掉（实测浏览器里
    胶囊显示成 11px/600/#748b81，作者写的 10.5px/800/#4c6b60 全是死代码）。 */
-.mobile-header-menu-aside small:not(.mobile-header-menu-count) { color: #748b81; font-size: 11px; font-weight: 600; line-height: 1.4; }
+.mobile-header-menu-aside small:not(.mobile-header-menu-count) { color: #587568; font-size: 11px; font-weight: 600; line-height: 1.4; }
 /* 计数胶囊：默认浅灰（0 是静默状态，不喊）；任务队列 data-hot（>0）实心绿 ——
    「有活要干」是页面级信号（⋯ 角标同口径 activeTaskCount），两个读数一眼可分。 */
-.mobile-header-menu-count { display: grid; min-width: 20px; height: 19px; place-items: center; border-radius: 999px; padding: 0 6px; color: #4c6b60; background: #f2f5f3; font-size: 10.5px; font-weight: 800; line-height: 1; }
+.mobile-header-menu-count { display: grid; min-width: 20px; height: 19px; place-items: center; border-radius: 999px; padding: 0 6px; color: #4c6b60; background: #f2f5f3; font-size: 11px; font-weight: 800; line-height: 1; }
 .mobile-header-menu-count[data-hot="true"] { color: #fff; background: #2c7567; }
 /* :not(:disabled) 是必要条件：禁用行（「历史会话 0」）本来只靠配色退档，
    底色却和可用行一样随悬停变 —— 点不动的东西给悬停底色等于说"可以点"。
@@ -353,7 +369,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-agent-processing-stage { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* ③ 阶段计时。tabular-nums 让数字等宽 —— 否则每秒重排时「1m09s → 1m10s」
    整格宽度会抖（等宽数字是这种常驻读数该有的基本处理）。 */
-.mobile-agent-processing-elapsed { flex: none; color: #3c7f6d; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.mobile-agent-processing-elapsed { flex: none; color: #33755f; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 @media (prefers-reduced-motion: reduce) { .mobile-task-syncing::before { animation: none; opacity: .75; } }
 /* ⚠️ 这条关键帧原先定义在上面状态条那一段里。状态条 2026-09-22 改成"徽标 + 阶段词 + 读数"
    三格之后，三颗跳点的 DOM 没了，但**这条关键帧不能跟着删** —— 下面「正在写」还在用它
@@ -637,8 +653,8 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-notice-icon { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #4a5d80; background: #dde3ef; font-size: 12px; line-height: 1; }
 .mobile-notice-text { min-width: 0; }
 .mobile-notice-text strong { display: block; color: #35505f; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
-.mobile-notice-text small { display: block; margin-top: 2px; color: #6d7d8c; font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
-.mobile-notice-time { flex: none; color: #9aa7b2; font-size: 11px; white-space: nowrap; }
+.mobile-notice-text small { display: block; margin-top: 2px; color: #5d6d7c; font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+.mobile-notice-time { flex: none; color: #5f707c; font-size: 11px; white-space: nowrap; }
 /* 变体类名必须带 mobile-notice- 前缀。裸类名（尤其 `.error`）会命中 style.css 里的
    全局组件样式——那里 .error 是右上角固定的提示条（position: fixed / top: 16px /
    max-width: min(480px, 100vw - 32px)），实测（320px）错误卡被钉成固定定位、宽度只剩
@@ -807,7 +823,9 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-task-panel .mobile-task-empty-mark { display: grid; width: 46px; height: 46px; place-items: center; margin-bottom: 12px; border-radius: 50%; color: #2c7567; background: #e5f4ea; }
 .mobile-task-panel .mobile-task-empty-mark svg { width: 22px; height: 22px; }
 .mobile-task-panel .mobile-task-empty strong { overflow-wrap: anywhere; color: #19332c; font-size: 15.5px; font-weight: 700; line-height: 1.5; }
-.mobile-task-status { display: inline-flex; width: fit-content; align-items: center; border-radius: 999px; padding: 3px 7px; color: #52766a; background: #edf6ef; font-size: 12px; font-weight: 700; }.mobile-task-status.status-running { color: #176b57; background: #dff3e8; }.mobile-task-status.status-awaiting_review { color: #8b5b1e; background: #fff1ce; }.mobile-task-status.status-failed, .mobile-task-status.status-blocked { color: #9b3e33; background: #fff0ec; }.mobile-task-status.status-completed, .mobile-task-status.status-done { color: #316c51; background: #e3f2e7; }.mobile-task-status.status-cancelled { color: #708078; background: #edf1ee; }
+.mobile-task-status { display: inline-flex; width: fit-content; align-items: center; border-radius: 999px; padding: 3px 7px; color: #52766a; background: #edf6ef; font-size: 12px; font-weight: 700; }.mobile-task-status.status-running { color: #176b57; background: #dff3e8; }.mobile-task-status.status-awaiting_review { color: #8b5b1e; background: #fff1ce; }.mobile-task-status.status-failed, .mobile-task-status.status-blocked { color: #9b3e33; background: #fff0ec; }.mobile-task-status.status-completed, .mobile-task-status.status-done { color: #316c51; background: #e3f2e7; }.mobile-task-status.status-cancelled { color: #5b6a64; background: #edf1ee; }
+/* `cancelled` 用中性灰 #5b6a64（#edf1ee 上 4.99:1；原 #708078 只有 4.16）：既过 AA，
+   又保住「已取消退到背景」的语义 —— 别为省一个色号改用待处理那档绿灰 #52766a。 */
 /* ⚠️ 上面这条链里**任何一格都不许当"死样式"删**（2026-09-16 我自己删过一次 `status-cancelled`，
    这一轮收回）：`cancelled / completed / failed / blocked` 这四个状态在面板里确实列不出来
    （分类栏只有 5 档），但它们守的是**协议上的状态空间**，不是当前的胶囊列表 ——
@@ -963,7 +981,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
   place-items: center; border: 0; border-radius: 999px; padding: 0; color: #4d7d6d; background: transparent; font-size: 15px; }
 .mobile-composer .mobile-quote-ref-remove::after { position: absolute; inset: -8px; content: ""; border-radius: inherit; }
 .mobile-composer .mobile-quote-ref-remove:disabled { color: #9db3a9; }
-.mobile-quote-ref-hint { color: #7d968b; font-size: 11px; }
+.mobile-quote-ref-hint { color: #587568; font-size: 11px; }
 /* 单行高度要与两侧 38px 圆钮齐平：23.2（1.45 行高）+ 上下各 7px ≈ 38。 */
 .mobile-composer textarea { min-width: 0; flex: 1; min-height: 38px; max-height: 140px; resize: none; overflow-y: auto; border: 0; border-radius: 0; padding: 7px 4px; background: transparent; line-height: 1.45; }
 /* 按钮视觉 38px，热区靠 ::after 外扩 3px 补回 44 —— 与头部那三颗同一套做法：
@@ -1095,10 +1113,10 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 /* 输入条的尺寸、触控尺寸与底部安全区已经并入上面「输入区（整盒 + 单行内嵌）」那一段
    （textarea min-height 38 / max-height 140 / 按钮视觉 38 而热区 ≥44），这里不再二次覆盖。 */
 /* 分类栏 5 等分一行：320px 屏每格 54px，13px 的三字标签（39px）会顶到格边，降一档字号。
-   注意这条媒体查询必须排在上面那组无断点规则**之后**（同特异性靠位置生效）。 */
+   注意这条媒体查询必须排在上面那组无断点规则**之后**（同特异性靠位置生效）。
+   计数徽标不再跟着降到 10px：11px 是这页辅助文字的可读性下限（见文件顶部约定）。 */
 @media (max-width: 359px) {
   .mobile-task-filters button { font-size: 12px; }
-  .mobile-task-filters button > span { font-size: 10px; }
   /* 操作行四颗按钮同现（下发 / 详情 / 编辑 / 删除）时，320 屏的卡片内宽只有 262px，
      而四颗按钮是 flex: none 不会自己缩：4×56 + 3×16 = 272，硬顶出去 10px 会被裁掉。
      收 gap 与内边距后是 4×52 + 3×12 = 244。这两个值都是量出来的，别再凭手感调。 */
@@ -1144,7 +1162,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-new-conversation-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .mobile-new-conversation-dialog header { margin-bottom: 14px; }
 .mobile-new-conversation-dialog h2 { margin: 0; color: #19332c; font-size: 19px; }
-.mobile-new-conversation-dialog header p { margin: 3px 0 0; color: #748b81; font-size: 12px; }
+.mobile-new-conversation-dialog header p { margin: 3px 0 0; color: #587568; font-size: 12px; }
 .mobile-new-conversation-dialog header > button { width: 32px; height: 32px; border: 0; border-radius: 8px; color: #4c6b60; background: #f2f5f3; font-size: 20px; cursor: pointer; }
 
 /* 工具徽标大卡：图形主导。裸图形（Claude/OpenAI）坐在品牌浅底上居中（30px）；
@@ -1155,7 +1173,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
   border: 1.5px solid #dfe9e3; border-radius: 16px; padding: 15px 8px 12px; color: #19332c; background: #fbfdfc; cursor: pointer; }
 .mobile-agent-app.selected { border-color: #2c7567; background: #f2faf5; box-shadow: 0 0 0 2px #cfe7db; }
 .mobile-agent-app b { font-size: 12px; line-height: 1.25; text-align: center; }
-.mobile-agent-app small { font-size: 10.5px; color: #748b81; }
+.mobile-agent-app small { font-size: 11px; color: #587568; }
 .mobile-agent-app.unavailable { opacity: .48; filter: grayscale(.72); cursor: not-allowed; }
 .mobile-agent-app.unavailable small { color: #9a7568; }
 .mobile-new-conversation-unavailable { margin: 10px 0 0; padding: 9px 11px; border: 1px solid #ead9cf; border-radius: 8px; background: #fff8f3; color: #8b5f50; font-size: 12px; line-height: 1.45; }
@@ -1179,7 +1197,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-permission-segments button { flex: 1; min-height: 34px; border: 0; border-radius: 8px; padding: 0 8px;
   color: #4c6b60; background: transparent; font-size: 12.5px; font-weight: 700; cursor: pointer; }
 .mobile-permission-segments button.active { color: #225c50; background: #fff; box-shadow: 0 1px 2px #17362c1f; }
-.mobile-permission-hint { margin: 0; color: #748b81; font-size: 11.5px; line-height: 1.6; }
+.mobile-permission-hint { margin: 0; color: #587568; font-size: 11.5px; line-height: 1.6; }
 
 .mobile-new-conversation-dialog footer { margin-top: 16px; }
 .mobile-new-conversation-dialog .mobile-new-conversation-cancel { flex: 1; height: 46px; border: 1px solid #cfe0d6; border-radius: 12px; color: #31594f; background: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
@@ -1210,13 +1228,15 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 }
 .mobile-conversation-history-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .mobile-conversation-history-dialog > header h2 { margin: 0; color: #19332c; font-size: 20px; }
-.mobile-conversation-history-dialog > header small { display: block; margin-top: 4px; color: #6b8178; font-size: 12px; }
+.mobile-conversation-history-dialog > header small { display: block; margin-top: 4px; color: #587568; font-size: 12px; }
 .mobile-conversation-history-dialog > header > button { width: 36px; height: 36px; flex: none; border: 0; border-radius: 6px; color: #607d71; background: transparent; font-size: 24px; line-height: 1; cursor: pointer; }
 /* min-height: 0 让列表在 flex 列里真能收缩，从而自己滚动而不是把弹窗顶出屏幕。 */
 .mobile-conversation-history-list { display: grid; min-height: 0; gap: 6px; margin: 14px 0 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; list-style: none; }
 .mobile-conversation-history-item { display: grid; min-width: 0; gap: 3px; border: 1px solid #d7e6dd; border-radius: 7px; padding: 10px 12px; color: #19332c; background: #f8fcf9; font: inherit; text-align: left; cursor: pointer; }
 .mobile-conversation-history-item strong { overflow: hidden; font-size: 14px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.mobile-conversation-history-item small { overflow: hidden; color: #71887e; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+/* #557065 而不是统一次级色 #587568：这一行会落在 .active 的 #e5f4eb 底上，
+   后者在那里只有 4.44:1（白底 5.05）。 */
+.mobile-conversation-history-item small { overflow: hidden; color: #557065; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-conversation-history-item:hover, .mobile-conversation-history-item:focus-visible { border-color: #5f9d88; background: #eef8f2; }
 .mobile-conversation-history-item.active { border-color: #5f9d88; background: #e5f4eb; box-shadow: 0 0 0 2px #bfe2cf; }
 /* 旧版新会话弹窗（居中小卡）的取消/创建按钮规则已随 2026-09-24 底部弹层改版删除 ——
@@ -1227,7 +1247,8 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 .mobile-update { display: flex; align-items: center; gap: 12px; max-width: 860px; margin: 0 auto 14px; border: 1px solid #c8e85a; border-radius: 7px; padding: 12px 14px; background: #f6fceb; }
 .mobile-update-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
 .mobile-update-text strong { color: #243b34; font-size: 14px; }
-.mobile-update-text small { overflow: hidden; color: #5d7a6d; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+/* #557065：底色是 #f6fceb（青柠色更新条），#5d7a6d 在那里只有 4.45:1。 */
+.mobile-update-text small { overflow: hidden; color: #557065; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-update-action { flex: none; min-height: 44px; display: inline-flex; align-items: center; border: 1px solid #7d9e2f; border-radius: 5px; padding: 9px 15px; color: #19332c; background: #c8e85a; font-size: 13px; font-weight: 700; text-decoration: none; }
 .mobile-update-action:hover { background: #d6f072; }
 .mobile-update-dismiss { flex: none; min-width: 44px; min-height: 44px; border: 1px solid #cfe0c8; border-radius: 5px; color: #5d7a6d; background: #fff; font-size: 14px; cursor: pointer; }
@@ -1266,7 +1287,9 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
    时间戳用 margin-left: auto 贴右，内容再长也不会把它挤出去（文字自己换行）。 */
 .mobile-refresh-status { display: flex; align-items: center; gap: 8px; max-width: 860px; margin: 0 auto 14px; border: 1px solid #c8ded2; border-radius: 7px; padding: 10px 12px; color: #2c7567; background: #eef8f1; font-size: 12px; font-weight: 700; }
 .mobile-refresh-status-text { min-width: 0; overflow-wrap: anywhere; }
-.mobile-refresh-status time { flex: none; margin-left: auto; color: #6f887c; font-weight: 700; white-space: nowrap; }
+/* 时间戳比正文深一档：这条会落在四种底色的变体上，成功态 #e6f5ec 用 #587568
+   只有 4.48:1（差一点不过 4.5），故取有色底那档 #557065（四种底色最低 4.79:1）。 */
+.mobile-refresh-status time { flex: none; margin-left: auto; color: #557065; font-weight: 700; white-space: nowrap; }
 .mobile-refresh-status-success { border-color: #8fb9a5; color: #216b58; background: #e6f5ec; }
 .mobile-refresh-status-unchanged { border-color: #cfded6; color: #567468; background: #f4f8f6; }
 .mobile-refresh-status-failed { border-color: #e5b8aa; color: #9b3e33; background: #fff1ed; }
@@ -1308,7 +1331,7 @@ html.barcode-scanner-active .mobile-remote > *:not(.mobile-scan) { visibility: h
 body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 
 /* 「长按磁贴可拖动换位」：只在没成功拖过一次时出现，拖成一次就永久收起。 */
-.mobile-project-drag-hint { margin: -2px 0 10px; color: #7b9187; font-size: 12px; line-height: 1.45; }
+.mobile-project-drag-hint { margin: -2px 0 10px; color: #587568; font-size: 12px; line-height: 1.45; }
 
 /* 配对状态行：沿用"刷新结果条"的视觉语言（同一页里"流程结果"长得一样）。
    它在 JSX 里是**一个元素、两处挂载点**（配对页内 / 页面级），所以不能挂在任何一层的
@@ -1467,7 +1490,7 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 /* 名字两行封顶：只给一行会把长电脑名截得太狠，不封顶又会让这张卡高矮参差。 */
 .mobile-device-who b { display: -webkit-box; overflow: hidden; color: #1c3a31; font-size: 15px; font-weight: 700;
   line-height: 1.35; word-break: break-word; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.mobile-device-who small { display: block; margin-top: 4px; overflow: hidden; color: #7b9187; font-size: 12px;
+.mobile-device-who small { display: block; margin-top: 4px; overflow: hidden; color: #587568; font-size: 12px;
   line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
 /* 「在线」紧跟电脑名。不加边框的实底胶囊：卡片已经有一圈边框，胶囊再描一道边就是"卡里套卡"。 */
 .mobile-device-pill { display: inline-block; margin-left: 7px; border-radius: 999px; padding: 2px 8px;
@@ -1491,7 +1514,7 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 .mobile-device-sheet h2 { margin: 0; font-size: 16px; color: #19332c; }
 /* 面板副标题：底部那颗按钮把"添加电脑"和"重新配对"合并成了同一件事（本来就是同一个流程），
    由这一句把两重含义说清楚。 */
-.mobile-device-sheet-note { margin: 2px 0 12px; color: #6f887c; font-size: 12px; line-height: 1.5; }
+.mobile-device-sheet-note { margin: 2px 0 12px; color: #587568; font-size: 12px; line-height: 1.5; }
 .mobile-device-sheet header button { border: 0; background: transparent; color: #52766a; font-size: 20px; line-height: 1;
   min-width: 40px; min-height: 40px; cursor: pointer; }
 /* 每一台电脑＝[行主体(点＝切到这台)] + [动作列：备注 / 解绑]。行**必须是容器而不是 <button>**：
@@ -1509,7 +1532,7 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
    选择器写到 (0,3,0) 是为了**与书写顺序无关**地压过 `.mobile-device-row-who small`(0,1,1) ——
    后者定义在本规则**下面**，靠顺序赢的话下次谁挪一下行序就会静默变色（本文件已吃过一次这种亏）。
    单行省略：真名可能 30 多个字符，它是"用来对账"的辅助信息，不该把行撑成三行。 */
-.mobile-device-row .mobile-device-row-who .mobile-device-row-origin { overflow: hidden; color: #9aafa6;
+.mobile-device-row .mobile-device-row-who .mobile-device-row-origin { overflow: hidden; color: #587568;
   text-overflow: ellipsis; white-space: nowrap; }
 /* 行尾动作列（2026-09-21 加「备注」）。**竖排而不是并排** —— 320px 屏上面板内容宽只有
    292px，并排时"名字 + 状态胶囊 + ✓ + 备注 + 解绑"会把名字挤到不足 80px（约 5 个字一行），
@@ -1532,7 +1555,7 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
   white-space: nowrap; cursor: pointer; }
 .mobile-device-row-unbind:disabled { opacity: .5; cursor: default; }
 .mobile-device-row-who b { display: block; font-size: 14px; color: #19332c; overflow-wrap: anywhere; }
-.mobile-device-row-who small { display: block; color: #6f887c; font-size: 11px; }
+.mobile-device-row-who small { display: block; color: #587568; font-size: 11px; }
 .mobile-device-tag { flex: none; border-radius: 999px; padding: 3px 8px; color: #976321; background: #fff1ce; font-size: 11px; font-weight: 700; }
 .mobile-device-tag.is-online { color: #286452; background: #e4f6e9; }
 .mobile-device-row[data-revoked="true"] .mobile-device-tag { color: #9b3e33; background: #fff1ed; }
@@ -1544,8 +1567,8 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 /* 「备注」弹层（2026-09-21）。骨架整体复用 `.mobile-task-modal`（居中小卡 + 头部 × + 底部按钮），
    这里只补两句它没有的：说明文字与「清除备注」。 */
 /* 那句说明必须说清"只在这台手机上生效" —— 否则用户会以为改的是电脑本身的名字
-   （那是云端 `/v1/instances` 报的 `deviceName`，手机改不了它）。它不是错误提示，用中性灰。 */
-.mobile-device-alias-hint { margin: 0; color: #6f887c; font-size: 12px; line-height: 1.6; }
+   （那是云端 `/v1/instances` 报的 `deviceName`，手机改不了它）。它不是错误提示，用中性色。 */
+.mobile-device-alias-hint { margin: 0; color: #587568; font-size: 12px; line-height: 1.6; }
 /* 「清除备注」靠左、独立一档。⚠️ 选择器写到 (0,3,1) 是**故意的**：`.mobile-task-modal footer button`
    是 (0,2,1)、`:last-child` 那条是 (0,2,2)，只写类名会被它们盖掉，效果就变成"靠书写顺序生效"。
    它只在**已经起过备注**时渲染，所以不会出现"一进来就有个红灯"。 */
@@ -1764,7 +1787,7 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 .mobile-optimization-trigger span:first-child { font-size: 15px; line-height: 1; }
 .mobile-optimization { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: #f7fbf8; color: #183a30; }
 .mobile-optimization-header { display: flex; align-items: center; justify-content: space-between; padding: max(14px, env(safe-area-inset-top)) 16px 13px; border-bottom: 1px solid #dceae2; background: #fbfefc; }
-.mobile-optimization-header small { color: #4a927c; font-size: 11px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.mobile-optimization-header small { color: #357a64; font-size: 11px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
 .mobile-optimization-header h2 { margin: 3px 0 0; font-size: 18px; }
 .mobile-optimization-header > button { width: 32px; height: 32px; border: 0; border-radius: 50%; color: #5b756b; background: #edf5f0; font-size: 22px; line-height: 1; }
 .mobile-optimization-body { width: min(100%, 520px); margin: 0 auto; padding: 18px 16px calc(24px + env(safe-area-inset-bottom)); overflow: auto; }
@@ -1775,19 +1798,19 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 .mobile-optimization-agents button.active { border-color: #4c9a7b; background: #eff9f3; box-shadow: 0 0 0 2px #4c9a7b22; }
 .mobile-optimization-agent-mark { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; color: #fff; background: #2c8069; font-weight: 800; }
 .mobile-optimization-agents button span:nth-child(2) { display: grid; gap: 2px; min-width: 0; }
-.mobile-optimization-agents button small { color: #7c9188; font-size: 11px; }
+.mobile-optimization-agents button small { color: #587568; font-size: 11px; }
 .mobile-optimization-agents button i { margin-left: auto; color: #2d8068; font-style: normal; font-weight: 800; }
 .mobile-optimization-primary, .mobile-optimization-actions .primary { min-height: 42px; border: 0; border-radius: 9px; color: #fff; background: #2d8068; font-weight: 750; }
 .mobile-optimization-primary { width: 100%; margin-top: 20px; }
 .mobile-optimization-running { display: grid; justify-items: center; padding-top: 70px; text-align: center; }
 .mobile-optimization-spinner { width: 42px; height: 42px; margin-bottom: 14px; border: 3px solid #dcece3; border-top-color: #2d8068; border-radius: 50%; animation: mobile-optimization-spin .8s linear infinite; }
 .mobile-optimization-running h3, .mobile-optimization-result-head h3 { margin: 0; font-size: 19px; }
-.mobile-optimization-running p { margin: 8px 0 18px; color: #6c8378; }
-.mobile-optimization-running small { color: #8ca097; }
+.mobile-optimization-running p { margin: 8px 0 18px; color: #587568; }
+.mobile-optimization-running small { color: #587568; }
 .mobile-optimization-progress { width: min(100%, 300px); height: 7px; overflow: hidden; border-radius: 5px; background: #dfede5; }
 .mobile-optimization-progress i { display: block; width: 62%; height: 100%; border-radius: inherit; background: #4c9a7b; animation: mobile-optimization-progress 1.3s ease-in-out infinite; }
 .mobile-optimization-result-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-.mobile-optimization-result-head small { color: #4a927c; font-size: 11px; font-weight: 700; }
+.mobile-optimization-result-head small { color: #357a64; font-size: 11px; font-weight: 700; }
 .mobile-optimization-retry { border: 0; color: #2d8068; background: transparent; font-size: 12px; font-weight: 750; }
 .mobile-optimization-list { display: grid; gap: 10px; }
 .mobile-optimization-list article { border: 1px solid #d8e7de; border-radius: 11px; overflow: hidden; background: #fff; }
@@ -1796,9 +1819,9 @@ body.card-drag-active .mobile-project-choice { cursor: grabbing; }
 .mobile-optimization-suggestion span { display: grid; gap: 6px; min-width: 0; }
 .mobile-optimization-suggestion b { font-size: 14px; }
 .mobile-optimization-suggestion small { color: #647a70; font-size: 12px; line-height: 1.45; }
-.mobile-optimization-suggestion em { flex: none; padding: 4px 6px; border-radius: 5px; color: #8a6b2b; background: #f5f0e4; font-size: 10px; font-style: normal; }
+.mobile-optimization-suggestion em { flex: none; padding: 4px 6px; border-radius: 5px; color: #7d5d1f; background: #f5f0e4; font-size: 11px; font-style: normal; }
 .mobile-optimization-actions { display: grid; gap: 10px; padding: 0 13px 13px; }
-.mobile-optimization-actions > small { color: #8a9b94; font-size: 11px; }
+.mobile-optimization-actions > small { color: #587568; font-size: 11px; }
 .mobile-optimization-actions > div { display: flex; gap: 8px; }
 .mobile-optimization-actions button { flex: 1; min-height: 38px; border-radius: 8px; font-size: 12px; font-weight: 700; }
 .mobile-optimization-actions .secondary { border: 1px solid #cfe1d7; color: #356b59; background: #fff; }

@@ -1,9 +1,10 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 
 import { toast } from "sonner";
 
 import { changeState, commitFileStatusLabel, formatGitTime, groupChanges, isMergeCommit, shortOID, type GitBranch, type GitChange, type GitCommit, type GitCommitDetail, type GitCommitFile, type GitConflictOverview, type GitDiff, type GitOperation, type GitSnapshot } from "./git-model";
 import { ConflictSolveView } from "./ConflictSolveView";
+import { useCodeFontSize } from "../files/useCodeFontSize";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Tab = "changes" | "branches";
@@ -868,9 +869,11 @@ export function parseDiffContent(content: string): DiffLine[] {
 }
 
 function DiffViewer({ diff, close }: { diff: GitDiff; close: () => void }) {
+  // 差异正文的字号跟设置页的“代码字号”走；行号与 hunk 行仍由 CSS 单独控制。
+  const { fontSize } = useCodeFontSize();
   const lines = parseDiffContent(diff.content);
   const stageLabel = diff.stage === "index" ? "已暂存差异" : diff.stage === "commit" ? "提交差异" : "工作区差异";
-  return <section className="git-diff"><header><div><span>{stageLabel}</span><b>{diff.path}</b></div><button type="button" className="git-close" title="关闭差异" aria-label="关闭差异" onClick={close}>×</button></header>{lines.length ? <div className="git-diff-code" role="region" aria-label={`${diff.path} 的${stageLabel}`}>{lines.map((line, index) => <div className={`git-diff-line ${line.kind}`} key={`${index}-${line.content}`}><span className="git-diff-number">{line.oldLine ?? ""}</span><span className="git-diff-number">{line.newLine ?? ""}</span><span className="git-diff-prefix" aria-hidden="true">{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : ""}</span><code>{line.content}</code></div>)}</div> : <p className="git-diff-empty">该文件没有可显示的文本差异。</p>}</section>;
+  return <section className="git-diff"><header><div><span>{stageLabel}</span><b>{diff.path}</b></div><button type="button" className="git-close" title="关闭差异" aria-label="关闭差异" onClick={close}>×</button></header>{lines.length ? <div className="git-diff-code" style={{ "--git-code-font-size": `${fontSize}px` } as CSSProperties} role="region" aria-label={`${diff.path} 的${stageLabel}`}>{lines.map((line, index) => <div className={`git-diff-line ${line.kind}`} key={`${index}-${line.content}`}><span className="git-diff-number">{line.oldLine ?? ""}</span><span className="git-diff-number">{line.newLine ?? ""}</span><span className="git-diff-prefix" aria-hidden="true">{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : ""}</span><code>{line.content}</code></div>)}</div> : <p className="git-diff-empty">该文件没有可显示的文本差异。</p>}</section>;
 }
 
 function ChangeList({ changes, stage, openDiff, mutatePath, requestDiscard, mutating, empty }: { changes: GitChange[]; stage: "worktree" | "index"; openDiff: (change: GitChange, stage: "worktree" | "index") => void; mutatePath: (action: "stage" | "unstage", path: string) => void; requestDiscard: (path: string, untracked: boolean) => void; mutating: string; empty: string }) {

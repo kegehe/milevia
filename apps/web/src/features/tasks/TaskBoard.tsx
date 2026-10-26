@@ -409,6 +409,27 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   const moveOrder = detail ? moveScope(detail) : [];
   const moveIndex = detail ? moveOrder.findIndex((item) => item.id === detail.id) : -1;
 
+  // 空态必须说清「为什么空」。三种真相分开渲染，原来一律显示「还没有任务 + 新建任务」，
+  // 搜索没命中或任务全被「已取消」折叠时，用户会以为任务被误删：
+  // - empty：项目里真的一条任务都没有；
+  // - filtered：队列里有任务，只是当前搜索词没命中（给「清除搜索」）；
+  // - hidden：任务都在，只是全是已取消且开关没打开（给「显示历史已取消」）。
+  // 判据用 `tasks.length`（总条数）而不是 `activeTasks.length`：后者为 0 不代表项目是空的。
+  const trimmedQuery = query.trim();
+  const hiddenCancelledCount = Math.max(0, tasks.length - activeTasks.length);
+  const emptyState = visibleTasks.length > 0 ? null
+    : tasks.length === 0 ? { state: "empty" as const, title: "还没有任务", description: "将可验证的开发事项加入项目，手动下发执行。" }
+    : trimmedQuery ? {
+      state: "filtered" as const,
+      title: `没有匹配「${trimmedQuery}」的任务`,
+      description: hiddenCancelledCount > 0
+        ? activeTasks.length === 0
+          ? `没有可搜索的任务；另有 ${hiddenCancelledCount} 条历史已取消的任务未显示。`
+          : `当前有 ${activeTasks.length} 个任务可搜索，另有 ${hiddenCancelledCount} 条历史已取消的任务未显示。`
+        : `当前有 ${activeTasks.length} 个任务，换个关键词或清除搜索再看。`,
+    }
+    : { state: "hidden" as const, title: "任务都被隐藏了", description: `全部 ${tasks.length} 个任务都是已取消状态，打开「显示历史已取消」即可查看。` };
+
   return <section className="task-workspace" aria-label="项目任务">
     <header className="task-workspace-head">
       <div className="task-workspace-actions">
@@ -446,7 +467,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
         </>}
       </div>
     </header>
-    {visibleTasks.length === 0 ? <div className="task-empty"><h3>还没有任务</h3><p>将可验证的开发事项加入项目，手动下发执行。</p><button className="primary" onClick={() => setEditor({})}>新建任务</button></div> : view === "board" ? <>{uncoveredStatusCount > 0 && <p className="task-board-note" role="status">有 <b>{uncoveredStatusCount}</b> 条任务的状态不在看板列里，切到「列表」可查看与清理。</p>}<TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} /></> : <TaskList tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} />}
+    {visibleTasks.length === 0 ? <div className="task-empty" data-state={emptyState?.state ?? "empty"} role="status"><h3>{emptyState?.title ?? "还没有任务"}</h3><p>{emptyState?.description}</p>{emptyState?.state === "filtered" ? <button className="primary" onClick={() => setQuery("")}>清除搜索</button> : emptyState?.state === "hidden" ? <button className="primary" onClick={() => setShowHistoricalCancelled(true)}>显示历史已取消</button> : <button className="primary" onClick={() => setEditor({})}>新建任务</button>}</div> : view === "board" ? <>{uncoveredStatusCount > 0 && <p className="task-board-note" role="status">有 <b>{uncoveredStatusCount}</b> 条任务的状态不在看板列里，切到「列表」可查看与清理。</p>}<TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} /></> : <TaskList tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
     {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} beginDispatch={beginDispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={moveIndex > 0} canMoveDown={moveIndex >= 0 && moveIndex < moveOrder.length - 1} request={request} fail={fail} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} confirmLabel={pendingConfirm.confirmLabel} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}

@@ -260,10 +260,11 @@
 .git-diff header span { color: #638177; font-size: 10px; }
 .git-diff header b { overflow: hidden; color: #294f43; text-overflow: ellipsis; white-space: nowrap; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .git-close { width: 30px; height: 30px; font-size: 21px; line-height: 1; }
-.git-diff-code { max-height: min(52dvh, 520px); overflow: auto; color: #dbe9e2; background: #1d3933; font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; tab-size: 2; }
+.git-diff-code { max-height: min(52dvh, 520px); overflow: auto; color: #dbe9e2; background: #1d3933; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--git-code-font-size, 12px); line-height: 1.65; tab-size: 2; }
 .git-diff-line { display: grid; grid-template-columns: 48px 48px 20px minmax(max-content, 1fr); min-width: max-content; min-height: 20px; }
 .git-diff-line:hover { background: rgb(255 255 255 / 5%); }
-.git-diff-line .git-diff-number { box-sizing: border-box; min-width: 0; padding: 0 8px 0 4px; color: #779489; border-right: 1px solid rgb(219 233 226 / 8%); text-align: right; user-select: none; }
+/* 行号列宽是固定的：字号跟着代码涨到 16px 以上时四位数会顶出列宽，所以封顶 13px。 */
+.git-diff-line .git-diff-number { box-sizing: border-box; min-width: 0; padding: 0 8px 0 4px; color: #779489; border-right: 1px solid rgb(219 233 226 / 8%); text-align: right; user-select: none; font-size: min(1em, 13px); }
 .git-diff-line .git-diff-prefix { display: grid; place-items: center; color: #8ea99f; user-select: none; }
 .git-diff-line code { display: block; min-width: 0; padding-right: 16px; color: inherit; font: inherit; white-space: pre; }
 .git-diff-line.added { color: #c7ead8; background: #204d3c; }
@@ -458,8 +459,10 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
   .git-commit-actions { align-items: stretch; flex-direction: column; }
   .git-change-list > div > button:first-child { grid-template-columns: 54px minmax(0, 1fr); }
   .git-change-list small { grid-column: 2; }
-  .git-diff-code { max-height: 250px; font-size: 11px; }
+  .git-diff-code { max-height: 250px; }
   .git-diff-line { grid-template-columns: 40px 40px 18px minmax(max-content, 1fr); }
+  /* 窄窗行号列只有 40px：代码字号涨上去后 13px 的四位数（≈43px）会顶出列宽，行号固定在 11px。 */
+  .git-diff-line .git-diff-number { font-size: 11px; }
   .git-confirmation-dialog > header { padding: 16px 16px 13px; }
   .git-confirmation-body { padding: 16px; }
   .git-confirmation-dialog > footer { padding: 13px 16px 16px; }
@@ -651,14 +654,14 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
 .git-workbench[data-mobile="true"] .git-conflict-unavailable b { font-size: 13px; }
 .git-workbench[data-mobile="true"] .git-conflict-unavailable span { font-size: 12px; }
 
-/* ③ diff 阅读区：11px 的代码在手机上要凑近看。基准是 `font: 12px/1.65`，
-   680px 断点把它压到 11px；这里按**文件查看器的代码字号**（13px）对齐。
+/* ③ diff 阅读区：字号跟设置页的“代码字号”走（缺省 13px，见 `--git-code-font-size`）。
+   680px 断点曾经把它压到 11px，现在不再单独缩 —— 用户设了多大就显示多大。
 
    ⚠️ 行号必须**显式**压回 11px：它跟着 `.git-diff-code` 继承，代码一涨它就一起涨，
    而 `.git-diff-number` 是固定列宽 + `box-sizing: border-box` ⇒ 13px 等宽下**三位数**
    就会顶出盒子、溢到左边那一列去。行号内边距与列宽的调整跟着上面那几条
    `.git-diff-line` 规则一起写（收紧成 7/3、两列 34→36px：content 26px，四位数也放得下）。 */
-.git-workbench[data-mobile="true"] .git-diff-code { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-diff-code { font-size: var(--git-code-font-size, 13px); }
 .git-workbench[data-mobile="true"] .git-diff-line { min-height: 22px; }
 .git-workbench[data-mobile="true"] .git-diff-line .git-diff-number { font-size: 11px; }
 .git-workbench[data-mobile="true"] .git-diff-line.meta,

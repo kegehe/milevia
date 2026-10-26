@@ -175,6 +175,11 @@
 
 .notification-empty-icon .notification-bell-icon { width: 16px; height: 16px; }
 
+/* 读取失败态：与空态分开着色，让“没读到”一眼区别于“确实没有未读通知”。 */
+.notification-load-failed { color: #8c3d2c; }
+.notification-load-failed small { max-width: 240px; color: #93756b; overflow-wrap: anywhere; font-size: 11px; line-height: 1.4; }
+.notification-load-failed .secondary { display: inline-flex; min-height: 30px; align-items: center; justify-self: center; padding: 0 12px; font-size: 12px; }
+
 .notification-item {
   display: flex;
   gap: 10px;

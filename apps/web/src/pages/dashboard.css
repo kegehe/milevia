@@ -28,3 +28,26 @@
 .delete-project-footer .secondary { border-color: #c8dcd1; color: #31594f; background: #f7fbf8; }.delete-project-footer .secondary:hover:not(:disabled) { border-color: #7fae9d; color: #1f6055; background: #eaf5ee; }
 .delete-project-footer .primary.danger { border-color: #b84431; color: #fff; background: #e25b44; box-shadow: none; }.delete-project-footer .primary.danger:hover:not(:disabled) { border-color: #9c3322; background: #d5513c; box-shadow: none; }.delete-project-footer .primary.danger:disabled { border-color: #c9d6ce; color: #809188; background: #dce7df; box-shadow: none; }
 @media (max-width: 520px) { .delete-project-body { padding: 14px; } }
+
+/* 项目总览首屏骨架：加载中显示占位卡，不再把"还没拉到列表"画成"还没有项目"。 */
+.project-card.project-skeleton-card { display: grid; grid-template-rows: auto auto auto auto 1fr; align-content: start; gap: 12px; cursor: default; }
+/* 骨架卡不继承真卡片的装饰（右上色带、右下网格块）：它们在空卡上会被读成内容或坏图。 */
+.project-card.project-skeleton-card::before, .project-card.project-skeleton-card::after { content: none; }
+.project-card.project-skeleton-card:hover { border-color: #c7dcd0; box-shadow: 0 1px 3px #17362c14, 0 10px 24px #17362c0d; transform: none; }
+.project-skeleton-card span { display: block; border-radius: 6px; background: #e3eee7; animation: project-skeleton-pulse 1.4s ease-in-out infinite; }
+/* 色带行本身不上底色、也不做脉冲：它若参与透明度动画，会与内部 i 的动画相乘，
+   两次呼吸中间几乎整块消失（父级 .45 × 子级 .45 ≈ .2）。 */
+.project-skeleton-card .project-skeleton-band { height: 18px; background: transparent; animation: none; }
+.project-skeleton-band i { display: block; width: 72px; height: 12px; border-radius: 6px; background: #e3eee7; animation: project-skeleton-pulse 1.4s ease-in-out infinite; }
+.project-skeleton-title { width: 58%; height: 22px; }
+.project-skeleton-line { width: 88%; height: 11px; }
+.project-skeleton-line.short { width: 46%; }
+.project-skeleton-footer { width: 100%; height: 16px; align-self: end; }
+@keyframes project-skeleton-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .project-skeleton-card span, .project-skeleton-band i { animation: none; } }
+
+/* 列表加载失败态：与"真的没有项目"区分，明确数据没丢，并提供重试入口。 */
+.load-failed { border-color: #e8c3b8; background: #fff8f5; }
+.load-failed h2 { color: #8c3d2c; }
+.load-failed p { margin: 0 0 6px; }
+.load-failed .load-failed-hint { color: #93756b; font-size: 12px; }

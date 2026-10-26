@@ -86,7 +86,8 @@ func TestEnsureStorageReclaimedSwitchesToIncremental(t *testing.T) {
 	}
 }
 
-// 已经是 INCREMENTAL 模式时走增量分支：不重写整库，仍然幂等可重复调用。
+// 已经是 INCREMENTAL 模式时走增量分支（收不干净才退回整库 VACUUM，见
+// needsFullVacuum），两种路径都必须幂等可重复调用。
 func TestEnsureStorageReclaimedIncrementalBranchIsIdempotent(t *testing.T) {
 	server := newTestServer(t)
 	buildFreelist(t, server, 20000)
@@ -104,6 +105,63 @@ func TestEnsureStorageReclaimedIncrementalBranchIsIdempotent(t *testing.T) {
 	}
 }
 
+// 真机那一版库的判据回归：auto_vacuum 已经是 INCREMENTAL、freelist 仍压着 2 GB
+// （631,934 页里 518,071 页空闲），而 incremental_vacuum 0.0 秒只放掉 1 页。这种情况
+// 必须选整库 VACUUM，否则文件会永远停在 2.6 GB、每次启动都"回收成功"却一点没缩小。
+func TestNeedsFullVacuumMatchesObservedBloat(t *testing.T) {
+	const pageSize = int64(4096)
+	for _, testCase := range []struct {
+		name      string
+		force     bool
+		pageCount int64
+		freelist  int64
+		want      bool
+	}{
+		{name: "observed 2.6GB db", pageCount: 631934, freelist: 518071, want: true},
+		{name: "few free pages", pageCount: 631934, freelist: 1000, want: false},
+		{name: "force ignores ratio", force: true, pageCount: 631934, freelist: 10000, want: true},
+		// force 不能比自动回收更保守：小库的高占比空洞重写成本也小，仍然要做。
+		{name: "force vacuums small db with high ratio", force: true, pageCount: 10000, freelist: 3000, want: true},
+		// 大库（20 GB）里的 40 MB 残留只有 0.2%：远低于按库大小放大的 1% 下限，跳过。
+		{name: "force skips tiny residual in huge db", force: true, pageCount: 5242880, freelist: 10000, want: false},
+		// 同一个大库里 250 MB 残留超过 1%，值得重写。
+		{name: "force vacuums meaningful residual in huge db", force: true, pageCount: 5242880, freelist: 64000, want: true},
+		// 增量回收只剩几 MB：不值得为它重写整库（真机 2.6 GB 库，~3 MB 残留）。
+		{name: "force skips negligible residual", force: true, pageCount: 631934, freelist: 1000, want: false},
+		{name: "no free pages", pageCount: 631934, freelist: 0, want: false},
+		{name: "unknown page count", pageCount: 0, freelist: 10, want: false},
+	} {
+		if got := needsFullVacuum(testCase.force, pageSize, testCase.pageCount, testCase.freelist); got != testCase.want {
+			t.Fatalf("%s: needsFullVacuum(force=%v, pageSize=%d, pageCount=%d, freelist=%d) = %v, want %v",
+				testCase.name, testCase.force, pageSize, testCase.pageCount, testCase.freelist, got, testCase.want)
+		}
+	}
+}
+
+// 切到 INCREMENTAL 之后又攒出一大块空洞：这次必须真的收回去。以前这里无论收没收到都
+// 直接返回成功，于是"回收"变成了空转 —— 上面那条真机读数就是这么来的。
+func TestEnsureStorageReclaimedShrinksIncrementalFreelist(t *testing.T) {
+	server := newTestServer(t)
+	buildFreelist(t, server, 20000)
+	if err := server.ensureStorageReclaimed(context.Background()); err != nil {
+		t.Fatalf("first reclaim: %v", err)
+	}
+	if mode := readAutoVacuum(t, server); mode != 2 {
+		t.Fatalf("auto_vacuum = %d after first reclaim, want 2", mode)
+	}
+	buildFreelist(t, server, 20000)
+	before := readFreelist(t, server)
+	if before <= 0 {
+		t.Fatalf("scratch did not leave any freelist pages: %d", before)
+	}
+	if err := server.ensureStorageReclaimed(context.Background()); err != nil {
+		t.Fatalf("second reclaim: %v", err)
+	}
+	if after := readFreelist(t, server); after >= before {
+		t.Fatalf("freelist = %d after second reclaim, want < %d (回收必须真的发生)", after, before)
+	}
+}
+
 // 没什么可回收时不做无谓的重写：auto_vacuum 保持 0，免得为一个小库白白 VACUUM 一遍。
 func TestEnsureStorageReclaimedSkipsWhenNothingToReclaim(t *testing.T) {
 	server := newTestServer(t)
@@ -115,8 +173,71 @@ func TestEnsureStorageReclaimedSkipsWhenNothingToReclaim(t *testing.T) {
 	}
 }
 
-// 用户显式点「清理」时不受阈值限制：force 路径必须真的回收。
+// 用户显式点「清理」时不受占比阈值限制：可回收空间超过绝对下限就必须真的回收。
 func TestReclaimFreePagesForceIgnoresThreshold(t *testing.T) {
+	server := newTestServer(t)
+	buildFreelist(t, server, 20000)
+
+	server.storageMu.Lock()
+	err := server.reclaimFreePagesLocked(context.Background(), true)
+	server.storageMu.Unlock()
+	if err != nil {
+		t.Fatalf("reclaimFreePagesLocked: %v", err)
+	}
+	if mode := readAutoVacuum(t, server); mode != 2 {
+		t.Fatalf("auto_vacuum = %d, want 2 (force must reclaim)", mode)
+	}
+}
+
+// fillLivePages 往库里写一块**保留**的数据，把 page_count 撑大（不制造 freelist），
+// 用来模拟"大库里的少量空洞"。
+func fillLivePages(t *testing.T, server *Server, rows int) {
+	t.Helper()
+	if _, err := server.db.Exec(`create table if not exists reclaim_keep (id integer primary key, blob text)`); err != nil {
+		t.Fatalf("create keep table: %v", err)
+	}
+	tx, err := server.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	stmt, err := tx.Prepare(`insert into reclaim_keep (blob) values (?)`)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("prepare: %v", err)
+	}
+	blob := strings.Repeat("x", 2000)
+	for i := 0; i < rows; i++ {
+		if _, err := stmt.Exec(blob); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			t.Fatalf("insert keep row %d: %v", i, err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+// 点「清理」也不能为几 MB 残留重写一个几 GB 的库：占用比与绝对量都很小时跳过。
+func TestReclaimFreePagesForceSkipsNegligibleResidual(t *testing.T) {
+	server := newTestServer(t)
+	fillLivePages(t, server, 20000) // ~40 MB 真实数据
+	buildFreelist(t, server, 4000)  // ~7 MB 空洞：占比低、绝对值也低于 32 MB
+
+	server.storageMu.Lock()
+	err := server.reclaimFreePagesLocked(context.Background(), true)
+	server.storageMu.Unlock()
+	if err != nil {
+		t.Fatalf("reclaimFreePagesLocked: %v", err)
+	}
+	if mode := readAutoVacuum(t, server); mode != 0 {
+		t.Fatalf("auto_vacuum = %d, want 0 (residual is too small to justify a full rewrite)", mode)
+	}
+}
+
+// force 必须比自动回收更积极：小库的高占比空洞重写成本小，仍然要做。
+func TestReclaimFreePagesForceVacuumsSmallDbWithHighRatio(t *testing.T) {
 	server := newTestServer(t)
 	buildFreelist(t, server, 4000)
 
@@ -127,7 +248,7 @@ func TestReclaimFreePagesForceIgnoresThreshold(t *testing.T) {
 		t.Fatalf("reclaimFreePagesLocked: %v", err)
 	}
 	if mode := readAutoVacuum(t, server); mode != 2 {
-		t.Fatalf("auto_vacuum = %d, want 2 (force must reclaim)", mode)
+		t.Fatalf("auto_vacuum = %d, want 2 (force must reclaim a high-ratio residual)", mode)
 	}
 }
 

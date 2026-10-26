@@ -567,6 +567,34 @@ func (s *Server) mcpOAuthAuthorizationHeader(ctx context.Context, serverID strin
 	return "Bearer " + plain, true
 }
 
+// currentMCPOAuthAccessToken 在并发刷新落败后返回胜者刚写好的令牌。
+// 只在引用确实变了（说明别人刷新过）时返回，避免把仍然有效的旧令牌误当新令牌。
+func (s *Server) currentMCPOAuthAccessToken(ctx context.Context, serverID, oldRef string) (string, bool) {
+	s.mcpOAuthLifecycleMu.Lock()
+	defer s.mcpOAuthLifecycleMu.Unlock()
+	current, err := s.loadMCPOAuthToken(ctx, serverID)
+	if err != nil || current.AccessTokenRef == "" || current.AccessTokenRef == oldRef {
+		return "", false
+	}
+	plain, err := s.profileSecrets.Load(s.db, ctx, current.AccessTokenRef)
+	if err != nil || plain == "" {
+		return "", false
+	}
+	return plain, true
+}
+
+// mcpOAuthAuthorized 只读检查该 server 是否持有可解密的访问令牌，**不触发刷新**。
+// 供已持有 mcpOAuthLifecycleMu 的调用方使用：refreshMCPOAuthToken 也要拿同一把
+// （非可重入）锁，在锁内调用 mcpOAuthAuthorizationHeader 会永久挂死。
+func (s *Server) mcpOAuthAuthorized(ctx context.Context, serverID string) bool {
+	row, err := s.loadMCPOAuthToken(ctx, serverID)
+	if err != nil || row.AccessTokenRef == "" {
+		return false
+	}
+	plain, err := s.profileSecrets.Load(s.db, ctx, row.AccessTokenRef)
+	return err == nil && plain != ""
+}
+
 // refreshMCPOAuthToken 用 refresh token 换新的 access token 并落库。
 // 刷新发生在运行路径上，因此使用独立的超时上下文，避免受调用方 ctx 生命周期影响。
 func (s *Server) refreshMCPOAuthToken(ctx context.Context, row mcpOAuthTokenRow) (string, bool) {
@@ -594,6 +622,11 @@ func (s *Server) refreshMCPOAuthToken(ctx context.Context, row mcpOAuthTokenRow)
 	defer cancel()
 	token, err := postMCPOAuthToken(refreshCtx, mcpOAuthHTTPClient(), row.TokenEndpoint, form, row.ClientID, clientSecret)
 	if err != nil {
+		// 并发的另一个刷新可能已经成功并吊销了我们手上的旧引用（refresh token 轮换
+		// 时本方的请求还会被 invalid_grant 拒绝）。先看当前行是否换了令牌，别让本轮 401。
+		if current, ok := s.currentMCPOAuthAccessToken(context.Background(), row.ServerID, row.AccessTokenRef); ok {
+			return current, true
+		}
 		return "", false
 	}
 	flow := &mcpOAuthFlow{
@@ -607,6 +640,27 @@ func (s *Server) refreshMCPOAuthToken(ctx context.Context, row mcpOAuthTokenRow)
 		ClientID:     row.ClientID,
 		ClientSecret: clientSecret,
 		Scope:        row.Scope,
+	}
+	// 刷新结果落库前必须与「断开授权 / 删除 server」互斥：否则吊销刚删掉令牌行，
+	// 这边的 upsert 又把它写回来（用户看到已断开、状态却变回已授权），或在删 server
+	// 的两步之间插入一条孤儿令牌行。拿到锁后重读令牌行：行没了或 access 引用已经
+	// 换了（别人刷新过 / 刚重新授权），就丢弃本次结果。
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
+	s.mcpOAuthLifecycleMu.Lock()
+	defer s.mcpOAuthLifecycleMu.Unlock()
+	current, err := s.loadMCPOAuthToken(context.Background(), row.ServerID)
+	if err != nil {
+		return "", false
+	}
+	if current.AccessTokenRef != row.AccessTokenRef {
+		// 另一个并发刷新已经落库（并吊销了我们手上这条旧引用）。返回它刚写好的令牌，
+		// 否则本轮会拿着已吊销的旧引用去 Load 失败、整轮运行 401。
+		plain, loadErr := s.profileSecrets.Load(s.db, context.Background(), current.AccessTokenRef)
+		if loadErr != nil || plain == "" {
+			return "", false
+		}
+		return plain, true
 	}
 	if err := s.storeMCPOAuthToken(refreshCtx, flow, token); err != nil {
 		return "", false
@@ -649,12 +703,16 @@ func (s *Server) startMCPServerOAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	projectPath := ""
+	runnerID := ""
 	if stored.ProjectID != "" {
 		if project, err := s.getProjectByID(ctx, stored.ProjectID); err == nil {
 			projectPath = project.Path
+			runnerID = project.RunnerID
 		}
 	}
-	target := s.resolveAgentTargetEnv("", projectPath)
+	// 必须带项目的 runner：只传空 runner 时，Windows 服务端会恒判成 windows，
+	// wsl-local 项目的 ${PROJECT_DIR} 会被塞进带反斜杠的 UNC 原始路径。
+	target := s.resolveAgentTargetEnv(runnerID, projectPath)
 	mcpURL := resolveMCPPlaceholders(stored.URL, target, projectPath)
 	if strings.TrimSpace(mcpURL) == "" {
 		writeError(w, http.StatusBadRequest, errors.New("MCP server 未配置地址"))
@@ -805,6 +863,10 @@ func (s *Server) handleMCPOAuthCallback(w http.ResponseWriter, r *http.Request) 
 		fail("换取访问令牌失败：" + err.Error())
 		return
 	}
+	// 令牌写入也要参与 mcpWriteMu：删除项目会先快照 token 引用再在事务里删行，
+	// 不串行化的话，这中间新落库的令牌行会被删掉但密文永远不会被回收。
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
 	s.mcpOAuthLifecycleMu.Lock()
 	defer s.mcpOAuthLifecycleMu.Unlock()
 	s.mu.Lock()

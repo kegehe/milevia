@@ -264,6 +264,9 @@ function ScheduledTaskEditor({ projectId, task, request, onClose, onSaved, onFai
   const [skills, setSkills] = useState<Skill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  // 完全控制是"无人值守时直接执行命令"的开关：确认层用全站自绘的 ConfirmDialog，
+  // 不再弹原生 confirm（桌面外壳里原生弹窗与其余确认样式不一致）。
+  const [pendingFullControl, setPendingFullControl] = useState(false);
   const permissionChoices = useMemo(() => permissionOptions(form.agentId), [form.agentId]);
 
   useEffect(() => {
@@ -289,7 +292,7 @@ function ScheduledTaskEditor({ projectId, task, request, onClose, onSaved, onFai
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (form.permissionMode === "full_control") {
-      if (window.confirm("定时任务会在无人值守时直接执行命令，不再等待审批。确认使用完全控制？")) save(true);
+      setPendingFullControl(true);
       return;
     }
     save();
@@ -312,7 +315,8 @@ function ScheduledTaskEditor({ projectId, task, request, onClose, onSaved, onFai
     }).then(onSaved).catch((cause) => onFail(cause instanceof Error ? cause.message : "无法保存定时任务")).finally(() => setSaving(false));
   };
 
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-label={task ? "编辑定时任务" : "新建定时任务"}>
+  return <>
+  <div className="backdrop" role="dialog" aria-modal="true" aria-label={task ? "编辑定时任务" : "新建定时任务"}>
     <section className="modal schedule-task-dialog">
       <header className="schedule-task-dialog-head"><div><span>{task ? "EDIT SCHEDULE" : "NEW SCHEDULE"}</span><h2>{task ? "编辑定时任务" : "新建定时任务"}</h2></div><button className="task-editor-close" type="button" title="关闭" aria-label="关闭" disabled={saving} onClick={onClose}>×</button></header>
       <form className="schedule-task-form" onSubmit={submit}>
@@ -326,5 +330,7 @@ function ScheduledTaskEditor({ projectId, task, request, onClose, onSaved, onFai
         <footer><button type="button" className="secondary" disabled={saving} onClick={onClose}>取消</button><button type="submit" className="primary" disabled={saving}>{saving ? "保存中" : "保存任务"}</button></footer>
       </form>
     </section>
-  </div>;
+  </div>
+  {pendingFullControl && createPortal(<ConfirmDialog title="使用完全控制" danger confirmLabel="确认使用" message="定时任务会在无人值守时直接执行命令，不再等待审批。确认使用完全控制？" onConfirm={() => { setPendingFullControl(false); save(true); }} onCancel={() => setPendingFullControl(false)} />, document.body)}
+  </>;
 }

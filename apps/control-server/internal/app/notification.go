@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -28,15 +29,18 @@ type NotificationEvent struct {
 	TaskTitle string `json:"taskTitle,omitempty"`
 	// DurationMs 是最近一次任务执行的耗时（startedAt→finishedAt，服务端算好）。
 	// 无执行记录或时间戳不完整时为 0，前端据此省略耗时行。
-	DurationMs     int64     `json:"durationMs,omitempty"`
-	ConversationID string    `json:"conversationId,omitempty"`
-	TaskID         string    `json:"taskId,omitempty"`
-	Title          string    `json:"title"`
-	Body           string    `json:"body"`
-	Priority       string    `json:"priority"` // "high" | "normal" | "low"
-	ActionURL      string    `json:"actionUrl"`
-	CreatedAt      time.Time `json:"createdAt"`
-	DedupeKey      string    `json:"-"`
+	DurationMs     int64  `json:"durationMs,omitempty"`
+	ConversationID string `json:"conversationId,omitempty"`
+	TaskID         string `json:"taskId,omitempty"`
+	// ScheduledTaskID 是定时任务通知的目标，仅用于删定时任务时一并清掉通知；
+	// 前端按 actionUrl 跳转，不需要这个内部关联。
+	ScheduledTaskID string    `json:"-"`
+	Title           string    `json:"title"`
+	Body            string    `json:"body"`
+	Priority        string    `json:"priority"` // "high" | "normal" | "low"
+	ActionURL       string    `json:"actionUrl"`
+	CreatedAt       time.Time `json:"createdAt"`
+	DedupeKey       string    `json:"-"`
 }
 
 type notificationSubscriber struct {
@@ -71,6 +75,7 @@ func (s *Server) migrateNotifications(ctx context.Context) error {
 	duration_ms integer not null default 0,
 	conversation_id text not null default '',
 	task_id text not null default '',
+	scheduled_task_id text not null default '',
 	title text not null,
 	body text not null,
 	priority text not null default 'normal',
@@ -82,7 +87,7 @@ func (s *Server) migrateNotifications(ctx context.Context) error {
 create index if not exists idx_notifications_dismissed on notifications(dismissed, created_at desc);
 `)
 	if err != nil {
-		return err
+		return fmt.Errorf("create notifications table: %w", err)
 	}
 	// 兼容旧表：添加新列（列已存在时 SQLite 返回错误但无副作用，忽略即可）
 	s.db.ExecContext(ctx, `alter table notifications add column project_name text not null default ''`)
@@ -90,8 +95,62 @@ create index if not exists idx_notifications_dismissed on notifications(dismisse
 	s.db.ExecContext(ctx, `alter table notifications add column duration_ms integer not null default 0`)
 	s.db.ExecContext(ctx, `alter table notifications add column conversation_id text not null default ''`)
 	s.db.ExecContext(ctx, `alter table notifications add column task_id text not null default ''`)
+	s.db.ExecContext(ctx, `alter table notifications add column scheduled_task_id text not null default ''`)
 	s.db.ExecContext(ctx, `alter table notifications add column dedupe_key text not null default ''`)
+	// 索引放在加列之后：旧表要等 alter 完成才有 conversation_id / scheduled_task_id。
+	// 删除项目/会话/定时任务都按这三列清理通知，不能每次全表扫。
+	if _, err = s.db.ExecContext(ctx, `create index if not exists idx_notifications_project on notifications(project_id) where project_id<>'';
+create index if not exists idx_notifications_conversation on notifications(conversation_id) where conversation_id<>'';
+create index if not exists idx_notifications_scheduled_task on notifications(scheduled_task_id) where scheduled_task_id<>''`); err != nil {
+		return fmt.Errorf("create notification target indexes: %w", err)
+	}
 	_, err = s.db.ExecContext(ctx, `create unique index if not exists idx_notifications_dedupe_key on notifications(dedupe_key) where dedupe_key<>''`)
+	return err
+}
+
+// pruneOrphanedNotifications 清理目标实体已不存在的旧通知。
+//
+// 新删除的项目/会话/定时任务都会在各自事务里一并清掉通知；但修复之前删掉的实体
+// 不会经过那些路径，这些行会一直留在通知中心，点“查看”落到不存在的页面。
+// 必须在 projects / conversations / scheduled_tasks / notifications 都建好之后调用
+// （启动迁移末尾）。
+//
+// 定时任务通知的会话只是执行历史，目标仍是定时任务：新行有 scheduled_task_id，
+// 修复前的旧行只有 action_url，所以这里两种都认。
+func (s *Server) pruneOrphanedNotifications(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `delete from notifications
+where (project_id<>'' and not exists (select 1 from projects p where p.id=notifications.project_id))
+   or (scheduled_task_id<>'' and not exists (select 1 from scheduled_tasks t where t.id=notifications.scheduled_task_id))
+   or (scheduled_task_id=''
+       and action_url like '%/tasks/schedules/%'
+       and not exists (select 1 from scheduled_tasks t
+                       where notifications.action_url = '/projects/'||notifications.project_id||'/tasks/schedules/'||t.id))
+   or (scheduled_task_id=''
+       and action_url not like '%/tasks/schedules/%'
+       and conversation_id<>''
+       and not exists (select 1 from conversations c where c.id=notifications.conversation_id))`)
+	return err
+}
+
+// deleteConversationNotificationsTx 删除“查看”目标会话已被删除的通知。
+// 定时任务通知（新行有 scheduled_task_id，旧行的 actionUrl 指向定时任务页）的目标
+// 不是会话，会话只是那次执行的历史，因此保留 —— 删会话不该让一条仍然有效的
+// 定时任务通知消失。
+func deleteConversationNotificationsTx(ctx context.Context, tx *sql.Tx, conversationID string) error {
+	_, err := tx.ExecContext(ctx, `delete from notifications
+where conversation_id<>'' and conversation_id=? and scheduled_task_id='' and action_url not like '%/tasks/schedules/%'`, conversationID)
+	return err
+}
+
+// deleteScheduledTaskNotificationsTx 删除指向已删定时任务的通知。
+// 除了新行按 scheduled_task_id 命中，还要处理修复前没有该列、只有 action_url 的旧行。
+func deleteScheduledTaskNotificationsTx(ctx context.Context, tx *sql.Tx, projectID, scheduledTaskID string) error {
+	// 新行按索引删；修复前的旧行没有该列，只能按 action_url 扫一遍（数量很少）。
+	if _, err := tx.ExecContext(ctx, `delete from notifications where scheduled_task_id<>'' and scheduled_task_id=?`, scheduledTaskID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `delete from notifications
+where scheduled_task_id='' and action_url=?`, "/projects/"+projectID+"/tasks/schedules/"+scheduledTaskID)
 	return err
 }
 
@@ -191,12 +250,39 @@ func (s *Server) addNotificationSubscriber(conn *websocket.Conn, sub *notificati
 // --- 广播函数 ---
 
 func (s *Server) broadcastNotification(event NotificationEvent) {
-	// 1. 持久化到 notifications 表（冗余存储 project_name/conversation_id/task_id，项目删除后仍可显示）
+	// 1. 持久化到 notifications 表。project_name/conversation_id/task_id 都是冗余快照，
+	// 显示时不依赖 join；但项目本身被删除时，这些通知会随项目一起清掉
+	// （见 deleteProjectLocked），否则“查看”会跳到已不存在的项目。
+	// where 再挡一次"检查目标存在之后、插入之前目标被删"的竞态：项目不存在就不落库、
+	// 也不广播；任务/编排通知的会话不存在时退回项目会话入口重试一次，不丢通知。
+	// 定时任务通知的目标是任务页，会话只是执行历史，不受会话检查限制。
 	s.notificationMu.Lock()
 	event.CreatedAt = time.Now().UTC()
-	result, err := s.db.ExecContext(s.runtimeCtx,
-		`insert or ignore into notifications (id, type, project_id, project_name, task_title, duration_ms, conversation_id, task_id, title, body, priority, action_url, dismissed, created_at, dedupe_key) values (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`,
-		event.ID, event.Type, event.ProjectID, event.ProjectName, event.TaskTitle, event.DurationMs, event.ConversationID, event.TaskID, event.Title, event.Body, event.Priority, event.ActionURL, event.CreatedAt, event.DedupeKey)
+	insert := func(conversationID, actionURL string) (sql.Result, error) {
+		return s.db.ExecContext(s.runtimeCtx,
+			`insert or ignore into notifications (id, type, project_id, project_name, task_title, duration_ms, conversation_id, task_id, scheduled_task_id, title, body, priority, action_url, dismissed, created_at, dedupe_key)
+			select ?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?
+			where (?='' or exists (select 1 from projects where id=?))
+			  and (?<>'' or ?='' or exists (select 1 from conversations where id=?))`,
+			event.ID, event.Type, event.ProjectID, event.ProjectName, event.TaskTitle, event.DurationMs, conversationID, event.TaskID, event.ScheduledTaskID, event.Title, event.Body, event.Priority, actionURL, event.CreatedAt, event.DedupeKey,
+			event.ProjectID, event.ProjectID, event.ScheduledTaskID, conversationID, conversationID)
+	}
+	result, err := insert(event.ConversationID, event.ActionURL)
+	if err == nil {
+		if changed, rowsErr := result.RowsAffected(); rowsErr == nil && changed == 0 && event.ConversationID != "" && event.ScheduledTaskID == "" {
+			// rowsAffected=0 也可能是去重键命中（同一通知已存在），不能一律当成
+			// "会话被删"。先确认会话确实不在了、项目还在，才退回项目入口重试；
+			// 这样去重命中时不再白做一次被忽略的插入。
+			var conversationExists, projectExists bool
+			if queryErr := s.db.QueryRowContext(s.runtimeCtx,
+				`select exists(select 1 from conversations where id=?), exists(select 1 from projects where id=?)`,
+				event.ConversationID, event.ProjectID).Scan(&conversationExists, &projectExists); queryErr == nil && !conversationExists && projectExists {
+				event.ConversationID = ""
+				event.ActionURL = "/projects/" + event.ProjectID + "/conversations"
+				result, err = insert("", event.ActionURL)
+			}
+		}
+	}
 	s.notificationMu.Unlock()
 	if err != nil {
 		log.Printf("persist notification %s: %v", event.ID, err)

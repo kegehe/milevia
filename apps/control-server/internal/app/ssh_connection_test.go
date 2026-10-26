@@ -638,6 +638,117 @@ func TestPreflightEditReusesStoredPrivateKeyPath(t *testing.T) {
 	}
 }
 
+// newTestHostKeyLine 生成一条真实可解析的 ed25519 主机公钥（authorized_keys 行）。
+// 手工拼接的假 base64 常常长度不匹配，parsePinnedHostKey 会直接拒绝。
+func newTestHostKeyLine(t *testing.T) string {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	key, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatalf("wrap host key: %v", err)
+	}
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+}
+
+// 编辑既有连接时，只要目标（host/port）没变，就必须把已保存的指纹作为严格 pin
+// 传给建连层：否则一次普通编辑会以 TOFU 接受任何主机键，并在保存时覆盖 known_hosts。
+func TestPreflightEditPinsStoredHostKey(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	pinned := newTestHostKeyLine(t)
+	if _, err := server.db.Exec(`update ssh_connections set known_hosts=? where id=?`, pinned, connection.ID); err != nil {
+		t.Fatalf("seed host key: %v", err)
+	}
+	var seen SSHConnection
+	orig := newSSHClient
+	newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
+		seen = conn
+		return nil, errors.New("stop after capture")
+	}
+	t.Cleanup(func() { newSSHClient = orig })
+	body := `{"name":"SSH test","host":"example.test","port":22,"user":"dev","authMethod":"key","privateKeyPath":"","rootPath":"/srv/projects","connectionId":"` + connection.ID + `"}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-connections/preflight", strings.NewReader(body)))
+	if seen.KnownHosts != pinned {
+		t.Fatalf("edit preflight did not pin the stored host key: got %q want %q", seen.KnownHosts, pinned)
+	}
+}
+
+// 改了主机/端口就是另一台机器，旧 pin 不该套用（否则合法的迁移永远预检不过）。
+func TestPreflightEditDropsPinWhenTargetChanges(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	pinned := newTestHostKeyLine(t)
+	if _, err := server.db.Exec(`update ssh_connections set known_hosts=? where id=?`, pinned, connection.ID); err != nil {
+		t.Fatalf("seed host key: %v", err)
+	}
+	var seen SSHConnection
+	orig := newSSHClient
+	newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
+		seen = conn
+		return nil, errors.New("stop after capture")
+	}
+	t.Cleanup(func() { newSSHClient = orig })
+	body := `{"name":"SSH test","host":"moved.example.test","port":22,"user":"dev","authMethod":"key","privateKeyPath":"","rootPath":"/srv/projects","connectionId":"` + connection.ID + `"}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-connections/preflight", strings.NewReader(body)))
+	if seen.KnownHosts != "" {
+		t.Fatalf("changed target kept the old pin: %q", seen.KnownHosts)
+	}
+}
+
+// 远端确实换了密钥时，预检要明确回报"指纹变了"并给出新旧两枚指纹，让界面能要求
+// 用户重新核对后显式确认再固定；不能只报一句连不上。
+func TestPreflightEditReportsChangedHostKeyForRepin(t *testing.T) {
+	server := newTestServer(t)
+	connection := seedSSHConnectionForTest(t, server, "disconnected")
+	pinned := newTestHostKeyLine(t)
+	presented := newTestHostKeyLine(t)
+	if _, err := server.db.Exec(`update ssh_connections set known_hosts=? where id=?`, pinned, connection.ID); err != nil {
+		t.Fatalf("seed host key: %v", err)
+	}
+	orig := newSSHClient
+	// closed=true 让 execCommand 立刻失败（无需真实拨号），同时保留握手"看到"的键。
+	newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, error) {
+		return &sshClient{closed: true, lastHostKey: presented}, nil
+	}
+	t.Cleanup(func() { newSSHClient = orig })
+	body := `{"name":"SSH test","host":"example.test","port":22,"user":"dev","authMethod":"key","privateKeyPath":"","rootPath":"/srv/projects","connectionId":"` + connection.ID + `"}`
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-connections/preflight", strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("preflight status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		OK               bool   `json:"ok"`
+		HostKeyChanged   bool   `json:"hostKeyChanged"`
+		HostKey          string `json:"hostKey"`
+		Fingerprint      string `json:"fingerprint"`
+		SavedFingerprint string `json:"savedFingerprint"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode preflight result: %v", err)
+	}
+	if result.OK {
+		t.Fatal("preflight reported success although the pinned host key changed")
+	}
+	if !result.HostKeyChanged {
+		t.Fatal("preflight did not flag the changed host key")
+	}
+	if result.HostKey != presented {
+		t.Fatalf("hostKey = %q, want the newly presented key %q", result.HostKey, presented)
+	}
+	if result.SavedFingerprint != hostKeyFingerprint(pinned) {
+		t.Fatalf("savedFingerprint = %q, want %q", result.SavedFingerprint, hostKeyFingerprint(pinned))
+	}
+	if result.Fingerprint != hostKeyFingerprint(presented) {
+		t.Fatalf("fingerprint = %q, want %q", result.Fingerprint, hostKeyFingerprint(presented))
+	}
+}
+
 func TestUpdateConnectedConnectionFailingReconnectKeepsConnectedStatus(t *testing.T) {
 	server := newTestServer(t)
 	connection := seedSSHConnectionForTest(t, server, "connected")

@@ -222,7 +222,13 @@ export default function CliToolsPage() {
       const list = await api<RunnerInfo[]>("/api/runners");
       setRunners(list);
       setRunnersState("ready");
-      setSelectedRunner((current) => current || list[0]?.id || "");
+      // 选中的那台可能已经不在清单里了（SSH 被断开/删除、WSL 没起来）。
+      // 留着它，下一次读这个环境必然 404，而页面上又没有别的标签可点
+      //（只剩一个环境时选择器整块隐藏）—— 于是整页卡在"读不到"上。
+      setSelectedRunner((current) => {
+        if (current && list.some((item) => item.id === current)) return current;
+        return list[0]?.id || "";
+      });
     } catch (cause) {
       setRunnersState("error");
       setRunnersError(cause instanceof Error ? cause.message : "无法读取执行环境");
@@ -361,17 +367,29 @@ export default function CliToolsPage() {
     }
   }, []);
 
-  const catalogKey = useMemo(() => catalog.entries.map((entry) => entry.id).join(","), [catalog.entries]);
+  /**
+   * 要查"最新版本"的那批工具。
+   *
+   * 只查**服务端能回答**的那些：这个执行环境根本不提供该工具时（unsupported），
+   * 服务端会回 404（resolveAgent 对 unsupported 直接报错）—— 那是必然失败的请求。
+   * `updateSupported` 正是服务端给出的这个判据（unsupported 那一档它是 false）。
+   *
+   * 名单取自「这台机器上的工具读数」而不是工具目录：目录里所有工具都在，
+   * 而"这个环境提供哪些"只有读数知道。
+   */
+  const checkableKey = useMemo(
+    () => (view?.items ?? []).filter((item) => item.updateSupported).map((item) => item.id).join(","),
+    [view?.items],
+  );
 
   // 进入页面（或换执行环境）后自动跑一次批量诊断 + 读一遍各工具的最新版本。
   // 放在这里而不是列表接口里：它们都是"深查"，只该发生在管理页真的被打开时。
   // ⚠️ 触发点**只能有一个**（就是这里的 viewState 回到 ready）：refresh() 里再调一次
   // 就会每次刷新跑两遍完整诊断，而两遍的结论必然一样。
   //
-  // ⚠️ catalogKey 必须在依赖里（"最新版本"那一趟要知道有哪些工具，而目录比 /agents 晚到
-  // 是常态），但它一变 effect 就整体重跑 —— 于是诊断也会跟着再跑一遍（多次子进程 + 扫目录，
-  // 这一页最贵的动作，2026-09-29 复查）。所以用**读数身份**去重：同一份 view 上只跑一次诊断，
-  // 目录晚到时只补"最新版本"那一趟。
+  // ⚠️ checkableKey 必须在依赖里（"最新版本"那一趟要知道该查哪些），但它一变 effect
+  // 就整体重跑 —— 于是诊断也会跟着再跑一遍（多次子进程 + 扫目录，这一页最贵的动作，
+  // 2026-09-29 复查）。所以用**读数身份**去重：同一份 view 上只跑一次诊断。
   const diagnosedViewRef = useRef<typeof view>(null);
   useEffect(() => {
     if (viewState !== "ready" || !view?.probeOk) return;
@@ -382,8 +400,8 @@ export default function CliToolsPage() {
     const alreadyDiagnosed = !force && diagnosedViewRef.current === view;
     diagnosedViewRef.current = view;
     if (!alreadyDiagnosed) void runDiagnostics(selectedRunner, force);
-    if (catalogKey) void checkLatestVersions(selectedRunner, catalogKey.split(","), force);
-  }, [runDiagnostics, checkLatestVersions, selectedRunner, viewState, view, catalogKey]);
+    if (checkableKey) void checkLatestVersions(selectedRunner, checkableKey.split(","), force);
+  }, [runDiagnostics, checkLatestVersions, selectedRunner, viewState, view, checkableKey]);
 
   /** 单个工具的显式详查（详情抽屉里的「重新检测这个工具」）。 */
   const diagnoseOne = useCallback(async (agentID: string) => {

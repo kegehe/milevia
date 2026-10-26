@@ -1634,7 +1634,8 @@ test("mobile device alias: 每台电脑一个只在这台手机上生效的备�
   assert.doesNotMatch(styles, /\.mobile-device-row-unbind \{ flex: none; align-self: center;/);
   // 「原名」那行要压过 `.mobile-device-row-who small`(0,1,1)，所以选择器必须写到 (0,3,0)；
   // 只写类名会变成"靠书写顺序生效"（本文件已吃过一次这种亏）。
-  assert.match(styles, /\.mobile-device-row \.mobile-device-row-who \.mobile-device-row-origin \{ overflow: hidden; color: #9aafa6;/);
+  // 颜色同 `.mobile-device-row-who small` 的次级档（2026-10-25 从 #9aafa6 改来：原色只有 2.32:1）。
+  assert.match(styles, /\.mobile-device-row \.mobile-device-row-who \.mobile-device-row-origin \{ overflow: hidden; color: #587568;/);
 });
 
 test("mobile device storage keeps the legacy key alive for older builds", () => {
@@ -1886,7 +1887,9 @@ test("mobile task panel is a full-page dialog whose status filters fit on one li
   // 而 `taskStatusClass` 是通用的 `status-${status}`。删掉只会让 failed/blocked 这类**安全信号**
   // 退回默认灰绿、跟「待处理」同色。"列不出来"要靠 `.mobile-task-hidden` 报数兜，不靠删色。
   for (const [status, color, background] of [
-    ["cancelled", "#708078", "#edf1ee"],
+    // cancelled 用中性灰（2026-10-25 从 #708078 改来：原色在白底只有 4.16:1）；
+    // 保持"退到背景"的语义，所以不取 #557065 那档绿灰。
+    ["cancelled", "#5b6a64", "#edf1ee"],
     ["completed", "#316c51", "#e3f2e7"],
     ["done", "#316c51", "#e3f2e7"],
     ["failed", "#9b3e33", "#fff0ec"],
@@ -2504,7 +2507,7 @@ test("mobile renders notices inside the message list and before the processing i
   // 消息与状态卡按时间混排，而不是"先列全部消息、再列全部状态"。
   assert.match(page, /return entries\.sort\(\(left, right\) => left\.at - right\.at\);/);
   // 图标沿用桌面时间线的字形，两端看到的是同一个符号。
-  assert.match(page, /const noticeIcons: Record<RemoteNotice\["variant"\], string> = \{ compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", task: "▸", error: "!" \};/);
+  assert.match(page, /const noticeIcons: Record<RemoteNotice\["variant"\], string> = \{ compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", session: "◌", task: "▸", error: "!" \};/);
 });
 
 test("mobile notice cards stay inside the narrow message column", () => {
@@ -3761,7 +3764,8 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
 
   // ⑭ 手机端的排版尺度是**设计参数**，把数值本身钉住（390×844 实测后定的）。
   //    没有这几条，任何一次"顺手统一字号"都能把它们悄悄改回去，而截图不会有人天天看。
-  assert.match(gitStyles, /\.git-workbench\[data-mobile="true"\] \.git-diff-code \{ font-size: 13px; \}/);
+  //    diff 源码区是例外：它跟随设置页的“代码字号”，13px 只作为缺省值保留。
+  assert.match(gitStyles, /\.git-workbench\[data-mobile="true"\] \.git-diff-code \{ font-size: var\(--git-code-font-size, 13px\); \}/);
   // ⚠️ 行号是最容易漏的一条：它继承 `.git-diff-code`，代码一涨它就跟着涨，
   //    而它的盒子是固定列宽 + border-box ⇒ 三位数就会顶出去。
   assert.match(gitStyles, /\.git-workbench\[data-mobile="true"\] \.git-diff-line \.git-diff-number \{ font-size: 11px; \}/);
@@ -3882,6 +3886,25 @@ test("mobile optimization panel is wired into the conversation view", async () =
   //    上面 ②③⑤ 断的就是这件事；这层 memo 与那些断言是一套约定，拆一边要同时改另一边。
   const optimizationPanel = normalize(await readFile(new URL("./features/optimization/MobileOptimizationPanel.tsx", import.meta.url), "utf8"));
   assert.match(optimizationPanel, /export const MobileOptimizationPanel = memo\(/);
+  // ⑨ 面板骨架里有几条与 mobile-remote.css **同名同特异性**的规则（这里一份、那边一份），
+  //    靠引入顺序决定谁生效 —— 两处必须同值，否则颜色/字号会随打包顺序漂移。
+  //    2026-10-25 复查时就出现过一边改了、另一边还是旧色。
+  const optimizationStyles = normalize(await readFile(new URL("./features/optimization/mobile-optimization.css", import.meta.url), "utf8"));
+  const pickRule = (css, suffix) => {
+    const escaped = suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return (css.match(new RegExp(`\\.mobile-optimization-header ${escaped}\\s*\\{[^}]*\\}`)) || [""])[0]
+      .replace(/\s+/g, " ").trim();
+  };
+  // 只比**两边本来就写成同样值**的三条；`.mobile-optimization-header` 本体和 `.mobile-optimization`
+  // 在两份里职责不同（flex/overflow 只写在面板那份），不在比较范围。
+  for (const suffix of ["small", "h2", "> button"]) {
+    assert.ok(pickRule(optimizationStyles, suffix), `面板样式表丢了 .mobile-optimization-header ${suffix} 的基础骨架`);
+    // 将来若把 mobile-remote.css 那份删掉（只剩一个来源），这条自动放行；只要两份都在，就必须同值。
+    if (pickRule(styles, suffix)) {
+      assert.equal(pickRule(optimizationStyles, suffix), pickRule(styles, suffix),
+        `.mobile-optimization-header ${suffix} 两份必须同值（胜负由引入顺序决定）`);
+    }
+  }
 });
 
 test("mobile conversation can actually be stopped from the composer", () => {

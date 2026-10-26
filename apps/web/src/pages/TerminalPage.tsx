@@ -4,6 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { api, type APIError } from "../lib/api";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { createWebSocket } from "../lib/runtime";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
 import type { TerminalSessionInfo, TerminalSessionList } from "../lib/types";
@@ -41,6 +42,10 @@ export default function TerminalPage() {
   const [connectionVersion, setConnectionVersion] = useState(0);
   const [showNewMenu, setShowNewMenu] = useState(false);
   const newMenuRef = useRef<HTMLDivElement>(null);
+  // 关闭确认：点标签上的 × 或中键点击都会立刻结束会话及其中的进程，
+  // 未结束的会话（可能正跑着构建/部署）要先确认，已结束的会话才直接关。
+  const [pendingCloseID, setPendingCloseID] = useState<string | null>(null);
+  const [closing, setClosing] = useState(false);
   projectIDRef.current = projectId;
   const conversationId = useActiveConversationId(projectId);
 	const workspaceQuery = conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : "";
@@ -60,6 +65,7 @@ export default function TerminalPage() {
       if (projectIDRef.current === projectId) {
         setSessions((current) => [...current.filter((item) => item.id !== created.id), created]);
         setActiveID(created.id);
+        statusRef.current = "connecting";
         setStatus("connecting");
         setExitCode(null);
         setError("");
@@ -118,6 +124,12 @@ export default function TerminalPage() {
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [showNewMenu]);
+
+  // 待确认的会话如果已经被服务端回收或被别的路径移除，弹窗就不该再挂着；
+  // 顺手清掉 id，避免状态一直停留在已消失的会话上。
+  useEffect(() => {
+    if (pendingCloseID && !sessions.some((item) => item.id === pendingCloseID)) setPendingCloseID(null);
+  }, [pendingCloseID, sessions]);
 
   useEffect(() => {
     let cancelled = false;
@@ -294,8 +306,32 @@ export default function TerminalPage() {
     // 用解析时刻的 activeID 判定，避免 DELETE 在途时用户已切到别的会话，
     // 却仍把那个会话的 status/exitCode 误重置。
     if (activeIDRef.current === targetID) {
+      statusRef.current = "idle";
       setStatus("idle");
       setExitCode(null);
+    }
+  };
+
+  const requestCloseSession = (targetID: string) => {
+    const item = sessions.find((session) => session.id === targetID);
+    // 活动会话用 ws 实时状态，后台会话只能读列表里的状态（可能略陈旧）。
+    const current = targetID === activeIDRef.current ? statusRef.current : item?.status ?? "idle";
+    // 只有确实已经结束的会话才能无确认直接关：exited / failed / closed 关掉不会丢东西；
+    // idle（还没连上）、starting、connecting、running、disconnected（连接断了但进程
+    // 可能还在）都要确认。
+    if (!item || current === "exited" || current === "failed" || current === "closed") {
+      void closeSession(targetID);
+      return;
+    }
+    setPendingCloseID(targetID);
+  };
+  const confirmCloseSession = async (targetID: string) => {
+    setClosing(true);
+    try {
+      await closeSession(targetID);
+    } finally {
+      setClosing(false);
+      setPendingCloseID(null);
     }
   };
 
@@ -306,6 +342,7 @@ export default function TerminalPage() {
       setActiveID(id);
       setConnectionVersion((version) => version + 1);
       // 立即把状态置为 connecting，避免切换瞬间沿用上个会话的实时状态一帧
+      statusRef.current = "connecting";
       setStatus("connecting");
       setExitCode(null);
       setError("");
@@ -332,6 +369,7 @@ export default function TerminalPage() {
   const canReconnect = Boolean(activeID) && status !== "running" && status !== "connecting";
   const statusLabel = status === "running" ? "运行中" : status === "connecting" ? "连接中" : status === "disconnected" ? "已断开" : status === "exited" ? "已退出" : status === "failed" ? "不可用" : "未启动";
   const reachedLimit = sessions.length >= maxSessions;
+  const pendingCloseIndex = pendingCloseID ? sessions.findIndex((item) => item.id === pendingCloseID) : -1;
   const limitTitle = reachedLimit ? `已达会话上限（${maxSessions} 个）：先关闭不再使用的会话后即可新建` : undefined;
   // 方案B（卡片化控制台）：整页一张白卡片 —— 卡片头 = 会话标签 + 新建/重连/清屏，
   // 卡片体 = 终端画布，卡片底 = 状态条（环境 · 管理员 · 路径 | 会话数 | 连接状态）。
@@ -345,7 +383,7 @@ export default function TerminalPage() {
             const isActive = item.id === activeID;
             return (
               <div key={item.id} className={`terminal-tab ${isActive ? "active" : ""}`}
-                onMouseDown={(event) => { if (event.button === 1) { event.preventDefault(); void closeSession(item.id); } }}>
+                onMouseDown={(event) => { if (event.button === 1) { event.preventDefault(); requestCloseSession(item.id); } }}>
                 <button type="button" className="terminal-tab-select" role="tab" aria-selected={isActive} tabIndex={isActive ? 0 : -1}
                   data-terminal-tab={item.id} title={`终端 ${index + 1} · ${sessionTitle(item)}`}
                   onClick={() => activateSession(item.id)} onKeyDown={(event) => handleTabKeyDown(event, item.id)}>
@@ -355,7 +393,7 @@ export default function TerminalPage() {
                   <span className="terminal-tab-env">{sessionEnvText(item)}</span>
                 </button>
                 <button type="button" className="terminal-tab-close" aria-label={`关闭终端 ${index + 1}`} title="关闭终端"
-                  onClick={() => void closeSession(item.id)}><CloseIcon /></button>
+                  onClick={() => requestCloseSession(item.id)}><CloseIcon /></button>
               </div>
             );
           })}
@@ -404,6 +442,17 @@ export default function TerminalPage() {
         <strong className={`terminal-status ${status}`}><i aria-hidden="true" />{statusLabel}</strong>
       </footer>
     </div>
+    {pendingCloseID && pendingCloseIndex >= 0 && <ConfirmDialog
+      title="关闭终端"
+      className="terminal-close-dialog"
+      danger
+      confirmLabel="关闭终端"
+      busy={closing}
+      icon={<CloseIcon />}
+      message={`终端 ${pendingCloseIndex + 1} 中的命令可能仍在运行。关闭会立即结束该会话及其中的进程，未完成的构建或部署会被中断。`}
+      onConfirm={() => confirmCloseSession(pendingCloseID)}
+      onCancel={() => { if (!closing) setPendingCloseID(null); }}
+    />}
   </section>;
 }
 

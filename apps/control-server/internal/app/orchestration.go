@@ -544,11 +544,16 @@ func (s *Server) createOrchestrationConversation(ctx context.Context, project Pr
 	if err := ensureSharedConversationWorkspaceTx(ctx, tx, conversationID, project.ID, now); err != nil {
 		return "", fmt.Errorf("create orchestration workspace: %w", err)
 	}
-	if err := pruneConversationHistoryTx(ctx, tx, project.ID); err != nil {
+	prunedHistory, err := pruneConversationHistoryTx(ctx, tx, project.ID)
+	if err != nil {
 		return "", fmt.Errorf("prune conversation history: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return "", err
+	}
+	// 同一事务里的历史裁剪可能删掉了仍带未读通知的旧会话。
+	if prunedHistory {
+		s.broadcastStateEvent(stEvNotifications, project.ID)
 	}
 	return conversationID, nil
 }
@@ -1273,13 +1278,23 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 	// The SQLite pool has one connection. Release the batch result set before
 	// calculating each batch's job summary, otherwise the next query waits on
 	// the connection held by rows indefinitely.
+	//
+	// 所有批次的作业汇总一次查出来：逐批查是 N+1，而这条连接只有一条，
+	// 计划多了以后列表刷新会被这些往返拖住。
+	batchIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		batchIDs = append(batchIDs, item.ID)
+	}
+	summaries, err := s.orchestrationBatchSummaries(r.Context(), batchIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	for index := range items {
 		item := &items[index]
-		var active, blocked, paused, awaitingMain int
-		if err := s.db.QueryRowContext(r.Context(), `select count(*), coalesce(sum(case when status in ('queued','preparing','implementing','checking') then 1 else 0 end),0), coalesce(sum(case when status='needs_human' then 1 else 0 end),0), coalesce(sum(case when status in ('paused','stopped') then 1 else 0 end),0), coalesce(sum(case when status in ('awaiting_main','integrated_to_dev') then 1 else 0 end),0) from task_orchestration_jobs where batch_id=?`, item.ID).Scan(&item.TaskCount, &active, &blocked, &paused, &awaitingMain); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+		summary := summaries[item.ID]
+		item.TaskCount = summary.taskCount
+		active, blocked, paused, awaitingMain := summary.active, summary.blocked, summary.paused, summary.awaitingMain
 		item.CompletedCount = item.TaskCount - active - blocked - paused - awaitingMain
 		// 未开始的计划优先于一切派生状态：它的子任务全是 queued，按下面的推导会落到
 		// 「active」，那会让①栏把一个还没提交的草稿画成正在执行。
@@ -1302,6 +1317,44 @@ func (s *Server) listOrchestrationBatches(w http.ResponseWriter, r *http.Request
 		}
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+// orchestrationBatchSummary 是一条计划（batch）的作业计数。没有作业的计划不会出现在
+// 查询结果里，对应的零值正好是"空计划"该有的样子（TaskCount=0 → active）。
+type orchestrationBatchSummary struct {
+	taskCount    int
+	active       int
+	blocked      int
+	paused       int
+	awaitingMain int
+}
+
+func (s *Server) orchestrationBatchSummaries(ctx context.Context, batchIDs []string) (map[string]orchestrationBatchSummary, error) {
+	summaries := make(map[string]orchestrationBatchSummary, len(batchIDs))
+	err := forEachIDBatch(batchIDs, func(placeholders string, args []any) error {
+		rows, err := s.db.QueryContext(ctx, `select batch_id,count(*),coalesce(sum(case when status in ('queued','preparing','implementing','checking') then 1 else 0 end),0),coalesce(sum(case when status='needs_human' then 1 else 0 end),0),coalesce(sum(case when status in ('paused','stopped') then 1 else 0 end),0),coalesce(sum(case when status in ('awaiting_main','integrated_to_dev') then 1 else 0 end),0) from task_orchestration_jobs where batch_id in (`+placeholders+`) group by batch_id`, args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var batchID string
+			var summary orchestrationBatchSummary
+			if err := rows.Scan(&batchID, &summary.taskCount, &summary.active, &summary.blocked, &summary.paused, &summary.awaitingMain); err != nil {
+				rows.Close()
+				return err
+			}
+			summaries[batchID] = summary
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		return rows.Close()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return summaries, nil
 }
 
 // addTasksToOrchestrationBatch permits a running plan to grow without

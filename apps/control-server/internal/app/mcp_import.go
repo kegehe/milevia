@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,8 @@ type claudeMCPServer struct {
 	Env     map[string]string `json:"env"`
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers"`
+	// Enabled 只由 Codex TOML 解析器填充（JSON 来源没有这个字段）。nil = 未声明。
+	Enabled *bool `json:"-"`
 }
 
 type mcpImportSource struct {
@@ -71,6 +75,10 @@ type mcpImportCandidate struct {
 	Conflict     bool   `json:"conflict"`
 	ConflictWith string `json:"conflictWith,omitempty"`
 	SkipReason   string `json:"skipReason,omitempty"`
+	// Fingerprint 是预览时这条候选的非敏感配置摘要（command/args/url/env 键名等）。
+	// 确认导入时前端原样回传，服务端重读来源后比对；不一致说明来源在预览后变了，
+	// 应拒绝而不是把用户没审阅过的配置写进去。
+	Fingerprint string `json:"fingerprint"`
 	// Warnings 记录「源里存在但未导入」的配置项（如 bearer_token_env_var），
 	// 提示用户导入后需要手工补齐的部分。
 	Warnings []string `json:"warnings,omitempty"`
@@ -80,6 +88,9 @@ type mcpImportInput struct {
 	ProjectID string   `json:"projectId"`
 	Confirm   bool     `json:"confirm"`
 	Selected  []string `json:"selected"`
+	// Fingerprints 是预览时各候选的 Fingerprint（键 = source|originalName）。
+	// 旧客户端不传时跳过这项校验。
+	Fingerprints map[string]string `json:"fingerprints"`
 }
 
 type mcpImportResponse struct {
@@ -244,6 +255,11 @@ func (s *Server) collectImportCandidates(ctx context.Context, projectID string) 
 				for _, name := range sortedKeysOfServers(servers) {
 					candidate := buildImportCandidate(name, servers[name], mcpScopeProject, projectID, "codex-project", source.Label, path, []string{"codex"})
 					candidate.Warnings = warnings[name]
+					// 源里明确停用的 server 与 `codex mcp list` 来源保持同一语义：跳过而不是
+					// 「导入后默认启用」—— 否则一份被作者关掉的配置会在 Milevia 里自动跑起来。
+					if servers[name].Enabled != nil && !*servers[name].Enabled {
+						candidate.SkipReason = "该 server 在 Codex 中处于禁用状态"
+					}
 					candidates = append(candidates, candidate)
 				}
 			}
@@ -285,6 +301,7 @@ func (s *Server) collectImportCandidates(ctx context.Context, projectID string) 
 			candidates[index].SkipReason = "同名 server 已存在，默认跳过（可先删除后重导）"
 		}
 	}
+	markBatchImportDuplicates(candidates)
 	return candidates, sources, nil
 }
 
@@ -311,9 +328,11 @@ func buildImportCandidate(originalName string, server claudeMCPServer, scope, pr
 		URL:          server.URL,
 		EnvKeys:      sortedKeys(server.Env),
 		HeaderKeys:   sortedKeys(server.Headers),
-		Scope:        scope,
-		ProjectID:    projectID,
-		Agents:       agents,
+		// nil 会序列化成 null，前端按 string[] 取 .length 直接抛错。
+		SecretKeys: []string{},
+		Scope:      scope,
+		ProjectID:  projectID,
+		Agents:     agents,
 	}
 	for _, key := range candidate.EnvKeys {
 		if looksLikeSecretKey(key) {
@@ -340,7 +359,35 @@ func buildImportCandidate(originalName string, server claudeMCPServer, scope, pr
 	} else {
 		candidate.URL = ""
 	}
+	candidate.Fingerprint = importCandidateFingerprint(candidate)
 	return candidate
+}
+
+// importCandidateFingerprint 只覆盖用户能在预览里审阅到的非敏感配置；值的真身本来就
+// 不回前端，不参与摘要。
+func importCandidateFingerprint(candidate mcpImportCandidate) string {
+	payload := struct {
+		Name       string   `json:"name"`
+		Transport  string   `json:"transport"`
+		Command    string   `json:"command"`
+		Args       []string `json:"args"`
+		URL        string   `json:"url"`
+		Scope      string   `json:"scope"`
+		ProjectID  string   `json:"projectId"`
+		EnvKeys    []string `json:"envKeys"`
+		HeaderKeys []string `json:"headerKeys"`
+		Agents     []string `json:"agents"`
+	}{
+		Name: candidate.Name, Transport: candidate.Transport, Command: candidate.Command,
+		Args: candidate.Args, URL: candidate.URL, Scope: candidate.Scope, ProjectID: candidate.ProjectID,
+		EnvKeys: candidate.EnvKeys, HeaderKeys: candidate.HeaderKeys, Agents: candidate.Agents,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:8])
 }
 
 // collectCodexImportCandidates 调用 `codex mcp list --json` 取得 Codex 侧 server 清单。
@@ -409,11 +456,41 @@ func (s *Server) importMCPServers(w http.ResponseWriter, r *http.Request) {
 
 	selected := map[string]bool{}
 	for _, key := range input.Selected {
-		selected[strings.TrimSpace(key)] = true
+		// 复合键是 `source|originalName`，server 名本身可能带首尾空白。整体 TrimSpace
+		// 会把名字改掉、与候选键对不上；前端回传的就是精确键，原样使用。
+		if key == "" {
+			continue
+		}
+		selected[key] = true
+	}
+	// 确认时重新收集来源：某份来源在预览后整体不可用（codex 命令失败 / WSL 掉线 /
+	// 文件被删）时，它的候选根本不在新列表里。必须把选中的缺失项报出来，否则用户
+	// 只会看到「没有新的 server 被导入」。
+	if len(selected) > 0 {
+		present := map[string]bool{}
+		for _, candidate := range candidates {
+			present[importCandidateKey(candidate)] = true
+		}
+		for key := range selected {
+			if !present[key] {
+				response.Errors = append(response.Errors, importKeyLabel(key)+"：来源已不可用或该 server 已不存在，未导入")
+			}
+		}
 	}
 	for _, candidate := range candidates {
 		key := importCandidateKey(candidate)
+		if expected, ok := input.Fingerprints[key]; ok && expected != "" && expected != candidate.Fingerprint {
+			response.Errors = append(response.Errors, candidate.OriginalName+"：来源配置在预览后已变化，请重新预览后再导入")
+			continue
+		}
 		if candidate.Conflict || candidate.SkipReason != "" {
+			if len(selected) > 0 && selected[key] {
+				reason := candidate.SkipReason
+				if reason == "" {
+					reason = "已存在同名配置"
+				}
+				response.Errors = append(response.Errors, fmt.Sprintf("%s：%s", candidate.OriginalName, reason))
+			}
 			continue
 		}
 		if len(selected) > 0 && !selected[key] {
@@ -437,12 +514,21 @@ func importCandidateKey(candidate mcpImportCandidate) string {
 	return candidate.Source + "|" + candidate.OriginalName
 }
 
+// importKeyLabel 把 `source|name` 的候选键转成用户能看懂的错误前缀。
+func importKeyLabel(key string) string {
+	parts := strings.SplitN(key, "|", 2)
+	if len(parts) == 2 {
+		return parts[1] + "（" + parts[0] + "）"
+	}
+	return key
+}
+
 // persistImportedCandidate 把一条候选写入 mcp_servers，密钥类值加密为 sec_ 引用。
 func (s *Server) persistImportedCandidate(ctx context.Context, candidate mcpImportCandidate) error {
 	input := mcpServerInput{
 		Name:         candidate.Name,
-		DisplayName:  candidate.DisplayName,
-		Description:  "从" + candidate.SourceLabel + "导入",
+		DisplayName:  stringPtr(candidate.DisplayName),
+		Description:  stringPtr("从" + candidate.SourceLabel + "导入"),
 		Transport:    candidate.Transport,
 		Command:      candidate.Command,
 		Args:         candidate.Args,
@@ -459,11 +545,29 @@ func (s *Server) persistImportedCandidate(ctx context.Context, candidate mcpImpo
 		return err
 	}
 
-	// 重新读取源值（候选里只带键名，值不经过前端）。
-	envValues, headerValues := s.lookupImportValues(ctx, candidate)
+	// 重新读取源值（候选里只带键名，值不经过前端）。读取失败必须中止：静默按
+	// 「无 env/headers」写入会得到一条「导入成功」但缺凭据的 server。
+	envValues, headerValues, err := s.lookupImportValues(ctx, candidate)
+	if err != nil {
+		return fmt.Errorf("重新读取来源失败：%w", err)
+	}
+	// 只写入预览里展示过的键：预览与确认之间来源新增的键未经用户审阅，不应被带进来。
+	envKeys := map[string]bool{}
+	for _, key := range candidate.EnvKeys {
+		envKeys[strings.TrimSpace(key)] = true
+	}
+	headerKeys := map[string]bool{}
+	for _, key := range candidate.HeaderKeys {
+		headerKeys[strings.TrimSpace(key)] = true
+	}
 	input.Env = map[string]string{}
 	input.EnvSecrets = map[string]string{}
-	for key, value := range envValues {
+	for _, original := range sortedKeys(envValues) {
+		key := strings.TrimSpace(original)
+		if !envKeys[key] {
+			continue
+		}
+		value := envValues[original]
 		if looksLikeSecretKey(key) {
 			input.EnvSecrets[key] = value
 		} else {
@@ -472,7 +576,12 @@ func (s *Server) persistImportedCandidate(ctx context.Context, candidate mcpImpo
 	}
 	input.Headers = map[string]string{}
 	input.HeaderSecrets = map[string]string{}
-	for key, value := range headerValues {
+	for _, original := range sortedKeys(headerValues) {
+		key := strings.TrimSpace(original)
+		if !headerKeys[key] {
+			continue
+		}
+		value := headerValues[original]
 		if looksLikeSecretKey(key) {
 			input.HeaderSecrets[key] = value
 		} else {
@@ -489,6 +598,10 @@ func (s *Server) persistImportedCandidate(ctx context.Context, candidate mcpImpo
 		return err
 	}
 
+	// 来源读取（codex mcp list / wsl.exe）可能各花十几秒，必须在拿写锁之前完成；
+	// 锁只包住真正的落库事务。
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -530,16 +643,20 @@ func (s *Server) persistImportedCandidate(ctx context.Context, candidate mcpImpo
 }
 
 // lookupImportValues 重新从来源读取该 server 的 env/headers 真值（值不经过前端）。
-func (s *Server) lookupImportValues(ctx context.Context, candidate mcpImportCandidate) (map[string]string, map[string]string) {
+//
+// 任何读取失败都必须报错，不能回落成「无 env/headers」：用户看到的是「导入成功」，
+// 实际拿到一条缺凭据的 server，而错误原因（来源被删/改、SSH 超时、WSL 不可用）完全
+// 不可见。预览与确认之间来源发生变化时，也由这里拒绝而不是悄悄写入另一份配置。
+func (s *Server) lookupImportValues(ctx context.Context, candidate mcpImportCandidate) (map[string]string, map[string]string, error) {
 	switch candidate.Source {
 	case "claude-global", "claude-project":
 		home, _ := os.UserHomeDir()
 		if home == "" {
-			return nil, nil
+			return nil, nil, errors.New("无法定位用户主目录")
 		}
 		raw, err := os.ReadFile(filepath.Join(home, ".claude.json"))
 		if err != nil {
-			return nil, nil
+			return nil, nil, fmt.Errorf("读取 ~/.claude.json 失败：%w", err)
 		}
 		var doc struct {
 			MCPServers map[string]claudeMCPServer `json:"mcpServers"`
@@ -547,70 +664,76 @@ func (s *Server) lookupImportValues(ctx context.Context, candidate mcpImportCand
 				MCPServers map[string]claudeMCPServer `json:"mcpServers"`
 			} `json:"projects"`
 		}
-		if json.Unmarshal(raw, &doc) != nil {
-			return nil, nil
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, nil, fmt.Errorf("解析 ~/.claude.json 失败：%w", err)
 		}
 		if candidate.Source == "claude-global" {
-			server := doc.MCPServers[candidate.OriginalName]
-			return server.Env, server.Headers
+			server, ok := doc.MCPServers[candidate.OriginalName]
+			if !ok {
+				return nil, nil, errors.New("来源配置里已找不到该 server")
+			}
+			return server.Env, server.Headers, nil
 		}
-		entry := doc.Projects[candidate.SourcePath]
-		server := entry.MCPServers[candidate.OriginalName]
-		return server.Env, server.Headers
+		entry, ok := doc.Projects[candidate.SourcePath]
+		if !ok {
+			return nil, nil, errors.New("来源项目已不在 ~/.claude.json 中")
+		}
+		server, ok := entry.MCPServers[candidate.OriginalName]
+		if !ok {
+			return nil, nil, errors.New("来源项目里已找不到该 server")
+		}
+		return server.Env, server.Headers, nil
 	case "mcp-json":
 		raw, err := os.ReadFile(candidate.SourcePath)
 		if err != nil {
-			return nil, nil
+			return nil, nil, fmt.Errorf("读取 %s 失败：%w", candidate.SourcePath, err)
 		}
 		var doc struct {
 			MCPServers map[string]claudeMCPServer `json:"mcpServers"`
 		}
-		if json.Unmarshal(raw, &doc) != nil {
-			return nil, nil
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, nil, fmt.Errorf("解析 %s 失败：%w", candidate.SourcePath, err)
 		}
-		server := doc.MCPServers[candidate.OriginalName]
-		return server.Env, server.Headers
+		server, ok := doc.MCPServers[candidate.OriginalName]
+		if !ok {
+			return nil, nil, errors.New("来源文件里已找不到该 server")
+		}
+		return server.Env, server.Headers, nil
 	case "claude-wsl":
 		raw, ok := s.readWSLUserFile(ctx, "~/.claude.json")
 		if !ok {
-			return nil, nil
+			return nil, nil, errors.New("无法读取 WSL 内的 ~/.claude.json（WSL 不可用或文件不存在）")
 		}
 		var doc struct {
 			MCPServers map[string]claudeMCPServer `json:"mcpServers"`
 		}
-		if json.Unmarshal(raw, &doc) != nil {
-			return nil, nil
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, nil, fmt.Errorf("解析 WSL 内 ~/.claude.json 失败：%w", err)
 		}
-		server := doc.MCPServers[candidate.OriginalName]
-		return server.Env, server.Headers
+		server, ok := doc.MCPServers[candidate.OriginalName]
+		if !ok {
+			return nil, nil, errors.New("WSL 配置里已找不到该 server")
+		}
+		return server.Env, server.Headers, nil
 	case "codex-project":
 		raw, err := os.ReadFile(candidate.SourcePath)
 		if err != nil {
-			return nil, nil
+			return nil, nil, fmt.Errorf("读取 %s 失败：%w", candidate.SourcePath, err)
 		}
 		servers, _ := parseCodexProjectMCPConfig(string(raw))
 		server, ok := servers[candidate.OriginalName]
 		if !ok {
-			return nil, nil
+			return nil, nil, errors.New("来源项目配置里已找不到该 server")
 		}
-		return server.Env, server.Headers
+		return server.Env, server.Headers, nil
 	case "codex":
-		list, _, ok := s.collectCodexImportCandidates(ctx)
+		values, headers, ok := s.codexImportValues(ctx, candidate.OriginalName)
 		if !ok {
-			return nil, nil
+			return nil, nil, errors.New("无法从 `codex mcp list --json` 重新读取该 server（命令失败或已不存在）")
 		}
-		for _, item := range list {
-			if item.OriginalName != candidate.OriginalName {
-				continue
-			}
-			// 重新执行命令取真值（候选不含值）。
-			if values, headers, ok := s.codexImportValues(ctx, candidate.OriginalName); ok {
-				return values, headers
-			}
-		}
-		return nil, nil
+		return values, headers, nil
 	default:
-		return nil, nil
+		return nil, nil, fmt.Errorf("未知的导入来源 %q", candidate.Source)
 	}
 }
 
@@ -659,4 +782,27 @@ func (s *Server) readWSLUserFile(ctx context.Context, linuxPath string) ([]byte,
 		return nil, false
 	}
 	return out, true
+}
+
+// markBatchImportDuplicates 标记同批次内同名（同 scope/project）的候选。
+//
+// ~/.claude.json 与项目 .mcp.json 都声明 github，或两个名字被
+// sanitizeImportedServerName 归一到同一个 key 时，唯一索引只在写入时才报错。
+// 预览必须提前标出来，否则用户会看到一堆「可选」却在确认时吃到「已存在」。
+func markBatchImportDuplicates(candidates []mcpImportCandidate) {
+	seen := map[string]string{}
+	for index := range candidates {
+		candidate := &candidates[index]
+		if candidate.Conflict || candidate.SkipReason != "" {
+			continue
+		}
+		key := candidate.Scope + "|" + candidate.ProjectID + "|" + candidate.Name
+		if previous, exists := seen[key]; exists {
+			candidate.Conflict = true
+			candidate.ConflictWith = previous
+			candidate.SkipReason = "与本批次另一来源同名（" + previous + "）"
+			continue
+		}
+		seen[key] = candidate.SourceLabel
+	}
 }

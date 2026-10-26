@@ -45,6 +45,19 @@ const (
 	// 半小时的磁盘/CPU 占用，不该在一个启动里做完 —— 剩下的留给下次启动，每次都是幂等的。
 	checkpointImportPerStartup = 1
 
+	// checkpointSweepStartDelay 是启动到开始整段快照维护（清理 + 遗留快照转换）之间的
+	// 静默期。旧实现只有"此刻没有运行"这一道门，于是应用刚起来就开始整目录 git add ——
+	// 用户两分钟后发的第一条消息只能跟它抢磁盘（真机上见过两者撞在一起、发送卡 61 秒）。
+	checkpointSweepStartDelay = 2 * time.Minute
+
+	// checkpointSweepWatchInterval 是转换期间检查"有人开始干活了吗"的间隔。
+	checkpointSweepWatchInterval = 2 * time.Second
+
+	// checkpointCleanupIdleWait 是清理阶段最多额外等空闲的时间。再等不到也要做：
+	// 编排/定时任务持续运行的机器上，如果坚持"完全空闲才动手"，孤儿快照目录
+	// （一份可能几百 MB）会在每次启动都被跳过、永远不回收。转换仍然只挑空闲窗口。
+	checkpointCleanupIdleWait = 8 * time.Minute
+
 	// checkpointShadowRepoName 是会话影子仓库在快照目录下的名字。
 	checkpointShadowRepoName = "shadow.git"
 
@@ -1143,6 +1156,24 @@ func (s *Server) restoreGitCheckpointSnapshot(ctx context.Context, req checkpoin
 //
 // 任何一步失败都只是"留到下次启动"，不会丢数据：DB 行的指针在 git 提交成功之后才改。
 func (s *Server) sweepCheckpointSnapshots(ctx context.Context) {
+	// 整段快照维护都避开"刚打开应用"那一小段：转换是分钟级磁盘活，清理也可能是一次几万
+	// 个文件的 RemoveAll（转换中断 / 崩溃留下的拷贝目录），两者都不该和用户的第一条消息
+	// 抢同一块磁盘。清理最多等 checkpointCleanupIdleWait 的空闲窗口，再等不到也做 ——
+	// 否则持续有运行的机器上孤儿目录永远无人回收；转换仍只挑空闲窗口（见下）。
+	cleanupWaitCtx, cancelCleanupWait := context.WithTimeout(ctx, s.checkpointSweepDelay+s.checkpointCleanupWait)
+	waitErr := s.waitForIdleWindow(cleanupWaitCtx, s.checkpointSweepDelay)
+	cancelCleanupWait()
+	if waitErr != nil && !errors.Is(waitErr, context.DeadlineExceeded) {
+		// 正常退出/超时会取消 ctx；那不算"维护被跳过"，别往日志里灌假故障。
+		if !errors.Is(waitErr, context.Canceled) {
+			log.Printf("[checkpoint] startup sweep deferred: %v", waitErr)
+		}
+		return
+	}
+	if ctx.Err() != nil {
+		// 父 ctx（维护总预算）真的用完了：上面的 DeadlineExceeded 不代表可以继续。
+		return
+	}
 	root := filepath.Join(s.checkpointStorageRoot(), "checkpoints")
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -1251,13 +1282,35 @@ func (s *Server) sweepCheckpointSnapshots(ctx context.Context) {
 			break
 		}
 		// 转换要整目录读一遍再压缩（真机实测单份 186 MB 要 6 分钟），是有代价的活：
-		// 等一个没有 run 在跑的空档再做，别和用户的 agent 抢磁盘。等不到就留到下次启动。
+		// 开工前再确认一次"现在没人用"（上面的静默期可能已经过去很久）。
+		// 等不到就留到下次启动。
 		if err := s.waitForIdleWindow(ctx, 0); err != nil {
-			log.Printf("[checkpoint] conversion deferred: %v", err)
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("[checkpoint] conversion deferred: %v", err)
+			}
 			break
 		}
 		started := time.Now()
-		if err := s.convertLegacyCheckpointSnapshot(ctx, candidate.conversationID, candidate.nodeIDs, candidate.path); err != nil {
+		// 开始之后用户随时可能发消息：这一步是分钟级磁盘活，必须能被"有人开始干活"打断，
+		// 否则它就会和首条消息的 CLI 冷启动抢同一块磁盘/页缓存。
+		// 打断不损失什么：下一轮启动会拿同一份目录重来（转换本身是幂等的）。
+		convertCtx, stopWatching := s.cancelWhenRunsStart(ctx, checkpointSweepWatchInterval)
+		err := s.convertLegacyCheckpointSnapshot(convertCtx, candidate.conversationID, candidate.nodeIDs, candidate.path)
+		// stopWatching 会无条件取消 convertCtx，所以"是不是被运行打断"必须由它
+		// 自己回报；事后看 convertCtx.Err() 永远非 nil，会把任何真实失败都记成暂停。
+		interrupted := stopWatching()
+		if err != nil {
+			// 用"是否被打断"而不是 errors.Is：中途撤手时 git 报的是"signal: killed"
+			// 之类的包装错误，认错对象就会把"有人开始干活了"误记成转换失败。
+			if interrupted {
+				log.Printf("[checkpoint] conversion of %s paused: a run started; it resumes on a later start", candidate.path)
+				break
+			}
+			// 停机/维护预算耗尽同样是取消，不是转换失败：错误可能是被包装过的
+			// "signal: killed"，用父 ctx 判断，避免把正常退出记成故障。
+			if ctx.Err() != nil {
+				break
+			}
 			log.Printf("[checkpoint] convert legacy snapshot %s: %v", candidate.path, err)
 			continue
 		}
@@ -1267,6 +1320,49 @@ func (s *Server) sweepCheckpointSnapshots(ctx context.Context) {
 	if converted > 0 || removed > 0 {
 		log.Printf("[checkpoint] startup sweep converted=%d removed=%d", converted, removed)
 	}
+}
+
+// cancelWhenRunsStart 返回一个"一发现有运行开始就取消"的派生 ctx。
+//
+// 用来给遗留快照转换这类分钟级磁盘活兜底：它只在真正空闲时开工，但开工之后用户随时
+// 可能发消息。旧实现只检查开工前那一刻，于是转换会和首条消息的 CLI 冷启动抢同一块
+// 磁盘/页缓存。返回的 stop 必须在转换结束后调用，并回报"是不是因为新运行而取消"——
+// stop 自身也会无条件取消 ctx，调用方不能事后用 ctx.Err() 去判断原因。
+func (s *Server) cancelWhenRunsStart(ctx context.Context, interval time.Duration) (context.Context, func() bool) {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	// interrupted 由 watcher goroutine 写、调用方在 <-done 之后读；close(done)
+	// 建立 happens-before，不需要原子量。
+	interrupted := false
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				if count, err := s.activeRunCount(runCtx); err == nil && count > 0 {
+					interrupted = true
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	stop := func() bool {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+		return interrupted
+	}
+	return runCtx, stop
 }
 
 // legacyCheckpointNodes 找出**所有**还在引用这个遗留拷贝目录的节点（快照创建早于引擎升级的节点）。

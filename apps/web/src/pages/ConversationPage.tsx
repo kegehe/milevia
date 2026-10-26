@@ -38,6 +38,7 @@ import {
   withRunnerAgentStatus,
 } from "../lib/agent-registry";
 import { createWebSocket } from "../lib/runtime";
+import { caretTextBefore, hidePastePop, hidePastePopIfDetached, insertPasteCardAtSelection, isComposerBlankResidue, serializeComposer, shouldFoldPaste } from "../lib/composer-paste";
 import {
   formatTime, formatHistoryTime, formatTokens, formatDuration,
   formatCost, runDuration, contextLevel, contextStateText, requiredShortcutVariables,
@@ -57,7 +58,7 @@ import { readConversationPanels, writeConversationPanels, type ConversationPanel
 import { modelList } from "../lib/model-options";
 import { dialogParamURL } from "../lib/dialog-params";
 import { copyToClipboard } from "../lib/clipboard";
-import { checkpointHasCode, rewindConfirmMessage, rewindHint, rewindPrimaryMode } from "../lib/conversation-rewind";
+import { checkpointHasCode, rewindConfirmAction, rewindConfirmBody, rewindConfirmTitle, rewindHint, rewindPrimaryMode } from "../lib/conversation-rewind";
 import { dropAfterCutoff } from "../lib/conversation-cutoff";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
 import { useLiveStateEventsFor } from "../components/LiveEventsProvider";
@@ -808,6 +809,9 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
   const [branches, setBranches] = useState<GitBranch[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
+  // 切换分支沿用全站自绘确认框（原生 confirm 在桌面外壳里很突兀）。点分支只打开
+  // 确认层，真正的切换在确认后执行 —— 与「移除工作区」「回退对话」同一套。
+  const [pendingSwitch, setPendingSwitch] = useState<GitBranch | null>(null);
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [errorText, setErrorText] = useState("");
   const branchRequestSeq = useRef(0);
@@ -847,9 +851,16 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
     }
   }, [projectID, conversationID]);
 
-  const switchBranch = useCallback(async (branch: GitBranch) => {
+  const switchBranch = useCallback((branch: GitBranch) => {
     if (!snapshot?.stateToken || branch.current || switching) return;
-    if (!window.confirm(`将切换到分支“${branch.name}”。工作区必须干净且没有正在运行的 AI 任务，是否继续？`)) return;
+    setMenuOpen(false);
+    setPendingSwitch(branch);
+  }, [snapshot, switching]);
+
+  const switchBranchConfirmed = useCallback(async () => {
+    const branch = pendingSwitch;
+    if (!branch || !snapshot?.stateToken || switching) return;
+    // 确认层先留着显示"处理中"，切换结束（成功或失败）再收掉 —— 与移除工作区/回退同一套反馈。
     setSwitching(true);
     try {
       const query = conversationID ? `?conversationId=${encodeURIComponent(conversationID)}` : "";
@@ -862,8 +873,9 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
       setPhase("error");
     } finally {
       setSwitching(false);
+      setPendingSwitch(null);
     }
-  }, [conversationID, load, projectID, snapshot, switching]);
+  }, [conversationID, load, pendingSwitch, projectID, snapshot, switching]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -879,6 +891,8 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
   useEffect(() => {
     branchRequestSeq.current += 1;
     setMenuOpen(false);
+    // 会话/工作区切换（或新一轮开始）时收掉确认层：分支名属于上一个工作区，留着会切错。
+    setPendingSwitch(null);
     void load();
   }, [load, runKey]);
 
@@ -901,6 +915,7 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
     return <span className="branch-pill" title="正在读取分支状态…"><BranchPillIcon />…</span>;
   }
   const head = snapshot.head;
+  const switchConfirm = pendingSwitch && createPortal(<ConfirmDialog title="切换分支" confirmLabel="切换分支" busy={switching} message={<>将切换到分支 <b>{pendingSwitch.name}</b>。工作区必须干净且没有正在运行的 AI 任务，是否继续？</>} onConfirm={switchBranchConfirmed} onCancel={() => { if (!switching) setPendingSwitch(null); }} />, document.body);
   // 状态卡对 detached / 正常分支是同一份 JSX，只差胶囊本身（原先两份菜单各写一遍，收口到这里）。
   const branchCard = menuOpen && (
     <div className="branch-card" role="group" aria-label="分支">
@@ -936,6 +951,7 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
           <span className={`branch-chevron${menuOpen ? " open" : ""}`} aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg></span>
         </button>
         {branchCard}
+        {switchConfirm}
       </span>
     );
   }
@@ -950,6 +966,7 @@ function ComposerBranchPill({ projectID, conversationID, runKey }: { projectID: 
         <span className={`branch-chevron${menuOpen ? " open" : ""}`} aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg></span>
       </button>
       {branchCard}
+      {switchConfirm}
     </span>
   );
 }
@@ -1519,7 +1536,7 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail, checkpoi
 });
 
 const SystemCard = memo(function SystemCard({ system }: { system: SystemItem }) {
-  const icon: Record<SystemVariant, string> = { compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", task: "▸" };
+  const icon: Record<SystemVariant, string> = { compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", session: "◌", task: "▸" };
   const variantClass = system.variant === "compact_result" && system.detail ? "compact_result failed" : system.variant;
   // task 卡片按 metadata.state 追加成功/失败/中性后缀，失败换成警告图标。
   const state = system.metadata?.state;
@@ -2026,12 +2043,31 @@ export default function ConversationPage() {
     }
   };
 
-  const archiveWorkspace = async (workspace: ConversationWorkspace) => {
+  const archiveWorkspace = (workspace: ConversationWorkspace) => {
     if (!conversation || workspaceBusy || workspace.active || workspace.mode !== "isolated_worktree" || run || clearing || stopping || handingOff || readOnlyConversation) return;
-    if (!window.confirm(`移除工作区 #${workspace.generation}？仅当没有未提交变更且专用分支已合并时才能移除。该目录和专用分支将被移除，历史运行记录会保留。`)) return;
+    // 目标会话在打开确认层时就钉死：确认层不是模态阻塞的，期间用户完全可能切走。
+    const targetConversationID = conversation.id;
+    const token = openPendingConfirm({
+      title: "移除工作区",
+      message: `移除工作区 #${workspace.generation}？仅当没有未提交变更且专用分支已合并时才能移除。该目录和专用分支将被移除，历史运行记录会保留。`,
+      confirmLabel: "移除工作区",
+      danger: true,
+      onConfirm: () => {
+        if (pendingConfirmBusyRef.current) return;
+        pendingConfirmBusyRef.current = true;
+        setPendingConfirmBusy(true);
+        void archiveWorkspaceConfirmed(targetConversationID, workspace).finally(() => closePendingConfirm(token));
+      },
+      onCancel: () => { if (!pendingConfirmBusyRef.current) closePendingConfirm(token); },
+    });
+  };
+
+  const archiveWorkspaceConfirmed = async (conversationID: string, workspace: ConversationWorkspace) => {
+    // 往返期间用户可能已经切到别的会话：绝不能拿旧工作区去删新会话的目录。
+    if (conversationRef.current?.id !== conversationID) return;
     setWorkspaceBusy(true);
     try {
-      await projectApi(`/api/conversations/${conversation.id}/workspaces/${workspace.id}`, { method: "DELETE" });
+      await projectApi(`/api/conversations/${conversationID}/workspaces/${workspace.id}`, { method: "DELETE" });
       setConversationWorkspaces((items) => items.map((item) => item.id === workspace.id ? { ...item, state: "archived", archivedAt: new Date().toISOString() } : item));
       setArchiveWorkspaceID((current) => current === workspace.id ? "" : current);
     } catch (cause) {
@@ -2041,19 +2077,38 @@ export default function ConversationPage() {
     }
   };
 
-  const rewindToCheckpoint = async (checkpoint: ConversationCheckpoint, mode: "conversation" | "code" | "conversation_and_code", fork = false) => {
+  // 回退入口只打开确认层：文案与"默认发哪个 mode"都在 lib/conversation-rewind 里，
+  // 与手机端共用一份（回退不可撤销，两端必须说清同一件事：丢几轮、代码会不会被改回去）。
+  const rewindToCheckpoint = (checkpoint: ConversationCheckpoint, mode: "conversation" | "code" | "conversation_and_code", fork = false) => {
     if (!conversation || checkpointBusy || run || clearing || stopping || handingOff || readOnlyConversation) return;
-    // 确认框的文案与"默认发哪个 mode"都在 lib/conversation-rewind 里，与手机端共用一份：
-    // 回退不可撤销，两端必须说清同一件事（丢几轮、代码会不会被改回去）。
     const request = { mode, fork, discarded: discardedTurnsAfter(checkpoint) };
-    if (!window.confirm(rewindConfirmMessage(checkpoint, request))) return;
-    const conversationID = conversation.id;
+    // 目标会话在打开确认层时就钉死（确认层不阻塞路由），与手机端 confirmRewind 同一条理由。
+    const targetConversationID = conversation.id;
+    const token = openPendingConfirm({
+      title: rewindConfirmTitle(request),
+      message: rewindConfirmBody(checkpoint, request),
+      confirmLabel: rewindConfirmAction(request, false),
+      busyLabel: rewindConfirmAction(request, true),
+      danger: true,
+      onConfirm: () => {
+        if (pendingConfirmBusyRef.current) return;
+        pendingConfirmBusyRef.current = true;
+        setPendingConfirmBusy(true);
+        void rewindToCheckpointConfirmed(targetConversationID, checkpoint, request).finally(() => closePendingConfirm(token));
+      },
+      onCancel: () => { if (!pendingConfirmBusyRef.current) closePendingConfirm(token); },
+    });
+  };
+
+  const rewindToCheckpointConfirmed = async (conversationID: string, checkpoint: ConversationCheckpoint, request: { mode: "conversation" | "code" | "conversation_and_code"; fork?: boolean; discarded: number }) => {
+    // 确认之后才真正执行：这期间用户可能已经切走，回退绝不能落到另一条会话上。
+    if (conversationRef.current?.id !== conversationID) return;
     setCheckpointBusy(true);
     try {
       // 回退可能要把整棵工作区写回去（秒级到分钟级）。用默认的 15 秒超时会让桌面对
       // 一次**其实成功**的回退报"失败"；服务端那侧已经不跟请求上下文走（见 checkpoint.go），
       // 所以这里只要给足预算。
-      const result = await apiWithTimeout<{ conversation?: Conversation; checkpoint: ConversationCheckpoint; forked: boolean }>(`/api/conversations/${conversationID}/rewind`, { method: "POST", body: JSON.stringify({ checkpointId: checkpoint.id, mode, fork }) }, 180_000);
+      const result = await apiWithTimeout<{ conversation?: Conversation; checkpoint: ConversationCheckpoint; forked: boolean }>(`/api/conversations/${conversationID}/rewind`, { method: "POST", body: JSON.stringify({ checkpointId: checkpoint.id, mode: request.mode, fork: request.fork }) }, 180_000);
       if (conversationRef.current?.id !== conversationID) return; // 往返期间用户可能已经切走
       if (result.forked && result.conversation) {
         navigate(conversationURL(result.conversation.id));
@@ -2209,8 +2264,42 @@ export default function ConversationPage() {
   // 游标倒回最新一页的边界：已经翻过的页要重翻一遍，按钮也会在明明已经到底之后重新亮起。
   // messages / events 该合并照旧合并（按 id 去重），只有分页状态受这个标记保护。
   const pagedBackRef = useRef(false);
-  const [pendingConfirm, setPendingConfirm] = useState<{ title: string; message: React.ReactNode; confirmLabel?: string; danger?: boolean; className?: string; icon?: React.ReactNode; onConfirm: () => void; onCancel: () => void } | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{ title: string; message: React.ReactNode; confirmLabel?: string; busyLabel?: string; danger?: boolean; className?: string; icon?: React.ReactNode; onConfirm: () => void; onCancel: () => void } | null>(null);
   const [pendingConfirmBusy, setPendingConfirmBusy] = useState(false);
+  // pendingConfirm 是全页共用的一格。每个打开者领一个递增令牌，清理时只清"还是自己的"那一格 ——
+  // 否则 A 会话上那个慢操作（移除工作区/回退）的 finally 会把期间在 B 会话上打开的新确认框一起清掉。
+  const pendingConfirmTokenRef = useRef(0);
+  const pendingConfirmRef = useRef(pendingConfirm);
+  pendingConfirmRef.current = pendingConfirm;
+
+  const openPendingConfirm = (config: { title: string; message: React.ReactNode; confirmLabel?: string; busyLabel?: string; danger?: boolean; className?: string; icon?: React.ReactNode; onConfirm: () => void; onCancel: () => void }) => {
+    const token = ++pendingConfirmTokenRef.current;
+    pendingConfirmBusyRef.current = false;
+    setPendingConfirmBusy(false);
+    setPendingConfirm(config);
+    return token;
+  };
+
+  const closePendingConfirm = (token: number) => {
+    if (pendingConfirmTokenRef.current !== token) return;
+    pendingConfirmTokenRef.current += 1; // 同一格再次清理时不重复生效
+    pendingConfirmBusyRef.current = false;
+    setPendingConfirmBusy(false);
+    setPendingConfirm(null);
+  };
+
+  // 确认层挂在"当前这条会话"上：切走时收掉，否则旧会话的回退/移除确认会浮在新会话上。
+  // 必须走一遍 onCancel：强制停止那条靠它复位 stopping，直接清空会让页面级标志漏成 true。
+  // 真正执行前还会再校验会话 id（见 archiveWorkspaceConfirmed / rewindToCheckpointConfirmed）。
+  useEffect(() => {
+    const orphaned = pendingConfirmRef.current;
+    pendingConfirmTokenRef.current += 1; // 作废在飞行的 finally
+    pendingConfirmRef.current = null;
+    pendingConfirmBusyRef.current = false;
+    setPendingConfirmBusy(false);
+    setPendingConfirm(null);
+    if (orphaned) orphaned.onCancel();
+  }, [conversation?.id]);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const [currentUserMessageIndex, setCurrentUserMessageIndex] = useState(-1);
   const [pendingPreviousUserMessageID, setPendingPreviousUserMessageID] = useState<string | null>(null);
@@ -2227,6 +2316,7 @@ export default function ConversationPage() {
   const historyIndex = useRef<number | null>(null);
   const draftBeforeHistory = useRef("");
   const textRef = useRef("");
+  const composerEditRef = useRef<HTMLDivElement | null>(null);
   const finishedRunIds = useRef(new Set<string>());
   const usageRequestVersion = useRef(0);
   const usageConversationID = useRef<string | null>(null);
@@ -2281,6 +2371,57 @@ export default function ConversationPage() {
     setText(value);
     if (persist && projectId && conversationID) saveConversationDraft(projectId, conversationID, value);
   }, [projectId, saveConversationDraft]);
+
+  // text → 编辑器 DOM 的单向同步（contenteditable 改造的核心接缝）。
+  // 所有"外部写回输入框"的路径（草稿恢复、历史翻阅、发送失败回填、清空、斜杠纠错建议、
+  // 引用消息…）都汇在 setText/setComposerText 上，这一个 effect 就是它们触达 DOM 的唯一入口：
+  // 序列化结果与 text 一致（= 用户正在打字的常规路径）时绝不动 DOM，否则光标会跳；
+  // 不一致（= 外部整体覆盖）才整体重写为纯文本。卡片只经由粘贴产生，外部回填是纯文本是可接受的降级。
+  // 「会话 id 变了」是无条件重写的例外：两个会话的草稿可能恰好是同一个字符串，
+  // 只比 text 会让旧会话 DOM 里的卡片残留到新会话（显示/删除/浮层全部错位）。
+  // 比对用 textRef.current 而不是闭包里的 text：passive effect 异步调度，快速打字时
+  // effect(t1) 可能flush 在 DOM 已到 t2 之后 —— 比 state 会误判成外部覆盖而重写、光标跳末尾；
+  // textRef 在每个输入事件里同步更新（全部 setText 路径都维护它），键 2 已把 ref 推到 t2，
+  // 迟到的 effect(t1) 就会被正确跳过。
+  const composerSyncedConversationRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const el = composerEditRef.current;
+    if (!el) return;
+    if (composerSyncedConversationRef.current === conversation?.id && serializeComposer(el) === textRef.current) return;
+    composerSyncedConversationRef.current = conversation?.id;
+    hidePastePop();
+    el.textContent = textRef.current;
+    // 光标在编辑器里且内容被外部覆盖时，把光标送到末尾，避免停留在越界位置。
+    if (document.activeElement === el) {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
+  }, [text, conversation?.id]);
+
+  // 卡片上的 ✕ 移除走的是 DOM 事件（contenteditable=false 区域不产生 React input 事件）：
+  // 监听后把草稿重算一遍，否则删了卡片发送的还是旧草稿。
+  // 经 ref 转发最新的处理器再挂一次监听：直接把 handleTextChange 闭包进 [] effect
+  // 会把首帧的 setComposerText（带旧 projectId）钉死，跨项目切换后草稿写串。
+  const pasteChangedRef = useRef<() => void>(() => {});
+  pasteChangedRef.current = () => {
+    const el = composerEditRef.current;
+    if (el) handleTextChange(serializeComposer(el));
+  };
+  useEffect(() => {
+    const el = composerEditRef.current;
+    if (!el) return;
+    const onChanged = () => pasteChangedRef.current();
+    el.addEventListener("composer-paste-changed", onChanged);
+    // 浮层是挂在本组件之外的 body 单例：卸载必须收掉，否则跨页面残留。
+    return () => {
+      el.removeEventListener("composer-paste-changed", onChanged);
+      hidePastePop();
+    };
+  }, []);
 
   // 技能引用属于当前会话。resetConversationView 负责主路径，这里也覆盖关闭最后一个
   // Tab 等直接清空会话的入口，避免引用在会话之间残留。
@@ -3209,7 +3350,7 @@ export default function ConversationPage() {
 
   useEffect(() => {
     if (!isEmptyConversation || text.trim() || sending || clearing || stopping || showHistory || showNewConversation || showUsage || showAgentExecution) return;
-    const frame = requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
+    const frame = requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>(".composer-edit")?.focus());
     return () => cancelAnimationFrame(frame);
   }, [clearing, isEmptyConversation, sending, showAgentExecution, showHistory, showNewConversation, showUsage, stopping, text]);
 
@@ -3534,7 +3675,7 @@ export default function ConversationPage() {
 
   const addSkillRef = (skill: Skill) => {
     setSkillRefs((current) => current.some((item) => item.name === skill.name && item.source === skill.source) ? current : [...current, skill]);
-    requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
+    requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>(".composer-edit")?.focus());
   };
 
   const removeSkillRef = (skill: Skill) => {
@@ -3667,7 +3808,7 @@ export default function ConversationPage() {
     const existing = textRef.current.trim();
     setComposerText(existing ? `${existing}\n${pending}` : pending, conversationID);
     setSkillRefs(refs);
-    requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
+    requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>(".composer-edit")?.focus());
   };
 
   // 会话彻底空闲（主回合结束，且没有子代理仍在运行）时，自动发出预约内容。
@@ -3851,9 +3992,7 @@ export default function ConversationPage() {
     if (conversationTransitionRef.current || !conversation || readOnlyConversation || sending || clearing || stopping || handingOff || shortcutBusy) return;
     if (run) {
       // 运行中时先停止，再关闭当前会话并新建一个会话。
-      pendingConfirmBusyRef.current = false;
-      setPendingConfirmBusy(false);
-      setPendingConfirm({
+      const token = openPendingConfirm({
         title: "停止并新建会话",
         message: "当前对话正在运行中，将先停止运行（包括排队中的请求），关闭当前会话后再新建空白会话。当前内容仍可在历史会话中恢复。",
         confirmLabel: "停止并新建",
@@ -3864,19 +4003,13 @@ export default function ConversationPage() {
           if (pendingConfirmBusyRef.current) return;
           pendingConfirmBusyRef.current = true;
           setPendingConfirmBusy(true);
-          void stopAndClearRef.current().finally(() => {
-            pendingConfirmBusyRef.current = false;
-            setPendingConfirmBusy(false);
-            setPendingConfirm(null);
-          });
+          void stopAndClearRef.current().finally(() => closePendingConfirm(token));
         },
-        onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
+        onCancel: () => { if (!pendingConfirmBusyRef.current) closePendingConfirm(token); },
       });
       return;
     }
-    pendingConfirmBusyRef.current = false;
-    setPendingConfirmBusy(false);
-    setPendingConfirm({
+    const token = openPendingConfirm({
       title: "关闭并新建会话",
       message: "将关闭当前会话并打开一个新的空白会话。当前内容仍可在历史会话中恢复。",
       confirmLabel: "关闭并新建",
@@ -3886,13 +4019,9 @@ export default function ConversationPage() {
         if (pendingConfirmBusyRef.current) return;
         pendingConfirmBusyRef.current = true;
         setPendingConfirmBusy(true);
-        void clearCurrentConversation().finally(() => {
-          pendingConfirmBusyRef.current = false;
-          setPendingConfirmBusy(false);
-          setPendingConfirm(null);
-        });
+        void clearCurrentConversation().finally(() => closePendingConfirm(token));
       },
-      onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
+      onCancel: () => { if (!pendingConfirmBusyRef.current) closePendingConfirm(token); },
     });
   };
 
@@ -4073,9 +4202,7 @@ export default function ConversationPage() {
 
 	const deleteHistoryConversation = (item: Conversation) => {
 		if (!projectId || deletingConversation || deleteAllConversationsBusy) return;
-		pendingConfirmBusyRef.current = false;
-		setPendingConfirmBusy(false);
-		setPendingConfirm({
+		const token = openPendingConfirm({
 			title: "删除会话",
 			message: `将永久删除会话「${item.title || "新会话"}」及其全部消息，无法恢复。`,
 			confirmLabel: "删除",
@@ -4085,13 +4212,9 @@ export default function ConversationPage() {
 				if (pendingConfirmBusyRef.current) return;
 				pendingConfirmBusyRef.current = true;
 				setPendingConfirmBusy(true);
-				void deleteHistoryConversationConfirmed(item.id).finally(() => {
-					pendingConfirmBusyRef.current = false;
-					setPendingConfirmBusy(false);
-					setPendingConfirm(null);
-				});
+				void deleteHistoryConversationConfirmed(item.id).finally(() => closePendingConfirm(token));
 			},
-			onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
+			onCancel: () => { if (!pendingConfirmBusyRef.current) closePendingConfirm(token); },
 		});
 	};
 
@@ -4115,9 +4238,7 @@ export default function ConversationPage() {
 
 	const deleteAllHistoryConversations = () => {
 		if (!projectId || deletingConversation || deleteAllConversationsBusy) return;
-		pendingConfirmBusyRef.current = false;
-		setPendingConfirmBusy(false);
-		setPendingConfirm({
+		const token = openPendingConfirm({
 			title: "清除全部历史对话",
 			message: "将永久删除该项目下的全部会话历史（自动编排会话只读保留），无法恢复。",
 			confirmLabel: "清除全部",
@@ -4127,13 +4248,9 @@ export default function ConversationPage() {
 				if (pendingConfirmBusyRef.current) return;
 				pendingConfirmBusyRef.current = true;
 				setPendingConfirmBusy(true);
-				void deleteAllHistoryConversationsConfirmed().finally(() => {
-					pendingConfirmBusyRef.current = false;
-					setPendingConfirmBusy(false);
-					setPendingConfirm(null);
-				});
+				void deleteAllHistoryConversationsConfirmed().finally(() => closePendingConfirm(token));
 			},
-			onCancel: () => { if (!pendingConfirmBusyRef.current) setPendingConfirm(null); },
+			onCancel: () => { if (!pendingConfirmBusyRef.current) closePendingConfirm(token); },
 		});
 	};
 
@@ -4260,18 +4377,18 @@ export default function ConversationPage() {
     }
     catch (cause) {
       if (requiresForceStop(cause)) {
-        setPendingConfirm({
+        const token = openPendingConfirm({
           title: "强制停止",
           message: "该对话还有其他排队中或执行中的请求，强制停止将一并取消它们。是否继续？",
           danger: true,
           onConfirm: () => {
-            setPendingConfirm(null);
+            closePendingConfirm(token);
             void stopRunInternal(true, runID).then((result) => { retractUserMessage(); restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore); if (result !== "stopping") setStopping(false); }).catch((cause) => {
               fail(cause instanceof Error ? cause.message : "无法停止任务");
               setStopping(false);
             });
           },
-          onCancel: () => { setPendingConfirm(null); setStopping(false); },
+          onCancel: () => { closePendingConfirm(token); setStopping(false); },
         });
         return;
       }
@@ -4291,13 +4408,67 @@ export default function ConversationPage() {
     setComposerText(value);
   };
 
-  const navigateInputHistory = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  // contenteditable 输入路径：每次按键/输入把 DOM 序列化回草稿。
+  // 序列化规则唯一来源是 lib/composer-paste.ts —— 卡片在这里还原成完整原文，
+  // 所以草稿、发送、历史记录拿到的都是完整文本。
+  const handleComposerInput = (event: React.FormEvent<HTMLDivElement>) => {
+    const el = event.currentTarget;
+    // 卡片失联（键盘 Backspace/拖拽删除，而非 ✕ 路径）时浮层会残留：锚卡片已不在 DOM。
+    hidePastePopIfDetached();
+    // IME 组合期间不做 DOM 归一化（会打断选字）。
+    // 归一化只针对「清空后的残留」：Chromium 可能留下孤立 <br> 或只含 <br> 的空 <div>。
+    // 文本节点一律算内容 —— 空编辑器里敲一个空格也是内容，不许吞（textarea 允许以空格开头）。
+    if (!(event.nativeEvent as InputEvent).isComposing
+      && el.childNodes.length > 0
+      && Array.from(el.childNodes).every(isComposerBlankResidue)) {
+      el.innerHTML = "";
+    }
+    handleTextChange(serializeComposer(el));
+  };
+
+  // 粘贴分流：超过阈值收成内联卡片（发送时还原为全文），以内走纯文本插入。
+  // 一律 preventDefault：富文本/图片粘贴不许直接进 DOM —— 标签看不见但 serialize 口径外，
+  // 「界面上有、发出去没有」正是本项目最忌的显示与发送分家。
+  const handleComposerPaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const pasted = event.clipboardData.getData("text/plain");
+    if (!pasted) return;
+    const el = event.currentTarget;
+    if (shouldFoldPaste(pasted)) {
+      el.focus();
+      insertPasteCardAtSelection(el, pasted);
+      handleTextChange(serializeComposer(el));
+      return;
+    }
+    // execCommand 走浏览器原生插入（保留撤销栈、触发 input 事件）；失败时手工补文本节点兜底。
+    if (!document.execCommand("insertText", false, pasted)) {
+      el.appendChild(document.createTextNode(pasted));
+      handleTextChange(serializeComposer(el));
+    }
+  };
+
+  const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    // keyCode 229 是 IME 组合处理的兜底信号：个别 WebKit 版本确认选词的 Enter
+    // 先派发 compositionend 再派发 keydown，isComposing 已为 false，会误发送。
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) {
+      event.preventDefault();
+      composerRef.current?.requestSubmit();
+      return;
+    }
+    navigateInputHistory(event);
+  };
+
+  const navigateInputHistory = (event: React.KeyboardEvent<HTMLDivElement>) => {
     if (event.nativeEvent.isComposing || event.shiftKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
-    const textarea = event.currentTarget;
+    const editor = event.currentTarget;
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return;
     const browsing = historyIndex.current !== null;
-    if (!browsing && textarea.selectionStart !== textarea.selectionEnd) return;
+    // 判据与 textarea 旧实现一一对应：非浏览态要求光标 collapsed；
+    // 上箭头还要求光标在第一行（光标之前的文本里没有换行），否则它只是普通的行间移动。
+    if (!browsing && !selection.isCollapsed) return;
     if (event.key === "ArrowUp") {
-      if (inputHistory.length === 0 || (!browsing && textarea.value.slice(0, textarea.selectionStart).includes("\n"))) return;
+      if (inputHistory.length === 0 || (!browsing && caretTextBefore(editor).includes("\n"))) return;
       event.preventDefault();
       if (!browsing) {
         draftBeforeHistory.current = text;
@@ -4377,7 +4548,7 @@ export default function ConversationPage() {
     historyIndex.current = null;
     draftBeforeHistory.current = "";
     setComposerText(prompt);
-    requestAnimationFrame(() => composerRef.current?.querySelector("textarea")?.focus());
+    requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>(".composer-edit")?.focus());
   };
 
   // 技能描述过长时截断，供悬浮卡片展示，避免过长的描述撑爆卡片。
@@ -4601,7 +4772,18 @@ export default function ConversationPage() {
         <div className="composer-card">
         <div className="composer-input-area">
           {inputHistoryPosition !== null && inputHistory.length > 0 && <span className="composer-history-position" role="status" aria-label={`输入历史第 ${inputHistoryPosition} 条，共 ${inputHistory.length} 条`}>{inputHistoryPosition}/{inputHistory.length}</span>}
-      <textarea value={text} onChange={(event) => handleTextChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); return; } navigateInputHistory(event); }} placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`} disabled={readOnlyConversation || sending || clearing || handingOff || changingModel || Boolean(shortcutBusy)} />
+      <div ref={composerEditRef}
+        className="composer-edit"
+        contentEditable={!(readOnlyConversation || sending || clearing || handingOff || changingModel || Boolean(shortcutBusy))}
+        role="textbox"
+        aria-multiline="true"
+        aria-label={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作`}
+        data-placeholder={readOnlyConversation ? "自动编排执行中，仅供查看" : `描述希望 ${activeAgentName} 在当前项目中完成的工作...`}
+        data-disabled={(readOnlyConversation || sending || clearing || handingOff || changingModel || Boolean(shortcutBusy)) || undefined}
+        onInput={handleComposerInput}
+        onPaste={handleComposerPaste}
+        onKeyDown={handleComposerKeyDown}
+      />
           <button className={`composer-mobile-shortcut-toggle${showMobileShortcuts ? " open" : ""}`} type="button" title="快捷操作" aria-label="快捷操作" aria-controls="mobile-shortcut-menu" aria-expanded={showMobileShortcuts} disabled={readOnlyConversation || sending || clearing || stopping || handingOff || Boolean(shortcutBusy)} onClick={() => setShowMobileShortcuts((open) => !open)}><ComposerShortcutIcon /></button>
         </div>
         {showMobileShortcuts && <section className="mobile-shortcut-menu" id="mobile-shortcut-menu" aria-label="快捷操作">
@@ -4638,6 +4820,6 @@ export default function ConversationPage() {
     {showAiConfig && <ProjectAiConfigDialog projectId={project.id} runnerID={project.runner} close={closeAiConfig} />}
     {shortcutEditor && <ShortcutEditor projectID={project.id} state={shortcutEditor} close={() => setShortcutEditor(null)} refresh={refreshShortcuts} fail={fail} agentID={conversation?.agentId || "claude-code"} catalog={commandCatalog} catalogLoading={commandCatalogLoading} refreshCatalog={refreshCommandCatalog} />}
     {shortcutVariables && <ShortcutVariablesDialog state={shortcutVariables} close={() => setShortcutVariables(null)} run={(variables) => { setShortcutVariables(null); void runShortcut(shortcutVariables.shortcut, variables, true); }} />}
-    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} confirmLabel={pendingConfirm.confirmLabel} danger={pendingConfirm.danger} busy={pendingConfirmBusy} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
+    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} confirmLabel={pendingConfirm.confirmLabel} busyLabel={pendingConfirm.busyLabel} danger={pendingConfirm.danger} busy={pendingConfirmBusy} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </>;
 }

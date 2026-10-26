@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -202,7 +203,10 @@ func (s *Server) probeMCPStdio(ctx context.Context, req mcpProbeRequest) (mcpPro
 				linuxDir = windowsToWSLMntPath(linuxDir)
 			}
 		}
-		cmd := runner.wslNativeCommand(ctx, req.Command, req.Args, envPairs(req.Env), linuxDir)
+		// 必须带 os.Environ()：wsl.exe 自身要 SystemRoot/PATH 才能正常启动；只给探针变量
+		// 会把 Windows 进程环境整体替换掉（与其它 wslNativeCommand 调用点同一纪律）。
+		// WSLENV 只转发探针变量名，其余 Windows 变量不会进 WSL。
+		cmd := runner.wslNativeCommand(ctx, req.Command, req.Args, mergedProbeEnv(req.Env), linuxDir, envNames(envPairs(req.Env))...)
 		return probeStdioInteractive(ctx, cmd, "（WSL）")
 
 	case agentTargetEnvRemote:
@@ -1120,9 +1124,15 @@ func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request) {
 	}
 	outcome, probeErr := s.probeMCPServer(ctx, probe)
 	response.DurationMs = time.Since(started).Milliseconds()
+	if hint := mcpTransportHint(stored.Transport, target); hint != "" {
+		response.Hint = hint
+	}
 	if probeErr != nil {
 		response.Error = probeErr.Error()
-		response.Hint = mcpTestHint(probeErr, target)
+		if response.Hint != "" {
+			response.Hint += " "
+		}
+		response.Hint += mcpTestHint(probeErr, target)
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
@@ -1130,7 +1140,9 @@ func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request) {
 	if stored.Source == mcpSourceOAuthPending {
 		s.mcpOAuthLifecycleMu.Lock()
 		defer s.mcpOAuthLifecycleMu.Unlock()
-		if _, authorized := s.mcpOAuthAuthorizationHeader(ctx, stored.ID); !authorized {
+		// 这里已经在锁内，必须用**只读**检查：mcpOAuthAuthorizationHeader 在令牌临期时
+		// 会走刷新，而 refreshMCPOAuthToken 也要拿这把锁（非可重入），会永久挂死。
+		if !s.mcpOAuthAuthorized(ctx, stored.ID) {
 			response.OK = false
 			response.Error = "授权尚未完成，请重新授权"
 		} else if result, err := s.db.ExecContext(ctx, `update mcp_servers set enabled=1,source=?,updated_at=? where id=? and source=?`, mcpSourceManual, time.Now().UTC(), stored.ID, mcpSourceOAuthPending); err != nil {
@@ -1167,11 +1179,15 @@ func fillMCPTestResponse(response *mcpTestResponse, outcome mcpProbeOutcome) {
 	response.ToolCount = len(outcome.Tools)
 	response.FlaggedCount = countFlaggedTools(outcome.Tools)
 	if response.ToolCount == 0 {
+		note := "server 已连通，但没有声明任何工具、resources 或 prompts。"
 		if len(response.Resources) > 0 || len(response.Prompts) > 0 {
-			response.Hint = "该 server 没有声明工具，但提供了 resources / prompts。Claude Code 可以使用它们；Codex 目前只支持 tools。"
-		} else {
-			response.Hint = "server 已连通，但没有声明任何工具、resources 或 prompts。"
+			note = "该 server 没有声明工具，但提供了 resources / prompts。Claude Code 可以使用它们；Codex 目前只支持 tools。"
 		}
+		// 追加而不是覆盖：HTTP/SSE 的「探针从控制服务本机发起」提示必须先保留。
+		if response.Hint != "" {
+			response.Hint += " "
+		}
+		response.Hint += note
 	}
 }
 
@@ -1188,7 +1204,14 @@ type mcpDraftTestInput struct {
 	Environment  string            `json:"environment"`
 	ProjectID    string            `json:"projectId"`
 	ConnectionID string            `json:"connectionId"`
-	TimeoutSec   int               `json:"timeoutSec"`
+	// ServerID 仅用于「编辑已有 server 时试连草稿」：已保存的密钥不会回显到表单，
+	// 前端只能把它们留空；带上 serverID 让服务端补上这些缺失的值，避免试连因缺凭据
+	// 假失败（真正保存后注入是带凭据的）。
+	ServerID string `json:"serverId"`
+	// 表单上显式移除的已保存凭据键：草稿试连也不能把它们从库里补回来。
+	RemovedEnvSecrets    []string `json:"removedEnvSecrets"`
+	RemovedHeaderSecrets []string `json:"removedHeaderSecrets"`
+	TimeoutSec           int      `json:"timeoutSec"`
 }
 
 // testMCPDraft 在保存之前试连一条尚未落库的配置。
@@ -1239,6 +1262,56 @@ func (s *Server) testMCPDraft(w http.ResponseWriter, r *http.Request) {
 		timeout = mcpDefaultProbeTimeout
 	}
 
+	// 编辑已有 server 时，表单里不可能有已保存的密钥（接口永不回显），草稿试连必须
+	// 从库里补上这些键；表单里显式填了值的键优先。只补 sec_ 引用对应的键 —— 普通值
+	// 用户可能在表单里刚删掉，补回来会让试连通过而保存后的配置实际不通过。
+	savedSecretsSkipped := false
+	savedSecretsBroken := false
+	if serverID := strings.TrimSpace(input.ServerID); serverID != "" {
+		if stored, err := s.fetchStoredMCPServer(r.Context(), serverID); err == nil && stored.Transport == transport {
+			if s.mcpDraftSavedSecretsSafe(r.Context(), stored, transport, target, input) {
+				removedEnv := map[string]bool{}
+				for _, key := range input.RemovedEnvSecrets {
+					removedEnv[strings.TrimSpace(key)] = true
+				}
+				removedHeaders := map[string]bool{}
+				for _, key := range input.RemovedHeaderSecrets {
+					removedHeaders[strings.TrimSpace(key)] = true
+				}
+				envValues, _, envOK := s.resolveMCPValues(r.Context(), stored.envRaw, false, target, projectPath)
+				headerValues, _, headerOK := s.resolveMCPValues(r.Context(), stored.headersRaw, false, target, projectPath)
+				if !envOK || !headerOK {
+					savedSecretsBroken = true
+				} else {
+					if input.Env == nil {
+						input.Env = map[string]string{}
+					}
+					for key, value := range envValues {
+						if removedEnv[key] || !strings.HasPrefix(stored.envRaw[key], mcpSecretRefPrefix) {
+							continue
+						}
+						if _, exists := input.Env[key]; !exists {
+							input.Env[key] = value
+						}
+					}
+					if input.Headers == nil {
+						input.Headers = map[string]string{}
+					}
+					for key, value := range headerValues {
+						if removedHeaders[key] || !strings.HasPrefix(stored.headersRaw[key], mcpSecretRefPrefix) {
+							continue
+						}
+						if _, exists := input.Headers[key]; !exists {
+							input.Headers[key] = value
+						}
+					}
+				}
+			} else if len(collectSecretRefs(stored.envRaw, stored.headersRaw)) > 0 {
+				savedSecretsSkipped = true
+			}
+		}
+	}
+
 	probe := mcpProbeRequest{
 		Transport:   transport,
 		Command:     resolveMCPPlaceholders(strings.TrimSpace(input.Command), target, projectPath),
@@ -1266,9 +1339,26 @@ func (s *Server) testMCPDraft(w http.ResponseWriter, r *http.Request) {
 	}
 	outcome, probeErr := s.probeMCPServer(r.Context(), probe)
 	response.DurationMs = time.Since(started).Milliseconds()
+	if hint := mcpTransportHint(transport, target); hint != "" {
+		response.Hint = hint
+	}
+	if savedSecretsBroken {
+		if response.Hint != "" {
+			response.Hint += " "
+		}
+		response.Hint += "已保存的凭据无法解密，本次测试未带上它们；请重新填写密钥后再试。"
+	} else if savedSecretsSkipped {
+		if response.Hint != "" {
+			response.Hint += " "
+		}
+		response.Hint += "草稿与已保存配置的目标/项目/普通变量不一致，本次测试未使用已保存的密钥（避免把凭据发往新目标）；保存后注入会带上它们。"
+	}
 	if probeErr != nil {
 		response.Error = probeErr.Error()
-		response.Hint = mcpTestHint(probeErr, target)
+		if response.Hint != "" {
+			response.Hint += " "
+		}
+		response.Hint += mcpTestHint(probeErr, target)
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
@@ -1286,6 +1376,96 @@ func resolveMCPDraftValues(values map[string]string, target agentTargetEnv, proj
 		out[key] = resolveMCPPlaceholders(value, target, projectPath)
 	}
 	return out
+}
+
+// mcpDraftSavedSecretsSafe 判断草稿试连能否安全地使用已保存的密钥。
+//
+// serverId 与草稿的 URL/command/args/项目/环境都由调用方控制；只要其中任何一项能把
+// 探测目标或行为改到别处，就不能把解密后的密钥补进去。判定标准是「目标与公共配置
+// 完全未变」：transport、目标串、解析 ${PROJECT_DIR} 所需的项目/环境、以及所有非密钥
+// 的 env/header 值都必须与库里一致；额外键只允许是凭据类。
+func (s *Server) mcpDraftSavedSecretsSafe(ctx context.Context, stored storedMCPServer, transport string, target agentTargetEnv, input mcpDraftTestInput) bool {
+	if stored.Transport != transport {
+		return false
+	}
+	storedProjectPath, storedRunnerID := "", ""
+	if stored.ProjectID != "" {
+		project, err := s.getProjectByID(ctx, stored.ProjectID)
+		if err != nil {
+			return false
+		}
+		storedProjectPath, storedRunnerID = project.Path, project.RunnerID
+	}
+	// 项目决定探测的工作目录（相对命令/配置解析都受影响），环境决定实际拉起的二进制
+	// （Windows 的 npx vs WSL 的 npx）。两者都必须与库里一致，哪怕配置里没有
+	// ${PROJECT_DIR} —— 否则同一个命令串可以被引导到另一处执行。
+	if strings.TrimSpace(input.ProjectID) != stored.ProjectID {
+		return false
+	}
+	if target != s.resolveAgentTargetEnv(storedRunnerID, storedProjectPath) {
+		return false
+	}
+	switch transport {
+	case mcpTransportStdio:
+		if strings.TrimSpace(input.Command) != stored.Command || !slices.Equal(input.Args, stored.Args) {
+			return false
+		}
+	case mcpTransportHTTP, mcpTransportSSE:
+		if strings.TrimSpace(input.URL) != stored.URL {
+			return false
+		}
+	}
+	removedEnv := map[string]bool{}
+	for _, key := range input.RemovedEnvSecrets {
+		removedEnv[strings.TrimSpace(key)] = true
+	}
+	removedHeaders := map[string]bool{}
+	for _, key := range input.RemovedHeaderSecrets {
+		removedHeaders[strings.TrimSpace(key)] = true
+	}
+	return mcpDraftPublicValuesSafe(stored.envRaw, input.Env, removedEnv) &&
+		mcpDraftPublicValuesSafe(stored.headersRaw, input.Headers, removedHeaders)
+}
+
+// mcpDraftPublicValuesSafe 要求库里的普通 env/header 在草稿里原样存在；草稿多出来的
+// 键只允许是凭据类（不能是 NODE_OPTIONS/PATH 这类能改变命令行为的变量）。
+func mcpDraftPublicValuesSafe(storedRaw, provided map[string]string, removed map[string]bool) bool {
+	stored := map[string]string{}
+	for _, original := range sortedKeys(storedRaw) {
+		stored[strings.TrimSpace(original)] = storedRaw[original]
+	}
+	providedNorm := map[string]string{}
+	for _, original := range sortedKeys(provided) {
+		providedNorm[strings.TrimSpace(original)] = provided[original]
+	}
+	for key, value := range stored {
+		if strings.HasPrefix(value, mcpSecretRefPrefix) || removed[key] {
+			continue
+		}
+		got, ok := providedNorm[key]
+		if !ok || got != value {
+			return false
+		}
+	}
+	for key := range providedNorm {
+		if _, ok := stored[key]; ok {
+			continue
+		}
+		if looksLikeSecretKey(key) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// mcpTransportHint 说明 HTTP/SSE 探针的通道限制：它始终从控制服务所在机器发起，
+// 环境下拉框对这类 server 只影响界面文案，不代表真的从 WSL/远端发起。
+func mcpTransportHint(transport string, target agentTargetEnv) string {
+	if (transport == mcpTransportHTTP || transport == mcpTransportSSE) && target != agentTargetEnvWindows {
+		return "HTTP/SSE 连接测试从控制服务所在机器发起，不经过 WSL/远端通道；远端本机地址（如 127.0.0.1）无法这样验证。"
+	}
+	return ""
 }
 
 // mcpTestHint 把常见失败翻译成可操作的建议，避免用户拿着「超时」无从下手。
@@ -1332,6 +1512,8 @@ type mcpRuntimeCheckInput struct {
 	Commands     []string `json:"commands"`
 	Environment  string   `json:"environment"`
 	ConnectionID string   `json:"connectionId"`
+	// ProjectID 让「SSH 远端」检查从项目的 runner 反推连接；表单没有连接选择。
+	ProjectID string `json:"projectId"`
 }
 
 type mcpRuntimeCheckItem struct {
@@ -1391,6 +1573,20 @@ func (s *Server) checkMCPRuntimes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target := agentTargetEnv(environment)
+	runnerID := ""
+	if projectID := strings.TrimSpace(input.ProjectID); projectID != "" {
+		project, err := s.getProjectByID(r.Context(), projectID)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, errors.New("项目不存在"))
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		runnerID = project.RunnerID
+	}
+	connectionID := mcpConnectionIDFromRunner(runnerID, strings.TrimSpace(input.ConnectionID))
 
 	// 合法命令名去重；非法项不拼进 shell，直接作为一条独立结论回传。
 	commands := make([]string, 0, len(input.Commands))
@@ -1460,7 +1656,7 @@ func (s *Server) checkMCPRuntimes(w http.ResponseWriter, r *http.Request) {
 		respond("", found)
 
 	case agentTargetEnvRemote:
-		connID := mcpConnectionIDFromRunner("", strings.TrimSpace(input.ConnectionID))
+		connID := connectionID
 		if connID == "" {
 			respond("远端检查需要指定 SSH 连接，请先在「SSH连接」页面建立连接后在项目视图里选择该项目", nil)
 			return
@@ -1474,7 +1670,9 @@ func (s *Server) checkMCPRuntimes(w http.ResponseWriter, r *http.Request) {
 		}
 		found := make([]mcpRuntimeCheckItem, 0, len(commands))
 		for _, command := range commands {
-			output, err := client.execCommand(ctx, mcpRuntimeProbeScript(command))
+			// 前置平台托管的目录：平台在远端装的那份 CLI 落在托管 npm prefix 下，
+			// 不在非交互 shell 的 PATH 上（与 sshRemoteCommand 同一条理由）。
+			output, err := client.execCommand(ctx, sshRemoteCommand(mcpRuntimeProbeScript(command)))
 			if err != nil {
 				respond("远端执行失败："+err.Error(), nil)
 				return

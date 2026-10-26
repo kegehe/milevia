@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
+	"time"
 )
 
 // setMCPAutoApprove 记录某会话本次运行生效的 MCP 自动放行模式。
@@ -59,7 +61,7 @@ type mcpInjection struct {
 	// JSON 是 {"mcpServers":{...}} 的序列化内容（无 server 时为空串）。
 	JSON string
 	// LocalPath 是 Windows / WSL 已落盘的本地路径（Windows 形态；WSL 需再转 /mnt）。
-	// SSH 远端不在此字段中：远端路径由 ssh runner 的 buildRemoteMCPSetup 依同一 runKey 生成。
+	// SSH 远端不在此字段中：远端路径由 ssh runner 的 prepareRemoteMCPConfig 依同一 runKey 生成。
 	LocalPath string
 	// Strict 表示是否附加 --strict-mcp-config。
 	Strict bool
@@ -69,6 +71,10 @@ type mcpInjection struct {
 	Environment agentTargetEnv
 	// Note 是降级说明（如远端版本不支持），空串表示无需提示。
 	Note string
+	// StartupTimeout 是本次注入的 server 里最大的启动超时（startupTimeoutSec，秒）。
+	// 0 表示没有注入任何 server。runner 用它把 CLI 的 MCP_TIMEOUT 压到用户配置值上 ——
+	// CLI 默认 30 秒且没有更小的兜底，一个挂掉的远端 server 就足以让首轮迟迟不开始。
+	StartupTimeout time.Duration
 	// Env 是该次运行需注入 CLI 进程的密钥环境变量（KEY=VAL）。
 	//
 	// 仅 Windows/WSL 非空：配置文件里只写 ${MCP_SEC_*} 占位符，真值随进程环境提供，
@@ -152,6 +158,39 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 		})
 		return mcpInjection{Environment: target}
 	}
+	// 远端 Claude 的注入能力在 runner 侧才最终判定。这里只用**已缓存**的探测结果：
+	// 已知不支持时先把状态记成「未注入」，不再虚报；未知时交给 buildRemoteMCPSetup
+	// 探测，避免在请求路径上额外多做一次 SSH 往返（失败时更会叠加 10s 超时）。
+	remoteCapabilityUnknown := false
+	if target == agentTargetEnvRemote && agentID == "claude-code" {
+		if runner, ok := s.runnerRegistry.get(runnerID); ok {
+			remote, isSSH := runner.(*sshRunner)
+			if !isSSH {
+				remoteCapabilityUnknown = true
+			}
+			if isSSH {
+				checked, injectable, _ := remote.mcpCapabilityCached()
+				if !checked {
+					remoteCapabilityUnknown = true
+				}
+				if checked && !injectable {
+					note := "无法确认远端 Claude Code 是否支持 MCP 注入（版本探测失败或版本过低），本次未注入任何 server。"
+					s.recordProjectMCPInjection(projectID, projectMCPStatus{
+						ProjectID:   projectID,
+						Environment: string(target),
+						AgentID:     agentID,
+						StrictMode:  !s.projectMCPAllowMcpJson(ctx, projectID),
+						Servers:     []projectMCPStatusServer{},
+						Note:        note,
+						RunKey:      runKey,
+					})
+					return mcpInjection{Environment: target, Note: note}
+				}
+			}
+		} else {
+			remoteCapabilityUnknown = true
+		}
+	}
 	if agentID == "opencode" {
 		return s.prepareOpenCodeMCPInjection(ctx, projectID, projectPath, servers, target, runKey)
 	}
@@ -197,10 +236,18 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 	env := []string{}
 	seenEnv := map[string]bool{}
 	injected := []projectMCPStatusServer{}
+	cwdDropped := false
+	startupTimeoutSec := 0
 	for _, server := range servers {
 		entry, additions, ok := s.mcpServerEntry(ctx, server, target, projectPath, useEnvRefs)
 		if !ok {
 			continue
+		}
+		if server.StartupTimeoutSec > startupTimeoutSec {
+			startupTimeoutSec = server.StartupTimeoutSec
+		}
+		if server.Transport == mcpTransportStdio && strings.TrimSpace(server.Cwd) != "" {
+			cwdDropped = true
 		}
 		entries[server.Name] = entry
 		injected = append(injected, describeMCPStatusServer(server))
@@ -229,14 +276,21 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 	if err != nil {
 		return mcpInjection{Environment: target}
 	}
+	if startupTimeoutSec <= 0 {
+		// 导入的 server 可能没带 startupTimeoutSec（列默认 20 只覆盖新建/编辑路径）。
+		// 有 server 却拿不到配置值时退回 20 秒 —— 与新建默认值一致，也保证这条上限
+		// 不会因为"字段为空"而静默失效。
+		startupTimeoutSec = 20
+	}
 	inj := mcpInjection{
 		JSON:             string(payload),
 		Strict:           strict,
 		AutoApproveTools: dedupeStrings(autoApprove),
 		Environment:      target,
+		StartupTimeout:   time.Duration(startupTimeoutSec) * time.Second,
 		Env:              env,
 	}
-	// SSH 远端不在本机落盘：远端路径由 ssh runner 的 buildRemoteMCPSetup 依据同一个
+	// SSH 远端不在本机落盘：远端路径由 ssh runner 的 prepareRemoteMCPConfig 依据同一个
 	// runKey 在远端生成（两处共用 sanitizeMCPRunKey，口径一致）。只有本地 / WSL 才写文件。
 	if target != agentTargetEnvRemote {
 		winPath, cleanup, err := s.writeMCPRuntimeFile(runKey, inj.JSON)
@@ -255,6 +309,24 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 		}
 		inj.LocalPath = winPath
 		inj.cleanup = cleanup
+	}
+	// Claude 的 MCP 配置条目只认 command/args/env（没有 cwd），而探针会按 cwd 拉起进程：
+	// 若不说明，就会出现「测试连接通过、实际运行在项目根启动」的口径差。
+	if cwdDropped {
+		note := "Claude 的 MCP 配置不支持 cwd：该字段只在测试连接时生效，运行时不会改变工作目录"
+		if inj.Note != "" {
+			inj.Note += "；"
+		}
+		inj.Note += note
+	}
+	if remoteCapabilityUnknown {
+		// 首次运行的能力探测在 runner 侧进行；若远端版本不支持或 SFTP/stdin 写入失败，
+		// 实际不会注入。状态只能如实标成「可能未注入」，而不是假装成功。
+		note := "远端 MCP 注入能力尚未探测；若远端版本不支持或配置写入失败，本次可能未实际注入"
+		if inj.Note != "" {
+			inj.Note += "；"
+		}
+		inj.Note += note
 	}
 	s.recordProjectMCPInjection(projectID, projectMCPStatus{
 		ProjectID:   projectID,
@@ -418,53 +490,127 @@ func describeMCPStatusServer(server storedMCPServer) projectMCPStatusServer {
 // 这一点在 UI 上说明（§7.4）。
 func (s *Server) buildCodexInjection(ctx context.Context, servers []storedMCPServer, target agentTargetEnv, projectPath string) (mcpInjection, []projectMCPStatusServer) {
 	args := []string{}
-	env := []string{}
-	seenEnv := map[string]bool{}
+	envPairs := []string{}
+	emittedEnv := map[string]bool{}
+	envValues := map[string]string{}
+	notes := []string{}
 	autoApprove := []string{}
 	injected := []projectMCPStatusServer{}
 	for _, server := range servers {
-		serverArgs, serverEnv, ok := s.codexServerArgs(ctx, server, target, projectPath)
+		serverArgs, serverEnv, skipped, ok := s.codexServerArgs(ctx, server, target, projectPath)
 		if !ok {
+			continue
+		}
+		if len(skipped) > 0 {
+			notes = append(notes, "server "+server.Name+" 的环境变量 "+strings.Join(skipped, "、")+
+				" 会改变 Codex 自身的运行环境（PATH/HOME/代理/预加载等），已忽略这些变量")
+		}
+		// Codex 的 env_vars 只能转发「Codex 进程环境里的同名变量」，没有按 server 隔离
+		// 取值的能力。两个 server 声明同名但不同值的变量时，后一个会拿到前一个的凭据 ——
+		// 如实跳过并说明，比静默串号安全。header 路径已用 server 名做过隔离（见
+		// codexHeaderArgs），stdio 的 env 没有等价机制。
+		//
+		// 键名按大写比较：Windows 环境变量名大小写不敏感，`Token` 与 `TOKEN` 会互相覆盖。
+		conflict := ""
+		local := map[string]string{}
+		for _, pair := range serverEnv {
+			name, value, found := strings.Cut(pair, "=")
+			if !found || name == "" {
+				continue
+			}
+			key := codexMCPEnvKey(target, name)
+			if previous, seen := local[key]; seen && previous != value {
+				conflict = name
+				break
+			}
+			local[key] = value
+			if existing, seen := envValues[key]; seen && existing != value {
+				conflict = name
+				break
+			}
+		}
+		if conflict != "" {
+			notes = append(notes, "server "+server.Name+" 的环境变量 "+conflict+
+				" 与已注入的 server 取值不同；Codex 无法按 server 隔离同名变量，已跳过该 server")
 			continue
 		}
 		injected = append(injected, describeMCPStatusServer(server))
 		args = append(args, serverArgs...)
 		autoApprove = append(autoApprove, server.AutoApproveTools...)
 		for _, pair := range serverEnv {
-			name, _, found := strings.Cut(pair, "=")
-			if !found || seenEnv[name] {
+			name, value, found := strings.Cut(pair, "=")
+			if !found || name == "" {
 				continue
 			}
-			seenEnv[name] = true
-			env = append(env, pair)
+			key := codexMCPEnvKey(target, name)
+			if _, seen := envValues[key]; !seen {
+				envValues[key] = value
+			}
+			// 输出按**原始键名**去重：`Token` 与 `TOKEN` 取值相同时两者都要保留 ——
+			// Linux 上它们是不同变量，只留第一个会让后一个 server 拿不到自己的变量。
+			if !emittedEnv[name] {
+				emittedEnv[name] = true
+				envPairs = append(envPairs, name+"="+value)
+			}
 		}
 	}
 	if len(args) == 0 {
-		note := ""
-		if len(servers) > 0 {
+		note := strings.Join(notes, "；")
+		if len(servers) > 0 && note == "" {
 			note = "所选 server 均无法注入（请检查命令 / URL 与密钥是否完整）。"
 		}
 		return mcpInjection{Environment: target, Note: note}, injected
 	}
+	sort.Strings(envPairs)
+	env := envPairs
+	notes = append(notes, "Codex 没有 --strict-mcp-config 等价物：你在 ~/.codex/config.toml 里配置的 MCP 无法被屏蔽。")
 	return mcpInjection{
 		CodexArgs:        args,
 		AutoApproveTools: dedupeStrings(autoApprove),
 		Environment:      target,
 		Env:              env,
-		Note:             "Codex 没有 --strict-mcp-config 等价物：你在 ~/.codex/config.toml 里配置的 MCP 无法被屏蔽。",
+		Note:             strings.Join(notes, "；"),
 	}, injected
 }
 
+// codexMCPEnvDenylist 是 Codex stdio MCP 的 env 转发必须拒绝的键。
+//
+// Codex 的 env_vars 只转发「CLI 进程环境里的同名变量」，因此这些键一旦进入 MCP
+// 配置就必须塞进 Codex 自己的进程环境 —— 等于让导入的第三方配置改动 CLI 本身的
+// PATH、配置目录、代理或预加载库，属于直接的进程劫持面。MCP server 仍按默认环境启动。
+var codexMCPEnvDenylist = map[string]bool{
+	"PATH": true, "HOME": true, "CODEX_HOME": true,
+	"OPENAI_BASE_URL": true, "ANTHROPIC_BASE_URL": true,
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true, "NO_PROXY": true,
+	"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "DYLD_INSERT_LIBRARIES": true,
+	"NODE_OPTIONS": true, "PYTHONPATH": true, "PYTHONHOME": true,
+	"SSL_CERT_FILE": true, "SSL_CERT_DIR": true,
+}
+
+// codexMCPEnvKey 归一环境变量名：Windows 上大小写不敏感（Token 与 TOKEN 会互相
+// 覆盖），WSL/远端 Linux 上则是两个不同变量，不能用大写折叠误判冲突/危险键。
+func codexMCPEnvKey(target agentTargetEnv, name string) string {
+	if target == agentTargetEnvWindows {
+		return strings.ToUpper(name)
+	}
+	return name
+}
+
+func codexMCPEnvDenied(target agentTargetEnv, name string) bool {
+	return codexMCPEnvDenylist[codexMCPEnvKey(target, name)]
+}
+
 // codexServerArgs 把一条定义转成 Codex 的 -c 参数序列与需要的密钥环境变量。
-func (s *Server) codexServerArgs(ctx context.Context, server storedMCPServer, target agentTargetEnv, projectPath string) ([]string, []string, bool) {
+func (s *Server) codexServerArgs(ctx context.Context, server storedMCPServer, target agentTargetEnv, projectPath string) ([]string, []string, []string, bool) {
 	prefix := "mcp_servers." + server.Name
 	args := []string{}
 	env := []string{}
+	skipped := []string{}
 	switch server.Transport {
 	case mcpTransportStdio:
 		command := resolveMCPPlaceholders(server.Command, target, projectPath)
 		if command == "" {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 		args = append(args, "-c", prefix+".command="+tomlString(command))
 		if len(server.Args) > 0 {
@@ -477,10 +623,11 @@ func (s *Server) codexServerArgs(ctx context.Context, server storedMCPServer, ta
 		if server.Cwd != "" {
 			args = append(args, "-c", prefix+".cwd="+tomlString(resolveMCPPlaceholders(server.Cwd, target, projectPath)))
 		}
-		names, pairs, ok := s.codexEnvVarNames(ctx, server.envRaw, target, projectPath)
+		names, pairs, skippedEnv, ok := s.codexEnvVarNames(ctx, server.envRaw, target, projectPath)
 		if !ok {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
+		skipped = skippedEnv
 		if len(names) > 0 {
 			args = append(args, "-c", prefix+".env_vars="+tomlStringArray(names))
 		}
@@ -488,12 +635,12 @@ func (s *Server) codexServerArgs(ctx context.Context, server storedMCPServer, ta
 	case mcpTransportHTTP, mcpTransportSSE:
 		url := resolveMCPPlaceholders(server.URL, target, projectPath)
 		if url == "" {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 		args = append(args, "-c", prefix+".url="+tomlString(url))
 		headerArgs, headerEnv, ok := s.codexHeaderArgs(ctx, prefix, server.headersRaw, target, projectPath)
 		if !ok {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 		args = append(args, headerArgs...)
 		env = headerEnv
@@ -508,7 +655,7 @@ func (s *Server) codexServerArgs(ctx context.Context, server storedMCPServer, ta
 			}
 		}
 	default:
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	timeout := server.StartupTimeoutSec
 	if timeout <= 0 {
@@ -518,7 +665,7 @@ func (s *Server) codexServerArgs(ctx context.Context, server storedMCPServer, ta
 	if server.ToolTimeoutSec > 0 {
 		args = append(args, "-c", fmt.Sprintf("%s.tool_timeout_sec=%d", prefix, server.ToolTimeoutSec))
 	}
-	return args, env, true
+	return args, env, skipped, true
 }
 
 // codexEnvVarNames 把 stdio 的 env 转成 env_vars（变量名列表）与进程环境增项。
@@ -526,22 +673,27 @@ func (s *Server) codexServerArgs(ctx context.Context, server storedMCPServer, ta
 //
 // 与 Claude 路径一致，非密钥值要先解析 ${PROJECT_DIR}（docs/34 §5.3）：Codex 的 env_vars
 // 只转发变量名，真值由 Milevia 注入 CLI 进程环境，CLI 侧无法展开 Milevia 专属占位符。
-func (s *Server) codexEnvVarNames(ctx context.Context, values map[string]string, target agentTargetEnv, projectPath string) ([]string, []string, bool) {
+func (s *Server) codexEnvVarNames(ctx context.Context, values map[string]string, target agentTargetEnv, projectPath string) ([]string, []string, []string, bool) {
 	if len(values) == 0 {
-		return nil, nil, true
+		return nil, nil, nil, true
 	}
 	names := []string{}
 	pairs := []string{}
+	skipped := []string{}
 	for _, key := range sortedKeys(values) {
+		if codexMCPEnvDenied(target, strings.TrimSpace(key)) {
+			skipped = append(skipped, key)
+			continue
+		}
 		plain, ok := s.resolveCodexSecretValue(ctx, values[key])
 		if !ok {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 		plain = resolveMCPPlaceholders(plain, target, projectPath)
 		names = append(names, key)
 		pairs = append(pairs, key+"="+plain)
 	}
-	return names, pairs, true
+	return names, pairs, skipped, true
 }
 
 // codexHeaderArgs 把 HTTP 的 headers 转成 Codex 的 http_headers / env_http_headers /
@@ -794,7 +946,15 @@ func resolveMCPPlaceholders(value string, target agentTargetEnv, projectPath str
 	dir := projectPath
 	switch target {
 	case agentTargetEnvWSL:
-		dir = windowsToWSLMntPath(projectPath)
+		// wsl-local 项目的路径以 UNC（\\wsl$\Ubuntu\home\user）存储，必须经 uncToWslPath
+		// 转成 WSL 内的 Linux 路径；windowsToWSLMntPath 只认盘符，对 UNC 会产出
+		// //wsl$/Ubuntu/...（WSL 内不存在的路径）。WSL 服务端下 /mnt/<盘符>/ 形态的项目
+		// 路径不是 UNC，仍走原分支。
+		if linuxPath, ok := uncToWslPath(projectPath, ""); ok {
+			dir = linuxPath
+		} else {
+			dir = windowsToWSLMntPath(projectPath)
+		}
 	case agentTargetEnvRemote:
 		dir = projectPath
 	}

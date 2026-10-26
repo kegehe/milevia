@@ -26,6 +26,9 @@ const (
 	// stEvScheduledTasks 表示某项目的定时任务集合已变化（增删改、暂停/恢复、
 	// 运行状态流转）。
 	stEvScheduledTasks = "scheduled-tasks"
+	// stEvNotifications 表示通知行已被服务端删除（项目/会话/定时任务删除等），
+	// 客户端应重新拉取未读列表以修正角标，而不是只靠下次重连。
+	stEvNotifications = "notifications"
 )
 
 // StateEvent 是推送给 /ws/events 订阅者的粗粒度失效信号。

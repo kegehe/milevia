@@ -128,7 +128,7 @@ test("Git, project dashboard, and SSH lists discard stale responses", () => {
   assert.match(projectStore, /requestVersion !== projectRequestVersion\.current\) return;/);
   assert.match(projectStore, /requestVersion !== statusRequestVersion\.current\) return;/);
   assert.match(sshManager, /const connectionsRequestVersion = useRef\(0\);/);
-  assert.match(sshManager, /requestVersion === connectionsRequestVersion\.current\) setConnections\(list\)/);
+  assert.match(sshManager, /requestVersion === connectionsRequestVersion\.current\) \{\s*setConnections\(list\);/);
   assert.match(sshManager, /const profilesRequestVersion = useRef\(0\);/);
   assert.match(runPanel, /const statusRequestVersionRef = useRef\(0\);/);
   assert.match(runPanel, /const requestVersion = \+\+statusRequestVersionRef\.current;/);

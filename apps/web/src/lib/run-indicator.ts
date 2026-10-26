@@ -74,8 +74,16 @@ export function splitLabelChars(label: string): string[] {
 export function latestActiveStage(events: Event[], runId: string): SystemItem | null {
   let best: SystemItem | null = null;
   let bestAt = -Infinity;
+  // 这一轮最后一条事件的时间（不分类别）：判断"CLI 是否已经开口"用。和找 best 合并成
+  // 一趟 —— 这个函数每秒都会被调用一次，分开再扫一遍就是白花一倍。
+  let latestEventAt = -Infinity;
   for (let index = 0; index < events.length; index += 1) {
-    const item = systemItemFromEvent(events[index]);
+    const event = events[index];
+    if (event.runId === runId) {
+      const at = Date.parse(event.createdAt) || -Infinity;
+      if (at > latestEventAt) latestEventAt = at;
+    }
+    const item = systemItemFromEvent(event);
     if (!item || item.runId !== runId) continue;
     const at = Date.parse(item.createdAt) || -Infinity;
     if (at >= bestAt) {
@@ -85,6 +93,10 @@ export function latestActiveStage(events: Event[], runId: string): SystemItem | 
   }
   if (!best) return null;
   if (best.variant === "compact_result" || best.variant === "compact_boundary") return null;
+  // "正在恢复会话上下文" 只覆盖 CLI 还没开口的那一段：只要这一轮之后又来了任何事件
+  // （CLI 的 init、assistant、工具输出），进程就已经起来了，阶段必须结束。少了这一步，
+  // 它会一直挂到本轮结束 —— 一边在流式输出、状态条还写着"正在恢复"。
+  if (best.variant === "session" && latestEventAt > bestAt) return null;
   const state = best.metadata?.state;
   if (state === "success" || state === "failed" || state === "info") return null;
   return best;

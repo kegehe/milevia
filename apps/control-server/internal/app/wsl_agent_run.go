@@ -495,11 +495,14 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 	if err != nil {
 		return nil, err
 	}
-	environment, profileArgs, closeProfile, err := r.claude.profileLaunch(ctx, request.Profile, append([]string{
+	launchEnv := append([]string{
 		"AUTO_CONTROL_URL=" + r.claude.config.ControlURL,
 		"AUTO_APPROVAL_CONVERSATION_ID=" + request.ConversationID,
 		"AUTO_APPROVAL_TOKEN=" + request.ApprovalToken,
-	}, request.MCPEnv...))
+	}, request.MCPEnv...)
+	// MCP_TIMEOUT 走 MCP_ 前缀，wslForwardEnvKeys 已覆盖，无需再改 WSLENV 名单。
+	launchEnv = append(launchEnv, mcpTimeoutEnv(request.MCPStartupTimeout)...)
+	environment, profileArgs, closeProfile, err := r.claude.profileLaunch(ctx, request.Profile, launchEnv)
 	if err != nil {
 		return nil, err
 	}

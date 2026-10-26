@@ -507,6 +507,8 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("create server: %v", err)
 	}
+	// 遗留快照转换前的静默期只对真实启动有意义；用例里不该为它白等两分钟。
+	server.checkpointSweepDelay = 0
 	t.Cleanup(server.Close)
 	return server
 }
@@ -2434,6 +2436,17 @@ func TestDeleteProjectRemovesProjectAndCascades(t *testing.T) {
 	if _, err := server.db.Exec(`insert into shortcut_projects (shortcut_id,project_id) values ('sc','delete-me')`); err != nil {
 		t.Fatalf("bind shortcut to project: %v", err)
 	}
+	// Notifications have no FK to projects, so they must be purged explicitly;
+	// entries for other projects must survive.
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('other-project','Other',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert other project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into notifications (id,type,project_id,title,body,action_url,created_at) values ('notif-deleted','task.done','delete-me','任务已完成','正文','/projects/delete-me/conversations',?)`, now); err != nil {
+		t.Fatalf("insert notification for deleted project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into notifications (id,type,project_id,title,body,action_url,created_at) values ('notif-kept','task.done','other-project','任务已完成','正文','/projects/other-project/conversations',?)`, now); err != nil {
+		t.Fatalf("insert notification for other project: %v", err)
+	}
 
 	handler := server.routes()
 	req := httptest.NewRequest(http.MethodDelete, "/api/projects/delete-me", nil)
@@ -2472,6 +2485,20 @@ func TestDeleteProjectRemovesProjectAndCascades(t *testing.T) {
 	if remain != 1 {
 		t.Fatalf("shortcut unexpectedly deleted: count=%d", remain)
 	}
+	// Notifications belonging to the deleted project are gone...
+	if err := server.db.QueryRow(`select count(*) from notifications where project_id='delete-me'`).Scan(&remain); err != nil {
+		t.Fatalf("count notifications after delete: %v", err)
+	}
+	if remain != 0 {
+		t.Fatalf("notifications for deleted project still exist: count=%d", remain)
+	}
+	// ...while other projects' notifications are untouched.
+	if err := server.db.QueryRow(`select count(*) from notifications where project_id='other-project'`).Scan(&remain); err != nil {
+		t.Fatalf("count other project notifications after delete: %v", err)
+	}
+	if remain != 1 {
+		t.Fatalf("unrelated notification unexpectedly deleted: count=%d", remain)
+	}
 }
 
 func TestDeleteConversationRemovesTaskRunHistory(t *testing.T) {
@@ -2488,6 +2515,18 @@ func TestDeleteConversationRemovesTaskRunHistory(t *testing.T) {
 	}
 	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('task-run','task','conversation',NULL,1,'completed','prompt','', '',?)`, now); err != nil {
 		t.Fatalf("insert task run: %v", err)
+	}
+	// 指向会话的通知会变成死链；定时任务通知的目标是定时任务页，应保留
+	// （新行看 scheduled_task_id，修复前的旧行只有 action_url）。
+	for _, item := range []struct{ id, scheduledTaskID, actionURL string }{
+		{id: "notif-conversation", actionURL: "/projects/project/conversations/conversation"},
+		{id: "notif-scheduled", scheduledTaskID: "scheduled-task", actionURL: "/projects/project/tasks/schedules/scheduled-task"},
+		{id: "notif-legacy-scheduled", actionURL: "/projects/project/tasks/schedules/legacy-task"},
+	} {
+		if _, err := server.db.Exec(`insert into notifications (id,type,project_id,conversation_id,scheduled_task_id,title,body,action_url,created_at) values (?,?,?,?,?,?,?,?,?)`,
+			item.id, "task.done", "project", "conversation", item.scheduledTaskID, "标题", "正文", item.actionURL, now); err != nil {
+			t.Fatalf("insert notification %s: %v", item.id, err)
+		}
 	}
 
 	rec := httptest.NewRecorder()
@@ -2520,6 +2559,19 @@ func TestDeleteConversationRemovesTaskRunHistory(t *testing.T) {
 	server.routes().ServeHTTP(runs, httptest.NewRequest(http.MethodGet, "/api/tasks/task/runs", nil))
 	if runs.Code != http.StatusOK {
 		t.Fatalf("list task runs after conversation deletion: %d body=%s", runs.Code, runs.Body.String())
+	}
+	// 目标会话已删 → 通知清掉；目标仍是定时任务的通知保留（含没有 scheduled_task_id 的旧行）。
+	if err := server.db.QueryRow(`select count(*) from notifications where id='notif-conversation'`).Scan(&count); err != nil {
+		t.Fatalf("count conversation notification: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("notification targeting the deleted conversation still exists: count=%d", count)
+	}
+	if err := server.db.QueryRow(`select count(*) from notifications where id in ('notif-scheduled','notif-legacy-scheduled')`).Scan(&count); err != nil {
+		t.Fatalf("count scheduled notifications: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("scheduled-task notifications were removed with their conversation: count=%d", count)
 	}
 }
 
@@ -4334,6 +4386,16 @@ func TestDeleteProjectConversationsRemovesAllDeletable(t *testing.T) {
 	if _, err := server.db.Exec(`insert into task_runs (id,task_id,conversation_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at) values ('task-run','task','conversation-a',1,'completed','prompt','', '',?)`, now); err != nil {
 		t.Fatalf("insert task run: %v", err)
 	}
+	for _, item := range []struct{ id, conversationID, scheduledTaskID string }{
+		{id: "notif-a", conversationID: "conversation-a"},
+		{id: "notif-b", conversationID: "conversation-b"},
+		{id: "notif-scheduled", conversationID: "conversation-a", scheduledTaskID: "scheduled-task"},
+	} {
+		if _, err := server.db.Exec(`insert into notifications (id,type,project_id,conversation_id,scheduled_task_id,title,body,action_url,created_at) values (?,?,?,?,?,?,?,?,?)`,
+			item.id, "task.done", "project", item.conversationID, item.scheduledTaskID, "标题", "正文", "/projects/project/conversations/"+item.conversationID, now); err != nil {
+			t.Fatalf("insert notification %s: %v", item.id, err)
+		}
+	}
 
 	response := httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/projects/project/conversations", nil))
@@ -4370,6 +4432,19 @@ func TestDeleteProjectConversationsRemovesAllDeletable(t *testing.T) {
 	}
 	if !lastRunID.Valid || lastRunID.String != "task-run" {
 		t.Fatalf("task last run pointer was not preserved: %#v", lastRunID)
+	}
+	// 指向被删会话的通知一起清掉；定时任务通知的目标仍有效，保留。
+	if err := server.db.QueryRow(`select count(*) from notifications where id in ('notif-a','notif-b')`).Scan(&count); err != nil {
+		t.Fatalf("count conversation notifications: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("notifications targeting deleted conversations still exist: %d", count)
+	}
+	if err := server.db.QueryRow(`select count(*) from notifications where id='notif-scheduled'`).Scan(&count); err != nil {
+		t.Fatalf("count scheduled notification: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("scheduled-task notification was removed with its conversation: %d", count)
 	}
 }
 
@@ -7340,6 +7415,153 @@ func TestMigrateNotificationsAddsDedupeKeyToExistingTable(t *testing.T) {
 	}
 }
 
+// 修复之前删掉的实体不会经过正常删除路径：启动时要按项目 / 会话 / 定时任务三种
+// 目标清掉孤儿通知，同时不能误删目标仍存在的行。
+func TestPruneOrphanedNotificationsRemovesRowsWithoutTargets(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('alive','Alive',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,is_current,created_at) values ('alive-conv','alive','alive-session','idle',1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into scheduled_tasks (id,project_id,title,prompt,schedule_type,timezone,created_at,updated_at) values ('alive-sched','alive','Scheduled','prompt','daily','UTC',?,?)`, now, now); err != nil {
+		t.Fatalf("insert scheduled task: %v", err)
+	}
+	for _, item := range []struct {
+		id, projectID, conversationID, scheduledTaskID, actionURL string
+	}{
+		{id: "notif-alive-project", projectID: "alive", actionURL: "/"},
+		{id: "notif-orphan-project", projectID: "already-deleted", actionURL: "/"},
+		{id: "notif-alive-conv", projectID: "alive", conversationID: "alive-conv", actionURL: "/projects/alive/conversations/alive-conv"},
+		{id: "notif-orphan-conv", projectID: "alive", conversationID: "already-deleted", actionURL: "/projects/alive/conversations/already-deleted"},
+		{id: "notif-alive-sched", projectID: "alive", conversationID: "alive-conv", scheduledTaskID: "alive-sched", actionURL: "/projects/alive/tasks/schedules/alive-sched"},
+		{id: "notif-orphan-sched", projectID: "alive", scheduledTaskID: "already-deleted", actionURL: "/projects/alive/tasks/schedules/already-deleted"},
+		// 修复前没有 scheduled_task_id 的旧行，只能按 action_url 认目标。
+		{id: "notif-alive-legacy-sched", projectID: "alive", conversationID: "alive-conv", actionURL: "/projects/alive/tasks/schedules/alive-sched"},
+		{id: "notif-orphan-legacy-sched", projectID: "alive", actionURL: "/projects/alive/tasks/schedules/already-deleted"},
+	} {
+		if _, err := server.db.Exec(`insert into notifications (id,type,project_id,conversation_id,scheduled_task_id,title,body,action_url,created_at) values (?,?,?,?,?,?,?,?,?)`,
+			item.id, "task.done", item.projectID, item.conversationID, item.scheduledTaskID, "标题", "正文", item.actionURL, now); err != nil {
+			t.Fatalf("insert notification %s: %v", item.id, err)
+		}
+	}
+
+	if err := server.pruneOrphanedNotifications(context.Background()); err != nil {
+		t.Fatalf("prune orphaned notifications: %v", err)
+	}
+	for _, id := range []string{"notif-orphan-project", "notif-orphan-conv", "notif-orphan-sched", "notif-orphan-legacy-sched"} {
+		var remaining int
+		if err := server.db.QueryRow(`select count(*) from notifications where id=?`, id).Scan(&remaining); err != nil {
+			t.Fatalf("count orphan notification %s: %v", id, err)
+		}
+		if remaining != 0 {
+			t.Fatalf("orphan notification %s survived prune: count=%d", id, remaining)
+		}
+	}
+	for _, id := range []string{"notif-alive-project", "notif-alive-conv", "notif-alive-sched", "notif-alive-legacy-sched"} {
+		var remaining int
+		if err := server.db.QueryRow(`select count(*) from notifications where id=?`, id).Scan(&remaining); err != nil {
+			t.Fatalf("count live notification %s: %v", id, err)
+		}
+		if remaining != 1 {
+			t.Fatalf("notification %s with an existing target was pruned: count=%d", id, remaining)
+		}
+	}
+}
+
+func TestBroadcastNotificationSkipsDeletedProject(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('live','Live',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	makeEvent := func(id, projectID string) NotificationEvent {
+		return NotificationEvent{
+			ID: id, Type: "task.done", ProjectID: projectID, ProjectName: projectID,
+			Title: "任务已完成", Body: "正文", Priority: "normal",
+			ActionURL: "/projects/" + projectID + "/conversations", CreatedAt: now,
+		}
+	}
+	server.broadcastNotification(makeEvent("notif-live", "live"))
+	// 模拟"检查项目存在之后、插入之前项目被删"：不存在的项目不能落库。
+	server.broadcastNotification(makeEvent("notif-gone", "gone"))
+
+	var remaining int
+	if err := server.db.QueryRow(`select count(*) from notifications where id='notif-gone'`).Scan(&remaining); err != nil {
+		t.Fatalf("count notification for missing project: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("notification for a missing project was persisted: count=%d", remaining)
+	}
+	if err := server.db.QueryRow(`select count(*) from notifications where id='notif-live'`).Scan(&remaining); err != nil {
+		t.Fatalf("count notification for live project: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("notification for an existing project was dropped: count=%d", remaining)
+	}
+}
+
+func TestBroadcastNotificationFallsBackWhenConversationDeleted(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('live','Live',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,is_current,created_at) values ('live-conv','live','live-session','idle',1,?)`, now); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	makeEvent := func(id, conversationID, scheduledTaskID string) NotificationEvent {
+		actionURL := "/projects/live/conversations"
+		if conversationID != "" {
+			actionURL += "/" + conversationID
+		}
+		return NotificationEvent{
+			ID: id, Type: "task.done", ProjectID: "live", ProjectName: "live",
+			ConversationID: conversationID, ScheduledTaskID: scheduledTaskID,
+			Title: "任务已完成", Body: "正文", Priority: "normal",
+			ActionURL: actionURL, CreatedAt: now,
+		}
+	}
+	server.broadcastNotification(makeEvent("notif-live-conv", "live-conv", ""))
+	// 模拟"检查会话存在之后、插入之前会话被删"：通知不能丢，退回项目会话入口。
+	server.broadcastNotification(makeEvent("notif-gone-conv", "gone-conv", ""))
+	// 定时任务通知的目标是定时任务页，会话只是执行历史：会话不在也保持原样。
+	server.broadcastNotification(makeEvent("notif-scheduled-gone-conv", "gone-conv", "sched-1"))
+	// 项目级通知（没有具体会话）不受影响。
+	server.broadcastNotification(makeEvent("notif-no-conv", "", ""))
+
+	for id, want := range map[string]int{
+		"notif-live-conv":           1,
+		"notif-gone-conv":           1,
+		"notif-scheduled-gone-conv": 1,
+		"notif-no-conv":             1,
+	} {
+		var remaining int
+		if err := server.db.QueryRow(`select count(*) from notifications where id=?`, id).Scan(&remaining); err != nil {
+			t.Fatalf("count notification %s: %v", id, err)
+		}
+		if remaining != want {
+			t.Fatalf("notification %s count=%d, want %d", id, remaining, want)
+		}
+	}
+	var conversationID, actionURL string
+	if err := server.db.QueryRow(`select conversation_id,action_url from notifications where id='notif-gone-conv'`).Scan(&conversationID, &actionURL); err != nil {
+		t.Fatalf("load fallback notification: %v", err)
+	}
+	if conversationID != "" || actionURL != "/projects/live/conversations" {
+		t.Fatalf("fallback notification = (conversation_id=%q, action_url=%q), want empty conversation and the project entry", conversationID, actionURL)
+	}
+	// 定时任务通知不能因为会话被删而退回项目入口 —— 它的跳转目标仍是任务页。
+	if err := server.db.QueryRow(`select conversation_id,action_url from notifications where id='notif-scheduled-gone-conv'`).Scan(&conversationID, &actionURL); err != nil {
+		t.Fatalf("load scheduled notification: %v", err)
+	}
+	if conversationID != "gone-conv" || actionURL != "/projects/live/conversations/gone-conv" {
+		t.Fatalf("scheduled notification was rewritten: (conversation_id=%q, action_url=%q)", conversationID, actionURL)
+	}
+}
+
 func TestTaskUpdateRecordsAuditEvent(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Audited task")
@@ -8750,6 +8972,50 @@ func TestProjectWorkspaceLeaseExcludesOtherOwners(t *testing.T) {
 		t.Fatal("workspace lease did not release after the final holder exited")
 	}
 	otherRelease()
+}
+
+// 项目删除允许与 AI 运行共享租约（删除会先停掉这些运行），但共享时 lease.owner
+// 仍是先到的 AI，必须靠 teardown 标志继续挡住 Git 等改写操作。
+func TestProjectDeleteLeaseSharesWithAIRunButBlocksGit(t *testing.T) {
+	server := newTestServer(t)
+	releaseRun, acquired := server.acquireProjectWorkspace("project", "run:active")
+	if !acquired {
+		t.Fatal("AI run could not acquire the workspace lease")
+	}
+	defer releaseRun()
+
+	releaseDelete, acquired := server.acquireProjectWorkspace("project", projectDeleteWorkspaceOwner)
+	if !acquired {
+		t.Fatal("project deletion could not join an active AI lease")
+	}
+	server.mu.Lock()
+	lease := server.projectWorkspaceLeases["project"]
+	teardown := lease != nil && lease.teardown
+	server.mu.Unlock()
+	if !teardown {
+		t.Fatal("project deletion did not mark the lease as teardown")
+	}
+	if _, acquired := server.acquireProjectWorkspace("project", "git:commit"); acquired {
+		t.Fatal("Git acquired the workspace while project deletion was in progress")
+	}
+	// 删除进行中也不再接纳新的 AI 运行：共享租约的 owner 还是先到的 AI，
+	// 光靠"AI 之间兼容"看不出删除已经开始。
+	if _, acquired := server.acquireProjectWorkspace("project", "run:late"); acquired {
+		t.Fatal("a new AI run joined the workspace while project deletion was in progress")
+	}
+
+	releaseDelete()
+	server.mu.Lock()
+	lease = server.projectWorkspaceLeases["project"]
+	teardown = lease != nil && lease.teardown
+	server.mu.Unlock()
+	if teardown {
+		t.Fatal("teardown flag was not cleared when deletion released the lease")
+	}
+	// AI 运行还在：回到原有语义，Git 仍被挡住。
+	if _, acquired := server.acquireProjectWorkspace("project", "git:commit"); acquired {
+		t.Fatal("Git acquired the workspace while the AI run was still active")
+	}
 }
 
 func TestLocalizedErrorTextUsesChineseMessages(t *testing.T) {

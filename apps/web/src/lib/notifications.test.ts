@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatDurationMs, isWithinQuietHours, isWindowsNotifyType, notificationConversationURL, notificationTargetURL, priorityForType, webNotificationsSupported, windowsToastLines, type NotificationEvent } from "./notifications";
+import { formatDurationMs, isWithinQuietHours, isWindowsNotifyType, notificationConversationURL, notificationTargetURL, priorityForType, unreadIdsMissingFromServer, webNotificationsSupported, windowsToastLines, type NotificationEvent } from "./notifications";
 
 test("failed and error notifications use normal priority", () => {
   assert.equal(priorityForType("task.done"), "normal");
@@ -99,4 +99,10 @@ test("Web Notification 只在浏览器可用：桌面端与原生包一律判不
   // 浏览器：非安全上下文里这条 API 压根不存在。
   assert.equal(webNotificationsSupported({ hasNotificationAPI: false, isDesktop: false, isNativePlatform: false }), false);
   assert.equal(webNotificationsSupported({ hasNotificationAPI: true, isDesktop: false, isNativePlatform: false }), true);
+});
+
+test("未读角标只清理服务端已删除的通知；拉取期间新到的不在快照里", () => {
+  const beforeFetch = new Set<string>(["kept", "deleted"]);
+  const serverIds = new Set<string>(["kept"]);
+  assert.deepEqual(unreadIdsMissingFromServer(beforeFetch, serverIds), ["deleted"]);
 });

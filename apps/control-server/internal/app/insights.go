@@ -832,6 +832,9 @@ func (s *Server) reserveInsightQuota(ctx context.Context, project Project, agent
 			_, cleanupErr = cleanup.ExecContext(cleanupCtx, `delete from runs where id=?`, runID)
 		}
 		if cleanupErr == nil {
+			cleanupErr = deleteConversationNotificationsTx(cleanupCtx, cleanup, conversationID)
+		}
+		if cleanupErr == nil {
 			_, cleanupErr = cleanup.ExecContext(cleanupCtx, `delete from conversations where id=?`, conversationID)
 		}
 		if cleanupErr != nil {
@@ -841,7 +844,10 @@ func (s *Server) reserveInsightQuota(ctx context.Context, project Project, agent
 		}
 		if cleanupErr = cleanup.Commit(); cleanupErr != nil {
 			log.Printf("[insights] commit quota cleanup %s: %v", runID, cleanupErr)
+			return
 		}
+		// 合成会话的删除可能带走了指向它的通知。
+		s.broadcastStateEvent(stEvNotifications, project.ID)
 	}, nil
 }
 

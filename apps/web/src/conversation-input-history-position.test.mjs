@@ -15,6 +15,8 @@ test("input history position uses the current history index and hides at the new
 test("input history position is anchored to the composer input area", () => {
   assert.match(page, /className="composer-history-position"/);
   assert.match(styles, /\.composer-input-area \{ position: relative; \}/);
-  assert.match(styles, /\.composer-input-area textarea \{ padding-right: 54px; \}/);
+  // 2026-10-26 起输入区是 contenteditable 的 .composer-edit（粘贴长文本收成内联卡片），
+  // 不再是 textarea；历史角标的让位规则跟着换目标，但「贴在 input-area 右上」不变。
+  assert.match(styles, /\.composer-input-area \.composer-edit \{ padding-right: 54px; \}/);
   assert.match(styles, /\.composer-history-position \{[\s\S]*position: absolute;[\s\S]*top: 8px;[\s\S]*right: 11px;/);
 });

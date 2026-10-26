@@ -1,6 +1,8 @@
 .mobile-optimization { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; overflow: hidden; background: #f7fbf8; color: #183a30; }
 .mobile-optimization-header { display: flex; align-items: center; justify-content: space-between; flex: none; padding: max(14px, env(safe-area-inset-top)) 16px 13px; border-bottom: 1px solid #dceae2; background: #fbfefc; }
-.mobile-optimization-header small { color: #4a927c; font-size: 11px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+/* 这条与 pages/mobile-remote.css 的同名规则重复（面板整体样式在那份里，这里只是
+   基础骨架）。两处都定义、靠引入顺序决定胜负，所以颜色/字号必须同步改。 */
+.mobile-optimization-header small { color: #357a64; font-size: 11px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
 .mobile-optimization-header h2 { margin: 3px 0 0; font-size: 18px; }
 .mobile-optimization-header > button { width: 32px; height: 32px; border: 0; border-radius: 50%; color: #5b756b; background: #edf5f0; font-size: 22px; line-height: 1; }
 .mobile-optimization-content { width: min(100%, 760px); margin: 0 auto; min-height: 0; flex: 1; overflow: auto; padding-bottom: env(safe-area-inset-bottom); }

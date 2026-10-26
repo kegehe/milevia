@@ -13,7 +13,7 @@ import { openExternal } from "../lib/runtime";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ServiceLogo } from "../components/ServiceLogo";
 import type { MCPAuditEntry, MCPAuditResponse, MCPImportCandidate, MCPImportResult, MCPInjectionStatus, MCPOAuthStatus, MCPPreset, MCPPreviewResult, MCPProjectView, MCPRuntimeCheckResult, MCPScope, MCPServer, MCPTestResult, MCPTransport } from "../lib/types";
-import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, draftProbeValues, groupPresetsByCategory, keyValueLines, parseCustomMCPConfig, parseKeyValueLines, parseLines, presetGuidanceLines, redactedMCPConfig, runtimeCommandsFor, uniqueMCPName, wizardStartsAt, type CustomMCPConfig, type MCPSecretInput } from "../features/mcp/mcp-model";
+import { buildDraftServerPayload, connectPlanFor, credentialPlaceholder, credentialsSatisfied, defaultTestEnvironment, draftProbeValues, groupPresetsByCategory, keyValueLines, parseCustomMCPConfig, parseKeyValueLines, parseLines, presetGuidanceLines, redactedMCPConfig, runtimeCommandsFor, uniqueMCPName, wizardStartsAt, type CustomMCPConfig, type MCPSecretInput } from "../features/mcp/mcp-model";
 import "./mcp-manager.css";
 import { waitForOAuthFlowResult } from "../features/mcp/oauth-flow";
 
@@ -26,6 +26,8 @@ const ENVIRONMENT_OPTIONS: { id: string; label: string }[] = [
 const AGENT_OPTIONS: { id: string; label: string }[] = [
   { id: "claude-code", label: "Claude Code" },
   { id: "codex", label: "Codex" },
+  { id: "codebuddy", label: "CodeBuddy" },
+  { id: "qoder", label: "Qoder" },
   { id: "opencode", label: "OpenCode" },
 ];
 
@@ -150,6 +152,9 @@ type FormState = {
   headerSecretKeys: string[];
   envSecrets: Record<string, string>;
   headerSecrets: Record<string, string>;
+  // 显式移除的已保存凭据键。密钥值不回显，前端只能用「键名」表达删除。
+  removedEnvSecrets: string[];
+  removedHeaderSecrets: string[];
 };
 
 function emptyForm(): FormState {
@@ -173,6 +178,8 @@ function emptyForm(): FormState {
     headerSecretKeys: [],
     envSecrets: {},
     headerSecrets: {},
+    removedEnvSecrets: [],
+    removedHeaderSecrets: [],
   };
 }
 
@@ -197,6 +204,8 @@ function formFromServer(server: MCPServer): FormState {
     headerSecretKeys: server.headerSecretKeys || [],
     envSecrets: {},
     headerSecrets: {},
+    removedEnvSecrets: [],
+    removedHeaderSecrets: [],
   };
 }
 
@@ -246,6 +255,7 @@ export default function McpManagerPage() {
   const [autoApproveConfirm, setAutoApproveConfirm] = useState(false);
   const [projectView, setProjectView] = useState<MCPProjectView | null>(null);
   const [viewProjectId, setViewProjectId] = useState("");
+  const [viewAgent, setViewAgent] = useState("claude-code");
   const [viewLoading, setViewLoading] = useState(false);
   // 连接测试：目标环境 + 工具列表（含可疑标注）。
   const [testTarget, setTestTarget] = useState<MCPServer | null>(null);
@@ -320,9 +330,34 @@ export default function McpManagerPage() {
   const wizardClosingRef = useRef(false);
   const wizardOAuthFlowRef = useRef("");
   const wizardOAuthCancelRef = useRef<AbortController | null>(null);
+  // 运行时检查/试连进行中时，取消要真的中止请求，而不是让按钮看起来没反应。
+  const wizardCheckAbortRef = useRef<AbortController | null>(null);
   const wizardServerRef = useRef<MCPServer | null>(null);
   const oauthFlowRef = useRef("");
   const oauthViewVersion = useRef(0);
+  // 异步读取的版本号：快速切项目/筛选时，旧响应不能覆盖新选择。
+  const viewRequestRef = useRef(0);
+  const importRequestRef = useRef(0);
+  const auditRequestRef = useRef(0);
+  // 三个表单探测各自的「结果版本号」：字段/环境/凭据变化时全部 +1（作废在途结果），
+  // 但**启动另一个探测不会**作废这一个 —— 否则会静默吞掉前一个操作的成功/失败结论。
+  const previewProbeRef = useRef(0);
+  const draftProbeRef = useRef(0);
+  const runtimeProbeRef = useRef(0);
+  // 各自的「加载态」版本号：只在本操作重新发起时递增，保证旧请求的 finally 不会
+  // 复位新请求的 loading（也不会因为结果被作废而让 loading 永久卡住）。
+  const previewRunRef = useRef(0);
+  const draftRunRef = useRef(0);
+  const runtimeRunRef = useRef(0);
+  // 连接测试弹窗自己的结果/加载版本号（切换目标环境时作废在途结果）。
+  const testProbeRef = useRef(0);
+  const testRunRef = useRef(0);
+
+  const invalidateProbes = () => {
+    previewProbeRef.current += 1;
+    draftProbeRef.current += 1;
+    runtimeProbeRef.current += 1;
+  };
 
   useEffect(() => () => {
     wizardOAuthCancelRef.current?.abort();
@@ -373,29 +408,38 @@ export default function McpManagerPage() {
 
   useEffect(() => { void loadPresets(); }, [loadPresets]);
 
-  const loadProjectView = useCallback(async (projectId: string) => {
+  const loadProjectView = useCallback(async (projectId: string, agentOverride?: string) => {
+    const request = ++viewRequestRef.current;
+    const agent = agentOverride ?? viewAgent;
     setViewProjectId(projectId);
-    if (!projectId) { setProjectView(null); setInjection(null); return; }
+    // 注入快照属于上一个项目；在 status 返回前先清掉，避免短暂串台。
+    setInjection(null);
+    if (!projectId) { setProjectView(null); setViewLoading(false); return; }
     setViewLoading(true);
     try {
-      const view = await api<MCPProjectView>(`/api/projects/${projectId}/mcp`);
+      const view = await api<MCPProjectView>(`/api/projects/${projectId}/mcp?agentId=${encodeURIComponent(agent)}`);
+      if (request !== viewRequestRef.current) return;
       setProjectView(view);
     } catch (cause) {
+      if (request !== viewRequestRef.current) return;
       setProjectView(null);
       toast.error(cause instanceof Error ? cause.message : "无法加载项目 MCP 视图");
     } finally {
-      setViewLoading(false);
+      if (request === viewRequestRef.current) setViewLoading(false);
     }
     // 注入快照是内存态、可能还没有（项目尚未跑过任务），失败静默即可。
     try {
       const status = await api<MCPInjectionStatus>(`/api/projects/${projectId}/mcp/status`);
-      setInjection(status && status.updatedAt ? status : null);
+      if (request === viewRequestRef.current) {
+        setInjection(status && status.updatedAt ? status : null);
+      }
     } catch {
-      setInjection(null);
+      if (request === viewRequestRef.current) setInjection(null);
     }
-  }, [api]);
+  }, [api, viewAgent]);
 
   const startCreate = (preset?: MCPPreset) => {
+    invalidateProbes();
     setCustomNameNotice("");
     setEditingId(null);
     if (preset) {
@@ -426,8 +470,13 @@ export default function McpManagerPage() {
   };
 
   const startEdit = (server: MCPServer) => {
+    invalidateProbes();
     setCopyMenuId(null);
     setCustomNameNotice("");
+    // 项目级 server 的草稿预览环境默认取项目所在环境：否则 WSL/SSH 项目的
+    // “测试草稿”会以 windows 为目标，既拿不到已保存密钥，也不是真实注入环境。
+    const project = server.projectId ? projects.find((item) => item.id === server.projectId) : undefined;
+    setPreviewEnvironment(project?.environment || "windows");
     setEditingId(server.id);
     setForm(formFromServer(server));
     // 编辑既有 server 时不再展示模板要求：它反映的是当初的模板，不是当前配置的事实。
@@ -546,6 +595,7 @@ export default function McpManagerPage() {
 
   const closeForm = () => {
     if (saving) return;
+    invalidateProbes();
     setShowForm(false);
     setEditingId(null);
     setPresetMeta(null);
@@ -567,6 +617,8 @@ export default function McpManagerPage() {
   // 按环境预览：占位符（${PROJECT_DIR} 等）在不同环境解析成完全不同的路径，保存前先看清
   // 目标环境里到底长什么样，可以挡掉「本地能跑、远端跑不起来」的配置错误。
   const runPreview = async () => {
+    const request = ++previewProbeRef.current;
+    const run = ++previewRunRef.current;
     setPreviewLoading(true);
     try {
       const result = await api<MCPPreviewResult>("/api/mcp/preview", {
@@ -582,12 +634,13 @@ export default function McpManagerPage() {
           projectId: form.scope === "project" ? form.projectId : "",
         }),
       });
-      setPreviewResult(result);
+      if (request === previewProbeRef.current) setPreviewResult(result);
     } catch (cause) {
+      if (request !== previewProbeRef.current) return;
       setPreviewResult(null);
       toast.error(cause instanceof Error ? cause.message : "预览失败");
     } finally {
-      setPreviewLoading(false);
+      if (run === previewRunRef.current) setPreviewLoading(false);
     }
   };
 
@@ -598,18 +651,22 @@ export default function McpManagerPage() {
   const runRuntimeCheck = async () => {
     const commands = runtimeCommands();
     if (commands.length === 0) return;
+    const request = ++runtimeProbeRef.current;
+    const run = ++runtimeRunRef.current;
     setRuntimeChecking(true);
     setRuntimeResult(null);
     try {
       const result = await api<MCPRuntimeCheckResult>("/api/mcp/runtime-check", {
         method: "POST",
-        body: JSON.stringify({ commands, environment: previewEnvironment }),
+        // SSH 远端的检查需要连接；表单没有连接选择，后端从项目的 runner 反推。
+        body: JSON.stringify({ commands, environment: previewEnvironment, projectId: form.scope === "project" ? form.projectId : "" }),
       });
-      setRuntimeResult(result);
+      if (request === runtimeProbeRef.current) setRuntimeResult(result);
     } catch (cause) {
+      if (request !== runtimeProbeRef.current) return;
       toast.error(cause instanceof Error ? cause.message : "运行时检查失败");
     } finally {
-      setRuntimeChecking(false);
+      if (run === runtimeRunRef.current) setRuntimeChecking(false);
     }
   };
 
@@ -636,7 +693,13 @@ export default function McpManagerPage() {
     // 读到的还是旧值，会发出第二个 DELETE（404 后反而报「清理失败」）。
     if (wizardClosingRef.current) return;
     const activeFlowId = wizardOAuthFlowRef.current;
-    if (wizardBusy && !wizardOAuthCancelRef.current) return;
+    if (wizardBusy && !wizardOAuthCancelRef.current) {
+      // 运行时检查/试连进行中：中止请求后照常关闭；保存中（没有 check 控制器）仍然拦住，
+      // 避免把一次正在落库的创建操作和关闭流程交错。
+      if (!wizardCheckAbortRef.current) return;
+      wizardCheckAbortRef.current.abort();
+      wizardCheckAbortRef.current = null;
+    }
     wizardOAuthCancelRef.current?.abort();
     wizardOAuthCancelRef.current = null;
     // OAuth 路径会先落库（回调要按 serverID 存令牌），所以「取消」时列表里可能躺着一条
@@ -668,7 +731,25 @@ export default function McpManagerPage() {
         setWizardBusy(false);
       }
     } else if (leftover) {
+      // 完成屏直接点 X：server 已留下，但「以后不用再问我」还没写入 —— 补上再提示，
+      // 否则用户勾了免审批、结果悄悄没生效。
+      if (wizardTrust) {
+        try {
+          await api(`/api/mcp/servers/${leftover.id}/auto-approve`, {
+            method: "PUT",
+            body: JSON.stringify({ patterns: [`mcp__${leftover.name}__*`] }),
+          });
+          // 列表里的旧对象没有新写入的免审批；不刷新的话，稍后编辑保存会用旧值把它整表覆盖掉。
+          await loadServers();
+        } catch (cause) {
+          setLocalError(cause instanceof Error ? cause.message : "保存免审批设置失败");
+        }
+      }
       toast.message(`「${leftover.displayName || leftover.name}」已保存，可在列表里管理`);
+    } else if (wizardStep === "done" && wizardResult?.ok === true) {
+      // 非 OAuth 路径在完成屏还没有落库（只有「完成」会 POST）；直接点 X/取消时
+      // 明确告诉用户没有保存，而不是静默丢掉一个已经验证通过的连接。
+      toast.message("已关闭连接向导，本次连接未保存");
     }
   };
 
@@ -687,6 +768,8 @@ export default function McpManagerPage() {
   // 只查依赖不试连，又等于把「凭据对不对」留到保存之后才发现。
   const runWizardCheck = async () => {
     if (!wizard) return;
+    const controller = new AbortController();
+    wizardCheckAbortRef.current = controller;
     setWizardBusy(true);
     setWizardError("");
     setWizardInstall(null);
@@ -698,6 +781,7 @@ export default function McpManagerPage() {
         const checked = await api<MCPRuntimeCheckResult>("/api/mcp/runtime-check", {
           method: "POST",
           body: JSON.stringify({ commands, environment: "" }),
+          signal: controller.signal,
         });
         setWizardInstall(checked);
         if (!checked.error && checked.items.some((item) => !item.found)) {
@@ -710,6 +794,7 @@ export default function McpManagerPage() {
         // 试连不落库，所以凭据必须直接放进 env / headers —— 创建请求走的才是 *Secrets 字段。
         // 少了这一步，试连根本不带凭据，用户会看到一条假的「连不上」。
         body: JSON.stringify({ ...wizardDraftPayload(), ...draftProbeValues(wizard, wizardSecrets), environment: "" }),
+        signal: controller.signal,
       });
       setWizardResult(tested);
       if (!tested.ok) {
@@ -718,8 +803,10 @@ export default function McpManagerPage() {
       }
       setWizardStep("done");
     } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") return;
       setWizardError(cause instanceof Error ? cause.message : "检查失败");
     } finally {
+      if (wizardCheckAbortRef.current === controller) wizardCheckAbortRef.current = null;
       setWizardBusy(false);
     }
   };
@@ -828,6 +915,8 @@ export default function McpManagerPage() {
   };
 
   const runDraftTest = async () => {
+    const request = ++draftProbeRef.current;
+    const run = ++draftRunRef.current;
     setDraftTestRunning(true);
     setDraftTestResult(null);
     try {
@@ -847,15 +936,50 @@ export default function McpManagerPage() {
           args: form.transport === "stdio" ? parseLines(form.argsText) : [], env,
           url: form.transport === "stdio" ? "" : form.url.trim(), headers,
           environment: previewEnvironment, projectId: form.scope === "project" ? form.projectId : "",
+          // 编辑已有 server 时，已保存的密钥永不回显；带上 id 让服务端补齐缺失的
+          // env/headers 值，否则“测试草稿”会因缺凭据假失败。
+          serverId: editingId || "",
+          removedEnvSecrets: form.removedEnvSecrets,
+          removedHeaderSecrets: form.removedHeaderSecrets,
         }),
       });
+      if (request !== draftProbeRef.current) return;
       setDraftTestResult(result);
       if (!result.ok) toast.error(result.error || "连接测试失败，草稿已保留");
     } catch (cause) {
+      if (request !== draftProbeRef.current) return;
       toast.error(cause instanceof Error ? `${cause.message}，草稿已保留` : "连接测试失败，草稿已保留");
     } finally {
-      setDraftTestRunning(false);
+      if (run === draftRunRef.current) setDraftTestRunning(false);
     }
+  };
+
+  const removeSavedSecret = (target: "envSecrets" | "headerSecrets", key: string) => {
+    // 删除也会改变试连结果，口径与编辑探测字段一致。
+    invalidateProbes();
+    setPreviewResult(null);
+    setDraftTestResult(null);
+    setRuntimeResult(null);
+    setForm((old) => {
+      if (target === "envSecrets") {
+        const secrets = { ...old.envSecrets };
+        delete secrets[key];
+        return {
+          ...old,
+          envSecrets: secrets,
+          envSecretKeys: old.envSecretKeys.filter((item) => item !== key),
+          removedEnvSecrets: [...old.removedEnvSecrets, key],
+        };
+      }
+      const secrets = { ...old.headerSecrets };
+      delete secrets[key];
+      return {
+        ...old,
+        headerSecrets: secrets,
+        headerSecretKeys: old.headerSecretKeys.filter((item) => item !== key),
+        removedHeaderSecrets: [...old.removedHeaderSecrets, key],
+      };
+    });
   };
 
   const performSave = async () => {
@@ -886,6 +1010,8 @@ export default function McpManagerPage() {
         url: form.transport === "stdio" ? "" : form.url.trim(),
         headers,
         headerSecrets,
+        removedEnvSecrets: form.removedEnvSecrets,
+        removedHeaderSecrets: form.removedHeaderSecrets,
         scope: form.scope,
         projectId: form.scope === "project" ? form.projectId : "",
         environments: form.environments,
@@ -950,13 +1076,19 @@ export default function McpManagerPage() {
   // 是抵御工具投毒最有效的一环。
   const openTest = (server: MCPServer) => {
     setCopyMenuId(null);
+    testProbeRef.current += 1;
+    setTestRunning(false);
     setTestTarget(server);
-    setTestEnvironment(server.environments[0] || "windows");
+    const project = server.projectId ? projects.find((item) => item.id === server.projectId) : undefined;
+    const projectEnv = project?.environment;
+    setTestEnvironment(projectEnv && server.environments.includes(projectEnv) ? projectEnv : defaultTestEnvironment(server.environments));
     setTestResult(null);
   };
 
   const runTest = async () => {
     if (!testTarget) return;
+    const request = ++testProbeRef.current;
+    const run = ++testRunRef.current;
     setTestRunning(true);
     setTestResult(null);
     try {
@@ -964,15 +1096,24 @@ export default function McpManagerPage() {
         method: "POST",
         body: JSON.stringify({ environment: testEnvironment }),
       });
+      if (request !== testProbeRef.current) return;
       setTestResult(result);
+      // 一次成功测试会把 oauth-pending 的临时记录晋升为已启用（后端改 source/enabled），
+      // 列表必须重新读，否则卡片会一直停在「待完成授权与验证」。
+      if (result.ok && testTarget.source === "oauth-pending") {
+        void loadServers();
+        setTestTarget({ ...testTarget, source: "manual", enabled: true });
+      }
     } catch (cause) {
+      if (request !== testProbeRef.current) return;
       toast.error(cause instanceof Error ? cause.message : "连接测试失败");
     } finally {
-      setTestRunning(false);
+      if (run === testRunRef.current) setTestRunning(false);
     }
   };
 
   const loadImportPreview = useCallback(async (projectId: string) => {
+    const request = ++importRequestRef.current;
     setImportProjectId(projectId);
     setImportLoading(true);
     try {
@@ -980,6 +1121,7 @@ export default function McpManagerPage() {
         method: "POST",
         body: JSON.stringify({ projectId, confirm: false }),
       });
+      if (request !== importRequestRef.current) return;
       setImportPreview(result);
       const next: Record<string, boolean> = {};
       for (const candidate of result.candidates) {
@@ -987,22 +1129,32 @@ export default function McpManagerPage() {
       }
       setImportSelection(next);
     } catch (cause) {
+      if (request !== importRequestRef.current) return;
       setImportPreview(null);
       toast.error(cause instanceof Error ? cause.message : "无法读取现有配置");
     } finally {
-      setImportLoading(false);
+      if (request === importRequestRef.current) setImportLoading(false);
     }
   }, [api]);
 
   const confirmImport = async () => {
+    const request = importRequestRef.current;
     setImportRunning(true);
     try {
       const selected = Object.entries(importSelection).filter(([, value]) => value).map(([key]) => key);
+      // 把预览时的指纹一起回传：来源在预览后被改过时，服务端会拒绝而不是写入新配置。
+      const fingerprints: Record<string, string> = {};
+      const selectedSet = new Set(selected);
+      for (const candidate of importPreview?.candidates || []) {
+        const key = `${candidate.source}|${candidate.originalName}`;
+        if (selectedSet.has(key) && candidate.fingerprint) fingerprints[key] = candidate.fingerprint;
+      }
       const result = await api<MCPImportResult>("/api/mcp/import", {
         method: "POST",
-        body: JSON.stringify({ projectId: importProjectId, confirm: true, selected }),
+        body: JSON.stringify({ projectId: importProjectId, confirm: true, selected, fingerprints }),
       });
-      setImportPreview(result);
+      // 导入期间切了项目：结果属于旧项目，不能覆盖新项目的候选列表。
+      if (request === importRequestRef.current) setImportPreview(result);
       await loadServers();
       if (result.imported > 0) {
         toast.success(`已导入 ${result.imported} 个 MCP server`);
@@ -1021,13 +1173,15 @@ export default function McpManagerPage() {
 
   const toggleBinding = async (serverId: string, enabled: boolean) => {
     if (!viewProjectId) return;
+    const request = ++viewRequestRef.current;
     setBindingBusy(serverId);
     try {
-      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp`, {
+      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp?agentId=${encodeURIComponent(viewAgent)}`, {
         method: "PATCH",
         body: JSON.stringify({ bindings: [{ serverId, enabled }] }),
       });
-      setProjectView(view);
+      // PATCH 返回的是「发出请求那一刻的项目视图」；期间切了项目/Agent 就不能覆盖新视图。
+      if (request === viewRequestRef.current) setProjectView(view);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "更新项目开关失败");
     } finally {
@@ -1169,6 +1323,18 @@ export default function McpManagerPage() {
     let patterns: string[];
     if (next) {
       patterns = [...current.filter((item) => item !== serverWildcard), exact];
+    } else if (current.includes(serverWildcard)) {
+      // 已有「整服务免审批」时，只删精确项等于什么都没做（通配仍然覆盖它，勾选框会
+      // 自动回勾）。必须把通配展开成其余工具的精确项，才真的只关掉这一个工具。
+      const tools = testTarget?.id === server.id ? testResult?.tools || [] : [];
+      if (tools.length === 0) {
+        toast.error("该 server 已启用整服务免审批；请先在「测试」里加载工具列表，再逐项关闭。");
+        return;
+      }
+      patterns = current.filter((item) => item !== exact && item !== serverWildcard);
+      for (const tool of tools) {
+        if (tool.name !== toolName) patterns.push(toolPattern(server, tool.name));
+      }
     } else {
       patterns = current.filter((item) => item !== exact);
     }
@@ -1198,24 +1364,32 @@ export default function McpManagerPage() {
   // —— P2：调用审计 ——
 
   const loadAudit = useCallback(async (serverName: string) => {
+    const request = ++auditRequestRef.current;
     setAuditLoading(true);
     try {
       const query = new URLSearchParams({ limit: "80" });
       if (serverName) query.set("serverName", serverName);
       const result = await api<MCPAuditResponse>(`/api/mcp/audit?${query.toString()}`);
+      if (request !== auditRequestRef.current) return;
       setAuditEntries(Array.isArray(result.entries) ? result.entries : []);
       setAuditTotal(result.total || 0);
     } catch (cause) {
+      if (request !== auditRequestRef.current) return;
       toast.error(cause instanceof Error ? cause.message : "无法读取调用审计");
     } finally {
-      setAuditLoading(false);
+      if (request === auditRequestRef.current) setAuditLoading(false);
     }
   }, [api]);
 
   const clearAudit = async () => {
+    // 作废在途读取：清空后迟到的旧响应会把列表又填回来。
+    auditRequestRef.current += 1;
+    setAuditLoading(false);
     setAuditClearing(true);
     try {
       await api("/api/mcp/audit", { method: "DELETE" });
+      // 清空期间启动的读取（读到的还是旧数据）也要作废，否则会在清空后把列表填回来。
+      auditRequestRef.current += 1;
       setAuditEntries([]);
       setAuditTotal(0);
       toast.success("审计记录已清空");
@@ -1230,13 +1404,14 @@ export default function McpManagerPage() {
 
   const toggleAllowMcpJson = async (next: boolean) => {
     if (!viewProjectId) return;
+    const request = ++viewRequestRef.current;
     setMcpJsonBusy(true);
     try {
-      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp`, {
+      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp?agentId=${encodeURIComponent(viewAgent)}`, {
         method: "PATCH",
         body: JSON.stringify({ allowMcpJson: next }),
       });
-      setProjectView(view);
+      if (request === viewRequestRef.current) setProjectView(view);
       toast.success(next ? "已放行项目 .mcp.json" : "已恢复严格模式");
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "更新项目设置失败");
@@ -1251,7 +1426,18 @@ export default function McpManagerPage() {
     return map;
   }, [projects]);
 
-  const setField = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((old) => ({ ...old, [key]: value }));
+  // 会改变探测输入的字段一改，旧的预览/试连结论立即失效；否则用户改完命令仍看到
+  // 上一次的「测试通过」。展示类字段（名称/说明/策略）不触发清空。
+  const PROBE_FIELDS: (keyof FormState)[] = ["transport", "command", "argsText", "envText", "url", "headersText", "scope", "projectId"];
+  const setField = <K extends keyof FormState>(key: K, value: FormState[K]) => {
+    setForm((old) => ({ ...old, [key]: value }));
+    if (PROBE_FIELDS.includes(key)) {
+      invalidateProbes();
+      setPreviewResult(null);
+      setDraftTestResult(null);
+      setRuntimeResult(null);
+    }
+  };
 
   const toggleIn = (key: "environments" | "agents", id: string) => {
     setForm((old) => {
@@ -1352,20 +1538,23 @@ export default function McpManagerPage() {
             </div>
             <div className="ssh-form-section"><header><h3>项目视图</h3></header>
             <label className="ssh-field">选择项目<select value={viewProjectId} onChange={(event) => void loadProjectView(event.target.value)}><option value="">未选择</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+            <label className="ssh-field">按 Agent 查看<select value={viewAgent} onChange={(event) => { setViewAgent(event.target.value); if (viewProjectId) void loadProjectView(viewProjectId, event.target.value); }}>{AGENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
             {viewLoading && <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在读取项目 MCP 视图…</p>}
             {projectView && !viewLoading && <div className="ssh-preflight valid"><header><span><McpIcon /></span><div><h4>{`环境：${projectView.environment}`}</h4><p>{projectView.strictMode ? "已启用严格模式（默认）" : "未启用严格模式"}</p></div></header>
               <div className="ssh-preflight-checks">{projectView.effective.length === 0 ? <span>该项目暂无生效的 MCP server</span> : projectView.effective.map((entry) => <span key={entry.id}>{entry.displayName || entry.name} <b>{entry.origin === "project" ? "项目" : "全局"}</b></span>)}</div>
               {projectView.bindings.length > 0 && <div className="ssh-form-section"><header><h3>项目开关</h3></header>
-                <div className="ssh-preflight-checks">{projectView.bindings.map((binding) => <button key={binding.serverId} className={binding.enabled ? "" : "secondary"} type="button" disabled={bindingBusy === binding.serverId} onClick={() => void toggleBinding(binding.serverId, !binding.enabled)}>
-                  {binding.displayName || binding.serverName}：{binding.enabled ? "已启用" : "已关闭"}{binding.overridden ? "（项目覆盖）" : ""}
-                </button>)}</div>
+                <div className="ssh-preflight-checks">{projectView.bindings.map((binding) => binding.scope === "project" && binding.definitionEnabled === false
+                  ? <span key={binding.serverId}>{binding.displayName || binding.serverName}：定义已停用（请在主列表启用）</span>
+                  : <button key={binding.serverId} className={binding.enabled ? "" : "secondary"} type="button" disabled={bindingBusy === binding.serverId} onClick={() => void toggleBinding(binding.serverId, !binding.enabled)}>
+                    {binding.displayName || binding.serverName}：{binding.enabled ? "已启用" : "已关闭"}{binding.overridden ? "（项目覆盖）" : ""}
+                  </button>)}</div>
               </div>}
               <div className="ssh-form-section"><header><h3>项目自带配置</h3><p>放行后，项目根目录的 <code>.mcp.json</code> 会随 Milevia 注入一并生效；此时不再强制严格模式，该文件里的 server 绕过 Milevia 的白名单与审计。</p></header>
                 <div className="ssh-auth-method"><label className={projectView.allowMcpJson ? "active" : ""}><input type="checkbox" checked={projectView.allowMcpJson} disabled={mcpJsonBusy} onChange={() => setMcpJsonConfirm({ next: !projectView.allowMcpJson })} />放行项目 .mcp.json</label></div>
-                {projectView.allowMcpJson && projectView.mcpJsonServers.length > 0 && <p className="ssh-form-notice">该文件中发现：{projectView.mcpJsonServers.join("、")}</p>}
-                {projectView.allowMcpJson && projectView.mcpJsonServers.length === 0 && <p className="ssh-form-notice">未在项目根目录发现 .mcp.json，或文件中没有 mcpServers。</p>}
+                {projectView.allowMcpJson && (projectView.mcpJsonServers || []).length > 0 && <p className="ssh-form-notice">该文件中发现：{(projectView.mcpJsonServers || []).join("、")}</p>}
+                {projectView.allowMcpJson && (projectView.mcpJsonServers || []).length === 0 && <p className="ssh-form-notice">未在项目根目录发现 .mcp.json，或文件中没有 mcpServers。</p>}
               </div>
-              {injection && <div className="ssh-form-section"><header><h3>最近一次注入</h3><p>{`${injection.environment || "—"} · ${injection.agentId || "—"} · ${new Date(injection.updatedAt).toLocaleString("zh-CN")}`}</p></header>
+              {injection && injection.updatedAt && new Date(injection.updatedAt).getFullYear() > 1 && <div className="ssh-form-section"><header><h3>最近一次注入</h3><p>{`${injection.environment || "—"} · ${injection.agentId || "—"} · ${new Date(injection.updatedAt).toLocaleString("zh-CN")}`}</p></header>
                 <div className="ssh-preflight-checks">{injection.serverCount === 0 ? <span>本次未注入任何 MCP server</span> : injection.servers.map((entry) => <span key={entry.name}>{entry.displayName || entry.name} <b>{entry.origin === "project" ? "项目" : "全局"}</b></span>)}</div>
                 {injection.note && <p className="ssh-form-notice">{injection.note}</p>}
               </div>}
@@ -1497,10 +1686,21 @@ export default function McpManagerPage() {
           <section className="ssh-form-section"><header><h3>凭据</h3><p>凭据在保存时加密存储，保存后不可回显。留空表示不修改。</p></header>
             {(form.transport === "stdio" ? form.envSecretKeys : form.headerSecretKeys).length === 0
               ? <p className="ssh-form-notice">暂无已保存的凭据。可在上面的环境变量 / 请求头中以明文写入，保存时自动加密处理。</p>
-              : (form.transport === "stdio" ? form.envSecretKeys : form.headerSecretKeys).map((key) => <label className="ssh-field" key={key}>{key}（已设置）<input type="password" autoComplete="new-password" value={(form.transport === "stdio" ? form.envSecrets : form.headerSecrets)[key] || ""} onChange={(event) => {
+              : (form.transport === "stdio" ? form.envSecretKeys : form.headerSecretKeys).map((key) => {
                 const target = form.transport === "stdio" ? "envSecrets" : "headerSecrets";
-                setForm((old) => ({ ...old, [target]: { ...old[target], [key]: event.target.value } }));
-              }} placeholder="留空保持原值" /></label>)}
+                return <div className="ssh-field" key={key}>
+                  <span>{key}（已设置）</span>
+                  <input type="password" autoComplete="new-password" value={(form.transport === "stdio" ? form.envSecrets : form.headerSecrets)[key] || ""} onChange={(event) => {
+                    // 改凭据也会改变试连结果，口径与 setField 的探测字段一致。
+                    invalidateProbes();
+                    setPreviewResult(null);
+                    setDraftTestResult(null);
+                    setRuntimeResult(null);
+                    setForm((old) => ({ ...old, [target]: { ...old[target], [key]: event.target.value } }));
+                  }} placeholder="留空保持原值" />
+                  <button type="button" className="ssh-action-button" title="移除该已保存凭据" onClick={() => removeSavedSecret(target, key)}>移除此凭据</button>
+                </div>;
+              })}
           </section>
           <section className="ssh-form-section"><header><h3>适用范围</h3><p>只有同时命中作用域、环境与 Agent 的会话才会注入该 server。</p></header>
             <div className="ssh-fields">
@@ -1509,10 +1709,11 @@ export default function McpManagerPage() {
             </div>
             <div className="ssh-auth-method">{ENVIRONMENT_OPTIONS.map((option) => <label key={option.id} className={form.environments.includes(option.id) ? "active" : ""}><input type="checkbox" checked={form.environments.includes(option.id)} onChange={() => toggleIn("environments", option.id)} />{option.label}</label>)}</div>
             <div className="ssh-auth-method">{AGENT_OPTIONS.map((option) => <label key={option.id} className={form.agents.includes(option.id) ? "active" : ""}><input type="checkbox" checked={form.agents.includes(option.id)} onChange={() => toggleIn("agents", option.id)} />{option.label}</label>)}</div>
+            {(form.environments.length === 0 || form.agents.length === 0) && <p className="ssh-form-notice">至少选择一个适用环境和一个 Agent，否则无法保存（当前保存按钮已置灰）。</p>}
           </section>
           <section className="ssh-form-section"><header><h3>按环境预览</h3></header>
             <div className="ssh-fields">
-              <label className="ssh-field">预览环境<select value={previewEnvironment} onChange={(event) => { setPreviewEnvironment(event.target.value); setPreviewResult(null); setRuntimeResult(null); }}>{ENVIRONMENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
+              <label className="ssh-field">预览环境<select value={previewEnvironment} onChange={(event) => { invalidateProbes(); setPreviewEnvironment(event.target.value); setPreviewResult(null); setRuntimeResult(null); setDraftTestResult(null); }}>{ENVIRONMENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
             </div>
             <div className="ssh-preflight-checks">
               <button className="secondary" type="button" disabled={previewLoading} onClick={() => void runPreview()}>{previewLoading ? "解析中…" : "解析占位符"}</button><button className="secondary" type="button" disabled={draftTestRunning || !canSubmit} onClick={() => void runDraftTest()}>{draftTestRunning ? "测试中…" : "测试草稿"}</button>
@@ -1550,7 +1751,7 @@ export default function McpManagerPage() {
         <header><div className="ssh-dialog-heading"><span className="ssh-dialog-mark"><McpIcon /></span><div><h2 id="mcp-test-title">测试连接</h2><p>{testTarget.displayName || testTarget.name} · {testTarget.transport}</p></div></div><button className="ssh-dialog-close" type="button" title="关闭" aria-label="关闭" disabled={testRunning} onClick={() => { setTestTarget(null); setTestResult(null); }}><CloseIcon /></button></header>
         <div className="ssh-form-body">
           <section className="ssh-form-section"><header><h3>目标环境</h3></header>
-            <label className="ssh-field">环境<select value={testEnvironment} onChange={(event) => setTestEnvironment(event.target.value)}>{ENVIRONMENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
+            <label className="ssh-field">环境<select value={testEnvironment} onChange={(event) => { testProbeRef.current += 1; setTestEnvironment(event.target.value); setTestResult(null); }}>{ENVIRONMENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
             {!testTarget.environments.includes(testEnvironment) && <p className="ssh-form-notice">该 server 未声明适用于此环境，实跑会按当前选择执行。</p>}
             <div className="ssh-preflight-checks"><button className="primary" type="button" disabled={testRunning} onClick={() => void runTest()}>{testRunning ? "测试中…" : "开始测试"}</button></div>
           </section>
@@ -1611,7 +1812,7 @@ export default function McpManagerPage() {
               const disabled = candidate.conflict || !!candidate.skipReason;
               return <label key={key} className={`mcp-import-item${disabled ? " is-disabled" : ""}`}>
                 <input type="checkbox" disabled={disabled} checked={!disabled && !!importSelection[key]} onChange={(event) => setImportSelection((old) => ({ ...old, [key]: event.target.checked }))} />
-                <div><b>{candidate.originalName}</b><small>{candidate.sourceLabel} · {candidate.transport}{candidate.secretKeys.length ? ` · 含凭据（${candidate.secretKeys.join("、")}）` : ""}</small>
+                <div><b>{candidate.originalName}</b><small>{candidate.sourceLabel} · {candidate.transport}{(candidate.secretKeys || []).length ? ` · 含凭据（${(candidate.secretKeys || []).join("、")}）` : ""}</small>
                   {candidate.command && <small>{candidate.command} {(candidate.args || []).join(" ")}</small>}
                   {candidate.url && <small>{candidate.url}</small>}
                   {candidate.skipReason && <small>{candidate.skipReason}</small>}
@@ -1622,7 +1823,7 @@ export default function McpManagerPage() {
           </section>}
           {(importPreview?.errors?.length || 0) > 0 && <section className="ssh-form-section"><header><h3>导入错误</h3></header>{importPreview?.errors?.map((error) => <p key={error} className="ssh-form-notice">{error}</p>)}</section>}
         </div>
-        <footer><button className="secondary" type="button" disabled={importRunning} onClick={() => { setImportOpen(false); setImportPreview(null); }}>取消</button><button className="primary" type="button" disabled={importRunning || !importPreview || Object.values(importSelection).every((value) => !value)} onClick={() => void confirmImport()}>{importRunning ? "导入中" : "导入所选"}</button></footer>
+        <footer><button className="secondary" type="button" disabled={importRunning} onClick={() => { setImportOpen(false); setImportPreview(null); }}>取消</button><button className="primary" type="button" disabled={importRunning || importLoading || !importPreview || Object.values(importSelection).every((value) => !value)} onClick={() => void confirmImport()}>{importRunning ? "导入中" : "导入所选"}</button></footer>
       </section>
     </div>}
     {oauthTarget && <div className="backdrop ssh-form-backdrop" role="dialog" aria-modal="true" aria-labelledby="mcp-oauth-title">
@@ -1673,6 +1874,9 @@ export default function McpManagerPage() {
       为 <b>{testTarget?.displayName || testTarget?.name}</b> 的 <b>{toolConfirm.toolName}</b> 配置免审批：
       <br /><code>{toolConfirm.pattern}</code><br />
       {toolConfirm.next ? "之后该工具调用不再弹出审批，直接执行。" : "之后该工具调用将恢复为需要确认。"}
+      {!toolConfirm.next && testTarget && (testTarget.autoApproveTools || []).includes(`mcp__${testTarget.name}__*`) && <>
+        <br /><b>当前启用了整服务免审批</b>：本次会把它展开为当前工具列表的精确项，以后新增的工具需要重新勾选。
+      </>}
     </>} confirmLabel={toolConfirm.next ? "确认放行" : "确认恢复"} danger={toolConfirm.next} busy={toolToggleBusy !== ""} onConfirm={() => void confirmToolAutoApprove()} onCancel={() => setToolConfirm(null)} />}
     {mcpJsonConfirm && <ConfirmDialog title="确认放行项目 .mcp.json" message={<>
       {mcpJsonConfirm.next ? <>

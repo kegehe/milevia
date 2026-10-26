@@ -93,6 +93,21 @@ export const NOTIFIABLE_STATUSES = new Set([
   "awaiting_review",
 ]);
 
+/** 服务端列表里已经不存在、应当从本地未读集合移除的通知 ID。
+ *
+ * 传进来的 `unreadIds` 必须是**本次拉取开始前**的本地快照：请求期间刚到的通知
+ * 不在快照里，因此不会因为"这次响应里还没有它"而被误删（也避免依赖两端时钟）。*/
+export function unreadIdsMissingFromServer(
+  unreadIds: ReadonlySet<string>,
+  serverIds: ReadonlySet<string>,
+): string[] {
+  const missing: string[] = [];
+  for (const id of unreadIds) {
+    if (!serverIds.has(id)) missing.push(id);
+  }
+  return missing;
+}
+
 /** 通知类型到优先级映射 */
 export function priorityForType(type: string): "high" | "normal" | "low" {
   if (type.includes("action_required") || type.includes("needs_human") || type.includes("approval")) {

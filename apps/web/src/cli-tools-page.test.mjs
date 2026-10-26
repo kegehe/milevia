@@ -796,3 +796,18 @@ test("横幅按钮按 actionLabel 渲染，授权链接走 ExternalLink", () => 
   assert.match(code, /<ExternalLink href=\{loginInfo\.authUrl\}/, "授权链接没走 ExternalLink");
   assert.doesNotMatch(code, /<a href=\{loginInfo\.authUrl\}/, "授权链接又变回裸 <a>");
 });
+
+test("执行环境列表刷新后，选中的那台若已不在清单里就落回第一个", () => {
+  // 留着那个 id，下一次读它必然 404；而只剩一个环境时选择器整块隐藏（runners.length > 1
+  // 才渲染），页面于是卡在"读不到"上且无处可点 —— SSH 被断开/删除后就会这样。
+  assert.match(code, /setSelectedRunner\(\(current\) => \{[\s\S]{0,200}list\.some\(\(item\) => item\.id === current\)/);
+  assert.match(code, /return list\[0\]\?\.id \|\| "";/);
+});
+
+test("「查最新版本」只问服务端能回答的那些工具", () => {
+  // 这个执行环境不提供该工具时（unsupported），服务端会回 404 —— 那是必然失败的请求。
+  assert.match(code, /filter\(\(item\) => item\.updateSupported\)/);
+  // 名单来自**这台机器的读数**而不是工具目录：目录里所有工具都在，而"这个环境提供
+  // 哪些"只有读数知道。
+  assert.ok(!code.includes("catalogKey"), "查最新版本的名单不该再来自工具目录");
+});

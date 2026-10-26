@@ -69,3 +69,60 @@ func TestStateEventsWebSocketContract(t *testing.T) {
 		t.Fatalf("frame projectId = %v, want proj-1 (线上字段名必须是 projectId)", raw["projectId"])
 	}
 }
+
+// 删项目会连带删掉该项目的通知：必须通过 /ws/events 发 notifications 失效信号，
+// 否则前端的未读角标会一直停在旧数字（通知列表本身要等重开才刷新）。
+func TestProjectDeletionBroadcastsNotificationInvalidation(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('notif-project','Notifications',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	httpServer := httptest.NewServer(server.routes())
+	t.Cleanup(httpServer.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws/events"
+	connection, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{httpServer.URL}})
+	if err != nil {
+		t.Fatalf("dial /ws/events: %v", err)
+	}
+	defer connection.Close()
+	connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := connection.ReadMessage(); err != nil {
+		t.Fatalf("read initial all frame: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.stateEventSubMu.Lock()
+		registered := len(server.stateEventSubs) == 1
+		server.stateEventSubMu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("state event WebSocket was not registered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	deleted := httptest.NewRecorder()
+	server.routes().ServeHTTP(deleted, httptest.NewRequest(http.MethodDelete, "/api/projects/notif-project", nil))
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete project: status=%d body=%s", deleted.Code, deleted.Body.String())
+	}
+
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, data, err := connection.ReadMessage()
+	if err != nil {
+		t.Fatalf("read invalidation frame: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode frame %s: %v", data, err)
+	}
+	if raw["type"] != "notifications" || raw["projectId"] != "notif-project" {
+		t.Fatalf("invalidation frame = %v, want type=notifications projectId=notif-project", raw)
+	}
+}

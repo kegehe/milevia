@@ -13,6 +13,7 @@ import {
   notificationTargetURL,
   priorityForType,
   toastVariantForType,
+  unreadIdsMissingFromServer,
   windowsToastLines,
 } from "../lib/notifications";
 import { useUIPreferences, type LocalPreferences } from "../stores/useUIPreferences";
@@ -23,10 +24,16 @@ import { NotificationToastBody } from "./NotificationToastBody";
 const NOTIFICATION_TOAST_DURATION_MS = 8000;
 
 const UnreadNotificationContext = createContext(0);
+const NotificationRefreshContext = createContext<() => void>(() => {});
 
 /** 未读通知数量，跨路由保持在常驻 Provider 中。 */
 export function useUnreadCount() {
   return useContext(UnreadNotificationContext);
+}
+
+/** 重新拉取未读通知：服务端删掉了通知目标（项目/会话/定时任务）后由 /ws/events 触发。 */
+export function useNotificationRefresh() {
+  return useContext(NotificationRefreshContext);
 }
 
 export function NotificationProvider({ children }: { children: React.ReactNode }) {
@@ -76,6 +83,36 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     syncUnreadCount();
     if (broadcast) channelRef.current?.postMessage({ type: "dismissed-all", dismissedAt });
   }, [syncUnreadCount]);
+
+  // 重新拉取未读列表并对账：服务端已删掉的通知（项目/会话/定时任务被删）要从角标里消失。
+  // recordShown 为真时把结果记入 shownRef（WebSocket 重连路径沿用旧行为，避免历史通知重弹）。
+  const refreshUnread = useCallback(async (recordShown: boolean) => {
+    // 先拍快照：拉取期间新到的通知不在里面，不能因这次响应里还没有它就被抹掉角标。
+    const beforeFetch = new Set(unreadNotificationsRef.current.keys());
+    try {
+      const list = await api<NotificationEvent[]>("/api/notifications");
+      if (!Array.isArray(list)) return;
+      const present = new Set<string>();
+      for (const notification of list) {
+        present.add(notification.id);
+        if (recordShown) shownRef.current.add(notification.id);
+        markUnread(notification);
+      }
+      const missing = unreadIdsMissingFromServer(beforeFetch, present);
+      if (missing.length === 0) return;
+      for (const id of missing) unreadNotificationsRef.current.delete(id);
+      syncUnreadCount();
+    } catch {
+      /* 拉取失败就保留现有角标，下次事件或重连再校正 */
+    }
+  }, [markUnread, syncUnreadCount]);
+
+  const refreshUnreadNow = useCallback(() => {
+    void refreshUnread(false).finally(() => {
+      // 通知中心若正开着，也需要重拉列表（角标由上面的未读集合直接更新）。
+      window.dispatchEvent(new Event("notification:invalidated"));
+    });
+  }, [refreshUnread]);
 
   // 初始加载未读通知：设置 count 并将已有通知 ID 标记到 shownRef，
   // 防止 WebSocket 连接后历史通知重复弹 toast 和重复 inc
@@ -256,18 +293,9 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         // 重连后重新加载未读通知 ID，更新 shownRef 防止历史通知重复弹 toast
         // 重置 initializedRef，让重连后的历史通知被拦截（不弹 toast、不 inc）
         initializedRef.current = false;
-        api<NotificationEvent[]>("/api/notifications")
-          .then((list) => {
-            if (!Array.isArray(list)) return;
-            for (const n of list) {
-              shownRef.current.add(n.id);
-              markUnread(n);
-            }
-            initializedRef.current = true;
-          })
-          .catch(() => {
-            initializedRef.current = true; // 失败也放行
-          });
+        void refreshUnread(true).finally(() => {
+          initializedRef.current = true; // 失败也放行
+        });
       };
 
       ws.onmessage = (raw: MessageEvent) => {
@@ -301,7 +329,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [handleNotification, markUnread]);
+  }, [handleNotification, refreshUnread]);
 
   // BroadcastChannel 跨 Tab 同步
   useEffect(() => {
@@ -343,11 +371,13 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
 
   return (
     <UnreadNotificationContext.Provider value={unreadCount}>
-      <Toaster
-        position="bottom-right"
-        closeButton
-      />
-      {children}
+      <NotificationRefreshContext.Provider value={refreshUnreadNow}>
+        <Toaster
+          position="bottom-right"
+          closeButton
+        />
+        {children}
+      </NotificationRefreshContext.Provider>
     </UnreadNotificationContext.Provider>
   );
 }

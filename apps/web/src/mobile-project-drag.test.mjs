@@ -206,6 +206,7 @@ test("磁贴化之后单列卡的旧结构不许残留（残留 = 第二份口�
   assert.doesNotMatch(mobileStyles, /\.mobile-project-choice-content|\.mobile-project-choice-head|\.mobile-project-choice-chevron/);
   assert.doesNotMatch(mobileCode, /mobile-project-choice-content|mobile-project-choice-head|mobile-project-choice-chevron/);
   // 旧的胶囊点（<i>）随纯文字状态一起退役；角点是 .mobile-project-live，不再依赖动画。
+  // 未运行状态用中性灰（2026-10-25 从 #74867f 加深到 #5b736a：浅底上原色只有 ~3.9:1）。
   assert.doesNotMatch(mobileStyles, /mobile-project-running-pulse/);
-  assert.match(mobileStyles, /\.mobile-project-running\s*\{[^}]*color:\s*#74867f;/);
+  assert.match(mobileStyles, /\.mobile-project-running\s*\{[^}]*color:\s*#5b736a;/);
 });

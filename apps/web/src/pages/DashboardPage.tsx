@@ -56,7 +56,8 @@ function CliToolsIcon() {
   return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" /><path d="M7.5 10.5 10 13l-2.5 2.5M12.5 15.5h4" /></svg>;
 }
 
-export default function DashboardPage() {  const { projects, projectStatuses, error, setError, refreshProjects, removeProject, api } = useProjectContext();
+export default function DashboardPage() {
+  const { projects, projectStatuses, projectsLoading, projectsLoaded, projectsLoadError, error, setError, refreshProjects, removeProject, api } = useProjectContext();
   const desktop = isDesktop();
   const processStatuses = useProcessStatusMap();
   const navigate = useNavigate();
@@ -76,6 +77,12 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
   const onRealtime = useCallback(() => { void refreshProjects().catch(() => undefined); }, [refreshProjects]);
   useLiveStateEventsFor("projects", undefined, onRealtime);
   useLiveStateEventsFor("all", undefined, onRealtime);
+
+  // 首屏三态：projects 为空可能只是"还没拉到"或"拉失败了"，不能一律当成"没有项目"。
+  // 失败态一旦成立就持续显示（即使后台 30s 兜底轮询正在重试），避免错误面板与空态来回闪。
+  const showInitialLoading = !projectsLoaded && !projectsLoadError && projectsLoading;
+  const showLoadFailed = !projectsLoaded && Boolean(projectsLoadError);
+  const retryLoad = useCallback(() => { void refreshProjects().catch(() => undefined); }, [refreshProjects]);
 
   type ProjectState = "running" | "ready" | "offline";
   // 状态判定必须与筛选共用同一个函数：先前标签数用 agentReady 单独统计，
@@ -183,10 +190,18 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
       <header className="dashboard-intro">
         <div><h1>项目<em>总览</em></h1></div>
         <div className="dashboard-summary" aria-label="按项目状态筛选">
-          {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><b>{item.count}</b><small>{item.label}</small></button>)}
+          {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><b>{projectsLoaded ? item.count : "—"}</b><small>{item.label}</small></button>)}
         </div>
       </header>
-      {projects.length === 0 ? <div className="empty"><h2>还没有项目</h2><p>加载一个本地目录后，即可在这里开始 AI 工具对话。</p><button className="primary" onClick={() => navigate("/projects/import")}>加载项目</button></div>
+      {projects.length === 0
+        ? showInitialLoading ? <ProjectGridSkeleton />
+          : showLoadFailed ? <div className="empty load-failed">
+            <h2>项目列表加载失败</h2>
+            <p>{projectsLoadError}</p>
+            <p className="load-failed-hint">项目数据没有被删除，只是这次没读到控制服务。恢复后重试即可。</p>
+            <button className="primary" type="button" disabled={projectsLoading} onClick={retryLoad}>{projectsLoading ? "重试中…" : "重试"}</button>
+          </div>
+            : <div className="empty"><h2>还没有项目</h2><p>加载一个本地目录后，即可在这里开始 AI 工具对话。</p><button className="primary" onClick={() => navigate("/projects/import")}>加载项目</button></div>
         : filteredProjects.length === 0 ? (() => {
           const current = filters.find((item) => item.id === filter);
           const others = filters.filter((item) => item.id !== filter && item.id !== "all" && item.count > 0);
@@ -203,6 +218,20 @@ export default function DashboardPage() {  const { projects, projectStatuses, er
     {desktop && <div className="dashboard-version"><AppVersionTag /></div>}
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} status={projectStatuses[deleteTarget.id]} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
   </main>;
+}
+
+// 首屏占位：与 .project-card 同构的骨架卡。此前首屏直接渲染"还没有项目"，
+// 加载慢或失败时会被误读成项目丢失，进而引导用户重复添加。
+function ProjectGridSkeleton() {
+  return <div className="project-grid" role="status" aria-label="正在加载项目列表">
+    {[0, 1, 2].map((index) => <div className="project-card project-skeleton-card" key={index} aria-hidden="true">
+      <span className="project-skeleton-band"><i /></span>
+      <span className="project-skeleton-title" />
+      <span className="project-skeleton-line" />
+      <span className="project-skeleton-line short" />
+      <span className="project-skeleton-footer" />
+    </div>)}
+  </div>;
 }
 
 function ProjectCard({ project, status, runStatus, runStartedAt, open, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isDropTarget }: {

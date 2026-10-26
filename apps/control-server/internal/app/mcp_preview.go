@@ -111,7 +111,11 @@ func (s *Server) previewMCPServer(w http.ResponseWriter, r *http.Request) {
 	if projectPath != "" {
 		switch target {
 		case agentTargetEnvWSL:
-			result.Notes = append(result.Notes, "WSL 环境按 /mnt/<盘符>/ 形态解析项目路径。")
+			if isWSLUncPath(projectPath) {
+				result.Notes = append(result.Notes, "WSL 项目按 WSL 内的 Linux 路径解析（\\wsl$\\... → /home/...）。")
+			} else {
+				result.Notes = append(result.Notes, "WSL 环境按 /mnt/<盘符>/ 形态解析项目路径。")
+			}
 		case agentTargetEnvRemote:
 			result.Notes = append(result.Notes, "SSH 远端使用远端路径形态；stdio 型 server 依赖远端已安装对应运行时。")
 		}

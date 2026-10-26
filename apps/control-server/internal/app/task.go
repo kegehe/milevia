@@ -162,6 +162,7 @@ create table if not exists task_events (
 create index if not exists tasks_project_status_priority on tasks(project_id,status,priority,position);
 create index if not exists task_dependencies_predecessor on task_dependencies(predecessor_task_id);
 create index if not exists task_runs_task_created on task_runs(task_id,created_at desc);
+create index if not exists task_runs_task_sequence on task_runs(task_id,sequence desc);
 create index if not exists task_runs_run on task_runs(run_id);
 create index if not exists task_events_task_created on task_events(task_id,created_at);`)
 	if err != nil {
@@ -281,6 +282,7 @@ func (s *Server) migrateTaskRunConversationReference(ctx context.Context) error 
 		`drop table task_runs`,
 		`alter table task_runs_rebuilt rename to task_runs`,
 		`create index if not exists task_runs_task_created on task_runs(task_id,created_at desc)`,
+		`create index if not exists task_runs_task_sequence on task_runs(task_id,sequence desc)`,
 		`create index if not exists task_runs_run on task_runs(run_id)`,
 	} {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -403,11 +405,13 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	hydrated := make([]*Task, 0, len(items))
 	for index := range items {
-		if err := s.hydrateTask(r.Context(), &items[index]); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+		hydrated = append(hydrated, &items[index])
+	}
+	if err := s.hydrateTasks(r.Context(), hydrated); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, items)
 }
@@ -458,6 +462,9 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.PredecessorTaskIDs != nil {
 		seen := map[string]struct{}{}
+		// 按请求里给的顺序插入：依赖列表的展示顺序就是 created_at + rowid（见 hydrateTaskDependencies），
+		// 而同一批依赖共用同一个 created_at，所以插入顺序必须等于用户给的顺序。
+		ordered := make([]string, 0, len(*input.PredecessorTaskIDs))
 		for _, predecessorID := range *input.PredecessorTaskIDs {
 			predecessorID = strings.TrimSpace(predecessorID)
 			if predecessorID == "" || predecessorID == task.ID {
@@ -469,6 +476,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			seen[predecessorID] = struct{}{}
+			ordered = append(ordered, predecessorID)
 			var predecessorProjectID string
 			if err := tx.QueryRowContext(r.Context(), `select project_id from tasks where id=?`, predecessorID).Scan(&predecessorProjectID); errors.Is(err, sql.ErrNoRows) || predecessorProjectID != projectID {
 				writeError(w, http.StatusBadRequest, errors.New("predecessor task must belong to the same project"))
@@ -478,7 +486,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		for predecessorID := range seen {
+		for _, predecessorID := range ordered {
 			if _, err := tx.ExecContext(r.Context(), `insert into task_dependencies (task_id,predecessor_task_id,created_at) values (?,?,?)`, task.ID, predecessorID, now); err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -604,6 +612,9 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen := map[string]struct{}{}
+		// 同 createTask：插入顺序决定了依赖列表顺序（created_at 相同，靠 rowid 兜底），
+		// 所以这里按请求顺序收集，不能遍历 seen 这个 map。
+		ordered := make([]string, 0, len(*input.PredecessorTaskIDs))
 		for _, predecessorID := range *input.PredecessorTaskIDs {
 			predecessorID = strings.TrimSpace(predecessorID)
 			if predecessorID == "" || predecessorID == task.ID {
@@ -615,6 +626,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			seen[predecessorID] = struct{}{}
+			ordered = append(ordered, predecessorID)
 			var projectID string
 			if err := tx.QueryRowContext(r.Context(), `select project_id from tasks where id=?`, predecessorID).Scan(&projectID); errors.Is(err, sql.ErrNoRows) || projectID != task.ProjectID {
 				writeError(w, http.StatusBadRequest, errors.New("predecessor task must belong to the same project"))
@@ -637,7 +649,7 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		for predecessorID := range seen {
+		for _, predecessorID := range ordered {
 			if _, err := tx.ExecContext(r.Context(), `insert into task_dependencies (task_id,predecessor_task_id,created_at) values (?,?,?)`, task.ID, predecessorID, task.UpdatedAt); err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -1034,66 +1046,145 @@ func scanTask(row interface{ Scan(...any) error }) (Task, error) {
 }
 
 func (s *Server) hydrateTask(ctx context.Context, task *Task) error {
-	task.DependsOn, task.BlockedBy, task.Blocks = []TaskDependency{}, []TaskBlocker{}, []TaskDependency{}
-	predecessors, err := s.db.QueryContext(ctx, `select predecessor.id,predecessor.title,predecessor.status from task_dependencies dependency join tasks predecessor on predecessor.id=dependency.predecessor_task_id where dependency.task_id=? order by dependency.created_at`, task.ID)
+	return s.hydrateTasks(ctx, []*Task{task})
+}
+
+// hydrateTasks 一次性补齐一批任务的派生字段（依赖、最近一次执行、编排状态）。
+// 任务看板与会话侧栏的任务队列都是整表读、每 10 秒一轮，而控制服务只有一条 SQLite 连接，
+// 早先"每条任务再查 4 次"的写法会让刷新耗时随任务数线性增长、并长时间占住连接。
+// 这里改成每批固定 4 条查询（predecessors、dependents、latest run、orchestration job）。
+func (s *Server) hydrateTasks(ctx context.Context, tasks []*Task) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	byID := make(map[string]*Task, len(tasks))
+	ids := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		task.DependsOn, task.BlockedBy, task.Blocks = []TaskDependency{}, []TaskBlocker{}, []TaskDependency{}
+		task.LastRun = nil
+		task.OrchestrationStatus, task.OrchestrationTargetBranch = "", ""
+		task.OrchestrationPending, task.OrchestrationUpdatedAt = false, nil
+		byID[task.ID] = task
+		ids = append(ids, task.ID)
+	}
+	return forEachIDBatch(ids, func(placeholders string, args []any) error {
+		if err := s.hydrateTaskDependencies(ctx, byID, placeholders, args); err != nil {
+			return err
+		}
+		if err := s.hydrateTaskLastRuns(ctx, byID, placeholders, args); err != nil {
+			return err
+		}
+		return s.hydrateTaskOrchestration(ctx, byID, placeholders, args)
+	})
+}
+
+// hydrateTaskDependencies 填 DependsOn / BlockedBy / Blocks。两条查询共用同一批任务 id：
+// 前一条的 task_id 是依赖的消费方，后一条的 predecessor_task_id 是依赖的提供方。
+// 排序键必须带上 rowid：同一任务的依赖是共用同一个 created_at 插入的，只按 created_at 排
+// 会让列表顺序在 SQL 层变成"任选一种"，表现为每次刷新依赖徽章的顺序可能不同。
+// rowid 是插入顺序，写入方（createTask / updateTask / replaceTaskDependencies）都按请求顺序插入。
+func (s *Server) hydrateTaskDependencies(ctx context.Context, byID map[string]*Task, ids string, args []any) error {
+	predecessors, err := s.db.QueryContext(ctx, `select dependency.task_id,predecessor.id,predecessor.title,predecessor.status from task_dependencies dependency join tasks predecessor on predecessor.id=dependency.predecessor_task_id where dependency.task_id in (`+ids+`) order by dependency.created_at,dependency.rowid`, args...)
 	if err != nil {
 		return err
 	}
 	for predecessors.Next() {
+		var taskID string
 		var item TaskDependency
-		if err := predecessors.Scan(&item.TaskID, &item.Title, &item.Status); err != nil {
+		if err := predecessors.Scan(&taskID, &item.TaskID, &item.Title, &item.Status); err != nil {
 			predecessors.Close()
 			return err
+		}
+		task, ok := byID[taskID]
+		if !ok {
+			continue
 		}
 		task.DependsOn = append(task.DependsOn, item)
 		if item.Status != taskDone {
 			task.BlockedBy = append(task.BlockedBy, TaskBlocker(item))
 		}
 	}
+	if err := predecessors.Err(); err != nil {
+		predecessors.Close()
+		return err
+	}
 	if err := predecessors.Close(); err != nil {
 		return err
 	}
-	if err := predecessors.Err(); err != nil {
-		return err
-	}
-	dependents, err := s.db.QueryContext(ctx, `select dependent.id,dependent.title,dependent.status from task_dependencies dependency join tasks dependent on dependent.id=dependency.task_id where dependency.predecessor_task_id=? order by dependency.created_at`, task.ID)
+	dependents, err := s.db.QueryContext(ctx, `select dependency.predecessor_task_id,dependent.id,dependent.title,dependent.status from task_dependencies dependency join tasks dependent on dependent.id=dependency.task_id where dependency.predecessor_task_id in (`+ids+`) order by dependency.created_at,dependency.rowid`, args...)
 	if err != nil {
 		return err
 	}
 	defer dependents.Close()
 	for dependents.Next() {
+		var taskID string
 		var item TaskDependency
-		if err := dependents.Scan(&item.TaskID, &item.Title, &item.Status); err != nil {
+		if err := dependents.Scan(&taskID, &item.TaskID, &item.Title, &item.Status); err != nil {
 			return err
 		}
-		task.Blocks = append(task.Blocks, item)
+		if task, ok := byID[taskID]; ok {
+			task.Blocks = append(task.Blocks, item)
+		}
 	}
-	if err := dependents.Err(); err != nil {
+	return dependents.Err()
+}
+
+// hydrateTaskLastRuns 填 LastRun：取每条任务 sequence 最大的那次执行
+// （sequence 由 max+1 在同一事务里分配，因此任务内唯一）。
+func (s *Server) hydrateTaskLastRuns(ctx context.Context, byID map[string]*Task, ids string, args []any) error {
+	rows, err := s.db.QueryContext(ctx, `select run.id,run.task_id,coalesce(run.conversation_id,''),coalesce(run.run_id,''),run.sequence,run.status,run.prompt_snapshot,run.acceptance_snapshot,run.failure_reason,run.created_at,run.started_at,run.finished_at
+		from task_runs run join (select task_id,max(sequence) as sequence from task_runs where task_id in (`+ids+`) group by task_id) latest
+			on latest.task_id=run.task_id and latest.sequence=run.sequence`, args...)
+	if err != nil {
 		return err
 	}
-	lastRun, err := s.latestTaskRun(ctx, task.ID)
-	if err == nil {
-		task.LastRun = &lastRun
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	defer rows.Close()
+	for rows.Next() {
+		item, err := scanTaskRun(rows)
+		if err != nil {
+			return err
+		}
+		if task, ok := byID[item.TaskID]; ok {
+			lastRun := item
+			task.LastRun = &lastRun
+		}
+	}
+	return rows.Err()
+}
+
+// hydrateTaskOrchestration 填编排状态。
+// OrchestrationPending 单独一个字段、不改 OrchestrationStatus 的取值：闸门未开的子任务
+// 仍然是 queued（队列里的位置、能否重下发这些判断都依赖这个值），只是"还没被计划放行"，
+// 任务看板需要把这层区别说出来。
+// 两个终态刻意不在这个列表里：released_to_main（已合并）与 applied_to_branch（直接模式
+// 已把改动写进工作目录、编排已结束）。前端 canRedispatch 只看本字段是否非空，把它加进来
+// 会让「重新下发」按钮消失，而后端 orchestrationOwnsTask 同样排除这两个终态、是允许重下发的
+// ——多一个少一个都会造成前后端不一致。已结束的编排任务在任务页看起来就是普通「待验收」。
+func (s *Server) hydrateTaskOrchestration(ctx context.Context, byID map[string]*Task, ids string, args []any) error {
+	rows, err := s.db.QueryContext(ctx, `select job.task_id,job.status,job.updated_at,job.policy_snapshot,(job.status='queued' and job.batch_id<>'' and exists (select 1 from orchestration_batches batch where batch.id=job.batch_id and batch.started_at is null)) from task_orchestration_jobs job where job.task_id in (`+ids+`) and job.status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev') order by job.task_id,job.updated_at desc`, args...)
+	if err != nil {
 		return err
 	}
-	var orchestrationUpdatedAt time.Time
-	var policySnapshot string
-	// OrchestrationPending 单独一个字段、不改 OrchestrationStatus 的取值：闸门未开的子任务
-	// 仍然是 queued（队列里的位置、能否重下发这些判断都依赖这个值），只是"还没被计划放行"，
-	// 任务看板需要把这层区别说出来。
-	// 两个终态刻意不在这个列表里：released_to_main（已合并）与 applied_to_branch（直接模式
-	// 已把改动写进工作目录、编排已结束）。前端 canRedispatch 只看本字段是否非空，把它加进来
-	// 会让「重新下发」按钮消失，而后端 orchestrationOwnsTask 同样排除这两个终态、是允许重下发的
-	// ——多一个少一个都会造成前后端不一致。已结束的编排任务在任务页看起来就是普通「待验收」。
-	err = s.db.QueryRowContext(ctx, `select job.status,job.updated_at,job.policy_snapshot,(job.status='queued' and job.batch_id<>'' and exists (select 1 from orchestration_batches batch where batch.id=job.batch_id and batch.started_at is null)) from task_orchestration_jobs job where job.task_id=? and job.status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev') order by job.updated_at desc limit 1`, task.ID).Scan(&task.OrchestrationStatus, &orchestrationUpdatedAt, &policySnapshot, &task.OrchestrationPending)
-	if err == nil {
-		task.OrchestrationUpdatedAt = &orchestrationUpdatedAt
+	defer rows.Close()
+	for rows.Next() {
+		var taskID, status, policySnapshot string
+		var updatedAt time.Time
+		var pending bool
+		if err := rows.Scan(&taskID, &status, &updatedAt, &policySnapshot, &pending); err != nil {
+			return err
+		}
+		task, ok := byID[taskID]
+		if !ok || task.OrchestrationStatus != "" {
+			// 已填过就跳过：job 表按 task_id 唯一，这只是防御历史库里的重复行，
+			// 排序保证第一次扫到的是 updated_at 最新的那条。
+			continue
+		}
+		task.OrchestrationStatus = status
+		task.OrchestrationUpdatedAt = &updatedAt
+		task.OrchestrationPending = pending
 		task.OrchestrationTargetBranch = orchestrationTargetBranch(task.ProjectID, policySnapshot)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
 	}
-	return nil
+	return rows.Err()
 }
 
 func (s *Server) verificationRunsForTask(ctx context.Context, taskID string) ([]VerificationRun, error) {

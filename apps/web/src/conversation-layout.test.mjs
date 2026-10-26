@@ -57,7 +57,9 @@ test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
 
 test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /\{run && <button className="runner-stop" type="button" disabled=\{readOnly\} onClick=\{onStop\}/);
-  assert.match(conversationPage, /<textarea[\s\S]*?disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| handingOff \|\| changingModel \|\| Boolean\(shortcutBusy\)\}/);
+  // 2026-10-26 起输入区是 contenteditable 的 .composer-edit；禁用态走 data-disabled
+  // （变体优先 data-*），状态集合与旧 textarea 的 disabled 完全一致，一条不许少。
+  assert.match(conversationPage, /data-disabled=\{\(readOnlyConversation \|\| sending \|\| clearing \|\| handingOff \|\| changingModel \|\| Boolean\(shortcutBusy\)\) \|\| undefined\}/);
   // 卡外细语行的调用点：usage 读数与 runner 状态同行呈现，三者的顺序必须固定。
   assert.match(conversationPage, /usage=\{usage\} readOnly=\{readOnlyConversation\} stopping=\{stopping\} onStop=\{\(\) => void stopRun\(\)\}/);
   // 分支胶囊挂在 meta 行 runner 之后，数据来自会话级 git summary（conversationId 决定读哪个工作区）。

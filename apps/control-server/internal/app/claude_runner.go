@@ -99,6 +99,10 @@ type AgentSessionRequest struct {
 	// MCPAutoApproveTools 是本次运行生效的自动放行模式，随 --settings 写进
 	// permissions.allow 作为兜底（真正的放行判定在 hook handler 内，见 docs/34 §8.4）。
 	MCPAutoApproveTools []string
+	// MCPStartupTimeout 是注入的 MCP server 里最大的启动超时（0 = 没注入）。
+	// runner 把它转成 CLI 的 MCP_TIMEOUT：一个连不上的远端 server 不该让整轮对话
+	// 无限期等着 —— CLI 自己的默认值是 30 秒，且没有更小的兜底。
+	MCPStartupTimeout time.Duration
 }
 
 type AgentSession interface {
@@ -745,16 +749,37 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	return nil
 }
 
+// mcpTimeoutEnv 把注入的 MCP 启动超时转成 CLI 认的环境变量（毫秒）。
+//
+// 下限 5 秒：再低会把冷启动的 stdio server（npx 首次拉包）误杀，用户静默少掉一组
+// 工具，比慢更糟。上限 30 秒与 CLI 自己的默认值对齐 —— 这条只是把"无限等待"压成
+// "有界等待"，不是把健康 server 的正常握手时间砍掉。
+func mcpTimeoutEnv(timeout time.Duration) []string {
+	if timeout <= 0 {
+		return nil
+	}
+	ms := int(timeout / time.Millisecond)
+	if ms < 5000 {
+		ms = 5000
+	}
+	if ms > 30000 {
+		ms = 30000
+	}
+	return []string{fmt.Sprintf("MCP_TIMEOUT=%d", ms)}
+}
+
 func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSessionRequest) (AgentSession, error) {
 	args, err := r.sessionArgs(request)
 	if err != nil {
 		return nil, err
 	}
-	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, append([]string{
+	launchEnv := append([]string{
 		"AUTO_CONTROL_URL=" + r.config.ControlURL,
 		"AUTO_APPROVAL_CONVERSATION_ID=" + request.ConversationID,
 		"AUTO_APPROVAL_TOKEN=" + request.ApprovalToken,
-	}, request.MCPEnv...))
+	}, request.MCPEnv...)
+	launchEnv = append(launchEnv, mcpTimeoutEnv(request.MCPStartupTimeout)...)
+	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, launchEnv)
 	if err != nil {
 		return nil, err
 	}

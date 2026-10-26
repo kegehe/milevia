@@ -318,6 +318,19 @@ export function buildDraftServerPayload(
   };
 }
 
+// ENVIRONMENT_PRIORITY 是「测试连接」默认环境的优先顺序。
+//
+// 不能用 server.environments[0]：后端写入时会 sort.Strings，全选后的首项是
+// "remote-linux"，于是本地 stdio server 点“测试”会默认走 SSH 远端并报缺少连接。
+const TEST_ENVIRONMENT_PRIORITY = ["windows", "wsl", "remote-linux"];
+
+export function defaultTestEnvironment(environments: string[]): string {
+  for (const candidate of TEST_ENVIRONMENT_PRIORITY) {
+    if (environments.includes(candidate)) return candidate;
+  }
+  return environments[0] || "windows";
+}
+
 // ── 官方服务图标 ─────────────────────────────────────────────────────────────
 //
 // 目录条目会随时间增加，前端不该为一个新服务发一次版：所以这里按**预设名**维护

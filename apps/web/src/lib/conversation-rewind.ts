@@ -47,7 +47,10 @@ export function rewindConfirmTitle(request: RewindRequest): string {
 }
 
 /**
- * 确认框正文：会发生什么、代价是什么。
+ * 确认框正文（不含标题）：会发生什么、代价是什么。
+ *
+ * 桌面端用 ConfirmDialog，标题与正文分开；手机端的确认层自带标题，正文同样用这一段 ——
+ * 两种壳共用这一份正文，文案只有一处。
  *
  * 早先两端都是一句"这会停止当前会话上下文"—— 既没说会丢几轮，也没说代码会被改回去，
  * 而这是**不可撤销**的操作。
@@ -57,7 +60,7 @@ export function rewindConfirmTitle(request: RewindRequest): string {
  * 才不会在看到模型"忘记"被回退掉的回合时以为哪里坏了 —— 也不该反过来写成"模型不受影响"
  * （那是旧行为，早就不成立了）。
  */
-export function rewindConfirmMessage(checkpoint: ConversationCheckpoint, request: RewindRequest): string {
+export function rewindConfirmBody(checkpoint: ConversationCheckpoint, request: RewindRequest): string {
   const scope = request.fork
     ? "原会话保持不变，新会话从这个节点继续。"
     : request.mode === "code"
@@ -67,7 +70,12 @@ export function rewindConfirmMessage(checkpoint: ConversationCheckpoint, request
         : request.mode === "conversation"
           ? "对话回到本轮结束时，此后内容不再显示；电脑端会重建模型上下文（只保留这段历史，被回退掉的回合它不再记得）。代码不动。"
           : "代码回到本轮结束时的状态（快照之后新建的文件会被删除），对话也回到本轮结束时，并重建模型上下文（被回退掉的回合它不再记得）。";
-  return `${rewindConfirmTitle(request)}？${scope}${request.discarded > 0 ? `此后 ${request.discarded} 轮对话将不再显示。` : ""}`;
+  return `${scope}${request.discarded > 0 ? `此后 ${request.discarded} 轮对话将不再显示。` : ""}`;
+}
+
+/** 标题 + 正文合成一句：给只吃一段文字的场景（如通知或引用文案）。 */
+export function rewindConfirmMessage(checkpoint: ConversationCheckpoint, request: RewindRequest): string {
+  return `${rewindConfirmTitle(request)}？${rewindConfirmBody(checkpoint, request)}`;
 }
 
 /** 确认按钮上的字（回退中要能显示进度，所以单独给一个）。 */

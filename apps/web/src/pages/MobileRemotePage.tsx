@@ -6,7 +6,7 @@ import { api, asRecord } from "../lib/api";
 import { isDesktop } from "../lib/runtime";
 import { copyToClipboard } from "../lib/clipboard";
 // 回退的文案与"默认发哪个 mode"与桌面端共用一份：回退不可撤销，两端不能各说一套。
-import { rewindConfirmMessage, rewindConfirmTitle, rewindHint, rewindPrimaryMode } from "../lib/conversation-rewind";
+import { rewindConfirmBody, rewindConfirmTitle, rewindHint, rewindPrimaryMode } from "../lib/conversation-rewind";
 import { dropAfterCutoff } from "../lib/conversation-cutoff";
 import { DEVICE_ALIAS_MAX_LENGTH, activeDevice, deviceDisplayName, deviceLabel, devicePlatform, markDeviceRevoked, normalizeAlias, readActiveToken, readDevices, type MobileDevice } from "../lib/mobile-devices";
 import { MOBILE_PROJECT_ORDER_STORAGE_KEY, dismissMobileDragHint, persistOrder, readMobileDragHint, sortProjectIds } from "../lib/project-order";
@@ -390,7 +390,7 @@ const MOBILE_AGENTS: MobileAgent[] = [
 ];
 
 // 状态卡图标沿用桌面时间线那一套字形，两端看到的是同一个符号。
-const noticeIcons: Record<RemoteNotice["variant"], string> = { compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", task: "▸", error: "!" };
+const noticeIcons: Record<RemoteNotice["variant"], string> = { compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", session: "◌", task: "▸", error: "!" };
 
 // 运行指示器的动画图形位：7 变体（波点/轨道/思绪波纹/星芒/追点/三点走三角/CLI 盲文）
 // 按 runId 哈希抽取，与桌面会话页同一个函数、同一份变体 CSS（run-indicator.css）。
@@ -628,6 +628,10 @@ function noticeFromEventFields(type: string, payload: unknown, id: string, runId
       merge: "replace",
     };
   }
+  // "正在恢复会话上下文"是**阶段读数**，不是通知：手机端拿不到"这一轮已经开口"的
+  // 信号（init 不是通知），照着渲染就会挂一整轮。桌面端由 run-indicator 用事件序列
+  // 自行收尾，手机端这边直接不生成通知，保持原来的表现。
+  if (type === "system" && source.payload.subtype === "session_starting") return null;
   const system = systemItemFromEvent(source);
   if (system) {
     const state = typeof system.metadata?.state === "string" ? system.metadata.state : "";
@@ -5625,7 +5629,7 @@ export default function MobileRemotePage() {
         所以不能像「停止」那样点了就走：文案在 lib/conversation-rewind 里与桌面端共用一份。
         与上面几个弹层同一套处理：backdrop 是 position: fixed 的一层，返回键优先收它
         （见 backHandlerRef —— 漏掉那句会让返回键一路退掉会话层，而「确认回退」仍可点）。 */}
-    {rewindTarget && rewindRequest && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-rewind-title"><section className="mobile-task-modal"><header><h2 id="mobile-rewind-title">{rewindConfirmTitle(rewindRequest)}</h2><button type="button" onClick={() => setRewindTarget(null)} disabled={rewinding} aria-label="关闭">×</button></header><p className="mobile-rewind-node">{rewindTarget.prompt.trim().replace(/\s+/g, " ").slice(0, 72) || "未命名回合"}</p><p>{rewindConfirmMessage(rewindTarget, rewindRequest)}</p><footer><button type="button" onClick={() => setRewindTarget(null)} disabled={rewinding}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmRewind()} disabled={rewinding}>{rewinding ? "回退中" : "确认回退"}</button></footer></section></div>}
+    {rewindTarget && rewindRequest && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-rewind-title"><section className="mobile-task-modal"><header><h2 id="mobile-rewind-title">{rewindConfirmTitle(rewindRequest)}</h2><button type="button" onClick={() => setRewindTarget(null)} disabled={rewinding} aria-label="关闭">×</button></header><p className="mobile-rewind-node">{rewindTarget.prompt.trim().replace(/\s+/g, " ").slice(0, 72) || "未命名回合"}</p><p>{rewindConfirmBody(rewindTarget, rewindRequest)}</p><footer><button type="button" onClick={() => setRewindTarget(null)} disabled={rewinding}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => void confirmRewind()} disabled={rewinding}>{rewinding ? "回退中" : "确认回退"}</button></footer></section></div>}
     {stopConfirmTarget && <div className="mobile-task-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-stop-confirm-title"><section className="mobile-task-modal"><header><h2 id="mobile-stop-confirm-title">{conversationStopConfirmCopy.title}</h2><button type="button" onClick={() => setStopConfirmTarget("")} aria-label="关闭">×</button></header><p>{conversationStopConfirmCopy.message}</p><footer><button type="button" onClick={() => setStopConfirmTarget("")}>取消</button><button type="button" className="mobile-task-delete-confirm" onClick={() => { const target = stopConfirmTarget; setStopConfirmTarget(""); void stopConversationRun(true, target); }}>{conversationStopConfirmCopy.confirm}</button></footer></section></div>}
     {/* 「备注」弹层：给某一台电脑起/改/清一个**只在这台手机上生效**的名字。
         三个设计点：

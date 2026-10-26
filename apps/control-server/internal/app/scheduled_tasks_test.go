@@ -435,10 +435,26 @@ func TestScheduledConversationStaysReadOnlyAfterTaskDeletion(t *testing.T) {
 	if _, err := server.db.Exec(`update scheduled_task_runs set status=?,finished_at=? where id=?`, scheduledRunStopped, now, queued.ID); err != nil {
 		t.Fatalf("stop queued scheduled run: %v", err)
 	}
+	if _, err := server.db.Exec(`insert into notifications (id,type,project_id,conversation_id,scheduled_task_id,title,body,action_url,created_at) values ('notif-scheduled-deleted','scheduled_task.succeeded',?,?,?,'标题','正文',?,?)`,
+		projectID, conversation.ID, task.ID, "/projects/"+projectID+"/tasks/schedules/"+task.ID, now); err != nil {
+		t.Fatalf("insert scheduled notification: %v", err)
+	}
+	// 修复前的旧通知没有 scheduled_task_id，只有 action_url。
+	if _, err := server.db.Exec(`insert into notifications (id,type,project_id,conversation_id,scheduled_task_id,title,body,action_url,created_at) values ('notif-scheduled-legacy','scheduled_task.succeeded',?,?,'','标题','正文',?,?)`,
+		projectID, conversation.ID, "/projects/"+projectID+"/tasks/schedules/"+task.ID, now); err != nil {
+		t.Fatalf("insert legacy scheduled notification: %v", err)
+	}
 	deleted := httptest.NewRecorder()
 	server.routes().ServeHTTP(deleted, httptest.NewRequest(http.MethodDelete, "/api/scheduled-tasks/"+task.ID, nil))
 	if deleted.Code != http.StatusNoContent {
 		t.Fatalf("delete scheduled task: status=%d body=%s", deleted.Code, deleted.Body.String())
+	}
+	var remaining int
+	if err := server.db.QueryRow(`select count(*) from notifications where id in ('notif-scheduled-deleted','notif-scheduled-legacy')`).Scan(&remaining); err != nil {
+		t.Fatalf("count scheduled notifications: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("notifications targeting the deleted scheduled task still exist: %d", remaining)
 	}
 	if !server.isScheduledConversation(context.Background(), conversation.ID) {
 		t.Fatal("scheduled conversation became writable after its task was deleted")
@@ -480,5 +496,77 @@ func TestScheduledTaskPromptIncludesSelectedSkills(t *testing.T) {
 	want := "Use the following installed skills for this task and follow each SKILL.md instruction:\n- repo-audit\n- release-notes\n\n检查项目风险并汇报。"
 	if got != want {
 		t.Fatalf("scheduled task prompt = %q, want %q", got, want)
+	}
+}
+
+// TestScheduledTaskListBatchesLatestRuns 覆盖列表接口批量取"每条定时任务最近一次执行"：
+// 有执行的取 created_at 最新那条（哪怕它的 scheduled_for 更早），没执行的留空，
+// 且互相之间不能串台（批量查询最容易犯的错就是按错误的键回填）。
+func TestScheduledTaskListBatchesLatestRuns(t *testing.T) {
+	server := newTestServer(t)
+	projectID := seedScheduledTaskProject(t, server)
+	handler := server.routes()
+
+	createTask := func(title string) ScheduledTask {
+		payload := map[string]any{
+			"title":          title,
+			"prompt":         "Summarize the project.",
+			"agentId":        "claude-code",
+			"permissionMode": "approval_required",
+			"scheduleType":   "daily",
+			"timezone":       "Asia/Shanghai",
+			"timeOfDay":      "07:00",
+			"enabled":        true,
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/scheduled-tasks", jsonBody(t, payload)))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create scheduled task %q: status=%d body=%s", title, response.Code, response.Body.String())
+		}
+		var task ScheduledTask
+		if err := json.NewDecoder(response.Body).Decode(&task); err != nil {
+			t.Fatalf("decode scheduled task: %v", err)
+		}
+		return task
+	}
+
+	withRuns := createTask("has runs")
+	withoutRuns := createTask("no runs")
+	now := time.Now().UTC()
+	// 先插 scheduled_for 更晚、created_at 更早的那条；后插的那条才是"最近一次执行"。
+	for _, run := range []struct {
+		id           string
+		scheduledFor time.Time
+		createdAt    time.Time
+	}{
+		{"run-earlier", now.Add(48 * time.Hour), now},
+		{"run-latest", now.Add(24 * time.Hour), now.Add(time.Minute)},
+	} {
+		if _, err := server.db.Exec(`insert into scheduled_task_runs (id,scheduled_task_id,scheduled_for,status,prompt_snapshot,created_at) values (?,?,?,?,?,?)`, run.id, withRuns.ID, run.scheduledFor, scheduledRunSucceeded, "prompt", run.createdAt); err != nil {
+			t.Fatalf("insert scheduled run: %v", err)
+		}
+	}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/scheduled-tasks", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list scheduled tasks: status=%d body=%s", response.Code, response.Body.String())
+	}
+	var listed []ScheduledTask
+	if err := json.NewDecoder(response.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode scheduled tasks: %v", err)
+	}
+	byID := map[string]ScheduledTask{}
+	for _, task := range listed {
+		byID[task.ID] = task
+	}
+	if len(byID) != 2 {
+		t.Fatalf("listed scheduled tasks: got %d want 2", len(byID))
+	}
+	if last := byID[withRuns.ID].LastRun; last == nil || last.ID != "run-latest" {
+		t.Fatalf("scheduled task last run: %+v want run-latest (max created_at)", last)
+	}
+	if byID[withoutRuns.ID].LastRun != nil {
+		t.Fatalf("scheduled task without runs got last run: %+v", byID[withoutRuns.ID].LastRun)
 	}
 }

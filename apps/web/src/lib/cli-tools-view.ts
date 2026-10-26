@@ -267,10 +267,26 @@ export function installBlockNote(input: Pick<ToolCardInput, "item" | "runtime" |
   return "";
 }
 
+/**
+ * 这台机器上**登记过**这个工具吗（= 曾经装过）。
+ *
+ * 判据是服务端的登记项（安装位置 / 安装方式），不是 `installed` ——
+ * 后者说的是"现在能不能用"。两者分开才分得出"没装"与"装了但坏了"：
+ * 这两件事的下一步完全不同（去装一个 vs 去修一个），而服务端已经为后者
+ * 备好了专门的理由（"已安装但不可用（可在 CLI 工具管理页检测并修复）"）。
+ */
+function wasInstalled(item: RunnerAgentItem | undefined): boolean {
+  return Boolean(item?.installKindUsed || item?.binaryPath);
+}
+
 /** 「当前版本」那一行怎么念。**没装**与**版本未知**是两件事。 */
 export function currentVersionLine(item: RunnerAgentItem | undefined): { text: string; tone: "plain" | "none" } {
   if (!item) return { text: "状态未知", tone: "none" };
-  if (!item.installed) return { text: "未安装", tone: "none" };
+  if (!item.installed) {
+    // 登记里装过、但现在跑不起来：**不是"未安装"**。
+    if (wasInstalled(item)) return { text: "已安装（当前不可用）", tone: "none" };
+    return { text: "未安装", tone: "none" };
+  }
   return { text: item.version || "已安装", tone: "plain" };
 }
 
@@ -562,8 +578,67 @@ export function buildToolCard(input: ToolCardInput): ToolCard {
     return card;
   }
 
-  // ③ 没装：给"装"或"为什么装不了"。
+  // ③ `installed=false` 这一档其实有**三件截然不同的事**，下一步也各不相同，
+  //    不能共用同一句话（服务端把它们的理由分得很开，见 agent_probe.go 的
+  //    agentUnavailableReasonText）。
   if (!installed) {
+    // ③-1 这个执行环境**不提供**该工具：不是"没装"，是"换环境"。
+    // `updateSupported=false` 正是服务端给出的这个判据（unsupported 那一档）。
+    if (item.updateSupported === false) {
+      card.icon = "unknown";
+      card.statusTone = "muted";
+      card.statusText = "这个执行环境不提供该工具。";
+      card.note = item.installBlockedReason || "这个执行环境不提供该工具。";
+      card.noteTone = "muted";
+      return card;
+    }
+    // ③-2 登记里装过、但现在跑不起来：**不是"没装"**。下一步是"检测并修复"，
+    //    不是"再装一次"—— 那正是服务端那句「已安装但不可用」要说的。
+    if (wasInstalled(item)) {
+      // 装了但**没登录**：下一步是登录。CLI 自报"没有凭据"是件具体事。
+      //
+      // ⚠️ 顺序：**症状优先于登录态**。诊断是实测（"二进制跑不起来"），登录态是
+      // CLI 自报；两者同时成立时，登录完也修不好 —— 先说更硬的那条。
+      // 但登录入口两种情况下都要给：loginSlotFor 要求 installed，而这一档
+      // installed=false（它现在用不了）。不补的话，Codex 那种"装了没登录"的用户
+      // 在这一页上既看不到原因，也没有登录入口。
+      const loggedOut = input.authStatus === "logged_out";
+      card.icon = "alert";
+      card.statusTone = noteworthy ? noteworthy.tone : loggedOut ? "warn" : "bad";
+      card.statusText = noteworthy
+        ? noteworthy.summary
+        : loggedOut
+          ? "已安装，但还没登录，登录之后才能用。"
+          : "已安装，但当前用不了。";
+      // ⚠️ 这一句**不照抄服务端原文**：那原文是给对话页与手机端看的
+      // （「可在 CLI 工具管理页检测并修复」在**这一页**里是自指）。原文照旧
+      // 不丢，挪进详情抽屉 —— 那里才是排查素材该待的地方。
+      card.note = loggedOut
+        ? "登录之后若仍不可用，按「详情」里的证据处理。"
+        : "已安装但当前不可用，按「详情」里的证据处理。";
+      card.noteTone = "warn";
+      if (loggedOut) {
+        card.login = "not-logged-in";
+        card.loginBlocked = true;
+      }
+      // 下一步只给一个：
+      // ① 症状明确、且服务端给了修复动作 → 「修好它」。**实测问题优先**：登录修不好
+      //    一个坏掉的二进制，此时给"登录"会把用户带偏。
+      // ② 没症状、只是没登录 → 「登录」（且不给"修好它"：平台没得修）。
+      // ③ 都没有 → 进抽屉看证据，不给点了没反应的按钮。
+      if (noteworthy && remedies.length > 0) {
+        card.primary = { kind: "repair", label: "修好它", remedies };
+      } else if (loggedOut) {
+        card.canOpenDetails = true;
+      } else if (remedies.length > 0) {
+        card.primary = { kind: "repair", label: "修好它", remedies };
+      } else {
+        card.canOpenDetails = true;
+      }
+      if (item.reason) card.detailNotes.push(item.reason);
+      return card;
+    }
+    // ③-3 真的没装：给"装"或"为什么装不了"。
     card.icon = installable ? "off" : "unknown";
     card.statusTone = "muted";
     card.statusText = "还没装。";

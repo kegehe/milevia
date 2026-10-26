@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,23 +87,59 @@ func summarizeMCPToolInput(raw json.RawMessage) string {
 	if trimmed == "" {
 		return ""
 	}
-	var decoded map[string]any
+	var decoded any
 	if json.Unmarshal(raw, &decoded) != nil {
-		return truncateAuditText(trimmed, mcpAuditArgsLimit)
+		// 非对象 JSON 也要过 URL 凭据脱敏，否则一行 `postgres://u:p@host` 会原文落库。
+		return truncateAuditText(redactMCPURLUserinfo(trimmed), mcpAuditArgsLimit)
 	}
-	redacted := make(map[string]any, len(decoded))
-	for key, value := range decoded {
-		if looksLikeSecretKey(key) {
-			redacted[key] = "***"
-			continue
-		}
-		redacted[key] = value
-	}
-	encoded, err := json.Marshal(redacted)
+	encoded, err := json.Marshal(redactMCPValue(decoded))
 	if err != nil {
-		return truncateAuditText(trimmed, mcpAuditArgsLimit)
+		return truncateAuditText(redactMCPURLUserinfo(trimmed), mcpAuditArgsLimit)
 	}
 	return truncateAuditText(string(encoded), mcpAuditArgsLimit)
+}
+
+// redactMCPValue 递归脱敏：密钥看键名（任意层级），字符串值里的 URL userinfo 一律替换。
+// 只处理顶层时，`{"headers":{"Authorization":"Bearer …"}}` 这种最常见的形状会整段落库。
+func redactMCPValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		// 常见的 [{"name":"Authorization","value":"Bearer ..."}] 形状：键名本身不可疑，
+		// 但 name/key 字段点出了这是凭据，对应的 value 必须打码。
+		secretName := ""
+		for _, nameKey := range []string{"name", "key"} {
+			if name, ok := typed[nameKey].(string); ok && looksLikeSecretKey(name) {
+				secretName = name
+			}
+		}
+		for key, child := range typed {
+			if looksLikeSecretKey(key) || (secretName != "" && key == "value") {
+				out[key] = "***"
+				continue
+			}
+			out[key] = redactMCPValue(child)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for index, child := range typed {
+			out[index] = redactMCPValue(child)
+		}
+		return out
+	case string:
+		return redactMCPURLUserinfo(typed)
+	default:
+		return value
+	}
+}
+
+// 贪婪匹配到第一个路径分隔符之前的最后一个 @：密码里未转义的 @ 也能整段吃掉。
+// 例：postgres://user:p@ss@host/db → postgres://***@host/db。
+var mcpURLUserinfoPattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/\s]*@`)
+
+func redactMCPURLUserinfo(text string) string {
+	return mcpURLUserinfoPattern.ReplaceAllString(text, "${1}***@")
 }
 
 func truncateAuditText(text string, limit int) string {
@@ -232,6 +270,7 @@ func (s *Server) recordMCPCallStart(ctx context.Context, conversationID, runID, 
 		(id,tool_use_id,conversation_id,run_id,server_name,tool_name,args_preview,decision,status,error_text,duration_ms,created_at,updated_at)
 		values (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		"audit_"+uuid.NewString(), toolUseID, conversationID, runID, server, tool, preview, decision, "pending", "", 0, now, now)
+	s.noteMCPAuditWrite(ctx)
 }
 
 // recordMCPCallFinish 回填一次 MCP 工具调用的执行结果。
@@ -260,6 +299,7 @@ func (s *Server) recordMCPCallFinish(ctx context.Context, conversationID, runID,
 		(id,tool_use_id,conversation_id,run_id,server_name,tool_name,args_preview,decision,status,error_text,duration_ms,created_at,updated_at)
 		values (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		"audit_"+uuid.NewString(), toolUseID, conversationID, runID, server, tool, "", "", status, errorText, 0, now, now)
+	s.noteMCPAuditWrite(ctx)
 }
 
 // mcpToolResultStatus 从 PostToolUse 的 tool_response 判断执行结果。
@@ -313,11 +353,28 @@ type mcpAuditResponse struct {
 	Total   int            `json:"total"`
 }
 
+// mcpAuditWriteCounter 让写路径每 128 次修剪一次保留上限。写路径每次都跑子查询会把
+// 延迟带进工具调用主链路，永不修剪又会让从不打开审计页的实例无限增长。
+var mcpAuditWriteCounter atomic.Int64
+
+func (s *Server) noteMCPAuditWrite(ctx context.Context) {
+	if mcpAuditWriteCounter.Add(1)%128 != 0 {
+		return
+	}
+	_ = s.trimMCPCallAudit(ctx)
+}
+
+func (s *Server) trimMCPCallAudit(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `delete from mcp_call_audit where id not in (
+		select id from mcp_call_audit order by created_at desc, id desc limit ?)`, mcpAuditRetention)
+	return err
+}
+
 func (s *Server) listMCPCallAudit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	// 保留上限内的记录：读接口顺手清理，避免写路径每次都跑一遍子查询。
-	if _, err := s.db.ExecContext(ctx, `delete from mcp_call_audit where id not in (
-		select id from mcp_call_audit order by created_at desc, id desc limit ?)`, mcpAuditRetention); err != nil {
+	// 保留上限内的记录：读接口顺手清理；写路径每 128 次也会做一次（见 noteMCPAuditWrite），
+	// 否则从不打开审计页的实例会无限增长。
+	if err := s.trimMCPCallAudit(ctx); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

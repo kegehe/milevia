@@ -237,6 +237,8 @@
 .system-card.compact_result.failed { border-left-color: #c65343; background: #fff5f3; }
 .system-card.compact_boundary { border-left-color: #5a6b8a; }
 .system-card.api_retry { border-left-color: #b8923a; background: #fbf7ed; }
+/* 会话启动/恢复阶段：中性灰蓝 —— 它描述"还没开始说话"，不该像压缩/重试那样抢注意力。 */
+.system-card.session { border-left-color: #6f7d8c; background: #f3f5f7; }
 .system-card.task { border-left-color: #7a6b9a; background: #f6f3fa; }
 .system-card.task.info .system-card-icon { color: #5d4f86; background: #e5ddf2; }
 .system-card.task.success { border-left-color: #2c7567; background: #eef6f4; }
@@ -2084,27 +2086,38 @@
   padding: 14px 24px 18px;
   background: #f8fcf9;
 }
-.composer textarea {
+/* 输入区是 contenteditable div（粘贴超长文本会成为内联卡片，textarea 做不到）。
+   style.css 只给 button/textarea 设了 font:inherit，div 必须自己补；
+   其余盒子样式逐条重申自原 .composer textarea 规则，不能省。 */
+.composer .composer-edit {
+  display: block;
+  width: 100%;
   min-height: 88px;
-  border-color: #bdd8ca;
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid #bdd8ca;
   border-radius: 8px;
   padding: 13px 14px;
   color: #19332c;
   background: #fff;
   box-shadow: inset 0 1px 1px #17362c08;
+  font: inherit;
   font-size: 14px;
   line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
 }
-.composer textarea::placeholder { color: #8aa096; }
-.composer textarea:hover:not(:disabled) { border-color: #9dc9b8; }
-.composer textarea:focus {
+.composer .composer-edit:empty::before { content: attr(data-placeholder); color: #8aa096; pointer-events: none; }
+.composer .composer-edit:hover:not([data-disabled]) { border-color: #9dc9b8; }
+.composer .composer-edit:focus {
   border-color: #55a697;
   outline: 0;
   background: #fcfffd;
   box-shadow: 0 0 0 3px #dff1e7, inset 0 1px 1px #17362c08;
 }
-.composer textarea:disabled { color: #80958b; background: #f2f7f3; }
+.composer .composer-edit:focus-visible { outline: 0; }
+.composer .composer-edit[data-disabled] { color: #80958b; background: #f2f7f3; cursor: default; }
 
 /* ── 浮岛卡：文本区与工具坞合在一张白卡里，卡是唯一的边框；焦点态由卡片接管 ── */
 .composer-card {
@@ -2118,17 +2131,111 @@
   border-color: #55a697;
   box-shadow: 0 0 0 3px #dff1e7, inset 0 1px 1px #17362c08, 0 12px 30px #17362c0f;
 }
-/* 卡内 textarea 不再自带边框：`.composer textarea:focus` (0,2,1) 被 (0,3,1) 压过，勿合并选择器。
-   禁用态灰底 (0,2,1) 与卡内规则同特异性、但在源码更早处——需在此显式列出，否则被透明底盖掉。 */
-.composer-card .composer-input-area textarea { border: 0; background: transparent; box-shadow: none; }
-.composer-card .composer-input-area textarea:hover:not(:disabled),
-.composer-card .composer-input-area textarea:focus {
+/* 卡内编辑器不再自带边框：`.composer .composer-edit:focus` (0,3,0) 被这里的 (0,4,0) 压过，勿合并选择器。
+   禁用态灰底也必须在此显式列出——与卡内透明底同源码位置更早时会被盖掉（原 textarea 踩过同一格）。 */
+.composer-card .composer-input-area .composer-edit { border: 0; background: transparent; box-shadow: none; }
+.composer-card .composer-input-area .composer-edit:hover:not([data-disabled]),
+.composer-card .composer-input-area .composer-edit:focus {
   border-color: transparent;
   background: transparent;
   box-shadow: none;
   outline: 0;
 }
-.composer-card .composer-input-area textarea:disabled { border-color: transparent; background: #f2f7f3; }
+.composer-card .composer-input-area .composer-edit[data-disabled] { border-color: transparent; background: #f2f7f3; }
+
+/* ── 粘贴超长文本的内联卡片 ──
+   显示层是卡片，发送时由 lib/composer-paste.ts 的 serializeComposer 还原为完整原文。
+   颜色全部取本页既有色板（胶囊 #f2f5f3 / 分隔 #e3ece7 / 次文字 #31594f / 安静 #748b81），
+   移除键的红色沿用 .composer-icon-btn.danger 的 #ad4835 系，不另造暖色。 */
+.composer .paste-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 300px;
+  margin: 0 5px;
+  padding: 2px 9px;
+  border: 1px solid #e3ece7;
+  border-radius: 8px;
+  background: #f2f5f3;
+  color: #31594f;
+  font-size: 12px;
+  line-height: 1.6;
+  vertical-align: middle;
+  cursor: default;
+  user-select: none;
+  transition: border-color .15s ease, background .15s ease;
+}
+.composer .paste-card:hover { border-color: #55a697; background: #ecf3ee; }
+.composer .paste-card-text { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.composer .paste-card-meta { flex: none; color: #748b81; font-size: 11px; }
+.composer .paste-card-x {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: #fdf1ee;
+  color: #ad4835;
+  font: inherit;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.composer .paste-card-x:hover { background: #f9e0da; }
+/* 禁用态（只读会话/发送中…）编辑器里的卡片不许删：JS 侧有 closest("[data-disabled]") 守卫，
+   这里把指针事件一并关掉做视觉与触控双兜底。悬浮看原文不受影响。 */
+.composer .composer-edit[data-disabled] .paste-card-x { pointer-events: none; opacity: .5; }
+
+/* 悬浮原文浮层：由 lib/composer-paste.ts 挂到 body 上（fixed 定位）——
+   编辑区是 overflow:auto 的滚动容器，卡片内的 absolute 浮层会被裁掉，所以不能作用域在 .composer 里。
+   z-index 取 25：盖过正文与 20 的分支弹层，让位 30 的模态背板。 */
+.paste-pop {
+  position: fixed;
+  z-index: 25;
+  display: none;
+  flex-direction: column;
+  width: min(640px, 80vw);
+  border: 1px solid #dfe9e2;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 2px 10px #17362c12, 0 16px 44px #17362c1f;
+  overflow: hidden;
+  cursor: default;
+  user-select: text;
+  animation: paste-pop-in .14s ease-out;
+}
+@keyframes paste-pop-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.paste-pop-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #e3ece7;
+  background: #f7fbf8;
+  color: #748b81;
+  font-size: 11.5px;
+}
+.paste-pop-title { flex: none; font-weight: 600; color: #19332c; font-size: 12.5px; }
+.paste-pop-sep { flex: none; color: #c8d6cd; }
+.paste-pop-hint { margin-left: auto; }
+.paste-pop-body {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 12px 16px 14px;
+  color: #19332c;
+  font-size: 12.5px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* flex-wrap 必须在基类、不能只放 ≤820px 那条 media query：视口宽度不是工具坞宽度的可靠代理 ——
    右侧任务栏在 1200px 变成栅格第三列（对话区骤降到 510px）、821–905px 这一段又是一个窄档，
@@ -2755,7 +2862,7 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 }
 
 @media (max-width: 480px) {
-  .composer textarea { min-height: 78px; }
+  .composer .composer-edit { min-height: 78px; }
   .composer-dock { row-gap: 6px; }
   .composer-icon-btn { width: 30px; height: 30px; }
 }
@@ -3976,7 +4083,7 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 .composer-skill-ref-remove:hover:not(:disabled) { color: #fff; background: #2c7567; }
 .composer-skill-ref-remove:disabled { color: #9db3a9; }
 .composer-input-area { position: relative; }
-.composer-input-area textarea { padding-right: 54px; }
+.composer-input-area .composer-edit { padding-right: 54px; }
 .composer-history-position {
   position: absolute;
   z-index: 1;
@@ -3996,7 +4103,7 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
   .task-queue-rail { grid-row: 1; }
   .chat-center { grid-row: 2; }
 
-  .composer-input-area textarea { padding-right: 54px; }
+  .composer-input-area .composer-edit { padding-right: 54px; }
   .composer-mobile-shortcut-toggle {
     position: absolute;
     right: 8px;

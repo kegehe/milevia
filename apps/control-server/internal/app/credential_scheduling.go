@@ -205,6 +205,8 @@ func (s *Server) migrateCredentialScheduling(ctx context.Context) error {
 	// Insight quota runs are intentionally ephemeral. If the process stopped
 	// before runReadOnlyAgent's cleanup callback ran, remove their synthetic
 	// conversations on the next startup so they never leak into history.
+	// 这些会话若被通知引用，由更后面的 pruneOrphanedNotifications 一并清掉
+	// （notifications 表在这里还没建）。
 	if _, err := s.db.ExecContext(ctx, `delete from conversations where id like 'insight-quota-%'`); err != nil {
 		return err
 	}

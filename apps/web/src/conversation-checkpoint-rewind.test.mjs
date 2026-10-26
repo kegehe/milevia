@@ -60,15 +60,19 @@ test("节点列表跟着回合刷新，否则刚跑完的那一轮永远不出�
 test("确认框说清代价：丢几轮、代码会不会被改回去、两端同一份文案", () => {
   // 回退是不可撤销的破坏性操作：早先那句"这会停止当前会话上下文"既没说丢几轮，
   // 也没说快照之后新建的文件会被删除。文案收口在 lib/conversation-rewind，两端共用。
-  assert.match(conversationPage, /import \{ checkpointHasCode, rewindConfirmMessage, rewindHint, rewindPrimaryMode \} from "\.\.\/lib\/conversation-rewind";/);
+  assert.match(conversationPage, /import \{ checkpointHasCode, rewindConfirmAction, rewindConfirmBody, rewindConfirmTitle, rewindHint, rewindPrimaryMode \} from "\.\.\/lib\/conversation-rewind";/);
   assert.match(conversationPage, /const request = \{ mode, fork, discarded: discardedTurnsAfter\(checkpoint\) \};/);
-  assert.match(conversationPage, /window\.confirm\(rewindConfirmMessage\(checkpoint, request\)\)/);
+  // 桌面端用自绘 ConfirmDialog（标题 + 正文分开），不再弹原生 window.confirm。
+  assert.match(conversationPage, /title: rewindConfirmTitle\(request\),\s*message: rewindConfirmBody\(checkpoint, request\),\s*confirmLabel: rewindConfirmAction\(request, false\),\s*busyLabel: rewindConfirmAction\(request, true\),/);
+  assert.doesNotMatch(conversationPage, /window\.confirm\(/);
   // 手机端的两个数（默认动作 / 会丢几轮）在一次渲染里算一次，判据与桌面端同源。
   assert.match(mobilePage, /const rewindRequest = rewindTarget \? \{ mode: rewindPrimaryMode\(rewindTarget\), discarded: rewindDiscardedTurns\(rewindTarget\) \} : null;/);
-  assert.match(mobilePage, /rewindConfirmMessage\(rewindTarget, rewindRequest\)/);
+  assert.match(mobilePage, /<h2 id="mobile-rewind-title">\{rewindConfirmTitle\(rewindRequest\)\}<\/h2>/);
+  // 标题已经在 h2 里，正文不能再重复一遍标题 —— 两端都吃 rewindConfirmBody。
+  assert.match(mobilePage, /<p>\{rewindConfirmBody\(rewindTarget, rewindRequest\)\}<\/p>/);
   // 手机端**只**有一次确认：确认框本身就是那一层（再套一个原生 window.confirm 等于对同一个
   // 不可撤销动作确认两次，而手机端别处从不使用原生 confirm）。
-  assert.doesNotMatch(mobilePage, /window\.confirm\(rewindConfirmMessage/);
+  assert.doesNotMatch(mobilePage, /window\.confirm\(/);
   assert.match(mobilePage, /const request = \{ mode: rewindPrimaryMode\(target\), discarded: rewindDiscardedTurns\(target\) \};\s*setRewindTarget\(null\);/);
   // 丢几轮 = 节点之后还剩几条顶层用户消息（子代理消息不算一轮）。
   assert.match(conversationPage, /messages\.filter\(\(message\) => message\.role === "user" && !message\.parentToolUseId && message\.createdAt > checkpoint\.createdAt\)\.length/);

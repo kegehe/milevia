@@ -29,6 +29,7 @@ func parseCodexProjectMCPConfig(raw string) (map[string]claudeMCPServer, map[str
 	lines := strings.Split(normalizeTOMLText(raw), "\n")
 	currentServer := ""
 	currentEnvTable := ""
+	currentServerTable := false
 	for index := 0; index < len(lines); index++ {
 		line := strings.TrimSpace(stripTOMLComment(lines[index]))
 		if line == "" {
@@ -37,12 +38,12 @@ func parseCodexProjectMCPConfig(raw string) (map[string]claudeMCPServer, map[str
 		if strings.HasPrefix(line, "[") {
 			section, ok := tomlSectionName(line)
 			if !ok {
-				currentServer, currentEnvTable = "", ""
+				currentServer, currentEnvTable, currentServerTable = "", "", false
 				continue
 			}
 			parts := splitTOMLPath(section)
 			if len(parts) < 2 || parts[0] != "mcp_servers" {
-				currentServer, currentEnvTable = "", ""
+				currentServer, currentEnvTable, currentServerTable = "", "", false
 				continue
 			}
 			name := parts[1]
@@ -51,6 +52,9 @@ func parseCodexProjectMCPConfig(raw string) (map[string]claudeMCPServer, map[str
 			}
 			currentServer = name
 			currentEnvTable = ""
+			// 只有 [mcp_servers.x] 这一层是 server 自己的字段；[mcp_servers.x.*]
+			// 是子表（env 有专门处理，其它子表不应把同名键归给 server）。
+			currentServerTable = len(parts) == 2
 			if len(parts) == 3 && parts[2] == "env" {
 				currentEnvTable = name
 			}
@@ -102,8 +106,14 @@ func parseCodexProjectMCPConfig(raw string) (map[string]claudeMCPServer, map[str
 				server.Headers = mergeStringMaps(server.Headers, values)
 			}
 		case "enabled":
-			if disabled, ok := parseTOMLBool(valueRaw); ok && !disabled {
-				warnings[currentServer] = append(warnings[currentServer], "该 server 在 Codex 配置中标为 enabled = false（已停用），导入后默认启用")
+			if !currentServerTable {
+				continue
+			}
+			if enabled, ok := parseTOMLBool(valueRaw); ok {
+				server.Enabled = &enabled
+				if !enabled {
+					warnings[currentServer] = append(warnings[currentServer], "该 server 在 Codex 配置中标为 enabled = false（已停用），导入时会跳过")
+				}
 			}
 		case "bearer_token_env_var":
 			if name, ok := parseTOMLString(valueRaw); ok && strings.TrimSpace(name) != "" {

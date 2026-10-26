@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   checkpointHasCode,
   rewindConfirmAction,
+  rewindConfirmBody,
   rewindConfirmMessage,
   rewindConfirmTitle,
   rewindHint,
@@ -80,6 +81,16 @@ test("确认文案说清丢几轮与代码的后果", () => {
   const fork = rewindConfirmMessage(node(), { mode: "conversation_and_code", fork: true, discarded: 5 });
   assert.match(fork, /原会话保持不变，新会话从这个节点继续。/);
   assert.match(fork, /此后 5 轮对话将不再显示。/);
+});
+
+// 桌面端用 ConfirmDialog：标题与正文分开，正文不能再把标题重复一遍；
+// 手机端仍然只吃一句合成文案，两种壳共享同一份正文。
+test("正文与标题分开，合成文案仍包含两者", () => {
+  const request = { mode: "conversation_and_code" as const, discarded: 2 };
+  const body = rewindConfirmBody(node(), request);
+  assert.doesNotMatch(body, /^恢复代码和对话？/);
+  assert.match(body, /此后 2 轮对话将不再显示。$/);
+  assert.equal(rewindConfirmMessage(node(), request), `恢复代码和对话？${body}`);
 });
 
 // 丢了 0 轮时不许出现"此后 0 轮对话将不再显示"。

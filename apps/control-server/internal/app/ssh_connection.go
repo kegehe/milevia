@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -367,16 +368,20 @@ func (s *Server) getSSHProfile(w http.ResponseWriter, r *http.Request) {
 // preflightSSHConnection verifies the selected profile or manual settings
 // before they are persisted. The returned host key must be confirmed on save.
 // When connectionId is supplied (edit mode), stored secrets are reused so the
-// preflight can actually connect without re-entering the password or key path.
+// preflight can actually connect without re-entering the password or key path,
+// and a stored host key is enforced as a strict pin while host/port stay the
+// same — a changed key is reported separately (hostKeyChanged) so the user can
+// re-verify both fingerprints before re-pinning on save.
 func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) {
 	var input sshConnectionInput
 	if !decode(w, r, &input) {
 		return
 	}
+	var existing *SSHConnection
 	if strings.TrimSpace(input.ConnectionID) != "" {
 		input.Update = true
-		existing, err := s.loadSSHConnection(r.Context(), strings.TrimSpace(input.ConnectionID))
-		if err == nil {
+		if current, err := s.loadSSHConnection(r.Context(), strings.TrimSpace(input.ConnectionID)); err == nil {
+			existing = current
 			// 凭据不回显到前端，编辑预检时沿用已保存的密码/私钥路径，使预检能真正连上远端。
 			// 仅补全当前认证方式对应的凭据，切换认证方式时不携带旧凭据，避免 newSSHClient
 			// 因残留密码而误用密码认证。
@@ -403,6 +408,18 @@ func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// 编辑时若目标没变（host/port 与已保存连接一致），把已保存的主机指纹当作严格
+	// pin 校验：否则一次普通编辑会以 TOFU 接受任何主机键，并在保存时覆盖 known_hosts，
+	// 用户即使勾了「已核对」也没有旧值可比对。目标变了就是另一台机器，旧 pin 不适用。
+	// resolve 可能用 SSH Profile 覆盖 host/port，所以判断必须放在它之后。
+	var pinnedHostKey, savedFingerprint string
+	if existing != nil && existing.KnownHosts != "" && strings.EqualFold(strings.TrimSpace(existing.Host), strings.TrimSpace(input.Host)) && existing.Port == input.Port {
+		if _, err := parsePinnedHostKey(existing.KnownHosts); err == nil {
+			pinnedHostKey = existing.KnownHosts
+			savedFingerprint = hostKeyFingerprint(pinnedHostKey)
+			input.HostKey = pinnedHostKey
+		}
+	}
 	connection := input.connection()
 	client, err := newSSHClient(connection, true)
 	if err != nil {
@@ -412,6 +429,19 @@ func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) 
 	defer client.close()
 	checks := map[string]bool{"ssh": false, "sftp": false, "claude": false, "approvalTunnel": false}
 	if _, err := client.execCommand(r.Context(), "echo ok"); err != nil {
+		// 已 pin 的连接握手失败时，先看是不是主机指纹变了：这需要用户重新核对后
+		// 显式确认，不能混在普通连接错误里（否则用户只知道连不上，不知道原因）。
+		if pinnedHostKey != "" {
+			if saved, changed := pinnedHostKeyMismatch(pinnedHostKey, client.lastHostKey); changed {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"ok": false, "checks": checks,
+					"hostKey": client.lastHostKey, "fingerprint": hostKeyFingerprint(client.lastHostKey),
+					"savedFingerprint": saved, "hostKeyChanged": true,
+					"error": "远端主机指纹与已保存的不一致，请先核对主机真实性再决定是否重新固定。",
+				})
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "checks": checks, "error": errorText(err)})
 		return
 	}
@@ -421,7 +451,9 @@ func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	checks["sftp"] = true
-	if output, err := client.execCommand(r.Context(), "command -v claude && claude --version"); err == nil && strings.TrimSpace(string(output)) != "" {
+	// 前置平台托管的目录：平台在远端装的那份 Claude 不在非交互 shell 的 PATH 上，
+	// 不前置就会把"装好了"说成"远端没有 claude"（与 sshRemoteCommand 同一条理由）。
+	if output, err := client.execCommand(r.Context(), sshRemoteCommand("command -v claude && claude --version")); err == nil && strings.TrimSpace(string(output)) != "" {
 		checks["claude"] = true
 	}
 	if _, err := client.startApprovalTunnel(r.Context(), s.config.ControlURL); err == nil {
@@ -434,7 +466,7 @@ func (s *Server) preflightSSHConnection(w http.ResponseWriter, r *http.Request) 
 	if !checks["claude"] {
 		errorText = "远端未检测到可用的 Claude Code"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "claudeReady": checks["claude"], "checks": checks, "hostKey": client.lastHostKey, "fingerprint": hostKeyFingerprint(client.lastHostKey), "resolved": map[string]any{"host": connection.Host, "port": connection.Port, "user": connection.User, "privateKeyPath": connection.PrivateKeyPath}, "error": errorText})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "claudeReady": checks["claude"], "checks": checks, "hostKey": client.lastHostKey, "fingerprint": hostKeyFingerprint(client.lastHostKey), "savedFingerprint": savedFingerprint, "resolved": map[string]any{"host": connection.Host, "port": connection.Port, "user": connection.User, "privateKeyPath": connection.PrivateKeyPath}, "error": errorText})
 }
 
 func hostKeyFingerprint(rawKey string) string {
@@ -443,6 +475,22 @@ func hostKeyFingerprint(rawKey string) string {
 		return ""
 	}
 	return ssh.FingerprintSHA256(key)
+}
+
+// pinnedHostKeyMismatch 判断本次握手呈现的主机公钥是否与已保存的 pin 不同。
+// 返回已保存指纹（供界面并排展示）与比较结果；呈现的键为空或无法解析时视为
+// "无法判断"，交给调用方按普通连接错误处理（例如握手前就被拒绝）。
+func pinnedHostKeyMismatch(pinnedRaw, presentedRaw string) (string, bool) {
+	pinned, err := parsePinnedHostKey(pinnedRaw)
+	if err != nil {
+		return "", false
+	}
+	saved := ssh.FingerprintSHA256(pinned)
+	presented, err := parsePinnedHostKey(presentedRaw)
+	if err != nil {
+		return saved, false
+	}
+	return saved, !bytes.Equal(pinned.Marshal(), presented.Marshal())
 }
 
 func (s *Server) listSSHConnections(w http.ResponseWriter, r *http.Request) {
@@ -720,6 +768,7 @@ func (s *Server) deleteSSHConnection(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.runnerRegistry.unregister(runnerID)
+	s.invalidateAgentReadings(runnerID)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
@@ -805,6 +854,8 @@ func (s *Server) disconnectSSHConnection(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.runnerRegistry.unregister(runnerID)
+	// 连接断了，那台机器上的读数从这一刻起就是过期的（下次连上可能是另一台了）。
+	s.invalidateAgentReadings(runnerID)
 	writeJSON(w, http.StatusOK, sanitizedSSHConnection(*c))
 }
 
@@ -937,6 +988,11 @@ func (s *Server) tryConnectAndRegister(ctx context.Context, c *SSHConnection) (e
 		s.terminals.closeRunner(runnerID)
 	}
 	s.runnerRegistry.register(runnerID, runner, meta)
+	// 换掉的可能是**另一台机器**（改了主机 / 账号 / root 之后重连），而读数缓存
+	// 是按 runnerID 存的 —— 不作废的话，旧环境的读数会继续被回放，最多 5 分钟
+	// （agent_readings.go 的 agentReadingsTTL）。手动「重新检查」能绕过，但不该
+	// 让用户先看到一份旧读数再自己发现。
+	s.invalidateAgentReadings(runnerID)
 	if oldSSH, ok := oldRunner.(*sshRunner); ok {
 		_ = oldSSH.client.close()
 	}

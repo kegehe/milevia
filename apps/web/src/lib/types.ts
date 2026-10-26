@@ -60,7 +60,7 @@ export type ToolAction = { id: string; runId: string; name: string; input: Recor
 export type AgentStatus = "pending" | "running" | "completed" | "failed" | "stopped" | "unresolved";
 export type SSHProfile = { host: string; port: number; user: string; privateKeyPath: string };
 export type SSHConnection = { id: string; name: string; host: string; port: number; user: string; authMethod: "key" | "password"; privateKeyPath?: string; rootPath: string; status: string; lastSeen?: string | null; errorMsg?: string; createdAt?: string };
-export type SSHPreflightResult = { ok: boolean; claudeReady?: boolean; hostKey?: string; fingerprint?: string; checks?: Record<string, boolean>; error?: string; resolved?: SSHProfile };
+export type SSHPreflightResult = { ok: boolean; claudeReady?: boolean; hostKey?: string; fingerprint?: string; savedFingerprint?: string; hostKeyChanged?: boolean; checks?: Record<string, boolean>; error?: string; resolved?: SSHProfile };
 export type MCPTransport = "stdio" | "http" | "sse";
 export type MCPScope = "global" | "project";
 export type MCPServer = {
@@ -93,6 +93,8 @@ export type MCPServer = {
 export type MCPProjectView = {
   projectId: string;
   environment: string;
+  /** 生效列表按哪个 Agent 计算（服务端默认 claude-code）。 */
+  agentId?: string;
   strictMode: boolean;
   // 放行项目根目录的 .mcp.json（关闭 strict 的等价开关）。开启后项目自带的 MCP
   // 配置会一并生效，代价是绕过了 Milevia 的白名单与审计，故需二次确认。
@@ -111,6 +113,8 @@ export type MCPProjectBinding = {
   enabled: boolean;
   // overridden 表示该项目显式关掉了这条全局 server（默认无覆盖即启用）。
   overridden: boolean;
+  // 定义本身是否启用。项目级定义被停用时，项目开关无法把它打开（开关只维护覆盖行）。
+  definitionEnabled?: boolean;
 };
 export type MCPToolFlag = { code: string; label: string; detail?: string; severity: "info" | "warn" | "danger"; note?: string };
 export type MCPToolInfo = {
@@ -164,6 +168,8 @@ export type MCPImportCandidate = {
   conflict: boolean;
   conflictWith?: string;
   skipReason?: string;
+  /** 预览时的非敏感配置摘要；确认导入原样回传，服务端据此拒绝“预览后来源已变化”。 */
+  fingerprint?: string;
   // 解析到但未导入的键（如 Codex 的 bearer_token_env_var）——提示用户手工补配。
   warnings?: string[];
 };
@@ -307,7 +313,7 @@ export type ModelUsage = { model: string; inputTokens: number; outputTokens: num
 export type RunUsage = { runId: string; conversationId: string; available: boolean; reason?: string; status: string; model: string; contextWindow: number; contextInputTokens: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; durationMs: number; ttftMs: number; terminalReason: string; hasResult: boolean; startedAt?: string; completedAt?: string; models: ModelUsage[] };
 export type ConversationUsage = { taskCount: number; agentTurns: number; modelSteps: number; toolCalls: number; subagentCount: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; estimatedCostUsd: number };
 export type ConversationUsageResponse = { conversationId: string; available: boolean; reason?: string; context: RunUsage; currentRun?: RunUsage; latestRun?: RunUsage; session: ConversationUsage; models: ModelUsage[] | null };
-export type SystemVariant = "compact" | "compact_result" | "compact_boundary" | "api_retry" | "task";
+export type SystemVariant = "compact" | "compact_result" | "compact_boundary" | "api_retry" | "session" | "task";
 export type SystemItem = { id: string; createdAt: string; runId: string; variant: SystemVariant; title: string; detail?: string; metadata?: Record<string, unknown> };
 export type TimelineItem =
   | { kind: "message"; id: string; createdAt: string; message: Message }

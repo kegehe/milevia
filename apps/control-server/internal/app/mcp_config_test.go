@@ -106,6 +106,20 @@ func TestResolveMCPPlaceholders(t *testing.T) {
 	if got := resolveMCPPlaceholders(`${PROJECT_DIR}/docs`, agentTargetEnvWSL, `D:\proj`); got != "/mnt/d/proj/docs" {
 		t.Fatalf("wsl resolve = %q", got)
 	}
+	// wsl-local 项目路径是 UNC：必须转成 WSL 内的 Linux 路径，而不是 //wsl$/...。
+	for _, projectPath := range []string{
+		`\\wsl$\Ubuntu\home\me\proj`,
+		`\\wsl.localhost\Ubuntu\home\me\proj`,
+		`\\WSL$\Ubuntu\home\me\proj`,
+	} {
+		if got := resolveMCPPlaceholders(`${PROJECT_DIR}/docs`, agentTargetEnvWSL, projectPath); got != "/home/me/proj/docs" {
+			t.Fatalf("wsl unc resolve(%q) = %q", projectPath, got)
+		}
+	}
+	// 非 WSL 的 UNC（普通共享盘）没有 Linux 等价路径，保持原有的斜杠归一化行为。
+	if got := resolveMCPPlaceholders(`${PROJECT_DIR}/docs`, agentTargetEnvWSL, `\\server\share\proj`); got != "//server/share/proj/docs" {
+		t.Fatalf("non-wsl unc resolve = %q", got)
+	}
 	// 其它 ${VAR} 占位符保持原样，交给 CLI 按进程环境展开。
 	if got := resolveMCPPlaceholders("${HOME}/.config", agentTargetEnvWindows, `D:\proj`); got != "${HOME}/.config" {
 		t.Fatalf("home placeholder should be preserved: %q", got)

@@ -115,6 +115,19 @@ func (s *Server) listRunnerAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 通道级健康检查：**先问一次通不通，再去探测工具**。
+	//
+	// 跨端 runner 若"现在连不上"，那批工具探测会全部失败，而失败会被读成
+	// 「未安装」—— 把"联系不上"说成"没装"，用户被支去装一个装不上的东西。
+	// 这一档必须报成 probeOk=false（"无法检测"），与"未安装"分开。
+	if healthy, reason := s.probeChannelHealth(r.Context(), meta); !healthy {
+		writeJSON(w, http.StatusOK, runnerAgentsView{
+			RunnerID: runnerID, ProbeOK: false, ProbeError: reason,
+			Items: []runnerAgentView{}, Runtime: nil,
+		})
+		return
+	}
+
 	// force=true（手动「重新检查」）才绕过读数缓存，见 agent_readings.go。
 	statuses, probedAt := s.probeAgentsFor(r.Context(), meta, forceRefresh(r))
 	view := runnerAgentsView{

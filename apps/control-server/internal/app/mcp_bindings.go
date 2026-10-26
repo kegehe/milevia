@@ -58,12 +58,15 @@ func (s *Server) disabledMCPServerIDs(ctx context.Context, projectID string) (ma
 
 // projectMCPBindingView 是项目视图里的绑定信息。
 type projectMCPBindingView struct {
-	ServerID    string `json:"serverId"`
-	Enabled     bool   `json:"enabled"`
-	Overridden  bool   `json:"overridden"`
-	ServerName  string `json:"serverName"`
-	DisplayName string `json:"displayName"`
-	Scope       string `json:"scope"`
+	ServerID   string `json:"serverId"`
+	Enabled    bool   `json:"enabled"`
+	Overridden bool   `json:"overridden"`
+	// DefinitionEnabled 是定义本身的启用状态。项目级定义被停用时，项目开关无法把它
+	// 打开（开关只维护项目覆盖行），界面需要如实区分。
+	DefinitionEnabled bool   `json:"definitionEnabled"`
+	ServerName        string `json:"serverName"`
+	DisplayName       string `json:"displayName"`
+	Scope             string `json:"scope"`
 }
 
 type projectMCPPatchInput struct {
@@ -82,22 +85,28 @@ func (s *Server) patchProjectMCP(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	ctx := r.Context()
-	project, err := s.getProjectByID(ctx, projectID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, errors.New("project not found"))
+	if status, err := s.applyProjectMCPPatch(r.Context(), projectID, input); err != nil {
+		writeError(w, status, err)
 		return
 	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	// 视图里的 `.mcp.json` 读取可能落在不可达的 UNC/WSL 路径上，必须放在锁外，
+	// 否则会把删除项目/其它 MCP 写入一起堵住。
+	s.getProjectMCP(w, r)
+}
+
+// applyProjectMCPPatch 在 mcpWriteMu 下完成项目级开关的写入，提前返回时自动释放。
+func (s *Server) applyProjectMCPPatch(ctx context.Context, projectID string, input projectMCPPatchInput) (int, error) {
+	s.mcpWriteMu.Lock()
+	defer s.mcpWriteMu.Unlock()
+	if _, err := s.getProjectByID(ctx, projectID); errors.Is(err, sql.ErrNoRows) {
+		return http.StatusNotFound, errors.New("project not found")
+	} else if err != nil {
+		return http.StatusInternalServerError, err
 	}
-	_ = project
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return http.StatusInternalServerError, err
 	}
 	defer tx.Rollback()
 	for _, binding := range input.Bindings {
@@ -105,18 +114,21 @@ func (s *Server) patchProjectMCP(w http.ResponseWriter, r *http.Request) {
 		if serverID == "" {
 			continue
 		}
-		var exists bool
-		if err := tx.QueryRowContext(ctx, `select exists(select 1 from mcp_servers where id=?)`, serverID).Scan(&exists); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		var scope, ownerProject string
+		err := tx.QueryRowContext(ctx, `select scope, project_id from mcp_servers where id=?`, serverID).Scan(&scope, &ownerProject)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
 		}
-		if !exists {
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+		// 只能操作本项目可见的定义：全局定义，或属于本项目的项目级定义。
+		if scope == mcpScopeProject && ownerProject != projectID {
 			continue
 		}
 		if binding.Enabled {
 			if _, err := tx.ExecContext(ctx, `delete from mcp_project_bindings where project_id=? and server_id=?`, projectID, serverID); err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
+				return http.StatusInternalServerError, err
 			}
 			continue
 		}
@@ -124,23 +136,20 @@ func (s *Server) patchProjectMCP(w http.ResponseWriter, r *http.Request) {
 			values (?,?,0,?,?)
 			on conflict(project_id, server_id) do update set enabled=0, updated_at=excluded.updated_at`,
 			projectID, serverID, now, now); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return http.StatusInternalServerError, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return http.StatusInternalServerError, err
 	}
 	// 放行 `.mcp.json` 是高权限设置（会让项目根目录声明的第三方 server 被自动启动），
-	// 因此单独写入并复用同一份视图返回，便于前端立即看到 strict 状态变化。
+	// 因此单独写入；视图由调用方在锁外刷新。
 	if input.AllowMcpJson != nil {
 		if err := s.setProjectMCPAllowMcpJson(ctx, projectID, *input.AllowMcpJson); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return http.StatusInternalServerError, err
 		}
 	}
-	s.getProjectMCP(w, r)
+	return 0, nil
 }
 
 // listProjectMCPBindings 返回该项目可见的全部 server（含来源、是否被项目关闭）。
@@ -164,17 +173,19 @@ func (s *Server) listProjectMCPBindings(ctx context.Context, projectID string) (
 		}
 		// 项目级定义只对所属项目可见；全局定义对全部项目可见。
 		view := projectMCPBindingView{
-			ServerID:    stored.ID,
-			ServerName:  stored.Name,
-			DisplayName: stored.DisplayName,
-			Scope:       stored.Scope,
-			Enabled:     stored.Enabled,
+			ServerID:          stored.ID,
+			ServerName:        stored.Name,
+			DisplayName:       stored.DisplayName,
+			Scope:             stored.Scope,
+			Enabled:           stored.Enabled,
+			DefinitionEnabled: stored.Enabled,
 		}
-		if stored.Scope == mcpScopeGlobal {
-			if disabled[stored.ID] {
-				view.Enabled = false
-				view.Overridden = true
-			}
+		// 项目级定义同样允许被本项目显式关闭：绑定表记录的是「本项目是否启用它」，
+		// 与定义属于哪个作用域无关。以前只对 global 应用覆盖，导致项目级 server 的
+		// 开关点了没反应、界面刷新后又变回「已启用」。
+		if disabled[stored.ID] {
+			view.Enabled = false
+			view.Overridden = true
 		}
 		out = append(out, view)
 	}

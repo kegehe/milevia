@@ -231,6 +231,24 @@ export function systemItemFromEvent(event: Event): SystemItem | null {
       detail: attempt && maxRetries ? `第 ${attempt}/${maxRetries} 次重试${errorPart}` : undefined,
     };
   }
+  // 服务端在拉起 CLI 之前落的一条状态事件。大会话的 --resume 要几十秒才产生第一条
+  // 事件（真机实测 7.6 MB / 3745 行 = 30~60 秒），没有这条的话，这段时间在界面上
+  // 只剩一句笼统的「正在处理任务」，用户无从判断是慢还是卡死。
+  //
+  // 历史条数只用来解释「为什么慢」，不换算成预计时长 —— 那个数在这台机器上
+  // 波动很大（冷盘、并发、CLI 版本），预测错了比不预测更糟。
+  if (subtype === "session_starting") {
+    const resume = payload.resume === true;
+    const history = Number(payload.historyMessages) || 0;
+    return {
+      ...base,
+      variant: "session",
+      title: resume ? "正在恢复会话上下文" : "正在启动 Claude 会话",
+      detail: resume
+        ? (history > 0 ? `载入 ${history} 条历史消息；历史越长启动越慢，可在空闲时新建会话` : "正在加载这条会话的本地历史…")
+        : "正在拉起 Claude Code 进程…",
+    };
+  }
   if (subtype === "task_started" || subtype === "task_notification" || subtype === "task_updated" || subtype === "background_tasks_changed") {
     let title = "后台任务";
     let detail = "";
@@ -331,8 +349,15 @@ export function cliOutputDiagnostic(messages: string[]): { title: string; detail
 export function buildTimeline(messages: Message[], events: Event[]): TimelineItem[] {
   const results = new Map<string, ToolOutput>();
   const runStatuses = new Map<string, string>();
+  // 每个 run 最后一条事件的时间：判断"这条会话启动阶段是否已经结束"要用它。
+  // 预先算一遍（O(n)），否则每张 system 卡都要再扫一次事件表 —— 大会话 × 多轮 =
+  // 每次渲染都做一遍 O(n²)，而 buildTimeline 是随流式输出反复调用的。
+  const lastEventAtByRun = new Map<string, number>();
   const approvalStates = new Map<string, ApprovalEvent>();
   for (const event of events) {
+    const at = Date.parse(event.createdAt) || -Infinity;
+    const known = lastEventAtByRun.get(event.runId);
+    if (known === undefined || at > known) lastEventAtByRun.set(event.runId, at);
     const payload = asRecord(event.payload);
     if (event.type === "user") {
       for (const part of asRecord(payload.message).content || []) {
@@ -430,7 +455,21 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
   const systemItems: SystemItem[] = [];
   for (const event of events) {
     const item = systemItemFromEvent(event);
-    if (item) systemItems.push(item);
+    if (!item) continue;
+    // 「正在恢复会话上下文」是**进行中**的读数，不是历史事实：这一轮结束后它已经
+    // 不成立了，留在时间线上就是一句永远为真的假话（与 api_retry/compact 不同，
+    // 那些记录的是"发生过一次重试/压缩"，回看时仍然成立）。所以只在 run 还活着时
+    // 收进时间线；它同时仍参与 latestActiveStage 的状态条推导（那里直接读事件）。
+    if (item.variant === "session") {
+      const status = runStatuses.get(event.runId) || "";
+      if (status && status !== "running" && status !== "queued") continue;
+      // 与状态条同一判据：这一轮只要已经产生过更晚的事件（init / assistant / 工具），
+      // "正在恢复"就已经不成立了。留着一张永远为真的旧卡，比不留更糟。
+      const startedAt = Date.parse(item.createdAt) || -Infinity;
+      const lastAt = lastEventAtByRun.get(event.runId);
+      if (lastAt !== undefined && lastAt > startedAt) continue;
+    }
+    systemItems.push(item);
   }
 
   const errorItems: TimelineItem[] = [];

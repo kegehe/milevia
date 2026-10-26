@@ -4,6 +4,7 @@ export interface ConfirmDialogProps {
   title: string;
   message: ReactNode;
   confirmLabel?: string;
+  busyLabel?: string;
   danger?: boolean;
   busy?: boolean;
   className?: string;
@@ -16,7 +17,7 @@ function ConfirmCloseIcon() {
   return <svg className="confirm-dialog-close-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
 }
 
-export function ConfirmDialog({ title, message, confirmLabel = "确认", danger, busy, className, icon, onConfirm, onCancel }: ConfirmDialogProps) {
+export function ConfirmDialog({ title, message, confirmLabel = "确认", busyLabel = "处理中", danger, busy, className, icon, onConfirm, onCancel }: ConfirmDialogProps) {
   return (
     <div className="backdrop" role="dialog" aria-modal="true">
       <section className={`modal confirm-dialog${className ? ` ${className}` : ""}`}>
@@ -28,7 +29,7 @@ export function ConfirmDialog({ title, message, confirmLabel = "确认", danger,
         <footer>
           <button type="button" className="secondary" disabled={busy} onClick={onCancel}>取消</button>
           <button className={danger ? "primary danger" : "primary"} disabled={busy} onClick={() => void onConfirm()}>
-            {busy ? "处理中" : confirmLabel}
+            {busy ? busyLabel : confirmLabel}
           </button>
         </footer>
       </section>

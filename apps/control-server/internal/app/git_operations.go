@@ -1154,7 +1154,9 @@ func (s *Server) gitIndexMutationState(w http.ResponseWriter, r *http.Request, s
 	}
 	s.mu.Lock()
 	lease := s.projectWorkspaceLeases[workspaceKey]
-	blocked := lease != nil && !isAIWorkspaceOwner(lease.owner)
+	// 项目删除与 AI 运行共享租约时 owner 可能仍是 AI；teardown 必须单独挡 Git，
+	// 否则删除正在清理 worktree 时还能开始 stage/commit。
+	blocked := lease != nil && (lease.teardown || !isAIWorkspaceOwner(lease.owner))
 	if !blocked {
 		if s.gitIndexActive == nil {
 			s.gitIndexActive = map[string]bool{}
@@ -1184,6 +1186,25 @@ func (s *Server) gitIndexMutationState(w http.ResponseWriter, r *http.Request, s
 
 func isAIWorkspaceOwner(owner string) bool {
 	return strings.HasPrefix(owner, "conversation:") || strings.HasPrefix(owner, "run:")
+}
+
+// projectDeleteWorkspaceOwner 是项目删除持有工作区租约时的 owner。
+const projectDeleteWorkspaceOwner = "project-delete"
+
+// workspaceLeaseCompatible 判断两个 owner 能否同时持有同一工作区租约。
+//
+// AI 运行之间共享（多个会话本来就会并发编辑同一目录）。项目删除是收尾操作：
+// 它会先取消、停止该项目的运行，再在后台等进程退出，因此必须能在 AI 运行仍
+// 持有租约时推进 —— 否则用户得先等任务跑完才能删项目（见
+// TestDeleteProjectStopsActiveAgentRun）。Git / 文件 / 分析等改写类操作仍互斥。
+func workspaceLeaseCompatible(existing, requested string) bool {
+	if existing == requested {
+		return true
+	}
+	if isAIWorkspaceOwner(existing) && isAIWorkspaceOwner(requested) {
+		return true
+	}
+	return requested == projectDeleteWorkspaceOwner && isAIWorkspaceOwner(existing)
 }
 
 func (s *Server) gitMutationState(w http.ResponseWriter, r *http.Request, stateToken string) (GitRunner, string, string, gitStateToken, func(), bool) {

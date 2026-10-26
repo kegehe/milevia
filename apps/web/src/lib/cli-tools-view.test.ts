@@ -759,3 +759,110 @@ test("手动安装：清单不随「装没装」变（它是手册，不是状�
   // 空目录 → 空清单（页面据此整块不渲染，而不是渲染一个空框）。
   assert.deepEqual(buildManualInstallRows([]), []);
 });
+
+// ── 「没装」有三件事，不能共用一句话 ─────────────────────────────────────────
+//
+// installed=false 只说明"现在不能用"。它至少涵盖三件下一步完全不同的事：
+// ① 这个环境根本不提供该工具（换环境）；② 登记里装过、但现在跑不起来
+// （去修它）；③ 真的没装（去装它）。把它们都说成「还没装」会把用户支去做
+// 一件没有用的事（去装一个装不上的、或本来就有的东西）。
+
+test("登记里装过、但现在跑不起来：不说「还没装」，下一步是修它", () => {
+  const card = buildToolCard(input({
+    item: item({
+      installed: false,
+      ready: false,
+      version: "",
+      installKindUsed: "npm-global-managed",
+      reason: "远程服务器上 Claude Code 已安装但不可用（可在 CLI 工具管理页检测并修复）",
+    }),
+    diagnosis: diagnosis({
+      status: "broken",
+      issues: [{
+        code: "binary-broken",
+        severity: "blocker",
+        summary: "二进制存在但跑不起来",
+        evidence: ["/home/u/.local/share/milevia/toolchain/npm-global/bin/claude"],
+        remedies: [{ id: "reinstall", label: "重新安装", detail: "在那台机器上重装一份" }],
+      }],
+    }),
+  }));
+  assert.notEqual(card.statusText, "还没装。");
+  assert.equal(card.statusText, "二进制存在但跑不起来");
+  assert.equal(card.primary?.kind, "repair");
+  // 修不了时也不给"安装"：那会把用户支去重装一个已经装好的东西。
+  const noRemedy = buildToolCard(input({
+    item: item({ installed: false, ready: false, installKindUsed: "npm-global-managed", reason: "已安装但不可用" }),
+  }));
+  assert.equal(noRemedy.primary, undefined);
+  assert.equal(noRemedy.canOpenDetails, true);
+  assert.notEqual(noRemedy.statusText, "还没装。");
+});
+
+test("这个执行环境不提供该工具：不说「还没装」", () => {
+  const card = buildToolCard(input({
+    item: item({
+      installed: false,
+      ready: false,
+      updateSupported: false,
+      installSupported: false,
+      installBlockedReason: "此 Runner 不支持 Cursor",
+    }),
+  }));
+  assert.equal(card.statusText, "这个执行环境不提供该工具。");
+  assert.equal(card.primary, undefined);
+});
+
+test("已安装但不可用时，「当前版本」那一行不说「未安装」", () => {
+  assert.equal(currentVersionLine(item({ installed: false, installKindUsed: "npm-global-managed" })).text, "已安装（当前不可用）");
+  // 真的没装的那一档仍然是「未安装」。
+  assert.equal(currentVersionLine(item({ installed: false })).text, "未安装");
+});
+
+test("已安装但没登录：给登录入口，而不是让人去重装", () => {
+  const card = buildToolCard(input({
+    item: item({
+      installed: false,
+      ready: false,
+      version: "",
+      installKindUsed: "npm-global-managed",
+      reason: "远程服务器上 Codex CLI 已安装但不可用（可在 CLI 工具管理页检测并修复）",
+    }),
+    authStatus: "logged_out",
+  }));
+  assert.equal(card.statusText, "已安装，但还没登录，登录之后才能用。");
+  assert.equal(card.login, "not-logged-in");
+  assert.equal(card.primary, undefined);
+  assert.equal(card.loginBlocked, true);
+});
+
+test("已安装但不可用时：症状优先于登录态，服务端原文进抽屉", () => {
+  // 诊断是实测（"二进制跑不起来"），登录态是 CLI 自报；两者同时成立时登录也修不好，
+  // 先说更硬的那条。
+  const card = buildToolCard(input({
+    item: item({
+      installed: false,
+      ready: false,
+      version: "",
+      installKindUsed: "npm-global-managed",
+      reason: "远程服务器上 Claude Code 已安装但不可用（可在 CLI 工具管理页检测并修复）",
+    }),
+    authStatus: "logged_out",
+    diagnosis: diagnosis({
+      status: "broken",
+      issues: [{
+        code: "binary-broken",
+        severity: "blocker",
+        summary: "二进制存在但跑不起来",
+        evidence: ["/home/u/.local/share/milevia/toolchain/npm-global/bin/claude"],
+        remedies: [{ id: "reinstall", label: "重新安装", detail: "重装一份" }],
+      }],
+    }),
+  }));
+  assert.equal(card.statusText, "二进制存在但跑不起来");
+  // 登录入口两种情况下都要给（loginSlotFor 要求 installed，而这一档 installed=false）。
+  assert.equal(card.login, "not-logged-in");
+  assert.equal(card.primary?.kind, "repair");
+  // 服务端原文照旧不丢，挪进详情抽屉（那一页才是排查素材该待的地方）。
+  assert.ok(card.detailNotes.some((line) => line.includes("已安装但不可用")));
+});

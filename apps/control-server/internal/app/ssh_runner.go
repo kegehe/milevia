@@ -736,11 +736,45 @@ type sshRunner struct {
 	toolResultTimeout      time.Duration
 
 	// MCP 能力探测结果（按 runner 缓存；远端 claude 版本不可控）。
-	mcpMu         sync.Mutex
+	//
+	// mcpProbeMu 只包住「真正探测」这一段（可能长达 10s），不保护状态；mcpStateMu 只
+	// 保护下面几个字段。分开是为了让注入前的 mcpCapabilityCached 不必等一次在途探测。
+	mcpProbeMu    sync.Mutex
+	mcpStateMu    sync.Mutex
 	mcpChecked    bool
 	mcpInjectable bool
 	mcpStrictOK   bool
 	mcpVersion    string
+	// mcpFailureUntil 是探测失败后的短暂退避窗口：不永久缓存失败（一次 SSH 抖动会让
+	// 整条连接再也用不上 MCP），也不让每个新会话都各付一次 10s 探测。
+	mcpFailureUntil time.Time
+	// mcpStaleChecked 保证每个 runner 只做一次远端残留清理。
+	mcpStaleChecked bool
+}
+
+const mcpCapabilityRetryInterval = time.Minute
+
+// mcpCapabilityState 在已缓存或退避窗口内时返回 done=true。调用方不得在持有
+// mcpStateMu 时做网络请求。
+func (r *sshRunner) mcpCapabilityState() (injectable, strictOK bool, version string, done bool) {
+	r.mcpStateMu.Lock()
+	defer r.mcpStateMu.Unlock()
+	if r.mcpChecked {
+		return r.mcpInjectable, r.mcpStrictOK, r.mcpVersion, true
+	}
+	if time.Now().Before(r.mcpFailureUntil) {
+		return false, false, "", true
+	}
+	return false, false, "", false
+}
+
+// mcpCapabilityCached 只返回已探测结果，不发网络请求、也不等待在途探测。
+// 失败退避窗口内的「未知」也按不可注入处理，保证状态不虚报。
+func (r *sshRunner) mcpCapabilityCached() (checked bool, injectable bool, version string) {
+	r.mcpStateMu.Lock()
+	defer r.mcpStateMu.Unlock()
+	checked = r.mcpChecked || time.Now().Before(r.mcpFailureUntil)
+	return checked, r.mcpInjectable, r.mcpVersion
 }
 
 // mcpCapability 探测远端 Claude Code 是否支持 MCP 注入。
@@ -755,23 +789,48 @@ type sshRunner struct {
 // 风险」。故改为：strict 照常启用，版本低于 2.1.246 时只打一条可见警告。
 // 结果按 runner 缓存，避免每次 run 都拉起一次 claude --version。
 func (r *sshRunner) mcpCapability(ctx context.Context) (injectable bool, strictOK bool, version string) {
-	r.mcpMu.Lock()
-	defer r.mcpMu.Unlock()
-	if r.mcpChecked {
-		return r.mcpInjectable, r.mcpStrictOK, r.mcpVersion
+	if injectable, strictOK, version, done := r.mcpCapabilityState(); done {
+		return injectable, strictOK, version
 	}
-	r.mcpChecked = true
+	// 同一时刻只允许一个探测；等待期间不持有 mcpStateMu，cached 读不会被阻塞。
+	r.mcpProbeMu.Lock()
+	defer r.mcpProbeMu.Unlock()
+	if injectable, strictOK, version, done := r.mcpCapabilityState(); done {
+		return injectable, strictOK, version
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := r.client.execCommand(probeCtx, "claude --version")
+	out, err := r.client.execCommand(probeCtx, sshRemoteCommand("claude --version"))
+	r.mcpStateMu.Lock()
 	if err != nil {
+		// 调用方取消（用户停止/请求断开）不是「远端不可用」，不能污染退避窗口。
+		if ctx.Err() != nil {
+			r.mcpStateMu.Unlock()
+			return false, false, ""
+		}
+		r.mcpFailureUntil = time.Now().Add(mcpCapabilityRetryInterval)
+		r.mcpInjectable = false
+		r.mcpStateMu.Unlock()
 		return false, false, ""
 	}
+	r.mcpChecked = true
+	r.mcpFailureUntil = time.Time{}
 	version = agentVersionFromOutput(string(out))
 	r.mcpVersion = version
 	r.mcpInjectable = versionAtLeast(version, 2, 1, 0)
 	r.mcpStrictOK = r.mcpInjectable
-	return r.mcpInjectable, r.mcpStrictOK, r.mcpVersion
+	staleCheck := !r.mcpStaleChecked
+	if staleCheck {
+		r.mcpStaleChecked = true
+	}
+	injectable, strictOK = r.mcpInjectable, r.mcpStrictOK
+	r.mcpStateMu.Unlock()
+	if staleCheck {
+		// 控制服务崩溃/SSH 被硬杀时远端 trap 不会执行；每次重连清一次 24h 前的残留。
+		// 24h 远长于任何正常会话，避免误删仍在使用的配置。
+		go r.cleanupStaleRemoteMCPFiles()
+	}
+	return injectable, strictOK, version
 }
 
 // versionAtLeast 比较形如 "2.1.266" 的版本号是否 ≥ major.minor.patch。
@@ -811,21 +870,68 @@ func versionAtLeast(version string, major, minor, patch int) bool {
 	return nums[2] >= patch
 }
 
-// buildRemoteMCPSetup 生成 SSH 远程命令的 MCP 前置脚本与参数片段。
-// 形态与 schemaSetup（runCodex 的 base64 落盘 + trap 清理）同构。
-func buildRemoteMCPSetup(ctx context.Context, r *sshRunner, mcpJSON, mcpKey string, strictRequested bool, sink AgentRunSink) (setup string, arg string) {
+// uploadRemoteMCPConfig 把 MCP 配置写到远端 0600 临时文件。
+//
+// 走 SSH 会话的 stdin：内容既不进远端 shell 的 argv（ps 看不到），也不受单参数长度
+// 限制，还不依赖 SFTP 子系统（SFTP 调用没有 ctx/超时，子系统卡住会把建会话挂死）。
+// 脚本用 umask 077 创建，再用 chmod 加固。
+func (r *sshRunner) uploadRemoteMCPConfig(ctx context.Context, content, mcpKey string) (string, string, error) {
+	remote := "/tmp/milevia-mcp-" + sanitizeMCPRunKey(mcpKey) + ".json"
+	writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	script := "umask 077; cat > " + shellQuote(remote) + " && chmod 600 " + shellQuote(remote)
+	if _, err := r.client.execCommandWithStdin(writeCtx, script, []byte(content)); err != nil {
+		// 失败时可能已经创建了截断/半成品文件，尽力删掉再报错。
+		r.removeRemoteMCPFile(remote)
+		return "", "", fmt.Errorf("在远端写入 MCP 配置失败：%w", err)
+	}
+	return remote, "", nil
+}
+
+// removeRemoteMCPFile 在进程被 SIGKILL / 连接取消后兜底删除远端配置。
+// `trap ... EXIT` 在 SIGKILL 下不会执行，长驻会话的 Stop() 正是 SIGKILL。
+func (r *sshRunner) removeRemoteMCPFile(path string) {
+	if path == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := r.client.execCommand(ctx, "rm -f "+shellQuote(path)); err != nil {
+		log.Printf("[mcp] remove remote config %s: %v", path, err)
+	}
+}
+
+// cleanupStaleRemoteMCPFiles 清理控制服务异常退出后残留在远端 /tmp 的 MCP 配置。
+// 只删 24 小时前的文件，且只匹配本功能的文件名前缀。
+func (r *sshRunner) cleanupStaleRemoteMCPFiles() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := r.client.execCommand(ctx,
+		"find /tmp -maxdepth 1 -type f -name 'milevia-mcp-*.json' -mmin +1440 -delete 2>/dev/null || true"); err != nil {
+		log.Printf("[mcp] cleanup stale remote configs: %v", err)
+	}
+}
+
+// prepareRemoteMCPConfig 生成 SSH 远程命令的 MCP 前置脚本与参数片段，并返回远端
+// 配置路径（供进程结束/SIGKILL 后兜底删除）。
+func prepareRemoteMCPConfig(ctx context.Context, r *sshRunner, mcpJSON, mcpKey string, strictRequested bool, sink AgentRunSink) (setup string, arg string, remotePath string) {
 	if mcpJSON == "" {
-		return "", ""
+		return "", "", ""
 	}
 	injectable, strictOK, version := r.mcpCapability(ctx)
 	if !injectable {
-		notifyMCPMessage(sink, "远端 Claude Code 不支持 MCP 配置注入，本次已跳过 MCP。")
-		return "", ""
+		notifyMCPMessage(sink, "远端 Claude Code 不支持 MCP 配置注入（版本探测失败或版本过低），本次已跳过 MCP。")
+		return "", "", ""
 	}
-	path := "/tmp/milevia-mcp-" + sanitizeMCPRunKey(mcpKey) + ".json"
-	encoded := base64.StdEncoding.EncodeToString([]byte(mcpJSON))
-	setup = fmt.Sprintf("printf '%%s' %s | base64 -d > %s && (chmod 600 %s 2>/dev/null || true) && trap 'rm -f %s' EXIT && ",
-		shellQuote(encoded), shellQuote(path), shellQuote(path), shellQuote(path))
+	path, note, err := r.uploadRemoteMCPConfig(ctx, mcpJSON, mcpKey)
+	if err != nil {
+		notifyMCPMessage(sink, "远端 MCP 配置写入失败，本次已跳过 MCP："+err.Error())
+		return "", "", ""
+	}
+	if note != "" {
+		notifyMCPMessage(sink, note)
+	}
+	setup = "trap " + shellQuote("rm -f "+path) + " EXIT; "
 	arg = " --mcp-config " + shellQuote(path)
 	if strictRequested && strictOK {
 		arg += " --strict-mcp-config"
@@ -837,7 +943,7 @@ func buildRemoteMCPSetup(ctx context.Context, r *sshRunner, mcpJSON, mcpKey stri
 	} else if strictRequested {
 		notifyMCPMessage(sink, "远端 Claude Code 无法启用 MCP 严格模式，本次已关闭以免会话挂起；项目 .mcp.json 的 server 可能被加载。")
 	}
-	return setup, arg
+	return setup, arg, path
 }
 
 func notifyMCPMessage(sink AgentRunSink, message string) {
@@ -863,13 +969,27 @@ func (r *sshRunner) canonicalProjectPath(ctx context.Context, requested string) 
 	return resolved, nil
 }
 
+// sshRemoteCommand 是在远端跑一条命令时的统一形状：**前置平台托管的目录**。
+//
+// 为什么必须前置：平台在远端装的那份 CLI 落在托管 npm prefix 下
+// （$HOME/.local/share/milevia/toolchain/npm-global），而 SSH 的非交互 shell
+// 的 PATH 里没有它（见 crossManagedPathValue 的注释）。不前置的后果是
+// "装完仍显示未安装"、升级报"未安装"、会话 command not found。
+//
+// 目录驱动的工具走 crossProbe（已带前缀），OpenCode 的探测与**会话命令**也带
+// （buildSSHOpenCodeCommand）；Claude/Codex 这几条特化路径原先漏了它 ——
+// 那不是"设计上不需要"，是漏了。
+func sshRemoteCommand(command string) string {
+	return crossManagedPathPrefix() + "; " + command
+}
+
 func (r *sshRunner) Ready(ctx context.Context) bool {
-	out, err := r.client.execCommand(ctx, "which claude && claude --version")
+	out, err := r.client.execCommand(ctx, sshRemoteCommand("command -v claude && claude --version"))
 	return err == nil && len(out) > 0
 }
 
 func (r *sshRunner) Version(ctx context.Context) string {
-	out, err := r.client.execCommand(ctx, "claude --version")
+	out, err := r.client.execCommand(ctx, sshRemoteCommand("claude --version"))
 	if err != nil {
 		return ""
 	}
@@ -881,13 +1001,17 @@ func (r *sshRunner) CheckUpdate(ctx context.Context) (bool, string, error) {
 	if local == "" {
 		return false, "", errors.New("远程服务器上未安装 Claude Code")
 	}
-	out, err := r.client.execCommand(ctx, "npm view @anthropic-ai/claude-code version 2>/dev/null")
+	// 最新版次在**控制服务这一侧**查 registry（npm 的版本号跨平台唯一），
+	// 与 WSL 侧（wsl_agent_update.go）、目录驱动的工具（agent_catalog_backend.go）
+	// 同一口径。远端自己跑 `npm view` 的做法有两个问题：远端没有 npm 或不通
+	// 外网时，那一档会变成"读不到最新版本"；而远端的 npm 可能配了私有镜像，
+	// 版本号与公网 registry 不是一回事。
+	//
+	// ⚠️ 走 latestAgentVersion 而不是写死包名：包名由工具目录（agent_catalog.go）
+	// 决定，那份清单只有一处 —— 写死一份就会在目录变更时漂移。
+	latest, err := latestAgentVersion(ctx, "claude-code")
 	if err != nil {
 		return false, "", err
-	}
-	latest := strings.TrimSpace(string(out))
-	if latest == "" {
-		return false, "", errors.New("latest Claude Code version is empty")
 	}
 	// 与 Codex 侧（以及本机）同一条判据：semver 比较，**不是**字符串不等。
 	// 字符串不等会把"本地是比 registry 更新的预发布版"报成"有更新可用"，
@@ -903,11 +1027,24 @@ func (r *sshRunner) CheckUpdate(ctx context.Context) (bool, string, error) {
 //
 // 编排（确认来源 → 执行 → 健康检查 → 必要时回滚）与 WSL 侧共用一套实现，
 // 差别只在"怎么在那边跑命令"（见 cross_npm_update.go）。
+//
+// ⚠️ 走 crossRun（前置平台托管的目录）而不是 execRemote：平台在远端装的那份
+// CLI 不在非交互 shell 的 PATH 上，不前置就找不到它（与 WSL 侧的 wslRunScript
+// 同一口径）。
+//
+// 一个取舍要说明白：确认来源那一步用 `npm prefix -g` 反推全局位置，而 PATH 上
+// 的 npm 现在**托管那份优先**。这只影响"用户自己装的工具"（平台登记过的走
+// performAgentUpdate → installAgentCLIFor，那里按登记的安装方式决定 npm 与
+// prefix，不经这条路）；那一档若升级失败，自动回滚可能定位不到同一个 prefix，
+// 于是如实报出错误、交给用户处理，而不是回滚到别的地方去。
 func (r *sshRunner) Update(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "远程服务器上", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, r.execRemote, r.Version)
+	return runCrossCLIUpdate(ctx, "远程服务器上", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, r.crossRun, r.Version)
 }
 
-// execRemote 在远端跑一条脚本（crossCommandRunner 的 SSH 实现）。
+// execRemote 在远端跑一条脚本。
+//
+// ⚠️ 它**不**前置平台托管的目录：跨端 CLI 那条路请走 crossRun（已前置，见
+// crossManagedPathValue 的注释）—— 直接用它会让平台在远端装的那份 CLI 找不到自己。
 func (r *sshRunner) execRemote(ctx context.Context, script string) (string, error) {
 	out, err := r.client.execCommand(ctx, script)
 	return string(out), err
@@ -919,7 +1056,7 @@ func (r *sshRunner) execRemote(ctx context.Context, script string) (string, erro
 const codexLoginStatusCommand = "codex login status"
 
 func (r *sshRunner) CodexReady(ctx context.Context) bool {
-	out, err := r.client.execCommand(ctx, "which codex && "+codexLoginStatusCommand)
+	out, err := r.client.execCommand(ctx, sshRemoteCommand("command -v codex && "+codexLoginStatusCommand))
 	return err == nil && len(out) > 0
 }
 
@@ -939,7 +1076,7 @@ func (r *sshRunner) OpenCodeVersion(ctx context.Context) string {
 }
 
 func (r *sshRunner) CodexVersion(ctx context.Context) string {
-	out, err := r.client.execCommand(ctx, "codex --version")
+	out, err := r.client.execCommand(ctx, sshRemoteCommand("codex --version"))
 	if err != nil {
 		return ""
 	}
@@ -986,7 +1123,7 @@ func (r *sshRunner) claudeCLIConfig(ctx context.Context) CLIConfigSnapshot {
 
 // codexModelCatalog 列出远端 Codex 的模型目录（modelCatalogRunner 实现）。
 func (r *sshRunner) codexModelCatalog(ctx context.Context) ([]AgentModelOption, error) {
-	out, err := r.client.execCommand(ctx, "codex debug models 2>/dev/null")
+	out, err := r.client.execCommand(ctx, sshRemoteCommand("codex debug models 2>/dev/null"))
 	if err != nil {
 		return nil, err
 	}
@@ -1002,13 +1139,11 @@ func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) 
 	if local == "" {
 		return false, "", errors.New("远程服务器上未安装 Codex CLI")
 	}
-	out, err := r.client.execCommand(ctx, "npm view @openai/codex version 2>/dev/null")
+	// 与 Claude 侧同一口径：最新版次在控制服务这一侧查 registry，
+	// 包名同样取自工具目录（不写死）。
+	latest, err := latestAgentVersion(ctx, "codex")
 	if err != nil {
 		return false, "", err
-	}
-	latest := strings.TrimSpace(string(out))
-	if latest == "" {
-		return false, "", errors.New("latest Codex version is empty")
 	}
 	available, err := updateAvailableFrom(local, latest)
 	if err != nil {
@@ -1018,7 +1153,7 @@ func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) 
 }
 
 func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "远程服务器上", "codex", []string{"update"}, "Codex CLI", codexNpmCLIInstall, r.execRemote, r.CodexVersion)
+	return runCrossCLIUpdate(ctx, "远程服务器上", "codex", []string{"update"}, "Codex CLI", codexNpmCLIInstall, r.crossRun, r.CodexVersion)
 }
 
 // ── crossShellRunner：目录驱动的工具（catalogAgentBackend 用）────────────────
@@ -1052,10 +1187,59 @@ func (r *sshRunner) crossRun(ctx context.Context, script string) (string, error)
 // crossWhere 是"在哪台机器上"的说法，只用于报错文案。
 func (r *sshRunner) crossWhere() string { return "远程服务器上" }
 
+// sshChannelHealthTimeout 是"这条 SSH 通道现在通不通"的探测上限。
+//
+// 与连接握手本身的超时一致（sshClient.connect 的拨号超时）：连不上时早一点把
+// "连不上"说出来，比让请求线程占着好。
+const sshChannelHealthTimeout = 10 * time.Second
+
+// ChannelHealth 报告这条 SSH 通道当前是否可用。
+//
+// 判据是"能不能在远端跑一条最便宜的命令"：它一次覆盖 TCP、SSH 握手、认证与
+// exec 四层 —— 任何一层断了都表现为跑不起来。
+//
+// 为什么要单独问一次：工具探测失败有两种完全不同的原因 —— "那个工具没装"与
+// "这台机器现在联系不上"。前者该说「未安装」，后者该说「无法检测」
+// （docs/42 §5.2 的三档）。注册表只回答"这台机器在不在清单里"，
+// 回答不了"现在还连得上吗" —— 于是连不上的 SSH 会被说成"工具没装"，
+// 用户被支去装一个装不上的东西。
+// sshChannelProbeCommand 是通道探针跑的那条命令。
+//
+// 用 printf 而不是 echo：它的行为不随 shell 的别名或实现变化，输出里带一个
+// 可辨识的标记，日志里一眼能看出"这条命令跑过了"。
+const sshChannelProbeCommand = "printf 'MILEVIA_CHANNEL_OK\\n'"
+
+func (r *sshRunner) ChannelHealth(ctx context.Context) (bool, string) {
+	probeCtx, cancel := context.WithTimeout(ctx, sshChannelHealthTimeout)
+	defer cancel()
+	// 判据**只看命令是否成功执行**，不看输出内容：
+	// 一次成功的远端命令已经同时证明了 TCP、握手、认证与 exec 四层都通；
+	// 而输出可能被远端 shell 掺进别的东西（/etc/profile 的提示、告警），
+	// 拿它做判据只会把"通道是好的"误判成"连不上"。
+	_, err := r.client.execCommand(probeCtx, sshChannelProbeCommand)
+	if err != nil {
+		return false, channelFailureLabel(r.channelLabel(), errorText(err))
+	}
+	return true, ""
+}
+
+// channelLabel 是这台机器在给用户看的名字。
+func (r *sshRunner) channelLabel() string {
+	if name := strings.TrimSpace(r.connName); name != "" {
+		return name
+	}
+	return r.connID
+}
+
 // 编译期钉住能力面：签名写歪了只会表现为"这个 runner 突然不支持目录驱动"（断言失败
 // 落到 agentBackend 的"尚未接通"分支），而那是一条**看起来像数据问题**的静默降级。
 var _ crossShellRunner = (*sshRunner)(nil)
 var _ OpenCodeCapableRunner = (*sshRunner)(nil)
+
+// channelHealthRunner 同样钉住：签名写歪了只会表现为"这个 runner 不支持通道检查"
+// （断言失败落到 probeChannelHealth 的"通道可用"分支），而那是一条**看起来像
+// "工具没装"** 的静默降级 —— 正是这次修复要挡掉的误判。
+var _ channelHealthRunner = (*sshRunner)(nil)
 
 // remoteNpmCLIRecovery 是一条"升级失败时可以回滚到哪"的信息。
 // SSH 与 WSL 共用（编排见 cross_npm_update.go）。
@@ -1219,8 +1403,11 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	}
 	// --allowedTools（只读执行）要求 prompt 经 stdin 提供（`claude ... -` 读 stdin）；
 	// 否则按 argv 传 prompt。
-	// MCP：远端无本地落盘通道，改为在同一 shell 命令内 base64 写入 /tmp 并 trap 清理。
-	mcpSetup, mcpArg := buildRemoteMCPSetup(ctx, r, request.MCPConfigJSON, request.MCPKey, request.StrictMCP, sink)
+	// MCP：优先 SFTP 写远端 0600 文件（不进 shell argv）；SFTP 不可用时才回退到
+	// 同一 shell 命令内的 base64 写入，并由 trap + 控制侧兜底清理。
+	mcpSetup, mcpArg, mcpPath := prepareRemoteMCPConfig(ctx, r, request.MCPConfigJSON, request.MCPKey, request.StrictMCP, sink)
+	// 进程被 SIGKILL / ctx 取消时远端 trap 不会执行，函数返回时无条件兜底删除。
+	defer r.removeRemoteMCPFile(mcpPath)
 	cmd := buildSSHClaudeRunCommand(request, mcpSetup, mcpArg, permissionArgs, sessionArg, modelArg)
 
 	stdout, err := session.StdoutPipe()
@@ -1307,14 +1494,26 @@ func (r *sshRunner) remoteCodexBaseURL(ctx context.Context) string {
 	return strings.TrimSpace(string(out))
 }
 
+// sshSessionPrefix 是远端**会话**命令的前置：先导出托管目录的 PATH。
+//
+// 与 sshRemoteCommand 同一件事，但用**换行**分隔而不是 "; "：会话命令的前置片段
+// 以什么结尾并不统一（远端 MCP 那段以 "; " 结尾，见 prepareRemoteMCPConfig），
+// 换行是唯一一种与"前面是什么"无关的接法 —— 它不会把两条语句粘成一条。
+func sshSessionPrefix() string {
+	return crossManagedPathPrefix() + "\n"
+}
+
 // buildSSHClaudeRunCommand 拼装远端一次性 Claude 命令。抽成纯函数是为了能直接断言参数
 // 装配（尤其是 --model 的引号与位置），Run 与测试共用同一份拼装逻辑。
 func buildSSHClaudeRunCommand(request AgentRunRequest, mcpSetup, mcpArg, permissionArgs, sessionArg, modelArg string) string {
+	// 会话命令同样要前置平台托管的目录：平台在远端装的那份 CLI 落在托管 npm
+	// prefix 下，不在非交互 shell 的 PATH 上（见 sshRemoteCommand 的注释）。
+	setup := sshSessionPrefix() + mcpSetup
 	if request.PromptViaStdin {
 		// --allowedTools（只读执行）要求 prompt 经 stdin 提供（`claude ... -` 读 stdin）。
 		return fmt.Sprintf(
 			"%scd %s && printf '%%s' %s | claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s%s -",
-			mcpSetup,
+			setup,
 			shellQuote(request.ProjectPath),
 			shellQuote(request.Prompt),
 			mcpArg,
@@ -1325,7 +1524,7 @@ func buildSSHClaudeRunCommand(request AgentRunRequest, mcpSetup, mcpArg, permiss
 	}
 	return fmt.Sprintf(
 		"%scd %s && claude -p --verbose --output-format stream-json --include-partial-messages%s %s %s%s %s",
-		mcpSetup,
+		setup,
 		shellQuote(request.ProjectPath),
 		mcpArg,
 		permissionArgs,
@@ -1398,7 +1597,7 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 	// 在 SSH 项目上会静默失效。
 	cmd := buildSSHCodexExecCommand(request, transportArgs, configArg, schemaArg, policy)
 	// Run from the project directory so Codex resolves relative paths correctly.
-	fullCmd := fmt.Sprintf("%scd %s && %s", schemaSetup, shellQuote(request.ProjectPath), cmd)
+	fullCmd := fmt.Sprintf("%s%scd %s && %s", sshSessionPrefix(), schemaSetup, shellQuote(request.ProjectPath), cmd)
 
 	session, err := r.client.newSession(ctx)
 	if err != nil {
@@ -1659,17 +1858,28 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 	} else if req.SessionID != "" {
 		sessionArg = "--session-id " + shellQuote(req.SessionID)
 	}
-	mcpSetup, mcpArg := buildRemoteMCPSetup(ctx, r, req.MCPConfigJSON, req.MCPKey, req.StrictMCP, nil)
+	mcpSetup, mcpArg, mcpPath := prepareRemoteMCPConfig(ctx, r, req.MCPConfigJSON, req.MCPKey, req.StrictMCP, nil)
+	// 注意：这里**不能** defer 删除。StartSession 返回的是「会话已启动」，远端 Claude
+	// 还没读到 --mcp-config 文件；清理由 mcpCleanup（Stop/进程退出）与远端 trap 负责，
+	// 各错误分支在 return 前显式删除。
 	// 长驻远端会话同样按会话/档案指定的模型启动；模型变化会经
 	// conversationSessionManager 退役旧会话后带新 --model 重启。
 	modelArg := ""
 	if req.Model != "" {
 		modelArg = " --model " + shellQuote(req.Model)
 	}
+	// 与本地/WSL 同口径：把 MCP 启动等待压到用户配置的上限内。远端没有 env 通道，
+	// 用 "VAR=VAL claude ..." 的进程级前缀设置，不污染远端 shell（也不会进 ps 的
+	// 环境列表，值本身不是密钥）。
+	timeoutPrefix := ""
+	if env := mcpTimeoutEnv(req.MCPStartupTimeout); len(env) > 0 {
+		timeoutPrefix = env[0] + " "
+	}
 	cmd := fmt.Sprintf(
-		"%scd %s && claude -p --verbose --input-format stream-json --output-format stream-json --include-partial-messages --replay-user-messages%s %s %s%s",
-		mcpSetup,
+		"%scd %s && %sclaude -p --verbose --input-format stream-json --output-format stream-json --include-partial-messages --replay-user-messages%s %s %s%s",
+		sshSessionPrefix()+mcpSetup,
 		shellQuote(req.ProjectPath),
+		timeoutPrefix,
 		mcpArg,
 		permissionArgs,
 		sessionArg,
@@ -1679,20 +1889,24 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 	stdin, err := session.StdinPipe()
 	if err != nil {
 		session.Close()
+		r.removeRemoteMCPFile(mcpPath)
 		return nil, fmt.Errorf("SSH stdin pipe: %w", err)
 	}
 	stdout, err := session.StdoutPipe()
 	if err != nil {
 		session.Close()
+		r.removeRemoteMCPFile(mcpPath)
 		return nil, fmt.Errorf("SSH stdout pipe: %w", err)
 	}
 	stderr, err := session.StderrPipe()
 	if err != nil {
 		session.Close()
+		r.removeRemoteMCPFile(mcpPath)
 		return nil, fmt.Errorf("SSH stderr pipe: %w", err)
 	}
 	if err := session.Start(cmd); err != nil {
 		session.Close()
+		r.removeRemoteMCPFile(mcpPath)
 		return nil, fmt.Errorf("启动远程 Claude 会话失败：%w", err)
 	}
 
@@ -1706,12 +1920,17 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 		turnIdleTimeout:        r.turnIdleTimeout,
 		initialResponseTimeout: r.initialResponseTimeout,
 		toolResultTimeout:      r.toolResultTimeout,
+		mcpCleanup:             func() { r.removeRemoteMCPFile(mcpPath) },
 	}
 
 	go func() {
 		// Read stdout in a loop, dispatching events to the current turn's sink.
 		err := sshSess.readOutputLoop()
-		if waitErr := session.Wait(); err == nil && waitErr != nil {
+		waitErr := session.Wait()
+		// 远端进程已结束：trap EXIT 正常时已删配置，SIGKILL 时靠这里兜底。
+		// 异步执行：SSH 连接已断时 rm 最多等 5s，不能拖住会话完成事件。
+		go sshSess.cleanupMCP()
+		if err == nil && waitErr != nil {
 			// 两件事一起管：
 			//  · "失败"两字是承重的：waitErr 是 Go 的进程状态描述（英文，如
 			//    "Process exited with status 137 from signal KILL"），句子里有残留英文
@@ -1764,6 +1983,9 @@ type sshAgentSession struct {
 	turnIdleTimeout        time.Duration
 	initialResponseTimeout time.Duration
 	toolResultTimeout      time.Duration
+	// mcpCleanup 删除远端 MCP 临时配置；Stop 的 SIGKILL 与正常退出都可能触发，
+	// 由 cleanupMCP 保证只执行一次。
+	mcpCleanup func()
 }
 
 func (s *sshAgentSession) Send(request AgentRunRequest, sink AgentRunSink) error {
@@ -1800,6 +2022,20 @@ func (s *sshAgentSession) Stop() {
 	s.mu.Unlock()
 	if session != nil {
 		_ = session.Signal(ssh.SIGKILL)
+	}
+	// SIGKILL 不会执行远端 trap：这里主动删一次临时配置（cleanupMCP 保证幂等）。
+	// 异步执行，避免 Stop 因一次失败的 SSH 往返阻塞最长 5 秒。
+	go s.cleanupMCP()
+}
+
+// cleanupMCP 删除远端 MCP 临时配置；正常退出与 Stop 可能并发调用，只执行一次。
+func (s *sshAgentSession) cleanupMCP() {
+	s.mu.Lock()
+	cleanup := s.mcpCleanup
+	s.mcpCleanup = nil
+	s.mu.Unlock()
+	if cleanup != nil {
+		cleanup()
 	}
 }
 

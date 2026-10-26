@@ -63,11 +63,16 @@ type Config struct {
 }
 
 const (
-	defaultClaudeTurnIdleTimeout         = 30 * time.Minute
-	defaultClaudeInitialResponseTimeout  = 5 * time.Minute
-	defaultClaudeToolResultTimeout       = 5 * time.Minute
-	defaultAgentUpdateTimeout            = 15 * time.Minute
-	defaultConversationSessionIdleTTL    = 30 * time.Minute
+	defaultClaudeTurnIdleTimeout        = 30 * time.Minute
+	defaultClaudeInitialResponseTimeout = 5 * time.Minute
+	defaultClaudeToolResultTimeout      = 5 * time.Minute
+	defaultAgentUpdateTimeout           = 15 * time.Minute
+	// 原生进程一旦被回收，下一条消息就要用 `claude --resume` 重新载入整份历史：
+	// 真机实测 7.6 MB / 3745 行的会话冷启动要 30~60 秒（新会话 1.4 秒）。30 分钟的
+	// 旧值意味着「隔半小时再问一句」几乎必然重付这笔钱，用户看到的就是发送后长时间
+	// 没有回应。常驻进程数由 conversationsPerRunner 封顶（默认 4），所以把 TTL 放到
+	// 1 小时换的是可预期的内存占用，不是无界增长；空闲回收仍由 reapExpired 负责。
+	defaultConversationSessionIdleTTL    = time.Hour
 	defaultConversationSessionsPerRunner = 4
 	// 60s 是正常退出路径的最坏耗时（读循环有 30s 兜底）的两倍余量：给足正常路径，
 	// 同时保证卡住的会话在一分钟内自愈，而不是永远不可用。
@@ -275,9 +280,15 @@ type Server struct {
 	// storageReclaiming 为真表示后台正在做一次性空间回收（VACUUM，会长时间独占唯一那条
 	// SQLite 连接）。对外暴露在存储用量接口里，让设置页能说明"这段时间为什么卡"。
 	storageReclaiming atomic.Bool
-	dataLock          *dataDirLock
-	httpMu            sync.Mutex
-	httpServer        *http.Server
+	// checkpointSweepDelay 是启动到开始快照维护（清理 + 遗留快照转换）之间的静默期。
+	// 生产用 checkpointSweepStartDelay（2 分钟）；测试里置 0，否则一条用例要白等两分钟。
+	checkpointSweepDelay time.Duration
+	// checkpointCleanupWait 是清理阶段在静默期之外最多再等空闲的时间。
+	// 生产用 checkpointCleanupIdleWait（8 分钟）；等不到也要做，避免持续有运行时饿死清理。
+	checkpointCleanupWait time.Duration
+	dataLock              *dataDirLock
+	httpMu                sync.Mutex
+	httpServer            *http.Server
 	// paths 回答"某个工具现在该用哪个可执行文件"。原先这是 Config 里两个不可变字段，
 	// 被直接读 18 处 —— 平台把工具装到自己的目录之后（托管 prefix 不在 PATH 上），
 	// 那 18 处全都不会知道。所有取值一律经它（见 agent_paths.go）。
@@ -380,6 +391,10 @@ type Server struct {
 	mcpOAuthFlows map[string]*mcpOAuthFlow
 	// 串行化 OAuth 回调提交、取消与临时配置回收，网络请求在锁外执行。
 	mcpOAuthLifecycleMu sync.Mutex
+	// mcpWriteMu 串行化 MCP 配置写入与「删除项目时的 MCP 快照+删除」。
+	// 删除项目要先把密文引用读出来、再在事务里删行；读到写之间若有并发编辑，
+	// 会漏收新引用（永久残留）或误吊销刚改成全局的 server 的凭据。
+	mcpWriteMu sync.Mutex
 	// mcpLastInject 记录每个项目最近一次 MCP 注入快照，供 GET /api/projects/{id}/mcp/status。
 	// 仅内存态：它是「当前运行了什么」的观测，不是用户配置。
 	mcpLastInject          map[string]projectMCPStatus
@@ -541,6 +556,10 @@ type nonStreamingRunLaunch struct {
 type projectWorkspaceLease struct {
 	owner   string
 	holders int
+	// teardown 表示项目删除已经加入这个租约。AI 运行之间可以共享租约，此时
+	// owner 仍是第一个持有者（通常是 AI），光看 owner 无法知道删除正在进行；
+	// Git / 文件等改写操作必须据此拒绝，否则会与删除过程中的 worktree 清理竞态。
+	teardown bool
 }
 
 // projectWorkspaceOccupiedError keeps the lease owner out of the user-facing
@@ -885,6 +904,8 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	cursorRunner := newCursorCLIRunner(config, paths)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
 	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, qoderRunner: qoderRunner, opencodeRunner: opencodeRunner, cursorRunner: cursorRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, gitIndexLocks: map[string]*sync.Mutex{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s.checkpointSweepDelay = checkpointSweepStartDelay
+	s.checkpointCleanupWait = checkpointCleanupIdleWait
 	s.sessionManager = newConversationSessionManager(s)
 	s.remoteCommandWake = make(chan struct{}, 1)
 	s.terminals = newTerminalManager(s)
@@ -1846,6 +1867,12 @@ func (s *Server) migrateRunWorkspaceColumns(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `create index if not exists runs_workspace on runs(workspace_id,created_at desc)`); err != nil {
 		return fmt.Errorf("index runs by workspace: %w", err)
 	}
+	// 活跃 run 的计数（启动维护、checkpoint 转换期间每 2 秒一次）必须走索引：
+	// runs 只随会话级联删除，大库里历史行很多，`status in (...)` 全表扫会独占那条
+	// 唯一的 SQLite 连接。部分索引只收活跃行，代价接近零。
+	if _, err := s.db.ExecContext(ctx, `create index if not exists runs_active_status on runs(status) where status in ('queued','running')`); err != nil {
+		return fmt.Errorf("index active runs: %w", err)
+	}
 	return nil
 }
 
@@ -2174,6 +2201,11 @@ create index if not exists messages_conversation_primary_created on messages(con
 	}
 	if err := s.migrateNotifications(ctx); err != nil {
 		return err
+	}
+	// 通知没有指向 projects 的外键，删项目时级联带不走它们；这里清掉修复之前
+	// 就已经失去项目的遗留行，避免通知中心一直显示点开即 404 的条目。
+	if err := s.pruneOrphanedNotifications(ctx); err != nil {
+		return fmt.Errorf("prune orphaned notifications: %w", err)
 	}
 	if err := s.migrateAgentInstallations(ctx); err != nil {
 		return err
@@ -2774,6 +2806,16 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err)
 		return
 	}
+	// 项目通知已随事务删除：通知客户端重拉未读列表，别让角标停在旧数字。
+	s.broadcastStateEvent(stEvNotifications, projectID)
+	// 内存态的注入快照/免审批模式也在这里清掉（锁已全部释放，避免 mcpWriteMu→s.mu
+	// 这类跨锁等待）。
+	s.mu.Lock()
+	delete(s.mcpLastInject, projectID)
+	for conversationID := range conversationIDs {
+		delete(s.mcpAutoApprove, conversationID)
+	}
+	s.mu.Unlock()
 
 	// Background teardown: from this point the project row and its cascaded
 	// conversations/runs are gone, so any new request to start a run is rejected
@@ -2816,7 +2858,7 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteProjectLocked(ctx context.Context, projectID string) (runners []projectRunnerInterface, conversationIDs map[string]struct{}, status int, resultErr error) {
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
-	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, "project-delete")
+	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, projectDeleteWorkspaceOwner)
 	if !acquired {
 		return nil, nil, http.StatusConflict, s.projectWorkspaceOccupiedError(projectID)
 	}
@@ -2873,6 +2915,21 @@ func (s *Server) deleteProjectLocked(ctx context.Context, projectID string) (run
 	//   conversations -> messages, runs, events, run_usage, run_model_usage
 	//   shortcut_projects (via project_id), shortcut_runs (via conversation_id)
 	//   tasks, task_runs, task_events, task_dependencies
+	// MCP 各表都没有指向 projects 的外键，级联不会带走它们。先取出项目级定义与
+	// OAuth 密文引用（删行之后引用就再也找不到），再在同一事务里删行。
+	// mcpWriteMu 覆盖「快照 + 删除」整段：并发编辑会在快照之后引入新引用，或在快照
+	// 之后把某条项目级 server 改成全局，前者导致密文永久残留、后者导致误吊销。
+	s.mcpWriteMu.Lock()
+	mcpLocked := true
+	defer func() {
+		if mcpLocked {
+			s.mcpWriteMu.Unlock()
+		}
+	}()
+	mcpServers, mcpTokens, mcpErr := s.projectMCPRowsForDeletion(ctx, projectID)
+	if mcpErr != nil {
+		return nil, nil, http.StatusInternalServerError, fmt.Errorf("inspect project MCP data: %w", mcpErr)
+	}
 	tx, txErr := s.db.BeginTx(ctx, nil)
 	if txErr != nil {
 		return nil, nil, http.StatusInternalServerError, txErr
@@ -2889,9 +2946,48 @@ func (s *Server) deleteProjectLocked(ctx context.Context, projectID string) (run
 	if changed != 1 {
 		return nil, nil, http.StatusNotFound, errors.New("project not found")
 	}
+	// notifications 没有指向 projects 的外键（它冗余存了 project_name，以便在项目
+	// 存在期间显示快照），所以级联不会带走它们。必须显式清理：否则通知中心会一直
+	// 留着已删项目的条目，“查看”跳到不存在的项目、得到“项目不存在”的错误页。
+	if _, err = tx.ExecContext(ctx, `delete from notifications where project_id<>'' and project_id=$1`, projectID); err != nil {
+		return nil, nil, http.StatusInternalServerError, err
+	}
+	// 项目级 MCP：定义、项目开关、`.mcp.json` 放行设置、OAuth 令牌。全局定义与
+	// 其它项目的定义不受影响。
+	for _, statement := range []string{
+		// 同时清理「其它项目」指向本项目 server 的历史孤儿绑定（修复前可写出这种行）。
+		`delete from mcp_project_bindings where project_id=$1 or server_id in (select id from mcp_servers where scope='project' and project_id=$1)`,
+		`delete from mcp_project_settings where project_id=$1`,
+		`delete from mcp_oauth_tokens where server_id in (select id from mcp_servers where scope='project' and project_id=$1)`,
+		`delete from mcp_servers where scope='project' and project_id=$1`,
+	} {
+		if _, err = tx.ExecContext(ctx, statement, projectID); err != nil {
+			return nil, nil, http.StatusInternalServerError, fmt.Errorf("clean project MCP data: %w", err)
+		}
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, nil, http.StatusInternalServerError, err
 	}
+	// 密文回收必须在提交之后：项目行与 MCP 行都没了，失败只能记日志。用一个独立
+	// 的后台超时上下文，避免请求 ctx 已取消时一条都回收不了。
+	revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer revokeCancel()
+	s.mcpOAuthLifecycleMu.Lock()
+	for _, server := range mcpServers {
+		s.cancelMCPServerFlows(server.ID)
+		for _, ref := range collectSecretRefs(server.envRaw, server.headersRaw) {
+			s.revokeProjectMCPCredential(revokeCtx, ref)
+		}
+	}
+	s.mcpOAuthLifecycleMu.Unlock()
+	for _, token := range mcpTokens {
+		for _, ref := range []string{token.AccessTokenRef, token.RefreshTokenRef, token.ClientSecretRef} {
+			s.revokeProjectMCPCredential(revokeCtx, ref)
+		}
+	}
+	// MCP 行与密文都已处理完；终端/进程收尾不再需要占着 MCP 写锁。
+	s.mcpWriteMu.Unlock()
+	mcpLocked = false
 	if s.terminals != nil {
 		s.terminals.closeProject(projectID)
 	}
@@ -3224,44 +3320,48 @@ const maxConversationHistoryPerProject = 100
 
 // pruneConversationHistoryTx keeps the newest conversations for a project.
 // Active conversations and the current conversation are retained even when a
-// project temporarily has more than the configured limit.
-func pruneConversationHistoryTx(ctx context.Context, tx *sql.Tx, projectID string) error {
+// project temporarily has more than the configured limit. 返回是否真的删了会话
+// （调用方据此决定要不要广播通知失效信号，避免每次新建会话都触发一次重拉）。
+func pruneConversationHistoryTx(ctx context.Context, tx *sql.Tx, projectID string) (bool, error) {
 	var count int
 	if err := tx.QueryRowContext(ctx, `select count(*) from conversations where project_id=?`, projectID).Scan(&count); err != nil {
-		return err
+		return false, err
 	}
 	excess := count - maxConversationHistoryPerProject
 	if excess <= 0 {
-		return nil
+		return false, nil
 	}
 	rows, err := tx.QueryContext(ctx, `select id from conversations where project_id=? and is_current=0 and status not in ('running','active') order by last_activity_at asc,created_at asc,id asc limit ?`, projectID, excess)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer rows.Close()
 	ids := make([]string, 0, excess)
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return err
+			return false, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
 	for _, id := range ids {
 		if _, err := tx.ExecContext(ctx, `update git_task_records set conversation_id='' where conversation_id=?`, id); err != nil {
-			return err
+			return false, err
+		}
+		if err := deleteConversationNotificationsTx(ctx, tx, id); err != nil {
+			return false, err
 		}
 		if _, err := tx.ExecContext(ctx, `delete from conversations where id=?`, id); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return len(ids) > 0, nil
 }
 
 func (s *Server) pruneConversationHistories(ctx context.Context) error {
@@ -3285,19 +3385,26 @@ func (s *Server) pruneConversationHistories(ctx context.Context) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	anyPruned := false
 	for _, projectID := range projectIDs {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
-		if err := pruneConversationHistoryTx(ctx, tx, projectID); err != nil {
+		prunedHistory, pruneErr := pruneConversationHistoryTx(ctx, tx, projectID)
+		if pruneErr != nil {
 			_ = tx.Rollback()
-			return err
+			return pruneErr
 		}
 		if err := tx.Commit(); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
+		anyPruned = anyPruned || prunedHistory
+	}
+	// 裁剪可能删掉了仍带未读通知的旧会话（事务里已同步清通知），让客户端重拉角标。
+	if anyPruned {
+		s.broadcastStateEvent(stEvNotifications, "")
 	}
 	return nil
 }
@@ -3348,8 +3455,9 @@ func (s *Server) StartBackgroundMaintenance() {
 	}()
 	// 会话快照的清理与转换单独一个 goroutine + 自己的预算：它主要是磁盘活（转换一份遗留
 	// 拷贝快照要整目录读一遍再压缩），不该和空间回收抢同一份 30 分钟预算，也不该让回收等它。
-	// 清理（删孤儿目录）便宜，立刻做；真正的转换在每份之前各自等一个空闲窗口
-	// （见 sweepCheckpointSnapshots），不与正在跑的 agent 抢磁盘。
+	// 清理先等启动后的静默窗口（最多再等一段空闲，不会因机器一直忙而永远饿死）；
+	// 每份转换再各自等一次空闲、开工后也随时可被新开始的运行打断
+	// （见 sweepCheckpointSnapshots），不与用户的第一条消息抢磁盘。
 	go func() {
 		sweepCtx, cancel := context.WithTimeout(s.runtimeCtx, checkpointMaintenanceTimeout)
 		defer cancel()
@@ -3580,8 +3688,9 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err = pruneConversationHistoryTx(r.Context(), tx, c.ProjectID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	prunedHistory, pruneErr := pruneConversationHistoryTx(r.Context(), tx, c.ProjectID)
+	if pruneErr != nil {
+		writeError(w, http.StatusInternalServerError, pruneErr)
 		return
 	}
 	if err = tx.Commit(); err != nil {
@@ -3597,6 +3706,10 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 	})
 	// 新建会话会改变列表页的会话数与活跃标题。
 	s.broadcastStateEvent(stEvProjects, c.ProjectID)
+	// 同一事务里的历史裁剪可能删掉了仍带未读通知的旧会话。
+	if prunedHistory {
+		s.broadcastStateEvent(stEvNotifications, c.ProjectID)
+	}
 	writeJSON(w, http.StatusCreated, c)
 }
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
@@ -3777,8 +3890,9 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err = pruneConversationHistoryTx(r.Context(), tx, fresh.ProjectID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	prunedHistory, pruneErr := pruneConversationHistoryTx(r.Context(), tx, fresh.ProjectID)
+	if pruneErr != nil {
+		writeError(w, http.StatusInternalServerError, pruneErr)
 		return
 	}
 	if err = tx.Commit(); err != nil {
@@ -3791,6 +3905,10 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 	previousSession := s.markConversationSessionStopping(previous.ID)
 	s.projectLifecycleMu.Unlock()
 	locked = false
+	// 清空会话时同一事务里的历史裁剪可能删掉了带未读通知的旧会话。
+	if prunedHistory {
+		s.broadcastStateEvent(stEvNotifications, fresh.ProjectID)
+	}
 	if previousSession != nil {
 		// Stopping a native CLI may wait for a wedged child process. The old
 		// conversation is already archived and marked stopping, so do not hold
@@ -3929,6 +4047,11 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 会话没了，“查看”指向它的通知就是死链；定时任务通知的目标不是会话，保留。
+	if err := deleteConversationNotificationsTx(s.runtimeCtx, tx, conversationID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	result, err := tx.ExecContext(s.runtimeCtx, `delete from conversations where id=?`, conversationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -3947,6 +4070,8 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 指向该会话的通知已一并删除：让客户端重拉未读列表。
+	s.broadcastStateEvent(stEvNotifications, projectID)
 	// Mark the old session before another lifecycle operation can reactivate
 	// the conversation. Stopping the underlying native process happens after
 	// releasing the global lock because it may block.
@@ -4077,6 +4202,10 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if err := deleteConversationNotificationsTx(s.runtimeCtx, tx, id); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 		result, err := tx.ExecContext(s.runtimeCtx, `delete from conversations where id=?`, id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -4093,6 +4222,8 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 被删会话的通知已一并清掉：让客户端重拉未读列表。
+	s.broadcastStateEvent(stEvNotifications, projectID)
 
 	sessions := s.stopConversationSessions(ids)
 	s.projectLifecycleMu.Unlock()
@@ -5800,6 +5931,14 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		s.registerProfileRunCancelLocked(conversation.AgentProfileRevisionID, runID, cancel)
 		s.streamingSetups[runID] = &streamingSetup{}
 		s.mu.Unlock()
+
+		// 先让界面知道"这一轮正在拉起 CLI"，但**只在真的要新起进程时**：常驻会话
+		// 还在的话这一轮是直接写 stdin，几毫秒就开始，闪一条"正在恢复会话上下文"
+		// 反而成了噪音。大会话的 --resume 要几十秒才吐出第一条事件（实测 7.6 MB /
+		// 3745 行 = 30~60 秒），那段空白才是需要解释的。
+		if !s.hasLiveSession(conversation.ID) {
+			s.announceSessionStarting(runID, conversation.ID, conversation.initialized())
+		}
 		s.submitStreamingRunWithProfile(runCtx, streamingRunner, runID, conversation, profile, projectRunner, projectPath, prompt)
 		return m, runID, record, http.StatusAccepted, nil
 	}
@@ -5910,13 +6049,19 @@ func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
 	// AI runs edit the same directory concurrently, just like independent CLI
 	// sessions. Keep the lease as a shared admission record so Git and other
 	// workspace-mutating operations can still see that AI work is active.
-	if lease != nil && lease.owner != owner && !(isAIWorkspaceOwner(lease.owner) && isAIWorkspaceOwner(owner)) {
+	// teardown 必须单独判断：删除加入共享租约时 owner 仍写着先到的 AI，此时任何
+	// 新持有者（包括新的 AI 运行）都不该再进来。释放路径不做这个判断，否则正在
+	// 退出的旧持有者会释放失败、租约永久卡住。
+	if lease != nil && ((lease.teardown && owner != projectDeleteWorkspaceOwner) || !workspaceLeaseCompatible(lease.owner, owner)) {
 		s.mu.Unlock()
 		return nil, false
 	}
 	if lease == nil {
 		lease = &projectWorkspaceLease{owner: owner}
 		s.projectWorkspaceLeases[workspaceKey] = lease
+	}
+	if owner == projectDeleteWorkspaceOwner {
+		lease.teardown = true
 	}
 	lease.holders++
 	s.mu.Unlock()
@@ -5927,8 +6072,11 @@ func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			current := s.projectWorkspaceLeases[workspaceKey]
-			if current == nil || (current.owner != owner && !(isAIWorkspaceOwner(current.owner) && isAIWorkspaceOwner(owner))) {
+			if current == nil || !workspaceLeaseCompatible(current.owner, owner) {
 				return
+			}
+			if owner == projectDeleteWorkspaceOwner {
+				current.teardown = false
 			}
 			current.holders--
 			if current.holders == 0 {
@@ -5950,6 +6098,10 @@ func (s *Server) workspaceOccupiedError(workspaceKey string) error {
 		// The owner may have released the lease immediately after admission was
 		// rejected. The retryable conflict remains correct, just without detail.
 		return &projectWorkspaceOccupiedError{}
+	}
+	if lease.teardown {
+		// 删除正在进行：租约 owner 可能写着先到的 AI 运行，但冲突的实际原因是删除。
+		return &projectWorkspaceOccupiedError{owner: projectDeleteWorkspaceOwner}
 	}
 	return &projectWorkspaceOccupiedError{owner: lease.owner}
 }
@@ -6110,10 +6262,13 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	s.mu.Unlock()
 	token := uuid.NewString()
 	// 新建持久会话时才生成 MCP 配置（会话内工具集固定，运行中的会话不热更新）。
-	mcpKey := "sess-" + conversation.ID
+	// 每次新建会话都带唯一后缀：同名运行时文件会让「旧会话的 cleanup」删掉新会话
+	// 正在使用的配置（watchStreamingSession 在释放锁之后才执行 cleanup）。异常退出
+	// 留下的文件由启动期 TTL 清理兜底。
+	mcpKey := "sess-" + conversation.ID + "-" + uuid.NewString()
 	injection := s.prepareMCPInjection(ctx, conversation.ProjectID, projectPath, conversation.AgentID, runnerID, mcpKey)
 	s.setMCPAutoApprove(conversation.ID, injection.AutoApproveTools)
-	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID), MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools})
+	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID), MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools, MCPStartupTimeout: injection.StartupTimeout})
 	if err != nil {
 		injection.done()
 		s.clearMCPAutoApprove(conversation.ID)
@@ -7257,6 +7412,40 @@ func (s *Server) resolveRunApprovals(runID, decision string) {
 	}
 }
 
+// hasLiveSession 报告这条会话是否已有常驻原生进程。用于决定要不要给界面播报
+// "正在恢复会话上下文"：常驻进程还在时这一轮只是往 stdin 写一行，几毫秒就开始，
+// 再闪一条阶段提示纯属噪音。调用方必须已持 streamMu（sessions 的增删遵守
+// streamMu → s.mu 的同一顺序）。
+func (s *Server) hasLiveSession(conversationID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session := s.sessions[conversationID]
+	return session != nil && !session.stopping
+}
+
+// announceSessionStarting 在真正拉起原生 CLI 之前落一条状态事件。
+//
+// 为什么需要它：流式会话的启动 = 起进程 + 让 CLI 载入 --resume 历史。大会话在这段
+// 时间里一条事件都不会产生（真机实测 7.6 MB / 3745 行要 30~60 秒），界面只能显示
+// 笼统的"正在处理任务"，用户无从判断是慢还是卡死。这条事件让时间线与状态条能说出
+// "正在恢复会话上下文"，并带上历史条数 —— 用户据此决定该等还是该开新会话。
+//
+// 历史条数只统计主消息（parent_tool_use_id 为空），与远端快照口径一致；查询走
+// messages(conversation_id, created_at) 索引，代价与"列一次会话"同级。
+// 只统计 resume 场景：新会话没有历史可载入，报 0 会让提示语自相矛盾。
+func (s *Server) announceSessionStarting(runID, conversationID string, resume bool) {
+	history := 0
+	if resume {
+		_ = s.db.QueryRowContext(s.runtimeCtx, `select count(*) from messages where conversation_id=? and parent_tool_use_id=''`, conversationID).Scan(&history)
+	}
+	s.appendEvent(runID, conversationID, "system", mustJSON(map[string]any{
+		"type":            "system",
+		"subtype":         "session_starting",
+		"resume":          resume,
+		"historyMessages": history,
+	}))
+}
+
 func (s *Server) appendEvent(runID, conversationID, typ string, payload []byte) {
 	e := Event{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Type: typ, Payload: payload, CreatedAt: time.Now().UTC()}
 	// thinking_tokens are high-frequency telemetry. Keep them out of SQLite and
@@ -7630,6 +7819,8 @@ func projectWorkspaceOwnerSummary(owner string) (kind, summary string) {
 		return "insight", "项目分析正在使用项目工作区"
 	case strings.HasPrefix(owner, "orchestration-"):
 		return "orchestration", "自动编排正在使用项目工作区"
+	case owner == projectDeleteWorkspaceOwner:
+		return "project_delete", "项目正在删除，请稍后重试"
 	default:
 		return "unknown", "另一项项目操作正在使用工作区"
 	}
@@ -8006,33 +8197,47 @@ func (s *Server) wslLocalRunnerMeta(distro, home string) RunnerMeta {
 
 func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	metas := s.runnerRegistry.list()
-	result := make([]map[string]any, 0, len(metas))
-	for _, m := range metas {
-		entry := map[string]any{
-			"id":                m.ID,
-			"name":              m.Name,
-			"environment":       m.Environment,
-			"root":              m.Root,
-			"roots":             m.Roots,
-			"profileManagement": s.canManageProfileRunner(m.ID),
-		}
-		if m.Host != "" {
-			entry["host"] = m.Host
-		}
-		// 探测目录里每个工具的状态。两个旧字段由 agents[] **派生**（同源），
-		// 不再各自探测一遍 —— 原先这里与 runnerStatus 是两段近乎逐行重复的代码。
-		_, runnerRegistered := s.runnerRegistry.get(m.ID)
-		agents := s.probeAgents(r.Context(), m)
-		entry["agents"] = agents
-		for key, value := range legacyAgentFields(agents, runnerRegistered) {
-			entry[key] = value
-		}
-
-		result = append(result, entry)
+	result := make([]map[string]any, len(metas))
+	// 各台机器**并行**探测：它们彼此无关，而耗时是叠加的。
+	//
+	// 串行时首屏耗时是各台之和（WSL 冷启动 7s 起，每台 SSH 再加一次往返与
+	// 可能的 10s 连接超时），环境一多就撞上前端 15 秒的读超时（api.ts 的
+	// requestTimeoutMs）；并行之后是其中**最慢的那一台**。
+	var probes sync.WaitGroup
+	for index, m := range metas {
+		probes.Add(1)
+		go func(index int, m RunnerMeta) {
+			defer probes.Done()
+			entry := map[string]any{
+				"id":                m.ID,
+				"name":              m.Name,
+				"environment":       m.Environment,
+				"root":              m.Root,
+				"roots":             m.Roots,
+				"profileManagement": s.canManageProfileRunner(m.ID),
+			}
+			if m.Host != "" {
+				entry["host"] = m.Host
+			}
+			// 探测目录里每个工具的状态。两个旧字段由 agents[] **派生**（同源），
+			// 不再各自探测一遍 —— 原先这里与 runnerStatus 是两段近乎逐行重复的代码。
+			_, runnerRegistered := s.runnerRegistry.get(m.ID)
+			// 通道断了就不去跑那批必然失败的探测（省掉一整轮远端连接超时），
+			// 直接给出"通道断了"这一档：理由写通道断开的原因，**不是**"未安装"。
+			var agents []AgentStatus
+			if healthy, reason := s.probeChannelHealth(r.Context(), m); healthy {
+				agents = s.probeAgents(r.Context(), m)
+			} else {
+				agents = s.channelUnavailableStatuses(m, reason)
+			}
+			entry["agents"] = agents
+			for key, value := range legacyAgentFields(agents, runnerRegistered) {
+				entry[key] = value
+			}
+			result[index] = entry
+		}(index, m)
 	}
-	if result == nil {
-		result = []map[string]any{}
-	}
+	probes.Wait()
 	writeJSON(w, http.StatusOK, result)
 }
 

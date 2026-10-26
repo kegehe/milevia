@@ -275,6 +275,37 @@ GET /api/runners/{runnerID}/agents
 2. `probeOk=true` 且 `installed=false` → **真的未安装**，给出「安装」按钮；
 3. 请求进行中 → 骨架/加载态。
 
+> ⚠️ `installed=false` 还要再分三档，它们的**下一步完全不同**（服务端在 `reason` 里
+> 逐档给说法，界面照着说，不自己另编一句）：
+> ① **这个环境不提供该工具** → 换环境（`updateSupported=false` 是这一档的判据）；
+> ② **登记里装过、但现在跑不起来** → 去检测并修复（判据是登记项，不是 `installed`）；
+> ③ **真的没装** → 去装它。
+
+**通道级失败怎么判定**（2026-10-26 补）：注册表只能回答"这台机器在不在清单里"，
+回答不了"现在还连得上吗" —— 于是连不上的 SSH 会被说成"工具没装"，用户被支去装一个
+装不上的东西。现在跨端 runner 要先回答一次 `ChannelHealth`（SSH 那条是"能不能在远端
+跑一条最便宜的命令"，一次覆盖 TCP／握手／认证／exec 四层），不可用就直接报
+`probeOk=false` + 原因（如 `prod：SSH 连接失败：连接被拒绝`），**不再跑那批必然失败的
+工具探测**。判据只有一处（`channel_health.go` 的 `probeChannelHealth`）：工具状态端点、
+诊断端点、`/api/runners` 与读数汇聚点（`probeAgentsFor`，手机端快照也走它）都调它，
+因此对同一台机器必然给出同一个结论。
+
+**跨端命令的 PATH 前置**（2026-10-26 补）：平台在远端装的那份 CLI 落在托管 npm
+prefix 下（`$HOME/.local/share/milevia/toolchain/npm-global`），而 SSH 的非交互
+shell 的 PATH 里没有它 —— 不前置的话，"装完"与"用得上"就是两件事：探测报未安装、
+升级报未安装、会话 command not found。现在远端命令统一走 `sshRemoteCommand`
+（探测）与 `sshSessionPrefix`（会话），都前置 `crossManagedPathPrefix()`，
+与目录驱动的工具（`crossProbe`）和 OpenCode 的会话命令同一口径。
+
+> ⚠️ 这条纪律的漏网处**不止一处**，2026-10-26 的复查分两次共找出六处：Claude 与
+> Codex 的探测与版本、跨端升级、远端会话命令、SSH 预检里的 claude 探测、远端 MCP 的
+> 能力探测、MCP 的远端命令检查。为防再犯，`TestRemoteCLICommandsPrefixManagedPath`
+> 用**源码断言**钉住：凡是直接执行 CLI 名的远端命令，一律判失败（变异实测：把其中
+> 一处改回裸命令，该断言变红并指出位置）。
+>
+> ⚠️ 反过来也不是"所有远端命令都要加前缀"：`crossRuntimeProbeScript` 用绝对路径
+> 区分托管那份与系统那份，**故意**不加前缀 —— 加了反而分不清。
+
 另需区分三档**不可安装**，文案各不相同：远端未授权（§9.1）／运行时缺失或版本过低（§7.3）／该架构或 libc 无官方分发包（§7.4）。三者都不能渲染成灰按钮了事。
 
 > ⚠️ **运行时探测只放在这个端点**，不要加进 `/api/runners`（§14.G）：`listRunners`（`app.go:6839`）已经对每个 runner 起一次 `claude --version`，而 `ConversationPage.tsx:543` 在更新中每 5s 轮询 `/api/runners`；再塞 node/npm 探测会变成每次多两个子进程。

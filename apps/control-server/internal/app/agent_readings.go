@@ -202,7 +202,18 @@ func (s *Server) probeAgentsFor(ctx context.Context, meta RunnerMeta, force bool
 		// 产出不该取决于"最先发起的那个请求有多有耐心"（与 wsl_agent_runner.go:137-143 同源）。
 		probeCtx, cancel := s.agentProbeContext()
 		defer cancel()
-		statuses := s.probeAgentsUncached(probeCtx, meta)
+		// 通道级失败与"工具没装"是两件事（见 channel_health.go）：连不上的机器
+		// 不该被说成"工具没装"。先问一次通不通，断了就直接给出那一档读数 ——
+		// 省掉一整轮必然失败的远端探测，措辞也对。
+		//
+		// 这一档照常入缓存：它是"不可用"，保鲜期取短的那档（agentReadingsStaleTTL），
+		// 于是机器恢复后很快就会重探。
+		var statuses []AgentStatus
+		if healthy, reason := s.probeChannelHealth(probeCtx, meta); healthy {
+			statuses = s.probeAgentsUncached(probeCtx, meta)
+		} else {
+			statuses = s.channelUnavailableStatuses(meta, reason)
+		}
 		// 整体超时/被取消 ⇒ 这份读数不完整（每个工具都会落成"不可用"，而那不是事实）。
 		// 不写进缓存：宁可下次重探，也不要把一次"没查成"钉住一个 TTL
 		// —— 与 probeRuntime 那条"取消时不入缓存"同源。

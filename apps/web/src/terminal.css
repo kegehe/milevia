@@ -254,6 +254,13 @@
 .terminal-status.disconnected i, .terminal-status.exited i { background: #c3922b; }
 @keyframes terminal-pulse { 50% { opacity: 0.35; transform: scale(0.75); } }
 
+/* ─── 关闭终端确认：沿用其它确认弹窗的图标块，裸 SVG 会按默认 300×150 渲染 ─────── */
+
+.terminal-close-dialog .confirm-dialog-heading { display: flex; min-width: 0; align-items: center; gap: 11px; }
+.terminal-close-dialog .confirm-dialog-icon { display: grid; width: 34px; height: 34px; flex: none; place-items: center; border: 1px solid #e6b7ae; border-radius: 7px; color: #ae493b; background: #fdeeea; }
+.terminal-close-dialog .confirm-dialog-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; }
+.terminal-close-dialog h2 { margin: 0; color: #7d372c; font-size: 17px; font-weight: 700; line-height: 1.25; }
+
 /* ─── 窄屏：卡片头换行（操作钮第一行右侧，标签第二行通铺）──────────────────── */
 
 @media (max-width: 760px) {
