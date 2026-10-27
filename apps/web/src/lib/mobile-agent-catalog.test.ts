@@ -1,31 +1,64 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { MOBILE_AGENTS } from "./mobile-agent-catalog";
+import { MOBILE_AGENTS, mobileAgent } from "./mobile-agent-catalog";
 
-// 手机端的工具清单是**手写镜像**（服务端目录在 Go 侧）。这份镜像有两处：
-// lib/mobile-agent-catalog.ts（设置页的默认工具下拉）与 pages/MobileRemotePage.tsx
-// 里那份（远程控制页新建会话真正用的）。两处都不在编译期与 Go 目录关联，于是"目录加了
-// 工具、手机端没跟"只会表现为"手机端少一个可选项"，没有任何测试会红。
-//
-// 这条用例把三个集合钉在一起：Go 目录的 ID、TSX 的 MobileAgentID 联合类型、lib 的清单。
-// 双向比：多一个少一个都算漂移。解析不到时不静默通过（锚点自证）。
-test("手机端工具清单与服务端目录 ID 集合一致", async () => {
+test("手机端设置页与远程控制页共用工具清单", async () => {
+  const pages = await Promise.all(["SettingsPage", "MobileRemotePage"].map((name) =>
+    readFile(new URL(`../pages/${name}.tsx`, import.meta.url), "utf8"),
+  ));
+  for (const page of pages) {
+    assert.match(page, /import \{ MOBILE_AGENTS \} from "\.\.\/lib\/mobile-agent-catalog"/);
+    assert.match(page, /MOBILE_AGENTS\.map\(/);
+    assert.doesNotMatch(page, /(?:const|let)\s+MOBILE_AGENTS\s*[:=]/);
+  }
+});
+
+// Go 侧是服务端目录的来源。除了 ID，还保护名称、厂商、权限档位及默认权限，
+// 避免手机端仍能选中工具，却显示旧名称或提交服务端不支持的权限。
+test("手机端工具清单与服务端目录一致", async (t) => {
   const catalog = await readFile(
     new URL("../../../control-server/internal/app/agent_catalog.go", import.meta.url),
     "utf8",
-  ).catch(() => "");
-  if (!catalog) return; // 只装了 web 包的裁剪环境，跳过
+  ).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (catalog === undefined) {
+    t.skip("只装了 web 包的裁剪环境，没有服务端目录");
+    return;
+  }
 
-  const serverIDs = [...catalog.matchAll(/^\s*ID:\s+"([a-z0-9-]+)",/gm)].map((match) => match[1]);
-  assert.ok(serverIDs.length >= 3, "从 agent_catalog.go 解析出的工具太少：" + JSON.stringify(serverIDs));
+  const entries = catalog.match(/var agentCatalogEntries = \[\]AgentCatalogEntry\{([\s\S]*?)^\}/m)?.[1];
+  assert.ok(entries, "找不到 agentCatalogEntries");
+  const serverAgents = [...entries.matchAll(/^\t\{\r?\n([\s\S]*?)^\t\},/gm)].map((match) => {
+    const entry = match[1];
+    const field = (name: string) => {
+      const value = entry.match(new RegExp(`^\\s*${name}:\\s+"([^"]+)",`, "m"))?.[1];
+      assert.ok(value, `目录条目缺少 ${name}：${entry}`);
+      return value;
+    };
+    const modes = entry.match(/^\s*PermissionModes:\s+\[\]string\{([^}]+)\}/m)?.[1];
+    assert.ok(modes, `目录条目缺少 PermissionModes：${entry}`);
+    return {
+      id: field("ID"),
+      name: field("Name"),
+      vendor: field("Vendor"),
+      permissionModes: [...modes.matchAll(/"([a-z_]+)"/g)].map((mode) => mode[1]),
+      defaultPermission: field("DefaultPermissionMode"),
+    };
+  });
+  const serverIDs = [...entries.matchAll(/^\s*ID:\s+"([a-z0-9-]+)",/gm)].map((match) => match[1]);
+  assert.ok(serverIDs.length >= 3, "从 agent_catalog.go 解析出的工具太少");
+  assert.equal(serverAgents.length, serverIDs.length, "未能解析全部目录条目");
 
-  const page = await readFile(new URL("../pages/MobileRemotePage.tsx", import.meta.url), "utf8");
-  const union = page.match(/type MobileAgentID = ([^;]+);/)?.[1] ?? "";
-  const pageIDs = [...union.matchAll(/"([a-z0-9-]+)"/g)].map((match) => match[1]);
-  assert.ok(pageIDs.length >= 3, "抠不到 MobileRemotePage 的 MobileAgentID 联合类型：" + JSON.stringify(union));
+  const mobileAgents = MOBILE_AGENTS.map(({ id, name, vendor, permissionModes, defaultPermission }) =>
+    ({ id, name, vendor, permissionModes, defaultPermission }),
+  );
+  assert.deepEqual(mobileAgents, serverAgents, "手机端工具信息或顺序与 agent_catalog.go 漂移");
+});
 
-  const sort = (ids: readonly string[]) => [...new Set(ids)].sort();
-  assert.deepEqual(sort(pageIDs), sort(serverIDs), "MobileRemotePage 的 MobileAgentID 与 agent_catalog.go 漂移");
-  assert.deepEqual(sort(MOBILE_AGENTS.map((agent) => agent.id)), sort(serverIDs), "mobile-agent-catalog.ts 与 agent_catalog.go 漂移");
+test("手机端保留厂商的中文展示名", () => {
+  assert.equal(mobileAgent("codebuddy")?.vendorLabel, "腾讯云");
+  assert.equal(mobileAgent("qoder")?.vendorLabel, "阿里云");
 });

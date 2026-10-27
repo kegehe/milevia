@@ -985,6 +985,31 @@ func (s *Server) instanceSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, value)
 }
 
+// mobileStreamResumeCursor distinguishes an explicit zero checkpoint from a new subscription.
+// A zero checkpoint must receive the first events instead of jumping to the live edge.
+func mobileStreamResumeCursor(r *http.Request) (int64, bool) {
+	lastSequence := int64(0)
+	hasResumeCursor := false
+	if raw := r.URL.Query().Get("after"); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed >= 0 {
+			lastSequence = parsed
+			hasResumeCursor = true
+		}
+	}
+	// EventSource reconnects automatically and carries the last delivered
+	// event in this header. Honor it so reconnects resume from the right point
+	// instead of replaying the entire event history.
+	if raw := strings.TrimSpace(r.Header.Get("Last-Event-ID")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed >= 0 {
+			if parsed > lastSequence {
+				lastSequence = parsed
+			}
+			hasResumeCursor = true
+		}
+	}
+	return lastSequence, hasResumeCursor
+}
+
 // mobileEventStream provides a lightweight downlink for mobile clients. The
 // desktop Agent remains the source of truth; message payloads are forwarded so
 // the client can render immediately, while snapshots remain the recovery path.
@@ -999,20 +1024,7 @@ func (s *Server) mobileEventStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("streaming is unavailable"))
 		return
 	}
-	lastSequence := int64(0)
-	if raw := r.URL.Query().Get("after"); raw != "" {
-		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
-			lastSequence = parsed
-		}
-	}
-	// EventSource reconnects automatically and carries the last delivered
-	// event in this header. Honor it so reconnects resume from the right point
-	// instead of replaying the entire event history.
-	if raw := strings.TrimSpace(r.Header.Get("Last-Event-ID")); raw != "" {
-		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > lastSequence {
-			lastSequence = parsed
-		}
-	}
+	lastSequence, hasResumeCursor := mobileStreamResumeCursor(r)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-store")
 	w.Header().Set("Connection", "keep-alive")
@@ -1057,7 +1069,7 @@ func (s *Server) mobileEventStream(w http.ResponseWriter, r *http.Request) {
 	// load, so a replay would push thousands of stored events to a phone that
 	// already has their result — and, because delivery is bounded per pass,
 	// those stale events would delay the live ones behind them.
-	if lastSequence == 0 {
+	if !hasResumeCursor {
 		if newest, err := s.instanceEventCursor(r.Context(), instanceID); err == nil {
 			lastSequence = newest
 		}

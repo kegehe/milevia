@@ -224,8 +224,9 @@ func rollbackInterruptedNpmCodexInstall(prefix, previous string) (string, error)
 // 没有被测试覆盖的路径，抽成纯函数后可直接断言，见 TestCodexExecArgsPassModel）。
 //
 // profileArgs 由 profileLaunch 产出（凭据/端点注入），schemaPath 非空时先落 --output-schema，
-// policy 是调用方已校验过的 sandbox 值（与 SSH 侧的 buildSSHCodexExecCommand 同形，
-// 保持纯函数、不吞错误）。参数顺序与既有实现逐一对应：resume 分支不带 -C/--sandbox 是既有行为。
+// policy 是调用方已校验过的 sandbox 值。prompt 始终通过 stdin 提供，末尾的 "-"
+// 是 CLI 的 stdin 标记：Windows npm .cmd 会截断 argv 中的多行文本，也有命令长度限制。
+// resume 分支不带 -C/--sandbox 是既有行为。
 func codexExecArgs(request AgentRunRequest, profileArgs []string, schemaPath, policy string) []string {
 	args := []string{"exec"}
 	if schemaPath != "" {
@@ -242,9 +243,9 @@ func codexExecArgs(request AgentRunRequest, profileArgs []string, schemaPath, po
 		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", request.ReasoningEffort))
 	}
 	if request.Resume {
-		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
+		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, "-")
 	} else {
-		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, request.Prompt)
+		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, "-")
 	}
 	return args
 }
@@ -275,6 +276,9 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	cmd := codexCommandContext(context.Background(), r.codexBinary(), args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
+	// os/exec 并发复制 stdin 与读取输出，避免长 prompt 填满管道后与 CLI 互相等待。
+	// Wait 会检查复制错误；进程结束或取消时也会关闭 stdin，不遗留写入 goroutine。
+	cmd.Stdin = strings.NewReader(request.Prompt)
 	configureProcessGroup(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -287,24 +291,17 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Codex: %w", err)
 	}
+	// 进程树放进 Job Object：turn.completed 之后仍握着输出管道的后裔（dev server、
+	// playwright、后台 shell）会随句柄关闭一起结束，不再变成谁也杀不到的孤儿。
+	releaseTree := containAgentProcess(cmd)
+	defer releaseTree()
 	completion := newCodexTurnCompletion()
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-completion.done:
-			// Codex has supplied its terminal event. Do not wait indefinitely for
-			// the CLI wrapper or one of its descendants to close inherited pipes.
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-			}
-		case <-done:
-		}
-	}()
+	// Cancellation and turn completion both reclaim the CLI and its children,
+	// including a process that has not consumed a large stdin prompt yet. 收尾有界：
+	// 见 watchAgentProcess（超过宽限期会关闭输出读端，不允许运行永久停在 running）。
+	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, request.ProjectPath, completion) }()
@@ -780,8 +777,8 @@ func readCodexStderr(reader io.Reader, sink AgentRunSink) {
 	scanner.Split(wslStderrSplit)
 	for scanner.Scan() {
 		if text := strings.TrimSpace(decodeAgentOutputLine(scanner.Bytes())); text != "" {
-			// codex exec emits this informational line when its /dev/null stdin is
-			// non-interactive. The prompt is already supplied through argv.
+			// Codex may announce non-interactive stdin on stderr. This is an
+			// informational notice, not a diagnostic to display as an error.
 			if text == codexAdditionalStdinNotice {
 				continue
 			}

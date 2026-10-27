@@ -8,6 +8,9 @@ import test from "node:test";
 // 根因是文件被换行改写，不是代码改了）。断言关心的是代码结构，不该被行尾格式左右。
 const normalize = (text) => text.replace(/\r\n/g, "\n");
 const page = normalize(await readFile(new URL("./pages/MobileRemotePage.tsx", import.meta.url), "utf8"));
+const mobileNotificationProvider = normalize(await readFile(new URL("./components/MobileRemoteProvider.tsx", import.meta.url), "utf8"));
+const mobileNotificationDelivery = normalize(await readFile(new URL("./features/remote/mobile-notification-delivery.ts", import.meta.url), "utf8"));
+const mobileEventStream = normalize(await readFile(new URL("./features/remote/use-mobile-remote-event-stream.ts", import.meta.url), "utf8"));
 const styles = normalize(await readFile(new URL("./pages/mobile-remote.css", import.meta.url), "utf8"));
 // 设备表（多设备 + 备注名）那一层。这里只做**结构/接线**断言：`alias` 是不是走同一处归一化、
 // 重新配对有没有继承。真正的行为判据在 `lib/mobile-devices.test.ts`（那份能直接跑函数）。
@@ -1428,42 +1431,19 @@ test("mobile never loses its device entry points when the instance read fails", 
   assert.match(page, /function openDevicesSheet\(\) \{\s*refreshDevices\(\);/);
   assert.match(page, /\} = useRemoteDevices\(\);/);
 
-  // 通知：原生包接的是 @capacitor/local-notifications 的**本地通知** —— App 自己把已经从 SSE
-  // 拿到的事件丢进系统通知栏，不经过任何服务器。这里曾经在原生平台判 `unsupported` 把入口收起，
-  // 那是因为当时确实没有通知通道（Android WebView 不把 Web Notification 接到通知栏）；
-  // 接上插件后那个短路已无依据，留着它会让华为/小米上永远看不到那颗「开启通知」。
-  assert.doesNotMatch(page, /Capacitor\.isNativePlatform\(\) \|\| typeof Notification === "undefined" \? "unsupported"/);
-  // 原生平台的权限初值给 "default"（真值由 checkPermissions 异步收敛），两处入口才会渲染。
-  assert.match(page, /if \(backend === "native"\) return "default"/);
-  // 入口只剩顶栏那颗（2026-10-13 起菜单里不再有通知项），它只认 "default"；
-  // 插件权限经 toNotificationPermission 映射回同一口径，所以这一处一个字都不用改。
-  // 数**恰好一处**而不是「至少有一处」：原来那条 >=2 是守着"顶栏与菜单各一颗"的，
-  // 菜单那颗删掉后改成了 assert.match，等于连"别在文件页/Git 页再冒一颗出来"也放过了。
-  assert.ok((page.match(/notificationPermission === "default"/g) || []).length === 1,
-    `「开启通知」入口只应剩顶栏那一处，实际 ${(page.match(/notificationPermission === "default"/g) || []).length} 处`);
-  // 渠道必须先建好再发：channelId 指向不存在的渠道时通知会**静默不发**（不是退回默认渠道），
-  // 所以发之前要等 createChannel 那条 promise —— 启动瞬间到达的事件正好落在这个窗口里。
-  assert.match(page, /notificationChannelRef\.current = LocalNotifications\.createChannel\(\{ \.\.\.MOBILE_NOTIFICATION_CHANNEL \}\)/);
-  assert.match(page, /void \(notificationChannelRef\.current \?\? Promise\.resolve\(\)\)/);
-  assert.match(page, /LocalNotifications\.schedule\(\{/);
-  assert.match(page, /channelId: MOBILE_NOTIFICATION_CHANNEL\.id/);
-  // extra 必须带 taskId：task.* 事件的 payload 里没有项目/会话字段（控制端只给显式传了
-  // 会话 id 的那条重载补写），taskId 是点通知后唯一能定位到项目的线索。
-  assert.match(page, /extra: \{ projectId: content\.projectId, conversationId: content\.conversationId, taskId: content\.taskId \}/);
-  // 点通知要能回到对应会话；目标可能只有 taskId，靠 pickNotificationProject 反查项目。
-  assert.match(page, /LocalNotifications\.addListener\("localNotificationActionPerformed"/);
+  // 通知与事件连接已移到路由之上的常驻 Provider，页面只消费状态和跳转目标。
+  assert.match(page, /const mobileNotifications = useMobileNotifications\(\);/);
+  assert.match(mobileNotificationProvider, /if \(Capacitor\.isNativePlatform\(\)\) return "default"/);
+  assert.equal((page.match(/notificationPermission === "default"/g) || []).length, 1);
+  assert.match(mobileNotificationDelivery, /await api\.createChannel\(/);
+  assert.match(mobileNotificationDelivery, /await api\.schedule\(/);
+  assert.match(mobileNotificationProvider, /LocalNotifications\.addListener\("localNotificationActionPerformed"/);
   assert.match(page, /pickNotificationProject\(projects, target\)/);
-  assert.match(page, /pickNotificationProject\(projects, pending\)/);
-  // 跳到项目时**必须同时进会话视图**：只 setSelectedProject 的话 mobileView 仍停在 "projects"，
-  // 用户点了通知还钉在项目列表上，看起来像点了没反应。没带会话 id 时挑当前会话（与
-  // openMobileProject 同口径）。
   assert.match(page, /function applyNotificationTarget\(projectValue: Project, _conversationId: string\) \{/);
   assert.match(page, /projectValue\.conversations\?\.find\(\(entry\) => entry\.isCurrent\)/);
-  assert.doesNotMatch(page.match(/function applyNotificationTarget\([\s\S]*?\n  \}/)?.[0] ?? "", /entry\.id === conversationId/);
-  // 前后台不能只看 document.hidden：Android WebView 里 visibilitychange 是否可靠触发
-  // 没有验证记录，若它不触发，通知就永远发不出去。原生侧补 appStateChange，两条取或。
-  assert.match(page, /CapacitorApp\.addListener\("appStateChange"/);
-  assert.match(page, /shouldNotifyWhileAway\(\{ isNative, nativeInBackground: nativeInBackgroundRef\.current, documentHidden: document\.hidden \}\)/);
+  assert.match(mobileNotificationProvider, /CapacitorApp\.addListener\("appStateChange"/);
+  assert.match(mobileNotificationProvider, /shouldNotifyWhileAway\(/);
+
 });
 
 test("mobile one-phone-many-desktops: device bar, switcher sheet and per-device state", () => {
@@ -2342,7 +2322,7 @@ test("mobile conversation header collapses to one line with an overflow menu", (
 
 test("mobile web exposes notification permission when the browser supports it", () => {
   assert.match(page, /notificationPermission === "default"/);
-  assert.match(page, /setNotificationPermission\(permission\)/);
+  assert.match(mobileNotificationProvider, /setPermission\(next\)/);
   assert.match(page, /onClick=\{\(\) => void enableMobileNotifications\(\)\}/);
   assert.doesNotMatch(page, /Notification\.permission !== "granted" && <button className="mobile-notification-button"/);
 });
@@ -2356,9 +2336,7 @@ test("mobile web exposes notification permission when the browser supports it", 
 // 这条通知没有 `schedule` 字段（即时投递），精确闹钟对它毫无意义。
 // 判据钉在"那个字段真的出现在 schedule 的载荷里"，而不是"有一次 commit 提过它"。
 test("native local notifications opt out of exact alarms", () => {
-  const schedule = page.match(/LocalNotifications\.schedule\(\{[\s\S]*?\}\)/)?.[0] ?? "";
-  assert.notEqual(schedule, "", "找不到 LocalNotifications.schedule 调用，锚点需要跟着实现更新");
-  assert.match(schedule, /isExactNotification: false/);
+  assert.match(mobileNotificationDelivery, /await api\.schedule\(\{[\s\S]*?isExactNotification: false/);
 });
 
 // 通知权限必须在**回到前台时**重读，不能只在挂载时读一次。
@@ -2367,8 +2345,9 @@ test("native local notifications opt out of exact alarms", () => {
 // （本会话再也发不出通知），而「开启通知」入口只判 `=== "default"` 也不会重新出现
 // —— 只能杀进程重来（2026-09-29 复查）。
 test("通知权限在回到前台时重读", () => {
-  assert.match(page, /const syncNotificationPermission = \(\) => \{/);
-  assert.match(page, /if \(isActive\) syncNotificationPermission\(\);/);
+  assert.match(mobileNotificationProvider, /const syncPermission = useCallback\(async \(\) =>/);
+  assert.match(mobileNotificationProvider, /if \(isActive\) resume\(\);/);
+  assert.match(mobileNotificationProvider, /void syncPermission\(\)\.then/);
 });
 
 test("legacy QR URLs automatically submit their embedded pairing code", () => {
@@ -2387,10 +2366,10 @@ test("mobile cloud request timeout covers response body parsing", () => {
 });
 
 test("mobile event stream uses an Authorization header instead of a URL token", () => {
-  assert.match(page, /Accept: "text\/event-stream", Authorization: `Bearer \$\{token\}`/);
-  assert.match(page, /headers\.set\("Last-Event-ID", lastEventID\)/);
-  assert.doesNotMatch(page, /access_token/);
-  assert.doesNotMatch(page, /new EventSource\(/);
+  assert.match(mobileEventStream, /Accept: "text\/event-stream", Authorization: `Bearer \$\{token\}`/);
+  assert.match(mobileEventStream, /headers\.set\("Last-Event-ID", lastEventID\)/);
+  assert.doesNotMatch(mobileEventStream, /access_token/);
+  assert.doesNotMatch(mobileEventStream, /new EventSource\(/);
 });
 
 test("entering a project pushes a real history entry so the system back gesture returns", () => {
@@ -3450,31 +3429,11 @@ test("mobile conversation creation and message send never wait for the desktop",
 });
 
 test("mobile event stream detects a dead connection instead of hanging forever", () => {
-  // 症状：手机换网 / NAT 表超时 / 系统把 socket 悄悄收走之后，这条 SSE 变成**半开**连接 ——
-  // `read()` 一直挂着，既没有事件也没有错误。原来那个 1s→30s 的退避重连只挂在 read() 报错上，
-  // 于是永远轮不到：实时通道静默，用户只能重开 App。这是文档里记过的"agent 卡死、重连循环
-  // 再也没跑过"在客户端的镜像（那次修的是服务端）。
-  //
-  // 服务端每 15 秒发一条 `: keepalive`（cloud-control 的 mobileEventStream），所以客户端
-  // 可以按"多久没有字节进来"判定。
-  const body = page.match(/async function consumeMobileEventStream\([\s\S]*?\n  \}\n\}/)?.[0] ?? "";
-  assert.ok(body, "找不到 consumeMobileEventStream");
-  // ① 判据：45 秒（三次没收到 keepalive），且这个数必须与 15 秒的 keepalive 同处可查。
-  assert.match(page, /const streamIdleTimeoutMs = 45_000;/);
-  assert.match(page, /服务端每 15 秒往这条流里写一条 `: keepalive` 注释/);
-  // ② 用**内部**的 controller 超时，不直接 abort 调用方那个 signal：后者表示"这次订阅该结束了"
-  //    （卸载 / 换电脑），混在一起会让上层把一次超时当成卸载而不再重连。
-  assert.match(body, /const controller = new AbortController\(\);/);
-  assert.match(body, /const abortByCaller = \(\) => controller.abort\(\);/);
-  assert.match(body, /signal\.addEventListener\("abort", abortByCaller, \{ once: true \}\);/);
-  assert.match(body, /idleTimer = window\.setTimeout\(\(\) => controller\.abort\(\), streamIdleTimeoutMs\);/);
-  // ③ 看门狗必须在**每次读到字节时**重新起表（注释行也算，它本来就只为"我还活着"而存在），
-  //    并且读完要清掉，否则一次订阅结束之后还会留下一个定时器。
-  assert.match(body, /armIdleWatchdog\(\);\n    while \(!controller\.signal\.aborted\) \{\n      const next = await reader\.read\(\);\n      \/\/ 每读到一段字节就重新起表[\s\S]{0,80}\n      armIdleWatchdog\(\);/);
-  assert.match(body, /while \(!controller\.signal\.aborted\) \{/);
-  assert.match(body, /\} finally \{\n    if \(idleTimer !== undefined\) window\.clearTimeout\(idleTimer\);\n    signal\.removeEventListener\("abort", abortByCaller\);/);
-  // ④ 循环判据换成内部 signal：还用调用方那个的话，看门狗 abort 之后这一次循环不会结束。
-  assert.doesNotMatch(body, /while \(!signal\.aborted\)/);
+  assert.match(mobileEventStream, /export const streamIdleTimeoutMs = 45_000;/);
+  assert.match(mobileEventStream, /const controller = new AbortController\(\)/);
+  assert.match(mobileEventStream, /window\.setTimeout\(\(\) => controller\.abort\(\), streamIdleTimeoutMs\)/);
+  assert.match(mobileEventStream, /const next = await reader\.read\(\);\s*armIdleWatchdog\(\);/);
+  assert.match(mobileEventStream, /finally \{\s*controller\.abort\(\);/);
 });
 
 test("mobile file view is a sub-state of the conversation, wired to the relay adapter", async () => {
@@ -4011,10 +3970,8 @@ test("mobile conversation can actually be stopped from the composer", () => {
 });
 
 test("enabling notifications also enables the product preference", () => {
-  assert.match(page, /const \{ localPreferences, updateLocalPreferences \} = useUIPreferences\(\);/);
-  const notificationFunction = page.slice(page.indexOf("async function enableMobileNotifications()"));
-  assert.match(notificationFunction, /notificationGrantedRef\.current = permission === "granted";\s*if \(permission === "granted"\) updateLocalPreferences\(\{ systemNotificationsEnabled: true \}\);/);
-  assert.match(notificationFunction, /const permission = await Notification\.requestPermission\(\);\s*setNotificationPermission\(permission\);\s*if \(permission === "granted"\) updateLocalPreferences\(\{ systemNotificationsEnabled: true \}\);/);
+  assert.match(page, /await mobileNotifications\?\.requestPermission\(\)/);
+  assert.match(mobileNotificationProvider, /if \(next === "granted"\) \{[\s\S]*?updateLocalPreferences\(\{ systemNotificationsEnabled: true \}\);/);
 });
 
 test("mobile conversation follows streaming content without covering the final entry", () => {

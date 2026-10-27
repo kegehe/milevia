@@ -53,6 +53,7 @@ type Config struct {
 	ClaudeTurnIdleTimeout         time.Duration
 	ClaudeInitialResponseTimeout  time.Duration
 	ClaudeToolResultTimeout       time.Duration
+	AgentRunIdleTimeout           time.Duration
 	ConversationSessionIdleTTL    time.Duration
 	ConversationSessionsPerRunner int
 	// ConversationSessionExitGrace 是会话被要求停止之后，仍愿意等待其进程真正
@@ -67,6 +68,7 @@ const (
 	defaultClaudeInitialResponseTimeout = 5 * time.Minute
 	defaultClaudeToolResultTimeout      = 5 * time.Minute
 	defaultAgentUpdateTimeout           = 15 * time.Minute
+	defaultAgentRunIdleTimeout          = 30 * time.Minute
 	// 原生进程一旦被回收，下一条消息就要用 `claude --resume` 重新载入整份历史：
 	// 真机实测 7.6 MB / 3745 行的会话冷启动要 30~60 秒（新会话 1.4 秒）。30 分钟的
 	// 旧值意味着「隔半小时再问一句」几乎必然重付这笔钱，用户看到的就是发送后长时间
@@ -185,6 +187,7 @@ func ConfigFromEnv() Config {
 		ClaudeTurnIdleTimeout:         durationFromEnv("AUTO_CLAUDE_TURN_IDLE_TIMEOUT", defaultClaudeTurnIdleTimeout),
 		ClaudeInitialResponseTimeout:  durationFromEnv("AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT", defaultClaudeInitialResponseTimeout),
 		ClaudeToolResultTimeout:       durationFromEnv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", defaultClaudeToolResultTimeout),
+		AgentRunIdleTimeout:           durationFromEnv("AUTO_AGENT_RUN_IDLE_TIMEOUT", defaultAgentRunIdleTimeout),
 		ConversationSessionIdleTTL:    durationFromEnv("AUTO_CONVERSATION_SESSION_IDLE_TTL", defaultConversationSessionIdleTTL),
 		ConversationSessionsPerRunner: positiveIntFromEnv("AUTO_CONVERSATION_SESSIONS_PER_RUNNER", defaultConversationSessionsPerRunner),
 		ConversationSessionExitGrace:  durationFromEnv("AUTO_CONVERSATION_SESSION_EXIT_GRACE", defaultConversationSessionExitGrace),
@@ -198,6 +201,20 @@ func (c Config) agentUpdateTimeout() time.Duration {
 		return defaultAgentUpdateTimeout
 	}
 	return c.AgentUpdateTimeout
+}
+
+// agentRunIdleTimeout 是一次性运行（Codex / Cursor / OpenCode / WSL / SSH）的
+// 「长时间无输出」上限。
+//
+// 流式 Claude 会话有自己的初始响应 / 回合空闲 / 工具结果三档超时，而这些一次性运行
+// 此前完全没有运行级超时：CLI 卡住（既不输出、也不退出、也不报错）就会永久停在
+// running，只能靠重启控制服务恢复。取值与 Claude 回合空闲超时同口径 —— 只要一直在
+// 输出就会被不断续期，连续 30 分钟一句事件都没有才判定为卡死。
+func (c Config) agentRunIdleTimeout() time.Duration {
+	if c.AgentRunIdleTimeout <= 0 {
+		return defaultAgentRunIdleTimeout
+	}
+	return c.AgentRunIdleTimeout
 }
 
 func durationFromEnv(name string, fallback time.Duration) time.Duration {
@@ -5914,6 +5931,10 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		Payload:        mustJSON(m),
 		CreatedAt:      m.CreatedAt,
 	})
+	// runs 行与 conversations.status 都已提交，运行从这里开始算：立刻让总览页/项目页
+	// 从"已就绪"切到"正在执行"。少了这条广播，卡片只能等 30 秒兜底轮询，短任务甚至
+	// 整个生命周期都不会被显示成"正在执行"。
+	s.broadcastStateEvent(stEvProjects, conversation.ProjectID)
 	s.registerRunWorkspace(runID, releaseWorkspace)
 	workspaceAdmitted = true
 	if !queuedNonStreaming {
@@ -6474,7 +6495,17 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		delete(s.runContexts, runID)
 		s.mu.Unlock()
 	}()
-	err := runner.Run(ctx, AgentRunRequest{
+	// 无输出看门狗：一次性运行的 CLI 卡住时（既不输出、也不退出、也不报错）此前会
+	// 永久停在 running，只能靠重启控制服务恢复。这里只负责取消运行，终态与原因由
+	// 下面统一收敛。流式会话不走这条路径（它有自己的三档超时）。
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	watchdog := newAgentRunIdleWatchdog(s.config.agentRunIdleTimeout(), func() {
+		log.Printf("[run] %s produced no output for %s; cancelling the run", runID, s.config.agentRunIdleTimeout())
+		cancelRun()
+	})
+	defer watchdog.stop()
+	err := runner.Run(runCtx, AgentRunRequest{
 		SessionID:           c.sessionID(),
 		ProjectPath:         projectPath,
 		Prompt:              prompt,
@@ -6494,9 +6525,14 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		CodexMCPArgs:        injection.CodexArgs,
 		OpenCodeConfig:      injection.OpenCodeConfig,
 		MCPAutoApproveTools: injection.AutoApproveTools,
-	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, projectID: c.ProjectID, agentID: c.AgentID})
+	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, projectID: c.ProjectID, agentID: c.AgentID, touch: watchdog.touch})
 	status := "completed"
-	if ctx.Err() != nil {
+	if watchdog.firedOnce() {
+		// 看门狗已经取消过这次运行：把"卡死"如实报成失败并给出可读原因，
+		// 否则用户只会看到一次莫名其妙的 stopped。
+		status = "failed"
+		err = errAgentRunIdleTimeout
+	} else if ctx.Err() != nil {
 		status = "stopped"
 	} else if err != nil {
 		status = "failed"
@@ -6601,6 +6637,10 @@ type agentRunSink struct {
 	// that one relay event per token never reaches the outbox or the cloud.
 	deltaBuffer    strings.Builder
 	deltaEmittedAt time.Time
+	// touch 喂一次"无输出看门狗"（见 agentRunIdleWatchdog）。只有一次性运行
+	// （runAgent 那条路径）会设置它：流式会话有自己的三档超时，不该被第二套计时器
+	// 抢着收尾。
+	touch func()
 }
 
 // assistantMessageEvent is the relayed form of a finished assistant message. It
@@ -6623,6 +6663,9 @@ func (sink *agentRunSink) SetAssistantMessageID(messageID string) {
 // accumulated. Emitting per token would multiply the local event log, the
 // desktop outbox and the cloud's event table for a single reply.
 func (sink *agentRunSink) AssistantDelta(delta string) {
+	if delta != "" && sink.touch != nil {
+		sink.touch()
+	}
 	if sink.assistantMessageID == "" || delta == "" {
 		return
 	}
@@ -6653,6 +6696,9 @@ func (sink *agentRunSink) flushAssistantDelta() {
 }
 
 func (sink *agentRunSink) Event(eventType string, payload json.RawMessage) {
+	if sink.touch != nil {
+		sink.touch()
+	}
 	sink.server.appendEvent(sink.runID, sink.conversationID, eventType, payload)
 	sink.server.collectUsageEvent(sink.runID, sink.conversationID, eventType, payload)
 	// 顺带采样 CLI 的命令目录（docs/37）：init 事件是"当前 CLI 到底支持哪些斜杠命令"
@@ -6835,9 +6881,18 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 			// 否则模型会在一段全新的会话里继续（比多喂一次糟得多）。
 			s.clearContextRebuildFlag(conversationID)
 		}
+		if committed {
+			// 事务提交时 conversations.status 已经是 idle（见上面那条 update），先让总览页 /
+			// 项目页刷新：它们是按这个字段聚合"正在执行"的。之前运行起止从不广播，只能靠
+			// 30 秒兜底轮询，于是"刚开始跑"和"刚跑完"在卡片上都要错最多半分钟。
+			s.broadcastStateEvent(stEvProjects, "")
+		}
 		if committed && status == "completed" && runErr == nil {
 			var prompt string
 			if err := s.db.QueryRowContext(context.Background(), `select content from messages where run_id=? and role='user' order by created_at asc,id asc limit 1`, runID).Scan(&prompt); err == nil {
+				// 快照仍排在终态事件之前：对话页收到 run.<status> 会立刻重拉回退节点列表，
+				// 晚一步就会漏掉"刚跑完的这一轮"（新会话甚至会让回退入口变灰）。工作区租约
+				// 此时还没释放（releaseRunWorkspace 在下面），快照读得到一致的工作树。
 				if err := s.createConversationCheckpoint(context.Background(), conversationID, runID, prompt); err != nil {
 					log.Printf("create conversation checkpoint for run %s: %v", runID, err)
 				}

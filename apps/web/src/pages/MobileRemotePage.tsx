@@ -16,7 +16,7 @@ import { NON_GIT_BRANCH } from "../lib/types";
 import type { ConversationCheckpoint, SystemVariant, PermissionMode, AgentID } from "../lib/types";
 import { AgentLogo } from "../components/AgentLogo";
 import { ExternalLink } from "../components/ExternalLink";
-import type { AgentLogoKey } from "../lib/cli-tools-view";
+import { MOBILE_AGENTS } from "../lib/mobile-agent-catalog";
 import { permissionCopy } from "../lib/agent-registry";
 import { markdownCodeComponents } from "../components/MarkdownCodeBlock";
 import { priorityLabels, statusLabels, type Priority } from "../features/tasks/task-model";
@@ -34,6 +34,8 @@ import { useRemoteSnapshotLoader } from "../features/remote/use-remote-snapshot-
 import { useRemoteInstances } from "../features/remote/use-remote-instances";
 import { useRemoteInstancePolling } from "../features/remote/use-remote-instance-polling";
 import { useMobileRemoteEventStream } from "../features/remote/use-mobile-remote-event-stream";
+import { cloudURL } from "../features/remote/cloud-url";
+import { useMobileNotifications } from "../components/MobileRemoteProvider";
 import { useRemoteDevices } from "../features/remote/use-remote-devices";
 import { useMobilePairingClaim } from "../features/remote/use-mobile-pairing-claim";
 import { useMobilePairingConfirmation } from "../features/remote/use-mobile-pairing-confirmation";
@@ -73,23 +75,13 @@ import { toast } from "sonner";
 import { projectFileReference } from "../lib/project-path";
 import type { NavigationGuard } from "../components/ProjectLayout";
 import { useNavigate } from "react-router-dom";
-import { useUIPreferences } from "../stores/useUIPreferences";
 import { Capacitor } from "@capacitor/core";
 import { App as CapacitorApp } from "@capacitor/app";
 import type { PluginListenerHandle } from "@capacitor/core";
 import { BarcodeScanner } from "@capacitor-mlkit/barcode-scanning";
-import { LocalNotifications } from "@capacitor/local-notifications";
 import { invoke } from "@tauri-apps/api/core";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
-import {
-  MOBILE_NOTIFICATION_CHANNEL,
-  mobileNotificationContent,
-  notificationBackend,
-  notificationIDFromEventID,
-  pickNotificationProject,
-  shouldNotifyWhileAway,
-  toNotificationPermission,
-} from "../lib/mobile-notify";
+import { pickNotificationProject } from "../lib/mobile-notify";
 import { checkMobileUpdate, type MobileUpdateState } from "../features/updater/mobile-update";
 // markdown 渲染的样式依赖必须由本页面自己声明：真机上 main.tsx 全局引入过它，
 // 所以"少这一行"在真机看不出来 —— 但任何绕过 main.tsx 的入口（预览夹具、单页测试）
@@ -354,40 +346,7 @@ function mobileAgentUnavailableReason(project: Project | null | undefined, agent
   return "该工具未安装或当前不可用";
 }
 
-// 手机端可新建的工具清单。**维护规则**：这里必须与电脑端目录
-// （`apps/control-server/internal/app/agent_catalog.go` 的 agentCatalogEntries）保持一致 ——
-// 名称、厂商、权限面取自目录；目录加了新工具而这里没跟，手机端就少一个可选项。
-// 权限面与默认权限同样来自目录（PermissionModes / DefaultPermissionMode）；
-// 手机端没有设置页偏好的通道，默认权限一律用目录声明值。
-type MobileAgentID = "claude-code" | "codex" | "codebuddy" | "qoder" | "opencode" | "cursor";
-type MobileAgent = {
-  id: MobileAgentID;
-  name: string;
-  vendor: string;
-  /** 没有官方图标资产时留空，界面回落两字母牌。 */
-  logo?: AgentLogoKey;
-  /** 目录声明的权限面（PermissionModes）。 */
-  permissionModes: PermissionMode[];
-  /** 目录声明的默认权限（DefaultPermissionMode）。 */
-  defaultPermission: PermissionMode;
-};
-const MOBILE_AGENTS: MobileAgent[] = [
-  { id: "claude-code", name: "Claude Code", vendor: "Anthropic", logo: "claude",
-    permissionModes: ["approval_required", "full_control"], defaultPermission: "approval_required" },
-  { id: "codex", name: "Codex", vendor: "OpenAI", logo: "openai",
-    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-  { id: "codebuddy", name: "CodeBuddy Code", vendor: "腾讯云", logo: "codebuddy",
-    // vendor 有意译成中文（目录原文是 "Tencent Cloud"）—— 界面语言是中文。
-    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-  { id: "qoder", name: "Qoder CLI", vendor: "阿里云",
-    // 没有官方图标资产：不拿别的工具图标顶替（与 agentLogoKey 白名单同一约定）。
-    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-  { id: "opencode", name: "OpenCode", vendor: "Anomaly",
-    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-  { id: "cursor", name: "Cursor CLI", vendor: "Anysphere",
-    // 没有官方图标资产：不拿别的工具图标顶替（与 agentLogoKey 白名单同一约定）。
-    permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-];
+type MobileAgentID = AgentID;
 
 // 状态卡图标沿用桌面时间线那一套字形，两端看到的是同一个符号。
 const noticeIcons: Record<RemoteNotice["variant"], string> = { compact: "◐", compact_result: "✓", compact_boundary: "≡", api_retry: "↻", session: "◌", task: "▸", error: "!" };
@@ -818,14 +777,6 @@ function conversationFromCommandResult(result: unknown): RemoteConversation | nu
   };
 }
 
-// Native builds do not have a proxy origin. Keep a production fallback so an
-// APK built without a local .env can still reach the single public endpoint.
-const configuredCloudURL = (import.meta.env.VITE_CLOUD_URL as string | undefined)?.replace(/\/$/, "") || "";
-// In Vite development use the local /v1 proxy to avoid browser CORS. Native
-// and production builds keep an absolute public URL.
-const cloudURL = Capacitor.isNativePlatform()
-  ? configuredCloudURL || "https://keyanjia.info:8443"
-  : import.meta.env.DEV ? "" : configuredCloudURL;
 /**
  * 手机端自己的等待上限 —— 判据与两个数都挪到了 `features/remote/cloud-budget.ts`。
  *
@@ -1081,77 +1032,6 @@ async function cloud<T>(path: string, init?: RequestInit, deviceToken?: string, 
   }
 }
 
-// 服务端每 15 秒往这条流里写一条 `: keepalive` 注释（见 cloud-control 的 mobileEventStream）。
-// 客户端必须**自己**盯着"还有没有字节进来"，不能只靠 read() 报错：
-// 半开连接（手机换网、NAT 表超时、系统把 socket 悄悄收走）在本地看起来一切正常 ——
-// read() 一直挂着，既没有事件也没有错误，于是上面那个 1s→30s 的退避重连**永远轮不到**，
-// 实时通道就此静默，直到用户重开 App。这正是文档里记过的"agent 卡死、重连循环再也没跑过"
-// 在客户端的镜像（那次修的是服务端）。
-//
-// 判定取 45 秒 = 连着三次没收到 keepalive。误判的代价只是重连一次（很便宜，
-// 而且带 Last-Event-ID 从断点续传），漏判的代价是实时通道一直不恢复。
-const streamIdleTimeoutMs = 45_000;
-
-async function consumeMobileEventStream(url: string, token: string, lastEventID: string, onMessage: (event: MessageEvent) => void, signal: AbortSignal) {
-  const headers = new Headers({ Accept: "text/event-stream", Authorization: `Bearer ${token}` });
-  if (lastEventID) headers.set("Last-Event-ID", lastEventID);
-  // 用**内部**的 controller，不直接 abort 调用方那个 signal：调用方的 signal 表示
-  // "这次订阅该结束了"（卸载 / 换电脑），内部的表示"这条连接已经不新鲜了、该换一条"。
-  // 混在一起的话上层分不清是"该退出"还是"该重连"，会把一次超时当成卸载而不再重连。
-  const controller = new AbortController();
-  const abortByCaller = () => controller.abort();
-  if (signal.aborted) controller.abort();
-  else signal.addEventListener("abort", abortByCaller, { once: true });
-  let idleTimer: number | undefined;
-  const armIdleWatchdog = () => {
-    if (idleTimer !== undefined) window.clearTimeout(idleTimer);
-    idleTimer = window.setTimeout(() => controller.abort(), streamIdleTimeoutMs);
-  };
-  try {
-    const response = await fetch(url, { headers, signal: controller.signal });
-    if (!response.ok) throw new Error(`stream request failed (${response.status})`);
-    if (!response.body) throw new Error("stream response has no body");
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let eventID = "";
-    let data: string[] = [];
-    const dispatch = () => {
-      if (data.length > 0) onMessage(new MessageEvent("message", { data: data.join("\n"), lastEventId: eventID }));
-      data = [];
-      eventID = "";
-    };
-    const processLine = (line: string) => {
-      if (line === "") { dispatch(); return; }
-      if (line.startsWith(":")) return;
-      const separator = line.indexOf(":");
-      const field = separator < 0 ? line : line.slice(0, separator);
-      const value = separator < 0 ? "" : line.slice(separator + 1).replace(/^ /, "");
-      if (field === "id") eventID = value;
-      if (field === "data") data.push(value);
-    };
-    armIdleWatchdog();
-    while (!controller.signal.aborted) {
-      const next = await reader.read();
-      // 每读到一段字节就重新起表：注释行（keepalive）也算，它本来就只为"我还活着"而存在。
-      armIdleWatchdog();
-      if (next.done) {
-        buffer += decoder.decode();
-        if (buffer) processLine(buffer);
-        break;
-      }
-      buffer += decoder.decode(next.value, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || "";
-      for (const line of lines) processLine(line);
-    }
-    dispatch();
-  } finally {
-    if (idleTimer !== undefined) window.clearTimeout(idleTimer);
-    signal.removeEventListener("abort", abortByCaller);
-  }
-}
-
 /** 「选择项目」里的一张磁贴（两列网格）。浮起的那张复用同一份标记 —— 两处各写一遍迟早会长歪。 */
 function MobileProjectChoice({ item, busy, open, isDragSlot = false, ghost = false }: {
   item: Project;
@@ -1184,7 +1064,6 @@ function MobileProjectChoice({ item, busy, open, isDragSlot = false, ghost = fal
 
 export default function MobileRemotePage() {
   const navigate = useNavigate();
-  const { localPreferences, updateLocalPreferences } = useUIPreferences();
   // Capacitor 原生 WebView 可能同时注入桌面运行时对象；原生包始终
   // 使用移动端项目选择/对话布局，避免被桌面分支误判。
   const mobileApp = Capacitor.isNativePlatform() || !isDesktop();
@@ -1251,8 +1130,7 @@ export default function MobileRemotePage() {
   // 优化建议是 inset:0 的整页浮层（z-index 60），与任务队列同一形态：不是会话视图的
   // 子态槽位（sessionSub），不参与顶栏子标题，返回键直接收掉整层。
   const [optimizationOpen, setOptimizationOpen] = useState(false);
-  // 扫描工具的用户选择。null = 还没选过，回落到当前会话的工具（两套类型一致：
-  // MobileAgentID 与 AgentID 是同一个联合，详见各自定义处的维护规则）。
+  // 扫描工具的用户选择。null = 还没选过，回落到当前会话的工具。
   const [optimizationAgent, setOptimizationAgent] = useState<AgentID | null>(null);
   // 会话视图的顶栏：返回 + 会话名 + 刷新 + 新会话 + ⋯。刷新和新会话是高频入口，
   // 历史会话与任务操作收进 ⋯ 菜单。
@@ -1371,28 +1249,8 @@ export default function MobileRemotePage() {
   const [rewindTarget, setRewindTarget] = useState<ConversationCheckpoint | null>(null);
   const [rewinding, setRewinding] = useState(false);
   const [error, setError] = useState("");
-  // 通知权限的初值。两条通道，判定与理由见 lib/mobile-notify.ts 顶部：
-  //   · 原生包（Capacitor）：@capacitor/local-notifications 的**本地通知** —— App 自己把
-  //     已经拿到的事件丢进系统通知栏，不经过任何服务器。权限只能**异步**读
-  //     （checkPermissions 返回 Promise），所以初值先给 "default"：既让那两颗「开启通知」
-  //     入口立刻渲染，也不会在读数回来前把它误显示成"已被拒绝"。真值由下面的接线 effect 收敛。
-  //   · 手机浏览器：Web Notification，权限是同步读的。
-  // 这里曾经在原生平台直接判 `unsupported`——当时确实没有通知通道（2026-09-20 的结论）。
-  // 接上插件后那个短路已无依据：插件的权限态经 toNotificationPermission 映射回同一套
-  // `NotificationPermission` 口径，两处入口的 `=== "default"` 判定因此一个字都不用改。
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(
-    () => {
-      const backend = notificationBackend({ isNativePlatform: Capacitor.isNativePlatform(), hasNotificationAPI: typeof Notification !== "undefined" });
-      if (backend === "native") return "default";
-      return backend === "web" ? Notification.permission : "unsupported";
-    },
-  );
-  // 已授权的镜像。notifyHiddenMobileEvent 是 [] 依赖的 useCallback，读 state 会拿到旧值，
-  // 而"此刻能不能发通知"必须读当前值 —— 所以用 ref，由接线 effect 与 enableMobileNotifications 维护。
-  const notificationGrantedRef = useRef(false);
-  // 原生侧的"用户切走了"信号，来自 Capacitor 的 appStateChange（见下面的接线 effect）。
-  // 同样必须是 ref：回调只注册一次，读 state 会永远停在注册那一刻。
-  const nativeInBackgroundRef = useRef(false);
+  const mobileNotifications = useMobileNotifications();
+  const notificationPermission = mobileNotifications?.permission ?? "unsupported";
   const [pairingCode, setPairingCode] = useState(() => new URLSearchParams(location.search).get("code") || "");
   const [manualPairingCode, setManualPairingCode] = useState("");
   const [pairingID, setPairingID] = useState(() => new URLSearchParams(location.search).get("pairingId") || new URLSearchParams(location.search).get("pairing_id") || "");
@@ -1513,7 +1371,6 @@ export default function MobileRemotePage() {
     code: new URLSearchParams(location.search).get("code") || "",
     attempted: false,
   });
-  const notifiedEventIDs = useRef(new Set<string>());
   const [commandState, setCommandState] = useState<CommandState | null>(null);
 
   // 页面可见性：切到后台时暂停轮询与快照兜底，回到前台立即补一次，省电又省流量。
@@ -1529,15 +1386,6 @@ export default function MobileRemotePage() {
   const emptyThreadRef = useRef(false);
   // 安卓物理返回键的当前处理逻辑。放在 ref 里，监听只注册一次也能拿到最新状态。
   const backHandlerRef = useRef<() => boolean>(() => false);
-  // 点了系统通知之后要跳去哪个会话。同样放 ref：插件的监听只注册一次，
-  // 而跳转要用到 snapshot / 各个 setter 的最新值（理由同 backHandlerRef）。
-  const notificationTapRef = useRef<(extra: { projectId?: string; conversationId?: string; taskId?: string }) => void>(() => undefined);
-  // 点通知时快照里还没有那个项目（冷启动、或刚切电脑）就先挂在这里，等快照到了再认领。
-  const pendingNotificationTargetRef = useRef<{ projectId: string; conversationId: string; taskId: string } | null>(null);
-  // 通知渠道的创建是异步的，而"首条通知到达"可能早于它完成 —— channelId 指向尚未创建的
-  // 渠道时通知**不会发出**（不是退回默认渠道），这是个静默失败，所以发之前要等这一条。
-  const notificationChannelRef = useRef<Promise<unknown> | null>(null);
-
   // 桌面端探测电脑端 Agent 是否已注册到云端。未注册时配对无法进行，页面应引导
   // 用户做一次注册，而不是让用户反复点击注定返回 503 的"生成二维码"。
   //
@@ -2025,66 +1873,6 @@ export default function MobileRemotePage() {
     return false;
   }, []);
 
-  const notifyHiddenMobileEvent = useCallback((raw: MessageEvent) => {
-    const isNative = Capacitor.isNativePlatform();
-    if (!localPreferences.systemNotificationsEnabled) return;
-    // 用户不在看时才提醒。原生侧多一条 appStateChange 信号（两条取或，理由见 mobile-notify.ts）。
-    if (!shouldNotifyWhileAway({ isNative, nativeInBackground: nativeInBackgroundRef.current, documentHidden: document.hidden })) return;
-    // 浏览器的授权状态是同步可读的，照旧实时判；原生侧的授权在"开启通知"那一刻已经过插件，
-    // 这里读 ref 镜像（schedule 自 8.3.0 起会自己补请求权限，那会在用户没预期的时刻弹系统框，
-    // 所以宁可先判）。
-    if (!isNative && (typeof Notification === "undefined" || Notification.permission !== "granted")) return;
-    if (isNative && !notificationGrantedRef.current) return;
-    try {
-      const event = JSON.parse(String(raw.data)) as { eventId?: string; type?: string; taskId?: string; payload?: unknown };
-      // 提成局部常量：下面的 schedule 走的是 then 回调，TS 不会把外面的收窄带进闭包。
-      const eventID = event.eventId;
-      if (!eventID || notifiedEventIDs.current.has(eventID)) return;
-      // 会话消息回到 App 就能看到，不值得打断；要提醒的是任务/运行的状态变化与等待审批。
-      // 判据与文案取法都收在 mobile-notify.ts 里（纯函数，可单测）。
-      const content = mobileNotificationContent(event);
-      if (!content) return;
-      notifiedEventIDs.current.add(eventID);
-      if (isNative) {
-        // 本地通知：纯本地 API 调用，不经过任何服务器，也不依赖 FCM/厂商推送通道。
-        // 前提只有一个 —— App 进程还活着（切后台后能撑多久由系统决定，见 docs/33 的审计）。
-        // 先等渠道建好：channelId 指向尚未创建的渠道时通知会**静默不发**。
-        void (notificationChannelRef.current ?? Promise.resolve())
-          .then(() => LocalNotifications.schedule({
-            notifications: [{
-              // 插件的 id 必须是 32 位整数，事件 id 是字符串，取稳定哈希。
-              // 稳定才意味着同一条事件的重复投递会覆盖同一条通知，而不是在通知栏里堆一串。
-              id: notificationIDFromEventID(eventID),
-              title: content.title,
-              body: content.body,
-              channelId: MOBILE_NOTIFICATION_CHANNEL.id,
-              // 点通知要跳回对应会话，目标只能靠 extra 带过去（通知本身会跨进程存活）。
-              // taskId 是 task.* 事件的唯一线索 —— 那类 payload 里没有项目/会话字段。
-              extra: { projectId: content.projectId, conversationId: content.conversationId, taskId: content.taskId },
-              autoCancel: true,
-              // ⚠️ 必须显式声明"不要精确闹钟"。插件的默认值是 `true`，而它在 `schedule()` 上
-              // 会检查 `canScheduleExactAlarms()`：没有"闹钟和提醒"权限时（Android 14+ 默认
-              // 不授予，本应用 targetSdk 36）插件会 **`startActivityForResult` 打开系统设置页
-              // 然后直接 return** —— 通知不发出、这个 call 一直悬着（既不 resolve 也不 reject，
-              // 所以下面的 catch 永远看不到），用户还平白被弹到设置页；直到他从设置页返回，
-              // 插件才继续排程。而这条通知根本没有 `schedule` 字段（即时投递），
-              // 精确闹钟对即时通知没有任何意义，白担这一跳。
-              // 见 @capacitor/local-notifications 8.3.1 的 definitions.d.ts（`@default true`）
-              // 与 LocalNotificationsPlugin.kt 的 honorExact 分支。
-              isExactNotification: false,
-            }],
-          }))
-          .catch(() => {
-            // 系统通知失败不影响应用内提醒（与桌面端同一条原则）。
-          });
-        return;
-      }
-      new Notification(content.title, { body: content.body, tag: eventID });
-    } catch {
-      // Malformed events are recovered by the normal snapshot refresh.
-    }
-  }, [localPreferences.systemNotificationsEnabled]);
-
   useMobileRemoteEventStream({
     instanceID,
     activeToken: token,
@@ -2093,7 +1881,6 @@ export default function MobileRemotePage() {
     streamURL: instanceID ? `${cloudURL}/v1/stream?${new URLSearchParams({ instanceId: instanceID }).toString()}` : "",
     isCurrentToken: (streamToken) => streamToken === readActiveToken(),
     onEvent: (event) => {
-      notifyHiddenMobileEvent(event);
       return applyRealtimeEvent(event);
     },
     refreshSnapshot: loadSnapshot,
@@ -2959,102 +2746,25 @@ export default function MobileRemotePage() {
     };
   }, []);
 
-  // 点系统通知 → 回到对应会话。
-  // 每次渲染刷新（无依赖数组）：插件的监听只注册一次，而跳转要读最新的 projects 与 setter
-  //（同 backHandlerRef 的做法）。
-  // 快照里还没有该项目时（冷启动、或刚切到另一台电脑）先挂起，交给下面的认领 effect ——
-  // 否则直接 setSelectedProject 会被"selectedProject 不在 projects 里就清空"那条收敛
-  // effect 立刻抹掉，用户点了通知却停在项目列表上。
+  // 通知监听与连接由常驻 Provider 持有；快照到达后再认领跳转。
   useEffect(() => {
-    notificationTapRef.current = (extra) => {
-      const target = {
-        projectId: typeof extra?.projectId === "string" ? extra.projectId : "",
-        conversationId: typeof extra?.conversationId === "string" ? extra.conversationId : "",
-        taskId: typeof extra?.taskId === "string" ? extra.taskId : "",
-      };
-      // 两个定位依据都没有就无从跳起（老版本发出去的通知、或事件本身没带）。
-      if (!target.projectId && !target.taskId) return;
-      const projectValue = pickNotificationProject(projects, target);
-      if (!projectValue) {
-        pendingNotificationTargetRef.current = target;
-        return;
-      }
-      // 这次直接跳成了，清掉上一次留下的挂起值 —— 否则它在快照变化时还会再跳一次。
-      pendingNotificationTargetRef.current = null;
-      applyNotificationTarget(projectValue, target.conversationId);
-    };
-  });
-
-  // 认领挂起的通知跳转：快照里真的出现该项目的那一刻再切视图。
-  // 项目已被删除时它一直不出现，挂起值就自然作废（无需超时清理：下一次点击会覆盖它）。
-  useEffect(() => {
-    const pending = pendingNotificationTargetRef.current;
-    if (!pending) return;
-    const projectValue = pickNotificationProject(projects, pending);
+    const target = mobileNotifications?.pendingTarget;
+    if (!target) return;
+    const targetDevice = devices.find((item) => item.instanceId === target.instanceId && !item.revoked);
+    if (!targetDevice) { mobileNotifications.clearTarget(); return; }
+    if (targetDevice.token !== token) {
+      activateDevice(targetDevice.token);
+      setSnapshot(null);
+      setInstanceID("");
+      void loadInstances();
+      return;
+    }
+    if (target.instanceId !== instanceID) return;
+    const projectValue = pickNotificationProject(projects, target);
     if (!projectValue) return;
-    pendingNotificationTargetRef.current = null;
-    applyNotificationTarget(projectValue, pending.conversationId);
-  }, [projects]);
-
-  // 原生包的通知接线：建渠道 + 收权限真值 + 注册"点通知"与"前后台"两个监听。
-  // 结构照抄上面 backButton 那段（cancelled 标志 + handle.remove()），只在原生平台跑。
-  useEffect(() => {
-    if (!Capacitor.isNativePlatform()) return;
-    let cancelled = false;
-    let actionListener: PluginListenerHandle | null = null;
-    let stateListener: PluginListenerHandle | null = null;
-
-    // 渠道必须先建：channelId 指向不存在的渠道时通知**不会发出**（不是退回默认渠道）。
-    // 重复创建同名渠道是幂等的，且它创建后配置不可改（改重要性只能换 id）——
-    // 所以重要性等参数一次定死在 MOBILE_NOTIFICATION_CHANNEL 里。
-    // 记下这条 promise：发通知前要等它，否则启动瞬间到达的事件会静默丢掉。
-    // 失败也照样放行（catch 成 undefined）：渠道可能上一次启动就建好了，不该因为这一跳失败
-    // 就永久发不出通知；真建不出来时 schedule 自己会失败。
-    notificationChannelRef.current = LocalNotifications.createChannel({ ...MOBILE_NOTIFICATION_CHANNEL }).catch(() => undefined);
-
-    // 权限真值只能异步读。API 32 及以下（含目标机 HarmonyOS 4.x）直接返回 granted、不弹框。
-    //
-    // 提成函数是因为它要在**两个**时机跑：挂载时，以及每次回到前台。只在挂载时读一次的话
-    // 状态不会收敛 —— 用户去系统设置里把通知打开再回来，ref 还是 false（本会话再也发不出
-    // 通知），而两颗「开启通知」入口只判 `=== "default"` 也不会重新出现，只能杀进程重来
-    // （2026-09-29 复查）。
-    const syncNotificationPermission = () => {
-      void LocalNotifications.checkPermissions()
-        .then((status) => {
-          if (cancelled) return;
-          const permission = toNotificationPermission(status?.display);
-          setNotificationPermission(permission);
-          notificationGrantedRef.current = permission === "granted";
-        })
-        .catch(() => undefined);
-    };
-    syncNotificationPermission();
-
-    // 点通知（含"App 被杀后由通知冷启动"这条路径）。
-    void LocalNotifications.addListener("localNotificationActionPerformed", ({ notification }) => {
-      notificationTapRef.current((notification?.extra || {}) as { projectId?: string; conversationId?: string; taskId?: string });
-    }).then((handle) => {
-      if (cancelled) { void handle.remove(); return; }
-      actionListener = handle;
-    }).catch(() => undefined);
-
-    // 前后台。Android WebView 里 visibilitychange 是否可靠触发没有验证记录，这条是原生侧
-    // 更可靠的信号；两条取或（见 mobile-notify.ts 的 shouldNotifyWhileAway）。
-    void CapacitorApp.addListener("appStateChange", ({ isActive }) => {
-      nativeInBackgroundRef.current = !isActive;
-      // 回到前台顺手重读一次通知权限：用户很可能刚去系统设置里改过它（见上面那个函数）。
-      if (isActive) syncNotificationPermission();
-    }).then((handle) => {
-      if (cancelled) { void handle.remove(); return; }
-      stateListener = handle;
-    }).catch(() => undefined);
-
-    return () => {
-      cancelled = true;
-      if (actionListener) void actionListener.remove();
-      if (stateListener) void stateListener.remove();
-    };
-  }, []);
+    mobileNotifications.clearTarget();
+    applyNotificationTarget(projectValue, target.conversationId);
+  }, [mobileNotifications?.pendingTarget, devices, token, instanceID, projects, activateDevice, loadInstances]);
 
   // Normalize an older cached snapshot as well as network responses. This
   // keeps revision comparisons numeric during offline recovery.
@@ -3629,22 +3339,10 @@ export default function MobileRemotePage() {
 
   async function enableMobileNotifications() {
     try {
-      // 原生包走插件申请（Android 13+ 才会弹系统框；API 32 及以下直接返回 granted）。
-      // 走插件的另一层意义：Android 上只有经过它，系统通知栏才认这个权限态。
-      if (Capacitor.isNativePlatform()) {
-        const status = await LocalNotifications.requestPermissions();
-        const permission = toNotificationPermission(status?.display);
-        setNotificationPermission(permission);
-        notificationGrantedRef.current = permission === "granted";
-        if (permission === "granted") updateLocalPreferences({ systemNotificationsEnabled: true });
-        return;
-      }
-      if (typeof Notification === "undefined") return;
-      const permission = await Notification.requestPermission();
-      setNotificationPermission(permission);
-      if (permission === "granted") updateLocalPreferences({ systemNotificationsEnabled: true });
+      const permission = await mobileNotifications?.requestPermission();
+      if (permission === "denied") setError("系统通知已被拒绝，请在系统通知设置中允许通知");
     } catch {
-      setError("无法请求通知权限，请在浏览器或系统设置中允许通知");
+      setError("无法请求通知权限，请在系统通知设置中允许通知");
     }
   }
 
@@ -5870,7 +5568,7 @@ export default function MobileRemotePage() {
                 : <em className="mobile-agent-app-mark" aria-hidden="true">{agent.name.replace(/\s+/g, "").slice(0, 2).toUpperCase()}</em>}
             </span>
             <b>{agent.name}</b>
-            <small>{available ? agent.vendor : statusLabel}</small>
+            <small>{available ? (agent.vendorLabel ?? agent.vendor) : statusLabel}</small>
             {selected && <i className="mobile-agent-app-check" aria-hidden="true">✓</i>}
           </button>;
         })}

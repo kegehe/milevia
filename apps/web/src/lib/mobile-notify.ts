@@ -1,8 +1,10 @@
+import { isWithinQuietHours, priorityForType } from "./notifications";
+
 // 手机端系统通知的纯逻辑。
 //
 // 单独成文件、**不 import 任何 Capacitor 模块**，是为了能被 `node --test` 直接跑
 // （同 features/updater/android-release.ts 与 lib/mobile-devices.ts 的既有做法）。
-// 真正碰插件的那一层留在 MobileRemotePage 里，本文件只回答"该不该发、发什么、跳哪"。
+// 插件调用与待投递队列由 MobileRemoteProvider 持有，本文件只回答"该不该发、发什么、跳哪"。
 //
 // 背景：手机端的系统通知有两条通道，语义完全不同 ——
 //   · 原生包（Capacitor Android）走 @capacitor/local-notifications 的**本地通知**，
@@ -48,6 +50,22 @@ export function isInterruptingMobileEvent(type: unknown): boolean {
   return typeof type === "string" && (/^(task\.|run\.|approval\.)/.test(type) || type === "project.batch_completed");
 }
 
+/** 与设置页的分类开关和免打扰约定一致；审批类仍须服从系统通知总开关。 */
+export function shouldPresentMobileNotification(type: string, preferences: {
+  systemNotificationsEnabled: boolean;
+  taskNotificationsEnabled: boolean;
+  lowPriorityNotificationsEnabled: boolean;
+  quietHoursEnabled: boolean;
+  quietHoursStart: string;
+  quietHoursEnd: string;
+}, now = new Date()): boolean {
+  if (!preferences.systemNotificationsEnabled) return false;
+  const priority = priorityForType(type);
+  if (priority === "high") return true;
+  if (preferences.quietHoursEnabled && isWithinQuietHours(now, preferences.quietHoursStart, preferences.quietHoursEnd)) return false;
+  return priority === "normal" ? preferences.taskNotificationsEnabled : preferences.lowPriorityNotificationsEnabled;
+}
+
 export interface MobileNotificationContent {
   title: string;
   body: string;
@@ -87,6 +105,10 @@ export function mobileNotificationContent(event: { type?: unknown; taskId?: unkn
   if (type === "run.completed" && typeof payload.batchId === "string" && payload.batchId !== "") return null;
   const statusLabel: Record<string, string> = {
     completed: "任务已完成",
+    succeeded: "任务已完成",
+    done: "任务已完成",
+    awaiting_review: "任务等待验收",
+    action_required: "任务需要处理",
     failed: "任务执行失败",
     stopped: "任务已停止",
     interrupted: "任务已中断",

@@ -15,6 +15,12 @@
 export const DEVICES_STORAGE_KEY = "milevia.cloud.devices";
 export const ACTIVE_STORAGE_KEY = "milevia.cloud.active";
 export const LEGACY_TOKEN_STORAGE_KEY = "milevia.cloud.token";
+export const MOBILE_DEVICES_CHANGED_EVENT = "milevia:devices-changed";
+
+function publishDeviceChange(): void {
+  // 旧设备迁移可能在 useState 初始化中发生，通知放到微任务以免跨组件在渲染中 setState。
+  if (typeof window !== "undefined") queueMicrotask(() => window.dispatchEvent(new Event(MOBILE_DEVICES_CHANGED_EVENT)));
+}
 
 /**
  * 「备注名」的长度上限。**必须与 UI 的 `maxLength` 用同一个常量**：两处各写一个数字，
@@ -157,6 +163,7 @@ export function readDevices(store: DeviceStore | null = defaultStore()): MobileD
 export function writeDevices(devices: MobileDevice[], store: DeviceStore | null = defaultStore()): void {
   if (!store) return;
   store.setItem(DEVICES_STORAGE_KEY, JSON.stringify(devices));
+  publishDeviceChange();
 }
 
 export function readActiveToken(store: DeviceStore | null = defaultStore()): string {
@@ -174,6 +181,7 @@ export function setActiveToken(token: string, store: DeviceStore | null = defaul
     store.removeItem(ACTIVE_STORAGE_KEY);
     store.removeItem(LEGACY_TOKEN_STORAGE_KEY);
   }
+  publishDeviceChange();
 }
 
 export function activeDevice(store: DeviceStore | null = defaultStore()): MobileDevice | undefined {

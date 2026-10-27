@@ -265,31 +265,9 @@ func (r *wslAgentRunner) runOpenCodeOnce(ctx context.Context, request AgentRunRe
 	completion := newOpenCodeCompletion()
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		closePipes := func() {
-			_ = stdout.Close()
-			_ = stderr.Close()
-		}
-		select {
-		case <-ctx.Done():
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-				closePipes()
-			}
-		case <-completion.done:
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-				closePipes()
-			}
-		case <-done:
-		}
-	}()
+	// 收尾有界：WSL 里的后裔进程（dev server / setsid）会继续握着 wsl.exe 的
+	// stdout/stderr，单杀进程组不会让 reader EOF；超时后关闭读端才能收敛。
+	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -357,30 +335,22 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 		return fmt.Errorf("start Claude (wsl): %w", err)
 	}
 
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-			}
-		case <-done:
-		}
-	}()
-
 	// PromptViaStdin：后台 goroutine 写 prompt 再关 stdin，避免阻塞主流程（与本地 Run 一致，
 	// 也不会因大 prompt 撑满管道而与后续 reader 互相阻塞——reader 已在此前启动）。
 	var stderrTail = &stderrCapture{}
 	// 与本地 Run 一致：包一层 sink 记录 CLI 自报的失败原因（见 claudeResultErrorDetail）。
 	recorded := &claudeResultErrorSink{AgentRunSink: sink}
+	// 终结事件（result）转成收尾信号：只监听 ctx 的话，WSL 侧后裔握着输出管道时
+	// wg.Wait 永远不返回（见 watchAgentProcess 的上界）。
+	signal := newTerminalSignalSink(recorded, "result")
+	done := make(chan struct{})
+	defer close(done)
+	go watchAgentProcess(ctx, cmd, signal.done, done, stdout, stderr)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); r.claude.readOutput(stdout, recorded) }()
-	go func() { defer wg.Done(); r.claude.readStderrCapture(stderr, recorded, stderrTail) }()
+	go func() { defer wg.Done(); r.claude.readOutput(stdout, signal) }()
+	go func() { defer wg.Done(); r.claude.readStderrCapture(stderr, signal, stderrTail) }()
 	if stdin != nil {
 		go func() {
 			_, _ = io.WriteString(stdin, request.Prompt)
@@ -457,19 +427,10 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	completion := newCodexTurnCompletion()
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-completion.done:
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-			}
-		case <-done:
-		}
-	}()
+	// 原先 ctx 分支是空体（取消时既不杀进程也不收尾），由 exec.CommandContext 的默认
+	// Kill 兜着；这里统一走 watchAgentProcess：取消与 turn.completed 都要回收进程树，
+	// 并且 WSL 侧后裔握着输出管道时有上界。
+	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 
 	var wg sync.WaitGroup
 	wg.Add(2)

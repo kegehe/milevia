@@ -698,34 +698,31 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Claude: %w", err)
 	}
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-			}
-		case <-done:
-		}
-	}()
+	// 进程树放进 Job Object：CLI 留下的后裔不再变成谁都杀不到的孤儿（见 containAgentProcess）。
+	releaseTree := containAgentProcess(cmd)
+	defer releaseTree()
 
 	var stderrTail = &stderrCapture{}
 	// sink 先包一层：把 CLI 在 result 事件里自报的失败原因记下来，失败时用于拼错误
 	// （见 claudeResultErrorDetail）。事件本身照常转发，调用方无感。
 	recorded := &claudeResultErrorSink{AgentRunSink: sink}
+	// 再把终结事件（result）转成收尾信号：此前这条路径只监听 ctx，CLI 退出后如果还有
+	// 后裔握着输出管道，就没有任何东西能让 wg.Wait 收敛 —— 运行会一直停在 running
+	// （与 Codex 那条真机故障同源）。收尾的上界见 watchAgentProcess。
+	signal := newTerminalSignalSink(recorded, "result")
+	done := make(chan struct{})
+	defer close(done)
+	go watchAgentProcess(ctx, cmd, signal.done, done, stdout, stderr)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		r.readOutput(stdout, recorded)
+		r.readOutput(stdout, signal)
 	}()
 	go func() {
 		defer wg.Done()
-		r.readStderrCapture(stderr, recorded, stderrTail)
+		r.readStderrCapture(stderr, signal, stderrTail)
 	}()
 	// PromptViaStdin：后台 goroutine 写 prompt 再关 stdin。绝不能在此主流程同步写——
 	// 大 prompt 超出 OS 管道缓冲时会阻塞，而此时 reader 才刚启动，claude 提前大量输出

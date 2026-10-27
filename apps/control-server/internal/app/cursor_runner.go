@@ -252,35 +252,15 @@ func (r *cursorCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	}
 	promptErr := writeCursorPrompt(stdin, request.Prompt)
 
+	// 进程树放进 Job Object：CLI 留下的后裔不再变成杀不到的孤儿（见 containAgentProcess）。
+	releaseTree := containAgentProcess(cmd)
+	defer releaseTree()
 	completion := newOpenCodeCompletion()
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		closePipes := func() {
-			// CLI 可能留下逃逸子进程继续持有 stdout；关掉读端才能让 wg.Wait 返回。
-			_ = stdout.Close()
-			_ = stderr.Close()
-		}
-		select {
-		case <-ctx.Done():
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-				closePipes()
-			}
-		case <-completion.done:
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-				closePipes()
-			}
-		case <-done:
-		}
-	}()
+	// 收尾有界：ctx 取消或终结事件之后最多等 agentProcessTeardownGrace，
+	// 超时就强杀并关闭读端，避免逃逸子进程握着 stdout 让 wg.Wait 永远不返回。
+	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 
 	var wg sync.WaitGroup
 	wg.Add(2)

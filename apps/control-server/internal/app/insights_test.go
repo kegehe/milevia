@@ -1066,14 +1066,14 @@ func firstInsightFindingID(t *testing.T, server *Server, projectID string) strin
 	return id
 }
 
-func TestPassBIncompleteRepairKeepsOnlyVerifiedFindings(t *testing.T) {
-	// Pass B 漏掉候选时，不得把未核实建议当作已确认落库；但已经明确核实
-	// 的候选仍应保留，不能因为一个漏项让整次分析失败。
+func TestPassBRepairsOnlyMissingFindings(t *testing.T) {
+	// 第二次调用只核实漏项，并按新清单的局部编号返回；已有判定保持不变。
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
 	passA := `[{"type":"bug","severity":"high","title":"已核实","summary":"s1"},{"type":"feature","severity":"normal","title":"未覆盖","summary":"s2"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`
-	server.runner = &insightScriptRunner{outputs: []string{passA, passB, passB}}
+	stub := &insightScriptRunner{outputs: []string{passA, passB, passB}}
+	server.runner = stub
 	scanID := insertSyncInsightScan(t, server, projectID)
 
 	var status, errMsg string
@@ -1084,19 +1084,16 @@ func TestPassBIncompleteRepairKeepsOnlyVerifiedFindings(t *testing.T) {
 	if err := server.db.QueryRow(`select count(*) from project_insights where scan_id=?`, scanID).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if status != insightScanCompleted || n != 1 || errMsg != "" {
-		t.Errorf("incomplete Pass B: status/count/error = %q/%d/%q want completed/1/empty", status, n, errMsg)
+	if status != insightScanCompleted || n != 2 || errMsg != "" {
+		t.Errorf("repaired Pass B: status/count/error = %q/%d/%q want completed/2/empty", status, n, errMsg)
 	}
-	var title string
-	if err := server.db.QueryRow(`select title from project_insights where scan_id=?`, scanID).Scan(&title); err != nil {
-		t.Fatalf("load verified finding: %v", err)
-	}
-	if title != "已核实" {
-		t.Errorf("persisted title=%q want 已核实", title)
+	reqs := stub.capturedRequests()
+	if len(reqs) != 3 || strings.Contains(reqs[2].Prompt, `"title":"已核实"`) || !strings.Contains(reqs[2].Prompt, `1. {"title":"未覆盖"`) {
+		t.Fatalf("repair must contain only the missing candidate with index 1: %+v", reqs)
 	}
 }
 
-func TestConservativeInsightVerifyOutcomesRejectsDuplicateAndInvalidIndexes(t *testing.T) {
+func TestPartialInsightVerifyOutcomesRejectsDuplicateAndInvalidIndexes(t *testing.T) {
 	verdict := insightVerifyVerdict{}
 	verdict.Findings = append(verdict.Findings,
 		struct {
@@ -1115,14 +1112,8 @@ func TestConservativeInsightVerifyOutcomesRejectsDuplicateAndInvalidIndexes(t *t
 			Reason    string `json:"reason"`
 		}{Index: 4, Confirmed: true},
 	)
-	outcomes, accepted := conservativeInsightVerifyOutcomes(verdict, 2)
-	if accepted != 0 || len(outcomes) != 2 {
-		t.Fatalf("accepted/outcomes=%d/%d want 0/2", accepted, len(outcomes))
-	}
-	for _, outcome := range outcomes {
-		if outcome.Confirmed {
-			t.Fatalf("untrusted outcome %#v must be excluded", outcome)
-		}
+	if outcomes, err := partialInsightVerifyOutcomes(verdict, 2); err == nil || outcomes != nil {
+		t.Fatalf("malformed indexes must force a full retry: outcomes=%+v err=%v", outcomes, err)
 	}
 }
 
@@ -1159,6 +1150,7 @@ func TestInsightVerifyResultErrorMessageClassifiesContractFailures(t *testing.T)
 		{"json", errors.New("invalid character 'n' looking for beginning of value"), "返回内容不是有效 JSON"},
 		{"count", errors.New("incomplete verdict: got 1 findings, want 2"), "核实结论数量不完整"},
 		{"index", errors.New("duplicate candidate index: 1"), "核实结论的候选编号无效"},
+		{"missing fields", errors.New("missing confirmed verdict"), "核实结论缺少必填字段"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

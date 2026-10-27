@@ -115,7 +115,7 @@ const noop = () => undefined;
 function sampleSnapshot(overrides: Partial<GitSnapshot["head"]> = {}): GitSnapshot {
   return {
     repositoryState: "ready",
-    head: { oid: "abc123def456", branch: "feature/hello", detached: false, upstream: "origin/feature/hello", ahead: 2, behind: 1, ...overrides },
+    head: { oid: "abc123def456".padEnd(40, "0"), branch: "feature/hello", detached: false, upstream: "origin/feature/hello", ahead: 2, behind: 1, ...overrides },
     worktree: { staged: 1, modified: 2, untracked: 3, deleted: 0, renamed: 0, conflicted: 0 },
   };
 }
@@ -262,6 +262,33 @@ function buttonHTML(html: string, className: string): string {
   assert.ok(match, `带 class="${className}" 的按钮没有渲染出来`);
   return match[0];
 }
+
+test("push eligibility covers tracked, untracked, detached, unborn and busy states", () => {
+  const cases: { name: string; snapshot: GitSnapshot | null; loading?: boolean; mutating?: string; reason?: string; disabled: boolean }[] = [
+    { name: "ahead", snapshot: sampleSnapshot({ ahead: 1, behind: 0 }), disabled: false },
+    { name: "diverged", snapshot: sampleSnapshot(), disabled: false },
+    { name: "synced", snapshot: sampleSnapshot({ ahead: 0, behind: 0 }), disabled: true, reason: "没有需要推送的提交" },
+    { name: "behind", snapshot: sampleSnapshot({ ahead: 0, behind: 2 }), disabled: true, reason: "没有需要推送的提交" },
+    { name: "first push", snapshot: sampleSnapshot({ upstream: "", ahead: 0, behind: 0 }), disabled: false },
+    { name: "SHA-256", snapshot: sampleSnapshot({ oid: "f".repeat(64), upstream: "", ahead: 0 }), disabled: false },
+    { name: "unborn", snapshot: sampleSnapshot({ oid: "(initial)", upstream: "", ahead: 0 }), disabled: true, reason: "创建首次提交后才能推送" },
+    { name: "detached", snapshot: sampleSnapshot({ detached: true, branch: "" }), disabled: true, reason: "游离指针状态无法推送" },
+    { name: "unavailable", snapshot: null, disabled: true, reason: "无法读取仓库状态" },
+    { name: "loading", snapshot: sampleSnapshot(), loading: true, disabled: true, reason: "正在读取仓库状态" },
+    { name: "mutating", snapshot: sampleSnapshot(), mutating: "commit", disabled: true },
+  ];
+  for (const item of cases) {
+    const html = renderToString(createElement(GitBar, {
+      snapshot: item.snapshot, loading: item.loading ?? false, mutating: item.mutating ?? "", refreshing: false,
+      operations: [], projectID: "p1", request: async () => ([] as never), fail: noop,
+      requestRefresh: noop, requestFetch: noop, requestPull: noop, requestPush: noop,
+    }));
+    const button = buttonHTML(html, "git-push");
+    assert.equal(button.includes("disabled="), item.disabled, item.name);
+    if (item.reason) assert.ok(button.includes(`title="${item.reason}"`), item.name);
+    else assert.doesNotMatch(button, /title=/, item.name);
+  }
+});
 
 test("counts the commit subject by code points, exactly like the server", () => {
   // 服务端用 utf8.RuneCountInString 数首行。前端若改用 .length（UTF-16 码元），

@@ -1,4 +1,10 @@
-import { useEffect, useRef } from "react";
+import { createContext, useContext, useEffect, useRef } from "react";
+import { advanceMobileStreamCursor } from "./mobile-stream-state";
+
+export type SharedMobileEvent = { instanceID: string; activeToken: string; event: MessageEvent };
+export const MobileRemoteEventStreamContext = createContext<{
+  subscribe: (handler: (message: SharedMobileEvent) => void) => () => void;
+} | null>(null);
 
 export const streamIdleTimeoutMs = 45_000;
 
@@ -15,6 +21,7 @@ export async function consumeMobileEventStream(url: string, token: string, lastE
     idleTimer = window.setTimeout(() => controller.abort(), streamIdleTimeoutMs);
   };
   try {
+    armIdleWatchdog();
     const response = await fetch(url, { headers, signal: controller.signal });
     if (!response.ok) throw new Error(`stream request failed (${response.status})`);
     if (!response.body) throw new Error("stream response has no body");
@@ -53,6 +60,7 @@ export async function consumeMobileEventStream(url: string, token: string, lastE
     }
     dispatch();
   } finally {
+    controller.abort();
     if (idleTimer !== undefined) window.clearTimeout(idleTimer);
     signal.removeEventListener("abort", abortByCaller);
   }
@@ -70,13 +78,23 @@ export function useMobileRemoteEventStream(options: {
   onEvent: (event: MessageEvent) => boolean;
   refreshSnapshot: RefreshSnapshot;
   refreshGit: () => void;
+  initialCursor?: (signal: AbortSignal) => Promise<string>;
+  onCursor?: (cursor: string) => void;
+  onError?: (error: unknown) => void;
 }) {
+  const shared = useContext(MobileRemoteEventStreamContext);
   const eventRef = useRef(options.onEvent);
   const refreshSnapshotRef = useRef(options.refreshSnapshot);
   const refreshGitRef = useRef(options.refreshGit);
   const isCurrentTokenRef = useRef(options.isCurrentToken);
   const visibleRef = useRef(options.visible);
   const wasVisibleRef = useRef(options.visible);
+  const cursorRef = useRef(options.onCursor);
+  const errorRef = useRef(options.onError);
+  const initialCursorRef = useRef(options.initialCursor);
+  cursorRef.current = options.onCursor;
+  errorRef.current = options.onError;
+  initialCursorRef.current = options.initialCursor;
   eventRef.current = options.onEvent;
   refreshSnapshotRef.current = options.refreshSnapshot;
   refreshGitRef.current = options.refreshGit;
@@ -111,26 +129,41 @@ export function useMobileRemoteEventStream(options: {
       }, 3000);
     };
     const wait = (delay: number) => new Promise<void>((resolve) => {
-      const timer = window.setTimeout(resolve, delay);
-      controller.signal.addEventListener("abort", () => { window.clearTimeout(timer); resolve(); }, { once: true });
+      const done = () => { window.clearTimeout(timer); controller.signal.removeEventListener("abort", done); resolve(); };
+      const timer = window.setTimeout(done, delay);
+      controller.signal.addEventListener("abort", done, { once: true });
     });
     const runStream = async () => {
       let retryDelay = 1000;
+      let initialized = false;
       while (!stopped && !controller.signal.aborted) {
         try {
+          if (!initialized) {
+            lastEventID = await initialCursorRef.current?.(controller.signal) ?? "";
+            if (stopped || controller.signal.aborted) break;
+            initialized = true;
+          }
           await consumeMobileEventStream(options.streamURL, options.activeToken, lastEventID, (event) => {
             if (stopped || !isCurrentTokenRef.current(options.activeToken)) return;
-            if (event.lastEventId) lastEventID = event.lastEventId;
             if (!eventRef.current(event)) {
               scheduleSnapshotRefresh();
               scheduleGitRefresh();
+            }
+            // 处理与持久入队失败时不推进断点，重连后才能重新处理这条事件。
+            if (event.lastEventId) {
+              const nextCursor = advanceMobileStreamCursor(lastEventID, event.lastEventId);
+              if (nextCursor !== lastEventID) {
+                cursorRef.current?.(nextCursor);
+                lastEventID = nextCursor;
+              }
             }
           }, controller.signal);
           if (stopped || controller.signal.aborted) break;
           await wait(retryDelay);
           retryDelay = 1000;
-        } catch {
+        } catch (error) {
           if (stopped || controller.signal.aborted) break;
+          errorRef.current?.(error);
           startFallbackTimer();
           await wait(retryDelay);
           retryDelay = Math.min(retryDelay * 2, 30_000);
@@ -138,15 +171,25 @@ export function useMobileRemoteEventStream(options: {
       }
     };
     startFallbackTimer();
-    void runStream();
+    // 页面只订阅常驻连接，进入设置页时仅移除页面监听，不关闭连接。
+    const unsubscribe = shared?.subscribe((message) => {
+      if (stopped || message.instanceID !== options.instanceID || message.activeToken !== options.activeToken ||
+        !isCurrentTokenRef.current(options.activeToken)) return;
+      if (!eventRef.current(message.event)) {
+        scheduleSnapshotRefresh();
+        scheduleGitRefresh();
+      }
+    });
+    if (!shared) void runStream();
     return () => {
       stopped = true;
+      unsubscribe?.();
       controller.abort();
       if (fallbackTimer !== null) window.clearInterval(fallbackTimer);
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
       if (gitRefreshTimer !== null) window.clearTimeout(gitRefreshTimer);
     };
-  }, [options.instanceID, options.activeToken, options.deviceEpoch, options.streamURL]);
+  }, [options.instanceID, options.activeToken, options.deviceEpoch, options.streamURL, shared]);
   useEffect(() => {
     const wasVisible = wasVisibleRef.current;
     wasVisibleRef.current = options.visible;

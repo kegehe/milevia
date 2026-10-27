@@ -693,6 +693,12 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
       : sync!.kind === "ahead" ? `领先 ${head.ahead}`
         : sync!.kind === "behind" ? `落后 ${head.behind}`
           : `领先 ${head.ahead} · 落后 ${head.behind}`;
+  const pushUnavailableReason = loading ? "正在读取仓库状态"
+    : !head ? "无法读取仓库状态"
+      : head.detached || !head.branch ? "游离指针状态无法推送"
+        : !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head.oid) ? "创建首次提交后才能推送"
+          : head.upstream && head.ahead === 0 ? "没有需要推送的提交"
+            : undefined;
   const needsAttention = operations.some((operation) => operation.status === "failed" || operation.status === "needs_attention");
   // 点击外部或 Escape 键关闭操作记录。沿用 NotificationCenter 的 ref.contains 模式：
   // 只监听不拦截，外部点击（如切换工作区 tab）会正常穿透。
@@ -736,7 +742,7 @@ export function GitBar({ snapshot, loading, mutating, refreshing, operations, pr
     <div className="git-bar-actions">
       <button type="button" className="secondary" disabled={loading || Boolean(mutating) || head?.detached || !head?.branch || !head?.upstream} onClick={() => { setOpsOpen(false); requestPull(); }} title={loading ? "正在读取仓库状态" : head?.detached || !head?.branch ? "游离指针状态无法拉取" : !head?.upstream ? "未设置上游分支" : undefined}>拉取</button>
       <button type="button" className="secondary" disabled={loading || Boolean(mutating)} onClick={() => { setOpsOpen(false); requestFetch(); }}>获取</button>
-      <button type="button" className="secondary git-push" disabled={loading || Boolean(mutating) || head?.detached || !head?.branch || head?.ahead === 0} onClick={() => { setOpsOpen(false); requestPush(); }} title={loading ? "正在读取仓库状态" : head?.detached || !head?.branch ? "游离指针状态无法推送" : head?.ahead === 0 ? "没有需要推送的提交" : undefined}>推送</button>
+      <button type="button" className="secondary git-push" disabled={Boolean(mutating) || Boolean(pushUnavailableReason)} onClick={() => { setOpsOpen(false); requestPush(); }} title={pushUnavailableReason}>推送</button>
       <button type="button" className={`git-refresh${refreshing ? " spinning" : ""}`} title={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} aria-label={refreshing ? "正在刷新仓库状态" : "刷新仓库状态"} disabled={refreshing || Boolean(mutating)} onClick={requestRefresh}><RefreshIcon /></button>
       <button type="button" ref={opsTriggerRef} className={`git-ops-trigger${opsOpen ? " active" : ""}${needsAttention ? " attention" : ""}`} title="操作记录" aria-label="操作记录" aria-expanded={opsOpen} aria-controls="git-ops-popover" disabled={operations.length === 0} onClick={() => setOpsOpen(!opsOpen)}><HistoryIcon />{needsAttention ? <i className="git-ops-dot" aria-hidden="true" /> : null}</button>
     </div>

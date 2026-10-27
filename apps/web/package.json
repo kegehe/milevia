@@ -8,6 +8,7 @@
     "test": "tsx --test \"src/**/*.test.ts\" \"src/**/*.test.mjs\"",
     "test:history-deletion": "node scripts/verify-history-deletion.mjs",
     "test:notification-retention": "node scripts/verify-notification-retention.mjs",
+    "test:mobile-notifications": "node scripts/verify-mobile-notifications.mjs",
     "build": "tsc -b && vite build",
     "icons": "node scripts/generate-icons.mjs"
   },

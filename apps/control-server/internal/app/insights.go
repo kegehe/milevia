@@ -1189,15 +1189,17 @@ func buildInsightScanPrompt(projectPath, repoSHA string, alreadySurfaced []strin
 %s
 3. 每条都先到项目里核实确有其事再报；拿不准的不要报。
 4. 你看不到运行中的浏览器，样式问题依据代码结构与组件树推断即可。
-5. cleanup 只报告有直接证据的无用文件、目录、构建产物、重复资源、不可达代码或死逻辑；不要建议直接批量删除，summary 中说明需要人工确认。`,
+5. cleanup 只报告有直接证据的无用文件、目录、构建产物、重复资源、不可达代码或死逻辑；不要建议直接批量删除，summary 中说明需要人工确认。
+6. 先梳理项目目录和主要模块，再逐模块检查所选类别；分析范围是整个项目，不要只检查最近改动或未提交的 diff。
+7. findings 只放实际问题或可行建议，不要放分析进度、工作区改动数量、完成说明或测试因权限无法运行的状态。只读环境下优先通过读取代码取得证据，不要为执行测试或构建而写文件。`,
 		projectPath, repoSHA, themeLine, strings.Join(types, "\n- "), prev)
 }
 
 // buildInsightRepairPrompt 组装 Pass A 解析失败后的修正重试 prompt。与首轮同方向
 // （theme + types），但对输出契约做最强约束：不得叙述、不得展示过程、不得贴示例、
 // 不得中途改口，整段回复就是且仅是那个 JSON 对象（{"findings":[...]}，见
-// insightCandidatesOutputSchema 为何不是裸数组）。首轮失败的真因是模型把 JSON
-// 留到最后却在输出前 end_turn，因此这里明确"宁可少报也必须在回复里给出 findings"。
+// insightCandidatesOutputSchema 为何不是裸数组）。重试是全新会话，必须重新提供
+// 完整任务，不能假定模型仍记得上一轮探索，也不能为了格式而要求减少发现。
 func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string {
 	var types []string
 	if len(opts.Types) == 0 {
@@ -1214,9 +1216,7 @@ func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string
 		themeLine = fmt.Sprintf("聚焦主题：%s。请从「%s」的视角审视项目，优先发现这类相关问题。",
 			insightThemeLabels[opts.Theme], insightThemeLabels[opts.Theme])
 	}
-	return fmt.Sprintf(`针对同一项目补交上一轮缺失的结果，直接给出，别再说思考过程、别再重新通读全目录。
-
-上一轮你只做了大量分析却未在回复里给出结果，这不可接受。你现在已经掌握项目结构，只需快速核对后用 JSON 数组把发现交出来，尽量少做重复探索。
+	return fmt.Sprintf(`执行一个独立的只读项目分析任务。此前的输出格式不符合要求，本次会话没有此前的分析上下文，请根据以下完整任务重新检查项目并给出结果。
 
 对象：%s（git %s）。%s
 覆盖类别（只能输出这些类型）：%s
@@ -1224,9 +1224,10 @@ func buildInsightRepairPrompt(projectPath, repoSHA string, opts scanOpts) string
 这一次的硬性要求（必须严格遵守）：
 1. 你的整段回复必须是且仅是一个 JSON 对象 {"findings":[ ... ]}，前面、后面、中间都不允许有任何说明文字、思考、标题、示例或 Markdown 围栏。
 2. findings 是 JSON 数组，元素格式：{"type":"bug|style|optimization|feature|cleanup","title":"一句话标题","summary":"面向用户的两三句说明","severity":"low|normal|high","fileHint":"（可选）最相关文件路径，否则留空"}
-3. 宁缺毋滥：只报你直接核实过的发现；拿不稳的不报，最少可以只报 1 条，但必须给出 findings 数组。
+3. 通读项目并覆盖所选类别，最多 30 条。只报有直接证据的发现；不要为了满足格式而缩减分析范围，没有可靠发现时返回 {"findings":[]}。
 4. title 用用户能看懂的表述；禁止代码标识符、行号、堆栈。
 5. cleanup 只报告有直接证据的无用文件、目录、构建产物、重复资源、不可达代码或死逻辑；不要建议直接批量删除，summary 中说明需要人工确认。
+6. 先梳理目录和主要模块，再逐模块检查，不要只检查最近改动或未提交的 diff。findings 只放实际问题或可行建议，不要放分析进度、工作区状态或测试因权限无法运行的状态；只读环境下优先读取代码取证。
 
 现在只输出那个 JSON 对象：`, projectPath, repoSHA, themeLine, strings.Join(types, "\n- "))
 }
@@ -1247,33 +1248,30 @@ func buildVerifyPrompt(projectPath string, candidates []pendingInsight) string {
 
 核验对象目录：%s
 
-对下面每条候选，到目录里读取相关文件/结构，判断它是否真实存在（是否伪需求、假 bug、已实现/已具备）：
+对下面全部 %d 条候选，到目录里读取相关文件/结构，逐条判断是否真实存在（是否伪需求、假 bug、已实现/已具备）。这是代码静态核验，不要用工作区状态或执行进度代替候选结论；测试因只读权限无法运行时，继续依据代码取证，不能把环境限制当作候选不成立的证据。
 
 候选清单：
 %s
 
-	硬性输出要求：你的整个回复只能包含一个 JSON 对象，不允许有任何前言、注释、Markdown 围栏、或对象之后的任何文字。结构：
-{"findings":[{"index":1,"confirmed":true,"reason":""},{"index":2,"confirmed":false,"reason":"项目当前已具备"}]}
-confirmed=true 表示确认真实存在；false 表示伪需求/假 bug/已具备。每条对应候选的 index；无法证实的判 false。`, projectPath, items)
+硬性输出要求：你的整个回复只能包含一个 JSON 对象，不允许有任何前言、注释、Markdown 围栏、或对象之后的任何文字。对象为 {"findings":[...]}，每项包含 index（候选编号）、confirmed（布尔值）、reason（本条候选的代码核实依据）。
+confirmed=true 表示确认真实存在；false 表示伪需求/假 bug/已具备。findings 必须恰有 %d 条，index 为本次候选清单的 1 到 %d，各出现一次，不得遗漏或重复。无法证实的判 false，并说明具体依据。`, projectPath, len(candidates), items, len(candidates), len(candidates))
 }
 
 // buildVerifyRepairPrompt 组装 Pass B 核实输出非法后的修正重试 prompt。
 // 仅复述候选与硬性输出契约，要求"整个回复只能是那个 JSON 对象"。
 func buildVerifyRepairPrompt(projectPath string, candidates []pendingInsight) string {
-	return fmt.Sprintf(`重新执行刚才的只读核验，直接给出结果，别再说思考过程。
-
-上一轮你只做了查证却未在回复里给出唯一结果，这不可接受。
+	return fmt.Sprintf(`执行一个独立的只读核验任务。此前的核实结果格式不规范或存在漏项，本次会话没有此前的分析上下文，下面提供本次需要核实的全部候选。
 
 对象目录：%s
 候选清单：
 %s
 
 这一次的硬性要求（必须严格遵守）：
-你的整段回复必须且仅是一个 JSON 对象，前面、后面、中间都不允许任何说明、思考、标题、示例或 Markdown 围栏。结构必须是：
-{"findings":[{"index":1,"confirmed":true,"reason":""},{"index":2,"confirmed":false,"reason":"项目当前已具备"}]}
-每条 findings 的 index 对应候选编号；confirmed=true 表示确认真实存在、false 表示伪需求/假 bug/已具备；无法证实的判 false。每条候选都必须有一条。
+你的整段回复必须且仅是一个 JSON 对象，前面、后面、中间都不允许任何说明、思考、标题、示例或 Markdown 围栏。对象为 {"findings":[...]}，每项包含 index（候选编号）、confirmed（布尔值）、reason（本条候选的代码核实依据）。
+findings 必须恰有 %d 条，index 为本次清单的 1 到 %d，各出现一次，不得遗漏、重复或使用此前批次的编号。
+confirmed=true 表示确认真实存在、false 表示伪需求/假 bug/已具备；逐条读取相关代码，无法证实的判 false 并说明具体依据。不要用工作区状态或执行进度代替候选结论；测试因只读权限无法运行时，继续依据代码取证，不能把环境限制当作候选不成立的证据。
 
-现在只输出那个 JSON 对象：`, projectPath, insightVerifyCandidateDetails(candidates))
+现在只输出那个 JSON 对象：`, projectPath, insightVerifyCandidateDetails(candidates), len(candidates), len(candidates))
 }
 
 // insightVerifyCandidateDetails 在初次核实与修正重试之间复用完整候选信息。
@@ -1316,58 +1314,70 @@ type insightVerifyOutcome struct {
 }
 
 func (s *Server) runInsightVerify(ctx context.Context, project Project, agentID string, candidates []pendingInsight, progress func(level, message string)) ([]insightVerifyOutcome, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
 	cc := func(prompt string) (string, error) {
 		return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, insightVerifyOutputSchema, insightQuotaWaitMax, progress)
 	}
-	decode := func(text string) ([]insightVerifyOutcome, error) {
+	decode := func(text string, count int) ([]insightVerifyOutcome, error) {
 		verdict, err := decodeInsightVerdict(text)
 		if err != nil {
 			return nil, err
 		}
-		if err := validateInsightVerdict(verdict, len(candidates)); err != nil {
+		if err := validateInsightVerdict(verdict, count); err != nil {
 			return nil, err
 		}
-		out := make([]insightVerifyOutcome, 0, len(verdict.Findings))
-		for _, item := range verdict.Findings {
-			out = append(out, insightVerifyOutcome{
-				Index:     item.Index,
-				Confirmed: item.Confirmed,
-				Reason:    truncateInsightLog(strings.TrimSpace(item.Reason), insightRejectionReasonLimit),
-			})
-		}
-		return out, nil
+		return partialInsightVerifyOutcomes(verdict, count)
 	}
 	// 首轮。
 	textB, err := cc(buildVerifyPrompt(project.Path, candidates))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInsightVerifyRunner, err)
 	}
-	outcomes, vErr := decode(textB)
+	outcomes, vErr := decode(textB, len(candidates))
 	if vErr == nil {
 		return outcomes, nil
 	}
 	log.Printf("[insights] project=%s Pass B parse failed on first attempt: %v", project.ID, vErr)
-	// 修正 prompt 重试一次。
-	textB, err = cc(buildVerifyRepairPrompt(project.Path, candidates))
+	// 合法但漏项的结果保留已有判定，只把漏项交给新会话，使用该清单的局部编号。
+	// 非法编号、重复编号或缺失字段不能安全归位，仍重验整批。每批最多重试一次。
+	known := make(map[int]insightVerifyOutcome, len(candidates))
+	if verdict, err := decodeInsightVerdict(textB); err == nil {
+		if partial, err := partialInsightVerifyOutcomes(verdict, len(candidates)); err == nil {
+			for _, item := range partial {
+				known[item.Index] = item
+			}
+		}
+	}
+	var retryCandidates []pendingInsight
+	var retryIndexes []int
+	for index, candidate := range candidates {
+		if _, ok := known[index+1]; !ok {
+			retryCandidates = append(retryCandidates, candidate)
+			retryIndexes = append(retryIndexes, index+1)
+		}
+	}
+	if progress != nil {
+		progress("warn", fmt.Sprintf("核实结果不完整或格式异常，正在重新核实 %d 条候选…", len(retryCandidates)))
+	}
+	textB, err = cc(buildVerifyRepairPrompt(project.Path, retryCandidates))
 	if err != nil {
 		return nil, fmt.Errorf("%w（重试）: %v", errInsightVerifyRunner, err)
 	}
-	outcomes, vErr = decode(textB)
+	outcomes, vErr = decode(textB, len(retryCandidates))
 	if vErr != nil {
-		// 模型有时会按 schema 返回可解析的 JSON，却漏掉部分候选。完整契约已重试
-		// 一次仍不成立时，不能让一个漏项抹掉本轮已核实的结果，也不能把漏项当作
-		// 已确认落库。只采纳编号唯一且合法的结论，其他候选一律保守排除。
-		if verdict, decodeErr := decodeInsightVerdict(textB); decodeErr == nil {
-			outcomes, accepted := conservativeInsightVerifyOutcomes(verdict, len(candidates))
-			if accepted > 0 {
-				log.Printf("[insights] project=%s Pass B repair returned incomplete verdict: %v; keeping %d/%d verified outcomes", project.ID, vErr, accepted, len(candidates))
-				if progress != nil {
-					progress("warn", fmt.Sprintf("核实结果不完整，已保守排除 %d 条未确认候选", len(candidates)-accepted))
-				}
-				return outcomes, nil
-			}
-		}
-		return nil, fmt.Errorf("核实代理未返回有效结果: %v (raw len=%d)", vErr, len(textB))
+		// 未返回结论不等于候选不成立。不要把漏项转换成 confirmed=false，
+		// 或把不完整核实标成成功；保留错误类型供扫描状态明确说明原因。
+		return nil, fmt.Errorf("%w (raw len=%d)", vErr, len(textB))
+	}
+	for _, item := range outcomes {
+		item.Index = retryIndexes[item.Index-1]
+		known[item.Index] = item
+	}
+	outcomes = make([]insightVerifyOutcome, 0, len(candidates))
+	for index := 1; index <= len(candidates); index++ {
+		outcomes = append(outcomes, known[index])
 	}
 	return outcomes, nil
 }
@@ -1378,9 +1388,29 @@ func decodeInsightVerdict(text string) (insightVerifyVerdict, error) {
 	if vJSON == "" {
 		return insightVerifyVerdict{}, errors.New("empty/non-json")
 	}
-	var verdict insightVerifyVerdict
-	if err := json.Unmarshal([]byte(vJSON), &verdict); err != nil {
+	var wire struct {
+		Findings *[]struct {
+			Index     int    `json:"index"`
+			Confirmed *bool  `json:"confirmed"`
+			Reason    string `json:"reason"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal([]byte(vJSON), &wire); err != nil {
 		return insightVerifyVerdict{}, err
+	}
+	if wire.Findings == nil {
+		return insightVerifyVerdict{}, errors.New("missing findings")
+	}
+	var verdict insightVerifyVerdict
+	for _, item := range *wire.Findings {
+		if item.Confirmed == nil {
+			return insightVerifyVerdict{}, errors.New("missing confirmed verdict")
+		}
+		verdict.Findings = append(verdict.Findings, struct {
+			Index     int    `json:"index"`
+			Confirmed bool   `json:"confirmed"`
+			Reason    string `json:"reason"`
+		}{item.Index, *item.Confirmed, item.Reason})
 	}
 	return verdict, nil
 }
@@ -1400,7 +1430,8 @@ func (s *Server) runInsightVerifyBatches(ctx context.Context, project Project, a
 			return nil, err
 		}
 		for _, item := range verdict {
-			verified[start+item.Index] = item
+			item.Index += start
+			verified[item.Index] = item
 		}
 	}
 	return verified, nil
@@ -1410,59 +1441,30 @@ func validateInsightVerdict(verdict insightVerifyVerdict, candidateCount int) er
 	if len(verdict.Findings) != candidateCount {
 		return fmt.Errorf("incomplete verdict: got %d findings, want %d", len(verdict.Findings), candidateCount)
 	}
-	seen := make(map[int]struct{}, candidateCount)
-	for _, finding := range verdict.Findings {
-		if finding.Index < 1 || finding.Index > candidateCount {
-			return fmt.Errorf("invalid candidate index: %d", finding.Index)
-		}
-		if _, ok := seen[finding.Index]; ok {
-			return fmt.Errorf("duplicate candidate index: %d", finding.Index)
-		}
-		seen[finding.Index] = struct{}{}
-	}
-	return nil
+	_, err := partialInsightVerifyOutcomes(verdict, candidateCount)
+	return err
 }
 
-// conservativeInsightVerifyOutcomes converts a malformed but parseable Pass B
-// response into a complete, safe result set. Only one valid verdict for an
-// in-range candidate is trusted; every unresolved candidate is excluded.
-func conservativeInsightVerifyOutcomes(verdict insightVerifyVerdict, candidateCount int) ([]insightVerifyOutcome, int) {
-	byIndex := make(map[int]insightVerifyOutcome, candidateCount)
-	invalid := make(map[int]struct{})
+// partialInsightVerifyOutcomes accepts only uniquely mapped verdicts. Missing
+// candidates remain unresolved and must be retried, never treated as rejected.
+func partialInsightVerifyOutcomes(verdict insightVerifyVerdict, candidateCount int) ([]insightVerifyOutcome, error) {
+	seen := make(map[int]struct{}, candidateCount)
+	outcomes := make([]insightVerifyOutcome, 0, len(verdict.Findings))
 	for _, finding := range verdict.Findings {
 		if finding.Index < 1 || finding.Index > candidateCount {
-			continue
+			return nil, fmt.Errorf("invalid candidate index: %d", finding.Index)
 		}
-		if _, duplicate := byIndex[finding.Index]; duplicate {
-			delete(byIndex, finding.Index)
-			invalid[finding.Index] = struct{}{}
-			continue
+		if _, duplicate := seen[finding.Index]; duplicate {
+			return nil, fmt.Errorf("duplicate candidate index: %d", finding.Index)
 		}
-		if _, duplicate := invalid[finding.Index]; duplicate {
-			continue
-		}
-		byIndex[finding.Index] = insightVerifyOutcome{
+		seen[finding.Index] = struct{}{}
+		outcomes = append(outcomes, insightVerifyOutcome{
 			Index:     finding.Index,
 			Confirmed: finding.Confirmed,
 			Reason:    truncateInsightLog(strings.TrimSpace(finding.Reason), insightRejectionReasonLimit),
-		}
+		})
 	}
-
-	outcomes := make([]insightVerifyOutcome, 0, candidateCount)
-	accepted := 0
-	for index := 1; index <= candidateCount; index++ {
-		if outcome, ok := byIndex[index]; ok {
-			outcomes = append(outcomes, outcome)
-			accepted++
-			continue
-		}
-		reason := "AI 未返回该候选的核实结论，已保守排除"
-		if _, duplicate := invalid[index]; duplicate {
-			reason = "AI 返回了重复的核实结论，已保守排除"
-		}
-		outcomes = append(outcomes, insightVerifyOutcome{Index: index, Confirmed: false, Reason: reason})
-	}
-	return outcomes, accepted
+	return outcomes, nil
 }
 
 // insightVerifyResultErrorMessage keeps the scan failure actionable without
@@ -1477,6 +1479,8 @@ func insightVerifyResultErrorMessage(err error) string {
 			detail = "核实结论数量不完整"
 		case strings.HasPrefix(err.Error(), "invalid candidate index:"), strings.HasPrefix(err.Error(), "duplicate candidate index:"):
 			detail = "核实结论的候选编号无效"
+		case strings.HasPrefix(err.Error(), "missing findings"), strings.HasPrefix(err.Error(), "missing confirmed verdict"):
+			detail = "核实结论缺少必填字段"
 		}
 	}
 	return "核实代理未返回有效结果（" + detail + "），已自动重试一次，请重试"

@@ -5,6 +5,7 @@ import { BrowserRouter, Routes, Route, Navigate, useNavigate, useParams } from "
 import { ProjectProvider } from "./stores/useProjectStore";
 import { UIPreferencesProvider } from "./stores/useUIPreferences";
 import { NotificationProvider } from "./components/NotificationProvider";
+import { MobileRemoteProvider } from "./components/MobileRemoteProvider";
 import { NotificationInvalidationBridge } from "./components/NotificationInvalidationBridge";
 import { ProcessStatusProvider } from "./components/ProcessStatusProvider";
 import { LiveEventsProvider } from "./components/LiveEventsProvider";
@@ -76,10 +77,12 @@ export function App() {
       <TooltipProvider>
         <UIPreferencesProvider>
           {nativeMobile || mobileRoute ? <ProjectProvider>
-            <Routes>
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="*" element={<MobileRemotePage />} />
-            </Routes>
+            <MobileRemoteProvider>
+              <Routes>
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="*" element={<MobileRemotePage />} />
+              </Routes>
+            </MobileRemoteProvider>
           </ProjectProvider> : <NotificationProvider>
             <LiveEventsProvider>
             <ProcessStatusProvider>

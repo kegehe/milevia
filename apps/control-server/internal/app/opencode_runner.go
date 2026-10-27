@@ -292,36 +292,16 @@ func (r *opencodeCLIRunner) Run(ctx context.Context, request AgentRunRequest, si
 	}
 	promptErr := writeOpenCodePrompt(stdin, request.Prompt)
 
+	// 进程树放进 Job Object：CLI 留下的逃逸后裔（setsid / 后台 dev server）不再变成
+	// 谁也杀不到的孤儿（见 containAgentProcess）。
+	releaseTree := containAgentProcess(cmd)
+	defer releaseTree()
 	completion := newOpenCodeCompletion()
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		closePipes := func() {
-			// 关键：如果 CLI 留下了逃逸子进程（setsid / 后台 dev server）继续持有
-			// stdout，单杀进程组不会让 reader EOF；关掉读端才能让 wg.Wait 返回。
-			_ = stdout.Close()
-			_ = stderr.Close()
-		}
-		select {
-		case <-ctx.Done():
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-				closePipes()
-			}
-		case <-completion.done:
-			terminateProcessGroup(cmd)
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				forceTerminateProcessGroup(cmd)
-				closePipes()
-			}
-		case <-done:
-		}
-	}()
+	// 收尾有界：ctx 取消或终结事件之后最多等 agentProcessTeardownGrace，超时就强杀并
+	// 关闭读端 —— 单杀进程组不会让握着 stdout 的逃逸子进程释放 reader。
+	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 
 	var wg sync.WaitGroup
 	wg.Add(2)

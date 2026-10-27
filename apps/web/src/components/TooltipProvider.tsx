@@ -7,12 +7,28 @@ type InputModality = "mouse" | "touch" | "pen" | "keyboard" | "unknown";
 
 const TOOLTIP_ID = "milevia-global-tooltip";
 const MAX_TOOLTIP_LENGTH = 360;
+const normalizedTitles = new WeakMap<HTMLElement, string>();
+
+function clearNormalizedTooltip(target: HTMLElement) {
+  const previous = normalizedTitles.get(target);
+  if (previous === undefined) return;
+  if (target.dataset.tooltip === previous) target.removeAttribute("data-tooltip");
+  normalizedTitles.delete(target);
+}
 
 function normalizeTooltip(target: HTMLElement) {
   const title = target.getAttribute("title");
-  if (!title?.trim()) return;
-  target.setAttribute("data-tooltip", title.trim());
-  target.removeAttribute("title");
+  if (title === "") return;
+  if (!title?.trim()) {
+    clearNormalizedTooltip(target);
+    return;
+  }
+  const text = title.trim();
+  normalizedTitles.set(target, text);
+  if (target.dataset.tooltip !== text) target.setAttribute("data-tooltip", text);
+  // 保留空属性以关闭原生提示，同时让 React 后续移除 title 时产生可观察的变化。
+  // 直接 removeAttribute 会让 React 移除已不存在的属性，旧 data-tooltip 因而永久残留。
+  target.setAttribute("title", "");
 }
 
 function normalizeTooltipTree(root: Node) {
@@ -57,7 +73,6 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const showTooltip = useCallback((anchor: HTMLElement) => {
-    normalizeTooltip(anchor);
     // 结构化悬浮卡片：data-tooltip-title(标题) + data-tooltip-desc(描述)。
     // 用于技能等需要“名称标题 + 简短描述”的场景，不走超长截断逻辑。
     const title = anchor.dataset.tooltipTitle?.trim();
@@ -69,14 +84,18 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
       setTooltip({ anchor, text: "", title, desc: anchor.dataset.tooltipDesc?.trim() });
       return;
     }
-    const text = anchor.dataset.tooltip?.trim();
-    if (!text) return;
+    // title 可能刚更新、尚未经过 MutationObserver；读取最新值，但不在事件中转换 DOM。
+    const text = anchor.getAttribute("title")?.trim() || anchor.dataset.tooltip?.trim();
+    if (!text) {
+      hideTooltip(anchor);
+      return;
+    }
     if (activeAnchorRef.current !== anchor && activeAnchorRef.current?.isConnected) updateTooltipDescription(activeAnchorRef.current, false);
     updateTooltipDescription(anchor, true);
     activeAnchorRef.current = anchor;
     setPosition(null);
     setTooltip({ anchor, text: tooltipPreview(text) });
-  }, []);
+  }, [hideTooltip]);
 
   const placeTooltip = useCallback(() => {
     if (!tooltip || !tooltipRef.current) return;
@@ -101,13 +120,29 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const root = document.body;
     normalizeTooltipTree(root);
+    const observerOptions: MutationObserverInit = { subtree: true, childList: true, attributes: true, attributeFilter: ["title", "data-tooltip", "data-tooltip-title", "data-tooltip-desc"] };
     const observer = new MutationObserver((records) => {
+      const titleTargets = new Set<HTMLElement>();
       for (const record of records) {
-        if (record.type === "attributes" && record.target instanceof HTMLElement) normalizeTooltip(record.target);
-        if (record.type === "childList") record.addedNodes.forEach(normalizeTooltipTree);
+        if (record.type === "attributes" && record.attributeName === "title" && record.target instanceof HTMLElement) titleTargets.add(record.target);
       }
+      // 转换器自身的属性写入不参与观察，避免把内部的 title="" 误判为调用方清空提示。
+      observer.disconnect();
+      try {
+        for (const target of titleTargets) {
+          if (target.getAttribute("title") === "") clearNormalizedTooltip(target);
+          else normalizeTooltip(target);
+        }
+        for (const record of records) {
+          if (record.type === "childList") record.addedNodes.forEach(normalizeTooltipTree);
+        }
+      } finally {
+        observer.observe(root, observerOptions);
+      }
+      const activeAnchor = activeAnchorRef.current;
+      if (activeAnchor && records.some((record) => record.type === "attributes" && record.target === activeAnchor)) showTooltip(activeAnchor);
     });
-    observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ["title"] });
+    observer.observe(root, observerOptions);
 
     const pointerOver = (event: PointerEvent) => {
       const target = tooltipTarget(event.target);

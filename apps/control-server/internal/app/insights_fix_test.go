@@ -85,6 +85,9 @@ func TestInsightScanDoesNotHoldWorkspaceLeaseWhileAnalyzing(t *testing.T) {
 			`[{"type":"bug","severity":"high","title":"a","summary":"s"}]`,
 			`{"findings":[{"index":1,"confirmed":true,"reason":""}]}`,
 		}}
+	// Admission probes use the registry; keep it on the same fixture rather
+	// than accidentally depending on Claude being installed on the test host.
+	server.runnerRegistry.register(server.localRunnerID(), server.runner, server.localRunnerMeta())
 
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/scan", nil))

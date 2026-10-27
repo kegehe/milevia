@@ -3226,8 +3226,10 @@ export default function ConversationPage() {
         const maxAttempts = 12;
         if (reconnectAttempts >= maxAttempts) {
           fail("实时连接已断开，请刷新页面重新建立连接。");
-          setRun("");
           setStopping(false);
+          // 这里不能凭"连接断了"就清空 run：后端很可能还在跑，清掉会让停止按钮消失、
+          // 页面显示成空闲，用户除了刷新没有别的办法。reload 会按服务端 activeRunId
+          // 给出权威答案；它自己失败时保留旧值，至少停止按钮还在。
           void reload();
           return;
         }

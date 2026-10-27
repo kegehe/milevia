@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Capacitor } from "@capacitor/core";
-import { LocalNotifications } from "@capacitor/local-notifications";
+import { useMobileNotifications } from "../components/MobileRemoteProvider";
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { useProjectContext } from "../stores/useProjectStore";
@@ -141,7 +141,9 @@ export default function SettingsPage() {
   const [draftVersion, setDraftVersion] = useState(0);
   const [updaterStatus, setUpdaterStatus] = useState<UpdaterStatus | null>(null);
   const [mobileVersion, setMobileVersion] = useState<string | null>(null);
-  const [mobileNotificationPermission, setMobileNotificationPermission] = useState<"granted" | "denied" | "default" | "unsupported">("unsupported");
+  const mobileNotifications = useMobileNotifications();
+  const mobileNotificationPermission = mobileNotifications?.permission ?? "unsupported";
+  const [testingNotification, setTestingNotification] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [openingDataDirectory, setOpeningDataDirectory] = useState(false);
@@ -166,9 +168,6 @@ export default function SettingsPage() {
   }, []);
   useEffect(() => {
     if (!nativeNotificationsAvailable) return;
-    void LocalNotifications.checkPermissions().then((status) => {
-      setMobileNotificationPermission(status.display === "granted" ? "granted" : status.display === "denied" ? "denied" : "default");
-    }).catch(() => setMobileNotificationPermission("unsupported"));
     void readMobileAppInfo().then((info) => {
       if (info) setMobileVersion(formatAppVersion(info.version));
     });
@@ -325,15 +324,22 @@ export default function SettingsPage() {
       return;
     }
     try {
-      const status = await LocalNotifications.requestPermissions();
-      const permission = status.display === "granted" ? "granted" : status.display === "denied" ? "denied" : "default";
-      setMobileNotificationPermission(permission);
-      if (permission === "granted") updateLocalPreferences({ systemNotificationsEnabled: true });
-      else toast.error(permission === "denied" ? "系统通知已被拒绝，请在系统设置中允许。" : "当前环境不支持系统通知。");
+      const permission = await mobileNotifications?.requestPermission();
+      if (permission !== "granted") toast.error(permission === "denied" ? "系统通知已被拒绝，请在系统设置中允许。" : "当前环境不支持系统通知。");
     } catch {
       toast.error("无法请求系统通知权限。");
     }
   };
+
+  async function testMobileNotification() {
+    setTestingNotification(true);
+    try {
+      await mobileNotifications?.testNotification();
+      toast.success("测试通知已交给系统，请查看通知栏。");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "测试通知发送失败");
+    } finally { setTestingNotification(false); }
+  }
 
   const toggleAutostart = async (enabled: boolean) => {
     setAutostartLoading(true);
@@ -442,6 +448,12 @@ export default function SettingsPage() {
         {activeTab === "notifications" && <div className="settings-grid">
           {nativeNotificationsAvailable && <SettingCard title="移动端系统通知" description={mobileNotificationPermission === "granted" ? "系统通知已获授权。" : mobileNotificationPermission === "denied" ? "系统通知已被拒绝。" : "开启后会请求系统通知授权。"}>
             <Toggle label="移动端系统通知" checked={localPreferences.systemNotificationsEnabled} disabled={mobileNotificationPermission === "unsupported"} onChange={(checked) => void toggleMobileSystemNotifications(checked)} />
+          </SettingCard>}
+          {nativeNotificationsAvailable && <SettingCard wide title="检查通知是否正常" description={<>
+            点击发送一条测试通知，再查看手机通知栏。部分 Android 或鸿蒙设备开启通知时不会弹授权框；锁屏后的提醒还受后台运行设置影响。
+            {mobileNotifications?.diagnostic && <span role="status">最近结果：{mobileNotifications.diagnostic.message}</span>}
+          </>}>
+            <button type="button" className="secondary" disabled={!mobileNotifications || testingNotification || mobileNotificationPermission !== "granted"} onClick={() => void testMobileNotification()}>{testingNotification ? "发送中…" : "发送测试通知"}</button>
           </SettingCard>}
           {/* 两条 Web Notification 开关只在浏览器里有意义（桌面端/原生包的支持判定见
               stores/useUIPreferences.tsx → webNotificationsSupported）：在桌面端留着它们，

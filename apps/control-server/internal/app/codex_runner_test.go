@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,161 @@ import (
 	"time"
 	"unicode/utf8"
 )
+
+// Run a real child through a Windows .cmd (the same %* forwarding used by npm),
+// or a POSIX shell. The helper records stdin instead of contacting any model.
+func writeCodexStdinFixture(t *testing.T) string {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MILEVIA_CODEX_STDIN_HELPER", "1")
+	t.Setenv("MILEVIA_CODEX_STDIN_EXE", executable)
+	path := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\nexec \"$MILEVIA_CODEX_STDIN_EXE\" -test.run=^TestCodexStdinHelperProcess$ -- \"$@\"\n"
+	if runtime.GOOS == "windows" {
+		path += ".cmd"
+		script = "@echo off\r\n\"%MILEVIA_CODEX_STDIN_EXE%\" -test.run=TestCodexStdinHelperProcess -- %*\r\n"
+	}
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCodexStdinHelperProcess(t *testing.T) {
+	if os.Getenv("MILEVIA_CODEX_STDIN_HELPER") != "1" {
+		return
+	}
+	if readyFile := os.Getenv("MILEVIA_CODEX_STDIN_BLOCK"); readyFile != "" {
+		if err := os.WriteFile(readyFile, []byte("ready"), 0o600); err != nil {
+			os.Exit(2)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	prompt, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		os.Exit(2)
+	}
+	var args []string
+	for index, arg := range os.Args {
+		if arg == "--" {
+			args = os.Args[index+1:]
+			break
+		}
+	}
+	captured, _ := json.Marshal(struct {
+		Args   []string `json:"args"`
+		Prompt string   `json:"prompt"`
+	}{args, string(prompt)})
+	event, _ := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]string{"type": "agent_message", "text": string(captured)},
+	})
+	_, _ = os.Stdout.Write(append(event, '\n'))
+	_, _ = io.WriteString(os.Stdout, "{\"type\":\"turn.completed\"}\n")
+	os.Exit(0)
+}
+
+func TestCodexRunPreservesPromptViaStdin(t *testing.T) {
+	path := writeCodexStdinFixture(t)
+	projectPath := t.TempDir()
+	cases := []struct {
+		name   string
+		prompt string
+	}{
+		{"lf", "核实任务\n候选清单：\n1. 登录失败\n2. 列表卡顿\n"},
+		{"crlf", "核实任务\r\n候选清单：\r\n1. 登录失败\r\n2. 列表卡顿\r\n"},
+		{"special", "检查 100%：%PATH% !value! & | < > ^ \"quotes\" `code` $value\n中文与 emoji 🧪"},
+		{"long", strings.Repeat("完整候选与代码证据\n", 16000)},
+		{"scan", buildInsightScanPrompt(projectPath, "fixture-sha", []string{"此前的建议"}, scanOpts{})},
+		{"scan_repair", buildInsightRepairPromptWithHistory(projectPath, "fixture-sha", []string{"此前的建议"}, scanOpts{})},
+		{"verify", buildVerifyPrompt(projectPath, []pendingInsight{{Title: "列表卡顿", Summary: "大列表缺少分页", FileHint: "src/List.tsx"}})},
+		{"verify_repair", buildVerifyRepairPrompt(projectPath, []pendingInsight{{Title: "列表卡顿", Summary: "大列表缺少分页", FileHint: "src/List.tsx"}})},
+	}
+	for _, resume := range []bool{false, true} {
+		for _, tc := range cases {
+			name := tc.name
+			if resume {
+				name += "_resume"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				sink := &recordingSink{}
+				runner := newCodexCLIRunner(Config{CodexPath: path}, nil)
+				err := runner.Run(ctx, AgentRunRequest{
+					ProjectPath: projectPath, PermissionMode: "read_only", Prompt: tc.prompt,
+					Resume: resume, SessionID: "fixture-session",
+				}, sink)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(sink.texts) != 1 {
+					t.Fatalf("helper responses=%d, want 1", len(sink.texts))
+				}
+				var got struct {
+					Args   []string `json:"args"`
+					Prompt string   `json:"prompt"`
+				}
+				if err := json.Unmarshal([]byte(sink.texts[0]), &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.Prompt != tc.prompt {
+					t.Fatalf("prompt changed in transit: got %d bytes, want %d", len(got.Prompt), len(tc.prompt))
+				}
+				if len(got.Args) == 0 || got.Args[len(got.Args)-1] != "-" {
+					t.Fatalf("missing stdin marker: %q", got.Args)
+				}
+				for _, arg := range got.Args {
+					if strings.Contains(arg, tc.prompt) {
+						t.Fatal("prompt leaked into command-line arguments")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCodexRunCancelsWhileStdinIsBlocked(t *testing.T) {
+	path := writeCodexStdinFixture(t)
+	readyFile := filepath.Join(t.TempDir(), "ready")
+	t.Setenv("MILEVIA_CODEX_STDIN_BLOCK", readyFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newCodexCLIRunner(Config{CodexPath: path}, nil)
+	done := make(chan error, 1)
+	projectPath := t.TempDir()
+	go func() {
+		done <- runner.Run(ctx, AgentRunRequest{
+			ProjectPath: projectPath, PermissionMode: "read_only", Prompt: strings.Repeat("blocked\n", 100000),
+		}, &recordingSink{})
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for !fileExists(readyFile) {
+		select {
+		case err := <-done:
+			t.Fatalf("helper exited before cancellation: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("helper did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled run unexpectedly succeeded")
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("cancellation did not unblock stdin and reclaim the process")
+	}
+}
 
 type codexPayloadSink struct {
 	recordingSink

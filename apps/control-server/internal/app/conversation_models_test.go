@@ -606,7 +606,7 @@ func TestEveryRunRequestSetsModel(t *testing.T) {
 }
 
 // 本机 Codex 的 argv 是"模型有没有传下去"唯一没被覆盖的路径（Claude 本机 args、SSH 两个
-// 构造器、WSL 复用 Claude args 都有测试）。模型串错位会顶掉 prompt，所以连位置一起断言。
+// 构造器、WSL 复用 Claude args 都有测试）。prompt 经 stdin 提供，模型参数不能顶掉 stdin 标记。
 func TestCodexExecArgsPassModel(t *testing.T) {
 	resume := codexExecArgs(AgentRunRequest{
 		Prompt: "hi", ProjectPath: `C:\proj`, SessionID: "sid", Resume: true,
@@ -618,8 +618,8 @@ func TestCodexExecArgsPassModel(t *testing.T) {
 	if containsArguments(resume, "--model") {
 		t.Fatalf("Codex 用的是 -c model=，不该出现 --model: %q", resume)
 	}
-	if resume[len(resume)-1] != "hi" {
-		t.Fatalf("prompt 必须是最后一个参数，否则模型串会顶掉它: %q", resume)
+	if resume[len(resume)-1] != "-" || containsArguments(resume, "hi") {
+		t.Fatalf("prompt 必须经 stdin 提供，末尾保留 stdin 标记: %q", resume)
 	}
 	modelIndex, resumeIndex := indexOfArgument(resume, `model="gpt-5.5"`), indexOfArgument(resume, "resume")
 	if modelIndex < 0 || resumeIndex < 0 || modelIndex > resumeIndex {
@@ -630,7 +630,7 @@ func TestCodexExecArgsPassModel(t *testing.T) {
 	if !strings.Contains(strings.Join(fresh, " "), `--output-schema /tmp/schema.json`) {
 		t.Fatalf("schema 参数丢失: %q", fresh)
 	}
-	if fresh[len(fresh)-1] != "hi" || !strings.Contains(strings.Join(fresh, " "), `-C /p --sandbox workspace-write`) {
+	if fresh[len(fresh)-1] != "-" || containsArguments(fresh, "hi") || !strings.Contains(strings.Join(fresh, " "), `-C /p --sandbox workspace-write`) {
 		t.Fatalf("新会话参数装配异常: %q", fresh)
 	}
 
