@@ -1677,13 +1677,13 @@ func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
 	server.runnerRegistry.register("update-runner", runner, RunnerMeta{ID: "update-runner"})
 
 	missing := httptest.NewRecorder()
-	server.routes().ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/api/runners/missing/claude/check-update", nil))
+	server.routes().ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/api/runners/missing/agents/claude-code/check-update", nil))
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing runner status=%d body=%s", missing.Code, missing.Body.String())
 	}
 
 	check := httptest.NewRecorder()
-	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/check-update", nil))
+	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/agents/claude-code/check-update", nil))
 	if check.Code != http.StatusOK {
 		t.Fatalf("check update status=%d body=%s", check.Code, check.Body.String())
 	}
@@ -1700,7 +1700,7 @@ func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
 	}
 
 	update := httptest.NewRecorder()
-	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/update", nil))
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/agents/claude-code/update", nil))
 	if update.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s", update.Code, update.Body.String())
 	}
@@ -1728,7 +1728,7 @@ func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
 	}
 
 	blocked := httptest.NewRecorder()
-	server.routes().ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/update", nil))
+	server.routes().ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/agents/claude-code/update", nil))
 	if blocked.Code != http.StatusConflict || runner.updateCalls != 1 {
 		t.Fatalf("blocked update status=%d calls=%d body=%s", blocked.Code, runner.updateCalls, blocked.Body.String())
 	}
@@ -1738,7 +1738,7 @@ func TestClaudeUpdateEndpointsValidateRunnerAndActiveRuns(t *testing.T) {
 	}
 	runner.updateErr = errors.New("update failed")
 	failed := httptest.NewRecorder()
-	server.routes().ServeHTTP(failed, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/claude/update", nil))
+	server.routes().ServeHTTP(failed, httptest.NewRequest(http.MethodPost, "/api/runners/update-runner/agents/claude-code/update", nil))
 	if failed.Code != http.StatusInternalServerError || runner.updateCalls != 2 {
 		t.Fatalf("failed update status=%d calls=%d body=%s", failed.Code, runner.updateCalls, failed.Body.String())
 	}
@@ -1762,13 +1762,13 @@ func TestCodexUpdateEndpointsUseLocalCodexRunner(t *testing.T) {
 	server.wslRunner = server.codexRunner
 
 	unsupported := httptest.NewRecorder()
-	server.routes().ServeHTTP(unsupported, httptest.NewRequest(http.MethodPost, "/api/runners/ssh-example/codex/check-update", nil))
+	server.routes().ServeHTTP(unsupported, httptest.NewRequest(http.MethodPost, "/api/runners/ssh-example/agents/codex/check-update", nil))
 	if unsupported.Code != http.StatusNotFound {
 		t.Fatalf("unsupported Codex runner status=%d body=%s", unsupported.Code, unsupported.Body.String())
 	}
 
 	check := httptest.NewRecorder()
-	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/check-update", nil))
+	server.routes().ServeHTTP(check, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/agents/codex/check-update", nil))
 	if check.Code != http.StatusOK {
 		t.Fatalf("check Codex update status=%d body=%s", check.Code, check.Body.String())
 	}
@@ -1785,7 +1785,7 @@ func TestCodexUpdateEndpointsUseLocalCodexRunner(t *testing.T) {
 	}
 
 	update := httptest.NewRecorder()
-	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil))
+	server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/agents/codex/update", nil))
 	if update.Code != http.StatusOK || codex.updateCalls != 1 {
 		t.Fatalf("update Codex status=%d calls=%d body=%s", update.Code, codex.updateCalls, update.Body.String())
 	}
@@ -1806,7 +1806,7 @@ func TestCodexUpdateIsIsolatedFromClaudeSessions(t *testing.T) {
 	update := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil))
+		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/agents/codex/update", nil))
 		close(done)
 	}()
 	select {
@@ -1872,7 +1872,7 @@ func TestRunnerUpdatesAreSerializedAcrossAgents(t *testing.T) {
 	codexUpdate := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		server.routes().ServeHTTP(codexUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil))
+		server.routes().ServeHTTP(codexUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/agents/codex/update", nil))
 		close(done)
 	}()
 	select {
@@ -1882,7 +1882,7 @@ func TestRunnerUpdatesAreSerializedAcrossAgents(t *testing.T) {
 	}
 
 	claudeUpdate := httptest.NewRecorder()
-	server.routes().ServeHTTP(claudeUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/claude/update", nil))
+	server.routes().ServeHTTP(claudeUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/agents/claude-code/update", nil))
 	if claudeUpdate.Code != http.StatusConflict || claude.updateCalls != 0 {
 		t.Fatalf("Claude update must wait for Codex update: status=%d calls=%d body=%s", claudeUpdate.Code, claude.updateCalls, claudeUpdate.Body.String())
 	}
@@ -1906,7 +1906,7 @@ func TestCodexUpdateSurvivesRequestCancellation(t *testing.T) {
 	server.wslRunner = server.codexRunner
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	request := httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/codex/update", nil).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodPost, "/api/runners/"+localRunnerID+"/agents/codex/update", nil).WithContext(ctx)
 	response := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -2096,7 +2096,7 @@ func TestClaudeUpdateBlocksConcurrentUpdatesAndNewClaudeRuns(t *testing.T) {
 	server.sessions["conversation"] = &activeAgentSession{agent: idle, runnerID: "wsl-local"}
 	server.mu.Unlock()
 	idleSessionUpdate := httptest.NewRecorder()
-	server.routes().ServeHTTP(idleSessionUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+	server.routes().ServeHTTP(idleSessionUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/agents/claude-code/update", nil))
 	if idleSessionUpdate.Code != http.StatusConflict {
 		t.Fatalf("update with idle session status=%d body=%s", idleSessionUpdate.Code, idleSessionUpdate.Body.String())
 	}
@@ -2107,7 +2107,7 @@ func TestClaudeUpdateBlocksConcurrentUpdatesAndNewClaudeRuns(t *testing.T) {
 	update := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+		server.routes().ServeHTTP(update, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/agents/claude-code/update", nil))
 		close(done)
 	}()
 	select {
@@ -2117,7 +2117,7 @@ func TestClaudeUpdateBlocksConcurrentUpdatesAndNewClaudeRuns(t *testing.T) {
 	}
 
 	secondUpdate := httptest.NewRecorder()
-	server.routes().ServeHTTP(secondUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+	server.routes().ServeHTTP(secondUpdate, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/agents/claude-code/update", nil))
 	if secondUpdate.Code != http.StatusConflict {
 		t.Fatalf("second update status=%d body=%s", secondUpdate.Code, secondUpdate.Body.String())
 	}
@@ -2175,7 +2175,7 @@ func TestClaudeUpdateDoesNotDeadlockWithMessageAdmission(t *testing.T) {
 	updateDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		response := httptest.NewRecorder()
-		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/claude/update", nil))
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-local/agents/claude-code/update", nil))
 		updateDone <- response
 	}()
 	close(runner.releaseReady)
@@ -10046,14 +10046,16 @@ func TestProjectGitDiscardAllHandlesAnUnbornHead(t *testing.T) {
 	}
 }
 
-func TestProjectGitDiscardAllDeletesExplicitlySelectedUntrackedDirectory(t *testing.T) {
+func TestProjectGitDiscardAllDeletesUntrackedFilesAndKeepsIgnoredFiles(t *testing.T) {
 	server := newTestServer(t)
 	repo := newTempGitRepository(t)
 	writeGitTestFile(t, repo, "readme.txt", "one\n")
-	runGitForTest(t, repo, "add", "readme.txt")
+	writeGitTestFile(t, repo, ".gitignore", "generated/keep.log\n")
+	runGitForTest(t, repo, "add", ".")
 	runGitForTest(t, repo, "commit", "-m", "initial commit")
 	writeGitTestFile(t, repo, "readme.txt", "two\n")
 	writeGitTestFile(t, repo, "generated/entry.txt", "new\n")
+	writeGitTestFile(t, repo, "generated/keep.log", "ignored content\n")
 	seedGitProjectForTest(t, server, "git-project", repo)
 
 	summary := gitSummaryForTest(t, server, "git-project")
@@ -10066,8 +10068,14 @@ func TestProjectGitDiscardAllDeletesExplicitlySelectedUntrackedDirectory(t *test
 	if err != nil || string(content) != "one\n" {
 		t.Fatalf("tracked file was not restored: %q err=%v", content, err)
 	}
-	if _, err := os.Stat(filepath.Join(repo, "generated")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("untracked directory remains: %v", err)
+	if _, err := os.Stat(filepath.Join(repo, "generated", "entry.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("selected untracked file remains: %v", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(repo, "generated", "keep.log")); err != nil || string(content) != "ignored content\n" {
+		t.Fatalf("ignored file was changed: %q err=%v", content, err)
+	}
+	if summary := gitSummaryForTest(t, server, "git-project"); summary.Worktree != (GitWorktreeSummary{}) {
+		t.Fatalf("discard left Git changes: %#v", summary.Worktree)
 	}
 }
 
@@ -10505,8 +10513,9 @@ func TestProjectGitDiffReturnsUntrackedContentAndRejectsUnchangedPath(t *testing
 
 type gitSummaryTestResponse struct {
 	GitSnapshot
-	StateToken string    `json:"stateToken"`
-	ObservedAt time.Time `json:"observedAt"`
+	StateToken      string    `json:"stateToken"`
+	ObservedAt      time.Time `json:"observedAt"`
+	ChangesRevision string    `json:"changesRevision"`
 }
 
 func gitSummaryForTest(t *testing.T, server *Server, projectID string) gitSummaryTestResponse {

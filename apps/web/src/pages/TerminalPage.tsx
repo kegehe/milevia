@@ -2,10 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useOutletContext, useParams } from "react-router-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { invoke } from "@tauri-apps/api/core";
 import "@xterm/xterm/css/xterm.css";
 import { api, type APIError } from "../lib/api";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { createWebSocket } from "../lib/runtime";
+import { useContextMenu } from "../components/ContextMenu";
+import { copyToClipboard } from "../lib/clipboard";
+import { createWebSocket, isDesktop } from "../lib/runtime";
 import type { ProjectLayoutOutletContext } from "../components/ProjectLayout";
 import type { TerminalSessionInfo, TerminalSessionList } from "../lib/types";
 import { useActiveConversationId } from "../lib/use-active-conversation";
@@ -41,6 +44,7 @@ export default function TerminalPage() {
   const [replayTruncated, setReplayTruncated] = useState(false);
   const [connectionVersion, setConnectionVersion] = useState(0);
   const [showNewMenu, setShowNewMenu] = useState(false);
+  const { openMenu, closeMenu, menu } = useContextMenu();
   const newMenuRef = useRef<HTMLDivElement>(null);
   // 关闭确认：点标签上的 × 或中键点击都会立刻结束会话及其中的进程，
   // 未结束的会话（可能正跑着构建/部署）要先确认，已结束的会话才直接关。
@@ -366,6 +370,51 @@ export default function TerminalPage() {
   };
 
   const selected = sessions.find((item) => item.id === activeID);
+  useEffect(() => { closeMenu(); }, [activeID, projectId, connectionVersion, closeMenu]);
+
+  const paste = async (term: Terminal, isCurrent: () => boolean) => {
+    if (!isCurrent()) return;
+    const ws = wsRef.current;
+    setError("");
+    try {
+      if (!navigator.clipboard?.readText) throw new Error("当前环境无法读取剪贴板，请使用 Ctrl+Shift+V 粘贴。");
+      const text = await navigator.clipboard.readText();
+      // 读取剪贴板可能弹出权限提示；期间切换、退出或重连时不能把内容送到另一个会话。
+      if (!isCurrent() || ws?.readyState !== WebSocket.OPEN || statusRef.current !== "running") return;
+      term.paste(text);
+      term.focus();
+    } catch {
+      if (isCurrent()) setError("无法读取剪贴板，请检查剪贴板权限，或使用 Ctrl+Shift+V 粘贴。");
+    }
+  };
+
+  const openDirectory = async (path: string, isCurrent: () => boolean) => {
+    if (!isCurrent()) return;
+    setError("");
+    try {
+      await invoke("open_terminal_directory", { path });
+    } catch (cause) {
+      if (isCurrent()) setError(`无法打开所在目录：${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  };
+
+  const terminalContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    const term = termRef.current;
+    const ws = wsRef.current;
+    const isCurrent = () => termRef.current === term && wsRef.current === ws && activeIDRef.current === activeID && projectIDRef.current === projectId;
+    const selection = term?.getSelection() || "";
+    const path = selected?.cwdDisplay || "";
+    const canOpenDirectory = isDesktop() && !!path && (selected?.environment === "windows" || selected?.environment === "wsl");
+    openMenu(event, "终端操作", [
+      { label: "复制", disabled: !selection, action: () => {
+        if (!isCurrent()) return;
+        void copyToClipboard(selection).then((copied) => { if (isCurrent() && !copied) setError("无法复制终端内容，请检查剪贴板权限。"); });
+      } },
+      { label: "粘贴", disabled: !term || status !== "running" || ws?.readyState !== WebSocket.OPEN, action: () => { if (term) void paste(term, isCurrent); } },
+      { label: "全选", disabled: !term, action: () => { term?.selectAll(); term?.focus(); } },
+      { label: "打开所在目录", disabled: !canOpenDirectory, title: canOpenDirectory ? path : "仅支持打开本机 Windows / WSL 会话的工作目录", action: () => void openDirectory(path, isCurrent) },
+    ]);
+  };
   const canReconnect = Boolean(activeID) && status !== "running" && status !== "connecting";
   const statusLabel = status === "running" ? "运行中" : status === "connecting" ? "连接中" : status === "disconnected" ? "已断开" : status === "exited" ? "已退出" : status === "failed" ? "不可用" : "未启动";
   const reachedLimit = sessions.length >= maxSessions;
@@ -425,7 +474,7 @@ export default function TerminalPage() {
           </div>
         </div>
       </header>
-      <div ref={hostRef} className="terminal-host">
+      <div ref={hostRef} className="terminal-host" onContextMenu={terminalContextMenu}>
         {(!activeID || selected?.projectId !== projectId) && <div className="terminal-empty"><span className="terminal-empty-icon" aria-hidden="true"><TerminalIcon /></span><strong>尚未选择终端</strong><span>创建一个新会话开始工作</span></div>}
       </div>
       {status === "exited" && exitCode !== null && <p className="terminal-exit-code">exit code {exitCode}</p>}
@@ -442,6 +491,7 @@ export default function TerminalPage() {
         <strong className={`terminal-status ${status}`}><i aria-hidden="true" />{statusLabel}</strong>
       </footer>
     </div>
+    {menu}
     {pendingCloseID && pendingCloseIndex >= 0 && <ConfirmDialog
       title="关闭终端"
       className="terminal-close-dialog"

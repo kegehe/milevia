@@ -16,7 +16,7 @@ import (
 // AI 辅助冲突解决：把单个冲突文件的 base/ours/theirs/working 交给只读 agent，
 // 生成整文件合并建议，用户审阅后接受（复用 conflicts/resolve action=working）。
 //
-// agent 严格只读（claude plan / codex read_only），不写工作区；建议结果暂存于
+// agent 严格只读（Claude 只读工具 / 其余工具 read_only），不写工作区；建议结果暂存于
 // 内存注册表，由前端轮询 GET 获取。接受动作仍走既有 stateToken 写路径，天然审计。
 
 const (
@@ -123,16 +123,19 @@ func parseConflictSuggestionJSON(raw string) (merged, explanation string, err er
 		return "", "", errors.New("AI 没有返回 JSON 结果")
 	}
 	var payload struct {
-		Merged      string `json:"merged"`
-		Explanation string `json:"explanation"`
+		Merged      *string `json:"merged"`
+		Explanation string  `json:"explanation"`
 	}
 	if err := json.Unmarshal([]byte(text[start:end+1]), &payload); err != nil {
 		return "", "", fmt.Errorf("解析 AI 返回的 JSON: %w", err)
 	}
-	if strings.Contains(payload.Merged, "<<<<<<<") || strings.Contains(payload.Merged, ">>>>>>>") {
+	if payload.Merged == nil {
+		return "", "", errors.New("AI 没有返回有效的 merged 文件内容，请重试或手动解决")
+	}
+	if strings.Contains(*payload.Merged, "<<<<<<<") || strings.Contains(*payload.Merged, ">>>>>>>") {
 		return "", "", errors.New("AI 建议中仍包含冲突标记，已丢弃；请重试或手动解决")
 	}
-	return payload.Merged, payload.Explanation, nil
+	return *payload.Merged, payload.Explanation, nil
 }
 
 // conflictSuggestionContentBudget 判断是否超过可送模型的体积预算。
@@ -156,9 +159,7 @@ func (s *Server) gitConflictSuggest(w http.ResponseWriter, r *http.Request) {
 	if input.Agent == "" {
 		input.Agent = "claude-code"
 	}
-	// 只接受已接通只读分析协议的工具：runReadOnlyAgent 对其余 ID 会回落到
-	// Claude runner，直接放行等于用错工具生成建议。
-	if entry, ok := agentByID(input.Agent); !ok || !entry.SupportsProjectInsights {
+	if entry, ok := agentByID(input.Agent); !ok || !entry.SupportsConflictSuggestions {
 		writeError(w, http.StatusBadRequest, errors.New("unsupported agent"))
 		return
 	}
@@ -170,6 +171,12 @@ func (s *Server) gitConflictSuggest(w http.ResponseWriter, r *http.Request) {
 	}
 	runner, repo, ok := s.getGitRunner(w, r)
 	if !ok {
+		return
+	}
+	// 能力判断与执行都使用本次冲突所属的会话工作区。
+	project.Path = repo
+	if _, err := s.conflictSuggestionLocalRunner(project, input.Agent); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	detail, err := runner.ConflictContent(r.Context(), repo, input.Path)
@@ -211,17 +218,15 @@ func (s *Server) gitConflictSuggest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("该项目已有 AI 冲突建议正在生成，请稍候"))
 		return
 	}
+	// 在记录对客户端可见之前登记取消函数；202 返回后立即取消也必须生效。
+	gctx, cancel := context.WithCancel(s.runtimeCtx)
+	record.cancel = cancel
+	record.StartedAt = time.Now().UTC()
 	s.conflictSuggestActive[projectID] = true
 	s.conflictSuggestions[record.ID] = record
 	s.conflictSuggestMu.Unlock()
 
 	writeJSON(w, http.StatusAccepted, record.response())
-
-	gctx, cancel := context.WithCancel(s.runtimeCtx)
-	s.conflictSuggestMu.Lock()
-	record.cancel = cancel
-	record.StartedAt = time.Now().UTC()
-	s.conflictSuggestMu.Unlock()
 
 	go func() {
 		defer cancel()
@@ -233,7 +238,7 @@ func (s *Server) runConflictSuggestion(ctx context.Context, project Project, rec
 	prompt := buildConflictSuggestionPrompt(record.Path, oursLabel, theirsLabel, detail)
 	// quotaWait=0：冲突解法是用户当场等结果的一次性建议，额度被占就该立刻回明确失败，
 	// 而不是让编辑器里的人在等待条上多停两分钟（排队语义只给后台的优化建议扫描/复核）。
-	text, runErr := s.runReadOnlyAgentWithSchema(ctx, project, record.Agent, prompt, conflictSuggestionOutputSchema, 0, nil)
+	text, runErr := s.runConflictSuggestionAgent(ctx, project, record.Agent, prompt)
 
 	s.conflictSuggestMu.Lock()
 	defer s.conflictSuggestMu.Unlock()

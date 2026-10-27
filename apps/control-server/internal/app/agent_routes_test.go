@@ -9,34 +9,27 @@ import (
 	"testing"
 )
 
-// TestGenericAgentRouteMatchesLegacyRoute 是成对用例。
-//
-// 泛化路由是过渡期新加的入口，旧路由改为委托。两者必须**逐字**给出同一个结果 ——
-// 否则前端切换过程中会出现"页面上看到的版本和更新按钮的结论不一致"这类难查的问题。
-func TestGenericAgentRouteMatchesLegacyRoute(t *testing.T) {
+// 已确认旧客户端不再依赖这些入口；旧路径应当路由未命中，而非进入工具更新逻辑。
+func TestLegacyAgentUpdateRoutesRemoved(t *testing.T) {
 	server := newTestServer(t)
 	runner := &updateTestRunner{checkAvailable: true, latestVersion: "2.1.217"}
 	server.runnerRegistry.register("paired", runner, RunnerMeta{ID: "paired"})
-
-	pairs := []struct{ legacy, generic string }{
-		{"/api/runners/paired/claude/check-update", "/api/runners/paired/agents/claude-code/check-update"},
-		{"/api/runners/paired/claude/update", "/api/runners/paired/agents/claude-code/update"},
+	server.codexRunner = runner
+	routes := server.routes()
+	for _, tool := range []string{"claude", "codex"} {
+		for _, action := range []string{"check-update", "update"} {
+			path := "/api/runners/paired/" + tool + "/" + action
+			t.Run(tool+"/"+action, func(t *testing.T) {
+				response := httptest.NewRecorder()
+				routes.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+				if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), "404 page not found") {
+					t.Fatalf("旧路由 %s 未移除：status=%d body=%s", path, response.Code, response.Body.String())
+				}
+			})
+		}
 	}
-	for _, pair := range pairs {
-		legacy := httptest.NewRecorder()
-		server.routes().ServeHTTP(legacy, httptest.NewRequest(http.MethodPost, pair.legacy, nil))
-		generic := httptest.NewRecorder()
-		server.routes().ServeHTTP(generic, httptest.NewRequest(http.MethodPost, pair.generic, nil))
-
-		if legacy.Code != generic.Code {
-			t.Fatalf("%s 与 %s 状态码不同：%d vs %d", pair.legacy, pair.generic, legacy.Code, generic.Code)
-		}
-		if legacy.Body.String() != generic.Body.String() {
-			t.Fatalf("%s 与 %s 响应不同：\n旧: %s\n新: %s", pair.legacy, pair.generic, legacy.Body.String(), generic.Body.String())
-		}
-		if legacy.Code != http.StatusOK {
-			t.Fatalf("%s 期望 200，得到 %d body=%s", pair.generic, legacy.Code, legacy.Body.String())
-		}
+	if runner.updateCalls != 0 {
+		t.Fatalf("旧路由触发了 %d 次升级", runner.updateCalls)
 	}
 }
 

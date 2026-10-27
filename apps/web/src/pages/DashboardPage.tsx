@@ -62,6 +62,7 @@ export default function DashboardPage() {
   const processStatuses = useProcessStatusMap();
   const navigate = useNavigate();
   const [filter, setFilter] = useState<ProjectFilter>("all");
+  const [query, setQuery] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
   const [deleting, setDeleting] = useState(false);
 
@@ -101,7 +102,9 @@ export default function DashboardPage() {
   const orderedIds = useMemo(() => sortProjectIds(projects.map((project) => project.id)), [projects, orderVersion]);
   // 排除掉已删除但仍残留在 localStorage 中的 id。
   const orderedProjects = orderedIds.map((id) => projectById.get(id)).filter((project): project is Project => Boolean(project));
-  const filteredProjects = orderedProjects.filter((project) => filter === "all" || projectState(project) === filter);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredProjects = orderedProjects.filter((project) =>
+    (filter === "all" || projectState(project) === filter) && project.name.toLowerCase().includes(normalizedQuery));
 
   // 把当前实际展示的顺序同步回存储：吸纳新增项目、清理已删除项目。
   // 放在副作用里执行，避免渲染期写 localStorage（StrictMode 下渲染会双调用）。
@@ -193,6 +196,13 @@ export default function DashboardPage() {
           {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><b>{projectsLoaded ? item.count : "—"}</b><small>{item.label}</small></button>)}
         </div>
       </header>
+      <div className="dashboard-search-bar">
+        <label className="dashboard-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg>
+          <input type="search" value={query} placeholder="按项目名称搜索…" aria-label="按项目名称搜索" onChange={(event) => setQuery(event.target.value)} />
+        </label>
+        {query && <button className="secondary" type="button" onClick={() => setQuery("")}>清除搜索</button>}
+      </div>
       {projects.length === 0
         ? showInitialLoading ? <ProjectGridSkeleton />
           : showLoadFailed ? <div className="empty load-failed">
@@ -207,10 +217,10 @@ export default function DashboardPage() {
           const others = filters.filter((item) => item.id !== filter && item.id !== "all" && item.count > 0);
           return <div className="empty filtered-empty">
             <span className="filtered-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" /><circle cx="18.5" cy="17.5" r="3.5" /><path d="M18.5 16v1.5l1 1" /></svg></span>
-            <h2>{`暂无${current?.label ?? ""}项目`}</h2>
-            <p>{`当前筛选下没有匹配的项目。${others.length ? "试试切换到下方其他状态，或查看全部项目。" : "切换到全部项目查看所有任务。"}`}</p>
-            {others.length > 0 && <div className="filtered-empty-suggest">{others.map((item) => <button key={item.id} type="button" className="filtered-empty-chip" onClick={() => setFilter(item.id)}><small>{item.label}</small><b>{item.count}</b></button>)}</div>}
-            <button className="primary" type="button" onClick={() => setFilter("all")}>查看全部项目</button>
+            <h2>{normalizedQuery ? "没有匹配的项目" : `暂无${current?.label ?? ""}项目`}</h2>
+            <p>{normalizedQuery ? "当前名称搜索和状态筛选下没有匹配的项目，请更换关键词、清除搜索或切换状态。" : `当前筛选下没有匹配的项目。${others.length ? "试试切换到下方其他状态，或查看全部项目。" : "切换到全部项目查看所有任务。"}`}</p>
+            {!normalizedQuery && others.length > 0 && <div className="filtered-empty-suggest">{others.map((item) => <button key={item.id} type="button" className="filtered-empty-chip" onClick={() => setFilter(item.id)}><small>{item.label}</small><b>{item.count}</b></button>)}</div>}
+            <button className="primary" type="button" onClick={() => { setFilter("all"); setQuery(""); }}>查看全部项目</button>
           </div>;
         })()
           : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} runStartedAt={processStatuses[item.id]?.runStartedAt ?? null} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}

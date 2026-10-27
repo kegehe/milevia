@@ -1,3 +1,13 @@
+/* 名称搜索与状态筛选叠加，独立一行以兼容窄屏。 */
+.dashboard-search-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; }
+.dashboard-search { display: flex; align-items: center; gap: 8px; width: 320px; max-width: 100%; min-width: 0; height: 38px; box-sizing: border-box; border: 1px solid #c6dbd0; border-radius: 6px; padding: 0 12px; color: #7a9086; background: #fbfefb; }
+.dashboard-search:focus-within { border-color: #55a697; outline: 2px solid #cfede3; }
+.dashboard-search svg { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.dashboard-search input { width: 100%; min-width: 0; border: 0; border-radius: 0; padding: 0; color: #19332c; background: transparent; font: inherit; font-size: 14px; outline: 0; }
+.dashboard-search input::placeholder { color: #7a9086; }
+.dashboard-search-bar > button { flex: none; white-space: nowrap; }
+@media (max-width: 520px) { .dashboard-search { flex: 1; } }
+
 /* 删除项目确认弹窗 — 复刻项目总览的绿色 studio 色板，突出"破坏性操作"的警示层级。 */
 .delete-project-dialog { width: min(480px, 100%); color: #19332c; background: #fcfefc; }
 .delete-project-dialog > header { border-bottom-color: #dcebe1; padding: 16px 18px; }

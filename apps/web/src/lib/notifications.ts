@@ -18,6 +18,43 @@ export interface NotificationEvent {
   createdAt: string;
 }
 
+/** 与服务端 notificationMaxRows 对齐，实时推送期间也不无限累积未读集合。 */
+export const MAX_UNREAD_NOTIFICATIONS = 1000;
+
+/** 保留一份 REST 历史和一份实时窗口；逐个淘汰，不能超限后整批清空。 */
+export function rememberNotificationID(ids: Set<string>, id: string): void {
+  ids.delete(id);
+  ids.add(id);
+  while (ids.size > 2 * MAX_UNREAD_NOTIFICATIONS) ids.delete(ids.values().next().value!);
+}
+
+/** Date 只保留毫秒；服务端 RFC3339Nano 的余下精度用于排序和全部已读边界。 */
+export function notificationTimeNs(value: string): bigint | null {
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return null;
+  const fraction = /\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/.exec(value)?.[1] ?? "";
+  const remainingNs = fraction.padEnd(9, "0").slice(3, 9);
+  return BigInt(milliseconds) * 1_000_000n + BigInt(remainingNs || "0");
+}
+
+export function trimUnreadNotifications(unread: Map<string, bigint>): void {
+  if (unread.size <= MAX_UNREAD_NOTIFICATIONS) return;
+  const latest = [...unread].sort(([leftID, leftTime], [rightID, rightTime]) =>
+    (leftTime < rightTime ? 1 : leftTime > rightTime ? -1 : 0) || (leftID < rightID ? 1 : leftID > rightID ? -1 : 0));
+  for (const [id] of latest.slice(MAX_UNREAD_NOTIFICATIONS)) unread.delete(id);
+}
+
+/** 整批对账后再裁剪，避免已删除的新记录先挤掉服务端补回的有效旧记录。 */
+export function reconcileUnreadNotifications(
+  unread: Map<string, bigint>,
+  beforeFetch: ReadonlySet<string>,
+  serverUnread: ReadonlyMap<string, bigint>,
+): void {
+  for (const id of unreadIdsMissingFromServer(beforeFetch, new Set(serverUnread.keys()))) unread.delete(id);
+  for (const [id, createdAt] of serverUnread) unread.set(id, createdAt);
+  trimUnreadNotifications(unread);
+}
+
 export function isClockTime(value: unknown): value is string {
   if (typeof value !== "string" || !/^\d{2}:\d{2}$/.test(value)) return false;
   const [hours, minutes] = value.split(":").map(Number);

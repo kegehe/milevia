@@ -17,7 +17,7 @@ import (
 
 // ─── Git op 名单 ────────────────────────────────────────────────────────────
 
-// 这 28 条是手机端能对仓库做的全部事情。多一条（偷偷开了写能力）或少一条
+// 这些操作是手机端能对仓库做的全部事情。多一条（偷偷开了写能力）或少一条
 // （某个 tab 静默空白）都必须在这里同时改，逼出一次有意识的决定。
 func TestGitRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	server := &Server{}
@@ -51,6 +51,9 @@ func TestGitRemoteOperationWhitelistIsExplicit(t *testing.T) {
 		{"git.push", http.MethodPost, "/git/push", nil, 0},
 		{"git.createBranch", http.MethodPost, "/git/branches", nil, 0},
 		{"git.switch", http.MethodPost, "/git/switch", nil, 0},
+		{"git.stashes", http.MethodGet, "/git/stashes", nil, 256 << 10},
+		{"git.stashCreate", http.MethodPost, "/git/stashes", nil, 0},
+		{"git.stashApply", http.MethodPost, "/git/stashes/apply", nil, 0},
 		{"git.conflictResolve", http.MethodPost, "/git/conflicts/resolve", nil, 0},
 		{"git.conflictAbort", http.MethodPost, "/git/conflicts/abort", nil, 0},
 		{"git.conflictContinue", http.MethodPost, "/git/conflicts/continue", nil, 0},

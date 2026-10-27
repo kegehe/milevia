@@ -8,6 +8,7 @@
 // 返回是否写入成功：调用方据此给出「已复制 / 复制失败」反馈，避免点了没反应。
 
 function copyWithLegacyClipboard(content: string): boolean {
+  const previousFocus = document.activeElement;
   const textarea = document.createElement("textarea");
   textarea.value = content;
   textarea.setAttribute("readonly", "");
@@ -21,6 +22,10 @@ function copyWithLegacyClipboard(content: string): boolean {
     return document.execCommand("copy");
   } finally {
     textarea.remove();
+    // 临时文本域会抢走终端/输入框的焦点，移除后应交还，避免复制后无法继续输入。
+    if (previousFocus?.isConnected && "focus" in previousFocus && typeof previousFocus.focus === "function") {
+      try { previousFocus.focus({ preventScroll: true }); } catch { /* 焦点恢复失败不影响复制结果。 */ }
+    }
   }
 }
 

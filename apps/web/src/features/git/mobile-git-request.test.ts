@@ -59,6 +59,9 @@ test("every REST call the workbench makes maps to a git op", () => {
     { path: "/push", method: "POST", op: "git.push" },
     { path: "/branches", method: "POST", op: "git.createBranch" },
     { path: "/switch", method: "POST", op: "git.switch" },
+    { path: "/stashes", method: "GET", op: "git.stashes" },
+    { path: "/stashes", method: "POST", op: "git.stashCreate" },
+    { path: "/stashes/apply", method: "POST", op: "git.stashApply" },
     { path: "/conflicts/resolve", method: "POST", op: "git.conflictResolve" },
     { path: "/conflicts/abort", method: "POST", op: "git.conflictAbort" },
     { path: "/conflicts/continue", method: "POST", op: "git.conflictContinue" },
@@ -150,6 +153,35 @@ test("reads do not pay for a token", async () => {
   const adapter = createMobileGitRequest({ transport });
   await adapter.request(git("/changes"));
   assert.deepEqual(calls.map((call) => call.op), ["git.changes"]);
+});
+
+test("stash writes retain the confirmed token, selected object ID and restore mode", async () => {
+  const { transport, calls } = makeTransport((op) => op === "git.summary" ? ok({ stateToken: "fresh" }) : ok({}));
+  const adapter = createMobileGitRequest({ transport });
+  await adapter.request(git("/stashes"));
+  await adapter.request(git("/stashes"), { method: "POST", body: JSON.stringify({ message: "切换前保存", stateToken: "old" }) });
+  await adapter.request(git("/stashes/apply"), { method: "POST", body: JSON.stringify({ oid: OID, restoreIndex: false, stateToken: "old" }) });
+  assert.deepEqual(calls.map((call) => call.op), ["git.stashes", "git.stashCreate", "git.stashApply"]);
+  assert.deepEqual(calls[1].params, { message: "切换前保存", stateToken: "old" });
+  assert.deepEqual(calls[2].params, { oid: OID, restoreIndex: false, stateToken: "old" });
+});
+
+test("stash cannot silently replace the state the user confirmed with a newer state", async () => {
+  for (const endpoint of ["/stashes", "/stashes/apply"]) {
+    const { transport } = makeTransport((op, params) => {
+      if (op === "git.summary") return ok({ stateToken: "current-state" });
+      if ((params as { stateToken?: string }).stateToken === "confirmed-state") {
+        return failure(409, "Git state changed; refresh the repository");
+      }
+      return ok({ operationId: "unexpected-write", status: "succeeded" });
+    });
+    const adapter = createMobileGitRequest({ transport });
+    await assert.rejects(
+      () => adapter.request(git(endpoint), { method: "POST", body: JSON.stringify({ stateToken: "confirmed-state", oid: OID }) }),
+      (error: unknown) => error instanceof MobileGitError && error.code === "stale_state",
+      `${endpoint} must reject changes made after the user reviewed the workspace`,
+    );
+  }
 });
 
 // 建分支与生成建议都不带乐观锁，所以它们也不该多付一次往返。

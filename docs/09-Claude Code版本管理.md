@@ -3,6 +3,8 @@
 > 日期：2026-07-22  
 > 阶段目标：让平台用户能够在页面中查看 Runner 的 Claude Code 版本号与可用状态，主动检查更新并在确认后执行更新；为未来远程 Runner 的版本管理保留统一接口。
 
+> 接口更新（2026-10-27）：前端已全部迁移，且已人工确认无旧客户端或外部脚本依赖，旧的 `/claude/check-update|update`、`/codex/check-update|update` 四条路由已删除。当前统一使用 `POST /api/runners/{runnerID}/agents/{agentID}/check-update` 和 `POST /api/runners/{runnerID}/agents/{agentID}/update`，Claude Code 的 `agentID` 为 `claude-code`，Codex CLI 为 `codex`。下文旧路径仅记录历史设计。
+
 ## 1. 结论
 
 当前平台只在项目创建时检测一次 Claude Code 是否可用（`claudeReady` 布尔值），用户看不到具体的版本号，也无法知道是否有新版本可更新。随着 Claude Code 快速迭代（周级发版），Runner 版本可能落后，导致新参数不支持、行为差异或已知 bug 未修复。

@@ -3695,7 +3695,10 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   //    症状是"仓库真有冲突，手机端却显示成一个完全正常的仓库"，且时好时坏（竞态）。
   // 同样先剥注释：这个文件的注释里为了说明"为什么删掉它"，把那句原样写了一遍。
   const workbenchCode = workbench.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
-  assert.doesNotMatch(workbenchCode, /\.catch\(\(\) => null\)/);
+  // 只约束冲突请求；Stash 列表用 null 表示“读不到”，并有独立的错误展示。
+  const conflictsLoader = workbenchCode.match(/async function loadConflicts\(\) \{[\s\S]*?\n    \}/)?.[0];
+  assert.ok(conflictsLoader, "冲突总览读取函数必须存在");
+  assert.doesNotMatch(conflictsLoader, /\.catch\(\(\) => null\)/);
   assert.match(workbench, /const \[conflictsState, setConflictsState\] = useState<"loading" \| "ready" \| "unavailable">\("loading"\);/);
   // 冲突总览改成**单独一路、不挡首屏**之后（它是这一组里最慢的一条：干净仓库上要跑
   // 四次 rev-parse 探测），三档的判据从 `conflictsResult.ok` 挪进了 loadConflicts 的
@@ -3784,7 +3787,8 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   //    结构上钉住两点：只有**一个** `<select`，且它排在胶囊那一支**之后**（= 它是 else 支）。
   const conflictView = normalize(await readFile(new URL("./features/git/ConflictSolveView.tsx", import.meta.url), "utf8"));
   assert.match(conflictView, /mobile\?: boolean;/);
-  assert.match(conflictView, /const AI_AGENT_OPTIONS = \[\{ value: "claude-code", label: "Claude" \}, \{ value: "codex", label: "Codex" \}\] as const;/);
+  assert.match(conflictView, /const agentOptions = content\?\.suggestionAgents \?\? \[\];/);
+  assert.doesNotMatch(conflictView, /const AI_AGENT_OPTIONS\s*=/, "冲突工具选项应由服务端下发，不能再固定为两个工具");
   assert.match(conflictView, /<div className="git-conflict-ai-agents">/);
   assert.equal((conflictView.match(/<select /g) ?? []).length, 1, "AI 模型只该留一个原生 select（桌面端那一支）");
   assert.ok(
@@ -3834,8 +3838,8 @@ test("mobile Git workbench is a sub-state of the conversation, wired to its own 
   const mobileBackRules = gitStyles.match(/\.git-mobile-back \{/g) ?? [];
   assert.equal(mobileBackRules.length, 1, `.git-mobile-back 应只有一条定义，实际 ${mobileBackRules.length} 条`);
 
-  // ⑬ 适配器的三条硬性质：写操作换新令牌、超时分档、路由表按"字面先于占位符"匹配。
-  assert.match(adapter, /if \(parsed\.route\.needsStateToken\) \{/);
+  // ⑬ 一般写操作换新令牌，Stash 保留已确认令牌；超时分档、路由按字面优先匹配。
+  assert.match(adapter, /if \(parsed\.route\.needsStateToken && !parsed\.route\.preserveStateToken\) \{/);
   assert.match(adapter, /const token = await fetchStateToken\(\);/);
   assert.match(adapter, /const LOCAL_WRITE_TIMEOUT_MS = 45_000;/);
   assert.match(adapter, /const NETWORK_WRITE_TIMEOUT_MS = 60_000;/);

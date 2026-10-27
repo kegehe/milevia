@@ -8,6 +8,7 @@ import {
   type MobileOpenPayload,
 } from "./mobile-fs-request";
 import type { FileInfo } from "./file-model";
+import { MOBILE_FILE_UPLOAD_LIMIT, uploadFiles } from "./file-upload";
 
 // 一个记账用的桩：记录每次发出了什么 op / params，并按脚本回话。
 // 断言里既看"返回了什么"，也看"打了几枪" —— 缓存类的改动最容易只验证返回值，
@@ -51,6 +52,27 @@ function openPayload(overrides: Partial<MobileOpenPayload> = {}): MobileOpenPayl
 }
 
 const PROJECT = "/api/projects/p1";
+
+test("二进制上传通过手机适配器保留编码与同名保护，刷新目标目录且符合帧预算", async () => {
+  const { transport, calls } = makeTransport((op) => ok(op === "fs.tree" ? { entries: [] } : { status: "ok" }));
+  const adapter = createMobileFsRequest({ transport, prefetch: false });
+  await adapter.request(`${PROJECT}/fs/tree?path=assets`);
+  const result = await uploadFiles({
+    files: [new File([new Uint8Array(MOBILE_FILE_UPLOAD_LIMIT).fill(255)], "photo.png")],
+    dirPath: "assets", endpoint: `${PROJECT}/fs/write?conversationId=c1`, mobile: true,
+    request: adapter.request, signal: new AbortController().signal,
+  });
+  assert.deepEqual(result, { uploaded: ["assets/photo.png"], failures: [] });
+  const write = calls.find((call) => call.op === "fs.write");
+  const params = write?.params as Record<string, unknown>;
+  assert.equal(params.path, "assets/photo.png");
+  assert.equal(params.encoding, "base64");
+  assert.equal(params.createOnly, true);
+  assert.equal(Buffer.from(String(params.content), "base64").length, MOBILE_FILE_UPLOAD_LIMIT);
+  assert.ok(Buffer.byteLength(JSON.stringify({ op: "fs.write", projectId: "p1", conversationId: "c1", params })) < 384 * 1024);
+  await adapter.request(`${PROJECT}/fs/tree?path=assets`);
+  assert.deepEqual(calls.map((call) => call.op), ["fs.tree", "fs.write", "fs.tree"]);
+});
 
 // ─── 路径映射 ───────────────────────────────────────────────────────────────
 

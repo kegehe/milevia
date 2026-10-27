@@ -133,6 +133,9 @@ type AgentCatalogEntry struct {
 	// SupportsProjectInsights 表示平台已接通该工具的只读分析协议，可用于优化建议。
 	// 这比能否参与普通项目对话更严格：分析需要可靠的只读权限、结构化输出与复核流程。
 	SupportsProjectInsights bool `json:"supportsProjectInsights"`
+	// SupportsConflictSuggestions 表示已接通单文件冲突的只读合并建议协议。
+	// 不等同于优化建议扫描：会话工具也可以只运行一轮并返回合并结果。
+	SupportsConflictSuggestions bool `json:"supportsConflictSuggestions"`
 	// SupportsProfiles 表示档案/路由表能存这个工具。当前仍受 agent_profiles 表的
 	// CHECK(agent_id in ('claude-code','codex')) 约束；新增工具在迁移表之前必须为 false，
 	// 否则界面会提供一个保存时必然撞 SQLite 约束的选项。
@@ -165,9 +168,10 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		SlashCommands: true,
 		MCPInjection:  "config-file",
 		// Claude 长驻会话（StartSession）已实现并经活 harness 验证，可参与项目对话。
-		RunnableInProject:       true,
-		SupportsProjectInsights: true,
-		SupportsProfiles:        true,
+		RunnableInProject:           true,
+		SupportsProjectInsights:     true,
+		SupportsConflictSuggestions: true,
+		SupportsProfiles:            true,
 	},
 	{
 		ID:                "codex",
@@ -196,9 +200,10 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		SlashCommands: false,
 		MCPInjection:  "cli-args",
 		// Codex 走一次性回合（非流式 Run），已在项目对话中接通，可参与对话。
-		RunnableInProject:       true,
-		SupportsProjectInsights: true,
-		SupportsProfiles:        true,
+		RunnableInProject:           true,
+		SupportsProjectInsights:     true,
+		SupportsConflictSuggestions: true,
+		SupportsProfiles:            true,
 	},
 	{
 		ID:                "codebuddy",
@@ -228,7 +233,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// CodeBuddy 首次使用需登录：支持的登录流程（浏览器授权）在阶段 2 接通。
 		SupportsLogin: true,
 		// AgentRunner（StartSession 流式会话）已实现并经活 harness 验证，可参与项目对话。
-		RunnableInProject: true,
+		RunnableInProject:           true,
+		SupportsConflictSuggestions: true,
 	},
 	{
 		ID:          "qoder",
@@ -272,7 +278,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		SupportsLogin: true,
 		// 会话走 `-p --input-format stream-json --output-format stream-json`，
 		// 事件形状与 Claude Code 同构（init → assistant → result）。
-		RunnableInProject: true,
+		RunnableInProject:           true,
+		SupportsConflictSuggestions: true,
 	},
 	{
 		ID:          "opencode",
@@ -308,8 +315,9 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		AuthStatusArgs:         []string{"auth", "list"},
 		AuthStatusEmptyMarkers: []string{"0 credentials", "No credentials", "not logged in", "No providers"},
 		// 会话走一次性 `opencode run --format json`，由 opencode_runner.go 提供。
-		RunnableInProject:       true,
-		SupportsProjectInsights: true,
+		RunnableInProject:           true,
+		SupportsProjectInsights:     true,
+		SupportsConflictSuggestions: true,
 	},
 	{
 		ID:       "cursor",
@@ -356,8 +364,9 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// 一次性 print 回合：`cursor-agent -p --output-format stream-json`，
 		// 下一轮用 `--resume <chatId>` 续聊（见 cursor_runner.go）。
 		// 会话面只在本机（可执行文件由控制服务的 PATH 解析）。
-		RunnableInProject:       true,
-		SupportsProjectInsights: false,
+		RunnableInProject:           true,
+		SupportsProjectInsights:     false,
+		SupportsConflictSuggestions: true,
 		// agent_profiles 的 CHECK 约束仍只允许 claude-code / codex。
 		SupportsProfiles: false,
 	},

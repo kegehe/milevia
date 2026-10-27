@@ -9,10 +9,11 @@ function stubGlobal(key: "navigator" | "document", value: unknown) {
   Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
 }
 
-function stubDocument(options: { execResult?: boolean; execThrows?: boolean } = {}) {
+function stubDocument(options: { execResult?: boolean; execThrows?: boolean; focusThrows?: boolean } = {}) {
   const removed: unknown[] = [];
   const appended: unknown[] = [];
   const commands: string[] = [];
+  const focusOptions: unknown[] = [];
   const textarea = {
     value: "",
     style: {} as Record<string, string>,
@@ -22,6 +23,10 @@ function stubDocument(options: { execResult?: boolean; execThrows?: boolean } = 
     remove() { removed.push(textarea); },
   };
   stubGlobal("document", {
+    activeElement: { isConnected: true, focus: (value: unknown) => {
+      focusOptions.push(value);
+      if (options.focusThrows) throw new Error("focus refused");
+    } },
     createElement: () => textarea,
     body: { append: (node: unknown) => void appended.push(node) },
     execCommand: (command: string) => {
@@ -30,7 +35,7 @@ function stubDocument(options: { execResult?: boolean; execThrows?: boolean } = 
       return options.execResult ?? true;
     },
   });
-  return { textarea, appended, removed, commands };
+  return { textarea, appended, removed, commands, focusOptions };
 }
 
 test("uses the async clipboard API when it is available", async () => {
@@ -80,4 +85,20 @@ test("never throws when the DOM is unavailable", async () => {
   stubGlobal("navigator", {});
   stubGlobal("document", undefined);
   assert.equal(await copyToClipboard("ssr"), false);
+});
+
+test("legacy copy restores focus without scrolling, including when copying throws", async () => {
+  stubGlobal("navigator", {});
+  const success = stubDocument();
+  assert.equal(await copyToClipboard("copied"), true);
+  assert.deepEqual(success.focusOptions, [{ preventScroll: true }]);
+  const failure = stubDocument({ execThrows: true });
+  assert.equal(await copyToClipboard("failed"), false);
+  assert.deepEqual(failure.focusOptions, [{ preventScroll: true }]);
+});
+
+test("failure to restore focus does not turn a successful copy into failure", async () => {
+  stubGlobal("navigator", {});
+  stubDocument({ focusThrows: true });
+  assert.equal(await copyToClipboard("copied"), true);
 });

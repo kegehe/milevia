@@ -2,9 +2,60 @@ package app
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// 设 MILEVIA_TEST_WSL_DISTRO 后才连接本机发行版；普通单测不依赖已安装 WSL。
+func TestWSLGitRebaseStateIntegration(t *testing.T) {
+	distro := os.Getenv("MILEVIA_TEST_WSL_DISTRO")
+	if runtime.GOOS != "windows" || distro == "" {
+		t.Skip("requires Windows and MILEVIA_TEST_WSL_DISTRO")
+	}
+	repo := newTempGitRepository(t)
+	writeGitTestFile(t, repo, "initial.txt", "initial\n")
+	runGitForTest(t, repo, "add", ".")
+	runGitForTest(t, repo, "commit", "-m", "initial")
+	backend := newWSLGitBackend(distro)
+	ctx := context.Background()
+	uncRepo := wslToUncPath(windowsToWSLMntPath(repo), distro)
+	if state, err := backend.hasRebaseState(ctx, uncRepo); err != nil || state {
+		t.Fatalf("clean WSL repository: state=%v err=%v", state, err)
+	}
+	worktree := filepath.Join(t.TempDir(), "linked worktree")
+	linuxWorktree := windowsToWSLMntPath(worktree)
+	if _, err := backend.runGit(ctx, uncRepo, "worktree", "add", "--detach", linuxWorktree); err != nil {
+		t.Fatal(err)
+	}
+	uncWorktree := wslToUncPath(linuxWorktree, distro)
+	gitDir, err := backend.runGit(ctx, uncWorktree, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowsGitDir, ok := wslPathToWindowsPath(strings.TrimSpace(string(gitDir)))
+	if !ok {
+		t.Fatalf("Git directory is not on test temp drive: %s", gitDir)
+	}
+	marker := filepath.Join(windowsGitDir, "rebase-merge")
+	if err := os.Mkdir(marker, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := backend.hasRebaseState(ctx, uncWorktree); err != nil || !state {
+		t.Fatalf("linked WSL worktree without REBASE_HEAD: state=%v err=%v", state, err)
+	}
+	if state, err := backend.hasRebaseState(ctx, uncRepo); err != nil || state {
+		t.Fatalf("linked rebase leaked to main WSL worktree: state=%v err=%v", state, err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := backend.hasRebaseState(ctx, uncWorktree); err != nil || state {
+		t.Fatalf("finished WSL rebase: state=%v err=%v", state, err)
+	}
+}
 
 func TestWSLGitBackendConvertsOnlyMatchingDistroPaths(t *testing.T) {
 	backend := newWSLGitBackend("Ubuntu")

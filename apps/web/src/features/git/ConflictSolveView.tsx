@@ -8,13 +8,6 @@ import { useCodeFontSize } from "../files/useCodeFontSize";
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type ResolveAction = "ours" | "theirs" | "delete" | "working";
 type SuggestionStatus = "running" | "completed" | "failed" | "cancelled";
-// ⚠️ 已知例外（docs/42 §15）：本组件桌面端与手机端共用，而**手机端目前读不到
-// 工具目录**（手机走云端 /api/remote/*，控制服务的 GET /api/agents 不在那条通道上）。
-// 因此这里暂时保留按工具 ID 的清单；强行改成读目录会让手机端把工具显示成裸 id，
-// 那是比现在更差的退化。正确修法是把工具目录放进手机快照（或让云端转发该端点），
-// 那是一条 REMOTE-CONTRACT 变更，单独排期。
-/** AI 建议可选的模型。手机端渲染成胶囊（不用原生 `<select>`），桌面端仍是下拉。 */
-const AI_AGENT_OPTIONS = [{ value: "claude-code", label: "Claude" }, { value: "codex", label: "Codex" }] as const;
 type ConflictSuggestion = {
   id: string;
   projectId: string;
@@ -24,6 +17,8 @@ type ConflictSuggestion = {
   merged?: string;
   explanation?: string;
   error?: string;
+  /** 本地轮询错误不代表后台任务已经失败。 */
+  pollError?: string;
 };
 
 interface ConflictSolveViewProps {
@@ -40,8 +35,8 @@ interface ConflictSolveViewProps {
    * 手机端形态：AI 模型那一项用胶囊代替原生 `<select>`。
    *
    * 原生 `<select>` 的弹层由系统绘制、样式一行都管不到 —— 这条在本项目是手机端的硬规则
-   * （操作记录的筛选栏就是为此从 `<select>` 换成胶囊的）。这一处是漏网的：它只有两个选项
-   * （Claude / Codex），胶囊放得下，而且与旁边那排按钮同一种手感。
+   * （操作记录的筛选栏就是为此从 `<select>` 换成胶囊的）。这里的模型选项
+   * 用胶囊展示，与旁边那排按钮保持一致。
    */
   mobile?: boolean;
   onResolve: (path: string, action: ResolveAction, content?: string) => void;
@@ -103,20 +98,25 @@ export function ConflictSolveView({ projectID, conversationId, path, conflictPat
     return (rel: string) => `/api/projects/${projectID}/git/${rel}${suffix}`;
   }, [projectID, conversationId]);
   const [suggestion, setSuggestion] = useState<ConflictSuggestion | null>(null);
-  const [suggestAgent, setSuggestAgent] = useState<"claude-code" | "codex">("claude-code");
+  const [selectedSuggestAgent, setSuggestAgent] = useState("claude-code");
   const [suggestStarting, setSuggestStarting] = useState(false);
+  // 工具能力与名称随冲突内容下发，桌面和手机无需各自维护名单或读取全局目录。
+  const agentOptions = content?.suggestionAgents ?? [];
+  const suggestAgent = agentOptions.some((option) => option.id === selectedSuggestAgent)
+    ? selectedSuggestAgent : agentOptions[0]?.id ?? "";
 
   const refreshSuggestion = useCallback(async (id: string) => {
     try {
       const data = await request<ConflictSuggestion>(apiPath(`conflicts/suggestions/${id}`));
-      setSuggestion(data);
+      // 手机网络可能让多次轮询重叠；旧请求不能复活已拒绝的建议，或覆盖新的建议。
+      setSuggestion((previous) => previous?.id === id && previous.status === "running" ? data : previous);
     } catch (cause) {
-      setSuggestion((previous) => previous ? { ...previous, status: "failed", error: cause instanceof Error ? cause.message : "无法读取 AI 建议状态" } : previous);
+      setSuggestion((previous) => previous?.id === id && previous.status === "running" ? { ...previous, pollError: cause instanceof Error ? cause.message : "无法读取 AI 建议状态" } : previous);
     }
   }, [request, apiPath]);
 
   const startSuggestion = useCallback(async () => {
-    if (suggestStarting) return;
+    if (suggestStarting || !suggestAgent) return;
     setSuggestStarting(true);
     try {
       const data = await request<ConflictSuggestion>(apiPath("conflicts/suggest"), { method: "POST", body: JSON.stringify({ path, agent: suggestAgent }) });
@@ -196,20 +196,22 @@ export function ConflictSolveView({ projectID, conversationId, path, conflictPat
       {editable ? (mobile
         ? <div className="git-conflict-ai-launch" role="group" aria-label="AI 模型">
           <div className="git-conflict-ai-agents">
-            {AI_AGENT_OPTIONS.map((option) => <button type="button" key={option.value} className="secondary" aria-pressed={suggestAgent === option.value} disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => setSuggestAgent(option.value)}>{option.label}</button>)}
+            {agentOptions.map((option) => <button type="button" key={option.id} className="secondary" aria-pressed={suggestAgent === option.id} disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => setSuggestAgent(option.id)}>{option.name}</button>)}
+            {agentOptions.length === 0 ? <span>暂无可用工具</span> : null}
           </div>
-          <button type="button" className="secondary" disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => void startSuggestion()}>{suggestStarting ? "启动中…" : suggestion?.status === "running" ? "AI 生成中…" : "AI 生成建议"}</button>
+          <button type="button" className="secondary" disabled={busy || !suggestAgent || suggestStarting || suggestion?.status === "running"} onClick={() => void startSuggestion()}>{suggestStarting ? "启动中…" : suggestion?.status === "running" ? "AI 生成中…" : "AI 生成建议"}</button>
         </div>
-        : <label className="git-conflict-ai-launch"><select value={suggestAgent} disabled={busy || suggestStarting || suggestion?.status === "running"} onChange={(event) => setSuggestAgent(event.target.value as "claude-code" | "codex")} aria-label="AI 模型"><option value="claude-code">Claude</option><option value="codex">Codex</option></select><button type="button" className="secondary" disabled={busy || suggestStarting || suggestion?.status === "running"} onClick={() => void startSuggestion()}>{suggestStarting ? "启动中…" : suggestion?.status === "running" ? "AI 生成中…" : "AI 生成建议"}</button></label>) : null}
+        : <label className="git-conflict-ai-launch"><select value={suggestAgent} disabled={busy || !suggestAgent || suggestStarting || suggestion?.status === "running"} onChange={(event) => setSuggestAgent(event.target.value)} aria-label="AI 模型">{agentOptions.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}{agentOptions.length === 0 ? <option value="">暂无可用工具</option> : null}</select><button type="button" className="secondary" disabled={busy || !suggestAgent || suggestStarting || suggestion?.status === "running"} onClick={() => void startSuggestion()}>{suggestStarting ? "启动中…" : suggestion?.status === "running" ? "AI 生成中…" : "AI 生成建议"}</button></label>) : null}
       {canMarkResolved ? <button type="button" className="primary" onClick={() => workingText !== null && onResolve(path, "working", workingText)}>标记为已解决</button> : null}
     </div>
 
     {!editable ? <NonTextConflict content={content} oursLabel={oursLabel} theirsLabel={theirsLabel} busy={busy} onResolve={onResolve} path={path} />
       : <>
         {suggestion ? <div className="git-conflict-ai" role="region" aria-label="AI 建议">
-          <header><span>AI 建议{suggestion.agent === "codex" ? "（Codex）" : "（Claude）"}</span>{suggestion.status === "running" ? <span className="git-conflict-ai-status running">生成中…</span> : suggestion.status === "completed" ? <span className="git-conflict-ai-status ok">完成</span> : <span className="git-conflict-ai-status error">{suggestion.status === "cancelled" ? "已取消" : "失败"}</span>}</header>
+          <header><span>AI 建议（{agentOptions.find((option) => option.id === suggestion.agent)?.name ?? suggestion.agent}）</span>{suggestion.status === "running" ? <span className="git-conflict-ai-status running">生成中…</span> : suggestion.status === "completed" ? <span className="git-conflict-ai-status ok">完成</span> : <span className="git-conflict-ai-status error">{suggestion.status === "cancelled" ? "已取消" : "失败"}</span>}</header>
           {suggestion.status === "running" ? <>
             <p className="git-conflict-ai-hint">AI 正在阅读三方内容并生成合并建议，通常需要十几秒到一分钟；可先处理其它冲突文件。</p>
+            {suggestion.pollError ? <p className="git-conflict-ai-hint error">读取 AI 建议状态失败：{suggestion.pollError}；正在自动重试。</p> : null}
             <footer><button type="button" className="secondary" disabled={busy} onClick={() => void cancelSuggestion()}>取消生成</button></footer>
           </>
             : suggestion.status === "completed" ? <>

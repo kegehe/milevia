@@ -64,6 +64,8 @@ type GitConflictContent struct {
 	Ours          string `json:"ours,omitempty"`
 	Theirs        string `json:"theirs,omitempty"`
 	Working       string `json:"working,omitempty"`
+	// HTTP 层按项目执行环境补充；手机端复用同一响应，不另维护工具名单。
+	SuggestionAgents []gitConflictSuggestAgent `json:"suggestionAgents,omitempty"`
 }
 
 // ConflictOverview 返回冲突操作上下文与冲突文件清单。
@@ -277,10 +279,14 @@ func (runner *gitCLIRunner) buildConflictContext(ctx context.Context, repo strin
 	return contextInfo, nil
 }
 
-// detectConflictOperation 通过伪引用判断当前进行中的操作。注意判定顺序：
-// rebase 自身不会留下 MERGE_HEAD，但可能残留 CHERRY_PICK_HEAD 之类，故先查 REBASE_HEAD。
+// detectConflictOperation 通过管理目录和伪引用判断当前进行中的操作。
+// interactive rebase 的 break 尚未重放提交时没有 REBASE_HEAD，必须检查工作区对应的管理目录。
 func (runner *gitCLIRunner) detectConflictOperation(ctx context.Context, repo string) (GitConflictOperationType, error) {
-	if runner.revParseVerify(ctx, repo, "REBASE_HEAD") {
+	rebasing, err := runner.backend.hasRebaseState(ctx, repo)
+	if err != nil {
+		return GitConflictOperationNone, err
+	}
+	if rebasing || runner.revParseVerify(ctx, repo, "REBASE_HEAD") {
 		return GitConflictOperationRebase, nil
 	}
 	if runner.revParseVerify(ctx, repo, "MERGE_HEAD") {

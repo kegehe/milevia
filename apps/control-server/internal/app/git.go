@@ -84,6 +84,9 @@ type GitChange struct {
 	Deleted      bool   `json:"deleted"`
 	Renamed      bool   `json:"renamed"`
 	Conflicted   bool   `json:"conflicted"`
+	// 保留 porcelain v2 中的模式与对象 ID，供令牌和后台摘要比较。
+	// 只比较路径、MM 等标记和工作区文件指纹会漏掉仅暂存区内容发生变化的情况。
+	porcelainState string
 }
 
 type GitCommit struct {
@@ -127,6 +130,8 @@ type GitBranch struct {
 // gitBackend 抽象 Git 命令执行与仓库文件系统操作，使本地 runner 与 SSH runner 共用同一套解析逻辑。
 // 本地实现用 exec.Command + os 文件 API；SSH 实现用 sshClient.execCommand + SFTP。
 type gitBackend interface {
+	// hasRebaseState 检查 Git 管理目录，覆盖尚未产生 REBASE_HEAD 的暂停状态。
+	hasRebaseState(context.Context, string) (bool, error)
 	// runGit 在 repo 目录执行 git args，返回 stdout。失败时返回 *gitCommandError 以便上层分类。
 	runGit(ctx context.Context, repo string, args ...string) ([]byte, error)
 	// runGitPaths 与 runGit 相同，但当路径过多时通过临时文件传递 pathspec。
@@ -411,7 +416,7 @@ func (runner *gitCLIRunner) CheckoutRemoteBranch(ctx context.Context, repo, loca
 }
 
 func (runner *gitCLIRunner) Snapshot(ctx context.Context, repo string) (GitSnapshot, error) {
-	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
+	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignore-submodules=none", "-z")
 	if err != nil {
 		return GitSnapshot{}, err
 	}
@@ -423,7 +428,10 @@ func (runner *gitCLIRunner) Snapshot(ctx context.Context, repo string) (GitSnaps
 // repositories are especially sensitive to duplicate status scans because
 // each filesystem lookup otherwise crosses the Windows/WSL boundary.
 func (runner *gitCLIRunner) SnapshotAndChanges(ctx context.Context, repo string) (GitSnapshot, []GitChange, error) {
-	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
+	// Stash 包含全部未跟踪文件；不能受 status.showUntrackedFiles 配置影响，
+	// 也不能折叠目录，否则目录内部内容变化不会进入逐文件指纹校验。
+	// 子模块内部改动虽然不能收起，也必须显式呈现，防止误报工作区已干净。
+	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignore-submodules=none", "-z")
 	if err != nil {
 		return GitSnapshot{}, nil, err
 	}
@@ -432,7 +440,7 @@ func (runner *gitCLIRunner) SnapshotAndChanges(ctx context.Context, repo string)
 }
 
 func (runner *gitCLIRunner) Changes(ctx context.Context, repo string) ([]GitChange, error) {
-	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "-z")
+	raw, err := runner.backend.runGit(ctx, repo, "status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignore-submodules=none", "-z")
 	if err != nil {
 		return nil, err
 	}
@@ -1141,7 +1149,9 @@ func parsePorcelainV2(raw []byte) (GitSnapshot, []GitChange, error) {
 			if len(fields) != 9 || len(fields[1]) != 2 {
 				return GitSnapshot{}, nil, errors.New("invalid Git porcelain change record")
 			}
-			changes = append(changes, changeFromXY(fields[8], fields[1]))
+			change := changeFromXY(fields[8], fields[1])
+			change.porcelainState = record
+			changes = append(changes, change)
 		case strings.HasPrefix(record, "2 "):
 			fields := strings.SplitN(record, " ", 10)
 			if len(fields) != 10 || len(fields[1]) != 2 {
@@ -1154,13 +1164,14 @@ func parsePorcelainV2(raw []byte) (GitSnapshot, []GitChange, error) {
 			change := changeFromXY(fields[9], fields[1])
 			change.OriginalPath = string(records[index])
 			change.Renamed = true
+			change.porcelainState = record
 			changes = append(changes, change)
 		case strings.HasPrefix(record, "u "):
 			fields := strings.SplitN(record, " ", 11)
 			if len(fields) != 11 {
 				return GitSnapshot{}, nil, errors.New("invalid Git porcelain conflict record")
 			}
-			changes = append(changes, GitChange{Path: fields[10], Conflicted: true})
+			changes = append(changes, GitChange{Path: fields[10], Conflicted: true, porcelainState: record})
 		case strings.HasPrefix(record, "? "):
 			changes = append(changes, GitChange{Path: strings.TrimPrefix(record, "? "), Untracked: true})
 		}

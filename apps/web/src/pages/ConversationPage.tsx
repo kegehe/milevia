@@ -58,6 +58,8 @@ import { readConversationPanels, writeConversationPanels, type ConversationPanel
 import { modelList } from "../lib/model-options";
 import { dialogParamURL } from "../lib/dialog-params";
 import { copyToClipboard } from "../lib/clipboard";
+import { isDesktop } from "../lib/runtime";
+import { selectedTextWithin, useContextMenu } from "../components/ContextMenu";
 import { checkpointHasCode, rewindConfirmAction, rewindConfirmBody, rewindConfirmTitle, rewindHint, rewindPrimaryMode } from "../lib/conversation-rewind";
 import { dropAfterCutoff } from "../lib/conversation-cutoff";
 import { useDocumentVisible } from "../lib/useDocumentVisible";
@@ -1512,13 +1514,17 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail, checkpoi
   const agentName = agentDisplayName(agentID);
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<number | null>(null);
+  const contentRef = useRef(message.content);
+  contentRef.current = message.content;
+  const { openMenu, menu } = useContextMenu();
 
   useEffect(() => () => {
     if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
   }, []);
 
-  const copy = async () => {
-    if (!(await copyToClipboard(message.content))) {
+  // 选区由菜单保存快照，完整消息则读取点击时的最新内容。
+  const copy = async (content = contentRef.current) => {
+    if (!(await copyToClipboard(content))) {
       fail("无法复制消息，请检查浏览器剪贴板权限。");
       return;
     }
@@ -1532,7 +1538,14 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail, checkpoi
   const notes = checkpoint ? rewindHint(checkpoint, discarded ?? 0) : "";
   const rewindTitle = checkpoint ? `回退到本轮结束时：${checkpointHasCode(checkpoint) ? "代码与对话都回到这一刻" : "只回退对话（该节点没有代码快照）"}${(discarded ?? 0) > 0 ? `，之后 ${discarded} 轮不再显示` : ""}` : "";
 
-  return <article className={`message ${message.role}`}><header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div><div className="message-actions" data-keep={persistent ? "" : undefined}><button type="button" className={`message-copy reveal${copied ? " copied" : ""}`} title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()}>{copied ? <CopyDoneIcon /> : <CopyIcon />}</button>{copied && <span className="copy-feedback" role="status">已复制</span>}{checkpoint && rewind && <button type="button" className="message-rewind reveal" disabled={rewindDisabled || checkpointBusy} title={rewindTitle} aria-label="回退到此处" onClick={() => rewind(checkpoint)}><RewindInlineIcon /></button>}{checkpoint && notes && <small className="reveal">{notes}</small>}{!checkpoint && checkpointRunning && <span className="checkpoint-pending">本轮结束后可回退到此处</span>}</div></article>;
+  return <article className={`message ${message.role}`} onContextMenu={(event) => {
+    if (!isDesktop()) return;
+    const selection = selectedTextWithin(event.currentTarget);
+    openMenu(event, "消息操作", [
+      { label: "复制选中内容", disabled: !selection, action: () => void copy(selection) },
+      { label: "复制消息", action: () => void copy() },
+    ]);
+  }}>{menu}<header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div><div className="message-actions" data-keep={persistent ? "" : undefined}><button type="button" className={`message-copy reveal${copied ? " copied" : ""}`} title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()}>{copied ? <CopyDoneIcon /> : <CopyIcon />}</button>{copied && <span className="copy-feedback" role="status">已复制</span>}{checkpoint && rewind && <button type="button" className="message-rewind reveal" disabled={rewindDisabled || checkpointBusy} title={rewindTitle} aria-label="回退到此处" onClick={() => rewind(checkpoint)}><RewindInlineIcon /></button>}{checkpoint && notes && <small className="reveal">{notes}</small>}{!checkpoint && checkpointRunning && <span className="checkpoint-pending">本轮结束后可回退到此处</span>}</div></article>;
 });
 
 const SystemCard = memo(function SystemCard({ system }: { system: SystemItem }) {

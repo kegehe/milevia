@@ -42,6 +42,8 @@ export type AgentCatalogEntry = {
   runnableInProject?: boolean;
   /** 平台是否已接通该工具的只读分析协议，可用于项目优化建议。 */
   supportsProjectInsights?: boolean;
+  /** 平台是否已接通单文件冲突的只读合并建议。 */
+  supportsConflictSuggestions?: boolean;
   /** 档案/路由表能否存这个工具（当前仅 Claude/Codex）。 */
   supportsProfiles?: boolean;
 };

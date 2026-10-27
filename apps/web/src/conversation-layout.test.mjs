@@ -34,10 +34,12 @@ test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
   assert.match(clipboard, /navigator\.clipboard\?\.writeText/);
   assert.match(clipboard, /await navigator\.clipboard\.writeText\(content\);\s*return true;\s*} catch \{/s);
   assert.match(clipboard, /document\.execCommand\("copy"\)/);
-  assert.match(clipboard, /try \{\s*textarea\.select\(\);[\s\S]*?\} finally \{\s*textarea\.remove\(\);\s*\}/);
+  assert.match(clipboard, /try \{\s*textarea\.select\(\);[\s\S]*?\} finally \{\s*textarea\.remove\(\);/);
   // 消息按钮在写入失败时给出提示，而不是静默失败。
   assert.match(conversationPage, /import \{ copyToClipboard \} from "\.\.\/lib\/clipboard";/);
-  assert.match(conversationPage, /if \(!\(await copyToClipboard\(message\.content\)\)\) \{/);
+  assert.match(conversationPage, /contentRef\.current = message\.content;/);
+  assert.match(conversationPage, /const copy = async \(content = contentRef\.current\) => \{/);
+  assert.match(conversationPage, /if \(!\(await copyToClipboard\(content\)\)\) \{/);
   // 复制按钮不区分角色：用户消息与 AI 回复都带一个（AI 回复此前只能靠框选整段复制）。
   // 2026-10-23 改版：按钮从伪元素画法换成与回退箭头同一支 SVG 描边图标，
   // 并住进气泡下方的 .message-actions 动作行（显形策略在 css 的 hover 媒体查询里）。

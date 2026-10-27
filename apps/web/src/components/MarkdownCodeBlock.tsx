@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Components } from "react-markdown";
 import { copyToClipboard } from "../lib/clipboard";
+import { isDesktop } from "../lib/runtime";
+import { selectedTextWithin, useContextMenu } from "./ContextMenu";
 
 // 代码块右上角的复制按钮。
 //
@@ -26,9 +28,12 @@ function textContent(node: ReactNode): string {
 
 export function MarkdownCodeBlock({ children }: { children?: ReactNode }) {
   const code = textContent(children);
+  const codeRef = useRef(code);
+  codeRef.current = code;
   const [state, setState] = useState<CopyState>("idle");
   const timer = useRef<number | null>(null);
   const mounted = useRef(true);
+  const { openMenu, menu } = useContextMenu();
 
   useEffect(() => {
     // StrictMode 下 effect 会「挂载 → 清理 → 再挂载」跑两次，标记必须在这里设回 true，
@@ -40,8 +45,9 @@ export function MarkdownCodeBlock({ children }: { children?: ReactNode }) {
     };
   }, []);
 
-  const copy = async () => {
-    const copied = await copyToClipboard(code);
+  // 菜单打开期间代码仍可能流式更新，完整复制读取点击时的内容。
+  const copy = async (content = codeRef.current) => {
+    const copied = await copyToClipboard(content);
     // 写入期间组件可能已经卸载（流式消息重排），此时不要再排一个没人清理的计时器。
     if (!mounted.current) return;
     setState(copied ? "copied" : "failed");
@@ -53,12 +59,20 @@ export function MarkdownCodeBlock({ children }: { children?: ReactNode }) {
   const hint = state === "copied" ? "已复制到剪贴板" : state === "failed" ? "复制失败，请检查剪贴板权限" : "复制代码";
 
   return (
-    <div className="markdown-code-block">
+    <div className="markdown-code-block" onContextMenu={(event) => {
+      if (!isDesktop()) return;
+      const selection = selectedTextWithin(event.currentTarget);
+      openMenu(event, "代码块操作", [
+        { label: "复制选中内容", disabled: !selection, action: () => void copy(selection) },
+        { label: "复制代码", action: () => void copy() },
+      ]);
+    }}>
       <pre>{children}</pre>
       <button type="button" className={`markdown-code-copy${state === "idle" ? "" : ` ${state}`}`} title={hint} aria-label={hint} onClick={() => void copy()}>
         <MarkdownCopyIcon copied={state === "copied"} />
         <span className="markdown-code-copy-label">{label}</span>
       </button>
+      {menu}
     </div>
   );
 }

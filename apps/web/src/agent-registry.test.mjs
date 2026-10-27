@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-// 「支持哪些工具」在前端只有一份来源：服务端 GET /api/agents，落在 lib/agent-registry.ts。
+// 「支持哪些工具」由服务端目录决定；冲突分析随内容响应下发，兼容手机中继。
 //
 // 这个文件守的是本次整理要消灭的那一类写法：
 //
@@ -21,6 +21,7 @@ const SOURCES = {
   "pages/OrchestrationPage.tsx": await readFile(new URL("./pages/OrchestrationPage.tsx", import.meta.url), "utf8"),
   "features/run/ProjectAiConfigDialog.tsx": await readFile(new URL("./features/run/ProjectAiConfigDialog.tsx", import.meta.url), "utf8"),
   "features/insights/InsightsPanel.tsx": await readFile(new URL("./features/insights/InsightsPanel.tsx", import.meta.url), "utf8"),
+  "features/git/ConflictSolveView.tsx": await readFile(new URL("./features/git/ConflictSolveView.tsx", import.meta.url), "utf8"),
 };
 
 // 危险形状 = 三元式的**兜底分支**落在另一个工具的文案/类名上，或者前端自己维护
@@ -107,12 +108,9 @@ test("目录 id 到 AgentID 的收窄只有一个转换点", () => {
   }
 });
 
-test("已知例外有据可依且只有这两处桌面/手机共用文件", async () => {
+test("剩余的手机工具目录例外有据可依", async () => {
   // 手机端目前读不到控制服务的 GET /api/agents（它走云端 /api/remote/*），
-  // 所以这两个桌面与手机共用的文件暂时保留按工具 ID 的清单 —— 强行改成读目录会让
-  // 手机端把工具显示成裸 id，那比现在更差。修法是把目录放进手机快照（REMOTE-CONTRACT 变更）。
-  for (const path of ["./features/git/ConflictSolveView.tsx", "./pages/MobileRemotePage.tsx"]) {
-    const source = await readFile(new URL(path, import.meta.url), "utf8");
-    assert.match(source, /已知例外（docs\/42 §15）/, `${path} 缺少例外说明`);
-  }
+  // MobileRemotePage 暂时保留本地清单；ConflictSolveView 已由冲突内容接口下发名单。
+  const source = await readFile(new URL("./pages/MobileRemotePage.tsx", import.meta.url), "utf8");
+  assert.match(source, /已知例外（docs\/42 §15）/);
 });

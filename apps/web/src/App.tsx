@@ -1,12 +1,13 @@
 // 路由入口 — 从 2003 行精简为 ~50 行
 
-import { useCallback, useEffect } from "react";
+import { useEffect } from "react";
 import { BrowserRouter, Routes, Route, Navigate, useNavigate, useParams } from "react-router-dom";
 import { ProjectProvider } from "./stores/useProjectStore";
 import { UIPreferencesProvider } from "./stores/useUIPreferences";
-import { NotificationProvider, useNotificationRefresh } from "./components/NotificationProvider";
+import { NotificationProvider } from "./components/NotificationProvider";
+import { NotificationInvalidationBridge } from "./components/NotificationInvalidationBridge";
 import { ProcessStatusProvider } from "./components/ProcessStatusProvider";
-import { LiveEventsProvider, useLiveStateEvents } from "./components/LiveEventsProvider";
+import { LiveEventsProvider } from "./components/LiveEventsProvider";
 import { TooltipProvider } from "./components/TooltipProvider";
 import DashboardPage from "./pages/DashboardPage";
 import ImportProjectPage from "./pages/ImportProjectPage";
@@ -56,16 +57,6 @@ function NavigationBridge() {
 function RedirectToTaskBoard() {
   const { projectId } = useParams<{ projectId: string }>();
   return <Navigate to={`/projects/${projectId}/tasks/board`} replace />;
-}
-
-/** 服务端删通知后通过 /ws/events 发失效信号：重拉未读列表，修正铃铛角标。
- *  必须放在 LiveEventsProvider 内部（订阅上下文）且在 NotificationProvider 内部（刷新上下文）。 */
-function NotificationInvalidationBridge() {
-  const refreshUnread = useNotificationRefresh();
-  useLiveStateEvents(useCallback((event) => {
-    if (event.type === "notifications") refreshUnread();
-  }, [refreshUnread]));
-  return null;
 }
 
 export function App() {

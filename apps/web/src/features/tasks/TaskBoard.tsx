@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import { anchorForSlot, compareTaskOrder, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Request, Task, TaskDetail, TaskStatus, Priority, VerificationRun, taskDisplayStatus, taskDisplayStatusClass, taskDisplayTitle } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { useDocumentVisible } from "../../lib/useDocumentVisible";
 type EditorState = { task?: Task } | null;
 type ReviewAction = "accept" | "request_changes";
 
@@ -68,6 +69,9 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   const tasksRequestVersion = useRef(0);
   const detailRequestVersion = useRef(0);
   const orchestrationRequestVersion = useRef(0);
+  const documentVisible = useDocumentVisible();
+  const prevTasksVisibleRef = useRef(documentVisible);
+  const prevDetailVisibleRef = useRef(documentVisible);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -92,19 +96,32 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     if (mountedRef.current && requestVersion === detailRequestVersion.current) setDetail(next);
     return next;
   }, [request]);
+  const closeDetail = () => {
+    // 作废尚未返回的详情刷新，避免关闭后被晚到响应重新打开。
+    detailRequestVersion.current++;
+    setDetail(null);
+  };
 
   useEffect(() => { void loadTasks().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务"); }); }, [fail, loadTasks]);
   useEffect(() => { void loadOrchestration().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载自动编排配置"); }); }, [fail, loadOrchestration]);
+  // 后台暂停列表与详情轮询；回到前台时补拉一次，首次加载仍由各自的加载入口负责。
   useEffect(() => {
+    const becameVisible = documentVisible && !prevTasksVisibleRef.current;
+    prevTasksVisibleRef.current = documentVisible;
+    if (!documentVisible) return;
+    if (becameVisible) void loadTasks().catch(() => undefined);
     const interval = window.setInterval(() => { void loadTasks().catch(() => undefined); }, 10_000);
     return () => window.clearInterval(interval);
-  }, [loadTasks]);
+  }, [documentVisible, loadTasks]);
   useEffect(() => {
-    if (!detail) return;
+    const becameVisible = documentVisible && !prevDetailVisibleRef.current;
+    prevDetailVisibleRef.current = documentVisible;
+    if (!documentVisible || !detail) return;
     const taskID = detail.id;
+    if (becameVisible) void loadDetail(taskID).catch(() => undefined);
     const interval = window.setInterval(() => { void loadDetail(taskID).catch(() => undefined); }, 10_000);
     return () => window.clearInterval(interval);
-  }, [detail?.id, loadDetail]);
+  }, [detail?.id, documentVisible, loadDetail]);
   useEffect(() => {
     if (!initialTaskID) return;
     void loadDetail(initialTaskID).catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载任务详情"); });
@@ -275,7 +292,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
         if (!mountedRef.current) return;
         setPendingConfirm(null);
         setBusy("delete");
-        try { await request(`/api/tasks/${detail.id}`, { method: "DELETE" }); if (mountedRef.current) { setDetail(null); await loadTasks(); } }
+        try { await request(`/api/tasks/${detail.id}`, { method: "DELETE" }); if (mountedRef.current) { closeDetail(); await loadTasks(); } }
         catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法删除任务"); }
         finally { if (mountedRef.current) setBusy(""); }
       })(),
@@ -469,7 +486,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     </header>
     {visibleTasks.length === 0 ? <div className="task-empty" data-state={emptyState?.state ?? "empty"} role="status"><h3>{emptyState?.title ?? "还没有任务"}</h3><p>{emptyState?.description}</p>{emptyState?.state === "filtered" ? <button className="primary" onClick={() => setQuery("")}>清除搜索</button> : emptyState?.state === "hidden" ? <button className="primary" onClick={() => setShowHistoricalCancelled(true)}>显示历史已取消</button> : <button className="primary" onClick={() => setEditor({})}>新建任务</button>}</div> : view === "board" ? <>{uncoveredStatusCount > 0 && <p className="task-board-note" role="status">有 <b>{uncoveredStatusCount}</b> 条任务的状态不在看板列里，切到「列表」可查看与清理。</p>}<TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} /></> : <TaskList tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
-    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={() => setDetail(null)} refresh={() => refresh(detail.id)} beginDispatch={beginDispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { setDetail(null); setEditor({ task }); } }} move={moveTask} canMoveUp={moveIndex > 0} canMoveDown={moveIndex >= 0 && moveIndex < moveOrder.length - 1} request={request} fail={fail} />}
+    {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={closeDetail} refresh={() => refresh(detail.id)} beginDispatch={beginDispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { closeDetail(); setEditor({ task }); } }} move={moveTask} canMoveUp={moveIndex > 0} canMoveDown={moveIndex >= 0 && moveIndex < moveOrder.length - 1} request={request} fail={fail} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} confirmLabel={pendingConfirm.confirmLabel} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </section>;
 }

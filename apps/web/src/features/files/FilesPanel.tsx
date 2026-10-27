@@ -9,6 +9,7 @@ import { getPreviewKind, isTextPreview } from "./source-language";
 import { contentOmittedFrom } from "./mobile-fs-request";
 import { FileIcon } from "./FileIcon";
 import { useCodeFontSize } from "./useCodeFontSize";
+import { droppedFiles, uploadFiles, type UploadResult } from "./file-upload";
 import type { NavigationGuard } from "../../components/ProjectLayout";
 
 interface FilesPanelProps {
@@ -63,6 +64,14 @@ function baseName(path: string): string {
   return slash >= 0 ? path.slice(slash + 1) : path;
 }
 
+function uploadDirectoryAtTarget(target: EventTarget | null): string {
+  if (!(target instanceof Element)) return "";
+  // 箭头、缩进与行内留白都属于该条目，但在 react-complex-tree 中不在标题节点里。
+  const row = target.closest<HTMLElement>("[data-file-upload-directory]") ??
+    target.closest("[data-rct-item-container]")?.querySelector<HTMLElement>("[data-file-upload-directory]");
+  return row?.dataset.fileUploadDirectory ?? "";
+}
+
 export function FilesPanel({
   projectId,
   conversationId,
@@ -106,6 +115,19 @@ export function FilesPanel({
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [uploadResult, setUploadResult] = useState<UploadResult | null>(null);
+  const [dropDirectory, setDropDirectory] = useState<string | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadSelectionRef = useRef<{
+    dirPath: string;
+    projectId: string;
+    conversationId?: string;
+    request: FilesPanelProps["request"];
+  } | null>(null);
+  const uploadControllerRef = useRef<AbortController | null>(null);
+  const occupiedRef = useRef(isWorkspaceOccupied);
+  occupiedRef.current = isWorkspaceOccupied;
   const [pendingDiscard, setPendingDiscard] = useState<{ files: OpenFile[]; proceed: () => void } | null>(null);
   const [mobileView, setMobileView] = useState<"tree" | "editor">("tree");
   const [openingFile, setOpeningFile] = useState<{ path: string; name: string } | null>(null);
@@ -143,6 +165,60 @@ export function FilesPanel({
   const readOnly = isWorkspaceOccupied;
   const activeFile = openFiles.find((f) => f.path === activeFilePath) || null;
   const activeDialog = showNewFileDialog ? "create" : showRenameDialog ? "rename" : showDeleteConfirm ? "delete" : pendingDiscard ? "discard" : null;
+
+  // 切换项目、会话或传输通道时停止旧批次，旧结果不进入新工作区。
+  useEffect(() => {
+    setUploadProgress(null);
+    setUploadResult(null);
+    setDropDirectory(null);
+    return () => {
+      uploadSelectionRef.current = null;
+      uploadControllerRef.current?.abort();
+      uploadControllerRef.current = null;
+    };
+  }, [projectId, conversationId, request]);
+
+  const startUpload = useCallback(async (files: File[], dirPath: string) => {
+    if (files.length === 0) return;
+    if (occupiedRef.current || uploadControllerRef.current) {
+      setError(occupiedRef.current ? "工作区正被占用，暂时无法上传文件" : "请等待当前上传完成");
+      return;
+    }
+    const controller = new AbortController();
+    uploadControllerRef.current = controller;
+    setUploadResult(null);
+    setUploadProgress({ completed: 0, total: files.length });
+    try {
+      const result = await uploadFiles({
+        files, dirPath, mobile, signal: controller.signal,
+        endpoint: withWorkspace(`/api/projects/${projectId}/fs/write`),
+        request: (path, init) => {
+          if (occupiedRef.current) throw new Error("工作区正被占用，暂时无法上传文件");
+          return request(path, init);
+        },
+        onProgress: (completed) => {
+          if (!controller.signal.aborted) setUploadProgress({ completed, total: files.length });
+        },
+      });
+      if (!controller.signal.aborted) {
+        setUploadResult(result);
+        if (result.uploaded.length > 0) treeRefreshRef.current?.(dirPath);
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) setError(err instanceof Error ? err.message : "上传失败");
+    } finally {
+      if (uploadControllerRef.current === controller) {
+        uploadControllerRef.current = null;
+        setUploadProgress(null);
+      }
+    }
+  }, [mobile, projectId, request, withWorkspace]);
+
+  const chooseUpload = useCallback((dirPath: string) => {
+    if (occupiedRef.current || uploadControllerRef.current) return;
+    uploadSelectionRef.current = { dirPath, projectId, conversationId, request };
+    uploadInputRef.current?.click();
+  }, [projectId, conversationId, request]);
 
   const requestDiscard = useCallback((files: OpenFile[], proceed: () => void) => {
     const dirtyFiles = files.filter((file) => file.isDirty);
@@ -648,7 +724,47 @@ export function FilesPanel({
   const isRemote = runner.startsWith("ssh-");
 
   return (
-    <div className="files-panel">
+    <div className="files-panel"
+      onDragOverCapture={(event) => {
+        if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = readOnly || uploadProgress ? "none" : "copy";
+        setDropDirectory(uploadDirectoryAtTarget(event.target));
+      }}
+      onDragLeave={(event) => {
+        if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropDirectory(null);
+      }}
+      onDropCapture={(event) => {
+        if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setDropDirectory(null);
+        const dirPath = uploadDirectoryAtTarget(event.target);
+        const { files, hasDirectories } = droppedFiles(event.dataTransfer);
+        if (hasDirectories) setError("暂不支持上传文件夹，请选择其中的文件");
+        void startUpload(files, dirPath);
+      }}
+    >
+      <input ref={uploadInputRef} type="file" multiple hidden aria-label="选择要上传的文件" onChange={(event) => {
+        const files = Array.from(event.currentTarget.files ?? []);
+        event.currentTarget.value = "";
+        const selection = uploadSelectionRef.current;
+        uploadSelectionRef.current = null;
+        // 原生选择器可能跨越工作区/通道切换；只接收打开时仍有效的那次选择。
+        if (!selection || selection.projectId !== projectId || selection.conversationId !== conversationId || selection.request !== request) return;
+        void startUpload(files, selection.dirPath);
+      }} />
+      {dropDirectory !== null && <div className="files-drop-hint" role="status">
+        {readOnly ? "工作区正被占用，暂时无法上传文件" : uploadProgress ? "请等待当前上传完成" : `松开以上传到 ${dropDirectory || "项目根目录"}`}
+      </div>}
+      {uploadProgress && <div className="files-upload-status" role="status" aria-live="polite">
+        正在上传文件（{uploadProgress.completed}/{uploadProgress.total}）…
+      </div>}
+      {uploadResult && <div className="files-upload-status" role="status" aria-live="polite">
+        <div className="files-upload-summary"><span>已上传 {uploadResult.uploaded.length} 个文件{uploadResult.failures.length > 0 ? `，${uploadResult.failures.length} 个失败` : ""}</span><button type="button" aria-label="关闭上传结果" onClick={() => setUploadResult(null)}>×</button></div>
+        {uploadResult.failures.length > 0 && <ul>{uploadResult.failures.map((failure, index) => <li key={index}>{failure.name}：{failure.message}</li>)}</ul>}
+      </div>}
       {/* 错误提示 */}
       {error && (
         <div className="files-error">
@@ -681,6 +797,8 @@ export function FilesPanel({
             onFileSelect={openFile}
             onCreateFile={handleCreateFile}
             onCreateDir={handleCreateDir}
+            onUpload={chooseUpload}
+            uploading={uploadProgress !== null}
             onRename={handleRename}
             onDelete={handleDelete}
             onAddToChat={onAddToChat}

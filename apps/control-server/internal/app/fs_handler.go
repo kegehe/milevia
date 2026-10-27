@@ -418,6 +418,7 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path            string `json:"path"`
 		Content         string `json:"content"`
+		Encoding        string `json:"encoding"`
 		ExpectedVersion string `json:"expectedVersion"`
 		CreateOnly      bool   `json:"createOnly"`
 	}
@@ -428,11 +429,28 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("path 必填"))
 		return
 	}
-	if len(req.Content) > maxFileSize {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("内容过大（%d 字节），最大支持 10MB", len(req.Content)))
+	content := []byte(req.Content)
+	switch req.Encoding {
+	case "": // 兼容现有的文本编辑、新建调用。
+	case "base64":
+		if len(req.Content) > base64.StdEncoding.EncodedLen(maxFileSize) {
+			writeError(w, http.StatusBadRequest, errors.New("文件过大，最大支持 10 MiB"))
+			return
+		}
+		content, err = base64.StdEncoding.Strict().DecodeString(req.Content)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("文件内容不是有效的 base64"))
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, errors.New("不支持的文件内容编码"))
 		return
 	}
-	if err := fs.WriteFile(r.Context(), req.Path, []byte(req.Content), req.ExpectedVersion, req.CreateOnly); err != nil {
+	if len(content) > maxFileSize {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("内容过大（%d 字节），最大支持 10 MiB", len(content)))
+		return
+	}
+	if err := fs.WriteFile(r.Context(), req.Path, content, req.ExpectedVersion, req.CreateOnly); err != nil {
 		if errors.Is(err, errFileVersionConflict) || errors.Is(err, errFileAlreadyExists) {
 			writeError(w, http.StatusConflict, err)
 			return
@@ -440,7 +458,7 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": contentVersion([]byte(req.Content))})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": contentVersion(content)})
 }
 
 func (s *Server) fsMkdir(w http.ResponseWriter, r *http.Request) {

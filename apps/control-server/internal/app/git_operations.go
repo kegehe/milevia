@@ -79,7 +79,7 @@ type gitSummaryResponse struct {
 	StateToken string    `json:"stateToken"`
 	// Changes 与 summary 随同一个响应返回，避免前端并发请求时把两个时刻拼在一起。
 	Changes []GitChange `json:"changes"`
-	// ChangesRevision 是"变更清单 + 每个文件指纹"的摘要，给手机端那个**只取 summary**
+	// ChangesRevision 是"变更清单 + 暂存区对象与模式 + 每个文件指纹"的摘要，给手机端那个**只取 summary**
 	// 的后台探针当变化判据用（见 apps/web 的 sameGitSnapshot）。
 	//
 	// 为什么不能只比 worktree 计数：一个文件恢复干净、另一个文件同时被改，计数一模一样，
@@ -103,6 +103,8 @@ func gitChangesRevision(changes []GitChange, fingerprints map[string]string) str
 		fmt.Fprintf(hash, "%d:%s:%t%t%t%t%t%t:%d:%s;", len(change.Path), change.Path,
 			change.Staged, change.Modified, change.Untracked, change.Deleted, change.Renamed, change.Conflicted,
 			len(fingerprint), fingerprint)
+		fmt.Fprintf(hash, "%d:%s:%d:%s;", len(change.OriginalPath), change.OriginalPath,
+			len(change.porcelainState), change.porcelainState)
 	}
 	return hex.EncodeToString(hash.Sum(nil))[:16]
 }
@@ -1026,6 +1028,13 @@ func (s *Server) gitConflictContent(w http.ResponseWriter, r *http.Request) {
 		s.writeGitReadError(w, err)
 		return
 	}
+	project, err := s.getProjectByID(r.Context(), chi.URLParam(r, "projectID"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, errors.New("project not found"))
+		return
+	}
+	project.Path = repo
+	detail.SuggestionAgents = s.conflictSuggestionAgents(project)
 	writeJSON(w, http.StatusOK, detail)
 }
 
@@ -1319,6 +1328,12 @@ func (s *Server) retryGitOperationUpdate(operationID, afterState, code, message 
 }
 
 func gitOperationFailure(err error) (status, code, message string) {
+	if errors.Is(err, errGitStashCreateIncomplete) {
+		return gitOperationNeedsAttention, "stash_create_incomplete", "收起未完成，可能已有 Stash 备份或仍有未收起的文件（如子模块内部改动）；请刷新并检查工作区，确认前不要移除工作区"
+	}
+	if errors.Is(err, errGitStashApplyFailed) {
+		return gitOperationNeedsAttention, "stash_restore_incomplete", "Stash 恢复未完成，可能存在冲突或部分改动；请检查工作区，Stash 备份仍然保留"
+	}
 	if errors.Is(err, errGitPartiallyApplied) {
 		return gitOperationNeedsAttention, "partial_result", "部分文件可能已被处理；请刷新仓库并检查工作区"
 	}
@@ -1343,7 +1358,7 @@ func gitOperationFailure(err error) (status, code, message string) {
 	case strings.Contains(stderr, "could not resolve host"), strings.Contains(stderr, "unable to access"):
 		return gitOperationFailed, "remote_unavailable", "无法连接到 Git 远端，请检查网络或远端地址"
 	case strings.Contains(stderr, "your local changes"), strings.Contains(stderr, "would be overwritten"):
-		return gitOperationFailed, "dirty_worktree", "工作区有未提交改动，请先提交或丢弃"
+		return gitOperationFailed, "dirty_worktree", "工作区有未提交改动，请先提交、收起（Stash）或丢弃"
 	default:
 		return gitOperationFailed, "git_failed", "Git 操作失败"
 	}
@@ -1619,6 +1634,7 @@ var gitOperationTypes = map[string]bool{
 	"stage": true, "unstage": true, "stage_all": true, "unstage_all": true,
 	"commit": true, "commit_amend": true, "discard_worktree": true, "discard_all": true,
 	"fetch": true, "pull": true, "push": true, "create_branch": true, "switch_branch": true,
+	"stash_create": true, "stash_apply": true,
 	"resolve_conflict": true, "conflict_abort": true, "conflict_continue": true,
 }
 

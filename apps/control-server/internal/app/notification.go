@@ -46,12 +46,34 @@ type NotificationEvent struct {
 type notificationSubscriber struct {
 	conn           *websocket.Conn
 	send           chan []byte
+	sendMu         sync.RWMutex
+	closed         bool
 	closeOnce      sync.Once
 	closeFrameOnce sync.Once
 }
 
 func (sub *notificationSubscriber) close() {
-	sub.closeOnce.Do(func() { close(sub.send) })
+	sub.closeOnce.Do(func() {
+		sub.sendMu.Lock()
+		defer sub.sendMu.Unlock()
+		sub.closed = true
+		close(sub.send)
+	})
+}
+
+// enqueue 同时用于历史补发和实时广播；关闭订阅时不能向已关闭的队列发送。
+func (sub *notificationSubscriber) enqueue(data []byte) bool {
+	sub.sendMu.RLock()
+	defer sub.sendMu.RUnlock()
+	if sub.closed {
+		return false
+	}
+	select {
+	case sub.send <- data:
+		return true
+	default:
+		return false
+	}
 }
 
 func (sub *notificationSubscriber) closeWithStatus(code int, reason string) {
@@ -84,7 +106,10 @@ func (s *Server) migrateNotifications(ctx context.Context) error {
 	created_at datetime not null,
 	dedupe_key text not null default ''
 );
-create index if not exists idx_notifications_dismissed on notifications(dismissed, created_at desc);
+create index if not exists idx_notifications_unread_order on notifications(dismissed, created_at desc, id desc);
+create index if not exists idx_notifications_retention_order on notifications(created_at desc, id desc);
+-- 新的未读排序索引覆盖旧索引，升级时移除冗余索引，避免额外的存储和写入开销。
+drop index if exists idx_notifications_dismissed;
 `)
 	if err != nil {
 		return fmt.Errorf("create notifications table: %w", err)
@@ -204,14 +229,14 @@ func (s *Server) subscribeNotifications(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// 连接后发送未读通知（writer goroutine 已启动，可以消费）
-	unread, err := s.getUnreadNotifications(r.Context())
+	// 历史补发仅取一队列的最新通知；完整的有界未读列表由 REST 恢复。
+	unread, err := s.getUnreadNotificationsWithLimit(r.Context(), notificationSubscriberQueueSize)
 	if err == nil {
 		for _, n := range unread {
 			data, _ := json.Marshal(n)
-			select {
-			case sub.send <- data:
-			default:
+			if !sub.enqueue(data) {
 				// 队列已满，跳过历史通知
+				break
 			}
 		}
 	}
@@ -297,9 +322,7 @@ func (s *Server) broadcastNotification(event NotificationEvent) {
 	toClose := make([]*notificationSubscriber, 0)
 	s.notificationSubMu.Lock()
 	for conn, sub := range s.notificationSubs {
-		select {
-		case sub.send <- data:
-		default:
+		if !sub.enqueue(data) {
 			delete(s.notificationSubs, conn)
 			toClose = append(toClose, sub)
 		}
@@ -327,20 +350,12 @@ func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) dismissNotification(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "notificationID")
-	result, err := s.db.ExecContext(r.Context(), `update notifications set dismissed=1 where id=?`, id)
+	_, err := s.db.ExecContext(r.Context(), `update notifications set dismissed=1 where id=?`, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if changed == 0 {
-		writeError(w, http.StatusNotFound, errNotificationNotFound)
-		return
-	}
+	// 通知可能刚被后台保留策略删除；目标状态已满足，重复忽略同样返回成功。
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -356,12 +371,15 @@ func (s *Server) dismissAllNotifications(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]time.Time{"dismissedAt": dismissedAt})
 }
 
-var errNotificationNotFound = errors.New("notification not found")
-
 // --- 内部辅助 ---
 
 func (s *Server) getUnreadNotifications(ctx context.Context) ([]NotificationEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `select n.id, n.type, n.project_id, coalesce(nullif(n.project_name,''), p.name,''), n.task_title, n.duration_ms, n.conversation_id, n.task_id, n.title, n.body, n.priority, n.action_url, n.created_at from notifications n left join projects p on p.id=n.project_id where n.dismissed=0 order by n.created_at desc`)
+	return s.getUnreadNotificationsWithLimit(ctx, notificationMaxRows)
+}
+
+func (s *Server) getUnreadNotificationsWithLimit(ctx context.Context, limit int) ([]NotificationEvent, error) {
+	// 维护在监听就绪后才开始；读取自身也要有界，避免旧库首次启动仍拉取全部积压。
+	rows, err := s.db.QueryContext(ctx, `select n.id, n.type, n.project_id, coalesce(nullif(n.project_name,''), p.name,''), n.task_title, n.duration_ms, n.conversation_id, n.task_id, n.title, n.body, n.priority, n.action_url, n.created_at from notifications n left join projects p on p.id=n.project_id where n.dismissed=0 and n.created_at>=? order by n.created_at desc,n.id desc limit ?`, time.Now().UTC().Add(-notificationUnreadRetention), limit)
 	if err != nil {
 		return nil, err
 	}

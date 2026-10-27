@@ -1074,6 +1074,17 @@ fn open_app_data_directory(app: tauri::AppHandle) -> Result<(), String> {
     open_directory(&dir)
 }
 
+/// 终端菜单使用服务端返回的会话工作目录（WSL 为 UNC 路径）。
+/// 只打开存在的绝对目录，不能把文件、URL 或相对路径交给 Explorer 执行。
+#[tauri::command]
+async fn open_terminal_directory(path: String) -> Result<(), String> {
+    let dir = PathBuf::from(&path);
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Err("所在目录不存在或不是绝对目录路径。".to_string());
+    }
+    open_directory(&dir)
+}
+
 /// 把 URL 交给系统协议处理器打开（http/https → 默认浏览器，mailto: → 邮件客户端）。
 ///
 /// ⚠️ 这个命令**前端一直在调、宿主却从没注册过**（2026-09-29 复查发现）：`@milevia/sdk`
@@ -2089,6 +2100,7 @@ fn main() {
             show_system_notification,
             enroll_remote_agent,
             open_app_data_directory,
+            open_terminal_directory,
             open_external,
             get_updater_status,
             check_for_update_now,

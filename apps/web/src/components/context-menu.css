@@ -1,0 +1,28 @@
+.app-context-menu {
+  position: fixed;
+  z-index: 10000;
+  display: grid;
+  min-width: 168px;
+  max-width: calc(100vw - 8px);
+  max-height: calc(100dvh - 8px);
+  overflow: auto;
+  padding: 5px;
+  border: 1px solid #c7d9d0;
+  border-radius: 8px;
+  background: #fbfefb;
+  box-shadow: 0 8px 28px #17362c30;
+}
+.app-context-menu > button {
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #31594f;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.app-context-menu > button:hover:not(:disabled),
+.app-context-menu > button:focus-visible { outline: none; background: #e6f4eb; }
+.app-context-menu > button:disabled { opacity: .4; cursor: default; }

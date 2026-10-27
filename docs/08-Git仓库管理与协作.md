@@ -176,7 +176,20 @@ Claude Run / 提交 / 暂存 / 切换分支 / fetch / push
 
 ### 6.3 分支切换门禁
 
-切换前必须检查：无运行中的 AI、无进行中的 Git 操作、无 merge/rebase/cherry-pick、工作树和暂存区均干净、目标分支存在且不是当前分支。否则拒绝并返回具体文件/状态，不提供“强制切换”按钮。若用户需要保留未提交改动，首期应先提交或在终端自行 stash；stash 工作流在第二阶段作为独立设计项。
+切换前必须检查：无运行中的 AI、无进行中的 Git 操作、无 merge/rebase/cherry-pick、工作树和暂存区均干净、目标分支存在且不是当前分支。否则拒绝并返回具体文件/状态，不提供“强制切换”按钮。若用户需要保留未提交改动，可先在 Git 工作台收起改动（Stash），再切换分支。
+
+### 6.4 收起与恢复改动（Stash，2026-10-27 更新）
+
+- 桌面端与手机端的“变更”页提供“收起的改动（Stash）”区域。收起使用 `git stash push --include-untracked`，保存已暂存、未暂存及未跟踪文件；忽略文件不包含在内。可填写收起说明，脏工作区的切分支确认中也提供入口。
+- Stash 列表在同一仓库的多个 worktree 间共享。隔离工作区收起后，即使该 worktree 被移除，仍可从主工作区恢复。
+- 恢复使用列表项的完整对象 ID，默认执行 `git stash apply --index`，还原原有暂存状态。跨分支导致暂存状态无法还原时，可取消“恢复原有暂存状态”，使用 `git stash apply` 合并改动。恢复后保留备份，不自动 pop/drop；恢复失败或产生冲突时标记 `needs_attention`，要求检查工作区，不自动重试。
+- 收起和恢复均使用工作区租约、index 锁及 `stateToken` 校验，并写入 `stash_create` / `stash_apply` 操作记录。手机端保留界面确认时的令牌，不在写入前自动换新；状态变化或令牌过期时要求刷新后重新确认。首次提交前、存在冲突或进行中的合并/变基等操作时拒绝执行；恢复前还要求工作区干净。
+- 状态读取显式列出全部未跟踪文件并检查子模块，不受隐藏未跟踪文件或忽略子模块的显示配置影响。未跟踪目录中的文件逐一进入状态校验；子模块内部改动无法收起时报告 `needs_attention`，不能据此认为工作区已干净。
+- 状态令牌与后台变更摘要保留 porcelain v2 中的对象 ID 和文件模式。即使路径、状态标记与工作区文件指纹未变，仅暂存区内容变化也会使旧令牌失效，并触发界面更新。
+- 收起后必须确认没有剩余改动；Git 无法收起子模块内部改动，命令零退出也可能未完成收起。这种情况、命令失败或无法核实结果时标记 `needs_attention`，提示检查备份和剩余文件，确认前不要移除工作区。切换项目、会话工作区或请求通道时，确认框、令牌与列表一并重置；旧请求结果不写入新工作区界面。
+- 进行中的 rebase 通过工作区自己的 Git 管理目录及伪引用共同判断，覆盖交互式 `break` 尚未产生 `REBASE_HEAD` 的情况；本地、SSH、WSL 均在仓库所在环境中检查。不会把另一个 worktree 的 rebase 状态套到当前工作区。
+- REST：`GET /git/stashes`、`POST /git/stashes`（`message`、`stateToken`）、`POST /git/stashes/apply`（`oid`、`stateToken`、可选 `restoreIndex`，默认 `true`）；手机端中继对应 `git.stashes`、`git.stashCreate`、`git.stashApply`。
+- 回归：后端 `TestGitStash*` 覆盖收起/恢复、状态门禁、冲突备份和 worktree 移除；前端 `node apps/web/scripts/verify-git-stash.mjs` 覆盖桌面/手机确认、列表刷新及失败呈现，可用 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定本机 Chromium 浏览器。
 
 ## 7. 首期页面与交互
 

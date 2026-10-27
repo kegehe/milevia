@@ -35,6 +35,7 @@
 /* ─── 主面板布局 ──────────────────────────────────────────────────────────── */
 
 .files-panel {
+  position: relative;
   display: flex;
   flex-direction: column;
   width: 100%;
@@ -42,6 +43,57 @@
   flex: 1;
   overflow: hidden;
   background: var(--file-bg);
+}
+
+.files-drop-hint {
+  position: absolute;
+  inset: 6px;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  border: 2px dashed var(--file-accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--file-bg) 90%, transparent);
+  color: var(--file-accent);
+  font-weight: 700;
+}
+
+.files-upload-status {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--file-border);
+  background: var(--file-accent-soft);
+  color: var(--file-text);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.files-upload-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.files-upload-summary button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.files-upload-status ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--file-error);
+}
+
+.file-tree-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .files-content {

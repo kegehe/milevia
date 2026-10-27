@@ -328,7 +328,7 @@ GET  /api/runners/{runnerID}/agents/{agentID}/operations/{opID}
 
 ### 5.4 旧路由处理
 
-`/claude/check-update|update`、`/codex/check-update|update`（`app.go:1119-1122`）**保留为薄适配**（内部转调泛化 handler），并在文档与注释里标注为 deprecated。理由：`ConversationPage.tsx:509/555` 正在用，一次性改会同时动到对话页回归面。
+过渡期曾将 `/claude/check-update|update`、`/codex/check-update|update` 保留为薄适配，供尚未迁移的对话页使用。2026-10-27 已确认前端全部切换至 `/agents/{agentID}/check-update|update`，且经人工确认无旧客户端或外部脚本依赖，现已删除这四条路由、转发 handler 与仅用于委托的中间函数。业务测试统一使用泛化入口，另有回归测试确认旧路径返回路由级 404。
 
 ### 5.5 明确不新增
 
@@ -721,15 +721,26 @@ npm --prefix <托管 prefix> install -g <NpmPackage>@<version>     # version 缺
 
 ### 15.2 已知例外：手机端读不到工具目录
 
-`features/git/ConflictSolveView.tsx` 与 `pages/MobileRemotePage.tsx` 是**桌面与手机共用**的
-组件，而手机端走的是云端 `/api/remote/*`，**拿不到控制服务的 `GET /api/agents`**。
+`pages/MobileRemotePage.tsx` 走云端 `/api/remote/*`，**拿不到控制服务的 `GET /api/agents`**。
 
-因此这两处暂时保留按工具 ID 的小清单（已就地写明原因，并有测试断言"例外说明存在"）。
+因此该处暂时保留按工具 ID 的小清单（已就地写明原因，并有测试断言"例外说明存在"）。
 强行改成读目录会让手机端把工具显示成裸 id（`claude-code`），那是比现在更差的退化。
 
 **正确修法**（需单独排期，属 REMOTE-CONTRACT 变更）：把工具目录放进手机快照
 （`remote_control.go` 下发的快照里已有项目与会话元数据），或让云端转发该端点。
-修完之后这两处可以一并收敛。
+修完之后该处可以收敛。
+
+`features/git/ConflictSolveView.tsx` 的例外已于 2026-10-27 移除：
+`GET /api/projects/{projectID}/git/conflicts/content` 新增 `suggestionAgents: [{id, name}]`，
+从服务端目录的 `supportsConflictSuggestions` 能力派生，并按项目执行环境过滤。
+桌面与手机使用同一响应，不需要手机访问全局工具目录，也未新增中继操作。
+本机支持 Claude Code、Codex、CodeBuddy Code、Qoder CLI、OpenCode、Cursor CLI；
+CodeBuddy、Qoder 使用临时只读会话，首轮完成或取消后关闭，Cursor 使用只读单次调用。
+CodeBuddy、Qoder、Cursor 仍受本机执行边界约束，不用于 WSL / SSH 项目。
+环境判断同时使用 Runner 与实际工作区路径：WSL 服务端的 `/mnt/<盘符>/` 项目
+按既有约定使用 Windows 工具，因此过滤 CodeBuddy、Qoder、Cursor，
+以及尚未接通 WSL→Windows 反向通道的 OpenCode。
+能力支持与安装状态是两回事；未安装或未登录时，由执行器返回具体错误。
 
 ### 15.3 顺带查到的既有问题（未修，仅登记）
 
@@ -1053,9 +1064,8 @@ rootPath（工具链要落在 `$HOME`，不在任何项目里），签名还要�
 
 ### 18.3 复核为真但**不改**的两处
 
-- **`ConflictSolveView.tsx` 里写死的两个选项**：这是桌面与手机**共用**的组件，而手机端读不到
-  `GET /api/agents`（它走云端 `/api/remote/*`）。改成读目录会让手机端显示成空 ——
-  正确修法是把工具目录放进手机快照，那是 REMOTE-CONTRACT 变更，得单独排期（§16 已登记）。
+- **`ConflictSolveView.tsx` 里写死的两个选项**：本轮复核时暂留，已于 2026-10-27
+  改为冲突内容响应下发工具能力与名称，桌面和手机统一使用，见 §15.2。
 - **`ConversationPage` 里 6 处 `conversation?.agentId || "claude-code"`**：这是"早于多工具支持的
   老会话没有 agentId"的兼容默认，不是"工具清单写死" —— 那些会话确实是 Claude 建的，
   默认落到 claude-code 是**正确**的历史事实。

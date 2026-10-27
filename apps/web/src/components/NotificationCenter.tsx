@@ -236,7 +236,7 @@ export default function NotificationCenter() {
               <div className="notification-header-title-group">
                 <span className="notification-header-icon"><NotificationBellIcon /></span>
                 <div>
-                  <span className="notification-header-title">通知</span>
+                  <span className="notification-header-title" title="未读通知保留 30 天，通知记录最多保留最新 1000 条">通知</span>
                   <small>{unreadCount > 0 ? `${unreadCount} 条待处理` : "通知中心"}</small>
                 </div>
               </div>

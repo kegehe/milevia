@@ -31,6 +31,20 @@ func TestParseConflictSuggestionJSONRejectsNonJSON(t *testing.T) {
 	}
 }
 
+func TestParseConflictSuggestionJSONRequiresMergedString(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"explanation":"无法解决"}`, `{"merged":null}`, `{"merged":42}`} {
+		t.Run(raw, func(t *testing.T) {
+			if merged, _, err := parseConflictSuggestionJSON(raw); err == nil {
+				t.Fatalf("invalid result was accepted as merged=%q", merged)
+			}
+		})
+	}
+	// 合法结果可以是空文件；不能用 merged == "" 代替字段校验。
+	if merged, _, err := parseConflictSuggestionJSON(`{"merged":""}`); err != nil || merged != "" {
+		t.Fatalf("explicit empty file was rejected: merged=%q err=%v", merged, err)
+	}
+}
+
 func TestConflictSuggestionBudget(t *testing.T) {
 	detail := GitConflictContent{Base: strings.Repeat("b", 1024), Ours: strings.Repeat("o", 1024), Theirs: strings.Repeat("t", 1024), Working: strings.Repeat("w", 1024)}
 	if got := conflictSuggestionContentBudget(detail); got != 4096 {

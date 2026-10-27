@@ -186,6 +186,16 @@
 .git-change-group > header { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px 9px 14px; border-bottom: 1px solid #e0ebe5; background: #f8fcf9; }
 .git-change-group h3 { margin: 0; color: #355e51; font-size: 13px; }
 .git-group-actions { display: flex; align-items: center; gap: 7px; }
+.git-stash-panel { flex-shrink: 0; }
+.git-stash-hint { margin: 10px 14px; color: var(--text-muted, #60746b); font-size: 12px; line-height: 1.6; }
+.git-stash-list { max-height: 260px; margin: 0; padding: 0; overflow: auto; list-style: none; }
+.git-stash-list li { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid #e0ebe5; }
+.git-stash-list li > div { display: grid; flex: 1; min-width: 0; gap: 4px; }
+.git-stash-list b { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.git-stash-list small { color: var(--text-muted, #60746b); font-size: 11px; }
+.git-stash-list button, .git-stash-panel > header button { flex-shrink: 0; padding: 5px 9px; font-size: 12px; }
+.git-stash-message { display: grid; gap: 8px; font-size: 13px; }
+.git-stash-message input { width: 100%; min-width: 0; }
 .git-group-actions > span { display: grid; min-width: 20px; height: 20px; place-items: center; border-radius: 10px; color: #507367; background: #eaf3ed; font: 700 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .git-icon-btn { width: 28px; height: 28px; }
 .git-icon-btn.danger { color: #a54a39; border-color: #e0c4be; background: #fff7f4; }
@@ -711,7 +721,7 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
    尺寸与间距跟着同一排的按钮走（上面 `.git-conflict-solve-toolbar button` 那条），
    这里只补选中态 —— 用 aria-pressed 当样式钩子，不新造裸类名。 */
 .git-workbench[data-mobile="true"] .git-conflict-ai-launch { flex-wrap: wrap; }
-.git-workbench[data-mobile="true"] .git-conflict-ai-agents { display: inline-flex; gap: 6px; }
+.git-workbench[data-mobile="true"] .git-conflict-ai-agents { display: inline-flex; flex-wrap: wrap; gap: 6px; }
 .git-workbench[data-mobile="true"] .git-conflict-ai-agents button[aria-pressed="true"] { border-color: #267b67; color: #fff; background: #2c7567; }
 
 /* 提交历史「读不到」那一档（与「这条分支没有提交」是两件事）。

@@ -13,8 +13,9 @@ export type GitCommit = { oid: string; parents: string[]; subject: string; autho
 export type GitCommitFile = { path: string; originalPath?: string; status: string; additions: number; deletions: number; binary: boolean };
 export type GitCommitDetail = { oid: string; parents: string[]; author: string; authoredAt: string; committer: string; committedAt: string; subject: string; message: string; files: GitCommitFile[] };
 export type GitBranch = { name: string; remote: boolean; current: boolean; upstream?: string };
+export type GitStash = { oid: string; ref: string; subject: string; createdAt: string };
 export type GitOperation = { id: string; projectId: string; workspaceId?: string; workspacePath?: string; type: GitOperationType; status: GitOperationStatus; requestSummary: string; beforeState: string; afterState: string; errorCode?: string; errorMessage?: string; requestedAt: string; startedAt?: string; finishedAt?: string };
-export type GitOperationType = "stage" | "unstage" | "stage_all" | "unstage_all" | "commit" | "commit_amend" | "discard_worktree" | "discard_all" | "fetch" | "pull" | "push" | "create_branch" | "switch_branch" | "resolve_conflict" | "conflict_abort" | "conflict_continue";
+export type GitOperationType = "stage" | "unstage" | "stage_all" | "unstage_all" | "commit" | "commit_amend" | "discard_worktree" | "discard_all" | "fetch" | "pull" | "push" | "create_branch" | "switch_branch" | "stash_create" | "stash_apply" | "resolve_conflict" | "conflict_abort" | "conflict_continue";
 export type GitOperationStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "needs_attention";
 
 // —— Git 冲突解决相关类型（对应后端 git_conflicts.go 的 JSON）——
@@ -33,6 +34,7 @@ export type GitConflictContent = {
   ours?: string;
   theirs?: string;
   working?: string;
+  suggestionAgents?: { id: string; name: string }[];
 };
 
 export function groupChanges(changes: GitChange[]): { staged: GitChange[]; worktree: GitChange[] } {

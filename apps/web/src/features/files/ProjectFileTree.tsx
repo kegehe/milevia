@@ -58,6 +58,8 @@ interface ProjectFileTreeProps {
   onFileSelect: (path: string, name: string) => void;
   onCreateFile: (dirPath: string) => void;
   onCreateDir: (dirPath: string) => void;
+  onUpload?: (dirPath: string) => void;
+  uploading?: boolean;
   onRename: (path: string, name: string) => void;
   onDelete: (path: string, name: string, isDir: boolean) => void;
   onAddToChat?: (path: string) => void;
@@ -88,11 +90,12 @@ interface FileTreeItemData {
   unreadable?: boolean;
 }
 
-function TreeActionIcon({ name }: { name: "new-file" | "new-folder" | "refresh" }) {
+function TreeActionIcon({ name }: { name: "new-file" | "new-folder" | "upload" | "refresh" }) {
   const paths = {
     "new-file": <><path d="M5 2.8h6.4L16 7.4v9.8a1.8 1.8 0 0 1-1.8 1.8H5A1.8 1.8 0 0 1 3.2 17.2V4.6A1.8 1.8 0 0 1 5 2.8Z" /><path d="M11.2 2.9v4.6h4.6M9.6 11v5M7.1 13.5h5" /></>,
     "new-folder": <><path d="M2.8 6.2A1.8 1.8 0 0 1 4.6 4.4h3l1.8 2h6.1a1.8 1.8 0 0 1 1.8 1.8v7.2a1.8 1.8 0 0 1-1.8 1.8H4.6a1.8 1.8 0 0 1-1.8-1.8V6.2Z" /><path d="M10 10v5M7.5 12.5h5" /></>,
     refresh: <><path d="M16.6 7.8A6.7 6.7 0 1 0 18 12" /><path d="M16.6 3.8v4h-4" /></>,
+    upload: <><path d="M10 13V3m-4 4 4-4 4 4M3 12v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" /></>,
   };
   return <svg className="file-tree-action-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.55" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
@@ -391,6 +394,8 @@ export function ProjectFileTree({
   onFileSelect,
   onCreateFile,
   onCreateDir,
+  onUpload,
+  uploading,
   onRename,
   onDelete,
   onAddToChat,
@@ -439,6 +444,11 @@ export function ProjectFileTree({
     isDir: boolean;
   } | null>(null);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  // 菜单中的路径属于打开菜单时的工作区，切换后不能交给新工作区的操作回调。
+  useEffect(() => {
+    setContextMenu(null);
+    setCopiedPath(null);
+  }, [projectId, conversationId, request]);
   const environmentRef = useRef<TreeEnvironmentRef<FileTreeItemData, never> | null>(null);
   // 结果列表容器。键盘上下选中的那条要跟着滚进可视区，否则用 ↑↓ 选到列表外的项时看不见。
   const searchListRef = useRef<HTMLDivElement | null>(null);
@@ -773,6 +783,7 @@ export function ProjectFileTree({
         <span className="file-tree-title">项目文件</span>
         <div className="file-tree-head-actions">
           {!readOnly && <>
+            {onUpload && <button type="button" className="file-tree-action" onClick={() => onUpload("")} disabled={uploading} title="上传文件到项目根目录" aria-label="上传文件"><TreeActionIcon name="upload" /></button>}
             <button type="button" className="file-tree-action" onClick={() => onCreateFile("")} title="新建文件" aria-label="新建文件"><TreeActionIcon name="new-file" /></button>
             <button type="button" className="file-tree-action" onClick={() => onCreateDir("")} title="新建目录" aria-label="新建目录"><TreeActionIcon name="new-folder" /></button>
           </>}
@@ -947,6 +958,7 @@ export function ProjectFileTree({
             return (
               <div
                 className={`file-tree-item ${isFocused ? "selected" : ""}`}
+                data-file-upload-directory={item.data.isDir ? item.data.path : getDirPath(item.data.path)}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
@@ -999,6 +1011,10 @@ export function ProjectFileTree({
         >
           {contextMenu.isDir && !readOnly && (
             <>
+              {onUpload && <button disabled={uploading} onClick={() => {
+                onUpload(contextMenu.path);
+                setContextMenu(null);
+              }}>上传文件到此目录</button>}
               <button
                 onClick={() => {
                   onCreateFile(contextMenu.path);

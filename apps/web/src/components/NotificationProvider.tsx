@@ -11,9 +11,12 @@ import {
   isWindowsNotifyType,
   isWithinQuietHours,
   notificationTargetURL,
+  notificationTimeNs,
   priorityForType,
+  reconcileUnreadNotifications,
+  rememberNotificationID,
   toastVariantForType,
-  unreadIdsMissingFromServer,
+  trimUnreadNotifications,
   windowsToastLines,
 } from "../lib/notifications";
 import { useUIPreferences, type LocalPreferences } from "../stores/useUIPreferences";
@@ -43,11 +46,13 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   const location = useLocation();
   const wsRef = useRef<WebSocket | null>(null);
   const dismissedRef = useRef(new Set<string>());
-  const dismissedAllAtRef = useRef(0); // dismiss-all 的时间戳，用于过滤旧通知
-  const unreadNotificationsRef = useRef(new Map<string, number>());
+  const dismissedAllAtRef = useRef(0n); // 纳秒精度，与服务端全部已读边界一致。
+  const unreadNotificationsRef = useRef(new Map<string, bigint>());
   const shownRef = useRef(new Set<string>()); // 跟踪 WebSocket 已展示的通知 ID（防止重连重复）
   const broadcastShownRef = useRef(new Set<string>()); // 跟踪 BroadcastChannel 已处理的通知 ID（防止重复 inc）
+  const activeToastIdsRef = useRef(new Set<string>());
   const initializedRef = useRef(false); // 初始加载完成标志，防止 WebSocket 历史通知与初始加载竞态
+  const unreadRequestSeq = useRef(0); // 首拉、重连与后台失效刷新共用序号，拒绝旧快照。
   const channelRef = useRef<BroadcastChannel | null>(null);
   const pathnameRef = useRef(location.pathname);
   const localPreferencesRef = useRef<LocalPreferences>(localPreferences);
@@ -55,25 +60,32 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   localPreferencesRef.current = localPreferences;
 
   const syncUnreadCount = useCallback(() => {
+    trimUnreadNotifications(unreadNotificationsRef.current);
+    // 已读、过期或超量移除的通知，其持久弹窗也必须一起收起。
+    for (const id of activeToastIdsRef.current) {
+      if (!unreadNotificationsRef.current.has(id)) {
+        toast.dismiss(`notif-${id}`);
+        activeToastIdsRef.current.delete(id);
+      }
+    }
     setUnreadCount(unreadNotificationsRef.current.size);
   }, []);
 
+  const unreadCreatedAt = useCallback((event: Pick<NotificationEvent, "id" | "createdAt">): bigint | null => {
+    if (dismissedRef.current.has(event.id)) return null;
+    const createdAt = notificationTimeNs(event.createdAt);
+    if (createdAt !== null && createdAt <= dismissedAllAtRef.current) return null;
+    return createdAt ?? BigInt(Date.now()) * 1_000_000n;
+  }, []);
+
   const markUnread = useCallback((event: Pick<NotificationEvent, "id" | "createdAt">) => {
-    if (dismissedRef.current.has(event.id)) return;
-    const createdAt = new Date(event.createdAt).getTime();
-    if (dismissedAllAtRef.current && Number.isFinite(createdAt) && createdAt <= dismissedAllAtRef.current) return;
-    unreadNotificationsRef.current.set(event.id, Number.isFinite(createdAt) ? createdAt : Date.now());
+    const createdAt = unreadCreatedAt(event);
+    if (createdAt === null) return;
+    unreadNotificationsRef.current.set(event.id, createdAt);
     syncUnreadCount();
-  }, [syncUnreadCount]);
+  }, [syncUnreadCount, unreadCreatedAt]);
 
-  const markDismissed = useCallback((id: string, broadcast = false) => {
-    dismissedRef.current.add(id);
-    unreadNotificationsRef.current.delete(id);
-    syncUnreadCount();
-    if (broadcast) channelRef.current?.postMessage({ type: "dismissed", id });
-  }, [syncUnreadCount]);
-
-  const markAllDismissed = useCallback((dismissedAt: number, broadcast = false) => {
+  const markAllDismissed = useCallback((dismissedAt: bigint, broadcast = false) => {
     if (dismissedAt < dismissedAllAtRef.current) return;
     dismissedRef.current.clear();
     dismissedAllAtRef.current = dismissedAt;
@@ -81,31 +93,41 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       if (createdAt <= dismissedAt) unreadNotificationsRef.current.delete(id);
     }
     syncUnreadCount();
-    if (broadcast) channelRef.current?.postMessage({ type: "dismissed-all", dismissedAt });
+    if (broadcast) channelRef.current?.postMessage({
+      type: "dismissed-all",
+      dismissedAt: Number(dismissedAt / 1_000_000n), // 保留旧标签页可识别的毫秒字段。
+      dismissedAtNs: dismissedAt,
+    });
   }, [syncUnreadCount]);
 
   // 重新拉取未读列表并对账：服务端已删掉的通知（项目/会话/定时任务被删）要从角标里消失。
   // recordShown 为真时把结果记入 shownRef（WebSocket 重连路径沿用旧行为，避免历史通知重弹）。
   const refreshUnread = useCallback(async (recordShown: boolean) => {
+    const seq = ++unreadRequestSeq.current;
+    const shouldRecordShown = recordShown || !initializedRef.current;
     // 先拍快照：拉取期间新到的通知不在里面，不能因这次响应里还没有它就被抹掉角标。
     const beforeFetch = new Set(unreadNotificationsRef.current.keys());
     try {
       const list = await api<NotificationEvent[]>("/api/notifications");
-      if (!Array.isArray(list)) return;
-      const present = new Set<string>();
-      for (const notification of list) {
-        present.add(notification.id);
-        if (recordShown) shownRef.current.add(notification.id);
-        markUnread(notification);
+      if (seq !== unreadRequestSeq.current || !Array.isArray(list)) return;
+      // REST 按新到旧返回；按旧到新记入，滚动淘汰时优先保留最新历史。
+      if (shouldRecordShown) {
+        for (const notification of [...list].reverse()) rememberNotificationID(shownRef.current, notification.id);
       }
-      const missing = unreadIdsMissingFromServer(beforeFetch, present);
-      if (missing.length === 0) return;
-      for (const id of missing) unreadNotificationsRef.current.delete(id);
+      const serverUnread = new Map<string, bigint>();
+      for (const notification of list) {
+        const createdAt = unreadCreatedAt(notification);
+        if (createdAt !== null) serverUnread.set(notification.id, createdAt);
+      }
+      reconcileUnreadNotifications(unreadNotificationsRef.current, beforeFetch, serverUnread);
       syncUnreadCount();
     } catch {
       /* 拉取失败就保留现有角标，下次事件或重连再校正 */
+    } finally {
+      // 只有最新请求能够结束初始化/重连补发保护，旧请求完成不能提前放行弹窗。
+      if (seq === unreadRequestSeq.current) initializedRef.current = true;
     }
-  }, [markUnread, syncUnreadCount]);
+  }, [syncUnreadCount, unreadCreatedAt]);
 
   const refreshUnreadNow = useCallback(() => {
     void refreshUnread(false).finally(() => {
@@ -114,26 +136,23 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     });
   }, [refreshUnread]);
 
+  const markDismissed = useCallback((id: string, broadcast = false) => {
+    rememberNotificationID(dismissedRef.current, id);
+    unreadNotificationsRef.current.delete(id);
+    syncUnreadCount();
+    if (broadcast) channelRef.current?.postMessage({ type: "dismissed", id });
+    // 清理前库中可能暂时超限：忽略后 REST 会补回下一条，角标也必须重新对账。
+    refreshUnreadNow();
+  }, [syncUnreadCount, refreshUnreadNow]);
+
   // 初始加载未读通知：设置 count 并将已有通知 ID 标记到 shownRef，
   // 防止 WebSocket 连接后历史通知重复弹 toast 和重复 inc
   useEffect(() => {
-    let stale = false;
-    api<NotificationEvent[]>("/api/notifications")
-      .then((list) => {
-        if (stale || !Array.isArray(list)) return;
-        for (const n of list) {
-          shownRef.current.add(n.id);
-          markUnread(n);
-        }
-        initializedRef.current = true;
-      })
-      .catch(() => {
-        if (!stale) initializedRef.current = true; // 即使失败也放行，避免永久阻塞 toast
-      });
+    void refreshUnread(true);
     return () => {
-      stale = true;
+      unreadRequestSeq.current++;
     };
-  }, [markUnread]);
+  }, [refreshUnread]);
 
   // 判断用户是否正在查看产生通知的会话页面（审批去重）
   // 使用 ref 读取 pathname，避免路由变化导致回调重建
@@ -159,7 +178,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       if (dismissedRef.current.has(event.id)) return;
 
       // dismiss-all 后过滤：创建时间早于 dismiss-all 时间戳的通知视为已处理
-      if (dismissedAllAtRef.current && new Date(event.createdAt).getTime() < dismissedAllAtRef.current) return;
+      if (unreadCreatedAt(event) === null) return;
 
       // 审批去重：如果用户正在查看该会话，不弹 toast
       if (event.type === "approval.pending" && isViewingConversation(event.conversationId)) {
@@ -172,25 +191,14 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       if (fromBroadcast) {
         if (shownRef.current.has(event.id)) return;
         if (broadcastShownRef.current.has(event.id)) return;
-        broadcastShownRef.current.add(event.id);
-        // broadcastShownRef 容量限制
-        if (broadcastShownRef.current.size > 1000) {
-          broadcastShownRef.current.clear();
-          broadcastShownRef.current.add(event.id);
-        }
+        rememberNotificationID(broadcastShownRef.current, event.id);
         markUnread(event);
         return;
       }
 
       // WebSocket 通知去重：防止重连后历史通知重复弹 toast
       if (shownRef.current.has(event.id)) return;
-      shownRef.current.add(event.id);
-
-      // shownRef 容量限制，防止长时间运行内存泄漏
-      if (shownRef.current.size > 1000) {
-        shownRef.current.clear();
-        shownRef.current.add(event.id);
-      }
+      rememberNotificationID(shownRef.current, event.id);
 
       // 初始加载完成前的通知（页面刷新后 WebSocket 历史通知）：
       // 计入未读集合，但不弹 toast；初始 REST 结果会与该集合合并。
@@ -212,8 +220,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       const inQuietHours = preferences.quietHoursEnabled && isWithinQuietHours(new Date(), preferences.quietHoursStart, preferences.quietHoursEnd);
       const shouldPresent = isHighPriority || (!inQuietHours && (isNormalPriority ? preferences.taskNotificationsEnabled : preferences.lowPriorityNotificationsEnabled));
 
-      // The notification center is an audit trail, so user display preferences
-      // only suppress transient alerts and never discard the underlying event.
+      // 显示偏好只控制临时提醒；通知中心仍保留服务端保留期内的通知。
       if (!shouldPresent) {
         markUnread(event);
         return;
@@ -231,6 +238,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         event.title
       );
 
+      activeToastIdsRef.current.add(event.id);
       toast[variant](titleNode, {
         id: `notif-${event.id}`, // 去重：同一通知只显示一个
         className: "notif-toast", // 方案E轨迹卡样式钩子（notification.css 末段）
@@ -239,11 +247,17 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         action: {
           label: "查看详情",
           onClick: () => {
+            activeToastIdsRef.current.delete(event.id);
             navigate(notificationTargetURL(event));
             dismissNotification(event.id);
           },
         },
-        onDismiss: () => dismissNotification(event.id),
+        onDismiss: () => {
+          // Sonner 的程序化 dismiss 也会触发回调；只有用户关闭才写入已读状态。
+          if (!activeToastIdsRef.current.delete(event.id)) return;
+          dismissNotification(event.id);
+        },
+        onAutoClose: () => activeToastIdsRef.current.delete(event.id),
       });
 
       markUnread(event);
@@ -273,7 +287,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         });
       }
     },
-    [navigate, isViewingConversation, dismissNotification, markUnread],
+    [navigate, isViewingConversation, dismissNotification, markUnread, unreadCreatedAt],
   );
 
   // WebSocket 连接 + 自动重连
@@ -287,18 +301,18 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       const ws = createWebSocket("/ws/notifications");
 
       ws.onopen = () => {
+        if (cancelled || wsRef.current !== ws) return;
         const isReconnect = reconnectAttempts > 0;
         reconnectAttempts = 0;
         if (!isReconnect) return; // 首次连接由初始加载 useEffect 处理
         // 重连后重新加载未读通知 ID，更新 shownRef 防止历史通知重复弹 toast
         // 重置 initializedRef，让重连后的历史通知被拦截（不弹 toast、不 inc）
         initializedRef.current = false;
-        void refreshUnread(true).finally(() => {
-          initializedRef.current = true; // 失败也放行
-        });
+        void refreshUnread(true);
       };
 
       ws.onmessage = (raw: MessageEvent) => {
+        if (cancelled || wsRef.current !== ws) return;
         try {
           const event: NotificationEvent = JSON.parse(raw.data);
           handleNotification(event);
@@ -308,7 +322,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       };
 
       ws.onclose = () => {
-        if (cancelled) return;
+        if (cancelled || wsRef.current !== ws) return;
         reconnectAttempts++;
         const delay = Math.min(500 * Math.pow(2, reconnectAttempts - 1), 15000);
         reconnectTimer = setTimeout(connect, delay);
@@ -340,8 +354,11 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         handleNotification(e.data.payload as NotificationEvent, true);
       } else if (e.data?.type === "dismissed" && typeof e.data.id === "string") {
         markDismissed(e.data.id);
-      } else if (e.data?.type === "dismissed-all" && typeof e.data.dismissedAt === "number") {
-        markAllDismissed(e.data.dismissedAt);
+      } else if (e.data?.type === "dismissed-all" && typeof e.data.dismissedAtNs === "bigint") {
+        markAllDismissed(e.data.dismissedAtNs);
+      } else if (e.data?.type === "dismissed-all" && typeof e.data.dismissedAt === "number" && Number.isFinite(e.data.dismissedAt)) {
+        // 兼容升级前标签页发送的毫秒时间戳。
+        markAllDismissed(BigInt(Math.trunc(e.data.dismissedAt)) * 1_000_000n);
       }
     };
     return () => {
@@ -358,8 +375,8 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     };
     const onDismissedAll = (event: Event) => {
       const raw = (event as CustomEvent<{ dismissedAt?: string }>).detail?.dismissedAt;
-      const dismissedAt = raw ? new Date(raw).getTime() : NaN;
-      markAllDismissed(Number.isFinite(dismissedAt) ? dismissedAt : Date.now(), true);
+      const dismissedAt = raw ? notificationTimeNs(raw) : null;
+      markAllDismissed(dismissedAt ?? BigInt(Date.now()) * 1_000_000n, true);
     };
     window.addEventListener("notification:dismissed", onDismissed);
     window.addEventListener("notification:dismissed-all", onDismissedAll);

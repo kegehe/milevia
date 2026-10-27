@@ -9,14 +9,15 @@
  *
  * 与文件适配器（`features/files/mobile-fs-request.ts`）同构，三处**有意的不同**：
  *
- *  1. **写操作前无条件换一次 `stateToken`**（见 §3.4 of docs/41）。服务端的乐观锁
+ *  1. **一般写操作前换一次 `stateToken`**（见 §3.4 of docs/41）。服务端的乐观锁
  *     令牌只有 2 分钟有效期，而手机上"看一眼 diff → 想一想 → 点提交"很容易越过去。
  *     令牌换取一次 `git.summary` 的代价，换掉"提交时报一句英文"。
+ *     Stash 收起和恢复保留界面令牌：必须绑定用户确认过的文件和分支，变化后刷新重试。
  *  2. **超时按 op 分档**：读 20s / 本地写 45s / 网络写 60s。服务端单条 git 命令上限
  *     是 30s（`git.go` 的 gitCommandTimeout），20s 的默认值会让 push/fetch **必然超时**。
  *     云端不认识 op，所以这个数由这里提议、由云端夹取。
  *  3. **不缓存任何内容**。Git 状态变得比文件内容快得多（AI 每改一个文件都会动它），
- *     缓存 diff 只会把过期内容当新的给用户看。**连令牌也不留**：写操作一律现取一次，
+ *     缓存 diff 只会把过期内容当新的给用户看。适配器不保存令牌；Stash 使用调用方传入的令牌，其他写操作现取一次，
  *     多出来的那次往返换掉"一个魔法数 + 一类漏判"，比留一份可能过期的令牌划算。
  *     所以这里没有 `invalidateAll` 那种"清缓存"的出口 —— 没有东西可清。
  */
@@ -39,8 +40,10 @@ interface Route {
   /** query：params 是查询参数；body：params 是 JSON 请求体。 */
   kind: "query" | "body";
   timeoutMs: number;
-  /** 该操作带服务端的 stateToken 乐观锁 ⇒ 发之前必须换一个新鲜的（见文件头 §1）。 */
+  /** 该操作带服务端的 stateToken 乐观锁；默认写前换新，preserveStateToken 路由除外。 */
   needsStateToken?: boolean;
+  /** Stash 必须校验用户确认过的状态，不能用新令牌静默放行后续改动。 */
+  preserveStateToken?: boolean;
 }
 
 /**
@@ -58,6 +61,7 @@ const ROUTES: Route[] = [
   { pattern: "/log", op: "git.log", method: "GET", kind: "query", timeoutMs: READ_TIMEOUT_MS },
   { pattern: "/operations", op: "git.operations", method: "GET", kind: "query", timeoutMs: READ_TIMEOUT_MS },
   { pattern: "/branches", op: "git.branches", method: "GET", kind: "query", timeoutMs: READ_TIMEOUT_MS },
+  { pattern: "/stashes", op: "git.stashes", method: "GET", kind: "query", timeoutMs: READ_TIMEOUT_MS },
   { pattern: "/conflicts", op: "git.conflicts", method: "GET", kind: "query", timeoutMs: READ_TIMEOUT_MS },
   { pattern: "/conflicts/content", op: "git.conflictContent", method: "GET", kind: "query", timeoutMs: READ_TIMEOUT_MS },
   { pattern: "/conflicts/suggestions/{suggestionID}", op: "git.suggestion", method: "GET", kind: "query", timeoutMs: READ_TIMEOUT_MS },
@@ -73,6 +77,8 @@ const ROUTES: Route[] = [
   { pattern: "/unstage-all", op: "git.unstageAll", method: "POST", kind: "body", timeoutMs: LOCAL_WRITE_TIMEOUT_MS, needsStateToken: true },
   { pattern: "/discard", op: "git.discard", method: "POST", kind: "body", timeoutMs: LOCAL_WRITE_TIMEOUT_MS, needsStateToken: true },
   { pattern: "/switch", op: "git.switch", method: "POST", kind: "body", timeoutMs: LOCAL_WRITE_TIMEOUT_MS, needsStateToken: true },
+  { pattern: "/stashes", op: "git.stashCreate", method: "POST", kind: "body", timeoutMs: LOCAL_WRITE_TIMEOUT_MS, needsStateToken: true, preserveStateToken: true },
+  { pattern: "/stashes/apply", op: "git.stashApply", method: "POST", kind: "body", timeoutMs: LOCAL_WRITE_TIMEOUT_MS, needsStateToken: true, preserveStateToken: true },
   // 新建分支与只读的分支列表**共用同一个路径**，靠方法区分（`gitCreateBranch` 不需要令牌）。
   { pattern: "/branches", op: "git.createBranch", method: "POST", kind: "body", timeoutMs: LOCAL_WRITE_TIMEOUT_MS },
   { pattern: "/conflicts/resolve", op: "git.conflictResolve", method: "POST", kind: "body", timeoutMs: LOCAL_WRITE_TIMEOUT_MS, needsStateToken: true },
@@ -254,7 +260,7 @@ export function createMobileGitRequest(options: MobileGitRequestOptions): Mobile
     async request<T>(path: string, init?: RequestInit): Promise<T> {
       const parsed = parseGitCall(path, init);
 
-      if (parsed.route.needsStateToken) {
+      if (parsed.route.needsStateToken && !parsed.route.preserveStateToken) {
         // 令牌由服务端签发、2 分钟有效，且**绑的是当时那份仓库状态**。带着界面上那份
         // 旧令牌去写，最常见的结局是 409 + 一句服务端文案。这里换成新鲜的再发。
         const token = await fetchStateToken();
@@ -266,8 +272,7 @@ export function createMobileGitRequest(options: MobileGitRequestOptions): Mobile
         return (await callRaw(parsed.route, params)) as T;
       } catch (error) {
         if (error instanceof MobileGitError && error.code === "stale_state") {
-          // 换了新令牌还是过期 ⇒ 电脑上的仓库在这几百毫秒里真的变了
-          // （多半是 AI 正在跑、或者别处刚提交）。这一档是可恢复的：
+          // 仓库在令牌对应的快照之后变了，或令牌过期。这一档是可恢复的：
           // 让宿主去重载，并说清"已为你刷新、请确认后再提交"。
           //
           // 抛出去的那条错误**用同一句话**：宿主会拿它去比对，从而不在红色错误条里

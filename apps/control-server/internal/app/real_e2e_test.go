@@ -948,19 +948,19 @@ func TestRealE2EInstallCodexAndRequestGuards(t *testing.T) {
 	}
 	e2eSay(t, "边界：未知工具 404、未知主机 404、对本机授权 400")
 
-	// 旧路径（前端尚未迁完的薄委托）必须仍然可用，否则对话页的更新按钮会静默失效。
-	var legacyCheck e2eUpdateCheck
-	if status := e2eRequest(t, client, http.MethodPost, api("/api/runners/"+localID+"/claude/check-update"), nil, &legacyCheck); status != http.StatusOK {
-		t.Fatalf("旧的 /claude/check-update 返回 %d（薄委托坏了会让对话页的更新按钮静默失效）", status)
+	// 对话页与工具管理页共用泛化更新检查入口。
+	var claudeCheck e2eUpdateCheck
+	if status := e2eRequest(t, client, http.MethodPost, api("/api/runners/"+localID+"/agents/claude-code/check-update"), nil, &claudeCheck); status != http.StatusOK {
+		t.Fatalf("Claude 更新检查返回 %d", status)
 	}
-	if legacyCheck.Error != "" {
-		t.Fatalf("旧的 /claude/check-update 报错：%s", legacyCheck.Error)
+	if claudeCheck.Error != "" {
+		t.Fatalf("Claude 更新检查报错：%s", claudeCheck.Error)
 	}
 	if status := e2eRequest(t, client, http.MethodGet, api("/api/runners/"+localID+"/status"), nil, nil); status != http.StatusOK {
-		t.Fatalf("旧的 /status 返回 %d", status)
+		t.Fatalf("Runner /status 返回 %d", status)
 	}
-	e2eSay(t, "旧路径仍可用：/claude/check-update（当前 %s，最新 %s）与 /status",
-		legacyCheck.CurrentVersion, legacyCheck.LatestVersion)
+	e2eSay(t, "Claude 更新检查（当前 %s，最新 %s）与 Runner /status 正常",
+		claudeCheck.CurrentVersion, claudeCheck.LatestVersion)
 
 	// ── 8. 并发：CLI 安装进行中时，这台机器上别的写操作必须被挡住 ──────
 	//

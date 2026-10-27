@@ -2,12 +2,25 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+type conflictSuggestionResponseWriter struct {
+	*httptest.ResponseRecorder
+	afterWrite func([]byte)
+}
+
+func (writer conflictSuggestionResponseWriter) Write(body []byte) (int, error) {
+	n, err := writer.ResponseRecorder.Write(body)
+	writer.afterWrite(body)
+	return n, err
+}
 
 // TestProjectGitConflictResolveApi 覆盖冲突解决 REST 链路的端到端行为：
 // 冲突总览 → 单文件三方内容 → 采用 theirs 解决 → 完成 merge。
@@ -27,6 +40,10 @@ func TestProjectGitConflictResolveApi(t *testing.T) {
 	runGitForTest(t, repo, "commit", "-m", "main change")
 	runGitForTestExpectConflict(t, repo, "merge", "feature")
 	seedGitProjectForTest(t, server, "git-project", repo)
+	// 本测试的仓库就在测试进程所在机器上，不能在 Windows 上把它标成 WSL 项目。
+	if _, err := server.db.Exec(`update projects set runner=? where id='git-project'`, server.localRunnerID()); err != nil {
+		t.Fatal(err)
+	}
 
 	// 冲突总览：merge 上下文 + 一个冲突文件。
 	overview := httptest.NewRecorder()
@@ -58,6 +75,48 @@ func TestProjectGitConflictResolveApi(t *testing.T) {
 	if detail.Ours != "one\nmain\n" || detail.Theirs != "one\nfeature\n" {
 		t.Fatalf("three-way content mismatch: ours=%q theirs=%q", detail.Ours, detail.Theirs)
 	}
+	if len(detail.SuggestionAgents) != 6 {
+		t.Fatalf("conflict content must carry all local suggestion tools: %+v", detail.SuggestionAgents)
+	}
+
+	t.Run("cancel immediately after accepted response", func(t *testing.T) {
+		server.cursorRunner = runnerFunc(func(ctx context.Context, _ AgentRunRequest, sink AgentRunSink) error {
+			sink.AssistantText(`{"merged":"resolved"}`, "")
+			return ctx.Err()
+		})
+		var suggestionID string
+		response := conflictSuggestionResponseWriter{ResponseRecorder: httptest.NewRecorder(), afterWrite: func(body []byte) {
+			var data struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(body, &data); err != nil || data.ID == "" {
+				t.Fatalf("invalid suggestion response: %s", body)
+			}
+			suggestionID = data.ID
+			// 202 已经对客户端可见时，立刻发取消，不等后台运行启动。
+			cancel := httptest.NewRecorder()
+			server.routes().ServeHTTP(cancel, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/conflicts/suggestions/"+suggestionID+"/cancel", nil))
+			if cancel.Code != http.StatusAccepted {
+				t.Fatalf("cancel status=%d body=%s", cancel.Code, cancel.Body.String())
+			}
+		}}
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/projects/git-project/git/conflicts/suggest", strings.NewReader(`{"path":"readme.txt","agent":"cursor"}`)))
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("suggest status=%d body=%s", response.Code, response.Body.String())
+		}
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			record, ok := server.copyConflictSuggestion(suggestionID)
+			if ok && record.Status != gitConflictSuggestStatusRunning {
+				if record.Status != gitConflictSuggestStatusCancelled {
+					t.Fatalf("immediate cancellation was lost: status=%s error=%s", record.Status, record.ErrorMessage)
+				}
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("cancelled suggestion did not finish")
+	})
 
 	// 采用 theirs 解决。
 	summary := gitSummaryForTest(t, server, "git-project")

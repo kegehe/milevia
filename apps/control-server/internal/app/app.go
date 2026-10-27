@@ -1386,11 +1386,6 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/runners/{runnerID}/agents/{agentID}/diagnose", s.diagnoseAgentHandler)
 	r.Get("/api/runners/{runnerID}/diagnostics", s.listRunnerDiagnostics)
 	r.Post("/api/runners/{runnerID}/agents/{agentID}/repair", s.repairAgentHandler)
-	// 过渡路由：内部委托给上面两条，仅服务尚未切换的旧前端。切换完成后删除。
-	r.Post("/api/runners/{runnerID}/claude/check-update", s.checkClaudeUpdate)
-	r.Post("/api/runners/{runnerID}/claude/update", s.updateClaude)
-	r.Post("/api/runners/{runnerID}/codex/check-update", s.checkCodexUpdate)
-	r.Post("/api/runners/{runnerID}/codex/update", s.updateCodex)
 	r.Get("/api/directories", s.listDirectories)
 	r.Post("/api/directories/mkdir", s.createDirectory)
 	r.Post("/api/projects/validate", s.validateProject)
@@ -1426,6 +1421,9 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/push", s.gitPush)
 	r.Post("/api/projects/{projectID}/git/branches", s.gitCreateBranch)
 	r.Post("/api/projects/{projectID}/git/switch", s.gitSwitchBranch)
+	r.Get("/api/projects/{projectID}/git/stashes", s.gitStashes)
+	r.Post("/api/projects/{projectID}/git/stashes", s.gitStashCreate)
+	r.Post("/api/projects/{projectID}/git/stashes/apply", s.gitStashApply)
 	r.Get("/api/projects/{projectID}/git/conflicts", s.gitConflicts)
 	r.Get("/api/projects/{projectID}/git/conflicts/content", s.gitConflictContent)
 	r.Post("/api/projects/{projectID}/git/conflicts/resolve", s.gitConflictResolve)
@@ -3419,6 +3417,7 @@ func (s *Server) StartBackgroundMaintenance() {
 	s.startEventRetentionLoop()
 	// 出队表也要有上界：投递不出去的事件若无限堆积，会拖住整个中继（见该文件的说明）。
 	s.startRemoteOutboxRetentionLoop()
+	s.startNotificationRetentionLoop()
 	go func() {
 		maintenanceStarted := time.Now()
 		log.Printf("[maintenance] startup begin delay=%s", storageReclaimStartDelay)
@@ -5502,7 +5501,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		return Message{}, "", nil, http.StatusInternalServerError, err
 	}
 	// Do not hold a database transaction while waiting for either of these
-	// locks. updateClaude takes the maintenance lock before querying SQLite.
+	// locks. updateAgent takes the maintenance lock before querying SQLite.
 	s.projectLifecycleMu.Lock()
 	lifecycleLocked := true
 	defer func() {

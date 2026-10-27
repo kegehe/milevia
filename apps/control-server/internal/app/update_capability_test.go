@@ -72,7 +72,7 @@ func TestCheckUpdateAutoUpdatableDefaultsTrue(t *testing.T) {
 	server.runnerRegistry.register("auto-update-runner", runner, RunnerMeta{ID: "auto-update-runner"})
 
 	rec := httptest.NewRecorder()
-	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/runners/auto-update-runner/claude/check-update", nil))
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/runners/auto-update-runner/agents/claude-code/check-update", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -101,7 +101,7 @@ func TestCheckUpdateAutoUpdatableFalseForCrossEndRunner(t *testing.T) {
 	server.runnerRegistry.register("wsl-cross", runner, RunnerMeta{ID: "wsl-cross"})
 
 	rec := httptest.NewRecorder()
-	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-cross/claude/check-update", nil))
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/runners/wsl-cross/agents/claude-code/check-update", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -130,7 +130,7 @@ func TestCodexCheckUpdateAutoUpdatableFalseForCrossEndRunner(t *testing.T) {
 	server.runnerRegistry.register("codex-cross", autoUpdateUnsupportedCodexRunner{}, RunnerMeta{ID: "codex-cross"})
 
 	rec := httptest.NewRecorder()
-	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/runners/codex-cross/codex/check-update", nil))
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/runners/codex-cross/agents/codex/check-update", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}

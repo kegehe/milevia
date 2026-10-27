@@ -2,8 +2,9 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRe
 
 import { toast } from "sonner";
 
-import { changeState, commitFileStatusLabel, formatGitTime, groupChanges, isMergeCommit, shortOID, type GitBranch, type GitChange, type GitCommit, type GitCommitDetail, type GitCommitFile, type GitConflictOverview, type GitDiff, type GitOperation, type GitSnapshot } from "./git-model";
+import { changeState, commitFileStatusLabel, formatGitTime, groupChanges, isMergeCommit, shortOID, type GitBranch, type GitChange, type GitCommit, type GitCommitDetail, type GitCommitFile, type GitConflictOverview, type GitDiff, type GitOperation, type GitSnapshot, type GitStash } from "./git-model";
 import { ConflictSolveView } from "./ConflictSolveView";
+import { GitStashPanel } from "./GitStashPanel";
 import { useCodeFontSize } from "../files/useCodeFontSize";
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
@@ -39,11 +40,13 @@ function isGitStateChangedError(cause: unknown): boolean {
   if (!cause || typeof cause !== "object") return false;
   const error = cause as { status?: number; code?: string; message?: string };
   return error.status === 409
-    && (error.code === "git_state_changed" || error.message?.includes("Git state changed") === true || error.message?.includes("仓库状态") === true);
+    && (error.code === "git_state_changed" || error.code === "stale_state" || error.message?.includes("Git state changed") === true || error.message?.includes("仓库状态") === true);
 }
 type Confirmation =
   | { type: "commit" }
   | { type: "amend" }
+  | { type: "stash-create" }
+  | { type: "stash-apply"; stash: GitStash }
   | { type: "discard-worktree"; path: string; untracked: boolean }
   | { type: "discard-all" }
   | { type: "fetch"; remote: string }
@@ -57,7 +60,7 @@ type Confirmation =
 const HISTORY_PAGE_SIZE = 50;
 const OPS_PAGE_SIZE = 50;
 // 操作记录的筛选选项（types 与 git-model 的 GitOperationType 对齐）。
-const OPERATION_TYPE_VALUES = ["stage", "unstage", "stage_all", "unstage_all", "commit", "commit_amend", "discard_worktree", "discard_all", "fetch", "pull", "push", "create_branch", "switch_branch", "resolve_conflict", "conflict_abort", "conflict_continue"];
+const OPERATION_TYPE_VALUES = ["stage", "unstage", "stage_all", "unstage_all", "commit", "commit_amend", "discard_worktree", "discard_all", "fetch", "pull", "push", "create_branch", "switch_branch", "stash_create", "stash_apply", "resolve_conflict", "conflict_abort", "conflict_continue"];
 const OPERATION_STATUS_VALUES = ["queued", "running", "succeeded", "failed", "cancelled", "needs_attention"];
 
 const tabs: { id: Tab; label: string }[] = [
@@ -181,7 +184,16 @@ interface GitWorkbenchProps {
   onGitInitialized?: () => void | Promise<void>;
 }
 
-export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(function GitWorkbench({ projectID, conversationId, request, fail, active, mobile = false, initialIsGitRepo = true, onGitInitialized }, ref) {
+export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(function GitWorkbench(props, ref) {
+  const [channel, setChannel] = useState({ request: props.request, revision: 0 });
+  if (channel.request !== props.request) {
+    setChannel({ request: props.request, revision: channel.revision + 1 });
+  }
+  // 工作区切换后，旧确认框、令牌、列表与在飞操作的回调必须一起退出。
+  return <GitWorkbenchSession key={JSON.stringify([props.projectID, props.conversationId ?? "", channel.revision])} {...props} ref={ref} />;
+});
+
+const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(function GitWorkbenchSession({ projectID, conversationId, request, fail, active, mobile = false, initialIsGitRepo = true, onGitInitialized }, ref) {
   const [tab, setTab] = useState<Tab>("changes");
   const [snapshot, setSnapshot] = useState<GitSnapshot | null>(null);
   const [historyRevision, setHistoryRevision] = useState(0);
@@ -190,6 +202,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const [initializingRepo, setInitializingRepo] = useState(false);
   const [changes, setChanges] = useState<GitChange[]>([]);
   const [branches, setBranches] = useState<GitBranch[]>([]);
+  const [stashes, setStashes] = useState<GitStash[] | null>(null);
   const [operations, setOperations] = useState<GitOperation[]>([]);
   const [conflictOverview, setConflictOverview] = useState<GitConflictOverview | null>(null);
   // 冲突总览的**第三档：读不到**。没有它，"这次没读到"会被渲染成"没有冲突" ——
@@ -330,7 +343,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       // reconcile / probe **什么都不置**。在位的内容一步都不动 —— 这正是"停在页面上自动
       // 保持最新"与"一直闪"之间唯一的区别（首屏那句「正在读取仓库状态」就是那一闪，
       // 见下面 render 里的 loading 分支）。任何"后台刷新也要转个圈"的想法都会把它带回来。
-      const [nextSnapshot, nextBranches, nextOperations] = await Promise.all([
+      const [nextSnapshot, nextBranches, nextOperations, nextStashes] = await Promise.all([
         probeSnapshot ? Promise.resolve(probeSnapshot) : request<GitSnapshot>(withWorkspace(`${base}/summary`)),
         // 分支列表只在四种情况下要：首屏/手动刷新、用户正看着「分支」tab、刚做过分支操作、
         // 或刚切到那个 tab（`selectTab` 会把 `branches: true` 明确传进来 —— 切 tab 那一刻
@@ -345,6 +358,9 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
         // **写后对账照取**：那正是刚刚多出一条审计记录的时刻（红点该亮的也是那一刻），
         // 而且它由用户动作触发、频率低。**probe 不取** —— 它一次可能只有几百毫秒的间隔。
         full || reason === "reconcile" ? request<GitOperation[]>(withWorkspace(`${base}/operations`)) : null,
+        full || reason === "reconcile"
+          ? request<GitStash[]>(withWorkspace(`${base}/stashes`)).catch(() => null)
+          : undefined,
       ]);
       if (!mountedRef.current || requestID !== reloadRequest.current) return;
       snapshotRef.current = nextSnapshot;
@@ -352,16 +368,15 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       setChanges(nextSnapshot.changes ?? []);
       if (nextBranches) setBranches(nextBranches);
       if (nextOperations) setOperations(nextOperations);
+      if (nextStashes !== undefined) setStashes(nextStashes);
       // 主体已经落地：左栏可以显示了。**手动刷新的转圈也到此为止** ——
       // 下面那份冲突总览是这一组里最慢的一条，不该让"刷新"按钮跟着它多转半秒。
       setLoading(false);
       setRefreshing(false);
-      if (nextSnapshot.worktree.conflicted > 0) {
-        void loadConflicts();
-      } else {
-        setConflictOverview(null);
-        setConflictsState("ready");
-      }
+      // 文件冲突清零不代表 merge/rebase 已结束，Stash 门禁仍需真实操作上下文。
+      // 此请求单独落地，保持仓库摘要和文件列表不被它阻塞。
+      setConflictsState("loading");
+      void loadConflicts();
     } catch (cause) {
       // **整条 probe 链静默**（不只是它第一句话）：那是后台对账，用户没要求过它，
       // 网络抖一下就在他眼皮底下弹一条红条子是噪音 —— 判据用 reason，不用"领没领号"
@@ -430,6 +445,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
 
   const grouped = useMemo(() => groupChanges(changes), [changes]);
   const changeCount = changes.length;
+  const stashBlocked = conflictsState !== "ready" || (snapshot?.worktree.conflicted ?? 0) > 0 || Boolean(conflictOverview && conflictOverview.context.operationType !== "none") || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(snapshot?.head.oid ?? "");
   const trackedChangeCount = changes.filter((change) => !change.untracked).length;
   const untrackedChangeCount = changes.filter((change) => change.untracked).length;
   const openDiff = async (change: GitChange, stage: "worktree" | "index") => {
@@ -467,7 +483,8 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       if (isGitStateChangedError(cause)) {
         // 写入前的令牌已经过期时，先把清单和新令牌一起换回来，避免用户继续对着旧行重试。
         await reload("reconcile").catch(() => undefined);
-        if (mountedRef.current) fail("仓库状态已经变化，已刷新变更列表，请确认后再操作");
+        // 手机适配器已发送可恢复提示，沿用原文让宿主去重。
+        if (mountedRef.current) fail((cause as { code?: string }).code === "stale_state" && cause instanceof Error ? cause.message : "仓库状态已经变化，已刷新变更列表，请确认后再操作");
       } else if (mountedRef.current) {
         fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
       }
@@ -478,7 +495,7 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       // （`gitStateToken` 存着当时的 snapshot / changes / 每个文件的指纹）。新令牌要等
       // 对账把 summary 取回来才到手。这段窗口（本机 ~90ms，手机 ~350ms）里再发一次写，
       // 服务端判定的就是"仓库状态已变化"—— 电脑上对着同一行连点两下就能撞上，
-      // 而手机端不会（那边的适配器每次写之前都无条件换一个新令牌）。
+      // 手机端的一般写操作会先换新令牌；Stash 同样保留界面上的令牌来校验确认范围。
       //
       // 于是分工是：**反馈不等它，"能再点"等它。**
       // 失败与 needs_attention 同样要对这一次账：半途失败也会在电脑上留下痕迹。
@@ -502,6 +519,8 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const mutatePath = (action: "stage" | "unstage", path: string) => mutate(`${action}:${path}`, action, { paths: [path] });
   const stageAll = () => mutate("stage-all", "stage-all", {});
   const unstageAll = () => mutate("unstage-all", "unstage-all", {});
+  const stashCreate = (message: string) => mutate("stash-create", "stashes", { message }, () => setConfirmation(null));
+  const stashApply = (oid: string, restoreIndex: boolean) => mutate("stash-apply", "stashes/apply", { oid, restoreIndex }, () => setConfirmation(null));
   const commit = () => mutate("commit", "commits", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); }, { history: true });
   const commitAmend = () => mutate("commit_amend", "commits/amend", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); }, { history: true });
   const discardWorktree = (path: string, untracked: boolean) => mutate(`discard:${path}`, "discard", { mode: "worktree", paths: [path], includeUntracked: untracked }, () => setConfirmation(null));
@@ -621,11 +640,11 @@ export const GitWorkbench = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
           `loading` 只由首屏那一档置位（后台对账一概不置），所以它本身就等于
           "屏幕上这份数据不属于当前工作区"，不需要再加一个 snapshot 非空的限定。 */}
       {loading ? <GitSkeleton /> : !snapshot ? <div className="git-empty">无法读取仓库状态</div> : <>
-        {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
+        {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes stashPanel={<GitStashPanel stashes={stashes} busy={Boolean(mutating)} dirty={changeCount > 0} blocked={stashBlocked} hasHead={/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(snapshot.head.oid)} requestCreate={() => setConfirmation({ type: "stash-create" })} requestApply={(stash) => setConfirmation({ type: "stash-apply", stash })} />} grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
         {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} historyRevision={historyRevision} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch, remote) => setConfirmation({ type: "switch-branch", branch, remote })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
       </>}
     </main>
-    {confirmation && <GitConfirmation confirmation={confirmation} snapshot={snapshot} conflictOverview={conflictOverview} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} commitAmend={commitAmend} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pullRemote={pullRemote} pushBranch={pushBranch} switchBranch={switchBranch} abortConflict={abortConflict} finishConflict={finishConflict} />}
+    {confirmation && <GitConfirmation stashBlocked={stashBlocked} key={confirmation.type} stashCreate={stashCreate} stashApply={stashApply} requestStash={() => setConfirmation({ type: "stash-create" })} confirmation={confirmation} snapshot={snapshot} conflictOverview={conflictOverview} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} commitAmend={commitAmend} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pullRemote={pullRemote} pushBranch={pushBranch} switchBranch={switchBranch} abortConflict={abortConflict} finishConflict={finishConflict} />}
   </section>;
 });
 
@@ -770,7 +789,8 @@ function GitSkeleton() {
   </div>;
 }
 
-function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview, conflictsState, conflictPath, openConflict, closeConflict, resolveConflict, requestAbortConflict, requestFinishConflict, projectID, conversationId, request, fail, mobile, mutatePath, stageAll, unstageAll, requestDiscardWorktree, requestDiscardAll, requestCommit, requestAmend, commitMessage, setCommitMessage, mutating, changeCount }: {
+function Changes({ stashPanel, grouped, selectedDiff, openDiff, closeDiff, conflictOverview, conflictsState, conflictPath, openConflict, closeConflict, resolveConflict, requestAbortConflict, requestFinishConflict, projectID, conversationId, request, fail, mobile, mutatePath, stageAll, unstageAll, requestDiscardWorktree, requestDiscardAll, requestCommit, requestAmend, commitMessage, setCommitMessage, mutating, changeCount }: {
+  stashPanel: ReactNode;
   grouped: { staged: GitChange[]; worktree: GitChange[] };
   selectedDiff: GitDiff | null;
   openDiff: (change: GitChange, stage: "worktree" | "index") => Promise<void>;
@@ -822,6 +842,7 @@ function Changes({ grouped, selectedDiff, openDiff, closeDiff, conflictOverview,
       <section className="git-change-group"><header><h3>已暂存</h3><div className="git-group-actions"><span>{grouped.staged.length}</span><button type="button" className={`git-icon-btn${mutating === "unstage-all" ? " spinning" : ""}`} title={mutating === "unstage-all" ? "取消暂存中" : "全部取消暂存"} aria-label="全部取消暂存" disabled={mutating !== "" || grouped.staged.length === 0} onClick={unstageAll}>{mutating === "unstage-all" ? <PendingIcon /> : <UndoIcon />}</button></div></header><ChangeList changes={grouped.staged} stage="index" openDiff={openFile} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="没有已暂存变更" /></section>
       <CommitPanel stagedCount={grouped.staged.length} value={commitMessage} setValue={setCommitMessage} open={requestCommit} openAmend={requestAmend} disabled={mutating !== ""} />
       <section className="git-change-group"><header><h3>工作区</h3><div className="git-group-actions"><span>{grouped.worktree.length}</span><button type="button" className={`git-icon-btn${mutating === "stage-all" ? " spinning" : ""}`} title={mutating === "stage-all" ? "暂存中" : conflictedCount > 0 ? "存在冲突文件，请先逐个解决" : "全部暂存"} aria-label="全部暂存" disabled={mutating !== "" || grouped.worktree.length === 0 || conflictedCount > 0} onClick={stageAll}>{mutating === "stage-all" ? <PendingIcon /> : <PlusIcon />}</button><button type="button" className="git-icon-btn danger" title="撤销全部未提交改动" aria-label="撤销全部未提交改动" disabled={mutating !== "" || changeCount === 0} onClick={requestDiscardAll}><UndoIcon /></button></div></header><ChangeList changes={grouped.worktree} stage="worktree" openDiff={openFile} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="工作区没有变更" /></section>
+      {stashPanel}
     </div>
     <section className="git-changes-content" aria-label="文件内容">
       {/* 手机端是「列表 ⇄ 详情」两级推进（桌面端两栏并排，不需要这颗按钮）。
@@ -914,7 +935,11 @@ export function CommitPanel({ stagedCount, value, setValue, open, openAmend, dis
     <footer><div className="git-commit-meta"><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span>{stagedCount === 0 ? null : <span className={`git-commit-subject-count${subjectOverLimit ? " over" : ""}`} title={`提交信息首行的字符数，上限 ${MAX_COMMIT_SUBJECT_LENGTH}`}>首行 {subjectLength}/{MAX_COMMIT_SUBJECT_LENGTH}</span>}</div><div className="git-commit-actions"><button type="button" className="secondary git-amend-btn" title="修改最近一次提交" disabled={disabled || !value.trim() || subjectOverLimit} onClick={openAmend}>修改最近一次提交</button></div><button type="button" className="primary git-commit-submit" disabled={disabled || stagedCount === 0 || !value.trim() || subjectOverLimit} onClick={open}>{stagedCount === 0 ? "提交" : `提交 ${stagedCount} 个已暂存文件`}</button></footer></section>;
 }
 
-function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, commitAmend, discardWorktree, discardAll, fetchRemote, pullRemote, pushBranch, switchBranch, abortConflict, finishConflict }: {
+function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, confirmation, snapshot, conflictOverview, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, commitAmend, discardWorktree, discardAll, fetchRemote, pullRemote, pushBranch, switchBranch, abortConflict, finishConflict }: {
+  stashBlocked: boolean;
+  stashCreate: (message: string) => void;
+  stashApply: (oid: string, restoreIndex: boolean) => void;
+  requestStash: () => void;
   confirmation: Confirmation;
   snapshot: GitSnapshot | null;
   conflictOverview: GitConflictOverview | null;
@@ -936,6 +961,12 @@ function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount
   finishConflict: () => void;
 }) {
   const [includeUntracked, setIncludeUntracked] = useState(confirmation.type === "discard-all" && untrackedChangeCount > 0 && trackedChangeCount === 0);
+  const [stashMessage, setStashMessage] = useState("");
+  const [restoreIndex, setRestoreIndex] = useState(true);
+  const isStashCreate = confirmation.type === "stash-create";
+  const isStashApply = confirmation.type === "stash-apply";
+  const isStash = isStashCreate || isStashApply;
+  const dirty = trackedChangeCount + untrackedChangeCount > 0;
   const isCommit = confirmation.type === "commit";
   const isAmend = confirmation.type === "amend";
   const isFetch = confirmation.type === "fetch";
@@ -947,13 +978,15 @@ function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount
   const isDestructive = confirmation.type === "discard-worktree" || confirmation.type === "discard-all" || isAbort;
   const operationVerb = conflictOperationVerb(conflictOverview?.context?.operationType);
   const context = conflictOverview?.context;
-  const title = isCommit ? "确认提交" : isAmend ? "确认修改提交" : isFetch ? "获取远端更新" : isPull ? "拉取远端更新" : isPush ? "推送到远端" : isSwitch ? "切换分支" : isAbort ? `中止${operationVerb}并还原` : isFinish ? `完成${operationVerb}` : confirmation.type === "discard-all" ? "丢弃全部未提交改动" : confirmation.type === "discard-worktree" && confirmation.untracked ? "删除未跟踪文件" : "撤销工作区更改";
+  const title = isStashCreate ? "收起改动（Stash）" : isStashApply ? "恢复收起的改动" : isCommit ? "确认提交" : isAmend ? "确认修改提交" : isFetch ? "获取远端更新" : isPull ? "拉取远端更新" : isPush ? "推送到远端" : isSwitch ? "切换分支" : isAbort ? `中止${operationVerb}并还原` : isFinish ? `完成${operationVerb}` : confirmation.type === "discard-all" ? "丢弃全部未提交改动" : confirmation.type === "discard-worktree" && confirmation.untracked ? "删除未跟踪文件" : "撤销工作区更改";
   const isUntracked = confirmation.type === "discard-worktree" && confirmation.untracked;
   const discardPath = confirmation.type === "discard-worktree" ? confirmation.path : "";
   const riskLabel = confirmation.type === "discard-worktree" && !confirmation.untracked ? "工作区内容将恢复到暂存版本" : isAbort ? `当前${operationVerb}产生的所有改动都会丢弃，仓库将还原到操作前状态` : "此操作无法在页面中撤销";
-  const categoryLabel = isCommit || isAmend ? "本地提交" : isFetch || isPull ? "远端操作" : isPush ? "远端操作" : isSwitch ? "分支操作" : isAbort || isFinish ? "冲突处理" : "高风险操作";
+  const categoryLabel = isStash ? "临时保存" : isCommit || isAmend ? "本地提交" : isFetch || isPull ? "远端操作" : isPush ? "远端操作" : isSwitch ? "分支操作" : isAbort || isFinish ? "冲突处理" : "高风险操作";
   const confirm = () => {
-    if (confirmation.type === "commit") commit();
+    if (confirmation.type === "stash-create") stashCreate(stashMessage);
+    else if (confirmation.type === "stash-apply") stashApply(confirmation.stash.oid, restoreIndex);
+    else if (confirmation.type === "commit") commit();
     else if (confirmation.type === "amend") commitAmend();
     else if (confirmation.type === "discard-all") discardAll(includeUntracked);
     else if (confirmation.type === "discard-worktree") discardWorktree(confirmation.path, confirmation.untracked);
@@ -964,18 +997,20 @@ function GitConfirmation({ confirmation, snapshot, conflictOverview, stagedCount
     else if (confirmation.type === "conflict-abort") abortConflict();
     else if (confirmation.type === "conflict-finish") finishConflict();
   };
-  const confirmLabel = busy ? "处理中" : isCommit ? "确认提交" : isAmend ? "确认修改" : isFetch ? "确认获取" : isPull ? "确认拉取" : isPush ? "确认推送" : isSwitch ? "确认切换" : isAbort ? "确认中止" : isFinish ? `确认完成${operationVerb}` : isUntracked ? "确认删除" : "确认撤销";
+  const confirmLabel = busy ? "处理中" : isStashCreate ? "确认收起" : isStashApply ? "确认恢复" : isCommit ? "确认提交" : isAmend ? "确认修改" : isFetch ? "确认获取" : isPull ? "确认拉取" : isPush ? "确认推送" : isSwitch ? "确认切换" : isAbort ? "确认中止" : isFinish ? `确认完成${operationVerb}` : isUntracked ? "确认删除" : "确认撤销";
   return <div className="backdrop git-confirmation-backdrop" role="dialog" aria-modal="true" aria-labelledby="git-confirmation-title"><section className={`modal git-confirmation-dialog${isDestructive ? " destructive" : ""}`}><header><div><span>{categoryLabel}</span><h2 id="git-confirmation-title">{title}</h2></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><CloseIcon /></button></header><div className="git-confirmation-body">
-    {confirmation.type === "commit" ? <><p className="git-confirmation-lead">将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交，包含 {stagedCount} 个已暂存文件。</p><pre>{commitMessage}</pre></>
+    {confirmation.type === "stash-create" ? <><p className="git-confirmation-lead">将保存已暂存、未暂存改动及未跟踪文件，并从当前工作区收起。忽略文件不会收起。</p><div className="git-confirmation-scope"><span>保存内容</span><b>{trackedChangeCount} 个受跟踪文件、{untrackedChangeCount} 个未跟踪文件</b><small>之后可在同一仓库的 Stash 列表中恢复，包括原来的暂存状态。</small></div><label className="git-stash-message">说明（可选）<input value={stashMessage} maxLength={200} disabled={busy} placeholder="例如：切换分支前的进行中改动" onChange={(event) => setStashMessage(event.target.value)} /></label></>
+      : confirmation.type === "stash-apply" ? <><p className="git-confirmation-lead">将以下 Stash 恢复到 <b>{snapshot?.head.branch || "当前 HEAD"}</b>{restoreIndex ? "，并还原暂存状态。" : "，不要求还原原来的暂存区。"}</p><pre>{confirmation.stash.subject}</pre><label className="git-confirmation-check"><input type="checkbox" checked={restoreIndex} disabled={busy} onChange={(event) => setRestoreIndex(event.target.checked)} />恢复原有暂存状态</label><div className="git-confirmation-scope"><span>操作说明</span><b>恢复后保留 Stash 备份</b><small>跨分支恢复时，如果原有暂存状态无法还原，可取消勾选后重试。如果出现冲突，请在工作区解决；备份仍可用于找回改动。</small></div></>
+      : confirmation.type === "commit" ? <><p className="git-confirmation-lead">将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交，包含 {stagedCount} 个已暂存文件。</p><pre>{commitMessage}</pre></>
       : confirmation.type === "amend" ? <><div className="git-confirmation-risk"><span>注意</span><p>修改最近一次提交会改写本地历史。若已推送到远端，普通推送会被拒绝（需强制推送）。</p></div><p className="git-confirmation-lead">将 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 的最近一次提交改写为：</p><pre>{commitMessage}</pre>{stagedCount > 0 ? <div className="git-confirmation-scope"><span>操作说明</span><b>已暂存的 {stagedCount} 个文件改动会一并并入该提交</b></div> : <div className="git-confirmation-scope"><span>操作说明</span><b>无已暂存改动，仅重写提交信息</b></div>}</>
       : confirmation.type === "fetch" ? <><p className="git-confirmation-lead">从 <b>{confirmation.remote}</b> 获取最新更新。</p><div className="git-confirmation-scope"><span>操作说明</span><b>更新远端引用并清理已删除的分支引用</b><small>工作树不会改变</small></div></>
       : confirmation.type === "pull" ? <><p className="git-confirmation-lead">从 <b>{confirmation.remote}</b> 拉取 <b>{confirmation.branch}</b> 并合并最新更新。</p><div className="git-confirmation-scope"><span>操作说明</span><b>仅允许快进合并，历史分叉时会失败以保护提交</b><small>有未提交改动时，冲突文件可能导致拉取失败</small></div></>
       : confirmation.type === "push" ? <><p className="git-confirmation-lead">将 <b>{confirmation.branch}</b> 推送到 <b>{confirmation.remote}</b>。</p><div className="git-confirmation-scope"><span>操作说明</span><b>仅允许普通推送，non-fast-forward 将被拒绝</b>{confirmation.setUpstream ? <small>将同时设置上游跟踪</small> : null}</div></>
-      : confirmation.type === "switch-branch" ? <><div className="git-confirmation-risk"><span>注意</span><p>切换分支前需确保工作区干净且无进行中的 AI 任务。</p></div><p className="git-confirmation-lead">{confirmation.remote ? <>将从远端分支 <b>{confirmation.branch}</b> 检出并切换到本地跟踪分支。</> : <>将切换到分支 <b>{confirmation.branch}</b>。</>}</p><div className="git-confirmation-scope"><span>当前分支</span><b>{snapshot?.head.branch || "HEAD"}</b></div></>
+      : confirmation.type === "switch-branch" ? <><div className="git-confirmation-risk"><span>注意</span><p>切换分支前需确保工作区干净且无进行中的 AI 任务。有改动时可先收起改动（Stash）。</p></div><p className="git-confirmation-lead">{confirmation.remote ? <>将从远端分支 <b>{confirmation.branch}</b> 检出并切换到本地跟踪分支。</> : <>将切换到分支 <b>{confirmation.branch}</b>。</>}</p><div className="git-confirmation-scope"><span>当前分支</span><b>{snapshot?.head.branch || "HEAD"}</b></div></>
       : confirmation.type === "conflict-abort" ? <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{context && context.operationType !== "none" ? <p className="git-confirmation-lead">正在{operationVerb} <b>{context.theirsLabel || ""} → {context.oursLabel}</b>，中止后将回到操作前状态。</p> : <p className="git-confirmation-lead">将中止当前冲突操作并丢弃所有已做解决的改动。</p>}</>
       : confirmation.type === "conflict-finish" ? <><p className="git-confirmation-lead">所有冲突文件都已解决，将{operationVerb} <b>{context?.theirsLabel || ""} → {context?.oursLabel || ""}</b> 并结束本次操作。</p><div className="git-confirmation-scope"><span>操作说明</span><b>解决结果会以{operationVerb}提交的形式保留</b></div></>
       : <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{confirmation.type === "discard-all" ? <><p className="git-confirmation-lead">已暂存和工作区中的受跟踪改动都会恢复到 <code>HEAD</code>。</p><div className="git-confirmation-scope"><span>受影响内容</span><b>{trackedChangeCount} 个受跟踪文件</b>{untrackedChangeCount > 0 ? <small>另有 {untrackedChangeCount} 个未跟踪文件可选删除</small> : null}</div><label className="git-confirmation-check"><input type="checkbox" checked={includeUntracked} onChange={(event) => setIncludeUntracked(event.target.checked)} />同时删除未跟踪文件</label></> : <><p className="git-confirmation-lead">{isUntracked ? "将永久删除以下未跟踪文件。" : "将以下文件恢复到暂存版本，已暂存内容不会改变。"}</p><code className="git-confirmation-path">{discardPath}</code></>}</>}
-  </div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button type="button" className={isDestructive ? "primary danger" : "primary"} disabled={busy} onClick={confirm}>{confirmLabel}</button></footer></section></div>;
+  </div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button>{isSwitch && dirty ? <button type="button" className="secondary" disabled={busy || stashBlocked} onClick={requestStash}>先收起改动</button> : null}<button type="button" className={isDestructive ? "primary danger" : "primary"} disabled={busy || (isStash && stashBlocked) || (isStashApply && dirty) || (isStashCreate && !dirty)} onClick={confirm}>{confirmLabel}</button></footer></section></div>;
 }
 
 async function copyToClipboard(text: string): Promise<boolean> {
@@ -1252,6 +1287,6 @@ function Branches({ branches, historyRevision, mutating, projectID, conversation
 
 function operationStatusLabel(status: string): string { return ({ queued: "等待中", running: "进行中", succeeded: "已完成", failed: "失败", cancelled: "已取消", needs_attention: "需检查" })[status] || status; }
 
-function operationTypeLabel(type: string): string { return ({ stage: "暂存", unstage: "取消暂存", stage_all: "全部暂存", unstage_all: "全部取消暂存", commit: "提交", commit_amend: "修改提交", discard_worktree: "撤销工作区改动", discard_all: "丢弃全部改动", fetch: "获取", pull: "拉取", push: "推送", create_branch: "创建分支", switch_branch: "切换分支", resolve_conflict: "解决冲突", conflict_abort: "中止操作", conflict_continue: "完成操作" })[type] || type; }
+function operationTypeLabel(type: string): string { return ({ stage: "暂存", unstage: "取消暂存", stage_all: "全部暂存", unstage_all: "全部取消暂存", commit: "提交", commit_amend: "修改提交", discard_worktree: "撤销工作区改动", discard_all: "丢弃全部改动", fetch: "获取", pull: "拉取", push: "推送", create_branch: "创建分支", switch_branch: "切换分支", stash_create: "收起改动", stash_apply: "恢复 Stash", resolve_conflict: "解决冲突", conflict_abort: "中止操作", conflict_continue: "完成操作" })[type] || type; }
 
 function Operations({ operations, loading = false }: { operations: GitOperation[]; loading?: boolean }) { if (loading && operations.length === 0) return <div className="git-empty">正在读取操作记录</div>; if (operations.length === 0) return <div className="git-empty">暂无操作记录</div>; return <div className="git-operations">{operations.map((operation) => <article key={operation.id}><span className={`git-operation-status ${operation.status}`}>{operationStatusLabel(operation.status)}</span><div><b>{operationTypeLabel(operation.type)}</b><p>{operation.requestSummary}</p>{operation.errorMessage ? <small>{operation.errorMessage}</small> : null}</div><time title={operation.finishedAt || operation.startedAt || operation.requestedAt}>{formatGitTime(operation.finishedAt || operation.startedAt || operation.requestedAt)}</time></article>)}</div>; }

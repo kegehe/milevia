@@ -4,7 +4,7 @@ import "net/http"
 
 // 手机端能执行的全部 **Git** 操作。名单类型与合成逻辑在 remote_relay.go。
 //
-// 这 28 条是电脑端 Git 工作台的全部 REST 端点（app.go 里 /api/projects/{projectID}/git/*
+// 这些操作对应电脑端 Git 工作台的 REST 端点（app.go 里 /api/projects/{projectID}/git/*
 // 那一组），一条不多一条不少：手机端要整块复用 GitWorkbench，就得让它发出的每个请求
 // 都有对应的 op —— 少一条的症状是那个 tab 静默空白。
 //
@@ -75,6 +75,9 @@ func (s *Server) remoteGitOperations() map[string]remoteOperation {
 		// ── 分支 ────────────────────────────────────────────────────────────────
 		"git.createBranch": {Method: http.MethodPost, Path: "/git/branches", Handle: s.gitCreateBranch},
 		"git.switch":       {Method: http.MethodPost, Path: "/git/switch", Handle: s.gitSwitchBranch},
+		"git.stashes":      {Method: http.MethodGet, Path: "/git/stashes", Query: true, MaxBytes: 256 << 10, Label: "Stash 列表", Handle: s.gitStashes},
+		"git.stashCreate":  {Method: http.MethodPost, Path: "/git/stashes", Handle: s.gitStashCreate},
+		"git.stashApply":   {Method: http.MethodPost, Path: "/git/stashes/apply", Handle: s.gitStashApply},
 
 		// ── 冲突（写）──────────────────────────────────────────────────────────
 		"git.conflictResolve":  {Method: http.MethodPost, Path: "/git/conflicts/resolve", Handle: s.gitConflictResolve},
