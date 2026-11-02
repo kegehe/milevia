@@ -234,6 +234,7 @@ func (s *Server) registerMCPRoutes(r chi.Router) {
 	r.Get("/api/mcp/oauth/flows/{flowID}", s.getMCPOAuthFlow)
 	r.Delete("/api/mcp/oauth/flows/{flowID}", s.cancelMCPOAuthFlow)
 	r.Get(mcpOAuthCallbackPath, s.handleMCPOAuthCallback)
+	r.Get(mcpOAuthShortCallbackPath, s.handleMCPOAuthCallback)
 	r.Get("/api/mcp/oauth/prepare/{flowID}", s.mcpOAuthPreparePage)
 	r.Get("/api/mcp/oauth/prepare/{flowID}/status", s.mcpOAuthPrepareStatus)
 	// 调用审计（P2）。
@@ -312,22 +313,12 @@ func normalizeMCPEnvironments(values []string) []string {
 	return out
 }
 
-func normalizeMCPAgents(values []string) []string {
-	seen := map[string]bool{}
-	out := []string{}
-	for _, v := range values {
-		v = strings.TrimSpace(v)
-		if !validProfileAgent(v) {
-			continue
-		}
-		if seen[v] {
-			continue
-		}
-		seen[v] = true
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
+// mcpAgentAll 表示这条 MCP 对全部 CLI 生效，包括以后才加进目录的工具。
+// 不在保存时抄一份当时的工具名单：那份名单会把新工具永久排除在外。
+const mcpAgentAll = "*"
+
+func normalizeMCPAgents([]string) []string {
+	return []string{mcpAgentAll}
 }
 
 func (input *mcpServerInput) normalize() {
@@ -1366,6 +1357,34 @@ const mcpGitHubRemoteURL = "https://api.githubcopilot.com/mcp/"
 // mcpGitHubDocsURL 是官方仓库，两种形态都指向这里。
 const mcpGitHubDocsURL = "https://github.com/github/github-mcp-server"
 
+// mcpQQMailRemoteURL 是 QQ 邮箱官方远程 MCP（2026-11-02 实测）。
+//
+// 未授权的 initialize 返回 401，WWW-Authenticate 指向
+// https://api.mail.qq.com/.well-known/oauth-protected-resource；
+// 授权服务器 https://wx.mail.qq.com 公布 authorization_code、PKCE S256
+// 与动态客户端注册，和本服务的 OAuth 发现路径一致。
+// 这是个人 QQ 邮箱，不是 agent.qq.com 上的 Agent Mail。
+const mcpQQMailRemoteURL = "https://api.mail.qq.com/mcp"
+
+// mcpQQMailDocsURL 是 QQ 邮箱官方的「授权访问」说明。
+const mcpQQMailDocsURL = "https://help.mail.qq.com/detail/0/1034"
+
+// mcpFeishuRemoteURL 是飞书官方远程 MCP（2026-11-02 实测）。
+//
+// 保护资源元数据在 https://mcp.feishu.cn/.well-known/oauth-protected-resource/mcp，
+// 授权服务器 https://accounts.feishu.cn/mcp 支持授权码、PKCE S256 与动态客户端注册。
+const mcpFeishuRemoteURL = "https://mcp.feishu.cn/mcp"
+
+const mcpFeishuDocsURL = "https://open.feishu.cn/document/mcp_open_tools/developers-call-remote-mcp-server"
+
+// mcpTencentDocsRemoteURL 是腾讯文档官方远程 MCP（2026-11-02 实测）。
+//
+// 元数据在资源路径末尾，不在 RFC 9728 的「.well-known 之后接路径」那种位置。
+// 授权服务器是 https://docs.qq.com，权限范围为用户自己的文档。
+const mcpTencentDocsRemoteURL = "https://docs.qq.com/openapi/mcp"
+
+const mcpTencentDocsDocsURL = "https://docs.qq.com/open/document/mcp/tool-introduce/"
+
 // mcpPresetEnvironmentsAll 是所有目录条目共用的适用环境。
 //
 // 远程托管形态天然环境无关；本地形态的实际可用性由「运行时依赖检查」在目标环境实测回答，
@@ -1394,7 +1413,8 @@ func mcpPresetCatalog() []mcpPreset {
 		DocsURL:     "https://github.com/settings/tokens",
 	}}
 
-	// 「常用服务」：远程托管 + OAuth，用户只需点一次浏览器授权（或填一个凭据）。
+	// 「常用服务」：一个公共官方地址，用户点一次用自己的账号授权。
+	// 没有公共端点、要每个云账号自己领取地址的服务（如阿里云 OpenAPI MCP）不进目录。
 	// 2026-09-24 起「本机运行」分组暂时下线（先只做远程托管），见目录分组处的注释。
 	common := []mcpPreset{
 		mcpRemotePreset("notion", "notion", "Notion", "读写你的 Notion 页面与数据库", "docs",
@@ -1410,7 +1430,14 @@ func mcpPresetCatalog() []mcpPreset {
 			}}, "https://docs.stripe.com/mcp"),
 	}
 
-	common = append(common, mcpRemotePreset("aliyun", "aliyun", "阿里云", "查询阿里云资源、配额、监控和审计信息", "cloud", "https://api.aliyun.com/mcp", true, nil, "https://help.aliyun.com/zh/openapi/user-guide/openapi-mcp-server-guide"))
+	common = append(common,
+		mcpRemotePreset("qqmail", "qqmail", "QQ邮箱", "查看、搜索与发送 QQ 邮箱里的邮件", "mail",
+			mcpQQMailRemoteURL, true, nil, mcpQQMailDocsURL),
+		mcpRemotePreset("feishu", "feishu", "飞书", "查看与编辑你的飞书文档和消息", "chat",
+			mcpFeishuRemoteURL, true, nil, mcpFeishuDocsURL),
+		mcpRemotePreset("tencent-docs", "tencent-docs", "腾讯文档", "查看与编辑你的腾讯文档", "docs",
+			mcpTencentDocsRemoteURL, true, nil, mcpTencentDocsDocsURL),
+	)
 	return common
 }
 
@@ -1455,8 +1482,7 @@ func (s *Server) getProjectMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target := s.resolveAgentTargetEnv(project.RunnerID, project.Path)
-	// 生效列表与注入一样是「按 Agent」的：以前固定按 claude-code 算，会话用 Codex/
-	// OpenCode 时界面展示的与实际注入的可以完全不同。允许显式指定，默认 claude-code。
+	// 生效列表不再按 CLI 过滤。agentId 只保留给旧的查看参数，默认 claude-code。
 	agentID := strings.TrimSpace(r.URL.Query().Get("agentId"))
 	if agentID == "" {
 		agentID = "claude-code"
@@ -1526,7 +1552,11 @@ func (s *Server) getProjectMCP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
-// selectMCPServers 解析一条项目在指定 Agent + 目标环境下实际生效的 MCP 定义。
+// selectMCPServers 解析一条项目在目标环境下实际生效的 MCP 定义。
+//
+// 不按保存时的 CLI 名单过滤。连接一次即对当前和以后的全部 CLI 生效；
+// 某个工具能不能真正注入，由 prepareMCPInjection 按它的注入通道决定。
+// agentID 保留在签名里，供调用方标明这一轮是哪个工具，筛选本身不使用它。
 // project 作用域覆盖同名 global 定义。
 func (s *Server) selectMCPServers(ctx context.Context, projectID, agentID string, target agentTargetEnv) ([]storedMCPServer, error) {
 	// 注意：SQLite 以 SetMaxOpenConns(1) 运行，必须在打开 rows 之前把绑定查完，
@@ -1548,7 +1578,7 @@ func (s *Server) selectMCPServers(ctx context.Context, projectID, agentID string
 		if err != nil {
 			return nil, err
 		}
-		if !containsString(stored.Environments, string(target)) || !containsString(stored.Agents, agentID) {
+		if !containsString(stored.Environments, string(target)) {
 			continue
 		}
 		if disabled[stored.ID] {

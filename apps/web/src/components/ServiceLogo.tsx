@@ -37,7 +37,9 @@ const LOGOS: Readonly<Record<ServiceLogoKey, string>> = {
   stripe: stripeLogo,
   playwright: playwrightLogo,
   context7: context7Logo,
-  aliyun: "https://www.aliyun.com/favicon.ico",
+  qqmail: "https://mail.qq.com/favicon.ico",
+  feishu: "https://www.feishu.cn/favicon.ico",
+  "tencent-docs": "https://docs.idqqimg.com/tim/docs/desktop/favicon.ico",
 };
 
 /** 白名单内渲染官方图标；白名单外渲染调用方给的回落（页面原有的示意图标）。 */

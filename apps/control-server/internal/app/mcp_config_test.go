@@ -317,7 +317,7 @@ func TestPrepareMCPInjectionWindows(t *testing.T) {
 	}
 }
 
-func TestPrepareMCPInjectionFiltersEnvironmentAndAgent(t *testing.T) {
+func TestPrepareMCPInjectionFiltersEnvironmentButNotAgent(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 	projectID := "proj-filter"
@@ -332,11 +332,11 @@ func TestPrepareMCPInjectionFiltersEnvironmentAndAgent(t *testing.T) {
 	if injection.JSON != "" {
 		t.Fatalf("expected no injection for non-matching environment, got %s", injection.JSON)
 	}
-	// 仅适用于 codex → P0 的 Claude 路径不注入。
+	// 旧数据只标了 codex，Claude 会话也要注入。CLI 名单不再做筛选。
 	insertTestMCPServer(t, s, "codex-only", mcpScopeGlobal, "", mcpTransportStdio, "npx", nil, []string{"windows"}, []string{"codex"})
 	injection = s.prepareMCPInjection(ctx, projectID, projectPath, "claude-code", s.localRunnerID(), "run-2")
-	if injection.JSON != "" {
-		t.Fatalf("expected no injection for non-matching agent, got %s", injection.JSON)
+	if !strings.Contains(injection.JSON, "codex-only") {
+		t.Fatalf("已连接的 MCP 应按环境注入到当前 CLI，got %s", injection.JSON)
 	}
 }
 

@@ -372,10 +372,10 @@ type Server struct {
 	// commandCatalogMu 保护按「项目 + 工具」分开的命令目录缓存（见 project_commands.go）。
 	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
 	// 串行地拉起一次探针进程。不能收成一个槽：Qoder 和 Claude 的命令名不是同一套。
-	commandCatalogMu sync.Mutex
-	commandCatalogs  map[string]*commandCatalogEntry
-	commandProbeMu      sync.Mutex
-	projectLifecycleMu  sync.Mutex
+	commandCatalogMu   sync.Mutex
+	commandCatalogs    map[string]*commandCatalogEntry
+	commandProbeMu     sync.Mutex
+	projectLifecycleMu sync.Mutex
 	// checkpointLocks 串行化同一会话上的快照类 git 操作（见 checkpoint.go 的 checkpointLockSet）。
 	checkpointLocks        checkpointLockSet
 	sshMu                  sync.Mutex
@@ -1685,7 +1685,7 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		// carry the desktop session header. It is guarded by the per-flow random
 		// state instead: redeeming the authorization code requires a state value
 		// that only the flow initiator and this server know.
-		if r.URL.Path == mcpOAuthCallbackPath {
+		if r.URL.Path == mcpOAuthCallbackPath || r.URL.Path == mcpOAuthShortCallbackPath {
 			next.ServeHTTP(w, r)
 			return
 		}

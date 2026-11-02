@@ -26,6 +26,7 @@ import {
 } from "../features/updater/update-view";
 import { readMobileAppInfo } from "../features/updater/mobile-update";
 import { formatAppVersion } from "../features/updater/android-release";
+import { IcpFooter } from "../components/IcpFooter";
 import "./settings.css";
 
 type InstallUpdateResult = { installed: boolean };
@@ -545,6 +546,7 @@ export default function SettingsPage() {
               ? <button type="button" className="primary" disabled={settingsInstallDisabled(updaterStatus, checkingUpdate, installingUpdate)} onClick={() => void installUpdate()}>{settingsInstallLabel(updaterStatus, installingUpdate)}</button>
               : <span className="settings-value">v{updaterStatus?.appVersion ?? "-"}</span>}
           </SettingCard>}
+          <IcpFooter className="settings-icp" />
         </div>}
       </div>
     </div>

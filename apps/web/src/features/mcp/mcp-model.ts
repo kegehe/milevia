@@ -286,14 +286,13 @@ export type MCPDraftServerPayload = {
 
 // buildDraftServerPayload 把「目录条目 + 用户只填的那一项 + 是否信任」拼成创建请求。
 //
-// 关键点是**默认值全给上**：作用域取全局、适用环境与 Agent 取全部、保存即启用 ——
+// 关键点是**默认值全给上**：作用域取全局、适用环境取全部、对所有 CLI 生效、保存即启用。
 // 这些问题用户答不出来，也不该由他答。密钥走 *Secrets 字段，交给服务端在保存时加密。
 export function buildDraftServerPayload(
   preset: MCPPreset,
   secrets: MCPSecretInput,
   trust: boolean,
   environments: string[],
-  agents: string[],
 ): MCPDraftServerPayload {
   const probe = draftProbeValues(preset, secrets);
   return {
@@ -311,7 +310,8 @@ export function buildDraftServerPayload(
     scope: "global",
     projectId: "",
     environments,
-    agents,
+    // "*" 表示全部 CLI，包括以后才加进来的工具。不在这里抄一份当时的名单。
+    agents: ["*"],
     enabled: true,
     // 「以后不用再问我」= 放行该服务的全部工具，与工具级白名单共用同一套语法。
     autoApproveTools: trust ? [`mcp__${preset.name}__*`] : [],
@@ -346,7 +346,9 @@ export const SERVICE_LOGO_KEYS = [
   "stripe",
   "playwright",
   "context7",
-  "aliyun",
+  "qqmail",
+  "feishu",
+  "tencent-docs",
 ] as const;
 export type ServiceLogoKey = (typeof SERVICE_LOGO_KEYS)[number];
 
@@ -371,8 +373,12 @@ export function serviceLogoKey(presetName: string): ServiceLogoKey | null {
       return "playwright";
     case "context7":
       return "context7";
-    case "aliyun":
-      return "aliyun";
+    case "qqmail":
+      return "qqmail";
+    case "feishu":
+      return "feishu";
+    case "tencent-docs":
+      return "tencent-docs";
     default:
       return null;
   }

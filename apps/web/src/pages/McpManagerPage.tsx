@@ -23,14 +23,6 @@ const ENVIRONMENT_OPTIONS: { id: string; label: string }[] = [
   { id: "remote-linux", label: "SSH 远端" },
 ];
 
-const AGENT_OPTIONS: { id: string; label: string }[] = [
-  { id: "claude-code", label: "Claude Code" },
-  { id: "codex", label: "Codex" },
-  { id: "codebuddy", label: "CodeBuddy" },
-  { id: "qoder", label: "Qoder" },
-  { id: "opencode", label: "OpenCode" },
-];
-
 function McpIcon({ className = "ssh-icon" }: { className?: string }) {
   return <svg className={className} viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5" /><rect x="13" y="13" width="7" height="7" rx="1.5" /><path d="M11 7.5h4.5a1.5 1.5 0 0 1 1.5 1.5V11M13 16.5H8.5A1.5 1.5 0 0 1 7 15v-2" /></svg>;
 }
@@ -64,6 +56,8 @@ function PresetIcon({ name }: { name?: string }) {
       return <svg className="mcp-service-icon" viewBox="0 0 24 24" aria-hidden="true" {...common}><path d="M12 4l8.5 15.5h-17z" /><path d="M12 10v4M12 16.6v.4" /></svg>;
     case "chat":
       return <svg className="mcp-service-icon" viewBox="0 0 24 24" aria-hidden="true" {...common}><path d="M4 6h16v9H9.5L4 19z" /></svg>;
+    case "mail":
+      return <svg className="mcp-service-icon" viewBox="0 0 24 24" aria-hidden="true" {...common}><rect x="3.5" y="5.5" width="17" height="13" rx="2" /><path d="m4 7 8 6 8-6" /></svg>;
     case "pay":
       return <svg className="mcp-service-icon" viewBox="0 0 24 24" aria-hidden="true" {...common}><rect x="3" y="6" width="18" height="12" rx="2" /><path d="M3 10h18M6.5 14h3" /></svg>;
     case "files":
@@ -171,7 +165,7 @@ function emptyForm(): FormState {
     scope: "global",
     projectId: "",
     environments: ENVIRONMENT_OPTIONS.map((item) => item.id),
-    agents: ["claude-code"],
+    agents: ["*"],
     enabled: true,
     autoApproveText: "",
     envSecretKeys: [],
@@ -197,7 +191,7 @@ function formFromServer(server: MCPServer): FormState {
     scope: server.scope,
     projectId: server.projectId || "",
     environments: server.environments.length > 0 ? server.environments : ENVIRONMENT_OPTIONS.map((item) => item.id),
-    agents: server.agents.length > 0 ? server.agents : ["claude-code"],
+    agents: ["*"],
     enabled: server.enabled,
     autoApproveText: (server.autoApproveTools || []).join("\n"),
     envSecretKeys: server.envSecretKeys || [],
@@ -255,7 +249,6 @@ export default function McpManagerPage() {
   const [autoApproveConfirm, setAutoApproveConfirm] = useState(false);
   const [projectView, setProjectView] = useState<MCPProjectView | null>(null);
   const [viewProjectId, setViewProjectId] = useState("");
-  const [viewAgent, setViewAgent] = useState("claude-code");
   const [viewLoading, setViewLoading] = useState(false);
   // 连接测试：目标环境 + 工具列表（含可疑标注）。
   const [testTarget, setTestTarget] = useState<MCPServer | null>(null);
@@ -408,16 +401,15 @@ export default function McpManagerPage() {
 
   useEffect(() => { void loadPresets(); }, [loadPresets]);
 
-  const loadProjectView = useCallback(async (projectId: string, agentOverride?: string) => {
+  const loadProjectView = useCallback(async (projectId: string) => {
     const request = ++viewRequestRef.current;
-    const agent = agentOverride ?? viewAgent;
     setViewProjectId(projectId);
     // 注入快照属于上一个项目；在 status 返回前先清掉，避免短暂串台。
     setInjection(null);
     if (!projectId) { setProjectView(null); setViewLoading(false); return; }
     setViewLoading(true);
     try {
-      const view = await api<MCPProjectView>(`/api/projects/${projectId}/mcp?agentId=${encodeURIComponent(agent)}`);
+      const view = await api<MCPProjectView>(`/api/projects/${projectId}/mcp`);
       if (request !== viewRequestRef.current) return;
       setProjectView(view);
     } catch (cause) {
@@ -436,7 +428,7 @@ export default function McpManagerPage() {
     } catch {
       if (request === viewRequestRef.current) setInjection(null);
     }
-  }, [api, viewAgent]);
+  }, [api]);
 
   const startCreate = (preset?: MCPPreset) => {
     invalidateProbes();
@@ -759,7 +751,6 @@ export default function McpManagerPage() {
     wizardSecrets,
     wizardTrust,
     ENVIRONMENT_OPTIONS.map((option) => option.id),
-    ["claude-code"],
   );
 
   // runWizardCheck 是向导第二屏：先确认「这台电脑跑不跑得起来」，再试连。
@@ -1015,7 +1006,7 @@ export default function McpManagerPage() {
         scope: form.scope,
         projectId: form.scope === "project" ? form.projectId : "",
         environments: form.environments,
-        agents: form.agents,
+        agents: ["*"],
         enabled: form.enabled,
         autoApproveTools: parseLines(form.autoApproveText),
       };
@@ -1176,11 +1167,11 @@ export default function McpManagerPage() {
     const request = ++viewRequestRef.current;
     setBindingBusy(serverId);
     try {
-      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp?agentId=${encodeURIComponent(viewAgent)}`, {
+      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp`, {
         method: "PATCH",
         body: JSON.stringify({ bindings: [{ serverId, enabled }] }),
       });
-      // PATCH 返回的是「发出请求那一刻的项目视图」；期间切了项目/Agent 就不能覆盖新视图。
+      // PATCH 返回的是「发出请求那一刻的项目视图」；期间切了项目就不能覆盖新视图。
       if (request === viewRequestRef.current) setProjectView(view);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "更新项目开关失败");
@@ -1407,7 +1398,7 @@ export default function McpManagerPage() {
     const request = ++viewRequestRef.current;
     setMcpJsonBusy(true);
     try {
-      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp?agentId=${encodeURIComponent(viewAgent)}`, {
+      const view = await api<MCPProjectView>(`/api/projects/${viewProjectId}/mcp`, {
         method: "PATCH",
         body: JSON.stringify({ allowMcpJson: next }),
       });
@@ -1439,7 +1430,7 @@ export default function McpManagerPage() {
     }
   };
 
-  const toggleIn = (key: "environments" | "agents", id: string) => {
+  const toggleIn = (key: "environments", id: string) => {
     setForm((old) => {
       const list = old[key];
       return { ...old, [key]: list.includes(id) ? list.filter((item) => item !== id) : [...list, id] };
@@ -1448,7 +1439,7 @@ export default function McpManagerPage() {
 
   const canSubmit = !saving && form.name.trim() !== "" &&
     (form.transport === "stdio" ? form.command.trim() !== "" : form.url.trim() !== "") &&
-    form.environments.length > 0 && form.agents.length > 0 &&
+    form.environments.length > 0 &&
     (form.scope !== "project" || form.projectId !== "");
 
   // 向导的两条派生量：要不要给用户「填密钥」的出路、用户到底填了没有。
@@ -1538,7 +1529,6 @@ export default function McpManagerPage() {
             </div>
             <div className="ssh-form-section"><header><h3>项目视图</h3></header>
             <label className="ssh-field">选择项目<select value={viewProjectId} onChange={(event) => void loadProjectView(event.target.value)}><option value="">未选择</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
-            <label className="ssh-field">按 Agent 查看<select value={viewAgent} onChange={(event) => { setViewAgent(event.target.value); if (viewProjectId) void loadProjectView(viewProjectId, event.target.value); }}>{AGENT_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
             {viewLoading && <p className="ssh-form-notice"><span className="ssh-loading-indicator"></span>正在读取项目 MCP 视图…</p>}
             {projectView && !viewLoading && <div className="ssh-preflight valid"><header><span><McpIcon /></span><div><h4>{`环境：${projectView.environment}`}</h4><p>{projectView.strictMode ? "已启用严格模式（默认）" : "未启用严格模式"}</p></div></header>
               <div className="ssh-preflight-checks">{projectView.effective.length === 0 ? <span>该项目暂无生效的 MCP server</span> : projectView.effective.map((entry) => <span key={entry.id}>{entry.displayName || entry.name} <b>{entry.origin === "project" ? "项目" : "全局"}</b></span>)}</div>
@@ -1702,14 +1692,13 @@ export default function McpManagerPage() {
                 </div>;
               })}
           </section>
-          <section className="ssh-form-section"><header><h3>适用范围</h3><p>只有同时命中作用域、环境与 Agent 的会话才会注入该 server。</p></header>
+          <section className="ssh-form-section"><header><h3>适用范围</h3><p>已连接的服务会注入到所有 CLI，包括以后新增的工具。这里只选择环境。</p></header>
             <div className="ssh-fields">
               <label className="ssh-field">作用域<select value={form.scope} onChange={(event) => setField("scope", event.target.value as MCPScope)}><option value="global">全局（所有项目）</option><option value="project">仅指定项目</option></select></label>
               {form.scope === "project" && <label className="ssh-field">项目<select value={form.projectId} onChange={(event) => setField("projectId", event.target.value)}><option value="">请选择项目</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>}
             </div>
             <div className="ssh-auth-method">{ENVIRONMENT_OPTIONS.map((option) => <label key={option.id} className={form.environments.includes(option.id) ? "active" : ""}><input type="checkbox" checked={form.environments.includes(option.id)} onChange={() => toggleIn("environments", option.id)} />{option.label}</label>)}</div>
-            <div className="ssh-auth-method">{AGENT_OPTIONS.map((option) => <label key={option.id} className={form.agents.includes(option.id) ? "active" : ""}><input type="checkbox" checked={form.agents.includes(option.id)} onChange={() => toggleIn("agents", option.id)} />{option.label}</label>)}</div>
-            {(form.environments.length === 0 || form.agents.length === 0) && <p className="ssh-form-notice">至少选择一个适用环境和一个 Agent，否则无法保存（当前保存按钮已置灰）。</p>}
+            {form.environments.length === 0 && <p className="ssh-form-notice">至少选择一个适用环境，否则无法保存（当前保存按钮已置灰）。</p>}
           </section>
           <section className="ssh-form-section"><header><h3>按环境预览</h3></header>
             <div className="ssh-fields">

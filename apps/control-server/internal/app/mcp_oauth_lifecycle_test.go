@@ -12,6 +12,46 @@ import (
 	"time"
 )
 
+func TestMCPOAuthTokenKeepsAcceptedRedirect(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	id := insertTestMCPServerURL(t, s, "feishu", "global", "", "http", "https://mcp.feishu.cn/mcp", []string{"*"})
+	accepted := "http://127.0.0.1:8080/callback"
+	flow := &mcpOAuthFlow{
+		ServerID:    id,
+		RedirectURI: accepted,
+		Endpoints: mcpOAuthEndpoints{
+			Resource:              "https://mcp.feishu.cn/mcp",
+			AuthorizationEndpoint: "https://accounts.feishu.cn/oauth/v2/mcp/authorize",
+			TokenEndpoint:         "https://accounts.feishu.cn/oauth/v3/token",
+			RegistrationEndpoint:  "https://open.feishu.cn/open-apis/app/v1/dcr",
+		},
+		ClientID: "cli",
+	}
+	if err := s.storeMCPOAuthToken(ctx, flow, mcpOAuthTokenResponse{AccessToken: "access", RefreshToken: "refresh", ExpiresIn: 60}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := s.loadMCPOAuthToken(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.RedirectURI != accepted {
+		t.Fatalf("注册回调未记下：%q", row.RedirectURI)
+	}
+	refresh := *flow
+	refresh.RedirectURI = ""
+	if err := s.storeMCPOAuthToken(ctx, &refresh, mcpOAuthTokenResponse{AccessToken: "access-2"}); err != nil {
+		t.Fatal(err)
+	}
+	row, err = s.loadMCPOAuthToken(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.RedirectURI != accepted {
+		t.Fatalf("刷新令牌把回调地址冲掉了：%q", row.RedirectURI)
+	}
+}
+
 func TestMCPOAuthPendingCannotEnableBeforeVerification(t *testing.T) {
 	s := newTestServer(t)
 	rec := httptest.NewRecorder()

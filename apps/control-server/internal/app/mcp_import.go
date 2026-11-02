@@ -166,7 +166,7 @@ func (s *Server) collectImportCandidates(ctx context.Context, projectID string) 
 			} else {
 				source.Present = true
 				for _, name := range sortedKeysOfServers(doc.MCPServers) {
-					candidates = append(candidates, buildImportCandidate(name, doc.MCPServers[name], mcpScopeGlobal, "", "claude-global", source.Label, claudeConfigPath, []string{"claude-code"}))
+					candidates = append(candidates, buildImportCandidate(name, doc.MCPServers[name], mcpScopeGlobal, "", "claude-global", source.Label, claudeConfigPath, []string{mcpAgentAll}))
 				}
 				// 分项目：优先取请求指定的项目路径，其次取该配置里全部项目。
 				targets := []string{}
@@ -188,7 +188,7 @@ func (s *Server) collectImportCandidates(ctx context.Context, projectID string) 
 						continue
 					}
 					for _, name := range sortedKeysOfServers(entry.MCPServers) {
-						candidates = append(candidates, buildImportCandidate(name, entry.MCPServers[name], mcpScopeProject, projectID, "claude-project", "Claude 项目配置", target, []string{"claude-code"}))
+						candidates = append(candidates, buildImportCandidate(name, entry.MCPServers[name], mcpScopeProject, projectID, "claude-project", "Claude 项目配置", target, []string{mcpAgentAll}))
 					}
 				}
 			}
@@ -215,7 +215,7 @@ func (s *Server) collectImportCandidates(ctx context.Context, projectID string) 
 			} else {
 				source.Present = true
 				for _, name := range sortedKeysOfServers(doc.MCPServers) {
-					candidates = append(candidates, buildImportCandidate(name, doc.MCPServers[name], mcpScopeProject, projectID, "mcp-json", "项目 .mcp.json", path, []string{"claude-code"}))
+					candidates = append(candidates, buildImportCandidate(name, doc.MCPServers[name], mcpScopeProject, projectID, "mcp-json", "项目 .mcp.json", path, []string{mcpAgentAll}))
 				}
 			}
 		}
@@ -253,7 +253,7 @@ func (s *Server) collectImportCandidates(ctx context.Context, projectID string) 
 			default:
 				source.Present = true
 				for _, name := range sortedKeysOfServers(servers) {
-					candidate := buildImportCandidate(name, servers[name], mcpScopeProject, projectID, "codex-project", source.Label, path, []string{"codex"})
+					candidate := buildImportCandidate(name, servers[name], mcpScopeProject, projectID, "codex-project", source.Label, path, []string{mcpAgentAll})
 					candidate.Warnings = warnings[name]
 					// 源里明确停用的 server 与 `codex mcp list` 来源保持同一语义：跳过而不是
 					// 「导入后默认启用」—— 否则一份被作者关掉的配置会在 Milevia 里自动跑起来。
@@ -276,7 +276,7 @@ func (s *Server) collectImportCandidates(ctx context.Context, projectID string) 
 		if json.Unmarshal(raw, &doc) == nil {
 			wslSource.Present = true
 			for _, name := range sortedKeysOfServers(doc.MCPServers) {
-				candidates = append(candidates, buildImportCandidate(name, doc.MCPServers[name], mcpScopeGlobal, "", "claude-wsl", wslSource.Label, "~/.claude.json", []string{"claude-code"}))
+				candidates = append(candidates, buildImportCandidate(name, doc.MCPServers[name], mcpScopeGlobal, "", "claude-wsl", wslSource.Label, "~/.claude.json", []string{mcpAgentAll}))
 			}
 		} else {
 			wslSource.Note = "WSL 内 ~/.claude.json 解析失败"
@@ -426,7 +426,7 @@ func (s *Server) collectCodexImportCandidates(ctx context.Context) ([]mcpImportC
 			URL:     item.Transport.URL,
 			Headers: item.Transport.Headers,
 		}
-		candidate := buildImportCandidate(item.Name, server, mcpScopeGlobal, "", "codex", "Codex 配置", "~/.codex/config.toml", []string{"codex"})
+		candidate := buildImportCandidate(item.Name, server, mcpScopeGlobal, "", "codex", "Codex 配置", "~/.codex/config.toml", []string{mcpAgentAll})
 		if !item.Enabled {
 			candidate.SkipReason = "该 server 在 Codex 中处于禁用状态"
 		}

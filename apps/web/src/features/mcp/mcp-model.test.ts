@@ -210,7 +210,6 @@ test("创建请求把默认值全给上，密钥只带条目声明的前缀", ()
     { Authorization: "ghp_secret", 不存在的键: "忽略" },
     false,
     ["windows", "wsl", "remote-linux"],
-    ["claude-code"],
   );
   assert.equal(payload.name, "github");
   assert.equal(payload.description, remoteGitHub.summary);
@@ -218,7 +217,7 @@ test("创建请求把默认值全给上，密钥只带条目声明的前缀", ()
   assert.equal(payload.scope, "global");
   assert.equal(payload.projectId, "");
   assert.deepEqual(payload.environments, ["windows", "wsl", "remote-linux"]);
-  assert.deepEqual(payload.agents, ["claude-code"]);
+  assert.deepEqual(payload.agents, ["*"]);
   assert.equal(payload.enabled, true);
   // 前缀由条目声明补上，用户只粘了裸 token。
   assert.deepEqual(payload.headerSecrets, { Authorization: "Bearer ghp_secret" });
@@ -229,16 +228,16 @@ test("创建请求把默认值全给上，密钥只带条目声明的前缀", ()
 });
 
 test("「以后不用再问」只影响白名单，并把裸 token 交给会话级前置信任", () => {
-  const trust = buildDraftServerPayload(localGitHub, { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" }, true, ["windows"], ["claude-code"]);
+  const trust = buildDraftServerPayload(localGitHub, { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" }, true, ["windows"]);
   assert.deepEqual(trust.autoApproveTools, ["mcp__github-local__*"]);
   // 环境变量凭据没有前缀概念，原样保存。
   assert.deepEqual(trust.envSecrets, { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" });
-  const noTrust = buildDraftServerPayload(localGitHub, { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" }, false, ["windows"], ["claude-code"]);
+  const noTrust = buildDraftServerPayload(localGitHub, { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" }, false, ["windows"]);
   assert.deepEqual(noTrust.autoApproveTools, []);
 });
 
 test("空白输入不会被当成凭据存下去", () => {
-  const payload = buildDraftServerPayload(remoteGitHub, { Authorization: "   " }, false, ["windows"], ["claude-code"]);
+  const payload = buildDraftServerPayload(remoteGitHub, { Authorization: "   " }, false, ["windows"]);
   assert.deepEqual(payload.headerSecrets, {});
 });
 
@@ -250,7 +249,7 @@ test("试连与创建请求共用同一份凭据整理（前缀只补一次）",
   // 两个消费者必须给出同一份值：创建请求进 *Secrets，试连进 env / headers。
   // 两处各写一份实现时最典型的故障就是试连忘了补 Bearer —— 表现是 401，
   // 而用户会去反复检查一个完全正确的 token。
-  const payload = buildDraftServerPayload(remoteGitHub, { Authorization: "ghp_secret" }, false, ["windows"], ["claude-code"]);
+  const payload = buildDraftServerPayload(remoteGitHub, { Authorization: "ghp_secret" }, false, ["windows"]);
   assert.deepEqual(payload.headerSecrets, probe.headers);
   assert.deepEqual(payload.envSecrets, probe.env);
   // 创建请求的 env / headers 是「手动配置」的裸值通道，目录路径下必须为空。
@@ -276,7 +275,10 @@ test("serviceLogoKey：官方图标按预设名白名单映射，认不出回落
   for (const name of ["notion", "linear", "sentry", "slack", "stripe", "playwright", "context7"]) {
     assert.equal(serviceLogoKey(name), name);
   }
-  assert.equal(serviceLogoKey("aliyun"), "aliyun");
+  assert.equal(serviceLogoKey("qqmail"), "qqmail");
+  assert.equal(serviceLogoKey("feishu"), "feishu");
+  assert.equal(serviceLogoKey("tencent-docs"), "tencent-docs");
+  assert.equal(serviceLogoKey("aliyun"), null);
   // 白名单外（filesystem / fetch / memory / 未知的未来条目）回落 null → 页面退回示意图标。
   assert.equal(serviceLogoKey("filesystem"), null);
   assert.equal(serviceLogoKey("fetch"), null);

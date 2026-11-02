@@ -114,6 +114,24 @@ func TestUpdateMCPServerKeepsDescriptionAndAllowsScopeChange(t *testing.T) {
 	}
 }
 
+func TestSelectMCPServersAppliesToCurrentAndFutureAgents(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	projectID := "proj-all-agents"
+	insertFixTestProject(t, s, projectID)
+	insertTestMCPServer(t, s, "shared", mcpScopeGlobal, "", mcpTransportStdio, "npx", nil,
+		[]string{"windows"}, []string{"claude-code"})
+	for _, agentID := range []string{"claude-code", "codex", "codebuddy", "qoder", "opencode", "cursor", "future-cli"} {
+		selected, err := s.selectMCPServers(ctx, projectID, agentID, agentTargetEnvWindows)
+		if err != nil {
+			t.Fatalf("%s: %v", agentID, err)
+		}
+		if len(selected) != 1 || selected[0].Name != "shared" {
+			t.Fatalf("%s 应注入已连接的 MCP，实际 %+v", agentID, selected)
+		}
+	}
+}
+
 func TestProjectBindingDisablesProjectScopedServer(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()

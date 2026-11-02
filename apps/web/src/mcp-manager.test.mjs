@@ -11,13 +11,14 @@ import test from "node:test";
 // 这个分工是被变异检验逼出来的：最初把「模板依赖优先于表单命令」也写成源码正则，
 // 结果把优先级改反照样绿 —— 文本里 `requires` 与 `return fromPreset` 都还在。
 
-const [page, types, styles, pageStyles, dashboard, model] = await Promise.all([
+const [page, types, styles, pageStyles, dashboard, model, logo] = await Promise.all([
   readFile(new URL("./pages/McpManagerPage.tsx", import.meta.url), "utf8"),
   readFile(new URL("./lib/types.ts", import.meta.url), "utf8"),
   readFile(new URL("./style.css", import.meta.url), "utf8"),
   readFile(new URL("./pages/mcp-manager.css", import.meta.url), "utf8"),
   readFile(new URL("./pages/DashboardPage.tsx", import.meta.url), "utf8"),
   readFile(new URL("./features/mcp/mcp-model.ts", import.meta.url), "utf8"),
+  readFile(new URL("./components/ServiceLogo.tsx", import.meta.url), "utf8"),
 ]);
 
 // sliceBetween 取出一段函数体 / 一段 JSX。
@@ -103,7 +104,8 @@ test("向导三屏：起点由模型层决定，界面上不留协议名词", ()
 test("创建体走模型层：默认值全给上，页面自己拼不出第二个版本", () => {
   assert.match(wizardDraftPayload, /buildDraftServerPayload\(/);
   assert.match(wizardDraftPayload, /ENVIRONMENT_OPTIONS\.map\(\(option\) => option\.id\)/);
-  assert.match(wizardDraftPayload, /\["claude-code"\]/);
+  assert.match(model, /agents: \["\*"\]/);
+  assert.doesNotMatch(wizardDraftPayload, /\["claude-code"\]/);
   // OAuth 路径与最终保存必须共用同一个创建体，否则两条路的默认值会漂移。
   assert.match(startWizardOAuth, /JSON\.stringify\(\{ \.\.\.wizardDraftPayload\(\), enabled: false, oauthPending: true \}\)/);
   assert.match(finishWizard, /JSON\.stringify\(wizardDraftPayload\(\)\)/);
@@ -206,7 +208,13 @@ test("服务牌位走官方图标：白名单内用 ServiceLogo，白名单外�
     const asset = await readFile(new URL(`./assets/mcp-${key}.svg`, import.meta.url), "utf8");
     assert.match(asset, /<svg[\s\S]+<\/svg>/, `assets/mcp-${key}.svg 不是一份 SVG`);
   }
-  assert.match(model, /case "aliyun":\s*return "aliyun"/);
+  assert.doesNotMatch(model, /case "aliyun"/);
+  assert.match(model, /case "qqmail":\s*return "qqmail"/);
+  assert.match(model, /case "feishu":\s*return "feishu"/);
+  assert.match(model, /case "tencent-docs":\s*return "tencent-docs"/);
+  assert.match(logo, /qqmail: "https:\/\/mail\.qq\.com\/favicon\.ico"/);
+  assert.match(logo, /feishu: "https:\/\/www\.feishu\.cn\/favicon\.ico"/);
+  assert.match(logo, /"tencent-docs": "https:\/\/docs\.idqqimg\.com\/tim\/docs\/desktop\/favicon\.ico"/);
 });
 
 test("解析与凭据提示共用模型层，页面里不留第二份实现", () => {
@@ -229,7 +237,8 @@ test("模板要求只在来自模板时展示，编辑既有 server 时清掉", 
 
 test("过期文案已修正：Codex 不再标「P1 起支持」", () => {
   assert.doesNotMatch(page, /P1 起支持/);
-  assert.match(page, /const AGENT_OPTIONS: \{ id: string; label: string \}\[\] = \[\s*\{ id: "claude-code", label: "Claude Code" \},\s*\{ id: "codex", label: "Codex" \},\s*\{ id: "codebuddy", label: "CodeBuddy" \},\s*\{ id: "qoder", label: "Qoder" \},\s*\{ id: "opencode", label: "OpenCode" \},\s*\];/);
+  assert.doesNotMatch(page, /按 Agent 查看/);
+  assert.doesNotMatch(page, /AGENT_OPTIONS/);
 });
 
 test("类型声明了目录字段、依赖与凭据落点", () => {

@@ -38,6 +38,9 @@ import (
 const (
 	// mcpOAuthCallbackPath 是 OAuth 回调路径（由浏览器直接跳转，必须放行会话校验）。
 	mcpOAuthCallbackPath = "/api/mcp/oauth/callback"
+	// mcpOAuthShortCallbackPath 是飞书动态注册接受的 loopback 回调。
+	// 飞书拒绝 /api/mcp/oauth/callback，只接受路径正好是 /callback 的本机地址。
+	mcpOAuthShortCallbackPath = "/callback"
 	// mcpOAuthFlowTTL 是单个授权流程的最长存活时间。
 	mcpOAuthFlowTTL = 10 * time.Minute
 	// mcpOAuthFinishedTTL 是流程结束后保留记录的时间（供前端轮询到结果）。
@@ -159,9 +162,12 @@ type mcpOAuthTokenRow struct {
 	Scope                 string
 	TokenType             string
 	ExpiresAt             sql.NullTime
+	// RedirectURI 是动态注册时被接受的回调。飞书只接受 /callback，
+	// 再次授权必须用同一个地址，不能退回默认的长路径。
+	RedirectURI string
 }
 
-const mcpOAuthTokenColumns = `server_id,resource,authorization_endpoint,token_endpoint,registration_endpoint,client_id,client_secret_ref,access_token_ref,refresh_token_ref,scope,token_type,expires_at`
+const mcpOAuthTokenColumns = `server_id,resource,authorization_endpoint,token_endpoint,registration_endpoint,client_id,client_secret_ref,access_token_ref,refresh_token_ref,scope,token_type,expires_at,redirect_uri`
 
 func migrateMCPOAuthTokens(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `create table if not exists mcp_oauth_tokens (
@@ -177,10 +183,14 @@ func migrateMCPOAuthTokens(ctx context.Context, db *sql.DB) error {
 		scope                  text not null default '',
 		token_type             text not null default 'Bearer',
 		expires_at             datetime,
+		redirect_uri           text not null default '',
 		created_at             datetime not null,
 		updated_at             datetime not null
 	)`); err != nil {
 		return fmt.Errorf("create mcp_oauth_tokens: %w", err)
+	}
+	if err := ensureColumn(ctx, db, "mcp_oauth_tokens", "redirect_uri", "text not null default ''"); err != nil {
+		return fmt.Errorf("add mcp_oauth_tokens.redirect_uri: %w", err)
 	}
 	return nil
 }
@@ -190,7 +200,7 @@ func scanMCPOAuthToken(row interface{ Scan(dest ...any) error }) (mcpOAuthTokenR
 	err := row.Scan(
 		&out.ServerID, &out.Resource, &out.AuthorizationEndpoint, &out.TokenEndpoint,
 		&out.RegistrationEndpoint, &out.ClientID, &out.ClientSecretRef, &out.AccessTokenRef,
-		&out.RefreshTokenRef, &out.Scope, &out.TokenType, &out.ExpiresAt,
+		&out.RefreshTokenRef, &out.Scope, &out.TokenType, &out.ExpiresAt, &out.RedirectURI,
 	)
 	return out, err
 }
@@ -289,12 +299,15 @@ func discoverMCPOAuthEndpoints(ctx context.Context, mcpURL string, client *http.
 	return mcpOAuthEndpoints{}, errors.New("未找到该 MCP server 的 OAuth 端点（.well-known 元数据缺失或不可达）")
 }
 
-// protectedResourceMetadataURLs 返回候选的保护资源元数据地址。RFC 9728 允许把资源路径
-// 追加到 .well-known 段之后；两种形态都试，兼容不同实现。
+// protectedResourceMetadataURLs 返回候选的保护资源元数据地址。
+//
+// RFC 9728 把资源路径追加到 .well-known 段之后。腾讯文档把元数据放在资源路径末尾
+// （https://docs.qq.com/openapi/mcp/.well-known/oauth-protected-resource），两种都试。
 func protectedResourceMetadataURLs(origin, resourcePath string) []string {
 	out := []string{}
 	if resourcePath != "" && resourcePath != "/" {
 		out = append(out, origin+"/.well-known/oauth-protected-resource"+resourcePath)
+		out = append(out, origin+resourcePath+"/.well-known/oauth-protected-resource")
 	}
 	return append(out, origin+"/.well-known/oauth-protected-resource")
 }
@@ -362,6 +375,26 @@ func registerMCPOAuthClient(ctx context.Context, client *http.Client, registrati
 	return doc.ClientID, doc.ClientSecret, nil
 }
 
+// registerMCPOAuthClientForFlow 按候选回调依次注册。返回实际被接受的回调地址，
+// 后续授权与换票必须用同一个地址。
+func registerMCPOAuthClientForFlow(ctx context.Context, client *http.Client, registrationEndpoint, primaryRedirect, clientName string) (string, string, string, error) {
+	var last error
+	for _, redirect := range mcpOAuthRedirectCandidates(primaryRedirect) {
+		clientID, clientSecret, err := registerMCPOAuthClient(ctx, client, registrationEndpoint, redirect, clientName)
+		if err == nil {
+			return clientID, clientSecret, redirect, nil
+		}
+		last = err
+		if !strings.Contains(err.Error(), "invalid_redirect_uri") {
+			return "", "", "", err
+		}
+	}
+	if last == nil {
+		last = errors.New("动态客户端注册失败")
+	}
+	return "", "", "", last
+}
+
 // ---------------------------------------------------------------------------
 // PKCE
 // ---------------------------------------------------------------------------
@@ -387,6 +420,16 @@ func (s *Server) mcpOAuthRedirectURI() string {
 		base = "http://127.0.0.1:8080"
 	}
 	return base + mcpOAuthCallbackPath
+}
+
+// mcpOAuthRedirectCandidates 先用正式回调，被服务方拒绝时再试飞书接受的短路径。
+func mcpOAuthRedirectCandidates(primary string) []string {
+	base := strings.TrimSuffix(primary, mcpOAuthCallbackPath)
+	short := base + mcpOAuthShortCallbackPath
+	if short == primary {
+		return []string{primary}
+	}
+	return []string{primary, short}
 }
 
 // pruneMCPOAuthFlowsLocked 清理过期流程。调用方必须已持有 s.mu。
@@ -518,18 +561,24 @@ func (s *Server) storeMCPOAuthToken(ctx context.Context, flow *mcpOAuthFlow, tok
 		expiresAt = sql.NullTime{Time: time.Now().UTC().Add(time.Duration(token.ExpiresIn) * time.Second), Valid: true}
 	}
 	now := time.Now().UTC()
+	redirectURI := flow.RedirectURI
+	if redirectURI == "" && oldErr == nil {
+		// 刷新令牌时手里没有这次授权用的回调，沿用注册时记下的地址。
+		redirectURI = old.RedirectURI
+	}
 	if _, err := tx.ExecContext(ctx, `insert into mcp_oauth_tokens (`+mcpOAuthTokenColumns+`,created_at,updated_at)
-		values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(server_id) do update set
 			resource=excluded.resource,authorization_endpoint=excluded.authorization_endpoint,
 			token_endpoint=excluded.token_endpoint,registration_endpoint=excluded.registration_endpoint,
 			client_id=excluded.client_id,client_secret_ref=excluded.client_secret_ref,
 			access_token_ref=excluded.access_token_ref,refresh_token_ref=excluded.refresh_token_ref,
 			scope=excluded.scope,token_type=excluded.token_type,expires_at=excluded.expires_at,
+			redirect_uri=excluded.redirect_uri,
 			updated_at=excluded.updated_at`,
 		flow.ServerID, flow.Endpoints.Resource, flow.Endpoints.AuthorizationEndpoint, flow.Endpoints.TokenEndpoint,
 		flow.Endpoints.RegistrationEndpoint, flow.ClientID, secretRef, accessRef, refreshRef, scope, tokenType,
-		expiresAt, now, now); err != nil {
+		expiresAt, redirectURI, now, now); err != nil {
 		rollback()
 		return err
 	}
@@ -752,6 +801,9 @@ func (s *Server) prepareMCPOAuthFlow(flow *mcpOAuthFlow, mcpURL string) {
 	if err == nil {
 		if existing, loadErr := s.loadMCPOAuthToken(ctx, flow.ServerID); loadErr == nil && existing.ClientID != "" && existing.RegistrationEndpoint == endpoints.RegistrationEndpoint {
 			clientID = existing.ClientID
+			if existing.RedirectURI != "" {
+				flow.RedirectURI = existing.RedirectURI
+			}
 			if existing.ClientSecretRef != "" {
 				if plain, secretErr := s.profileSecrets.Load(s.db, ctx, existing.ClientSecretRef); secretErr == nil {
 					clientSecret = plain
@@ -762,7 +814,11 @@ func (s *Server) prepareMCPOAuthFlow(flow *mcpOAuthFlow, mcpURL string) {
 			if endpoints.RegistrationEndpoint == "" {
 				err = errors.New("OAuth 服务未提供动态客户端注册端点，请先配置 client_id")
 			} else {
-				clientID, clientSecret, err = registerMCPOAuthClient(ctx, mcpOAuthHTTPClient(), endpoints.RegistrationEndpoint, flow.RedirectURI, "Milevia")
+				var accepted string
+				clientID, clientSecret, accepted, err = registerMCPOAuthClientForFlow(ctx, mcpOAuthHTTPClient(), endpoints.RegistrationEndpoint, flow.RedirectURI, "Milevia")
+				if err == nil && accepted != "" {
+					flow.RedirectURI = accepted
+				}
 			}
 		}
 	}

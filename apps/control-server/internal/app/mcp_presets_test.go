@@ -1,9 +1,12 @@
 package app
 
 import (
+	"context"
 	"encoding/base64"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 本轮（2026-09-15）修掉的模板缺陷的回归测试。
@@ -22,7 +25,7 @@ func findMCPPreset(id string) (mcpPreset, bool) {
 }
 
 func TestMCPPresetCatalogKeepsOnlyRequestedServices(t *testing.T) {
-	want := map[string]bool{"notion": true, "github": true, "stripe": true, "aliyun": true}
+	want := map[string]bool{"notion": true, "github": true, "stripe": true, "qqmail": true, "feishu": true, "tencent-docs": true}
 	presets := mcpPresetCatalog()
 	if len(presets) != len(want) {
 		t.Fatalf("模板目录包含 %d 个服务，期望 %d 个：%v", len(presets), len(want), presets)
@@ -256,19 +259,142 @@ func TestMCPCommonPresetsAreOneClick(t *testing.T) {
 			t.Errorf("「常用服务」条目 %s 未给出官方文档地址", preset.ID)
 		}
 	}
-	if count != 4 {
-		t.Errorf("「常用服务」只有 %d 条可连接服务，期望 8 条", count)
+	if count != 6 {
+		t.Errorf("「常用服务」只有 %d 条可连接服务，期望 6 条", count)
 	}
 }
 
-func TestMCPOnlyOAuthDomesticPresetIsRetained(t *testing.T) {
-	if _, ok := findMCPPreset("aliyun"); !ok {
-		t.Fatal("缺少阿里云 OAuth 模板")
+func TestNormalizeMCPAgentsMeansEveryTool(t *testing.T) {
+	got := normalizeMCPAgents([]string{"claude-code"})
+	if len(got) != 1 || got[0] != mcpAgentAll {
+		t.Fatalf("保存时的 CLI 名单 = %v，期望 [%s]", got, mcpAgentAll)
+	}
+	if again := normalizeMCPAgents(nil); len(again) != 1 || again[0] != mcpAgentAll {
+		t.Fatalf("空名单 = %v，期望 [%s]", again, mcpAgentAll)
+	}
+}
+
+func TestMCPPerAccountEndpointsStayOutOfCatalog(t *testing.T) {
+	// 阿里云 OpenAPI MCP 没有公共地址：每个主账号在控制台领取自己的端点，
+	// 授权还必须属于该端点的主账号。这种服务不能放进一键目录。
+	if _, ok := findMCPPreset("aliyun"); ok {
+		t.Fatal("阿里云没有公共端点，不应出现在一键目录")
+	}
+}
+
+func TestMCPOAuthRedirectCandidatesFallBackToShortCallback(t *testing.T) {
+	got := mcpOAuthRedirectCandidates("http://127.0.0.1:8080/api/mcp/oauth/callback")
+	want := []string{
+		"http://127.0.0.1:8080/api/mcp/oauth/callback",
+		"http://127.0.0.1:8080/callback",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("回调候选 = %v，期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("回调候选 = %v，期望 %v", got, want)
+		}
+	}
+}
+
+func TestProtectedResourceMetadataURLsIncludesPathSuffix(t *testing.T) {
+	got := protectedResourceMetadataURLs("https://docs.qq.com", "/openapi/mcp")
+	want := "https://docs.qq.com/openapi/mcp/.well-known/oauth-protected-resource"
+	for _, item := range got {
+		if item == want {
+			return
+		}
+	}
+	t.Fatalf("候选地址缺少腾讯文档实际公布的元数据位置：%v", got)
+}
+
+func TestMCPOAuthDomesticPresetsAreRetained(t *testing.T) {
+	for _, id := range []string{"qqmail", "feishu", "tencent-docs"} {
+		if _, ok := findMCPPreset(id); !ok {
+			t.Fatalf("缺少国内 OAuth 模板：%s", id)
+		}
+	}
+}
+
+func TestMCPQQMailPresetPointsAtOfficialServer(t *testing.T) {
+	preset, ok := findMCPPreset("qqmail")
+	if !ok {
+		t.Fatal("缺少 qqmail 模板")
+	}
+	if preset.Transport != mcpTransportHTTP || preset.URL != mcpQQMailRemoteURL {
+		t.Errorf("qqmail 应指向官方远程地址 %s，实际 transport=%s url=%s", mcpQQMailRemoteURL, preset.Transport, preset.URL)
+	}
+	if !preset.OAuth || len(preset.Credentials) != 0 {
+		t.Errorf("qqmail 应只走浏览器授权，实际 oauth=%v credentials=%+v", preset.OAuth, preset.Credentials)
+	}
+	if preset.DocsURL != mcpQQMailDocsURL {
+		t.Errorf("qqmail 文档应为 %s，实际 %s", mcpQQMailDocsURL, preset.DocsURL)
+	}
+	if preset.Note != "" {
+		t.Errorf("qqmail 不应在目录卡片上显示说明，实际 %s", preset.Note)
+	}
+}
+
+func TestMCPFeishuAndTencentDocsPointAtOfficialServers(t *testing.T) {
+	cases := []struct {
+		id, url, docs string
+	}{
+		{"feishu", mcpFeishuRemoteURL, mcpFeishuDocsURL},
+		{"tencent-docs", mcpTencentDocsRemoteURL, mcpTencentDocsDocsURL},
+	}
+	for _, tc := range cases {
+		preset, ok := findMCPPreset(tc.id)
+		if !ok {
+			t.Fatalf("缺少 %s 模板", tc.id)
+		}
+		if preset.Transport != mcpTransportHTTP || preset.URL != tc.url {
+			t.Errorf("%s 应指向官方远程地址 %s，实际 transport=%s url=%s", tc.id, tc.url, preset.Transport, preset.URL)
+		}
+		if !preset.OAuth || len(preset.Credentials) != 0 {
+			t.Errorf("%s 应只走浏览器授权，实际 oauth=%v credentials=%+v", tc.id, preset.OAuth, preset.Credentials)
+		}
+		if preset.DocsURL != tc.docs {
+			t.Errorf("%s 文档应为 %s，实际 %s", tc.id, tc.docs, preset.DocsURL)
+		}
+	}
+}
+
+func TestLiveFeishuAndTencentDocsOAuthDiscovery(t *testing.T) {
+	if os.Getenv("MILEVIA_MCP_LIVE") == "" {
+		t.Skip("设置 MILEVIA_MCP_LIVE=1 后探测飞书和腾讯文档的官方授权")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cases := []struct {
+		url, authHost string
+	}{
+		{mcpFeishuRemoteURL, "accounts.feishu.cn"},
+		{mcpTencentDocsRemoteURL, "docs.qq.com"},
+	}
+	for _, tc := range cases {
+		endpoints, err := discoverMCPOAuthEndpoints(ctx, tc.url, nil)
+		if err != nil {
+			t.Fatalf("%s 授权发现失败：%v", tc.url, err)
+		}
+		if !strings.Contains(endpoints.AuthorizationEndpoint, tc.authHost) {
+			t.Errorf("%s 授权端点应在 %s，实际 %s", tc.url, tc.authHost, endpoints.AuthorizationEndpoint)
+		}
+		if endpoints.TokenEndpoint == "" || endpoints.RegistrationEndpoint == "" {
+			t.Fatalf("%s 缺少令牌或注册端点：%+v", tc.url, endpoints)
+		}
+		clientID, _, redirect, err := registerMCPOAuthClientForFlow(ctx, nil, endpoints.RegistrationEndpoint, "http://127.0.0.1:8080/api/mcp/oauth/callback", "Milevia")
+		if err != nil {
+			t.Fatalf("%s 动态注册失败：%v", tc.url, err)
+		}
+		if clientID == "" || redirect == "" {
+			t.Fatalf("%s 动态注册没有返回 client_id 或回调地址", tc.url)
+		}
 	}
 }
 
 func TestMCPDomesticConnectPresetsHaveRealConfiguration(t *testing.T) {
-	for _, id := range []string{"aliyun"} {
+	for _, id := range []string{"qqmail", "feishu", "tencent-docs"} {
 		preset, ok := findMCPPreset(id)
 		if !ok {
 			t.Fatalf("缺少国内可连接模板：%s", id)

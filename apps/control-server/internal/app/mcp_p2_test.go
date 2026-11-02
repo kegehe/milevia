@@ -801,8 +801,8 @@ func TestMCPDeleteServerRevokesOAuthTokens(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	if _, err := s.db.ExecContext(ctx,
-		`insert into mcp_oauth_tokens (`+mcpOAuthTokenColumns+`,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		serverID, "https://api.example.com", "https://auth.example.com", "https://token.example.com", "", "client-id", csRef, atRef, rtRef, "read", "Bearer", nil, now, now); err != nil {
+		`insert into mcp_oauth_tokens (`+mcpOAuthTokenColumns+`,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		serverID, "https://api.example.com", "https://auth.example.com", "https://token.example.com", "", "client-id", csRef, atRef, rtRef, "read", "Bearer", nil, "", now, now); err != nil {
 		t.Fatalf("insert oauth token: %v", err)
 	}
 

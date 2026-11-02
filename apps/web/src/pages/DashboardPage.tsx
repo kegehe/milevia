@@ -14,6 +14,7 @@ import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order"
 import { autoscrollDelta } from "../lib/card-drag";
 import { literalNameClass, workspacePathForDisplay } from "../lib/utils";
 import { AppVersionTag } from "../features/updater/AppVersionTag";
+import { IcpFooter } from "../components/IcpFooter";
 import { isDesktop } from "../lib/runtime";
 import "./dashboard.css";
 
@@ -322,6 +323,8 @@ export default function DashboardPage() {
           : <div className="project-grid">{filteredProjects.map((item) => <ProjectCard key={item.id} project={item} status={projectStatuses[item.id]} runStatus={(processStatuses[item.id]?.runStatus ?? "stopped") as RunStatus} runStartedAt={processStatuses[item.id]?.runStartedAt ?? null} open={() => navigate(`/projects/${item.id}`)} onDelete={() => setDeleteTarget(item)} onDragStart={handleDragStart} onDragOver={handleDragOver} onDrop={handleDrop} onDragEnd={handleDragEnd} isDragging={draggingId === item.id} isDropTarget={dropTargetId === item.id} />)}</div>}
     </section>
     {desktop && <div className="dashboard-version"><AppVersionTag /></div>}
+    {/* 法定展示项：备案号必须在网站底部可见，不能只在设置里。 */}
+    <IcpFooter />
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} status={projectStatuses[deleteTarget.id]} busy={deleting} close={() => setDeleteTarget(null)} confirm={confirmDelete} />}
   </main>;
 }
