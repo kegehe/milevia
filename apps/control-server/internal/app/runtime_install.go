@@ -132,8 +132,7 @@ func runVersionCommand(ctx context.Context, binary string, args ...string) strin
 	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, binary, args...)
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runProbeCommand(probeCtx, cmd)
 	if err != nil {
 		return ""
 	}

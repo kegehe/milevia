@@ -641,13 +641,14 @@ type commandCatalogEntry struct {
 func (s *Server) cachedCommandCatalog(key string, ttl time.Duration) (commandCatalogEntry, bool) {
 	s.commandCatalogMu.Lock()
 	defer s.commandCatalogMu.Unlock()
-	if s.commandCatalogEntry == nil || s.commandCatalogEntry.key != key {
+	entry := s.commandCatalogs[key]
+	if entry == nil {
 		return commandCatalogEntry{}, false
 	}
-	if ttl > 0 && time.Since(s.commandCatalogEntry.observed) > ttl {
+	if ttl > 0 && time.Since(entry.observed) > ttl {
 		return commandCatalogEntry{}, false
 	}
-	return *s.commandCatalogEntry, true
+	return *entry, true
 }
 
 // storeCommandCatalog 写入缓存。来自真实运行的观测永远覆盖缓存（它比探针更新），
@@ -655,11 +656,14 @@ func (s *Server) cachedCommandCatalog(key string, ttl time.Duration) (commandCat
 func (s *Server) storeCommandCatalog(entry commandCatalogEntry) {
 	s.commandCatalogMu.Lock()
 	defer s.commandCatalogMu.Unlock()
-	if entry.source == "probe" && s.commandCatalogEntry != nil && s.commandCatalogEntry.key == entry.key && s.commandCatalogEntry.source == "run" && time.Since(s.commandCatalogEntry.observed) < commandCatalogTTL {
+	if s.commandCatalogs == nil {
+		s.commandCatalogs = map[string]*commandCatalogEntry{}
+	}
+	if existing := s.commandCatalogs[entry.key]; entry.source == "probe" && existing != nil && existing.source == "run" && time.Since(existing.observed) < commandCatalogTTL {
 		return // 真实运行的观测更可信，探针不覆盖它
 	}
 	copied := entry
-	s.commandCatalogEntry = &copied
+	s.commandCatalogs[entry.key] = &copied
 }
 
 // slashCommandsMarker 用于在事件热路径上做零分配的子串判断，避免为每条 system 事件
@@ -672,21 +676,23 @@ var slashCommandsMarker = []byte(`"slash_commands"`)
 // SSH 长驻会话）的事件都汇聚到 agentRunSink.Event，因此这里能覆盖全部环境。
 // 调用点在事件热路径上，故先做一次零成本的字节子串判断再反序列化。
 func (s *Server) observeCommandCatalog(projectID, agentID string, payload json.RawMessage) {
-	// 缓存只有**一个槽位**，且 /commands 的探针与服务对象都是 Claude Code。
-	// Qoder / CodeBuddy 的 init 帧同样带 slash_commands；照收会把它们的命令名
-	// 写进 Claude 的目录（还会互相覆盖）。在它们各自的目录接入前，只采 Claude 的观测。
-	if projectID == "" || agentID != "claude-code" || !bytes.Contains(payload, slashCommandsMarker) {
+	// 按工具分开存。CodeBuddy 的目录还没接探测，不能先收进选择器。
+	if projectID == "" || (agentID != "claude-code" && agentID != "qoder") || !bytes.Contains(payload, slashCommandsMarker) {
 		return
 	}
 	catalog, ok := parseClaudeCommandCatalog(payload)
 	if !ok {
 		return
 	}
+	note := "目录来自最近一次运行的 Claude Code 会话。"
+	if agentID == "qoder" {
+		note = "目录来自最近一次运行的 Qoder 会话。"
+	}
 	s.storeCommandCatalog(commandCatalogEntry{
-		key:      commandCatalogCacheKey(projectID, "claude-code"),
+		key:      commandCatalogCacheKey(projectID, agentID),
 		catalog:  catalog,
 		source:   "run",
-		note:     "目录来自最近一次运行的 Claude Code 会话。",
+		note:     note,
 		observed: time.Now(),
 	})
 }
@@ -704,8 +710,8 @@ func commandCatalogCacheKey(projectID, agentID string) string {
 // projectCommands 返回命令选择器需要的目录与来源说明。
 //
 // 查询参数：
-//   - agentId  默认 claude-code；codex / qoder / opencode / codebuddy / cursor
-//     返回空目录（各自尚未接通独立的斜杠命令探测，不能拿 Claude 的目录冒充）。
+//   - agentId  默认 claude-code。qoder 用自己的启动帧；codex / opencode / codebuddy / cursor
+//     返回空目录，不能拿 Claude 的目录冒充。
 //   - refresh=1 忽略 TTL 重新探测（用户点"刷新"）
 //   - probe=0  不允许起探针：只用缓存/扫描/静态表。会话页加载时的徽标判定走这条，
 //     避免仅仅打开一个项目就拉起 CLI 进程。
@@ -747,12 +753,7 @@ func (s *Server) projectCommands(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if agentID == "qoder" {
-		// Qoder 的 init 帧确实自带 slash_commands，但这里没有等价于 Claude 的那条探测通道。
-		// **不**回落到 Claude 的目录：那会把 Claude 的命令名当成 Qoder 的展示出去
-		// （前者在 Qoder 里未必存在）。如实给空目录 + 说明。
-		view.Source = "static"
-		view.Note = "Qoder 的斜杠命令目录尚未接入；可直接输入内容，或使用自定义命令。"
-		writeJSON(w, http.StatusOK, view)
+		s.writeQoderCommands(w, r, project, &view)
 		return
 	}
 	if agentID == "opencode" {
@@ -819,6 +820,63 @@ func (s *Server) projectCommands(w http.ResponseWriter, r *http.Request) {
 		}
 		view.Commands = buildCommandOptions(claudeCommandCatalog{}, scanned, false)
 	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// writeQoderCommands 只使用 Qoder 自己的启动帧。探测失败时不退回 Claude 的命令名。
+func (s *Server) writeQoderCommands(w http.ResponseWriter, r *http.Request, project Project, view *ProjectCommandsView) {
+	key := commandCatalogCacheKey(project.ID, "qoder")
+	refresh := r.URL.Query().Get("refresh") == "1"
+	probeAllowed := r.URL.Query().Get("probe") != "0"
+	entry, cached := s.cachedCommandCatalog(key, commandCatalogTTL)
+	staleNote := ""
+	if refresh || !cached {
+		if probeAllowed {
+			s.commandProbeMu.Lock()
+			if !refresh {
+				if fresh, ok := s.cachedCommandCatalog(key, commandCatalogTTL); ok {
+					entry, cached = fresh, true
+				}
+			}
+			if refresh || !cached {
+				probeCtx, cancel := context.WithTimeout(r.Context(), claudeCommandProbeTimeout)
+				catalog, err := probeQoderCommandCatalog(probeCtx, project.Path)
+				cancel()
+				if err == nil {
+					entry = commandCatalogEntry{
+						key:      key,
+						catalog:  catalog,
+						source:   "probe",
+						note:     "目录来自 Qoder CLI 的启动帧。",
+						observed: time.Now(),
+					}
+					s.storeCommandCatalog(entry)
+					cached = true
+				} else if stale, ok := s.cachedCommandCatalog(key, 0); ok {
+					entry, cached = stale, true
+					staleNote = fmt.Sprintf("刷新没有读到新目录，展示的是 %s 观测到的 Qoder 命令。", stale.observed.Local().Format("01-02 15:04"))
+				} else {
+					log.Printf("probe Qoder command catalog for project %s: %v", project.ID, err)
+				}
+			}
+			s.commandProbeMu.Unlock()
+		}
+	}
+	if !cached {
+		view.Source = "static"
+		view.Note = "还没有读到 Qoder 的斜杠命令。在项目里跑一次，或点「刷新」。"
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	view.Source = entry.source
+	view.Note = entry.note
+	if staleNote != "" {
+		view.Note = staleNote
+	}
+	view.ClaudeVersion = entry.catalog.version
+	view.RefreshedAt = entry.observed.UTC().Format(time.RFC3339)
+	view.Authoritative = true
+	view.Commands = buildCommandOptions(entry.catalog, scanLocalCommands(project.Path), true)
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -905,4 +963,47 @@ func slashCommandName(template string) string {
 		return ""
 	}
 	return strings.TrimPrefix(fields[0], "/")
+}
+
+// probeQoderCommandCatalog 读到 init 帧就停。Qoder 的斜杠命令在模型调用之前就在这帧里。
+func probeQoderCommandCatalog(ctx context.Context, projectPath string) (claudeCommandCatalog, error) {
+	bin, err := exec.LookPath("qoder")
+	if err != nil {
+		return claudeCommandCatalog{}, errors.New("未找到 Qoder CLI")
+	}
+	cmd := qoderCommand(ctx, bin, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--permission-mode", "default")
+	cmd.Dir = projectPath
+	cmd.Env = appendUTF8ChildEnv(os.Environ())
+	configureProcessGroup(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return claudeCommandCatalog{}, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return claudeCommandCatalog{}, err
+	}
+	if err := cmd.Start(); err != nil {
+		return claudeCommandCatalog{}, err
+	}
+	defer func() {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		terminateProcessGroup(cmd)
+		_ = cmd.Wait()
+	}()
+	if _, err := io.WriteString(stdin, `{"type":"user","message":{"role":"user","content":"/context"}}`+"\n"); err != nil {
+		return claudeCommandCatalog{}, err
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		if catalog, ok := parseClaudeCommandCatalog(scanner.Bytes()); ok {
+			return catalog, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return claudeCommandCatalog{}, err
+	}
+	return claudeCommandCatalog{}, errors.New("Qoder 启动帧里没有斜杠命令")
 }

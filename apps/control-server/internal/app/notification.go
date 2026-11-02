@@ -32,6 +32,9 @@ type NotificationEvent struct {
 	DurationMs     int64  `json:"durationMs,omitempty"`
 	ConversationID string `json:"conversationId,omitempty"`
 	TaskID         string `json:"taskId,omitempty"`
+	// ApprovalID 是命令审批的 id。这条通知的主键与它相同：历史重放从数据库读出时
+	// 没有单独的列，前端仍能用通知 id 去允许或拒绝。
+	ApprovalID string `json:"approvalId,omitempty"`
 	// ScheduledTaskID 是定时任务通知的目标，仅用于删定时任务时一并清掉通知；
 	// 前端按 actionUrl 跳转，不需要这个内部关联。
 	ScheduledTaskID string    `json:"-"`
@@ -317,7 +320,12 @@ func (s *Server) broadcastNotification(event NotificationEvent) {
 		return
 	}
 
-	// 2. 广播给所有通知订阅者
+	s.deliverNotification(event)
+}
+
+// deliverNotification 只推给当前订阅者，不落库。
+// 审批已经处理掉时用它发一条 notification.dismissed，让各端收起角标和弹窗。
+func (s *Server) deliverNotification(event NotificationEvent) {
 	data, _ := json.Marshal(event)
 	toClose := make([]*notificationSubscriber, 0)
 	s.notificationSubMu.Lock()
@@ -332,6 +340,113 @@ func (s *Server) broadcastNotification(event NotificationEvent) {
 		log.Printf("[ws] /ws/notifications subscriber queue full; closing slow client")
 		go sub.closeWithStatus(websocket.CloseTryAgainLater, "client is too slow")
 	}
+}
+
+// approvalNotificationText 给系统弹窗准备一句人能看懂的说明。
+// 命令要露出原文，否则用户无法在弹窗上决定允许还是拒绝。
+// MCP 只给「服务 · 工具」和描述，不把参数原文放进通知：参数里可能有密钥。
+func approvalNotificationText(toolName string, toolInput json.RawMessage) (title, detail string) {
+	var fields map[string]any
+	_ = json.Unmarshal(toolInput, &fields)
+	description, _ := fields["description"].(string)
+	description = strings.TrimSpace(description)
+	if strings.HasPrefix(toolName, "mcp__") {
+		title = "等待确认工具调用"
+		server, tool := splitMCPToolName(toolName)
+		name := strings.TrimSpace(toolName)
+		if server != "" && tool != "" {
+			name = server + " · " + tool
+		}
+		if description != "" {
+			detail = name + "：" + description
+		} else {
+			detail = name
+		}
+	} else {
+		title = "等待确认命令"
+		command, _ := fields["command"].(string)
+		command = strings.TrimSpace(command)
+		switch {
+		case command != "" && description != "" && description != command:
+			detail = description + "：" + command
+		case command != "":
+			detail = command
+		default:
+			detail = description
+		}
+	}
+	detail = clipNotificationDetail(detail, 120)
+	if detail == "" {
+		detail = "需要你确认后才能继续"
+	}
+	return title, detail
+}
+
+func clipNotificationDetail(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	runes := []rune(text)
+	if limit < 1 || len(runes) <= limit {
+		if limit < 1 {
+			return ""
+		}
+		return text
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+// notifyApprovalPending 把一次命令审批送进通知中心。
+// 通知失败不能挡住审批本身：会话里的 approval.pending 事件已经写好了。
+//
+// 通知 id 故意等于 approvalID。数据库不另存一列，窗口重连后重放的历史通知
+// 仍能用这个 id 调用允许 / 拒绝。
+func (s *Server) notifyApprovalPending(conversationID, approvalID, toolName string, toolInput json.RawMessage) {
+	if strings.TrimSpace(approvalID) == "" || strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	var projectID, projectName string
+	if err := s.db.QueryRowContext(s.runtimeCtx,
+		`select c.project_id, coalesce(p.name,'') from conversations c left join projects p on p.id=c.project_id where c.id=?`,
+		conversationID).Scan(&projectID, &projectName); err != nil {
+		log.Printf("notifyApprovalPending: conversation %s: %v", conversationID, err)
+		return
+	}
+	title, detail := approvalNotificationText(toolName, toolInput)
+	s.broadcastNotification(NotificationEvent{
+		ID:             approvalID,
+		Type:           "approval.pending",
+		ProjectID:      projectID,
+		ProjectName:    projectName,
+		ConversationID: conversationID,
+		ApprovalID:     approvalID,
+		Title:          title,
+		Body:           detail,
+		Priority:       "high",
+		ActionURL:      "/projects/" + projectID + "/conversations/" + conversationID,
+		DedupeKey:      "approval:" + approvalID,
+	})
+}
+
+// dismissApprovalNotification 在审批已有结果（允许、拒绝、超时、中断）后收起通知。
+// 没有对应行时什么都不做：通知没写成，或用户已经在界面上忽略过。
+func (s *Server) dismissApprovalNotification(approvalID string) {
+	approvalID = strings.TrimSpace(approvalID)
+	if approvalID == "" {
+		return
+	}
+	result, err := s.db.ExecContext(s.runtimeCtx, `update notifications set dismissed=1 where id=? and type='approval.pending' and dismissed=0`, approvalID)
+	if err != nil {
+		log.Printf("dismiss approval notification %s: %v", approvalID, err)
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed == 0 {
+		return
+	}
+	s.deliverNotification(NotificationEvent{
+		ID:        approvalID,
+		Type:      "notification.dismissed",
+		CreatedAt: time.Now().UTC(),
+	})
 }
 
 // --- REST API ---
@@ -518,16 +633,24 @@ func (s *Server) notifyOrchestrationNeedsHuman(_ context.Context, job Orchestrat
 		return
 	}
 	conversationID, actionURL := s.taskNotificationTarget(ctx, job.ProjectID, job.TaskID)
+	// 原因放在前面：系统弹窗第三行会截断，项目名和任务名已经在另一行，不能把原因截没。
+	where := "项目「" + project.Name + "」的编排任务「" + taskTitle + "」"
+	reason := orchestrationFailureText(cause)
+	body := where + "需要人工介入"
+	if reason != "" {
+		body = reason + "。" + body
+	}
 
 	s.broadcastNotification(NotificationEvent{
 		ID:             uuid.NewString(),
 		Type:           "orchestration.needs_human",
 		ProjectID:      job.ProjectID,
 		ProjectName:    project.Name,
+		TaskTitle:      taskTitle,
 		ConversationID: conversationID,
 		TaskID:         job.TaskID,
 		Title:          "编排任务需要人工介入",
-		Body:           "项目「" + project.Name + "」的编排任务「" + taskTitle + "」需要人工介入：" + orchestrationFailureText(cause),
+		Body:           body,
 		Priority:       "high",
 		ActionURL:      actionURL,
 		CreatedAt:      time.Now().UTC(),

@@ -11,7 +11,8 @@ import type { Project, ProjectFilter, ProjectStatus } from "../lib/types";
 import type { RunStatus } from "../features/run/run-model";
 import { statusColors, statusLabels, runDurationLabel } from "../features/run/run-model";
 import { sortProjectIds, moveProject, persistOrder } from "../lib/project-order";
-import { literalNameClass } from "../lib/utils";
+import { autoscrollDelta } from "../lib/card-drag";
+import { literalNameClass, workspacePathForDisplay } from "../lib/utils";
 import { AppVersionTag } from "../features/updater/AppVersionTag";
 import { isDesktop } from "../lib/runtime";
 import "./dashboard.css";
@@ -117,42 +118,134 @@ export default function DashboardPage() {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
 
+  // 拖到视口上下边缘时自动滚动。
+  // 浏览器自带的拖拽滚动指望不上：实测它只在指针贴住视口最外侧十几像素时才动
+  // （离底边 10px 会滚、20px 就完全不动），而这里卡片上方压着一条 76px 高的 sticky 页头 ——
+  // 指针停在页头上就不滚了，项目一多就变成「只能拖到屏幕中间，松手、滚一屏、再拖第二次」。
+  // 所以自己接管：dragover 只负责记指针坐标（因此挂在 <main> 上，页头也算数），
+  // 真正的位移交给每帧循环，免得滚动速度被 dragover 的派发频率带着抖。
+  const dragPointerXRef = useRef(0);
+  const dragPointerYRef = useRef(0);
+  const autoScrollFrameRef = useRef(0);
+  /** 这次拖拽有没有真的滚过页面：决定松手时要不要补一次落点（见 handleDragEnd）。 */
+  const didAutoScrollRef = useRef(false);
+
+  // 落点高亮的 ref 镜像：自动滚动时每帧都要和指针下的卡片比对一次，
+  // 只靠 state 读不到「当前值」，而且每次都 setState 会白渲染一帧。
+  const dropTargetIdRef = useRef<string | null>(null);
+  const setDropTarget = useCallback((id: string | null) => {
+    if (dropTargetIdRef.current === id) return;
+    dropTargetIdRef.current = id;
+    setDropTargetId(id);
+  }, []);
+
+  const stopAutoScroll = useCallback(() => {
+    if (autoScrollFrameRef.current) cancelAnimationFrame(autoScrollFrameRef.current);
+    autoScrollFrameRef.current = 0;
+  }, []);
+
+  /** 指针底下那张卡（不含正被拖走的那张）。 */
+  const cardIdUnderPointer = useCallback(() => {
+    const element = document.elementFromPoint(dragPointerXRef.current, dragPointerYRef.current);
+    const card = element instanceof Element ? element.closest("[data-project-id]") : null;
+    const id = card?.getAttribute("data-project-id") ?? null;
+    return id && id !== dragIdRef.current ? id : null;
+  }, []);
+
+  /**
+   * 按指针位置重新认一次落点卡片。
+   * 必须自己算：程序化滚动之后浏览器不会重新派发 dragover（实测滚 500px 后事件还停在原来那张卡），
+   * 指针没动、卡片却已经在指针底下换了一张。不补这一下，高亮会留在滚走的卡上，
+   * 而松手时浏览器按指针下的新卡片落点 —— 看到的位置和实际落点对不上，比没有高亮更糟。
+   */
+  const syncDropTargetFromPointer = useCallback(() => {
+    setDropTarget(cardIdUnderPointer());
+  }, [cardIdUnderPointer, setDropTarget]);
+
+  const startAutoScroll = useCallback(() => {
+    stopAutoScroll();
+    const step = () => {
+      // dragend / drop 会把 dragIdRef 清空，循环就此停在这一帧，不需要额外的停止信号。
+      if (!dragIdRef.current) {
+        autoScrollFrameRef.current = 0;
+        return;
+      }
+      const delta = autoscrollDelta(dragPointerYRef.current, window.innerHeight);
+      if (delta) {
+        // 只有页面真的动了，指针底下的卡片才会换人。已经顶到最上/最下（滚不动）时不许记这一笔，
+        // 否则松手兜底会把「其实什么都没变」也当成一次重排。
+        const before = window.scrollY;
+        window.scrollBy(0, delta);
+        if (window.scrollY !== before) didAutoScrollRef.current = true;
+        // 只在真的滚了之后重量：指针自己在动的时候，dragover 会把落点带上来。
+        syncDropTargetFromPointer();
+      }
+      autoScrollFrameRef.current = requestAnimationFrame(step);
+    };
+    autoScrollFrameRef.current = requestAnimationFrame(step);
+  }, [stopAutoScroll, syncDropTargetFromPointer]);
+
+  // 组件卸载时循环必须停：留着它会拿着过期的指针坐标一直滚页面。
+  useEffect(() => stopAutoScroll, [stopAutoScroll]);
+
+  const trackDragPointer = useCallback((event: DragEvent) => {
+    dragPointerXRef.current = event.clientX;
+    dragPointerYRef.current = event.clientY;
+  }, []);
+
   const handleDragStart = useCallback((event: DragEvent, id: string) => {
     dragIdRef.current = id;
+    didAutoScrollRef.current = false;
     setDraggingId(id);
+    setDropTarget(null);
+    trackDragPointer(event);
+    startAutoScroll();
     event.dataTransfer.effectAllowed = "move";
     // Firefox 等浏览器需要设置 data 才能触发拖拽。
     event.dataTransfer.setData("text/plain", id);
-  }, []);
+  }, [startAutoScroll, setDropTarget, trackDragPointer]);
 
   const handleDragOver = useCallback((event: DragEvent, id: string) => {
     if (!dragIdRef.current || dragIdRef.current === id) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
-    setDropTargetId(id);
-  }, []);
+    setDropTarget(id);
+  }, [setDropTarget]);
 
   const handleDrop = useCallback((event: DragEvent, id: string) => {
     event.preventDefault();
+    stopAutoScroll();
     const fromId = dragIdRef.current;
     if (!fromId || fromId === id) {
       dragIdRef.current = null;
       setDraggingId(null);
-      setDropTargetId(null);
+      setDropTarget(null);
       return;
     }
     moveProject(orderedIds, fromId, id);
     dragIdRef.current = null;
     setDraggingId(null);
-    setDropTargetId(null);
+    setDropTarget(null);
     setOrderVersion((v) => v + 1);
-  }, [orderedIds]);
+  }, [orderedIds, stopAutoScroll, setDropTarget]);
 
   const handleDragEnd = useCallback(() => {
+    stopAutoScroll();
+    // 走到这里 dragIdRef 还留着 id，说明这次松手**没有**收到过 drop（handleDrop 会清掉它）。
+    // 原因是自动滚动把指针底下的卡片换了一张、指针自己却没动：浏览器只认「松手前最后一次
+    // dragover 落在谁身上」，于是原地松手时 drop 一次都不派发（实测：只有 dragend，
+    // dropEffect=none）。这种情况按指针底下那张卡补一次落点 —— 屏幕上一直亮着的就是它。
+    // 只在真的滚过页面时才补：没滚过的松手（Esc 取消、拖出窗口）保持原来的「什么都不做」。
+    const fromId = dragIdRef.current;
+    const toId = fromId && didAutoScrollRef.current ? cardIdUnderPointer() : null;
+    didAutoScrollRef.current = false;
     dragIdRef.current = null;
     setDraggingId(null);
-    setDropTargetId(null);
-  }, []);
+    setDropTarget(null);
+    if (!fromId || !toId) return;
+    moveProject(orderedIds, fromId, toId);
+    setOrderVersion((v) => v + 1);
+  }, [cardIdUnderPointer, orderedIds, setDropTarget, stopAutoScroll]);
 
   const filters: { id: ProjectFilter; label: string; count: number }[] = [{ id: "all", label: "全部", count: projects.length }, { id: "running", label: "进行中", count: runningCount }, { id: "ready", label: "已就绪", count: readyCount }, { id: "offline", label: "不可用", count: offlineCount }];
 
@@ -173,7 +266,9 @@ export default function DashboardPage() {
     }
   };
 
-  return <main className="app-shell">
+  // onDragOver 挂在 <main>（不是 grid）上：拖拽途中指针常常落在页头或留白里，
+  // 只有挂在整页上才记得到那些位置的纵坐标，贴边滚动才不会在半路「断线」。
+  return <main className="app-shell" onDragOver={trackDragPointer}>
     {error && <div className="error"><span>{error}</span><button title="关闭错误提示" onClick={() => setError("")}>x</button></div>}
     <header className={`dashboard-bar${desktop ? " dashboard-bar-fixed" : ""}`}>
       <a className="brand" href="/"><img className="brand-mark" src="/milevia-mark.svg" width="42" height="42" alt="" /><span className="brand-word"><strong>Mile</strong><em>via</em></span></a>
@@ -192,17 +287,18 @@ export default function DashboardPage() {
     <section className="project-dashboard command-dashboard">
       <header className="dashboard-intro">
         <div><h1>项目<em>总览</em></h1></div>
-        <div className="dashboard-summary" aria-label="按项目状态筛选">
-          {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><b>{projectsLoaded ? item.count : "—"}</b><small>{item.label}</small></button>)}
+        {/* 搜索框与状态筛选同组靠右（B2 方案）：标题独占左侧，「搜索 + 筛选」同属过滤工具。 */}
+        <div className="dashboard-tools">
+          <label className="dashboard-search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg>
+            <input type="search" value={query} placeholder="按项目名称搜索…" aria-label="按项目名称搜索" onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          {query && <button className="secondary" type="button" onClick={() => setQuery("")}>清除搜索</button>}
+          <div className="dashboard-summary" aria-label="按项目状态筛选">
+            {filters.map((item) => <button key={item.id} className={`${filter === item.id ? "selected " : ""}summary-${item.id}`} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}><b>{projectsLoaded ? item.count : "—"}</b><small>{item.label}</small></button>)}
+          </div>
         </div>
       </header>
-      <div className="dashboard-search-bar">
-        <label className="dashboard-search">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg>
-          <input type="search" value={query} placeholder="按项目名称搜索…" aria-label="按项目名称搜索" onChange={(event) => setQuery(event.target.value)} />
-        </label>
-        {query && <button className="secondary" type="button" onClick={() => setQuery("")}>清除搜索</button>}
-      </div>
       {projects.length === 0
         ? showInitialLoading ? <ProjectGridSkeleton />
           : showLoadFailed ? <div className="empty load-failed">
@@ -275,7 +371,11 @@ function ProjectCard({ project, status, runStatus, runStartedAt, open, onDelete,
   // 其余情况（启动中/停止中/失败/时长算不出）回退终端小徽标——运行中的事实不许双双消失。
   const runDuration = runStatus === "running" && runStartedAt ? runDurationLabel(runStartedAt) : "";
   const runBadgeVisible = runStatus !== "stopped" && !runDuration;
-  return <article className={`project-card task-card state-${stateClass}${dragClass}`} draggable onClick={open}
+  // WSL 项目挂在 \\wsl$\<发行版> 下，卡片上方已有企鹅图标标明环境，这里只显示 Linux 侧路径。
+  const workspacePath = workspacePathForDisplay(project.fullPath);
+  // data-project-id 是拖拽时「指针底下是哪张卡」的唯一判据：自动滚动时浏览器不再派发 dragover，
+  // 只能自己用 elementFromPoint 认卡（见 syncDropTargetFromPointer）。
+  return <article className={`project-card task-card state-${stateClass}${dragClass}`} draggable data-project-id={project.id} onClick={open}
     onDragStart={(event) => onDragStart(event, project.id)}
     onDragOver={(event) => onDragOver(event, project.id)}
     onDrop={(event) => onDrop(event, project.id)}
@@ -299,7 +399,7 @@ function ProjectCard({ project, status, runStatus, runStartedAt, open, onDelete,
         </div>
         <p>{taskTitle}</p>
       </div>
-      <div className="project-card-meta"><span><small>会话数</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b className={literalNameClass(project.fullPath)}>{project.fullPath}</b></span></div>
+      <div className="project-card-meta"><span><small>会话数</small><b>{status ? status.conversationCount : "--"}</b></span><span title={project.fullPath}><small>工作目录</small><b className={literalNameClass(workspacePath)}>{workspacePath}</b></span></div>
       <footer><span>{project.gitBranch || "非 Git 项目"}</span><b aria-hidden="true">打开对话<i>→</i></b></footer>
     </div>
   </article>;

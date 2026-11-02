@@ -345,13 +345,14 @@ POST   /api/mcp/import                       从现有 Claude / Codex 配置导�
 # 项目视图
 GET    /api/projects/{projectID}/mcp          该项目实际生效的 MCP（含来源与可用性）
 PATCH  /api/projects/{projectID}/mcp          项目级开关（P1）
-GET    /api/projects/{projectID}/mcp/status   当前会话最近一次注入的 server 与连接状态
+GET    /api/projects/{projectID}/mcp/status   最近一次注入的 server 与连接状态
 ```
 
 **约束：**
 
 - 经 `registerMCPRoutes` 分组注册，由 `app.go:953` 的 `routes()` 挂载，自动继承 `requireSession`（`app.go:1197`）。
 - 后端校验：`transport` 枚举合法；`stdio` 必有 `command`、`http`/`sse` 必有合法 `url`；`name` 满足 `^[A-Za-z0-9_-]+$`（否则注入 JSON 的 key 非法）；`scope=project` 必有 `project_id`。**不信任前端枚举。**
+- `GET /api/projects/{projectID}/mcp/status` 默认返回「最近一次注入」的快照（管理页的历史记录）；带 `?scope=session&agentId=` 时按**当前**启停与适用范围复核后再返回（对话页托盘用）。快照只在运行开始时写入，不会因用户在「MCP 连接」里停用某个 server 而变化，所以托盘必须走会话视角，否则会把已停用的 server 一直显示成已连接。尚未被注入过的 server 不会因为刚启用就出现（它还没被 CLI 加载过）。
 - `POST /api/mcp/import` 第一遍只返回发现结果与重名情况，不落库；`confirm: true` 才写入。
 - 所有接口不得回显 `sec_` 引用的明文。
 

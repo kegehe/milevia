@@ -1547,7 +1547,9 @@ func buildSSHCodexExecCommand(request AgentRunRequest, transportArgs, configArg,
 		modelArg += fmt.Sprintf(" -c %s", shellQuote(fmt.Sprintf("model_reasoning_effort=%q", request.ReasoningEffort)))
 	}
 	if request.Resume {
-		return fmt.Sprintf("codex exec%s resume -c %s --json%s %s %s",
+		// resume 同样要跳过 git 仓库检查：远端项目目录也可能还没有 .git，
+		// 缺这个开关时 CLI 会在恢复会话前就退出（与本地/WSL 的 resume 分支一致）。
+		return fmt.Sprintf("codex exec%s resume -c %s --json --skip-git-repo-check%s %s %s",
 			modelArg, shellQuote(configArg), schemaArg, shellQuote(request.SessionID), shellQuote(request.Prompt))
 	}
 	return fmt.Sprintf("codex exec %s%s -c %s --json --skip-git-repo-check --color never -C %s --sandbox %s%s %s",

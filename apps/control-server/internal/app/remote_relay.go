@@ -70,6 +70,9 @@ const (
 	// 落点是**会话**而不是项目，与 app.go 里 /api/conversations/{conversationID}/* 那一族
 	// （clear / activate / messages / …）平级。conversationID 只取自信封，见 relayTarget。
 	relayScopeConversation
+	// relayScopeAPI 的 Path 本身就是 `/api/...` 完整路径（提问作答、工具确认、
+	// 交接状态、档案名单）。这些路由不挂在项目或会话前缀下，不能再拼一次前缀。
+	relayScopeAPI
 )
 
 // remoteOperation 是 op 表里的一条。
@@ -126,6 +129,9 @@ func (s *Server) remoteOperations() map[string]remoteOperation {
 		operations[name] = operation
 	}
 	for name, operation := range s.remoteConversationOperations() {
+		operations[name] = operation
+	}
+	for name, operation := range s.remoteInteractionOperations() {
 		operations[name] = operation
 	}
 	for name, operation := range s.remoteInsightOperations() {
@@ -245,7 +251,16 @@ func relayTarget(operation remoteOperation, projectID, conversationID string, pa
 	// 会话域是"落到哪条会话"（进 URL 路径）—— 但两种都只认信封那一份。
 	target := "/api/projects/" + projectID
 	conversationInQuery := true
-	if operation.Scope == relayScopeConversation {
+	appendScopedPath := true
+	if operation.Scope == relayScopeAPI {
+		if !strings.HasPrefix(operation.Path, "/api/") || strings.Contains(operation.Path, "..") {
+			return "", nil, nil, errors.New("api 作用域的路径不合法")
+		}
+		// 路径已经是完整的 /api/...，不能再拼项目或会话前缀，也不能把 Path 追加第二次。
+		target = operation.Path
+		conversationInQuery = false
+		appendScopedPath = false
+	} else if operation.Scope == relayScopeConversation {
 		conversationID = strings.TrimSpace(conversationID)
 		if conversationID == "" {
 			return "", nil, nil, errors.New("conversationId 必填")
@@ -266,7 +281,9 @@ func relayTarget(operation remoteOperation, projectID, conversationID string, pa
 		// 将来一旦分叉就没人说得清哪份作数。
 		conversationInQuery = false
 	}
-	target += operation.Path
+	if appendScopedPath {
+		target += operation.Path
+	}
 
 	var body json.RawMessage
 	if operation.Query {
@@ -425,6 +442,26 @@ var relayPathParamValidators = map[string]func(string) error{
 		}
 		return nil
 	},
+	"askID":      relayUUIDParam("askID"),
+	"approvalID": relayUUIDParam("approvalID"),
+	"handoffID":  relayUUIDParam("handoffID"),
+	"runnerID": func(value string) error {
+		// 本机是 windows-local / wsl-local，远端是 ssh- 前缀或登记时的名字。
+		// 只挡路径分隔符和空白，避免把 runner id 拼进 URL 时指到别的路由。
+		if value == "" || len(value) > 80 || strings.ContainsAny(value, "/\\?#% \t") {
+			return errors.New("runnerID 不合法")
+		}
+		return nil
+	},
+}
+
+func relayUUIDParam(name string) func(string) error {
+	return func(value string) error {
+		if !relayUUID.MatchString(value) {
+			return fmt.Errorf("%s 格式不正确", name)
+		}
+		return nil
+	}
 }
 
 func validateRelayPathParam(name, value string) error {

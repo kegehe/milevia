@@ -11,9 +11,10 @@ import { dropAfterCutoff } from "../lib/conversation-cutoff";
 import { DEVICE_ALIAS_MAX_LENGTH, activeDevice, deviceDisplayName, deviceLabel, devicePlatform, markDeviceRevoked, normalizeAlias, readActiveToken, readDevices, type MobileDevice } from "../lib/mobile-devices";
 import { MOBILE_PROJECT_ORDER_STORAGE_KEY, dismissMobileDragHint, persistOrder, readMobileDragHint, sortProjectIds } from "../lib/project-order";
 import { useCardDragReorder } from "../lib/use-card-drag";
-import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval } from "../lib/timeline";
+import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic } from "../lib/timeline";
+import { contextLabel, contextLevel } from "../lib/utils";
 import { NON_GIT_BRANCH } from "../lib/types";
-import type { ConversationCheckpoint, SystemVariant, PermissionMode, AgentID } from "../lib/types";
+import type { Ask, ConversationCheckpoint, ConversationModels, ConversationUsageResponse, SystemVariant, PermissionMode, AgentID } from "../lib/types";
 import { AgentLogo } from "../components/AgentLogo";
 import { ExternalLink } from "../components/ExternalLink";
 import { MOBILE_AGENTS } from "../lib/mobile-agent-catalog";
@@ -48,6 +49,8 @@ import { useMobileConversationHistory } from "../features/remote/use-mobile-conv
 import { normalizeBindings, phoneSyncView, platformLabel, syncAgeFrom, type DesktopBinding } from "../features/remote/desktop-phone";
 import { applyPendingTaskMutations, mutationReflectsInSnapshot, newPendingTaskID } from "../lib/task-mutations";
 import { applyMobileTerminalEvent, type MobileRealtimeEvent } from "../lib/mobile-realtime";
+import { askFromNotice, interactiveNotice, pendingApproval, retainAskQuestions, scheduledSendReady, selectableProfiles, type MobileProfileChoice } from "../features/remote/mobile-session-controls";
+import { MobileApprovalCard, MobileAskCard, MobileModelSheet, MobilePermissionSheet } from "../features/remote/MobileSessionDock";
 // 会话末尾那条「正在处理」裸行的判据（动画变体 / 阶段词 / 阶段计时）。读数来自不同来源，
 // 收口在纯函数里，页面只调用 + 渲染 —— 理由见 lib/processing-indicator.ts 的文件头。
 // 动画变体与计时格式化与桌面共用 lib/run-indicator.ts（同一 run 两端同一种动画、同一口径）。
@@ -119,8 +122,11 @@ type RemoteNotice = {
   //   "replace" —— 状态推进（工具确认 pending → allow/deny），用最新状态覆盖。
   // 缺省 = 同 id 视为重复，保留先到的那条。
   merge?: "append" | "replace";
+  ask?: Ask;
+  approvalId?: string;
+  approvalDecision?: string;
 };
-type RemoteConversation = { id: string; title: string; status: string; agentId: string; lastActivityAt: string; isCurrent: boolean; messages: Message[]; notices?: RemoteNotice[]; isOrchestration?: boolean; messagesCutoff?: string; messagesVisibleAfter?: string };
+type RemoteConversation = { id: string; title: string; status: string; agentId: string; permissionMode?: string; modelOverride?: string; lastActivityAt: string; isCurrent: boolean; messages: Message[]; notices?: RemoteNotice[]; isOrchestration?: boolean; messagesCutoff?: string; messagesVisibleAfter?: string };
 type RemoteConversationIndex = Omit<RemoteConversation, "messages" | "notices"> & { preview?: string };
 type RemoteAgentStatus = { id: string; status: "ready" | "unavailable" | "updating" | "unsupported"; version?: string; reason?: string };
 // 电脑端数据库里的「常用提示词 / 常用命令」条目。字段与 control-server 的 Shortcut 一一对应
@@ -376,16 +382,6 @@ function MobileRunIndicatorAnim({ variant }: { variant: RunIndicatorVariant }) {
   );
 }
 
-// 工具确认的只读文案。桌面端是工具卡上的 allow/deny 按钮，手机端不做交互，
-// 只用一张卡说明"卡在哪了"；键是 approval 事件的类型后缀。
-const approvalLabels: Record<string, { title: string; state: string }> = {
-  pending: { title: "等待工具确认", state: "info" },
-  allow: { title: "工具已确认", state: "success" },
-  deny: { title: "工具已拒绝", state: "failed" },
-  aborted: { title: "工具确认已中止", state: "info" },
-  timeout: { title: "工具确认超时", state: "failed" },
-};
-
 // 一次会话只保留最近这一段运行记录：时间久了状态卡会越积越多，而用户翻历史时
 // 关心的是刚刚发生了什么，不是三天前的每一次重试。
 const maxConversationNotices = 24;
@@ -565,28 +561,9 @@ function noticeFromEventFields(type: string, payload: unknown, id: string, runId
     if (!output) return null; // 心跳行等噪声（过滤规则见 isIgnoredCLIStderr）
     return { id: `stderr:${runId || createdAt}`, runId, createdAt, variant: "error", title: output.title, detail: output.detail, merge: "append" };
   }
-  // 工具确认：桌面把它做成工具卡上的按钮；手机端只读，但必须显示——运行卡在等确认时，
-  // 用户至少要知道"为什么没动静"，而不是以为进程死了。
-  const approval = getApproval(source);
-  if (approval) {
-    const command = typeof approval.toolInput.command === "string" ? approval.toolInput.command.replace(/\s+/g, " ").trim() : "";
-    const detail = command ? `${approval.toolName}：${command.slice(0, 120)}${command.length > 120 ? "…" : ""}` : approval.toolName;
-    // 状态取事件类型后缀而不是 getApproval 的 status：aborted/timeout 在那边被归成
-    // "pending"，沿用会让已经中止的确认一直显示成"等待确认"（5 分钟无人操作就会超时，
-    // 这条路径并不罕见）。
-    const resolution = type.slice("approval.".length);
-    const label = approvalLabels[resolution] || approvalLabels.pending;
-    return {
-      id: `approval:${approval.approvalId}`,
-      runId,
-      createdAt,
-      variant: "task",
-      title: label.title,
-      detail: resolution === "pending" ? `${detail} · 请在电脑上确认` : detail,
-      state: label.state,
-      merge: "replace",
-    };
-  }
+  // 提问和工具确认要能在手机上作答，不能只留一张「请在电脑上确认」的说明。
+  const interactive = interactiveNotice(type, payload, id, runId, createdAt);
+  if (interactive) return interactive as RemoteNotice;
   // "正在恢复会话上下文"是**阶段读数**，不是通知：手机端拿不到"这一轮已经开口"的
   // 信号（init 不是通知），照着渲染就会挂一整轮。桌面端由 run-indicator 用事件序列
   // 自行收尾，手机端这边直接不生成通知，保持原来的表现。
@@ -659,8 +636,9 @@ function appendNotice(notices: RemoteNotice[] | undefined, notice: RemoteNotice)
     // 快照有上传节流，可能带着比本地更旧的状态回来（工具确认已经在电脑上被允许，
     // 但快照里还只有 pending）。只有不更旧的才允许覆盖，否则界面会从"已确认"
     // 倒退回"等待确认"，用户以为又被卡住了。
-    if ((Date.parse(notice.createdAt) || 0) < (Date.parse(existing.createdAt) || 0)) return current;
-    return current.map((item, at) => (at === index ? notice : item));
+    const incomingWins = (Date.parse(notice.createdAt) || 0) >= (Date.parse(existing.createdAt) || 0);
+    const kept = retainAskQuestions(incomingWins ? notice : existing, incomingWins ? existing : notice);
+    return current.map((item, at) => (at === index ? kept : item));
   }
   if (notice.merge === "append" && notice.detail) {
     const existing = current[index];
@@ -1100,6 +1078,8 @@ export default function MobileRemotePage() {
   const [newConversationAgent, setNewConversationAgent] = useState<MobileAgentID>("claude-code");
   // 执行权限随所选工具重置（切工具的副作用写在 selectMobileAgent 里，不用 effect 猜意图）。
   const [newConversationPermission, setNewConversationPermission] = useState<PermissionMode>(MOBILE_AGENTS[0].defaultPermission);
+  const [profileChoices, setProfileChoices] = useState<MobileProfileChoice[]>([]);
+  const [newConversationProfile, setNewConversationProfile] = useState("");
   const [mobileView, setMobileView] = useState<"projects" | "conversation">("projects");
   // 手机上的"侧滑返回"（Chrome/WebView 的返回手势、iOS 边缘手势）本质是**历史后退**。
   // 只在 React state 里切视图时历史里没有这一层，手势就什么也不做——所以进项目要真的压一层历史。
@@ -1189,6 +1169,18 @@ export default function MobileRemotePage() {
   // 已引用、尚未发送的那条消息（见 MessageQuote）。与技能引用同一条生命周期规则：
   // 发送时与草稿一起乐观清空、失败时一起还回来、换会话/换项目时一起清掉。
   const [quoteRef, setQuoteRef] = useState<MessageQuote | null>(null);
+  const [scheduledSend, setScheduledSend] = useState<{ id: string; conversationId: string; draft: string; skillRefs: RemoteSkill[]; quote: MessageQuote | null } | null>(null);
+  const [contextUsage, setContextUsage] = useState<ConversationUsageResponse | null>(null);
+  const [modelSheet, setModelSheet] = useState<ConversationModels | null | false>(false);
+  const [permissionSheetOpen, setPermissionSheetOpen] = useState(false);
+  const [confirmingFullControl, setConfirmingFullControl] = useState(false);
+  const [sessionControlBusy, setSessionControlBusy] = useState("");
+  const [handingOff, setHandingOff] = useState(false);
+  const handoffTokenRef = useRef(0);
+  const flushingScheduledIdRef = useRef("");
+  // 模型目录要等电脑端探测 CLI，回来时会话可能已经换过、弹层也可能被返回键关掉。
+  // 序号对不上就丢掉那次回包，避免旧目录把新会话的弹层重新打开。
+  const modelRequestRef = useRef(0);
   // 正在展开图标行的**那条消息的 id**（空串＝没有，与 expandedTask 同一个写法）。
   // 记 id 而不是 Message 对象：流式消息的正文每一帧都在变，记住对象就会把"展开那一刻的旧正文"
   // 带进后续动作 —— 上一版那张面板正是为此要在动作执行前再查一次最新内容，现在这个坑从根上没了。
@@ -2545,7 +2537,18 @@ export default function MobileRemotePage() {
   // 少了这一句：在 A 上点了停止、再切到也在跑的 B，B 的停止键会显示「停止中」并被禁掉
   // 好几秒 —— 用户看着一条自己没停过的会话停在"停止中"，只能等。确认框同理，
   // 它是挂在 A 上的（见 stopConfirmTarget 的说明），换到 B 就该消失而不是留在屏上。
-  useEffect(() => { setStoppingConversation(false); setStopConfirmTarget(""); setRewindTarget(null); }, [conversation?.id]);
+  useEffect(() => {
+    setStoppingConversation(false);
+    setStopConfirmTarget("");
+    setRewindTarget(null);
+    // 换会话就作废还在轮询的交接：否则它结束时会把人从当前会话拽到新会话上。
+    handoffTokenRef.current += 1;
+    modelRequestRef.current += 1;
+    setHandingOff(false);
+    setModelSheet(false);
+    setPermissionSheetOpen(false);
+    setConfirmingFullControl(false);
+  }, [conversation?.id]);
   // 兜底放开（见 conversationStopFallbackMs）：正常路径是上面那个 effect 摘掉它，
   // 这一条只是保证"没有任何人摘"时按钮也会自己活过来。
   useEffect(() => {
@@ -2665,6 +2668,16 @@ export default function MobileRemotePage() {
       // 弹层正在提交时，与弹层内「关闭/取消」按钮的 disabled 规则保持一致：
       // 吞掉返回事件，避免中途丢弃已经在进行的请求。
       if (busy && (editingTask || deletingTask || creatingTask || newConversationProject || confirmShortcut || confirmUnbind)) return true;
+      // 模型 / 权限是盖住整页的 fixed 层。漏掉的话，返回键会先退出会话，弹层还浮在项目列表上，
+      // 确认按钮仍然会改到刚才那条会话。正在切换时吞掉返回，避免请求发出去之后界面已经不在了。
+      if (modelSheet !== false || permissionSheetOpen) {
+        if (sessionControlBusy === "model" || sessionControlBusy === "permission") return true;
+        modelRequestRef.current += 1;
+        setModelSheet(false);
+        setConfirmingFullControl(false);
+        setPermissionSheetOpen(false);
+        return true;
+      }
       // ⋯ 菜单是页面里最上层的一小块浮层，返回键先收它，别一步退到项目列表。
       if (headerMenuOpen) { setHeaderMenuOpen(false); return true; }
       // 快捷方式确认框与上面两个任务弹层同样处理。漏掉它的症状实测过：返回键一路走到
@@ -4118,19 +4131,35 @@ export default function MobileRemotePage() {
 
   async function sendConversationMessage(event: FormEvent) {
     event.preventDefault();
+    if (!conversation) return;
+    await deliverConversationMessage(conversation, messageDraft.trim(), skillRefs, quoteRef, true);
+  }
+
+  function scheduleConversationMessage() {
+    if (!conversation || !conversationProcessing || conversation.isOrchestration) return;
+    const draft = messageDraft.trim();
+    if (!draft && skillRefs.length === 0 && !quoteRef) return;
+    setScheduledSend({ id: idempotencyKey(), conversationId: conversation.id, draft, skillRefs, quote: quoteRef });
+    setMessageDraft("");
+    setSkillRefs([]);
+    setQuoteRef(null);
+    setComposerToolsOpen(false);
+    setError("");
+  }
+
+  async function deliverConversationMessage(target: RemoteConversation, draft: string, refs: RemoteSkill[], quote: MessageQuote | null, clearComposer: boolean) {
     // draft = 用户自己在输入框里写的正文；content = 拼上技能引用 / 引用块之后真正上云的那条消息。
     // 所有"写回输入框"的路径都只能用 draft —— 否则一次发送失败就会把整段技能描述重新灌回输入框。
     // 「引用」与「技能」一样不计入 draft：它是一颗可以单独摘掉的胶囊，不是用户写的正文。
-    const draft = messageDraft.trim();
-    if (!conversation || (!draft && skillRefs.length === 0 && !quoteRef)) return;
-    if (conversation.isOrchestration) {
+    if (!draft && refs.length === 0 && !quote) return;
+    if (target.isOrchestration) {
       setError("编排任务会话只能查看，请在任务队列中继续处理");
       return;
     }
     // 先拼引用块再交给 composeSkillMessage，得到的顺序是「技能指令 → 引用块 → 正文」：
     // 技能那段文案必须与桌面端逐字一致，只能由 composeSkillMessage 生成（见 withQuoteBlock）。
-    const content = composeSkillMessage(withQuoteBlock(draft, quoteRef), skillRefs);
-    const conversationID = conversation.id;
+    const content = composeSkillMessage(withQuoteBlock(draft, quote), refs);
+    const conversationID = target.id;
     const clientRequestId = idempotencyKey();
     const createdAt = new Date().toISOString();
     const optimisticID = `pending-${clientRequestId}`;
@@ -4144,10 +4173,12 @@ export default function MobileRemotePage() {
     // 先把指示亮起来就是在替电脑端许一个它还不知道的承诺。它由 dispatchConversationMessage
     // 在命令真的交给云端那一刻点，两条路径（直发 / 补发）因此都只点一次。
     setSnapshot((current) => current ? { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => entry.id === conversationID && !entry.messages.some((message) => message.id === optimisticID) ? { ...entry, messages: [...entry.messages, { id: optimisticID, role: "user", content, createdAt }] } : entry) })) } : current);
-    setMessageDraft("");
-    // 引用与草稿一起乐观清空；下面每条失败回填分支都会把胶囊一并放回去。
-    setSkillRefs([]);
-    setQuoteRef(null);
+    if (clearComposer) {
+      setMessageDraft("");
+      // 引用与草稿一起乐观清空；下面每条失败回填分支都会把胶囊一并放回去。
+      setSkillRefs([]);
+      setQuoteRef(null);
+    }
     setError("");
     // 会话本身还没在电脑端建好（新建会话的乐观窗口，见 createConversationForProject）：
     // 这条命令此刻发出去必然"找不到会话"。先把消息排队，真 id 一到立刻补发 ——
@@ -4164,7 +4195,7 @@ export default function MobileRemotePage() {
       // 而引用对这类消息是禁用的（见 isTransientMessage）。留着它的理由不是"现在用得上"，而是
       // "**漏掉它才是静默丢数据**"：一旦哪天允许引用，丢的就是用户刚挂上的那条引用，
       // 而他只会看到自己写的字回来了、以为引用还在。三行代码换掉这一类不可见的错。
-      queue.push({ requestId: clientRequestId, content, createdAt, draft, quote: quoteRef });
+      queue.push({ requestId: clientRequestId, content, createdAt, draft, quote });
       deferredMessagesRef.current.set(conversationID, queue);
       markPendingConversationsChanged();
       return;
@@ -4172,9 +4203,199 @@ export default function MobileRemotePage() {
     if (overlaid) markPendingConversationsChanged();
     await dispatchConversationMessage(conversationID, content, clientRequestId, createdAt, (reason) => {
       setMessageDraft((current) => current.trim() ? current : draft);
-      setSkillRefs((current) => current.length > 0 ? current : skillRefs);
-      setQuoteRef((current) => current ?? quoteRef);
+      setSkillRefs((current) => current.length > 0 ? current : refs);
+      setQuoteRef((current) => current ?? quote);
       setError(reason);
+    });
+  }
+
+  // 预约发送：这一轮还在跑时先收下，空闲后再走与「发送」同一条投递。
+  // setTimeout(0) 是为了避开开发模式里 effect 执行两次时把同一条发出去两遍。
+  useEffect(() => {
+    if (!scheduledSend) {
+      flushingScheduledIdRef.current = "";
+      return;
+    }
+    // 快照会不断换掉 projects 的身份，把这个 effect 重新跑一遍。超时回调若已经发出去，
+    // 下一次跑到这里必须认出来，否则同一条预约会再发一次。
+    if (flushingScheduledIdRef.current === scheduledSend.id) return;
+    const target = projects.flatMap((item) => item.conversations).find((item) => item.id === scheduledSend.conversationId);
+    const processing = Boolean(processingConversations[scheduledSend.conversationId]);
+    if (!target || !scheduledSendReady(target.status, processing, Boolean(target.isOrchestration))) return;
+    const job = scheduledSend;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled || flushingScheduledIdRef.current === job.id) return;
+      flushingScheduledIdRef.current = job.id;
+      setScheduledSend((current) => current?.id === job.id ? null : current);
+      void deliverConversationMessage(target, job.draft, job.skillRefs, job.quote, false);
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [scheduledSend, processingConversations, projects]);
+
+  function patchConversationFields(conversationID: string, patch: Partial<RemoteConversation>) {
+    setSnapshot((current) => current ? { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => entry.id === conversationID ? { ...entry, ...patch } : entry) })) } : current);
+  }
+
+  function patchConversationNotice(conversationID: string, noticeID: string, patch: Partial<RemoteNotice>) {
+    const apply = (notice: RemoteNotice) => notice.id === noticeID ? { ...notice, ...patch, ask: patch.ask ? { ...notice.ask, ...patch.ask } : notice.ask } : notice;
+    // 下一次快照会整份换掉会话通知。已答过的提问 / 已点过的确认若只改当前画面，
+    // 快照里那条更早的 pending 会把卡片重新弹出来，再点一次服务端会说「已经结束」。
+    // 放进待合并记录后，刷新时按同一条 id 保留这次的结果。
+    const pending = pendingNoticesRef.current.get(conversationID) || [];
+    const visible = snapshotRef.current?.projects.flatMap((item) => item.conversations).find((item) => item.id === conversationID)?.notices?.find((notice) => notice.id === noticeID);
+    const source = pending.find((notice) => notice.id === noticeID) || visible;
+    pendingNoticesRef.current.set(conversationID, appendNotice(pending, source ? apply(source) : { id: noticeID, runId: "", createdAt: new Date().toISOString(), variant: "task", title: patch.title || "", merge: "replace", ...patch }));
+    setSnapshot((current) => current ? { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => entry.id !== conversationID ? entry : { ...entry, notices: (entry.notices || []).map(apply) }) })) } : current);
+  }
+
+  useEffect(() => {
+    if (mobileView !== "conversation" || !conversation || conversationPending) return;
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const reply = await rpcTransport("conversation.usage", {}, 20_000);
+        if (cancelled || !reply.ok || !reply.data || typeof reply.data !== "object") return;
+        setContextUsage(reply.data as ConversationUsageResponse);
+      } catch {
+        // 用量读不到不打断对话；输入栏保持上一次的读数或「计算中」。
+      }
+    };
+    setContextUsage(null);
+    void pull();
+    const timer = window.setInterval(() => void pull(), 20_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [mobileView, conversation?.id, conversationPending, rpcTransport]);
+
+  async function openModelSheet() {
+    if (!conversation || conversationPending || conversationProcessing) return;
+    const request = modelRequestRef.current + 1;
+    modelRequestRef.current = request;
+    const conversationID = conversation.id;
+    setModelSheet(null);
+    const reply = await rpcTransport("conversation.models", {}, 25_000);
+    if (request !== modelRequestRef.current || selectedConversationRef.current !== conversationID) return;
+    if (!reply.ok || !reply.data || typeof reply.data !== "object") {
+      setModelSheet(false);
+      setError(reply.error || "无法读取可用模型");
+      return;
+    }
+    setModelSheet(reply.data as ConversationModels);
+  }
+
+  async function applyModel(model: string) {
+    if (!conversation || conversationPending) return;
+    const request = modelRequestRef.current;
+    const conversationID = conversation.id;
+    setSessionControlBusy("model");
+    try {
+      const reply = await rpcTransport("conversation.model", { model }, 30_000);
+      if (request !== modelRequestRef.current || selectedConversationRef.current !== conversationID) return;
+      if (!reply.ok) {
+        setError(reply.error || "无法切换模型");
+        return;
+      }
+      const updated = reply.data as { modelOverride?: string } | undefined;
+      patchConversationFields(conversationID, { modelOverride: updated?.modelOverride ?? model });
+      setModelSheet(false);
+    } finally {
+      setSessionControlBusy((current) => current === "model" ? "" : current);
+    }
+  }
+
+  async function applyPermission(mode: PermissionMode, confirmed = false) {
+    if (!conversation || conversationPending || conversationProcessing) return;
+    if (mode === "full_control" && !confirmed && conversation.permissionMode !== "full_control") {
+      setConfirmingFullControl(true);
+      setPermissionSheetOpen(true);
+      return;
+    }
+    const conversationID = conversation.id;
+    setSessionControlBusy("permission");
+    try {
+      const reply = await rpcTransport("conversation.permissionMode", { permissionMode: mode }, 30_000);
+      if (selectedConversationRef.current !== conversationID) return;
+      if (!reply.ok) {
+        setError(reply.error || "无法修改执行权限");
+        return;
+      }
+      patchConversationFields(conversationID, { permissionMode: mode });
+      setConfirmingFullControl(false);
+      setPermissionSheetOpen(false);
+    } finally {
+      setSessionControlBusy((current) => current === "permission" ? "" : current);
+    }
+  }
+
+  async function startContextHandoff() {
+    if (!conversation || conversation.agentId !== "codex" || conversationProcessing || conversation.isOrchestration || !project) return;
+    const token = handoffTokenRef.current + 1;
+    handoffTokenRef.current = token;
+    const projectID = project.id;
+    setHandingOff(true);
+    const stillMine = () => handoffTokenRef.current === token;
+    try {
+      const started = await rpcTransport("conversation.handoff", {}, 20_000);
+      if (!stillMine()) return;
+      if (!started.ok) throw new Error(started.error || "上下文交接失败");
+      const handoffID = typeof (started.data as { id?: unknown } | undefined)?.id === "string" ? (started.data as { id: string }).id : "";
+      if (!handoffID) throw new Error("上下文交接没有返回编号");
+      for (let attempt = 0; attempt < 90; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        if (!stillMine()) return;
+        const current = await rpcTransport("handoff.status", { handoffID }, 15_000);
+        if (!stillMine()) return;
+        if (!current.ok) throw new Error(current.error || "上下文交接失败");
+        const status = current.data as { status?: string; targetConversationId?: string; errorMessage?: string };
+        if (status.status === "failed") throw new Error(status.errorMessage || "上下文交接失败");
+        if (status.status === "completed" && status.targetConversationId) {
+          await activateSharedConversation(projectID, status.targetConversationId);
+          return;
+        }
+      }
+      if (!stillMine()) return;
+      throw new Error("上下文交接超时，请稍后从历史会话重试");
+    } catch (cause) {
+      if (stillMine()) setError(cause instanceof Error ? cause.message : "上下文交接失败");
+    } finally {
+      if (stillMine()) setHandingOff(false);
+    }
+  }
+
+  async function answerPendingAsk(ask: Ask, action: { answers?: Record<string, string>; notes?: string; action?: "skip" }) {
+    if (!conversation) return;
+    setSessionControlBusy(ask.askId);
+    const reply = await rpcTransport("interaction.answerAsk", { askID: ask.askId, ...action }, 20_000);
+    setSessionControlBusy("");
+    if (!reply.ok) {
+      setError(reply.error || "回答没有送出");
+      return;
+    }
+    const reported = typeof (reply.data as { status?: unknown } | undefined)?.status === "string" ? (reply.data as { status: string }).status : "";
+    const skipped = action.action === "skip" || reported === "skipped";
+    patchConversationNotice(conversation.id, `ask:${ask.askId}`, {
+      title: skipped ? "已跳过" : "已回答",
+      state: "success",
+      ask: { ...ask, status: skipped ? "skipped" : "answered", answers: action.answers, notes: action.notes },
+    });
+  }
+
+  async function decidePendingApproval(approvalId: string, decision: "allow" | "deny") {
+    if (!conversation) return;
+    setSessionControlBusy(approvalId);
+    const reply = await rpcTransport("interaction.resolveApproval", { approvalID: approvalId, decision }, 20_000);
+    setSessionControlBusy("");
+    if (!reply.ok) {
+      setError(reply.error || "确认没有送出");
+      return;
+    }
+    patchConversationNotice(conversation.id, `approval:${approvalId}`, {
+      title: decision === "allow" ? "工具已确认" : "工具已拒绝",
+      state: decision === "allow" ? "success" : "failed",
+      approvalDecision: decision,
     });
   }
 
@@ -4562,7 +4783,7 @@ export default function MobileRemotePage() {
         headers: { "Idempotency-Key": idempotencyKey() },
         // permissionMode 显式带上：手机端的意图在手机端说清，不依赖服务端的空权限派生
         // （派生只是兜底；默认值取自目录声明 MOBILE_AGENTS.defaultPermission）。
-        body: JSON.stringify({ type: "conversation.create", projectId: projectValue.id, payload: { agentId, permissionMode } }),
+        body: JSON.stringify({ type: "conversation.create", projectId: projectValue.id, payload: { agentId, permissionMode, ...(newConversationProfile ? { profileId: newConversationProfile } : {}) } }),
       });
       setCommandState(accepted);
       const tracked = pendingConversationsRef.current.get(pendingID);
@@ -4623,13 +4844,32 @@ export default function MobileRemotePage() {
       : MOBILE_AGENTS.find((agent) => mobileAgentAvailable(projectValue, agent.id)) ?? preferred;
     setNewConversationAgent(selected?.id ?? "claude-code");
     setNewConversationPermission(selected?.defaultPermission ?? MOBILE_AGENTS[0].defaultPermission);
+    setNewConversationProfile("");
+    setProfileChoices([]);
     setNewConversationProject(projectValue);
+    void loadProfileChoices(projectValue);
+  }
+
+  async function loadProfileChoices(projectValue: Project) {
+    if (!projectValue.runner) return;
+    try {
+      const reply = await remoteConversationRPC(projectValue.id, "", "runner.profileChoices", { runnerID: projectValue.runner }, 20_000);
+      if (!reply.ok || !Array.isArray(reply.data)) return;
+      setProfileChoices(reply.data.filter((item): item is MobileProfileChoice => {
+        if (!item || typeof item !== "object") return false;
+        const record = item as MobileProfileChoice;
+        return typeof record.id === "string" && typeof record.agentId === "string" && typeof record.name === "string";
+      }));
+    } catch {
+      setProfileChoices([]);
+    }
   }
 
   /** 换工具时权限跟着该工具的目录默认走（不同工具的权限面不同，旧选择可能不适用）。 */
   function selectMobileAgent(agentID: MobileAgentID) {
     if (newConversationProject && !mobileAgentAvailable(newConversationProject, agentID)) return;
     setNewConversationAgent(agentID);
+    setNewConversationProfile("");
     const agent = MOBILE_AGENTS.find((item) => item.id === agentID);
     if (agent) setNewConversationPermission(agent.defaultPermission);
   }
@@ -4975,6 +5215,9 @@ export default function MobileRemotePage() {
   // 就该居中"，于是**有消息的会话也带上 data-empty**（探针抓到的第一条）。
   const conversationViewActive = Boolean(mobileApp && mobileView === "conversation" && project);
   const showConversationEmpty = conversationViewActive && conversationTimeline.length === 0 && conversationEmpty !== null;
+  const pendingAskNotice = (conversation?.notices || []).map((notice) => askFromNotice(notice)).find((ask) => ask !== null) || null;
+  const pendingApprovalNotice = (conversation?.notices || []).map((notice) => pendingApproval(notice)).find((item) => item !== null) || null;
+  const newConversationProfiles = selectableProfiles(profileChoices, newConversationAgent);
   // 同步给输入条那个 ResizeObserver 用（它挂在 `[mobileView, project?.id]` 上，
   // 闭包里拿不到最新的这个布尔）。放在 effect 里而不是渲染期直写 ref：effect 在浏览器
   // 布局前就跑完了，用户不可能在它之前点开工具面板。
@@ -5516,7 +5759,7 @@ export default function MobileRemotePage() {
       // 「查看文件」要先收面板：文件视图开在面板（z-60 全屏遮罩）**下面**，不收的话
       // 用户点了像没反应，返回键也得按两次才见得到文件列表。
       onOpenFile={openFileFromOptimization}
-    />}<div className="mobile-composer-shell" ref={composerShellRef}>{composerToolsOpen && <section className="mobile-composer-tools" id="mobile-composer-tools" aria-label="工具">
+    />}<div className="mobile-composer-shell" ref={composerShellRef}>{pendingAskNotice && <MobileAskCard ask={pendingAskNotice} busy={sessionControlBusy === pendingAskNotice.askId} onSkip={() => void answerPendingAsk(pendingAskNotice, { action: "skip" })} onAnswer={(answers, notes) => void answerPendingAsk(pendingAskNotice, { answers, notes })} />}{pendingApprovalNotice && <MobileApprovalCard detail={pendingApprovalNotice.detail} busy={sessionControlBusy === pendingApprovalNotice.approvalId} onDecide={(decision) => void decidePendingApproval(pendingApprovalNotice.approvalId, decision)} />}<div className="mobile-session-meta"><button type="button" disabled={conversationPending || conversationProcessing || sessionControlBusy === "model"} onClick={() => void openModelSheet()}>{conversation?.modelOverride || contextUsage?.context?.model || "模型"}</button><button type="button" disabled={conversationPending || conversationProcessing || sessionControlBusy === "permission"} onClick={() => { setConfirmingFullControl(false); setPermissionSheetOpen(true); }}>{conversation?.permissionMode ? permissionCopy[conversation.permissionMode as PermissionMode]?.title || "执行权限" : "执行权限"}</button>{conversation?.agentId === "codex" && <button type="button" disabled={conversationPending || conversationProcessing || handingOff || Boolean(conversation.isOrchestration)} onClick={() => void startContextHandoff()}>{handingOff ? "交接中" : "交接上下文"}</button>}<span className={`mobile-session-context mobile-session-context-${contextLevel(contextUsage?.context)}`}>{contextLabel(contextUsage?.context)}</span></div>{scheduledSend?.conversationId === conversation?.id && <p className="mobile-scheduled-send">已预约，本轮结束后发送<button type="button" onClick={() => setScheduledSend(null)}>取消</button></p>}{composerToolsOpen && <section className="mobile-composer-tools" id="mobile-composer-tools" aria-label="工具">
 <div className="mobile-tool-group"><h3>常用提示词<span>{promptShortcuts.length}</span></h3>{promptShortcuts.length === 0 ? <p className="mobile-tool-empty">电脑端还没有添加常用提示词。</p> : <div className="mobile-tool-chips">{promptShortcuts.map((item) => <button type="button" key={item.id} disabled={busy || !conversation || Boolean(shortcutBusy)} onClick={() => void applyShortcut(item)} title={item.template}>{shortcutBusy === item.id ? "处理中" : item.name}</button>)}</div>}</div>
 <div className="mobile-tool-group"><h3>常用命令<span>{commandShortcuts.length}</span></h3>{commandShortcuts.length === 0 ? <p className="mobile-tool-empty">电脑端还没有添加常用命令。</p> : <div className="mobile-tool-chips">{commandShortcuts.map((item) => <button type="button" key={item.id} disabled={busy || !conversation || Boolean(shortcutBusy)} onClick={() => void applyShortcut(item)} title={item.template}>{shortcutBusy === item.id ? "处理中" : item.name}</button>)}</div>}</div>
 <div className="mobile-tool-group"><h3>技能<span>{projectSkills.length}</span></h3>{projectSkills.length === 0 ? <p className="mobile-tool-empty">电脑端未发现可用技能。</p> : <div className="mobile-tool-subgroups">{skillGroups.map((group) => <div className="mobile-tool-subgroup" key={group.source}><h4>{group.label}<span>{group.items.length}</span></h4><div className="mobile-tool-chips">{group.items.map((skill) => <button type="button" key={`${group.source}-${skill.name}`} disabled={busy || !conversation} onClick={() => fillSkill(skill)} title={skill.description}>{skill.name}</button>)}</div></div>)}</div>}</div>
@@ -5541,13 +5784,15 @@ export default function MobileRemotePage() {
     而停止走的是另一条通道、且是幂等的，没理由被它们挡住。
     会话还是本地态（conversationPending）时不显示：那个窗口里电脑端还没接到任何东西，
     而中继的 conversationId 只取自信封、这种情况传的是空串，发出去只会得到一句参数错误。 */}
-{conversationProcessing && !conversationPending && <button type="button" className="mobile-composer-stop" disabled={stoppingConversation} title={stoppingConversation ? "正在停止当前对话" : "停止当前对话"} onClick={() => void stopConversationRun(false, conversation?.id ?? "")}>{stoppingConversation ? "停止中" : "停止"}</button>}<button type="submit" className="mobile-composer-send" disabled={busy || !conversation || (!messageDraft.trim() && skillRefs.length === 0 && !quoteRef)} aria-label="发送消息" title="发送消息"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg></button></div></form></div></section>}
+{conversationProcessing && !conversationPending && (messageDraft.trim() || skillRefs.length > 0 || quoteRef) && <button type="button" className="mobile-composer-schedule" disabled={Boolean(scheduledSend)} onClick={scheduleConversationMessage}>预约</button>}{conversationProcessing && !conversationPending && <button type="button" className="mobile-composer-stop" disabled={stoppingConversation} title={stoppingConversation ? "正在停止当前对话" : "停止当前对话"} onClick={() => void stopConversationRun(false, conversation?.id ?? "")}>{stoppingConversation ? "停止中" : "停止"}</button>}<button type="submit" className="mobile-composer-send" disabled={busy || !conversation || (!messageDraft.trim() && skillRefs.length === 0 && !quoteRef)} aria-label="发送消息" title="发送消息"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg></button></div></form></div></section>}
     {newConversationProject && <div className="mobile-new-conversation-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-new-conversation-title"><section className="mobile-new-conversation-dialog">
       <div className="mobile-sheet-grabber" aria-hidden="true"></div>
       <header><div><h2 id="mobile-new-conversation-title">新会话</h2><p>选择执行工具</p></div><button type="button" onClick={cancelNewConversation} disabled={busy} aria-label="关闭">×</button></header>
       {/* 方案 A（2026-09-24）：横向徽标大卡 —— 图形主导的"选应用"形态。
-          真实官方图标来自与桌面端同一份资产（AgentLogo）；徽标类（CodeBuddy）由
-          data-logo-badge 铺满图位，裸图形（Claude/OpenAI）坐在品牌浅底上居中。
+          真实官方图标来自与桌面端同一份资产（AgentLogo）；徽标类（CodeBuddy/Qoder，
+          自带底色）由 data-logo-badge 铺满图位，裸图形（Claude/OpenAI/OpenCode/Cursor）
+          坐在品牌浅底上居中。logo 白名单在 lib/cli-tools-view.ts 的 agentLogoKey，
+          没有官方图标的工具回落两字母牌。
           副标题是厂商，不是"已就绪"—— 手机快照里没有每个工具的就绪读数，
           写"已就绪"就是把"读不到"写成"没有"。 */}
       <div className="mobile-agent-app-grid" role="radiogroup" aria-label="选择执行工具">
@@ -5595,8 +5840,17 @@ export default function MobileRemotePage() {
         </div>
         <p className="mobile-permission-hint">{permissionCopy[newConversationPermission].detail}</p>
       </div>
+      {newConversationProfiles.length > 0 && <div className="mobile-permission">
+        <span className="mobile-permission-label">配置档案</span>
+        <div className="mobile-permission-segments" role="radiogroup" aria-label="配置档案">
+          <button type="button" role="radio" aria-checked={newConversationProfile === ""} className={newConversationProfile === "" ? "active" : ""} onClick={() => setNewConversationProfile("")}>CLI 当前登录</button>
+          {newConversationProfiles.map((profile) => <button type="button" key={profile.id} role="radio" aria-checked={newConversationProfile === profile.id} className={newConversationProfile === profile.id ? "active" : ""} onClick={() => setNewConversationProfile(profile.id)}>{profile.name}{profile.model ? ` · ${profile.model}` : ""}</button>)}
+        </div>
+      </div>}
       <footer><button type="button" className="mobile-new-conversation-cancel" onClick={cancelNewConversation} disabled={busy}>取消</button><button type="button" className="mobile-new-conversation-confirm" onClick={() => void createConversationForProject(newConversationProject, newConversationAgent, newConversationPermission)} disabled={busy || !mobileAgentAvailable(newConversationProject, newConversationAgent)}>创建会话</button></footer>
     </section></div>}
+    {modelSheet !== false && <MobileModelSheet models={modelSheet} busy={sessionControlBusy === "model"} onClose={() => { if (sessionControlBusy !== "model") setModelSheet(false); }} onSelect={(model) => void applyModel(model)} />}
+    {permissionSheetOpen && <MobilePermissionSheet agentName={MOBILE_AGENTS.find((agent) => agent.id === conversation?.agentId)?.name || "Agent"} modes={MOBILE_AGENTS.find((agent) => agent.id === conversation?.agentId)?.permissionModes || []} current={conversation?.permissionMode || ""} busy={sessionControlBusy === "permission"} confirmingFullControl={confirmingFullControl} onClose={() => { if (sessionControlBusy === "permission") return; setConfirmingFullControl(false); setPermissionSheetOpen(false); }} onSelect={(mode) => void applyPermission(mode)} onConfirmFullControl={() => void applyPermission("full_control", true)} />}
     {conversationHistoryOpen && <div className="mobile-conversation-history-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-conversation-history-title" onClick={(event) => { if (event.target === event.currentTarget) setConversationHistoryOpen(false); }}><section className="mobile-conversation-history-dialog"><header><div><h2 id="mobile-conversation-history-title">历史会话</h2><small>{historyDirectoryProjectID === project?.id && historyDirectory ? `${historyDirectory.length} 个会话` : "正在同步目录"}</small></div><button type="button" onClick={() => setConversationHistoryOpen(false)} aria-label="关闭历史会话">×</button></header>{historyDirectoryLoading && <p className="mobile-empty">正在从电脑端读取全部会话...</p>}{historyDirectoryError && <p className="mobile-empty" role="status">{historyDirectoryError}</p>}{!historyDirectoryLoading && conversations.length === 0 ? <p className="mobile-empty">该项目还没有会话。</p> : <ul className="mobile-conversation-history-list">{conversations.map((item) => <li key={item.id}><button type="button" className={`mobile-conversation-history-item${item.id === conversation?.id ? " active" : ""}`} aria-current={item.id === conversation?.id ? "true" : undefined} onClick={() => { if (!project?.id || item.isOrchestration) return; void activateSharedConversation(project.id, item.id).then((activated) => { if (activated) { setConversationHistoryOpen(false); void loadConversationHistory(project.id, item.id); } }).catch((cause) => setError(cause instanceof Error ? cause.message : "无法切换当前会话")); }}><strong>{item.title || "未命名会话"}</strong><small>{conversationStatusLabel(item.status)}{item.isOrchestration ? " · 编排任务（只读）" : ""}{item.lastActivityAt ? ` · ${new Date(item.lastActivityAt).toLocaleString()}` : ""}</small></button></li>)}</ul>}</section></div>}
   </main>;
 }

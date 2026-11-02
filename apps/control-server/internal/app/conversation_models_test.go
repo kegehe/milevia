@@ -175,6 +175,9 @@ func TestSSHCommandsCarryModel(t *testing.T) {
 	if !strings.HasPrefix(codexCmd, `codex exec -c 'model="gpt-5.5"' resume `) {
 		t.Fatalf("模型必须排在 exec 之后、resume 之前（与本地 runner 同序）: %q", codexCmd)
 	}
+	if !strings.Contains(codexCmd, "--skip-git-repo-check") {
+		t.Fatalf("SSH resume 缺少 --skip-git-repo-check，远端非 git 目录无法恢复会话: %q", codexCmd)
+	}
 
 	freshCodex := buildSSHCodexExecCommand(
 		AgentRunRequest{Prompt: "hi", ProjectPath: "/srv/app", Model: "gpt-5.5"},
@@ -621,6 +624,11 @@ func TestCodexExecArgsPassModel(t *testing.T) {
 	if resume[len(resume)-1] != "-" || containsArguments(resume, "hi") {
 		t.Fatalf("prompt 必须经 stdin 提供，末尾保留 stdin 标记: %q", resume)
 	}
+	// 新建目录常常还不是 git 仓库；缺 --skip-git-repo-check 时 CLI 会直接拒绝执行，
+	// 前端只能看到「工具输出异常」，所以两条分支都必须带上。
+	if !containsArguments(resume, "--skip-git-repo-check") {
+		t.Fatalf("resume 分支缺少 --skip-git-repo-check，非 git 目录会启动失败: %q", resume)
+	}
 	modelIndex, resumeIndex := indexOfArgument(resume, `model="gpt-5.5"`), indexOfArgument(resume, "resume")
 	if modelIndex < 0 || resumeIndex < 0 || modelIndex > resumeIndex {
 		t.Fatalf("模型覆盖应排在 resume 之前（与既有行为一致）: %q", resume)
@@ -629,6 +637,9 @@ func TestCodexExecArgsPassModel(t *testing.T) {
 	fresh := codexExecArgs(AgentRunRequest{Prompt: "hi", ProjectPath: "/p", Model: "gpt-5.5"}, nil, "/tmp/schema.json", "workspace-write")
 	if !strings.Contains(strings.Join(fresh, " "), `--output-schema /tmp/schema.json`) {
 		t.Fatalf("schema 参数丢失: %q", fresh)
+	}
+	if !containsArguments(fresh, "--skip-git-repo-check") {
+		t.Fatalf("新会话分支缺少 --skip-git-repo-check，非 git 目录会启动失败: %q", fresh)
 	}
 	if fresh[len(fresh)-1] != "-" || containsArguments(fresh, "hi") || !strings.Contains(strings.Join(fresh, " "), `-C /p --sandbox workspace-write`) {
 		t.Fatalf("新会话参数装配异常: %q", fresh)

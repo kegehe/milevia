@@ -1809,52 +1809,221 @@ fn navigate_main(app: tauri::AppHandle, path: String) {
     }
 }
 
-/// 在 Windows 系统右下角弹一条系统通知。前端只在用户开启“Windows 弹窗通知”
-/// 且收到任务完成类通知时调用。
+#[derive(serde::Deserialize)]
+struct ToastButton {
+    label: String,
+    action: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationActivation {
+    action: String,
+    path: String,
+    approval_id: String,
+    notification_id: String,
+}
+
+/// 弹窗被点了之后该做什么。
 ///
-/// - 内容为「方案A分层完整版」三行：`title`（“任务已完成/任务等待审查”，与事件类型
-///   语义匹配，由前端 isWindowsNotifyType 保证）、`line1`（“项目「X」· 任务Y”）、
-///   `line2`（“耗时 …”）。字段全部由服务端算好、前端组好行传入；空串的行跳过不渲染，
-///   因此旧数据缺耗时/任务名时自动退化为更短的弹窗，不会显示占位符。
-/// - `Duration::Short` 让系统按短时展示（会在一段时间后自动消失）。
-/// - 用户点击弹窗时（前台激活）调用回调：`on_activated` 闭包直接捕获本次 `path`，
-///   因此**每条弹窗点击都只跳到它对应的那条任务的项目**（无需中心的共享状态，
-///   也不存在多条弹窗互相覆盖导航目标的问题）。跳转复用托盘“跳转主窗口”同款实现。
+/// 按钮把 `allow` / `deny` 放进激活参数；点正文、或参数不是这两词，都是「打开会话」。
+/// 审批 id 不从参数里取，由弹出时的闭包带上，避免一条通知去裁决另一条审批。
+fn toast_activation_action(arguments: Option<&str>) -> &'static str {
+    match arguments.map(str::trim).unwrap_or("") {
+        "allow" => "allow",
+        "deny" => "deny",
+        _ => "open",
+    }
+}
+
+const TOAST_GROUP: &str = "milevia";
+
+/// 系统通知的编号。只留字母和数字，最长 64：这是 Windows 能用来事后按编号收起的上限。
+fn toast_tag(notification_id: &str) -> String {
+    let mut tag = String::new();
+    for ch in notification_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            tag.push(ch);
+        }
+        if tag.len() == 64 {
+            break;
+        }
+    }
+    tag
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn activated_argument(value: windows::core::Ref<'_, windows::core::IInspectable>) -> Option<String> {
+    use windows::core::Interface;
+    let inspectable = value.as_ref()?;
+    let args = inspectable.cast::<windows::UI::Notifications::ToastActivatedEventArgs>().ok()?;
+    let arguments = args.Arguments().ok()?;
+    if arguments.is_empty() {
+        None
+    } else {
+        Some(arguments.to_string())
+    }
+}
+
+/// 弹出一条带编号的系统通知。编号非空时，之后可以用同一个编号把它收掉。
+fn show_windows_toast<F>(app_id: &str, xml: &str, tag: &str, mut on_activated: F) -> Result<(), String>
+where
+    F: FnMut(Option<String>) + Send + 'static,
+{
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::core::{HSTRING, IInspectable};
+
+    let document = XmlDocument::new().map_err(|error| error.to_string())?;
+    document.LoadXml(&HSTRING::from(xml)).map_err(|error| error.to_string())?;
+    let toast = ToastNotification::CreateToastNotification(&document).map_err(|error| error.to_string())?;
+    if !tag.is_empty() {
+        toast.SetTag(&HSTRING::from(tag)).map_err(|error| error.to_string())?;
+        toast.SetGroup(&HSTRING::from(TOAST_GROUP)).map_err(|error| error.to_string())?;
+    }
+    let handler = TypedEventHandler::<ToastNotification, IInspectable>::new(move |_, args| {
+        on_activated(activated_argument(args));
+        Ok(())
+    });
+    toast.Activated(&handler).map_err(|error| error.to_string())?;
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id))
+        .map_err(|error| error.to_string())?;
+    notifier.Show(&toast).map_err(|error| error.to_string())
+}
+
+fn remove_windows_toast(app_id: &str, tag: &str) -> Result<(), String> {
+    use windows::UI::Notifications::ToastNotificationManager;
+    use windows::core::HSTRING;
+
+    if tag.is_empty() {
+        return Ok(());
+    }
+    let history = ToastNotificationManager::History().map_err(|error| error.to_string())?;
+    history
+        .RemoveGroupedTagWithId(&HSTRING::from(tag), &HSTRING::from(TOAST_GROUP), &HSTRING::from(app_id))
+        .map_err(|error| error.to_string())
+}
+
+/// 在 Windows 系统右下角弹一条系统通知。前端只在用户开启“Windows 弹窗通知”
+/// 且主窗口不在前台时调用。
+///
+/// - `title` / `line1` / `line2` 由前端组好。空串的行跳过，不显示占位符。
+/// - `sticky` 为真时通知留到用户处理（审批、提问、需要人工介入、编排卡住）。
+///   完成类保持短时，过一会儿自己消失。
+/// - `buttons` 只接受 `allow` / `deny`，并且必须带上 `approval_id`。点按钮不拉起窗口，
+///   把裁决发给前端去调本机接口。点正文才聚焦主窗口并打开对应会话。
 #[tauri::command]
-fn show_system_notification(app: tauri::AppHandle, path: String, title: String, line1: String, line2: String) {
+fn show_system_notification(
+    app: tauri::AppHandle,
+    path: String,
+    title: String,
+    line1: String,
+    line2: String,
+    buttons: Option<Vec<ToastButton>>,
+    approval_id: Option<String>,
+    notification_id: Option<String>,
+    sticky: Option<bool>,
+) {
     let app_id = app.config().identifier.clone();
     let callback_app = app.clone();
-    // 把本条弹窗自己的导航目标放进闭包，随 Toast 一起保存（每条调用独享一份）。
     let target = path.clone();
-    let mut toast = tauri_winrt_notification::Toast::new(app_id.as_str()).title(title.as_str());
+    let approval_id = approval_id.unwrap_or_default();
+    let notification_id = notification_id.unwrap_or_default();
+    let can_decide = !approval_id.is_empty();
+    let mut actions = String::new();
+    if can_decide {
+        if let Some(buttons) = buttons {
+            let mut body = String::new();
+            for button in buttons {
+                if button.action != "allow" && button.action != "deny" {
+                    continue;
+                }
+                let label = button.label.trim();
+                if label.is_empty() {
+                    continue;
+                }
+                body.push_str(&format!(
+                    "<action content=\"{}\" arguments=\"{}\"/>",
+                    xml_escape(label),
+                    xml_escape(&button.action),
+                ));
+            }
+            if !body.is_empty() {
+                actions = format!("<actions>{body}</actions>");
+            }
+        }
+    }
+    let sticky = sticky.unwrap_or(false);
+    let duration = if sticky { "duration=\"long\"" } else { "duration=\"short\"" };
+    let scenario = if sticky { "scenario=\"reminder\"" } else { "" };
+    let mut texts = format!("<text id=\"1\">{}</text>", xml_escape(&title));
     if !line1.is_empty() {
-        toast = toast.text1(line1.as_str());
+        texts.push_str(&format!("<text id=\"2\">{}</text>", xml_escape(&line1)));
     }
     if !line2.is_empty() {
-        toast = toast.text2(line2.as_str());
+        texts.push_str(&format!("<text id=\"3\">{}</text>", xml_escape(&line2)));
     }
-    let result = toast
-        .duration(tauri_winrt_notification::Duration::Short)
-        .on_activated(move |_args| {
-            // WebView 必须在主线程操作，跳到该条弹窗对应的项目。
+    let xml = format!(
+        r#"<toast {duration} {scenario}><visual><binding template="ToastGeneric">{texts}</binding></visual>{actions}</toast>"#
+    );
+    // 有通知 id 才编号。审批在别处处理完之后，靠这个编号把还留在屏幕上的弹窗收掉。
+    let tag = toast_tag(&notification_id);
+    let result = show_windows_toast(app_id.as_str(), &xml, &tag, move |args| {
+        let action = toast_activation_action(args.as_deref());
+        let payload = NotificationActivation {
+            action: action.to_string(),
+            path: target.clone(),
+            approval_id: approval_id.clone(),
+            notification_id: notification_id.clone(),
+        };
+        if action == "open" {
             let app = callback_app.clone();
-            let target = target.clone();
+            let navigate_to = target.clone();
             let _ = callback_app.run_on_main_thread(move || {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.unminimize();
                     let _ = window.set_focus();
                     let _ = window.eval(&format!(
-                        "window.__mileviaNavigate && window.__mileviaNavigate({target:?})"
+                        "window.__mileviaNavigate && window.__mileviaNavigate({navigate_to:?})"
                     ));
                 }
             });
-            Ok(())
-        })
-        .show();
+        }
+        if let Err(error) = callback_app.emit("notification://activated", payload) {
+            eprintln!("[notification] 回报弹窗操作失败: {error}");
+        }
+    });
     if let Err(error) = result {
         eprintln!("[notification] 显示系统通知失败: {error}");
     }
+}
+
+/// 按弹出时的编号收起一条系统通知。通知已经点掉或不存在时静默返回。
+#[tauri::command]
+fn dismiss_system_notification(app: tauri::AppHandle, notification_id: String) {
+    let tag = toast_tag(&notification_id);
+    if tag.is_empty() {
+        return;
+    }
+    let app_id = app.config().identifier.clone();
+    // 人已经点过这条弹窗时，系统里已经没有它，再收一次会失败。那不是故障。
+    let _ = remove_windows_toast(&app_id, &tag);
 }
 
 /// 真正退出应用（触发 ExitRequested → 优雅停掉 sidecar）。
@@ -2098,6 +2267,7 @@ fn main() {
             set_panel_size,
             navigate_main,
             show_system_notification,
+            dismiss_system_notification,
             enroll_remote_agent,
             open_app_data_directory,
             open_terminal_directory,
@@ -2562,5 +2732,26 @@ mod tests {
 
         assert!(!start, "正在安装时不该再起下载");
         assert!(state.downloading.is_none());
+    }
+
+    #[test]
+    fn toast_tag_keeps_the_id_windows_can_remove() {
+        assert_eq!(toast_tag(""), "");
+        assert_eq!(
+            toast_tag("550e8400-e29b-41d4-a716-446655440000"),
+            "550e8400e29b41d4a716446655440000"
+        );
+        assert_eq!(toast_tag(&"a".repeat(80)).len(), 64);
+        assert_eq!(toast_tag("审批"), "");
+    }
+
+    #[test]
+    fn toast_button_decides_and_body_click_opens() {
+        assert_eq!(toast_activation_action(Some("allow")), "allow");
+        assert_eq!(toast_activation_action(Some(" deny ")), "deny");
+        assert_eq!(toast_activation_action(Some("")), "open");
+        assert_eq!(toast_activation_action(None), "open");
+        assert_eq!(toast_activation_action(Some("open")), "open");
+        assert_eq!(toast_activation_action(Some("allow;other")), "open");
     }
 }

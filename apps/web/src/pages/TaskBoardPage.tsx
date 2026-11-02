@@ -8,7 +8,7 @@ import { TasksSubnav } from "./TasksSubnav";
 export default function TaskBoardPage() {
   const { projectId, taskId } = useParams<{ projectId: string; taskId?: string }>();
   const navigate = useNavigate();
-  const { api, setError } = useProjectContext();
+  const { api, setError, projects } = useProjectContext();
 
   if (!projectId) return null;
 
@@ -17,6 +17,7 @@ export default function TaskBoardPage() {
       <TasksSubnav projectId={projectId} active="board" />
       <TaskBoard
         projectID={projectId}
+        projectName={projects.find((project) => project.id === projectId)?.name || ""}
         initialTaskID={taskId}
         permissionMode="full_control"
         request={api}

@@ -46,6 +46,11 @@ export default function TerminalPage() {
   const [showNewMenu, setShowNewMenu] = useState(false);
   const { openMenu, closeMenu, menu } = useContextMenu();
   const newMenuRef = useRef<HTMLDivElement>(null);
+  // 最近一次真实鼠标右键按下的时间：用来区分「右键」和键盘菜单键 / 触屏长按
+  // 合成的 contextmenu（后者没有右键 mousedown，应打开菜单而不是直接粘贴）。
+  // 初值用 -Infinity 而不是 0：页面刚加载时 performance.now() 本身还不到 1000，
+  // 用 0 当「没有右键」的哨兵会把键盘菜单键误判成右键。
+  const rightMouseDownAtRef = useRef(Number.NEGATIVE_INFINITY);
   // 关闭确认：点标签上的 × 或中键点击都会立刻结束会话及其中的进程，
   // 未结束的会话（可能正跑着构建/部署）要先确认，已结束的会话才直接关。
   const [pendingCloseID, setPendingCloseID] = useState<string | null>(null);
@@ -168,7 +173,8 @@ export default function TerminalPage() {
 
   useEffect(() => {
     const activeSession = sessions.find((item) => item.id === activeID);
-    if (!projectId || !activeID || !hostRef.current || activeSession?.projectId !== projectId) return;
+    const host = hostRef.current;
+    if (!projectId || !activeID || !host || activeSession?.projectId !== projectId) return;
     let disposed = false;
     const term = new Terminal({
       convertEol: false,
@@ -204,10 +210,10 @@ export default function TerminalPage() {
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.open(hostRef.current);
+    term.open(host);
     termRef.current = term;
     const resize = () => {
-      if (!hostRef.current || hostRef.current.clientWidth === 0) return;
+      if (host.clientWidth === 0) return;
       fit.fit();
       const ws = wsRef.current;
       if (ws?.readyState === WebSocket.OPEN && term.cols > 0 && term.rows > 0) {
@@ -215,7 +221,7 @@ export default function TerminalPage() {
       }
     };
     const observer = new ResizeObserver(resize);
-    observer.observe(hostRef.current);
+    observer.observe(host);
     resize();
     statusRef.current = "connecting";
     setStatus("connecting");
@@ -271,8 +277,45 @@ export default function TerminalPage() {
       frame.set(bytes, 8);
       ws.send(frame);
     });
+    // 拖拽选中即复制：与 Linux 终端、Windows Terminal 的习惯一致，松开鼠标就把
+    // 最终选区写进剪贴板。
+    //   · mousedown / mouseup 都挂在 document 捕获阶段：每次按下都会重置本次手势
+    //     的状态，即便某次 mouseup 丢在窗口外，之后任意一次松手也不会把旧选区重新
+    //     复制一遍；把鼠标拖出终端再松手时事件同样不会落在 host 内；
+    //   · 只认 .xterm 内、滚动条（.xterm-viewport）外的按下点，拖滚动条不复制；
+    //   · 捕获阶段也绕开了 xterm 在应用开启鼠标上报（vim 等）时对 mousedown 的
+    //     stopPropagation；
+    //   · 鼠标上报模式（vim / htop 等）下普通点击不会改选区，这种模式只复制
+    //     真正变过的选区，否则每次点击都会把同一段旧内容重新写进剪贴板；正常模式
+    //     下直接复制，免得“重新拖选同一段”因为文本没变而漏复制。xterm 的
+    //     onSelectionChange 要等它自己的 mouseup 处理后才触发，晚于这里的捕获
+    //     监听，所以用「按下时的选区」与松开时的选区比对。
+    let selecting = false;
+    let selectionAtMouseDown = "";
+    const onSelectionMouseDown = (event: MouseEvent) => {
+      if (event.button === 2 && event.target instanceof Node && host.contains(event.target)) rightMouseDownAtRef.current = performance.now();
+      selecting = false;
+      if (event.button !== 0) return;
+      const target = event.target;
+      selecting = target instanceof Element && !!target.closest(".xterm") && !target.closest(".xterm-viewport");
+      selectionAtMouseDown = selecting ? term.getSelection() : "";
+    };
+    const onSelectionMouseUp = (event: MouseEvent) => {
+      if (!selecting || event.button !== 0) return;
+      selecting = false;
+      const text = term.getSelection();
+      if (!text) return;
+      if (term.modes.mouseTrackingMode !== "none" && text === selectionAtMouseDown) return;
+      void copyToClipboard(text).then((copied) => {
+        if (!copied && !disposed) setError("无法复制终端内容，请检查剪贴板权限。");
+      });
+    };
+    document.addEventListener("mousedown", onSelectionMouseDown, true);
+    document.addEventListener("mouseup", onSelectionMouseUp, true);
     return () => {
       disposed = true;
+      document.removeEventListener("mousedown", onSelectionMouseDown, true);
+      document.removeEventListener("mouseup", onSelectionMouseUp, true);
       input.dispose();
       observer.disconnect();
       ws.close();
@@ -405,6 +448,19 @@ export default function TerminalPage() {
     const selection = term?.getSelection() || "";
     const path = selected?.cwdDisplay || "";
     const canOpenDirectory = isDesktop() && !!path && (selected?.environment === "windows" || selected?.environment === "wsl");
+    // 裸右键直接粘贴（Linux 终端与 Windows Terminal 的习惯）；Shift+右键才打开
+    // 复制 / 全选 / 打开目录这些低频操作。会话不可写入时仍回到菜单，免得右键
+    // 看起来毫无反应，也还能复制已退出会话里的历史内容。
+    // 只有紧随真实右键按下的 contextmenu 才粘贴：键盘菜单键与触屏长按同样会发
+    // contextmenu，但它们没有右键 mousedown，应当照旧打开菜单。
+    const fromRightMouse = performance.now() - rightMouseDownAtRef.current < 1000;
+    rightMouseDownAtRef.current = Number.NEGATIVE_INFINITY;
+    const canPaste = Boolean(term) && status === "running" && ws?.readyState === WebSocket.OPEN;
+    if (fromRightMouse && !event.shiftKey && term && canPaste) {
+      event.preventDefault();
+      void paste(term, isCurrent);
+      return;
+    }
     openMenu(event, "终端操作", [
       { label: "复制", disabled: !selection, action: () => {
         if (!isCurrent()) return;

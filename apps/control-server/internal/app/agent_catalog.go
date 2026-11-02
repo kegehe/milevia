@@ -140,6 +140,13 @@ type AgentCatalogEntry struct {
 	// CHECK(agent_id in ('claude-code','codex')) 约束；新增工具在迁移表之前必须为 false，
 	// 否则界面会提供一个保存时必然撞 SQLite 约束的选项。
 	SupportsProfiles bool `json:"supportsProfiles"`
+	// SupportsSteering 表示该 CLI 的会话能在**回合进行中**接收用户追加消息（平台侧
+	// 写一帧 user 到 stdin，模型在当前批工具结果返回后就能看到，当回合调整）。
+	//
+	// 这只是一半判据：另一半在 Runner 上 —— SSH 远端的 sshAgentSession 尚未实现
+	// InjectPrompt，界面需要同时确认项目不是远端会话，否则会把"排队"说成"插话"。
+	// 见 claude_runner.go 的 SteerableAgentSession。
+	SupportsSteering bool `json:"supportsSteering"`
 }
 
 // agentCatalogEntries 是唯一清单。顺序即界面顺序。
@@ -172,6 +179,9 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		SupportsProjectInsights:     true,
 		SupportsConflictSuggestions: true,
 		SupportsProfiles:            true,
+		// 回合内插话：claudeCLISession.InjectPrompt（本机与 WSL 复用同一个会话实现，
+		// 实测 2.1.310 在工具结果返回边界注入成功；SSH 远端走另一套 sshAgentSession）。
+		SupportsSteering: true,
 	},
 	{
 		ID:                "codex",
@@ -263,11 +273,9 @@ var agentCatalogEntries = []AgentCatalogEntry{
 			Command: "npm", Label: "Node.js（含 npm）", Kind: "managed-runtime",
 			InstallHint: "https://nodejs.org/",
 		}},
-		// 实测（1.1.75）`-p -o stream-json` 的 system/init 帧自带 slash_commands 列表，
-		// 但平台的"命令目录"接口（project_commands.go）还没有接 Qoder 的探测 —— 那边
-		// 一旦按 Claude 探测，就会把 Claude 的命令当成 Qoder 的。目录接通前如实为 false：
-		// 界面不给一个空的选择器。
-		SlashCommands: false,
+		// 2026-10-29 本机实测（1.1.80）：init 帧里有 82 条 slash_commands。
+		// 目录按项目和工具分开缓存，不再和 Claude 共用一个槽。
+		SlashCommands: true,
 		// 走 `--mcp-config <file> [--strict-mcp-config]`，与 Claude Code 同形；
 		// 密钥仍以 ${VAR} 占位符留在文件里、真值随进程环境走（mcp_config.go）。
 		MCPInjection: "cli-args",
@@ -280,6 +288,9 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// 事件形状与 Claude Code 同构（init → assistant → result）。
 		RunnableInProject:           true,
 		SupportsConflictSuggestions: true,
+		// 2026-10-29 本机实测（1.1.80）：后补的用户帧在同一个 result 之前生效，没有另开 init。
+		// SSH 不走这个会话实现，界面还会再排除 ssh- 开头的 runner。
+		SupportsSteering: true,
 	},
 	{
 		ID:          "opencode",

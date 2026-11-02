@@ -2086,10 +2086,10 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
- "tauri-winrt-notification",
  "tokio",
  "url",
  "uuid",
+ "windows",
 ]
 
 [[package]]
@@ -3923,17 +3923,6 @@ dependencies = [
  "dunce",
  "embed-resource",
  "toml 1.1.2+spec-1.1.0",
-]
-
-[[package]]
-name = "tauri-winrt-notification"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ed071c670382e85fc2f48ae706492d8c338f4f89bf72520d32f8abfe880aade"
-dependencies = [
- "thiserror 2.0.18",
- "windows",
- "windows-version",
 ]
 
 [[package]]

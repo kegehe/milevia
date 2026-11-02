@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -124,14 +125,28 @@ func (s *Server) recordProjectMCPInjection(projectID string, status projectMCPSt
 }
 
 // getProjectMCPStatus 返回该项目最近一次注入快照；尚未运行过任务时返回空快照。
+//
+// 两种视角（query 参数区分）：
+//   - 默认（快照视角）：原样返回最近一次注入的记录，供「MCP 连接」页做历史展示；
+//   - scope=session + agentId（会话视角）：对话页托盘问的是「我这个会话现在能用哪些」，
+//     快照本身不会因为用户在「MCP 连接」里停用某个 server 而变化，照直返回就会把已停用
+//     的条目一直显示成连接中。这里按**当前**启停与适用范围复核一遍，把失效的剔掉。
 func (s *Server) getProjectMCPStatus(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
-	if _, err := s.getProjectByID(r.Context(), projectID); err != nil {
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, errors.New("project not found"))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	query := r.URL.Query()
+	sessionView := query.Get("scope") == "session"
+	agentID := strings.TrimSpace(query.Get("agentId"))
+	if sessionView && agentID != "" && !validProfileAgent(agentID) {
+		writeError(w, http.StatusBadRequest, errors.New("未知的 Agent"))
 		return
 	}
 	s.mu.Lock()
@@ -143,5 +158,69 @@ func (s *Server) getProjectMCPStatus(w http.ResponseWriter, r *http.Request) {
 	if status.Servers == nil {
 		status.Servers = []projectMCPStatusServer{}
 	}
+	if sessionView {
+		status = s.resolveSessionMCPStatus(r.Context(), projectID, agentID, s.resolveAgentTargetEnv(project.RunnerID, project.Path), status)
+	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+// resolveSessionMCPStatus 把「最近一次注入快照」换算成「本会话当前可用的 server」。
+//
+// 只做减法、不做加法：没被注入过的 server 不会因为刚启用就凭空出现在托盘里（它还没被
+// CLI 加载过），但被停用 / 删掉 / 改了适用范围的一定要立即消失 —— 否则对话页会一边说
+// 「已连接」、一边在「MCP 连接」里显示「已停用」，用户只能靠自己猜哪个是真的。
+func (s *Server) resolveSessionMCPStatus(ctx context.Context, projectID, agentID string, target agentTargetEnv, status projectMCPStatus) projectMCPStatus {
+	// 没给 Agent 就无从判断，退回快照：宁可少一层过滤，也不猜。
+	if agentID == "" {
+		return status
+	}
+	// 快照是**按项目**存的，同一项目的不同会话可能跑不同 Agent；把 A 会话注入的 server
+	// 画到 B 会话的托盘里，与事实不符，直接按「本会话还没有连接」处理。
+	if status.AgentID != "" && status.AgentID != agentID {
+		status.Servers = []projectMCPStatusServer{}
+		status.ServerCount = 0
+		status.Note = "最近一次注入来自其他 Agent 的会话，本会话还没有连接任何 MCP server。"
+		return status
+	}
+	if len(status.Servers) == 0 {
+		return status
+	}
+	if target != agentTargetEnvWindows && target != agentTargetEnvWSL && target != agentTargetEnvRemote {
+		return status
+	}
+	selected, err := s.selectMCPServers(ctx, projectID, agentID, target)
+	if err != nil {
+		// 读不到当前配置时保留快照：把查询失败说成「没有 server」会凭空清空托盘。
+		return status
+	}
+	live := make(map[string]bool, len(selected))
+	for _, server := range selected {
+		live[server.Name] = true
+	}
+	kept := make([]projectMCPStatusServer, 0, len(status.Servers))
+	removed := 0
+	for _, server := range status.Servers {
+		if live[server.Name] {
+			kept = append(kept, server)
+			continue
+		}
+		removed++
+	}
+	if removed == 0 {
+		return status
+	}
+	status.Servers = kept
+	status.ServerCount = len(kept)
+	removal := fmt.Sprintf("其中 %d 个 server 已停用、删除或不再适用于本会话，已从列表中移除。", removed)
+	if len(kept) == 0 {
+		removal = fmt.Sprintf("最近一次注入的 %d 个 server 已全部停用、删除或不再适用于本会话，当前没有可用的 MCP server。", removed)
+	}
+	// 快照自己可能已经有说明（cwd 被丢弃、远端能力未探测…），那是注入侧的事实，
+	// 不能因为这里补一条就把它盖掉。
+	if strings.TrimSpace(status.Note) != "" {
+		status.Note += "；" + removal
+	} else {
+		status.Note = removal
+	}
+	return status
 }

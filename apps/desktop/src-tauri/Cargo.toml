@@ -16,7 +16,7 @@ tauri = { version = "2.11.3", features = ["tray-icon", "image-ico"] }
 tauri-plugin-single-instance = "2.4.0"
 tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"
-tauri-winrt-notification = "0.7"
 tokio = { version = "1", features = ["time"] }
+windows = { version = "0.61", features = ["Data_Xml_Dom", "Foundation", "UI_Notifications"] }
 url = "2.5.8"
 uuid = { version = "1.19.0", features = ["v4"] }

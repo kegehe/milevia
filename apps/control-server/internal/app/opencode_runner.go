@@ -131,8 +131,7 @@ func (r *opencodeCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	cmd := opencodeCommandContext(ctx, r.opencodeBinary(), "--version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runProbeCommand(ctx, cmd)
 	if err != nil {
 		return ""
 	}

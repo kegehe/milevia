@@ -190,3 +190,44 @@ func TestStreamJSONSessionDoneIsNotConsumedByWatcher(t *testing.T) {
 		t.Fatal("stopped 没有被关闭，旁路会一直挂着")
 	}
 }
+
+func TestQoderInjectPromptWritesIntoActiveTurn(t *testing.T) {
+	stdin := &captureWriteCloser{}
+	session := newStreamJSONSession(streamJSONSessionConfig{agentID: "qoder", label: "Qoder", steer: true}, nil, stdin, nil, nil)
+	if err := session.Send(AgentRunRequest{Prompt: "先看目录", AgentID: "qoder", RunID: "run-1"}, newRecordingTurnSink()); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	runID, err := session.InjectPrompt("改成只回答 PINEAPPLE")
+	if err != nil {
+		t.Fatalf("InjectPrompt: %v", err)
+	}
+	if runID != "run-1" {
+		t.Fatalf("run id = %q", runID)
+	}
+	if strings.Count(stdin.String(), "\"type\":\"user\"") != 2 {
+		t.Fatalf("stdin = %s", stdin.String())
+	}
+}
+
+func TestCodebuddyInjectPromptFallsBackWhenSteeringIsOff(t *testing.T) {
+	session := newStreamJSONSession(streamJSONSessionConfig{agentID: "codebuddy", label: "CodeBuddy"}, nil, &captureWriteCloser{}, nil, nil)
+	if err := session.Send(AgentRunRequest{Prompt: "hi", AgentID: "codebuddy", RunID: "run-1"}, newRecordingTurnSink()); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := session.InjectPrompt("后补"); err != errNoActiveTurn {
+		t.Fatalf("err = %v, want errNoActiveTurn", err)
+	}
+}
+
+func TestCodebuddyReadOnlyDeniesExitPlanMode(t *testing.T) {
+	frame, ok := codebuddyReadOnlyControlResponse([]byte(`{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","tool_use_id":"tool-1"}}`))
+	if !ok {
+		t.Fatal("只读回合必须拒绝 ExitPlanMode")
+	}
+	if !bytes.Contains(frame, []byte(`"allowed":false`)) || !bytes.Contains(frame, []byte(`"request_id":"r1"`)) {
+		t.Fatalf("response = %s", frame)
+	}
+	if _, ok := codebuddyReadOnlyControlResponse([]byte(`{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-2"}}`)); ok {
+		t.Fatal("不能代答其它工具")
+	}
+}

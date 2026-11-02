@@ -46,6 +46,8 @@ export type AgentCatalogEntry = {
   supportsConflictSuggestions?: boolean;
   /** 档案/路由表能否存这个工具（当前仅 Claude/Codex）。 */
   supportsProfiles?: boolean;
+  /** 会话能否在回合进行中接收追加消息（插话），见 agentSupportsSteering。 */
+  supportsSteering?: boolean;
 };
 
 /**
@@ -155,6 +157,18 @@ export function agentDisplayName(agentID: string): string {
 /** 该工具是否自报斜杠命令目录（决定界面是否显示命令选择器）。 */
 export function agentSupportsSlashCommands(agentID: string): boolean {
   return agentEntry(agentID)?.slashCommands ?? false;
+}
+
+/**
+ * 该工具能否在**回合进行中**接收追加消息（"立即发送"真的插进当前任务）。
+ *
+ * 目录里的是 CLI 侧能力；能不能用还取决于 Runner —— SSH 远端的 sshAgentSession
+ * 尚未实现 InjectPrompt，所以调用方还要排除远端项目（见 ConversationPage 的
+ * canSteer）。缺省（旧服务端未返回该字段）按 false 处理：宁可写成"排队"，
+ * 也不能把排队说成插话。
+ */
+export function agentSupportsSteering(agentID: string): boolean {
+  return agentEntry(agentID)?.supportsSteering ?? false;
 }
 
 /** 该工具支持的权限模式。未加载时返回空数组 —— 界面据此不给出选项，而不是猜。 */

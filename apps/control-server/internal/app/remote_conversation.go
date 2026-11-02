@@ -93,5 +93,44 @@ func (s *Server) remoteConversationOperations() map[string]remoteOperation {
 			Path:   "/rewind",
 			Handle: s.rewindConversation,
 		},
+		// 上下文用量：只读，手机输入栏显示「上下文 x / y」。
+		"conversation.usage": {
+			Method:   http.MethodGet,
+			Scope:    relayScopeConversation,
+			Path:     "/usage",
+			MaxBytes: 64 << 10,
+			Label:    "上下文用量",
+			Handle:   s.getConversationUsage,
+		},
+		// 模型目录与当前生效模型。探测 CLI 可能要几秒，手机端把等待上限单独放宽。
+		"conversation.models": {
+			Method:   http.MethodGet,
+			Scope:    relayScopeConversation,
+			Path:     "/models",
+			MaxBytes: 64 << 10,
+			Label:    "模型目录",
+			Handle:   s.conversationModels,
+		},
+		// 会话级模型覆盖。空闲才能切，服务端会退役长驻进程；与桌面端同一条 handler。
+		"conversation.model": {
+			Method: http.MethodPost,
+			Scope:  relayScopeConversation,
+			Path:   "/model",
+			Handle: s.setConversationModel,
+		},
+		// 建好之后改执行权限。完全控制的二次确认在手机界面做，服务端仍只认合法档位。
+		"conversation.permissionMode": {
+			Method: http.MethodPost,
+			Scope:  relayScopeConversation,
+			Path:   "/permission-mode",
+			Handle: s.setConversationPermissionMode,
+		},
+		// 上下文交接（目前只有 Codex）。开始之后手机再轮询 handoff.status。
+		"conversation.handoff": {
+			Method: http.MethodPost,
+			Scope:  relayScopeConversation,
+			Path:   "/handoff",
+			Handle: s.startConversationHandoff,
+		},
 	}
 }

@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { anchorForSlot, compareTaskOrder, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Request, Task, TaskDetail, TaskStatus, Priority, VerificationRun, taskDisplayStatus, taskDisplayStatusClass, taskDisplayTitle } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
+import { TaskTransferDialog } from "./TaskTransferDialog";
 type EditorState = { task?: Task } | null;
 type ReviewAction = "accept" | "request_changes";
 
@@ -40,18 +41,20 @@ function verificationPhaseLabel(phase: VerificationRun["phase"]): string {
   return phase;
 }
 
-function TaskToolbarIcon({ name }: { name: "board" | "list" | "workflow" | "batch" | "plus" }) {
+function TaskToolbarIcon({ name }: { name: "board" | "list" | "workflow" | "batch" | "plus" | "download" | "upload" }) {
   const paths = {
     board: <><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="12" y="3" width="5" height="5" rx="1" /><rect x="3" y="12" width="5" height="5" rx="1" /><rect x="12" y="12" width="5" height="5" rx="1" /></>,
     list: <><path d="M8 5h9M8 10h9M8 15h9" /><path d="M4 5h.01M4 10h.01M4 15h.01" /></>,
     workflow: <><circle cx="5" cy="5" r="2" /><circle cx="15" cy="6" r="2" /><circle cx="10" cy="15" r="2" /><path d="m6.8 6.1 6.4-.8M6.1 6.8l2.8 6.4M13.8 7.7l-2.6 5.5" /></>,
     batch: <><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="3" y="12" width="5" height="5" rx="1" /><path d="M11 5.5h6M11 14.5h6" /></>,
     plus: <><path d="M10 4v12M4 10h12" /></>,
+    download: <><path d="M10 3v9" /><path d="m6 8.5 4 4 4-4" /><path d="M3.5 16.5h13" /></>,
+    upload: <><path d="M10 16v-9" /><path d="m6 10.5 4-4 4 4" /><path d="M3.5 16.5h13" /></>,
   };
   return <svg className="task-toolbar-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
-export function TaskBoard({ projectID, initialTaskID, permissionMode, request, fail, close, onDispatched }: { projectID: string; initialTaskID?: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; close: () => void; onDispatched: (message: { id: string; role: "user" | "assistant"; content: string; createdAt: string }, runID: string) => void }) {
+export function TaskBoard({ projectID, projectName, initialTaskID, permissionMode, request, fail, close, onDispatched }: { projectID: string; projectName?: string; initialTaskID?: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; close: () => void; onDispatched: (message: { id: string; role: "user" | "assistant"; content: string; createdAt: string }, runID: string) => void }) {
   const navigate = useNavigate();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [view, setView] = useState<"board" | "list">("board");
@@ -65,6 +68,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
   const [batchMode, setBatchMode] = useState(false);
   const [selectedIDs, setSelectedIDs] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
+  const [transfer, setTransfer] = useState<"export" | "import" | null>(null);
   const mountedRef = useRef(true);
   const tasksRequestVersion = useRef(0);
   const detailRequestVersion = useRef(0);
@@ -478,6 +482,8 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
           <div className="task-toolbar-group task-toolbar-commands">
             <label className="task-toolbar-search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg><input type="search" value={query} placeholder="搜索任务…" aria-label="搜索任务" onChange={(event) => setQuery(event.target.value)} /></label>
             <button className="task-toolbar-action" onClick={() => navigate(`/projects/${projectID}/orchestration`)}><TaskToolbarIcon name="workflow" />自动编排</button>
+            <button className="task-toolbar-action" onClick={() => setTransfer("export")}><TaskToolbarIcon name="download" />导出</button>
+            <button className="task-toolbar-action" onClick={() => setTransfer("import")}><TaskToolbarIcon name="upload" />导入</button>
             <button className="task-toolbar-action" onClick={enterBatchMode}><TaskToolbarIcon name="batch" />批量管理</button>
             <button className="task-toolbar-action task-toolbar-create" onClick={() => setEditor({})}><TaskToolbarIcon name="plus" />新建任务</button>
           </div>
@@ -487,6 +493,7 @@ export function TaskBoard({ projectID, initialTaskID, permissionMode, request, f
     {visibleTasks.length === 0 ? <div className="task-empty" data-state={emptyState?.state ?? "empty"} role="status"><h3>{emptyState?.title ?? "还没有任务"}</h3><p>{emptyState?.description}</p>{emptyState?.state === "filtered" ? <button className="primary" onClick={() => setQuery("")}>清除搜索</button> : emptyState?.state === "hidden" ? <button className="primary" onClick={() => setShowHistoricalCancelled(true)}>显示历史已取消</button> : <button className="primary" onClick={() => setEditor({})}>新建任务</button>}</div> : view === "board" ? <>{uncoveredStatusCount > 0 && <p className="task-board-note" role="status">有 <b>{uncoveredStatusCount}</b> 条任务的状态不在看板列里，切到「列表」可查看与清理。</p>}<TaskBoardColumns tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} onDrop={handleDrop} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} /></> : <TaskList tasks={visibleTasks} showHistoricalCancelled={showHistoricalCancelled} open={openDetail} batchMode={batchMode} selectedIDs={selectedIDs} toggleSelect={toggleSelect} toggleGroup={toggleGroup} />}
     {editor && <TaskEditor projectID={projectID} task={editor.task} request={request} close={() => setEditor(null)} saved={async (taskID) => { setEditor(null); await refresh(taskID); }} fail={fail} />}
     {detail && <TaskDetailDialog detail={detail} permissionMode={permissionMode} busy={busy} close={closeDetail} refresh={() => refresh(detail.id)} beginDispatch={beginDispatch} enqueue={enqueue} orchestrationEnabled={Boolean(orchestration?.enabled)} transition={transition} deleteTask={deleteTask} confirmTransition={confirmTransition} edit={() => { const task = tasks.find((item) => item.id === detail.id); if (task) { closeDetail(); setEditor({ task }); } }} move={moveTask} canMoveUp={moveIndex > 0} canMoveDown={moveIndex >= 0 && moveIndex < moveOrder.length - 1} request={request} fail={fail} />}
+    {transfer && <TaskTransferDialog mode={transfer} projectID={projectID} projectName={projectName || ""} tasks={tasks} request={request} close={() => setTransfer(null)} onImported={async () => { setQuery(""); setSelectedIDs(new Set()); await refresh(); }} />}
     {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} danger={pendingConfirm.danger} confirmLabel={pendingConfirm.confirmLabel} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </section>;
 }

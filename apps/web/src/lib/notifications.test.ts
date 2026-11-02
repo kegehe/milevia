@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatDurationMs, isWithinQuietHours, isWindowsNotifyType, MAX_UNREAD_NOTIFICATIONS, notificationConversationURL, notificationTargetURL, notificationTimeNs, priorityForType, reconcileUnreadNotifications, rememberNotificationID, trimUnreadNotifications, unreadIdsMissingFromServer, webNotificationsSupported, windowsToastLines, type NotificationEvent } from "./notifications";
+import { approvalIDFromNotification, formatDurationMs, isWithinQuietHours, isWindowsNotifyType, MAX_UNREAD_NOTIFICATIONS, notificationConversationURL, notificationTargetURL, notificationTimeNs, priorityForType, reconcileUnreadNotifications, rememberNotificationID, trimUnreadNotifications, unreadIdsMissingFromServer, webNotificationsSupported, windowsToastActions, windowsToastLines, windowsToastSticky, type NotificationEvent } from "./notifications";
 
 test("failed and error notifications use normal priority", () => {
   assert.equal(priorityForType("task.done"), "normal");
@@ -46,15 +46,32 @@ test("免打扰时段支持日间与跨午夜区间", () => {
   assert.equal(isWithinQuietHours(new Date(2026, 7, 20, 8, 0), "22:00", "08:00"), false);
 });
 
-test("Windows 弹窗通知仅限任务完成类状态", () => {
-  // 完成语义 → 应触发
+test("窗口不在前台时，完成类和需要马上处理的通知都弹，状态流水不弹", () => {
   assert.equal(isWindowsNotifyType("task.done"), true);
   assert.equal(isWindowsNotifyType("task.awaiting_review"), true);
-  // 需要处理/审批等 → 不应触发（弹窗标题取事件 title，是完成语义；含义不符的不弹）
-  assert.equal(isWindowsNotifyType("task.action_required"), false);
-  assert.equal(isWindowsNotifyType("orchestration.needs_human"), false);
-  assert.equal(isWindowsNotifyType("approval.pending"), false);
+  assert.equal(isWindowsNotifyType("task.action_required"), true);
+  assert.equal(isWindowsNotifyType("orchestration.needs_human"), true);
+  assert.equal(isWindowsNotifyType("approval.pending"), true);
+  assert.equal(isWindowsNotifyType("ask.pending"), true);
   assert.equal(isWindowsNotifyType("run.completed"), false);
+  assert.equal(isWindowsNotifyType("orchestration.retry"), false);
+  assert.equal(isWindowsNotifyType("orchestration.paused"), false);
+});
+
+test("只有命令审批能在弹窗上允许或拒绝，并且留在屏幕上", () => {
+  assert.deepEqual(windowsToastActions(makeEvent({ type: "approval.pending", id: "ap-1" })), [
+    { label: "拒绝", action: "deny" },
+    { label: "允许", action: "allow" },
+  ]);
+  assert.equal(approvalIDFromNotification(makeEvent({ type: "approval.pending", id: "ap-1", approvalId: "ap-live" })), "ap-live");
+  assert.equal(approvalIDFromNotification(makeEvent({ type: "approval.pending", id: "ap-1" })), "ap-1");
+  assert.deepEqual(windowsToastActions(makeEvent({ type: "ask.pending", id: "ask-1" })), []);
+  assert.deepEqual(windowsToastActions(makeEvent({ type: "task.action_required" })), []);
+  assert.equal(windowsToastSticky("approval.pending"), true);
+  assert.equal(windowsToastSticky("orchestration.needs_human"), true);
+  assert.equal(windowsToastSticky("ask.pending"), true);
+  assert.equal(windowsToastSticky("task.action_required"), true);
+  assert.equal(windowsToastSticky("task.done"), false);
 });
 
 test("formatDurationMs 按秒/分/小时分层", () => {
@@ -70,6 +87,13 @@ test("formatDurationMs 按秒/分/小时分层", () => {
 test("windowsToastLines 组装方案A三行：结果 / 项目+任务 / 耗时", () => {
   const lines = windowsToastLines(makeEvent({ title: "任务已完成", taskTitle: "修复移动端导航错位", durationMs: 222_000 }));
   assert.deepEqual(lines, { title: "任务已完成", line1: "项目「项目一」· 修复移动端导航错位", line2: "3 分 42 秒" });
+});
+
+test("需要处理的弹窗把正文放进第三行，完成类没有耗时时不拿正文填", () => {
+  assert.equal(windowsToastLines(makeEvent({ type: "approval.pending", title: "等待确认命令", body: "pnpm test", taskTitle: "", durationMs: 0 })).line2, "pnpm test");
+  assert.equal(windowsToastLines(makeEvent({ type: "task.done", body: "项目「项目一」的任务已完成", taskTitle: "X", durationMs: 0 })).line2, "");
+  const long = "命".repeat(200);
+  assert.equal([...windowsToastLines(makeEvent({ type: "ask.pending", body: long, durationMs: 0 })).line2].length, 140);
 });
 
 test("windowsToastLines 字段缺失时省略对应行，不编造", () => {

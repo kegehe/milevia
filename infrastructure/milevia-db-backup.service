@@ -1,0 +1,7 @@
+[Unit]
+Description=Milevia cloud-control PostgreSQL backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/milevia-db-backup.sh

@@ -383,6 +383,52 @@ func TestProbeAgentsWaiterDoesNotReplayUnacceptedRound(t *testing.T) {
 	}
 }
 
+// TestProbeAgentsWaiterReusesExpiredRound 钉住"超时那一轮不重做"。
+//
+// 场景：探测（第 1 轮）卡在某个慢工具里，整体超时（probeCtx 到点）；此时**第二个调用方**
+// 到达，看到在飞的那一轮就等在上面。这一轮是因为超时没被采纳（结果不完整、不入缓存），
+// 但它没有跨越写操作 —— 等待者若照旧"醒来再探一轮"，等于把同一台慢机器再等一遍，
+// 实测把一次读从 65 秒拖到 84 秒（2026-10-30）。正确行为：直接拿这一轮已经查到的部分。
+//
+// 反面（跨越写操作的那一档必须重做）由 TestProbeAgentsWaiterDoesNotReplayUnacceptedRound 钉着。
+func TestProbeAgentsWaiterReusesExpiredRound(t *testing.T) {
+	runner := &blockingProbeRunner{started: make(chan struct{}), release: make(chan struct{})}
+	runner.version = "1.0.0"
+	server, meta := newReadingsFixture(t, runner)
+
+	// 让这一轮的探测上下文很短：它就是"慢工具把整轮拖到超时"的替身。
+	probeDeadline, cancelProbe := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancelProbe()
+	server.runtimeCtx = probeDeadline
+
+	first := make(chan []AgentStatus, 1)
+	go func() { first <- server.probeAgents(context.Background(), meta) }()
+	<-runner.started // 第 1 轮确实在飞（此时 entry.round 已挂上）
+	<-probeDeadline.Done()
+
+	// 第二个调用方：缓存是空的、有一轮在飞 → 必然等在上面。
+	second := make(chan []AgentStatus, 1)
+	go func() { second <- server.probeAgents(context.Background(), meta) }()
+	// 等待者没有可观察的"已挂上"信号（它不进 Version），只能给它一个调度窗口；
+	// 这里要证明的是"它醒来之后不再探一轮"，给它 100ms 足够跑进 select。
+	time.Sleep(100 * time.Millisecond)
+
+	close(runner.release)
+	<-first
+	got := <-second
+
+	if probes := runner.probeCount(); probes != 1 {
+		t.Fatalf("等待者重做了已经超时的那一轮（共探了 %d 次）—— 那是把同一台慢机器再等一遍", probes)
+	}
+	if len(got) == 0 {
+		t.Fatal("等待者拿到了空读数：超时那一轮已经查到的部分应当原样给它")
+	}
+	// 超时轮里替身报不出版本 → unavailable。若等待者重探，它会拿到 ready 的 1.0.0。
+	if status := statusByID(got)["claude-code"]; status.Status != agentStatusUnavailable {
+		t.Fatalf("等待者拿到的不是那一轮已经查到的部分：%+v", status)
+	}
+}
+
 // TestProbeAgentsForceIsNotClobberedByOlderRound 钉住轮次序号。
 //
 // 场景：进页面的自动探测（第 1 轮）还在飞，用户点了「重新检查」（force，第 2 轮）；

@@ -919,7 +919,36 @@ export function ProjectFileTree({
           而实际上 node_modules 这类目录被跳过了。 */}
       {treeSummary && <p className="file-tree-summary" role="status">{treeSummary}</p>}
 
-      <div className="file-tree-body">
+      {/* 右键菜单挂在整个树容器上，而不是挂在标题那段文字上。
+          树的行结构是 <div data-rct-item-container><箭头/><button data-rct-item-id>标题</button></div>：
+          标题（.file-tree-item）只是按钮里的一段内容，宽度只到文字末尾，而按钮、箭头、
+          行的内边距与缩进都在它外面。以前 handler 挂在标题上，所以只有右键正好落在文字上
+          才有反应，文字右边一点点、箭头、行尾空白全都点不出来。这里统一在容器接收，
+          再用被点中的行反查条目 —— 整条（含内边距与缩进）都能右键。 */}
+      <div
+        className="file-tree-body"
+        onContextMenu={(e) => {
+          const target = e.target as HTMLElement | null;
+          // 改名时行里是输入框，那里的右键该留给它自己（粘贴等）。
+          if (!target || target.closest("input, textarea")) return;
+          const row = target.closest("[data-rct-item-container]");
+          if (!row) return; // 树下面的空白不是条目，不弹条目菜单
+          const id = row.querySelector("[data-rct-item-id]")?.getAttribute("data-rct-item-id");
+          if (id == null) return;
+          // 以数据源为准：环境里的条目只增不减，被删掉的旧行仍可能挂在 DOM 上。
+          const entry = provider.getItem(id)?.data;
+          if (!entry) return;
+          e.preventDefault();
+          e.stopPropagation();
+          setContextMenu({
+            x: e.clientX,
+            y: e.clientY,
+            path: entry.path,
+            name: entry.name,
+            isDir: entry.isDir,
+          });
+        }}
+      >
         <UncontrolledTreeEnvironment
           key={treeKey}
           ref={environmentRef}
@@ -959,17 +988,6 @@ export function ProjectFileTree({
               <div
                 className={`file-tree-item ${isFocused ? "selected" : ""}`}
                 data-file-upload-directory={item.data.isDir ? item.data.path : getDirPath(item.data.path)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setContextMenu({
-                    x: e.clientX,
-                    y: e.clientY,
-                    path: item.data.path,
-                    name: item.data.name,
-                    isDir: item.data.isDir,
-                  });
-                }}
               >
                 <span className="file-tree-item-icon">
                   <FileIcon iconKey={item.data.icon} expanded={item.data.isDir && context.isExpanded} size={16} />

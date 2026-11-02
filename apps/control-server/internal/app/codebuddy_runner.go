@@ -87,8 +87,7 @@ func (r *codebuddyCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	cmd := codebuddyCommand(ctx, r.codebuddyBinary(), "--version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runProbeCommand(ctx, cmd)
 	if err != nil {
 		return ""
 	}
@@ -219,6 +218,7 @@ func (r *codebuddyCLIRunner) StartSession(ctx context.Context, request AgentSess
 		agentID:    "codebuddy",
 		label:      "CodeBuddy",
 		exitPrefix: codebuddyExitPrefix,
+		readOnly:   request.PermissionMode == "read_only",
 	}, cmd, stdin, stdout, stderr)
 	session.watch(ctx)
 	return session, nil

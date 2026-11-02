@@ -330,3 +330,37 @@ test("含中文的 Go 内部错误也要被换成兜底句（判据顺序与服�
   const readable = eventDiagnostic(event("e2", "run.failed", { error: "Codex 运行失败：exit status 1" }));
   assert.equal(readable?.detail, "Codex 运行失败：exit status 1");
 });
+
+test("ask.pending 建卡，终态事件只改状态、不挪位置", () => {
+  const questions = [{ id: "q1", header: "数据库", question: "选哪个？", options: [{ label: "PG" }, { label: "SQLite" }] }];
+  const pendingAt = "2026-10-28T10:00:00.000Z";
+  const timeline = buildTimeline([], [
+    { id: "a1", type: "ask.pending", runId: "run-1", createdAt: pendingAt, payload: { askId: "ask-1", status: "pending", questions } } as Event,
+    { id: "a2", type: "ask.answered", runId: "run-1", createdAt: "2026-10-28T10:00:30.000Z", payload: { askId: "ask-1", status: "answered", answers: { q1: "PG" } } } as Event,
+  ]);
+  const asks = timeline.filter((item): item is Extract<TimelineItem, { kind: "ask" }> => item.kind === "ask");
+  assert.equal(asks.length, 1);
+  assert.equal(asks[0].ask.status, "answered");
+  assert.equal(asks[0].ask.answers?.q1, "PG");
+  // 卡片的落点必须是提问那一刻：终态事件只是收口。
+  assert.equal(asks[0].createdAt, pendingAt);
+});
+
+test("只有终态、没有题目的 ask 事件不建卡", () => {
+  const timeline = buildTimeline([], [
+    { id: "a1", type: "ask.cancelled", runId: "run-1", createdAt: at, payload: { askId: "ask-x", status: "cancelled" } } as Event,
+  ]);
+  assert.equal(timeline.filter((item) => item.kind === "ask").length, 0);
+});
+
+test("ask.expired 把卡片标成已超时并保留题目", () => {
+  const questions = [{ id: "q1", header: "部署", question: "现在发布吗？", options: [{ label: "是" }, { label: "否" }] }];
+  const timeline = buildTimeline([], [
+    { id: "a1", type: "ask.pending", runId: "run-1", createdAt: at, payload: { askId: "ask-2", status: "pending", questions } } as Event,
+    { id: "a2", type: "ask.expired", runId: "run-1", createdAt: at, payload: { askId: "ask-2", status: "expired" } } as Event,
+  ]);
+  const ask = timeline.find((item): item is Extract<TimelineItem, { kind: "ask" }> => item.kind === "ask");
+  assert.ok(ask);
+  assert.equal(ask?.ask.status, "expired");
+  assert.equal(ask?.ask.questions.length, 1);
+});

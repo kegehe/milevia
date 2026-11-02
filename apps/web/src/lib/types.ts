@@ -56,6 +56,30 @@ export type Directory = { name: string; path: string };
 export type Approval = { approvalId: string; status: "pending" | "allow" | "deny"; toolName: string; toolInput: Record<string, unknown>; toolUseId?: string };
 export type ApprovalEvent = { approval: Approval; runId: string; createdAt: string };
 export type ToolOutput = { content: string; isError: boolean };
+// 会话内提问（docs/51）。questions/answers 的结构由服务端 ask.go 定义：
+// answers 以 question.id 为键，不用题目原文 —— 同题同文会撞。
+export type AskOption = { label: string; description?: string };
+export type AskQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  kind?: "choice" | "text" | "number";
+  options?: AskOption[];
+  multiSelect?: boolean;
+  placeholder?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+};
+export type Ask = {
+  askId: string;
+  status: "pending" | "answered" | "skipped" | "expired" | "cancelled";
+  questions: AskQuestion[];
+  answers?: Record<string, string>;
+  notes?: string;
+};
+
 export type ToolAction = { id: string; runId: string; name: string; input: Record<string, unknown>; createdAt: string; output?: ToolOutput; approval?: Approval; runStatus?: string };
 export type AgentStatus = "pending" | "running" | "completed" | "failed" | "stopped" | "unresolved";
 export type SSHProfile = { host: string; port: number; user: string; privateKeyPath: string };
@@ -294,6 +318,7 @@ export type MCPAuditEntry = {
 export type MCPAuditResponse = { entries: MCPAuditEntry[]; total: number };
 
 // —— 最近一次注入快照（GET /api/projects/{id}/mcp/status） ——
+// scope=session&agentId= 时是同一条记录按当前启停与适用范围复核后的「本会话已连接」。
 export type MCPInjectionServer = { name: string; displayName: string; transport: string; origin: string };
 export type MCPInjectionStatus = {
   projectId: string;
@@ -319,6 +344,7 @@ export type TimelineItem =
   | { kind: "message"; id: string; createdAt: string; message: Message }
   | { kind: "tool"; id: string; createdAt: string; action: ToolAction }
   | { kind: "system"; id: string; createdAt: string; system: SystemItem }
+  | { kind: "ask"; id: string; createdAt: string; runId: string; ask: Ask }
   | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
 export type WorkspaceTab = "conversation" | "tasks" | "orchestration" | "files" | "git" | "run" | "terminal" | "insights";
 export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?: string; environment: string; shell?: string; elevated?: boolean; cwdDisplay?: string; status: "starting" | "running" | "exited" | "failed" | "closed"; createdAt: string };

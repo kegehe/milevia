@@ -81,7 +81,7 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   // 工具坞必须有 MCP 托盘与上下文进度环，且都在卡片（composer-card）之内。
   const dockBlock = conversationPage.match(/<div className="composer-dock">[\s\S]*?<\/div>\s*<\/div>/)?.[0] ?? "";
   assert.ok(dockBlock, "找不到工具坞区块");
-  assert.match(dockBlock, /<ComposerMcpTray projectID=\{project\.id\} runKey=\{run\} \/>/);
+  assert.match(dockBlock, /<ComposerMcpTray projectID=\{project\.id\} agentID=\{conversation\?\.agentId \|\| "claude-code"\} runKey=\{run\} \/>/);
   assert.match(dockBlock, /<ContextRing usage=\{usage\} \/>/);
   assert.match(dockBlock, /composer-send-wrap/);
   // MCP 托盘只摆前 4 个，其余在 ⋯ 里（菜单本来就逐条列全）。
@@ -93,6 +93,15 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /trayServers\.length > 0 \? trayServers\.map\(/);
   // 托盘摆不下的那些**必须**还在 ⋯ 的菜单里（菜单仍走全量 status.servers）。
   assert.match(conversationPage, /\{status\.servers\.map\(\(srv\) => \(/);
+  // 托盘问的是「本会话现在能用哪些」，请求必须带会话视角：不带 scope=session 时服务端
+  // 返回的是「最近一次注入」的历史快照 —— 用户之后在「MCP 连接」里停用某个 server，它
+  // 照样挂在托盘上说已连接（管理页却显示已停用）。
+  assert.match(conversationPage, /\/api\/projects\/\$\{projectID\}\/mcp\/status\?scope=session&agentId=\$\{encodeURIComponent\(agentID\)\}/);
+  // 文案口径：用户看到的是「已连接」，不是实现细节「已注入」；空态同样说「已连接」。
+  const mcpTileTitle = conversationPage.match(/const tileTitle = [^\n]*\n[^\n]*/)?.[0] ?? "";
+  assert.ok(mcpTileTitle.includes("已连接（"), "托盘 tile 的提示必须说已连接");
+  assert.ok(!mcpTileTitle.includes("已注入"), "托盘 tile 不得再出现已注入");
+  assert.match(conversationPage, /本次会话还没有已连接的 MCP 服务器/);
   // 工具坞的换行必须在**基类**：视口宽度不是工具坞宽度的可靠代理 —— 1200px 起右侧任务栏
   // 变成栅格第三列（对话区骤降到 510px），821–905px 又是一个窄档，两处都在 ≤820px 那条
   // media query 够不到的地方，只在那里写 flex-wrap 就会把发送键挤出卡片压到任务栏上
@@ -103,7 +112,7 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   // 发送按钮必须保持「form 内默认 submit」语义：不得显式声明 type 属性。
   const sendBtn = conversationPage.match(/<button className="primary composer-action composer-send"[^>]*>/)?.[0] ?? "";
   assert.ok(sendBtn && !sendBtn.includes("type="), "发送按钮不得写 type 属性（submit 语义）");
-  // 悬停抬升只给可点的 tile（错误态 / ⋯ 才是 button）：已注入的 server 是纯展示 span
+  // 悬停抬升只给可点的 tile（错误态 / ⋯ 才是 button）：已连接的 server 是纯展示 span
   // （cursor: default、无 onClick），给它同样的抬升等于许诺一个点不动的按钮。
   assert.match(stylesheet, /button\.mcp-tile:hover \{/);
   assert.doesNotMatch(stylesheet, /(^|\n)\.mcp-tile:hover \{/);
@@ -128,9 +137,17 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /const restorePendingUserDraft = \(conversationID: string, routeVersion: number, runID: string, draft: string \| undefined\) => \{\s*if \(!draft \|\| conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;/s);
   assert.match(conversationPage, /setText\(\(current\) => current === "" \? draft : current\);/);
   assert.match(conversationPage, /saveConversationDraft\(projectId, conversationID, restoredText\)/);
-  assert.match(conversationPage, /const conversationID = conversation\.id;\s*const routeVersion = conversationRouteVersion\.current;\s*const runID = run;/s);
+  // routeVersion 现在先于 conversationID 捕获（停止锁用 conversationId|routeVersion 做键）。
+  assert.match(conversationPage, /const routeVersion = conversationRouteVersion\.current;[\s\S]{0,320}?const conversationID = conversation\.id;\s*const runID = run;/s);
   assert.match(conversationPage, /restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
-  assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{ retractUserMessage\(\); restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
+  // 强制停止也必须按终态判据收尾：非终态（还在排队 / 不由本机控制）时不能撤回消息、
+  // 不能恢复草稿，否则用户会以为那一轮已经没了。
+  assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{[\s\S]{0,240}?runStatusIsFinished\(result\)[\s\S]{0,240}?retractUserMessage\(\);/);
+  // 停止失败/超时必须就近上屏：全局错误条在页面顶部，长对话里根本看不到。
+  assert.match(conversationPage, /const \[stopNotice, setStopNotice\] = useState\(""\);/);
+  assert.match(conversationPage, /composer-stop-note/);
+  // 20s 兜底现在写成可重排的 check（请求在飞时每 5s 复查一次），复位与提示仍在同一个函数里。
+  assert.match(conversationPage, /const check = \(\) => \{[\s\S]{0,500}?setStopping\(false\);[\s\S]{0,240}?setStopNotice\("停止请求已发出/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
 });
 
@@ -309,13 +326,19 @@ test("the new-conversation tool icon defers to the shared official-logo criteria
   assert.doesNotMatch(conversationPage, /if \(agent === "claude-code"\) return <svg className="new-conversation-agent-icon"/);
   // 不可用的卡片上，官方图标要随卡片一起置灰（img 不吃 color，必须另有 filter）。
   assert.match(stylesheet, /\.new-conversation-agent-card:disabled \.new-conversation-agent-mark img \{[^}]*filter: grayscale\(1\);/s);
-  // 徽标类图标（自带底色，CodeBuddy）铺满整块牌子，牌子的底色与边框让位 ——
+  // 徽标类图标（自带底色，CodeBuddy / Qoder）铺满整块牌子，牌子的底色与边框让位 ——
   // 缩在中间就是"小徽标浮在大底板上"。
   assert.match(stylesheet, /\.new-conversation-agent-mark:has\(img\[data-logo-badge\]\) \{ border-color: transparent; background: transparent; \}/);
   assert.match(stylesheet, /\.new-conversation-agent-mark img\[data-logo-badge\] \{ width: 100%; height: 100%; border-radius: inherit; \}/);
-  // 中性档规则 (0,3,0) 必须排除徽标类，否则会压过 :has 让位规则 (0,2,1)，
-  // 紫色徽标外圈留一圈灰底灰边（换视角审查实测抓到过）。
-  assert.match(stylesheet, /\.new-conversation-agent-mark:not\(\.claude-code\):not\(\.codex\):not\(\.codebuddy\) \{/);
+  // 中性档判据是"牌位里没有官方 <img>"（:not(:has(img))），**不按工具 ID 枚举** ——
+  // 旧写法 :not(.claude-code):not(.codex):not(.codebuddy) 在 Qoder 加入徽标家族时
+  // 漏排了：(0,4,0) 的中性底压过 :has 让位那条 (0,2,1)，徽标外圈留一圈灰底灰边。
+  assert.match(stylesheet, /\.new-conversation-agent-mark:not\(:has\(img\)\) \{/);
+  // 反面：按 ID 枚举的中性档不许回来（它每加一个徽标类工具就要补一个 :not，漏一个就出灰圈）。
+  assert.doesNotMatch(stylesheet, /\.new-conversation-agent-mark:not\(\.claude-code\)/);
+  // OpenCode / Cursor 官方标是单色黑，给 Cli管理页「其他厂商」同档蓝灰底；
+  // 落回基底暖米的话，颜色在说"这是 Claude"。
+  assert.match(stylesheet, /\.new-conversation-agent-mark\.opencode, \.new-conversation-agent-mark\.cursor \{/);
 });
 
 test("mobile conversation tabs replace the open-tab list with a history dialog trigger", () => {
@@ -343,14 +366,20 @@ test("scheduled send holds input until the conversation plus subagents go idle",
   // 预约入口：发送按钮旁的下拉里提供「预约发送」
   assert.match(conversationPage, /composer-send-wrap/, "发送按钮有下拉容器");
   assert.match(conversationPage, /composer-send-more[\s\S]*?aria-expanded=\{showSendMenu\}/, "有切换下拉的小箭头");
-  assert.match(conversationPage, /<b>立即发送<\/b><small>立即交给/s, "下拉提供立即发送");
-  assert.match(conversationPage, /<b>预约发送<\/b><small>当前任务（含子代理）全部结束后再发送<\/small>/, "下拉提供预约发送说明");
+  // 立即发送的说明随是否支持插话而不同（canSteer），不能写死一句文案。
+  assert.match(conversationPage, /<b>立即发送<\/b><small>\{canSteer \?/s, "下拉提供立即发送");
+  assert.match(conversationPage, /<b>预约发送<\/b><small>等当前任务（含子代理）全部结束后，作为新的一轮发送<\/small>/, "下拉提供预约发送说明");
   // 预约：把内容暂存到 ref 驱动的 state，清空输入框
   assert.match(conversationPage, /const scheduleSend = \(\) => \{[\s\S]*?pendingSendRef\.current = content;[\s\S]*?setPendingSendContent\(content\);[\s\S]*?setComposerText\("", conversation\.id\);/s);
   // 取消失约：把内容写回输入框
   assert.match(conversationPage, /const cancelScheduledSend = \(\) => \{[\s\S]*?setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);/s);
   // 空闲判定：主回合结束 且 没有任何子代理仍在运行
   assert.match(conversationPage, /const isConversationIdle = useCallback\(\(\) => \{[\s\S]*?if \(run\) return false;[\s\S]*?for \(const execution of agentExecutions\)[\s\S]*?agent\.status === "running" \|\| agent\.status === "pending"\) return false;/s);
+  // 预约判据必须是 `=== null`：只引用技能、没有正文时 pending 是空串，
+  // 真值判断会把它当成"没有预约"，预约条挂着却永远不挂起发送。
+  assert.match(conversationPage, /if \(pendingSendRef\.current === null\) \{/, "空串预约不能被当成没有预约");
+  assert.doesNotMatch(conversationPage, /if \(!pendingSendRef\.current\) \{/, "预约判据不许用真值");
+  assert.match(conversationPage, /if \(!fired && pendingSendRef\.current !== null\)/, "拦截重试同样区分空串");
   // 触发：空闲才真正 sendContent（第一个参数是用户正文 draft，技能引用另走 skillRefs 选项）
   assert.match(conversationPage, /if \(!isConversationIdle\(\)\) return false;\s*[\s\S]*?await sendContent(?:Ref\.current)?\(draft[,;]/s);
   // 预约进行中的提示条与取消按钮。
@@ -441,7 +470,8 @@ test("stop and clear retries with force and reports a force-stop failure", () =>
   assert.match(conversationPage, /function requiresForceStop\(cause: unknown\): boolean[\s\S]*?active_runs_present/);
   assert.match(conversationPage, /if \(requiresForceStop\(cause\)\)/);
   assert.doesNotMatch(conversationPage, /message\.includes\("queued"\)/);
-  assert.match(conversationPage, /const result = await stopRunInternal\(false\);\s*if \(result !== "stopping"\) setStopping\(false\);/s);
+  // 往返之后先校验会话仍是同一条（A 的停止结果不能改 B 的状态），再复位 stopping。
+  assert.match(conversationPage, /const result = await stopRunInternal\(false\);[\s\S]{0,240}?if \(!stillHere\(\)\) return;[\s\S]{0,160}?if \(result !== "stopping"\) setStopping\(false\);/s);
   assert.match(conversationPage, /projectApi<\{ conversation: Conversation; activeRunId: string \| null \}>\(`\/api\/conversations\/\$\{conversationID\}\?limit=1`\)/);
   assert.match(conversationPage, /status\.conversation\.status === "idle" && !status\.activeRunId/);
   assert.match(conversationPage, /await stopRunInternal\(true\);\s*}\s*catch \(forceCause\) \{\s*fail\(forceCause instanceof Error \? forceCause\.message : "无法强制停止任务"\);\s*setStopping\(false\);\s*return;/s);

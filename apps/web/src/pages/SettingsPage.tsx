@@ -469,7 +469,7 @@ export default function SettingsPage() {
           </>}
           {/* 反向的同一条死路：Windows 弹窗走 Rust winrt Toast，Web 端调用点被 isDesktop() 挡着，
               在浏览器里勾上永远不会有任何效果，所以只在桌面端显示。 */}
-          {isDesktop() && <SettingCard wide title="Windows 弹窗通知" description="在 Windows 系统右下角弹出系统通知；显示完成的任务、所属项目与耗时，点击后跳转到对应会话。">
+          {isDesktop() && <SettingCard wide title="Windows 弹窗通知" description="窗口不在前台时弹出。任务完成会显示项目和耗时；命令等待确认、有问题要回答、任务需要处理或编排卡住会留在屏幕上，命令审批可以直接允许或拒绝。点击通知正文会打开对应会话。">
             <Toggle label="Windows 弹窗通知" checked={localPreferences.windowsToastsEnabled} onChange={(checked) => updateLocalPreferences({ windowsToastsEnabled: checked })} />
           </SettingCard>}
           <SettingCard title="任务完成与失败" description="控制普通优先级的 Toast 与系统通知；审批和人工介入始终保留应用内提醒。">

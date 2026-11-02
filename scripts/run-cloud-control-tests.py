@@ -13,7 +13,7 @@ It needs no writes of its own: the deployment file is read to obtain the DSN and
 the password is never printed.
 
 Usage (PowerShell):
-    $env:SSH_HOST="111.229.52.158"; $env:SSH_USER="root"
+    $env:SSH_HOST="8.153.198.174"; $env:SSH_USER="root"
     $env:SSH_PASS="<server password>"
     python scripts/run-cloud-control-tests.py
 
@@ -32,7 +32,7 @@ import paramiko
 LOCAL_PORT = 15432
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLOUD_DIR = os.path.join(REPO_ROOT, "apps", "cloud-control")
-REMOTE_ENV_FILE = "/root/projects/milevia/infrastructure/.env.server"
+REMOTE_ENV_FILE = "/etc/milevia/cloud-control.env"
 TEST_PATTERN = "MobileStream|DrainInstanceEvents"
 
 
@@ -130,7 +130,7 @@ def main():
 
     env = dict(os.environ)
     env["MILEVIA_TEST_DATABASE_URL"] = (
-        f"postgres://{db_user}:{db_pass}@127.0.0.1:{LOCAL_PORT}/{db_name}"
+        f"postgres://{db_user}:{db_pass}@127.0.0.1:{LOCAL_PORT}/{db_name}?sslmode=disable"
     )
     env.setdefault("GOPROXY", "https://goproxy.cn,direct")
     env["GOFLAGS"] = "-mod=mod"

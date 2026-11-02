@@ -672,10 +672,13 @@ test("官方图标按工具 ID 白名单，白名单之外一律 null（回落�
   assert.equal(agentLogoKey("claude-code"), "claude");
   assert.equal(agentLogoKey("codex"), "openai");
   assert.equal(agentLogoKey("codebuddy"), "codebuddy");
+  assert.equal(agentLogoKey("qoder"), "qoder");
+  assert.equal(agentLogoKey("opencode"), "opencode");
+  assert.equal(agentLogoKey("cursor"), "cursor");
   // 服务端新加的工具、拼错的 ID、空串：null —— 界面回落两字母牌，
   // **绝不**回落到某个已知产品的图标（与 cardTint 的中性档同一个理由：
   // 把别的工具盖上 Claude 的星芒，就是"把未知工具显示成 Claude Code"那一族错）。
-  for (const id of ["gemini-cli", "claude", "Claude-Code", "", "claude-code "]) {
+  for (const id of ["gemini-cli", "claude", "Claude-Code", "", "claude-code ", "cursor-cli", "opencode-ai"]) {
     assert.equal(agentLogoKey(id), null, `id=${JSON.stringify(id)}`);
   }
   // buildToolCard 把它带出来（页面只渲染，不再自己认一遍）。

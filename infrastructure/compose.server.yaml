@@ -1,7 +1,9 @@
 name: milevia
 
-# 服务器部署变体：复用现有 PostgreSQL，不启动新的 PostgreSQL/Redis/MinIO。
-# 现有 PostgreSQL 容器必须位于 external Docker network `keyanjia-network`。
+# 旧服务器（111.229.52.158）的部署变体：复用外部 Docker network
+# `keyanjia-network` 上的 PostgreSQL。2026-10 迁移后的新服务器
+# （8.153.198.174）使用 `docker run --network host` + 宿主本地 PostgreSQL，
+# 不再使用本文件；保留仅作历史参考，见 docs/35-发布操作手册.md。
 services:
   cloud-control:
     build:

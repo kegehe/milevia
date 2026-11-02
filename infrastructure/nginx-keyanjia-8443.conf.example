@@ -1,14 +1,42 @@
-# 将此 server 块加入现有 Nginx 配置，并替换静态文件目录。
-# 它只监听 8443，不改动 keyanjia.info 现有的 80/443 server。
+# 云端连接服务（apps/cloud-control）的 Nginx 站点配置。
+#
+# 8443 是 Milevia 客户端（桌面端 / Android APK / PWA）使用的唯一公网入口：
+#   /          -> PWA 静态文件
+#   /health    -> cloud-control
+#   /v1/*      -> cloud-control（含 Agent WebSocket 与手机 SSE）
+#   /updates/  -> 在线升级清单与安装包
+#
+# 80 端口只用于 Let's Encrypt HTTP-01 续期；ACME 路径必须用 ^~ 且放在
+# 重定向之前，否则证书续期会被 301 吞掉。
+#
+# 注意：阿里云对未完成接入备案的域名会在 80 返回 ICP 拦截页，并在 8443
+# 按 SNI 重置 TLS。这种情况下 HTTP-01 不可用，必须改用 DNS-01，或先完成
+# 阿里云接入备案。若运营商拦截 80，同样改用 DNS-01。
+server {
+    listen 80;
+    server_name keyanjia.info;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://keyanjia.info:8443$request_uri;
+    }
+}
+
 server {
     listen 8443 ssl;
     listen [::]:8443 ssl;
     server_name keyanjia.info;
 
-    # Remote snapshots include recent conversation messages and can exceed
-    # Nginx's 1 MiB default request limit.
-    client_max_body_size 8m;
+    # 后端 agentSnapshot 的 JSON 上限是 32 MiB（decodeWithLimit），
+    # Nginx 默认 1 MiB 会先返回 413，导致大快照永远传不上来。
+    client_max_body_size 40m;
 
+    # 迁移期可先指向从旧服务器复制的桥接证书
+    # （/etc/nginx/ssl/keyanjia.info/{fullchain,privkey}.pem）；
+    # 用 certbot 重新签发后切回下面的 Let's Encrypt 路径。
     ssl_certificate /etc/letsencrypt/live/keyanjia.info/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/keyanjia.info/privkey.pem;
     include /etc/letsencrypt/options-ssl-nginx.conf;

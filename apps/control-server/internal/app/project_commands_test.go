@@ -328,7 +328,14 @@ func TestObserveCommandCatalogIgnoresUnrelatedEvents(t *testing.T) {
 	server.observeCommandCatalog("project", "qoder", []byte(`{"type":"system","subtype":"init","slash_commands":["qoder-only"]}`))
 	server.observeCommandCatalog("project", "codebuddy", []byte(`{"type":"system","subtype":"init","slash_commands":["codebuddy-only"]}`))
 	if _, ok := server.cachedCommandCatalog(commandCatalogCacheKey("project", "claude-code"), 0); ok {
-		t.Fatal("不该写入缓存")
+		t.Fatal("不该写入 Claude 的缓存")
+	}
+	qoder, ok := server.cachedCommandCatalog(commandCatalogCacheKey("project", "qoder"), 0)
+	if !ok || len(qoder.catalog.names) != 1 || qoder.catalog.names[0] != "qoder-only" {
+		t.Fatalf("Qoder 目录应单独存放：%+v ok=%v", qoder.catalog.names, ok)
+	}
+	if _, ok := server.cachedCommandCatalog(commandCatalogCacheKey("project", "codebuddy"), 0); ok {
+		t.Fatal("CodeBuddy 目录还没接，不能写入")
 	}
 }
 
@@ -342,7 +349,7 @@ func TestProjectCommandsRefreshFailureKeepsLastKnownCatalog(t *testing.T) {
 	// 让缓存"过期"，再把探针弄失败：这一次刷新拿不到新目录，但手里那份是**真观测到的**，
 	// 比退回内置候选准确得多，所以应当继续用它，并在说明里如实写明没能刷新。
 	server.commandCatalogMu.Lock()
-	server.commandCatalogEntry.observed = time.Now().Add(-2 * commandCatalogTTL)
+	server.commandCatalogs[commandCatalogCacheKey(projectID, "claude-code")].observed = time.Now().Add(-2 * commandCatalogTTL)
 	server.commandCatalogMu.Unlock()
 	runner.err = errors.New("claude probe timed out")
 

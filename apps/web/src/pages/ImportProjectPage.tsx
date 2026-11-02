@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useProjectContext } from "../stores/useProjectStore";
 import type { Project, Directory } from "../lib/types";
-import { literalNameClass } from "../lib/utils";
+import { literalNameClass, workspacePathForDisplay } from "../lib/utils";
 import DashboardPage from "./DashboardPage";
 
 function displayPath(path: string): string {
@@ -12,21 +12,11 @@ function displayPath(path: string): string {
   const driveRoot = /^([a-zA-Z]):[\\/]*$/.exec(path);
   if (driveRoot) return `${driveRoot[1].toUpperCase()}:`;
   const matched = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/.exec(path);
-  if (!matched) return displayUncPath(path);
+  if (!matched) return workspacePathForDisplay(path);
   const [, drive, rest = ""] = matched;
   const driveLabel = `${drive.toUpperCase()}:`;
   // 仅驱动器根（/mnt/c）时省略分隔符，显示 "C:" 而不是 "C:\"。
   return rest ? `${driveLabel}\\${rest.replaceAll("/", "\\")}` : driveLabel;
-}
-
-// WSL UNC 路径（\\wsl$\Ubuntu\home\user 或 \\wsl.localhost\Ubuntu\...）只显示
-// Linux 路径（/home/user），不显示发行版前缀。
-function displayUncPath(path: string): string {
-  const matched = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)(?:\\(.*))?$/.exec(path);
-  if (!matched) return path;
-  const [, , rest = ""] = matched;
-  const linuxRest = rest.replaceAll("\\", "/");
-  return `/${linuxRest}`;
 }
 
 // RootEntry 描述一个可浏览的根路径（来自 runner 的 roots 列表）。DisplayRootEntry

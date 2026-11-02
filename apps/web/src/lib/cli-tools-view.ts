@@ -410,12 +410,15 @@ export function cardMark(name: string): string {
 // 只是难看，图标错了是冒充身份）。
 // ⚠️ 白名单之外一律 null：界面回落到两字母牌，**绝不**回落到某个已知图标。
 
-export type AgentLogoKey = "claude" | "openai" | "codebuddy";
+export type AgentLogoKey = "claude" | "openai" | "codebuddy" | "qoder" | "opencode" | "cursor";
 
 const AGENT_LOGOS: Readonly<Record<string, AgentLogoKey>> = {
   "claude-code": "claude",
   "codex": "openai",
   "codebuddy": "codebuddy",
+  "qoder": "qoder",
+  "opencode": "opencode",
+  "cursor": "cursor",
 };
 
 export function agentLogoKey(agentID: string): AgentLogoKey | null {

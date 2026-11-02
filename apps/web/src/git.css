@@ -87,6 +87,35 @@
 .git-bar-actions { display: flex; flex: none; align-items: center; gap: 8px; }
 .git-bar-actions button { white-space: nowrap; }
 
+/* 远端操作（获取 / 拉取 / 推送）的结果读数 —— 就在工具栏下面，工作台内部。
+   为什么不用页面级那条红条：它在窗口右上角、6 秒后自动消失，而远端失败的善后
+   （先 fetch 再推送、去配凭据、处理历史分叉）要花几分钟；而且确认框开着时
+   它被模态遮罩压在下面（遮罩 z-index 30）。
+
+   ⚠️ **三个状态类名必须带 git-op-feedback- 前缀**，不许缩写成 error / success / running。
+   全局有一条 .error（style.css）：它是**窗口右上角的固定定位红条**
+   （position: fixed; top: 16px; right: 16px; z-index: 13000）。
+   同名类会把它一并吃进来 —— 而本条的规则没有覆盖 position/top/right，
+   结果这条读数会脱离工作台、变成浮在窗口右上角的一个小方块，
+   还顺带继承全局那套边框/圆角/阴影。
+   （这不是假想：这么写过一次，探针只加载 git.css 没加载 style.css，
+   端到端跑出来一切正常，真页面上却是错的。） */
+.git-op-feedback { display: flex; flex: none; align-items: flex-start; gap: 9px; border-bottom: 1px solid #dce9e1; padding: 8px 12px; font-size: 12px; line-height: 1.5; }
+.git-op-feedback-mark { display: grid; flex: none; width: 18px; height: 18px; margin-top: 1px; place-items: center; }
+.git-op-feedback-text { display: grid; flex: 1; min-width: 0; gap: 1px; }
+.git-op-feedback-text b { font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+.git-op-feedback-text small { font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.git-op-feedback-close { display: grid; flex: none; width: 22px; height: 22px; place-items: center; border: 0; border-radius: 5px; padding: 0; color: inherit; background: transparent; font-size: 15px; line-height: 1; cursor: pointer; }
+.git-op-feedback-close:hover { background: rgb(0 0 0 / 6%); }
+.git-op-feedback-close:focus-visible { outline: 2px solid #2b7b68; outline-offset: 1px; }
+.git-op-feedback-running { color: #3c5c74; background: #f2f7fb; }
+.git-op-feedback-running .git-op-feedback-mark { color: #4a7fa5; }
+.git-op-feedback-running .git-op-feedback-mark svg { animation: git-spin 0.8s linear infinite; }
+.git-op-feedback-success { color: #2b6b48; background: #eff8f1; }
+.git-op-feedback-success .git-op-feedback-mark { color: #2f8f68; }
+.git-op-feedback-error { color: #8a2d22; background: #fff5f2; box-shadow: inset 3px 0 0 #d14233; }
+.git-op-feedback-error .git-op-feedback-mark { color: #d14233; }
+
 .git-ops-trigger { position: relative; display: grid; width: 32px; height: 32px; place-items: center; border: 1px solid #c8dcd1; border-radius: 6px; padding: 0; color: #31594f; background: #fbfefb; cursor: pointer; transition: border-color 160ms ease, background 160ms ease, color 160ms ease; }
 .git-ops-trigger:hover:not(:disabled) { border-color: #8eb9aa; background: #eaf5ee; }
 .git-ops-trigger.active { border-color: #78b7a1; color: #21483d; background: #eaf5ee; }
@@ -422,6 +451,11 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
 .git-confirmation-risk { display: flex; align-items: center; gap: 9px; border: 1px solid #ebc6bd; border-radius: 5px; padding: 9px 10px; background: #fff6f3; }
 .git-confirmation-risk > span { flex: none; border-radius: 4px; padding: 3px 5px; color: #9d4636; background: #f9ddd5; font-size: 10px; font-weight: 700; }
 .git-confirmation-risk p { color: #7c4439; font-size: 12px; }
+/* 远端操作失败：原因就地落在确认框里。失败时框子不关（用户可以直接重试），
+   而工作台那条读数被模态遮罩挡着 —— 框子里一个字都没有的话，失败等于没告诉用户。 */
+.git-confirmation-error { display: grid; gap: 3px; border: 1px solid #f0c4ba; border-radius: 6px; padding: 10px 11px; background: #fff5f2; }
+.git-confirmation-error b { color: #8a2d22; font-size: 12px; font-weight: 700; }
+.git-confirmation-error span { color: #8a2d22; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .git-confirmation-scope { display: grid; gap: 3px; border: 1px solid #d6e4dc; border-radius: 5px; padding: 10px 11px; background: #f8fcf9; }
 .git-confirmation-scope > span { color: #72897f; font-size: 10px; }
 .git-confirmation-scope b { color: #315e50; font-size: 13px; }
@@ -663,6 +697,11 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
 .git-workbench[data-mobile="true"] .git-conflict-banner-actions button { padding: 7px 13px; font-size: 12px; }
 .git-workbench[data-mobile="true"] .git-conflict-unavailable b { font-size: 13px; }
 .git-workbench[data-mobile="true"] .git-conflict-unavailable span { font-size: 12px; }
+/* 远端操作结果读数：手机上字号跟其它正文一致（11px 在触屏上偏小）。 */
+.git-workbench[data-mobile="true"] .git-op-feedback { padding: 10px 12px; }
+.git-workbench[data-mobile="true"] .git-op-feedback-text b { font-size: 13px; }
+.git-workbench[data-mobile="true"] .git-op-feedback-text small { font-size: 12px; }
+.git-workbench[data-mobile="true"] .git-op-feedback-close { width: 30px; height: 30px; font-size: 17px; }
 
 /* ③ diff 阅读区：字号跟设置页的“代码字号”走（缺省 13px，见 `--git-code-font-size`）。
    680px 断点曾经把它压到 11px，现在不再单独缩 —— 用户设了多大就显示多大。
@@ -942,3 +981,46 @@ code.git-oid .git-oid-copied { border-radius: 4px; padding: 1px 6px; color: #fff
 /* 骨架屏与内容卡片是同一种东西的两态（在读 / 已读到），跟着方案 C 一起去边框， */
 /* 否则首屏是一圈带边框的灰卡、落定后变成无边的白卡，形状会跳一下。 */
 .git-workbench:not([data-mobile="true"]) .git-skeleton-group { border: 0; border-radius: 14px; box-shadow: 0 4px 14px -2px rgb(19 46 37 / 7%); }
+
+/* 提交键旁的下拉箭头（桌面端专属）。
+   主键 + 箭头拼成一条分裂按钮：主键仍是「提交」，箭头展开「提交并推送」。
+   与会话页发送键同一套做法（.composer-send-wrap + .composer-send-more）。
+   手机端不渲染这个箭头 —— 移动端 DOM 是定稿契约（docs/41 §6.2）。 */
+.git-workbench:not([data-mobile="true"]) .git-commit-panel footer .git-commit-submit-row { display: flex; grid-column: 1 / -1; align-items: stretch; }
+/* 提交键的右端要变成直角（箭头那一侧），两半才拼成一颗完整的胶囊。
+   ⚠️ 选择器必须与上面那条「提交键通栏胶囊」同样具体 —— 否则这条的
+   border-radius 会被那条的 999px 盖掉（:not() 的特异度按参数算，
+   少一个元素选择器就输了），拼出来就成了「圆角胶囊 + 直角方块」。 */
+.git-workbench:not([data-mobile="true"]) .git-commit-panel footer .git-commit-submit-row .git-commit-submit { flex: 1 1 auto; min-width: 0; width: auto; border-radius: 999px 0 0 999px; }
+.git-workbench:not([data-mobile="true"]) .git-commit-submit-caret {
+  display: inline-flex;
+  width: 40px;
+  min-height: 38px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  /* 不吃 UA 默认的按钮内边距：宽度是定死的 40px，内边距会把图标挤偏。 */
+  padding: 0;
+  border: 0;
+  border-left: 1px solid rgb(25 51 44 / 18%);
+  border-radius: 0 999px 999px 0;
+  color: #19332c;
+  background: #c8e85a;
+  box-shadow: none;
+  cursor: pointer;
+  transition: background .16s ease;
+}
+.git-workbench:not([data-mobile="true"]) .git-commit-submit-caret:hover:not(:disabled) { background: #d8f47b; }
+.git-workbench:not([data-mobile="true"]) .git-commit-submit-caret:disabled { color: #809188; background: #dce7df; cursor: not-allowed; }
+
+/* 「提交并推送」的弹层：走 portal + fixed（提交面板在 .git-changes-sidebar 里，
+   那个容器 overflow: auto，绝对定位的菜单会被它裁掉并跟着侧栏一起滚），
+   所以用触发键的屏幕坐标定位。外观沿用会话页 .send-menu 的那一套。 */
+.git-commit-menu { position: fixed; z-index: 55; display: flex; width: 260px; flex-direction: column; gap: 4px; padding: 6px; border: 1px solid #c4d9cd; border-radius: 10px; background: #fff; box-shadow: 0 8px 24px rgb(31 61 49 / 16%); }
+.git-commit-menu-item { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; border: 0; border-radius: 7px; color: #244c40; background: transparent; text-align: left; cursor: pointer; }
+.git-commit-menu-item:hover:not(:disabled) { background: #eef7f1; }
+.git-commit-menu-item:disabled { cursor: not-allowed; opacity: .55; }
+.git-commit-menu-icon { display: inline-flex; flex: none; margin-top: 1px; color: #3a7a5f; }
+.git-commit-menu-text { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.git-commit-menu-text b { font-size: 12px; font-weight: 700; }
+.git-commit-menu-text small { font-size: 11px; font-weight: 700; color: #6b8a7a; line-height: 1.35; }

@@ -30,30 +30,34 @@ import (
 )
 
 type Config struct {
-	DatabasePath                  string
-	DataDir                       string
-	Mode                          string
-	WebRoot                       string
-	SessionToken                  string
-	AllowedOrigins                []string
-	AllowedRoot                   string
-	ClaudePath                    string
-	CodexPath                     string
-	OpenCodePath                  string
-	OpenCodeGitBashPath           string
-	PermissionMode                string
-	ControlURL                    string
-	RemoteAgentToken              string
-	RemoteCloudURL                string
-	RemoteCloudToken              string
-	RemoteInstanceID              string
-	ApprovalHook                  string
-	NativeApprovalHook            bool
-	AgentUpdateTimeout            time.Duration
-	ClaudeTurnIdleTimeout         time.Duration
-	ClaudeInitialResponseTimeout  time.Duration
-	ClaudeToolResultTimeout       time.Duration
-	AgentRunIdleTimeout           time.Duration
+	DatabasePath                 string
+	DataDir                      string
+	Mode                         string
+	WebRoot                      string
+	SessionToken                 string
+	AllowedOrigins               []string
+	AllowedRoot                  string
+	ClaudePath                   string
+	CodexPath                    string
+	OpenCodePath                 string
+	OpenCodeGitBashPath          string
+	PermissionMode               string
+	ControlURL                   string
+	RemoteAgentToken             string
+	RemoteCloudURL               string
+	RemoteCloudToken             string
+	RemoteInstanceID             string
+	ApprovalHook                 string
+	NativeApprovalHook           bool
+	AgentUpdateTimeout           time.Duration
+	ClaudeTurnIdleTimeout        time.Duration
+	ClaudeInitialResponseTimeout time.Duration
+	ClaudeToolResultTimeout      time.Duration
+	AgentRunIdleTimeout          time.Duration
+	// UserAskTimeout 是一次会话内提问的等待预算（docs/51 §4.5）。默认 5 分钟：
+	// 只实测过 90 秒不被 CLI 掐断，客户端 MCP 工具超时还有一次未知的上下限夹取，
+	// 在没有测出上限之前，默认值必须压在已验证区间内。
+	UserAskTimeout                time.Duration
 	ConversationSessionIdleTTL    time.Duration
 	ConversationSessionsPerRunner int
 	// ConversationSessionExitGrace 是会话被要求停止之后，仍愿意等待其进程真正
@@ -69,6 +73,9 @@ const (
 	defaultClaudeToolResultTimeout      = 5 * time.Minute
 	defaultAgentUpdateTimeout           = 15 * time.Minute
 	defaultAgentRunIdleTimeout          = 30 * time.Minute
+	// 提问的等待预算：只实测过 90 秒不被 CLI 掐断，客户端 MCP 工具超时还有一次未知
+	// 的上下限夹取（见 docs/51 §4.5），默认值必须压在已验证区间内。
+	defaultUserAskTimeout = 5 * time.Minute
 	// 原生进程一旦被回收，下一条消息就要用 `claude --resume` 重新载入整份历史：
 	// 真机实测 7.6 MB / 3745 行的会话冷启动要 30~60 秒（新会话 1.4 秒）。30 分钟的
 	// 旧值意味着「隔半小时再问一句」几乎必然重付这笔钱，用户看到的就是发送后长时间
@@ -188,6 +195,7 @@ func ConfigFromEnv() Config {
 		ClaudeInitialResponseTimeout:  durationFromEnv("AUTO_CLAUDE_INITIAL_RESPONSE_TIMEOUT", defaultClaudeInitialResponseTimeout),
 		ClaudeToolResultTimeout:       durationFromEnv("AUTO_CLAUDE_TOOL_RESULT_TIMEOUT", defaultClaudeToolResultTimeout),
 		AgentRunIdleTimeout:           durationFromEnv("AUTO_AGENT_RUN_IDLE_TIMEOUT", defaultAgentRunIdleTimeout),
+		UserAskTimeout:                durationFromEnv("AUTO_USER_ASK_TIMEOUT", defaultUserAskTimeout),
 		ConversationSessionIdleTTL:    durationFromEnv("AUTO_CONVERSATION_SESSION_IDLE_TTL", defaultConversationSessionIdleTTL),
 		ConversationSessionsPerRunner: positiveIntFromEnv("AUTO_CONVERSATION_SESSIONS_PER_RUNNER", defaultConversationSessionsPerRunner),
 		ConversationSessionExitGrace:  durationFromEnv("AUTO_CONVERSATION_SESSION_EXIT_GRACE", defaultConversationSessionExitGrace),
@@ -361,11 +369,11 @@ type Server struct {
 	remoteAgentProbeRetryAfter map[string]time.Time
 	agentUpdateChecksMu        sync.Mutex
 	agentUpdateChecks          map[agentUpdateCheckKey]agentUpdateCheck
-	// commandCatalogMu 保护 Claude 命令目录的单条缓存（见 project_commands.go）：
+	// commandCatalogMu 保护按「项目 + 工具」分开的命令目录缓存（见 project_commands.go）。
 	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
-	// 串行地拉起一次探针进程。
-	commandCatalogMu    sync.Mutex
-	commandCatalogEntry *commandCatalogEntry
+	// 串行地拉起一次探针进程。不能收成一个槽：Qoder 和 Claude 的命令名不是同一套。
+	commandCatalogMu sync.Mutex
+	commandCatalogs  map[string]*commandCatalogEntry
 	commandProbeMu      sync.Mutex
 	projectLifecycleMu  sync.Mutex
 	// checkpointLocks 串行化同一会话上的快照类 git 操作（见 checkpoint.go 的 checkpointLockSet）。
@@ -394,12 +402,24 @@ type Server struct {
 	gitIndexActive         map[string]bool
 	runWorkspaceReleases   map[string]func()
 	nonStreamingLaunches   map[string]*nonStreamingRunLaunch
-	gitStateTokens         map[string]gitStateToken
-	sessions               map[string]*activeAgentSession
-	sessionManager         *conversationSessionManager
-	sessionMu              sync.Mutex
-	streamMu               sync.Mutex
-	approvals              map[string]*approvalWaiter
+	// stopDeadlines 是每轮"已经受理停止、但还没进终态"的兜底计时器（见 armStopDeadline）。
+	// 它不是主路径：正常停止由终结事件 / 进程退出收尾；只有两者都没发生时才会到点强制收尾。
+	stopDeadlines map[string]*time.Timer
+	// forcedStopRuns 记录"被停止兜底强制收尾、但进程可能还没退出"的 run（runID → conversationID）。
+	// 只用来阻止同一会话在旧进程还活着时再起新一轮；正常收尾不会进这张表。
+	forcedStopRuns map[string]string
+	// finishRetries 记录终态落库失败后的重试次数（最多 3 次），见 scheduleFinishRetry。
+	finishRetries  map[string]int
+	gitStateTokens map[string]gitStateToken
+	sessions       map[string]*activeAgentSession
+	sessionManager *conversationSessionManager
+	sessionMu      sync.Mutex
+	streamMu       sync.Mutex
+	approvals      map[string]*approvalWaiter
+	// asks 是按 askID 索引的待答提问；askBudgets 按会话记录当前 run 已用掉的提问次数
+	// （见 ask.go 的 beginAsk：上限是让提问不比审批更廉价的护栏）。
+	asks       map[string]*askWaiter
+	askBudgets map[string]*askBudget
 	// mcpAutoApprove 保存各会话本次运行生效的 MCP 自动放行模式（按 conversationID）。
 	// hook handler 据此直接返回 allow，避免重建 pending（settings.permissions.allow 无效）。
 	mcpAutoApprove map[string][]string
@@ -920,7 +940,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	opencodeRunner := newOpenCodeManageRunner(config, paths)
 	cursorRunner := newCursorCLIRunner(config, paths)
 	runtimeCtx, runtimeStop := context.WithCancel(context.Background())
-	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, qoderRunner: qoderRunner, opencodeRunner: opencodeRunner, cursorRunner: cursorRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, gitIndexLocks: map[string]*sync.Mutex{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
+	s := &Server{db: pool, config: config, paths: paths, runtimes: newNodeRuntimeManager(), dataLock: dataLock, runner: runner, codexRunner: codexRunner, codebuddyRunner: codebuddyRunner, qoderRunner: qoderRunner, opencodeRunner: opencodeRunner, cursorRunner: cursorRunner, runnerRegistry: newRunnerRegistry(), runnerUpdating: map[runnerAgentKey]bool{}, runnerUpdateExecuting: map[string]bool{}, runtimeCtx: runtimeCtx, runtimeStop: runtimeStop, subscribers: map[string]map[*websocket.Conn]*subscriber{}, cancels: map[string]context.CancelFunc{}, runTokens: map[string]string{}, runContexts: map[string]string{}, profileAdmissions: newProfileRevisionAdmissionGate(), profileRunCancels: map[string]map[string]context.CancelFunc{}, quotaLeaseStops: map[string]context.CancelFunc{}, streamingSetups: map[string]*streamingSetup{}, projectWorkspaceLeases: map[string]*projectWorkspaceLease{}, gitIndexLocks: map[string]*sync.Mutex{}, runWorkspaceReleases: map[string]func(){}, nonStreamingLaunches: map[string]*nonStreamingRunLaunch{}, gitStateTokens: map[string]gitStateToken{}, sessions: map[string]*activeAgentSession{}, approvals: map[string]*approvalWaiter{}, asks: map[string]*askWaiter{}, askBudgets: map[string]*askBudget{}, mcpAutoApprove: map[string][]string{}, mcpOAuthFlows: map[string]*mcpOAuthFlow{}, mcpLastInject: map[string]projectMCPStatus{}, runUsage: map[string]*runUsageAccumulator{}, runManagers: map[string]projectRunnerInterface{}, runLogSubscribers: map[string]map[*websocket.Conn]*runLogSubscriber{}, notificationSubs: map[*websocket.Conn]*notificationSubscriber{}, processStatusSubs: map[*websocket.Conn]*processStatusSubscriber{}, processStatusSequences: map[string]uint64{}, processStatusEpoch: uint64(time.Now().UnixMicro()), stateEventSubs: map[*websocket.Conn]*stateEventSubscriber{}, orchestrationActive: map[string]bool{}, orchestrationCancels: map[string]context.CancelFunc{}, orchestrationDone: map[string]chan struct{}{}, orchestrationOwner: uuid.NewString(), insightActive: map[string]bool{}, insightCancels: map[string]context.CancelFunc{}, codexProbeCache: map[string]codexProbeCacheEntry{}, conflictSuggestions: map[string]*gitConflictSuggestion{}, conflictSuggestActive: map[string]bool{}}
 	s.checkpointSweepDelay = checkpointSweepStartDelay
 	s.checkpointCleanupWait = checkpointCleanupIdleWait
 	s.sessionManager = newConversationSessionManager(s)
@@ -1006,6 +1026,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		log.Printf("[ssh] failed to recover SSH connections: %v", err)
 	}
 	s.recoverOrchestration(ctx)
+	s.reconcilePendingAsks(ctx)
 	s.startScheduledTaskLoop()
 	s.sessionManager.start()
 	return s, nil
@@ -1452,6 +1473,9 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
 	r.Post("/api/projects/{projectID}/tasks/review-all", s.reviewAllTasks)
+	// 任务导出/导入（docs/50）：导出只产出快照，导入在一个事务里重建 id、顺序与依赖。
+	r.Get("/api/projects/{projectID}/tasks/export", s.exportTasks)
+	r.Post("/api/projects/{projectID}/tasks/import", s.importTasks)
 	r.Get("/api/conversations/recent", s.recentConversations)
 	r.Get("/api/projects/{projectID}/scheduled-tasks", s.listScheduledTasks)
 	r.Post("/api/projects/{projectID}/scheduled-tasks", s.createScheduledTask)
@@ -1554,7 +1578,9 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/runs/{runID}/stop", s.stopRun)
 	r.Get("/api/runs/{runID}/usage", s.getRunUsage)
 	r.Post("/api/approvals/{approvalID}", s.resolveApproval)
+	r.Post("/api/asks/{askID}", s.answerAsk)
 	r.Post("/api/internal/approvals/wait", s.waitForApproval)
+	r.Post(interactionMCPPath, s.interactionMCP)
 	r.Get("/ws/conversations/{conversationID}", s.subscribe)
 	r.Route("/api/projects/{projectID}/run", func(r chi.Router) {
 		r.Get("/config", s.getRunConfig)
@@ -1645,6 +1671,12 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		// Claude hooks and SSH approval tunnels cannot carry the desktop page
 		// session. The handler validates this separate, per-run secret before it
 		// creates an approval waiter.
+		// 内置 MCP 交互端点（提问通道）：与审批同理，CLI 进程带不了桌面会话头，
+		// 只能靠 per-run token 进 handler 再校验一次。
+		if r.URL.Path == interactionMCPPath && r.Header.Get("X-Auto-Approval-Token") != "" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if r.URL.Path == "/api/internal/approvals/wait" && r.Header.Get("X-Auto-Approval-Token") != "" {
 			next.ServeHTTP(w, r)
 			return
@@ -5322,12 +5354,145 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	m, runID, _, status, err := s.startMessage(r.Context(), chi.URLParam(r, "conversationID"), input.Content, input.ClientRequestID, nil)
+	conversationID := chi.URLParam(r, "conversationID")
+	// 会话正在跑的时候，这条消息默认**插进当前回合**而不是排队：Claude 系的
+	// stream-json 会话支持在回合中途接收新的 user 帧，模型在下一次工具返回后
+	// 就能看到并按它调整。只有做不到的情况（非流式 Runner、会话没有活跃回合、
+	// 交接/编排等只读场景）才回落到原来的一次性 startMessage。
+	//
+	// 这里刻意不提供 mode 参数：想要"等这一轮彻底结束再说"的客户端走预约发送
+	// （先等空闲再 POST），那是另一套已经存在的语义，不该在同一个接口里再分叉。
+	if m, runID, handled, status, err := s.trySteerMessage(r.Context(), conversationID, input.Content, input.ClientRequestID); handled {
+		if err != nil {
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"message": m, "runId": runID})
+		return
+	}
+	m, runID, _, status, err := s.startMessage(r.Context(), conversationID, input.Content, input.ClientRequestID, nil)
 	if err != nil {
 		writeError(w, status, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"message": m, "runId": runID})
+}
+
+// trySteerMessage 把一条用户消息注入**正在执行的回合**。
+//
+// 返回 handled=false 表示这次发送不该走插话（会话没在跑、Runner 不支持、交接或
+// 只读场景），调用方应回落到普通的 startMessage —— 行为与改造前完全一致。
+//
+// 为什么不建新 Run：插话在 CLI 侧只是当前回合里多出来的一条 user 消息，不会产生
+// 第二个 result。若在平台侧再建一个 Run，两个 Run 的 sink 会同时挂在同一个进程上，
+// 用量记两遍、时间线两条并行、Stop 时还会互相判终态。所以插话只落一条 messages 行，
+// run_id 复用当前回合。
+func (s *Server) trySteerMessage(ctx context.Context, conversationID, content, clientRequestID string) (Message, string, bool, int, error) {
+	content = strings.TrimSpace(content)
+	clientRequestID = strings.TrimSpace(clientRequestID)
+	if content == "" {
+		// 空内容交给 startMessage 报出原有的 400，这里不抢它的文案。
+		return Message{}, "", false, 0, nil
+	}
+	// 只读类会话不允许写入。这里只判断"能不能插话"，拒绝理由仍由 startMessage
+	// 给出——两处文案必须一致，否则同一个限制会有两种说法。顺序也不能反：幂等重放
+	// 必须排在它后面，否则一条重放的编排会话消息会被当成 202 成功，而 startMessage
+	// 对同一请求返回的是 409。
+	if s.isOrchestrationConversation(ctx, conversationID) || s.isScheduledConversation(ctx, conversationID) {
+		return Message{}, "", false, 0, nil
+	}
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing {
+		// 关停途中不再往任何会话里塞消息；交给 startMessage 回它的 503。
+		return Message{}, "", false, 0, nil
+	}
+	if clientRequestID != "" {
+		existing, found, err := messageForClientRequest(ctx, s.db, conversationID, clientRequestID)
+		if err != nil {
+			return Message{}, "", true, http.StatusInternalServerError, err
+		}
+		if found {
+			// 幂等重放：这条消息已经投递过（插话或新回合皆可），原样返回。
+			// 内容不一致必须拒绝 —— 与 startMessage 同一句文案，否则同一个约束
+			// 会因为走了哪条路径而给出两种说法。
+			if existing.Content != content {
+				return Message{}, "", true, http.StatusConflict, errors.New("client request ID was already used for different content")
+			}
+			return existing, existing.RunID, true, http.StatusAccepted, nil
+		}
+	}
+	var status string
+	var handingOff int
+	err := s.db.QueryRowContext(ctx, "select c.status,(select count(*) from conversation_handoffs h where h.source_conversation_id=c.id and h.status in ('summarizing','initializing')) from conversations c where c.id=?", conversationID).Scan(&status, &handingOff)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, "", false, 0, nil
+	}
+	if err != nil {
+		return Message{}, "", true, http.StatusInternalServerError, err
+	}
+	// status 是"有没有活跃回合"最便宜的粗筛：有回合在跑才会是 running。
+	// 真正的裁决在 InjectPrompt 内部（session 自己的锁里），那里才不存在竞态。
+	if status != "running" || handingOff > 0 {
+		return Message{}, "", false, 0, nil
+	}
+	s.mu.Lock()
+	session := s.sessions[conversationID]
+	stopping := session != nil && session.stopping
+	s.mu.Unlock()
+	if session == nil || stopping {
+		return Message{}, "", false, 0, nil
+	}
+	steerable, ok := session.agent.(SteerableAgentSession)
+	if !ok {
+		return Message{}, "", false, 0, nil
+	}
+	runID, err := steerable.InjectPrompt(content)
+	if errors.Is(err, errNoActiveTurn) {
+		return Message{}, "", false, 0, nil
+	}
+	if err != nil {
+		// 写 stdin 失败基本等于会话进程已经死了：这条会话的回合会由 watcher 收尾。
+		// 用 startMessage 同口径的 503（"会话不可用"），而不是 500，避免客户端把它
+		// 当成平台 bug 去重试同一条注定失败的注入。
+		return Message{}, "", true, http.StatusServiceUnavailable, err
+	}
+	// 先注入、再落库：反过来会留下一条"用户说了、模型没收到"的幽灵消息，比多一次
+	// 重试更难解释。代价是落库失败时模型已经看到了这条指令，所以这里必须留日志。
+	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, CreatedAt: time.Now().UTC()}
+	result, err := s.db.ExecContext(ctx, "insert into messages (id,conversation_id,run_id,role,content,client_request_id,parent_tool_use_id,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing", m.ID, m.ConversationID, m.RunID, m.Role, m.Content, clientRequestID, m.ParentToolUseID, m.CreatedAt)
+	if err != nil {
+		log.Printf("[steer] run %s already received the steering prompt but persisting its message failed: %v", runID, err)
+		return Message{}, "", true, http.StatusInternalServerError, err
+	}
+	if clientRequestID != "" {
+		if inserted, _ := result.RowsAffected(); inserted == 0 {
+			existing, found, lookupErr := messageForClientRequest(ctx, s.db, conversationID, clientRequestID)
+			if lookupErr != nil {
+				return Message{}, "", true, http.StatusInternalServerError, lookupErr
+			}
+			if found {
+				if existing.Content != content {
+					return Message{}, "", true, http.StatusConflict, errors.New("client request ID was already used for different content")
+				}
+				return existing, existing.RunID, true, http.StatusAccepted, nil
+			}
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, "update conversations set last_activity_at=? where id=?", m.CreatedAt, conversationID); err != nil {
+		log.Printf("[steer] update conversation activity for %s: %v", conversationID, err)
+	}
+	// 与普通发送同一条用户消息事件：移动端/多标签页靠它立刻看到这条插话。
+	s.broadcastConversationEvent(Event{
+		ID:             uuid.NewString(),
+		ConversationID: conversationID,
+		RunID:          runID,
+		Type:           "user.message",
+		Payload:        mustJSON(m),
+		CreatedAt:      m.CreatedAt,
+	})
+	return m, runID, true, http.StatusAccepted, nil
 }
 
 func (s *Server) runShortcut(w http.ResponseWriter, r *http.Request) {
@@ -5537,6 +5702,29 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			}
 			return existing, existing.RunID, record, http.StatusAccepted, nil
 		}
+	}
+	// 只有"被停止兜底强制收尾、且进程可能还活着"的 run 才禁止新回合；
+	// 正常收尾后 runContexts 会晚几毫秒才删，不能因此拒绝一次正常发送（既有测试
+	// TestProfileModelStillReachesRunner 就命中过这个假阳性）。
+	s.mu.Lock()
+	waitingForForcedStop := false
+	stoppingSession := s.sessions[conversationID] != nil && s.sessions[conversationID].stopping
+	for runID, runConversationID := range s.forcedStopRuns {
+		if runConversationID != conversationID {
+			continue
+		}
+		if _, active := s.runContexts[runID]; active || stoppingSession {
+			waitingForForcedStop = true
+		} else {
+			delete(s.forcedStopRuns, runID)
+		}
+	}
+	s.mu.Unlock()
+	// 注意：这里**不**按 session.stopping 拒绝。正常停止仍然必须走 streamMu 的
+	// 串行化（并发准入测试钉着这个契约），而且流式准入自己会回"会话正在停止"。
+	// 只有兜底强收（进程可能还活着）才需要在这里拦住新回合。
+	if waitingForForcedStop {
+		return Message{}, "", nil, http.StatusConflict, errors.New("上一轮运行还没有完全退出，请稍后重试")
 	}
 	if admission.agentID == "claude-code" || admission.agentID == "codex" || admission.agentID == "opencode" || admission.agentID == "cursor" {
 		s.runnerMaintenanceMu.Lock()
@@ -5969,6 +6157,15 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		}
 		s.nonStreamingLaunches[runID] = &nonStreamingRunLaunch{runner: runnerObj, conversation: conversation, profile: profile, runnerID: projectRunner, projectPath: projectPath, prompt: prompt}
 		s.mu.Unlock()
+		// 与另一端的停止并发：run 行可能在登记 launch 之前就被收成 stopped。再确认一次；
+		// 不是 queued 就把刚登记的 launch 摘掉，避免一条永远不会被 startNext 选中的记录。
+		var queuedStatus string
+		if err := s.db.QueryRowContext(ctx, "select status from runs where id=?", runID).Scan(&queuedStatus); err == nil && queuedStatus != "queued" {
+			s.mu.Lock()
+			delete(s.nonStreamingLaunches, runID)
+			s.mu.Unlock()
+			return m, runID, record, http.StatusAccepted, nil
+		}
 		s.startNextNonStreamingRun(conversation.ID)
 		return m, runID, record, http.StatusAccepted, nil
 	}
@@ -6360,6 +6557,7 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 		delete(s.cancels, runID)
 		delete(s.runContexts, runID)
 		delete(s.streamingSetups, runID)
+		delete(s.forcedStopRuns, runID)
 	}
 	delete(s.sessions, conversationID)
 	cleanup := managed.mcpCleanup
@@ -6383,6 +6581,8 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 		s.resolveRunApprovals(runID, "deny")
 		s.finishRun(runID, conversationID, status, runErr)
 	}
+	// 会话已经真正退出：之前被 runContexts 守卫挡住的排队非流式回合现在可以开始。
+	s.startNextNonStreamingRun(conversationID)
 }
 
 // conversationSessionExitPoll 是"进程是否已退出"的巡检间隔，会按宽限期缩小以
@@ -6480,7 +6680,12 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 	c = s.refreshConversationForRun(ctx, c)
 	injection := mcpInjection{}
 	if !c.Handoff {
-		injection = s.prepareMCPInjection(ctx, c.ProjectID, projectPath, c.AgentID, runnerID, runID)
+		// 一次性运行没有常驻会话，凭据只能挂 run：runTokens 在 runAgent 之前就已登记。
+		identity := mcpInteractionIdentity{}
+		if askAllowedForPolicy(c.executionPolicy()) {
+			identity = mcpInteractionIdentity{RunID: runID, ApprovalToken: runToken}
+		}
+		injection = s.prepareMCPInjectionWith(ctx, c.ProjectID, projectPath, c.AgentID, runnerID, runID, identity)
 	}
 	defer injection.done()
 	s.setMCPAutoApprove(c.ID, injection.AutoApproveTools)
@@ -6493,7 +6698,11 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		delete(s.cancels, runID)
 		delete(s.runTokens, runID)
 		delete(s.runContexts, runID)
+		delete(s.forcedStopRuns, runID)
 		s.mu.Unlock()
+		// A 的进程已经真正收尾，排队的下一轮现在才可以开始（见 startNextNonStreamingRun
+		// 里的 runContexts 守卫：兜底收尾时它会被这条记录挡住）。
+		s.startNextNonStreamingRun(c.ID)
 	}()
 	// 无输出看门狗：一次性运行的 CLI 卡住时（既不输出、也不退出、也不报错）此前会
 	// 永久停在 running，只能靠重启控制服务恢复。这里只负责取消运行，终态与原因由
@@ -6548,6 +6757,25 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 func (s *Server) startNextNonStreamingRun(conversationID string) {
 	s.mu.Lock()
 	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	// 只有两种"旧进程可能还活着"的情况要拦住排队的下一轮：
+	//   · 被停止兜底强收、但 runAgent 还没返回的 run（forcedStopRuns 里有、runContexts 还在）；
+	//   · 正在退役的流式会话。
+	// 不能对所有 runContexts 一刀切：正常一次性运行在 Run 返回后、defer 清 map 前有一小段
+	// 窗口，那台进程已经结束，拦它只会把队列无故拖住（并让依赖"finishRun 后立即起下一轮"
+	// 的用例挂起）。
+	for runID, runConversationID := range s.forcedStopRuns {
+		if runConversationID != conversationID {
+			continue
+		}
+		if _, active := s.runContexts[runID]; active {
+			s.mu.Unlock()
+			return
+		}
+	}
+	if session := s.sessions[conversationID]; session != nil && session.stopping {
 		s.mu.Unlock()
 		return
 	}
@@ -6807,6 +7035,7 @@ func (s *Server) finishStreamingRun(runID, conversationID string, runErr error) 
 	delete(s.cancels, runID)
 	delete(s.runContexts, runID)
 	delete(s.streamingSetups, runID)
+	delete(s.forcedStopRuns, runID)
 	s.mu.Unlock()
 	status := "completed"
 	// os.ErrClosed 是停止/强杀进程后管道被关闭的副产物（尤其 SSH 路径
@@ -6832,6 +7061,9 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 			var changed int64
 			changed, err = result.RowsAffected()
 			if err == nil && changed == 0 {
+				// 已经有别的路径把它落成终态：兜底计时器与失败重试都不再需要。
+				s.disarmStopDeadline(runID)
+				s.clearFinishRetry(runID)
 				tx.Rollback()
 				return
 			}
@@ -6873,7 +7105,13 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 			committed = err == nil
 		}
 		if err != nil {
+			// 事务失败：run 仍是 running，**不要**摘兜底计时器，留给它 15 秒后重试。
 			tx.Rollback()
+		}
+		if committed {
+			// 只有真正提交成功才摘计时器：失败时摘掉就回到"永久 running 且无人再收"。
+			s.disarmStopDeadline(runID)
+			s.clearFinishRetry(runID)
 		}
 		if committed && status == "completed" {
 			// 这一轮真的跑完了：回退时喂回去的历史已被原生会话吸收，标记可以清了。
@@ -6898,6 +7136,13 @@ func (s *Server) finishRun(runID, conversationID, status string, runErr error) {
 				}
 			}
 		}
+	}
+	if !committed {
+		// 事务没提交：run 仍是 running，不能广播终态、更不能释放工作区让别人进来。
+		// 留一个短重试（最多 3 次），成功后再发 run.<status>。
+		log.Printf("[run] finalize %s as %s failed: %v; will retry", runID, status, err)
+		s.scheduleFinishRetry(runID, conversationID, status, runErr)
+		return
 	}
 	payload := map[string]any{"status": status, "error": errorText(runErr)}
 	// Attach taskId so the frontend can link error cards to the task detail page.
@@ -7019,11 +7264,15 @@ func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "true"
+	started := time.Now()
 	status, code, err := s.stopRunByID(r.Context(), id, force)
+	elapsed := time.Since(started).Round(time.Millisecond)
 	if err != nil {
+		log.Printf("[stop] run=%s conversation=%s force=%t code=%d elapsed=%s error=%v", id, conversationID, force, code, elapsed, err)
 		writeError(w, code, err)
 		return
 	}
+	log.Printf("[stop] run=%s conversation=%s force=%t status=%s elapsed=%s", id, conversationID, force, status, elapsed)
 	writeJSON(w, code, map[string]string{"status": status})
 }
 
@@ -7072,17 +7321,56 @@ func (s *Server) stopConversationRuns(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "idle"})
 		return
 	}
-	status, code, err := s.stopRunByID(r.Context(), runID, r.URL.Query().Get("force") == "true")
+	force := r.URL.Query().Get("force") == "true"
+	started := time.Now()
+	status, code, err := s.stopRunByID(r.Context(), runID, force)
+	elapsed := time.Since(started).Round(time.Millisecond)
 	if err != nil {
+		log.Printf("[stop] conversation=%s run=%s force=%t code=%d elapsed=%s error=%v", conversationID, runID, force, code, elapsed, err)
 		writeError(w, code, err)
 		return
 	}
+	log.Printf("[stop] conversation=%s run=%s force=%t status=%s elapsed=%s", conversationID, runID, force, status, elapsed)
 	writeJSON(w, code, map[string]string{"status": status})
 }
 
 func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string, int, error) {
 	if force {
 		return s.forceStopConversationRuns(ctx, id)
+	}
+	// 排队中的非流式回合**还没有 cancel 函数**：它在 nonStreamingLaunches 里等前一轮结束，
+	// 由 startNextNonStreamingRun 拉起。少了这一段，下面按 cancels / sessions 一定找不到它，
+	// 最后落进"按 DB 状态原样返回"的兜底 —— 那一支会把 queued 当成"这一轮本来就没在跑"：
+	// 桌面端据此收掉停止键，手机端提示"停不下来"，而它仍会在队列里照常开始。用户看到的就是
+	// "点了停止，AI 还在跑，连点几次都没用"。
+	//
+	// 判据与流式会话那条一致：会话里还有别的活跃回合时，单独停这一条只会让用户以为停住了，
+	// 返回 active_runs_present 交给调用方走"强制停止"（一次停掉整条会话）；只有它是唯一活跃
+	// 回合时，才把它从队列里摘掉并直接收尾。
+	s.mu.Lock()
+	queuedLaunch, queuedLaunchFound := s.nonStreamingLaunches[id]
+	s.mu.Unlock()
+	if queuedLaunchFound {
+		otherActive, err := s.otherActiveRunExists(ctx, queuedLaunch.conversation.ID, id)
+		if err != nil {
+			return "", http.StatusInternalServerError, err
+		}
+		if otherActive {
+			return "", http.StatusConflict, errActiveRunsPresent
+		}
+		s.mu.Lock()
+		// 查询与摘除之间可能已被 startNextNonStreamingRun 拉起：它同样在 s.mu 下把这一条
+		// 移出 nonStreamingLaunches 并登记 cancels。以"此刻还在队列里"为准，让位给常规路径。
+		_, stillQueued := s.nonStreamingLaunches[id]
+		if stillQueued {
+			delete(s.nonStreamingLaunches, id)
+		}
+		s.mu.Unlock()
+		if stillQueued {
+			s.resolveRunApprovals(id, "deny")
+			s.finishRun(id, queuedLaunch.conversation.ID, "stopped", errQueuedRunStopped)
+			return "stopping", http.StatusAccepted, nil
+		}
 	}
 	s.mu.Lock()
 	cancel, ok := s.cancels[id]
@@ -7100,6 +7388,9 @@ func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string
 	}
 	s.mu.Unlock()
 	if setupStop {
+		// 先挂兜底再发 Stop：SSH 的 Stop 是一次远端信号，连接半死时会阻塞很久，
+		// 顺序反过来会让"15 秒兜底"在这个分支上永远挂不上。
+		s.armStopDeadline(id, conversationID)
 		if ok {
 			cancel()
 		}
@@ -7126,6 +7417,8 @@ func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string
 			session.markStopping()
 		}
 		s.mu.Unlock()
+		// 同 setup 分支：先挂兜底，再发可能阻塞的 Stop。
+		s.armStopDeadline(id, conversationID)
 		session.agent.Stop()
 		s.resolveRunApprovals(id, "deny")
 		return "stopping", http.StatusAccepted, nil
@@ -7159,8 +7452,22 @@ func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string
 				session.markStopping()
 			}
 			s.mu.Unlock()
+			s.armStopDeadline(id, queuedConversationID)
 			session.agent.Stop()
 			s.resolveRunApprovals(id, "deny")
+			return "stopping", http.StatusAccepted, nil
+		}
+		if status == "queued" {
+			// 队列里已经没有它的发射记录（既不在 nonStreamingLaunches，也没有活跃会话）：
+			// 这一条在本实例里永远不会被拉起（例如控制服务重启后残留的队列行）。停在它上面
+			// 不能把 queued 当成"没在跑"回给调用方 —— 按 stopped 收尾才是用户按下的那个意思。
+			s.resolveRunApprovals(id, "deny")
+			s.finishRun(id, queuedConversationID, "stopped", errQueuedRunStopped)
+			// 停止与准入并发时，startMessage 可能在"查不到 launch"之后才把记录登记进来；
+			// 这里再删一次，缩小泄漏窗口（startMessage 自己的二次校验负责另一侧）。
+			s.mu.Lock()
+			delete(s.nonStreamingLaunches, id)
+			s.mu.Unlock()
 			return "stopping", http.StatusAccepted, nil
 		}
 		if status != "running" {
@@ -7168,9 +7475,155 @@ func (s *Server) stopRunByID(ctx context.Context, id string, force bool) (string
 		}
 		return "", http.StatusConflict, errors.New("run is not controlled by this service instance")
 	}
+	s.armStopDeadline(id, conversationID)
 	cancel()
 	s.resolveRunApprovals(id, "deny")
 	return "stopping", http.StatusAccepted, nil
+}
+
+// runStopDeadline 是"停止已受理"到"必须给出终态"之间的上限。
+//
+// 202 只代表停止请求被接受，真正的终态由终结事件或进程退出决定。只要其中一个环节没收敛
+// （后裔进程占着 stdout、Run 永远不返回、远端进程杀不掉……），运行就会永久停在 running：
+// 桌面端的停止键停在"再次停止"、手机端停在"停止中"，用户点多少次都没用，而且因为请求本身
+// 是成功的，界面连一句错误都不会有。这里的上界保证即使清理链路失灵，运行也会在 15 秒内
+// 进入 stopped 并广播出去；它只兜底，正常停止（秒级）根本走不到。
+const runStopDeadline = 15 * time.Second
+
+// errStopDeadline 是停止兜底触发时写进 run.stopped 事件的原因。
+var errStopDeadline = errors.New("停止未在限定时间内完成，已强制结束该轮")
+
+// armStopDeadline 给一轮已受理的停止挂兜底计时器。同一轮只挂一次：用户连点"再次停止"
+// 不应该把上限一直往后推，否则又变回"永远在等"。
+func (s *Server) armStopDeadline(runID, conversationID string) {
+	s.armStopDeadlineWithin(runID, conversationID, runStopDeadline)
+}
+
+// armStopDeadlineWithin 是可注入上限的版本，单独拆出来只为让测试能用毫秒级验证
+// "到点一定收尾"，生产代码不读可变的全局变量。
+func (s *Server) armStopDeadlineWithin(runID, conversationID string, grace time.Duration) {
+	if runID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.stopDeadlines == nil {
+		s.stopDeadlines = map[string]*time.Timer{}
+	}
+	if _, exists := s.stopDeadlines[runID]; exists {
+		s.mu.Unlock()
+		return
+	}
+	s.stopDeadlines[runID] = time.AfterFunc(grace, func() { s.forceStopDeadline(runID, conversationID, grace) })
+	s.mu.Unlock()
+}
+
+// disarmStopDeadline 由 finishRun 调用：正常路径先到终态时把兜底计时器摘掉。
+func (s *Server) disarmStopDeadline(runID string) {
+	s.mu.Lock()
+	if timer := s.stopDeadlines[runID]; timer != nil {
+		timer.Stop()
+		delete(s.stopDeadlines, runID)
+	}
+	s.mu.Unlock()
+}
+
+// forceStopDeadline 在停止上界到点、而运行仍未进终态时强行收尾。
+//
+// 先按 DB 状态再确认一次：正常路径可能恰好在计时器触发前完成终态，那时这里必须什么都不做
+// （finishRun 自身也会用 status in ('queued','running') 做最后一道幂等保护）。
+func (s *Server) forceStopDeadline(runID, conversationID string, grace time.Duration) {
+	s.mu.Lock()
+	delete(s.stopDeadlines, runID)
+	s.mu.Unlock()
+
+	var status, storedConversationID string
+	if err := s.db.QueryRowContext(s.runtimeCtx, "select status,coalesce(conversation_id,'') from runs where id=?", runID).Scan(&status, &storedConversationID); err != nil {
+		return
+	}
+	if status != "queued" && status != "running" {
+		return
+	}
+	if storedConversationID != "" {
+		conversationID = storedConversationID
+	}
+	// 标记"这是兜底强收的回合"：它的进程可能还活着，禁止同一会话在此期间起新一轮。
+	s.mu.Lock()
+	if s.forcedStopRuns == nil {
+		s.forcedStopRuns = map[string]string{}
+	}
+	s.forcedStopRuns[runID] = conversationID
+	s.mu.Unlock()
+	s.mu.Lock()
+	session := s.sessions[conversationID]
+	cancel := s.cancels[runID]
+	// 只停**仍拥有这一轮**的会话：上一轮结束后同一条会话可能已经被新会话替换，
+	// 盲目 Stop 会杀掉用户刚发起的新一轮。
+	if session != nil {
+		if _, owns := session.runIDs[runID]; !owns {
+			session = nil
+		}
+	}
+	s.mu.Unlock()
+	log.Printf("[stop] run %s: no terminal state %s after the stop request; force-finalizing as stopped (the agent process may still be alive)", runID, grace.Round(time.Millisecond))
+	// 非流式回合不在 sessions 里：补一次 cancel（通常停止入口已经调过，幂等），
+	// 否则兜底只剩下"改状态"，连最后一次取消都没发。
+	if cancel != nil {
+		cancel()
+	}
+	if session != nil && session.agent != nil {
+		s.mu.Lock()
+		if s.sessions[conversationID] == session {
+			session.markStopping()
+		}
+		s.mu.Unlock()
+		// 兜底路径里 Stop 必须是异步的：SSH 的 Stop 要发一次远端信号，连接半死时
+		// 会阻塞很久，同步等它就等于让"15 秒兜底"自己也被卡住。终态先落库、UI 先收敛，
+		// 进程回收尽力而为。
+		go session.agent.Stop()
+	}
+	s.resolveRunApprovals(runID, "deny")
+	s.finishRun(runID, conversationID, "stopped", errStopDeadline)
+	// 没有 runContexts 且没有正在退役的会话，说明进程已经收尾（或本来就是排队的回合）：
+	// 标记没必要留着。会话还在 stopping 时必须保留，否则新回合会在旧进程可能还活着时进来。
+	s.mu.Lock()
+	if _, active := s.runContexts[runID]; !active {
+		if session := s.sessions[conversationID]; session == nil || !session.stopping {
+			delete(s.forcedStopRuns, runID)
+		}
+	}
+	s.mu.Unlock()
+}
+
+// finishRetryLimit / finishRetryDelay 是终态落库失败后的短重试：SQLite busy、磁盘瞬断
+// 这类错误通常几秒内恢复；重试成功后才会广播 run.<status> 并释放工作区。
+const (
+	finishRetryLimit = 3
+	finishRetryDelay = 2 * time.Second
+)
+
+// scheduleFinishRetry 在 finishRun 事务失败时排一次重试；同一 run 最多 3 次。
+func (s *Server) scheduleFinishRetry(runID, conversationID, status string, runErr error) {
+	s.mu.Lock()
+	if s.finishRetries == nil {
+		s.finishRetries = map[string]int{}
+	}
+	attempt := s.finishRetries[runID]
+	if attempt >= finishRetryLimit {
+		delete(s.finishRetries, runID)
+		s.mu.Unlock()
+		log.Printf("[run] finalize %s gave up after %d retries; the run may stay running until the next stop or restart", runID, attempt)
+		return
+	}
+	s.finishRetries[runID] = attempt + 1
+	s.mu.Unlock()
+	time.AfterFunc(finishRetryDelay, func() { s.finishRun(runID, conversationID, status, runErr) })
+}
+
+// clearFinishRetry 在成功提交或发现已被别的路径收尾时清理重试计数。
+func (s *Server) clearFinishRetry(runID string) {
+	s.mu.Lock()
+	delete(s.finishRetries, runID)
+	s.mu.Unlock()
 }
 
 // forceStopConversationRuns stops every active turn for the requested run's
@@ -7233,6 +7686,10 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 	}
 	s.mu.Unlock()
 
+	// 先给每条活跃回合挂兜底，再执行可能阻塞的取消/Stop：强制停止也必须有界。
+	for _, run := range activeRuns {
+		s.armStopDeadline(run.id, conversationID)
+	}
 	for _, cancel := range cancels {
 		cancel()
 	}
@@ -7255,8 +7712,11 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 	}
 	s.mu.Unlock()
 	for _, run := range activeRuns {
-		if nonStreamingQueued[run.id] {
-			s.finishRun(run.id, conversationID, "stopped", context.Canceled)
+		// 所有 queued 回合都不可能有进程在跑：有 launch 记录的已经摘掉，没记录的
+		// （例如重启残留）也永远不会被拉起。强制停止必须把两类一起收尾，不能只处理
+		// 有 launch 记录的那一类、让另一类在界面上继续显示排队 15 秒。
+		if run.status == "queued" {
+			s.finishRun(run.id, conversationID, "stopped", errQueuedRunStopped)
 		}
 	}
 	for _, run := range activeRuns {
@@ -7271,6 +7731,10 @@ func (s *Server) forceStopConversationRuns(ctx context.Context, requestedRunID s
 // 类型而不是英文原文：原先那里比的是 err.Error() 的整串，把文案翻成中文的那一刻，
 // 码会**静默**变空串，而调用方只是少了分支、不会报错。errNotSQLiteDatabase 是同型的先例。
 var errActiveRunsPresent = errors.New("当前会话还有排队或运行中的任务，暂时无法单独停止此任务。")
+
+// errQueuedRunStopped 是"这一轮还在队列里、被用户直接停掉"时写进运行记录的原因。
+// 它只在 run.stopped 事件的 error 字段里出现；中文原文与其它停止原因同型。
+var errQueuedRunStopped = errors.New("排队中的任务已停止")
 
 // errOrchestrationStopRestricted 是"这条对话由自动编排接管，不能在这里停"的哨兵。
 //
@@ -7297,9 +7761,23 @@ func (s *Server) activeRunIDForConversation(ctx context.Context, conversationID 
 	return runID, true, nil
 }
 
-func (s *Server) ensureStreamingStopIsIsolated(ctx context.Context, conversationID, runID string) error {
+// otherActiveRunExists 报告这条会话里除 runID 之外是否还有排队/运行中的回合。
+//
+// 停止的判据只该有一份：一条会话的 AI 进程会把后来的消息接成排队回合，所以"单独停这一条"
+// 在还有别的回合时并不能让会话真正停下来。流式会话（ensureStreamingStopIsIsolated）与
+// 排队中的非流式回合（stopRunByID）必须给出同一个答复：active_runs_present，让调用方
+// 走强制停止。
+func (s *Server) otherActiveRunExists(ctx context.Context, conversationID, runID string) (bool, error) {
 	var otherActive bool
 	if err := s.db.QueryRowContext(ctx, `select exists(select 1 from runs where conversation_id=? and id<>? and status in ('queued','running'))`, conversationID, runID).Scan(&otherActive); err != nil {
+		return false, err
+	}
+	return otherActive, nil
+}
+
+func (s *Server) ensureStreamingStopIsIsolated(ctx context.Context, conversationID, runID string) error {
+	otherActive, err := s.otherActiveRunExists(ctx, conversationID, runID)
+	if err != nil {
 		return err
 	}
 	if otherActive {
@@ -7359,6 +7837,19 @@ func (s *Server) waitForApproval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 会话内提问是平台自己的工具，不是用户的动作：它必须直接放行，否则会先弹一次
+	// "允许执行这条命令"，用户点完还要再答一次问题。也不写审计 —— 它不是真实工具调用。
+	if input.ToolName == interactionApprovalToolName() {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"hookSpecificOutput": map[string]any{
+				"hookEventName":            "PreToolUse",
+				"permissionDecision":       "allow",
+				"permissionDecisionReason": "会话内提问通道，无需审批。",
+			},
+		})
+		return
+	}
 	// PostToolUse 复用同一条 hook 命令（见 mcpApprovalHooksSettingsJSON）：它只用于回填
 	// 调用审计的执行结果，不需要等待裁决，记录后立即返回空对象。
 	if input.HookEventName == "PostToolUse" {
@@ -7390,8 +7881,11 @@ func (s *Server) waitForApproval(w http.ResponseWriter, r *http.Request) {
 
 	// 参数经上限截断后再落事件：MCP 工具参数可能极大（如整份文件内容），原样写入会话
 	// 事件会撑大数据库并拖慢前端。command 键保留原文，前端靠它锚定审批横幅（docs/34 §9）。
-	pending := map[string]any{"approvalId": approvalID, "status": "pending", "toolName": input.ToolName, "toolInput": truncateApprovalToolInput(input.ToolInput), "toolUseId": input.ToolUseID}
+	truncatedInput := truncateApprovalToolInput(input.ToolInput)
+	pending := map[string]any{"approvalId": approvalID, "status": "pending", "toolName": input.ToolName, "toolInput": truncatedInput, "toolUseId": input.ToolUseID}
 	s.appendEvent(runID, conversationID, "approval.pending", mustJSON(pending))
+	// 窗口缩在托盘里时，会话事件到不了人眼前。通知中心和系统弹窗走这一条。
+	s.notifyApprovalPending(conversationID, approvalID, input.ToolName, truncatedInput)
 	decision := "deny"
 	// auditDecision 记录「为什么是这个结果」：用户裁决 / 客户端断开 / 超时。
 	auditDecision := "timeout"
@@ -7406,6 +7900,7 @@ func (s *Server) waitForApproval(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	delete(s.approvals, approvalID)
 	s.mu.Unlock()
+	s.dismissApprovalNotification(approvalID)
 	s.recordMCPCallStart(r.Context(), conversationID, runID, input.ToolUseID, input.ToolName, auditDecision, input.ToolInput)
 	result := map[string]any{"approvalId": approvalID, "status": decision, "toolName": input.ToolName, "toolInput": truncateApprovalToolInput(input.ToolInput), "toolUseId": input.ToolUseID}
 	s.appendEvent(runID, conversationID, "approval."+decision, mustJSON(result))
@@ -7448,7 +7943,13 @@ func (s *Server) resolveApproval(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": input.Decision})
 }
 
+// resolveRunApprovals 同时取消该 run 名下所有待答提问。
+//
+// 两件事故意绑在同一个函数里：run 收尾的调用点有十来个，分成两个必须成对调用的
+// 函数，迟早有一条路径只写了其中一个 —— 表现是 run 已经结束、卡片还在"等待你的
+// 回答"。提问的等待预算比审批的 5 分钟长，漏一次就会挂很久。
 func (s *Server) resolveRunApprovals(runID, decision string) {
+	s.resolveRunAsks(runID)
 	s.mu.Lock()
 	waiters := make([]*approvalWaiter, 0)
 	for approvalID, waiter := range s.approvals {
@@ -8026,19 +8527,29 @@ func localizedErrorText(err error, fallback string) string {
 		// 原文是英文，不翻译的话用户看到的是"当前操作与进行中的操作冲突，请稍后重试。：stop automatic
 		// orchestration from the orchestration controls" —— 既没说清发生了什么，也没说该去哪停。
 		// 这句同时点明"为什么"与"该去哪"：编排对话的队列由编排面板接管（暂停/停止队列）。
-		"stop automatic orchestration from the orchestration controls":          "这条对话由自动编排任务接管，请在编排面板里暂停或停止它的队列。",
-		"executionMode must be worktree or branch":                              "执行方式只能是「隔离工作树」或「直接写入已有分支」。",
-		"task branch is not ready to confirm":                                   "该任务分支尚未完成验证，暂时不能确认合并。",
-		"main does not contain this task branch commit":                         "main 尚未包含该任务分支的提交。请先合并分支，再确认完成。",
-		"task branch status changed before confirmation":                        "任务分支状态已变化，请刷新后重试确认。",
-		"conversation not found":                                                "会话不存在或已被删除。",
-		"checkpoint not found":                                                  "该节点已不存在（可能已被清理），请刷新后重试。",
-		"checkpointId is required":                                              "缺少要回退的节点，请刷新页面后重试。",
-		"invalid rewind request":                                                "回退请求无效，请刷新页面后重试。",
-		"mode must be conversation, code, or conversation_and_code":             "回退方式只能是「恢复对话」「恢复代码」或「恢复全部」。",
-		"native agent session is still stopping":                                "会话正在重启，请稍后重试。",
-		"run not found":                                                         "任务运行记录不存在。",
-		"invalid JSON request":                                                  "请求内容不是有效的 JSON。",
+		"stop automatic orchestration from the orchestration controls": "这条对话由自动编排任务接管，请在编排面板里暂停或停止它的队列。",
+		"executionMode must be worktree or branch":                     "执行方式只能是「隔离工作树」或「直接写入已有分支」。",
+		"task branch is not ready to confirm":                          "该任务分支尚未完成验证，暂时不能确认合并。",
+		"main does not contain this task branch commit":                "main 尚未包含该任务分支的提交。请先合并分支，再确认完成。",
+		"task branch status changed before confirmation":               "任务分支状态已变化，请刷新后重试确认。",
+		"conversation not found":                                       "会话不存在或已被删除。",
+		"checkpoint not found":                                         "该节点已不存在（可能已被清理），请刷新后重试。",
+		"checkpointId is required":                                     "缺少要回退的节点，请刷新页面后重试。",
+		"invalid rewind request":                                       "回退请求无效，请刷新页面后重试。",
+		"mode must be conversation, code, or conversation_and_code":    "回退方式只能是「恢复对话」「恢复代码」或「恢复全部」。",
+		"native agent session is still stopping":                       "会话正在重启，请稍后重试。",
+		"run not found":                                                "任务运行记录不存在。",
+		"invalid JSON request":                                         "请求内容不是有效的 JSON。",
+		// 任务导出/导入（task_transfer.go）。文案必须是固定短句：这张表是精确匹配。
+		"unsupported task export scope":                                         "任务导出范围只能是「仅未完成」或「全部任务」。",
+		"unsupported task export file":                                          "无法识别的任务导出文件，请确认文件来自 Milevia 的任务导出。",
+		"task export file version is not supported":                             "任务导出文件版本不受支持，请升级 Milevia 后重试。",
+		"task export contains no tasks":                                         "任务导出文件里没有任务。",
+		"task export contains too many tasks":                                   "任务导出文件包含的任务过多，请分批导出后再导入。",
+		"task export file is too large":                                         "任务导出文件过大，请分批导出后再导入。",
+		"duplicate task key in export file":                                     "任务导出文件里的任务编号重复或格式不正确。",
+		"task export references an unknown dependency":                          "任务导出文件里的依赖指向了不存在的任务。",
+		"task export dependencies form a cycle":                                 "任务导出文件里的依赖关系存在循环，无法导入。",
 		"conversation was cleared; start a new conversation from its history":   "该会话已清空，请先从历史记录恢复后再发送消息。",
 		"activate this conversation before sending a message":                   "请先激活该会话，再发送消息。",
 		"Codex is currently available only on the local WSL runner":             "Codex 目前仅支持本地 WSL 运行器。",

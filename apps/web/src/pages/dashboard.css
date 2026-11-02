@@ -1,12 +1,19 @@
-/* 名称搜索与状态筛选叠加，独立一行以兼容窄屏。 */
-.dashboard-search-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; }
-.dashboard-search { display: flex; align-items: center; gap: 8px; width: 320px; max-width: 100%; min-width: 0; height: 38px; box-sizing: border-box; border: 1px solid #c6dbd0; border-radius: 6px; padding: 0 12px; color: #7a9086; background: #fbfefb; }
+/* 名称搜索并入标题行右侧，与状态筛选同组靠右（B2 方案：标题独占左侧）。
+   flex-wrap 兜底中窄屏：放不下时搜索框先收缩，摘要再折到下一行。 */
+.dashboard-intro > div:first-child { flex: none; white-space: nowrap; }
+.dashboard-tools { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; align-self: center; }
+.dashboard-search { display: flex; align-items: center; gap: 8px; width: 360px; max-width: 100%; min-width: 0; height: 38px; box-sizing: border-box; border: 1px solid #c6dbd0; border-radius: 6px; padding: 0 12px; color: #7a9086; background: #fbfefb; }
 .dashboard-search:focus-within { border-color: #55a697; outline: 2px solid #cfede3; }
 .dashboard-search svg { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .dashboard-search input { width: 100%; min-width: 0; border: 0; border-radius: 0; padding: 0; color: #19332c; background: transparent; font: inherit; font-size: 14px; outline: 0; }
 .dashboard-search input::placeholder { color: #7a9086; }
-.dashboard-search-bar > button { flex: none; white-space: nowrap; }
-@media (max-width: 520px) { .dashboard-search { flex: 1; } }
+.dashboard-tools > button { flex: none; white-space: nowrap; }
+/* 中窄屏：搜索框改为弹性收缩，避免挤压筛选摘要。
+   单行放下「标题+搜索360+摘要」约需 1170px 内容宽，视口 ≤1240 起开始收缩。 */
+@media (max-width: 1240px) { .dashboard-search { width: auto; flex: 1 1 260px; } }
+/* 标题行在 ≤820px 转纵向（style.css:345），工具组改回通宽、左对齐。 */
+@media (max-width: 820px) { .dashboard-tools { align-self: stretch; width: 100%; } }
+@media (max-width: 520px) { .dashboard-search { flex: 1; width: auto; } }
 
 /* 删除项目确认弹窗 — 复刻项目总览的绿色 studio 色板，突出"破坏性操作"的警示层级。 */
 .delete-project-dialog { width: min(480px, 100%); color: #19332c; background: #fcfefc; }

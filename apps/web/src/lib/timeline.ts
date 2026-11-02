@@ -1,6 +1,6 @@
 // Timeline 构建逻辑 — 从 App.tsx 提取
 
-import type { Event, Message, ToolAction, ToolOutput, AgentExecution, AgentNode, AgentLog, TimelineItem, Approval, ApprovalEvent, SystemItem, SystemVariant } from "./types";
+import type { Event, Message, ToolAction, ToolOutput, AgentExecution, AgentNode, AgentLog, TimelineItem, Approval, ApprovalEvent, SystemItem, SystemVariant, Ask, AskQuestion } from "./types";
 import { asRecord } from "./api";
 import { contentToText, agentSummary, toolSummary, formatTokens, formatDuration } from "./utils";
 
@@ -151,6 +151,47 @@ function eventErrorDetail(payload: Record<string, any>): string {
 // 只认英文的话，新事件的 deferFallback 恒为 false，界面会多出一条只有退出码的卡。
 function isGenericCodexExit(detail: string): boolean {
   return /^(?:Codex exited: |Codex 运行失败：)exit status \d+\.?$/.test(detail.trim());
+}
+
+// getAskEvent 把一条 ask.* 事件折成"这次提问当前是什么状态"。
+// 与服务端 ask.go 的事件族一一对应：pending 建卡，其余四条收口。
+// 返回 null 表示这条事件与提问无关（或字段残缺，宁可少一张卡也不要渲染半张）。
+export function getAskEvent(event: Event): { askId: string; status: Ask["status"]; questions?: AskQuestion[]; answers?: Record<string, string>; notes?: string } | null {
+  if (!event.type.startsWith("ask.")) return null;
+  const payload = asRecord(event.payload);
+  const askId = typeof payload.askId === "string" ? payload.askId : "";
+  if (!askId) return null;
+  const rawQuestions = Array.isArray(payload.questions) ? payload.questions.map(asRecord) : [];
+  const questions: AskQuestion[] = rawQuestions.map((question) => ({
+    id: String(question.id || ""),
+    header: String(question.header || ""),
+    question: String(question.question || ""),
+    kind: question.kind === "text" || question.kind === "number" ? question.kind : "choice",
+    options: Array.isArray(question.options)
+      ? question.options.map((option: unknown) => {
+          const record = asRecord(option);
+          return { label: String(record.label || ""), description: typeof record.description === "string" ? record.description : undefined };
+        })
+      : undefined,
+    multiSelect: Boolean(question.multiSelect),
+    placeholder: typeof question.placeholder === "string" ? question.placeholder : undefined,
+    min: typeof question.min === "number" ? question.min : undefined,
+    max: typeof question.max === "number" ? question.max : undefined,
+    step: typeof question.step === "number" ? question.step : undefined,
+    unit: typeof question.unit === "string" ? question.unit : undefined,
+  }));
+  const answers = asRecord(payload.answers);
+  const normalizedAnswers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(answers)) {
+    if (typeof value === "string") normalizedAnswers[key] = value;
+  }
+  return {
+    askId,
+    status: event.type.slice(4) as Ask["status"],
+    questions: questions.length > 0 ? questions : undefined,
+    answers: Object.keys(normalizedAnswers).length > 0 ? normalizedAnswers : undefined,
+    notes: typeof payload.notes === "string" ? payload.notes : undefined,
+  };
 }
 
 export function getApproval(event: Event): Approval | null {
@@ -354,6 +395,8 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
   // 每次渲染都做一遍 O(n²)，而 buildTimeline 是随流式输出反复调用的。
   const lastEventAtByRun = new Map<string, number>();
   const approvalStates = new Map<string, ApprovalEvent>();
+  // 提问状态按 askId 聚合：pending 建卡，终态事件覆盖状态与答案。
+  const askStates = new Map<string, { ask: Ask; createdAt: string; runId: string }>();
   for (const event of events) {
     const at = Date.parse(event.createdAt) || -Infinity;
     const known = lastEventAtByRun.get(event.runId);
@@ -371,6 +414,22 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
     if (event.type.startsWith("run.")) runStatuses.set(event.runId, event.type.slice(4));
     const approval = getApproval(event);
     if (approval) approvalStates.set(approval.approvalId, { approval, runId: event.runId, createdAt: event.createdAt });
+    const askEvent = getAskEvent(event);
+    if (askEvent) {
+      const existing = askStates.get(askEvent.askId);
+      askStates.set(askEvent.askId, {
+        ask: {
+          askId: askEvent.askId,
+          status: askEvent.status,
+          questions: askEvent.questions || existing?.ask.questions || [],
+          answers: askEvent.answers || existing?.ask.answers,
+          notes: askEvent.notes || existing?.ask.notes,
+        },
+        // 卡片的落点固定在 pending 那一刻：终态事件只是改状态，不能把卡挪到时间线末尾。
+        createdAt: existing?.createdAt || event.createdAt,
+        runId: existing?.runId || event.runId,
+      });
+    }
   }
   const approvals = [...approvalStates.values()].sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
   const usedApprovals = new Set<string>();
@@ -518,6 +577,9 @@ export function buildTimeline(messages: Message[], events: Event[]): TimelineIte
     ...messages.map((message) => ({ kind: "message" as const, id: message.id, createdAt: message.createdAt, message })),
     ...tools.map((action) => ({ kind: "tool" as const, id: action.id, createdAt: action.createdAt, action })),
     ...systemItems.map((system) => ({ kind: "system" as const, id: system.id, createdAt: system.createdAt, system })),
+    // 没有题目的事件不建卡：启动对账写出的 ask.cancelled 可能落在回放窗口边缘，
+    // 只剩一条终态、没有 pending 的题目，渲染出来就是一张空卡。
+    ...[...askStates.values()].filter((entry) => entry.ask.questions.length > 0).map((entry) => ({ kind: "ask" as const, id: entry.ask.askId, createdAt: entry.createdAt, runId: entry.runId, ask: entry.ask })),
     ...errorItems,
   ];
   return timeline.sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
@@ -642,6 +704,8 @@ export function timelineContentVersion(timeline: TimelineItem[], executions: Age
       return `tool:${item.id}:${item.action.output?.content.length || 0}:${item.action.approval?.status || ""}:${item.action.runStatus || ""}`;
     }
     if (item.kind === "system") return `system:${item.id}:${item.system.title}:${item.system.detail?.length || 0}`;
+    // 提问卡片也要进版本签名：否则答完之后列表认为"内容没变"，卡片停在等待态。
+    if (item.kind === "ask") return `ask:${item.id}:${item.ask.status}:${Object.keys(item.ask.answers || {}).length}`;
     return `error:${item.id}:${item.detail.length}`;
   });
   const nodeVersion = (node: AgentNode): string => [

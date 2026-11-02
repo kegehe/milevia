@@ -18,6 +18,16 @@ export function literalNameClass(name: string | undefined | null): string | unde
   return name && name.includes("_") ? "literal-name" : undefined;
 }
 
+// WSL 项目在 Windows 侧是 UNC 路径（\\wsl$\Ubuntu\home\root\projects 或
+// \\wsl.localhost\Ubuntu\...）。界面上已有企鹅图标标明 WSL 环境，再重复一遍
+// 发行版前缀只会挤占路径本身的位置，所以展示时剥掉前缀、转成 Linux 风格路径。
+export function workspacePathForDisplay(path: string): string {
+  const matched = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)(?:\\(.*))?$/i.exec(path);
+  if (!matched) return path;
+  const rest = (matched[2] ?? "").replaceAll("\\", "/");
+  return `/${rest}`;
+}
+
 export function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });

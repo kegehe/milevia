@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -103,6 +104,67 @@ func containAgentProcess(cmd *exec.Cmd) func() {
 	}
 	var once sync.Once
 	return func() { once.Do(job.close) }
+}
+
+// probePipeCloseGrace 是探针命令结束后，还愿意等输出管道关闭的上限。
+//
+// 作业对象已经能在超时时结束整棵树；这一条兜住其余情况（非 Windows、作业创建失败、
+// 或者命令正常退出但把管道留给了某个后裔）：没有它，`Wait` 会一直等管道 EOF。
+const probePipeCloseGrace = 2 * time.Second
+
+// runProbeCommand 跑一条"问状态"的命令（`--version` / `auth status` / `login status`），
+// 并保证 ctx 到点时**整棵进程树**一起结束。
+//
+// ⚠️ 为什么不能继续用 `exec.CommandContext + cmd.Output()`：Windows 上这些 CLI 常常是
+// `.cmd` 包装器，取消时 `CommandContext` 只杀得掉直接子进程（cmd.exe），真正的 node
+// 孙进程还握着 stdout 写端 —— 而 `Output()` 要等管道关闭才返回。实测（700ms 的 ctx +
+// `cmd /c ping -n 6`）：`Output()` 一直拖到 5.46 秒（= ping 自己跑完）才回；把进程放进
+// `KILL_ON_JOB_CLOSE` 的作业对象后 0.78 秒就回。
+//
+// 这正是 `/api/runners` 的探测**不服从 `agentProbeTimeout`** 的来源：单条探针的 5~10 秒
+// 超时形同虚设，一轮"最慢那条"可以是 65 秒（2026-10-30 实测），进而把一次读拖成
+// 84 秒，客户端只能判它"持续未响应"。
+//
+// 语义与 `cmd.Output()` 对齐：成功返回 stdout；失败返回 `*exec.ExitError`（Stderr 已填）。
+func runProbeCommand(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// 管道被后裔占住时，Wait 不该无限等 —— 见 probePipeCloseGrace。
+	cmd.WaitDelay = probePipeCloseGrace
+	configureProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	// 作业成员关系只能在进程创建时继承，所以 Start 之后立刻加入 —— 晚一步，
+	// 包装器在那之前拉起的孙进程就可能漏在作业外（见 probe_job_windows.go）。
+	release := containAgentProcess(cmd)
+	defer release()
+
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case <-ctx.Done():
+			// 关句柄 ⇒ 作业内所有进程（含握着管道的孙进程）一起结束，Wait 才收得回来。
+			release()
+			// 作业没建起来（非 Windows / 创建失败）时的兜底，与 `CommandContext` 原语义一致。
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		case <-finished:
+		}
+	}()
+
+	err := cmd.Wait()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitErr.Stderr = stderr.Bytes()
+		}
+		return stdout.Bytes(), err
+	}
+	return stdout.Bytes(), nil
 }
 
 // terminalSignalSink 把 CLI 的终结事件（claude 的 result、codex 的 turn.completed）

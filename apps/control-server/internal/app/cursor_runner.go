@@ -98,8 +98,7 @@ func (r *cursorCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	cmd := cursorCommandContext(ctx, r.cursorBinary(), "--version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runProbeCommand(ctx, cmd)
 	if err != nil {
 		return ""
 	}

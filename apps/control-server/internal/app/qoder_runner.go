@@ -89,14 +89,18 @@ func (r *qoderCLIRunner) Ready(parent context.Context) bool {
 }
 
 func (r *qoderCLIRunner) Version(parent context.Context) string {
-	// 10s 而不是跟着 CodeBuddy 用 5s：实测（1.1.75，Windows 冷启动）`qoder --version`
+	// 15s 而不是跟着 CodeBuddy 用 5s：实测（1.1.75，Windows 冷启动）`qoder --version`
 	// 要 3.1s —— 70MB 的 bundle 起 node 本身就慢。5s 在负载高的机器上会把"装好了"
 	// 探成"未安装"，而管理页会据此只给「安装」按钮。
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	//
+	// 从 10s 抬到 15s（2026-10-30）：同一台机器上实测 10.09s（1.1.80），**正好压着 10s 上限**
+	// —— 于是超时一恢复生效，Qoder 就稳定被报成"已安装但不可用"，而它其实工作正常。
+	// 探针的超时一旦真的能框住调用（见 runProbeCommand），这个数就必须留出冷启动余量，
+	// 否则"探得准"会输给"探得快"。整体仍有 agentProbeTimeout(45s) 兜底。
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
 	cmd := qoderCommand(ctx, r.qoderBinary(), "--version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runProbeCommand(ctx, cmd)
 	if err != nil {
 		return ""
 	}
@@ -425,6 +429,7 @@ func (r *qoderCLIRunner) StartSession(ctx context.Context, request AgentSessionR
 		label:      "Qoder",
 		exitPrefix: qoderExitPrefix,
 		turnError:  qoderTurnError,
+		steer:      true,
 	}, cmd, stdin, stdout, stderr)
 	session.watch(ctx)
 	return session, nil

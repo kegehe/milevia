@@ -35,6 +35,12 @@ type streamJSONSession struct {
 	exitPrefix string
 	// turnError 把 result 帧里的原始错误翻成面向用户的说法。nil 时用原文本（截断）。
 	turnError func(raw string, code string) error
+	// steer 为真时，活跃回合里可以再写一帧用户消息（Qoder 实测会在同一轮里采纳）。
+	steer bool
+	// readOnly 为真时，CodeBuddy 的 plan 模式如果请求退出去写文件，直接拒绝，
+	// 否则无头进程会停在没人能回的 control_request 上。
+	readOnly     bool
+	currentRunID string
 
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
@@ -43,7 +49,8 @@ type streamJSONSession struct {
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
-	mu     sync.Mutex
+	mu       sync.Mutex
+	stdinMu  sync.Mutex
 	sink   AgentRunSink
 	queued []streamJSONTurn
 	// turnFinishing closes the small gap after a result has detached the
@@ -68,11 +75,14 @@ type streamJSONSessionConfig struct {
 	label      string
 	exitPrefix string
 	turnError  func(raw string, code string) error
+	steer      bool
+	readOnly   bool
 }
 
 type streamJSONTurn struct {
 	frame []byte
 	sink  AgentRunSink
+	runID string
 }
 
 func newStreamJSONSession(config streamJSONSessionConfig, cmd *exec.Cmd, stdin io.WriteCloser, stdout, stderr io.ReadCloser) *streamJSONSession {
@@ -81,6 +91,8 @@ func newStreamJSONSession(config streamJSONSessionConfig, cmd *exec.Cmd, stdin i
 		label:       config.label,
 		exitPrefix:  config.exitPrefix,
 		turnError:   config.turnError,
+		steer:       config.steer,
+		readOnly:    config.readOnly,
 		cmd:         cmd,
 		stdin:       stdin,
 		stdout:      stdout,
@@ -143,11 +155,12 @@ func (s *streamJSONSession) Send(request AgentRunRequest, sink AgentRunSink) err
 		return fmt.Errorf("%s 会话已结束", s.label)
 	}
 	if s.sink != nil || s.turnFinishing {
-		s.queued = append(s.queued, streamJSONTurn{frame: append([]byte(nil), append(frame, '\n')...), sink: sink})
+		s.queued = append(s.queued, streamJSONTurn{frame: append([]byte(nil), append(frame, '\n')...), sink: sink, runID: request.RunID})
 		s.mu.Unlock()
 		return nil
 	}
 	s.sink = sink
+	s.currentRunID = request.RunID
 	s.mu.Unlock()
 	// 工具调用由 CLI 内部自执行并自己产出 tool_result（实测事件序列：
 	// assistant(tool_use) → user(tool_result) → assistant(text) → result），
@@ -156,18 +169,59 @@ func (s *streamJSONSession) Send(request AgentRunRequest, sink AgentRunSink) err
 	if ts, ok := sink.(AgentTurnSink); ok {
 		ts.TurnStarted()
 	}
-	if _, err := s.stdin.Write(append(frame, '\n')); err != nil {
+	if _, err := s.writeFrame(append(frame, '\n')); err != nil {
 		// 写入失败时 CLI 可能仍会继续产事件；先把 sink 摘掉并结束会话，避免
 		// 一个已被调用方判失败的 Run 继续收到 assistant/result 写入。
 		s.mu.Lock()
 		if s.sink == sink {
 			s.sink = nil
+			s.currentRunID = ""
 		}
 		s.mu.Unlock()
 		s.Stop()
 		return err
 	}
 	return nil
+}
+
+func (s *streamJSONSession) InjectPrompt(prompt string) (string, error) {
+	return s.injectPrompt(prompt)
+}
+
+func (s *streamJSONSession) writeFrame(frame []byte) (int, error) {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
+	if s.stdin == nil {
+		return 0, fmt.Errorf("%s 会话已结束", s.label)
+	}
+	return s.stdin.Write(frame)
+}
+
+// injectPrompt 在当前回合还没收到 result 时再写一帧。没有活跃回合时返回 errNoActiveTurn，
+// 调用方会改走排队，而不是报错。
+func (s *streamJSONSession) injectPrompt(prompt string) (string, error) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "", errors.New("steer prompt is required")
+	}
+	if !s.steer {
+		return "", errNoActiveTurn
+	}
+	frame, err := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": prompt}})
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	if s.closed || s.sink == nil || s.turnFinishing || s.currentRunID == "" {
+		s.mu.Unlock()
+		return "", errNoActiveTurn
+	}
+	runID := s.currentRunID
+	s.mu.Unlock()
+	if _, err := s.writeFrame(append(frame, '\n')); err != nil {
+		return "", err
+	}
+	return runID, nil
 }
 
 // Stop 结束会话进程组，并关闭读端以解除逃逸子进程对管道的占用。
@@ -261,6 +315,13 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 		if err := json.Unmarshal(line, &ev); err != nil {
 			continue
 		}
+		// 只读拒绝不依赖当前回合是否已经挂上 sink。control_request 若被
+		// 「还没有 sink」挡掉，CodeBuddy 会一直停在 ExitPlanMode。
+		if ev.Type == "control_request" && s.readOnly && s.agentID == "codebuddy" {
+			if frame, ok := codebuddyReadOnlyControlResponse(append([]byte(nil), line...)); ok {
+				_, _ = s.writeFrame(frame)
+			}
+		}
 		s.mu.Lock()
 		sink := s.sink
 		s.mu.Unlock()
@@ -294,6 +355,7 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 			// Detach the completed sink before its callback. finish() therefore
 			// cannot report the same turn again if the CLI exits concurrently.
 			s.sink = nil
+			s.currentRunID = ""
 			s.turnFinishing = true
 			s.mu.Unlock()
 			if ts, ok := sink.(AgentTurnSink); ok {
@@ -308,6 +370,7 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 			if len(s.queued) > 0 {
 				nextTurn := s.queued[0]
 				s.sink = nextTurn.sink
+				s.currentRunID = nextTurn.runID
 				s.queued = s.queued[1:]
 				s.turnFinishing = false
 				next := s.sink
@@ -344,6 +407,42 @@ func trimTurnText(raw, fallback string) string {
 		return string(runes[:200]) + "…"
 	}
 	return text
+}
+
+// codebuddyReadOnlyControlResponse 在只读回合里拒绝退出计划模式。
+// 其它 control_request 不代答。
+func codebuddyReadOnlyControlResponse(line []byte) ([]byte, bool) {
+	var ev struct {
+		Type      string `json:"type"`
+		RequestID string `json:"request_id"`
+		Request   struct {
+			Subtype   string `json:"subtype"`
+			ToolName  string `json:"tool_name"`
+			ToolUseID string `json:"tool_use_id"`
+		} `json:"request"`
+	}
+	if err := json.Unmarshal(line, &ev); err != nil || ev.Type != "control_request" {
+		return nil, false
+	}
+	if ev.Request.Subtype != "can_use_tool" || ev.Request.ToolName != "ExitPlanMode" || ev.RequestID == "" {
+		return nil, false
+	}
+	payload, err := json.Marshal(map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"subtype":    "success",
+			"request_id": ev.RequestID,
+			"response": map[string]any{
+				"allowed":     false,
+				"tool_use_id": ev.Request.ToolUseID,
+				"reason":      "只读回合不能退出计划模式去写文件。",
+			},
+		},
+	})
+	if err != nil {
+		return nil, false
+	}
+	return append(payload, '\n'), true
 }
 
 func drainLines(r io.Reader) {

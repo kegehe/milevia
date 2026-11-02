@@ -2,7 +2,7 @@ import { FormEvent, MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 
-import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, taskRunStatusTone, Task, TaskDetail, TaskFilter, taskDisplayTitle, taskQueueNote } from "./task-model";
+import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Priority, Request, sortQueueTasks, statusLabels, taskDisplayStatus, taskDisplayStatusClass, taskRunStatusLabel, taskRunStatusTone, Task, TaskDetail, TaskFilter, TaskRun, taskDisplayTitle, taskQueueNote } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import { persistTaskQuickDraft, readTaskQuickDraft } from "../../lib/task-quick-draft";
@@ -22,7 +22,7 @@ type QueueDragData = { taskID: string; sourceIndex: number };
 // WebView2 上 dataTransfer 的自定义 MIME 数据往返不可靠（getData 常读回空），
 // 拖拽目标数据改走内存：拖拽源写入、拖放目标读取。行组件彼此独立，故用模块级 ref。
 const queueDragPayloadRef: { current: QueueDragData | null } = { current: null };
-type PendingConfirm = { title: string; message: React.ReactNode; confirmLabel?: string; danger?: boolean; className?: string; icon?: React.ReactNode; onConfirm: () => void; onCancel: () => void } | null;
+type PendingConfirm = { title: string; message?: React.ReactNode; confirmLabel?: string; danger?: boolean; className?: string; icon?: React.ReactNode; centered?: boolean; object?: { title: string; meta?: string }; onConfirm: () => void; onCancel: () => void } | null;
 type ExecutionPolicy = "approval_required" | "full_control" | "read_only" | "workspace_write";
 
 function policyLabel(policy?: ExecutionPolicy): string {
@@ -286,9 +286,11 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const inlineDelete = () => {
     if (!inlineDetail) return;
     setPendingConfirm({
-      title: "删除任务",
-      message: <>确认删除任务「<b>{taskDisplayTitle(inlineDetail)}</b>」？此操作不可撤销，所有执行记录将被永久删除。</>,
+      title: "删除任务？",
+      centered: true,
       danger: true,
+      confirmLabel: "删除",
+      object: { title: taskDisplayTitle(inlineDetail), meta: deleteObjectMeta(inlineDetail.runs.length, inlineDetail.lastRun) },
       onConfirm: () => void (async () => {
         if (!mountedRef.current) return;
         const taskID = inlineDetail.id;
@@ -311,9 +313,11 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const deleteTask = (task: Task) => {
     if (!mountedRef.current) return;
     setPendingConfirm({
-      title: "删除任务",
-      message: <>确认删除任务「<b>{taskDisplayTitle(task)}</b>」？此操作不可撤销，所有执行记录将被永久删除。</>,
+      title: "删除任务？",
+      centered: true,
       danger: true,
+      confirmLabel: "删除",
+      object: { title: taskDisplayTitle(task), meta: deleteObjectMeta(undefined, task.lastRun) },
       onConfirm: () => void (async () => {
         if (!mountedRef.current) return;
         const taskID = task.id;
@@ -604,7 +608,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
       />)}</div>
     </div>
     {confirmingTask && createPortal(<DispatchConfirmation task={confirmingTask} detail={detail} loading={loadingDetail} dispatching={dispatching} dispatchDisabled={dispatchDisabled} permissionMode={permissionMode} close={closeConfirmation} openBoard={() => openBoard(confirmingTask.id)} dispatch={dispatch} />, document.body)}
-    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} confirmLabel={pendingConfirm.confirmLabel} danger={pendingConfirm.danger} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
+    {pendingConfirm && createPortal(<ConfirmDialog title={pendingConfirm.title} message={pendingConfirm.message} confirmLabel={pendingConfirm.confirmLabel} danger={pendingConfirm.danger} centered={pendingConfirm.centered} object={pendingConfirm.object} className={pendingConfirm.className} icon={pendingConfirm.icon} onConfirm={pendingConfirm.onConfirm} onCancel={pendingConfirm.onCancel} />, document.body)}
   </div>;
 }
 
@@ -1014,4 +1018,15 @@ function InlineTaskDetail({ detail, loading, busy, initialEditing = false, onEdi
 function formatDate(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+// 删除确认弹窗对象卡的元信息：有几个事实念几个，都读不到就不渲染（别把「读不到」写成「没有」）。
+// 行内删除拿得到完整 runs（总数）；列表行快照只有 lastRun，就只念最近一次。日期念法复用本页 formatDate。
+// 注意：必须放在 formatDate 之后——task-model.test.ts 把「InlineTaskDetail 到 formatDate」圈为组件区，
+// 断言其中不出现 formatDate/创建/上次执行（读数不进操作条），这个帮助函数不能落进那个区间。
+function deleteObjectMeta(runCount: number | undefined, lastRun?: TaskRun): string | undefined {
+  const parts: string[] = [];
+  if (typeof runCount === "number" && runCount > 0) parts.push(`执行记录${runCount}次`);
+  if (lastRun) parts.push(`最近运行${formatDate(lastRun.createdAt)}`);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
 }

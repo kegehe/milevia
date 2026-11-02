@@ -136,6 +136,8 @@ type remoteSnapshotConversation struct {
 	Title          string                  `json:"title"`
 	Status         string                  `json:"status"`
 	AgentID        string                  `json:"agentId"`
+	PermissionMode string                  `json:"permissionMode,omitempty"`
+	ModelOverride  string                  `json:"modelOverride,omitempty"`
 	LastActivityAt time.Time               `json:"lastActivityAt"`
 	IsCurrent      bool                    `json:"isCurrent"`
 	Messages       []remoteSnapshotMessage `json:"messages"`
@@ -228,7 +230,7 @@ const (
 // aborted/timeout："卡在等工具确认"是重新打开会话时最需要看到的状态，漏掉它用户只会
 // 以为程序死了。stderr 刻意不在其中——它逐行产生，几十行会把配额挤爆，而且真正的原因
 // 通常已经在 run.failed / error 的 detail 里；实时通道仍会把它聚合成一条"CLI 输出"。
-const remoteNoticeTypesSQL = `type in ('system','run.failed','run.interrupted','error','turn.failed','stream.error') or type like 'approval.%'`
+const remoteNoticeTypesSQL = `type in ('system','run.failed','run.interrupted','error','turn.failed','stream.error') or type like 'approval.%' or type like 'ask.%'`
 
 // remoteNoticeReplayPredicate 是快照运行记录的完整取数条件：类型命中 remoteNoticeTypesSQL、
 // 不是渲染不出来的空转子类型（unrenderedSystemSubtypePredicate）、也不是历史遗留的
@@ -1319,14 +1321,14 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 		taskRows.Close()
 		project.Conversations = make([]remoteSnapshotConversation, 0) // The active conversation is enough to make a project immediately usable
 		// on mobile. Do not turn a recovery snapshot into a full history export.
-		conversationRows, err := tx.QueryContext(r.Context(), `select id,title,status,agent_id,last_activity_at,is_current from conversations where project_id=? order by is_current desc,last_activity_at desc,id desc limit ?`, project.ID, remoteSnapshotConversationsPerProject)
+		conversationRows, err := tx.QueryContext(r.Context(), `select id,title,status,agent_id,permission_mode,model_override,last_activity_at,is_current from conversations where project_id=? order by is_current desc,last_activity_at desc,id desc limit ?`, project.ID, remoteSnapshotConversationsPerProject)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		for conversationRows.Next() {
 			var conversation remoteSnapshotConversation
-			if err := conversationRows.Scan(&conversation.ID, &conversation.Title, &conversation.Status, &conversation.AgentID, &conversation.LastActivityAt, &conversation.IsCurrent); err != nil {
+			if err := conversationRows.Scan(&conversation.ID, &conversation.Title, &conversation.Status, &conversation.AgentID, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.LastActivityAt, &conversation.IsCurrent); err != nil {
 				conversationRows.Close()
 				writeError(w, http.StatusInternalServerError, err)
 				return

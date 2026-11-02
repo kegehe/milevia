@@ -30,6 +30,40 @@ export type Task = {
 };
 export type TaskDetail = Task & { canDispatch: boolean; blockReason?: string; runs: TaskRun[]; events: TaskEvent[]; verificationRuns: VerificationRun[] };
 
+// ── 任务导出/导入（docs/50） ───────────────────────────────────────────────
+// 文件格式与 Task 是两套结构：文件里没有本机 uuid / position / 执行记录，
+// 依赖用文件内 key（t1…tN）表达。导入端只信任 task-transfer.ts 校验后的结果。
+export type TaskExportItem = {
+  key: string;
+  title?: string;
+  description: string;
+  priority?: string;
+  pinned?: boolean;
+  /** 源状态只用于判断依赖是否已满足（done 的前置在源项目里不阻塞）。 */
+  status?: string;
+  createdAt?: string;
+  dependsOn?: string[];
+};
+
+export type TaskExportFile = {
+  format: string;
+  version: number;
+  exportedAt?: string;
+  source?: { project?: string };
+  droppedDependencies?: number;
+  tasks: TaskExportItem[];
+};
+
+export type TaskImportResult = {
+  imported: number;
+  duplicates: number;
+  invalid: { key: string; reason: string }[];
+  satisfiedDependencies: number;
+  droppedDependencies: number;
+  dependencies: number;
+  created: { key: string; id: string }[];
+};
+
 export const priorityLabels: Record<Priority, string> = { urgent: "紧急", high: "高", normal: "普通", low: "低" };
 export const statusLabels: Record<TaskStatus, string> = { todo: "待处理", running: "执行中", awaiting_review: "待验收", action_required: "需处理", done: "已完成", cancelled: "已取消" };
 

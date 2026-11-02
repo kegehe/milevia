@@ -20,9 +20,9 @@ export const MOBILE_AGENTS: readonly MobileAgent[] = [
   { id: "claude-code", name: "Claude Code", vendor: "Anthropic", logo: "claude", permissionModes: ["approval_required", "full_control"], defaultPermission: "approval_required" },
   { id: "codex", name: "Codex", vendor: "OpenAI", logo: "openai", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
   { id: "codebuddy", name: "CodeBuddy Code", vendor: "Tencent Cloud", vendorLabel: "腾讯云", logo: "codebuddy", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-  { id: "qoder", name: "Qoder CLI", vendor: "Alibaba", vendorLabel: "阿里云", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-  { id: "opencode", name: "OpenCode", vendor: "Anomaly", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
-  { id: "cursor", name: "Cursor CLI", vendor: "Anysphere", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+  { id: "qoder", name: "Qoder CLI", vendor: "Alibaba", vendorLabel: "阿里云", logo: "qoder", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+  { id: "opencode", name: "OpenCode", vendor: "Anomaly", logo: "opencode", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
+  { id: "cursor", name: "Cursor CLI", vendor: "Anysphere", logo: "cursor", permissionModes: ["read_only", "workspace_write", "full_control"], defaultPermission: "workspace_write" },
 ];
 
 export function mobileAgent(id: string): MobileAgent | undefined {

@@ -13,6 +13,23 @@ const requestTimeoutMs = 15_000;
 
 /** 探测类长任务：服务端自己有 10~45 秒的预算（registry 查询、逐工具探测）。 */
 const probeTimeoutMs = 60_000;
+/**
+ * 「执行环境清单」的等待上限 —— 它不是一个探测，是**一串探测的聚合器**。
+ *
+ * 服务端给它的是两段**串行**预算：先问通道（`channelHealthTimeout` 30 秒），再探工具
+ * （`agentProbeTimeout` 45 秒）；各台机器并行，所以最慢的那一台可以合法地走到约 75 秒。
+ *
+ * 而且远不止一轮：`probeAgentsFor` 在"接到一轮已经超时的探测"时**不采纳**它
+ * （accepted=false，那样不会把不完整的读数写进缓存），等待者会**重做一整轮**。于是
+ * 一次读的合法上限是两轮 ≈ 90 秒，加上单轮本身可能超出 45 秒（实测一轮 65 秒 ——
+ * 探针的子进程不响应取消时就是这样），最坏约 110 秒。2026-10-30 本机抓到一次
+ * 84.4 秒才正常返回的 200（同样的读在 27~65 秒之间波动）。
+ *
+ * 所以它不是 60 秒那一档能装下的：60 秒、甚至 90 秒都会在"重做一轮"的机器上
+ * 复现同一条假失败。取 120 秒贴着这个上限，不取更整的数 —— 再大就只是把真卡死
+ * （服务端确实没在跑）也拖到两分钟以后才报。
+ */
+const runnerListTimeoutMs = 120_000;
 /** 外部进程/网络类长任务：服务端按 30 秒~2 分钟设计（单条 git 命令、MCP 探针、SSH 握手、UAC 等待）。 */
 const externalTaskTimeoutMs = 120_000;
 /** 安装类长任务：服务端按 15 分钟设计（`Config.AgentUpdateTimeout`，见 `defaultAgentUpdateTimeout`）。 */
@@ -83,6 +100,10 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	{ methods: ["POST"], pattern: /^\/api\/conversations\/[^/]+\/messages$/, timeoutMs: externalTaskTimeoutMs },
 	// 任务下发复用会话启动流水线，可能等待 runner/额度/工作区。
 	{ methods: ["POST"], pattern: /^\/api\/tasks\/[^/]+\/dispatch$/, timeoutMs: externalTaskTimeoutMs },
+	// 任务导入是同步长事务（单连接 + 最多 2000 条），且服务端已 detach 写上下文：
+	// 15 秒一到只会得到假失败，用户会重复提交。导出是整表序列化，同样按长任务给预算。
+	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/tasks\/import$/, timeoutMs: externalTaskTimeoutMs },
+	{ methods: ["GET"], pattern: /^\/api\/projects\/[^/]+\/tasks\/export$/, timeoutMs: externalTaskTimeoutMs },
 	// 编排的两条重活（合并分支 / 清理工作区资源）：
 	//   · merge-main 是**一串** git 命令（status → rev-parse → merge-base --is-ancestor →
 	//     merge --no-ff），单条上限就是 gitCommandTimeout = 30 秒，慢盘/大仓库上叠起来超 15 秒很正常；
@@ -114,6 +135,15 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	// ── 探测类 ──
 	// 逐工具探测受 agentProbeTimeout = 45 秒约束；这里是"读一台机器上的全部工具"
 	{ methods: ["GET"], pattern: /^\/api\/runners\/[^/]+\/(agents|diagnostics)$/, timeoutMs: probeTimeoutMs },
+	// **执行环境清单本身也是探测**：它把上面那条对每台机器各跑一遍（外加一次通道健康
+	// 检查），所以它是全站最慢的一次读。漏在表外的代价是 CLI 管理页必然报错 ——
+	// 15 秒到的第一次放弃、30 秒的第二次放弃，而服务端 27~84 秒才正常返回，
+	// 于是用户看到的是"控制服务持续未响应，请重启 Milevia"（2026-10-30 用真实
+	// 前端模块打真实服务复现：旧预算 45.8 秒就落了这条错误）。
+	{ methods: ["GET"], pattern: /^\/api\/runners$/, timeoutMs: runnerListTimeoutMs },
+	// 同一份探测的单机形态（新会话弹窗、建议面板用它）。同样只探工具，没有聚合，
+	// 但单台也能走到 45 秒。
+	{ methods: ["GET"], pattern: /^\/api\/runners\/[^/]+\/status$/, timeoutMs: probeTimeoutMs },
 	{ methods: ["GET"], pattern: /^\/api\/runners\/[^/]+\/agents\/[^/]+\/diagnose$/, timeoutMs: probeTimeoutMs },
 	// registry 往返：实测 2~3 秒/次，最坏一次 14.6 秒才失败（docs/42 §25）—— 正好贴着 15 秒
 	{ methods: ["POST"], pattern: /^\/api\/runners\/[^/]+\/agents\/[^/]+\/check-update$/, timeoutMs: probeTimeoutMs },

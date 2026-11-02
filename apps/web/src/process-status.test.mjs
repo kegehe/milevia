@@ -39,8 +39,9 @@ test("DashboardPage: 项目卡片渲染开发进程状态点徽标（stopped 隐
   assert.match(dashboard, /useProcessStatusMap\(\)/);
 });
 
-test("DashboardPage: 项目卡片显示完整工作目录路径", () => {
-  assert.match(dashboard, /<span title=\{project\.fullPath\}><small>[^<]*<\/small><b className=\{literalNameClass\(project\.fullPath\)\}>\{project\.fullPath\}<\/b><\/span>/);
+test("DashboardPage: 项目卡片显示完整工作目录路径（WSL 剥掉发行版前缀）", () => {
+  assert.match(dashboard, /const workspacePath = workspacePathForDisplay\(project\.fullPath\)/);
+  assert.match(dashboard, /<span title=\{project\.fullPath\}><small>[^<]*<\/small><b className=\{literalNameClass\(workspacePath\)\}>\{workspacePath\}<\/b><\/span>/);
   assert.doesNotMatch(dashboard, /<span title=\{project\.fullPath\}><small>[^<]*<\/small><b className=\{literalNameClass\(project\.pathDisplay\)\}>\{project\.pathDisplay\}<\/b><\/span>/);
 });
 

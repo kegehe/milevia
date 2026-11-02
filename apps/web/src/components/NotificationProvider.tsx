@@ -4,10 +4,12 @@ import { createContext, useContext, useEffect, useRef, useCallback, useState } f
 import { useNavigate, useLocation } from "react-router-dom";
 import { Toaster, toast } from "sonner";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { createWebSocket, isDesktop } from "../lib/runtime";
 import {
   type NotificationEvent,
+  approvalIDFromNotification,
   isWindowsNotifyType,
   isWithinQuietHours,
   notificationTargetURL,
@@ -17,7 +19,9 @@ import {
   rememberNotificationID,
   toastVariantForType,
   trimUnreadNotifications,
+  windowsToastActions,
   windowsToastLines,
+  windowsToastSticky,
 } from "../lib/notifications";
 import { useUIPreferences, type LocalPreferences } from "../stores/useUIPreferences";
 import { NotificationToastBody } from "./NotificationToastBody";
@@ -51,6 +55,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   const shownRef = useRef(new Set<string>()); // 跟踪 WebSocket 已展示的通知 ID（防止重连重复）
   const broadcastShownRef = useRef(new Set<string>()); // 跟踪 BroadcastChannel 已处理的通知 ID（防止重复 inc）
   const activeToastIdsRef = useRef(new Set<string>());
+  const decidingApprovalsRef = useRef(new Set<string>());
   const initializedRef = useRef(false); // 初始加载完成标志，防止 WebSocket 历史通知与初始加载竞态
   const unreadRequestSeq = useRef(0); // 首拉、重连与后台失效刷新共用序号，拒绝旧快照。
   const channelRef = useRef<BroadcastChannel | null>(null);
@@ -175,15 +180,22 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   // 处理收到的通知
   const handleNotification = useCallback(
     (event: NotificationEvent, fromBroadcast = false) => {
+      // 审批已经有了结果。这条和当初那条用同一个 id，必须在去重之前处理，否则会被当成重复通知丢掉。
+      if (event.type === "notification.dismissed") {
+        if (event.id) {
+          markDismissed(event.id, true);
+          // 审批可能已经在会话里处理完，或已经超时。屏幕上那条带按钮的弹窗要一起收掉。
+          if (isDesktop()) {
+            invoke("dismiss_system_notification", { notificationId: event.id }).catch(() => {});
+          }
+        }
+        return;
+      }
+
       if (dismissedRef.current.has(event.id)) return;
 
       // dismiss-all 后过滤：创建时间早于 dismiss-all 时间戳的通知视为已处理
       if (unreadCreatedAt(event) === null) return;
-
-      // 审批去重：如果用户正在查看该会话，不弹 toast
-      if (event.type === "approval.pending" && isViewingConversation(event.conversationId)) {
-        return;
-      }
 
       // BroadcastChannel 收到的通知（来自其他 Tab 的转发）：
       // - 如果本 Tab 已通过 WebSocket 处理过（shownRef 有记录），跳过
@@ -213,6 +225,12 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         payload: event,
       });
 
+      // 缩进托盘或最小化时，WebView 有时仍报 hasFocus()。可见性一起看，避免该弹的不弹。
+      const windowAway = !document.hasFocus() || document.visibilityState === "hidden";
+      const viewingApproval = event.type === "approval.pending" && isViewingConversation(event.conversationId);
+      // 人正在看这个会话、窗口也在前台：不叠应用内 toast（横幅已经在），也不弹系统通知。
+      // 角标先留着。审批还没裁决，不能在这里标已读。
+
       const preferences = localPreferencesRef.current;
       const mappedPriority = priorityForType(event.type);
       const isHighPriority = event.priority === "high" || mappedPriority === "high";
@@ -221,6 +239,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       const shouldPresent = isHighPriority || (!inQuietHours && (isNormalPriority ? preferences.taskNotificationsEnabled : preferences.lowPriorityNotificationsEnabled));
 
       // 显示偏好只控制临时提醒；通知中心仍保留服务端保留期内的通知。
+      // 正在看这个会话时不叠应用内 toast（横幅已经在），系统弹窗仍按“窗口不在前台”单独发。
       if (!shouldPresent) {
         markUnread(event);
         return;
@@ -238,42 +257,47 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         event.title
       );
 
-      activeToastIdsRef.current.add(event.id);
-      toast[variant](titleNode, {
-        id: `notif-${event.id}`, // 去重：同一通知只显示一个
-        className: "notif-toast", // 方案E轨迹卡样式钩子（notification.css 末段）
-        description: <NotificationToastBody body={event.body} durationMs={duration} />,
-        duration,
-        action: {
-          label: "查看详情",
-          onClick: () => {
-            activeToastIdsRef.current.delete(event.id);
-            navigate(notificationTargetURL(event));
+      if (!viewingApproval) {
+        activeToastIdsRef.current.add(event.id);
+        toast[variant](titleNode, {
+          id: `notif-${event.id}`, // 去重：同一通知只显示一个
+          className: "notif-toast", // 方案E轨迹卡样式钩子（notification.css 末段）
+          description: <NotificationToastBody body={event.body} durationMs={duration} />,
+          duration,
+          action: {
+            label: "查看详情",
+            onClick: () => {
+              activeToastIdsRef.current.delete(event.id);
+              navigate(notificationTargetURL(event));
+              // 审批还在等裁决。打开会话不能当成已经处理，否则人再缩回托盘就没有入口。
+              if (event.type !== "approval.pending") dismissNotification(event.id);
+            },
+          },
+          onDismiss: () => {
+            // Sonner 的程序化 dismiss 也会触发回调；只有用户关闭才写入已读状态。
+            if (!activeToastIdsRef.current.delete(event.id)) return;
+            if (event.type === "approval.pending") return;
             dismissNotification(event.id);
           },
-        },
-        onDismiss: () => {
-          // Sonner 的程序化 dismiss 也会触发回调；只有用户关闭才写入已读状态。
-          if (!activeToastIdsRef.current.delete(event.id)) return;
-          dismissNotification(event.id);
-        },
-        onAutoClose: () => activeToastIdsRef.current.delete(event.id),
-      });
+          onAutoClose: () => activeToastIdsRef.current.delete(event.id),
+        });
+      }
 
       markUnread(event);
 
-      // Windows 系统右下角弹窗通知：用户开启 + 任务完成类 + 主窗口不在前台时发起。
-      // 内容为方案A分层完整版：标题=事件 title，第二行「项目「X」· 任务Y」，第三行耗时
-      // （均为服务端算好的字段，经 windowsToastLines 组装，缺失时省略对应行）；
-      // 点击后跳到对应项目。用 document.hasFocus() 判断主窗口是否在前台：聚焦时已有
-      // 应用内 toast，不叠加系统弹窗造成双重提醒；切到别处（窗口失焦/最小化）才弹。
-      if (isDesktop() && preferences.windowsToastsEnabled && isWindowsNotifyType(event.type) && !document.hasFocus()) {
+      // 窗口不在前台（缩到托盘、或切到别的程序）才弹系统通知。
+      // 完成类是短时提示；审批、提问、需要处理和编排卡住会留着，审批带允许 / 拒绝。
+      if (isDesktop() && preferences.windowsToastsEnabled && isWindowsNotifyType(event.type) && windowAway) {
         const toastLines = windowsToastLines(event);
         invoke("show_system_notification", {
           path: notificationTargetURL(event),
           title: toastLines.title,
           line1: toastLines.line1,
           line2: toastLines.line2,
+          buttons: windowsToastActions(event),
+          approvalId: approvalIDFromNotification(event),
+          notificationId: event.id,
+          sticky: windowsToastSticky(event.type),
         }).catch(() => {
           /* 系统通知失败不影响应用内提醒 */
         });
@@ -287,8 +311,41 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         });
       }
     },
-    [navigate, isViewingConversation, dismissNotification, markUnread, unreadCreatedAt],
+    [navigate, isViewingConversation, dismissNotification, markDismissed, markUnread, unreadCreatedAt],
   );
+
+  // 系统弹窗上的「允许 / 拒绝」。窗口可以仍缩在托盘里，这条请求不把窗口拉到前台。
+  const decideApprovalFromToast = useCallback(async (approvalId: string, decision: "allow" | "deny", notificationId: string, path: string) => {
+    if (!approvalId || decidingApprovalsRef.current.has(approvalId)) return;
+    decidingApprovalsRef.current.add(approvalId);
+    try {
+      await api(`/api/approvals/${approvalId}`, { method: "POST", body: JSON.stringify({ decision }) });
+      if (notificationId) dismissNotification(notificationId);
+    } catch (cause) {
+      const status = cause && typeof cause === "object" && "status" in cause ? (cause as { status?: number }).status : undefined;
+      // 404 说明这条审批已经有结果了，通知可以收掉。别的失败（网络、服务忙）审批还在，
+      // 不能标已读，否则托盘里再没有入口。
+      if (status === 404) {
+        if (notificationId) dismissNotification(notificationId);
+        invoke("show_system_notification", {
+          path,
+          title: "这条审批已经处理过了",
+          line1: "",
+          line2: "",
+          buttons: [],
+          approvalId: "",
+          notificationId: "",
+          sticky: false,
+        }).catch(() => {});
+        return;
+      }
+      invoke("show_main_window").catch(() => {});
+      navigate(path);
+      toast.error(cause instanceof Error ? cause.message : "未能处理这条审批");
+    } finally {
+      decidingApprovalsRef.current.delete(approvalId);
+    }
+  }, [dismissNotification, navigate]);
 
   // WebSocket 连接 + 自动重连
   useEffect(() => {
@@ -366,6 +423,33 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       channelRef.current = null;
     };
   }, [handleNotification, markDismissed, markAllDismissed]);
+
+  // 点系统弹窗：正文打开会话；允许 / 拒绝直接裁决，不把窗口拉起来。
+  useEffect(() => {
+    if (!isDesktop()) return;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<{ action?: string; path?: string; approvalId?: string; notificationId?: string }>("notification://activated", (event) => {
+      const action = event.payload?.action;
+      const path = event.payload?.path || "/";
+      const notificationId = event.payload?.notificationId || "";
+      const approvalId = event.payload?.approvalId || "";
+      if (action === "allow" || action === "deny") {
+        void decideApprovalFromToast(approvalId, action, notificationId, path);
+        return;
+      }
+      // 点正文只是去看。审批还没裁决，不能在这里标已读。
+      if (notificationId && !approvalId) dismissNotification(notificationId);
+      navigate(path);
+    }).then((stop) => {
+      if (disposed) { stop(); return; }
+      unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [decideApprovalFromToast, dismissNotification, navigate]);
 
   // 监听 NotificationCenter 的已读事件，并同步其他标签页。
   useEffect(() => {

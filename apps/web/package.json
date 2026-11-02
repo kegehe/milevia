@@ -9,6 +9,7 @@
     "test:history-deletion": "node scripts/verify-history-deletion.mjs",
     "test:notification-retention": "node scripts/verify-notification-retention.mjs",
     "test:mobile-notifications": "node scripts/verify-mobile-notifications.mjs",
+    "test:git-commit-push": "node scripts/verify-git-commit-push.mjs",
     "build": "tsc -b && vite build",
     "icons": "node scripts/generate-icons.mjs"
   },

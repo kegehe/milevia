@@ -148,8 +148,7 @@ func (r *codexCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	cmd := codexCommandContext(ctx, r.codexBinary(), "--version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runProbeCommand(ctx, cmd)
 	if err != nil {
 		return ""
 	}
@@ -242,10 +241,13 @@ func codexExecArgs(request AgentRunRequest, profileArgs []string, schemaPath, po
 	if request.ReasoningEffort != "" {
 		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", request.ReasoningEffort))
 	}
+	// --skip-git-repo-check：新建目录常常还不是 git 仓库，缺这个开关时 CLI 直接以
+	// "Not inside a trusted directory and --skip-git-repo-check was not specified" 退出，
+	// 用户看到的就是一句「工具输出异常」。SSH/WSL 两处 runner 同样会踩到，三处 resume 分支一起补上。
 	if request.Resume {
-		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, "-")
+		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", request.SessionID, "-")
 	} else {
-		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, "-")
+		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, "-")
 	}
 	return args
 }

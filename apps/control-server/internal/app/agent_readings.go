@@ -61,6 +61,13 @@ type agentProbeRound struct {
 	// 探测期间发生过写操作（epoch 变了）或整体超时时，结果不入缓存，此时回放等于把
 	// **写操作之前**的读数标上"探测结束时刻"交给界面 —— 正是 epoch 机制要挡的那件事。
 	accepted bool
+	// expired 报告这一轮是**被整体超时截断**、且没有被写操作作废的。
+	//
+	// 这一档等待者可以拿它的结果：它既没有跨越写操作（epoch 没变），也不该进缓存
+	// （读数不完整），但它就是**这次探测已经查到的部分** —— 与发起者拿到的完全一致。
+	// 不重做是必须的：重做只是把同一台慢机器再等一遍，实测把一次读从 65 秒拖到 84 秒
+	// （2026-10-30，两个客户端同时等同一轮时发生）。
+	expired bool
 }
 
 // agentReading 是某台机器上"工具状态"的一份读数快照（含由它派生的批量诊断报告）。
@@ -161,13 +168,15 @@ func (s *Server) probeAgentsFor(ctx context.Context, meta RunnerMeta, force bool
 				s.agentReadingsMu.Unlock()
 				select {
 				case <-round.done:
-					if round.accepted {
+					if round.accepted || round.expired {
 						return round.statuses, round.at
 					}
 					// 那一轮结束了但**没被采纳**（探测期间发生过写操作，或整体超时）：
 					// 它的 statuses 是写操作**之前**的读数、at 却是探测结束时刻，直接回放
 					// 就是把旧读数标成"刚刚读到的"——正是 epoch 机制要挡的那件事
 					// （2026-09-29 定位）。重新走一遍决策：大概率自己再探一轮。
+					//
+					// 超时那一档例外，见 round.expired：它没有跨越写操作，重做只是再等一遍。
 					continue
 				case <-ctx.Done():
 					// 调用方不等了（典型：用户切走了页面）。探测本身跑在服务端生命周期上、
@@ -241,6 +250,10 @@ func (s *Server) probeAgentsFor(ctx context.Context, meta RunnerMeta, force bool
 				}
 				next.at, next.statuses = round.at, statuses
 			}
+		} else if timedOut && current.epoch == epoch && current.roundSeq == seq {
+			// 只是超时、没被写操作作废：结果不进缓存（不完整），但等待者不必重做一轮
+			// —— 它拿到的与发起者拿到的完全一致（见 round.expired）。
+			round.expired = true
 		}
 		s.agentReadings[meta.ID] = next
 		s.agentReadingsMu.Unlock()

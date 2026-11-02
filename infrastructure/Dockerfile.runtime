@@ -1,0 +1,16 @@
+# 生产运行镜像：只包含预编译好的静态二进制。
+#
+# 构建（宿主机先准备好 cloud-control 二进制）：
+#   docker build -t milevia-cloud-control:bootstrap \
+#     -f infrastructure/Dockerfile.runtime /path/to/dir-containing-binary
+#
+# 为什么用 scratch：cloud-control 以 CGO_ENABLED=0 构建，不依赖 libc 或
+# 其它运行时文件；镜像里只有二进制，体积最小，也不需要从 Docker Hub 拉基础镜像。
+# 注意：scratch 里没有 sha256sum 等命令，部署脚本的哈希校验必须在宿主侧完成
+# （见 scripts/deploy-cloud-control.sh）。如果服务器上的 CI 仍在用旧版脚本
+# （容器内 docker exec sha256sum），请改用带 busybox 的最小运行镜像；当前
+# 生产机就是这样兼容的，等宿主侧校验的修复推送后再换回本文件。
+FROM scratch
+COPY cloud-control /usr/local/bin/cloud-control
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/cloud-control"]

@@ -1327,6 +1327,19 @@ func (s *Server) retryGitOperationUpdate(operationID, afterState, code, message 
 	}
 }
 
+// gitOperationFailure 把一次 git 命令的失败翻译成**用户看得懂、且知道下一步做什么**的一句话。
+//
+// 判据与约束：
+//
+//   · **先按错误的种类判，再看 stderr 的措辞**。git 的文案随版本变（实测 2.52 的
+//     分叉提示是 "Diverging branches can't be fast-forwarded" + "fatal: Not possible
+//     to fast-forward, aborting."），所以关键字要挑那些跨版本稳定的。
+//   · **兜底不能是「Git 操作失败」**。那句话零信息量：用户既不知道成没成，也不知道
+//     该做什么，只能去翻终端。实测七种常见失败（远端仓库不存在、远端分支不存在、
+//     历史分叉、缺上游、远端名写错、命令超时…）都会落到这句兜底上 ——
+//     这是"操作失败但界面什么都不说"的根因之一。
+//   · **不把英文原文透给用户**（见 docs/45 错误文案本地化）：所有文案都是中文，
+//     stderr 只用来判类，不用来拼句子。
 func gitOperationFailure(err error) (status, code, message string) {
 	if errors.Is(err, errGitStashCreateIncomplete) {
 		return gitOperationNeedsAttention, "stash_create_incomplete", "收起未完成，可能已有 Stash 备份或仍有未收起的文件（如子模块内部改动）；请刷新并检查工作区，确认前不要移除工作区"
@@ -1337,9 +1350,17 @@ func gitOperationFailure(err error) (status, code, message string) {
 	if errors.Is(err, errGitPartiallyApplied) {
 		return gitOperationNeedsAttention, "partial_result", "部分文件可能已被处理；请刷新仓库并检查工作区"
 	}
+	// 命令超时不是 gitCommandError（runGit 直接把 ctx 的错误返回上来），
+	// 所以必须单独判 —— 否则它也会掉进下面那句零信息量的兜底。
+	if errors.Is(err, context.DeadlineExceeded) {
+		return gitOperationFailed, "git_timeout", "Git 命令超过 30 秒仍未结束。请检查网络与仓库状态后重试"
+	}
+	if errors.Is(err, errGitTerminationTimedOut) {
+		return gitOperationFailed, "git_hung", "Git 命令卡住且无法结束，已被强制终止。请检查仓库状态后重试"
+	}
 	var commandErr *gitCommandError
 	if !errors.As(err, &commandErr) {
-		return gitOperationFailed, "git_failed", "Git 操作失败"
+		return gitOperationFailed, "git_failed", "Git 操作失败，请查看终端或操作记录了解详情"
 	}
 	stderr := strings.ToLower(commandErr.stderr)
 	switch {
@@ -1351,16 +1372,42 @@ func gitOperationFailure(err error) (status, code, message string) {
 		return gitOperationFailed, "hook_rejected", "Git hook 拒绝了本次操作"
 	case strings.Contains(stderr, "nothing to commit"):
 		return gitOperationFailed, "nothing_to_commit", "没有可提交的已暂存改动"
+	// 推送被拒：远端有本地没有的提交（non-fast-forward）。要判在"分叉"之前 ——
+	// 推送被拒的提示里也可能出现 fast-forward 字样，先判分叉会把它误分类。
 	case strings.Contains(stderr, "non-fast-forward"), strings.Contains(stderr, "updates were rejected"):
-		return gitOperationFailed, "push_rejected", "推送被拒绝，远端有更新。请先 fetch 再推送"
+		return gitOperationFailed, "push_rejected", "推送被拒绝，远端有本地没有的提交。请先获取（fetch）远端更新并合入，再推送"
+	// 拉取时的历史分叉：本项目对拉取一律 --ff-only，宁可失败也不静默产生合并冲突。
+	// 这恰恰是最该解释清楚的一种 —— 失败是设计使然，不是出了故障。
+	case strings.Contains(stderr, "not possible to fast-forward"), strings.Contains(stderr, "diverging branches"), strings.Contains(stderr, "cannot fast-forward"):
+		return gitOperationFailed, "pull_diverged", "本地与远端历史已分叉，无法快进合并。请在电脑上先合并或变基，再重新拉取"
 	case strings.Contains(stderr, "authentication failed"), strings.Contains(stderr, "permission denied"):
-		return gitOperationFailed, "auth_failed", "Git 远端认证失败，请检查凭证"
-	case strings.Contains(stderr, "could not resolve host"), strings.Contains(stderr, "unable to access"):
+		return gitOperationFailed, "auth_failed", "Git 远端认证失败，请检查仓库地址与访问凭据"
+	// 远端名写错 / URL 不对（git 报 "does not appear to be a git repository"）。
+	// 它后面常跟一句 "Could not read from remote repository" —— 那句要留给下面那条判，
+	// 所以这一档必须排在它前面。
+	case strings.Contains(stderr, "does not appear to be a git repository"):
+		return gitOperationFailed, "remote_not_configured", "远端地址不可用，请检查远端名称与 URL 是否配置正确"
+	// 远端仓库不存在或无权访问（私有库没授权时 git 也报 "Repository not found"）。
+	case strings.Contains(stderr, "repository not found"), strings.Contains(stderr, "repository does not exist"):
+		return gitOperationFailed, "remote_not_found", "远端仓库不存在或无权访问，请检查仓库地址与访问权限"
+	case strings.Contains(stderr, "could not read from remote repository"):
+		return gitOperationFailed, "remote_unreadable", "无法读取远端仓库，请检查远端地址、网络与访问权限"
+	case strings.Contains(stderr, "could not read username"), strings.Contains(stderr, "terminal prompts disabled"), strings.Contains(stderr, "could not read password"), strings.Contains(stderr, "askpass"):
+		return gitOperationFailed, "credentials_required", "远端需要身份凭据。请先在电脑上配置好 Git 凭据（SSH 密钥或凭据管理器），再重试"
+	case strings.Contains(stderr, "could not resolve host"), strings.Contains(stderr, "unable to access"), strings.Contains(stderr, "failed to connect to"):
 		return gitOperationFailed, "remote_unavailable", "无法连接到 Git 远端，请检查网络或远端地址"
 	case strings.Contains(stderr, "your local changes"), strings.Contains(stderr, "would be overwritten"):
 		return gitOperationFailed, "dirty_worktree", "工作区有未提交改动，请先提交、收起（Stash）或丢弃"
+	case strings.Contains(stderr, "couldn't find remote ref"), strings.Contains(stderr, "could not find remote ref"):
+		return gitOperationFailed, "remote_ref_missing", "远端没有这个分支，请检查分支名是否正确"
+	case strings.Contains(stderr, "src refspec"), strings.Contains(stderr, "does not match any"):
+		return gitOperationFailed, "nothing_to_push", "没有可推送的提交，请先创建提交"
+	case strings.Contains(stderr, "has no upstream branch"):
+		return gitOperationFailed, "no_upstream", "当前分支还没有上游分支，请先设置跟踪分支再推送"
+	case strings.Contains(stderr, "protected branch"), strings.Contains(stderr, "remote rejected"):
+		return gitOperationFailed, "remote_rejected", "远端拒绝了这次推送，可能是受保护分支或权限策略限制"
 	default:
-		return gitOperationFailed, "git_failed", "Git 操作失败"
+		return gitOperationFailed, "git_failed", "Git 操作失败，请查看终端或操作记录了解详情"
 	}
 }
 

@@ -2,7 +2,8 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRe
 
 import { toast } from "sonner";
 
-import { changeState, commitFileStatusLabel, formatGitTime, groupChanges, isMergeCommit, shortOID, type GitBranch, type GitChange, type GitCommit, type GitCommitDetail, type GitCommitFile, type GitConflictOverview, type GitDiff, type GitOperation, type GitSnapshot, type GitStash } from "./git-model";
+import { changeState, commitFileStatusLabel, commitPushFailureDetail, commitPushFailureTitle, commitPushPushedCount, commitPushRunningText, commitPushSuccessText, commitPushUnavailableReason, formatGitTime, gitCommitPushOption, gitPushTarget, groupChanges, isMergeCommit, remoteOpFailureTitle, remoteOpRunningText, remoteOpSuccessText, shortOID, type CommitPushOption, type GitBranch, type GitChange, type GitCommit, type GitCommitDetail, type GitCommitFile, type GitCommitPushOutcome, type GitCommitPushPhase, type GitConflictOverview, type GitDiff, type GitFeedbackOp, type GitOperation, type GitRemoteOpKind, type GitSnapshot, type GitStash } from "./git-model";
+import { CommitPushMenu } from "./CommitPushMenu";
 import { ConflictSolveView } from "./ConflictSolveView";
 import { GitStashPanel } from "./GitStashPanel";
 import { useCodeFontSize } from "../files/useCodeFontSize";
@@ -42,8 +43,24 @@ function isGitStateChangedError(cause: unknown): boolean {
   return error.status === 409
     && (error.code === "git_state_changed" || error.code === "stale_state" || error.message?.includes("Git state changed") === true || error.message?.includes("仓库状态") === true);
 }
+
+/**
+ * 这次失败是服务端**明确回绝**（带 HTTP 状态码），还是**传输层断了**（连接断了 / 请求超时）？
+ *
+ * 为什么要分清这两件事：传输层失败**不代表**服务端没执行这次写入 —— 它可能已经把
+ * 提交建出来了。那种情况下说"本地没有产生任何提交，可以直接重试"是在骗用户：
+ * 他照着做就会多出一个提交。只有服务端**明确回了状态码**（4xx/5xx），才敢说
+ * "确定没执行"。
+ *
+ * 判据用结构（有没有 status 字段），不用文案 —— 文案会被翻译、会被改措辞，
+ * 拿它当判据是静默失效（见 errGitStateChanged 上方的注释）。
+ */
+function serverResponded(cause: unknown): boolean {
+  return typeof (cause as { status?: unknown } | null)?.status === "number";
+}
 type Confirmation =
   | { type: "commit" }
+  | { type: "commit-push"; remote: string; branch: string; setUpstream: boolean }
   | { type: "amend" }
   | { type: "stash-create" }
   | { type: "stash-apply"; stash: GitStash }
@@ -55,6 +72,28 @@ type Confirmation =
   | { type: "switch-branch"; branch: string; remote?: boolean }
   | { type: "conflict-abort" }
   | { type: "conflict-finish" };
+
+/**
+ * 远端操作（获取 / 拉取 / 推送）的**结果读数**。
+ *
+ * 为什么单独立一个状态，而不是复用页面级那条错误横幅：
+ *
+ *  · **成功也要说**。远端操作成功的信号常常是"界面什么都没变"（远端本来就没更新），
+ *    不说话就等于"没做"，而"没做"和"做失败了"在界面上长得一模一样。
+ *  · **失败要有落点**。页面级红条在窗口右上角、6 秒后自动消失，而远端失败的
+ *    后续动作（先 fetch 再推送、去配置凭据、处理分叉）往往要花几分钟 ——
+ *    一条会自己消失的提示等于没提示。
+ *  · **就地**：读数落在 Git 工作台内部，离按钮近，且**跨两端一致**
+ *    （手机端此前只有一条会盖住整屏的错误条）。
+ */
+type RemoteFeedback = { kind: "running" | "success" | "error"; op: GitFeedbackOp; title: string; detail?: string };
+
+/** 一次远端操作的身份：是哪一类、对哪个远端、哪个分支。 */
+interface RemoteOp {
+  kind: GitRemoteOpKind;
+  remote: string;
+  branch: string;
+}
 
 // 提交历史与操作记录的分页每页条数。
 const HISTORY_PAGE_SIZE = 50;
@@ -215,6 +254,8 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const [mutating, setMutating] = useState("");
   const [commitMessage, setCommitMessage] = useState("");
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
+  // 最近一次远端操作的结果读数（获取 / 拉取 / 推送）。见 RemoteFeedback 的说明。
+  const [remoteFeedback, setRemoteFeedback] = useState<RemoteFeedback | null>(null);
   const diffRequest = useRef(0);
   const reloadRequest = useRef(0);
   // 刷新出口。`reload` 在下面才定义（它依赖若干个 state 回调），而 ref 句柄要能调它，
@@ -243,6 +284,19 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   // 单向即可：prop 只会告诉我们"它现在是仓库了"（非 git 的判定由页面按 gitBranch 给出，
   // 这里不需要反向把 true 改回 false —— 那会让 git init 刚成功的工作台瞬间塌回空态）。
   useEffect(() => { if (initialIsGitRepo) setIsGitRepo(true); }, [initialIsGitRepo]);
+  // 成功读数**自动收起**，失败读数**常驻**（用户可以自己关）。
+  //
+  // 分工的理由：成功是"事情办完了"的一句话，看见就够了，长期挂在界面上反而占地方；
+  // 失败带着"下一步该做什么"（先 fetch 再推送 / 去配凭据 / 处理分叉），用户要花时间处理 ——
+  // 一条几秒后自己消失的提示等于没提示。
+  //
+  // 收起时用函数式更新并复核 kind：新一次远端操作会先把读数换成"进行中"，
+  // 旧计时器这时若直接 setState(null) 就会把**新**读数抹掉。
+  useEffect(() => {
+    if (remoteFeedback?.kind !== "success") return;
+    const timer = window.setTimeout(() => setRemoteFeedback((current) => (current?.kind === "success" ? null : current)), 4500);
+    return () => window.clearTimeout(timer);
+  }, [remoteFeedback]);
   // 错误落点只走 ref，**不进 `reload` 的依赖**。
   //
   // `reload` 是下面那个"装载 / 刷新" effect 的依赖项，而 `fail` 是宿主传进来的回调
@@ -456,13 +510,22 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法读取差异"); }
   };
 
-  const mutate = async (key: string, endpoint: string, payload: Record<string, unknown>, success?: () => void, options?: ReloadOptions) => {
+  const mutate = async (key: string, endpoint: string, payload: Record<string, unknown>, success?: () => void, options?: ReloadOptions, remote?: RemoteOp) => {
     if (!mountedRef.current) return;
     if (!snapshot?.stateToken) {
       fail("Git 状态尚未准备完成，请刷新后重试");
       return;
     }
     setMutating(key);
+    // 远端操作开始：先把上一次的读数换成"进行中"。
+    //
+    // 为什么要占住这个位置：远端操作**可能毫无界面变化**（fetch 到的东西本地看不出来），
+    // 用户点完「确认获取」之后若什么都不发生，他没法区分"还没开始""正在跑"和"失败了"。
+    // 一句"正在从 origin 获取远端更新…"把这三件事分开了。
+    if (remote) setRemoteFeedback({ kind: "running", op: remote.kind, title: remoteOpRunningText(remote.kind, remote.remote, remote.branch) });
+    // 成功读数要靠"操作前 / 操作后"两份仓库状态做对比（推了几个、拉了几个），
+    // 所以先把操作前那份留在手边 —— reload 之后手上那份就已经是新的了。
+    const beforeRemote = remote ? snapshotRef.current : null;
     // 这次写到底成没成 —— 决定 busy 要不要等对账（见 finally）。
     let wrote = false;
     try {
@@ -479,14 +542,32 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
       // （手机上：写一趟中继 + 读一趟中继）才看到对话框关上，那就是"点一下没反应"。
       closeDiff();
       success?.();
+      // 远端操作成功也要说话。这里先给"做完了"的最小读数（不等信息），
+      // 对账落地之后再用真数字补准（见 finally）。
+      if (remote) setRemoteFeedback({ kind: "success", op: remote.kind, title: remoteOpSuccessText(remote.kind, remote.remote, remote.branch, beforeRemote, null) });
     } catch (cause) {
       if (isGitStateChangedError(cause)) {
         // 写入前的令牌已经过期时，先把清单和新令牌一起换回来，避免用户继续对着旧行重试。
         await reload("reconcile").catch(() => undefined);
-        // 手机适配器已发送可恢复提示，沿用原文让宿主去重。
-        if (mountedRef.current) fail((cause as { code?: string }).code === "stale_state" && cause instanceof Error ? cause.message : "仓库状态已经变化，已刷新变更列表，请确认后再操作");
+        if (mountedRef.current) {
+          // 手机适配器已发送可恢复提示，沿用原文让宿主去重。
+          const message = (cause as { code?: string }).code === "stale_state" && cause instanceof Error ? cause.message : "仓库状态已经变化，已刷新变更列表，请确认后再操作";
+          // 远端操作同样要把读数落到"结束"上。**不能停在这一档**：这一趟已经结束了
+          // （服务端在执行前就拒了），而读数还写着"正在推送到 origin/main…" ——
+          // 一条永远转着的提示比没有提示更糟，它会让人以为推送还在跑。
+          if (remote) setRemoteFeedback({ kind: "error", op: remote.kind, title: remoteOpFailureTitle(remote.kind), detail: message });
+          else fail(message);
+        }
       } else if (mountedRef.current) {
-        fail(cause instanceof Error ? cause.message : "无法执行 Git 操作");
+        const message = cause instanceof Error ? cause.message : "无法执行 Git 操作";
+        // 远端失败的落点是**工作台内部**的那条读数，不是页面级红条：
+        //  · 红条在窗口右上角、6 秒后自动消失，而远端失败的善后（先 fetch 再推送、
+        //    去配凭据、处理历史分叉）往往要花几分钟；
+        //  · 确认框还开着（失败时它不关），红条又被模态遮罩压在下面 ——
+        //    用户正盯着框子，框子里却一个字都没有。
+        // 所以远端失败**不再**调 fail()，改由 remoteFeedback 承接（弹窗内也会显示同一句）。
+        if (remote) setRemoteFeedback({ kind: "error", op: remote.kind, title: remoteOpFailureTitle(remote.kind), detail: message });
+        else fail(message);
       }
     } finally {
       // ⚠️ 但 **busy 要留到对账落地**，而不是写回来就撤。
@@ -504,6 +585,12 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
         // 但万一它抛出（那是个 bug），"清 busy 那一句不执行 ⇒ 按钮永远禁着"不该是后果。
         if (options?.history) setHistoryRevision((value) => value + 1);
         await reload("reconcile", options).catch(() => undefined);
+        // 对账落地后把真数字补进成功读数（"已推送 2 个提交"而不是"已推送"）。
+        // 只在读数**仍是本次的成功态**时才改：等待期间用户若又点了一次远端操作，
+        // 那次的"进行中"已经顶掉了这一条，这时再改就会张冠李戴。
+        if (remote && mountedRef.current) setRemoteFeedback((current) => (current?.kind === "success"
+          ? { ...current, title: remoteOpSuccessText(remote.kind, remote.remote, remote.branch, beforeRemote, snapshotRef.current) }
+          : current));
       } else {
         // 失败：对账照发，但**不等它**。
         // 等它的代价是实打实的卡死：写请求超时（推送的预算是 120s）之后确认框还开着，
@@ -513,6 +600,10 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
         void reload("reconcile", options);
       }
       if (mountedRef.current) setMutating("");
+      // 兜底：读数**不能停在"进行中"**。若这一趟结束时它还写着"正在…"，
+      // 说明有一条分支既没判成功也没判失败（令牌过期那一支已单独处理过，
+      // 这里再兜一层）—— 一条永远转着的"正在推送…"比没有更糟。
+      if (remote && mountedRef.current) setRemoteFeedback((current) => (current?.kind === "running" && current.op === remote.kind ? null : current));
     }
   };
 
@@ -522,14 +613,136 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const stashCreate = (message: string) => mutate("stash-create", "stashes", { message }, () => setConfirmation(null));
   const stashApply = (oid: string, restoreIndex: boolean) => mutate("stash-apply", "stashes/apply", { oid, restoreIndex }, () => setConfirmation(null));
   const commit = () => mutate("commit", "commits", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); }, { history: true });
+
+  /**
+   * 「提交并推送」= 两段串联的写操作：先在本地创建提交，再把提交推到远端。
+   *
+   * 为什么两段要分别报告成败（而不是一句"提交并推送失败"）：
+   *  · 第一段失败 = 本地什么都没发生，用户改好提交信息就能重试；
+   *  · 第二段失败 = 提交**已经在本地**，用户再点一次会多出一个提交。
+   * 这两种情况的善后完全不同，用一句话说会让用户做错动作，所以读数分两段。
+   *
+   * 为什么不用两次 mutate()：mutate() 用的令牌是 React state 闭包里的
+   * `snapshot.stateToken`，第一段写完它就作废了（服务端按仓库状态比对令牌），
+   * 第二段必须用**对账后重新签发**的那枚。这里显式接力，不用 mutate()。
+   */
+  const commitAndPush = async (remote: string, branch: string, setUpstream: boolean, message: string) => {
+    if (!mountedRef.current) return;
+    // 令牌用 ref 里那枚：它是**最后一次对账签发**的，比 state 闭包里的新
+    // （闭包那份可能停在一次被后台对账顶掉的旧快照上）。
+    const token = snapshotRef.current?.stateToken ?? snapshot?.stateToken;
+    if (!token) { fail("Git 状态尚未准备完成，请刷新后重试"); return; }
+    setMutating("commit-push");
+    // 阶段：失败时要按段说清"本地现在是什么状态"——
+    // commit 段失败 = 本地什么都没发生（可以直接重试）；
+    // push 段失败   = 提交**已经在本地**了（再提交一次就多一个提交）。
+    // outcome 再说一层"结果确不确定"：服务端可能只说"我没法核实"（needs_attention），
+    // 这时候说"什么都没发生"就是在骗用户 —— 那是把"不知道"写成"没有"。
+    let phase: GitCommitPushPhase = "commit";
+    let outcome: GitCommitPushOutcome = "failed";
+    try {
+      // ── 阶段一：本地提交 ──
+      setRemoteFeedback({ kind: "running", op: "commit-push", title: commitPushRunningText("commit", remote, branch) });
+      const created = await request<GitOperationResult>(withWorkspace(`/api/projects/${projectID}/git/commits`), { method: "POST", body: JSON.stringify({ message, stateToken: token }) }).catch((cause: unknown) => {
+        // 传输层失败（连接断了 / 请求超时）≠ 服务端没执行这次写入 —— 它可能已经把
+        // 提交建出来了。那种情况下说"本地没有产生任何提交"是在骗用户，照做就多一个提交。
+        if (!serverResponded(cause)) outcome = "unknown";
+        throw cause;
+      });
+      if (!mountedRef.current) return;
+      if (created.status === "needs_attention") {
+        // 服务端说"操作已执行，但我没法核实最终状态" —— 提交**可能**已经建成了。
+        // 这时候说"什么都没发生"就是在骗用户，所以单独一种结局。
+        closeDiff();
+        setConfirmation(null);
+        outcome = "unknown";
+        throw new Error(created.errorMessage || "提交已执行，但无法确认最终状态");
+      }
+      if (created.status !== "succeeded") throw new Error(created.errorMessage || "提交未完成，请查看操作记录");
+      closeDiff();
+      setHistoryRevision((value) => value + 1);
+      // ⚠️ phase 必须**在这里**翻过去，不能等到推送请求发出去之前。
+      // 提交一旦建成功，本地就有了这个提交；此后任何失败都属于"推送段"。
+      // 晚一步翻的话，中间那几次失败（对账失败、令牌没拿到）会被说成
+      // "提交失败 / 本地没有产生任何提交" —— 而提交其实已经在了，
+      // 用户照着提示重试就多出一个提交。
+      phase = "push";
+      // 对账：换新令牌 + 拿到推送前的仓库状态（"推了几个提交"要靠它算）。
+      // ⚠️ 令牌接力就在这一步：提交改动了仓库（HEAD 前进了、暂存区空了），
+      // 服务端按仓库状态比对令牌，第一段那枚随即作废，第二段必须用重新签发的。
+      await reload("reconcile").catch(() => undefined);
+      if (!mountedRef.current) return;
+      const beforePush = snapshotRef.current;
+      const nextToken = beforePush?.stateToken;
+      if (!nextToken) throw new Error("仓库状态尚未准备完成，请刷新后重试");
+      // ── 阶段二：推送到远端 ──
+      setRemoteFeedback({ kind: "running", op: "commit-push", title: commitPushRunningText("push", remote, branch) });
+      const pushed = await request<GitOperationResult>(withWorkspace(`/api/projects/${projectID}/git/push`), { method: "POST", body: JSON.stringify({ remote, branch, setUpstream, stateToken: nextToken }) }).catch((cause: unknown) => {
+        // 同上：推送的传输层失败也不能说"推送失败"—— 它可能已经推上去了。
+        if (!serverResponded(cause)) outcome = "unknown";
+        throw cause;
+      });
+      if (!mountedRef.current) return;
+      if (pushed.status === "needs_attention") {
+        // 同上：推送**可能**已经推上去了。提交确定在本地，推送结果不确定。
+        outcome = "unknown";
+        throw new Error(pushed.errorMessage || "推送已执行，但无法确认最终状态");
+      }
+      if (pushed.status !== "succeeded") throw new Error(pushed.errorMessage || "推送未完成，请查看操作记录");
+      // 推送后再对账一次：领先数变了，"推了几个提交"要靠前后两个数做差。
+      await reload("reconcile").catch(() => undefined);
+      setRemoteFeedback({ kind: "success", op: "commit-push", title: commitPushSuccessText(remote, branch, commitPushPushedCount(beforePush, snapshotRef.current)) });
+      // 两段都成了：提交信息已入库（清掉，免得下次又带着旧信息提交），确认框收掉。
+      setCommitMessage("");
+      setConfirmation(null);
+    } catch (cause) {
+      if (!mountedRef.current) return;
+      if (isGitStateChangedError(cause)) {
+        // 令牌过期：先把清单和新令牌一起换回来，避免用户继续对着旧行重试。
+        await reload("reconcile").catch(() => undefined);
+        if (!mountedRef.current) return;
+        // 令牌被拒 = 服务端**还没执行**这次写入，所以这一段是确定的失败，不是"不确定"。
+        setRemoteFeedback({ kind: "error", op: "commit-push", title: commitPushFailureTitle(phase, outcome), detail: commitPushFailureDetail(phase, outcome, "仓库状态已经变化，已刷新变更列表，请确认后再操作") });
+        if (phase === "push") { setCommitMessage(""); setConfirmation(null); }
+        return;
+      }
+      const reason = cause instanceof Error ? cause.message : "无法执行 Git 操作";
+      setRemoteFeedback({ kind: "error", op: "commit-push", title: commitPushFailureTitle(phase, outcome), detail: commitPushFailureDetail(phase, outcome, reason) });
+      if (phase === "push") {
+        // 推送段失败：提交**已经在本地**了。确认框必须收掉 ——
+        // 留着它，用户再点一次「确认提交并推送」就会多出一个提交。
+        // 提交信息也已随提交入库，一并清掉。
+        setCommitMessage("");
+        setConfirmation(null);
+      } else if (outcome === "unknown") {
+        // 提交段"结果无法确认"（传输层断了）：提交**可能已经建成了**。
+        // 确认框同样必须收掉 —— 留着它等于把"再提交一次"的按钮摆在用户面前。
+        // 提交信息**不**清：它可能还没被用掉，刷新核对历史后再决定是否重试。
+        setConfirmation(null);
+      }
+    } finally {
+      if (mountedRef.current) setMutating("");
+    }
+  };
   const commitAmend = () => mutate("commit_amend", "commits/amend", { message: commitMessage }, () => { setCommitMessage(""); setConfirmation(null); }, { history: true });
   const discardWorktree = (path: string, untracked: boolean) => mutate(`discard:${path}`, "discard", { mode: "worktree", paths: [path], includeUntracked: untracked }, () => setConfirmation(null));
   const discardAll = (includeUntracked: boolean) => mutate("discard-all", "discard", { mode: "all", includeUntracked }, () => setConfirmation(null));
-  const fetchRemote = (remote: string) => mutate("fetch", "fetch", { remote }, () => setConfirmation(null), { history: true });
-  const pullRemote = (remote: string, branch: string) => mutate("pull", "pull", { remote, branch }, () => setConfirmation(null), { history: true });
-  const pushBranch = (remote: string, branch: string, setUpstream: boolean) => mutate("push", "push", { remote, branch, setUpstream }, () => setConfirmation(null), { history: true });
+  // 三类远端操作都带上自己的身份（哪一类、对哪个远端、哪个分支）——
+  // 那是结果读数的全部素材：没有它就没法说"推给谁、推了几个"。
+  const fetchRemote = (remote: string) => mutate("fetch", "fetch", { remote }, () => setConfirmation(null), { history: true }, { kind: "fetch", remote, branch: "" });
+  const pullRemote = (remote: string, branch: string) => mutate("pull", "pull", { remote, branch }, () => setConfirmation(null), { history: true }, { kind: "pull", remote, branch });
+  const pushBranch = (remote: string, branch: string, setUpstream: boolean) => mutate("push", "push", { remote, branch, setUpstream }, () => setConfirmation(null), { history: true }, { kind: "push", remote, branch });
   const switchBranch = (branch: string, remote = false) => mutate("switch-branch", "switch", { branch, remote }, () => setConfirmation(null), { branches: true, history: true });
   const pullTarget = gitPullTarget(snapshot);
+  // 「提交并推送」的落点 —— 与工具栏那个「推送」按钮**同一个函数**算出来的，
+  // 两处各算一次早晚会对不上（上游换远端、或本地分支名与上游分支名不同时）。
+  const pushOption = gitCommitPushOption(snapshot);
+  // 点「提交并推送」时**当场**取一次落点：确认框要显示推给谁，
+  // 用点击那一刻的仓库状态，而不是渲染那一刻的。
+  const requestCommitPush = () => {
+    const target = gitPushTarget(snapshotRef.current ?? snapshot);
+    setConfirmation({ type: "commit-push", remote: target.remote, branch: target.branch, setUpstream: target.setUpstream });
+  };
 
   // 非 git 项目在空态里发起 git init：成功后置 isGitRepo、通知宿主刷新项目、再加载仓库状态。
   const initializeRepo = async () => {
@@ -625,7 +838,15 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
   const headSync = snapshot ? gitSync(snapshot.head) : null;
   const syncAccent = headSync !== null && (headSync.kind === "ahead" || headSync.kind === "behind" || headSync.kind === "diverged");
   return <section id="workspace-panel-git" className="git-workbench workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-git" hidden={!active} data-mobile={mobile ? "true" : undefined} data-detail={mobileDetailOpen ? "open" : undefined}>
-    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} tabs={mobile ? undefined : tabsNav} requestRefresh={() => void reload("manual")} requestFetch={() => setConfirmation({ type: "fetch", remote: snapshot?.head.upstream?.split("/")[0] || "origin" })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", remote: snapshot?.head.upstream?.split("/")[0] || "origin", branch: snapshot?.head.branch || "", setUpstream: !snapshot?.head.upstream })} />
+    <GitBar snapshot={snapshot} loading={loading} mutating={mutating} refreshing={refreshing} operations={operations} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} tabs={mobile ? undefined : tabsNav} requestRefresh={() => void reload("manual")} requestFetch={() => setConfirmation({ type: "fetch", remote: gitPushTarget(snapshot).remote })} requestPull={() => setConfirmation({ type: "pull", remote: pullTarget.remote, branch: pullTarget.branch })} requestPush={() => setConfirmation({ type: "push", ...gitPushTarget(snapshot) })} />
+    {/* 远端操作的结果读数：进行中 / 成功 / 失败都落在这里（就在工具栏下面）。
+        它是**工作台内部**的落点 —— 桌面端此前只有一条窗口右上角的页面级红条，
+        6 秒后消失、离按钮远、还不带"下一步该做什么"。 */}
+    {remoteFeedback ? <div className={`git-op-feedback git-op-feedback-${remoteFeedback.kind}`} role={remoteFeedback.kind === "error" ? "alert" : "status"}>
+      <span className="git-op-feedback-mark" aria-hidden="true">{remoteFeedback.kind === "running" ? <PendingIcon /> : remoteFeedback.kind === "success" ? <CheckIcon /> : <ErrorIcon />}</span>
+      <span className="git-op-feedback-text"><b>{remoteFeedback.title}</b>{remoteFeedback.detail ? <small>{remoteFeedback.detail}</small> : null}</span>
+      <button type="button" className="git-op-feedback-close" title="关闭这条提示" aria-label="关闭这条提示" onClick={() => setRemoteFeedback(null)}>×</button>
+    </div> : null}
     {mobile ? tabsNav : null}
     {!mobile && tab === "changes" && snapshot && !loading ? <div className="git-stats" role="group" aria-label="仓库概览">
       <div className="git-stats-card"><span>同步状态</span><b className={syncAccent ? "accent" : ""}>{gitSyncStatus(snapshot.head)}</b><small>{snapshot.head.upstream || (snapshot.head.detached ? "HEAD (游离指针)" : snapshot.head.branch)}</small></div>
@@ -640,11 +861,11 @@ const GitWorkbenchSession = forwardRef<GitWorkbenchHandle, GitWorkbenchProps>(fu
           `loading` 只由首屏那一档置位（后台对账一概不置），所以它本身就等于
           "屏幕上这份数据不属于当前工作区"，不需要再加一个 snapshot 非空的限定。 */}
       {loading ? <GitSkeleton /> : !snapshot ? <div className="git-empty">无法读取仓库状态</div> : <>
-        {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes stashPanel={<GitStashPanel stashes={stashes} busy={Boolean(mutating)} dirty={changeCount > 0} blocked={stashBlocked} hasHead={/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(snapshot.head.oid)} requestCreate={() => setConfirmation({ type: "stash-create" })} requestApply={(stash) => setConfirmation({ type: "stash-apply", stash })} />} grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
+        {tab === "changes" && <div id="git-view-changes" role="tabpanel" aria-labelledby="git-tab-changes"><Changes stashPanel={<GitStashPanel stashes={stashes} busy={Boolean(mutating)} dirty={changeCount > 0} blocked={stashBlocked} hasHead={/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(snapshot.head.oid)} requestCreate={() => setConfirmation({ type: "stash-create" })} requestApply={(stash) => setConfirmation({ type: "stash-apply", stash })} />} grouped={grouped} selectedDiff={selectedDiff} openDiff={openDiff} closeDiff={closeDiff} conflictOverview={conflictOverview} conflictsState={conflictsState} conflictPath={conflictPath} openConflict={openConflict} closeConflict={closeConflict} resolveConflict={resolveConflict} requestAbortConflict={requestAbortConflict} requestFinishConflict={requestFinishConflict} projectID={projectID} conversationId={conversationId} request={request} fail={fail} mobile={mobile} mutatePath={mutatePath} stageAll={stageAll} unstageAll={unstageAll} requestDiscardWorktree={(path, untracked) => setConfirmation({ type: "discard-worktree", path, untracked })} requestDiscardAll={() => setConfirmation({ type: "discard-all" })} requestCommit={() => setConfirmation({ type: "commit" })} requestAmend={() => setConfirmation({ type: "amend" })} requestCommitPush={requestCommitPush} pushOption={pushOption} commitMessage={commitMessage} setCommitMessage={setCommitMessage} mutating={mutating} changeCount={changeCount} /></div>}
         {tab === "branches" && <div id="git-view-branches" role="tabpanel" aria-labelledby="git-tab-branches"><Branches branches={branches} historyRevision={historyRevision} mutating={mutating} projectID={projectID} conversationId={conversationId} request={request} fail={fail} requestSwitchBranch={(branch, remote) => setConfirmation({ type: "switch-branch", branch, remote })} requestCreateBranch={(name, startPoint) => void createBranch(name, startPoint)} /></div>}
       </>}
     </main>
-    {confirmation && <GitConfirmation stashBlocked={stashBlocked} key={confirmation.type} stashCreate={stashCreate} stashApply={stashApply} requestStash={() => setConfirmation({ type: "stash-create" })} confirmation={confirmation} snapshot={snapshot} conflictOverview={conflictOverview} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} commitAmend={commitAmend} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pullRemote={pullRemote} pushBranch={pushBranch} switchBranch={switchBranch} abortConflict={abortConflict} finishConflict={finishConflict} />}
+    {confirmation && <GitConfirmation stashBlocked={stashBlocked} key={confirmation.type} stashCreate={stashCreate} stashApply={stashApply} requestStash={() => setConfirmation({ type: "stash-create" })} confirmation={confirmation} snapshot={snapshot} conflictOverview={conflictOverview} stagedCount={grouped.staged.length} trackedChangeCount={trackedChangeCount} untrackedChangeCount={untrackedChangeCount} commitMessage={commitMessage} busy={Boolean(mutating)} close={() => setConfirmation(null)} commit={commit} commitAmend={commitAmend} commitAndPush={commitAndPush} discardWorktree={discardWorktree} discardAll={discardAll} fetchRemote={fetchRemote} pullRemote={pullRemote} pushBranch={pushBranch} switchBranch={switchBranch} abortConflict={abortConflict} finishConflict={finishConflict} remoteFeedback={remoteFeedback} />}
   </section>;
 });
 
@@ -755,6 +976,9 @@ function PlusIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fil
 function UndoIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M13.5 11a5.5 5.5 0 0 0-9.4-3.9L2.5 8.7" /><path d="M2.5 4.5v4.2h4.2" /></svg>; }
 
 function PendingIcon() { return <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M14 8A6 6 0 1 1 8 2" /><polyline points="8 2 8 5.5 11 2.5" /></svg>; }
+/** 结果读数上的两个记号：成功是对勾，失败是感叹号圈。形状不同才不用读文字也知道成没成。 */
+function CheckIcon() { return <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M13.4 4.6 6.4 11.6 2.6 7.8" /></svg>; }
+function ErrorIcon() { return <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="8" r="6.2" /><path d="M8 4.6v4" /><path d="M8 11.3h.01" /></svg>; }
 
 function RefreshIcon() { return <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M13 5.8A5.5 5.5 0 1 0 13.4 10" /><path d="M13 2.5v3.3H9.7" /></svg>; }
 
@@ -795,7 +1019,7 @@ function GitSkeleton() {
   </div>;
 }
 
-function Changes({ stashPanel, grouped, selectedDiff, openDiff, closeDiff, conflictOverview, conflictsState, conflictPath, openConflict, closeConflict, resolveConflict, requestAbortConflict, requestFinishConflict, projectID, conversationId, request, fail, mobile, mutatePath, stageAll, unstageAll, requestDiscardWorktree, requestDiscardAll, requestCommit, requestAmend, commitMessage, setCommitMessage, mutating, changeCount }: {
+function Changes({ stashPanel, grouped, selectedDiff, openDiff, closeDiff, conflictOverview, conflictsState, conflictPath, openConflict, closeConflict, resolveConflict, requestAbortConflict, requestFinishConflict, projectID, conversationId, request, fail, mobile, mutatePath, stageAll, unstageAll, requestDiscardWorktree, requestDiscardAll, requestCommit, requestAmend, requestCommitPush, pushOption, commitMessage, setCommitMessage, mutating, changeCount }: {
   stashPanel: ReactNode;
   grouped: { staged: GitChange[]; worktree: GitChange[] };
   selectedDiff: GitDiff | null;
@@ -822,6 +1046,10 @@ function Changes({ stashPanel, grouped, selectedDiff, openDiff, closeDiff, confl
   requestDiscardAll: () => void;
   requestCommit: () => void;
   requestAmend: () => void;
+  /** 「提交并推送」的落点（桌面端专属）。 */
+  pushOption: CommitPushOption | null;
+  /** 打开「提交并推送」的确认框。 */
+  requestCommitPush: () => void;
   commitMessage: string;
   setCommitMessage: (value: string) => void;
   mutating: string;
@@ -846,7 +1074,7 @@ function Changes({ stashPanel, grouped, selectedDiff, openDiff, closeDiff, confl
           ? <div className="git-conflict-banner finished" role="status"><b>✓ 冲突已全部解决</b><span>{operationVerb}可完成，提交后将结束本次操作</span><div className="git-conflict-banner-actions"><button type="button" className="primary" disabled={mutating !== ""} onClick={requestFinishConflict}>完成{operationVerb}</button><button type="button" className="secondary danger" disabled={mutating !== ""} onClick={requestAbortConflict}>中止并还原</button></div></div>
           : null}
       <section className="git-change-group"><header><h3>已暂存</h3><div className="git-group-actions"><span>{grouped.staged.length}</span><button type="button" className={`git-icon-btn${mutating === "unstage-all" ? " spinning" : ""}`} title={mutating === "unstage-all" ? "取消暂存中" : "全部取消暂存"} aria-label="全部取消暂存" disabled={mutating !== "" || grouped.staged.length === 0} onClick={unstageAll}>{mutating === "unstage-all" ? <PendingIcon /> : <UndoIcon />}</button></div></header><ChangeList changes={grouped.staged} stage="index" openDiff={openFile} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="没有已暂存变更" /></section>
-      <CommitPanel stagedCount={grouped.staged.length} value={commitMessage} setValue={setCommitMessage} open={requestCommit} openAmend={requestAmend} disabled={mutating !== ""} />
+      <CommitPanel stagedCount={grouped.staged.length} value={commitMessage} setValue={setCommitMessage} open={requestCommit} openAmend={requestAmend} disabled={mutating !== ""} mobile={mobile} pushOption={pushOption} requestCommitPush={requestCommitPush} />
       <section className="git-change-group"><header><h3>工作区</h3><div className="git-group-actions"><span>{grouped.worktree.length}</span><button type="button" className={`git-icon-btn${mutating === "stage-all" ? " spinning" : ""}`} title={mutating === "stage-all" ? "暂存中" : conflictedCount > 0 ? "存在冲突文件，请先逐个解决" : "全部暂存"} aria-label="全部暂存" disabled={mutating !== "" || grouped.worktree.length === 0 || conflictedCount > 0} onClick={stageAll}>{mutating === "stage-all" ? <PendingIcon /> : <PlusIcon />}</button><button type="button" className="git-icon-btn danger" title="撤销全部未提交改动" aria-label="撤销全部未提交改动" disabled={mutating !== "" || changeCount === 0} onClick={requestDiscardAll}><UndoIcon /></button></div></header><ChangeList changes={grouped.worktree} stage="worktree" openDiff={openFile} mutatePath={mutatePath} requestDiscard={requestDiscardWorktree} mutating={mutating} empty="工作区没有变更" /></section>
       {stashPanel}
     </div>
@@ -926,9 +1154,29 @@ export function commitSubjectLength(message: string): number {
   return Array.from(message.trim().split("\n")[0]).length;
 }
 
-export function CommitPanel({ stagedCount, value, setValue, open, openAmend, disabled }: { stagedCount: number; value: string; setValue: (value: string) => void; open: () => void; openAmend: () => void; disabled: boolean }) {
+export function CommitPanel({ stagedCount, value, setValue, open, openAmend, disabled, mobile, pushOption, requestCommitPush }: { stagedCount: number; value: string; setValue: (value: string) => void; open: () => void; openAmend: () => void; disabled: boolean; /**
+   * 手机端**不渲染**下拉箭头：移动端的 DOM 是定稿契约（docs/41 §6.2），
+   * 新入口只能是桌面端专属。
+   */
+  mobile?: boolean;
+  /** 「提交并推送」的落点与是否游离指针。null = 还没读到仓库状态。 */
+  pushOption?: CommitPushOption | null;
+  /** 点下拉项时打开确认框（与工具栏的「推送」同一个确认层）。 */
+  requestCommitPush?: () => void;
+}) {
   const subjectLength = commitSubjectLength(value);
   const subjectOverLimit = subjectLength > MAX_COMMIT_SUBJECT_LENGTH;
+  // 菜单项为什么灰掉 —— 逐条说清缺哪一样，不合成一句"条件不满足"。
+  const pushDisabledReason = commitPushUnavailableReason({
+    stagedCount,
+    message: value,
+    subjectOverLimit,
+    detached: pushOption?.detached ?? false,
+    hasBranch: Boolean(pushOption?.target.branch),
+  });
+  // 还没读到仓库状态时也要给一个落点：分支名留空 → 菜单项灰掉并说明原因，
+  // 而不是让整个箭头按钮消失（那会让用户以为没有这个功能）。
+  const pushTarget = pushOption?.target ?? { remote: "origin", branch: "", setUpstream: true };
   return <section className="git-commit-panel"><label htmlFor="git-commit-message">提交信息</label><textarea id="git-commit-message" value={value} maxLength={4000} disabled={disabled || stagedCount === 0} aria-invalid={subjectOverLimit || undefined} aria-describedby={subjectOverLimit ? "git-commit-subject-warning" : undefined} onChange={(event) => setValue(event.target.value)} placeholder={stagedCount === 0 ? "暂存文件后即可提交" : "简要说明本次变更"} />
     {/* 首行超长会让「提交」变灰，必须当场说明原因，否则用户只会以为按钮坏了。
         文案直接点明「提交」和「修改最近一次提交」都会受影响 —— 只说限制，
@@ -938,10 +1186,21 @@ export function CommitPanel({ stagedCount, value, setValue, open, openAmend, dis
     {/* 计数器从能输入的那一刻就常驻，而不是等超限才出现：这条 72 字的规矩要在用户写之前就看得见。 */}
     {/* 方案 C 的提交区主次：「修改最近一次提交」降成与计数同行的一条文字按钮，
         「提交」独占一行的通栏胶囊，并把自己的对象写进按钮文案（提交几个文件，不用猜）。 */}
-    <footer><div className="git-commit-meta"><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span>{stagedCount === 0 ? null : <span className={`git-commit-subject-count${subjectOverLimit ? " over" : ""}`} title={`提交信息首行的字符数，上限 ${MAX_COMMIT_SUBJECT_LENGTH}`}>首行 {subjectLength}/{MAX_COMMIT_SUBJECT_LENGTH}</span>}</div><div className="git-commit-actions"><button type="button" className="secondary git-amend-btn" title="修改最近一次提交" disabled={disabled || !value.trim() || subjectOverLimit} onClick={openAmend}>修改最近一次提交</button></div><button type="button" className="primary git-commit-submit" disabled={disabled || stagedCount === 0 || !value.trim() || subjectOverLimit} onClick={open}>{stagedCount === 0 ? "提交" : `提交 ${stagedCount} 个已暂存文件`}</button></footer></section>;
+    <footer><div className="git-commit-meta"><span>{stagedCount === 0 ? "没有已暂存文件" : `将提交 ${stagedCount} 个文件`}</span>{stagedCount === 0 ? null : <span className={`git-commit-subject-count${subjectOverLimit ? " over" : ""}`} title={`提交信息首行的字符数，上限 ${MAX_COMMIT_SUBJECT_LENGTH}`}>首行 {subjectLength}/{MAX_COMMIT_SUBJECT_LENGTH}</span>}</div><div className="git-commit-actions"><button type="button" className="secondary git-amend-btn" title="修改最近一次提交" disabled={disabled || !value.trim() || subjectOverLimit} onClick={openAmend}>修改最近一次提交</button></div>
+      {/* 手机端：**逐字保持**原来的 DOM（提交键直接挂在 footer 下）——
+          移动端 DOM 是定稿契约（docs/41 §6.2），多一层包裹就是改了那份契约。
+          桌面端才做成分裂按钮：主键仍是「提交」，箭头展开「提交并推送」。 */}
+      {mobile || !requestCommitPush ? (
+        <button type="button" className="primary git-commit-submit" disabled={disabled || stagedCount === 0 || !value.trim() || subjectOverLimit} onClick={open}>{stagedCount === 0 ? "提交" : `提交 ${stagedCount} 个已暂存文件`}</button>
+      ) : (
+        <div className="git-commit-submit-row">
+          <button type="button" className="primary git-commit-submit" disabled={disabled || stagedCount === 0 || !value.trim() || subjectOverLimit} onClick={open}>{stagedCount === 0 ? "提交" : `提交 ${stagedCount} 个已暂存文件`}</button>
+          <CommitPushMenu target={pushTarget} disabledReason={pushDisabledReason} buttonDisabled={disabled} onPick={requestCommitPush} />
+        </div>
+      )}</footer></section>;
 }
 
-function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, confirmation, snapshot, conflictOverview, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, commitAmend, discardWorktree, discardAll, fetchRemote, pullRemote, pushBranch, switchBranch, abortConflict, finishConflict }: {
+function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, confirmation, snapshot, conflictOverview, stagedCount, trackedChangeCount, untrackedChangeCount, commitMessage, busy, close, commit, commitAmend, commitAndPush, discardWorktree, discardAll, fetchRemote, pullRemote, pushBranch, switchBranch, abortConflict, finishConflict, remoteFeedback }: {
   stashBlocked: boolean;
   stashCreate: (message: string) => void;
   stashApply: (oid: string, restoreIndex: boolean) => void;
@@ -957,6 +1216,13 @@ function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, 
   close: () => void;
   commit: () => void;
   commitAmend: () => void;
+  /**
+   * 「提交并推送」= 两段串联的写操作（本地提交 → 推送远端）。
+   *
+   * 消息由确认框传进去而不是让被调方自己读状态：确认框才是用户按下"确认"那一刻
+   * 的真相所在（输入框里的内容此刻可能已经被改过），消息跟着这次点击走才不会串。
+   */
+  commitAndPush: (remote: string, branch: string, setUpstream: boolean, message: string) => void;
   discardWorktree: (path: string, untracked: boolean) => void;
   discardAll: (includeUntracked: boolean) => void;
   fetchRemote: (remote: string) => void;
@@ -965,6 +1231,14 @@ function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, 
   switchBranch: (branch: string, remote?: boolean) => void;
   abortConflict: () => void;
   finishConflict: () => void;
+  /**
+   * 最近一次远端操作的结果读数。
+   *
+   * 弹窗要自己显示它，是因为**弹窗遮罩盖住了工作台**（遮罩 z-index 30，整屏）——
+   * 用户点完「确认推送」之后视线就在框子上，而失败时框子还开着（它不关），
+   * 框子里若一个字都没有，用户只能去窗口右上角找一条 6 秒后就没了的红条。
+   */
+  remoteFeedback?: RemoteFeedback | null;
 }) {
   const [includeUntracked, setIncludeUntracked] = useState(confirmation.type === "discard-all" && untrackedChangeCount > 0 && trackedChangeCount === 0);
   const [stashMessage, setStashMessage] = useState("");
@@ -974,6 +1248,10 @@ function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, 
   const isStash = isStashCreate || isStashApply;
   const dirty = trackedChangeCount + untrackedChangeCount > 0;
   const isCommit = confirmation.type === "commit";
+  // 「提交并推送」是**两段**的复合操作：本地提交 + 推送远端。
+  // 它的失败语义与其它操作都不同（失败在第二段时提交已经在本地了），
+  // 所以确认框要单独说清"会发生什么、失败会留下什么"。
+  const isCommitPush = confirmation.type === "commit-push";
   const isAmend = confirmation.type === "amend";
   const isFetch = confirmation.type === "fetch";
   const isPull = confirmation.type === "pull";
@@ -984,15 +1262,16 @@ function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, 
   const isDestructive = confirmation.type === "discard-worktree" || confirmation.type === "discard-all" || isAbort;
   const operationVerb = conflictOperationVerb(conflictOverview?.context?.operationType);
   const context = conflictOverview?.context;
-  const title = isStashCreate ? "收起改动（Stash）" : isStashApply ? "恢复收起的改动" : isCommit ? "确认提交" : isAmend ? "确认修改提交" : isFetch ? "获取远端更新" : isPull ? "拉取远端更新" : isPush ? "推送到远端" : isSwitch ? "切换分支" : isAbort ? `中止${operationVerb}并还原` : isFinish ? `完成${operationVerb}` : confirmation.type === "discard-all" ? "丢弃全部未提交改动" : confirmation.type === "discard-worktree" && confirmation.untracked ? "删除未跟踪文件" : "撤销工作区更改";
+  const title = isStashCreate ? "收起改动（Stash）" : isStashApply ? "恢复收起的改动" : isCommitPush ? "提交并推送" : isCommit ? "确认提交" : isAmend ? "确认修改提交" : isFetch ? "获取远端更新" : isPull ? "拉取远端更新" : isPush ? "推送到远端" : isSwitch ? "切换分支" : isAbort ? `中止${operationVerb}并还原` : isFinish ? `完成${operationVerb}` : confirmation.type === "discard-all" ? "丢弃全部未提交改动" : confirmation.type === "discard-worktree" && confirmation.untracked ? "删除未跟踪文件" : "撤销工作区更改";
   const isUntracked = confirmation.type === "discard-worktree" && confirmation.untracked;
   const discardPath = confirmation.type === "discard-worktree" ? confirmation.path : "";
   const riskLabel = confirmation.type === "discard-worktree" && !confirmation.untracked ? "工作区内容将恢复到暂存版本" : isAbort ? `当前${operationVerb}产生的所有改动都会丢弃，仓库将还原到操作前状态` : "此操作无法在页面中撤销";
-  const categoryLabel = isStash ? "临时保存" : isCommit || isAmend ? "本地提交" : isFetch || isPull ? "远端操作" : isPush ? "远端操作" : isSwitch ? "分支操作" : isAbort || isFinish ? "冲突处理" : "高风险操作";
+  const categoryLabel = isCommitPush ? "提交与推送" : isStash ? "临时保存" : isCommit || isAmend ? "本地提交" : isFetch || isPull ? "远端操作" : isPush ? "远端操作" : isSwitch ? "分支操作" : isAbort || isFinish ? "冲突处理" : "高风险操作";
   const confirm = () => {
     if (confirmation.type === "stash-create") stashCreate(stashMessage);
     else if (confirmation.type === "stash-apply") stashApply(confirmation.stash.oid, restoreIndex);
     else if (confirmation.type === "commit") commit();
+    else if (confirmation.type === "commit-push") commitAndPush(confirmation.remote, confirmation.branch, confirmation.setUpstream, commitMessage);
     else if (confirmation.type === "amend") commitAmend();
     else if (confirmation.type === "discard-all") discardAll(includeUntracked);
     else if (confirmation.type === "discard-worktree") discardWorktree(confirmation.path, confirmation.untracked);
@@ -1003,11 +1282,20 @@ function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, 
     else if (confirmation.type === "conflict-abort") abortConflict();
     else if (confirmation.type === "conflict-finish") finishConflict();
   };
-  const confirmLabel = busy ? "处理中" : isStashCreate ? "确认收起" : isStashApply ? "确认恢复" : isCommit ? "确认提交" : isAmend ? "确认修改" : isFetch ? "确认获取" : isPull ? "确认拉取" : isPush ? "确认推送" : isSwitch ? "确认切换" : isAbort ? "确认中止" : isFinish ? `确认完成${operationVerb}` : isUntracked ? "确认删除" : "确认撤销";
+  // 确认框只认**自己那次**远端操作：上一次推送失败的原因不该出现在
+  // 「获取远端更新」的框子里 —— 那是两件事，混在一起会让人以为获取也失败了。
+  const confirmOp: GitFeedbackOp | null = isFetch ? "fetch" : isPull ? "pull" : isPush ? "push" : isCommitPush ? "commit-push" : null;
+  const remoteError = confirmOp !== null && remoteFeedback?.kind === "error" && remoteFeedback.op === confirmOp ? remoteFeedback : null;
+  // 远端操作进行中时，按钮直接说**在做什么**，而不是笼统的"处理中" ——
+  // 推送到远端可能要几十秒（慢网络 / 大仓库 / 要握手），"处理中"只说得出
+  // "有东西在跑"，说不出"在等什么"。
+  const remoteBusy = busy && confirmOp !== null && remoteFeedback?.kind === "running" && remoteFeedback.op === confirmOp;
+  const confirmLabel = remoteBusy ? remoteFeedback.title : busy ? "处理中" : isStashCreate ? "确认收起" : isStashApply ? "确认恢复" : isCommitPush ? "确认提交并推送" : isCommit ? "确认提交" : isAmend ? "确认修改" : isFetch ? "确认获取" : isPull ? "确认拉取" : isPush ? "确认推送" : isSwitch ? "确认切换" : isAbort ? "确认中止" : isFinish ? `确认完成${operationVerb}` : isUntracked ? "确认删除" : "确认撤销";
   return <div className="backdrop git-confirmation-backdrop" role="dialog" aria-modal="true" aria-labelledby="git-confirmation-title"><section className={`modal git-confirmation-dialog${isDestructive ? " destructive" : ""}`}><header><div><span>{categoryLabel}</span><h2 id="git-confirmation-title">{title}</h2></div><button type="button" className="git-confirmation-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}><CloseIcon /></button></header><div className="git-confirmation-body">
     {confirmation.type === "stash-create" ? <><p className="git-confirmation-lead">将保存已暂存、未暂存改动及未跟踪文件，并从当前工作区收起。忽略文件不会收起。</p><div className="git-confirmation-scope"><span>保存内容</span><b>{trackedChangeCount} 个受跟踪文件、{untrackedChangeCount} 个未跟踪文件</b><small>之后可在同一仓库的 Stash 列表中恢复，包括原来的暂存状态。</small></div><label className="git-stash-message">说明（可选）<input value={stashMessage} maxLength={200} disabled={busy} placeholder="例如：切换分支前的进行中改动" onChange={(event) => setStashMessage(event.target.value)} /></label></>
       : confirmation.type === "stash-apply" ? <><p className="git-confirmation-lead">将以下 Stash 恢复到 <b>{snapshot?.head.branch || "当前 HEAD"}</b>{restoreIndex ? "，并还原暂存状态。" : "，不要求还原原来的暂存区。"}</p><pre>{confirmation.stash.subject}</pre><label className="git-confirmation-check"><input type="checkbox" checked={restoreIndex} disabled={busy} onChange={(event) => setRestoreIndex(event.target.checked)} />恢复原有暂存状态</label><div className="git-confirmation-scope"><span>操作说明</span><b>恢复后保留 Stash 备份</b><small>跨分支恢复时，如果原有暂存状态无法还原，可取消勾选后重试。如果出现冲突，请在工作区解决；备份仍可用于找回改动。</small></div></>
       : confirmation.type === "commit" ? <><p className="git-confirmation-lead">将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交，包含 {stagedCount} 个已暂存文件。</p><pre>{commitMessage}</pre></>
+      : confirmation.type === "commit-push" ? <><p className="git-confirmation-lead">将在 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 创建本地提交（{stagedCount} 个已暂存文件），随后推送到 <b>{confirmation.remote}/{confirmation.branch}</b>。</p><pre>{commitMessage}</pre><div className="git-confirmation-scope"><span>操作说明</span><b>先创建提交，再推送，两步合成一次操作</b><small>推送失败时提交仍会留在本地（可在工具栏用「推送」补推），不会重复提交</small></div>{confirmation.setUpstream ? <div className="git-confirmation-scope"><span>上游跟踪</span><b>将同时设置 {confirmation.remote}/{confirmation.branch} 为上游</b></div> : null}</>
       : confirmation.type === "amend" ? <><div className="git-confirmation-risk"><span>注意</span><p>修改最近一次提交会改写本地历史。若已推送到远端，普通推送会被拒绝（需强制推送）。</p></div><p className="git-confirmation-lead">将 <b>{snapshot?.head.branch || "当前 HEAD"}</b> 的最近一次提交改写为：</p><pre>{commitMessage}</pre>{stagedCount > 0 ? <div className="git-confirmation-scope"><span>操作说明</span><b>已暂存的 {stagedCount} 个文件改动会一并并入该提交</b></div> : <div className="git-confirmation-scope"><span>操作说明</span><b>无已暂存改动，仅重写提交信息</b></div>}</>
       : confirmation.type === "fetch" ? <><p className="git-confirmation-lead">从 <b>{confirmation.remote}</b> 获取最新更新。</p><div className="git-confirmation-scope"><span>操作说明</span><b>更新远端引用并清理已删除的分支引用</b><small>工作树不会改变</small></div></>
       : confirmation.type === "pull" ? <><p className="git-confirmation-lead">从 <b>{confirmation.remote}</b> 拉取 <b>{confirmation.branch}</b> 并合并最新更新。</p><div className="git-confirmation-scope"><span>操作说明</span><b>仅允许快进合并，历史分叉时会失败以保护提交</b><small>有未提交改动时，冲突文件可能导致拉取失败</small></div></>
@@ -1016,6 +1304,11 @@ function GitConfirmation({ stashBlocked, stashCreate, stashApply, requestStash, 
       : confirmation.type === "conflict-abort" ? <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{context && context.operationType !== "none" ? <p className="git-confirmation-lead">正在{operationVerb} <b>{context.theirsLabel || ""} → {context.oursLabel}</b>，中止后将回到操作前状态。</p> : <p className="git-confirmation-lead">将中止当前冲突操作并丢弃所有已做解决的改动。</p>}</>
       : confirmation.type === "conflict-finish" ? <><p className="git-confirmation-lead">所有冲突文件都已解决，将{operationVerb} <b>{context?.theirsLabel || ""} → {context?.oursLabel || ""}</b> 并结束本次操作。</p><div className="git-confirmation-scope"><span>操作说明</span><b>解决结果会以{operationVerb}提交的形式保留</b></div></>
       : <><div className="git-confirmation-risk"><span>注意</span><p>{riskLabel}</p></div>{confirmation.type === "discard-all" ? <><p className="git-confirmation-lead">已暂存和工作区中的受跟踪改动都会恢复到 <code>HEAD</code>。</p><div className="git-confirmation-scope"><span>受影响内容</span><b>{trackedChangeCount} 个受跟踪文件</b>{untrackedChangeCount > 0 ? <small>另有 {untrackedChangeCount} 个未跟踪文件可选删除</small> : null}</div><label className="git-confirmation-check"><input type="checkbox" checked={includeUntracked} onChange={(event) => setIncludeUntracked(event.target.checked)} />同时删除未跟踪文件</label></> : <><p className="git-confirmation-lead">{isUntracked ? "将永久删除以下未跟踪文件。" : "将以下文件恢复到暂存版本，已暂存内容不会改变。"}</p><code className="git-confirmation-path">{discardPath}</code></>}</>}
+    {/* 远端操作失败：原因就地显示在框子里。
+        失败时框子**不关**（用户可以直接再点一次重试），所以这条必须留在框内 ——
+        工作台那条读数被模态遮罩挡着（遮罩 z-index 30，盖住整屏），
+        只靠它的话失败原因等于没告诉用户。 */}
+    {remoteError ? <div className="git-confirmation-error" role="alert"><b>{remoteError.title}</b><span>{remoteError.detail}</span></div> : null}
   </div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button>{isSwitch && dirty ? <button type="button" className="secondary" disabled={busy || stashBlocked} onClick={requestStash}>先收起改动</button> : null}<button type="button" className={isDestructive ? "primary danger" : "primary"} disabled={busy || (isStash && stashBlocked) || (isStashApply && dirty) || (isStashCreate && !dirty)} onClick={confirm}>{confirmLabel}</button></footer></section></div>;
 }
 

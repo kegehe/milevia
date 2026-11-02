@@ -18,10 +18,34 @@ const stripComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^
 const mobileCode = stripComments(mobile);
 
 test("桌面端保持原生 HTML5 拖放，没有被换成指针版", () => {
-  assert.match(dashboard, /draggable onClick=\{open\}/);
+  // data-project-id 是贴边自动滚动时「指针底下是哪张卡」的判据，和原生拖放不冲突。
+  assert.match(dashboard, /draggable data-project-id=\{project\.id\} onClick=\{open\}/);
   assert.match(dashboard, /onDragStart=\{\(event\) => onDragStart\(event, project\.id\)\}/);
   assert.match(dashboard, /moveProject\(orderedIds, fromId, id\)/);
   assert.doesNotMatch(stripComments(dashboard), /useCardDragReorder|data-card-id|card-drag-ghost|dashboard-drag-hint/);
+});
+
+test("桌面端贴边自动滚动：dragover 只记坐标，位移交给每帧循环", () => {
+  // 实测过：原生 HTML5 拖放在页头、留白这些位置根本不滚，项目一多就变成
+  // 「只能拖到屏幕中间 → 松手 → 滚一屏 → 再拖第二次」。
+  assert.match(dashboard, /<main className="app-shell" onDragOver=\{trackDragPointer\}>/);
+  assert.match(dashboard, /const delta = autoscrollDelta\(dragPointerYRef\.current, window\.innerHeight\);/);
+  // 必须按「滚动前后 scrollY 真的变了」才算滚过：顶到最上/最下时 scrollBy 是空操作，
+  // 那种情况不许记账，否则松手兜底会把什么都没变也当成一次重排。
+  assert.match(dashboard, /const before = window\.scrollY;\s*window\.scrollBy\(0, delta\);\s*if \(window\.scrollY !== before\) didAutoScrollRef\.current = true;/);
+
+  // 滚完之后浏览器不会重新派发 dragover（实测滚 500px 事件还停在原来那张卡），
+  // 所以每滚一次都要按指针位置重新认落点，否则高亮和实际落点会错位。
+  assert.match(dashboard, /syncDropTargetFromPointer\(\);/);
+  assert.match(dashboard, /document\.elementFromPoint\(dragPointerXRef\.current, dragPointerYRef\.current\)/);
+  // 拖拽结束必须停循环：循环读的是 ref 里的旧坐标，不停会一直滚页面。
+  assert.match(dashboard, /const handleDragEnd = useCallback\(\(\) => \{\s*stopAutoScroll\(\);/);
+  // 自动滚动之后的原地松手，浏览器压根不派发 drop（实测只有 dragend，dropEffect=none），
+  // 所以要按指针底下的卡片补一次落点；而且只在我们真的滚过页面时才补，
+  // 没滚过的松手（Esc 取消、拖出窗口）必须保持「什么都不做」。
+  assert.match(dashboard, /didAutoScrollRef\.current = true;/);
+  assert.match(dashboard, /const toId = fromId && didAutoScrollRef\.current \? cardIdUnderPointer\(\) : null;/);
+  assert.match(dashboard, /if \(!fromId \|\| !toId\) return;\s*moveProject\(orderedIds, fromId, toId\);/);
 });
 
 test("手机端「选择项目」接线：容器挂 ref 与指针入口，卡片挂 data-card-id", () => {

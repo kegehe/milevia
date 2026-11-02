@@ -526,11 +526,14 @@
 .new-conversation-agent-mark { display: grid; width: 56px; height: 56px; place-items: center; border: 1px solid #f0dccd; border-radius: 14px; color: #c2603f; background: #fdf1ec; }
 /* Codex 档：官方扭结是单色黑， Cli管理页用的薄荷绿底（#eaf6f2）在这里同用一份。 */
 .new-conversation-agent-mark.codex { border-color: #cfe0da; color: #1f7a68; background: #eaf6f2; }
+/* OpenCode / Cursor 的官方标是单色黑：底与边沿用 Cli 管理页「其他厂商」那档蓝灰，
+   落回基底暖米的话，颜色在说"这是 Claude"。 */
+.new-conversation-agent-mark.opencode, .new-conversation-agent-mark.cursor { border-color: #d3daf2; color: #3457c8; background: #eef1fd; }
 /* 基类沿用的是 Claude 的暖米。目录里新增、还没有官方图标的工具必须给中性色，
    否则它在界面上看起来"就是 Claude"——而名字已经正确，只有颜色在说谎。
    ⚠️ :not(.codebuddy) 必须带着：徽标类（自带紫底、data-logo-badge 铺满）要让位 ——
    这条 (0, 3, 0) 不排除它的话会压过下面 :has 那条 (0, 2, 1)，紫色徽标外圈留一圈灰底灰边。 */
-.new-conversation-agent-mark:not(.claude-code):not(.codex):not(.codebuddy) { border-color: #dcdcd6; color: #6b6b66; background: #f4f3f0; }
+.new-conversation-agent-mark:not(:has(img)) { border-color: #dcdcd6; color: #6b6b66; background: #f4f3f0; }
 /* 官方徽标类图标（CodeBuddy，自带紫色底）：铺满整块牌子，牌子的底色与边框让位。
    （:has() 本文件已有使用先例。） */
 .new-conversation-agent-mark:has(img[data-logo-badge]) { border-color: transparent; background: transparent; }
@@ -602,53 +605,46 @@
 
 /* ---- 新会话起点 ---------------------------------------------------------- */
 .conversation-starter {
-  display: grid;
-  width: min(100% - 32px, 500px);
-  justify-items: start;
-  gap: 10px;
-  margin: clamp(56px, 14vh, 156px) auto;
+  position: relative;
+  left: -8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: min(100% - 32px, 560px);
+  margin: clamp(48px, 12vh, 140px) auto;
   color: #19332c;
+  text-align: center;
 }
-.conversation-starter > span {
-  color: #4f907f;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .06em;
-  text-transform: uppercase;
-}
-.conversation-starter h2 { margin: 0; font-size: 22px; line-height: 1.25; }
-.conversation-starter-options {
-  display: grid;
-  width: 100%;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 4px;
-}
+.conversation-starter-mark { flex: none; width: 52px; height: 52px; border-radius: 13px; box-shadow: 0 6px 16px #17362c26; }
+.conversation-starter h2 { margin: 18px 0 0; font-size: 25px; line-height: 1.25; }
+.conversation-starter > p { margin: 10px 0 0; color: #748b81; font-size: 13.5px; }
+.conversation-starter-options { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-top: 28px; }
 .conversation-starter-options button {
-  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 46px;
+  padding: 0 21px 0 15px;
   border: 1px solid #c8dcd1;
-  border-radius: 6px;
-  padding: 8px 11px;
+  border-radius: 999px;
   color: #31594f;
-  background: #f8fcf9;
-  font-size: 12px;
-  font-weight: 700;
-  text-align: left;
-  transition: border-color .16s ease, color .16s ease, background .16s ease, transform .16s ease;
+  background: #fbfdfc;
+  font-size: 13.5px;
+  font-weight: 600;
+  box-shadow: 0 1px 2px #17362c08;
+  transition: border-color .16s, color .16s, background .16s;
 }
 .conversation-starter-options button:hover,
-.conversation-starter-options button:focus-visible {
-  border-color: #55a697;
-  color: #19332c;
-  background: #eaf5ee;
-  transform: translateX(2px);
-}
-.composer.empty-session textarea {
+.conversation-starter-options button:focus-visible { border-color: #55a697; color: #19332c; background: #eaf5ee; }
+.starter-chip-icon { width: 20px; height: 20px; flex: none; fill: none; stroke: #2c7567; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.6px; }
+.starter-chip-icon .starter-chip-accent { fill: #eaf5ee; stroke: none; }
+.starter-chip-icon .starter-chip-dot { fill: #2c7567; stroke: none; }
+.composer.empty-session .composer-edit {
   min-height: 112px;
   border-color: #8bbcae;
   box-shadow: 0 0 0 3px #eaf5ee;
 }
+
 .head-actions-menu { display: flex; align-items: center; gap: 8px; }
 .head-actions { position: relative; display: flex; align-items: center; gap: 8px; }
 .head-actions-mobile-toggle { display: none; }
@@ -4218,3 +4214,34 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
    把空间让给数量角标与折叠箭头，避免标题折行。技能组整行较宽，仍保留图标。 */
 .quick-actions-row .quick-tag-group:not(.skill-tags) .quick-tag-heading-toggle .quick-tag-heading-icon { display: none; }
 /* 头部「节点」列表 2026-10-23 撤除（回退入口上卡片），checkpoint-popover / checkpoint-entry 规则随之删除。 */
+
+/* ---- 会话内提问卡片（docs/51 §6.1） ---------------------------------- */
+.ask-card { overflow: hidden; border: 1px solid #d8dfeb; border-radius: 10px; background: #fbfcfe; margin-bottom: 20px; }
+.ask-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border-bottom: 1px solid #e6ebf4; }
+.ask-card header > div { display: flex; gap: 10px; align-items: center; }
+.ask-card header b { display: block; color: #24324a; font-size: 13px; }
+.ask-card header small { display: block; margin-top: 2px; color: #75839b; font-size: 11px; }
+.ask-icon { display: inline-flex; width: 22px; height: 22px; flex: none; align-items: center; justify-content: center; border-radius: 50%; background: #e8eefc; color: #3d63c8; font-size: 13px; font-weight: 700; }
+.ask-card.waiting { border-color: #cdd9f4; box-shadow: 0 2px 12px #3d63c814; }
+.ask-card.settled { background: #fafbfc; }
+.ask-question { display: grid; gap: 10px; padding: 12px 14px; border-bottom: 1px solid #eef1f7; }
+.ask-question:last-of-type { border-bottom: none; }
+.ask-question-head { display: flex; gap: 8px; align-items: baseline; }
+.ask-chip { flex: none; padding: 2px 7px; border-radius: 6px; background: #eef2fb; color: #4a5d85; font-size: 11px; }
+.ask-question-head p { margin: 0; color: #24324a; font-size: 13px; line-height: 1.6; }
+.ask-options { display: grid; gap: 8px; }
+.ask-option { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; border: 1px solid #dbe2ee; border-radius: 8px; background: #fff; cursor: pointer; text-align: left; }
+.ask-option.selected { border-color: #3d63c8; background: #f2f6ff; }
+.ask-option-mark { flex: none; width: 16px; height: 16px; margin-top: 2px; border: 1px solid #b9c6dd; border-radius: 4px; color: #3d63c8; font-size: 11px; line-height: 14px; text-align: center; }
+.ask-option.selected .ask-option-mark { border-color: #3d63c8; background: #3d63c8; color: #fff; }
+.ask-option b { display: block; color: #24324a; font-size: 13px; }
+.ask-option small { display: block; margin-top: 2px; color: #75839b; font-size: 11px; line-height: 1.5; }
+.ask-other, .ask-text, .ask-notes-input { width: 100%; padding: 8px 10px; border: 1px solid #dbe2ee; border-radius: 8px; background: #fff; color: #24324a; font-family: inherit; font-size: 13px; }
+.ask-text { min-height: 68px; resize: vertical; }
+.ask-number { display: inline-flex; gap: 8px; align-items: center; }
+.ask-number input { width: 120px; padding: 8px 10px; border: 1px solid #dbe2ee; border-radius: 8px; font-size: 13px; }
+.ask-actions { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 12px 14px; flex-wrap: wrap; }
+.ask-actions > div { display: flex; gap: 8px; }
+.ask-notes-input { flex: 1; min-width: 180px; }
+.ask-answer-readonly { padding: 8px 10px; border-radius: 8px; background: #f1f5f2; color: #2f5b45; font-size: 13px; }
+.ask-notes { padding: 0 14px 12px; color: #75839b; font-size: 12px; }

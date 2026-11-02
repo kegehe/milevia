@@ -28,12 +28,12 @@ import type {
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
   AgentExecution, ConversationUsageResponse, ConversationModels, AgentModelOption,
   RunnerInfo, CheckUpdateResult, UpdateResult, SystemItem, SystemVariant, AgentProfile,
-  Skill, AgentCommandOption, ProjectCommands, MCPInjectionStatus, MCPTransport,
+  Skill, AgentCommandOption, ProjectCommands, MCPInjectionStatus, MCPTransport, Ask, AskQuestion,
 } from "../lib/types";
 import { NON_GIT_BRANCH } from "../lib/types";
 import { api, apiWithTimeout, asRecord } from "../lib/api";
 import {
-  agentDisplayName, agentEntry, agentPermissionModes, agentSupportsSlashCommands, catalogAgentID,
+  agentDisplayName, agentEntry, agentPermissionModes, agentSupportsSlashCommands, agentSupportsSteering, catalogAgentID,
   permissionCopy, runnerAgentStatus, runnerAgentReady, useAgentCatalogState,
   withRunnerAgentStatus,
 } from "../lib/agent-registry";
@@ -72,6 +72,14 @@ import { ExternalLink } from "../components/ExternalLink";
 
 function requiresForceStop(cause: unknown): boolean {
   return typeof cause === "object" && cause !== null && (cause as { code?: unknown }).code === "active_runs_present";
+}
+
+// 停止接口只有在这几种状态下才表示"这一轮真的结束了"。
+// 服务端在"这一轮不由本实例控制"时会把 runs 自己的状态原样回给调用方（历史实现里出现过
+// queued）——把 queued/running 也当终态，会让停止键在 AI 还在跑的时候消失。
+const finishedRunStatuses = new Set(["completed", "failed", "stopped", "interrupted", "cancelled"]);
+function runStatusIsFinished(status: string): boolean {
+  return finishedRunStatuses.has(status);
 }
 
 // 合并现有草稿与预约内容：已约内容优先追加到末尾，避免续期时互相覆盖。
@@ -126,6 +134,24 @@ function WorkspaceCreateIcon() {
 
 function WorkspaceRemoveIcon() {
   return <svg className="conversation-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.2c0-1 .8-1.8 1.8-1.8h4l2 2.2h7.4c1 0 1.8.8 1.8 1.8v9.4c0 1-.8 1.8-1.8 1.8H5.3c-1 0-1.8-.8-1.8-1.8V6.2Z" /><path d="M9.5 13.5h5" /></svg>;
+}
+
+// 新会话起点（2026-10-28 方案 A）的四个建议胶囊图标：主色描边 + 浅绿填充面
+// （配色收在 .starter-chip-icon 的 CSS 里），与 mockup outputs/conversation-starter 定稿一致。
+function StarterReviewIcon() {
+  return <svg className="starter-chip-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 3.5h8l4.5 4.5v12.5h-12.5z" /><path d="M13.5 3.5V8H18" /><path d="M8.5 10.5h4M8.5 13.5h3" /><circle className="starter-chip-accent" cx="15.5" cy="15.5" r="3.6" /><path d="M18.2 18.2l2 2" /><path d="M14 15.6l1.1 1.1 2-2" /></svg>;
+}
+
+function StarterLocateIcon() {
+  return <svg className="starter-chip-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7" /><circle className="starter-chip-accent" cx="12" cy="12" r="3.4" /><circle className="starter-chip-dot" cx="12" cy="12" r="1.3" /><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22" /></svg>;
+}
+
+function StarterBuildIcon() {
+  return <svg className="starter-chip-icon" viewBox="0 0 24 24" aria-hidden="true"><rect className="starter-chip-accent" x="3.5" y="4.5" width="12.5" height="12.5" rx="4" /><path d="M9.75 7.8v5.9M6.8 10.75h5.9" /><path d="M17 14.5v6M14 17.5h6" /></svg>;
+}
+
+function StarterExplainIcon() {
+  return <svg className="starter-chip-icon" viewBox="0 0 24 24" aria-hidden="true"><path className="starter-chip-accent" d="M12 6.5C10.5 4.8 8.2 4 4.5 4v14.5c3.7 0 6 .8 7.5 2.5 1.5-1.7 3.8-2.5 7.5-2.5V4c-3.7 0-6 .8-7.5 2.5z" /><path d="M12 6.5V21" /><path d="M8.6 9.4L6.6 11.5l2 2.1M15.4 9.4l2 2.1-2 2.1" /></svg>;
 }
 
 function NewConversationDialogIcon() {
@@ -646,12 +672,14 @@ function ComposerMcpIcon() {
 // 托盘上最多摆几个 server 图标（其余只在 ⋯ 菜单里）。见 ComposerMcpTray 里的布局说明。
 const mcpTrayVisibleLimit = 4;
 
-// ── MCP 图标托盘：数据源是「最近一次注入快照」（GET /api/projects/{id}/mcp/status）──
-// 只展示 CLI 实际注入过的服务器，不展示"配置了但没注入"的——对话里能用什么以注入为准；
+// ── MCP 图标托盘：数据源是「最近一次注入快照」，按会话视角复核（?scope=session&agentId=）──
+// 只用注入过的事实，不用"配置了就算数"——对话里能用什么以注入为准；但快照不会因为用户在
+// 「MCP 连接」里停用某个 server 而自己更新，所以这里让服务端按**当前**启停与适用范围再复核
+// 一遍：被停用 / 删除 / 改了适用范围的条目立即消失，而不是一直挂在托盘上说"已连接"。
 // 超过 mcpTrayVisibleLimit 个时托盘只摆前 N 个，剩下的在 ⋯ 里逐条列全。
-// 三态分开渲染：读取中 / 读取失败（可重试）/ 快照（含"本次未注入"的明示），绝不把读不到说成没有。
+// 三态分开渲染：读取中 / 读取失败（可重试）/ 快照（含"本次会话没有连接"的明示），绝不把读不到说成没有。
 // 弹层沿用 ComposerModelPicker 的 portal + fixed 定位模式，避免被卡片的滚动容器裁掉。
-function ComposerMcpTray({ projectID, runKey }: { projectID: string; runKey: string }) {
+function ComposerMcpTray({ projectID, agentID, runKey }: { projectID: string; agentID: string; runKey: string }) {
   const [status, setStatus] = useState<MCPInjectionStatus | null>(null);
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [open, setOpen] = useState(false);
@@ -667,7 +695,7 @@ function ComposerMcpTray({ projectID, runKey }: { projectID: string; runKey: str
     // 已有快照先留着显示，新响应到了再换，避免每次刷新都闪一下空态。
     setPhase((prev) => (prev === "ready" ? prev : "loading"));
     try {
-      const data = await api<MCPInjectionStatus>(`/api/projects/${projectID}/mcp/status`);
+      const data = await api<MCPInjectionStatus>(`/api/projects/${projectID}/mcp/status?scope=session&agentId=${encodeURIComponent(agentID)}`);
       if (seq !== requestSeq.current) return;
       setStatus(data);
       setPhase("ready");
@@ -675,7 +703,7 @@ function ComposerMcpTray({ projectID, runKey }: { projectID: string; runKey: str
       if (seq !== requestSeq.current) return;
       setPhase((prev) => (prev === "ready" ? prev : "error"));
     }
-  }, [projectID]);
+  }, [projectID, agentID]);
 
   useEffect(() => { void load(); }, [load, runKey]);
 
@@ -719,7 +747,7 @@ function ComposerMcpTray({ projectID, runKey }: { projectID: string; runKey: str
   };
 
   const tileTitle = (name: string, displayName: string, origin: string, transport: string) =>
-    `${displayName || name} · 已注入（${origin === "project" ? "项目" : "全局"}） · ${transportLabel(transport as MCPTransport)}`;
+    `${displayName || name} · 已连接（${origin === "project" ? "项目" : "全局"}） · ${transportLabel(transport as MCPTransport)}`;
 
   // 托盘最多摆 4 个 tile，其余只在 ⋯ 的菜单里出现（菜单本来就逐条列全）。
   // 上限是**布局**要求、不是审美：工具坞是一行 flex、托盘 flex:none 不缩，而 1200–1300px
@@ -741,18 +769,18 @@ function ComposerMcpTray({ projectID, runKey }: { projectID: string; runKey: str
           <i className="mcp-tile-dot" aria-hidden="true" />
         </span>
       )) : (
-        <span className="mcp-tile" title={phase === "loading" ? "正在读取 MCP 状态…" : status?.note || "本次会话未注入任何 MCP 服务器"}>
+        <span className="mcp-tile" title={phase === "loading" ? "正在读取 MCP 状态…" : status?.note || "本次会话还没有已连接的 MCP 服务器"}>
           <ComposerMcpIcon />
         </span>
       )}
-      <button ref={triggerRef} type="button" className={`mcp-tile mcp-tile-more${open ? " open" : ""}`} title={status && status.serverCount > 0 ? `全部 MCP 服务器（共 ${status.serverCount} 个）` : "全部 MCP 服务器"} aria-label="全部 MCP 服务器" aria-haspopup="dialog" aria-expanded={open} onClick={toggle}>⋯</button>
+      <button ref={triggerRef} type="button" className={`mcp-tile mcp-tile-more${open ? " open" : ""}`} title={status && status.serverCount > 0 ? `已连接的 MCP 服务器（共 ${status.serverCount} 个）` : "MCP 服务器"} aria-label="MCP 服务器" aria-haspopup="dialog" aria-expanded={open} onClick={toggle}>⋯</button>
       {open && createPortal(
         <div ref={menuRef} className="mcp-menu" role="dialog" aria-label="MCP 服务器" style={position ? { left: position.left, bottom: position.bottom, width: position.width } : undefined}>
           <header>
-            <div><label>MCP SERVERS</label><b>最近一次注入</b></div>
+            <div><label>MCP SERVERS</label><b>已连接</b></div>
             <button type="button" className="mcp-menu-manage" onClick={() => { close(); navigate("/mcp-manager"); }}>管理连接</button>
           </header>
-          {phase === "loading" && <p className="mcp-menu-note">正在读取注入状态…</p>}
+          {phase === "loading" && <p className="mcp-menu-note">正在读取连接状态…</p>}
           {phase === "error" && <p className="mcp-menu-note mcp-menu-error">MCP 状态读取失败。<button type="button" onClick={() => void load()}>重试</button></p>}
           {phase === "ready" && status && (status.serverCount > 0 ? (
             <ul className="mcp-menu-list">
@@ -768,9 +796,12 @@ function ComposerMcpTray({ projectID, runKey }: { projectID: string; runKey: str
               ))}
             </ul>
           ) : (
-            <p className="mcp-menu-note">{status.note || "本次会话未注入任何 MCP 服务器。"}</p>
+            <p className="mcp-menu-note">{status.note || "本次会话还没有已连接的 MCP 服务器。"}</p>
           ))}
-          {phase === "ready" && status?.updatedAt && !status.updatedAt.startsWith("0001-") && <p className="mcp-menu-foot">注入快照 · {new Date(status.updatedAt).toLocaleString("zh-CN")}</p>}
+          {/* 部分 server 被停用时列表仍非空，note 必须单独呈现：否则用户只知道图标没了，
+              不知道为什么没的。 */}
+          {phase === "ready" && status && status.serverCount > 0 && status.note && <p className="mcp-menu-note">{status.note}</p>}
+          {phase === "ready" && status?.updatedAt && !status.updatedAt.startsWith("0001-") && <p className="mcp-menu-foot">连接状态 · {new Date(status.updatedAt).toLocaleString("zh-CN")}</p>}
         </div>,
         document.body,
       )}
@@ -1675,6 +1706,109 @@ function ConversationTabStrip({ state, conversations, workspaceLabels, select, c
   </nav>;
 }
 
+// AskCard —— 会话内提问（docs/51 §6.1）。
+//
+// 三件事必须成立，否则用户会以为进程卡死：
+//   1. 卡片落在提问发生的位置（不是末尾），答完可回看；
+//   2. 允许部分作答 —— 服务端会把"没答的题"单独告诉模型，而不是当空字符串；
+//   3. 状态永远可读：等待 / 已答 / 已跳过 / 已超时 / 已取消。
+function askStatusLabel(ask: Ask): string {
+  switch (ask.status) {
+    case "answered": return "已答";
+    case "skipped": return "已跳过";
+    case "expired": return "已超时";
+    case "cancelled": return "已取消";
+    default: return "等待回答";
+  }
+}
+
+const AskCard = memo(function AskCard({ ask, resolving, answer }: {
+  ask: Ask;
+  resolving: string;
+  answer: (askId: string, payload: { answers?: Record<string, string>; notes?: string; action?: "skip" }) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [other, setOther] = useState<Record<string, string>>({});
+  const [notes, setNotes] = useState("");
+  const pending = ask.status === "pending";
+  const busy = resolving === ask.askId;
+
+  const choose = (question: AskQuestion, label: string) => {
+    const current = draft[question.id] || "";
+    if (!question.multiSelect) {
+      setDraft((old) => ({ ...old, [question.id]: old[question.id] === label ? "" : label }));
+      return;
+    }
+    const parts = current ? current.split("、").filter(Boolean) : [];
+    const next = parts.includes(label) ? parts.filter((part) => part !== label) : [...parts, label];
+    setDraft((old) => ({ ...old, [question.id]: next.join("、") }));
+  };
+
+  const submit = () => {
+    const answers: Record<string, string> = {};
+    for (const question of ask.questions) {
+      const value = (other[question.id] || "").trim() || (draft[question.id] || "").trim();
+      if (value) answers[question.id] = value;
+    }
+    void answer(ask.askId, { answers, notes: notes.trim() || undefined });
+  };
+
+  return <article className={`ask-card ${pending ? "waiting" : "settled"}`}>
+    <header><div><span className="ask-icon" aria-hidden="true">?</span><div><b>需要你确认</b><small>{askStatusLabel(ask)}</small></div></div></header>
+    {ask.questions.map((question) => {
+      const answerValue = ask.answers?.[question.id] || "";
+      return <section className="ask-question" key={question.id}>
+        <div className="ask-question-head"><span className="ask-chip">{question.header || "提问"}</span><p>{question.question}</p></div>
+        {!pending && <div className="ask-answer-readonly">{answerValue || "未回答"}</div>}
+        {pending && question.kind === "text" && <textarea className="ask-text" value={draft[question.id] || ""} placeholder={question.placeholder || "输入你的回答"} onChange={(event) => setDraft((old) => ({ ...old, [question.id]: event.target.value }))} />}
+        {pending && question.kind === "number" && <label className="ask-number"><input type="number" value={draft[question.id] || ""} min={question.min} max={question.max} step={question.step || 1} onChange={(event) => setDraft((old) => ({ ...old, [question.id]: event.target.value }))} /><span>{question.unit || ""}</span></label>}
+        {pending && question.kind !== "text" && question.kind !== "number" && <div className="ask-options">
+          {(question.options || []).map((option) => {
+            const selected = (draft[question.id] || "").split("、").includes(option.label);
+            return <button key={option.label} type="button" className={`ask-option ${selected ? "selected" : ""}`} onClick={() => choose(question, option.label)}>
+              <span className="ask-option-mark" aria-hidden="true">{selected ? "✓" : ""}</span>
+              <span><b>{option.label}</b>{option.description && <small>{option.description}</small>}</span>
+            </button>;
+          })}
+        </div>}
+        {pending && <input className="ask-other" value={other[question.id] || ""} placeholder="其他（直接输入）" onChange={(event) => setOther((old) => ({ ...old, [question.id]: event.target.value }))} />}
+      </section>;
+    })}
+    {!pending && ask.notes && <div className="ask-notes">补充：{ask.notes}</div>}
+    {pending && <footer className="ask-actions">
+      <input className="ask-notes-input" value={notes} placeholder="补充说明（可选）" onChange={(event) => setNotes(event.target.value)} />
+      <div>
+        <button type="button" className="secondary" disabled={busy} onClick={() => void answer(ask.askId, { action: "skip" })}>跳过</button>
+        <button type="button" className="primary" disabled={busy} onClick={submit}>{busy ? "提交中" : "提交"}</button>
+      </div>
+    </footer>}
+  </article>;
+});
+
+function AskBanner({ ask, resolving, answer, scrollToCard }: {
+  ask: Ask;
+  resolving: string;
+  answer: (askId: string, payload: { answers?: Record<string, string>; notes?: string; action?: "skip" }) => Promise<void>;
+  scrollToCard: () => void;
+}) {
+  const first = ask.questions[0];
+  if (!first) return null;
+  const busy = resolving === ask.askId;
+  return <div className="approval-banner ask-banner">
+    <div className="approval-banner-body">
+      <span className="approval-banner-icon">❓</span>
+      <div className="approval-banner-info">
+        <b>{first.header || "需要你回答"}</b>
+        <span>{first.question}</span>
+      </div>
+      <div className="approval-banner-actions">
+        <button type="button" className="secondary" disabled={busy} onClick={() => void answer(ask.askId, { action: "skip" })}>跳过</button>
+        <button type="button" className="primary" disabled={busy} onClick={scrollToCard}>去回答</button>
+      </div>
+    </div>
+  </div>;
+}
+
 function ApprovalBanner({ action, resolving, decide, scrollToCard }: { action: ToolAction; resolving: string; decide: (approvalId: string, decision: "allow" | "deny") => Promise<void>; scrollToCard: () => void }) {
   const mcp = mcpToolMeta(action.name);
   const command = typeof action.input.command === "string" ? action.input.command : "";
@@ -1831,12 +1965,13 @@ function ShortcutEditor({ projectID, state, close, refresh, fail, agentID, catal
 // 动作行（气泡下方、与复制同区）。两种"没有按钮"的情形由 MessageCard 如实说清：
 //   - 这一轮还在跑：节点要等 run 成功结束才生成 → 动作行显示"本轮结束后可回退"；
 //   - 这一轮失败/被停止：服务端不会留节点 → 什么都不显示（不是坏了，是没有这个时间点）。
-const MessageList = memo(function MessageList({ timeline, agentID, fail, resolving, decide, projectId, onViewTask, executionByRun, onOpenExecution, registerUserMessageElement, checkpointByRun, activeRunId, checkpointBusy, rewindDisabled, discardedTurnsAfter, rewindToCheckpoint }: {
+const MessageList = memo(function MessageList({ timeline, agentID, fail, resolving, decide, answer, projectId, onViewTask, executionByRun, onOpenExecution, registerUserMessageElement, checkpointByRun, activeRunId, checkpointBusy, rewindDisabled, discardedTurnsAfter, rewindToCheckpoint }: {
   timeline: TimelineItem[];
   agentID: AgentID;
   fail: (message: string) => void;
   resolving: string;
   decide: (approvalId: string, decision: "allow" | "deny") => Promise<void>;
+  answer: (askId: string, payload: { answers?: Record<string, string>; notes?: string; action?: "skip" }) => Promise<void>;
   projectId: string;
   onViewTask: (taskId: string) => void;
   executionByRun: Map<string, AgentExecution>;
@@ -1866,7 +2001,7 @@ const MessageList = memo(function MessageList({ timeline, agentID, fail, resolvi
     {timeline.map((item) => {
       const checkpoint = item.kind === "message" && item.message.role === "user" && item.message.runId ? checkpointByRun.get(item.message.runId) : undefined;
       const isUserMessage = item.kind === "message" && item.message.role === "user";
-      return <div key={item.id} className="timeline-item" data-timeline-kind={item.kind} data-user-message-id={isUserMessage ? item.message.id : undefined} ref={isUserMessage ? (element) => { registerUserMessageElement(item.message.id, element); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={agentID} fail={fail} checkpoint={checkpoint} checkpointRunning={isUserMessage && item.message.runId === activeRunId} discarded={checkpoint ? discardedTurnsAfter(checkpoint) : 0} rewindDisabled={rewindDisabled} checkpointBusy={checkpointBusy} rewind={rewindDefault} persistent={isUserMessage && item.message.id === persistentUserID} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : item.kind === "system" ? <SystemCard system={item.system} /> : <ErrorCard item={item} projectId={projectId} onViewTask={onViewTask} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => onOpenExecution(item.message.runId!)} />}</div>;
+      return <div key={item.id} className="timeline-item" data-timeline-kind={item.kind} data-user-message-id={isUserMessage ? item.message.id : undefined} ref={isUserMessage ? (element) => { registerUserMessageElement(item.message.id, element); } : undefined}><div className={`timeline-entry ${item.kind === "message" ? "message-entry" : item.kind}`}>{item.kind === "message" ? <MessageCard message={item.message} agentID={agentID} fail={fail} checkpoint={checkpoint} checkpointRunning={isUserMessage && item.message.runId === activeRunId} discarded={checkpoint ? discardedTurnsAfter(checkpoint) : 0} rewindDisabled={rewindDisabled} checkpointBusy={checkpointBusy} rewind={rewindDefault} persistent={isUserMessage && item.message.id === persistentUserID} /> : item.kind === "ask" ? <AskCard ask={item.ask} resolving={resolving} answer={answer} /> : item.kind === "tool" ? <ToolCard action={item.action} resolving={resolving} decide={decide} /> : item.kind === "system" ? <SystemCard system={item.system} /> : <ErrorCard item={item} projectId={projectId} onViewTask={onViewTask} />}</div>{item.kind === "message" && item.message.role === "user" && item.message.runId && executionByRun.get(item.message.runId) && <AgentExecutionCard execution={executionByRun.get(item.message.runId)!} open={() => onOpenExecution(item.message.runId!)} />}</div>;
     })}
     {executionByRun && Array.from(executionByRun.values()).filter((execution) => !anchoredExecutionRunIDs.has(execution.runId)).map((execution) => <AgentExecutionCard key={execution.runId} execution={execution} open={() => onOpenExecution(execution.runId)} />)}
   </>;
@@ -2157,6 +2292,9 @@ export default function ConversationPage() {
   const [handingOff, setHandingOff] = useState(false);
   const [resolving, setResolving] = useState("");
   const [stopping, setStopping] = useState(false);
+  // 停止失败/超时的就地提示：全局错误条在页面顶部，用户滚到对话底部根本看不到，
+  // 于是"点了停止没反应"。停止相关的反馈一律落在输入框上方。
+  const [stopNotice, setStopNotice] = useState("");
   const [changingPermission, setChangingPermission] = useState(false);
   const [changingModel, setChangingModel] = useState(false);
   // 弹窗状态 — 通过 URL search params 驱动
@@ -2312,6 +2450,13 @@ export default function ConversationPage() {
     setPendingConfirmBusy(false);
     setPendingConfirm(null);
     if (orphaned) orphaned.onCancel();
+    // 停止与它的就地提示都只属于上一条会话；切走时一并复位，避免新会话输入区被旧的
+    // stopping 禁掉、或旧会话的失败提示漂到屏幕上。
+    setStopping(false);
+    setStopNotice("");
+    // A 的停止请求可能还在飞；切到 B 后它不该再挡住 B 的停止键。请求本身幂等，
+    // 旧的 finally 再置一次 false 也无害。
+    stopRequestInFlightRef.current = "";
   }, [conversation?.id]);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
   const [currentUserMessageIndex, setCurrentUserMessageIndex] = useState(-1);
@@ -2367,7 +2512,7 @@ export default function ConversationPage() {
   // The stop endpoint is asynchronous. Keep a short request lock so a double
   // click does not create concurrent stop requests, while still allowing a
   // retry after the first request has returned `stopping`.
-  const stopRequestInFlightRef = useRef(false);
+  const stopRequestInFlightRef = useRef("");
   const stopAndClearRef = useRef<() => Promise<void>>(async () => {});
   const pendingUserDrafts = useRef(new Map<string, string>());
   const assistantOutputRuns = useRef(new Set<string>());
@@ -2689,6 +2834,11 @@ export default function ConversationPage() {
     setComposerText(nextDraft, next.id);
     // 技能引用属于上一个会话：草稿跟着会话走，引用不该跟着漂到新会话去。
     setSkillRefs([]);
+    // 停止是"针对上一条会话"的动作：切走时两个标记都必须复位，否则新会话的输入区会被
+    // 上一条会话遗留的 stopping 一起禁掉，按钮还会显示"再次停止"。
+    setStopping(false);
+    setStopNotice("");
+    stopRequestInFlightRef.current = "";
     setMessages([]); setEvents([]); setRun(""); setUsage(null); historyIndex.current = null; draftBeforeHistory.current = ""; finishedRunIds.current.clear(); pendingUserDrafts.current.clear(); assistantOutputRuns.current.clear(); retractedMessageRuns.current.clear(); setShowPermissionMenu(false); setShowFullControlConfirmation(false); closeAgentExecution(); setHasMoreHistory(false); setHasMoreMessageHistory(false); setHistoryCursor(""); pagedBackRef.current = false; setLoadingOlderHistory(false); setCurrentUserMessageIndex(-1); setPendingPreviousUserMessageID(null); setHasNewContent(false); userNearBottom.current = true; setConversation(next);
   };
 
@@ -3415,6 +3565,14 @@ export default function ConversationPage() {
     return null;
   }, [timeline]);
 
+  // 待答提问：只挑真正的 pending，终态卡片留在时间线里供回看。
+  const pendingAsk = useMemo(() => {
+    for (const item of timeline) {
+      if (item.kind === "ask" && item.ask.status === "pending") return item;
+    }
+    return null;
+  }, [timeline]);
+
   // 滚动
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     if (isNarrowConversationLayout()) {
@@ -3698,6 +3856,11 @@ export default function ConversationPage() {
   };
 
   // 业务方法
+  // "立即发送"能不能真的插进正在跑的回合：目录说这份 CLI 支持（supportsSteering），
+  // 还要这个项目不是 SSH 远端 —— 远端会话走 sshAgentSession，尚未实现 InjectPrompt，
+  // 消息会安静地排到本轮之后。声明不了就不要在菜单里承诺。
+  const canSteer = agentSupportsSteering(conversation?.agentId ?? "") && !project.runner.startsWith("ssh-");
+
   const sendContent = async (rawContent: string, clearDraft = true, options: { restoreOnFailure?: boolean; notifyFailure?: boolean; clientRequestId?: string; skillRefs?: Skill[] } = {}): Promise<boolean> => {
     const { restoreOnFailure = true, notifyFailure = true } = options;
     const refs = options.skillRefs ?? [];
@@ -3750,8 +3913,14 @@ export default function ConversationPage() {
       if (conversationRef.current?.id !== conversationID) return false;
       // 撤回 / 上箭头重发要恢复的是"用户自己写的东西"，所以这里存 draft 而不是 data.message.content：
       // 后者带着整段技能引用，写回输入框就等于把胶囊重新变成一大段文本（正是本次要修的问题）。
-      if (!assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, draft);
+      // 一个 run 只记一条草稿：能"停止后恢复"的永远是**开启这一轮**的那条消息。
+      // 会话运行中再发的消息会插进同一个 run（插话），如果它覆盖了这里的草稿，
+      // 撤回/停止就会把用户原本那句话换成后来那句。用 has() 做首写优先，
+      // 不依赖服务端告诉我们"这条是不是插话"——那个信息在幂等重放时本来就不可判定。
+      if (!pendingUserDrafts.current.has(data.runId) && !assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, draft);
       setMessages((old) => [...old, data.message]); if (draft) appendInputHistory(draft); setHistoryRefresh((version) => version + 1); setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
+      // 新一轮开始：上一条停止失败/超时的提示已经过时，不能留在输入框上方。
+      setStopNotice("");
       followAfterDispatch();
       void refreshUsage().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新用量统计"));
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
@@ -3904,7 +4073,9 @@ export default function ConversationPage() {
       wasScheduledIdleRef.current = false;
       return;
     }
-    if (!pendingSendRef.current) {
+    // 必须用 `=== null` 而不是真值判断：只引用技能、没有正文时预约内容是空串，
+    // 真值判断会把它当成"没有预约"，预约条挂着却永远不挂起发送。
+    if (pendingSendRef.current === null) {
       if (scheduledSendTimerRef.current != null) {
         window.clearTimeout(scheduledSendTimerRef.current);
         scheduledSendTimerRef.current = null;
@@ -3920,10 +4091,10 @@ export default function ConversationPage() {
         scheduledSendTimerRef.current = null;
         void fireScheduledSendRef.current().then((fired) => {
           // 若因发送中/停止中/清空中被拦截而未真正发出，重置状态让下一次空闲成立时重试。
-          if (!fired && pendingSendRef.current) wasScheduledIdleRef.current = false;
+          if (!fired && pendingSendRef.current !== null) wasScheduledIdleRef.current = false;
         }).catch(() => {
           // sendContent 内部已兜底，这里仅防止意外拒绝导致未处理 Promise。
-          if (pendingSendRef.current) wasScheduledIdleRef.current = false;
+          if (pendingSendRef.current !== null) wasScheduledIdleRef.current = false;
         });
       }, 400);
     } else if (!idle) {
@@ -4342,6 +4513,13 @@ export default function ConversationPage() {
     finally { setResolving(""); }
   }, [projectApi, fail]);
 
+  const answerAsk = useCallback(async (askId: string, payload: { answers?: Record<string, string>; notes?: string; action?: "skip" }) => {
+    setResolving(askId);
+    try { await projectApi(`/api/asks/${askId}`, { method: "POST", body: JSON.stringify(payload) }); }
+    catch (cause) { fail(cause instanceof Error ? cause.message : "无法提交回答"); }
+    finally { setResolving(""); }
+  }, [projectApi, fail]);
+
   // 稳定回调：避免每次渲染新建函数导致 MessageList memo 失效
   const onViewTask = useCallback((taskId: string) => { navigate(`/projects/${project.id}/tasks/${taskId}`); }, [navigate, project.id]);
   const registerUserMessageElement = useCallback((messageId: string, element: HTMLDivElement | null) => {
@@ -4349,24 +4527,29 @@ export default function ConversationPage() {
     else userMessageElements.current.delete(messageId);
   }, []);
 
-  const stopRunInternal = async (force: boolean, requestedRunID = run) => {
+  const stopRunInternal = async (force: boolean, requestedRunID = run): Promise<string> => {
     const runID = requestedRunID;
-    if (!runID) return;
+    if (!runID) return "";
     const url = force ? `/api/runs/${runID}/stop?force=true` : `/api/runs/${runID}/stop`;
     const result = await projectApi<{ status: string }>(url, { method: "POST" });
-    if (result.status !== "stopping") { rememberFinishedRun(runID); setRun((active) => active === runID ? "" : active); }
+    if (runStatusIsFinished(result.status)) { rememberFinishedRun(runID); setRun((active) => active === runID ? "" : active); }
     return result.status;
   };
 
   const stopRun = async () => {
-    if (!conversation || readOnlyConversation || !run || handingOff || stopRequestInFlightRef.current) return;
-    stopRequestInFlightRef.current = true;
-    const conversationID = conversation.id;
+    if (!conversation || readOnlyConversation || !run || handingOff) return;
     const routeVersion = conversationRouteVersion.current;
+    // 锁的键带上路由版本：A→B→A 回到同一 id 时，A 的迟到结果不能当作新一次停止的结果。
+    const stopKey = `${conversation.id}|${routeVersion}`;
+    if (stopRequestInFlightRef.current === stopKey) return;
+    stopRequestInFlightRef.current = stopKey;
+    const conversationID = conversation.id;
     const runID = run;
+    const stillHere = () => conversationRef.current?.id === conversationID && conversationRouteVersion.current === routeVersion;
     // 用户主动停止：仅清空预约状态，避免停止后又把预约自动发射开启新一轮。
     // 不写回输入框——restorePendingUserDraft 依赖"输入框为空"才恢复中断草稿，预填会破坏它。
     clearScheduledSend();
+    setStopNotice("");
     // 助手没有输出时，需要撤回用户消息并恢复草稿
     const shouldRetractMessage = !assistantOutputRuns.current.has(runID);
     const draftToRestore = shouldRetractMessage ? pendingUserDrafts.current.get(runID) : undefined;
@@ -4386,11 +4569,23 @@ export default function ConversationPage() {
     };
     try {
       const result = await stopRunInternal(false);
+      // 往返期间可能已经切到别的会话（或 A→B→A）：停止请求属于旧视图，不能再改当前按钮/提示/消息。
+      if (!stillHere()) return;
       if (result !== "stopping") setStopping(false);
+      // 既不是"正在停"、也不是终态：这一趟什么都没停成（服务端在"不由本实例控制"时会把它
+      // 自己的状态原样回给我们，例如 queued）。此时不能撤回消息、不能恢复草稿 —— 那一轮
+      // 还在排队或还在跑，撤回会让用户以为它没了。
+      if (result !== "stopping" && !runStatusIsFinished(result)) {
+        setStopping(false);
+        setStopNotice("停止请求没有生效（这一轮可能还在排队或不由本机控制），请重试。");
+        return;
+      }
       retractUserMessage();
       restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore);
     }
     catch (cause) {
+      // 同上：旧视图的失败不能在当前视图上弹强制停止框或写一行"停止失败"。
+      if (!stillHere()) return;
       if (requiresForceStop(cause)) {
         const token = openPendingConfirm({
           title: "强制停止",
@@ -4398,24 +4593,80 @@ export default function ConversationPage() {
           danger: true,
           onConfirm: () => {
             closePendingConfirm(token);
-            void stopRunInternal(true, runID).then((result) => { retractUserMessage(); restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore); if (result !== "stopping") setStopping(false); }).catch((cause) => {
-              fail(cause instanceof Error ? cause.message : "无法停止任务");
+            // 弹窗属于旧视图；已经切走（含 A→B→A）就什么都不做，别把当前输入区一起锁上。
+            if (!stillHere()) return;
+            setStopNotice("");
+            // 20 秒兜底可能已经把 stopping 复位（弹窗开着的时候），强制停止发出前重新置上，
+            // 否则这段往返里发送键会提前解禁、按钮也显示成"停止"。
+            setStopping(true);
+            stopRequestInFlightRef.current = stopKey;
+            void stopRunInternal(true, runID).then((result) => {
+              if (!stillHere()) return;
+              if (result !== "stopping" && !runStatusIsFinished(result)) {
+                setStopping(false);
+                setStopNotice("强制停止没有生效，请重试。");
+                return;
+              }
+              retractUserMessage();
+              restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore);
+              if (result !== "stopping") setStopping(false);
+            }).catch((cause) => {
+              if (!stillHere()) return;
+              setStopNotice(cause instanceof Error ? cause.message : "无法强制停止任务");
               setStopping(false);
+            }).finally(() => {
+              if (stopRequestInFlightRef.current === stopKey) stopRequestInFlightRef.current = "";
             });
           },
-          onCancel: () => { closePendingConfirm(token); setStopping(false); },
+          onCancel: () => {
+            closePendingConfirm(token);
+            // 弹窗可能是在旧视图打开、切走后才被 effect 关掉的；别让旧视图的取消
+            // 去复位当前正在进行的停止状态。
+            if (stillHere()) {
+              setStopping(false);
+              setStopNotice("");
+            }
+          },
         });
         return;
       }
-      fail(cause instanceof Error ? cause.message : "无法停止任务");
+      setStopNotice(cause instanceof Error ? cause.message : "无法停止任务");
       setStopping(false);
       return;
     }
     finally {
-      stopRequestInFlightRef.current = false;
+      // 只清自己那一格：旧请求晚到不能把新一次停止的锁解开。
+      if (stopRequestInFlightRef.current === stopKey) stopRequestInFlightRef.current = "";
     }
   };
   stopRunRef.current = stopRun;
+
+  // 停止键的"再次停止"不能无限挂着：后端 15 秒会兜底收尾，这里再留 5 秒给实时事件/轮询。
+  // 到点仍未收到终态，就把按钮恢复成可重试，并明确告诉用户 —— 不能让它一直显示"再次停止"
+  // 又什么都不发生（那是用户最难判断的状态）。
+  useEffect(() => {
+    if (!stopping) return undefined;
+    let timer = 0;
+    const check = () => {
+      // 请求还在飞（例如用户刚确认强制停止）：不要在这个窗口里复位按钮、也不要写一条
+      // 过时的"还没退出"提示 —— 请求自己的 15 秒超时会给出权威结果。但**不能到点就
+      // 永久放弃**：再排一次，否则请求随后返回 stopping 而事件/轮询又漏掉时，按钮会
+      // 一直停在"再次停止"，正是这次要消灭的状态。
+      if (stopRequestInFlightRef.current) {
+        timer = window.setTimeout(check, 5_000);
+        return;
+      }
+      setStopping(false);
+      setStopNotice("停止请求已发出，但 AI 还没有退出。可以重试；如果仍然停不下来，请刷新页面或重启 Milevia。");
+    };
+    timer = window.setTimeout(check, 20_000);
+    return () => window.clearTimeout(timer);
+  }, [stopping]);
+
+  // 运行结束（停止成功或自然完成）时把就地提示一起收掉，避免留着一条已经过时的错误。
+  useEffect(() => {
+    if (!run) setStopNotice("");
+  }, [run]);
 
   const handleTextChange = (value: string) => {
     historyIndex.current = null;
@@ -4553,10 +4804,10 @@ export default function ConversationPage() {
   const userMessageNavigationIndex = userMessages.length === 0 ? -1 : Math.max(0, Math.min(currentUserMessageIndex, userMessages.length - 1));
   const inputHistoryPosition = historyIndex.current === null ? null : historyIndex.current + 1;
   const starterSuggestions = [
-    { label: "审查改动", prompt: "请审查当前工作区的改动，重点检查潜在问题、风险和缺少的测试。" },
-    { label: "定位问题", prompt: "请帮我定位并分析以下问题的原因：" },
-    { label: "实现功能", prompt: "请帮我在当前项目中实现以下功能：" },
-    { label: "解释代码", prompt: "请解释以下代码的作用、关键逻辑和需要注意的地方：" },
+    { label: "审查改动", prompt: "请审查当前工作区的改动，重点检查潜在问题、风险和缺少的测试。", icon: <StarterReviewIcon /> },
+    { label: "定位问题", prompt: "请帮我定位并分析以下问题的原因：", icon: <StarterLocateIcon /> },
+    { label: "实现功能", prompt: "请帮我在当前项目中实现以下功能：", icon: <StarterBuildIcon /> },
+    { label: "解释代码", prompt: "请解释以下代码的作用、关键逻辑和需要注意的地方：", icon: <StarterExplainIcon /> },
   ];
 
   const startFromSuggestion = (prompt: string) => {
@@ -4759,8 +5010,11 @@ export default function ConversationPage() {
       <section className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
         <div ref={top} />
         {hasMoreHistory && <button className="secondary load-earlier-history" type="button" disabled={loadingOlderHistory || sending} onClick={() => void loadOlderHistory()}>{loadingOlderHistory ? "加载中" : "加载更早记录"}</button>}
-        {isEmptyConversation && <section className="conversation-starter" aria-label="新会话建议"><span>新会话</span><h2>从一个任务开始</h2><div className="conversation-starter-options">{starterSuggestions.map((suggestion) => <button key={suggestion.label} type="button" onClick={() => startFromSuggestion(suggestion.prompt)}>{suggestion.label}</button>)}</div></section>}
-        <MessageList timeline={timeline} agentID={conversation?.agentId || "claude-code"} fail={fail} resolving={resolving} decide={decide} projectId={project.id} onViewTask={onViewTask} executionByRun={executionByRun} onOpenExecution={openExecutionParam} registerUserMessageElement={registerUserMessageElement} checkpointByRun={checkpointByRun} activeRunId={run} checkpointBusy={checkpointBusy} rewindDisabled={rewindDisabled} discardedTurnsAfter={discardedTurnsAfter} rewindToCheckpoint={rewindFromTimeline} />
+        {/* 新会话起点（2026-10-28 方案 A）：Milevia 品牌图标 + 问候 + 四个图标胶囊。
+            复用 /milevia-mark.svg 与顶部品牌栏同一份资源，避免图形漂移（同 AppVersionTag）。
+            删掉了旧版「新会话」kicker——会话页签已经说明了这一层语义。 */}
+        {isEmptyConversation && <section className="conversation-starter" aria-label="新会话建议"><img className="conversation-starter-mark" src="/milevia-mark.svg" alt="" width="52" height="52" /><h2>有什么可以帮你？</h2><p>描述一个任务，或从下面挑一个常用的开始</p><div className="conversation-starter-options">{starterSuggestions.map((suggestion) => <button key={suggestion.label} type="button" onClick={() => startFromSuggestion(suggestion.prompt)}>{suggestion.icon}<span>{suggestion.label}</span></button>)}</div></section>}
+        <MessageList timeline={timeline} agentID={conversation?.agentId || "claude-code"} fail={fail} resolving={resolving} decide={decide} answer={answerAsk} projectId={project.id} onViewTask={onViewTask} executionByRun={executionByRun} onOpenExecution={openExecutionParam} registerUserMessageElement={registerUserMessageElement} checkpointByRun={checkpointByRun} activeRunId={run} checkpointBusy={checkpointBusy} rewindDisabled={rewindDisabled} discardedTurnsAfter={discardedTurnsAfter} rewindToCheckpoint={rewindFromTimeline} />
         {run && runIndicatorVariant && runTextVariant && <RunIndicatorView variant={runIndicatorVariant} textVariant={runTextVariant} label={stageLabel} clockStartMs={stageStartMs} />}
         <div ref={bottom} />
       </section>
@@ -4771,9 +5025,10 @@ export default function ConversationPage() {
         <button type="button" className="scroll-btn scroll-to-next-message" title="下一条我的消息" aria-label="下一条我的消息" disabled={userMessageNavigationIndex < 0 || userMessageNavigationIndex >= userMessages.length - 1} onClick={goToNextUserMessage}><ScrollNavigationIcon direction="next" /></button>
         <button type="button" className={`scroll-btn scroll-to-bottom${hasNewContent ? " pulse" : ""}`} title="回到底部" aria-label="回到底部" onClick={() => scrollToBottomNextFrame("auto")}><ScrollNavigationIcon direction="bottom" /></button>
       </div>
-      <form ref={composerRef} className={`composer${pendingApproval ? " has-approval" : ""}${isEmptyConversation ? " empty-session" : ""}`} onSubmit={(event) => void send(event)}>
+      <form ref={composerRef} className={`composer${pendingApproval || pendingAsk ? " has-approval" : ""}${isEmptyConversation ? " empty-session" : ""}`} onSubmit={(event) => void send(event)}>
         <fieldset className="composer-model-switch-lock" disabled={changingModel}>
         {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
+        {pendingAsk && <AskBanner ask={pendingAsk.ask} resolving={resolving} answer={answerAsk} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.ask .ask-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
         {skillRefs.length > 0 && <div className="composer-skill-refs" role="group" aria-label="已引用的技能">
           {skillRefs.map((skill) => <span className="composer-skill-ref" key={`${skill.source}-${skill.name}`}>
             <span className="composer-skill-ref-name" title={truncateSkillDescription(skill.description, skill.name) || skill.name}><SkillTagIcon /><span>{skill.name}</span></span>
@@ -4806,8 +5061,9 @@ export default function ConversationPage() {
           <div className="quick-tag-group command-tags"><div className="quick-tag-heading"><span className="quick-tag-heading-label"><ShortcutCategoryIcon kind="command" /><span>常用命令</span><b className="quick-tag-count">{commandShortcuts.length}</b></span><button type="button" title="新增常用命令" aria-label="新增常用命令" disabled={readOnlyConversation} onClick={() => { setShowMobileShortcuts(false); setShortcutEditor({ kind: "command_request" }); }}><ShortcutAddIcon /></button></div><ShortcutSortableList items={commandShortcuts} kind="command_request" renderItem={renderMobileCommandCell} draggingDisabled={sortableDraggingDisabled} onReorder={reorderKind} /></div>
           {renderSkillGroup()}
         </section>}
+          {stopNotice && <div className="composer-stop-note" role="alert"><span>{stopNotice}</span><button type="button" title="关闭" aria-label="关闭" onClick={() => setStopNotice("")}>×</button></div>}
           <div className="composer-dock">
-            <ComposerMcpTray projectID={project.id} runKey={run} />
+            <ComposerMcpTray projectID={project.id} agentID={conversation?.agentId || "claude-code"} runKey={run} />
             <ContextRing usage={usage} />
             <span className="composer-dock-push" aria-hidden="true"></span>
             {conversation?.id ? <ComposerModelPicker conversationID={conversation.id} agentID={conversation?.agentId || "claude-code"} selected={conversation?.modelOverride || ""} displayed={displayedModel} disabled={readOnlyConversation || Boolean(run) || stopping || changingModel} runActive={Boolean(run)} busy={changingModel} onSelect={selectConversationModel} onFail={fail} /> : <span className="composer-usage-model" title={displayedModel}>{displayedModel}</span>}
@@ -4815,7 +5071,7 @@ export default function ConversationPage() {
             <button className="composer-icon-btn composer-continue" type="button" title="继续任务" aria-label="继续任务" disabled={readOnlyConversation || sending || clearing || stopping || handingOff} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /></button>
             {run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation} onClick={() => void stopRun()}>{stopping ? "再次停止" : "停止"}</button>}
             <button className="composer-icon-btn composer-usage-open" type="button" title={!run && !usage ? "用量将在工具就绪后显示" : "使用状态"} aria-label="使用状态" disabled={!run && !usage} onClick={openUsage}><svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V10M10 19V5M15 19v-7M20 19V8" /><path d="M3.5 19.5h17" /></svg></button>
-            <span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>立即交给 {activeAgentName}，在下一轮工具调用后继续</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>当前任务（含子代理）全部结束后再发送</small></span></button></span>}</span>
+            <span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>{canSteer ? "交给 " + activeAgentName + "；运行中会插入当前任务，模型在下一个工具结果后看到" : "交给 " + activeAgentName + "；当前会话不支持中途插入，会排在本轮之后"}</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>等当前任务（含子代理）全部结束后，作为新的一轮发送</small></span></button></span>}</span>
           </div>
         </div>
         <ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} projectID={project.id} conversationID={conversation?.id || ""} isGitRepo={project.gitBranch !== NON_GIT_BRANCH} run={run} runLabel={runLabel} usage={usage} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} />

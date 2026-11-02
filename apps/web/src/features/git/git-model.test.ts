@@ -4,7 +4,7 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
 
-import { groupChanges, isMergeCommit, type GitCommit, type GitOperation, type GitSnapshot } from "./git-model.ts";
+import { commitPushFailureDetail, commitPushFailureTitle, commitPushPushedCount, commitPushSuccessText, commitPushUnavailableReason, gitCommitPushOption, gitPushTarget, groupChanges, isMergeCommit, type GitCommit, type GitOperation, type GitSnapshot } from "./git-model.ts";
 import { CommitHistory, CommitPanel, GitBar, GitWorkbench, MAX_COMMIT_SUBJECT_LENGTH, commitSubjectLength, parseDiffContent } from "./GitWorkbench.tsx";
 
 test("keeps staged and worktree entries for the same path distinct", () => {
@@ -318,8 +318,20 @@ test("measures the first line the server will see, not the raw first line", () =
 });
 
 // 渲染提交面板并清掉 React 在相邻文本节点之间插入的 <!-- -->，便于直接比对文案。
-function renderCommitPanel(value: string, stagedCount = 1): string {
-  return renderToString(createElement(CommitPanel, { stagedCount, value, setValue: noop, open: noop, openAmend: noop, disabled: false })).replaceAll("<!-- -->", "");
+function renderCommitPanel(value: string, stagedCount = 1, options: { mobile?: boolean } = {}): string {
+  const mobile = options.mobile ?? false;
+  return renderToString(createElement(CommitPanel, {
+    stagedCount,
+    value,
+    setValue: noop,
+    open: noop,
+    openAmend: noop,
+    disabled: false,
+    mobile,
+    // 桌面端才会渲染下拉箭头；手机端这两项传什么都不该出现箭头。
+    pushOption: gitCommitPushOption(sampleSnapshot({ upstream: "origin/main" })),
+    requestCommitPush: noop,
+  })).replaceAll("<!-- -->", "");
 }
 
 test("explains why the commit button is disabled when the subject is too long", () => {
@@ -370,3 +382,120 @@ test("never counts the subject with UTF-16 length again", () => {
   assert.equal(source.split(String.raw`split("\n")[0]`).length - 1, 1);
   assert.match(source, /commitSubjectLength\(/);
 });
+
+// —— 「提交并推送」：落点推导 + 两段失败的文案 ——
+//
+// 这组测试守的是三件事：
+//  1. 落点必须与工具栏那个「推送」按钮一致（两处各算一次早晚会对不上）；
+//  2. 两段失败的语义不同 —— 第一段失败"什么都没发生"，第二段失败"提交已在本地"；
+//  3. 服务端说"结果无法确认"时，不能说成"什么都没发生"（把"不知道"写成"没有"）。
+
+test("derives the push target from the upstream, matching the toolbar push button", () => {
+  // 上游是 origin/main → 推给 origin 的 main，并**不**再设置上游（已经有了）。
+  assert.deepEqual(gitPushTarget(sampleSnapshot({ upstream: "origin/main" })), {
+    remote: "origin",
+    branch: "feature/hello",
+    setUpstream: false,
+  });
+
+  // 没有上游（首次推送）→ 推 origin 的当前分支，并建立上游跟踪。
+  assert.deepEqual(gitPushTarget(sampleSnapshot({ upstream: "" })), {
+    remote: "origin",
+    branch: "feature/hello",
+    setUpstream: true,
+  });
+
+  // ⚠️ 分支名里可以带 "/"（origin/feature/x）—— 远端名要按**第一段**切，
+  // 按最后一个切会切出 "x" 当远端名。
+  assert.equal(gitPushTarget(sampleSnapshot({ upstream: "upstream/feature/x" })).remote, "upstream");
+  assert.equal(gitPushTarget(sampleSnapshot({ upstream: "origin/feature/x" })).remote, "origin");
+  assert.equal(gitPushTarget(sampleSnapshot({ upstream: "origin/feature/x" })).branch, "feature/hello");
+
+  // 读不到仓库状态时也要给出一个能用的落点（远端名 origin），
+  // 不能返回 undefined 让调用方各处自己判空。
+  assert.deepEqual(gitPushTarget(null), { remote: "origin", branch: "", setUpstream: true });
+});
+
+test("the commit-and-push target and the toolbar push target share one derivation", () => {
+  // 回归闸门：工具栏的「推送」按钮与提交区的「提交并推送」必须推同一个地方。
+  // 两处各写一遍推导逻辑，早晚会有一处漏改（上游换远端时尤其明显）。
+  const source = readFileSync(new URL("./GitWorkbench.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /upstream\?\.split\("\/\"\)\[0\]/);
+  assert.match(source, /gitPushTarget\(/);
+  assert.match(source, /gitCommitPushOption\(/);
+});
+
+test("says the push is not possible for the one reason that actually applies", () => {
+  const base = { stagedCount: 1, message: "改了 README", subjectOverLimit: false, detached: false, hasBranch: true };
+  assert.equal(commitPushUnavailableReason(base), "");
+
+  // 四个前置条件各自独立：任何一条不满足，都只说**那一条**。
+  assert.equal(commitPushUnavailableReason({ ...base, stagedCount: 0 }), "没有已暂存文件可提交");
+  assert.equal(commitPushUnavailableReason({ ...base, message: "   " }), "请先填写提交信息");
+  assert.equal(commitPushUnavailableReason({ ...base, subjectOverLimit: true }), "提交信息首行过长，无法提交");
+  assert.equal(commitPushUnavailableReason({ ...base, detached: true }), "游离指针状态无法推送");
+  assert.equal(commitPushUnavailableReason({ ...base, hasBranch: false }), "当前没有可推送的分支");
+
+  // 游离指针与"没有分支名"不是一回事，说错会让用户去查错的东西
+  // （工具栏那个「推送」按钮用的就是"游离指针状态无法推送"这个词）。
+  assert.notEqual(commitPushUnavailableReason({ ...base, detached: true }), commitPushUnavailableReason({ ...base, hasBranch: false }));
+});
+
+test("splits the failure semantics of the two phases", () => {
+  // 第一段失败：本地什么都没发生，用户改好提交信息就能重试。
+  assert.equal(commitPushFailureTitle("commit", "failed"), "提交失败");
+  assert.match(commitPushFailureDetail("commit", "failed", "提交信息为空"), /本地没有产生任何提交，可以直接重试/);
+
+  // 第二段失败：提交**已经在本地**了 —— 说成"什么都没发生"会让人重复提交。
+  assert.equal(commitPushFailureTitle("push", "failed"), "推送失败");
+  const pushDetail = commitPushFailureDetail("push", "failed", "推送被拒绝");
+  assert.match(pushDetail, /提交已在本地创建，不要重复提交/);
+  assert.doesNotMatch(pushDetail, /本地没有产生任何提交/);
+
+  // ⚠️ 服务端说"结果无法确认"（needs_attention）时**不能**说"什么都没发生"。
+  // 提交可能其实建成了 —— 说"没有"就是在骗用户。
+  assert.equal(commitPushFailureTitle("commit", "unknown"), "提交结果未确认");
+  const unknown = commitPushFailureDetail("commit", "unknown", "Git 操作已执行，但无法读取最新仓库状态");
+  assert.match(unknown, /无法确认/);
+  assert.doesNotMatch(unknown, /本地没有产生任何提交/);
+  assert.doesNotMatch(unknown, /可以直接重试/);
+
+  // 推送段的结果不确定：提交确定在本地，推送不确定 —— 两件事要分开说。
+  assert.equal(commitPushFailureTitle("push", "unknown"), "推送结果未确认");
+  const pushUnknown = commitPushFailureDetail("push", "unknown", "推送已执行，但无法确认最终状态");
+  assert.match(pushUnknown, /提交已在本地创建/);
+  assert.match(pushUnknown, /无法确认/);
+});
+
+test("counts the pushed commits from the two readings, never from the commit count", () => {
+  // 有上游时：推送前 ahead=2（本地领先两个提交），推送后 ahead=0 → 推了 2 个。
+  const before = sampleSnapshot({ upstream: "origin/main", ahead: 2 });
+  const after = sampleSnapshot({ upstream: "origin/main", ahead: 0 });
+  assert.equal(commitPushPushedCount(before, after), 2);
+
+  // ⚠️ 没有上游时**数不出来**（ahead 恒为 0，实际推上去的是整个分支）。
+  // 这时候报"推了 1 个"是编的 —— 返回 0，只说"推上去了"，不说推了几个。
+  assert.equal(commitPushPushedCount(sampleSnapshot({ upstream: "", ahead: 0 }), sampleSnapshot({ upstream: "", ahead: 0 })), 0);
+
+  // 读不到读数时同样退回到 0（宁可少报也不要报错数）。
+  assert.equal(commitPushPushedCount(null, after), 0);
+  assert.equal(commitPushPushedCount(before, null), 0);
+
+  // 成功读数把两件事**分开**说："提交发生了"和"推送送上去 N 个"。
+  // ⚠️ N 是推上去的提交总数（可能含此前未推送的），不能让 N 读起来像"你新建了 N 个提交"。
+  assert.equal(commitPushSuccessText("origin", "main", 2), "已提交，已推送 2 个提交到 origin/main");
+  assert.equal(commitPushSuccessText("origin", "main", 0), "已提交，已推送到 origin/main");
+});
+
+test("the commit-and-push entry is desktop only and the mobile DOM stays as contracted", () => {
+  // 移动端 DOM 是定稿契约（docs/41 §6.2）：手机端**不渲染**下拉箭头。
+  const mobile = renderCommitPanel("改了 README", 2, { mobile: true });
+  assert.doesNotMatch(mobile, /git-commit-submit-caret/);
+  assert.doesNotMatch(mobile, /git-commit-submit-row/);
+
+  // 桌面端渲染分裂按钮：主键 + 箭头。
+  const desktop = renderCommitPanel("改了 README", 2, { mobile: false });
+  assert.match(desktop, /git-commit-submit-row/);
+  assert.match(desktop, /git-commit-submit-caret/);
+});
+

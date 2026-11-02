@@ -247,7 +247,63 @@ test("every CLI-management endpoint a page calls is on the long-task table", asy
     // 这台机器上的工具清单与批量诊断（页面的卡片区靠它们）
     ["GET", "/api/runners/windows-local/agents"],
     ["GET", "/api/runners/windows-local/diagnostics"],
+    // 执行环境清单（顶栏的环境标签靠它，卡片区没有它就不画）—— 它是"对每台机器各探一遍"
+    // 的聚合，比上面两条更慢；漏在表外的表现就是 2026-10-30 那条"读不到执行环境"。
+    ["GET", "/api/runners"],
+    // 同一份探测的单机形态（新会话弹窗、建议面板）
+    ["GET", "/api/runners/windows-local/status"],
   ], { controlMethod: "POST", controlPath: "/api/preferences" });
+});
+
+test("执行环境清单等的是聚合预算（两轮探测），60 秒与 90 秒都不是它的上限", async () => {
+  // 这条与上一条不同：它钉的是**数值**。清单接口服务端串了两段预算，且在接到"已经超时的
+  // 那一轮"时会重做一整轮，所以一次读的合法上限是两轮 ≈ 90 秒；单轮本身还可能超出 45 秒
+  // （实测一轮 65 秒、整读 84.4 秒才正常返回）。若有人把它挪回 60 秒或 90 秒那一档，
+  // 这里会在对应时刻先判失败。
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const originalFetch = globalThis.fetch;
+  try {
+    let fetchCalls = 0;
+    globalThis.fetch = (_url, init) => {
+      fetchCalls++;
+      return new Promise((_resolve, reject) => {
+        const signal = init.signal;
+        const abort = () => reject(new DOMException("Aborted", "AbortError"));
+        if (signal?.aborted) {
+          abort();
+          return;
+        }
+        signal?.addEventListener("abort", abort, { once: true });
+      });
+    };
+    const flush = async () => {
+      await Promise.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const pending = api("/api/runners");
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    const rejected = assert.rejects(pending, /这项操作超过 2 分钟仍未返回/);
+    pending.catch(() => {});
+
+    // 60 秒（probeTimeoutMs）与 90 秒（两轮无超支）到点时**都不能**有结论。
+    mock.timers.tick(60_001);
+    await flush();
+    assert.equal(settled, false, "执行环境清单不该在 60 秒被判失败");
+    mock.timers.tick(30_000);
+    await flush();
+    assert.equal(settled, false, "重做一轮的机器上 90 秒也不够");
+    assert.equal(fetchCalls, 1, "聚合探测没有重试资格（重试就是把整轮探测再跑一遍）");
+
+    // 自己的预算走完才轮到客户端说话。
+    mock.timers.tick(30_000);
+    await flush();
+    await rejected;
+  } finally {
+    globalThis.fetch = originalFetch;
+    mock.timers.reset();
+  }
 });
 
 test("同一条路径上的读不算长任务：判据必须看方法", async () => {

@@ -78,6 +78,8 @@ restore_previous() {
     return 1
   fi
   log "回滚到上一个版本"
+  # docker cp 会保留宿主源文件的权限；容器以非 root 运行，必须先补可执行位。
+  chmod 0755 "${PREV_BIN}"
   docker cp "${PREV_BIN}" "${CONTAINER}:${TARGET}"
   docker restart "${CONTAINER}" >/dev/null
   if health_ok; then
@@ -154,11 +156,24 @@ fi
 # ── 部署 ────────────────────────────────────────────────────
 log "备份当前二进制到 ${PREV_BIN}（覆盖上一次的备份，只保留最近一份）"
 docker cp "${CONTAINER}:${TARGET}" "${PREV_BIN}"
+chmod 0755 "${PREV_BIN}"
 
 log "替换容器内二进制"
 docker cp "${NEW_BIN}" "${CONTAINER}:${TARGET}"
 
-ACTUAL_SHA="$(docker exec "${CONTAINER}" sha256sum "${TARGET}" | cut -d' ' -f1)"
+# 把容器里的文件取回宿主校验，而不是在容器内执行 sha256sum：
+# 生产镜像可能是 scratch（没有 coreutils/busybox），docker exec 会因
+# "executable file not found" 直接失败。宿主对同一份文件算哈希同样能证明
+# docker cp 没有写坏内容，且不依赖容器内有哪些命令。
+VERIFY_BIN="$(mktemp)"
+if ! docker cp "${CONTAINER}:${TARGET}" "${VERIFY_BIN}" || \
+   ! ACTUAL_SHA="$(sha256sum "${VERIFY_BIN}" | cut -d' ' -f1)"; then
+  rm -f "${VERIFY_BIN}"
+  log "无法读取容器内二进制做校验，回滚"
+  restore_previous || true
+  exit 1
+fi
+rm -f "${VERIFY_BIN}"
 if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
   log "容器内二进制校验不一致（期望 ${EXPECTED_SHA}，实际 ${ACTUAL_SHA}），回滚"
   restore_previous || true

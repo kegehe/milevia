@@ -405,7 +405,8 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 		environment = append(environment, request.MCPEnv...)
 	}
 	if request.Resume {
-		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", request.SessionID, request.Prompt)
+		// 与本地/SSH 的 resume 分支一致：WSL 里的项目目录也可能还不是 git 仓库。
+		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", request.SessionID, request.Prompt)
 	} else {
 		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy, request.Prompt)
 	}
@@ -470,6 +471,8 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 	args = append(args, profileArgs...)
 	linuxWorkDir := r.wslLinuxWorkDir(request.ProjectPath)
 	cmd := r.wslClaudeCommand(ctx, args, environment, linuxWorkDir)
+	// 同本地流式会话：给 reader 5 秒读完退出前的最后几帧，再关父端读管道。
+	cmd.WaitDelay = agentProcessTeardownGrace
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -499,6 +502,10 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 		initialResponseTimeout: r.claude.config.ClaudeInitialResponseTimeout,
 		toolResultTimeout:      r.claude.config.ClaudeToolResultTimeout,
 	}
+	// 与本地流式会话同一条收尾约定：wsl.exe 放进 KILL_ON_JOB_CLOSE 作业，
+	// cmd.Wait 一返回就先关树、再等 reader。注意 Job 管不到 WSL 里的 Linux 侧进程，
+	// 这里能保证的是 Windows 侧包装器与管道写端不再把收尾拖住。
+	releaseTree := containAgentProcess(cmd)
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go func() { defer readers.Done(); session.readOutput(stdout) }()
@@ -511,7 +518,9 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 		}
 	}()
 	go func() {
+		defer releaseTree()
 		err := cmd.Wait()
+		releaseTree()
 		readersDone := make(chan struct{})
 		go func() { readers.Wait(); close(readersDone) }()
 		select {

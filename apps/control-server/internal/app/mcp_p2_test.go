@@ -362,6 +362,97 @@ func TestProjectMCPAllowMcpJsonControlsStrictMode(t *testing.T) {
 	}
 }
 
+// 对话页托盘问的是「本会话现在能用哪些 MCP」。快照只记「最近一次注入」，用户之后在
+// 「MCP 连接」里停用（或删除、改适用范围）时它不会自己更新——必须按当前配置复核，
+// 否则托盘会一直把已停用的 server 画成已连接。
+func TestProjectMCPStatusSessionViewDropsDisabledServers(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	projectID := "proj-session-status"
+	projectPath := t.TempDir()
+	insertTestProject(t, s, projectID, projectPath)
+	target := s.resolveAgentTargetEnv(s.localRunnerID(), projectPath)
+	envs := []string{string(target)}
+	fsID := insertTestMCPServer(t, s, "fs", mcpScopeGlobal, "", mcpTransportStdio, "npx", nil, envs, []string{"claude-code"})
+	githubID := insertTestMCPServer(t, s, "github", mcpScopeGlobal, "", mcpTransportStdio, "npx", nil, envs, []string{"claude-code"})
+	s.recordProjectMCPInjection(projectID, projectMCPStatus{
+		ProjectID:   projectID,
+		Environment: string(target),
+		AgentID:     "claude-code",
+		Note:        "远端 MCP 注入能力尚未探测",
+		RunKey:      "run-1",
+		Servers: []projectMCPStatusServer{
+			{Name: "fs", DisplayName: "FS", Transport: mcpTransportStdio, Origin: mcpScopeGlobal},
+			{Name: "github", DisplayName: "GitHub", Transport: mcpTransportStdio, Origin: mcpScopeGlobal},
+		},
+	})
+	read := func(query string) projectMCPStatus {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		request := withURLParam(httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/mcp/status"+query, nil), "projectID", projectID)
+		s.getProjectMCPStatus(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status endpoint = %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var status projectMCPStatus
+		if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+			t.Fatalf("decode status: %v", err)
+		}
+		return status
+	}
+
+	// 用户在「MCP 连接」里停用了 fs。
+	if _, err := s.db.ExecContext(ctx, "update mcp_servers set enabled=0 where id=?", fsID); err != nil {
+		t.Fatalf("disable server: %v", err)
+	}
+	// 快照视角（管理页的历史记录）保持原样：它回答的是「刚才那次注入了什么」。
+	if snapshot := read(""); snapshot.ServerCount != 2 {
+		t.Fatalf("snapshot view should keep the historical list, got %+v", snapshot)
+	}
+	// 会话视角：停用的条目必须立刻消失，并说明被移除了几条。
+	session := read("?scope=session&agentId=claude-code")
+	if session.ServerCount != 1 || len(session.Servers) != 1 || session.Servers[0].Name != "github" {
+		t.Fatalf("session view should drop the disabled server, got %+v", session)
+	}
+	if !strings.Contains(session.Note, "停用") {
+		t.Fatalf("session view should explain the removal, got note %q", session.Note)
+	}
+	// 快照原来的说明是注入侧的事实，不能因为补了一条移除说明就被盖掉。
+	if !strings.Contains(session.Note, "远端 MCP 注入能力尚未探测") {
+		t.Fatalf("session view should keep the snapshot note, got %q", session.Note)
+	}
+	// 全部停用：列表清空，note 仍然解释原因（不能只说「没有」）。
+	if _, err := s.db.ExecContext(ctx, "update mcp_servers set enabled=0 where id=?", githubID); err != nil {
+		t.Fatalf("disable second server: %v", err)
+	}
+	if empty := read("?scope=session&agentId=claude-code"); empty.ServerCount != 0 || len(empty.Servers) != 0 || empty.Note == "" {
+		t.Fatalf("all disabled should yield an empty explained list, got %+v", empty)
+	}
+	// 快照属于 claude-code 的会话；同一项目的 Codex 会话不能继承它的托盘。
+	other := read("?scope=session&agentId=codex")
+	if other.ServerCount != 0 || len(other.Servers) != 0 || other.Note == "" {
+		t.Fatalf("agent mismatch should yield an empty explained list, got %+v", other)
+	}
+	// 项目级开关同样算「停用」：定义是启用的，但这个项目把它关掉了。
+	if _, err := s.db.ExecContext(ctx, "update mcp_servers set enabled=1 where id in (?,?)", fsID, githubID); err != nil {
+		t.Fatalf("re-enable servers: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, "insert into mcp_project_bindings (project_id,server_id,enabled,created_at,updated_at) values (?,?,0,?,?)",
+		projectID, githubID, time.Now().UTC(), time.Now().UTC()); err != nil {
+		t.Fatalf("disable project binding: %v", err)
+	}
+	if bound := read("?scope=session&agentId=claude-code"); bound.ServerCount != 1 || len(bound.Servers) != 1 || bound.Servers[0].Name != "fs" {
+		t.Fatalf("project-level disable must drop the server too, got %+v", bound)
+	}
+	// 未知 Agent 直接 400，而不是静默按快照返回。
+	recorder := httptest.NewRecorder()
+	request := withURLParam(httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/mcp/status?scope=session&agentId=nope", nil), "projectID", projectID)
+	s.getProjectMCPStatus(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unknown agent should be rejected, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestProjectMcpJSONServerNames(t *testing.T) {
 	dir := t.TempDir()
 	if names := projectMcpJSONServerNames(dir); len(names) != 0 {
@@ -735,4 +826,55 @@ func TestMCPDeleteServerRevokesOAuthTokens(t *testing.T) {
 			t.Errorf("密钥引用 %s 应已吊销，但仍能加载出明文", ref)
 		}
 	}
+}
+
+func TestApprovalNotificationTextShowsCommandAndHidesMCPSecrets(t *testing.T) {
+	title, detail := approvalNotificationText("Bash", json.RawMessage(`{"command":"git status","description":"查看状态"}`))
+	if title != "等待确认命令" || !strings.Contains(detail, "git status") || !strings.Contains(detail, "查看状态") {
+		t.Fatalf("bash notice = %q / %q", title, detail)
+	}
+	title, detail = approvalNotificationText("mcp__github__create_issue", json.RawMessage(`{"token":"ghp_secret","description":"开一个 issue"}`))
+	if title != "等待确认工具调用" {
+		t.Fatalf("mcp title = %q", title)
+	}
+	if strings.Contains(detail, "ghp_secret") || !strings.Contains(detail, "github · create_issue") || !strings.Contains(detail, "开一个 issue") {
+		t.Fatalf("mcp notice leaked or dropped the name: %q", detail)
+	}
+	_, detail = approvalNotificationText("Bash", json.RawMessage(`{"command":"`+strings.Repeat("a", 300)+`"}`))
+	if len([]rune(detail)) != 120 || !strings.HasSuffix(detail, "…") {
+		t.Fatalf("detail not clipped: %d %q", len([]rune(detail)), detail)
+	}
+	title, detail = approvalNotificationText("Bash", json.RawMessage(`{}`))
+	if title != "等待确认命令" || detail != "需要你确认后才能继续" {
+		t.Fatalf("empty notice = %q / %q", title, detail)
+	}
+}
+
+func TestApprovalPendingNotificationUsesApprovalIDAndClears(t *testing.T) {
+	server := newTestServer(t)
+	seedConversation(t, server, "project", "conversation")
+	server.notifyApprovalPending("conversation", "approval-1", "Bash", json.RawMessage(`{"command":"pnpm test"}`))
+
+	var id, typ, body, action, dedupe string
+	var dismissed int
+	if err := server.db.QueryRow(`select id, type, body, action_url, dedupe_key, dismissed from notifications where id=?`, "approval-1").Scan(&id, &typ, &body, &action, &dedupe, &dismissed); err != nil {
+		t.Fatalf("load notification: %v", err)
+	}
+	if typ != "approval.pending" || dismissed != 0 || dedupe != "approval:approval-1" {
+		t.Fatalf("notification = type %q dismissed %d dedupe %q", typ, dismissed, dedupe)
+	}
+	if action != "/projects/project/conversations/conversation" || !strings.Contains(body, "pnpm test") {
+		t.Fatalf("notification target/body = %q / %q", action, body)
+	}
+
+	server.dismissApprovalNotification("approval-1")
+	if err := server.db.QueryRow(`select dismissed from notifications where id=?`, "approval-1").Scan(&dismissed); err != nil {
+		t.Fatalf("reload notification: %v", err)
+	}
+	if dismissed != 1 {
+		t.Fatalf("dismissed = %d, want 1", dismissed)
+	}
+	// 再收一次不能报错，也不能把别的通知清掉。
+	server.dismissApprovalNotification("approval-1")
+	server.dismissApprovalNotification("")
 }

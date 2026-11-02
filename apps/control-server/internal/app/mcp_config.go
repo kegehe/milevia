@@ -121,7 +121,28 @@ func (inj mcpInjection) remoteJSON() string {
 // 步骤：判定目标环境 → 取该环境下启用且适用该 Agent 的定义（project 覆盖同名 global）
 // → 解析 ${PROJECT_DIR} 占位符并解密 sec_ 引用 → 序列化 → 按环境落盘（WSL 用 /mnt 形态）。
 // runner 只负责拼参数，不查库；因此这里把内容与路径一次性备好。
+// mcpInteractionIdentity 描述"这一轮要不要给 CLI 注入内置的提问 server"。
+//
+// 只在**本地 Windows** 注入：MCP 配置里的 URL 是控制服务地址，而 WSL 里的进程访问
+// 127.0.0.1 命中的是它自己的回环，SSH 远端更要经过审批隧道（隧道 URL 在 runner 侧
+// 才确定）。两处的正确解法是把隧道地址回填进配置，属于下一步；在那之前宁可没有提问，
+// 也不要注入一个连不上的 server（那会让模型每次提问都拿到连接错误）。
+type mcpInteractionIdentity struct {
+	ConversationID string
+	RunID          string
+	ApprovalToken  string
+}
+
+func (identity mcpInteractionIdentity) enabled() bool {
+	return identity.ApprovalToken != "" && (identity.ConversationID != "" || identity.RunID != "")
+}
+
+// prepareMCPInjection 保持原签名：不注入交互 server，供既有调用点与测试使用。
 func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath, agentID, runnerID, runKey string) mcpInjection {
+	return s.prepareMCPInjectionWith(ctx, projectID, projectPath, agentID, runnerID, runKey, mcpInteractionIdentity{})
+}
+
+func (s *Server) prepareMCPInjectionWith(ctx context.Context, projectID, projectPath, agentID, runnerID, runKey string, identity mcpInteractionIdentity) mcpInjection {
 	if agentID == "" {
 		agentID = "claude-code"
 	}
@@ -147,6 +168,11 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 	}
 	target := s.resolveAgentTargetEnv(runnerID, projectPath)
 	servers, err := s.selectMCPServers(ctx, projectID, agentID, target)
+	// 内置提问 server 必须**并进列表之后再判空**：否则一个没配任何 MCP 的项目
+	// （绝大多数）会在下面那条 len(servers)==0 的早退里把它一起丢掉。
+	if err == nil && identity.enabled() && target == agentTargetEnvWindows {
+		servers = append(servers, s.interactionMCPServer(identity))
+	}
 	if err != nil || len(servers) == 0 {
 		s.recordProjectMCPInjection(projectID, projectMCPStatus{
 			ProjectID:   projectID,
@@ -250,7 +276,11 @@ func (s *Server) prepareMCPInjection(ctx context.Context, projectID, projectPath
 			cwdDropped = true
 		}
 		entries[server.Name] = entry
-		injected = append(injected, describeMCPStatusServer(server))
+		// 内置提问 server 不进"已注入 server"清单：它不是用户配的，列出来只会让人
+		// 以为项目里凭空多了一条配置。
+		if server.ID != interactionServerID {
+			injected = append(injected, describeMCPStatusServer(server))
+		}
 		autoApprove = append(autoApprove, server.AutoApproveTools...)
 		for _, item := range additions {
 			name, _, found := strings.Cut(item, "=")

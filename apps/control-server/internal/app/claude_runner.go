@@ -42,6 +42,27 @@ type StreamingAgentRunner interface {
 	StartSession(context.Context, AgentSessionRequest) (AgentSession, error)
 }
 
+// errNoActiveTurn 表示会话此刻没有正在执行的回合，调用方应改为开一个新回合。
+// 它是"能不能插话"的唯一裁决依据：判定必须发生在 session 自己的锁内，否则
+// "准入已提交、prompt 还没写进 stdin"的那段窗口会被误判成空闲。
+var errNoActiveTurn = errors.New("agent session has no active turn")
+
+// SteerableAgentSession 是"回合跑到一半还能接收用户追加消息"的可选能力。
+//
+// 语义（实测 Claude Code 2.1.x，--input-format stream-json）：
+//   - 有活跃回合时，往 stdin 再写一帧 user，CLI 会在**下一次模型请求边界**
+//     （通常是当前这批工具结果返回后）把它并入上下文，模型当回合就能看到；
+//   - 它**不会**新开一个 CLI 回合，也不会产生第二个 result。
+//
+// 因此插话不建新 Run：Run 与 CLI 回合一一对应，多出来的只在 messages 里
+// 挂一条 run_id=当前 run 的用户消息。新建 Run 会让两条 sink 抢同一个进程的
+// 事件流（用量、时间线、停止语义全部失真）。
+//
+// 返回的 runID 是这条消息真正归属的 Run，调用方据此落库。
+type SteerableAgentSession interface {
+	InjectPrompt(prompt string) (runID string, err error)
+}
+
 // CodexCapableRunner is implemented by runners that can run Codex CLI in
 // addition to Claude Code (notably SSH runners, where Codex runs remotely).
 // The local WSL runner uses the standalone codexRunner instead.
@@ -201,8 +222,12 @@ func (r *claudeCLIRunner) claudeCLIConfig(context.Context) CLIConfigSnapshot {
 }
 
 type claudeCLISession struct {
-	cmd                    *exec.Cmd
-	stdin                  io.WriteCloser
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	// stdinMu 只保护 stdin 的整帧写入。首轮 prompt 与插话共用同一根管道：单帧
+	// 超过管道缓冲时 Write 会被拆成多次，若两条路径并发写，JSONL 会交错成坏行。
+	// 它不能与 session.mu 合并（插话写入时刻意不持 session.mu，见 InjectPrompt）。
+	stdinMu                sync.Mutex
 	mu                     sync.Mutex
 	current                *claudeSessionTurn
 	queued                 []*claudeSessionTurn
@@ -232,7 +257,19 @@ type claudeCLISession struct {
 	backgroundGeneration uint64
 	// backgroundTimer 是等待后台任务的兜底定时器，见 armBackgroundWaitTimer。
 	backgroundTimer *time.Timer
+
+	// pendingSteerEcho 记录"已经写进 stdin、还等着 CLI 回显"的插话文本。
+	//
+	// --replay-user-messages 会把每一帧 user 原样回显到 stdout。首轮 prompt 的
+	// 回显无妨（它本来就在事件流里），但插话的那条在平台侧已经作为一条用户消息
+	// 落库并广播了，再存成一条 user 事件就是纯噪声 —— 两处渲染、一次排障时还得
+	// 先分辨谁是本体。所以按文本 FIFO 匹配后丢弃回显。
+	pendingSteerEcho []string
 }
+
+// maxPendingSteerEcho 是回显队列的上限。正常情况下每条插话都会在下一个事件边界
+// 被回显、随即出队；上限只用来兜住"CLI 换了行为不再回显"时的内存增长。
+const maxPendingSteerEcho = 16
 
 // claudePendingResult 是"主回合已给出 result、但仍有后台任务在跑"时暂存的回合结果。
 type claudePendingResult struct {
@@ -349,16 +386,15 @@ func (r *claudeCLIRunner) Ready(parent context.Context) bool {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, r.claudeBinary(), "auth", "status")
-	configureProcessGroup(cmd)
-	return cmd.Run() == nil
+	_, err := runProbeCommand(ctx, cmd)
+	return err == nil
 }
 
 func (r *claudeCLIRunner) Version(parent context.Context) string {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, r.claudeBinary(), "--version")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	out, err := runProbeCommand(ctx, cmd)
 	if err != nil {
 		return ""
 	}
@@ -662,7 +698,7 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 		"AUTO_CONTROL_URL=" + r.config.ControlURL,
 		"AUTO_APPROVAL_RUN_ID=" + request.RunID,
 		"AUTO_APPROVAL_TOKEN=" + request.RunToken,
-	}, request.MCPEnv...))
+	}, append([]string{r.mcpToolTimeoutEnv()}, request.MCPEnv...)...))
 	if err != nil {
 		return err
 	}
@@ -765,6 +801,18 @@ func mcpTimeoutEnv(timeout time.Duration) []string {
 	return []string{fmt.Sprintf("MCP_TIMEOUT=%d", ms)}
 }
 
+// mcpToolTimeoutEnv 把 CLI 的 MCP 工具调用上限抬到「提问等待预算 + 60 秒」。
+//
+// 为什么要显式给：CLI 的默认上限未知，而且二进制里还会做一次 min/max 夹取；提问是
+// 一次会挂几分钟的工具调用，默认值一旦小于预算，模型看到的是「工具失败」而不是
+// 「用户没回答」（docs/51 §4.5）。
+func (r *claudeCLIRunner) mcpToolTimeoutEnv() string {
+	budget := r.config.UserAskTimeout
+	if budget <= 0 {
+		budget = defaultUserAskTimeout
+	}
+	return fmt.Sprintf("MCP_TOOL_TIMEOUT=%d", int((budget+time.Minute)/time.Millisecond))
+}
 func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSessionRequest) (AgentSession, error) {
 	args, err := r.sessionArgs(request)
 	if err != nil {
@@ -774,7 +822,7 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 		"AUTO_CONTROL_URL=" + r.config.ControlURL,
 		"AUTO_APPROVAL_CONVERSATION_ID=" + request.ConversationID,
 		"AUTO_APPROVAL_TOKEN=" + request.ApprovalToken,
-	}, request.MCPEnv...)
+	}, append([]string{r.mcpToolTimeoutEnv()}, request.MCPEnv...)...)
 	launchEnv = append(launchEnv, mcpTimeoutEnv(request.MCPStartupTimeout)...)
 	environment, profileArgs, closeProfile, err := r.profileLaunch(ctx, request.Profile, launchEnv)
 	if err != nil {
@@ -784,6 +832,10 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 	cmd := exec.Command(r.claudeBinary(), args...)
 	cmd.Dir = request.ProjectPath
 	cmd.Env = environment
+	// 进程退出后给 reader 最多 5 秒把管道里最后几帧（result / 最后一段 assistant）读完，
+	// 再关闭父端读管道。默认行为是 Wait 一返回就关，缓冲里的收尾事件会直接丢掉，
+	// 会话可能被误判成"完成未结束的对话轮次之前就结束"。
+	cmd.WaitDelay = agentProcessTeardownGrace
 	configureProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -813,6 +865,10 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 		initialResponseTimeout: r.config.ClaudeInitialResponseTimeout,
 		toolResultTimeout:      r.config.ClaudeToolResultTimeout,
 	}
+	// 流式会话同样放进 KILL_ON_JOB_CLOSE 的 Job Object：CLI 的 .cmd 包装器、MCP server、
+	// 后台 shell 都是它的后代，句柄一关整组结束。此前只有一次性运行接了这层保护，
+	// 流式会话在 Stop 之后仍可能留下握着管道/继续改文件的孤儿。
+	releaseTree := containAgentProcess(cmd)
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go func() { defer readers.Done(); session.readOutput(stdout) }()
@@ -825,7 +881,12 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 		}
 	}()
 	go func() {
+		defer releaseTree() // 幂等；正常路径下面会先关一次，异常路径由这里兜底
 		err := cmd.Wait()
+		// 主进程已经退出：先关 Job 回收仍活着的后裔，避免孤儿进程继续改工作区。
+		// 注意 Go 的 Cmd.Wait 会关闭父端读管道，下面等 readers 只是有界兜底，
+		// 不是"等 EOF 收完剩余输出"；最后几帧若在 Wait 前未被读走，本来就拿不到。
+		releaseTree()
 		// Defensive timeout: if reader goroutines are stuck (e.g. pipe never
 		// closed), force-unblock after a generous grace period so session
 		// cleanup is never permanently blocked.
@@ -1275,6 +1336,10 @@ func (session *claudeCLISession) readOutput(reader io.Reader) {
 			continue
 		}
 		parts, content := parseClaudeMessage(envelope.Message)
+		// 插话的回显先于 noteStreamEvent 丢弃：它在平台侧已经是一条落库的用户消息了。
+		if envelope.Type == "user" && session.consumeSteerEcho(parts, content) {
+			continue
+		}
 		session.noteStreamEvent(envelope.Type, content)
 		// 逐 token 的流式分片交给合并增量路径：**不落库、不广播**。
 		//
@@ -1618,6 +1683,9 @@ func (session *claudeCLISession) finish(err error) {
 	turns = append(turns, session.queued...)
 	session.current = nil
 	session.queued = nil
+	// 会话已死，没人会再来回显这些插话了：留着只会在下一次会话里误吞一条同文本
+	// 的真实用户消息（虽然 session 对象不复用，这条仍是最省心的收尾方式）。
+	session.pendingSteerEcho = nil
 	session.mu.Unlock()
 	for _, turn := range turns {
 		finishTurn(turn, err)
@@ -1666,26 +1734,144 @@ func (session *claudeCLISession) startCurrentLocked(turn *claudeSessionTurn) err
 			}
 		}
 	}
-	payload, err := json.Marshal(map[string]any{
-		"type":               "user",
-		"session_id":         "",
-		"parent_tool_use_id": nil,
-		"message": map[string]any{
-			"role":    "user",
-			"content": []map[string]string{{"type": "text", "text": turn.request.Prompt}},
-		},
-	})
+	payload, err := encodeClaudeUserFrame(turn.request.Prompt)
 	if err != nil {
-		return fmt.Errorf("encode Claude input: %w", err)
+		return err
 	}
-	if _, err := session.stdin.Write(append(payload, '\n')); err != nil {
-		return fmt.Errorf("write Claude input: %w", err)
+	session.stdinMu.Lock()
+	_, writeErr := session.stdin.Write(append(payload, '\n'))
+	session.stdinMu.Unlock()
+	if writeErr != nil {
+		return fmt.Errorf("write Claude input: %w", writeErr)
 	}
 	turn.waitPhase = claudeTurnWaitingInitialResponse
 	turn.lastEvent = "user_prompt"
 	turn.lastToolName = ""
 	session.startTurnTimerLocked(turn)
 	return nil
+}
+
+// encodeClaudeUserFrame 生成一帧 --input-format stream-json 的 user 输入。
+// 首轮 prompt 与回合中的插话共用同一份编码，避免两条路径悄悄长出差异。
+func encodeClaudeUserFrame(prompt string) ([]byte, error) {
+	payload, err := json.Marshal(map[string]any{
+		"type":               "user",
+		"session_id":         "",
+		"parent_tool_use_id": nil,
+		"message": map[string]any{
+			"role":    "user",
+			"content": []map[string]string{{"type": "text", "text": prompt}},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode Claude input: %w", err)
+	}
+	return payload, nil
+}
+
+// InjectPrompt 把一条用户追加消息写进正在运行的回合（SteerableAgentSession）。
+//
+// 与 Send 的唯一区别：Send 在有活跃回合时把回合排队到结束，InjectPrompt 直接写
+// stdin，让 CLI 在当前回合的下一个模型请求里带上它。实测注入点落在"当前这批
+// 工具结果返回之后"，所以模型是当回合看到、当回合调整，而不是等整轮结束。
+func (session *claudeCLISession) InjectPrompt(prompt string) (string, error) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "", errors.New("steer prompt is required")
+	}
+	payload, err := encodeClaudeUserFrame(prompt)
+	if err != nil {
+		return "", err
+	}
+
+	session.mu.Lock()
+	if session.stopped || session.stdin == nil {
+		session.mu.Unlock()
+		return "", errors.New("Claude session is not available")
+	}
+	// current == nil 有两种情况：首轮 prompt 还没写进去，或者上一轮已经收尾。
+	// 两种都不该在这里硬写 —— 前者会插到首轮 prompt 前面，后者会变成一条没有
+	// 回合归属的消息。交回调用方走正常的 startMessage。
+	if session.current == nil {
+		session.mu.Unlock()
+		return "", errNoActiveTurn
+	}
+	// pendingResult 非空 = 主回合的 result 已经收到、正在等后台任务回报。此时 CLI
+	// 已经处在两个回合之间，再写一帧会被它当成**新的一回合**，而事件仍会落到这个
+	// 还没收尾的回合的 sink 上。这段时间可达数分钟（后台任务），必须显式排除：
+	// 交回调用方开新 Run，由 Send 排队到本轮真正结束之后。
+	if session.pendingResult != nil {
+		session.mu.Unlock()
+		return "", errNoActiveTurn
+	}
+	runID := session.current.request.RunID
+	stdin := session.stdin
+	// 回显登记必须早于写入：CLI 可能在 Write 返回之前就把这一帧回显出来。
+	echoTracked := false
+	if len(session.pendingSteerEcho) < maxPendingSteerEcho {
+		session.pendingSteerEcho = append(session.pendingSteerEcho, prompt)
+		echoTracked = true
+	}
+	session.mu.Unlock()
+
+	// 写 stdin 刻意不持 session.mu。CLI 在工具执行期间不读 stdin（实测：中途写入的帧
+	// 要到工具结果返回后才被消费），管道写满时 Write 会一直阻塞；若此时还握着
+	// session.mu，读 stdout 的 goroutine 就进不了 emit 的锁，CLI 随即卡在写 stdout
+	// 上 —— 整条会话死锁。但整帧写入必须用独立的 stdinMu 与首轮 prompt 串行：
+	// 一帧超过管道缓冲（Windows 4KB）时 Write 会被拆成多次，与下一轮的帧交错就是
+	// 一行坏 JSONL，两轮内容都会丢。
+	session.stdinMu.Lock()
+	_, err = stdin.Write(append(payload, '\n'))
+	session.stdinMu.Unlock()
+	if err != nil {
+		if echoTracked {
+			session.dropSteerEcho(prompt)
+		}
+		return "", fmt.Errorf("write Claude steering input: %w", err)
+	}
+	// 回合状态机不因插话而改变：CLI 仍会先跑完手上的工具、再在下一个请求里带上
+	// 这条消息，随后照常产出 assistant/result。计时器由下一条事件自然重置，这里
+	// 既不动 waitPhase 也不重新 arm —— 动了会把"正在等工具结果"错标成新回合。
+	//
+	// 残留竞态（不可消除）：CLI 已经写出 result、我们的 read loop 还没读到的那几毫秒里，
+	// current 仍非空，这一帧会被当成下一回合的开头。后果是良性的 —— 新回合的事件经
+	// emit 的 lastTurnSink 兜底仍落在同一个 run 上，它的 result 遇到 current==nil 是
+	// 空操作，不会二次收尾、也不会丢消息。想彻底消除只能让 CLI 在协议层告诉我们
+	// "回合已结束"，目前没有这个信号。
+	return runID, nil
+}
+
+// dropSteerEcho 在写入失败时撤销回显登记：这一帧根本没到 CLI，留着只会让下一个
+// 回合里一条同文本的真实消息被当成回显丢掉。
+func (session *claudeCLISession) dropSteerEcho(prompt string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for index, text := range session.pendingSteerEcho {
+		if text == prompt {
+			session.pendingSteerEcho = append(session.pendingSteerEcho[:index], session.pendingSteerEcho[index+1:]...)
+			return
+		}
+	}
+}
+
+// consumeSteerEcho 判断这条 user 事件是不是我们插话的回显，是则出队并丢弃。
+//
+// 只认纯文本且文本与队首完全一致：工具结果同样是 user 事件，绝不能被吞掉。
+func (session *claudeCLISession) consumeSteerEcho(parts []string, content json.RawMessage) bool {
+	if len(parts) == 0 || claudeToolResult(content) {
+		return false
+	}
+	text := strings.TrimSpace(strings.Join(parts, "\n"))
+	if text == "" {
+		return false
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if len(session.pendingSteerEcho) == 0 || strings.TrimSpace(session.pendingSteerEcho[0]) != text {
+		return false
+	}
+	session.pendingSteerEcho = session.pendingSteerEcho[1:]
+	return true
 }
 
 func (session *claudeCLISession) startTurnTimerLocked(turn *claudeSessionTurn) {

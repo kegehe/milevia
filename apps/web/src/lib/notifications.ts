@@ -11,6 +11,8 @@ export interface NotificationEvent {
   durationMs?: number;
   conversationId?: string;
   taskId?: string;
+  /** 命令审批的 id。实时推送会带上；历史重放没有这一列时，通知 id 就是它。 */
+  approvalId?: string;
   title: string;
   body: string;
   priority: "high" | "normal" | "low";
@@ -88,11 +90,49 @@ export function isWithinQuietHours(now: Date, start: string, end: string): boole
     : currentMinutes >= startMinutes || currentMinutes < endMinutes;
 }
 
-/** 需要弹 Windows 系统通知的类型：仅“任务完成 / 等待审查”这类已完成语义。
- * 弹窗标题直接取事件 title（“任务已完成 / 任务等待审查”），因此只匹配完成类事件；
- * 需要处理的（action_required、needs_human 等）仍走应用内提醒，避免文字与事件含义不符。 */
+/** 窗口不在前台时要弹 Windows 通知的种类。
+ * result：任务完成 / 等待审查，短时弹窗，点正文打开会话。
+ * interrupt：需要人处理（提问、任务需要处理、编排卡住），留在屏幕上直到点掉。
+ * approval：命令审批。除了留在屏幕上，还带允许 / 拒绝。 */
+export function windowsToastKind(type: string): "result" | "interrupt" | "approval" | null {
+  if (type === "task.done" || type === "task.awaiting_review") return "result";
+  if (type === "approval.pending") return "approval";
+  if (type === "task.action_required" || type === "orchestration.needs_human" || type === "ask.pending") return "interrupt";
+  return null;
+}
+
 export function isWindowsNotifyType(type: string): boolean {
-  return type === "task.done" || type === "task.awaiting_review";
+  return windowsToastKind(type) !== null;
+}
+
+/** 命令审批的 id。实时事件带 approvalId；数据库重放的历史通知用通知 id（两者被写成同一个）。 */
+export function approvalIDFromNotification(event: { type: string; id?: string; approvalId?: string }): string {
+  if (event.type !== "approval.pending") return "";
+  return (event.approvalId || event.id || "").trim();
+}
+
+/** 弹窗上的按钮。只有命令审批能在通知上直接裁决，顺序与会话里的横幅一致：拒绝在前。 */
+export function windowsToastActions(event: { type: string; id?: string; approvalId?: string }): { label: string; action: "allow" | "deny" }[] {
+  if (!approvalIDFromNotification(event)) return [];
+  return [
+    { label: "拒绝", action: "deny" },
+    { label: "允许", action: "allow" },
+  ];
+}
+
+/** 需要人马上处理的弹窗不自己消失。完成类仍是短时提示。 */
+export function windowsToastSticky(type: string): boolean {
+  const kind = windowsToastKind(type);
+  return kind === "approval" || kind === "interrupt";
+}
+
+const WINDOWS_TOAST_DETAIL_TYPES = new Set(["approval.pending", "orchestration.needs_human", "ask.pending"]);
+
+function toastDetail(body: string): string {
+  const text = body.replace(/\s+/g, " ").trim();
+  const runes = [...text];
+  if (runes.length <= 140) return text;
+  return `${runes.slice(0, 139).join("")}…`;
 }
 
 /** 毫秒 → 人类可读耗时（Windows 弹窗第三行）。
@@ -109,16 +149,18 @@ export function formatDurationMs(durationMs: number): string {
   return restMinutes > 0 ? `${hours} 小时 ${restMinutes} 分钟` : `${hours} 小时`;
 }
 
-/** Windows 系统弹窗的三行内容（方案A分层完整版）。
- * 判据只此一份：标题=事件 title（语义与类型匹配由 isWindowsNotifyType 保证）；
- * 第二行「项目「X」· 任务Y」直接消费服务端的 projectName/taskTitle 字段；
- * 第三行耗时消费服务端 durationMs，缺失或为 0 时省略整行（不猜、不编）。
+/** Windows 系统弹窗的三行内容。
+ * 标题=事件 title；第二行「项目「X」· 任务Y」消费服务端的 projectName/taskTitle；
+ * 第三行优先是耗时。审批、提问、编排卡住没有耗时，第三行改用正文（命令、问题或原因）。
  * 各行都可能为空串，Rust 侧按空串跳过对应行。 */
-export function windowsToastLines(event: Pick<NotificationEvent, "title" | "projectName" | "taskTitle" | "durationMs">): { title: string; line1: string; line2: string } {
+export function windowsToastLines(event: Pick<NotificationEvent, "title" | "projectName" | "taskTitle" | "durationMs" | "type" | "body">): { title: string; line1: string; line2: string } {
   const taskTitle = (event.taskTitle ?? "").trim();
   const projectName = (event.projectName ?? "").trim();
   const line1 = projectName && taskTitle ? `项目「${projectName}」· ${taskTitle}` : taskTitle || (projectName ? `项目「${projectName}」` : "");
-  const line2 = event.durationMs && event.durationMs > 0 ? formatDurationMs(event.durationMs) : "";
+  const duration = event.durationMs && event.durationMs > 0 ? formatDurationMs(event.durationMs) : "";
+  // 完成类没有耗时时留空，不拿正文去填——正文常常是标题的另一种说法。
+  // 审批、提问、编排卡住的正文才是人要看的那一句（命令、问题、原因）。
+  const line2 = duration || (WINDOWS_TOAST_DETAIL_TYPES.has(event.type) ? toastDetail(event.body ?? "") : "");
   return { title: event.title, line1, line2 };
 }
 

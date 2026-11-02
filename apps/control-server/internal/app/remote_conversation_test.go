@@ -28,8 +28,8 @@ import (
 func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	server := &Server{}
 	operations := server.remoteConversationOperations()
-	if len(operations) != 6 {
-		t.Fatalf("conversation operation count = %d, want 6", len(operations))
+	if len(operations) != 11 {
+		t.Fatalf("conversation operation count = %d, want 11", len(operations))
 	}
 	list, ok := operations["conversation.list"]
 	if !ok || list.Method != http.MethodGet || list.Scope != relayScopeProject || list.Path != "/conversations" || !list.Query || list.Handle == nil {
@@ -88,6 +88,26 @@ func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	}
 	if len(rewind.PathParams) != 0 {
 		t.Errorf("conversation.rewind pathParams = %v, want none（节点 id 走请求体）", rewind.PathParams)
+	}
+	usage, ok := operations["conversation.usage"]
+	if !ok || usage.Method != http.MethodGet || usage.Scope != relayScopeConversation || usage.Path != "/usage" || usage.Handle == nil {
+		t.Fatalf("conversation.usage = %#v, want the desktop usage endpoint", usage)
+	}
+	models, ok := operations["conversation.models"]
+	if !ok || models.Method != http.MethodGet || models.Scope != relayScopeConversation || models.Path != "/models" || models.Handle == nil {
+		t.Fatalf("conversation.models = %#v, want the desktop model catalog", models)
+	}
+	model, ok := operations["conversation.model"]
+	if !ok || model.Method != http.MethodPost || model.Scope != relayScopeConversation || model.Path != "/model" || model.Query || model.Handle == nil {
+		t.Fatalf("conversation.model = %#v, want the desktop model override endpoint", model)
+	}
+	permission, ok := operations["conversation.permissionMode"]
+	if !ok || permission.Method != http.MethodPost || permission.Scope != relayScopeConversation || permission.Path != "/permission-mode" || permission.Query || permission.Handle == nil {
+		t.Fatalf("conversation.permissionMode = %#v, want the desktop permission endpoint", permission)
+	}
+	handoff, ok := operations["conversation.handoff"]
+	if !ok || handoff.Method != http.MethodPost || handoff.Scope != relayScopeConversation || handoff.Path != "/handoff" || handoff.Query || handoff.Handle == nil {
+		t.Fatalf("conversation.handoff = %#v, want the desktop context handoff endpoint", handoff)
 	}
 }
 
