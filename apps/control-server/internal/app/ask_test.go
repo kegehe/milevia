@@ -399,3 +399,51 @@ func TestAskExemptFromApprovalHook(t *testing.T) {
 		t.Fatalf("不应产生 ask 事件：%v", types)
 	}
 }
+
+// 回归（docs/51 §4.6 的竞态）：作答与超时同一瞬间时，beginAsk 的 select 可能走超时分支，
+// 此时 settleAsk 落空、答案由 drainSettledOutcome 读走 —— 终态事件必须在这里补落，
+// 否则模型已经拿到答案继续跑，时间线却停在「等待你的回答」。
+func TestAskSettledOutcomeRecordsTerminalEvent(t *testing.T) {
+	server := newTestServer(t)
+	runID := seedConversation(t, server, "project", "conversation")
+
+	waiter := &askWaiter{
+		askID:          "ask-drain-answered",
+		runID:          runID,
+		conversationID: "conversation",
+		questions:      askFixtureQuestions(),
+		result:         make(chan askOutcome, 1),
+	}
+	// 模拟 answerAsk 已经跑完：waiter 从表里摘掉（settleAsk 因此必然落空），答案投进通道。
+	waiter.result <- askOutcome{status: askStatusAnswered, answers: map[string]string{"q1": "SQLite"}}
+
+	outcome := server.drainSettledOutcome(waiter, askStatusExpired)
+	if outcome.status != askStatusAnswered {
+		t.Fatalf("outcome = %q, want answered（不能把用户的答案丢掉）", outcome.status)
+	}
+	if types := askEventTypes(t, server, "conversation"); len(types) != 1 || types[0] != "ask.answered" {
+		t.Fatalf("event sequence = %v, want [ask.answered]", types)
+	}
+}
+
+// 走 fallback（裁决方摘了 waiter 但 50ms 内没投递结果）时也要落终态：
+// 返回给模型什么状态，时间线就记什么状态，不能让卡片悬空。
+func TestAskDrainFallbackRecordsTerminalEvent(t *testing.T) {
+	server := newTestServer(t)
+	runID := seedConversation(t, server, "project", "conversation")
+
+	waiter := &askWaiter{
+		askID:          "ask-drain-cancelled",
+		runID:          runID,
+		conversationID: "conversation",
+		questions:      askFixtureQuestions(),
+		result:         make(chan askOutcome, 1),
+	}
+	outcome := server.drainSettledOutcome(waiter, askStatusCancelled)
+	if outcome.status != askStatusCancelled {
+		t.Fatalf("outcome = %q, want cancelled", outcome.status)
+	}
+	if types := askEventTypes(t, server, "conversation"); len(types) != 1 || types[0] != "ask.cancelled" {
+		t.Fatalf("event sequence = %v, want [ask.cancelled]", types)
+	}
+}

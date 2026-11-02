@@ -60,7 +60,7 @@ test("the reference is expanded only at send time, and both ends agree on the te
   // 先由 withQuoteBlock 拼成「引用块 + 正文」，再交给 composeSkillMessage 加技能指令。
   // 顺序因此严格是 **技能 → 引用 → 正文**：技能那段文案仍由 composeSkillMessage 唯一生成
   // （在调用点重拼一次就等于把"两端逐字一致"那道闸门交给两个人守）。
-  assert.match(mobilePage, /const content = composeSkillMessage\(withQuoteBlock\(draft, quoteRef\), skillRefs\);/);
+  assert.match(mobilePage, /const content = composeSkillMessage\(withQuoteBlock\(draft, quote\), refs\);/);
   assert.match(mobilePage, /function withQuoteBlock\(text: string, quote: MessageQuote \| null\): string \{/);
   // 引用块的行前缀：**空行也要带 ">"**（markdown 把空行当作引用结束，不补就会被拆成两截）。
   assert.match(mobilePage, /return body\.split\("\\n"\)\.map\(\(line\) => \(line \? `> \$\{line\}` : ">"\)\)\.join\("\\n"\);/);
@@ -74,7 +74,7 @@ test("every write-back path keeps the draft and the reference separate", () => {
   assert.match(conversationPage, /const draft = rawContent\.trim\(\);/);
   assert.match(conversationPage, /setComposerText\(draft, conversationID\);\s*setSkillRefs\(refs\);/s);
   // 手机端失败回填：正文与引用一起还回去，且都带"用户已经打了新的字就不覆盖"的守卫。
-  assert.match(mobilePage, /setMessageDraft\(\(current\) => current\.trim\(\) \? current : draft\);\s*setSkillRefs\(\(current\) => current\.length > 0 \? current : skillRefs\);/s);
+  assert.match(mobilePage, /setMessageDraft\(\(current\) => current\.trim\(\) \? current : draft\);\s*setSkillRefs\(\(current\) => current\.length > 0 \? current : refs\);/s);
   // 撤回 / 上箭头重发恢复的是"用户自己写的东西"，不是拼好的上线文本。
   assert.match(conversationPage, /pendingUserDrafts\.current\.set\(data\.runId, draft\)/);
   assert.match(conversationPage, /if \(draft\) appendInputHistory\(draft\);/);

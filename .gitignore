@@ -18,6 +18,8 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+# 前端测试输出（根目录 web-test.log 曾经被误提交；机器本地路径与乱码都在里面）
+/web-test.log
 
 # Go build output
 bin/

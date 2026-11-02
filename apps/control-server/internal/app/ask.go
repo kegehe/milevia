@@ -153,12 +153,20 @@ func (s *Server) beginAsk(ctx context.Context, conversationID, runID string, que
 
 // drainSettledOutcome 处理"超时/取消与作答同时发生"的竞态：裁决方刚把 waiter 摘掉并
 // 写进通道，这里必须把那个结果读出来，不能丢掉用户的答案。
+//
+// ⚠️ 终态事件必须在这里补落。裁决方（answerAsk / resolveRunAsks）只负责摘 waiter 与
+// 投递结果，谁摘到 waiter 谁落事件；一旦 beginAsk 的 select 同时命中超时分支，settleAsk
+// 会落空、结果又被这里读走 —— 事件就一条都没有，卡片永久停在"等待你的回答"，而模型其实
+// 已经拿到答案继续跑了。走 fallback 时同样要落，返回给模型什么状态，时间线就记什么状态。
 func (s *Server) drainSettledOutcome(waiter *askWaiter, fallback string) askOutcome {
 	select {
 	case outcome := <-waiter.result:
+		s.appendAskTerminal(waiter, outcome)
 		return outcome
 	case <-time.After(50 * time.Millisecond):
-		return askOutcome{status: fallback}
+		outcome := askOutcome{status: fallback}
+		s.appendAskTerminal(waiter, outcome)
+		return outcome
 	}
 }
 

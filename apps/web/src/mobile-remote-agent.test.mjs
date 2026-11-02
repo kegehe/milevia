@@ -10,6 +10,7 @@ const normalize = (text) => text.replace(/\r\n/g, "\n");
 const page = normalize(await readFile(new URL("./pages/MobileRemotePage.tsx", import.meta.url), "utf8"));
 const mobileNotificationProvider = normalize(await readFile(new URL("./components/MobileRemoteProvider.tsx", import.meta.url), "utf8"));
 const mobileNotificationDelivery = normalize(await readFile(new URL("./features/remote/mobile-notification-delivery.ts", import.meta.url), "utf8"));
+const mobileSessionControls = normalize(await readFile(new URL("./features/remote/mobile-session-controls.ts", import.meta.url), "utf8"));
 const mobileEventStream = normalize(await readFile(new URL("./features/remote/use-mobile-remote-event-stream.ts", import.meta.url), "utf8"));
 const styles = normalize(await readFile(new URL("./pages/mobile-remote.css", import.meta.url), "utf8"));
 // 设备表（多设备 + 备注名）那一层。这里只做**结构/接线**断言：`alias` 是不是走同一处归一化、
@@ -368,10 +369,10 @@ test("mobile + panel mirrors the desktop shortcut library instead of hardcoded p
   assert.match(page, /const draft = messageDraft\.trim\(\);/);
   // 2026-09-20 起 content 先过 withQuoteBlock（「引用某条消息」的引用块），再交给
   // composeSkillMessage 加技能指令 —— 所以顺序严格是 技能 → 引用 → 正文。
-  assert.match(page, /const content = composeSkillMessage\(withQuoteBlock\(draft, quoteRef\), skillRefs\);/);
+  assert.match(page, /const content = composeSkillMessage\(withQuoteBlock\(draft, quote\), refs\);/);
   // 引用与技能同一条生命周期：发送时一起清、失败时一起还回来、切会话一起清掉。
   assert.match(page, /setSkillRefs\(\[\]\);\s*setQuoteRef\(null\);/);
-  assert.match(page, /setQuoteRef\(\(current\) => current \?\? quoteRef\);/);
+  assert.match(page, /setQuoteRef\(\(current\) => current \?\? quote\);/);
   // 引用块的行前缀：逐行加 "> "，**空行也要带 ">"**（markdown 把空行当引用结束，
   // 不补的话一段带空行的长引用会被拆成「引用 + 普通段落」两截）。
   // 这条与超长引用的截断声明一起守"发出去的到底是什么"。
@@ -382,7 +383,7 @@ test("mobile + panel mirrors the desktop shortcut library instead of hardcoded p
   assert.match(page, /function closeMessageActions\(\) \{[\s\S]*?setMessageCopyState\("idle"\);\s*setMessageActionId\(""\);\s*\}/);
   // 正文与引用**一起**回填，且都走"用户已经打了字就不覆盖"的守卫形式 —— 命令没发出去
   // 时把正文还回去、把技能胶囊还回去，两件事必须成对出现。
-  assert.match(page, /setMessageDraft\(\(current\) => current\.trim\(\) \? current : draft\);\s*setSkillRefs\(\(current\) => current\.length > 0 \? current : skillRefs\);/s);
+  assert.match(page, /setMessageDraft\(\(current\) => current\.trim\(\) \? current : draft\);\s*setSkillRefs\(\(current\) => current\.length > 0 \? current : refs\);/s);
   assert.doesNotMatch(page, /setMessageDraft\(content\)/);
   // 胶囊本体：可删除的 × 必须在，且视觉 28px + ::after 外扩到 44 的触控热区。
   // 容器用 role="group" 而不是 role="list"：这一行里除了胶囊还有一句提示文字，
@@ -736,7 +737,7 @@ test("mobile message bubbles reveal an icon action row instead of opening a shee
     assert.match(failBlock, /if \(lastQuote\) setQuoteRef\(\(current\) => current \?\? lastQuote\);/);
   }
   // 入队那一刻就把 quote 存进队列（它是"失败时要还回去的东西"的清单，不能只存 draft）。
-  assert.match(page, /queue\.push\(\{ requestId: clientRequestId, content, createdAt, draft, quote: quoteRef \}\);/);
+  assert.match(page, /queue\.push\(\{ requestId: clientRequestId, content, createdAt, draft, quote \}\);/);
 
   // ⑨ 收起与焦点：点图标行之外的任何地方、按 Esc 都收（顶栏 ⋯ 菜单同一套：document 上的
   //    pointerdown + closest，**不铺透明遮罩** —— 遮罩虽然也能"点外部收起"，但它是 inset:0
@@ -2418,7 +2419,12 @@ test("mobile timeline carries run status notices alongside messages", () => {
   //
   // 解析必须来自桌面时间线同一份实现：两边各写一套枚举，就会出现电脑上说
   // 「第 2/5 次重试：服务过载」、手机上是另一套说法，改了一处另一处悄悄对不上。
-  assert.match(page, /import \{ systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval \} from "\.\.\/lib\/timeline";/);
+  // 解析仍必须来自桌面时间线同一份实现。2026-11 起审批/提问的解析收口进
+  // features/remote/mobile-session-controls（页面只消费它的输出），所以这里锁两件事：
+  // 页面没有自己再造一套 approval 解析、而那份模块用的确实是 timeline 的 getApproval。
+  assert.match(page, /import \{ systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic \} from "\.\.\/lib\/timeline";/);
+  assert.match(page, /import \{ askFromNotice, interactiveNotice, pendingApproval,/);
+  assert.match(mobileSessionControls, /import \{ getApproval, getAskEvent \} from "\.\.\/\.\.\/lib\/timeline";/);
   // 断言锁在 applyRealtimeEvent 函数体内：只在模块里定义解析函数、实时路径不调用，
   // 手机上依旧什么都看不到（这正是改坏时的表现）。
   const realtimeBody = page.match(/const applyRealtimeEvent = useCallback\(\(raw: MessageEvent\): boolean => \{[\s\S]*?\n  \}, \[\]\);/)?.[0] ?? "";
@@ -2460,7 +2466,7 @@ test("mobile keeps run status notices across snapshot refreshes", () => {
   // 归并模块独立测试覆盖「已进入快照的记录从本地表移除」与 replace 型记录保留的行为；
   // 页面只负责把当前的 pending ref 接入该模块。
   assert.match(page, /mergeSnapshotNotices\(merged, pendingNoticesRef\.current, noticesFromSnapshot, mergeNotices\)/);
-  assert.match(page, /if \(\(Date\.parse\(notice\.createdAt\) \|\| 0\) < \(Date\.parse\(existing\.createdAt\) \|\| 0\)\) return current;/);
+  assert.match(page, /const incomingWins = \(Date\.parse\(notice\.createdAt\) \|\| 0\) >= \(Date\.parse\(existing\.createdAt\) \|\| 0\);/);
   // 实例切换要清空：另一个实例里恰好同 id 的会话不该继承上一台的记录。
   assert.match(page, /pendingNoticesRef\.current\.clear\(\);/);
 });
@@ -2524,7 +2530,9 @@ test("mobile aggregates CLI stderr into one notice and keeps the newest tool con
   assert.match(page, /const output = cliOutputDiagnostic\(\[message\]\);/);
   assert.match(page, /id: `stderr:\$\{runId \|\| createdAt\}`/);
   assert.match(page, /variant: "error", title: output\.title, detail: output\.detail, merge: "append"/);
-  assert.match(page, /id: `approval:\$\{approval\.approvalId\}`/);
+  // 工具确认与提问的解析 2026-11 起收口在 mobile-session-controls，页面只调用 interactiveNotice。
+  // 语义不变：同一个 approvalId 只留一条（replace），id 仍带 approval: 前缀便于定位与回填。
+  assert.match(mobileSessionControls, /id: `approval:\$\{approval\.approvalId\}`/);
   assert.match(page, /merge: "replace",/);
   // 两种语义必须在 appendNotice 里真的落地（只写在类型注释里等于没实现）。
   const appendBody = page.match(/function appendNotice\(notices: RemoteNotice\[\] \| undefined, notice: RemoteNotice\): RemoteNotice\[\] \{[\s\S]*?\n\}/)?.[0] ?? "";
@@ -2538,20 +2546,22 @@ test("mobile aggregates CLI stderr into one notice and keeps the newest tool con
   assert.ok(snapshotBody, "找不到 noticesFromSnapshot");
   assert.match(snapshotBody, /if \(notice\) items = appendNotice\(items, notice\);/);
   // 超时/中止不能被显示成"还在等确认"：状态取事件类型后缀，而不是 getApproval 归一化后的 status。
-  assert.match(page, /const resolution = type\.slice\("approval\."\.length\);/);
-  assert.match(page, /timeout: \{ title: "工具确认超时", state: "failed" \}/);
-  assert.match(page, /deny: \{ title: "工具已拒绝", state: "failed" \}/);
-  assert.match(page, /title: label\.title,/);
-  assert.match(page, /resolution === "pending" \? `\$\{detail\} · 请在电脑上确认` : detail/);
+  assert.match(mobileSessionControls, /const resolution = type\.slice\("approval\."\.length\);/);
+  // 四种终态各自的标题与配色：allow 绿、deny/timeout 红、pending 才算"等待"。
+  assert.match(mobileSessionControls, /resolution === "deny" \? "工具已拒绝" : resolution === "timeout" \? "工具确认超时"/);
+  assert.match(mobileSessionControls, /state: pending \? "info" : resolution === "allow" \? "success" : resolution === "deny" \|\| resolution === "timeout" \? "failed" : "info"/);
+  // pending 时只能写"等待工具确认"，不许提前给出结论。
+  assert.match(mobileSessionControls, /title: pending \? "等待工具确认"/);
   // 桌面端的 CLI 输出聚合规则与手机端共用同一份实现。
-  assert.match(page, /import \{ systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic, getApproval \}/);
+  assert.match(page, /import \{ systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic \} from "\.\.\/lib\/timeline";/);
 });
 
 test("the snapshot replays tool confirmations so a stuck run is visible after reopening", async () => {
   // 契约跨层：手机端把 approval 卡片解析出来了，但快照若不回放 approval 事件，
   // 用户重进页面就只看到"运行中"却不知道卡在等确认。这条断言锁住后端的取数条件。
   const remote = await readFile(new URL("../../../apps/control-server/internal/app/remote_control.go", import.meta.url), "utf8");
-  assert.match(remote, /const remoteNoticeTypesSQL = `type in \('system','run\.failed','run\.interrupted','error','turn\.failed','stream\.error'\) or type like 'approval\.%'`/);
+  // 提问事件必须一起回放：否则重进页面时卡片消失，而电脑端还在等答案。
+  assert.match(remote, /const remoteNoticeTypesSQL = `type in \('system','run\.failed','run\.interrupted','error','turn\.failed','stream\.error'\) or type like 'approval\.%' or type like 'ask\.%'`/);
   // 取数条件从"只有类型表"变成了类型表 + 排除空转子类型：快照的窗口是定长的，而 CLI 每几秒
   // 一条 {"status":"requesting","subtype":"status"} 会把 24 格占满（实测只剩 4~10 格是真卡片），
   // 一张"后台任务启动"卡片几分钟就被挤出去。所以这里必须锁到**新**的谓词上。
@@ -3340,8 +3350,14 @@ test("mobile conversation creation and message send never wait for the desktop",
   const sendBody = page.match(/async function sendConversationMessage\(event: FormEvent\) \{[\s\S]*?\n  \}\n/)?.[0] ?? "";
   assert.ok(sendBody, "找不到 sendConversationMessage");
   assert.doesNotMatch(sendBody, /setBusy\(/);
-  assert.match(sendBody, /if \(isPendingConversationID\(conversationID\)\) \{/);
-  assert.match(sendBody, /deferredMessagesRef\.current\.set\(conversationID, queue\);/);
+  // 投递本体（含"没有真 id 就排队"那条分支）2026-11 挪进 deliverConversationMessage：
+  // 直发、待建会话补发、预约发送共用同一条路径。断言跟着走，语义仍是排队而不是丢掉。
+  assert.match(sendBody, /await deliverConversationMessage\(conversation/);
+  const deliverBody = page.match(/async function deliverConversationMessage\(target: RemoteConversation,[\s\S]*?\n  \}\n/)?.[0] ?? "";
+  assert.ok(deliverBody, "找不到 deliverConversationMessage");
+  assert.doesNotMatch(deliverBody, /setBusy\(/);
+  assert.match(deliverBody, /if \(isPendingConversationID\(conversationID\)\) \{/);
+  assert.match(deliverBody, /deferredMessagesRef\.current\.set\(conversationID, queue\);/);
 
   // ⑥ 「没拿到终态」（null）那一支**不许**撤气泡、不许回填输入框 —— 与任务那三条同一套策略。
   const dispatchBody = page.match(/async function dispatchConversationMessage\([\s\S]*?\n  \}\n/)?.[0] ?? "";
@@ -3911,7 +3927,8 @@ test("mobile conversation can actually be stopped from the composer", () => {
   // 少了它，在 A 上点了停止再切到也在跑的 B，B 的停止键会显示「停止中」并被禁掉好几秒。
   // 换会话时无条件复位这组"我刚才对屏幕上这条会话做的动作"：少一个，"关于 A"的确认框就会
   // 浮在 B 上（回退那颗也一样 —— 它同样会把电脑端的工作区按 A 的节点改回去）。
-  assert.match(page, /useEffect\(\(\) => \{ setStoppingConversation\(false\); setStopConfirmTarget\(""\); setRewindTarget\(null\); \}, \[conversation\?\.id\]\);/);
+  // 换会话必须清掉"停止中"与确认框；2026-11 起同一 effect 还挂了交接 / 面板复位。
+  assert.match(page, /useEffect\(\(\) => \{\s*setStoppingConversation\(false\);\s*setStopConfirmTarget\(""\);\s*setRewindTarget\(null\);[^}]*\}, \[conversation\?\.id\]\);/);
   // 兜底放开：上面那两条都是"别人来摘"，而 processingConversations 里那条乐观记录是有可能
   // 清不掉的（还有待确认的消息时对账会跳过它）—— 没有这一条，按钮就可能永远禁着。
   assert.match(page, /const conversationStopFallbackMs = 60_000;/);

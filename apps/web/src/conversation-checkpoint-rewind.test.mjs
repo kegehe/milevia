@@ -109,7 +109,9 @@ test("手机端的回退入口在消息 ⋯ 菜单里，且破坏性动作要有
   // 漏掉这一句，返回键会一路退掉会话层，而「确认回退」仍可点）。
   assert.match(mobilePage, /if \(rewindTarget\) \{ setRewindTarget\(null\); return true; \}/);
   // 换会话时无条件复位：它挂在"我刚才看的那条会话"上。
-  assert.match(mobilePage, /useEffect\(\(\) => \{ setStoppingConversation\(false\); setStopConfirmTarget\(""\); setRewindTarget\(null\); \}, \[conversation\?\.id\]\);/);
+  // 复位语义不变（换会话就无条件复位）；2026-11 起同一个 effect 里还挂了交接 / 面板
+  // 的复位，断言只要求这三句都在、且仍挂在 [conversation?.id] 上，不锁死中间的行。
+  assert.match(mobilePage, /useEffect\(\(\) => \{\s*setStoppingConversation\(false\);\s*setStopConfirmTarget\(""\);\s*setRewindTarget\(null\);[^}]*\}, \[conversation\?\.id\]\);/);
   // 回退走中继上那条与桌面端同形的端点，只发 mode（"从节点分支"是电脑端才有的动作）。
   assert.match(mobilePage, /rpcTransport\("conversation\.rewind", \{ checkpointId: target\.id, mode: request\.mode \}, checkpointRewindRPCTimeoutMs\)/);
   // 回退改了电脑端的工作区与对话：必须重读权威快照，否则手机端还停在旧内容上。
