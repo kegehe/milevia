@@ -115,17 +115,21 @@ type AgentCatalogEntry struct {
 	MCPInjection string `json:"mcpInjection"`
 
 	// ── 能力开关（界面据此渲染，不在前端另写一遍）────────────────────
-	// SupportsLogin 表示平台可以在管理页发起该工具自己的登录流程（浏览器授权/D 码）。
-	// 仅录入目录、接收登录动作；真正的登录执行器在 agent_login.go（阶段 2）。
+	// SupportsLogin 表示管理页提供原生授权流程或目标终端的可操作登录指引。
 	SupportsLogin bool `json:"supportsLogin"`
+	// 查询认证与启动授权分别声明，避免只有终端登录入口的工具无法查询状态。
+	SupportsAuthStatus bool   `json:"supportsAuthStatus"`
+	AuthStatusKind     string `json:"-"`
 	// LoginArgs 是兜底登录指引里的子命令参数（如 `auth login`）。
 	// 只有无头环境无法驱动 TUI 的工具才需要它；能自行发起登录的 runner 不读这里。
 	LoginArgs []string `json:"-"`
 	// AuthStatusArgs 是查询登录态的目录命令（如 `auth list`）。跨端 backend 用它
-	// 在目标环境执行；为空表示该工具没有可用的非交互登录态查询。
+	// 在目标环境执行；未登记命令或协议时才无法非交互查询。
 	AuthStatusArgs []string `json:"-"`
+	// AuthStatusProtocol 为需要请求/响应握手的认证查询协议，优先于单次命令。
+	AuthStatusProtocol string `json:"-"`
 	// AuthStatusEmptyMarkers 是 AuthStatusArgs 输出里表示“没有凭据”的片段。
-	// 命中任意一条即判为未登录；不命中且命令成功才判为已登录。
+	// 仅供没有专用解析器的旧命令识别明确未登录；不命中时不能推断已登录。
 	AuthStatusEmptyMarkers []string `json:"-"`
 	// RunnableInProject 表示平台已实现该工具的 AgentRunner，可在项目对话中真正运行。
 	// 未接通前为 false：管理页照常展示与安装，但新建会话不会把它列为可用 agent。
@@ -160,7 +164,7 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		NpmPackage:        "@anthropic-ai/claude-code",
 		CommandName:       "claude",
 		BinPath:           "bin/claude.exe",
-		MinRuntimeVersion: "18.0.0",
+		MinRuntimeVersion: "22.0.0",
 		Readiness:         readinessVersion,
 		VersionArgs:       []string{"--version"},
 		SupportsInstall:   true,
@@ -172,8 +176,13 @@ var agentCatalogEntries = []AgentCatalogEntry{
 			Command: "npm", Label: "Node.js（含 npm）", Kind: "managed-runtime",
 			InstallHint: "https://nodejs.org/",
 		}},
-		SlashCommands: true,
-		MCPInjection:  "config-file",
+		SlashCommands:      true,
+		MCPInjection:       "config-file",
+		SupportsLogin:      true,
+		SupportsAuthStatus: true,
+		LoginArgs:          []string{"auth", "login"},
+		AuthStatusArgs:     []string{"auth", "status"},
+		AuthStatusKind:     "claude-json",
 		// Claude 长驻会话（StartSession）已实现并经活 harness 验证，可参与项目对话。
 		RunnableInProject:           true,
 		SupportsProjectInsights:     true,
@@ -207,8 +216,13 @@ var agentCatalogEntries = []AgentCatalogEntry{
 			InstallHint: "https://nodejs.org/",
 		}},
 		// Codex 没有斜杠命令目录：远端命令面不提供该自报清单。
-		SlashCommands: false,
-		MCPInjection:  "cli-args",
+		SlashCommands:      false,
+		MCPInjection:       "cli-args",
+		SupportsLogin:      true,
+		SupportsAuthStatus: true,
+		LoginArgs:          []string{"login", "--device-auth"},
+		AuthStatusArgs:     []string{"login", "status"},
+		AuthStatusKind:     "codex-text",
 		// Codex 走一次性回合（非流式 Run），已在项目对话中接通，可参与对话。
 		RunnableInProject:           true,
 		SupportsProjectInsights:     true,
@@ -241,7 +255,9 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		SlashCommands: true,
 		MCPInjection:  "config-file",
 		// CodeBuddy 首次使用需登录：支持的登录流程（浏览器授权）在阶段 2 接通。
-		SupportsLogin: true,
+		SupportsLogin:      true,
+		SupportsAuthStatus: true,
+		AuthStatusProtocol: authProtocolACPUserInfo,
 		// AgentRunner（StartSession 流式会话）已实现并经活 harness 验证，可参与项目对话。
 		RunnableInProject:           true,
 		SupportsConflictSuggestions: true,
@@ -283,7 +299,11 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// CI / SSH / 无图形界面时才跳过并打印链接）。登录是长流程，进程由 runner 持有、
 		// 上限 10 分钟，重复点击复用同一次；登录态用 `qoder status` 的 Account 行读真实
 		// 结果，见 qoder_runner.go 的 Login / LoginStatus。
-		SupportsLogin: true,
+		SupportsLogin:      true,
+		SupportsAuthStatus: true,
+		LoginArgs:          []string{"login"},
+		AuthStatusArgs:     []string{"status", "-o", "json"},
+		AuthStatusKind:     "qoder-json",
 		// 会话走 `-p --input-format stream-json --output-format stream-json`，
 		// 事件形状与 Claude Code 同构（init → assistant → result）。
 		RunnableInProject:           true,
@@ -322,6 +342,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// OpenCode 的登录是按 provider 的交互式流程（opencode auth login），平台不驱动 TUI，
 		// 只提供入口与 `opencode auth list` 读数。
 		SupportsLogin:          true,
+		SupportsAuthStatus:     true,
+		AuthStatusKind:         "opencode-list",
 		LoginArgs:              []string{"auth", "login"},
 		AuthStatusArgs:         []string{"auth", "list"},
 		AuthStatusEmptyMarkers: []string{"0 credentials", "No credentials", "not logged in", "No providers"},
@@ -369,8 +391,10 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		MCPInjection: "user-config",
 		// `cursor-agent login` 是交互式浏览器授权，平台只给入口与 `cursor-agent status` 读数。
 		SupportsLogin:          true,
+		SupportsAuthStatus:     true,
+		AuthStatusKind:         "cursor-json",
 		LoginArgs:              []string{"login"},
-		AuthStatusArgs:         []string{"status"},
+		AuthStatusArgs:         []string{"status", "--format", "json"},
 		AuthStatusEmptyMarkers: []string{"not logged in", "not authenticated", "logged out", "not signed in"},
 		// 一次性 print 回合：`cursor-agent -p --output-format stream-json`，
 		// 下一轮用 `--resume <chatId>` 续聊（见 cursor_runner.go）。

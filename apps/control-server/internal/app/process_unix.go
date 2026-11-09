@@ -12,12 +12,18 @@ func configureProcessGroup(cmd *exec.Cmd) {
 }
 
 func terminateProcessGroup(cmd *exec.Cmd) {
+	if stopOrdinaryCLICommand(cmd) {
+		return
+	}
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 }
 
 func forceTerminateProcessGroup(cmd *exec.Cmd) {
+	if stopOrdinaryCLICommand(cmd) {
+		return
+	}
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}

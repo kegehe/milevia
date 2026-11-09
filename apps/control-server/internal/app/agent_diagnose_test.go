@@ -71,6 +71,11 @@ func plantAgentFixture(t *testing.T, prefix string, entry AgentCatalogEntry, ver
 	packageDir := filepath.Join(install.packageRoot(prefix), install.packageName)
 	if !opts.SkipPackage {
 		writePackageJSON(t, packageDir, version)
+		// 运行时诊断核对真实包名及 engines，健康安装夹具也必须提供它们。
+		body := fmt.Sprintf(`{"name":%q,"version":%q,"engines":{"node":%q}}`, entry.NpmPackage, version, ">="+entry.MinRuntimeVersion)
+		if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		// 包内的可执行文件在 `bin/` 下 —— 那个子目录要自己建
 		// （writePackageJSON 只保证包目录本身存在）。
 		binary := filepath.Join(packageDir, filepath.FromSlash(install.binPath))

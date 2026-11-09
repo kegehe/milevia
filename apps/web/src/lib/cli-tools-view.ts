@@ -68,13 +68,14 @@ export type LatestRead =
 export const latestLoading: LatestRead = { state: "loading" };
 
 /**
- * 登录态三态（与后端 `agent_auth.go` 的取值一一对应）。
+ * 登录态（与后端 `agent_auth.go` 的取值一一对应）。
+ * `configured` 只表示 Key/Token 等认证已配置，尚未验证有效性。
  *
  * `unreadable` 不是"未登录"：它是"判断不了"（工具没有非交互查询，或这次没读成）。
  * 把它们合并的后果在 2026-10-23 之前一直存在 —— 一个明明登录着的 codebuddy 用户，
  * 面板上永远写着未登录，而他会被指去再登录一次。
  */
-export type AgentAuthStatus = "logged_in" | "logged_out" | "unreadable";
+export type AgentAuthStatus = "logged_in" | "logged_out" | "configured" | "unreadable";
 
 // ── 卡片 ───────────────────────────────────────────────────────────────────
 
@@ -156,7 +157,7 @@ export type ToolCard = {
    * ⚠️ 它**不进 `primary`**：登录是"能做的事"不是"要做的事"，与主操作位那颗（安装 /
    * 更新 / 修好它）并列显示，且不参与 `bannerFor` 的任何一条分支。
    */
-  login?: "not-logged-in" | "logged-in";
+  login?: "not-logged-in" | "logged-in" | "configured";
   /**
    * 这张卡的「用不了」来自**还没登录**（装好了、版本也正常，就是没有凭据）。
    *
@@ -488,12 +489,13 @@ function updateDecision(input: {
  *     登录态挂到这台机器的卡上。
  *   - 已登录 ⇒ 不给「登录」，给"已登录"牌子。这就是 2026-10-23 那条反馈的落点：
  *     在终端里登录成功之后，卡片上那颗按钮必须自己消失，而不是等用户再点一次"检查"。
- *   - 未登录 / **判断不了** ⇒ 都给「登录」入口。判断不了时不能不给：codebuddy 永远自报不了
- *     登录态，不给入口等于让它无法从这一页登录。
+ *   - 已配置 Key/Token ⇒ 显示「已配置认证」，不冒充已验证的账号登录。
+ *   - 未登录 / 判断不了 ⇒ 给「登录」入口，区别在面板里解释。
  */
 function loginSlotFor(input: ToolCardInput, installed: boolean, running: boolean): ToolCard["login"] {
-  if (!input.entry.supportsLogin || !installed || running || input.reading) return undefined;
+  if (!(input.entry.supportsAuthStatus ?? input.entry.supportsLogin) || !installed || running || input.reading) return undefined;
   if (input.authStatus === "logged_in") return "logged-in";
+  if (input.authStatus === "configured") return "configured";
   // logged_out / unreadable 都要入口；**undefined 是"还没读到"**，不是"没登录"。
   return input.authStatus ? "not-logged-in" : undefined;
 }

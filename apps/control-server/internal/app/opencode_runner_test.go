@@ -311,7 +311,7 @@ func TestAgentAuthListHasCredentials(t *testing.T) {
 	if agentAuthListHasCredentials("No providers configured", nil) {
 		t.Fatal("no providers should not be treated as logged in")
 	}
-	if !agentAuthListHasCredentials("anthropic\nopencode", nil) {
+	if !agentAuthListHasCredentials("2 credentials", nil) {
 		t.Fatal("provider lines should be treated as logged in")
 	}
 	if agentAuthListHasCredentials("NOT LOGGED IN", nil) {

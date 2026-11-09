@@ -56,6 +56,12 @@ func (s *Server) startConversationHandoff(w http.ResponseWriter, r *http.Request
 	}
 
 	s.projectLifecycleMu.Lock()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		s.projectLifecycleMu.Unlock()
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		s.projectLifecycleMu.Unlock()

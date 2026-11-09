@@ -84,7 +84,12 @@ func (session *conflictTestSession) Send(request AgentRunRequest, sink AgentRunS
 	session.request = request
 	return session.send(sink)
 }
-func (session *conflictTestSession) Stop()              { session.stopped = true }
+func (session *conflictTestSession) Stop() {
+	if !session.stopped {
+		session.stopped = true
+		close(session.done)
+	}
+}
 func (session *conflictTestSession) Done() <-chan error { return session.done }
 
 func TestConflictSuggestionSessionAgentsReadOnlyAndStop(t *testing.T) {
@@ -116,7 +121,8 @@ func TestConflictSuggestionSessionAgentsReadOnlyAndStop(t *testing.T) {
 				if outcome == "start-error" {
 					runner.startErr = errors.New("start failed")
 				}
-				server := &Server{codebuddyRunner: runner, qoderRunner: runner}
+				server := newTestServer(t)
+				server.codebuddyRunner, server.qoderRunner = runner, runner
 				project := Project{ID: "p", Path: t.TempDir()}
 				record := &gitConflictSuggestion{ProjectID: "p", Agent: agentID, Path: "test.txt"}
 				server.runConflictSuggestion(ctx, project, record, GitConflictContent{Working: "conflict"}, "main", "feature")
@@ -148,16 +154,18 @@ func TestConflictSuggestionSessionAgentsReadOnlyAndStop(t *testing.T) {
 
 func TestConflictSuggestionCursorUsesReadOnlyRunner(t *testing.T) {
 	var request AgentRunRequest
-	server := &Server{cursorRunner: runnerFunc(func(_ context.Context, req AgentRunRequest, sink AgentRunSink) error {
+	server := newTestServer(t)
+	server.cursorRunner = runnerFunc(func(_ context.Context, req AgentRunRequest, sink AgentRunSink) error {
 		request = req
 		sink.AssistantText(`{"merged":"cursor result"}`, "")
 		return nil
-	})}
-	text, err := server.runConflictSuggestionAgent(context.Background(), Project{Path: "workspace"}, "cursor", "merge")
+	})
+	projectPath := t.TempDir()
+	text, err := server.runConflictSuggestionAgent(context.Background(), Project{Path: projectPath}, "cursor", "merge")
 	if err != nil || text != `{"merged":"cursor result"}` {
 		t.Fatalf("cursor result=%q err=%v", text, err)
 	}
-	if request.AgentID != "cursor" || request.PermissionMode != "read_only" || request.ProjectPath != "workspace" {
+	if request.AgentID != "cursor" || request.PermissionMode != "read_only" || request.ProjectPath != projectPath {
 		t.Fatalf("wrong Cursor request: %+v", request)
 	}
 }

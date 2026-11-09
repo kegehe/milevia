@@ -25,8 +25,12 @@ import (
 // 两者都必须让 wslPathPrefix() 把用户原生的 npm bin 前置：WSL 的 PATH 里混着
 // Windows 挂载进来的 npm shim，落到那上面会一跑即崩（它缺平台可选二进制）。
 func (r *wslAgentRunner) wslRunScript(ctx context.Context, script string) (string, error) {
+	prefix, err := r.wslPathPrefixContext(ctx)
+	if err != nil {
+		return "", err
+	}
 	env := &wslCrossEnvironment{runner: r}
-	stdout, stderr, err := env.run(ctx, r.wslPathPrefix()+"\n"+script)
+	stdout, stderr, err := env.run(ctx, prefix+"\n"+script)
 	if err != nil {
 		return stdout, fmt.Errorf("%w%s", err, crossOutputDetail(stderr))
 	}
@@ -35,10 +39,12 @@ func (r *wslAgentRunner) wslRunScript(ctx context.Context, script string) (strin
 
 // Update implements AgentRunner。
 func (r *wslAgentRunner) Update(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "WSL 内", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, r.wslRunScript, r.Version)
+	e, _ := agentByID("claude-code")
+	return (&catalogAgentBackend{entry: e, shell: r}).Update(ctx)
 }
 
 // CodexUpdate implements CodexCapableRunner。
 func (r *wslAgentRunner) CodexUpdate(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "WSL 内", "codex", []string{"update"}, "Codex CLI", codexNpmCLIInstall, r.wslRunScript, r.CodexVersion)
+	e, _ := agentByID("codex")
+	return (&catalogAgentBackend{entry: e, shell: r}).Update(ctx)
 }

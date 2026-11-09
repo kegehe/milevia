@@ -126,7 +126,8 @@ func main() {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
-	mode := flag.String("mode", config.Mode, "server mode: web or desktop-api")
+	mode := flag.String("mode", config.Mode, "server mode: web, desktop-api or supervision-target (authenticated stdio)")
+	ordinaryTicket := flag.String("ordinary-ticket", "", "immutable ordinary CLI workspace ticket")
 	listenAddr := flag.String("addr", addr, "TCP listen address")
 	dataDir := flag.String("data-dir", config.DataDir, "user data directory")
 	webRoot := flag.String("web-root", "", "built web application directory for web mode")
@@ -137,6 +138,32 @@ func main() {
 	parentPID := flag.Int("parent-pid", 0, "desktop host process PID; sidecar exits if this process dies")
 	logFile := flag.String("log-file", "", "append server logs to this file as well (rotated at 8 MiB); desktop-api mode defaults to <data-dir>/milevia-control.log")
 	flag.Parse()
+	if *mode == "ordinary-cli" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := app.RunOrdinaryCLI(ctx, config, *ordinaryTicket, flag.Args(), os.Stdin, os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintln(os.Stderr, "ordinary CLI stopped:", err)
+			os.Exit(app.OrdinaryCLIExitCode(err))
+		}
+		return
+	}
+	if *mode == "workspace-guard" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := app.ServeWorkspaceGuard(ctx, config, &app.SupervisionTargetStdio{Input: os.Stdin, Output: os.Stdout}); err != nil {
+			log.Fatalf("workspace guard stopped: %v", err)
+		}
+		return
+	}
+	if *mode == "supervision-target" {
+		config.DataDir = *dataDir
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := app.ServeSupervisionTarget(ctx, config, &app.SupervisionTargetStdio{Input: os.Stdin, Output: os.Stdout}); err != nil {
+			log.Fatalf("supervision target stopped: %v", err)
+		}
+		return
+	}
 	// 桌面模式默认落盘：sidecar 由桌面的 GUI 子系统进程拉起，stderr 没有控制台可去，
 	// 慢请求日志（phase=slow / db_wait_ms）不落文件就等于没有。web 模式（容器）交给容器日志。
 	// 由 sidecar 自己决定路径（而不是桌面传参），这样老版本桌面配新 sidecar 也能拿到日志。

@@ -158,43 +158,59 @@ func (r *wslAgentRunner) backgroundContext() context.Context {
 // 才是可在 Linux 执行的版本；平台装的则落在托管 npm-global/bin。探测与运行都前置这些
 // 目录，保证"WSL 项目用 WSL 原生那一份"，不被 Windows shim 劫持。
 func (r *wslAgentRunner) wslPathPrefix() string {
-	nodeBin := r.zshNodeBin()
+	prefix, _ := r.wslPathPrefixContext(context.Background())
+	return prefix
+}
+
+func (r *wslAgentRunner) wslPathPrefixContext(ctx context.Context) (string, error) {
+	nodeBin, err := r.zshNodeBinContext(ctx)
+	if err != nil {
+		return "", err
+	}
 	// $HOME 必须在双引号里展开；nodeBin 由 zsh 解析出来，单独用 shellQuote 保护。
 	prefix := `export PATH="` + crossManagedPathValue + `:$PATH"`
 	if nodeBin == "" {
-		return prefix
+		return prefix, nil
 	}
-	return "export PATH=" + shellQuote(nodeBin) + `:` + crossManagedPathValue + `:$PATH`
+	return "export PATH=" + shellQuote(nodeBin) + `:` + crossManagedPathValue + `:$PATH`, nil
 }
 
-func (r *wslAgentRunner) zshNodeBin() string {
+func (r *wslAgentRunner) zshNodeBinContext(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	r.nodeBinMu.Lock()
 	if r.nodeBinResolved {
 		nodeBin := r.nodeBin
 		r.nodeBinMu.Unlock()
-		return nodeBin
+		return nodeBin, nil
 	}
-	if done := r.nodeBinLookup; done != nil {
-		r.nodeBinMu.Unlock()
-		<-done
+	done := r.nodeBinLookup
+	if done == nil {
+		done = make(chan struct{})
+		r.nodeBinLookup = done
+		// Discovery remains shared and may populate the cache after a request
+		// times out; each waiter independently respects its own deadline.
+		go func() {
+			nodeBin := r.resolveZshNodeBin()
+			r.nodeBinMu.Lock()
+			r.nodeBin = nodeBin
+			r.nodeBinResolved = true
+			r.nodeBinLookup = nil
+			close(done)
+			r.nodeBinMu.Unlock()
+		}()
+	}
+	r.nodeBinMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-done:
 		r.nodeBinMu.Lock()
 		nodeBin := r.nodeBin
 		r.nodeBinMu.Unlock()
-		return nodeBin
+		return nodeBin, nil
 	}
-	done := make(chan struct{})
-	r.nodeBinLookup = done
-	r.nodeBinMu.Unlock()
-
-	nodeBin := r.resolveZshNodeBin()
-	r.nodeBinMu.Lock()
-	r.nodeBin = nodeBin
-	r.nodeBinResolved = true
-	r.nodeBinLookup = nil
-	close(done)
-	nodeBin = r.nodeBin
-	r.nodeBinMu.Unlock()
-	return nodeBin
 }
 
 func (r *wslAgentRunner) resolveZshNodeBin() string {
@@ -205,7 +221,7 @@ func (r *wslAgentRunner) resolveZshNodeBin() string {
 		return ""
 	}
 	cmd := exec.CommandContext(ctx, wslPath, "-d", r.distro, "-e", "zsh", "-ic", "command -v node")
-	out, err := cmd.Output()
+	out, _, err := runProbeCommandStreamsLimit(ctx, cmd, 8<<10)
 	if err != nil {
 		return ""
 	}
@@ -236,7 +252,11 @@ func (r *wslAgentRunner) wslBridgeProbe(ctx context.Context, command string) (st
 		probeCtx, cancel = context.WithTimeout(probeCtx, 5*time.Second)
 		defer cancel()
 	}
-	full := r.wslPathPrefix() + ";" + command
+	prefix, err := r.wslPathPrefixContext(probeCtx)
+	if err != nil {
+		return "", err
+	}
+	full := prefix + ";" + command
 	cmd := exec.CommandContext(probeCtx, wslPath, "-d", r.distro, "-e", "sh", "-c", full)
 	configureProcessGroup(cmd)
 	out, err := cmd.Output()

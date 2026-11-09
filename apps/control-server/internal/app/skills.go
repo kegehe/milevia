@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,15 +15,18 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// Skill 描述一处已安装的 Claude Code / Codex 技能，供对话页「Skill」区域展示与引用。
+// Skill 描述一处 CLI 技能，供对话页展示与引用；发现不代表已经启用。
 // 发现以文件系统扫描为唯一真实来源（不依赖 CLI 子命令，见 docs/22）。
 type Skill struct {
 	// Name 是技能的标识符（frontmatter name 或目录名），如 "frontend-design"。
 	Name string `json:"name"`
 	// Description 是 frontmatter 的 description，用于预览/悬浮提示；缺失时回退为目录名。
 	Description string `json:"description"`
-	// Agent 标识技能所属 CLI："claude-code" 或 "codex"。
+	// Agent 标识技能所属 CLI，与 AgentID 一致。
 	Agent string `json:"agent"`
+	// Managed is false when the CLI may discover the skill itself but Milevia
+	// does not provide install/enable lifecycle management for that CLI.
+	Managed bool `json:"managed"`
 	// Env 标识技能运行的环境："windows"、"wsl" 或 "remote-linux"。
 	Env string `json:"env"`
 	// Source 标识技能来源："user"、"project" 或 "plugin"。
@@ -127,17 +131,6 @@ func parseSkillFrontmatter(content string) (name, description string) {
 func (s *Server) discoverLocalSkillRoots(target agentTargetEnv, projectPath string) []skillScanRoot {
 	env := string(target)
 	roots := []skillScanRoot{}
-	add := func(abs string, agent, source string, pluginRoot bool) {
-		if abs == "" {
-			return
-		}
-		roots = append(roots, skillScanRoot{
-			absPath: abs, agent: agent, source: source, env: env, pluginRoot: pluginRoot,
-			recursive: agent == skillAgentCodex,
-			// 优先级递增装配：后 add 的（project）数值更大，同名去重时胜出。
-			priority: len(roots),
-		})
-	}
 
 	if target == agentTargetEnvWSL {
 		// WSL 用户级 + 插件树：把 WSL Linux home 转成可读的 UNC 后纳入扫描。
@@ -145,21 +138,15 @@ func (s *Server) discoverLocalSkillRoots(target agentTargetEnv, projectPath stri
 		homePath, distro := s.wslUserHomeDistro()
 		if homePath != "" && distro != "" {
 			home := wslToUncPath(homePath, distro)
-			add(filepath.Join(home, ".claude", "skills"), skillAgentClaude, skillSourceUser, false)
-			add(filepath.Join(home, ".codex", "skills"), skillAgentCodex, skillSourceUser, false)
-			add(filepath.Join(home, ".claude", "plugins"), skillAgentClaude, skillSourcePlugin, true)
+			roots = append(roots, skillRootsForPaths(home, projectPath, env, filepath.Join(home, ".codex", "skills"), "")...)
+			return roots
 		}
-		add(filepath.Join(projectPath, ".claude", "skills"), skillAgentClaude, skillSourceProject, false)
-		add(filepath.Join(projectPath, ".codex", "skills"), skillAgentCodex, skillSourceProject, false)
+		roots = append(roots, skillRootsForPaths("", projectPath, env, "", "")...)
 		return roots
 	}
 
 	// windows（本机）环境：用户级 + 项目级 + 插件树。
-	add(filepath.Join(homeDir(), ".claude", "skills"), skillAgentClaude, skillSourceUser, false)
-	add(codexUserSkillsDir(), skillAgentCodex, skillSourceUser, false)
-	add(filepath.Join(homeDir(), ".claude", "plugins"), skillAgentClaude, skillSourcePlugin, true)
-	add(filepath.Join(projectPath, ".claude", "skills"), skillAgentClaude, skillSourceProject, false)
-	add(filepath.Join(projectPath, ".codex", "skills"), skillAgentCodex, skillSourceProject, false)
+	roots = append(roots, skillRootsForPaths(homeDir(), projectPath, env, codexUserSkillsDir(), strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")))...)
 	return roots
 }
 
@@ -318,6 +305,7 @@ func resolveSkillScans(scans []skillScan) []Skill {
 			Name:        p.name,
 			Description: p.desc,
 			Agent:       key[0],
+			Managed:     false,
 			Env:         p.root.env,
 			Source:      p.root.source,
 		})
@@ -360,7 +348,7 @@ func filterSkillsByAgent(skills []Skill, agentID string) []Skill {
 	return out
 }
 
-// listSkills 返回项目中当前环境可用的技能。`?agentId=` 可选过滤（claude-code / codex）。
+// listSkills 返回项目中当前环境可用的技能。`?agentId=` 可按 CLI 过滤。
 // 实时扫描、不做缓存；目录缺失 / 远端未就绪时返回空列表，不报错。
 func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
@@ -372,6 +360,14 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if conversationID := r.URL.Query().Get("conversationId"); conversationID != "" {
+		workspace, resolveErr := s.resolveRequestWorkspace(r.Context(), projectID, conversationID)
+		if resolveErr != nil {
+			writeError(w, http.StatusConflict, resolveErr)
+			return
+		}
+		project.Path = workspace.Workspace.Path
 	}
 	skills := s.discoverSkillsForProject(r.Context(), project, r.URL.Query().Get("agentId"))
 	if skills == nil {
@@ -396,22 +392,22 @@ func (s *Server) discoverSkillsRemote(ctx context.Context, project Project, agen
 	}
 	proj := filepath.ToSlash(project.Path)
 
-	// 用户 + 项目两类根；按 agentID 定向裁剪命令。顺序与本地优先级一致：
-	// user < plugin < project，故 project 排最后；parseRemoteSkillOutput 同名"后者覆盖前者"，
-	// 使 project 级 over 插件 over 用户级，与 discoverLocalSkillRoots 的 priority 语义一致。
+	// 根目录及优先级与本地共用；同一兼容目录只扫描一次。
 	var cmds []string
-	if agentID == "" || agentID == skillAgentClaude {
-		cmds = append(cmds,
-			skillFindAndCat(shellQuotePresent(filepath.Join(home, ".claude", "skills"))),
-			skillFindPlugins(shellQuotePresent(filepath.Join(home, ".claude", "plugins"))),
-			skillFindAndCat(shellQuotePresent(filepath.Join(proj, ".claude", "skills"))),
-		)
-	}
-	if agentID == "" || agentID == skillAgentCodex {
-		cmds = append(cmds,
-			skillFindAndCat(shellQuotePresent(filepath.Join(home, ".codex", "skills"))),
-			skillFindAndCat(shellQuotePresent(filepath.Join(proj, ".codex", "skills"))),
-		)
+	seen := map[string]bool{}
+	for _, root := range skillRootsForPaths(home, proj, "remote-linux", "", "") {
+		if agentID != "" && agentID != root.agent {
+			continue
+		}
+		if seen[root.absPath] {
+			continue
+		}
+		seen[root.absPath] = true
+		if root.pluginRoot {
+			cmds = append(cmds, skillFindPlugins(shellQuotePresent(root.absPath)))
+		} else {
+			cmds = append(cmds, skillFindAndCat(shellQuotePresent(root.absPath)))
+		}
 	}
 	if len(cmds) == 0 {
 		return nil
@@ -438,7 +434,7 @@ func shellQuotePresent(p string) string {
 	if p == "" {
 		return ""
 	}
-	return shellQuote(p)
+	return shellQuote(filepath.ToSlash(p))
 }
 
 // skillFindAndCat 返回「find <root> -name SKILL.md 并回显 marker+路径+内容」的远端命令。
@@ -460,10 +456,11 @@ func skillFindPlugins(pluginRoot string) string {
 // parseRemoteSkillOutput 解析远端 find+cat 的输出（每条以 marker+路径开头，随后是文件内容，
 // 直到下一个 marker 或末尾），逐文件解析 frontmatter。
 func parseRemoteSkillOutput(output, home, projectPath, agentID string) []Skill {
-	// 远端命令顺序 user → plugin → project（见 discoverSkillsRemote），同名"后者覆盖前者"，
-	// 使 project 优先级最高，与本地 discoverLocalSkillRoots 一致。
+	// Use the same explicit root priorities as local discovery, independent of
+	// find output order. Only the deepest matching root owns a nested project.
 	skills := []Skill{}
 	index := map[string]int{} // agent:name → skills 下标
+	priorities := map[string]int{}
 	for _, block := range strings.Split(output, remoteSkillOutputMarker) {
 		block = strings.TrimPrefix(block, "\n")
 		if block == "" {
@@ -485,19 +482,24 @@ func parseRemoteSkillOutput(output, home, projectPath, agentID string) []Skill {
 		if description == "" {
 			description = name
 		}
-		agent := skillAgentForRemotePath(filePath)
-		if agentID != "" && agent != agentID {
-			continue
+		for _, root := range skillRootsForRemotePath(filePath, home, projectPath) {
+			agent, source := root.agent, root.source
+			if agentID != "" && agent != agentID {
+				continue
+			}
+			key := agent + ":" + name
+			skill := Skill{Name: name, Description: description, Agent: agent, Env: "remote-linux", Source: source, Managed: false}
+			if i, ok := index[key]; ok {
+				if root.priority >= priorities[key] {
+					skills[i] = skill
+					priorities[key] = root.priority
+				}
+				continue
+			}
+			index[key] = len(skills)
+			priorities[key] = root.priority
+			skills = append(skills, skill)
 		}
-		source := skillSourceForRemotePath(filePath, home, projectPath)
-		key := agent + ":" + name
-		skill := Skill{Name: name, Description: description, Agent: agent, Env: "remote-linux", Source: source}
-		if i, ok := index[key]; ok {
-			skills[i] = skill // 后者覆盖前者
-			continue
-		}
-		index[key] = len(skills)
-		skills = append(skills, skill)
 	}
 	sort.Slice(skills, func(i, j int) bool {
 		if skills[i].Agent != skills[j].Agent {
@@ -510,27 +512,58 @@ func parseRemoteSkillOutput(output, home, projectPath, agentID string) []Skill {
 
 // skillAgentForRemotePath 依据远端路径判断技能所属 CLI。
 func skillAgentForRemotePath(filePath string) string {
-	if strings.Contains(filepath.ToSlash(filePath), "/.codex/") {
-		return skillAgentCodex
+	p := filepath.ToSlash(filePath)
+	for _, dir := range skillDirectories {
+		if strings.Contains(p, "/"+filepath.ToSlash(dir.user)+"/") || strings.Contains(p, "/"+filepath.ToSlash(dir.project)+"/") {
+			return dir.agent
+		}
+	}
+	for _, dir := range pluginDirectories {
+		if strings.Contains(p, "/"+filepath.ToSlash(dir.root)+"/") {
+			return dir.agent
+		}
 	}
 	return skillAgentClaude
 }
 
 // skillSourceForRemotePath 依据远端路径判断技能来源（user/project/plugin）。
 func skillSourceForRemotePath(filePath, home, projectPath string) string {
-	p := filepath.ToSlash(filePath)
-	if strings.Contains(p, "/plugins/") {
-		return skillSourcePlugin
-	}
-	if proj := strings.TrimSuffix(filepath.ToSlash(projectPath), "/") + "/"; strings.HasPrefix(p, proj) {
-		return skillSourceProject
+	if roots := skillRootsForRemotePath(filePath, home, projectPath); len(roots) > 0 {
+		return roots[0].source
 	}
 	return skillSourceUser
 }
 
+func skillRootsForRemotePath(filePath, home, projectPath string) []skillScanRoot {
+	p := filepath.ToSlash(filepath.Clean(filePath))
+	var matches []skillScanRoot
+	longest := 0
+	for _, root := range skillRootsForPaths(home, projectPath, "remote-linux", "", "") {
+		prefix := strings.TrimRight(filepath.ToSlash(root.absPath), "/") + "/"
+		if !strings.HasPrefix(p, prefix) || len(prefix) < longest {
+			continue
+		}
+		if len(prefix) > longest {
+			matches = nil
+			longest = len(prefix)
+		}
+		matches = append(matches, root)
+	}
+	return matches
+}
+
 // readFileBestEffort 读取文件，失败返回空串；用于不可靠的 SKILL.md 读取。
 func readFileBestEffort(path string) string {
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 128<<10))
 	if err != nil {
 		return ""
 	}

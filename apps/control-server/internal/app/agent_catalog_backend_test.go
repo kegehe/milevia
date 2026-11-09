@@ -434,6 +434,8 @@ func TestCatalogBackendUpdateUsesTheSharedCrossOrchestration(t *testing.T) {
 // 那句话里写死了别的工具名，用户就会去终端里跑一个错的命令。
 func TestCatalogBackendLoginGuidesToTheCatalogsOwnCommand(t *testing.T) {
 	entry, _ := agentByID("codebuddy")
+	// 本用例验证无查询协议时的兜底；ACP 查询另有握手与目录分派测试。
+	entry.AuthStatusProtocol = ""
 	shell := newFakeCrossShell()
 	backend := &catalogAgentBackend{entry: entry, shell: shell}
 
@@ -447,9 +449,9 @@ func TestCatalogBackendLoginGuidesToTheCatalogsOwnCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("已安装时发起登录失败：%v", err)
 	}
-	// 空信息是**有意**的：真正的指引由 agent_login.go 按目录拼出（见那条用例）。
-	if info.AuthURL != "" || info.UserCode != "" || info.Message != "" {
-		t.Fatalf("无头环境不该声称拿到了设备码/授权链接：%+v", info)
+	// 只提供实际可用命令的终端指引，不声称拿到了设备码/授权链接。
+	if info.AuthURL != "" || info.UserCode != "" || !strings.Contains(info.Message, "运行 "+agentLoginCommand(entry)+" 完成登录") {
+		t.Fatalf("无头环境的终端指引不正确：%+v", info)
 	}
 	// 目录没登记登录态命令 ⇒ 只能报 unreadable（判断不了），既不许冒充已登录，
 	// 也不许冒充未登录 —— 后者会让一个明明登录着的用户被指去再登录一次。
@@ -582,12 +584,8 @@ func TestCatalogBackendUpdateHealthCheckReadsFreshVersion(t *testing.T) {
 	}
 }
 
-// TestCatalogBackendUpdateFallsBackToTheCachedReadWhenFreshProbeFails 是上一条的另一半：
-// "这次没真探成"不等于"没装"。
-//
-// 真探失败时若直接回空版本，runCrossCLIUpdate 会把它当成"未安装"并拒绝升级 —— 一句
-// 指错方向的结论。退回常规读数才是对的做法（代价只是维持改动前那个旧毛病）。
-func TestCatalogBackendUpdateFallsBackToTheCachedReadWhenFreshProbeFails(t *testing.T) {
+// 真探失败只表示无法确认版本。旧缓存不能作为升级或健康检查的证据。
+func TestCatalogBackendUpdateRejectsCachedReadWhenFreshProbeFails(t *testing.T) {
 	runner := newWSLAgentRunner(Config{}, "Ubuntu", nil)
 	calls := 0
 	runner.probeFn = func(context.Context, string) (string, error) {
@@ -605,8 +603,11 @@ func TestCatalogBackendUpdateFallsBackToTheCachedReadWhenFreshProbeFails(t *test
 	if got := backend.Version(context.Background()); got != "2.162.0" {
 		t.Fatalf("先把读数放进缓存失败：%q", got)
 	}
-	if got := backend.freshVersion(context.Background()); got != "2.162.0" {
-		t.Fatalf("真探失败时应当退回常规读数，得到 %q（退回空串会让升级被误报成「未安装」）", got)
+	if got, err := backend.checkedFreshVersion(context.Background()); got != "" || err == nil {
+		t.Fatalf("真探失败不能用缓存冒充健康：%q / %v", got, err)
+	}
+	if _, _, err := backend.Update(context.Background()); err == nil {
+		t.Fatal("真探失败却执行升级")
 	}
 }
 

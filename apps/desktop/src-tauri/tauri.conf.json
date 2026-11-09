@@ -28,7 +28,8 @@
       "../binaries/milevia-approval.exe": "milevia-approval.exe",
       "../binaries/milevia-terminal-bridge.exe": "milevia-terminal-bridge.exe",
       "../binaries/milevia-agent.exe": "milevia-agent.exe",
-      "../binaries/milevia-agent.env": "milevia-agent.env"
+      "../binaries/milevia-agent.env": "milevia-agent.env",
+      "../binaries/supervision-targets/": "supervision-targets/"
     },
     "windows": {
       "webviewInstallMode": {

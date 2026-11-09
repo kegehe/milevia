@@ -16,8 +16,8 @@ test("Codex context handoff has no composer entry point", () => {
 });
 
 test("context handoff freezes every message-dispatch path", () => {
-  assert.match(page, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff \|\| shortcutBusy(?: \|\| changingModel)?\) return false;/);
-  assert.match(page, /if \(sending \|\| clearing \|\| stopping \|\| handingOff \|\| shortcutBusy(?: \|\| changingModel)?\) return;/);
-  assert.match(page, /if \(sending \|\| clearing \|\| stopping \|\| handingOff \|\| shortcutBusy(?: \|\| changingModel)?\) return false;/);
+  assert.match(page, /if \(!conversation \|\| readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff \|\| shortcutBusy(?: \|\| changingModel)? \|\| attachmentBusy \|\| workspaceBusy\) return false;/);
+  assert.match(page, /if \(sending \|\| clearing \|\| stopping \|\| handingOff \|\| shortcutBusy(?: \|\| changingModel)? \|\| attachmentBusy \|\| workspaceBusy\) return;/);
+  assert.match(page, /if \(sending \|\| clearing \|\| stopping \|\| handingOff \|\| shortcutBusy(?: \|\| changingModel)? \|\| attachmentBusy \|\| workspaceBusy\) return false;/);
   assert.match(page, /disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff(?: \|\| changingModel)? \|\| Boolean\(shortcutBusy\)\}/);
 });

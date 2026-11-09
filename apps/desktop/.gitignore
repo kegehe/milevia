@@ -1,5 +1,6 @@
 binaries/*.exe
 binaries/.build-cache.json
+binaries/supervision-targets/
 src-tauri/icons/
 src-tauri/target/
 src-tauri/gen/schemas/

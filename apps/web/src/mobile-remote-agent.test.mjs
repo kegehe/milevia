@@ -245,7 +245,7 @@ test("mobile composer is one rounded box with both buttons mounted inside it", (
   // "正文 / 已引用技能 / 已引用某条消息"三者有其一，发送键就该可用（只点了一颗技能、
   // 或只引用了某条消息、一个字没写，都能发出去）。漏掉 quoteRef 这一项的症状是：
   // 输入框上方明明挂着一颗引用胶囊，发送键却是灰的 —— 用户以为引用没生效。
-  assert.match(page, /<button type="submit" className="mobile-composer-send" disabled=\{busy \|\| !conversation \|\| \(!messageDraft\.trim\(\) && skillRefs\.length === 0 && !quoteRef\)\}/);
+  assert.match(page, /<button type="submit" className="mobile-composer-send" disabled=\{attachmentBusy \|\| busy \|\| !conversation \|\| \(!messageDraft\.trim\(\) && skillRefs\.length === 0 && !quoteRef && messageAttachments\.length === 0\)\}/);
   // 整盒 + 单行内嵌（DeepSeek / ChatGPT 那种）：盒子里**一行**依次是 [＋] [文字] [发送]；
   // 这条会话跑起来时，在发送键**左边**多一颗停止键（见下面那条用例）。
   //
@@ -669,7 +669,7 @@ test("mobile message bubbles reveal an icon action row instead of opening a shee
   assert.match(styles, /\.mobile-message-action-status \{[^}]*clip-path: inset\(50%\);/s);
   assert.doesNotMatch(styles, /\.mobile-message-action-status \{[^}]*display: none/s, "sr-only 用 display:none 会把节点移出无障碍树");
   // 复制的是**现在这一刻**的正文（直接读渲染中的 entry.message），不再是某次快照。
-  assert.match(page, /onClick=\{\(\) => void copyMessageBody\(entry\.message\.content\)\}/);
+  assert.match(page, /onClick=\{\(\) => void copyMessageBody\(mobileMessageBody\(entry\.message\)\)\}/);
 
   // ⑤ 流式（stream-*）与乐观（pending-*）消息把「引用」禁用掉（前者内容还在变、后者还没真发出去），
   //    「重发」另外只对用户消息出现。禁用而不是隐藏 —— 图标位置不跳，也让"有过这颗、此刻不可用"
@@ -690,7 +690,9 @@ test("mobile message bubbles reveal an icon action row instead of opening a shee
   // 分开写三份的结果是"改一处、另两处说错原因"，而这两句话被明确要求**必须分开**。
   assert.match(page, /title=\{isTransientMessage\(entry\.message\) \? transientReason\(entry\.message, "quote"\) : "引用到输入框"\}/);
   assert.match(page, /\{entry\.message\.role === "user" && <button type="button" className="mobile-message-action-icon" disabled=\{isTransientMessage\(entry\.message\)\} aria-label="把这条消息的原文填回输入框"/);
-  assert.match(page, /title=\{isTransientMessage\(entry\.message\) \? transientReason\(entry\.message, "resend"\) : "填回输入框，改完再发"\} onClick=\{\(\) => resendMessage\(entry\.message\.content\)\}/);
+  assert.match(page, /title=\{isTransientMessage\(entry\.message\) \? transientReason\(entry\.message, "resend"\) : "填回输入框，改完再发"\} onClick=\{\(\) => resendAttachedMessage\(entry\.message\)\}/);
+  assert.match(page, /function resendAttachedMessage\(message: Message\) \{\s*addMessageAttachments\(message\.attachments \|\| \[\]\);\s*resendMessage\(message\.content\);/);
+  assert.match(page, /quoteMessage\(\{ id: entry\.message\.id, role: entry\.message\.role, content: mobileMessageBody\(entry\.message\) \}\)/);
 
   // ⑥ 引用：**只留一条**，挂在输入条上方（与技能引用同一形态），发送时才展开成引用块。
   assert.match(page, /const \[quoteRef, setQuoteRef\] = useState<MessageQuote \| null>\(null\);/);
@@ -737,7 +739,7 @@ test("mobile message bubbles reveal an icon action row instead of opening a shee
     assert.match(failBlock, /if \(lastQuote\) setQuoteRef\(\(current\) => current \?\? lastQuote\);/);
   }
   // 入队那一刻就把 quote 存进队列（它是"失败时要还回去的东西"的清单，不能只存 draft）。
-  assert.match(page, /queue\.push\(\{ requestId: clientRequestId, content, createdAt, draft, quote \}\);/);
+  assert.match(page, /queue\.push\(\{ requestId: clientRequestId, content, createdAt, draft, quote, attachments: files \}\);/);
 
   // ⑨ 收起与焦点：点图标行之外的任何地方、按 Esc 都收（顶栏 ⋯ 菜单同一套：document 上的
   //    pointerdown + closest，**不铺透明遮罩** —— 遮罩虽然也能"点外部收起"，但它是 inset:0

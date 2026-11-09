@@ -210,6 +210,9 @@
 .cli-tools-card-actions .cli-tools-auth-chip[data-state="logged-in"] {
   border-color: transparent; background: #eef7f2; color: #2c7567; }
 .cli-tools-card-actions .cli-tools-auth-chip[data-state="logged-in"]:hover { background: #e3f1ea; }
+.cli-tools-card-actions .cli-tools-auth-chip[data-state="configured"] {
+  border-color: transparent; background: #f0f3f5; color: #52606a; }
+.cli-tools-card-actions .cli-tools-auth-chip[data-state="configured"]:hover { background: #e7ecef; }
 /* 进行中：按钮里那一圈转动的缺口环。它只出现在**发起操作的那颗按钮**上（页面按
    runner + agent 判，见 activeAction），所以"在跑"这件事有了落点，不需要页面级
    横幅再说一遍。disabled 的按钮是灰底，环用青色保持可读。

@@ -28,7 +28,7 @@ import (
 // 退出的前缀，以及可选的回合错误翻译。
 //
 // ⚠️ 与 claude_runner.go 的会话**不是**同一层：Claude 那条链路还带逐命令审批 hook、
-// 用量解析与更细的事件；这里只覆盖"工具调用自执行、平台只收集文本"的那一类。
+// 更细的审批控制；这里转发工具、用量和初始化事件，工具执行仍由 CLI 负责。
 type streamJSONSession struct {
 	agentID    string
 	label      string
@@ -39,8 +39,9 @@ type streamJSONSession struct {
 	steer bool
 	// readOnly 为真时，CodeBuddy 的 plan 模式如果请求退出去写文件，直接拒绝，
 	// 否则无头进程会停在没人能回的 control_request 上。
-	readOnly     bool
-	currentRunID string
+	readOnly               bool
+	denyPermissionRequests bool
+	currentRunID           string
 
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
@@ -49,13 +50,14 @@ type streamJSONSession struct {
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
-	mu       sync.Mutex
-	stdinMu  sync.Mutex
-	sink   AgentRunSink
-	queued []streamJSONTurn
+	mu      sync.Mutex
+	stdinMu sync.Mutex
+	sink    AgentRunSink
+	queued  []streamJSONTurn
 	// turnFinishing closes the small gap after a result has detached the
 	// current sink but before the next queued turn becomes active.
 	turnFinishing bool
+	terminalErr   error // published only after the process/container has settled
 	done          chan error
 	// processDone 在 cmd.Wait 返回后关闭，供 Stop 的"先 SIGTERM、5 秒后强杀"使用。
 	processDone chan struct{}
@@ -66,17 +68,20 @@ type streamJSONSession struct {
 	// 两个读者（这里的 ctx 看门狗与 app.go 的 waitForStreamingSessionExit）会互相
 	// 抢那一个值 —— 看门狗抢到，等退出的一方就永远收不到信号，只能等到宽限期超时，
 	// 然后留下一条"进程仍未退出"的假警告。关闭广播通道不会抢值。
-	stopped chan struct{}
-	closed  bool
+	stopped   chan struct{}
+	closed    bool
+	stopping  bool
+	initFrame json.RawMessage
 }
 
 type streamJSONSessionConfig struct {
-	agentID    string
-	label      string
-	exitPrefix string
-	turnError  func(raw string, code string) error
-	steer      bool
-	readOnly   bool
+	agentID                string
+	label                  string
+	exitPrefix             string
+	turnError              func(raw string, code string) error
+	steer                  bool
+	readOnly               bool
+	denyPermissionRequests bool
 }
 
 type streamJSONTurn struct {
@@ -87,19 +92,20 @@ type streamJSONTurn struct {
 
 func newStreamJSONSession(config streamJSONSessionConfig, cmd *exec.Cmd, stdin io.WriteCloser, stdout, stderr io.ReadCloser) *streamJSONSession {
 	return &streamJSONSession{
-		agentID:     config.agentID,
-		label:       config.label,
-		exitPrefix:  config.exitPrefix,
-		turnError:   config.turnError,
-		steer:       config.steer,
-		readOnly:    config.readOnly,
-		cmd:         cmd,
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		done:        make(chan error, 1),
-		stopped:     make(chan struct{}),
-		processDone: make(chan struct{}),
+		agentID:                config.agentID,
+		label:                  config.label,
+		exitPrefix:             config.exitPrefix,
+		turnError:              config.turnError,
+		steer:                  config.steer,
+		readOnly:               config.readOnly,
+		denyPermissionRequests: config.denyPermissionRequests,
+		cmd:                    cmd,
+		stdin:                  stdin,
+		stdout:                 stdout,
+		stderr:                 stderr,
+		done:                   make(chan error, 1),
+		stopped:                make(chan struct{}),
+		processDone:            make(chan struct{}),
 	}
 }
 
@@ -126,8 +132,11 @@ func (s *streamJSONSession) watch(ctx context.Context) {
 		// 先 Wait 再读会把最后的 result 帧吞掉（表现为“会话在回合完成前结束”）。
 		// 先等 stdout 读取 goroutine 随 EOF 结束，再回收进程。
 		<-stdoutDone
-		err := s.cmd.Wait()
+		err := waitOrdinaryCLICommand(s.cmd)
 		close(s.processDone)
+		s.mu.Lock()
+		err = errors.Join(s.terminalErr, err)
+		s.mu.Unlock()
 		if err != nil {
 			// 前缀必须含"失败"：后面跟的是 Go 的进程状态描述（英文），少了这两个字就过不了
 			// localizedErrorText 的直通判据，用户看到的会是一句指不到原因、还建议重试的文案
@@ -145,12 +154,18 @@ func (s *streamJSONSession) Send(request AgentRunRequest, sink AgentRunSink) err
 		return fmt.Errorf("%s 会话只接受 %s 运行", s.label, s.agentID)
 	}
 	payload := map[string]any{"role": "user", "content": request.Prompt}
+	if s.agentID == "codebuddy" && len(request.Attachments) > 0 {
+		payload["content"] = agentContent(request.Prompt, request.Attachments)
+	}
+	if len(request.Attachments) > 0 && s.agentID == "qoder" {
+		sink.Event("attachment.reference", mustJSON(map[string]string{"message": "Qoder 当前通过工作区文件路径引用附件。"}))
+	}
 	frame, err := json.Marshal(map[string]any{"type": "user", "message": payload})
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.stopping || s.terminalErr != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("%s 会话已结束", s.label)
 	}
@@ -161,6 +176,7 @@ func (s *streamJSONSession) Send(request AgentRunRequest, sink AgentRunSink) err
 	}
 	s.sink = sink
 	s.currentRunID = request.RunID
+	initFrame := append(json.RawMessage(nil), s.initFrame...)
 	s.mu.Unlock()
 	// 工具调用由 CLI 内部自执行并自己产出 tool_result（实测事件序列：
 	// assistant(tool_use) → user(tool_result) → assistant(text) → result），
@@ -168,6 +184,16 @@ func (s *streamJSONSession) Send(request AgentRunRequest, sink AgentRunSink) err
 	// TurnStarted 放在锁外调用，避免持锁回调 sink（sink 可能反向进入本 session）造成再入死锁。
 	if ts, ok := sink.(AgentTurnSink); ok {
 		ts.TurnStarted()
+	}
+	if len(initFrame) > 0 {
+		sink.Event("system", initFrame)
+		var init struct {
+			SessionID string `json:"session_id"`
+		}
+		if json.Unmarshal(initFrame, &init) == nil {
+			sink.SessionIdentified(init.SessionID)
+			sink.SessionInitialized()
+		}
 	}
 	if _, err := s.writeFrame(append(frame, '\n')); err != nil {
 		// 写入失败时 CLI 可能仍会继续产事件；先把 sink 摘掉并结束会话，避免
@@ -212,7 +238,7 @@ func (s *streamJSONSession) injectPrompt(prompt string) (string, error) {
 		return "", err
 	}
 	s.mu.Lock()
-	if s.closed || s.sink == nil || s.turnFinishing || s.currentRunID == "" {
+	if s.closed || s.stopping || s.terminalErr != nil || s.sink == nil || s.turnFinishing || s.currentRunID == "" {
 		s.mu.Unlock()
 		return "", errNoActiveTurn
 	}
@@ -226,6 +252,9 @@ func (s *streamJSONSession) injectPrompt(prompt string) (string, error) {
 
 // Stop 结束会话进程组，并关闭读端以解除逃逸子进程对管道的占用。
 func (s *streamJSONSession) Stop() {
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
 	// Windows 上 npm 的 .cmd shim 让直接子进程是 cmd.exe；只 Kill 它会留下真正的
 	// node/codebuddy/qoder 进程。terminateProcessGroup 会按进程树回收后代。
 	// SIGTERM 可能被忽略（或后代仍握着管道），5 秒后强杀一次 —— 与 Claude 长驻会话
@@ -292,19 +321,25 @@ func (s *streamJSONSession) finish(err error) {
 // readOutput 逐行解析 NDJSON，映射 init/assistant/result 到当前 sink。
 func (s *streamJSONSession) readOutput(out io.Reader) {
 	sc := bufio.NewScanner(out)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	// A user echo can contain several base64 image blocks (20 MiB of files).
+	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
+		raw := sc.Bytes()
+		if len(raw) == 0 {
+			continue
+		}
+		line, sanitizeErr := sanitizeAgentJSONL(decodeAgentOutputBytes(raw))
+		if sanitizeErr != nil {
 			continue
 		}
 		var ev struct {
-			Type      string `json:"type"`
-			Subtype   string `json:"subtype"`
-			IsError   bool   `json:"is_error"`
-			Error     string `json:"error"`
-			SessionID string `json:"session_id"`
-			Message   struct {
+			ParentToolUseID string `json:"parent_tool_use_id"`
+			Type            string `json:"type"`
+			Subtype         string `json:"subtype"`
+			IsError         bool   `json:"is_error"`
+			Error           string `json:"error"`
+			SessionID       string `json:"session_id"`
+			Message         struct {
 				Content []struct {
 					Type string `json:"type"`
 					Text string `json:"text"`
@@ -317,16 +352,26 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 		}
 		// 只读拒绝不依赖当前回合是否已经挂上 sink。control_request 若被
 		// 「还没有 sink」挡掉，CodeBuddy 会一直停在 ExitPlanMode。
-		if ev.Type == "control_request" && s.readOnly && s.agentID == "codebuddy" {
-			if frame, ok := codebuddyReadOnlyControlResponse(append([]byte(nil), line...)); ok {
+		if ev.Type == "control_request" && (s.readOnly || s.denyPermissionRequests) && s.agentID == "codebuddy" {
+			if frame, ok := codebuddyPermissionDenial(line, s.denyPermissionRequests); ok {
 				_, _ = s.writeFrame(frame)
 			}
 		}
 		s.mu.Lock()
+		if ev.Type == "system" && ev.Subtype == "init" {
+			s.initFrame = append(json.RawMessage(nil), line...)
+		}
 		sink := s.sink
 		s.mu.Unlock()
 		if sink == nil {
 			continue
+		}
+		if ev.Type == "stream_event" {
+			handleClaudePartialMessage(line, sink)
+			continue
+		}
+		if ev.Type != "" {
+			sink.Event(ev.Type, append(json.RawMessage(nil), line...))
 		}
 		switch ev.Type {
 		case "system":
@@ -337,7 +382,7 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 		case "assistant":
 			for _, part := range ev.Message.Content {
 				if part.Type == "text" && part.Text != "" {
-					sink.AssistantText(part.Text, "")
+					sink.AssistantText(part.Text, ev.ParentToolUseID)
 				}
 			}
 		case "result":
@@ -362,7 +407,7 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 				ts.TurnFinished(turnErr)
 			}
 			s.mu.Lock()
-			if s.closed {
+			if s.closed || s.stopping || s.terminalErr != nil {
 				s.turnFinishing = false
 				s.mu.Unlock()
 				continue
@@ -378,15 +423,31 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 				if ts, ok := next.(AgentTurnSink); ok {
 					ts.TurnStarted()
 				}
-				if _, writeErr := s.stdin.Write(nextTurn.frame); writeErr != nil {
+				if _, writeErr := s.writeFrame(nextTurn.frame); writeErr != nil {
+					s.mu.Lock()
+					s.terminalErr = errors.Join(s.terminalErr, writeErr)
+					s.mu.Unlock()
 					s.Stop()
-					s.finish(writeErr)
 				}
 			} else {
 				s.turnFinishing = false
 				s.mu.Unlock()
 			}
 		}
+	}
+	if err := sc.Err(); err != nil {
+		s.mu.Lock()
+		sink := s.sink
+		s.mu.Unlock()
+		if text := errorText(err); text != "" && sink != nil {
+			sink.Event("stream.error", mustJSON(map[string]string{"error": text}))
+		}
+		// Stop reading without terminating the writer would leave it blocked on
+		// a full pipe and keep this turn/workspace alive indefinitely.
+		s.mu.Lock()
+		s.terminalErr = errors.Join(s.terminalErr, fmt.Errorf("%s 输出流读取失败：%w", s.label, err))
+		s.mu.Unlock()
+		s.Stop()
 	}
 }
 
@@ -412,6 +473,10 @@ func trimTurnText(raw, fallback string) string {
 // codebuddyReadOnlyControlResponse 在只读回合里拒绝退出计划模式。
 // 其它 control_request 不代答。
 func codebuddyReadOnlyControlResponse(line []byte) ([]byte, bool) {
+	return codebuddyPermissionDenial(line, false)
+}
+
+func codebuddyPermissionDenial(line []byte, allTools bool) ([]byte, bool) {
 	var ev struct {
 		Type      string `json:"type"`
 		RequestID string `json:"request_id"`
@@ -424,7 +489,7 @@ func codebuddyReadOnlyControlResponse(line []byte) ([]byte, bool) {
 	if err := json.Unmarshal(line, &ev); err != nil || ev.Type != "control_request" {
 		return nil, false
 	}
-	if ev.Request.Subtype != "can_use_tool" || ev.Request.ToolName != "ExitPlanMode" || ev.RequestID == "" {
+	if ev.Request.Subtype != "can_use_tool" || (!allTools && ev.Request.ToolName != "ExitPlanMode") || ev.RequestID == "" {
 		return nil, false
 	}
 	payload, err := json.Marshal(map[string]any{
@@ -435,7 +500,7 @@ func codebuddyReadOnlyControlResponse(line []byte) ([]byte, bool) {
 			"response": map[string]any{
 				"allowed":     false,
 				"tool_use_id": ev.Request.ToolUseID,
-				"reason":      "只读回合不能退出计划模式去写文件。",
+				"reason":      "当前权限不允许此操作；CodeBuddy 尚未接入平台交互审批。",
 			},
 		},
 	})
@@ -446,8 +511,5 @@ func codebuddyReadOnlyControlResponse(line []byte) ([]byte, bool) {
 }
 
 func drainLines(r io.Reader) {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		// 丢弃 stderr 输出；仅在调试时有用。
-	}
+	_, _ = io.Copy(io.Discard, r)
 }

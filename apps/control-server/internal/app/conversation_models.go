@@ -63,9 +63,10 @@ type ConversationModelsView struct {
 	ConversationID string `json:"conversationId"`
 	AgentID        string `json:"agentId"`
 	// Selected 是会话级覆盖（空 = 未设置）。
-	Selected         string   `json:"selected"`
-	ReasoningEffort  string   `json:"reasoningEffort"`
-	ReasoningOptions []string `json:"reasoningOptions"`
+	Selected               string   `json:"selected"`
+	ReasoningEffort        string   `json:"reasoningEffort"`
+	ReasoningOptions       []string `json:"reasoningOptions"`
+	ReasoningCustomAllowed bool     `json:"reasoningCustomAllowed,omitempty"`
 	// Effective 是"跟随配置时会实际使用的模型"，未知时为空串。
 	Effective string `json:"effective"`
 	// Source 说明 effective 的来源：override | profile | cli_default。
@@ -167,6 +168,21 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// Provider configuration can differ between isolated workspaces. Probe in
+	// the same active root used for execution, with legacy empty bindings allowed.
+	var activeWorkspaceID string
+	if err := s.db.QueryRowContext(r.Context(), `select active_workspace_id from conversations where id=?`, conversationID).Scan(&activeWorkspaceID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if activeWorkspaceID != "" {
+		workspace, err := s.resolveRequestWorkspace(r.Context(), conversation.ProjectID, conversationID)
+		if err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		projectPath = workspace.Workspace.Path
+	}
 
 	view := ConversationModelsView{
 		ConversationID:   conversation.ID,
@@ -192,27 +208,22 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if conversation.AgentID == "qoder" {
-		// Qoder 有 `--list-models`，但它们需要登录态且输出形状未校准（本机实测未登录时
-		// 只回一句英文报错）。先如实返回空目录 + 可输入提示，不拿猜出来的型号表冒充目录。
-		view.Models = []AgentModelOption{}
-		view.Note = "Qoder 没有内置模型目录，可直接在下方输入模型名（如 auto、performance，或自有模型 ID）；切换后下一条消息生效。"
+		// Only recognized structured records become model options; prose/errors
+		// fall back to manual input without inventing account-specific models.
+		view.Models = s.nativeModelCatalog(r.Context(), "qoder", projectRunner, projectPath)
+		view.Note = "目录来自 Qoder --list-models；未安装、未登录或输出无法识别时保留自定义输入。"
 	} else if conversation.AgentID == "codebuddy" {
-		// CodeBuddy 支持 --model（官方 CLI 参考），但没有与 Codex `debug models` 等价的
-		// 目录列举命令，也没有可靠的静态型号表（其型号体系与 Claude 不同）。这里不给它
-		// 冒充 Claude 的模型目录（opus/sonnet 等对 CodeBuddy 是无效模型名），如实返回空
-		// 目录，交还自定义输入。
-		view.Models = []AgentModelOption{}
-		view.Note = "CodeBuddy 没有内置模型目录，可直接在下方输入模型名（如 gpt-5）；切换后下一条消息生效。"
+		view.Models = s.nativeModelCatalog(r.Context(), "codebuddy", projectRunner, projectPath)
+		view.Note = "建议型号来自目标 CodeBuddy --help；不代表账号均可使用。读取失败仍可自填，切换后下一条消息生效。"
 	} else if conversation.AgentID == "opencode" {
 		// OpenCode 的模型 ID 由 provider/model 组成，且可用模型取决于用户在本机
-		// 配置了哪些 provider。给空目录 + 自定义输入，不拿 Claude 的型号表冒充。
-		view.Models = []AgentModelOption{}
-		view.Note = "OpenCode 使用 provider/model 形式的模型 ID（如 opencode/gpt-5.1-codex）；可直接输入，切换后下一条消息生效。"
+		// 配置了哪些 provider。通过目标环境的 CLI 探测，失败时保留自定义输入。
+		view.Models = s.nativeModelCatalog(r.Context(), "opencode", projectRunner, projectPath)
+		view.ReasoningCustomAllowed = true
+		view.Note = "目录来自 OpenCode models，使用 provider/model ID；探测失败仍可自填。推理强度对应 variant，具体名称由 provider/model 决定。"
 	} else if conversation.AgentID == "cursor" {
-		// Cursor 有 `--model`，但没有非交互的模型目录命令；可用型号还取决于账号。
-		// 给空目录 + 自定义输入，不拿 Claude 的 opus/sonnet 冒充 Cursor 的型号。
-		view.Models = []AgentModelOption{}
-		view.Note = "Cursor CLI 没有内置模型目录，可直接输入模型名（如 auto、gpt-5、sonnet-4）；切换后下一条消息生效。"
+		view.Models = s.nativeModelCatalog(r.Context(), "cursor", projectRunner, projectPath)
+		view.Note = "目录来自 Cursor agent models；探测失败仍可自填，具体可用型号取决于账号。"
 	} else if conversation.AgentID == "codex" {
 		options, note := s.codexModelCatalogFor(r.Context(), projectRunner, projectPath)
 		if len(options) > 0 {
@@ -246,14 +257,21 @@ func (s *Server) conversationModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
+// These are CLI argument choices, not a promise that every model supports every level.
 func reasoningEffortOptions(agentID string) []string {
-	if agentID == "codex" {
+	switch agentID {
+	case "codex":
 		return []string{"low", "medium", "high", "xhigh"}
-	}
-	if agentID == "claude-code" {
+	case "claude-code":
+		return []string{"low", "medium", "high", "xhigh", "max"}
+	case "codebuddy":
+		return []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+	case "qoder":
 		return []string{"low", "medium", "high"}
+	case "opencode":
+		return []string{"minimal", "low", "medium", "high", "max"}
 	}
-	return nil
+	return []string{}
 }
 
 func (s *Server) conversationReasoningEffort(ctx context.Context, conversationID string) string {
@@ -271,9 +289,8 @@ func (s *Server) setConversationReasoningEffort(w http.ResponseWriter, r *http.R
 	if !decode(w, r, &input) {
 		return
 	}
-	effort := strings.ToLower(strings.TrimSpace(input.ReasoningEffort))
-	allowed := map[string]bool{"": true, "low": true, "medium": true, "high": true, "xhigh": true}
-	if !allowed[effort] {
+	effort := strings.TrimSpace(input.ReasoningEffort)
+	if len(effort) > 64 || (effort != "" && !opencodeVariantPattern.MatchString(effort)) {
 		writeError(w, http.StatusBadRequest, errors.New("invalid reasoning effort"))
 		return
 	}
@@ -284,6 +301,11 @@ func (s *Server) setConversationReasoningEffort(w http.ResponseWriter, r *http.R
 	}
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, id); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+
 	var status, agentID string
 	if err := s.db.QueryRowContext(r.Context(), `select status,agent_id from conversations where id=?`, id).Scan(&status, &agentID); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("conversation not found"))
@@ -297,13 +319,16 @@ func (s *Server) setConversationReasoningEffort(w http.ResponseWriter, r *http.R
 		return
 	}
 	valid := false
+	if agentID != "opencode" {
+		effort = strings.ToLower(effort)
+	}
 	for _, option := range reasoningEffortOptions(agentID) {
 		if option == effort {
 			valid = true
 			break
 		}
 	}
-	if effort != "" && !valid {
+	if effort != "" && !valid && agentID != "opencode" {
 		writeError(w, http.StatusBadRequest, errors.New("该工具不支持此推理强度"))
 		return
 	}
@@ -443,6 +468,10 @@ func (s *Server) setConversationModel(w http.ResponseWriter, r *http.Request) {
 	// 与清空会话、激活会话、改权限保持同一把顺序锁。
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, chi.URLParam(r, "conversationID")); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 
 	conversationID := chi.URLParam(r, "conversationID")
 	var conversation Conversation

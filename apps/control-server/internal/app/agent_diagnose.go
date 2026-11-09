@@ -232,6 +232,10 @@ func finalizeDiagnosis(report *agentDiagnosis, hasAnyInstallation bool) {
 			return
 		}
 	}
+	if len(report.Limitations) > 0 {
+		report.Status = diagnosisUnknown
+		return
+	}
 	if hasAnyInstallation {
 		report.Status = diagnosisOK
 		return
@@ -270,7 +274,7 @@ func (s *Server) buildLocalAgentDiagnosisWith(ctx context.Context, meta RunnerMe
 	}
 
 	// 环境档先判：这一档的结论是"换环境"，不是"修工具"，后面所有检查都不必跑。
-	if _, unsupportedReason := s.agentBackend(meta, entry); unsupportedReason != "" {
+	if _, unsupportedReason := s.agentManagementBackend(meta, entry); unsupportedReason != "" {
 		report.Status = diagnosisUnsupported
 		report.add(issueEnvUnsupported, severityInfo, unsupportedReason,
 			[]string{"执行环境：" + meta.ID + "（" + diagnoseOrDash(meta.Environment) + "）"})
@@ -394,7 +398,8 @@ func (s *Server) buildCrossAgentDiagnosis(ctx context.Context, meta RunnerMeta, 
 	}
 	report.LastFailure = s.lastAgentInstallFailure(ctx, meta.ID, entry.ID)
 
-	status := s.probeAgent(ctx, meta, entry)
+	backend, reason := s.agentManagementBackend(meta, entry)
+	status := s.probeAgentBackend(ctx, meta, entry, backend, reason)
 	switch status.Status {
 	case agentStatusReady:
 		report.Status = diagnosisOK
@@ -731,6 +736,10 @@ func (s *Server) assessRuntime(ctx context.Context, shared diagnoseShared, repor
 	if !npmKind {
 		return
 	}
+	entry, requirementNote := installedRuntimeEntry(entry, recorded)
+	if requirementNote != "" {
+		report.limit(requirementNote)
+	}
 	if recorded.InstallKind != installKindNpmManaged {
 		// 装在**系统 npm 全局**里的工具：判据必须来自系统那一套，见 assessSystemNpmRuntime。
 		// 顺带也省掉一次它用不上的托管读数（`node --version` + `npm --version`）。
@@ -752,7 +761,7 @@ func (s *Server) assessRuntime(ctx context.Context, shared diagnoseShared, repor
 	if !status.Installed {
 		report.add(issueRuntimeMissing, severityBlocker,
 			fmt.Sprintf("%s 需要一个 Node.js 运行时，但这台机器上找不到可用的", entry.Name),
-			[]string{"要求：Node >= " + entry.MinRuntimeVersion},
+			[]string{"需要可用的 Node.js 运行时"},
 			remedyInstallRuntime)
 		return
 	}
@@ -772,7 +781,9 @@ func (s *Server) assessRuntime(ctx context.Context, shared diagnoseShared, repor
 	}
 	// 版本是否够用：托管工具用的就是我们那个 node，与安装闸门（plan.RuntimeVersion =
 	// runVersionCommand(managedNodeBinary)）读的是**同一个文件**，所以这里的判据同源。
-	if meets, err := runtimeMeetsMinimum(status.Version, entry.MinRuntimeVersion); err == nil && !meets {
+	if meets, err := runtimeMeetsMinimum(status.Version, entry.MinRuntimeVersion); err != nil {
+		report.limit("未能解析 Node.js 版本，未完成运行时兼容性检查")
+	} else if !meets {
 		report.add(issueRuntimeTooOld, severityBlocker,
 			fmt.Sprintf("当前 Node %s 低于 %s 要求的 %s", status.Version, entry.Name, entry.MinRuntimeVersion),
 			[]string{"运行时来源：" + status.Origin},
@@ -805,10 +816,12 @@ func (s *Server) assessSystemNpmRuntime(ctx context.Context, report *agentDiagno
 	if version == "" {
 		report.add(issueRuntimeMissing, severityBlocker,
 			fmt.Sprintf("%s 用的是系统 npm（%s），但那套 npm 旁边找不到可用的 node", entry.Name, npmPath),
-			[]string{"要求：Node >= " + entry.MinRuntimeVersion})
+			[]string{"需要可用的系统 Node.js 运行时"})
 		return
 	}
-	if meets, compareErr := runtimeMeetsMinimum(version, entry.MinRuntimeVersion); compareErr == nil && !meets {
+	if meets, compareErr := runtimeMeetsMinimum(version, entry.MinRuntimeVersion); compareErr != nil {
+		report.limit("未能解析系统 Node.js 版本，未完成运行时兼容性检查")
+	} else if !meets {
 		report.add(issueRuntimeTooOld, severityBlocker,
 			fmt.Sprintf("系统 Node %s 低于 %s 要求的 %s", version, entry.Name, entry.MinRuntimeVersion),
 			[]string{"运行时来源：系统（" + npmPath + "）"})

@@ -85,7 +85,7 @@ func (s *Server) refineTaskTitleAsync(projectID, taskID, description string) {
 			}
 			// A later edit owns the title. Never let an older background response
 			// overwrite the title derived from newer task content.
-			if _, err := s.db.ExecContext(ctx, `update tasks set title=?,updated_at=? where id=? and description=?`, title, time.Now().UTC(), taskID, description); err != nil && ctx.Err() == nil {
+			if _, err := s.db.ExecContext(ctx, `update tasks set title=?,updated_at=? where id=? and description=? and not exists(select 1 from task_execution_claims c where c.task_id=tasks.id and c.owner_kind='supervision')`, title, time.Now().UTC(), taskID, description); err != nil && ctx.Err() == nil {
 				log.Printf("refine task title %s: %v", taskID, err)
 			}
 			return

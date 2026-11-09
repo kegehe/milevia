@@ -464,6 +464,7 @@ export function TaskBoard({ projectID, projectName, initialTaskID, permissionMod
                 「点列头」选出来的其实是筛过的那几条，用户会以为选的是整列。 */}
             <span className="task-batch-hint" data-scope={query.trim() ? "filtered" : "all"}>{query.trim() ? `筛选生效：只作用于搜索出的 ${visibleTasks.length} 项` : view === "board" ? "点列头复选框可整列选择" : "点分组头复选框可整组选择"}</span>
             <span className="task-batch-count">已选 {selectedIDs.size} 项</span>
+            <button disabled={selectedIDs.size === 0 || batchDeleting} onClick={() => navigate(`/projects/${projectID}/supervision?${new URLSearchParams([...selectedIDs].map(id => ["task", id]))}`)}>托管所选任务</button>
             <button className="danger" disabled={selectedIDs.size === 0 || batchDeleting} onClick={batchDelete}>{batchDeleting ? "删除中" : `删除 (${selectedIDs.size})`}</button>
             <button className="secondary" disabled={batchDeleting} onClick={exitBatchMode}>取消</button>
           </div>
@@ -482,6 +483,7 @@ export function TaskBoard({ projectID, projectName, initialTaskID, permissionMod
           <div className="task-toolbar-group task-toolbar-commands">
             <label className="task-toolbar-search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg><input type="search" value={query} placeholder="搜索任务…" aria-label="搜索任务" onChange={(event) => setQuery(event.target.value)} /></label>
             <button className="task-toolbar-action" onClick={() => navigate(`/projects/${projectID}/orchestration`)}><TaskToolbarIcon name="workflow" />自动编排</button>
+            <button className="task-toolbar-action" onClick={() => navigate(`/projects/${projectID}/supervision`)}><TaskToolbarIcon name="workflow" />任务托管</button>
             <button className="task-toolbar-action" onClick={() => setTransfer("export")}><TaskToolbarIcon name="download" />导出</button>
             <button className="task-toolbar-action" onClick={() => setTransfer("import")}><TaskToolbarIcon name="upload" />导入</button>
             <button className="task-toolbar-action" onClick={enterBatchMode}><TaskToolbarIcon name="batch" />批量管理</button>

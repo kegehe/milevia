@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,19 +29,21 @@ import (
 // sshClient wraps an SSH connection to a remote server. It is safe for
 // concurrent use.
 type sshClient struct {
-	mu          sync.Mutex
-	config      ssh.ClientConfig
-	host        string
-	port        int
-	client      *ssh.Client
-	lastHostKey string // set after the first successful dial
-	tunnel      net.Listener
-	tunnelReady chan struct{}
-	tunnelWG    sync.WaitGroup
-	agentConn   net.Conn
-	closed      bool
-	sftpClient  *sftp.Client // 持久化 SFTP 客户端（懒初始化）
-	sftpMu      sync.Mutex   // 保护 sftpClient
+	workspaceUncertainty atomic.Uint64
+	workspaceFailures    workspaceFailureTracker
+	mu                   sync.Mutex
+	config               ssh.ClientConfig
+	host                 string
+	port                 int
+	client               *ssh.Client
+	lastHostKey          string // set after the first successful dial
+	tunnel               net.Listener
+	tunnelReady          chan struct{}
+	tunnelWG             sync.WaitGroup
+	agentConn            net.Conn
+	closed               bool
+	sftpClient           *sftp.Client // 持久化 SFTP 客户端（懒初始化）
+	sftpMu               sync.Mutex   // 保护 sftpClient
 }
 
 func parsePinnedHostKey(value string) (ssh.PublicKey, error) {
@@ -100,6 +103,7 @@ var newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, e
 	// A saved host key is a strict pin. New connections are allowed to capture a
 	// key only during preflight; creation requires the user to submit that key.
 	var storedCallback ssh.HostKeyCallback
+	var hostKeyAlgorithms []string
 	if conn.KnownHosts != "" {
 		pubKey, err := parsePinnedHostKey(conn.KnownHosts)
 		if err != nil {
@@ -107,6 +111,13 @@ var newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, e
 			return nil, err
 		}
 		storedCallback = ssh.FixedHostKey(pubKey)
+		// A host commonly offers RSA, ECDSA and Ed25519 together. Negotiate
+		// the saved key's type rather than rejecting the same host just because
+		// another client preferred a different algorithm during preflight.
+		hostKeyAlgorithms = []string{pubKey.Type()}
+		if pubKey.Type() == ssh.KeyAlgoRSA {
+			hostKeyAlgorithms = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}
+		}
 	} else if !trustOnFirstUse {
 		_ = c.close()
 		return nil, errors.New("未确认远端主机指纹，请先重新执行连接预检")
@@ -115,8 +126,9 @@ var newSSHClient = func(conn SSHConnection, trustOnFirstUse bool) (*sshClient, e
 	// Wrap in a unified callback that always captures lastHostKey, then
 	// delegates to the stored verifier (if any).
 	c.config = ssh.ClientConfig{
-		User: conn.User,
-		Auth: []ssh.AuthMethod{auth},
+		User:              conn.User,
+		Auth:              []ssh.AuthMethod{auth},
+		HostKeyAlgorithms: hostKeyAlgorithms,
 		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 			c.lastHostKey = string(ssh.MarshalAuthorizedKey(key))
 			c.lastHostKey = strings.TrimSuffix(c.lastHostKey, "\n")
@@ -272,6 +284,7 @@ func (c *sshClient) close() error {
 		return nil
 	}
 	c.closed = true
+	c.workspaceUncertainty.Add(1)
 	tunnelReady := c.tunnelReady
 	tunnel := c.tunnel
 	client := c.client
@@ -407,7 +420,7 @@ func (c *sshClient) execCommand(ctx context.Context, cmd string) ([]byte, error)
 		return nil, errors.New("SSH 连接已断开")
 	}
 
-	session, err := client.NewSession()
+	session, err := c.newWorkspaceSession(client, workspaceCommandPath(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("创建 SSH session 失败：%w", err)
 	}
@@ -455,71 +468,11 @@ func (cw *cappedWriter) Write(p []byte) (int, error) {
 
 // execCommandSeparate runs a command on the remote server, returning stdout
 // and stderr separately. stdout is capped at stdoutLimit+1 bytes to bound
-// memory; callers check for overflow. stderr is read in full (typically small).
+// memory; callers check for overflow. stderr retains at most 64 KiB.
 // Respects context cancellation. Used by the Git SSH backend so that git
 // warnings on stderr do not pollute structured stdout.
 func (c *sshClient) execCommandSeparate(ctx context.Context, cmd string, stdoutLimit int) (stdout, stderr []byte, err error) {
-	if err := c.connect(ctx); err != nil {
-		return nil, nil, err
-	}
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
-	if client == nil {
-		return nil, nil, errors.New("SSH 连接已断开")
-	}
-
-	session, err := client.NewSession()
-	if err != nil {
-		return nil, nil, fmt.Errorf("创建 SSH session 失败：%w", err)
-	}
-	defer session.Close()
-
-	stdoutPipe, err := session.StdoutPipe()
-	if err != nil {
-		return nil, nil, fmt.Errorf("创建 stdout 管道失败：%w", err)
-	}
-	stderrPipe, err := session.StderrPipe()
-	if err != nil {
-		return nil, nil, fmt.Errorf("创建 stderr 管道失败：%w", err)
-	}
-
-	type result struct {
-		stdout []byte
-		stderr []byte
-		err    error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		var stdoutBuf, stderrBuf bytes.Buffer
-		stdoutCapped := &cappedWriter{buf: &stdoutBuf, limit: stdoutLimit + 1}
-		done := make(chan struct{})
-		go func() {
-			io.Copy(stdoutCapped, stdoutPipe)
-			io.Copy(&stderrBuf, stderrPipe)
-			close(done)
-		}()
-		err := session.Start(cmd)
-		if err != nil {
-			// Start 失败时 session 未运行，pipe reader 会阻塞在 Read 上。
-			// 关闭 session 让 pipe reader 收到 EOF 后退出，避免 <-done 死锁。
-			session.Close()
-			<-done
-			ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), err}
-			return
-		}
-		waitErr := session.Wait()
-		<-done
-		ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), waitErr}
-	}()
-
-	select {
-	case <-ctx.Done():
-		session.Signal(ssh.SIGKILL)
-		return nil, nil, ctx.Err()
-	case r := <-ch:
-		return r.stdout, r.stderr, r.err
-	}
+	return c.execCommandWithStdinSeparate(ctx, cmd, nil, stdoutLimit)
 }
 
 // execCommandWithStdin runs a command on the remote server, feeding stdin and
@@ -535,7 +488,7 @@ func (c *sshClient) execCommandWithStdin(ctx context.Context, cmd string, stdin 
 		return nil, errors.New("SSH 连接已断开")
 	}
 
-	session, err := client.NewSession()
+	session, err := c.newWorkspaceSession(client, workspaceCommandPath(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("创建 SSH session 失败：%w", err)
 	}
@@ -569,7 +522,7 @@ func (c *sshClient) execCommandWithStdin(ctx context.Context, cmd string, stdin 
 
 // execCommandWithStdinSeparate runs a command on the remote server, feeding
 // stdin via pipe and returning stdout/stderr separately. stdout is capped at
-// stdoutLimit+1 bytes to bound memory. Respects context cancellation.
+// stdoutLimit+1 bytes and stderr at 64 KiB. Respects context cancellation.
 // Used by the Git SSH backend for --pathspec-from-file=- and commit --file=-.
 func (c *sshClient) execCommandWithStdinSeparate(ctx context.Context, cmd string, stdin []byte, stdoutLimit int) (stdout, stderr []byte, err error) {
 	if err := c.connect(ctx); err != nil {
@@ -582,23 +535,12 @@ func (c *sshClient) execCommandWithStdinSeparate(ctx context.Context, cmd string
 		return nil, nil, errors.New("SSH 连接已断开")
 	}
 
-	session, err := client.NewSession()
+	session, err := c.newWorkspaceSession(client, workspaceCommandPath(ctx))
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建 SSH session 失败：%w", err)
 	}
 	defer session.Close()
-	w, err := session.StdinPipe()
-	if err != nil {
-		return nil, nil, fmt.Errorf("创建 SSH stdin 管道失败：%w", err)
-	}
-	stdoutPipe, err := session.StdoutPipe()
-	if err != nil {
-		return nil, nil, fmt.Errorf("创建 stdout 管道失败：%w", err)
-	}
-	stderrPipe, err := session.StderrPipe()
-	if err != nil {
-		return nil, nil, fmt.Errorf("创建 stderr 管道失败：%w", err)
-	}
+	session.Stdin = bytes.NewReader(stdin)
 
 	type result struct {
 		stdout []byte
@@ -607,29 +549,12 @@ func (c *sshClient) execCommandWithStdinSeparate(ctx context.Context, cmd string
 	}
 	ch := make(chan result, 1)
 	go func() {
-		go func() {
-			_, _ = w.Write(stdin)
-			_ = w.Close()
-		}()
 		var stdoutBuf, stderrBuf bytes.Buffer
-		stdoutCapped := &cappedWriter{buf: &stdoutBuf, limit: stdoutLimit + 1}
-		done := make(chan struct{})
-		go func() {
-			io.Copy(stdoutCapped, stdoutPipe)
-			io.Copy(&stderrBuf, stderrPipe)
-			close(done)
-		}()
-		startErr := session.Start(cmd)
-		if startErr != nil {
-			// Start 失败时 session 未运行，pipe reader 会阻塞在 Read 上。
-			// 关闭 session 让 pipe reader 收到 EOF 后退出，避免 <-done 死锁。
-			session.Close()
-			<-done
-			ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), startErr}
-			return
-		}
-		waitErr := session.Wait()
-		<-done
+		// ssh.Session drains both writers concurrently and Wait joins the copies.
+		// Sequential pipe reads can fill the shared SSH window and deadlock.
+		session.Stdout = &cappedWriter{buf: &stdoutBuf, limit: stdoutLimit + 1}
+		session.Stderr = &cappedWriter{buf: &stderrBuf, limit: 64 << 10}
+		waitErr := session.Run(cmd)
 		ch <- result{stdoutBuf.Bytes(), stderrBuf.Bytes(), waitErr}
 	}()
 	select {
@@ -712,14 +637,17 @@ func (c *sshClient) readDir(ctx context.Context, path string) ([]os.FileInfo, er
 }
 
 // newSession creates a new SSH session. The caller must close it.
-func (c *sshClient) newSession(ctx context.Context) (*ssh.Session, error) {
+func (c *sshClient) newSession(ctx context.Context, paths ...string) (*workspaceSSHSession, error) {
 	if err := c.connect(ctx); err != nil {
 		return nil, err
 	}
 	c.mu.Lock()
 	client := c.client
 	c.mu.Unlock()
-	return client.NewSession()
+	if len(paths) > 0 {
+		ctx = workspaceCommandContext(ctx, paths[0])
+	}
+	return c.newWorkspaceSession(client, workspaceCommandPath(ctx))
 }
 
 // sshRunner implements AgentRunner + StreamingAgentRunner for a remote server
@@ -1038,7 +966,8 @@ func (r *sshRunner) CheckUpdate(ctx context.Context) (bool, string, error) {
 // prefix，不经这条路）；那一档若升级失败，自动回滚可能定位不到同一个 prefix，
 // 于是如实报出错误、交给用户处理，而不是回滚到别的地方去。
 func (r *sshRunner) Update(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "远程服务器上", "claude", []string{"update"}, "Claude Code", claudeNpmCLIInstall, r.crossRun, r.Version)
+	e, _ := agentByID("claude-code")
+	return (&catalogAgentBackend{entry: e, shell: r}).Update(ctx)
 }
 
 // execRemote 在远端跑一条脚本。
@@ -1050,14 +979,9 @@ func (r *sshRunner) execRemote(ctx context.Context, script string) (string, erro
 	return string(out), err
 }
 
-// codexLoginStatusCommand mirrors the local codex runner's readiness check on
-// the remote host. Codex prints "Logged in" (or similar) on success and exits
-// non-zero when not authenticated.
-const codexLoginStatusCommand = "codex login status"
-
+// 安装就绪与账号认证分别查询，认证失败不应隐藏管理操作。
 func (r *sshRunner) CodexReady(ctx context.Context) bool {
-	out, err := r.client.execCommand(ctx, sshRemoteCommand("command -v codex && "+codexLoginStatusCommand))
-	return err == nil && len(out) > 0
+	return r.CodexVersion(ctx) != ""
 }
 
 // OpenCodeReady / OpenCodeVersion implement OpenCodeCapableRunner.
@@ -1153,13 +1077,14 @@ func (r *sshRunner) CodexCheckUpdate(ctx context.Context) (bool, string, error) 
 }
 
 func (r *sshRunner) CodexUpdate(ctx context.Context) (string, string, error) {
-	return runCrossCLIUpdate(ctx, "远程服务器上", "codex", []string{"update"}, "Codex CLI", codexNpmCLIInstall, r.crossRun, r.CodexVersion)
+	e, _ := agentByID("codex")
+	return (&catalogAgentBackend{entry: e, shell: r}).Update(ctx)
 }
 
 // ── crossShellRunner：目录驱动的工具（catalogAgentBackend 用）────────────────
 //
 // 与 CodexCapableRunner 那类逐工具方法的分工：那些只为**真有额外语义**的工具保留
-// （Codex 的就绪要看登录态）。目录里其余工具一律走这三个方法，因此远端新增一个工具
+// （Codex 独立的执行适配）。目录里其余工具一律走这三个方法，因此远端新增一个工具
 // 时这里不需要任何改动。
 
 // crossProbe 在远端执行 `name args...` 并拿回 stdout。
@@ -1341,7 +1266,7 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 			return err
 		}
 	}
-	session, err := r.client.newSession(ctx)
+	session, err := r.client.newSession(ctx, request.ProjectPath)
 	if err != nil {
 		return err
 	}
@@ -1418,8 +1343,18 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	if err != nil {
 		return fmt.Errorf("SSH stderr pipe: %w", err)
 	}
-	if err := session.Start(cmd); err != nil {
-		return fmt.Errorf("启动远程 Claude 失败：%w", err)
+	cmd, stopCLI, err := ordinaryCLIRemoteScript(ctx, ordinaryCLIConfig(ctx), r, request.ProjectPath, cmd)
+	defer func() {
+		if stopCLI != nil {
+			stopCLI()
+		}
+	}()
+	if err != nil {
+		session.Close()
+		return err
+	}
+	if startErr := session.Start(cmd); startErr != nil {
+		return fmt.Errorf("启动远程 Claude 失败：%w", startErr)
 	}
 
 	done := make(chan error, 1)
@@ -1546,14 +1481,20 @@ func buildSSHCodexExecCommand(request AgentRunRequest, transportArgs, configArg,
 	if request.ReasoningEffort != "" {
 		modelArg += fmt.Sprintf(" -c %s", shellQuote(fmt.Sprintf("model_reasoning_effort=%q", request.ReasoningEffort)))
 	}
+	imageArgs := ""
+	for _, attachment := range request.Attachments {
+		if nativeImageMediaType(attachment.MediaType) {
+			imageArgs += " --image " + shellQuote(attachment.Path)
+		}
+	}
 	if request.Resume {
 		// resume 同样要跳过 git 仓库检查：远端项目目录也可能还没有 .git，
 		// 缺这个开关时 CLI 会在恢复会话前就退出（与本地/WSL 的 resume 分支一致）。
 		return fmt.Sprintf("codex exec%s resume -c %s --json --skip-git-repo-check%s %s %s",
-			modelArg, shellQuote(configArg), schemaArg, shellQuote(request.SessionID), shellQuote(request.Prompt))
+			modelArg, shellQuote(configArg), schemaArg+imageArgs, shellQuote(request.SessionID), shellQuote(request.Prompt))
 	}
 	return fmt.Sprintf("codex exec %s%s -c %s --json --skip-git-repo-check --color never -C %s --sandbox %s%s %s",
-		transportArgs, modelArg, shellQuote(configArg), shellQuote(request.ProjectPath), policy, schemaArg, shellQuote(request.Prompt))
+		transportArgs, modelArg, shellQuote(configArg), shellQuote(request.ProjectPath), policy, schemaArg+imageArgs, shellQuote(request.Prompt))
 }
 
 // runCodex executes one non-interactive Codex turn on the remote host over SSH.
@@ -1601,7 +1542,7 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 	// Run from the project directory so Codex resolves relative paths correctly.
 	fullCmd := fmt.Sprintf("%s%scd %s && %s", sshSessionPrefix(), schemaSetup, shellQuote(request.ProjectPath), cmd)
 
-	session, err := r.client.newSession(ctx)
+	session, err := r.client.newSession(ctx, request.ProjectPath)
 	if err != nil {
 		return err
 	}
@@ -1614,6 +1555,16 @@ func (r *sshRunner) runCodex(ctx context.Context, request AgentRunRequest, sink 
 	stderr, err := session.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("SSH stderr pipe: %w", err)
+	}
+	fullCmd, stopCLI, err := ordinaryCLIRemoteScript(ctx, ordinaryCLIConfig(ctx), r, request.ProjectPath, fullCmd)
+	defer func() {
+		if stopCLI != nil {
+			stopCLI()
+		}
+	}()
+	if err != nil {
+		session.Close()
+		return err
 	}
 	if err := session.Start(fullCmd); err != nil {
 		return fmt.Errorf("启动远程 Codex 失败：%w", err)
@@ -1684,7 +1635,7 @@ func (r *sshRunner) runOpenCode(ctx context.Context, request AgentRunRequest, si
 	if err != nil {
 		return err
 	}
-	session, err := r.client.newSession(ctx)
+	session, err := r.client.newSession(ctx, request.ProjectPath)
 	if err != nil {
 		return err
 	}
@@ -1701,6 +1652,16 @@ func (r *sshRunner) runOpenCode(ctx context.Context, request AgentRunRequest, si
 	stderr, err := session.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("SSH OpenCode stderr pipe: %w", err)
+	}
+	command, stopCLI, err := ordinaryCLIRemoteScript(ctx, ordinaryCLIConfig(ctx), r, request.ProjectPath, command)
+	defer func() {
+		if stopCLI != nil {
+			stopCLI()
+		}
+	}()
+	if err != nil {
+		session.Close()
+		return err
 	}
 	if err := session.Start(command); err != nil {
 		return fmt.Errorf("启动远程 OpenCode 失败：%w", err)
@@ -1834,7 +1795,7 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 			return nil, err
 		}
 	}
-	session, err := r.client.newSession(ctx)
+	session, err := r.client.newSession(ctx, req.ProjectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -1906,6 +1867,15 @@ func (r *sshRunner) StartSession(ctx context.Context, req AgentSessionRequest) (
 		r.removeRemoteMCPFile(mcpPath)
 		return nil, fmt.Errorf("SSH stderr pipe: %w", err)
 	}
+	cmd, stopCLI, err := ordinaryCLIRemoteScript(ctx, ordinaryCLIConfig(ctx), r, req.ProjectPath, cmd)
+	if stopCLI != nil {
+		session.setOrdinaryCLIStop(stopCLI)
+	}
+	if err != nil {
+		session.Close()
+		r.removeRemoteMCPFile(mcpPath)
+		return nil, err
+	}
 	if err := session.Start(cmd); err != nil {
 		session.Close()
 		r.removeRemoteMCPFile(mcpPath)
@@ -1970,7 +1940,7 @@ func sshClaudePermissionArgs(permissionMode, approvalHookCmd string, autoApprove
 
 // sshAgentSession implements AgentSession for a remote SSH Claude process.
 type sshAgentSession struct {
-	session                *ssh.Session
+	session                *workspaceSSHSession
 	stdin                  io.WriteCloser
 	stdout                 io.Reader
 	stderr                 io.Reader
@@ -2131,7 +2101,7 @@ func (s *sshAgentSession) startCurrentLocked(turn *claudeSessionTurn) error {
 	}
 	payload, err := json.Marshal(map[string]any{
 		"type":    "user",
-		"message": map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": turn.request.Prompt}}},
+		"message": map[string]any{"role": "user", "content": agentContent(turn.request.Prompt, turn.request.Attachments)},
 	})
 	if err != nil {
 		return fmt.Errorf("encode stream-json request: %w", err)

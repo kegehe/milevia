@@ -730,6 +730,11 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 		scanCtx, cancel = context.WithTimeout(ctx, insightScanPassTimeout)
 	}
 	defer cancel()
+	scanCtx, releaseWorkspace, err := s.beginCLIWorkspaceOperationAtPath(scanCtx, project, project.Path, "insight-agent")
+	if err != nil {
+		return "", err
+	}
+	defer releaseWorkspace()
 	if err := runner.Run(scanCtx, AgentRunRequest{
 		SessionID:      uuid.NewString(),
 		ProjectPath:    project.Path,

@@ -65,8 +65,8 @@ func TestAgentAuthStateFromStatusOutputIsThreeWay(t *testing.T) {
 	if got := agentAuthStateFromStatusOutput("0 credentials\n", markers); got != agentAuthLoggedOut {
 		t.Fatalf("命中空标记应读成未登录，得到 %q", got)
 	}
-	if got := agentAuthStateFromStatusOutput("OpenCode Zen  api_key\n", markers); got != agentAuthLoggedIn {
-		t.Fatalf("命令成功且没有空标记应读成已登录，得到 %q", got)
+	if got := agentAuthStateFromStatusOutput("OpenCode Zen  api_key\n", markers); got != agentAuthUnreadable {
+		t.Fatalf("没有正向证据不能推断登录，得到 %q", got)
 	}
 	// 空输出是**判断不了**：既不冒充未登录，也不冒充已登录。
 	if got := agentAuthStateFromStatusOutput("   \n", markers); got != agentAuthUnreadable {
@@ -226,30 +226,37 @@ func TestLoginStatusWireKeepsUnreadableOutOfLoggedOut(t *testing.T) {
 		return body
 	}
 
-	shell.outputs["opencode"] = "0 credentials\n"
+	output, failed := "0 credentials\n", false
+	shell.runFunc = func(string) (string, error) {
+		if failed {
+			return "", errors.New("fixture failure")
+		}
+		return output + "\n__MILEVIA_AUTH_STDERR__\n\n__MILEVIA_AUTH_CODE__=0\n", nil
+	}
 	if body := call(false); body["authStatus"] != agentAuthLoggedOut || body["loggedIn"] != false {
 		t.Fatalf("空标记应读成未登录：%v", body)
 	}
-	shell.outputs["opencode"] = "OpenCode Zen  api_key\n"
-	if body := call(true); body["authStatus"] != agentAuthLoggedIn || body["loggedIn"] != true {
-		t.Fatalf("有凭据应读成已登录：%v", body)
+	output = "0 credentials\n1 environment variable\n"
+	if body := call(true); body["authStatus"] != agentAuthConfigured || body["loggedIn"] != false {
+		t.Fatalf("有凭据应读成已配置：%v", body)
 	}
 	// 命令跑不起来：判断不了，而 loggedIn 这个兼容位仍然是 false —— 新界面读的是
 	// authStatus，所以它不会把这句 false 念成"未登录"。
-	shell.failing["opencode"] = true
+	failed = true
 	body := call(true)
 	if body["authStatus"] != agentAuthUnreadable {
 		t.Fatalf("读不到时必须报 unreadable：%v", body)
 	}
-	if note, _ := body["note"].(string); !strings.Contains(note, "opencode") {
+	if note, _ := body["note"].(string); note == "" || strings.Contains(note, "fixture failure") {
 		t.Fatalf("读不到时要带可读原因：%v", body)
 	}
 }
 
 func TestLoginStatusRejectsToolsOutsidePlatformLogin(t *testing.T) {
+	withExtraCatalogEntry(t, AgentCatalogEntry{ID: "no-auth", Name: "No auth"})
 	server := &Server{runtimeCtx: context.Background()}
-	request := httptest.NewRequest(http.MethodGet, "/api/runners/windows-local/agents/claude-code/login-status", nil)
-	request = withURLParam(withURLParam(request, "runnerID", "windows-local"), "agentID", "claude-code")
+	request := httptest.NewRequest(http.MethodGet, "/api/runners/windows-local/agents/no-auth/login-status", nil)
+	request = withURLParam(request, "agentID", "no-auth")
 	recorder := httptest.NewRecorder()
 	server.agentLoginStatus(recorder, request)
 	if recorder.Code != http.StatusNotImplemented {

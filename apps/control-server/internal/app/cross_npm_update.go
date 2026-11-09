@@ -40,7 +40,17 @@ func runCrossCLIUpdate(
 	run crossCommandRunner,
 	version func(context.Context) string,
 ) (string, string, error) {
-	previous := version(ctx)
+	return runCrossCLIUpdateChecked(ctx, where, commandName, updateArgs, displayName, install, run,
+		func(ctx context.Context) (string, error) { return version(ctx), nil })
+}
+
+func runCrossCLIUpdateChecked(ctx context.Context, where, commandName string, updateArgs []string, displayName string,
+	install npmCLIInstall, run crossCommandRunner, version func(context.Context) (string, error),
+) (string, string, error) {
+	previous, probeErr := version(ctx)
+	if probeErr != nil {
+		return "", "", fmt.Errorf("升级前无法确认 %s 的版本：%w", displayName, probeErr)
+	}
 	if previous == "" {
 		return "", "", fmt.Errorf("%s未安装 %s", where, displayName)
 	}
@@ -52,14 +62,17 @@ func runCrossCLIUpdate(
 	}
 	out, err := run(ctx, updateCommand)
 	if err != nil {
-		return finishCrossNpmUpdate(previous, displayName, version, run,
+		return finishCrossNpmUpdateChecked(previous, displayName, version, run,
 			fmt.Errorf("%s执行 %s %s 失败：%w%s", where, commandName, strings.Join(updateArgs, " "), err, updateOutputDetail(out)), recovery, recoveryErr)
 	}
 	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	current := version(healthCtx)
+	current, probeErr := version(healthCtx)
+	if probeErr != nil {
+		return previous, "", fmt.Errorf("%s 更新后无法确认健康状态：%w；未自动回滚，请重新检查", displayName, probeErr)
+	}
 	if current == "" {
-		return finishCrossNpmUpdate(previous, displayName, version, run,
+		return finishCrossNpmUpdateChecked(previous, displayName, version, run,
 			fmt.Errorf("%s上的 %s 更新后未通过健康检查", where, displayName), recovery, recoveryErr)
 	}
 	return previous, current, nil
@@ -98,8 +111,19 @@ func finishCrossNpmUpdate(
 	recovery remoteNpmCLIRecovery,
 	recoveryErr error,
 ) (string, string, error) {
+	return finishCrossNpmUpdateChecked(previous, displayName, func(ctx context.Context) (string, error) { return version(ctx), nil }, run, updateErr, recovery, recoveryErr)
+}
+
+func finishCrossNpmUpdateChecked(previous, displayName string, version func(context.Context) (string, error), run crossCommandRunner,
+	updateErr error, recovery remoteNpmCLIRecovery, recoveryErr error,
+) (string, string, error) {
 	healthCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	if version(healthCtx) != "" {
+	current, probeErr := version(healthCtx)
+	if probeErr != nil {
+		cancel()
+		return previous, "", fmt.Errorf("%w；无法确认健康状态：%v；未自动回滚，请重新检查", updateErr, probeErr)
+	}
+	if current != "" {
 		// 命令报错但工具还能用：不回滚（回滚反而会把一个可用的版本换掉）。
 		cancel()
 		return previous, "", updateErr
@@ -115,8 +139,11 @@ func finishCrossNpmUpdate(
 		return previous, "", fmt.Errorf("%w；自动回滚失败：%v", updateErr, err)
 	}
 	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	current := version(verifyCtx)
+	current, probeErr = version(verifyCtx)
 	verifyCancel()
+	if probeErr != nil {
+		return previous, "", fmt.Errorf("%w；已执行回滚但无法确认版本：%v", updateErr, probeErr)
+	}
 	if current != previous {
 		return previous, "", fmt.Errorf("%w；自动回滚失败：回滚后的健康检查没过（版本 %q）", updateErr, current)
 	}

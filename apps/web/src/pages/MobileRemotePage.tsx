@@ -14,7 +14,9 @@ import { useCardDragReorder } from "../lib/use-card-drag";
 import { systemItemFromEvent, eventDiagnostic, cliOutputDiagnostic } from "../lib/timeline";
 import { contextLabel, contextLevel } from "../lib/utils";
 import { NON_GIT_BRANCH } from "../lib/types";
-import type { Ask, ConversationCheckpoint, ConversationModels, ConversationUsageResponse, SystemVariant, PermissionMode, AgentID } from "../lib/types";
+import type { Ask, ConversationCheckpoint, ConversationModels, ConversationUsageResponse, SystemVariant, PermissionMode, AgentID, MessageAttachment } from "../lib/types";
+import { MessageAttachmentPicker } from "../features/files/MessageAttachments";
+import { attachmentMessageBody, mergeMessageAttachments } from "../features/files/message-attachment-model";
 import { AgentLogo } from "../components/AgentLogo";
 import { ExternalLink } from "../components/ExternalLink";
 import { MOBILE_AGENTS } from "../lib/mobile-agent-catalog";
@@ -27,7 +29,7 @@ import { priorityLabels, statusLabels, type Priority } from "../features/tasks/t
 import { desktopServiceView, heartbeatAgoText, refreshDesktopStatusMessage, shortInstanceID } from "../features/remote/desktop-service";
 import { cloudClientWaitMs } from "../features/remote/cloud-budget";
 import { snapshotRequestPath } from "../features/remote/snapshot-request";
-import { mergeSnapshotPendingMessages } from "../features/remote/snapshot-pending-message-merge";
+import { hasOtherPendingMessages, mergeSnapshotPendingMessages, pendingMessageMatches } from "../features/remote/snapshot-pending-message-merge";
 import { mergeSnapshotRealtimeMessages } from "../features/remote/snapshot-realtime-merge";
 import { mergeSnapshotStreamingMessages } from "../features/remote/snapshot-streaming-merge";
 import { mergeSnapshotNotices } from "../features/remote/snapshot-notice-merge";
@@ -104,7 +106,7 @@ type Instance = { instanceId: string; name: string; status: string; lastAgentSeq
 // `.toLowerCase()`"的直取都会被编译期挡下，而不是等到真机上整页白屏（2026-09-18 复查收紧）。
 // 历史上这里是 `string`，而 `taskSummary` 里那句直取的 `title.trim()` 真炸过（有实测复现）。
 type Task = { id: string; title: string | null; description?: string | null; priority: string; status: string; updatedAt: string };
-type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; createdAt: string };
+type Message = { id: string; runId?: string; clientRequestId?: string; role: "user" | "assistant"; content: string; createdAt: string; attachments?: MessageAttachment[] };
 // Notice 是"运行过程"而非"对话内容"：API 重试、上下文压缩、后台任务、执行失败。
 // 手机端原先只转发 user/assistant 消息，这类事件在到达时被直接丢弃，于是电脑上
 // 已经显示"重试中 / 正在压缩上下文 / 执行失败"，手机端却像卡住了一样什么都没有。
@@ -144,7 +146,7 @@ type AcceptedCommand = { commandId: string; status: string };
 type InstanceFetchResult = { instances: Instance[]; outcome: "ok" | "failed" | "superseded"; reason?: string };
 // 刷新按钮的结果条：refreshing 与其它状态互斥，at 为完成时刻（refreshing 时为空）。
 type RefreshStatus = { state: "refreshing" | "success" | "unchanged" | "failed"; message: string; at: Date | null };
-type PendingMessage = { requestId: string; content: string; createdAt: string };
+type PendingMessage = { requestId: string; content: string; createdAt: string; attachments?: MessageAttachment[] };
 type ProcessingConversation = { count: number; startedAt: number; snapshotRevision: number };
 type ProcessingConversations = Record<string, ProcessingConversation>;
 
@@ -325,8 +327,20 @@ function remoteHistoryMessages(value: unknown): Message[] {
     if (!item || typeof item.id !== "string" || typeof item.content !== "string" || (item.role !== "user" && item.role !== "assistant")) return [];
     // 工具调用的内部子消息不属于用户可继续阅读的对话正文。
     if (typeof item.parentToolUseId === "string" && item.parentToolUseId) return [];
-    return [{ id: item.id, runId: typeof item.runId === "string" ? item.runId : undefined, role: item.role, content: item.content, createdAt: typeof item.createdAt === "string" ? item.createdAt : "" }];
+    return [{ id: item.id, runId: typeof item.runId === "string" ? item.runId : undefined, clientRequestId: typeof item.clientRequestId === "string" ? item.clientRequestId : undefined, role: item.role, content: item.content, attachments: remoteAttachments(item.attachments), createdAt: typeof item.createdAt === "string" ? item.createdAt : "" }];
   });
+}
+
+function remoteAttachments(value: unknown): MessageAttachment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const item = asRecord(entry);
+    return item && typeof item.path === "string" ? [{ path: item.path, size: typeof item.size === "number" ? item.size : undefined, mediaType: typeof item.mediaType === "string" ? item.mediaType : undefined }] : [];
+  });
+}
+
+function mobileMessageBody(message: Message): string {
+  return attachmentMessageBody(message);
 }
 
 function mobileAgentStatus(project: Project | null | undefined, agentID: MobileAgentID): RemoteAgentStatus | undefined {
@@ -1166,10 +1180,16 @@ export default function MobileRemotePage() {
   // 手机上会直接铺满整屏，而 setMessageDraft 是整体覆盖 —— 用户写到一半的草稿会被无声吃掉。
   // 现在记成一颗可删除的胶囊，发送那一刻才由 composeSkillMessage 展开成完整引用指令。
   const [skillRefs, setSkillRefs] = useState<RemoteSkill[]>([]);
+  const [messageAttachments, setMessageAttachments] = useState<MessageAttachment[]>([]);
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const attachmentDraftsRef = useRef(new Map<string, MessageAttachment[]>());
+  const attachmentConversationRef = useRef("");
+  const attachmentsRef = useRef(messageAttachments);
+  attachmentsRef.current = messageAttachments;
   // 已引用、尚未发送的那条消息（见 MessageQuote）。与技能引用同一条生命周期规则：
   // 发送时与草稿一起乐观清空、失败时一起还回来、换会话/换项目时一起清掉。
   const [quoteRef, setQuoteRef] = useState<MessageQuote | null>(null);
-  const [scheduledSend, setScheduledSend] = useState<{ id: string; conversationId: string; draft: string; skillRefs: RemoteSkill[]; quote: MessageQuote | null } | null>(null);
+  const [scheduledSend, setScheduledSend] = useState<{ id: string; conversationId: string; draft: string; skillRefs: RemoteSkill[]; quote: MessageQuote | null; attachments: MessageAttachment[] } | null>(null);
   const [contextUsage, setContextUsage] = useState<ConversationUsageResponse | null>(null);
   const [modelSheet, setModelSheet] = useState<ConversationModels | null | false>(false);
   const [permissionSheetOpen, setPermissionSheetOpen] = useState(false);
@@ -1637,11 +1657,12 @@ export default function MobileRemotePage() {
   });
 
   const mergeLoadedSnapshot = useCallback((value: Snapshot, baseline: number): Snapshot => {
-    let merged = mergeSnapshotPendingMessages(value, pendingMessageRef.current, (message) => ({
+    let merged = mergeSnapshotPendingMessages<Snapshot, Message>(value, pendingMessageRef.current, (message): Message => ({
       id: `pending-${message.requestId}`,
       role: "user",
       content: message.content,
       createdAt: message.createdAt,
+      attachments: message.attachments,
     }));
     merged = mergeSnapshotRealtimeMessages(merged, realtimeMessagesRef.current, baseline);
     merged = mergeSnapshotStreamingMessages(merged, streamingMessagesRef.current, (messageID, chunk) => ({
@@ -1811,7 +1832,7 @@ export default function MobileRemotePage() {
       }
       if ((event.type === "user.message" || event.type === "assistant.message") && typeof payload.id === "string" && typeof payload.conversationId === "string" && typeof payload.content === "string") {
         const role: Message["role"] = event.type === "assistant.message" ? "assistant" : "user";
-        const realtimeMessage: Message = { id: payload.id, runId: payload.runId, role, content: payload.content, createdAt: payload.createdAt || event.createdAt || new Date().toISOString() };
+        const realtimeMessage: Message = { id: payload.id, runId: payload.runId, clientRequestId: typeof payload.clientRequestId === "string" ? payload.clientRequestId : undefined, role, content: payload.content, attachments: remoteAttachments(payload.attachments), createdAt: payload.createdAt || event.createdAt || new Date().toISOString() };
         realtimeMessagesRef.current.set(realtimeMessage.id, { conversationId: payload.conversationId, message: realtimeMessage, revision: snapshotRevisionRef.current });
         if (realtimeMessagesRef.current.size > 500) {
           const oldest = realtimeMessagesRef.current.keys().next().value;
@@ -1820,7 +1841,7 @@ export default function MobileRemotePage() {
         if (role === "user") {
           const pending = pendingMessageRef.current.get(payload.conversationId);
           if (pending) {
-            const matching = [...pending.values()].find((item) => item.content === payload.content);
+            const matching = [...pending.values()].find((item) => pendingMessageMatches(item, realtimeMessage));
             if (matching) pending.delete(matching.requestId);
             if (pending.size === 0) pendingMessageRef.current.delete(payload.conversationId);
           }
@@ -1836,7 +1857,7 @@ export default function MobileRemotePage() {
             if (entry.id !== payload.conversationId) return entry;
             const base = placeholderID === "" ? entry.messages : entry.messages.filter((message) => message.id !== placeholderID);
             const exists = base.some((message) => message.id === payload.id);
-            const optimisticIndex = role === "user" ? base.findIndex((message) => message.id.startsWith("pending-") && message.role === "user" && message.content === payload.content) : -1;
+            const optimisticIndex = role === "user" ? base.findIndex((message) => message.id.startsWith("pending-") && message.role === "user" && pendingMessageMatches({ ...message, requestId: message.id.slice("pending-".length) }, realtimeMessage)) : -1;
             if (exists) return base.length === entry.messages.length ? entry : { ...entry, messages: base };
             const messages = optimisticIndex >= 0
               ? base.map((message, index) => index === optimisticIndex ? realtimeMessage : message)
@@ -2358,6 +2379,21 @@ export default function MobileRemotePage() {
   // 文件适配器**持有缓存**（内容 + 子树），所以绝不能在每次渲染时重建 ——
   // 重建就是缓存清零，用户在目录里点两下会不停重新拉取。
   const filesAdapter = useMemo(() => createMobileFsRequest({ transport: rpcTransport, prefetch: true }), [rpcTransport]);
+  useEffect(() => {
+    const key = `${instanceID}:${project?.id || ""}:${conversation?.id || ""}`;
+    attachmentConversationRef.current = key;
+    setMessageAttachments(attachmentDraftsRef.current.get(key) || []);
+    setAttachmentBusy(false);
+  }, [instanceID, project?.id, conversation?.id]);
+  function updateMessageAttachments(files: MessageAttachment[]) {
+    attachmentsRef.current = files;
+    setMessageAttachments(files);
+    attachmentDraftsRef.current.set(`${instanceID}:${project?.id || ""}:${conversation?.id || ""}`, files);
+  }
+  function addMessageAttachments(files: MessageAttachment[]) {
+    if (attachmentConversationRef.current !== `${instanceID}:${project?.id || ""}:${conversation?.id || ""}`) return;
+    updateMessageAttachments(mergeMessageAttachments(attachmentsRef.current, files));
+  }
   useEffect(() => () => filesAdapter.invalidateAll(), [filesAdapter]);
   // 优化建议适配器：与文件 / Git 同一条中继发信器（fs / git / conversation / insights
   // 共用 `POST /v1/instances/{id}/rpc`，电脑端按 op 分发表）。**不能**直接喂桌面同源的
@@ -4038,6 +4074,11 @@ export default function MobileRemotePage() {
     });
   }
 
+  function resendAttachedMessage(message: Message) {
+    addMessageAttachments(message.attachments || []);
+    resendMessage(message.content);
+  }
+
   // 快捷方式入口。fill 只让电脑端渲染（模板里的 ${project.path} 这类变量手机端没有），
   // 把渲染结果填进手机输入框；run / confirm 直接在电脑端执行。
   // confirm 先在手机上弹确认框：这条命令会在电脑上跑，误触的代价不在这一屏。
@@ -4132,14 +4173,16 @@ export default function MobileRemotePage() {
   async function sendConversationMessage(event: FormEvent) {
     event.preventDefault();
     if (!conversation) return;
-    await deliverConversationMessage(conversation, messageDraft.trim(), skillRefs, quoteRef, true);
+    if (attachmentBusy) return;
+    await deliverConversationMessage(conversation, messageDraft.trim(), skillRefs, quoteRef, true, messageAttachments);
   }
 
   function scheduleConversationMessage() {
     if (!conversation || !conversationProcessing || conversation.isOrchestration) return;
     const draft = messageDraft.trim();
-    if (!draft && skillRefs.length === 0 && !quoteRef) return;
-    setScheduledSend({ id: idempotencyKey(), conversationId: conversation.id, draft, skillRefs, quote: quoteRef });
+    if (attachmentBusy || (!draft && skillRefs.length === 0 && !quoteRef && messageAttachments.length === 0)) return;
+    setScheduledSend({ id: idempotencyKey(), conversationId: conversation.id, draft, skillRefs, quote: quoteRef, attachments: messageAttachments });
+    updateMessageAttachments([]);
     setMessageDraft("");
     setSkillRefs([]);
     setQuoteRef(null);
@@ -4147,11 +4190,21 @@ export default function MobileRemotePage() {
     setError("");
   }
 
-  async function deliverConversationMessage(target: RemoteConversation, draft: string, refs: RemoteSkill[], quote: MessageQuote | null, clearComposer: boolean) {
+  function cancelScheduledConversationMessage() {
+    if (!scheduledSend || scheduledSend.conversationId !== conversation?.id) return;
+    const job = scheduledSend;
+    setMessageDraft((current) => [current.trim(), job.draft].filter(Boolean).join("\n"));
+    setSkillRefs((current) => [...current, ...job.skillRefs.filter((ref) => !current.some((item) => item.source === ref.source && item.name === ref.name))]);
+    setQuoteRef((current) => current ?? job.quote);
+    addMessageAttachments(job.attachments);
+    setScheduledSend(null);
+  }
+
+  async function deliverConversationMessage(target: RemoteConversation, draft: string, refs: RemoteSkill[], quote: MessageQuote | null, clearComposer: boolean, files: MessageAttachment[] = []) {
     // draft = 用户自己在输入框里写的正文；content = 拼上技能引用 / 引用块之后真正上云的那条消息。
     // 所有"写回输入框"的路径都只能用 draft —— 否则一次发送失败就会把整段技能描述重新灌回输入框。
     // 「引用」与「技能」一样不计入 draft：它是一颗可以单独摘掉的胶囊，不是用户写的正文。
-    if (!draft && refs.length === 0 && !quote) return;
+    if (!draft && refs.length === 0 && !quote && files.length === 0) return;
     if (target.isOrchestration) {
       setError("编排任务会话只能查看，请在任务队列中继续处理");
       return;
@@ -4167,13 +4220,14 @@ export default function MobileRemotePage() {
     // 判定顶掉，若不在这里重置，用户发完消息不会自动跟随自己的新消息与回复。
     stickToBottomRef.current = true;
     const pending = pendingMessageRef.current.get(conversationID) || new Map<string, PendingMessage>();
-    pending.set(clientRequestId, { requestId: clientRequestId, content, createdAt });
+    pending.set(clientRequestId, { requestId: clientRequestId, content, createdAt, attachments: files });
     pendingMessageRef.current.set(conversationID, pending);
     // ⚠️ 「Agent 正在跑」的指示**不在这里**打：排队等真 id 的那条消息根本还没发出去，
     // 先把指示亮起来就是在替电脑端许一个它还不知道的承诺。它由 dispatchConversationMessage
     // 在命令真的交给云端那一刻点，两条路径（直发 / 补发）因此都只点一次。
-    setSnapshot((current) => current ? { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => entry.id === conversationID && !entry.messages.some((message) => message.id === optimisticID) ? { ...entry, messages: [...entry.messages, { id: optimisticID, role: "user", content, createdAt }] } : entry) })) } : current);
+    setSnapshot((current) => current ? { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => entry.id === conversationID && !entry.messages.some((message) => message.id === optimisticID) ? { ...entry, messages: [...entry.messages, { id: optimisticID, role: "user", content, createdAt, attachments: files }] } : entry) })) } : current);
     if (clearComposer) {
+      updateMessageAttachments([]);
       setMessageDraft("");
       // 引用与草稿一起乐观清空；下面每条失败回填分支都会把胶囊一并放回去。
       setSkillRefs([]);
@@ -4195,7 +4249,7 @@ export default function MobileRemotePage() {
       // 而引用对这类消息是禁用的（见 isTransientMessage）。留着它的理由不是"现在用得上"，而是
       // "**漏掉它才是静默丢数据**"：一旦哪天允许引用，丢的就是用户刚挂上的那条引用，
       // 而他只会看到自己写的字回来了、以为引用还在。三行代码换掉这一类不可见的错。
-      queue.push({ requestId: clientRequestId, content, createdAt, draft, quote });
+      queue.push({ requestId: clientRequestId, content, createdAt, draft, quote, attachments: files });
       deferredMessagesRef.current.set(conversationID, queue);
       markPendingConversationsChanged();
       return;
@@ -4206,7 +4260,7 @@ export default function MobileRemotePage() {
       setSkillRefs((current) => current.length > 0 ? current : refs);
       setQuoteRef((current) => current ?? quote);
       setError(reason);
-    });
+    }, files);
   }
 
   // 预约发送：这一轮还在跑时先收下，空闲后再走与「发送」同一条投递。
@@ -4228,7 +4282,7 @@ export default function MobileRemotePage() {
       if (cancelled || flushingScheduledIdRef.current === job.id) return;
       flushingScheduledIdRef.current = job.id;
       setScheduledSend((current) => current?.id === job.id ? null : current);
-      void deliverConversationMessage(target, job.draft, job.skillRefs, job.quote, false);
+      void deliverConversationMessage(target, job.draft, job.skillRefs, job.quote, false, job.attachments);
     }, 0);
     return () => {
       cancelled = true;
@@ -4304,6 +4358,20 @@ export default function MobileRemotePage() {
     } finally {
       setSessionControlBusy((current) => current === "model" ? "" : current);
     }
+  }
+
+  async function applyReasoning(reasoningEffort: string) {
+    if (!conversation || conversationPending || conversationProcessing || sessionControlBusy) return;
+    const id = conversation.id;
+    setSessionControlBusy("model");
+    try {
+      const reply = await rpcTransport("conversation.reasoningEffort", { reasoningEffort }, 30_000);
+      if (selectedConversationRef.current !== id) return;
+      if (!reply.ok) { setError(reply.error || "无法切换推理强度"); return; }
+      setModelSheet((current) => current ? { ...current, reasoningEffort } : current);
+    } catch (cause) {
+      if (selectedConversationRef.current === id) setError(cause instanceof Error ? cause.message : "无法切换推理强度");
+    } finally { setSessionControlBusy((current) => current === "model" ? "" : current); }
   }
 
   async function applyPermission(mode: PermissionMode, confirmed = false) {
@@ -4403,7 +4471,18 @@ export default function MobileRemotePage() {
   // id"那条路径），这里只负责发命令与收尾；`onRejected` 只在**明确失败**时被调用一次。
   //
   // 这里**不碰全局 busy**：发消息完全是本机的操作，那条命令只是事后发给电脑端的一条通知。
-  async function dispatchConversationMessage(conversationID: string, content: string, clientRequestId: string, createdAt: string, onRejected: (reason: string) => void) {
+  async function dispatchConversationMessage(conversationID: string, content: string, clientRequestId: string, createdAt: string, onRejected: (reason: string) => void, attachments: MessageAttachment[] = []) {
+    const ownerProjectID = projects.find((item) => item.conversations.some((entry) => entry.id === conversationID))?.id || project?.id || "";
+    const restoreAttachmentDraft = () => {
+      if (!attachments.length) return;
+      const key = `${instanceID}:${ownerProjectID}:${conversationID}`;
+      const saved = mergeMessageAttachments(attachmentDraftsRef.current.get(key) || [], attachments);
+      attachmentDraftsRef.current.set(key, saved);
+      if (attachmentConversationRef.current === key) {
+        attachmentsRef.current = saved;
+        setMessageAttachments(saved);
+      }
+    };
     const optimisticID = `pending-${clientRequestId}`;
     const dropOptimistic = () => setSnapshot((current) => current ? { ...current, projects: current.projects.map((item) => ({ ...item, conversations: item.conversations.map((entry) => entry.id === conversationID ? { ...entry, messages: entry.messages.filter((message) => message.id !== optimisticID) } : entry) })) } : current);
     // 命令马上要交给云端了 —— 从这一刻起"电脑端在跑"才是句实话。
@@ -4412,7 +4491,7 @@ export default function MobileRemotePage() {
       const accepted = await cloud<{ commandId: string; status: string }>(`/v1/instances/${encodeURIComponent(instanceID)}/commands`, {
         method: "POST",
         headers: { "Idempotency-Key": clientRequestId },
-        body: JSON.stringify({ type: "conversation.message", payload: { conversationId: conversationID, content, clientRequestId } }),
+        body: JSON.stringify({ type: "conversation.message", payload: { conversationId: conversationID, content, clientRequestId, attachments } }),
       });
       setCommandState(accepted);
       const queued = pendingMessageRef.current.get(conversationID);
@@ -4431,7 +4510,7 @@ export default function MobileRemotePage() {
           return;
         }
         const stillOnConversation = selectedConversationRef.current === conversationID;
-        const anotherMessagePending = (pendingMessageRef.current.get(conversationID)?.size || 0) > 0;
+        const anotherMessagePending = hasOtherPendingMessages(pendingMessageRef.current.get(conversationID), clientRequestId);
         // ⚠️ 没拿到终态（null）**不等于**电脑端没做：命令已经被云端受理，只是我们没在
         // 30 秒窗口里看到结果。这时候撤气泡、把正文放回输入框，就是删掉一条很可能已经
         // 送达的消息、再诱导用户重发一次。与任务那三条同一套策略（见 settleTaskMutation）。
@@ -4445,6 +4524,7 @@ export default function MobileRemotePage() {
         failed?.delete(clientRequestId);
         if (failed?.size === 0) pendingMessageRef.current.delete(conversationID);
         dropOptimistic();
+        restoreAttachmentDraft();
         if (stillOnConversation && !anotherMessagePending) {
           onRejected(`消息执行失败：${commandFailureDetail(finalState.result) || "输入内容仍保留在输入框"}`);
         }
@@ -4456,6 +4536,7 @@ export default function MobileRemotePage() {
       failed?.delete(clientRequestId);
       if (failed?.size === 0) pendingMessageRef.current.delete(conversationID);
       dropOptimistic();
+      restoreAttachmentDraft();
       if (selectedConversationRef.current === conversationID) onRejected(cause instanceof Error ? cause.message : "消息发送失败");
     }
   }
@@ -4614,7 +4695,7 @@ export default function MobileRemotePage() {
           // 用户没法"再点一次"把它找回来（技能胶囊至少还能在面板里重新点一遍）。
           setQuoteRef((current) => current ?? message.quote);
           setError(reason);
-        });
+        }, message.attachments);
       }
     })();
   }
@@ -4632,7 +4713,7 @@ export default function MobileRemotePage() {
     // 用同一套 `pending-<requestId>` id 并按 id 去重，因此与 loadSnapshot 的对账不打架。
     const messages = pendingMessageRef.current.get(realID);
     if (messages && messages.size > 0) {
-      const bubbles = Array.from(messages.values()).map((message) => ({ id: `pending-${message.requestId}`, role: "user" as const, content: message.content, createdAt: message.createdAt }));
+      const bubbles = Array.from(messages.values()).map((message) => ({ id: `pending-${message.requestId}`, role: "user" as const, content: message.content, createdAt: message.createdAt, attachments: message.attachments }));
       setSnapshot((current) => current ? {
         ...current,
         projects: current.projects.map((project) => ({
@@ -5657,7 +5738,7 @@ export default function MobileRemotePage() {
       initialPath={filesInitialPath}
       onInitialPathConsumed={() => setFilesInitialPath(null)}
     /></section>}
-    {mobileApp && mobileView === "conversation" && project && !subHeaderActive && <section className="mobile-conversation"><div className="mobile-message-list" ref={messageListRef} data-empty={showConversationEmpty ? "true" : undefined}>{conversationTimeline.length ? conversationTimeline.map((entry, index) => entry.kind === "message" ? <article className={`mobile-message ${entry.message.role}`} key={entry.key} data-group={messageGroups.get(entry.key)} data-transient={isTransientMessage(entry.message) ? "true" : undefined} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} data-actions={messageActionId === entry.message.id ? "open" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><div className="mobile-message-head"><small>{entry.message.role === "user" ? "我" : "Agent"} · {messageTime(entry.message.createdAt)}{isStreamingMessage(entry.message) && <span className="mobile-message-writing" role="img" aria-label="正在写入"><i aria-hidden="true" /><i aria-hidden="true" /><i aria-hidden="true" /></span>}</small><div className="mobile-message-head-actions">{messageActionId === entry.message.id && <div className="mobile-message-actions" id={`mobile-message-actions-${index}`} ref={messageActionsRef} role="group" aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作${isTransientMessage(entry.message) ? `（${transientReason(entry.message, "row")}）` : ""}`}><button type="button" className="mobile-message-action-icon" data-copy-state={messageCopyState} aria-label={messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请重试" : "复制这条消息"} title="复制 Markdown 原文" onClick={() => void copyMessageBody(entry.message.content)}><MessageActionIcon kind={messageCopyState === "idle" ? "copy" : messageCopyState} /></button><span className="mobile-message-action-status" role="status" aria-live="polite">{messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请检查剪贴板权限" : ""}</span><button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label={`引用${entry.message.role === "user" ? "我" : "Agent"}这条消息到输入框`} title={isTransientMessage(entry.message) ? transientReason(entry.message, "quote") : "引用到输入框"} onClick={() => quoteMessage({ id: entry.message.id, role: entry.message.role, content: entry.message.content })}><MessageActionIcon kind="quote" /></button>{entry.message.role === "user" && <button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label="把这条消息的原文填回输入框" title={isTransientMessage(entry.message) ? transientReason(entry.message, "resend") : "填回输入框，改完再发"} onClick={() => resendMessage(entry.message.content)}><MessageActionIcon kind="resend" /></button>}{entry.message.role === "user" && checkpointByRun.has(entry.message.runId || "") && <button type="button" className="mobile-message-action-icon" disabled={conversationProcessing || rewinding} aria-label="回退到这一轮结束时" title={conversationProcessing ? "这条会话正在跑，等这一轮结束后再回退" : rewindHint(checkpointByRun.get(entry.message.runId || "")!, rewindDiscardedTurns(checkpointByRun.get(entry.message.runId || "")!)) || "回退到这一轮结束时（代码与对话都回到这一刻）"} onClick={() => { const target = checkpointByRun.get(entry.message.runId || ""); closeMessageActions(); if (target) setRewindTarget(target); }}><MessageActionIcon kind="rewind" /></button>}</div>}<button type="button" className="mobile-message-more" aria-expanded={messageActionId === entry.message.id} aria-controls={messageActionId === entry.message.id ? `mobile-message-actions-${index}` : undefined} aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作`} title="更多操作" onClick={(event) => { if (messageActionId === entry.message.id) { closeMessageActions(); return; } openMessageActions(event.currentTarget, entry.message.id); }}>⋯</button></div></div><div className="mobile-message-markdown markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <MobileMarkdownLink href={href}>{children}</MobileMarkdownLink>, code: ({ className, children }) => <MobileInlineCode className={className} onOpenFile={openFiles}>{children}</MobileInlineCode> }}>{entry.message.content}</ReactMarkdown></div></article> : <article className={`mobile-notice mobile-notice-${entry.notice.variant}${entry.notice.state ? ` mobile-notice-${entry.notice.state}` : ""}`} key={entry.key} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><span className="mobile-notice-icon" aria-hidden="true">{noticeIcons[entry.notice.variant]}</span><div className="mobile-notice-text"><strong>{entry.notice.title}</strong>{entry.notice.detail && <small>{entry.notice.detail}</small>}</div>{noticeTime(entry.notice.createdAt) && <time className="mobile-notice-time">{noticeTime(entry.notice.createdAt)}</time>}</article>) : conversationEmpty}{conversationProcessing && runIndicatorVariant && <div className="mobile-agent-processing">{/* 裸行三格（2026-10-13 定稿）：动画图形位 / 阶段词 / 阶段计时，判据分别在
+    {mobileApp && mobileView === "conversation" && project && !subHeaderActive && <section className="mobile-conversation"><div className="mobile-message-list" ref={messageListRef} data-empty={showConversationEmpty ? "true" : undefined}>{conversationTimeline.length ? conversationTimeline.map((entry, index) => entry.kind === "message" ? <article className={`mobile-message ${entry.message.role}`} key={entry.key} data-group={messageGroups.get(entry.key)} data-transient={isTransientMessage(entry.message) ? "true" : undefined} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} data-actions={messageActionId === entry.message.id ? "open" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><div className="mobile-message-head"><small>{entry.message.role === "user" ? "我" : "Agent"} · {messageTime(entry.message.createdAt)}{isStreamingMessage(entry.message) && <span className="mobile-message-writing" role="img" aria-label="正在写入"><i aria-hidden="true" /><i aria-hidden="true" /><i aria-hidden="true" /></span>}</small><div className="mobile-message-head-actions">{messageActionId === entry.message.id && <div className="mobile-message-actions" id={`mobile-message-actions-${index}`} ref={messageActionsRef} role="group" aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作${isTransientMessage(entry.message) ? `（${transientReason(entry.message, "row")}）` : ""}`}><button type="button" className="mobile-message-action-icon" data-copy-state={messageCopyState} aria-label={messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请重试" : "复制这条消息"} title="复制 Markdown 原文" onClick={() => void copyMessageBody(mobileMessageBody(entry.message))}><MessageActionIcon kind={messageCopyState === "idle" ? "copy" : messageCopyState} /></button><span className="mobile-message-action-status" role="status" aria-live="polite">{messageCopyState === "copied" ? "已复制到剪贴板" : messageCopyState === "failed" ? "复制失败，请检查剪贴板权限" : ""}</span><button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label={`引用${entry.message.role === "user" ? "我" : "Agent"}这条消息到输入框`} title={isTransientMessage(entry.message) ? transientReason(entry.message, "quote") : "引用到输入框"} onClick={() => quoteMessage({ id: entry.message.id, role: entry.message.role, content: mobileMessageBody(entry.message) })}><MessageActionIcon kind="quote" /></button>{entry.message.role === "user" && <button type="button" className="mobile-message-action-icon" disabled={isTransientMessage(entry.message)} aria-label="把这条消息的原文填回输入框" title={isTransientMessage(entry.message) ? transientReason(entry.message, "resend") : "填回输入框，改完再发"} onClick={() => resendAttachedMessage(entry.message)}><MessageActionIcon kind="resend" /></button>}{entry.message.role === "user" && checkpointByRun.has(entry.message.runId || "") && <button type="button" className="mobile-message-action-icon" disabled={conversationProcessing || rewinding} aria-label="回退到这一轮结束时" title={conversationProcessing ? "这条会话正在跑，等这一轮结束后再回退" : rewindHint(checkpointByRun.get(entry.message.runId || "")!, rewindDiscardedTurns(checkpointByRun.get(entry.message.runId || "")!)) || "回退到这一轮结束时（代码与对话都回到这一刻）"} onClick={() => { const target = checkpointByRun.get(entry.message.runId || ""); closeMessageActions(); if (target) setRewindTarget(target); }}><MessageActionIcon kind="rewind" /></button>}</div>}<button type="button" className="mobile-message-more" aria-expanded={messageActionId === entry.message.id} aria-controls={messageActionId === entry.message.id ? `mobile-message-actions-${index}` : undefined} aria-label={`${entry.message.role === "user" ? "我" : "Agent"}这条消息的操作`} title="更多操作" onClick={(event) => { if (messageActionId === entry.message.id) { closeMessageActions(); return; } openMessageActions(event.currentTarget, entry.message.id); }}>⋯</button></div></div><div className="mobile-message-markdown markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ ...markdownCodeComponents, a: ({ href, children }) => <MobileMarkdownLink href={href}>{children}</MobileMarkdownLink>, code: ({ className, children }) => <MobileInlineCode className={className} onOpenFile={openFiles}>{children}</MobileInlineCode> }}>{mobileMessageBody(entry.message)}</ReactMarkdown></div></article> : <article className={`mobile-notice mobile-notice-${entry.notice.variant}${entry.notice.state ? ` mobile-notice-${entry.notice.state}` : ""}`} key={entry.key} data-arrive={arrivingKeys.includes(entry.key) ? "true" : undefined} onAnimationEnd={(event) => { if (event.target === event.currentTarget) clearArriving(entry.key); }}><span className="mobile-notice-icon" aria-hidden="true">{noticeIcons[entry.notice.variant]}</span><div className="mobile-notice-text"><strong>{entry.notice.title}</strong>{entry.notice.detail && <small>{entry.notice.detail}</small>}</div>{noticeTime(entry.notice.createdAt) && <time className="mobile-notice-time">{noticeTime(entry.notice.createdAt)}</time>}</article>) : conversationEmpty}{conversationProcessing && runIndicatorVariant && <div className="mobile-agent-processing">{/* 裸行三格（2026-10-13 定稿）：动画图形位 / 阶段词 / 阶段计时，判据分别在
       lib/run-indicator.ts 与 lib/processing-indicator.ts —— 这一格里**不许再出现任何
       条件判断**，否则就是"服务端算了一套、界面又另判一套"。不加 role="status"：
       计时每秒在变，播报读屏反而成骚扰（图形本就 aria-hidden）。 */}
@@ -5759,18 +5840,18 @@ export default function MobileRemotePage() {
       // 「查看文件」要先收面板：文件视图开在面板（z-60 全屏遮罩）**下面**，不收的话
       // 用户点了像没反应，返回键也得按两次才见得到文件列表。
       onOpenFile={openFileFromOptimization}
-    />}<div className="mobile-composer-shell" ref={composerShellRef}>{pendingAskNotice && <MobileAskCard ask={pendingAskNotice} busy={sessionControlBusy === pendingAskNotice.askId} onSkip={() => void answerPendingAsk(pendingAskNotice, { action: "skip" })} onAnswer={(answers, notes) => void answerPendingAsk(pendingAskNotice, { answers, notes })} />}{pendingApprovalNotice && <MobileApprovalCard detail={pendingApprovalNotice.detail} busy={sessionControlBusy === pendingApprovalNotice.approvalId} onDecide={(decision) => void decidePendingApproval(pendingApprovalNotice.approvalId, decision)} />}<div className="mobile-session-meta"><button type="button" disabled={conversationPending || conversationProcessing || sessionControlBusy === "model"} onClick={() => void openModelSheet()}>{conversation?.modelOverride || contextUsage?.context?.model || "模型"}</button><button type="button" disabled={conversationPending || conversationProcessing || sessionControlBusy === "permission"} onClick={() => { setConfirmingFullControl(false); setPermissionSheetOpen(true); }}>{conversation?.permissionMode ? permissionCopy[conversation.permissionMode as PermissionMode]?.title || "执行权限" : "执行权限"}</button>{conversation?.agentId === "codex" && <button type="button" disabled={conversationPending || conversationProcessing || handingOff || Boolean(conversation.isOrchestration)} onClick={() => void startContextHandoff()}>{handingOff ? "交接中" : "交接上下文"}</button>}<span className={`mobile-session-context mobile-session-context-${contextLevel(contextUsage?.context)}`}>{contextLabel(contextUsage?.context)}</span></div>{scheduledSend?.conversationId === conversation?.id && <p className="mobile-scheduled-send">已预约，本轮结束后发送<button type="button" onClick={() => setScheduledSend(null)}>取消</button></p>}{composerToolsOpen && <section className="mobile-composer-tools" id="mobile-composer-tools" aria-label="工具">
+    />}<div className="mobile-composer-shell" ref={composerShellRef}>{pendingAskNotice && <MobileAskCard ask={pendingAskNotice} busy={sessionControlBusy === pendingAskNotice.askId} onSkip={() => void answerPendingAsk(pendingAskNotice, { action: "skip" })} onAnswer={(answers, notes) => void answerPendingAsk(pendingAskNotice, { answers, notes })} />}{pendingApprovalNotice && <MobileApprovalCard detail={pendingApprovalNotice.detail} busy={sessionControlBusy === pendingApprovalNotice.approvalId} onDecide={(decision) => void decidePendingApproval(pendingApprovalNotice.approvalId, decision)} />}<div className="mobile-session-meta"><button type="button" disabled={conversationPending || conversationProcessing || sessionControlBusy === "model"} onClick={() => void openModelSheet()}>{conversation?.modelOverride || contextUsage?.context?.model || "模型"}</button><button type="button" disabled={conversationPending || conversationProcessing || sessionControlBusy === "permission"} onClick={() => { setConfirmingFullControl(false); setPermissionSheetOpen(true); }}>{conversation?.permissionMode ? permissionCopy[conversation.permissionMode as PermissionMode]?.title || "执行权限" : "执行权限"}</button>{conversation?.agentId === "codex" && <button type="button" disabled={conversationPending || conversationProcessing || handingOff || Boolean(conversation.isOrchestration)} onClick={() => void startContextHandoff()}>{handingOff ? "交接中" : "交接上下文"}</button>}<span className={`mobile-session-context mobile-session-context-${contextLevel(contextUsage?.context)}`}>{contextLabel(contextUsage?.context)}</span></div>{scheduledSend?.conversationId === conversation?.id && <p className="mobile-scheduled-send">已预约，本轮结束后发送<button type="button" onClick={cancelScheduledConversationMessage}>取消</button></p>}{composerToolsOpen && <section className="mobile-composer-tools" id="mobile-composer-tools" aria-label="工具">
 <div className="mobile-tool-group"><h3>常用提示词<span>{promptShortcuts.length}</span></h3>{promptShortcuts.length === 0 ? <p className="mobile-tool-empty">电脑端还没有添加常用提示词。</p> : <div className="mobile-tool-chips">{promptShortcuts.map((item) => <button type="button" key={item.id} disabled={busy || !conversation || Boolean(shortcutBusy)} onClick={() => void applyShortcut(item)} title={item.template}>{shortcutBusy === item.id ? "处理中" : item.name}</button>)}</div>}</div>
 <div className="mobile-tool-group"><h3>常用命令<span>{commandShortcuts.length}</span></h3>{commandShortcuts.length === 0 ? <p className="mobile-tool-empty">电脑端还没有添加常用命令。</p> : <div className="mobile-tool-chips">{commandShortcuts.map((item) => <button type="button" key={item.id} disabled={busy || !conversation || Boolean(shortcutBusy)} onClick={() => void applyShortcut(item)} title={item.template}>{shortcutBusy === item.id ? "处理中" : item.name}</button>)}</div>}</div>
 <div className="mobile-tool-group"><h3>技能<span>{projectSkills.length}</span></h3>{projectSkills.length === 0 ? <p className="mobile-tool-empty">电脑端未发现可用技能。</p> : <div className="mobile-tool-subgroups">{skillGroups.map((group) => <div className="mobile-tool-subgroup" key={group.source}><h4>{group.label}<span>{group.items.length}</span></h4><div className="mobile-tool-chips">{group.items.map((skill) => <button type="button" key={`${group.source}-${skill.name}`} disabled={busy || !conversation} onClick={() => fillSkill(skill)} title={skill.description}>{skill.name}</button>)}</div></div>)}</div>}</div>
-<div className="mobile-tool-group"><h3>输入</h3><div className="mobile-tool-chips"><button type="button" disabled={busy || !conversation} onClick={insertComposerLineBreak}>换行</button><button type="button" disabled={!messageDraft && skillRefs.length === 0 && !quoteRef} onClick={() => { setMessageDraft(""); setSkillRefs([]); setQuoteRef(null); setComposerToolsOpen(false); }}>清空草稿</button></div></div>
-</section>}<form className="mobile-composer" onSubmit={sendConversationMessage}>{skillRefs.length > 0 && <div className="mobile-skill-refs" role="group" aria-label="已引用的技能">{skillRefs.map((skill) => <span className="mobile-skill-ref" key={`${skill.source}-${skill.name}`}><span className="mobile-skill-ref-name" title={skill.description || skill.name}>{skill.name}</span><button type="button" className="mobile-skill-ref-remove" title={`移除技能 ${skill.name}`} aria-label={`移除技能 ${skill.name}`} disabled={busy} onClick={() => removeSkillRef(skill)}>×</button></span>)}</div>}
+<div className="mobile-tool-group"><h3>输入</h3><div className="mobile-tool-chips"><button type="button" disabled={busy || !conversation} onClick={insertComposerLineBreak}>换行</button><button type="button" disabled={attachmentBusy || (!messageDraft && skillRefs.length === 0 && !quoteRef && messageAttachments.length === 0)} onClick={() => { setMessageDraft(""); setSkillRefs([]); setQuoteRef(null); updateMessageAttachments([]); setComposerToolsOpen(false); }}>清空草稿</button></div></div>
+</section>}<form className="mobile-composer" onSubmit={sendConversationMessage}>{messageAttachments.length > 0 && <div className="mobile-skill-refs" aria-label="已添加的附件">{messageAttachments.map((file) => <span className="mobile-skill-ref" key={file.path}>{file.path.split("/").pop()}<button type="button" aria-label={`移除附件 ${file.path}`} onClick={() => updateMessageAttachments(messageAttachments.filter((item) => item.path !== file.path))}>×</button></span>)}</div>}{skillRefs.length > 0 && <div className="mobile-skill-refs" role="group" aria-label="已引用的技能">{skillRefs.map((skill) => <span className="mobile-skill-ref" key={`${skill.source}-${skill.name}`}><span className="mobile-skill-ref-name" title={skill.description || skill.name}>{skill.name}</span><button type="button" className="mobile-skill-ref-remove" title={`移除技能 ${skill.name}`} aria-label={`移除技能 ${skill.name}`} disabled={busy} onClick={() => removeSkillRef(skill)}>×</button></span>)}</div>}
 {/* 被引用的消息（消息操作面板里的「引用到输入框」）：与技能引用同一形态的一行胶囊 ——
     正文留给用户自己写、发送那一刻才展开成引用块。**只挂一条**（见 MessageQuote）。
     正文必须夹列宽 + 单行省略：这里回显的是别人写的内容，长度不可控
     （本文件记过四次的「回显用户输入」坑，第四例就是它）。 */}
 {quoteRef && <div className="mobile-quote-refs" role="group" aria-label="已引用的消息"><span className="mobile-quote-ref"><MessageActionIcon kind="quote" /><span className="mobile-quote-ref-text" title={quoteRef.content}>{quoteRef.content}</span><button type="button" className="mobile-quote-ref-remove" title="取消引用" aria-label={`取消引用${quoteRef.role === "user" ? "我" : "Agent"}的这条消息`} disabled={busy} onClick={() => setQuoteRef(null)}>×</button></span><span className="mobile-quote-ref-hint">发送时展开为引用块</span></div>}
-<div className="mobile-composer-box"><button type="button" className="mobile-composer-tool" aria-label="工具" title="工具" aria-expanded={composerToolsOpen} aria-controls="mobile-composer-tools" onClick={() => setComposerToolsOpen((open) => !open)} disabled={busy}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg></button><textarea ref={messageInputRef} value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversation ? "输入消息..." : "请先新建会话"} aria-label="输入消息" rows={1} disabled={busy || !conversation} />{/* 运行中：在发送键**左边**多一颗停止键，发送键留着。
+{project && conversation && <MessageAttachmentPicker key={`${instanceID}:${project.id}:${conversation.id}`} projectID={project.id} mobile attachments={messageAttachments} request={filesAdapter.request} onAdd={addMessageAttachments} onBusy={setAttachmentBusy} onFail={setError} disabled={busy || attachmentBusy || conversationPending || conversationProcessing || Boolean(conversation.isOrchestration)} />}<div className="mobile-composer-box"><button type="button" className="mobile-composer-tool" aria-label="工具" title="工具" aria-expanded={composerToolsOpen} aria-controls="mobile-composer-tools" onClick={() => setComposerToolsOpen((open) => !open)} disabled={busy}><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg></button><textarea ref={messageInputRef} value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={conversation ? "输入消息..." : "请先新建会话"} aria-label="输入消息" rows={1} disabled={busy || !conversation} />{/* 运行中：在发送键**左边**多一颗停止键，发送键留着。
     刻意不是"把发送键换成停止键"（第一版就是那样，复查时改掉了）：跑着的时候再发一条是
     **既有能力** —— 桌面端在运行中同样能发（还有「立即发送 / 预约发送」两种），而把发送键换掉
     等于在最需要它的时刻把入口藏起来，手机上就只剩"按回车"这一条看不见的路。
@@ -5784,7 +5865,7 @@ export default function MobileRemotePage() {
     而停止走的是另一条通道、且是幂等的，没理由被它们挡住。
     会话还是本地态（conversationPending）时不显示：那个窗口里电脑端还没接到任何东西，
     而中继的 conversationId 只取自信封、这种情况传的是空串，发出去只会得到一句参数错误。 */}
-{conversationProcessing && !conversationPending && (messageDraft.trim() || skillRefs.length > 0 || quoteRef) && <button type="button" className="mobile-composer-schedule" disabled={Boolean(scheduledSend)} onClick={scheduleConversationMessage}>预约</button>}{conversationProcessing && !conversationPending && <button type="button" className="mobile-composer-stop" disabled={stoppingConversation} title={stoppingConversation ? "正在停止当前对话" : "停止当前对话"} onClick={() => void stopConversationRun(false, conversation?.id ?? "")}>{stoppingConversation ? "停止中" : "停止"}</button>}<button type="submit" className="mobile-composer-send" disabled={busy || !conversation || (!messageDraft.trim() && skillRefs.length === 0 && !quoteRef)} aria-label="发送消息" title="发送消息"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg></button></div></form></div></section>}
+{conversationProcessing && !conversationPending && (messageDraft.trim() || skillRefs.length > 0 || quoteRef || messageAttachments.length > 0) && <button type="button" className="mobile-composer-schedule" disabled={attachmentBusy || Boolean(scheduledSend)} onClick={scheduleConversationMessage}>预约</button>}{conversationProcessing && !conversationPending && <button type="button" className="mobile-composer-stop" disabled={stoppingConversation} title={stoppingConversation ? "正在停止当前对话" : "停止当前对话"} onClick={() => void stopConversationRun(false, conversation?.id ?? "")}>{stoppingConversation ? "停止中" : "停止"}</button>}<button type="submit" className="mobile-composer-send" disabled={attachmentBusy || busy || !conversation || (!messageDraft.trim() && skillRefs.length === 0 && !quoteRef && messageAttachments.length === 0)} aria-label="发送消息" title="发送消息"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5" /><path d="M5 12l7-7 7 7" /></svg></button></div></form></div></section>}
     {newConversationProject && <div className="mobile-new-conversation-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-new-conversation-title"><section className="mobile-new-conversation-dialog">
       <div className="mobile-sheet-grabber" aria-hidden="true"></div>
       <header><div><h2 id="mobile-new-conversation-title">新会话</h2><p>选择执行工具</p></div><button type="button" onClick={cancelNewConversation} disabled={busy} aria-label="关闭">×</button></header>
@@ -5849,7 +5930,7 @@ export default function MobileRemotePage() {
       </div>}
       <footer><button type="button" className="mobile-new-conversation-cancel" onClick={cancelNewConversation} disabled={busy}>取消</button><button type="button" className="mobile-new-conversation-confirm" onClick={() => void createConversationForProject(newConversationProject, newConversationAgent, newConversationPermission)} disabled={busy || !mobileAgentAvailable(newConversationProject, newConversationAgent)}>创建会话</button></footer>
     </section></div>}
-    {modelSheet !== false && <MobileModelSheet models={modelSheet} busy={sessionControlBusy === "model"} onClose={() => { if (sessionControlBusy !== "model") setModelSheet(false); }} onSelect={(model) => void applyModel(model)} />}
+    {modelSheet !== false && <MobileModelSheet models={modelSheet} busy={sessionControlBusy === "model"} onClose={() => { if (sessionControlBusy !== "model") setModelSheet(false); }} onSelect={(model) => void applyModel(model)} onReasoning={(effort) => void applyReasoning(effort)} />}
     {permissionSheetOpen && <MobilePermissionSheet agentName={MOBILE_AGENTS.find((agent) => agent.id === conversation?.agentId)?.name || "Agent"} modes={MOBILE_AGENTS.find((agent) => agent.id === conversation?.agentId)?.permissionModes || []} current={conversation?.permissionMode || ""} busy={sessionControlBusy === "permission"} confirmingFullControl={confirmingFullControl} onClose={() => { if (sessionControlBusy === "permission") return; setConfirmingFullControl(false); setPermissionSheetOpen(false); }} onSelect={(mode) => void applyPermission(mode)} onConfirmFullControl={() => void applyPermission("full_control", true)} />}
     {conversationHistoryOpen && <div className="mobile-conversation-history-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-conversation-history-title" onClick={(event) => { if (event.target === event.currentTarget) setConversationHistoryOpen(false); }}><section className="mobile-conversation-history-dialog"><header><div><h2 id="mobile-conversation-history-title">历史会话</h2><small>{historyDirectoryProjectID === project?.id && historyDirectory ? `${historyDirectory.length} 个会话` : "正在同步目录"}</small></div><button type="button" onClick={() => setConversationHistoryOpen(false)} aria-label="关闭历史会话">×</button></header>{historyDirectoryLoading && <p className="mobile-empty">正在从电脑端读取全部会话...</p>}{historyDirectoryError && <p className="mobile-empty" role="status">{historyDirectoryError}</p>}{!historyDirectoryLoading && conversations.length === 0 ? <p className="mobile-empty">该项目还没有会话。</p> : <ul className="mobile-conversation-history-list">{conversations.map((item) => <li key={item.id}><button type="button" className={`mobile-conversation-history-item${item.id === conversation?.id ? " active" : ""}`} aria-current={item.id === conversation?.id ? "true" : undefined} onClick={() => { if (!project?.id || item.isOrchestration) return; void activateSharedConversation(project.id, item.id).then((activated) => { if (activated) { setConversationHistoryOpen(false); void loadConversationHistory(project.id, item.id); } }).catch((cause) => setError(cause instanceof Error ? cause.message : "无法切换当前会话")); }}><strong>{item.title || "未命名会话"}</strong><small>{conversationStatusLabel(item.status)}{item.isOrchestration ? " · 编排任务（只读）" : ""}{item.lastActivityAt ? ` · ${new Date(item.lastActivityAt).toLocaleString()}` : ""}</small></button></li>)}</ul>}</section></div>}
   </main>;

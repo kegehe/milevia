@@ -1105,6 +1105,8 @@ func gitCommandEnvironment(base []string) []string {
 		"GIT_ASKPASS=",
 		"SSH_ASKPASS=",
 		"GIT_TERMINAL_PROMPT=0",
+		// status 等读取不能顺带刷新索引；显式写操作仍使用 Git 的必要锁。
+		"GIT_OPTIONAL_LOCKS=0",
 		"GIT_PAGER=cat",
 		"GIT_PROTOCOL_FROM_USER=0",
 		"GIT_CONFIG_COUNT=2",

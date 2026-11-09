@@ -7,16 +7,17 @@ import (
 	"time"
 )
 
-// 登录态读数（三态 + 缓存）。
+// 登录态读数（账号登录 / 未登录 / 已配置凭据 / 无法确认 + 缓存）。
 //
 // 收口前的缺陷（2026-10-23 实测）：卡片上那颗「登录」只看 supportsLogin 与装没装，
 // **完全不看登录态** —— 于是在终端里已经登录的 qoder 卡片上照样亮着「登录」；
 // 而唯一能读到登录态的 /login-status 返回的是 bool，codebuddy 判别不了就报 false，
 // 界面于是把"读不到"念成"未登录"（用户点进去还得再"检查"一次，检查完仍是未登录）。
 //
-// 这里按项目一贯的三态重写：
+// 查询结论分开保留：
 //   - logged_in  ｜CLI 自己报出了身份（qoder 的 Username/Email、opencode 的凭据表 …）；
 //   - logged_out ｜CLI 自己说没有凭据（"not logged in" / "0 credentials"）；
+//   - configured ｜配置了 Key/Token，但不代表已验证有效性或有账号登录；
 //   - unreadable ｜**判断不了**。两种成因分别落在 note 上：工具根本不提供非交互查询，
 //     或这一次没读成（命令失败、超时、输出形状变了）。
 //
@@ -25,6 +26,7 @@ import (
 const (
 	agentAuthLoggedIn   = "logged_in"
 	agentAuthLoggedOut  = "logged_out"
+	agentAuthConfigured = "configured" // 配置了 Key/Token；没有验证账号身份或凭据有效性。
 	agentAuthUnreadable = "unreadable"
 )
 
@@ -33,9 +35,9 @@ type agentAuthState string
 
 // authStateRunner 是可实现"报告该工具是否已登录"的可选接口。
 //
-// 返回值是**三态**而不是 bool：判别不了必须和"未登录"分开（见上面的常量）。
+// 返回值不是 bool：无法判断、配置凭据和账号登录分别保留（见上面的常量）。
 // error 非空表示**这一次**没读成；state=unreadable 且 error 为空表示该工具根本没有
-// 可用的非交互登录态查询（codebuddy 就是这一档）。
+// 可用的非交互登录态查询。
 type authStateRunner interface {
 	LoginStatus(context.Context) (agentAuthState, error)
 }
@@ -54,7 +56,7 @@ type agentAuthReading struct {
 
 // readable 报告这份读数是不是一个**结论**。
 func (r agentAuthReading) readable() bool {
-	return r.state == agentAuthLoggedIn || r.state == agentAuthLoggedOut
+	return r.state == agentAuthLoggedIn || r.state == agentAuthLoggedOut || r.state == agentAuthConfigured
 }
 
 // loggedIn 只服务 /login-status 的兼容字段 loggedIn（旧客户端读它）。
@@ -107,7 +109,7 @@ func (s *Server) agentAuthFor(ctx context.Context, runnerID string, entry AgentC
 		s.agentAuthMu.Unlock()
 		return cached
 	}
-	if flight, flying := s.agentAuthFlights[key]; flying {
+	if flight, flying := s.agentAuthFlights[key]; flying && !force {
 		s.agentAuthMu.Unlock()
 		select {
 		case <-flight.done:
@@ -126,8 +128,12 @@ func (s *Server) agentAuthFor(ctx context.Context, runnerID string, entry AgentC
 
 	s.agentAuthMu.Lock()
 	flight.reading = read
-	delete(s.agentAuthFlights, key)
-	s.agentAuths[key] = read
+	// A manual refresh or invalidation supersedes the old probe. Its original
+	// waiters still receive its result, but it cannot restore stale shared state.
+	if s.agentAuthFlights[key] == flight {
+		delete(s.agentAuthFlights, key)
+		s.agentAuths[key] = read
+	}
 	s.agentAuthMu.Unlock()
 	// 先写 flight.reading 再 close：等待者读到的一定是写完的那份。
 	close(flight.done)
@@ -140,9 +146,7 @@ func (s *Server) agentAuthFor(ctx context.Context, runnerID string, entry AgentC
 // 之后立刻作废 —— 一次修复可能重装或替换了 CLI 的配置，之后还回放「动之前读到的已登录」，
 // 就是拿旧状态说新事实。
 //
-// 只清**已缓存**的值：正在飞的那一轮仍会写回（它最多比这次写操作早一轮，而登录态几乎
-// 不受安装影响）；要连它一起挡，得再引入一套世代号，代价大于收益。手动「检查登录状态」
-// 本来就带 force，用户随时可以拿回真读数。
+// 同时脱离旧的在途探测：它仍负责唤醒原等待者，但不能再写回缓存。
 func (s *Server) invalidateAgentAuth(runnerID string) {
 	if runnerID == "" {
 		return
@@ -151,6 +155,11 @@ func (s *Server) invalidateAgentAuth(runnerID string) {
 	for key := range s.agentAuths {
 		if key.runnerID == runnerID {
 			delete(s.agentAuths, key)
+		}
+	}
+	for key := range s.agentAuthFlights {
+		if key.runnerID == runnerID {
+			delete(s.agentAuthFlights, key)
 		}
 	}
 	s.agentAuthMu.Unlock()
@@ -170,8 +179,8 @@ func (s *Server) probeAgentAuth(parent context.Context, entry AgentCatalogEntry,
 	// at 是**读完**的时刻，不是开始读的时刻：这份读数描述的是 CLI 在那一刻的样子，
 	// 而探测本身可能花掉 7.5s（qoder 冷启动）。
 	defer func() { read.at = time.Now() }()
-	if !entry.SupportsLogin {
-		return agentAuthReading{state: agentAuthUnreadable, note: fmt.Sprintf("%s 不在平台内登录的支持范围内", entry.Name)}
+	if !entry.SupportsAuthStatus {
+		return agentAuthReading{state: agentAuthUnreadable, note: fmt.Sprintf("%s 尚未提供认证查询能力", entry.Name)}
 	}
 	if backend == nil {
 		return agentAuthReading{state: agentAuthUnreadable, note: fmt.Sprintf("这个执行环境没有 %s 的执行面", entry.Name)}
@@ -198,10 +207,12 @@ func (s *Server) probeAgentAuth(parent context.Context, entry AgentCatalogEntry,
 		}
 	}
 	switch state {
+	case agentAuthConfigured:
+		return agentAuthReading{state: state, note: "已配置认证凭据，尚未验证其有效性。"}
 	case agentAuthLoggedIn, agentAuthLoggedOut:
 		return agentAuthReading{state: state}
 	default:
-		// 工具自己说不清（codebuddy）。这一档**不能**念成未登录：用户可能明明登录着。
+		// 工具自己说不清。这一档不能念成未登录：用户可能明明登录着。
 		return agentAuthReading{state: agentAuthUnreadable, note: fmt.Sprintf("%s 无法自动判断登录态，请到目标环境的终端里确认", entry.Name)}
 	}
 }
@@ -209,16 +220,17 @@ func (s *Server) probeAgentAuth(parent context.Context, entry AgentCatalogEntry,
 // agentAuthStateFromStatusOutput 把"列凭据 / 列状态"类命令的输出读成三态。
 //
 //   - 命中空标记 ⇒ 未登录（CLI 自己说没有凭据）；
-//   - 命令成功、输出非空、且没有空标记 ⇒ 已登录（只能证明"CLI 认为自己有凭据"，
-//     不能证明凭据此刻还有效）；
+//   - 其它输出 ⇒ 判断不了；只有专用解析器识别的正向证据才能证明账号或凭据状态。
 //   - **输出为空 ⇒ 判断不了**。这一档不许冒充任何一种结论：空输出既可能是"没有凭据"，
 //     也可能只是一个不认识的版本把输出写到了别的地方。
 func agentAuthStateFromStatusOutput(output string, emptyMarkers []string) agentAuthState {
 	if strings.TrimSpace(output) == "" {
 		return agentAuthUnreadable
 	}
-	if agentAuthListHasCredentials(output, emptyMarkers) {
-		return agentAuthLoggedIn
+	for _, marker := range emptyMarkers {
+		if strings.Contains(strings.ToLower(output), strings.ToLower(marker)) {
+			return agentAuthLoggedOut
+		}
 	}
-	return agentAuthLoggedOut
+	return agentAuthUnreadable
 }

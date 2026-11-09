@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -27,6 +28,7 @@ import (
 // 同一条边界），WSL / SSH 项目在建立会话时就被拒绝。
 type cursorCLIRunner struct {
 	paths *agentPathResolver
+	login browserLogin
 }
 
 var (
@@ -196,36 +198,32 @@ func (r *cursorCLIRunner) Update(parent context.Context) (string, string, error)
 
 func (r *cursorCLIRunner) AutoUpdateSupported() bool { return true }
 
-// Login 只给出可操作入口，不后台驱动 `cursor-agent login`：那是交互式浏览器授权，
-// 无头环境无法可靠驱动（与 OpenCode / CodeBuddy 同一取舍）。
+// Login 使用 CLI 原生 NO_OPEN_BROWSER 授权，后台进程由服务持有并回收。
 func (r *cursorCLIRunner) Login(parent context.Context) (agentLoginInfo, error) {
-	if !r.Ready(parent) {
+	binary, err := exec.LookPath(r.cursorBinary())
+	if err != nil {
 		return agentLoginInfo{}, errors.New("Cursor CLI 未安装")
 	}
-	return agentLoginInfo{}, nil
+	return r.login.start(parent, func(ctx context.Context) *exec.Cmd {
+		cmd := codexCommandContext(ctx, binary, "login")
+		cmd.Env = append(os.Environ(), "NO_OPEN_BROWSER=1", "NO_COLOR=1")
+		return cmd
+	})
 }
 
-// LoginStatus 跑 `cursor-agent status`，按目录里的空标记判断是否已登录。
-//
-// 只能证明"CLI 认为自己有登录态"，不能证明凭据当前有效。
-// ⚠️ status 的真实输出形状尚未在装有 Cursor CLI 的机器上校准（见待校准清单）：
-// 命令成功但输出为空时**判断不了**（unreadable），不把它当成未登录；命令失败时把
-// 失败原因交出去，界面据此说"这次没读成"。
+func (r *cursorCLIRunner) stopLogin() { r.login.stop() }
+
+// LoginStatus 优先读取原生 JSON；本地令牌存在但没有账号详情时只报告 configured。
 func (r *cursorCLIRunner) LoginStatus(parent context.Context) (agentAuthState, error) {
-	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
-	defer cancel()
-	cmd := cursorCommandContext(ctx, r.cursorBinary(), "status")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
-	if err != nil {
-		return agentAuthUnreadable, err
-	}
 	entry, _ := agentByID("cursor")
-	return agentAuthStateFromStatusOutput(string(out), entry.AuthStatusEmptyMarkers), nil
+	return localCLIAuthStatus(parent, entry, r.cursorBinary())
 }
 
 // Run 执行一轮 Cursor。`-p` 不带提示词参数，CLI 从 stdin 读取；输出是 stream-json。
 func (r *cursorCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
+	if len(request.Attachments) > 0 {
+		sink.Event("attachment.reference", mustJSON(map[string]string{"message": "Cursor 当前通过工作区文件路径引用附件。"}))
+	}
 	args, err := cursorExecArgs(request)
 	if err != nil {
 		return err
@@ -246,7 +244,7 @@ func (r *cursorCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	if err != nil {
 		return fmt.Errorf("open Cursor stderr: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLICommand(ctx, cmd, Config{}); err != nil {
 		return fmt.Errorf("start Cursor: %w", err)
 	}
 	promptErr := writeCursorPrompt(stdin, request.Prompt)
@@ -266,7 +264,7 @@ func (r *cursorCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	go func() { defer wg.Done(); readCursorJSONL(stdout, sink, completion) }()
 	go func() { defer wg.Done(); readCursorStderr(stderr, sink, completion) }()
 	wg.Wait()
-	err = cmd.Wait()
+	err = waitOrdinaryCLICommand(cmd)
 
 	if completion.finished() {
 		if failure := completion.failure(); failure != nil {

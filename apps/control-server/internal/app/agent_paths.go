@@ -137,19 +137,24 @@ func platformFallbackCandidates(entry AgentCatalogEntry) []string {
 		return nativeFallbackCandidates(entry)
 	}
 	if runtime.GOOS != "windows" {
+		if entry.ID == "claude-code" {
+			return nativeFallbackCandidates(entry)
+		}
 		return nil
 	}
 	appData := os.Getenv("APPDATA")
-	if appData == "" {
-		return nil
-	}
 	names := agentCommandNames(entry)
 	candidates := make([]string, 0, len(names)*2)
 	for _, name := range names {
-		candidates = append(candidates,
-			filepath.Join(appData, "npm", name+".cmd"),
-			filepath.Join(appData, "npm", name+".exe"),
-		)
+		if appData != "" {
+			candidates = append(candidates,
+				filepath.Join(appData, "npm", name+".cmd"),
+				filepath.Join(appData, "npm", name+".exe"),
+			)
+		}
+	}
+	if entry.ID == "claude-code" {
+		candidates = append(candidates, nativeFallbackCandidates(entry)...)
 	}
 	return candidates
 }

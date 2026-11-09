@@ -12,7 +12,7 @@ import (
 
 type sshTerminalSession struct {
 	id, projectID string
-	session       *ssh.Session
+	session       *workspaceSSHSession
 	stdin         io.WriteCloser
 	reader        *io.PipeReader
 	writer        *io.PipeWriter
@@ -46,7 +46,7 @@ func (s *Server) openSSHTerminal(ctx context.Context, spec TerminalSpec) (Termin
 	if err != nil {
 		return nil, err
 	}
-	sess, err := sshRunner.client.newSession(ctx)
+	sess, err := sshRunner.client.newSession(ctx, workDir)
 	if err != nil {
 		return nil, err
 	}

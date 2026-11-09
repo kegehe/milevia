@@ -904,6 +904,9 @@ func (s *Server) enqueueTask(ctx context.Context, task Task, cfg OrchestrationCo
 // errorStatusForEnqueue maps enqueue errors to the HTTP status code a handler
 // should return. Business-rule violations are 409; anything else is 500.
 func errorStatusForEnqueue(err error) int {
+	if isTaskExecutionConflict(err) {
+		return http.StatusConflict
+	}
 	if errors.Is(err, errOrchestrationDisabled) || errors.Is(err, errOrchestrationTaskIneligible) || errors.Is(err, errOrchestrationSettled) {
 		return http.StatusConflict
 	}
@@ -1231,7 +1234,7 @@ func (s *Server) createOrchestrationBatch(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeError(w, errorStatusForEnqueue(err), err)
 		return
 	}
 	if err = tx.Commit(); err != nil {
@@ -1463,7 +1466,7 @@ func (s *Server) addTasksToOrchestrationBatch(w http.ResponseWriter, r *http.Req
 		_, err = tx.ExecContext(r.Context(), `update orchestration_batches set updated_at=? where id=?`, now, batchID)
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeError(w, errorStatusForEnqueue(err), err)
 		return
 	}
 	if err = tx.Commit(); err != nil {
@@ -2473,6 +2476,11 @@ func (s *Server) resumeCommittedOrchestrationReview(ctx context.Context, job Orc
 	if record.WorktreePath == "" || record.TaskBranch == "" {
 		return errors.New("committed orchestration record is incomplete")
 	}
+	releaseTarget, err := s.beginWorkspaceOperationAtPath(project, record.WorktreePath, "orchestration-restore")
+	if err != nil {
+		return err
+	}
+	defer releaseTarget()
 	if _, err := os.Stat(record.WorktreePath); errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(filepath.Dir(record.WorktreePath), 0700); err != nil {
 			return err
@@ -2700,7 +2708,7 @@ type sqlQueryer interface {
 func orchestrationOwnsTask(ctx context.Context, q sqlQueryer, taskID string) (bool, error) {
 	var owns bool
 	err := q.QueryRowContext(ctx, `select exists(select 1 from task_orchestration_jobs
-		where task_id=? and status in ('queued','preparing','implementing','checking','paused','needs_human','stopped','removing','awaiting_main','integrated_to_dev'))`, taskID).Scan(&owns)
+		where task_id=? and status in (`+orchestrationOwnedStatuses+`))`, taskID).Scan(&owns)
 	return owns, err
 }
 
@@ -2885,6 +2893,11 @@ func (s *Server) prepareAndDispatchOrchestrationJob(ctx context.Context, job Orc
 			return errors.New("orchestration conversation changed while preparing")
 		}
 	}
+	releaseTarget, err := s.beginWorkspaceOperationAtPath(project, worktree, "orchestration-prepare")
+	if err != nil {
+		return err
+	}
+	defer releaseTarget()
 	if err := os.MkdirAll(filepath.Dir(worktree), 0700); err != nil {
 		return err
 	}
@@ -3217,6 +3230,11 @@ func (s *Server) keepOrchestrationReviewAlive(ctx context.Context, job Orchestra
 }
 
 func (s *Server) runIndependentReview(ctx context.Context, project Project, job OrchestrationJob, cfg OrchestrationConfig, worktree, commit string) error {
+	ctx, release, err := s.beginCLIWorkspaceOperationAtPath(ctx, project, worktree, "orchestration-review")
+	if err != nil {
+		return err
+	}
+	defer release()
 	var task Task
 	if err := s.db.QueryRowContext(ctx, `select id,project_id,title,description,priority,position,status,created_at,updated_at,completed_at,cancelled_at from tasks where id=?`, job.TaskID).Scan(&task.ID, &task.ProjectID, &task.Title, &task.Description, &task.Priority, &task.Position, &task.Status, &task.CreatedAt, &task.UpdatedAt, new(sql.NullTime), new(sql.NullTime)); err != nil {
 		return err
@@ -3280,7 +3298,7 @@ func (s *Server) runIndependentReview(ctx context.Context, project Project, job 
 			s.postOrchestrationMessage(context.Background(), job, content)
 		}}
 		s.postOrchestrationMessage(ctx, job, fmt.Sprintf("开始独立审查（第 %d/%d 次）。", attempt, maxIndependentReviewAttempts))
-		if err := runner.Run(reviewCtx, AgentRunRequest{
+		if err := s.runTrackedOrdinaryCLI(reviewCtx, runner, project.Runner, AgentRunRequest{
 			SessionID:      uuid.NewString(),
 			ProjectPath:    worktree,
 			Prompt:         prompt,
@@ -3503,6 +3521,11 @@ func (s *Server) gitCommand(ctx context.Context, repo string, args ...string) er
 	return err
 }
 func (s *Server) gitOutput(ctx context.Context, repo string, args ...string) (string, error) {
+	release, err := s.beginWorkspaceOperationAtPath(Project{Runner: s.localRunnerID()}, repo, "internal-git")
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	commandCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(commandCtx, "git", args...)
@@ -3516,6 +3539,11 @@ func (s *Server) gitOutput(ctx context.Context, repo string, args ...string) (st
 	return string(output), nil
 }
 func (s *Server) runVerificationCommands(ctx context.Context, job OrchestrationJob, worktree, sha, phase string, commands []string) error {
+	release, err := s.beginWorkspaceOperationAtPath(Project{Runner: s.localRunnerID()}, worktree, "orchestration-test")
+	if err != nil {
+		return err
+	}
+	defer release()
 	for _, command := range commands {
 		if err := s.assertOrchestrationLease(ctx, job); err != nil {
 			return err
@@ -3589,7 +3617,11 @@ func (s *Server) removeOrchestrationGitResources(ctx context.Context, repo, proj
 }
 
 func (s *Server) removeOrchestrationWorktree(ctx context.Context, repo, projectID, jobID, worktree string) error {
-	var err error
+	release, err := s.beginWorkspaceOperationAtPath(Project{Runner: s.localRunnerID()}, worktree, "orchestration-cleanup")
+	if err != nil {
+		return err
+	}
+	defer release()
 	for attempt := 1; attempt <= orchestrationWorktreeRemoveAttempts; attempt++ {
 		err = s.gitCommand(ctx, repo, "worktree", "remove", "--force", worktree)
 		if err == nil {
@@ -3840,7 +3872,8 @@ func (s *Server) confirmReleaseMergedToMain(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	type releasedJob struct{ ID, TaskID string }
+	type releasedJob struct{ ID, TaskID, IntegrationSHA string }
+	candidates := []releasedJob{}
 	jobIDs := []releasedJob{}
 	for rows.Next() {
 		var jobID, taskID, integrationSHA string
@@ -3852,9 +3885,7 @@ func (s *Server) confirmReleaseMergedToMain(w http.ResponseWriter, r *http.Reque
 		if strings.TrimSpace(integrationSHA) == "" {
 			continue
 		}
-		if s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", integrationSHA, item.DevSHA) == nil {
-			jobIDs = append(jobIDs, releasedJob{ID: jobID, TaskID: taskID})
-		}
+		candidates = append(candidates, releasedJob{ID: jobID, TaskID: taskID, IntegrationSHA: integrationSHA})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -3862,6 +3893,21 @@ func (s *Server) confirmReleaseMergedToMain(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	rows.Close()
+	// Git commands register workspace operations in SQLite. Do not hold a rows
+	// cursor while acquiring that write protection: SQLite can block the writer
+	// behind this reader, causing eligible jobs to be silently skipped.
+	for _, job := range candidates {
+		checkErr := s.gitCommand(r.Context(), project.Path, "merge-base", "--is-ancestor", job.IntegrationSHA, item.DevSHA)
+		if checkErr == nil {
+			jobIDs = append(jobIDs, job)
+		} else {
+			var exitErr *exec.ExitError
+			if !errors.As(checkErr, &exitErr) || exitErr.ExitCode() != 1 {
+				writeError(w, http.StatusInternalServerError, checkErr)
+				return
+			}
+		}
+	}
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {

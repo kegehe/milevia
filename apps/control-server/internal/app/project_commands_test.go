@@ -334,8 +334,9 @@ func TestObserveCommandCatalogIgnoresUnrelatedEvents(t *testing.T) {
 	if !ok || len(qoder.catalog.names) != 1 || qoder.catalog.names[0] != "qoder-only" {
 		t.Fatalf("Qoder 目录应单独存放：%+v ok=%v", qoder.catalog.names, ok)
 	}
-	if _, ok := server.cachedCommandCatalog(commandCatalogCacheKey("project", "codebuddy"), 0); ok {
-		t.Fatal("CodeBuddy 目录还没接，不能写入")
+	buddy, ok := server.cachedCommandCatalog(commandCatalogCacheKey("project", "codebuddy"), 0)
+	if !ok || len(buddy.catalog.names) != 1 || buddy.catalog.names[0] != "codebuddy-only" {
+		t.Fatalf("CodeBuddy catalog must be isolated: %+v", buddy)
 	}
 }
 

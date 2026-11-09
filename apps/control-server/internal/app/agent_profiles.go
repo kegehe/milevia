@@ -56,6 +56,8 @@ type AgentProfileRevision struct {
 // AgentProfileView exposes the current revision's non-sensitive summary for
 // the selector UI. SecretRef remains deliberately excluded.
 type AgentProfileView struct {
+	TargetID      string `json:"targetId,omitempty"`
+	ExecutionMode string `json:"executionMode"`
 	AgentProfile
 	Revision int               `json:"revision"`
 	BaseURL  string            `json:"baseUrl,omitempty"`
@@ -86,6 +88,7 @@ type profileRouteSelection struct {
 
 // AgentRuntimeProfile only exists in the control service and local runner.
 type AgentRuntimeProfile struct {
+	TargetID      string
 	RevisionID    string
 	AgentID       string
 	BaseURL       string
@@ -569,8 +572,8 @@ func mapsEqual(left, right map[string]string) bool {
 
 func (s *Server) listAgentProfiles(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
-	rows, err := s.db.QueryContext(r.Context(), `select p.id,p.runner_id,p.agent_id,p.name,p.current_revision_id,p.enabled,p.is_default,p.created_at,p.updated_at,r.revision,r.base_url,r.model,r.options_json,r.auth_mode,r.state
-		from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id where p.runner_id=? order by p.agent_id,p.is_default desc,p.name`, runnerID)
+	rows, err := s.db.QueryContext(r.Context(), `select p.id,p.runner_id,p.agent_id,p.name,p.current_revision_id,p.enabled,p.is_default,p.created_at,p.updated_at,r.revision,r.base_url,r.model,r.options_json,r.auth_mode,r.state,r.execution_mode,coalesce(t.target_id,'')
+		from agent_profiles p join agent_profile_revisions r on r.id=p.current_revision_id left join supervision_profile_targets t on t.revision_id=r.id where p.runner_id=? and (r.execution_mode='isolated' or ?=1) order by p.agent_id,p.is_default desc,p.name`, runnerID, allowsSupervisionProfiles(r.Context()))
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -580,7 +583,7 @@ func (s *Server) listAgentProfiles(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var profile AgentProfileView
 		var optionsJSON string
-		if err := rows.Scan(&profile.ID, &profile.RunnerID, &profile.AgentID, &profile.Name, &profile.CurrentRevisionID, &profile.Enabled, &profile.IsDefault, &profile.CreatedAt, &profile.UpdatedAt, &profile.Revision, &profile.BaseURL, &profile.Model, &optionsJSON, &profile.AuthMode, &profile.State); err != nil {
+		if err := rows.Scan(&profile.ID, &profile.RunnerID, &profile.AgentID, &profile.Name, &profile.CurrentRevisionID, &profile.Enabled, &profile.IsDefault, &profile.CreatedAt, &profile.UpdatedAt, &profile.Revision, &profile.BaseURL, &profile.Model, &optionsJSON, &profile.AuthMode, &profile.State, &profile.ExecutionMode, &profile.TargetID); err != nil {
 			writeError(w, 500, err)
 			return
 		}
@@ -752,7 +755,7 @@ func (s *Server) projectCLIConfig(ctx context.Context, project *Project, agentID
 
 func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 	runnerID := chi.URLParam(r, "runnerID")
-	if !s.canManageProfileRunner(runnerID) {
+	if !s.canManageProfileRequest(r, runnerID) {
 		writeError(w, http.StatusConflict, errors.New("target Runner Agent is not installed; remote managed credentials are unavailable"))
 		return
 	}
@@ -782,7 +785,7 @@ func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if !s.canManageProfileRunner(runnerID) {
+	if !s.canManageProfileRequest(r, runnerID) {
 		writeError(w, http.StatusConflict, errors.New("this runner only supports remote-managed profiles"))
 		return
 	}
@@ -802,6 +805,9 @@ func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	revision := AgentProfileRevision{ID: uuid.NewString(), ProfileID: profile.ID, Revision: 1, BaseURL: input.BaseURL, Model: input.Model, Protocol: profileProtocol(input.AgentID, input.AuthMode), AuthMode: input.AuthMode, State: "active", ExecutionMode: "isolated", CreatedAt: now, Environment: input.Env}
+	if allowsSupervisionProfiles(r.Context()) {
+		revision.ExecutionMode = "target_isolated"
+	}
 	// Persist the managed secret before the revision so secret_ref is stable and
 	// never carries plaintext into the revision row.
 	var secretID string
@@ -816,6 +822,9 @@ func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	profile.CurrentRevisionID = revision.ID
 	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err == nil && revision.ExecutionMode == "target_isolated" {
+		err = s.ensureSupervisionProfileRunnerTx(r.Context(), tx, runnerID, now)
+	}
 	if err == nil {
 		_, err = tx.ExecContext(r.Context(), `insert into agent_profiles (id,runner_id,agent_id,name,current_revision_id,enabled,is_default,created_at,updated_at) values (?,?,?,?,?,?,?,?,?)`, profile.ID, profile.RunnerID, profile.AgentID, profile.Name, profile.CurrentRevisionID, profile.Enabled, profile.IsDefault, profile.CreatedAt, profile.UpdatedAt)
 	}
@@ -825,9 +834,12 @@ func (s *Server) createAgentProfile(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		err = s.ensurePrivateQuotaGroupTx(r.Context(), tx, profile.ID, profile.RunnerID)
 	}
+	if err == nil && revision.ExecutionMode == "target_isolated" {
+		err = s.saveSupervisionProfileDestinationTx(r.Context(), tx, revision.ID, profile.RunnerID)
+	}
 	if err == nil {
 		err = tx.Commit()
-	} else {
+	} else if tx != nil {
 		_ = tx.Rollback()
 	}
 	if err != nil {
@@ -886,11 +898,11 @@ func (s *Server) updateAgentProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("agent profile revision is invalid"))
 		return
 	}
-	if !s.canManageProfileRunner(profile.RunnerID) {
+	if !s.canManageProfileRequest(r, profile.RunnerID) {
 		writeError(w, http.StatusConflict, errors.New("this runner only supports remote-managed profiles"))
 		return
 	}
-	if current.State != "active" || current.ExecutionMode != "isolated" {
+	if current.State != "active" || !admissibleProfileMode(r.Context(), current.ExecutionMode) {
 		writeError(w, http.StatusConflict, errors.New("agent profile revision is not editable"))
 		return
 	}
@@ -973,6 +985,19 @@ func (s *Server) updateAgentProfile(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if current.ExecutionMode == "target_isolated" {
+			result, bindErr := tx.ExecContext(r.Context(), `insert into supervision_profile_targets(revision_id,target_id,connection_key) select ?,target_id,connection_key from supervision_profile_targets where revision_id=?`, newRevision.ID, current.ID)
+			if bindErr != nil {
+				writeError(w, 500, bindErr)
+				return
+			}
+			count, _ := result.RowsAffected()
+			if count != 1 {
+				writeError(w, 409, errors.New("target profile destination is missing"))
+				return
+			}
+		}
+
 		if _, err = tx.ExecContext(r.Context(), `update agent_profile_revisions set state='deprecated' where id=? and state='active'`, current.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -1006,7 +1031,7 @@ func (s *Server) validateAgentProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !s.canManageProfileRunner(runnerID) || revision.State != "active" {
+	if !s.canManageProfileRequest(r, runnerID) || revision.State != "active" {
 		writeError(w, http.StatusConflict, errors.New("agent profile is not available for local validation"))
 		return
 	}
@@ -1038,7 +1063,7 @@ func (s *Server) disableAgentProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !s.canManageProfileRunner(runnerID) {
+	if !s.canManageProfileRequest(r, runnerID) {
 		writeError(w, http.StatusConflict, errors.New("this runner only supports remote-managed profiles"))
 		return
 	}
@@ -1079,7 +1104,7 @@ func (s *Server) enableAgentProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !s.canManageProfileRunner(runnerID) {
+	if !s.canManageProfileRequest(r, runnerID) {
 		writeError(w, http.StatusConflict, errors.New("this runner only supports remote-managed profiles"))
 		return
 	}
@@ -1113,7 +1138,7 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !s.canManageProfileRunner(runnerID) {
+	if !s.canManageProfileRequest(r, runnerID) {
 		writeError(w, http.StatusConflict, errors.New("this runner only supports remote-managed profiles"))
 		return
 	}
@@ -1204,6 +1229,11 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	supervisionIDs, err := revokeSupervisionProfileTx(r.Context(), tx, revisionID, time.Now().UTC())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, 500, err)
 		return
@@ -1219,6 +1249,9 @@ func (s *Server) revokeAgentProfileRevision(w http.ResponseWriter, r *http.Reque
 	}
 	for _, cancel := range cancels {
 		cancel()
+	}
+	for _, id := range supervisionIDs {
+		s.wakeSupervisionWorker(id)
 	}
 	stoppingSessionCount := s.sessionManager.retireForProfileRevision(conversationIDs)
 	writeJSON(w, http.StatusAccepted, map[string]any{"state": "revoked", "revocationJobId": jobID, "revocationJobState": jobState, "stoppingRunCount": len(runIDs), "stoppingSessionCount": stoppingSessionCount})
@@ -1305,7 +1338,7 @@ func (s *Server) profileRouteForNewConversationTx(ctx context.Context, tx *sql.T
 	if err != nil {
 		return profileRouteSelection{}, err
 	}
-	if revision.State != "active" || revision.ExecutionMode != "isolated" || (revision.AuthMode != "cli_managed" && revision.AuthMode != "api_key") {
+	if revision.State != "active" || !admissibleProfileMode(ctx, revision.ExecutionMode) || (revision.AuthMode != "cli_managed" && revision.AuthMode != "api_key") {
 		return profileRouteSelection{}, errors.New("agent profile revision is not admissible")
 	}
 	if revision.AuthMode == "cli_managed" && (revision.BaseURL != "" || revision.SecretRef != "") {
@@ -1405,8 +1438,13 @@ func (s *Server) runtimeProfileTx(ctx context.Context, tx *sql.Tx, revisionID, r
 	if profile.Env, err = unmarshalProfileOptions(optionsJSON); err != nil {
 		return nil, errors.New("agent profile revision is invalid")
 	}
-	if (state != "active" && state != "deprecated") || profile.ExecutionMode != "isolated" {
+	if (state != "active" && state != "deprecated") || !admissibleProfileMode(ctx, profile.ExecutionMode) {
 		return nil, errors.New("agent profile revision is not admissible")
+	}
+	if profile.ExecutionMode == "target_isolated" {
+		if err := tx.QueryRowContext(ctx, `select target_id from supervision_profile_targets where revision_id=?`, revisionID).Scan(&profile.TargetID); err != nil || profile.TargetID == "" {
+			return nil, errors.New("target supervision profile has no verified destination")
+		}
 	}
 	switch profile.AuthMode {
 	case "cli_managed":

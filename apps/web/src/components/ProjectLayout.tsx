@@ -30,6 +30,7 @@ function ErrorAlertIcon() {
 
 function WorkspaceTabIcon({ tab }: { tab: WorkspaceTab }) {
   const paths: Record<WorkspaceTab, ReactNode> = {
+    supervision: <><circle cx="12" cy="6" r="3" /><path d="M12 9v5M5 19v-5h14v5M12 14v5" /></>,
     conversation: <><path d="M6.5 17.5 3.8 20v-11A3.5 3.5 0 0 1 7.3 5.5h9.4A3.5 3.5 0 0 1 20.2 9v5a3.5 3.5 0 0 1-3.5 3.5H6.5Z" /><path d="M8 11.5h8M8 14.5h5" /></>,
     tasks: <><path d="M8.5 6.5h10M8.5 12h10M8.5 17.5h10" /><path d="m4.7 6.5.9.9 1.8-2M4.7 12l.9.9 1.8-2M4.7 17.5l.9.9 1.8-2" /></>,
     orchestration: <><circle cx="6" cy="6" r="2" /><circle cx="18" cy="12" r="2" /><circle cx="6" cy="18" r="2" /><path d="M8 6h3.5a4.5 4.5 0 0 1 0 9H8M15.8 10.8l-2.3 2.3 2.3 2.3" /></>,
@@ -81,6 +82,7 @@ export default function ProjectLayout() {
     const path = location.pathname.replace(/\/+$/, "");
     if (path.endsWith("/tasks") || path.includes("/tasks/")) return "tasks";
     if (path.endsWith("/orchestration")) return "orchestration";
+    if (path.endsWith("/supervision")) return "supervision";
     if (path.endsWith("/files")) return "files";
     if (path.endsWith("/git")) return "git";
     if (path.endsWith("/run")) return "run";
@@ -101,6 +103,7 @@ export default function ProjectLayout() {
       case "conversation": guardedNavigate(`${base}/conversations`); break;
       case "tasks": guardedNavigate(`${base}/tasks`); break;
       case "orchestration": guardedNavigate(`${base}/orchestration`); break;
+      case "supervision": guardedNavigate(`${base}/supervision`); break;
       case "files": guardedNavigate(`${base}/files`); break;
       case "git": guardedNavigate(`${base}/git`); break;
       case "run": guardedNavigate(`${base}/run`); break;
@@ -196,6 +199,7 @@ export default function ProjectLayout() {
       </div>
     </header>
     <nav className="workspace-tabs" role="tablist" aria-label="项目工作区" onKeyDown={navigateWorkspaceTabs}>
+      <button data-workspace-tab="supervision" id="workspace-tab-supervision" type="button" role="tab" aria-controls="workspace-panel-supervision" aria-selected={workspaceTab === "supervision"} className={workspaceTab === "supervision" ? "active" : ""} onClick={() => selectWorkspaceTab("supervision")}><WorkspaceTabIcon tab="supervision" /><span>任务托管</span></button>
       <button data-workspace-tab="conversation" id="workspace-tab-conversation" type="button" role="tab" aria-controls="workspace-panel-conversation" aria-selected={workspaceTab === "conversation"} className={workspaceTab === "conversation" ? "active" : ""} onClick={() => selectWorkspaceTab("conversation")}><WorkspaceTabIcon tab="conversation" /><span>对话</span></button>
       <button data-workspace-tab="tasks" id="workspace-tab-tasks" type="button" role="tab" aria-controls="workspace-panel-tasks" aria-selected={workspaceTab === "tasks"} className={workspaceTab === "tasks" ? "active" : ""} onClick={() => selectWorkspaceTab("tasks")}><WorkspaceTabIcon tab="tasks" /><span>任务</span></button>
       <button data-workspace-tab="orchestration" id="workspace-tab-orchestration" type="button" role="tab" aria-controls="workspace-panel-orchestration" aria-selected={workspaceTab === "orchestration"} className={workspaceTab === "orchestration" ? "active" : ""} onClick={() => selectWorkspaceTab("orchestration")}><WorkspaceTabIcon tab="orchestration" /><span>自动编排</span></button>

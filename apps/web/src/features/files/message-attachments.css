@@ -1,0 +1,8 @@
+.message-attachment-picker { position: relative; display: inline-flex; }
+.message-attachment-picker > .composer-icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 8px; background: transparent; color: #547766; cursor: pointer; }
+.message-attachment-picker .composer-action-icon { width: 17px; height: 17px; flex: none; }
+.message-attachment-picker button:disabled { opacity: .45; cursor: not-allowed; }
+.message-attachment-menu { position: absolute; bottom: calc(100% + 12px); left: 0; z-index: 30; display: grid; gap: 10px; padding: 14px; width: min(320px, 80vw); border: 1px solid var(--border, #ddd); border-radius: 12px; background: var(--panel, #fff); box-shadow: 0 8px 28px #0002; color: var(--text, #222); }
+.message-attachment-menu label { display: grid; gap: 6px; font-size: 12px; }
+.message-attachment-menu input { width: 100%; box-sizing: border-box; }
+.message-attachment-menu small { font-size: 11px; opacity: .7; }

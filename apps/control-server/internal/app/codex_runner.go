@@ -244,15 +244,30 @@ func codexExecArgs(request AgentRunRequest, profileArgs []string, schemaPath, po
 	// --skip-git-repo-check：新建目录常常还不是 git 仓库，缺这个开关时 CLI 直接以
 	// "Not inside a trusted directory and --skip-git-repo-check was not specified" 退出，
 	// 用户看到的就是一句「工具输出异常」。SSH/WSL 两处 runner 同样会踩到，三处 resume 分支一起补上。
+	imageArgs := []string{}
+	for _, attachment := range request.Attachments {
+		if nativeImageMediaType(attachment.MediaType) {
+			imageArgs = append(imageArgs, "--image", attachment.Path)
+		}
+	}
 	if request.Resume {
-		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", request.SessionID, "-")
+		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", request.SessionID)
+		args = append(args, imageArgs...)
+		args = append(args, "-")
 	} else {
-		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy, "-")
+		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", request.ProjectPath, "--sandbox", policy)
+		args = append(args, imageArgs...)
+		args = append(args, "-")
 	}
 	return args
 }
 
 func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
+	if runtime.GOOS == "windows" {
+		if err := validateAttachmentShimArgs(r.codexBinary(), request.Attachments); err != nil {
+			return err
+		}
+	}
 	policy, err := codexSandbox(request.PermissionMode)
 	if err != nil {
 		return err
@@ -290,7 +305,7 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	if err != nil {
 		return fmt.Errorf("open Codex stderr: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLICommand(ctx, cmd, r.config); err != nil {
 		return fmt.Errorf("start Codex: %w", err)
 	}
 	// 进程树放进 Job Object：turn.completed 之后仍握着输出管道的后裔（dev server、
@@ -309,7 +324,7 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, request.ProjectPath, completion) }()
 	go func() { defer wg.Done(); readCodexStderr(stderr, sink) }()
 	wg.Wait()
-	err = cmd.Wait()
+	err = waitOrdinaryCLICommand(cmd)
 	if completion.finished() {
 		// The expected termination after turn.completed may produce a non-zero
 		// process exit. The completed turn is the user-visible outcome.
@@ -799,7 +814,12 @@ func readCodexStderr(reader io.Reader, sink AgentRunSink) {
 // JSONL output, so this must remain independent of a particular CLI schema.
 func sanitizeAgentJSONL(line []byte) (json.RawMessage, error) {
 	var payload any
-	if err := json.Unmarshal(line, &payload); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+	if !json.Valid(line) {
+		return nil, errors.New("invalid agent JSON event")
+	}
+	if err := decoder.Decode(&payload); err != nil {
 		return nil, err
 	}
 	sanitized, err := json.Marshal(redactAgentJSONValue(payload, ""))
@@ -819,6 +839,20 @@ func redactAgentJSONValue(value any, field string) any {
 	case map[string]any:
 		redacted := make(map[string]any, len(typed))
 		for key, item := range typed {
+			if typed["type"] == "image" && key == "source" {
+				if source, ok := item.(map[string]any); ok {
+					copySource := make(map[string]any, len(source))
+					for sourceKey, sourceValue := range source {
+						if sourceKey == "data" {
+							copySource[sourceKey] = "[REDACTED_IMAGE]"
+						} else {
+							copySource[sourceKey] = redactAgentJSONValue(sourceValue, sourceKey)
+						}
+					}
+					redacted[key] = copySource
+					continue
+				}
+			}
 			redacted[key] = redactAgentJSONValue(item, key)
 		}
 		return redacted

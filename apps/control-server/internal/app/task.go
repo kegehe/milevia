@@ -24,20 +24,21 @@ const (
 )
 
 type Task struct {
-	ID                        string           `json:"id"`
-	ProjectID                 string           `json:"projectId"`
-	Title                     string           `json:"title"`
-	Description               string           `json:"description"`
-	Priority                  string           `json:"priority"`
-	Pinned                    bool             `json:"pinned"`
-	Position                  float64          `json:"position"`
-	Status                    string           `json:"status"`
-	DependsOn                 []TaskDependency `json:"dependsOn"`
-	BlockedBy                 []TaskBlocker    `json:"blockedBy"`
-	Blocks                    []TaskDependency `json:"blocks"`
-	LastRun                   *TaskRun         `json:"lastRun,omitempty"`
-	OrchestrationStatus       string           `json:"orchestrationStatus,omitempty"`
-	OrchestrationTargetBranch string           `json:"orchestrationTargetBranch,omitempty"`
+	ID                        string              `json:"id"`
+	ProjectID                 string              `json:"projectId"`
+	Title                     string              `json:"title"`
+	Description               string              `json:"description"`
+	Priority                  string              `json:"priority"`
+	Pinned                    bool                `json:"pinned"`
+	Position                  float64             `json:"position"`
+	Status                    string              `json:"status"`
+	DependsOn                 []TaskDependency    `json:"dependsOn"`
+	BlockedBy                 []TaskBlocker       `json:"blockedBy"`
+	Blocks                    []TaskDependency    `json:"blocks"`
+	LastRun                   *TaskRun            `json:"lastRun,omitempty"`
+	ExecutionClaim            *TaskExecutionClaim `json:"executionClaim,omitempty"`
+	OrchestrationStatus       string              `json:"orchestrationStatus,omitempty"`
+	OrchestrationTargetBranch string              `json:"orchestrationTargetBranch,omitempty"`
 	// OrchestrationPending 表示该任务所属的编排任务还没点「开始执行」，所以在队列里等着。
 	OrchestrationPending   bool       `json:"orchestrationPending,omitempty"`
 	OrchestrationUpdatedAt *time.Time `json:"orchestrationUpdatedAt,omitempty"`
@@ -60,19 +61,21 @@ type TaskBlocker struct {
 }
 
 type TaskRun struct {
-	ID                 string     `json:"id"`
-	TaskID             string     `json:"taskId"`
-	ConversationID     string     `json:"conversationId"`
-	RunID              string     `json:"runId"`
-	Sequence           int        `json:"sequence"`
-	Status             string     `json:"status"`
-	PromptSnapshot     string     `json:"promptSnapshot"`
-	AcceptanceSnapshot string     `json:"acceptanceSnapshot"`
-	FailureReason      string     `json:"failureReason"`
-	CreatedAt          time.Time  `json:"createdAt"`
-	StartedAt          *time.Time `json:"startedAt,omitempty"`
-	FinishedAt         *time.Time `json:"finishedAt,omitempty"`
-	ExecutionIntentID  string     `json:"-"`
+	ID                 string              `json:"id"`
+	TaskID             string              `json:"taskId"`
+	ConversationID     string              `json:"conversationId"`
+	RunID              string              `json:"runId"`
+	Sequence           int                 `json:"sequence"`
+	Status             string              `json:"status"`
+	PromptSnapshot     string              `json:"promptSnapshot"`
+	AcceptanceSnapshot string              `json:"acceptanceSnapshot"`
+	FailureReason      string              `json:"failureReason"`
+	CreatedAt          time.Time           `json:"createdAt"`
+	StartedAt          *time.Time          `json:"startedAt,omitempty"`
+	FinishedAt         *time.Time          `json:"finishedAt,omitempty"`
+	ExecutionIntentID  string              `json:"-"`
+	ExecutionSource    taskExecutionSource `json:"executionSource"`
+	ExecutionOwnerID   string              `json:"executionOwnerId,omitempty"`
 }
 
 type TaskEvent struct {
@@ -450,6 +453,12 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	if input.PredecessorTaskIDs != nil {
+		if err := rejectSupervisedDependencyMutation(r.Context(), tx, task.ID, (*input.PredecessorTaskIDs)...); err != nil {
+			writeTaskExecutionError(w, err)
+			return
+		}
+	}
 	if task.Position == 0 {
 		if err := tx.QueryRowContext(r.Context(), `select coalesce(max(position),0)+1 from tasks where project_id=?`, projectID).Scan(&task.Position); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -587,6 +596,16 @@ func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	if err := rejectSupervisedTaskMutation(r.Context(), tx, task.ID); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
+	if input.PredecessorTaskIDs != nil {
+		if err := rejectSupervisedDependencyMutation(r.Context(), tx, task.ID, (*input.PredecessorTaskIDs)...); err != nil {
+			writeTaskExecutionError(w, err)
+			return
+		}
+	}
 	result, err := tx.ExecContext(r.Context(), `update tasks set title=?,description=?,priority=?,pinned=?,position=?,status=?,updated_at=? where id=? and status=?`, task.Title, task.Description, task.Priority, task.Pinned, task.Position, task.Status, task.UpdatedAt, task.ID, originalStatus)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -716,6 +735,10 @@ func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	if err := rejectSupervisedTaskDeletionTx(r.Context(), tx, task.ID); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
 	if _, err := tx.ExecContext(r.Context(), `delete from task_dependencies where task_id=? or predecessor_task_id=?`, task.ID, task.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("delete task dependencies: %w", err))
 		return
@@ -784,6 +807,10 @@ func (s *Server) addTaskDependency(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	if err := rejectSupervisedDependencyMutation(r.Context(), tx, task.ID, predecessor.ID); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
 	var taskProjectID, taskStatus, predecessorProjectID string
 	if err := tx.QueryRowContext(r.Context(), `select project_id,status from tasks where id=?`, task.ID).Scan(&taskProjectID, &taskStatus); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -858,6 +885,10 @@ func (s *Server) deleteTaskDependency(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	if err := rejectSupervisedDependencyMutation(r.Context(), tx, task.ID, chi.URLParam(r, "predecessorTaskID")); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
 	var status string
 	if err := tx.QueryRowContext(r.Context(), `select status from tasks where id=?`, task.ID).Scan(&status); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -932,6 +963,10 @@ func (s *Server) replaceTaskDependencies(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer tx.Rollback()
+	if err := rejectSupervisedDependencyMutation(r.Context(), tx, task.ID, ids...); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
 	var status string
 	if err := tx.QueryRowContext(r.Context(), `select status from tasks where id=?`, task.ID).Scan(&status); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1052,7 +1087,7 @@ func (s *Server) hydrateTask(ctx context.Context, task *Task) error {
 // hydrateTasks 一次性补齐一批任务的派生字段（依赖、最近一次执行、编排状态）。
 // 任务看板与会话侧栏的任务队列都是整表读、每 10 秒一轮，而控制服务只有一条 SQLite 连接，
 // 早先"每条任务再查 4 次"的写法会让刷新耗时随任务数线性增长、并长时间占住连接。
-// 这里改成每批固定 4 条查询（predecessors、dependents、latest run、orchestration job）。
+// 这里改成每批固定 5 条查询（predecessors、dependents、latest run、orchestration job、execution claim）。
 func (s *Server) hydrateTasks(ctx context.Context, tasks []*Task) error {
 	if len(tasks) == 0 {
 		return nil
@@ -1062,6 +1097,7 @@ func (s *Server) hydrateTasks(ctx context.Context, tasks []*Task) error {
 	for _, task := range tasks {
 		task.DependsOn, task.BlockedBy, task.Blocks = []TaskDependency{}, []TaskBlocker{}, []TaskDependency{}
 		task.LastRun = nil
+		task.ExecutionClaim = nil
 		task.OrchestrationStatus, task.OrchestrationTargetBranch = "", ""
 		task.OrchestrationPending, task.OrchestrationUpdatedAt = false, nil
 		byID[task.ID] = task
@@ -1074,7 +1110,10 @@ func (s *Server) hydrateTasks(ctx context.Context, tasks []*Task) error {
 		if err := s.hydrateTaskLastRuns(ctx, byID, placeholders, args); err != nil {
 			return err
 		}
-		return s.hydrateTaskOrchestration(ctx, byID, placeholders, args)
+		if err := s.hydrateTaskOrchestration(ctx, byID, placeholders, args); err != nil {
+			return err
+		}
+		return s.hydrateTaskExecutionClaims(ctx, byID, placeholders, args)
 	})
 }
 
@@ -1132,7 +1171,7 @@ func (s *Server) hydrateTaskDependencies(ctx context.Context, byID map[string]*T
 // hydrateTaskLastRuns 填 LastRun：取每条任务 sequence 最大的那次执行
 // （sequence 由 max+1 在同一事务里分配，因此任务内唯一）。
 func (s *Server) hydrateTaskLastRuns(ctx context.Context, byID map[string]*Task, ids string, args []any) error {
-	rows, err := s.db.QueryContext(ctx, `select run.id,run.task_id,coalesce(run.conversation_id,''),coalesce(run.run_id,''),run.sequence,run.status,run.prompt_snapshot,run.acceptance_snapshot,run.failure_reason,run.created_at,run.started_at,run.finished_at
+	rows, err := s.db.QueryContext(ctx, `select run.id,run.task_id,coalesce(run.conversation_id,''),coalesce(run.run_id,''),run.sequence,run.status,run.prompt_snapshot,run.acceptance_snapshot,run.failure_reason,run.created_at,run.started_at,run.finished_at,run.execution_source,run.execution_owner_id
 		from task_runs run join (select task_id,max(sequence) as sequence from task_runs where task_id in (`+ids+`) group by task_id) latest
 			on latest.task_id=run.task_id and latest.sequence=run.sequence`, args...)
 	if err != nil {
@@ -1211,7 +1250,7 @@ func (s *Server) verificationRunsForTask(ctx context.Context, taskID string) ([]
 }
 
 func (s *Server) latestTaskRun(ctx context.Context, taskID string) (TaskRun, error) {
-	return scanTaskRun(s.db.QueryRowContext(ctx, `select id,task_id,coalesce(conversation_id,''),coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at from task_runs where task_id=? order by sequence desc limit 1`, taskID))
+	return scanTaskRun(s.db.QueryRowContext(ctx, `select id,task_id,coalesce(conversation_id,''),coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at,execution_source,execution_owner_id from task_runs where task_id=? order by sequence desc limit 1`, taskID))
 }
 
 func (s *Server) wouldCreateTaskCycle(ctx context.Context, taskID, predecessorTaskID string) (bool, error) {
@@ -1235,7 +1274,7 @@ func (s *Server) wouldCreateTaskCycleTx(ctx context.Context, tx *sql.Tx, taskID,
 }
 
 func (s *Server) taskRuns(ctx context.Context, taskID string) ([]TaskRun, error) {
-	rows, err := s.db.QueryContext(ctx, `select id,task_id,coalesce(conversation_id,''),coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at from task_runs where task_id=? order by sequence desc`, taskID)
+	rows, err := s.db.QueryContext(ctx, `select id,task_id,coalesce(conversation_id,''),coalesce(run_id,''),sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,finished_at,execution_source,execution_owner_id from task_runs where task_id=? order by sequence desc`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1254,7 +1293,7 @@ func (s *Server) taskRuns(ctx context.Context, taskID string) ([]TaskRun, error)
 func scanTaskRun(row interface{ Scan(...any) error }) (TaskRun, error) {
 	var item TaskRun
 	var startedAt, finishedAt sql.NullTime
-	if err := row.Scan(&item.ID, &item.TaskID, &item.ConversationID, &item.RunID, &item.Sequence, &item.Status, &item.PromptSnapshot, &item.AcceptanceSnapshot, &item.FailureReason, &item.CreatedAt, &startedAt, &finishedAt); err != nil {
+	if err := row.Scan(&item.ID, &item.TaskID, &item.ConversationID, &item.RunID, &item.Sequence, &item.Status, &item.PromptSnapshot, &item.AcceptanceSnapshot, &item.FailureReason, &item.CreatedAt, &startedAt, &finishedAt, &item.ExecutionSource, &item.ExecutionOwnerID); err != nil {
 		return TaskRun{}, err
 	}
 	if startedAt.Valid {
@@ -1310,6 +1349,19 @@ func taskPrompt(task Task) string {
 }
 
 func (s *Server) taskDispatchEligibility(ctx context.Context, task Task, orchestrated bool) (bool, string, error) {
+	claim, claimed, err := taskExecutionClaim(ctx, s.db, task.ID)
+	if err != nil {
+		return false, "", err
+	}
+	if claimed && !(orchestrated && claim.OwnerKind == string(taskSourceOrchestration)) {
+		if claim.OwnerKind == string(taskSourceSupervision) {
+			return false, errTaskSupervised.Error(), nil
+		}
+		if claim.OwnerKind == string(taskSourceOrchestration) {
+			return false, "自动编排尚未结束此任务，无法重新下发", nil
+		}
+		return false, "任务已有执行归属，请先结束原执行或显式移出旧编排", nil
+	}
 	if task.Status != taskTodo && task.Status != taskActionRequired && task.Status != taskAwaitingReview {
 		return false, "任务当前状态不可下发", nil
 	}
@@ -1384,7 +1436,7 @@ type taskDispatchResult struct {
 // 它取代了原来那个"不给目标"的包装（dispatchTaskByID）：后者唯一的调用者是手机端的
 // task.dispatch 命令，留着只会把下一个人引回上面那个坑。
 func (s *Server) dispatchTaskByIDForConversation(ctx context.Context, taskID, conversationID string) (taskDispatchResult, int, error) {
-	return s.dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx, taskID, "", "", "", conversationID, "")
+	return s.dispatchTaskWithOptions(ctx, taskID, taskDispatchOptions{Source: taskSourceManual, ConversationID: conversationID})
 }
 
 func (s *Server) dispatchTaskByIDInWorkspaceWithContext(ctx context.Context, taskID, worktreePath, repairContext string) (taskDispatchResult, int, error) {
@@ -1396,6 +1448,26 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntent(ctx context.Cont
 }
 
 func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(ctx context.Context, taskID, worktreePath, repairContext, executionIntentID, expectedConversationID, workspaceInstruction string) (taskDispatchResult, int, error) {
+	// 保留旧编排调用适配层；身份来自调用方，绝不再通过目录是否为空推断。
+	return s.dispatchTaskWithOptions(ctx, taskID, taskDispatchOptions{Source: taskSourceOrchestration, WorkspacePath: worktreePath, RepairContext: repairContext, ExecutionIntentID: executionIntentID, ConversationID: expectedConversationID, WorkspaceInstruction: workspaceInstruction})
+}
+
+type taskDispatchOptions struct {
+	Source               taskExecutionSource
+	WorkspacePath        string
+	RepairContext        string
+	ExecutionIntentID    string
+	ConversationID       string
+	WorkspaceInstruction string
+}
+
+func (s *Server) dispatchTaskWithOptions(ctx context.Context, taskID string, options taskDispatchOptions) (taskDispatchResult, int, error) {
+	if options.Source == "" {
+		options.Source = taskSourceManual
+	}
+	if options.Source != taskSourceManual && options.Source != taskSourceOrchestration {
+		return taskDispatchResult{}, http.StatusConflict, errors.New("task execution source is not available")
+	}
 	task, err := s.taskByID(ctx, taskID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return taskDispatchResult{}, http.StatusNotFound, errors.New("task not found")
@@ -1403,7 +1475,7 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(c
 	if err != nil {
 		return taskDispatchResult{}, http.StatusInternalServerError, err
 	}
-	orchestrated := worktreePath != ""
+	orchestrated := options.Source == taskSourceOrchestration
 	allowed, reason, err := s.taskDispatchEligibility(ctx, task, orchestrated)
 	if err != nil {
 		return taskDispatchResult{}, http.StatusInternalServerError, err
@@ -1411,7 +1483,7 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(c
 	if !allowed {
 		return taskDispatchResult{}, http.StatusConflict, errors.New(reason)
 	}
-	conversationID := expectedConversationID
+	conversationID := options.ConversationID
 	if conversationID == "" {
 		// A task request without a target is legacy input. Choose a deterministic
 		// most-recent idle conversation instead of a browser-global selection.
@@ -1432,16 +1504,16 @@ func (s *Server) dispatchTaskByIDInWorkspaceWithExecutionIntentForConversation(c
 	// workspaceInstruction 是执行方式自带的硬约束说明（当前只有编排的"直接在已有分支上跑"
 	// 会传）：它讲的是"这次在哪干活、不要做什么"，与 repairContext 的"上一轮哪里错了"
 	// 不是一回事，所以单独一段、独立于修复提示词。
-	if strings.TrimSpace(workspaceInstruction) != "" {
-		prompt += "\n\n" + strings.TrimSpace(workspaceInstruction)
+	if strings.TrimSpace(options.WorkspaceInstruction) != "" {
+		prompt += "\n\n" + strings.TrimSpace(options.WorkspaceInstruction)
 	}
-	if strings.TrimSpace(repairContext) != "" {
-		prompt += "\n\n上轮检查或审查发现的问题：\n" + strings.TrimSpace(repairContext) + "\n\n请只修复这些问题，并重新运行相关检查。"
+	if strings.TrimSpace(options.RepairContext) != "" {
+		prompt += "\n\n上轮检查或审查发现的问题：\n" + strings.TrimSpace(options.RepairContext) + "\n\n请只修复这些问题，并重新运行相关检查。"
 	}
 	// 验收条件已从产品移除，task_runs.acceptance_snapshot 仅保留旧 run 的历史快照；
 	// 新 run 一律快照空值（prompt 也不再包含验收条件段）。
-	taskRun := &TaskRun{ID: uuid.NewString(), TaskID: task.ID, ConversationID: conversationID, PromptSnapshot: prompt, AcceptanceSnapshot: "", CreatedAt: now, ExecutionIntentID: executionIntentID}
-	message, runID, record, status, err := s.startMessage(ctx, conversationID, taskRun.PromptSnapshot, "", &runStartRecord{Task: taskRun, WorktreePath: worktreePath, Orchestrated: orchestrated})
+	taskRun := &TaskRun{ID: uuid.NewString(), TaskID: task.ID, ConversationID: conversationID, PromptSnapshot: prompt, AcceptanceSnapshot: "", CreatedAt: now, ExecutionIntentID: options.ExecutionIntentID}
+	message, runID, record, status, err := s.startMessage(ctx, conversationID, taskRun.PromptSnapshot, "", &runStartRecord{Task: taskRun, WorktreePath: options.WorkspacePath, ExecutionSource: options.Source})
 	if err != nil {
 		return taskDispatchResult{}, status, err
 	}
@@ -1492,6 +1564,10 @@ func (s *Server) reviewTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	if err := rejectSupervisedTaskMutation(r.Context(), tx, task.ID); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
 	result, err := tx.ExecContext(r.Context(), `update tasks set status=?,updated_at=?,completed_at=case when ?='done' then ? else null end where id=? and status=? and not exists(select 1 from task_orchestration_jobs where task_id=? and status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`, nextStatus, now, nextStatus, now, task.ID, taskAwaitingReview, task.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1558,7 +1634,7 @@ func (s *Server) reviewAllTasks(w http.ResponseWriter, r *http.Request) {
 	// 一律排除。该筛选与下方 UPDATE 处于同一事务、同一 Snapshot 连接（SQLite 写事务持有数据库锁），
 	// 从而把“检查编排状态”与“写入验收”放进同一个原子窗口，消除二者间的 TOCTOU 间隙。
 	// 全程只使用事务连接 tx，避免在 SQLite 单连接下对 s.db 再发查询导致死锁。
-	rows, err := tx.QueryContext(r.Context(), `select id from tasks where project_id=? and status=? and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`, projectID, taskAwaitingReview)
+	rows, err := tx.QueryContext(r.Context(), `select id from tasks where project_id=? and status=? and not exists(select 1 from task_execution_claims c where c.task_id=tasks.id and c.owner_kind='supervision') and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`, projectID, taskAwaitingReview)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1594,7 +1670,7 @@ func (s *Server) reviewAllTasks(w http.ResponseWriter, r *http.Request) {
 	for _, id := range accepted {
 		args = append(args, id)
 	}
-	query := `update tasks set status=?,updated_at=?,completed_at=? where id in (` + placeholders + `) and status=? and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`
+	query := `update tasks set status=?,updated_at=?,completed_at=? where id in (` + placeholders + `) and status=? and not exists(select 1 from task_execution_claims c where c.task_id=tasks.id and c.owner_kind='supervision') and not exists(select 1 from task_orchestration_jobs oc where oc.task_id=tasks.id and oc.status in ('queued','preparing','implementing','checking','awaiting_main','integrated_to_dev'))`
 	args = append(args, taskAwaitingReview)
 	result, err := tx.ExecContext(r.Context(), query, args...)
 	if err != nil {
@@ -1651,6 +1727,10 @@ func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eve
 		return
 	}
 	defer tx.Rollback()
+	if err := rejectSupervisedTaskMutation(r.Context(), tx, task.ID); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
 	result, err := tx.ExecContext(r.Context(), `update tasks set status=?,updated_at=?,completed_at=null,cancelled_at=null where id=? and status=?`, nextStatus, now, task.ID, allowedStatus)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1678,6 +1758,10 @@ func (s *Server) transitionTaskState(w http.ResponseWriter, r *http.Request, eve
 }
 
 func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
+	if err := rejectSupervisedTaskMutation(r.Context(), s.db, chi.URLParam(r, "taskID")); err != nil {
+		writeTaskExecutionError(w, err)
+		return
+	}
 	task, err := s.taskByID(r.Context(), chi.URLParam(r, "taskID"))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("task not found"))
@@ -1719,6 +1803,19 @@ func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) validateTaskDispatchTx(ctx context.Context, tx *sql.Tx, taskRun TaskRun, conversation Conversation, orchestrated bool) error {
+	claim, claimed, err := taskExecutionClaim(ctx, tx, taskRun.TaskID)
+	if err != nil {
+		return err
+	}
+	if claimed && !(orchestrated && claim.OwnerKind == string(taskSourceOrchestration)) {
+		if claim.OwnerKind == string(taskSourceSupervision) {
+			return errTaskSupervised
+		}
+		if claim.OwnerKind == string(taskSourceOrchestration) {
+			return errors.New("自动编排尚未结束此任务，无法重新下发")
+		}
+		return errTaskExecutionClaimed
+	}
 	var projectID, status string
 	if err := tx.QueryRowContext(ctx, `select project_id,status from tasks where id=?`, taskRun.TaskID).Scan(&projectID, &status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1785,7 +1882,8 @@ func (s *Server) readAutoReviewEnabledTx(ctx context.Context, tx *sql.Tx) (bool,
 
 func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStatus, failureReason string, now time.Time) error {
 	var taskRunID, taskID, taskRunStatus string
-	err := tx.QueryRowContext(ctx, `select id,task_id,status from task_runs where run_id=?`, runID).Scan(&taskRunID, &taskID, &taskRunStatus)
+	var source taskExecutionSource
+	err := tx.QueryRowContext(ctx, `select id,task_id,status,execution_source from task_runs where run_id=?`, runID).Scan(&taskRunID, &taskID, &taskRunStatus, &source)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -1795,6 +1893,11 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 	if taskRunStatus != "queued" && taskRunStatus != "running" {
 		return nil
 	}
+	claim, claimed, err := taskExecutionClaim(ctx, tx, taskID)
+	if err != nil {
+		return err
+	}
+	supervised := source == taskSourceSupervision || (claimed && claim.OwnerKind == string(taskSourceSupervision))
 	taskRunTerminalStatus, taskStatus := "", ""
 	switch runStatus {
 	case "completed":
@@ -1804,7 +1907,7 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 		if err != nil {
 			return err
 		}
-		if autoReview {
+		if autoReview && !supervised {
 			// 与 reviewTask 的守卫一致：仍有自动编排作业在进行（含等待合并）时
 			// 不允许验收，回退为待验收，交由后续手动/编排流程处理。
 			var busy bool
@@ -1834,6 +1937,11 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 	if changed == 0 {
 		return fmt.Errorf("task run %s: expected queued/running but status was already terminal", taskRunID)
 	}
+	if supervised {
+		// Run 终态不等于业务完成，也不能释放会话的长期认领。
+		// 托管结果消费服务将另行判断交回问题、实施事实和后续验收。
+		return s.recordTaskEventTx(ctx, tx, taskID, taskRunID, "task.run_"+taskRunTerminalStatus, map[string]string{"runId": runID, "status": taskRunTerminalStatus}, now)
+	}
 	var taskCompletedAt any
 	if taskStatus == taskDone {
 		taskCompletedAt = now
@@ -1848,6 +1956,9 @@ func (s *Server) finishTaskRunTx(ctx context.Context, tx *sql.Tx, runID, runStat
 	}
 	if taskChanged == 0 {
 		return fmt.Errorf("task %s: expected running but status had already changed", taskID)
+	}
+	if err := releaseTaskExecutionTx(ctx, tx, taskID, string(taskSourceManual), taskRunID); err != nil {
+		return err
 	}
 	// 自动验收视为任务被自动接受，补记一条 task.accepted 事件便于审计追踪。
 	if taskStatus == taskDone {

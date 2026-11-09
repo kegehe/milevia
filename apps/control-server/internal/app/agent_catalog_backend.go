@@ -15,8 +15,8 @@ import (
 // 方法（Claude 一组、Codex 一组），加第三个工具就得再加一组；`agent_probe.go` 的
 // agentBackend 注释把这处耦合记为"会在引入 Runtime 适配层时收敛"，并明令**不要继续扩散**。
 //
-// 现在：**目录驱动是默认，逐工具特化只留给真有额外语义的那一档**（Codex 的就绪还要看
-// 登录态；Claude 的跨端探测键已被 WSL 的读数缓存与保活唤醒依赖）。于是目录里新增一个
+// 现在：目录驱动是默认，Codex 的执行适配与 Claude 的既有探测键保留特化。
+// Claude 的探测键已被 WSL 的读数缓存与保活唤醒依赖。于是目录里新增一个
 // npm 全局分发的工具，跨端这一侧一行代码都不用加。
 //
 // ⚠️ 这里**任何工具名都不许出现**。出现一个，就等于把目录之外的清单又开了一份 ——
@@ -164,8 +164,8 @@ func (b *catalogAgentBackend) Update(ctx context.Context) (string, string, error
 	if b.entry.InstallKind != InstallKindNpmGlobal {
 		return b.updateNative(ctx)
 	}
-	return runCrossCLIUpdate(ctx, b.shell.crossWhere(), b.entry.CommandName, b.entry.UpdateArgs, b.entry.Name,
-		agentNpmCLIInstall(b.entry), b.shell.crossRun, b.freshVersion)
+	return runCrossCLIUpdateChecked(ctx, b.shell.crossWhere(), b.entry.CommandName, b.entry.UpdateArgs, b.entry.Name,
+		agentNpmCLIInstall(b.entry), b.shell.crossRun, b.checkedFreshVersion)
 }
 
 // updateNative 在目标环境执行 CLI 自带的 update 并做健康检查。
@@ -173,9 +173,11 @@ func (b *catalogAgentBackend) Update(ctx context.Context) (string, string, error
 // 命令名取**实际探测到的那个**（主名或别名）：只装出 `agent` 的机器上执行
 // `cursor-agent update` 必然失败。
 func (b *catalogAgentBackend) updateNative(ctx context.Context) (string, string, error) {
-	previous, command, ok := b.probeVersionWithCommand(ctx, true)
+	probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Second)
+	previous, command, ok := b.probeVersionWithCommand(probeCtx, true)
+	probeCancel()
 	if !ok || previous == "" {
-		return "", "", fmt.Errorf("%s未安装 %s", b.shell.crossWhere(), b.entry.Name)
+		return "", "", fmt.Errorf("升级前无法确认 %s 的版本，请检查目标环境的安装与连接", b.entry.Name)
 	}
 	script := shellQuote(command)
 	for _, arg := range b.entry.UpdateArgs {
@@ -187,9 +189,11 @@ func (b *catalogAgentBackend) updateNative(ctx context.Context) (string, string,
 	if err != nil {
 		return previous, "", fmt.Errorf("升级 %s 失败：%w%s", b.entry.Name, err, updateOutputDetail(out))
 	}
-	current := b.freshVersion(context.Background())
-	if current == "" {
-		return previous, "", fmt.Errorf("升级 %s 失败：更新后未通过健康检查", b.entry.Name)
+	healthCtx, healthCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer healthCancel()
+	current, probeErr := b.checkedFreshVersion(healthCtx)
+	if probeErr != nil {
+		return previous, "", fmt.Errorf("升级 %s 后无法确认健康状态：%w", b.entry.Name, probeErr)
 	}
 	return previous, current, nil
 }
@@ -207,14 +211,19 @@ func (b *catalogAgentBackend) updateNative(ctx context.Context) (string, string,
 //	③ 回滚之后的核对（`current != previous` 就报"回滚失败"）同样拿旧值比对，于是
 //	   一次没生效的回滚会被判成成功。
 //
-// 真探失败时**退回常规读数**而不是直接报空：那是"这次没探成"，不是"没装"，
-// 而 runCrossCLIUpdate 会把空版本当成"未安装"（一句指错方向的结论）。
-// 退回之后的行为与改动前一致 —— 宁可维持旧毛病，也不要凭空多出一种误判。
+// 真探失败必须报告不确定，不拿展示缓存冒充健康，也不据此盲目回滚。
 func (b *catalogAgentBackend) freshVersion(ctx context.Context) string {
+	version, _ := b.checkedFreshVersion(ctx)
+	return version
+}
+
+func (b *catalogAgentBackend) checkedFreshVersion(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	if version, _, ok := b.probeVersionWithCommand(ctx, true); ok && version != "" {
-		return version
+		return version, nil
 	}
-	return b.Version(ctx)
+	return "", fmt.Errorf("目标环境未返回可确认的 %s 版本", b.entry.Name)
 }
 
 // AutoUpdateSupported：跨端这条路上的升级已经接通（平台装的走 npm 重装，用户自己装的走
@@ -231,24 +240,32 @@ func (b *catalogAgentBackend) Run(context.Context, AgentRunRequest, AgentRunSink
 // Login 发起该工具的登录。
 //
 // 目录驱动的这一层**不驱动交互式 TUI**（无头环境无法可靠驱动它，与 codebuddyCLIRunner
-// 的取舍一致）：如实返回空信息，由 agent_login.go 拼出"去目标环境终端里运行 <命令>"的
-// 指引 —— 那句话本来就该按目录里的名字生成，而不是写死某一个工具。
+// 的取舍一致）：用实际探测成功的入口生成终端指引，兼容只安装了别名的环境。
 //
 // 未安装时报错而不是回一句空指引：让用户"去终端里跑"一个还不存在的命令，是把一次
 // 必然失败的操作说成下一步。
 func (b *catalogAgentBackend) Login(ctx context.Context) (agentLoginInfo, error) {
-	if b.Version(ctx) == "" {
+	version, command, ok := b.probeVersionWithCommand(ctx, false)
+	if !ok || version == "" {
 		return agentLoginInfo{}, fmt.Errorf("%s 未安装", b.entry.Name)
 	}
-	return agentLoginInfo{}, nil
+	entry := b.entry
+	entry.CommandName = command
+	return agentLoginInfo{Message: agentTerminalLoginGuidance(entry)}, nil
 }
 
 // LoginStatus：目录里登记了非交互登录态命令（AuthStatusArgs）时，在目标环境执行它，
 // 按 AuthStatusEmptyMarkers 判断是否“没有凭据”。
 //
-// 三态（见 agent_auth.go）：没有登记命令 ⇒ unreadable 且不带 error（"这个工具不能自报"）；
+// 未登记命令或协议 ⇒ unreadable 且不带 error（"这个工具不能自报"）；
 // 命令没跑成 ⇒ unreadable + 失败原因（"这次没读成"，界面说法不同，且按短 TTL 重试）。
 func (b *catalogAgentBackend) LoginStatus(ctx context.Context) (agentAuthState, error) {
+	if b.entry.AuthStatusProtocol == authProtocolACPUserInfo {
+		return crossACPAuthStatus(ctx, b.entry, b.shell)
+	}
+	if b.entry.AuthStatusKind != "" {
+		return crossCLIAuthStatus(ctx, b.entry, b.shell)
+	}
 	if len(b.entry.AuthStatusArgs) == 0 {
 		return agentAuthUnreadable, nil
 	}

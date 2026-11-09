@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -91,6 +92,9 @@ func watchAgentProcessWithin(ctx context.Context, cmd *exec.Cmd, terminal <-chan
 // 加入失败（例如被更强的作业约束）不是致命错误：调用方仍会走 terminateProcessGroup
 // 与关闭读端那条尽力而为的路径，所以这里只返回空操作的释放函数。
 func containAgentProcess(cmd *exec.Cmd) func() {
+	if _, ok := ordinaryCLICommandState(cmd); ok {
+		return func() {}
+	}
 	if cmd == nil || cmd.Process == nil {
 		return func() {}
 	}
@@ -127,29 +131,53 @@ const probePipeCloseGrace = 2 * time.Second
 //
 // 语义与 `cmd.Output()` 对齐：成功返回 stdout；失败返回 `*exec.ExitError`（Stderr 已填）。
 func runProbeCommand(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	stdout, _, err := runProbeCommandStreams(ctx, cmd)
+	return stdout, err
+}
+
+func runProbeCommandStreams(ctx context.Context, cmd *exec.Cmd) ([]byte, []byte, error) {
+	return runProbeCommandStreamsLimit(ctx, cmd, 0)
+}
+
+// Keep draining both pipes while bounding memory for account/provider probes.
+func runProbeCommandStreamsLimit(ctx context.Context, cmd *exec.Cmd, limit int) ([]byte, []byte, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if limit > 0 {
+		cmd.Stdout = &cappedWriter{buf: &stdout, limit: limit + 1}
+		cmd.Stderr = &cappedWriter{buf: &stderr, limit: limit + 1}
+	}
 	// 管道被后裔占住时，Wait 不该无限等 —— 见 probePipeCloseGrace。
 	cmd.WaitDelay = probePipeCloseGrace
 	configureProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// 作业成员关系只能在进程创建时继承，所以 Start 之后立刻加入 —— 晚一步，
 	// 包装器在那之前拉起的孙进程就可能漏在作业外（见 probe_job_windows.go）。
 	release := containAgentProcess(cmd)
-	defer release()
+	defer func() {
+		// POSIX 上 Job 是空实现。正常退出的包装器也可能留下已关闭输出的后裔。
+		if runtime.GOOS != "windows" {
+			forceTerminateProcessGroup(cmd)
+		}
+		release()
+	}()
 
 	finished := make(chan struct{})
-	defer close(finished)
+	watcherDone := make(chan struct{})
+	defer func() { close(finished); <-watcherDone }()
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
 			// 关句柄 ⇒ 作业内所有进程（含握着管道的孙进程）一起结束，Wait 才收得回来。
 			release()
-			// 作业没建起来（非 Windows / 创建失败）时的兜底，与 `CommandContext` 原语义一致。
-			if cmd.Process != nil {
+			// 非 Windows 没有 Job；必须结束整个进程组，不能只杀包装器。
+			if runtime.GOOS != "windows" {
+				forceTerminateProcessGroup(cmd)
+			} else if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
 		case <-finished:
@@ -157,14 +185,17 @@ func runProbeCommand(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
 	}()
 
 	err := cmd.Wait()
+	if limit > 0 && (stdout.Len() > limit || stderr.Len() > limit) {
+		return nil, nil, errors.New("CLI 探测输出超过大小限制")
+	}
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			exitErr.Stderr = stderr.Bytes()
 		}
-		return stdout.Bytes(), err
+		return stdout.Bytes(), stderr.Bytes(), err
 	}
-	return stdout.Bytes(), nil
+	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
 // terminalSignalSink 把 CLI 的终结事件（claude 的 result、codex 的 turn.completed）

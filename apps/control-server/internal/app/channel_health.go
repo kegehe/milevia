@@ -59,7 +59,7 @@ func (s *Server) channelUnavailableStatuses(meta RunnerMeta, reason string) []Ag
 	entries := agentCatalog()
 	out := make([]AgentStatus, 0, len(entries))
 	for _, entry := range entries {
-		if _, unsupportedReason := s.agentBackend(meta, entry); unsupportedReason != "" {
+		if _, unsupportedReason := s.agentManagementBackend(meta, entry); unsupportedReason != "" {
 			out = append(out, AgentStatus{ID: entry.ID, Status: agentStatusUnsupported, Reason: unsupportedReason})
 			continue
 		}

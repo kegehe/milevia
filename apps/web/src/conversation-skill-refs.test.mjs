@@ -41,9 +41,9 @@ test("the reference is expanded only at send time, and both ends agree on the te
   assert.match(conversationPage, /const body = refs\.map\(mergeSkillPrompt\)\.join\("\\n"\);/);
   assert.match(conversationPage, /return text\.trim\(\) \? `\$\{body\}\\n\\n\$\{text\.trim\(\)\}` : body;/);
   assert.match(conversationPage, /const content = composeSkillMessage\(draft, refs\);/);
-  assert.match(conversationPage, /if \(!draft && refs\.length === 0\) return false;/);
+  assert.match(conversationPage, /if \(!draft && refs\.length === 0 && files\.length === 0\) return false;/);
   // 点发送这条路径必须真的把引用带上（漏了它就是"输入框里有胶囊、发出去却没有引用"）。
-  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*if \(changingModel\) return;\s*setShowSendMenu\(false\);\s*void sendContent\(text, true, \{ skillRefs \}\);\s*\};/s);
+  assert.match(conversationPage, /const send = \(event: FormEvent\) => \{\s*event\.preventDefault\(\);\s*if \(changingModel\) return;\s*setShowSendMenu\(false\);\s*void sendContent\(text, true, \{ skillRefs, attachments \}\);\s*\};/s);
   // 两端必须逐字一致：同一个技能不能因为"在手机上点的"就让 Agent 收到另一句指令。
   // headless 通道（-p --output-type stream-json）不解析交互式斜杠命令，所以发出去的
   // 只能是这句自然语言引用 —— 能改的只有显示层，这条断言就是那道闸门。
@@ -90,12 +90,12 @@ test("every write-back path keeps the draft and the reference separate", () => {
 test("scheduled send carries the references through the queue", () => {
   assert.match(conversationPage, /const pendingSendSkillRefsRef = useRef<Skill\[\]>\(\[\]\);/);
   assert.match(conversationPage, /pendingSendSkillRefsRef\.current = skillRefs;/);
-  assert.match(conversationPage, /if \(\(!content && skillRefs\.length === 0\) \|\| !conversation\) return;/);
+  assert.match(conversationPage, /if \(\(!content && skillRefs\.length === 0 && attachments\.length === 0\) \|\| !conversation\) return;/);
   assert.match(conversationPage, /const refs = pendingSendSkillRefsRef\.current;/);
-  assert.match(conversationPage, /skillRefs: refs \}\)/);
-  assert.match(conversationPage, /if \(!conversationID \|\| \(!draft && refs\.length === 0\) \|\| !clientRequestId\) return false;/);
+  assert.match(conversationPage, /skillRefs: refs, attachments: files \}\)/);
+  assert.match(conversationPage, /if \(!conversationID \|\| \(!draft && refs\.length === 0 && files\.length === 0\) \|\| !clientRequestId\) return false;/);
   // 取消预约：正文回输入框，引用回胶囊（不展开成长文本）。
-  assert.match(conversationPage, /setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);\s*setSkillRefs\(refs\);/s);
+  assert.match(conversationPage, /setComposerText\(existing \? `\$\{existing\}\\n\$\{pending\}` : pending, conversationID\);\s*setSkillRefs\(\(current\) => \[\.\.\.current, \.\.\.refs\.filter/);
   // 所有"清掉预约"的出口都要连引用一起清，否则下一轮预约会带上失效引用。
   assert.ok((conversationPage.match(/pendingSendSkillRefsRef\.current = \[\];/g) ?? []).length >= 4, "预约链路里有出口没有清掉技能引用");
   // 只引用技能时 content 是空串，预约条仍要显示（真值判断会让它整条消失、取消不掉）。

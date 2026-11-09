@@ -30,6 +30,9 @@ import (
 )
 
 type Config struct {
+	WorkspaceGuardDir            string
+	SupervisionTargetsDir        string
+	DisableSupervisionWorker     bool
 	DatabasePath                 string
 	DataDir                      string
 	Mode                         string
@@ -177,6 +180,7 @@ func ConfigFromEnv() Config {
 	return Config{
 		DatabasePath:                  db,
 		DataDir:                       dataDir,
+		SupervisionTargetsDir:         strings.TrimSpace(os.Getenv("AUTO_SUPERVISION_TARGETS_DIR")),
 		Mode:                          "web",
 		AllowedRoot:                   root,
 		ClaudePath:                    claudePath,
@@ -398,6 +402,16 @@ type Server struct {
 	quotaLeaseStops        map[string]context.CancelFunc
 	streamingSetups        map[string]*streamingSetup
 	projectWorkspaceLeases map[string]*projectWorkspaceLease
+	workspaceAdmissionMu   sync.Mutex
+	workspaceScopes        map[string]workspaceScope
+	workspaceOperations    map[string]workspaceOperation
+	workspaceAdmissions    map[string]WorkspaceAdmission
+	supervisionMu          sync.Mutex
+	supervisionCompletions map[string]chan struct{}
+	supervisionWG          sync.WaitGroup
+	supervisionWorker      *supervisionWorker
+	supervisionTargets     *supervisionTargetConnections
+	workspaceGuardTargets  *supervisionTargetConnections
 	gitIndexLocks          map[string]*sync.Mutex
 	gitIndexActive         map[string]bool
 	runWorkspaceReleases   map[string]func()
@@ -530,14 +544,15 @@ type approvalWaiter struct {
 }
 
 type activeAgentSession struct {
-	agent         AgentSession
-	approvalToken string
-	runnerID      string
-	agentID       string
-	config        conversationSessionConfig
-	configSet     bool
-	activeRunID   string
-	stopping      bool
+	workspaceGuardRelease func()
+	agent                 AgentSession
+	approvalToken         string
+	runnerID              string
+	agentID               string
+	config                conversationSessionConfig
+	configSet             bool
+	activeRunID           string
+	stopping              bool
 	// stoppingSince 是进入 stopping 的时刻，由 markStopping 维护。它是 watcher
 	// 判断"进程迟迟不退出"的唯一依据：没有它，任何一次杀不掉的进程都会让这条
 	// 会话永远停在 stopping（见 waitForStreamingSessionExit）。
@@ -698,13 +713,15 @@ type runWorkspaceSnapshot struct {
 }
 
 type Message struct {
-	ID              string    `json:"id"`
-	ConversationID  string    `json:"conversationId"`
-	RunID           string    `json:"runId,omitempty"`
-	Role            string    `json:"role"`
-	Content         string    `json:"content"`
-	ParentToolUseID string    `json:"parentToolUseId,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
+	ID              string              `json:"id"`
+	ConversationID  string              `json:"conversationId"`
+	RunID           string              `json:"runId,omitempty"`
+	Role            string              `json:"role"`
+	Content         string              `json:"content"`
+	Attachments     []MessageAttachment `json:"attachments,omitempty"`
+	ClientRequestID string              `json:"clientRequestId"`
+	ParentToolUseID string              `json:"parentToolUseId,omitempty"`
+	CreatedAt       time.Time           `json:"createdAt"`
 }
 
 type Shortcut struct {
@@ -737,12 +754,12 @@ type ShortcutRun struct {
 }
 
 type runStartRecord struct {
-	Shortcut     *ShortcutRun
-	Task         *TaskRun
-	Scheduled    *ScheduledTaskRun
-	Handoff      *conversationHandoffRun
-	WorktreePath string
-	Orchestrated bool
+	Shortcut        *ShortcutRun
+	Task            *TaskRun
+	Scheduled       *ScheduledTaskRun
+	Handoff         *conversationHandoffRun
+	WorktreePath    string
+	ExecutionSource taskExecutionSource
 }
 
 type conversationHandoffRun struct{ ID string }
@@ -968,6 +985,18 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 		_ = dataLock.close()
 		return nil, err
 	}
+	if err := s.recoverWorkspaceAdmissions(ctx); err != nil {
+		runtimeStop()
+		pool.Close()
+		_ = dataLock.close()
+		return nil, fmt.Errorf("restore workspace admission protection: %w", err)
+	}
+	if err := s.recoverSupervisionSessions(ctx, time.Now().UTC()); err != nil {
+		runtimeStop()
+		pool.Close()
+		_ = dataLock.close()
+		return nil, fmt.Errorf("restore supervision state: %w", err)
+	}
 	// 把登记表里的实测路径载入解析器。顺序在 migrate 之后：表是 migrate 建的。
 	// 载入失败不阻断启动（解析器还有 PATH 与平台兜底两级），但要如实记下来，
 	// 否则"装过的东西忽然找不到了"会没有任何线索。
@@ -1029,6 +1058,9 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	s.reconcilePendingAsks(ctx)
 	s.startScheduledTaskLoop()
 	s.sessionManager.start()
+	if !s.config.DisableSupervisionWorker {
+		s.startSupervisionWorkerLoop()
+	}
 	return s, nil
 }
 
@@ -1078,16 +1110,24 @@ func (s *Server) Close() {
 			_ = httpServer.Close()
 		}
 		s.runtimeStop()
+		s.closeSupervisionTargetConnections()
 		for _, cancel := range cancels {
 			cancel()
 		}
 		for _, session := range sessions {
 			session.Stop()
 		}
+		// 与 worker 的 Add 共用 gate；数据库关闭前等待托管进程和领域事实收口。
+		s.supervisionMu.Lock()
+		s.supervisionMu.Unlock()
+		s.supervisionWG.Wait()
 		// 长驻登录进程（Qoder）也要收掉：Windows 上父进程退出不会带走子进程，
 		// 留下一个还在等浏览器授权的 node 进程，既占资源又会让下一次登录撞上
 		// "已经有一次在进行中"的假象。
 		if stopper, ok := s.qoderRunner.(loginProcessStopper); ok {
+			stopper.stopLogin()
+		}
+		if stopper, ok := s.cursorRunner.(loginProcessStopper); ok {
 			stopper.stopLogin()
 		}
 		// No new orchestration worker may start once closing is set. Wait for
@@ -1495,6 +1535,7 @@ func (s *Server) routes() http.Handler {
 	r.Delete("/api/projects/{projectID}/insights/{findingID}/dismiss", s.clearInsightDismissed)
 	r.Get("/api/projects/{projectID}/input-history", s.listProjectInputHistory)
 	r.Get("/api/projects/{projectID}/orchestration/config", s.getOrchestrationConfig)
+	s.registerSupervisionRoutes(r)
 	r.Put("/api/projects/{projectID}/orchestration/config", s.updateOrchestrationConfig)
 	r.Get("/api/projects/{projectID}/orchestration", s.listOrchestrationJobs)
 	// 发布快照：把开发分支当前 HEAD 固定成 release/<sha> 供人工验收，并在用户确认
@@ -1545,6 +1586,7 @@ func (s *Server) routes() http.Handler {
 	r.Delete("/api/projects/{projectID}/terminal/sessions/{sessionID}", s.deleteTerminal)
 	r.Get("/api/projects/{projectID}/shortcuts", s.listShortcuts)
 	r.Get("/api/projects/{projectID}/skills", s.listSkills)
+	r.Get("/api/projects/{projectID}/plugins", s.listPlugins)
 	r.Get("/api/projects/{projectID}/commands", s.projectCommands)
 	r.Put("/api/projects/{projectID}/shortcuts/reorder", s.reorderShortcuts)
 	r.Post("/api/shortcuts/defaults", s.seedDefaultShortcuts)
@@ -2207,6 +2249,9 @@ create index if not exists conversation_handoffs_source_status on conversation_h
 			return fmt.Errorf("add message run id: %w", err)
 		}
 	}
+	if err := ensureColumn(ctx, s.db, "messages", "attachments", "text not null default '[]'"); err != nil {
+		return err
+	}
 	if err := ensureColumn(ctx, s.db, "messages", "client_request_id", "text not null default ''"); err != nil {
 		return fmt.Errorf("add message client request id: %w", err)
 	}
@@ -2244,6 +2289,18 @@ create index if not exists messages_conversation_primary_created on messages(con
 		return err
 	}
 	if err := s.migrateOrchestration(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateTaskExecution(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateWorkspaceAdmissions(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateSupervisionRuns(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateSupervision(ctx); err != nil {
 		return err
 	}
 	if err := s.migrateNotifications(ctx); err != nil {
@@ -2313,7 +2370,7 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 		return fmt.Errorf("begin interrupted run recovery: %w", err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `select id,conversation_id from runs where status in ('queued','running')`)
+	rows, err := tx.QueryContext(ctx, `select id,conversation_id from runs where status in ('queued','running') and not exists(select 1 from supervision_run_links l where l.run_id=runs.id)`)
 	if err != nil {
 		return fmt.Errorf("list interrupted runs: %w", err)
 	}
@@ -2335,7 +2392,7 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 	}
 	now := time.Now().UTC()
 	if len(runs) > 0 {
-		if _, err := tx.ExecContext(ctx, `update shortcut_runs set status='interrupted',completed_at=? where status in ('accepted','queued','running') and run_id in (select id from runs where status in ('queued','running'))`, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `update shortcut_runs set status='interrupted',completed_at=? where status in ('accepted','queued','running') and run_id in (select id from runs where status in ('queued','running') and not exists(select 1 from supervision_run_links l where l.run_id=runs.id))`, now); err != nil {
 			return fmt.Errorf("mark interrupted shortcut runs: %w", err)
 		}
 		for _, run := range runs {
@@ -2346,7 +2403,7 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 				return fmt.Errorf("mark interrupted scheduled task run: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `update runs set status='interrupted',completed_at=? where status in ('queued','running')`, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `update runs set status='interrupted',completed_at=? where status in ('queued','running') and not exists(select 1 from supervision_run_links l where l.run_id=runs.id)`, now); err != nil {
 			return fmt.Errorf("mark interrupted runs: %w", err)
 		}
 		for _, run := range runs {
@@ -2363,7 +2420,7 @@ func (s *Server) recoverInterruptedRuns(ctx context.Context) error {
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `update conversations set status='idle' where status='running'`, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `update conversations set status='idle' where status='running' and not exists(select 1 from supervision_run_links l join runs r on r.id=l.run_id where l.conversation_id=conversations.id and r.status in ('queued','running'))`); err != nil {
 		return fmt.Errorf("release interrupted conversations: %w", err)
 	}
 	for _, run := range runs {
@@ -2905,6 +2962,13 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteProjectLocked(ctx context.Context, projectID string) (runners []projectRunnerInterface, conversationIDs map[string]struct{}, status int, resultErr error) {
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	var supervised bool
+	if err := s.db.QueryRowContext(ctx, `select exists(select 1 from task_execution_claims c join tasks t on t.id=c.task_id where t.project_id=? and c.owner_kind='supervision')`, projectID).Scan(&supervised); err != nil {
+		return nil, nil, http.StatusInternalServerError, err
+	}
+	if supervised {
+		return nil, nil, http.StatusConflict, errTaskSupervised
+	}
 	releaseWorkspace, acquired := s.acquireProjectWorkspace(projectID, projectDeleteWorkspaceOwner)
 	if !acquired {
 		return nil, nil, http.StatusConflict, s.projectWorkspaceOccupiedError(projectID)
@@ -3378,7 +3442,7 @@ func pruneConversationHistoryTx(ctx context.Context, tx *sql.Tx, projectID strin
 	if excess <= 0 {
 		return false, nil
 	}
-	rows, err := tx.QueryContext(ctx, `select id from conversations where project_id=? and is_current=0 and status not in ('running','active') order by last_activity_at asc,created_at asc,id asc limit ?`, projectID, excess)
+	rows, err := tx.QueryContext(ctx, `select id from conversations where project_id=? and is_current=0 and status not in ('running','active') and not exists(select 1 from supervision_conversation_links l where l.conversation_id=conversations.id) order by last_activity_at asc,created_at asc,id asc limit ?`, projectID, excess)
 	if err != nil {
 		return false, err
 	}
@@ -3879,6 +3943,10 @@ func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request) {
 			s.projectLifecycleMu.Unlock()
 		}
 	}()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 
 	var previous Conversation
 	var projectRunner string
@@ -4037,6 +4105,10 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 			s.projectLifecycleMu.Unlock()
 		}
 	}()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 
 	var projectID, status string
 	err := s.db.QueryRowContext(s.runtimeCtx, `select p.id,c.status from conversations c join projects p on p.id=c.project_id where c.id=?`, conversationID).Scan(&projectID, &status)
@@ -4194,6 +4266,10 @@ func (s *Server) deleteProjectConversations(w http.ResponseWriter, r *http.Reque
 	ids := make([]string, 0, len(all))
 	skipped := 0
 	for _, item := range all {
+		if err := rejectActiveSupervisionConversation(s.runtimeCtx, s.db, item.id); err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		if s.isOrchestrationConversation(s.runtimeCtx, item.id) {
 			skipped++
 			continue
@@ -4313,7 +4389,7 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	messageQuery := `select id,conversation_id,run_id,role,content,parent_tool_use_id,created_at from messages where conversation_id=?`
+	messageQuery := `select id,conversation_id,run_id,role,content,parent_tool_use_id,created_at,attachments,client_request_id from messages where conversation_id=?`
 	messageArgs := []any{id}
 	if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
 		messageQuery += " and " + clause
@@ -4334,10 +4410,12 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 	messages := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.RunID, &m.Role, &m.Content, &m.ParentToolUseID, &m.CreatedAt); err != nil {
+		var rawAttachments string
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.RunID, &m.Role, &m.Content, &m.ParentToolUseID, &m.CreatedAt, &rawAttachments, &m.ClientRequestID); err != nil {
 			writeError(w, 500, err)
 			return
 		}
+		m.Attachments = decodeAttachments(rawAttachments)
 		messages = append(messages, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -4681,6 +4759,11 @@ func (s *Server) activateConversation(w http.ResponseWriter, r *http.Request) {
 	// connected client.
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -4756,6 +4839,11 @@ func (s *Server) setConversationPermissionMode(w http.ResponseWriter, r *http.Re
 	// Keep permission changes ordered with conversation clearing and activation.
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, chi.URLParam(r, "conversationID")); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+
 	conversationID := chi.URLParam(r, "conversationID")
 	var conversation Conversation
 	err := s.db.QueryRowContext(r.Context(), `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=$1`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.ClaudeSessionID, &conversation.AgentID, &conversation.AgentSessionID, &conversation.AgentRuntimeID, &conversation.AgentProfileRevisionID, &conversation.ExecutionPolicy, &conversation.Status, &conversation.PermissionMode, &conversation.ModelOverride, &conversation.Title, &conversation.LastActivityAt, &conversation.ClaudeInitialized, &conversation.AgentInitialized, &conversation.IsCurrent, &conversation.CreatedAt)
@@ -5348,13 +5436,15 @@ func (s *Server) listShortcutRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Content         string `json:"content"`
-		ClientRequestID string `json:"clientRequestId"`
+		Content         string              `json:"content"`
+		Attachments     []MessageAttachment `json:"attachments"`
+		ClientRequestID string              `json:"clientRequestId"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
 	conversationID := chi.URLParam(r, "conversationID")
+
 	// 会话正在跑的时候，这条消息默认**插进当前回合**而不是排队：Claude 系的
 	// stream-json 会话支持在回合中途接收新的 user 帧，模型在下一次工具返回后
 	// 就能看到并按它调整。只有做不到的情况（非流式 Runner、会话没有活跃回合、
@@ -5362,15 +5452,17 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	//
 	// 这里刻意不提供 mode 参数：想要"等这一轮彻底结束再说"的客户端走预约发送
 	// （先等空闲再 POST），那是另一套已经存在的语义，不该在同一个接口里再分叉。
-	if m, runID, handled, status, err := s.trySteerMessage(r.Context(), conversationID, input.Content, input.ClientRequestID); handled {
-		if err != nil {
-			writeError(w, status, err)
+	if len(input.Attachments) == 0 {
+		if m, runID, handled, status, err := s.trySteerMessage(r.Context(), conversationID, input.Content, input.ClientRequestID); handled {
+			if err != nil {
+				writeError(w, status, err)
+				return
+			}
+			writeJSON(w, http.StatusAccepted, map[string]any{"message": m, "runId": runID})
 			return
 		}
-		writeJSON(w, http.StatusAccepted, map[string]any{"message": m, "runId": runID})
-		return
 	}
-	m, runID, _, status, err := s.startMessage(r.Context(), conversationID, input.Content, input.ClientRequestID, nil)
+	m, runID, _, status, err := s.startMessage(r.Context(), conversationID, input.Content, input.ClientRequestID, nil, input.Attachments)
 	if err != nil {
 		writeError(w, status, err)
 		return
@@ -5417,7 +5509,7 @@ func (s *Server) trySteerMessage(ctx context.Context, conversationID, content, c
 			// 幂等重放：这条消息已经投递过（插话或新回合皆可），原样返回。
 			// 内容不一致必须拒绝 —— 与 startMessage 同一句文案，否则同一个约束
 			// 会因为走了哪条路径而给出两种说法。
-			if existing.Content != content {
+			if existing.Content != content || len(existing.Attachments) != 0 {
 				return Message{}, "", true, http.StatusConflict, errors.New("client request ID was already used for different content")
 			}
 			return existing, existing.RunID, true, http.StatusAccepted, nil
@@ -5460,7 +5552,7 @@ func (s *Server) trySteerMessage(ctx context.Context, conversationID, content, c
 	}
 	// 先注入、再落库：反过来会留下一条"用户说了、模型没收到"的幽灵消息，比多一次
 	// 重试更难解释。代价是落库失败时模型已经看到了这条指令，所以这里必须留日志。
-	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, CreatedAt: time.Now().UTC()}
+	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, ClientRequestID: clientRequestID, CreatedAt: time.Now().UTC()}
 	result, err := s.db.ExecContext(ctx, "insert into messages (id,conversation_id,run_id,role,content,client_request_id,parent_tool_use_id,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing", m.ID, m.ConversationID, m.RunID, m.Role, m.Content, clientRequestID, m.ParentToolUseID, m.CreatedAt)
 	if err != nil {
 		log.Printf("[steer] run %s already received the steering prompt but persisting its message failed: %v", runID, err)
@@ -5473,7 +5565,7 @@ func (s *Server) trySteerMessage(ctx context.Context, conversationID, content, c
 				return Message{}, "", true, http.StatusInternalServerError, lookupErr
 			}
 			if found {
-				if existing.Content != content {
+				if existing.Content != content || len(existing.Attachments) != 0 {
 					return Message{}, "", true, http.StatusConflict, errors.New("client request ID was already used for different content")
 				}
 				return existing, existing.RunID, true, http.StatusAccepted, nil
@@ -5645,23 +5737,33 @@ type messageLookupQuerier interface {
 
 func messageForClientRequest(ctx context.Context, query messageLookupQuerier, conversationID, clientRequestID string) (Message, bool, error) {
 	var message Message
-	err := query.QueryRowContext(ctx, `select id,conversation_id,run_id,role,content,parent_tool_use_id,created_at from messages where conversation_id=? and client_request_id=?`, conversationID, clientRequestID).Scan(&message.ID, &message.ConversationID, &message.RunID, &message.Role, &message.Content, &message.ParentToolUseID, &message.CreatedAt)
+	var rawAttachments string
+	err := query.QueryRowContext(ctx, `select id,conversation_id,run_id,role,content,parent_tool_use_id,created_at,attachments from messages where conversation_id=? and client_request_id=?`, conversationID, clientRequestID).Scan(&message.ID, &message.ConversationID, &message.RunID, &message.Role, &message.Content, &message.ParentToolUseID, &message.CreatedAt, &rawAttachments)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, false, nil
 	}
 	if err != nil {
 		return Message{}, false, err
 	}
+	message.Attachments = decodeAttachments(rawAttachments)
+	message.ClientRequestID = clientRequestID
 	return message, true, nil
 }
 
-func (s *Server) startMessage(ctx context.Context, conversationID, content, clientRequestID string, record *runStartRecord) (Message, string, *runStartRecord, int, error) {
+func (s *Server) startMessage(ctx context.Context, conversationID, content, clientRequestID string, record *runStartRecord, attached ...[]MessageAttachment) (Message, string, *runStartRecord, int, error) {
+	if err := rejectSupervisionConversationMessage(ctx, s.db, conversationID); err != nil {
+		return Message{}, "", nil, http.StatusConflict, err
+	}
+	var attachments []MessageAttachment
+	if len(attached) > 0 {
+		attachments = attached[0]
+	}
 	content = strings.TrimSpace(content)
 	clientRequestID = strings.TrimSpace(clientRequestID)
-	if content == "" {
+	if content == "" && len(attachments) == 0 {
 		return Message{}, "", nil, http.StatusBadRequest, errors.New("message is required")
 	}
-	if s.isOrchestrationConversation(ctx, conversationID) && (record == nil || !record.Orchestrated) {
+	if s.isOrchestrationConversation(ctx, conversationID) && (record == nil || record.ExecutionSource != taskSourceOrchestration) {
 		return Message{}, "", nil, http.StatusConflict, errors.New("automatic orchestration conversations are read-only")
 	}
 	if s.isScheduledConversation(ctx, conversationID) && (record == nil || record.Scheduled == nil) {
@@ -5691,16 +5793,35 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			s.projectLifecycleMu.Unlock()
 		}
 	}()
+	if err := rejectSupervisionConversationMessage(ctx, s.db, conversationID); err != nil {
+		return Message{}, "", nil, http.StatusConflict, err
+	}
 	if clientRequestID != "" {
 		existing, found, err := messageForClientRequest(ctx, s.db, conversationID, clientRequestID)
 		if err != nil {
 			return Message{}, "", nil, http.StatusInternalServerError, err
 		}
 		if found {
-			if existing.Content != content {
+			if existing.Content != content || !sameAttachmentPaths(existing.Attachments, attachments) {
 				return Message{}, "", nil, http.StatusConflict, errors.New("client request ID was already used for different content")
 			}
 			return existing, existing.RunID, record, http.StatusAccepted, nil
+		}
+	}
+	// 本机会话适配器不应为远端旧会话先申请工作区保护或发起 RPC。
+	// 放在幂等重放之后，保留已经接受过的请求回执。
+	if !isLocalRunnerID(admission.runnerID) {
+		var reason string
+		switch admission.agentID {
+		case "codebuddy":
+			reason = codebuddyLocalOnlyMessage
+		case "qoder":
+			reason = qoderLocalOnlyMessage
+		case "cursor":
+			reason = cursorLocalOnlyMessage
+		}
+		if reason != "" {
+			return Message{}, "", nil, http.StatusServiceUnavailable, errors.New(reason)
 		}
 	}
 	// 只有"被停止兜底强制收尾、且进程可能还活着"的 run 才禁止新回合；
@@ -5741,7 +5862,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 
 	runID := uuid.NewString()
-	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, CreatedAt: time.Now().UTC()}
+	m := Message{ID: uuid.NewString(), ConversationID: conversationID, RunID: runID, Role: "user", Content: content, Attachments: attachments, ClientRequestID: clientRequestID, CreatedAt: time.Now().UTC()}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Message{}, "", nil, http.StatusInternalServerError, err
@@ -5753,7 +5874,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			return Message{}, "", nil, http.StatusInternalServerError, err
 		}
 		if found {
-			if existing.Content != content {
+			if existing.Content != content || !sameAttachmentPaths(existing.Attachments, attachments) {
 				return Message{}, "", nil, http.StatusConflict, errors.New("client request ID was already used for different content")
 			}
 			return existing, existing.RunID, record, http.StatusAccepted, nil
@@ -5848,13 +5969,15 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	// run without holding SQLite or the global lock.
 	workspaceOwner := "conversation:" + conversation.ID
 	workspaceKey := workspaceLeaseKey(Project{ID: conversation.ProjectID, Path: projectRoot}, ConversationWorkspace{ID: workspace.ID, Path: workspace.Path})
-	releaseWorkspace, acquired := s.acquireWorkspace(workspaceKey, workspaceOwner)
+	s.rememberWorkspaceScope(workspaceKey, workspace.Path, projectRunner)
+	releaseWorkspace, acquired := s.acquireWorkspaceMode(workspaceKey, workspaceOwner, false)
 	if !acquired {
 		return Message{}, "", nil, http.StatusConflict, s.workspaceOccupiedError(workspaceKey)
 	}
 	workspaceAdmitted := false
 	defer func() {
 		if !workspaceAdmitted {
+			_ = tx.Rollback() // A later admission transaction may still be open.
 			releaseWorkspace()
 		}
 	}()
@@ -5865,6 +5988,32 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 	s.projectLifecycleMu.Unlock()
 	lifecycleLocked = false
+	// The in-memory reservation above protects local lifecycle changes. Shared
+	// target registration can perform RPC only after committing and unlocking.
+	s.workspaceAdmissionMu.Lock()
+	sharedScope := s.workspaceScopeLocked(workspaceKey)
+	s.workspaceAdmissionMu.Unlock()
+	releaseShared, sharedErr := s.beginSharedWorkspaceOperation(sharedScope, &workspaceGuardRecord{})
+	if sharedErr != nil {
+		return Message{}, "", nil, http.StatusConflict, sharedErr
+	}
+	releaseMemory := releaseWorkspace
+	releaseWorkspace = func() { releaseShared(); releaseMemory() }
+	// Validate only after idempotent replay and workspace admission. Metadata is
+	// authoritative from the same root that the eventual CLI will execute in.
+	attachments, err = s.validateMessageAttachments(ctx, resolvedConversationWorkspace{
+		Project:        Project{ID: conversation.ProjectID, Runner: projectRunner, Path: projectRoot},
+		Workspace:      ConversationWorkspace{ID: workspace.ID, Path: workspace.Path},
+		ConversationID: conversation.ID,
+	}, attachments)
+	if err != nil {
+		return Message{}, "", nil, http.StatusBadRequest, err
+	}
+	m.Attachments = attachments
+	if refs := attachmentReferences(attachments); refs != "" {
+		prompt += "\n\n" + refs
+	}
+
 	// Select the runner for this specific project by its target environment
 	// (docs/20 §3.3). SSH projects resolve through the registry; local Windows/WSL
 	// projects route to the runner for their resolved target environment so a
@@ -5997,7 +6146,10 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 	defer tx.Rollback()
 	if record != nil && record.Task != nil {
-		if err := s.validateTaskDispatchTx(ctx, tx, *record.Task, conversation, record.Orchestrated); err != nil {
+		if err := s.validateTaskDispatchTx(ctx, tx, *record.Task, conversation, record.ExecutionSource == taskSourceOrchestration); err != nil {
+			return Message{}, "", nil, http.StatusConflict, err
+		}
+		if err := admitTaskExecutionTx(ctx, tx, record.Task, record.ExecutionSource, m.CreatedAt); err != nil {
 			return Message{}, "", nil, http.StatusConflict, err
 		}
 	}
@@ -6015,7 +6167,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 	}
 	if err == nil {
 		var result sql.Result
-		result, err = tx.ExecContext(ctx, `insert into messages (id,conversation_id,run_id,role,content,client_request_id,parent_tool_use_id,created_at) values ($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`, m.ID, m.ConversationID, m.RunID, m.Role, m.Content, clientRequestID, m.ParentToolUseID, m.CreatedAt)
+		result, err = tx.ExecContext(ctx, `insert into messages (id,conversation_id,run_id,role,content,client_request_id,parent_tool_use_id,created_at,attachments) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict do nothing`, m.ID, m.ConversationID, m.RunID, m.Role, m.Content, clientRequestID, m.ParentToolUseID, m.CreatedAt, attachmentJSON(attachments))
 		if err == nil && clientRequestID != "" {
 			var changed int64
 			changed, err = result.RowsAffected()
@@ -6025,7 +6177,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 					err = lookupErr
 				} else if !found {
 					err = errors.New("message idempotency conflict without an existing message")
-				} else if existing.Content != content {
+				} else if existing.Content != content || !sameAttachmentPaths(existing.Attachments, attachments) {
 					return Message{}, "", nil, http.StatusConflict, errors.New("client request ID was already used for different content")
 				} else {
 					return existing, existing.RunID, record, http.StatusAccepted, nil
@@ -6059,7 +6211,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 		err = tx.QueryRowContext(ctx, `select coalesce(max(sequence),0)+1 from task_runs where task_id=?`, record.Task.TaskID).Scan(&sequence)
 		if err == nil {
 			record.Task.Sequence = sequence
-			_, err = tx.ExecContext(ctx, `insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at) values (?,?,?,?,?,?,?,?,?,?,?)`, record.Task.ID, record.Task.TaskID, record.Task.ConversationID, record.Task.RunID, record.Task.Sequence, record.Task.Status, record.Task.PromptSnapshot, record.Task.AcceptanceSnapshot, record.Task.FailureReason, record.Task.CreatedAt, record.Task.StartedAt)
+			_, err = tx.ExecContext(ctx, `insert into task_runs (id,task_id,conversation_id,run_id,sequence,status,prompt_snapshot,acceptance_snapshot,failure_reason,created_at,started_at,execution_source,execution_owner_id) values (?,?,?,?,?,?,?,?,?,?,?,?,?)`, record.Task.ID, record.Task.TaskID, record.Task.ConversationID, record.Task.RunID, record.Task.Sequence, record.Task.Status, record.Task.PromptSnapshot, record.Task.AcceptanceSnapshot, record.Task.FailureReason, record.Task.CreatedAt, record.Task.StartedAt, record.Task.ExecutionSource, record.Task.ExecutionOwnerID)
 		}
 		if err == nil && record.Task.ExecutionIntentID != "" {
 			var result sql.Result
@@ -6076,7 +6228,7 @@ func (s *Server) startMessage(ctx context.Context, conversationID, content, clie
 			_, err = tx.ExecContext(ctx, `update tasks set status=?,last_task_run_id=?,updated_at=? where id=? and status in ('todo','action_required','awaiting_review')`, taskRunning, record.Task.ID, m.CreatedAt, record.Task.TaskID)
 		}
 		if err == nil {
-			err = s.recordTaskEventTx(ctx, tx, record.Task.TaskID, record.Task.ID, "task.dispatched", map[string]string{"runId": runID, "status": record.Task.Status}, m.CreatedAt)
+			err = s.recordTaskEventTx(ctx, tx, record.Task.TaskID, record.Task.ID, "task.dispatched", map[string]string{"runId": runID, "status": record.Task.Status, "executionSource": string(record.Task.ExecutionSource), "executionOwnerId": record.Task.ExecutionOwnerID}, m.CreatedAt)
 		}
 	}
 	if err == nil && record != nil && record.Scheduled != nil {
@@ -6234,6 +6386,10 @@ func (s *Server) acquireProjectWorkspace(projectID, owner string) (func(), bool)
 // does not inspect or acquire the project workspace lease, so staging can run
 // while an AI process continues editing the worktree.
 func (s *Server) acquireGitIndexLock(workspaceKey string) (func(), bool) {
+	releaseAdmission, err := s.beginWorkspaceOperation(workspaceKey, "git:index")
+	if err != nil {
+		return nil, false
+	}
 	s.mu.Lock()
 	if s.gitIndexLocks == nil {
 		s.gitIndexLocks = map[string]*sync.Mutex{}
@@ -6245,21 +6401,32 @@ func (s *Server) acquireGitIndexLock(workspaceKey string) (func(), bool) {
 	}
 	s.mu.Unlock()
 	if !lock.TryLock() {
+		releaseAdmission()
 		return nil, false
 	}
-	return lock.Unlock, true
+	var once sync.Once
+	return func() { once.Do(func() { lock.Unlock(); releaseAdmission() }) }, true
 }
 
 // acquireWorkspace serializes operations against the actual directory they
 // affect. project_shared keeps its historical project ID key; isolated
 // worktrees use their cleaned absolute path and can therefore run in parallel.
 func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
+	return s.acquireWorkspaceMode(workspaceKey, owner, true)
+}
+
+func (s *Server) acquireWorkspaceMode(workspaceKey, owner string, shared bool) (func(), bool) {
+	releaseAdmission, err := s.beginWorkspaceOperationMode(workspaceKey, owner, shared)
+	if err != nil {
+		return nil, false
+	}
 	s.mu.Lock()
 	if s.projectWorkspaceLeases == nil {
 		s.projectWorkspaceLeases = make(map[string]*projectWorkspaceLease)
 	}
 	if s.gitIndexActive[workspaceKey] && !isAIWorkspaceOwner(owner) {
 		s.mu.Unlock()
+		releaseAdmission()
 		return nil, false
 	}
 	lease := s.projectWorkspaceLeases[workspaceKey]
@@ -6271,6 +6438,7 @@ func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
 	// 退出的旧持有者会释放失败、租约永久卡住。
 	if lease != nil && ((lease.teardown && owner != projectDeleteWorkspaceOwner) || !workspaceLeaseCompatible(lease.owner, owner)) {
 		s.mu.Unlock()
+		releaseAdmission()
 		return nil, false
 	}
 	if lease == nil {
@@ -6286,6 +6454,7 @@ func (s *Server) acquireWorkspace(workspaceKey, owner string) (func(), bool) {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			defer releaseAdmission()
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			current := s.projectWorkspaceLeases[workspaceKey]
@@ -6308,6 +6477,14 @@ func (s *Server) projectWorkspaceOccupiedError(projectID string) error {
 }
 
 func (s *Server) workspaceOccupiedError(workspaceKey string) error {
+	s.workspaceAdmissionMu.Lock()
+	for _, admission := range s.workspaceAdmissions {
+		if s.admissionOverlapsLocked(admission, s.workspaceScopeLocked(workspaceKey)) {
+			s.workspaceAdmissionMu.Unlock()
+			return errWorkspaceSupervised
+		}
+	}
+	s.workspaceAdmissionMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lease := s.projectWorkspaceLeases[workspaceKey]
@@ -6397,11 +6574,26 @@ func (s *Server) unregisterProfileRunCancel(runID string) {
 
 func (s *Server) releaseRunWorkspace(runID string) {
 	s.mu.Lock()
+	if _, forced := s.forcedStopRuns[runID]; forced {
+		if _, active := s.runContexts[runID]; active {
+			s.mu.Unlock()
+			return // Logical stop deadlines cannot certify process termination.
+		}
+	}
 	release := s.runWorkspaceReleases[runID]
 	delete(s.runWorkspaceReleases, runID)
 	s.mu.Unlock()
 	if release != nil {
 		release()
+	}
+}
+
+// A logical finalizer may already have committed while the process was still
+// running. Its later exit must finish cleanup even if finishRun is now a replay.
+func (s *Server) releaseTerminalRunWorkspace(runID string) {
+	var status string
+	if err := s.db.QueryRowContext(context.Background(), `select status from runs where id=?`, runID).Scan(&status); err == nil && status != "queued" && status != "running" {
+		s.releaseRunWorkspace(runID)
 	}
 }
 
@@ -6413,12 +6605,17 @@ func (s *Server) submitStreamingRunWithProfile(ctx context.Context, runner Strea
 	// startMessage holds streamMu across admission and the ordered transport
 	// write. streamingSetups separately lets a stop cancel initialization before
 	// the first prompt is admitted.
+	attachments, attachmentErr := s.runAttachments(ctx, runID, conversation.AgentID, runnerID, projectPath)
+	if attachmentErr != nil {
+		s.finishStreamingRun(runID, conversation.ID, attachmentErr)
+		return
+	}
 	session, err := s.streamingSession(ctx, runner, runID, conversation, profile, runnerID, projectPath)
 	if err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
 	}
-	request := AgentRunRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID)}
+	request := AgentRunRequest{AgentID: conversation.AgentID, Attachments: attachments, SessionID: conversation.sessionID(), ProjectPath: projectPath, Prompt: prompt, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), RunID: runID, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID)}
 	if err := s.beginStreamingRun(ctx, runID); err != nil {
 		s.finishStreamingRun(runID, conversation.ID, err)
 		return
@@ -6478,6 +6675,17 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	}
 	s.mu.Unlock()
 	token := uuid.NewString()
+	var cliTicket workspaceGuardRecord
+	releaseSessionGuard, err := s.beginSharedWorkspaceOperation(workspaceScope{Path: projectPath, OriginalPath: projectPath, RunnerID: runnerID}, &cliTicket)
+	if err != nil {
+		return nil, err
+	}
+	guardTransferred := false
+	defer func() {
+		if !guardTransferred {
+			releaseSessionGuard()
+		}
+	}()
 	// 新建持久会话时才生成 MCP 配置（会话内工具集固定，运行中的会话不热更新）。
 	// 每次新建会话都带唯一后缀：同名运行时文件会让「旧会话的 cleanup」删掉新会话
 	// 正在使用的配置（watchStreamingSession 在释放锁之后才执行 cleanup）。异常退出
@@ -6485,23 +6693,36 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	mcpKey := "sess-" + conversation.ID + "-" + uuid.NewString()
 	injection := s.prepareMCPInjection(ctx, conversation.ProjectID, projectPath, conversation.AgentID, runnerID, mcpKey)
 	s.setMCPAutoApprove(conversation.ID, injection.AutoApproveTools)
-	agent, err := runner.StartSession(ctx, AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID), MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools, MCPStartupTimeout: injection.StartupTimeout})
+	agent, err := runner.StartSession(ordinaryCLIContext(ctx, s.config, cliTicket), AgentSessionRequest{SessionID: conversation.sessionID(), ProjectPath: projectPath, PermissionMode: conversation.executionPolicy(), Resume: conversation.initialized(), ConversationID: conversation.ID, ApprovalToken: token, Profile: profile, Model: runModel(conversation.ModelOverride, profile), ReasoningEffort: s.conversationReasoningEffort(ctx, conversation.ID), MCPConfigPath: injection.localConfigPath(), MCPConfigJSON: injection.remoteJSON(), MCPKey: mcpKey, StrictMCP: injection.Strict, MCPEnv: injection.Env, MCPAutoApproveTools: injection.AutoApproveTools, MCPStartupTimeout: injection.StartupTimeout})
 	if err != nil {
 		injection.done()
 		s.clearMCPAutoApprove(conversation.ID)
 		return nil, err
 	}
+	// Logical turn completion is not native session termination.
+	guardTransferred = true
+	watchFailedSetup := func() {
+		go func() {
+			select {
+			case <-agent.Done():
+				releaseSessionGuard()
+			case <-time.After(s.sessionManager.exitGrace()):
+			}
+		}()
+	}
 	if err := ctx.Err(); err != nil {
 		agent.Stop()
+		watchFailedSetup()
 		injection.done()
 		s.clearMCPAutoApprove(conversation.ID)
 		return nil, err
 	}
-	managed := &activeAgentSession{agent: agent, approvalToken: token, runnerID: runnerID, agentID: conversation.AgentID, config: newConversationSessionConfig(runnerID, conversation, profile, projectPath), configSet: true, runIDs: map[string]struct{}{runID: {}}, lastUsedAt: s.sessionManager.now(), mcpCleanup: injection.cleanup}
+	managed := &activeAgentSession{workspaceGuardRelease: releaseSessionGuard, agent: agent, approvalToken: token, runnerID: runnerID, agentID: conversation.AgentID, config: newConversationSessionConfig(runnerID, conversation, profile, projectPath), configSet: true, runIDs: map[string]struct{}{runID: {}}, lastUsedAt: s.sessionManager.now(), mcpCleanup: injection.cleanup}
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
 		agent.Stop()
+		watchFailedSetup()
 		injection.done()
 		s.clearMCPAutoApprove(conversation.ID)
 		return nil, errors.New("control service is shutting down")
@@ -6510,6 +6731,7 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 	if setup == nil || setup.cancelled {
 		s.mu.Unlock()
 		agent.Stop()
+		watchFailedSetup()
 		injection.done()
 		s.clearMCPAutoApprove(conversation.ID)
 		return nil, context.Canceled
@@ -6531,11 +6753,11 @@ func (s *Server) streamingSession(ctx context.Context, runner StreamingAgentRunn
 // Stop returns, so its active runs must not be finalized early.
 //
 // 等待有上限：只有会话被要求停止之后才开始计时（见 waitForStreamingSessionExit），
-// 到点仍不退出就放弃等待、照常释放——宁可冒"进程可能还活着"的风险，也不能让这条
-// 会话永久停在 stopping。
+// 到点可结束会话的逻辑等待，但保留共享目录保护，不能据此证明目标静默。
 func (s *Server) watchStreamingSession(conversationID string, managed *activeAgentSession) {
-	if !s.waitForStreamingSessionExit(managed) {
-		log.Printf("conversation %s: native agent process has not exited %s after it was stopped; releasing its session so the conversation can accept new turns again (its runs are finalized as stopped; its workspace lease is released with them)", conversationID, s.sessionManager.exitGrace())
+	exitConfirmed := s.waitForStreamingSessionExit(managed)
+	if !exitConfirmed {
+		log.Printf("conversation %s: native agent exit remains unconfirmed after %s; retaining shared workspace protection", conversationID, s.sessionManager.exitGrace())
 	}
 
 	// Block new streaming admission while removing this stopped session and
@@ -6560,10 +6782,15 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 		delete(s.forcedStopRuns, runID)
 	}
 	delete(s.sessions, conversationID)
+	guardRelease := managed.workspaceGuardRelease
+	managed.workspaceGuardRelease = nil
 	cleanup := managed.mcpCleanup
 	managed.mcpCleanup = nil
 	s.mu.Unlock()
 	s.streamMu.Unlock()
+	if exitConfirmed && guardRelease != nil {
+		guardRelease()
+	}
 	s.clearMCPAutoApprove(conversationID)
 	if cleanup != nil {
 		cleanup()
@@ -6580,6 +6807,9 @@ func (s *Server) watchStreamingSession(conversationID string, managed *activeAge
 		s.discardRunUsage(runID)
 		s.resolveRunApprovals(runID, "deny")
 		s.finishRun(runID, conversationID, status, runErr)
+		if exitConfirmed {
+			s.releaseTerminalRunWorkspace(runID)
+		}
 	}
 	// 会话已经真正退出：之前被 runContexts 守卫挡住的排队非流式回合现在可以开始。
 	s.startNextNonStreamingRun(conversationID)
@@ -6695,11 +6925,15 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		s.discardRunUsage(runID)
 		s.resolveRunApprovals(runID, "deny")
 		s.mu.Lock()
+		_, forced := s.forcedStopRuns[runID]
 		delete(s.cancels, runID)
 		delete(s.runTokens, runID)
 		delete(s.runContexts, runID)
 		delete(s.forcedStopRuns, runID)
 		s.mu.Unlock()
+		if forced {
+			s.releaseTerminalRunWorkspace(runID)
+		}
 		// A 的进程已经真正收尾，排队的下一轮现在才可以开始（见 startNextNonStreamingRun
 		// 里的 runContexts 守卫：兜底收尾时它会被这条记录挡住）。
 		s.startNextNonStreamingRun(c.ID)
@@ -6714,27 +6948,32 @@ func (s *Server) runAgent(ctx context.Context, runner AgentRunner, runID, runTok
 		cancelRun()
 	})
 	defer watchdog.stop()
-	err := runner.Run(runCtx, AgentRunRequest{
-		SessionID:           c.sessionID(),
-		ProjectPath:         projectPath,
-		Prompt:              prompt,
-		PermissionMode:      c.executionPolicy(),
-		Resume:              c.initialized(),
-		RunID:               runID,
-		RunToken:            runToken,
-		AgentID:             c.AgentID,
-		Profile:             profile,
-		Model:               runModel(c.ModelOverride, profile),
-		ReasoningEffort:     s.conversationReasoningEffort(ctx, c.ID),
-		MCPConfigPath:       injection.localConfigPath(),
-		MCPConfigJSON:       injection.remoteJSON(),
-		MCPKey:              runID,
-		StrictMCP:           injection.Strict,
-		MCPEnv:              injection.Env,
-		CodexMCPArgs:        injection.CodexArgs,
-		OpenCodeConfig:      injection.OpenCodeConfig,
-		MCPAutoApproveTools: injection.AutoApproveTools,
-	}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, projectID: c.ProjectID, agentID: c.AgentID, touch: watchdog.touch})
+	attachments, attachmentErr := s.runAttachments(ctx, runID, c.AgentID, runnerID, projectPath)
+	err := attachmentErr
+	if err == nil {
+		err = s.runTrackedOrdinaryCLI(runCtx, runner, runnerID, AgentRunRequest{
+			Attachments:         attachments,
+			SessionID:           c.sessionID(),
+			ProjectPath:         projectPath,
+			Prompt:              prompt,
+			PermissionMode:      c.executionPolicy(),
+			Resume:              c.initialized(),
+			RunID:               runID,
+			RunToken:            runToken,
+			AgentID:             c.AgentID,
+			Profile:             profile,
+			Model:               runModel(c.ModelOverride, profile),
+			ReasoningEffort:     s.conversationReasoningEffort(ctx, c.ID),
+			MCPConfigPath:       injection.localConfigPath(),
+			MCPConfigJSON:       injection.remoteJSON(),
+			MCPKey:              runID,
+			StrictMCP:           injection.Strict,
+			MCPEnv:              injection.Env,
+			CodexMCPArgs:        injection.CodexArgs,
+			OpenCodeConfig:      injection.OpenCodeConfig,
+			MCPAutoApproveTools: injection.AutoApproveTools,
+		}, &agentRunSink{server: s, runID: runID, conversationID: c.ID, projectID: c.ProjectID, agentID: c.AgentID, touch: watchdog.touch})
+	}
 	status := "completed"
 	if watchdog.firedOnce() {
 		// 看门狗已经取消过这次运行：把"卡死"如实报成失败并给出可读原因，
@@ -7264,6 +7503,11 @@ func (s *Server) stopRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "true"
+
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	started := time.Now()
 	status, code, err := s.stopRunByID(r.Context(), id, force)
 	elapsed := time.Since(started).Round(time.Millisecond)
@@ -7310,6 +7554,11 @@ func (s *Server) stopConversationRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.isOrchestrationConversation(r.Context(), conversationID) {
 		writeError(w, http.StatusConflict, errOrchestrationStopRestricted)
+		return
+	}
+
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
 		return
 	}
 	runID, found, err := s.activeRunIDForConversation(r.Context(), conversationID)
@@ -8444,6 +8693,9 @@ func localizedErrorText(err error, fallback string) string {
 	if message == "" {
 		return fallback
 	}
+	if strings.Contains(message, errTaskExecutionClaimed.Error()) {
+		return "任务已由其他执行来源管理，请先结束原执行或显式移出原队列。"
+	}
 	if strings.HasPrefix(message, "project workspace is occupied") {
 		return "项目工作区正被其他 AI 任务或 Git 操作占用，请等待当前操作完成后重试。"
 	}
@@ -9169,8 +9421,17 @@ func (s *Server) projectRunManagerForWorkspace(ctx context.Context, project Proj
 	var runner projectRunnerInterface
 	if prepared != nil {
 		runner = prepared.runner
+		if remote, ok := runner.(*sshProjectRunner); ok {
+			remote.workspaceAdmission = func(path string) (func(), error) {
+				return s.beginWorkspaceOperationAtPath(project, path, "project-run")
+			}
+		}
 	} else {
-		runner = newProjectRunner(projectID, "", "", nil, broadcast)
+		local := newProjectRunner(projectID, "", "", nil, broadcast)
+		local.workspaceAdmission = func(path string) (func(), error) {
+			return s.beginWorkspaceOperationAtPath(project, path, "project-run")
+		}
+		runner = local
 	}
 	runner.setStatusListener(func(RunStatusEvent) {
 		s.broadcastProjectProcessStatus(projectID)
@@ -9284,6 +9545,7 @@ func (s *Server) getProjectByID(ctx context.Context, projectID string) (Project,
 		return Project{}, err
 	}
 	p.RunnerID = p.Runner
+	s.rememberWorkspaceScope(p.ID, p.Path, p.Runner)
 	return p, nil
 }
 
@@ -9422,6 +9684,12 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
+	releaseAdmission, admissionErr := s.beginWorkspaceOperationAtPath(project, resolved.Workspace.Path, "project-run-request")
+	if admissionErr != nil {
+		writeError(w, http.StatusConflict, admissionErr)
+		return
+	}
+	defer releaseAdmission()
 	if !isLocalRunnerID(project.Runner) {
 		// SSH 等远程项目：校验 runner 在线，由 projectRunManagerForExistingProject 负责。
 		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
@@ -9541,6 +9809,12 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
+	releaseAdmission, admissionErr := s.beginWorkspaceOperationAtPath(project, resolved.Workspace.Path, "project-run-request")
+	if admissionErr != nil {
+		writeError(w, http.StatusConflict, admissionErr)
+		return
+	}
+	defer releaseAdmission()
 	if !isLocalRunnerID(project.Runner) {
 		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
 			writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})

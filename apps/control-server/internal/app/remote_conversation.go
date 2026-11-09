@@ -118,6 +118,12 @@ func (s *Server) remoteConversationOperations() map[string]remoteOperation {
 			Path:   "/model",
 			Handle: s.setConversationModel,
 		},
+		"conversation.reasoningEffort": {
+			Method: http.MethodPost,
+			Scope:  relayScopeConversation,
+			Path:   "/reasoning-effort",
+			Handle: s.setConversationReasoningEffort,
+		},
 		// 建好之后改执行权限。完全控制的二次确认在手机界面做，服务端仍只认合法档位。
 		"conversation.permissionMode": {
 			Method: http.MethodPost,

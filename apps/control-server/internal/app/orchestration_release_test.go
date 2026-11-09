@@ -260,6 +260,27 @@ func TestReleaseSnapshotPublishesJobsAdvancedByWorker(t *testing.T) {
 	assertTaskStatus(t, server, taskID, taskDone)
 }
 
+func TestReleaseSnapshotDoesNotConfirmWhenJobAncestryCannotBeChecked(t *testing.T) {
+	server := newTestServer(t)
+	repo, _, _ := seedReleaseTestProject(t, server, "release-unreadable")
+	taskID := createTaskForTest(t, server.routes(), "release-unreadable", "unreadable commit")
+	seedReleaseTestJob(t, server, "release-unreadable", "job-unreadable", taskID, "awaiting_main", strings.Repeat("a", 40))
+	create := releaseSnapshotRequest(t, server, http.MethodPost, "/api/projects/release-unreadable/orchestration/releases")
+	if create.Code != http.StatusCreated {
+		t.Fatal(create.Code, create.Body.String())
+	}
+	snapshot := decodeReleaseSnapshot(t, create)
+	runGitForTest(t, repo, "merge", "--ff-only", snapshot.Branch)
+	confirm := releaseSnapshotRequest(t, server, http.MethodPost, "/api/projects/release-unreadable/orchestration/releases/"+snapshot.ID+"/confirm")
+	if confirm.Code != http.StatusInternalServerError {
+		t.Fatalf("uncheckable commit silently confirmed: %d %s", confirm.Code, confirm.Body.String())
+	}
+	var status string
+	if err := server.db.QueryRow("select status from release_snapshots where id=?", snapshot.ID).Scan(&status); err != nil || status != "awaiting_main" {
+		t.Fatal("failed verification changed snapshot", status, err)
+	}
+}
+
 // TestReleaseSnapshotRoutesValidateTargets 覆盖路由参数校验：未知项目 404，缺失 dev
 // 分支 409 且提示分支名，未知快照 404。
 func TestReleaseSnapshotRoutesValidateTargets(t *testing.T) {

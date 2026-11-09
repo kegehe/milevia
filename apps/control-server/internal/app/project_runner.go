@@ -137,7 +137,8 @@ type projectRunner struct {
 	logMu     sync.Mutex
 	nextLogID uint64
 
-	statusBroadcast statusBroadcaster
+	statusBroadcast    statusBroadcaster
+	workspaceAdmission func(string) (func(), error)
 
 	status      RunStatus
 	retired     bool
@@ -226,6 +227,20 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 		pr.mu.Unlock()
 		return err
 	}
+	releaseWorkspace := func() {}
+	if pr.workspaceAdmission != nil {
+		releaseWorkspace, err = pr.workspaceAdmission(workDir)
+		if err != nil {
+			pr.mu.Unlock()
+			return err
+		}
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseWorkspace()
+		}
+	}()
 
 	pr.status = RunStatusStarting
 	pr.exitChan = make(chan struct{})
@@ -334,7 +349,8 @@ func (pr *projectRunner) start(parentCtx context.Context, projectPath string) er
 		pipeReaders.Wait()
 		close(pipeReadersDone)
 	}()
-	go pr.wait(pipeReadersDone)
+	transferred = true
+	go pr.wait(pipeReadersDone, releaseWorkspace, executionTarget, pr.ctx, cmd)
 	if windowsPIDReady != nil {
 		select {
 		case <-windowsPIDReady:
@@ -649,11 +665,15 @@ func (pr *projectRunner) recordWindowsPID(text string) bool {
 	return true
 }
 
-func (pr *projectRunner) wait(pipeReadersDone <-chan struct{}) {
+func (pr *projectRunner) wait(pipeReadersDone <-chan struct{}, releaseWorkspace func(), target RunExecutionTarget, runCtx context.Context, cmd *exec.Cmd) {
 	// Cmd.Wait closes the pipe handles. Wait for both scanners first so the
 	// final output (including Windows launcher errors) is not discarded.
 	<-pipeReadersDone
-	err := pr.cmd.Wait()
+	err := cmd.Wait()
+	// 先释放本次进程的占用，再广播终态；避免重启错用上一轮的释放函数。
+	if projectRunWorkspaceExitConfirmed(target, runCtx, err) {
+		releaseWorkspace()
+	}
 	pr.mu.Lock()
 	exitCode := 0
 	if err != nil && pr.status != RunStatusStopping {

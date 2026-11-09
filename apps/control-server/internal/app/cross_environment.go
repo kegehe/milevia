@@ -264,6 +264,9 @@ func (e *wslCrossEnvironment) run(ctx context.Context, script string) (string, s
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if cmd.Process != nil {
+			noteWorkspaceWSLExit(e.runner.distro, ctx, err, false)
+		}
 		return stdout.String(), stderr.String(), fmt.Errorf("%s 执行失败：%w", e.describe(), err)
 	}
 	return stdout.String(), stderr.String(), nil

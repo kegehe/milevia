@@ -1,0 +1,80 @@
+.supervision-page { padding:22px; color:#24443a; max-width:1800px; margin:auto; height:100%; overflow:auto }
+.supervision-page h2,.supervision-page h3,.supervision-page h4 { margin:0 0 12px }
+.supervision-page p { line-height:1.65; margin:8px 0 }
+.supervision-page small { color:#62766e }
+.supervision-heading,.supervision-status,.supervision-message header { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap }
+.supervision-heading { margin-bottom:20px }
+.supervision-heading p { color:#62766e }
+.supervision-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+.supervision-page button,.supervision-page select,.supervision-page input[type=number],.supervision-page textarea { border:1px solid #cfe0d6; border-radius:8px; background:#fff; color:inherit; padding:8px 11px; font:inherit }
+.supervision-page button { cursor:pointer }
+.supervision-page button:disabled { opacity:.5; cursor:default }
+.supervision-page button.primary { background:#2c7567; color:white; border-color:#2c7567 }
+.supervision-page button:focus-visible,.supervision-page select:focus-visible,.supervision-page input:focus-visible,.supervision-page textarea:focus-visible { outline:2px solid #2c7567; outline-offset:2px }
+.supervision-page textarea { width:100%; min-height:90px; resize:vertical; box-sizing:border-box }
+.supervision-page label { display:flex; gap:8px; align-items:center }
+.supervision-page input[type=checkbox] { accent-color:#2c7567 }
+.supervision-error { padding:12px; border:1px solid #ebbbad; background:#fff2ed; display:flex; justify-content:space-between; gap:12px; margin:12px 0 }
+.supervision-create { display:grid; grid-template-columns:1fr 1fr; gap:28px; background:#fbfefb; padding:24px; border:1px solid #cfe0d6; border-radius:12px }
+.supervision-task-picker { max-height:55vh; overflow:auto; margin-top:16px }
+.supervision-task-picker label { padding:12px 8px; border-bottom:1px solid #e6eee9 }
+.supervision-task-picker span { flex:1 }
+.supervision-budget-fields { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:18px 0 }
+.supervision-budget-fields label { align-items:stretch; flex-direction:column; font-size:13px }
+.supervision-status { background:#edf6f0; border:1px solid #cfe0d6; border-radius:10px; padding:14px; margin-bottom:12px }
+.supervision-status>div:first-child { display:flex; align-items:center; gap:16px; flex-wrap:wrap }
+.supervision-status code { font-size:12px }
+.supervision-grid { display:grid; grid-template-columns:220px minmax(320px,1fr) 320px; gap:16px; min-height:65vh }
+.supervision-tasks,.supervision-inspector,.supervision-process { border:1px solid #dbe6df; background:#fbfefb; border-radius:10px; padding:14px; min-width:0 }
+.supervision-tasks button { display:flex; flex-direction:column; align-items:flex-start; text-align:left; gap:8px; width:100%; margin:8px 0 }
+.supervision-tasks button.selected { border-color:#2c7567; background:#e6f3eb }
+.supervision-tasks button span { font-size:12px }
+.supervision-process { display:flex; flex-direction:column }
+.supervision-process-tabs { display:flex; gap:4px; flex-wrap:wrap; padding-bottom:12px; border-bottom:1px solid #dbe6df }
+.supervision-process-tabs button { font-size:12px; padding:6px 9px }
+.supervision-process-tabs button[aria-selected=true] { background:#2c7567; color:#fff }
+.supervision-transcript { max-height:65vh; min-height:320px; overflow:auto; flex:1; overflow-wrap:anywhere }
+.supervision-transcript article { padding:14px 0; border-bottom:1px solid #e1ebe5 }
+.supervision-transcript time { color:#76857e; font-size:11px }
+.supervision-message.input { color:#65776e }
+.supervision-message a { font-size:11px }
+.supervision-page pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:500px; overflow:auto; background:#f0f5f2; border-radius:6px; padding:10px; font-size:12px }
+.supervision-page details { margin:10px 0 }
+.supervision-page summary { cursor:pointer; font-size:12px; color:#2c7567 }
+.supervision-message table { display:block; overflow:auto }
+.supervision-inspector { max-height:85vh; overflow:auto }
+.supervision-inspector h4 { margin-top:20px }
+.supervision-point,.supervision-evidence { border-bottom:1px solid #dbe6df; padding:12px 0; font-size:13px }
+.supervision-evidence small { display:block; margin-top:6px }
+.supervision-instruction { border-top:1px solid #dbe6df; margin-top:14px; padding-top:14px }
+.supervision-instruction>label { flex-direction:column; align-items:flex-start }
+.supervision-instruction .supervision-actions { margin-top:8px; font-size:12px }
+.supervision-question { background:#fff7e5; border:1px solid #e4d6ae; padding:12px; margin:16px 0 }
+.supervision-question button { margin-top:8px }
+.supervision-empty { padding:30px; color:#62766e }
+.supervision-drift { font-size:13px; margin:12px 0 }
+.supervision-budget-edit { max-width:700px; padding:16px; border:1px solid #cfe0d6; margin-bottom:16px }
+.supervision-report { padding:20px; border:1px solid #cfe0d6; background:#edf6f0; margin-top:16px; border-radius:10px }
+.supervision-artifact { position:fixed; inset:5vh 5vw; z-index:1000; width:90vw; height:90vh; box-sizing:border-box; background:white; border:1px solid #cfe0d6; border-radius:10px; box-shadow:0 0 0 100vmax #142a2366; overflow:auto }
+.supervision-artifact img { display:block; max-width:100%; margin-top:16px }
+.supervision-artifact iframe { width:100%; height:90%; border:0 }
+.supervision-artifact a { margin-left:16px }
+@media(max-width:1200px) { .supervision-grid { grid-template-columns:180px minmax(300px,1fr) } .supervision-inspector { grid-column:1/-1; max-height:none } }
+@media(max-width:700px) { .supervision-page { padding:12px } .supervision-grid,.supervision-create { grid-template-columns:1fr } .supervision-tasks { max-height:220px; overflow:auto } .supervision-heading select { max-width:85vw } .supervision-inspector { grid-column:auto } .supervision-transcript { max-height:60vh } }
+.supervision-message > small { display: block; margin: 6px 0; }
+
+.supervision-role-fields { display: grid; gap: 12px; min-width: 0; }
+.supervision-role-fields fieldset { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0; border: 1px solid var(--border-color, #ddd); border-radius: 8px; }
+.supervision-role-fields label { display: grid; gap: 4px; min-width: 0; }
+.supervision-role-fields input { border: 1px solid #cfe0d6; border-radius: 8px; background: #fff; color: inherit; padding: 8px 11px; font: inherit; }
+.supervision-role-fields input, .supervision-role-fields select { width: 100%; min-width: 0; box-sizing: border-box; }
+@media (max-width: 700px) { .supervision-role-fields fieldset { grid-template-columns: minmax(0, 1fr); } }
+.supervision-profile-dialog { position: fixed; inset: 5vh auto auto 50%; transform: translateX(-50%); z-index: 100; width: min(680px, 92vw); max-height: 88vh; overflow: auto; padding: 1.25rem; border: 1px solid var(--border-color, #777); border-radius: 12px; background: var(--bg-primary, #fff); color: inherit; box-shadow: 0 12px 60px #0005; }
+.supervision-profile-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.supervision-profile-dialog form, .supervision-profile-dialog label { display: grid; gap: .5rem; }
+.supervision-profile-dialog form { gap: .85rem; margin-top: 1rem; }
+.supervision-profile-dialog input, .supervision-profile-dialog select, .supervision-profile-dialog textarea { box-sizing: border-box; width: 100%; min-width: 0; }
+.supervision-profile-list article { display: grid; gap: .5rem; padding: 1rem 0; border-bottom: 1px solid var(--border-color, #aaa); }
+.supervision-workspace-operations { margin: 12px 0; padding: 12px; border: 1px solid #cfe0d6; border-radius: 8px; }
+.supervision-workspace-operations code { overflow-wrap: anywhere; }
+.supervision-workspace-operations > div { padding: 8px 0; border-top: 1px solid #dbe6df; }

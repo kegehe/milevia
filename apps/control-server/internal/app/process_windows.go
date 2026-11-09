@@ -31,6 +31,9 @@ func configureProcessGroup(cmd *exec.Cmd) {
 // 后代进程在后台回收：主进程先走能立刻解开 Wait()，而后代（MCP server、后台 shell、
 // npm 子进程）只是资源回收，晚一点无妨，不值得让调用方陪着等。
 func terminateProcessGroup(cmd *exec.Cmd) {
+	if stopOrdinaryCLICommand(cmd) {
+		return
+	}
 	if cmd == nil || cmd.Process == nil {
 		return
 	}

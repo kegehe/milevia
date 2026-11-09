@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -353,6 +354,10 @@ func (s *Server) rewindConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("automatic orchestration conversations are read-only"))
 		return
 	}
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	// 从这里往下的破坏性部分（退休进程、改工作区、落库）跑在**服务运行时上下文**上，
 	// 不跟 HTTP 请求走：客户端的超时（桌面 15s、手机受 agent 60s 上限）不该把 read-tree
 	// 杀在半路，留下一个改了一半的工作区 + 一个仍然写着"没回退"的库。理由与 deleteConversation
@@ -399,6 +404,11 @@ func (s *Server) rewindConversation(w http.ResponseWriter, r *http.Request) {
 	// （fork 分支自己已经拿了这把锁，且 sync.Mutex 不可重入，所以放在它之后。）
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+
 	if _, found, err := s.activeRunIDForConversation(ctx, conversationID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -601,6 +611,11 @@ func (s *Server) nextCodexTurnID(ctx context.Context, conversationID string, cre
 }
 
 func (s *Server) codexRevertThread(ctx context.Context, projectPath, threadID, beforeTurnID string) error {
+	releaseWorkspace, err := s.beginWorkspaceOperationAtPath(Project{Runner: s.localRunnerID()}, projectPath, "codex-rewind")
+	if err != nil {
+		return err
+	}
+	defer releaseWorkspace()
 	binary := s.config.CodexPath
 	if binary == "" {
 		binary = "codex"
@@ -710,7 +725,7 @@ func (s *Server) forkConversationAtCheckpoint(ctx context.Context, sourceID stri
 	if _, err := tx.ExecContext(ctx, `insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, child.ID, child.ProjectID, child.ClaudeSessionID, child.AgentID, child.AgentSessionID, child.AgentRuntimeID, child.AgentProfileRevisionID, child.ProjectAgentRouteRevisionID, child.ExecutionPolicy, child.Status, child.PermissionMode, child.ModelOverride, child.Title, child.LastActivityAt, false, false, true, child.CreatedAt); err != nil {
 		return Conversation{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `insert into messages (id,conversation_id,run_id,role,content,client_request_id,parent_tool_use_id,created_at) select lower(hex(randomblob(16))),?, '',role,content,'',parent_tool_use_id,created_at from messages where conversation_id=? and created_at<=?`, child.ID, sourceID, checkpoint.CreatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `insert into messages (id,conversation_id,run_id,role,content,client_request_id,parent_tool_use_id,created_at,attachments) select lower(hex(randomblob(16))),?, '',role,content,'',parent_tool_use_id,created_at,attachments from messages where conversation_id=? and created_at<=?`, child.ID, sourceID, checkpoint.CreatedAt); err != nil {
 		return Conversation{}, err
 	}
 	metadata := checkpoint.Metadata
@@ -728,6 +743,13 @@ func (s *Server) forkConversationAtCheckpoint(ctx context.Context, sourceID stri
 }
 
 func (s *Server) createConversationCheckpoint(ctx context.Context, conversationID, runID, prompt string) error {
+	var supervised bool
+	if err := s.db.QueryRowContext(ctx, `select exists(select 1 from supervision_run_links where run_id=?)`, runID).Scan(&supervised); err != nil {
+		return err
+	}
+	if supervised {
+		return nil // 托管证据由专属快照管理，普通 shadow Git 不参与。
+	}
 	// 整个"拍快照 + 写节点行 + 裁旧节点"都在会话锁里：回退会在锁里改节点状态，若节点行能
 	// 在两次状态更新之间插进来，它就是"回退之后的新节点"，会逃过这次回退（而且它的快照可能
 	// 拍在恢复工作区的过程中）。恢复/转换也拿同一把锁（见 checkpointLockSet）。
@@ -894,6 +916,11 @@ func (s *Server) checkpointGitPaths(projectPath, projectRunner, gitDir string) (
 	case "", "windows-local":
 		return projectPath, gitDir, nil
 	case "wsl-local":
+		// The native Linux/WSL service uses wsl-local as its own Runner ID.
+		// Only a Windows controller needs UNC and /mnt path translation.
+		if runtime.GOOS != "windows" {
+			return projectPath, gitDir, nil
+		}
 		runner, ok := s.wslAgentRunner().(*wslAgentRunner)
 		if !ok || runner == nil {
 			return "", "", errors.New("WSL runner is unavailable")
@@ -1042,6 +1069,11 @@ func withCheckpointGitTimeout(runner GitRunner, timeout time.Duration) GitRunner
 }
 
 func (s *Server) createWorkspaceSnapshot(ctx context.Context, projectID, projectPath, projectRunner, conversationID string) (string, string, map[string]any, error) {
+	release, err := s.beginWorkspaceOperationAtPath(Project{ID: projectID, Runner: projectRunner}, projectPath, "checkpoint-create")
+	if err != nil {
+		return "", "", nil, err
+	}
+	defer release()
 	runner, repo, err := s.checkpointGitRunner(ctx, projectID)
 	if err != nil {
 		return "", "", nil, err
@@ -1105,6 +1137,11 @@ func (s *Server) restoreCheckpointCode(ctx context.Context, req checkpointRestor
 		return errors.New("checkpoint workspace unavailable")
 	}
 	req.WorkspacePath = workTree
+	release, err := s.beginWorkspaceOperationAtPath(Project{ID: req.ProjectID, Runner: req.Runner}, workTree, "checkpoint-restore")
+	if err != nil {
+		return err
+	}
+	defer release()
 	switch req.Engine {
 	case checkpointEngineGit, checkpointEngineGitLegacy:
 		return s.restoreGitCheckpointSnapshot(ctx, req)
@@ -1527,7 +1564,7 @@ func (s *Server) contextRebuildPreamble(ctx context.Context, tx *sql.Tx, convers
 	if err != nil || cutoff == nil {
 		return "", err
 	}
-	query := `select role,content from messages where conversation_id=? and parent_tool_use_id='' and role in ('user','assistant')`
+	query := `select role,content,attachments from messages where conversation_id=? and parent_tool_use_id='' and role in ('user','assistant')`
 	args := []any{conversationID}
 	if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
 		query += " and " + clause
@@ -1546,8 +1583,12 @@ func (s *Server) contextRebuildPreamble(ctx context.Context, tx *sql.Tx, convers
 	turns := make([]turn, 0)
 	for rows.Next() {
 		var item turn
-		if err := rows.Scan(&item.role, &item.content); err != nil {
+		var rawAttachments string
+		if err := rows.Scan(&item.role, &item.content, &rawAttachments); err != nil {
 			return "", err
+		}
+		if refs := attachmentReferences(decodeAttachments(rawAttachments)); refs != "" {
+			item.content += "\n" + refs
 		}
 		if strings.TrimSpace(item.content) != "" {
 			turns = append(turns, item)

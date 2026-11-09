@@ -58,7 +58,7 @@ func (b *wslGitBackend) scriptCommand(ctx context.Context, script string) *exec.
 	return cmd
 }
 
-func (b *wslGitBackend) run(ctx context.Context, cmd *exec.Cmd, stdin []byte, label string) ([]byte, error) {
+func (b *wslGitBackend) run(ctx context.Context, cmd *exec.Cmd, stdin []byte, label string, scope ...string) ([]byte, error) {
 	timeout := b.timeout
 	if timeout <= 0 {
 		timeout = gitCommandTimeout
@@ -87,6 +87,7 @@ func (b *wslGitBackend) run(ctx context.Context, cmd *exec.Cmd, stdin []byte, la
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
+		noteWorkspaceWSLExit(b.distro, commandCtx, err, false, scope...)
 		if commandCtx.Err() != nil {
 			return output.Stdout(), commandCtx.Err()
 		}
@@ -98,12 +99,14 @@ func (b *wslGitBackend) run(ctx context.Context, cmd *exec.Cmd, stdin []byte, la
 		}
 		return output.Stdout(), nil
 	case <-commandCtx.Done():
+		noteWorkspaceWSLExit(b.distro, commandCtx, context.Canceled, true, scope...)
 		terminateProcessGroup(cmd)
 		if !waitForGitCommand(cmd, done, gitTerminateWait, gitForceWait) {
 			return output.Stdout(), fmt.Errorf("%w: %v", errGitTerminationTimedOut, commandCtx.Err())
 		}
 		return output.Stdout(), commandCtx.Err()
 	case <-output.Overflowed():
+		noteWorkspaceWSLExit(b.distro, commandCtx, context.Canceled, true, scope...)
 		terminateProcessGroup(cmd)
 		if !waitForGitCommand(cmd, done, gitTerminateWait, gitForceWait) {
 			return output.Stdout(), errGitTerminationTimedOut
@@ -117,7 +120,7 @@ func (b *wslGitBackend) runGit(ctx context.Context, repo string, args ...string)
 	if err != nil {
 		return nil, err
 	}
-	return b.run(ctx, cmd, nil, gitFirstArg(args))
+	return b.run(ctx, cmd, nil, gitFirstArg(args), repo)
 }
 
 func (b *wslGitBackend) runGitPaths(ctx context.Context, repo string, args, paths []string) ([]byte, error) {
@@ -131,7 +134,7 @@ func (b *wslGitBackend) runGitPaths(ctx context.Context, repo string, args, path
 	if err != nil {
 		return nil, err
 	}
-	return b.run(ctx, cmd, []byte(strings.Join(paths, "\x00")+"\x00"), gitFirstArg(args))
+	return b.run(ctx, cmd, []byte(strings.Join(paths, "\x00")+"\x00"), gitFirstArg(args), repo)
 }
 
 func (b *wslGitBackend) runGitStdin(ctx context.Context, repo string, args []string, stdin []byte) ([]byte, error) {
@@ -139,7 +142,7 @@ func (b *wslGitBackend) runGitStdin(ctx context.Context, repo string, args []str
 	if err != nil {
 		return nil, err
 	}
-	return b.run(ctx, cmd, stdin, gitFirstArg(args))
+	return b.run(ctx, cmd, stdin, gitFirstArg(args), repo)
 }
 
 func (b *wslGitBackend) writeTempFile(content []byte) (string, func(), error) {
@@ -155,7 +158,7 @@ func (b *wslGitBackend) lstat(repo, rel string) (os.FileMode, int64, int64, int6
 		return 0, 0, 0, 0, err
 	}
 	path := wslInnerToken(linuxRepo + "/" + rel)
-	out, err := b.runScript(context.Background(), "stat -c '%f %s %Y' -- "+path, "stat")
+	out, err := b.runScript(context.Background(), "stat -c '%f %s %Y' -- "+path, "stat", repo)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
@@ -212,7 +215,7 @@ func (b *wslGitBackend) GitChangeFingerprints(ctx context.Context, repo string, 
 		path := wslInnerToken(linuxRepo + "/" + change.Path)
 		fmt.Fprintf(&script, "printf '%d:'; stat -c '%%f %%s %%Y' -- %s 2>/dev/null || printf 'missing'; printf '\\n';", index, path)
 	}
-	out, err := b.runScript(ctx, script.String(), "stat")
+	out, err := b.runScript(ctx, script.String(), "stat", repo)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +254,7 @@ func (b *wslGitBackend) readFile(repo, rel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return b.runScript(context.Background(), "cat -- "+wslInnerToken(linuxRepo+"/"+rel), "cat")
+	return b.runScript(context.Background(), "cat -- "+wslInnerToken(linuxRepo+"/"+rel), "cat", repo)
 }
 
 func (b *wslGitBackend) writeFile(repo, rel string, content []byte) error {
@@ -263,7 +266,7 @@ func (b *wslGitBackend) writeFile(repo, rel string, content []byte) error {
 		return err
 	}
 	path := wslInnerToken(linuxRepo + "/" + rel)
-	_, err = b.runScriptWithStdin(context.Background(), "test ! -L "+path+" && cat > "+path, content, "write")
+	_, err = b.runScriptWithStdin(context.Background(), "test ! -L "+path+" && cat > "+path, content, "write", repo)
 	return err
 }
 
@@ -272,7 +275,7 @@ func (b *wslGitBackend) validateUntrackedRemoval(repo string, paths []string) er
 	if err != nil {
 		return err
 	}
-	_, err = b.runScript(context.Background(), script, "validate removal")
+	_, err = b.runScript(context.Background(), script, "validate removal", repo)
 	return err
 }
 
@@ -292,7 +295,7 @@ func (b *wslGitBackend) removeUntracked(repo string, paths []string) error {
 		path := wslInnerToken(linuxRepo + "/" + rel)
 		parts = append(parts, "test ! -L "+path+" && rm -rf -- "+path+" && test ! -e "+path)
 	}
-	_, err = b.runScript(context.Background(), strings.Join(parts, " && "), "remove")
+	_, err = b.runScript(context.Background(), strings.Join(parts, " && "), "remove", repo)
 	if err != nil {
 		return fmt.Errorf("%w: %v", errGitPartiallyApplied, err)
 	}
@@ -315,12 +318,12 @@ func (b *wslGitBackend) pathChecks(repo string, paths []string, check string) (s
 	return strings.Join(parts, " && "), nil
 }
 
-func (b *wslGitBackend) runScript(ctx context.Context, script, label string) ([]byte, error) {
-	return b.run(ctx, b.scriptCommand(ctx, script), nil, label)
+func (b *wslGitBackend) runScript(ctx context.Context, script, label string, scope ...string) ([]byte, error) {
+	return b.run(ctx, b.scriptCommand(ctx, script), nil, label, scope...)
 }
 
-func (b *wslGitBackend) runScriptWithStdin(ctx context.Context, script string, stdin []byte, label string) ([]byte, error) {
-	return b.run(ctx, b.scriptCommand(ctx, script), stdin, label)
+func (b *wslGitBackend) runScriptWithStdin(ctx context.Context, script string, stdin []byte, label string, scope ...string) ([]byte, error) {
+	return b.run(ctx, b.scriptCommand(ctx, script), stdin, label, scope...)
 }
 
 var _ gitBackend = (*wslGitBackend)(nil)

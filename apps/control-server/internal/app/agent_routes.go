@@ -36,7 +36,7 @@ func (s *Server) resolveAgent(ctx context.Context, runnerID, agentID string) (Ru
 		// 对本机 Claude 会返回 nil，下面照常报错。
 		meta = RunnerMeta{ID: runnerID, Name: runnerID, Environment: "local"}
 	}
-	backend, unsupportedReason := s.agentBackend(meta, entry)
+	backend, unsupportedReason := s.agentManagementBackend(meta, entry)
 	if unsupportedReason != "" {
 		return RunnerMeta{}, AgentCatalogEntry{}, nil, errors.New(unsupportedReason)
 	}

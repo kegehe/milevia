@@ -67,6 +67,10 @@ func (s *Server) probeAgentsUncached(ctx context.Context, meta RunnerMeta) []Age
 // probeAgent 探测单个工具。
 func (s *Server) probeAgent(ctx context.Context, meta RunnerMeta, entry AgentCatalogEntry) AgentStatus {
 	backend, unsupportedReason := s.agentBackend(meta, entry)
+	return s.probeAgentBackend(ctx, meta, entry, backend, unsupportedReason)
+}
+
+func (s *Server) probeAgentBackend(ctx context.Context, meta RunnerMeta, entry AgentCatalogEntry, backend AgentRunner, unsupportedReason string) AgentStatus {
 	if unsupportedReason != "" {
 		// "这个环境不提供该工具"与"提供了但没装"是两件事：前者要用户换环境，
 		// 后者要用户去安装。这一档也不能被更新状态盖掉 —— 没人会在不支持它的
@@ -108,6 +112,19 @@ func (s *Server) probeAgent(ctx context.Context, meta RunnerMeta, entry AgentCat
 	return AgentStatus{ID: entry.ID, Status: status, Version: version, Reason: reason}
 }
 
+// Management may inspect/update a CLI even when its conversation adapter has
+// not been implemented. Keep agentBackend/probeAgents strict for session UIs.
+func (s *Server) agentManagementBackend(meta RunnerMeta, entry AgentCatalogEntry) (AgentRunner, string) {
+	if entry.ID == "cursor" && !isLocalRunnerID(meta.ID) && s.runnerRegistry != nil {
+		if runner, ok := s.runnerRegistry.get(meta.ID); ok {
+			if shell, ok := runner.(crossShellRunner); ok {
+				return &catalogAgentBackend{entry: entry, shell: shell}, ""
+			}
+		}
+	}
+	return s.agentBackend(meta, entry)
+}
+
 // agentBackend 选出"在这个 Runner 上执行该工具"的后端。
 //
 // 返回 nil 表示探测不了，第二项是给用户的原因（空串 = 运行器自身未注册，
@@ -120,8 +137,7 @@ func (s *Server) probeAgent(ctx context.Context, meta RunnerMeta, entry AgentCat
 //	   Cursor 走一次性 JSONL，CodeBuddy 与 Qoder 走 stream-json 会话）。这是结构差异，
 //	   不是"哪个工具特殊"。
 //	② Codex / Claude 这两个**真有额外语义**的走特化：
-//	   - Codex 的"就绪"要看登录态（`codex login status`），仅测能不能报版本会把
-//	     "装了但没登录"报成就绪；
+//	   - Codex 通过 CodexCapableRunner 调用自己的执行与探测面；认证由独立接口查询；
 //	   - Claude 的跨端探测键（claude-version / `claude auth status`）与读数缓存已被
 //	     WSL 的保活唤醒（refreshFailedProbes）依赖着，改走目录驱动会另起一套探测键
 //	     （同一件事探两遍），并把就绪判据从"登录态"放宽成"能报版本"。

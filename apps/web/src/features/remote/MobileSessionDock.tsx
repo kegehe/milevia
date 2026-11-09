@@ -68,13 +68,15 @@ export function MobileApprovalCard({ detail, busy, onDecide }: {
   </section>;
 }
 
-export function MobileModelSheet({ models, busy, onClose, onSelect }: {
+export function MobileModelSheet({ models, busy, onClose, onSelect, onReasoning }: {
   models: ConversationModels | null;
   busy: boolean;
   onClose: () => void;
   onSelect: (model: string) => void;
+  onReasoning?: (effort: string) => void;
 }) {
   const [custom, setCustom] = useState("");
+  const [variant, setVariant] = useState("");
   const options = models?.models || [];
   const current = models?.selected || models?.effective || "";
   return <div className="mobile-sheet-backdrop" role="dialog" aria-modal="true" aria-labelledby="mobile-model-title" onClick={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
@@ -82,6 +84,8 @@ export function MobileModelSheet({ models, busy, onClose, onSelect }: {
       <header><h2 id="mobile-model-title">切换模型</h2><button type="button" onClick={onClose} disabled={busy} aria-label="关闭">×</button></header>
       <p className="mobile-sheet-note">{models?.note || "切换后下一条消息生效。会话正在运行时不能换。"}</p>
       {current && <p className="mobile-sheet-current">当前模型：<b>{current}</b></p>}
+      {onReasoning && Boolean(models?.reasoningOptions?.length) && <label>推理强度<select disabled={busy} value={models?.reasoningEffort || ""} onChange={(event) => onReasoning(event.target.value)}><option value="">默认</option>{models?.reasoningEffort && !models.reasoningOptions?.includes(models.reasoningEffort) && <option value={models.reasoningEffort}>{models.reasoningEffort}</option>}{models?.reasoningOptions?.map((value) => <option value={value} key={value}>{value}</option>)}</select></label>}
+      {onReasoning && models?.reasoningCustomAllowed && <form className="mobile-sheet-custom" onSubmit={(event) => { event.preventDefault(); if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(variant)) onReasoning(variant); }}><label>自定义 variant（{models.reasoningEffort || "默认"}）<input value={variant} maxLength={64} disabled={busy} onChange={(event) => setVariant(event.target.value)} /></label><button type="submit" disabled={busy || !variant}>使用</button></form>}
       <div className="mobile-sheet-list">
         {options.map((option) => <button type="button" key={option.id} disabled={busy} className={current === option.id ? "selected" : ""} onClick={() => onSelect(option.id)}>
           <b>{option.label || option.id}</b>

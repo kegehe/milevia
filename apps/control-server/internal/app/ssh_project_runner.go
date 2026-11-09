@@ -49,7 +49,7 @@ type sshProjectRunner struct {
 	status      RunStatus
 	retired     bool
 	startedAt   time.Time
-	session     *ssh.Session
+	session     *workspaceSSHSession
 	exitChan    chan struct{}
 	exitCode    int
 	hasExitCode bool
@@ -64,8 +64,9 @@ type sshProjectRunner struct {
 	opMu sync.Mutex
 	mu   sync.RWMutex
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx                context.Context
+	cancel             context.CancelFunc
+	workspaceAdmission func(string) (func(), error)
 }
 
 func newSSHProjectRunner(projectID string, client *sshClient, rootPath string, broadcast logBroadcaster) *sshProjectRunner {
@@ -223,8 +224,30 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 	pr.hasExitCode = false
 	pr.mu.Unlock()
 
+	// The HTTP request guard ends when Start returns. The process needs its own
+	// token until the target's actual exit is observed.
+	releaseWorkspace := func() {}
+	if pr.workspaceAdmission != nil {
+		var err error
+		releaseWorkspace, err = pr.workspaceAdmission(pr.rootPath)
+		if err != nil {
+			pr.mu.Lock()
+			pr.status = RunStatusFailed
+			close(pr.exitChan)
+			pr.mu.Unlock()
+			pr.emitStatus(RunStatusEvent{ProjectID: pr.projectID, Status: RunStatusFailed})
+			return err
+		}
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseWorkspace()
+		}
+	}()
+
 	pr.ctx, pr.cancel = context.WithCancel(parentCtx)
-	session, err := pr.client.newSession(pr.ctx)
+	session, err := pr.client.newSession(pr.ctx, pr.rootPath)
 	if err != nil {
 		pr.cancel()
 		pr.mu.Lock()
@@ -321,7 +344,8 @@ func (pr *sshProjectRunner) start(parentCtx context.Context, projectPath string)
 		pipeReaders.Wait()
 		close(pipeReadersDone)
 	}()
-	go pr.wait(session, pipeReadersDone, gen)
+	transferred = true
+	go pr.wait(session, pipeReadersDone, gen, releaseWorkspace)
 	return nil
 }
 
@@ -337,16 +361,19 @@ func (pr *sshProjectRunner) readPipe(r io.Reader, stream string) {
 	}
 }
 
-func (pr *sshProjectRunner) wait(session *ssh.Session, pipeReadersDone <-chan struct{}, gen uint64) {
+func (pr *sshProjectRunner) wait(session *workspaceSSHSession, pipeReadersDone <-chan struct{}, gen uint64, releaseWorkspace func()) {
 	<-pipeReadersDone
 	err := session.Wait()
+	if session.WorkspaceExitConfirmed() {
+		releaseWorkspace()
+	}
 	// 尽力清理本代次 pidfile（异步，不阻塞状态切换与 stop() 返回）。路径按 gen 唯一，
 	// 只删自己的文件，不影响后续运行；连接异常时静默失败，残留文件无害。
 	pidfile := remoteRunPIDFile(pr.projectID, gen)
 	go func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		_, _ = pr.client.execCommand(cleanupCtx, "rm -f -- "+shellQuote(pidfile))
+		_, _ = pr.client.execCommand(workspaceCommandContext(cleanupCtx, pr.rootPath), "rm -f -- "+shellQuote(pidfile))
 	}()
 
 	pr.mu.Lock()
@@ -431,7 +458,7 @@ func (pr *sshProjectRunner) stop() error {
 	}
 	if killCmd := remoteProcessGroupKillCommand(pidfile); killCmd != "" {
 		killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_, _ = pr.client.execCommand(killCtx, killCmd)
+		_, _ = pr.client.execCommand(workspaceCommandContext(killCtx, pr.rootPath), killCmd)
 		killCancel()
 	}
 	_ = session.Signal(ssh.SIGKILL)

@@ -168,7 +168,11 @@ func (s *Server) listRunnerAgents(w http.ResponseWriter, r *http.Request) {
 		entry, known := agentByID(status.ID)
 		var backend AgentRunner
 		if known {
-			backend, _ = s.agentBackend(meta, entry)
+			var reason string
+			backend, reason = s.agentManagementBackend(meta, entry)
+			if entry.ID == "cursor" && !isLocalRunnerID(meta.ID) {
+				status = s.probeAgentBackend(r.Context(), meta, entry, backend, reason)
+			}
 		}
 		item := runnerAgentView{
 			ID:              status.ID,

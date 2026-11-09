@@ -5,6 +5,7 @@ import "./style.css";
 import "./markdown.css";
 import "./notification.css";
 import "./components/context-menu.css";
+import "./features/files/message-attachments.css";
 import { App } from "./App";
 import { getDesktopRuntime, isDesktop } from "./lib/runtime";
 import { purgeServiceWorkerState, serviceWorkerPolicy } from "./lib/service-worker";

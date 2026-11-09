@@ -184,7 +184,7 @@ func TestDiscoverLocalSkillRootsWSL(t *testing.T) {
 		t.Helper()
 		// 只比对 absPath，其它字段在每个分支断言。
 		if len(roots) != len(want) {
-			t.Fatalf("root count: got %d %v, want %d (user+plugin+project)", len(roots), roots, len(want))
+			t.Fatalf("root count: got %d %v, want %d", len(roots), roots, len(want))
 		}
 		for i, r := range roots {
 			if !strings.EqualFold(r.absPath, want[i]) {
@@ -196,25 +196,32 @@ func TestDiscoverLocalSkillRootsWSL(t *testing.T) {
 	// 有 WSL home：用户级 + 插件 + 项目级。
 	s := &Server{wslDistro: "Ubuntu", wslHome: "/home/tangmaoke"}
 	roots := s.discoverLocalSkillRoots(agentTargetEnvWSL, proj)
-	assertRoots(t, roots, []string{
-		`\\wsl$\Ubuntu\home\tangmaoke\.claude\skills`,
-		`\\wsl$\Ubuntu\home\tangmaoke\.codex\skills`,
-		`\\wsl$\Ubuntu\home\tangmaoke\.claude\plugins`,
-		`\\wsl$\Ubuntu\home\tangmaoke\work\app\.claude\skills`,
-		`\\wsl$\Ubuntu\home\tangmaoke\work\app\.codex\skills`,
-	})
+	wantPaths := make([]string, 0, len(skillDirectories)+len(pluginDirectories)+len(skillDirectories))
+	for _, d := range skillDirectories {
+		wantPaths = append(wantPaths, filepath.Join(`\\wsl$\Ubuntu\home\tangmaoke`, filepath.FromSlash(d.user)))
+	}
+	for _, d := range pluginDirectories {
+		wantPaths = append(wantPaths, filepath.Join(`\\wsl$\Ubuntu\home\tangmaoke`, filepath.FromSlash(d.root)))
+	}
+	for _, d := range skillDirectories {
+		wantPaths = append(wantPaths, filepath.Join(proj, filepath.FromSlash(d.project)))
+	}
+	assertRoots(t, roots, wantPaths)
 	// 来源 / 优先级 / 环境逐项校验。
 	type wantRoot struct {
 		source string
 		agent  string
 		plugin bool
 	}
-	wants := []wantRoot{
-		{skillSourceUser, skillAgentClaude, false},
-		{skillSourceUser, skillAgentCodex, false},
-		{skillSourcePlugin, skillAgentClaude, true},
-		{skillSourceProject, skillAgentClaude, false},
-		{skillSourceProject, skillAgentCodex, false},
+	wants := make([]wantRoot, 0, len(roots))
+	for _, d := range skillDirectories {
+		wants = append(wants, wantRoot{skillSourceUser, d.agent, false})
+	}
+	for _, d := range pluginDirectories {
+		wants = append(wants, wantRoot{skillSourcePlugin, d.agent, true})
+	}
+	for _, d := range skillDirectories {
+		wants = append(wants, wantRoot{skillSourceProject, d.agent, false})
 	}
 	for i, r := range roots {
 		if r.source != wants[i].source || r.agent != wants[i].agent || r.pluginRoot != wants[i].plugin || r.env != "wsl" {
@@ -232,7 +239,7 @@ func TestDiscoverLocalSkillRootsWSL(t *testing.T) {
 	// 无 WSL home：退化为仅项目级（回归现状）。
 	s0 := &Server{}
 	roots0 := s0.discoverLocalSkillRoots(agentTargetEnvWSL, proj)
-	if len(roots0) != 2 || roots0[0].source != skillSourceProject || roots0[1].source != skillSourceProject {
+	if len(roots0) != len(skillDirectories) || roots0[0].source != skillSourceProject || roots0[len(roots0)-1].source != skillSourceProject {
 		t.Fatalf("no-WSL-home roots: got %+v, want only project roots", roots0)
 	}
 }
@@ -263,12 +270,12 @@ func TestParseRemoteSkillOutput(t *testing.T) {
 	skills := parseRemoteSkillOutput(output, home, proj, "")
 	byName := map[string]Skill{}
 	for _, sk := range skills {
-		byName[sk.Name] = sk
+		byName[sk.Agent+":"+sk.Name] = sk
 	}
-	if sk, ok := byName["alpha"]; !ok || sk.Agent != skillAgentClaude || sk.Source != skillSourceUser || sk.Env != "remote-linux" {
+	if sk, ok := byName[skillAgentClaude+":alpha"]; !ok || sk.Agent != skillAgentClaude || sk.Source != skillSourceUser || sk.Env != "remote-linux" {
 		t.Errorf("alpha: %+v", sk)
 	}
-	if sk, ok := byName["beta"]; !ok || sk.Agent != skillAgentCodex || sk.Source != skillSourceProject {
+	if sk, ok := byName[skillAgentCodex+":beta"]; !ok || sk.Agent != skillAgentCodex || sk.Source != skillSourceProject {
 		t.Errorf("beta: %+v", sk)
 	}
 	// 按 agentID 过滤。
@@ -320,6 +327,28 @@ func TestSkillAgentAndSourceForRemotePath(t *testing.T) {
 	}
 	if got := skillSourceForRemotePath(home+"/.claude/skills/x/SKILL.md", home, proj); got != skillSourceUser {
 		t.Errorf("user source: got %q", got)
+	}
+}
+
+func TestRemoteSkillsUseAnchoredRootsAndNativePriority(t *testing.T) {
+	for _, project := range []string{"/srv/plugins/app", "/home/u/.claude/skills/app"} {
+		output := remoteSkillOutputMarker + project + "/.cursor/skills/x/SKILL.md\n---\nname: x\ndescription: native\n---\n"
+		got := parseRemoteSkillOutput(output, "/home/u", project, "")
+		if len(got) != 1 || got[0].Agent != "cursor" || got[0].Source != skillSourceProject {
+			t.Errorf("project %s: %+v", project, got)
+		}
+	}
+	// Discovery output order must not decide which directory overrides a compatibility root.
+	project := "/srv/app"
+	output := remoteSkillOutputMarker + project + "/.cursor/skills/x/SKILL.md\n---\nname: x\ndescription: native\n---\n" +
+		remoteSkillOutputMarker + project + "/.claude/skills/x/SKILL.md\n---\nname: x\ndescription: compatibility\n---\n"
+	got := parseRemoteSkillOutput(output, "/home/u", project, "cursor")
+	if len(got) != 1 || got[0].Description != "native" {
+		t.Errorf("native directory should win: %+v", got)
+	}
+	output = remoteSkillOutputMarker + "/elsewhere/.cursor/skills/x/SKILL.md\n---\nname: x\n---\n"
+	if got := parseRemoteSkillOutput(output, "/home/u", project, ""); len(got) != 0 {
+		t.Errorf("unscanned root accepted: %+v", got)
 	}
 }
 

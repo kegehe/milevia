@@ -14,6 +14,8 @@ import "../run-indicator.css";
 import "../tasks.css";
 import "../git.css";
 import "../run.css";
+import { MessageAttachmentPicker, uploadMessageFiles } from "../features/files/MessageAttachments";
+import { attachmentMessageBody, mergeMessageAttachments, readAttachmentDraft } from "../features/files/message-attachment-model";
 import { TaskQueue } from "../features/tasks/TaskQueue";
 import { ProjectAiConfigDialog } from "../features/run/ProjectAiConfigDialog";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -22,7 +24,7 @@ import { agentLogoKey } from "../lib/cli-tools-view";
 import { useProjectContext } from "../stores/useProjectStore";
 import { useUIPreferences, type AppPreferences } from "../stores/useUIPreferences";
 import type {
-  Conversation, Message, Event, Shortcut, ShortcutEditorState,
+  Conversation, Message, MessageAttachment, Event, Shortcut, ShortcutEditorState,
   ConversationWorkspace,
   ConversationCheckpoint,
   PermissionMode, AgentID, AgentStatus, TimelineItem, ToolAction, AgentNode, AgentLog,
@@ -529,11 +531,15 @@ function ConversationClearIcon({ running = false }: { running?: boolean }) {
 // 由控制服务在下一次运行时以 --model / -c model= 注入；切换模型会让长驻会话按新模型重启，
 // 因此运行中禁用入口（与权限菜单一致）。
 // 弹层用 portal + fixed 定位：移动端 .composer-usage 有 overflow-x:auto，内联绝对定位会被裁掉。
-function ComposerModelPicker({ conversationID, agentID, selected, displayed, disabled, runActive, busy, onSelect, onFail }: { conversationID: string; agentID: AgentID; selected: string; displayed: string; disabled: boolean; runActive: boolean; busy: boolean; onSelect: (model: string) => Promise<boolean>; onFail: (message: string) => void }) {
+function ComposerModelPicker({ conversationID, agentID, selected, displayed, disabled, runActive, busy: modelBusy, onSelect, onFail }: { conversationID: string; agentID: AgentID; selected: string; displayed: string; disabled: boolean; runActive: boolean; busy: boolean; onSelect: (model: string) => Promise<boolean>; onFail: (message: string) => void }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [view, setView] = useState<ConversationModels | null>(null);
   const [custom, setCustom] = useState("");
+  const [customVariant, setCustomVariant] = useState("");
+  const [reasoningBusy, setReasoningBusy] = useState(false);
+  const reasoningInFlight = useRef(false);
+  const busy = modelBusy || reasoningBusy;
   const [position, setPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -543,6 +549,7 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
   const buttonModel = selected || view?.effective || displayed;
 
   useEffect(() => {
+    if (agentID === "opencode" || agentID === "qoder") return;
     let cancelled = false;
     void api<ConversationModels>(`/api/conversations/${conversationID}/models`).then((data) => {
       if (!cancelled) setView(data);
@@ -550,7 +557,7 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
       // 打开菜单时会再次请求并显示错误；预取失败不打扰当前对话。
     });
     return () => { cancelled = true; };
-  }, [conversationID]);
+  }, [conversationID, agentID]);
 
   // 打开时定位：弹层贴在触发按钮上方，宽度按视口收敛，避免贴边溢出。
   const placeMenu = useCallback(() => {
@@ -629,6 +636,22 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
     if (ok) { setCustom(""); close(); }
   };
 
+  const chooseReasoning = async (effort: string) => {
+    if (busy || disabled || runActive || reasoningInFlight.current) return;
+    reasoningInFlight.current = true;
+    setReasoningBusy(true);
+    const seq = requestSeq.current;
+    try {
+      await api(`/api/conversations/${conversationID}/reasoning-effort`, { method: "POST", body: JSON.stringify({ reasoningEffort: effort }) });
+      if (seq === requestSeq.current) setView((current) => current ? { ...current, reasoningEffort: effort } : current);
+    } catch (cause) {
+      if (seq === requestSeq.current) onFail(cause instanceof Error ? cause.message : "推理强度切换失败");
+    } finally {
+      reasoningInFlight.current = false;
+      setReasoningBusy(false);
+    }
+  };
+
   const selectedLabel = selected || view?.effective || "";
   // 候选项可能整个缺席：服务端把"该工具没有模型目录"（CodeBuddy）表示成空目录，而
   // Go 的 nil 切片会序列化成 null —— 只把可选链挂在外层对象上、随后直接读字段的
@@ -656,7 +679,8 @@ function ComposerModelPicker({ conversationID, agentID, selected, displayed, dis
           <div><input id="composer-model-custom" value={custom} maxLength={128} placeholder="例如 opus、claude-opus-5、gpt-5.6-sol" disabled={busy} onChange={(event) => setCustom(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && customValid && !busy) { event.preventDefault(); void choose(custom.trim()); } }} /><button type="button" className="primary" disabled={busy || !customValid} onClick={() => void choose(custom.trim())}>{busy ? "切换中" : "使用"}</button></div>
         </div>
         {selectedLabel && <p className="model-menu-current">当前模型：<b>{selectedLabel}</b></p>}
-        {(view?.reasoningOptions?.length ?? 0) > 0 && <label className="model-menu-effort">推理强度<select value={view?.reasoningEffort || ""} disabled={busy} onChange={async (event) => { const effort = event.target.value; try { await api(`/api/conversations/${conversationID}/reasoning-effort`, { method: "POST", body: JSON.stringify({ reasoningEffort: effort }) }); setView((current) => current ? { ...current, reasoningEffort: effort } : current); } catch (cause) { onFail(cause instanceof Error ? cause.message : "推理强度切换失败"); } }}><option value="">默认强度</option>{view?.reasoningOptions?.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>}
+        {(view?.reasoningOptions?.length ?? 0) > 0 && <label className="model-menu-effort">推理强度<select value={view?.reasoningEffort || ""} disabled={busy} onChange={(event) => void chooseReasoning(event.target.value)}><option value="">默认强度</option>{view?.reasoningEffort && !view.reasoningOptions?.includes(view.reasoningEffort) && <option value={view.reasoningEffort}>{view.reasoningEffort}</option>}{view?.reasoningOptions?.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>}
+        {view?.reasoningCustomAllowed && <div className="model-menu-custom"><label htmlFor="composer-custom-variant">自定义 variant（{view.reasoningEffort || "默认"}）</label><div><input id="composer-custom-variant" value={customVariant} maxLength={64} disabled={busy} placeholder="以当前模型的配置为准" onChange={(event) => setCustomVariant(event.target.value)} /><button type="button" disabled={busy || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(customVariant)} onClick={() => void chooseReasoning(customVariant)}>使用</button></div></div>}
         {view?.note && <p className="model-menu-note">{view.note}</p>}
         <p className="model-menu-hint">切换后下一条消息生效，本会话内持续有效；仅影响模型，不影响凭据与权限。</p>
       </>}
@@ -1545,8 +1569,8 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail, checkpoi
   const agentName = agentDisplayName(agentID);
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<number | null>(null);
-  const contentRef = useRef(message.content);
-  contentRef.current = message.content;
+  const contentRef = useRef(attachmentMessageBody(message));
+  contentRef.current = attachmentMessageBody(message);
   const { openMenu, menu } = useContextMenu();
 
   useEffect(() => () => {
@@ -1576,7 +1600,7 @@ const MessageCard = memo(function MessageCard({ message, agentID, fail, checkpoi
       { label: "复制选中内容", disabled: !selection, action: () => void copy(selection) },
       { label: "复制消息", action: () => void copy() },
     ]);
-  }}>{menu}<header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={message.content} /></div><div className="message-actions" data-keep={persistent ? "" : undefined}><button type="button" className={`message-copy reveal${copied ? " copied" : ""}`} title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()}>{copied ? <CopyDoneIcon /> : <CopyIcon />}</button>{copied && <span className="copy-feedback" role="status">已复制</span>}{checkpoint && rewind && <button type="button" className="message-rewind reveal" disabled={rewindDisabled || checkpointBusy} title={rewindTitle} aria-label="回退到此处" onClick={() => rewind(checkpoint)}><RewindInlineIcon /></button>}{checkpoint && notes && <small className="reveal">{notes}</small>}{!checkpoint && checkpointRunning && <span className="checkpoint-pending">本轮结束后可回退到此处</span>}</div></article>;
+  }}>{menu}<header><span className="message-avatar">{isUser ? "你" : agentName.slice(0, 1).toUpperCase()}</span><b>{isUser ? "你" : agentName}</b><time>{formatTime(message.createdAt)}</time></header><div className="markdown"><Markdown content={[message.content, ...(message.attachments || []).map((a) => `@${a.path}`)].filter(Boolean).join("\n\n")} /></div><div className="message-actions" data-keep={persistent ? "" : undefined}><button type="button" className={`message-copy reveal${copied ? " copied" : ""}`} title={copied ? "已复制" : "复制消息"} aria-label={copied ? "已复制消息" : "复制消息"} onClick={() => void copy()}>{copied ? <CopyDoneIcon /> : <CopyIcon />}</button>{copied && <span className="copy-feedback" role="status">已复制</span>}{checkpoint && rewind && <button type="button" className="message-rewind reveal" disabled={rewindDisabled || checkpointBusy} title={rewindTitle} aria-label="回退到此处" onClick={() => rewind(checkpoint)}><RewindInlineIcon /></button>}{checkpoint && notes && <small className="reveal">{notes}</small>}{!checkpoint && checkpointRunning && <span className="checkpoint-pending">本轮结束后可回退到此处</span>}</div></article>;
 });
 
 const SystemCard = memo(function SystemCard({ system }: { system: SystemItem }) {
@@ -2159,12 +2183,14 @@ export default function ConversationPage() {
   }, [archiveWorkspaceID, conversationWorkspaces]);
 
   const createIsolatedWorkspace = async () => {
-    if (!conversation || workspaceBusy || run || clearing || stopping || handingOff || readOnlyConversation) return;
+    if (!conversation || workspaceBusy || attachmentBusy || pendingSendContent !== null || run || clearing || stopping || handingOff || readOnlyConversation) return;
     setWorkspaceBusy(true);
     try {
       const workspace = await projectApi<ConversationWorkspace>(`/api/conversations/${conversation.id}/workspaces`, { method: "POST" });
       if (!workspace) return;
       await projectApi(`/api/conversations/${conversation.id}/workspaces/${workspace.id}/activate`, { method: "POST" });
+      updateAttachments([]);
+      if (conversationRef.current?.id !== conversation.id) return;
       setConversationWorkspaces((items) => [
         { ...workspace, active: true },
         ...items.filter((item) => item.id !== workspace.id).map((item) => ({ ...item, active: false })),
@@ -2178,10 +2204,12 @@ export default function ConversationPage() {
   };
 
   const activateWorkspace = async (workspace: ConversationWorkspace) => {
-    if (!conversation || workspaceBusy || workspace.active || run || clearing || stopping || handingOff || readOnlyConversation) return;
+    if (!conversation || workspaceBusy || attachmentBusy || pendingSendContent !== null || workspace.active || run || clearing || stopping || handingOff || readOnlyConversation) return;
     setWorkspaceBusy(true);
     try {
       await projectApi(`/api/conversations/${conversation.id}/workspaces/${workspace.id}/activate`, { method: "POST" });
+      updateAttachments([]);
+      if (conversationRef.current?.id !== conversation.id) return;
       setConversationWorkspaces((items) => items.map((item) => ({ ...item, active: item.id === workspace.id })));
       setConversationWorkspaceLabels((current) => ({ ...current, [conversation.id]: workspace.mode === "isolated_worktree" ? `工作区 #${workspace.generation}` : "项目工作区" }));
     } catch (cause) {
@@ -2375,6 +2403,8 @@ export default function ConversationPage() {
   const [usage, setUsage] = useState<ConversationUsageResponse | null>(null);
   const [shortcuts, setShortcuts] = useState<Shortcut[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
+  const [plugins, setPlugins] = useState<{name:string; version?:string; description?:string; status:string}[]>([]);
+  const [pluginsNote, setPluginsNote] = useState("");
   const [skillsLoading, setSkillsLoading] = useState(false);
   // 常用命令目录（GET /api/projects/{id}/commands，见 docs/37）。命令标签据此标注
   // "当前 CLI 未提供"，命令选择器据此列出可选命令。
@@ -2388,6 +2418,37 @@ export default function ConversationPage() {
   // 现在记成一颗可删除的胶囊，发送那一刻才由 composeSkillMessage 展开成完整引用指令 ——
   // 发出去的文本与旧实现逐字一致，变的只是"用户在输入框里看到什么"。
   const [skillRefs, setSkillRefs] = useState<Skill[]>([]);
+  const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const pasteUploadRef = useRef<AbortController | null>(null);
+  const attachmentConversationRef = useRef("");
+  const pendingSendAttachmentsRef = useRef<MessageAttachment[]>([]);
+  const attachmentRequest = useCallback(<T,>(path: string, init?: RequestInit): Promise<T> => {
+    const url = new URL(path, window.location.origin);
+    if (conversation?.id) url.searchParams.set("conversationId", conversation.id);
+    return projectApi<T>(url.pathname + url.search, init);
+  }, [projectApi, conversation?.id]);
+  useEffect(() => {
+    const id = conversation?.id || "";
+    attachmentConversationRef.current = id;
+    if (!projectId || !id) { setAttachments([]); return; }
+    try { setAttachments(readAttachmentDraft(localStorage.getItem(`milevia-attachments:${projectId}:${id}`))); }
+    catch { setAttachments([]); }
+    return () => { pasteUploadRef.current?.abort(); pasteUploadRef.current = null; setAttachmentBusy(false); };
+  }, [projectId, conversation?.id]);
+  const updateAttachments = (next: MessageAttachment[]) => {
+    if (attachmentConversationRef.current === conversation?.id) {
+      attachmentsRef.current = next;
+      setAttachments(next);
+    }
+    try { if (projectId && conversation?.id) localStorage.setItem(`milevia-attachments:${projectId}:${conversation.id}`, JSON.stringify(next)); } catch { /* Draft persistence is optional. */ }
+  };
+  const addAttachments = (added: MessageAttachment[]) => {
+    if (attachmentConversationRef.current !== conversation?.id) return;
+    updateAttachments(mergeMessageAttachments(attachmentsRef.current, added));
+  };
   // 侧栏模块（常用提示词+常用命令合并为一个整体折叠、技能、任务队列）的折叠状态，按项目持久化。
   // state 记录它属于哪个项目，持久化 effect 只在项目一致时才写回，
   // 避免“切换项目”的那一帧把上一项目的折叠状态写进新项目。
@@ -2515,6 +2576,7 @@ export default function ConversationPage() {
   const stopRequestInFlightRef = useRef("");
   const stopAndClearRef = useRef<() => Promise<void>>(async () => {});
   const pendingUserDrafts = useRef(new Map<string, string>());
+  const pendingUserAttachments = useRef(new Map<string, MessageAttachment[]>());
   const assistantOutputRuns = useRef(new Set<string>());
   // 跟踪被撤回的用户消息 runId — reload 时需过滤避免后端数据重新加回来
   const retractedMessageRuns = useRef(new Set<string>());
@@ -2812,22 +2874,26 @@ export default function ConversationPage() {
       if (oldest !== undefined) outputs.delete(oldest);
     }
     pendingUserDrafts.current.delete(runID);
+    pendingUserAttachments.current.delete(runID);
     // 一旦助手有输出，该消息就不再需要被撤回
     retractedMessageRuns.current.delete(runID);
   }, []);
 
-  const restorePendingUserDraft = (conversationID: string, routeVersion: number, runID: string, draft: string | undefined) => {
-    if (!draft || conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) return;
+  const restorePendingUserDraft = (conversationID: string, routeVersion: number, runID: string, draft: string | undefined, files: MessageAttachment[] = []) => {
+    if ((draft === undefined && !files.length) || conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion || assistantOutputRuns.current.has(runID)) return;
     pendingUserDrafts.current.delete(runID);
-    const restoredText = textRef.current === "" ? draft : textRef.current;
+    pendingUserAttachments.current.delete(runID);
+    addAttachments(files);
+    const restoredText = textRef.current === "" ? draft ?? "" : textRef.current;
     textRef.current = restoredText;
     if (projectId) saveConversationDraft(projectId, conversationID, restoredText);
-    setText((current) => current === "" ? draft : current);
+    setText((current) => current === "" ? draft ?? "" : current);
     historyIndex.current = null;
     draftBeforeHistory.current = "";
   };
 
   const resetConversationView = (next: Conversation) => {
+    pendingUserAttachments.current.clear();
     const previousConversationID = conversationRef.current?.id;
     if (projectId && previousConversationID && previousConversationID !== next.id) flushConversationDraft(projectId, previousConversationID);
     const nextDraft = projectId ? getConversationDraft(projectId, next.id) : "";
@@ -3172,16 +3238,22 @@ export default function ConversationPage() {
     let cancelled = false;
     // agentId 变化（切换到另一 CLI 的会话）时先清空旧技能，避免短暂显示上一 CLI 的技能。
     setSkills([]);
+    setPlugins([]);
+    setPluginsNote("");
     setSkillsLoading(true);
     void (async () => {
-      try {
-        const list = await projectApi<Skill[]>(`/api/projects/${projectId}/skills?agentId=${encodeURIComponent(agentId)}`);
-        if (!cancelled) setSkills(list);
-      } catch { if (!cancelled) setSkills([]); }
-      finally { if (!cancelled) setSkillsLoading(false); }
+      const [skillResult, pluginResult] = await Promise.allSettled([
+        attachmentRequest<Skill[]>(`/api/projects/${projectId}/skills?agentId=${encodeURIComponent(agentId)}`),
+        attachmentRequest<{plugins: typeof plugins; note?:string}>(`/api/projects/${projectId}/plugins?agentId=${encodeURIComponent(agentId)}`),
+      ]);
+      if (cancelled) return;
+      if (skillResult.status === "fulfilled") setSkills(skillResult.value);
+      if (pluginResult.status === "fulfilled") { setPlugins(pluginResult.value.plugins); setPluginsNote(pluginResult.value.note || ""); }
+      else setPluginsNote("插件目录暂时无法读取。");
+      setSkillsLoading(false);
     })();
     return () => { cancelled = true; };
-  }, [projectId, conversation?.agentId, projectApi]);
+  }, [projectId, conversation?.agentId, attachmentRequest, conversationWorkspaces.find((item) => item.active)?.id]);
 
   // 加载常用命令目录（docs/37）：命令标签的"未提供"提示与命令选择器都用它。
   // probe=0：只是打开项目不该拉起 CLI 进程——目录优先来自真实运行的采样，冷启动时
@@ -3285,6 +3357,9 @@ export default function ConversationPage() {
         if (!isCurrentConversation()) return;
         const event = JSON.parse(raw.data) as Event;
         setEvents((old) => old.some((item) => item.id === event.id) ? old : [...old, event]);
+        if (event.type === "system" && asRecord(event.payload).subtype === "init" && conversation.agentId === "codebuddy") {
+          void projectApi<ProjectCommands>(`/api/projects/${projectId}/commands?agentId=codebuddy&probe=0`).then((catalog) => { if (isCurrentConversation()) setCommandCatalog(catalog); }).catch(() => {});
+        }
         if (event.type === "assistant.message") {
           const m = asRecord(event.payload);
           if (typeof m.id === "string" && typeof m.content === "string") {
@@ -3349,6 +3424,7 @@ export default function ConversationPage() {
             setMessages((old) => mergeConversationItems(old, [markerMessage]));
           }
           pendingUserDrafts.current.delete(event.runId);
+          pendingUserAttachments.current.delete(event.runId);
           assistantOutputRuns.current.delete(event.runId);
           // 不在这里清理 retractedMessageRuns。
           // 如果之前 stopRun 标记了撤回，需要在后续 reload 中过滤用户消息。
@@ -3463,6 +3539,7 @@ export default function ConversationPage() {
   useEffect(() => {
     if (!conversation) return;
     pendingUserDrafts.current.clear();
+    pendingUserAttachments.current.clear();
     assistantOutputRuns.current.clear();
     retractedMessageRuns.current.clear();
     historyIndex.current = null;
@@ -3475,12 +3552,17 @@ export default function ConversationPage() {
         const currentDraft = getConversationDraft(projectId, scheduledConversationID) || "";
         saveConversationDraft(projectId, scheduledConversationID, mergeDraftAndPending(currentDraft, scheduledContent));
         flushConversationDraft(projectId, scheduledConversationID);
+        try {
+          const key = `milevia-attachments:${projectId}:${scheduledConversationID}`;
+          localStorage.setItem(key, JSON.stringify(mergeMessageAttachments(readAttachmentDraft(localStorage.getItem(key)), pendingSendAttachmentsRef.current)));
+        } catch { /* Draft persistence is optional. */ }
       }
       pendingSendRef.current = null;
       pendingSendConversationRef.current = null;
       pendingSendRequestIDRef.current = null;
       // 技能引用属于原来那个会话，跟着预约一起作废（草稿里只回用户正文）。
       pendingSendSkillRefsRef.current = [];
+      pendingSendAttachmentsRef.current = [];
       setPendingSendContent(null);
     }
     setShowSendMenu(false);
@@ -3861,15 +3943,17 @@ export default function ConversationPage() {
   // 消息会安静地排到本轮之后。声明不了就不要在菜单里承诺。
   const canSteer = agentSupportsSteering(conversation?.agentId ?? "") && !project.runner.startsWith("ssh-");
 
-  const sendContent = async (rawContent: string, clearDraft = true, options: { restoreOnFailure?: boolean; notifyFailure?: boolean; clientRequestId?: string; skillRefs?: Skill[] } = {}): Promise<boolean> => {
+  const sendContent = async (rawContent: string, clearDraft = true, options: { restoreOnFailure?: boolean; notifyFailure?: boolean; clientRequestId?: string; skillRefs?: Skill[]; attachments?: MessageAttachment[] } = {}): Promise<boolean> => {
     const { restoreOnFailure = true, notifyFailure = true } = options;
     const refs = options.skillRefs ?? [];
-    if (!conversation || readOnlyConversation || sending || clearing || stopping || handingOff || shortcutBusy || changingModel) return false;
+    const files = options.attachments ?? [];
+    if (!conversation || readOnlyConversation || sending || clearing || stopping || handingOff || shortcutBusy || changingModel || attachmentBusy || workspaceBusy) return false;
     // draft = 用户在输入框里写的正文；content = 加上技能引用后真正上线的文本。
     // 所有"写回输入框"的路径只能用 draft：否则一次发送失败就会把整段技能描述重新灌回输入框，
     // 又回到"输入框被技能描述铺满"的老问题。
     const draft = rawContent.trim();
-    if (!draft && refs.length === 0) return false;
+    if (!draft && refs.length === 0 && files.length === 0) return false;
+    if (files.length && (draft === "/resume" || draft === "/clear")) { fail("请先移除附件，再执行会话命令。"); return false; }
     if (draft === "/resume") {
       if (clearDraft) {
         setComposerText("", conversation.id);
@@ -3906,10 +3990,11 @@ export default function ConversationPage() {
       setComposerText("", conversationID);
       // 引用与草稿一起乐观清空；发送失败时在 catch 里一并恢复（见下）。
       setSkillRefs([]);
+      updateAttachments([]);
     }
     setShowPermissionMenu(false); historyIndex.current = null; draftBeforeHistory.current = "";
     try {
-      const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content, clientRequestId }) });
+      const data = await projectApi<{ message: Message; runId: string }>(`/api/conversations/${conversationID}/messages`, { method: "POST", body: JSON.stringify({ content, clientRequestId, attachments: files }) });
       if (conversationRef.current?.id !== conversationID) return false;
       // 撤回 / 上箭头重发要恢复的是"用户自己写的东西"，所以这里存 draft 而不是 data.message.content：
       // 后者带着整段技能引用，写回输入框就等于把胶囊重新变成一大段文本（正是本次要修的问题）。
@@ -3917,7 +4002,10 @@ export default function ConversationPage() {
       // 会话运行中再发的消息会插进同一个 run（插话），如果它覆盖了这里的草稿，
       // 撤回/停止就会把用户原本那句话换成后来那句。用 has() 做首写优先，
       // 不依赖服务端告诉我们"这条是不是插话"——那个信息在幂等重放时本来就不可判定。
-      if (!pendingUserDrafts.current.has(data.runId) && !assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) pendingUserDrafts.current.set(data.runId, draft);
+      if (!pendingUserDrafts.current.has(data.runId) && !assistantOutputRuns.current.has(data.runId) && !finishedRunIds.current.has(data.runId)) {
+        pendingUserDrafts.current.set(data.runId, draft);
+        pendingUserAttachments.current.set(data.runId, files);
+      }
       setMessages((old) => [...old, data.message]); if (draft) appendInputHistory(draft); setHistoryRefresh((version) => version + 1); setRun(finishedRunIds.current.has(data.runId) ? "" : data.runId);
       // 新一轮开始：上一条停止失败/超时的提示已经过时，不能留在输入框上方。
       setStopNotice("");
@@ -3926,12 +4014,22 @@ export default function ConversationPage() {
       void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
       return true;
     } catch (cause) {
-      if (conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) return false;
+      if (conversationRef.current?.id !== conversationID || conversationRouteVersion.current !== routeVersion) {
+        if (clearDraft && restoreOnFailure && projectId && files.length) {
+          try {
+            const key = `milevia-attachments:${projectId}:${conversationID}`;
+            const merged = mergeMessageAttachments(readAttachmentDraft(localStorage.getItem(key)), files);
+            localStorage.setItem(key, JSON.stringify(merged));
+          } catch { /* Draft persistence is optional. */ }
+        }
+        return false;
+      }
       if (notifyFailure) fail(cause instanceof Error ? cause.message : "无法发送消息");
       if (clearDraft && restoreOnFailure) {
         // 正文与引用各自回到原来的位置：文本回输入框，技能回胶囊。
         setComposerText(draft, conversationID);
         setSkillRefs(refs);
+        addAttachments(files);
         if (projectId) flushConversationDraft(projectId, conversationID);
       }
       return false;
@@ -3946,7 +4044,7 @@ export default function ConversationPage() {
     event.preventDefault();
     if (changingModel) return;
     setShowSendMenu(false);
-    void sendContent(text, true, { skillRefs });
+    void sendContent(text, true, { skillRefs, attachments });
   };
 
   // 预约发送：将输入内容暂存，等当前对话（含所有子代理）彻底空闲后再真正发送。
@@ -3954,11 +4052,13 @@ export default function ConversationPage() {
   const scheduleSend = () => {
     const content = text.trim();
     // 只有技能引用、没有正文时同样可以预约（与"点技能后直接发送"一致）。
-    if ((!content && skillRefs.length === 0) || !conversation) return;
-    if (sending || clearing || stopping || handingOff || shortcutBusy || changingModel) return;
+    if ((!content && skillRefs.length === 0 && attachments.length === 0) || !conversation) return;
+    if (sending || clearing || stopping || handingOff || shortcutBusy || changingModel || attachmentBusy || workspaceBusy) return;
     setShowSendMenu(false);
     pendingSendRef.current = content;
     pendingSendSkillRefsRef.current = skillRefs;
+    pendingSendAttachmentsRef.current = attachments;
+    updateAttachments([]);
     pendingSendConversationRef.current = conversation.id;
     pendingSendRequestIDRef.current = crypto.randomUUID();
     // 新预约视为“尚未开始等待空闲”，让 effect 在空闲成立时重新挂起延迟发送
@@ -3974,8 +4074,10 @@ export default function ConversationPage() {
   // 若这里预填输入框会污染 textRef，破坏它们对"输入框为空才恢复"的判断或被 reset 覆盖。
   const clearScheduledSend = () => {
     const pending = pendingSendRef.current;
+    if (pendingSendConversationRef.current === conversation?.id && pendingSendAttachmentsRef.current.length) addAttachments(pendingSendAttachmentsRef.current);
     pendingSendRef.current = null;
     pendingSendSkillRefsRef.current = [];
+    pendingSendAttachmentsRef.current = [];
     pendingSendConversationRef.current = null;
     pendingSendRequestIDRef.current = null;
     if (pending != null) setPendingSendContent(null);
@@ -3991,7 +4093,7 @@ export default function ConversationPage() {
     clearScheduledSend();
     const existing = textRef.current.trim();
     setComposerText(existing ? `${existing}\n${pending}` : pending, conversationID);
-    setSkillRefs(refs);
+    setSkillRefs((current) => [...current, ...refs.filter((ref) => !current.some((item) => item.source === ref.source && item.name === ref.name))]);
     requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>(".composer-edit")?.focus());
   };
 
@@ -4015,10 +4117,11 @@ export default function ConversationPage() {
     const draft = pendingSendRef.current ?? "";
     const clientRequestId = pendingSendRequestIDRef.current;
     const refs = pendingSendSkillRefsRef.current;
+    const files = pendingSendAttachmentsRef.current;
     // draft 为空但带着技能引用，同样是一条可发的消息（点技能就能发）。
-    if (!conversationID || (!draft && refs.length === 0) || !clientRequestId) return false;
+    if (!conversationID || (!draft && refs.length === 0 && files.length === 0) || !clientRequestId) return false;
     if (readOnlyConversation) return false; // 会话变为只读（编排/readonly）时不能发送，保留预约不丢失
-    if (sending || clearing || stopping || handingOff || shortcutBusy) return false;
+    if (sending || clearing || stopping || handingOff || shortcutBusy || attachmentBusy || workspaceBusy) return false;
     if (conversationRef.current?.id !== conversationID) return false; // 切换会话后不越界发送
     if (!isConversationIdle()) return false; // 延迟期间又有了新的运行，继续等待
     // 自动发送可能撞上瞬时的后端拒绝（工作区被并发的 insight 扫描 / Git 操作占用、
@@ -4030,21 +4133,27 @@ export default function ConversationPage() {
       if (conversationRef.current?.id !== conversationID) return false;
       if (!isConversationIdleRef.current()) return false; // 重试期间又有了新的运行，交回空闲检测重新挂起
       const last = attempt === backoff.length;
-      const ok = await sendContentRef.current(draft, true, { restoreOnFailure: last, notifyFailure: last, clientRequestId, skillRefs: refs });
+      // The user may already be composing another message. Sending the stored
+      // job must not clear that new text or its attachment draft.
+      const ok = await sendContentRef.current(draft, false, { restoreOnFailure: false, notifyFailure: last, clientRequestId, skillRefs: refs, attachments: files });
+      if (conversationRef.current?.id !== conversationID || pendingSendRequestIDRef.current !== clientRequestId) return false;
       if (ok) {
         pendingSendRef.current = null;
         pendingSendSkillRefsRef.current = [];
+        pendingSendAttachmentsRef.current = [];
         pendingSendConversationRef.current = null;
         pendingSendRequestIDRef.current = null;
         setPendingSendContent((current) => current === draft ? null : current);
         return true;
       }
       if (last) {
-        // 最后一次也失败：sendContent 若走了 catch（restoreOnFailure）已把内容写回输入框；
-        // 否则（被 sendContent 守卫拦截，如 sending 卡住）在这里手动写回，避免预约内容丢失。
-        if (!textRef.current.trim()) { setComposerText(draft, conversationID); setSkillRefs(refs); }
+        // Restore the stored job alongside any draft written while it waited.
+        setComposerText(mergeDraftAndPending(textRef.current, draft), conversationID);
+        setSkillRefs((current) => [...current, ...refs.filter((ref) => !current.some((item) => item.source === ref.source && item.name === ref.name))]);
+        addAttachments(files);
         pendingSendRef.current = null;
         pendingSendSkillRefsRef.current = [];
+        pendingSendAttachmentsRef.current = [];
         pendingSendConversationRef.current = null;
         pendingSendRequestIDRef.current = null;
         setPendingSendContent((current) => current === draft ? null : current);
@@ -4053,7 +4162,7 @@ export default function ConversationPage() {
       await new Promise((resolve) => setTimeout(resolve, backoff[attempt]));
     }
     return true;
-  }, [changingModel, clearing, handingOff, isConversationIdle, readOnlyConversation, sending, shortcutBusy, stopping]);
+  }, [attachmentBusy, workspaceBusy, changingModel, clearing, handingOff, isConversationIdle, readOnlyConversation, sending, shortcutBusy, stopping]);
 
   const fireScheduledSendRef = useRef(fireScheduledSend);
   fireScheduledSendRef.current = fireScheduledSend;
@@ -4108,7 +4217,7 @@ export default function ConversationPage() {
     // 注意：不要把 sendContent 加进依赖。它每次渲染都重建（非 useCallback），
     // 且本 effect 只通过 fireScheduledSendRef 间接调用它，加了会让此 effect 每
     // 次渲染都跑一遍，白白重复 idle 判定。
-  }, [changingModel, isConversationIdle, pendingSendContent, clearing, readOnlyConversation, sending, shortcutBusy, stopping]);
+  }, [attachmentBusy, workspaceBusy, changingModel, isConversationIdle, pendingSendContent, clearing, readOnlyConversation, sending, shortcutBusy, stopping]);
 
   useEffect(() => () => {
     if (scheduledSendTimerRef.current != null) window.clearTimeout(scheduledSendTimerRef.current);
@@ -4553,6 +4662,7 @@ export default function ConversationPage() {
     // 助手没有输出时，需要撤回用户消息并恢复草稿
     const shouldRetractMessage = !assistantOutputRuns.current.has(runID);
     const draftToRestore = shouldRetractMessage ? pendingUserDrafts.current.get(runID) : undefined;
+    const attachmentsToRestore = shouldRetractMessage ? pendingUserAttachments.current.get(runID) : undefined;
     setStopping(true);
     // retractUserMessage 在执行时重新检查 assistantOutputRuns，避免竞态：
     // 如果在异步 stop 请求期间 WebSocket 收到了助手输出，就不应撤回消息
@@ -4581,7 +4691,7 @@ export default function ConversationPage() {
         return;
       }
       retractUserMessage();
-      restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore);
+      restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore, attachmentsToRestore);
     }
     catch (cause) {
       // 同上：旧视图的失败不能在当前视图上弹强制停止框或写一行"停止失败"。
@@ -4608,7 +4718,7 @@ export default function ConversationPage() {
                 return;
               }
               retractUserMessage();
-              restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore);
+              restorePendingUserDraft(conversationID, routeVersion, runID, draftToRestore, attachmentsToRestore);
               if (result !== "stopping") setStopping(false);
             }).catch((cause) => {
               if (!stillHere()) return;
@@ -4697,6 +4807,21 @@ export default function ConversationPage() {
   // 「界面上有、发出去没有」正是本项目最忌的显示与发送分家。
   const handleComposerPaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
     event.preventDefault();
+    const pastedFiles = Array.from(event.clipboardData.files);
+    if (pastedFiles.length > 0) {
+      if (attachmentBusy || workspaceBusy || !conversation || readOnlyConversation || sending || clearing || stopping || handingOff || run) return;
+      if (pastedFiles.length + attachmentsRef.current.length > 8) { fail("每条消息最多添加 8 个附件"); return; }
+      if (pastedFiles.reduce((sum, file) => sum + file.size, 0) + attachmentsRef.current.reduce((sum, file) => sum + (file.size || 0), 0) > 20 * 1024 * 1024) { fail("附件总计不能超过 20 MiB"); return; }
+      const originID = conversation?.id;
+      const controller = new AbortController();
+      pasteUploadRef.current = controller;
+      setAttachmentBusy(true);
+      void uploadMessageFiles(pastedFiles, project.id, attachmentRequest, false, controller.signal, fail).then((added) => {
+        if (attachmentConversationRef.current === originID && !controller.signal.aborted) addAttachments(added);
+      }).catch((cause) => { if (!controller.signal.aborted) fail(cause instanceof Error ? cause.message : "附件上传失败"); })
+        .finally(() => { if (!controller.signal.aborted) setAttachmentBusy(false); });
+      return;
+    }
     const pasted = event.clipboardData.getData("text/plain");
     if (!pasted) return;
     const el = event.currentTarget;
@@ -4893,9 +5018,9 @@ export default function ConversationPage() {
 
   // Skill 组内容：标题 + 按来源分组的技能标签列表。技能点击填入输入框；加载中 / 空态单独呈现。
   const skillSourceMeta: Record<Skill["source"], { label: string; className: string; title: string }> = {
-    plugin: { label: "系统/官方", className: "plugin", title: "来自插件 / 官方 marketplace 的技能（含内置样板），~/.claude/plugins" },
-    user: { label: "用户", className: "user", title: "用户目录中的自建技能（~/.claude/skills）" },
-    project: { label: "项目", className: "project", title: "当前项目自带的技能（<项目>/.claude/skills）" },
+    plugin: { label: "插件", className: "plugin", title: "从当前 CLI 的插件目录中发现的技能，启用状态由 CLI 决定" },
+    user: { label: "用户", className: "user", title: "当前 CLI 用户目录及兼容目录中的技能" },
+    project: { label: "项目", className: "project", title: "当前工作区的 CLI 技能目录" },
   };
   const skillSources: Skill["source"][] = ["plugin", "user", "project"];
   const skillsBySource = (source: Skill["source"]) => skills.filter((skill) => skill.source === source);
@@ -4905,6 +5030,7 @@ export default function ConversationPage() {
     const collapsible = Boolean(options?.collapsible);
     const collapsed = collapsible && Boolean(options?.collapsed);
     const toggle = options?.onToggle ?? (() => {});
+    const pluginSection = (plugins.length > 0 || pluginsNote) && <details className="plugin-discovery"><summary>插件（{plugins.length}）</summary><small>{pluginsNote || "启用状态由 CLI 决定。"}</small>{plugins.map((plugin, index) => <p key={`${plugin.name}-${index}`} title={plugin.description}>{plugin.name} {plugin.version}<small> · {plugin.status === "configured" ? "已配置" : "已发现"}</small></p>)}</details>;
     // 桌面端（collapsible）渲染为「技能」色块的块头（.quick-block-head），与提示词/命令块同构；
     // 移动端输入框菜单（非折叠）沿用原有 .quick-tag-group 标题行，样式随 .skill-tag 全局改版同步。
     const heading = collapsible
@@ -4947,8 +5073,9 @@ export default function ConversationPage() {
       ? <div className={`quick-block skill-block${collapsed ? " collapsed" : ""}`}>
           {heading}
           {!collapsed && body}
+          {!collapsed && pluginSection}
         </div>
-      : <div className="quick-tag-group skill-tags">{heading}{body}</div>;
+      : <div className="quick-tag-group skill-tags">{heading}{body}{pluginSection}</div>;
   };
 
   return <>
@@ -4963,9 +5090,9 @@ export default function ConversationPage() {
               仍随回合刷新（refreshConversationCheckpoints），只是不再有第二个入口。
               代价（已与用户确认）：「分支 / 恢复代码 / 恢复对话」三种变体动作随列表
               一并撤下 —— 需要时要按变体 C 加第三颗虚线图标钮或恢复精简列表。 */}
-          {conversationWorkspaces.length > 0 && <label className="conversation-workspace-picker"><WorkspaceFolderIcon /><span>工作区</span><select aria-label="会话工作区" value={conversationWorkspaces.find((item) => item.active)?.id || ""} disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => { const selected = conversationWorkspaces.find((item) => item.id === event.target.value); if (selected) void activateWorkspace(selected); }}><option value="" disabled>选择工作区</option>{conversationWorkspaces.filter((item) => item.state === "ready").map((item) => <option key={item.id} value={item.id}>{item.mode === "isolated_worktree" ? `工作区 #${item.generation}` : "项目工作区"}</option>)}</select></label>}
-          <button className="conversation-head-action secondary workspace-create-action icon-action" type="button" disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => void createIsolatedWorkspace()} title={workspaceBusy ? "正在创建工作区…" : "创建会话级 Git 工作区"} aria-label={workspaceBusy ? "正在创建工作区" : "创建会话级 Git 工作区"}><WorkspaceCreateIcon /><span className="action-label">{workspaceBusy ? "处理中" : "新建工作区"}</span></button>
-          {conversationWorkspaces.some((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active) && <><label className="conversation-workspace-picker workspace-remove-picker"><span>移除目标</span><select aria-label="移除工作区" value={archiveWorkspaceID} disabled={workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => setArchiveWorkspaceID(event.target.value)}>{conversationWorkspaces.filter((item) => item.mode === "isolated_worktree" && item.state === "ready").map((item) => <option key={item.id} value={item.id}>工作区 #{item.generation}</option>)}</select></label><button className="conversation-head-action secondary workspace-remove-action icon-action" type="button" disabled={!archiveWorkspaceID || workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => { const workspace = conversationWorkspaces.find((item) => item.id === archiveWorkspaceID); if (workspace) void archiveWorkspace(workspace); }} title="移除选中的闲置工作区" aria-label="移除选中的闲置工作区"><WorkspaceRemoveIcon /><span className="action-label">移除工作区</span></button></>}
+          {conversationWorkspaces.length > 0 && <label className="conversation-workspace-picker"><WorkspaceFolderIcon /><span>工作区</span><select aria-label="会话工作区" value={conversationWorkspaces.find((item) => item.active)?.id || ""} disabled={workspaceBusy || attachmentBusy || pendingSendContent !== null || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => { const selected = conversationWorkspaces.find((item) => item.id === event.target.value); if (selected) void activateWorkspace(selected); }}><option value="" disabled>选择工作区</option>{conversationWorkspaces.filter((item) => item.state === "ready").map((item) => <option key={item.id} value={item.id}>{item.mode === "isolated_worktree" ? `工作区 #${item.generation}` : "项目工作区"}</option>)}</select></label>}
+          <button className="conversation-head-action secondary workspace-create-action icon-action" type="button" disabled={workspaceBusy || attachmentBusy || pendingSendContent !== null || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => void createIsolatedWorkspace()} title={workspaceBusy ? "正在创建工作区…" : "创建会话级 Git 工作区"} aria-label={workspaceBusy ? "正在创建工作区" : "创建会话级 Git 工作区"}><WorkspaceCreateIcon /><span className="action-label">{workspaceBusy ? "处理中" : "新建工作区"}</span></button>
+          {conversationWorkspaces.some((item) => item.mode === "isolated_worktree" && item.state === "ready" && !item.active) && <><label className="conversation-workspace-picker workspace-remove-picker"><span>移除目标</span><select aria-label="移除工作区" value={archiveWorkspaceID} disabled={workspaceBusy || attachmentBusy || pendingSendContent !== null || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onChange={(event) => setArchiveWorkspaceID(event.target.value)}>{conversationWorkspaces.filter((item) => item.mode === "isolated_worktree" && item.state === "ready").map((item) => <option key={item.id} value={item.id}>工作区 #{item.generation}</option>)}</select></label><button className="conversation-head-action secondary workspace-remove-action icon-action" type="button" disabled={!archiveWorkspaceID || workspaceBusy || Boolean(run) || clearing || stopping || handingOff || readOnlyConversation} onClick={() => { const workspace = conversationWorkspaces.find((item) => item.id === archiveWorkspaceID); if (workspace) void archiveWorkspace(workspace); }} title="移除选中的闲置工作区" aria-label="移除选中的闲置工作区"><WorkspaceRemoveIcon /><span className="action-label">移除工作区</span></button></>}
           <button className="conversation-head-action secondary icon-action" type="button" disabled={readOnlyConversation} onClick={openAiConfig} title="AI 配置" aria-label="AI 配置"><ProjectConfigIcon /><span className="action-label">AI 配置</span></button>
           <div className="permission-menu">
           <button className={`permission-trigger ${conversation?.permissionMode === "full_control" ? "full" : ""}`} type="button" aria-haspopup="menu" aria-expanded={showPermissionMenu} disabled={readOnlyConversation || !!run || clearing || stopping || handingOff || changingPermission} onClick={() => setShowPermissionMenu((open) => !open)}><PermissionModeIcon /><span>{permissionLabel}</span></button>
@@ -5029,6 +5156,10 @@ export default function ConversationPage() {
         <fieldset className="composer-model-switch-lock" disabled={changingModel}>
         {pendingApproval && <ApprovalBanner action={pendingApproval} resolving={resolving} decide={decide} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.tool .tool-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
         {pendingAsk && <AskBanner ask={pendingAsk.ask} resolving={resolving} answer={answerAsk} scrollToCard={() => { const el = timelineRef.current?.querySelector(".timeline-entry.ask .ask-card.waiting"); if (el) el.scrollIntoView({ behavior: "smooth", block: "center" }); }} />}
+        {attachments.length > 0 && <div className="composer-skill-refs" role="group" aria-label="已添加的附件">
+          {attachments.map((attachment) => <span className="composer-skill-ref" key={attachment.path} title={attachment.path}>{attachment.path.split("/").pop()}<button type="button" aria-label={`移除附件 ${attachment.path}`} onClick={() => updateAttachments(attachments.filter((a) => a.path !== attachment.path))}>×</button></span>)}
+          {(conversation?.agentId === "qoder" || conversation?.agentId === "cursor") && <small>此 CLI 当前通过工作区路径引用附件，读取受会话权限限制。</small>}
+        </div>}
         {skillRefs.length > 0 && <div className="composer-skill-refs" role="group" aria-label="已引用的技能">
           {skillRefs.map((skill) => <span className="composer-skill-ref" key={`${skill.source}-${skill.name}`}>
             <span className="composer-skill-ref-name" title={truncateSkillDescription(skill.description, skill.name) || skill.name}><SkillTagIcon /><span>{skill.name}</span></span>
@@ -5065,13 +5196,14 @@ export default function ConversationPage() {
           <div className="composer-dock">
             <ComposerMcpTray projectID={project.id} agentID={conversation?.agentId || "claude-code"} runKey={run} />
             <ContextRing usage={usage} />
+            <MessageAttachmentPicker key={`${conversation?.id}:${conversationWorkspaces.find((item) => item.active)?.id}`} projectID={project.id} attachments={attachments} request={attachmentRequest} onAdd={addAttachments} onBusy={setAttachmentBusy} onFail={fail} disabled={!conversation || readOnlyConversation || sending || clearing || stopping || handingOff || Boolean(run) || attachmentBusy || workspaceBusy} />
             <span className="composer-dock-push" aria-hidden="true"></span>
-            {conversation?.id ? <ComposerModelPicker conversationID={conversation.id} agentID={conversation?.agentId || "claude-code"} selected={conversation?.modelOverride || ""} displayed={displayedModel} disabled={readOnlyConversation || Boolean(run) || stopping || changingModel} runActive={Boolean(run)} busy={changingModel} onSelect={selectConversationModel} onFail={fail} /> : <span className="composer-usage-model" title={displayedModel}>{displayedModel}</span>}
+            {conversation?.id ? <ComposerModelPicker key={conversation.id} conversationID={conversation.id} agentID={conversation?.agentId || "claude-code"} selected={conversation?.modelOverride || ""} displayed={displayedModel} disabled={readOnlyConversation || Boolean(run) || stopping || changingModel} runActive={Boolean(run)} busy={changingModel} onSelect={selectConversationModel} onFail={fail} /> : <span className="composer-usage-model" title={displayedModel}>{displayedModel}</span>}
             <button className="composer-icon-btn danger composer-clear" type="button" title="清空内容并新建对话" aria-label="清空内容并新建对话" disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={clearConversationContext}><ComposerActionIcon action="clear" /></button>
             <button className="composer-icon-btn composer-continue" type="button" title="继续任务" aria-label="继续任务" disabled={readOnlyConversation || sending || clearing || stopping || handingOff} onClick={() => void sendContent("继续", false)}><ComposerActionIcon action="continue" /></button>
             {run && <button className="secondary composer-action composer-stop" type="button" disabled={readOnlyConversation} onClick={() => void stopRun()}>{stopping ? "再次停止" : "停止"}</button>}
             <button className="composer-icon-btn composer-usage-open" type="button" title={!run && !usage ? "用量将在工具就绪后显示" : "使用状态"} aria-label="使用状态" disabled={!run && !usage} onClick={openUsage}><svg className="composer-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V10M10 19V5M15 19v-7M20 19V8" /><path d="M3.5 19.5h17" /></svg></button>
-            <span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>{canSteer ? "交给 " + activeAgentName + "；运行中会插入当前任务，模型在下一个工具结果后看到" : "交给 " + activeAgentName + "；当前会话不支持中途插入，会排在本轮之后"}</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0) || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>等当前任务（含子代理）全部结束后，作为新的一轮发送</small></span></button></span>}</span>
+            <span className="composer-send-wrap"><button className="primary composer-action composer-send" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0 && attachments.length === 0) || attachmentBusy || workspaceBusy || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff}><ComposerActionIcon action="send" /><span>{sending ? "发送中" : "发送"}</span></button><button className={`composer-send-more${showSendMenu ? " open" : ""}`} type="button" title="发送方式" aria-label="发送方式" aria-haspopup="menu" aria-expanded={showSendMenu} disabled={readOnlyConversation || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => setShowSendMenu((value) => !value)}><svg className="composer-send-more-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.5 12 15.5 18 9.5" /></svg></button>{showSendMenu && <span className="send-menu" role="menu"><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0 && attachments.length === 0) || attachmentBusy || workspaceBusy || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={(evt) => { setShowSendMenu(false); evt.currentTarget.form?.requestSubmit(); }}><ComposerActionIcon action="send" /><span><b>立即发送</b><small>{canSteer ? "交给 " + activeAgentName + "；运行中会插入当前任务，模型在下一个工具结果后看到" : "交给 " + activeAgentName + "；当前会话不支持中途插入，会排在本轮之后"}</small></span></button><button className="send-menu-item" type="button" role="menuitem" disabled={readOnlyConversation || (!text.trim() && skillRefs.length === 0 && attachments.length === 0) || attachmentBusy || workspaceBusy || sending || clearing || stopping || Boolean(shortcutBusy) || handingOff} onClick={() => void scheduleSend()}><ComposerActionIcon action="schedule" /><span><b>预约发送</b><small>等当前任务（含子代理）全部结束后，作为新的一轮发送</small></span></button></span>}</span>
           </div>
         </div>
         <ComposerRunnerInfo runnerID={project.runner} agentID={conversation?.agentId || "claude-code"} projectID={project.id} conversationID={conversation?.id || ""} isGitRepo={project.gitBranch !== NON_GIT_BRANCH} run={run} runLabel={runLabel} usage={usage} readOnly={readOnlyConversation} stopping={stopping} onStop={() => void stopRun()} />

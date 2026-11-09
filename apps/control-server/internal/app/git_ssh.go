@@ -87,7 +87,7 @@ func gitFirstArg(args []string) string {
 }
 
 func (b *sshGitBackend) runGit(ctx context.Context, repo string, args ...string) ([]byte, error) {
-	commandCtx, cancel := context.WithTimeout(ctx, gitCommandTimeout)
+	commandCtx, cancel := context.WithTimeout(workspaceCommandContext(ctx, repo), gitCommandTimeout)
 	defer cancel()
 	cmd := b.buildGitShell(repo, args)
 	out, stderr, err := b.client.execCommandSeparate(commandCtx, cmd, gitOutputLimit)
@@ -109,7 +109,7 @@ func (b *sshGitBackend) runGitPaths(ctx context.Context, repo string, args, path
 		all = append(all, paths...)
 		return b.runGit(ctx, repo, all...)
 	}
-	commandCtx, cancel := context.WithTimeout(ctx, gitCommandTimeout)
+	commandCtx, cancel := context.WithTimeout(workspaceCommandContext(ctx, repo), gitCommandTimeout)
 	defer cancel()
 	// 通过 stdin 传递 pathspec（NUL 分隔），避免在远端创建临时文件。
 	pathspec := strings.Join(paths, "\x00") + "\x00"
@@ -129,7 +129,7 @@ func (b *sshGitBackend) runGitPaths(ctx context.Context, repo string, args, path
 }
 
 func (b *sshGitBackend) runGitStdin(ctx context.Context, repo string, args []string, stdin []byte) ([]byte, error) {
-	commandCtx, cancel := context.WithTimeout(ctx, gitCommandTimeout)
+	commandCtx, cancel := context.WithTimeout(workspaceCommandContext(ctx, repo), gitCommandTimeout)
 	defer cancel()
 	cmd := b.buildGitShell(repo, args)
 	out, stderr, err := b.client.execCommandWithStdinSeparate(commandCtx, cmd, stdin, gitOutputLimit)
@@ -147,7 +147,7 @@ func (b *sshGitBackend) runGitStdin(ctx context.Context, repo string, args []str
 
 // writeTempFile 在远端创建临时文件并写入内容，返回远端路径与清理函数。
 func (b *sshGitBackend) writeTempFile(content []byte) (string, func(), error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(workspaceCommandContext(context.Background(), b.rootPath), 10*time.Second)
 	defer cancel()
 	// mktemp 在远端 $TMPDIR 创建唯一文件并输出路径。
 	out, err := b.client.execCommand(ctx, "mktemp")
@@ -168,17 +168,17 @@ func (b *sshGitBackend) writeTempFile(content []byte) (string, func(), error) {
 		_, _ = b.client.execCommand(ctx, "rm -f -- "+shellQuote(remotePath))
 		return "", nil, fmt.Errorf("open remote temp file: %w", err)
 	}
-	if _, err := f.Write(content); err != nil {
+	if _, err := f.Write(content); b.client.workspaceSFTPError(err, b.rootPath) != nil {
 		f.Close()
 		_, _ = b.client.execCommand(ctx, "rm -f -- "+shellQuote(remotePath))
 		return "", nil, fmt.Errorf("write remote temp file: %w", err)
 	}
-	if err := f.Close(); err != nil {
+	if err := b.client.workspaceSFTPError(f.Close(), b.rootPath); err != nil {
 		_, _ = b.client.execCommand(ctx, "rm -f -- "+shellQuote(remotePath))
 		return "", nil, fmt.Errorf("close remote temp file: %w", err)
 	}
 	cleanup := func() {
-		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cctx, ccancel := context.WithTimeout(workspaceCommandContext(context.Background(), b.rootPath), 5*time.Second)
 		_, _ = b.client.execCommand(cctx, "rm -f -- "+shellQuote(remotePath))
 		ccancel()
 	}
@@ -242,14 +242,15 @@ func (b *sshGitBackend) writeFile(repo, rel string, content []byte) error {
 		return errors.New("refusing to write through a symbolic link")
 	}
 	f, err := sftpClient.OpenFile(abs, os.O_WRONLY|os.O_TRUNC)
+	err = b.client.workspaceSFTPError(err, b.rootPath)
 	if err != nil {
 		return fmt.Errorf("open Git path for writing: %w", err)
 	}
-	if _, err := f.Write(content); err != nil {
+	if _, err := f.Write(content); b.client.workspaceSFTPError(err, b.rootPath) != nil {
 		f.Close()
 		return fmt.Errorf("write Git path: %w", err)
 	}
-	if err := f.Close(); err != nil {
+	if err := b.client.workspaceSFTPError(f.Close(), b.rootPath); err != nil {
 		return fmt.Errorf("close Git path after writing: %w", err)
 	}
 	return nil
@@ -298,7 +299,7 @@ func (b *sshGitBackend) removeUntracked(repo string, paths []string) error {
 			return fmt.Errorf("%w: refusing to remove a symbolic link", errGitPartiallyApplied)
 		}
 		// RemoveAll 能递归删除目录；Remove 仅删除文件。
-		if err := sftpClient.RemoveAll(abs); err != nil {
+		if err := b.client.workspaceSFTPError(sftpClient.RemoveAll(abs), b.rootPath); err != nil {
 			return fmt.Errorf("%w: remove untracked Git path: %v", errGitPartiallyApplied, err)
 		}
 		if _, err := sftpClient.Lstat(abs); err == nil {

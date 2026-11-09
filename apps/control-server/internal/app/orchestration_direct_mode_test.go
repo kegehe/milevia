@@ -441,6 +441,14 @@ func TestDeleteOrchestrationBatchAllowsAppliedJobs(t *testing.T) {
 
 func TestAppliedToBranchTaskStaysReviewableAndRedispatched(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
+	// Keep dispatch running without depending on an installed/authenticated CLI.
+	server.runner = runnerFunc(func(ctx context.Context, _ AgentRunRequest, _ AgentRunSink) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if _, err := server.db.Exec(`update projects set runner=?,runner_id=? where id=?`, server.localRunnerID(), server.localRunnerID(), projectID); err != nil {
+		t.Fatal(err)
+	}
 	enableOrchestrationForTest(t, server, projectID)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Applied reviewable task")
 	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
@@ -466,6 +474,9 @@ func TestAppliedToBranchTaskStaysReviewableAndRedispatched(t *testing.T) {
 	server.routes().ServeHTTP(dispatch, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dispatch", bytes.NewBufferString(`{}`)))
 	if dispatch.Code == http.StatusConflict && strings.Contains(dispatch.Body.String(), "自动编排尚未结束此任务") {
 		t.Fatalf("an applied task must not block manual re-dispatch: %d body=%s", dispatch.Code, dispatch.Body.String())
+	}
+	if dispatch.Code != http.StatusAccepted {
+		t.Fatalf("manual re-dispatch: %d body=%s", dispatch.Code, dispatch.Body.String())
 	}
 	assertTaskStatus(t, server, taskID, taskRunning)
 }

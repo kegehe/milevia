@@ -498,11 +498,13 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("resolve hook path: %v", err)
 	}
 	server, err := New(context.Background(), Config{
-		DatabasePath: filepath.Join(t.TempDir(), "auto.db"),
-		AllowedRoot:  t.TempDir(),
-		ClaudePath:   "claude",
-		ControlURL:   "http://127.0.0.1:8080",
-		ApprovalHook: hookPath,
+		DisableSupervisionWorker: true,
+		WorkspaceGuardDir:        t.TempDir(),
+		DatabasePath:             filepath.Join(t.TempDir(), "auto.db"),
+		AllowedRoot:              t.TempDir(),
+		ClaudePath:               "claude",
+		ControlURL:               "http://127.0.0.1:8080",
+		ApprovalHook:             hookPath,
 	})
 	if err != nil {
 		t.Fatalf("create server: %v", err)
@@ -3528,63 +3530,106 @@ func TestSSHPermissionArgsKeepReviewsReadOnly(t *testing.T) {
 
 func TestStreamingClaudeSessionAcceptsMessagesWhileTurnIsRunning(t *testing.T) {
 	requirePOSIXShell(t)
-	server := newTestServer(t)
-	now := time.Now().UTC()
-	projectPath := t.TempDir()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
-		t.Fatalf("insert project: %v", err)
-	}
-	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle','full_control',0,1,?)`, now); err != nil {
-		t.Fatalf("insert conversation: %v", err)
-	}
-	capturePath := filepath.Join(t.TempDir(), "stream-input.jsonl")
-	releasePath := filepath.Join(t.TempDir(), "release-first-turn")
-	scriptPath := filepath.Join(t.TempDir(), "fake-streaming-claude")
-	script := "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\ncount=0\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> \"$CAPTURE_PATH\"\n  count=$((count + 1))\n  if [ \"$count\" -eq 1 ]; then\n    while [ ! -f \"$RELEASE_PATH\" ]; do sleep 0.01; done\n  fi\n  printf '%s\\n' \"{\\\"type\\\":\\\"assistant\\\",\\\"message\\\":{\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"reply-$count\\\"}]}}\"\n  printf '%s\\n' '{\"type\":\"result\",\"num_turns\":1,\"usage\":{},\"modelUsage\":{}}'\ndone\n"
-	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
-		t.Fatalf("write streaming Claude CLI: %v", err)
-	}
-	t.Setenv("CAPTURE_PATH", capturePath)
-	t.Setenv("RELEASE_PATH", releasePath)
-	server.runner = &claudeCLIRunner{config: Config{ClaudePath: scriptPath, PermissionMode: "acceptEdits", ControlURL: "http://127.0.0.1:8080", ApprovalHook: server.config.ApprovalHook}}
-	handler := server.routes()
-	first := httptest.NewRecorder()
-	handler.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", bytes.NewBufferString(`{"content":"first"}`)))
-	if first.Code != http.StatusAccepted {
-		t.Fatalf("first streaming send status: %d body=%s", first.Code, first.Body.String())
-	}
-	second := httptest.NewRecorder()
-	handler.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", bytes.NewBufferString(`{"content":"second"}`)))
-	if second.Code != http.StatusAccepted {
-		t.Fatalf("second streaming send while running status: %d body=%s", second.Code, second.Body.String())
-	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		input, err := os.ReadFile(capturePath)
-		if err == nil && strings.Count(strings.TrimSpace(string(input)), "\n") == 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	inputBeforeResult, err := os.ReadFile(capturePath)
-	if err != nil || strings.Contains(string(inputBeforeResult), `"text":"second"`) {
-		t.Fatalf("second input was written before the first result: %q err=%v", inputBeforeResult, err)
-	}
-	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
-		t.Fatalf("release first turn: %v", err)
-	}
-	waitForConversationIdle(t, server, "conversation")
-	input, err := os.ReadFile(capturePath)
-	if err != nil {
-		t.Fatalf("read streaming input: %v", err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(input)), "\n")
-	if len(lines) != 2 || !strings.Contains(lines[0], `"text":"first"`) || !strings.Contains(lines[1], `"text":"second"`) {
-		t.Fatalf("unexpected stream input: %q", input)
-	}
-	var completed int
-	if err := server.db.QueryRow(`select count(*) from runs where conversation_id='conversation' and status='completed'`).Scan(&completed); err != nil || completed != 2 {
-		t.Fatalf("streaming runs did not complete: count=%d err=%v", completed, err)
+	for _, mode := range []string{"steering", "queued"} {
+		t.Run(mode, func(t *testing.T) {
+			server := newTestServer(t)
+			now := time.Now().UTC()
+			projectPath := t.TempDir()
+			if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, projectPath, now); err != nil {
+				t.Fatalf("insert project: %v", err)
+			}
+			if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,status,permission_mode,claude_initialized,is_current,created_at) values ('conversation','project','00000000-0000-4000-8000-000000000000','idle','full_control',0,1,?)`, now); err != nil {
+				t.Fatalf("insert conversation: %v", err)
+			}
+			capturePath := filepath.Join(t.TempDir(), "stream-input.jsonl")
+			releasePath := filepath.Join(t.TempDir(), "release-first-turn")
+			scriptPath := filepath.Join(t.TempDir(), "fake-streaming-claude")
+			script := `#!/bin/sh
+printf '%s\n' '{"type":"system","subtype":"init"}'
+count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE_PATH"
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    while [ ! -f "$RELEASE_PATH" ]; do sleep 0.01; done
+    if [ "$STREAMING_TEST_MODE" = steering ]; then
+      IFS= read -r line || exit 1
+      printf '%s\n' "$line" >> "$CAPTURE_PATH"
+    fi
+  fi
+  printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"reply-$count\"}]}}"
+  printf '%s\n' '{"type":"result","num_turns":1,"usage":{},"modelUsage":{}}'
+done
+`
+			if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+				t.Fatalf("write streaming Claude CLI: %v", err)
+			}
+			t.Setenv("CAPTURE_PATH", capturePath)
+			t.Setenv("RELEASE_PATH", releasePath)
+			t.Setenv("STREAMING_TEST_MODE", mode)
+			server.runner = &claudeCLIRunner{config: Config{ClaudePath: scriptPath, PermissionMode: "acceptEdits", ControlURL: "http://127.0.0.1:8080", ApprovalHook: server.config.ApprovalHook}}
+			handler := server.routes()
+			first := httptest.NewRecorder()
+			handler.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", bytes.NewBufferString(`{"content":"first"}`)))
+			if first.Code != http.StatusAccepted {
+				t.Fatalf("first streaming send status: %d body=%s", first.Code, first.Body.String())
+			}
+			wantRuns := 2
+			if mode == "steering" {
+				// The HTTP API steers the active turn and reuses its Run. The fixture
+				// consumes both prompts before emitting that turn's single result.
+				second := httptest.NewRecorder()
+				handler.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/api/conversations/conversation/messages", bytes.NewBufferString(`{"content":"second"}`)))
+				if second.Code != http.StatusAccepted {
+					t.Fatalf("second streaming send while running status: %d body=%s", second.Code, second.Body.String())
+				}
+				wantRuns = 1
+			} else {
+				// Explicit task/turn admission queues a separate Run. Exercise the real
+				// admission path without the HTTP endpoint's mid-turn steering policy.
+				if _, _, _, status, err := server.startMessage(context.Background(), "conversation", "second", "", nil); err != nil || status != http.StatusAccepted {
+					t.Fatalf("queued streaming send status=%d err=%v", status, err)
+				}
+			}
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				input, err := os.ReadFile(capturePath)
+				if err == nil && strings.Count(strings.TrimSpace(string(input)), "\n") == 0 {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			inputBeforeResult, err := os.ReadFile(capturePath)
+			if err != nil || strings.Contains(string(inputBeforeResult), `"text":"second"`) {
+				t.Fatalf("second input was written before the first result: %q err=%v", inputBeforeResult, err)
+			}
+			if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+				t.Fatalf("release first turn: %v", err)
+			}
+			waitForConversationIdle(t, server, "conversation")
+			input, err := os.ReadFile(capturePath)
+			if err != nil {
+				t.Fatalf("read streaming input: %v", err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(input)), "\n")
+			if len(lines) != 2 || !strings.Contains(lines[0], `"text":"first"`) || !strings.Contains(lines[1], `"text":"second"`) {
+				t.Fatalf("unexpected stream input: %q", input)
+			}
+			var completed int
+			if err := server.db.QueryRow(`select count(*) from runs where conversation_id='conversation' and status='completed'`).Scan(&completed); err != nil || completed != wantRuns {
+				var states, terminalEvents sql.NullString
+				_ = server.db.QueryRow(`select group_concat(id || ':' || status) from runs where conversation_id='conversation'`).Scan(&states)
+				_ = server.db.QueryRow(`select group_concat(type || ':' || payload) from events where conversation_id='conversation' and type in ('run.failed','run.stopped','run.completed')`).Scan(&terminalEvents)
+				t.Fatalf("streaming runs did not complete: count=%d err=%v states=%s terminal_events=%s", completed, err, states.String, terminalEvents.String)
+			}
+			var total, messages, messageRuns int
+			if err := server.db.QueryRow(`select count(*) from runs where conversation_id='conversation'`).Scan(&total); err != nil || total != wantRuns {
+				t.Fatalf("unexpected run count=%d want=%d err=%v", total, wantRuns, err)
+			}
+			if err := server.db.QueryRow(`select count(*),count(distinct run_id) from messages where conversation_id='conversation' and role='user'`).Scan(&messages, &messageRuns); err != nil || messages != 2 || messageRuns != wantRuns {
+				t.Fatalf("incorrect message ownership: messages=%d runs=%d want_runs=%d err=%v", messages, messageRuns, wantRuns, err)
+			}
+		})
 	}
 }
 
@@ -6860,6 +6905,12 @@ func TestTaskAwaitingReviewUnderOrchestrationCannotBeRedispatched(t *testing.T) 
 
 func TestTaskAwaitingReviewReleasedJobCanBeRedispatched(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
+	// 这里只验证任务归属和派发准入，不能依赖机器上的真实 WSL/CLI 就绪。
+	server.runner = runnerFunc(func(ctx context.Context, _ AgentRunRequest, _ AgentRunSink) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	server.wslRunner = server.runner
 	enableOrchestrationForTest(t, server, projectID)
 	taskID := createTaskForTest(t, server.routes(), projectID, "Released orchestration task")
 	if _, err := server.db.Exec(`update tasks set status=? where id=?`, taskAwaitingReview, taskID); err != nil {
@@ -6873,8 +6924,8 @@ func TestTaskAwaitingReviewReleasedJobCanBeRedispatched(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/dispatch", bytes.NewBufferString(`{}`)))
-	if response.Code == http.StatusConflict && strings.Contains(response.Body.String(), "自动编排尚未结束此任务") {
-		t.Fatalf("released orchestration job should not block manual re-dispatch: status=%d body=%s", response.Code, response.Body.String())
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("released orchestration job should allow manual re-dispatch: status=%d body=%s", response.Code, response.Body.String())
 	}
 	// 下发应真正推进（进入 running），而非被编排终态 job 拦下。
 	assertTaskStatus(t, server, taskID, taskRunning)
@@ -8595,6 +8646,7 @@ func TestReorderRejectsPartialList(t *testing.T) {
 func TestOrchestrationDispatchLinksIntentAndRunInOneTransaction(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	server.wslRunner = server.runner
 	taskID := createTaskForTest(t, server.routes(), projectID, "intent linkage")
 	var projectPath string
 	if err := server.db.QueryRow(`select path from projects where id=?`, projectID).Scan(&projectPath); err != nil {
@@ -8847,11 +8899,14 @@ func TestWaitForGitCommandHasFinalBound(t *testing.T) {
 }
 
 func TestGitCommandEnvironmentDisablesInheritedAskpassAndDangerousProtocols(t *testing.T) {
-	env := gitCommandEnvironment([]string{"PATH=/usr/bin", "GIT_ASKPASS=/tmp/unsafe", "GIT_TERMINAL_PROMPT=1", "GIT_CONFIG_COUNT=1", "GIT_DIR=/tmp/other-repository", "GIT_WORK_TREE=/tmp/other-worktree", "GIT_INDEX_FILE=/tmp/other-index", "GIT_COMMON_DIR=/tmp/other-common", "GIT_OBJECT_DIRECTORY=/tmp/other-objects", "GIT_ALTERNATE_OBJECT_DIRECTORIES=/tmp/other-alternates"})
+	env := gitCommandEnvironment([]string{"PATH=/usr/bin", "GIT_ASKPASS=/tmp/unsafe", "GIT_TERMINAL_PROMPT=1", "GIT_CONFIG_COUNT=1", "GIT_DIR=/tmp/other-repository", "GIT_WORK_TREE=/tmp/other-worktree", "GIT_INDEX_FILE=/tmp/other-index", "GIT_COMMON_DIR=/tmp/other-common", "GIT_OBJECT_DIRECTORY=/tmp/other-objects", "GIT_ALTERNATE_OBJECT_DIRECTORIES=/tmp/other-alternates", "GIT_OPTIONAL_LOCKS=1"})
 	values := map[string]string{}
 	for _, entry := range env {
 		parts := strings.SplitN(entry, "=", 2)
 		values[parts[0]] = parts[1]
+	}
+	if values["GIT_OPTIONAL_LOCKS"] != "0" {
+		t.Fatalf("read operations may refresh a supervised index: %#v", values)
 	}
 	if values["GIT_ASKPASS"] != "" || values["GIT_TERMINAL_PROMPT"] != "0" || values["GIT_CONFIG_COUNT"] != "2" || values["GIT_CONFIG_KEY_0"] != "protocol.ext.allow" || values["GIT_CONFIG_VALUE_0"] != "never" || values["GIT_CONFIG_KEY_1"] != "protocol.file.allow" || values["GIT_CONFIG_VALUE_1"] != "never" {
 		t.Fatalf("unsafe Git environment: %#v", values)
@@ -11544,9 +11599,10 @@ func TestConversationAcceptsNewTurnsAfterStuckSessionIsReleased(t *testing.T) {
 	server.sessions[conversationID] = managed
 	managed.markStopping()
 	server.mu.Unlock()
-	go server.watchStreamingSession(conversationID, managed)
 
 	// 还在停止中就先拒绝：绝不能把新一轮挂到正在退出的旧进程上。
+	// 先验证准入，再启动宽限期回收，避免较慢的共享目录准入检查跨过 40ms
+	// 使 watcher 提前移除会话，导致这里实际测成了“回收后发送”。
 	stopping := httptest.NewRecorder()
 	server.routes().ServeHTTP(stopping, httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversationID+"/messages", bytes.NewBufferString(`{"content":"继续"}`)))
 	if stopping.Code != http.StatusConflict {
@@ -11554,6 +11610,7 @@ func TestConversationAcceptsNewTurnsAfterStuckSessionIsReleased(t *testing.T) {
 	}
 
 	// 兜底释放之后必须能继续对话。
+	go server.watchStreamingSession(conversationID, managed)
 	waitForManagedSessionRemoval(t, server, conversationID)
 	resumed := httptest.NewRecorder()
 	server.routes().ServeHTTP(resumed, httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversationID+"/messages", bytes.NewBufferString(`{"content":"继续"}`)))
@@ -11720,7 +11777,7 @@ func TestRecreatedStreamingSessionResumesPersistedNativeSession(t *testing.T) {
 	server.mu.Lock()
 	server.streamingSetups["resume-run"] = &streamingSetup{}
 	server.mu.Unlock()
-	started, err := server.streamingSession(context.Background(), runner, "resume-run", conversation, nil, "runner", t.TempDir())
+	started, err := server.streamingSession(context.Background(), runner, "resume-run", conversation, nil, server.localRunnerID(), t.TempDir())
 	if err != nil {
 		t.Fatalf("start replacement session: %v", err)
 	}

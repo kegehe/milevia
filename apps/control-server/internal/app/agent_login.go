@@ -62,17 +62,21 @@ func (s *Server) runAgentLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := loginR.Login(r.Context())
 	if err != nil {
-		info = agentLoginInfo{Message: fmt.Sprintf("无法发起 %s 登录：%v。请打开官方登录页完成授权。", entry.Name, err)}
-	} else if info.AuthURL == "" && info.UserCode == "" {
+		info = agentLoginInfo{Message: fmt.Sprintf("无法发起 %s 登录：%v。可在目标环境终端运行 %s 完成授权，再检查登录状态。", entry.Name, err, agentLoginCommand(entry))}
+	} else if info.AuthURL == "" && info.UserCode == "" && info.Message == "" {
 		// 管理 runner 的 Login 不真正拉起交互式 TUI（无头环境无法驱动），如实给可直接
 		// 操作的指引，不说"已经启动流程"这类对其运行状态无法保证的话。
 		//
 		// ⚠️ 工具名与命令名都从**目录**取，不写死：写死的那一版在新增第二个需要登录的
 		// 工具时，会把用户指向另一个 CLI（而这句话是"点进去之后唯一的指引"）。
-		info.Message = fmt.Sprintf("%s 需要登录后才能使用。请在目标环境的终端里运行 %s 完成登录授权，然后回到本页点「检查登录状态」。",
-			entry.Name, agentLoginCommand(entry))
+		info.Message = agentTerminalLoginGuidance(entry)
 	}
 	writeJSON(w, http.StatusOK, info)
+}
+
+func agentTerminalLoginGuidance(entry AgentCatalogEntry) string {
+	return fmt.Sprintf("如需使用 %s 账号授权，请在目标环境的终端里运行 %s 完成登录，然后回到本页点「检查登录状态」。",
+		entry.Name, agentLoginCommand(entry))
 }
 
 // agentLoginCommand 是“去终端里登录”的完整命令。目录没有声明 LoginArgs 时只给命令名，
@@ -88,7 +92,7 @@ func agentLoginCommand(entry AgentCatalogEntry) string {
 
 // agentLoginStatus 是 GET /api/runners/{runnerID}/agents/{agentID}/login-status。
 //
-// 回三件事：authStatus（三态，见 agent_auth.go）、note（判断不了时的一句话）、
+// 回三件事：authStatus（见 agent_auth.go）、note（配置凭据或判断不了时的说明）、
 // loggedIn（**给旧客户端留的兼容字段**：桌面端/手机端可能落后一个版本，而它们只认得
 // 这个 bool）。新界面只读 authStatus —— bool 表达不了"判断不了"，而"判断不了"被念成
 // "未登录"正是这一轮要修的那件事。
@@ -102,13 +106,12 @@ func (s *Server) agentLoginStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("不支持的工具"+agentID))
 		return
 	}
-	if !entry.SupportsLogin {
-		// 平台连登录入口都不给的工具，"登录状态"这个读数就没有意义。回 501 而不是
-		// 一个假的 false —— 后者会让调用方以为"它只是没登录"。
+	if !entry.SupportsAuthStatus {
+		// 查询能力与发起登录独立，缺少查询适配时返回 501。
 		//
 		// 判定放在解析后端**之前**：这条结论与执行环境无关（哪台机器上都一样），
 		// 先解析只会把 501 变成一个随环境变化的 404。
-		writeError(w, http.StatusNotImplemented, fmt.Errorf("%s 不在平台内登录的支持范围内", entry.Name))
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("%s 尚未提供认证查询能力", entry.Name))
 		return
 	}
 	_, _, backend, err := s.resolveAgent(r.Context(), runnerID, agentID)

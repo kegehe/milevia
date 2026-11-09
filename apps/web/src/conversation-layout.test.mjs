@@ -37,7 +37,7 @@ test("每条消息（用户与 AI 回复）都能从图标按钮复制", () => {
   assert.match(clipboard, /try \{\s*textarea\.select\(\);[\s\S]*?\} finally \{\s*textarea\.remove\(\);/);
   // 消息按钮在写入失败时给出提示，而不是静默失败。
   assert.match(conversationPage, /import \{ copyToClipboard \} from "\.\.\/lib\/clipboard";/);
-  assert.match(conversationPage, /contentRef\.current = message\.content;/);
+  assert.match(conversationPage, /contentRef\.current = attachmentMessageBody\(message\);/);
   assert.match(conversationPage, /const copy = async \(content = contentRef\.current\) => \{/);
   assert.match(conversationPage, /if \(!\(await copyToClipboard\(content\)\)\) \{/);
   // 复制按钮不区分角色：用户消息与 AI 回复都带一个（AI 回复此前只能靠框选整段复制）。
@@ -134,12 +134,16 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /const recordAssistantOutput = useCallback[\s\S]*?if \(outputs\.size > 128\)[\s\S]*?pendingUserDrafts\.current\.delete\(runID\);/);
   assert.match(conversationPage, /pendingUserDrafts\.current\.set\(data\.runId, data\.message\.content\)/);
   assert.match(conversationPage, /const shouldRetractMessage = !assistantOutputRuns\.current\.has\(runID\);\s*const draftToRestore = shouldRetractMessage \? pendingUserDrafts\.current\.get\(runID\) : undefined;/s);
-  assert.match(conversationPage, /const restorePendingUserDraft = \(conversationID: string, routeVersion: number, runID: string, draft: string \| undefined\) => \{\s*if \(!draft \|\| conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return;/s);
-  assert.match(conversationPage, /setText\(\(current\) => current === "" \? draft : current\);/);
+  const restoreBody = conversationPage.match(/const restorePendingUserDraft = [\s\S]*?\n  \};/)?.[0] ?? "";
+  assert.match(restoreBody, /draft === undefined && !files\.length/);
+  assert.match(restoreBody, /conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion/);
+  assert.match(restoreBody, /assistantOutputRuns\.current\.has\(runID\)/);
+  assert.match(restoreBody, /addAttachments\(files\)/);
+  assert.match(restoreBody, /setText\(\(current\) => current === "" \? draft \?\? "" : current\);/);
   assert.match(conversationPage, /saveConversationDraft\(projectId, conversationID, restoredText\)/);
   // routeVersion 现在先于 conversationID 捕获（停止锁用 conversationId|routeVersion 做键）。
   assert.match(conversationPage, /const routeVersion = conversationRouteVersion\.current;[\s\S]{0,320}?const conversationID = conversation\.id;\s*const runID = run;/s);
-  assert.match(conversationPage, /restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore\);/);
+  assert.match(conversationPage, /restorePendingUserDraft\(conversationID, routeVersion, runID, draftToRestore, attachmentsToRestore\);/);
   // 强制停止也必须按终态判据收尾：非终态（还在排队 / 不由本机控制）时不能撤回消息、
   // 不能恢复草稿，否则用户会以为那一轮已经没了。
   assert.match(conversationPage, /stopRunInternal\(true, runID\)\.then\(\(result\) => \{[\s\S]{0,240}?runStatusIsFinished\(result\)[\s\S]{0,240}?retractUserMessage\(\);/);
@@ -148,7 +152,7 @@ test("stopping an unanswered direct prompt restores it to the composer", () => {
   assert.match(conversationPage, /composer-stop-note/);
   // 20s 兜底现在写成可重排的 check（请求在飞时每 5s 复查一次），复位与提示仍在同一个函数里。
   assert.match(conversationPage, /const check = \(\) => \{[\s\S]{0,500}?setStopping\(false\);[\s\S]{0,240}?setStopNotice\("停止请求已发出/);
-  assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
+  assert.match(conversationPage, /pendingUserDrafts\.current\.delete\(event\.runId\);\s*pendingUserAttachments\.current\.delete\(event\.runId\);\s*assistantOutputRuns\.current\.delete\(event\.runId\);/s);
 });
 
 test("branch status card opens upward and keeps a single source for its readings", () => {
@@ -408,7 +412,12 @@ test("user-triggered stop or clear cancels a pending scheduled send", () => {
 
 test("a failed send restores its draft only while the original conversation remains active", () => {
   assert.match(conversationPage, /const conversationID = conversation\.id;\s*const clientRequestId = options\.clientRequestId \?\? crypto\.randomUUID\(\);\s*const routeVersion = conversationRouteVersion\.current;\s*const content = composeSkillMessage\(draft, refs\);\s*setSending\(true\);/s);
-  assert.match(conversationPage, /catch \(cause\) \{\s*if \(conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) return false;\s*if \(notifyFailure\) fail\(cause instanceof Error \? cause\.message : "无法发送消息"\);\s*if \(clearDraft && restoreOnFailure\) \{/s);
+  const catchBody = conversationPage.match(/catch \(cause\) \{\s*if \(conversationRef\.current\?\.id !== conversationID \|\| conversationRouteVersion\.current !== routeVersion\) \{([\s\S]*?)return false;\s*\}\s*if \(notifyFailure\) fail\(cause instanceof Error \? cause\.message : "无法发送消息"\);\s*if \(clearDraft && restoreOnFailure\) \{/s)?.[1];
+  assert.ok(catchBody, "离开原会话后应先退出，再恢复当前视图草稿");
+  // 合并恢复草稿时不能按发送上限截断，超出的附件应保留给用户处理。
+  assert.match(catchBody, /localStorage\.setItem\(key, JSON\.stringify\(merged\)\)/);
+  assert.doesNotMatch(catchBody, /\.slice\(0, 8\)/);
+  assert.doesNotMatch(catchBody, /setComposerText|setSkillRefs|updateAttachments|setAttachments/);
 });
 
 test("switching conversations from the history dialog closes it before moving the tab", () => {
@@ -559,7 +568,7 @@ test("approval and task-board views keep working inside the workspace", () => {
 
 test("Git workbench, project runner, and terminal are first-class workspace tabs", () => {
   // Types 在 lib/types.ts
-  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "orchestration" \| "files" \| "git" \| "run" \| "terminal" \| "insights";/);
+  assert.match(types, /type WorkspaceTab = "conversation" \| "tasks" \| "orchestration" \| "supervision" \| "files" \| "git" \| "run" \| "terminal" \| "insights";/);
   // ProjectLayout 管理 workspace tabs
   assert.match(projectLayout, /const \[workspaceTab, setWorkspaceTab\] = useState<WorkspaceTab>/);
   assert.match(projectLayout, /<nav className="workspace-tabs" role="tablist" aria-label="项目工作区" onKeyDown=\{navigateWorkspaceTabs\}>/);
@@ -734,7 +743,7 @@ test("clearing context closes the current tab and starts a fresh conversation wi
   assert.match(taskQueue, /const redispatchRequest = useRef\(0\);/);
   assert.match(conversationPage, /<button className="composer-icon-btn danger composer-clear" type="button" title="清空内容并新建对话" aria-label="清空内容并新建对话" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\} onClick=\{clearConversationContext\}><ComposerActionIcon action="clear" \/><\/button>/);
   assert.match(conversationPage, /<button className="composer-icon-btn composer-continue" type="button" title="继续任务" aria-label="继续任务" disabled=\{readOnlyConversation \|\| sending \|\| clearing \|\| stopping \|\| handingOff\} onClick=\{\(\) => void sendContent\("继续", false\)\}><ComposerActionIcon action="continue" \/><\/button>/);
-  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| \(!text\.trim\(\) && skillRefs\.length === 0\) \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\}><ComposerActionIcon action="send" \/>/);
+  assert.match(conversationPage, /<button className="primary composer-action composer-send" disabled=\{readOnlyConversation \|\| \(!text\.trim\(\) && skillRefs\.length === 0 && attachments\.length === 0\) \|\| attachmentBusy \|\| workspaceBusy \|\| sending \|\| clearing \|\| stopping \|\| Boolean\(shortcutBusy\) \|\| handingOff\}><ComposerActionIcon action="send" \/>/);
 });
 
 test("/clear in the composer and the 清屏 shortcut route through the app clear flow", () => {

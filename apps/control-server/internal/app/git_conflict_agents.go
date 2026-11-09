@@ -79,6 +79,16 @@ func (s *Server) runConflictSuggestionAgent(ctx context.Context, project Project
 	if runner == nil || !runner.Ready(ctx) {
 		return "", fmt.Errorf("%s 不可用，请先在 CLI 工具页安装或登录", entry.Name)
 	}
+	ctx, releaseWorkspace, err := s.beginCLIWorkspaceOperationAtPath(ctx, project, project.Path, "conflict-suggestion-agent")
+	if err != nil {
+		return "", err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseWorkspace()
+		}
+	}()
 	request := AgentRunRequest{
 		SessionID: uuid.NewString(), ProjectPath: project.Path,
 		AgentID: agentID, Prompt: prompt, PermissionMode: "read_only",
@@ -94,13 +104,28 @@ func (s *Server) runConflictSuggestionAgent(ctx context.Context, project Project
 		if startErr != nil {
 			return "", startErr
 		}
-		defer session.Stop()
+		transferred = true
+		exitObserved := false
+		defer func() {
+			session.Stop()
+			// Done 只保证发送一次退出结果，不保证关闭。若 select 已消费该结果，
+			// 不能再次等待；否则在当前接收方返回后接收一次，避免抢走退出错误。
+			if exitObserved {
+				releaseWorkspace()
+				return
+			}
+			go func() {
+				<-session.Done()
+				releaseWorkspace()
+			}()
+		}()
 		if err := session.Send(request, sink); err != nil {
 			return "", err
 		}
 		select {
 		case err = <-sink.finished:
 		case err = <-session.Done():
+			exitObserved = true
 			// result 与进程退出可以同时就绪；已经完成的回合优先。
 			select {
 			case err = <-sink.finished:

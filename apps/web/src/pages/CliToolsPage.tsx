@@ -34,6 +34,7 @@ import { api } from "../lib/api";
 import { ExternalLink } from "../components/ExternalLink";
 import { agentDisplayName, loadAgentCatalog, useAgentCatalogState } from "../lib/agent-registry";
 import { copyToClipboard } from "../lib/clipboard";
+import { CLIAuthRequests } from "../lib/cli-auth-requests";
 import {
   describeRepair,
   diagnoseMoment,
@@ -153,13 +154,11 @@ export default function CliToolsPage() {
    * 服务端有 5 分钟缓存 + singleflight，反复进出不会反复拉起 CLI。
    */
   const [authStates, setAuthStates] = useState<Record<string, AgentAuthStatus>>({});
+  const [authNotes, setAuthNotes] = useState<Record<string, string>>({});
   /**
-   * 面板当前展示的是哪个工具（空串 = 面板关着）。
-   *
-   * 挡的是"回来晚的那份读数"：面板里的状态是**单槽**的，而读登录态是异步的 —— 用户关掉
-   * 面板、换一个工具再打开，前一个工具的结果回来时不许写进后一个工具的面板。
+   * 同一工具关闭重开、手动刷新、切换环境后，旧响应不能覆盖新面板或卡片。
    */
-  const loginPanelAgent = useRef("");
+  const authRequests = useRef(new CLIAuthRequests());
   const [runtimeCatalog, setRuntimeCatalog] = useState<RuntimeCatalog | null>(null);
   /** 打开了哪个工具的「详情」抽屉（存 agentID）。 */
   const [openAgent, setOpenAgent] = useState("");
@@ -392,7 +391,7 @@ export default function CliToolsPage() {
   // 2026-09-29 复查）。所以用**读数身份**去重：同一份 view 上只跑一次诊断。
   const diagnosedViewRef = useRef<typeof view>(null);
   useEffect(() => {
-    if (viewState !== "ready" || !view?.probeOk) return;
+    if (viewState !== "ready" || !view?.probeOk || view.runnerId !== selectedRunner) return;
     // 手动刷新只把"这一次要绕过缓存"的意愿放在 ref 上，由这里取用并**立刻复位**
     // —— 触发点仍然只有这一个，不会因为多了个 force 就多跑一轮。
     const force = forceNextReadings.current;
@@ -512,6 +511,7 @@ export default function CliToolsPage() {
   // 已安装 codebuddy 的真机输出校准 —— 后端当前会回一个可操作指引（见 agent_login.go）。
   const runLogin = useCallback(async () => {
     if (!loginAgent || loginBusy) return;
+    const isCurrent = authRequests.current.beginPanel();
     setLoginBusy(true);
     setLoginInfo(null);
     try {
@@ -519,11 +519,11 @@ export default function CliToolsPage() {
         `/api/runners/${encodeURIComponent(selectedRunner)}/agents/${encodeURIComponent(loginAgent.agentID)}/login`,
         { method: "POST" },
       );
-      setLoginInfo(result);
+      if (isCurrent()) setLoginInfo(result);
     } catch (cause) {
-      setLoginInfo({ message: cause instanceof Error ? cause.message : "发起登录失败" });
+      if (isCurrent()) setLoginInfo({ message: cause instanceof Error ? cause.message : "发起登录失败" });
     } finally {
-      setLoginBusy(false);
+      if (isCurrent()) setLoginBusy(false);
     }
   }, [loginAgent, loginBusy, selectedRunner]);
 
@@ -538,17 +538,22 @@ export default function CliToolsPage() {
    */
   const readAuthStatus = useCallback(async (runnerID: string, agentID: string, force = false) => {
     const key = `${runnerID}:${agentID}`;
+    const isCurrent = authRequests.current.beginReading(runnerID, agentID);
     try {
       const result = await api<LoginStatusResult>(
         withForce(`/api/runners/${encodeURIComponent(runnerID)}/agents/${encodeURIComponent(agentID)}/login-status`, force),
       );
       // 空串也要当成"判断不了"：服务端在"调用方没等到"那一档会回空值。
       const state = result.authStatus ? result.authStatus : "unreadable";
+      if (!isCurrent()) return null;
       setAuthStates((current) => ({ ...current, [key]: state }));
+      setAuthNotes((current) => ({ ...current, [key]: result.note ?? "" }));
       return { state, note: result.note ?? "" };
     } catch (cause) {
+      if (!isCurrent()) return null;
       // 读不到**不是**未登录：这一档照样给登录入口，但面板里要说清"没读成"。
       setAuthStates((current) => ({ ...current, [key]: "unreadable" }));
+      setAuthNotes((current) => ({ ...current, [key]: cause instanceof Error ? cause.message : "读取登录状态失败" }));
       return { state: "unreadable" as const, note: cause instanceof Error ? cause.message : "读取登录状态失败" };
     }
   }, []);
@@ -557,15 +562,16 @@ export default function CliToolsPage() {
   const checkLoginStatus = useCallback(async () => {
     if (!loginAgent || loginBusy) return;
     const agentID = loginAgent.agentID;
+    const isCurrent = authRequests.current.beginPanel();
     setLoginBusy(true);
+    setLoginInfo(null);
     try {
       const result = await readAuthStatus(selectedRunner, agentID, true);
-      // 与 openLogin 里那条同理：面板是**单槽**的，回来晚的那份不许写进别的工具的面板。
-      if (loginPanelAgent.current !== agentID) return;
+      if (!isCurrent() || !result) return;
       setLoginAuth(result.state);
       setLoginNote(result.note);
     } finally {
-      setLoginBusy(false);
+      if (isCurrent()) setLoginBusy(false);
     }
   }, [loginAgent, loginBusy, readAuthStatus, selectedRunner]);
 
@@ -580,13 +586,23 @@ export default function CliToolsPage() {
    * 而**不会**变成"未登录"，更不会因此把一颗「登录」按钮亮在一个已登录的工具上。
    */
   useEffect(() => {
-    if (viewState !== "ready" || !view?.probeOk) return;
-    const loginIDs = new Set(catalog.entries.filter((entry) => entry.supportsLogin).map((entry) => entry.id));
+    if (viewState !== "ready" || !view?.probeOk || view.runnerId !== selectedRunner) return;
+    const loginIDs = new Set(catalog.entries.filter((entry) => entry.supportsAuthStatus ?? entry.supportsLogin).map((entry) => entry.id));
     for (const item of view.items) {
       if (!item.installed || !loginIDs.has(item.id)) continue;
       void readAuthStatus(selectedRunner, item.id);
     }
   }, [catalog.entries, readAuthStatus, selectedRunner, view, viewState]);
+
+  // 后发的自动查询可能取代面板初次请求；面板仍消费同一个最新缓存。
+  useEffect(() => {
+    if (!loginAgent || loginBusy) return;
+    const key = `${selectedRunner}:${loginAgent.agentID}`;
+    if (authStates[key]) {
+      setLoginAuth(authStates[key]);
+      setLoginNote(authNotes[key] ?? "");
+    }
+  }, [authStates, authNotes, loginAgent, loginBusy, selectedRunner]);
 
   /**
    * 打开登录面板。
@@ -596,9 +612,10 @@ export default function CliToolsPage() {
    */
   const openLogin = useCallback((agentID: string, name: string) => {
     const known = authStates[`${selectedRunner}:${agentID}`];
-    loginPanelAgent.current = agentID;
+    const isCurrent = authRequests.current.beginPanel();
+    setLoginBusy(false);
     setLoginAuth(known ?? "");
-    setLoginNote("");
+    setLoginNote(authNotes[`${selectedRunner}:${agentID}`] ?? "");
     setLoginInfo(null);
     setLoginAgent({ agentID, name });
     if (!known) {
@@ -607,12 +624,19 @@ export default function CliToolsPage() {
       void readAuthStatus(selectedRunner, agentID).then((result) => {
         // 这期间用户可能已经关掉面板、或换了一个工具打开 —— 回来晚的那份**不许**盖上去
         // （那一刻 panel 上写的是另一个工具的名字，说它的登录态就是张冠李戴）。
-        if (loginPanelAgent.current !== agentID) return;
+        if (!isCurrent() || !result) return;
         setLoginAuth(result.state);
         setLoginNote(result.note);
       });
     }
-  }, [authStates, readAuthStatus, selectedRunner]);
+  }, [authStates, authNotes, readAuthStatus, selectedRunner]);
+
+  useEffect(() => {
+    authRequests.current.closePanel();
+    setLoginAgent(null);
+    setLoginBusy(false);
+    return () => authRequests.current.closePanel();
+  }, [selectedRunner]);
 
   // 逐主机授权：只对这一台机器生效，且可随时撤销（撤销入口在远程控制页/后续版本）。
   const grantRunnerInstall = useCallback(async () => {
@@ -755,6 +779,7 @@ export default function CliToolsPage() {
     else setPending({ kind: "repair", agentID: card.id, remedies: action.remedies });
   }, []);
 
+  const loginCanStart = !!catalog.entries.find((entry) => entry.id === loginAgent?.agentID)?.supportsLogin;
   return <main className="app-shell cli-tools-shell">
     <header className="dashboard-bar cli-tools-bar">
       {/* 返回收成圆形图标钮（aria-label 承担可读名）：纯导航，视觉上让位给标题。 */}
@@ -927,11 +952,11 @@ export default function CliToolsPage() {
                             亮着登录，会让人以为登录没生效；点开它就是面板（换账号/重新登录）。
                             未登录或判断不了 → 「登录」按钮。
                             还没读到 → 什么都不给（页面正在后台探，探回来自己会变）。 */}
-                        {card.login && <button type="button" className={`secondary${card.login === "logged-in" ? " cli-tools-auth-chip" : ""}`}
+                        {card.login && <button type="button" className={`secondary${card.login === "logged-in" || card.login === "configured" ? " cli-tools-auth-chip" : ""}`}
                           data-state={card.login} disabled={busy}
                           title={card.login === "logged-in" ? "已登录；点开可查看状态或换账号" : undefined}
                           onClick={() => openLogin(card.id, card.name)}>
-                          {card.login === "logged-in" ? "已登录" : "登录"}
+                          {card.login === "logged-in" ? "已登录" : card.login === "configured" ? "已配置认证" : "登录"}
                         </button>}
                         {/* 「详情」只在模型判定"这张卡的下一步就在抽屉里"时出现（canOpenDetails）。
                             横幅只指向**第一张**问题卡，别的卡（第 2 张要处理的、"没检查成功"那一档）
@@ -1207,17 +1232,19 @@ export default function CliToolsPage() {
         <header>
           <div><label>登录</label><h2 id="cli-tools-login-title">{loginAgent.name}</h2></div>
           {loginAuth === "logged_in" && <span className="cli-tools-login-ok">已登录</span>}
+          {loginAuth === "configured" && <span className="cli-tools-login-ok">已配置认证</span>}
         </header>
         <div className="cli-tools-login-body">
           {loginInfo === null ? (<>
             {/* 面板一打开就把**已知的**结论说出来，而不是让用户再点一次「检查登录状态」
                 去换一句他已经知道的话。四档各有各的说法：已登录 / 正在读 / 判断不了 / 未登录。 */}
-            {loginAuth === "logged_in" && <p>该工具已登录，可以直接使用。要换账号请点「发起登录」重新授权。</p>}
+            {loginAuth === "logged_in" && <p>已读取到该工具的账号登录信息。{loginCanStart ? "要换账号请点「发起登录」查看指引。" : "需要换账号时，请在目标环境的 CLI 中操作。"}</p>}
+            {loginAuth === "configured" && <p>已配置 API Key 或其他认证凭据，尚未验证其有效性。{loginCanStart ? "如需使用账号登录，可点「发起登录」查看指引。" : "需要调整认证时，请在目标环境的 CLI 中操作。"}</p>}
             {loginAuth === "" && <p>正在读取登录状态…</p>}
-            {loginAuth === "unreadable" && <p>这个工具的登录状态无法自动判断。若它确实还没登录，点「发起登录」按指引完成授权。</p>}
+            {loginAuth === "unreadable" && <p>暂时未能确认登录状态，可重新检查。{loginCanStart ? "若确实还没登录，点「发起登录」按指引完成授权。" : "若确实还没登录，请在目标环境的 CLI 中完成授权。"}</p>}
             {/* 判断不了 ≠ 未登录：原因要说出来，别让用户以为登录没生效。 */}
             {loginAuth === "unreadable" && loginNote && <p className="cli-tools-hintline">{loginNote}</p>}
-            {loginAuth === "logged_out" && <p>该工具需要登录后才能使用。点击「发起登录」在本机启动登录流程；若页面拿到授权链接，请在浏览器打开并完成授权。</p>}
+            {loginAuth === "logged_out" && <p>未读取到该工具的认证。{loginCanStart ? "点击「发起登录」查看目标环境的授权链接或终端指引，完成后重新检查。" : "请在目标环境的 CLI 中完成授权，然后重新检查。"}</p>}
             {/* 这条只对 CodeBuddy 说：它的登录是官方交互式 TUI，拿不到无头设备码 URL
                 （后端 agent_login.go 那两条等价指引要等点过「发起登录」才经 message 出现）。
                 以前对所有工具无条件显示，其它工具那边它是废话。 */}
@@ -1230,11 +1257,11 @@ export default function CliToolsPage() {
         </div>
         <footer>
           <button className="secondary" disabled={loginBusy} onClick={() => {
-            loginPanelAgent.current = "";
+            authRequests.current.closePanel();
             setLoginAgent(null);
           }}>关闭</button>
           <button className="secondary" disabled={loginBusy} onClick={() => void checkLoginStatus()}>{loginBusy ? "读取中…" : (loginAuth === "logged_in" ? "刷新登录状态" : "检查登录状态")}</button>
-          <button className="primary" disabled={loginBusy} onClick={() => void runLogin()}>{loginBusy ? "处理中…" : "发起登录"}</button>
+          {loginCanStart && <button className="primary" disabled={loginBusy} onClick={() => void runLogin()}>{loginBusy ? "处理中…" : "发起登录"}</button>}
         </footer>
       </section>
     </div>}

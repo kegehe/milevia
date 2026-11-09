@@ -54,6 +54,7 @@ type FileEntry struct {
 
 // FileInfo 文件元信息。
 type FileInfo struct {
+	Regular  bool   `json:"-"` // internal attachment validation; permissions alone omit file type
 	Name     string `json:"name"`
 	Path     string `json:"path"`
 	IsDir    bool   `json:"isDir"`
@@ -158,8 +159,8 @@ func (fs *LocalFilesystem) OpenRead(ctx context.Context, path string) (io.ReadCl
 	if err != nil {
 		return nil, FileInfo{}, err
 	}
-	if info.IsDir {
-		return nil, FileInfo{}, errors.New("路径是目录，不是文件")
+	if !info.Regular {
+		return nil, FileInfo{}, errors.New("路径不是普通文件")
 	}
 	absPath, err := fs.resolvePath(path)
 	if err != nil {
@@ -183,7 +184,7 @@ func (fs *LocalFilesystem) Stat(ctx context.Context, path string) (FileInfo, err
 	}
 	// 对于文本检测，只读前 512 字节
 	var sample []byte
-	if !info.IsDir() && info.Size() > 0 {
+	if info.Mode().IsRegular() && info.Size() > 0 {
 		f, err := os.Open(absPath)
 		if err == nil {
 			sample = make([]byte, 512)
@@ -538,6 +539,7 @@ func (fs *LocalFilesystem) makeFileInfo(absPath string, info os.FileInfo, sample
 	isText := isTextFile(filepath.Base(absPath), sample)
 	mode := fmt.Sprintf("%04o", info.Mode().Perm())
 	return FileInfo{
+		Regular:  info.Mode().IsRegular(),
 		Name:     info.Name(),
 		Path:     fs.relativePath(filepath.Dir(absPath), info.Name()),
 		IsDir:    info.IsDir(),
@@ -635,8 +637,8 @@ func (fs *SFTPFilesystem) OpenRead(ctx context.Context, path string) (io.ReadClo
 	if err != nil {
 		return nil, FileInfo{}, err
 	}
-	if info.IsDir {
-		return nil, FileInfo{}, errors.New("路径是目录，不是文件")
+	if !info.Regular {
+		return nil, FileInfo{}, errors.New("路径不是普通文件")
 	}
 	absPath, err := fs.resolvePath(ctx, path)
 	if err != nil {
@@ -668,7 +670,7 @@ func (fs *SFTPFilesystem) Stat(ctx context.Context, path string) (FileInfo, erro
 	}
 	// 对于文本检测，只读前 512 字节
 	var sample []byte
-	if !info.IsDir() && info.Size() > 0 {
+	if info.Mode().IsRegular() && info.Size() > 0 {
 		f, err := sftpClient.Open(absPath)
 		if err == nil {
 			sample = make([]byte, 512)
@@ -693,7 +695,7 @@ func (fs *SFTPFilesystem) Search(ctx context.Context, rootPath, query string) ([
 		shellQuote(absRoot),
 		escapedQuery,
 	)
-	output, err := fs.client.execCommand(ctx, cmd)
+	output, err := fs.client.execCommand(workspaceCommandContext(ctx, fs.rootPath), cmd)
 	if err != nil {
 		return nil, fmt.Errorf("远程搜索失败：%w", err)
 	}
@@ -733,7 +735,7 @@ func (fs *SFTPFilesystem) WriteFile(ctx context.Context, path string, content []
 	// 确保父目录存在
 	dir := pathpkg.Dir(absPath)
 	if dir != "" && dir != "/" {
-		if err := sftpClient.MkdirAll(dir); err != nil {
+		if err := fs.client.workspaceSFTPError(sftpClient.MkdirAll(dir), fs.rootPath); err != nil {
 			return fmt.Errorf("创建父目录失败：%w", err)
 		}
 	}
@@ -751,6 +753,7 @@ func (fs *SFTPFilesystem) WriteFile(ctx context.Context, path string, content []
 	}
 	if createOnly {
 		f, err := sftpClient.OpenFile(absPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+		err = fs.client.workspaceSFTPError(err, fs.rootPath)
 		if err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return errFileAlreadyExists
@@ -758,36 +761,39 @@ func (fs *SFTPFilesystem) WriteFile(ctx context.Context, path string, content []
 			return err
 		}
 		written, writeErr := f.Write(content)
+		writeErr = fs.client.workspaceSFTPError(writeErr, fs.rootPath)
 		if writeErr == nil && written != len(content) {
 			writeErr = io.ErrShortWrite
 		}
-		if closeErr := f.Close(); writeErr == nil {
+		if closeErr := fs.client.workspaceSFTPError(f.Close(), fs.rootPath); writeErr == nil {
 			writeErr = closeErr
 		}
 		if writeErr != nil {
-			_ = sftpClient.Remove(absPath)
+			_ = fs.client.workspaceSFTPError(sftpClient.Remove(absPath), fs.rootPath)
 			return writeErr
 		}
-		return sftpClient.Chmod(absPath, mode)
+		return fs.client.workspaceSFTPError(sftpClient.Chmod(absPath, mode), fs.rootPath)
 	}
 	tmpPath := pathpkg.Join(dir, ".auto-fs-write-"+uuid.NewString())
 	f, err := sftpClient.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	err = fs.client.workspaceSFTPError(err, fs.rootPath)
 	if err != nil {
 		return err
 	}
-	cleanup := func() { _ = sftpClient.Remove(tmpPath) }
+	cleanup := func() { _ = fs.client.workspaceSFTPError(sftpClient.Remove(tmpPath), fs.rootPath) }
 	written, err := f.Write(content)
+	err = fs.client.workspaceSFTPError(err, fs.rootPath)
 	if err == nil && written != len(content) {
 		err = io.ErrShortWrite
 	}
-	if closeErr := f.Close(); err == nil {
+	if closeErr := fs.client.workspaceSFTPError(f.Close(), fs.rootPath); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		cleanup()
 		return err
 	}
-	if err := sftpClient.Chmod(tmpPath, mode); err != nil {
+	if err := fs.client.workspaceSFTPError(sftpClient.Chmod(tmpPath, mode), fs.rootPath); err != nil {
 		cleanup()
 		return err
 	}
@@ -796,21 +802,21 @@ func (fs *SFTPFilesystem) WriteFile(ctx context.Context, path string, content []
 		cleanup()
 		return err
 	}
-	if err := sftpClient.PosixRename(tmpPath, absPath); err != nil {
-		if err = sftpClient.Rename(tmpPath, absPath); err != nil {
+	if err := fs.client.workspaceSFTPError(sftpClient.PosixRename(tmpPath, absPath), fs.rootPath); err != nil {
+		if err = fs.client.workspaceSFTPError(sftpClient.Rename(tmpPath, absPath), fs.rootPath); err != nil {
 			// 一些 SFTP v2 服务不允许 Rename 覆盖已有目标。先将旧文件
 			// 移到同目录备份，再替换；替换失败时尽力恢复旧文件。
 			backupPath := pathpkg.Join(dir, ".auto-fs-backup-"+uuid.NewString())
-			if backupErr := sftpClient.Rename(absPath, backupPath); backupErr != nil {
+			if backupErr := fs.client.workspaceSFTPError(sftpClient.Rename(absPath, backupPath), fs.rootPath); backupErr != nil {
 				cleanup()
 				return fmt.Errorf("原子替换远程文件失败：%w", err)
 			}
-			if replaceErr := sftpClient.Rename(tmpPath, absPath); replaceErr != nil {
-				_ = sftpClient.Rename(backupPath, absPath)
+			if replaceErr := fs.client.workspaceSFTPError(sftpClient.Rename(tmpPath, absPath), fs.rootPath); replaceErr != nil {
+				_ = fs.client.workspaceSFTPError(sftpClient.Rename(backupPath, absPath), fs.rootPath)
 				cleanup()
 				return fmt.Errorf("替换远程文件失败：%w", replaceErr)
 			}
-			_ = sftpClient.Remove(backupPath)
+			_ = fs.client.workspaceSFTPError(sftpClient.Remove(backupPath), fs.rootPath)
 		}
 	}
 	return nil
@@ -836,7 +842,7 @@ func (fs *SFTPFilesystem) Mkdir(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	return sftpClient.MkdirAll(absPath)
+	return fs.client.workspaceSFTPError(sftpClient.MkdirAll(absPath), fs.rootPath)
 }
 
 func (fs *SFTPFilesystem) Remove(ctx context.Context, path string) error {
@@ -863,16 +869,16 @@ func (fs *SFTPFilesystem) Remove(ctx context.Context, path string) error {
 	}
 	if info.IsDir() {
 		// 尝试删除空目录，如果非空则用 rm -rf
-		if err := sftpClient.RemoveDirectory(absPath); err != nil {
+		if err := fs.client.workspaceSFTPError(sftpClient.RemoveDirectory(absPath), fs.rootPath); err != nil {
 			// 非空目录，用远程命令删除
-			_, cmdErr := fs.client.execCommand(ctx, "rm -rf "+shellQuote(absPath))
+			_, cmdErr := fs.client.execCommand(workspaceCommandContext(ctx, fs.rootPath), "rm -rf "+shellQuote(absPath))
 			if cmdErr != nil {
 				return fmt.Errorf("删除目录失败：%w", cmdErr)
 			}
 		}
 		return nil
 	}
-	return sftpClient.Remove(absPath)
+	return fs.client.workspaceSFTPError(sftpClient.Remove(absPath), fs.rootPath)
 }
 
 func (fs *SFTPFilesystem) Rename(ctx context.Context, oldPath, newPath string) error {
@@ -896,7 +902,7 @@ func (fs *SFTPFilesystem) Rename(ctx context.Context, oldPath, newPath string) e
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return sftpClient.Rename(absOld, absNew)
+	return fs.client.workspaceSFTPError(sftpClient.Rename(absOld, absNew), fs.rootPath)
 }
 
 // resolvePath canonicalizes remote paths through SFTP and rejects paths which
@@ -988,6 +994,7 @@ func (fs *SFTPFilesystem) makeFileInfo(absPath string, info os.FileInfo, sample 
 	isText := isTextFile(pathpkg.Base(absPath), sample)
 	mode := fmt.Sprintf("%04o", info.Mode().Perm())
 	return FileInfo{
+		Regular:  info.Mode().IsRegular(),
 		Name:     info.Name(),
 		Path:     fs.relativePath(absPath),
 		IsDir:    info.IsDir(),

@@ -83,7 +83,7 @@ func TestNewConversationUsesApplicationDefaultsWhenRequestOmitsThem(t *testing.T
 	server := newTestServer(t)
 	server.codexRunner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
 	now := time.Now().UTC()
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,'wsl-local','main',1,?)`, t.TempDir(), now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('project','project',?,?,'main',1,?)`, t.TempDir(), server.localRunnerID(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
 	if _, err := server.db.Exec(`update app_preferences set default_agent_id='codex',codex_permission_mode='read_only' where id=1`); err != nil {

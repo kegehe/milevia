@@ -47,7 +47,7 @@ func TestWorkspaceSnapshotRestoreIsReal(t *testing.T) {
 	writeCheckpointFile(t, filepath.Join(root, "build", "artifact.bin"), "ignored\n")
 	writeCheckpointFile(t, filepath.Join(root, "debug.log"), "log\n")
 
-	gitDir, ref, metadata, err := server.createWorkspaceSnapshot(t.Context(), "checkpoint-project", root, "windows-local", "checkpoint-conversation")
+	gitDir, ref, metadata, err := server.createWorkspaceSnapshot(t.Context(), "checkpoint-project", root, server.localRunnerID(), "checkpoint-conversation")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestWorkspaceSnapshotRestoreIsReal(t *testing.T) {
 	writeCheckpointFile(t, filepath.Join(root, "new.txt"), "new\n")
 	writeCheckpointFile(t, filepath.Join(root, "fresh.log"), "log\n")
 
-	if err := server.restoreCheckpointCode(t.Context(), checkpointRestoreRequest{ProjectID: "checkpoint-project", ProjectPath: root, Runner: "windows-local", SnapshotDir: gitDir, SnapshotRef: ref, Engine: checkpointEngineGit}); err != nil {
+	if err := server.restoreCheckpointCode(t.Context(), checkpointRestoreRequest{ProjectID: "checkpoint-project", ProjectPath: root, Runner: server.localRunnerID(), SnapshotDir: gitDir, SnapshotRef: ref, Engine: checkpointEngineGit}); err != nil {
 		t.Fatal(err)
 	}
 	if got := readCheckpointFile(t, filepath.Join(root, "a.txt")); got != "before\n" {
@@ -158,14 +158,14 @@ func TestWorkspaceSnapshotRecoversFromStaleIndexLock(t *testing.T) {
 	server.config.DataDir = t.TempDir()
 	writeCheckpointFile(t, filepath.Join(root, "a.txt"), "before\n")
 
-	gitDir, _, _, err := server.createWorkspaceSnapshot(t.Context(), "checkpoint-project", root, "windows-local", "checkpoint-conversation")
+	gitDir, _, _, err := server.createWorkspaceSnapshot(t.Context(), "checkpoint-project", root, server.localRunnerID(), "checkpoint-conversation")
 	if err != nil {
 		t.Fatal(err)
 	}
 	writeCheckpointFile(t, filepath.Join(gitDir, "index.lock"), "")
 	writeCheckpointFile(t, filepath.Join(root, "a.txt"), "after\n")
 
-	_, ref, _, err := server.createWorkspaceSnapshot(t.Context(), "checkpoint-project", root, "windows-local", "checkpoint-conversation")
+	_, ref, _, err := server.createWorkspaceSnapshot(t.Context(), "checkpoint-project", root, server.localRunnerID(), "checkpoint-conversation")
 	if err != nil {
 		t.Fatalf("snapshot with a stale index lock failed: %v", err)
 	}
@@ -208,7 +208,7 @@ func seedCheckpointConversation(t *testing.T, server *Server) string {
 	t.Helper()
 	root := t.TempDir()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('checkpoint-project','checkpoint-project',?,'windows-local','main',1,?)`, root, now); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values ('checkpoint-project','checkpoint-project',?,?,'main',1,?)`, root, server.localRunnerID(), now); err != nil {
 		t.Fatalf("insert project: %v", err)
 	}
 	if _, err := server.db.Exec(`insert into conversations (id,project_id,claude_session_id,agent_id,agent_session_id,status,is_current,created_at,last_activity_at) values ('checkpoint-conversation','checkpoint-project','checkpoint-session','claude-code','checkpoint-session','idle',1,?,?)`, now, now); err != nil {
@@ -425,6 +425,9 @@ func TestForkConversationAtCheckpointDoesNotReuseRunIDs(t *testing.T) {
 	if _, err := server.db.Exec(`insert into messages (id,conversation_id,run_id,role,content,created_at) values ('message-1','checkpoint-conversation','old-run','user','keep',?)`, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := server.db.Exec(`update messages set attachments='[{"path":"docs/design.png","mediaType":"image/png","size":12}]' where id='message-1'`); err != nil {
+		t.Fatal(err)
+	}
 	snapshot := t.TempDir()
 	checkpointAt := time.Now().UTC().Add(time.Second)
 	if _, err := server.db.Exec(`insert into conversation_checkpoints (id,conversation_id,agent_id,native_session_id,prompt,snapshot_path,status,metadata,created_at) values ('checkpoint-1','checkpoint-conversation','claude-code','checkpoint-session','first',?,'active','{}',?)`, snapshot, checkpointAt); err != nil {
@@ -453,6 +456,14 @@ func TestForkConversationAtCheckpointDoesNotReuseRunIDs(t *testing.T) {
 	}
 	if runID != "" {
 		t.Fatalf("forked message reused run id %q", runID)
+	}
+	var rawAttachments string
+	if err := server.db.QueryRow(`select attachments from messages where conversation_id=?`, child.ID).Scan(&rawAttachments); err != nil {
+		t.Fatal(err)
+	}
+	files := decodeAttachments(rawAttachments)
+	if len(files) != 1 || files[0].Path != "docs/design.png" || files[0].Size != 12 {
+		t.Fatalf("forked message lost attachments: %s", rawAttachments)
 	}
 }
 
@@ -605,7 +616,7 @@ func TestSweepCheckpointSnapshotsCleansAndConverts(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeCheckpointFile(t, filepath.Join(root, "extra.txt"), "extra\n")
-	if err := server.restoreCheckpointCode(t.Context(), checkpointRestoreRequest{ProjectID: "checkpoint-project", ProjectPath: root, Runner: "windows-local", SnapshotDir: path, SnapshotRef: ref, Engine: checkpointEngineOf(metadata, ref)}); err != nil {
+	if err := server.restoreCheckpointCode(t.Context(), checkpointRestoreRequest{ProjectID: "checkpoint-project", ProjectPath: root, Runner: server.localRunnerID(), SnapshotDir: path, SnapshotRef: ref, Engine: checkpointEngineOf(metadata, ref)}); err != nil {
 		t.Fatal(err)
 	}
 	if got := readCheckpointFile(t, filepath.Join(root, "a.txt")); got != "before\n" {

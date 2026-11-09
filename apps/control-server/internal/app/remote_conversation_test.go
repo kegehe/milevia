@@ -28,8 +28,8 @@ import (
 func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	server := &Server{}
 	operations := server.remoteConversationOperations()
-	if len(operations) != 11 {
-		t.Fatalf("conversation operation count = %d, want 11", len(operations))
+	if len(operations) != 12 {
+		t.Fatalf("conversation operation count = %d, want 12", len(operations))
 	}
 	list, ok := operations["conversation.list"]
 	if !ok || list.Method != http.MethodGet || list.Scope != relayScopeProject || list.Path != "/conversations" || !list.Query || list.Handle == nil {
@@ -100,6 +100,10 @@ func TestConversationRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	model, ok := operations["conversation.model"]
 	if !ok || model.Method != http.MethodPost || model.Scope != relayScopeConversation || model.Path != "/model" || model.Query || model.Handle == nil {
 		t.Fatalf("conversation.model = %#v, want the desktop model override endpoint", model)
+	}
+	reasoning, ok := operations["conversation.reasoningEffort"]
+	if !ok || reasoning.Method != http.MethodPost || reasoning.Scope != relayScopeConversation || reasoning.Path != "/reasoning-effort" || reasoning.Query || reasoning.Handle == nil || len(reasoning.PathParams) != 0 {
+		t.Fatalf("conversation.reasoningEffort = %#v, want the desktop conversation reasoning endpoint", reasoning)
 	}
 	permission, ok := operations["conversation.permissionMode"]
 	if !ok || permission.Method != http.MethodPost || permission.Scope != relayScopeConversation || permission.Path != "/permission-mode" || permission.Query || permission.Handle == nil {

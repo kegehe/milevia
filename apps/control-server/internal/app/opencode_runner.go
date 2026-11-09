@@ -197,37 +197,19 @@ func (r *opencodeCLIRunner) Login(parent context.Context) (agentLoginInfo, error
 // 三态（见 agent_auth.go）：命中空标记 → 未登录；命令失败且凭据文件里也没有东西 →
 // **unreadable + 失败原因**（不是"未登录"：那次可能只是没跑起来）。
 func (r *opencodeCLIRunner) LoginStatus(parent context.Context) (agentAuthState, error) {
-	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
-	defer cancel()
-	cmd := opencodeCommandContext(ctx, r.opencodeBinary(), "auth", "list")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
 	entry, _ := agentByID("opencode")
+	state, err := localCLIAuthStatus(parent, entry, r.opencodeBinary())
 	if err == nil {
-		return agentAuthStateFromStatusOutput(string(out), entry.AuthStatusEmptyMarkers), nil
+		return state, nil
 	}
 	if opencodeAuthFileHasCredentials() {
-		return agentAuthLoggedIn, nil
+		return agentAuthConfigured, nil
 	}
 	return agentAuthUnreadable, err
 }
 
 func agentAuthListHasCredentials(output string, emptyMarkers []string) bool {
-	text := strings.TrimSpace(output)
-	if text == "" {
-		return false
-	}
-	lower := strings.ToLower(text)
-	markers := emptyMarkers
-	if len(markers) == 0 {
-		markers = []string{"0 credentials", "no credentials", "not logged in", "no providers"}
-	}
-	for _, marker := range markers {
-		if strings.Contains(lower, strings.ToLower(marker)) {
-			return false
-		}
-	}
-	return true
+	return parseCLIAuthState("opencode-list", output, "", 0) == agentAuthConfigured
 }
 
 func opencodeAuthFilePath() string {
@@ -246,21 +228,44 @@ func opencodeAuthFileHasCredentials() bool {
 	if path == "" {
 		return false
 	}
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
-	var value map[string]any
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, authOutputLimit+1))
+	if err != nil || len(raw) > authOutputLimit {
+		return false
+	}
+	var value map[string]struct {
+		Type    string `json:"type"`
+		Key     string `json:"key"`
+		Access  string `json:"access"`
+		Refresh string `json:"refresh"`
+	}
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return false
 	}
-	return len(value) > 0
+	for _, credential := range value {
+		if credential.Type == "api" && strings.TrimSpace(credential.Key) != "" {
+			return true
+		}
+		if credential.Type == "oauth" && (strings.TrimSpace(credential.Access) != "" || strings.TrimSpace(credential.Refresh) != "") {
+			return true
+		}
+	}
+	return false
 }
 
 // Run 执行一轮 OpenCode。OpenCode 的 JSONL 输出、权限与配置注入都在这里收口。
 // request.OutputSchema 在 OpenCode 上被有意忽略：它没有 --output-schema 等价物，
 // Insights 依赖 prompt 的 JSON 约束与 extractInsightJSON 的修复轮。
 func (r *opencodeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink AgentRunSink) error {
+	if runtime.GOOS == "windows" {
+		if err := validateAttachmentShimArgs(r.opencodeBinary(), request.Attachments); err != nil {
+			return err
+		}
+	}
 	args, err := opencodeExecArgs(request)
 	if err != nil {
 		return err
@@ -286,7 +291,7 @@ func (r *opencodeCLIRunner) Run(ctx context.Context, request AgentRunRequest, si
 	if err != nil {
 		return fmt.Errorf("open OpenCode stderr: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLICommand(ctx, cmd, Config{}); err != nil {
 		return fmt.Errorf("start OpenCode: %w", err)
 	}
 	promptErr := writeOpenCodePrompt(stdin, request.Prompt)
@@ -307,7 +312,7 @@ func (r *opencodeCLIRunner) Run(ctx context.Context, request AgentRunRequest, si
 	go func() { defer wg.Done(); readOpenCodeJSONL(stdout, sink, completion) }()
 	go func() { defer wg.Done(); readOpenCodeStderr(stderr, sink, completion) }()
 	wg.Wait()
-	err = cmd.Wait()
+	err = waitOrdinaryCLICommand(cmd)
 
 	if completion.finished() {
 		if failure := completion.failure(); failure != nil {
@@ -385,6 +390,9 @@ func opencodeExecArgs(request AgentRunRequest) ([]string, error) {
 			return nil, fmt.Errorf("OpenCode 模型 variant 不合法：%q", request.ReasoningEffort)
 		}
 		args = append(args, "--variant", request.ReasoningEffort)
+	}
+	for _, attachment := range request.Attachments {
+		args = append(args, "--file", attachment.Path)
 	}
 	return args, nil
 }
@@ -722,6 +730,7 @@ func readOpenCodeJSONL(reader io.Reader, sink AgentRunSink, completion *opencode
 			sink.Event("stream.error", mustJSON(map[string]string{"error": message}))
 			completion.noteError(errors.New(message))
 		case "step_finish":
+			sink.Event("opencode.step_finish", append(json.RawMessage(nil), sanitized...))
 			flushText()
 			reason := strings.ToLower(firstNonEmpty(event.Reason, event.Part.Reason))
 			if reason == "stop" {

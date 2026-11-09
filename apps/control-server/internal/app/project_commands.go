@@ -676,8 +676,8 @@ var slashCommandsMarker = []byte(`"slash_commands"`)
 // SSH 长驻会话）的事件都汇聚到 agentRunSink.Event，因此这里能覆盖全部环境。
 // 调用点在事件热路径上，故先做一次零成本的字节子串判断再反序列化。
 func (s *Server) observeCommandCatalog(projectID, agentID string, payload json.RawMessage) {
-	// 按工具分开存。CodeBuddy 的目录还没接探测，不能先收进选择器。
-	if projectID == "" || (agentID != "claude-code" && agentID != "qoder") || !bytes.Contains(payload, slashCommandsMarker) {
+	// 按工具分开存，不能用 Claude 候选冒充其他工具的目录。
+	if projectID == "" || (agentID != "claude-code" && agentID != "qoder" && agentID != "codebuddy") || !bytes.Contains(payload, slashCommandsMarker) {
 		return
 	}
 	catalog, ok := parseClaudeCommandCatalog(payload)
@@ -687,6 +687,9 @@ func (s *Server) observeCommandCatalog(projectID, agentID string, payload json.R
 	note := "目录来自最近一次运行的 Claude Code 会话。"
 	if agentID == "qoder" {
 		note = "目录来自最近一次运行的 Qoder 会话。"
+	}
+	if agentID == "codebuddy" {
+		note = "目录来自最近一次运行的 CodeBuddy 会话。"
 	}
 	s.storeCommandCatalog(commandCatalogEntry{
 		key:      commandCatalogCacheKey(projectID, agentID),
@@ -710,7 +713,7 @@ func commandCatalogCacheKey(projectID, agentID string) string {
 // projectCommands 返回命令选择器需要的目录与来源说明。
 //
 // 查询参数：
-//   - agentId  默认 claude-code。qoder 用自己的启动帧；codex / opencode / codebuddy / cursor
+//   - agentId  默认 claude-code。qoder / codebuddy 用自己的启动帧；codex / opencode / cursor
 //     返回空目录，不能拿 Claude 的目录冒充。
 //   - refresh=1 忽略 TTL 重新探测（用户点"刷新"）
 //   - probe=0  不允许起探针：只用缓存/扫描/静态表。会话页加载时的徽标判定走这条，
@@ -727,7 +730,7 @@ func (s *Server) projectCommands(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// agentId 只保留有独立语义的取值；其余（包括未识别的查询串）归一成 claude-code。
-	// CodeBuddy 不在这里回落到 Claude：它的探针/目录还没有接，回落会把 Claude 的命令名
+	// CodeBuddy 不在这里回落到 Claude：它读取自己的运行目录，回落会把 Claude 的命令名
 	// 当成 CodeBuddy 的能力展示出去（与 Qoder/OpenCode 同一取舍）。
 	agentID := strings.TrimSpace(r.URL.Query().Get("agentId"))
 	switch agentID {
@@ -765,10 +768,15 @@ func (s *Server) projectCommands(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if agentID == "codebuddy" {
-		// CodeBuddy 的 init 帧虽带 slash_commands，但这条通道还只服务 Claude；
-		// **不**回落到 Claude 的探针/静态表，避免把 Claude 的命令名当成 CodeBuddy 的。
-		view.Source = "static"
-		view.Note = "CodeBuddy 的斜杠命令目录尚未接入；可直接输入内容，或使用自定义命令。"
+		if entry, ok := s.cachedCommandCatalog(commandCatalogCacheKey(project.ID, agentID), 0); ok {
+			view.Source, view.Note, view.Authoritative = entry.source, entry.note, true
+			view.ClaudeVersion = entry.catalog.version
+			view.RefreshedAt = entry.observed.UTC().Format(time.RFC3339)
+			view.Commands = buildCommandOptions(entry.catalog, nil, true)
+		} else {
+			view.Source = "run"
+			view.Note = "还没有读到 CodeBuddy 的命令目录；在项目中运行一次后自动更新。仍可手输命令。"
+		}
 		writeJSON(w, http.StatusOK, view)
 		return
 	}
@@ -840,7 +848,7 @@ func (s *Server) writeQoderCommands(w http.ResponseWriter, r *http.Request, proj
 			}
 			if refresh || !cached {
 				probeCtx, cancel := context.WithTimeout(r.Context(), claudeCommandProbeTimeout)
-				catalog, err := probeQoderCommandCatalog(probeCtx, project.Path)
+				catalog, err := s.probeQoderCommandCatalog(probeCtx, project)
 				cancel()
 				if err == nil {
 					entry = commandCatalogEntry{
@@ -883,6 +891,8 @@ func (s *Server) writeQoderCommands(w http.ResponseWriter, r *http.Request, proj
 // commandCatalogFailureReason 把"没能探测"的原因翻成一个不带标点的从句，供下面两句拼接。
 func commandCatalogFailureReason(reason string) string {
 	switch reason {
+	case "supervised":
+		return "项目正由任务托管持有，暂不启动 CLI 命令探针"
 	case "disabled":
 		return "本次没有主动探测命令目录"
 	case "no-runner":
@@ -935,6 +945,11 @@ func (s *Server) probeCommandCatalog(ctx context.Context, project Project, targe
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, claudeCommandProbeTimeout)
 	defer cancel()
+	releaseWorkspace, err := s.beginWorkspaceOperationAtPath(project, project.Path, "command-probe")
+	if err != nil {
+		return commandCatalogEntry{}, false, "supervised"
+	}
+	defer releaseWorkspace()
 	catalog, err := capable.claudeCommandCatalog(probeCtx, project.Path)
 	if err != nil {
 		log.Printf("probe Claude command catalog for project %s: %v", project.ID, err)
@@ -963,6 +978,15 @@ func slashCommandName(template string) string {
 		return ""
 	}
 	return strings.TrimPrefix(fields[0], "/")
+}
+
+func (s *Server) probeQoderCommandCatalog(ctx context.Context, project Project) (claudeCommandCatalog, error) {
+	release, err := s.beginWorkspaceOperationAtPath(project, project.Path, "qoder-command-probe")
+	if err != nil {
+		return claudeCommandCatalog{}, err
+	}
+	defer release()
+	return probeQoderCommandCatalog(ctx, project.Path)
 }
 
 // probeQoderCommandCatalog 读到 init 帧就停。Qoder 的斜杠命令在模型调用之前就在这帧里。

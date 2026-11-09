@@ -73,6 +73,25 @@ function item(partial: Partial<RunnerAgentItem> = {}): RunnerAgentItem {
 const LATEST: LatestRead = { state: "ready", latest: "2.0.31", updateAvailable: true };
 const UP_TO_DATE: LatestRead = { state: "ready", latest: "2.0.28", updateAvailable: false };
 
+test("认证凭据已配置时不冒充账号登录，也不提示需要登录", () => {
+  const card = buildToolCard(input({
+    entry: entry({ id: "codebuddy", name: "CodeBuddy Code", supportsLogin: true }),
+    authStatus: "configured",
+  }));
+  assert.equal(card.login, "configured");
+  assert.equal(card.loginBlocked, false);
+  assert.doesNotMatch(card.statusText, /还没登录|需要登录/);
+});
+
+test("认证查询与授权入口独立声明，兼容旧服务端", () => {
+  const queryOnly = buildToolCard(input({entry: entry({supportsLogin: false, supportsAuthStatus: true}), authStatus: "logged_in"}));
+  assert.equal(queryOnly.login, "logged-in");
+  const disabled = buildToolCard(input({entry: entry({supportsLogin: true, supportsAuthStatus: false}), authStatus: "logged_in"}));
+  assert.equal(disabled.login, undefined);
+  const legacy = buildToolCard(input({entry: entry({supportsLogin: true}), authStatus: "logged_in"}));
+  assert.equal(legacy.login, "logged-in");
+});
+
 function input(partial: Partial<ToolCardInput> = {}): ToolCardInput {
   return {
     entry: entry(),

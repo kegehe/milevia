@@ -276,17 +276,8 @@ func qoderLoginURL(line string) string {
 // 界面在"未登录"这一档给的是"去登录"，而把一个已登录的用户指去再登录一次，
 // 正是这一轮要修的那件事（见 agent_auth.go 的三态）。
 func (r *qoderCLIRunner) LoginStatus(parent context.Context) (agentAuthState, error) {
-	// 实测冷启动 7.5s（同样是 node + 大 bundle）。这条不在运行路径上，
-	// 宁可多等也不要因为超时把"已登录"读成"未登录"。
-	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
-	defer cancel()
-	cmd := qoderCommand(ctx, r.qoderBinary(), "status")
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
-	if err != nil {
-		return agentAuthUnreadable, err
-	}
-	return qoderAuthState(string(out)), nil
+	entry, _ := agentByID("qoder")
+	return localCLIAuthStatus(parent, entry, r.qoderBinary())
 }
 
 // loginProcessStopper 由**持有长驻登录进程**的 runner 实现（目前只有 Qoder）。
@@ -323,7 +314,11 @@ func (r *qoderCLIRunner) stopLogin() {
 // 录一次）。
 func qoderAuthState(output string) agentAuthState {
 	sawIdentity := false
+	sawToken := false
 	for _, line := range strings.Split(output, "\n") {
+		if strings.EqualFold(strings.TrimSpace(line), "not logged in") {
+			return agentAuthLoggedOut
+		}
 		name, value, found := strings.Cut(strings.TrimSpace(line), ":")
 		if !found {
 			continue
@@ -334,11 +329,16 @@ func qoderAuthState(output string) agentAuthState {
 			return agentAuthLoggedOut
 		}
 		switch key {
-		case "account", "username", "email", "user type", "login method":
+		case "auth source", "login method":
+			sawToken = sawToken || tokenAuthSource(text)
+		case "account", "username", "email":
 			if text != "" {
 				sawIdentity = true
 			}
 		}
+	}
+	if sawToken {
+		return agentAuthConfigured
 	}
 	if sawIdentity {
 		return agentAuthLoggedIn
@@ -377,6 +377,9 @@ func qoderSessionArgs(request AgentSessionRequest) []string {
 	}
 	if request.Model != "" {
 		args = append(args, "--model", request.Model)
+	}
+	if request.ReasoningEffort != "" {
+		args = append(args, "--reasoning-effort", request.ReasoningEffort)
 	}
 	args = appendMCPConfigArgs(args, request.MCPConfigPath, request.StrictMCP)
 	return args
@@ -421,7 +424,7 @@ func (r *qoderCLIRunner) StartSession(ctx context.Context, request AgentSessionR
 	if err != nil {
 		return nil, errors.New("打开 Qoder stderr 失败")
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLICommand(ctx, cmd, Config{}); err != nil {
 		return nil, errors.New("启动 Qoder 失败")
 	}
 	session := newStreamJSONSession(streamJSONSessionConfig{

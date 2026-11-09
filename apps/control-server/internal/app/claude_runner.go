@@ -129,6 +129,8 @@ type AgentSessionRequest struct {
 type AgentSession interface {
 	Send(AgentRunRequest, AgentRunSink) error
 	Stop()
+	// Done delivers one terminal process result. It need not close and must have
+	// a single consumer; observing a turn result or calling Stop does not replace it.
 	Done() <-chan error
 }
 
@@ -141,6 +143,7 @@ type AgentTurnSink interface {
 }
 
 type AgentRunRequest struct {
+	Attachments    []AgentAttachment
 	SessionID      string
 	ProjectPath    string
 	Prompt         string
@@ -731,7 +734,7 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	if err != nil {
 		return fmt.Errorf("open Claude stderr: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLICommand(ctx, cmd, r.config); err != nil {
 		return fmt.Errorf("start Claude: %w", err)
 	}
 	// 进程树放进 Job Object：CLI 留下的后裔不再变成谁都杀不到的孤儿（见 containAgentProcess）。
@@ -771,7 +774,7 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 		}()
 	}
 	wg.Wait()
-	if err := cmd.Wait(); err != nil {
+	if err := waitOrdinaryCLICommand(cmd); err != nil {
 		// 失败原因的选择规则见 claudeRunFailureDetail：CLI 自报的可读原因优先，
 		// 其次是 stderr，最后才是 CLI 只给出枚举时的机器可读值。
 		if detail := claudeRunFailureDetail(recorded.failureResult(), stderrTail.tail()); detail != "" {
@@ -852,7 +855,7 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 		closeProfile()
 		return nil, fmt.Errorf("open Claude stderr: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLICommand(ctx, cmd, r.config); err != nil {
 		closeProfile()
 		return nil, fmt.Errorf("start Claude: %w", err)
 	}
@@ -882,20 +885,22 @@ func (r *claudeCLIRunner) StartSession(ctx context.Context, request AgentSession
 	}()
 	go func() {
 		defer releaseTree() // 幂等；正常路径下面会先关一次，异常路径由这里兜底
-		err := cmd.Wait()
-		// 主进程已经退出：先关 Job 回收仍活着的后裔，避免孤儿进程继续改工作区。
-		// 注意 Go 的 Cmd.Wait 会关闭父端读管道，下面等 readers 只是有界兜底，
-		// 不是"等 EOF 收完剩余输出"；最后几帧若在 Wait 前未被读走，本来就拿不到。
-		releaseTree()
-		// Defensive timeout: if reader goroutines are stuck (e.g. pipe never
-		// closed), force-unblock after a generous grace period so session
-		// cleanup is never permanently blocked.
+		// The contained waiter collects process exit and closes child pipe ends
+		// independently. Drain the final protocol frames before Cmd closes its
+		// parent read handles. Start the drain deadline only after the container
+		// has finished; a live persistent session can run for hours.
+		if process, ok := ordinaryCLICommandState(cmd); ok {
+			<-process.done
+		}
 		readersDone := make(chan struct{})
 		go func() { readers.Wait(); close(readersDone) }()
 		select {
 		case <-readersDone:
 		case <-time.After(30 * time.Second):
+			closeAgentOutputPipes(stdout, stderr)
 		}
+		err := waitOrdinaryCLICommand(cmd)
+		releaseTree()
 		if err == nil && session.hasTurns() {
 			err = errors.New("Claude 会话在完成未结束的对话轮次之前就结束了")
 		}
@@ -1734,7 +1739,7 @@ func (session *claudeCLISession) startCurrentLocked(turn *claudeSessionTurn) err
 			}
 		}
 	}
-	payload, err := encodeClaudeUserFrame(turn.request.Prompt)
+	payload, err := encodeClaudeUserFrame(turn.request.Prompt, turn.request.Attachments...)
 	if err != nil {
 		return err
 	}
@@ -1753,14 +1758,14 @@ func (session *claudeCLISession) startCurrentLocked(turn *claudeSessionTurn) err
 
 // encodeClaudeUserFrame 生成一帧 --input-format stream-json 的 user 输入。
 // 首轮 prompt 与回合中的插话共用同一份编码，避免两条路径悄悄长出差异。
-func encodeClaudeUserFrame(prompt string) ([]byte, error) {
+func encodeClaudeUserFrame(prompt string, attachments ...AgentAttachment) ([]byte, error) {
 	payload, err := json.Marshal(map[string]any{
 		"type":               "user",
 		"session_id":         "",
 		"parent_tool_use_id": nil,
 		"message": map[string]any{
 			"role":    "user",
-			"content": []map[string]string{{"type": "text", "text": prompt}},
+			"content": agentContent(prompt, attachments),
 		},
 	})
 	if err != nil {

@@ -87,6 +87,7 @@ type runUsageAccumulator struct {
 	cost           float64
 	agentTurns     int64
 	modelSteps     int64
+	openCodeSteps  map[string]struct{}
 	toolCalls      int64
 	durationMS     int64
 	ttftMS         int64
@@ -174,6 +175,61 @@ func (s *Server) collectUsageEvent(runID, conversationID, eventType string, payl
 
 func (accumulator *runUsageAccumulator) collect(eventType string, payload json.RawMessage) bool {
 	switch eventType {
+	case "opencode.step_finish":
+		var event struct {
+			Reason string `json:"reason"`
+			Part   struct {
+				ID     string   `json:"id"`
+				Reason string   `json:"reason"`
+				Cost   *float64 `json:"cost"`
+				Tokens *struct {
+					Input  int64 `json:"input"`
+					Output int64 `json:"output"`
+					Cache  struct {
+						Read  int64 `json:"read"`
+						Write int64 `json:"write"`
+					} `json:"cache"`
+				} `json:"tokens"`
+			} `json:"part"`
+		}
+		if json.Unmarshal(payload, &event) != nil {
+			return false
+		}
+		if event.Part.Reason == "" {
+			event.Part.Reason = event.Reason
+		}
+		if event.Part.Tokens == nil || (event.Part.Reason != "stop" && event.Part.Reason != "tool-calls" && event.Part.Reason != "tool_calls") {
+			return false
+		}
+		if accumulator.openCodeSteps == nil {
+			accumulator.openCodeSteps = map[string]struct{}{}
+		}
+		key := event.Part.ID
+		if key == "" {
+			key = string(payload)
+		}
+		if _, exists := accumulator.openCodeSteps[key]; exists {
+			return false
+		}
+		u := event.Part.Tokens
+		if u.Input < 0 || u.Output < 0 || u.Cache.Read < 0 || u.Cache.Write < 0 {
+			return false
+		}
+		accumulator.openCodeSteps[key] = struct{}{}
+		accumulator.inputTokens += u.Input
+		accumulator.outputTokens += u.Output
+		accumulator.cacheRead += u.Cache.Read
+		accumulator.cacheCreation += u.Cache.Write
+		if event.Part.Cost != nil && *event.Part.Cost >= 0 {
+			accumulator.cost += *event.Part.Cost
+		}
+		accumulator.contextInput = contextSnapshotTokens(u.Input, u.Cache.Read, u.Cache.Write)
+		if event.Part.Reason == "stop" {
+			accumulator.hasResult = true
+			accumulator.agentTurns++
+		}
+		accumulator.modelSteps++
+		return true
 	case "system":
 		var event struct {
 			Subtype string `json:"subtype"`
@@ -242,7 +298,7 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 			TTFTMS         int64   `json:"ttft_ms"`
 			TotalCostUSD   float64 `json:"total_cost_usd"`
 			TerminalReason string  `json:"terminal_reason"`
-			Usage          struct {
+			Usage          *struct {
 				InputTokens         int64 `json:"input_tokens"`
 				OutputTokens        int64 `json:"output_tokens"`
 				CacheReadTokens     int64 `json:"cache_read_input_tokens"`
@@ -265,11 +321,13 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 		accumulator.ttftMS = event.TTFTMS
 		accumulator.cost = event.TotalCostUSD
 		accumulator.terminalReason = event.TerminalReason
-		accumulator.inputTokens = event.Usage.InputTokens
-		accumulator.outputTokens = event.Usage.OutputTokens
-		accumulator.cacheRead = event.Usage.CacheReadTokens
-		accumulator.cacheCreation = event.Usage.CacheCreationTokens
-		accumulator.hasResult = true
+		if event.Usage != nil {
+			accumulator.inputTokens = event.Usage.InputTokens
+			accumulator.outputTokens = event.Usage.OutputTokens
+			accumulator.cacheRead = event.Usage.CacheReadTokens
+			accumulator.cacheCreation = event.Usage.CacheCreationTokens
+			accumulator.hasResult = true
+		}
 		// result.usage is cumulative for this run. It is valid for run-level
 		// usage metrics, but not for a context snapshot: a multi-turn run can
 		// exceed the model window many times over. ContextInput therefore only
@@ -337,7 +395,7 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 		// prompt size — it reflects the maximum context used and should NOT be
 		// accumulated.
 		var event struct {
-			Usage struct {
+			Usage *struct {
 				InputTokens           int64 `json:"input_tokens"`
 				OutputTokens          int64 `json:"output_tokens"`
 				CachedInputTokens     int64 `json:"cached_input_tokens"`
@@ -346,6 +404,10 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 		}
 		if json.Unmarshal(payload, &event) != nil {
 			return false
+		}
+		accumulator.agentTurns++
+		if event.Usage == nil {
+			return true
 		}
 		accumulator.inputTokens += event.Usage.InputTokens
 		accumulator.outputTokens += event.Usage.OutputTokens
@@ -356,7 +418,6 @@ func (accumulator *runUsageAccumulator) collect(eventType string, payload json.R
 		// latest value approximates peak context-window utilisation.
 		accumulator.contextInput = contextSnapshotTokens(event.Usage.InputTokens, event.Usage.CachedInputTokens, event.Usage.CacheWriteInputTokens)
 		accumulator.hasResult = true
-		accumulator.agentTurns++
 		return true
 	}
 	return false
@@ -369,7 +430,16 @@ func (accumulator *runUsageAccumulator) snapshot(status string, completedAt *tim
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].Model < models[j].Model })
 	startedAt := accumulator.startedAt
-	return RunUsage{RunID: accumulator.runID, ConversationID: accumulator.conversationID, Available: true, Status: status, Model: accumulator.model, ContextWindow: accumulator.contextWindow, ContextInputTokens: accumulator.contextInput, InputTokens: accumulator.inputTokens, OutputTokens: accumulator.outputTokens, CacheReadTokens: accumulator.cacheRead, CacheCreationTokens: accumulator.cacheCreation, EstimatedCostUSD: accumulator.cost, AgentTurns: accumulator.agentTurns, ModelSteps: accumulator.modelSteps, ToolCalls: accumulator.toolCalls, SubagentCount: int64(len(accumulator.parentIDs)), DurationMS: accumulator.durationMS, TTFTMS: accumulator.ttftMS, TerminalReason: accumulator.terminalReason, HasResult: accumulator.hasResult, StartedAt: &startedAt, CompletedAt: completedAt, Models: models}
+	snapshot := RunUsage{RunID: accumulator.runID, ConversationID: accumulator.conversationID, Available: true, Status: status, Model: accumulator.model, ContextWindow: accumulator.contextWindow, ContextInputTokens: accumulator.contextInput, InputTokens: accumulator.inputTokens, OutputTokens: accumulator.outputTokens, CacheReadTokens: accumulator.cacheRead, CacheCreationTokens: accumulator.cacheCreation, EstimatedCostUSD: accumulator.cost, AgentTurns: accumulator.agentTurns, ModelSteps: accumulator.modelSteps, ToolCalls: accumulator.toolCalls, SubagentCount: int64(len(accumulator.parentIDs)), DurationMS: accumulator.durationMS, TTFTMS: accumulator.ttftMS, TerminalReason: accumulator.terminalReason, HasResult: accumulator.hasResult, StartedAt: &startedAt, CompletedAt: completedAt, Models: models}
+	markUsageAvailability(&snapshot)
+	return snapshot
+}
+
+func markUsageAvailability(usage *RunUsage) {
+	usage.Available = usage.HasResult || usage.ContextInputTokens > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.CacheReadTokens > 0 || usage.CacheCreationTokens > 0
+	if !usage.Available {
+		usage.Reason = "CLI 尚未提供可验证的 token 用量；缺失数据不计为已知的零。"
+	}
 }
 
 func (s *Server) persistRunUsage(runID, status string) error {
@@ -561,7 +631,7 @@ func (s *Server) loadRunUsage(ctx context.Context, runID string) (*RunUsage, err
 	}
 	usage.StartedAt = &startedAt
 	usage.CompletedAt = &completedAt
-	usage.Available = true
+	markUsageAvailability(usage)
 	models, err := s.loadRunModelUsage(ctx, runID)
 	if err != nil {
 		return nil, err

@@ -2543,7 +2543,9 @@ headless 的 `-p` 没有可回复的审批通道，所以不提供 `approval_req
 用户在终端里登录了 qoder（`qoder status` 能读出 Username / Email），但 Cli 管理页的
 qoder 卡片上**照样亮着一颗「登录」按钮**；点进面板再点「检查登录状态」，才看到「已登录」。
 同一个毛病在 codebuddy 上更糟：面板检查完永远说**未登录**，因为它的登录态判别写死成
-`false`。opencode / cursor 有真正的判别，但卡片同样不看它。
+`false`。opencode / cursor 有真正的判别，但卡片同样不看它。此处后来改为 ACP
+`_codebuddy.ai/getUserInfo` 探针：它能读出 CLI 已恢复的账号会话，且不发送模型提示词；
+查询不支持、凭据损坏或超时仍保留 unreadable，不把未知状态念成未登录。
 
 ### 36.2 三处根因（缺一不可）
 
@@ -2560,13 +2562,13 @@ qoder 卡片上**照样亮着一颗「登录」按钮**；点进面板再点「�
 
 **后端（`agent_auth.go`，新文件）**
 
-- `agentAuthState` 三态：`logged_in` / `logged_out` / `unreadable`。
+- `agentAuthState`：`logged_in` / `logged_out` / `configured` / `unreadable`。
   `unreadable` 的两种成因分开：工具不支持自报（`note` 说明），或这次没读成（带 error，
   按 30 秒短 TTL 重试；稳定结论按 5 分钟）。
 - `authStateRunner` 从 `LoginStatus(ctx) bool` 改成 `LoginStatus(ctx) (agentAuthState, error)`。
   五个实现跟着改：qoder（`status` 解析：`not logged in` ⇒ 未登录 / 有身份字段 ⇒ 已登录 /
   形状陌生 ⇒ unreadable）、opencode（`auth list` + 凭据文件兜底）、cursor（`status` + 目录
-  空标记）、codebuddy（**永远 unreadable**，它没有非交互查询）、目录驱动的跨端后端
+  空标记）、codebuddy（ACP getUserInfo，不触发模型调用）、目录驱动的跨端后端
   （`AuthStatusArgs` 有就执行，没有就 unreadable）。
 - 读数按 **(runner, agent)** 缓存 + singleflight：TTL 5 分钟，`?force=true` 绕过。缓存
   必须按机器分 —— 只按 agentID 会把 A 机器的"已登录"带到 B 机器。
@@ -2600,7 +2602,8 @@ qoder 卡片上**照样亮着一颗「登录」按钮**；点进面板再点「�
 |---|---|---|
 | 已登录 | 「已登录」牌子（无「登录」） | 打开即显示「已登录」 |
 | 未登录 | 「登录」 + 状态行「还没登录，登录之后才能用。」 | 打开即显示「需要登录」+ 指引 |
-| 判断不了（codebuddy / 这次没读成） | 「登录」（入口不能少） | 说清判断不了 + 原因 |
+| 判断不了（协议不支持 / 凭据损坏 / 这次没读成） | 「登录」（入口不能少） | 说清判断不了 + 原因 |
+| 已配置 API Key/Token（尚未验证有效性） | 「已配置认证」 | 明确是配置存在，不冒充账号已登录 |
 | 还没读到 / 没装 / 有任务在跑 | 不给入口 | — |
 
 补一条（2026-10-23 同日）：**未登录时状态行也不再说「已是最新，不用管它」**。
@@ -2619,3 +2622,42 @@ qoder 卡片上**照样亮着一颗「登录」按钮**；点进面板再点「�
 - `TestLoginStatusWireKeepsUnreadableOutOfLoggedOut`：线上格式里 unreadable 与未登录是两个值。
 - `cli-tools-view.test.ts` 的「登录那一格」五条；`cli-tools-page.test.mjs` 钉住页面不重判、
   进入后自动探、手动检查带 force。
+
+## 37. CodeBuddy 登录状态接入 ACP（2026-11-06）
+
+此前“没有 status 子命令，因此永远无法判断”的推论不成立。官方 2.162.0、2.177.0
+发行包中已有 ACP 扩展 `_codebuddy.ai/getUserInfo`；本机当前安装版本实际探针也能
+恢复账号会话。网页 ACP 文档说明协议入口，但未明确承诺该扩展方法的稳定性，因此
+接口不支持、响应异常或超时时必须保留“暂时无法确认”。
+
+### 实现
+
+- `agent_auth_acp.go` 与内嵌 `codebuddy_auth_probe.cjs`：只执行 initialize 和
+  getUserInfo，不调用 authenticate、不创建模型会话、不发送 prompt。关闭自动更新
+  和会话清理，使用中性临时目录与空 MCP 配置。
+- 目录通过 AuthStatusProtocol 声明查询协议。本机、WSL/SSH 后端复用相同探针；跨端
+  先验证目标原生 CLI 和 Node，WSL 不得误执行 Windows 挂载中的工具。
+- 区分 logged_in、logged_out、configured、unreadable。API Key、Token、apiKeyHelper
+  以及匿名 Key 身份只表示“已配置认证”，不能证明凭据有效。
+- 空会话同时检查凭据恢复异常、仍存在的共享认证文件；凭据可能损坏时保留未知。
+  共享文件仅检查文件名和退出标记，不读取或自行解密密钥。其他产品残留凭据可能
+  让空会话保守地显示未知，避免误报“需要登录”。
+- 对外只返回状态和固定中文原因，丢弃账号标识、token、原始 stderr。限制输出大小、
+  冷启动时间和剩余超时预算；Windows 用探针 Job 回收进程树，POSIX 清理进程组。
+- 沿用五分钟缓存、失败短缓存、按目标与工具合并并发、手动强制刷新。前端保留每个
+  目标与工具的检测原因，打开面板时不再丢失后台读取的说明。
+
+### 验证范围
+
+- 协议对照测试覆盖账号、空会话、匿名 Key、设置中的 Key/Helper、损坏配置、共享凭据
+  与退出标记、不支持方法、响应损坏/错 ID/缺 token、输出上限、超时和提前退出。
+- 认证端点测试验证 configured 的 JSON、兼容 loggedIn=false、缓存与强制刷新。
+- Windows 真实进程测试验证正常完成和取消后 CLI 及其后代均退出。
+- 目录分派测试验证目标原生工具检查、目标 Node 检查和错误脱敏；不把替身测试当作
+  WSL/SSH 真机登录验证。
+- 显式 `MILEVIA_TEST_CODEBUDDY_AUTH=1` 的本机安装版用例返回 logged_in，没有模型调用。
+- 前端管理页与纯函数共 94 项测试通过；TypeScript 与 Vite 构建通过。Go 全项目
+  编译检查通过；相关 Go 回归含子用例共 44 项通过，竞态检测无异常，2 项 POSIX
+  专用用例在 Windows 上跳过。WSL/SSH 尚未完成真实账号联调。
+
+修改保留在工作区，未提交或发布。用户需运行包含这些修改的控制服务与前端后才能生效。

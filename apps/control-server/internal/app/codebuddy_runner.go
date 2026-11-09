@@ -24,8 +24,7 @@ import (
 // 需要自己的 --permission-mode（plan）与 --dangerously-skip-permissions。
 // 因此 `approval_required` 这类依赖平台审批回调的模式不适用于 CodeBuddy —— 目录里
 // 只给它列了 read_only/workspace_write/full_control 三档：read_only ↔
-// --permission-mode plan，workspace_write/full_control ↔ --dangerously-skip-permissions
-// （headless -p 下执行授权操作的必要参数；实测 acceptEdits 不是合法值，见 codebuddySessionArgs）。
+// --permission-mode plan，workspace_write ↔ acceptEdits，full_control ↔ skip permissions。
 type codebuddyCLIRunner struct {
 	paths *agentPathResolver
 }
@@ -147,28 +146,28 @@ func (r *codebuddyCLIRunner) Login(parent context.Context) (agentLoginInfo, erro
 
 // LoginStatus 报告 CodeBuddy 是否已登录。
 //
-// 它**没有**可用的非交互登录态查询（官方没给 status 类命令），所以这一档永远是
-// unreadable 且不带 error —— 语义是"这个工具不能自报"，而不是"这次没读成"。
+// 没有独立 status 命令，但 ACP 的 getUserInfo 可读取已恢复的认证会话。
+// 不发起重新认证，不调用模型；异常保留 unreadable，API Key 单独标为 configured。
 //
 // ⚠️ 曾经这里返回 false，注释写的是"避免冒充已登录"。方向对，结论错：那个 false 会被
 // 界面念成"未登录"，于是一个明明登录着的用户每次打开面板都被说成未登录、再被指去登录。
 // 判断不了就该说判断不了（agent_auth.go 的三态）。
-func (r *codebuddyCLIRunner) LoginStatus(context.Context) (agentAuthState, error) {
-	return agentAuthUnreadable, nil
+func (r *codebuddyCLIRunner) LoginStatus(ctx context.Context) (agentAuthState, error) {
+	entry, _ := agentByID("codebuddy")
+	return localACPAuthStatus(ctx, entry, r.codebuddyBinary())
 }
 
 // codebuddySessionArgs 拼装会话命令行参数。
 func codebuddySessionArgs(request AgentSessionRequest) []string {
 	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json"}
-	// 实测（2.156.0）：--permission-mode 的合法值有 plan 等；acceptEdits 不是合法值，
-	// 传它会报错。只读走 --permission-mode plan；要写/要完全控制都必须追加
-	// --dangerously-skip-permissions（headless -p 下做需要授权操作的必要参数，见官方
-	// Headless 文档）。
+	// CodeBuddy 2.177+ 支持 acceptEdits；项目写入不能静默升级成跳过全部审批。
 	switch request.PermissionMode {
 	case "read_only":
 		args = append(args, "--permission-mode", "plan")
-	default: // workspace_write / full_control 两者都需要执行与写文件，headless 必须放行
+	case "full_control":
 		args = append(args, "--dangerously-skip-permissions")
+	default:
+		args = append(args, "--permission-mode", "acceptEdits")
 	}
 	if request.Resume && request.SessionID != "" {
 		args = append(args, "--resume", request.SessionID)
@@ -179,6 +178,9 @@ func codebuddySessionArgs(request AgentSessionRequest) []string {
 	if request.Model != "" {
 		args = append(args, "--model", request.Model)
 	}
+	if request.ReasoningEffort != "" {
+		args = append(args, "--effort", request.ReasoningEffort)
+	}
 	args = appendMCPConfigArgs(args, request.MCPConfigPath, request.StrictMCP)
 	return args
 }
@@ -188,6 +190,13 @@ func (r *codebuddyCLIRunner) StartSession(ctx context.Context, request AgentSess
 	bin := r.codebuddyBinary()
 	if bin == "" {
 		return nil, errors.New("CodeBuddy CLI 未安装")
+	}
+	if request.PermissionMode != "read_only" && request.PermissionMode != "full_control" {
+		version, versionErr := parseSemver(r.Version(ctx))
+		minimum, _ := parseSemver("2.177.0")
+		if versionErr != nil || compareSemver(version, minimum) < 0 {
+			return nil, errors.New("项目内写入需要 CodeBuddy 2.177.0 或更高版本，请先更新 CLI；不会自动降级为完全控制")
+		}
 	}
 	cmd := codebuddyCommand(ctx, bin, codebuddySessionArgs(request)...)
 	cmd.Dir = request.ProjectPath
@@ -211,14 +220,15 @@ func (r *codebuddyCLIRunner) StartSession(ctx context.Context, request AgentSess
 	if err != nil {
 		return nil, errors.New("打开 CodeBuddy stderr 失败")
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLICommand(ctx, cmd, Config{}); err != nil {
 		return nil, errors.New("启动 CodeBuddy 失败")
 	}
 	session := newStreamJSONSession(streamJSONSessionConfig{
-		agentID:    "codebuddy",
-		label:      "CodeBuddy",
-		exitPrefix: codebuddyExitPrefix,
-		readOnly:   request.PermissionMode == "read_only",
+		agentID:                "codebuddy",
+		label:                  "CodeBuddy",
+		exitPrefix:             codebuddyExitPrefix,
+		readOnly:               request.PermissionMode == "read_only",
+		denyPermissionRequests: request.PermissionMode != "full_control",
 	}, cmd, stdin, stdout, stderr)
 	session.watch(ctx)
 	return session, nil

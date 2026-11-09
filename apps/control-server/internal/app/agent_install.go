@@ -225,10 +225,6 @@ func (s *Server) installAgentCLIWithPlan(ctx context.Context, runnerID, agentID 
 	if !ok {
 		return agentInstallation{}, fmt.Errorf("不支持的工具 %s", agentID)
 	}
-	if err := checkRuntimeGate(plan.RuntimeVersion, entry); err != nil {
-		return agentInstallation{}, err
-	}
-
 	version := strings.TrimSpace(versionSelector)
 	if version == "" {
 		version = "latest"
@@ -240,12 +236,15 @@ func (s *Server) installAgentCLIWithPlan(ctx context.Context, runnerID, agentID 
 			return agentInstallation{}, fmt.Errorf("版本号 %q 不合法", version)
 		}
 	}
+	if err := checkSelectedRuntimeGate(plan.RuntimeVersion, entry, version); err != nil {
+		return agentInstallation{}, err
+	}
 
 	args := []string{}
 	if plan.Prefix != "" {
 		args = append(args, "--prefix", plan.Prefix)
 	}
-	args = append(args, "install", "-g", entry.NpmPackage+"@"+version)
+	args = append(args, "install", "-g", "--engine-strict=true", "--force=false", entry.NpmPackage+"@"+version)
 
 	// previous 只用于"失败时报出旧版本"，读不到就留空（不阻塞安装）——
 	// 这里与上面那条判据不同：那里读失败会导致**装错地方**，这里只是少一个展示字段。
@@ -305,6 +304,18 @@ func checkRuntimeGate(runtimeVersion string, entry AgentCatalogEntry) error {
 			runtimeVersion, entry.Name, entry.MinRuntimeVersion)
 	}
 	return nil
+}
+
+// 目录描述默认版本的要求。指定历史版本时由实际安装包 engines 判定，
+// 安装命令始终强制 engine-strict，覆盖用户 npm 配置中的 force。
+func checkSelectedRuntimeGate(runtimeVersion string, entry AgentCatalogEntry, selector string) error {
+	if selector != "" && selector != "latest" {
+		if _, err := parseSemver(selector); err != nil {
+			return fmt.Errorf("版本号 %q 不合法", selector)
+		}
+		return nil
+	}
+	return checkRuntimeGate(runtimeVersion, entry)
 }
 
 // verifyAgentInstall 找出刚装出来的可执行文件并确认它真的能运行。

@@ -156,11 +156,13 @@ type remoteSnapshotConversation struct {
 }
 
 type remoteSnapshotMessage struct {
-	ID        string    `json:"id"`
-	RunID     string    `json:"runId,omitempty"`
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID              string              `json:"id"`
+	RunID           string              `json:"runId,omitempty"`
+	Role            string              `json:"role"`
+	Content         string              `json:"content"`
+	CreatedAt       time.Time           `json:"createdAt"`
+	Attachments     []MessageAttachment `json:"attachments,omitempty"`
+	ClientRequestID string              `json:"clientRequestId"`
 }
 
 // remoteSnapshotNotice carries one status/diagnostic event verbatim: the phone
@@ -1367,7 +1369,7 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			conversation.MessagesVisibleAfter = checkpointCutoffValue(rewoundAt)
 			// 消息从最新往回装，装到预算用尽为止（详见 remoteSnapshotMessageBudget）。
 			// 每条最多吃掉「预算 - reserve」，超出的部分截断并留下标记。
-			messageQuery := `select id,run_id,role,content,created_at from messages where conversation_id=? and parent_tool_use_id=''`
+			messageQuery := `select id,run_id,role,content,created_at,attachments,client_request_id from messages where conversation_id=? and parent_tool_use_id=''`
 			messageArgs := []any{conversation.ID}
 			if clause, clauseArgs := checkpointVisibilityClause("created_at", cutoff, rewoundAt); clause != "" {
 				messageQuery += " and " + clause
@@ -1384,11 +1386,21 @@ func (s *Server) remoteSnapshot(w http.ResponseWriter, r *http.Request) {
 			messageIndex := 0
 			for messageRows.Next() {
 				var message remoteSnapshotMessage
-				if err := messageRows.Scan(&message.ID, &message.RunID, &message.Role, &message.Content, &message.CreatedAt); err != nil {
+				var rawAttachments string
+				if err := messageRows.Scan(&message.ID, &message.RunID, &message.Role, &message.Content, &message.CreatedAt, &rawAttachments, &message.ClientRequestID); err != nil {
 					messageRows.Close()
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				message.Attachments = decodeAttachments(rawAttachments)
+				attachmentBytes := 0
+				if len(message.Attachments) > 0 {
+					attachmentBytes = len(attachmentJSON(message.Attachments))
+				}
+				if attachmentBytes > remaining {
+					break
+				}
+				remaining -= attachmentBytes
 				// 任何一条消息最多吃掉 预算 - reserve（见 remoteSnapshotMessageReserve）：
 				// 既让最新那条能完整显示（只要它没超这个数），也保证无论**哪一条**特别长，
 				// 窗口都不会被它挤空。其余按剩余预算裁到装不下为止。
@@ -1923,16 +1935,17 @@ func (s *Server) executeRemoteCommand(ctx context.Context, command remoteCommand
 	}
 	if command.Type == "conversation.message" {
 		var input struct {
-			ConversationID  string `json:"conversationId"`
-			Content         string `json:"content"`
-			ClientRequestID string `json:"clientRequestId,omitempty"`
+			ConversationID  string              `json:"conversationId"`
+			Content         string              `json:"content"`
+			ClientRequestID string              `json:"clientRequestId,omitempty"`
+			Attachments     []MessageAttachment `json:"attachments,omitempty"`
 		}
 		if err := json.Unmarshal(command.Payload, &input); err != nil {
 			return nil, errors.New("conversation message payload is invalid")
 		}
 		input.ConversationID = strings.TrimSpace(input.ConversationID)
 		input.Content = strings.TrimSpace(input.Content)
-		if input.ConversationID == "" || input.Content == "" {
+		if input.ConversationID == "" || (input.Content == "" && len(input.Attachments) == 0) {
 			return nil, errors.New("conversationId and content are required")
 		}
 		return s.executeRemoteHTTPCommand(ctx, http.MethodPost, "/api/conversations/"+input.ConversationID+"/messages", "", "", input.ConversationID, s.sendMessage, mustJSON(input))

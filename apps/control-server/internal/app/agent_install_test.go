@@ -186,7 +186,7 @@ func TestCheckRuntimeGateBlocksOldRuntime(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "过低") {
 		t.Fatalf("报错没有说明是版本过低：%v", err)
 	}
-	if err := checkRuntimeGate("18.0.0", entry); err != nil {
+	if err := checkRuntimeGate(entry.MinRuntimeVersion, entry); err != nil {
 		t.Fatalf("刚好满足最低版本时不该拦：%v", err)
 	}
 	// 读不到版本时放行（那是"探测失败"，不是"版本过低"——不能把读不到说成太旧）。

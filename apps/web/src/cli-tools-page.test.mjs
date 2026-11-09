@@ -689,8 +689,9 @@ test("需要登录的工具把登录入口摆在卡片上，判据来自模型",
   assert.match(code, /\{card\.login && <button/);
   assert.match(viewCode, /authStatus === "logged_in"\) return "logged-in"/);
   const supportsLoginUses = code.match(/supportsLogin/g) ?? [];
-  assert.equal(supportsLoginUses.length, 1, "页面里出现了第二份「能不能登录」的判据");
-  assert.match(code, /entries\.filter\(\(entry\) => entry\.supportsLogin\)/);
+  assert.equal(supportsLoginUses.length, 2, "查询与发起登录各读取一次服务端能力");
+  assert.match(code, /entries\.filter\(\(entry\) => entry\.supportsAuthStatus \?\? entry\.supportsLogin\)/);
+  assert.match(code, /loginCanStart && <button className="primary"/);
   // 点开的是登录面板：带进去的是**这个工具已有的结论**（已登录就别再让它点一次"检查"）。
   const loginAt = code.indexOf("{card.login && <button");
   assert.ok(loginAt > 0, "找不到卡片上的登录入口");
@@ -702,7 +703,9 @@ test("需要登录的工具把登录入口摆在卡片上，判据来自模型",
 
 test("已登录就不给「登录」：卡片上是「已登录」牌子，且页面进入后自己探一次", () => {
   // 2026-10-23 用户反馈：终端里登录成功，卡片上还亮着一颗「登录」。
-  assert.match(code, /card\.login === "logged-in" \? "已登录" : "登录"/);
+  assert.match(code, /card\.login === "logged-in" \? "已登录" : card\.login === "configured" \? "已配置认证" : "登录"/);
+  assert.match(code, /loginAuth === "configured"/);
+  assert.match(code, /setLoginNote\(authNotes\[/);
   assert.match(code, /cli-tools-auth-chip/);
   assert.match(css, /\.cli-tools-card-actions \.cli-tools-auth-chip\[data-state="logged-in"\]/);
   // 登录态是**另一个读数**（不进 /agents：那条接口是首屏瓶颈，而 qoder status 冷启动 7.5s），
@@ -810,4 +813,19 @@ test("「查最新版本」只问服务端能回答的那些工具", () => {
   // 名单来自**这台机器的读数**而不是工具目录：目录里所有工具都在，而"这个环境提供
   // 哪些"只有读数知道。
   assert.ok(!code.includes("catalogKey"), "查最新版本的名单不该再来自工具目录");
+});
+
+test("登录面板与卡片都拦截迟到响应，检查时移除旧授权链接", () => {
+  const login = code.slice(code.indexOf("const runLogin ="), code.indexOf("const readAuthStatus ="));
+  assert.ok(login.includes("const isCurrent = authRequests.current.beginPanel()"));
+  assert.ok(login.includes("if (isCurrent()) setLoginInfo(result)"));
+  assert.ok(login.includes("if (isCurrent()) setLoginBusy(false)"));
+  const reading = code.slice(code.indexOf("const readAuthStatus ="), code.indexOf("const checkLoginStatus ="));
+  assert.ok(reading.includes("beginReading(runnerID, agentID)"));
+  assert.equal(reading.split("if (!isCurrent()) return null").length - 1, 2);
+  const check = code.slice(code.indexOf("const checkLoginStatus ="), code.indexOf("const openLogin ="));
+  assert.ok(check.includes("setLoginInfo(null)"));
+  assert.ok(check.includes("if (!isCurrent() || !result) return"));
+  assert.ok(code.includes("return () => authRequests.current.closePanel();\n  }, [selectedRunner]);"));
+  assert.doesNotMatch(code, /loginPanelAgent/, "仅 agentID 无法区分关闭重开同一工具");
 });

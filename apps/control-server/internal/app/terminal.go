@@ -118,6 +118,7 @@ type terminalRecord struct {
 	detachedAt                                    time.Time
 	readerDone, waiterDone                        bool
 	exitCode                                      *int
+	releaseWorkspace                              func()
 }
 type terminalChunk struct {
 	seq  uint64
@@ -297,6 +298,16 @@ func (m *terminalManager) createInWorkspace(ctx context.Context, project Project
 	}
 	openCtx, cancelOpen := context.WithTimeout(m.shutdownCtx, openTimeout)
 	defer cancelOpen()
+	releaseWorkspace, err := m.server.beginWorkspaceOperationAtPath(project, project.Path, "terminal")
+	if err != nil {
+		return nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseWorkspace()
+		}
+	}()
 	sess, err := m.factory.Open(openCtx, spec)
 	if err != nil {
 		return nil, err
@@ -316,6 +327,8 @@ func (m *terminalManager) createInWorkspace(ctx context.Context, project Project
 		return nil, errors.New("terminal creation was invalidated")
 	}
 	m.sessions[sess.ID()] = r
+	r.releaseWorkspace = releaseWorkspace
+	transferred = true
 	m.sessionWG.Add(1)
 	m.mu.Unlock()
 	go m.consume(r)
@@ -425,9 +438,9 @@ func (s terminalExitStatus) ExitCode() int { return s.code }
 
 func terminalExitCode(session TerminalSession, err error) *int {
 	if provider, ok := session.(terminalExitCodeProvider); ok {
-		if code := provider.TerminalExitCode(); code != nil {
-			return code
-		}
+		// A bridge can exit successfully without a target exit receipt. Its
+		// explicit unknown result must not become the launcher's exit code.
+		return provider.TerminalExitCode()
 	}
 	if err == nil {
 		code := 0
@@ -456,7 +469,11 @@ func (m *terminalManager) markReaderDone(r *terminalRecord) {
 	r.mu.Lock()
 	r.readerDone = true
 	detachedAt := m.markExitedLocked(r)
+	release := r.takeWorkspaceReleaseLocked()
 	r.mu.Unlock()
+	if release != nil {
+		release()
+	}
 	if !detachedAt.IsZero() {
 		m.closeDetachedLater(r.session.ID(), detachedAt)
 	}
@@ -467,10 +484,24 @@ func (m *terminalManager) markWaiterDone(r *terminalRecord, exitCode *int) {
 	r.waiterDone = true
 	r.exitCode = exitCode
 	detachedAt := m.markExitedLocked(r)
+	release := r.takeWorkspaceReleaseLocked()
 	r.mu.Unlock()
+	if release != nil {
+		release()
+	}
 	if !detachedAt.IsZero() {
 		m.closeDetachedLater(r.session.ID(), detachedAt)
 	}
+}
+
+// 关闭记录、断开页面或启动失败均不代表进程和输出读取已经退出。
+func (r *terminalRecord) takeWorkspaceReleaseLocked() func() {
+	if !r.readerDone || !r.waiterDone || r.exitCode == nil || *r.exitCode < 0 {
+		return nil
+	}
+	release := r.releaseWorkspace
+	r.releaseWorkspace = nil
+	return release
 }
 
 // markExitedLocked preserves final PTY output by waiting for both the reader

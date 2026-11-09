@@ -58,6 +58,7 @@ func (s *Server) resolveRequestWorkspace(ctx context.Context, projectID, convers
 	if workspace.State != "ready" || strings.TrimSpace(workspace.Path) == "" {
 		return resolvedConversationWorkspace{}, errors.New("conversation workspace is not ready")
 	}
+	s.rememberWorkspaceScope(workspaceLeaseKey(project, workspace), workspace.Path, project.Runner)
 	return resolvedConversationWorkspace{Project: project, Workspace: workspace, ConversationID: conversationID}, nil
 }
 
@@ -232,6 +233,19 @@ func (s *Server) removeConversationWorktrees(ctx context.Context, projectID, con
 	if len(items) == 0 {
 		return nil
 	}
+	project, err := s.getProjectByID(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	paths := []string{project.Path}
+	for _, value := range items {
+		paths = append(paths, value.path)
+	}
+	release, err := s.beginWorkspaceOperationsAtPaths(project, paths, "workspace-cleanup")
+	if err != nil {
+		return err
+	}
+	defer release()
 	runner, repo, err := s.gitRunnerForProject(ctx, projectID)
 	if err != nil {
 		return err
@@ -267,6 +281,10 @@ func (s *Server) removeConversationWorktrees(ctx context.Context, projectID, con
 
 func (s *Server) createConversationWorktree(w http.ResponseWriter, r *http.Request) {
 	conversationID := chi.URLParam(r, "conversationID")
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	var project Project
 	var conversationProjectID, status string
 	err := s.db.QueryRowContext(r.Context(), `select p.id,p.name,p.path,coalesce(nullif(p.runner_id,''),p.runner),p.git_branch,p.claude_ready,p.created_at,coalesce(p.default_profile_id,''),c.project_id,c.status
@@ -295,6 +313,7 @@ func (s *Server) createConversationWorktree(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	s.rememberWorkspaceScope(project.ID, project.Path, project.Runner)
 	release, acquired := s.acquireProjectWorkspace(project.ID, "workspace-create:"+conversationID)
 	if !acquired {
 		writeError(w, http.StatusConflict, s.projectWorkspaceOccupiedError(project.ID))
@@ -349,6 +368,13 @@ func (s *Server) createConversationWorktree(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	releaseTarget, err := s.beginWorkspaceOperationAtPath(project, path, "workspace-create")
+	if err != nil {
+		_, _ = s.db.ExecContext(r.Context(), `update conversation_workspaces set state='failed' where id=? and state='provisioning'`, workspace.ID)
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	defer releaseTarget()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err == nil {
 		_, err = runner.runGit(r.Context(), repo, "worktree", "add", "-b", branch, path, baseRevision)
@@ -405,6 +431,10 @@ func (s *Server) activateConversationWorkspace(w http.ResponseWriter, r *http.Re
 	workspaceID := chi.URLParam(r, "workspaceID")
 	s.projectLifecycleMu.Lock()
 	defer s.projectLifecycleMu.Unlock()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 
 	var status string
 	err := s.db.QueryRowContext(r.Context(), `select c.status from conversations c join conversation_workspaces w on w.conversation_id=c.id where c.id=? and w.id=? and w.state='ready'`, conversationID, workspaceID).Scan(&status)
@@ -451,6 +481,10 @@ func (s *Server) archiveConversationWorkspace(w http.ResponseWriter, r *http.Req
 			s.projectLifecycleMu.Unlock()
 		}
 	}()
+	if err := rejectActiveSupervisionConversation(r.Context(), s.db, conversationID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 
 	var project Project
 	var workspace ConversationWorkspace
@@ -518,6 +552,13 @@ func (s *Server) archiveConversationWorkspace(w http.ResponseWriter, r *http.Req
 	// Hold the project lease across the external Git cleanup. Conversation and
 	// project deletion use the same lease, so releasing projectLifecycleMu below
 	// cannot leave a deleted row or project behind an in-flight worktree removal.
+	releaseTarget, err := s.beginWorkspaceOperationAtPath(project, workspace.Path, "workspace-archive")
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	defer releaseTarget()
+	s.rememberWorkspaceScope(project.ID, project.Path, project.Runner)
 	release, acquired := s.acquireProjectWorkspace(project.ID, "workspace-archive:"+workspace.ID)
 	if !acquired {
 		writeError(w, http.StatusConflict, s.projectWorkspaceOccupiedError(project.ID))

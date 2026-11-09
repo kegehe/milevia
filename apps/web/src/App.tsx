@@ -18,6 +18,7 @@ import ConversationPage from "./pages/ConversationPage";
 import TaskBoardPage from "./pages/TaskBoardPage";
 import ScheduledTasksPage from "./pages/ScheduledTasksPage";
 import OrchestrationPage from "./pages/OrchestrationPage";
+import SupervisionPage from "./pages/SupervisionPage";
 import GitWorkbenchPage from "./pages/GitWorkbenchPage";
 import ProjectRunPage from "./pages/ProjectRunPage";
 import InsightsPage from "./pages/InsightsPage";
@@ -110,6 +111,7 @@ export function App() {
                     <Route path="tasks/schedules/:scheduledTaskId" element={<ScheduledTasksPage />} />
                     <Route path="tasks/:taskId" element={<TaskBoardPage />} />
                     <Route path="orchestration" element={<OrchestrationPage />} />
+                    <Route path="supervision" element={<SupervisionPage />} />
                     <Route path="files" element={<FilesPage />} />
                     <Route path="git" element={<GitWorkbenchPage />} />
                     <Route path="run" element={<ProjectRunPage />} />

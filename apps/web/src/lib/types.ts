@@ -31,10 +31,11 @@ export type AgentModelOption = { id: string; label?: string; description?: strin
 // 前端也可能连到更早的 sidecar 二进制（Go 的 nil 切片会序列化成 null）。写死成非空
 // 数组曾经让渲染路径上的 .length 直接抛错——取值一律经 lib/model-options.ts 的
 // modelList()，类型上就不要再假装它一定在。
-export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[] | null; customAllowed: boolean; reasoningEffort?: string; reasoningOptions?: string[]; note?: string };
+export type ConversationModels = { conversationId: string; agentId: AgentID; selected: string; effective: string; source: "override" | "profile" | "cli_default"; models: AgentModelOption[] | null; customAllowed: boolean; reasoningEffort?: string; reasoningOptions?: string[]; reasoningCustomAllowed?: boolean; note?: string };
 export type ConversationWorkspace = { id: string; conversationId: string; generation: number; mode: "project_shared" | "isolated_worktree" | string; path: string; branch?: string; baseRevision?: string; state: "provisioning" | "ready" | "active" | "failed" | "archived" | string; active?: boolean; createdAt: string; archivedAt?: string | null };
 export type ConversationCheckpoint = { id: string; conversationId: string; parentId?: string; agentId: AgentID | string; nativeSessionId?: string; nativeTurnId?: string; runId?: string; prompt: string; hasSnapshot?: boolean; status: "active" | "rewound" | string; createdAt: string; rewoundAt?: string | null; metadata?: string };
-export type Message = { id: string; runId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
+export type MessageAttachment = { path: string; mediaType?: string; size?: number };
+export type Message = { attachments?: MessageAttachment[]; id: string; runId?: string; clientRequestId?: string; role: "user" | "assistant"; content: string; parentToolUseId?: string; createdAt: string };
 export type ShortcutKind = "prompt" | "snippet" | "command_request";
 export type Shortcut = { id: string; name: string; description: string; kind: ShortcutKind; template: string; scope: "local" | "project"; defaultAction: "fill" | "confirm" | "run"; groupName: string; pinned: boolean; enabled: boolean; sortOrder: number; projectIds: string[] };
 export type ShortcutEditorState = { kind: ShortcutKind; shortcut?: Shortcut };
@@ -44,9 +45,9 @@ export type AgentCommandOption = { name: string; label?: string; description?: s
 // 命令目录。authoritative 为 true 时目录来自 CLI 本身，才能用它判断某条命令是否已失效；
 // static/scan 下的"没找到"不能当作失效（会误报）。
 export type ProjectCommands = { projectId: string; agentId: AgentID; env: string; source: "run" | "probe" | "scan" | "static"; authoritative: boolean; commands: AgentCommandOption[]; claudeCodeVersion?: string; refreshedAt?: string; customAllowed: boolean; note?: string };
-export type SkillAgent = "claude-code" | "codex";
+export type SkillAgent = AgentID;
 export type SkillSource = "user" | "project" | "plugin";
-export type Skill = { name: string; description: string; agent: SkillAgent; env: "windows" | "wsl" | "remote-linux"; source: SkillSource };
+export type Skill = { managed?: boolean; backgroundSource?: string; name: string; description: string; agent: SkillAgent; env: "windows" | "wsl" | "remote-linux"; source: SkillSource };
 export type ScheduledTaskScheduleType = "once" | "daily" | "weekly";
 export type ScheduledTaskRunStatus = "queued" | "running" | "succeeded" | "failed" | "stopped" | "interrupted";
 export type ScheduledTaskRun = { id: string; scheduledTaskId: string; scheduledFor: string; status: ScheduledTaskRunStatus; titleSnapshot?: string; agentIdSnapshot?: AgentID; permissionModeSnapshot?: PermissionMode; profileRevisionSnapshot?: string; promptSnapshot: string; skillsSnapshot: string[]; conversationId?: string; runId?: string; failureReason?: string; createdAt: string; startedAt?: string; finishedAt?: string };
@@ -346,7 +347,7 @@ export type TimelineItem =
   | { kind: "system"; id: string; createdAt: string; system: SystemItem }
   | { kind: "ask"; id: string; createdAt: string; runId: string; ask: Ask }
   | { kind: "error"; id: string; createdAt: string; runId: string; title: string; detail: string; taskId?: string };
-export type WorkspaceTab = "conversation" | "tasks" | "orchestration" | "files" | "git" | "run" | "terminal" | "insights";
+export type WorkspaceTab = "conversation" | "tasks" | "orchestration" | "supervision" | "files" | "git" | "run" | "terminal" | "insights";
 export type TerminalSessionInfo = { id: string; projectId: string; workspaceId?: string; environment: string; shell?: string; elevated?: boolean; cwdDisplay?: string; status: "starting" | "running" | "exited" | "failed" | "closed"; createdAt: string };
 // GET .../terminal/sessions 的响应：会话清单 + 服务端下发的并发上限（界面禁用
 // “新建”和计数都以此为准，不再前端硬编码固定值）。

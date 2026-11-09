@@ -349,6 +349,8 @@ func TestConversationModelsWithoutProfile(t *testing.T) {
 // 曾实测：CodeBuddy 会话里点开底部模型下拉就白掉面板。JSON 里必须逐字出现 `[]`。
 func TestConversationModelsCodeBuddyReturnsEmptyArray(t *testing.T) {
 	server := newTestServer(t)
+	// 明确隔离 CLI：本用例验证读取失败的空数组降级，不能依赖机器上是否安装了 CodeBuddy。
+	server.codebuddyRunner = &codebuddyCLIRunner{paths: &agentPathResolver{override: map[string]string{"codebuddy": filepath.Join(t.TempDir(), "missing-codebuddy")}}}
 	seedModelConversation(t, server, "codebuddy", "idle")
 
 	response := httptest.NewRecorder()

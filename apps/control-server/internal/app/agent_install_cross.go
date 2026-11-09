@@ -92,7 +92,7 @@ func (s *Server) installAgentCLICross(ctx context.Context, runnerID string, env 
 		return agentInstallation{}, errors.New(reason)
 	}
 	installKind, npmPath, prefix := installTarget.InstallKind, installTarget.NpmPath, installTarget.Prefix
-	if err := checkRuntimeGate(installTarget.GateRuntime, entry); err != nil {
+	if err := checkSelectedRuntimeGate(installTarget.GateRuntime, entry, version); err != nil {
 		return agentInstallation{}, err
 	}
 
@@ -153,7 +153,7 @@ func crossAgentInstallScript(npmPath, prefix, packageSpec, commandName string) s
 	return "set -eu\n" +
 		"export PATH=" + shellQuote(npmDir) + ":$PATH\n" +
 		prefixLine +
-		shellQuote(npmPath) + " install -g" + installPrefix + " " + shellQuote(packageSpec) + "\n" +
+		shellQuote(npmPath) + " install -g --engine-strict=true --force=false" + installPrefix + " " + shellQuote(packageSpec) + "\n" +
 		"target=\"$prefix/bin/" + commandName + "\"\n" +
 		"if [ ! -x \"$target\" ]; then\n" +
 		"  echo '安装后没有在 prefix 里找到可执行的 " + commandName + "' >&2\n" +

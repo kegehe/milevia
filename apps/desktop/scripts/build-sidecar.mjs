@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildSupervisionTargets } from "../../../scripts/build-supervision-targets.mjs";
 
 const desktopRoot = resolve(import.meta.dirname, "..");
 const controlRoot = resolve(desktopRoot, "../control-server");
@@ -195,7 +197,7 @@ function prepareAgentBootstrapConfig() {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-const goSources = collectFiles(controlRoot, new Set([".go"]));
+const goSources = collectFiles(controlRoot, new Set([".go", ".cjs"]));
 const agentSources = collectFiles(agentRoot, new Set([".go"]));
 // go.mod / go.sum affect dependency resolution — must be part of fingerprint
 const modFiles = [
@@ -204,6 +206,7 @@ const modFiles = [
 ];
 const agentEnvSource = resolve(agentRoot, ".env.windows");
 const fingerprint = computeFingerprint([
+  fileURLToPath(import.meta.url),
   ...goSources,
   ...agentSources,
   ...modFiles,
@@ -211,6 +214,10 @@ const fingerprint = computeFingerprint([
 ]);
 
 prepareAgentBootstrapConfig();
+
+// Target helpers use no business DB and intentionally build without CGO. Keep
+// their platform/hash manifest separate from the Windows sidecar's CGO cache.
+buildSupervisionTargets({ out: resolve(binaries, "supervision-targets"), force });
 
 const controlNeeded = force || shouldRebuild(controlOutput, fingerprint);
 const approvalNeeded = force || shouldRebuild(approvalOutput, fingerprint);

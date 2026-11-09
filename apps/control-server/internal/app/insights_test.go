@@ -3412,7 +3412,7 @@ func TestInsightPendingOnlyAppliesToSelectedRevision(t *testing.T) {
 func TestRunInsightScanAllowsNonGitProject(t *testing.T) {
 	server := newTestServer(t)
 	projectID := "non-git-insight-project"
-	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,'windows','非 Git 目录',1,?)`, projectID, projectID, t.TempDir(), time.Now().UTC()); err != nil {
+	if _, err := server.db.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,'非 Git 目录',1,?)`, projectID, projectID, t.TempDir(), server.localRunnerID(), time.Now().UTC()); err != nil {
 		t.Fatalf("insert non-Git project: %v", err)
 	}
 	runner := &insightScriptRunner{outputs: []string{`[]`}}

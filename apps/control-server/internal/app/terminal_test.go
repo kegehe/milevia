@@ -74,11 +74,12 @@ func (s *testTerminalSession) Wait() error                 { s.mu.Lock(); s.wait
 func TestTerminalCreateIsInvalidatedByProjectDeletion(t *testing.T) {
 	session := &testTerminalSession{id: "terminal", ready: make(chan error, 1)}
 	factory := &blockingTerminalFactory{started: make(chan struct{}), release: make(chan struct{}), session: session}
-	manager := newTerminalManager(&Server{})
+	manager := newTerminalManager(newTestServer(t))
+	t.Cleanup(manager.closeAll)
 	manager.factory = factory
 	result := make(chan error, 1)
 	go func() {
-		_, err := manager.create(context.Background(), Project{ID: "project", RunnerID: "local", Path: "/tmp/project"}, 120, 36)
+		_, err := manager.create(context.Background(), Project{ID: "project", RunnerID: manager.server.localRunnerID(), Path: manager.server.config.AllowedRoot}, 120, 36)
 		result <- err
 	}()
 	<-factory.started
@@ -184,11 +185,12 @@ func TestTerminalManagerLimitsReadFromConfig(t *testing.T) {
 func TestTerminalCreateIsInvalidatedByShutdown(t *testing.T) {
 	session := &testTerminalSession{id: "terminal", ready: make(chan error, 1)}
 	factory := &blockingTerminalFactory{started: make(chan struct{}), release: make(chan struct{}), session: session}
-	manager := newTerminalManager(&Server{})
+	manager := newTerminalManager(newTestServer(t))
+	t.Cleanup(manager.closeAll)
 	manager.factory = factory
 	result := make(chan error, 1)
 	go func() {
-		_, err := manager.create(context.Background(), Project{ID: "project", RunnerID: "local", Path: "/tmp/project"}, 120, 36)
+		_, err := manager.create(context.Background(), Project{ID: "project", RunnerID: manager.server.localRunnerID(), Path: manager.server.config.AllowedRoot}, 120, 36)
 		result <- err
 	}()
 	<-factory.started
@@ -217,13 +219,14 @@ func TestTerminalCreateIsInvalidatedByShutdown(t *testing.T) {
 }
 
 func TestTerminalShutdownCancelsPendingOpen(t *testing.T) {
-	manager := newTerminalManager(&Server{})
+	manager := newTerminalManager(newTestServer(t))
+	t.Cleanup(manager.closeAll)
 	started := make(chan struct{})
 	canceled := make(chan struct{})
 	manager.factory = contextTerminalFactory{started: started, canceled: canceled}
 	result := make(chan error, 1)
 	go func() {
-		_, err := manager.create(context.Background(), Project{ID: "project", RunnerID: "local"}, 120, 36)
+		_, err := manager.create(context.Background(), Project{ID: "project", RunnerID: manager.server.localRunnerID(), Path: manager.server.config.AllowedRoot}, 120, 36)
 		result <- err
 	}()
 	<-started
@@ -239,11 +242,12 @@ func TestTerminalShutdownCancelsPendingOpen(t *testing.T) {
 }
 
 func TestTerminalStartupTimeoutClosesUnreadySession(t *testing.T) {
-	manager := newTerminalManager(&Server{})
+	manager := newTerminalManager(newTestServer(t))
+	t.Cleanup(manager.closeAll)
 	manager.startupTimeout = 10 * time.Millisecond
-	session := &testTerminalSession{id: "terminal", ready: make(chan error)}
+	session := &closingTerminalSession{testTerminalSession: testTerminalSession{id: "terminal", ready: make(chan error)}, done: make(chan struct{})}
 	manager.factory = staticTerminalFactory{session: session}
-	record, err := manager.create(context.Background(), Project{ID: "project", RunnerID: "local"}, 120, 36)
+	record, err := manager.create(context.Background(), Project{ID: "project", RunnerID: manager.server.localRunnerID(), Path: manager.server.config.AllowedRoot}, 120, 36)
 	if err != nil {
 		t.Fatalf("create terminal: %v", err)
 	}
@@ -254,6 +258,13 @@ func TestTerminalStartupTimeoutClosesUnreadySession(t *testing.T) {
 	}
 	if !errors.Is(record.readyErr, errTerminalStartupTimeout) {
 		t.Fatalf("ready error=%v, want startup timeout", record.readyErr)
+	}
+	// Readiness publishes the failure before asynchronous resource teardown.
+	// Wait for the actual Close receipt instead of racing that goroutine.
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("startup timeout did not close the terminal session")
 	}
 	session.mu.Lock()
 	closes := session.closeCount

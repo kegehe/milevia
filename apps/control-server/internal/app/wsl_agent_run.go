@@ -20,8 +20,8 @@ import (
 //   - --cd 设置 WSL 内工作目录（request.ProjectPath 为 UNC，经 uncToWslPath 转换）。
 //   - 环境变量经 WSLENV 透传到 WSL 内进程（/u 后缀不转路径）。
 //   - 进程清理走 configureProcessGroup / terminateProcessGroup（主进程立即终止 +
-//     枚举回收 Windows 侧后代，见 process_windows.go）；wsl.exe 被杀后 WSL 内那个
-//     cli 进程随之结束。
+//     枚举回收 Windows 侧后代，见 process_windows.go）。包装器异常结束不证明Linux
+//     后代已退出，普通目录保护会保留未确认令牌。
 
 // wslForwardEnvKeys 是需经 WSLENV 透传到 WSL 内的环境变量名前缀。managedCLIEnvironment
 // 返回的 KEY=VAL 中匹配这些前缀的变量，既设到 wsl.exe 进程 Env，又加入 WSLENV。
@@ -243,7 +243,11 @@ func (r *wslAgentRunner) runOpenCodeOnce(ctx context.Context, request AgentRunRe
 	if err != nil {
 		return err
 	}
-	cmd := r.wslNativeCommand(ctx, "opencode", args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
+	cmd, err := r.wslOrdinaryCLICommand(ctx, "opencode", args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
+	if err != nil {
+		return err
+	}
+	defer stopOrdinaryCLITransport(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -257,7 +261,7 @@ func (r *wslAgentRunner) runOpenCodeOnce(ctx context.Context, request AgentRunRe
 	if err != nil {
 		return fmt.Errorf("open OpenCode stderr (wsl): %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLITransport(cmd); err != nil {
 		return fmt.Errorf("start OpenCode (wsl): %w", err)
 	}
 	promptErr := writeOpenCodePrompt(stdin, request.Prompt)
@@ -274,7 +278,8 @@ func (r *wslAgentRunner) runOpenCodeOnce(ctx context.Context, request AgentRunRe
 	go func() { defer wg.Done(); readOpenCodeJSONL(stdout, sink, completion) }()
 	go func() { defer wg.Done(); readOpenCodeStderr(stderr, sink, completion) }()
 	wg.Wait()
-	err = cmd.Wait()
+	err = waitOrdinaryCLICommand(cmd)
+	noteWorkspaceWSLExit(r.distro, ctx, err, true, linuxWorkDir)
 	if completion.finished() {
 		if failure := completion.failure(); failure != nil {
 			return failure
@@ -313,7 +318,11 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 	if request.PromptViaStdin {
 		args = append(args, profileArgs...)
 	}
-	cmd := r.wslClaudeCommand(ctx, args, environment, linuxWorkDir)
+	cmd, err := r.wslOrdinaryCLICommand(ctx, r.claude.claudeBinary(), args, environment, linuxWorkDir)
+	if err != nil {
+		return err
+	}
+	defer stopOrdinaryCLITransport(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -331,7 +340,7 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 		}
 		stdin = pipe
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLITransport(cmd); err != nil {
 		return fmt.Errorf("start Claude (wsl): %w", err)
 	}
 
@@ -358,7 +367,9 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 		}()
 	}
 	wg.Wait()
-	if err := cmd.Wait(); err != nil {
+	waitErr := waitOrdinaryCLICommand(cmd)
+	noteWorkspaceWSLExit(r.distro, ctx, waitErr, true, linuxWorkDir)
+	if err := waitErr; err != nil {
 		// 与 claudeCLIRunner.Run 一致（规则见 claudeRunFailureDetail）。
 		if detail := claudeRunFailureDetail(recorded.failureResult(), stderrTail.tail()); detail != "" {
 			return fmt.Errorf(claudeExitPrefix+"%w %s", err, detail)
@@ -406,12 +417,28 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	}
 	if request.Resume {
 		// 与本地/SSH 的 resume 分支一致：WSL 里的项目目录也可能还不是 git 仓库。
-		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", request.SessionID, request.Prompt)
+		args = append(args, "resume", "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", request.SessionID)
+		for _, attachment := range request.Attachments {
+			if nativeImageMediaType(attachment.MediaType) {
+				args = append(args, "--image", attachment.Path)
+			}
+		}
+		args = append(args, request.Prompt)
 	} else {
-		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy, request.Prompt)
+		args = append(args, "-c", fmt.Sprintf("sandbox_mode=%q", policy), "--json", "--skip-git-repo-check", "--color", "never", "-C", linuxWorkDir, "--sandbox", policy)
+		for _, attachment := range request.Attachments {
+			if nativeImageMediaType(attachment.MediaType) {
+				args = append(args, "--image", attachment.Path)
+			}
+		}
+		args = append(args, request.Prompt)
 	}
 
-	cmd := r.wslNativeCommand(ctx, r.codex.codexBinary(), args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
+	cmd, err := r.wslOrdinaryCLICommand(ctx, r.codex.codexBinary(), args, environment, linuxWorkDir, envNames(request.MCPEnv)...)
+	if err != nil {
+		return err
+	}
+	defer stopOrdinaryCLITransport(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -421,7 +448,7 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	if err != nil {
 		return fmt.Errorf("open Codex stderr: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLITransport(cmd); err != nil {
 		return fmt.Errorf("start Codex (wsl): %w", err)
 	}
 
@@ -440,7 +467,8 @@ func (r *wslAgentRunner) runCodexOnce(ctx context.Context, request AgentRunReque
 	go func() { defer wg.Done(); readCodexJSONL(stdout, sink, "", completion) }()
 	go func() { defer wg.Done(); readCodexStderr(stderr, sink) }()
 	wg.Wait()
-	err = cmd.Wait()
+	err = waitOrdinaryCLICommand(cmd)
+	noteWorkspaceWSLExit(r.distro, ctx, err, true, linuxWorkDir)
 	if completion.finished() {
 		return nil
 	}
@@ -470,7 +498,17 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 	}
 	args = append(args, profileArgs...)
 	linuxWorkDir := r.wslLinuxWorkDir(request.ProjectPath)
-	cmd := r.wslClaudeCommand(ctx, args, environment, linuxWorkDir)
+	cmd, err := r.wslOrdinaryCLICommand(ctx, r.claude.claudeBinary(), args, environment, linuxWorkDir)
+	if err != nil {
+		closeProfile()
+		return nil, err
+	}
+	transportTransferred := false
+	defer func() {
+		if !transportTransferred {
+			stopOrdinaryCLITransport(cmd)
+		}
+	}()
 	// 同本地流式会话：给 reader 5 秒读完退出前的最后几帧，再关父端读管道。
 	cmd.WaitDelay = agentProcessTeardownGrace
 
@@ -489,10 +527,11 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 		closeProfile()
 		return nil, fmt.Errorf("open Claude stderr: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startOrdinaryCLITransport(cmd); err != nil {
 		closeProfile()
 		return nil, fmt.Errorf("start Claude (wsl): %w", err)
 	}
+	transportTransferred = true
 	session := &claudeCLISession{
 		cmd:                    cmd,
 		stdin:                  stdin,
@@ -519,7 +558,8 @@ func wslAgentStartSession(ctx context.Context, r *wslAgentRunner, request AgentS
 	}()
 	go func() {
 		defer releaseTree()
-		err := cmd.Wait()
+		err := waitOrdinaryCLICommand(cmd)
+		noteWorkspaceWSLExit(r.distro, ctx, err, true, linuxWorkDir)
 		releaseTree()
 		readersDone := make(chan struct{})
 		go func() { readers.Wait(); close(readersDone) }()
