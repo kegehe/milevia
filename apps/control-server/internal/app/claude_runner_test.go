@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/kegehe/milevia/apps/control-server/internal/targetexec"
 )
 
 type claudeTurnTestSink struct {
@@ -546,6 +548,56 @@ func TestClaudeCLIRunSurfacesSelfReportedFailure(t *testing.T) {
 	}
 }
 
+// TestClaudeCLIRunWaitsForNaturalExitAfterSuccessfulResult 复现 2026-11-04 的回归：
+// 假 CLI 打出成功的终结 result 之后还要收尾一段时间才退出 —— 收尾阶段会写一个标记文件。
+// v0.1.14 的收尾看护在 result 上立刻杀进程，标记文件不会出现（进程根本没活到收尾），
+// 且 cmd.Wait 拿到非零退出码，一次已经产出完整结果的运行被报成失败。
+func TestClaudeCLIRunWaitsForNaturalExitAfterSuccessfulResult(t *testing.T) {
+	const resultLine = `{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"done"}`
+	scriptPath := writeFakeClaudeExecutable(t,
+		"printf '%s\\n' '"+resultLine+"'\nsleep 0.3\nprintf teardown > teardown.marker\nexit 0\n",
+		"@echo off\r\necho "+resultLine+"\r\nping -n 2 127.0.0.1 >nul\r\necho teardown>teardown.marker\r\nexit /b 0\r\n")
+
+	projectDir := t.TempDir()
+	runner := claudeCLIRunner{config: Config{ClaudePath: scriptPath}}
+	err := runner.Run(context.Background(), AgentRunRequest{
+		SessionID:      "00000000-0000-4000-8000-000000000000",
+		ProjectPath:    projectDir,
+		Prompt:         "test",
+		PermissionMode: "full_control",
+	}, &recordingSink{})
+	if err != nil {
+		t.Fatalf("successful result should survive the CLI's own teardown, got %v", err)
+	}
+	// 标记文件是"进程活到了自然收尾"的直接证据：只有等它自然退出才会被写出来。
+	if _, statErr := os.Stat(filepath.Join(projectDir, "teardown.marker")); statErr != nil {
+		t.Fatalf("CLI teardown did not run (process was killed right after result): %v", statErr)
+	}
+}
+
+// TestClaudeCLIRunTreatsSuccessfulResultAsAuthoritativeDespiteExitCode：成功的终结
+// result 已经完整到达时，进程之后以非零码退出不再把运行判成失败——与 Codex 的
+// "turn.completed 即结果"同口径（见 codex_runner.go）。真正的失败 result 仍要报错，
+// 由 TestClaudeCLIRunSurfacesSelfReportedFailure 钉住。
+func TestClaudeCLIRunTreatsSuccessfulResultAsAuthoritativeDespiteExitCode(t *testing.T) {
+	const resultLine = `{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"done"}`
+	// stderr 故意留一行告警：成功收尾时 stderr 仍可能有内容，判定不能被它拉回失败。
+	scriptPath := writeFakeClaudeExecutable(t,
+		"printf '%s\\n' '"+resultLine+"'\nprintf '%s\\n' 'warning: telemetry flush failed' >&2\nexit 1\n",
+		"@echo off\r\necho "+resultLine+"\r\necho warning: telemetry flush failed 1>&2\r\nexit /b 1\r\n")
+
+	runner := claudeCLIRunner{config: Config{ClaudePath: scriptPath}}
+	err := runner.Run(context.Background(), AgentRunRequest{
+		SessionID:      "00000000-0000-4000-8000-000000000000",
+		ProjectPath:    t.TempDir(),
+		Prompt:         "test",
+		PermissionMode: "full_control",
+	}, &recordingSink{})
+	if err != nil {
+		t.Fatalf("successful terminal result should win over a non-zero exit code: %v", err)
+	}
+}
+
 // TestClaudeResultErrorSinkRecordsReadOutputFailure 不依赖子进程夹具（Windows 也能跑）：
 // readOutput 解析 stdout 事件流时，result 事件里的失败原因应被包装的 sink 记下（供
 // Run 拼进错误信息），且事件仍照常转发给调用方的 sink——包装对调用方透明。
@@ -587,6 +639,81 @@ func TestClaudeResultErrorSinkRecordsReadOutputFailure(t *testing.T) {
 			`{"type":"result","is_error":true,"result":"最后一条失败"}`+"\n"), multi)
 	if got := claudeRunFailureDetail(multi.failureResult(), ""); !strings.Contains(got, "最后一条失败") {
 		t.Fatalf("latest failure result should win, got %q", got)
+	}
+}
+
+// TestClaudeResultSucceededRequiresExplicitSuccess：只有 CLI 显式写出 is_error:false 才算
+// "结果已完整产出"；缺失该字段或失败帧都不能为成功收尾背书。
+func TestClaudeResultSucceededRequiresExplicitSuccess(t *testing.T) {
+	cases := []struct {
+		payload string
+		want    bool
+	}{
+		{`{"type":"result","is_error":false}`, true},
+		{`{"type":"result","is_error":true,"result":"boom"}`, false},
+		{`{"type":"result","result":"缺少 is_error"}`, false},
+		{`not json`, false},
+		{``, false},
+	}
+	for _, c := range cases {
+		if got := claudeResultSucceeded(json.RawMessage(c.payload)); got != c.want {
+			t.Fatalf("claudeResultSucceeded(%s) = %v, want %v", c.payload, got, c.want)
+		}
+	}
+
+	// sink 以最近一次终结 result 为准：失败帧必须清掉先前的成功标记，否则
+	// "先成功、后失败"会被误判成成功。
+	recorded := &claudeResultErrorSink{AgentRunSink: &claudeOutputTestSink{}}
+	recorded.Event("result", json.RawMessage(`{"type":"result","is_error":false}`))
+	if !recorded.resultSucceeded() {
+		t.Fatal("successful result should be recorded")
+	}
+	recorded.Event("result", json.RawMessage(`{"type":"result","is_error":true,"result":"boom"}`))
+	if recorded.resultSucceeded() {
+		t.Fatal("failure result should clear the success flag")
+	}
+
+	// 反方向同样要以最后一条为准：成功帧必须清掉先前记录的失败原因，否则"先失败、
+	// 后成功"的运行在被取消/异常收尾时会把旧失败原因拼进错误。
+	recorded = &claudeResultErrorSink{AgentRunSink: &claudeOutputTestSink{}}
+	recorded.Event("result", json.RawMessage(`{"type":"result","is_error":true,"result":"old failure"}`))
+	recorded.Event("result", json.RawMessage(`{"type":"result","is_error":false}`))
+	if !recorded.resultSucceeded() || recorded.failureResult() != nil {
+		t.Fatalf("successful result must clear the recorded failure: success=%v failure=%s",
+			recorded.resultSucceeded(), recorded.failureResult())
+	}
+
+	// 被取消的运行即使成功 result 已到，也不能按成功收尾（用户要的是"没跑完"）。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if claudeRunExitSucceeded(recorded, ctx, nil) {
+		t.Fatal("canceled run must not be treated as succeeded")
+	}
+}
+
+// TestClaudeGovernanceFailureStillFailsSuccessfulRun：成功 result 可以豁免退出码与
+// 收尾告警，但不能豁免工作区治理类失败——租约失效/身份冲突/协议错误说明这次运行的
+// 授权与身份事实已不可信，按成功采信会越过工作区保护。
+func TestClaudeGovernanceFailureStillFailsSuccessfulRun(t *testing.T) {
+	recorded := &claudeResultErrorSink{AgentRunSink: &claudeOutputTestSink{}}
+	recorded.Event("result", json.RawMessage(`{"type":"result","is_error":false}`))
+	ctx := context.Background()
+	exitErr := &supervisionExitError{Code: 1}
+
+	if !claudeRunExitSucceeded(recorded, ctx, exitErr) {
+		t.Fatal("成功的 result 应该能豁免进程退出码")
+	}
+	if !claudeRunExitSucceeded(recorded, ctx, errors.Join(exitErr, errors.New("容器收尾告警"))) {
+		t.Fatal("成功的 result 应该能豁免收尾告警")
+	}
+	for _, governance := range []error{targetexec.ErrAuthority, targetexec.ErrConflict, targetexec.ErrProtocol} {
+		if claudeRunExitSucceeded(recorded, ctx, errors.Join(exitErr, governance)) {
+			t.Fatalf("治理类失败 %v 不能被成功的 result 豁免", governance)
+		}
+		// 真实链路里治理错误常被 fmt 包装或与其他收尾错误 join，判定必须穿透。
+		if claudeRunExitSucceeded(recorded, ctx, fmt.Errorf("admission: %w", governance)) {
+			t.Fatalf("包装后的治理类失败 %v 不能被成功的 result 豁免", governance)
+		}
 	}
 }
 

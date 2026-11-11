@@ -62,8 +62,8 @@ func (s *Server) conflictSuggestionAgents(project Project) []gitConflictSuggestA
 	return agents
 }
 
-// runConflictSuggestionAgent 不改变优化建议扫描的能力开关。CodeBuddy / Qoder
-// 只提供 StartSession，因此为冲突建议创建临时只读会话，首轮完成或取消就关闭。
+// runConflictSuggestionAgent 对已接通优化建议的工具走同一条只读分析链路。
+// 尚未接通、且只有 StartSession 的工具，在这里开一轮即关的临时只读会话。
 func (s *Server) runConflictSuggestionAgent(ctx context.Context, project Project, agentID, prompt string) (string, error) {
 	entry, ok := agentByID(agentID)
 	if !ok || !entry.SupportsConflictSuggestions {

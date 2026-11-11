@@ -136,17 +136,27 @@ func TestCatalogEntriesAreSelfConsistent(t *testing.T) {
 }
 
 func TestInsightAgentSupportIsExplicit(t *testing.T) {
-	for _, agentID := range []string{"claude-code", "codex", "opencode"} {
-		entry, ok := agentByID(agentID)
-		if !ok || !entry.SupportsProjectInsights {
-			t.Fatalf("%s must be explicitly enabled for optimization insights", agentID)
+	enabled := map[string]bool{
+		"claude-code": true,
+		"codex":       true,
+		"opencode":    true,
+		"codebuddy":   true,
+		"qoder":       true,
+		"cursor":      true,
+	}
+	localOnly := map[string]bool{"codebuddy": true, "qoder": true, "cursor": true}
+	seen := map[string]bool{}
+	for _, entry := range agentCatalog() {
+		seen[entry.ID] = true
+		if enabled[entry.ID] != entry.SupportsProjectInsights {
+			t.Fatalf("%s insights support = %v, want %v", entry.ID, entry.SupportsProjectInsights, enabled[entry.ID])
+		}
+		if localOnly[entry.ID] != entry.ProjectInsightsLocalOnly {
+			t.Fatalf("%s local-only insights = %v, want %v", entry.ID, entry.ProjectInsightsLocalOnly, localOnly[entry.ID])
 		}
 	}
-	for _, agentID := range []string{"codebuddy", "qoder", "cursor"} {
-		entry, ok := agentByID(agentID)
-		if !ok || entry.SupportsProjectInsights {
-			t.Fatalf("%s must stay out of optimization insights until its read-only analysis protocol is implemented", agentID)
-		}
+	if len(seen) != len(enabled) {
+		t.Fatalf("catalog ids = %v, insight expectations = %v", seen, enabled)
 	}
 }
 
@@ -279,7 +289,7 @@ func TestListAgentsEndpointExposesQoder(t *testing.T) {
 	if !qoder.SupportsInstall || !qoder.SupportsLogin || !qoder.RunnableInProject {
 		t.Fatalf("qoder 能力开关不完整（安装/登录/可运行都要为 true）：%+v", *qoder)
 	}
-	if qoder.SupportsProjectInsights {
-		t.Fatal("洞察协议还没接，目录不能声称支持")
+	if !qoder.SupportsProjectInsights || !qoder.ProjectInsightsLocalOnly {
+		t.Fatal("Qoder 的只读分析已接通，且只在本机执行")
 	}
 }

@@ -317,7 +317,8 @@ func (r *codexCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink 
 	defer close(done)
 	// Cancellation and turn completion both reclaim the CLI and its children,
 	// including a process that has not consumed a large stdin prompt yet. 收尾有界：
-	// 见 watchAgentProcess（超过宽限期会关闭输出读端，不允许运行永久停在 running）。
+	// 见 watchAgentProcess（终结事件后先等自然退出；仍不收敛会强杀并关闭输出读端，
+	// 不允许运行永久停在 running）。
 	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 	var wg sync.WaitGroup
 	wg.Add(2)

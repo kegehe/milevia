@@ -44,10 +44,18 @@ func closeAgentOutputPipes(pipes ...io.Closer) {
 // watchAgentProcess 是一次性 CLI 运行共用的收尾看护，取代各 runner 里各写一份的
 // select 块（codex / cursor / opencode / claude 一次性 / wsl 三条路径）。
 //
-//   - ctx 被取消（用户停止）或 CLI 给出了终结事件 → 结束整棵进程树；
-//   - 主进程已经收敛 → 立即返回，正常路径不多等一毫秒；
-//   - 超过 agentProcessTeardownGrace 仍未收敛 → 强杀并关闭输出读端，
+//   - ctx 被取消（用户停止）→ 立即结束整棵进程树；
+//   - CLI 给出了终结事件 → **先等它自然退出**，最多等 agentProcessTeardownGrace。
+//     终结事件只代表"这一轮答完了"，不代表进程已经退出；CLI 打出 result 之后还要花
+//     约半秒刷转录、发遥测。此时立刻杀会让一次成功运行以非零退出码收场（Windows 上
+//     .cmd shim 被终止 → cmd.Wait 返回 exit status 1），被上层当成失败。
+//   - 主进程已经收敛 → 返回前补一次进程组回收（POSIX 上没有 Job Object，detached
+//     后裔不会因为主进程退出而消失；见 reapProcessGroupAfterExit）；
+//   - 宽限内仍未收敛 → 结束进程树；再等一个宽限仍未收敛 → 强杀并关闭输出读端，
 //     保证"有后裔进程握着管道"这种异常不会再让一次运行永久停在 running。
+//
+// 因此"终结事件之后"最坏耗时有界但不止一个宽限：先等自然退出，再等强杀生效。
+// 正常路径（CLI 自己退出）只花它本身的收尾时间，不多等。
 //
 // done 由调用方在 Run 返回时关闭（defer close(done)），它是"整次运行已收敛"的信号；
 // terminal 为 nil 表示这条 runner 没有可依赖的终结事件（只认 ctx 与进程退出）。
@@ -60,10 +68,25 @@ func watchAgentProcess(ctx context.Context, cmd *exec.Cmd, terminal <-chan struc
 // 又不至于让生产代码读一个可变的全局变量。
 func watchAgentProcessWithin(ctx context.Context, cmd *exec.Cmd, terminal <-chan struct{}, done <-chan struct{}, grace time.Duration, pipes ...io.Closer) {
 	select {
-	case <-ctx.Done():
-	case <-terminal:
 	case <-done:
+		// 主进程已自然退出：补一次进程组回收（POSIX 上没有 Job Object，见
+		// reapProcessGroupAfterExit）。Windows 上是空操作，进程树由 Job 兜底。
+		reapProcessGroupAfterExit(cmd)
 		return
+	case <-ctx.Done():
+		// 取消要立刻生效：不等自然退出，直接回收进程树。
+	case <-terminal:
+		// 终结事件（claude 的 result / codex 的 turn.completed）只是"这一轮答完了"，
+		// 不是"进程已经退出"：实测 claude 打完 result 后还要约 0.55 秒才真正退出。
+		// 立即杀会让一次成功运行以非零退出码收场（见函数头注释），所以先给一个有界
+		// 的自然退出窗口；窗口内没退出（后裔握着管道、进程挂住）再按原逻辑强杀。
+		select {
+		case <-done:
+			reapProcessGroupAfterExit(cmd)
+			return
+		case <-ctx.Done():
+		case <-time.After(grace):
+		}
 	}
 	terminateProcessGroup(cmd)
 	select {
@@ -222,6 +245,22 @@ func (s *terminalSignalSink) Event(eventType string, payload json.RawMessage) {
 	s.AgentRunSink.Event(eventType, payload)
 	if _, ok := s.types[eventType]; ok {
 		s.once.Do(func() { close(s.done) })
+	}
+}
+
+// 与 claudeResultErrorSink 同理：readOutput / readClaudeJSONLines 会对 sink 做可选接口
+// 断言（assistantMessageIDSetter / assistantDeltaSink），包装层必须显式转发，否则
+// "增量输出 / 采纳 assistant message id"会被静默吞掉。本地、WSL、SSH 三条一次性
+// Claude 路径都把本类型交给了 reader。内层 sink 没实现对应能力时静默跳过。
+func (s *terminalSignalSink) SetAssistantMessageID(messageID string) {
+	if setter, ok := s.AgentRunSink.(assistantMessageIDSetter); ok {
+		setter.SetAssistantMessageID(messageID)
+	}
+}
+
+func (s *terminalSignalSink) AssistantDelta(delta string) {
+	if target, ok := s.AgentRunSink.(assistantDeltaSink); ok {
+		target.AssistantDelta(delta)
 	}
 }
 

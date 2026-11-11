@@ -294,9 +294,11 @@ func (s *streamJSONSession) finish(err error) {
 	queued := s.queued
 	s.sink = nil
 	s.queued = nil
+	// 先放锁再发送。done 没有缓冲，发送方会等到有人接收；若这时还握着锁，
+	// 接收方要先 Stop（Stop 也要这把锁）就会和这里互相卡住。
+	s.mu.Unlock()
 	s.done <- err
 	close(s.stopped)
-	s.mu.Unlock()
 
 	// 进程可能在 result 帧之前退出。每个已接受的回合仍然必须收到终态回调，
 	// 否则它对应的 Run 会永远停在 queued/running。排队中的回合虽然还没开始，
@@ -323,6 +325,7 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 	sc := bufio.NewScanner(out)
 	// A user echo can contain several base64 image blocks (20 MiB of files).
 	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	sawAssistantText := false
 	for sc.Scan() {
 		raw := sc.Bytes()
 		if len(raw) == 0 {
@@ -382,6 +385,7 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 		case "assistant":
 			for _, part := range ev.Message.Content {
 				if part.Type == "text" && part.Text != "" {
+					sawAssistantText = true
 					sink.AssistantText(part.Text, ev.ParentToolUseID)
 				}
 			}
@@ -392,6 +396,14 @@ func (s *streamJSONSession) readOutput(out io.Reader) {
 			if ev.IsError || strings.HasPrefix(ev.Subtype, "error") {
 				turnErr = s.turnFailure(ev.Result, ev.Error)
 			}
+			// 有的版本只在 result 里给最终正文、不发 assistant 帧。只在一条正文都没收到、
+			// 且这一帧不是失败时才补上，避免和 assistant 文本重复，也不把错误说明当成分析结果。
+			if turnErr == nil && !sawAssistantText {
+				if text := strings.TrimSpace(ev.Result); text != "" {
+					sink.AssistantText(text, ev.ParentToolUseID)
+				}
+			}
+			sawAssistantText = false
 			s.mu.Lock()
 			if s.sink != sink || s.closed {
 				s.mu.Unlock()

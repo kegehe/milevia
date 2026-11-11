@@ -51,12 +51,13 @@ import {
   buildTimeline, buildAgentExecutions, subagentTextIndex,
   isSubagentMessage, flattenAgents, timelineContentVersion,
 } from "../lib/timeline";
-import { formatStageClock, latestActiveStage, pickRunIndicatorVariant, pickRunTextVariant, splitLabelChars, type RunIndicatorVariant, type RunTextVariant } from "../lib/run-indicator";
+import { formatStageClock, indicatorClockStart, latestActiveStage, pickRunIndicatorVariant, pickRunTextVariant, splitLabelChars, type RunIndicatorVariant, type RunTextVariant } from "../lib/run-indicator";
 import {
   MAX_OPEN_CONVERSATION_TABS, closeConversationTab, markConversationTabRead, openConversationTab, recordConversationActivity,
   readClosedConversationIds, clearConversationTabClosed, markConversationTabClosed, readConversationTabs, writeConversationTabs, type ConversationTabsState,
 } from "../lib/conversation-tabs";
 import { readConversationPanels, writeConversationPanels, type ConversationPanelKey, type ConversationPanelsState } from "../lib/conversation-panels";
+import { useConversationLayout } from "../lib/use-conversation-layout";
 import { modelList } from "../lib/model-options";
 import { dialogParamURL } from "../lib/dialog-params";
 import { copyToClipboard } from "../lib/clipboard";
@@ -477,9 +478,9 @@ function CommandCatalogList({ commands, selected, onSelect }: { commands: AgentC
 
 // 运行指示器：7 个动画变体（波点/轨道/思绪波纹/星芒/追点/三点走三角/CLI 盲文）
 // 按 runId 哈希随机抽一个，同一 run 内不换（判据在 lib/run-indicator.ts）。
-// cli 变体的字符与阶段计时都由本组件内部的 interval 驱动 —— 计时状态必须收在
+// cli 变体的字符与耗时都由本组件内部的 interval 驱动 —— 计时状态必须收在
 // 这里而不是页面根上：页面根每秒 setState 会强迫整个会话页树重渲染，
-// 收在这里每秒只重渲染这一行。clockStartMs 传 null 表示无阶段事件，不显示计时。
+// 收在这里每秒只重渲染这一行。某一颗起点传 null 表示该读数没有可读时间，不显示那一颗。
 const runIndicatorCliFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // 文字位变体的拆字由这里渲染：rt-bounce 把阶段词拆成单字 span 逐字起舞，
 // 其余变体整段一个节点（渐变 clip:text 的背景要铺满整段，拆开就扫不过去了）。
@@ -489,7 +490,7 @@ function RunStageText({ textVariant, label }: { textVariant: RunTextVariant; lab
     <span key={index} style={{ animationDelay: `${index * 70}ms` }}>{ch}</span>
   ));
 }
-function RunIndicatorView({ variant, textVariant, label, clockStartMs }: { variant: RunIndicatorVariant; textVariant: RunTextVariant; label: string; clockStartMs: number | null }) {
+function RunIndicatorView({ variant, textVariant, label, stageStartMs, totalStartMs }: { variant: RunIndicatorVariant; textVariant: RunTextVariant; label: string; stageStartMs: number | null; totalStartMs: number | null }) {
   const [cliFrame, setCliFrame] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -499,12 +500,14 @@ function RunIndicatorView({ variant, textVariant, label, clockStartMs }: { varia
     return () => window.clearInterval(timer);
   }, [variant]);
   useEffect(() => {
-    if (clockStartMs === null) return;
+    if (stageStartMs === null && totalStartMs === null) return;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [clockStartMs]);
-  const clock = clockStartMs !== null ? formatStageClock(now - clockStartMs) : "";
+  }, [stageStartMs, totalStartMs]);
+  // 立即显示。总耗时全程保留；进入阶段时前面再加一颗阶段耗时，阶段切换只归零这一颗。
+  const stageClock = stageStartMs !== null ? formatStageClock(now - stageStartMs, 0) : "";
+  const totalClock = totalStartMs !== null ? formatStageClock(now - totalStartMs, 0) : "";
   return (
     <div className={`run-indicator ri-${variant}`}>
       {variant === "dots" && <span className="ri-anim ri-dots" aria-hidden="true"><i></i><i></i><i></i></span>}
@@ -515,7 +518,8 @@ function RunIndicatorView({ variant, textVariant, label, clockStartMs }: { varia
       {variant === "tri" && <span className="ri-anim ri-tri" aria-hidden="true"><i></i><i></i><i></i></span>}
       {variant === "cli" && <span className="ri-anim ri-cli" aria-hidden="true">{runIndicatorCliFrames[cliFrame % runIndicatorCliFrames.length]}</span>}
       <span className={`ri-stage rt-${textVariant}`}><RunStageText textVariant={textVariant} label={label} /></span>
-      {clock && <span className="ri-clock">· {clock}</span>}
+      {stageClock && <span className="ri-clock" title="当前阶段耗时">· {stageClock}</span>}
+      {totalClock && <span className="ri-clock" title="本次任务耗时">· {stageClock ? `共 ${totalClock}` : totalClock}</span>}
     </div>
   );
 }
@@ -2328,6 +2332,7 @@ export default function ConversationPage() {
   // 弹窗状态 — 通过 URL search params 驱动
   const showHistory = searchParams.get("history") === "true";
 	const readOnlyConversation = searchParams.get("readonly") === "true" || conversation?.isOrchestration === true;
+  const panes = useConversationLayout(!readOnlyConversation);
   // 回退的禁用条件：跑着、清空中、正在停止、正在交接、只读会话时都不能回退。头部入口与
   // 时间线上的入口共用这一份判据（服务端也会拒，但界面不该让用户点了才知道）。
   const rewindDisabled = readOnlyConversation || checkpointBusy || Boolean(run) || clearing || stopping || handingOff;
@@ -4903,18 +4908,20 @@ export default function ConversationPage() {
     void refreshConversationHistory().catch((cause) => fail(cause instanceof Error ? cause.message : "无法刷新会话历史"));
   };
 
-  // 阶段计时：本阶段从最新一条「进行中」阶段事件（压缩/重试/后台任务）起算，
-  // 阶段一变自然归零，run 结束即停表 —— 口径对齐 CLI 的"当前动作计时"。
-  // 判据收口在 lib/run-indicator.ts；没有阶段事件时退回 runLabel 且不显示计时
-  //（时间戳读不到就是读不到，不许拿 0 起点编出一个大数）。
-  // 计时的每秒 tick 在 RunIndicatorView 内部，不放在页面根上。
+  // 耗时：总任务耗时从本轮最早的消息、事件或用量 startedAt 起算，全程不归零。
+  // 有进行中的阶段（压缩/重试/恢复会话）时，前面再加一颗从该阶段起算的读数。
+  // 判据收口在 lib/run-indicator.ts。时间戳读不到的那颗不显示。
+  // 每秒 tick 在 RunIndicatorView 内部，不放在页面根上。
   const stageItem = useMemo(() => (run ? latestActiveStage(events, run) : null), [events, run]);
+  const clock = useMemo(() => {
+    if (!run) return { stageStartMs: null, totalStartMs: null };
+    const currentRun = usage?.currentRun?.runId === run ? usage.currentRun.startedAt : null;
+    return indicatorClockStart({ runId: run, stage: stageItem, messages, events, startedAt: currentRun });
+  }, [run, stageItem, messages, events, usage?.currentRun?.runId, usage?.currentRun?.startedAt]);
   const runIndicatorVariant = run ? pickRunIndicatorVariant(run) : null;
   // 文字位变体：与图形位同一套 runId 哈希机制（种子加 ":text" 后缀，互不绑死），
   // 同一 run 内图形与文字的花样都稳定（判据在 lib/run-indicator.ts）。
   const runTextVariant = run ? pickRunTextVariant(run) : null;
-  const stageCreatedAtMs = stageItem ? Date.parse(stageItem.createdAt) : Number.NaN;
-  const stageStartMs = Number.isFinite(stageCreatedAtMs) ? stageCreatedAtMs : null;
   const activeAgentName = conversation ? agentDisplayName(conversation.agentId) : "";
   const permissionLabel = conversation ? permissionCopy[conversation.permissionMode]?.title ?? conversation.permissionMode : "";
   const runLabel = activeAgentName ? `${activeAgentName} 正在处理任务` : "正在处理任务";
@@ -5102,8 +5109,9 @@ export default function ConversationPage() {
         </div>
       </div>, document.querySelector('.head-actions-slot') || document.body)}
     {/* 对话面板：快捷方式、对话内容和任务队列 */}
-    <section className="conversation-canvas" data-queue-collapsed={!readOnlyConversation && conversationPanels.taskQueue ? "true" : undefined}>
+    <section className="conversation-canvas" ref={panes.canvasRef}>
       <aside className="quick-tag-rail" aria-label="常用操作">
+        <button type="button" className="pane-rail-expand" title="展开常用操作" aria-label="展开常用操作" onClick={() => panes.expandPane("left")}><svg className="pane-rail-expand-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg><span>常用</span></button>
         <div className="quick-actions-row">
           {/* 方案 F 色块分区：提示词 / 命令 / 技能各一块浅色底板，白色胶囊浮在上面。
               三块独立折叠（shortcuts / commands / skills），新增入口收进各自块头右端。 */}
@@ -5132,6 +5140,7 @@ export default function ConversationPage() {
           {renderSkillGroup({ collapsible: true, collapsed: conversationPanels.skills, onToggle: () => toggleConversationPanel("skills") })}
         </div>
       </aside>
+      <div {...panes.splitterProps("left")} />
       <section className="chat-center" id="conversation-panel" role="tabpanel" aria-labelledby={conversationTabs.activeConversationId ? `conversation-tab-${conversationTabs.activeConversationId}` : undefined}>
       <ConversationTabStrip state={conversationTabs} conversations={conversationHistory} workspaceLabels={conversationWorkspaceLabels} select={selectConversationTab} close={closeConversationTabFromUI} create={openNewConversationParam} openHistory={openConversationHistory} />
       <section className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
@@ -5142,7 +5151,7 @@ export default function ConversationPage() {
             删掉了旧版「新会话」kicker——会话页签已经说明了这一层语义。 */}
         {isEmptyConversation && <section className="conversation-starter" aria-label="新会话建议"><img className="conversation-starter-mark" src="/milevia-mark.svg" alt="" width="52" height="52" /><h2>有什么可以帮你？</h2><p>描述一个任务，或从下面挑一个常用的开始</p><div className="conversation-starter-options">{starterSuggestions.map((suggestion) => <button key={suggestion.label} type="button" onClick={() => startFromSuggestion(suggestion.prompt)}>{suggestion.icon}<span>{suggestion.label}</span></button>)}</div></section>}
         <MessageList timeline={timeline} agentID={conversation?.agentId || "claude-code"} fail={fail} resolving={resolving} decide={decide} answer={answerAsk} projectId={project.id} onViewTask={onViewTask} executionByRun={executionByRun} onOpenExecution={openExecutionParam} registerUserMessageElement={registerUserMessageElement} checkpointByRun={checkpointByRun} activeRunId={run} checkpointBusy={checkpointBusy} rewindDisabled={rewindDisabled} discardedTurnsAfter={discardedTurnsAfter} rewindToCheckpoint={rewindFromTimeline} />
-        {run && runIndicatorVariant && runTextVariant && <RunIndicatorView variant={runIndicatorVariant} textVariant={runTextVariant} label={stageLabel} clockStartMs={stageStartMs} />}
+        {run && runIndicatorVariant && runTextVariant && <RunIndicatorView variant={runIndicatorVariant} textVariant={runTextVariant} label={stageLabel} stageStartMs={clock.stageStartMs} totalStartMs={clock.totalStartMs} />}
         <div ref={bottom} />
       </section>
       <UserMessageDotsRail messages={userMessages} activeIndex={userMessageNavigationIndex} onJump={scrollToUserMessage} />
@@ -5211,8 +5220,9 @@ export default function ConversationPage() {
         </fieldset>
       </form>
       </section>
-      {!readOnlyConversation && <aside className="task-queue-rail" aria-label="任务队列" data-collapsed={conversationPanels.taskQueue ? "true" : undefined}>
-        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || handingOff || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} collapsed={conversationPanels.taskQueue} onToggleCollapsed={() => toggleConversationPanel("taskQueue")} />
+      {!readOnlyConversation && <div {...panes.splitterProps("right")} />}
+      {!readOnlyConversation && <aside className="task-queue-rail" aria-label="任务队列">
+        <TaskQueue projectID={project.id} conversationID={conversation?.id || ""} permissionMode={conversation?.permissionMode} request={projectApi} fail={fail} dispatchDisabled={clearing || stopping || handingOff || !conversation} onDispatched={handleTaskDispatched} openBoard={(taskID) => navigate(`/projects/${project.id}/tasks${taskID ? `/${taskID}` : ""}`)} collapsed={panes.wide && panes.rightCollapsedVisual} onToggleCollapsed={() => panes.togglePane("right")} onExpandCollapsed={() => panes.expandPane("right")} />
       </aside>}
     </section>
     {showNewConversation && <NewConversationDialog runnerID={project.runner} defaults={appPreferences} defaultsLoading={appPreferencesLoading} defaultsError={appPreferencesError} close={closeNewConversation} create={newConversation} />}

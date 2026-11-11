@@ -255,8 +255,8 @@ func (r *cursorCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	completion := newOpenCodeCompletion()
 	done := make(chan struct{})
 	defer close(done)
-	// 收尾有界：ctx 取消或终结事件之后最多等 agentProcessTeardownGrace，
-	// 超时就强杀并关闭读端，避免逃逸子进程握着 stdout 让 wg.Wait 永远不返回。
+	// 收尾有界：ctx 取消立即回收；终结事件后先在宽限内等进程自然退出，仍不收敛再强杀，
+	// 超时就关闭读端，避免逃逸子进程握着 stdout 让 wg.Wait 永远不返回。
 	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 
 	var wg sync.WaitGroup

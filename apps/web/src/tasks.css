@@ -853,22 +853,24 @@
 @media (min-width: 1200px) {
   .task-queue-fold { display: grid; }
   .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle {
-    display: inline-flex;
+    display: flex;
+    flex-direction: column;
     width: 100%;
-    min-height: 38px;
+    min-height: 72px;
     align-items: center;
-    justify-content: center;
-    gap: 6px;
+    justify-content: flex-start;
+    gap: 8px;
     box-sizing: border-box;
     border: 1px solid #cfe0d6;
     border-radius: 7px;
-    padding: 8px 6px;
+    padding: 10px 0;
     color: #315e50;
     background: #f8fcf9;
     font-size: 12px;
     font-weight: 700;
-    white-space: nowrap;
-    box-shadow: 0 3px 10px #17362c12;
+    line-height: 1;
+    white-space: normal;
+    box-shadow: none;
     transition: border-color .16s ease, color .16s ease, background .16s ease;
   }
   .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle:hover { border-color: #8fbca9; color: #1f5d4e; background: #eaf6ee; }
@@ -901,3 +903,17 @@
 .task-transfer-invalid p { margin: 0; }
 .task-transfer-check { display: flex; align-items: center; gap: 8px; color: #315b4e; font-size: 12px; font-weight: 700; }
 .task-transfer-check input { width: auto; min-width: 0; margin: 0; border: 0; padding: 0; background: transparent; box-shadow: none; }
+
+.task-draft-trigger { margin-right: auto; }
+.task-editor-form > footer .task-draft-trigger { flex: none; }
+.task-draft-panel { display: grid; gap: 8px; border: 1px solid #d5e6dc; border-radius: 6px; padding: 8px; background: #f8fcf9; color: #315b4e; font-size: 12px; line-height: 1.5; }
+.task-draft-panel p, .task-draft-panel ul { margin: 0; }
+.task-draft-panel ul { padding-left: 18px; }
+.task-draft-panel button, .task-draft-actions button { justify-self: end; }
+.task-draft-card { display: grid; gap: 6px; border: 1px solid #d5e6dc; border-radius: 6px; padding: 8px; background: #fff; }
+.task-draft-card header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.task-draft-card header b { color: #21493e; font-size: 12px; }
+.task-draft-card header button { border: 0; padding: 0; color: #8a4a3c; background: transparent; font-size: 12px; font-weight: 700; }
+.task-draft-card small { color: #6b8078; font-size: 11px; }
+.task-draft-card textarea { width: 100%; min-height: 72px; box-sizing: border-box; resize: vertical; border: 1px solid #c5dad0; border-radius: 6px; padding: 8px 10px; color: #21463c; background: #fff; font: inherit; font-size: 12px; line-height: 1.5; }
+.task-draft-actions { display: flex; justify-content: flex-end; gap: 6px; }

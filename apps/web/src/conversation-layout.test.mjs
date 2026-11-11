@@ -892,9 +892,13 @@ test("run indicator stage word joins the per-run text-variant lottery", () => {
   // 文字位变体（K 高亮扫过 / L 填色擦除 / M 弹跳字符 / N 双色脉冲 / O 液态填充）：
   // 与图形位同一套 runId 哈希机制的第二条随机轴 —— 判据在 lib/run-indicator.ts
   //（pickRunTextVariant，种子加 ":text" 后缀与图形位抽取独立），页面只消费不另判。
-  assert.match(conversationPage, /import \{ formatStageClock, latestActiveStage, pickRunIndicatorVariant, pickRunTextVariant, splitLabelChars, type RunIndicatorVariant, type RunTextVariant \} from "\.\.\/lib\/run-indicator";/);
+  assert.match(conversationPage, /import \{ formatStageClock, indicatorClockStart, latestActiveStage, pickRunIndicatorVariant, pickRunTextVariant, splitLabelChars, type RunIndicatorVariant, type RunTextVariant \} from "\.\.\/lib\/run-indicator";/);
   assert.match(conversationPage, /const runTextVariant = run \? pickRunTextVariant\(run\) : null;/);
-  assert.match(conversationPage, /<RunIndicatorView variant=\{runIndicatorVariant\} textVariant=\{runTextVariant\} label=\{stageLabel\} clockStartMs=\{stageStartMs\} \/>/);
+  assert.match(conversationPage, /indicatorClockStart\(\{ runId: run, stage: stageItem, messages, events, startedAt: currentRun \}\)/);
+  assert.match(conversationPage, /<RunIndicatorView variant=\{runIndicatorVariant\} textVariant=\{runTextVariant\} label=\{stageLabel\} stageStartMs=\{clock\.stageStartMs\} totalStartMs=\{clock\.totalStartMs\} \/>/);
+  assert.match(conversationPage, /formatStageClock\(now - stageStartMs, 0\)/);
+  assert.match(conversationPage, /formatStageClock\(now - totalStartMs, 0\)/);
+  assert.match(conversationPage, /stageClock \? `共 \$\{totalClock\}` : totalClock/);
   // 阶段词 span 必须带上 rt- 变体类：丢了它 = 五种文字动效一个都不会出现。
   assert.match(conversationPage, /className=\{`ri-stage rt-\$\{textVariant\}`\}/);
   // 弹跳变体逐字起舞（拆字 + 按字符序内联 delay）；其余变体必须整段渲染 —— 渐变

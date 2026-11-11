@@ -32,6 +32,8 @@ const probeTimeoutMs = 60_000;
 const runnerListTimeoutMs = 120_000;
 /** 外部进程/网络类长任务：服务端按 30 秒~2 分钟设计（单条 git 命令、MCP 探针、SSH 握手、UAC 等待）。 */
 const externalTaskTimeoutMs = 120_000;
+/** 起草任务。服务端 taskDraftTimeout 是 90 秒；这里多留 10 秒，让服务端的超时文案先回来。 */
+const taskDraftTimeoutMs = 100_000;
 /** 安装类长任务：服务端按 15 分钟设计（`Config.AgentUpdateTimeout`，见 `defaultAgentUpdateTimeout`）。 */
 const installTimeoutMs = 16 * 60_000;
 
@@ -103,6 +105,8 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	// 任务导入是同步长事务（单连接 + 最多 2000 条），且服务端已 detach 写上下文：
 	// 15 秒一到只会得到假失败，用户会重复提交。导出是整表序列化，同样按长任务给预算。
 	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/tasks\/import$/, timeoutMs: externalTaskTimeoutMs },
+	// 起草任务会只读阅读当前仓库，服务端上限 90 秒。15 秒预算会把正常起草判成失败。
+	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/tasks\/draft$/, timeoutMs: taskDraftTimeoutMs },
 	{ methods: ["GET"], pattern: /^\/api\/projects\/[^/]+\/tasks\/export$/, timeoutMs: externalTaskTimeoutMs },
 	// 编排的两条重活（合并分支 / 清理工作区资源）：
 	//   · merge-main 是**一串** git 命令（status → rev-parse → merge-base --is-ancestor →

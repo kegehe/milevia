@@ -303,7 +303,7 @@ func (r *opencodeCLIRunner) Run(ctx context.Context, request AgentRunRequest, si
 	completion := newOpenCodeCompletion()
 	done := make(chan struct{})
 	defer close(done)
-	// 收尾有界：ctx 取消或终结事件之后最多等 agentProcessTeardownGrace，超时就强杀并
+	// 收尾有界：ctx 取消立即回收；终结事件后先在宽限内等进程自然退出，仍不收敛再强杀并
 	// 关闭读端 —— 单杀进程组不会让握着 stdout 的逃逸子进程释放 reader。
 	go watchAgentProcess(ctx, cmd, completion.done, done, stdout, stderr)
 

@@ -71,6 +71,31 @@ func TestStreamJSONSessionMapsFramesToSink(t *testing.T) {
 	}
 }
 
+func TestStreamJSONSessionUsesResultTextWhenAssistantIsMissing(t *testing.T) {
+	session := newStreamJSONSession(streamJSONSessionConfig{
+		agentID: "codebuddy", label: "CodeBuddy", exitPrefix: codebuddyExitPrefix,
+	}, nil, &captureWriteCloser{}, nil, nil)
+	sink := newRecordingTurnSink()
+	if err := session.Send(AgentRunRequest{Prompt: "analyze", AgentID: "codebuddy"}, sink); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	frames := strings.Join([]string{
+		`{"type":"result","subtype":"success","is_error":false,"result":"{\"findings\":[]}"}`,
+	}, "\n")
+	session.readOutput(strings.NewReader(frames))
+	select {
+	case err := <-sink.finished:
+		if err != nil {
+			t.Fatalf("TurnFinished 带错误: %v", err)
+		}
+	default:
+		t.Fatal("result 帧没有收尾回合")
+	}
+	if len(sink.text) != 1 || sink.text[0] != `{"findings":[]}` {
+		t.Fatalf("result 正文没有补进助手文本：%v", sink.text)
+	}
+}
+
 // TestStreamJSONSessionQueuesTurns 钉住串行语义：第二个回合必须等第一个 result 之后才
 // 被写入 stdin 并收到 TurnStarted —— 否则同一进程里的两轮对话会互相串。
 func TestStreamJSONSessionQueuesTurns(t *testing.T) {

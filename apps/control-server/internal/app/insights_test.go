@@ -862,6 +862,89 @@ func TestInsightScanPassesCodexRouteProfileToRunner(t *testing.T) {
 	}
 }
 
+func TestRunReadOnlyAgentUsesEachLocalEngine(t *testing.T) {
+	server := newTestServer(t)
+	projectID := insightTestProject(t, server)
+	project, err := server.getProjectByID(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("load project: %v", err)
+	}
+	cursor := &insightCaptureRunner{}
+	server.cursorRunner = cursor
+	text, err := server.runReadOnlyAgent(context.Background(), project, "cursor", "analyze", nil)
+	if err != nil || text != `{"findings":[]}` {
+		t.Fatalf("cursor text=%q err=%v", text, err)
+	}
+	if cursor.request.AgentID != "cursor" || cursor.request.PermissionMode != "read_only" {
+		t.Fatalf("cursor request=%+v", cursor.request)
+	}
+
+	for _, agentID := range []string{"codebuddy", "qoder"} {
+		session := &insightScriptSession{done: make(chan error, 1)}
+		streaming := &recordingStreamingRunner{sessions: []AgentSession{session}}
+		server.codebuddyRunner, server.qoderRunner = streaming, streaming
+		text, err = server.runReadOnlyAgent(context.Background(), project, agentID, "analyze", nil)
+		if err != nil || text != `{"findings":[]}` {
+			t.Fatalf("%s text=%q err=%v", agentID, text, err)
+		}
+		starts := streaming.starts()
+		if len(starts) != 1 || starts[0].PermissionMode != "read_only" || starts[0].Model != "" {
+			t.Fatalf("%s session=%+v", agentID, starts)
+		}
+		if session.request.AgentID != agentID || session.request.PermissionMode != "read_only" {
+			t.Fatalf("%s turn=%+v", agentID, session.request)
+		}
+	}
+}
+
+func TestRunReadOnlyAgentRejectsCrossEnvironmentEngines(t *testing.T) {
+	server := newTestServer(t)
+	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error {
+		t.Fatal("cross-environment analysis fell back to Claude")
+		return nil
+	})
+	project := Project{Runner: "ssh-test", Path: t.TempDir()}
+	for _, agentID := range []string{"codebuddy", "qoder", "cursor"} {
+		_, err := server.runReadOnlyAgent(context.Background(), project, agentID, "analyze", nil)
+		if err == nil || !strings.Contains(err.Error(), "目前仅支持本机项目") {
+			t.Fatalf("%s err=%v", agentID, err)
+		}
+	}
+}
+
+type insightCaptureRunner struct {
+	request AgentRunRequest
+}
+
+func (runner *insightCaptureRunner) Ready(context.Context) bool     { return true }
+func (runner *insightCaptureRunner) Version(context.Context) string { return "test" }
+func (runner *insightCaptureRunner) CheckUpdate(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+func (runner *insightCaptureRunner) Update(context.Context) (string, string, error) {
+	return "", "", nil
+}
+func (runner *insightCaptureRunner) Run(_ context.Context, request AgentRunRequest, sink AgentRunSink) error {
+	runner.request = request
+	sink.AssistantText(`{"findings":[]}`, "")
+	return nil
+}
+
+type insightScriptSession struct {
+	request AgentRunRequest
+	done    chan error
+	once    sync.Once
+}
+
+func (session *insightScriptSession) Send(request AgentRunRequest, sink AgentRunSink) error {
+	session.request = request
+	sink.AssistantText(`{"findings":[]}`, "")
+	sink.(AgentTurnSink).TurnFinished(nil)
+	return nil
+}
+func (session *insightScriptSession) Stop()              { session.once.Do(func() { close(session.done) }) }
+func (session *insightScriptSession) Done() <-chan error { return session.done }
+
 func TestRunReadOnlyAgentRejectsUnavailableCodexBeforeRun(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)

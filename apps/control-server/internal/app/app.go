@@ -1326,7 +1326,7 @@ func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
 // 本次把它从"某一个 handler"推广成一条**写操作的统一规则** —— 否则每加一个会跑外部
 // 进程的 handler，都要再有人想起来一次。
 //
-// ── 边界（三条，都有具体反例，不是洁癖）──────────────────────────────────
+// ── 边界（四条，都有具体反例，不是洁癖）──────────────────────────────────
 //
 //  1. **只动非幂等方法**。GET 里混着长轮询（`/api/remote/outbox?wait=`）与文件下载，
 //     它们的生命周期**本来就等于**连接 —— 客户端走了它们就该结束，脱开只会留下
@@ -1336,6 +1336,8 @@ func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
 //     进程一死，那次工具调用就该被判拒绝。脱开它会让被取消的会话永远挂着等待。
 //  3. **跳过 WebSocket 升级请求**（防御性）。升级之后这条连接被 hijack，它的生命周期
 //     就是整条 socket，脱开等于让处理器在 socket 关掉后继续跑。
+//  4. **不脱开 `POST …/tasks/draft`**。这是用户点「取消」就要停掉的只读分析：
+//     脱开之后 Agent 会继续占着工作区租约和凭据额度，直到自己的超时。它不写任务。
 //
 // ── 脱开的是连接，不是服务端生命周期 ──────────────────────────────────────
 //
@@ -1344,7 +1346,8 @@ func (s *Server) slowRequestLogger(next http.Handler) http.Handler {
 func (s *Server) detachWriteContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions ||
-			websocket.IsWebSocketUpgrade(r) || strings.HasPrefix(r.URL.Path, "/api/internal/") {
+			websocket.IsWebSocketUpgrade(r) || strings.HasPrefix(r.URL.Path, "/api/internal/") ||
+			taskDraftRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1512,6 +1515,9 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/projects/{projectID}/git/conflicts/suggestions/{suggestionID}/cancel", s.gitConflictSuggestCancel)
 	r.Get("/api/projects/{projectID}/tasks", s.listTasks)
 	r.Post("/api/projects/{projectID}/tasks", s.createTask)
+	// 整理只读、可取消；批量创建在一个事务里落成待办。都要写在 /tasks/{taskID} 之外。
+	r.Post("/api/projects/{projectID}/tasks/draft", s.draftTask)
+	r.Post("/api/projects/{projectID}/tasks/batch", s.createTaskBatch)
 	r.Post("/api/projects/{projectID}/tasks/review-all", s.reviewAllTasks)
 	// 任务导出/导入（docs/50）：导出只产出快照，导入在一个事务里重建 id、顺序与依赖。
 	r.Get("/api/projects/{projectID}/tasks/export", s.exportTasks)
@@ -9084,6 +9090,9 @@ func (s *Server) runnerStatus(w http.ResponseWriter, r *http.Request) {
 		"root":              m.Root,
 		"roots":             m.Roots,
 		"profileManagement": s.canManageProfileRunner(m.ID),
+		// local 由服务端按 isLocalRunnerID 给出。前端不能自己用 runner id 判断本机，
+		// 否则 Windows 上的 wsl-local 会被误当成能跑只在本机执行的分析引擎。
+		"local": isLocalRunnerID(m.ID),
 	}
 	if m.Host != "" {
 		entry["host"] = m.Host

@@ -43,6 +43,8 @@ export type AgentCatalogEntry = {
   runnableInProject?: boolean;
   /** 平台是否已接通该工具的只读分析协议，可用于项目优化建议。 */
   supportsProjectInsights?: boolean;
+  /** 只读分析只在服务端本机执行。跨端环境即使装了这个 CLI，也不能列为分析引擎。 */
+  projectInsightsLocalOnly?: boolean;
   /** 平台是否已接通单文件冲突的只读合并建议。 */
   supportsConflictSuggestions?: boolean;
   /** 档案/路由表能否存这个工具（当前仅 Claude/Codex）。 */

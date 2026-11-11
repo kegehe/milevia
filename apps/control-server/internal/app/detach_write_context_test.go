@@ -114,7 +114,21 @@ func TestDetachWriteContextLeavesApprovalWaitOnTheConnection(t *testing.T) {
 	probe.release()
 }
 
-// 上面四条验的是中间件本身。这一条验的是**它真的接在路由链上** ——
+func TestDetachWriteContextLeavesTaskDraftOnTheConnection(t *testing.T) {
+	// 起草任务是用户可取消的只读分析。脱开之后，取消按钮停不掉 Agent，
+	// 工作区租约和凭据额度会一直占到超时。
+	server, stopRuntime := newDetachTestServer()
+	defer stopRuntime()
+	probe := observeThroughMiddleware(t, server, http.MethodPost, "/api/projects/p1/tasks/draft")
+
+	probe.cancelRequest()
+	if err := probe.seen.Err(); err == nil {
+		t.Fatal("任务整理被脱开了 —— 用户取消后 Agent 仍会占着工作区和额度")
+	}
+	probe.release()
+}
+
+// 上面几条验的是中间件本身。这一条验的是**它真的接在路由链上** ——
 // 中间件写对了却没挂进 routes()，不会有任何东西报红。
 //
 // 探针用 POST /api/notifications/dismiss-all：它是一条真实的写，且直接拿

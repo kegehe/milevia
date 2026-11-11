@@ -370,6 +370,13 @@ func (r *wslAgentRunner) runClaudeOnce(ctx context.Context, request AgentRunRequ
 	waitErr := waitOrdinaryCLICommand(cmd)
 	noteWorkspaceWSLExit(r.distro, ctx, waitErr, true, linuxWorkDir)
 	if err := waitErr; err != nil {
+		// 与本地 Run 一致：成功的终结 result 已经完整到达时，非零退出码不再判失败
+		// （收尾看护在自然退出窗口后回收进程树 / CLI 自身清理失败 / stderr 只剩告警）。
+		// 必须放在失败详情之前，否则 stderr 的告警行会把成功运行又拉回失败；取消仍如实报错，
+		// 工作区治理类失败也不豁免（见 claudeGovernanceFailure）。
+		if claudeRunExitSucceeded(recorded, ctx, err) {
+			return nil
+		}
 		// 与 claudeCLIRunner.Run 一致（规则见 claudeRunFailureDetail）。
 		if detail := claudeRunFailureDetail(recorded.failureResult(), stderrTail.tail()); detail != "" {
 			return fmt.Errorf(claudeExitPrefix+"%w %s", err, detail)

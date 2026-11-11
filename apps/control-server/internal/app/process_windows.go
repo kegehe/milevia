@@ -56,6 +56,12 @@ func processKillBenign(err error) bool {
 // TerminateProcess 更硬的终止手段。
 func forceTerminateProcessGroup(cmd *exec.Cmd) { terminateProcessGroup(cmd) }
 
+// reapProcessGroupAfterExit 在 Windows 上是空操作：一次性运行的整棵进程树由
+// KILL_ON_JOB_CLOSE 的 Job Object 在 runner 返回时整组回收（容器路径见
+// startOrdinaryContainedProcess，裸 exec 路径见 containAgentProcess）。
+// 不能像 POSIX 那样按 PID 再 Kill 一次——主进程已被 cmd.Wait 回收，PID 存在复用风险。
+func reapProcessGroupAfterExit(*exec.Cmd) {}
+
 // killProcessTree 结束 pid 的全部后代进程。
 //
 // 刻意不用 taskkill：本机实测它连"查一个不存在的 PID"都要 32 秒（正常机器上是毫秒级），

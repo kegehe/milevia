@@ -442,32 +442,71 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	// 队列按 position 升序展示（不按状态或优先级分组），所以任何"新任务要排在最后"的
 	// 写入路径都必须给出比现有全部 position 更大的值。
 	now := time.Now().UTC()
-	position := 0.0
-	if input.Position != nil {
-		position = *input.Position
-	}
-	task := Task{ID: uuid.NewString(), ProjectID: projectID, Title: input.Title, Description: input.Description, Priority: input.Priority, Position: position, Status: taskTodo, CreatedAt: now, UpdatedAt: now, DependsOn: []TaskDependency{}, BlockedBy: []TaskBlocker{}, Blocks: []TaskDependency{}}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer tx.Rollback()
+	task, err := s.insertTodoTaskTx(r.Context(), tx, projectID, input, now)
+	if err != nil {
+		writeTaskInsertError(w, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, task)
+	s.refineTaskTitleAsync(task.ProjectID, task.ID, task.Description)
+}
+
+// taskWriteError 是插入待办时可以映射成 HTTP 状态的校验失败。
+// 数据库错误和托管冲突不走这个类型，调用方按原错误处理。
+type taskWriteError struct {
+	status int
+	err    error
+}
+
+func (e *taskWriteError) Error() string { return e.err.Error() }
+func (e *taskWriteError) Unwrap() error { return e.err }
+
+func writeTaskInsertError(w http.ResponseWriter, err error) {
+	if isTaskExecutionConflict(err) {
+		writeTaskExecutionError(w, err)
+		return
+	}
+	var write *taskWriteError
+	if errors.As(err, &write) {
+		writeError(w, write.status, write.err)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err)
+}
+
+// insertTodoTaskTx 在调用方的事务里追加一条待办。position 为 0 时改写成当前队尾，
+// 与 createTask 的哨兵约定相同。失败时不提交；调用方决定回滚。
+func (s *Server) insertTodoTaskTx(ctx context.Context, tx *sql.Tx, projectID string, input taskInput, now time.Time) (Task, error) {
+	if err := validateTaskInput(&input); err != nil {
+		return Task{}, &taskWriteError{status: http.StatusBadRequest, err: err}
+	}
+	position := 0.0
+	if input.Position != nil {
+		position = *input.Position
+	}
+	task := Task{ID: uuid.NewString(), ProjectID: projectID, Title: input.Title, Description: input.Description, Priority: input.Priority, Position: position, Status: taskTodo, CreatedAt: now, UpdatedAt: now, DependsOn: []TaskDependency{}, BlockedBy: []TaskBlocker{}, Blocks: []TaskDependency{}}
 	if input.PredecessorTaskIDs != nil {
-		if err := rejectSupervisedDependencyMutation(r.Context(), tx, task.ID, (*input.PredecessorTaskIDs)...); err != nil {
-			writeTaskExecutionError(w, err)
-			return
+		if err := rejectSupervisedDependencyMutation(ctx, tx, task.ID, (*input.PredecessorTaskIDs)...); err != nil {
+			return Task{}, err
 		}
 	}
 	if task.Position == 0 {
-		if err := tx.QueryRowContext(r.Context(), `select coalesce(max(position),0)+1 from tasks where project_id=?`, projectID).Scan(&task.Position); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		if err := tx.QueryRowContext(ctx, `select coalesce(max(position),0)+1 from tasks where project_id=?`, projectID).Scan(&task.Position); err != nil {
+			return Task{}, err
 		}
 	}
-	if _, err := tx.ExecContext(r.Context(), `insert into tasks (id,project_id,title,description,priority,pinned,position,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?)`, task.ID, task.ProjectID, task.Title, task.Description, task.Priority, task.Pinned, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	if _, err := tx.ExecContext(ctx, `insert into tasks (id,project_id,title,description,priority,pinned,position,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?)`, task.ID, task.ProjectID, task.Title, task.Description, task.Priority, task.Pinned, task.Position, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
+		return Task{}, err
 	}
 	if input.PredecessorTaskIDs != nil {
 		seen := map[string]struct{}{}
@@ -477,41 +516,30 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		for _, predecessorID := range *input.PredecessorTaskIDs {
 			predecessorID = strings.TrimSpace(predecessorID)
 			if predecessorID == "" || predecessorID == task.ID {
-				writeError(w, http.StatusBadRequest, errors.New("a task cannot depend on itself"))
-				return
+				return Task{}, &taskWriteError{status: http.StatusBadRequest, err: errors.New("a task cannot depend on itself")}
 			}
 			if _, exists := seen[predecessorID]; exists {
-				writeError(w, http.StatusBadRequest, errors.New("duplicate predecessor task"))
-				return
+				return Task{}, &taskWriteError{status: http.StatusBadRequest, err: errors.New("duplicate predecessor task")}
 			}
 			seen[predecessorID] = struct{}{}
 			ordered = append(ordered, predecessorID)
 			var predecessorProjectID string
-			if err := tx.QueryRowContext(r.Context(), `select project_id from tasks where id=?`, predecessorID).Scan(&predecessorProjectID); errors.Is(err, sql.ErrNoRows) || predecessorProjectID != projectID {
-				writeError(w, http.StatusBadRequest, errors.New("predecessor task must belong to the same project"))
-				return
+			if err := tx.QueryRowContext(ctx, `select project_id from tasks where id=?`, predecessorID).Scan(&predecessorProjectID); errors.Is(err, sql.ErrNoRows) || predecessorProjectID != projectID {
+				return Task{}, &taskWriteError{status: http.StatusBadRequest, err: errors.New("predecessor task must belong to the same project")}
 			} else if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
+				return Task{}, err
 			}
 		}
 		for _, predecessorID := range ordered {
-			if _, err := tx.ExecContext(r.Context(), `insert into task_dependencies (task_id,predecessor_task_id,created_at) values (?,?,?)`, task.ID, predecessorID, now); err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
+			if _, err := tx.ExecContext(ctx, `insert into task_dependencies (task_id,predecessor_task_id,created_at) values (?,?,?)`, task.ID, predecessorID, now); err != nil {
+				return Task{}, err
 			}
 		}
 	}
-	if err := s.recordTaskEventTx(r.Context(), tx, task.ID, "", "task.created", map[string]string{"status": task.Status}, now); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	if err := s.recordTaskEventTx(ctx, tx, task.ID, "", "task.created", map[string]string{"status": task.Status}, now); err != nil {
+		return Task{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, task)
-	s.refineTaskTitleAsync(task.ProjectID, task.ID, task.Description)
+	return task, nil
 }
 
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {

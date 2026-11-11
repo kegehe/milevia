@@ -294,9 +294,11 @@
 .run-indicator { display: flex; align-items: center; gap: 9px; margin: 4px 0 20px 34px; color: #5f766c; font-size: 12px; }
 .run-indicator .ri-stage { color: #4c6b60; }
 .run-indicator .ri-clock {
+  flex: none;
   color: #809188;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
   padding: 1px 7px;
   border-radius: 999px;
   background: #f2f5f3;
@@ -1333,6 +1335,72 @@
   scrollbar-width: thin;
 }
 
+/* 分隔条默认不占位。只有宽屏 flex 布局才把它显示出来。 */
+.pane-splitter {
+  display: none;
+  position: relative;
+  z-index: 2;
+  flex: 0 0 8px;
+  align-items: stretch;
+  justify-content: center;
+  width: 8px;
+  min-width: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+.pane-splitter::before {
+  content: "";
+  width: 1px;
+  height: 100%;
+  background: #cfe0d6;
+  transition: width .12s ease, background .12s ease;
+}
+.pane-splitter:hover::before,
+.pane-splitter[data-dragging="true"]::before,
+.pane-splitter:focus-visible::before {
+  width: 2px;
+  background: #2b7b68;
+}
+.pane-splitter:focus-visible { outline: none; }
+.pane-rail-expand {
+  display: none;
+  width: 100%;
+  min-height: 72px;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  border: 1px solid #cfe0d6;
+  border-radius: 7px;
+  padding: 10px 0;
+  color: #315e50;
+  background: #f8fcf9;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.pane-rail-expand:hover { border-color: #8fbca9; color: #1f5d4e; background: #eaf6ee; }
+.pane-rail-expand:focus-visible { outline: 2px solid #2b7b68; outline-offset: 2px; }
+.pane-rail-expand-icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.pane-rail-expand span { writing-mode: vertical-rl; letter-spacing: .12em; }
+body.conversation-pane-dragging,
+body.conversation-pane-dragging * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
 /* 宽屏右侧任务栏：标题和筛选保持可见，任务列表在栏内滚动。 */
 @media (min-width: 1200px) {
   .task-queue-rail {
@@ -1365,6 +1433,38 @@
     overscroll-behavior: contain;
     scrollbar-width: thin;
   }
+
+  /* 宽屏改成可拖的 flex 行。左右宽度由 --pane-left / --pane-right 决定，中间吃掉剩余空间。 */
+  .conversation-canvas {
+    display: flex;
+    align-items: stretch;
+  }
+  .conversation-canvas > .quick-tag-rail {
+    flex: 0 0 var(--pane-left, 300px);
+    width: var(--pane-left, 300px);
+    min-width: 0;
+    border-right: 0;
+  }
+  .conversation-canvas > .chat-center {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+  }
+  .conversation-canvas > .task-queue-rail {
+    flex: 0 0 var(--pane-right, 320px);
+    width: var(--pane-right, 320px);
+    min-width: 0;
+    border-left: 0;
+  }
+  .conversation-canvas > .pane-splitter { display: flex; }
+  .conversation-canvas[data-left-collapsed="true"] > .quick-tag-rail {
+    padding: 12px 4px;
+    overflow: hidden;
+    align-content: start;
+    justify-items: center;
+  }
+  .conversation-canvas[data-left-collapsed="true"] > .quick-tag-rail .quick-actions-row { display: none; }
+  .conversation-canvas[data-left-collapsed="true"] > .quick-tag-rail .pane-rail-expand { display: flex; }
 }
 
 /* 右侧对话中心 */
@@ -4184,27 +4284,26 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 
 /* ---- 任务队列栏折叠（宽屏桌面） ------------------------------------------ */
 @media (min-width: 1200px) {
-  .conversation-canvas[data-queue-collapsed="true"] { grid-template-columns: minmax(260px, 300px) minmax(440px, 1fr) minmax(0, 120px); }
   .task-queue-rail[data-collapsed="true"] {
     display: flex;
     min-width: 0;
     min-height: 0;
     align-items: flex-start;
     justify-content: center;
-    padding: 22px 10px;
-    border-left: 1px solid #cfe0d6;
-    overflow: visible;
+    padding: 12px 4px;
+    overflow: hidden;
   }
   .task-queue-rail[data-collapsed="true"] .task-queue {
     display: block;
+    width: 100%;
     min-height: auto;
     flex: none;
     border-top: 0;
     padding-top: 0;
-    overflow: visible;
+    overflow: hidden;
   }
   .task-queue-rail[data-collapsed="true"] .task-queue-panel { display: none; }
-  .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle { display: inline-flex; }
+  .task-queue-rail[data-collapsed="true"] .task-queue-mobile-toggle { display: flex; }
 }
 
 /* 标题行内切换钮与右侧新增按钮之间留出间距（折叠图标贴紧 + 号）。 */

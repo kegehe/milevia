@@ -137,6 +137,9 @@ type AgentCatalogEntry struct {
 	// SupportsProjectInsights 表示平台已接通该工具的只读分析协议，可用于优化建议。
 	// 这比能否参与普通项目对话更严格：分析需要可靠的只读权限、结构化输出与复核流程。
 	SupportsProjectInsights bool `json:"supportsProjectInsights"`
+	// ProjectInsightsLocalOnly 表示只读分析只在服务端本机执行。
+	// 管理页仍可在其它环境探测安装状态，但优化建议不能把这种「装了」当成「能分析」。
+	ProjectInsightsLocalOnly bool `json:"projectInsightsLocalOnly,omitempty"`
 	// SupportsConflictSuggestions 表示已接通单文件冲突的只读合并建议协议。
 	// 不等同于优化建议扫描：会话工具也可以只运行一轮并返回合并结果。
 	SupportsConflictSuggestions bool `json:"supportsConflictSuggestions"`
@@ -260,6 +263,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		AuthStatusProtocol: authProtocolACPUserInfo,
 		// AgentRunner（StartSession 流式会话）已实现并经活 harness 验证，可参与项目对话。
 		RunnableInProject:           true,
+		SupportsProjectInsights:     true,
+		ProjectInsightsLocalOnly:    true,
 		SupportsConflictSuggestions: true,
 	},
 	{
@@ -307,6 +312,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// 会话走 `-p --input-format stream-json --output-format stream-json`，
 		// 事件形状与 Claude Code 同构（init → assistant → result）。
 		RunnableInProject:           true,
+		SupportsProjectInsights:     true,
+		ProjectInsightsLocalOnly:    true,
 		SupportsConflictSuggestions: true,
 		// 2026-10-29 本机实测（1.1.80）：后补的用户帧在同一个 result 之前生效，没有另开 init。
 		// SSH 不走这个会话实现，界面还会再排除 ssh- 开头的 runner。
@@ -400,7 +407,8 @@ var agentCatalogEntries = []AgentCatalogEntry{
 		// 下一轮用 `--resume <chatId>` 续聊（见 cursor_runner.go）。
 		// 会话面只在本机（可执行文件由控制服务的 PATH 解析）。
 		RunnableInProject:           true,
-		SupportsProjectInsights:     false,
+		SupportsProjectInsights:     true,
+		ProjectInsightsLocalOnly:    true,
 		SupportsConflictSuggestions: true,
 		// agent_profiles 的 CHECK 约束仍只允许 claude-code / codex。
 		SupportsProfiles: false,

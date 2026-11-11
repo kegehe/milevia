@@ -7,9 +7,9 @@
 //      不同 run 之间分布均匀 —— 这就是"每次随机选一个"的可测试实现。
 //   2. 阶段词 —— 复用桌面时间线的 systemItemFromEvent（手机端也用同一份），
 //      不在这里造第二套文案；只保留"进行中"的阶段，结果类标题不当阶段词。
-//   3. 阶段计时 —— CLI 口径：从本阶段事件起算，阶段一变就归零；
-//      10 秒内不显示（沿用手机端 processingClockVisibleAfterMs 的阈值理由：
-//      秒级任务上闪一个「0:03」只增加噪音）。
+//   3. 计时起点 —— 总耗时从本轮最早的消息、事件或用量 startedAt 起算，全程不归零。
+//      有进行中的阶段时再给出该阶段的起点（阶段一变归零）。两颗读数同时返回，
+//      时间戳读不到的那颗是 null，不用「现在」编起点。
 import { systemItemFromEvent } from "./timeline";
 import type { Event, SystemItem } from "./types";
 
@@ -102,13 +102,49 @@ export function latestActiveStage(events: Event[], runId: string): SystemItem | 
   return best;
 }
 
-// 计时显示阈值：默认 10 秒内不显示。与手机端 processingClockVisibleAfterMs 同口径同理由。
-// 移动端传 minMs = 0 立即显示（用户定稿的「正在压缩上下文 · 8s」形态）。
+// 指示器的两颗计时起点。
+//
+// totalStartMs：本轮任务耗时。取当前 runId 下最早的消息、事件，以及用量接口的
+// startedAt。上一轮的时间再早也不算。全程不因阶段切换而改起点。
+// stageStartMs：进行中阶段的耗时，从该阶段 createdAt 起算，阶段一变就换起点。
+// 没有进行中的阶段，或阶段时间读不到时，这一颗是 null，总耗时照常返回。
+// 两颗都读不到时都是 null。不用调用时刻冒充起点，否则刷新页面会归零。
+export function indicatorClockStart(input: {
+  runId: string;
+  stage: { createdAt: string } | null;
+  messages: ReadonlyArray<{ runId?: string; createdAt: string }>;
+  events: ReadonlyArray<{ runId: string; createdAt: string }>;
+  startedAt?: string | null;
+}): { stageStartMs: number | null; totalStartMs: number | null } {
+  let totalStartMs = Infinity;
+  const startedAt = input.startedAt ? Date.parse(input.startedAt) : Number.NaN;
+  if (Number.isFinite(startedAt)) totalStartMs = startedAt;
+  for (let index = 0; index < input.messages.length; index += 1) {
+    const message = input.messages[index];
+    if (message.runId !== input.runId) continue;
+    const at = Date.parse(message.createdAt);
+    if (Number.isFinite(at) && at < totalStartMs) totalStartMs = at;
+  }
+  for (let index = 0; index < input.events.length; index += 1) {
+    const event = input.events[index];
+    if (event.runId !== input.runId) continue;
+    const at = Date.parse(event.createdAt);
+    if (Number.isFinite(at) && at < totalStartMs) totalStartMs = at;
+  }
+  const stageAt = input.stage ? Date.parse(input.stage.createdAt) : Number.NaN;
+  return {
+    stageStartMs: Number.isFinite(stageAt) ? stageAt : null,
+    totalStartMs: totalStartMs === Infinity ? null : totalStartMs,
+  };
+}
+
+// 函数默认门槛仍是 10 秒。桌面运行指示器和移动端都显式传 0，任务一开始就显示。
+// 不要把这个默认值当成桌面端的界面行为。
 export const stageClockVisibleAfterMs = 10_000;
 
-// 把毫秒差格式化成 CLI 风格的读数：8s / 59s / 1m05s。
-// minMs 是显示门槛（毫秒）：低于它返回空串。桌面默认 10 秒（秒级任务上闪读数只加噪音）；
-// 移动端传 0 立即显示。
+// 把毫秒差格式化成 CLI 风格的读数：8s / 59s / 1m05s / 1h01m05s。
+// minMs 是显示门槛（毫秒）：低于它返回空串。不传时用上面的 10 秒默认值；
+// 桌面指示器与移动端传 0，立即显示。
 // 负值（时钟偏差）与 NaN 一律返回空串 —— 显示「-3s」「NaNs」是纯粹的坏；
 // NaN 与任何数比较恒为 false，必须单独拦，不能靠门槛那半句兜住。
 export function formatStageClock(elapsedMs: number, minMs: number = stageClockVisibleAfterMs): string {
@@ -116,7 +152,10 @@ export function formatStageClock(elapsedMs: number, minMs: number = stageClockVi
   if (elapsedMs < minMs) return "";
   const totalSeconds = Math.floor(elapsedMs / 1000);
   if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
-  return `${minutes}m${seconds < 10 ? "0" : ""}${seconds}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m${seconds < 10 ? "0" : ""}${seconds}s`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h${minutes < 10 ? "0" : ""}${minutes}m${seconds < 10 ? "0" : ""}${seconds}s`;
 }

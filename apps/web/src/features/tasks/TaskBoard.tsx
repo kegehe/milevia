@@ -1,10 +1,11 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import { anchorForSlot, compareTaskOrder, isSameSlot, isTaskAwaitingMainMerge, isTaskOrchestrating, positionForMove, priorityLabels, Request, Task, TaskDetail, TaskStatus, Priority, VerificationRun, taskDisplayStatus, taskDisplayStatusClass, taskDisplayTitle } from "./task-model";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import { TaskTransferDialog } from "./TaskTransferDialog";
+import { TaskDraftAssist } from "./TaskDraftAssist";
 type EditorState = { task?: Task } | null;
 type ReviewAction = "accept" | "request_changes";
 
@@ -750,6 +751,12 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
   const [description, setDescription] = useState(task?.description || "");
   const [priority, setPriority] = useState<Priority>(task?.priority || "normal");
   const [busy, setBusy] = useState(false);
+  const [draftPending, setDraftPending] = useState(false);
+  const [draftHold, setDraftHold] = useState(false);
+  const onDraftState = useCallback((state: { pending: boolean; holdSubmit: boolean }) => {
+    setDraftPending(state.pending);
+    setDraftHold(state.holdSubmit);
+  }, []);
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -757,7 +764,7 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
   }, []);
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    if (!mountedRef.current) return;
+    if (!mountedRef.current || draftHold) return;
     setBusy(true);
     try {
       // 新建：position 传 0 = 服务端约定的"追加到队列末尾"哨兵值（改写成 max(position)+1）。
@@ -771,7 +778,9 @@ function TaskEditor({ projectID, task, request, close, saved, fail }: { projectI
     } catch (cause) { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法保存任务"); }
     finally { if (mountedRef.current) setBusy(false); }
   };
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog task-editor-dialog"><header className="task-editor-header"><div><span>任务</span><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button type="button" className="task-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><form className="task-editor-form" onSubmit={(event) => void save(event)}><div className="task-form"><section className="task-form-section"><div className="task-form-section-head"><h3>基本信息</h3></div><div className="task-form-basic-grid"><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div></section><section className="task-form-section"><div className="task-form-section-head"><h3>任务内容</h3></div><label>任务说明<textarea autoFocus required maxLength={12000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label></section></div><footer><button type="button" className="secondary" disabled={busy} onClick={close}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
+  const editorForm = (draftButton: ReactNode = null, draftPanel: ReactNode = null) => <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="task-editor-title"><section className="modal task-dialog task-editor-dialog"><header className="task-editor-header"><div><span>任务</span><h2 id="task-editor-title">{task ? "编辑任务" : "新建任务"}</h2></div><button type="button" className="task-editor-close" title="关闭" aria-label="关闭" disabled={busy} onClick={close}>x</button></header><form className="task-editor-form" onSubmit={(event) => void save(event)}><div className="task-form"><section className="task-form-section"><div className="task-form-section-head"><h3>基本信息</h3></div><div className="task-form-basic-grid"><label>优先级<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(priorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div></section><section className="task-form-section"><div className="task-form-section-head"><h3>任务内容</h3></div><label>任务说明<textarea autoFocus required maxLength={12000} value={description} disabled={busy || draftPending} onChange={(event) => setDescription(event.target.value)} placeholder="说明背景、范围、限制和需要完成的实现。" /></label>{draftPanel}</section></div><footer>{draftButton}<button type="button" className="secondary" disabled={busy || draftPending} onClick={close}>取消</button><button className="primary" disabled={busy || draftPending || draftHold}>{busy ? "保存中" : "保存任务"}</button></footer></form></section></div>;
+  if (task) return editorForm();
+  return <TaskDraftAssist projectID={projectID} text={description} request={request} disabled={busy} onUseDescription={setDescription} onCreated={async () => { if (mountedRef.current) await saved(""); }} onState={onDraftState} fail={fail}>{(controls) => editorForm(controls.button, controls.panel)}</TaskDraftAssist>;
 }
 
 function TaskDetailDialog({ detail, permissionMode, busy, close, refresh, beginDispatch, enqueue, orchestrationEnabled, transition, deleteTask, confirmTransition, edit, move, canMoveUp, canMoveDown, request, fail }: { detail: TaskDetail; permissionMode?: ExecutionPolicy; busy: string; close: () => void; refresh: () => Promise<void>; beginDispatch: () => void; enqueue: () => Promise<void>; orchestrationEnabled: boolean; transition: (action: "reopen" | "stop") => Promise<void>; deleteTask: () => void; confirmTransition: () => void; edit: () => void; move: (taskID: string, direction: "up" | "down") => Promise<void>; canMoveUp: boolean; canMoveDown: boolean; request: Request; fail: (message: string) => void }) {

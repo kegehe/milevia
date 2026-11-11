@@ -1363,32 +1363,86 @@ func (r *sshRunner) Run(ctx context.Context, request AgentRunRequest, sink Agent
 	// 远端崩溃的真因分别在 stdout 的 result 事件和 stderr 里，取不到就永远是一句无信息量的
 	// 退出状态——而远程项目恰恰是最难就地排查的。
 	recorded := &claudeResultErrorSink{AgentRunSink: sink}
+	// 终结事件转成收尾信号：与本地/WSL 一致，result 只是"这一轮答完了"，远端进程
+	// 还要收尾；而远端后裔若握着 stdout，reader 等不到 EOF，done 永远不会返回。
+	// 没有这个信号时，整条运行只能等用户取消（WSL/本地已有上界）。
+	terminal := newTerminalSignalSink(recorded, "result")
 	var stderrTail = &stderrCapture{}
 	go func() {
-		done <- readClaudeJSONLines(stdout, recorded)
+		done <- readClaudeJSONLines(stdout, terminal)
 	}()
 	go func() {
 		readStderrLines(stderr, recorded, stderrTail)
 	}()
 
-	select {
-	case <-ctx.Done():
+	// finish 处理"stdout reader 已结束"的收尾：成功 result 已完整到达时以结果为准
+	// （见 claudeRunExitSucceeded）。
+	finish := func(readErr error) error {
+		waitErr := session.Wait()
+		// 与本地/WSL 一致：成功的终结 result 已完整到达时，远端进程的非零退出码、
+		// 以及收尾阶段才出现的流错误都不再把运行判成失败（取消仍走 ctx 分支）。
+		// 必须放在 err / waitErr 之前：结果之后 SSH 通道重置并不代表这次运行没跑完。
+		// SSH 的 waitErr 只来自远端退出/通道关闭，没有本地容器与租约错误混入；
+		// 治理类排除仍由 claudeRunExitSucceeded 统一处理，避免三条路径判定漂移。
+		if claudeRunExitSucceeded(recorded, ctx, waitErr) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+		if waitErr != nil {
+			return sshClaudeRunFailureError(waitErr, recorded.failureResult(), stderrTail.tail())
+		}
+		return nil
+	}
+	// killSession 是收尾超时/取消时的统一动作：结束远端进程并关闭通道。
+	killSession := func() {
 		_ = session.Signal(ssh.SIGKILL)
 		_ = session.Close()
+	}
+
+	select {
+	case <-ctx.Done():
+		killSession()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
 		}
 		return ctx.Err()
 	case err := <-done:
-		waitErr := session.Wait()
-		if err != nil {
-			return err
+		return finish(err)
+	case <-terminal.done:
+		// result 已完整到达：先给远端进程自然退出的窗口（与本地/WSL 的收尾看护同口径）。
+		select {
+		case err := <-done:
+			return finish(err)
+		case <-ctx.Done():
+			killSession()
+			select {
+			case <-done:
+			case <-time.After(agentProcessTeardownGrace):
+			}
+			return ctx.Err()
+		case <-time.After(agentProcessTeardownGrace):
+			// 远端后裔握着 stdout：有界收尾，不让运行永久停在 running。
+			killSession()
+			select {
+			case <-done:
+			case <-time.After(agentProcessTeardownGrace):
+			}
+			waitErr := session.Wait()
+			// 这里的非零退出是我们自己 SIGKILL 造成的，成功 result 已到就不该改判；
+			// 治理类错误仍由统一判定拦下（SSH 的 waitErr 通常不含它们）。
+			if claudeRunExitSucceeded(recorded, ctx, waitErr) {
+				return nil
+			}
+			// 这里不走 finish：done 的读取错误多半只是我们关通道造成的 EOF，
+			// 用它会把 CLI 自报的失败原因顶掉；有 waitErr 时以它为准。
+			if waitErr != nil {
+				return sshClaudeRunFailureError(waitErr, recorded.failureResult(), stderrTail.tail())
+			}
+			return errors.New("远程 Claude 收尾超时：结果流没有关闭")
 		}
-		if waitErr != nil {
-			return sshClaudeRunFailureError(waitErr, recorded.failureResult(), stderrTail.tail())
-		}
-		return nil
 	}
 }
 

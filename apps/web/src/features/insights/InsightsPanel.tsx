@@ -6,7 +6,7 @@ import { AgentLogo } from "../../components/AgentLogo";
 import { agentLogoKey } from "../../lib/cli-tools-view";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import type { AgentID, RunnerInfo } from "../../lib/types";
-import { catalogAgentID, knownAgentID, runnerAgentReady, useAgentCatalog } from "../../lib/agent-registry";
+import { catalogAgentID, knownAgentID, runnerAgentReady, useAgentCatalog, type AgentCatalogEntry } from "../../lib/agent-registry";
 import {
   filterFindingsByType,
   insightFindingCounts,
@@ -41,6 +41,14 @@ import {
 
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 type InsightAgent = AgentID;
+
+// 分析引擎同时看协议和当前环境：没接通只读分析的不出现；只支持本机的工具
+// 在 WSL / SSH 上即使探测为就绪也不出现。local 必须用服务端给的读数。
+function insightEngineAvailable(entry: AgentCatalogEntry, runner: RunnerInfo | null): boolean {
+  if (entry.supportsProjectInsights !== true || !runnerAgentReady(runner, entry.id)) return false;
+  if (entry.projectInsightsLocalOnly === true && runner?.local !== true) return false;
+  return true;
+}
 
 // 类型图标：贴合现有 20/24 描边图标风格。
 function TypeIcon({ type }: { type: InsightType }) {
@@ -132,7 +140,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
   const eventSeqRef = useRef(0);
 
   const availableAgentOptions = useMemo(
-    () => agentOptions.filter((entry) => entry.supportsProjectInsights === true && runnerAgentReady(agentRunner, entry.id)),
+    () => agentOptions.filter((entry) => insightEngineAvailable(entry, agentRunner)),
     [agentOptions, agentRunner],
   );
 

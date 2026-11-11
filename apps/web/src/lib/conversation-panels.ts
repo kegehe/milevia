@@ -1,6 +1,7 @@
-// 对话页侧栏模块的折叠状态（常用提示词/常用命令/技能/任务队列）。
+// 对话页侧栏模块的折叠状态（常用提示词/常用命令/技能）。
 // 方案 F 色块分区改版后，提示词与命令拆成两个独立色块，各自折叠（shortcuts / commands）。
 // 按项目持久化到 localStorage，切换项目/重进页面时保持用户上次的折叠偏好。
+// taskQueue 只为旧存档保留：宽屏任务栏的整栏收起改由 conversation-layout 负责。
 
 export type ConversationPanelKey = "shortcuts" | "commands" | "skills" | "taskQueue";
 

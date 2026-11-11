@@ -368,6 +368,8 @@ export type RunnerInfo = {
   environment: string;
   root: string;
   profileManagement?: boolean;
+  /** 服务端按本机 runner 规则给出。前端不要自己用 id 推断。 */
+  local?: boolean;
   // claude / codex 是过渡字段（后端由 agents[] 派生），改用 agents 后可删。
   claude?: ToolStatus;
   codex?: ToolStatus;

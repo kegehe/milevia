@@ -108,6 +108,33 @@ func TestWatchAgentProcessClosingOnContextCancel(t *testing.T) {
 	}
 }
 
+// terminalSignalSink 只是收尾信号的外壳，不能吞掉调用方 sink 的可选能力：
+// readOutput / readClaudeJSONLines 都会做 assistantMessageIDSetter / assistantDeltaSink
+// 断言，而本地、WSL、SSH 三条一次性 Claude 路径都把这个包装交给了 reader。
+func TestTerminalSignalSinkForwardsOptionalSinkCapabilities(t *testing.T) {
+	inner := &partialSink{}
+	signal := newTerminalSignalSink(inner, "result")
+
+	setter, ok := interface{}(signal).(assistantMessageIDSetter)
+	if !ok {
+		t.Fatal("包装后的 sink 不再实现 assistantMessageIDSetter：增量消息 id 会被静默丢弃")
+	}
+	setter.SetAssistantMessageID("cli-message-1")
+	delta, ok := interface{}(signal).(assistantDeltaSink)
+	if !ok {
+		t.Fatal("包装后的 sink 不再实现 assistantDeltaSink：增量文本会被静默丢弃")
+	}
+	delta.AssistantDelta("hi")
+	if inner.messageID != "cli-message-1" || len(inner.deltas) != 1 || inner.deltas[0] != "hi" {
+		t.Fatalf("可选能力没有转发到内层 sink: id=%q deltas=%q", inner.messageID, inner.deltas)
+	}
+
+	// 内层 sink 没实现对应能力时必须静默跳过，不能 panic。
+	plain := newTerminalSignalSink(&plainSink{}, "result")
+	plain.SetAssistantMessageID("x")
+	plain.AssistantDelta("y")
+}
+
 func TestTerminalSignalSinkFiresOnceOnTerminalEvent(t *testing.T) {
 	sink := &terminalRecordingSink{}
 	signal := newTerminalSignalSink(sink, "result")

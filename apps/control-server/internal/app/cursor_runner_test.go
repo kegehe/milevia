@@ -424,8 +424,8 @@ func TestCatalogExposesCursor(t *testing.T) {
 	if !entry.SupportsLogin || !entry.RunnableInProject {
 		t.Fatalf("cursor capability flags incomplete: %+v", entry)
 	}
-	if entry.SupportsProjectInsights {
-		t.Fatal("cursor has no read-only analysis protocol yet; insights must stay off")
+	if !entry.SupportsProjectInsights || !entry.ProjectInsightsLocalOnly {
+		t.Fatal("cursor read-only analysis is local-only and must be advertised as such")
 	}
 	if entry.SupportsProfiles {
 		t.Fatal("cursor profiles would hit the agent_profiles CHECK constraint; SupportsProfiles must stay false")

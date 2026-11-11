@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -251,13 +252,16 @@ func (s *Server) requireInsightAgentReady(ctx context.Context, projectID, agentI
 	if err != nil {
 		return err
 	}
-	meta, ok := s.runnerRegistry.getMeta(project.Runner)
-	if !ok {
-		return errors.New("当前项目的运行环境不可用")
-	}
 	entry, ok := agentByID(agentID)
 	if !ok || !entry.SupportsProjectInsights {
 		return errors.New("该分析引擎不支持项目分析")
+	}
+	if entry.ProjectInsightsLocalOnly && !s.insightOnNativeHost(project) {
+		return errors.New(insightLocalOnlyMessage(agentID))
+	}
+	meta, ok := s.runnerRegistry.getMeta(project.Runner)
+	if !ok {
+		return errors.New("当前项目的运行环境不可用")
 	}
 	for _, status := range s.probeAgents(ctx, meta) {
 		if status.ID != agentID {
@@ -619,9 +623,7 @@ func (s *Server) projectRuntimeProfile(ctx context.Context, project Project, age
 
 // runReadOnlyAgent 封装「选 runner → 解析项目代理路由档案 → sink → 超时 → Run →
 // 收集助手文本」，供 Pass A（发现）/ Pass B（核实）/ 再复核复用。严格只读：Claude 用
-// `plan`、Codex 用 `read_only`，绕开 HTTP 层的 `validAgentPolicy`（见 docs/25 §5.2）。
-// 选 runner 与 startMessage（app.go:3556）同一语义：SSH 走 runnerRegistry、本机按
-// 目标环境；`agentClaudeRunnerFor/codexRunnerFor` 对 remote 返回 nil，故兜底 s.runner。
+// `plan`，其余已接通的工具用各自的 `read_only`。选错工具时直接失败，不能改由 Claude 执行。
 // progress 非空时把 agent 的实时工具动作（读取/搜索…）作为分析进度回调给调用方。
 func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID, prompt string, progress func(level, message string)) (string, error) {
 	return s.runReadOnlyAgentWithSchema(ctx, project, agentID, prompt, nil, insightQuotaWaitMax, progress)
@@ -631,54 +633,9 @@ func (s *Server) runReadOnlyAgent(ctx context.Context, project Project, agentID,
 // 优化建议的调用方传 insightQuotaWaitMax：扫描与复核可并发，额度冲突是常态而非异常；
 // 其它调用方（如冲突解法的单次建议）要保持"要么马上给结果、要么明确失败"，传 0。
 func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project, agentID, prompt string, outputSchema json.RawMessage, quotaWait time.Duration, progress func(level, message string)) (string, error) {
-	var runner AgentRunner
-	policy := "plan"
-	isSSH := strings.HasPrefix(project.Runner, "ssh-")
-	target := s.resolveAgentTargetEnv(project.Runner, project.Path)
-	switch {
-	case agentID == "opencode":
-		policy = "read_only"
-		if isSSH {
-			r, ok := s.runnerRegistry.get(project.Runner)
-			if !ok {
-				return "", fmt.Errorf("SSH 连接不可用")
-			}
-			runner = r
-		} else {
-			runner = s.opencodeRunnerFor(target)
-			if runner == nil {
-				return "", errors.New("没有可用的 OpenCode 分析运行器")
-			}
-		}
-	case isSSH:
-		r, ok := s.runnerRegistry.get(project.Runner)
-		if !ok {
-			return "", fmt.Errorf("SSH 连接不可用")
-		}
-		runner = r
-		if agentID == "codex" {
-			policy = "read_only"
-		}
-	default:
-		if agentID == "codex" {
-			runner = s.codexRunnerFor(target)
-			policy = "read_only"
-		} else {
-			runner = s.agentClaudeRunnerFor(target)
-		}
-		if runner == nil {
-			if agentID == "codex" {
-				// Never run a Codex request through the Claude runner. This can
-				// happen when a cross-environment runner (for example WSL) is not
-				// available; returning an explicit error is safer than silently
-				// launching the wrong CLI.
-				return "", fmt.Errorf("没有可用的 Codex 分析运行器")
-			}
-			runner = s.runner // Claude 的兼容回退：目标 runner 缺失时用服务端 runner
-		}
-		if runner == nil {
-			return "", fmt.Errorf("没有可用的分析运行器")
-		}
+	runner, policy, err := s.insightAnalysisRunner(project, agentID)
+	if err != nil {
+		return "", err
 	}
 
 	profile, err := s.projectRuntimeProfile(ctx, project, agentID)
@@ -709,6 +666,11 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 			return "", errors.New("OpenCode CLI is unavailable")
 		}
 	}
+	if agentID == "codebuddy" || agentID == "qoder" || agentID == "cursor" {
+		if runner == nil || !runner.Ready(ctx) {
+			return "", fmt.Errorf("%s 不可用，请先在 CLI 工具页安装或登录", agentDisplayName(agentID))
+		}
+	}
 	cleanupQuota, err := s.reserveInsightQuotaWithWait(ctx, project, agentID, profile, quotaWait, progress)
 	if err != nil {
 		// 排队超时给出的已经是可直接展示的中文原因（见 reserveInsightQuotaWithWait），
@@ -735,7 +697,7 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 		return "", err
 	}
 	defer releaseWorkspace()
-	if err := runner.Run(scanCtx, AgentRunRequest{
+	request := AgentRunRequest{
 		SessionID:      uuid.NewString(),
 		ProjectPath:    project.Path,
 		Prompt:         prompt,
@@ -747,11 +709,19 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 		Model:         runModel("", profile),
 		SkipSessionID: true, // 一次性只读分析：避免 plan 模式带 --session-id 走"待命"
 		// 只读执行（claude）：default + 仅放行只读工具，能执行但不改文件、不挂审批。
-		// codex 走其自身 read_only sandbox，不设此项。
+		// codex 走其自身 read_only sandbox，不设此项。会话型 CLI 的只读由各自的权限参数落地。
 		ReadOnlyTools:  insightReadOnlyTools(agentID),
 		PromptViaStdin: len(insightReadOnlyTools(agentID)) > 0, // 用了 --allowedTools 就需 stdin 传 prompt
 		OutputSchema:   outputSchema,
-	}, sink); err != nil {
+	}
+	var runErr error
+	if agentID == "codebuddy" || agentID == "qoder" {
+		// 这两个 CLI 的 Run 会直接拒绝一次性调用，只读分析改走一轮即关的会话。
+		runErr = runInsightStreamingTurn(scanCtx, runner, request, sink)
+	} else {
+		runErr = runner.Run(scanCtx, request, sink)
+	}
+	if runErr != nil {
 		// 区分"跑满上限被杀"（agent 进程被终止，cmd.Wait 的报错不含 deadline
 		// 语义，这里显式看 scanCtx.Err()）与真正的运行失败，让用户拿到准确原因。
 		// 注意：单趟/总预算都是 0（不限时）时这里不可能命中——scanCtx 无 deadline；
@@ -776,9 +746,166 @@ func (s *Server) runReadOnlyAgentWithSchema(ctx context.Context, project Project
 			return "", fmt.Errorf("分析超时：超过 %d 分钟未完成。项目可能较大或模型处理较慢，请稍后重试或更换更快的模型档案",
 				int(insightScanPassTimeout.Minutes()))
 		}
-		return "", err
+		return "", runErr
 	}
 	return strings.TrimSpace(sink.text.String()), nil
+}
+
+// insightOnNativeHost 与冲突建议的本机边界同一判据：runner 是服务端本机，
+// 且项目路径也落在这个本机环境。WSL 上的 Windows 盘路径不能算 WSL 本机。
+func (s *Server) insightOnNativeHost(project Project) bool {
+	if !isLocalRunnerID(project.Runner) {
+		return false
+	}
+	return s.resolveAgentTargetEnv(project.Runner, project.Path) == s.resolveAgentTargetEnv(s.localRunnerID(), "")
+}
+
+func insightLocalOnlyMessage(agentID string) string {
+	switch agentID {
+	case "codebuddy":
+		return codebuddyLocalOnlyMessage
+	case "qoder":
+		return qoderLocalOnlyMessage
+	case "cursor":
+		return cursorLocalOnlyMessage
+	default:
+		return agentDisplayName(agentID) + " 目前仅支持本机项目"
+	}
+}
+
+// insightAnalysisRunner 按工具选出只读分析的执行面。未知工具和跨环境未接通的工具
+// 都返回错误，默认分支不再落到 Claude。
+func (s *Server) insightAnalysisRunner(project Project, agentID string) (AgentRunner, string, error) {
+	isSSH := strings.HasPrefix(project.Runner, "ssh-")
+	target := s.resolveAgentTargetEnv(project.Runner, project.Path)
+	switch agentID {
+	case "opencode":
+		if isSSH {
+			runner, ok := s.runnerRegistry.get(project.Runner)
+			if !ok {
+				return nil, "", errors.New("SSH 连接不可用")
+			}
+			return runner, "read_only", nil
+		}
+		runner := s.opencodeRunnerFor(target)
+		if runner == nil {
+			return nil, "", errors.New("没有可用的 OpenCode 分析运行器")
+		}
+		return runner, "read_only", nil
+	case "codex":
+		if isSSH {
+			runner, ok := s.runnerRegistry.get(project.Runner)
+			if !ok {
+				return nil, "", errors.New("SSH 连接不可用")
+			}
+			return runner, "read_only", nil
+		}
+		runner := s.codexRunnerFor(target)
+		if runner == nil {
+			return nil, "", errors.New("没有可用的 Codex 分析运行器")
+		}
+		return runner, "read_only", nil
+	case "claude-code":
+		if isSSH {
+			runner, ok := s.runnerRegistry.get(project.Runner)
+			if !ok {
+				return nil, "", errors.New("SSH 连接不可用")
+			}
+			return runner, "plan", nil
+		}
+		runner := s.agentClaudeRunnerFor(target)
+		if runner == nil {
+			runner = s.runner
+		}
+		if runner == nil {
+			return nil, "", errors.New("没有可用的分析运行器")
+		}
+		return runner, "plan", nil
+	case "cursor":
+		if !s.insightOnNativeHost(project) {
+			return nil, "", errors.New(cursorLocalOnlyMessage)
+		}
+		if s.cursorRunner == nil {
+			return nil, "", errors.New("没有可用的 Cursor 分析运行器")
+		}
+		return s.cursorRunner, "read_only", nil
+	case "codebuddy":
+		if !s.insightOnNativeHost(project) {
+			return nil, "", errors.New(codebuddyLocalOnlyMessage)
+		}
+		if s.codebuddyRunner == nil {
+			return nil, "", errors.New("没有可用的 CodeBuddy 分析运行器")
+		}
+		return s.codebuddyRunner, "read_only", nil
+	case "qoder":
+		if !s.insightOnNativeHost(project) {
+			return nil, "", errors.New(qoderLocalOnlyMessage)
+		}
+		if s.qoderRunner == nil {
+			return nil, "", errors.New("没有可用的 Qoder 分析运行器")
+		}
+		return s.qoderRunner, "read_only", nil
+	default:
+		return nil, "", errors.New("该分析引擎不支持项目分析")
+	}
+}
+
+// runInsightStreamingTurn 跑一轮即关的只读会话。CodeBuddy / Qoder 没有一次性 Run。
+func runInsightStreamingTurn(ctx context.Context, runner AgentRunner, request AgentRunRequest, sink *insightLiveSink) error {
+	streaming, ok := runner.(StreamingAgentRunner)
+	if !ok {
+		return fmt.Errorf("%s 没有可用的只读会话", agentDisplayName(request.AgentID))
+	}
+	session, err := streaming.StartSession(ctx, AgentSessionRequest{
+		SessionID:      request.SessionID,
+		ProjectPath:    request.ProjectPath,
+		PermissionMode: request.PermissionMode,
+		Model:          request.Model,
+	})
+	if err != nil {
+		return err
+	}
+	turn := &insightTurnSink{insightLiveSink: sink, finished: make(chan error, 1)}
+	exitObserved := false
+	defer func() {
+		session.Stop()
+		if exitObserved {
+			return
+		}
+		// Done 是进程退出的唯一信号。Stop 自己会在 5 秒后强杀；这里必须等到它，
+		// 不能超时后先放开工作区，否则 CLI 还活着时下一轮分析会和它抢同一份项目。
+		<-session.Done()
+	}()
+	if err := session.Send(request, turn); err != nil {
+		return err
+	}
+	select {
+	case err = <-turn.finished:
+	case err = <-session.Done():
+		exitObserved = true
+		select {
+		case err = <-turn.finished:
+		default:
+			if err == nil {
+				err = fmt.Errorf("%s 会话在返回分析结果前结束", agentDisplayName(request.AgentID))
+			}
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return err
+}
+
+type insightTurnSink struct {
+	*insightLiveSink
+	finished chan error
+	once     sync.Once
+}
+
+func (*insightTurnSink) TurnStarted() {}
+
+func (sink *insightTurnSink) TurnFinished(err error) {
+	sink.once.Do(func() { sink.finished <- err })
 }
 
 // reserveInsightQuota creates a short-lived internal run so read-only insight
@@ -2580,8 +2707,8 @@ func insightRevisionFailureReason(err error) string {
 	return truncateInsightLog(text, 160)
 }
 
-// currentInsightAgent 返回项目当前会话的 agentId（决定扫描/再验证用 claude
-// 还是 codex）；无当前会话或缺省值时回退 claude-code。它不能依赖浏览器窗口的活跃 Tab。
+// currentInsightAgent 返回项目当前会话的 agentId，作为扫描/再验证的默认引擎。
+// 当前工具没有接通只读分析时回退 claude-code。它不能依赖浏览器窗口的活跃 Tab。
 func (s *Server) currentInsightAgent(ctx context.Context, projectID string) string {
 	agentID := "claude-code"
 	_ = s.db.QueryRowContext(ctx, `select agent_id from conversations where project_id=? and is_current=true`, projectID).Scan(&agentID)

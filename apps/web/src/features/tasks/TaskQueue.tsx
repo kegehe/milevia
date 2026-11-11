@@ -6,6 +6,7 @@ import { anchorForSlot, canOfferDispatch, canRedispatch, filterQueueTasks, isSam
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import { persistTaskQuickDraft, readTaskQuickDraft } from "../../lib/task-quick-draft";
+import { TaskDraftAssist } from "./TaskDraftAssist";
 
 type DispatchedMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
 type DispatchResult = { message: DispatchedMessage; runId: string };
@@ -73,7 +74,7 @@ function CloseIcon() {
   return <svg className="task-inline-close-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
 }
 
-export function TaskQueue({ projectID, conversationID, permissionMode, request, fail, dispatchDisabled = false, onDispatched, openBoard, collapsed = false, onToggleCollapsed }: { projectID: string; conversationID: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; dispatchDisabled?: boolean; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void; collapsed?: boolean; onToggleCollapsed?: () => void }) {
+export function TaskQueue({ projectID, conversationID, permissionMode, request, fail, dispatchDisabled = false, onDispatched, openBoard, collapsed = false, onToggleCollapsed, onExpandCollapsed }: { projectID: string; conversationID: string; permissionMode?: ExecutionPolicy; request: Request; fail: (message: string) => void; dispatchDisabled?: boolean; onDispatched: (message: DispatchedMessage, runID: string) => void; openBoard: (taskID?: string) => void; collapsed?: boolean; onToggleCollapsed?: () => void; onExpandCollapsed?: () => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<TaskFilter>("active");
   const [query, setQuery] = useState("");
@@ -85,6 +86,12 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
   const [quickCreateOpen, setQuickCreateOpen] = useState(() => Boolean(readTaskQuickDraft(projectID)));
   const [quickDescription, setQuickDescription] = useState(() => readTaskQuickDraft(projectID));
   const [quickCreating, setQuickCreating] = useState(false);
+  const [draftPending, setDraftPending] = useState(false);
+  const [draftHold, setDraftHold] = useState(false);
+  const onDraftState = useCallback((state: { pending: boolean; holdSubmit: boolean }) => {
+    setDraftPending(state.pending);
+    setDraftHold(state.holdSubmit);
+  }, []);
   const [reviewNote, setReviewNote] = useState("");
   const [reviewingTaskID, setReviewingTaskID] = useState<string | null>(null);
   const [reviewSubmitting, setReviewSubmitting] = useState(false);
@@ -555,7 +562,7 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
 
   const quickCreate = async (event: FormEvent) => {
     event.preventDefault();
-    if (!quickDescription.trim() || quickCreating) return;
+    if (!quickDescription.trim() || quickCreating || draftHold) return;
     if (!mountedRef.current) return;
     setQuickCreating(true);
     try {
@@ -582,11 +589,18 @@ export function TaskQueue({ projectID, conversationID, permissionMode, request, 
     persistTaskQuickDraft(projectID, "");
   };
 
+  const onDraftCreated = useCallback(async () => {
+    persistTaskQuickDraft(projectID, "");
+    setQuickDescription("");
+    setQuickCreateOpen(false);
+    await loadTasks();
+  }, [loadTasks, projectID]);
+
   return <div className={`task-queue ${mobileOpen ? "mobile-open" : ""}`}>
-    <button type="button" className="task-queue-mobile-toggle" aria-expanded={collapsed ? false : mobileOpen} onClick={() => { if (collapsed) onToggleCollapsed?.(); setMobileOpen((open) => !open); }}>任务 <b>{taskCounts.active}</b></button>
+    <button type="button" className="task-queue-mobile-toggle" aria-expanded={collapsed ? false : mobileOpen} title={collapsed ? "展开任务队列" : undefined} aria-label={collapsed ? "展开任务队列" : undefined} onClick={() => { if (collapsed) { (onExpandCollapsed ?? onToggleCollapsed)?.(); return; } setMobileOpen((open) => !open); }}>任务 <b>{taskCounts.active}</b></button>
     <div className="task-queue-panel">
       <header className="task-queue-head"><div><TaskQueueIcon /><span>任务队列</span><b>{taskCounts.active}</b></div><div className="task-queue-head-actions">{taskCounts.awaiting_review > 0 && <button type="button" className="task-queue-review-all" disabled={approvingAll} title="一键验收全部待验收任务" aria-label="一键验收全部待验收任务" onClick={confirmReviewAll}>{approvingAll ? "验收中" : "一键验收"}{!approvingAll && <b>{taskCounts.awaiting_review}</b>}</button>}<button type="button" className="task-queue-add" title="快速创建任务" aria-label="快速创建任务" onClick={() => setQuickCreateOpen(true)}>+</button><button type="button" className="task-queue-all" onClick={() => openBoard()}>查看全部</button><button type="button" className="task-queue-fold" title={collapsed ? "展开任务队列" : "收起任务队列"} aria-label={collapsed ? "展开任务队列" : "收起任务队列"} aria-expanded={!collapsed} onClick={() => onToggleCollapsed?.()}><TaskQueueFoldIcon /></button></div></header>
-      {quickCreateOpen && <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating} onChange={(event) => updateQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" /><div className="task-queue-quick-create-actions"><button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating}>{quickCreating ? "创建中" : "创建"}</button></div></form>}
+      {quickCreateOpen && <TaskDraftAssist projectID={projectID} text={quickDescription} request={request} disabled={quickCreating} onUseDescription={updateQuickDescription} onCreated={onDraftCreated} onState={onDraftState} fail={fail}>{(controls) => <form className="task-queue-quick-create" onSubmit={(event) => void quickCreate(event)}><textarea autoFocus required maxLength={12000} rows={2} value={quickDescription} disabled={quickCreating || draftPending} onChange={(event) => updateQuickDescription(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); if (draftHold || quickCreating) return; const form = event.currentTarget.form; if (form) form.requestSubmit(); } }} placeholder="输入任务说明，回车快速创建…" />{controls.panel}<div className="task-queue-quick-create-actions">{controls.button}<button type="button" className="secondary" disabled={quickCreating} onClick={closeQuickCreate}>取消</button><button type="submit" className="primary" disabled={!quickDescription.trim() || quickCreating || draftHold}>{quickCreating ? "创建中" : "创建"}</button></div></form>}</TaskDraftAssist>}
       <div className="task-queue-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z" /><path d="m16 16 4 4" /></svg><input type="search" value={query} placeholder="搜索任务…" aria-label="搜索任务" onChange={(event) => setQuery(event.target.value)} /></div>
       <nav className="task-queue-filters" aria-label="任务筛选">{filters.map((item) => <button type="button" key={item.id} className={filter === item.id ? "active" : ""} aria-pressed={filter === item.id} onClick={() => setFilter(item.id)}>{item.label}<span>{taskCounts[item.id]}</span></button>)}</nav>
       <div className="task-queue-list">{queueTasks.length === 0 ? <p className="task-queue-empty">当前筛选没有任务。</p> : queueTasks.map((task, index) => <TaskQueueRow key={task.id} task={task} index={index} open={(edit = false) => void openInlineDetail(task.id, edit)} confirm={openConfirmation} redispatch={redispatchTask} redispatching={redispatchingTaskID === task.id} dispatchDisabled={dispatchDisabled} openReview={(taskID) => { setReviewingTaskID(taskID); setReviewNote(""); }} closeReview={() => { setReviewingTaskID(null); setReviewNote(""); }} reviewingTaskID={reviewingTaskID} reviewNote={reviewNote} setReviewNote={setReviewNote} reviewSubmitting={reviewSubmitting} submitReview={submitReview} onDrop={handleQueueDrop} setInlineEditingID={setInlineEditingID}

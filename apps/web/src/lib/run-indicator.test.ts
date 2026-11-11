@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   formatStageClock,
+  indicatorClockStart,
   latestActiveStage,
   pickRunIndicatorVariant,
   pickRunTextVariant,
@@ -175,11 +176,13 @@ test("计时：10 秒内不显示；阈值本身按手机端同口径（ms < 阈
   assert.equal(formatStageClock(stageClockVisibleAfterMs), "10s");
 });
 
-test("计时：过阈值按 CLI 风格显示秒与分", () => {
+test("计时：过阈值按 CLI 风格显示秒、分和小时", () => {
   assert.equal(formatStageClock(stageClockVisibleAfterMs + 1), "10s");
   assert.equal(formatStageClock(59_999), "59s");
   assert.equal(formatStageClock(61_000), "1m01s");
   assert.equal(formatStageClock(600_000), "10m00s");
+  assert.equal(formatStageClock(3_600_000), "1h00m00s");
+  assert.equal(formatStageClock(3_665_000), "1h01m05s");
 });
 
 test("计时：坏输入（NaN / 负数）返回空串，绝不显示 NaNs 或负数", () => {
@@ -192,4 +195,89 @@ test("计时：minMs=0 立即显示（移动端口径），负数仍拦", () => 
   assert.equal(formatStageClock(8_000, 0), "8s");
   assert.equal(formatStageClock(-3_000, 0), "");
   assert.equal(formatStageClock(Number.NaN, 0), "");
+});
+
+// ── 读数：计时起点（阶段耗时与总任务耗时同时保留）────────────────────────
+test("计时起点：没有进行中阶段时，只给出本轮最早的消息或事件", () => {
+  const start = indicatorClockStart({
+    runId: "run-1",
+    stage: null,
+    messages: [
+      { runId: "run-1", createdAt: "2026-10-12T10:00:20Z" },
+      { runId: "run-1", createdAt: "2026-10-12T10:00:05Z" },
+      { runId: "run-other", createdAt: "2026-10-12T09:00:00Z" },
+    ],
+    events: [
+      { runId: "run-1", createdAt: "2026-10-12T10:00:08Z" },
+      { runId: "run-prev", createdAt: "2026-10-12T08:00:00Z" },
+    ],
+  });
+  assert.deepEqual(start, { stageStartMs: null, totalStartMs: Date.parse("2026-10-12T10:00:05Z") });
+});
+
+test("计时起点：事件比消息更早时，总耗时以事件为准", () => {
+  const start = indicatorClockStart({
+    runId: "run-1",
+    stage: null,
+    messages: [{ runId: "run-1", createdAt: "2026-10-12T10:00:05Z" }],
+    events: [{ runId: "run-1", createdAt: "2026-10-12T10:00:01Z" }],
+  });
+  assert.deepEqual(start, { stageStartMs: null, totalStartMs: Date.parse("2026-10-12T10:00:01Z") });
+});
+
+test("计时起点：有进行中阶段时两颗都在，总耗时不改去跟阶段", () => {
+  const start = indicatorClockStart({
+    runId: "run-1",
+    stage: { createdAt: "2026-10-12T10:01:00Z" },
+    messages: [{ runId: "run-1", createdAt: "2026-10-12T10:00:00Z" }],
+    events: [{ runId: "run-1", createdAt: "2026-10-12T10:00:01Z" }],
+  });
+  assert.deepEqual(start, {
+    stageStartMs: Date.parse("2026-10-12T10:01:00Z"),
+    totalStartMs: Date.parse("2026-10-12T10:00:00Z"),
+  });
+});
+
+test("计时起点：阶段时间读不到时，总耗时仍在", () => {
+  const start = indicatorClockStart({
+    runId: "run-1",
+    stage: { createdAt: "not-a-date" },
+    messages: [{ runId: "run-1", createdAt: "2026-10-12T10:00:00Z" }],
+    events: [],
+  });
+  assert.deepEqual(start, { stageStartMs: null, totalStartMs: Date.parse("2026-10-12T10:00:00Z") });
+});
+
+test("计时起点：用量 startedAt 比已加载的消息更早时，用它补上被翻页裁掉的任务起点", () => {
+  const start = indicatorClockStart({
+    runId: "run-1",
+    stage: null,
+    startedAt: "2026-10-12T10:00:00Z",
+    messages: [{ runId: "run-1", createdAt: "2026-10-12T10:05:00Z" }],
+    events: [],
+  });
+  assert.deepEqual(start, { stageStartMs: null, totalStartMs: Date.parse("2026-10-12T10:00:00Z") });
+});
+
+test("计时起点：有进行中阶段时，更早的 startedAt 只影响总耗时", () => {
+  const start = indicatorClockStart({
+    runId: "run-1",
+    stage: { createdAt: "2026-10-12T10:02:00Z" },
+    startedAt: "2026-10-12T10:00:00Z",
+    messages: [],
+    events: [],
+  });
+  assert.deepEqual(start, {
+    stageStartMs: Date.parse("2026-10-12T10:02:00Z"),
+    totalStartMs: Date.parse("2026-10-12T10:00:00Z"),
+  });
+});
+
+test("计时起点：本轮没有任何可读时间戳时两颗都空", () => {
+  assert.deepEqual(indicatorClockStart({
+    runId: "run-1",
+    stage: null,
+    messages: [{ runId: "run-other", createdAt: "2026-10-12T10:00:00Z" }, { createdAt: "nope" }],
+    events: [{ runId: "run-1", createdAt: "" }],
+  }), { stageStartMs: null, totalStartMs: null });
 });

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kegehe/milevia/apps/control-server/internal/targetexec"
 )
 
 // AgentRunner is the boundary between the control service and an AI CLI.
@@ -775,6 +777,16 @@ func (r *claudeCLIRunner) Run(ctx context.Context, request AgentRunRequest, sink
 	}
 	wg.Wait()
 	if err := waitOrdinaryCLICommand(cmd); err != nil {
+		// 成功的终结 result 已经完整到达：用户可见的结果就在里面，进程之后再以非零码
+		// 退出（收尾看护在自然退出窗口后回收进程树、CLI 自身清理失败、stderr 只剩告警）
+		// 不该把这次运行判成失败——与 Codex「turn.completed 即结果」同口径（见
+		// codex_runner.go）。必须放在失败详情之前：成功收尾时 stderr 仍可能有告警行，
+		// 先拼 stderr 详情会把这次运行又拉回失败。被取消的运行、夹带工作区治理类失败的
+		// 运行不在此列（见 claudeGovernanceFailure）。
+		// 注意：CLI 自报失败时 success 已被清掉，失败分支不会走到这里。
+		if claudeRunExitSucceeded(recorded, ctx, err) {
+			return nil
+		}
 		// 失败原因的选择规则见 claudeRunFailureDetail：CLI 自报的可读原因优先，
 		// 其次是 stderr，最后才是 CLI 只给出枚举时的机器可读值。
 		if detail := claudeRunFailureDetail(recorded.failureResult(), stderrTail.tail()); detail != "" {
@@ -2317,6 +2329,10 @@ type claudeResultErrorSink struct {
 	AgentRunSink
 	mu      sync.Mutex
 	failure json.RawMessage
+	// success 记录是否收到过"成功的终结 result"（is_error 显式为假）。用户可见的
+	// 结果已经完整产出，进程之后再以非零码退出就不该把这次运行判成失败——收尾看护
+	// 在 Windows 上终止 .cmd shim、CLI 自身清理失败都会走到这里（见 Run 的收尾判定）。
+	success bool
 }
 
 func (s *claudeResultErrorSink) Event(eventType string, payload json.RawMessage) {
@@ -2326,6 +2342,14 @@ func (s *claudeResultErrorSink) Event(eventType string, payload json.RawMessage)
 			// 覆盖式记录：一次运行通常只有一个终结 result；真出现多个时以最后一个为准
 			// （更接近终止状态）。成功收尾不会进这里，也就不会污染失败信息。
 			s.failure = append(json.RawMessage(nil), payload...)
+			s.success = false
+			s.mu.Unlock()
+		} else if claudeResultSucceeded(payload) {
+			s.mu.Lock()
+			// 以最后一条终结 result 为准：成功帧要清掉先前记录的失败原因，否则
+			// "先失败、后成功"的运行在被取消/异常收尾时会把旧失败原因拼进错误。
+			s.failure = nil
+			s.success = true
 			s.mu.Unlock()
 		}
 	}
@@ -2337,6 +2361,33 @@ func (s *claudeResultErrorSink) failureResult() json.RawMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.failure
+}
+
+// resultSucceeded 报告是否收到过成功的终结 result（见 success 字段）。
+func (s *claudeResultErrorSink) resultSucceeded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.success
+}
+
+// claudeRunExitSucceeded 是本地 / WSL / SSH 三条一次性 Claude 路径共用的收尾判定：
+// 成功的终结 result 已经完整到达，且这次运行不是被取消的。满足时进程退出码与收尾
+// 告警不再决定成败——与 Codex「turn.completed 即结果」同口径（见 codex_runner.go）。
+// 但 waitErr 里夹带的工作区治理类失败不豁免：它们说明这次运行的前置条件已不可信，
+// 结果不能直接采信（见 claudeGovernanceFailure）。
+func claudeRunExitSucceeded(recorded *claudeResultErrorSink, ctx context.Context, waitErr error) bool {
+	return recorded.resultSucceeded() && ctx.Err() == nil && !claudeGovernanceFailure(waitErr)
+}
+
+// claudeGovernanceFailure 报告这次运行是否夹带了工作区治理类失败。成功的终结
+// result 可以豁免退出码、容器/CLI 收尾告警与 SSH 通道收尾错误，但不能豁免租约失效、
+// 工作区身份冲突、目标协议错误——这三类说明运行期间的授权/身份事实已不可信，
+// 把结果按成功采信会越过工作区保护。错误可能被容器收尾逻辑 join 或 fmt 包装，
+// 所以统一用 errors.Is 判断。
+func claudeGovernanceFailure(waitErr error) bool {
+	return errors.Is(waitErr, targetexec.ErrAuthority) ||
+		errors.Is(waitErr, targetexec.ErrConflict) ||
+		errors.Is(waitErr, targetexec.ErrProtocol)
 }
 
 // 下面两个方法让包装层对调用方 sink 的**可选能力**保持透明。
@@ -2387,6 +2438,19 @@ func decodeClaudeResultError(payload json.RawMessage) (claudeResultError, bool) 
 		APIErrorStatus: raw.APIErrorStatus,
 		Result:         raw.Result,
 	}, true
+}
+
+// claudeResultSucceeded 判断 result 事件是否是一次成功的终态输出。
+// 只认 CLI 显式写出的 is_error:false：缺失该字段（旧版/异常帧）时宁可不当成成功，
+// 避免把真正的失败当成成功收尾。失败事件的判定见 decodeClaudeResultError。
+func claudeResultSucceeded(payload json.RawMessage) bool {
+	var raw struct {
+		IsError *bool `json:"is_error"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &raw) != nil {
+		return false
+	}
+	return raw.IsError != nil && !*raw.IsError
 }
 
 // claudeResultMachineDetail 把机器可读的失败原因转成附加段。terminal_reason 与 subtype
