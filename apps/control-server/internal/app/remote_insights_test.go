@@ -14,6 +14,7 @@ import (
 func TestInsightsRemoteOperationWhitelistIsExplicit(t *testing.T) {
 	server := &Server{}
 	expected := map[string]string{
+		"insights.engines":             http.MethodGet,
 		"insights.list":                http.MethodGet,
 		"insights.scan":                http.MethodPost,
 		"insights.cancel":              http.MethodPost,

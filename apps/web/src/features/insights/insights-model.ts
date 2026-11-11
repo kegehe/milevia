@@ -34,6 +34,8 @@ export type InsightFinding = {
   title: string;
   summary: string;
   fileHint?: string;
+  evidence?: string;
+  acceptanceCriteria?: string;
   status: string;
   createdAt: string;
   // 建议再验证（re-verify）落库状态：''=未验证 | pending=验证中 | valid=确认仍存在 |
@@ -109,6 +111,7 @@ export type InsightsResponse = {
   // 列表触到后端上限（findingsLimit）时为 true，前端提示"仅显示最近 N 条"。
   truncated?: boolean;
   findingsLimit?: number;
+  foldedTruncated?: boolean;
 };
 
 // 一条分析过程中的进度消息（"分析信息"滚动展示）。level 与后端一一对应。

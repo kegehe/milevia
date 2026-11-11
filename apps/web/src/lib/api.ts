@@ -120,6 +120,10 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	{ methods: ["POST"], pattern: /^\/api\/tasks\/[^/]+\/orchestration\/(merge-main|cleanup)$/, timeoutMs: externalTaskTimeoutMs },
 	// 建项目 / 校验项目：SSH 分支要三次远端往返
 	{ methods: ["POST"], pattern: /^\/api\/projects(\/validate)?$/, timeoutMs: externalTaskTimeoutMs },
+	// 分析 / 再验证在登记运行前会同步探测当前引擎（requireInsightAgentReady，
+	// agentProbeTimeout = 45 秒）。不能套用普通请求的 15 秒预算而提前取消探测。
+	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/insights\/(scan|verify)$/, timeoutMs: probeTimeoutMs },
+	{ methods: ["GET"], pattern: /^\/api\/projects\/[^/]+\/insights\/engines$/, timeoutMs: probeTimeoutMs },
 	// 批量把建议转成任务 / 删除：N 条 finding = N 次写库，服务端在单事务里同步做完
 	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/insights\/(to-task|delete)$/, timeoutMs: externalTaskTimeoutMs },
 	// 删项目：服务端**无界**（deleteProjectLocked 用 s.runtimeCtx），要删会话、停 runner、
@@ -208,82 +212,61 @@ export async function apiWithTimeout<T>(path: string, init?: RequestInit, retrie
   // 放宽到 2x 的重试机会；仍超时才提示重启，避免单个慢请求误导用户。
   let timeoutRetried = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const headers = sessionHeaders(init?.headers);
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    const attemptTimeoutMs = timeoutRetried ? timeoutMs * 2 : timeoutMs;
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), attemptTimeoutMs);
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
     try {
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      const headers = sessionHeaders(init?.headers);
-      if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-      const attemptTimeoutMs = timeoutRetried ? timeoutMs * 2 : timeoutMs;
-      const controller = new AbortController();
-      const timeout = globalThis.setTimeout(() => controller.abort(), attemptTimeoutMs);
-      const abort = () => controller.abort();
-      signal?.addEventListener("abort", abort, { once: true });
-      let response: Response;
-      try {
-        response = await fetch(apiURL(path), {
-          ...init,
-          headers,
-          signal: controller.signal,
-        });
-      } catch (cause) {
-        if (controller.signal.aborted && !signal?.aborted) {
-          // 内部超时触发：重试过一次仍超时（或本次无重试资格）才给出最终错误。
-          //
-          // ⚠️ 长任务那一档**不能说"失败"**。它们的服务端预算本来就是分钟级，而且其中
-          // 一部分（走 s.runtimeCtx 的那些）**客户端断开也不中止** —— 说成失败会让用户
-          // 重来一次，而第一次其实成功了。这里如实说"还在跑"，并让他去刷新看结果。
-          const long = timeoutMs > requestTimeoutMs;
-          lastError = new Error(
-            timeoutRetried
-              ? `控制服务持续未响应，请重启 Milevia 后重试。`
-              : long
-                ? `这项操作超过 ${formatWait(timeoutMs)}仍未返回。服务端可能仍在后台继续执行 —— 稍后刷新即可看到结果，不要重复提交。`
-                : `控制服务未在 ${Math.round(attemptTimeoutMs / 1000)} 秒内响应，请稍后重试。`,
-          );
-          if (!timeoutRetried && attempt < retries) {
-            timeoutRetried = true;
-            await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
-            continue;
-          }
-          throw lastError;
-        }
-        throw cause;
-      } finally {
-        globalThis.clearTimeout(timeout);
-        signal?.removeEventListener("abort", abort);
-      }
+      const response = await fetch(apiURL(path), { ...init, headers, signal: controller.signal });
       if (response.ok) {
         if (response.status === 204 || response.status === 205) return undefined as T;
         try {
           return await response.json() as T;
         } catch (cause: unknown) {
-          if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+          if (controller.signal.aborted || (cause instanceof DOMException && cause.name === "AbortError")) throw cause;
           throw new Error("服务响应格式无效，请稍后重试。");
         }
       }
-      const body = await response.json().catch(() => null);
+      const body = await response.json().catch((cause: unknown) => {
+        if (controller.signal.aborted || (cause instanceof DOMException && cause.name === "AbortError")) throw cause;
+        return null;
+      });
       const message = body?.error || `请求失败（状态码 ${response.status}）`;
-      if (response.status >= 400 && response.status < 500) {
-        const err = new Error(message) as APIError;
-        err.status = response.status;
-        if (typeof body?.code === "string") err.code = body.code;
-        if (body?.details && typeof body.details === "object" && !Array.isArray(body.details)) err.details = body.details as Record<string, string>;
-        throw err;
-      }
-      const err5xx = new Error(message) as APIError;
-      err5xx.status = response.status;
-      if (typeof body?.code === "string") err5xx.code = body.code;
-      if (body?.details && typeof body.details === "object" && !Array.isArray(body.details)) err5xx.details = body.details as Record<string, string>;
-      lastError = err5xx;
-      if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+      const error = new Error(message) as APIError;
+      error.status = response.status;
+      if (typeof body?.code === "string") error.code = body.code;
+      if (body?.details && typeof body.details === "object" && !Array.isArray(body.details)) error.details = body.details as Record<string, string>;
+      if (response.status >= 400 && response.status < 500) throw error;
+      lastError = error;
     } catch (cause: unknown) {
-      if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
-      if (cause instanceof TypeError) {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      if (controller.signal.aborted) {
+        // 超时包含响应头和正文读取；写请求不重试，避免重复提交仍在执行的操作。
+        const long = timeoutMs > requestTimeoutMs;
+        lastError = new Error(
+          timeoutRetried
+            ? "控制服务持续未响应，请重启 Milevia 后重试。"
+            : long
+              ? `这项操作超过 ${formatWait(timeoutMs)}仍未返回。服务端可能仍在后台继续执行 —— 稍后刷新即可看到结果，不要重复提交。`
+              : `控制服务未在 ${Math.round(attemptTimeoutMs / 1000)} 秒内响应，请稍后重试。`,
+        );
+        if (timeoutRetried || attempt >= retries) throw lastError;
+        timeoutRetried = true;
+      } else if (cause instanceof TypeError) {
         lastError = new Error("无法连接到服务，请检查服务是否在运行。");
-        if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
-        continue;
+      } else {
+        throw cause;
       }
-      throw cause;
+    } finally {
+      // 直到正文解析完成才释放截止时间和调用方取消监听。
+      globalThis.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
     }
+    if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
   }
   throw lastError;
 }

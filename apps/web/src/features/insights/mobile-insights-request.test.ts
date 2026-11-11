@@ -27,6 +27,7 @@ const PROJECT = "/api/projects/p1";
 test("集合端点都映射到对应的 op，方法写错要当场报错", async () => {
   for (const testCase of [
     { route: "", method: "GET", op: "insights.list" },
+    { route: "/engines", method: "GET", op: "insights.engines" },
     { route: "/scan", method: "POST", op: "insights.scan" },
     { route: "/cancel", method: "POST", op: "insights.cancel" },
     { route: "/verify", method: "POST", op: "insights.verify" },
@@ -50,6 +51,24 @@ test("集合端点都映射到对应的 op，方法写错要当场报错", async
     );
     assert.equal(wrong.calls.length, 0, "接线错误不应该真的发出去");
   }
+});
+
+test("读取引擎、启动分析与复核给就绪探测留出 60 秒，普通读取保持默认预算", async () => {
+  const calls: Array<{ op: string; timeoutMs?: number }> = [];
+  const adapter = createMobileInsightsRequest({ transport: async (op, _params, timeoutMs) => {
+    calls.push({ op, timeoutMs });
+    return ok({});
+  } });
+  await adapter.request(`${PROJECT}/insights/engines`);
+  await adapter.request(`${PROJECT}/insights/scan`, { method: "POST" });
+  await adapter.request(`${PROJECT}/insights/verify`, { method: "POST" });
+  await adapter.request(`${PROJECT}/insights`);
+  assert.deepEqual(calls, [
+    { op: "insights.engines", timeoutMs: 60_000 },
+    { op: "insights.scan", timeoutMs: 60_000 },
+    { op: "insights.verify", timeoutMs: 60_000 },
+    { op: "insights.list", timeoutMs: undefined },
+  ]);
 });
 
 test("单条建议端点把 findingID 从路径提进 params，body 字段原样透传", async () => {

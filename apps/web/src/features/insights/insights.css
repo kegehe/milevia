@@ -754,7 +754,15 @@
 .insight-card-body > .insight-card-actions { grid-column: 2; grid-row: 1; justify-self: end; }
 .insight-card-body > b,
 .insight-card-body > p,
+.insight-card-body > .insight-details,
 .insight-card-body > .insight-card-foot { grid-column: 1 / -1; }
+
+.insight-details { min-width: 0; color: #4c6b60; font-size: 12px; line-height: 1.65; }
+.insight-details > summary { width: fit-content; cursor: pointer; color: #2c7867; }
+.insight-details > summary:focus-visible { outline: 2px solid #55a697; outline-offset: 3px; }
+.insight-details dl { margin: 8px 0 0; }
+.insight-details dt { font-weight: 700; margin-top: 6px; }
+.insight-details dd { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* 卡片首行：复选框 + 类型徽标共用一行（徽标只留文字，图标由左侧的章承担） */
 .insight-card-top {

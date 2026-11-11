@@ -12,7 +12,7 @@ func TestInsightVerifyRepairMapsSubsetIndexesAndPreservesRejections(t *testing.T
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
 	stub := &insightScriptRunner{outputs: []string{
-		`{"findings":[{"type":"bug","title":"候选甲","summary":"甲"},{"type":"bug","title":"候选乙","summary":"乙"},{"type":"bug","title":"候选丙","summary":"丙"},{"type":"bug","title":"候选丁","summary":"丁"}]}`,
+		`{"findings":[{"type":"bug","title":"候选甲","summary":"甲","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"bug","title":"候选乙","summary":"乙","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"bug","title":"候选丙","summary":"丙","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"bug","title":"候选丁","summary":"丁","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]}`,
 		`{"findings":[{"index":3,"confirmed":true,"reason":"丙存在"},{"index":1,"confirmed":false,"reason":"甲已实现"}]}`,
 		`{"findings":[{"index":2,"confirmed":false,"reason":"丁已修复"},{"index":1,"confirmed":true,"reason":"乙存在"}]}`,
 	}}
@@ -44,8 +44,12 @@ func TestInsightVerifyRepairMapsSubsetIndexesAndPreservesRejections(t *testing.T
 			t.Fatalf("repair missing %q: %s", detail, reqs[2].Prompt)
 		}
 	}
-	if strings.Contains(reqs[2].Prompt, "候选甲") || strings.Contains(reqs[2].Prompt, "候选丙") {
+	repair, refs, hasRefs := strings.Cut(reqs[2].Prompt, "\n\n本轮此前已确认候选")
+	if strings.Contains(repair, "候选甲") || strings.Contains(repair, "候选丙") {
 		t.Fatal("repair repeated candidates that already had valid verdicts")
+	}
+	if !hasRefs || !strings.Contains(refs, "候选丙") || strings.Contains(refs, "候选甲") {
+		t.Fatal("repair must retain confirmed candidates only as dedup references")
 	}
 }
 
@@ -53,7 +57,7 @@ func TestInsightVerifyIncompleteRepairFailsInsteadOfRejectingMissingCandidates(t
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
 	stub := &insightScriptRunner{outputs: []string{
-		`[{"type":"bug","title":"甲","summary":"甲"},{"type":"bug","title":"乙","summary":"乙"},{"type":"bug","title":"丙","summary":"丙"}]`,
+		`[{"type":"bug","title":"甲","summary":"甲","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"bug","title":"乙","summary":"乙","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"bug","title":"丙","summary":"丙","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`,
 		`{"findings":[{"index":1,"confirmed":true}]}`,
 		`{"findings":[{"index":1,"confirmed":true}]}`,
 	}}

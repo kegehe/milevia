@@ -82,7 +82,7 @@ func TestInsightScanDoesNotHoldWorkspaceLeaseWhileAnalyzing(t *testing.T) {
 	entered := make(chan struct{})
 	server.runner = &gatedInsightRunner{entered: entered, gate: gate,
 		outputs: []string{
-			`[{"type":"bug","severity":"high","title":"a","summary":"s"}]`,
+			`[{"type":"bug","severity":"high","title":"a","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`,
 			`{"findings":[{"index":1,"confirmed":true,"reason":""}]}`,
 		}}
 	// Admission probes use the registry; keep it on the same fixture rather
@@ -120,7 +120,7 @@ func TestInsightPublishFailsWhenWorkspaceBusy(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
 	server.runner = &insightScriptRunner{outputs: []string{
-		`[{"type":"bug","severity":"high","title":"a","summary":"s"}]`,
+		`[{"type":"bug","severity":"high","title":"a","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`,
 		`{"findings":[{"index":1,"confirmed":true,"reason":""}]}`,
 	}}
 	release, acquired := server.acquireProjectWorkspace(projectID, "run:blocker")
@@ -169,7 +169,7 @@ func TestInsightPublishFailsWhenWorkspaceBusy(t *testing.T) {
 func TestInsightScanRecordsRejectionReasons(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"s1"},{"type":"feature","severity":"normal","title":"伪需求","summary":"s2"}]`
+	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"s1","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"normal","title":"伪需求","summary":"s2","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	const reason = "项目已实现该功能，属于伪需求"
 	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""},{"index":2,"confirmed":false,"reason":"` + reason + `"}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
@@ -199,7 +199,7 @@ func TestInsightReverifyBatchFailureKeepsEarlierBatches(t *testing.T) {
 	projectID := insightTestProject(t, server)
 	var items []string
 	for i := 0; i < 12; i++ {
-		items = append(items, fmt.Sprintf(`{"type":"bug","severity":"normal","title":"建议%02d","summary":"s%d"}`, i+1, i+1))
+		items = append(items, fmt.Sprintf(`{"type":"bug","severity":"normal","title":"建议%02d","summary":"s%d","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}`, i+1, i+1))
 	}
 	findings := seedInsightFindings(t, server, projectID, "["+strings.Join(items, ",")+"]")
 	if len(findings) != 12 {
@@ -360,7 +360,7 @@ func TestNormalizeInsightReverifyStatusToleratesCaseAndSpace(t *testing.T) {
 func TestReverifyAcceptsIdTypoWithoutExtraAgentRun(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	server.runner = &insightScriptRunner{outputs: []string{
 		`{"findings":[{"id":"` + flipOneHexChar(t, f.ID) + `","status":"valid","reason":"仍在"}]}`,
@@ -380,7 +380,7 @@ func TestReverifyAcceptsIdTypoWithoutExtraAgentRun(t *testing.T) {
 func TestReverifyRetriesUnknownID(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	server.runner = &insightScriptRunner{outputs: []string{
 		`{"findings":[{"id":"11111111-2222-3333-4444-555555555555","status":"valid","reason":"乱编的 id"}]}`,
@@ -401,7 +401,7 @@ func TestReverifyRetriesUnknownID(t *testing.T) {
 func TestReverifyUnknownIDAfterRetryMarksFailed(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	bad := `{"findings":[{"id":"11111111-2222-3333-4444-555555555555","status":"valid","reason":"乱编的 id"}]}`
 	server.runner = &insightScriptRunner{outputs: []string{bad, bad}}
@@ -446,7 +446,7 @@ func flipOneHexChar(t *testing.T, id string) string {
 func TestInsightDismissHidesAndSuppressesRescan(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"噪声建议","summary":"用户不想再看到"}]`
+	passA := `[{"type":"bug","severity":"high","title":"噪声建议","summary":"用户不想再看到","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	server.runner = &insightScriptRunner{outputs: []string{passA, `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`}}
 	insertSyncInsightScan(t, server, projectID)
 	f := firstInsightFinding(t, server, projectID)
@@ -510,7 +510,7 @@ func TestInsightDismissHidesAndSuppressesRescan(t *testing.T) {
 func TestConvertInsightToTaskSkipsWhileLinkedTaskOpen(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"重复问题","summary":"同一个问题"}]`
+	passA := `[{"type":"bug","severity":"high","title":"重复问题","summary":"同一个问题","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	server.runner = &insightScriptRunner{outputs: []string{passA, `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`}}
 	insertSyncInsightScan(t, server, projectID)
 	f := firstInsightFinding(t, server, projectID)
@@ -527,9 +527,18 @@ func TestConvertInsightToTaskSkipsWhileLinkedTaskOpen(t *testing.T) {
 		t.Fatalf("task should record the source fingerprint, got %q", fingerprint)
 	}
 
-	// 同一问题被再次发现（硬删后重新上报）→ 已有未完成任务 → 跳过。
+	// Active tasks suppress exact rediscovery; the conversion guard also covers a
+	// suggestion already present before that task was created (e.g. older data).
 	server.runner = &insightScriptRunner{outputs: []string{passA, `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`}}
 	insertSyncInsightScan(t, server, projectID)
+	var rediscovered int
+	if err := server.db.QueryRow(`select count(*) from project_insights where project_id=?`, projectID).Scan(&rediscovered); err != nil || rediscovered != 0 {
+		t.Fatalf("active task should suppress rediscovery: count=%d err=%v", rediscovered, err)
+	}
+	if _, err := server.db.Exec(`insert into project_insights (id,project_id,scan_id,type,severity,title,summary,fingerprint,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?)`,
+		f.ID, projectID, f.ScanID, f.Type, f.Severity, f.Title, f.Summary, fingerprint, insightStatusOpen, f.CreatedAt, f.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
 	again := firstInsightFinding(t, server, projectID)
 	if _, converted, err := server.convertInsightToTask(context.Background(), projectID, again); err != nil || converted {
 		t.Fatalf("second convert while task open: converted=%v err=%v want false/nil", converted, err)
@@ -556,16 +565,19 @@ func TestConvertInsightToTaskSkipsWhileLinkedTaskOpen(t *testing.T) {
 func TestListInsightsAnnotatesLinkedTask(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"关联问题","summary":"同一个问题"}]`
+	passA := `[{"type":"bug","severity":"high","title":"关联问题","summary":"同一个问题","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	server.runner = &insightScriptRunner{outputs: []string{passA, `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`}}
 	insertSyncInsightScan(t, server, projectID)
 	f := firstInsightFinding(t, server, projectID)
 	if _, converted, err := server.convertInsightToTask(context.Background(), projectID, f); err != nil || !converted {
 		t.Fatalf("convert: converted=%v err=%v", converted, err)
 	}
-	// 重新上报同一问题（硬删后扫描会再次发现）。
-	server.runner = &insightScriptRunner{outputs: []string{passA, `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`}}
-	insertSyncInsightScan(t, server, projectID)
+	// A pre-existing card still shows the linked task, even though new scans now
+	// suppress this exact source fingerprint while its task is active.
+	if _, err := server.db.Exec(`insert into project_insights (id,project_id,scan_id,type,severity,title,summary,fingerprint,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?)`,
+		f.ID, projectID, f.ScanID, f.Type, f.Severity, f.Title, f.Summary, insightFingerprint(f.Title, f.Summary), insightStatusOpen, f.CreatedAt, f.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
 
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/projects/"+projectID+"/insights", nil))
@@ -582,7 +594,7 @@ func TestListInsightsAnnotatesLinkedTask(t *testing.T) {
 func TestUpdateInsightFindingSuppressesPreviousFingerprint(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	oldPassA := `[{"type":"bug","severity":"high","title":"旧写法","summary":"旧说明"}]`
+	oldPassA := `[{"type":"bug","severity":"high","title":"旧写法","summary":"旧说明","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	server.runner = &insightScriptRunner{outputs: []string{oldPassA, `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`}}
 	insertSyncInsightScan(t, server, projectID)
 	f := firstInsightFinding(t, server, projectID)
@@ -721,7 +733,7 @@ func TestInsightRevisionAbortTextNeverClaimsCodeChanged(t *testing.T) {
 func TestInsightPublishFailureReportsReason(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"a","summary":"s"}]`
+	passA := `[{"type":"bug","severity":"high","title":"a","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	server.runner = &insightScriptRunner{outputs: []string{passA, `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`}}
 
 	// 让写库必然失败：先把 project_insights 换成一张只读/冲突的表代价太大，这里改用

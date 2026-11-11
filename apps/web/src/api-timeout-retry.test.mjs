@@ -179,6 +179,41 @@ test("long-running endpoints are never auto-retried, even when they are GETs", a
   }
 });
 
+test("分析与再验证等待引擎探测，60 秒超时后不重复提交", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const originalFetch = globalThis.fetch;
+  try {
+    let fetchCalls = 0;
+    globalThis.fetch = (_url, init) => {
+      fetchCalls++;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      });
+    };
+    const flush = async () => {
+      await Promise.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    for (const action of ["scan", "verify"]) {
+      const callsBefore = fetchCalls;
+      const pending = api(`/api/projects/p1/insights/${action}`, { method: "POST" });
+      let settled = false;
+      pending.then(() => { settled = true; }, () => { settled = true; });
+      const rejected = assert.rejects(pending, /这项操作超过 1 分钟仍未返回/);
+      mock.timers.tick(15_001);
+      await flush();
+      assert.equal(settled, false, `${action} 不应在引擎探测尚未结束时提前中止`);
+      mock.timers.tick(45_000);
+      await flush();
+      await rejected;
+      assert.equal(fetchCalls, callsBefore + 1, `${action} 不应自动重复提交`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    mock.timers.reset();
+  }
+});
+
 // 表容易漏 —— 漏一个的后果就是"这个按钮又变成 15 秒判失败"。所以把 CLI 管理页
 // （pages/CliToolsPage.tsx）真正会打的那几条端点逐个钉住：15 秒到点时**不能**有结论。
 // 这也是把"入表"这件事从注释变成断言：以后页面新增一个长端点，这里就该多一行。

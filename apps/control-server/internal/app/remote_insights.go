@@ -4,7 +4,7 @@ import "net/http"
 
 // 手机端能执行的全部 **优化建议** 操作。名单类型与合成逻辑在 remote_relay.go。
 //
-// 这 11 条是电脑端优化建议面板的全部 REST 端点（app.go 里 /api/projects/{projectID}/insights*
+// 这些是电脑端优化建议面板的全部 REST 端点（app.go 里 /api/projects/{projectID}/insights*
 // 那一组），一条不多一条不少：手机端要整块复用 InsightsPanel，就得让它发出的每个请求
 // 都有对应的 op —— 少一条的症状是面板静默空白。
 //
@@ -16,6 +16,7 @@ import "net/http"
 // 错误文案全部原样继承 —— 手机端不新增任何一条建议语义。
 func (s *Server) remoteInsightOperations() map[string]remoteOperation {
 	return map[string]remoteOperation{
+		"insights.engines": {Method: http.MethodGet, Path: "/insights/engines", Handle: s.insightEngines},
 		// ── 列表与扫描 ──────────────────────────────────────────────────────────
 		// 列表把 findings / invalidated / dismissed / 事件一并带回，是这批 op 里
 		// 唯一可能顶到 320 KiB 的：截断上限由服务端自己控制（insightFindingsListLimit），
@@ -24,14 +25,14 @@ func (s *Server) remoteInsightOperations() map[string]remoteOperation {
 			Method: http.MethodGet, Path: "/insights", Query: true,
 			MaxBytes: 320 << 10, Label: "建议列表", Handle: s.listInsights,
 		},
-		// 扫描是**异步**的（立刻返回 + 轮询 insights.list 取进度），不会撞通道超时。
+		// 扫描异步执行，但登记前的工具就绪探测可能耗时 45 秒；手机端需给 60 秒预算。
 		"insights.scan":   {Method: http.MethodPost, Path: "/insights/scan", Handle: s.triggerInsightScan},
 		"insights.cancel": {Method: http.MethodPost, Path: "/insights/cancel", Handle: s.cancelInsightScan},
 
 		// ── 批量动作 ────────────────────────────────────────────────────────────
-		// 复核同为异步登记（202 + 轮询）；verify 的 FindingIDs 在请求体里。
+		// 复核也会先探测工具，再异步登记（202 + 轮询）；FindingIDs 在请求体里。
 		"insights.verify": {Method: http.MethodPost, Path: "/insights/verify", Handle: s.verifyInsightFindings},
-		"insights.toTask": {Method: http.MethodPost, Path: "/insights/to-task", Handle: s.addInsightToTasks},
+		"insights.toTask": {Method: http.MethodPost, Path: "/insights/to-task", Handle: s.addInsightToTasksRemote},
 		"insights.delete": {Method: http.MethodPost, Path: "/insights/delete", Handle: s.deleteInsightFindings},
 
 		// ── 单条建议 ────────────────────────────────────────────────────────────

@@ -122,6 +122,11 @@ func (s *Server) exportTasks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tasks = append(tasks, task)
+		if len(tasks) > taskTransferMaxTasks {
+			rows.Close()
+			writeError(w, http.StatusRequestEntityTooLarge, errors.New("task export selection contains too many tasks"))
+			return
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -173,7 +178,19 @@ func (s *Server) exportTasks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	file.DroppedDependencies = dropped
-	writeJSON(w, http.StatusOK, file)
+	// 与前端实际下载的两空格缩进格式对齐，防止成功导出后撞上 64 MiB 导入门禁。
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if len(data) > taskTransferMaxBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, errors.New("task export selection is too large"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 // taskTransferDependencies 取项目内全部依赖边，翻译成文件内 key。

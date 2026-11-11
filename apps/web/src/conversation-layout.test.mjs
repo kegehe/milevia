@@ -11,6 +11,7 @@ const timelineLib = await readFile(new URL("./lib/timeline.ts", import.meta.url)
 const utilsLib = await readFile(new URL("./lib/utils.ts", import.meta.url), "utf8");
 const projectLayout = await readFile(new URL("./components/ProjectLayout.tsx", import.meta.url), "utf8");
 const conversationPage = await readFile(new URL("./pages/ConversationPage.tsx", import.meta.url), "utf8");
+const conversationLayoutHook = await readFile(new URL("./lib/use-conversation-layout.ts", import.meta.url), "utf8");
 const taskQueue = await readFile(new URL("./features/tasks/TaskQueue.tsx", import.meta.url), "utf8");
 const taskStyles = await readFile(new URL("./tasks.css", import.meta.url), "utf8");
 const gitWorkbench = await readFile(new URL("./features/git/GitWorkbench.tsx", import.meta.url), "utf8");
@@ -882,9 +883,12 @@ test("conversation side modules collapse through header toggles and persist per 
   assert.match(stylesheet, /\.quick-block\.collapsed \.quick-block-title \.quick-tag-heading-chevron \{[^}]*transform: rotate\(180deg\);/s);
   // 任务队列标题提供折叠箭头；折叠后在宽屏收敛为右侧窄条。
   assert.match(taskQueue, /task-queue-fold[\s\S]*?aria-expanded=\{!collapsed\}[\s\S]*?onClick=\{\(\) => onToggleCollapsed\?\.\(\)\}/);
-  assert.match(conversationPage, /data-collapsed=\{conversationPanels\.taskQueue \? "true" : undefined\}/);
-  assert.match(conversationPage, /collapsed=\{conversationPanels\.taskQueue\} onToggleCollapsed=\{\(\) => toggleConversationPanel\("taskQueue"\)\}/);
-  assert.match(stylesheet, /@media \(min-width: 1200px\)[\s\S]*?\.conversation-canvas\[data-queue-collapsed="true"\]/);
+  // 任务栏已由可调整宽度的布局 hook 管理；data-collapsed 在 hook 中随实际显示状态写入。
+  assert.match(conversationPage, /const panes = useConversationLayout\(!readOnlyConversation\);/);
+  assert.match(conversationPage, /className="conversation-canvas" ref=\{panes\.canvasRef\}/);
+  assert.match(conversationPage, /collapsed=\{panes\.wide && panes\.rightCollapsedVisual\} onToggleCollapsed=\{\(\) => panes\.togglePane\("right"\)\} onExpandCollapsed=\{\(\) => panes\.expandPane\("right"\)\}/);
+  assert.match(conversationLayoutHook, /const rightRail = canvas\.querySelector<HTMLElement>\(":scope > \.task-queue-rail"\);/);
+  assert.match(conversationLayoutHook, /if \(rightRail\) setFlag\(rightRail, "collapsed", displayed\.rightCollapsed\);/);
   assert.match(stylesheet, /\.task-queue-rail\[data-collapsed="true"\] \.task-queue-panel \{\s*display:\s*none;\s*\}/);
 });
 

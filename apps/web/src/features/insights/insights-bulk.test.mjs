@@ -103,12 +103,12 @@ test("两个确认框各自独立，且条数来自真实读数", () => {
   assert.match(panel, /const selectedFoldedCount =/);
   assert.match(panel, /\{selectedFoldedCount > 0 && <>其中 \{selectedFoldedCount\} 条来自/);
   // 截断时要说清"会一并删掉没显示的那些"。
-  assert.match(panel, /\{truncated && <>列表当前只显示前 \{findingsLimit \|\| openCount\} 条/);
+  assert.match(panel, /\{truncated && <>列表当前只显示前 \{findingsLimit\} 条/);
 });
 
 test("卡片点选是「控件优先」：整卡可点但按钮/链接/输入框不受影响", () => {
   assert.match(panel, /function isCardControl\(target: EventTarget \| null\): boolean \{/);
-  assert.match(panel, /target\.closest\("button,a,input,select,textarea,label"\) !== null/);
+  assert.match(panel, /target\.closest\("button,a,input,select,textarea,label,summary"\) !== null/);
   assert.match(panel, /onClick=\{selectable \? \(event\) => \{ if \(isCardControl\(event\.target\)\) return; onToggleSelect\?\.\(\); \} : undefined\}/);
 });
 
@@ -162,7 +162,7 @@ test("截断提示必须报出真实总数（不能只报看得见的那些）",
   // 在后端也是全量执行 —— 提示里丢掉它，用户就会以为"全部"= 列表上这 500 条。
   const notice = panel.slice(panel.indexOf("{truncated && ("), panel.indexOf("</section>\n          )}"));
   assert.match(notice, /有效建议共 \{openCount\} 条/);
-  assert.match(notice, /列表仅显示最近 \{findingsLimit \|\| openCount\} 条/);
+  assert.match(notice, /列表仅显示最近 \{findingsLimit\} 条/);
   assert.match(notice, /「全部添加为任务」「验证全部」「全部删除」作用于全部 \{openCount\} 条/);
   // 四个确认框/汇总行上的数字也必须是 openCount（不是 findings.length）。
   assert.doesNotMatch(code, /全部 <b>\{findings\.length\}/);

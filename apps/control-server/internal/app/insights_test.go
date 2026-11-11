@@ -120,6 +120,9 @@ func insightTestProject(t *testing.T, server *Server) string {
 // insightTestProjectID 与 insightTestProject 相同，但使用指定项目 id（供多项目测试）。
 func insightTestProjectID(t *testing.T, server *Server, projectID string) string {
 	t.Helper()
+	// Fixture scans must not depend on probing an installed CLI or its login state.
+	// Availability-specific cases can explicitly replace this registration.
+	server.runnerRegistry.register(server.localRunnerID(), &insightScriptRunner{}, server.localRunnerMeta())
 	projectPath := t.TempDir()
 	runner := newGitRunner()
 	for _, args := range [][]string{
@@ -313,7 +316,7 @@ func TestTriggerInsightScanAccepts(t *testing.T) {
 func TestRunInsightScanPersistsConfirmedFindings(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx"},{"type":"feature","severity":"normal","title":"可加导出按钮","summary":"在列表页加一个导出功能","fileHint":""}]`
+	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"normal","title":"可加导出按钮","summary":"在列表页加一个导出功能","fileHint":"","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""},{"index":2,"confirmed":true,"reason":""}]}`
 	stub := &insightScriptRunner{outputs: []string{passA, passB}}
 	server.runner = stub
@@ -491,7 +494,7 @@ func TestRunInsightScanRetriesBadPassA(t *testing.T) {
 1. **列表加载慢** —— 建议优化分页，具体见源码。
 ["这是","随手写的","字符串数组","不满足契约"]
 以上就是我发现的问题，我稍后再整理成正式结果。`
-	goodA := `[{"type":"optimization","severity":"normal","title":"列表分页","summary":"列表页数据量大时可加分页避免卡顿","fileHint":"src/List.tsx"}]`
+	goodA := `[{"type":"optimization","severity":"normal","title":"列表分页","summary":"列表页数据量大时可加分页避免卡顿","fileHint":"src/List.tsx","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`
 	stub := &insightScriptRunner{outputs: []string{badA, goodA, passB}}
 	server.runner = stub
@@ -566,7 +569,7 @@ func stubCalls(runner AgentRunner) int {
 func TestRunInsightScanRetriesBadPassB(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"悬浮球重挂","summary":"取消截图后悬浮球又冒出来","fileHint":"src-tauri/src/commands.rs"}]`
+	passA := `[{"type":"bug","severity":"high","title":"悬浮球重挂","summary":"取消截图后悬浮球又冒出来","fileHint":"src-tauri/src/commands.rs","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	badB := `我逐条核对了候选：
 1. 确实在 cleanup_screenshot_session_inner 里无条件 orb.show()，属实。
 以上就是我的核实结论，整理后再给正式输出。`
@@ -611,7 +614,7 @@ func TestRunInsightScanRetriesBadPassB(t *testing.T) {
 func TestRunInsightScanBadJSONFailsAfterVerifyRetry(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`
+	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	stub := &insightScriptRunner{outputs: []string{passA, `no json`, `still no json`}}
 	server.runner = stub
 
@@ -641,7 +644,7 @@ func TestRunInsightScanBadJSONFailsAfterVerifyRetry(t *testing.T) {
 func TestRunInsightScanVerifyRunnerErrorFailsWithSuggestionMessage(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`
+	passA := `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	calls := 0
 	server.runner = runnerFunc(func(_ context.Context, _ AgentRunRequest, sink AgentRunSink) error {
 		calls++
@@ -673,7 +676,7 @@ func TestRunInsightScanVerifyRunnerErrorFailsWithSuggestionMessage(t *testing.T)
 func TestUnconfirmedFindingsDoNotPersist(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"假 bug","summary":"并不存在"}]`
+	passA := `[{"type":"bug","severity":"high","title":"假 bug","summary":"并不存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":false,"reason":"项目里没有该问题"}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	scanID := insertSyncInsightScan(t, server, projectID)
@@ -690,8 +693,8 @@ func TestUnconfirmedFindingsDoNotPersist(t *testing.T) {
 func TestRule1DedupByFingerprint(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA1 := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开很慢","fileHint":""}]`
-	passA2 := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开很慢","fileHint":""}]`
+	passA1 := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开很慢","fileHint":"","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
+	passA2 := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开很慢","fileHint":"","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`
 
 	// 第一批。
@@ -731,7 +734,7 @@ func TestRule1DedupByFingerprint(t *testing.T) {
 func TestListInsightsReturnsScanAndFindings(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"高严重度","summary":"s"},{"type":"feature","severity":"low","title":"低严重度","summary":"t"}]`
+	passA := `[{"type":"bug","severity":"high","title":"高严重度","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"low","title":"低严重度","summary":"t","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true},{"index":2,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -965,7 +968,7 @@ func TestInsightFindingsCap(t *testing.T) {
 	// 验证数量钳制：超过上限时截断，并让每个 Pass B 批次使用局部索引。
 	var items []string
 	for i := 0; i < 60; i++ {
-		items = append(items, fmt.Sprintf(`{"type":"feature","severity":"normal","title":"功能 %d","summary":"描述 %d"}`, i, i))
+		items = append(items, fmt.Sprintf(`{"type":"feature","severity":"normal","title":"功能 %d","summary":"描述 %d","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}`, i, i))
 	}
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
@@ -986,8 +989,8 @@ func TestInsightFindingsCap(t *testing.T) {
 	if err := server.db.QueryRow(`select count(*) from project_insights where scan_id=?`, scanID).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if n > insightFindingsCap {
-		t.Errorf("findings exceeded cap: got %d want <=%d", n, insightFindingsCap)
+	if n != insightFindingsCap {
+		t.Errorf("findings cap: got %d want %d", n, insightFindingsCap)
 	}
 }
 
@@ -1023,8 +1026,12 @@ func TestInsightRequestsRejectUnavailableOrUnsupportedAgent(t *testing.T) {
 	t.Run("unsupported engine", func(t *testing.T) {
 		server := newTestServer(t)
 		projectID := insightTestProject(t, server)
+		// Every current built-in engine supports insights; use an explicit fixture.
+		original := agentCatalogEntries
+		agentCatalogEntries = append(agentCatalog(), AgentCatalogEntry{ID: "insight-unsupported", Name: "Unsupported fixture"})
+		defer func() { agentCatalogEntries = original }()
 		for _, endpoint := range []string{"scan", "verify"} {
-			body := strings.NewReader(`{"agent":"codebuddy"}`)
+			body := strings.NewReader(`{"agent":"insight-unsupported"}`)
 			rec := httptest.NewRecorder()
 			server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/projects/"+projectID+"/insights/"+endpoint, body))
 			if rec.Code != http.StatusConflict {
@@ -1153,7 +1160,7 @@ func TestPassBRepairsOnlyMissingFindings(t *testing.T) {
 	// 第二次调用只核实漏项，并按新清单的局部编号返回；已有判定保持不变。
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"已核实","summary":"s1"},{"type":"feature","severity":"normal","title":"未覆盖","summary":"s2"}]`
+	passA := `[{"type":"bug","severity":"high","title":"已核实","summary":"s1","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"normal","title":"未覆盖","summary":"s2","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true,"reason":""}]}`
 	stub := &insightScriptRunner{outputs: []string{passA, passB, passB}}
 	server.runner = stub
@@ -1179,21 +1186,9 @@ func TestPassBRepairsOnlyMissingFindings(t *testing.T) {
 func TestPartialInsightVerifyOutcomesRejectsDuplicateAndInvalidIndexes(t *testing.T) {
 	verdict := insightVerifyVerdict{}
 	verdict.Findings = append(verdict.Findings,
-		struct {
-			Index     int    `json:"index"`
-			Confirmed bool   `json:"confirmed"`
-			Reason    string `json:"reason"`
-		}{Index: 1, Confirmed: true},
-		struct {
-			Index     int    `json:"index"`
-			Confirmed bool   `json:"confirmed"`
-			Reason    string `json:"reason"`
-		}{Index: 1, Confirmed: true},
-		struct {
-			Index     int    `json:"index"`
-			Confirmed bool   `json:"confirmed"`
-			Reason    string `json:"reason"`
-		}{Index: 4, Confirmed: true},
+		insightVerifyDecision{Index: 1, Confirmed: true},
+		insightVerifyDecision{Index: 1, Confirmed: true},
+		insightVerifyDecision{Index: 4, Confirmed: true},
 	)
 	if outcomes, err := partialInsightVerifyOutcomes(verdict, 2); err == nil || outcomes != nil {
 		t.Fatalf("malformed indexes must force a full retry: outcomes=%+v err=%v", outcomes, err)
@@ -1204,11 +1199,7 @@ func TestValidateInsightVerdictRejectsInvalidIndexes(t *testing.T) {
 	verdict := func(indexes ...int) insightVerifyVerdict {
 		out := insightVerifyVerdict{}
 		for _, index := range indexes {
-			out.Findings = append(out.Findings, struct {
-				Index     int    `json:"index"`
-				Confirmed bool   `json:"confirmed"`
-				Reason    string `json:"reason"`
-			}{Index: index, Confirmed: true})
+			out.Findings = append(out.Findings, insightVerifyDecision{Index: index, Confirmed: true})
 		}
 		return out
 	}
@@ -1248,7 +1239,7 @@ func TestInsightVerifyResultErrorMessageClassifiesContractFailures(t *testing.T)
 func TestDeleteInsightFindingHardDeletes(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"待删除","summary":"s"}]`
+	passA := `[{"type":"bug","severity":"high","title":"待删除","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	scanID := insertSyncInsightScan(t, server, projectID)
@@ -1330,7 +1321,7 @@ func postInsightDelete(t *testing.T, server *Server, projectID, body string) *ht
 // seedInsightTrio 落三条建议（标题固定为 甲/乙/丙），供批量删除的三种范围共用。
 func seedInsightTrio(t *testing.T, server *Server, projectID string) {
 	t.Helper()
-	passA := `[{"type":"bug","severity":"high","title":"甲","summary":"s1"},{"type":"style","severity":"normal","title":"乙","summary":"s2"},{"type":"feature","severity":"low","title":"丙","summary":"s3"}]`
+	passA := `[{"type":"bug","severity":"high","title":"甲","summary":"s1","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"style","severity":"normal","title":"乙","summary":"s2","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"low","title":"丙","summary":"s3","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	seedInsightFindings(t, server, projectID, passA)
 	if got := insightRowCount(t, server, projectID, ""); got != 3 {
 		t.Fatalf("seed trio: got %d findings want 3", got)
@@ -1545,7 +1536,7 @@ func TestDeleteInsightFindingsKeepsConvertedTasks(t *testing.T) {
 func TestAddInsightToTaskCreatesTaskAndRemovesFinding(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx"}]`
+	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -1629,7 +1620,7 @@ func TestAddInsightToTaskRejectsCrossProjectFinding(t *testing.T) {
 	projectA := insightTestProject(t, server)
 	// 再建一个项目 B（id 不同，同样初始化 Git 仓库），在其中落一条 finding。
 	projectB := insightTestProjectID(t, server, "insight-project-b")
-	passA := `[{"type":"bug","severity":"high","title":"B 的建议","summary":"s"}]`
+	passA := `[{"type":"bug","severity":"high","title":"B 的建议","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectB)
@@ -1646,7 +1637,7 @@ func TestAddInsightToTaskRejectsCrossProjectFinding(t *testing.T) {
 func TestAddInsightToTaskRejectsPendingVerification(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"待复核","summary":"s"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"待复核","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	server.setInsightVerification(context.Background(), projectID, f.ID, insightVerifyPending, "", time.Now().UTC())
 
 	rec := httptest.NewRecorder()
@@ -1666,7 +1657,7 @@ func TestAddInsightToTaskRejectsPendingVerification(t *testing.T) {
 func TestAddInsightToTaskRejectsInvalidatedFinding(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"已失效","summary":"s"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"已失效","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	server.setInsightVerification(context.Background(), projectID, f.ID, insightVerifyInvalid, "已修复", time.Now().UTC())
 
 	rec := httptest.NewRecorder()
@@ -1707,7 +1698,7 @@ func TestBuildInsightTaskDescriptionForCleanupRequiresConfirmation(t *testing.T)
 func TestAddInsightToTaskSecondAttemptNotFound(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒"}]`
+	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -1774,11 +1765,7 @@ func seedInsightFindings(t *testing.T, server *Server, projectID, passA string) 
 func TestAddInsightToTasksConvertsAllValid(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[
-		{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒"},
-		{"type":"optimization","severity":"normal","title":"接口可加缓存","summary":"每次请求都打全量数据"},
-		{"type":"feature","severity":"low","title":"加导出按钮","summary":"用户常要导出数据"}
-	]`
+	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"optimization","severity":"normal","title":"接口可加缓存","summary":"每次请求都打全量数据","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"low","title":"加导出按钮","summary":"用户常要导出数据","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	_ = seedInsightFindings(t, server, projectID, passA)
 
 	rec := httptest.NewRecorder()
@@ -1825,11 +1812,7 @@ func TestAddInsightToTasksConvertsAllValid(t *testing.T) {
 func TestAddInsightToTasksSkipsPendingAndInvalid(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[
-		{"type":"bug","severity":"high","title":"A","summary":"s"},
-		{"type":"optimization","severity":"normal","title":"B","summary":"s"},
-		{"type":"feature","severity":"low","title":"C","summary":"s"}
-	]`
+	passA := `[{"type":"bug","severity":"high","title":"A","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"optimization","severity":"normal","title":"B","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"low","title":"C","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	findings := seedInsightFindings(t, server, projectID, passA)
 	if len(findings) != 3 {
 		t.Fatalf("seeded findings: got %d want 3", len(findings))
@@ -1869,11 +1852,7 @@ func TestAddInsightToTasksSkipsPendingAndInvalid(t *testing.T) {
 func TestAddInsightToTasksExplicitIDs(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[
-		{"type":"bug","severity":"high","title":"A","summary":"s"},
-		{"type":"optimization","severity":"normal","title":"B","summary":"s"},
-		{"type":"feature","severity":"low","title":"C","summary":"s"}
-	]`
+	passA := `[{"type":"bug","severity":"high","title":"A","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"optimization","severity":"normal","title":"B","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"low","title":"C","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	findings := seedInsightFindings(t, server, projectID, passA)
 	if len(findings) != 3 {
 		t.Fatalf("seeded findings: got %d want 3", len(findings))
@@ -1929,10 +1908,7 @@ func TestAddInsightToTasksUnknownProject(t *testing.T) {
 func TestAddInsightToTasksSecondRunIdempotent(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[
-		{"type":"bug","severity":"high","title":"A","summary":"s"},
-		{"type":"optimization","severity":"normal","title":"B","summary":"s"}
-	]`
+	passA := `[{"type":"bug","severity":"high","title":"A","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"optimization","severity":"normal","title":"B","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	_ = seedInsightFindings(t, server, projectID, passA)
 
 	for i, want := range []int{2, 0} {
@@ -1961,7 +1937,7 @@ func TestAddInsightToTasksSecondRunIdempotent(t *testing.T) {
 func TestConvertInsightToTaskSkipsFindingInvalidatedMidway(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"s"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	// 用旧快照 f 调用转换；落库前该建议已被并发复核判为 invalid。
 	server.setInsightVerification(context.Background(), projectID, f.ID, insightVerifyInvalid, "已修复", time.Now().UTC())
 
@@ -1988,7 +1964,7 @@ func TestConvertInsightToTaskSkipsFindingInvalidatedMidway(t *testing.T) {
 func TestConvertInsightToTaskSkipsFindingPendingMidway(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"s"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	server.setInsightVerification(context.Background(), projectID, f.ID, insightVerifyPending, "", time.Now().UTC())
 
 	task, converted, err := server.convertInsightToTask(context.Background(), projectID, f)
@@ -2013,7 +1989,7 @@ func TestConvertInsightToTaskSkipsFindingPendingMidway(t *testing.T) {
 func TestUpdateInsightFindingRewritesFingerprint(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"原标题","summary":"原说明"}]`
+	passA := `[{"type":"bug","severity":"high","title":"原标题","summary":"原说明","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -2046,7 +2022,7 @@ func TestUpdateInsightFindingConflictOnDuplicateFingerprint(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
 	// 两条不同 finding。
-	passA := `[{"type":"bug","severity":"high","title":"A","summary":"sa"},{"type":"bug","severity":"normal","title":"B","summary":"sb"}]`
+	passA := `[{"type":"bug","severity":"high","title":"A","summary":"sa","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"bug","severity":"normal","title":"B","summary":"sb","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true},{"index":2,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -2088,7 +2064,7 @@ func TestUpdateInsightFindingNotFound(t *testing.T) {
 func TestListInsightsOpenCount(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"a","summary":"s"},{"type":"feature","severity":"low","title":"b","summary":"t"}]`
+	passA := `[{"type":"bug","severity":"high","title":"a","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"low","title":"b","summary":"t","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true},{"index":2,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -2202,7 +2178,7 @@ func TestDeleteInsightFindingsScopeOpenDeletesBeyondListLimit(t *testing.T) {
 func TestRunInsightScanEmitsProgressEvents(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒"},{"type":"feature","severity":"normal","title":"可加导出按钮","summary":"在列表页加一个导出功能"}]`
+	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"normal","title":"可加导出按钮","summary":"在列表页加一个导出功能","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true},{"index":2,"confirmed":false}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	scanID := insertSyncInsightScan(t, server, projectID)
@@ -2244,7 +2220,7 @@ func TestRunInsightScanEmitsProgressEvents(t *testing.T) {
 func TestListInsightsReturnsProgressEventsOnlyWhileRunning(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"a","summary":"s"}]`
+	passA := `[{"type":"bug","severity":"high","title":"a","summary":"s","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	scanID := insertSyncInsightScan(t, server, projectID)
@@ -2481,7 +2457,7 @@ func insightVerificationRow(t *testing.T, server *Server, findingID string) (res
 func TestVerifyInsightFindingMarksValid(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	// 再验证返回 exists:true → 保持有效，reason 写入 note。
 	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[{"id":"` + f.ID + `","exists":true,"reason":"src/List.tsx 里仍未做分页"}]}`}}
@@ -2512,7 +2488,7 @@ func TestVerifyInsightFindingMarksValid(t *testing.T) {
 func TestVerifyInsightFindingMarksInvalidAndHides(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[{"id":"` + f.ID + `","exists":false,"reason":"已加分页，位于 src/List.tsx"}]}`}}
 	runSyncInsightVerify(t, server, projectID, []string{f.ID})
@@ -2539,7 +2515,7 @@ func TestVerifyInsightFindingMarksInvalidAndHides(t *testing.T) {
 func TestVerifyInsightFindingRunnerErrorMarksFailed(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	// 再验证时 runner 直接失败（环境问题）→ 不重试、标 failed，note 提示"建议验证失败"。
 	calls := 0
@@ -2564,7 +2540,7 @@ func TestVerifyInsightFindingRunnerErrorMarksFailed(t *testing.T) {
 func TestVerifyInsightFindingBadJSONRetries(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	bad := "我核对了代码，结论稍后给出。"
 	good := `{"findings":[{"id":"` + f.ID + `","exists":true,"reason":"确认仍在"}]}`
@@ -2583,7 +2559,7 @@ func TestVerifyInsightFindingBadJSONRetries(t *testing.T) {
 func TestVerifyInsightFindingMissingResultMarksFailed(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	// agent 给了合法 JSON 却漏掉该 id → 契约违约触发修正重试，重试仍漏 → 标 failed，
 	// 不能静默留在 pending（两份输出都漏，才走到"重试后仍不可用"）。
@@ -2606,7 +2582,7 @@ func TestVerifyInsightFindingMissingResultMarksFailed(t *testing.T) {
 func TestReverifyInvalidatedFindingFailureStaysInvalid(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	// 第一次复验判失效。
 	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[{"id":"` + f.ID + `","exists":false,"reason":"已加分页"}]}`}}
 	runSyncInsightVerify(t, server, projectID, []string{f.ID})
@@ -2638,7 +2614,7 @@ func TestReverifyInvalidatedFindingFailureStaysInvalid(t *testing.T) {
 func TestReverifyInvalidatedFindingValidRestoresIt(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[{"id":"` + f.ID + `","exists":false,"reason":"已加分页"}]}`}}
 	runSyncInsightVerify(t, server, projectID, []string{f.ID})
 
@@ -2779,7 +2755,7 @@ func TestCancelInsightScanEndToEnd(t *testing.T) {
 func TestVerifyInsightFindingUndeterminedVerdictMarksFailed(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	// agent 返回了该 id 却缺 exists 字段（违约输出）：必须标 failed，不能默认 false
 	// 把仍有效的建议误判为已失效隐藏。
@@ -2795,7 +2771,7 @@ func TestVerifyInsightFindingUndeterminedVerdictMarksFailed(t *testing.T) {
 func TestVerifyInsightFindingBatch(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"A","summary":"sa"},{"type":"feature","severity":"normal","title":"B","summary":"sb"}]`
+	passA := `[{"type":"bug","severity":"high","title":"A","summary":"sa","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"},{"type":"feature","severity":"normal","title":"B","summary":"sb","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true},{"index":2,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -2854,7 +2830,7 @@ func TestVerifyInsightFindingsSplitsLargeBatch(t *testing.T) {
 func TestTriggerVerifyInsightRejectsConcurrent(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	server.insightMu.Lock()
 	server.insightActive[insightRunKey(projectID, insightRunVerify)] = true
@@ -2872,7 +2848,7 @@ func TestTriggerVerifyInsightRejectsConcurrent(t *testing.T) {
 func TestVerifyInsightFindingsAllowedWhileScanRunning(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	// 扫描在跑：内存占用 + DB 里一条 running 扫描行（与 triggerInsightScan 的判定口径一致）。
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
@@ -3046,7 +3022,7 @@ func TestReserveInsightQuotaWithWait(t *testing.T) {
 func TestTriggerVerifyInsightRejectsOccupiedWorkspace(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	release, acquired := server.acquireProjectWorkspace(projectID, "run:active")
 	if !acquired {
 		t.Fatal("acquire test workspace lease")
@@ -3087,7 +3063,7 @@ func TestTriggerVerifyInsightNoTargets(t *testing.T) {
 func TestTriggerVerifyInsightAcceptsAndPersistsPending(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	var mu sync.Mutex
 	calls := 0
@@ -3196,7 +3172,7 @@ func TestInsightVerifyAdvancesProgressAcrossBatches(t *testing.T) {
 
 	var items []string
 	for i := 0; i < 12; i++ {
-		items = append(items, fmt.Sprintf(`{"type":"bug","severity":"high","title":"建议%02d","summary":"s%d"}`, i+1, i+1))
+		items = append(items, fmt.Sprintf(`{"type":"bug","severity":"high","title":"建议%02d","summary":"s%d","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}`, i+1, i+1))
 	}
 	findings := seedInsightFindings(t, server, projectID, "["+strings.Join(items, ",")+"]")
 	if len(findings) != 12 {
@@ -3284,7 +3260,7 @@ func TestInsightVerifyAdvancesProgressAcrossBatches(t *testing.T) {
 func TestUpdateInsightFindingResetsVerification(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"原标题","summary":"原说明"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"原标题","summary":"原说明","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[{"id":"` + f.ID + `","exists":true,"reason":"仍在"}]}`}}
 	runSyncInsightVerify(t, server, projectID, []string{f.ID})
@@ -3333,7 +3309,7 @@ func TestVerifyRepairPromptIncludesCompleteCandidates(t *testing.T) {
 func TestVerifyInsightFindingUncertainVerdictMarksFailed(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	server.runner = &insightScriptRunner{outputs: []string{`{"findings":[{"id":"` + f.ID + `","status":"uncertain","reason":"无法读取相关实现"}]}`}}
 	runSyncInsightVerify(t, server, projectID, []string{f.ID})
 
@@ -3346,7 +3322,7 @@ func TestVerifyInsightFindingUncertainVerdictMarksFailed(t *testing.T) {
 func TestRunInsightScanReactivatesRediscoveredInvalidFinding(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx"}]`
+	passA := `[{"type":"bug","severity":"high","title":"列表加载很慢","summary":"列表页打开要等好几秒","fileHint":"src/List.tsx","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`
 	passB := `{"findings":[{"index":1,"confirmed":true}]}`
 	server.runner = &insightScriptRunner{outputs: []string{passA, passB}}
 	_ = insertSyncInsightScan(t, server, projectID)
@@ -3369,7 +3345,7 @@ func TestRunInsightScanReactivatesRediscoveredInvalidFinding(t *testing.T) {
 func TestResolveVerifyTargetsDedupesExplicitIDs(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","severity":"high","title":"真问题","summary":"存在","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 
 	// 同一 id 传两次 → 只验证一次（去重），不重复出现在 agent prompt。
 	targets, err := server.resolveVerifyTargets(context.Background(), projectID, []string{f.ID, f.ID})
@@ -3415,7 +3391,7 @@ func TestInsightUntrackedContentHashTracksContentChanges(t *testing.T) {
 func TestInsightVerifyCancelledRunPersistsCancelled(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","title":"needs review","summary":"still exists"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","title":"needs review","summary":"still exists","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	now := time.Now().UTC()
 	server.setInsightVerification(context.Background(), projectID, f.ID, insightVerifyPending, "", now)
 	verificationID := "cancelled-verify"
@@ -3463,7 +3439,7 @@ func TestInsightScanCancelledRunPersistsCancelled(t *testing.T) {
 func TestInsightPendingOnlyAppliesToSelectedRevision(t *testing.T) {
 	server := newTestServer(t)
 	projectID := insightTestProject(t, server)
-	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","title":"needs review","summary":"still exists"}]`)
+	f := seedInsightFinding(t, server, projectID, `[{"type":"bug","title":"needs review","summary":"still exists","evidence":"测试代码依据","acceptanceCriteria":"按复现步骤检查预期结果"}]`)
 	targets, err := server.resolveVerifyTargets(context.Background(), projectID, []string{f.ID})
 	if err != nil || len(targets) != 1 {
 		t.Fatalf("resolve target: targets=%d err=%v", len(targets), err)

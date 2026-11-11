@@ -1526,6 +1526,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/api/projects/{projectID}/scheduled-tasks", s.listScheduledTasks)
 	r.Post("/api/projects/{projectID}/scheduled-tasks", s.createScheduledTask)
 	r.Post("/api/projects/{projectID}/insights/scan", s.triggerInsightScan)
+	r.Get("/api/projects/{projectID}/insights/engines", s.insightEngines)
 	r.Post("/api/projects/{projectID}/insights/cancel", s.cancelInsightScan)
 	r.Post("/api/projects/{projectID}/insights/verify", s.verifyInsightFindings)
 	r.Post("/api/projects/{projectID}/insights/to-task", s.addInsightToTasks)
@@ -2083,7 +2084,12 @@ create index if not exists conversation_handoffs_source_status on conversation_h
 	if err := ensureColumn(ctx, s.db, "project_insights", "verified_at", "datetime"); err != nil {
 		return fmt.Errorf("add insight verified at: %w", err)
 	}
-	// project_insight_suppressions：本项目内"永不再报告"的建议指纹。目前只有一种来源——
+	for _, column := range []string{"evidence", "acceptance_criteria"} {
+		if err := ensureColumn(ctx, s.db, "project_insights", column, "text not null default ''"); err != nil {
+			return fmt.Errorf("add insight %s: %w", column, err)
+		}
+	}
+	// project_insight_suppressions：编辑旧文案映射，只在建议/任务仍需防重时生效。
 	// 用户编辑了建议（title/summary 变了），旧指纹（编辑前的原文）记进来，否则下次扫描
 	// 会把编辑前的写法当成一条新建议再报一次，与编辑后的卡片并存。
 	// 用户显式「不再提示」不走这张表：它落在 project_insights.status='dismissed' 上，
@@ -2096,6 +2102,12 @@ create index if not exists conversation_handoffs_source_status on conversation_h
 		primary key (project_id, fingerprint)
 	);`); err != nil {
 		return fmt.Errorf("create insight suppressions: %w", err)
+	}
+	if err := ensureColumn(ctx, s.db, "project_insight_suppressions", "canonical_fingerprint", "text not null default ''"); err != nil {
+		return fmt.Errorf("add insight canonical fingerprint: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `create index if not exists insight_suppressions_canonical on project_insight_suppressions(project_id,canonical_fingerprint)`); err != nil {
+		return fmt.Errorf("index insight canonical fingerprint: %w", err)
 	}
 	// 服务启动时，上次遗留的 pending 验证必然已不在此进程内跑（进程重启即中止），
 	// 一律回退为未验证，避免前端对该建议永久轮询"验证中"。
@@ -8804,6 +8816,8 @@ func localizedErrorText(err error, fallback string) string {
 		"task export file version is not supported":                             "任务导出文件版本不受支持，请升级 Milevia 后重试。",
 		"task export contains no tasks":                                         "任务导出文件里没有任务。",
 		"task export contains too many tasks":                                   "任务导出文件包含的任务过多，请分批导出后再导入。",
+		"task export selection contains too many tasks":                         "当前导出范围超过 2000 条任务，请缩小导出范围。",
+		"task export selection is too large":                                    "当前导出范围超过 64MB，无法生成可导入的文件，请缩小导出范围。",
 		"task export file is too large":                                         "任务导出文件过大，请分批导出后再导入。",
 		"duplicate task key in export file":                                     "任务导出文件里的任务编号重复或格式不正确。",
 		"task export references an unknown dependency":                          "任务导出文件里的依赖指向了不存在的任务。",

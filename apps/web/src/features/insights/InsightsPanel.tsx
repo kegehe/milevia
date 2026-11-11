@@ -6,7 +6,7 @@ import { AgentLogo } from "../../components/AgentLogo";
 import { agentLogoKey } from "../../lib/cli-tools-view";
 import { useDocumentVisible } from "../../lib/useDocumentVisible";
 import type { AgentID, RunnerInfo } from "../../lib/types";
-import { catalogAgentID, knownAgentID, runnerAgentReady, useAgentCatalog, type AgentCatalogEntry } from "../../lib/agent-registry";
+import { catalogAgentID, runnerAgentReady, type AgentCatalogEntry } from "../../lib/agent-registry";
 import {
   filterFindingsByType,
   insightFindingCounts,
@@ -67,7 +67,7 @@ function TypeIcon({ type }: { type: InsightType }) {
 // ——点「编辑」「查看文件」不该顺带把这张卡选上。真正的勾选控件是卡片上那颗原生复选框
 // （可 Tab 到、可用空格切换），整卡点击只是鼠标的顺路。
 function isCardControl(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement && target.closest("button,a,input,select,textarea,label") !== null;
+  return target instanceof HTMLElement && target.closest("button,a,input,select,textarea,label,summary") !== null;
 }
 
 // 把进度事件时间戳格式化为 HH:MM:SS（日志行紧凑展示）。
@@ -89,7 +89,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
   onOpenFile?: (path: string) => void;
 }) {
   // 工具目录给出平台支持项；当前项目 Runner 的状态决定哪些项实际可用于分析。
-  const agentOptions = useAgentCatalog();
+  const [agentOptions, setAgentOptions] = useState<AgentCatalogEntry[]>([]);
   const [agentRunner, setAgentRunner] = useState<RunnerInfo | null>(null);
   const [agentRunnerLoading, setAgentRunnerLoading] = useState(true);
   const [agentRunnerError, setAgentRunnerError] = useState("");
@@ -101,6 +101,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
   const [openCount, setOpenCount] = useState(0);
   const [truncated, setTruncated] = useState(false);
   const [findingsLimit, setFindingsLimit] = useState(0);
+  const [foldedTruncated, setFoldedTruncated] = useState(false);
   const [filter, setFilter] = useState<InsightFilter>("all");
   const [theme, setTheme] = useState<InsightTheme>("");
   const [agent, setAgent] = useState<InsightAgent>(defaultAgentID ?? "claude-code");
@@ -147,11 +148,15 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
   useEffect(() => {
     let cancelled = false;
     setAgentRunner(null);
+    setAgentOptions([]);
     setAgentRunnerLoading(true);
     setAgentRunnerError("");
-    void request<RunnerInfo>(`/api/runners/${encodeURIComponent(runnerID)}/status`)
-      .then((runner) => {
-        if (!cancelled) setAgentRunner(runner);
+    void request<{ entries: AgentCatalogEntry[]; runner: RunnerInfo }>(`/api/projects/${encodeURIComponent(projectID)}/insights/engines`)
+      .then(({ entries, runner }) => {
+        if (!cancelled) {
+          setAgentOptions(entries);
+          setAgentRunner(runner);
+        }
       })
       .catch((cause) => {
         if (!cancelled) setAgentRunnerError(cause instanceof Error ? cause.message : "无法读取当前环境的分析引擎状态");
@@ -160,7 +165,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
         if (!cancelled) setAgentRunnerLoading(false);
       });
     return () => { cancelled = true; };
-  }, [request, runnerID]);
+  }, [projectID, request, runnerID]);
 
   useEffect(() => {
     if (agentRunnerLoading || availableAgentOptions.length === 0) return;
@@ -179,18 +184,17 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
     const cursorQuery = cursorScan !== null && sinceSeq > 0
       ? `?sinceScan=${encodeURIComponent(cursorScan)}&sinceSeq=${sinceSeq}`
       : "";
-    const res = await request<{ defaultAgent?: string; scan: InsightScan | null; findings: InsightFinding[]; events: InsightEvent[]; hasScan: boolean; suppressedCount: number; openCount: number; invalidated?: InsightFinding[]; dismissed?: InsightFinding[]; truncated?: boolean; findingsLimit?: number; verification?: InsightVerificationRun | null }>(
+    const res = await request<{ defaultAgent?: string; scan: InsightScan | null; findings: InsightFinding[]; events: InsightEvent[]; hasScan: boolean; suppressedCount: number; openCount: number; invalidated?: InsightFinding[]; dismissed?: InsightFinding[]; truncated?: boolean; findingsLimit?: number; foldedTruncated?: boolean; verification?: InsightVerificationRun | null }>(
       `/api/projects/${projectID}/insights${cursorQuery}`,
     );
     if (!mountedRef.current || version !== requestVersion.current) return;
     setScan(res.scan);
     if (!agentSelectionInitializedRef.current) {
       agentSelectionInitializedRef.current = true;
-      const initialAgent = defaultAgentID ?? knownAgentID(res.scan?.agent ?? res.defaultAgent);
-      // 服务端可能报出一个前端还不认识的工具；那种情况保持当前选择，
-      // 而不是回落成某一个已知工具（那会把"不知道"说成"就是它"）。
+      const initialAgent = defaultAgentID ?? res.scan?.agent ?? res.defaultAgent;
+      // 最终由目标电脑返回的可用目录校正选择，不依赖手机端同源的桌面目录。
       if (initialAgent) {
-        setAgent(initialAgent);
+        setAgent(initialAgent as InsightAgent);
       }
     }
     setFindings(res.findings);
@@ -207,6 +211,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
     });
     setTruncated(res.truncated === true);
     setFindingsLimit(res.findingsLimit ?? 0);
+    setFoldedTruncated(res.foldedTruncated === true);
     setVerification(res.verification ?? null);
     // 同步 in-flight 集合：只保留当前确实 pending 的建议。结果到达（valid/invalid/
     // failed）后自动清除，轮询随之停止；POST 后立即刷新也能借此拿到 pending。
@@ -259,14 +264,17 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
     void loadInsights().catch((cause) => { if (mountedRef.current) fail(cause instanceof Error ? cause.message : "无法加载优化建议"); });
   }, [loadInsights, fail]);
 
-  // 扫描进行中或任一建议验证中时轮询，直到完成/失败。2s 一拉让进度日志与
-  // 验证结果保持流动。
+  // 扫描/复核及关联任务进行中时保持读数更新。否则任务完成后，旧的关联状态
+  // 会让「添加到任务」一直禁用，直到用户重新打开面板。
   const anyVerifying =
     verification?.status === "running" ||
     verifyInFlight.size > 0 ||
     findings.some((f) => f.verificationResult === "pending") ||
     invalidated.some((f) => f.verificationResult === "pending") ||
     dismissed.some((f) => f.verificationResult === "pending");
+  const hasActiveLinkedTask = findings.some((finding) =>
+    !!finding.linkedTaskStatus && finding.linkedTaskStatus !== "done" && finding.linkedTaskStatus !== "cancelled",
+  );
   // 页面不可见（窗口最小化/切到后台标签页）时暂停轮询，避免空耗请求与电量；
   // 仅在从「不可见」回到「可见」的那一下补拉一次，补齐后台期间服务器侧已推进的状态。
   const documentVisible = useDocumentVisible();
@@ -275,13 +283,13 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
     const becameVisible = documentVisible && !prevDocumentVisible.current;
     prevDocumentVisible.current = documentVisible;
     if (!documentVisible) return;
-    if (scan?.status !== "running" && !anyVerifying) return;
     if (becameVisible) void loadInsights().catch(() => undefined);
+    if (scan?.status !== "running" && !anyVerifying && !hasActiveLinkedTask) return;
     const interval = window.setInterval(() => {
       void loadInsights().catch(() => undefined);
     }, 2_000);
     return () => window.clearInterval(interval);
-  }, [documentVisible, scan?.status, anyVerifying, loadInsights]);
+  }, [documentVisible, scan?.status, anyVerifying, hasActiveLinkedTask, loadInsights]);
 
   // 新进度事件到达时把日志滚到底部，始终展示最新一条分析信息。
   useEffect(() => {
@@ -396,15 +404,15 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
       });
       if (res.created > 0) {
         const parts = [`已将 ${res.created} 条建议添加为任务`];
-        if (res.skipped > 0) parts.push(`跳过 ${res.skipped} 条复核中的建议`);
+        if (res.skipped > 0) parts.push(`跳过 ${res.skipped} 条当前不可转换的建议`);
         if (res.failed > 0) parts.push(`${res.failed} 条失败`);
         toast.success(parts.join("，"));
       } else if (res.failed > 0) {
         const parts = [`添加失败（${res.failed} 条），请重试`];
-        if (res.skipped > 0) parts.unshift(`跳过 ${res.skipped} 条复核中的建议`);
+        if (res.skipped > 0) parts.unshift(`跳过 ${res.skipped} 条当前不可转换的建议`);
         toast.error(parts.join("，"));
       } else if (res.skipped > 0) {
-        toast.info(`当前没有可添加的建议，跳过 ${res.skipped} 条复核中的`);
+        toast.info(`当前没有可添加的建议，跳过 ${res.skipped} 条当前不可转换的建议`);
       } else {
         toast.info("当前没有可添加为任务的建议");
       }
@@ -842,9 +850,10 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
 
           {truncated && (
             <section className="insights-notice" role="status">
-              有效建议共 {openCount} 条，列表仅显示最近 {findingsLimit || openCount} 条；处理掉一部分后即可看到其余。「全部添加为任务」「验证全部」「全部删除」作用于全部 {openCount} 条，不只是上面看到的这些。
+              有效建议共 {openCount} 条，列表仅显示最近 {findingsLimit} 条；处理掉一部分后即可看到其余。「全部添加为任务」「验证全部」「全部删除」作用于全部 {openCount} 条，不只是上面看到的这些。
             </section>
           )}
+          {foldedTruncated && <section className="insights-notice" role="status">已失效或已忽略的建议内容较多，本次仅显示部分；清理部分记录后可查看其余。</section>}
 
           {scan && scan.rejected && scan.rejected.length > 0 && showRejected && (
             <section className="insights-rejected" aria-label="被核实剔除的候选">
@@ -1031,7 +1040,7 @@ export function InsightsPanel({ projectID, runnerID, request, fail, onOpenFile, 
           title="删除全部有效建议"
           message={<>
             确定删除当前全部 <b>{openCount}</b> 条有效建议？删除后无法恢复，下次扫描时这些问题可能重新出现（如果它们还没被修好）。「已失效 / 已忽略」折叠区里的建议不受影响。
-            {truncated && <>列表当前只显示前 {findingsLimit || openCount} 条，本次会一并删除列表之外的有效建议。</>}
+            {truncated && <>列表当前只显示前 {findingsLimit} 条，本次会一并删除列表之外的有效建议。</>}
             {running && <>分析仍在进行，结束后新发现的建议仍会出现在列表里。</>}
           </>}
           confirmLabel="全部删除"
@@ -1114,7 +1123,7 @@ function InsightVerifyBadge({ result, note, verifiedAt }: {
   return null;
 }
 
-function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismissed, fail, invalidated = false, dismissed = false, selectable = false, selected = false, onToggleSelect, verifying = false, canVerify = true, onVerify, onOpenFile }: {
+export function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismissed, fail, invalidated = false, dismissed = false, selectable = false, selected = false, onToggleSelect, verifying = false, canVerify = true, onVerify, onOpenFile }: {
   finding: InsightFinding;
   projectID: string;
   request: Request;
@@ -1142,7 +1151,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
   const linkedLabel = insightLinkedTaskLabel(finding);
   const [editing, setEditing] = useState(false);
   const [confirming, setConfirming] = useState(false);
-  const [draft, setDraft] = useState({ title: finding.title, summary: finding.summary, severity, type });
+  const [draft, setDraft] = useState({ title: finding.title, summary: finding.summary, evidence: finding.evidence ?? "", acceptanceCriteria: finding.acceptanceCriteria ?? "", severity, type });
   const [saving, setSaving] = useState(false);
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -1151,7 +1160,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
   }, []);
 
   const beginEdit = () => {
-    setDraft({ title: finding.title, summary: finding.summary, severity, type });
+    setDraft({ title: finding.title, summary: finding.summary, evidence: finding.evidence ?? "", acceptanceCriteria: finding.acceptanceCriteria ?? "", severity, type });
     setEditing(true);
   };
 
@@ -1166,7 +1175,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
       await request(`/api/projects/${projectID}/insights/${finding.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, summary: draft.summary.trim(), severity: draft.severity, type: draft.type }),
+        body: JSON.stringify({ title, summary: draft.summary.trim(), evidence: draft.evidence.trim(), acceptanceCriteria: draft.acceptanceCriteria.trim(), severity: draft.severity, type: draft.type }),
       });
       setEditing(false);
       onDeleted(); // 触发父级 loadInsights 刷新
@@ -1191,9 +1200,8 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
   };
 
   // 把建议转为任务：后端在同一事务里创建任务并硬删该建议，刷新后从列表消失。
-  // 【规则 · 勿改】转任务后必须硬删（而非软删/标记已处理/仅隐藏）：下次扫描会重新
-  // 报告同一问题（指纹消失），因为任务执行完之前问题可能仍然存在。改动这里会破坏
-  // "问题可被再次发现"的语义。后端对应注释见 insights.go convertInsightToTask。
+  // 转任务后仍硬删建议；扫描跳过已有未完成任务覆盖的问题，任务完成或取消后仍可
+  // 重新发现尚未解决的问题。任务状态不等于修复证据，不能永久抑制该问题。
   // 同一问题已有未完成任务时后端会拒绝（409），避免反复堆重复任务。
   const addToTask = async () => {
     if (saving) return;
@@ -1230,6 +1238,14 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
           <select value={draft.type} onChange={(e) => setDraft((d) => ({ ...d, type: e.target.value as InsightType }))}>
             {insightTypeOrder.map((t) => <option key={t} value={t}>{insightTypeLabels[t]}</option>)}
           </select>
+        </label>
+        <label className="insight-edit-field">
+          <span>分析依据</span>
+          <textarea value={draft.evidence} onChange={(e) => setDraft((d) => ({ ...d, evidence: e.target.value }))} rows={3} maxLength={2000} placeholder="相关代码、影响及待验证的假设" />
+        </label>
+        <label className="insight-edit-field">
+          <span>验收要点</span>
+          <textarea value={draft.acceptanceCriteria} onChange={(e) => setDraft((d) => ({ ...d, acceptanceCriteria: e.target.value }))} rows={3} maxLength={2000} placeholder="检查步骤与预期结果" />
         </label>
         <label className="insight-edit-field insight-edit-severity">
           <span>严重度</span>
@@ -1272,6 +1288,15 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
       </div>
       <b>{finding.title}</b>
       <p>{finding.summary}</p>
+      {(finding.evidence || finding.acceptanceCriteria) && (
+        <details className="insight-details">
+          <summary>依据与验收要点</summary>
+          <dl>
+            {finding.evidence && <><dt>分析依据</dt><dd>{finding.evidence}</dd></>}
+            {finding.acceptanceCriteria && <><dt>验收要点</dt><dd>{finding.acceptanceCriteria}</dd></>}
+          </dl>
+        </details>
+      )}
       {/* AI 验证的判断依据：仍存在/失效/失败的说明。失败 note 已自带失败语义，不再加前缀。 */}
       {(verificationResult === "valid" || verificationResult === "failed") && finding.verificationNote && (
         <p className={`insight-verify-reason${verificationResult === "failed" ? " failed" : ""}`}>
@@ -1305,7 +1330,7 @@ function InsightsFindingCard({ finding, projectID, request, onDeleted, onDismiss
           </button>
         )}
         {!invalidated && !dismissed && (
-          <button type="button" className="insight-action" onClick={() => void addToTask()} disabled={saving || isVerifying} title="添加到任务，通过任务下发执行（复核中暂不可转）"><AddTaskIcon />添加到任务</button>
+          <button type="button" className="insight-action" onClick={() => void addToTask()} disabled={saving || isVerifying || (!!finding.linkedTaskStatus && finding.linkedTaskStatus !== "done" && finding.linkedTaskStatus !== "cancelled")} title={linkedLabel && finding.linkedTaskStatus !== "done" && finding.linkedTaskStatus !== "cancelled" ? linkedLabel : "添加到任务，通过任务下发执行（复核中暂不可转）"}><AddTaskIcon />添加到任务</button>
         )}
         {!invalidated && (
           <button type="button" className="insight-action" onClick={beginEdit} disabled={saving} title="编辑此建议">编辑</button>

@@ -6,7 +6,7 @@
 
 import { ChangeEvent, FormEvent, useRef, useState } from "react";
 
-import { TASK_TRANSFER_MAX_BYTES, parseTaskTransferFile, previewTaskImport, taskTransferFileName, taskTransferImportBody } from "../../lib/task-transfer";
+import { TASK_TRANSFER_MAX_BYTES, TASK_TRANSFER_MAX_TASKS, parseTaskTransferFile, previewTaskImport, taskTransferFileName, taskTransferImportBody } from "../../lib/task-transfer";
 import type { Request, Task, TaskExportFile, TaskImportResult } from "./task-model";
 
 type TransferMode = "export" | "import";
@@ -41,6 +41,8 @@ export function TaskTransferDialog({ mode, projectID, projectName, tasks, reques
     setLocalError(null);
     try {
       const file = await request<TaskExportFile>(`/api/projects/${projectID}/tasks/export?scope=${scope}`);
+      // 同时保护连接旧服务端的客户端，避免下载无法重新导入的文件。
+      if (file.tasks.length > TASK_TRANSFER_MAX_TASKS) throw new Error("当前导出范围超过 2000 条任务，请缩小导出范围。");
       const name = taskTransferFileName(projectName);
       saveJSONFile(file, name);
       setExported({ name, count: file.tasks.length, dropped: file.droppedDependencies || 0 });
@@ -132,6 +134,7 @@ export function TaskTransferDialog({ mode, projectID, projectName, tasks, reques
       </section></div><footer><button type="button" className="primary" onClick={close}>知道了</button></footer></div>;
     }
     const empty = scope === "active" ? activeCount === 0 : totalCount === 0;
+    const tooMany = (scope === "active" ? activeCount : totalCount) > TASK_TRANSFER_MAX_TASKS;
     return <form className="task-editor-form" onSubmit={(event) => void runExport(event)}>
       <div className="task-form"><section className="task-form-section">
         <div className="task-form-section-head"><h3>导出范围</h3></div>
@@ -141,11 +144,12 @@ export function TaskTransferDialog({ mode, projectID, projectName, tasks, reques
         </div>
         <p className="task-transfer-hint">选择「全部任务」时，已完成 / 已取消的任务也会导出，但导入后会变成待处理。</p>
         <p className="task-transfer-hint">导出文件包含任务全文，请妥善保管。</p>
+        <p className={tooMany ? "error" : "task-transfer-hint"}>单次导出最多 2000 条、64MB。{tooMany ? "当前范围超过条数上限，请缩小导出范围。" : ""}</p>
         {localError && <p className="error" role="alert">{localError}</p>}
       </section></div>
       <footer>
         <button type="button" className="secondary" disabled={busy} onClick={close}>取消</button>
-        <button className="primary" disabled={busy || empty}>{busy ? "导出中" : empty ? "没有可导出的任务" : "导出"}</button>
+        <button className="primary" disabled={busy || empty || tooMany}>{busy ? "导出中" : empty ? "没有可导出的任务" : "导出"}</button>
       </footer>
     </form>;
   }
@@ -197,6 +201,7 @@ function errorMessage(cause: unknown, fallback: string): string {
 // 延迟 revoke：立即释放偶尔会让下载拿不到内容。
 function saveJSONFile(value: unknown, fileName: string) {
   const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+  if (blob.size > TASK_TRANSFER_MAX_BYTES) throw new Error("当前导出范围超过 64MB，无法生成可导入的文件，请缩小导出范围。");
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;

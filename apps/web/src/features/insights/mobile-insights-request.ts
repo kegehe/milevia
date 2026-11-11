@@ -39,6 +39,7 @@ interface ParsedCall {
  */
 const ROUTES = {
   "": { op: "insights.list", method: "GET" },
+  "/engines": { op: "insights.engines", method: "GET" },
   "/scan": { op: "insights.scan", method: "POST" },
   "/cancel": { op: "insights.cancel", method: "POST" },
   "/verify": { op: "insights.verify", method: "POST" },
@@ -74,7 +75,9 @@ export function createMobileInsightsRequest(options: MobileInsightsRequestOption
   const { transport } = options;
 
   async function call(op: string, params: unknown): Promise<unknown> {
-    const reply: MobileRpcReply = await transport(op, params);
+    // 登记扫描/复核前要探测工具（45 秒）；中继默认的 20 秒装不下。
+    const timeoutMs = op === "insights.engines" || op === "insights.scan" || op === "insights.verify" ? 60_000 : undefined;
+    const reply: MobileRpcReply = await transport(op, params, timeoutMs);
     if (reply?.ok) return reply.data;
     // 业务失败：把服务端那句面向用户的中文**原样**抛出去（它已经是给用户看的）。
     // InsightsPanel 只按 message 展示，不按 HTTP 码分支 —— 与文件适配器要区分
