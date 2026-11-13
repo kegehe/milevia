@@ -493,12 +493,23 @@ func (rejectingWriteCloser) Close() error              { return nil }
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
+	return newTestServerWithWSLProbe(t, false)
+}
+
+// newTestServerWithWSLProbe 构造测试夹具；realWSLProbe 为 true 时保留真实的 WSL 探测。
+//
+// 默认关掉探测是刻意的：Windows 上每个 Server 都要跑两条 wsl.exe（实测每条 0.1~0.2s，
+// 冷启动可达数秒），全量用例累计约 1200 次注册、折合四五分钟。需要真实 WSL 的专项
+// 用例（如 wsl-local 注册、WSL 项目管理器）显式传 true。
+func newTestServerWithWSLProbe(t *testing.T, realWSLProbe bool) *Server {
+	t.Helper()
 	hookPath, err := filepath.Abs("../../../../scripts/claude-approval-hook.sh")
 	if err != nil {
 		t.Fatalf("resolve hook path: %v", err)
 	}
 	server, err := New(context.Background(), Config{
 		DisableSupervisionWorker: true,
+		DisableWSLProbe:          !realWSLProbe,
 		WorkspaceGuardDir:        t.TempDir(),
 		DatabasePath:             filepath.Join(t.TempDir(), "auto.db"),
 		AllowedRoot:              t.TempDir(),
@@ -3134,7 +3145,7 @@ create table messages (id text primary key, conversation_id text not null refere
 	if err != nil {
 		t.Fatalf("resolve hook path: %v", err)
 	}
-	server, err := New(context.Background(), Config{DatabasePath: databasePath, AllowedRoot: t.TempDir(), ClaudePath: "claude", ControlURL: "http://127.0.0.1:8080", ApprovalHook: hookPath})
+	server, err := New(context.Background(), Config{DatabasePath: databasePath, AllowedRoot: t.TempDir(), ClaudePath: "claude", ControlURL: "http://127.0.0.1:8080", ApprovalHook: hookPath, DisableWSLProbe: true})
 	if err != nil {
 		t.Fatalf("migrate legacy database: %v", err)
 	}
@@ -11448,6 +11459,8 @@ func seedServerWithProject(t *testing.T) (*Server, string) {
 		ClaudePath:     "echo",
 		PermissionMode: "acceptEdits",
 		ControlURL:     "http://127.0.0.1:8080",
+		// 夹具不探测真实 WSL，理由见 newTestServerWithWSLProbe。
+		DisableWSLProbe: true,
 	}
 	ctx := context.Background()
 	server, err := NewWithRunner(ctx, config, runnerFunc(func(ctx context.Context, req AgentRunRequest, sink AgentRunSink) error {

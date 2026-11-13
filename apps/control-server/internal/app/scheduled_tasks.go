@@ -135,7 +135,8 @@ skills_snapshot text not null default '[]',
 );
 create index if not exists scheduled_tasks_due on scheduled_tasks(enabled,next_run_at);
 create index if not exists scheduled_task_runs_task_created on scheduled_task_runs(scheduled_task_id,created_at desc);
-create index if not exists scheduled_task_runs_run on scheduled_task_runs(run_id);`)
+create index if not exists scheduled_task_runs_run on scheduled_task_runs(run_id);
+create index if not exists scheduled_task_runs_conversation on scheduled_task_runs(conversation_id);`)
 	if err != nil {
 		return fmt.Errorf("migrate scheduled tasks: %w", err)
 	}
@@ -774,7 +775,9 @@ where scheduled_task_id='' and action_url not like '%/tasks/schedules/%'
 	)`, taskID, scheduledRunQueued); err != nil {
 		return false, err
 	}
-	result, err := tx.ExecContext(ctx, `update scheduled_task_runs set status=?,failure_reason=?,finished_at=? where scheduled_task_id=? and status=? and run_id=''`, scheduledRunStopped, "任务在开始前已暂停。", now, taskID, scheduledRunQueued)
+	// 会话已删，引用也要一起失效：留一个指向不存在会话的 conversation_id，运行历史里
+	// 就会有一条点不开的“查看”，失败/恢复路径清引用时也会对不上。
+	result, err := tx.ExecContext(ctx, `update scheduled_task_runs set status=?,failure_reason=?,finished_at=?,conversation_id='' where scheduled_task_id=? and status=? and run_id=''`, scheduledRunStopped, "任务在开始前已暂停。", now, taskID, scheduledRunQueued)
 	if err != nil {
 		return false, err
 	}
@@ -1188,6 +1191,9 @@ func (s *Server) launchScheduledTaskRun(ctx context.Context, scheduledRunID stri
 	record := &runStartRecord{Scheduled: &run}
 	_, _, _, status, err := s.startMessage(ctx, conversation.ID, run.PromptSnapshot, "scheduled:"+run.ID, record)
 	if err == nil {
+		// 运行已在 startMessage 里提交（会话状态为 running），此时才裁剪历史：
+		// 新会话不会成为被淘汰的对象，也不会为一次从未开始的派发腾位置。
+		s.pruneScheduledProjectHistory(ctx, project.ID)
 		return
 	}
 	// 判据取错误类型，不比英文原文：这条以前用 strings.Contains 匹配
@@ -1198,7 +1204,7 @@ func (s *Server) launchScheduledTaskRun(ctx context.Context, scheduledRunID stri
 		_, _ = s.db.ExecContext(context.Background(), `update scheduled_task_runs set failure_reason=? where id=? and status=? and run_id=''`, reason, run.ID, scheduledRunQueued)
 		return
 	}
-	s.failScheduledTaskRun(scheduledRunID, err.Error())
+	s.failScheduledTaskRun(scheduledRunID, errorText(err))
 }
 
 // scheduledRunRetryReason 判断一次派发失败属于"稍后再试"还是"真失败"。
@@ -1263,13 +1269,21 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 	if existingConversationID != "" {
 		var existing Conversation
 		err = tx.QueryRowContext(ctx, `select id,project_id,claude_session_id,agent_id,agent_session_id,agent_runtime_id,agent_profile_revision_id,project_agent_route_revision_id,execution_policy,status,permission_mode,model_override,title,last_activity_at,claude_initialized,agent_initialized,is_current,created_at from conversations where id=?`, existingConversationID).Scan(&existing.ID, &existing.ProjectID, &existing.ClaudeSessionID, &existing.AgentID, &existing.AgentSessionID, &existing.AgentRuntimeID, &existing.AgentProfileRevisionID, &existing.ProjectAgentRouteRevisionID, &existing.ExecutionPolicy, &existing.Status, &existing.PermissionMode, &existing.ModelOverride, &existing.Title, &existing.LastActivityAt, &existing.ClaudeInitialized, &existing.AgentInitialized, &existing.IsCurrent, &existing.CreatedAt)
-		if err != nil {
+		if err == nil {
+			if err := tx.Commit(); err != nil {
+				return Conversation{}, err
+			}
+			return existing, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
 			return Conversation{}, err
 		}
-		if err := tx.Commit(); err != nil {
+		// 占位会话在等待期间被删掉了（用户在列表里删了这条还没开始的会话，或旧版本的
+		// 历史裁剪删过它）。不清掉这枚悬空引用，后面"只更新 conversation_id='' 的行"
+		// 会匹配不到，这一轮就再也派发不出去 —— 按"还没有会话"重新建一条。
+		if _, err := tx.ExecContext(ctx, `update scheduled_task_runs set conversation_id='' where id=? and status=? and run_id=''`, run.ID, scheduledRunQueued); err != nil {
 			return Conversation{}, err
 		}
-		return existing, nil
 	}
 	title, agentID, permissionMode := scheduledRunExecutionConfig(task, run)
 	profileRevisionID := run.ProfileRevisionSnapshot
@@ -1290,10 +1304,10 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 	if err := ensureSharedConversationWorkspaceTx(ctx, tx, conversation.ID, conversation.ProjectID, conversation.CreatedAt); err != nil {
 		return Conversation{}, err
 	}
-	prunedHistory, err := pruneConversationHistoryTx(ctx, tx, conversation.ProjectID)
-	if err != nil {
-		return Conversation{}, err
-	}
+	// 这里刻意**不**裁剪历史。此时占位会话还没有任何消息，派发也可能在
+	// startMessage 里被拒绝（服务关闭、Runner 不可用、CLI 正在更新……）；
+	// 一旦此刻裁剪，真实会话已经被挤掉，而失败路径随后删掉占位会话也补不回来。
+	// 裁剪改在运行真正开始之后由 pruneScheduledProjectHistory 执行。
 	result, err := tx.ExecContext(ctx, `update scheduled_task_runs set conversation_id=? where id=? and status=? and conversation_id=''`, conversation.ID, run.ID, scheduledRunQueued)
 	if err != nil {
 		return Conversation{}, err
@@ -1310,28 +1324,148 @@ func (s *Server) createScheduledTaskConversation(ctx context.Context, project Pr
 	}
 	// 为定时运行新建会话后，列表页的会话数/活跃标题会变化。
 	s.broadcastStateEvent(stEvProjects, conversation.ProjectID)
-	// 同一事务里的历史裁剪可能删掉了仍带未读通知的旧会话。
-	if prunedHistory {
-		s.broadcastStateEvent(stEvNotifications, conversation.ProjectID)
-	}
 	return conversation, nil
 }
 
+// failScheduledTaskRun marks a queued occurrence failed and drops the
+// placeholder conversation it never used. The placeholder is created before the
+// dispatch is admitted, so a start refused by startMessage (service shutting
+// down, runner unavailable, CLI being updated, a forced stop still in flight…)
+// would otherwise leave an empty "Scheduled: …" entry behind. Those entries
+// accumulate on every failure and, with the project at its 100-conversation
+// cap, each one evicts a real conversation from the history.
 func (s *Server) failScheduledTaskRun(runID, reason string) {
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(context.Background(), `update scheduled_task_runs set status=?,failure_reason=?,finished_at=? where id=? and status=?`, scheduledRunFailed, reason, now, runID, scheduledRunQueued)
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("fail scheduled task run %s: %v", runID, err)
+		return
+	}
+	defer tx.Rollback()
+	// agentRunID 非空表示这一轮已经真正派发过（用户消息已提交），它的会话是历史，
+	// 不能删；只有"还没派发"的占位会话才归失败路径清理。任务在这一刻可能已经被
+	// 删除，所以任务与项目单独查：查不到不影响把这次运行收成失败。
+	var conversationID, agentRunID, taskID, projectID string
+	err = tx.QueryRowContext(ctx, `select coalesce(conversation_id,''),run_id,scheduled_task_id from scheduled_task_runs where id=? and status=?`, runID, scheduledRunQueued).Scan(&conversationID, &agentRunID, &taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	if err != nil {
+		log.Printf("fail scheduled task run %s: %v", runID, err)
+		return
+	}
+	_ = tx.QueryRowContext(ctx, `select project_id from scheduled_tasks where id=?`, taskID).Scan(&projectID)
+	releasedConversation := false
+	if agentRunID == "" && conversationID != "" {
+		releasedConversation, err = deleteScheduledPlaceholderConversationTx(ctx, tx, conversationID)
+		if err != nil {
+			log.Printf("fail scheduled task run %s: remove placeholder conversation: %v", runID, err)
+			return
+		}
+	}
+	statement := `update scheduled_task_runs set status=?,failure_reason=?,finished_at=? where id=? and status=?`
+	args := []any{scheduledRunFailed, reason, now, runID, scheduledRunQueued}
+	if releasedConversation {
+		statement = `update scheduled_task_runs set status=?,failure_reason=?,finished_at=?,conversation_id='' where id=? and status=?`
+	}
+	result, err := tx.ExecContext(ctx, statement, args...)
 	if err != nil {
 		log.Printf("fail scheduled task run %s: %v", runID, err)
 		return
 	}
 	changed, err := result.RowsAffected()
-	if err == nil && changed == 1 {
-		_, _ = s.db.ExecContext(context.Background(), `update scheduled_tasks set last_run_at=?,updated_at=? where id=(select scheduled_task_id from scheduled_task_runs where id=?)`, now, now, runID)
-		s.notifyScheduledTaskRun(runID)
-		var projectID string
-		if err := s.db.QueryRowContext(context.Background(), `select t.project_id from scheduled_tasks t join scheduled_task_runs r on r.scheduled_task_id=t.id where r.id=?`, runID).Scan(&projectID); err == nil {
-			s.broadcastStateEvent(stEvScheduledTasks, projectID)
+	if err != nil || changed != 1 {
+		if err != nil {
+			log.Printf("fail scheduled task run %s: %v", runID, err)
 		}
+		return
+	}
+	if _, err := tx.ExecContext(ctx, `update scheduled_tasks set last_run_at=?,updated_at=? where id=?`, now, now, taskID); err != nil {
+		log.Printf("fail scheduled task run %s: update task: %v", runID, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("fail scheduled task run %s: %v", runID, err)
+		return
+	}
+	s.notifyScheduledTaskRun(runID)
+	if projectID != "" {
+		s.broadcastStateEvent(stEvScheduledTasks, projectID)
+		if releasedConversation {
+			// 占位会话已从历史里消失（或引用本来就悬空），项目卡片与未读通知都要重拉。
+			s.broadcastStateEvent(stEvProjects, projectID)
+			s.broadcastStateEvent(stEvNotifications, projectID)
+		}
+	}
+}
+
+// deleteScheduledPlaceholderConversationTx removes a scheduled occurrence's
+// still-empty placeholder conversation and reports whether the run's
+// conversation reference is now dead (the conversation was removed, or it no
+// longer exists at all). It deletes nothing and returns false when the
+// conversation is not a scheduled one or already holds messages, so a run that
+// produced history is never erased.
+func deleteScheduledPlaceholderConversationTx(ctx context.Context, tx *sql.Tx, conversationID string) (bool, error) {
+	if conversationID == "" {
+		return false, nil
+	}
+	var origin string
+	err := tx.QueryRowContext(ctx, `select origin from conversations where id=?`, conversationID).Scan(&origin)
+	if errors.Is(err, sql.ErrNoRows) {
+		// 引用本来就悬空（旧版本裁剪不看未派发的运行，可能已经删掉它）：
+		// 没有会话可删，但调用方必须把 conversation_id 清掉。
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if origin != "scheduled" {
+		return false, nil
+	}
+	var hasMessages bool
+	if err := tx.QueryRowContext(ctx, `select exists(select 1 from messages where conversation_id=?)`, conversationID).Scan(&hasMessages); err != nil {
+		return false, err
+	}
+	if hasMessages {
+		return false, nil
+	}
+	// 占位会话可能被一条任务通知当成回退目标；删会话前先清掉这类通知。
+	if err := deleteConversationNotificationsTx(ctx, tx, conversationID); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `update git_task_records set conversation_id='' where conversation_id=?`, conversationID); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `delete from conversations where id=?`, conversationID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// pruneScheduledProjectHistory applies the per-project conversation cap once a
+// scheduled run has actually started. The placeholder must not prune on
+// creation: a start that gets refused would have already evicted a real
+// conversation to make room for an entry it is about to delete.
+func (s *Server) pruneScheduledProjectHistory(ctx context.Context, projectID string) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("prune scheduled project history %s: %v", projectID, err)
+		return
+	}
+	defer tx.Rollback()
+	prunedHistory, err := pruneConversationHistoryTx(ctx, tx, projectID)
+	if err != nil {
+		log.Printf("prune scheduled project history %s: %v", projectID, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("prune scheduled project history %s: %v", projectID, err)
+		return
+	}
+	// 同一事务里的历史裁剪可能删掉了仍带未读通知的旧会话。
+	if prunedHistory {
+		s.broadcastStateEvent(stEvNotifications, projectID)
 	}
 }
 
@@ -1380,10 +1514,47 @@ func (s *Server) finishScheduledTaskRunTx(ctx context.Context, tx *sql.Tx, runID
 	return nil
 }
 
+// recoverInterruptedScheduledTasks closes out occurrences that were still
+// queued when the service stopped. Such a run may already own a placeholder
+// conversation created right before dispatch, so the recovery removes it in the
+// same transaction instead of leaving an empty "Scheduled: …" entry behind on
+// every crash.
 func (s *Server) recoverInterruptedScheduledTasks(ctx context.Context) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `update scheduled_task_runs set status=?,failure_reason=?,finished_at=? where status=? and run_id=''`, scheduledRunInterrupted, "Milevia was closed before this scheduled run could start.", now, scheduledRunQueued)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("recover queued scheduled task runs: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `select conversation_id from scheduled_task_runs where status=? and run_id='' and conversation_id<>''`, scheduledRunQueued)
+	if err != nil {
+		return fmt.Errorf("recover queued scheduled task runs: %w", err)
+	}
+	placeholders := []string{}
+	for rows.Next() {
+		var conversationID string
+		if scanErr := rows.Scan(&conversationID); scanErr != nil {
+			rows.Close()
+			return fmt.Errorf("recover queued scheduled task runs: %w", scanErr)
+		}
+		placeholders = append(placeholders, conversationID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("recover queued scheduled task runs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("recover queued scheduled task runs: %w", err)
+	}
+	for _, conversationID := range placeholders {
+		if _, err := deleteScheduledPlaceholderConversationTx(ctx, tx, conversationID); err != nil {
+			return fmt.Errorf("recover queued scheduled task runs: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `update scheduled_task_runs set status=?,failure_reason=?,finished_at=?,conversation_id='' where status=? and run_id=''`, scheduledRunInterrupted, "Milevia was closed before this scheduled run could start.", now, scheduledRunQueued); err != nil {
+		return fmt.Errorf("recover queued scheduled task runs: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("recover queued scheduled task runs: %w", err)
 	}
 	return nil

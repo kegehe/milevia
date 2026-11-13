@@ -27,6 +27,7 @@ import AgentProfilesPage from "./pages/AgentProfilesPage";
 import SettingsPage from "./pages/SettingsPage";
 import McpManagerPage from "./pages/McpManagerPage";
 import CliToolsPage from "./pages/CliToolsPage";
+import PluginsPage from "./pages/PluginsPage";
 import TerminalPage from "./pages/TerminalPage";
 import MobileRemotePage from "./pages/MobileRemotePage";
 import { UpdateBanner } from "./features/updater/UpdateBanner";
@@ -97,6 +98,7 @@ export function App() {
                   <Route path="/ssh-manager" element={<SSHManagerPage />} />
                   <Route path="/mcp-manager" element={<McpManagerPage />} />
                   <Route path="/cli-tools" element={<CliToolsPage />} />
+                  <Route path="/plugins" element={<PluginsPage />} />
                   <Route path="/agent-profiles" element={<AgentProfilesPage />} />
                   <Route path="/settings" element={<SettingsPage />} />
                   <Route path="/mobile" element={<MobileRemotePage />} />

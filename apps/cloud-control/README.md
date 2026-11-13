@@ -29,6 +29,12 @@ Web app and Cloud Control are served behind the same reverse proxy.
 
 默认监听 `:8090`，可通过 `MILEVIA_CLOUD_ADDR` 修改。
 
+未认证接口（注册、配对 claim / status）按来源 IP 限流。只有**来自回环地址**的请求才会读取
+`X-Real-IP` / `X-Forwarded-For`：前者由 Nginx 以 `$remote_addr` 覆盖写入，后者只取最后一跳
+（反代追加的那一段），客户端自带的前几段一律忽略。因此若把 Nginx 换到另一台机器或容器网络，
+必须改为把服务绑回环（或调整 `clientIP` 的信任判定），否则所有客户端会共用同一个限流桶。
+桶表有硬上限（每个限流器 10000 条），满时先清过期条目再淘汰最旧的一批，内存不会随伪造来源无限增长。
+
 服务器复用已有 PostgreSQL 时，可使用 `infrastructure/compose.server.yaml`。Cloud Control
 只需要 PostgreSQL；当前实现不依赖 Redis 或 MinIO。数据库应使用独立数据库和账号，且
 Cloud Control 容器需加入现有 PostgreSQL 所在的 Docker network。

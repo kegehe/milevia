@@ -878,6 +878,8 @@ func seedRemoteConversation(t *testing.T, server *Server, projectID, conversatio
 func TestRemoteTaskDispatchHonorsRequestedConversation(t *testing.T) {
 	server, projectID, conversationID := seedTaskConversation(t)
 	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	// 夹具默认不探测真实 WSL：项目是 wsl-local，下发要过"环境可用"这关，用同一替身顶上。
+	server.wslRunner = server.runner
 	// 另一条会话刻意更近活跃：没有 payload 目标时，任务会落到它身上（见下一条用例）。
 	seedRemoteConversation(t, server, projectID, "conversation-bg", time.Now().UTC().Add(time.Minute))
 	taskID := createTaskForTest(t, server.routes(), projectID, "dispatch target")
@@ -927,6 +929,7 @@ func TestRemoteTaskDispatchHonorsRequestedConversation(t *testing.T) {
 func TestRemoteTaskDispatchWithoutTargetKeepsServerChoice(t *testing.T) {
 	server, projectID, _ := seedTaskConversation(t)
 	server.runner = runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error { return nil })
+	server.wslRunner = server.runner // 同上：夹具不探测 WSL，替身即"环境可用"
 	seedRemoteConversation(t, server, projectID, "conversation-bg", time.Now().UTC().Add(time.Minute))
 	taskID := createTaskForTest(t, server.routes(), projectID, "dispatch fallback")
 

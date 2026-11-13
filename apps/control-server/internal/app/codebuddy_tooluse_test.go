@@ -39,6 +39,9 @@ func TestCodebuddyLiveToolUse(t *testing.T) {
 		cmd = exec.CommandContext(ctx, bin, "-p", "--input-format", "stream-json", "--output-format", "stream-json")
 	}
 	cmd.Dir = dir
+	// 直接子进程退出不代表管道关闭：CLI 派生的后代若继承了 stdout，Wait 会一直等
+	// 那个写端关闭（本机实测能挂到外层测试超时）。给 I/O 收尾设上限，超时就关管道返回。
+	cmd.WaitDelay = 10 * time.Second
 	if runtime.GOOS != "windows" {
 		configureProcessGroup(cmd)
 	}

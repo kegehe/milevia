@@ -157,7 +157,7 @@ function LogSegment({ segment }: { segment: AnsiSegment }) {
 	})}</>;
 }
 
-export function ProjectRunPanel({ projectID, conversationId, request, fail, active, isRemote = false }: { projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; active: boolean; isRemote?: boolean }) {
+export function ProjectRunPanel({ projectID, conversationId, request, fail, active, isRemote = false, wslProject = false }: { projectID: string; conversationId?: string; request: Request; fail: (message: string) => void; active: boolean; isRemote?: boolean; wslProject?: boolean }) {
 	const [config, setConfig] = useState<RunConfig>(emptyRunConfig);
 	const [status, setStatus] = useState<RunStatusResponse | null>(null);
 	const [worktrees, setWorktrees] = useState<OrchestrationWorktree[]>([]);
@@ -190,7 +190,9 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	const withWorkspace = (path: string) => `${path}${path.includes("?") ? "&" : "?"}${conversationId ? `conversationId=${encodeURIComponent(conversationId)}` : ""}`;
 	// 运行环境为 Windows cmd 时提示写法（反斜杠、不加 ./ 前缀）。优先用后端解析后的
 	// 真实目标（status.executionTarget，SSH 远端为 ""），未加载时退回配置近似判断。
-	const resolvedTarget = status?.executionTarget ?? (isRemote ? "" : config.executionTarget || "auto");
+	// WSL 项目的项目目录在 WSL 内（\\wsl$ UNC），执行环境只能是 WSL，不再让用户选。
+	const fixedTarget = isRemote ? "" : wslProject ? "wsl" : "";
+	const resolvedTarget = status?.executionTarget ?? (fixedTarget || config.executionTarget || "auto");
 	const isWindowsTarget = resolvedTarget === "windows";
 	const mergeIncomingLogs = useCallback((entries: LogEntry[]) => {
 		const visibleEntries = entries.filter((entry) => entry.id <= 0 || entry.id > clearedThroughLogIDRef.current);
@@ -380,8 +382,8 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 	};
 	const selectCommand = (id: string) => updateConfig(withRunCommands(config, commands, id));
 
-	// 远程项目的执行环境固定为 auto，避免旧值被持久化。
-	const configPayload = (): RunConfig => (isRemote ? { ...config, executionTarget: "auto" } : config);
+	// 远程项目的执行环境固定为 auto、WSL 项目固定为 wsl，避免旧值被持久化。
+	const configPayload = (): RunConfig => (isRemote ? { ...config, executionTarget: "auto" } : wslProject ? { ...config, executionTarget: "wsl" } : config);
 	const configValidationError = () => environmentValidationError(config.envVars || {}) || commandsValidationError(commands);
 
 	/** 把未保存的改动落库。启动/重启前必须做一次：后端是按**保存的**配置解析选中的命令 ID 的，
@@ -574,10 +576,10 @@ export function ProjectRunPanel({ projectID, conversationId, request, fail, acti
 						<header className="run-sidebar-heading"><div><h3>命令与环境</h3></div><button type="button" className={`run-save-config${configDirty ? " is-dirty" : ""}`} title={configDirty ? "有未保存的改动；启动、重启时会自动保存" : "保存启动配置"} disabled={busy === "save"} onClick={saveConfig}>{busy === "save" ? "保存中" : configDirty ? "保存 •" : "保存"}</button></header>
 						<div className="run-config-row">
 							<label htmlFor="run-execution-target">运行环境</label>
-							<select id="run-execution-target" value={isRemote ? "auto" : (config.executionTarget || "auto")} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })} disabled={isRemote}>
+							<select id="run-execution-target" value={isRemote ? "auto" : wslProject ? "wsl" : (config.executionTarget || "auto")} onChange={(e) => updateConfig({ ...config, executionTarget: e.target.value as RunConfig["executionTarget"] })} disabled={isRemote || wslProject}>
 								<option value="auto">{isRemote ? "远程" : "自动"}</option>
-								{!isRemote && <option value="windows">Windows</option>}
-								{!isRemote && <option value="wsl">WSL</option>}
+								{!isRemote && !wslProject && <option value="windows">Windows</option>}
+								{!isRemote && <option value="wsl">{wslProject ? "WSL（项目位于 WSL 内）" : "WSL"}</option>}
 							</select>
 						</div>
 						<div className="run-config-row">

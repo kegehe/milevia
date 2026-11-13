@@ -38,6 +38,11 @@ type crossEnvironment interface {
 	// 传进来的必须是**已经完全拼好、且变量都经过 shellQuote** 的脚本 ——
 	// 这里不做任何转义，跨端的转义责任在构造脚本的那一侧（与 ssh_runner 一致）。
 	run(ctx context.Context, script string) (stdout string, stderr string, err error)
+	// runWithLimit 与 run 相同，但调用方可以指定 stdout 上限。
+	//
+	// 探测/自检的输出都很短（crossOutputLimit），而插件清单可能到几十上百 KB：
+	// 超过上限会被静默截断成不可解析的 JSON，所以这类调用必须显式放宽。
+	runWithLimit(ctx context.Context, script string, stdoutLimit int) (stdout string, stderr string, err error)
 	// sharedPath 给出"目标环境里能读到本机这个文件的路径"。
 	//
 	// WSL 上 `C:\a\b` → `/mnt/c/a/b`（前提是该盘符已挂载可读）；SSH 上恒为 false。
@@ -252,6 +257,12 @@ func (e *wslCrossEnvironment) describe() string {
 }
 
 func (e *wslCrossEnvironment) run(ctx context.Context, script string) (string, string, error) {
+	return e.runWithLimit(ctx, script, 0)
+}
+
+// runWithLimit 在 WSL 上不设输出上限（本机管道没有跨端截断问题），stdoutLimit 仅为
+// 接口对称保留。
+func (e *wslCrossEnvironment) runWithLimit(ctx context.Context, script string, _ int) (string, string, error) {
 	wslPath, err := wslExePath()
 	if err != nil {
 		return "", "", fmt.Errorf("无法访问 wsl.exe：%w", err)
@@ -327,9 +338,21 @@ func (e *sshCrossEnvironment) describe() string {
 }
 
 func (e *sshCrossEnvironment) run(ctx context.Context, script string) (string, string, error) {
-	stdout, stderr, err := e.runner.client.execCommandSeparate(ctx, script, crossOutputLimit)
+	return e.runWithLimit(ctx, script, crossOutputLimit)
+}
+
+func (e *sshCrossEnvironment) runWithLimit(ctx context.Context, script string, stdoutLimit int) (string, string, error) {
+	if stdoutLimit <= 0 {
+		stdoutLimit = crossOutputLimit
+	}
+	stdout, stderr, err := e.runner.client.execCommandSeparate(ctx, script, stdoutLimit)
 	if err != nil {
 		return string(stdout), string(stderr), fmt.Errorf("%s 执行失败：%w", e.describe(), err)
+	}
+	// execCommandSeparate 用 stdoutLimit+1 字节标记溢出；不检查就会把半截输出交给
+	// 上层，最后被误报成"CLI 没有返回 JSON"。
+	if len(stdout) > stdoutLimit {
+		return string(stdout[:stdoutLimit]), string(stderr), fmt.Errorf("%s 输出超过 %d KiB 上限，无法完整读取", e.describe(), stdoutLimit/1024)
 	}
 	return string(stdout), string(stderr), nil
 }

@@ -35,3 +35,17 @@ test("configures each startup entry with only its command", () => {
   assert.match(source, /aria-label=\{`第 \$\{index \+ 1\} 条启动命令`\}/);
   assert.match(source, /const commands = \(config\.commands \|\| \[\]\)\.map\(\(\{ id, command, envVars \}\)/);
 });
+
+test("locks the execution target to WSL for projects whose directory lives in WSL", async () => {
+  // WSL 项目的项目目录在 WSL 内（\wsl$ UNC），后端只接受 auto/wsl 两个目标；让用户选
+  // Windows 只会在保存/启动时被拒。这里固定为 wsl，并把选项藏起来。
+  assert.match(source, /wslProject\?: boolean/);
+  assert.match(source, /wslProject \? \{ \.\.\.config, executionTarget: "wsl" \} : config/);
+  assert.match(source, /disabled=\{isRemote \|\| wslProject\}/);
+  assert.match(source, /\{!isRemote && !wslProject && <option value="windows">Windows<\/option>\}/);
+
+  // 判据必须来自服务端下发的 localRunner：非 Windows 服务端的 wsl-local 就是本机 runner。
+  const page = await readFile(new URL("../../pages/ProjectRunPage.tsx", import.meta.url), "utf8");
+  assert.match(page, /const wslProject = project\.runner === "wsl-local" && !project\.localRunner;/);
+  assert.match(page, /wslProject=\{wslProject\}/);
+});

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -44,6 +45,19 @@ func main() {
 	addr := os.Getenv("MILEVIA_CLOUD_ADDR")
 	if addr == "" {
 		addr = ":8090"
+	}
+	// 限流按来源 IP 分桶，而 clientIP 只信任来自回环的 X-Real-IP / X-Forwarded-For
+	// （防止客户端自造来源绕开限流）。监听非回环地址（含空 host = 所有网卡）时，若反代
+	// 也不在回环上，所有客户端会共用代理地址这一个桶 —— 一台机器就能把其他人限流到 429。
+	// 这里只提示，不改变行为。
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		switch host {
+		case "127.0.0.1", "::1", "localhost":
+		case "":
+			log.Printf("[cloud] 提示：监听所有网卡（%s）。限流按来源 IP 分桶，只有来自回环的反代头才被信任；若反代不在本机回环，所有客户端会共用一个限流桶。详见 apps/cloud-control/README.md。", addr)
+		default:
+			log.Printf("[cloud] 警告：监听 %s（非回环）。反代必须与 cloud-control 在同一回环上，否则未认证接口的限流会退化成所有客户端共用一个桶；详见 apps/cloud-control/README.md。", addr)
+		}
 	}
 	// Do not set ReadTimeout/WriteTimeout here: upgraded WebSocket requests are
 	// long-lived and must not be terminated by an HTTP request deadline.

@@ -98,3 +98,38 @@ func TestWSLGitBackendCommandUsesLinuxWorkingDirectoryAndLiteralArgs(t *testing.
 		t.Fatalf("WSL command leaked literal shell arguments: %q", cmd.Args)
 	}
 }
+
+// TestWSLProjectGitWithoutWSLRunner 钉住"WSL runner 只对 UNC 路径是硬依赖"：
+// 关闭探测的夹具里 s.wslRunner 为 nil，wsl-local 项目指向本机路径时仍走本机 git；
+// 换成 \\wsl$ UNC 才必须报 WSL runner 不可用（不能拿本机 git 硬跑）。
+func TestWSLProjectGitWithoutWSLRunner(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("wsl-local 在非 Windows 服务端就是本机 runner")
+	}
+	server, projectID := seedServerWithProject(t)
+	if server.wslAgentRunner() != nil {
+		t.Fatal("fixture should not probe WSL")
+	}
+	if _, err := server.db.Exec(`update projects set runner='wsl-local', runner_id='' where id=?`, projectID); err != nil {
+		t.Fatalf("mark project as wsl-local: %v", err)
+	}
+
+	runner, repo, err := server.gitRunnerForProject(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("local-path wsl-local project must fall back to local git: %v", err)
+	}
+	if _, ok := runner.(*gitCLIRunner); !ok {
+		t.Fatalf("runner=%T want *gitCLIRunner", runner)
+	}
+	if repo == "" {
+		t.Fatal("local-path wsl-local project returned an empty repo path")
+	}
+
+	// 真正的 WSL 工作区没有 runner 就做不了：路径换成 UNC 后必须明确失败。
+	if _, err := server.db.Exec(`update projects set path=? where id=?`, `\\wsl$\Ubuntu\home\dev\project`, projectID); err != nil {
+		t.Fatalf("switch project path to UNC: %v", err)
+	}
+	if _, _, err := server.gitRunnerForProject(context.Background(), projectID); err == nil || !strings.Contains(err.Error(), "WSL runner is unavailable") {
+		t.Fatalf("UNC path without WSL runner: err=%v want WSL runner is unavailable", err)
+	}
+}

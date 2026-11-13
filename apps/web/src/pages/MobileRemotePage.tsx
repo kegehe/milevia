@@ -70,6 +70,7 @@ import { applyPendingConversations, isPendingConversationID, matchPendingConvers
 // 云端的中继请求（见 mobile-fs-request.ts），树/查看器/编辑器/JSON/SQLite 全部是同一份实现。
 import { FilesPanel, type FilesPanelHandle } from "../features/files/FilesPanel";
 import { createMobileFsRequest, type MobileRpcReply } from "../features/files/mobile-fs-request";
+import { INSTANCE_OFFLINE_CODE, INSTANCE_OFFLINE_MESSAGE, localizeRpcReply } from "../features/remote/mobile-rpc";
 import { createMobileInsightsRequest } from "../features/insights/mobile-insights-request";
 // Git 工作台同属一个子态槽位，同样是**整块复用**桌面端那套（见 mobile-git-request.ts）。
 import { MobileGitPanel, type MobileGitPanelHandle } from "../features/git/MobileGitPanel";
@@ -949,7 +950,7 @@ function MobileInlineCode({ className, children, onOpenFile }: { className?: str
 
 function localizeCloudError(raw: string, status: number): string {
   const text = raw.toLowerCase();
-  if (text.includes("instance_offline")) return "电脑当前离线，请等电脑上线后再试";
+  if (text.includes(INSTANCE_OFFLINE_CODE)) return INSTANCE_OFFLINE_MESSAGE;
   if (text.includes("pairing is not ready for confirmation")) return "手机还没有提交校验码，请先扫码并输入校验码";
   if (text.includes("too many pairing attempts")) return "配对尝试次数过多，请让电脑重新生成二维码";
   if (text.includes("pairing code is ambiguous")) return "校验码发生冲突，请让电脑重新生成二维码";
@@ -2160,7 +2161,7 @@ export default function MobileRemotePage() {
     cloud<MobileRpcReply>(`/v1/instances/${encodeURIComponent(instanceID)}/rpc`, {
       method: "POST",
       body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
-    }, undefined, timeoutMs), [instanceID]);
+    }, undefined, timeoutMs).then(localizeRpcReply), [instanceID]);
   const {
     pages: historyPages,
     directory: historyDirectory,
@@ -2333,7 +2334,7 @@ export default function MobileRemotePage() {
       cloud<MobileRpcReply>(`/v1/instances/${encodeURIComponent(instanceID)}/rpc`, {
         method: "POST",
         body: JSON.stringify({ op, projectId: projectID, conversationId: conversationID || undefined, params, timeoutMs }),
-      }, undefined, timeoutMs);
+      }, undefined, timeoutMs).then(localizeRpcReply);
   }, [instanceID, project?.id, conversation?.id, conversationPending]);
 
   // ── 会话回退（节点）───────────────────────────────────────────────────────

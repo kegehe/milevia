@@ -557,9 +557,12 @@ func (*delayedAdmissionSession) Stop() {} // 请求停止尚不代表进程退�
 func TestWorkspaceAdmissionTemporaryAgentHoldsUntilProcessExit(t *testing.T) {
 	s, p, _ := admissionProjectForTest(t)
 	session := &conflictTestSession{done: make(chan error, 1)}
+	// 回合已经结束（TurnFinished），但 Stop 只是"请求停止"，进程还没退出。
+	sent := make(chan struct{}, 1)
 	session.send = func(sink AgentRunSink) error {
 		sink.AssistantText(`{"merged":"done"}`, "")
 		sink.(AgentTurnSink).TurnFinished(nil)
+		sent <- struct{}{}
 		return nil
 	}
 	runner := &admissionStreamingRunner{session: &delayedAdmissionSession{session}}
@@ -567,14 +570,33 @@ func TestWorkspaceAdmissionTemporaryAgentHoldsUntilProcessExit(t *testing.T) {
 	var once sync.Once
 	finish := func() { once.Do(func() { close(session.done) }) }
 	defer finish()
-	if _, err := s.runConflictSuggestionAgent(context.Background(), p, "codebuddy", "review"); err != nil {
-		t.Fatal(err)
+
+	// 临时 Agent 的调用在进程退出（Done）之前不会返回 —— 这正是准入必须被保住的原因。
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := s.runConflictSuggestionAgent(context.Background(), p, "codebuddy", "review")
+		callDone <- err
+	}()
+	select {
+	case <-sent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent turn did not start")
 	}
+
 	a := reserveAdmissionForTest(t, s, p, "session")
 	if err := s.transitionWorkspaceAdmission(context.Background(), a.ID, a.OwnerID, a.Epoch, "owned"); !errors.Is(err, errWorkspaceNotQuiescent) {
 		t.Fatalf("turn completion released a live CLI: %v", err)
 	}
+
 	finish()
+	select {
+	case err := <-callDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("temporary agent call did not return after the process exited")
+	}
 	deadline := time.Now().Add(time.Second)
 	for {
 		err := s.transitionWorkspaceAdmission(context.Background(), a.ID, a.OwnerID, a.Epoch, "owned")

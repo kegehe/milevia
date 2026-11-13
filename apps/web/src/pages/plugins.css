@@ -1,0 +1,142 @@
+/* 插件管理页（路由 `/plugins`）。
+   配色沿用 Cli管理页那一套（#f3f8f4 底 / #19332c 字 / #cfe0d6 边框 / #2c7567 强调），
+   不再引入第二套中性色。变体一律走 data-*，不拼动态类名。 */
+
+.plugins-shell { display: flex; flex-direction: column; min-height: 100vh; background: #f3f8f4; color: #19332c; }
+
+.plugins-bar { display: flex; align-items: center; gap: 12px; padding: 14px max(20px, calc((100% - 1224px) / 2)); }
+.plugins-back { display: grid; place-items: center; flex: none; width: 38px; height: 38px; padding: 0;
+  border: 1px solid #c8dcd1; border-radius: 50%; color: #31594f; background: #f7fbf8;
+  font-size: 15px; font-weight: 700; line-height: 1; }
+.plugins-back:hover:not(:disabled) { border-color: #8eb9aa; background: #eaf5ee; color: #1f6055; }
+.plugins-badge { display: grid; place-items: center; flex: none; width: 27px; height: 27px; border-radius: 8px;
+  background: #e5f4ea; color: #2c7567; font-size: 14px; font-weight: 700; }
+.plugins-title { margin: 0; font-size: 17.5px; font-weight: 700; letter-spacing: .01em; }
+.plugins-shell .plugins-bar-actions { margin-left: auto; display: flex; gap: 12px; align-items: center; }
+.plugins-shell .plugins-env { display: flex; gap: 2px; margin-left: 10px; padding: 3px; border: 1px solid #cfe0d6; border-radius: 10px; background: #e9f1ec; }
+.plugins-env-item { border: 0; border-radius: 7px; padding: 5px 15px; color: #4c6b60; background: transparent;
+  font-size: 12.5px; font-weight: 700; line-height: 1.5; }
+.plugins-env-item:hover { color: #225c50; }
+.plugins-env-item[aria-selected="true"] { background: #fff; color: #225c50; box-shadow: 0 1px 2px rgba(25, 51, 44, .12); }
+
+.plugins-body { width: min(1224px, 100% - 48px); margin: 0 auto; padding: 6px 0 40px; }
+
+.plugins-agents { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px; }
+.plugins-agent { display: grid; justify-items: start; gap: 1px; padding: 8px 14px; border-radius: 10px;
+  border: 1px solid #cfe0d6; background: #fff; color: #31594f; text-align: left; }
+.plugins-agent span { font-size: 13px; font-weight: 700; }
+.plugins-agent small { font-size: 11px; color: #748b81; }
+.plugins-agent[aria-selected="true"] { border-color: #2c7567; background: #eaf5ee; color: #1f6055; }
+.plugins-agent[aria-selected="true"] small { color: #2c7567; }
+
+.plugins-block { margin: 12px 0; padding: 14px 18px; border-radius: 12px; border: 1px solid #cfe0d6; background: #fff;
+  font-size: 13px; line-height: 1.7; display: grid; gap: 6px; justify-items: start; }
+.plugins-block b { font-size: 14px; }
+.plugins-block span { color: #4c6b60; font-size: 12.5px; }
+.plugins-error { border-color: #f2c8c0; background: #fdf3f1; color: #a4462f; }
+.plugins-error span { color: #a4462f; }
+.plugins-warn { border-color: #f0d9a8; background: #fff8e8; color: #85671c; }
+.plugins-warn span { color: #9a7d2c; }
+.plugins-empty { background: #fff; }
+.plugins-note { margin: 10px 0; padding: 9px 14px; border-radius: 10px; border: 1px solid #e3ece7; background: #f7fbf8;
+  color: #4c6b60; font-size: 12.5px; line-height: 1.6; }
+
+.plugins-skeleton { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; margin: 12px 0; }
+.plugins-skeleton-card { height: 180px; border-radius: 13px; border: 1px solid #e3ece7; background: #fff; }
+
+.plugins-sechead { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin: 18px 0 12px; }
+.plugins-sechead h2 { margin: 0 0 2px; font-size: 15px; font-weight: 700; }
+.plugins-count { font-size: 12px; color: #748b81; }
+.plugins-sechead-actions { display: flex; gap: 8px; align-items: center; }
+
+.plugins-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 13px; }
+.plugins-card { display: flex; flex-direction: column; gap: 9px; padding: 16px; border-radius: 13px;
+  border: 1px solid #cfe0d6; background: #fff; }
+.plugins-card[data-disabled="true"] { background: #f7fbf8; border-style: dashed; }
+.plugins-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.plugins-card-head > div { display: grid; gap: 2px; min-width: 0; }
+.plugins-card-head b { font-size: 14px; font-weight: 700; letter-spacing: .01em; overflow-wrap: anywhere; }
+.plugins-card-id { font-size: 11.5px; color: #809188; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.plugins-card-desc { margin: 0; color: #4c6b60; font-size: 12.5px; line-height: 1.6; }
+.plugins-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0; }
+.plugins-meta div { display: grid; gap: 1px; }
+.plugins-meta dt { font-size: 10.5px; color: #809188; }
+.plugins-meta dd { margin: 0; font-size: 12.5px; font-weight: 600; color: #31594f; overflow-wrap: anywhere; }
+.plugins-components { margin: 0; font-size: 12px; color: #748b81; }
+.plugins-card-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: auto -16px -16px; padding: 11px 16px;
+  border-top: 1px solid #e3ece7; background: #f7fbf8; border-radius: 0 0 13px 13px; }
+.plugins-card-actions .primary, .plugins-card-actions .secondary, .plugins-card-actions .danger, .plugins-toggle {
+  min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+
+.plugins-chip { flex: none; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 700; }
+.plugins-chip[data-tone="on"] { background: #e5f4ea; color: #1f6055; }
+.plugins-chip[data-tone="off"] { background: #f2f5f3; color: #748b81; }
+.plugins-chip[data-tone="unknown"] { border: 1px dashed #c8dcd1; color: #748b81; }
+
+.plugins-toggle { border: 1px solid #c8dcd1; border-radius: 8px; background: #fff; color: #31594f; font-weight: 700; }
+.plugins-toggle:hover:not(:disabled) { border-color: #8eb9aa; background: #eaf5ee; color: #1f6055; }
+
+.plugins-market { margin-top: 22px; padding: 16px; border-radius: 13px; border: 1px solid #cfe0d6; background: #fff; }
+.plugins-market-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.plugins-market-head h2 { margin: 0; font-size: 15px; font-weight: 700; }
+.plugins-market-empty { margin: 0; color: #748b81; font-size: 12.5px; line-height: 1.7; }
+.plugins-market-list { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 8px; }
+.plugins-market-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px; border-radius: 10px; border: 1px solid #e3ece7; background: #f7fbf8; }
+.plugins-market-list li > div:first-child { display: grid; gap: 2px; min-width: 0; }
+.plugins-market-list b { font-size: 13px; }
+.plugins-market-list small { font-size: 11.5px; color: #809188; overflow-wrap: anywhere; }
+.plugins-market-actions { display: flex; gap: 6px; flex: none; }
+.plugins-market-actions .secondary, .plugins-market-actions .danger { min-height: 28px; padding: 0 10px; font-size: 12px; }
+.plugins-market-add { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.plugins-market-add input { flex: 1 1 240px; min-height: 34px; padding: 0 12px; border-radius: 8px;
+  border: 1px solid #cfe0d6; background: #fff; color: #19332c; font-size: 13px; }
+.plugins-market-add select, .plugins-field select { min-height: 34px; padding: 0 10px; border-radius: 8px;
+  border: 1px solid #cfe0d6; background: #fff; color: #19332c; font-size: 13px; }
+
+.plugins-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end;
+  background: rgba(25, 51, 44, .28); }
+.plugins-drawer { width: min(440px, 100%); height: 100%; overflow: auto; padding: 20px 22px;
+  background: #fff; box-shadow: -12px 0 32px rgba(25, 51, 44, .16); }
+.plugins-drawer header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.plugins-drawer header > div { display: grid; gap: 3px; min-width: 0; }
+.plugins-drawer h2 { margin: 0; font-size: 16px; font-weight: 700; }
+.plugins-drawer header span { font-size: 11.5px; color: #809188; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.plugins-drawer-close { flex: none; width: 32px; height: 32px; border: 0; border-radius: 8px; background: #f2f5f3;
+  color: #4c6b60; font-size: 18px; line-height: 1; }
+.plugins-drawer-close:hover { background: #e9f1ec; color: #1f6055; }
+.plugins-drawer-desc { margin: 0 0 14px; color: #31594f; font-size: 13px; line-height: 1.7; }
+.plugins-drawer-facts { display: grid; gap: 10px; margin: 0; }
+.plugins-drawer-facts div { display: grid; gap: 2px; }
+.plugins-drawer-facts dt { font-size: 11px; color: #809188; }
+.plugins-drawer-facts dd { margin: 0; font-size: 13px; font-weight: 600; color: #31594f; }
+.plugins-drawer-tip { margin: 18px 0 0; padding-top: 12px; border-top: 1px solid #e3ece7; color: #748b81; font-size: 12px; line-height: 1.7; }
+.plugins-path { font-family: ui-monospace, monospace; font-size: 11.5px; font-weight: 400; word-break: break-all; }
+.plugins-pending { color: #748b81; font-size: 13px; }
+
+.plugins-modal { width: min(520px, calc(100% - 32px)); margin: auto; padding: 20px 22px; border-radius: 14px;
+  background: #fff; box-shadow: 0 18px 48px rgba(25, 51, 44, .22); display: grid; gap: 12px; }
+.plugins-modal-small { width: min(420px, calc(100% - 32px)); }
+.plugins-modal header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.plugins-modal header > div { display: grid; gap: 3px; }
+.plugins-modal h2 { margin: 0; font-size: 16px; font-weight: 700; }
+.plugins-modal header span { font-size: 12px; color: #809188; }
+.plugins-modal p { margin: 0; color: #4c6b60; font-size: 13px; line-height: 1.7; }
+.plugins-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.plugins-modal-row { display: flex; flex-wrap: wrap; gap: 12px; }
+.plugins-field { display: grid; gap: 4px; flex: 1 1 180px; }
+.plugins-field > span { font-size: 11.5px; color: #809188; }
+.plugins-confirm { display: grid; gap: 10px; padding: 14px; border-radius: 12px; border: 1px solid #f0d9a8; background: #fff8e8; }
+.plugins-confirm b { color: #85671c; font-size: 14px; }
+.plugins-confirm p { color: #9a7d2c; }
+.plugins-confirm pre { margin: 0; padding: 10px 12px; border-radius: 8px; background: #fff; border: 1px solid #f0d9a8;
+  color: #19332c; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+.plugins-confirm-hint { color: #9a7d2c; font-size: 12px; }
+
+@media (max-width: 720px) {
+  .plugins-shell .plugins-bar { flex-wrap: wrap; }
+  .plugins-body { width: min(1224px, 100% - 28px); }
+  .plugins-skeleton { grid-template-columns: 1fr; }
+  .plugins-grid { grid-template-columns: 1fr; }
+  .plugins-drawer { width: 100%; }
+}

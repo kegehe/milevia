@@ -15,5 +15,10 @@ export default function ProjectRunPage() {
 
   if (!projectId) return null;
 
-  return <ProjectRunPanel projectID={projectId} conversationId={conversationId} request={api} fail={setError} active={true} isRemote={project.runner.startsWith("ssh-")} />;
+  // WSL 项目（项目目录在 WSL 内、跑在 Windows 控制服务之外的 WSL 里）：执行环境只能是
+  // WSL，运行环境选择由后端固定，不能当作普通本机项目。localRunner 由服务端下发，
+  // 非 Windows 服务端上的 wsl-local 就是本机 runner，不能按 runner id 自行判断。
+  const wslProject = project.runner === "wsl-local" && !project.localRunner;
+
+  return <ProjectRunPanel projectID={projectId} conversationId={conversationId} request={api} fail={setError} active={true} isRemote={project.runner.startsWith("ssh-")} wslProject={wslProject} />;
 }

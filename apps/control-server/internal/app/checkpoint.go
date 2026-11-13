@@ -921,9 +921,13 @@ func (s *Server) checkpointGitPaths(projectPath, projectRunner, gitDir string) (
 		if runtime.GOOS != "windows" {
 			return projectPath, gitDir, nil
 		}
-		runner, ok := s.wslAgentRunner().(*wslAgentRunner)
-		if !ok || runner == nil {
-			return "", "", errors.New("WSL runner is unavailable")
+		runner, _ := s.wslAgentRunner().(*wslAgentRunner)
+		if runner == nil {
+			// 只有 UNC 工作区需要 WSL 内的 git；本机路径照旧走本机 git。
+			if isWSLUncPath(projectPath) {
+				return "", "", errors.New("WSL runner is unavailable")
+			}
+			return projectPath, gitDir, nil
 		}
 		workTree, ok := uncToWslPath(projectPath, runner.distro)
 		if !ok || workTree == "" {

@@ -2408,7 +2408,7 @@ export default function ConversationPage() {
   const [usage, setUsage] = useState<ConversationUsageResponse | null>(null);
   const [shortcuts, setShortcuts] = useState<Shortcut[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
-  const [plugins, setPlugins] = useState<{name:string; version?:string; description?:string; status:string}[]>([]);
+  const [plugins, setPlugins] = useState<{name:string; version?:string; description?:string; status:string; enabled?:boolean; stateKnown?:boolean; managed?:boolean}[]>([]);
   const [pluginsNote, setPluginsNote] = useState("");
   const [skillsLoading, setSkillsLoading] = useState(false);
   // 常用命令目录（GET /api/projects/{id}/commands，见 docs/37）。命令标签据此标注
@@ -5037,7 +5037,9 @@ export default function ConversationPage() {
     const collapsible = Boolean(options?.collapsible);
     const collapsed = collapsible && Boolean(options?.collapsed);
     const toggle = options?.onToggle ?? (() => {});
-    const pluginSection = (plugins.length > 0 || pluginsNote) && <details className="plugin-discovery"><summary>插件（{plugins.length}）</summary><small>{pluginsNote || "启用状态由 CLI 决定。"}</small>{plugins.map((plugin, index) => <p key={`${plugin.name}-${index}`} title={plugin.description}>{plugin.name} {plugin.version}<small> · {plugin.status === "configured" ? "已配置" : "已发现"}</small></p>)}</details>;
+    const pluginStatusText = (plugin: { stateKnown?: boolean; enabled?: boolean; status: string }) =>
+      !plugin.stateKnown ? "状态未知" : plugin.enabled ? "已启用" : "已禁用";
+    const pluginSection = (plugins.length > 0 || pluginsNote) && <details className="plugin-discovery"><summary>插件（{plugins.length}）</summary><small>{pluginsNote || "启用状态来自 CLI。"}{" "}<button type="button" className="plugin-discovery-manage" onClick={() => navigate("/plugins")}>管理插件</button></small>{plugins.map((plugin, index) => <p key={`${plugin.name}-${index}`} title={plugin.description}>{plugin.name} {plugin.version}<small> · {pluginStatusText(plugin)}</small></p>)}</details>;
     // 桌面端（collapsible）渲染为「技能」色块的块头（.quick-block-head），与提示词/命令块同构；
     // 移动端输入框菜单（非折叠）沿用原有 .quick-tag-group 标题行，样式随 .skill-tag 全局改版同步。
     const heading = collapsible

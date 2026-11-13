@@ -2,10 +2,12 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -366,6 +368,119 @@ func TestProcessStatusWebSocketBroadcastContract(t *testing.T) {
 	}
 	if _, exists := raw["pid"]; !exists || raw["pid"] != float64(4242) {
 		t.Fatalf("frame pid = %v, want 4242", raw["pid"])
+	}
+}
+
+// TestProcessStatusSubscriberEnqueueAfterClose 关闭后 enqueue 必须报失败且不 panic：
+// 向已关闭 channel 发送是唯一会让发送方 goroutine 崩溃的路径。
+func TestProcessStatusSubscriberEnqueueAfterClose(t *testing.T) {
+	sub := &processStatusSubscriber{send: make(chan RunStatusEvent, processStatusSubscriberQueueSize)}
+	sub.close()
+	if sub.enqueue(RunStatusEvent{ProjectID: "after-close"}) {
+		t.Fatal("closed subscriber accepted an event")
+	}
+}
+
+// TestPushProcessStatusSnapshotSurvivesConcurrentCloseAll 回归"快照推送途中订阅被关闭"：
+// closeAllProcessStatusSubscribers 先换空注册表、解锁后才异步关闭订阅队列，
+// 而 pushProcessStatusSnapshot 逐项目持锁推送期间只持有订阅者指针，不校验它是否仍注册。
+// 两条路径交错时向已关闭 channel 发送会 panic —— select 的 default 分支并不能兜住。
+// 用例用多项目/多 runner 拉长快照循环，并让消费者读到第一帧就触发 closeAll，
+// 使关闭稳定落在循环中途。push 在独立 goroutine 里运行且不 recover：一旦向已关闭
+// channel 发送，整个测试进程会带着 panic 栈立即失败（旧实现下即如此）。
+func TestPushProcessStatusSnapshotSurvivesConcurrentCloseAll(t *testing.T) {
+	server := newTestServer(t)
+
+	const (
+		projectCount = 3000
+		runnerCount  = 20
+		rounds       = 5
+	)
+	root := t.TempDir()
+	tx, err := server.db.Begin()
+	if err != nil {
+		t.Fatalf("begin project seed: %v", err)
+	}
+	for i := 0; i < projectCount; i++ {
+		id := fmt.Sprintf("ps-race-%04d", i)
+		if _, err := tx.Exec(`insert into projects (id,name,path,runner,git_branch,claude_ready,created_at) values (?,?,?,?,?,1,?)`,
+			id, "ps-race", filepath.Join(root, id), "wsl-local", "main", time.Now()); err != nil {
+			t.Fatalf("insert project %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit project seed: %v", err)
+	}
+	// runner 只为拖慢每个项目的快照计算；不启动任何进程。
+	server.runManagersMu.Lock()
+	for i := 0; i < runnerCount; i++ {
+		id := fmt.Sprintf("ps-race-runner-%02d", i)
+		server.runManagers[id] = newProjectRunner(id, "", "", nil, func(LogEntry) {})
+	}
+	server.runManagersMu.Unlock()
+
+	interleaved := 0
+	for round := 0; round < rounds; round++ {
+		// nil 连接：这里只验证队列收尾，不写网络帧（initiateWebSocketClose 对 nil 直接返回）。
+		sub := &processStatusSubscriber{send: make(chan RunStatusEvent, processStatusSubscriberQueueSize)}
+		if !server.addProcessStatusSubscriber(nil, sub) {
+			t.Fatalf("round %d: register subscriber", round)
+		}
+
+		triggerClose := make(chan struct{})
+		drainReady := make(chan struct{})
+		writerDone := make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			close(drainReady)
+			seen := 0
+			for range sub.send {
+				seen++
+				if seen == 1 {
+					close(triggerClose)
+				}
+			}
+		}()
+		// 等消费者就绪再启动推送，避免推送先跑完、关闭落在循环之后。
+		<-drainReady
+
+		var pushFinished atomic.Bool
+		closedWhilePushing := make(chan bool, 1)
+		go func() {
+			<-triggerClose
+			closedWhilePushing <- !pushFinished.Load()
+			server.closeAllProcessStatusSubscribers()
+		}()
+
+		pushDone := make(chan struct{})
+		go func() {
+			defer close(pushDone)
+			defer pushFinished.Store(true)
+			server.pushProcessStatusSnapshot(sub)
+		}()
+
+		select {
+		case <-pushDone:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: snapshot push did not finish", round)
+		}
+		select {
+		case closedEarly := <-closedWhilePushing:
+			if closedEarly {
+				interleaved++
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: close was never triggered", round)
+		}
+		select {
+		case <-writerDone:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: writer did not exit after close", round)
+		}
+	}
+	// 调度抖动可能让某一轮在推送结束后才关闭；只要有一轮真正交错，就覆盖到了该窗口。
+	if interleaved == 0 {
+		t.Fatal("no round closed the subscriber while the snapshot was still pushing")
 	}
 }
 

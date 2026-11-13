@@ -16,12 +16,44 @@ import (
 type processStatusSubscriber struct {
 	conn           *websocket.Conn
 	send           chan RunStatusEvent
+	sendMu         sync.RWMutex
+	closed         bool
 	closeOnce      sync.Once
 	closeFrameOnce sync.Once
 }
 
 func (sub *processStatusSubscriber) close() {
-	sub.closeOnce.Do(func() { close(sub.send) })
+	sub.closeOnce.Do(func() {
+		sub.sendMu.Lock()
+		defer sub.sendMu.Unlock()
+		sub.closed = true
+		close(sub.send)
+	})
+}
+
+// enqueue 非阻塞入队，返回 false 表示队列已满或订阅已关闭。
+// 关闭订阅可能发生在任何一条推送路径上（快照、实时广播、慢客户端清理），
+// 而发送方持有的是订阅者指针而非注册表锁，必须由 closed 标志兜住，
+// 否则向已关闭 channel 发送会 panic。
+func (sub *processStatusSubscriber) enqueue(event RunStatusEvent) bool {
+	sub.sendMu.RLock()
+	defer sub.sendMu.RUnlock()
+	if sub.closed {
+		return false
+	}
+	select {
+	case sub.send <- event:
+		return true
+	default:
+		return false
+	}
+}
+
+// isClosed 让快照推送区分"队列满"（丢这一帧、继续推）与"订阅已关闭"（停止推送）。
+func (sub *processStatusSubscriber) isClosed() bool {
+	sub.sendMu.RLock()
+	defer sub.sendMu.RUnlock()
+	return sub.closed
 }
 
 func (sub *processStatusSubscriber) closeWithStatus(code int, reason string) {
@@ -179,12 +211,16 @@ func (s *Server) pushProcessStatusSnapshot(sub *processStatusSubscriber) {
 		s.processStatusSubMu.Lock()
 		event := s.projectProcessStatusSnapshot(id)
 		event.Sequence = s.nextProcessStatusSequenceLocked(id)
-		select {
-		case sub.send <- event:
-		default:
-			// 快照积压：丢弃剩余帧即可，实时变更仍会收敛快照与真实状态。
-		}
+		ok := sub.enqueue(event)
 		s.processStatusSubMu.Unlock()
+		if ok {
+			continue
+		}
+		if sub.isClosed() {
+			// 订阅已被并发关闭（停机或慢客户端清理）：没有消费者了，停止推送。
+			return
+		}
+		// 快照积压：丢弃这一帧，继续推后续项目；实时变更仍会收敛快照与真实状态。
 	}
 }
 
@@ -239,9 +275,7 @@ func (s *Server) broadcastProcessStatusLocked(event RunStatusEvent) []*processSt
 	}
 	event.Sequence = s.nextProcessStatusSequenceLocked(event.ProjectID)
 	for conn, sub := range s.processStatusSubs {
-		select {
-		case sub.send <- event:
-		default:
+		if !sub.enqueue(event) {
 			delete(s.processStatusSubs, conn)
 			toClose = append(toClose, sub)
 		}

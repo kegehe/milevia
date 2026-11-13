@@ -224,16 +224,56 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.publishCredentials(ctx); err != nil {
 		log.Printf("publish agent credentials to local control server: %v", err)
 	}
-	backoff := time.Second
+	return a.runReconnectLoop(ctx, a.runConnection, defaultReconnectPolicy)
+}
+
+// reconnectPolicy 定义断线后的重连节奏。
+type reconnectPolicy struct {
+	// min 是首次重连前等待的时长，也是连接恢复后的复位值。
+	min time.Duration
+	// max 是连续失败时的等待上限。
+	max time.Duration
+	// stableAfter 是一次连接要存活多久才算链路真的恢复。刚连上就被断开
+	// （例如云端把同一实例的旧连接踢掉）不应把退避打回最短，否则两个进程
+	// 抢同一条连接时会变成每秒一次的互相踢。
+	stableAfter time.Duration
+}
+
+var defaultReconnectPolicy = reconnectPolicy{
+	min: time.Second,
+	max: 30 * time.Second,
+	// 5 秒足够区分"真的连上过"和"连上就断"：正常掉线前连接通常已维持几分钟，
+	// 阈值越低，用户越不会在又一次短断网后重新落到 30 秒等待。
+	stableAfter: 5 * time.Second,
+}
+
+// connectFunc 跑一次连接直到断开，返回这次连接**真正建立后**维持的时长和
+// 断开原因。拨号失败时已建立时长为 0。
+type connectFunc func(context.Context) (time.Duration, error)
+
+// runReconnectLoop 用指数退避维持连接，直到 ctx 结束。
+//
+// connect 由调用方注入而不是直接调 a.runConnection，测试才能用可控的连接
+// 序列（连续失败、稳定连接、再次断开）验证退避节奏。
+//
+// 退避的复位条件必须是"这条连接建立后活过 reconnectPolicy.stableAfter"，不能
+// 只看 connect 是否返回 nil：真实断线（读错误、写错误、写队列卡死）一律返回
+// 错误，所以老实现只有在 ctx 取消时才复位 —— 几次短断网之后每次掉线都要白等
+// 30 秒。也不能按"尝试了多久"计：拨号自己就能挂上几十秒，那既不说明链路恢复，
+// 也不该借机把退避清零。
+func (a *Agent) runReconnectLoop(ctx context.Context, connect connectFunc, policy reconnectPolicy) error {
+	backoff := policy.min
 	for {
-		if err := a.runConnection(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("agent connection lost: %v", err)
-			backoff = minDuration(backoff*2, 30*time.Second)
-		} else {
-			backoff = time.Second
-		}
+		established, err := connect(ctx)
 		if ctx.Err() != nil {
 			return nil
+		}
+		if err != nil {
+			log.Printf("agent connection lost: %v", err)
+		}
+		// 这条连接稳定存活过，说明网络确实恢复过；下一次掉线按最短间隔重连。
+		if err == nil || established >= policy.stableAfter {
+			backoff = policy.min
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -242,6 +282,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 		case <-timer.C:
 		}
+		backoff = minDuration(backoff*2, policy.max)
 	}
 }
 
@@ -324,11 +365,12 @@ func (a *Agent) register(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) runConnection(ctx context.Context) error {
+// runConnection 跑一次连接直到断开，返回值见 connectFunc。
+func (a *Agent) runConnection(ctx context.Context) (established time.Duration, err error) {
 	instanceID, cloudToken := a.credentials()
 	endpoint, err := cloudWebSocketEndpoint(a.config.CloudURL, instanceID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	header := http.Header{"X-Milevia-Agent-Token": []string{cloudToken}}
 	conn, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
@@ -338,12 +380,29 @@ func (a *Agent) runConnection(ctx context.Context) error {
 			// stale secret and enroll again so the next connection uses a fresh
 			// instance-scoped token.
 			if reErr := a.reEnroll(ctx); reErr != nil {
-				return fmt.Errorf("cloud rejected agent credentials (%w); re-enrollment failed: %v", err, reErr)
+				return 0, fmt.Errorf("cloud rejected agent credentials (%w); re-enrollment failed: %v", err, reErr)
 			}
-			return errors.New("re-enrolled after the cloud rejected the previous credential")
+			return 0, errors.New("re-enrolled after the cloud rejected the previous credential")
 		}
-		return err
+		return 0, err
 	}
+	// 从拨号成功起计时。拨号本身可能挂上几十秒，那不算"连接存活"，否则一次
+	// 卡住的拨号就会被重连循环误当成链路恢复。
+	//
+	// 下面的 defer 统一补这个返回值：拨号之后的每个 return 都自动带上已建立
+	// 时长，新增返回分支也不会漏（漏掉会让退避永远无法复位）。
+	establishedAt := time.Now()
+	// 断连时刻单独记：shutdown() 里最多会等 15 秒让后台 goroutine 收尾，那段时间
+	// 不算"连接稳定存活"。否则刚连上就被踢的连接会被误判成稳定连接、把退避打回最短，
+	// 两个 agent 抢同一条连接时会退化成每秒互踢一次。
+	var disconnectedAt time.Time
+	defer func() {
+		end := disconnectedAt
+		if end.IsZero() {
+			end = time.Now()
+		}
+		established = end.Sub(establishedAt)
+	}()
 	a.mu.Lock()
 	a.conn = conn
 	a.mu.Unlock()
@@ -442,6 +501,9 @@ func (a *Agent) runConnection(ctx context.Context) error {
 	// 把重连拖到一分多钟 —— 那和"卡死"在用户眼里差不多。正常路径上五个 channel
 	// 都是微秒级关闭，这个期限只在真出问题时才起作用。
 	shutdown := func() {
+		if disconnectedAt.IsZero() {
+			disconnectedAt = time.Now()
+		}
 		cancel()
 		_ = conn.Close()
 		deadline := time.Now().Add(agentShutdownGrace)
@@ -457,20 +519,20 @@ func (a *Agent) runConnection(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			shutdown()
-			return nil
+			return 0, nil
 		case err := <-readErr:
 			shutdown()
-			return err
+			return 0, err
 		case err := <-writeErr:
 			shutdown()
-			return err
+			return 0, err
 		case <-ticker.C:
 			// 写队列灌满说明连接实际已经卡住（对端不读，或者 writer 卡在一次
 			// 写里）。老实现会一直阻塞在 sendMessage 上：既不报错也不重连，
 			// 整个 agent 就此静默。宁可断开重连。
 			if !sendMessageWithin(connectionCtx, writeCh, map[string]string{"kind": "ping"}, agentWriteQueueStallTimeout) {
 				shutdown()
-				return agentWriteStallError(connectionCtx)
+				return 0, agentWriteStallError(connectionCtx)
 			}
 			wakeSnapshot()
 		}

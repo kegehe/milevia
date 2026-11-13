@@ -44,7 +44,11 @@ type fakeCrossEnvironment struct {
 
 func (f *fakeCrossEnvironment) describe() string { return f.name }
 
-func (f *fakeCrossEnvironment) run(_ context.Context, script string) (string, string, error) {
+func (f *fakeCrossEnvironment) run(ctx context.Context, script string) (string, string, error) {
+	return f.runWithLimit(ctx, script, crossOutputLimit)
+}
+
+func (f *fakeCrossEnvironment) runWithLimit(ctx context.Context, script string, _ int) (string, string, error) {
 	f.scripts = append(f.scripts, script)
 	for _, reply := range f.replies {
 		if strings.Contains(script, reply.match) {

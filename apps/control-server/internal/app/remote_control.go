@@ -306,6 +306,8 @@ create index if not exists remote_outbox_pending on remote_outbox(next_attempt_a
 	);
 create unique index if not exists processed_remote_commands_idempotency
 	on processed_remote_commands(idempotency_key,type);
+create index if not exists processed_remote_commands_retention
+	on processed_remote_commands(status,updated_at);
 `)
 	if err != nil {
 		return err
@@ -764,7 +766,7 @@ func (s *Server) enqueueRemoteCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestBody := mustJSON(command)
-	_, err = tx.ExecContext(r.Context(), `insert into processed_remote_commands(command_id,idempotency_key,type,status,result,received_at,updated_at,expires_at,request_payload,request_hash) values(?,?,?,?,?,?,?,?,?,?)`, command.CommandID, command.IdempotencyKey, command.Type, "queued", string(result), now, now, command.ExpiresAt, requestBody, hash)
+	_, err = tx.ExecContext(r.Context(), `insert into processed_remote_commands(command_id,idempotency_key,type,status,result,received_at,updated_at,expires_at,request_payload,request_hash) values(?,?,?,?,?,?,?,?,?,?)`, command.CommandID, command.IdempotencyKey, command.Type, "queued", string(result), now, now, command.ExpiresAt.UTC(), requestBody, hash)
 	if err != nil {
 		_ = tx.Rollback()
 		writeError(w, http.StatusInternalServerError, err)

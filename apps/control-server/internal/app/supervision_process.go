@@ -34,6 +34,10 @@ type supervisionContainedProcess interface {
 }
 
 var errSupervisionProcessUnsupported = errors.New("当前平台尚不支持托管进程的严格容器核对")
+
+// errSupervisionTargetUnavailable 表示目标侧辅助程序缺失（构建产物没打进来或读不到）。
+// 与"工作区被占用"不同，这是环境不可用，调用方应按 503 而不是 409 呈现。
+var errSupervisionTargetUnavailable = errors.New("目标辅助程序构建产物不可用")
 var errSupervisionProcessIO = errors.New("托管进程输出尚未收敛")
 
 func validSupervisionContainer(name string) bool {

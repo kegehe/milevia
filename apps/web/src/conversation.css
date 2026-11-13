@@ -3344,6 +3344,9 @@ button.branch-pill:hover { border-color: #7fae9d; color: #1f6055; background: #e
 }
 .skill-source-heading:hover { background: rgba(23, 61, 50, .05); }
 .skill-source-heading:focus-visible {  outline: 2px solid #2b7b68; outline-offset: 1px;  }
+/* 插件块里的「管理插件」：与说明文字同处一行，样式上退到链接位。 */
+.plugin-discovery-manage { border: 0; padding: 0; color: #2b7b68; background: transparent; font: inherit; font-weight: 700; cursor: pointer; }
+.plugin-discovery-manage:hover { text-decoration: underline; }
 /* 来源徽章 → 来源色点：小圆点区分来源，名称保持普通文字，弱化到接近图例。 */
 .skill-source-chip {
   flex: none;

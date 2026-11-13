@@ -21,6 +21,7 @@
  *     多出来的那次往返换掉"一个魔法数 + 一类漏判"，比留一份可能过期的令牌划算。
  *     所以这里没有 `invalidateAll` 那种"清缓存"的出口 —— 没有东西可清。
  */
+import { rpcFailureMessage } from "../remote/mobile-rpc";
 import type { MobileRpcReply, MobileRpcTransport } from "../remote/mobile-rpc";
 
 /** 只读操作：本地一条 git 命令是毫秒级，SSH 项目要算 SFTP 往返。 */
@@ -239,7 +240,9 @@ export function createMobileGitRequest(options: MobileGitRequestOptions): Mobile
       }
       return reply.data;
     }
-    const message = reply?.error || "操作失败";
+    // 文案先过通道层那一关：电脑在请求进行中掉线时，error 里是云端写的机器串，
+    // 不是一句人话（见 mobile-rpc.ts 的 rpcFailureMessage）。
+    const message = rpcFailureMessage(reply);
     // 码优先，文案兜底 —— 服务端会把文案本地化，见 classifyGitFailure 的说明。
     throw new MobileGitError(classifyGitFailure(message, reply?.code), message, reply?.status ?? 0);
   }

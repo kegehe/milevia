@@ -9,6 +9,7 @@ import {
   STALE_STATE_NOTICE,
 } from "./mobile-git-request";
 import type { MobileRpcReply, MobileRpcTransport } from "../remote/mobile-rpc";
+import { INSTANCE_OFFLINE_MESSAGE } from "../remote/mobile-rpc";
 
 // 记账桩：记录每次发出的 op / params / timeoutMs，并按脚本回话。
 //
@@ -380,7 +381,29 @@ test("a failed token refresh fails the write instead of reusing an old token", a
   const adapter = createMobileGitRequest({ transport });
   await assert.rejects(
     () => adapter.request(git("/stage"), { method: "POST", body: JSON.stringify({ paths: ["a.go"], stateToken: "tok-old" }) }),
-    (error: unknown) => error instanceof MobileGitError && error.message.includes("instance_offline"),
+    (error: unknown) => error instanceof MobileGitError && error.message === INSTANCE_OFFLINE_MESSAGE,
   );
   assert.deepEqual(calls.map((call) => call.op), ["git.summary"], "the write must not be sent with a stale token");
+});
+
+// 提交/推送进行中电脑掉线：云端把在途请求就地判死（HTTP 200 + ok:false + code），
+// error 里是云端写的机器串。判定要落在 code 上，文案翻成中文 —— 否则手机上显示的
+// 就是 "instance_offline: the computer is not connected right now"。
+test("电脑掉线时提交/推送给出中文提示", async () => {
+  const { transport, calls } = makeTransport((op) =>
+    op === "git.summary"
+      ? ok({ stateToken: "tok" })
+      : { ok: false, status: 409, error: "instance_offline: the computer is not connected right now", code: "instance_offline" },
+  );
+  const adapter = createMobileGitRequest({ transport });
+  await assert.rejects(
+    () => adapter.request(git("/push"), { method: "POST" }),
+    (error: unknown) => {
+      assert.ok(error instanceof MobileGitError);
+      assert.equal(error.status, 409);
+      assert.equal(error.message, INSTANCE_OFFLINE_MESSAGE);
+      return true;
+    },
+  );
+  assert.deepEqual(calls.map((call) => call.op), ["git.summary", "git.push"]);
 });

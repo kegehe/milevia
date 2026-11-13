@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,18 +165,26 @@ func newRateLimiter(capacity, perMinute int) *rateLimiter {
 	return &rateLimiter{buckets: map[string]bucket{}, capacity: float64(capacity), refill: float64(perMinute) / 60}
 }
 
+// The bucket table is bounded: an attacker who manages to rotate bucket keys
+// must not be able to grow it until the process runs out of memory, and the
+// trimming cost must not be paid on every request once the table is full.
+const (
+	rateLimiterMaxBuckets = 10000
+	rateLimiterBucketTTL  = 10 * time.Minute
+	// rateLimiterEvictFraction is the share of the table dropped when it is full
+	// and nothing is stale. Dropping a batch (rather than one entry) keeps the
+	// sort that finds the oldest entries amortised over many requests.
+	rateLimiterEvictFraction = 10
+)
+
 func (l *rateLimiter) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.buckets) > 10000 {
-		for k, b := range l.buckets {
-			if now.Sub(b.last) > 10*time.Minute {
-				delete(l.buckets, k)
-			}
-		}
-	}
 	current, ok := l.buckets[key]
 	if !ok {
+		if len(l.buckets) >= rateLimiterMaxBuckets {
+			l.evict(now)
+		}
 		current = bucket{tokens: l.capacity, last: now}
 	}
 	if elapsed := now.Sub(current.last).Seconds(); elapsed > 0 {
@@ -191,20 +200,104 @@ func (l *rateLimiter) allow(key string, now time.Time) bool {
 	return true
 }
 
-// clientIP identifies the caller for rate limiting. The documented deployment
-// terminates TLS at a reverse proxy on the same host, so X-Forwarded-For is the
-// only way to see the real client; RemoteAddr is the fallback for direct
-// access. Rate limiting is defence in depth here, not the only gate.
-func clientIP(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
-			return first
+// evict makes room for one new bucket. Stale entries go first; if none are
+// stale, the oldest slice of the table is dropped. It runs only when the table
+// is full, so its O(n log n) cost is paid once per batch of new keys instead of
+// on every request.
+func (l *rateLimiter) evict(now time.Time) {
+	for k, b := range l.buckets {
+		if now.Sub(b.last) > rateLimiterBucketTTL {
+			delete(l.buckets, k)
 		}
 	}
+	if len(l.buckets) < rateLimiterMaxBuckets {
+		return
+	}
+	type entry struct {
+		key  string
+		last time.Time
+	}
+	entries := make([]entry, 0, len(l.buckets))
+	for k, b := range l.buckets {
+		entries = append(entries, entry{key: k, last: b.last})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].last.Before(entries[j].last) })
+	drop := len(entries) / rateLimiterEvictFraction
+	if drop < 1 {
+		drop = 1
+	}
+	for _, e := range entries[:drop] {
+		delete(l.buckets, e.key)
+	}
+}
+
+// clientIP identifies the caller for rate limiting. Only forwarding headers set
+// by a trusted proxy are believed: the documented deployment runs Nginx on the
+// same host and cloud-control binds to 127.0.0.1, so a request that does not
+// originate from loopback either came in directly (RemoteAddr is the truth) or
+// carries headers the caller wrote itself.
+//
+// Nginx sets X-Real-IP to $remote_addr, which overwrites anything the client
+// sent, so it is preferred. X-Forwarded-For is only trusted at its **last** hop,
+// the one the proxy appended; earlier hops are whatever the client claimed.
+// Reading the first hop — as this used to — let anyone mint a fresh rate-limit
+// bucket per request.
+func clientIP(r *http.Request) string {
+	remote := remoteHost(r)
+	if !isLoopbackHost(remote) {
+		return remote
+	}
+	if real, ok := normalizeIP(r.Header.Get("X-Real-IP")); ok {
+		return real
+	}
+	if hop, ok := lastForwardedHop(r.Header.Values("X-Forwarded-For")); ok {
+		return hop
+	}
+	return remote
+}
+
+func remoteHost(r *http.Request) string {
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+// isLoopbackHost accepts the textual forms net/http can put in RemoteAddr.
+func isLoopbackHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// lastForwardedHop returns the rightmost well-formed address in the header — the
+// one the proxy appended. Scanning from the right also means the client's own
+// (possibly very long) prefix is never parsed on the hot path.
+func lastForwardedHop(values []string) (string, bool) {
+	for i := len(values) - 1; i >= 0; i-- {
+		parts := strings.Split(values[i], ",")
+		for j := len(parts) - 1; j >= 0; j-- {
+			if ip, ok := normalizeIP(parts[j]); ok {
+				return ip, true
+			}
+		}
+	}
+	return "", false
+}
+
+// normalizeIP canonicalises an address so that different spellings of the same
+// host (IPv6 forms, an optional port) cannot create separate buckets, and so
+// that arbitrary header text can never become a bucket key.
+func normalizeIP(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if ip := net.ParseIP(raw); ip != nil {
+		return ip.String(), true
+	}
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.String(), true
+		}
+	}
+	return "", false
 }
 
 func (s *Server) limit(limiter *rateLimiter, scope string) func(http.Handler) http.Handler {
@@ -1540,7 +1633,7 @@ func (s *Server) createCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if instanceStatus != "online" {
-		writeError(w, http.StatusConflict, errors.New("instance_offline: the computer is not connected right now"))
+		writeError(w, http.StatusConflict, errInstanceOffline)
 		return
 	}
 	idempotency := strings.TrimSpace(r.Header.Get("Idempotency-Key"))

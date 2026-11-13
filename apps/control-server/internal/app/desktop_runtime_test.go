@@ -18,6 +18,8 @@ import (
 
 func newDesktopTestServer(t *testing.T, config Config) *Server {
 	t.Helper()
+	// 夹具一律不探测真实 WSL（理由见 newTestServerWithWSLProbe）。
+	config.DisableWSLProbe = true
 	server, err := NewWithRunner(context.Background(), config, runnerFunc(func(context.Context, AgentRunRequest, AgentRunSink) error {
 		return nil
 	}))

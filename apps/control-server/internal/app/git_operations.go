@@ -1713,10 +1713,15 @@ func (s *Server) getGitRunner(w http.ResponseWriter, r *http.Request) (GitRunner
 	}
 	project := workspace.Project
 	if project.Runner == "wsl-local" && runtime.GOOS == "windows" {
-		wslRunner, ok := s.wslAgentRunner().(*wslAgentRunner)
-		if !ok || wslRunner == nil {
-			writeError(w, http.StatusServiceUnavailable, errors.New("WSL runner is unavailable"))
-			return nil, "", false
+		wslRunner, _ := s.wslAgentRunner().(*wslAgentRunner)
+		if wslRunner == nil {
+			// 只有 WSL UNC 路径真的离不开 WSL runner；本机路径（历史数据 / 测试构造的
+			// 路径）在探测不到 WSL 时照旧走本机 git，与有 WSL 时的分支保持一致。
+			if isWSLUncPath(workspace.Workspace.Path) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("WSL runner is unavailable"))
+				return nil, "", false
+			}
+			return newGitRunner(), workspace.Workspace.Path, true
 		}
 		if _, ok := uncToWslPath(workspace.Workspace.Path, wslRunner.distro); !ok {
 			// Keep synthetic/local paths usable for tests and legacy data. Real WSL
@@ -1753,9 +1758,13 @@ func (s *Server) gitRunnerForProject(ctx context.Context, projectID string) (Git
 		return nil, "", err
 	}
 	if project.Runner == "wsl-local" && runtime.GOOS == "windows" {
-		wslRunner, ok := s.wslAgentRunner().(*wslAgentRunner)
-		if !ok || wslRunner == nil {
-			return nil, "", errors.New("WSL runner is unavailable")
+		wslRunner, _ := s.wslAgentRunner().(*wslAgentRunner)
+		if wslRunner == nil {
+			// 同 getGitRunner：非 UNC 路径不需要 WSL runner。
+			if isWSLUncPath(project.Path) {
+				return nil, "", errors.New("WSL runner is unavailable")
+			}
+			return newGitRunner(), project.Path, nil
 		}
 		if _, ok := uncToWslPath(project.Path, wslRunner.distro); !ok {
 			return newGitRunner(), project.Path, nil

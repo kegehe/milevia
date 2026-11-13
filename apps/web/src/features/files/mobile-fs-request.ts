@@ -13,6 +13,7 @@
  * **HTTP 码只表示这条通道是否走通**，业务失败仍是 ok:false —— 见 docs/40 §7.1。
  */
 import type { FileContent, FileEntry, FileInfo, TreeResponse } from "./file-model";
+import { rpcFailureMessage } from "../remote/mobile-rpc";
 import type { MobileRpcReply, MobileRpcTransport } from "../remote/mobile-rpc";
 
 // 这两个类型属于通道、不属于文件（Git 适配器也要用），定义在 features/remote/mobile-rpc.ts。
@@ -242,7 +243,9 @@ export function createMobileFsRequest(options: MobileFsRequestOptions): MobileFs
     if (reply?.ok) return reply.data;
     // 业务失败：把服务端那句面向用户的中文**原样**抛出去（它已经是给用户看的），
     // 同时带上 status —— `FilesPanel` 靠 `status === 409` 走版本冲突分支。
-    throw new MobileFsError("operation_failed", reply?.error || "操作失败", reply?.status ?? 0);
+    // 例外是"请求进行中电脑掉线"：那是**云端**自己造的失败，文案得由通道层翻译
+    // （见 rpcFailureMessage），否则用户看到的是 instance_offline 那串英文。
+    throw new MobileFsError("operation_failed", rpcFailureMessage(reply), reply?.status ?? 0);
   }
 
   async function openFile(path: string): Promise<MobileOpenPayload> {

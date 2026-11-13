@@ -50,7 +50,7 @@ func (s *Server) registerWSLRunner(ctx context.Context) error {
 // wslProbeAt 而不再重试，不会连环重探。探测使用独立超时上下文而非请求 ctx，避免客户端断开
 // 导致半途取消、冷却空转。
 func (s *Server) ensureWSLRunner() {
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" || s.config.DisableWSLProbe {
 		return
 	}
 	if _, ok := s.runnerRegistry.getMeta("wsl-local"); ok {

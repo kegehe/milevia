@@ -8,6 +8,7 @@ import {
   type MobileOpenPayload,
 } from "./mobile-fs-request";
 import type { FileInfo } from "./file-model";
+import { INSTANCE_OFFLINE_MESSAGE } from "../remote/mobile-rpc";
 import { MOBILE_FILE_UPLOAD_LIMIT, uploadFiles } from "./file-upload";
 
 // 一个记账用的桩：记录每次发出了什么 op / params，并按脚本回话。
@@ -179,6 +180,28 @@ test("业务失败抛出带状态码的错误，文案原样保留", async () =>
       assert.equal(error.status, 409);
       assert.equal(error.code, "operation_failed");
       assert.equal(error.message, "文件已被修改，请重新加载后再保存");
+      return true;
+    },
+  );
+});
+
+// 请求进行中电脑掉线（中继断开 / 被新连接顶替）：云端就地判死在途请求，回包是
+// HTTP 200 + ok:false，`error` 里是云端写的机器串。适配器会原样显示它，所以必须
+// 按 code 翻成中文 —— 用户不知道 "instance_offline" 是什么，也不知道该等还是该重试。
+test("电脑掉线时抛出中文提示，而不是云端那句英文机器码", async () => {
+  const { transport } = makeTransport(() => ({
+    ok: false,
+    status: 409,
+    error: "instance_offline: the computer is not connected right now",
+    code: "instance_offline",
+  }));
+  const adapter = createMobileFsRequest({ transport });
+  await assert.rejects(
+    () => adapter.request(`${PROJECT}/fs/tree?path=src`),
+    (error: unknown) => {
+      assert.ok(error instanceof MobileFsError);
+      assert.equal(error.status, 409);
+      assert.equal(error.message, INSTANCE_OFFLINE_MESSAGE);
       return true;
     },
   );

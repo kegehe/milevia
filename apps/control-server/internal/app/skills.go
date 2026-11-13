@@ -330,6 +330,8 @@ func (s *Server) discoverSkillsForProject(ctx context.Context, project Project, 
 
 	roots := s.discoverLocalSkillRoots(target, project.Path)
 	scans := scanLocalSkills(ctx, roots)
+	// 已被 CLI 禁用的插件，其技能不应继续显示为可用。
+	scans = filterDisabledPluginScans(scans, s.disabledPluginPaths(ctx, project, agentID))
 	all := resolveSkillScans(scans)
 	return filterSkillsByAgent(all, agentID)
 }
@@ -417,7 +419,8 @@ func (s *Server) discoverSkillsRemote(ctx context.Context, project Project, agen
 	// 时把所有（可能有效的）技能一并丢弃。
 	script := strings.Join(cmds, "\n")
 	out, _ := sshR.client.execCommand(ctx, script)
-	return parseRemoteSkillOutput(string(out), home, proj, agentID)
+	// 远端插件状态同样经 SSH 查询（pluginList 走跨端通道），路径都是远端 Linux 路径。
+	return parseRemoteSkillOutputExcept(string(out), home, proj, agentID, s.disabledPluginPaths(ctx, project, agentID))
 }
 
 // remoteHome 查询远端 $HOME。
@@ -456,6 +459,11 @@ func skillFindPlugins(pluginRoot string) string {
 // parseRemoteSkillOutput 解析远端 find+cat 的输出（每条以 marker+路径开头，随后是文件内容，
 // 直到下一个 marker 或末尾），逐文件解析 frontmatter。
 func parseRemoteSkillOutput(output, home, projectPath, agentID string) []Skill {
+	return parseRemoteSkillOutputExcept(output, home, projectPath, agentID, nil)
+}
+
+// parseRemoteSkillOutputExcept 与 parseRemoteSkillOutput 相同，但丢弃落在已禁用插件目录下的技能。
+func parseRemoteSkillOutputExcept(output, home, projectPath, agentID string, disabled []string) []Skill {
 	// Use the same explicit root priorities as local discovery, independent of
 	// find output order. Only the deepest matching root owns a nested project.
 	skills := []Skill{}
@@ -473,6 +481,10 @@ func parseRemoteSkillOutput(output, home, projectPath, agentID string) []Skill {
 		filePath := strings.TrimSpace(block[:nl])
 		content := block[nl+1:]
 		if filePath == "" {
+			continue
+		}
+		// 已禁用的插件不再提供技能。
+		if pluginPathInAny(filePath, disabled) {
 			continue
 		}
 		name, description := parseSkillFrontmatter(content)

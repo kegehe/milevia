@@ -57,6 +57,9 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
+        # 限流键来自这两行：X-Real-IP 用 $remote_addr 覆盖写入，cloud-control 优先读它；
+        # $proxy_add_x_forwarded_for 会把客户端自带的 X-Forwarded-For 放在最前、把真实地址
+        # 追加在最后，服务端只认最后一跳。所以必须保留 "覆盖" 语义，不要改成透传客户端头。
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;

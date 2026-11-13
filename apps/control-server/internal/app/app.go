@@ -30,9 +30,13 @@ import (
 )
 
 type Config struct {
-	WorkspaceGuardDir            string
-	SupervisionTargetsDir        string
-	DisableSupervisionWorker     bool
+	WorkspaceGuardDir        string
+	SupervisionTargetsDir    string
+	DisableSupervisionWorker bool
+	// DisableWSLProbe 跳过 Windows 下的 WSL 探测与 wsl-local 注册（启动期与请求期补注册都跳）。
+	// 仅供测试：单测夹具每建一个 Server 都要跑两条 wsl.exe（实测每条 0.1~0.2s，冷启动可达数秒），
+	// 全量用例累计约 1200 次探测、折合四五分钟。生产配置恒为 false。
+	DisableWSLProbe              bool
 	DatabasePath                 string
 	DataDir                      string
 	Mode                         string
@@ -376,9 +380,21 @@ type Server struct {
 	// commandCatalogMu 保护按「项目 + 工具」分开的命令目录缓存（见 project_commands.go）。
 	// 目录来自 CLI 的 init 事件，优先从真实运行采样，冷启动时才由 commandProbeMu
 	// 串行地拉起一次探针进程。不能收成一个槽：Qoder 和 Claude 的命令名不是同一套。
-	commandCatalogMu   sync.Mutex
-	commandCatalogs    map[string]*commandCatalogEntry
-	commandProbeMu     sync.Mutex
+	commandCatalogMu sync.Mutex
+	commandCatalogs  map[string]*commandCatalogEntry
+	commandProbeMu   sync.Mutex
+	// 插件管理（见 plugin_manager.go）。插件清单来自 CLI 自己的 JSON 输出，是读数不是
+	// 事实：按 runner+agent+项目路径缓存一小段时间，任何写操作立即失效。写操作本身
+	// 串行化，避免两个请求同时改同一份 CLI 配置。map 一律懒初始化。
+	pluginCacheMu sync.Mutex
+	pluginCache   map[string]pluginCacheEntry
+	// pluginCacheEpoch 在每次写操作后递增，防止写前发起的列表查询把旧结果写回缓存。
+	pluginCacheEpoch   uint64
+	pluginFlightMu     sync.Mutex
+	pluginFlights      map[string]*pluginListFlight
+	pluginMutationMu   sync.Mutex
+	pluginCapsMu       sync.Mutex
+	pluginCaps         map[string]pluginCapabilitiesCache
 	projectLifecycleMu sync.Mutex
 	// checkpointLocks 串行化同一会话上的快照类 git 操作（见 checkpoint.go 的 checkpointLockSet）。
 	checkpointLocks        checkpointLockSet
@@ -1045,7 +1061,7 @@ func NewWithRunner(ctx context.Context, config Config, runner AgentRunner) (*Ser
 	// WSL 内的项目目录（UNC 路径），加载后 AI 经 wsl.exe 在 WSL 侧执行。无 WSL / 探测
 	// 失败时仅记日志跳过，绝不影响 windows-local（其注册在上行）。启动期 WSL 冷启动可能
 	// 超过探测超时而失败——此时 wsl-local 缺失，由 ensureWSLRunner 在后续请求中按需补注册。
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" && !s.config.DisableWSLProbe {
 		if err := s.registerWSLRunner(ctx); err != nil {
 			log.Printf("[wsl] wsl-local not registered at startup, will lazy-register on demand: %v", err)
 		}
@@ -1458,6 +1474,19 @@ func (s *Server) routes() http.Handler {
 	r.Post("/api/runners/{runnerID}/runtime/install", s.installRuntime)
 	// 某个 Runner 上"运行时 + 每个工具"的状态汇总：管理页唯一的数据来源。
 	r.Get("/api/runners/{runnerID}/agents", s.listRunnerAgents)
+	// 插件管理：把各 CLI 自己的插件子命令代理成一套统一接口（见 plugin_manager.go）。
+	// 列表与详情带上能力位；写操作串行化且不自动确认 marketplace 命令。
+	r.Get("/api/runners/{runnerID}/plugins", s.listRunnerPlugins)
+	r.Get("/api/plugin-agents", s.listPluginAgents)
+	r.Get("/api/runners/{runnerID}/plugins/{pluginID}/details", s.pluginDetailsHandler)
+	r.Post("/api/runners/{runnerID}/plugins/install", s.installRunnerPlugin)
+	r.Post("/api/runners/{runnerID}/plugins/{pluginID}/enable", s.setRunnerPluginEnabled)
+	r.Post("/api/runners/{runnerID}/plugins/{pluginID}/disable", s.setRunnerPluginEnabled)
+	r.Post("/api/runners/{runnerID}/plugins/{pluginID}/update", s.updateRunnerPlugin)
+	r.Delete("/api/runners/{runnerID}/plugins/{pluginID}", s.uninstallRunnerPlugin)
+	r.Post("/api/runners/{runnerID}/plugin-marketplaces", s.addPluginMarketplace)
+	r.Put("/api/runners/{runnerID}/plugin-marketplaces", s.updatePluginMarketplaces)
+	r.Delete("/api/runners/{runnerID}/plugin-marketplaces/{name}", s.removePluginMarketplace)
 	// 跨端安装的逐主机授权与审计（默认关、可撤销）。
 	r.Post("/api/runners/{runnerID}/remote-install/grant", s.grantRunnerInstall)
 	r.Delete("/api/runners/{runnerID}/remote-install/grant", s.revokeRunnerInstall)
@@ -3460,7 +3489,10 @@ func pruneConversationHistoryTx(ctx context.Context, tx *sql.Tx, projectID strin
 	if excess <= 0 {
 		return false, nil
 	}
-	rows, err := tx.QueryContext(ctx, `select id from conversations where project_id=? and is_current=0 and status not in ('running','active') and not exists(select 1 from supervision_conversation_links l where l.conversation_id=conversations.id) order by last_activity_at asc,created_at asc,id asc limit ?`, projectID, excess)
+	// 尚未派发的定时运行已经握着一个占位会话（排队等工作区空闲时会一直留着）。
+	// 把它当普通历史淘汰，run.conversation_id 就指向一条不存在的会话，这一轮之后
+	// 再也派发不出去 —— 所以这类会话不参与裁剪。
+	rows, err := tx.QueryContext(ctx, `select id from conversations where project_id=? and is_current=0 and status not in ('running','active') and not exists(select 1 from supervision_conversation_links l where l.conversation_id=conversations.id) and not exists(select 1 from scheduled_task_runs r where r.conversation_id=conversations.id and r.status='`+scheduledRunQueued+`' and r.run_id='') order by last_activity_at asc,created_at asc,id asc limit ?`, projectID, excess)
 	if err != nil {
 		return false, err
 	}
@@ -3548,6 +3580,9 @@ func (s *Server) StartBackgroundMaintenance() {
 	s.startEventRetentionLoop()
 	// 出队表也要有上界：投递不出去的事件若无限堆积，会拖住整个中继（见该文件的说明）。
 	s.startRemoteOutboxRetentionLoop()
+	// 手机下发命令的台账同样要有上界：终态命令的完整请求正文保留下来没有读者，
+	// 长期只增不减会把库撑大（见 remote_command_retention.go）。
+	s.startRemoteCommandRetentionLoop()
 	s.startNotificationRetentionLoop()
 	go func() {
 		maintenanceStarted := time.Now()
@@ -9399,18 +9434,30 @@ func (s *Server) projectRunManagerForWorkspace(ctx context.Context, project Proj
 	if !sameCleanPath(workspacePath, projectRoot) {
 		key = runManagerKey(projectID, workspacePath)
 	}
+	broadcast := func(entry LogEntry) {
+		s.broadcastRunLog(key, entry)
+	}
 
-	// SSH 项目需要先解析远端规范路径（含一次 SSH 往返），在锁外完成。
+	// SSH 项目需要先解析远端规范路径（含一次 SSH 往返），WSL 项目需要探测发行版与
+	// Linux 路径，都放在锁外完成。
 	type preparedRunner struct {
 		runner projectRunnerInterface
 	}
 	var prepared *preparedRunner
-	if project.Runner == "wsl-local" {
-		// WSL 项目运行在 WSL 内，Windows 控制侧不支持"运行命令"（resolveRunExecutionTarget
-		// 对 Windows+WSL 目标亦明确拒绝）。给出明确提示而非误导性的 SSH 类型错误。
-		return nil, errors.New("WSL 环境暂不支持运行命令；请改用会话/文件操作，或在 WSL 内直接执行")
-	}
-	if !isLocalRunnerID(project.Runner) {
+	switch {
+	case projectRunUsesWSLExec(project.Runner):
+		// Windows 控制服务 + WSL 项目：经 wsl.exe 在 WSL 内运行（与 AI 会话、文件、Git
+		// 同一条跨端链路）。
+		s.ensureWSLRunner()
+		distro := s.wslDistroName()
+		if distro == "" {
+			return nil, errWSLProjectRunUnavailable
+		}
+		if _, err := wslProjectRunRoot(project.Path, distro); err != nil {
+			return nil, err
+		}
+		prepared = &preparedRunner{runner: newWSLProjectRunner(projectID, distro, broadcast)}
+	case !isLocalRunnerID(project.Runner):
 		agentRunner, ok := s.runnerRegistry.get(project.Runner)
 		if !ok {
 			return nil, &runnerOfflineError{RunnerID: project.Runner}
@@ -9422,9 +9469,6 @@ func (s *Server) projectRunManagerForWorkspace(ctx context.Context, project Proj
 		repo, err := sshR.canonicalProjectPath(ctx, project.Path)
 		if err != nil {
 			return nil, err
-		}
-		broadcast := func(entry LogEntry) {
-			s.broadcastRunLog(key, entry)
 		}
 		prepared = &preparedRunner{runner: newSSHProjectRunner(projectID, sshR.client, repo, broadcast)}
 	}
@@ -9438,16 +9482,17 @@ func (s *Server) projectRunManagerForWorkspace(ctx context.Context, project Proj
 	if runner, ok := s.runManagers[key]; ok {
 		return runner, nil
 	}
-	broadcast := func(entry LogEntry) {
-		s.broadcastRunLog(key, entry)
-	}
 	var runner projectRunnerInterface
 	if prepared != nil {
 		runner = prepared.runner
-		if remote, ok := runner.(*sshProjectRunner); ok {
-			remote.workspaceAdmission = func(path string) (func(), error) {
-				return s.beginWorkspaceOperationAtPath(project, path, "project-run")
-			}
+		admit := func(path string) (func(), error) {
+			return s.beginWorkspaceOperationAtPath(project, path, "project-run")
+		}
+		switch typed := runner.(type) {
+		case *sshProjectRunner:
+			typed.workspaceAdmission = admit
+		case *wslProjectRunner:
+			typed.workspaceAdmission = admit
 		}
 	} else {
 		local := newProjectRunner(projectID, "", "", nil, broadcast)
@@ -9463,6 +9508,90 @@ func (s *Server) projectRunManagerForWorkspace(ctx context.Context, project Proj
 	})
 	s.runManagers[key] = runner
 	return runner, nil
+}
+
+// projectRunUsesWSLExec 报告"项目位于 WSL 内、由 Windows 控制服务经 wsl.exe 运行"。
+// 非 Windows 服务端上 wsl-local 就是本机 runner（isLocalRunnerID 为真），不走这条路径。
+func projectRunUsesWSLExec(runnerID string) bool {
+	return runtime.GOOS == "windows" && runnerID == "wsl-local"
+}
+
+// errWSLProjectRunUnavailable 表示当前机器上探测不到可用的 WSL 发行版。
+// 与"工作区被占用"不同，这是环境不可用，启动接口按 503 呈现。
+var errWSLProjectRunUnavailable = errors.New("WSL 环境不可用：未检测到已安装的 WSL 发行版。请先在 Windows 上安装并启动一次 WSL，再启动项目命令")
+
+// ensureProjectRunWSLRunner 在拿项目生命周期锁之前补一次 wsl-local 注册。
+//
+// WSL 项目的启动/重启请求会先做工作区准入核对，而核对需要已注册的 wslAgentRunner
+// （workspaceGuardTargetPath 用它换算发行版内路径）。启动期探测失败时请求会在准入处
+// 直接失败，永远走不到 manager 里的 ensureWSLRunner；这里提前补一次，并且不持生命周期
+// 锁 —— 冷探测最坏 60 秒，不能把全局项目锁按住。
+func (s *Server) ensureProjectRunWSLRunner(r *http.Request, projectID string) {
+	if runtime.GOOS != "windows" || strings.TrimSpace(projectID) == "" {
+		return
+	}
+	project, err := s.getProjectByID(r.Context(), projectID)
+	if err != nil || !projectRunUsesWSLExec(project.Runner) {
+		return
+	}
+	s.ensureWSLRunner()
+}
+
+// preflightWSLProjectRun 在准入核对之前把 WSL 侧的不可用原因说清楚。
+//
+// 准入对 WSL 路径的换算依赖发行版与发行版内路径，失败时只会返回统一的冲突错误；
+// 不先检查的话，"没装 WSL"或"项目路径不属于该发行版"都会被报成"操作冲突，请稍后重试"。
+func (s *Server) preflightWSLProjectRun(project Project, workspacePath string) error {
+	if !projectRunUsesWSLExec(project.Runner) {
+		return nil
+	}
+	distro := s.wslDistroName()
+	if distro == "" {
+		return errWSLProjectRunUnavailable
+	}
+	// 实际运行用的是解析后的工作区（会话 worktree 也可能是 WSL 路径），不是项目根。
+	path := strings.TrimSpace(workspacePath)
+	if path == "" {
+		path = project.Path
+	}
+	if _, err := wslProjectRunRoot(path, distro); err != nil {
+		return err
+	}
+	return nil
+}
+
+// projectRunAdmissionStatus 区分"工作区确实被别的操作占用"（409）与"执行环境不可用"
+// （503）。后者包括 WSL 未安装、目标辅助程序构建产物缺失 —— 报成冲突会让用户以为是
+// 瞬时占用而反复重试，而真正的原因（以及 manager 里准备好的诊断）永远不会出现。
+func projectRunAdmissionStatus(err error) int {
+	if errors.Is(err, errSupervisionProcessUnsupported) || errors.Is(err, errSupervisionTargetUnavailable) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusConflict
+}
+
+// resolveWSLProjectRunExecutionTarget 解析 WSL 项目的运行环境：项目本来就在 WSL 内，
+// auto 与 wsl 都落到 WSL；显式选 Windows 是不可能的组合（项目路径是 \\wsl$\ UNC）。
+func resolveWSLProjectRunExecutionTarget(requested RunExecutionTarget) (RunExecutionTarget, error) {
+	switch normalizeRunExecutionTarget(requested) {
+	case RunExecutionTargetAuto, RunExecutionTargetWSL:
+		return RunExecutionTargetWSL, nil
+	case RunExecutionTargetWindows:
+		return "", errors.New("WSL 项目只能在 WSL 内运行，请把运行环境改为自动或 WSL")
+	default:
+		return "", errors.New("运行环境必须为 auto、wsl 或 windows")
+	}
+}
+
+// validateRunExecutionTargetForProject 按项目 Runner 选择执行目标解析器：WSL 项目看
+// WSL 规则，其余本机项目按项目路径推导。
+func validateRunExecutionTargetForProject(project Project, requested RunExecutionTarget) error {
+	if projectRunUsesWSLExec(project.Runner) {
+		_, err := resolveWSLProjectRunExecutionTarget(requested)
+		return err
+	}
+	_, err := resolveRunExecutionTarget(project.Path, requested)
+	return err
 }
 
 func validateProjectRunConfig(project Project, cfg RunConfig) error {
@@ -9482,6 +9611,9 @@ func validateProjectRunConfig(project Project, cfg RunConfig) error {
 }
 
 func validateProjectRunWorkDir(project Project, cfg RunConfig) error {
+	if projectRunUsesWSLExec(project.Runner) {
+		return validateWSLProjectRunWorkDir(project, cfg)
+	}
 	// SSH 远程项目的执行环境与工作目录在远端解析，跳过本地路径校验。
 	if !isLocalRunnerID(project.Runner) {
 		return nil
@@ -9493,6 +9625,20 @@ func validateProjectRunWorkDir(project Project, cfg RunConfig) error {
 		return errors.New("工作目录必须是项目内相对路径")
 	}
 	_, err := resolveProjectRunWorkDir(project.Path, cfg.WorkDir)
+	return err
+}
+
+// validateWSLProjectRunWorkDir 校验 WSL 项目的执行目标与工作目录。工作目录只做词法
+// 校验（WSL 内是否真实存在由启动脚本的 cd 兜底），避免保存配置依赖 wsl.exe 往返。
+func validateWSLProjectRunWorkDir(project Project, cfg RunConfig) error {
+	if err := validateRunExecutionTargetForProject(project, cfg.ExecutionTarget); err != nil {
+		return err
+	}
+	linuxRoot, err := wslProjectRunRoot(project.Path, "")
+	if err != nil {
+		return err
+	}
+	_, err = resolveWSLProjectRunWorkDir(linuxRoot, cfg.WorkDir)
 	return err
 }
 
@@ -9511,6 +9657,11 @@ func (s *Server) validateProjectRunConfigWithWorktree(ctx context.Context, proje
 }
 
 func (s *Server) validateProjectRunWorkDirWithWorktree(ctx context.Context, project Project, cfg RunConfig) error {
+	if projectRunUsesWSLExec(project.Runner) {
+		// WSL 项目没有自动编排 worktree（listProjectRunWorktrees 对其返回空），
+		// 工作目录只允许项目内的相对路径或项目内 Linux/UNC 绝对路径。
+		return validateWSLProjectRunWorkDir(project, cfg)
+	}
 	if !isLocalRunnerID(project.Runner) {
 		return nil
 	}
@@ -9670,8 +9821,8 @@ func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if isLocalRunnerID(project.Runner) {
-		if _, err := resolveRunExecutionTarget(project.Path, c.ExecutionTarget); err != nil {
+	if isLocalRunnerID(project.Runner) || projectRunUsesWSLExec(project.Runner) {
+		if err := validateRunExecutionTargetForProject(project, c.ExecutionTarget); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -9689,6 +9840,8 @@ func (s *Server) updateRunConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	s.ensureProjectRunWSLRunner(r, projectID)
 	s.projectLifecycleMu.Lock()
 	locked := true
 	defer func() {
@@ -9696,7 +9849,6 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 			s.projectLifecycleMu.Unlock()
 		}
 	}()
-	projectID := chi.URLParam(r, "projectID")
 	resolved, err := s.resolveRequestWorkspaceFromRequest(r)
 	project := resolved.Project
 	if err != nil {
@@ -9707,14 +9859,23 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
+	if err := s.preflightWSLProjectRun(project, resolved.Workspace.Path); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errWSLProjectRunUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		writeError(w, status, err)
+		return
+	}
 	releaseAdmission, admissionErr := s.beginWorkspaceOperationAtPath(project, resolved.Workspace.Path, "project-run-request")
 	if admissionErr != nil {
-		writeError(w, http.StatusConflict, admissionErr)
+		writeError(w, projectRunAdmissionStatus(admissionErr), admissionErr)
 		return
 	}
 	defer releaseAdmission()
-	if !isLocalRunnerID(project.Runner) {
+	if !isLocalRunnerID(project.Runner) && !projectRunUsesWSLExec(project.Runner) {
 		// SSH 等远程项目：校验 runner 在线，由 projectRunManagerForExistingProject 负责。
+		// WSL 项目不在这里判 —— 补注册与"WSL 不可用"的具体原因都在 manager 里给。
 		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
 			writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})
 			return
@@ -9748,6 +9909,11 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// WSL 项目的执行环境恒为 WSL。旧版保存过 windows 目标的配置在这里直接归位：
+	// 运行页对 WSL 项目已锁定该选项，若仍按配置报错，用户没有任何办法改回来。
+	if projectRunUsesWSLExec(project.Runner) {
+		cfg.ExecutionTarget = RunExecutionTargetWSL
+	}
 
 	selected, err := cfg.resolveRunCommand(strings.TrimSpace(req.SelectedCommandID))
 	if err != nil {
@@ -9768,6 +9934,10 @@ func (s *Server) startProjectRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+			return
+		}
+		if errors.Is(err, errWSLProjectRunUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
 		if offline, ok := err.(*runnerOfflineError); ok {
@@ -9814,6 +9984,8 @@ func (s *Server) stopProjectRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	s.ensureProjectRunWSLRunner(r, projectID)
 	s.projectLifecycleMu.Lock()
 	locked := true
 	defer func() {
@@ -9821,7 +9993,6 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 			s.projectLifecycleMu.Unlock()
 		}
 	}()
-	projectID := chi.URLParam(r, "projectID")
 	resolved, err := s.resolveRequestWorkspaceFromRequest(r)
 	project := resolved.Project
 	if err != nil {
@@ -9832,13 +10003,21 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
+	if err := s.preflightWSLProjectRun(project, resolved.Workspace.Path); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errWSLProjectRunUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		writeError(w, status, err)
+		return
+	}
 	releaseAdmission, admissionErr := s.beginWorkspaceOperationAtPath(project, resolved.Workspace.Path, "project-run-request")
 	if admissionErr != nil {
-		writeError(w, http.StatusConflict, admissionErr)
+		writeError(w, projectRunAdmissionStatus(admissionErr), admissionErr)
 		return
 	}
 	defer releaseAdmission()
-	if !isLocalRunnerID(project.Runner) {
+	if !isLocalRunnerID(project.Runner) && !projectRunUsesWSLExec(project.Runner) {
 		if _, ok := s.runnerRegistry.get(project.Runner); !ok {
 			writeError(w, http.StatusConflict, &runnerOfflineError{RunnerID: project.Runner})
 			return
@@ -9854,6 +10033,10 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 	var req RunConfig
 	if !decodeOptional(w, r, &req) {
 		return
+	}
+	// 与启动一致：WSL 项目的执行环境恒为 WSL，旧配置里的 windows 目标在此归位。
+	if projectRunUsesWSLExec(project.Runner) {
+		cfg.ExecutionTarget = RunExecutionTargetWSL
 	}
 	selected, err := cfg.resolveRunCommand(strings.TrimSpace(req.SelectedCommandID))
 	if err != nil {
@@ -9873,6 +10056,10 @@ func (s *Server) restartProjectRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, errors.New("项目不存在"))
+			return
+		}
+		if errors.Is(err, errWSLProjectRunUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
 		if offline, ok := err.(*runnerOfflineError); ok {

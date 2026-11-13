@@ -58,6 +58,11 @@ function CliToolsIcon() {
   return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" /><path d="M7.5 10.5 10 13l-2.5 2.5M12.5 15.5h4" /></svg>;
 }
 
+// 插件用「拼图块」意象：能力被打包接入 CLI。
+function PluginsIcon() {
+  return <svg className="dashboard-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4h4v3.2a2.3 2.3 0 1 0 3.5 2V12H20v4h-2.5a2.3 2.3 0 1 0-2 3.5H12V16H9.5A2.5 2.5 0 0 1 7 13.5V12H4V8h3V6a2 2 0 0 1 2-2z" /></svg>;
+}
+
 export default function DashboardPage() {
   const { projects, projectStatuses, projectsLoading, projectsLoaded, projectsLoadError, error, setError, refreshProjects, removeProject, api } = useProjectContext();
   const desktop = isDesktop();
@@ -282,6 +287,7 @@ export default function DashboardPage() {
         <button className="dashboard-action dashboard-action-ssh secondary" title="SSH连接" aria-label="SSH连接" onClick={() => navigate("/ssh-manager")}><SshConnectionIcon /><span className="action-label">SSH连接</span></button>
         <button className="dashboard-action dashboard-action-mcp secondary" title="MCP连接" aria-label="MCP连接" onClick={() => navigate("/mcp-manager")}><McpIcon /><span className="action-label">MCP连接</span></button>
         <button className="dashboard-action dashboard-action-cli-tools secondary" title="Cli管理" aria-label="Cli管理" onClick={() => navigate("/cli-tools")}><CliToolsIcon /><span className="action-label">Cli管理</span></button>
+        <button type="button" className="dashboard-action dashboard-action-plugins secondary" title="插件" aria-label="插件" onClick={() => navigate("/plugins")}><PluginsIcon /><span className="action-label">插件</span></button>
         <button className="dashboard-action dashboard-action-import primary" onClick={() => navigate("/projects/import")}><ImportProjectIcon /><span>加载项目</span></button>
       </div>
     </header>

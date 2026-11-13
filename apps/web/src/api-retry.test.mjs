@@ -19,6 +19,15 @@ test("only safe API methods receive automatic retries", () => {
   assert.match(apiModule, /entry\.methods\.includes\(method\) && entry\.pattern\.test\(bare\)/);
 });
 
+test("plugin marketplace refresh also gets the mutation budget", () => {
+  // 刷新市场是 PUT（服务端要拉远端清单，pluginMutationTimeout = 5 分钟）。
+  // 这一条曾经只列了 POST/DELETE，刷新会被默认 15 秒预算掐断。
+  assert.match(
+    apiModule,
+    /\{ methods: \["POST", "PUT", "DELETE"\], pattern: \/\^\\\/api\\\/runners\\\/\[\^\/\]\+\\\/\(plugins\|plugin-marketplaces\)\(\\\/\|\$\)\/, timeoutMs: pluginMutationTimeoutMs \}/,
+  );
+});
+
 test("successful responses with invalid JSON use a Chinese fallback", () => {
   assert.match(apiModule, /服务响应格式无效，请稍后重试。/);
   assert.match(apiModule, /response\.status === 204 \|\| response\.status === 205/);

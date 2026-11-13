@@ -1,21 +1,21 @@
 {
-  "version": "0.1.14",
-  "notes": "新增「会话内提问」：模型遇到需要你拍板的事会直接弹出结构化问题，在对话里选好或填好，模型拿到答案继续跑（当前仅本机 Windows 项目生效）。任务支持导出/导入，换电脑搬任务时保留优先级、置顶、顺序和依赖关系。修复运行卡死：一次性运行在 CLI 退出后最多等 5 秒就收尾，长时间没有任何输出会被自动停止，不再出现「一直显示运行中」。通知中心重做：未读排序、保留上限、删除项目或会话时一并清理。Git 工作台新增暂存面板与提交推送菜单，远端失败会给出可读原因。文件页支持上传与右键菜单。MCP 连接与项目级设置修复。",
-  "pub_date": "2026-11-02T03:58:10.400Z",
+  "version": "0.1.15",
+  "notes": "新增任务托管 Agent：任务可派给本机、WSL、SSH 上的 Agent 执行，含预算、产物与证据留痕；优化建议支持在手机上分析、复核并批量转任务，修复启动超时与批量转换响应超限；MCP 管理与 CLI 工具管理完善；通用接口的超时与取消现在覆盖响应正文；任务导出上限与导入规则对齐。",
+  "pub_date": "2026-11-11T06:53:04.346Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczVZbHhnSEdPYmtSb05KbnJiWU9VajFmYUdXcDhrNDk3ZTMyWTdiRHd0ZytwVHlCdnM0YmVpbUZhR3gxZ1Nua3JiejRpUTU2VlhDZkhWRXM5S09SWmdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNTkxODkwCWZpbGU6TWlsZXZpYV8wLjEuMTRfeDY0LXNldHVwLmV4ZQpOR0pGQnI2SVJnOEcyVTA3MmI3SnhlVWxYOVM3VXRBYjluN2VibDgzelUzMUN3WXlMc1JKelc0T3MzTlFiTHJIM3BMdG1RQ1dBRjZhSkQwOHFtUmxEdz09Cg==",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.14/Milevia_0.1.14_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaG5Ya0xvcDNnczJMd05qMlMySUFFQUFTSk8vRUhUQzNZUUpFaUxobjRuUkRFRUNkWWZzU1d2a1U3RmtSam4xdlNtWGkzK0NFdWZ5R3BIUVQxVXlEZU1oV3UyQkU2VWdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0Mzc5OTg0CWZpbGU6TWlsZXZpYV8wLjEuMTVfeDY0LXNldHVwLmV4ZQo2UDJoSm90VGpEUHhZRmNpUklDVng5MTZDU0I0eDR0L1MwVTN0M2VUN0JvWkl3V3c3ZEtSYmdlcUVvMkUrWXkvdkNEcm0zcWZFQk5hNkorWktsaFZBUT09Cg==",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.15/Milevia_0.1.15_x64-setup.exe"
     },
     "android": {
-      "version": "0.1.14",
-      "versionCode": 11,
-      "notes": "手机端同步这一版的核心能力：模型提问可以直接在手机上作答，电脑端和手机端看到的是同一张卡片；会话控制区重做，模型、执行权限、停止与预约发送收进一条工具栏，本轮还在跑时可以先把下一条预约上；新增「优化建议」入口。同步上游修复：运行卡死的收尾、任务导入导出、MCP 连接与项目级设置、Git 工作台提示。通知投递修复，同一件事不会重复提醒。",
-      "pub_date": "2026-11-02T04:01:31.355Z",
-      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.14/Milevia_0.1.14_android.apk",
-      "size": 28633805,
-      "sha256": "629051acd2d9d330f3af3342b05323c954a26e46d68b57f217810911c4bdf4d0",
-      "signature": "629051acd2d9d330f3af3342b05323c954a26e46d68b57f217810911c4bdf4d0"
+      "version": "0.1.15",
+      "versionCode": 12,
+      "notes": "新增任务托管 Agent：任务可派给本机、WSL、SSH 上的 Agent 执行，含预算、产物与证据留痕；优化建议支持在手机上分析、复核并批量转任务，修复启动超时与批量转换响应超限；MCP 管理与 CLI 工具管理完善；通用接口的超时与取消现在覆盖响应正文；任务导出上限与导入规则对齐。",
+      "pub_date": "2026-11-11T06:55:56.963Z",
+      "url": "https://github.com/kegehe/milevia/releases/download/v0.1.15/Milevia_0.1.15_android.apk",
+      "size": 28663417,
+      "sha256": "c9a5bf9c20ece76ce762580022e90a60a52d2d1d63c619ce4c18adb80c448c61",
+      "signature": "c9a5bf9c20ece76ce762580022e90a60a52d2d1d63c619ce4c18adb80c448c61"
     }
   }
 }

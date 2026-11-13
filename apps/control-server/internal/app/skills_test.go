@@ -285,6 +285,21 @@ func TestParseRemoteSkillOutput(t *testing.T) {
 	}
 }
 
+// TestParseRemoteSkillOutputSkipsDisabledPlugins 钉住 SSH 分支的禁用过滤：
+// 远端插件路径是 Linux 路径，必须与远端 CLI 报出的 installPath 直接比对。
+func TestParseRemoteSkillOutputSkipsDisabledPlugins(t *testing.T) {
+	home := "/home/u"
+	proj := "/home/u/work/app"
+	marker := remoteSkillOutputMarker
+	output := "" +
+		marker + "/home/u/.claude/plugins/cache/demo/on/skills/alpha/SKILL.md\n---\nname: alpha\ndescription: on\n---\n" +
+		marker + "/home/u/.claude/plugins/cache/demo/off/skills/beta/SKILL.md\n---\nname: beta\ndescription: off\n---\n"
+	skills := parseRemoteSkillOutputExcept(output, home, proj, "", []string{"/home/u/.claude/plugins/cache/demo/off"})
+	if len(skills) != 1 || skills[0].Name != "alpha" {
+		t.Fatalf("被禁用插件目录下的技能应被丢弃：%+v", skills)
+	}
+}
+
 // TestParseRemoteSkillOutputProjectWins 验证同名技能"后者覆盖前者"：
 // 远端命令顺序 user → plugin → project，故 user 级 alpha 应被 project 级 alpha 覆盖（source=project）。
 func TestParseRemoteSkillOutputProjectWins(t *testing.T) {

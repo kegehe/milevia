@@ -81,10 +81,13 @@ func rpcTimeoutFor(proposedMs int) time.Duration {
 //
 // Status 必须一路保留到手机端：客户端要据此区分"版本冲突（409，文件在电脑上被改过）"、
 // "lease 占用（409，AI 正在跑）"与"参数错误（400，客户端自己的问题）"，压成一句话
-// 就没法做这三种分支。Error 里是电脑端原本那句面向用户的中文，客户端原样显示。
+// 就没法做这三种分支。Error 里是一句面向用户的中文，客户端原样显示 —— 正常回话由
+// 电脑端写；电脑在请求进行中掉线时电脑端已经不在，那句话由云端写（见
+// failRPCRequestsForInstance）。
 //
-// Code 是电脑端给的**稳定机器码**（如 workspace_occupied）。云端同样不自作主张：
-// 它不认识那些码，只是原样搬运 —— 判据留在真正执行操作的那一端。
+// Code 是**稳定机器码**（如 workspace_occupied）。除了"电脑在请求进行中掉线"
+// 这一种云端自己造的失败（instance_offline，见 instanceOfflineReply），其余码都由
+// 电脑端给出；云端不认识那些码，只是原样搬运 —— 判据留在真正执行操作的那一端。
 // 这个字段不是可有可无的：那句 Error 会被本地化，按文案分支的客户端判据会静默失效。
 type rpcResponse struct {
 	OK     bool            `json:"ok"`
@@ -178,7 +181,23 @@ func (s *Server) agentSession(instanceID string) *agentConnection {
 	return s.connections[instanceID]
 }
 
+// errInstanceOffline 是"这台电脑此刻没有中继连接"那条**通道级**失败。
+//
+// 它走 HTTP 409 + body.error，手机端靠这句里的 instance_offline 标识符翻译成中文
+// （见 MobileRemotePage 的 localizeCloudError）。中继**在途**请求掉线时走的是另一条
+// 形态（HTTP 200 + ok:false），那个 error 字段会被适配器原样显示给用户，所以
+// 用的必须是下面这句现成的中文，不能复用这里的英文原文。
 var errInstanceOffline = errors.New("instance_offline: the computer is not connected right now")
+
+const (
+	// instanceOfflineCode 是掉线的稳定机器码。客户端按码分支，不依赖文案。
+	instanceOfflineCode = "instance_offline"
+	// instanceOfflineMessage 是给用户看的那句话。
+	//
+	// 这条失败由云端自己造出来（电脑端已经掉线，没人替它写文案），因此中文化只能
+	// 在这里做；文案要与手机端 localizeCloudError 里那句译文逐字相同。
+	instanceOfflineMessage = "电脑当前离线，请等电脑上线后再试"
+)
 
 // mobileRPCRequest 是手机端唯一的远程调用入口：文件与 Git 都走它。
 //
@@ -316,14 +335,23 @@ func (s *Server) resolveAgentRPCResponse(raw json.RawMessage) bool {
 }
 
 // failRPCRequestsForInstance 在中继断开时把在途请求立刻落成明确失败。
+//
+// 回包是 HTTP 200 + ok:false（通道走通了，只是这次操作确定失败），手机端适配器会把
+// Error **原样显示**给用户 —— 所以这里必须是中文，并带上稳定码让客户端按码分支。
 func (s *Server) failRPCRequestsForInstance(instanceID string) {
-	failed := s.rpcRequestHub().failInstance(instanceID, rpcResponse{
-		OK:     false,
-		Status: http.StatusConflict,
-		Error:  errInstanceOffline.Error(),
-	})
+	failed := s.rpcRequestHub().failInstance(instanceID, instanceOfflineReply())
 	if failed > 0 {
 		log.Printf("failed %d in-flight remote calls for %s: relay disconnected", failed, instanceID)
+	}
+}
+
+// instanceOfflineReply 是对"电脑在请求进行中掉线/被新连接顶替"的答复。
+func instanceOfflineReply() rpcResponse {
+	return rpcResponse{
+		OK:     false,
+		Status: http.StatusConflict,
+		Error:  instanceOfflineMessage,
+		Code:   instanceOfflineCode,
 	}
 }
 

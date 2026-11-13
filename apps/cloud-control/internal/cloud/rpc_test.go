@@ -3,6 +3,7 @@ package cloud
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -155,6 +156,60 @@ func TestRPCRequestHubFailsOnlyTheDisconnectedInstance(t *testing.T) {
 	// 保留下来的那条仍然能正常收到回答。
 	if !hub.resolve(keptID, rpcResponse{OK: true, Status: http.StatusOK}) {
 		t.Fatal("the surviving request stopped being resolvable")
+	}
+}
+
+// 掉线时那条回包是 HTTP 200 + ok:false，手机端适配器会把 Error **原样显示**。
+// 所以它必须是给人看的中文，并带上稳定码 —— 以前这里带的是
+// "instance_offline: the computer is not connected right now"，用户看到的就是这串英文。
+func TestFailRPCRequestsForInstanceSpeaksChineseAndCarriesTheCode(t *testing.T) {
+	server := &Server{}
+	_, result := server.rpcRequestHub().register("pc-offline")
+	server.failRPCRequestsForInstance("pc-offline")
+
+	select {
+	case response := <-result:
+		if response.OK || response.Status != http.StatusConflict {
+			t.Fatalf("offline response = %+v, want ok:false status 409", response)
+		}
+		if response.Code != instanceOfflineCode {
+			t.Fatalf("offline response code = %q, want %q", response.Code, instanceOfflineCode)
+		}
+		if response.Error != instanceOfflineMessage {
+			t.Fatalf("offline response error = %q, want %q", response.Error, instanceOfflineMessage)
+		}
+		if strings.Contains(response.Error, "instance_offline") || strings.Contains(response.Error, "not connected") {
+			t.Fatalf("offline response leaked a machine string to the user: %q", response.Error)
+		}
+	default:
+		t.Fatal("the in-flight request was not failed")
+	}
+}
+
+// 手机端读的是 **JSON 字段名**（`ok` / `status` / `error` / `code`），不是 Go 字段。
+// 只断言结构体的话，改一次 json tag 就能让"按码分支"静默失效 —— 所以这里把线上格式
+// 也钉住：平板/手机收到的那一帧必须长这样。
+func TestInstanceOfflineReplyWireShape(t *testing.T) {
+	encoded, err := json.Marshal(instanceOfflineReply())
+	if err != nil {
+		t.Fatalf("marshal offline reply: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatalf("unmarshal offline reply: %v", err)
+	}
+	if wire["ok"] != false {
+		t.Fatalf("wire ok = %v, want false", wire["ok"])
+	}
+	if wire["status"] != float64(http.StatusConflict) {
+		t.Fatalf("wire status = %v, want %d", wire["status"], http.StatusConflict)
+	}
+	if wire["error"] != instanceOfflineMessage {
+		t.Fatalf("wire error = %v, want %q", wire["error"], instanceOfflineMessage)
+	}
+	// 客户端按 code 分支，这个名字是与手机端 INSTANCE_OFFLINE_CODE 的契约。
+	if wire["code"] != "instance_offline" {
+		t.Fatalf("wire code = %v, want instance_offline", wire["code"])
 	}
 }
 

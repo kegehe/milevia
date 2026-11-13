@@ -184,7 +184,7 @@ func openSupervisionTargetMode(ctx context.Context, config Config, runner AgentR
 	}
 	artifact, body, err := targetexec.LoadHelper(supervisionHelperDirectory(config), targetOS, arch)
 	if err != nil {
-		return nil, fmt.Errorf("目标辅助程序构建产物不可用：%w", err)
+		return nil, fmt.Errorf("%w：%v", errSupervisionTargetUnavailable, err)
 	}
 	var channel *supervisionTargetPipe
 	switch typed := runner.(type) {

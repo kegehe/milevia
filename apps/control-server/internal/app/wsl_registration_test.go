@@ -47,3 +47,23 @@ func TestEnsureWSLRunnerRecoversWhenMissing(t *testing.T) {
 		t.Fatalf("ensureWSLRunner registered runner without distro/home state: distro=%q home=%q", s.wslDistro, s.wslHome)
 	}
 }
+
+// TestDisableWSLProbeSkipsRegistration 钉住测试专用开关 DisableWSLProbe：置位后 New()
+// 与 ensureWSLRunner 都不再拉起 wsl.exe，wsl-local 也不会注册。需要本机确有 WSL，否则
+// "没注册" 无法区分是开关生效还是本来就没有 WSL。
+func TestDisableWSLProbeSkipsRegistration(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("WSL 探测只在 Windows 服务端发生")
+	}
+	if _, err := detectDefaultWSLDistro(context.Background()); err != nil {
+		t.Skipf("no WSL on this host, skip: %v", err)
+	}
+	server := newTestServer(t) // 夹具默认 DisableWSLProbe=true
+	server.ensureWSLRunner()
+	if _, ok := server.runnerRegistry.getMeta("wsl-local"); ok {
+		t.Fatal("wsl-local was registered even though WSL probing is disabled")
+	}
+	if distro := server.wslDistroName(); distro != "" {
+		t.Fatalf("WSL probe ran (distro=%q) even though WSL probing is disabled", distro)
+	}
+}

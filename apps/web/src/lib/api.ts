@@ -34,8 +34,17 @@ const runnerListTimeoutMs = 120_000;
 const externalTaskTimeoutMs = 120_000;
 /** 起草任务。服务端 taskDraftTimeout 是 90 秒；这里多留 10 秒，让服务端的超时文案先回来。 */
 const taskDraftTimeoutMs = 100_000;
+/**
+ * 单台 runner 的插件清单：服务端在同一个请求里**串行**跑 list(30s)、marketplaces(30s)
+ * 和首次能力探测 --help(10s)，每次 CLI 还有 5 秒的管道收尾宽限，单飞 leader 的硬上限
+ * 是 90 秒。客户端必须比服务端上限更宽，否则会被服务端自己的超时抢先，用户看到的是
+ * "客户端超时"而不是服务端的原因。
+ */
+const pluginListTimeoutMs = 110_000;
 /** 安装类长任务：服务端按 15 分钟设计（`Config.AgentUpdateTimeout`，见 `defaultAgentUpdateTimeout`）。 */
 const installTimeoutMs = 16 * 60_000;
+/** 插件写操作：服务端 `pluginMutationTimeout` 是 5 分钟；多留 1 分钟让服务端文案先回来。 */
+const pluginMutationTimeoutMs = 6 * 60_000;
 
 /**
  * 长任务端点表 —— **唯一一份**。
@@ -126,6 +135,9 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	{ methods: ["GET"], pattern: /^\/api\/projects\/[^/]+\/insights\/engines$/, timeoutMs: probeTimeoutMs },
 	// 批量把建议转成任务 / 删除：N 条 finding = N 次写库，服务端在单事务里同步做完
 	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/insights\/(to-task|delete)$/, timeoutMs: externalTaskTimeoutMs },
+	// 停止/重启项目运行：服务端先按 pidfile 结束进程组（10 秒上限），再等 wsl.exe 退出
+	// （5+5 秒）。WSL 项目这一步可能合法地超过默认的 15 秒。
+	{ methods: ["POST"], pattern: /^\/api\/projects\/[^/]+\/run\/(stop|restart)$/, timeoutMs: 45_000 },
 	// 删项目：服务端**无界**（deleteProjectLocked 用 s.runtimeCtx），要删会话、停 runner、
 	// 清 worktree。同族的"删会话"早就在 ConversationPage 里单独放宽到 120 秒，这条漏在外面。
 	// 它还是写操作 —— 已被 detachWriteContext 脱开，所以 15 秒一到只得到"删除失败"，
@@ -143,6 +155,15 @@ const longRunningEndpoints: Array<{ methods: string[]; pattern: RegExp; timeoutM
 	// ── 探测类 ──
 	// 逐工具探测受 agentProbeTimeout = 45 秒约束；这里是"读一台机器上的全部工具"
 	{ methods: ["GET"], pattern: /^\/api\/runners\/[^/]+\/(agents|diagnostics)$/, timeoutMs: probeTimeoutMs },
+	// 插件清单：服务端单次 CLI 查询上限 30 秒，但一次请求要串行跑 list、市场与能力探测
+	// 三步（最坏约 70 秒），所以不能用 60 秒那一档。项目插件接口服务端自己限 45 秒。
+	{ methods: ["GET"], pattern: /^\/api\/runners\/[^/]+\/plugins(\/[^/]+\/details)?$/, timeoutMs: pluginListTimeoutMs },
+	{ methods: ["GET"], pattern: /^\/api\/projects\/[^/]+\/plugins$/, timeoutMs: probeTimeoutMs },
+	// 技能列表要扫磁盘、插件树，SSH 项目还要跨端 find；禁用过滤本身又是一次插件查询。
+	{ methods: ["GET"], pattern: /^\/api\/projects\/[^/]+\/skills$/, timeoutMs: probeTimeoutMs },
+	// 插件写操作：服务端 pluginMutationTimeout = 5 分钟（安装要从市场拉取并可能执行命令）。
+	// PUT 是"刷新市场"（同样要拉远端清单），漏掉它会让刷新卡在默认 15 秒。
+	{ methods: ["POST", "PUT", "DELETE"], pattern: /^\/api\/runners\/[^/]+\/(plugins|plugin-marketplaces)(\/|$)/, timeoutMs: pluginMutationTimeoutMs },
 	// **执行环境清单本身也是探测**：它把上面那条对每台机器各跑一遍（外加一次通道健康
 	// 检查），所以它是全站最慢的一次读。漏在表外的代价是 CLI 管理页必然报错 ——
 	// 15 秒到的第一次放弃、30 秒的第二次放弃，而服务端 27~84 秒才正常返回，
